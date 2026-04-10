@@ -67,4 +67,13 @@ if [[ -n "${SKILLS:-}" ]] && [[ -n "${AGENT_NAME:-}" ]]; then
   done
 fi
 
+# --- Heartbeat 自動更新 ---
+# AGENT_NAME が設定されている場合、ツール実行のたびに heartbeat を更新する
+# Worker は何も意識しなくてよい。hook が自動で処理する。
+if [[ -n "${AGENT_NAME:-}" ]]; then
+  HEARTBEAT_DIR="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}/registry/heartbeats"
+  mkdir -p "$HEARTBEAT_DIR"
+  date +%s > "${HEARTBEAT_DIR}/${AGENT_NAME}" 2>/dev/null || true
+fi
+
 exit 0

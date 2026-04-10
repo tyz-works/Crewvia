@@ -239,5 +239,15 @@ if [[ "${CREWVIA_TMUX:-0}" == "1" ]]; then
   echo "[crewvia] Agent launched in tmux window: ${SESSION}:${WINDOW_NAME}"
 else
   # Default: run inline (no tmux)
+  # Orchestrator 起動時に watchdog をバックグラウンドで起動
+  if [[ "${ROLE}" == "orchestrator" ]]; then
+    WATCHDOG="${REPO_ROOT}/scripts/watchdog.sh"
+    if [[ -f "$WATCHDOG" ]]; then
+      bash "$WATCHDOG" &
+      WATCHDOG_PID=$!
+      echo "[crewvia] Watchdog started (PID: ${WATCHDOG_PID})"
+      trap "kill ${WATCHDOG_PID} 2>/dev/null || true" EXIT
+    fi
+  fi
   exec claude "${PROMPT_FLAG[@]+"${PROMPT_FLAG[@]}"}"
 fi

@@ -504,3 +504,83 @@ EOF
 - **Taskvia非依存で動作可能** — 接続失敗時もミッションを止めない
 - **完了の定義を守る** — result が具体的でない完了報告を受け付けない
 - **PRは自分でマージしない** — PR作成後は必ず別の `review` スキルWorkerに委任する。この分離はセキュリティと品質保証のための必須ルールであり、例外はない
+
+---
+
+## 13. Worker 生存監視（Watchdog）
+
+### 自動起動
+
+起動時に `scripts/watchdog.sh` がバックグラウンドで自動起動される。手動操作は不要。
+
+```bash
+# start.sh が自動実行する（参考）
+bash scripts/watchdog.sh &
+```
+
+### heartbeat の仕組み
+
+Worker がツールを実行するたびに PostToolUse hook が `registry/heartbeats/{AGENT_NAME}` ファイルを自動更新する。
+
+```
+registry/
+  heartbeats/
+    Kai          ← 最終ツール実行時刻（タイムスタンプ）
+    Priya
+    John
+```
+
+watchdog はこのファイルの更新時刻を監視し、**10分以上（デフォルト）更新がない Worker** を停止とみなす。
+
+### 停止検知時の動作
+
+停止が検知されると:
+
+1. **stderr に警告を出力する**:
+   ```
+   [watchdog] WARNING: Worker {AGENT_NAME} — no heartbeat for 10+ minutes
+   ```
+
+2. **Taskvia トークンが設定されていれば `/api/log` に alert として通知される**:
+   ```json
+   {
+     "type": "alert",
+     "content": "Worker {AGENT_NAME} stopped responding (no heartbeat for 10+ min)",
+     "agent": "watchdog"
+   }
+   ```
+
+### 停止を検知した場合の対応フロー
+
+**1. 当該 Worker のブランチを確認する**
+
+```bash
+git log --oneline origin/{branch}..HEAD
+git status
+```
+
+partial commit（中途半端なコミット）がある場合は内容を確認し、引き継ぎ情報として次の Worker に渡すこと。
+
+**2. 必要であれば同スキルの新しい Worker を起動して引き継ぐ**
+
+```bash
+# 同スキルの Worker を新たに割り当て
+NEW_WORKER=$(./scripts/assign-name.sh --skills "{skills}")
+
+# 引き継ぎ情報を渡す
+cat <<EOF
+担当: $NEW_WORKER
+引き継ぎ: {前Worker}が停止。以下のカードを引き継いでください。
+カード: {card_id}
+ブランチ: {branch}
+進捗: {partial commitの内容 または 未着手}
+EOF
+```
+
+**3. heartbeat ファイルを削除してリセットする**
+
+```bash
+rm registry/heartbeats/{AGENT_NAME}
+```
+
+これにより watchdog の警告が止まる。

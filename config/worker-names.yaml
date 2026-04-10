@@ -1,0 +1,98 @@
+# Worker Name Pool
+# エージェントのWorkerに割り当てる名前のリスト。
+# スキル・役割ごとに名前が固定される（同じスキルのWorkerは同じ名前を引き継ぐ）。
+# 自由に編集・追加・削除してOK。
+
+names:
+  # 東アジア
+  - Hana       # 日本・韓国（花）
+  - Ren        # 日本（蓮）
+  - Sora       # 日本（空）
+  - Yuki       # 日本（雪）
+  - Kai        # 日本（海）
+  - Mika       # 日本
+  - Haruto     # 日本
+  - Seo        # 韓国
+  - Jiwon      # 韓国
+  - Minjun     # 韓国
+  - Wei        # 中国
+  - Lin        # 中国
+  - Mei        # 中国
+
+  # 東南・南アジア
+  - Arjun      # インド
+  - Priya      # インド
+  - Anika      # インド
+  - Rohan      # インド
+  - Siti       # インドネシア・マレーシア
+  - Budi       # インドネシア
+  - Nadia      # アラブ圏
+
+  # 中東・アラビア
+  - Layla      # アラビア（夜）
+  - Omar       # アラビア
+  - Yasmin     # アラビア・ペルシャ（ジャスミン）
+  - Tariq      # アラビア
+
+  # ヨーロッパ（英・仏・独・伊・西・北欧）
+  - Clara      # フランス・スペイン
+  - Luca       # イタリア
+  - Sofia      # スペイン・イタリア・ロシア
+  - Finn       # アイルランド・北欧
+  - Astrid     # 北欧（神の力）
+  - Erik       # 北欧・ドイツ
+  - Ingrid     # 北欧
+  - Elias      # ドイツ・スカンジナビア
+  - Mathis     # フランス・ドイツ
+  - Chiara     # イタリア
+  - Mateo      # スペイン・中南米
+  - Elena      # スペイン・イタリア・ロシア
+  - Hugo       # フランス・スペイン
+
+  # アメリカ（北米・中南米）
+  - Maya       # メキシコ・マヤ文明
+  - Diego      # スペイン語圏
+  - Luna       # 中南米
+  - Caden      # アメリカ
+  - Zara       # 英語圏・アラビア
+
+  # アフリカ
+  - Amara      # スワヒリ・アムハラ（恵み）
+  - Kofi       # ガーナ・アカン（金曜生まれ）
+  - Nia        # スワヒリ（目的）
+  - Tendai     # ジンバブエ・ショナ（感謝）
+  - Imani      # スワヒリ（信仰）
+
+  # スラブ・東欧
+  - Mila       # スラブ（愛しい）
+  - Ivan       # ロシア・スラブ
+  - Vera       # ロシア・スラブ（信仰）
+
+# ロール・スキルのカスタマイズ
+# デフォルトでは全ての名前がどの役割にもなれる。
+# コメントを外して名前ごとに役割・スキルを固定できる。
+
+customizations:
+  # Orchestratorに固定する例:
+  # - name: Kai
+  #   role: orchestrator
+
+  # Workerに固定してスキルを指定する例:
+  # - name: Luca
+  #   role: worker
+  #   skills: [code, python]
+
+  # 使わない名前を除外する例:
+  # - name: Sora
+  #   disabled: true
+
+# スキルタグ一覧（参考）
+# ops        インフラ・サーバー操作
+# bash       シェルスクリプト・コマンド実行
+# code       コーディング全般
+# python     Python
+# typescript TypeScript / JavaScript
+# research   調査・情報収集
+# database   DB操作・クエリ
+# cloud      クラウド（AWS / OCI）
+# docs       ドキュメント作成

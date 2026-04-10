@@ -1,0 +1,27 @@
+# Environment variables
+.env
+.env.*
+.env.local
+.env.production
+
+# Node
+node_modules/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+
+# Secrets
+*.pem
+*.key
+*.p12
+*.secret

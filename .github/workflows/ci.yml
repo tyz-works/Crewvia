@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  shell-validate:
+    name: Shell Validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: bash -n (syntax check)
+        run: |
+          failed=0
+          while IFS= read -r -d '' f; do
+            if ! bash -n "$f" 2>&1; then
+              echo "FAIL: $f"
+              failed=1
+            fi
+          done < <(find . -name "*.sh" -not -path "./.git/*" -print0)
+          exit $failed
+
+      - name: classify_sh.sh (security scan)
+        run: |
+          failed=0
+          while IFS= read -r -d '' f; do
+            result=$(bash scripts/shared/classify_sh.sh "$f" 2>&1)
+            if [[ "$result" == BLOCK* ]]; then
+              echo "BLOCK: $f — $result"
+              failed=1
+            else
+              echo "SAFE: $f"
+            fi
+          done < <(find . -name "*.sh" -not -path "./.git/*" -not -path "./scripts/shared/classify_sh.sh" -print0)
+          exit $failed
+
+  yaml-validate:
+    name: YAML Validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: YAML syntax check
+        run: |
+          python3 - <<'EOF'
+          import sys, pathlib, yaml
+
+          failed = False
+          for p in pathlib.Path('.').rglob('*.yaml'):
+              if '.git' in p.parts:
+                  continue
+              try:
+                  yaml.safe_load(p.read_text())
+              except yaml.YAMLError as e:
+                  print(f"FAIL: {p} — {e}")
+                  failed = True
+
+          sys.exit(1 if failed else 0)
+          EOF

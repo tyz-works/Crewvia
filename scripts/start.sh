@@ -77,9 +77,16 @@ if [[ "${ROLE}" == "worker" ]]; then
     fi
   done
 
-  # Build full prompt: agent.md + knowledge context
+  # Build full prompt: identity header + agent.md + knowledge context
+  NAME_HEADER="# Worker Identity
+
+あなたの名前は **${AGENT_NAME}** です。
+担当スキル: ${SKILLS:-（未指定）}
+
+registry/workers.yaml でこの名前のエントリを確認し、過去の task_count を把握してください。"
+
   BASE_PROMPT="${AGENT_MD:+$(cat "$AGENT_MD")}"
-  FULL_PROMPT="${BASE_PROMPT}${KNOWLEDGE_CONTEXT}"
+  FULL_PROMPT="${NAME_HEADER}"$'\n\n'"${BASE_PROMPT}${KNOWLEDGE_CONTEXT}"
 
   # Update last_active for this worker in registry
   REGISTRY_YAML="${REPO_ROOT}/registry/workers.yaml"

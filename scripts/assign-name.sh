@@ -1,66 +1,53 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# assign-name.sh — Deterministically assign a worker name based on skill tags
+# assign-name.sh — Registry-first worker name assignment
 # Usage: ./scripts/assign-name.sh [skill1 skill2 ...]
-# Example: ./scripts/assign-name.sh ops bash
-# Same skill set always returns the same name.
+# Same skill set returns the registered name, or assigns a new one from the pool.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-NAMES_YAML="${SCRIPT_DIR}/../config/worker-names.yaml"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+NAMES_YAML="${REPO_ROOT}/config/worker-names.yaml"
+REGISTRY_DIR="${REPO_ROOT}/registry"
+REGISTRY_YAML="${REGISTRY_DIR}/workers.yaml"
 
 if [[ ! -f "$NAMES_YAML" ]]; then
   echo "ERROR: worker-names.yaml not found at $NAMES_YAML" >&2
   exit 1
 fi
 
-# Sort skill tags alphabetically and join with space
-if [[ $# -eq 0 ]]; then
-  SORTED_TAGS=""
-else
-  SORTED_TAGS=$(echo "$@" | tr ' ' '\n' | sort | tr '\n' ' ' | sed 's/ $//')
+# Ensure registry directory and file exist
+mkdir -p "$REGISTRY_DIR"
+if [[ ! -f "$REGISTRY_YAML" ]]; then
+  printf 'workers: []\n' > "$REGISTRY_YAML"
 fi
 
-# SHA256 hash of sorted tags
-if command -v sha256sum &>/dev/null; then
-  HASH=$(echo "$SORTED_TAGS" | sha256sum | awk '{print $1}')
-else
-  HASH=$(echo "$SORTED_TAGS" | shasum -a 256 | awk '{print $1}')
-fi
-
-# First 8 hex chars → decimal
-HASH8="${HASH:0:8}"
-HASH_DEC=$(python3 -c "print(int('$HASH8', 16))")
-
-# Read names and customizations from YAML using python3
-python3 - "$NAMES_YAML" "$SORTED_TAGS" "$HASH_DEC" "$@" <<'PYEOF'
+# Registry-first lookup and assignment via python3
+python3 - "$NAMES_YAML" "$REGISTRY_YAML" "$@" <<'PYEOF'
 import sys
 import re
+from datetime import date
 
-yaml_path = sys.argv[1]
-sorted_tags_str = sys.argv[2]
-hash_dec = int(sys.argv[3])
-input_skills = set(sys.argv[4:]) if len(sys.argv) > 4 else set()
+names_yaml_path = sys.argv[1]
+registry_yaml_path = sys.argv[2]
+input_skills = sorted(sys.argv[3:]) if len(sys.argv) > 3 else []
+input_skills_set = set(input_skills)
 
-# Minimal YAML parser for worker-names.yaml structure
+
 def parse_worker_names(path):
+    """Parse config/worker-names.yaml → (names list, custom_map dict)."""
     names = []
     customizations = []
+    section = None
+    current_custom = None
 
     with open(path) as f:
         lines = f.readlines()
 
-    section = None
-    current_custom = None
-
     for line in lines:
-        stripped = line.rstrip()
-        # Skip comments and blank lines
-        content = re.sub(r'\s*#.*$', '', stripped).rstrip()
+        content = re.sub(r'\s*#.*$', '', line.rstrip()).rstrip()
         if not content:
             continue
-
-        # Detect section headers
         if content == 'names:':
             section = 'names'
             continue
@@ -69,13 +56,11 @@ def parse_worker_names(path):
             continue
 
         if section == 'names':
-            # Match list items: "  - Name"
             m = re.match(r'^\s+-\s+(\S+)', content)
             if m:
                 names.append(m.group(1))
 
         elif section == 'customizations':
-            # Match "  - name: Foo"
             m = re.match(r'^\s+-\s+name:\s+(\S+)', content)
             if m:
                 if current_custom is not None:
@@ -83,60 +68,124 @@ def parse_worker_names(path):
                 current_custom = {'name': m.group(1)}
                 continue
             if current_custom is not None:
-                # role
                 m = re.match(r'^\s+role:\s+(\S+)', content)
                 if m:
                     current_custom['role'] = m.group(1)
                     continue
-                # disabled
                 m = re.match(r'^\s+disabled:\s+(\S+)', content)
                 if m:
                     current_custom['disabled'] = (m.group(1).lower() == 'true')
                     continue
-                # skills: [a, b]
                 m = re.match(r'^\s+skills:\s+\[([^\]]*)\]', content)
                 if m:
-                    skill_list = [s.strip() for s in m.group(1).split(',') if s.strip()]
-                    current_custom['skills'] = skill_list
+                    current_custom['skills'] = [s.strip() for s in m.group(1).split(',') if s.strip()]
                     continue
 
     if current_custom is not None:
         customizations.append(current_custom)
 
-    return names, customizations
+    return names, {c['name']: c for c in customizations}
 
-names, customizations = parse_worker_names(yaml_path)
 
-# Build lookup for customizations
-custom_map = {c['name']: c for c in customizations}
+def parse_registry(path):
+    """Parse registry/workers.yaml → list of worker dicts."""
+    workers = []
+    current = None
 
-# Filter names based on customization rules
-def is_eligible(name, input_skills):
+    with open(path) as f:
+        lines = f.readlines()
+
+    for line in lines:
+        content = re.sub(r'\s*#.*$', '', line.rstrip()).rstrip()
+        if not content or content in ('workers:', 'workers: []'):
+            continue
+        m = re.match(r'^\s+-\s+name:\s+(\S+)', content)
+        if m:
+            if current is not None:
+                workers.append(current)
+            current = {'name': m.group(1), 'skills': [], 'task_count': 0, 'last_active': ''}
+            continue
+        if current is not None:
+            m = re.match(r'^\s+skills:\s+\[([^\]]*)\]', content)
+            if m:
+                current['skills'] = [s.strip() for s in m.group(1).split(',') if s.strip()]
+                continue
+            m = re.match(r'^\s+task_count:\s+(\d+)', content)
+            if m:
+                current['task_count'] = int(m.group(1))
+                continue
+            m = re.match(r'^\s+last_active:\s+(\S+)', content)
+            if m:
+                current['last_active'] = m.group(1)
+                continue
+
+    if current is not None:
+        workers.append(current)
+    return workers
+
+
+def write_registry(path, workers):
+    """Write worker list back to registry/workers.yaml."""
+    lines = ['workers:\n']
+    for w in workers:
+        skills_str = ', '.join(w['skills'])
+        lines.append(f"  - name: {w['name']}\n")
+        lines.append(f"    skills: [{skills_str}]\n")
+        lines.append(f"    task_count: {w['task_count']}\n")
+        lines.append(f"    last_active: {w['last_active']}\n")
+    with open(path, 'w') as f:
+        f.writelines(lines)
+
+
+pool_names, custom_map = parse_worker_names(names_yaml_path)
+registry = parse_registry(registry_yaml_path)
+
+# Step 2: Return existing name if same skill set is already registered
+for w in registry:
+    if set(w['skills']) == input_skills_set:
+        print(w['name'])
+        sys.exit(0)
+
+# Step 3: Find first eligible name not already in registry
+registered_names = {w['name'] for w in registry}
+
+
+def is_pool_eligible(name):
     c = custom_map.get(name)
     if c is None:
-        # No customization — eligible for any worker assignment
         return True
-    # disabled names are always excluded
     if c.get('disabled'):
         return False
-    # orchestrator-fixed names excluded for worker assignment
     if c.get('role') == 'orchestrator':
         return False
-    # skills-fixed names: only match if input skills exactly equal the fixed skills
-    if 'skills' in c:
-        fixed = set(c['skills'])
-        if input_skills != fixed:
-            return False
     return True
 
-# Build eligible list (preserving order, shifting index on disabled/excluded)
-eligible = [n for n in names if is_eligible(n, input_skills)]
 
-if not eligible:
-    echo_result = names[hash_dec % len(names)] if names else "Unknown"
-    print(echo_result)
-    sys.exit(0)
+chosen = None
+for name in pool_names:
+    if is_pool_eligible(name) and name not in registered_names:
+        chosen = name
+        break
 
-index = hash_dec % len(eligible)
-print(eligible[index])
+if chosen is None:
+    # Fallback: reuse first eligible name
+    for name in pool_names:
+        if is_pool_eligible(name):
+            chosen = name
+            break
+
+if chosen is None:
+    chosen = "Unknown"
+
+# Step 4: Append new worker to registry
+registry.append({
+    'name': chosen,
+    'skills': input_skills,
+    'task_count': 0,
+    'last_active': str(date.today()),
+})
+write_registry(registry_yaml_path, registry)
+
+# Step 5: Output name
+print(chosen)
 PYEOF

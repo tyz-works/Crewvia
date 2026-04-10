@@ -20,11 +20,11 @@ shift || true
 case "$ROLE" in
   orchestrator)
     AGENT_FILE="agents/orchestrator.md"
-    SKILLS=()
+    SKILLS_ARR=()
     ;;
   worker)
     AGENT_FILE="agents/worker.md"
-    SKILLS=("$@")
+    SKILLS_ARR=("$@")
     ;;
   *)
     echo "ERROR: Unknown role '$ROLE'. Use 'orchestrator' or 'worker'." >&2
@@ -36,11 +36,19 @@ esac
 if [[ "${ROLE}" == "orchestrator" ]]; then
   AGENT_NAME=$(bash "${SCRIPT_DIR}/assign-name.sh")
 else
-  AGENT_NAME=$(bash "${SCRIPT_DIR}/assign-name.sh" "${SKILLS[@]+"${SKILLS[@]}"}")
+  AGENT_NAME=$(bash "${SCRIPT_DIR}/assign-name.sh" "${SKILLS_ARR[@]+"${SKILLS_ARR[@]}"}")
 fi
 
 export AGENT_NAME
+export ROLE
 export TASKVIA_URL="${TASKVIA_URL:-https://taskvia.vercel.app}"
+
+# Export SKILLS as comma-separated env var
+if [[ ${#SKILLS_ARR[@]} -gt 0 ]]; then
+  export SKILLS="$(IFS=','; echo "${SKILLS_ARR[*]}")"
+else
+  export SKILLS=""
+fi
 
 echo "[crewvia] Starting as $AGENT_NAME ($ROLE)"
 
@@ -56,10 +64,60 @@ if [[ ! -f "$AGENT_MD" ]]; then
   AGENT_MD=""
 fi
 
-# Build the --append-system-prompt flag value
-SYSTEM_PROMPT_FLAG=()
-if [[ -n "$AGENT_MD" ]]; then
-  SYSTEM_PROMPT_FLAG=(--append-system-prompt "$(cat "$AGENT_MD")")
+# --- Worker: load knowledge files and update registry last_active ---
+FULL_PROMPT=""
+
+if [[ "${ROLE}" == "worker" ]]; then
+  # Build knowledge context from per-skill knowledge files
+  KNOWLEDGE_CONTEXT=""
+  for skill in "${SKILLS_ARR[@]+"${SKILLS_ARR[@]}"}"; do
+    KNOWLEDGE_FILE="${REPO_ROOT}/knowledge/${skill}.md"
+    if [[ -f "$KNOWLEDGE_FILE" ]] && [[ -s "$KNOWLEDGE_FILE" ]]; then
+      KNOWLEDGE_CONTEXT+=$'\n\n'"## ${skill} ナレッジベース"$'\n'"$(cat "$KNOWLEDGE_FILE")"
+    fi
+  done
+
+  # Build full prompt: agent.md + knowledge context
+  BASE_PROMPT="${AGENT_MD:+$(cat "$AGENT_MD")}"
+  FULL_PROMPT="${BASE_PROMPT}${KNOWLEDGE_CONTEXT}"
+
+  # Update last_active for this worker in registry
+  REGISTRY_YAML="${REPO_ROOT}/registry/workers.yaml"
+  if [[ -f "$REGISTRY_YAML" ]]; then
+    python3 - "$REGISTRY_YAML" "$AGENT_NAME" <<'PYEOF'
+import sys, re
+from datetime import date
+
+path, agent_name = sys.argv[1], sys.argv[2]
+today = str(date.today())
+
+with open(path) as f:
+    lines = f.readlines()
+
+in_target = False
+result = []
+for line in lines:
+    m_name = re.match(r'^\s+-\s+name:\s+(\S+)', line)
+    if m_name:
+        in_target = (m_name.group(1) == agent_name)
+    if in_target and re.match(r'^\s+last_active:', line):
+        line = re.sub(r'(last_active:\s+)\S+', rf'\g<1>{today}', line)
+    result.append(line)
+
+with open(path, 'w') as f:
+    f.writelines(result)
+PYEOF
+  fi
+
+else
+  # Orchestrator: use agent.md as-is
+  FULL_PROMPT="${AGENT_MD:+$(cat "$AGENT_MD")}"
+fi
+
+# Build prompt flag
+PROMPT_FLAG=()
+if [[ -n "$FULL_PROMPT" ]]; then
+  PROMPT_FLAG=(--append-system-prompt "$FULL_PROMPT")
 fi
 
 # Launch with or without tmux
@@ -67,11 +125,17 @@ if [[ "${CREWVIA_TMUX:-0}" == "1" ]]; then
   SESSION="crewvia"
   WINDOW_NAME="${AGENT_NAME}-${ROLE}"
 
-  # Write a bootstrap env file so tmux windows pick up env vars
-  ENV_EXPORTS="export AGENT_NAME='$AGENT_NAME' TASKVIA_URL='$TASKVIA_URL' ROLE='$ROLE'"
+  ENV_EXPORTS="export AGENT_NAME='$AGENT_NAME' TASKVIA_URL='$TASKVIA_URL' ROLE='$ROLE' SKILLS='${SKILLS:-}'"
   [[ -n "${TASKVIA_TOKEN:-}" ]] && ENV_EXPORTS+=" TASKVIA_TOKEN='$TASKVIA_TOKEN'"
 
-  LAUNCH_CMD="$ENV_EXPORTS; cd '$REPO_ROOT'; claude${AGENT_MD:+ --append-system-prompt \"\$(cat '$AGENT_MD')\"}"
+  if [[ -n "$FULL_PROMPT" ]]; then
+    # Write prompt to temp file to avoid quoting issues with large content in send-keys
+    PROMPT_TMPFILE=$(mktemp /tmp/crewvia_prompt_XXXXXX.txt)
+    printf '%s' "$FULL_PROMPT" > "$PROMPT_TMPFILE"
+    LAUNCH_CMD="$ENV_EXPORTS; cd '$REPO_ROOT'; claude --append-system-prompt \"\$(cat '${PROMPT_TMPFILE}')\""
+  else
+    LAUNCH_CMD="$ENV_EXPORTS; cd '$REPO_ROOT'; claude"
+  fi
 
   if ! tmux has-session -t "$SESSION" 2>/dev/null; then
     echo "[crewvia] Creating tmux session: $SESSION"
@@ -87,5 +151,5 @@ if [[ "${CREWVIA_TMUX:-0}" == "1" ]]; then
   echo "[crewvia] Agent launched in tmux window: ${SESSION}:${WINDOW_NAME}"
 else
   # Default: run inline (no tmux)
-  exec claude "${SYSTEM_PROMPT_FLAG[@]}"
+  exec claude "${PROMPT_FLAG[@]+"${PROMPT_FLAG[@]}"}"
 fi

@@ -38,6 +38,32 @@
 
 環境変数が未設定の場合はエラーを出力して停止せよ。
 
+### registry からチーム構成を把握する
+
+環境変数確認後、`registry/workers.yaml` を読み込み、既存チームの構成を把握せよ：
+
+```bash
+# registry の読み込み
+REGISTRY_FILE="registry/workers.yaml"
+if [ -f "$REGISTRY_FILE" ]; then
+  echo "=== 現在のチーム構成 ==="
+  cat "$REGISTRY_FILE"
+else
+  echo "[INFO] registry が存在しません。全Workerが新規扱いです。"
+fi
+```
+
+registryから以下の情報を把握する：
+
+- **担当スキル** (`skills`): どのスキルを持つWorkerか
+- **経験値** (`task_count`): 担当タスク数。数が多いほど熟練
+- **最終稼働日** (`last_active`): 直近の稼働時期
+
+**例**: `Hana (code, typescript, task_count=12)` — 経験豊富なコード担当Worker
+
+`workers: []`（空）または registry ファイルが存在しない場合は、全Workerが新規。
+`assign-name.sh` を使って名前を割り当て、完了後に registry を更新する。
+
 ---
 
 ## 3. ミッション受領とタスク分解
@@ -77,16 +103,61 @@
 
 ## 4. Worker名の決定手順
 
-Worker割り当て時は必ず `scripts/assign-name.sh` を呼び出してAGENT_NAMEを決定せよ。
+Worker割り当て時は、まず `registry/workers.yaml` で同スキルの担当履歴を確認してから名前を決定せよ。
+担当履歴があるWorkerを優先することで、スキルの継続性とナレッジ継承を保証する。
 
-```bash
-# スキルセットを渡してWorker名を取得
-WORKER_NAME=$(./scripts/assign-name.sh --skills "ops,bash")
+### 基本フロー
+
+```
+1. registry/workers.yaml で要求スキルを検索
+   ├─ 担当履歴あり → そのWorkerを名指しで呼ぶ（ナレッジ継承のため）
+   └─ 担当履歴なし → scripts/assign-name.sh で新規割り当て
+
+2. 同スキルのWorkerが複数必要な場合:
+   ├─ 1人目: registryの担当Worker（既存・ナレッジ継承）
+   └─ 2人目以降: assign-name.sh で新規割り当て
+      ※ knowledge/{skill}.md は全員が共有して読み込む
 ```
 
-- 同じスキルセットには常に同じ名前が返される（継続性の保証）
-- 名前プールは `config/worker-names.yaml` で管理される
+### registry 参照手順
+
+```bash
+REQUIRED_SKILL="ops"  # 要求スキル（単一）
+
+# registry で担当Workerを検索
+EXISTING_WORKER=$(yq eval \
+  ".workers[] | select(.skills[] == \"$REQUIRED_SKILL\") | .name" \
+  registry/workers.yaml 2>/dev/null | head -1)
+
+if [ -n "$EXISTING_WORKER" ]; then
+  # 担当履歴あり → 名指しで呼ぶ
+  WORKER_NAME="$EXISTING_WORKER"
+  echo "[INFO] 担当Worker: $WORKER_NAME (スキル継続・ナレッジ引き継ぎ)"
+else
+  # 担当履歴なし → 新規割り当て
+  WORKER_NAME=$(./scripts/assign-name.sh --skills "$REQUIRED_SKILL")
+  echo "[INFO] 新規Worker割り当て: $WORKER_NAME"
+fi
+```
+
+### 複数Workerが必要な場合
+
+```bash
+SKILL="code"
+
+# 1人目: registry から既存Worker（担当履歴あり優先）
+WORKER_1=$(yq eval \
+  ".workers[] | select(.skills[] == \"$SKILL\") | .name" \
+  registry/workers.yaml 2>/dev/null | head -1)
+[ -z "$WORKER_1" ] && WORKER_1=$(./scripts/assign-name.sh --skills "$SKILL")
+
+# 2人目以降: 新規割り当て（既存名を除外）
+WORKER_2=$(./scripts/assign-name.sh --skills "$SKILL" --exclude "$WORKER_1")
+```
+
 - 返された名前を `AGENT_NAME` 環境変数としてWorkerに渡す
+- 名前プールは `config/worker-names.yaml` で管理される
+- registry が存在しない場合は `assign-name.sh` のみで決定してよい
 
 ---
 

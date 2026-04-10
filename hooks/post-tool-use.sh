@@ -52,4 +52,19 @@ curl -sf -X POST "${TASKVIA_URL}/api/log" \
   -H "Authorization: Bearer ${TASKVIA_TOKEN}" \
   -d "$PAYLOAD" >/dev/null 2>&1 || true
 
+# SKILLS と AGENT_NAME が設定されている場合のみ knowledge ログを追記
+# SKILLS は カンマ区切り（例: "code,typescript"）
+if [[ -n "${SKILLS:-}" ]] && [[ -n "${AGENT_NAME:-}" ]]; then
+  REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+  IFS=',' read -ra SKILL_ARRAY <<< "$SKILLS"
+  for skill in "${SKILL_ARRAY[@]}"; do
+    KNOWLEDGE_FILE="${REPO_ROOT}/knowledge/${skill}.md"
+    if [[ -f "$KNOWLEDGE_FILE" ]] && [[ -n "${TASK_ID:-}" ]]; then
+      printf "\n<!-- log: %s %s %s -->\n" \
+        "$(date +%Y-%m-%d)" "${TASK_ID}" "${TOOL_NAME:-unknown}" \
+        >> "$KNOWLEDGE_FILE" 2>/dev/null || true
+    fi
+  done
+fi
+
 exit 0

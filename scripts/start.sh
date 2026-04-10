@@ -9,6 +9,19 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+# --- crewvia.yaml からシステム設定を読み込む ---
+# 環境変数が既に設定されていれば config より優先される。
+# wip_limit 以外の設定を追加する場合はここにロード処理を足す。
+CONFIG_FILE="${REPO_ROOT}/config/crewvia.yaml"
+if [[ -f "$CONFIG_FILE" ]] && [[ -z "${CREWVIA_WIP_LIMIT:-}" ]]; then
+  WIP_FROM_CONFIG=$(grep -E '^wip_limit:[[:space:]]*[0-9]+' "$CONFIG_FILE" | awk '{print $2}' | tr -d '"' | head -1)
+  if [[ -n "$WIP_FROM_CONFIG" ]]; then
+    export CREWVIA_WIP_LIMIT="$WIP_FROM_CONFIG"
+  fi
+fi
+# Default fallback（config ファイル無しでも必ず値が入る）
+export CREWVIA_WIP_LIMIT="${CREWVIA_WIP_LIMIT:-8}"
+
 if [[ $# -eq 0 ]]; then
   echo "Usage: $0 orchestrator | worker [skill1 skill2 ...]" >&2
   exit 1
@@ -111,6 +124,38 @@ PYEOF
   fi
 else
   AGENT_NAME=$(bash "${SCRIPT_DIR}/assign-name.sh" "${SKILLS_ARR[@]+"${SKILLS_ARR[@]}"}")
+fi
+
+# --- tmux モード選択（Orchestrator 起動時のみ、CREWVIA_TMUX 未設定時のみ） ---
+# Orchestrator が tmux モードを選ぶと、この env は exec claude に引き継がれ、
+# Orchestrator が後続で起動する Worker もすべて tmux ウィンドウで動く。
+if [[ "${ROLE}" == "orchestrator" ]] && [[ -z "${CREWVIA_TMUX:-}" ]]; then
+  if ! command -v tmux >/dev/null 2>&1; then
+    echo "[crewvia] tmux 未検出 → インラインモードで起動します。" >&2
+    echo "          （並列 Worker 起動には 'brew install tmux' を推奨）" >&2
+    export CREWVIA_TMUX=0
+  elif [[ ! -e /dev/tty ]]; then
+    # 非対話環境（CI など）: tmux モードはスキップ
+    export CREWVIA_TMUX=0
+  else
+    echo ""
+    echo "[crewvia] tmux を使ってマルチエージェント並列モードで起動しますか？"
+    echo "          Y = tmux モード（Orchestrator と Worker を crewvia セッションに展開）"
+    echo "          n = インラインモード（Worker 並列起動不可、単独セッション）"
+    printf "> [Y/n]: "
+    read -r TMUX_CHOICE </dev/tty || TMUX_CHOICE=""
+    case "$TMUX_CHOICE" in
+      n|N|no|No|NO)
+        export CREWVIA_TMUX=0
+        echo "[crewvia] インラインモードで起動します。"
+        ;;
+      *)
+        export CREWVIA_TMUX=1
+        echo "[crewvia] tmux モードで起動します（セッション名: crewvia）。"
+        echo "          別ターミナルから 'tmux attach -t crewvia' で覗けます。"
+        ;;
+    esac
+  fi
 fi
 
 export AGENT_NAME

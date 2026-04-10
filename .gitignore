@@ -25,3 +25,7 @@ Thumbs.db
 *.key
 *.p12
 *.secret
+
+# Crewvia runtime state (per-session)
+queue/
+registry/heartbeats/

@@ -103,7 +103,7 @@ def parse_registry(path):
         if m:
             if current is not None:
                 workers.append(current)
-            current = {'name': m.group(1), 'skills': [], 'task_count': 0, 'last_active': ''}
+            current = {'name': m.group(1), 'skills': [], 'task_count': 0, 'last_active': '', 'role': ''}
             continue
         if current is not None:
             m = re.match(r'^\s+skills:\s+\[([^\]]*)\]', content)
@@ -117,6 +117,10 @@ def parse_registry(path):
             m = re.match(r'^\s+last_active:\s+(\S+)', content)
             if m:
                 current['last_active'] = m.group(1)
+                continue
+            m = re.match(r'^\s+role:\s+(\S+)', content)
+            if m:
+                current['role'] = m.group(1)
                 continue
 
     if current is not None:
@@ -147,7 +151,10 @@ for w in registry:
         sys.exit(0)
 
 # Step 3: Find first eligible name not already in registry
-registered_names = {w['name'] for w in registry}
+# Exclude names registered as orchestrator
+registered_names = {w['name'] for w in registry if w.get('role') != 'orchestrator'}
+orchestrator_names = {w['name'] for w in registry if w.get('role') == 'orchestrator'}
+registered_names |= orchestrator_names
 
 
 def is_pool_eligible(name):

@@ -32,9 +32,83 @@ case "$ROLE" in
     ;;
 esac
 
-# Determine AGENT_NAME via assign-name.sh
+# Determine AGENT_NAME
+REGISTRY_YAML="${REPO_ROOT}/registry/workers.yaml"
+
 if [[ "${ROLE}" == "orchestrator" ]]; then
-  AGENT_NAME=$(bash "${SCRIPT_DIR}/assign-name.sh")
+  # Check if an orchestrator is already registered
+  EXISTING_ORCH=$(python3 - "$REGISTRY_YAML" <<'PYEOF'
+import sys, re
+
+path = sys.argv[1]
+try:
+    with open(path) as f:
+        lines = f.readlines()
+except FileNotFoundError:
+    sys.exit(0)
+
+current = None
+for line in lines:
+    content = re.sub(r'\s*#.*$', '', line.rstrip()).rstrip()
+    if not content:
+        continue
+    m = re.match(r'^\s+-\s+name:\s+(\S+)', content)
+    if m:
+        current = {'name': m.group(1)}
+        continue
+    if current is not None:
+        if re.match(r'^\s+role:\s+orchestrator', content):
+            print(current['name'])
+            sys.exit(0)
+PYEOF
+)
+
+  if [[ -n "$EXISTING_ORCH" ]]; then
+    AGENT_NAME="$EXISTING_ORCH"
+  else
+    # First launch: prompt for name or use random
+    echo ""
+    echo "[crewvia] 初回起動です。Orchestrator の名前を入力してください。"
+    echo "          半角英字のみ（例: Alex）。Enter で自動割り当て。"
+    printf "> "
+    read -r INPUT_NAME </dev/tty || INPUT_NAME=""
+    if [[ "$INPUT_NAME" =~ ^[a-zA-Z]+$ ]]; then
+      AGENT_NAME="$INPUT_NAME"
+    else
+      AGENT_NAME=$(bash "${SCRIPT_DIR}/assign-name.sh")
+    fi
+    # Register orchestrator in registry
+    mkdir -p "${REPO_ROOT}/registry"
+    python3 - "$REGISTRY_YAML" "$AGENT_NAME" <<'PYEOF'
+import sys, re
+from datetime import date
+
+path, name = sys.argv[1], sys.argv[2]
+today = str(date.today())
+
+try:
+    with open(path) as f:
+        content = f.read()
+except FileNotFoundError:
+    content = 'workers: []\n'
+
+entry = (
+    f"  - name: {name}\n"
+    f"    role: orchestrator\n"
+    f"    task_count: 0\n"
+    f"    last_active: {today}\n"
+)
+
+if content.strip() == 'workers: []' or content.strip() == 'workers:':
+    content = f"workers:\n{entry}"
+else:
+    content = content.rstrip('\n') + '\n' + entry
+
+with open(path, 'w') as f:
+    f.write(content)
+PYEOF
+    echo "[crewvia] Orchestrator '${AGENT_NAME}' を registry に登録しました。"
+  fi
 else
   AGENT_NAME=$(bash "${SCRIPT_DIR}/assign-name.sh" "${SKILLS_ARR[@]+"${SKILLS_ARR[@]}"}")
 fi
@@ -117,8 +191,15 @@ PYEOF
   fi
 
 else
-  # Orchestrator: use agent.md as-is
-  FULL_PROMPT="${AGENT_MD:+$(cat "$AGENT_MD")}"
+  # Orchestrator: identity header + agent.md
+  NAME_HEADER="# Orchestrator Identity
+
+あなたの名前は **${AGENT_NAME}** です。
+
+registry/workers.yaml を読んで現在のチーム構成を把握してください。"
+
+  BASE_PROMPT="${AGENT_MD:+$(cat "$AGENT_MD")}"
+  FULL_PROMPT="${NAME_HEADER}"$'\n\n'"${BASE_PROMPT}"
 fi
 
 # Build prompt flag

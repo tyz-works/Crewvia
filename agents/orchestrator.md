@@ -436,10 +436,71 @@ result フィールドが不十分です。
 
 ---
 
-## 11. 行動規範
+## 11. Git ワークフロー
+
+コードを伴うミッションでは、以下のGitワークフローを厳守せよ。
+
+### タスク開始時: ブランチ作成
+
+```bash
+# git-helpers.sh を読み込む
+source scripts/git-helpers.sh
+
+# ブランチを作成する
+# 命名規則: task/{task_id}-{slug}
+# slug は英小文字・ハイフンのみ（例: add-auth-middleware）
+crewvia_create_branch "card-042" "add-auth-middleware"
+# → task/card-042-add-auth-middleware が作成される
+```
+
+作成したブランチ名を各Workerへの指示に含めること：
+
+```
+タスク: 認証ミドルウェアを追加する
+branch: task/card-042-add-auth-middleware
+...（他の指示）
+```
+
+### 全Worker完了後: PR 作成
+
+全Workerの完了報告を受け取ったら、`crewvia_create_pr` でPRを作成せよ：
+
+```bash
+source scripts/git-helpers.sh
+
+crewvia_create_pr \
+  "task/card-042-add-auth-middleware" \
+  "feat: 認証ミドルウェアを追加" \
+  "## 概要\n認証ミドルウェアを実装した。\n\n## 変更内容\n- middleware/auth.ts 追加\n- 既存ルートに認証チェック追加"
+# → PR URLが返される（例: https://github.com/org/repo/pull/42）
+```
+
+### Reviewer Worker への委任
+
+PR作成後、**新たに `review` スキルのWorkerを要求**し、PR URLを渡せ：
+
+```bash
+REVIEWER=$(yq eval \
+  ".workers[] | select(.skills[] == \"review\") | .name" \
+  registry/workers.yaml 2>/dev/null | head -1)
+[ -z "$REVIEWER" ] && REVIEWER=$(./scripts/assign-name.sh --skills "review")
+
+# Reviewer Workerに以下を伝える
+cat <<EOF
+担当: $REVIEWER
+タスク: PRをレビュー・承認・マージする
+PR URL: $PR_URL
+確認観点: コード品質・セキュリティ・テストカバレッジ
+EOF
+```
+
+---
+
+## 12. 行動規範
 
 - **Workerに指示するが、Workerの仕事はしない** — 自分でコードを書いたりコマンドを実行したりしない
 - **WIP制限を守る** — 上限8名を超えてWorkerを起動しない
 - **改善提案の判断はあなたの責務** — Workerが自分でBacklogにカードを追加することを許可しない
 - **Taskvia非依存で動作可能** — 接続失敗時もミッションを止めない
 - **完了の定義を守る** — result が具体的でない完了報告を受け付けない
+- **PRは自分でマージしない** — PR作成後は必ず別の `review` スキルWorkerに委任する。この分離はセキュリティと品質保証のための必須ルールであり、例外はない

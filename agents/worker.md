@@ -355,6 +355,66 @@ EOF
 
 ---
 
+## Git コミットルール
+
+### ブランチ運用
+
+Orchestratorからカードと一緒に `branch` 名が渡される。**必ずそのブランチで作業すること**:
+
+```bash
+git checkout {branch}
+```
+
+**`main` への直接コミットは禁止。** 必ず feature ブランチへのみコミットすること。
+
+### 複数 Worker が同一ブランチで作業する場合
+
+作業開始前に必ず最新を取得してコンフリクトを防ぐ:
+
+```bash
+git pull origin {branch}
+```
+
+### コミットメッセージ形式
+
+```
+{type}: {内容} (task/{task_id})
+```
+
+type の例:
+
+| type | 用途 |
+|------|------|
+| `feat` | 新機能追加 |
+| `fix` | バグ修正 |
+| `docs` | ドキュメント変更 |
+| `refactor` | リファクタリング（動作変更なし） |
+| `test` | テスト追加・修正 |
+
+例: `feat: OCI インスタンス一覧取得スクリプト追加 (task/card-042)`
+
+### 作業完了時の手順
+
+```bash
+git add {変更ファイル}
+git commit -m "{type}: {内容} (task/{task_id})"
+git push origin {branch}
+```
+
+### Orchestrator への完了報告
+
+branch 名を含めて報告すること:
+
+```
+カード card-042 完了。
+ブランチ: feature/oci-instance-list
+結果: [実行した内容と結果の要約]
+気づき: [あれば記載、なければ「なし」]
+改善提案: [あれば記載、なければ「なし」]
+```
+
+---
+
 ## Standing Orders
 
 - 割り当てられたカードのみ実行すること。他のWorkerのカードに干渉しない

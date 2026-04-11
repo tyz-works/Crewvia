@@ -78,6 +78,29 @@ registryから以下の情報を把握する：
 
 不明点があればユーザーに確認してから分解に進め。
 
+### ファイルレイアウト（per-task / multi-mission）
+
+```
+queue/
+  state.yaml                          # active mission slug リスト + default_mission
+  missions/
+    20260411-auth-refactor/
+      mission.yaml                    # title / status / next_task_id
+      tasks/
+        t001.md                       # frontmatter + Description / Result
+        t002.md
+    20260412-billing-api/
+      mission.yaml
+      tasks/
+        t001.md
+  archive/                            # 完了 mission の退避先
+```
+
+- 1 mission = 1 ディレクトリ。task は `tNNN.md` の per-file。
+- task は **mission ごとに自動採番**されるため、別 mission の `t001` 同士は共存可能。
+- 複数 mission を同時に走らせられる。`default_mission` は最後に init した mission。
+- `plan.sh` の各コマンドは `--mission <slug>` を取る。省略時は `default_mission` を使う。
+
 ### プランファースト フロー
 
 ```
@@ -85,11 +108,11 @@ registryから以下の情報を把握する：
   ↓
 タスクを独立単位に分解
   ↓
-plan.sh init "<mission>" でプランを初期化
+plan.sh init "<title>" でプランを初期化（slug は自動生成、または --mission で明示）
   ↓
 plan.sh add で全タスクを登録（依存関係・スキル・優先度を設定）
   ↓
-plan.sh status で登録内容を確認
+plan.sh status --mission <slug> で登録内容を確認
   ↓
 必要なスキルセットで Workers を起動:
   bash scripts/start.sh worker <skill1> [skill2]
@@ -97,30 +120,39 @@ plan.sh status で登録内容を確認
   ↓
 plan.sh status を定期確認（watchdog が liveness も監視）
   ↓
-全タスク done → ユーザーへ報告
+mission.yaml status: done → plan.sh archive <slug> で退避 → ユーザーへ報告
 ```
+
+複数 mission を並走させる場合は、各 mission に対してこのフローを独立に回す。Workers は active 全 mission を default 優先で横断的に pull するため、特に追加設定は要らない。
 
 ### plan.sh コマンド一覧
 
-**重要**: task id は `t001`, `t002`, ... の形で **自動採番** される（`--id` フラグは無い）。タスクタイトルは第1位置引数で渡す。オプションのフラグ名はすべて **ハイフン区切り**（`--blocked-by` であって `--blocked_by` ではない）。
+**重要**:
+- task id は `t001`, `t002`, ... の形で **mission ごとに自動採番**される（`--id` フラグは無い）。
+- mission slug は `init` 時に自動生成（`YYYYMMDD-<title-ascii>` または `YYYYMMDD-<hash>`）、あるいは `--mission <slug>` で明示。
+- オプションのフラグ名はすべて **ハイフン区切り**（`--blocked-by` であって `--blocked_by` ではない）。
 
 ```bash
-# プランを初期化（ミッション名を設定）
+# プランを初期化（slug 自動生成）
 ./scripts/plan.sh init "認証システムをリファクタリングする"
+# → Initialized mission: 20260411-d9aad760
+# slug を明示したい場合
+./scripts/plan.sh init "認証システムをリファクタリングする" --mission 20260411-auth-refactor
 
-# 既存 plan.yaml を上書きして再初期化する場合
-./scripts/plan.sh init "..." --force
+# 既存 mission を上書きして再初期化
+./scripts/plan.sh init "..." --mission <slug> --force
 
-# タスクを追加（id は自動採番。返り値で "Added: t001 — <title>" が出る）
+# タスクを追加（--mission 省略時は default_mission に追加される）
 ./scripts/plan.sh add "既存認証コードの調査・設計" \
   --skills "research,code" \
   --priority high \
   --description "既存実装を読み、新設計のドラフトを書き出す"
+# → Added: 20260411-auth-refactor/t001 — 既存認証コードの調査・設計
 
 ./scripts/plan.sh add "新認証ミドルウェアの実装" \
   --skills "code,typescript" \
   --priority high \
-  --blocked-by "t001"   # t001 完了後に解除
+  --blocked-by "t001"
 
 ./scripts/plan.sh add "テスト作成" \
   --skills "code" \
@@ -132,14 +164,26 @@ plan.sh status を定期確認（watchdog が liveness も監視）
   --skills "review" \
   --blocked-by "t001,t002,t003"
 
-# プラン全体のステータスを確認（テキスト表示）
-./scripts/plan.sh status
+# 別の mission にタスクを追加するときは --mission を明示
+./scripts/plan.sh add "billing API スキーマ" \
+  --mission 20260412-billing-api \
+  --skills "docs" --priority high
+
+# ステータス確認
+./scripts/plan.sh status                              # active 全 mission の要約
+./scripts/plan.sh status --mission <slug>             # 1 mission の詳細
+./scripts/plan.sh status --all                        # archive 含めて全件
 
 # タスク完了を記録（Worker 完了報告の受領後に Orchestrator が実行）
-./scripts/plan.sh done t002 "実装完了。middleware/auth.ts を追加しルート全件に適用。"
+./scripts/plan.sh done t002 "実装完了。middleware/auth.ts を追加しルート全件に適用。" \
+  --mission 20260411-auth-refactor
+# → --mission 省略時は active mission を検索。複数 mission に同 ID が存在すると曖昧エラー。
+
+# 完了 mission を archive へ退避
+./scripts/plan.sh archive 20260411-auth-refactor
 ```
 
-**利用可能なサブコマンド**: `init` / `add` / `pull` / `done` / `status`。
+**利用可能なサブコマンド**: `init` / `add` / `pull` / `done` / `status` / `archive`。
 `pull` は Worker が使うもので、Orchestrator が直接呼ぶことはない。
 
 ### タスク分解の原則
@@ -313,11 +357,11 @@ Orchestrator はこの env を直接参照すればよい。
 
 ### WIP確認手順
 
-`plan.sh status` は JSON 出力をまだサポートしていない（改善 Backlog 済み）。当面はテキスト出力を grep で数える。
+`plan.sh status` は JSON 出力をまだサポートしていない（改善 Backlog 済み）。当面はテキスト出力を grep で数える。デフォルト出力は active 全 mission を横断するので、稼働中 Worker は active 全体に対して数えられる。
 
 ```bash
-# 現在稼働中の Worker 数を確認（"(進行中)" マーカを数える）
-RUNNING=$(./scripts/plan.sh status 2>/dev/null | grep -c "(進行中)")
+# 現在稼働中の Worker 数を確認（"🔄" マーカを数える）
+RUNNING=$(./scripts/plan.sh status 2>/dev/null | grep -c "🔄")
 WIP_LIMIT="${CREWVIA_WIP_LIMIT:-8}"
 
 if [ "$RUNNING" -ge "$WIP_LIMIT" ]; then
@@ -339,11 +383,22 @@ fi
 ### plan.sh status で確認
 
 ```bash
-# 全タスクのステータス一覧
+# active 全 mission の要約
 ./scripts/plan.sh status
 
 # 実際の出力例:
+# Active missions (1):
+#
+#   20260411-auth-refactor — 認証システムをリファクタリングする
+#     Status: in_progress  Progress: 1/3
+#     🔄 t002 新認証ミドルウェアの実装 (Luca)
+
+# 特定 mission の詳細
+./scripts/plan.sh status --mission 20260411-auth-refactor
+
+# 実際の出力例:
 # Mission: 認証システムをリファクタリングする
+# Slug:    20260411-auth-refactor
 # Status:  in_progress
 #
 # [✅] t001 既存認証コードの調査・設計 (Hana, 完了)
@@ -356,17 +411,20 @@ fi
 ### 完了チェック
 
 ```bash
-# Mission ステータスから判定（すべて done になると Status: done に変わる）
-MISSION_STATUS=$(./scripts/plan.sh status 2>/dev/null | grep "^Status:" | awk '{print $2}')
+# 特定 mission の完了判定（mission.yaml の status から）
+MISSION_SLUG=20260411-auth-refactor
+MISSION_STATUS=$(./scripts/plan.sh status --mission "$MISSION_SLUG" 2>/dev/null | grep "^Status:" | awk '{print $2}')
 
 if [ "$MISSION_STATUS" = "done" ]; then
-  echo "全タスク完了。ユーザーに報告します。"
+  echo "$MISSION_SLUG: 全タスク完了。"
 fi
 
-# または未完タスクを数える
-PENDING=$(./scripts/plan.sh status 2>/dev/null | grep -E "^\[(📋|🔄|⏭)\]" | wc -l)
-if [ "$PENDING" -eq 0 ]; then
-  echo "全タスク完了。ユーザーに報告します。"
+# active 全 mission について残タスクを数える
+PENDING=$(./scripts/plan.sh status 2>/dev/null | grep -E "Progress: [0-9]+/[0-9]+" | awk '{
+  split($2, a, "/"); total += a[2]; done += a[1]
+} END { print total - done }')
+if [ "$PENDING" = "0" ]; then
+  echo "active 全 mission 完了。"
 fi
 ```
 
@@ -482,11 +540,13 @@ curl -s -X POST "$TASKVIA_URL/api/log" \
 
 ### 完了条件
 
-以下をすべて満たした時点でミッション完了とする：
+以下をすべて満たした時点で対象 mission を完了とする：
 
-1. `plan.sh status` で全タスクが `done`
-2. 稼働中の Worker がゼロ
+1. `plan.sh status --mission <slug>` で全タスクが `done`
+2. 当該 mission 担当の稼働中 Worker がゼロ
 3. `blocked` のままのタスクがない
+
+完了確認後、`plan.sh archive <slug>` で `queue/archive/` に退避してから、ユーザーへ報告する。複数 mission を並走している場合は mission ごとに独立に判断する。
 
 ### ユーザーへの報告フォーマット
 
@@ -527,8 +587,7 @@ crewvia_create_branch "card-042" "add-auth-middleware"
 # → task/card-042-add-auth-middleware が作成される
 ```
 
-作成したブランチ名をWorkerが参照できるよう `plan.sh` のタスク情報に含めること。
-Workerは `plan.sh` から自分のタスクを pull する際にブランチ名も取得する。
+ブランチ名は現状 `plan.sh` の task frontmatter には保存されないため、Worker への伝達は `plan.sh add --description` 内に明記するか、Orchestrator から Worker メッセージで直接渡すこと。
 
 ### 全Worker完了後: PR 作成
 

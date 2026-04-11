@@ -11,12 +11,26 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # --- crewvia.yaml からシステム設定を読み込む ---
 # 環境変数が既に設定されていれば config より優先される。
-# wip_limit 以外の設定を追加する場合はここにロード処理を足す。
+# 設定を追加する場合はここにロード処理を足す。
 CONFIG_FILE="${REPO_ROOT}/config/crewvia.yaml"
-if [[ -f "$CONFIG_FILE" ]] && [[ -z "${CREWVIA_WIP_LIMIT:-}" ]]; then
-  WIP_FROM_CONFIG=$(grep -E '^wip_limit:[[:space:]]*[0-9]+' "$CONFIG_FILE" | awk '{print $2}' | tr -d '"' | head -1)
-  if [[ -n "$WIP_FROM_CONFIG" ]]; then
-    export CREWVIA_WIP_LIMIT="$WIP_FROM_CONFIG"
+if [[ -f "$CONFIG_FILE" ]]; then
+  if [[ -z "${CREWVIA_WIP_LIMIT:-}" ]]; then
+    WIP_FROM_CONFIG=$(grep -E '^wip_limit:[[:space:]]*[0-9]+' "$CONFIG_FILE" | awk '{print $2}' | tr -d '"' | head -1)
+    if [[ -n "$WIP_FROM_CONFIG" ]]; then
+      export CREWVIA_WIP_LIMIT="$WIP_FROM_CONFIG"
+    fi
+  fi
+  if [[ -z "${CREWVIA_ORCHESTRATOR_MODEL:-}" ]]; then
+    ORCH_MODEL_FROM_CONFIG=$(grep -E '^orchestrator_model:[[:space:]]*\S' "$CONFIG_FILE" | awk '{print $2}' | tr -d '"' | head -1)
+    if [[ -n "$ORCH_MODEL_FROM_CONFIG" ]]; then
+      export CREWVIA_ORCHESTRATOR_MODEL="$ORCH_MODEL_FROM_CONFIG"
+    fi
+  fi
+  if [[ -z "${CREWVIA_WORKER_MODEL:-}" ]]; then
+    WORKER_MODEL_FROM_CONFIG=$(grep -E '^worker_model:[[:space:]]*\S' "$CONFIG_FILE" | awk '{print $2}' | tr -d '"' | head -1)
+    if [[ -n "$WORKER_MODEL_FROM_CONFIG" ]]; then
+      export CREWVIA_WORKER_MODEL="$WORKER_MODEL_FROM_CONFIG"
+    fi
   fi
 fi
 # Default fallback（config ファイル無しでも必ず値が入る）
@@ -253,6 +267,18 @@ if [[ -n "$FULL_PROMPT" ]]; then
   PROMPT_FLAG=(--append-system-prompt "$FULL_PROMPT")
 fi
 
+# Resolve model per role (config / env で指定されていれば --model を渡す)
+if [[ "${ROLE}" == "orchestrator" ]]; then
+  SELECTED_MODEL="${CREWVIA_ORCHESTRATOR_MODEL:-}"
+else
+  SELECTED_MODEL="${CREWVIA_WORKER_MODEL:-}"
+fi
+MODEL_FLAG=()
+if [[ -n "$SELECTED_MODEL" ]]; then
+  MODEL_FLAG=(--model "$SELECTED_MODEL")
+  echo "[crewvia] Model: $SELECTED_MODEL"
+fi
+
 # Launch with or without tmux
 if [[ "${CREWVIA_TMUX:-0}" == "1" ]]; then
   SESSION="crewvia"
@@ -260,6 +286,12 @@ if [[ "${CREWVIA_TMUX:-0}" == "1" ]]; then
 
   ENV_EXPORTS="export AGENT_NAME='$AGENT_NAME' TASKVIA_URL='$TASKVIA_URL' ROLE='$ROLE' SKILLS='${SKILLS:-}'"
   [[ -n "${TASKVIA_TOKEN:-}" ]] && ENV_EXPORTS+=" TASKVIA_TOKEN='$TASKVIA_TOKEN'"
+
+  # --model flag (空なら省略)
+  MODEL_CLI_ARG=""
+  if [[ -n "$SELECTED_MODEL" ]]; then
+    MODEL_CLI_ARG=" --model '$SELECTED_MODEL'"
+  fi
 
   if [[ -n "$FULL_PROMPT" ]]; then
     # Write prompt to temp file to avoid quoting issues with large content in send-keys.
@@ -269,9 +301,9 @@ if [[ "${CREWVIA_TMUX:-0}" == "1" ]]; then
     # 末尾に X's を置いた `crewvia_prompt.XXXXXX` が BSD/GNU 両対応の正解。
     PROMPT_TMPFILE=$(mktemp /tmp/crewvia_prompt.XXXXXX)
     printf '%s' "$FULL_PROMPT" > "$PROMPT_TMPFILE"
-    LAUNCH_CMD="$ENV_EXPORTS; cd '$REPO_ROOT'; claude --append-system-prompt \"\$(cat '${PROMPT_TMPFILE}')\""
+    LAUNCH_CMD="$ENV_EXPORTS; cd '$REPO_ROOT'; claude${MODEL_CLI_ARG} --append-system-prompt \"\$(cat '${PROMPT_TMPFILE}')\""
   else
-    LAUNCH_CMD="$ENV_EXPORTS; cd '$REPO_ROOT'; claude"
+    LAUNCH_CMD="$ENV_EXPORTS; cd '$REPO_ROOT'; claude${MODEL_CLI_ARG}"
   fi
 
   if ! tmux has-session -t "$SESSION" 2>/dev/null; then
@@ -298,5 +330,5 @@ else
       trap "kill ${WATCHDOG_PID} 2>/dev/null || true" EXIT
     fi
   fi
-  exec claude "${PROMPT_FLAG[@]+"${PROMPT_FLAG[@]}"}"
+  exec claude "${MODEL_FLAG[@]+"${MODEL_FLAG[@]}"}" "${PROMPT_FLAG[@]+"${PROMPT_FLAG[@]}"}"
 fi

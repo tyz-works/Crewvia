@@ -125,11 +125,33 @@ export AGENT_NAME
 export ROLE
 export TASKVIA_URL="${TASKVIA_URL:-https://taskvia.vercel.app}"
 
+# CREWVIA_REPO: crewvia 本体のパス。Worker の cwd が target project に
+# 切り替わった後も、plan.sh / registry / knowledge / hooks などを絶対パスで
+# 呼び出せるように、常に export する。
+export CREWVIA_REPO="$REPO_ROOT"
+
 # Export SKILLS as comma-separated env var
 if [[ ${#SKILLS_ARR[@]} -gt 0 ]]; then
   export SKILLS="$(IFS=','; echo "${SKILLS_ARR[*]}")"
 else
   export SKILLS=""
+fi
+
+# --- Worker の cwd を決定する ---
+# Worker は TARGET_DIR env var が指定されていればそのプロジェクトの cwd で
+# claude を起動する (claude は cwd の CLAUDE.md / .claude/settings.json /
+# git 状態を読むため、target project の文脈で動かすには cwd 切替が必須)。
+# Orchestrator は常に crewvia 本体の cwd のまま (registry / queue を管理
+# する必要があるため)。
+WORK_DIR="$REPO_ROOT"
+if [[ "${ROLE}" == "worker" ]] && [[ -n "${TARGET_DIR:-}" ]]; then
+  if [[ ! -d "$TARGET_DIR" ]]; then
+    echo "[crewvia] ERROR: TARGET_DIR does not exist or is not a directory: $TARGET_DIR" >&2
+    exit 1
+  fi
+  WORK_DIR="$(cd "$TARGET_DIR" && pwd)"  # canonicalize
+  echo "[crewvia] Worker target project: $WORK_DIR"
+  export TARGET_DIR="$WORK_DIR"  # Worker 側にも canonicalized pathを渡す
 fi
 
 echo "[crewvia] Starting as $AGENT_NAME ($ROLE)"
@@ -211,8 +233,9 @@ if [[ "${CREWVIA_TMUX:-0}" == "1" ]]; then
   SESSION="crewvia"
   WINDOW_NAME="${AGENT_NAME}-${ROLE}"
 
-  ENV_EXPORTS="export AGENT_NAME='$AGENT_NAME' TASKVIA_URL='$TASKVIA_URL' ROLE='$ROLE' SKILLS='${SKILLS:-}'"
+  ENV_EXPORTS="export AGENT_NAME='$AGENT_NAME' TASKVIA_URL='$TASKVIA_URL' ROLE='$ROLE' SKILLS='${SKILLS:-}' CREWVIA_REPO='$CREWVIA_REPO'"
   [[ -n "${TASKVIA_TOKEN:-}" ]] && ENV_EXPORTS+=" TASKVIA_TOKEN='$TASKVIA_TOKEN'"
+  [[ "${ROLE}" == "worker" ]] && [[ "$WORK_DIR" != "$REPO_ROOT" ]] && ENV_EXPORTS+=" TARGET_DIR='$WORK_DIR'"
 
   # --model flag (空なら省略)
   MODEL_CLI_ARG=""
@@ -228,9 +251,9 @@ if [[ "${CREWVIA_TMUX:-0}" == "1" ]]; then
     # 末尾に X's を置いた `crewvia_prompt.XXXXXX` が BSD/GNU 両対応の正解。
     PROMPT_TMPFILE=$(mktemp /tmp/crewvia_prompt.XXXXXX)
     printf '%s' "$FULL_PROMPT" > "$PROMPT_TMPFILE"
-    LAUNCH_CMD="$ENV_EXPORTS; cd '$REPO_ROOT'; claude${MODEL_CLI_ARG} --append-system-prompt \"\$(cat '${PROMPT_TMPFILE}')\""
+    LAUNCH_CMD="$ENV_EXPORTS; cd '$WORK_DIR'; claude${MODEL_CLI_ARG} --append-system-prompt \"\$(cat '${PROMPT_TMPFILE}')\""
   else
-    LAUNCH_CMD="$ENV_EXPORTS; cd '$REPO_ROOT'; claude${MODEL_CLI_ARG}"
+    LAUNCH_CMD="$ENV_EXPORTS; cd '$WORK_DIR'; claude${MODEL_CLI_ARG}"
   fi
 
   if ! tmux has-session -t "$SESSION" 2>/dev/null; then
@@ -257,5 +280,10 @@ else
       trap "kill ${WATCHDOG_PID} 2>/dev/null || true" EXIT
     fi
   fi
+  # Worker 向け cwd 切替 (TARGET_DIR 指定時のみ)。Orchestrator はそのまま。
+  cd "$WORK_DIR" || {
+    echo "[crewvia] ERROR: failed to cd into $WORK_DIR" >&2
+    exit 1
+  }
   exec claude "${MODEL_FLAG[@]+"${MODEL_FLAG[@]}"}" "${PROMPT_FLAG[@]+"${PROMPT_FLAG[@]}"}"
 fi

@@ -12,3 +12,18 @@
 #
 # 環境変数での上書き: CREWVIA_WIP_LIMIT=12
 wip_limit: 8
+
+# ===== モデル選択 =====
+# Orchestrator と Worker が起動時に使う Claude モデルを指定します。
+# 空にすると claude CLI のデフォルト（ユーザーの /model 設定）に従います。
+#
+# 利用可能な ID:
+#   claude-opus-4-6            ← 複雑な調整・計画向き
+#   claude-sonnet-4-6          ← バランス型、実装作業向き
+#   claude-haiku-4-5-20251001  ← 高速・低コスト、軽タスク向き
+#
+# 環境変数での上書き:
+#   CREWVIA_ORCHESTRATOR_MODEL=claude-opus-4-6
+#   CREWVIA_WORKER_MODEL=claude-sonnet-4-6
+orchestrator_model: claude-opus-4-6
+worker_model: claude-sonnet-4-6

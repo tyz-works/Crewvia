@@ -262,8 +262,12 @@ if [[ "${CREWVIA_TMUX:-0}" == "1" ]]; then
   [[ -n "${TASKVIA_TOKEN:-}" ]] && ENV_EXPORTS+=" TASKVIA_TOKEN='$TASKVIA_TOKEN'"
 
   if [[ -n "$FULL_PROMPT" ]]; then
-    # Write prompt to temp file to avoid quoting issues with large content in send-keys
-    PROMPT_TMPFILE=$(mktemp /tmp/crewvia_prompt_XXXXXX.txt)
+    # Write prompt to temp file to avoid quoting issues with large content in send-keys.
+    # macOS BSD mktemp は template 末尾の X's しか randomize しないため、
+    # 旧パターン `crewvia_prompt_XXXXXX.txt` ではファイル名が literal のまま
+    # (parallel Worker 起動時に temp file が衝突する latent bug)。
+    # 末尾に X's を置いた `crewvia_prompt.XXXXXX` が BSD/GNU 両対応の正解。
+    PROMPT_TMPFILE=$(mktemp /tmp/crewvia_prompt.XXXXXX)
     printf '%s' "$FULL_PROMPT" > "$PROMPT_TMPFILE"
     LAUNCH_CMD="$ENV_EXPORTS; cd '$REPO_ROOT'; claude --append-system-prompt \"\$(cat '${PROMPT_TMPFILE}')\""
   else

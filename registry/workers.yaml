@@ -1,15 +1,22 @@
 # registry/workers.yaml
-# Worker名 → 担当スキルの対応表（担当履歴）
-# assign-name.sh が自動更新する。手動編集も可。
+# Worker 名 → 担当スキル・経験値の対応表（担当履歴）
+# scripts/assign-name.sh および scripts/start.sh が自動更新する。手動編集も可。
+#
+# 各エントリの意味:
+#   name         - assign-name.sh が決定した Worker 名（config/worker-names.yaml のプールから割り当て）
+#   role         - orchestrator 指定時のみ付与される（未指定なら worker 扱い）
+#   skills       - この Worker が担当するスキルセット（リスト形式・複数可）
+#   task_count   - 完了タスク数（セッション終了時に自動インクリメント）
+#   last_active  - 最終稼働日（YYYY-MM-DD 形式・自動更新）
 #
 # スキルタグ一覧: ops / bash / code / python / typescript / research / database / cloud / docs
 
 workers:
-  - name: Hana          # assign-name.sh が決定した Worker 名（名前プールから割り当て）
-    skills: [bash, ops] # このWorkerが担当するスキルセット（リスト形式・複数可）
-    task_count: 0       # 完了タスク数（セッション終了時に assign-name.sh が自動インクリメント）
-    last_active: 2026-04-10  # 最終稼働日（YYYY-MM-DD 形式・セッション終了時に自動更新）
-  - name: Ren             # assign-name.sh が決定した Worker 名（名前プールから割り当て）
-    skills: [code, python] # このWorkerが担当するスキルセット（リスト形式・複数可）
-    task_count: 0          # 完了タスク数（セッション終了時に assign-name.sh が自動インクリメント）
-    last_active: 2026-04-10  # 最終稼働日（YYYY-MM-DD 形式・セッション終了時に自動更新）
+  - name: Hana
+    skills: [bash, ops]
+    task_count: 0
+    last_active: 2026-04-10
+  - name: Ren
+    skills: [code, python]
+    task_count: 0
+    last_active: 2026-04-10

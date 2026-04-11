@@ -596,6 +596,7 @@ def cmd_add(args):
         '--blocked-by': 'value',
         '--priority': 'value',
         '--description': 'value',
+        '--target-dir': 'value',
     })
     if not positional:
         die("add requires a task title")
@@ -607,6 +608,17 @@ def cmd_add(args):
     if priority not in PRIORITY_ORDER:
         die(f"invalid priority '{priority}'. Use high|medium|low.")
     description = opts.get('--description', '')
+
+    # --target-dir: Worker が起動時に cd する target project のパス。
+    # 未指定なら None (crewvia 本体を触るタスク扱い)。
+    # ~ 展開と絶対パス化をかけ、ディレクトリ存在確認を入れる。
+    target_dir = opts.get('--target-dir')
+    if target_dir:
+        target_dir = os.path.abspath(os.path.expanduser(target_dir))
+        if not os.path.isdir(target_dir):
+            die(f"--target-dir does not exist or is not a directory: {target_dir}")
+    else:
+        target_dir = None
 
     def _do():
         state = load_state()
@@ -627,6 +639,7 @@ def cmd_add(args):
             'priority': priority,
             'status': 'pending',
             'blocked_by': blocked_by,
+            'target_dir': target_dir,
             'worker': None,
             'started_at': None,
             'completed_at': None,
@@ -636,7 +649,8 @@ def cmd_add(args):
 
         mission['next_task_id'] = task_num + 1
         save_mission(slug, mission)
-        print(f"Added: {slug}/{task_id} — {title}")
+        suffix = f" [target: {target_dir}]" if target_dir else ""
+        print(f"Added: {slug}/{task_id} — {title}{suffix}")
 
     with_lock(_do)
 
@@ -750,6 +764,7 @@ def cmd_pull(args):
             'skills': meta.get('skills') or [],
             'priority': meta.get('priority', 'medium'),
             'blocked_by': meta.get('blocked_by') or [],
+            'target_dir': meta.get('target_dir'),  # None for crewvia-local tasks
         }
 
     with_lock(_do)

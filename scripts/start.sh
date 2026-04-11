@@ -263,7 +263,7 @@ if [[ "${CREWVIA_TMUX:-0}" == "1" ]]; then
 
   if [[ -n "$FULL_PROMPT" ]]; then
     # Write prompt to temp file to avoid quoting issues with large content in send-keys
-    PROMPT_TMPFILE=$(mktemp /tmp/crewvia_prompt_XXXXXX.txt)
+    PROMPT_TMPFILE=$(mktemp /tmp/crewvia_prompt.XXXXXX)
     printf '%s' "$FULL_PROMPT" > "$PROMPT_TMPFILE"
     LAUNCH_CMD="$ENV_EXPORTS; cd '$REPO_ROOT'; claude --append-system-prompt \"\$(cat '${PROMPT_TMPFILE}')\""
   else

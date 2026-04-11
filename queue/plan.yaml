@@ -1,0 +1,14 @@
+# queue/plan.yaml
+# Orchestrator が作成するタスクフロー。Workers が自律的に pull して実行する。
+#
+# 使い方:
+#   初期化:    bash scripts/plan.sh init "ミッション名"
+#   タスク追加: bash scripts/plan.sh add "タイトル" --skills "code,typescript"
+#   進捗確認:  bash scripts/plan.sh status
+#
+# Worker は plan.sh pull で自動的にタスクを取得する。手動編集も可。
+
+mission: ""
+created_at: ""
+status: pending
+tasks: []

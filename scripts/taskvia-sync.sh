@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# taskvia-sync.sh — queue/missions/ 配下の状態を Taskvia にミラーリングする（オプション）
-# Usage: bash scripts/taskvia-sync.sh [--queue <path>]
+# taskvia-sync.sh — plan.yaml の状態を Taskvia にミラーリングする（オプション）
+# Usage: bash scripts/taskvia-sync.sh [--plan <path>]
 # TASKVIA_TOKEN が未設定の場合は何もしない（exit 0）
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -11,15 +11,18 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 TASKVIA_URL="${TASKVIA_URL:-https://taskvia.vercel.app}"
 TASKVIA_TOKEN="${TASKVIA_TOKEN:-}"
 
+# TASKVIA_TOKEN 未設定ならサイレントにスキップ
 if [[ -z "$TASKVIA_TOKEN" ]]; then
   exit 0
 fi
 
-QUEUE_DIR="${CREWVIA_QUEUE:-${REPO_ROOT}/queue}"
+PLAN_FILE="${REPO_ROOT}/queue/plan.yaml"
+
+# 引数パース
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --queue)
-      QUEUE_DIR="$2"
+    --plan)
+      PLAN_FILE="$2"
       shift 2
       ;;
     *)
@@ -29,94 +32,40 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ ! -d "$QUEUE_DIR" ]]; then
+# plan.yaml が存在しない場合はサイレントに exit 0
+if [[ ! -f "$PLAN_FILE" ]]; then
   exit 0
 fi
 
+QUEUE_DIR="$(dirname "$PLAN_FILE")"
 MAP_FILE="${QUEUE_DIR}/.taskvia-map.json"
 AUTH_HEADER="Authorization: Bearer ${TASKVIA_TOKEN}"
 
-python3 - "$QUEUE_DIR" "$MAP_FILE" "$TASKVIA_URL" "$AUTH_HEADER" <<'PYEOF'
+python3 - "$PLAN_FILE" "$MAP_FILE" "$TASKVIA_URL" "$AUTH_HEADER" <<'PYEOF'
 import sys
 import os
-import re
 import json
 import urllib.request
 
-queue_dir   = sys.argv[1]
+plan_file   = sys.argv[1]
 map_file    = sys.argv[2]
 taskvia_url = sys.argv[3]
 auth_header = sys.argv[4]
 
-state_file = os.path.join(queue_dir, 'state.yaml')
-missions_dir = os.path.join(queue_dir, 'missions')
 
+# ---------- plan.yaml 読み込み ----------
 
-# ---------- minimal YAML / frontmatter helpers ----------
-
-def _scalar(val):
-    if val == 'null' or val == '':
-        return None
-    if val in ('true', 'True'):
-        return True
-    if val in ('false', 'False'):
-        return False
-    if len(val) >= 2 and val[0] == '"' and val[-1] == '"':
-        return val[1:-1].replace('\\"', '"').replace('\\\\', '\\')
-    if len(val) >= 2 and val[0] == "'" and val[-1] == "'":
-        return val[1:-1]
-    if re.fullmatch(r'-?\d+', val):
-        return int(val)
-    return val
-
-
-def parse_yaml(text):
-    lines = text.splitlines()
-    result = {}
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        if not line.strip() or line.lstrip().startswith('#'):
-            i += 1
-            continue
-        m = re.match(r'^([\w-]+):\s*(.*)$', line)
-        if not m:
-            i += 1
-            continue
-        key, val = m.group(1), m.group(2).rstrip()
-        if val == '':
-            i += 1
-            items = []
-            while i < len(lines):
-                lst = re.match(r'^\s+-\s*(.*)$', lines[i])
-                if lst:
-                    items.append(_scalar(lst.group(1).strip()))
-                    i += 1
-                else:
-                    break
-            result[key] = items if items else None
-        elif val.startswith('[') and val.endswith(']'):
-            inner = val[1:-1].strip()
-            result[key] = [_scalar(s.strip()) for s in inner.split(',') if s.strip()] if inner else []
-            i += 1
-        else:
-            result[key] = _scalar(val)
-            i += 1
-    return result
-
-
-def parse_frontmatter(text):
-    lines = text.splitlines()
-    if not lines or lines[0].strip() != '---':
-        return None
-    end = None
-    for i in range(1, len(lines)):
-        if lines[i].strip() == '---':
-            end = i
-            break
-    if end is None:
-        return None
-    return parse_yaml('\n'.join(lines[1:end]))
+def load_plan(path):
+    try:
+        import yaml
+        with open(path) as f:
+            return yaml.safe_load(f) or {}
+    except ImportError:
+        print("[taskvia-sync] WARNING: PyYAML が利用できません。pip install pyyaml を実行してください。", file=sys.stderr)
+        return {}
+    except Exception as e:
+        print(f"[taskvia-sync] WARNING: plan.yaml の読み込み失敗: {e}", file=sys.stderr)
+        return {}
 
 
 # ---------- map I/O ----------
@@ -160,90 +109,62 @@ def http_post(url, payload):
         return None
 
 
-# ---------- mission scanning ----------
-
-def scan_missions():
-    """Yield (slug, mission_meta, task_meta) for every task in active missions."""
-    if not os.path.exists(state_file):
-        return
-    with open(state_file) as f:
-        state = parse_yaml(f.read())
-    active = state.get('active_missions') or []
-    for slug in active:
-        mdir = os.path.join(missions_dir, slug)
-        myaml = os.path.join(mdir, 'mission.yaml')
-        if not os.path.exists(myaml):
-            continue
-        with open(myaml) as f:
-            mission_meta = parse_yaml(f.read())
-        tdir = os.path.join(mdir, 'tasks')
-        if not os.path.isdir(tdir):
-            continue
-        entries = []
-        for fn in os.listdir(tdir):
-            m = re.fullmatch(r't(\d+)\.md', fn)
-            if m:
-                entries.append((int(m.group(1)), fn))
-        entries.sort()
-        for _, fn in entries:
-            with open(os.path.join(tdir, fn)) as f:
-                meta = parse_frontmatter(f.read())
-            if meta is None:
-                continue
-            yield slug, mission_meta, meta
-
-
 # ---------- main ----------
 
-records = list(scan_missions())
-if not records:
-    print("[taskvia-sync] active mission にタスクが見つかりません。スキップ。", file=sys.stderr)
+plan = load_plan(plan_file)
+tasks = plan.get('tasks') or []
+
+if not tasks:
+    print("[taskvia-sync] plan.yaml にタスクが見つかりません。スキップ。", file=sys.stderr)
     sys.exit(0)
 
 task_map = load_map(map_file)
 updated = False
 
-for slug, mission_meta, task in records:
-    task_id = task.get('id', '')
+for task in tasks:
+    if not isinstance(task, dict):
+        continue
+    task_id = str(task.get('id', '')).strip()
     if not task_id:
         continue
 
-    map_key = f"{slug}:{task_id}"
-    title = task.get('title', task_id)
-    status = task.get('status', 'pending')
-    priority = task.get('priority', 'medium')
-    agent = task.get('worker') or 'orchestrator'
+    title    = str(task.get('title',    task_id))
+    status   = str(task.get('status',   'pending'))
+    priority = str(task.get('priority', 'medium'))
+    agent    = str(task.get('worker') or task.get('agent') or 'orchestrator')
 
-    if map_key not in task_map:
+    if task_id not in task_map:
+        # 未登録 → Taskvia にカード登録
         payload = {
-            'tool': f"task:{slug}/{task_id}",
-            'agent': agent,
+            'tool':       f"task:{task_id}",
+            'agent':      agent,
             'task_title': title,
-            'task_id': f"{slug}/{task_id}",
-            'priority': priority,
+            'task_id':    task_id,
+            'priority':   priority,
         }
         resp = http_post(f"{taskvia_url}/api/request", payload)
         if resp and resp.get('id'):
             card_id = resp['id']
-            task_map[map_key] = {'card_id': card_id, 'status': status}
-            print(f"[taskvia-sync] 登録: {map_key} → card_id={card_id}")
+            task_map[task_id] = {'card_id': card_id, 'status': status}
+            print(f"[taskvia-sync] 登録: {task_id} → card_id={card_id}")
             updated = True
         else:
-            print(f"[taskvia-sync] WARNING: {map_key} の登録失敗。スキップ。", file=sys.stderr)
+            print(f"[taskvia-sync] WARNING: {task_id} の登録失敗。スキップ。", file=sys.stderr)
     else:
-        card_id = task_map[map_key].get('card_id', '')
-        last_status = task_map[map_key].get('status', '')
+        # 登録済み → ステータス差分があれば更新
+        card_id     = task_map[task_id].get('card_id', '')
+        last_status = task_map[task_id].get('status', '')
         if card_id and status != last_status:
             resp = http_post(
                 f"{taskvia_url}/api/cards/{card_id}",
                 {'status': status},
             )
             if resp is not None:
-                task_map[map_key]['status'] = status
-                print(f"[taskvia-sync] 更新: {map_key} status {last_status} → {status}")
+                task_map[task_id]['status'] = status
+                print(f"[taskvia-sync] 更新: {task_id} status {last_status} → {status}")
                 updated = True
             else:
-                print(f"[taskvia-sync] WARNING: {map_key} のステータス更新失敗。スキップ。", file=sys.stderr)
+                print(f"[taskvia-sync] WARNING: {task_id} のステータス更新失敗。スキップ。", file=sys.stderr)
 
 if updated:
     save_map(map_file, task_map)

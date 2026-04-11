@@ -27,5 +27,7 @@ Thumbs.db
 *.secret
 
 # Crewvia runtime state (per-session)
-queue/
+queue/*
+!queue/.gitkeep
+!queue/plan.yaml
 registry/heartbeats/

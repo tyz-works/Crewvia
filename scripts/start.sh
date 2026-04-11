@@ -64,31 +64,7 @@ REGISTRY_YAML="${REPO_ROOT}/registry/workers.yaml"
 
 if [[ "${ROLE}" == "orchestrator" ]]; then
   # Check if an orchestrator is already registered
-  EXISTING_ORCH=$(python3 - "$REGISTRY_YAML" <<'PYEOF'
-import sys, re
-
-path = sys.argv[1]
-try:
-    with open(path) as f:
-        lines = f.readlines()
-except FileNotFoundError:
-    sys.exit(0)
-
-current = None
-for line in lines:
-    content = re.sub(r'\s*#.*$', '', line.rstrip()).rstrip()
-    if not content:
-        continue
-    m = re.match(r'^\s+-\s+name:\s+(\S+)', content)
-    if m:
-        current = {'name': m.group(1)}
-        continue
-    if current is not None:
-        if re.match(r'^\s+role:\s+orchestrator', content):
-            print(current['name'])
-            sys.exit(0)
-PYEOF
-)
+  EXISTING_ORCH=$(python3 "${SCRIPT_DIR}/lib_registry.py" get-orchestrator "$REGISTRY_YAML" 2>/dev/null || true)
 
   if [[ -n "$EXISTING_ORCH" ]]; then
     AGENT_NAME="$EXISTING_ORCH"
@@ -106,34 +82,7 @@ PYEOF
     fi
     # Register orchestrator in registry
     mkdir -p "${REPO_ROOT}/registry"
-    python3 - "$REGISTRY_YAML" "$AGENT_NAME" <<'PYEOF'
-import sys, re
-from datetime import date
-
-path, name = sys.argv[1], sys.argv[2]
-today = str(date.today())
-
-try:
-    with open(path) as f:
-        content = f.read()
-except FileNotFoundError:
-    content = 'workers: []\n'
-
-entry = (
-    f"  - name: {name}\n"
-    f"    role: orchestrator\n"
-    f"    task_count: 0\n"
-    f"    last_active: {today}\n"
-)
-
-if content.strip() == 'workers: []' or content.strip() == 'workers:':
-    content = f"workers:\n{entry}"
-else:
-    content = content.rstrip('\n') + '\n' + entry
-
-with open(path, 'w') as f:
-    f.write(content)
-PYEOF
+    python3 "${SCRIPT_DIR}/lib_registry.py" register-orchestrator "$REGISTRY_YAML" "$AGENT_NAME"
     echo "[crewvia] Orchestrator '${AGENT_NAME}' を registry に登録しました。"
   fi
 else
@@ -224,29 +173,7 @@ registry/workers.yaml でこの名前のエントリを確認し、過去の tas
   # Update last_active for this worker in registry
   REGISTRY_YAML="${REPO_ROOT}/registry/workers.yaml"
   if [[ -f "$REGISTRY_YAML" ]]; then
-    python3 - "$REGISTRY_YAML" "$AGENT_NAME" <<'PYEOF'
-import sys, re
-from datetime import date
-
-path, agent_name = sys.argv[1], sys.argv[2]
-today = str(date.today())
-
-with open(path) as f:
-    lines = f.readlines()
-
-in_target = False
-result = []
-for line in lines:
-    m_name = re.match(r'^\s+-\s+name:\s+(\S+)', line)
-    if m_name:
-        in_target = (m_name.group(1) == agent_name)
-    if in_target and re.match(r'^\s+last_active:', line):
-        line = re.sub(r'(last_active:\s+)\S+', rf'\g<1>{today}', line)
-    result.append(line)
-
-with open(path, 'w') as f:
-    f.writelines(result)
-PYEOF
+    python3 "${SCRIPT_DIR}/lib_registry.py" set-last-active "$REGISTRY_YAML" "$AGENT_NAME"
   fi
 
 else

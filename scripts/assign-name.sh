@@ -22,15 +22,19 @@ if [[ ! -f "$REGISTRY_YAML" ]]; then
   printf 'workers: []\n' > "$REGISTRY_YAML"
 fi
 
-# Registry-first lookup and assignment via python3
-python3 - "$NAMES_YAML" "$REGISTRY_YAML" "$@" <<'PYEOF'
+# Registry-first lookup and assignment via python3.
+# lib_registry.py でヘッダ保存・同名 dedup・role 保存を一元化している。
+python3 - "$SCRIPT_DIR" "$NAMES_YAML" "$REGISTRY_YAML" "$@" <<'PYEOF'
 import sys
 import re
 from datetime import date
 
-names_yaml_path = sys.argv[1]
-registry_yaml_path = sys.argv[2]
-input_skills = sorted(sys.argv[3:]) if len(sys.argv) > 3 else []
+sys.path.insert(0, sys.argv[1])
+from lib_registry import parse, write
+
+names_yaml_path = sys.argv[2]
+registry_yaml_path = sys.argv[3]
+input_skills = sorted(sys.argv[4:]) if len(sys.argv) > 4 else []
 input_skills_set = set(input_skills)
 
 
@@ -87,74 +91,24 @@ def parse_worker_names(path):
     return names, {c['name']: c for c in customizations}
 
 
-def parse_registry(path):
-    """Parse registry/workers.yaml → list of worker dicts."""
-    workers = []
-    current = None
-
-    with open(path) as f:
-        lines = f.readlines()
-
-    for line in lines:
-        content = re.sub(r'\s*#.*$', '', line.rstrip()).rstrip()
-        if not content or content in ('workers:', 'workers: []'):
-            continue
-        m = re.match(r'^\s+-\s+name:\s+(\S+)', content)
-        if m:
-            if current is not None:
-                workers.append(current)
-            current = {'name': m.group(1), 'skills': [], 'task_count': 0, 'last_active': '', 'role': ''}
-            continue
-        if current is not None:
-            m = re.match(r'^\s+skills:\s+\[([^\]]*)\]', content)
-            if m:
-                current['skills'] = [s.strip() for s in m.group(1).split(',') if s.strip()]
-                continue
-            m = re.match(r'^\s+task_count:\s+(\d+)', content)
-            if m:
-                current['task_count'] = int(m.group(1))
-                continue
-            m = re.match(r'^\s+last_active:\s+(\S+)', content)
-            if m:
-                current['last_active'] = m.group(1)
-                continue
-            m = re.match(r'^\s+role:\s+(\S+)', content)
-            if m:
-                current['role'] = m.group(1)
-                continue
-
-    if current is not None:
-        workers.append(current)
-    return workers
-
-
-def write_registry(path, workers):
-    """Write worker list back to registry/workers.yaml."""
-    lines = ['workers:\n']
-    for w in workers:
-        skills_str = ', '.join(w['skills'])
-        lines.append(f"  - name: {w['name']}\n")
-        lines.append(f"    skills: [{skills_str}]\n")
-        lines.append(f"    task_count: {w['task_count']}\n")
-        lines.append(f"    last_active: {w['last_active']}\n")
-    with open(path, 'w') as f:
-        f.writelines(lines)
-
-
 pool_names, custom_map = parse_worker_names(names_yaml_path)
-registry = parse_registry(registry_yaml_path)
+header, order, by_name = parse(registry_yaml_path)
 
-# Step 2: Return existing name if same skill set is already registered
-for w in registry:
+# Step 2: Return existing name if the same skill set is already registered.
+# Skip orchestrator entries — their empty skills list would false-match callers
+# that also pass zero skills (e.g. `start.sh worker` with no args).
+for name in order:
+    w = by_name[name]
+    if w.get('role') == 'orchestrator':
+        continue
     if set(w['skills']) == input_skills_set:
         print(w['name'])
         sys.exit(0)
 
-# Step 3: Find first eligible name not already in registry
-# Exclude names registered as orchestrator
-registered_names = {w['name'] for w in registry if w.get('role') != 'orchestrator'}
-orchestrator_names = {w['name'] for w in registry if w.get('role') == 'orchestrator'}
-registered_names |= orchestrator_names
+# Step 3: Find the first eligible name not already in the registry.
+# All registered names are excluded (orchestrator + worker alike) so a new
+# Worker never collides with an existing entry.
+registered_names = set(by_name.keys())
 
 
 def is_pool_eligible(name):
@@ -175,7 +129,7 @@ for name in pool_names:
         break
 
 if chosen is None:
-    # Fallback: reuse first eligible name
+    # Fallback: reuse the first eligible name even if already registered.
     for name in pool_names:
         if is_pool_eligible(name):
             chosen = name
@@ -184,14 +138,22 @@ if chosen is None:
 if chosen is None:
     chosen = "Unknown"
 
-# Step 4: Append new worker to registry
-registry.append({
-    'name': chosen,
-    'skills': input_skills,
-    'task_count': 0,
-    'last_active': str(date.today()),
-})
-write_registry(registry_yaml_path, registry)
+# Step 4: Append (or merge into) the chosen name.
+today = str(date.today())
+if chosen in by_name:
+    # Fallback path hit — merge skills / refresh last_active, keep task_count & role.
+    by_name[chosen]['skills'] = input_skills
+    by_name[chosen]['last_active'] = today
+else:
+    by_name[chosen] = {
+        'name': chosen,
+        'role': '',
+        'skills': input_skills,
+        'task_count': 0,
+        'last_active': today,
+    }
+    order.append(chosen)
+write(registry_yaml_path, header, order, by_name)
 
 # Step 5: Output name
 print(chosen)

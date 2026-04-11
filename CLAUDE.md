@@ -154,7 +154,7 @@ Backlog → In Progress → Awaiting Approval → Done
 
 ---
 
-## ディレクトリ構成（案）
+## ディレクトリ構成
 
 ```
 /
@@ -169,6 +169,17 @@ Backlog → In Progress → Awaiting Approval → Done
     worker.md           Workerのシステムプロンプト
   scripts/
     start.sh            マルチエージェント起動スクリプト
+    plan.sh             タスクプラン管理 CLI（per-task / multi-mission）
+    taskvia-sync.sh     queue → Taskvia 同期
+  queue/                プラン置き場（plan.sh が管理）
+    state.yaml          active mission slug + default_mission
+    missions/<slug>/
+      mission.yaml      title / status / next_task_id
+      tasks/tNNN.md     frontmatter + Description / Result
+    archive/            完了 mission の退避先
+  registry/
+    workers.yaml        Worker のスキル・経験値
+    heartbeats/         watchdog 監視用
   CLAUDE.md             このファイル
   README.md             公開向けセットアップガイド
 ```
@@ -187,17 +198,12 @@ Backlog → In Progress → Awaiting Approval → Done
 
 ---
 
-## 未実装・今後の設計事項
+## 今後の拡張余地
 
-- [ ] Orchestratorのシステムプロンプト設計
-- [ ] Workerのシステムプロンプト設計
-- [ ] 名前割り当てロジック実装（スキルハッシュ → 名前）
-- [ ] 起動スクリプト（tmuxあり/なし両対応）
-- [ ] WIP制限の数値決定（同時実行Worker数の上限）
-- [ ] Taskvia未実装APIの完成を待って結合テスト
-  - `/api/log`
-  - `/api/flush-logs`
-  - カンバンWebUI
+- [ ] Planner ロール（mission spec → タスク分解の自動化）。skill タグ `planning` を予約済み。
+- [ ] `plan.sh status` の JSON 出力サポート（WIP 計測の grep を置き換える）
+- [ ] task frontmatter にブランチ名を持たせて Worker に伝達
+- [ ] mission 間の優先度設定（現状は default_mission 優先のみ）
 
 ---
 

@@ -50,8 +50,11 @@ echo "$STRIPPED" | grep -qE ':\(\)\{[[:space:]]*:[[:space:]]*\|[[:space:]]*:&' &
 
 # ---- Stage 2: rm -rf "$VAR" のコンテキスト判定 ----
 # 変数名抽出は元ファイルから（STRIPPED は引用符内の変数名も除去するため）
+# 注意: Stage 1 と同じ `-[rf]*r[rf]*` を使うこと。単純な `-[rf]+` は `-f` 単独にも
+# マッチしてしまい、合法な `rm -f "$BACKUP"` が false positive で BLOCK される。
+# r フラグが必須 (= 本当に recursive な rm だけを検査対象にする)。
 RM_VARS=$(grep -v '^[[:space:]]*#' "$FILE" \
-  | grep -oE 'rm[[:space:]]+-[rf]+[[:space:]]+"?\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?"?' \
+  | grep -oE 'rm[[:space:]]+-[rf]*r[rf]*[[:space:]]+"?\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?"?' \
   | grep -oE '\$\{?[A-Za-z_][A-Za-z0-9_]*\}?' \
   | tr -d '${}' | sort -u 2>/dev/null || true)
 

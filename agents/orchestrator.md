@@ -310,6 +310,39 @@ AGENT_NAME=$WORKER_NAME bash scripts/start.sh worker code typescript
 AGENT_NAME=$WORKER_NAME bash scripts/start.sh worker ops bash cloud
 ```
 
+### target project を触る Worker を起動する
+
+Worker に crewvia 以外のプロジェクト (例: `~/workspace/taskvia`) を触らせる場合、Worker の cwd を target project に切り替える必要がある。手順:
+
+1. **task 追加時に `--target-dir` を指定する**
+   ```bash
+   ./scripts/plan.sh add "taskvia のバグ修正" \
+     --mission 20260412-taskvia-fix \
+     --skills "typescript,code" \
+     --target-dir ~/workspace/taskvia
+   ```
+   これで task frontmatter に絶対パスで `target_dir` が記録される。
+
+2. **Worker の状況を plan.sh で確認し、target_dir ありのタスクが pending なら事前に取得する**
+   ```bash
+   # pending task の target_dir を参照 (peek 相当、pull はしない)
+   PEEK=$(cat queue/missions/<slug>/tasks/t00X.md | awk '/^target_dir:/ {print $2}')
+   ```
+   注意: 現状の plan.sh は「どの task を pull するか」を Worker が自律的に決める Pull モデル。Orchestrator は target_dir 付きタスクを実行する Worker を **先回りで** 起動し、`TARGET_DIR` env を渡す必要がある。
+
+3. **`TARGET_DIR` env var を渡して Worker を起動**
+   ```bash
+   TARGET_DIR=~/workspace/taskvia \
+     AGENT_NAME=$WORKER_NAME \
+     bash scripts/start.sh worker typescript code
+   ```
+   - `TARGET_DIR` 未設定なら Worker の cwd は crewvia 本体 (従来通り)
+   - `TARGET_DIR` 設定時は Worker の cwd がそのプロジェクトになり、`$CREWVIA_REPO` 経由で plan.sh を呼ぶ
+   - start.sh が `TARGET_DIR` の存在確認を行うので、存在しないパスなら起動失敗
+
+4. **Worker がどの target project に割り当てられているかを把握しておく**
+   同じ Worker 名 (例: Hana) でも、起動時の `TARGET_DIR` が異なれば触るプロジェクトが変わる。Orchestrator は「今起動中の Hana はどの TARGET_DIR で動いているか」を混同しないように記憶しておく。
+
 起動モードによる挙動の違い:
 
 - **tmux モード（`CREWVIA_TMUX=1`）**: 新しい tmux ウィンドウ `crewvia:${AGENT_NAME}-worker` が生成され、Worker がバックグラウンドで起動する。Orchestrator の制御は即座に返る。並列 Worker 起動が可能。`tmux attach -t crewvia` で出力を確認できる。

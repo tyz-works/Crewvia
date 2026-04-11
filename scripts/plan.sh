@@ -79,8 +79,13 @@ def now_iso():
 # Minimal YAML helpers (narrow subset, no external deps)
 # ---------------------------------------------------------------------------
 
-def parse_yaml(text):
-    """Parse a narrow subset: scalar fields, inline lists, block lists."""
+def parse_yaml(text, source='<yaml>'):
+    """Parse a narrow subset: scalar fields, inline lists, block lists.
+
+    Unrecognized lines raise instead of being silently dropped, so a hand-edit
+    typo (e.g. missing colon, mis-indented block list) cannot quietly produce a
+    half-loaded dict.
+    """
     lines = text.splitlines()
     result = {}
     i = 0
@@ -91,8 +96,10 @@ def parse_yaml(text):
             continue
         m = re.match(r'^([\w-]+):\s*(.*)$', line)
         if not m:
-            i += 1
-            continue
+            raise ValueError(
+                f"{source}: malformed line {i + 1}: {line!r} "
+                f"(expected `key: value`, `key: [a, b]`, or `key:` followed by `  - item` lines)"
+            )
         key = m.group(1)
         val = m.group(2).rstrip()
         if val == '':
@@ -217,11 +224,9 @@ def _dump_inline(val):
         return 'true' if val else 'false'
     if isinstance(val, int):
         return str(val)
-    s = str(val)
-    if any(ch in ',[]{}#:\'"\n' for ch in s) or s == '':
-        escaped = s.replace('\\', '\\\\').replace('"', '\\"')
-        return f'"{escaped}"'
-    return s
+    # Strings: delegate to _dump_scalar so reserved-word / int-shaped strings
+    # ('true', '123', etc.) are preserved through the YAML round-trip.
+    return _dump_scalar(str(val))
 
 
 # ---------------------------------------------------------------------------
@@ -234,23 +239,29 @@ TASK_META_KEY_ORDER = [
 ]
 
 
-def parse_frontmatter(text):
+def parse_frontmatter(text, source='<task>'):
     """Split a markdown file into (meta dict, body string)."""
     lines = text.splitlines()
     if not lines or lines[0].strip() != '---':
-        raise ValueError("missing frontmatter delimiter")
+        raise ValueError(
+            f"missing frontmatter delimiter — file must begin with a line "
+            f"containing only `---`"
+        )
     end = None
     for i in range(1, len(lines)):
         if lines[i].strip() == '---':
             end = i
             break
     if end is None:
-        raise ValueError("unterminated frontmatter")
+        raise ValueError(
+            f"unterminated frontmatter — frontmatter block must close with a "
+            f"line containing only `---` before the body"
+        )
     meta_text = '\n'.join(lines[1:end])
     body = '\n'.join(lines[end + 1:])
     if body.startswith('\n'):
         body = body[1:]
-    return parse_yaml(meta_text), body
+    return parse_yaml(meta_text, source=f"{source} (frontmatter)"), body
 
 
 def serialize_frontmatter(meta, body):
@@ -261,16 +272,23 @@ def serialize_frontmatter(meta, body):
 
 
 def parse_task_body(body):
-    """Extract Description and Result sections from task body."""
+    """Extract Description and Result sections from task body.
+
+    Only the *first* `## Description` and `## Result` headers are treated as
+    section boundaries. Later occurrences are kept verbatim inside the current
+    section, so a worker-supplied result that contains the literal text
+    `## Result` does not silently corrupt the file on the next round-trip.
+    """
     sections = {}
     current = None
     buf = []
     for line in body.splitlines():
         m = re.match(r'^##\s+(Description|Result)\s*$', line, re.IGNORECASE)
-        if m:
+        if m and m.group(1).lower() not in sections and current != m.group(1).lower():
+            name = m.group(1).lower()
             if current is not None:
                 sections[current] = '\n'.join(buf).rstrip()
-            current = m.group(1).lower()
+            current = name
             buf = []
         else:
             buf.append(line)
@@ -293,12 +311,37 @@ def load_state():
     if not os.path.exists(STATE_FILE):
         return {'active_missions': [], 'default_mission': None}
     with open(STATE_FILE) as f:
-        data = parse_yaml(f.read())
+        text = f.read()
+    try:
+        data = parse_yaml(text, source=STATE_FILE)
+    except ValueError as e:
+        die(f"failed to parse {STATE_FILE}: {e}")
     if 'active_missions' not in data or data['active_missions'] is None:
         data['active_missions'] = []
     if 'default_mission' not in data:
         data['default_mission'] = None
     return data
+
+
+def _atomic_write(path, text):
+    """Write text to path via tmp + os.replace, with fsync, so a crash mid-write
+    cannot leave a half-written file behind. The caller is responsible for
+    holding any necessary lock."""
+    os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+    tmp = f"{path}.tmp.{os.getpid()}"
+    try:
+        with open(tmp, 'w') as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        # Best-effort cleanup; never mask the original exception.
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def save_state(state):
@@ -315,9 +358,7 @@ def save_state(state):
     else:
         lines.append('active_missions: []')
     lines.append(_dump_kv('default_mission', out['default_mission']))
-    text = '\n'.join(lines) + '\n'
-    with open(STATE_FILE, 'w') as f:
-        f.write(text)
+    _atomic_write(STATE_FILE, '\n'.join(lines) + '\n')
 
 
 def mission_dir(slug):
@@ -344,13 +385,16 @@ def load_mission(slug):
     if not os.path.exists(path):
         die(f"mission '{slug}' not found at {path}")
     with open(path) as f:
-        return parse_yaml(f.read())
+        text = f.read()
+    try:
+        return parse_yaml(text, source=path)
+    except ValueError as e:
+        die(f"failed to parse {path}: {e}")
 
 
 def save_mission(slug, data):
     os.makedirs(mission_dir(slug), exist_ok=True)
-    with open(mission_yaml_path(slug), 'w') as f:
-        f.write(dump_yaml(data, key_order=MISSION_KEY_ORDER))
+    _atomic_write(mission_yaml_path(slug), dump_yaml(data, key_order=MISSION_KEY_ORDER))
 
 
 def load_task(slug, task_id):
@@ -358,13 +402,16 @@ def load_task(slug, task_id):
     if not os.path.exists(path):
         die(f"task '{task_id}' not found in mission '{slug}'")
     with open(path) as f:
-        return parse_frontmatter(f.read())
+        text = f.read()
+    try:
+        return parse_frontmatter(text, source=path)
+    except ValueError as e:
+        die(f"failed to parse {path}: {e}")
 
 
 def save_task(slug, task_id, meta, body):
     os.makedirs(tasks_dir(slug), exist_ok=True)
-    with open(task_path(slug, task_id), 'w') as f:
-        f.write(serialize_frontmatter(meta, body))
+    _atomic_write(task_path(slug, task_id), serialize_frontmatter(meta, body))
 
 
 def list_tasks(slug, base_dir=None):
@@ -381,11 +428,17 @@ def list_tasks(slug, base_dir=None):
     entries.sort()
     out = []
     for _, fn in entries:
-        with open(os.path.join(tdir, fn)) as f:
-            try:
-                meta, body = parse_frontmatter(f.read())
-            except ValueError as e:
-                die(f"failed to parse {fn}: {e}")
+        path = os.path.join(tdir, fn)
+        with open(path) as f:
+            text = f.read()
+        try:
+            meta, body = parse_frontmatter(text, source=path)
+        except ValueError as e:
+            die(
+                f"failed to parse {path}: {e}\n"
+                f"  hint: task files start with `---` / frontmatter / `---` / "
+                f"`## Description` / `## Result` (see existing tNNN.md for the template)."
+            )
         # Normalize defaults
         meta.setdefault('skills', [])
         meta.setdefault('blocked_by', [])
@@ -402,13 +455,25 @@ def list_tasks(slug, base_dir=None):
 # ---------------------------------------------------------------------------
 
 def with_lock(callback):
-    os.makedirs(QUEUE_DIR, exist_ok=True)
-    with open(LOCK_FILE, 'a+') as lf:
+    try:
+        os.makedirs(QUEUE_DIR, exist_ok=True)
+    except OSError as e:
+        die(f"cannot create queue dir {QUEUE_DIR}: {e}")
+    try:
+        lf = open(LOCK_FILE, 'a+')
+    except OSError as e:
+        die(
+            f"cannot open queue lock {LOCK_FILE}: {e}\n"
+            f"  hint: check write permission on {QUEUE_DIR}, or remove a stale lock file."
+        )
+    try:
         fcntl.flock(lf, fcntl.LOCK_EX)
         try:
             return callback()
         finally:
             fcntl.flock(lf, fcntl.LOCK_UN)
+    finally:
+        lf.close()
 
 
 # ---------------------------------------------------------------------------
@@ -478,7 +543,25 @@ def cmd_init(args):
             if existing and not force:
                 die(f"mission '{slug}' already exists. Use --force to overwrite.")
             if existing:
-                shutil.rmtree(mission_dir(slug))
+                # Non-destructive overwrite: move the previous mission to
+                # archive/<slug>.overwritten-<timestamp>/ instead of rm -rf,
+                # so worker output is never silently lost.
+                ts = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+                backup_name = f"{slug}.overwritten-{ts}"
+                os.makedirs(ARCHIVE_DIR, exist_ok=True)
+                shutil.move(mission_dir(slug), os.path.join(ARCHIVE_DIR, backup_name))
+                print(
+                    f"[plan.sh init] previous '{slug}' moved to archive/{backup_name}",
+                    file=sys.stderr,
+                )
+                # Drop the slug from active_missions so save_state doesn't
+                # leave a dangling reference if the rebuild below fails.
+                active = state.get('active_missions') or []
+                if slug in active:
+                    active.remove(slug)
+                state['active_missions'] = active
+                if state.get('default_mission') == slug:
+                    state['default_mission'] = active[0] if active else None
         else:
             slug = generate_slug(title)
 
@@ -568,6 +651,7 @@ def cmd_pull(args):
     agent = opts.get('--agent') or os.environ.get('AGENT_NAME', '')
 
     chosen_holder = [None]
+    diag = {'reason': None, 'detail': ''}
 
     def _do():
         state = load_state()
@@ -581,27 +665,69 @@ def cmd_pull(args):
                 slugs.insert(0, default)
 
         if not slugs:
+            diag['reason'] = 'no_active_missions'
+            diag['detail'] = 'state.yaml lists no active missions'
             return
+
+        # Diagnostic counters per slug
+        scanned = 0
+        pending_count = 0
+        skill_mismatch = 0
+        blocked_count = 0
+        missing_dirs = []
 
         candidates = []
         for slug in slugs:
             if not os.path.exists(mission_dir(slug)):
+                missing_dirs.append(slug)
                 continue
             tasks = list_tasks(slug)
+            scanned += len(tasks)
             done_ids = {m['id'] for (m, _) in tasks if m.get('status') in TERMINAL_STATUSES}
             for (meta, body) in tasks:
                 if meta.get('status') != 'pending':
                     continue
+                pending_count += 1
                 if requested_skills and not requested_skills.intersection(set(meta.get('skills', []))):
+                    skill_mismatch += 1
                     continue
                 bb = meta.get('blocked_by') or []
                 if any(dep not in done_ids for dep in bb):
+                    blocked_count += 1
                     continue
                 candidates.append((slug, meta, body))
 
+        if missing_dirs:
+            print(
+                f"[plan.sh pull] WARNING: state.yaml references missing mission "
+                f"directories: {missing_dirs}",
+                file=sys.stderr,
+            )
+
         if not candidates:
+            if pending_count == 0:
+                diag['reason'] = 'no_pending_tasks'
+                diag['detail'] = f'{scanned} task(s) scanned across {len(slugs)} mission(s); none pending'
+            elif skill_mismatch and not blocked_count:
+                diag['reason'] = 'no_skill_match'
+                diag['detail'] = (
+                    f'{pending_count} pending task(s) found but none match skills '
+                    f'{sorted(requested_skills) or "<any>"}'
+                )
+            elif blocked_count and not skill_mismatch:
+                diag['reason'] = 'all_blocked'
+                diag['detail'] = f'{blocked_count} pending task(s) blocked by unmet dependencies'
+            else:
+                diag['reason'] = 'no_eligible_task'
+                diag['detail'] = (
+                    f'{pending_count} pending; {skill_mismatch} skill-mismatch; '
+                    f'{blocked_count} blocked'
+                )
             return
 
+        # Priority-first sort: high-priority tasks across all active missions
+        # win before any lower-priority work, regardless of which mission they
+        # live in. Default-mission ordering is only a tiebreaker.
         slug_index = {s: i for i, s in enumerate(slugs)}
         candidates.sort(key=lambda c: (
             PRIORITY_ORDER.get(c[1].get('priority', 'medium'), 1),
@@ -629,7 +755,13 @@ def cmd_pull(args):
     with_lock(_do)
 
     if chosen_holder[0] is None:
-        sys.exit(1)
+        # exit 2 = "no task available" (idle / sleep & retry)
+        # exit 1 is reserved for real errors raised via die()
+        print(
+            f"[plan.sh pull] no task available: {diag['reason']} — {diag['detail']}",
+            file=sys.stderr,
+        )
+        sys.exit(2)
     print(json.dumps(chosen_holder[0], ensure_ascii=False))
 
 
@@ -649,6 +781,21 @@ def cmd_done(args):
                 if os.path.exists(task_path(s, task_id)):
                     matches.append(s)
             if not matches:
+                # Check archived missions to surface a more useful error if the
+                # mission was archived between pull and done (race window).
+                archived_matches = []
+                if os.path.isdir(ARCHIVE_DIR):
+                    for entry in os.listdir(ARCHIVE_DIR):
+                        archived_task = os.path.join(ARCHIVE_DIR, entry, 'tasks', f"{task_id}.md")
+                        if os.path.exists(archived_task):
+                            archived_matches.append(entry)
+                if archived_matches:
+                    die(
+                        f"task '{task_id}' exists only in archived mission(s) "
+                        f"{archived_matches}. The mission was archived before this "
+                        f"done report — re-activate the mission to record the result, "
+                        f"or merge the result manually into the archived task file."
+                    )
                 die(f"task '{task_id}' not found in any active mission.")
             if len(matches) > 1:
                 die(f"task '{task_id}' exists in multiple missions: {matches}. Use --mission.")
@@ -731,7 +878,12 @@ def _print_mission_summary(slug, archived=False):
         print(f"  {slug} — (mission.yaml missing)")
         return
     with open(mission_path) as f:
-        mission = parse_yaml(f.read())
+        text = f.read()
+    try:
+        mission = parse_yaml(text, source=mission_path)
+    except ValueError as e:
+        print(f"  {slug} — (mission.yaml unparseable: {e})")
+        return
     tasks = list_tasks(slug, base_dir=os.path.join(base, 'tasks'))
     total = len(tasks)
     done = sum(1 for (m, _) in tasks if m.get('status') == 'done')
@@ -753,7 +905,11 @@ def _print_mission_detail(slug):
         die(f"mission '{slug}' not found.")
     mission_path = os.path.join(base, 'mission.yaml')
     with open(mission_path) as f:
-        mission = parse_yaml(f.read())
+        text = f.read()
+    try:
+        mission = parse_yaml(text, source=mission_path)
+    except ValueError as e:
+        die(f"failed to parse {mission_path}: {e}")
     tasks = list_tasks(slug, base_dir=os.path.join(base, 'tasks'))
 
     print(f"Mission: {mission.get('title', '(unnamed)')}")

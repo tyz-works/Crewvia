@@ -107,10 +107,21 @@ plan.sh status で active mission の存在を確認
 ### タスクを pull する
 
 ```bash
-TASK_JSON=$(./scripts/plan.sh pull --skills "$SKILLS" --agent "$AGENT_NAME") || TASK_JSON=""
+TASK_JSON=$(./scripts/plan.sh pull --skills "$SKILLS" --agent "$AGENT_NAME")
+PULL_RC=$?
 ```
 
-`plan.sh pull` は以下の JSON を stdout に返し exit 0 する（タスクある場合）:
+`plan.sh pull` の終了コードは以下の通り、**「タスクなし」と「実エラー」を必ず区別すること**:
+
+| exit code | 意味 | Worker の対応 |
+|---|---|---|
+| `0` | タスク取得成功。stdout に JSON を出力 | JSON をパースして実行に進む |
+| `2` | タスクなし（idle）。stderr に reason を出力 | 30秒待機して再試行 |
+| `1` | 実エラー（parse 失敗 / lock 取得失敗 / 不正引数等）。stderr に詳細 | 即座に Orchestrator に報告し終了 |
+
+**`||` で雑に握り潰さない**。idle と error を取り違えると、壊れた plan ファイルや lock 競合を「ただのアイドル」として無限にリトライしてしまう。
+
+成功時の JSON 例:
 
 ```json
 {
@@ -126,7 +137,11 @@ TASK_JSON=$(./scripts/plan.sh pull --skills "$SKILLS" --agent "$AGENT_NAME") || 
 
 `mission` フィールドは Worker の所属 mission slug。完了報告時 `plan.sh done` に `--mission <slug>` で渡すこと（active mission が複数あると task_id が衝突する可能性があるため）。
 
-タスクがない場合は exit 1 で stdout は空。
+idle 時の stderr 例（参考、Worker は内容を解釈しなくて良い）:
+
+```
+[plan.sh pull] no task available: no_skill_match — 3 pending task(s) found but none match skills ['ops']
+```
 
 ### 環境変数を export してから作業開始する
 

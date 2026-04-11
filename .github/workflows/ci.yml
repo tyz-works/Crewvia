@@ -26,14 +26,20 @@ jobs:
 
       - name: classify_sh.sh (security scan)
         run: |
+          # classify_sh.sh は SAFE=exit 0 / BLOCK=exit 1 を返す。
+          # set -e 下で result=$(... classify_sh.sh ...) を直接書くと、BLOCK
+          # (exit 1) の瞬間に assignment 行で即 exit してしまい、本来の
+          # "BLOCK: ..." メッセージが出力されないまま workflow が失敗する
+          # (CI log が sea of SAFE で終わって原因不明になる)。
+          # if result=$(...); then ... else ... fi の形にすれば set -e の
+          # 早期 exit を回避しつつ、exit code からそのまま BLOCK 判定できる。
           failed=0
           while IFS= read -r -d '' f; do
-            result=$(bash scripts/shared/classify_sh.sh "$f" 2>&1)
-            if [[ "$result" == BLOCK* ]]; then
+            if result=$(bash scripts/shared/classify_sh.sh "$f" 2>&1); then
+              echo "SAFE: $f"
+            else
               echo "BLOCK: $f — $result"
               failed=1
-            else
-              echo "SAFE: $f"
             fi
           done < <(find . -name "*.sh" -not -path "./.git/*" -not -path "./scripts/shared/classify_sh.sh" -print0)
           exit $failed

@@ -13,11 +13,13 @@ No tmux required — it works standalone or with any terminal multiplexer.
 2. [Prerequisites](#prerequisites)
 3. [Setup](#setup)
 4. [Starting Agents](#starting-agents)
-5. [Taskvia Integration](#taskvia-integration)
-6. [Customizing worker-names.yaml](#customizing-worker-namesyaml)
-7. [Autonomous Improvement System](#autonomous-improvement-system)
-8. [Architecture](#architecture)
-9. [Directory Structure](#directory-structure)
+5. [Managing Tasks with plan.sh](#managing-tasks-with-plansh)
+6. [Taskvia Integration](#taskvia-integration)
+7. [Watchdog](#watchdog)
+8. [Customizing worker-names.yaml](#customizing-worker-namesyaml)
+9. [Autonomous Improvement System](#autonomous-improvement-system)
+10. [Architecture](#architecture)
+11. [Directory Structure](#directory-structure)
 
 ---
 
@@ -190,6 +192,82 @@ tmux send-keys "cd /path/to/crewvia && ./scripts/start.sh worker docs research" 
 
 ---
 
+## Managing Tasks with plan.sh
+
+`scripts/plan.sh` is the task plan management CLI. It supports multiple concurrent missions
+and is the primary interface for Orchestrators and Workers to manage task flow.
+
+### Basic usage
+
+```bash
+# Initialize a new mission
+./scripts/plan.sh init "My mission title"
+
+# Add a task to the current mission
+./scripts/plan.sh add "Task title" --skills docs,research --priority medium
+
+# Add a task blocked by another
+./scripts/plan.sh add "Task B" --skills code --blocked-by t001
+
+# Pull the next available task (Workers call this in a loop)
+./scripts/plan.sh pull --skills docs,research --agent Jiwon
+
+# Mark a task as done
+./scripts/plan.sh done t002 "Updated README with new sections" --mission 20260412-example
+
+# Show mission status
+./scripts/plan.sh status
+./scripts/plan.sh status --mission 20260412-example
+./scripts/plan.sh status --all   # show all active missions
+```
+
+### Multi-mission support
+
+Multiple missions can be active simultaneously. Each mission lives under
+`queue/missions/<slug>/` and has its own task list:
+
+```
+queue/
+  state.yaml              # active mission slugs + default_mission
+  missions/
+    20260412-auth/        # mission slug (auto-generated or explicit)
+      mission.yaml        # title, status, next_task_id
+      tasks/
+        t001.md           # frontmatter + Description / Result
+        t002.md
+    20260412-refactor/
+      mission.yaml
+      tasks/
+        t001.md
+  archive/                # completed missions moved here by plan.sh archive
+```
+
+When multiple missions are active, `pull` picks the highest-priority available task
+across all missions. Pass `--mission <slug>` to scope operations to a single mission.
+
+### `--target-dir` option
+
+Workers can be scoped to a specific external project directory using `--target-dir`.
+This enables a single Crewvia installation to coordinate work across multiple repositories.
+
+```bash
+# Add a task targeting an external project
+./scripts/plan.sh add "Update config" --skills ops --target-dir /path/to/other-repo
+
+# Pull only tasks for a specific target directory
+./scripts/plan.sh pull --skills ops --target-dir /path/to/other-repo
+```
+
+When `TARGET_DIR` is set in the environment (done automatically by `start.sh`),
+`pull` filters tasks to only return those matching that directory.
+Tasks with no `target_dir` are treated as crewvia-local tasks.
+
+> **Important**: Workers operating on a target project must use absolute paths
+> (`$CREWVIA_REPO/scripts/plan.sh`) for all plan.sh calls, since their working
+> directory is set to the target project.
+
+---
+
 ## Taskvia Integration
 
 [Taskvia](https://taskvia.vercel.app) is a lightweight kanban WebUI that serves as the
@@ -246,6 +324,54 @@ When `TASKVIA_TOKEN` is not set:
 - PreToolUse hook exits `0` immediately (all tools allowed)
 - PostToolUse hook prints log entries to stdout only
 - No approval UI is available; suitable for trusted local development
+
+---
+
+## Watchdog
+
+`scripts/watchdog.sh` monitors Worker liveness using heartbeat files in `registry/heartbeats/`.
+It is automatically started by `start.sh` when launching an Orchestrator.
+
+### How it works
+
+Each Worker periodically writes a Unix timestamp to `registry/heartbeats/<AgentName>`.
+The watchdog checks all heartbeat files at a configurable interval and alerts when a
+Worker has not updated its heartbeat recently.
+
+```
+registry/heartbeats/
+  Kai          # last heartbeat timestamp (Unix seconds)
+  Luca
+  Jiwon
+```
+
+When a Worker goes stale:
+- A warning is printed to stderr: `[watchdog] STALE: Kai — last heartbeat 720秒前`
+- If `TASKVIA_TOKEN` is set, an `alert` log is posted to Taskvia
+
+### Configuration
+
+```bash
+# Default settings (started automatically with Orchestrator)
+./scripts/watchdog.sh
+
+# Custom threshold and interval
+./scripts/watchdog.sh --threshold 300 --interval 30
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--threshold` | `600` (10 min) | Seconds without heartbeat before a Worker is considered stale |
+| `--interval` | `60` (1 min) | How often the watchdog polls heartbeat files |
+
+### Manual start
+
+The watchdog runs automatically when you start an Orchestrator. To run it manually
+(e.g., in standalone mode without tmux):
+
+```bash
+bash scripts/watchdog.sh --threshold 300 &
+```
 
 ---
 
@@ -437,7 +563,23 @@ crewvia/
 │   ├── orchestrator.md            # Orchestrator system prompt
 │   └── worker.md                  # Worker system prompt
 ├── scripts/
-│   └── start.sh                   # Agent launcher (sets AGENT_NAME, starts Claude Code)
+│   ├── start.sh                   # Agent launcher (sets AGENT_NAME, starts Claude Code)
+│   ├── plan.sh                    # Task plan management CLI (multi-mission, target-dir)
+│   ├── watchdog.sh                # Worker liveness monitor (heartbeat-based)
+│   ├── taskvia-sync.sh            # queue → Taskvia sync
+│   ├── assign-name.sh             # Skill-hash → Worker name assignment
+│   └── git-helpers.sh             # Shared git utilities
+├── queue/
+│   ├── state.yaml                 # Active mission slugs + default_mission
+│   ├── missions/<slug>/           # Per-mission task files
+│   │   ├── mission.yaml           # Title, status, next_task_id
+│   │   └── tasks/tNNN.md          # Task frontmatter + Description / Result
+│   └── archive/                   # Completed missions
+├── registry/
+│   ├── workers.yaml               # Worker skills and experience (task_count)
+│   └── heartbeats/                # Worker liveness files (written by Workers, read by watchdog)
+├── knowledge/
+│   └── <skill>.md                 # Per-skill knowledge base (injected into Worker prompts)
 ├── CLAUDE.md                      # System spec and design decisions
 └── README.md                      # This file
 ```

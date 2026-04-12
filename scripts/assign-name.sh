@@ -2,8 +2,24 @@
 set -euo pipefail
 
 # assign-name.sh — Registry-first worker name assignment
-# Usage: ./scripts/assign-name.sh [skill1 skill2 ...]
-# Same skill set returns the registered name, or assigns a new one from the pool.
+#
+# Usage:
+#   ./scripts/assign-name.sh [skill1 skill2 ...]
+#
+# 引数:
+#   [skill ...]   スキルタグ（スペース区切り）。同じスキルセットには同じ名前が返る。
+#                 省略時はスキルなしとして扱い、未登録なら新規名前を割り当て。
+#
+# 動作:
+#   1. registry/workers.yaml から同スキルセットの登録名を検索
+#   2. 見つかれば同じ名前を返す（継続性の確保）
+#   3. なければ config/worker-names.yaml のプールから未使用の名前を割り当て
+#
+# 出力:
+#   stdout に決定した名前を出力（例: "Haruto"）
+#
+# 依存:
+#   python3, config/worker-names.yaml, registry/workers.yaml
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"

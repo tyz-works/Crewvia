@@ -2,9 +2,23 @@
 set -euo pipefail
 
 # start.sh — Launch a crewvia agent (Orchestrator or Worker)
+#
 # Usage:
 #   ./scripts/start.sh orchestrator               # Start as Orchestrator
 #   ./scripts/start.sh worker [skill1 skill2 ...]  # Start as Worker with given skills
+#
+# 引数:
+#   orchestrator              Orchestrator ロールで起動
+#   worker [skill ...]        指定スキルで Worker を起動（例: worker bash code）
+#
+# 環境変数:
+#   TASKVIA_URL               Taskvia WebUI の URL（デフォルト: https://taskvia.vercel.app）
+#   TASKVIA_TOKEN             Taskvia API 認証トークン
+#   CREWVIA_WIP_LIMIT         Worker の WIP 上限（デフォルト: 8、config/crewvia.yaml でも設定可）
+#   CREWVIA_ORCHESTRATOR_MODEL  Orchestrator が使う Claude モデル ID
+#   CREWVIA_WORKER_MODEL        Worker が使う Claude モデル ID
+#   CREWVIA_TMUX              tmux モード制御（1=有効 / 0=無効、未設定時は起動時に選択）
+#   TARGET_DIR                Worker 起動時の作業ディレクトリ（他プロジェクトを対象とする場合）
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"

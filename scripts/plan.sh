@@ -16,10 +16,22 @@ set -euo pipefail
 #   plan.sh init "<title>" [--mission <slug>] [--force]
 #   plan.sh add  "<title>" [--mission <slug>] --skills <csv> [--blocked-by <csv>]
 #                          [--priority high|medium|low] [--description <text>]
+#                          [--target-dir <path>]
 #   plan.sh pull [--mission <slug>] --skills <csv> [--agent <name>]
+#                [--target-dir <path>]
 #   plan.sh done <task_id> "<result>" [--mission <slug>]
 #   plan.sh status [--mission <slug>] [--all]
 #   plan.sh archive <slug>
+#
+# 環境変数:
+#   CREWVIA_QUEUE   queue ディレクトリのパス（デフォルト: <repo_root>/queue）
+#   AGENT_NAME      pull 時に使用するエージェント名（--agent の代替）
+#   TARGET_DIR      pull 時のターゲットディレクトリフィルタ（--target-dir の代替）
+#
+# 終了コード (pull サブコマンド):
+#   0   タスク取得成功（stdout に JSON を出力）
+#   2   タスクなし（idle）
+#   1   実エラー（パース失敗 / lock 競合 / 不正引数等）
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"

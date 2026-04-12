@@ -2,8 +2,22 @@
 set -euo pipefail
 
 # watchdog.sh — Worker 死活監視
-# Usage: bash scripts/watchdog.sh [--threshold <秒数>] [--interval <秒数>]
-# Orchestrator の start.sh から自動起動される。直接実行も可。
+#
+# Usage:
+#   bash scripts/watchdog.sh [--threshold <秒数>] [--interval <秒数>]
+#
+# 引数:
+#   --threshold <秒数>   ハートビートが途切れてから警告するまでの秒数（デフォルト: 600）
+#   --interval  <秒数>   監視ループのポーリング間隔（秒）（デフォルト: 60）
+#
+# 環境変数:
+#   TASKVIA_URL     Taskvia WebUI の URL（デフォルト: https://taskvia.vercel.app）
+#   TASKVIA_TOKEN   Taskvia API 認証トークン（設定時のみ警告ログを投稿）
+#
+# 動作:
+#   registry/heartbeats/ 配下のファイルを監視し、<threshold> 秒以上更新されていない
+#   Worker を検出して警告を出す。TASKVIA_TOKEN が設定されていれば Taskvia にもログ投稿。
+#   Orchestrator の start.sh から自動起動される。直接実行も可。
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"

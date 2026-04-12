@@ -274,7 +274,10 @@ if [[ "${CREWVIA_TMUX:-0}" == "1" ]]; then
   # ユーザーメッセージがないと Claude がハングするため send-keys で補う。
   sleep 5
   if [[ "${ROLE}" == "worker" ]]; then
-    KICKOFF_MSG="ミッション開始。./scripts/plan.sh pull --agent ${AGENT_NAME} --skills ${SKILLS} でタスクを取得し、指示に従って作業してください。完了したら ./scripts/plan.sh done で報告。"
+    # TARGET_DIR が設定されている場合は --target-dir を渡して target 不一致タスクをスキップ
+    PULL_TARGET_DIR_ARG=""
+    [[ -n "${TARGET_DIR:-}" ]] && PULL_TARGET_DIR_ARG=" --target-dir ${TARGET_DIR}"
+    KICKOFF_MSG="ミッション開始。./scripts/plan.sh pull --agent ${AGENT_NAME} --skills ${SKILLS}${PULL_TARGET_DIR_ARG} でタスクを取得し、指示に従って作業してください。完了したら ./scripts/plan.sh done で報告。"
   else
     KICKOFF_MSG="ミッション開始。./scripts/plan.sh status で状態を確認し、タスク分解・Worker 割り当て・全体管理を開始してください。"
   fi

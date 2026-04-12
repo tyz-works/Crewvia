@@ -660,9 +660,19 @@ def cmd_pull(args):
         '--mission': 'value',
         '--skills': 'value',
         '--agent': 'value',
+        '--target-dir': 'value',
     })
     requested_skills = {s.strip() for s in opts.get('--skills', '').split(',') if s.strip()}
     agent = opts.get('--agent') or os.environ.get('AGENT_NAME', '')
+
+    # Determine effective target_dir for filtering:
+    # --target-dir flag > TARGET_DIR env var > None (crewvia-local)
+    explicit_td = opts.get('--target-dir')
+    if explicit_td:
+        effective_target = os.path.abspath(os.path.expanduser(explicit_td))
+    else:
+        env_td = os.environ.get('TARGET_DIR', '').strip()
+        effective_target = os.path.abspath(env_td) if env_td else None
 
     chosen_holder = [None]
     diag = {'reason': None, 'detail': ''}
@@ -688,6 +698,7 @@ def cmd_pull(args):
         pending_count = 0
         skill_mismatch = 0
         blocked_count = 0
+        target_mismatch = 0
         missing_dirs = []
 
         candidates = []
@@ -705,6 +716,19 @@ def cmd_pull(args):
                 if requested_skills and not requested_skills.intersection(set(meta.get('skills', []))):
                     skill_mismatch += 1
                     continue
+                # Target-dir filtering:
+                # (1) effective_target is None AND task target_dir is None → match (crewvia-local)
+                # (2) effective_target is set AND task target_dir matches   → match
+                # (3) otherwise → skip
+                task_td = meta.get('target_dir')
+                if effective_target is None:
+                    if task_td is not None:
+                        target_mismatch += 1
+                        continue
+                else:
+                    if task_td != effective_target:
+                        target_mismatch += 1
+                        continue
                 bb = meta.get('blocked_by') or []
                 if any(dep not in done_ids for dep in bb):
                     blocked_count += 1
@@ -722,20 +746,27 @@ def cmd_pull(args):
             if pending_count == 0:
                 diag['reason'] = 'no_pending_tasks'
                 diag['detail'] = f'{scanned} task(s) scanned across {len(slugs)} mission(s); none pending'
-            elif skill_mismatch and not blocked_count:
+            elif skill_mismatch and not blocked_count and not target_mismatch:
                 diag['reason'] = 'no_skill_match'
                 diag['detail'] = (
                     f'{pending_count} pending task(s) found but none match skills '
                     f'{sorted(requested_skills) or "<any>"}'
                 )
-            elif blocked_count and not skill_mismatch:
+            elif target_mismatch and not skill_mismatch and not blocked_count:
+                diag['reason'] = 'no_target_match'
+                target_label = effective_target or '(crewvia-local)'
+                diag['detail'] = (
+                    f'{pending_count} pending task(s) found but none match target_dir '
+                    f'{target_label!r}'
+                )
+            elif blocked_count and not skill_mismatch and not target_mismatch:
                 diag['reason'] = 'all_blocked'
                 diag['detail'] = f'{blocked_count} pending task(s) blocked by unmet dependencies'
             else:
                 diag['reason'] = 'no_eligible_task'
                 diag['detail'] = (
                     f'{pending_count} pending; {skill_mismatch} skill-mismatch; '
-                    f'{blocked_count} blocked'
+                    f'{target_mismatch} target-mismatch; {blocked_count} blocked'
                 )
             return
 

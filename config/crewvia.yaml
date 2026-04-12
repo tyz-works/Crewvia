@@ -27,3 +27,20 @@ wip_limit: 8
 #   CREWVIA_WORKER_MODEL=claude-sonnet-4-6
 orchestrator_model: claude-opus-4-6
 worker_model: claude-sonnet-4-6
+
+# ===== 起動モード =====
+# tmux  — Orchestrator + Worker を tmux セッション "crewvia" 内に展開（並列 Worker 可）
+# inline — 単独プロセスで起動（Worker 並列不可、デバッグ向き）
+#
+# 環境変数での上書き: CREWVIA_TMUX=1 (tmux) / CREWVIA_TMUX=0 (inline)
+mode: tmux
+
+# ===== Taskvia 連携 =====
+# Taskvia WebUI の URL。
+# 環境変数での上書き: TASKVIA_URL=https://...
+taskvia_url: https://taskvia.vercel.app
+
+# Taskvia API トークン。
+# セキュリティのため、トークンは config/.taskvia-token に記載してください（gitignore 済み）。
+# ファイルが存在しない場合はスタンドアロンモードで起動します。
+# 環境変数での上書き: TASKVIA_TOKEN=sk-...

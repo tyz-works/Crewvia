@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# crewvia — One-command launcher for the crewvia multi-agent system
+#
+# Usage:
+#   ./crewvia                        # Orchestrator を tmux モードで起動
+#   ./crewvia worker code typescript  # Worker を手動起動
+#   ./crewvia status                 # 稼働中の mission/worker を表示
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG_FILE="${SCRIPT_DIR}/config/crewvia.yaml"
+TOKEN_FILE="${SCRIPT_DIR}/config/.taskvia-token"
+
+# --- config から設定を読み込む ---
+read_config() {
+  local key="$1" default="${2:-}"
+  if [[ -f "$CONFIG_FILE" ]]; then
+    local val
+    val=$(grep -E "^${key}:" "$CONFIG_FILE" 2>/dev/null | head -1 | sed 's/^[^:]*:[[:space:]]*//' | sed 's/[[:space:]]*#.*//' | tr -d '"' | tr -d "'")
+    if [[ -n "$val" ]]; then
+      echo "$val"
+      return
+    fi
+  fi
+  echo "$default"
+}
+
+# --- Taskvia トークンを読み込む ---
+if [[ -z "${TASKVIA_TOKEN:-}" ]] && [[ -f "$TOKEN_FILE" ]]; then
+  TASKVIA_TOKEN="$(tr -d '[:space:]' < "$TOKEN_FILE")"
+  export TASKVIA_TOKEN
+fi
+
+# --- Taskvia URL ---
+if [[ -z "${TASKVIA_URL:-}" ]]; then
+  export TASKVIA_URL="$(read_config taskvia_url "https://taskvia.vercel.app")"
+fi
+
+# --- 起動モード ---
+if [[ -z "${CREWVIA_TMUX:-}" ]]; then
+  MODE="$(read_config mode "tmux")"
+  case "$MODE" in
+    tmux)  export CREWVIA_TMUX=1 ;;
+    inline) export CREWVIA_TMUX=0 ;;
+    *)
+      echo "[crewvia] WARNING: 不明な mode '$MODE'。tmux で起動します。" >&2
+      export CREWVIA_TMUX=1
+      ;;
+  esac
+fi
+
+# --- サブコマンド ---
+SUBCMD="${1:-orchestrator}"
+
+case "$SUBCMD" in
+  status)
+    exec bash "${SCRIPT_DIR}/scripts/plan.sh" status "${@:2}"
+    ;;
+  worker)
+    shift
+    exec bash "${SCRIPT_DIR}/scripts/start.sh" worker "$@"
+    ;;
+  orchestrator|start)
+    exec bash "${SCRIPT_DIR}/scripts/start.sh" orchestrator
+    ;;
+  help|-h|--help)
+    cat <<HELP
+crewvia — マルチエージェントシステム ランチャー
+
+Usage:
+  ./crewvia                         Orchestrator を起動 (デフォルト)
+  ./crewvia worker <skill> ...      Worker を起動
+  ./crewvia status [--mission slug] ミッション状態を表示
+
+Config:  config/crewvia.yaml
+Token:   config/.taskvia-token  (1行にトークンを書く、gitignore 済み)
+
+Environment variables (config より優先):
+  CREWVIA_TMUX=1|0        起動モード
+  TASKVIA_TOKEN=sk-...    API トークン
+  TASKVIA_URL=https://... Taskvia URL
+HELP
+    ;;
+  *)
+    echo "[crewvia] Unknown command: $SUBCMD" >&2
+    echo "  Run './crewvia help' for usage." >&2
+    exit 1
+    ;;
+esac

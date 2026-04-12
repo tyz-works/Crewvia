@@ -29,3 +29,6 @@ Thumbs.db
 # Crewvia runtime state (per-session)
 queue/
 registry/heartbeats/
+
+# Crewvia secrets
+config/.taskvia-token

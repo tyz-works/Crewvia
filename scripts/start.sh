@@ -93,7 +93,15 @@ fi
 # Orchestrator が tmux モードを選ぶと、この env は exec claude に引き継がれ、
 # Orchestrator が後続で起動する Worker もすべて tmux ウィンドウで動く。
 if [[ "${ROLE}" == "orchestrator" ]] && [[ -z "${CREWVIA_TMUX:-}" ]]; then
-  if ! command -v tmux >/dev/null 2>&1; then
+  # config/crewvia.yaml の mode 設定を読む
+  MODE_FROM_CONFIG=$(grep -E '^mode:[[:space:]]*\S' "$CONFIG_FILE" 2>/dev/null | awk '{print $2}' | tr -d '"' | head -1)
+  if [[ "$MODE_FROM_CONFIG" == "tmux" ]]; then
+    export CREWVIA_TMUX=1
+    echo "[crewvia] tmux モードで起動します（config 設定）。"
+  elif [[ "$MODE_FROM_CONFIG" == "inline" ]]; then
+    export CREWVIA_TMUX=0
+    echo "[crewvia] インラインモードで起動します（config 設定）。"
+  elif ! command -v tmux >/dev/null 2>&1; then
     echo "[crewvia] tmux 未検出 → インラインモードで起動します。" >&2
     echo "          （並列 Worker 起動には 'brew install tmux' を推奨）" >&2
     export CREWVIA_TMUX=0
@@ -156,9 +164,15 @@ fi
 
 echo "[crewvia] Starting as $AGENT_NAME ($ROLE)"
 
-# Check for TASKVIA_TOKEN
+# Check for TASKVIA_TOKEN (try token file if env not set)
 if [[ -z "${TASKVIA_TOKEN:-}" ]]; then
-  echo "[crewvia] WARNING: TASKVIA_TOKEN is not set. Running in standalone mode (no Taskvia integration)." >&2
+  TOKEN_FILE="${REPO_ROOT}/config/.taskvia-token"
+  if [[ -f "$TOKEN_FILE" ]]; then
+    TASKVIA_TOKEN="$(tr -d '[:space:]' < "$TOKEN_FILE")"
+    export TASKVIA_TOKEN
+  else
+    echo "[crewvia] WARNING: TASKVIA_TOKEN is not set. Running in standalone mode (no Taskvia integration)." >&2
+  fi
 fi
 
 # Resolve agent markdown path

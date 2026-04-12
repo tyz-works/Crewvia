@@ -44,6 +44,7 @@ import fcntl
 import re
 import shutil
 import hashlib
+import urllib.request
 from datetime import datetime, timezone
 
 QUEUE_DIR = sys.argv[1]
@@ -498,6 +499,65 @@ def generate_slug(title):
 
 
 # ---------------------------------------------------------------------------
+# Taskvia sync helpers (best-effort, standalone-compatible)
+# ---------------------------------------------------------------------------
+
+_TASKVIA_URL = os.environ.get('TASKVIA_URL', '').rstrip('/')
+_TASKVIA_TOKEN = os.environ.get('TASKVIA_TOKEN', '')
+
+
+def _taskvia_request(method, path, payload=None):
+    """HTTP call to Taskvia. Best-effort: never raises, logs warnings to stderr."""
+    if not (_TASKVIA_URL and _TASKVIA_TOKEN):
+        return None
+    url = f"{_TASKVIA_URL}{path}"
+    headers = {
+        'Content-Type': 'application/json',
+        'Authorization': f'Bearer {_TASKVIA_TOKEN}',
+    }
+    body = json.dumps(payload).encode() if payload is not None else None
+    try:
+        req = urllib.request.Request(url, data=body, headers=headers, method=method)
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read().decode())
+    except Exception as e:
+        print(f"[taskvia-sync] WARNING: {method} {path} failed: {e}", file=sys.stderr)
+        return None
+
+
+def taskvia_sync_init(slug, title):
+    _taskvia_request('POST', '/api/missions', {'slug': slug, 'title': title})
+
+
+def taskvia_sync_add(slug, task_id, title, skills, priority, blocked_by):
+    _taskvia_request('POST', f'/api/missions/{slug}/tasks', {
+        'id': task_id,
+        'title': title,
+        'skills': skills,
+        'priority': priority,
+        'blocked_by': blocked_by,
+    })
+
+
+def taskvia_sync_pull(slug, task_id, assignee):
+    _taskvia_request('PATCH', f'/api/missions/{slug}/tasks/{task_id}', {
+        'status': 'in_progress',
+        'assignee': assignee,
+    })
+
+
+def taskvia_sync_done(slug, task_id, result):
+    _taskvia_request('PATCH', f'/api/missions/{slug}/tasks/{task_id}', {
+        'status': 'done',
+        'result': result,
+    })
+
+
+def taskvia_sync_archive(slug):
+    _taskvia_request('PATCH', f'/api/missions/{slug}', {'status': 'archived'})
+
+
+# ---------------------------------------------------------------------------
 # Argument parsing helper
 # ---------------------------------------------------------------------------
 
@@ -534,6 +594,7 @@ def cmd_init(args):
         die("init requires a mission title")
     title = positional[0]
     force = opts.get('--force', False)
+    sync_holder = [None]  # (slug, title)
 
     def _do():
         state = load_state()
@@ -582,11 +643,14 @@ def cmd_init(args):
         state['active_missions'] = active
         state['default_mission'] = slug
         save_state(state)
+        sync_holder[0] = (slug, title)
         print(f"Initialized mission: {slug}")
         print(f"  title: {title}")
         print(f"  path:  {mission_dir(slug)}")
 
     with_lock(_do)
+    if sync_holder[0]:
+        taskvia_sync_init(*sync_holder[0])
 
 
 def cmd_add(args):
@@ -601,6 +665,7 @@ def cmd_add(args):
     if not positional:
         die("add requires a task title")
     title = positional[0]
+    sync_holder = [None]  # (slug, task_id, title, skills, priority, blocked_by)
 
     skills = [s.strip() for s in opts.get('--skills', '').split(',') if s.strip()]
     blocked_by = [s.strip() for s in opts.get('--blocked-by', '').split(',') if s.strip()]
@@ -646,6 +711,7 @@ def cmd_add(args):
         }
         body = build_task_body(description, '')
         save_task(slug, task_id, meta, body)
+        sync_holder[0] = (slug, task_id, title, skills, priority, blocked_by)
 
         mission['next_task_id'] = task_num + 1
         save_mission(slug, mission)
@@ -653,6 +719,8 @@ def cmd_add(args):
         print(f"Added: {slug}/{task_id} — {title}{suffix}")
 
     with_lock(_do)
+    if sync_holder[0]:
+        taskvia_sync_add(*sync_holder[0])
 
 
 def cmd_pull(args):
@@ -808,6 +876,7 @@ def cmd_pull(args):
             file=sys.stderr,
         )
         sys.exit(2)
+    taskvia_sync_pull(chosen_holder[0]['mission'], chosen_holder[0]['id'], agent)
     print(json.dumps(chosen_holder[0], ensure_ascii=False))
 
 
@@ -817,6 +886,7 @@ def cmd_done(args):
         die("done requires <task_id> and <result>")
     task_id = positional[0]
     result = positional[1]
+    sync_holder = [None]  # (slug, task_id, result)
 
     def _do():
         state = load_state()
@@ -859,6 +929,7 @@ def cmd_done(args):
         desc, _ = parse_task_body(body)
         new_body = build_task_body(desc, result)
         save_task(slug, task_id, meta, new_body)
+        sync_holder[0] = (slug, task_id, result)
 
         # Mission complete?
         tasks = list_tasks(slug)
@@ -871,6 +942,8 @@ def cmd_done(args):
         print(f"Done: {slug}/{task_id}")
 
     with_lock(_do)
+    if sync_holder[0]:
+        taskvia_sync_done(*sync_holder[0])
 
 
 def cmd_status(args):
@@ -1016,6 +1089,7 @@ def cmd_archive(args):
         print(f"Archived: {slug} → archive/{slug}")
 
     with_lock(_do)
+    taskvia_sync_archive(slug)
 
 
 # ---------------------------------------------------------------------------

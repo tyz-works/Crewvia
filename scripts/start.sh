@@ -268,6 +268,19 @@ if [[ "${CREWVIA_TMUX:-0}" == "1" ]]; then
   tmux send-keys -t "$TARGET" "$LAUNCH_CMD"
   tmux send-keys -t "$TARGET" Enter
   echo "[crewvia] Agent launched in tmux window: ${SESSION}:${WINDOW_NAME}"
+
+  # Claude が起動して入力待ちになるまで待ってから kickoff メッセージを送る。
+  # インラインモードは exec claude に引数を渡せるが、tmux モードは
+  # ユーザーメッセージがないと Claude がハングするため send-keys で補う。
+  sleep 5
+  if [[ "${ROLE}" == "worker" ]]; then
+    KICKOFF_MSG="ミッション開始。./scripts/plan.sh pull --agent ${AGENT_NAME} --skills ${SKILLS} でタスクを取得し、指示に従って作業してください。完了したら ./scripts/plan.sh done で報告。"
+  else
+    KICKOFF_MSG="ミッション開始。./scripts/plan.sh status で状態を確認し、タスク分解・Worker 割り当て・全体管理を開始してください。"
+  fi
+  tmux send-keys -t "$TARGET" "$KICKOFF_MSG"
+  tmux send-keys -t "$TARGET" Enter
+  echo "[crewvia] Kickoff message sent to ${SESSION}:${WINDOW_NAME}"
 else
   # Default: run inline (no tmux)
   # Orchestrator 起動時に watchdog をバックグラウンドで起動

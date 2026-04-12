@@ -732,3 +732,121 @@ rm registry/heartbeats/{AGENT_NAME}
 ```
 
 これにより watchdog の警告が止まる。
+
+---
+
+## 15. 依頼取り込みフロー（Taskvia Request Intake）
+
+Orchestrator は起動時に taskvia の未処理依頼を確認し、必要に応じて mission に変換する。
+
+### 起動時の確認手順
+
+セッション開始 (§2. 起動時の初期化) の後に実行すること:
+
+```bash
+# 未処理依頼の一覧を確認
+bash scripts/fetch-requests.sh --status pending
+```
+
+出力例:
+```
+=== Taskvia Requests (status=pending) — 2 件 ===
+
+[abc123xyz] ログビューアの改善
+  Status  : pending
+  Priority: medium
+  Skills  : typescript, code
+  Target  : /Users/tyz/workspace/taskvia
+  Created : 2026-04-12T03:00:00.000Z
+
+[def456uvw] OCI インスタンス監視スクリプト追加
+  Status  : pending
+  Priority: high
+  Skills  : ops, bash
+  Target  : (crewvia)
+  Created : 2026-04-12T04:00:00.000Z
+```
+
+pending が 0 件なら取り込み作業は不要。通常のミッション受領フローに進む。
+
+### 依頼の取り込み手順
+
+1 件ずつ詳細を確認してから取り込むこと:
+
+```bash
+# 依頼の詳細を確認
+bash scripts/fetch-requests.sh --process <id>
+
+# 問題なければ mission に変換
+bash scripts/process-request.sh <id>
+```
+
+`process-request.sh` は以下を自動実行する:
+- `plan.sh init` で mission を作成 (slug: `YYYYMMDD-req<short_id>`)
+- `plan.sh add` で body を含む仮タスク t001 を追加
+- `PATCH /api/requests/<id>` で `status=processing` に書き戻す
+
+### タスク分解
+
+`process-request.sh` が作成するのは **仮タスク t001 のみ**。
+Orchestrator が実際の作業内容に合わせてタスクを分解すること:
+
+```bash
+# 仮タスクを確認
+bash scripts/plan.sh status --mission <MISSION_SLUG>
+
+# 適切なタスクを追加（仮タスクは Worker が pull して内容を把握するのに使う）
+bash scripts/plan.sh add "実装: フィルタUI追加" \
+  --mission <MISSION_SLUG> \
+  --skills typescript,code \
+  --blocked-by t001
+```
+
+`target_dir` がある依頼は `--target-dir` を `plan.sh add` に渡すこと（`process-request.sh` が自動で設定済み）:
+```bash
+bash scripts/plan.sh add "実装: フィルタUI追加" \
+  --mission <MISSION_SLUG> \
+  --skills typescript \
+  --target-dir /Users/tyz/workspace/taskvia
+```
+
+### Worker 起動
+
+タスク分解後は通常の Worker 起動フロー (§6) に従う:
+
+```bash
+bash scripts/start.sh worker typescript code
+```
+
+### 完了時の書き戻し
+
+mission 完了報告 (§11) の後、taskvia にも完了を書き戻すこと:
+
+```bash
+curl -X PATCH "${TASKVIA_URL}/api/requests/<id>" \
+  -H "Authorization: Bearer ${TASKVIA_TOKEN}" \
+  -H "Content-Type: application/json" \
+  -d '{"status": "done"}'
+```
+
+または `--json` フラグで取得して自動化:
+
+```bash
+# 全 processing 依頼を確認
+bash scripts/fetch-requests.sh --status processing --json | \
+  python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+for r in data.get('requests', []):
+    print(r['id'], r['title'])
+"
+```
+
+### エラー時の対応
+
+| 状況 | 対応 |
+|------|------|
+| `fetch-requests.sh` が失敗 | TASKVIA_URL / TASKVIA_TOKEN を確認。Taskvia 非接続時はスキップして通常フローへ |
+| `process-request.sh` の書き戻し失敗 | mission は作成済み。後で手動 PATCH すれば良い |
+| 依頼が `processing` 状態のまま放置 | `fetch-requests.sh --status processing` で確認し、完了済みなら `status=done` に更新 |
+| 依頼を却下したい場合 | `PATCH /api/requests/<id>` で `status=rejected` に更新 |

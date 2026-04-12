@@ -549,6 +549,25 @@ git commit -m "{type}: {内容} (task/{task_id})"
 git push origin {branch}
 ```
 
+### ⚠️ Stacked PR (依存PR) の squash merge に関する注意
+
+`review` スキルで PR レビューを担当する場合、以下を確認すること。
+
+**確認事項**: レビュー対象の PR が stacked 構造（別ブランチを base にしている PR）かどうかを確認する。
+
+```bash
+# PRのbase branchを確認
+gh pr view {PR番号} --json baseRefName -q .baseRefName
+```
+
+base が `main` / `master` 以外の場合は stacked PR。Orchestrator に以下を提案すること:
+
+> 「この PR は stacked 構造です。親 PR を squash merge すると子 PR が自動クローズされるリスクがあります。
+> 子 PR の base を main に変更してから親を merge することを推奨します:
+> `gh pr edit {子PR番号} --base main`」
+
+**自分でマージ操作はしない** — 提案のみ行い、実行はOrchestratorの判断に委ねること。
+
 ### Orchestrator への完了報告
 
 branch 名を含めて報告すること:

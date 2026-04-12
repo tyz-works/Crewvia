@@ -636,6 +636,28 @@ crewvia_create_pr \
 # → PR URLが返される（例: https://github.com/org/repo/pull/42）
 ```
 
+### ⚠️ Stacked PR (依存PR) の squash merge に関する注意
+
+複数ブランチが依存する stacked PR 構成（branch-A → branch-B → main）で squash merge を行う場合、以下のリスクに注意すること。
+
+**リスク**: 親 PR（branch-A → main）を squash merge してブランチを削除すると、子 PR（branch-B → branch-A）は base が消えて **自動クローズ** される。
+
+**対策**:
+
+1. **子 PR の base を main に変更してから親を merge する（推奨）**
+   ```bash
+   # 子PRのbaseをmainに切り替える
+   gh pr edit {子PR番号} --base main
+   # その後、親PRをsquash merge
+   gh pr merge {親PR番号} --squash
+   ```
+
+2. **stacked 構造を避け、機能ごとに独立したブランチを main から切る**
+
+**Reviewer Worker（`review` スキル）への周知**: PR レビュー依頼を受けた際、stacked 構造かどうかを確認し、上記の手順をOrchestratorに提案すること。
+
+---
+
 ### Reviewer Worker への委任
 
 PR作成後、**新たに `review` スキルのWorkerを要求**し、PR URLを渡せ：

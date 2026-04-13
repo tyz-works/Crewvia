@@ -554,7 +554,7 @@ def taskvia_sync_done(slug, task_id, result):
 
 
 def taskvia_sync_archive(slug):
-    _taskvia_request('PATCH', f'/api/missions/{slug}', {'status': 'archived'})
+    _taskvia_request('DELETE', f'/api/missions/{slug}')
 
 
 # ---------------------------------------------------------------------------

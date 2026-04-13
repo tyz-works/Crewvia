@@ -116,11 +116,13 @@ plan.sh status --mission <slug> で登録内容を確認
   ↓
 必要なスキルセットで Workers を起動:
   bash scripts/start.sh worker <skill1> [skill2]
-  （タスクは渡さない。Workers が自分で pull する）
+  ※ タスクの割り当ては Dispatcher が自動で行う。Orchestrator は Workers にタスクを送らない
   ↓
-plan.sh status を定期確認（watchdog が liveness も監視）
+Dispatcher が Worker にタスクを割り当て・進行管理する（自動）
   ↓
-mission.yaml status: done → plan.sh archive <slug> で退避 → ユーザーへ報告
+Dispatcher から通知を受け取る:
+  「要求スキル [...] の Worker を起動してください」→ §16 参照
+  「全ミッション完了」→ plan.sh archive <slug> で退避 → ユーザーへ報告
 ```
 
 複数 mission を並走させる場合は、各 mission に対してこのフローを独立に回す。Workers は **active 全 mission を priority 優先で横断的に pull する**（同一優先度のタイブレークは default mission 優先 → 末尾は task id 順）。つまり緊急 mission の `high` タスクは、default mission の `medium` タスクよりも先に消化される。同一優先度の中では default mission に積んだ順から消化されるので、ルーティン作業とアドホックを `default` / `非default` に分けると整理しやすい。
@@ -300,15 +302,18 @@ fi
 
 ### Worker 起動
 
-タスクは渡さない。Worker が `plan.sh pull` から自分でタスクを pull する。
+タスクは渡さない。Dispatcher が Worker にタスクを割り当てる。
 
 ```bash
-# スキルを指定して Worker を起動（タスクは渡さない）
+# スキルを指定して Worker を起動（タスクは Dispatcher が割り当てる）
 AGENT_NAME=$WORKER_NAME bash scripts/start.sh worker code typescript
 
 # 複数スキルが必要な場合はスペース区切りで指定
 AGENT_NAME=$WORKER_NAME bash scripts/start.sh worker ops bash cloud
 ```
+
+Worker 起動後、Dispatcher が自動的にスキルマッチしたタスクを Worker に割り当てる。
+Orchestrator は Worker に個別にメッセージを送らなくてよい。
 
 ### target project を触る Worker を起動する
 
@@ -872,3 +877,48 @@ for r in data.get('requests', []):
 | `process-request.sh` の書き戻し失敗 | mission は作成済み。後で手動 PATCH すれば良い |
 | 依頼が `processing` 状態のまま放置 | `fetch-requests.sh --status processing` で確認し、完了済みなら `status=done` に更新 |
 | 依頼を却下したい場合 | `PATCH /api/requests/<id>` で `status=rejected` に更新 |
+
+---
+
+## 16. Dispatcher からの通知受け取り
+
+tmux モードでは `scripts/dispatcher.sh` が `crewvia:dispatcher` ウィンドウで常駐し、
+5秒ごとにタスク状況を確認して Orchestrator に通知を送る。
+
+**Orchestrator はポーリングや Workers への個別メッセージ送信は不要。**
+Dispatcher からの通知を受け取った時だけ対応すればよい。
+
+### 通知メッセージの種類と対応
+
+| Dispatcher からの通知 | 意味 | Orchestrator の対応 |
+|---|---|---|
+| `要求スキル [...] の Worker を起動してください (task {id}, mission={slug})` | 該当スキルを持つ Worker が存在しない | 必要スキルで `bash scripts/start.sh worker <skill>` を実行 |
+| `全ミッション完了` | 全 active mission が done 状態になった | `plan.sh archive <slug>` で退避 → ユーザーへ完了報告 |
+
+### Worker 起動が必要な通知への対応例
+
+```
+# Dispatcher からの通知例:
+# 要求スキル ['code', 'typescript'] の Worker を起動してください (task t003, mission=20260412-billing-api)
+
+# 対応: 該当スキルで Worker を起動する
+WORKER_NAME=$(./scripts/assign-name.sh code typescript)
+AGENT_NAME=$WORKER_NAME bash scripts/start.sh worker code typescript
+```
+
+### 全ミッション完了通知への対応例
+
+```
+# Dispatcher からの通知:
+# 全ミッション完了
+
+# 対応: archive して報告する
+./scripts/plan.sh archive <slug>
+# → ユーザーへミッション完了報告（§11 フォーマット）
+```
+
+### Dispatcher が通知しないケース
+
+- **Worker が busy（タスク実行中）**: Dispatcher は busy Worker をスキップし、5秒後に再確認する
+- **全タスクがブロック中**: 依存タスクが完了するまで Dispatcher は待機する（通知なし）
+- **同一通知の重複防止**: 同じ内容の通知は NOTIFY_TTL（デフォルト 60 秒）以内は抑制される

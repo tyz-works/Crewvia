@@ -877,6 +877,15 @@ def cmd_pull(args):
         )
         sys.exit(2)
     taskvia_sync_pull(chosen_holder[0]['mission'], chosen_holder[0]['id'], agent)
+
+    # Write assignment file so hooks can look up TASK_ID/TASK_TITLE without env vars
+    if agent:
+        assignments_dir = os.path.join(QUEUE_DIR, 'assignments')
+        os.makedirs(assignments_dir, exist_ok=True)
+        assignment_file = os.path.join(assignments_dir, agent)
+        with open(assignment_file, 'w') as _f:
+            _f.write(f"{chosen_holder[0]['mission']}:{chosen_holder[0]['id']}\n")
+
     print(json.dumps(chosen_holder[0], ensure_ascii=False))
 
 
@@ -942,6 +951,14 @@ def cmd_done(args):
         print(f"Done: {slug}/{task_id}")
 
     with_lock(_do)
+
+    # Remove assignment file on done
+    agent_name = os.environ.get('AGENT_NAME', '')
+    if agent_name:
+        assignment_file = os.path.join(QUEUE_DIR, 'assignments', agent_name)
+        if os.path.exists(assignment_file):
+            os.remove(assignment_file)
+
     if sync_holder[0]:
         taskvia_sync_done(*sync_holder[0])
 

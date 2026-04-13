@@ -82,13 +82,77 @@ if [[ -n "${SKILLS:-}" ]] && [[ -n "${AGENT_NAME:-}" ]]; then
   done
 fi
 
-# --- Heartbeat 自動更新 ---
+# --- Heartbeat 自動更新 + Taskvia /api/agents 送信 ---
 # AGENT_NAME が設定されている場合、ツール実行のたびに heartbeat を更新する
 # Worker は何も意識しなくてよい。hook が自動で処理する。
 if [[ -n "${AGENT_NAME:-}" ]]; then
-  HEARTBEAT_DIR="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}/registry/heartbeats"
+  _HB_REPO="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+  HEARTBEAT_DIR="${_HB_REPO}/registry/heartbeats"
   mkdir -p "$HEARTBEAT_DIR"
   date +%s > "${HEARTBEAT_DIR}/${AGENT_NAME}" 2>/dev/null || true
+
+  # workers.yaml からロール・スキルを取得
+  _WORKERS_YAML="${_HB_REPO}/registry/workers.yaml"
+  _HB_ROLE="worker"
+  _HB_SKILLS_STR=""
+  if [[ -f "$_WORKERS_YAML" ]]; then
+    _HB_AGENT_META="$(python3 - "$AGENT_NAME" "$_WORKERS_YAML" <<'PYEOF' 2>/dev/null || echo "worker|"
+import re, sys
+from pathlib import Path
+agent_name, yaml_path = sys.argv[1], sys.argv[2]
+content = Path(yaml_path).read_text()
+in_target = False
+role = "worker"
+skills = []
+for line in content.splitlines():
+    if re.match(r'\s*- name: ' + re.escape(agent_name) + r'\s*$', line):
+        in_target = True
+        continue
+    if in_target:
+        if re.match(r'\s*- name:', line):
+            break
+        m = re.match(r'\s*role:\s*(.+)', line)
+        if m:
+            role = m.group(1).strip()
+        m = re.match(r'\s*skills:\s*\[(.+)\]', line)
+        if m:
+            skills = [s.strip() for s in m.group(1).split(",")]
+print(f"{role}|{','.join(skills)}")
+PYEOF
+)"
+    _HB_ROLE="${_HB_AGENT_META%%|*}"
+    _HB_SKILLS_STR="${_HB_AGENT_META##*|}"
+  fi
+
+  # assignments から現在タスク情報を補完（env 未設定時のみ）
+  _HB_TASK_ID="${TASK_ID:-}"
+  _HB_TASK_TITLE="${TASK_TITLE:-}"
+  if [[ -z "$_HB_TASK_ID" ]]; then
+    _HB_ASSIGNMENT_FILE="${_HB_REPO}/queue/assignments/${AGENT_NAME}"
+    if [[ -f "$_HB_ASSIGNMENT_FILE" ]]; then
+      _HB_ASSIGNMENT="$(tr -d '\n' < "$_HB_ASSIGNMENT_FILE")"
+      _HB_MISSION="${_HB_ASSIGNMENT%%:*}"
+      _HB_TASK_ID="${_HB_ASSIGNMENT##*:}"
+      _HB_TASK_FILE="${_HB_REPO}/queue/missions/${_HB_MISSION}/tasks/${_HB_TASK_ID}.md"
+      if [[ -f "$_HB_TASK_FILE" ]]; then
+        _HB_TASK_TITLE="$(grep '^title:' "$_HB_TASK_FILE" | head -1 | sed 's/^title:[[:space:]]*//' | sed 's/^"\(.*\)"$/\1/')"
+      fi
+    fi
+  fi
+
+  # Taskvia /api/agents にハートビートを送信（TASKVIA_TOKEN が設定済みの場合のみここに到達）
+  _AGENTS_PAYLOAD="$(jq -nc \
+    --arg name   "$AGENT_NAME" \
+    --arg role   "$_HB_ROLE" \
+    --arg skills "$_HB_SKILLS_STR" \
+    --arg tid    "${_HB_TASK_ID:-}" \
+    --arg ttitle "${_HB_TASK_TITLE:-}" \
+    '{name: $name, role: $role, skills: ($skills | split(",") | map(select(. != ""))), current_task_id: ($tid | if . == "" then null else . end), task_title: ($ttitle | if . == "" then null else . end)}')"
+
+  curl -sf -X POST "${TASKVIA_URL}/api/agents" \
+    -H "Content-Type: application/json" \
+    -H "Authorization: Bearer ${TASKVIA_TOKEN}" \
+    -d "$_AGENTS_PAYLOAD" >/dev/null 2>&1 || true
 fi
 
 exit 0

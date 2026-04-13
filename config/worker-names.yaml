@@ -73,9 +73,9 @@ names:
 # コメントを外して名前ごとに役割・スキルを固定できる。
 
 customizations:
-  # Orchestratorに固定する例:
+  # Directorに固定する例:
   # - name: Kai
-  #   role: orchestrator
+  #   role: director
 
   # Workerに固定してスキルを指定する例:
   # - name: Luca

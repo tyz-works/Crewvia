@@ -3,7 +3,7 @@ set -euo pipefail
 
 # watchdog.sh — Worker 死活監視
 # Usage: bash scripts/watchdog.sh [--threshold <秒数>] [--interval <秒数>]
-# Orchestrator の start.sh から自動起動される。直接実行も可。
+# Director の start.sh から自動起動される。直接実行も可。
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"

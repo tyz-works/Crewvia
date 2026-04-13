@@ -95,18 +95,18 @@ pool_names, custom_map = parse_worker_names(names_yaml_path)
 header, order, by_name = parse(registry_yaml_path)
 
 # Step 2: Return existing name if the same skill set is already registered.
-# Skip orchestrator entries — their empty skills list would false-match callers
+# Skip director entries — their empty skills list would false-match callers
 # that also pass zero skills (e.g. `start.sh worker` with no args).
 for name in order:
     w = by_name[name]
-    if w.get('role') == 'orchestrator':
+    if w.get('role') == 'director':
         continue
     if set(w['skills']) == input_skills_set:
         print(w['name'])
         sys.exit(0)
 
 # Step 3: Find the first eligible name not already in the registry.
-# All registered names are excluded (orchestrator + worker alike) so a new
+# All registered names are excluded (director + worker alike) so a new
 # Worker never collides with an existing entry.
 registered_names = set(by_name.keys())
 
@@ -117,7 +117,7 @@ def is_pool_eligible(name):
         return True
     if c.get('disabled'):
         return False
-    if c.get('role') == 'orchestrator':
+    if c.get('role') == 'director':
         return False
     return True
 

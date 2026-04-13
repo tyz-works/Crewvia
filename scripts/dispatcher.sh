@@ -3,18 +3,18 @@
 #
 # Observes:
 #   queue/missions/**/tasks/*.md   pending tasks
-#   tmux list-windows              live Worker / Orchestrator windows
+#   tmux list-windows              live Worker / Director windows
 #   queue/assignments/<NAME>       busy (exists) / idle (absent) state
 #
 # Dispatch logic (every 5 s):
 #   idle Worker + unblocked pending task with skill intersection
 #     → tmux send-keys assign message to Worker window
 #   unblocked pending task with NO matching live Worker
-#     → notify crewvia:Sora-orchestrator to spawn a Worker
+#     → notify crewvia:Sora-director to spawn a Worker
 #   Worker with zero tasks for its skill set (blocked included)
 #     → send shutdown message and kill the window
 #   All active missions done
-#     → notify crewvia:Sora-orchestrator
+#     → notify crewvia:Sora-director
 #
 # Notification dedup: same key is suppressed for NOTIFY_TTL seconds.
 # Standalone-safe: exits 0 silently when tmux is not available.
@@ -365,7 +365,7 @@ AGENT_PRESENCE_TTL = 600  # 10 minutes — heartbeat files older than this are i
 def publish_agents():
     """Publish active agents to Taskvia /api/agents every dispatch cycle.
 
-    Orchestrator: always published (from registry role=orchestrator).
+    Director: always published (from registry role=director).
     Workers: published only when registry/heartbeats/<name> mtime is within
     AGENT_PRESENCE_TTL (10 min) — i.e. the Worker has been seen recently.
     TASKVIA_TOKEN not set → silently skip (standalone mode).
@@ -394,8 +394,8 @@ def publish_agents():
         role = info.get('role', 'worker')
         skills = info.get('skills') or []
 
-        if role == 'orchestrator':
-            # Orchestrator is always published regardless of heartbeat TTL.
+        if role == 'director':
+            # Director is always published regardless of heartbeat TTL.
             # Use heartbeat mtime for last_seen if available, else current time.
             mtime = hb_mtimes.get(name, now)
             last_seen = datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat()
@@ -479,7 +479,7 @@ def dispatch():
     if all_done:
         key = 'all_missions_done'
         if should_notify(key):
-            tmux_send('crewvia:Sora-orchestrator', '全ミッション完了')
+            tmux_send('crewvia:Sora-director', '全ミッション完了')
             record_notify(key)
         return
 
@@ -578,7 +578,7 @@ def dispatch():
                     f"要求スキル {sorted(task_skills)} の Worker を起動してください "
                     f"(task {task_id}, mission={slug})"
                 )
-                tmux_send('crewvia:Sora-orchestrator', msg)
+                tmux_send('crewvia:Sora-director', msg)
                 record_notify(notify_key)
 
 

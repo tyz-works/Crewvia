@@ -27,7 +27,7 @@ Crewvia follows a two-role model:
 
 | Role | Description |
 |------|-------------|
-| **Orchestrator** | Decomposes tasks, creates cards, assigns Workers, manages kanban column transitions (Backlog → In Progress → Done) |
+| **Director** | Decomposes tasks, creates cards, assigns Workers, manages kanban column transitions (Backlog → In Progress → Done) |
 | **Worker** | Executes assigned cards, requests approval for risky tool calls via PreToolUse hooks, posts knowledge logs to Taskvia |
 
 Key design principles:
@@ -139,14 +139,14 @@ Replace `/path/to/crewvia` with the absolute path to your Crewvia installation.
 Use `scripts/start.sh` to launch agents. The script sets the `AGENT_NAME` environment
 variable based on the role and skill set, then starts Claude Code.
 
-### Start as Orchestrator
+### Start as Director
 
 ```bash
-./scripts/start.sh orchestrator
+./scripts/start.sh director
 ```
 
-The Orchestrator reads `agents/orchestrator.md` as its system prompt and begins
-managing the kanban board. Only one Orchestrator should run per project.
+The Director reads `agents/director.md` as its system prompt and begins
+managing the kanban board. Only one Director should run per project.
 
 ### Start as Worker
 
@@ -173,9 +173,9 @@ so the same skills always produce the same name (e.g., `ops bash` → "Kai").
 ### Running with tmux (optional)
 
 ```bash
-# Create a session with Orchestrator + 3 Workers
-tmux new-session -s crewvia -n orchestrator
-tmux send-keys "cd /path/to/crewvia && ./scripts/start.sh orchestrator" Enter
+# Create a session with Director + 3 Workers
+tmux new-session -s crewvia -n director
+tmux send-keys "cd /path/to/crewvia && ./scripts/start.sh director" Enter
 
 tmux new-window -t crewvia -n workers
 tmux split-window -h
@@ -255,7 +255,7 @@ When `TASKVIA_TOKEN` is not set:
 
 ### Default behavior
 
-Without customizations, all names in the pool can become either an Orchestrator or Worker.
+Without customizations, all names in the pool can become either an Director or Worker.
 Names are assigned deterministically based on the skill set hash:
 
 ```
@@ -274,7 +274,7 @@ Edit `config/worker-names.yaml` to customize name behavior:
 # Pin a name to a specific role
 customizations:
   - name: Kai
-    role: orchestrator    # This name is always Orchestrator, never a Worker
+    role: director    # This name is always Director, never a Worker
 
 # Fix a name to specific skills
   - name: Luca
@@ -335,8 +335,8 @@ Worker discovers an improvement opportunity
            ↓
 Check against autonomous-improvement.yaml
            ↓
-allowed?  →  Report to Orchestrator as "improvement proposal"
-              Orchestrator adds card to Backlog (low priority)
+allowed?  →  Report to Director as "improvement proposal"
+              Director adds card to Backlog (low priority)
               Auto-executes when scheduled
            ↓
 requires_approval?  →  POST /api/log with type: "improvement"
@@ -380,7 +380,7 @@ Set `max_per_day: 0` to disable autonomous improvements entirely.
         ┌──────────────────┼──────────────────────┐
         │                  │                      │
 ┌───────▼──────┐   ┌───────▼──────┐       ┌───────▼──────┐
-│ Orchestrator │   │   Worker A   │       │   Worker B   │
+│ Director │   │   Worker A   │       │   Worker B   │
 │   (1 agent)  │   │  ops, bash   │       │ code, python │
 │              │   │   "Kai"      │       │   "Luca"     │
 └──────┬───────┘   └──────┬───────┘       └──────┬───────┘
@@ -400,25 +400,25 @@ Set `max_per_day: 0` to disable autonomous improvements entirely.
 ### Dispatcher モデル（tmux モード）
 
 tmux モードでは `scripts/dispatcher.sh` が常駐バックグラウンドプロセスとして動作する。
-Orchestrator が直接 Worker にタスクを送る代わりに、Dispatcher がタスクを割り当てる。
+Director が直接 Worker にタスクを送る代わりに、Dispatcher がタスクを割り当てる。
 
 | コンポーネント | 役割 |
 |---|---|
-| **Orchestrator** | ミッション受領・プラン作成・Worker 起動・Dispatcher 通知への応答 |
+| **Director** | ミッション受領・プラン作成・Worker 起動・Dispatcher 通知への応答 |
 | **Dispatcher** | 5秒ごとにタスク状況を確認し、idle Worker にタスクを割り当てる |
 | **Worker** | Dispatcher からの assign を受け取り、`plan.sh pull` で取得して実行 |
 
 ### Communication flow
 
-1. Orchestrator decomposes mission → registers tasks with `plan.sh add`
-2. Orchestrator spawns Workers with required skills via `bash scripts/start.sh worker <skill>`
+1. Director decomposes mission → registers tasks with `plan.sh add`
+2. Director spawns Workers with required skills via `bash scripts/start.sh worker <skill>`
 3. Dispatcher (started automatically) polls every 5 seconds for idle Workers + unblocked tasks
 4. Dispatcher assigns tasks to idle Workers via `tmux send-keys`
 5. Worker pulls assigned task via `plan.sh pull --task <id> --mission <slug>`, executes it
 6. Before risky tool calls, PreToolUse hook requests approval from Taskvia
 7. Worker reports completion via `plan.sh done`, then waits for next Dispatcher assign
-8. Dispatcher notifies Orchestrator when a new Worker skill is needed or all missions are complete
-9. Orchestrator responds to Dispatcher notifications (spawns Workers / archives mission)
+8. Dispatcher notifies Director when a new Worker skill is needed or all missions are complete
+9. Director responds to Dispatcher notifications (spawns Workers / archives mission)
 
 ### Kanban card structure
 
@@ -454,7 +454,7 @@ crewvia/
 │   ├── pre-tool-use.sh            # PreToolUse hook — Taskvia approval gate
 │   └── post-tool-use.sh           # PostToolUse hook — knowledge log posting
 ├── agents/
-│   ├── orchestrator.md            # Orchestrator system prompt
+│   ├── director.md            # Director system prompt
 │   └── worker.md                  # Worker system prompt
 ├── scripts/
 │   └── start.sh                   # Agent launcher (sets AGENT_NAME, starts Claude Code)

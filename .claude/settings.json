@@ -1,4 +1,65 @@
 {
+  "permissions": {
+    "allow": [
+      "Bash(ls:*)",
+      "Bash(cat:*)",
+      "Bash(pwd)",
+      "Bash(which:*)",
+      "Bash(head:*)",
+      "Bash(tail:*)",
+      "Bash(wc:*)",
+      "Bash(file:*)",
+      "Bash(echo:*)",
+
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git show:*)",
+      "Bash(git branch:*)",
+      "Bash(git checkout:*)",
+      "Bash(git stash:*)",
+      "Bash(git rebase:*)",
+      "Bash(git merge:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git fetch:*)",
+      "Bash(git pull:*)",
+      "Bash(git push origin feat/*)",
+      "Bash(git push origin fix/*)",
+      "Bash(git push origin chore/*)",
+      "Bash(git push origin task/*)",
+      "Bash(git push -u origin feat/*)",
+      "Bash(git push -u origin fix/*)",
+      "Bash(git push -u origin chore/*)",
+      "Bash(git push -u origin task/*)",
+
+      "Bash(gh pr view:*)",
+      "Bash(gh pr list:*)",
+      "Bash(gh pr diff:*)",
+      "Bash(gh pr checks:*)",
+      "Bash(gh run list:*)",
+      "Bash(gh run view:*)",
+      "Bash(gh api repos/*)",
+
+      "Bash(npm test:*)",
+      "Bash(npm run test:*)",
+      "Bash(bun test:*)",
+      "Bash(pytest:*)",
+      "Bash(tsc --noEmit:*)",
+      "Bash(eslint:*)",
+      "Bash(prettier --check:*)",
+
+      "Bash(./scripts/plan.sh:*)",
+      "Bash(bash scripts/plan.sh:*)"
+    ],
+    "deny": [
+      "Bash(git push --force:*)",
+      "Bash(git push -f:*)",
+      "Bash(git push origin main:*)",
+      "Bash(git push origin master:*)",
+      "Bash(rm -rf:*)"
+    ]
+  },
   "hooks": {
     "PreToolUse": [
       {

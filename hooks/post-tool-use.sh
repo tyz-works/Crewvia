@@ -147,7 +147,7 @@ PYEOF
     --arg skills "$_HB_SKILLS_STR" \
     --arg tid    "${_HB_TASK_ID:-}" \
     --arg ttitle "${_HB_TASK_TITLE:-}" \
-    '{name: $name, role: $role, skills: ($skills | split(",") | map(select(. != ""))), current_task_id: ($tid | if . == "" then null else . end), task_title: ($ttitle | if . == "" then null else . end)}')"
+    '{name: $name, role: $role, skills: ($skills | split(",") | map(select(. != ""))), current_task_id: ($tid | if . == "" then null else . end), current_task_title: ($ttitle | if . == "" then null else . end)}')"
 
   curl -sf -X POST "${TASKVIA_URL}/api/agents" \
     -H "Content-Type: application/json" \

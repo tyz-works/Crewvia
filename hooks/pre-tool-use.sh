@@ -77,9 +77,20 @@ RESPONSE="$(curl -sf --connect-timeout 5 --max-time 10 -X POST "${TASKVIA_URL}/a
 
 CARD_ID="$(echo "$RESPONSE" | jq -r '.id')"
 
+# Claude Code PreToolUse hook の permission 決定を stdout に出力する
+# これによりターミナルの承認プロンプトをスキップし、Taskvia 一本化する
+emit_decision() {
+  local decision="$1" reason="$2"
+  jq -nc \
+    --arg d "$decision" \
+    --arg r "$reason" \
+    '{hookSpecificOutput: {hookEventName: "PreToolUse", permissionDecision: $d, permissionDecisionReason: $r}}'
+}
+
 if [ -z "$CARD_ID" ] || [ "$CARD_ID" = "null" ]; then
   echo "[taskvia] リクエスト投入失敗。デフォルト拒否。" >&2
-  exit 1
+  emit_decision "deny" "Taskvia request submission failed"
+  exit 0
 fi
 
 echo "[taskvia] 承認待ち: ${TOOL_SUMMARY} (id=${CARD_ID})" >&2
@@ -94,18 +105,22 @@ for i in $(seq 1 "$TIMEOUT"); do
   case "$STATUS" in
     approved)
       echo "[taskvia] ✅ 承認済み: ${TOOL_SUMMARY}" >&2
+      emit_decision "allow" "Taskvia approved (id=${CARD_ID})"
       exit 0
       ;;
     denied)
       echo "[taskvia] ❌ 拒否: ${TOOL_SUMMARY}" >&2
-      exit 1
+      emit_decision "deny" "Taskvia denied (id=${CARD_ID})"
+      exit 0
       ;;
     not_found)
       echo "[taskvia] TTL切れ（拒否扱い）: ${TOOL_SUMMARY}" >&2
-      exit 1
+      emit_decision "deny" "Taskvia card not found / TTL expired (id=${CARD_ID})"
+      exit 0
       ;;
   esac
 done
 
 echo "[taskvia] タイムアウト（${TIMEOUT}秒）: ${TOOL_SUMMARY}" >&2
-exit 1
+emit_decision "deny" "Taskvia approval timed out after ${TIMEOUT}s (id=${CARD_ID})"
+exit 0

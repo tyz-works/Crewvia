@@ -160,6 +160,21 @@ def http_post(url, payload):
         return None
 
 
+def http_delete(url):
+    try:
+        req = urllib.request.Request(url, headers=_headers(), method='DELETE')
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return None  # すでに存在しない — OK
+        print(f"[taskvia-sync] WARNING: DELETE {url} 失敗: {e}", file=sys.stderr)
+        return None
+    except Exception as e:
+        print(f"[taskvia-sync] WARNING: DELETE {url} 失敗: {e}", file=sys.stderr)
+        return None
+
+
 # ---------- mission scanning ----------
 
 def scan_missions():
@@ -250,6 +265,19 @@ if updated:
     print(f"[taskvia-sync] .taskvia-map.json を保存しました ({len(task_map)} 件)。")
 else:
     print("[taskvia-sync] 変更なし。同期完了。")
+
+# ---------- archive 済み mission の掃除 ----------
+# queue/archive/ にある slug を taskvia からも削除する（冪等: 404 は無視）
+archive_dir = os.path.join(queue_dir, 'archive')
+if os.path.isdir(archive_dir):
+    for entry in os.listdir(archive_dir):
+        entry_path = os.path.join(archive_dir, entry)
+        if not os.path.isdir(entry_path):
+            continue
+        slug = entry
+        result = http_delete(f"{taskvia_url}/api/missions/{slug}")
+        if result is not None:
+            print(f"[taskvia-sync] archive 済み mission 削除: {slug}")
 PYEOF
 
 exit 0

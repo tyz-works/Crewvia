@@ -15,33 +15,37 @@ workers:
   - name: Hana
     skills: [bash, ops]
     task_count: 0
-    last_active: 2026-04-12
+    last_active: 2026-04-13
   - name: Ren
     skills: [code, python]
     task_count: 0
-    last_active: 2026-04-12
+    last_active: 2026-04-13
   - name: Sora
     role: orchestrator
     skills: []
     task_count: 0
-    last_active: 2026-04-12
+    last_active: 2026-04-13
   - name: Yuki
     skills: [research, typescript]
     task_count: 2
-    last_active: 2026-04-12
+    last_active: 2026-04-13
   - name: Kai
     skills: [code, database, typescript]
     task_count: 0
-    last_active: 2026-04-12
+    last_active: 2026-04-13
   - name: Mika
     skills: [code, typescript]
-    task_count: 1
-    last_active: 2026-04-12
+    task_count: 7
+    last_active: 2026-04-13
   - name: Haruto
     skills: [bash, code]
-    task_count: 1
-    last_active: 2026-04-12
+    task_count: 3
+    last_active: 2026-04-13
   - name: Seo
     skills: [review]
-    task_count: 1
-    last_active: 2026-04-12
+    task_count: 5
+    last_active: 2026-04-13
+  - name: Jiwon
+    skills: [docs, research]
+    task_count: 2
+    last_active: 2026-04-13

@@ -22,6 +22,21 @@ AGENT_NAME="${AGENT_NAME:-$(hostname -s)}"
 TASK_TITLE="${TASK_TITLE:-}"
 TASK_ID="${TASK_ID:-}"
 
+# env に TASK_ID がなければ assignments ファイルから補完する
+if [ -z "$TASK_ID" ] && [ -n "$AGENT_NAME" ]; then
+  _CREWVIA_REPO="${CREWVIA_REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+  _ASSIGNMENT_FILE="${_CREWVIA_REPO}/queue/assignments/${AGENT_NAME}"
+  if [ -f "$_ASSIGNMENT_FILE" ]; then
+    _ASSIGNMENT="$(cat "$_ASSIGNMENT_FILE" | tr -d '\n')"
+    _MISSION_SLUG="${_ASSIGNMENT%%:*}"
+    TASK_ID="${_ASSIGNMENT##*:}"
+    _TASK_FILE="${_CREWVIA_REPO}/queue/missions/${_MISSION_SLUG}/tasks/${TASK_ID}.md"
+    if [ -f "$_TASK_FILE" ]; then
+      TASK_TITLE="$(grep '^title:' "$_TASK_FILE" | head -1 | sed 's/^title:[[:space:]]*//' | sed 's/^"\(.*\)"$/\1/')"
+    fi
+  fi
+fi
+
 # スタンドアロンモード: トークン未設定なら投稿スキップ
 if [ -z "$TASKVIA_TOKEN" ]; then
   exit 0

@@ -56,6 +56,8 @@ import re
 import json
 import time
 import subprocess
+import urllib.request
+import urllib.error
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -357,6 +359,103 @@ def tmux_kill_window(target):
 # Main dispatch logic
 # ---------------------------------------------------------------------------
 
+AGENT_PRESENCE_TTL = 600  # 10 minutes — heartbeat files older than this are ignored
+
+
+def publish_agents():
+    """Publish active agents to Taskvia /api/agents every dispatch cycle.
+
+    Orchestrator: always published (from registry role=orchestrator).
+    Workers: published only when registry/heartbeats/<name> mtime is within
+    AGENT_PRESENCE_TTL (10 min) — i.e. the Worker has been seen recently.
+    TASKVIA_TOKEN not set → silently skip (standalone mode).
+    """
+    taskvia_url = os.environ.get('TASKVIA_URL', 'https://taskvia.vercel.app')
+    taskvia_token = os.environ.get('TASKVIA_TOKEN', '')
+    if not taskvia_token:
+        return
+
+    now = time.time()
+    workers = load_workers()
+    agents_to_publish = []
+
+    # Collect heartbeat mtimes for all agents
+    heartbeats_dir = REGISTRY_DIR / 'heartbeats'
+    hb_mtimes = {}
+    if heartbeats_dir.exists():
+        for hb_file in heartbeats_dir.iterdir():
+            if hb_file.is_file() and not hb_file.name.startswith('.'):
+                try:
+                    hb_mtimes[hb_file.name] = hb_file.stat().st_mtime
+                except OSError:
+                    pass
+
+    for name, info in workers.items():
+        role = info.get('role', 'worker')
+        skills = info.get('skills') or []
+
+        if role == 'orchestrator':
+            # Orchestrator is always published regardless of heartbeat TTL.
+            # Use heartbeat mtime for last_seen if available, else current time.
+            mtime = hb_mtimes.get(name, now)
+            last_seen = datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat()
+            agents_to_publish.append({
+                'name': name,
+                'role': role,
+                'skills': skills,
+                'current_task_id': None,
+                'current_task_title': None,
+                'last_seen': last_seen,
+            })
+        else:
+            # Workers must have a fresh heartbeat file.
+            mtime = hb_mtimes.get(name)
+            if mtime is None or now - mtime > AGENT_PRESENCE_TTL:
+                continue
+
+            # Resolve current task from assignments file.
+            task_id = None
+            task_title = None
+            assignment_file = ASSIGNMENTS_DIR / name
+            if assignment_file.exists():
+                try:
+                    assignment = assignment_file.read_text().strip()
+                    # Format: "mission_slug:task_id"
+                    if ':' in assignment:
+                        mission_slug, task_id = assignment.split(':', 1)
+                        task_file = MISSIONS_DIR / mission_slug / 'tasks' / f'{task_id}.md'
+                        if task_file.exists():
+                            meta, _ = parse_frontmatter(task_file.read_text())
+                            task_title = meta.get('title')
+                except Exception:
+                    pass
+
+            last_seen = datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat()
+            agents_to_publish.append({
+                'name': name,
+                'role': role,
+                'skills': skills,
+                'current_task_id': task_id,
+                'current_task_title': task_title,
+                'last_seen': last_seen,
+            })
+
+    endpoint = f'{taskvia_url}/api/agents'
+    headers = {
+        'Content-Type': 'application/json',
+        'Authorization': f'Bearer {taskvia_token}',
+    }
+
+    for agent in agents_to_publish:
+        payload = json.dumps(agent).encode('utf-8')
+        try:
+            req = urllib.request.Request(endpoint, data=payload, headers=headers, method='POST')
+            with urllib.request.urlopen(req, timeout=5):
+                pass
+        except Exception as e:
+            log(f"WARNING: /api/agents publish failed for {agent['name']}: {e}")
+
+
 def dispatch():
     state = load_state()
     active_missions = list(state.get('active_missions') or [])
@@ -483,6 +582,7 @@ def dispatch():
                 record_notify(notify_key)
 
 
+publish_agents()
 dispatch()
 PYEOF
 }

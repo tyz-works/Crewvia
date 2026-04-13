@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# start.sh — Launch a crewvia agent (Orchestrator or Worker)
+# start.sh — Launch a crewvia agent (Director or Worker)
 # Usage:
-#   ./scripts/start.sh orchestrator               # Start as Orchestrator
+#   ./scripts/start.sh director               # Start as Director
 #   ./scripts/start.sh worker [skill1 skill2 ...]  # Start as Worker with given skills
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -20,10 +20,10 @@ if [[ -f "$CONFIG_FILE" ]]; then
       export CREWVIA_WIP_LIMIT="$WIP_FROM_CONFIG"
     fi
   fi
-  if [[ -z "${CREWVIA_ORCHESTRATOR_MODEL:-}" ]]; then
-    ORCH_MODEL_FROM_CONFIG=$(grep -E '^orchestrator_model:[[:space:]]*\S' "$CONFIG_FILE" | awk '{print $2}' | tr -d '"' | head -1)
+  if [[ -z "${CREWVIA_DIRECTOR_MODEL:-}" ]]; then
+    ORCH_MODEL_FROM_CONFIG=$(grep -E '^director_model:[[:space:]]*\S' "$CONFIG_FILE" | awk '{print $2}' | tr -d '"' | head -1)
     if [[ -n "$ORCH_MODEL_FROM_CONFIG" ]]; then
-      export CREWVIA_ORCHESTRATOR_MODEL="$ORCH_MODEL_FROM_CONFIG"
+      export CREWVIA_DIRECTOR_MODEL="$ORCH_MODEL_FROM_CONFIG"
     fi
   fi
   if [[ -z "${CREWVIA_WORKER_MODEL:-}" ]]; then
@@ -37,7 +37,7 @@ fi
 export CREWVIA_WIP_LIMIT="${CREWVIA_WIP_LIMIT:-8}"
 
 if [[ $# -eq 0 ]]; then
-  echo "Usage: $0 orchestrator | worker [skill1 skill2 ...]" >&2
+  echo "Usage: $0 director | worker [skill1 skill2 ...]" >&2
   exit 1
 fi
 
@@ -45,8 +45,8 @@ ROLE="$1"
 shift || true
 
 case "$ROLE" in
-  orchestrator)
-    AGENT_FILE="agents/orchestrator.md"
+  director)
+    AGENT_FILE="agents/director.md"
     SKILLS_ARR=()
     ;;
   worker)
@@ -54,7 +54,7 @@ case "$ROLE" in
     SKILLS_ARR=("$@")
     ;;
   *)
-    echo "ERROR: Unknown role '$ROLE'. Use 'orchestrator' or 'worker'." >&2
+    echo "ERROR: Unknown role '$ROLE'. Use 'director' or 'worker'." >&2
     exit 1
     ;;
 esac
@@ -62,16 +62,16 @@ esac
 # Determine AGENT_NAME
 REGISTRY_YAML="${REPO_ROOT}/registry/workers.yaml"
 
-if [[ "${ROLE}" == "orchestrator" ]]; then
-  # Check if an orchestrator is already registered
-  EXISTING_ORCH=$(python3 "${SCRIPT_DIR}/lib_registry.py" get-orchestrator "$REGISTRY_YAML" 2>/dev/null || true)
+if [[ "${ROLE}" == "director" ]]; then
+  # Check if an director is already registered
+  EXISTING_ORCH=$(python3 "${SCRIPT_DIR}/lib_registry.py" get-director "$REGISTRY_YAML" 2>/dev/null || true)
 
   if [[ -n "$EXISTING_ORCH" ]]; then
     AGENT_NAME="$EXISTING_ORCH"
   else
     # First launch: prompt for name or use random
     echo ""
-    echo "[crewvia] 初回起動です。Orchestrator の名前を入力してください。"
+    echo "[crewvia] 初回起動です。Director の名前を入力してください。"
     echo "          半角英字のみ（例: Alex）。Enter で自動割り当て。"
     printf "> "
     read -r INPUT_NAME </dev/tty || INPUT_NAME=""
@@ -80,19 +80,19 @@ if [[ "${ROLE}" == "orchestrator" ]]; then
     else
       AGENT_NAME=$(bash "${SCRIPT_DIR}/assign-name.sh")
     fi
-    # Register orchestrator in registry
+    # Register director in registry
     mkdir -p "${REPO_ROOT}/registry"
-    python3 "${SCRIPT_DIR}/lib_registry.py" register-orchestrator "$REGISTRY_YAML" "$AGENT_NAME"
-    echo "[crewvia] Orchestrator '${AGENT_NAME}' を registry に登録しました。"
+    python3 "${SCRIPT_DIR}/lib_registry.py" register-director "$REGISTRY_YAML" "$AGENT_NAME"
+    echo "[crewvia] Director '${AGENT_NAME}' を registry に登録しました。"
   fi
 else
   AGENT_NAME=$(bash "${SCRIPT_DIR}/assign-name.sh" "${SKILLS_ARR[@]+"${SKILLS_ARR[@]}"}")
 fi
 
-# --- tmux モード選択（Orchestrator 起動時のみ、CREWVIA_TMUX 未設定時のみ） ---
-# Orchestrator が tmux モードを選ぶと、この env は exec claude に引き継がれ、
-# Orchestrator が後続で起動する Worker もすべて tmux ウィンドウで動く。
-if [[ "${ROLE}" == "orchestrator" ]] && [[ -z "${CREWVIA_TMUX:-}" ]]; then
+# --- tmux モード選択（Director 起動時のみ、CREWVIA_TMUX 未設定時のみ） ---
+# Director が tmux モードを選ぶと、この env は exec claude に引き継がれ、
+# Director が後続で起動する Worker もすべて tmux ウィンドウで動く。
+if [[ "${ROLE}" == "director" ]] && [[ -z "${CREWVIA_TMUX:-}" ]]; then
   # config/crewvia.yaml の mode 設定を読む
   MODE_FROM_CONFIG=$(grep -E '^mode:[[:space:]]*\S' "$CONFIG_FILE" 2>/dev/null | awk '{print $2}' | tr -d '"' | head -1)
   if [[ "$MODE_FROM_CONFIG" == "tmux" ]]; then
@@ -111,7 +111,7 @@ if [[ "${ROLE}" == "orchestrator" ]] && [[ -z "${CREWVIA_TMUX:-}" ]]; then
   else
     echo ""
     echo "[crewvia] tmux を使ってマルチエージェント並列モードで起動しますか？"
-    echo "          Y = tmux モード（Orchestrator と Worker を crewvia セッションに展開）"
+    echo "          Y = tmux モード（Director と Worker を crewvia セッションに展開）"
     echo "          n = インラインモード（Worker 並列起動不可、単独セッション）"
     printf "> [Y/n]: "
     read -r TMUX_CHOICE </dev/tty || TMUX_CHOICE=""
@@ -149,7 +149,7 @@ fi
 # Worker は TARGET_DIR env var が指定されていればそのプロジェクトの cwd で
 # claude を起動する (claude は cwd の CLAUDE.md / .claude/settings.json /
 # git 状態を読むため、target project の文脈で動かすには cwd 切替が必須)。
-# Orchestrator は常に crewvia 本体の cwd のまま (registry / queue を管理
+# Director は常に crewvia 本体の cwd のまま (registry / queue を管理
 # する必要があるため)。
 WORK_DIR="$REPO_ROOT"
 if [[ "${ROLE}" == "worker" ]] && [[ -n "${TARGET_DIR:-}" ]]; then
@@ -213,8 +213,8 @@ registry/workers.yaml でこの名前のエントリを確認し、過去の tas
   fi
 
 else
-  # Orchestrator: identity header + agent.md
-  NAME_HEADER="# Orchestrator Identity
+  # Director: identity header + agent.md
+  NAME_HEADER="# Director Identity
 
 あなたの名前は **${AGENT_NAME}** です。
 
@@ -231,8 +231,8 @@ if [[ -n "$FULL_PROMPT" ]]; then
 fi
 
 # Resolve model per role (config / env で指定されていれば --model を渡す)
-if [[ "${ROLE}" == "orchestrator" ]]; then
-  SELECTED_MODEL="${CREWVIA_ORCHESTRATOR_MODEL:-}"
+if [[ "${ROLE}" == "director" ]]; then
+  SELECTED_MODEL="${CREWVIA_DIRECTOR_MODEL:-}"
 else
   SELECTED_MODEL="${CREWVIA_WORKER_MODEL:-}"
 fi
@@ -299,8 +299,8 @@ if [[ "${CREWVIA_TMUX:-0}" == "1" ]]; then
   tmux send-keys -t "$TARGET" Enter
   echo "[crewvia] Kickoff message sent to ${SESSION}:${WINDOW_NAME}"
 
-  # Orchestrator: dispatcher を crewvia:dispatcher 窓で起動（二重起動防止）
-  if [[ "${ROLE}" == "orchestrator" ]]; then
+  # Director: dispatcher を crewvia:dispatcher 窓で起動（二重起動防止）
+  if [[ "${ROLE}" == "director" ]]; then
     if tmux list-windows -t "$SESSION" -F '#{window_name}' 2>/dev/null | grep -q '^dispatcher$'; then
       echo "[crewvia] Dispatcher already running (${SESSION}:dispatcher)"
     else
@@ -311,8 +311,8 @@ if [[ "${CREWVIA_TMUX:-0}" == "1" ]]; then
   fi
 else
   # Default: run inline (no tmux)
-  # Orchestrator 起動時に watchdog をバックグラウンドで起動
-  if [[ "${ROLE}" == "orchestrator" ]]; then
+  # Director 起動時に watchdog をバックグラウンドで起動
+  if [[ "${ROLE}" == "director" ]]; then
     WATCHDOG="${REPO_ROOT}/scripts/watchdog.sh"
     if [[ -f "$WATCHDOG" ]]; then
       bash "$WATCHDOG" &
@@ -321,7 +321,7 @@ else
       trap "kill ${WATCHDOG_PID} 2>/dev/null || true" EXIT
     fi
   fi
-  # Worker 向け cwd 切替 (TARGET_DIR 指定時のみ)。Orchestrator はそのまま。
+  # Worker 向け cwd 切替 (TARGET_DIR 指定時のみ)。Director はそのまま。
   cd "$WORK_DIR" || {
     echo "[crewvia] ERROR: failed to cd into $WORK_DIR" >&2
     exit 1

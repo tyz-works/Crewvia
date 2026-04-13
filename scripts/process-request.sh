@@ -199,7 +199,7 @@ if [ -n "$REQ_DEADLINE" ]; then
 fi
 TASK_DESC="${TASK_DESC}
 
-※ このタスクは Orchestrator が分解する前の仮タスクです。
+※ このタスクは Director が分解する前の仮タスクです。
   taskvia request ID: ${REQUEST_ID}"
 
 # plan.sh add の呼び出し

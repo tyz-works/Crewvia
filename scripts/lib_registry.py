@@ -3,15 +3,15 @@
 header comments and deduping same-name entries.
 
 Usable as:
-  - Module: from lib_registry import parse, write, register_orchestrator, ...
+  - Module: from lib_registry import parse, write, register_director, ...
   - CLI:    python3 lib_registry.py <command> [args...]
 
 CLI commands:
-  get-orchestrator PATH
-      Print the registered orchestrator name (if any).
+  get-director PATH
+      Print the registered director name (if any).
 
-  register-orchestrator PATH NAME
-      Mark NAME as orchestrator. If an entry with that name already exists,
+  register-director PATH NAME
+      Mark NAME as director. If an entry with that name already exists,
       update its role field in place (avoids duplicate entries).
 
   set-last-active PATH NAME [YYYY-MM-DD]
@@ -117,18 +117,18 @@ def write(path, header, order, workers_by_name):
         f.writelines(out)
 
 
-def register_orchestrator(path, name):
-    """Add or update NAME as orchestrator. Same-name worker entries are upgraded."""
+def register_director(path, name):
+    """Add or update NAME as director. Same-name worker entries are upgraded."""
     header, order, by_name = parse(path)
     today = str(date.today())
     if name in by_name:
-        by_name[name]['role'] = 'orchestrator'
+        by_name[name]['role'] = 'director'
         if not by_name[name].get('last_active'):
             by_name[name]['last_active'] = today
     else:
         by_name[name] = {
             'name': name,
-            'role': 'orchestrator',
+            'role': 'director',
             'skills': [],
             'task_count': 0,
             'last_active': today,
@@ -137,11 +137,11 @@ def register_orchestrator(path, name):
     write(path, header, order, by_name)
 
 
-def get_orchestrator(path):
-    """Return the orchestrator name, or None if none registered."""
+def get_director(path):
+    """Return the director name, or None if none registered."""
     _, order, by_name = parse(path)
     for n in order:
-        if by_name[n].get('role') == 'orchestrator':
+        if by_name[n].get('role') == 'director':
             return n
     return None
 
@@ -160,19 +160,19 @@ def _main(argv):
         print(__doc__, file=sys.stderr)
         return 1
     cmd = argv[1]
-    if cmd == 'get-orchestrator':
+    if cmd == 'get-director':
         if len(argv) < 3:
-            print("usage: get-orchestrator PATH", file=sys.stderr)
+            print("usage: get-director PATH", file=sys.stderr)
             return 2
-        result = get_orchestrator(argv[2])
+        result = get_director(argv[2])
         if result is not None:
             print(result)
         return 0
-    if cmd == 'register-orchestrator':
+    if cmd == 'register-director':
         if len(argv) < 4:
-            print("usage: register-orchestrator PATH NAME", file=sys.stderr)
+            print("usage: register-director PATH NAME", file=sys.stderr)
             return 2
-        register_orchestrator(argv[2], argv[3])
+        register_director(argv[2], argv[3])
         return 0
     if cmd == 'set-last-active':
         if len(argv) < 4:

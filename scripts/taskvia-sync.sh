@@ -227,7 +227,7 @@ for slug, mission_meta, task in records:
     title = task.get('title', task_id)
     status = task.get('status', 'pending')
     priority = task.get('priority', 'medium')
-    agent = task.get('worker') or 'orchestrator'
+    agent = task.get('worker') or 'director'
 
     if map_key not in task_map:
         payload = {

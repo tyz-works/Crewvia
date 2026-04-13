@@ -4,7 +4,7 @@
 #
 # 各エントリの意味:
 #   name         - assign-name.sh が決定した Worker 名（config/worker-names.yaml のプールから割り当て）
-#   role         - orchestrator 指定時のみ付与される（未指定なら worker 扱い）
+#   role         - director 指定時のみ付与される（未指定なら worker 扱い）
 #   skills       - この Worker が担当するスキルセット（リスト形式・複数可）
 #   task_count   - 完了タスク数（セッション終了時に自動インクリメント）
 #   last_active  - 最終稼働日（YYYY-MM-DD 形式・自動更新）
@@ -15,37 +15,45 @@ workers:
   - name: Hana
     skills: [bash, ops]
     task_count: 0
-    last_active: 2026-04-13
+    last_active: 2026-04-14
   - name: Ren
     skills: [code, python]
     task_count: 0
-    last_active: 2026-04-13
+    last_active: 2026-04-14
   - name: Sora
-    role: orchestrator
+    role: director
     skills: []
     task_count: 0
-    last_active: 2026-04-13
+    last_active: 2026-04-14
   - name: Yuki
     skills: [research, typescript]
     task_count: 2
-    last_active: 2026-04-13
+    last_active: 2026-04-14
   - name: Kai
     skills: [code, database, typescript]
     task_count: 0
-    last_active: 2026-04-13
+    last_active: 2026-04-14
   - name: Mika
     skills: [code, typescript]
-    task_count: 7
-    last_active: 2026-04-13
+    task_count: 11
+    last_active: 2026-04-14
   - name: Haruto
     skills: [bash, code]
-    task_count: 3
-    last_active: 2026-04-13
+    task_count: 4
+    last_active: 2026-04-14
   - name: Seo
     skills: [review]
-    task_count: 5
-    last_active: 2026-04-13
+    task_count: 14
+    last_active: 2026-04-14
   - name: Jiwon
     skills: [docs, research]
     task_count: 2
-    last_active: 2026-04-13
+    last_active: 2026-04-14
+  - name: Minjun
+    skills: [docs]
+    task_count: 0
+    last_active: 2026-04-14
+  - name: Wei
+    skills: [bash, code, docs]
+    task_count: 0
+    last_active: 2026-04-14

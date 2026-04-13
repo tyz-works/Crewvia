@@ -6,15 +6,15 @@
 # 一時的な上書きは env var を使い、永続的な変更はこのファイルを編集してください。
 
 # ===== WIP 制限 =====
-# 同時に稼働できる Worker の最大数。Orchestrator はこの値を超えて Worker を
-# 起動しないようにします。タスクがブロックされる等の緊急時のみ、Orchestrator の
-# 判断で一時的に超過できます（orchestrator.md §7 の WIP 制限の例外 参照）。
+# 同時に稼働できる Worker の最大数。Director はこの値を超えて Worker を
+# 起動しないようにします。タスクがブロックされる等の緊急時のみ、Director の
+# 判断で一時的に超過できます（director.md §7 の WIP 制限の例外 参照）。
 #
 # 環境変数での上書き: CREWVIA_WIP_LIMIT=12
 wip_limit: 8
 
 # ===== モデル選択 =====
-# Orchestrator と Worker が起動時に使う Claude モデルを指定します。
+# Director と Worker が起動時に使う Claude モデルを指定します。
 # 空にすると claude CLI のデフォルト（ユーザーの /model 設定）に従います。
 #
 # 利用可能な ID:
@@ -23,13 +23,13 @@ wip_limit: 8
 #   claude-haiku-4-5-20251001  ← 高速・低コスト、軽タスク向き
 #
 # 環境変数での上書き:
-#   CREWVIA_ORCHESTRATOR_MODEL=claude-opus-4-6
+#   CREWVIA_DIRECTOR_MODEL=claude-opus-4-6
 #   CREWVIA_WORKER_MODEL=claude-sonnet-4-6
-orchestrator_model: claude-opus-4-6
+director_model: claude-opus-4-6
 worker_model: claude-sonnet-4-6
 
 # ===== 起動モード =====
-# tmux  — Orchestrator + Worker を tmux セッション "crewvia" 内に展開（並列 Worker 可）
+# tmux  — Director + Worker を tmux セッション "crewvia" 内に展開（並列 Worker 可）
 # inline — 単独プロセスで起動（Worker 並列不可、デバッグ向き）
 #
 # 環境変数での上書き: CREWVIA_TMUX=1 (tmux) / CREWVIA_TMUX=0 (inline)

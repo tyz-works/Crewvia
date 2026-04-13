@@ -372,33 +372,53 @@ Set `max_per_day: 0` to disable autonomous improvements entirely.
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                        Taskvia WebUI                        │
-│     Backlog │ In Progress │ Awaiting Approval │ Done        │
-└──────────────────────────┬──────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│                         Taskvia WebUI                           │
+│     Backlog │ In Progress │ Awaiting Approval │ Done            │
+└──────────────────────────┬──────────────────────────────────────┘
                            │ REST API
-        ┌──────────────────┼──────────────────┐
-        │                  │                  │
-┌───────▼──────┐   ┌───────▼──────┐   ┌───────▼──────┐
-│ Orchestrator │   │   Worker A   │   │   Worker B   │
-│   (1 agent)  │   │  ops, bash   │   │ code, python │
-│              │   │   "Kai"      │   │   "Luca"     │
-└──────┬───────┘   └──────┬───────┘   └──────┬───────┘
-       │ assign            │ pre-tool-use      │ post-tool-use
-       │ cards             │ approval hook     │ knowledge hook
-       └───────────────────┴───────────────────┘
-                     Claude Code CLI
+        ┌──────────────────┼──────────────────────┐
+        │                  │                      │
+┌───────▼──────┐   ┌───────▼──────┐       ┌───────▼──────┐
+│ Orchestrator │   │   Worker A   │       │   Worker B   │
+│   (1 agent)  │   │  ops, bash   │       │ code, python │
+│              │   │   "Kai"      │       │   "Luca"     │
+└──────┬───────┘   └──────┬───────┘       └──────┬───────┘
+       │ ▲                │ ▲ assign              │ ▲ assign
+       │ │notify          │ │ (tmux send-keys)    │ │ (tmux send-keys)
+       │ │                └─┴─────────────────────┘─┘
+       │ │                          │
+       │ └──────────────────────────┤
+       │                   ┌────────▼────────┐
+       │                   │   Dispatcher    │
+       │                   │  (bg daemon,    │
+       └──────────────────►│   5-sec poll)   │
+          notify (Worker   └─────────────────┘
+          needed / done)
 ```
+
+### Dispatcher モデル（tmux モード）
+
+tmux モードでは `scripts/dispatcher.sh` が常駐バックグラウンドプロセスとして動作する。
+Orchestrator が直接 Worker にタスクを送る代わりに、Dispatcher がタスクを割り当てる。
+
+| コンポーネント | 役割 |
+|---|---|
+| **Orchestrator** | ミッション受領・プラン作成・Worker 起動・Dispatcher 通知への応答 |
+| **Dispatcher** | 5秒ごとにタスク状況を確認し、idle Worker にタスクを割り当てる |
+| **Worker** | Dispatcher からの assign を受け取り、`plan.sh pull` で取得して実行 |
 
 ### Communication flow
 
-1. Orchestrator pulls cards from Taskvia Backlog → moves to In Progress
-2. Orchestrator assigns card to Worker with matching skills
-3. Worker executes task; before risky tools, PreToolUse hook requests approval
-4. Taskvia card moves to **Awaiting Approval**; user approves/denies in WebUI
-5. Worker completes task; PostToolUse hook posts knowledge log
-6. Worker reports completion to Orchestrator
-7. Orchestrator moves card to **Done** in Taskvia
+1. Orchestrator decomposes mission → registers tasks with `plan.sh add`
+2. Orchestrator spawns Workers with required skills via `bash scripts/start.sh worker <skill>`
+3. Dispatcher (started automatically) polls every 5 seconds for idle Workers + unblocked tasks
+4. Dispatcher assigns tasks to idle Workers via `tmux send-keys`
+5. Worker pulls assigned task via `plan.sh pull --task <id> --mission <slug>`, executes it
+6. Before risky tool calls, PreToolUse hook requests approval from Taskvia
+7. Worker reports completion via `plan.sh done`, then waits for next Dispatcher assign
+8. Dispatcher notifies Orchestrator when a new Worker skill is needed or all missions are complete
+9. Orchestrator responds to Dispatcher notifications (spawns Workers / archives mission)
 
 ### Kanban card structure
 

@@ -729,9 +729,11 @@ def cmd_pull(args):
         '--skills': 'value',
         '--agent': 'value',
         '--target-dir': 'value',
+        '--task': 'value',   # specific task ID (dispatcher-assigned; bypasses skill/target/blocked filters)
     })
     requested_skills = {s.strip() for s in opts.get('--skills', '').split(',') if s.strip()}
     agent = opts.get('--agent') or os.environ.get('AGENT_NAME', '')
+    specific_task = opts.get('--task')
 
     # Determine effective target_dir for filtering:
     # --target-dir flag > TARGET_DIR env var > None (crewvia-local)
@@ -778,6 +780,24 @@ def cmd_pull(args):
             scanned += len(tasks)
             done_ids = {m['id'] for (m, _) in tasks if m.get('status') in TERMINAL_STATUSES}
             for (meta, body) in tasks:
+                # --task: match by ID only, bypass skill/target/blocked filters
+                if specific_task:
+                    if meta.get('id') != specific_task:
+                        continue
+                    st = meta.get('status')
+                    if st in TERMINAL_STATUSES:
+                        die(f"task '{specific_task}' is already {st} (use plan.sh status to review)")
+                    if st == 'in_progress':
+                        die(
+                            f"task '{specific_task}' is already in_progress "
+                            f"(assigned to {meta.get('worker', '?')}). "
+                            f"If the worker crashed, reset the task status manually."
+                        )
+                    if st != 'pending':
+                        die(f"task '{specific_task}' has unexpected status: {st}")
+                    candidates.append((slug, meta, body))
+                    break  # task IDs are unique within a mission
+                # Regular auto-selection flow
                 if meta.get('status') != 'pending':
                     continue
                 pending_count += 1
@@ -811,6 +831,8 @@ def cmd_pull(args):
             )
 
         if not candidates:
+            if specific_task:
+                die(f"task '{specific_task}' not found in mission(s): {slugs}")
             if pending_count == 0:
                 diag['reason'] = 'no_pending_tasks'
                 diag['detail'] = f'{scanned} task(s) scanned across {len(slugs)} mission(s); none pending'

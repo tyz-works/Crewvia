@@ -291,13 +291,24 @@ if [[ "${CREWVIA_TMUX:-0}" == "1" ]]; then
     # TARGET_DIR が設定されている場合は --target-dir を渡して target 不一致タスクをスキップ
     PULL_TARGET_DIR_ARG=""
     [[ -n "${TARGET_DIR:-}" ]] && PULL_TARGET_DIR_ARG=" --target-dir ${TARGET_DIR}"
-    KICKOFF_MSG="ミッション開始。./scripts/plan.sh pull --agent ${AGENT_NAME} --skills ${SKILLS}${PULL_TARGET_DIR_ARG} でタスクを取得し、指示に従って作業してください。完了したら ./scripts/plan.sh done で報告。"
+    KICKOFF_MSG="ミッション開始。./scripts/plan.sh pull --agent ${AGENT_NAME} --skills ${SKILLS}${PULL_TARGET_DIR_ARG} でタスクを取得し、指示に従って作業してください。完了したら ./scripts/plan.sh done で報告し、待機してください（Dispatcher が次のタスクを自動割り当てします）。"
   else
     KICKOFF_MSG="ミッション開始。./scripts/plan.sh status で状態を確認し、タスク分解・Worker 割り当て・全体管理を開始してください。"
   fi
   tmux send-keys -t "$TARGET" "$KICKOFF_MSG"
   tmux send-keys -t "$TARGET" Enter
   echo "[crewvia] Kickoff message sent to ${SESSION}:${WINDOW_NAME}"
+
+  # Orchestrator: dispatcher を crewvia:dispatcher 窓で起動（二重起動防止）
+  if [[ "${ROLE}" == "orchestrator" ]]; then
+    if tmux list-windows -t "$SESSION" -F '#{window_name}' 2>/dev/null | grep -q '^dispatcher$'; then
+      echo "[crewvia] Dispatcher already running (${SESSION}:dispatcher)"
+    else
+      tmux new-window -t "$SESSION" -n "dispatcher"
+      tmux send-keys -t "${SESSION}:dispatcher" "cd '${REPO_ROOT}' && bash '${SCRIPT_DIR}/dispatcher.sh'" Enter
+      echo "[crewvia] Dispatcher started in tmux window: ${SESSION}:dispatcher"
+    fi
+  fi
 else
   # Default: run inline (no tmux)
   # Orchestrator 起動時に watchdog をバックグラウンドで起動

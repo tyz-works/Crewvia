@@ -903,15 +903,19 @@ def cmd_pull(args):
             file=sys.stderr,
         )
         sys.exit(2)
-    taskvia_sync_pull(chosen_holder[0]['mission'], chosen_holder[0]['id'], agent)
 
-    # Write assignment file so hooks can look up TASK_ID/TASK_TITLE without env vars
+    # Write assignment file BEFORE Taskvia sync to prevent a dispatcher race:
+    # the dispatcher checks assignment_file existence to decide "is worker idle?"
+    # If we write it after a slow Taskvia sync, the dispatcher may see
+    # task.status=in_progress (no longer pending) + no assignment file → shutdown.
     if agent:
         assignments_dir = os.path.join(QUEUE_DIR, 'assignments')
         os.makedirs(assignments_dir, exist_ok=True)
         assignment_file = os.path.join(assignments_dir, agent)
         with open(assignment_file, 'w') as _f:
             _f.write(f"{chosen_holder[0]['mission']}:{chosen_holder[0]['id']}\n")
+
+    taskvia_sync_pull(chosen_holder[0]['mission'], chosen_holder[0]['id'], agent)
 
     print(json.dumps(chosen_holder[0], ensure_ascii=False))
 

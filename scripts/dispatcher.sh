@@ -19,14 +19,14 @@
 # Notification dedup: same key is suppressed for NOTIFY_TTL seconds.
 # Standalone-safe: exits 0 silently when tmux is not available.
 
-set -uo pipefail
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 QUEUE_DIR="${CREWVIA_QUEUE:-${REPO_ROOT}/queue}"
 REGISTRY_DIR="${REPO_ROOT}/registry"
 LOG_FILE="${REGISTRY_DIR}/dispatcher.log"
-NOTIFY_CACHE="/tmp/dispatcher-notify-cache.json"
+NOTIFY_CACHE="/tmp/dispatcher-notify-cache.$$.json"
 NOTIFY_TTL=60   # seconds before repeating the same notification
 
 # Standalone-safe: silently exit when tmux is not installed

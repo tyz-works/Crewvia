@@ -11,6 +11,11 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 TASKVIA_URL="${TASKVIA_URL:-https://taskvia.vercel.app}"
 TASKVIA_TOKEN="${TASKVIA_TOKEN:-}"
 
+if [[ "${CREWVIA_TASKVIA:-}" = "disabled" ]]; then
+  echo "[taskvia-sync] Taskvia 無効モード。同期をスキップ。" >&2
+  exit 0
+fi
+
 if [[ -z "$TASKVIA_TOKEN" ]]; then
   exit 0
 fi

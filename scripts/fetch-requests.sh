@@ -22,6 +22,11 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 TASKVIA_URL="${TASKVIA_URL:-}"
 TASKVIA_TOKEN="${TASKVIA_TOKEN:-}"
 
+if [ "${CREWVIA_TASKVIA:-}" = "disabled" ]; then
+  echo "[fetch-requests] ERROR: Taskvia 連携が無効化されています（CREWVIA_TASKVIA=disabled）" >&2
+  exit 1
+fi
+
 if [ -z "$TASKVIA_URL" ]; then
   echo "[fetch-requests] ERROR: TASKVIA_URL が未設定です" >&2
   exit 1

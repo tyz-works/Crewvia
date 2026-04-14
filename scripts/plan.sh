@@ -1136,6 +1136,72 @@ def cmd_archive(args):
     taskvia_sync_archive(slug)
 
 
+def _resync_one(slug):
+    """Push one local mission + all its tasks to Taskvia (upsert, idempotent)."""
+    if not os.path.exists(mission_dir(slug)):
+        print(f"[resync] WARNING: mission '{slug}' not found locally, skipping.", file=sys.stderr)
+        return
+
+    mission = load_mission(slug)
+    title = mission.get('title', slug)
+    print(f"[resync] syncing mission: {slug}")
+
+    # Upsert mission (POST; Taskvia returns existing record if slug already registered)
+    _taskvia_request('POST', '/api/missions', {'slug': slug, 'title': title})
+
+    tasks = list_tasks(slug)
+    for meta, body in tasks:
+        task_id = meta.get('id')
+        if not task_id:
+            continue
+
+        # Try to create the task; silently ignored if it already exists
+        _taskvia_request('POST', f'/api/missions/{slug}/tasks', {
+            'id': task_id,
+            'title': meta.get('title', ''),
+            'skills': meta.get('skills', []),
+            'priority': meta.get('priority', 'medium'),
+            'blocked_by': meta.get('blocked_by', []),
+        })
+
+        # Always PATCH to sync current status / assignee / result
+        status = meta.get('status', 'pending')
+        patch: dict = {'status': status}
+        if meta.get('worker'):
+            patch['assignee'] = meta['worker']
+        if status == 'done':
+            _, result_text = parse_task_body(body)
+            if result_text:
+                patch['result'] = result_text
+
+        _taskvia_request('PATCH', f'/api/missions/{slug}/tasks/{task_id}', patch)
+
+    print(f"[resync] done: {slug} ({len(tasks)} task(s) synced)")
+
+
+def cmd_resync(args):
+    """Resync local mission(s) to Taskvia.
+
+    Usage:
+      plan.sh resync <slug>    — resync a specific mission
+      plan.sh resync --all     — resync all active missions
+    """
+    opts, positional = parse_opts(args, {'--all': 'bool'})
+    if opts.get('--all'):
+        state = load_state()
+        slugs = state.get('active_missions') or []
+        if not slugs:
+            print("[resync] No active missions to resync.", file=sys.stderr)
+            return
+    elif positional:
+        slugs = [positional[0]]
+    else:
+        die("resync requires <slug> or --all")
+
+    for slug in slugs:
+        _resync_one(slug)
+
+
 # ---------------------------------------------------------------------------
 # Dispatch
 # ---------------------------------------------------------------------------
@@ -1147,6 +1213,7 @@ dispatch = {
     'done': cmd_done,
     'status': cmd_status,
     'archive': cmd_archive,
+    'resync': cmd_resync,
 }
 
 if SUBCOMMAND not in dispatch:

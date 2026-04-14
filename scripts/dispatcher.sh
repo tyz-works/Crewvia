@@ -332,10 +332,20 @@ def tmux_list_worker_windows():
 
 
 def tmux_send(target, message):
-    """Send a message to a tmux window (Enter-terminated)."""
+    """Send a message to a tmux window (Enter-terminated).
+
+    Split into two send-keys invocations: Claude TUI's bracketed paste
+    swallows Enter when message+Enter arrive in one burst, so Enter must
+    be delivered as a separate key event after the paste closes.
+    """
     try:
         subprocess.run(
-            ['tmux', 'send-keys', '-t', target, message, 'Enter'],
+            ['tmux', 'send-keys', '-t', target, message],
+            capture_output=True, timeout=5,
+        )
+        time.sleep(0.1)
+        subprocess.run(
+            ['tmux', 'send-keys', '-t', target, 'Enter'],
             capture_output=True, timeout=5,
         )
         log(f"→ [{target}] {message[:120]}")

@@ -504,10 +504,15 @@ def generate_slug(title):
 
 _TASKVIA_URL = os.environ.get('TASKVIA_URL', '').rstrip('/')
 _TASKVIA_TOKEN = os.environ.get('TASKVIA_TOKEN', '')
+_TASKVIA_TOKEN_WARNING_SHOWN = False
 
 
 def _taskvia_request(method, path, payload=None):
     """HTTP call to Taskvia. Best-effort: never raises, logs warnings to stderr."""
+    global _TASKVIA_TOKEN_WARNING_SHOWN
+    if _TASKVIA_URL and not _TASKVIA_TOKEN and not _TASKVIA_TOKEN_WARNING_SHOWN:
+        print("[plan.sh] WARNING: TASKVIA_URL is set but TASKVIA_TOKEN is empty — Taskvia sync will be skipped.", file=sys.stderr)
+        _TASKVIA_TOKEN_WARNING_SHOWN = True
     if not (_TASKVIA_URL and _TASKVIA_TOKEN):
         return None
     url = f"{_TASKVIA_URL}{path}"

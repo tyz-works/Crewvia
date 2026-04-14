@@ -565,7 +565,17 @@ def dispatch():
                 worker_skills & set(meta.get('skills') or [])
                 for _, meta in all_pending
             )
-            if not has_any:
+            # Defense-in-depth: also keep the worker alive if it owns an
+            # in_progress task.  plan.sh pull writes the assignment file before
+            # the Taskvia sync, but there is still a narrow window between
+            # save_task (task→in_progress) and the assignment file write where
+            # the dispatcher could see is_idle=True + no pending tasks.
+            has_in_progress = any(
+                meta.get('worker') == agent_name
+                for _, meta in all_tasks
+                if meta.get('status') == 'in_progress'
+            )
+            if not has_any and not has_in_progress:
                 notify_key = f"shutdown_{agent_name}"
                 if should_notify(notify_key):
                     tmux_send(target, 'タスクなし、shutdown')

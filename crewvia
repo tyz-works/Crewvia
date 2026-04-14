@@ -51,7 +51,7 @@ if [[ -z "${CREWVIA_TMUX:-}" ]]; then
 fi
 
 # --- サブコマンド ---
-SUBCMD="${1:-orchestrator}"
+SUBCMD="${1:-director}"
 
 case "$SUBCMD" in
   status)
@@ -61,15 +61,15 @@ case "$SUBCMD" in
     shift
     exec bash "${SCRIPT_DIR}/scripts/start.sh" worker "$@"
     ;;
-  orchestrator|start)
-    exec bash "${SCRIPT_DIR}/scripts/start.sh" orchestrator
+  director|orchestrator|start)
+    exec bash "${SCRIPT_DIR}/scripts/start.sh" director
     ;;
   help|-h|--help)
     cat <<HELP
 crewvia — マルチエージェントシステム ランチャー
 
 Usage:
-  ./crewvia                         Orchestrator を起動 (デフォルト)
+  ./crewvia                         Director を起動 (デフォルト)
   ./crewvia worker <skill> ...      Worker を起動
   ./crewvia status [--mission slug] ミッション状態を表示
 

@@ -49,11 +49,12 @@ while true; do
 
         # Taskvia に alert を投稿（トークンがある場合のみ）
         if [[ -n "${TASKVIA_TOKEN:-}" ]]; then
+          PAYLOAD=$(jq -n --arg type "alert" --arg agent "watchdog" --arg content "STALE: ${name} — last heartbeat ${age}秒前" \
+            '{type: $type, agent: $agent, content: $content}')
           curl -s -X POST "${TASKVIA_URL:-https://taskvia.vercel.app}/api/log" \
             -H "Authorization: Bearer ${TASKVIA_TOKEN}" \
             -H "Content-Type: application/json" \
-            -d "{\"type\":\"alert\",\"agent\":\"watchdog\",\"content\":\"STALE: ${name} — last heartbeat ${age}秒前\"}" \
-            >/dev/null 2>&1 || true
+            -d "$PAYLOAD" >/dev/null 2>&1 || true
         fi
       fi
     done

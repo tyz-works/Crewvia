@@ -132,6 +132,10 @@ fi
 export AGENT_NAME
 export ROLE
 export TASKVIA_URL="${TASKVIA_URL:-https://taskvia.vercel.app}"
+if [[ "${TASKVIA_URL}" != https://* ]]; then
+  echo "[crewvia] ERROR: TASKVIA_URL must start with https://: ${TASKVIA_URL}" >&2
+  exit 1
+fi
 
 # CREWVIA_REPO: crewvia 本体のパス。Worker の cwd が target project に
 # 切り替わった後も、plan.sh / registry / knowledge / hooks などを絶対パスで
@@ -168,6 +172,7 @@ echo "[crewvia] Starting as $AGENT_NAME ($ROLE)"
 if [[ -z "${TASKVIA_TOKEN:-}" ]]; then
   TOKEN_FILE="${REPO_ROOT}/config/.taskvia-token"
   if [[ -f "$TOKEN_FILE" ]]; then
+    chmod 600 "$TOKEN_FILE"
     TASKVIA_TOKEN="$(tr -d '[:space:]' < "$TOKEN_FILE")"
     export TASKVIA_TOKEN
   else
@@ -248,7 +253,6 @@ if [[ "${CREWVIA_TMUX:-0}" == "1" ]]; then
   WINDOW_NAME="${AGENT_NAME}-${ROLE}"
 
   ENV_EXPORTS="export AGENT_NAME='$AGENT_NAME' TASKVIA_URL='$TASKVIA_URL' ROLE='$ROLE' SKILLS='${SKILLS:-}' CREWVIA_REPO='$CREWVIA_REPO'"
-  [[ -n "${TASKVIA_TOKEN:-}" ]] && ENV_EXPORTS+=" TASKVIA_TOKEN='$TASKVIA_TOKEN'"
   [[ "${ROLE}" == "worker" ]] && [[ "$WORK_DIR" != "$REPO_ROOT" ]] && ENV_EXPORTS+=" TARGET_DIR='$WORK_DIR'"
 
   # --model flag (空なら省略)

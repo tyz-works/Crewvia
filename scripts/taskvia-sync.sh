@@ -15,6 +15,11 @@ if [[ -z "$TASKVIA_TOKEN" ]]; then
   exit 0
 fi
 
+if [[ "${TASKVIA_URL}" != https://* ]]; then
+  echo "[taskvia-sync] ERROR: TASKVIA_URL must start with https://: ${TASKVIA_URL}" >&2
+  exit 1
+fi
+
 QUEUE_DIR="${CREWVIA_QUEUE:-${REPO_ROOT}/queue}"
 while [[ $# -gt 0 ]]; do
   case "$1" in

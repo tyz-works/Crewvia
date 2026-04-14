@@ -16,6 +16,26 @@
 
 set -euo pipefail
 
+# 読み取り・メタ系ツール: Taskvia 承認をスキップして即 exit 0
+SAFE_TOOLS=(
+  Read
+  Grep
+  Glob
+  LS
+  NotebookRead
+  TodoWrite
+  TaskCreate
+  TaskGet
+  TaskList
+  TaskOutput
+  TaskStop
+  TaskUpdate
+  WebFetch
+  WebSearch
+  Skill
+  ToolSearch
+)
+
 TASKVIA_URL="${TASKVIA_URL:-https://taskvia.vercel.app}"
 TASKVIA_TOKEN="${TASKVIA_TOKEN:-}"
 AGENT_NAME="${AGENT_NAME:-$(hostname -s)}"
@@ -47,6 +67,13 @@ fi
 INPUT="$(cat)"
 TOOL_NAME="$(echo "$INPUT" | jq -r '.tool_name // "unknown"')"
 TOOL_INPUT="$(echo "$INPUT" | jq -c '.tool_input // {}' 2>/dev/null || echo '{}')"
+
+# 読み取り・メタ系ツールは Taskvia に投げず即通過
+for _safe in "${SAFE_TOOLS[@]}"; do
+  if [ "$TOOL_NAME" = "$_safe" ]; then
+    exit 0
+  fi
+done
 
 # tool_input から簡易サマリーを作成
 TOOL_SUMMARY="${TOOL_NAME}"

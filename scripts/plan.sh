@@ -897,7 +897,7 @@ def cmd_pull(args):
                 if meta.get('status') != 'pending':
                     continue
                 pending_count += 1
-                if requested_skills and not requested_skills.issubset(set(meta.get('skills', []))):
+                if requested_skills and not set(meta.get('skills', [])).issubset(requested_skills):
                     skill_mismatch += 1
                     continue
                 # Target-dir filtering:

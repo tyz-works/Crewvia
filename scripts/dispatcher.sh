@@ -584,7 +584,7 @@ def dispatch():
             # If there are ZERO tasks (even blocked) matching this worker's skills
             # across all active missions → worker is no longer needed.
             has_any = any(
-                set(meta.get('skills') or []).issubset(worker_skills)
+                bool(task_s := set(meta.get('skills') or [])) and task_s.issubset(worker_skills)
                 for _, meta in all_pending
             )
             # Defense-in-depth: also keep the worker alive if it owns an

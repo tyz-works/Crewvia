@@ -470,6 +470,10 @@ def dispatch():
     state = load_state()
     active_missions = list(state.get('active_missions') or [])
 
+    # No active missions — nothing to dispatch, stay silent
+    if not active_missions:
+        return
+
     workers = load_workers()
 
     # Check if all active missions are done (empty list = all done)

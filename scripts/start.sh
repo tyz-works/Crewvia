@@ -131,10 +131,36 @@ fi
 
 export AGENT_NAME
 export ROLE
-export TASKVIA_URL="${TASKVIA_URL:-https://taskvia.vercel.app}"
-if [[ "${TASKVIA_URL}" != https://* ]]; then
-  echo "[crewvia] ERROR: TASKVIA_URL must start with https://: ${TASKVIA_URL}" >&2
-  exit 1
+
+# --- Taskvia 連携モード確定（CREWVIA_TASKVIA 未設定の場合は config を読む） ---
+# crewvia ランチャー経由なら ask は既に resolved 済み。直接 start.sh を呼んだ場合は
+# ここで config を読み、ask なら非対話フォールバック（enabled）を使う。
+if [[ -z "${CREWVIA_TASKVIA:-}" ]]; then
+  if [[ -f "$CONFIG_FILE" ]]; then
+    TASKVIA_MODE_FROM_CONFIG=$(grep -E '^taskvia:[[:space:]]*\S' "$CONFIG_FILE" 2>/dev/null | awk '{print $2}' | tr -d '"' | head -1)
+    case "${TASKVIA_MODE_FROM_CONFIG:-ask}" in
+      enabled|disabled|ask) export CREWVIA_TASKVIA="${TASKVIA_MODE_FROM_CONFIG:-ask}" ;;
+      *) export CREWVIA_TASKVIA="ask" ;;
+    esac
+  else
+    export CREWVIA_TASKVIA="ask"
+  fi
+  # ask が残っている場合は enabled にフォールバック（start.sh 直呼び = 非対話前提）
+  if [[ "${CREWVIA_TASKVIA}" == "ask" ]]; then
+    export CREWVIA_TASKVIA="enabled"
+  fi
+fi
+
+if [[ "${CREWVIA_TASKVIA}" == "disabled" ]]; then
+  echo "[crewvia] Taskvia 連携を無効化します（スタンドアロンモード）。" >&2
+  export TASKVIA_TOKEN=""
+  export TASKVIA_URL="${TASKVIA_URL:-https://taskvia.vercel.app}"
+else
+  export TASKVIA_URL="${TASKVIA_URL:-https://taskvia.vercel.app}"
+  if [[ "${TASKVIA_URL}" != https://* ]]; then
+    echo "[crewvia] ERROR: TASKVIA_URL must start with https://: ${TASKVIA_URL}" >&2
+    exit 1
+  fi
 fi
 
 # CREWVIA_REPO: crewvia 本体のパス。Worker の cwd が target project に
@@ -168,15 +194,17 @@ fi
 
 echo "[crewvia] Starting as $AGENT_NAME ($ROLE)"
 
-# Check for TASKVIA_TOKEN (try token file if env not set)
-if [[ -z "${TASKVIA_TOKEN:-}" ]]; then
-  TOKEN_FILE="${REPO_ROOT}/config/.taskvia-token"
-  if [[ -f "$TOKEN_FILE" ]]; then
-    chmod 600 "$TOKEN_FILE"
-    TASKVIA_TOKEN="$(tr -d '[:space:]' < "$TOKEN_FILE")"
-    export TASKVIA_TOKEN
-  else
-    echo "[crewvia] WARNING: TASKVIA_TOKEN is not set. Running in standalone mode (no Taskvia integration)." >&2
+# Check for TASKVIA_TOKEN (try token file if env not set; skip entirely when Taskvia disabled)
+if [[ "${CREWVIA_TASKVIA}" != "disabled" ]]; then
+  if [[ -z "${TASKVIA_TOKEN:-}" ]]; then
+    TOKEN_FILE="${REPO_ROOT}/config/.taskvia-token"
+    if [[ -f "$TOKEN_FILE" ]]; then
+      chmod 600 "$TOKEN_FILE"
+      TASKVIA_TOKEN="$(tr -d '[:space:]' < "$TOKEN_FILE")"
+      export TASKVIA_TOKEN
+    else
+      echo "[crewvia] WARNING: TASKVIA_TOKEN is not set. Running in standalone mode (no Taskvia integration)." >&2
+    fi
   fi
 fi
 
@@ -252,7 +280,7 @@ if [[ "${CREWVIA_TMUX:-0}" == "1" ]]; then
   SESSION="crewvia"
   WINDOW_NAME="${AGENT_NAME}-${ROLE}"
 
-  ENV_EXPORTS="export AGENT_NAME='$AGENT_NAME' TASKVIA_URL='$TASKVIA_URL' TASKVIA_TOKEN='$TASKVIA_TOKEN' ROLE='$ROLE' SKILLS='${SKILLS:-}' CREWVIA_REPO='$CREWVIA_REPO'"
+  ENV_EXPORTS="export AGENT_NAME='$AGENT_NAME' TASKVIA_URL='$TASKVIA_URL' TASKVIA_TOKEN='${TASKVIA_TOKEN:-}' CREWVIA_TASKVIA='${CREWVIA_TASKVIA:-enabled}' ROLE='$ROLE' SKILLS='${SKILLS:-}' CREWVIA_REPO='$CREWVIA_REPO'"
   [[ "${ROLE}" == "worker" ]] && [[ "$WORK_DIR" != "$REPO_ROOT" ]] && ENV_EXPORTS+=" TARGET_DIR='$WORK_DIR'"
 
   # --model flag (空なら省略)

@@ -26,10 +26,62 @@ read_config() {
   echo "$default"
 }
 
-# --- Taskvia トークンを読み込む ---
-if [[ -z "${TASKVIA_TOKEN:-}" ]] && [[ -f "$TOKEN_FILE" ]]; then
-  TASKVIA_TOKEN="$(tr -d '[:space:]' < "$TOKEN_FILE")"
-  export TASKVIA_TOKEN
+# --- CLI フラグ解析（--taskvia / --no-taskvia） ---
+FLAG_TASKVIA=""
+FLAG_NO_TASKVIA=""
+REMAINING_ARGS=()
+for arg in "$@"; do
+  case "$arg" in
+    --taskvia)    FLAG_TASKVIA="true" ;;
+    --no-taskvia) FLAG_NO_TASKVIA="true" ;;
+    *)            REMAINING_ARGS+=("$arg") ;;
+  esac
+done
+set -- "${REMAINING_ARGS[@]+"${REMAINING_ARGS[@]}"}"
+
+# --- CREWVIA_TASKVIA 決定（env > flag > config > ask） ---
+if [[ -z "${CREWVIA_TASKVIA:-}" ]]; then
+  if [[ "$FLAG_TASKVIA" == "true" ]]; then
+    export CREWVIA_TASKVIA="enabled"
+  elif [[ "$FLAG_NO_TASKVIA" == "true" ]]; then
+    export CREWVIA_TASKVIA="disabled"
+  else
+    TASKVIA_FROM_CONFIG="$(read_config taskvia "ask")"
+    export CREWVIA_TASKVIA="$TASKVIA_FROM_CONFIG"
+  fi
+fi
+
+# ask モードの対話処理（crewvia 起動時に解決する）
+if [[ "${CREWVIA_TASKVIA}" == "ask" ]]; then
+  if [[ -e /dev/tty ]]; then
+    echo ""
+    echo "[crewvia] Taskvia 承認フローを使用しますか？"
+    echo "          Y = 有効（WebUI でツール承認・ログ投稿）"
+    echo "          n = 無効（スタンドアロンモード、承認なし）"
+    printf "> [Y/n]: "
+    read -r TASKVIA_CHOICE </dev/tty || TASKVIA_CHOICE=""
+    case "$TASKVIA_CHOICE" in
+      n|N|no|No|NO)
+        export CREWVIA_TASKVIA="disabled"
+        echo "[crewvia] Taskvia 連携を無効にします（スタンドアロンモード）。"
+        ;;
+      *)
+        export CREWVIA_TASKVIA="enabled"
+        echo "[crewvia] Taskvia 承認フローを有効にします。"
+        ;;
+    esac
+  else
+    # 非対話環境: enabled にフォールバック（トークン未設定なら既存の standalone 動作に委譲）
+    export CREWVIA_TASKVIA="enabled"
+  fi
+fi
+
+# --- Taskvia トークンを読み込む（disabled 時はスキップ） ---
+if [[ "${CREWVIA_TASKVIA}" != "disabled" ]]; then
+  if [[ -z "${TASKVIA_TOKEN:-}" ]] && [[ -f "$TOKEN_FILE" ]]; then
+    TASKVIA_TOKEN="$(tr -d '[:space:]' < "$TOKEN_FILE")"
+    export TASKVIA_TOKEN
+  fi
 fi
 
 # --- Taskvia URL ---
@@ -69,17 +121,25 @@ case "$SUBCMD" in
 crewvia — マルチエージェントシステム ランチャー
 
 Usage:
-  ./crewvia                         Director を起動 (デフォルト)
-  ./crewvia worker <skill> ...      Worker を起動
-  ./crewvia status [--mission slug] ミッション状態を表示
+  ./crewvia [--taskvia|--no-taskvia] [subcommand] [options]
+
+Subcommands:
+  (none)                            Director を起動 (デフォルト)
+  worker <skill> ...                Worker を起動
+  status [--mission slug]           ミッション状態を表示
+
+Flags:
+  --taskvia                         Taskvia 承認フローを有効化
+  --no-taskvia                      Taskvia 連携を無効化（スタンドアロン）
 
 Config:  config/crewvia.yaml
 Token:   config/.taskvia-token  (1行にトークンを書く、gitignore 済み)
 
 Environment variables (config より優先):
-  CREWVIA_TMUX=1|0        起動モード
-  TASKVIA_TOKEN=sk-...    API トークン
-  TASKVIA_URL=https://... Taskvia URL
+  CREWVIA_TASKVIA=enabled|disabled|ask  Taskvia 連携モード
+  CREWVIA_TMUX=1|0                      起動モード
+  TASKVIA_TOKEN=sk-...                  API トークン
+  TASKVIA_URL=https://...               Taskvia URL
 HELP
     ;;
   *)

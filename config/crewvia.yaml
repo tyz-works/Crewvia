@@ -44,3 +44,12 @@ taskvia_url: https://taskvia.vercel.app
 # セキュリティのため、トークンは config/.taskvia-token に記載してください（gitignore 済み）。
 # ファイルが存在しない場合はスタンドアロンモードで起動します。
 # 環境変数での上書き: TASKVIA_TOKEN=sk-...
+
+# ===== Taskvia 連携モード =====
+# enabled  — Taskvia 承認ゲートとログ投稿を有効化（TASKVIA_TOKEN 必須）
+# disabled — Taskvia 連携を完全無効化（スタンドアロン動作）
+# ask      — 起動時に対話プロンプトで選択（デフォルト）
+#
+# 環境変数での上書き: CREWVIA_TASKVIA=enabled|disabled|ask
+# CLI フラグでの上書き: ./crewvia --taskvia | --no-taskvia
+taskvia: ask

@@ -508,7 +508,9 @@ _TASKVIA_TOKEN_WARNING_SHOWN = False
 
 
 def _taskvia_request(method, path, payload=None):
-    """HTTP call to Taskvia. Best-effort: never raises, logs warnings to stderr."""
+    """HTTP call to Taskvia. Best-effort: never raises, logs warnings to stderr.
+    Returns parsed response dict on success, None on failure.
+    """
     global _TASKVIA_TOKEN_WARNING_SHOWN
     if _TASKVIA_URL and not _TASKVIA_TOKEN and not _TASKVIA_TOKEN_WARNING_SHOWN:
         print("[plan.sh] WARNING: TASKVIA_URL is set but TASKVIA_TOKEN is empty — Taskvia sync will be skipped.", file=sys.stderr)
@@ -525,41 +527,115 @@ def _taskvia_request(method, path, payload=None):
         req = urllib.request.Request(url, data=body, headers=headers, method=method)
         with urllib.request.urlopen(req, timeout=10) as resp:
             return json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        try:
+            body_text = e.read().decode('utf-8', errors='replace')
+        except Exception:
+            body_text = '(unreadable)'
+        print(f"[taskvia-sync] WARNING: {method} {path} HTTP {e.code}: {body_text}", file=sys.stderr)
+        return None
     except Exception as e:
         print(f"[taskvia-sync] WARNING: {method} {path} failed: {e}", file=sys.stderr)
         return None
 
 
+def _taskvia_enabled():
+    """Return True if Taskvia credentials are configured."""
+    return bool(_TASKVIA_URL and _TASKVIA_TOKEN)
+
+
+def _taskvia_map_update(slug, task_id, status='pending'):
+    """Update .taskvia-map.json after a successful inline sync.
+    Keeps taskvia-sync.sh from re-registering tasks already pushed inline.
+    """
+    map_path = os.path.join(QUEUE_DIR, '.taskvia-map.json')
+    try:
+        with open(map_path) as f:
+            task_map = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        task_map = {}
+    map_key = f"{slug}:{task_id}"
+    task_map[map_key] = {'registered': True, 'status': status}
+    try:
+        with open(map_path, 'w') as f:
+            json.dump(task_map, f, indent=2, ensure_ascii=False)
+            f.write('\n')
+    except OSError as e:
+        print(f"[taskvia-sync] WARNING: .taskvia-map.json 更新失敗: {e}", file=sys.stderr)
+
+
+def _taskvia_map_update_status(slug, task_id, status):
+    """Update status of an existing .taskvia-map.json entry."""
+    map_path = os.path.join(QUEUE_DIR, '.taskvia-map.json')
+    try:
+        with open(map_path) as f:
+            task_map = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        task_map = {}
+    map_key = f"{slug}:{task_id}"
+    if map_key in task_map:
+        task_map[map_key]['status'] = status
+    else:
+        task_map[map_key] = {'registered': True, 'status': status}
+    try:
+        with open(map_path, 'w') as f:
+            json.dump(task_map, f, indent=2, ensure_ascii=False)
+            f.write('\n')
+    except OSError as e:
+        print(f"[taskvia-sync] WARNING: .taskvia-map.json 更新失敗: {e}", file=sys.stderr)
+
+
+def _print_sync_summary(ok):
+    """Print a one-line sync result to stdout (only when Taskvia is configured)."""
+    if not _taskvia_enabled():
+        return
+    if ok:
+        print("[taskvia-sync] ok")
+    else:
+        print("[taskvia-sync] failed — run scripts/taskvia-sync.sh to retry")
+
+
 def taskvia_sync_init(slug, title):
-    _taskvia_request('POST', '/api/missions', {'slug': slug, 'title': title})
+    resp = _taskvia_request('POST', '/api/missions', {'slug': slug, 'title': title})
+    return resp is not None
 
 
 def taskvia_sync_add(slug, task_id, title, skills, priority, blocked_by):
-    _taskvia_request('POST', f'/api/missions/{slug}/tasks', {
+    resp = _taskvia_request('POST', f'/api/missions/{slug}/tasks', {
         'id': task_id,
         'title': title,
         'skills': skills,
         'priority': priority,
         'blocked_by': blocked_by,
     })
+    if resp is not None:
+        _taskvia_map_update(slug, task_id, 'pending')
+    return resp is not None
 
 
 def taskvia_sync_pull(slug, task_id, assignee):
-    _taskvia_request('PATCH', f'/api/missions/{slug}/tasks/{task_id}', {
+    resp = _taskvia_request('PATCH', f'/api/missions/{slug}/tasks/{task_id}', {
         'status': 'in_progress',
         'assignee': assignee,
     })
+    if resp is not None:
+        _taskvia_map_update_status(slug, task_id, 'in_progress')
+    return resp is not None
 
 
 def taskvia_sync_done(slug, task_id, result):
-    _taskvia_request('PATCH', f'/api/missions/{slug}/tasks/{task_id}', {
+    resp = _taskvia_request('PATCH', f'/api/missions/{slug}/tasks/{task_id}', {
         'status': 'done',
         'result': result,
     })
+    if resp is not None:
+        _taskvia_map_update_status(slug, task_id, 'done')
+    return resp is not None
 
 
 def taskvia_sync_archive(slug):
-    _taskvia_request('DELETE', f'/api/missions/{slug}')
+    resp = _taskvia_request('DELETE', f'/api/missions/{slug}')
+    return resp is not None
 
 
 # ---------------------------------------------------------------------------
@@ -655,7 +731,8 @@ def cmd_init(args):
 
     with_lock(_do)
     if sync_holder[0]:
-        taskvia_sync_init(*sync_holder[0])
+        ok = taskvia_sync_init(*sync_holder[0])
+        _print_sync_summary(ok)
 
 
 def cmd_add(args):
@@ -725,7 +802,8 @@ def cmd_add(args):
 
     with_lock(_do)
     if sync_holder[0]:
-        taskvia_sync_add(*sync_holder[0])
+        ok = taskvia_sync_add(*sync_holder[0])
+        _print_sync_summary(ok)
 
 
 def cmd_pull(args):
@@ -915,7 +993,8 @@ def cmd_pull(args):
         with open(assignment_file, 'w') as _f:
             _f.write(f"{chosen_holder[0]['mission']}:{chosen_holder[0]['id']}\n")
 
-    taskvia_sync_pull(chosen_holder[0]['mission'], chosen_holder[0]['id'], agent)
+    ok = taskvia_sync_pull(chosen_holder[0]['mission'], chosen_holder[0]['id'], agent)
+    _print_sync_summary(ok)
 
     print(json.dumps(chosen_holder[0], ensure_ascii=False))
 
@@ -991,7 +1070,8 @@ def cmd_done(args):
             os.remove(assignment_file)
 
     if sync_holder[0]:
-        taskvia_sync_done(*sync_holder[0])
+        ok = taskvia_sync_done(*sync_holder[0])
+        _print_sync_summary(ok)
 
 
 def cmd_status(args):
@@ -1137,7 +1217,8 @@ def cmd_archive(args):
         print(f"Archived: {slug} → archive/{slug}")
 
     with_lock(_do)
-    taskvia_sync_archive(slug)
+    ok = taskvia_sync_archive(slug)
+    _print_sync_summary(ok)
 
 
 def _resync_one(slug):

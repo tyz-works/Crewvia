@@ -82,7 +82,7 @@
       "Bash(basename:*)",
       "Bash(dirname:*)",
       "Bash(mktemp:*)",
-      "Bash(cp:*)"
+      "Bash(cp .claude/settings.json:*)"
     ],
     "deny": [
       "Bash(git push --force:*)",

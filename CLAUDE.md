@@ -190,8 +190,9 @@ Backlog → In Progress → Awaiting Approval → Done
 
 | 変数名 | 用途 |
 |---|---|
+| `CREWVIA_TASKVIA` | Taskvia 連携モード: `enabled` / `disabled` / `ask`（最優先。config・フラグより上） |
 | `TASKVIA_URL` | Taskvia WebUIのURL |
-| `TASKVIA_TOKEN` | Taskvia API認証トークン |
+| `TASKVIA_TOKEN` | Taskvia API認証トークン（`disabled` 時は不要） |
 | `AGENT_NAME` | 起動時に設定されるエージェント名 |
 | `TASK_TITLE` | 現在担当中のタスクタイトル |
 | `TASK_ID` | 現在担当中のカードID |

@@ -72,7 +72,17 @@
       "Bash(eslint:*)",
       "Bash(prettier --check:*)",
       "Bash(./scripts/plan.sh:*)",
-      "Bash(bash scripts/plan.sh:*)"
+      "Bash(bash scripts/plan.sh:*)",
+      "Bash(bash hooks/:*)",
+      "Bash(./hooks/:*)",
+      "Bash(python3 scripts/:*)",
+      "Bash(gh pr create:*)",
+      "Bash(shasum:*)",
+      "Bash(realpath:*)",
+      "Bash(basename:*)",
+      "Bash(dirname:*)",
+      "Bash(mktemp:*)",
+      "Bash(cp:*)"
     ],
     "deny": [
       "Bash(git push --force:*)",

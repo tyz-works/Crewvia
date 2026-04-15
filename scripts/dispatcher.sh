@@ -522,6 +522,10 @@ def dispatch():
         bb = meta.get('blocked_by') or []
         if any(dep not in done_ids for dep in bb):
             continue
+        task_skills = set(meta.get('skills') or [])
+        if not task_skills:
+            log(f"WARNING: task {meta.get('id')} (mission={slug}) has no skills — dispatcher cannot assign it")
+            continue
         unblocked_pending.append((slug, meta))
     unblocked_pending.sort(key=lambda c: PRIORITY_ORDER.get(c[1].get('priority', 'medium'), 1))
 
@@ -557,7 +561,8 @@ def dispatch():
         for slug, meta in unblocked_pending:
             if meta['id'] in assigned_task_ids:
                 continue
-            if worker_skills & set(meta.get('skills') or []):
+            task_skills = set(meta.get('skills') or [])
+            if task_skills.issubset(worker_skills):
                 best = (slug, meta)
                 break
 
@@ -579,7 +584,7 @@ def dispatch():
             # If there are ZERO tasks (even blocked) matching this worker's skills
             # across all active missions → worker is no longer needed.
             has_any = any(
-                worker_skills & set(meta.get('skills') or [])
+                bool(task_s := set(meta.get('skills') or [])) and task_s.issubset(worker_skills)
                 for _, meta in all_pending
             )
             # Defense-in-depth: also keep the worker alive if it owns an
@@ -605,7 +610,7 @@ def dispatch():
         task_id = meta['id']
         task_skills = set(meta.get('skills') or [])
         can_handle = any(
-            task_skills & set((workers.get(w['agent_name']) or {}).get('skills') or [])
+            task_skills.issubset(set((workers.get(w['agent_name']) or {}).get('skills') or []))
             for w in windows
         )
         if not can_handle:

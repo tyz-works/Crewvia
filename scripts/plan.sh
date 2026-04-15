@@ -750,6 +750,8 @@ def cmd_add(args):
     sync_holder = [None]  # (slug, task_id, title, skills, priority, blocked_by)
 
     skills = [s.strip() for s in opts.get('--skills', '').split(',') if s.strip()]
+    if not skills:
+        print("WARNING: task added with no skills — dispatcher will not be able to assign it automatically", file=sys.stderr)
     blocked_by = [s.strip() for s in opts.get('--blocked-by', '').split(',') if s.strip()]
     priority = opts.get('--priority', 'medium')
     if priority not in PRIORITY_ORDER:
@@ -878,13 +880,24 @@ def cmd_pull(args):
                         )
                     if st != 'pending':
                         die(f"task '{specific_task}' has unexpected status: {st}")
+                    # Warn if worker skills don't fully cover the task's required skills
+                    task_req = set(meta.get('skills') or [])
+                    worker_skills = {s.strip() for s in requested_skills}
+                    missing = task_req - worker_skills
+                    if task_req and missing:
+                        print(
+                            f"WARNING: task '{specific_task}' requires skills {sorted(task_req)} "
+                            f"but worker has {sorted(worker_skills) or '<none>'}; "
+                            f"missing: {sorted(missing)}",
+                            file=sys.stderr,
+                        )
                     candidates.append((slug, meta, body))
                     break  # task IDs are unique within a mission
                 # Regular auto-selection flow
                 if meta.get('status') != 'pending':
                     continue
                 pending_count += 1
-                if requested_skills and not requested_skills.intersection(set(meta.get('skills', []))):
+                if requested_skills and not requested_skills.issubset(set(meta.get('skills', []))):
                     skill_mismatch += 1
                     continue
                 # Target-dir filtering:

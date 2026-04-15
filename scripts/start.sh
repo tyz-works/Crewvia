@@ -306,6 +306,9 @@ if [[ "${CREWVIA_TMUX:-0}" == "1" ]]; then
     echo "[crewvia] Creating tmux session: $SESSION"
     tmux new-session -d -s "$SESSION" -n "$WINDOW_NAME"
     TARGET="${SESSION}:${WINDOW_NAME}"
+  elif tmux list-windows -t "$SESSION" -F '#{window_name}' 2>/dev/null | grep -qx "$WINDOW_NAME"; then
+    echo "[crewvia] Window ${SESSION}:${WINDOW_NAME} already exists, skipping launch"
+    exit 0
   else
     tmux new-window -t "$SESSION" -n "$WINDOW_NAME"
     TARGET="${SESSION}:${WINDOW_NAME}"

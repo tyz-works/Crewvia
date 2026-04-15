@@ -469,12 +469,10 @@ def publish_agents():
 def dispatch():
     state = load_state()
     active_missions = list(state.get('active_missions') or [])
-    if not active_missions:
-        return
 
     workers = load_workers()
 
-    # Check if all active missions are done
+    # Check if all active missions are done (empty list = all done)
     all_done = True
     for slug in active_missions:
         mfile = MISSIONS_DIR / slug / 'mission.yaml'
@@ -487,6 +485,21 @@ def dispatch():
             break
 
     if all_done:
+        # Shut down all idle workers before notifying director
+        windows = tmux_list_worker_windows()
+        for window in windows:
+            agent_name = window['agent_name']
+            target = window['window_target']
+            assignment_file = ASSIGNMENTS_DIR / agent_name
+            is_idle = not assignment_file.exists()
+            if is_idle:
+                notify_key = f"shutdown_{agent_name}"
+                if should_notify(notify_key):
+                    tmux_send(target, 'タスクなし、shutdown')
+                    record_notify(notify_key)
+                    time.sleep(1)
+                    tmux_kill_window(target)
+
         key = 'all_missions_done'
         if should_notify(key):
             tmux_send('crewvia:Sora-director', '全ミッション完了')

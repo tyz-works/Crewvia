@@ -197,6 +197,14 @@ so the same skills always produce the same name (e.g., `ops bash` → "Kai").
 
 ### Running with tmux (optional)
 
+When `./crewvia` starts in tmux mode, it automatically attaches you to the Director
+window after launching. No manual `tmux attach` needed:
+
+- **Outside tmux**: `exec tmux attach-session` opens the Director window in your terminal.
+- **Inside tmux** (e.g. nested session): `tmux switch-client` switches to the `crewvia` session.
+
+To manually set up a session instead:
+
 ```bash
 # Create a session with Director + 3 Workers
 tmux new-session -s crewvia -n director

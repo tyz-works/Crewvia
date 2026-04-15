@@ -343,6 +343,16 @@ if [[ "${CREWVIA_TMUX:-0}" == "1" ]]; then
       tmux send-keys -t "${SESSION}:dispatcher" "cd '${REPO_ROOT}' && bash '${SCRIPT_DIR}/dispatcher.sh'" Enter
       echo "[crewvia] Dispatcher started in tmux window: ${SESSION}:dispatcher"
     fi
+
+    # Auto-attach to Director window after kickoff + dispatcher launch.
+    # $TMUX が set されている（既に tmux 内にいる）場合は switch-client、
+    # tmux 外のシェルなら attach-session で Director 窓に移動する。
+    if [[ -n "${TMUX:-}" ]]; then
+      tmux switch-client -t "$SESSION"
+    else
+      echo "[crewvia] Attaching to ${SESSION}:${WINDOW_NAME} ..."
+      exec tmux attach-session -t "${SESSION}:${WINDOW_NAME}"
+    fi
   fi
 else
   # Default: run inline (no tmux)

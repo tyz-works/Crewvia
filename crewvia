@@ -145,6 +145,10 @@ Environment variables (config より優先):
   CREWVIA_TMUX=1|0                      起動モード
   TASKVIA_TOKEN=sk-...                  API トークン
   TASKVIA_URL=https://...               Taskvia URL
+
+Behavior:
+  tmux モード起動時、kickoff + Dispatcher 起動後に自動で Director 窓に attach します。
+  tmux 内から起動した場合は switch-client、外からなら attach-session を使用します。
 HELP
     ;;
   *)

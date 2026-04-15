@@ -382,7 +382,7 @@ def publish_agents():
     """
     taskvia_url = os.environ.get('TASKVIA_URL', 'https://taskvia.vercel.app')
     taskvia_token = os.environ.get('TASKVIA_TOKEN', '')
-    if not taskvia_token:
+    if os.environ.get('CREWVIA_TASKVIA') == 'disabled' or not taskvia_token:
         return
 
     now = time.time()

@@ -31,6 +31,11 @@ REQUEST_ID="$1"
 TASKVIA_URL="${TASKVIA_URL:-}"
 TASKVIA_TOKEN="${TASKVIA_TOKEN:-}"
 
+if [ "${CREWVIA_TASKVIA:-}" = "disabled" ]; then
+  echo "[process-request] ERROR: Taskvia 連携が無効化されています（CREWVIA_TASKVIA=disabled）" >&2
+  exit 1
+fi
+
 if [ -z "$TASKVIA_URL" ]; then
   echo "[process-request] ERROR: TASKVIA_URL が未設定です" >&2
   exit 1

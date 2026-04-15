@@ -58,8 +58,8 @@ if [ -z "$TASK_ID" ] && [ -n "$AGENT_NAME" ]; then
   fi
 fi
 
-# スタンドアロンモード: トークン未設定なら承認なしで通過
-if [ -z "$TASKVIA_TOKEN" ]; then
+# Taskvia 無効モード: CREWVIA_TASKVIA=disabled または トークン未設定なら承認なしで通過
+if [ "${CREWVIA_TASKVIA:-}" = "disabled" ] || [ -z "$TASKVIA_TOKEN" ]; then
   exit 0
 fi
 

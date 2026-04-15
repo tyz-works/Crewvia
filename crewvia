@@ -132,11 +132,16 @@ Flags:
   --taskvia                         Taskvia 承認フローを有効化
   --no-taskvia                      Taskvia 連携を無効化（スタンドアロン）
 
+Taskvia フラグ:
+  --taskvia      承認フロー有効（WebUI でツール承認・ログ投稿）
+  --no-taskvia   スタンドアロンモード（承認なし、トークン不要）
+  ※ config/crewvia.yaml の taskvia: 設定より優先される
+
 Config:  config/crewvia.yaml
 Token:   config/.taskvia-token  (1行にトークンを書く、gitignore 済み)
 
 Environment variables (config より優先):
-  CREWVIA_TASKVIA=enabled|disabled|ask  Taskvia 連携モード
+  CREWVIA_TASKVIA=enabled|disabled|ask  Taskvia 連携モード（最優先）
   CREWVIA_TMUX=1|0                      起動モード
   TASKVIA_TOKEN=sk-...                  API トークン
   TASKVIA_URL=https://...               Taskvia URL

@@ -71,8 +71,9 @@ Crewvia uses the following environment variables. Add them to your shell profile
 
 | Variable | Required | Description |
 |----------|----------|-------------|
+| `CREWVIA_TASKVIA` | Optional | Taskvia mode: `enabled`, `disabled`, or `ask` (default). Overrides config and flags |
 | `TASKVIA_URL` | Optional | Taskvia WebUI URL (default: `https://taskvia.vercel.app`) |
-| `TASKVIA_TOKEN` | Optional | Taskvia API authentication token. If unset, standalone mode is used |
+| `TASKVIA_TOKEN` | Optional | Taskvia API authentication token. Required when `CREWVIA_TASKVIA=enabled` |
 | `AGENT_NAME` | Set by `start.sh` | Name assigned to this agent instance |
 | `TASK_TITLE` | Set at runtime | Human-readable title of the current task card |
 | `TASK_ID` | Set at runtime | Card ID of the current task (e.g., `card-042`) |
@@ -84,8 +85,10 @@ export TASKVIA_URL="https://taskvia.vercel.app"
 export TASKVIA_TOKEN="tvk_xxxxxxxxxxxxxxxxxxxx"
 ```
 
-> **Standalone mode**: If `TASKVIA_TOKEN` is not set, approval requests are skipped
-> (PreToolUse hook exits 0 immediately) and knowledge logs are printed to stdout only.
+> **Standalone mode**: Run with `./crewvia --no-taskvia` or set `CREWVIA_TASKVIA=disabled` to skip
+> all approval gates and log posting. No token needed. Suitable for local development and CI.
+>
+> If `TASKVIA_TOKEN` is not set and mode is `enabled`, Crewvia falls back to standalone automatically.
 
 ### 3. Grant execute permissions
 
@@ -136,8 +139,30 @@ Replace `/path/to/crewvia` with the absolute path to your Crewvia installation.
 
 ## Starting Agents
 
-Use `scripts/start.sh` to launch agents. The script sets the `AGENT_NAME` environment
-variable based on the role and skill set, then starts Claude Code.
+The recommended way to launch agents is via the `./crewvia` launcher script,
+which handles Taskvia mode selection, token loading, and agent startup in one step.
+
+### Quick start
+
+```bash
+# Start Director (prompts for Taskvia mode if config/crewvia.yaml has taskvia: ask)
+./crewvia
+
+# Start Director with Taskvia approval flow enabled
+./crewvia --taskvia
+
+# Start Director in standalone mode (no Taskvia, no token needed)
+./crewvia --no-taskvia
+
+# Start a Worker
+./crewvia worker docs research
+./crewvia --no-taskvia worker code python
+```
+
+> **Taskvia mode priority**: `CREWVIA_TASKVIA` env var > `--taskvia/--no-taskvia` flag > `config/crewvia.yaml taskvia:` key > interactive prompt (`ask`)
+
+Alternatively, use `scripts/start.sh` directly — the script sets `AGENT_NAME`
+based on the role and skill set, then starts Claude Code.
 
 ### Start as Director
 
@@ -240,12 +265,35 @@ After tool execution, Workers post discoveries to `POST /api/log`. Log types:
 | `improvement` | Improvement proposals | Pushed to Obsidian |
 | `work` | Routine work logs | Temporary, discarded |
 
-### Standalone mode (no TASKVIA_TOKEN)
+### Standalone mode (Taskvia disabled)
 
-When `TASKVIA_TOKEN` is not set:
-- PreToolUse hook exits `0` immediately (all tools allowed)
-- PostToolUse hook prints log entries to stdout only
-- No approval UI is available; suitable for trusted local development
+Run in standalone mode when you don't need approval gating — useful for local development,
+CI pipelines, or when you haven't set up a Taskvia account yet.
+
+**Three ways to enable standalone mode** (listed by priority):
+
+```bash
+# 1. Environment variable (highest priority)
+CREWVIA_TASKVIA=disabled ./crewvia
+
+# 2. CLI flag
+./crewvia --no-taskvia
+
+# 3. Permanent setting in config/crewvia.yaml
+#    taskvia: disabled
+```
+
+When standalone mode is active:
+- PreToolUse hook exits `0` immediately (all tools allowed without approval)
+- PostToolUse hook skips log posting to Taskvia
+- `TASKVIA_TOKEN` is not required and not read
+- `scripts/taskvia-sync.sh` exits silently (no sync)
+- `scripts/fetch-requests.sh` and `scripts/process-request.sh` exit with an error
+  (these scripts require Taskvia by design)
+
+> **Legacy behavior**: If `TASKVIA_TOKEN` is simply not set (and `CREWVIA_TASKVIA` is
+> not `disabled`), Crewvia also falls back to standalone automatically — this preserves
+> backwards compatibility for existing setups.
 
 ---
 

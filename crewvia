@@ -70,16 +70,24 @@ crewvia — マルチエージェントシステム ランチャー
 
 Usage:
   ./crewvia                         Director を起動 (デフォルト)
+  ./crewvia --taskvia               Taskvia 承認フローを有効化して起動
+  ./crewvia --no-taskvia            Taskvia を無効化してスタンドアロン起動
   ./crewvia worker <skill> ...      Worker を起動
   ./crewvia status [--mission slug] ミッション状態を表示
+
+Taskvia フラグ:
+  --taskvia      承認フロー有効（WebUI でツール承認・ログ投稿）
+  --no-taskvia   スタンドアロンモード（承認なし、トークン不要）
+  ※ config/crewvia.yaml の taskvia: 設定より優先される
 
 Config:  config/crewvia.yaml
 Token:   config/.taskvia-token  (1行にトークンを書く、gitignore 済み)
 
 Environment variables (config より優先):
-  CREWVIA_TMUX=1|0        起動モード
-  TASKVIA_TOKEN=sk-...    API トークン
-  TASKVIA_URL=https://... Taskvia URL
+  CREWVIA_TASKVIA=enabled|disabled|ask  Taskvia モード（最優先）
+  CREWVIA_TMUX=1|0                      起動モード
+  TASKVIA_TOKEN=sk-...                  API トークン
+  TASKVIA_URL=https://...               Taskvia URL
 HELP
     ;;
   *)

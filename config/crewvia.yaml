@@ -36,6 +36,17 @@ worker_model: claude-sonnet-4-6
 mode: tmux
 
 # ===== Taskvia 連携 =====
+# Taskvia 承認フローの使用モードを指定します。
+#
+#   ask      — 起動時に対話プロンプトで選択（デフォルト）
+#   enabled  — 常に Taskvia 承認ゲートとログ投稿を使用（TASKVIA_TOKEN 必須）
+#   disabled — Taskvia を完全無効化（スタンドアロン動作、トークン不要）
+#
+# 優先順位: env CREWVIA_TASKVIA > --taskvia/--no-taskvia フラグ > このキー
+# 環境変数での上書き: CREWVIA_TASKVIA=enabled|disabled|ask
+# CLI フラグでの上書き: ./crewvia --taskvia | ./crewvia --no-taskvia
+taskvia: ask
+
 # Taskvia WebUI の URL。
 # 環境変数での上書き: TASKVIA_URL=https://...
 taskvia_url: https://taskvia.vercel.app

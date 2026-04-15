@@ -170,6 +170,36 @@ def http_post(url, payload):
         return None
 
 
+def http_get(url):
+    try:
+        req = urllib.request.Request(url, headers=_headers(), method='GET')
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return None
+        print(f"[taskvia-sync] WARNING: GET {url} 失敗: {e}", file=sys.stderr)
+        return None
+    except Exception as e:
+        print(f"[taskvia-sync] WARNING: GET {url} 失敗: {e}", file=sys.stderr)
+        return None
+
+
+def http_patch(url, payload):
+    try:
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode(),
+            headers=_headers(),
+            method='PATCH',
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read().decode())
+    except Exception as e:
+        print(f"[taskvia-sync] WARNING: PATCH {url} 失敗: {e}", file=sys.stderr)
+        return None
+
+
 def http_delete(url):
     try:
         req = urllib.request.Request(url, headers=_headers(), method='DELETE')
@@ -228,6 +258,30 @@ if not records:
 task_map = load_map(map_file)
 updated = False
 
+# ---------- ミッション登録 (冪等) ----------
+existing_resp = http_get(f"{taskvia_url}/api/missions")
+existing_slugs = set()
+if existing_resp:
+    for m in existing_resp.get('missions', []):
+        existing_slugs.add(m.get('slug', ''))
+
+seen_slugs = set()
+for slug, mission_meta, _ in records:
+    if slug in seen_slugs or slug in existing_slugs:
+        seen_slugs.add(slug)
+        continue
+    seen_slugs.add(slug)
+    resp = http_post(f"{taskvia_url}/api/missions", {
+        'slug': slug,
+        'title': mission_meta.get('title', slug),
+    })
+    if resp:
+        print(f"[taskvia-sync] ミッション登録: {slug}")
+        updated = True
+    else:
+        print(f"[taskvia-sync] WARNING: ミッション {slug} の登録失敗。スキップ。", file=sys.stderr)
+
+# ---------- タスク登録・更新 ----------
 for slug, mission_meta, task in records:
     task_id = task.get('id', '')
     if not task_id:
@@ -238,29 +292,31 @@ for slug, mission_meta, task in records:
     status = task.get('status', 'pending')
     priority = task.get('priority', 'medium')
     agent = task.get('worker') or 'director'
+    skills = task.get('skills') or []
+    blocked_by = task.get('blocked_by') or []
 
     if map_key not in task_map:
         payload = {
-            'tool': f"task:{slug}/{task_id}",
-            'agent': agent,
-            'task_title': title,
-            'task_id': f"{slug}/{task_id}",
+            'id': task_id,
+            'title': title,
+            'status': status,
+            'assignee': agent,
+            'skills': skills,
             'priority': priority,
+            'blocked_by': blocked_by,
         }
-        resp = http_post(f"{taskvia_url}/api/request", payload)
-        if resp and resp.get('id'):
-            card_id = resp['id']
-            task_map[map_key] = {'card_id': card_id, 'status': status}
-            print(f"[taskvia-sync] 登録: {map_key} → card_id={card_id}")
+        resp = http_post(f"{taskvia_url}/api/missions/{slug}/tasks", payload)
+        if resp is not None:
+            task_map[map_key] = {'registered': True, 'status': status}
+            print(f"[taskvia-sync] 登録: {map_key} (blocked_by={blocked_by})")
             updated = True
         else:
             print(f"[taskvia-sync] WARNING: {map_key} の登録失敗。スキップ。", file=sys.stderr)
     else:
-        card_id = task_map[map_key].get('card_id', '')
         last_status = task_map[map_key].get('status', '')
-        if card_id and status != last_status:
-            resp = http_post(
-                f"{taskvia_url}/api/cards/{card_id}",
+        if status != last_status:
+            resp = http_patch(
+                f"{taskvia_url}/api/missions/{slug}/tasks/{task_id}",
                 {'status': status},
             )
             if resp is not None:

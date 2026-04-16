@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# DEPRECATED: watchdog.sh は scripts/watchdog.py (Watchdog v2) に置き換えられました。
+# このファイルは互換性のため残していますが、新規利用は watchdog.py を使用してください。
 set -euo pipefail
 
 # watchdog.sh — Worker 死活監視

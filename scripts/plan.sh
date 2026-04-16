@@ -26,7 +26,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 QUEUE_DIR="${CREWVIA_QUEUE:-${REPO_ROOT}/queue}"
 
 if [[ $# -eq 0 ]]; then
-  echo "Usage: plan.sh <init|add|pull|done|status|archive> [args...]" >&2
+  echo "Usage: plan.sh <init|add|pull|done|fail|status|archive> [args...]" >&2
   exit 1
 fi
 
@@ -1089,8 +1089,9 @@ def cmd_done(args):
             die(f"task '{task_id}' not found in mission '{slug}'.")
 
         meta, body = load_task(slug, task_id)
-        if meta.get('status') == 'done':
-            die(f"task '{task_id}' is already done.")
+        cur_status = meta.get('status')
+        if cur_status in ('done', 'failed', 'skipped'):
+            die(f"task '{task_id}' is already {cur_status}.")
 
         meta['status'] = 'done'
         meta['completed_at'] = now_iso()

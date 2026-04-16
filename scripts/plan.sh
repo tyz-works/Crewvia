@@ -104,17 +104,30 @@ def parse_yaml(text, source='<yaml>'):
         key = m.group(1)
         val = m.group(2).rstrip()
         if val == '':
-            # Possible block list on subsequent indented `- ` lines
+            # Possible block list (`- item`) or block mapping (`  key: val`)
             i += 1
             items = []
+            sub_dict = {}
             while i < len(lines):
                 lst = re.match(r'^\s+-\s*(.*)$', lines[i])
                 if lst:
                     items.append(_scalar(lst.group(1).strip()))
                     i += 1
                 else:
-                    break
-            result[key] = items if items else None
+                    map_m = re.match(r'^  ([\w-]+):\s*(.*)$', lines[i])
+                    if map_m:
+                        sub_key = map_m.group(1)
+                        sub_val = _scalar(map_m.group(2).rstrip())
+                        sub_dict[sub_key] = sub_val
+                        i += 1
+                    else:
+                        break
+            if items:
+                result[key] = items
+            elif sub_dict:
+                result[key] = sub_dict
+            else:
+                result[key] = None
         elif val.startswith('[') and val.endswith(']'):
             inner = val[1:-1].strip()
             if not inner:
@@ -193,6 +206,11 @@ def _dump_kv(key, val):
         return f"{key}: {'true' if val else 'false'}"
     if isinstance(val, int):
         return f"{key}: {val}"
+    if isinstance(val, dict):
+        lines = [f"{key}:"]
+        for k, v in val.items():
+            lines.append(f"  {k}: {_dump_inline(v)}")
+        return '\n'.join(lines)
     if isinstance(val, list):
         if not val:
             return f"{key}: []"
@@ -236,7 +254,7 @@ def _dump_inline(val):
 
 TASK_META_KEY_ORDER = [
     'id', 'title', 'skills', 'priority', 'status',
-    'blocked_by', 'worker', 'started_at', 'completed_at',
+    'blocked_by', 'timeout', 'target_dir', 'worker', 'started_at', 'completed_at',
 ]
 
 
@@ -743,6 +761,8 @@ def cmd_add(args):
         '--priority': 'value',
         '--description': 'value',
         '--target-dir': 'value',
+        '--idle-timeout': 'value',
+        '--max-timeout': 'value',
     })
     if not positional:
         die("add requires a task title")
@@ -769,6 +789,20 @@ def cmd_add(args):
     else:
         target_dir = None
 
+    # --idle-timeout / --max-timeout: タスクごとの timeout 秒数（省略可）
+    timeout = {}
+    if opts.get('--idle-timeout'):
+        try:
+            timeout['idle'] = int(opts['--idle-timeout'])
+        except ValueError:
+            die("--idle-timeout must be an integer number of seconds")
+    if opts.get('--max-timeout'):
+        try:
+            timeout['max'] = int(opts['--max-timeout'])
+        except ValueError:
+            die("--max-timeout must be an integer number of seconds")
+    timeout = timeout if timeout else None
+
     def _do():
         state = load_state()
         slug = opts.get('--mission') or state.get('default_mission')
@@ -793,6 +827,8 @@ def cmd_add(args):
             'started_at': None,
             'completed_at': None,
         }
+        if timeout:
+            meta['timeout'] = timeout
         body = build_task_body(description, '')
         save_task(slug, task_id, meta, body)
         sync_holder[0] = (slug, task_id, title, skills, priority, blocked_by)
@@ -1195,7 +1231,17 @@ def _print_mission_detail(slug):
             suffix = f"(blocked: {', '.join(unmet)})" if unmet else "(pending)"
         else:
             suffix = "(pending)"
-        print(f"[{icon}] {tid} {title} {suffix}")
+        timeout_suffix = ''
+        to = m.get('timeout')
+        if isinstance(to, dict):
+            parts = []
+            if 'idle' in to:
+                parts.append(f"idle={to['idle']}s")
+            if 'max' in to:
+                parts.append(f"max={to['max']}s")
+            if parts:
+                timeout_suffix = f" [{' '.join(parts)}]"
+        print(f"[{icon}] {tid} {title} {suffix}{timeout_suffix}")
 
     total = len(tasks)
     done_count = sum(1 for (m, _) in tasks if m.get('status') == 'done')

@@ -541,48 +541,47 @@ handoff_path: $HANDOFF_PATH
 `task_count` を +1 し、`last_active` を今日の日付に更新する。`yq` 非依存で python3 を使うこと:
 
 ```bash
-python3 - <<'EOF'
+python3 - "${AGENT_NAME}" <<'PYEOF'
 import sys, re
 from pathlib import Path
 from datetime import date
 
-registry_path = Path("registry/workers.yaml")
-content = registry_path.read_text()
-agent_name = "${AGENT_NAME}"
+agent_name = sys.argv[1]
 today = date.today().isoformat()
+registry = Path("registry/workers.yaml")
+lines = registry.read_text().splitlines()
 
-# task_count を +1
-lines = content.splitlines()
 in_target = False
-result = []
-for line in lines:
-    if re.match(r'\s*- name: ' + re.escape(agent_name) + r'\s*$', line):
+for i, line in enumerate(lines):
+    if re.match(r'\s*- name:\s*' + re.escape(agent_name) + r'\s*$', line):
         in_target = True
-    if in_target and re.match(r'\s*task_count:', line):
-        count = int(re.search(r'task_count:\s*(\d+)', line).group(1))
-        line = re.sub(r'(task_count:\s*)\d+', f'\\g<1>{count + 1}', line)
-        in_target = False  # task_count 更新後はフラグリセット
-    if re.match(r'\s*last_active:', line) and agent_name in content[content.find('- name: ' + agent_name):content.find('- name: ' + agent_name) + 200]:
-        line = re.sub(r'(last_active:\s*)[\d-]+', f'\\g<1>{today}', line)
-    result.append(line)
+        continue
+    if in_target:
+        if re.match(r'\s*- name:', line):
+            break  # 次のエントリに入ったら離脱
+        if re.match(r'\s*task_count:', line):
+            n = int(re.search(r'(\d+)', line).group(1))
+            lines[i] = re.sub(r'(task_count:\s*)\d+', rf'\g<1>{n+1}', line)
+        elif re.match(r'\s*last_active:', line):
+            lines[i] = re.sub(r'(last_active:\s*)[\d-]+', rf'\g<1>{today}', line)
 
-registry_path.write_text('\n'.join(result) + '\n')
+registry.write_text('\n'.join(lines) + '\n')
 print(f"Updated: {agent_name} task_count +1, last_active={today}")
-EOF
+PYEOF
 ```
 
 エントリが存在しない場合（初回）は追加する:
 
 ```bash
-python3 - <<'EOF'
+python3 - "${AGENT_NAME}" <<'PYEOF'
 import sys
 from pathlib import Path
 from datetime import date
 
+agent_name = sys.argv[1]
+today = date.today().isoformat()
 registry_path = Path("registry/workers.yaml")
 content = registry_path.read_text()
-agent_name = "${AGENT_NAME}"
-today = date.today().isoformat()
 
 if f"name: {agent_name}" not in content:
     new_entry = (
@@ -594,7 +593,7 @@ if f"name: {agent_name}" not in content:
     content = content.rstrip() + new_entry
     registry_path.write_text(content)
     print(f"Added new entry: {agent_name}")
-EOF
+PYEOF
 ```
 
 ### 2. Directorへ完了報告する

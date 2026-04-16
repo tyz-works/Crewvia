@@ -37,6 +37,17 @@ if [ -z "$TASK_ID" ] && [ -n "$AGENT_NAME" ]; then
   fi
 fi
 
+# --- Activity logging for Watchdog v2 ---
+# Appends a timestamped entry to registry/activity/<AGENT_NAME>/<TASK_ID>.activity
+# so that watchdog.py can detect live tool execution activity.
+# Runs unconditionally (before Taskvia guard) so it works in standalone mode too.
+if [ -n "${AGENT_NAME:-}" ] && [ -n "${TASK_ID:-}" ]; then
+  _ACTIVITY_REPO="${CREWVIA_REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+  ACTIVITY_DIR="${_ACTIVITY_REPO}/registry/activity/${AGENT_NAME}"
+  mkdir -p "$ACTIVITY_DIR"
+  echo "$(date +%s) tool=${CLAUDE_TOOL_NAME:-unknown}" >> "${ACTIVITY_DIR}/${TASK_ID}.activity"
+fi
+
 # Taskvia 無効モード: CREWVIA_TASKVIA=disabled または トークン未設定なら投稿スキップ
 if [ "${CREWVIA_TASKVIA:-}" = "disabled" ] || [ -z "$TASKVIA_TOKEN" ]; then
   exit 0
@@ -154,5 +165,6 @@ PYEOF
     -H "Authorization: Bearer ${TASKVIA_TOKEN}" \
     -d "$_AGENTS_PAYLOAD" >/dev/null 2>&1 || true
 fi
+
 
 exit 0

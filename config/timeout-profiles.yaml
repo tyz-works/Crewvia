@@ -1,0 +1,61 @@
+# Watchdog v2 タイムアウトプロファイル
+#
+# idle: 最後のアクティビティから N 秒無音で warn 判定（Watchdog が介入検討）
+# max:  タスク開始から N 秒で強制 terminate
+#
+# 設計根拠（実測値 2026-04-16 時点 / crewvia queue/archive 全 ~100 タスクより）:
+#   quick_edit   実測: 55–400s    → idle 120s / max 600s
+#   feature_impl 実測: 120–1500s  → idle 300s / max 3600s
+#   test_run     実測: 65–244s (unit); CI 待ちは無音 10–30 min も想定
+#   build        実測例なし; npm install / compile は無音 10–60 min を想定
+#   research     実測: 248–973s   → idle 600s / max 3600s
+#   ops_long     実測: 633–21701s → idle 3600s / max 14400s
+#   review       実測: 55–6590s   → feature_impl 相当 (review は code タスクと同等視)
+#
+# Watchdog v2 はこのファイルを読み取り、タスク frontmatter の timeout 指定を優先、
+# 未指定なら skills → default_profile の順でフォールバックする。
+
+profiles:
+  quick_edit:
+    idle: 120
+    max: 600
+    description: "小規模ファイル修正・設定変更（実測 55–400s）"
+    skills: [bash, docs, config]
+
+  feature_impl:
+    idle: 300
+    max: 3600
+    description: "機能実装・中規模コード変更（実測 120–1500s, 最大 3600s で 2x 余裕）"
+    skills: [code, typescript, python]
+
+  test_run:
+    idle: 600
+    max: 3600
+    description: "テスト実行（unit は短時間だが CI 待ち・E2E は無音 10 分超を想定）"
+    skills: [test]
+
+  build:
+    idle: 1800
+    max: 7200
+    description: "ビルド・パッケージインストール（npm install / compile は無音 30 分超を想定）"
+    skills: [build, ops]
+
+  research:
+    idle: 600
+    max: 3600
+    description: "調査・分析タスク（実測 248–973s; 複合調査は最大 3600s を想定）"
+    skills: [research, review, database]
+
+  ops_long:
+    idle: 3600
+    max: 14400
+    description: "長時間インフラ作業・マイグレーション（実測 633–21701s の ops 系タスク）"
+    skills: [ops_infra, migration, database_admin]
+
+# タスク frontmatter に timeout 指定なし、かつ skills 解決不能な場合のフォールバック
+default_profile: feature_impl
+
+# スキルマッチ優先順位ノート:
+# plan.sh add --skills で付与されるスキル群を上から順にスキャンし、
+# 最初にマッチした profiles エントリを採用する。
+# 複数スキルが異なるプロファイルにマッチする場合は最も制限の緩い方（max が大きい方）を選択。

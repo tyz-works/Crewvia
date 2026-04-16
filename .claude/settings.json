@@ -82,7 +82,11 @@
       "Bash(basename:*)",
       "Bash(dirname:*)",
       "Bash(mktemp:*)",
-      "Bash(cp .claude/settings.json:*)"
+      "Bash(cp .claude/settings.json:*)",
+      "Bash(./hooks/notification.sh:*)",
+      "Bash(bash hooks/notification.sh:*)",
+      "Bash(chmod +x ./hooks/notification.sh)",
+      "Bash(chmod +x hooks/notification.sh)"
     ],
     "deny": [
       "Bash(git push --force:*)",
@@ -120,6 +124,17 @@
           {
             "type": "command",
             "command": "/Users/tyz/workspace/crewvia/hooks/sh_perm_manager.sh"
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/tyz/workspace/crewvia/hooks/notification.sh"
           }
         ]
       }

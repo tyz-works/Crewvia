@@ -112,6 +112,18 @@ def load_config(yaml_path: str) -> dict:
     return config
 
 
+_QUOTED_STRING_RE = re.compile(r"""(?:"(?:[^"\\]|\\.)*"|'[^']*')""")
+
+
+def _strip_quoted_strings(cmd: str) -> str:
+    """Remove single/double quoted strings from a command.
+
+    This prevents false positives when dangerous keywords appear
+    inside string literals (e.g., git commit -m "fix sudo issue").
+    """
+    return _QUOTED_STRING_RE.sub("", cmd)
+
+
 def _extract_bash_command(tool_sig: str) -> str | None:
     """Extract the command string from a Bash tool signature."""
     if tool_sig.startswith("Bash(") and tool_sig.endswith(")"):
@@ -142,12 +154,13 @@ def check_permission(config: dict, skills_csv: str, tool_sig: str) -> dict:
             return {"decision": "deny", "source": f"_global:deny:{pattern}"}
 
     # 1b. Substring scan for compound commands (cd /tmp && rm -rf /)
-    # Only scan when the command contains shell operators, to avoid
-    # false positives on string literals (e.g., commit messages mentioning "sudo")
+    # Strip quoted strings first to avoid false positives on string literals
+    # (e.g., git commit -m "fix sudo issue" && git push)
     cmd = _extract_bash_command(tool_sig)
     if cmd and re.search(r"[;&|]", cmd):
+        cmd_stripped = _strip_quoted_strings(cmd)
         for regex, label in _GLOBAL_DENY_SUBSTRINGS:
-            if regex.search(cmd):
+            if regex.search(cmd_stripped):
                 return {"decision": "deny", "source": f"_global:deny:substring:{label}"}
 
     # No skills → fall through (global deny was already checked above)

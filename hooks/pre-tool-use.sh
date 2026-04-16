@@ -100,7 +100,8 @@ else
   _TOOL_SIG="${TOOL_NAME}"
 fi
 
-# _global.deny は SKILLS 有無に関係なく常にチェック（絶対安全弁）
+# _global.deny は SKILLS 有無・Taskvia 有効/無効に関係なく常にチェック（絶対安全弁）
+# 注意: CREWVIA_TASKVIA=disabled でも _global.deny は発動する（意図的な設計）
 if [ -f "$_SKILL_PERMS_YAML" ] && [ -f "$_SKILL_PERMS_PY" ]; then
   _GLOBAL_RESULT="$(python3 "$_SKILL_PERMS_PY" "$_SKILL_PERMS_YAML" "__global_only__" "$_TOOL_SIG" 2>/dev/null || echo '{"decision":"none"}')"
   _GLOBAL_DECISION="$(echo "$_GLOBAL_RESULT" | jq -r '.decision')"
@@ -147,7 +148,13 @@ if [ -n "${SKILLS:-}" ] && [ -f "$_SKILL_PERMS_YAML" ] && [ -f "$_SKILL_PERMS_PY
 fi
 
 # Taskvia 無効モード: CREWVIA_TASKVIA=disabled または トークン未設定なら承認なしで通過
+# ただし skill-deny の urgent 例外は Taskvia なしでは承認できないため拒否する
 if [ "${CREWVIA_TASKVIA:-}" = "disabled" ] || [ -z "$TASKVIA_TOKEN" ]; then
+  if [ "$_SKILL_EXCEPTION" = "true" ]; then
+    echo "[skill-perms] ❌ urgent exception denied: Taskvia unavailable for approval" >&2
+    emit_decision "deny" "Skill deny (urgent): Taskvia unavailable for exception approval"
+    exit 0
+  fi
   exit 0
 fi
 

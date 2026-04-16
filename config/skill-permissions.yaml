@@ -39,7 +39,9 @@ skills:
       - "Edit"
       - "Write"
       - "MultiEdit"
-    deny: []
+    deny:
+      - "Bash(terraform destroy*)"
+      - "Bash(kubectl delete*--all*)"
 
   ops:
     allow:

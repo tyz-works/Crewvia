@@ -18,6 +18,7 @@ set -euo pipefail
 #                          [--priority high|medium|low] [--description <text>]
 #   plan.sh pull [--mission <slug>] --skills <csv> [--agent <name>]
 #   plan.sh done <task_id> "<result>" [--mission <slug>]
+#   plan.sh fail <task_id> [<handoff_path>] [--mission <slug>]
 #   plan.sh status [--mission <slug>] [--all]
 #   plan.sh archive <slug>
 
@@ -64,6 +65,7 @@ STATUS_ICON = {
     'in_progress': '🔄',
     'pending': '📋',
     'skipped': '⏭️',
+    'failed': '❌',
 }
 
 
@@ -255,6 +257,7 @@ def _dump_inline(val):
 TASK_META_KEY_ORDER = [
     'id', 'title', 'skills', 'priority', 'status',
     'blocked_by', 'timeout', 'target_dir', 'worker', 'started_at', 'completed_at',
+    'handoff_path',
 ]
 
 
@@ -1124,6 +1127,54 @@ def cmd_done(args):
         _print_sync_summary(ok)
 
 
+def cmd_fail(args):
+    opts, positional = parse_opts(args, {'--mission': 'value'})
+    if not positional:
+        die("fail requires <task_id>")
+    task_id = positional[0]
+    handoff_path = positional[1] if len(positional) > 1 else None
+
+    def _do():
+        state = load_state()
+        slug = opts.get('--mission')
+        if not slug:
+            matches = []
+            for s in state.get('active_missions') or []:
+                if os.path.exists(task_path(s, task_id)):
+                    matches.append(s)
+            if not matches:
+                die(f"task '{task_id}' not found in any active mission.")
+            if len(matches) > 1:
+                die(f"task '{task_id}' exists in multiple missions: {matches}. Use --mission.")
+            slug = matches[0]
+
+        if not os.path.exists(task_path(slug, task_id)):
+            die(f"task '{task_id}' not found in mission '{slug}'.")
+
+        meta, body = load_task(slug, task_id)
+        cur_status = meta.get('status')
+        if cur_status in ('done', 'failed', 'skipped'):
+            die(f"task '{task_id}' is already {cur_status}.")
+
+        meta['status'] = 'failed'
+        meta['completed_at'] = now_iso()
+        if handoff_path:
+            meta['handoff_path'] = handoff_path
+        desc, _ = parse_task_body(body)
+        new_body = build_task_body(desc, f"FAILED — handoff: {handoff_path or 'none'}")
+        save_task(slug, task_id, meta, new_body)
+        print(f"Failed: {slug}/{task_id}")
+
+    with_lock(_do)
+
+    # Remove assignment file (same as done)
+    agent_name = os.environ.get('AGENT_NAME', '')
+    if agent_name:
+        assignment_file = os.path.join(QUEUE_DIR, 'assignments', agent_name)
+        if os.path.exists(assignment_file):
+            os.remove(assignment_file)
+
+
 def cmd_status(args):
     opts, _ = parse_opts(args, {'--mission': 'value', '--all': 'bool'})
     state = load_state()
@@ -1356,6 +1407,7 @@ dispatch = {
     'add': cmd_add,
     'pull': cmd_pull,
     'done': cmd_done,
+    'fail': cmd_fail,
     'status': cmd_status,
     'archive': cmd_archive,
     'resync': cmd_resync,

@@ -658,6 +658,38 @@ def dispatch():
                 record_notify(notify_key)
 
 
+    # Handoff detection: failed tasks with handoff_path → notify Director
+    for slug in active_missions:
+        tasks_for_slug = list_tasks_for_mission(slug)
+        for meta, _ in tasks_for_slug:
+            if meta.get('status') != 'failed':
+                continue
+            handoff_path = meta.get('handoff_path')
+            if not handoff_path:
+                continue
+            task_id = meta.get('id', '?')
+            notify_key = f"handoff_{slug}_{task_id}"
+            if should_notify(notify_key):
+                handoff_summary = ''
+                try:
+                    hp = Path(handoff_path)
+                    if not hp.is_absolute():
+                        hp = REGISTRY_DIR.parent / handoff_path
+                    if hp.exists():
+                        lines = hp.read_text().splitlines()[:10]
+                        handoff_summary = ' | '.join(lines)
+                except Exception:
+                    handoff_summary = '(読み取り失敗)'
+                msg = (
+                    f"タスク {task_id} (mission={slug}) が failed になりました。"
+                    f"handoff_path: {handoff_path} — {handoff_summary[:200]}。"
+                    f"plan.sh add で継続タスクを追加してください。"
+                )
+                tmux_send('crewvia:Sora-director', msg)
+                record_notify(notify_key)
+                log(f"handoff detected: {slug}/{task_id} -> notified director")
+
+
 publish_agents()
 dispatch()
 PYEOF

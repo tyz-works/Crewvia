@@ -1,0 +1,132 @@
+# config/skill-permissions.yaml
+# スキル別ツール権限定義
+#
+# allow: このスキルのタスクで自動許可するツールパターン
+# deny:  このスキルのタスクで自動拒否するツールパターン
+#
+# パターン構文:
+#   - ツール名そのまま: "Edit", "Write", "MultiEdit"
+#   - Bash コマンド:    "Bash(npm *)", "Bash(git *)"
+#   - ワイルドカード:   fnmatch 準拠 (* は任意文字列)
+#
+# SAFE_TOOLS (Read, Grep, Glob, WebSearch 等) は hook で既にスキップされるため
+# ここに記載不要。
+#
+# 判定フロー:
+#   1. _global.deny にマッチ → 即拒否 (urgent でもオーバーライド不可)
+#   2. タスク skills の deny にマッチ → 拒否 (urgent なら Taskvia 例外承認)
+#   3. タスク skills の allow にマッチ → 即許可 (Taskvia スキップ)
+#   4. どちらにもマッチしない → 既存 Taskvia フローへ fallthrough
+
+# 全スキル共通の絶対禁止 (urgent でもオーバーライド不可)
+_global:
+  deny:
+    - "Bash(rm -rf *)"
+    - "Bash(sudo *)"
+    - "Bash(curl*|*sh*)"
+    - "Bash(wget*|*sh*)"
+
+skills:
+  bash:
+    allow:
+      - "Bash(*)"
+      - "Edit"
+      - "Write"
+      - "MultiEdit"
+    deny: []
+
+  ops:
+    allow:
+      - "Bash(*)"
+      - "Edit"
+      - "Write"
+      - "MultiEdit"
+    deny:
+      - "Bash(terraform destroy*)"
+
+  code:
+    allow:
+      - "Edit"
+      - "Write"
+      - "MultiEdit"
+      - "Bash(npm *)"
+      - "Bash(npx *)"
+      - "Bash(tsc *)"
+      - "Bash(eslint *)"
+      - "Bash(prettier *)"
+      - "Bash(git *)"
+    deny: []
+
+  python:
+    allow:
+      - "Edit"
+      - "Write"
+      - "MultiEdit"
+      - "Bash(python*)"
+      - "Bash(pip *)"
+      - "Bash(pytest *)"
+      - "Bash(git *)"
+    deny: []
+
+  typescript:
+    allow:
+      - "Edit"
+      - "Write"
+      - "MultiEdit"
+      - "Bash(npm *)"
+      - "Bash(npx *)"
+      - "Bash(tsc *)"
+      - "Bash(node *)"
+      - "Bash(bun *)"
+      - "Bash(git *)"
+    deny: []
+
+  research:
+    allow: []
+    deny:
+      - "Edit"
+      - "Write"
+      - "MultiEdit"
+      - "Bash(git push *)"
+
+  review:
+    allow:
+      - "Bash(gh pr *)"
+      - "Bash(gh api *)"
+      - "Bash(gh-app-review *)"
+      - "Bash(gh run *)"
+    deny:
+      - "Edit"
+      - "Write"
+      - "MultiEdit"
+
+  database:
+    allow:
+      - "Edit"
+      - "Write"
+      - "MultiEdit"
+      - "Bash(psql *)"
+      - "Bash(sqlite3 *)"
+      - "Bash(git *)"
+    deny:
+      - "Bash(*DROP *)"
+      - "Bash(*TRUNCATE *)"
+      - "Bash(*DELETE FROM *)"
+
+  cloud:
+    allow:
+      - "Bash(oci *)"
+      - "Bash(aws *)"
+      - "Edit"
+      - "Write"
+      - "MultiEdit"
+    deny:
+      - "Bash(terraform destroy*)"
+
+  docs:
+    allow:
+      - "Edit"
+      - "Write"
+      - "MultiEdit"
+    deny:
+      - "Bash(git push *)"

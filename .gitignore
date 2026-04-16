@@ -29,6 +29,15 @@ Thumbs.db
 # Crewvia runtime state (per-session)
 queue/
 registry/heartbeats/
+registry/activity/
+registry/notifications/
+registry/dispatcher.log
+registry/watchdog.log
+logs/
+
+# Claude Code local state
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
 
 # Crewvia secrets
 config/.taskvia-token

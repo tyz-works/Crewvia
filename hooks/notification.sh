@@ -30,8 +30,8 @@ mkdir -p "$NOTIFICATIONS_DIR"
 # stdin からペイロードを読む
 INPUT="$(cat)"
 
-# タイムスタンプ（Unix エポック秒）
-TS="$(date +%s)"
+# タイムスタンプ（秒精度衝突防止: epoch_pid_random）
+TS="$(date +%s)_${BASHPID:-$$}_${RANDOM}"
 
 # ペイロードを <timestamp>.txt に書き出す
 printf '%s\n' "$INPUT" > "${NOTIFICATIONS_DIR}/${TS}.txt"

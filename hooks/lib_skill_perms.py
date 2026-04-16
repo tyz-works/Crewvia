@@ -14,9 +14,13 @@ Output (JSON, single line):
 Performance target: <100ms including Python startup.
 """
 
+from __future__ import annotations
+
 import json
 import os
+import re
 import sys
+import tempfile
 from fnmatch import fnmatch
 from hashlib import md5
 
@@ -95,12 +99,35 @@ def load_config(yaml_path: str) -> dict:
             config = _parse_yaml_fallback(yaml_path)
 
     try:
-        with open(cache_path, "w") as f:
+        tmp_fd, tmp_path = tempfile.mkstemp(dir="/tmp", prefix="crewvia_sp_")
+        with os.fdopen(tmp_fd, "w") as f:
             json.dump(config, f)
+        os.rename(tmp_path, cache_path)
     except OSError:
-        pass
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
 
     return config
+
+
+def _extract_bash_command(tool_sig: str) -> str | None:
+    """Extract the command string from a Bash tool signature."""
+    if tool_sig.startswith("Bash(") and tool_sig.endswith(")"):
+        return tool_sig[5:-1]
+    return None
+
+
+# Dangerous substrings to scan for in compound commands.
+# These catch cases where fnmatch fails because a dangerous command
+# is preceded by other commands (e.g., "cd /tmp && rm -rf /").
+_GLOBAL_DENY_SUBSTRINGS: list[tuple[re.Pattern, str]] = [
+    (re.compile(r"\brm\s+-\S*r\S*f"), "rm -rf"),
+    (re.compile(r"\bsudo\b"), "sudo"),
+    (re.compile(r"\|\s*(ba)?sh\b"), "pipe-to-shell"),
+    (re.compile(r"\|\s*source\b"), "pipe-to-source"),
+]
 
 
 def check_permission(config: dict, skills_csv: str, tool_sig: str) -> dict:
@@ -108,6 +135,22 @@ def check_permission(config: dict, skills_csv: str, tool_sig: str) -> dict:
 
     Returns {"decision": "allow"|"deny"|"none", "source": "..."}.
     """
+    # 1. _global.deny — always checked, regardless of SKILLS
+    global_deny = config.get("_global", {}).get("deny", [])
+    for pattern in global_deny:
+        if fnmatch(tool_sig, pattern):
+            return {"decision": "deny", "source": f"_global:deny:{pattern}"}
+
+    # 1b. Substring scan for compound commands (cd /tmp && rm -rf /)
+    # Only scan when the command contains shell operators, to avoid
+    # false positives on string literals (e.g., commit messages mentioning "sudo")
+    cmd = _extract_bash_command(tool_sig)
+    if cmd and re.search(r"[;&|]", cmd):
+        for regex, label in _GLOBAL_DENY_SUBSTRINGS:
+            if regex.search(cmd):
+                return {"decision": "deny", "source": f"_global:deny:substring:{label}"}
+
+    # No skills → fall through (global deny was already checked above)
     if not skills_csv:
         return {"decision": "none", "source": "no_skills"}
 
@@ -115,23 +158,19 @@ def check_permission(config: dict, skills_csv: str, tool_sig: str) -> dict:
     if not skills:
         return {"decision": "none", "source": "no_skills"}
 
-    # 1. _global.deny — always checked, cannot be overridden
-    global_deny = config.get("_global", {}).get("deny", [])
-    for pattern in global_deny:
-        if fnmatch(tool_sig, pattern):
-            return {"decision": "deny", "source": f"_global:deny:{pattern}"}
-
     skills_config = config.get("skills", {})
     known_skills = [s for s in skills if s in skills_config]
     if not known_skills:
         return {"decision": "none", "source": "unknown_skills"}
 
-    # 2. Skill deny — union across all task skills
+    # 2. Skill deny — union across all task skills (case-insensitive for SQL patterns)
     for skill in known_skills:
         deny_patterns = skills_config[skill].get("deny", [])
         for pattern in deny_patterns:
             if fnmatch(tool_sig, pattern):
                 return {"decision": "deny", "source": f"skill:{skill}:deny:{pattern}"}
+            if cmd and fnmatch(tool_sig.lower(), pattern.lower()):
+                return {"decision": "deny", "source": f"skill:{skill}:deny:{pattern}(ci)"}
 
     # 3. Skill allow — union across all task skills
     for skill in known_skills:

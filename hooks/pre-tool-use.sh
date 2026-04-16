@@ -93,19 +93,32 @@ fi
 _SKILL_PERMS_YAML="${_CREWVIA_REPO}/config/skill-permissions.yaml"
 _SKILL_PERMS_PY="${_CREWVIA_REPO}/hooks/lib_skill_perms.py"
 
+# ツール署名を構築（_global.deny と skill チェック両方で使う）
+if [ "$TOOL_NAME" = "Bash" ] && [ -n "$COMMAND" ]; then
+  _TOOL_SIG="Bash(${COMMAND})"
+else
+  _TOOL_SIG="${TOOL_NAME}"
+fi
+
+# _global.deny は SKILLS 有無に関係なく常にチェック（絶対安全弁）
+if [ -f "$_SKILL_PERMS_YAML" ] && [ -f "$_SKILL_PERMS_PY" ]; then
+  _GLOBAL_RESULT="$(python3 "$_SKILL_PERMS_PY" "$_SKILL_PERMS_YAML" "__global_only__" "$_TOOL_SIG" 2>/dev/null || echo '{"decision":"none"}')"
+  _GLOBAL_DECISION="$(echo "$_GLOBAL_RESULT" | jq -r '.decision')"
+  if [ "$_GLOBAL_DECISION" = "deny" ]; then
+    _GLOBAL_SOURCE="$(echo "$_GLOBAL_RESULT" | jq -r '.source // "unknown"')"
+    echo "[skill-perms] ❌ global denied: ${_TOOL_SIG} (${_GLOBAL_SOURCE})" >&2
+    emit_decision "deny" "Global permission denied: ${_GLOBAL_SOURCE}"
+    exit 0
+  fi
+fi
+
+# Per-skill チェック（SKILLS がある場合のみ）
 if [ -n "${SKILLS:-}" ] && [ -f "$_SKILL_PERMS_YAML" ] && [ -f "$_SKILL_PERMS_PY" ]; then
   # タスクファイルから skills を取得 (フォールバック: SKILLS env)
   _TASK_SKILLS="${SKILLS}"
   if [ -n "${_TASK_FILE:-}" ] && [ -f "${_TASK_FILE:-}" ]; then
     _TS="$(grep '^skills:' "$_TASK_FILE" 2>/dev/null | head -1 | sed 's/^skills:[[:space:]]*//' | tr -d '[]"' | tr ',' ' ' | xargs | tr ' ' ',' || true)"
     [ -n "$_TS" ] && _TASK_SKILLS="$_TS"
-  fi
-
-  # ツール署名を構築
-  if [ "$TOOL_NAME" = "Bash" ] && [ -n "$COMMAND" ]; then
-    _TOOL_SIG="Bash(${COMMAND})"
-  else
-    _TOOL_SIG="${TOOL_NAME}"
   fi
 
   _PERM_RESULT="$(python3 "$_SKILL_PERMS_PY" "$_SKILL_PERMS_YAML" "$_TASK_SKILLS" "$_TOOL_SIG" 2>/dev/null || echo '{"decision":"none"}')"

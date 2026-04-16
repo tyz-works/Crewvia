@@ -464,6 +464,74 @@ Director への報告フォーマット:
 
 ---
 
+## 7. Watchdog terminate 予告受領時 — Graceful Handoff
+
+### 概要
+
+Watchdog が hard timeout 予告を送信した時、Worker はこのプロトコルを実行して作業状態を後任 Worker に引き継ぐ。
+
+### Watchdog からの terminate 予告メッセージ形式
+
+```
+[watchdog] terminate: タスク {task_id} — {N}秒以内に handoff してください
+```
+
+### Handoff 手順
+
+**Step 1**: 現在の作業を可能な範囲でキリの良い状態まで進める（最大60秒以内）
+
+**Step 2**: HANDOFF.md を作成する:
+
+```bash
+mkdir -p "registry/handoffs/$AGENT_NAME"
+HANDOFF_PATH="registry/handoffs/$AGENT_NAME/${TASK_ID}_HANDOFF.md"
+```
+
+**Step 3**: HANDOFF.md に以下を記述する（下記テンプレート参照）
+
+**Step 4**: plan.sh fail を実行:
+
+```bash
+./scripts/plan.sh fail "$TASK_ID" "$HANDOFF_PATH" --mission "$TASK_MISSION"
+```
+
+**Step 5**: Director に報告:
+
+```
+タスク $TASK_ID を graceful handoff しました。
+handoff_path: $HANDOFF_PATH
+引き継ぎ内容: [HANDOFF.md の残作業サマリー]
+```
+
+**Step 6**: セッション終了（task_count は更新しない — タスクは完了していないため）
+
+### HANDOFF.md テンプレート
+
+```markdown
+# HANDOFF — {TASK_ID} ({TASK_TITLE})
+
+## 作業者
+{AGENT_NAME}
+
+## ブランチ
+{branch_name}
+
+## 進捗サマリー
+[ここに何をどこまでやったかを記述]
+
+## 残作業
+- [ ] [残っている作業1]
+- [ ] [残っている作業2]
+
+## 再開時の注意点
+[再開する Worker へのアドバイス・コンテキスト]
+
+## 変更済みファイル
+[git status または git diff --name-only の出力]
+```
+
+---
+
 ## セッション終了プロトコル
 
 カード完了・Director報告の**前**に必ず実行すること:

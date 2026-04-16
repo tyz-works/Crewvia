@@ -894,6 +894,44 @@ Dispatcher からの通知を受け取った時だけ対応すればよい。
 |---|---|---|
 | `要求スキル [...] の Worker を起動してください (task {id}, mission={slug})` | 該当スキルを持つ Worker が存在しない | 必要スキルで `bash scripts/start.sh worker <skill>` を実行 |
 | `全ミッション完了` | 全 active mission が done 状態になった | `plan.sh archive <slug>` で退避 → ユーザーへ完了報告 |
+| `タスク {id} (mission={slug}) が failed になりました。handoff_path: {path} — ...。plan.sh add で継続タスクを追加してください。` | Worker が graceful handoff でタスクを中断した | 以下の Handoff 再計画フローを実行 |
+
+### Handoff 再計画フロー
+
+Worker が graceful handoff でタスクを中断した場合、以下の手順で継続タスクを作成する:
+
+**1.** HANDOFF.md を読んで残作業を把握する:
+
+```bash
+cat {handoff_path}
+```
+
+**2.** 継続タスクを plan.sh add で追加する（元タスクとは独立した新タスク）:
+
+```bash
+./scripts/plan.sh add "【継続】{元タスクのタイトル}" \
+  --skills "{元タスクと同じスキル}" \
+  --priority high \
+  --description "前タスク {task_id} の引き継ぎ。handoff: {handoff_path}
+残作業:
+[HANDOFF.md の残作業リスト]"
+```
+
+> **注意**: `--blocked-by` は設定しない（failed タスクは blocking を解除しないため）
+
+**3.** 適切なスキルの Worker を起動（既存 Worker が idle なら再利用）:
+
+```bash
+bash scripts/start.sh worker {skills}
+```
+
+**4.** plan.sh status で継続タスクが pending になっていることを確認する:
+
+```bash
+./scripts/plan.sh status
+```
+
+---
 
 ### Worker 起動が必要な通知への対応例
 

@@ -72,6 +72,8 @@ STATE_FILE     = QUEUE_DIR / 'state.yaml'
 ASSIGNMENTS_DIR = QUEUE_DIR / 'assignments'
 WORKERS_FILE   = REGISTRY_DIR / 'workers.yaml'
 LOG_FILE       = REGISTRY_DIR / 'dispatcher.log'
+# Bug2 fix: persistent flag to track all_done state across dispatch cycles
+ALL_DONE_STATE_FILE = REGISTRY_DIR / 'dispatcher_all_done.flag'
 
 PRIORITY_ORDER  = {'high': 0, 'medium': 1, 'low': 2}
 TERMINAL_STATUSES = {'done', 'skipped'}
@@ -466,12 +468,50 @@ def publish_agents():
             log(f"WARNING: /api/agents publish failed for {agent['name']}: {e}")
 
 
+def was_all_done_last_cycle():
+    """Return True if the previous dispatch cycle also saw all_done=True."""
+    return ALL_DONE_STATE_FILE.exists()
+
+
+def set_all_done_state(done):
+    """Persist all_done state so the next cycle can detect transitions."""
+    if done:
+        try:
+            ALL_DONE_STATE_FILE.touch()
+        except OSError as e:
+            log(f"WARNING: cannot write all_done state: {e}")
+    else:
+        try:
+            ALL_DONE_STATE_FILE.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def shutdown_idle_workers():
+    """Send shutdown message and kill idle Worker windows."""
+    windows = tmux_list_worker_windows()
+    for window in windows:
+        agent_name = window['agent_name']
+        target = window['window_target']
+        assignment_file = ASSIGNMENTS_DIR / agent_name
+        is_idle = not assignment_file.exists()
+        if is_idle:
+            notify_key = f"shutdown_{agent_name}"
+            if should_notify(notify_key):
+                tmux_send(target, 'タスクなし、shutdown')
+                record_notify(notify_key)
+                time.sleep(1)
+                tmux_kill_window(target)
+
+
 def dispatch():
     state = load_state()
     active_missions = list(state.get('active_missions') or [])
 
-    # No active missions — nothing to dispatch, stay silent
+    # Bug1 fix: even with no active missions, shut down lingering idle Workers
     if not active_missions:
+        shutdown_idle_workers()
+        set_all_done_state(False)
         return
 
     workers = load_workers()
@@ -490,25 +530,19 @@ def dispatch():
 
     if all_done:
         # Shut down all idle workers before notifying director
-        windows = tmux_list_worker_windows()
-        for window in windows:
-            agent_name = window['agent_name']
-            target = window['window_target']
-            assignment_file = ASSIGNMENTS_DIR / agent_name
-            is_idle = not assignment_file.exists()
-            if is_idle:
-                notify_key = f"shutdown_{agent_name}"
-                if should_notify(notify_key):
-                    tmux_send(target, 'タスクなし、shutdown')
-                    record_notify(notify_key)
-                    time.sleep(1)
-                    tmux_kill_window(target)
+        shutdown_idle_workers()
 
-        key = 'all_missions_done'
-        if should_notify(key):
+        # Bug2 fix: notify only on False→True transition, not every cycle
+        prev_all_done = was_all_done_last_cycle()
+        if not prev_all_done:
             tmux_send('crewvia:Sora-director', '全ミッション完了')
-            record_notify(key)
+            log("→ all missions done — notified director (one-shot)")
+
+        set_all_done_state(True)
         return
+
+    # Missions still in progress — clear the all_done flag
+    set_all_done_state(False)
 
     # Load all tasks
     all_tasks, done_ids_by_mission = load_all_tasks(active_missions)

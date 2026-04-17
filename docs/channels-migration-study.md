@@ -162,6 +162,8 @@ Crewvia の Worker は Dispatcher から tmux send-keys でタスクを受信し
 
 この制約が解消されない限り、シナリオA・Bともに Crewvia への本格統合は困難。
 
+> 詳細なテスト実施記録: [fakechat PoC 動作確認ログ](docs/poc/channels-sample/poc-log.md)
+
 ---
 
 ## 6. セキュリティ論点

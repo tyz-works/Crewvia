@@ -532,6 +532,46 @@ handoff_path: $HANDOFF_PATH
 
 ---
 
+## 8. PreCompact 対応プロトコル
+
+### 概要
+
+Claude Code の auto-compaction または `/compact` 実行時、Worker は context 圧縮前に
+current task の状態を保全する。
+
+### 自律 snapshot 更新（推奨）
+
+長時間タスク（目安 15 分以上）では、作業節目ごとに自律的に以下を更新すること:
+
+```markdown
+## Pre-Compact Snapshot
+
+- **現状**: <完了したステップの概要>
+- **残作業**: <未完了ステップ・次にやること>
+- **再開手順**: <compaction 後にこのセクションを読んで即作業再開できる最小手順>
+- **注意事項**: <失敗したこと・ハマりポイント>
+```
+
+### compaction 後の resume
+
+1. 現在のタスクファイルを Read する
+2. `## Pre-Compact Snapshot` セクションを読む
+3. 「残作業」から作業を再開する
+4. **HANDOFF.md との違い**: PreCompact は Worker が生きたまま継続する場合の保全。
+   HANDOFF.md は Worker が終了して別 Worker に引き継ぐ場合の手順書。
+
+### hooks/pre-compact.sh による自動保全
+
+`hooks/pre-compact.sh` が compaction イベント時に自動実行される（`.claude/settings.json` に登録済み）。
+
+- `CREWVIA_TASK_ID` 環境変数からタスクIDを取得
+- 対応するタスクファイル（`queue/missions/<slug>/tasks/<id>.md`）の `## Pre-Compact Snapshot` セクションを自動更新
+- タスクファイルが見つからない場合は `queue/pre-compact-fallback.log` に記録
+
+hook が動作するためには **`export CREWVIA_TASK_ID="$TASK_ID"` を必ず実行すること**（`TASK_ID` の export だけでは不足）。
+
+---
+
 ## セッション終了プロトコル
 
 カード完了・Director報告の**前**に必ず実行すること:

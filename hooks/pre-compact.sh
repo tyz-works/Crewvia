@@ -7,7 +7,7 @@ CREWVIA_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # Read JSON payload from stdin
 payload="$(cat)"
-trigger="$(echo "$payload" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('trigger','unknown'))")"
+trigger="$(echo "$payload" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('trigger','unknown'))" 2>/dev/null || echo "unknown")"
 custom_instructions="$(echo "$payload" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('custom_instructions',''))" 2>/dev/null || echo "")"
 
 # Resolve task ID from environment
@@ -41,7 +41,7 @@ fi
 
 if [[ -n "$task_file" && -f "$task_file" ]]; then
     # Update or append "## Pre-Compact Snapshot" section using python3
-    python3 - "$task_file" "$snapshot" <<'PYEOF'
+    python3 - "$task_file" "$snapshot" <<'PYEOF' || true
 import sys, re
 
 task_file = sys.argv[1]

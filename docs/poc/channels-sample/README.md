@@ -5,20 +5,20 @@
 
 ---
 
-## 1. Claude Code Channels 仕様要点
+## 1. Channels 仕様要点
 
 ### 概要
-Claude Code Channels は MCP を双方向メッセージング基盤に拡張する仕組み。
-外部システム（Discord / Telegram / GitHub webhook 等）から Claude Code セッションへイベントを push し、Claude がリアクティブに応答できる。
+Claude Code Channels は MCP を双方向メッセージング基盤に拡張する機能。
+外部システムから Claude Code セッションへイベントを push し、Claude がリアクティブに応答できる。
 
 ### 主要仕様
 
 | 項目 | 内容 |
 |------|------|
-| 必要バージョン | Claude Code v2.1.81 以降（permission relay は v2.1.81+） |
+| 必要バージョン | Claude Code v2.1.81 以降 |
 | CLI フラグ | `--channels <tag>` |
 | タグ形式 | `plugin:<name>@<marketplace>` または `server:<name>` |
-| transport | stdio（標準的な MCP transport） |
+| transport | stdio（標準 MCP transport） |
 | capability キー | `"claude/channel": { "permission": true }` |
 | プロトコル | JSON-RPC 2.0 over stdio |
 
@@ -31,7 +31,7 @@ claude --channels plugin:telegram@claude-plugins-official
 # 手動設定 MCP サーバ（--mcp-config または .mcp.json）
 claude --channels server:fakechat
 
-# 開発中サーバのサイドロード（dev のみ）
+# 開発中サーバのサイドロード
 claude --channels server:mydev --dangerously-load-development-channels
 ```
 
@@ -49,10 +49,10 @@ claude --channels server:mydev --dangerously-load-development-channels
 
 ### sender allowlist 設計
 
-- 各 channel plugin は **送信者ホワイトリスト**を管理
-- 未ペアリングの送信者メッセージは**サイレント破棄**（no error, no log）
-- ペアリング: 初回メッセージ → pairing code 返却 → Claude Code セッションで入力
-- 粒度: メール＝ドメイン単位 / GitHub・Slack = ユーザーID / Telegram・Discord = ユーザーID
+- 各 channel plugin は送信者ホワイトリストを管理
+- 未ペアリングの送信者メッセージはサイレント破棄
+- ペアリング: 初回メッセージ → pairing code → Claude Code セッションで入力
+- 粒度: メール＝ドメイン / GitHub・Slack＝ユーザーID / Telegram・Discord＝ユーザーID
 
 ---
 
@@ -61,47 +61,41 @@ claude --channels server:mydev --dangerously-load-development-channels
 ### 現在の Crewvia 承認フロー（Taskvia）
 
 ```
-Claude Code (Worker)
-  → hooks/pre-tool-use.sh
-    → POST /api/request (Taskvia SaaS)
-    → polling /api/status/{id} (1秒間隔・最大600秒)
-  ← approved / denied
+Claude Code → hooks/pre-tool-use.sh → POST /api/request (Taskvia)
+           → polling /api/status/{id} (1秒間隔・最大600秒)
+           ← approved / denied
 ```
 
 ### Channels permission relay フロー
 
 ```
-Claude Code (Worker)
-  → notifications/claude/channel/permission_request (MCP stdio)
-  → channel server (fakechat-server.js 等)
-    → forward to user (ターミナル表示 / Discord / Telegram)
-  ← notifications/claude/channel/permission_response
-  ← verdict 即時適用
+Claude Code → notifications/claude/channel/permission_request (MCP stdio)
+           → channel server → ユーザー（ターミナル / Discord / Telegram）
+           ← notifications/claude/channel/permission_response (即時)
 ```
 
 ### 機能マッピング表
 
 | 機能 | Taskvia (現在) | Channels relay (新) | 備考 |
 |------|--------------|---------------------|------|
-| 承認リクエスト送信 | POST /api/request | `permission_request` notification | MCP統合で外部HTTP不要 |
-| 承認待ちポーリング | GET /api/status (1s) | event-driven (即時) | latency 大幅削減 |
-| ユーザー通知先 | Taskvia UI (Web) | Discord/Telegram/ターミナル | 柔軟な通知先 |
-| sender 認証 | Bearer token | allowlist + pairing code | Channelsは事前ペアリング必要 |
-| タスク ID / コンテキスト | task_id, task_title | tool_name, tool_input (全量) | Channelsはより詳細 |
-| 承認 UI | Kanban card | モバイルチャット / ターミナル | チャットアプリで即承認 |
-| timeout | 600s で自動拒否 | N/A (request_id で管理) | TTL実装は channel server 側 |
-| skill-based auto-allow | lib_skill_perms.py | 不変（Channels非関係） | 引き続き有効 |
+| 承認リクエスト | POST /api/request | `permission_request` notification | 外部HTTP不要 |
+| 承認待ち | GET /api/status (1s polling) | event-driven (即時) | latency 大幅削減 |
+| 通知先 | Taskvia Web UI | Discord/Telegram/ターミナル | 柔軟 |
+| 認証 | Bearer token | allowlist + pairing code | 事前ペアリング必要 |
+| コンテキスト | task_id, task_title | tool_name, tool_input (全量) | Channels がより詳細 |
+| timeout | 600s 自動拒否 | N/A (server側実装) | TTL は channel server 担当 |
+| skill auto-allow | lib_skill_perms.py | 変更なし | 引き続き有効 |
 
-### 統合ポイント
+### 統合ポジション
 
-Channels は Taskvia の**代替**ではなく**補完**として機能する:
+Channels は Taskvia の**代替でなく補完**:
 
-- **Taskvia**: Web UI Kanban で visual management、複数エージェント一元管理
-- **Channels relay**: モバイルチャット（外出中）、低レイテンシ、Taskvia 利用不可時のフォールバック
+- **Taskvia**: Web Kanban による visual management、複数エージェント一元管理
+- **Channels relay**: モバイルチャット承認、低レイテンシ、Taskvia 不可時フォールバック
 
 `pre-tool-use.sh` への統合案:
-1. `CREWVIA_TASKVIA=disabled` かつ Channels 接続済みの場合 → `permission_request` 経由で relay
-2. Taskvia 応答タイムアウト時 → Channels relay へフォールバック
+1. `CREWVIA_TASKVIA=disabled` かつ Channels 接続済み → `permission_request` で relay
+2. Taskvia タイムアウト時 → Channels relay へフォールバック
 
 ---
 
@@ -112,52 +106,35 @@ Channels は Taskvia の**代替**ではなく**補完**として機能する:
 | `claude/channel` capability 宣言 | ✅ 動作 |
 | `--channels server:<name>` 接続 | ✅ 動作 |
 | MCP initialize ハンドシェイク | ✅ 動作 |
-| `permission_request` 受信（インタラクティブ） | ⚠️ 未確認（非インタラクティブでは発火しない） |
-| `permission_response` 送信後 verdict 適用 | ⚠️ 未確認 |
-| sender allowlist 実装 | ⚠️ PoC省略（TODO） |
-
-## 4. PoC で確認できなかった動作
-
-### permission relay エンドツーエンド
-
-`claude -p`（非インタラクティブ）モードでは tool 承認プロンプトが生成されないため、
-`notifications/claude/channel/permission_request` が Claude Code から送信されなかった。
-
-**再現手順（今後）:**
-```bash
-# インタラクティブセッションで実行
-claude --mcp-config /tmp/fakechat-mcp.json --channels server:fakechat
-# セッション内で Write / Bash を呼ぶタスクを与える
-# → permission_request が fakechat-server に届くはず
-```
+| `permission_request` 受信（インタラクティブ） | ⚠️ 未確認（-p では発火しない） |
+| `permission_response` 後の verdict 適用 | ⚠️ 未確認 |
+| sender allowlist | ⚠️ PoC省略（TODO） |
 
 ---
 
-## 5. 実装ファイル
+## 4. 実装ファイル
 
 ```
 docs/poc/channels-sample/
-├── README.md              ← このファイル
-├── fakechat-server.js     ← 最小 MCP サーバ (claude/channel 宣言 + relay)
-└── poc-log.md             ← 動作確認ログ
+├── README.md              ← このファイル（仕様・マッピング・結果）
+├── fakechat-server.js     ← 最小 MCP サーバ（claude/channel 宣言 + relay）
+└── poc-log.md             ← 動作確認ログ（テスト結果詳細）
 ```
 
-### fakechat-server.js の起動方法
+### 起動方法
 
 ```bash
-# MCP config を用意
 cat > /tmp/fakechat-mcp.json << 'EOF'
 {
   "mcpServers": {
     "fakechat": {
       "type": "stdio",
       "command": "node",
-      "args": ["/path/to/fakechat-server.js"]
+      "args": ["<absolute-path-to>/fakechat-server.js"]
     }
   }
 }
 EOF
 
-# Claude Code に接続
 claude --mcp-config /tmp/fakechat-mcp.json --channels server:fakechat
 ```

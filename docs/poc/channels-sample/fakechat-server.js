@@ -9,18 +9,12 @@
  *   node fakechat-server.js
  *
  * Then connect with:
- *   claude --channels fakechat
+ *   claude --mcp-config /tmp/fakechat-mcp.json --channels server:fakechat
  *
- * (Requires claude/channels support: Claude Code v2.1.81+)
- * (For development: add --dangerously-load-development-channels)
+ * (Requires Claude Code v2.1.81+)
  */
 
 const readline = require("readline");
-
-// --- MCP JSON-RPC over stdio transport ---
-
-const pending = new Map(); // requestId -> { resolve, reject }
-let msgId = 0;
 
 function send(obj) {
   process.stdout.write(JSON.stringify(obj) + "\n");
@@ -34,15 +28,10 @@ function replyError(id, code, message) {
   send({ jsonrpc: "2.0", id, error: { code, message } });
 }
 
-// --- Permission relay: terminal-based approve/deny ---
-
-const rl = readline.createInterface({ input: process.stdin });
-let lineBuffer = "";
-const permQueue = []; // pending permission requests waiting for terminal input
+const permQueue = [];
 let promptActive = false;
 
-function askTerminal(prompt, cb) {
-  process.stderr.write(prompt);
+function askTerminal(cb) {
   permQueue.push(cb);
   drainPrompt();
 }
@@ -50,17 +39,15 @@ function askTerminal(prompt, cb) {
 function drainPrompt() {
   if (promptActive || permQueue.length === 0) return;
   promptActive = true;
-  // handled in rl.on('line')
 }
 
-// --- MCP message handling ---
+const rl = readline.createInterface({ input: process.stdin });
 
 rl.on("line", (raw) => {
   let msg;
   try {
     msg = JSON.parse(raw);
   } catch {
-    // silently ignore non-JSON lines (e.g., terminal input for perms)
     if (promptActive && permQueue.length > 0) {
       const verdict = raw.trim().toLowerCase();
       const cb = permQueue.shift();
@@ -70,14 +57,12 @@ rl.on("line", (raw) => {
     }
     return;
   }
-
   handleMessage(msg);
 });
 
 function handleMessage(msg) {
   const { id, method, params } = msg;
 
-  // Requests (have id + method)
   if (id !== undefined && method) {
     switch (method) {
       case "initialize":
@@ -85,17 +70,14 @@ function handleMessage(msg) {
           protocolVersion: "2024-11-05",
           serverInfo: { name: "fakechat", version: "0.1.0" },
           capabilities: {
-            // Declare claude/channel capability for permission relay
-            "claude/channel": {
-              permission: true, // we handle permission relay
-            },
+            "claude/channel": { permission: true },
           },
         });
-        process.stderr.write("[fakechat] ✅ initialize OK — channel capability declared\n");
+        process.stderr.write("[fakechat] ✅ initialize — claude/channel/permission declared\n");
         break;
 
       case "tools/list":
-        reply(id, { tools: [] }); // no tools in this PoC
+        reply(id, { tools: [] });
         break;
 
       case "resources/list":
@@ -112,15 +94,13 @@ function handleMessage(msg) {
     return;
   }
 
-  // Notifications (no id, only method)
   if (id === undefined && method) {
     switch (method) {
       case "notifications/initialized":
-        process.stderr.write("[fakechat] ✅ Session initialized. Waiting for permission requests...\n");
+        process.stderr.write("[fakechat] ✅ Session ready. Waiting for permission requests...\n");
         break;
 
       case "notifications/claude/channel/permission_request": {
-        // Permission relay: Claude Code is asking us to forward this to the user
         const { request_id, tool_name, tool_input, reason } = params ?? {};
         const display = JSON.stringify(tool_input ?? {}, null, 2).slice(0, 400);
 
@@ -134,8 +114,7 @@ function handleMessage(msg) {
           `  Approve? (y/n): `
         );
 
-        askTerminal("", (approved) => {
-          // Send verdict back to Claude Code via notification
+        askTerminal((approved) => {
           send({
             jsonrpc: "2.0",
             method: "notifications/claude/channel/permission_response",
@@ -152,7 +131,6 @@ function handleMessage(msg) {
       }
 
       default:
-        // Unknown notifications are silently ignored per MCP spec
         break;
     }
   }

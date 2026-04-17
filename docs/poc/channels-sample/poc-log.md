@@ -11,7 +11,8 @@ Node.js バージョン: v25.6.1
 
 **コマンド:**
 ```bash
-echo '{"jsonrpc":"2.0","id":1,"method":"initialize",...}' | node fakechat-server.js
+echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0.1"}}}' \
+  | node fakechat-server.js
 ```
 
 **結果: ✅ 成功**
@@ -33,10 +34,8 @@ echo '{"jsonrpc":"2.0","id":1,"method":"initialize",...}' | node fakechat-server
 stderr:
 ```
 [fakechat] MCP server started (stdio). Declaring claude/channel/permission.
-[fakechat] ✅ initialize OK — channel capability declared
+[fakechat] ✅ initialize — claude/channel/permission declared
 ```
-
-**確認事項:** `claude/channel` capability が正しく宣言されている。
 
 ---
 
@@ -49,32 +48,26 @@ claude --mcp-config /tmp/fakechat-mcp.json --channels server:fakechat -p "say he
 
 **結果: ✅ 成功**
 
-```
-Hello!
-```
+出力: `Hello!`
 
-Claude Code が fakechat MCP サーバに `server:fakechat` 形式で接続し、セッションが正常に動作した。
+Claude Code が `server:fakechat` 形式で接続し、セッションが正常動作した。
 
 ---
 
-## テスト 3: --channels フラグ形式確認
+## テスト 3: --channels フラグ形式確認（エラーケース）
 
 **コマンド:**
 ```bash
-claude --channels fakechat  # タグなし（誤った形式）
+claude --channels fakechat  # タグなし
 ```
 
-**結果: 確認済みのエラー（仕様通り）**
+**結果: 仕様通りのエラー（確認済み）**
 
 ```
 --channels entries must be tagged: fakechat
   plugin:<name>@<marketplace>  — plugin-provided channel (allowlist enforced)
   server:<name>                — manually configured MCP server
 ```
-
-**確認事項:** `--channels` は以下2形式のみ受付:
-- `plugin:<name>@<marketplace>` — Anthropic承認済みプラグイン（アローリスト強制）
-- `server:<name>` — `.mcp.json` / `--mcp-config` で設定した MCP サーバ
 
 ---
 
@@ -86,27 +79,24 @@ claude --channels fakechat  # タグなし（誤った形式）
 | `--channels server:<name>` 接続 | ✅ OK | Claude Code がサーバを認識・接続 |
 | MCP initialize ハンドシェイク | ✅ OK | protocolVersion 2024-11-05 |
 | `notifications/claude/channel/permission_request` 受信 | ⚠️ 未確認 | 非インタラクティブ (-p) では発火しない |
-| permission_response 送信後の verdict 適用 | ⚠️ 未確認 | 上記と同じ理由 |
-| sender allowlist | ⚠️ 未実装 | PoC のため省略（TODO） |
+| permission_response 送信後 verdict 適用 | ⚠️ 未確認 | 上記と同じ理由 |
+| sender allowlist | ⚠️ 未実装 | PoC のため省略 |
 
 ---
 
 ## 確認できなかった動作
 
-### permission_request / permission_response
-
 `claude -p`（非インタラクティブ）モードでは tool 承認 UI が発生しないため、
-`notifications/claude/channel/permission_request` 通知が Claude Code から送られてこなかった。
+`notifications/claude/channel/permission_request` が送信されなかった。
 
-**次のステップ:** インタラクティブセッション（`claude` のみ）で実行し、
-Bash/Write/Edit ツールが呼ばれるタスクを与えることで permission relay をテストできる。
+**次ステップ:** インタラクティブセッション（`claude` のみ）で Bash/Write を呼ぶタスクを与えて再テスト。
 
 ---
 
 ## 知見サマリー
 
-1. **`--channels` は `server:<name>` 形式が必要** — MCP config に登録したサーバ名を使う
-2. **capability 宣言は `capabilities["claude/channel"]`** — `{"permission": true}` を含める
-3. **permission relay は stdio transport で動作する** — HTTP 不要
-4. **非インタラクティブモードでは relay テスト不可** — インタラクティブセッション必須
-5. **Crewvia の pre-tool-use.sh との統合は実装可能** — Taskvia の代替/補完として位置付けられる
+1. `--channels` は `server:<name>` 形式が必須（タグなしはエラー）
+2. capability キーは `"claude/channel": { "permission": true }`
+3. stdio transport で動作、HTTP 不要
+4. permission relay テストにはインタラクティブセッションが必要
+5. Crewvia `pre-tool-use.sh` への統合は実装可能

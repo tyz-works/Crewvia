@@ -18,7 +18,7 @@ standard:
   auto_verified: false  # Verifier エージェントの判定が必要
 
 strict:
-  description: "高リスクタスク用。integration test + safety review 含む。（M-QA-7 で有効化）"
+  description: "高リスクタスク用（auth/billing/migration/delete 系）。integration test + safety review 含む。"
   checks:
     - lint
     - typecheck
@@ -29,6 +29,7 @@ strict:
     - safety_review
     - rollback_review
   auto_verified: false
+  escalate_on_fail: true   # fail 時は Director に即エスカレーション
 
 research:
   description: "リサーチ・ドキュメントタスク用。diff + acceptance_criteria のみ。"

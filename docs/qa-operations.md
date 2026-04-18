@@ -111,3 +111,25 @@ plan.sh status --all | grep -E "ready_for_verification|verifying"
 ### 自己検証の禁止
 
 Verifier Dispatcher は同一 agent が同じ task の worker かつ verifier になることを自動的に防ぐ。Worker が `plan.sh ready-for-verification t001` を呼ぶと、Dispatcher は worker フィールドと異なる idle Verifier を探して assign する。
+
+---
+
+## risk flag 上流→下流伝播
+
+Plan Reviewer が `risk_flags` を付けたタスクは、`plan.sh review` の完了時に自動的に `verification.mode` が昇格する。
+
+### 昇格ルール
+
+`light < standard < strict` の順で、**より厳しい方が優先**される。
+
+- Director が手動で `strict` と書いたタスクは、Plan Reviewer の `standard` 判定で上書きされない
+- Plan Reviewer が `strict` を推奨したタスクは、Director の `standard` 設定より優先される
+
+### rework 学習ループ
+
+`rework_count >= max_rework` に達した task の情報は `knowledge/director.md` に自動追記される。Director は計画時にこのファイルを参照することで、過去の失敗パターンを活かせる。
+
+```bash
+# 学習ログを確認
+cat knowledge/director.md
+```

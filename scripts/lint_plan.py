@@ -403,11 +403,20 @@ def lint_mission(slug: str, queue_dir: str, config_dir: str, strict: bool = Fals
 
     # Summary OK lines for passing tasks
     task_ids = [m.get('id', '?') for m in valid_tasks]
-    fail_ids = {
-        msg.split('/')[1].split(':')[0]
-        for lvl, cat, msg in all_results
-        if lvl == 'FAIL' and msg.startswith('task/')
-    }
+    # Bug A fix: respect strict mode (WARN promoted to FAIL counts as FAIL)
+    # Bug B fix: extract task IDs from circular dependency messages too
+    fail_ids: set[str] = set()
+    for lvl, cat, msg in all_results:
+        effective_lvl = 'FAIL' if (strict and lvl == 'WARN') else lvl
+        if effective_lvl != 'FAIL':
+            continue
+        if msg.startswith('task/'):
+            fail_ids.add(msg.split('/')[1].split(':')[0])
+        elif cat == 'dependency' and 'circular dependency' in msg:
+            # Extract all task IDs from "circular dependency detected: a → b → a"
+            for tid in task_ids:
+                if tid in msg:
+                    fail_ids.add(tid)
     for tid in task_ids:
         if tid not in fail_ids:
             print(f"[OK]   task/{tid}: all checks passed")

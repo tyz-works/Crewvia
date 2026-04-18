@@ -1629,9 +1629,16 @@ def cmd_review(args):
         sys.exit(1)
     print(f"[review] lint OK", file=sys.stderr)
 
-    # --- Step 2: check mission + cycle limit ---
+    # --- Step 2: check mission status + cycle limit ---
     def _do_start():
         mission = load_mission(slug)
+        cur_status = mission.get('status')
+        allowed = ('drafting', 'ready')
+        if cur_status not in allowed:
+            die(
+                f"mission '{slug}' status is '{cur_status}' — "
+                f"only {allowed} missions can enter review"
+            )
         review = mission.get('review') or {}
         if not isinstance(review, dict):
             review = {}
@@ -1660,12 +1667,25 @@ def cmd_review(args):
     review_script = os.path.join(repo_root, 'scripts', 'review-plan.sh')
     print(f"[review] invoking review-plan.sh...", file=sys.stderr)
     proc = subprocess.run(['bash', review_script, slug])
+
+    def _rollback_to_drafting(reason):
+        """P2: rollback mission from reviewing → drafting on failure."""
+        def _do_rollback():
+            m = load_mission(slug)
+            if m.get('status') == 'reviewing':
+                m['status'] = 'drafting'
+                save_mission(slug, m)
+                print(f"[review] rollback: mission '{slug}' → drafting ({reason})", file=sys.stderr)
+        with_lock(_do_rollback)
+
     if proc.returncode != 0:
+        _rollback_to_drafting("review-plan.sh failed")
         die(f"review-plan.sh failed or timed out for mission '{slug}'")
 
     # --- Step 4: read verdict from plan_review.md ---
     review_output = os.path.join(MISSIONS_DIR, slug, 'plan_review.md')
     if not os.path.exists(review_output):
+        _rollback_to_drafting("plan_review.md not found")
         die(f"plan_review.md not found for mission '{slug}' after review-plan.sh completed")
 
     verdict = None
@@ -1676,6 +1696,7 @@ def cmd_review(args):
                 verdict = vm.group(1)
                 break
     if not verdict:
+        _rollback_to_drafting("no valid verdict in plan_review.md")
         die(f"No valid verdict found in plan_review.md for mission '{slug}'")
 
     # --- Step 5: update mission based on verdict ---

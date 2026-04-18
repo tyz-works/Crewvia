@@ -70,3 +70,44 @@ Exit: 1 (strict mode: 1 warning treated as failure)
 
 > **注意**: `timeout` 未指定のタスクは検査対象外としてスキップされる（WARN も出ない）。
 > WARN/FAIL が発生するのは timeout 値が timeout-profiles.yaml の許容範囲を外れた場合のみ。
+
+---
+
+## Verifier Dispatcher
+
+`ready_for_verification` 状態のタスクを自動検出し、idle Verifier に assign するデーモン。Worker Dispatcher とは独立して稼働する。
+
+### 起動
+
+```bash
+# バックグラウンドで起動
+nohup ./scripts/verifier-dispatcher.sh > logs/verifier-dispatcher.log 2>&1 &
+echo $! > /tmp/verifier-dispatcher.pid
+```
+
+### 停止
+
+```bash
+kill $(cat /tmp/verifier-dispatcher.pid)
+```
+
+### 監視
+
+```bash
+# ログ確認
+tail -f logs/verifier-dispatcher.log
+
+# 動作確認（ready_for_verification タスクが verifying に遷移するか）
+plan.sh status --all | grep -E "ready_for_verification|verifying"
+```
+
+### 設定
+
+| 環境変数 | デフォルト | 説明 |
+|---|---|---|
+| `VERIFIER_POLL_INTERVAL` | 30 | ポーリング間隔（秒）|
+| `NOTIFY_TTL` | 60 | 通知 dedup 有効期間（秒）|
+
+### 自己検証の禁止
+
+Verifier Dispatcher は同一 agent が同じ task の worker かつ verifier になることを自動的に防ぐ。Worker が `plan.sh ready-for-verification t001` を呼ぶと、Dispatcher は worker フィールドと異なる idle Verifier を探して assign する。

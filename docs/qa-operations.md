@@ -54,15 +54,19 @@ plan.sh lint my-mission || exit 1
 ```bash
 $ plan.sh lint 20260418-auth-refactor
 [OK]   frontmatter: all required fields present (3 tasks)
-[WARN] timeout: task t002 has no timeout specified (default will apply)
+[OK]   task/t001: all checks passed
+[OK]   task/t002: all checks passed
 [OK]   dependency: no circular dependencies found
 [OK]   skill: all task skills match skill-permissions.yaml
-Exit: 0 (1 warning)
+Exit: 0
 
 $ plan.sh lint 20260418-auth-refactor --strict
 [OK]   frontmatter: all required fields present (3 tasks)
-[FAIL] timeout: task t002 has no timeout specified (default will apply)
+[WARN] timeout: task t003 timeout 7200s exceeds profile maximum 3600s
 [OK]   dependency: no circular dependencies found
 [OK]   skill: all task skills match skill-permissions.yaml
 Exit: 1 (strict mode: 1 warning treated as failure)
 ```
+
+> **注意**: `timeout` 未指定のタスクは検査対象外としてスキップされる（WARN も出ない）。
+> WARN/FAIL が発生するのは timeout 値が timeout-profiles.yaml の許容範囲を外れた場合のみ。

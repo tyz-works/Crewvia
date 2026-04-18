@@ -1,0 +1,38 @@
+# Verification profiles — Verifier の検査強度設定
+# verification.mode に対応するチェックリストを定義
+
+light:
+  description: "高速・低コスト。機械 check + 簡易 diff 確認のみ。"
+  checks:
+    - lint
+    - diff_review
+  auto_verified: true   # 機械 check 全 pass で自動 verified
+
+standard:
+  description: "通常モード。機械 check + diff + acceptance_criteria 照合。"
+  checks:
+    - lint
+    - typecheck
+    - diff_review
+    - acceptance_review
+  auto_verified: false  # Verifier エージェントの判定が必要
+
+strict:
+  description: "高リスクタスク用。integration test + safety review 含む。（M-QA-7 で有効化）"
+  checks:
+    - lint
+    - typecheck
+    - unit_test
+    - integration_test
+    - diff_review
+    - acceptance_review
+    - safety_review
+    - rollback_review
+  auto_verified: false
+
+research:
+  description: "リサーチ・ドキュメントタスク用。diff + acceptance_criteria のみ。"
+  checks:
+    - diff_review
+    - acceptance_review
+  auto_verified: false

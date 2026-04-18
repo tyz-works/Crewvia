@@ -27,7 +27,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 QUEUE_DIR="${CREWVIA_QUEUE:-${REPO_ROOT}/queue}"
 
 if [[ $# -eq 0 ]]; then
-  echo "Usage: plan.sh <init|add|pull|done|fail|ready-for-verification|verify-result|lint|status|archive> [args...]" >&2
+  echo "Usage: plan.sh <init|add|pull|done|fail|ready-for-verification|verify-result|review|launch|lint|status|archive> [args...]" >&2
   exit 1
 fi
 
@@ -417,7 +417,7 @@ def task_path(slug, task_id):
     return os.path.join(tasks_dir(slug), f"{task_id}.md")
 
 
-MISSION_KEY_ORDER = ['title', 'slug', 'status', 'created_at', 'completed_at', 'next_task_id']
+MISSION_KEY_ORDER = ['title', 'slug', 'status', 'created_at', 'completed_at', 'next_task_id', 'max_review_cycles', 'review']
 
 
 def load_mission(slug):
@@ -750,10 +750,17 @@ def cmd_init(args):
         mission = {
             'title': title,
             'slug': slug,
-            'status': 'in_progress',
+            'status': 'drafting',
             'created_at': now_iso(),
             'completed_at': None,
             'next_task_id': 1,
+            'max_review_cycles': 3,
+            'review': {
+                'last_verdict': None,
+                'cycle_count': 0,
+                'reviewed_at': None,
+                'reviewer': None,
+            },
         }
         save_mission(slug, mission)
 
@@ -1455,6 +1462,149 @@ def cmd_verify_result(args):
     with_lock(_do)
 
 
+def _load_lint_module():
+    """Load lint_plan.py dynamically (same pattern as cmd_lint)."""
+    import importlib.util, pathlib
+    repo_root = os.path.dirname(QUEUE_DIR)
+    lint_path = pathlib.Path(repo_root) / 'scripts' / 'lint_plan.py'
+    spec = importlib.util.spec_from_file_location('lint_plan', lint_path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod, os.path.join(repo_root, 'config')
+
+
+def cmd_review(args):
+    """
+    Usage: plan.sh review <slug>
+
+    1. Runs lint as a pre-step (FAIL → treated as revise, exit 1)
+    2. Checks max_review_cycles
+    3. Sets mission status to reviewing, increments cycle_count
+    4. Invokes scripts/review-plan.sh <slug>
+    5. Reads plan_review.md verdict and updates mission:
+       - approve → status: ready
+       - revise  → status: drafting, cycle_count++
+       - reject  → status: drafting, cycle_count++
+    """
+    opts, positional = parse_opts(args, {})
+    if not positional:
+        die("review requires <mission_slug>")
+    slug = positional[0]
+
+    # --- Step 1: lint pre-check ---
+    print(f"[review] running lint on '{slug}'...", file=sys.stderr)
+    try:
+        lint_mod, config_dir = _load_lint_module()
+        lint_rc = lint_mod.lint_mission(slug, QUEUE_DIR, config_dir, strict=False)
+    except Exception as e:
+        die(f"lint failed to load: {e}")
+    if lint_rc != 0:
+        print(
+            f"[review] lint FAIL — treating as revise. Fix lint errors before review.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    print(f"[review] lint OK", file=sys.stderr)
+
+    # --- Step 2: check mission + cycle limit ---
+    def _do_start():
+        mission = load_mission(slug)
+        review = mission.get('review') or {}
+        if not isinstance(review, dict):
+            review = {}
+        cycle_count = review.get('cycle_count') or 0
+        max_cycles = mission.get('max_review_cycles') or 3
+        if cycle_count >= max_cycles:
+            print(
+                f"[review] ESCALATION: '{slug}' has reached max_review_cycles ({max_cycles}). "
+                f"Director intervention required.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        review['cycle_count'] = cycle_count + 1
+        review['reviewed_at'] = now_iso()
+        mission['review'] = review
+        mission['status'] = 'reviewing'
+        save_mission(slug, mission)
+        print(f"[review] mission '{slug}' → reviewing (cycle {cycle_count + 1}/{max_cycles})")
+
+    with_lock(_do_start)
+
+    # --- Step 3: invoke review-plan.sh ---
+    import subprocess
+    repo_root = os.path.dirname(QUEUE_DIR)
+    review_script = os.path.join(repo_root, 'scripts', 'review-plan.sh')
+    print(f"[review] invoking review-plan.sh...", file=sys.stderr)
+    proc = subprocess.run(['bash', review_script, slug])
+    if proc.returncode != 0:
+        die(f"review-plan.sh failed or timed out for mission '{slug}'")
+
+    # --- Step 4: read verdict from plan_review.md ---
+    review_output = os.path.join(MISSIONS_DIR, slug, 'plan_review.md')
+    if not os.path.exists(review_output):
+        die(f"plan_review.md not found for mission '{slug}' after review-plan.sh completed")
+
+    verdict = None
+    with open(review_output) as f:
+        for line in f:
+            vm = re.search(r'\*\*Verdict:\*\*\s*(approve|revise|reject)', line)
+            if vm:
+                verdict = vm.group(1)
+                break
+    if not verdict:
+        die(f"No valid verdict found in plan_review.md for mission '{slug}'")
+
+    # --- Step 5: update mission based on verdict ---
+    def _do_verdict():
+        mission = load_mission(slug)
+        review = mission.get('review') or {}
+        if not isinstance(review, dict):
+            review = {}
+        review['last_verdict'] = verdict
+        review['reviewed_at'] = now_iso()
+        mission['review'] = review
+        if verdict == 'approve':
+            mission['status'] = 'ready'
+            print(f"[review] verdict: approve → mission '{slug}' is now ready for launch")
+        else:
+            mission['status'] = 'drafting'
+            print(
+                f"[review] verdict: {verdict} → mission '{slug}' returned to drafting "
+                f"(cycle {review.get('cycle_count', '?')} of {mission.get('max_review_cycles', 3)})"
+            )
+        save_mission(slug, mission)
+
+    with_lock(_do_verdict)
+
+
+def cmd_launch(args):
+    """
+    Usage: plan.sh launch <slug>
+
+    Transitions mission from status: ready → in_progress, enabling workers to pull tasks.
+    Rejects with an error if status is not ready (drafting/reviewing require plan.sh review first).
+    """
+    opts, positional = parse_opts(args, {})
+    if not positional:
+        die("launch requires <mission_slug>")
+    slug = positional[0]
+
+    def _do():
+        mission = load_mission(slug)
+        cur_status = mission.get('status')
+        if cur_status != 'ready':
+            die(
+                f"mission '{slug}' status is '{cur_status}' — only 'ready' missions can be launched. "
+                f"Run 'plan.sh review {slug}' first to get reviewer approval."
+            )
+        mission['status'] = 'in_progress'
+        save_mission(slug, mission)
+        print(f"Launched: '{slug}' is now in_progress — workers can pull tasks")
+
+    with_lock(_do)
+
+
 def cmd_lint(args):
     opts, positional = parse_opts(args, {'--strict': 'bool', '--mission': 'value'})
     slug = opts.get('--mission') or (positional[0] if positional else None)
@@ -1585,6 +1735,8 @@ dispatch = {
     'fail': cmd_fail,
     'ready-for-verification': cmd_ready_for_verification,
     'verify-result': cmd_verify_result,
+    'review': cmd_review,
+    'launch': cmd_launch,
     'lint': cmd_lint,
     'status': cmd_status,
     'archive': cmd_archive,

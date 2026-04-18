@@ -158,3 +158,14 @@ skills:
       - "Bash(git push*)"
       - "Bash(rm*)"
       - "Bash(mv*)"
+
+  plan_review:
+    allow:
+      - "Read(**)"
+      - "Grep(**)"
+      - "Glob(**)"
+    deny:
+      - "Write(**)"
+      - "Edit(**)"
+      - "MultiEdit(**)"
+      - "Bash(**)"

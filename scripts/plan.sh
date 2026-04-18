@@ -1158,6 +1158,7 @@ def cmd_fail(args):
         die("fail requires <task_id>")
     task_id = positional[0]
     handoff_path = positional[1] if len(positional) > 1 else None
+    knowledge_info = [None]  # populated inside _do if rework limit reached
 
     def _do():
         state = load_state()
@@ -1190,7 +1191,17 @@ def cmd_fail(args):
         save_task(slug, task_id, meta, new_body)
         print(f"Failed: {slug}/{task_id}")
 
+        # Rework learning loop: record in knowledge/director.md if rework limit was reached
+        rework = meta.get('rework_count') or 0
+        max_rework = meta.get('max_rework') or 3
+        if rework >= max_rework:
+            knowledge_info[0] = (task_id, slug, rework, max_rework, handoff_path)
+
     with_lock(_do)
+
+    # Post-lock: write rework pattern to knowledge/director.md
+    if knowledge_info[0]:
+        _append_knowledge_director(*knowledge_info[0])
 
     # Remove assignment file (same as done)
     agent_name = os.environ.get('AGENT_NAME', '')
@@ -1462,6 +1473,118 @@ def cmd_verify_result(args):
     with_lock(_do)
 
 
+_MODE_ORDER = ['light', 'standard', 'strict']
+
+
+def upgrade_mode(current, proposed):
+    """Return the stricter of two verification modes (light < standard < strict)."""
+    ci = _MODE_ORDER.index(current) if current in _MODE_ORDER else 0
+    pi = _MODE_ORDER.index(proposed) if proposed in _MODE_ORDER else 0
+    return _MODE_ORDER[max(ci, pi)]
+
+
+def _apply_risk_flags(slug, plan_review_path):
+    """Parse ## Risk Flags from plan_review.md and upgrade task verification.mode."""
+    try:
+        with open(plan_review_path) as f:
+            content = f.read()
+    except OSError:
+        return
+
+    # Find ## Risk Flags section
+    in_risk_flags = False
+    current_task_id = None
+    recommended_mode = None
+    upgrades: list = []  # list of (task_id, mode)
+
+    for line in content.splitlines():
+        if re.match(r'^##\s+Risk\s+Flags', line, re.IGNORECASE):
+            in_risk_flags = True
+            continue
+        if in_risk_flags:
+            if re.match(r'^##', line):
+                break  # Next section — stop
+            m_task = re.match(r'^-\s+task:\s*(\S+)', line)
+            if m_task:
+                if current_task_id and recommended_mode:
+                    upgrades.append((current_task_id, recommended_mode))
+                current_task_id = m_task.group(1).strip()
+                recommended_mode = None
+                continue
+            m_mode = re.match(r'\s+recommended_mode:\s*(\S+)', line)
+            if m_mode and current_task_id:
+                recommended_mode = m_mode.group(1).strip()
+
+    if current_task_id and recommended_mode:
+        upgrades.append((current_task_id, recommended_mode))
+
+    if not upgrades:
+        return
+
+    # Apply upgrades to task files
+    for task_id, proposed_mode in upgrades:
+        task_file = None
+        for fn in os.listdir(os.path.join(MISSIONS_DIR, slug, 'tasks')):
+            if fn == f"{task_id}.md":
+                task_file = os.path.join(MISSIONS_DIR, slug, 'tasks', fn)
+                break
+        if not task_file or not os.path.exists(task_file):
+            print(f"[risk-flags] task '{task_id}' not found in mission '{slug}' — skipping", file=sys.stderr)
+            continue
+
+        meta, body = load_task(slug, task_id)
+        verification = meta.get('verification') or {}
+        if not isinstance(verification, dict):
+            verification = {}
+        current_mode = verification.get('mode') or 'standard'
+        new_mode = upgrade_mode(current_mode, proposed_mode)
+        if new_mode != current_mode:
+            verification['mode'] = new_mode
+            meta['verification'] = verification
+            save_task(slug, task_id, meta, body)
+            print(
+                f"[risk-flags] task '{task_id}': verification.mode {current_mode} → {new_mode} "
+                f"(recommended_mode={proposed_mode})"
+            )
+        else:
+            print(
+                f"[risk-flags] task '{task_id}': verification.mode stays {current_mode} "
+                f"(already >= recommended {proposed_mode})"
+            )
+
+
+def _append_knowledge_director(task_id, slug, rework_count, max_rework, handoff_path=None):
+    """Append a rework-limit record to knowledge/director.md (create with header if absent)."""
+    repo_root = os.path.dirname(QUEUE_DIR)
+    knowledge_dir = os.path.join(repo_root, 'knowledge')
+    os.makedirs(knowledge_dir, exist_ok=True)
+    knowledge_path = os.path.join(knowledge_dir, 'director.md')
+    header = (
+        "# Director Knowledge Base\n\n"
+        "Director が過去のミッション実績から学んだパターンを自動追記するファイル。\n"
+        "計画精度改善のために参照すること。\n"
+    )
+    timestamp = now_iso()
+    entry = (
+        f"\n## {timestamp} — rework 上限到達: {task_id}\n"
+        f"- mission: {slug}\n"
+        f"- rework_count: {rework_count} / max_rework: {max_rework}\n"
+        f"- handoff_path: {handoff_path or 'none'}\n"
+    )
+    try:
+        if not os.path.exists(knowledge_path):
+            with open(knowledge_path, 'w') as f:
+                f.write(header)
+        with open(knowledge_path, 'a') as f:
+            f.write(entry)
+        print(
+            f"[knowledge] appended rework pattern to knowledge/director.md "
+            f"(task={task_id}, rework={rework_count}/{max_rework})"
+        )
+    except OSError as e:
+        print(f"WARNING: failed to write knowledge/director.md: {e}", file=sys.stderr)
+
+
 def _load_lint_module():
     """Load lint_plan.py dynamically (same pattern as cmd_lint)."""
     import importlib.util, pathlib
@@ -1576,6 +1699,9 @@ def cmd_review(args):
         save_mission(slug, mission)
 
     with_lock(_do_verdict)
+
+    # --- Step 6: apply risk_flags → verification.mode upgrade ---
+    _apply_risk_flags(slug, review_output)
 
 
 def cmd_launch(args):

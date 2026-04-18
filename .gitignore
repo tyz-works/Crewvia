@@ -41,3 +41,4 @@ logs/
 
 # Crewvia secrets
 config/.taskvia-token
+registry/verification/

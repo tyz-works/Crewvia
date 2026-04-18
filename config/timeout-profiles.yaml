@@ -52,6 +52,24 @@ profiles:
     description: "長時間インフラ作業・マイグレーション（実測 633–21701s の ops 系タスク）"
     skills: [ops_infra, migration, database_admin]
 
+  verify_light:
+    idle: 180
+    max: 600
+    description: "軽量 verification（lint・型チェック等、600s 以内に完了する想定）"
+    skills: []
+
+  verify_standard:
+    idle: 300
+    max: 1800
+    description: "標準 verification（unit test 含む、30 分以内の想定）"
+    skills: []
+
+  verify_strict:
+    idle: 600
+    max: 3600
+    description: "厳格 verification（E2E・統合テスト含む、60 分以内の想定）"
+    skills: []
+
 # タスク frontmatter に timeout 指定なし、かつ skills 解決不能な場合のフォールバック
 default_profile: feature_impl
 

@@ -104,6 +104,11 @@ def parse_yaml(text, source='<yaml>'):
             continue
         m = re.match(r'^([\w-]+):\s*(.*)$', line)
         if not m:
+            if line and line[0] in (' ', '\t'):
+                # Deeply nested / orphaned indented line (e.g. inside verification.commands)
+                # — skip silently to maintain backward compatibility with unknown block structures
+                i += 1
+                continue
             raise ValueError(
                 f"{source}: malformed line {i + 1}: {line!r} "
                 f"(expected `key: value`, `key: [a, b]`, or `key:` followed by `  - item` lines)"

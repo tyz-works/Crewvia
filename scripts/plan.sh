@@ -27,7 +27,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 QUEUE_DIR="${CREWVIA_QUEUE:-${REPO_ROOT}/queue}"
 
 if [[ $# -eq 0 ]]; then
-  echo "Usage: plan.sh <init|add|pull|done|fail|status|archive> [args...]" >&2
+  echo "Usage: plan.sh <init|add|pull|done|fail|ready-for-verification|status|archive> [args...]" >&2
   exit 1
 fi
 
@@ -58,14 +58,19 @@ ARCHIVE_DIR = os.path.join(QUEUE_DIR, 'archive')
 LOCK_FILE = os.path.join(QUEUE_DIR, '.lock')
 
 PRIORITY_ORDER = {'high': 0, 'medium': 1, 'low': 2}
-TERMINAL_STATUSES = {'done', 'skipped'}
+TERMINAL_STATUSES = {'done', 'verified', 'skipped'}
 
 STATUS_ICON = {
     'done': '✅',
+    'verified': '✅',
     'in_progress': '🔄',
     'pending': '📋',
     'skipped': '⏭️',
     'failed': '❌',
+    'ready_for_verification': '🔍',
+    'verifying': '🔎',
+    'verification_failed': '⚠️',
+    'needs_human_review': '👁️',
 }
 
 
@@ -258,7 +263,15 @@ TASK_META_KEY_ORDER = [
     'id', 'title', 'skills', 'priority', 'status',
     'blocked_by', 'timeout', 'target_dir', 'worker', 'started_at', 'completed_at',
     'handoff_path',
+    'acceptance_criteria', 'verification', 'rework_count', 'max_rework',
 ]
+
+TASK_META_DEFAULTS = {
+    'acceptance_criteria': None,
+    'verification': None,
+    'rework_count': 0,
+    'max_rework': 3,
+}
 
 
 def parse_frontmatter(text, source='<task>'):
@@ -1093,7 +1106,7 @@ def cmd_done(args):
 
         meta, body = load_task(slug, task_id)
         cur_status = meta.get('status')
-        if cur_status in ('done', 'failed', 'skipped'):
+        if cur_status in ('done', 'verified', 'failed', 'skipped'):
             die(f"task '{task_id}' is already {cur_status}.")
 
         meta['status'] = 'done'
@@ -1153,7 +1166,7 @@ def cmd_fail(args):
 
         meta, body = load_task(slug, task_id)
         cur_status = meta.get('status')
-        if cur_status in ('done', 'failed', 'skipped'):
+        if cur_status in ('done', 'verified', 'failed', 'skipped'):
             die(f"task '{task_id}' is already {cur_status}.")
 
         meta['status'] = 'failed'
@@ -1272,12 +1285,21 @@ def _print_mission_detail(slug):
         tid = m['id']
         title = m['title']
         bb = m.get('blocked_by') or []
-        if st == 'done':
+        if st in ('done', 'verified'):
             worker = m.get('worker') or ''
             suffix = f"({worker}, 完了)" if worker else "(完了)"
         elif st == 'in_progress':
             worker = m.get('worker') or ''
             suffix = f"({worker}, 進行中)" if worker else "(進行中)"
+        elif st == 'ready_for_verification':
+            worker = m.get('worker') or ''
+            suffix = f"({worker}, 検証待ち)" if worker else "(検証待ち)"
+        elif st == 'verifying':
+            suffix = "(検証中)"
+        elif st == 'verification_failed':
+            suffix = "(検証失敗)"
+        elif st == 'needs_human_review':
+            suffix = "(要人間レビュー)"
         elif bb:
             unmet = [d for d in bb if d not in done_ids]
             suffix = f"(blocked: {', '.join(unmet)})" if unmet else "(pending)"
@@ -1299,6 +1321,44 @@ def _print_mission_detail(slug):
     done_count = sum(1 for (m, _) in tasks if m.get('status') == 'done')
     print()
     print(f"Progress: {done_count}/{total} done")
+
+
+def cmd_ready_for_verification(args):
+    opts, positional = parse_opts(args, {'--mission': 'value'})
+    if not positional:
+        die("ready-for-verification requires <task_id>")
+    task_id = positional[0]
+
+    def _do():
+        state = load_state()
+        slug = opts.get('--mission')
+        if not slug:
+            matches = []
+            for s in state.get('active_missions') or []:
+                if os.path.exists(task_path(s, task_id)):
+                    matches.append(s)
+            if not matches:
+                die(f"task '{task_id}' not found in any active mission.")
+            if len(matches) > 1:
+                die(f"task '{task_id}' exists in multiple missions: {matches}. Use --mission.")
+            slug = matches[0]
+
+        if not os.path.exists(task_path(slug, task_id)):
+            die(f"task '{task_id}' not found in mission '{slug}'.")
+
+        meta, body = load_task(slug, task_id)
+        cur_status = meta.get('status')
+        if cur_status != 'in_progress':
+            die(
+                f"ready-for-verification requires task to be in_progress, "
+                f"but '{task_id}' is currently '{cur_status}'."
+            )
+
+        meta['status'] = 'ready_for_verification'
+        save_task(slug, task_id, meta, body)
+        print(f"Ready for verification: {slug}/{task_id}")
+
+    with_lock(_do)
 
 
 def cmd_archive(args):
@@ -1408,6 +1468,7 @@ dispatch = {
     'pull': cmd_pull,
     'done': cmd_done,
     'fail': cmd_fail,
+    'ready-for-verification': cmd_ready_for_verification,
     'status': cmd_status,
     'archive': cmd_archive,
     'resync': cmd_resync,

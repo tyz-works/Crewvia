@@ -426,6 +426,10 @@ done を忘れて tmux で idle 待機するのは最悪のパターン。絶対
 ./scripts/plan.sh done "$TASK_ID" "実行した内容と結果の要約" --mission "$TASK_MISSION"
 ```
 
+> **移行予告**: 将来的に `plan.sh done` は `plan.sh ready-for-verification <task_id>` に移行予定。
+> Verifier 機能（M-QA-4）が導入されるまでは `done` を使い続けてよい。
+> `plan.sh ready-for-verification` は現時点では手動でも呼び出し可能（動作確認用）。
+
 `--mission` 省略時は active mission 全体から `task_id` を検索するが、複数 mission に同じ ID（t001 等）が存在する可能性があるので **常に明示する** こと。
 
 完了登録後、`plan.sh status --mission "$TASK_MISSION"` の出力を Director に報告する:

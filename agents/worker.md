@@ -430,6 +430,21 @@ done を忘れて tmux で idle 待機するのは最悪のパターン。絶対
 > Verifier 機能（M-QA-4）が導入されるまでは `done` を使い続けてよい。
 > `plan.sh ready-for-verification` は現時点では手動でも呼び出し可能（動作確認用）。
 
+### verify-task.sh による事前機械 check（オプション）
+
+`plan.sh ready-for-verification` を呼ぶ前に、自分で機械 check を走らせることができる:
+
+```bash
+./scripts/verify-task.sh <task_id>
+```
+
+- task frontmatter の `verification.commands` に記述されたコマンドを並列実行
+- 結果は `registry/verification/<task_id>/<cycle>.json` に保存
+- `verification.commands` が未定義の場合は no-op（exit 0）
+- Verifier が総合判定に使用する（M-QA-4 以降）
+
+> **注意**: `verify-task.sh` の実行は任意。Worker は機械 check を省略して直接 `ready-for-verification` を呼んでよい。Verifier Dispatcher（M-QA-5）が自動で機械 check を実行する予定。
+
 `--mission` 省略時は active mission 全体から `task_id` を検索するが、複数 mission に同じ ID（t001 等）が存在する可能性があるので **常に明示する** こと。
 
 完了登録後、`plan.sh status --mission "$TASK_MISSION"` の出力を Director に報告する:

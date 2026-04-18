@@ -27,7 +27,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 QUEUE_DIR="${CREWVIA_QUEUE:-${REPO_ROOT}/queue}"
 
 if [[ $# -eq 0 ]]; then
-  echo "Usage: plan.sh <init|add|pull|done|fail|ready-for-verification|status|archive> [args...]" >&2
+  echo "Usage: plan.sh <init|add|pull|done|fail|ready-for-verification|lint|status|archive> [args...]" >&2
   exit 1
 fi
 
@@ -1361,6 +1361,27 @@ def cmd_ready_for_verification(args):
     with_lock(_do)
 
 
+def cmd_lint(args):
+    opts, positional = parse_opts(args, {'--strict': 'bool', '--mission': 'value'})
+    slug = opts.get('--mission') or (positional[0] if positional else None)
+    if not slug:
+        state = load_state()
+        active = state.get('active_missions') or []
+        if not active:
+            die("lint: no active missions and no --mission specified")
+        slug = active[0]
+    strict = bool(opts.get('--strict'))
+    import importlib.util, pathlib
+    repo_root = os.path.dirname(QUEUE_DIR)
+    lint_path = pathlib.Path(repo_root) / 'scripts' / 'lint_plan.py'
+    spec = importlib.util.spec_from_file_location('lint_plan', lint_path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    config_dir = os.path.join(repo_root, 'config')
+    rc = mod.lint_mission(slug, QUEUE_DIR, config_dir, strict=strict)
+    sys.exit(rc)
+
+
 def cmd_archive(args):
     opts, positional = parse_opts(args, {})
     if not positional:
@@ -1469,6 +1490,7 @@ dispatch = {
     'done': cmd_done,
     'fail': cmd_fail,
     'ready-for-verification': cmd_ready_for_verification,
+    'lint': cmd_lint,
     'status': cmd_status,
     'archive': cmd_archive,
     'resync': cmd_resync,

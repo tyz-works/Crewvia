@@ -27,7 +27,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 QUEUE_DIR="${CREWVIA_QUEUE:-${REPO_ROOT}/queue}"
 
 if [[ $# -eq 0 ]]; then
-  echo "Usage: plan.sh <init|add|pull|done|fail|ready-for-verification|lint|status|archive> [args...]" >&2
+  echo "Usage: plan.sh <init|add|pull|done|fail|ready-for-verification|verify-result|lint|status|archive> [args...]" >&2
   exit 1
 fi
 
@@ -1366,6 +1366,95 @@ def cmd_ready_for_verification(args):
     with_lock(_do)
 
 
+def cmd_verify_result(args):
+    """
+    Usage: plan.sh verify-result <task_id> <verdict> [--notes "..."] [--mission <slug>]
+    verdict: pass | fail | needs_human_review
+
+    Appends a verification entry to the ## Verification section of the task file.
+    pass          → status: verified (terminal)
+    fail          → rework_count += 1, status: in_progress (or needs_human_review if max_rework exceeded)
+    needs_human_review → status: needs_human_review
+    """
+    opts, positional = parse_opts(args, {'--mission': 'value', '--notes': 'value'})
+    if len(positional) < 2:
+        die("verify-result requires <task_id> <verdict>")
+    task_id = positional[0]
+    verdict = positional[1]
+    VALID_VERDICTS = {'pass', 'fail', 'needs_human_review'}
+    if verdict not in VALID_VERDICTS:
+        die(f"verdict must be one of: {', '.join(sorted(VALID_VERDICTS))}")
+    notes = opts.get('--notes', '')
+
+    def _do():
+        state = load_state()
+        slug = opts.get('--mission')
+        if not slug:
+            matches = []
+            for s in state.get('active_missions') or []:
+                if os.path.exists(task_path(s, task_id)):
+                    matches.append(s)
+            if not matches:
+                die(f"task '{task_id}' not found in any active mission.")
+            if len(matches) > 1:
+                die(f"task '{task_id}' exists in multiple missions: {matches}. Use --mission.")
+            slug = matches[0]
+
+        if not os.path.exists(task_path(slug, task_id)):
+            die(f"task '{task_id}' not found in mission '{slug}'.")
+
+        meta, body = load_task(slug, task_id)
+        cur_status = meta.get('status')
+        if cur_status in ('done', 'verified', 'skipped', 'failed'):
+            die(f"task '{task_id}' is already {cur_status}.")
+
+        # Build and append verification entry
+        timestamp = now_iso()
+        entry_lines = [f"\n### {timestamp}", f"**Verdict:** {verdict}"]
+        if notes:
+            entry_lines.append(f"**Notes:** {notes}")
+        verification_entry = '\n'.join(entry_lines) + '\n'
+
+        if '## Verification' in body:
+            body_new = body.rstrip() + '\n' + verification_entry
+        else:
+            body_new = body.rstrip() + '\n\n## Verification\n' + verification_entry
+
+        # Status transition
+        if verdict == 'pass':
+            meta['status'] = 'verified'
+            meta['completed_at'] = now_iso()
+        elif verdict == 'fail':
+            rework = (meta.get('rework_count') or 0) + 1
+            max_rework = meta.get('max_rework') or 3
+            meta['rework_count'] = rework
+            if rework >= max_rework:
+                meta['status'] = 'needs_human_review'
+                print(
+                    f"rework_count ({rework}) >= max_rework ({max_rework}): "
+                    f"escalating to needs_human_review"
+                )
+            else:
+                meta['status'] = 'in_progress'
+        else:  # needs_human_review
+            meta['status'] = 'needs_human_review'
+
+        save_task(slug, task_id, meta, body_new)
+
+        # Check mission completion (only on pass→verified)
+        if verdict == 'pass':
+            tasks = list_tasks(slug)
+            if all(m.get('status') in TERMINAL_STATUSES for (m, _) in tasks):
+                mission = load_mission(slug)
+                mission['status'] = 'done'
+                mission['completed_at'] = now_iso()
+                save_mission(slug, mission)
+
+        print(f"verify-result: {slug}/{task_id} → {meta['status']} (verdict={verdict})")
+
+    with_lock(_do)
+
+
 def cmd_lint(args):
     opts, positional = parse_opts(args, {'--strict': 'bool', '--mission': 'value'})
     slug = opts.get('--mission') or (positional[0] if positional else None)
@@ -1495,6 +1584,7 @@ dispatch = {
     'done': cmd_done,
     'fail': cmd_fail,
     'ready-for-verification': cmd_ready_for_verification,
+    'verify-result': cmd_verify_result,
     'lint': cmd_lint,
     'status': cmd_status,
     'archive': cmd_archive,

@@ -132,6 +132,52 @@ fi
 export AGENT_NAME
 export ROLE
 
+# --- 承認チャネル設定を config から読み込む ---
+# CREWVIA_APPROVAL_CHANNEL が未設定の場合は config を読む
+_read_approval_channel_yaml() {
+  local cfg="$1" key_path="$2"
+  [[ ! -f "$cfg" ]] && return
+  awk -v kp="$key_path" '
+    BEGIN { in_ac=0; in_ntfy=0; n=split(kp,a,"."); tk=a[1]; sk=( n>1 ? a[2] : "" ) }
+    /^approval_channel:/ { in_ac=1; next }
+    in_ac && /^[a-zA-Z_]/ { in_ac=0; in_ntfy=0 }
+    in_ac {
+      if (/^  ntfy:/) { in_ntfy=1; next }
+      if (in_ntfy && /^  [a-zA-Z_]/ && !/^    /) { in_ntfy=0 }
+      if (tk=="mode" && sk=="" && /^  mode:/) {
+        v=$0; gsub(/^  mode:[[:space:]]*/,"",v); gsub(/^['"'"'"]|['"'"'"]$/,"",v); print v; exit
+      }
+      if (tk=="ntfy" && in_ntfy) {
+        pfx="    " sk ":"
+        if (index($0,pfx)==1) {
+          v=substr($0,length(pfx)+1); gsub(/^[[:space:]]*/,"",v)
+          gsub(/^['"'"'"]|['"'"'"]$/,"",v); print v; exit
+        }
+      }
+    }
+  ' "$cfg"
+}
+
+if [[ -z "${CREWVIA_APPROVAL_CHANNEL:-}" ]] && [[ -f "$CONFIG_FILE" ]]; then
+  _AC_MODE=$(_read_approval_channel_yaml "$CONFIG_FILE" "mode")
+  [[ -n "$_AC_MODE" ]] && export CREWVIA_APPROVAL_CHANNEL="$_AC_MODE"
+fi
+export CREWVIA_APPROVAL_CHANNEL="${CREWVIA_APPROVAL_CHANNEL:-taskvia}"
+
+# ntfy 設定を config から読み込む（env var 優先）
+if [[ -f "$CONFIG_FILE" ]]; then
+  [[ -z "${NTFY_URL:-}" ]]                   && export NTFY_URL="$(_read_approval_channel_yaml "$CONFIG_FILE" "ntfy.url")"
+  [[ -z "${NTFY_TOPIC:-}" ]]                 && export NTFY_TOPIC="$(_read_approval_channel_yaml "$CONFIG_FILE" "ntfy.topic")"
+  [[ -z "${NTFY_USER:-}" ]]                  && export NTFY_USER="$(_read_approval_channel_yaml "$CONFIG_FILE" "ntfy.user")"
+  [[ -z "${NTFY_PASS:-}" ]]                  && export NTFY_PASS="$(_read_approval_channel_yaml "$CONFIG_FILE" "ntfy.pass")"
+  [[ -z "${APPROVAL_TOKEN_TTL_SECONDS:-}" ]] && export APPROVAL_TOKEN_TTL_SECONDS="$(_read_approval_channel_yaml "$CONFIG_FILE" "ntfy.token_ttl_seconds")"
+fi
+export NTFY_URL="${NTFY_URL:-}"
+export NTFY_TOPIC="${NTFY_TOPIC:-}"
+export NTFY_USER="${NTFY_USER:-}"
+export NTFY_PASS="${NTFY_PASS:-}"
+export APPROVAL_TOKEN_TTL_SECONDS="${APPROVAL_TOKEN_TTL_SECONDS:-900}"
+
 # --- Taskvia 連携モード確定（CREWVIA_TASKVIA 未設定の場合は config を読む） ---
 # crewvia ランチャー経由なら ask は既に resolved 済み。直接 start.sh を呼んだ場合は
 # ここで config を読み、ask なら非対話フォールバック（enabled）を使う。
@@ -280,7 +326,7 @@ if [[ "${CREWVIA_TMUX:-0}" == "1" ]]; then
   SESSION="crewvia"
   WINDOW_NAME="${AGENT_NAME}-${ROLE}"
 
-  ENV_EXPORTS="export AGENT_NAME='$AGENT_NAME' TASKVIA_URL='$TASKVIA_URL' TASKVIA_TOKEN='${TASKVIA_TOKEN:-}' CREWVIA_TASKVIA='${CREWVIA_TASKVIA:-enabled}' ROLE='$ROLE' SKILLS='${SKILLS:-}' CREWVIA_REPO='$CREWVIA_REPO'"
+  ENV_EXPORTS="export AGENT_NAME='$AGENT_NAME' TASKVIA_URL='$TASKVIA_URL' TASKVIA_TOKEN='${TASKVIA_TOKEN:-}' CREWVIA_TASKVIA='${CREWVIA_TASKVIA:-enabled}' ROLE='$ROLE' SKILLS='${SKILLS:-}' CREWVIA_REPO='$CREWVIA_REPO' CREWVIA_APPROVAL_CHANNEL='${CREWVIA_APPROVAL_CHANNEL:-taskvia}' NTFY_URL='${NTFY_URL:-}' NTFY_TOPIC='${NTFY_TOPIC:-}' NTFY_USER='${NTFY_USER:-}' NTFY_PASS='${NTFY_PASS:-}' APPROVAL_TOKEN_TTL_SECONDS='${APPROVAL_TOKEN_TTL_SECONDS:-900}'"
   [[ "${ROLE}" == "worker" ]] && [[ "$WORK_DIR" != "$REPO_ROOT" ]] && ENV_EXPORTS+=" TARGET_DIR='$WORK_DIR'"
 
   # --model flag (空なら省略)

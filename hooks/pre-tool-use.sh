@@ -46,6 +46,16 @@ _SKILL_EXCEPTION=false
 
 _CREWVIA_REPO="${CREWVIA_REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 
+# 承認チャネルライブラリを読み込む
+# shellcheck source=hooks/lib_approval_channel.sh
+if [ -f "${_CREWVIA_REPO}/hooks/lib_approval_channel.sh" ]; then
+  . "${_CREWVIA_REPO}/hooks/lib_approval_channel.sh"
+  load_ntfy_config
+  _APPROVAL_CHANNEL_MODE="$(get_approval_channel_mode)"
+else
+  _APPROVAL_CHANNEL_MODE="taskvia"
+fi
+
 # Claude Code PreToolUse hook の permission 決定を stdout に出力する
 emit_decision() {
   local decision="$1" reason="$2"
@@ -164,6 +174,12 @@ case "$TOOL_NAME" in Bash|Write|Edit) PRIORITY="high" ;; esac
 
 AUTH_HEADER="Authorization: Bearer ${TASKVIA_TOKEN}"
 
+# ntfy モードでは Taskvia に ntfy=true を渡してトークン URL を生成させる
+_NTFY_FLAG="false"
+case "${_APPROVAL_CHANNEL_MODE:-taskvia}" in
+  ntfy|both) _NTFY_FLAG="true" ;;
+esac
+
 # 承認リクエスト投入
 PAYLOAD="$(jq -nc \
   --arg tool   "$TOOL_SUMMARY" \
@@ -172,7 +188,8 @@ PAYLOAD="$(jq -nc \
   --arg tid    "${TASK_ID:-}" \
   --arg prio   "$PRIORITY" \
   --argjson exc "${_SKILL_EXCEPTION}" \
-  '{tool: $tool, agent: $agent, task_title: $title, task_id: ($tid | if . == "" then null else . end), priority: $prio, exception: $exc}')"
+  --argjson ntfy "${_NTFY_FLAG}" \
+  '{tool: $tool, agent: $agent, task_title: $title, task_id: ($tid | if . == "" then null else . end), priority: $prio, exception: $exc, ntfy: $ntfy}')"
 
 RESPONSE="$(curl -sf --connect-timeout 5 --max-time 10 -X POST "${TASKVIA_URL}/api/request" \
   -H "Content-Type: application/json" \
@@ -186,6 +203,20 @@ if [ -z "$CARD_ID" ] || [ "$CARD_ID" = "null" ]; then
   emit_decision "deny" "Taskvia request submission failed"
   exit 0
 fi
+
+# ntfy / both モードでは Crewvia 側から直接 ntfy 通知を送信する
+case "${_APPROVAL_CHANNEL_MODE:-taskvia}" in
+  ntfy|both)
+    _TOKEN_URLS="$(parse_token_urls "$RESPONSE")"
+    _APPROVE_URL="${_TOKEN_URLS%% *}"
+    _DENY_URL="${_TOKEN_URLS##* }"
+    if [ -n "$_APPROVE_URL" ] && [ "$_APPROVE_URL" != "$_DENY_URL" ]; then
+      ntfy_publish "$AGENT_NAME" "$TOOL_SUMMARY" "$_APPROVE_URL" "$_DENY_URL" || true
+    else
+      echo "[ntfy] approve_url/deny_url が取得できませんでした。taskvia フォールバックで継続します。" >&2
+    fi
+    ;;
+esac
 
 echo "[taskvia] 承認待ち: ${TOOL_SUMMARY} (id=${CARD_ID})" >&2
 

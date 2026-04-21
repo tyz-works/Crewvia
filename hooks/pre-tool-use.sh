@@ -8,11 +8,15 @@
 #   }
 #
 # 環境変数:
-#   TASKVIA_URL    — Taskvia のベースURL (default: https://taskvia.vercel.app)
-#   TASKVIA_TOKEN  — Bearer トークン（未設定時はスタンドアロンモード）
-#   AGENT_NAME     — エージェント識別子 (default: hostname)
-#   TASK_TITLE     — 現在のタスク名 (任意)
-#   TASK_ID        — 現在のタスクID (任意)
+#   TASKVIA_URL               — Taskvia のベースURL (default: https://taskvia.vercel.app)
+#   TASKVIA_TOKEN             — Bearer トークン（未設定時はスタンドアロンモード）
+#   AGENT_NAME                — エージェント識別子 (default: hostname)
+#   TASK_TITLE                — 現在のタスク名 (任意)
+#   TASK_ID                   — 現在のタスクID (任意)
+#   APPROVAL_TIMEOUT          — 承認ポーリング上限秒数 (default: 600)
+#   CREWVIA_APPROVAL_CHANNEL  — 承認チャネル: taskvia|ntfy|both (default: taskvia)
+#   NTFY_URL / NTFY_TOPIC     — ntfy サーバー設定（mode=ntfy|both 時に必要）
+#   NTFY_USER / NTFY_PASS     — ntfy Basic 認証（任意）
 
 set -euo pipefail
 
@@ -41,7 +45,8 @@ TASKVIA_TOKEN="${TASKVIA_TOKEN:-}"
 AGENT_NAME="${AGENT_NAME:-$(hostname -s)}"
 TASK_TITLE="${TASK_TITLE:-}"
 TASK_ID="${TASK_ID:-}"
-TIMEOUT=600
+# APPROVAL_TIMEOUT env var でポーリング上限を上書きできる（デフォルト: 600秒）
+TIMEOUT="${APPROVAL_TIMEOUT:-600}"
 _SKILL_EXCEPTION=false
 
 _CREWVIA_REPO="${CREWVIA_REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
@@ -205,13 +210,39 @@ if [ -z "$CARD_ID" ] || [ "$CARD_ID" = "null" ]; then
 fi
 
 # ntfy / both モードでは Crewvia 側から直接 ntfy 通知を送信する
+_NTFY_SENT=false
 case "${_APPROVAL_CHANNEL_MODE:-taskvia}" in
   ntfy|both)
     _TOKEN_URLS="$(parse_token_urls "$RESPONSE")"
     _APPROVE_URL="${_TOKEN_URLS%% *}"
     _DENY_URL="${_TOKEN_URLS##* }"
     if [ -n "$_APPROVE_URL" ] && [ "$_APPROVE_URL" != "$_DENY_URL" ]; then
-      ntfy_publish "$AGENT_NAME" "$TOOL_SUMMARY" "$_APPROVE_URL" "$_DENY_URL" || true
+      if ntfy_publish "$AGENT_NAME" "$TOOL_SUMMARY" "$_APPROVE_URL" "$_DENY_URL"; then
+        _NTFY_SENT=true
+      else
+        # ntfy 送信失敗時のフォールバック
+        if [ "${_APPROVAL_CHANNEL_MODE}" = "ntfy" ]; then
+          # mode=ntfy: 通知手段がないため skill-permissions の静的ルールで判定する
+          echo "[ntfy] ⚠️ ntfy 送信失敗。skill-permissions フォールバックを適用します。" >&2
+          if [ -f "$_SKILL_PERMS_YAML" ] && [ -f "$_SKILL_PERMS_PY" ]; then
+            _FB_RESULT="$(python3 "$_SKILL_PERMS_PY" "$_SKILL_PERMS_YAML" "${SKILLS:-}" "$_TOOL_SIG" 2>/dev/null || echo '{"decision":"none"}')"
+            _FB_DECISION="$(echo "$_FB_RESULT" | jq -r '.decision')"
+            if [ "$_FB_DECISION" = "allow" ]; then
+              _FB_SOURCE="$(echo "$_FB_RESULT" | jq -r '.source // "skill-permissions"')"
+              echo "[ntfy] ✅ skill-permissions allow: ${_TOOL_SIG} (${_FB_SOURCE})" >&2
+              emit_decision "allow" "ntfy failed; skill-permissions fallback: ${_FB_SOURCE}"
+              exit 0
+            fi
+          fi
+          # allow ルールなし → 承認者に届かないため拒否
+          echo "[ntfy] ❌ ntfy 送信失敗かつ skill-permissions allow なし。ツール実行を拒否します。" >&2
+          emit_decision "deny" "ntfy publish failed; no approval channel available"
+          exit 0
+        else
+          # mode=both: Taskvia WebUI で承認可能なため警告のみで継続
+          echo "[ntfy] ⚠️ ntfy 送信失敗。Taskvia WebUI で承認を継続します。" >&2
+        fi
+      fi
     else
       echo "[ntfy] approve_url/deny_url が取得できませんでした。taskvia フォールバックで継続します。" >&2
     fi
@@ -246,6 +277,6 @@ for i in $(seq 1 "$TIMEOUT"); do
   esac
 done
 
-echo "[taskvia] タイムアウト（${TIMEOUT}秒）: ${TOOL_SUMMARY}" >&2
-emit_decision "deny" "Taskvia approval timed out after ${TIMEOUT}s (id=${CARD_ID})"
+echo "[approval] ⏱️ タイムアウト（${TIMEOUT}秒）: ${TOOL_SUMMARY} (channel=${_APPROVAL_CHANNEL_MODE:-taskvia})" >&2
+emit_decision "deny" "Approval timed out after ${TIMEOUT}s (channel=${_APPROVAL_CHANNEL_MODE:-taskvia}, id=${CARD_ID})"
 exit 0

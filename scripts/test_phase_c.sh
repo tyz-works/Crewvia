@@ -3,7 +3,8 @@
 # 実行: bash ~/workspace/crewvia/scripts/test_phase_c.sh
 # 出力: ~/workspace/crewvia/docs/20260422_task089_integration_log.md
 
-set -euo pipefail
+set -eo pipefail
+# -u は外す: 空配列 "${AUTH_ARGS[@]}" を bash 3.2 (macOS default) で展開すると unbound エラーになるため
 
 TASKVIA_DIR="${TASKVIA_DIR:-$HOME/workspace/Taskvia}"
 LOG_FILE="$HOME/workspace/crewvia/docs/20260422_task089_integration_log.md"

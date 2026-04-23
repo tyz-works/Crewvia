@@ -77,12 +77,25 @@ Crewvia uses the following environment variables. Add them to your shell profile
 | `AGENT_NAME` | Set by `start.sh` | Name assigned to this agent instance |
 | `TASK_TITLE` | Set at runtime | Human-readable title of the current task card |
 | `TASK_ID` | Set at runtime | Card ID of the current task (e.g., `card-042`) |
+| `CREWVIA_APPROVAL_CHANNEL` | Optional | Approval notification channel: `taskvia` (default) / `ntfy` / `both` |
+| `NTFY_URL` | Required for ntfy | ntfy server base URL (e.g., `https://ntfy.elni.net`) |
+| `NTFY_TOPIC` | Required for ntfy | ntfy topic name. Use `taskvia-approval-` prefix for ACL compatibility |
+| `NTFY_USER` | Required for ntfy | ntfy Basic auth username (required if server uses `auth-default-access: deny-all`) |
+| `NTFY_PASS` | Required for ntfy | ntfy Basic auth password |
+| `APPROVAL_TOKEN_TTL_SECONDS` | Optional | One-time token TTL in seconds (default: `900`) |
 
 Example `.env`-style configuration:
 
 ```bash
 export TASKVIA_URL="https://taskvia.vercel.app"
 export TASKVIA_TOKEN="tvk_xxxxxxxxxxxxxxxxxxxx"
+
+# ntfy push notifications (optional — set CREWVIA_APPROVAL_CHANNEL=ntfy or both)
+export CREWVIA_APPROVAL_CHANNEL="both"
+export NTFY_URL="https://ntfy.elni.net"
+export NTFY_TOPIC="taskvia-approval-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+export NTFY_USER="taskvia"
+export NTFY_PASS="your-ntfy-password"
 ```
 
 > **Standalone mode**: Run with `./crewvia --no-taskvia` or set `CREWVIA_TASKVIA=disabled` to skip
@@ -272,6 +285,58 @@ After tool execution, Workers post discoveries to `POST /api/log`. Log types:
 | `knowledge` | Discoveries, patterns, caveats | Pushed to Obsidian |
 | `improvement` | Improvement proposals | Pushed to Obsidian |
 | `work` | Routine work logs | Temporary, discarded |
+
+### Mobile push notifications via ntfy (optional)
+
+Crewvia can send approval requests as push notifications to your iPhone via a
+[self-hosted ntfy server](https://ntfy.sh). This enables one-tap approve/deny without
+opening the Taskvia WebUI.
+
+**How it works** (`CREWVIA_APPROVAL_CHANNEL=ntfy` or `both`):
+
+```
+Worker triggers tool call
+        ↓
+POST /api/request  { notify: true }  →  Taskvia
+                                          ├─ Redis: approval card created
+                                          ├─ Redis: one-time token (TTL 900s)
+                                          └─ ntfy: push notification sent
+                                                    ↓
+                                          [iPhone ntfy app]
+                                          ✓承認 / ✗却下 action button
+                                                    ↓
+                                          POST /api/approve-token/<token>
+                                             or /api/deny-token/<token>
+                                                    ↓
+                                          Redis: card status → approved/denied
+        ↓
+poll /api/status/:id every 1s  →  detect approved/denied  →  exit 0/1
+```
+
+**Setup**:
+
+1. Set up a self-hosted ntfy server (see [ntfy docs](https://docs.ntfy.sh/))
+2. Create a topic with the `taskvia-approval-` prefix (e.g., `taskvia-approval-my32chartoken`)
+3. Subscribe to the topic in the ntfy iOS app
+4. Set environment variables:
+
+```bash
+export CREWVIA_APPROVAL_CHANNEL="ntfy"   # or "both" for ntfy + WebUI
+export NTFY_URL="https://ntfy.example.com"
+export NTFY_TOPIC="taskvia-approval-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+export NTFY_USER="taskvia"
+export NTFY_PASS="your-ntfy-password"
+```
+
+5. Set the same `NTFY_*` variables in Taskvia's environment (Vercel dashboard or `.env.local`)
+
+> **Mode comparison**:
+>
+> | Mode | Approve via | Use case |
+> |------|-------------|---------|
+> | `taskvia` (default) | Browser WebUI | Desktop-first workflows |
+> | `ntfy` | iPhone push notification | Mobile-first, away from desk |
+> | `both` | Either WebUI or iPhone | Maximum flexibility |
 
 ### Standalone mode (Taskvia disabled)
 
@@ -517,6 +582,65 @@ crewvia/
 ├── CLAUDE.md                      # System spec and design decisions
 └── README.md                      # This file
 ```
+
+---
+
+## Troubleshooting
+
+### ntfy push notifications not arriving on iPhone
+
+**Step 1 — Verify ntfy server directly**
+
+```bash
+curl -u <NTFY_USER>:<NTFY_PASS> \
+  -H "Title: test" -d "hello" \
+  https://<NTFY_URL>/<NTFY_TOPIC>
+# 200 → server is reachable
+# 401/403 → check NTFY_USER / NTFY_PASS (server may use auth-default-access: deny-all)
+```
+
+> **Note**: Always test with `POST`, not `GET`. `GET` hits the subscribe endpoint and will
+> return a streaming response (not 401/200 as a publish test). This distinction matters when
+> scripting health checks (lesson from E2E testing).
+
+**Step 2 — Verify Taskvia → ntfy path**
+
+```bash
+curl -X POST https://taskvia.vercel.app/api/request \
+  -H "Authorization: Bearer <TASKVIA_TOKEN>" \
+  -H "Content-Type: application/json" \
+  -d '{"tool":"test","agent":"debug","task_title":"test","notify":true}'
+# Check: does the iPhone receive a notification within ~5 seconds?
+# If not, the NTFY_* vars in Taskvia's environment are likely wrong or empty.
+```
+
+**Step 3 — Check Taskvia production environment variables (most common cause)**
+
+> **⚠️ Lesson L1**: Vercel production environment variables are **completely independent** from
+> `.env.local`. Even if ntfy works in local development, you must separately add `NTFY_URL`,
+> `NTFY_TOPIC`, `NTFY_USER`, and `NTFY_PASS` to Vercel's **Settings > Environment Variables**
+> for the **Production** environment.
+>
+> `vercel env ls` shows that a variable *exists* but cannot confirm its value is non-empty —
+> Encrypted variables can be stored with an empty value. Run `vercel env pull` or send a live
+> test notification to verify.
+
+### ntfy notification arrives but approve/deny doesn't register
+
+- The one-time token may have expired (`APPROVAL_TOKEN_TTL_SECONDS`, default 900 s)
+- Debug via Upstash Redis: `SCAN 0 MATCH approval_token:*` — if the token key is missing, it has expired
+- The `request_id` field in `approval_token:<token>` links back to `approval:<id>` for cross-referencing
+
+### Silent failure — no notification and no error
+
+> **⚠️ Lesson L2**: `publishApprovalRequest()` in Taskvia returns silently when `NTFY_URL` or
+> `NTFY_TOPIC` is empty (`if (!ntfyUrl || !topic) return;`). No error is logged. To confirm
+> whether the function ran:
+>
+> - Check Upstash Redis for `approval_token:*` keys. If a token exists, the function executed
+>   past the early-return guard — the issue is downstream (network, wrong topic, auth).
+> - If no token exists, `NTFY_URL` or `NTFY_TOPIC` is empty in the Taskvia environment.
+>   Check Vercel dashboard → Settings → Environment Variables.
 
 ---
 

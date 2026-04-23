@@ -56,15 +56,6 @@ taskvia_url: https://taskvia.vercel.app
 # ファイルが存在しない場合はスタンドアロンモードで起動します。
 # 環境変数での上書き: TASKVIA_TOKEN=sk-...
 
-# ===== Taskvia 連携モード =====
-# enabled  — Taskvia 承認ゲートとログ投稿を有効化（TASKVIA_TOKEN 必須）
-# disabled — Taskvia 連携を完全無効化（スタンドアロン動作）
-# ask      — 起動時に対話プロンプトで選択（デフォルト）
-#
-# 環境変数での上書き: CREWVIA_TASKVIA=enabled|disabled|ask
-# CLI フラグでの上書き: ./crewvia --taskvia | --no-taskvia
-taskvia: ask
-
 # ===== 承認チャネル設定 =====
 # ツール実行の承認通知をどのチャネルで受け取るかを設定します。
 #
@@ -75,19 +66,21 @@ taskvia: ask
 #
 # 環境変数での上書き: CREWVIA_APPROVAL_CHANNEL=taskvia|ntfy|both
 approval_channel:
-  mode: taskvia
+  mode: both
 
   ntfy:
     # ntfy サーバーの URL（例: https://ntfy.sh または自己ホスト）
     # 環境変数: NTFY_URL
-    url: ""
+    url: "https://ntfy.elni.net"
 
-    # 通知を受け取るトピック名
-    # 環境変数: NTFY_TOPIC
+    # 通知を受け取るトピック名。必ず環境変数 NTFY_TOPIC で設定すること。
+    # ntfy ACL: taskvia-approval-* パターンのみ iphone ユーザーが subscribe 可能。
+    # 環境変数: NTFY_TOPIC (必須 — ここには書かず env var で注入)
     topic: ""
 
-    # Basic 認証（任意。パブリックサーバーや認証不要な場合は空欄）
-    # 環境変数: NTFY_USER / NTFY_PASS
+    # Basic 認証。ntfy サーバーが auth-default-access: deny-all の場合は必須。
+    # セキュリティのため値はここに書かず、環境変数で設定すること。
+    # 環境変数: NTFY_USER / NTFY_PASS (必須 — 空のまま運用すると 401 で通知失敗)
     user: ""
     pass: ""
 

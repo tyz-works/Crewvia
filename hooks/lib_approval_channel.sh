@@ -5,8 +5,9 @@
 # 提供する関数:
 #   get_approval_channel_mode  — 有効モードを返す (taskvia|ntfy|both)
 #   load_ntfy_config           — ntfy 設定を config / env から読み込む
-#   ntfy_publish               — ntfy サーバーに承認通知を送信する
-#   parse_token_urls           — POST /api/request レスポンスから approve/deny URL を抽出する
+#
+# α方針 (task_089): ntfy publish は Taskvia が担当。crewvia は POST /api/request に
+#   { notify: true } を渡すのみ。ntfy_publish / parse_token_urls は削除済み。
 
 # 二重 source 防止
 [[ "${_LIB_APPROVAL_CHANNEL_LOADED:-}" == "1" ]] && return 0
@@ -99,59 +100,3 @@ load_ntfy_config() {
   export APPROVAL_TOKEN_TTL_SECONDS="${APPROVAL_TOKEN_TTL_SECONDS:-900}"
 }
 
-# ---------------------------------------------------------------------------
-# ntfy_publish <agent> <tool_summary> <approve_url> <deny_url>
-#   ntfy サーバーに承認通知を送る。
-#   NTFY_URL と NTFY_TOPIC が未設定の場合は何もしない（エラーにしない）。
-#   戻り値: 0=送信成功, 1=設定不足/送信失敗
-# ---------------------------------------------------------------------------
-ntfy_publish() {
-  local agent="$1" tool_summary="$2" approve_url="$3" deny_url="$4"
-
-  if [[ -z "${NTFY_URL:-}" ]] || [[ -z "${NTFY_TOPIC:-}" ]]; then
-    echo "[ntfy] NTFY_URL または NTFY_TOPIC が未設定。ntfy 送信をスキップします。" >&2
-    return 1
-  fi
-
-  local auth_flag=()
-  if [[ -n "${NTFY_USER:-}" ]] && [[ -n "${NTFY_PASS:-}" ]]; then
-    auth_flag=(-u "${NTFY_USER}:${NTFY_PASS}")
-  fi
-
-  local ntfy_endpoint="${NTFY_URL%/}/${NTFY_TOPIC}"
-  local title="[${agent}] ${tool_summary} 承認要求"
-  local actions="http, ✓承認, ${approve_url}, method=POST, clear=true; http, ✗却下, ${deny_url}, method=POST, clear=true"
-
-  curl -sf --connect-timeout 5 --max-time 10 \
-    -X POST "$ntfy_endpoint" \
-    "${auth_flag[@]+"${auth_flag[@]}"}" \
-    -H "Title: ${title}" \
-    -H "Priority: high" \
-    -H "Tags: lock" \
-    -H "Actions: ${actions}" \
-    -d "承認待ち: ${tool_summary}" \
-    > /dev/null 2>&1
-
-  local rc=$?
-  if [[ $rc -ne 0 ]]; then
-    echo "[ntfy] 送信失敗 (curl exit=${rc})。ポーリングは継続します。" >&2
-    return 1
-  fi
-
-  echo "[ntfy] 承認通知を送信しました: ${tool_summary}" >&2
-  return 0
-}
-
-# ---------------------------------------------------------------------------
-# parse_token_urls <json_response>
-#   POST /api/request のレスポンス JSON から approve_url / deny_url を抽出する。
-#   stdout に "approve_url deny_url" をスペース区切りで出力する。
-#   URL が取得できない場合は空文字列を出力する。
-# ---------------------------------------------------------------------------
-parse_token_urls() {
-  local response="$1"
-  local approve_url deny_url
-  approve_url=$(echo "$response" | jq -r '.approve_url // empty' 2>/dev/null || true)
-  deny_url=$(echo "$response"    | jq -r '.deny_url    // empty' 2>/dev/null || true)
-  echo "${approve_url:-} ${deny_url:-}"
-}

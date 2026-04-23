@@ -84,11 +84,17 @@ WebUI URL: `taskvia.vercel.app`
 
 ### 承認フロー（PreToolUse hook）
 
-```bash
-#!/bin/bash
-TASKVIA_URL="https://taskvia.vercel.app"
+承認チャネルは `CREWVIA_APPROVAL_CHANNEL` 環境変数（または `config/crewvia.yaml` の `approval_channel.mode`）で選択する。
 
-CARD_ID=$(curl -s -X POST "$TASKVIA_URL/api/request" \
+| モード | 動作 |
+|---|---|
+| `taskvia`（デフォルト） | Taskvia WebUI にカードを作成し、ブラウザまたは ntfy アクションボタンで承認 |
+| `ntfy` | `notify: true` を付けて `/api/request` に投げ、Taskvia が ntfy 通知を送信 |
+| `both` | 上記両方。ntfy 通知 + WebUI の両方で承認可能 |
+
+```bash
+# ntfy モード / both モード: "notify": true を渡すと Taskvia が ntfy 送信する
+RESPONSE=$(curl -s -X POST "$TASKVIA_URL/api/request" \
   -H "Authorization: Bearer $TASKVIA_TOKEN" \
   -H "Content-Type: application/json" \
   -d "{
@@ -96,8 +102,11 @@ CARD_ID=$(curl -s -X POST "$TASKVIA_URL/api/request" \
     \"agent\": \"$AGENT_NAME\",
     \"task_title\": \"$TASK_TITLE\",
     \"task_id\": \"$TASK_ID\",
-    \"priority\": \"$PRIORITY\"
-  }" | jq -r .id)
+    \"priority\": \"$PRIORITY\",
+    \"notify\": true
+  }")
+
+CARD_ID=$(echo "$RESPONSE" | jq -r .id)
 
 for i in $(seq 600); do
   STATUS=$(curl -s \
@@ -109,6 +118,8 @@ for i in $(seq 600); do
 done
 exit 1
 ```
+
+実際の実装は `hooks/pre-tool-use.sh` と `hooks/lib_approval_channel.sh` を参照。
 
 ### ナレッジログ投稿（PostToolUse or 自発的）
 
@@ -196,6 +207,12 @@ Backlog → In Progress → Awaiting Approval → Done
 | `AGENT_NAME` | 起動時に設定されるエージェント名 |
 | `TASK_TITLE` | 現在担当中のタスクタイトル |
 | `TASK_ID` | 現在担当中のカードID |
+| `CREWVIA_APPROVAL_CHANNEL` | 承認通知チャネル: `taskvia` / `ntfy` / `both`（config `approval_channel.mode` より優先） |
+| `NTFY_URL` | ntfy サーバーの URL（例: `https://ntfy.elni.net`）。`approval_channel.ntfy.url` より優先 |
+| `NTFY_TOPIC` | ntfy 通知トピック名。`taskvia-approval-` プレフィックス推奨。**必須** — 空のまま運用すると通知が silent skip される |
+| `NTFY_USER` | ntfy Basic 認証ユーザー名。`auth-default-access: deny-all` サーバーでは必須 |
+| `NTFY_PASS` | ntfy Basic 認証パスワード。上記同様に必須 |
+| `APPROVAL_TOKEN_TTL_SECONDS` | ntfy アクションボタン用ワンタイムトークンの有効期限（秒）。デフォルト: 900 |
 
 ---
 

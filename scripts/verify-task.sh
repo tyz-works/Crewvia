@@ -12,4 +12,10 @@ if [[ -z "$TASK_ID" ]]; then
     exit 1
 fi
 
-exec python3 "$SCRIPT_DIR/run_verification_checks.py" "$TASK_ID" "$QUEUE_DIR"
+python3 "$SCRIPT_DIR/run_verification_checks.py" "$TASK_ID" "$QUEUE_DIR"
+_EXIT=$?
+
+# Fail-open: never block verify-task on sync errors
+"$SCRIPT_DIR/taskvia-verification-sync.sh" "$TASK_ID" "$QUEUE_DIR" || true
+
+exit $_EXIT

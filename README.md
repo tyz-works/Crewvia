@@ -83,6 +83,7 @@ Crewvia uses the following environment variables. Add them to your shell profile
 | `NTFY_USER` | Required for ntfy | ntfy Basic auth username (required if server uses `auth-default-access: deny-all`) |
 | `NTFY_PASS` | Required for ntfy | ntfy Basic auth password |
 | `APPROVAL_TOKEN_TTL_SECONDS` | Optional | One-time token TTL in seconds (default: `900`) |
+| `CREWVIA_VERIFICATION_UI` | Optional | Set in **Taskvia's** Vercel env (not crewvia). `disabled` hides all verification UI and redirects `/verification-queue` to `/` |
 
 Example `.env`-style configuration:
 
@@ -337,6 +338,26 @@ export NTFY_PASS="your-ntfy-password"
 > | `taskvia` (default) | Browser WebUI | Desktop-first workflows |
 > | `ntfy` | iPhone push notification | Mobile-first, away from desk |
 > | `both` | Either WebUI or iPhone | Maximum flexibility |
+
+### Verification push (crewvia QA → Taskvia)
+
+After a Worker completes a task, the QA layer pushes verification results to Taskvia so Admirals can monitor status in the Board UI.
+
+```
+plan.sh verify-result <task_id> <verdict> [rework_count]
+       ↓
+scripts/taskvia-verification-sync.sh
+       ↓
+POST $TASKVIA_URL/api/verification    (Bearer $TASKVIA_TOKEN)
+       ↓
+Taskvia Board: verification badge updates within 5 seconds (polling)
+```
+
+**Prerequisites**: The approval card (`POST /api/request`) must already exist for the `task_id` before pushing verification data. The Board reads `approval:{id}` to render a card — `POST /api/verification` alone will not make a card appear.
+
+**no-op when**: `TASKVIA_TOKEN` is unset or `CREWVIA_TASKVIA=disabled` — verification push is silently skipped.
+
+**E2E testing**: Use `pnpm dev` (localhost) with a shared Upstash Redis. Vercel Preview URLs may be SSO-protected and block external POSTs (see [Troubleshooting](#troubleshooting)).
 
 ### Standalone mode (Taskvia disabled)
 
@@ -641,6 +662,49 @@ curl -X POST https://taskvia.vercel.app/api/request \
 >   past the early-return guard — the issue is downstream (network, wrong topic, auth).
 > - If no token exists, `NTFY_URL` or `NTFY_TOPIC` is empty in the Taskvia environment.
 >   Check Vercel dashboard → Settings → Environment Variables.
+
+### Verification badge not appearing on Board (Lesson L6)
+
+The Board renders cards from `approval:index` → `approval:{id}`. The verification badge is overlaid onto an existing card using `task_id`. If you only call `POST /api/verification` without a prior `POST /api/request`, no card will appear on the Board.
+
+**Fix**: Always create the approval card first, then push verification data using the same `task_id`.
+
+### Approval card disappears before verification push (Lesson L7)
+
+`approval:{id}` has a TTL of 600 seconds. If the verification push is delayed more than ~10 minutes after card creation, the card expires and the index becomes an orphan.
+
+**Fix**: Push verification results immediately after the QA run completes. In practice, complete the full `pending → verifying → verified` cycle within one 10-minute window.
+
+### POST to Vercel Preview is blocked (Lesson L4)
+
+Vercel Preview URLs may be protected by Team SSO, blocking external HTTP POSTs from scripts.
+
+**Fix**: Run E2E tests against `pnpm dev` (localhost) using the same Upstash Redis instance. To bypass SSO on Preview, set `VERCEL_AUTOMATION_BYPASS_SECRET` in Vercel project settings.
+
+### `vercel curl` does not support POST (Lesson L5)
+
+`vercel curl` (≤ v50.37.3) ignores `-X POST` and only performs GET requests.
+
+**Fix**: Use standard `curl` with `Authorization: Bearer <TASKVIA_TOKEN>`:
+
+```bash
+curl -X POST "$TASKVIA_URL/api/verification" \
+  -H "Authorization: Bearer $TASKVIA_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{ "task_id": "...", "verdict": "pass", ... }'
+```
+
+### `CREWVIA_VERIFICATION_UI` has no effect (Lesson L8)
+
+This variable is read **server-side** by Taskvia (Server Component / Server Action). It does **not** need the `NEXT_PUBLIC_` prefix. Set it in **Taskvia's** Vercel environment variables, not in crewvia.
+
+```bash
+# ✅ Correct — server-side env var in Taskvia's Vercel project
+CREWVIA_VERIFICATION_UI=disabled
+
+# ❌ Wrong — NEXT_PUBLIC_ prefix is unnecessary and will not work
+NEXT_PUBLIC_CREWVIA_VERIFICATION_UI=disabled
+```
 
 ---
 

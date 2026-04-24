@@ -1,6 +1,7 @@
 # acceptance_criteria 正準フォーマット仕様
 
 作成: 2026-04-23 / Data (task_090_p0_data)
+最終化: 2026-04-24 / Troi (task_090_pf_troi)
 Admiral 確定方針: **(R) ハイブリッド形式** — 構造化 YAML を推奨、自由記述 (markdown 箇条書き) は既存互換として許容
 
 ---
@@ -69,7 +70,7 @@ acceptance_criteria: |
 - テストが pass すること
 ```
 
-**許容はするが非推奨**: 自由記述形式では lint_plan.py が measurable_check の有無を判定できない。新規タスク作成時は構造化形式を使うこと。
+**許容はするが非推奨**: 自由記述形式では `lint_plan.py` が `measurable_check` の有無を判定できない。新規タスク作成時は構造化形式を使うこと。
 
 ---
 
@@ -292,3 +293,7 @@ def check_acceptance_criteria(tasks: list[dict]) -> list[tuple[str, str, str]]:
 | queue/archive/qa4-test (Verifier notes) | AC 3/3 充足確認 — frontmatter 構造化形式の参照 | Verifier が前提として構造化 AC を期待している実証 |
 
 **観察**: 現状の大多数のタスクは AC を持たず、Verifier が Description / Result から意図を読み取る形になっている。構造化 AC の導入により Verifier の判定ブレを削減できる。
+
+---
+
+*本仕様は task_090 Phase 0 (Data) が策定し、Phase F (Troi) が文面整形した正準ドキュメントです。仕様変更は Admiral 承認が必要。*

@@ -213,6 +213,60 @@ Backlog → In Progress → Awaiting Approval → Done
 | `NTFY_USER` | ntfy Basic 認証ユーザー名。`auth-default-access: deny-all` サーバーでは必須 |
 | `NTFY_PASS` | ntfy Basic 認証パスワード。上記同様に必須 |
 | `APPROVAL_TOKEN_TTL_SECONDS` | ntfy アクションボタン用ワンタイムトークンの有効期限（秒）。デフォルト: 900 |
+| `CREWVIA_VERIFICATION_UI` | Taskvia 側の verification UI 表示制御。`disabled` でバッジ・タブを非表示。**Taskvia 側** の env に設定（crewvia 側ではなく Taskvia の Vercel env に追加）。 |
+
+---
+
+## Verification Push 運用ガイド
+
+crewvia QA レイヤーが verification 結果を Taskvia に push する際のフロー。
+
+### 基本フロー
+
+```
+plan.sh verify-result <task_id> <verdict> [rework_count]
+    ↓
+scripts/taskvia-verification-sync.sh
+    ↓
+POST $TASKVIA_URL/api/verification   (Bearer $TASKVIA_TOKEN)
+    ↓
+Taskvia Board: バッジ更新 (5s polling で自動反映)
+```
+
+### 前提条件: approval card との連携（重要）
+
+Taskvia Board にカードを表示するには、**先に** `POST /api/request` で approval card が作成されている必要があります。
+`POST /api/verification` だけ投入してもバッジは表示されません。
+
+```bash
+# 1. approval card 作成（task 実行開始時に crewvia hooks が自動実行）
+POST /api/request  →  { id: "<card_id>" }
+
+# 2. verification 結果 push（QA 完了後）
+POST /api/verification  {
+  "task_id": "<task_id>",
+  "mission_slug": "<slug>",
+  "verdict": "pass" | "fail",
+  "rework_count": 0,
+  "mode": "standard",
+  "verifier": "<agent_name>"
+}
+```
+
+### `TASKVIA_TOKEN` 未設定時 / `CREWVIA_TASKVIA=disabled` 時
+
+`taskvia-verification-sync.sh` は `TASKVIA_TOKEN` が未設定、または `CREWVIA_TASKVIA=disabled` の場合に **no-op** で終了します。CI やスタンドアロン環境では verification push をスキップして構いません。
+
+### TTL 管理
+
+- `verification:{task_id}`: TTL 7 日 (604800s)
+- `verification:index:{slug}`: TTL なし（lazy cleanup）
+- `approval:{id}`: TTL 600 秒 — verification push は approval card 作成後 **5 分以内**に実施すること
+
+### Worf テスト改善メモ（次回 Phase C 系実装時に対応）
+
+Worf 統合テスト 3-b / 4-d で「不存在 task_id への GET が 404 でなく 200+null/[] を返す」仕様乖離が確認済み。
+現実装では 200+null/[] を返す設計（Admiral option A で採用）。次回 verification API を拡張する際に Worf が expectation を更新すること。
 
 ---
 

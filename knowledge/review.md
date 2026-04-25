@@ -31,6 +31,18 @@ plan.sh verify-result <task_id> <verdict> [rework_count]
 
 **前提**: Taskvia Board にバッジを表示するには、先に `POST /api/request` で approval card が作成されている必要がある（task 実行開始時に hooks が自動実行）。`POST /api/verification` だけではバッジは表示されない。
 
+**リクエストボディ**:
+```json
+{
+  "task_id": "<task_id>",
+  "mission_slug": "<slug>",
+  "verdict": "pass" | "fail",
+  "rework_count": 0,
+  "mode": "standard",
+  "verifier": "<agent_name>"
+}
+```
+
 **TTL**:
 - `verification:{task_id}`: 7 日
 - `verification:index:{slug}`: TTL なし（lazy cleanup）

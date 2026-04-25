@@ -38,7 +38,7 @@
 /
   config/
     worker-names.yaml   名前プール・カスタマイズ設定
-    skills.yaml         スキルタグ定義
+    crewvia.yaml        システム設定（承認チャネル・WIP制限等）
   hooks/
     pre-tool-use.sh     PreToolUse hook（Taskvia承認）
     post-tool-use.sh    PostToolUse hook（ログ投稿）

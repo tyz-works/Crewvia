@@ -12,156 +12,23 @@
 
 ---
 
-## ロール設計
+## ロール
 
-### Director（1名）
-
-- タスクの分解・カード生成・Worker割り当て・全体管理
-- Taskviaのカンバンに対してBacklog→In Progressの遷移を管理
-- Worker完了報告を受けてDoneに遷移させる
-- 名前はworker-names.yamlのプールから選ぶ（カスタマイズで固定可能）
-
-### Worker（複数）
-
-- Directorから割り当てられたカードを実行する
-- ツール実行が必要な場合はPreToolUse hookでTaskviaに承認リクエストを送る
-- 完了・気づき・改善案をTaskviaのログAPIに投稿する
-- **名前の継承ルール**: 同じスキルセットのWorkerは同じ名前を引き継ぐ
-  - 例: `skills: [ops, bash]` のWorkerは歴代 "Kai" を名乗る
-  - ナレッジログに「Kai発見:...」と残り、次のKaiが引き継ぐ
-  - これによりWorkerに継続性・愛着が生まれる
-
----
-
-## 名前システム
-
-設定ファイル: `config/worker-names.yaml`
-
-**デフォルト動作**
-- 全ての名前がDirectorにもWorkerにもなれる
-- スキルセットをキーとして名前をハッシュ割り当て（同スキル→同名前）
-- プール内の名前が足りなければランダムに組み合わせ
-
-**カスタマイズ**
-```yaml
-customizations:
-  - name: Kai
-    role: director    # Director固定
-
-  - name: Luca
-    role: worker
-    skills: [code, python]  # スキル固定
-
-  - name: Sora
-    disabled: true          # 除外
-```
-
-**名前プール**: 世界各国のファーストネーム50個
-アジア東・南・中東・ヨーロッパ・南北アメリカ・アフリカ・スラブ圏をカバー。
-
----
-
-## スキルタグ
-
-| タグ | 内容 |
-|---|---|
-| `ops` | インフラ・サーバー操作 |
-| `bash` | シェルスクリプト・コマンド実行 |
-| `code` | コーディング全般 |
-| `python` | Python |
-| `typescript` | TypeScript / JavaScript |
-| `research` | 調査・情報収集 |
-| `database` | DB操作・クエリ |
-| `cloud` | クラウド（AWS / OCI） |
-| `docs` | ドキュメント作成 |
+- **Director**（1名）: タスク分解・Worker割り当て・進捗管理。詳細は `agents/director.md`
+- **Worker**（複数）: タスク実行・改善提案。名前はスキルに紐づき歴代継承される。詳細は `agents/worker.md`
+- スキルタグ一覧: `agents/director.md` §5
+- 名前プール・カスタマイズ: `config/worker-names.yaml`
+- 自律改善ルール: `config/autonomous-improvement.yaml`
 
 ---
 
 ## Taskvia連携
 
-リポジトリ: `tyz-works/taskvia`
-WebUI URL: `taskvia.vercel.app`
-
-### 承認フロー（PreToolUse hook）
-
-承認チャネルは `CREWVIA_APPROVAL_CHANNEL` 環境変数（または `config/crewvia.yaml` の `approval_channel.mode`）で選択する。
-
-| モード | 動作 |
-|---|---|
-| `taskvia`（デフォルト） | Taskvia WebUI にカードを作成し、ブラウザまたは ntfy アクションボタンで承認 |
-| `ntfy` | `notify: true` を付けて `/api/request` に投げ、Taskvia が ntfy 通知を送信 |
-| `both` | 上記両方。ntfy 通知 + WebUI の両方で承認可能 |
-
-```bash
-# ntfy モード / both モード: "notify": true を渡すと Taskvia が ntfy 送信する
-RESPONSE=$(curl -s -X POST "$TASKVIA_URL/api/request" \
-  -H "Authorization: Bearer $TASKVIA_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d "{
-    \"tool\": \"$TOOL_NAME\",
-    \"agent\": \"$AGENT_NAME\",
-    \"task_title\": \"$TASK_TITLE\",
-    \"task_id\": \"$TASK_ID\",
-    \"priority\": \"$PRIORITY\",
-    \"notify\": true
-  }")
-
-CARD_ID=$(echo "$RESPONSE" | jq -r .id)
-
-for i in $(seq 600); do
-  STATUS=$(curl -s \
-    -H "Authorization: Bearer $TASKVIA_TOKEN" \
-    "$TASKVIA_URL/api/status/$CARD_ID" | jq -r .status)
-  [ "$STATUS" = "approved" ] && exit 0
-  [ "$STATUS" = "denied" ]   && exit 1
-  sleep 1
-done
-exit 1
-```
-
-実際の実装は `hooks/pre-tool-use.sh` と `hooks/lib_approval_channel.sh` を参照。
-
-### ナレッジログ投稿（PostToolUse or 自発的）
-
-```bash
-curl -s -X POST "$TASKVIA_URL/api/log" \
-  -H "Authorization: Bearer $TASKVIA_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d "{
-    \"type\": \"knowledge\",
-    \"content\": \"気づいた内容\",
-    \"task_title\": \"$TASK_TITLE\",
-    \"task_id\": \"$TASK_ID\",
-    \"agent\": \"$AGENT_NAME\"
-  }"
-```
-
-ログのtype:
-- `knowledge` : 気づき・パターン・注意点 → Obsidianにpush
-- `improvement` : 改善案 → Obsidianにpush
-- `work` : 作業ログ → 一時保存後に破棄
-
----
-
-## カンバンのカード構造
-
-```json
-{
-  "card_id": "card-042",
-  "column": "backlog",
-  "assigned_to": "Kai",
-  "priority": "high",
-  "task": "タスク内容",
-  "skills_required": ["ops", "bash"],
-  "tool": "Bash(oci db ...)",
-  "blocked_by": ["card-038"]
-}
-```
-
-カラム遷移:
-```
-Backlog → In Progress → Awaiting Approval → Done
-```
+- リポジトリ: `tyz-works/taskvia` / WebUI: `taskvia.vercel.app`
+- 承認チャネル（`CREWVIA_APPROVAL_CHANNEL`）: `taskvia`（デフォルト）/ `ntfy` / `both`
+- 承認フロー実装: `hooks/pre-tool-use.sh`, `hooks/lib_approval_channel.sh`
+- ナレッジログ投稿: `hooks/post-tool-use.sh`（type: `knowledge` / `improvement` / `work`）
+- Verification Push: `scripts/taskvia-verification-sync.sh`（運用詳細は `knowledge/review.md`）
 
 ---
 
@@ -171,12 +38,12 @@ Backlog → In Progress → Awaiting Approval → Done
 /
   config/
     worker-names.yaml   名前プール・カスタマイズ設定
-    skills.yaml         スキルタグ定義
+    crewvia.yaml        システム設定（承認チャネル・WIP制限等）
   hooks/
     pre-tool-use.sh     PreToolUse hook（Taskvia承認）
     post-tool-use.sh    PostToolUse hook（ログ投稿）
   agents/
-    director.md     Directorのシステムプロンプト
+    director.md         Directorのシステムプロンプト
     worker.md           Workerのシステムプロンプト
   scripts/
     start.sh            マルチエージェント起動スクリプト
@@ -208,74 +75,12 @@ Backlog → In Progress → Awaiting Approval → Done
 | `TASK_TITLE` | 現在担当中のタスクタイトル |
 | `TASK_ID` | 現在担当中のカードID |
 | `CREWVIA_APPROVAL_CHANNEL` | 承認通知チャネル: `taskvia` / `ntfy` / `both`（config `approval_channel.mode` より優先） |
-| `NTFY_URL` | ntfy サーバーの URL（例: `https://ntfy.elni.net`）。`approval_channel.ntfy.url` より優先 |
-| `NTFY_TOPIC` | ntfy 通知トピック名。`taskvia-approval-` プレフィックス推奨。**必須** — 空のまま運用すると通知が silent skip される |
+| `NTFY_URL` | ntfy サーバーの URL。`approval_channel.ntfy.url` より優先 |
+| `NTFY_TOPIC` | ntfy 通知トピック名。**必須** — 空のまま運用すると通知が silent skip される |
 | `NTFY_USER` | ntfy Basic 認証ユーザー名。`auth-default-access: deny-all` サーバーでは必須 |
-| `NTFY_PASS` | ntfy Basic 認証パスワード。上記同様に必須 |
-| `APPROVAL_TOKEN_TTL_SECONDS` | ntfy アクションボタン用ワンタイムトークンの有効期限（秒）。デフォルト: 900 |
-| `CREWVIA_VERIFICATION_UI` | Taskvia 側の verification UI 表示制御。`disabled` でバッジ・タブを非表示。**Taskvia 側** の env に設定（crewvia 側ではなく Taskvia の Vercel env に追加）。 |
-
----
-
-## Verification Push 運用ガイド
-
-crewvia QA レイヤーが verification 結果を Taskvia に push する際のフロー。
-
-### 基本フロー
-
-```
-plan.sh verify-result <task_id> <verdict> [rework_count]
-    ↓
-scripts/taskvia-verification-sync.sh
-    ↓
-POST $TASKVIA_URL/api/verification   (Bearer $TASKVIA_TOKEN)
-    ↓
-Taskvia Board: バッジ更新 (5s polling で自動反映)
-```
-
-### 前提条件: approval card との連携（重要）
-
-Taskvia Board にカードを表示するには、**先に** `POST /api/request` で approval card が作成されている必要があります。
-`POST /api/verification` だけ投入してもバッジは表示されません。
-
-```bash
-# 1. approval card 作成（task 実行開始時に crewvia hooks が自動実行）
-POST /api/request  →  { id: "<card_id>" }
-
-# 2. verification 結果 push（QA 完了後）
-POST /api/verification  {
-  "task_id": "<task_id>",
-  "mission_slug": "<slug>",
-  "verdict": "pass" | "fail",
-  "rework_count": 0,
-  "mode": "standard",
-  "verifier": "<agent_name>"
-}
-```
-
-### `TASKVIA_TOKEN` 未設定時 / `CREWVIA_TASKVIA=disabled` 時
-
-`taskvia-verification-sync.sh` は `TASKVIA_TOKEN` が未設定、または `CREWVIA_TASKVIA=disabled` の場合に **no-op** で終了します。CI やスタンドアロン環境では verification push をスキップして構いません。
-
-### TTL 管理
-
-- `verification:{task_id}`: TTL 7 日 (604800s)
-- `verification:index:{slug}`: TTL なし（lazy cleanup）
-- `approval:{id}`: TTL 600 秒 — verification push は approval card 作成後 **5 分以内**に実施すること
-
-### Worf テスト改善メモ（次回 Phase C 系実装時に対応）
-
-Worf 統合テスト 3-b / 4-d で「不存在 task_id への GET が 404 でなく 200+null/[] を返す」仕様乖離が確認済み。
-現実装では 200+null/[] を返す設計（Admiral option A で採用）。次回 verification API を拡張する際に Worf が expectation を更新すること。
-
----
-
-## 今後の拡張余地
-
-- [ ] Planner ロール（mission spec → タスク分解の自動化）。skill タグ `planning` を予約済み。
-- [ ] `plan.sh status` の JSON 出力サポート（WIP 計測の grep を置き換える）
-- [ ] task frontmatter にブランチ名を持たせて Worker に伝達
-- [ ] mission 間の優先度設定（現状は default_mission 優先のみ）
+| `NTFY_PASS` | ntfy Basic 認証パスワード |
+| `APPROVAL_TOKEN_TTL_SECONDS` | ntfy ワンタイムトークンの有効期限（秒）。デフォルト: 900 |
+| `CREWVIA_VERIFICATION_UI` | Taskvia 側の verification UI 表示制御。**Taskvia の Vercel env に設定** |
 
 ---
 
@@ -288,86 +93,9 @@ Worf 統合テスト 3-b / 4-d で「不存在 task_id への GET が 404 でな
 
 ---
 
-## 自律改善システム
+## 今後の拡張余地
 
-Workerが改善案を発見したとき、自律的にフィードバックループを回す仕組み。
-
-### 改善案の分類
-
-Workerは改善案を発見したら以下の基準で自己判断する：
-
-```
-自律実行OK（承認不要）    → Directorに提案 → Backlogに自動追加
-要確認（リスクあり）      → improvementとしてログ投稿 → ユーザーに確認
-```
-
-### 自律実行してよい改善の範囲
-
-`config/autonomous-improvement.yaml` で設定する（ユーザーが自由に編集可能）。
-
-**デフォルトでOKな改善:**
-- ドキュメント・コメントの更新
-- スクリプトのリファクタリング（動作変更なし）
-- ログ・コメントの追加
-- テストの追加
-
-**デフォルトで要確認な改善:**
-- 外部サービスへの変更
-- 設定ファイルの変更
-- 削除操作
-- 新規ファイルの作成
-- パッケージ・依存関係の変更
-
-### フロー
-
-```
-Worker が改善案を発見
-   ↓
-autonomous-improvement.yaml の基準で自己判断
-   ↓
-自律実行OK → Directorに「改善提案: xxx」を報告
-             Directorがカードを作成してBacklogに積む
-             優先度低めで自動実行
-   ↓
-要確認     → type: "improvement" でTaskviaにログ投稿
-             Obsidianにも蓄積される
-             ユーザーが確認して明示的に依頼した場合のみ実行
-```
-
-### autonomous-improvement.yaml（設定ファイル）
-
-```yaml
-# 自律改善の設定
-# ユーザーが自由に編集できる
-
-autonomous:
-  # 承認なしで自律実行してよい改善の種類
-  allowed:
-    - docs          # ドキュメント更新
-    - refactor      # リファクタリング（動作変更なし）
-    - comment       # コメント・ログ追加
-    - test          # テスト追加
-
-  # 必ずユーザー確認が必要な改善
-  requires_approval:
-    - external      # 外部サービスへの変更
-    - config        # 設定ファイルの変更
-    - delete        # 削除操作
-    - dependency    # パッケージ・依存関係の変更
-    - new_file      # 新規ファイル作成
-
-  # 自律改善の1日あたり最大実行数（暴走防止）
-  max_per_day: 5
-```
-
-### Workerのシステムプロンプトへの組み込み
-
-Workerは以下の判断フローを持つ：
-
-1. タスク実行中に改善案を発見
-2. `autonomous-improvement.yaml` のallowedリストと照合
-3. OK → Directorに「改善提案」として報告（自分でタスク化しない）
-4. NG → `type: improvement` でTaskvia `/api/log` に投稿して終了
-5. DirectorがBacklogに積むかどうかを判断する
-
-※ Workerが自分でBacklogにカードを追加しないこと。必ずDirectorを経由する。
+- [ ] Planner ロール（mission spec → タスク分解の自動化）。skill タグ `planning` を予約済み。
+- [ ] `plan.sh status` の JSON 出力サポート（WIP 計測の grep を置き換える）
+- [ ] task frontmatter にブランチ名を持たせて Worker に伝達
+- [ ] mission 間の優先度設定（現状は default_mission 優先のみ）

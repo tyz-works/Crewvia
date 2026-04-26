@@ -63,13 +63,25 @@ else
 fi
 
 # Claude Code PreToolUse hook の permission 決定を stdout に出力する
+_DECISION_EMITTED=false
 emit_decision() {
+  _DECISION_EMITTED=true
   local decision="$1" reason="$2"
   jq -nc \
     --arg d "$decision" \
     --arg r "$reason" \
     '{hookSpecificOutput: {hookEventName: "PreToolUse", permissionDecision: $d, permissionDecisionReason: $r}}'
 }
+
+# set -e で hook がクラッシュした場合、decision 未発行なら deny を発行する安全弁
+# これにより Claude Code が native TUI プロンプトにフォールバックするのを防ぐ
+_crash_guard() {
+  if ! $_DECISION_EMITTED; then
+    echo "[pre-tool-use] ⚠️ crash guard: hook exited without decision" >&2
+    jq -nc '{hookSpecificOutput: {hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: "Hook crashed without emitting decision"}}' 2>/dev/null || true
+  fi
+}
+trap '_crash_guard' EXIT
 
 # env に TASK_ID がなければ assignments ファイルから補完する
 _TASK_FILE=""
@@ -91,9 +103,10 @@ INPUT="$(cat)"
 TOOL_NAME="$(echo "$INPUT" | jq -r '.tool_name // "unknown"')"
 TOOL_INPUT="$(echo "$INPUT" | jq -c '.tool_input // {}' 2>/dev/null || echo '{}')"
 
-# 読み取り・メタ系ツールは即通過
+# 読み取り・メタ系ツールは即通過（明示的 allow で crash guard を抑制）
 for _safe in "${SAFE_TOOLS[@]}"; do
   if [ "$TOOL_NAME" = "$_safe" ]; then
+    emit_decision "allow" "Safe tool: ${TOOL_NAME}"
     exit 0
   fi
 done
@@ -171,6 +184,8 @@ if [ "${CREWVIA_TASKVIA:-}" = "disabled" ] || [ -z "$TASKVIA_TOKEN" ]; then
     emit_decision "deny" "Skill deny (urgent): Taskvia unavailable for exception approval"
     exit 0
   fi
+  # Taskvia 無効時は native permission にフォールバック（crash guard 抑制）
+  _DECISION_EMITTED=true
   exit 0
 fi
 
@@ -196,14 +211,17 @@ PAYLOAD="$(jq -nc \
   --arg proj   "${CREWVIA_PROJECT:-crewvia}" \
   --argjson exc "${_SKILL_EXCEPTION}" \
   --argjson notify "${_NOTIFY_FLAG}" \
-  '{tool: $tool, agent: $agent, task_title: $title, task_id: ($tid | if . == "" then null else . end), priority: $prio, project: $proj, exception: $exc, notify: $notify}')"
+  '{tool: $tool, agent: $agent, task_title: $title, task_id: ($tid | if . == "" then null else . end), priority: $prio, project: $proj, exception: $exc, notify: $notify}' 2>/dev/null)" || {
+  emit_decision "deny" "Taskvia payload construction failed"
+  exit 0
+}
 
 RESPONSE="$(curl -sf --connect-timeout 5 --max-time 10 -X POST "${TASKVIA_URL}/api/request" \
   -H "Content-Type: application/json" \
   -H "$AUTH_HEADER" \
-  -d "$PAYLOAD")"
+  -d "$PAYLOAD" 2>/dev/null)" || RESPONSE=""
 
-CARD_ID="$(echo "$RESPONSE" | jq -r '.id')"
+CARD_ID="$(echo "$RESPONSE" | jq -r '.id' 2>/dev/null)" || CARD_ID=""
 
 if [ -z "$CARD_ID" ] || [ "$CARD_ID" = "null" ]; then
   echo "[taskvia] リクエスト投入失敗。デフォルト拒否。" >&2

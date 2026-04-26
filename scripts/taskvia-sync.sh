@@ -281,6 +281,23 @@ for slug, mission_meta, _ in records:
     else:
         print(f"[taskvia-sync] WARNING: ミッション {slug} の登録失敗。スキップ。", file=sys.stderr)
 
+# ---------- done タスク ID を収集（blocked 判定用） ----------
+done_ids = set()
+for slug, mission_meta, task in records:
+    if task.get('status') in ('done', 'verified', 'skipped'):
+        tid = task.get('id', '')
+        if tid:
+            done_ids.add(f"{slug}:{tid}")
+
+
+def taskvia_status(status, blocked_by, slug):
+    """crewvia status → Taskvia status に変換。pending + 未解決 blocked_by → blocked"""
+    if status == 'pending' and blocked_by:
+        if any(f"{slug}:{dep}" not in done_ids for dep in blocked_by):
+            return 'blocked'
+    return status
+
+
 # ---------- タスク登録・更新 ----------
 for slug, mission_meta, task in records:
     task_id = task.get('id', '')
@@ -289,11 +306,12 @@ for slug, mission_meta, task in records:
 
     map_key = f"{slug}:{task_id}"
     title = task.get('title', task_id)
-    status = task.get('status', 'pending')
+    raw_status = task.get('status', 'pending')
     priority = task.get('priority', 'medium')
     agent = task.get('worker') or 'director'
     skills = task.get('skills') or []
     blocked_by = task.get('blocked_by') or []
+    status = taskvia_status(raw_status, blocked_by, slug)
 
     if map_key not in task_map:
         payload = {

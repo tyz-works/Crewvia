@@ -43,8 +43,8 @@ workers:
     last_active: 2026-04-21
   - name: Seo
     skills: [review]
-    task_count: 19
-    last_active: 2026-04-22
+    task_count: 20
+    last_active: 2026-04-26
   - name: Jiwon
     skills: [docs, research]
     task_count: 2
@@ -65,3 +65,9 @@ workers:
     skills: [code, docs]
     task_count: 1
     last_active: 2026-04-21
+  - name: Arjun
+    skills: [qa]
+    task_count: 0
+    last_active: 2026-04-26
+    task_count: 0
+    last_active: 2026-04-26

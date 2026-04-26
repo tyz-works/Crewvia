@@ -252,6 +252,7 @@ Dispatcher から通知を受け取る:
 | `cloud` | クラウド（AWS / OCI） |
 | `docs` | ドキュメント作成 |
 | `review` | コードレビュー・PR承認 |
+| `qa` | QA・動作検証（実装者とは別Workerが担当） |
 
 ---
 

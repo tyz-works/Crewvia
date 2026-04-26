@@ -192,9 +192,10 @@ PAYLOAD="$(jq -nc \
   --arg title  "${TASK_TITLE:-Untitled}" \
   --arg tid    "${TASK_ID:-}" \
   --arg prio   "$PRIORITY" \
+  --arg proj   "${CREWVIA_PROJECT:-crewvia}" \
   --argjson exc "${_SKILL_EXCEPTION}" \
   --argjson notify "${_NOTIFY_FLAG}" \
-  '{tool: $tool, agent: $agent, task_title: $title, task_id: ($tid | if . == "" then null else . end), priority: $prio, exception: $exc, notify: $notify}')"
+  '{tool: $tool, agent: $agent, task_title: $title, task_id: ($tid | if . == "" then null else . end), priority: $prio, project: $proj, exception: $exc, notify: $notify}')"
 
 RESPONSE="$(curl -sf --connect-timeout 5 --max-time 10 -X POST "${TASKVIA_URL}/api/request" \
   -H "Content-Type: application/json" \

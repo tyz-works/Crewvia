@@ -77,6 +77,7 @@ Crewvia uses the following environment variables. Add them to your shell profile
 | `AGENT_NAME` | Set by `start.sh` | Name assigned to this agent instance |
 | `TASK_TITLE` | Set at runtime | Human-readable title of the current task card |
 | `TASK_ID` | Set at runtime | Card ID of the current task (e.g., `card-042`) |
+| `CREWVIA_PROJECT` | Optional | Project identifier sent to Taskvia for multi-project filtering (default: `crewvia`) |
 | `CREWVIA_APPROVAL_CHANNEL` | Optional | Approval notification channel: `taskvia` (default) / `ntfy` / `both` |
 | `NTFY_URL` | Required for ntfy | ntfy server base URL (e.g., `https://ntfy.elni.net`) |
 | `NTFY_TOPIC` | Required for ntfy | ntfy topic name. Use `taskvia-approval-` prefix for ACL compatibility |

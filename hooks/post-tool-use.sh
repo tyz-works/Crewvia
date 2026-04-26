@@ -70,7 +70,8 @@ PAYLOAD="$(jq -nc \
   --arg title   "${TASK_TITLE:-}" \
   --arg tid     "${TASK_ID:-}" \
   --arg agent   "$AGENT_NAME" \
-  '{type: $type, content: $content, task_title: $title, task_id: ($tid | if . == "" then null else . end), agent: $agent}')"
+  --arg proj    "${CREWVIA_PROJECT:-crewvia}" \
+  '{type: $type, content: $content, task_title: $title, task_id: ($tid | if . == "" then null else . end), agent: $agent, project: $proj}')"
 
 # curl 失敗でもエージェントを止めないため exit 0 で終了
 curl -sf -X POST "${TASKVIA_URL}/api/log" \

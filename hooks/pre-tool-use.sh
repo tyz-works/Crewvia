@@ -14,6 +14,7 @@
 #   TASK_TITLE                — 現在のタスク名 (任意)
 #   TASK_ID                   — 現在のタスクID (任意)
 #   APPROVAL_TIMEOUT          — 承認ポーリング上限秒数 (default: 600)
+#   CREWVIA_PROJECT           — Taskvia に送るプロジェクト識別子 (default: crewvia)
 #   CREWVIA_APPROVAL_CHANNEL  — 承認チャネル: taskvia|ntfy|both (default: taskvia)
 #   NTFY_URL / NTFY_TOPIC     — ntfy サーバー設定（mode=ntfy|both 時に必要）
 #   NTFY_USER / NTFY_PASS     — ntfy Basic 認証（任意）

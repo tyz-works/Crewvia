@@ -74,6 +74,7 @@
 | `AGENT_NAME` | 起動時に設定されるエージェント名 |
 | `TASK_TITLE` | 現在担当中のタスクタイトル |
 | `TASK_ID` | 現在担当中のカードID |
+| `CREWVIA_PROJECT` | Taskvia に送るプロジェクト識別子。デフォルト: `crewvia` |
 | `CREWVIA_APPROVAL_CHANNEL` | 承認通知チャネル: `taskvia` / `ntfy` / `both`（config `approval_channel.mode` より優先） |
 | `NTFY_URL` | ntfy サーバーの URL。`approval_channel.ntfy.url` より優先 |
 | `NTFY_TOPIC` | ntfy 通知トピック名。**必須** — 空のまま運用すると通知が silent skip される |

@@ -114,8 +114,11 @@ done
 # tool_input から簡易サマリーを作成
 TOOL_SUMMARY="${TOOL_NAME}"
 COMMAND="$(echo "$TOOL_INPUT" | jq -r '.command // empty' 2>/dev/null || true)"
+FILE_PATH="$(echo "$TOOL_INPUT" | jq -r '.file_path // empty' 2>/dev/null || true)"
 if [ -n "$COMMAND" ]; then
   TOOL_SUMMARY="${TOOL_NAME}($(echo "$COMMAND" | head -c 80))"
+elif [ -n "$FILE_PATH" ]; then
+  TOOL_SUMMARY="${TOOL_NAME}(${FILE_PATH})"
 fi
 
 # --- Skill-based permission check ---

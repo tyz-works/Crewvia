@@ -640,15 +640,17 @@ def taskvia_sync_init(slug, title):
 
 
 def taskvia_sync_add(slug, task_id, title, skills, priority, blocked_by):
+    status = 'blocked' if blocked_by else 'pending'
     resp = _taskvia_request('POST', f'/api/missions/{slug}/tasks', {
         'id': task_id,
         'title': title,
+        'status': status,
         'skills': skills,
         'priority': priority,
         'blocked_by': blocked_by,
     })
     if resp is not None:
-        _taskvia_map_update(slug, task_id, 'pending')
+        _taskvia_map_update(slug, task_id, status)
     return resp is not None
 
 
@@ -669,7 +671,28 @@ def taskvia_sync_done(slug, task_id, result):
     })
     if resp is not None:
         _taskvia_map_update_status(slug, task_id, 'done')
+    _taskvia_unblock_dependents(slug, task_id)
     return resp is not None
+
+
+def _taskvia_unblock_dependents(slug, completed_task_id):
+    """completed_task_id の完了により blocked → pending に遷移すべきタスクを更新"""
+    tasks = list_tasks(slug)
+    done_ids = {m['id'] for (m, _) in tasks if m.get('status') in TERMINAL_STATUSES}
+    done_ids.add(completed_task_id)
+    for meta, _ in tasks:
+        if meta.get('status') != 'pending':
+            continue
+        bb = meta.get('blocked_by') or []
+        if not bb:
+            continue
+        if completed_task_id not in bb:
+            continue
+        if all(dep in done_ids for dep in bb):
+            _taskvia_request('PATCH', f'/api/missions/{slug}/tasks/{meta["id"]}', {
+                'status': 'pending',
+            })
+            _taskvia_map_update_status(slug, meta['id'], 'pending')
 
 
 def taskvia_sync_archive(slug):

@@ -66,7 +66,7 @@ taskvia_url: https://taskvia.vercel.app
 #
 # 環境変数での上書き: CREWVIA_APPROVAL_CHANNEL=taskvia|ntfy|both
 approval_channel:
-  mode: both
+  mode: taskvia
 
   ntfy:
     # ntfy サーバーの URL（例: https://ntfy.sh または自己ホスト）

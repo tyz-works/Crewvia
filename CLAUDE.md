@@ -16,7 +16,7 @@
 
 - **Director**（1名）: タスク分解・Worker割り当て・進捗管理。詳細は `agents/director.md`
 - **Worker**（複数）: タスク実行・改善提案。名前はスキルに紐づき歴代継承される。詳細は `agents/worker.md`
-- スキルタグ一覧: `agents/director.md` §5
+- スキルタグ一覧: `agents/director.md` §5（`qa` スキルは crewvia-qa skill で手順定義）
 - 名前プール・カスタマイズ: `config/worker-names.yaml`
 - 自律改善ルール: `config/autonomous-improvement.yaml`
 
@@ -96,7 +96,7 @@
 
 ## 今後の拡張余地
 
-- [ ] Planner ロール（mission spec → タスク分解の自動化）。skill タグ `planning` を予約済み。
+- [x] ~~Planner ロール~~ → `planning` スキルでプランレビュー Worker (Priya) として実装済み。crewvia-plan-review skill 参照。
 - [ ] `plan.sh status` の JSON 出力サポート（WIP 計測の grep を置き換える）
 - [ ] task frontmatter にブランチ名を持たせて Worker に伝達
 - [ ] mission 間の優先度設定（現状は default_mission 優先のみ）

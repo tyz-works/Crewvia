@@ -103,6 +103,17 @@ skills:
       - "Bash(gh api *)"
       - "Bash(gh-app-review *)"
       - "Bash(gh run *)"
+      - "Bash(git diff*)"
+      - "Bash(git log*)"
+      - "Bash(git show*)"
+      - "Bash(git fetch*)"
+      - "Bash(git branch*)"
+      - "Bash(git status*)"
+      - "Bash(git rev-parse*)"
+      - "Bash(npm test*)"
+      - "Bash(npm run lint*)"
+      - "Bash(npm run typecheck*)"
+      - "Bash(npm run build*)"
     deny:
       - "Edit"
       - "Write"
@@ -139,6 +150,25 @@ skills:
     deny:
       - "Bash(git push *)"
 
+  qa:
+    allow:
+      - "Bash(npm test*)"
+      - "Bash(npm run *)"
+      - "Bash(npx playwright*)"
+      - "Bash(pytest *)"
+      - "Bash(git diff*)"
+      - "Bash(git log*)"
+      - "Bash(git status*)"
+      - "Bash(git fetch*)"
+      - "Bash(git rev-parse*)"
+      - "Bash(gh pr *)"
+      - "Bash(curl -s *)"
+      - "Bash(kill *)"
+    deny:
+      - "Bash(git push*)"
+      - "Bash(git commit*)"
+      - "Bash(gh pr merge*)"
+
   verify:
     allow:
       - "Read(**)"
@@ -158,6 +188,19 @@ skills:
       - "Bash(git push*)"
       - "Bash(rm*)"
       - "Bash(mv*)"
+
+  planning:
+    allow:
+      - "Bash(*/plan.sh status*)"
+      - "Bash(*/plan.sh pull*)"
+      - "Bash(git log*)"
+      - "Bash(git diff*)"
+    deny:
+      - "Write(**)"
+      - "Edit(**)"
+      - "MultiEdit(**)"
+      - "Bash(git commit*)"
+      - "Bash(git push*)"
 
   plan_review:
     allow:

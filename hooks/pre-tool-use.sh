@@ -118,6 +118,73 @@ if [ -n "$COMMAND" ]; then
   TOOL_SUMMARY="${TOOL_NAME}($(echo "$COMMAND" | head -c 80))"
 fi
 
+# Bash コマンドの安全性判定
+if [ "$TOOL_NAME" = "Bash" ] && [ -n "$COMMAND" ]; then
+
+  # 壊滅的コマンド — 承認不可・即拒否（コマンド先頭のみマッチ）
+  _CATASTROPHIC_PREFIXES=(
+    "rm -rf /"
+    "rm -rf ~"
+    "rm -rf ."
+    "mkfs "
+    "mkfs."
+    "dd if="
+    ":(){ :|:& };:"
+  )
+  for _cat in "${_CATASTROPHIC_PREFIXES[@]}"; do
+    if [[ "$COMMAND" == ${_cat}* ]]; then
+      echo "[pre-tool-use] 🚫 catastrophic command blocked: ${COMMAND}" >&2
+      emit_decision "deny" "Catastrophic command blocked: ${_cat}"
+      exit 0
+    fi
+  done
+
+  _NEEDS_APPROVAL=false
+
+  # 機密ファイルパターン — コマンド文字列に含まれていたら承認必須
+  _SENSITIVE_PATTERNS=(.env .pem .key _rsa _ed25519 _dsa .secret credentials .ssh/ .aws/ .config/)
+  for _pat in "${_SENSITIVE_PATTERNS[@]}"; do
+    if [[ "$COMMAND" == *"$_pat"* ]]; then
+      _NEEDS_APPROVAL=true
+      break
+    fi
+  done
+
+  # 破壊的 / 外部影響コマンド — prefix マッチで承認必須
+  _DANGEROUS_COMMANDS=(
+    "git push"
+    "gh pr create"
+    "gh pr merge"
+    "gh pr close"
+    "rm "
+    "rm -"
+    "curl "
+    "wget "
+    "ssh "
+    "scp "
+    "rsync "
+    "docker "
+    "kubectl "
+    "terraform "
+    "sudo "
+    "chmod "
+    "chown "
+    "npm publish"
+    "npx "
+  )
+  for _dcmd in "${_DANGEROUS_COMMANDS[@]}"; do
+    if [[ "$COMMAND" == ${_dcmd}* ]]; then
+      _NEEDS_APPROVAL=true
+      break
+    fi
+  done
+
+  if ! $_NEEDS_APPROVAL; then
+    emit_decision "allow" "Non-destructive command"
+    exit 0
+  fi
+fi
+
 # --- Skill-based permission check ---
 _SKILL_PERMS_YAML="${_CREWVIA_REPO}/config/skill-permissions.yaml"
 _SKILL_PERMS_PY="${_CREWVIA_REPO}/hooks/lib_skill_perms.py"

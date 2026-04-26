@@ -161,10 +161,15 @@ Dispatcher から通知を受け取る:
   --priority medium \
   --blocked-by "t002"
 
+./scripts/plan.sh add "QA: 認証ミドルウェアの動作検証" \
+  --skills "qa" \
+  --priority medium \
+  --blocked-by "t002,t003"
+
 # 複数タスクに blocked_by する場合は CSV
 ./scripts/plan.sh add "最終統合レビュー" \
   --skills "review" \
-  --blocked-by "t001,t002,t003"
+  --blocked-by "t001,t002,t003,t004"
 
 # 別の mission にタスクを追加するときは --mission を明示
 ./scripts/plan.sh add "billing API スキーマ" \
@@ -194,6 +199,7 @@ Dispatcher から通知を受け取る:
 - 依存関係を明示する（`blocked_by`）
 - 必要なスキルタグを付与する
 - 優先度を設定する: `high` / `medium` / `low`
+- **成果物がある実装タスクには必ず QA タスクをセットで積む**（`--skills qa --blocked-by <実装タスク>`）。QA は実装者とは別の Worker が担当する
 
 ---
 

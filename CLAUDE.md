@@ -96,7 +96,7 @@
 
 ## 今後の拡張余地
 
-- [ ] Planner ロール（mission spec → タスク分解の自動化）。skill タグ `planning` を予約済み。
+- [x] ~~Planner ロール~~ → `planning` スキルでプランレビュー Worker (Priya) として実装済み。crewvia-plan-review skill 参照。
 - [ ] `plan.sh status` の JSON 出力サポート（WIP 計測の grep を置き換える）
 - [ ] task frontmatter にブランチ名を持たせて Worker に伝達
 - [ ] mission 間の優先度設定（現状は default_mission 優先のみ）

@@ -69,5 +69,7 @@ workers:
     skills: [qa]
     task_count: 0
     last_active: 2026-04-26
+  - name: Priya
+    skills: [planning]
     task_count: 0
     last_active: 2026-04-26

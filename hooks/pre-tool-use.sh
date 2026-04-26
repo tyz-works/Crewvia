@@ -118,7 +118,31 @@ if [ -n "$COMMAND" ]; then
   TOOL_SUMMARY="${TOOL_NAME}($(echo "$COMMAND" | head -c 80))"
 fi
 
-# Bash コマンドの安全性判定
+# --- Skill-based permission check ---
+_SKILL_PERMS_YAML="${_CREWVIA_REPO}/config/skill-permissions.yaml"
+_SKILL_PERMS_PY="${_CREWVIA_REPO}/hooks/lib_skill_perms.py"
+
+# ツール署名を構築（_global.deny と skill チェック両方で使う）
+if [ "$TOOL_NAME" = "Bash" ] && [ -n "$COMMAND" ]; then
+  _TOOL_SIG="Bash(${COMMAND})"
+else
+  _TOOL_SIG="${TOOL_NAME}"
+fi
+
+# _global.deny は全チェックに先行する絶対安全弁（何があってもバイパスされない）
+# 注意: CREWVIA_TASKVIA=disabled でも _global.deny は発動する（意図的な設計）
+if [ -f "$_SKILL_PERMS_YAML" ] && [ -f "$_SKILL_PERMS_PY" ]; then
+  _GLOBAL_RESULT="$(python3 "$_SKILL_PERMS_PY" "$_SKILL_PERMS_YAML" "__global_only__" "$_TOOL_SIG" 2>/dev/null || echo '{"decision":"none"}')"
+  _GLOBAL_DECISION="$(echo "$_GLOBAL_RESULT" | jq -r '.decision')"
+  if [ "$_GLOBAL_DECISION" = "deny" ]; then
+    _GLOBAL_SOURCE="$(echo "$_GLOBAL_RESULT" | jq -r '.source // "unknown"')"
+    echo "[skill-perms] ❌ global denied: ${_TOOL_SIG} (${_GLOBAL_SOURCE})" >&2
+    emit_decision "deny" "Global permission denied: ${_GLOBAL_SOURCE}"
+    exit 0
+  fi
+fi
+
+# Bash コマンドの安全性判定（_global.deny 通過後に評価）
 if [ "$TOOL_NAME" = "Bash" ] && [ -n "$COMMAND" ]; then
 
   # 壊滅的コマンド — 承認不可・即拒否（コマンド先頭のみマッチ）
@@ -153,11 +177,11 @@ if [ "$TOOL_NAME" = "Bash" ] && [ -n "$COMMAND" ]; then
   # 破壊的 / 外部影響コマンド — prefix マッチで承認必須
   _DANGEROUS_COMMANDS=(
     "git push"
+    "git reset --hard"
     "gh pr create"
     "gh pr merge"
     "gh pr close"
     "rm "
-    "rm -"
     "curl "
     "wget "
     "ssh "
@@ -170,7 +194,6 @@ if [ "$TOOL_NAME" = "Bash" ] && [ -n "$COMMAND" ]; then
     "chmod "
     "chown "
     "npm publish"
-    "npx "
   )
   for _dcmd in "${_DANGEROUS_COMMANDS[@]}"; do
     if [[ "$COMMAND" == ${_dcmd}* ]]; then
@@ -181,30 +204,6 @@ if [ "$TOOL_NAME" = "Bash" ] && [ -n "$COMMAND" ]; then
 
   if ! $_NEEDS_APPROVAL; then
     emit_decision "allow" "Non-destructive command"
-    exit 0
-  fi
-fi
-
-# --- Skill-based permission check ---
-_SKILL_PERMS_YAML="${_CREWVIA_REPO}/config/skill-permissions.yaml"
-_SKILL_PERMS_PY="${_CREWVIA_REPO}/hooks/lib_skill_perms.py"
-
-# ツール署名を構築（_global.deny と skill チェック両方で使う）
-if [ "$TOOL_NAME" = "Bash" ] && [ -n "$COMMAND" ]; then
-  _TOOL_SIG="Bash(${COMMAND})"
-else
-  _TOOL_SIG="${TOOL_NAME}"
-fi
-
-# _global.deny は SKILLS 有無・Taskvia 有効/無効に関係なく常にチェック（絶対安全弁）
-# 注意: CREWVIA_TASKVIA=disabled でも _global.deny は発動する（意図的な設計）
-if [ -f "$_SKILL_PERMS_YAML" ] && [ -f "$_SKILL_PERMS_PY" ]; then
-  _GLOBAL_RESULT="$(python3 "$_SKILL_PERMS_PY" "$_SKILL_PERMS_YAML" "__global_only__" "$_TOOL_SIG" 2>/dev/null || echo '{"decision":"none"}')"
-  _GLOBAL_DECISION="$(echo "$_GLOBAL_RESULT" | jq -r '.decision')"
-  if [ "$_GLOBAL_DECISION" = "deny" ]; then
-    _GLOBAL_SOURCE="$(echo "$_GLOBAL_RESULT" | jq -r '.source // "unknown"')"
-    echo "[skill-perms] ❌ global denied: ${_TOOL_SIG} (${_GLOBAL_SOURCE})" >&2
-    emit_decision "deny" "Global permission denied: ${_GLOBAL_SOURCE}"
     exit 0
   fi
 fi

@@ -78,6 +78,12 @@ ALL_DONE_STATE_FILE = REGISTRY_DIR / 'dispatcher_all_done.flag'
 PRIORITY_ORDER  = {'high': 0, 'medium': 1, 'low': 2}
 TERMINAL_STATUSES = {'done', 'skipped'}
 
+# Circuit breaker for Taskvia API calls
+TASKVIA_CB_FAILURES = 0
+TASKVIA_CB_THRESHOLD = 3        # consecutive failures to trip
+TASKVIA_CB_BACKOFF = 60         # seconds to wait after tripping
+TASKVIA_CB_LAST_TRIP = 0.0
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -381,11 +387,24 @@ def publish_agents():
     Workers: published only when registry/heartbeats/<name> mtime is within
     AGENT_PRESENCE_TTL (10 min) — i.e. the Worker has been seen recently.
     TASKVIA_TOKEN not set → silently skip (standalone mode).
+
+    Circuit breaker: after TASKVIA_CB_THRESHOLD consecutive failures, skip
+    publishing for TASKVIA_CB_BACKOFF seconds before retrying.
     """
+    global TASKVIA_CB_FAILURES, TASKVIA_CB_LAST_TRIP
+
     taskvia_url = os.environ.get('TASKVIA_URL', 'https://taskvia.vercel.app')
     taskvia_token = os.environ.get('TASKVIA_TOKEN', '')
     if os.environ.get('CREWVIA_TASKVIA') == 'disabled' or not taskvia_token:
         return
+
+    # Circuit breaker: skip if tripped and still in backoff
+    if TASKVIA_CB_FAILURES >= TASKVIA_CB_THRESHOLD:
+        elapsed = time.time() - TASKVIA_CB_LAST_TRIP
+        if elapsed < TASKVIA_CB_BACKOFF:
+            return
+        log(f"Taskvia circuit breaker: retrying after {TASKVIA_CB_BACKOFF}s backoff")
+        TASKVIA_CB_FAILURES = 0
 
     now = time.time()
     workers = load_workers()
@@ -458,6 +477,7 @@ def publish_agents():
         'Authorization': f'Bearer {taskvia_token}',
     }
 
+    any_failure = False
     for agent in agents_to_publish:
         payload = json.dumps(agent).encode('utf-8')
         try:
@@ -465,7 +485,19 @@ def publish_agents():
             with urllib.request.urlopen(req, timeout=5):
                 pass
         except Exception as e:
+            any_failure = True
             log(f"WARNING: /api/agents publish failed for {agent['name']}: {e}")
+            break  # stop sending remaining agents on first failure
+
+    if any_failure:
+        TASKVIA_CB_FAILURES += 1
+        if TASKVIA_CB_FAILURES >= TASKVIA_CB_THRESHOLD:
+            TASKVIA_CB_LAST_TRIP = time.time()
+            log(f"Taskvia circuit breaker TRIPPED after {TASKVIA_CB_FAILURES} consecutive failures. Backing off {TASKVIA_CB_BACKOFF}s.")
+    else:
+        if TASKVIA_CB_FAILURES > 0:
+            log("Taskvia circuit breaker reset (publish succeeded)")
+        TASKVIA_CB_FAILURES = 0
 
 
 def was_all_done_last_cycle():

@@ -27,7 +27,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 QUEUE_DIR="${CREWVIA_QUEUE:-${REPO_ROOT}/queue}"
 
 if [[ $# -eq 0 ]]; then
-  echo "Usage: plan.sh <init|add|pull|done|fail|ready-for-verification|verify-result|review|launch|lint|status|archive> [args...]" >&2
+  echo "Usage: plan.sh <init|add|pull|done|fail|ready-for-verification|verify-result|review|launch|lint|status|archive|dashboard|dashboard-data> [args...]" >&2
   exit 1
 fi
 
@@ -35,6 +35,202 @@ SUBCOMMAND="$1"
 shift
 
 mkdir -p "$QUEUE_DIR" "$QUEUE_DIR/missions" "$QUEUE_DIR/archive"
+
+# ─── dashboard TUI (fzf + gum) ───────────────────────────────────────────────
+
+_plan_dashboard() {
+  local show_all=""
+  for arg in "$@"; do [[ "$arg" == "--all" ]] && show_all="--all"; done
+
+  for dep in fzf gum jq; do
+    command -v "$dep" &>/dev/null \
+      || { echo "Error: '$dep' not installed. Run: brew install $dep" >&2; return 1; }
+  done
+
+  local self="$SCRIPT_DIR/plan.sh"
+  local tmpdata tmppreview_m tmppreview_t
+  tmpdata=$(mktemp /tmp/crewvia-dash-XXXX.json)
+  tmppreview_m=$(mktemp /tmp/crewvia-preview-m-XXXX.sh)
+  tmppreview_t=$(mktemp /tmp/crewvia-preview-t-XXXX.sh)
+  chmod +x "$tmppreview_m" "$tmppreview_t"
+  # shellcheck disable=SC2064
+  trap "rm -f '$tmpdata' '$tmppreview_m' '$tmppreview_t'" EXIT
+
+  cat > "$tmppreview_m" << 'PREVEOF'
+#!/bin/bash
+SLUG="$1"; DATA="$2"
+jq -r --arg s "$SLUG" '
+  (.missions + .archived) | map(select(.slug == $s)) | .[0] // {} |
+  "Tasks: \(.done // 0)/\(.total // 0)" + "\n" +
+  ((.tasks // []) |
+    if length == 0 then "  (no tasks)"
+    else [.[] |
+      "  " + (if .status == "done" then "[32m✅"
+         elif .status == "in_progress" then "[33m🔄"
+         elif .status == "blocked" then "[31m🚫"
+         else "[37m⏳" end) +
+      " \(.id) \(.title)[0m" +
+      (if .worker then " (\(.worker))" else "" end)
+    ] | join("\n")
+    end)
+' "$DATA"
+PREVEOF
+
+  cat > "$tmppreview_t" << 'PREVEOF'
+#!/bin/bash
+TASK_ID="$1"; SLUG="$2"; DATA="$3"
+jq -r --arg s "$SLUG" --arg t "$TASK_ID" '
+  (.missions + .archived) | map(select(.slug == $s)) | .[0].tasks // [] |
+  map(select(.id == $t)) | .[0] // {} |
+  "Status:    \(.status // "?")\n" +
+  "Worker:    \(.worker // "unassigned")\n" +
+  "Priority:  \(.priority // "?")\n" +
+  "Skills:    \((.skills // []) | join(", "))\n" +
+  (if ((.blocked_by // []) | length) > 0 then "Blocked:   \(.blocked_by | join(", "))\n" else "" end) +
+  "\n── Description ──\n" +
+  (.description // "(no description)")
+' "$DATA"
+PREVEOF
+
+  local refresh=1
+  while [[ "$refresh" -eq 1 ]]; do
+    refresh=0
+    "$self" dashboard-data $show_all 2>/dev/null > "$tmpdata" \
+      || { echo "Failed to load mission data." >&2; return 1; }
+
+    local lines
+    lines=$(jq -r '
+      (.missions + .archived) | .[] |
+      (if .archived then "[90m📦"
+       elif .status == "done" then "[32m✅"
+       elif .status == "in_progress" then "[33m🔄"
+       elif .status == "blocked" then "[31m🚫"
+       elif .status == "drafting" then "[36m📝"
+       else "[37m⏳" end) as $icon |
+      "\(.slug)\t\($icon) \(.title) [\(.done)/\(.total)][0m"
+    ' "$tmpdata")
+
+    if [[ -z "$lines" ]]; then
+      gum style --foreground 240 "No missions found."
+      return 0
+    fi
+
+    local result key slug
+    result=$(printf '%s\n' "$lines" | fzf \
+      --ansi \
+      --delimiter=$'\t' \
+      --with-nth='2..' \
+      --prompt='  Mission > ' \
+      --header=$'  Enter=Select  r=Refresh  q=Quit' \
+      --expect='r,q' \
+      --preview="$tmppreview_m {1} $tmpdata" \
+      --preview-window='right:50%:wrap' \
+      2>/dev/null) || return 0
+
+    key=$(printf '%s' "$result" | head -1)
+    slug=$(printf '%s' "$result" | tail -n +2 | cut -f1)
+
+    if [[ "$key" == "q" ]]; then return 0; fi
+    if [[ "$key" == "r" ]]; then refresh=1; continue; fi
+    [[ -z "$slug" ]] && continue
+
+    _dashboard_tasks "$self" "$slug" "$show_all" "$tmpdata" "$tmppreview_t"
+  done
+}
+
+_dashboard_tasks() {
+  local self="$1" slug="$2" show_all="$3" tmpdata="$4" tmppreview_t="$5"
+
+  while true; do
+    "$self" dashboard-data $show_all 2>/dev/null > "$tmpdata" || true
+
+    local lines
+    lines=$(jq -r --arg s "$slug" '
+      (.missions + .archived) | map(select(.slug == $s)) | .[0].tasks // [] | .[] |
+      (if .status == "done" then "[32m✅"
+       elif .status == "in_progress" then "[33m🔄"
+       elif .status == "blocked" then "[31m🚫"
+       else "[37m⏳" end) as $icon |
+      "\(.id)\t\($icon) \(.title)[0m" + (if .worker then " (\(.worker))" else "" end)
+    ' "$tmpdata")
+
+    if [[ -z "$lines" ]]; then
+      gum style --foreground 240 "No tasks in this mission."
+      sleep 1
+      return 0
+    fi
+
+    local result key task_id
+    result=$(printf '%s\n' "$lines" | fzf \
+      --ansi \
+      --delimiter=$'\t' \
+      --with-nth='2..' \
+      --prompt="  Task ($slug) > " \
+      --header=$'  Enter=Detail  r=Refresh  q/Esc=Back' \
+      --expect='r,q' \
+      --preview="$tmppreview_t {1} $slug $tmpdata" \
+      --preview-window='right:50%:wrap' \
+      2>/dev/null) || return 0
+
+    key=$(printf '%s' "$result" | head -1)
+    task_id=$(printf '%s' "$result" | tail -n +2 | cut -f1)
+
+    if [[ "$key" == "q" ]]; then return 0; fi
+    if [[ "$key" == "r" ]]; then continue; fi
+    [[ -z "$task_id" ]] && return 0
+
+    _dashboard_task_detail "$slug" "$task_id" "$tmpdata"
+  done
+}
+
+_dashboard_task_detail() {
+  local slug="$1" task_id="$2" tmpdata="$3"
+
+  local info
+  info=$(jq -c --arg s "$slug" --arg t "$task_id" '
+    (.missions + .archived) | map(select(.slug == $s)) | .[0].tasks // [] |
+    map(select(.id == $t)) | .[0] // {}
+  ' "$tmpdata")
+
+  local title status worker priority skills description color
+  title=$(jq -r '.title // "?"' <<< "$info")
+  status=$(jq -r '.status // "?"' <<< "$info")
+  worker=$(jq -r '.worker // "unassigned"' <<< "$info")
+  priority=$(jq -r '.priority // "?"' <<< "$info")
+  skills=$(jq -r '(.skills // []) | join(", ")' <<< "$info")
+  description=$(jq -r '.description // "(no description)"' <<< "$info")
+
+  case "$status" in
+    done)        color=2;;
+    in_progress) color=3;;
+    blocked)     color=1;;
+    *)           color=8;;
+  esac
+
+  clear
+  gum style \
+    --border rounded --border-foreground "$color" \
+    --padding "1 2" --width 72 \
+    "$(gum style --bold "$task_id: $title")" \
+    "" \
+    "Status:   $(gum style --foreground "$color" "$status")" \
+    "Worker:   $worker" \
+    "Priority: $priority" \
+    "Skills:   $skills" \
+    "" \
+    "$(gum style --bold 'Description')" \
+    "$description"
+
+  echo ""
+  read -rp "  [Press Enter to go back] " < /dev/tty || true
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+if [[ "$SUBCOMMAND" == "dashboard" ]]; then
+  _plan_dashboard "$@"
+  exit $?
+fi
 
 # Delegate to Python3
 python3 - "$QUEUE_DIR" "$SUBCOMMAND" "$@" <<'PYEOF'
@@ -1894,6 +2090,71 @@ def cmd_resync(args):
 
 
 # ---------------------------------------------------------------------------
+# Dashboard data
+# ---------------------------------------------------------------------------
+
+def _mission_data(slug, archived=False):
+    base = os.path.join(ARCHIVE_DIR, slug) if archived else mission_dir(slug)
+    mission_path = os.path.join(base, 'mission.yaml')
+    try:
+        with open(mission_path) as f:
+            mission = parse_yaml(f.read(), source=mission_path)
+    except (FileNotFoundError, ValueError):
+        mission = {}
+
+    tasks_list = list_tasks(slug, base_dir=os.path.join(base, 'tasks'))
+    done = sum(1 for (m, _) in tasks_list if m.get('status') == 'done')
+
+    task_data = []
+    for meta, body in tasks_list:
+        description, _ = parse_task_body(body)
+        task_data.append({
+            'id': meta.get('id', '?'),
+            'title': meta.get('title', '?'),
+            'status': meta.get('status', 'pending'),
+            'skills': meta.get('skills') or [],
+            'worker': meta.get('worker'),
+            'priority': meta.get('priority', 'medium'),
+            'blocked_by': meta.get('blocked_by') or [],
+            'description': description,
+        })
+
+    return {
+        'slug': slug,
+        'title': mission.get('title', '(unnamed)'),
+        'status': mission.get('status', 'unknown'),
+        'done': done,
+        'total': len(tasks_list),
+        'archived': archived,
+        'tasks': task_data,
+    }
+
+
+def cmd_dashboard_data(args):
+    """Output JSON with missions and tasks for the dashboard TUI.
+
+    Usage: plan.sh dashboard-data [--all]
+    """
+    opts, _ = parse_opts(args, {'--all': 'bool'})
+    state = load_state()
+
+    missions = [
+        _mission_data(slug)
+        for slug in (state.get('active_missions') or [])
+        if os.path.exists(mission_dir(slug))
+    ]
+
+    archived = []
+    if opts.get('--all') and os.path.exists(ARCHIVE_DIR):
+        for entry in sorted(os.listdir(ARCHIVE_DIR)):
+            full = os.path.join(ARCHIVE_DIR, entry)
+            if os.path.isdir(full) and os.path.exists(os.path.join(full, 'mission.yaml')):
+                archived.append(_mission_data(entry, archived=True))
+
+    print(json.dumps({'missions': missions, 'archived': archived}, ensure_ascii=False, indent=2))
+
+
+# ---------------------------------------------------------------------------
 # Dispatch
 # ---------------------------------------------------------------------------
 
@@ -1911,6 +2172,7 @@ dispatch = {
     'status': cmd_status,
     'archive': cmd_archive,
     'resync': cmd_resync,
+    'dashboard-data': cmd_dashboard_data,
 }
 
 if SUBCOMMAND not in dispatch:

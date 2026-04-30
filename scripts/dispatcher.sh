@@ -78,6 +78,17 @@ ALL_DONE_STATE_FILE = REGISTRY_DIR / 'dispatcher_all_done.flag'
 PRIORITY_ORDER  = {'high': 0, 'medium': 1, 'low': 2}
 TERMINAL_STATUSES = {'done', 'skipped'}
 
+# Circuit breaker for Taskvia API calls
+TASKVIA_CB_FAILURES = 0
+TASKVIA_CB_THRESHOLD = 3        # consecutive failures to trip
+TASKVIA_CB_BACKOFF = 60         # seconds to wait after tripping
+TASKVIA_CB_LAST_TRIP = 0.0
+
+# Agent publish throttle: only publish heartbeats every PUBLISH_INTERVAL seconds
+PUBLISH_INTERVAL = 60
+LAST_PUBLISH_TIME = 0.0
+LAST_PUBLISHED_AGENTS = set()   # names published in the last cycle
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -375,21 +386,32 @@ AGENT_PRESENCE_TTL = 600  # 10 minutes — heartbeat files older than this are i
 
 
 def publish_agents():
-    """Publish active agents to Taskvia /api/agents every dispatch cycle.
+    """Publish active agents to Taskvia /api/agents.
 
-    Director: always published (from registry role=director).
-    Workers: published only when registry/heartbeats/<name> mtime is within
-    AGENT_PRESENCE_TTL (10 min) — i.e. the Worker has been seen recently.
-    TASKVIA_TOKEN not set → silently skip (standalone mode).
+    Heartbeat publish: every PUBLISH_INTERVAL (60s), POST all active agents.
+    Departure publish: immediately DELETE agents that disappeared since last cycle.
+
+    Circuit breaker: after TASKVIA_CB_THRESHOLD consecutive failures, skip
+    for TASKVIA_CB_BACKOFF seconds before retrying.
     """
+    global TASKVIA_CB_FAILURES, TASKVIA_CB_LAST_TRIP
+    global LAST_PUBLISH_TIME, LAST_PUBLISHED_AGENTS
+
     taskvia_url = os.environ.get('TASKVIA_URL', 'https://taskvia.vercel.app')
     taskvia_token = os.environ.get('TASKVIA_TOKEN', '')
     if os.environ.get('CREWVIA_TASKVIA') == 'disabled' or not taskvia_token:
         return
 
+    # Circuit breaker: skip if tripped and still in backoff
+    if TASKVIA_CB_FAILURES >= TASKVIA_CB_THRESHOLD:
+        elapsed = time.time() - TASKVIA_CB_LAST_TRIP
+        if elapsed < TASKVIA_CB_BACKOFF:
+            return
+        log(f"Taskvia circuit breaker: retrying after {TASKVIA_CB_BACKOFF}s backoff")
+        TASKVIA_CB_FAILURES = 0
+
     now = time.time()
     workers = load_workers()
-    agents_to_publish = []
 
     # Collect heartbeat mtimes for all agents
     heartbeats_dir = REGISTRY_DIR / 'heartbeats'
@@ -402,37 +424,34 @@ def publish_agents():
                 except OSError:
                     pass
 
+    # Build current active agent set
+    agents_to_publish = []
+    current_agent_names = set()
+
     for name, info in workers.items():
         role = info.get('role', 'worker')
         skills = info.get('skills') or []
 
         if role == 'director':
-            # Director is always published regardless of heartbeat TTL.
-            # Use heartbeat mtime for last_seen if available, else current time.
             mtime = hb_mtimes.get(name, now)
             last_seen = datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat()
             agents_to_publish.append({
-                'name': name,
-                'role': role,
-                'skills': skills,
-                'current_task_id': None,
-                'current_task_title': None,
+                'name': name, 'role': role, 'skills': skills,
+                'current_task_id': None, 'current_task_title': None,
                 'last_seen': last_seen,
             })
+            current_agent_names.add(name)
         else:
-            # Workers must have a fresh heartbeat file.
             mtime = hb_mtimes.get(name)
             if mtime is None or now - mtime > AGENT_PRESENCE_TTL:
                 continue
 
-            # Resolve current task from assignments file.
             task_id = None
             task_title = None
             assignment_file = ASSIGNMENTS_DIR / name
             if assignment_file.exists():
                 try:
                     assignment = assignment_file.read_text().strip()
-                    # Format: "mission_slug:task_id"
                     if ':' in assignment:
                         mission_slug, task_id = assignment.split(':', 1)
                         task_file = MISSIONS_DIR / mission_slug / 'tasks' / f'{task_id}.md'
@@ -444,13 +463,11 @@ def publish_agents():
 
             last_seen = datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat()
             agents_to_publish.append({
-                'name': name,
-                'role': role,
-                'skills': skills,
-                'current_task_id': task_id,
-                'current_task_title': task_title,
+                'name': name, 'role': role, 'skills': skills,
+                'current_task_id': task_id, 'current_task_title': task_title,
                 'last_seen': last_seen,
             })
+            current_agent_names.add(name)
 
     endpoint = f'{taskvia_url}/api/agents'
     headers = {
@@ -458,14 +475,48 @@ def publish_agents():
         'Authorization': f'Bearer {taskvia_token}',
     }
 
-    for agent in agents_to_publish:
-        payload = json.dumps(agent).encode('utf-8')
+    any_failure = False
+
+    # Immediate DELETE for departed agents
+    departed = LAST_PUBLISHED_AGENTS - current_agent_names
+    for name in departed:
+        payload = json.dumps({'name': name}).encode('utf-8')
         try:
-            req = urllib.request.Request(endpoint, data=payload, headers=headers, method='POST')
+            req = urllib.request.Request(endpoint, data=payload, headers=headers, method='DELETE')
             with urllib.request.urlopen(req, timeout=5):
                 pass
+            log(f"Agent departed: {name} (deleted from Taskvia)")
         except Exception as e:
-            log(f"WARNING: /api/agents publish failed for {agent['name']}: {e}")
+            any_failure = True
+            log(f"WARNING: /api/agents DELETE failed for {name}: {e}")
+            break
+
+    # Throttled heartbeat POST (every PUBLISH_INTERVAL)
+    if not any_failure and now - LAST_PUBLISH_TIME >= PUBLISH_INTERVAL:
+        for agent in agents_to_publish:
+            payload = json.dumps(agent).encode('utf-8')
+            try:
+                req = urllib.request.Request(endpoint, data=payload, headers=headers, method='POST')
+                with urllib.request.urlopen(req, timeout=5):
+                    pass
+            except Exception as e:
+                any_failure = True
+                log(f"WARNING: /api/agents publish failed for {agent['name']}: {e}")
+                break
+        if not any_failure:
+            LAST_PUBLISH_TIME = now
+
+    # Update state and circuit breaker
+    if not any_failure:
+        LAST_PUBLISHED_AGENTS = current_agent_names
+        if TASKVIA_CB_FAILURES > 0:
+            log("Taskvia circuit breaker reset (publish succeeded)")
+        TASKVIA_CB_FAILURES = 0
+    else:
+        TASKVIA_CB_FAILURES += 1
+        if TASKVIA_CB_FAILURES >= TASKVIA_CB_THRESHOLD:
+            TASKVIA_CB_LAST_TRIP = time.time()
+            log(f"Taskvia circuit breaker TRIPPED after {TASKVIA_CB_FAILURES} consecutive failures. Backing off {TASKVIA_CB_BACKOFF}s.")
 
 
 def was_all_done_last_cycle():

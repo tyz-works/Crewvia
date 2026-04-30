@@ -44,6 +44,17 @@ SAFE_TOOLS=(
 TASKVIA_URL="${TASKVIA_URL:-https://taskvia.vercel.app}"
 TASKVIA_TOKEN="${TASKVIA_TOKEN:-}"
 AGENT_NAME="${AGENT_NAME:-$(hostname -s)}"
+
+# Director は承認不要 — registry で role: director を確認して即通過
+_CREWVIA_REPO_EARLY="${CREWVIA_REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+_REGISTRY="${_CREWVIA_REPO_EARLY}/registry/workers.yaml"
+if [ -f "$_REGISTRY" ] && grep -qA1 "name: ${AGENT_NAME}$" "$_REGISTRY" 2>/dev/null; then
+  _AGENT_ROLE="$(grep -A3 "name: ${AGENT_NAME}$" "$_REGISTRY" | grep 'role:' | awk '{print $2}' | head -1)"
+  if [ "$_AGENT_ROLE" = "director" ]; then
+    _DECISION_EMITTED=true
+    exit 0
+  fi
+fi
 TASK_TITLE="${TASK_TITLE:-}"
 TASK_ID="${TASK_ID:-}"
 # APPROVAL_TIMEOUT env var でポーリング上限を上書きできる（デフォルト: 600秒）

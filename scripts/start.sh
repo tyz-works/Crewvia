@@ -9,6 +9,18 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+# --- .env ファイルから環境変数を読み込む ---
+# 既存の env var は上書きしない（env > .env > config の優先順位を維持）
+if [[ -f "${REPO_ROOT}/.env" ]]; then
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    key="${line%%=*}"
+    if [[ -z "${!key:-}" ]]; then
+      export "$line"
+    fi
+  done < "${REPO_ROOT}/.env"
+fi
+
 # --- crewvia.yaml からシステム設定を読み込む ---
 # 環境変数が既に設定されていれば config より優先される。
 # 設定を追加する場合はここにロード処理を足す。

@@ -75,9 +75,25 @@ fi
 
 # Claude Code PreToolUse hook の permission 決定を stdout に出力する
 _DECISION_EMITTED=false
+_APPROVAL_LOG_DIR="${_CREWVIA_REPO}/registry/approvals"
+
 emit_decision() {
   _DECISION_EMITTED=true
   local decision="$1" reason="$2"
+
+  # ローカル承認ログ（safe tool の allow 以外を記録）
+  if [ "$decision" != "allow" ] || [[ "$reason" != "Safe tool:"* && "$reason" != "Non-destructive command" ]]; then
+    mkdir -p "$_APPROVAL_LOG_DIR"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+      "$AGENT_NAME" \
+      "${TASK_ID:-}" \
+      "$decision" \
+      "${TOOL_SUMMARY:-$TOOL_NAME}" \
+      "$reason" \
+      >> "${_APPROVAL_LOG_DIR}/approvals.tsv"
+  fi
+
   jq -nc \
     --arg d "$decision" \
     --arg r "$reason" \

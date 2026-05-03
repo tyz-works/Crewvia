@@ -18,7 +18,6 @@ export function isEligibleForDiscount(user: User, cart: Cart): boolean {
   return user.age >= 65 && cart.items.length > 5;
 }
 
-// BUG-5: sorts descending instead of ascending
 export function sortByAge(users: User[]): User[] {
-  return [...users].sort((a, b) => b.age - a.age);
+  return [...users].sort((a, b) => a.age - b.age);
 }

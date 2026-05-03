@@ -110,6 +110,19 @@ def bench_current_strategy() -> str:
     except OSError:
         return ''
 
+def bench_worker_restarting(agent_name: str) -> bool:
+    """Return True if benchmark-ctx.sh is mid-restart for this Worker (Strategy C).
+
+    benchmark-ctx.sh writes queue/assignments/<agent>.restarting before killing
+    the tmux window and removes it once the new Worker is running.  While the
+    flag is present the dispatcher must not try to assign a task — the Worker
+    window does not exist yet.
+    """
+    if not BENCH_MODE:
+        return False
+    flag = ASSIGNMENTS_DIR / f'{agent_name}.restarting'
+    return flag.exists()
+
 # Agent publish throttle: only publish heartbeats every PUBLISH_INTERVAL seconds
 PUBLISH_INTERVAL = 60
 LAST_PUBLISH_TIME = 0.0
@@ -672,6 +685,13 @@ def dispatch():
         # orchestrator and released once the strategy action is complete.
         if bench_gate_active(agent_name):
             log(f"[bench] gate active for {agent_name} — skipping assignment (strategy={bench_current_strategy()})")
+            continue
+
+        # Strategy C: skip assignment while the Worker window is being killed
+        # and re-launched.  The .restarting flag is written by benchmark-ctx.sh
+        # before tmux kill-window and removed after the new window is ready.
+        if bench_worker_restarting(agent_name):
+            log(f"[bench] {agent_name} is restarting (Strategy C) — skipping assignment")
             continue
 
         # Find best unblocked pending task with skill match

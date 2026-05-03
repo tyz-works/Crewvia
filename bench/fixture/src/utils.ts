@@ -14,9 +14,8 @@ export function getUserDisplayName(user: User): string {
   return user.name ? user.name.toUpperCase() : '';
 }
 
-// BUG-4: || should be && — any senior OR large cart qualifies (too permissive)
 export function isEligibleForDiscount(user: User, cart: Cart): boolean {
-  return user.age >= 65 || cart.items.length > 5;
+  return user.age >= 65 && cart.items.length > 5;
 }
 
 // BUG-5: sorts descending instead of ascending

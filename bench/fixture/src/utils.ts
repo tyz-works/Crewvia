@@ -10,9 +10,8 @@ export function calculateTotal(items: OrderItem[]): number {
   return items.reduce((sum, item) => sum + item.quantity * item.price, 0);
 }
 
-// BUG-3: no null check — crashes when user.name is null
 export function getUserDisplayName(user: User): string {
-  return user.name.toUpperCase();
+  return user.name ? user.name.toUpperCase() : '';
 }
 
 export function isEligibleForDiscount(user: User, cart: Cart): boolean {

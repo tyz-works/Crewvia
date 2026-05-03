@@ -134,7 +134,7 @@ if [[ $DRY_RUN -eq 0 ]]; then
         ADD_OUT=$(CREWVIA_TASKVIA=disabled \
             "$SCRIPT_DIR/plan.sh" add "$TASK_TITLE" \
             --mission "$BENCH_SLUG" \
-            --skills "code,bash" \
+            --skills "code,typescript" \
             --priority high \
             --target-dir "$FIXTURE_DIR" \
             --description "$TASK_BODY" \
@@ -157,7 +157,8 @@ echo "$STRATEGY" > "$STRATEGY_CONF"
 # ── Step 5: JSONL session tracking ────────────────────────────────────────────
 
 # Claude Code stores sessions in ~/.claude/projects/<path-with-slashes-as-dashes>/
-FIXTURE_PATH_KEY=$(echo "$FIXTURE_DIR" | sed 's|^/||; s|/|-|g')
+# Mapping: replace every '/' with '-' (the leading '/' becomes a leading '-').
+FIXTURE_PATH_KEY=$(echo "$FIXTURE_DIR" | sed 's|/|-|g')
 JSONL_DIR="$HOME/.claude/projects/$FIXTURE_PATH_KEY"
 mkdir -p "$JSONL_DIR"
 
@@ -187,9 +188,39 @@ _launch_worker_window() {
     tmux kill-window -t "$window" 2>/dev/null || true
     sleep 1
 
-    # Launch via start.sh — it sets AGENT_NAME, CREWVIA_REPO, ENV exports, etc.
-    TARGET_DIR="$target_dir" CREWVIA_TMUX=1 CREWVIA_TASKVIA=disabled \
-        bash "$SCRIPT_DIR/start.sh" worker code bash &
+    # Write a minimal settings.json for the bench Worker.
+    # The full Worker system prompt (~38KB) crashes claude when written to settings.json;
+    # this compact version covers exactly what bench tasks need.
+    mkdir -p "$target_dir/.claude"
+    python3 - "$target_dir/.claude/settings.json" "$agent" "$REPO_ROOT" <<'PYEOF'
+import sys, json
+settings_path, agent_name, crewvia_repo = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    settings = json.load(open(settings_path))
+except Exception:
+    settings = {}
+settings['systemPrompt'] = (
+    f"You are {agent_name}, a crewvia bench Worker (skills: code, typescript).\n"
+    "Your cwd is the bench/fixture TypeScript project. "
+    f"CREWVIA_REPO env var = {crewvia_repo} (use this for plan.sh calls).\n\n"
+    "For each bench task:\n"
+    "1. Pull: $CREWVIA_REPO/scripts/plan.sh pull --task <id> --mission <mission>\n"
+    "2. Read description; fix the TypeScript bug in src/\n"
+    "3. Verify: npm test\n"
+    "4. Commit: git add -A && git commit -m 'fix: <desc> (task/<id>)'\n"
+    "5. Done: $CREWVIA_REPO/scripts/plan.sh done <id> '<summary>' --mission <mission>\n\n"
+    "Always use absolute $CREWVIA_REPO prefix for plan.sh since cwd is bench/fixture."
+)
+# Allow all tools without permission prompts so the bench loop runs unblocked.
+settings['permissions'] = {'allow': ['Bash(*)', 'Edit(*)', 'Write(*)', 'Read(*)', 'MultiEdit(*)']}
+with open(settings_path, 'w') as f:
+    json.dump(settings, f, ensure_ascii=False, indent=2)
+PYEOF
+
+    # Launch via start.sh — pass AGENT_NAME so start.sh uses it instead of assign-name.sh.
+    # CREWVIA_BENCH_MODE=1 suppresses start.sh auto-kickoff and settings.json overwrite.
+    AGENT_NAME="$agent" TARGET_DIR="$target_dir" CREWVIA_TMUX=1 CREWVIA_TASKVIA=disabled \
+        CREWVIA_BENCH_MODE=1 bash "$SCRIPT_DIR/start.sh" worker code bash &
     disown $!
 
     log "Worker launched (window: $window). Waiting ${WORKER_STARTUP_SLEEP}s for Claude..."

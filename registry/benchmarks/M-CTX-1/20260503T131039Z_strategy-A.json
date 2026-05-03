@@ -1,0 +1,97 @@
+{
+  "strategy": "A",
+  "worker": "Mika",
+  "run_at": "20260503T131039Z",
+  "max_runtime_minutes": 60,
+  "dry_run": false,
+  "tasks_completed": 5,
+  "bench_mission": "bench-20260503T130636",
+  "session_file": "/Users/tyz/.claude/projects/-Users-tyz-workspace-crewvia-bench-fixture/a9a5cdfa-1ec5-4e6d-ae3d-d715d9ab0a2f.jsonl",
+  "task_markers": [
+    "2026-05-03T13:06:48.000Z",
+    "2026-05-03T13:08:08.000Z",
+    "2026-05-03T13:08:59.000Z",
+    "2026-05-03T13:09:39.000Z",
+    "2026-05-03T13:10:09.000Z"
+  ],
+  "metrics": [
+    {
+      "segment": 0,
+      "input_tokens": 0,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens": 0,
+      "compaction_count": 0,
+      "compaction_duration_ms": 0,
+      "turn_count": 0,
+      "start_time": "2026-05-03T13:06:40.346000Z",
+      "end_time": "2026-05-03T13:06:44.297000Z",
+      "wall_clock_seconds": 3.951
+    },
+    {
+      "segment": 1,
+      "input_tokens": 1318,
+      "cache_creation_input_tokens": 63502,
+      "cache_read_input_tokens": 705897,
+      "output_tokens": 4446,
+      "compaction_count": 0,
+      "compaction_duration_ms": 0,
+      "turn_count": 22,
+      "start_time": "2026-05-03T13:06:51.695000Z",
+      "end_time": "2026-05-03T13:08:07.635000Z",
+      "wall_clock_seconds": 75.94
+    },
+    {
+      "segment": 2,
+      "input_tokens": 19,
+      "cache_creation_input_tokens": 5985,
+      "cache_read_input_tokens": 499400,
+      "output_tokens": 2445,
+      "compaction_count": 0,
+      "compaction_duration_ms": 0,
+      "turn_count": 13,
+      "start_time": "2026-05-03T13:08:08.223000Z",
+      "end_time": "2026-05-03T13:08:58.770000Z",
+      "wall_clock_seconds": 50.547
+    },
+    {
+      "segment": 3,
+      "input_tokens": 21,
+      "cache_creation_input_tokens": 3337,
+      "cache_read_input_tokens": 455304,
+      "output_tokens": 1575,
+      "compaction_count": 0,
+      "compaction_duration_ms": 0,
+      "turn_count": 11,
+      "start_time": "2026-05-03T13:08:59.399000Z",
+      "end_time": "2026-05-03T13:09:38.984000Z",
+      "wall_clock_seconds": 39.585
+    },
+    {
+      "segment": 4,
+      "input_tokens": 5,
+      "cache_creation_input_tokens": 1559,
+      "cache_read_input_tokens": 215452,
+      "output_tokens": 709,
+      "compaction_count": 0,
+      "compaction_duration_ms": 0,
+      "turn_count": 5,
+      "start_time": "2026-05-03T13:09:39.579000Z",
+      "end_time": "2026-05-03T13:10:03.787000Z",
+      "wall_clock_seconds": 24.208
+    },
+    {
+      "segment": 5,
+      "input_tokens": 15,
+      "cache_creation_input_tokens": 2454,
+      "cache_read_input_tokens": 399479,
+      "output_tokens": 1255,
+      "compaction_count": 0,
+      "compaction_duration_ms": 0,
+      "turn_count": 9,
+      "start_time": "2026-05-03T13:10:11.778000Z",
+      "end_time": "2026-05-03T13:10:39.705000Z",
+      "wall_clock_seconds": 27.927
+    }
+  ]
+}

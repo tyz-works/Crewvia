@@ -13,6 +13,14 @@
 #   B — /clear between tasks (requires dispatcher.sh Strategy B support: t004)
 #   C — Worker restart between tasks (requires dispatcher.sh Strategy C support: t005)
 #
+# Prerequisites:
+#   - Strategies B and C require the crewvia dispatcher to be launched with
+#     CREWVIA_BENCH_MODE=1 so the gate-file and .restarting guards take effect.
+#     Without this env var, the dispatcher may race ahead and assign the next
+#     task before the context strategy action has been applied.
+#   - start.sh sets CREWVIA_BENCH_MODE=1 for the Worker launched by this script,
+#     but the dispatcher must be restarted with the same env if already running.
+#
 # Output: registry/benchmarks/M-CTX-1/<timestamp>_strategy-<X>.json
 
 set -euo pipefail

@@ -11,8 +11,8 @@ cd "$FIXTURE_DIR"
 
 if [ -d .git ]; then
   echo "[init-fixture] resetting existing repo to bugged state..."
-  # Find the initial "bugged state" commit (oldest) and reset to it
-  INITIAL_COMMIT=$(git log --oneline | tail -1 | awk '{print $1}')
+  # Find the initial "bugged state" commit (root commit) and reset to it
+  INITIAL_COMMIT=$(git rev-list --max-parents=0 HEAD)
   git reset --hard "$INITIAL_COMMIT"
   git clean -fd
   echo "[init-fixture] HEAD reset to initial: $(git rev-parse --short HEAD)"

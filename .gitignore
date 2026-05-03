@@ -43,3 +43,6 @@ logs/
 # Crewvia secrets
 config/.taskvia-token
 registry/verification/
+
+# Benchmark fixture runtime git repo (created by bench/init-fixture.sh)
+bench/fixture/.git/

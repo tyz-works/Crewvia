@@ -6,9 +6,8 @@ export function paginate<T>(items: T[], page: number, pageSize: number): T[] {
   return items.slice(start, end);
 }
 
-// BUG-2: uses addition instead of multiplication for item total
 export function calculateTotal(items: OrderItem[]): number {
-  return items.reduce((sum, item) => sum + item.quantity + item.price, 0);
+  return items.reduce((sum, item) => sum + item.quantity * item.price, 0);
 }
 
 // BUG-3: no null check — crashes when user.name is null

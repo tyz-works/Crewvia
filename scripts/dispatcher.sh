@@ -84,6 +84,45 @@ TASKVIA_CB_THRESHOLD = 3        # consecutive failures to trip
 TASKVIA_CB_BACKOFF = 60         # seconds to wait after tripping
 TASKVIA_CB_LAST_TRIP = 0.0
 
+# ---------------------------------------------------------------------------
+# Bench mode (CREWVIA_BENCH_MODE=1): gate-file-based assignment guard
+# ---------------------------------------------------------------------------
+# When enabled, the dispatcher checks /tmp/crewvia-bench-gate-<agent> before
+# assigning any task to an idle Worker.  If the gate file exists, assignment
+# is skipped for that cycle — benchmark-ctx.sh holds the gate while applying
+# its context strategy (B: /clear, C: restart) and removes it when ready.
+# This prevents the dispatcher from racing ahead and assigning the next task
+# before the strategy action has been applied.
+BENCH_MODE = os.environ.get('CREWVIA_BENCH_MODE', '') == '1'
+BENCH_STRATEGY_CONF = Path('/tmp/crewvia-bench-strategy.conf')
+
+def bench_gate_active(agent_name: str) -> bool:
+    """Return True if the benchmark gate file exists for this agent."""
+    if not BENCH_MODE:
+        return False
+    gate = Path(f'/tmp/crewvia-bench-gate-{agent_name}')
+    return gate.exists()
+
+def bench_current_strategy() -> str:
+    """Read the current strategy (A/B/C) from the strategy conf file."""
+    try:
+        return BENCH_STRATEGY_CONF.read_text().strip()
+    except OSError:
+        return ''
+
+def bench_worker_restarting(agent_name: str) -> bool:
+    """Return True if benchmark-ctx.sh is mid-restart for this Worker (Strategy C).
+
+    benchmark-ctx.sh writes queue/assignments/<agent>.restarting before killing
+    the tmux window and removes it once the new Worker is running.  While the
+    flag is present the dispatcher must not try to assign a task — the Worker
+    window does not exist yet.
+    """
+    if not BENCH_MODE:
+        return False
+    flag = ASSIGNMENTS_DIR / f'{agent_name}.restarting'
+    return flag.exists()
+
 # Agent publish throttle: only publish heartbeats every PUBLISH_INTERVAL seconds
 PUBLISH_INTERVAL = 60
 LAST_PUBLISH_TIME = 0.0
@@ -640,6 +679,20 @@ def dispatch():
 
         if not is_idle:
             continue  # Worker is busy; do not interrupt
+
+        # BENCH_MODE: hold off assignment while benchmark-ctx.sh applies its
+        # context strategy (B: /clear, C: restart).  Gate is held by the
+        # orchestrator and released once the strategy action is complete.
+        if bench_gate_active(agent_name):
+            log(f"[bench] gate active for {agent_name} — skipping assignment (strategy={bench_current_strategy()})")
+            continue
+
+        # Strategy C: skip assignment while the Worker window is being killed
+        # and re-launched.  The .restarting flag is written by benchmark-ctx.sh
+        # before tmux kill-window and removed after the new window is ready.
+        if bench_worker_restarting(agent_name):
+            log(f"[bench] {agent_name} is restarting (Strategy C) — skipping assignment")
+            continue
 
         # Find best unblocked pending task with skill match
         best = None

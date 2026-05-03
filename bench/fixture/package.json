@@ -1,0 +1,9 @@
+{
+  "name": "bench-fixture",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Benchmark fixture: small TypeScript project with intentional bugs for M-CTX-1",
+  "scripts": {
+    "test": "node --strip-types --test tests/utils.test.ts"
+  }
+}

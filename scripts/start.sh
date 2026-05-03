@@ -98,7 +98,9 @@ if [[ "${ROLE}" == "director" ]]; then
     echo "[crewvia] Director '${AGENT_NAME}' を registry に登録しました。"
   fi
 else
-  AGENT_NAME=$(bash "${SCRIPT_DIR}/assign-name.sh" "${SKILLS_ARR[@]+"${SKILLS_ARR[@]}"}")
+  if [[ -z "${AGENT_NAME:-}" ]]; then
+    AGENT_NAME=$(bash "${SCRIPT_DIR}/assign-name.sh" "${SKILLS_ARR[@]+"${SKILLS_ARR[@]}"}")
+  fi
 fi
 
 # --- tmux モード選択（Director 起動時のみ、CREWVIA_TMUX 未設定時のみ） ---
@@ -347,18 +349,30 @@ if [[ "${CREWVIA_TMUX:-0}" == "1" ]]; then
     MODEL_CLI_ARG=" --model '$SELECTED_MODEL'"
   fi
 
-  if [[ -n "$FULL_PROMPT" ]]; then
-    # Write prompt to temp file to avoid quoting issues with large content in send-keys.
-    # macOS BSD mktemp は template 末尾の X's しか randomize しないため、
-    # 旧パターン `crewvia_prompt_XXXXXX.txt` ではファイル名が literal のまま
-    # (parallel Worker 起動時に temp file が衝突する latent bug)。
-    # 末尾に X's を置いた `crewvia_prompt.XXXXXX` が BSD/GNU 両対応の正解。
+  if [[ -n "$FULL_PROMPT" ]] && [[ "${CREWVIA_BENCH_MODE:-0}" != "1" ]]; then
+    # Write the system prompt to .claude/settings.json in the target dir so claude
+    # picks it up without shell-expansion issues (the prompt contains $ / backticks
+    # that would be incorrectly expanded when embedded in a send-keys string).
+    # Python handles JSON encoding safely including Japanese / special characters.
+    # BENCH_MODE skips this to avoid the ~38KB prompt causing claude to crash;
+    # benchmark-ctx.sh writes a minimal bench-specific settings.json instead.
     PROMPT_TMPFILE=$(mktemp /tmp/crewvia_prompt.XXXXXX)
     printf '%s' "$FULL_PROMPT" > "$PROMPT_TMPFILE"
-    LAUNCH_CMD="$ENV_EXPORTS; cd '$WORK_DIR'; claude${MODEL_CLI_ARG} --append-system-prompt \"\$(cat '${PROMPT_TMPFILE}')\""
-  else
-    LAUNCH_CMD="$ENV_EXPORTS; cd '$WORK_DIR'; claude${MODEL_CLI_ARG}"
+    SETTINGS_DIR="$WORK_DIR/.claude"
+    mkdir -p "$SETTINGS_DIR"
+    python3 - "$PROMPT_TMPFILE" "$SETTINGS_DIR/settings.json" <<'PYEOF'
+import sys, json
+prompt = open(sys.argv[1]).read()
+try:
+    existing = json.load(open(sys.argv[2]))
+except Exception:
+    existing = {}
+existing['systemPrompt'] = (existing.get('systemPrompt') or '') + '\n' + prompt
+with open(sys.argv[2], 'w') as f:
+    json.dump(existing, f, ensure_ascii=False, indent=2)
+PYEOF
   fi
+  LAUNCH_CMD="$ENV_EXPORTS; cd '$WORK_DIR'; claude${MODEL_CLI_ARG}"
 
   if ! tmux has-session -t "$SESSION" 2>/dev/null; then
     echo "[crewvia] Creating tmux session: $SESSION"
@@ -380,17 +394,21 @@ if [[ "${CREWVIA_TMUX:-0}" == "1" ]]; then
   # インラインモードは exec claude に引数を渡せるが、tmux モードは
   # ユーザーメッセージがないと Claude がハングするため send-keys で補う。
   sleep 5
-  if [[ "${ROLE}" == "worker" ]]; then
-    # TARGET_DIR が設定されている場合は --target-dir を渡して target 不一致タスクをスキップ
-    PULL_TARGET_DIR_ARG=""
-    [[ -n "${TARGET_DIR:-}" ]] && PULL_TARGET_DIR_ARG=" --target-dir ${TARGET_DIR}"
-    KICKOFF_MSG="ミッション開始。./scripts/plan.sh pull --agent ${AGENT_NAME} --skills ${SKILLS}${PULL_TARGET_DIR_ARG} でタスクを取得し、指示に従って作業してください。完了したら ./scripts/plan.sh done で報告し、待機してください（Dispatcher が次のタスクを自動割り当てします）。"
+  if [[ "${CREWVIA_BENCH_MODE:-0}" != "1" ]]; then
+    if [[ "${ROLE}" == "worker" ]]; then
+      # TARGET_DIR が設定されている場合は --target-dir を渡して target 不一致タスクをスキップ
+      PULL_TARGET_DIR_ARG=""
+      [[ -n "${TARGET_DIR:-}" ]] && PULL_TARGET_DIR_ARG=" --target-dir ${TARGET_DIR}"
+      KICKOFF_MSG="ミッション開始。./scripts/plan.sh pull --agent ${AGENT_NAME} --skills ${SKILLS}${PULL_TARGET_DIR_ARG} でタスクを取得し、指示に従って作業してください。完了したら ./scripts/plan.sh done で報告し、待機してください（Dispatcher が次のタスクを自動割り当てします）。"
+    else
+      KICKOFF_MSG="ミッション開始。./scripts/plan.sh status で状態を確認し、タスク分解・Worker 割り当て・全体管理を開始してください。"
+    fi
+    tmux send-keys -t "$TARGET" "$KICKOFF_MSG"
+    tmux send-keys -t "$TARGET" Enter
+    echo "[crewvia] Kickoff message sent to ${SESSION}:${WINDOW_NAME}"
   else
-    KICKOFF_MSG="ミッション開始。./scripts/plan.sh status で状態を確認し、タスク分解・Worker 割り当て・全体管理を開始してください。"
+    echo "[crewvia] BENCH_MODE: skipping auto-kickoff (benchmark-ctx.sh will control task dispatch)"
   fi
-  tmux send-keys -t "$TARGET" "$KICKOFF_MSG"
-  tmux send-keys -t "$TARGET" Enter
-  echo "[crewvia] Kickoff message sent to ${SESSION}:${WINDOW_NAME}"
 
   # Director: dispatcher を crewvia:dispatcher 窓で起動（二重起動防止）
   if [[ "${ROLE}" == "director" ]]; then

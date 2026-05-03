@@ -1,0 +1,109 @@
+{
+  "strategy": "C",
+  "worker": "Mika",
+  "run_at": "20260503T134633Z",
+  "max_runtime_minutes": 60,
+  "dry_run": false,
+  "tasks_completed": 5,
+  "bench_mission": "bench-20260503T134038",
+  "session_file": "/Users/tyz/.claude/projects/-Users-tyz-workspace-crewvia-bench-fixture/9d307f6a-7793-462f-b631-e5a6585d8db3.jsonl",
+  "task_markers": [
+    "2026-05-03T13:40:49.000Z",
+    "2026-05-03T13:42:43.000Z",
+    "2026-05-03T13:44:46.000Z",
+    "2026-05-03T13:45:39.000Z",
+    "2026-05-03T13:46:22.000Z"
+  ],
+  "metrics": [
+    {
+      "segment": 0,
+      "input_tokens": 38,
+      "cache_creation_input_tokens": 69212,
+      "cache_read_input_tokens": 1090884,
+      "output_tokens": 9813,
+      "compaction_count": 0,
+      "compaction_duration_ms": 0,
+      "turn_count": 32,
+      "start_time": "2026-05-03T13:40:41.247000Z",
+      "end_time": "2026-05-03T13:42:28.808000Z",
+      "wall_clock_seconds": 107.561,
+      "session_index": 0
+    },
+    {
+      "segment": 0,
+      "input_tokens": 26,
+      "cache_creation_input_tokens": 45544,
+      "cache_read_input_tokens": 742334,
+      "output_tokens": 3050,
+      "compaction_count": 0,
+      "compaction_duration_ms": 0,
+      "turn_count": 22,
+      "start_time": "2026-05-03T13:42:34.906000Z",
+      "end_time": "2026-05-03T13:44:32.747000Z",
+      "wall_clock_seconds": 117.841,
+      "session_index": 1
+    },
+    {
+      "segment": 0,
+      "input_tokens": 0,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens": 0,
+      "compaction_count": 0,
+      "compaction_duration_ms": 0,
+      "turn_count": 0,
+      "start_time": "2026-05-03T13:44:39.352000Z",
+      "end_time": "2026-05-03T13:44:43.910000Z",
+      "wall_clock_seconds": 4.558,
+      "session_index": 2
+    },
+    {
+      "segment": 1,
+      "input_tokens": 25,
+      "cache_creation_input_tokens": 62895,
+      "cache_read_input_tokens": 458834,
+      "output_tokens": 2633,
+      "compaction_count": 0,
+      "compaction_duration_ms": 0,
+      "turn_count": 15,
+      "start_time": "2026-05-03T13:44:47.113000Z",
+      "end_time": "2026-05-03T13:45:37.421000Z",
+      "wall_clock_seconds": 50.308,
+      "session_index": 2
+    },
+    {
+      "segment": 2,
+      "input_tokens": 18,
+      "cache_creation_input_tokens": 6276,
+      "cache_read_input_tokens": 531618,
+      "output_tokens": 2643,
+      "compaction_count": 0,
+      "compaction_duration_ms": 0,
+      "turn_count": 14,
+      "start_time": "2026-05-03T13:45:44.780000Z",
+      "end_time": "2026-05-03T13:46:26.981000Z",
+      "wall_clock_seconds": 42.201,
+      "session_index": 2
+    },
+    {
+      "segment": 0,
+      "input_tokens": 0,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "output_tokens": 0,
+      "compaction_count": 0,
+      "compaction_duration_ms": 0,
+      "turn_count": 0,
+      "start_time": "2026-05-03T13:46:16.554000Z",
+      "end_time": "2026-05-03T13:47:14.845000Z",
+      "wall_clock_seconds": 58.291,
+      "session_index": 3
+    }
+  ],
+  "session_files": [
+    "/Users/tyz/.claude/projects/-Users-tyz-workspace-crewvia-bench-fixture/9d307f6a-7793-462f-b631-e5a6585d8db3.jsonl",
+    "/Users/tyz/.claude/projects/-Users-tyz-workspace-crewvia-bench-fixture/c19b3df3-a527-4791-a12a-8033000479b8.jsonl",
+    "/Users/tyz/.claude/projects/-Users-tyz-workspace-crewvia-bench-fixture/177a04ef-7564-484a-b152-0db5b4f0b360.jsonl",
+    "/Users/tyz/.claude/projects/-Users-tyz-workspace-crewvia-bench-fixture/85fc1949-6b2c-44fd-acba-58a548d10ef4.jsonl"
+  ]
+}

@@ -1,0 +1,18 @@
+{
+  "strategy": "A",
+  "worker": "Haruto",
+  "run_at": "20260503T054702Z",
+  "max_runtime_minutes": 60,
+  "dry_run": true,
+  "tasks_completed": 5,
+  "bench_mission": "bench-dry-run",
+  "session_file": null,
+  "task_markers": [
+    "2026-05-03T05:46:57.000Z",
+    "2026-05-03T05:46:58.000Z",
+    "2026-05-03T05:46:59.000Z",
+    "2026-05-03T05:47:00.000Z",
+    "2026-05-03T05:47:01.000Z"
+  ],
+  "metrics": []
+}

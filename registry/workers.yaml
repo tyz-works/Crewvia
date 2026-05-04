@@ -24,7 +24,7 @@ workers:
     role: director
     skills: []
     task_count: 0
-    last_active: 2026-04-14
+    last_active: 2026-05-05
   - name: Yuki
     skills: [research, typescript]
     task_count: 2
@@ -40,7 +40,7 @@ workers:
   - name: Haruto
     skills: [bash, code]
     task_count: 10
-    last_active: 2026-05-03
+    last_active: 2026-05-05
   - name: Seo
     skills: [review]
     task_count: 20

@@ -98,6 +98,14 @@ if [[ "${ROLE}" == "director" ]]; then
     echo "[crewvia] Director '${AGENT_NAME}' を registry に登録しました。"
   fi
 else
+  # Director の env から AGENT_NAME が漏れていたら無視して再割り当てする
+  if [[ -n "${AGENT_NAME:-}" ]]; then
+    EXISTING_DIR=$(python3 "${SCRIPT_DIR}/lib_registry.py" get-director "$REGISTRY_YAML" 2>/dev/null || true)
+    if [[ "${AGENT_NAME}" == "$EXISTING_DIR" ]]; then
+      echo "[crewvia] AGENT_NAME='${AGENT_NAME}' は Director 名と一致 — Worker 用に再割り当てします。" >&2
+      unset AGENT_NAME
+    fi
+  fi
   if [[ -z "${AGENT_NAME:-}" ]]; then
     AGENT_NAME=$(bash "${SCRIPT_DIR}/assign-name.sh" "${SKILLS_ARR[@]+"${SKILLS_ARR[@]}"}")
   fi
@@ -390,10 +398,20 @@ PYEOF
   tmux send-keys -t "$TARGET" Enter
   echo "[crewvia] Agent launched in tmux window: ${SESSION}:${WINDOW_NAME}"
 
-  # Claude が起動して入力待ちになるまで待ってから kickoff メッセージを送る。
-  # インラインモードは exec claude に引数を渡せるが、tmux モードは
-  # ユーザーメッセージがないと Claude がハングするため send-keys で補う。
-  sleep 5
+  # Claude Code の入力プロンプト（❯）が表示されるまで待ってから kickoff メッセージを送る。
+  # 固定 sleep だと環境依存でタイミングがずれるため、プロンプト検出でポーリングする。
+  PROMPT_READY=0
+  for _i in $(seq 1 30); do
+    if tmux capture-pane -t "$TARGET" -p 2>/dev/null | grep -q '❯'; then
+      PROMPT_READY=1
+      break
+    fi
+    sleep 1
+  done
+  if [[ "$PROMPT_READY" -eq 0 ]]; then
+    echo "[crewvia] WARNING: Claude prompt not detected after 30s in ${SESSION}:${WINDOW_NAME}" >&2
+  fi
+
   if [[ "${CREWVIA_BENCH_MODE:-0}" != "1" ]]; then
     if [[ "${ROLE}" == "worker" ]]; then
       # TARGET_DIR が設定されている場合は --target-dir を渡して target 不一致タスクをスキップ
@@ -404,6 +422,7 @@ PYEOF
       KICKOFF_MSG="ミッション開始。./scripts/plan.sh status で状態を確認し、タスク分解・Worker 割り当て・全体管理を開始してください。"
     fi
     tmux send-keys -t "$TARGET" "$KICKOFF_MSG"
+    sleep 1
     tmux send-keys -t "$TARGET" Enter
     echo "[crewvia] Kickoff message sent to ${SESSION}:${WINDOW_NAME}"
   else

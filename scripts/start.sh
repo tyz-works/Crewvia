@@ -367,7 +367,7 @@ try:
     existing = json.load(open(sys.argv[2]))
 except Exception:
     existing = {}
-existing['systemPrompt'] = (existing.get('systemPrompt') or '') + '\n' + prompt
+existing['systemPrompt'] = prompt
 with open(sys.argv[2], 'w') as f:
     json.dump(existing, f, ensure_ascii=False, indent=2)
 PYEOF

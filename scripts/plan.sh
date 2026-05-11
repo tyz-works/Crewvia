@@ -854,6 +854,7 @@ def taskvia_sync_pull(slug, task_id, assignee):
     resp = _taskvia_request('PATCH', f'/api/missions/{slug}/tasks/{task_id}', {
         'status': 'in_progress',
         'assignee': assignee,
+        'started_at': now_iso(),
     })
     if resp is not None:
         _taskvia_map_update_status(slug, task_id, 'in_progress')
@@ -864,6 +865,7 @@ def taskvia_sync_done(slug, task_id, result):
     resp = _taskvia_request('PATCH', f'/api/missions/{slug}/tasks/{task_id}', {
         'status': 'done',
         'result': result,
+        'completed_at': now_iso(),
     })
     if resp is not None:
         _taskvia_map_update_status(slug, task_id, 'done')
@@ -894,6 +896,65 @@ def _taskvia_unblock_dependents(slug, completed_task_id):
 def taskvia_sync_archive(slug):
     resp = _taskvia_request('DELETE', f'/api/missions/{slug}')
     return resp is not None
+
+
+def _load_workers_from_registry():
+    """Parse registry/workers.yaml and return list of worker dicts."""
+    registry_path = os.path.join(os.path.dirname(QUEUE_DIR), 'registry', 'workers.yaml')
+    if not os.path.exists(registry_path):
+        return []
+    workers = []
+    current = None
+    try:
+        with open(registry_path) as f:
+            text = f.read()
+    except OSError:
+        return []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith('- name:'):
+            if current is not None:
+                workers.append(current)
+            name = stripped[len('- name:'):].strip().strip('"\'')
+            current = {'name': name, 'skills': [], 'task_count': 0}
+        elif current and re.match(r'\s+skills:', line):
+            m = re.search(r'\[([^\]]*)\]', line)
+            if m:
+                inner = m.group(1).strip()
+                current['skills'] = [s.strip() for s in inner.split(',')] if inner else []
+        elif current and re.match(r'\s+task_count:', line):
+            m = re.search(r'task_count:\s*(\d+)', line)
+            if m:
+                current['task_count'] = int(m.group(1))
+        elif current and re.match(r'\s+role:', line):
+            current['role'] = line.split(':', 1)[1].strip()
+        elif current and re.match(r'\s+last_active:', line):
+            current['last_active'] = line.split(':', 1)[1].strip()
+    if current is not None:
+        workers.append(current)
+    return workers
+
+
+def taskvia_sync_workers():
+    """Sync all workers from registry/workers.yaml to Taskvia."""
+    workers = _load_workers_from_registry()
+    if not workers:
+        return True
+    ok = True
+    for w in workers:
+        payload = {
+            'name': w['name'],
+            'skills': w.get('skills', []),
+            'task_count': w.get('task_count', 0),
+        }
+        if w.get('role'):
+            payload['role'] = w['role']
+        if w.get('last_active'):
+            payload['last_active'] = w['last_active']
+        resp = _taskvia_request('POST', '/api/workers', payload)
+        if resp is None:
+            ok = False
+    return ok
 
 
 # ---------------------------------------------------------------------------
@@ -998,6 +1059,7 @@ def cmd_init(args):
     if sync_holder[0]:
         ok = taskvia_sync_init(*sync_holder[0])
         _print_sync_summary(ok)
+        taskvia_sync_workers()
 
 
 def cmd_add(args):
@@ -2051,15 +2113,19 @@ def _resync_one(slug):
             'blocked_by': meta.get('blocked_by', []),
         })
 
-        # Always PATCH to sync current status / assignee / result
+        # Always PATCH to sync current status / assignee / result / timestamps
         status = meta.get('status', 'pending')
         patch: dict = {'status': status}
         if meta.get('worker'):
             patch['assignee'] = meta['worker']
+        if meta.get('started_at'):
+            patch['started_at'] = meta['started_at']
         if status == 'done':
             _, result_text = parse_task_body(body)
             if result_text:
                 patch['result'] = result_text
+            if meta.get('completed_at'):
+                patch['completed_at'] = meta['completed_at']
 
         _taskvia_request('PATCH', f'/api/missions/{slug}/tasks/{task_id}', patch)
 

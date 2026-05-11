@@ -34,7 +34,18 @@ from lib_registry import parse, write
 
 names_yaml_path = sys.argv[2]
 registry_yaml_path = sys.argv[3]
-input_skills = sorted(sys.argv[4:]) if len(sys.argv) > 4 else []
+_raw = sys.argv[4:]
+input_skills = []
+_skip = False
+for _a in _raw:
+    if _skip:
+        _skip = False
+        continue
+    if _a.startswith('-'):
+        _skip = True
+        continue
+    input_skills.append(_a)
+input_skills.sort()
 input_skills_set = set(input_skills)
 
 

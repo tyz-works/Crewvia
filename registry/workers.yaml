@@ -73,3 +73,27 @@ workers:
     skills: [planning]
     task_count: 0
     last_active: 2026-04-26
+  - name: Anika
+    skills: [research]
+    task_count: 0
+    last_active: 2026-05-10
+  - name: Rohan
+    skills: [python]
+    task_count: 0
+    last_active: 2026-05-10
+  - name: Siti
+    skills: [python]
+    task_count: 0
+    last_active: 2026-05-10
+  - name: Budi
+    skills: [python]
+    task_count: 0
+    last_active: 2026-05-10
+  - name: Nadia
+    skills: [python]
+    task_count: 0
+    last_active: 2026-05-10
+  - name: Layla
+    skills: [python]
+    task_count: 0
+    last_active: 2026-05-10

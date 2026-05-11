@@ -63,7 +63,17 @@ case "$ROLE" in
     ;;
   worker)
     AGENT_FILE="agents/worker.md"
-    SKILLS_ARR=("$@")
+    SKILLS_ARR=()
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --mission) shift; shift ;;
+        --name)    AGENT_NAME="$2"; shift 2 ;;
+        --task)    shift; shift ;;
+        --skills)  IFS=',' read -ra _sk <<< "$2"; SKILLS_ARR+=("${_sk[@]}"); shift 2 ;;
+        --*)       echo "[start.sh] WARNING: unknown flag '$1' ignored" >&2; shift ;;
+        *)         SKILLS_ARR+=("$1"); shift ;;
+      esac
+    done
     ;;
   *)
     echo "ERROR: Unknown role '$ROLE'. Use 'director' or 'worker'." >&2

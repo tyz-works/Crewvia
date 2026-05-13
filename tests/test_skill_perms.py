@@ -42,6 +42,27 @@ class TestGlobalDeny:
         result = check_permission(_config(), "code", "Bash(git status)")
         assert result["decision"] != "deny" or "_global" not in result.get("source", "")
 
+    def test_push_origin_main_denied(self):
+        result = check_permission(_config(), "code", "Bash(git push origin main)")
+        assert result["decision"] == "deny"
+        assert "_global" in result["source"]
+
+    def test_push_origin_master_denied(self):
+        result = check_permission(_config(), "code", "Bash(git push origin master)")
+        assert result["decision"] == "deny"
+
+    def test_force_push_denied(self):
+        result = check_permission(_config(), "bash", "Bash(git push --force origin feat/x)")
+        assert result["decision"] == "deny"
+
+    def test_force_push_short_flag_denied(self):
+        result = check_permission(_config(), "bash", "Bash(git push -f origin feat/x)")
+        assert result["decision"] == "deny"
+
+    def test_push_feature_branch_not_global_denied(self):
+        result = check_permission(_config(), "code", "Bash(git push origin feat/my-feature)")
+        assert result["decision"] != "deny" or "_global" not in result.get("source", "")
+
 
 class TestSkillAllow:
     def test_code_edit_allowed(self):

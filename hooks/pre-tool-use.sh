@@ -197,7 +197,7 @@ if [ "$TOOL_NAME" = "Bash" ] && [ -n "$COMMAND" ]; then
   _NEEDS_APPROVAL=false
 
   # 機密ファイルパターン — コマンド文字列に含まれていたら承認必須
-  _SENSITIVE_PATTERNS=(.env .pem .key _rsa _ed25519 _dsa .secret credentials .ssh/ .aws/ .config/)
+  _SENSITIVE_PATTERNS=(.env .pem .key _rsa _ed25519 _dsa .secret credentials .ssh/ .aws/)
   for _pat in "${_SENSITIVE_PATTERNS[@]}"; do
     if [[ "$COMMAND" == *"$_pat"* ]]; then
       _NEEDS_APPROVAL=true

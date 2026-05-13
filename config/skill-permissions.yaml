@@ -67,6 +67,9 @@ skills:
       - "Bash(eslint *)"
       - "Bash(prettier *)"
       - "Bash(git *)"
+      - "Bash(gh pr create*)"
+      - "Bash(gh pr view*)"
+      - "Bash(gh run *)"
     deny: []
 
   python:
@@ -78,6 +81,9 @@ skills:
       - "Bash(pip *)"
       - "Bash(pytest *)"
       - "Bash(git *)"
+      - "Bash(gh pr create*)"
+      - "Bash(gh pr view*)"
+      - "Bash(gh run *)"
     deny: []
 
   typescript:
@@ -91,6 +97,9 @@ skills:
       - "Bash(node *)"
       - "Bash(bun *)"
       - "Bash(git *)"
+      - "Bash(gh pr create*)"
+      - "Bash(gh pr view*)"
+      - "Bash(gh run *)"
     deny: []
 
   research:
@@ -114,6 +123,8 @@ skills:
       - "Bash(git branch*)"
       - "Bash(git status*)"
       - "Bash(git rev-parse*)"
+      - "Bash(git checkout*)"
+      - "Bash(git merge*)"
       - "Bash(npm test*)"
       - "Bash(npm run lint*)"
       - "Bash(npm run typecheck*)"
@@ -151,19 +162,25 @@ skills:
       - "Edit"
       - "Write"
       - "MultiEdit"
-    deny:
-      - "Bash(git push *)"
+      - "Bash(git *)"
+    deny: []
 
   qa:
     allow:
+      - "Edit"
+      - "Write"
+      - "MultiEdit"
       - "Bash(npm test*)"
       - "Bash(npm run *)"
       - "Bash(npx playwright*)"
       - "Bash(pytest *)"
+      - "Bash(node *)"
       - "Bash(git diff*)"
       - "Bash(git log*)"
       - "Bash(git status*)"
       - "Bash(git fetch*)"
+      - "Bash(git show*)"
+      - "Bash(git branch*)"
       - "Bash(git rev-parse*)"
       - "Bash(gh pr *)"
       - "Bash(curl -s *)"

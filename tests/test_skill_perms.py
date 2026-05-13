@@ -132,3 +132,100 @@ class TestQuotedStringStripping:
             "Bash(echo 'rm -rf /' > /tmp/test.txt)"
         )
         assert result["decision"] == "allow"
+
+
+class TestExpandedSkillAllow:
+    """Tests for expanded skill-permissions (post-improvement)."""
+
+    def test_code_git_push_allowed(self):
+        result = check_permission(_config(), "code", "Bash(git push origin feat/my-feature)")
+        assert result["decision"] == "allow"
+
+    def test_code_gh_pr_create_allowed(self):
+        result = check_permission(_config(), "code", "Bash(gh pr create --title 'feat: x')")
+        assert result["decision"] == "allow"
+
+    def test_code_gh_run_allowed(self):
+        result = check_permission(_config(), "code", "Bash(gh run list)")
+        assert result["decision"] == "allow"
+
+    def test_typescript_git_push_allowed(self):
+        result = check_permission(_config(), "typescript", "Bash(git push origin feat/ts)")
+        assert result["decision"] == "allow"
+
+    def test_typescript_gh_pr_create_allowed(self):
+        result = check_permission(_config(), "typescript", "Bash(gh pr create --title 'x')")
+        assert result["decision"] == "allow"
+
+    def test_python_git_push_allowed(self):
+        result = check_permission(_config(), "python", "Bash(git push origin feat/py)")
+        assert result["decision"] == "allow"
+
+    def test_python_gh_pr_create_allowed(self):
+        result = check_permission(_config(), "python", "Bash(gh pr create --title 'x')")
+        assert result["decision"] == "allow"
+
+    def test_qa_edit_allowed(self):
+        result = check_permission(_config(), "qa", "Edit")
+        assert result["decision"] == "allow"
+
+    def test_qa_write_allowed(self):
+        result = check_permission(_config(), "qa", "Write")
+        assert result["decision"] == "allow"
+
+    def test_qa_multi_edit_allowed(self):
+        result = check_permission(_config(), "qa", "MultiEdit")
+        assert result["decision"] == "allow"
+
+    def test_qa_node_allowed(self):
+        result = check_permission(_config(), "qa", "Bash(node test-runner.js)")
+        assert result["decision"] == "allow"
+
+    def test_qa_git_push_still_denied(self):
+        result = check_permission(_config(), "qa", "Bash(git push origin feat/qa)")
+        assert result["decision"] == "deny"
+
+    def test_qa_git_commit_still_denied(self):
+        result = check_permission(_config(), "qa", "Bash(git commit -m 'test')")
+        assert result["decision"] == "deny"
+
+    def test_review_git_checkout_allowed(self):
+        result = check_permission(_config(), "review", "Bash(git checkout feat/review)")
+        assert result["decision"] == "allow"
+
+    def test_review_git_merge_allowed(self):
+        result = check_permission(_config(), "review", "Bash(git merge feat/review)")
+        assert result["decision"] == "allow"
+
+    def test_review_edit_still_denied(self):
+        result = check_permission(_config(), "review", "Edit")
+        assert result["decision"] == "deny"
+
+    def test_docs_git_push_allowed(self):
+        result = check_permission(_config(), "docs", "Bash(git push origin feat/docs)")
+        assert result["decision"] == "allow"
+
+    def test_docs_git_commit_allowed(self):
+        result = check_permission(_config(), "docs", "Bash(git commit -m 'docs: update')")
+        assert result["decision"] == "allow"
+
+
+class TestGlobalDenyOverridesSkillAllow:
+    """_global.deny must override skill allow — main push denied even for code skill."""
+
+    def test_code_cannot_push_main(self):
+        result = check_permission(_config(), "code", "Bash(git push origin main)")
+        assert result["decision"] == "deny"
+        assert "_global" in result["source"]
+
+    def test_typescript_cannot_push_main(self):
+        result = check_permission(_config(), "typescript", "Bash(git push origin main)")
+        assert result["decision"] == "deny"
+
+    def test_bash_cannot_force_push(self):
+        result = check_permission(_config(), "bash", "Bash(git push --force origin feat/x)")
+        assert result["decision"] == "deny"
+
+    def test_docs_cannot_push_master(self):
+        result = check_permission(_config(), "docs", "Bash(git push origin master)")
+        assert result["decision"] == "deny"

@@ -228,6 +228,20 @@ if [ "$TOOL_NAME" = "Bash" ] && [ -n "$COMMAND" ]; then
     fi
   done
 
+  # compound command 内の危険パターン検出（Python 側 _GLOBAL_DENY_SUBSTRINGS と二重化）
+  if [[ "$COMMAND" == *"&&"* || "$COMMAND" == *"||"* || "$COMMAND" == *";"* || "$COMMAND" == *"|"* ]]; then
+    _CMD_STRIPPED=$(printf '%s' "$COMMAND" | sed "s/'[^']*'//g; s/\"[^\"]*\"//g")
+    if printf '%s' "$_CMD_STRIPPED" | grep -qE '\brm\s+-\S*r\S*f'; then
+      _NEEDS_APPROVAL=true
+    fi
+    if printf '%s' "$_CMD_STRIPPED" | grep -qE '\bsudo\b'; then
+      _NEEDS_APPROVAL=true
+    fi
+    if printf '%s' "$_CMD_STRIPPED" | grep -qE '\|\s*(ba)?sh\b'; then
+      _NEEDS_APPROVAL=true
+    fi
+  fi
+
   if ! $_NEEDS_APPROVAL; then
     emit_decision "allow" "Non-destructive command"
     exit 0

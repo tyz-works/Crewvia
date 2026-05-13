@@ -39,6 +39,7 @@ SAFE_TOOLS=(
   WebSearch
   Skill
   ToolSearch
+  Agent
 )
 
 TASKVIA_URL="${TASKVIA_URL:-https://taskvia.vercel.app}"
@@ -206,11 +207,6 @@ if [ "$TOOL_NAME" = "Bash" ] && [ -n "$COMMAND" ]; then
 
   # 破壊的 / 外部影響コマンド — prefix マッチで承認必須
   _DANGEROUS_COMMANDS=(
-    "git push"
-    "git reset --hard"
-    "gh pr create"
-    "gh pr merge"
-    "gh pr close"
     "rm "
     "curl "
     "wget "

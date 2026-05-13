@@ -39,6 +39,7 @@ SAFE_TOOLS=(
   WebSearch
   Skill
   ToolSearch
+  Agent
 )
 
 TASKVIA_URL="${TASKVIA_URL:-https://taskvia.vercel.app}"
@@ -196,7 +197,7 @@ if [ "$TOOL_NAME" = "Bash" ] && [ -n "$COMMAND" ]; then
   _NEEDS_APPROVAL=false
 
   # 機密ファイルパターン — コマンド文字列に含まれていたら承認必須
-  _SENSITIVE_PATTERNS=(.env .pem .key _rsa _ed25519 _dsa .secret credentials .ssh/ .aws/ .config/)
+  _SENSITIVE_PATTERNS=(.env .pem .key _rsa _ed25519 _dsa .secret credentials .ssh/ .aws/)
   for _pat in "${_SENSITIVE_PATTERNS[@]}"; do
     if [[ "$COMMAND" == *"$_pat"* ]]; then
       _NEEDS_APPROVAL=true
@@ -206,11 +207,6 @@ if [ "$TOOL_NAME" = "Bash" ] && [ -n "$COMMAND" ]; then
 
   # 破壊的 / 外部影響コマンド — prefix マッチで承認必須
   _DANGEROUS_COMMANDS=(
-    "git push"
-    "git reset --hard"
-    "gh pr create"
-    "gh pr merge"
-    "gh pr close"
     "rm "
     "curl "
     "wget "
@@ -232,13 +228,33 @@ if [ "$TOOL_NAME" = "Bash" ] && [ -n "$COMMAND" ]; then
     fi
   done
 
+  # compound command 内の危険パターン検出（Python 側 _GLOBAL_DENY_SUBSTRINGS と二重化）
+  if [[ "$COMMAND" == *"&&"* || "$COMMAND" == *"||"* || "$COMMAND" == *";"* || "$COMMAND" == *"|"* ]]; then
+    _CMD_STRIPPED=$(printf '%s' "$COMMAND" | sed "s/'[^']*'//g; s/\"[^\"]*\"//g")
+    if printf '%s' "$_CMD_STRIPPED" | grep -qE '\brm\s+-\S*r\S*f'; then
+      _NEEDS_APPROVAL=true
+    fi
+    if printf '%s' "$_CMD_STRIPPED" | grep -qE '\bsudo\b'; then
+      _NEEDS_APPROVAL=true
+    fi
+    if printf '%s' "$_CMD_STRIPPED" | grep -qE '\|\s*(ba)?sh\b'; then
+      _NEEDS_APPROVAL=true
+    fi
+  fi
+
   if ! $_NEEDS_APPROVAL; then
-    emit_decision "allow" "Non-destructive command"
-    exit 0
+    # SKILLS 設定時は per-skill チェックへ進む（skill deny を評価するため）
+    # SKILLS 未設定時は非破壊コマンドとして即許可
+    if [ -z "${SKILLS:-}" ]; then
+      emit_decision "allow" "Non-destructive command"
+      exit 0
+    fi
   fi
 fi
 
 # Per-skill チェック（SKILLS がある場合のみ）
+# Note: Bash safety の後に配置。Non-Bash ツール (Edit/Write 等) と、
+# Bash safety で _NEEDS_APPROVAL=true になったコマンドがここに到達する。
 if [ -n "${SKILLS:-}" ] && [ -f "$_SKILL_PERMS_YAML" ] && [ -f "$_SKILL_PERMS_PY" ]; then
   # タスクファイルから skills を取得 (フォールバック: SKILLS env)
   _TASK_SKILLS="${SKILLS}"

@@ -243,12 +243,18 @@ if [ "$TOOL_NAME" = "Bash" ] && [ -n "$COMMAND" ]; then
   fi
 
   if ! $_NEEDS_APPROVAL; then
-    emit_decision "allow" "Non-destructive command"
-    exit 0
+    # SKILLS 設定時は per-skill チェックへ進む（skill deny を評価するため）
+    # SKILLS 未設定時は非破壊コマンドとして即許可
+    if [ -z "${SKILLS:-}" ]; then
+      emit_decision "allow" "Non-destructive command"
+      exit 0
+    fi
   fi
 fi
 
 # Per-skill チェック（SKILLS がある場合のみ）
+# Note: Bash safety の後に配置。Non-Bash ツール (Edit/Write 等) と、
+# Bash safety で _NEEDS_APPROVAL=true になったコマンドがここに到達する。
 if [ -n "${SKILLS:-}" ] && [ -f "$_SKILL_PERMS_YAML" ] && [ -f "$_SKILL_PERMS_PY" ]; then
   # タスクファイルから skills を取得 (フォールバック: SKILLS env)
   _TASK_SKILLS="${SKILLS}"

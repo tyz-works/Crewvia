@@ -15,7 +15,7 @@ workers:
   - name: Hana
     skills: [bash, ops]
     task_count: 3
-    last_active: 2026-05-03
+    last_active: 2026-05-12
   - name: Ren
     skills: [code, python]
     task_count: 1
@@ -36,15 +36,15 @@ workers:
   - name: Mika
     skills: [code, typescript]
     task_count: 13
-    last_active: 2026-05-03
+    last_active: 2026-05-12
   - name: Haruto
     skills: [bash, code]
     task_count: 10
-    last_active: 2026-05-05
+    last_active: 2026-05-12
   - name: Seo
     skills: [review]
     task_count: 20
-    last_active: 2026-05-03
+    last_active: 2026-05-12
   - name: Jiwon
     skills: [docs, research]
     task_count: 2
@@ -68,7 +68,7 @@ workers:
   - name: Arjun
     skills: [qa]
     task_count: 0
-    last_active: 2026-04-26
+    last_active: 2026-05-12
   - name: Priya
     skills: [planning]
     task_count: 0

@@ -25,7 +25,7 @@ wip_limit: 8
 # 環境変数での上書き:
 #   CREWVIA_DIRECTOR_MODEL=claude-opus-4-6
 #   CREWVIA_WORKER_MODEL=claude-sonnet-4-6
-director_model: claude-opus-4-6
+director_model: claude-opus-4-7
 worker_model: claude-sonnet-4-6
 
 # ===== 起動モード =====

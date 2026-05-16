@@ -228,8 +228,9 @@ skills:
       - "Read(**)"
       - "Grep(**)"
       - "Glob(**)"
+      # verdict 出力のみ書き込み許可（plan_reviewer.md 指定の唯一の出力先）
+      - "Write(**/plan_review.md)"
     deny:
-      - "Write(**)"
       - "Edit(**)"
       - "MultiEdit(**)"
       - "Bash(**)"

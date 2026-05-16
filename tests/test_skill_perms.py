@@ -229,3 +229,43 @@ class TestGlobalDenyOverridesSkillAllow:
     def test_docs_cannot_push_master(self):
         result = check_permission(_config(), "docs", "Bash(git push origin master)")
         assert result["decision"] == "deny"
+
+
+class TestPlanReview:
+    """plan_review skill: read-only with one exception — can write plan_review.md output."""
+
+    def test_plan_review_can_write_plan_review_md(self):
+        result = check_permission(
+            _config(), "plan_review", "Write(queue/missions/foo/plan_review.md)"
+        )
+        assert result["decision"] == "allow"
+
+    def test_plan_review_can_write_plan_review_md_absolute_path(self):
+        result = check_permission(
+            _config(),
+            "plan_review",
+            "Write(/Users/x/crewvia/queue/missions/bar/plan_review.md)",
+        )
+        assert result["decision"] == "allow"
+
+    def test_plan_review_cannot_auto_write_other_file(self):
+        result = check_permission(
+            _config(), "plan_review", "Write(queue/missions/foo/tasks/t001.md)"
+        )
+        assert result["decision"] != "allow"
+
+    def test_plan_review_cannot_edit(self):
+        result = check_permission(
+            _config(), "plan_review", "Edit(queue/missions/foo/plan_review.md)"
+        )
+        assert result["decision"] == "deny"
+
+    def test_plan_review_cannot_multiedit(self):
+        result = check_permission(
+            _config(), "plan_review", "MultiEdit(queue/missions/foo/plan_review.md)"
+        )
+        assert result["decision"] == "deny"
+
+    def test_plan_review_cannot_run_bash(self):
+        result = check_permission(_config(), "plan_review", "Bash(ls)")
+        assert result["decision"] == "deny"

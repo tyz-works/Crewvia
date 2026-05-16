@@ -229,3 +229,56 @@ class TestGlobalDenyOverridesSkillAllow:
     def test_docs_cannot_push_master(self):
         result = check_permission(_config(), "docs", "Bash(git push origin master)")
         assert result["decision"] == "deny"
+
+
+class TestVerifySkillBareTokenDeny:
+    """verify skill: read-only verifier. agents/verifier.md は Write/Edit/MultiEdit
+    が「権限層で deny されている」と明記しているが、以前は `Write(**)` 形式で
+    hook signature (bare token) と不一致だった。本テストは bare 形式の deny を pin。
+    """
+
+    def test_verify_cannot_write(self):
+        result = check_permission(_config(), "verify", "Write")
+        assert result["decision"] == "deny"
+
+    def test_verify_cannot_edit(self):
+        result = check_permission(_config(), "verify", "Edit")
+        assert result["decision"] == "deny"
+
+    def test_verify_cannot_multiedit(self):
+        result = check_permission(_config(), "verify", "MultiEdit")
+        assert result["decision"] == "deny"
+
+    def test_verify_can_run_npm_test(self):
+        result = check_permission(_config(), "verify", "Bash(npm test)")
+        assert result["decision"] == "allow"
+
+    def test_verify_cannot_git_commit(self):
+        result = check_permission(_config(), "verify", "Bash(git commit -m 'x')")
+        assert result["decision"] == "deny"
+
+
+class TestPlanningSkillBareTokenDeny:
+    """planning skill: plan.sh status/pull で読むだけのレビュアー。Write/Edit/MultiEdit
+    は intent 上禁止だが、以前は `Write(**)` 形式で never-match だった。bare 形式で pin。
+    """
+
+    def test_planning_cannot_write(self):
+        result = check_permission(_config(), "planning", "Write")
+        assert result["decision"] == "deny"
+
+    def test_planning_cannot_edit(self):
+        result = check_permission(_config(), "planning", "Edit")
+        assert result["decision"] == "deny"
+
+    def test_planning_cannot_multiedit(self):
+        result = check_permission(_config(), "planning", "MultiEdit")
+        assert result["decision"] == "deny"
+
+    def test_planning_can_run_plan_sh_status(self):
+        result = check_permission(_config(), "planning", "Bash(./scripts/plan.sh status)")
+        assert result["decision"] == "allow"
+
+    def test_planning_cannot_git_push(self):
+        result = check_permission(_config(), "planning", "Bash(git push origin feat/x)")
+        assert result["decision"] == "deny"

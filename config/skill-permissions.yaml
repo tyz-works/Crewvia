@@ -234,8 +234,15 @@ skills:
       - "Read(**)"
       - "Grep(**)"
       - "Glob(**)"
+      # hook (pre-tool-use.sh) は非 Bash ツールに bare な tool 名 (`Write` 等) を
+      # signature として渡すため、bare token で記述する。パス制限は agents/plan_reviewer.md
+      # で「plan_review.md 以外への出力禁止」として agent prompt 層で担保している。
+      - "Write"
     deny:
-      - "Write(**)"
+      # bare token は hook signature と完全一致。`Edit(**)` 等は将来 hook が
+      # file_path を含めるよう拡張された際の保険として残す。
+      - "Edit"
       - "Edit(**)"
+      - "MultiEdit"
       - "MultiEdit(**)"
       - "Bash(**)"

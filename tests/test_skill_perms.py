@@ -235,19 +235,25 @@ class TestVerifySkillBareTokenDeny:
     """verify skill: read-only verifier. agents/verifier.md は Write/Edit/MultiEdit
     が「権限層で deny されている」と明記しているが、以前は `Write(**)` 形式で
     hook signature (bare token) と不一致だった。本テストは bare 形式の deny を pin。
+
+    bare-token deny の test は source も pin する: 「test は通るが理由が違う」
+    (e.g., 別 layer (_global) が偶然 deny する) regression を検知するため。
     """
 
     def test_verify_cannot_write(self):
         result = check_permission(_config(), "verify", "Write")
         assert result["decision"] == "deny"
+        assert result["source"] == "skill:verify:deny:Write"
 
     def test_verify_cannot_edit(self):
         result = check_permission(_config(), "verify", "Edit")
         assert result["decision"] == "deny"
+        assert result["source"] == "skill:verify:deny:Edit"
 
     def test_verify_cannot_multiedit(self):
         result = check_permission(_config(), "verify", "MultiEdit")
         assert result["decision"] == "deny"
+        assert result["source"] == "skill:verify:deny:MultiEdit"
 
     def test_verify_can_run_npm_test(self):
         result = check_permission(_config(), "verify", "Bash(npm test)")
@@ -266,14 +272,17 @@ class TestPlanningSkillBareTokenDeny:
     def test_planning_cannot_write(self):
         result = check_permission(_config(), "planning", "Write")
         assert result["decision"] == "deny"
+        assert result["source"] == "skill:planning:deny:Write"
 
     def test_planning_cannot_edit(self):
         result = check_permission(_config(), "planning", "Edit")
         assert result["decision"] == "deny"
+        assert result["source"] == "skill:planning:deny:Edit"
 
     def test_planning_cannot_multiedit(self):
         result = check_permission(_config(), "planning", "MultiEdit")
         assert result["decision"] == "deny"
+        assert result["source"] == "skill:planning:deny:MultiEdit"
 
     def test_planning_can_run_plan_sh_status(self):
         result = check_permission(_config(), "planning", "Bash(./scripts/plan.sh status)")

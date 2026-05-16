@@ -244,9 +244,25 @@ class TestPlanReview:
         assert result["decision"] == "allow"
         assert "plan_review" in result["source"]
 
-    def test_plan_review_can_read(self):
-        result = check_permission(_config(), "plan_review", "Read(queue/missions/foo/mission.yaml)")
+    def test_plan_review_write_with_path_does_not_match_bare_allow(self):
+        # Pin: 今日の hook は非 Bash ツールに bare な signature を emit する。
+        # 将来 hook が Write(<path>) を emit するよう拡張された場合、bare "Write"
+        # allow ではマッチしなくなり plan_review が silent に Write 権限を失う。
+        # 本テストはその契約の境界を明示し、hook 拡張時にここが落ちて
+        # YAML/agent-prompt 側の再評価を強制する canary として残す。
+        result = check_permission(_config(), "plan_review", "Write(plan_review.md)")
+        assert result["decision"] != "allow"
+
+    def test_plan_review_read_allow_is_defense_in_depth(self):
+        # 注意: Read は hooks/pre-tool-use.sh の SAFE_TOOLS で short-circuit するため、
+        # production では YAML 層に到達しない。本 allow 行は SAFE_TOOLS が将来
+        # 削減された場合の defense-in-depth。source を pin することで「不要だから」
+        # と allow 行が削除されると検知できる。
+        result = check_permission(
+            _config(), "plan_review", "Read(queue/missions/foo/mission.yaml)"
+        )
         assert result["decision"] == "allow"
+        assert result["source"] == "skill:plan_review:allow:Read(**)"
 
     def test_plan_review_cannot_edit(self):
         result = check_permission(_config(), "plan_review", "Edit")

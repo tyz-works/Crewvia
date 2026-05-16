@@ -625,20 +625,19 @@ curl -s -X POST "$TASKVIA_URL/api/log" \
 
 コードを伴うミッションでは、以下のGitワークフローを厳守せよ。
 
-### タスク開始時: ブランチ作成
+### ブランチ・worktree の自動管理
 
-```bash
-# git-helpers.sh を読み込む
-source scripts/git-helpers.sh
+Worker が `plan.sh pull` を実行すると、ブランチと worktree が **自動的に** 作成される。
 
-# ブランチを作成する
-# 命名規則: task/{task_id}-{slug}
-# slug は英小文字・ハイフンのみ（例: add-auth-middleware）
-crewvia_create_branch "card-042" "add-auth-middleware"
-# → task/card-042-add-auth-middleware が作成される
+```
+ブランチ命名規則: task/{mission_slug}/{task_id}-{task_slug}
+worktree パス:   .claude/worktrees/{mission_slug}/{task_id}-{task_slug}/
 ```
 
-ブランチ名は現状 `plan.sh` の task frontmatter には保存されないため、Worker への伝達は `plan.sh add --description` 内に明記するか、Director から Worker メッセージで直接渡すこと。
+- `mission_slug`: kebab-case、英数とハイフンのみ（例: `20260411-auth-refactor`）
+- `task_slug`: タスクタイトルの ASCII 部分を kebab-case 化した文字列（plan.sh が自動生成）
+
+**Director がブランチを手動作成する必要はない。** `crewvia_create_branch` は廃止済み。Worker 起動後、pull 時に自動でブランチと worktree がセットアップされる。
 
 ### 全Worker完了後: PR 作成
 
@@ -648,7 +647,7 @@ crewvia_create_branch "card-042" "add-auth-middleware"
 source scripts/git-helpers.sh
 
 crewvia_create_pr \
-  "task/card-042-add-auth-middleware" \
+  "task/20260411-auth-refactor/t002-add-auth-middleware" \
   "feat: 認証ミドルウェアを追加" \
   "## 概要\n認証ミドルウェアを実装した。\n\n## 変更内容\n- middleware/auth.ts 追加\n- 既存ルートに認証チェック追加"
 # → PR URLが返される（例: https://github.com/org/repo/pull/42）

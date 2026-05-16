@@ -74,6 +74,11 @@
 | `AGENT_NAME` | 起動時に設定されるエージェント名 |
 | `TASK_TITLE` | 現在担当中のタスクタイトル |
 | `TASK_ID` | 現在担当中のカードID |
+| `CREWVIA_REPO_ROOT` | crewvia リポジトリの絶対パス。worktree 内からでも crewvia tools を参照できる |
+| `CREWVIA_QUEUE` | キューディレクトリの絶対パス（通常 `$CREWVIA_REPO_ROOT/queue`） |
+| `CREWVIA_MISSION_SLUG` | 担当中ミッションの slug（plan.sh pull 後に `.crewvia-env` 経由で設定） |
+| `CREWVIA_TASK_ID` | 担当中タスクの ID（plan.sh pull 後に設定） |
+| `CREWVIA_TASK_SLUG` | タスクタイトルを kebab-case 化した slug（worktree パス末尾に使用） |
 | `CREWVIA_PROJECT` | Taskvia に送るプロジェクト識別子。デフォルト: `crewvia` |
 | `CREWVIA_APPROVAL_CHANNEL` | 承認通知チャネル: `taskvia` / `ntfy` / `both`（config `approval_channel.mode` より優先） |
 | `NTFY_URL` | ntfy サーバーの URL。`approval_channel.ntfy.url` より優先 |

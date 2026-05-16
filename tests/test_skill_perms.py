@@ -232,40 +232,36 @@ class TestGlobalDenyOverridesSkillAllow:
 
 
 class TestPlanReview:
-    """plan_review skill: read-only with one exception — can write plan_review.md output."""
+    """plan_review skill: read + verdict-file write only.
 
-    def test_plan_review_can_write_plan_review_md(self):
-        result = check_permission(
-            _config(), "plan_review", "Write(queue/missions/foo/plan_review.md)"
-        )
+    Signatures match hooks/pre-tool-use.sh の実装: 非 Bash ツールは bare token
+    (`Write` 等)、Bash のみ `Bash(<command>)` 形式で渡される。
+    """
+
+    def test_plan_review_can_write(self):
+        # hook が emit する Write signature は bare token。パス制限は agent prompt 層。
+        result = check_permission(_config(), "plan_review", "Write")
         assert result["decision"] == "allow"
+        assert "plan_review" in result["source"]
 
-    def test_plan_review_can_write_plan_review_md_absolute_path(self):
-        result = check_permission(
-            _config(),
-            "plan_review",
-            "Write(/Users/x/crewvia/queue/missions/bar/plan_review.md)",
-        )
+    def test_plan_review_can_read(self):
+        result = check_permission(_config(), "plan_review", "Read(queue/missions/foo/mission.yaml)")
         assert result["decision"] == "allow"
-
-    def test_plan_review_cannot_auto_write_other_file(self):
-        result = check_permission(
-            _config(), "plan_review", "Write(queue/missions/foo/tasks/t001.md)"
-        )
-        assert result["decision"] != "allow"
 
     def test_plan_review_cannot_edit(self):
-        result = check_permission(
-            _config(), "plan_review", "Edit(queue/missions/foo/plan_review.md)"
-        )
+        result = check_permission(_config(), "plan_review", "Edit")
         assert result["decision"] == "deny"
 
     def test_plan_review_cannot_multiedit(self):
-        result = check_permission(
-            _config(), "plan_review", "MultiEdit(queue/missions/foo/plan_review.md)"
-        )
+        result = check_permission(_config(), "plan_review", "MultiEdit")
         assert result["decision"] == "deny"
 
     def test_plan_review_cannot_run_bash(self):
         result = check_permission(_config(), "plan_review", "Bash(ls)")
         assert result["decision"] == "deny"
+
+    def test_plan_review_global_deny_overrides_skill_bash_deny(self):
+        # _global.deny は skill.deny より先行。source は _global を指すべき。
+        result = check_permission(_config(), "plan_review", "Bash(rm -rf /tmp/x)")
+        assert result["decision"] == "deny"
+        assert "_global" in result["source"]

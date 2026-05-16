@@ -233,7 +233,7 @@ if [[ "$SUBCOMMAND" == "dashboard" ]]; then
 fi
 
 # Delegate to Python3
-python3 - "$QUEUE_DIR" "$SUBCOMMAND" "$@" <<'PYEOF'
+python3 - "$QUEUE_DIR" "$SUBCOMMAND" "$REPO_ROOT" "$@" <<'PYEOF'
 import sys
 import os
 import json
@@ -241,12 +241,15 @@ import fcntl
 import re
 import shutil
 import hashlib
+import subprocess
+import shlex
 import urllib.request
 from datetime import datetime, timezone
 
 QUEUE_DIR = sys.argv[1]
 SUBCOMMAND = sys.argv[2]
-ARGS = sys.argv[3:]
+REPO_ROOT = sys.argv[3]
+ARGS = sys.argv[4:]
 
 STATE_FILE = os.path.join(QUEUE_DIR, 'state.yaml')
 MISSIONS_DIR = os.path.join(QUEUE_DIR, 'missions')
@@ -1353,6 +1356,46 @@ def cmd_pull(args):
 
     ok = taskvia_sync_pull(chosen_holder[0]['mission'], chosen_holder[0]['id'], agent)
     _print_sync_summary(ok)
+
+    # Derive a URL-safe task slug from the title for worktree naming
+    def _slugify(title, fallback):
+        ascii_only = re.sub(r'[^\x00-\x7F]+', ' ', title)
+        normalized = re.sub(r'[^a-zA-Z0-9]+', ' ', ascii_only)
+        parts = [p.lower() for p in normalized.split() if p]
+        slug = '-'.join(parts)[:40].rstrip('-')
+        return slug or fallback
+
+    task_id = chosen_holder[0]['id']
+    mission_slug = chosen_holder[0]['mission']
+    task_slug = _slugify(chosen_holder[0]['title'], task_id)
+    worktree_path = None
+
+    git_helpers = os.path.join(REPO_ROOT, 'scripts', 'git-helpers.sh')
+    if os.path.exists(git_helpers):
+        wt_cmd = (
+            f'source {shlex.quote(git_helpers)} && '
+            f'crewvia_create_worktree {shlex.quote(mission_slug)} '
+            f'{shlex.quote(task_id)} {shlex.quote(task_slug)}'
+        )
+        wt = subprocess.run(
+            ['bash', '-c', wt_cmd],
+            capture_output=True, text=True, cwd=REPO_ROOT,
+        )
+        if wt.returncode == 0:
+            worktree_path = wt.stdout.strip()
+            env_file = os.path.join(worktree_path, '.crewvia-env')
+            with open(env_file, 'w') as _ef:
+                _ef.write(f'export CREWVIA_MISSION_SLUG={shlex.quote(mission_slug)}\n')
+                _ef.write(f'export CREWVIA_TASK_ID={shlex.quote(task_id)}\n')
+                _ef.write(f'export CREWVIA_TASK_SLUG={shlex.quote(task_slug)}\n')
+        else:
+            print(
+                f'[plan.sh pull] WARNING: worktree creation skipped:\n{wt.stderr.strip()}',
+                file=sys.stderr,
+            )
+
+    chosen_holder[0]['task_slug'] = task_slug
+    chosen_holder[0]['worktree_path'] = worktree_path
 
     print(json.dumps(chosen_holder[0], ensure_ascii=False))
 

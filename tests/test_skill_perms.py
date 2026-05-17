@@ -6,6 +6,8 @@ import os
 import sys
 import tempfile
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "hooks"))
 from lib_skill_perms import check_permission, load_config
 
@@ -231,29 +233,54 @@ class TestGlobalDenyOverridesSkillAllow:
         assert result["decision"] == "deny"
 
 
-class TestVerifySkillBareTokenDeny:
-    """verify skill: read-only verifier. agents/verifier.md は Write/Edit/MultiEdit
-    が「権限層で deny されている」と明記しているが、以前は `Write(**)` 形式で
-    hook signature (bare token) と不一致だった。本テストは bare 形式の deny を pin。
+class TestReadOnlySkillsBareTokenDeny:
+    """Read-only な skill 群 (plan_review / verify / planning) の bare-token deny を
+    parametrize で網羅。新しい read-only skill を足すときは BARE_DENY_CASES に
+    1 行追加するだけで OK。
 
-    bare-token deny の test は source も pin する: 「test は通るが理由が違う」
-    (e.g., 別 layer (_global) が偶然 deny する) regression を検知するため。
+    背景: hooks/pre-tool-use.sh:157-161 は非 Bash ツールに bare token (`Write`/
+    `Edit`/`MultiEdit`) を signature として渡すため、YAML パターンも bare 形で
+    書かないと never-match (PR #92, #93 で修正済)。
+
+    pin する 2 軸:
+    - decision == "deny" — 動作レベル
+    - source == "skill:<skill>:deny:<tool>" — レイヤーまで pin。これにより
+      「test は通るが実は別 layer (_global 等) が偶然 deny している」regression
+      も検知できる
     """
 
-    def test_verify_cannot_write(self):
-        result = check_permission(_config(), "verify", "Write")
-        assert result["decision"] == "deny"
-        assert result["source"] == "skill:verify:deny:Write"
+    # plan_review は Write が allow (verdict 出力のため) なので Write は除外。
+    # verify / planning は Write/Edit/MultiEdit 全て deny。
+    BARE_DENY_CASES = [
+        ("plan_review", "Edit"),
+        ("plan_review", "MultiEdit"),
+        ("verify", "Write"),
+        ("verify", "Edit"),
+        ("verify", "MultiEdit"),
+        ("planning", "Write"),
+        ("planning", "Edit"),
+        ("planning", "MultiEdit"),
+    ]
 
-    def test_verify_cannot_edit(self):
-        result = check_permission(_config(), "verify", "Edit")
+    @pytest.mark.parametrize("skill,tool", BARE_DENY_CASES)
+    def test_skill_denies_bare_token(self, skill, tool):
+        result = check_permission(_config(), skill, tool)
         assert result["decision"] == "deny"
-        assert result["source"] == "skill:verify:deny:Edit"
+        assert result["source"] == f"skill:{skill}:deny:{tool}"
 
-    def test_verify_cannot_multiedit(self):
-        result = check_permission(_config(), "verify", "MultiEdit")
+    @pytest.mark.parametrize("skill", ["plan_review", "verify", "planning"])
+    def test_global_deny_overrides_skill_bash_deny(self, skill):
+        # _global.deny は skill.deny より先行。source は _global を指すべき。
+        # PR #93 review (Important #2) で defer された verify/planning 分もここで網羅。
+        result = check_permission(_config(), skill, "Bash(rm -rf /tmp/x)")
         assert result["decision"] == "deny"
-        assert result["source"] == "skill:verify:deny:MultiEdit"
+        assert "_global" in result["source"]
+
+
+class TestVerifySkillSpecifics:
+    """verify skill 固有の allow/Bash deny テスト。bare-token deny は
+    TestReadOnlySkillsBareTokenDeny に移動済。
+    """
 
     def test_verify_can_run_npm_test(self):
         result = check_permission(_config(), "verify", "Bash(npm test)")
@@ -264,25 +291,10 @@ class TestVerifySkillBareTokenDeny:
         assert result["decision"] == "deny"
 
 
-class TestPlanningSkillBareTokenDeny:
-    """planning skill: plan.sh status/pull で読むだけのレビュアー。Write/Edit/MultiEdit
-    は intent 上禁止だが、以前は `Write(**)` 形式で never-match だった。bare 形式で pin。
+class TestPlanningSkillSpecifics:
+    """planning skill 固有の allow/Bash deny テスト。bare-token deny は
+    TestReadOnlySkillsBareTokenDeny に移動済。
     """
-
-    def test_planning_cannot_write(self):
-        result = check_permission(_config(), "planning", "Write")
-        assert result["decision"] == "deny"
-        assert result["source"] == "skill:planning:deny:Write"
-
-    def test_planning_cannot_edit(self):
-        result = check_permission(_config(), "planning", "Edit")
-        assert result["decision"] == "deny"
-        assert result["source"] == "skill:planning:deny:Edit"
-
-    def test_planning_cannot_multiedit(self):
-        result = check_permission(_config(), "planning", "MultiEdit")
-        assert result["decision"] == "deny"
-        assert result["source"] == "skill:planning:deny:MultiEdit"
 
     def test_planning_can_run_plan_sh_status(self):
         result = check_permission(_config(), "planning", "Bash(./scripts/plan.sh status)")
@@ -294,10 +306,9 @@ class TestPlanningSkillBareTokenDeny:
 
 
 class TestPlanReview:
-    """plan_review skill: read + verdict-file write only.
-
-    Signatures match hooks/pre-tool-use.sh の実装: 非 Bash ツールは bare token
-    (`Write` 等)、Bash のみ `Bash(<command>)` 形式で渡される。
+    """plan_review skill 固有のテスト: Write allow (narrow), hook 契約 canary,
+    Read defense-in-depth, Bash deny。bare-token Edit/MultiEdit deny と
+    _global.deny precedence は TestReadOnlySkillsBareTokenDeny に移動済。
     """
 
     def test_plan_review_can_write(self):
@@ -326,20 +337,6 @@ class TestPlanReview:
         assert result["decision"] == "allow"
         assert result["source"] == "skill:plan_review:allow:Read(**)"
 
-    def test_plan_review_cannot_edit(self):
-        result = check_permission(_config(), "plan_review", "Edit")
-        assert result["decision"] == "deny"
-
-    def test_plan_review_cannot_multiedit(self):
-        result = check_permission(_config(), "plan_review", "MultiEdit")
-        assert result["decision"] == "deny"
-
     def test_plan_review_cannot_run_bash(self):
         result = check_permission(_config(), "plan_review", "Bash(ls)")
         assert result["decision"] == "deny"
-
-    def test_plan_review_global_deny_overrides_skill_bash_deny(self):
-        # _global.deny は skill.deny より先行。source は _global を指すべき。
-        result = check_permission(_config(), "plan_review", "Bash(rm -rf /tmp/x)")
-        assert result["decision"] == "deny"
-        assert "_global" in result["source"]

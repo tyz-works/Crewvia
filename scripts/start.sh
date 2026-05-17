@@ -390,7 +390,7 @@ with open(sys.argv[2], 'w') as f:
     json.dump(existing, f, ensure_ascii=False, indent=2)
 PYEOF
   fi
-  LAUNCH_CMD="$ENV_EXPORTS; cd '$WORK_DIR'; claude${MODEL_CLI_ARG}"
+  LAUNCH_CMD="$ENV_EXPORTS; cd '$WORK_DIR'; claude${MODEL_CLI_ARG} --permission-mode auto"
 
   if ! tmux has-session -t "$SESSION" 2>/dev/null; then
     echo "[crewvia] Creating tmux session: $SESSION"
@@ -476,5 +476,5 @@ else
     echo "[crewvia] ERROR: failed to cd into $WORK_DIR" >&2
     exit 1
   }
-  exec claude "${MODEL_FLAG[@]+"${MODEL_FLAG[@]}"}" "${PROMPT_FLAG[@]+"${PROMPT_FLAG[@]}"}"
+  exec claude "${MODEL_FLAG[@]+"${MODEL_FLAG[@]}"}" "${PROMPT_FLAG[@]+"${PROMPT_FLAG[@]}"}" --permission-mode auto
 fi

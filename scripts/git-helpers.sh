@@ -54,9 +54,9 @@ crewvia_create_worktree() {
   mkdir -p "$(dirname "$worktree_path")"
 
   if git show-ref --verify --quiet "refs/heads/${branch}"; then
-    git worktree add "$worktree_path" "$branch"
+    git worktree add "$worktree_path" "$branch" >&2
   else
-    git worktree add -b "$branch" "$worktree_path" "$base"
+    git worktree add -b "$branch" "$worktree_path" "$base" >&2
   fi
 
   echo "$worktree_path"

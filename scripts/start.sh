@@ -245,6 +245,8 @@ fi
 # 切り替わった後も、plan.sh / registry / knowledge / hooks などを絶対パスで
 # 呼び出せるように、常に export する。
 export CREWVIA_REPO="$REPO_ROOT"
+export CREWVIA_REPO_ROOT="$REPO_ROOT"
+export CREWVIA_QUEUE="${REPO_ROOT}/queue"
 
 # Export SKILLS as comma-separated env var
 if [[ ${#SKILLS_ARR[@]} -gt 0 ]]; then
@@ -358,7 +360,7 @@ if [[ "${CREWVIA_TMUX:-0}" == "1" ]]; then
   SESSION="crewvia"
   WINDOW_NAME="${AGENT_NAME}-${ROLE}"
 
-  ENV_EXPORTS="export AGENT_NAME='$AGENT_NAME' TASKVIA_URL='$TASKVIA_URL' TASKVIA_TOKEN='${TASKVIA_TOKEN:-}' CREWVIA_TASKVIA='${CREWVIA_TASKVIA:-enabled}' ROLE='$ROLE' SKILLS='${SKILLS:-}' CREWVIA_REPO='$CREWVIA_REPO' CREWVIA_APPROVAL_CHANNEL='${CREWVIA_APPROVAL_CHANNEL:-taskvia}' NTFY_URL='${NTFY_URL:-}' NTFY_TOPIC='${NTFY_TOPIC:-}' NTFY_USER='${NTFY_USER:-}' NTFY_PASS='${NTFY_PASS:-}' APPROVAL_TOKEN_TTL_SECONDS='${APPROVAL_TOKEN_TTL_SECONDS:-900}'"
+  ENV_EXPORTS="export AGENT_NAME='$AGENT_NAME' TASKVIA_URL='$TASKVIA_URL' TASKVIA_TOKEN='${TASKVIA_TOKEN:-}' CREWVIA_TASKVIA='${CREWVIA_TASKVIA:-enabled}' ROLE='$ROLE' SKILLS='${SKILLS:-}' CREWVIA_REPO='$CREWVIA_REPO' CREWVIA_REPO_ROOT='$CREWVIA_REPO_ROOT' CREWVIA_QUEUE='$CREWVIA_QUEUE' CREWVIA_APPROVAL_CHANNEL='${CREWVIA_APPROVAL_CHANNEL:-taskvia}' NTFY_URL='${NTFY_URL:-}' NTFY_TOPIC='${NTFY_TOPIC:-}' NTFY_USER='${NTFY_USER:-}' NTFY_PASS='${NTFY_PASS:-}' APPROVAL_TOKEN_TTL_SECONDS='${APPROVAL_TOKEN_TTL_SECONDS:-900}'"
   [[ "${ROLE}" == "worker" ]] && [[ "$WORK_DIR" != "$REPO_ROOT" ]] && ENV_EXPORTS+=" TARGET_DIR='$WORK_DIR'"
 
   # --model flag (空なら省略)
@@ -427,7 +429,11 @@ PYEOF
       # TARGET_DIR が設定されている場合は --target-dir を渡して target 不一致タスクをスキップ
       PULL_TARGET_DIR_ARG=""
       [[ -n "${TARGET_DIR:-}" ]] && PULL_TARGET_DIR_ARG=" --target-dir ${TARGET_DIR}"
-      KICKOFF_MSG="ミッション開始。./scripts/plan.sh pull --agent ${AGENT_NAME} --skills ${SKILLS}${PULL_TARGET_DIR_ARG} でタスクを取得し、指示に従って作業してください。完了したら ./scripts/plan.sh done で報告し、待機してください（Dispatcher が次のタスクを自動割り当てします）。"
+      if [[ -n "${TARGET_DIR:-}" ]]; then
+        KICKOFF_MSG="ミッション開始。./scripts/plan.sh pull --agent ${AGENT_NAME} --skills ${SKILLS} --target-dir ${TARGET_DIR} でタスクを取得し、指示に従って作業してください。完了したら ./scripts/plan.sh done で報告し、待機してください（Dispatcher が次のタスクを自動割り当てします）。"
+      else
+        KICKOFF_MSG="ミッション開始。./scripts/plan.sh pull --agent ${AGENT_NAME} --skills ${SKILLS} でタスクを取得し、指示に従って作業してください。JSON に worktree_path が含まれる場合はそのディレクトリに cd し、.crewvia-env を source してから作業してください（例: cd <worktree_path> && source .crewvia-env）。完了したら ./scripts/plan.sh done で報告し、待機してください（Dispatcher が次のタスクを自動割り当てします）。"
+      fi
     else
       KICKOFF_MSG="ミッション開始。./scripts/plan.sh status で状態を確認し、タスク分解・Worker 割り当て・全体管理を開始してください。"
     fi

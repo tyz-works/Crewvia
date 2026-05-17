@@ -202,9 +202,13 @@ skills:
       - "Bash(git log*)"
       - "Bash(python3 scripts/verify-task.sh*)"
     deny:
-      - "Write(**)"
-      - "Edit(**)"
-      - "MultiEdit(**)"
+      # hooks/pre-tool-use.sh:157-161 は非 Bash ツールに bare token を渡すため
+      # bare 形式で記述する (research / review skill と同様)。`Edit(**)` 等は
+      # never-match だったため削除。intent は agents/verifier.md にも記載通り
+      # 「コード変更なし、検証のみ」。
+      - "Edit"
+      - "Write"
+      - "MultiEdit"
       - "Bash(git commit*)"
       - "Bash(git push*)"
       - "Bash(rm*)"
@@ -217,9 +221,11 @@ skills:
       - "Bash(git log*)"
       - "Bash(git diff*)"
     deny:
-      - "Write(**)"
-      - "Edit(**)"
-      - "MultiEdit(**)"
+      # bare 形式: research / review skill と同じ規約。hook の bare token
+      # signature と一致させる。planning は plan.sh status/pull で読むだけ。
+      - "Edit"
+      - "Write"
+      - "MultiEdit"
       - "Bash(git commit*)"
       - "Bash(git push*)"
 
@@ -228,8 +234,15 @@ skills:
       - "Read(**)"
       - "Grep(**)"
       - "Glob(**)"
+      # hook (pre-tool-use.sh) は非 Bash ツールに bare な tool 名 (`Write` 等) を
+      # signature として渡すため、bare token で記述する。パス制限は agents/plan_reviewer.md
+      # で「plan_review.md 以外への出力禁止」として agent prompt 層で担保している。
+      - "Write"
     deny:
-      - "Write(**)"
+      # bare token は hook signature と完全一致。`Edit(**)` 等は将来 hook が
+      # file_path を含めるよう拡張された際の保険として残す。
+      - "Edit"
       - "Edit(**)"
+      - "MultiEdit"
       - "MultiEdit(**)"
       - "Bash(**)"

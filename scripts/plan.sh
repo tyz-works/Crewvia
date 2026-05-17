@@ -1369,9 +1369,10 @@ def cmd_pull(args):
     mission_slug = chosen_holder[0]['mission']
     task_slug = _slugify(chosen_holder[0]['title'], task_id)
     worktree_path = None
+    task_target_dir = chosen_holder[0].get('target_dir')
 
     git_helpers = os.path.join(REPO_ROOT, 'scripts', 'git-helpers.sh')
-    if os.path.exists(git_helpers):
+    if not task_target_dir and os.path.exists(git_helpers):
         wt_cmd = (
             f'source {shlex.quote(git_helpers)} && '
             f'crewvia_create_worktree {shlex.quote(mission_slug)} '

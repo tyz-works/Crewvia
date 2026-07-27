@@ -9,11 +9,15 @@
 # 解決するため、両者が別ファイルを指し dispatcher からは存在しないファイルに
 # 見える → Director への通知が中身なしで飛ぶ (task_158 で実機再現)。
 #
-# 修正: 書き手・読み手ともに scripts/git-helpers.sh の crewvia_handoff_path()
+# 修正: 書き手 (agents/worker.md) は scripts/git-helpers.sh の crewvia_handoff_path()
 # (== main repo root からの絶対パス、worktree の cwd に依存しない) を単一の
-# 真実源として使う。このテストは、worktree の中から crewvia_handoff_path で
-# 書いたファイルが、main repo root から見て存在することを実機で確認する
-# (dispatcher.sh の hp.exists() 相当のチェック)。
+# 真実源として使う。読み手 (scripts/dispatcher.sh の handoff detection) は
+# embedded Python (`python3 - <<'PYEOF'`) のためこの bash 関数を直接 source
+# できないが、crewvia_handoff_path が返す絶対パスをそのまま受け取り、
+# 非絶対パスを受け取った場合は警告を出しつつ main repo root 基準で解決する
+# (同じ絶対パス規約に独自実装で追随している)。このテストは、worktree の中から
+# crewvia_handoff_path で書いたファイルが、main repo root から見て存在することを
+# 実機で確認する (dispatcher.sh の hp.exists() 相当のチェック)。
 #
 # 実行: bash scripts/test_handoff_path.sh
 # 副作用: 一時的な worktree/branch/HANDOFF ファイルを作成し、終了時に必ず削除する
@@ -118,6 +122,42 @@ if git -C "$OWN_CHECKOUT_ROOT" check-ignore -q "registry/handoffs/${AGENT_NAME}/
   pass "registry/handoffs/ is gitignored (current-state visibility does not depend on git branch/checkout)"
 else
   fail "registry/handoffs/ is NOT gitignored — a HANDOFF.md could get committed and become branch-dependent"
+fi
+
+# --- 静的チェック: agents/worker.md が worker.md:136 の絶対パス規約を守っていること ---
+# ★★W-1 敵対的検証で判明した欠陥A: 上の実機テストは crewvia_handoff_path() を直接呼ぶだけで
+# agents/worker.md を一度も読まない。そのため誰かが worker.md の Handoff 手順 (Step 2) を
+# 元の相対パス "registry/handoffs/$AGENT_NAME/${TASK_ID}_HANDOFF.md" へ書き戻しても、
+# 上のテストは緑のまま通ってしまう (実測済み: 2026-07-27, Worf)。
+# ここでは worker.md 本文の ```bash コードブロックを静的に検査し、この回帰を検出する。
+# 対象は worker.md:136 の規約が明示的に適用される2箇所 (:582 相当の handoff、:514 相当の
+# verify-task.sh) に限定する — agents/*.md 全体には他にも相対 registry/ 参照が残っているが、
+# それらは別ミッション扱い (F1 registry/workers.yaml, F7 Verifier 到達不能) であり
+# task_158 の対象外 (W-3 参照)。ここを全面 grep にすると無関係な既知の残存に対して
+# 誤検知で fail する。
+# OWN_CHECKOUT_ROOT (not REPO_ROOT): agents/worker.md はブランチ依存の tracked ファイル
+# なので、gitignore チェックと同じ理由で「今チェックアウトされているこの checkout」を見る
+# 必要がある (REPO_ROOT はメインクローンが指す任意のブランチであり、fix ブランチとは限らない)。
+WORKER_MD="$OWN_CHECKOUT_ROOT/agents/worker.md"
+extract_bash_blocks() {
+  awk '/^```bash/{flag=1; next} /^```/{flag=0} flag' "$1"
+}
+WORKER_BASH_BLOCKS="$(extract_bash_blocks "$WORKER_MD")"
+
+if echo "$WORKER_BASH_BLOCKS" | grep -qE '^HANDOFF_PATH="?registry/handoffs/'; then
+  fail "agents/worker.md の Handoff 手順が crewvia_handoff_path() を経由しない生の相対パスに回帰している (task_158 の元バグの再発)"
+elif echo "$WORKER_BASH_BLOCKS" | grep -qF 'HANDOFF_PATH="$(crewvia_handoff_path'; then
+  pass "agents/worker.md の Handoff 手順は引き続き crewvia_handoff_path() 経由で HANDOFF_PATH を解決している"
+else
+  fail "agents/worker.md の Handoff 手順から HANDOFF_PATH の代入行が見つからない (想定外の構造変化 — 要調査)"
+fi
+
+if echo "$WORKER_BASH_BLOCKS" | grep -qE '(^|[^"$/[:alnum:]_])\.?/?scripts/verify-task\.sh'; then
+  fail "agents/worker.md の verify-task.sh 呼び出しが \$CREWVIA_REPO 起点でない相対パスに回帰している (worker.md:136 違反の再発)"
+elif echo "$WORKER_BASH_BLOCKS" | grep -qF '"$CREWVIA_REPO/scripts/verify-task.sh"'; then
+  pass "agents/worker.md の verify-task.sh 呼び出しは引き続き \$CREWVIA_REPO 起点の絶対パスである"
+else
+  fail "agents/worker.md から verify-task.sh の呼び出し行が見つからない (想定外の構造変化 — 要調査)"
 fi
 
 echo ""

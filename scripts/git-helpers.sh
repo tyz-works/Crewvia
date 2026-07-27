@@ -22,12 +22,16 @@ _crewvia_repo_root() {
 
 # crewvia_handoff_path <agent_name> <task_id>
 #   Canonical absolute path for a Worker's HANDOFF.md (graceful handoff protocol).
-#   Shared by the writer (agents/worker.md Handoff 手順 Step 2) and the reader
-#   (scripts/dispatcher.sh handoff detection). Always resolves under the MAIN
-#   repo root via _crewvia_repo_root (works from inside a per-task worktree,
-#   task_158: a plain relative path there resolved to two different files for
-#   writer vs reader). registry/handoffs/ is gitignored, so visibility does not
-#   depend on which branch/worktree is checked out.
+#   Used by the writer (agents/worker.md Handoff 手順 Step 2) to produce a single,
+#   worktree-independent path. Always resolves under the MAIN repo root via
+#   _crewvia_repo_root (works from inside a per-task worktree — task_158: a plain
+#   relative path there resolved to two different files for writer vs reader).
+#   The reader (scripts/dispatcher.sh handoff detection) cannot source this bash
+#   function — that logic is embedded Python (dispatcher.sh invokes it via
+#   `python3 - <<'PYEOF'`) — so it independently expects handoff_path to already
+#   be absolute and warns if it ever receives one that is not. registry/handoffs/
+#   is gitignored, so visibility does not depend on which branch/worktree is
+#   checked out.
 crewvia_handoff_path() {
   local agent_name="${1:-}" task_id="${2:-}"
 

@@ -575,11 +575,15 @@ Watchdog が hard timeout 予告を送信した時、Worker はこのプロト�
 
 **Step 1**: 現在の作業を可能な範囲でキリの良い状態まで進める（最大60秒以内）
 
-**Step 2**: HANDOFF.md を作成する:
+**Step 2**: HANDOFF.md を作成する。★相対パス `registry/handoffs/...` は使わないこと
+(worker.md:136 の規約通り絶対パスで呼ぶ — cwd が worktree の場合、相対パスは dispatcher が
+読む main repo 側の `registry/handoffs/` と別ファイルを指してしまい、Director への通知が
+中身なしで飛ぶ。`crewvia_handoff_path` は writer/reader 共有の解決関数):
 
 ```bash
-mkdir -p "registry/handoffs/$AGENT_NAME"
-HANDOFF_PATH="registry/handoffs/$AGENT_NAME/${TASK_ID}_HANDOFF.md"
+source "$CREWVIA_REPO/scripts/git-helpers.sh"
+HANDOFF_PATH="$(crewvia_handoff_path "$AGENT_NAME" "$TASK_ID")"
+mkdir -p "$(dirname "$HANDOFF_PATH")"
 ```
 
 **Step 3**: HANDOFF.md に以下を記述する（下記テンプレート参照）

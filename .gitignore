@@ -32,6 +32,7 @@ registry/heartbeats/
 registry/activity/
 registry/notifications/
 registry/approvals/
+registry/handoffs/
 registry/dispatcher.log
 registry/watchdog.log
 logs/

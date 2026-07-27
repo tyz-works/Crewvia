@@ -508,10 +508,14 @@ PYEOF
 
 ### verify-task.sh による事前機械 check（オプション）
 
-Step 5 の `plan.sh done` を呼ぶ前に、自分で機械 check を走らせることができる:
+Step 5 の `plan.sh done` を呼ぶ前に、自分で機械 check を走らせることができる。
+★相対パス `./scripts/verify-task.sh` は使わないこと(worker.md:136 の規約通り絶対パスで呼ぶ —
+cwd が worktree の場合、verify-task.sh 内の `SCRIPT_DIR` が worktree 側を指し、その既定の
+`QUEUE_DIR`（`$SCRIPT_DIR/../queue`）も worktree/queue に解決されるが、`queue/` は gitignore
+対象で worktree には存在しない):
 
 ```bash
-./scripts/verify-task.sh <task_id>
+"$CREWVIA_REPO/scripts/verify-task.sh" <task_id>
 ```
 
 - task frontmatter の `verification.commands` に記述されたコマンドを並列実行
@@ -575,11 +579,17 @@ Watchdog が hard timeout 予告を送信した時、Worker はこのプロト�
 
 **Step 1**: 現在の作業を可能な範囲でキリの良い状態まで進める（最大60秒以内）
 
-**Step 2**: HANDOFF.md を作成する:
+**Step 2**: HANDOFF.md を作成する。★相対パス `registry/handoffs/...` は使わないこと
+(worker.md:136 の規約通り絶対パスで呼ぶ — cwd が worktree の場合、相対パスは dispatcher が
+読む main repo 側の `registry/handoffs/` と別ファイルを指してしまい、Director への通知が
+中身なしで飛ぶ。`crewvia_handoff_path` は writer 側の解決関数。dispatcher.sh の読み手側は
+embedded Python のためこの bash 関数を直接は呼べず、絶対パスであることを前提に独自実装で
+検査している):
 
 ```bash
-mkdir -p "registry/handoffs/$AGENT_NAME"
-HANDOFF_PATH="registry/handoffs/$AGENT_NAME/${TASK_ID}_HANDOFF.md"
+source "$CREWVIA_REPO/scripts/git-helpers.sh"
+HANDOFF_PATH="$(crewvia_handoff_path "$AGENT_NAME" "$TASK_ID")"
+mkdir -p "$(dirname "$HANDOFF_PATH")"
 ```
 
 **Step 3**: HANDOFF.md に以下を記述する（下記テンプレート参照）

@@ -778,10 +778,19 @@ def dispatch():
                 try:
                     hp = Path(handoff_path)
                     if not hp.is_absolute():
+                        # task_158: writer(worker.md)は crewvia_handoff_path 経由で常に絶対パスを
+                        # 書くはずなので、ここに来るのは規約からの逸脱(回帰)。cwd(worktree)基準の
+                        # 相対パスは main repo 側から見て別ファイルを指し handoff_summary が空に
+                        # なる既知の壊れ方(task_158)なので、黙って空文字にせず明示的に警告する。
+                        log(f"WARNING: handoff_path is not absolute (task_158 regression?): "
+                            f"{slug}/{task_id} handoff_path={handoff_path!r}")
                         hp = REGISTRY_DIR.parent / handoff_path
                     if hp.exists():
                         lines = hp.read_text().splitlines()[:10]
                         handoff_summary = ' | '.join(lines)
+                    else:
+                        log(f"WARNING: handoff file not found at resolved path: "
+                            f"{slug}/{task_id} resolved={hp}")
                 except Exception:
                     handoff_summary = '(読み取り失敗)'
                 msg = (

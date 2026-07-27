@@ -67,3 +67,19 @@ jobs:
 
           sys.exit(1 if failed else 0)
           EOF
+
+  handoff-path-test:
+    name: Handoff Path Regression Test (task_158)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: git identity (required for git worktree add in CI)
+        run: |
+          git config user.email "ci@crewvia.local"
+          git config user.name "Crewvia CI"
+
+      - name: scripts/test_handoff_path.sh
+        run: bash scripts/test_handoff_path.sh

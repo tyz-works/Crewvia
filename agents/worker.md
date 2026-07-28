@@ -145,7 +145,14 @@ task の `target_dir` が非 null の場合、`plan.sh pull` は **worktree を�
   ```bash
   "$CREWVIA_REPO/scripts/plan.sh" done t002 "result" --mission <slug>
   ```
-- hooks (pre-tool-use.sh / post-tool-use.sh) は `~/.claude/settings.json` に絶対パスで登録されているので cwd に依存せず動く
+- hooks (pre-tool-use.sh / post-tool-use.sh) は `~/.claude/settings.json`(ユーザーレベル)ではなく、
+  crewvia の**プロジェクトレベル** `.claude/settings.json`(`$CREWVIA_REPO/.claude/settings.json`)に
+  絶対パスで登録されている。★これは cwd 依存である(task_160 F8 実測で確認済み — worktree モード
+  では発火するが、TARGET_DIR モードで cwd が crewvia 配下から外れると発火しない)。
+  `scripts/start.sh` は TARGET_DIR モードの Worker 起動時に `--settings "$CREWVIA_REPO/.claude/settings.json"`
+  を明示的に渡すことでこれを補っている(target project 自身の `.claude/settings.json` は上書きしない・
+  `~/.claude/settings.json` へのユーザーレベル登録は行わない)。手動で `claude` を起動する場合は
+  この `--settings` フラグを自分で付け忘れないこと。
 
 ### 作業スコープの制約 (重要)
 

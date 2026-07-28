@@ -30,7 +30,7 @@ import re
 from datetime import date
 
 sys.path.insert(0, sys.argv[1])
-from lib_registry import parse, write
+from lib_registry import parse, write, with_lock
 
 names_yaml_path = sys.argv[2]
 registry_yaml_path = sys.argv[3]
@@ -103,68 +103,76 @@ def parse_worker_names(path):
 
 
 pool_names, custom_map = parse_worker_names(names_yaml_path)
-header, order, by_name = parse(registry_yaml_path)
-
-# Step 2: Return existing name if the same skill set is already registered.
-# Skip director entries — their empty skills list would false-match callers
-# that also pass zero skills (e.g. `start.sh worker` with no args).
-for name in order:
-    w = by_name[name]
-    if w.get('role') == 'director':
-        continue
-    if set(w['skills']) == input_skills_set:
-        print(w['name'])
-        sys.exit(0)
-
-# Step 3: Find the first eligible name not already in the registry.
-# All registered names are excluded (director + worker alike) so a new
-# Worker never collides with an existing entry.
-registered_names = set(by_name.keys())
 
 
-def is_pool_eligible(name):
-    c = custom_map.get(name)
-    if c is None:
+# task_161 F1是正: parse()からwrite()までの全体(選択ロジック込み)を単一のロック区間に
+# する。writeの瞬間だけをロックしても、ロック取得前に古いスナップショットをparseしていれば
+# 意味が無い(lost update)。ここでは選択ロジック自体をロック取得後のparse()の結果に対して
+# 行うことで、read-modify-write全体を原子化する。
+def _do():
+    header, order, by_name = parse(registry_yaml_path)
+
+    # Step 2: Return existing name if the same skill set is already registered.
+    # Skip director entries — their empty skills list would false-match callers
+    # that also pass zero skills (e.g. `start.sh worker` with no args).
+    for name in order:
+        w = by_name[name]
+        if w.get('role') == 'director':
+            continue
+        if set(w['skills']) == input_skills_set:
+            return w['name']
+
+    # Step 3: Find the first eligible name not already in the registry.
+    # All registered names are excluded (director + worker alike) so a new
+    # Worker never collides with an existing entry.
+    registered_names = set(by_name.keys())
+
+    def is_pool_eligible(name):
+        c = custom_map.get(name)
+        if c is None:
+            return True
+        if c.get('disabled'):
+            return False
+        if c.get('role') == 'director':
+            return False
         return True
-    if c.get('disabled'):
-        return False
-    if c.get('role') == 'director':
-        return False
-    return True
 
-
-chosen = None
-for name in pool_names:
-    if is_pool_eligible(name) and name not in registered_names:
-        chosen = name
-        break
-
-if chosen is None:
-    # Fallback: reuse the first eligible name even if already registered.
+    chosen = None
     for name in pool_names:
-        if is_pool_eligible(name):
+        if is_pool_eligible(name) and name not in registered_names:
             chosen = name
             break
 
-if chosen is None:
-    chosen = "Unknown"
+    if chosen is None:
+        # Fallback: reuse the first eligible name even if already registered.
+        for name in pool_names:
+            if is_pool_eligible(name):
+                chosen = name
+                break
 
-# Step 4: Append (or merge into) the chosen name.
-today = str(date.today())
-if chosen in by_name:
-    # Fallback path hit — merge skills / refresh last_active, keep task_count & role.
-    by_name[chosen]['skills'] = input_skills
-    by_name[chosen]['last_active'] = today
-else:
-    by_name[chosen] = {
-        'name': chosen,
-        'role': '',
-        'skills': input_skills,
-        'task_count': 0,
-        'last_active': today,
-    }
-    order.append(chosen)
-write(registry_yaml_path, header, order, by_name)
+    if chosen is None:
+        chosen = "Unknown"
+
+    # Step 4: Append (or merge into) the chosen name.
+    today = str(date.today())
+    if chosen in by_name:
+        # Fallback path hit — merge skills / refresh last_active, keep task_count & role.
+        by_name[chosen]['skills'] = input_skills
+        by_name[chosen]['last_active'] = today
+    else:
+        by_name[chosen] = {
+            'name': chosen,
+            'role': '',
+            'skills': input_skills,
+            'task_count': 0,
+            'last_active': today,
+        }
+        order.append(chosen)
+    write(registry_yaml_path, header, order, by_name)
+    return chosen
+
+
+chosen = with_lock(registry_yaml_path, _do)
 
 # Step 5: Output name
 print(chosen)

@@ -33,6 +33,7 @@ registry/activity/
 registry/notifications/
 registry/approvals/
 registry/handoffs/
+registry/.workers.lock
 registry/dispatcher.log
 registry/watchdog.log
 logs/

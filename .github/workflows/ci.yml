@@ -83,3 +83,12 @@ jobs:
 
       - name: scripts/test_handoff_path.sh
         run: bash scripts/test_handoff_path.sh
+
+  registry-lock-test:
+    name: Registry Lock Regression Test (task_161)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: scripts/test_registry_lock.sh
+        run: bash scripts/test_registry_lock.sh

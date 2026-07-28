@@ -36,6 +36,7 @@ registry/handoffs/
 registry/.workers.lock
 registry/dispatcher.log
 registry/watchdog.log
+registry/watchdog-observations.jsonl
 logs/
 
 # Claude Code local state

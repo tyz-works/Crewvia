@@ -8,7 +8,12 @@
 #   }
 #
 # 環境変数:
-#   CLAUDE_AGENT_NAME — エージェント識別子（未設定時は "unknown"）
+#   AGENT_NAME — エージェント識別子 (default: hostname)
+#
+# task_162 P3是正: 以前は CLAUDE_AGENT_NAME という、crewvia のどこにも設定されない
+# 変数名を読んでおり、全ての通知が registry/notifications/unknown/ に落ちていた
+# (pre-tool-use.sh:47・post-tool-use.sh:21 は共に AGENT_NAME を読む。start.sh が
+# export するのも AGENT_NAME であり、他hookと同じ流儀に揃えた)。
 #
 # 動作:
 #   stdin から Notification hook の JSON ペイロードを受け取り、
@@ -21,7 +26,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-AGENT_NAME="${CLAUDE_AGENT_NAME:-unknown}"
+AGENT_NAME="${AGENT_NAME:-$(hostname -s)}"
 NOTIFICATIONS_DIR="${REPO_ROOT}/registry/notifications/${AGENT_NAME}"
 
 # 書き出し先ディレクトリを作成（なければ）

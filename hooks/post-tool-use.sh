@@ -48,6 +48,19 @@ if [ -n "${AGENT_NAME:-}" ] && [ -n "${TASK_ID:-}" ]; then
   echo "$(date +%s) tool=${CLAUDE_TOOL_NAME:-unknown}" >> "${ACTIVITY_DIR}/${TASK_ID}.activity"
 fi
 
+# --- Heartbeat ファイル更新 (task_162 P2是正) ---
+# heartbeat は crewvia 内部の信号(watchdog.py が読む)であり Taskvia とは無関係。
+# 以前は下の Taskvia ガードの下流にあり standalone モードでは一切書かれなかった
+# (順序の事故であり設計判断ではない — task_162 Picard裁定)。activity と同じ扱いにし、
+# ガードより前(無条件実行)へ移す。Taskvia への役割・スキル送信(/api/agents)自体は
+# 引き続きガードの下流のままで変更していない(下記参照)。
+if [[ -n "${AGENT_NAME:-}" ]]; then
+  _HB_REPO="${CREWVIA_REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+  HEARTBEAT_DIR="${_HB_REPO}/registry/heartbeats"
+  mkdir -p "$HEARTBEAT_DIR"
+  date +%s > "${HEARTBEAT_DIR}/${AGENT_NAME}" 2>/dev/null || true
+fi
+
 # Taskvia 無効モード: CREWVIA_TASKVIA=disabled または トークン未設定なら投稿スキップ
 if [ "${CREWVIA_TASKVIA:-}" = "disabled" ] || [ -z "$TASKVIA_TOKEN" ]; then
   exit 0
@@ -79,16 +92,13 @@ curl -sf -X POST "${TASKVIA_URL}/api/log" \
   -H "Authorization: Bearer ${TASKVIA_TOKEN}" \
   -d "$PAYLOAD" >/dev/null 2>&1 || true
 
-# --- Heartbeat 自動更新 + Taskvia /api/agents 送信 ---
-# AGENT_NAME が設定されている場合、ツール実行のたびに heartbeat を更新する
-# Worker は何も意識しなくてよい。hook が自動で処理する。
+# --- Taskvia /api/agents 送信(役割・スキル付きハートビート情報) ---
+# heartbeat ファイル自体は上流(ガード前)で既に更新済み。ここは Taskvia への
+# メタデータ送信のみ(TASKVIA_TOKEN が設定済みの場合のみここに到達)。
 if [[ -n "${AGENT_NAME:-}" ]]; then
   # task_160 F9是正: 汎用名 REPO_ROOT は外部から乗っ取り可能なため CREWVIA_REPO_ROOT を読む
   # (start.sh:248 が既に export 済み)。読み手(watchdog.py)側は変更しないこと — 向きが重要。
   _HB_REPO="${CREWVIA_REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
-  HEARTBEAT_DIR="${_HB_REPO}/registry/heartbeats"
-  mkdir -p "$HEARTBEAT_DIR"
-  date +%s > "${HEARTBEAT_DIR}/${AGENT_NAME}" 2>/dev/null || true
 
   # workers.yaml からロール・スキルを取得
   _WORKERS_YAML="${_HB_REPO}/registry/workers.yaml"

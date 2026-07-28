@@ -180,6 +180,81 @@ class WorkerMonitor:
 
         return max(candidates) if candidates else self.started_at
 
+    def _observation_snapshot(self) -> dict:
+        """★task_162 案C(観測専用). check() の判定には一切使わない — 呼び出し元は
+        check() の戻り値やロジックを変更しない別経路のログ専用スナップショットである。
+
+        無音区間の長さ(idle_seconds、_last_activity_mtime() をそのまま呼ぶだけで
+        既存の計算方法を変えない)に加え、直近の notification(あれば)の種別・
+        経過時間・「その後 activity/heartbeat の更新があったか(=解除されたか)」を
+        記録する。「無音」と「人間待ちで無音」を区別するための情報(Picard指示)。
+        """
+        now = time.time()
+
+        activity_file = (
+            self.repo_root / "registry" / "activity" / self.agent_name
+            / f"{self.task_id}.activity"
+        )
+        activity_mtime = activity_file.stat().st_mtime if activity_file.exists() else None
+
+        hb_file = self.repo_root / "registry" / "heartbeats" / self.agent_name
+        heartbeat_mtime = hb_file.stat().st_mtime if hb_file.exists() else None
+
+        # notification を除いた「実活動」の最新mtime(通知の解除判定に使う。
+        # _last_activity_mtime() は notification 自体を候補に含めるため、
+        # ここでは意図的に別計算にしている — 通知が来ただけで「解除済み」と
+        # 誤認しないようにするため)
+        non_notification_candidates = [
+            m for m in (activity_mtime, heartbeat_mtime) if m is not None
+        ]
+        non_notification_mtime = max(non_notification_candidates) if non_notification_candidates else None
+
+        last_notif_type: Optional[str] = None
+        last_notif_mtime: Optional[float] = None
+        notif_dir = self.repo_root / "registry" / "notifications" / self.agent_name
+        if notif_dir.exists():
+            newest_file = None
+            newest_mtime = -1.0
+            for f in notif_dir.iterdir():
+                if not f.is_file():
+                    continue
+                try:
+                    m = f.stat().st_mtime
+                except OSError:
+                    continue
+                if m > newest_mtime:
+                    newest_mtime = m
+                    newest_file = f
+            if newest_file is not None:
+                last_notif_mtime = newest_mtime
+                try:
+                    payload = json.loads(newest_file.read_text())
+                    last_notif_type = payload.get("notification_type")
+                except Exception:
+                    last_notif_type = "(unparseable)"
+
+        cleared_since_notification: Optional[bool] = None
+        if last_notif_mtime is not None:
+            cleared_since_notification = (
+                non_notification_mtime is not None and non_notification_mtime > last_notif_mtime
+            )
+
+        idle_seconds = now - self._last_activity_mtime()
+
+        return {
+            "ts": round(now, 3),
+            "agent": self.agent_name,
+            "task_id": self.task_id,
+            "idle_seconds": round(idle_seconds, 1),
+            "idle_threshold": self.idle_threshold,
+            "max_threshold": self.max_threshold,
+            "last_notification_type": last_notif_type,
+            "last_notification_age_seconds": (
+                round(now - last_notif_mtime, 1) if last_notif_mtime is not None else None
+            ),
+            "cleared_since_notification": cleared_since_notification,
+        }
+
     def _tmux_window_target(self) -> Optional[str]:
         """Return tmux window target for this agent, or None if not found."""
         try:
@@ -376,6 +451,7 @@ def load_active_tasks(queue_dir: Path) -> list[tuple[str, str, dict]]:
 # ---------------------------------------------------------------------------
 
 _LOG_FILE: Optional[Path] = None
+_OBSERVATION_LOG_FILE: Optional[Path] = None
 
 
 def _log(msg: str) -> None:
@@ -390,15 +466,32 @@ def _log(msg: str) -> None:
             pass
 
 
+def _log_observation(monitor: "WorkerMonitor", check_result: str) -> None:
+    """★task_162 案C(観測専用). idle秒数・通知状況を registry/watchdog-observations.jsonl
+    へ追記するだけの関数。check() の戻り値・判定条件には一切関与しない
+    (check_result は記録のためだけに受け取る — この関数の失敗や有無で check() の
+    振る舞いが変わることは無い)。"""
+    if _OBSERVATION_LOG_FILE is None:
+        return
+    try:
+        snapshot = monitor._observation_snapshot()
+        snapshot["check_result"] = check_result
+        with _OBSERVATION_LOG_FILE.open("a") as f:
+            f.write(json.dumps(snapshot) + "\n")
+    except Exception:
+        pass  # 観測ログの失敗で watchdog 本体を止めない
+
+
 # ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
 
 def run(repo_root: Path, interval: int) -> None:
-    global _LOG_FILE
+    global _LOG_FILE, _OBSERVATION_LOG_FILE
     registry_dir = repo_root / "registry"
     registry_dir.mkdir(exist_ok=True)
     _LOG_FILE = registry_dir / "watchdog.log"
+    _OBSERVATION_LOG_FILE = registry_dir / "watchdog-observations.jsonl"
 
     taskvia_url = os.environ.get("TASKVIA_URL", "https://taskvia.vercel.app")
     taskvia_token = os.environ.get("TASKVIA_TOKEN", "")
@@ -442,6 +535,11 @@ def run(repo_root: Path, interval: int) -> None:
             for (slug, task_id), monitor in list(monitors.items()):
                 status = monitor.check()
                 agent = monitor.agent_name
+
+                # ★task_162 案C(観測専用): check() の戻り値・分岐には一切影響しない
+                # 独立した記録経路。この呼び出しを削除しても以下の判定ロジックは
+                # 完全に同一に動作する。
+                _log_observation(monitor, status)
 
                 if status == "alive":
                     pass  # healthy — no action

@@ -16,10 +16,58 @@ CLI commands:
 
   set-last-active PATH NAME [YYYY-MM-DD]
       Update last_active for NAME. No-op if name not in registry.
+
+  bump-task-count PATH NAME [YYYY-MM-DD]
+      Increment task_count and update last_active for NAME (Worker Step4).
+      No-op if name not in registry.
 """
+import fcntl
+import os
 import re
 import sys
 from datetime import date
+
+
+def _lock_path(path):
+    """Dedicated lock file for a given registry path, sibling to the registry
+    file itself. Not shared with queue/.lock (scripts/plan.sh) — a distinct
+    lock file per resource keeps registry and queue contention independent,
+    and lets tests target an isolated temp registry without touching the
+    real lock."""
+    directory = os.path.dirname(os.path.abspath(path)) or '.'
+    return os.path.join(directory, '.workers.lock')
+
+
+def with_lock(path, callback):
+    """Run callback() while holding an exclusive lock scoped to `path`'s
+    registry directory. Mirrors scripts/plan.sh's with_lock (fcntl.flock).
+
+    ★Critical: callers must perform their ENTIRE parse-modify-write cycle
+    inside `callback`, not just the write. Locking only the write step does
+    not fix the lost-update race — a caller that already parsed a stale
+    snapshot before the lock existed would still write stale data once it
+    gets the lock. The lock must be held from before parse() through write().
+    """
+    lock_file = _lock_path(path)
+    try:
+        os.makedirs(os.path.dirname(lock_file) or '.', exist_ok=True)
+    except OSError as e:
+        raise RuntimeError(f"cannot create registry dir for lock {lock_file}: {e}")
+    try:
+        lf = open(lock_file, 'a+')
+    except OSError as e:
+        raise RuntimeError(
+            f"cannot open registry lock {lock_file}: {e}\n"
+            f"  hint: check write permission, or remove a stale lock file."
+        )
+    try:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        try:
+            return callback()
+        finally:
+            fcntl.flock(lf, fcntl.LOCK_UN)
+    finally:
+        lf.close()
 
 
 def parse(path):
@@ -119,22 +167,24 @@ def write(path, header, order, workers_by_name):
 
 def register_director(path, name):
     """Add or update NAME as director. Same-name worker entries are upgraded."""
-    header, order, by_name = parse(path)
-    today = str(date.today())
-    if name in by_name:
-        by_name[name]['role'] = 'director'
-        if not by_name[name].get('last_active'):
-            by_name[name]['last_active'] = today
-    else:
-        by_name[name] = {
-            'name': name,
-            'role': 'director',
-            'skills': [],
-            'task_count': 0,
-            'last_active': today,
-        }
-        order.append(name)
-    write(path, header, order, by_name)
+    def _do():
+        header, order, by_name = parse(path)
+        today = str(date.today())
+        if name in by_name:
+            by_name[name]['role'] = 'director'
+            if not by_name[name].get('last_active'):
+                by_name[name]['last_active'] = today
+        else:
+            by_name[name] = {
+                'name': name,
+                'role': 'director',
+                'skills': [],
+                'task_count': 0,
+                'last_active': today,
+            }
+            order.append(name)
+        write(path, header, order, by_name)
+    with_lock(path, _do)
 
 
 def get_director(path):
@@ -148,11 +198,27 @@ def get_director(path):
 
 def set_last_active(path, name, day=None):
     """Update last_active for NAME. No-op if name is not in the registry."""
-    header, order, by_name = parse(path)
-    if name not in by_name:
-        return
-    by_name[name]['last_active'] = day or str(date.today())
-    write(path, header, order, by_name)
+    def _do():
+        header, order, by_name = parse(path)
+        if name not in by_name:
+            return
+        by_name[name]['last_active'] = day or str(date.today())
+        write(path, header, order, by_name)
+    with_lock(path, _do)
+
+
+def bump_task_count(path, name, day=None):
+    """Increment task_count and update last_active for NAME (Worker Step4).
+    No-op if name is not in the registry. Replaces the raw read_text/
+    write_text idiom formerly inlined in agents/worker.md."""
+    def _do():
+        header, order, by_name = parse(path)
+        if name not in by_name:
+            return
+        by_name[name]['task_count'] = by_name[name].get('task_count', 0) + 1
+        by_name[name]['last_active'] = day or str(date.today())
+        write(path, header, order, by_name)
+    with_lock(path, _do)
 
 
 def _main(argv):
@@ -180,6 +246,13 @@ def _main(argv):
             return 2
         day = argv[4] if len(argv) > 4 else None
         set_last_active(argv[2], argv[3], day)
+        return 0
+    if cmd == 'bump-task-count':
+        if len(argv) < 4:
+            print("usage: bump-task-count PATH NAME [YYYY-MM-DD]", file=sys.stderr)
+            return 2
+        day = argv[4] if len(argv) > 4 else None
+        bump_task_count(argv[2], argv[3], day)
         return 0
     print(f"Unknown command: {cmd}", file=sys.stderr)
     return 1

@@ -470,36 +470,17 @@ requires_approval に該当 → type: improvement でTaskvia /api/log に投稿�
 
 #### Step 4: registry/workers.yaml の更新
 
-`task_count` を +1 し、`last_active` を今日の日付に更新する:
+`task_count` を +1 し、`last_active` を今日の日付に更新する。
+★task_161是正: 以前はここでregistry/workers.yamlを生のPython(read_text→正規表現置換→
+write_text)で直接書き換えていたが、他の書込経路(register-director・set-last-active・
+assign-name.sh)との並行書込レース(lost update)の原因になっていた
+(task_160 F1・task_161で実機再現・是正済み)。エージェント指示が行う生のファイル操作は
+指示の書き方では安全にできない(task_158と同型の原則)。必ず`lib_registry.py`経由で呼ぶこと
+(内部でロックを取得しparse-modify-write全体を排他する):
 
 ```bash
-python3 - "${AGENT_NAME}" <<'PYEOF'
-import sys, re, os
-from pathlib import Path
-from datetime import date
-
-agent_name = sys.argv[1]
-today = date.today().isoformat()
-registry = Path(f"{os.environ.get('CREWVIA_REPO', '.')}/registry/workers.yaml")
-lines = registry.read_text().splitlines()
-
-in_target = False
-for i, line in enumerate(lines):
-    if re.match(r'\s*- name:\s*' + re.escape(agent_name) + r'\s*$', line):
-        in_target = True
-        continue
-    if in_target:
-        if re.match(r'\s*- name:', line):
-            break
-        if re.match(r'\s*task_count:', line):
-            n = int(re.search(r'(\d+)', line).group(1))
-            lines[i] = re.sub(r'(task_count:\s*)\d+', rf'\g<1>{n+1}', line)
-        elif re.match(r'\s*last_active:', line):
-            lines[i] = re.sub(r'(last_active:\s*)[\d-]+', rf'\g<1>{today}', line)
-
-registry.write_text('\n'.join(lines) + '\n')
-print(f"Updated: {agent_name} task_count +1, last_active={today}")
-PYEOF
+python3 "${CREWVIA_REPO}/scripts/lib_registry.py" bump-task-count \
+  "${CREWVIA_REPO}/registry/workers.yaml" "${AGENT_NAME}"
 ```
 
 #### Step 5: plan.sh done + Director 報告

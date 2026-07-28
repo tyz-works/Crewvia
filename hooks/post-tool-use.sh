@@ -83,7 +83,9 @@ curl -sf -X POST "${TASKVIA_URL}/api/log" \
 # AGENT_NAME が設定されている場合、ツール実行のたびに heartbeat を更新する
 # Worker は何も意識しなくてよい。hook が自動で処理する。
 if [[ -n "${AGENT_NAME:-}" ]]; then
-  _HB_REPO="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+  # task_160 F9是正: 汎用名 REPO_ROOT は外部から乗っ取り可能なため CREWVIA_REPO_ROOT を読む
+  # (start.sh:248 が既に export 済み)。読み手(watchdog.py)側は変更しないこと — 向きが重要。
+  _HB_REPO="${CREWVIA_REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
   HEARTBEAT_DIR="${_HB_REPO}/registry/heartbeats"
   mkdir -p "$HEARTBEAT_DIR"
   date +%s > "${HEARTBEAT_DIR}/${AGENT_NAME}" 2>/dev/null || true

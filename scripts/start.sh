@@ -355,6 +355,18 @@ if [[ -n "$SELECTED_MODEL" ]]; then
   echo "[crewvia] Model: $SELECTED_MODEL"
 fi
 
+# task_160 F8是正: TARGET_DIRモードではcwdがcrewvia配下から外れるため、crewviaの
+# プロジェクトレベル .claude/settings.json(hooks含む)がclaude本体に読み込まれず
+# hooksが発火しない(実測確認済み)。--settings で crewvia 自身の settings.json を
+# 明示的に追加ロードさせることで解決する。target project 自身の .claude/settings.json
+# は書き換えない・上書きもしない(--settings は追加ロードであり、target project 自身の
+# hooks/permissions と共存することを実測確認済み)。~/.claude/settings.json(ユーザー
+# レベル)への登録は行わない(禁止選択肢)。
+SETTINGS_FLAG=()
+if [[ "${ROLE}" == "worker" ]] && [[ "$WORK_DIR" != "$REPO_ROOT" ]]; then
+  SETTINGS_FLAG=(--settings "${REPO_ROOT}/.claude/settings.json")
+fi
+
 # Launch with or without tmux
 if [[ "${CREWVIA_TMUX:-0}" == "1" ]]; then
   SESSION="crewvia"
@@ -367,6 +379,12 @@ if [[ "${CREWVIA_TMUX:-0}" == "1" ]]; then
   MODEL_CLI_ARG=""
   if [[ -n "$SELECTED_MODEL" ]]; then
     MODEL_CLI_ARG=" --model '$SELECTED_MODEL'"
+  fi
+
+  # --settings flag (TARGET_DIRモードのworkerのみ。F8是正、上のSETTINGS_FLAG参照)
+  SETTINGS_CLI_ARG=""
+  if [[ ${#SETTINGS_FLAG[@]} -gt 0 ]]; then
+    SETTINGS_CLI_ARG=" --settings '${REPO_ROOT}/.claude/settings.json'"
   fi
 
   if [[ -n "$FULL_PROMPT" ]] && [[ "${CREWVIA_BENCH_MODE:-0}" != "1" ]]; then
@@ -392,7 +410,7 @@ with open(sys.argv[2], 'w') as f:
     json.dump(existing, f, ensure_ascii=False, indent=2)
 PYEOF
   fi
-  LAUNCH_CMD="$ENV_EXPORTS; cd '$WORK_DIR'; claude${MODEL_CLI_ARG}"
+  LAUNCH_CMD="$ENV_EXPORTS; cd '$WORK_DIR'; claude${MODEL_CLI_ARG}${SETTINGS_CLI_ARG}"
 
   if ! tmux has-session -t "$SESSION" 2>/dev/null; then
     echo "[crewvia] Creating tmux session: $SESSION"
@@ -455,6 +473,17 @@ PYEOF
       echo "[crewvia] Dispatcher started in tmux window: ${SESSION}:dispatcher"
     fi
 
+    # Director: watchdog(v2)を crewvia:watchdog 窓で起動（二重起動防止）
+    # F6是正: tmuxモードでは従来watchdogが一度も起動していなかった。非tmuxブランチの
+    # watchdog.sh(v1・DEPRECATED)ではなくwatchdog.py(v2)を起動する（v1は延命させない）。
+    if tmux list-windows -t "$SESSION" -F '#{window_name}' 2>/dev/null | grep -q '^watchdog$'; then
+      echo "[crewvia] Watchdog already running (${SESSION}:watchdog)"
+    else
+      tmux new-window -t "$SESSION" -n "watchdog"
+      tmux send-keys -t "${SESSION}:watchdog" "cd '${REPO_ROOT}' && python3 '${SCRIPT_DIR}/watchdog.py'" Enter
+      echo "[crewvia] Watchdog(v2) started in tmux window: ${SESSION}:watchdog"
+    fi
+
     # Auto-attach to Director window after kickoff + dispatcher launch.
     # $TMUX が set されている（既に tmux 内にいる）場合は switch-client、
     # tmux 外のシェルなら attach-session で Director 窓に移動する。
@@ -482,5 +511,5 @@ else
     echo "[crewvia] ERROR: failed to cd into $WORK_DIR" >&2
     exit 1
   }
-  exec claude "${MODEL_FLAG[@]+"${MODEL_FLAG[@]}"}" "${PROMPT_FLAG[@]+"${PROMPT_FLAG[@]}"}"
+  exec claude "${MODEL_FLAG[@]+"${MODEL_FLAG[@]}"}" "${PROMPT_FLAG[@]+"${PROMPT_FLAG[@]}"}" "${SETTINGS_FLAG[@]+"${SETTINGS_FLAG[@]}"}"
 fi

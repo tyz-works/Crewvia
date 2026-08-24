@@ -807,7 +807,7 @@ bash scripts/fetch-requests.sh --status pending
   Status  : pending
   Priority: medium
   Skills  : typescript, code
-  Target  : /Users/tyz/workspace/taskvia
+  Target  : ~/workspace/taskvia
   Created : 2026-04-12T03:00:00.000Z
 
 [def456uvw] OCI インスタンス監視スクリプト追加
@@ -858,7 +858,7 @@ bash scripts/plan.sh add "実装: フィルタUI追加" \
 bash scripts/plan.sh add "実装: フィルタUI追加" \
   --mission <MISSION_SLUG> \
   --skills typescript \
-  --target-dir /Users/tyz/workspace/taskvia
+  --target-dir ~/workspace/taskvia
 ```
 
 ### Worker 起動

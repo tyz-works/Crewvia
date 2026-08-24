@@ -388,9 +388,11 @@ if [[ "${CREWVIA_TMUX:-0}" == "1" ]]; then
   fi
 
   if [[ -n "$FULL_PROMPT" ]] && [[ "${CREWVIA_BENCH_MODE:-0}" != "1" ]]; then
-    # Write the system prompt to .claude/settings.json in the target dir so claude
-    # picks it up without shell-expansion issues (the prompt contains $ / backticks
-    # that would be incorrectly expanded when embedded in a send-keys string).
+    # Write the system prompt to .claude/settings.local.json in the target dir so
+    # claude picks it up without shell-expansion issues (the prompt contains $ /
+    # backticks that would be incorrectly expanded when embedded in a send-keys
+    # string). settings.local.json is .gitignore'd, preventing worktree pollution
+    # from the ~38KB prompt being committed accidentally (settings.json is tracked).
     # Python handles JSON encoding safely including Japanese / special characters.
     # BENCH_MODE skips this to avoid the ~38KB prompt causing claude to crash;
     # benchmark-ctx.sh writes a minimal bench-specific settings.json instead.
@@ -398,7 +400,7 @@ if [[ "${CREWVIA_TMUX:-0}" == "1" ]]; then
     printf '%s' "$FULL_PROMPT" > "$PROMPT_TMPFILE"
     SETTINGS_DIR="$WORK_DIR/.claude"
     mkdir -p "$SETTINGS_DIR"
-    python3 - "$PROMPT_TMPFILE" "$SETTINGS_DIR/settings.json" <<'PYEOF'
+    python3 - "$PROMPT_TMPFILE" "$SETTINGS_DIR/settings.local.json" <<'PYEOF'
 import sys, json
 prompt = open(sys.argv[1]).read()
 try:

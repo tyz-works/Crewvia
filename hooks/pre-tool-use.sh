@@ -46,11 +46,23 @@ TASKVIA_URL="${TASKVIA_URL:-https://taskvia.vercel.app}"
 TASKVIA_TOKEN="${TASKVIA_TOKEN:-}"
 AGENT_NAME="${AGENT_NAME:-$(hostname -s)}"
 
+# クラッシュガードを最上部に登録する。
+# これより後のどの箇所で set -e が発動しても crash guard が確実に発火する。
+_DECISION_EMITTED=false
+_crash_guard_early() {
+  if ! $_DECISION_EMITTED; then
+    echo "[pre-tool-use] ⚠️ crash guard: hook exited without decision" >&2
+    jq -nc '{hookSpecificOutput: {hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: "Hook crashed without emitting decision"}}' 2>/dev/null || true
+  fi
+}
+trap '_crash_guard_early' EXIT
+
 # Director は承認不要 — registry で role: director を確認して即通過
 _CREWVIA_REPO_EARLY="${CREWVIA_REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 _REGISTRY="${_CREWVIA_REPO_EARLY}/registry/workers.yaml"
 if [ -f "$_REGISTRY" ] && grep -qA1 "name: ${AGENT_NAME}$" "$_REGISTRY" 2>/dev/null; then
-  _AGENT_ROLE="$(grep -A3 "name: ${AGENT_NAME}$" "$_REGISTRY" | grep 'role:' | awk '{print $2}' | head -1)"
+  # grep 'role:' が見つからない（一般 Worker）場合に pipefail で落ちないよう || true を付ける
+  _AGENT_ROLE="$(grep -A3 "name: ${AGENT_NAME}$" "$_REGISTRY" | grep 'role:' | awk '{print $2}' | head -1 || true)"
   if [ "$_AGENT_ROLE" = "director" ]; then
     _DECISION_EMITTED=true
     exit 0
@@ -75,7 +87,8 @@ else
 fi
 
 # Claude Code PreToolUse hook の permission 決定を stdout に出力する
-_DECISION_EMITTED=false
+# 注意: _DECISION_EMITTED と crash guard trap はスクリプト上部に移動済み。
+#       ここでは emit_decision を定義し、_APPROVAL_LOG_DIR を設定する。
 _APPROVAL_LOG_DIR="${_CREWVIA_REPO}/registry/approvals"
 
 emit_decision() {
@@ -101,8 +114,8 @@ emit_decision() {
     '{hookSpecificOutput: {hookEventName: "PreToolUse", permissionDecision: $d, permissionDecisionReason: $r}}'
 }
 
-# set -e で hook がクラッシュした場合、decision 未発行なら deny を発行する安全弁
-# これにより Claude Code が native TUI プロンプトにフォールバックするのを防ぐ
+# trap は上部の _crash_guard_early で既に登録済み。
+# emit_decision が定義された後に trap を上書きして同名関数を使う（より詳細なメッセージを出力可）
 _crash_guard() {
   if ! $_DECISION_EMITTED; then
     echo "[pre-tool-use] ⚠️ crash guard: hook exited without decision" >&2

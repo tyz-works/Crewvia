@@ -468,20 +468,16 @@ requires_approval に該当 → type: improvement でTaskvia /api/log に投稿�
 
 改善案があれば §4 のフローに従って記録する。なければスキップ可。
 
-#### Step 4: registry/workers.yaml の更新
+#### Step 4: registry/workers.yaml の自動更新
 
-`task_count` を +1 し、`last_active` を今日の日付に更新する。
-★task_161是正: 以前はここでregistry/workers.yamlを生のPython(read_text→正規表現置換→
-write_text)で直接書き換えていたが、他の書込経路(register-director・set-last-active・
-assign-name.sh)との並行書込レース(lost update)の原因になっていた
-(task_160 F1・task_161で実機再現・是正済み)。エージェント指示が行う生のファイル操作は
-指示の書き方では安全にできない(task_158と同型の原則)。必ず`lib_registry.py`経由で呼ぶこと
-(内部でロックを取得しparse-modify-write全体を排他する):
+`task_count` の +1 と `last_active` の更新は **`plan.sh done` が自動実行する**。
+Worker はここで手動 bump を呼ばないこと（二重 bump 防止）。
 
-```bash
-python3 "${CREWVIA_REPO}/scripts/lib_registry.py" bump-task-count \
-  "${CREWVIA_REPO}/registry/workers.yaml" "${AGENT_NAME}"
-```
+> ★task_161→task-count-fix 経緯: 旧来の生Python書き換えは並行書込レース(lost update)の
+> 原因となったため task_161 で `lib_registry.py` 経由に是正。さらに mission 20260824-macos-wsl
+> で 8 Worker 全員が Step4 を実行せず task_count 未更新となった（Worker 指示遵守失敗）ため、
+> task 20260825-task-count-fix/t001 で `plan.sh done` 内部に移動し Worker 判断に依存しない
+> 自動化を実現した。
 
 #### Step 5: plan.sh done + Director 報告
 

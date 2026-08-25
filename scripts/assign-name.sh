@@ -2,8 +2,19 @@
 set -euo pipefail
 
 # assign-name.sh — Registry-first worker name assignment
-# Usage: ./scripts/assign-name.sh [skill1 skill2 ...]
-# Same skill set returns the registered name, or assigns a new one from the pool.
+# Usage: ./scripts/assign-name.sh [skill1 skill2 ...] [OPTIONS]
+#
+# Options:
+#   --exclude <name1,name2,...>   Exclude specific names from lookup and pool selection.
+#                                  Useful when launching a parallel Worker with the same skills.
+#   --fresh                        Skip registry lookup and always assign a new name from pool.
+#                                  Errors if the pool is exhausted.
+#
+# Examples:
+#   WORKER_1=$(./scripts/assign-name.sh research)
+#   WORKER_2=$(./scripts/assign-name.sh research --exclude Yuki)   # avoids Yuki
+#   WORKER_2=$(./scripts/assign-name.sh research --fresh)          # always new name
+#   WORKER_2=$(./scripts/assign-name.sh research --fresh --exclude Yuki)  # fresh + excluded
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -36,15 +47,23 @@ names_yaml_path = sys.argv[2]
 registry_yaml_path = sys.argv[3]
 _raw = sys.argv[4:]
 input_skills = []
-_skip = False
-for _a in _raw:
-    if _skip:
-        _skip = False
-        continue
-    if _a.startswith('-'):
-        _skip = True
-        continue
-    input_skills.append(_a)
+exclude_names = set()
+fresh = False
+_i = 0
+while _i < len(_raw):
+    _a = _raw[_i]
+    if _a == '--exclude':
+        _i += 1
+        if _i < len(_raw):
+            for _n in _raw[_i].split(','):
+                _n = _n.strip()
+                if _n:
+                    exclude_names.add(_n)
+    elif _a == '--fresh':
+        fresh = True
+    elif not _a.startswith('-'):
+        input_skills.append(_a)
+    _i += 1
 input_skills.sort()
 input_skills_set = set(input_skills)
 
@@ -113,21 +132,29 @@ def _do():
     header, order, by_name = parse(registry_yaml_path)
 
     # Step 2: Return existing name if the same skill set is already registered.
+    # Skip if --fresh is set (always assign a new name from pool).
     # Skip director entries — their empty skills list would false-match callers
     # that also pass zero skills (e.g. `start.sh worker` with no args).
-    for name in order:
-        w = by_name[name]
-        if w.get('role') == 'director':
-            continue
-        if set(w['skills']) == input_skills_set:
-            return w['name']
+    # Skip names in --exclude list (caller wants a different name).
+    if not fresh:
+        for name in order:
+            w = by_name[name]
+            if w.get('role') == 'director':
+                continue
+            if name in exclude_names:
+                continue
+            if set(w['skills']) == input_skills_set:
+                return w['name']
 
     # Step 3: Find the first eligible name not already in the registry.
     # All registered names are excluded (director + worker alike) so a new
     # Worker never collides with an existing entry.
+    # Additionally, names in --exclude list are skipped.
     registered_names = set(by_name.keys())
 
     def is_pool_eligible(name):
+        if name in exclude_names:
+            return False
         c = custom_map.get(name)
         if c is None:
             return True
@@ -144,6 +171,10 @@ def _do():
             break
 
     if chosen is None:
+        if fresh:
+            # --fresh requires an unregistered name; error if pool is exhausted.
+            print("ERROR: name pool exhausted — no unregistered eligible names available", file=sys.stderr)
+            sys.exit(1)
         # Fallback: reuse the first eligible name even if already registered.
         for name in pool_names:
             if is_pool_eligible(name):

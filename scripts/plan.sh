@@ -1408,6 +1408,7 @@ def cmd_done(args):
     task_id = positional[0]
     result = positional[1]
     sync_holder = [None]  # (slug, task_id, result)
+    worker_holder = [None]  # worker name for registry bump (None = _do未実行, '' = worker未設定)
 
     def _do():
         state = load_state()
@@ -1451,6 +1452,7 @@ def cmd_done(args):
         desc, _ = parse_task_body(body)
         new_body = build_task_body(desc, result)
         save_task(slug, task_id, meta, new_body)
+        worker_holder[0] = meta.get('worker') or ''  # capture worker for post-lock bump
         sync_holder[0] = (slug, task_id, result)
 
         # Mission complete?
@@ -1471,6 +1473,37 @@ def cmd_done(args):
         assignment_file = os.path.join(QUEUE_DIR, 'assignments', agent_name)
         if os.path.exists(assignment_file):
             os.remove(assignment_file)
+
+    # Auto-bump task_count in worker registry (Worker Step4 automation)
+    # worker_holder[0] is None if _do didn't run, '' if no worker field, else worker name
+    if worker_holder[0]:
+        # Use CREWVIA_REPO_ROOT when available so that Workers calling plan.sh done
+        # from a worktree still update the main repo's registry (not the worktree's).
+        _actual_root = os.environ.get('CREWVIA_REPO_ROOT', REPO_ROOT)
+        _registry = os.path.join(_actual_root, 'registry', 'workers.yaml')
+        _lib = os.path.join(_actual_root, 'scripts', 'lib_registry.py')
+        try:
+            _result = subprocess.run(
+                [sys.executable, _lib, 'bump-task-count', _registry, worker_holder[0]],
+                check=True, capture_output=True, text=True
+            )
+            if _result.stdout.strip() == 'no-op':
+                print(
+                    f"[plan.sh warn] worker '{worker_holder[0]}' not found in registry"
+                    f" — bump-task-count skipped (task '{task_id}')",
+                    file=sys.stderr
+                )
+        except Exception as _e:
+            print(
+                f"[plan.sh warn] bump-task-count failed for '{worker_holder[0]}': {_e}",
+                file=sys.stderr
+            )
+    elif worker_holder[0] is not None:
+        # _do completed but task had no 'worker' field
+        print(
+            f"[plan.sh warn] task '{task_id}' has no 'worker' field — skipping bump-task-count",
+            file=sys.stderr
+        )
 
     if sync_holder[0]:
         ok = taskvia_sync_done(*sync_holder[0])

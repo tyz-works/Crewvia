@@ -1477,13 +1477,22 @@ def cmd_done(args):
     # Auto-bump task_count in worker registry (Worker Step4 automation)
     # worker_holder[0] is None if _do didn't run, '' if no worker field, else worker name
     if worker_holder[0]:
-        _registry = os.path.join(REPO_ROOT, 'registry', 'workers.yaml')
-        _lib = os.path.join(REPO_ROOT, 'scripts', 'lib_registry.py')
+        # Use CREWVIA_REPO_ROOT when available so that Workers calling plan.sh done
+        # from a worktree still update the main repo's registry (not the worktree's).
+        _actual_root = os.environ.get('CREWVIA_REPO_ROOT', REPO_ROOT)
+        _registry = os.path.join(_actual_root, 'registry', 'workers.yaml')
+        _lib = os.path.join(_actual_root, 'scripts', 'lib_registry.py')
         try:
-            subprocess.run(
+            _result = subprocess.run(
                 [sys.executable, _lib, 'bump-task-count', _registry, worker_holder[0]],
                 check=True, capture_output=True, text=True
             )
+            if _result.stdout.strip() == 'no-op':
+                print(
+                    f"[plan.sh warn] worker '{worker_holder[0]}' not found in registry"
+                    f" — bump-task-count skipped (task '{task_id}')",
+                    file=sys.stderr
+                )
         except Exception as _e:
             print(
                 f"[plan.sh warn] bump-task-count failed for '{worker_holder[0]}': {_e}",

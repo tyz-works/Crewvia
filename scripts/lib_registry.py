@@ -209,8 +209,9 @@ def set_last_active(path, name, day=None):
 
 def bump_task_count(path, name, day=None):
     """Increment task_count and update last_active for NAME (Worker Step4).
-    No-op if name is not in the registry. Replaces the raw read_text/
-    write_text idiom formerly inlined in agents/worker.md."""
+    Returns True if bumped, False (no-op) if name is not in the registry.
+    Replaces the raw read_text/write_text idiom formerly inlined in agents/worker.md."""
+    result = [False]
     def _do():
         header, order, by_name = parse(path)
         if name not in by_name:
@@ -218,7 +219,9 @@ def bump_task_count(path, name, day=None):
         by_name[name]['task_count'] = by_name[name].get('task_count', 0) + 1
         by_name[name]['last_active'] = day or str(date.today())
         write(path, header, order, by_name)
+        result[0] = True
     with_lock(path, _do)
+    return result[0]
 
 
 def _main(argv):
@@ -252,7 +255,8 @@ def _main(argv):
             print("usage: bump-task-count PATH NAME [YYYY-MM-DD]", file=sys.stderr)
             return 2
         day = argv[4] if len(argv) > 4 else None
-        bump_task_count(argv[2], argv[3], day)
+        bumped = bump_task_count(argv[2], argv[3], day)
+        print('bumped' if bumped else 'no-op')
         return 0
     print(f"Unknown command: {cmd}", file=sys.stderr)
     return 1

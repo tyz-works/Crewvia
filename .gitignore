@@ -35,6 +35,7 @@ registry/approvals/
 registry/handoffs/
 registry/.workers.lock
 registry/dispatcher.log
+registry/dispatcher_all_done.flag
 registry/watchdog.log
 registry/watchdog-observations.jsonl
 logs/

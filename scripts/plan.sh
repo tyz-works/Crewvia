@@ -19,6 +19,9 @@ set -euo pipefail
 #   plan.sh pull [--mission <slug>] --skills <csv> [--agent <name>]
 #   plan.sh done <task_id> "<result>" [--mission <slug>]
 #   plan.sh fail <task_id> [<handoff_path>] [--mission <slug>]
+#   plan.sh update <task_id> [--mission <slug>] [--skills <csv>] [--blocked-by <csv>]
+#                            [--priority high|medium|low] [--worker <name>] [--status <status>]
+#                            [--description <text>] [--reset]
 #   plan.sh status [--mission <slug>] [--all]
 #   plan.sh archive <slug>
 
@@ -27,7 +30,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 QUEUE_DIR="${CREWVIA_QUEUE:-${REPO_ROOT}/queue}"
 
 if [[ $# -eq 0 ]]; then
-  echo "Usage: plan.sh <init|add|pull|done|fail|ready-for-verification|verify-result|review|launch|lint|status|archive|dashboard|dashboard-data> [args...]" >&2
+  echo "Usage: plan.sh <init|add|pull|done|fail|update|ready-for-verification|verify-result|review|launch|lint|status|archive|dashboard|dashboard-data> [args...]" >&2
   exit 1
 fi
 
@@ -2319,6 +2322,117 @@ def cmd_dashboard_data(args):
 
 
 # ---------------------------------------------------------------------------
+# cmd_update — safe in-place task frontmatter editor
+# ---------------------------------------------------------------------------
+
+def cmd_update(args):
+    """Update specific frontmatter fields of an existing task.
+
+    Usage:
+      plan.sh update <task_id> [--mission <slug>]
+                               [--skills <csv>]
+                               [--blocked-by <csv>]
+                               [--priority high|medium|low]
+                               [--worker <name>]
+                               [--status <status>]
+                               [--description <text>]
+                               [--reset]
+
+    --reset sets: status=pending, worker=null, started_at=null, completed_at=null
+    Body (Description / Result sections) is never modified by this command.
+    """
+    opts, positional = parse_opts(args, {
+        '--mission': 'value',
+        '--skills': 'value',
+        '--blocked-by': 'value',
+        '--priority': 'value',
+        '--worker': 'value',
+        '--status': 'value',
+        '--description': 'value',
+        '--reset': 'bool',
+    })
+
+    if not positional:
+        die("update requires a task_id (e.g. t005)")
+    task_id = positional[0]
+
+    # Validate task_id format
+    if not re.fullmatch(r't\d+', task_id):
+        die(f"invalid task_id '{task_id}': expected format tNNN (e.g. t001, t012)")
+
+    # Validate priority if given
+    priority = opts.get('--priority')
+    if priority and priority not in PRIORITY_ORDER:
+        die(f"invalid priority '{priority}'. Use high|medium|low.")
+
+    # Validate status if given
+    status = opts.get('--status')
+    valid_statuses = {
+        'pending', 'in_progress', 'done', 'failed', 'blocked', 'skipped', 'verified',
+        'ready_for_verification', 'verifying', 'verification_failed', 'needs_human_review',
+    }
+    if status and status not in valid_statuses:
+        die(f"invalid status '{status}'. Valid statuses: {', '.join(sorted(valid_statuses))}")
+
+    def _do():
+        state = load_state()
+        slug = opts.get('--mission') or state.get('default_mission')
+        if not slug:
+            die("no active mission. Pass --mission <slug> or set a default mission.")
+        if not os.path.exists(mission_dir(slug)):
+            die(f"mission '{slug}' not found.")
+
+        meta, body = load_task(slug, task_id)
+
+        changed = []
+
+        if opts.get('--reset'):
+            meta['status'] = 'pending'
+            meta['worker'] = None
+            meta['started_at'] = None
+            meta['completed_at'] = None
+            changed.append('reset(status=pending,worker=null,started_at=null,completed_at=null)')
+
+        if opts.get('--skills') is not None:
+            new_skills = [s.strip() for s in opts['--skills'].split(',') if s.strip()]
+            meta['skills'] = new_skills
+            changed.append(f"skills={new_skills}")
+
+        if opts.get('--blocked-by') is not None:
+            raw = opts['--blocked-by'].strip()
+            new_blocked = [s.strip() for s in raw.split(',') if s.strip()] if raw else []
+            meta['blocked_by'] = new_blocked
+            changed.append(f"blocked_by={new_blocked}")
+
+        if priority:
+            meta['priority'] = priority
+            changed.append(f"priority={priority}")
+
+        if opts.get('--worker') is not None:
+            meta['worker'] = opts['--worker'] or None
+            changed.append(f"worker={meta['worker']}")
+
+        if status:
+            meta['status'] = status
+            changed.append(f"status={status}")
+
+        if opts.get('--description') is not None:
+            # Replace Description section while preserving Result section
+            _, result_text = parse_task_body(body)
+            body = build_task_body(opts['--description'], result_text)
+            changed.append('description=<updated>')
+
+        if not changed:
+            print(f"update {slug}/{task_id}: nothing to do (no fields specified)", file=sys.stderr)
+            return
+
+        save_task(slug, task_id, meta, body)
+        print(f"Updated: {slug}/{task_id} — {', '.join(changed)}")
+
+    with_lock(_do)
+
+
+# ---------------------------------------------------------------------------
 # Dispatch
 # ---------------------------------------------------------------------------
 
@@ -2328,6 +2442,7 @@ dispatch = {
     'pull': cmd_pull,
     'done': cmd_done,
     'fail': cmd_fail,
+    'update': cmd_update,
     'ready-for-verification': cmd_ready_for_verification,
     'verify-result': cmd_verify_result,
     'review': cmd_review,

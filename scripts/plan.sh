@@ -1213,7 +1213,9 @@ def cmd_pull(args):
             scanned += len(tasks)
             done_ids = {m['id'] for (m, _) in tasks if m.get('status') in TERMINAL_STATUSES}
             for (meta, body) in tasks:
-                # --task: match by ID only, bypass skill/target/blocked filters
+                # --task: match by ID; skill/target filters are bypassed (dispatcher
+                # has already verified them), but blocked_by is always enforced as
+                # a defense-in-depth guard against dispatcher races or bugs.
                 if specific_task:
                     if meta.get('id') != specific_task:
                         continue
@@ -1228,6 +1230,18 @@ def cmd_pull(args):
                         )
                     if st != 'pending':
                         die(f"task '{specific_task}' has unexpected status: {st}")
+                    # Defense-in-depth: reject pull if any dependency is not yet done,
+                    # even when --task bypasses skill/target filters.  This prevents
+                    # a blocked task from being executed when the dispatcher sends a
+                    # stale kickoff message (e.g. blocked_by race, parse glitch).
+                    bb = meta.get('blocked_by') or []
+                    unmet = [dep for dep in bb if dep not in done_ids]
+                    if unmet:
+                        die(
+                            f"task '{specific_task}' is blocked by unfinished dependencies: "
+                            f"{unmet} — cannot pull until all blocked_by tasks are done. "
+                            f"(dispatcher should not have assigned this task yet)"
+                        )
                     # Warn if worker skills don't fully cover the task's required skills
                     task_req = set(meta.get('skills') or [])
                     worker_skills = {s.strip() for s in requested_skills}

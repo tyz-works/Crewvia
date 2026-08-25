@@ -76,7 +76,7 @@ LOG_FILE       = REGISTRY_DIR / 'dispatcher.log'
 ALL_DONE_STATE_FILE = REGISTRY_DIR / 'dispatcher_all_done.flag'
 
 PRIORITY_ORDER  = {'high': 0, 'medium': 1, 'low': 2}
-TERMINAL_STATUSES = {'done', 'skipped'}
+TERMINAL_STATUSES = {'done', 'verified', 'skipped'}
 
 # Circuit breaker for Taskvia API calls
 TASKVIA_CB_FAILURES = 0

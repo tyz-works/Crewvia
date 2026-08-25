@@ -76,7 +76,7 @@ LOG_FILE       = REGISTRY_DIR / 'dispatcher.log'
 ALL_DONE_STATE_FILE = REGISTRY_DIR / 'dispatcher_all_done.flag'
 
 PRIORITY_ORDER  = {'high': 0, 'medium': 1, 'low': 2}
-TERMINAL_STATUSES = {'done', 'skipped'}
+TERMINAL_STATUSES = {'done', 'verified', 'skipped'}
 
 # Circuit breaker for Taskvia API calls
 TASKVIA_CB_FAILURES = 0
@@ -317,16 +317,23 @@ def list_tasks_for_mission(slug):
 
 
 def load_all_tasks(active_missions):
-    """Return (all_tasks, done_ids_by_mission) where all_tasks is list of (slug, meta)."""
+    """Return (all_tasks, done_ids_by_mission, task_statuses_by_mission).
+
+    all_tasks: list of (slug, meta)
+    done_ids_by_mission: {slug: set of task IDs whose status is in TERMINAL_STATUSES}
+    task_statuses_by_mission: {slug: {task_id: status}} for blocked_by dep checks
+    """
     all_tasks = []
     done_ids_by_mission = {}
+    task_statuses_by_mission = {}
     for slug in active_missions:
         tasks = list_tasks_for_mission(slug)
         done_ids = {m['id'] for m, _ in tasks if m.get('status') in TERMINAL_STATUSES}
         done_ids_by_mission[slug] = done_ids
+        task_statuses_by_mission[slug] = {m['id']: m.get('status') for m, _ in tasks}
         for meta, _ in tasks:
             all_tasks.append((slug, meta))
-    return all_tasks, done_ids_by_mission
+    return all_tasks, done_ids_by_mission, task_statuses_by_mission
 
 
 # ---------------------------------------------------------------------------
@@ -635,7 +642,7 @@ def dispatch():
     set_all_done_state(False)
 
     # Load all tasks
-    all_tasks, done_ids_by_mission = load_all_tasks(active_missions)
+    all_tasks, done_ids_by_mission, task_statuses_by_mission = load_all_tasks(active_missions)
 
     # Unblocked pending tasks (eligible for assignment), sorted by priority
     unblocked_pending = []
@@ -643,8 +650,12 @@ def dispatch():
         if meta.get('status') != 'pending':
             continue
         done_ids = done_ids_by_mission.get(slug, set())
+        task_statuses = task_statuses_by_mission.get(slug, {})
         bb = meta.get('blocked_by') or []
-        if any(dep not in done_ids for dep in bb):
+        # failed/cancelled deps do not block: they indicate the dep will never
+        # complete, so downstream tasks should remain eligible for assignment.
+        if any(dep not in done_ids and task_statuses.get(dep) not in ('failed', 'cancelled')
+               for dep in bb):
             continue
         task_skills = set(meta.get('skills') or [])
         if not task_skills:

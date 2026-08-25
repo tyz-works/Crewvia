@@ -289,29 +289,33 @@ Worker起動時は、まず `registry/workers.yaml` で同スキルの担当履�
 
 ### registry 参照手順
 
-`assign-name.sh` は **位置引数でスキルを受け取る**（`--skills` フラグは無い）。同じスキルセットが既に registry に登録されていれば、そのWorker名を返して新規採番はしない。
+`assign-name.sh` は **位置引数でスキルを受け取る**（`--skills` フラグは無い）。
+registry lookup は `assign-name.sh` が内部で行うため、`yq` による手動検索は不要。
+同じスキルセットが既に登録されていれば既存名を返し、未登録なら新規採番する。
 
 ```bash
-REQUIRED_SKILLS=("code" "typescript")
-
-# registry から同スキルのWorkerを検索
-EXISTING_WORKER=$(yq eval \
-  ".workers[] | select(.skills[] == \"${REQUIRED_SKILLS[0]}\") | .name" \
-  registry/workers.yaml 2>/dev/null | head -1)
-
-if [ -n "$EXISTING_WORKER" ]; then
-  WORKER_NAME="$EXISTING_WORKER"
-  echo "[INFO] 担当Worker: $WORKER_NAME (スキル継続・ナレッジ引き継ぎ)"
-else
-  # assign-name.sh は位置引数でスキルを取る（CSV ではなくスペース区切り）
-  WORKER_NAME=$(./scripts/assign-name.sh "${REQUIRED_SKILLS[@]}")
-  echo "[INFO] 新規Worker割り当て: $WORKER_NAME"
-fi
+# assign-name.sh が registry を参照し、既存名があればそれを返す（スキルは位置引数・スペース区切り）
+WORKER_NAME=$(./scripts/assign-name.sh code typescript)
+echo "[INFO] Worker: $WORKER_NAME"
 ```
 
-**注意**:
-- `yq` が利用できない環境では `grep -A2 "name: " registry/workers.yaml` などで代替する
-- `assign-name.sh` に `--help` を渡すと、それがスキル名として登録されてしまう（positional しか見ない）ので注意
+**オプション**:
+
+| フラグ | 効果 |
+|--------|------|
+| `--exclude <name1,name2,...>` | 指定した名前を lookup とプール選択から除外する。同スキルの並列Worker起動に使う。 |
+| `--fresh` | registry lookup をスキップし、常にプールから新規採番する。プール枯渇時はエラー終了。 |
+
+```bash
+# --exclude: 既存Worker(Yuki)を避けて別名を割り当てる
+WORKER_2=$(./scripts/assign-name.sh research --exclude Yuki)
+
+# --fresh: 必ず新規名を割り当てる（registry にヒットしても再利用しない）
+WORKER_2=$(./scripts/assign-name.sh research --fresh)
+
+# 組み合わせ可能
+WORKER_2=$(./scripts/assign-name.sh research --fresh --exclude Yuki)
+```
 
 ### Worker 起動
 
@@ -371,26 +375,39 @@ Worker に crewvia 以外のプロジェクト (例: `~/workspace/taskvia`) を�
 ### 複数Workerが必要な場合
 
 **tmux モード必須**。同じ registry 登録名の重複起動は避ける。
+`assign-name.sh` の `--exclude` / `--fresh` フラグを使って別名を確実に割り当てる。
+
+**方法A: `--exclude` で1人目を除外して2人目を採番**（推奨）
 
 ```bash
 SKILL="research"
 
-# 1人目: registry から既存Worker
-WORKER_1=$(yq eval \
-  ".workers[] | select(.skills[] == \"$SKILL\") | .name" \
-  registry/workers.yaml 2>/dev/null | head -1)
-[ -z "$WORKER_1" ] && WORKER_1=$(./scripts/assign-name.sh "$SKILL")
+# 1人目: registry-first — 既存名があれば返し、なければ新規採番
+WORKER_1=$(./scripts/assign-name.sh "$SKILL")
 
-# 2人目: 新規採番が必要な場合は、まず WORKER_1 を registry に book してから呼ぶ
-# （assign-name.sh は同じスキルセットに対し既存名を返すため、単純に再呼び出ししても別名が返らない）
-# 現行実装では手動で別名を付けるか、スキルセットを微妙に変えて区別する
-WORKER_2="${WORKER_1}-2"  # 簡易的な派生命名
+# 2人目: --exclude で1人目を除外して別名を割り当て
+WORKER_2=$(./scripts/assign-name.sh "$SKILL" --exclude "$WORKER_1")
 
 AGENT_NAME=$WORKER_1 bash scripts/start.sh worker $SKILL
 AGENT_NAME=$WORKER_2 bash scripts/start.sh worker $SKILL
 ```
 
-※ `assign-name.sh` に `--exclude` フラグは無い。複数 Worker を同じスキルで並列起動する仕組みは現状最適化されていないので、手動で別名を渡すか、registry のスキル集合を工夫する。
+**方法B: `--fresh` で常に新規採番**（registry を無視して確実に別名が欲しい場合）
+
+```bash
+SKILL="research"
+
+# 1人目: 通常の registry-first 割り当て
+WORKER_1=$(./scripts/assign-name.sh "$SKILL")
+
+# 2人目: --fresh でプールから必ず新規採番（プール枯渇時はエラー）
+WORKER_2=$(./scripts/assign-name.sh "$SKILL" --fresh)
+
+AGENT_NAME=$WORKER_1 bash scripts/start.sh worker $SKILL
+AGENT_NAME=$WORKER_2 bash scripts/start.sh worker $SKILL
+```
+
+3人目以降は `--exclude WORKER_1,WORKER_2` のように CSV で複数名を除外できる。
 
 ---
 

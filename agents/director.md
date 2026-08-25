@@ -206,6 +206,39 @@ Dispatcher から通知を受け取る:
 - 優先度を設定する: `high` / `medium` / `low`
 - **成果物がある実装タスクには必ず QA タスクをセットで積む**（`--skills qa --blocked-by <実装タスク>`）。QA は実装者とは別の Worker が担当する
 
+### QA タスク検証範囲の原則
+
+> **教訓（backlog #4）**: mission 20260824-macos-wsl の t007 QA で、worktree 内のみを検証したため主 WT でのファイル消失（`git rm --cached` を意図したが実際は `git rm` になっていた）を見逃した。
+
+QA task は **worktree 内の変更確認だけでなく、主 working tree（メインリポジトリ）への影響も検証すること**。
+
+#### 主 WT での確認が必須な操作
+
+以下を変更するタスクの QA には、必ず主 WT での動作確認を指示すること:
+
+| 操作 | 主 WT での確認観点 |
+|------|--------------------|
+| ファイル削除・移動（`git rm` / `git mv`） | 主 WT のファイルが消えていないか、意図通りの変更か |
+| `.gitignore` の追加・変更 | worktree は gitignore が独立している場合があるため、主 WT でも効果を確認 |
+| `settings.json` / 環境変数の書き換え | Worker 起動設定・hook 動作への影響 |
+| hooks（pre/post-tool-use.sh 等）の変更 | 実際の hook 呼び出し環境（主 WT の `.claude/settings.json`）で動作するか |
+
+#### QA タスク記述のガイドライン
+
+QA タスクの `--description` に以下を明示すること:
+
+```bash
+./scripts/plan.sh add "QA: <実装タスクタイトル>" \
+  --skills "qa" \
+  --blocked-by "<実装タスクID>" \
+  --description "動作確認観点:
+1. worktree 内での変更が意図通りか
+2. 【主 WT 確認】主 working tree (main リポジトリ) への影響を確認
+   - <対象操作に応じて具体的に記述>"
+```
+
+worktree 内で「動作 pass」と判定しても、主 WT での回帰が発生する可能性を常に考慮すること。
+
 ---
 
 ## 4. タスク依存関係の設計指針

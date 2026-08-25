@@ -451,10 +451,34 @@ requires_approval に該当 → type: improvement でTaskvia /api/log に投稿�
 
 タスクの種類に応じて成果物を永続化する:
 
-- **コード変更**: `git add` → `git commit` → `git push origin {branch}`
-- **ドキュメント更新**: ファイル書き出し → commit → push
+- **コード変更**: `git add` → `git commit` → `git push origin {branch}` → **`gh pr create`（PR 作成）**
+- **ドキュメント更新**: ファイル書き出し → commit → push → **`gh pr create`（PR 作成）**
 - **調査タスク**: 調査結果をファイルに書き出す（レポート・まとめ等）
 - **Obsidian 操作**: 対象ファイルの作成・編集を完了する
+
+**PR 作成（コード・ドキュメント変更の場合）**:
+
+```bash
+gh pr create \
+  --title "{type}: {内容}" \
+  --body "## 概要
+[変更の概要]
+
+## 変更内容
+- [変更点1]
+- [変更点2]
+
+task: ${TASK_MISSION}/${TASK_ID}
+branch: $(git branch --show-current)" \
+  --base main
+
+# PR URL を確認して完了報告に含める
+PR_URL=$(gh pr view --json url -q .url)
+echo "[worker] PR created: $PR_URL"
+```
+
+- PR merge は `review` スキルの Worker (Seo) の責務。自分でマージしないこと
+- PR URL は必ず完了報告フォーマットに含めること
 
 成果物がリポジトリ外（Obsidian 等）の場合でも、何を作成・変更したかを後で報告できるようメモしておくこと。
 
@@ -519,12 +543,15 @@ Director への報告フォーマット:
 ```
 タスク {TASK_MISSION}/{TASK_ID}（{TASK_TITLE}）完了。
 ブランチ: task/{CREWVIA_MISSION_SLUG}/{CREWVIA_TASK_ID}-{CREWVIA_TASK_SLUG}
+PR: {PR URL}（review Worker (Seo) による merge 待ち）
 worktree: {WORKTREE_PATH}
 結果: [実行した内容と結果の要約]
 気づき: [あれば記載、なければ「なし」]
 改善提案: [あれば記載、なければ「なし」]
 プラン状態: [plan.sh status --mission "$TASK_MISSION" の出力]
 ```
+
+PR が不要なタスク（調査・Obsidian 操作等）の場合は `PR: なし` と記載すること。
 
 **「Director の確認を待とう」「PR がマージされるまで待とう」は NG。** PR レビュー/マージは別 worker の責務。Step 1〜5 を終えたら done → 次のタスクを pull。
 
@@ -714,7 +741,26 @@ type の例:
 git add {変更ファイル}
 git commit -m "{type}: {内容} (task/{task_id})"
 git push origin {branch}
+
+# PR を作成する（Worker-driven PR モデル）
+gh pr create \
+  --title "{type}: {内容}" \
+  --body "## 概要
+[変更の概要]
+
+## 変更内容
+- [変更点1]
+- [変更点2]
+
+task: ${TASK_MISSION}/${TASK_ID}
+branch: $(git branch --show-current)" \
+  --base main
+
+# PR URL を確認して完了報告に含める
+gh pr view --json url -q .url
 ```
+
+PR merge は `review` スキルの Worker (Seo) が行う。**自分でマージしないこと。**
 
 ### ⚠️ Stacked PR (依存PR) の squash merge に関する注意
 
@@ -737,15 +783,18 @@ base が `main` / `master` 以外の場合は stacked PR。Director に以下を
 
 ### Director への完了報告
 
-branch 名を含めて報告すること:
+branch 名と PR URL を含めて報告すること:
 
 ```
 タスク {task_id} 完了。
 ブランチ: task/{mission_slug}/{task_id}-{task_slug}
+PR: {PR URL}（review Worker (Seo) による merge 待ち）
 結果: [実行した内容と結果の要約]
 気づき: [あれば記載、なければ「なし」]
 改善提案: [あれば記載、なければ「なし」]
 ```
+
+PR が不要なタスク（調査・Obsidian 操作等）の場合は `PR: なし` と記載すること。
 
 ---
 

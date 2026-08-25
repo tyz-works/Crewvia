@@ -662,19 +662,24 @@ worktree パス:   .claude/worktrees/{mission_slug}/{task_id}-{task_slug}/
 
 **Director がブランチを手動作成する必要はない。** `crewvia_create_branch` は廃止済み。Worker 起動後、pull 時に自動でブランチと worktree がセットアップされる。
 
-### 全Worker完了後: PR 作成
+### PR 作成: Worker-driven
 
-全Workerの完了報告を受け取ったら、`crewvia_create_pr` でPRを作成せよ：
+PR は **各 Worker が自 task の完了時に自分で作成する**（Worker-driven PR モデル）。
+Director が代わりに PR を作成する必要はない。
 
-```bash
-source scripts/git-helpers.sh
+- Worker は実装完了後、`git push` の直後に `gh pr create` で PR を作成する
+- 完了報告には必ず PR URL を含める
+- Director は Worker の完了報告に含まれる PR URL を収集し、merge 順序を管理する
 
-crewvia_create_pr \
-  "task/20260411-auth-refactor/t002-add-auth-middleware" \
-  "feat: 認証ミドルウェアを追加" \
-  "## 概要\n認証ミドルウェアを実装した。\n\n## 変更内容\n- middleware/auth.ts 追加\n- 既存ルートに認証チェック追加"
-# → PR URLが返される（例: https://github.com/org/repo/pull/42）
-```
+**Director の役割（PR 作成後）**:
+
+1. Worker の完了報告に含まれる **PR URL を確認・記録する**
+2. 全 PR の merge 順序を把握する（stacked PR がある場合は後述の注意事項に従う）
+3. `review` スキルの Worker (Seo) に PR URL を渡してレビューを依頼する
+
+> **実運用実績**: mission 20260824-macos-wsl, 20260825-task-count-fix, 20260825-backlog-m1,
+> 20260825-backlog-m2 の全タスクで Worker-driven PR が採用され、いずれも問題なく完了している。
+> Worker は実装 context を最も豊富に持つため、PR 本文の具体性も向上する。
 
 ### ⚠️ Stacked PR (依存PR) の squash merge に関する注意
 
@@ -700,7 +705,8 @@ crewvia_create_pr \
 
 ### Reviewer Worker への委任
 
-PR作成後、**新たに `review` スキルのWorkerを要求**し、PR URLを渡せ：
+Worker の完了報告に PR URL が含まれたら、**`review` スキルの Worker (Seo) を起動**し、PR URL を渡せ。
+Director が PR を作成する必要はない — Worker がすでに作成済みである。
 
 ```bash
 REVIEWER=$(yq eval \
@@ -709,8 +715,10 @@ REVIEWER=$(yq eval \
 [ -z "$REVIEWER" ] && REVIEWER=$(./scripts/assign-name.sh review)
 
 AGENT_NAME=$REVIEWER bash scripts/start.sh worker review
-# Worker起動後、PR URLと確認観点を plan.sh 経由で渡す
+# Worker起動後、PR URL（Worker の完了報告に含まれる）と確認観点を plan.sh 経由で渡す
 ```
+
+**merge 順序の管理**: 複数 PR がある場合、Director は依存関係を考慮して Seo (review) に merge 順序を指示すること。PR merge は必ず Seo に委任し、Director 自身はマージしない（§13 参照）。
 
 ---
 

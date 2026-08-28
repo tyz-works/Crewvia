@@ -16,6 +16,20 @@
 
 set -euo pipefail
 
+# クラッシュガード: set -euo pipefail で予期せず exit した場合に exit 0 で収束させる。
+# PostToolUse はログ投稿のみで、失敗してもエージェント動作に影響しないため exit 0 が正しい。
+# trap の登録を set -euo pipefail の直後に置くことで、以降のどの行でクラッシュしても捕捉できる。
+_CURRENT_STEP="init"
+_crash_guard() {
+  local _EXIT_CODE=$?
+  if [ "$_EXIT_CODE" -ne 0 ]; then
+    echo "[post-tool-use] ⚠️ crash guard: hook exited unexpectedly (exit=${_EXIT_CODE}, step=${_CURRENT_STEP})" >&2
+  fi
+  exit 0
+}
+trap '_crash_guard' EXIT
+
+_CURRENT_STEP="env-setup"
 TASKVIA_URL="${TASKVIA_URL:-https://taskvia.vercel.app}"
 TASKVIA_TOKEN="${TASKVIA_TOKEN:-}"
 AGENT_NAME="${AGENT_NAME:-$(hostname -s)}"
@@ -23,8 +37,9 @@ TASK_TITLE="${TASK_TITLE:-}"
 TASK_ID="${TASK_ID:-}"
 
 # env に TASK_ID がなければ assignments ファイルから補完する
+_CURRENT_STEP="task-id-lookup"
 if [ -z "$TASK_ID" ] && [ -n "$AGENT_NAME" ]; then
-  _CREWVIA_REPO="${CREWVIA_REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+  _CREWVIA_REPO="${CREWVIA_REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
   _ASSIGNMENT_FILE="${_CREWVIA_REPO}/queue/assignments/${AGENT_NAME}"
   if [ -f "$_ASSIGNMENT_FILE" ]; then
     _ASSIGNMENT="$(cat "$_ASSIGNMENT_FILE" | tr -d '\n')"
@@ -41,8 +56,9 @@ fi
 # Appends a timestamped entry to registry/activity/<AGENT_NAME>/<TASK_ID>.activity
 # so that watchdog.py can detect live tool execution activity.
 # Runs unconditionally (before Taskvia guard) so it works in standalone mode too.
+_CURRENT_STEP="activity-log"
 if [ -n "${AGENT_NAME:-}" ] && [ -n "${TASK_ID:-}" ]; then
-  _ACTIVITY_REPO="${CREWVIA_REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+  _ACTIVITY_REPO="${CREWVIA_REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
   ACTIVITY_DIR="${_ACTIVITY_REPO}/registry/activity/${AGENT_NAME}"
   mkdir -p "$ACTIVITY_DIR"
   echo "$(date +%s) tool=${CLAUDE_TOOL_NAME:-unknown}" >> "${ACTIVITY_DIR}/${TASK_ID}.activity"
@@ -54,6 +70,7 @@ fi
 # (順序の事故であり設計判断ではない — task_162 Picard裁定)。activity と同じ扱いにし、
 # ガードより前(無条件実行)へ移す。Taskvia への役割・スキル送信(/api/agents)自体は
 # 引き続きガードの下流のままで変更していない(下記参照)。
+_CURRENT_STEP="heartbeat"
 if [[ -n "${AGENT_NAME:-}" ]]; then
   _HB_REPO="${CREWVIA_REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
   HEARTBEAT_DIR="${_HB_REPO}/registry/heartbeats"
@@ -67,6 +84,7 @@ if [ "${CREWVIA_TASKVIA:-}" = "disabled" ] || [ -z "$TASKVIA_TOKEN" ]; then
 fi
 
 # stdin から hook の JSON ペイロードを読む
+_CURRENT_STEP="read-input"
 INPUT="$(cat)"
 TOOL_NAME="$(echo "$INPUT" | jq -r '.tool_name // "unknown"')"
 TOOL_INPUT="$(echo "$INPUT" | jq -c '.tool_input // {}' 2>/dev/null || echo '{}')"
@@ -77,6 +95,7 @@ TOOL_INPUT_SUMMARY="$(echo "$TOOL_INPUT" | head -c 80)"
 CONTENT="${TOOL_NAME}: ${TOOL_INPUT_SUMMARY}"
 
 # ログペイロード構築
+_CURRENT_STEP="build-payload"
 PAYLOAD="$(jq -nc \
   --arg type    "work" \
   --arg content "$CONTENT" \
@@ -95,6 +114,7 @@ curl -sf -X POST "${TASKVIA_URL}/api/log" \
 # --- Taskvia /api/agents 送信(役割・スキル付きハートビート情報) ---
 # heartbeat ファイル自体は上流(ガード前)で既に更新済み。ここは Taskvia への
 # メタデータ送信のみ(TASKVIA_TOKEN が設定済みの場合のみここに到達)。
+_CURRENT_STEP="agents-heartbeat"
 if [[ -n "${AGENT_NAME:-}" ]]; then
   # task_160 F9是正: 汎用名 REPO_ROOT は外部から乗っ取り可能なため CREWVIA_REPO_ROOT を読む
   # (start.sh:248 が既に export 済み)。読み手(watchdog.py)側は変更しないこと — 向きが重要。
@@ -164,5 +184,5 @@ PYEOF
     -d "$_AGENTS_PAYLOAD" >/dev/null 2>&1 || true
 fi
 
-
+_CURRENT_STEP="done"
 exit 0

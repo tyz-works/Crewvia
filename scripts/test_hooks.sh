@@ -144,6 +144,77 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# hooks/post-tool-use.sh テスト
+# ---------------------------------------------------------------------------
+
+POST_HOOK="${REPO_ROOT}/hooks/post-tool-use.sh"
+
+echo ""
+echo "=== hooks/post-tool-use.sh 回帰テスト ==="
+echo ""
+
+_run_post_hook() {
+  local input="$1"
+  shift
+  env -i \
+    HOME=/tmp \
+    PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    CREWVIA_REPO_ROOT="$REPO_ROOT" \
+    "$@" \
+    bash "$POST_HOOK" <<< "$input" 2>/tmp/test_post_stderr
+}
+
+_assert_exit() {
+  local test_name="$1" expected_exit="$2" actual_exit="$3"
+  if [ "$actual_exit" -eq "$expected_exit" ]; then
+    echo "PASS [$test_name]: exit $actual_exit"
+    PASS=$((PASS + 1))
+  else
+    echo "FAIL [$test_name]: expected exit $expected_exit, got exit $actual_exit"
+    echo "  stderr: $(cat /tmp/test_post_stderr 2>/dev/null)"
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+# PT-1: TASKVIA disabled 正常系 — exit 0
+_run_post_hook \
+  '{"tool_name":"Bash","tool_input":{"command":"echo test"}}' \
+  CREWVIA_TASKVIA=disabled AGENT_NAME=TestHaruto TASK_ID=t999 \
+  || true
+EXIT=$?
+_assert_exit "PT-1: TASKVIA disabled 正常系 → exit 0" 0 "$EXIT"
+
+# PT-2: クラッシュガード確認 — 壊れた CREWVIA_REPO_ROOT でも exit 0
+# (activity-log step で mkdir が失敗してもクラッシュガードが exit 0 を保証する)
+env -i \
+  HOME=/tmp \
+  PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+  CREWVIA_REPO_ROOT="/nonexistent_crewvia_repo_for_test_$$" \
+  CREWVIA_TASKVIA=disabled AGENT_NAME=TestHaruto TASK_ID=t999 \
+  bash "$POST_HOOK" <<< '{"tool_name":"Bash","tool_input":{"command":"echo test"}}' \
+  2>/tmp/test_post_stderr || true
+EXIT=$?
+_assert_exit "PT-2: 壊れた env でも exit 0 (crash guard)" 0 "$EXIT"
+
+# PT-3: TASKVIA TOKEN 設定なし (standalone mode) — exit 0
+_run_post_hook \
+  '{"tool_name":"Edit","tool_input":{"file_path":"/tmp/test.txt"}}' \
+  TASKVIA_TOKEN="" AGENT_NAME=TestHaruto TASK_ID=t998 \
+  || true
+EXIT=$?
+_assert_exit "PT-3: TOKEN 未設定 standalone → exit 0" 0 "$EXIT"
+
+# PT-4: curl 失敗 (Taskvia 接続不可) でも exit 0
+_run_post_hook \
+  '{"tool_name":"Bash","tool_input":{"command":"ls"}}' \
+  CREWVIA_TASKVIA=enabled TASKVIA_TOKEN=dummy_token \
+  TASKVIA_URL=http://127.0.0.1:19999 \
+  AGENT_NAME=TestHaruto TASK_ID=t997 \
+  || true
+EXIT=$?
+_assert_exit "PT-4: Taskvia 接続不可でも exit 0" 0 "$EXIT"
+
+# ---------------------------------------------------------------------------
 # 結果
 # ---------------------------------------------------------------------------
 

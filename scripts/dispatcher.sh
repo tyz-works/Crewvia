@@ -26,8 +26,8 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 QUEUE_DIR="${CREWVIA_QUEUE:-${REPO_ROOT}/queue}"
 REGISTRY_DIR="${REPO_ROOT}/registry"
 LOG_FILE="${REGISTRY_DIR}/dispatcher.log"
-NOTIFY_CACHE="/tmp/dispatcher-notify-cache.$$.json"
-NOTIFY_TTL=60   # seconds before repeating the same notification
+NOTIFY_CACHE="/tmp/dispatcher-notify-cache.json"
+NOTIFY_TTL=300  # seconds before repeating the same notification (5 min)
 
 # Standalone-safe: silently exit when tmux is not installed
 if ! command -v tmux &>/dev/null; then
@@ -77,6 +77,11 @@ ALL_DONE_STATE_FILE = REGISTRY_DIR / 'dispatcher_all_done.flag'
 
 PRIORITY_ORDER  = {'high': 0, 'medium': 1, 'low': 2}
 TERMINAL_STATUSES = {'done', 'verified', 'skipped'}
+
+# Skills that mark a task as Director-only (handled directly by the Director,
+# not dispatchable to any Worker).  Tasks with these skills are excluded from
+# the "no worker available" notification loop so the Director is not spammed.
+DIRECTOR_ONLY_SKILLS = {'director-only'}
 
 # Circuit breaker for Taskvia API calls
 TASKVIA_CB_FAILURES = 0
@@ -660,6 +665,10 @@ def dispatch():
         task_skills = set(meta.get('skills') or [])
         if not task_skills:
             log(f"WARNING: task {meta.get('id')} (mission={slug}) has no skills — dispatcher cannot assign it")
+            continue
+        if task_skills & DIRECTOR_ONLY_SKILLS:
+            # Task is handled directly by the Director — skip Worker assignment
+            # and suppress "no worker" notifications for it.
             continue
         unblocked_pending.append((slug, meta))
     unblocked_pending.sort(key=lambda c: PRIORITY_ORDER.get(c[1].get('priority', 'medium'), 1))

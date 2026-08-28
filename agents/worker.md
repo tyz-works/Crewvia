@@ -49,7 +49,7 @@ Kai発見: oci compute instance list で --compartment-id を省略すると全�
 3. **プランの存在と状態を確認する** — active mission が存在しない場合（`queue/state.yaml` の `active_missions` が空）は Director に報告して待機する。存在する場合は現在のプラン全体を把握する:
 
    ```bash
-   ./scripts/plan.sh status
+   ${CREWVIA_REPO_ROOT}/scripts/plan.sh status
    ```
 
    出力例:
@@ -61,7 +61,7 @@ Kai発見: oci compute instance list で --compartment-id を省略すると全�
        🔄 t002 新認証ミドルウェアの実装 (Luca)
    ```
 
-   特定 mission の詳細を見たいときは `./scripts/plan.sh status --mission <slug>` を使う。
+   特定 mission の詳細を見たいときは `${CREWVIA_REPO_ROOT}/scripts/plan.sh status --mission <slug>` を使う。
 
 ---
 
@@ -186,12 +186,12 @@ Dispatcher から `--task {id} --mission {slug}` が届いた場合はそれを�
 
 ```bash
 # Dispatcher からの assign 通知ありの場合
-TASK_JSON=$(./scripts/plan.sh pull --skills "$SKILLS" --agent "$AGENT_NAME" \
+TASK_JSON=$(${CREWVIA_REPO_ROOT}/scripts/plan.sh pull --skills "$SKILLS" --agent "$AGENT_NAME" \
   --task "$ASSIGNED_TASK_ID" --mission "$ASSIGNED_MISSION")
 PULL_RC=$?
 
 # 起動直後や --task なしの場合（スキルマッチで自動選択）
-TASK_JSON=$(./scripts/plan.sh pull --skills "$SKILLS" --agent "$AGENT_NAME")
+TASK_JSON=$(${CREWVIA_REPO_ROOT}/scripts/plan.sh pull --skills "$SKILLS" --agent "$AGENT_NAME")
 PULL_RC=$?
 ```
 
@@ -508,7 +508,7 @@ Worker はここで手動 bump を呼ばないこと（二重 bump 防止）。
 **ここまで全て完了してから**、タスクを手放す:
 
 ```bash
-./scripts/plan.sh done "$TASK_ID" "実行した内容と結果の要約" --mission "$TASK_MISSION"
+${CREWVIA_REPO_ROOT}/scripts/plan.sh done "$TASK_ID" "実行した内容と結果の要約" --mission "$TASK_MISSION"
 ```
 
 > **移行予告**: 将来的に `plan.sh done` は `plan.sh ready-for-verification <task_id>` に移行予定。
@@ -535,7 +535,7 @@ cwd が worktree の場合、verify-task.sh 内の `SCRIPT_DIR` が worktree 側
 完了登録後、`plan.sh status --mission "$TASK_MISSION"` の出力を Director に報告する:
 
 ```bash
-./scripts/plan.sh status --mission "$TASK_MISSION"
+${CREWVIA_REPO_ROOT}/scripts/plan.sh status --mission "$TASK_MISSION"
 ```
 
 Director への報告フォーマット:
@@ -608,7 +608,7 @@ mkdir -p "$(dirname "$HANDOFF_PATH")"
 **Step 4**: plan.sh fail を実行:
 
 ```bash
-./scripts/plan.sh fail "$TASK_ID" "$HANDOFF_PATH" --mission "$TASK_MISSION"
+${CREWVIA_REPO_ROOT}/scripts/plan.sh fail "$TASK_ID" "$HANDOFF_PATH" --mission "$TASK_MISSION"
 ```
 
 **Step 5**: Director に報告:

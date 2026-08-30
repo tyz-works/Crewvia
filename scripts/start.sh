@@ -272,6 +272,45 @@ if [[ "${ROLE}" == "worker" ]] && [[ -n "${TARGET_DIR:-}" ]]; then
   export TARGET_DIR="$WORK_DIR"  # Worker 側にも canonicalized pathを渡す
 fi
 
+# --- TARGET_DIR モード: 対象プロジェクトの settings.local.json に絶対パス hook を injection ---
+# Worker が TARGET_DIR で起動すると ${CLAUDE_PROJECT_DIR} が TARGET_DIR を指し、
+# crewvia hooks（pre-tool-use.sh / post-tool-use.sh）が見つからず hook error が
+# 発生する（root cause: memory crewvia-target-dir-hook-path-pitfall 参照）。
+# settings.local.json に絶対パスで hook を injection することで解決する。
+# settings.local.json は --settings 経由の settings.json より優先されるため、
+# 誤パス hooks の発火を上書きし、正しい絶対パス hooks のみが発火する。
+if [[ "${ROLE}" == "worker" ]] && [[ "$WORK_DIR" != "$REPO_ROOT" ]]; then
+  _INJECT_SETTINGS_DIR="$WORK_DIR/.claude"
+  mkdir -p "$_INJECT_SETTINGS_DIR"
+  python3 - "$_INJECT_SETTINGS_DIR/settings.local.json" "$REPO_ROOT" <<'PYEOF'
+import sys, json
+settings_path = sys.argv[1]
+repo_root = sys.argv[2]
+
+try:
+    with open(settings_path) as f:
+        existing = json.load(f)
+except Exception:
+    existing = {}
+
+# hooks キーのみ絶対パスで上書き（他のキーは保持）
+existing['hooks'] = {
+    "PreToolUse": [{
+        "matcher": "Bash|Write|Edit|MultiEdit",
+        "hooks": [{"type": "command", "command": f"{repo_root}/hooks/pre-tool-use.sh"}]
+    }],
+    "PostToolUse": [{
+        "matcher": "Bash|Write|Edit|MultiEdit",
+        "hooks": [{"type": "command", "command": f"{repo_root}/hooks/post-tool-use.sh"}]
+    }]
+}
+
+with open(settings_path, 'w') as f:
+    json.dump(existing, f, ensure_ascii=False, indent=2)
+PYEOF
+  echo "[crewvia] TARGET_DIR mode: hook injection → $WORK_DIR/.claude/settings.local.json"
+fi
+
 echo "[crewvia] Starting as $AGENT_NAME ($ROLE)"
 
 # Check for TASKVIA_TOKEN (try token file if env not set; skip entirely when Taskvia disabled)

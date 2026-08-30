@@ -720,6 +720,10 @@ def dispatch():
             if meta['id'] in assigned_task_ids:
                 continue
             task_skills = set(meta.get('skills') or [])
+            # Defense-in-depth: skip director-only tasks even if the gate above
+            # let them through (e.g. scalar-typed skills field edge case).
+            if task_skills & DIRECTOR_ONLY_SKILLS:
+                continue
             if task_skills.issubset(worker_skills):
                 best = (slug, meta)
                 break
@@ -767,6 +771,10 @@ def dispatch():
     for slug, meta in unblocked_pending:
         task_id = meta['id']
         task_skills = set(meta.get('skills') or [])
+        # Defense-in-depth: director-only tasks must never trigger a Worker
+        # startup request — skip them regardless of how they reached this loop.
+        if task_skills & DIRECTOR_ONLY_SKILLS:
+            continue
         can_handle = any(
             task_skills.issubset(set((workers.get(w['agent_name']) or {}).get('skills') or []))
             for w in windows

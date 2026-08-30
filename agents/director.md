@@ -299,6 +299,70 @@ worktree 内で「動作 pass」と判定しても、主 WT での回帰が発�
 | `qa` | QA・動作検証（実装者とは別Workerが担当） |
 | `planning` | プランレビュー（タスク分解・依存関係・スキル割り当ての妥当性検証） |
 
+### Edit/Write 可否一覧
+
+Worker がファイルを編集・作成できるかはスキルで決まる。
+**実装タスクに read-only スキルのみを割り当てると、Worker が大量トークンを消費しても何も実装できない事故になる**（実績: research を混ぜた Worker が 44k トークン消費→実装ゼロ）。
+
+| スキル | Edit/Write | 備考 |
+|--------|:----------:|------|
+| `code` | ✅ 可 | コーディング全般 |
+| `python` | ✅ 可 | Python 実装 |
+| `typescript` | ✅ 可 | TypeScript / JavaScript 実装 |
+| `bash` | ✅ 可 | Bash スクリプト実装 |
+| `ops` | ✅ 可 | インフラ・サーバー操作 |
+| `database` | ✅ 可 | DB操作・クエリ |
+| `cloud` | ✅ 可 | クラウドリソース操作 |
+| `docs` | ✅ 可 | ドキュメント作成 |
+| `qa` | ✅ 可 | QA・動作検証（テスト結果記録等） |
+| `review` | ❌ deny | コードレビュー・PR承認（gh コマンド中心。Edit/Write は不可） |
+| `research` | ❌ deny | **調査のみ。実装タスクには絶対に使わない** |
+| `planning` | ❌ deny | プランレビューのみ |
+
+> **ソース**: `config/skill-permissions.yaml` が実際の権限定義ソース。スキルを追加・変更した場合は必ずそちらを更新し、この表と同期すること。
+
+### 実装タスクの skills 命名パターン
+
+迷いやすい組み合わせと NG 例を示す。
+
+```
+# ✅ 正しい組み合わせ
+Python 実装     : --skills "code,python"
+Bash/Shell 実装 : --skills "bash,code"
+docs 実装       : --skills "docs"  または  --skills "code,docs"
+TypeScript 実装 : --skills "typescript,code"
+調査+実装の混合 : --skills "code"  ← 調査は実装の中で完結させる
+
+# ❌ NG（実装タスクに research を混ぜてはいけない）
+--skills "code,research"      ← research の deny が code の allow を上書きし Edit/Write が全拒否
+--skills "research,docs"      ← research deny が優先し Edit/Write が使えない
+--skills "code,review"        ← review の deny が Edit/Write を塞ぐ
+
+# ❌ NG の根本原因
+タスク skills の deny は allow より強い（判定フロー §2 in skill-permissions.yaml 参照）。
+read-only スキルを 1 つでも混ぜると、その deny が全体に適用される。
+```
+
+### Worker 起動前チェックリスト
+
+Worker 起動の**直前**に以下をすべて確認せよ：
+
+```
+□ task frontmatter の skills を確認した
+□ 各 skill が上記「Edit/Write 可否一覧」で ✅ 可 であることを確認した
+□ "research" "review" "planning" が実装タスクに混入していないことを確認した
+□ config/skill-permissions.yaml の deny 定義と矛盾しないことを確認した
+```
+
+実装 task なのに上記チェックで ❌ deny スキルが含まれている場合、**Worker を起動する前に** `plan.sh` で skills を修正すること:
+
+```bash
+# read-only スキルの deny 定義をその場で確認する
+grep -A5 'research:' config/skill-permissions.yaml
+grep -A5 'review:' config/skill-permissions.yaml
+grep -A5 'planning:' config/skill-permissions.yaml
+```
+
 ---
 
 ## 6. Worker名の決定と起動

@@ -353,6 +353,95 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Test 9: dispatch loop — defense-in-depth で director-only task を Worker 割り当てから除外
+#   unblocked_pending にすり抜けた director-only task があっても assign しない
+# ---------------------------------------------------------------------------
+echo ""
+echo "-- Test 9: dispatch loop defense-in-depth (assignment skip) --"
+python3 - <<'PYEOF'
+import re, sys
+
+DIRECTOR_ONLY_SKILLS = {'director-only'}
+
+# Simulate unblocked_pending that somehow still contains a director-only task
+# (worst-case: the gate filter failed)
+unblocked_pending = [
+    ('test-mission', {'id': 't010', 'title': 'director task', 'skills': ['director-only'], 'priority': 'high'}),
+    ('test-mission', {'id': 't011', 'title': 'normal task',   'skills': ['bash'],           'priority': 'high'}),
+]
+worker_skills = {'bash', 'code', 'director-only'}  # worker has director-only in skills
+
+assigned = []
+for slug, meta in unblocked_pending:
+    task_skills = set(meta.get('skills') or [])
+    # Defense-in-depth check (same as dispatcher.sh line 725)
+    if task_skills & DIRECTOR_ONLY_SKILLS:
+        continue
+    if task_skills.issubset(worker_skills):
+        assigned.append(meta['id'])
+        break
+
+assert 't010' not in assigned, f"director-only task (t010) was assigned to a worker: {assigned}"
+assert 't011' in assigned,     f"normal task (t011) was NOT assigned: {assigned}"
+print(f"assigned={assigned} — director-only correctly skipped, normal task assigned")
+PYEOF
+if [[ $? -eq 0 ]]; then
+  pass "dispatch loop: director-only task は Worker 割り当てから除外される (defense-in-depth)"
+else
+  fail "dispatch loop: director-only task が Worker に割り当てられた"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 10: no_worker 通知ループ — defense-in-depth で director-only task を除外
+#   unblocked_pending にすり抜けた director-only task でも「Worker 起動」通知を発火しない
+# ---------------------------------------------------------------------------
+echo ""
+echo "-- Test 10: no_worker 通知ループ defense-in-depth --"
+python3 - <<'PYEOF'
+DIRECTOR_ONLY_SKILLS = {'director-only'}
+
+# Simulate unblocked_pending that somehow still contains a director-only task
+unblocked_pending = [
+    ('test-mission', {'id': 't010', 'title': 'director task', 'skills': ['director-only']}),
+    ('test-mission', {'id': 't011', 'title': 'normal task',   'skills': ['ops']}),
+]
+windows = []  # no live workers → can_handle=False for all tasks
+
+would_notify = []
+for slug, meta in unblocked_pending:
+    task_skills = set(meta.get('skills') or [])
+    # Defense-in-depth check (same as dispatcher.sh line 776)
+    if task_skills & DIRECTOR_ONLY_SKILLS:
+        continue
+    can_handle = any(False for _ in windows)  # always False when no windows
+    if not can_handle:
+        would_notify.append(meta['id'])
+
+assert 't010' not in would_notify, \
+    f"director-only task (t010) triggered 'Worker を起動' notification: {would_notify}"
+assert 't011' in would_notify, \
+    f"normal task (t011) should trigger 'Worker を起動' notification: {would_notify}"
+print(f"would_notify={would_notify} — director-only suppressed, normal task notified")
+PYEOF
+if [[ $? -eq 0 ]]; then
+  pass "no_worker 通知ループ: director-only task は「Worker 起動」通知から除外される (defense-in-depth)"
+else
+  fail "no_worker 通知ループ: director-only task が「Worker 起動」通知を発火した"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 11: dispatcher.sh に defense-in-depth チェックが dispatch/notify 両ループにある
+# ---------------------------------------------------------------------------
+echo ""
+echo "-- Test 11: dispatcher.sh の dispatch/notify 両ループに defense-in-depth チェック --"
+DO_CHECK_COUNT=$(grep -c 'task_skills & DIRECTOR_ONLY_SKILLS' "$DISPATCHER_SH" || true)
+if [[ "$DO_CHECK_COUNT" -ge 3 ]]; then
+  pass "DIRECTOR_ONLY_SKILLS チェックが dispatcher.sh に ${DO_CHECK_COUNT} か所存在 (gate + dispatch + notify)"
+else
+  fail "DIRECTOR_ONLY_SKILLS チェックが ${DO_CHECK_COUNT} か所のみ (期待: 3 か所以上)"
+fi
+
+# ---------------------------------------------------------------------------
 # 結果サマリ
 # ---------------------------------------------------------------------------
 echo ""

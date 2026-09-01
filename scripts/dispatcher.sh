@@ -96,6 +96,11 @@ TERMINAL_STATUSES = {'done', 'verified', 'skipped'}
 # the "no worker available" notification loop so the Director is not spammed.
 DIRECTOR_ONLY_SKILLS = {'director-only'}
 
+# Rule 2: blocked-stuck threshold (seconds).  If an idle Worker's only matching
+# tasks have been blocked for longer than this, the Worker is sent shutdown.
+# Uses task file mtime as a proxy for last_status_change.
+BLOCKED_STUCK_THRESHOLD = 600  # 10 minutes
+
 # Circuit breaker for Taskvia API calls
 TASKVIA_CB_FAILURES = 0
 TASKVIA_CB_THRESHOLD = 3        # consecutive failures to trip
@@ -767,10 +772,11 @@ def dispatch():
             # No unblocked pending task for this worker.
             # If there are ZERO tasks (even blocked) matching this worker's skills
             # across all active missions → worker is no longer needed.
-            has_any = any(
-                bool(task_s := set(meta.get('skills') or [])) and task_s.issubset(worker_skills)
-                for _, meta in all_pending
-            )
+            matching_pending = [
+                (slug, meta) for slug, meta in all_pending
+                if bool(task_s := set(meta.get('skills') or [])) and task_s.issubset(worker_skills)
+            ]
+            has_any = bool(matching_pending)
             # Defense-in-depth: also keep the worker alive if it owns an
             # in_progress task.  plan.sh pull writes the assignment file before
             # the Taskvia sync, but there is still a narrow window between
@@ -788,6 +794,32 @@ def dispatch():
                     record_notify(notify_key)
                     time.sleep(1)  # allow the message to land before killing
                     tmux_kill_window(target)
+            elif has_any and not has_in_progress:
+                # Rule 2: all matching tasks are blocked.  If the most recently
+                # modified matching task file is older than BLOCKED_STUCK_THRESHOLD,
+                # the blocker chain has not progressed — send shutdown (worker is stuck).
+                # Uses file mtime as a proxy for last_status_change.
+                def _task_mtime(slug, meta):
+                    p = MISSIONS_DIR / slug / 'tasks' / f"{meta['id']}.md"
+                    try:
+                        return p.stat().st_mtime
+                    except OSError:
+                        return time.time()  # file missing → treat as fresh
+
+                newest_mtime = max(_task_mtime(s, m) for s, m in matching_pending)
+                stuck_secs = time.time() - newest_mtime
+                if stuck_secs >= BLOCKED_STUCK_THRESHOLD:
+                    notify_key = f"blocked_stuck_{agent_name}"
+                    if should_notify(notify_key):
+                        log(
+                            f"[Rule 2] {agent_name}: all matching tasks blocked for "
+                            f"{stuck_secs:.0f}s ≥ {BLOCKED_STUCK_THRESHOLD}s "
+                            f"— sending shutdown (blocked-stuck)"
+                        )
+                        tmux_send(target, 'タスクなし、shutdown')
+                        record_notify(notify_key)
+                        time.sleep(1)
+                        tmux_kill_window(target)
 
     # Notify Sora about unblocked pending tasks that NO live worker can handle
     for slug, meta in unblocked_pending:

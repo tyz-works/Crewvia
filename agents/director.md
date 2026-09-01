@@ -1106,3 +1106,76 @@ AGENT_NAME=$WORKER_NAME bash scripts/start.sh worker code typescript
 - **Worker が busy（タスク実行中）**: Dispatcher は busy Worker をスキップし、5秒後に再確認する
 - **全タスクがブロック中**: 依存タスクが完了するまで Dispatcher は待機する（通知なし）
 - **同一通知の重複防止**: 同じ内容の通知は NOTIFY_TTL（デフォルト 60 秒）以内は抑制される
+
+---
+
+## 17. Worker 生存判定と能動 kill フロー（Rule 3）
+
+> 詳細仕様: `knowledge/worker-shutdown-rules.md`
+
+Worker が idle のまま WIP 枠を消費し続ける問題を防ぐため、Director は以下の条件で能動的に Worker を終了させる。
+
+### Rule 3: User 手作業 phase での能動 kill
+
+**適用トリガー**: ユーザーへの確認・作業待ちが発生し、以下を全て満たす場合:
+1. ユーザー確認完了まで **30 分以上** かかる見込みがある
+2. `plan.sh status` で idle（`in_progress` タスクなし）の Worker が存在する
+3. 当該 Worker のスキルに合う unblocked pending タスクが **ゼロ**
+
+**確認手順**:
+
+```bash
+# 1. 現在の WIP 状況を確認
+./scripts/plan.sh status
+
+# 2. 対象 Worker のスキルに合う unblocked タスクがゼロか確認
+#    (plan.sh status で pending/blocked の内訳を確認)
+```
+
+**実行手順** (AGENT_NAME に対象 Worker 名を設定):
+
+```bash
+AGENT_NAME=<対象Workerの名前>   # 例: Tariq
+
+# shutdown 通知を送信
+tmux send-keys -t "crewvia:${AGENT_NAME}-worker" "タスクなし、shutdown" Enter
+sleep 2
+
+# ウィンドウを閉じる（Worker が自発終了しなかった場合）
+tmux kill-window -t "crewvia:${AGENT_NAME}-worker" 2>/dev/null || true
+
+# heartbeat ファイルを削除
+rm -f "registry/heartbeats/${AGENT_NAME}"
+```
+
+> **注意**: Worker は shutdown 通知を受けたら **即座に** セッションを終了しなければならない（Rule 1）。
+> ただし LLM の個体差で無視することがある → 2 秒後に `tmux kill-window` で強制終了する。
+
+### Dispatcher の自動 blocked-stuck 検出（Rule 2）
+
+Dispatcher は Worker のスキルに合う全 pending タスクが **600 秒以上** blocked 状態のままの場合、自動的に shutdown を送信する（Director の手動操作不要）。
+
+- しきい値: `BLOCKED_STUCK_THRESHOLD = 600` 秒（変更は dispatcher.sh 定数）
+- 判定頻度: 5 秒ごとの通常ポーリングに統合
+- 通知重複抑制: 同一 Worker への再通知は `NOTIFY_TTL` 秒後まで抑制
+
+### Rule 1: shutdown 通知受信時の Worker 側義務（確認用）
+
+Director が観測すべき正常動作:
+- Dispatcher が「タスクなし、shutdown」を送信
+- Worker は Pre-Done チェックリストを実行後、**即座に** セッション終了
+- ❌ 「もう少し待てば次のタスクが来るかもしれない」と待機継続する Worker は異常
+
+異常が確認された場合は `tmux kill-window` で強制終了すること。
+
+### Rule 4: Graceful Handoff タイムアウト
+
+Watchdog が terminate 判定した場合、Worker には 60 秒の graceful period がある。
+HANDOFF.md は **30 秒以内**に完了させること（完璧さより速度優先）。
+
+```
+最低限の HANDOFF.md:
+1. 進捗（何%完了か）
+2. 残作業リスト
+3. 注意点・引き継ぎ事項
+```

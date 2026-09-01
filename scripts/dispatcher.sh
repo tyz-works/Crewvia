@@ -659,8 +659,12 @@ def dispatch():
         bb = meta.get('blocked_by') or []
         # failed/cancelled deps do not block: they indicate the dep will never
         # complete, so downstream tasks should remain eligible for assignment.
-        if any(dep not in done_ids and task_statuses.get(dep) not in ('failed', 'cancelled')
-               for dep in bb):
+        unmet_deps = [dep for dep in bb
+                      if dep not in done_ids
+                      and task_statuses.get(dep) not in ('failed', 'cancelled')]
+        if unmet_deps:
+            log(f"[blocked] task {meta.get('id')} (mission={slug}) — unmet deps: "
+                f"{unmet_deps} (statuses: {[task_statuses.get(d) for d in unmet_deps]})")
             continue
         task_skills = set(meta.get('skills') or [])
         if not task_skills:

@@ -686,6 +686,11 @@ def list_tasks(slug, base_dir=None):
         meta.setdefault('blocked_by', [])
         if meta.get('skills') is None:
             meta['skills'] = []
+        elif isinstance(meta.get('skills'), str):
+            # Normalize scalar string to list: `skills: bash` → `skills: [bash]`
+            # Without this, set("bash") yields individual characters, breaking
+            # skill-intersection checks (worker matching, DIRECTOR_ONLY_SKILLS).
+            meta['skills'] = [meta['skills']]
         if meta.get('blocked_by') is None:
             meta['blocked_by'] = []
         out.append((meta, body))

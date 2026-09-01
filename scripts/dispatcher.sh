@@ -18,6 +18,19 @@
 #
 # Notification dedup: same key is suppressed for NOTIFY_TTL seconds.
 # Standalone-safe: exits 0 silently when tmux is not available.
+#
+# IMPORTANT — Daemon restart after code changes:
+#   This script embeds Python as a heredoc.  The Python code is compiled once
+#   at process start and held in memory for the lifetime of the daemon.
+#   Any changes to this file take effect ONLY after the daemon is restarted:
+#
+#     # Kill the running daemon
+#     pkill -f "dispatcher.sh" || true
+#     # Restart (start.sh manages the tmux window automatically)
+#     bash scripts/dispatcher.sh &
+#
+#   Symptom of a stale daemon: new filters / fixes appear in the file but
+#   the old behaviour persists — always restart after updating dispatcher.sh.
 
 set -euo pipefail
 
@@ -249,6 +262,11 @@ def parse_frontmatter(text):
     meta.setdefault('blocked_by', [])
     if meta.get('skills') is None:
         meta['skills'] = []
+    elif isinstance(meta.get('skills'), str):
+        # Normalize scalar string to list: `skills: bash` → `skills: [bash]`
+        # Without this, set("bash") yields individual characters, breaking
+        # every skill-intersection check (DIRECTOR_ONLY_SKILLS, worker matching).
+        meta['skills'] = [meta['skills']]
     if meta.get('blocked_by') is None:
         meta['blocked_by'] = []
     return meta, body

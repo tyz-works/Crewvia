@@ -458,6 +458,11 @@ Worker に crewvia 以外のプロジェクト (例: `~/workspace/taskvia`) を�
    - `TARGET_DIR` 未設定なら Worker の cwd は crewvia 本体 (従来通り)
    - `TARGET_DIR` 設定時は Worker の cwd がそのプロジェクトになり、`$CREWVIA_REPO` 経由で plan.sh を呼ぶ
    - start.sh が `TARGET_DIR` の存在確認を行うので、存在しないパスなら起動失敗
+   - **hooks 注入（Option D 方式）**: start.sh は対象プロジェクトの `settings.local.json` を変更せず、
+     `TARGET_DIR/.claude/crewvia-worker-{AGENT_NAME}.json` を専用ファイルとして作成し
+     `--settings` で追加ロードする。Worker 停止時（`plan.sh done`）に自動削除される。
+     SIGKILL 等で削除が実行されなかった場合は次回起動時に孤立ファイルを自動削除。
+     手動リカバリ: `bash scripts/cleanup-target-dir.sh <TARGET_DIR> [AGENT_NAME]`
 
 4. **Worker がどの target project に割り当てられているかを把握しておく**
    同じ Worker 名 (例: Hana) でも、起動時の `TARGET_DIR` が異なれば触るプロジェクトが変わる。Director は「今起動中の Hana はどの TARGET_DIR で動いているか」を混同しないように記憶しておく。

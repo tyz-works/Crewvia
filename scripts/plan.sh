@@ -1503,6 +1503,19 @@ def cmd_done(args):
         if os.path.exists(assignment_file):
             os.remove(assignment_file)
 
+    # Clean up crewvia-worker-{AGENT_NAME}.json from TARGET_DIR (Option D revert)
+    # This file is created by start.sh at Worker startup to inject crewvia hooks without
+    # modifying the target project's settings.local.json.
+    target_dir = os.environ.get('TARGET_DIR', '').strip()
+    if target_dir and agent_name:
+        worker_settings = os.path.join(target_dir, '.claude', f'crewvia-worker-{agent_name}.json')
+        if os.path.exists(worker_settings):
+            try:
+                os.remove(worker_settings)
+                print(f"[plan.sh] crewvia worker settings cleaned up: {worker_settings}")
+            except OSError as _e:
+                print(f"[plan.sh warn] failed to remove worker settings {worker_settings}: {_e}", file=sys.stderr)
+
     # Auto-bump task_count in worker registry (Worker Step4 automation)
     # worker_holder[0] is None if _do didn't run, '' if no worker field, else worker name
     if worker_holder[0]:

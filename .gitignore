@@ -43,6 +43,9 @@ logs/
 # Claude Code local state
 .claude/settings.local.json
 .claude/scheduled_tasks.lock
+# crewvia TARGET_DIR mode: Worker 専用 settings ファイル（start.sh が起動時に生成 / plan.sh done で削除）
+# worktree 汚染防止のため gitignore 対象とする
+.claude/crewvia-worker-*.json
 
 # Crewvia secrets
 config/.taskvia-token

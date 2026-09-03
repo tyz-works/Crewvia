@@ -272,43 +272,50 @@ if [[ "${ROLE}" == "worker" ]] && [[ -n "${TARGET_DIR:-}" ]]; then
   export TARGET_DIR="$WORK_DIR"  # Worker 側にも canonicalized pathを渡す
 fi
 
-# --- TARGET_DIR モード: 対象プロジェクトの settings.local.json に絶対パス hook を injection ---
+# --- TARGET_DIR モード: crewvia 専用 settings ファイルに絶対パス hook を書き込む ---
 # Worker が TARGET_DIR で起動すると ${CLAUDE_PROJECT_DIR} が TARGET_DIR を指し、
 # crewvia hooks（pre-tool-use.sh / post-tool-use.sh）が見つからず hook error が
 # 発生する（root cause: memory crewvia-target-dir-hook-path-pitfall 参照）。
-# settings.local.json に絶対パスで hook を injection することで解決する。
-# settings.local.json は --settings 経由の settings.json より優先されるため、
-# 誤パス hooks の発火を上書きし、正しい絶対パス hooks のみが発火する。
+#
+# 旧実装: settings.local.json の hooks キーを直接上書き → 対象プロジェクトの既存 hooks が消滅
+# 新実装（Option D）: crewvia-worker-{AGENT_NAME}.json を専用ファイルとして書き込み、
+#   --settings で追加ロードする。settings.local.json は一切触らない。
+#   → 対象プロジェクトの既存 hooks を完全保持し、crewvia hooks がマージされて両方発火する。
+#   → Worker 停止時（plan.sh done）でファイルを削除。SIGKILL 後は次回起動時に孤立ファイルを削除。
 if [[ "${ROLE}" == "worker" ]] && [[ "$WORK_DIR" != "$REPO_ROOT" ]]; then
-  _INJECT_SETTINGS_DIR="$WORK_DIR/.claude"
-  mkdir -p "$_INJECT_SETTINGS_DIR"
-  python3 - "$_INJECT_SETTINGS_DIR/settings.local.json" "$REPO_ROOT" <<'PYEOF'
+  _WORKER_SETTINGS_DIR="$WORK_DIR/.claude"
+  mkdir -p "$_WORKER_SETTINGS_DIR"
+  _WORKER_SETTINGS="${_WORKER_SETTINGS_DIR}/crewvia-worker-${AGENT_NAME}.json"
+
+  # 前回の孤立ファイルを削除（SIGKILL 等で前回クリーンアップが実行されなかった場合の対処）
+  if [[ -f "$_WORKER_SETTINGS" ]]; then
+    rm "$_WORKER_SETTINGS"
+    echo "[crewvia] 孤立した crewvia worker settings を削除しました: $_WORKER_SETTINGS"
+  fi
+
+  # crewvia 専用ファイルに絶対パス hooks を書き込む（settings.local.json は触らない）
+  python3 - "$_WORKER_SETTINGS" "$REPO_ROOT" <<'PYEOF'
 import sys, json
 settings_path = sys.argv[1]
 repo_root = sys.argv[2]
 
-try:
-    with open(settings_path) as f:
-        existing = json.load(f)
-except Exception:
-    existing = {}
-
-# hooks キーのみ絶対パスで上書き（他のキーは保持）
-existing['hooks'] = {
-    "PreToolUse": [{
-        "matcher": "Bash|Write|Edit|MultiEdit",
-        "hooks": [{"type": "command", "command": f"{repo_root}/hooks/pre-tool-use.sh"}]
-    }],
-    "PostToolUse": [{
-        "matcher": "Bash|Write|Edit|MultiEdit",
-        "hooks": [{"type": "command", "command": f"{repo_root}/hooks/post-tool-use.sh"}]
-    }]
+data = {
+    "hooks": {
+        "PreToolUse": [{
+            "matcher": "Bash|Write|Edit|MultiEdit",
+            "hooks": [{"type": "command", "command": f"{repo_root}/hooks/pre-tool-use.sh"}]
+        }],
+        "PostToolUse": [{
+            "matcher": "Bash|Write|Edit|MultiEdit",
+            "hooks": [{"type": "command", "command": f"{repo_root}/hooks/post-tool-use.sh"}]
+        }]
+    }
 }
 
 with open(settings_path, 'w') as f:
-    json.dump(existing, f, ensure_ascii=False, indent=2)
+    json.dump(data, f, ensure_ascii=False, indent=2)
 PYEOF
-  echo "[crewvia] TARGET_DIR mode: hook injection → $WORK_DIR/.claude/settings.local.json"
+  echo "[crewvia] TARGET_DIR mode: crewvia hooks → $_WORKER_SETTINGS"
 fi
 
 echo "[crewvia] Starting as $AGENT_NAME ($ROLE)"
@@ -403,7 +410,12 @@ fi
 # レベル)への登録は行わない(禁止選択肢)。
 SETTINGS_FLAG=()
 if [[ "${ROLE}" == "worker" ]] && [[ "$WORK_DIR" != "$REPO_ROOT" ]]; then
-  SETTINGS_FLAG=(--settings "${REPO_ROOT}/.claude/settings.json")
+  # crewvia settings.json（共通設定）+ crewvia-worker-{AGENT_NAME}.json（絶対パス hooks）を両方追加ロード。
+  # crewvia-worker-*.json は上の injection ブロックで作成済み。
+  SETTINGS_FLAG=(
+    --settings "${REPO_ROOT}/.claude/settings.json"
+    --settings "${WORK_DIR}/.claude/crewvia-worker-${AGENT_NAME}.json"
+  )
 fi
 
 # Launch with or without tmux
@@ -420,10 +432,10 @@ if [[ "${CREWVIA_TMUX:-0}" == "1" ]]; then
     MODEL_CLI_ARG=" --model '$SELECTED_MODEL'"
   fi
 
-  # --settings flag (TARGET_DIRモードのworkerのみ。F8是正、上のSETTINGS_FLAG参照)
+  # --settings flag (TARGET_DIRモードのworkerのみ。crewvia settings.json + crewvia-worker ファイルの2つを渡す)
   SETTINGS_CLI_ARG=""
   if [[ ${#SETTINGS_FLAG[@]} -gt 0 ]]; then
-    SETTINGS_CLI_ARG=" --settings '${REPO_ROOT}/.claude/settings.json'"
+    SETTINGS_CLI_ARG=" --settings '${REPO_ROOT}/.claude/settings.json' --settings '${WORK_DIR}/.claude/crewvia-worker-${AGENT_NAME}.json'"
   fi
 
   if [[ -n "$FULL_PROMPT" ]] && [[ "${CREWVIA_BENCH_MODE:-0}" != "1" ]]; then

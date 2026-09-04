@@ -1009,3 +1009,152 @@ print('legacy compat OK')
     run env CREWVIA_MUX=herdr PATH="${ISOLATED_BIN}" python3 "$LIB_MUX_PY" available
     [ "$status" -eq 1 ]
 }
+
+# ===========================================================================
+# state() verb tests
+# ===========================================================================
+#
+# Tests cover:
+#   - tmux backend always returns "unknown"
+#   - herdr backend returns each of the 5 valid values
+#   - herdr backend returns "unknown" on pane-get failure
+#   - herdr backend returns "unknown" when agent_status field is absent
+
+# ---------------------------------------------------------------------------
+# state() — TmuxBackend (always "unknown")
+# ---------------------------------------------------------------------------
+
+@test "state: tmux backend always returns 'unknown'" {
+    setup_fake_tmux
+
+    run python3 "$LIB_MUX_PY" state "Omar-worker"
+    [ "$status" -eq 0 ]
+    [[ "$output" == "unknown" ]]
+}
+
+# ---------------------------------------------------------------------------
+# state() — HerdrBackend (reads agent_status from pane get)
+# ---------------------------------------------------------------------------
+
+# Helper: build a fake herdr that returns a given agent_status from pane get.
+setup_fake_herdr_with_state() {
+    local agent_status="$1"
+    setup_fake_herdr  # sets up standard fake
+
+    # Patch the herdr fake to return agent_status in pane get response.
+    cat > "${FAKE_HERDR_DIR}/herdr" << FAKESCRIPT_STATE
+#!/usr/bin/env bash
+echo "\$*" >> "\$FAKE_HERDR_LOG"
+cmd1="\${1:-}"; cmd2="\${2:-}"; cmd3="\${3:-}"
+case "\${cmd1}" in
+  --version) echo "herdr 0.8.2"; exit 0 ;;
+  server) exit 0 ;;
+  workspace)
+    case "\${cmd2}" in
+      list) echo '{"result":{"workspaces":[{"workspace_id":"w1","label":"crewvia"}]}}'; exit 0 ;;
+      create) echo '{"result":{"workspace":{"workspace_id":"w1","label":"crewvia"}}}'; exit 0 ;;
+    esac ;;
+  pane)
+    case "\${cmd2}" in
+      list) echo '{"result":{"panes":[{"pane_id":"w1:p1","tab_id":"w1:t1","label":"Omar-worker"}]}}'; exit 0 ;;
+      get)  echo '{"result":{"pane":{"pane_id":"w1:p1","agent_status":"${agent_status}"}}}'; exit 0 ;;
+      read) echo "❯ "; exit 0 ;;
+      run)  echo '{"result":{"type":"ok"}}'; exit 0 ;;
+    esac ;;
+esac
+exit 2
+FAKESCRIPT_STATE
+    chmod +x "${FAKE_HERDR_DIR}/herdr"
+}
+
+@test "herdr state: returns 'blocked' when agent_status=blocked" {
+    setup_fake_herdr_with_state "blocked"
+
+    run python3 "$LIB_MUX_PY" state "Omar-worker"
+    [ "$status" -eq 0 ]
+    [[ "$output" == "blocked" ]]
+}
+
+@test "herdr state: returns 'working' when agent_status=working" {
+    setup_fake_herdr_with_state "working"
+
+    run python3 "$LIB_MUX_PY" state "Omar-worker"
+    [ "$status" -eq 0 ]
+    [[ "$output" == "working" ]]
+}
+
+@test "herdr state: returns 'idle' when agent_status=idle" {
+    setup_fake_herdr_with_state "idle"
+
+    run python3 "$LIB_MUX_PY" state "Omar-worker"
+    [ "$status" -eq 0 ]
+    [[ "$output" == "idle" ]]
+}
+
+@test "herdr state: returns 'done' when agent_status=done" {
+    setup_fake_herdr_with_state "done"
+
+    run python3 "$LIB_MUX_PY" state "Omar-worker"
+    [ "$status" -eq 0 ]
+    [[ "$output" == "done" ]]
+}
+
+@test "herdr state: returns 'unknown' when pane get fails" {
+    setup_fake_herdr
+
+    # Patch herdr to fail pane get.
+    cat > "${FAKE_HERDR_DIR}/herdr" << 'FAKESCRIPT_FAIL'
+#!/usr/bin/env bash
+echo "$*" >> "$FAKE_HERDR_LOG"
+cmd1="${1:-}"; cmd2="${2:-}"
+case "${cmd1}" in
+  --version) echo "herdr 0.8.2"; exit 0 ;;
+  server) exit 0 ;;
+  workspace)
+    case "${cmd2}" in
+      list) echo '{"result":{"workspaces":[{"workspace_id":"w1","label":"crewvia"}]}}'; exit 0 ;;
+    esac ;;
+  pane)
+    case "${cmd2}" in
+      list) echo '{"result":{"panes":[{"pane_id":"w1:p1","tab_id":"w1:t1","label":"Omar-worker"}]}}'; exit 0 ;;
+      get)  echo '{"error":"pane not found"}' >&2; exit 1 ;;
+    esac ;;
+esac
+exit 2
+FAKESCRIPT_FAIL
+    chmod +x "${FAKE_HERDR_DIR}/herdr"
+
+    run python3 "$LIB_MUX_PY" state "Omar-worker"
+    [ "$status" -eq 0 ]
+    [[ "$output" == "unknown" ]]
+}
+
+@test "herdr state: returns 'unknown' when agent_status field is absent" {
+    setup_fake_herdr
+
+    # Patch herdr to return pane get without agent_status.
+    cat > "${FAKE_HERDR_DIR}/herdr" << 'FAKESCRIPT_NOFIELD'
+#!/usr/bin/env bash
+echo "$*" >> "$FAKE_HERDR_LOG"
+cmd1="${1:-}"; cmd2="${2:-}"
+case "${cmd1}" in
+  --version) echo "herdr 0.8.2"; exit 0 ;;
+  server) exit 0 ;;
+  workspace)
+    case "${cmd2}" in
+      list) echo '{"result":{"workspaces":[{"workspace_id":"w1","label":"crewvia"}]}}'; exit 0 ;;
+    esac ;;
+  pane)
+    case "${cmd2}" in
+      list) echo '{"result":{"panes":[{"pane_id":"w1:p1","tab_id":"w1:t1","label":"Omar-worker"}]}}'; exit 0 ;;
+      get)  echo '{"result":{"pane":{"pane_id":"w1:p1"}}}'; exit 0 ;;
+    esac ;;
+esac
+exit 2
+FAKESCRIPT_NOFIELD
+    chmod +x "${FAKE_HERDR_DIR}/herdr"
+
+    run python3 "$LIB_MUX_PY" state "Omar-worker"
+    [ "$status" -eq 0 ]
+    [[ "$output" == "unknown" ]]
+}

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Mux backend abstraction — spawn / send / capture / list / kill / pid / attach.
+"""Mux backend abstraction — spawn / send / capture / list / kill / pid / attach / state.
 
 Backends:
   TmuxBackend  — wraps current tmux CLI calls verbatim (Phase 1)
@@ -21,6 +21,7 @@ Usage as module:
   pid = m.pid("Omar-worker")
   m.attach("Sora-director")
   ok = m.available()
+  st = m.state("Omar-worker")  # "blocked"|"working"|"idle"|"done"|"unknown"
 
 CLI usage (for bash callers):
   python3 lib_mux.py available            # exit 0 = available
@@ -31,6 +32,7 @@ CLI usage (for bash callers):
   python3 lib_mux.py kill <name>
   python3 lib_mux.py pid  <name>          # prints integer PID
   python3 lib_mux.py attach <name>
+  python3 lib_mux.py state <name>         # prints agent state string
 """
 
 import json
@@ -140,6 +142,9 @@ class _Backend:
         raise NotImplementedError
 
     def available(self) -> bool:
+        raise NotImplementedError
+
+    def state(self, name: str) -> str:
         raise NotImplementedError
 
 
@@ -360,6 +365,10 @@ class TmuxBackend(_Backend):
         except Exception as e:
             self._warn(f"attach {name!r} failed: {e}")
             return False
+
+    def state(self, name: str) -> str:
+        """Return agent state — always 'unknown' for tmux (state not available)."""
+        return "unknown"
 
 
 # ---------------------------------------------------------------------------
@@ -939,6 +948,34 @@ class HerdrBackend(_Backend):
             )
             return False
 
+    def state(self, name: str) -> str:
+        """Return the agent state for the named pane.
+
+        Uses ``herdr pane get <pane_id>`` and reads ``.result.pane.agent_status``.
+        Cache is used first (same re-resolution as other verbs).
+
+        Returns one of: "blocked", "working", "idle", "done", "unknown".
+        Returns "unknown" on any error (fail-safe: caller skips notification).
+        """
+        pane_id = self._resolve_pane_id(name)
+        if pane_id is None:
+            self._warn(f"state {name!r}: pane not found")
+            return "unknown"
+        data = _herdr_run("pane_get", [pane_id], timeout=5)
+        if data is None:
+            self._warn(f"state {name!r}: pane get failed")
+            return "unknown"
+        try:
+            status = data["result"]["pane"]["agent_status"]
+            if status in ("blocked", "working", "idle", "done", "unknown"):
+                return status
+            # Completely unexpected value → treat as unknown (safe side).
+            self._warn(f"state {name!r}: unexpected agent_status={status!r} → unknown")
+            return "unknown"
+        except (KeyError, TypeError):
+            # agent_status field absent (older herdr or non-Claude pane) → unknown.
+            return "unknown"
+
 
 # ---------------------------------------------------------------------------
 # Public Mux facade
@@ -983,6 +1020,9 @@ class Mux:
 
     def attach(self, name: str) -> bool:
         return self._backend.attach(name)
+
+    def state(self, name: str) -> str:
+        return self._backend.state(name)
 
 
 # ---------------------------------------------------------------------------
@@ -1052,6 +1092,13 @@ def _cli_main(args: List[str]) -> int:
             print("Usage: lib_mux.py attach <name>", file=sys.stderr)
             return 2
         return 0 if m.attach(rest[0]) else 1
+
+    elif verb == "state":
+        if not rest:
+            print("Usage: lib_mux.py state <name>", file=sys.stderr)
+            return 2
+        print(m.state(rest[0]))
+        return 0
 
     else:
         print(f"Unknown verb: {verb!r}", file=sys.stderr)

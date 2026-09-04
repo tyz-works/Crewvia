@@ -42,6 +42,22 @@ LOG_FILE="${REGISTRY_DIR}/dispatcher.log"
 NOTIFY_CACHE="/tmp/dispatcher-notify-cache.json"
 NOTIFY_TTL=300  # seconds before repeating the same notification (5 min)
 
+# Rule 5: state grace period in seconds (env > config > default 60).
+# Read from config/crewvia.yaml mux.state_grace_seconds if env is absent.
+_read_state_grace() {
+  local cfg="${REPO_ROOT}/config/crewvia.yaml"
+  if [[ -n "${CREWVIA_STATE_GRACE:-}" ]]; then
+    echo "${CREWVIA_STATE_GRACE}"
+    return
+  fi
+  if [[ -f "$cfg" ]]; then
+    # Look for "  state_grace_seconds: <n>" under "mux:" section.
+    awk '/^mux:/{in_mux=1} in_mux && /state_grace_seconds:/{print $2; exit}' "$cfg"
+  fi
+}
+STATE_GRACE="$(_read_state_grace)"
+STATE_GRACE="${STATE_GRACE:-60}"  # default 60 seconds
+
 # Standalone-safe: silently exit when no mux backend (tmux / herdr) is available
 if ! python3 "${SCRIPT_DIR}/lib_mux.py" available >/dev/null 2>&1; then
   exit 0
@@ -62,7 +78,7 @@ log "Starting dispatcher (PID $$, queue=$QUEUE_DIR)"
 # One dispatch cycle — implemented in Python for YAML / file parsing
 # ---------------------------------------------------------------------------
 run_dispatch() {
-  python3 - "$QUEUE_DIR" "$REGISTRY_DIR" "$NOTIFY_CACHE" "$NOTIFY_TTL" <<'PYEOF'
+  python3 - "$QUEUE_DIR" "$REGISTRY_DIR" "$NOTIFY_CACHE" "$NOTIFY_TTL" "$STATE_GRACE" <<'PYEOF'
 import sys
 import os
 import re
@@ -78,6 +94,7 @@ QUEUE_DIR      = Path(sys.argv[1])
 REGISTRY_DIR   = Path(sys.argv[2])
 NOTIFY_CACHE   = Path(sys.argv[3])
 NOTIFY_TTL     = int(sys.argv[4])
+STATE_GRACE    = int(sys.argv[5]) if len(sys.argv) > 5 else 60
 
 # Import lib_mux from scripts/ (same dir as this script via REGISTRY_DIR.parent)
 _SCRIPTS_DIR = REGISTRY_DIR.parent / 'scripts'
@@ -106,6 +123,10 @@ DIRECTOR_ONLY_SKILLS = {'director-only'}
 # tasks have been blocked for longer than this, the Worker is sent shutdown.
 # Uses task file mtime as a proxy for last_status_change.
 BLOCKED_STUCK_THRESHOLD = 600  # 10 minutes
+
+# Rule 5: state persistence files live in registry/mux/<name>.state.json.
+# Format: {"state": "<blocked|working|idle|done|unknown>", "since": <epoch_float>}
+STATE_JSON_DIR = REGISTRY_DIR / 'mux'
 
 # Circuit breaker for Taskvia API calls
 TASKVIA_CB_FAILURES = 0
@@ -600,6 +621,130 @@ def set_all_done_state(done):
             pass
 
 
+def _state_json_path(name: str) -> Path:
+    return STATE_JSON_DIR / f'{name}.state.json'
+
+
+def _load_state_entry(name: str) -> dict:
+    """Load state persistence entry.  Returns {} on missing / corrupt file."""
+    p = _state_json_path(name)
+    try:
+        return json.loads(p.read_text(encoding='utf-8'))
+    except Exception:
+        return {}
+
+
+def _save_state_entry(name: str, state: str, since: float) -> None:
+    """Persist state + since timestamp for Rule 5 grace tracking."""
+    try:
+        STATE_JSON_DIR.mkdir(parents=True, exist_ok=True)
+        _state_json_path(name).write_text(
+            json.dumps({'state': state, 'since': since}), encoding='utf-8'
+        )
+    except Exception as e:
+        log(f'WARNING: cannot write state entry for {name!r}: {e}')
+
+
+def check_rule5(name: str, target: str, assignment_file: Path) -> None:
+    """Rule 5: detect blocked / idle-with-task and notify Director.
+
+    A: state == "blocked"
+    B: state in {"idle", "done"} AND assignment_file exists
+
+    State is persisted to registry/mux/<name>.state.json for grace tracking.
+    Notifications are deduped via the standard NOTIFY_TTL cache.
+
+    tmux mode (state == "unknown") → skip entirely (safe side).
+    """
+    st = _mux.state(name)
+
+    # unknown / working → no action.  tmux always returns unknown → skip.
+    if st in ('unknown', 'working'):
+        # If state returned to working, clear notify dedup keys so re-notification
+        # fires when the worker gets stuck again later.
+        if st == 'working':
+            cache = load_notify_cache()
+            for key in (f'blocked_{name}', f'idle_with_task_{name}'):
+                cache.pop(key, None)
+            try:
+                NOTIFY_CACHE.write_text(json.dumps(cache), encoding='utf-8')
+            except Exception:
+                pass
+            # Also reset state entry so grace timer restarts cleanly.
+            _save_state_entry(name, 'working', time.time())
+        return
+
+    # Determine which condition applies.
+    is_A = (st == 'blocked')
+    is_B = (st in ('idle', 'done')) and assignment_file.exists()
+
+    if not is_A and not is_B:
+        # idle/done without assignment → not B.  Reset state entry.
+        _save_state_entry(name, st, time.time())
+        return
+
+    # Load persisted state to check grace period.
+    entry = _load_state_entry(name)
+    prev_state = entry.get('state', '')
+    since = entry.get('since', 0.0)
+    now = time.time()
+
+    # Normalize condition key to distinguish A vs B.
+    condition = 'blocked' if is_A else 'idle-with-task'
+
+    # If the condition changed (or is fresh), reset the timer.
+    if prev_state != condition:
+        _save_state_entry(name, condition, now)
+        return  # grace period starts now; don't notify yet
+
+    elapsed = now - since
+    if elapsed < STATE_GRACE:
+        return  # grace period not yet exceeded
+
+    # Grace exceeded — notify Director if not already notified recently.
+    notify_key = f'blocked_{name}' if is_A else f'idle_with_task_{name}'
+    if not should_notify(notify_key):
+        return
+
+    # Collect task info from assignment file.
+    task_id = '?'
+    mission_slug = '?'
+    try:
+        raw = assignment_file.read_text().strip()
+        if ':' in raw:
+            mission_slug, task_id = raw.split(':', 1)
+        else:
+            task_id = raw
+    except Exception:
+        pass
+
+    # Collect screen tail for context.
+    screen_tail = ''
+    try:
+        screen = _mux.capture(name)
+        if screen:
+            lines = screen.splitlines()
+            screen_tail = '\n'.join(lines[-5:]) if len(lines) >= 5 else '\n'.join(lines)
+    except Exception:
+        pass
+
+    director = _director_name()
+    director_live = bool(_mux.list(suffix='-director'))
+
+    msg = (
+        f'[Rule 5] Worker {name} が {condition} です '
+        f'(task {task_id}, mission={mission_slug}, {elapsed:.0f}秒継続)。'
+        f'画面末尾:\n{screen_tail}'
+    )
+
+    if director_live:
+        tmux_send(director, msg)
+    else:
+        log(f'WARNING: Rule 5 — Director 不在のため通知スキップ: {msg[:200]}')
+
+    record_notify(notify_key)
+
+
 def shutdown_idle_workers():
     """Send shutdown message and kill idle Worker windows."""
     windows = tmux_list_worker_windows()
@@ -711,6 +856,10 @@ def dispatch():
         # Idle = no assignment file
         assignment_file = ASSIGNMENTS_DIR / agent_name
         is_idle = not assignment_file.exists()
+
+        # Rule 5 (herdr only): check agent state for blocked / idle-with-task.
+        # Runs for ALL workers (busy and idle) before the is_idle gate below.
+        check_rule5(agent_name, target, assignment_file)
 
         if not is_idle:
             continue  # Worker is busy; do not interrupt

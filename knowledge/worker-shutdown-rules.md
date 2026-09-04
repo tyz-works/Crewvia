@@ -161,6 +161,41 @@ plan.sh done/fail 実行時のタイムスタンプをファイル mtime で代�
 将来の自動化案: queue/missions/<slug>/user_wait.flag ファイルを Director が作成し、
 Dispatcher がそれを検知して自動的に Rule 3 を実行する仕組みを追加（t008 以降）。
 
+### Rule 5: herdr agent state による blocked / idle-with-task 検知（Dispatcher 側、通知のみ）
+
+トリガー: herdr モードで Worker の `agent_status` が以下のいずれかを **grace 秒連続** で満たす
+
+| 条件名 | 条件 | 意味 |
+|---|---|---|
+| A: blocked | `agent_status == blocked` | 承認ダイアログ等で止まっている |
+| B: idle-with-task | `agent_status ∈ {idle, done}` かつ `queue/assignments/<name>` が存在 | task を持ったまま手が止まっている |
+
+Dispatcher の動作:
+1. 各 Worker の `agent_status` を 5 秒ごとに `lib_mux.py state <name>` で取得
+2. 状態を `registry/mux/<name>.state.json` に `{state, since}` として保存
+3. A or B が grace 秒 (デフォルト 60、`config mux.state_grace_seconds`、env `CREWVIA_STATE_GRACE`) 以上連続 → Director に通知
+4. `working` に戻ったら通知 dedup key をクリアし、再発時に再通知可能にする
+
+通知文面:
+```
+[Rule 5] Worker <name> が <blocked|idle-with-task> です (task <id>, mission=<slug>, <n>秒継続)。
+画面末尾:
+<pane の末尾 5 行>
+```
+
+Director の対応 (参照: `agents/director.md §17`):
+1. 画面末尾で状況を判断
+2. 質問待ち → `python3 scripts/lib_mux.py send {name}-worker "<回答>"`
+3. 承認ダイアログ → ユーザーへエスカレーション
+4. 回復不能 → kill + `plan.sh update --reset`
+
+設定値:
+  grace 連続時間しきい値: 60 秒 (config `mux.state_grace_seconds`)
+  NOTIFY_TTL           : 300 秒 (共通、重複通知抑制)
+  チェック間隔          : 5 秒 (通常ポーリングに統合)
+
+注意: **自動対処はしない**。通知 + Director 判断のみ。tmux モードでは state が unknown 固定なので発火しない。
+
 ### Rule 4: Graceful Handoff タイムアウト制約（Worker 側）
 
 トリガー: watchdog.py から「タイムアウトのため中断します」を受信
@@ -222,6 +257,7 @@ Worker idle 待機時間（exit 2後）| 30 秒  | 30 秒      | 変更なし
 Rule 2: blocked 継続判定しきい値 | なし  | 600 秒     | 新規追加
 Rule 3: Director 介入判断しきい値 | なし | 30 分（目安）| 新規追加
 Rule 4: Worker handoff 目標時間 | なし  | 30 秒      | 新規追加
+Rule 5: herdr state grace 秒数 | なし   | 60 秒      | 新規追加 (herdr モードのみ)
 
 ---
 

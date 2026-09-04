@@ -543,6 +543,35 @@ ${CREWVIA_REPO_ROOT}/scripts/plan.sh done "$TASK_ID" "実行した内容と結�
 > **移行予告**: 将来的に `plan.sh done` は `plan.sh ready-for-verification <task_id>` に移行予定。
 > Verifier 機能（M-QA-4）が導入されるまでは `done` を使い続けてよい。
 
+#### 詰まったとき: plan.sh needs-director
+
+チェックポイントを完遂できない・証拠が提出できない・判断が必要な場合は、代替検証で done を押し通すのではなく **Director に差し戻す**:
+
+```bash
+${CREWVIA_REPO_ROOT}/scripts/plan.sh needs-director "$TASK_ID" "詰まった理由を具体的に記述" --mission "$TASK_MISSION"
+```
+
+- タスクは `needs_director` 状態になり、`done` 遷移はブロックされる
+- 後続タスクの `blocked_by` は解除されない（依存関係を保つ）
+- Director が `plan.sh update <task_id> --status in_progress --reset` で差し戻し、追加指示を出す
+- `plan.sh needs-director` は「代替検証して done を無理やり呼ぶ」より **常に安い選択肢**であること
+
+**QA タスクの結果フォーマット** (`qa_checkpoints` が宣言されたタスクの場合):
+
+`plan.sh done` の result に `## QA Gate` セクションを含めること:
+
+```
+## QA Gate
+
+checkpoint: <チェックポイント名> | required: yes | result: observed
+checkpoint: <チェックポイント名> | required: yes | result: not_run | note: <理由>
+checkpoint: <チェックポイント名> | required: no  | result: not_run | note: <理由>
+```
+
+- `result` は `observed` / `not_run` / `failed` の 3 値のみ
+- `required: yes` かつ `result: observed` 以外の場合、`plan.sh done` が FAIL を返す
+- FAIL になった場合は完遂するか `plan.sh needs-director` で差し戻すこと
+
 ### verify-task.sh による事前機械 check（オプション）
 
 Step 5 の `plan.sh done` を呼ぶ前に、自分で機械 check を走らせることができる。

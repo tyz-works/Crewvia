@@ -153,6 +153,23 @@ Replace `/path/to/crewvia` with the absolute path to your Crewvia installation.
 > **Note**: Claude Code merges hook configurations, so existing hooks are preserved.
 > You can verify the active hooks with `claude config list`.
 
+### 5. Install Crewvia skills
+
+Crewvia ships built-in skills in the `skills/` directory. Install them as symlinks so
+Claude Code can load them, and so `git pull` always keeps them up to date:
+
+```bash
+# From the crewvia repo root
+ln -sf "$(pwd)/skills/crewvia-qa" ~/.claude/skills/crewvia-qa
+```
+
+> **Existing installation**: if `~/.claude/skills/crewvia-qa` already exists as a
+> regular directory (pre-skill-migration), back it up first:
+> ```bash
+> mv ~/.claude/skills/crewvia-qa ~/.claude/skills/crewvia-qa.bak
+> ln -sf "$(pwd)/skills/crewvia-qa" ~/.claude/skills/crewvia-qa
+> ```
+
 ---
 
 ## Starting Agents

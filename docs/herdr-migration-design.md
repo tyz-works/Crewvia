@@ -167,6 +167,8 @@ mode: tmux        # inline | tmux | herdr
 | **2. herdr backend** | `HerdrBackend`、`mode: herdr` / `CREWVIA_MUX`、version guard、bats に herdr fake ケース | bats 全 pass |
 | **3. E2E + docs** | herdr 上で mission 1 本完走、4.5 のドキュメント更新 | herdr E2E pass、ドキュメント merge |
 
+Phase 3 完了 (2026-09-04): herdr E2E pass (mission 20260904-herdr-phase3 / t003 QA)、ドキュメント更新 merge 済み。
+
 Phase 1 を herdr と切り離すことで、Phase 1 で壊れたら herdr のせいではないと切り分けられる。Phase 2 の mission は Phase 0 完了後に起票する。
 
 ### Phase 0 の結果 (2026-09-04, herdr 0.8.2 / WSL2 — 詳細: `docs/herdr-spike-results.md`)

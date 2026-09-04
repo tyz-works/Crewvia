@@ -49,9 +49,11 @@ Make sure the following are installed before setting up Crewvia:
 | **jq** | JSON parsing in hooks/scripts | `brew install jq` / `apt install jq` |
 | **curl** | HTTP requests to Taskvia API | Usually pre-installed |
 
-Optional but recommended:
+Optional but recommended (one of the following for parallel agent execution):
 
 - **tmux** — for running multiple agents in split panes
+- **herdr** — agent-oriented terminal multiplexer (alternative to tmux)
+  - Install: `curl -fsSL https://herdr.dev/install.sh | sh` / `brew install herdr` / `mise use herdr`
 
 ---
 
@@ -85,6 +87,7 @@ Crewvia uses the following environment variables. Add them to your shell profile
 | `NTFY_PASS` | Required for ntfy | ntfy Basic auth password |
 | `APPROVAL_TOKEN_TTL_SECONDS` | Optional | One-time token TTL in seconds (default: `900`) |
 | `CREWVIA_VERIFICATION_UI` | Optional | Set in **Taskvia's** Vercel env (not crewvia). `disabled` hides all verification UI and redirects `/verification-queue` to `/` |
+| `CREWVIA_MUX` | Optional | Mux backend override: `tmux` or `herdr`. Overrides `mode:` in `config/crewvia.yaml` |
 
 Example `.env`-style configuration:
 
@@ -235,6 +238,29 @@ tmux send-keys "cd /path/to/crewvia && ./scripts/start.sh worker code python" En
 tmux select-pane -t crewvia:workers.3
 tmux send-keys "cd /path/to/crewvia && ./scripts/start.sh worker docs research" Enter
 ```
+
+### Running with herdr (alternative to tmux)
+
+[herdr](https://herdr.dev) is an agent-oriented terminal multiplexer and an alternative
+parallel execution backend. Use `CREWVIA_MUX=herdr` to select it.
+
+**Important**: herdr does not support nested attach, so launch order matters:
+
+```bash
+# 1. Start herdr first (in a plain terminal, outside any existing herdr session)
+herdr
+
+# 2. Inside herdr, start the Director
+export CREWVIA_MUX=herdr
+bash scripts/start.sh director
+```
+
+Workers are launched automatically by `start.sh` into herdr tabs — no manual tab
+management needed. To observe a Worker's output, run `herdr` from another terminal
+(or use `tab focus` within herdr).
+
+Set `mode: herdr` in `config/crewvia.yaml` for a persistent default, or use
+`CREWVIA_MUX=herdr` for a per-session override.
 
 ---
 

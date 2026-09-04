@@ -86,7 +86,7 @@ Kai発見: oci compute instance list で --compartment-id を省略すると全�
 
 ## 基本フロー
 
-Dispatcher が tmux send-keys でタスクを通知し、Worker はその通知を受けて pull する。
+Dispatcher が mux (tmux / herdr) 経由でタスクを通知し、Worker はその通知を受けて pull する。
 **Worker 自身はポーリングしない** — Dispatcher に任せて待機する。
 
 ```

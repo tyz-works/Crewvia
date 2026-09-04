@@ -49,6 +49,8 @@
     start.sh            マルチエージェント起動スクリプト
     plan.sh             タスクプラン管理 CLI（per-task / multi-mission）
     taskvia-sync.sh     queue → Taskvia 同期
+    lib_mux.py          mux 抽象化モジュール（TmuxBackend / HerdrBackend）
+    lib_mux.sh          bash 向け薄いラッパー（mux_spawn / mux_send 等）
   queue/                プラン置き場（plan.sh が管理）
     state.yaml          active mission slug + default_mission
     missions/<slug>/
@@ -58,6 +60,7 @@
   registry/
     workers.yaml        Worker のスキル・経験値
     heartbeats/         watchdog 監視用
+    mux/                mux バックエンドのタブ/ペイン ID キャッシュ（.gitignore 対象）
   CLAUDE.md             このファイル
   README.md             公開向けセットアップガイド
 ```
@@ -81,6 +84,9 @@
 | `CREWVIA_TASK_SLUG` | タスクタイトルを kebab-case 化した slug（worktree パス末尾に使用） |
 | `CREWVIA_PROJECT` | Taskvia に送るプロジェクト識別子。デフォルト: `crewvia` |
 | `CREWVIA_APPROVAL_CHANNEL` | 承認通知チャネル: `taskvia` / `ntfy` / `both`（config `approval_channel.mode` より優先） |
+| `CREWVIA_MUX` | mux バックエンド選択: `tmux` / `herdr`。config `mode:` より優先 |
+| `CREWVIA_TMUX_SESSION` | tmux backend が使うセッション名（デフォルト: `crewvia`） |
+| `CREWVIA_HERDR_WORKSPACE` | herdr backend が使うワークスペース名（デフォルト: `crewvia`） |
 | `NTFY_URL` | ntfy サーバーの URL。`approval_channel.ntfy.url` より優先 |
 | `NTFY_TOPIC` | ntfy 通知トピック名。**必須** — 空のまま運用すると通知が silent skip される |
 | `NTFY_USER` | ntfy Basic 認証ユーザー名。`auth-default-access: deny-all` サーバーでは必須 |
@@ -92,7 +98,7 @@
 
 ## 設計原則
 
-1. **tmux非依存** - tmuxがなくても動く。tmuxはオプション
+1. **mux 非依存** - mux（tmux / herdr）がなくても動く。どちらもオプション（並列モード用）
 2. **Taskvia非依存** - Taskvia未接続でもスタンドアロンで動作可能
 3. **名前はポジション** - 同スキルWorkerは同名前を引き継ぐ
 4. **公開前提** - ドメイン固有設定を外に出し、設定ファイルで全カスタマイズ可能

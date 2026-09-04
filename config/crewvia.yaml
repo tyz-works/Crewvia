@@ -29,10 +29,13 @@ director_model: claude-opus-4-7
 worker_model: claude-sonnet-4-6
 
 # ===== 起動モード =====
-# tmux  — Director + Worker を tmux セッション "crewvia" 内に展開（並列 Worker 可）
+# tmux   — Director + Worker を tmux セッション "crewvia" 内に展開（並列 Worker 可）
+# herdr  — Director + Worker を herdr workspace "crewvia" 内に展開（並列 Worker 可）
+#          herdr モードでは先に herdr を起動し、その中で bash scripts/start.sh director を実行すること
 # inline — 単独プロセスで起動（Worker 並列不可、デバッグ向き）
 #
-# 環境変数での上書き: CREWVIA_TMUX=1 (tmux) / CREWVIA_TMUX=0 (inline)
+# 環境変数での上書き: CREWVIA_MUX=tmux|herdr (最優先) / CREWVIA_TMUX=1 (tmux) / CREWVIA_TMUX=0 (inline)
+# CREWVIA_MUX が設定されていれば CREWVIA_TMUX より優先される。
 mode: tmux
 
 # ===== Taskvia 連携 =====

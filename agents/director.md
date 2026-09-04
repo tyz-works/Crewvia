@@ -470,7 +470,7 @@ Worker に crewvia 以外のプロジェクト (例: `~/workspace/taskvia`) を�
 起動モードによる挙動の違い:
 
 - **tmux モード（`CREWVIA_MUX=tmux` または `CREWVIA_TMUX=1`）**: 新しい tmux ウィンドウ `crewvia:${AGENT_NAME}-worker` が生成され、Worker がバックグラウンドで起動する。Director の制御は即座に返る。並列 Worker 起動が可能。`tmux attach -t crewvia` で出力を確認できる。
-- **herdr モード（`CREWVIA_MUX=herdr`）**: 新しい herdr タブ `${AGENT_NAME}-worker` が生成され、Worker がバックグラウンドで起動する。Director の制御は即座に返る。並列 Worker 起動が可能。`herdr` を別ターミナルで実行すると出力を確認できる（herdr 内からの nested attach は不可）。
+- **herdr モード（`CREWVIA_MUX=herdr`）**: 新しい herdr タブ `${AGENT_NAME}-worker` が生成され、Worker がバックグラウンドで起動する。Director の制御は即座に返る。並列 Worker 起動が可能。普通のターミナルから `./crewvia` を実行すると起動後に herdr へ自動 attach する（herdr の pane 内から実行した場合は tab focus のみ）。
 - **インラインモード（`CREWVIA_TMUX=0` または未設定、かつ `CREWVIA_MUX` 未設定）**: `exec claude` でカレントシェルが Worker プロセスに置き換わるため、Director から Worker を spawn するとハングする。**1セッション1エージェント制限**。複数 Worker 起動はできない。
 
 モードは Director 起動時に `bash scripts/start.sh director` 実行直後のプロンプト「並列モードにしますか？」で選択する。選択結果は `CREWVIA_MUX` env として Director Claude プロセスに引き継がれ、後続の Worker 起動に自動で反映される。
@@ -1157,7 +1157,7 @@ rm -f "registry/heartbeats/${AGENT_NAME}"
 
 > **注意**: Worker は shutdown 通知を受けたら **即座に** セッションを終了しなければならない（Rule 1）。
 > ただし LLM の個体差で無視することがある → 2 秒後に mux kill で強制終了する。
-> herdr モードで覗く場合: 別ターミナルで `herdr` を実行（herdr 内からの nested attach は不可）。
+> herdr モードで覗く場合: 別ターミナルから `./crewvia` を実行（herdr の pane 内からの nested attach は不可）。
 
 ### Dispatcher の自動 blocked-stuck 検出（Rule 2）
 

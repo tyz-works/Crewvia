@@ -242,25 +242,24 @@ tmux send-keys "cd /path/to/crewvia && ./scripts/start.sh worker docs research" 
 ### Running with herdr (alternative to tmux)
 
 [herdr](https://herdr.dev) is an agent-oriented terminal multiplexer and an alternative
-parallel execution backend. Use `CREWVIA_MUX=herdr` to select it.
-
-**Important**: herdr does not support nested attach, so launch order matters:
+parallel execution backend. Set `mode: herdr` in `config/crewvia.yaml` (or use
+`CREWVIA_MUX=herdr`) to select it, then launch with `./crewvia` from a plain terminal:
 
 ```bash
-# 1. Start herdr first (in a plain terminal, outside any existing herdr session)
-herdr
-
-# 2. Inside herdr, start the Director
-export CREWVIA_MUX=herdr
-bash scripts/start.sh director
+# Launch from a plain terminal (outside any existing herdr session).
+# ./crewvia handles herdr server check and auto-attaches after startup.
+./crewvia
 ```
 
-Workers are launched automatically by `start.sh` into herdr tabs — no manual tab
-management needed. To observe a Worker's output, run `herdr` from another terminal
-(or use `tab focus` within herdr).
+Workers are launched automatically into herdr tabs — no manual tab management needed.
+If you run `./crewvia` from **inside** an existing herdr pane, the tab focus is updated
+but automatic attach is skipped (nested `herdr` attach is not supported).
 
-Set `mode: herdr` in `config/crewvia.yaml` for a persistent default, or use
-`CREWVIA_MUX=herdr` for a per-session override.
+For a per-session override without editing the config:
+
+```bash
+CREWVIA_MUX=herdr ./crewvia
+```
 
 ---
 

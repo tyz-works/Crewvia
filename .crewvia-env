@@ -1,0 +1,3 @@
+export CREWVIA_MISSION_SLUG=20260904-crewvia-launcher-herdr
+export CREWVIA_TASK_ID=t002
+export CREWVIA_TASK_SLUG=crewvia-mode-herdr-attach-exec-attach-cm

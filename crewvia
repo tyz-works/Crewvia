@@ -90,16 +90,50 @@ if [[ -z "${TASKVIA_URL:-}" ]]; then
 fi
 
 # --- 起動モード ---
+# CREWVIA_MUX が既に env で指定されていれば尊重し、CREWVIA_TMUX のみ補完する。
+# CREWVIA_MUX 未設定の場合は config/crewvia.yaml の mode: を読む。
 if [[ -z "${CREWVIA_TMUX:-}" ]]; then
-  MODE="$(read_config mode "tmux")"
-  case "$MODE" in
-    tmux)  export CREWVIA_TMUX=1 ;;
-    inline) export CREWVIA_TMUX=0 ;;
-    *)
-      echo "[crewvia] WARNING: 不明な mode '$MODE'。tmux で起動します。" >&2
-      export CREWVIA_TMUX=1
-      ;;
-  esac
+  if [[ -n "${CREWVIA_MUX:-}" ]]; then
+    # CREWVIA_MUX が env で明示指定済み → CREWVIA_TMUX を合わせるだけ
+    case "${CREWVIA_MUX}" in
+      herdr)  export CREWVIA_TMUX=1 ;;
+      tmux)   export CREWVIA_TMUX=1 ;;
+      *)      export CREWVIA_TMUX=0 ;;
+    esac
+  else
+    MODE="$(read_config mode "tmux")"
+    case "$MODE" in
+      tmux)
+        export CREWVIA_TMUX=1
+        ;;
+      herdr)
+        export CREWVIA_MUX=herdr
+        export CREWVIA_TMUX=1
+        ;;
+      inline)
+        export CREWVIA_TMUX=0
+        ;;
+      *)
+        echo "[crewvia] WARNING: 不明な mode '$MODE'。tmux で起動します。" >&2
+        export CREWVIA_TMUX=1
+        ;;
+    esac
+  fi
+fi
+
+# --- herdr 到達チェック（herdr モード時） ---
+# start.sh と同じ判定を ./crewvia でも行い、起動前に早期 exit する。
+if [[ "${CREWVIA_MUX:-}" == "herdr" ]]; then
+  if ! command -v herdr >/dev/null 2>&1; then
+    echo "[crewvia] ERROR: CREWVIA_MUX=herdr が設定されていますが herdr バイナリが見つかりません。" >&2
+    echo "          herdr をインストールするか CREWVIA_MUX=tmux に変更してください。" >&2
+    exit 1
+  fi
+  if ! python3 "${SCRIPT_DIR}/scripts/lib_mux.py" available >/dev/null 2>&1; then
+    echo "[crewvia] ERROR: herdr server に接続できません。" >&2
+    echo "          'herdr server' を起動してから再試行してください。" >&2
+    exit 1
+  fi
 fi
 
 # --- サブコマンド ---
@@ -142,13 +176,17 @@ Token:   config/.taskvia-token  (1行にトークンを書く、gitignore 済み
 
 Environment variables (config より優先):
   CREWVIA_TASKVIA=enabled|disabled|ask  Taskvia 連携モード（最優先）
-  CREWVIA_TMUX=1|0                      起動モード
+  CREWVIA_MUX=tmux|herdr                mux バックエンド（config の mode: より優先）
+  CREWVIA_TMUX=1|0                      起動モード（CREWVIA_MUX から自動設定）
   TASKVIA_TOKEN=sk-...                  API トークン
   TASKVIA_URL=https://...               Taskvia URL
 
 Behavior:
-  tmux モード起動時、kickoff + Dispatcher 起動後に自動で Director 窓に attach します。
-  tmux 内から起動した場合は switch-client、外からなら attach-session を使用します。
+  tmux モード: kickoff + Dispatcher 起動後に Director 窓に attach します。
+    tmux 内から起動した場合は switch-client、外からなら attach-session (exec) を使用します。
+  herdr モード: 普通のターミナルから ./crewvia を実行してください。
+    ./crewvia が herdr server 到達チェックを行い、起動後に 'herdr' へ exec します。
+    herdr の pane 内から実行した場合は tab focus のみ（自動 attach なし）。
 HELP
     ;;
   *)

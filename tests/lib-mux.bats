@@ -328,13 +328,135 @@ log_count() {
     log_contains "switch-client -t crewvia"
 }
 
-@test "attach: uses attach-session when TMUX env is not set" {
+@test "attach: returns 1 when TMUX env is not set (use attach-cmd + exec instead)" {
     setup_fake_tmux
     unset TMUX
 
     run python3 "$LIB_MUX_PY" attach "Sora-director"
+    [ "$status" -eq 1 ]
+    # attach-session must NOT be called — exec-based path via attach-cmd handles this.
+    ! log_contains "attach-session"
+}
+
+# ---------------------------------------------------------------------------
+# attach-cmd()
+# ---------------------------------------------------------------------------
+
+@test "attach-cmd: tmux outside (TMUX not set) returns attach-session argv" {
+    setup_fake_tmux
+    unset TMUX
+
+    run python3 "$LIB_MUX_PY" attach-cmd "Sora-director"
     [ "$status" -eq 0 ]
-    log_contains "attach-session -t crewvia:Sora-director"
+    # Output should be one arg per line: tmux, attach-session, -t, crewvia:Sora-director
+    [[ "$output" == *"tmux"* ]]
+    [[ "$output" == *"attach-session"* ]]
+    [[ "$output" == *"crewvia:Sora-director"* ]]
+}
+
+@test "attach-cmd: tmux inside (TMUX set) returns empty (use attach/switch-client)" {
+    setup_fake_tmux
+    export TMUX="/tmp/tmux-1000/default,12345,0"
+
+    run python3 "$LIB_MUX_PY" attach-cmd "Sora-director"
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+}
+
+@test "attach-cmd: herdr outside (HERDR_ENV not set) calls tab focus first then returns 'herdr'" {
+    setup_fake_herdr
+    unset HERDR_ENV
+
+    run python3 "$LIB_MUX_PY" attach-cmd "Omar-worker"
+    [ "$status" -eq 0 ]
+    # Must output 'herdr' as the argv (one arg per line → single line 'herdr').
+    [[ "$output" == "herdr" ]]
+    # tab focus must have been called with the tab_id.
+    herdr_log_contains "tab focus"
+    herdr_log_contains "${FAKE_TAB_ID}"
+}
+
+@test "attach-cmd: herdr inside (HERDR_ENV=1) returns empty (use attach/tab focus)" {
+    setup_fake_herdr
+    export HERDR_ENV=1
+
+    run python3 "$LIB_MUX_PY" attach-cmd "Omar-worker"
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+    # tab focus must NOT have been called (already inside herdr).
+    ! herdr_log_contains "tab focus"
+}
+
+# ---------------------------------------------------------------------------
+# mux_attach shell function — exec branch verification
+# ---------------------------------------------------------------------------
+
+@test "mux_attach: execs the command when attach-cmd returns non-empty" {
+    setup_fake_tmux
+    unset TMUX
+
+    # Source lib_mux.sh and override exec to record the argv instead of replacing
+    # the process.  We also stub python3 lib_mux.py attach-cmd to return a known
+    # argv, and python3 lib_mux.py attach to verify it is NOT called.
+
+    FAKE_LIB_DIR="$(mktemp -d)"
+    # Write a fake python3 that returns our fixed argv for attach-cmd.
+    cat > "${FAKE_LIB_DIR}/python3" << 'FAKE_PY3'
+#!/usr/bin/env bash
+# Fake python3 for mux_attach exec test.
+# Detect which verb is being called.
+for arg in "$@"; do
+    case "$arg" in
+        attach-cmd)
+            # Output the argv to exec (one arg per line).
+            printf "tmux\nattach-session\n-t\ncrewvia:Sora-director\n"
+            exit 0
+            ;;
+        attach)
+            # This must NOT be reached in the exec branch.
+            echo "ATTACH_CALLED" >&2
+            exit 0
+            ;;
+    esac
+done
+exit 0
+FAKE_PY3
+    chmod +x "${FAKE_LIB_DIR}/python3"
+
+    # Create a test script that sources lib_mux.sh, overrides exec, and calls mux_attach.
+    TEST_SCRIPT="${FAKE_LIB_DIR}/test_attach.sh"
+    cat > "$TEST_SCRIPT" << TESTSCRIPT
+#!/usr/bin/env bash
+# Override exec to record the argv and exit instead of replacing the process.
+exec() {
+    printf '%s\n' "\$@" > "${FAKE_LIB_DIR}/exec_argv"
+    exit 0
+}
+# Point PATH to fake python3 so lib_mux.sh uses it.
+export PATH="${FAKE_LIB_DIR}:${PATH}"
+export CREWVIA_MUX=tmux
+unset TMUX
+# Override _LIB_MUX_PY to a dummy path (fake python3 intercepts by verb name).
+_LIB_MUX_PY="lib_mux.py"
+source "${REPO_ROOT}/scripts/lib_mux.sh"
+mux_attach "Sora-director"
+TESTSCRIPT
+    chmod +x "$TEST_SCRIPT"
+
+    run bash "$TEST_SCRIPT"
+    [ "$status" -eq 0 ]
+
+    # exec must have been called with the tmux attach-session argv.
+    [ -f "${FAKE_LIB_DIR}/exec_argv" ]
+    grep -qF "tmux" "${FAKE_LIB_DIR}/exec_argv"
+    grep -qF "attach-session" "${FAKE_LIB_DIR}/exec_argv"
+
+    # python3 attach (fallback) must NOT have been reached.
+    ! grep -qF "ATTACH_CALLED" <<< "$output"
+
+    # Cleanup.
+    find "$FAKE_LIB_DIR" -type f -delete 2>/dev/null || true
+    find "$FAKE_LIB_DIR" -type d -delete 2>/dev/null || true
 }
 
 # ---------------------------------------------------------------------------
@@ -883,13 +1005,16 @@ FAKESCRIPT2
     herdr_log_contains "${FAKE_TAB_ID}"
 }
 
-@test "herdr attach: without HERDR_ENV prints hint and returns 1" {
+@test "herdr attach: without HERDR_ENV returns 1 (use attach-cmd + exec instead)" {
+    # Since herdr attach without HERDR_ENV is now handled by attach_cmd() + exec,
+    # attach() itself just returns False — no hint needed here.
     setup_fake_herdr
     unset HERDR_ENV
 
     run python3 "$LIB_MUX_PY" attach "Omar-worker"
     [ "$status" -eq 1 ]
-    [[ "$output" == *"herdr"* ]] || [[ "$stderr" == *"herdr"* ]]
+    # tab focus must NOT have been called — that belongs to attach_cmd().
+    ! herdr_log_contains "tab focus"
 }
 
 # ---------------------------------------------------------------------------

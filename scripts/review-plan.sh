@@ -30,8 +30,9 @@ INLINE_CMD="cd '$CREWVIA_DIR' && CLAUDE_SKILL=plan_review claude --model claude-
      -p 'Mission slug: $SLUG. agents/plan_reviewer.md の手順に従い queue/missions/$SLUG/ の全タスクを検査し、queue/missions/$SLUG/plan_review.md を出力せよ。' \
      2>&1 | tee /tmp/plan_reviewer_$$.log"
 
+MUX_LAUNCHED=0
 if mux_available && mux_spawn "$WINDOW_NAME" "$INLINE_CMD" "$CREWVIA_DIR"; then
-    : # launched in mux window
+    MUX_LAUNCHED=1
 else
     echo "[review-plan.sh] WARNING: mux unavailable or spawn failed — running Plan Reviewer inline" >&2
     cd "$CREWVIA_DIR"
@@ -49,6 +50,7 @@ echo "[review-plan.sh] Waiting for plan_review.md with valid verdict (max 600s).
 for i in $(seq 1 120); do
     if [[ -f "$REVIEW_OUTPUT" ]] && grep -q '^\*\*Verdict:\*\*' "$REVIEW_OUTPUT" 2>/dev/null; then
         echo "[review-plan.sh] plan_review.md output complete (verdict found)"
+        [[ $MUX_LAUNCHED -eq 1 ]] && mux_kill "$WINDOW_NAME" 2>/dev/null || true
         exit 0
     fi
     sleep 5

@@ -104,7 +104,6 @@ fi
 
 GATE_FILE="/tmp/crewvia-bench-gate-${WORKER_NAME}"
 WORKER_WINDOW="${WORKER_NAME}-worker"
-TMUX_TARGET="${TMUX_SESSION}:${WORKER_WINDOW}"
 RESTARTING_FLAG="$REPO_ROOT/queue/assignments/${WORKER_NAME}.restarting"
 
 log "strategy=$STRATEGY worker=$WORKER_NAME max_runtime=${MAX_RUNTIME_MINUTES}m dry_run=$DRY_RUN"

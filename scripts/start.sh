@@ -121,13 +121,40 @@ else
   fi
 fi
 
-# --- tmux モード選択（Director 起動時のみ、CREWVIA_TMUX 未設定時のみ） ---
-# Director が tmux モードを選ぶと、この env は exec claude に引き継がれ、
-# Director が後続で起動する Worker もすべて tmux ウィンドウで動く。
+# --- 並列モード選択（Director 起動時のみ、CREWVIA_TMUX 未設定時のみ） ---
+# Director が並列モードを選ぶと、CREWVIA_TMUX=1 が exec claude に引き継がれ、
+# Director が後続で起動する Worker もすべて mux ウィンドウ (tmux or herdr) で動く。
+# backend は CREWVIA_MUX env または config/crewvia.yaml の mode: で決まる。
+#
+# herdr backend を要求しているのに herdr が不在 / server 不通なら exit 1。
+# tmux にフォールバックしない（異なる mux に分散する事故防止）。
 if [[ "${ROLE}" == "director" ]] && [[ -z "${CREWVIA_TMUX:-}" ]]; then
+  # CREWVIA_MUX が明示指定されている場合は herdr 不在チェックを先に行う
+  if [[ "${CREWVIA_MUX:-}" == "herdr" ]]; then
+    if ! command -v herdr >/dev/null 2>&1; then
+      echo "[crewvia] ERROR: CREWVIA_MUX=herdr が設定されていますが herdr バイナリが見つかりません。" >&2
+      echo "          herdr をインストールするか CREWVIA_MUX=tmux に変更してください。" >&2
+      exit 1
+    fi
+    if ! python3 "${SCRIPT_DIR}/lib_mux.py" available >/dev/null 2>&1; then
+      echo "[crewvia] ERROR: CREWVIA_MUX=herdr が設定されていますが herdr server に接続できません。" >&2
+      echo "          'herdr server' を起動してから再試行してください。" >&2
+      exit 1
+    fi
+  fi
+
   # config/crewvia.yaml の mode 設定を読む
   MODE_FROM_CONFIG=$(grep -E '^mode:[[:space:]]*\S' "$CONFIG_FILE" 2>/dev/null | awk '{print $2}' | tr -d '"' | head -1)
-  if [[ "$MODE_FROM_CONFIG" == "tmux" ]]; then
+  if [[ "$MODE_FROM_CONFIG" == "herdr" ]]; then
+    # herdr backend を config で指定している場合も不在チェック
+    if ! command -v herdr >/dev/null 2>&1 || ! python3 "${SCRIPT_DIR}/lib_mux.py" available >/dev/null 2>&1; then
+      echo "[crewvia] ERROR: config に mode: herdr が設定されていますが herdr が利用できません。" >&2
+      exit 1
+    fi
+    export CREWVIA_MUX=herdr
+    export CREWVIA_TMUX=1
+    echo "[crewvia] herdr 並列モードで起動します（config 設定）。"
+  elif [[ "$MODE_FROM_CONFIG" == "tmux" ]]; then
     export CREWVIA_TMUX=1
     echo "[crewvia] tmux モードで起動します（config 設定）。"
   elif [[ "$MODE_FROM_CONFIG" == "inline" ]]; then
@@ -138,12 +165,12 @@ if [[ "${ROLE}" == "director" ]] && [[ -z "${CREWVIA_TMUX:-}" ]]; then
     echo "          （並列 Worker 起動には 'brew install tmux' を推奨）" >&2
     export CREWVIA_TMUX=0
   elif [[ ! -e /dev/tty ]]; then
-    # 非対話環境（CI など）: tmux モードはスキップ
+    # 非対話環境（CI など）: 並列モードはスキップ
     export CREWVIA_TMUX=0
   else
     echo ""
-    echo "[crewvia] tmux を使ってマルチエージェント並列モードで起動しますか？"
-    echo "          Y = tmux モード（Director と Worker を crewvia セッションに展開）"
+    echo "[crewvia] 並列モードにしますか？（mux backend: ${CREWVIA_MUX:-自動検出}）"
+    echo "          Y = 並列モード（Director と Worker を mux ウィンドウに展開）"
     echo "          n = インラインモード（Worker 並列起動不可、単独セッション）"
     printf "> [Y/n]: "
     read -r TMUX_CHOICE </dev/tty || TMUX_CHOICE=""
@@ -154,8 +181,7 @@ if [[ "${ROLE}" == "director" ]] && [[ -z "${CREWVIA_TMUX:-}" ]]; then
         ;;
       *)
         export CREWVIA_TMUX=1
-        echo "[crewvia] tmux モードで起動します（セッション名: crewvia）。"
-        echo "          別ターミナルから 'tmux attach -t crewvia' で覗けます。"
+        echo "[crewvia] 並列モードで起動します。"
         ;;
     esac
   fi
@@ -426,7 +452,7 @@ if [[ "${CREWVIA_TMUX:-0}" == "1" ]]; then
 
   WINDOW_NAME="${AGENT_NAME}-${ROLE}"
 
-  ENV_EXPORTS="export AGENT_NAME='$AGENT_NAME' TASKVIA_URL='$TASKVIA_URL' TASKVIA_TOKEN='${TASKVIA_TOKEN:-}' CREWVIA_TASKVIA='${CREWVIA_TASKVIA:-enabled}' ROLE='$ROLE' SKILLS='${SKILLS:-}' CREWVIA_REPO='$CREWVIA_REPO' CREWVIA_REPO_ROOT='$CREWVIA_REPO_ROOT' CREWVIA_QUEUE='$CREWVIA_QUEUE' CREWVIA_APPROVAL_CHANNEL='${CREWVIA_APPROVAL_CHANNEL:-taskvia}' NTFY_URL='${NTFY_URL:-}' NTFY_TOPIC='${NTFY_TOPIC:-}' NTFY_USER='${NTFY_USER:-}' NTFY_PASS='${NTFY_PASS:-}' APPROVAL_TOKEN_TTL_SECONDS='${APPROVAL_TOKEN_TTL_SECONDS:-900}'"
+  ENV_EXPORTS="export AGENT_NAME='$AGENT_NAME' TASKVIA_URL='$TASKVIA_URL' TASKVIA_TOKEN='${TASKVIA_TOKEN:-}' CREWVIA_TASKVIA='${CREWVIA_TASKVIA:-enabled}' ROLE='$ROLE' SKILLS='${SKILLS:-}' CREWVIA_REPO='$CREWVIA_REPO' CREWVIA_REPO_ROOT='$CREWVIA_REPO_ROOT' CREWVIA_QUEUE='$CREWVIA_QUEUE' CREWVIA_APPROVAL_CHANNEL='${CREWVIA_APPROVAL_CHANNEL:-taskvia}' NTFY_URL='${NTFY_URL:-}' NTFY_TOPIC='${NTFY_TOPIC:-}' NTFY_USER='${NTFY_USER:-}' NTFY_PASS='${NTFY_PASS:-}' APPROVAL_TOKEN_TTL_SECONDS='${APPROVAL_TOKEN_TTL_SECONDS:-900}' CREWVIA_MUX='${CREWVIA_MUX:-}'"
   [[ "${ROLE}" == "worker" ]] && [[ "$WORK_DIR" != "$REPO_ROOT" ]] && ENV_EXPORTS+=" TARGET_DIR='$WORK_DIR'"
 
   # --model flag (空なら省略)

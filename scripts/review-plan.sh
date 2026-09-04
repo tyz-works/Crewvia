@@ -26,7 +26,8 @@ WINDOW_NAME="plan-reviewer-$$"
 # shellcheck source=lib_mux.sh
 source "${SCRIPT_DIR}/lib_mux.sh"
 
-INLINE_CMD="cd '$CREWVIA_DIR' && CLAUDE_SKILL=plan_review claude --model claude-opus-4-5 \
+# unset CLAUDE_CODE_CHILD_SESSION: herdr server 由来の汚染変数が Plan Reviewer に伝播しないよう除去。
+INLINE_CMD="unset CLAUDE_CODE_CHILD_SESSION; cd '$CREWVIA_DIR' && CLAUDE_SKILL=plan_review claude --model claude-opus-4-5 \
      -p 'Mission slug: $SLUG. agents/plan_reviewer.md の手順に従い queue/missions/$SLUG/ の全タスクを検査し、queue/missions/$SLUG/plan_review.md を出力せよ。' \
      2>&1 | tee /tmp/plan_reviewer_$$.log"
 
@@ -36,6 +37,8 @@ if mux_available && mux_spawn "$WINDOW_NAME" "$INLINE_CMD" "$CREWVIA_DIR"; then
 else
     echo "[review-plan.sh] WARNING: mux unavailable or spawn failed — running Plan Reviewer inline" >&2
     cd "$CREWVIA_DIR"
+    # herdr server 汚染の伝播を防ぐため claude 実行直前に除去する。
+    unset CLAUDE_CODE_CHILD_SESSION
     CLAUDE_SKILL=plan_review claude --model claude-opus-4-5 \
         -p "Mission slug: $SLUG. agents/plan_reviewer.md の手順に従い queue/missions/$SLUG/ の全タスクを検査し、queue/missions/$SLUG/plan_review.md を出力せよ。" \
         2>&1 | tee /tmp/plan_reviewer_$$.log

@@ -492,7 +492,9 @@ with open(sys.argv[2], 'w') as f:
     json.dump(existing, f, ensure_ascii=False, indent=2)
 PYEOF
   fi
-  LAUNCH_CMD="$ENV_EXPORTS; cd '$WORK_DIR'; claude${MODEL_CLI_ARG}${SETTINGS_CLI_ARG}"
+  # unset CLAUDE_CODE_CHILD_SESSION: herdr server が陳腐化した環境変数を引き継いでいる場合に
+  # Director/Worker の claude プロセスへ汚染が伝播しないよう、起動直前に必ず除去する。
+  LAUNCH_CMD="$ENV_EXPORTS; unset CLAUDE_CODE_CHILD_SESSION; cd '$WORK_DIR'; claude${MODEL_CLI_ARG}${SETTINGS_CLI_ARG}"
 
   # Spawn agent window (mux_spawn handles has-session/new-session/new-window internally).
   if ! mux_spawn "$WINDOW_NAME" "$LAUNCH_CMD" "$WORK_DIR"; then
@@ -578,5 +580,7 @@ else
     echo "[crewvia] ERROR: failed to cd into $WORK_DIR" >&2
     exit 1
   }
+  # herdr server 汚染の伝播を防ぐため exec 直前に除去する (mux 経由と同様の防御)。
+  unset CLAUDE_CODE_CHILD_SESSION
   exec claude "${MODEL_FLAG[@]+"${MODEL_FLAG[@]}"}" "${PROMPT_FLAG[@]+"${PROMPT_FLAG[@]}"}" "${SETTINGS_FLAG[@]+"${SETTINGS_FLAG[@]}"}"
 fi

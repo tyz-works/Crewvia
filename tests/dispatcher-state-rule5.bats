@@ -15,6 +15,7 @@
 #   6. working recovery → dedup key cleared → re-notify fires on next stuck
 #   7. tmux (state==unknown) → completely skip, no notify
 #   8. idle WITHOUT assignment → B does not trigger
+#   9. fix regression: state() called with target ('Omar-worker'), not agent name ('Omar')
 #
 # Run:
 #   npx bats tests/dispatcher-state-rule5.bats
@@ -79,10 +80,10 @@ completed_at: null
 Test task for Rule 5.
 MD
 
-    # workers.yaml
+    # workers.yaml — agent base name is 'Omar'; mux pane label is 'Omar-worker'
     cat > "${TEST_REGISTRY}/workers.yaml" << YAML
 workers:
-  - name: Omar-worker
+  - name: Omar
     role: worker
     skills: bash
     task_count: 1
@@ -92,9 +93,9 @@ workers:
     task_count: 0
 YAML
 
-    # heartbeat for Omar-worker (fresh)
+    # heartbeat for Omar (fresh)
     mkdir -p "${TEST_REGISTRY}/heartbeats"
-    touch "${TEST_REGISTRY}/heartbeats/Omar-worker"
+    touch "${TEST_REGISTRY}/heartbeats/Omar"
 
     # State JSON dir
     mkdir -p "${TEST_REGISTRY}/mux"
@@ -103,17 +104,18 @@ YAML
     export MISSION_DIR TASKS_DIR
 }
 
-# make_assignment: create assignment file for Omar-worker.
+# make_assignment: create assignment file for Omar (agent base name).
 make_assignment() {
-    echo "${TEST_MISSION}:t001" > "${TEST_QUEUE}/assignments/Omar-worker"
+    echo "${TEST_MISSION}:t001" > "${TEST_QUEUE}/assignments/Omar"
 }
 
 # remove_assignment: remove assignment file.
 remove_assignment() {
-    rm -f "${TEST_QUEUE}/assignments/Omar-worker"
+    rm -f "${TEST_QUEUE}/assignments/Omar"
 }
 
-# write_state_entry: write a state.json entry for Omar-worker.
+# write_state_entry: write a state.json entry for Omar.
+# Key uses the agent base name (not the pane label 'Omar-worker').
 # Usage: write_state_entry <state_label> <since_seconds_ago>
 write_state_entry() {
     local state_label="$1"
@@ -121,7 +123,7 @@ write_state_entry() {
     local since_epoch
     since_epoch="$(python3 -c "import time; print(time.time() - ${since_ago})")"
     echo "{\"state\": \"${state_label}\", \"since\": ${since_epoch}}" \
-        > "${TEST_REGISTRY}/mux/Omar-worker.state.json"
+        > "${TEST_REGISTRY}/mux/Omar.state.json"
 }
 
 # build_fake_herdr: create a fake herdr that returns a fixed agent_status.
@@ -481,7 +483,8 @@ def _save_state_entry(n, s, t):
     _state_json_path(n).write_text(json.dumps({'state': s, 'since': t}))
 
 def check_rule5(name, target, assignment_file):
-    st = _mux.state(name)
+    # FIXED: use target (= '<name>-worker' pane label) for mux state/capture.
+    st = _mux.state(target)
     if st in ('unknown', 'working'):
         if st == 'working':
             c = load_notify_cache()
@@ -512,7 +515,7 @@ def check_rule5(name, target, assignment_file):
     except: mission_slug = task_id = '?'
     screen_tail = ''
     try:
-        screen = _mux.capture(name)
+        screen = _mux.capture(target)  # FIXED: use target not name
         if screen:
             lines = screen.splitlines()
             screen_tail = '\n'.join(lines[-5:] if len(lines) >= 5 else lines)
@@ -525,7 +528,8 @@ def check_rule5(name, target, assignment_file):
 
     record_notify(notify_key)
 
-check_rule5('Omar-worker', 'Omar-worker', ASSIGNMENTS_DIR / 'Omar-worker')
+# name='Omar' (agent base name), target='Omar-worker' (mux pane label).
+check_rule5('Omar', 'Omar-worker', ASSIGNMENTS_DIR / 'Omar')
 INNEREOF
 )
 PYEOF
@@ -533,7 +537,7 @@ PYEOF
     # Check the mux_send.log was written with Rule 5 message.
     mux_send_log_contains "[Rule 5]"
     mux_send_log_contains "blocked"
-    notify_cache_has_key "blocked_Omar-worker"
+    notify_cache_has_key "blocked_Omar"
 }
 
 # ---------------------------------------------------------------------------
@@ -602,7 +606,8 @@ def _save_state_entry(n, s, t):
     except Exception as e: log(f'WARNING: state entry write: {e}')
 
 def check_rule5(name, target, assignment_file):
-    st = _mux.state(name)
+    # FIXED: use target (= '<name>-worker' pane label) for mux state/capture.
+    st = _mux.state(target)
     if st in ('unknown', 'working'):
         if st == 'working':
             c = load_notify_cache()
@@ -633,7 +638,7 @@ def check_rule5(name, target, assignment_file):
     except: mission_slug = task_id = '?'
     screen_tail = ''
     try:
-        screen = _mux.capture(name)
+        screen = _mux.capture(target)  # FIXED: use target not name
         if screen:
             lines = screen.splitlines()
             screen_tail = '\n'.join(lines[-5:] if len(lines) >= 5 else lines)
@@ -646,7 +651,9 @@ def check_rule5(name, target, assignment_file):
     else: log(f'WARNING: Rule 5 — Director 不在: {msg[:200]}')
     record_notify(notify_key)
 
-check_rule5('Omar-worker', 'Omar-worker', ASSIGNMENTS_DIR / 'Omar-worker')
+# name='Omar' (agent base name from workers.yaml / assignments/)
+# target='Omar-worker' (mux pane label — must match what fake herdr lists)
+check_rule5('Omar', 'Omar-worker', ASSIGNMENTS_DIR / 'Omar')
 PYEOF
 }
 
@@ -682,7 +689,7 @@ run_helper() {
 
     mux_send_log_contains "[Rule 5]"
     mux_send_log_contains "idle-with-task"
-    notify_cache_has_key "idle_with_task_Omar-worker"
+    notify_cache_has_key "idle_with_task_Omar"
 }
 
 # ---------------------------------------------------------------------------
@@ -725,7 +732,7 @@ run_helper() {
     run_helper 3600
 
     ! mux_send_log_contains "[Rule 5]"
-    notify_cache_lacks_key "blocked_Omar-worker"
+    notify_cache_lacks_key "blocked_Omar"
 }
 
 # ---------------------------------------------------------------------------
@@ -772,14 +779,14 @@ run_helper() {
 
     # First call: notifies and records key.
     run_helper 1
-    notify_cache_has_key "blocked_Omar-worker"
+    notify_cache_has_key "blocked_Omar"
 
     # Worker recovers: now state=working.
     build_fake_herdr "working" "${FAKE_MUX_DIR}"
     run_helper 1
 
     # Key should be cleared from the cache after working recovery.
-    notify_cache_lacks_key "blocked_Omar-worker"
+    notify_cache_lacks_key "blocked_Omar"
 }
 
 # ---------------------------------------------------------------------------
@@ -800,7 +807,7 @@ run_helper() {
     run_helper 1
 
     ! mux_send_log_contains "[Rule 5]"
-    notify_cache_lacks_key "blocked_Omar-worker"
+    notify_cache_lacks_key "blocked_Omar"
 }
 
 # ---------------------------------------------------------------------------
@@ -822,5 +829,131 @@ run_helper() {
     run_helper 1
 
     ! mux_send_log_contains "[Rule 5]"
-    notify_cache_lacks_key "idle_with_task_Omar-worker"
+    notify_cache_lacks_key "idle_with_task_Omar"
+}
+
+# ---------------------------------------------------------------------------
+# Test 9: fix regression — state() must use target ('Omar-worker'), not name
+# ---------------------------------------------------------------------------
+# Demonstrates the original bug: _mux.state(name) where name='Omar' would
+# fail to find the pane (label is 'Omar-worker') and return 'unknown',
+# silently disabling Rule 5 in production.
+# With the fix (_mux.state(target)), the pane is found and Rule 5 fires.
+
+@test "Rule5 fix: state() uses target pane label (name-worker), not agent name" {
+    setup_queue_fixture
+    FAKE_MUX_DIR="$(mktemp -d)"
+    # Fake herdr only lists pane labeled 'Omar-worker' (not 'Omar').
+    build_fake_herdr "blocked" "${FAKE_MUX_DIR}"
+    export CREWVIA_MUX=herdr
+    export CREWVIA_REPO_ROOT="${REPO_ROOT}"
+
+    # Assignment and state entry keyed on agent base name 'Omar'.
+    echo "${TEST_MISSION}:t001" > "${TEST_QUEUE}/assignments/Omar"
+    local since_epoch
+    since_epoch="$(python3 -c "import time; print(time.time() - 120)")"
+    echo "{\"state\": \"blocked\", \"since\": ${since_epoch}}" \
+        > "${TEST_REGISTRY}/mux/Omar.state.json"
+
+    # Run check_rule5 with distinct name='Omar' vs target='Omar-worker'.
+    # Fixed code: _mux.state('Omar-worker') → finds pane → 'blocked' → notify.
+    # Old buggy code: _mux.state('Omar') → pane not found → 'unknown' → skip.
+    CREWVIA_MUX=herdr \
+    CREWVIA_HERDR_WORKSPACE=crewvia \
+    CREWVIA_REPO_ROOT="${REPO_ROOT}" \
+    PATH="${FAKE_MUX_DIR}:${PATH}" \
+    python3 - "${TEST_QUEUE}" "${TEST_REGISTRY}" "${TEST_NOTIFY_CACHE}" 300 1 << 'PYEOF'
+import sys, os, json, time
+from pathlib import Path
+QUEUE_DIR    = Path(sys.argv[1])
+REGISTRY_DIR = Path(sys.argv[2])
+NOTIFY_CACHE = Path(sys.argv[3])
+NOTIFY_TTL   = int(sys.argv[4])
+STATE_GRACE  = int(sys.argv[5]) if len(sys.argv) > 5 else 60
+_SCRIPTS_DIR = Path(os.environ.get('CREWVIA_REPO_ROOT', '')) / 'scripts'
+sys.path.insert(0, str(_SCRIPTS_DIR))
+from lib_mux import Mux
+_mux = Mux()
+ASSIGNMENTS_DIR = QUEUE_DIR / 'assignments'
+STATE_JSON_DIR  = REGISTRY_DIR / 'mux'
+MUX_SEND_LOG    = REGISTRY_DIR / 'mux_send.log'
+
+def log(msg): pass
+def load_notify_cache():
+    try: return json.loads(NOTIFY_CACHE.read_text())
+    except: return {}
+def should_notify(key):
+    c = load_notify_cache()
+    return key not in c or time.time() - c[key] > NOTIFY_TTL
+def record_notify(key):
+    c = load_notify_cache(); c[key] = time.time()
+    NOTIFY_CACHE.write_text(json.dumps(c))
+def _director_name():
+    names = _mux.list(suffix='-director')
+    return names[0] if names else 'Sora-director'
+def tmux_send(target, msg):
+    _mux.send(target, msg)
+    with MUX_SEND_LOG.open('a') as f: f.write(f'{target}|{msg}\n')
+def _state_json_path(n): return STATE_JSON_DIR / f'{n}.state.json'
+def _load_state_entry(n):
+    try: return json.loads(_state_json_path(n).read_text())
+    except: return {}
+def _save_state_entry(n, s, t):
+    STATE_JSON_DIR.mkdir(parents=True, exist_ok=True)
+    _state_json_path(n).write_text(json.dumps({'state': s, 'since': t}))
+
+def check_rule5(name, target, assignment_file):
+    # FIXED: use target (= '<name>-worker') not name for mux lookups.
+    st = _mux.state(target)
+    if st in ('unknown', 'working'):
+        if st == 'working':
+            c = load_notify_cache()
+            for k in (f'blocked_{name}', f'idle_with_task_{name}'): c.pop(k, None)
+            try: NOTIFY_CACHE.write_text(json.dumps(c))
+            except: pass
+            _save_state_entry(name, 'working', time.time())
+        return
+    is_A = st == 'blocked'
+    is_B = st in ('idle', 'done') and assignment_file.exists()
+    if not is_A and not is_B:
+        _save_state_entry(name, st, time.time())
+        return
+    entry = _load_state_entry(name)
+    prev_state, since = entry.get('state', ''), entry.get('since', 0.0)
+    now = time.time()
+    condition = 'blocked' if is_A else 'idle-with-task'
+    if prev_state != condition:
+        _save_state_entry(name, condition, now)
+        return
+    elapsed = now - since
+    if elapsed < STATE_GRACE: return
+    notify_key = f'blocked_{name}' if is_A else f'idle_with_task_{name}'
+    if not should_notify(notify_key): return
+    try:
+        raw = assignment_file.read_text().strip()
+        mission_slug, task_id = (raw.split(':', 1) if ':' in raw else ('?', raw))
+    except: mission_slug = task_id = '?'
+    screen_tail = ''
+    try:
+        screen = _mux.capture(target)  # FIXED: use target not name
+        if screen:
+            lines = screen.splitlines()
+            screen_tail = '\n'.join(lines[-5:] if len(lines) >= 5 else lines)
+    except: pass
+    director = _director_name()
+    director_live = bool(_mux.list(suffix='-director'))
+    msg = (f'[Rule 5] Worker {name} が {condition} です '
+           f'(task {task_id}, mission={mission_slug}, {elapsed:.0f}秒継続)。画面末尾:\n{screen_tail}')
+    if director_live: tmux_send(director, msg)
+    record_notify(notify_key)
+
+# Distinct name vs target: simulates real dispatcher behaviour.
+# name='Omar' (agent base name), target='Omar-worker' (pane label).
+check_rule5('Omar', 'Omar-worker', ASSIGNMENTS_DIR / 'Omar')
+PYEOF
+
+    # Notification must fire: state('Omar-worker') finds the blocked pane.
+    mux_send_log_contains "[Rule 5]"
+    mux_send_log_contains "blocked"
+    notify_cache_has_key "blocked_Omar"
 }

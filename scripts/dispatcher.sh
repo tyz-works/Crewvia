@@ -656,7 +656,11 @@ def check_rule5(name: str, target: str, assignment_file: Path) -> None:
 
     tmux mode (state == "unknown") → skip entirely (safe side).
     """
-    st = _mux.state(name)
+    # IMPORTANT: mux pane labels are '<name>-worker' (e.g. 'Omar-worker'), not
+    # the bare agent name.  Use `target` (= window_target from
+    # tmux_list_worker_windows) so the label lookup succeeds.  Using `name`
+    # always returns 'unknown' (pane not found) and silently disables Rule 5.
+    st = _mux.state(target)
 
     # unknown / working → no action.  tmux always returns unknown → skip.
     if st in ('unknown', 'working'):
@@ -721,7 +725,7 @@ def check_rule5(name: str, target: str, assignment_file: Path) -> None:
     # Collect screen tail for context.
     screen_tail = ''
     try:
-        screen = _mux.capture(name)
+        screen = _mux.capture(target)  # use target (= '<name>-worker') not name
         if screen:
             lines = screen.splitlines()
             screen_tail = '\n'.join(lines[-5:]) if len(lines) >= 5 else '\n'.join(lines)

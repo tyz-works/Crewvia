@@ -719,15 +719,13 @@ class HerdrBackend(_Backend):
         """True if herdr binary exists and server is running (or can be started).
 
         Also performs version guard — warns (does not stop) if version != 0.8.2.
+        ``herdr --version`` outputs plain text (not JSON), so subprocess is used
+        directly rather than _herdr_run().
         """
         if shutil.which("herdr") is None:
             return False
 
-        # Version guard.
-        data = _herdr_run("version", [], timeout=5)
-        if data is not None:
-            # herdr --version outputs plain text like "herdr 0.8.2"
-            pass
+        # Version guard (plain-text output — not JSON).
         try:
             r = subprocess.run(
                 _HERDR_CLI["version"], capture_output=True, text=True, timeout=5

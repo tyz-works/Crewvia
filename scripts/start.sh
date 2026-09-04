@@ -133,8 +133,8 @@ if [[ "${ROLE}" == "director" ]] && [[ -z "${CREWVIA_TMUX:-}" ]]; then
   elif [[ "$MODE_FROM_CONFIG" == "inline" ]]; then
     export CREWVIA_TMUX=0
     echo "[crewvia] インラインモードで起動します（config 設定）。"
-  elif ! command -v tmux >/dev/null 2>&1; then
-    echo "[crewvia] tmux 未検出 → インラインモードで起動します。" >&2
+  elif ! python3 "${SCRIPT_DIR}/lib_mux.py" available >/dev/null 2>&1; then
+    echo "[crewvia] mux backend (tmux / herdr) 未検出 → インラインモードで起動します。" >&2
     echo "          （並列 Worker 起動には 'brew install tmux' を推奨）" >&2
     export CREWVIA_TMUX=0
   elif [[ ! -e /dev/tty ]]; then
@@ -418,9 +418,12 @@ if [[ "${ROLE}" == "worker" ]] && [[ "$WORK_DIR" != "$REPO_ROOT" ]]; then
   )
 fi
 
-# Launch with or without tmux
+# Launch with or without mux (tmux / herdr)
 if [[ "${CREWVIA_TMUX:-0}" == "1" ]]; then
-  SESSION="crewvia"
+  # Load mux abstraction layer (backend selected via CREWVIA_MUX or config/crewvia.yaml).
+  # shellcheck source=lib_mux.sh
+  source "${SCRIPT_DIR}/lib_mux.sh"
+
   WINDOW_NAME="${AGENT_NAME}-${ROLE}"
 
   ENV_EXPORTS="export AGENT_NAME='$AGENT_NAME' TASKVIA_URL='$TASKVIA_URL' TASKVIA_TOKEN='${TASKVIA_TOKEN:-}' CREWVIA_TASKVIA='${CREWVIA_TASKVIA:-enabled}' ROLE='$ROLE' SKILLS='${SKILLS:-}' CREWVIA_REPO='$CREWVIA_REPO' CREWVIA_REPO_ROOT='$CREWVIA_REPO_ROOT' CREWVIA_QUEUE='$CREWVIA_QUEUE' CREWVIA_APPROVAL_CHANNEL='${CREWVIA_APPROVAL_CHANNEL:-taskvia}' NTFY_URL='${NTFY_URL:-}' NTFY_TOPIC='${NTFY_TOPIC:-}' NTFY_USER='${NTFY_USER:-}' NTFY_PASS='${NTFY_PASS:-}' APPROVAL_TOKEN_TTL_SECONDS='${APPROVAL_TOKEN_TTL_SECONDS:-900}'"
@@ -465,41 +468,36 @@ PYEOF
   fi
   LAUNCH_CMD="$ENV_EXPORTS; cd '$WORK_DIR'; claude${MODEL_CLI_ARG}${SETTINGS_CLI_ARG}"
 
-  if ! tmux has-session -t "$SESSION" 2>/dev/null; then
-    echo "[crewvia] Creating tmux session: $SESSION"
-    tmux new-session -d -s "$SESSION" -n "$WINDOW_NAME"
-    TARGET="${SESSION}:${WINDOW_NAME}"
-  elif tmux list-windows -t "$SESSION" -F '#{window_name}' 2>/dev/null | grep -qx "$WINDOW_NAME"; then
-    echo "[crewvia] Window ${SESSION}:${WINDOW_NAME} already exists, skipping launch"
+  # Spawn agent window (mux_spawn handles has-session/new-session/new-window internally).
+  if ! mux_spawn "$WINDOW_NAME" "$LAUNCH_CMD" "$WORK_DIR"; then
+    # Check if the window already exists (safe no-op) vs a real error.
+    if mux_list | grep -qx "$WINDOW_NAME"; then
+      echo "[crewvia] Window $WINDOW_NAME already exists, skipping launch"
+    else
+      echo "[crewvia] ERROR: Failed to spawn mux window: $WINDOW_NAME" >&2
+    fi
     exit 0
-  else
-    tmux new-window -t "$SESSION" -n "$WINDOW_NAME"
-    TARGET="${SESSION}:${WINDOW_NAME}"
   fi
-
-  tmux send-keys -t "$TARGET" "$LAUNCH_CMD"
-  tmux send-keys -t "$TARGET" Enter
-  echo "[crewvia] Agent launched in tmux window: ${SESSION}:${WINDOW_NAME}"
+  echo "[crewvia] Agent launched in mux window: $WINDOW_NAME"
 
   # Claude Code の入力プロンプト（❯）が表示されるまで待ってから kickoff メッセージを送る。
   # 固定 sleep だと環境依存でタイミングがずれるため、プロンプト検出でポーリングする。
+  # (spec §4.2-D: capture で ❯ を確認してから send する規約)
   PROMPT_READY=0
   for _i in $(seq 1 30); do
-    if tmux capture-pane -t "$TARGET" -p 2>/dev/null | grep -q '❯'; then
+    if mux_capture "$WINDOW_NAME" 2>/dev/null | grep -q '❯'; then
       PROMPT_READY=1
       break
     fi
     sleep 1
   done
   if [[ "$PROMPT_READY" -eq 0 ]]; then
-    echo "[crewvia] WARNING: Claude prompt not detected after 30s in ${SESSION}:${WINDOW_NAME}" >&2
+    echo "[crewvia] WARNING: Claude prompt not detected after 30s in $WINDOW_NAME" >&2
   fi
 
   if [[ "${CREWVIA_BENCH_MODE:-0}" != "1" ]]; then
     if [[ "${ROLE}" == "worker" ]]; then
       # TARGET_DIR が設定されている場合は --target-dir を渡して target 不一致タスクをスキップ
-      PULL_TARGET_DIR_ARG=""
-      [[ -n "${TARGET_DIR:-}" ]] && PULL_TARGET_DIR_ARG=" --target-dir ${TARGET_DIR}"
       if [[ -n "${TARGET_DIR:-}" ]]; then
         KICKOFF_MSG="ミッション開始。${CREWVIA_REPO_ROOT}/scripts/plan.sh pull --agent ${AGENT_NAME} --skills ${SKILLS} --target-dir ${TARGET_DIR} でタスクを取得し、指示に従って作業してください。完了したら ${CREWVIA_REPO_ROOT}/scripts/plan.sh done で報告し、待機してください（Dispatcher が次のタスクを自動割り当てします）。"
       else
@@ -508,44 +506,34 @@ PYEOF
     else
       KICKOFF_MSG="ミッション開始。${CREWVIA_REPO_ROOT}/scripts/plan.sh status で状態を確認し、タスク分解・Worker 割り当て・全体管理を開始してください。"
     fi
-    tmux send-keys -t "$TARGET" "$KICKOFF_MSG"
-    sleep 1
-    tmux send-keys -t "$TARGET" Enter
-    echo "[crewvia] Kickoff message sent to ${SESSION}:${WINDOW_NAME}"
+    mux_send "$WINDOW_NAME" "$KICKOFF_MSG"
+    echo "[crewvia] Kickoff message sent to $WINDOW_NAME"
   else
     echo "[crewvia] BENCH_MODE: skipping auto-kickoff (benchmark-ctx.sh will control task dispatch)"
   fi
 
-  # Director: dispatcher を crewvia:dispatcher 窓で起動（二重起動防止）
+  # Director: dispatcher を mux 窓で起動（二重起動防止）
   if [[ "${ROLE}" == "director" ]]; then
-    if tmux list-windows -t "$SESSION" -F '#{window_name}' 2>/dev/null | grep -q '^dispatcher$'; then
-      echo "[crewvia] Dispatcher already running (${SESSION}:dispatcher)"
+    if mux_list | grep -qx 'dispatcher'; then
+      echo "[crewvia] Dispatcher already running (dispatcher)"
     else
-      tmux new-window -t "$SESSION" -n "dispatcher"
-      tmux send-keys -t "${SESSION}:dispatcher" "cd '${REPO_ROOT}' && bash '${SCRIPT_DIR}/dispatcher.sh'" Enter
-      echo "[crewvia] Dispatcher started in tmux window: ${SESSION}:dispatcher"
+      mux_spawn "dispatcher" "cd '${REPO_ROOT}' && bash '${SCRIPT_DIR}/dispatcher.sh'" "$REPO_ROOT"
+      echo "[crewvia] Dispatcher started in mux window: dispatcher"
     fi
 
-    # Director: watchdog(v2)を crewvia:watchdog 窓で起動（二重起動防止）
+    # Director: watchdog(v2)を mux 窓で起動（二重起動防止）
     # F6是正: tmuxモードでは従来watchdogが一度も起動していなかった。非tmuxブランチの
     # watchdog.sh(v1・DEPRECATED)ではなくwatchdog.py(v2)を起動する（v1は延命させない）。
-    if tmux list-windows -t "$SESSION" -F '#{window_name}' 2>/dev/null | grep -q '^watchdog$'; then
-      echo "[crewvia] Watchdog already running (${SESSION}:watchdog)"
+    if mux_list | grep -qx 'watchdog'; then
+      echo "[crewvia] Watchdog already running (watchdog)"
     else
-      tmux new-window -t "$SESSION" -n "watchdog"
-      tmux send-keys -t "${SESSION}:watchdog" "cd '${REPO_ROOT}' && python3 '${SCRIPT_DIR}/watchdog.py'" Enter
-      echo "[crewvia] Watchdog(v2) started in tmux window: ${SESSION}:watchdog"
+      mux_spawn "watchdog" "cd '${REPO_ROOT}' && python3 '${SCRIPT_DIR}/watchdog.py'" "$REPO_ROOT"
+      echo "[crewvia] Watchdog(v2) started in mux window: watchdog"
     fi
 
     # Auto-attach to Director window after kickoff + dispatcher launch.
-    # $TMUX が set されている（既に tmux 内にいる）場合は switch-client、
-    # tmux 外のシェルなら attach-session で Director 窓に移動する。
-    if [[ -n "${TMUX:-}" ]]; then
-      tmux switch-client -t "$SESSION"
-    else
-      echo "[crewvia] Attaching to ${SESSION}:${WINDOW_NAME} ..."
-      exec tmux attach-session -t "${SESSION}:${WINDOW_NAME}"
-    fi
+    echo "[crewvia] Attaching to $WINDOW_NAME ..."
+    mux_attach "$WINDOW_NAME"
   fi
 else
   # Default: run inline (no tmux)

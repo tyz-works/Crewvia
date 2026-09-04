@@ -24,8 +24,8 @@ NOTIFY_CACHE="/tmp/verifier-dispatcher-notify-cache.$$.json"
 NOTIFY_TTL="${NOTIFY_TTL:-60}"
 POLL_INTERVAL="${VERIFIER_POLL_INTERVAL:-30}"
 
-# Standalone-safe: silently exit when tmux is not installed
-if ! command -v tmux &>/dev/null; then
+# Standalone-safe: silently exit when no mux backend (tmux / herdr) is available
+if ! python3 "${SCRIPT_DIR}/lib_mux.py" available >/dev/null 2>&1; then
   exit 0
 fi
 
@@ -58,6 +58,12 @@ QUEUE_DIR      = Path(sys.argv[1])
 REGISTRY_DIR   = Path(sys.argv[2])
 NOTIFY_CACHE   = Path(sys.argv[3])
 NOTIFY_TTL     = int(sys.argv[4])
+
+# Import lib_mux from scripts/ (same dir as this script via REGISTRY_DIR.parent)
+_SCRIPTS_DIR = REGISTRY_DIR.parent / 'scripts'
+sys.path.insert(0, str(_SCRIPTS_DIR))
+from lib_mux import Mux  # noqa: E402
+_mux = Mux()
 
 MISSIONS_DIR    = QUEUE_DIR / 'missions'
 STATE_FILE      = QUEUE_DIR / 'state.yaml'
@@ -335,45 +341,31 @@ def record_notify(key):
 
 
 # ---------------------------------------------------------------------------
-# tmux helpers (mirrors dispatcher.sh 2-step send-keys pattern)
+# mux helpers (delegated to lib_mux.Mux via _mux instance)
 # ---------------------------------------------------------------------------
 
 def tmux_list_verifier_windows():
-    """Return list of {'window_target', 'agent_name'} for crewvia:*-verifier windows."""
-    try:
-        r = subprocess.run(
-            ['tmux', 'list-windows', '-t', 'crewvia', '-F', '#{window_name}'],
-            capture_output=True, text=True, timeout=5,
-        )
-        if r.returncode != 0:
-            return []
-        windows = []
-        for line in r.stdout.splitlines():
-            name = line.strip()
-            if name.endswith('-verifier'):
-                agent_name = name[:-len('-verifier')]
-                windows.append({'window_target': f'crewvia:{name}', 'agent_name': agent_name})
-        return windows
-    except Exception as e:
-        log(f"WARNING: tmux list-windows failed: {e}")
-        return []
+    """Return list of {'window_target', 'agent_name'} for *-verifier windows."""
+    names = _mux.list(suffix='-verifier')
+    return [
+        {'window_target': name, 'agent_name': name[:-len('-verifier')]}
+        for name in names
+    ]
+
+
+def _director_name():
+    """Return the name of the live Director window, falling back to 'Sora-director'."""
+    names = _mux.list(suffix='-director')
+    return names[0] if names else 'Sora-director'
 
 
 def tmux_send(target, message):
-    """Send message to tmux window (2-step: message then Enter separately)."""
-    try:
-        subprocess.run(
-            ['tmux', 'send-keys', '-t', target, message],
-            capture_output=True, timeout=5,
-        )
-        time.sleep(0.1)
-        subprocess.run(
-            ['tmux', 'send-keys', '-t', target, 'Enter'],
-            capture_output=True, timeout=5,
-        )
+    """Send message to mux window (2-step via lib_mux: message then Enter)."""
+    ok = _mux.send(target, message)
+    if ok:
         log(f"→ [{target}] {message[:120]}")
-    except Exception as e:
-        log(f"WARNING: tmux send-keys to {target} failed: {e}")
+    else:
+        log(f"WARNING: mux send to {target!r} failed")
 
 
 # ---------------------------------------------------------------------------
@@ -467,7 +459,7 @@ def dispatch():
                     f" ready_for_verification だが idle Verifier がいない ({reason})。"
                     f"verify スキルの Verifier を起動してください。"
                 )
-                tmux_send('crewvia:Sora-director', msg)
+                tmux_send(_director_name(), msg)
                 record_notify(notify_key)
                 log(f"no idle verifier for task {task_id}: notified director")
 

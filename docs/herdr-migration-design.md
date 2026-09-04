@@ -81,7 +81,7 @@ CLI: python3 lib_mux.py <verb> [args]   # bash からの呼び口。list は 1 �
 
 **A. Server ライフサイクル**
 - `available()`: socket `~/.config/herdr/herdr.sock` に `{"id":"1","method":"ping","params":{}}` を投げ `pong` で OK
-- 不通なら `setsid nohup herdr server >> ~/.config/herdr/crewvia-server.log 2>&1 &` で起動し最大 10 秒 ping ポーリング。`herdr server` が自前で daemon 化するかは未記載のため Phase 0 で確定し、daemon 化するなら wrapper は不要
+- 不通なら `herdr server` を実行し最大 10 秒 ping ポーリング。**Phase 0 で確認済み: `herdr server` は自律的に daemon 化する** (socket 到達まで約 500ms)。`setsid nohup` wrapper は不要
 - default session を使う (`--session` は使わない)。ユーザーが `herdr` と打つだけで覗ける状態を維持
 
 **B. tmux session ↔ herdr workspace / window ↔ tab**
@@ -90,12 +90,13 @@ CLI: python3 lib_mux.py <verb> [args]   # bash からの呼び口。list は 1 �
 - `spawn` は cmd を `pane run $pane "<cmd>"` で流す。現行 `LAUNCH_CMD` (export 群 + cd + claude ...) を文字列のまま渡す。env は `--env` でも渡せるが tmux と同じ「シェルに export を打ち込む」方式に統一して差分を減らす
 
 **C. 名前 → ID 解決とキャッシュ**
-- 正: `pane list` で `label == name` の pane を取り `tab_id` / `pane_id` を得る。`tab create --label` が root pane の label に伝播しなければ spawn 直後に `pane rename $pane <name>` を打つ (Phase 0 で確認)
+- 正: `pane list` で `label == name` の pane を取り `tab_id` / `pane_id` を得る。**Phase 0 で確認済み: `tab create --label` は root pane の label に伝播しない** → spawn 直後に必ず `pane rename $pane <name>` を打つ
 - キャッシュ: `registry/mux/<name>.json` に `{tab_id, pane_id, backend, created_at}`。`send / capture / pid` はキャッシュ優先、herdr 側で pane が消えていれば (`pane get` エラー) キャッシュを捨てて再解決、それでも無ければ「端末なし」
 - `list()` は常に herdr に問い合わせる (生存判定の正は herdr 側)。`kill()` 成功時にキャッシュ削除。`registry/mux/` は `.gitignore` 対象
 
 **D. send の Enter 保険**
-- 基本は `pane run` 1 発。旧版で「Claude 初期化中は Enter が落ちる」観測があるため、`send` 後に `capture` で入力行に text が残っていれば `pane send-keys $pane enter` を 1 回だけ追送する
+- 基本は `pane run` 1 発。**Phase 0 で確認済み: `❯` 表示後の `pane run` は確実に submit される。`❯` 表示前に送ると Enter が落ちる** (v0.8.2 でも再現)
+- したがって spawn 直後の kickoff は現行 start.sh と同じく `capture` で `❯` を検出してから `send` する (この順序を lib_mux の利用規約として明記)。加えて `send` 後に `capture` で入力行に text が残っていれば `pane send-keys $pane enter` を 1 回だけ追送する保険を残す
 
 **E. attach**
 - herdr は pane 内からの nested 起動を禁止している
@@ -168,13 +169,17 @@ mode: tmux        # inline | tmux | herdr
 
 Phase 1 を herdr と切り離すことで、Phase 1 で壊れたら herdr のせいではないと切り分けられる。Phase 2 の mission は Phase 0 完了後に起票する。
 
-### Phase 0 で確認する未確定事項
+### Phase 0 の結果 (2026-09-04, herdr 0.8.2 / WSL2 — 詳細: `docs/herdr-spike-results.md`)
 
-1. `herdr server` が daemon 化するか (しないなら 4.2-A の wrapper が必要)
-2. `tab create --label` が root pane の `label` に伝播するか (しないなら `pane rename`)
-3. `pane run` の Enter が Claude Code TUI で確実に submit されるか (4.2-D の保険が要るか)
-4. `tab close` で claude プロセスが正しく終了するか (孤児プロセスが残らないか)
-5. WSL2 上で socket / ConPTY 周りに問題がないか
+| # | 項目 | 結論 | 設計への反映 |
+|---|---|---|---|
+| 1 | `herdr server` が daemon 化するか | **Yes** (自律 daemon 化、socket 約 500ms) | 4.2-A: `setsid nohup` wrapper 不要 |
+| 2 | `tab create --label` が pane の `label` に伝播するか | **No** | 4.2-C: spawn 直後に `pane rename` 必須 |
+| 3 | `pane run` の Enter が Claude TUI で submit されるか | **条件付き** (`❯` 後は OK、`❯` 前は drop) | 4.2-D: `❯` 検出後に send する規約 + Enter 追送保険を維持 |
+| 4 | `tab close` で claude が終了するか | **Yes** (子プロセス含め 2s 以内、孤児なし) | 変更なし |
+| 5 | WSL2 で socket / ConPTY に問題がないか | **Yes** (問題なし) | 変更なし |
+
+Phase 0 の出口条件を満たしたため Phase 1 / 2 に進む。
 
 ## 8. リスクと逃げ道
 

@@ -438,6 +438,36 @@ def _herdr_run(cmd_key: str, extra_args: List[str], timeout: int = 10) -> Option
     return {}
 
 
+def _herdr_run_raw(cmd_key: str, extra_args: List[str], timeout: int = 10) -> Optional[str]:
+    """Run a herdr CLI command and return raw stdout as a string.
+
+    Use for commands whose stdout is plain text, not JSON (e.g. ``pane read``).
+    ``herdr pane read <pane> --source visible`` outputs the pane content directly
+    to stdout as plain text; trying to JSON-parse it would always fail.
+
+    Returns the raw stdout string on success (exit 0), or None on error.
+    Never raises.
+    """
+    cmd = _HERDR_CLI[cmd_key] + extra_args
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except Exception as e:
+        print(f"[mux:herdr] WARNING: {cmd_key} subprocess failed: {e}", file=sys.stderr)
+        return None
+
+    if r.returncode == 2:
+        print(
+            f"[mux:herdr] WARNING: herdr CLI の引数が変わった可能性 (exit 2): {' '.join(cmd)}",
+            file=sys.stderr,
+        )
+        return None
+
+    if r.returncode != 0:
+        return None
+
+    return r.stdout
+
+
 def _herdr_ping() -> bool:
     """Send a NDJSON ping to herdr socket and return True on pong."""
     sock_path = str(_HERDR_SOCK_PATH)
@@ -766,11 +796,17 @@ class HerdrBackend(_Backend):
         return True
 
     def _capture_by_pane_id(self, pane_id: str) -> str:
-        """Internal: capture screen by pane_id directly (no name lookup)."""
-        data = _herdr_run("pane_read", [pane_id], timeout=10)
-        if data is None:
+        """Internal: capture screen by pane_id directly (no name lookup).
+
+        ``herdr pane read <pane> --source visible`` writes plain text (the
+        pane's visible content) to stdout — NOT JSON.  Use _herdr_run_raw()
+        so the raw stdout is returned as-is instead of being JSON-parsed into
+        an empty dict.
+        """
+        text = _herdr_run_raw("pane_read", [pane_id], timeout=10)
+        if text is None:
             return ""
-        return data.get("result", {}).get("output", "") or ""
+        return text
 
     def capture(self, name: str) -> str:
         """Return the current visible screen contents of the named pane."""

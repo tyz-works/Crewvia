@@ -399,7 +399,25 @@ setup_fake_herdr() {
 
     cat > "${FAKE_HERDR_DIR}/herdr" << 'FAKESCRIPT'
 #!/usr/bin/env bash
-# Fake herdr: log all calls, return fixed JSON.
+# Fake herdr: log all calls, return fixed responses.
+#
+# Response format reference (verified against herdr 0.8.2 docs / Phase 0 spike):
+#   --version          → plain text ("herdr 0.8.2")         [spec: plain]
+#   workspace list     → JSON  {"result":{"workspaces":[…]}} [spec: JSON]
+#   workspace create   → JSON  {"result":{"workspace":{…}}}  [spec: JSON]
+#   tab create         → JSON  {"result":{"tab":{…},"root_pane":{…}}} [spec: JSON]
+#   tab list           → JSON  {"result":{"tabs":[…]}}       [spec: JSON]
+#   tab close          → exit 0, no stdout                   [spec: no output]
+#   tab focus          → JSON  {"result":{"type":"ok"}}      [spec: JSON]
+#   pane list          → JSON  {"result":{"panes":[…]}}      [spec: JSON]
+#   pane get           → JSON  {"result":{"pane":{…}}}       [spec: JSON]
+#   pane rename        → JSON  {"result":{"pane":{…}}}       [spec: JSON]
+#   pane run           → JSON  {"result":{"type":"ok"}}      [spec: JSON]
+#   pane read          → plain text (raw terminal content)   [spec: PLAIN — NOT JSON]
+#                        This is the t006 fix: real herdr writes pane content
+#                        directly to stdout without JSON wrapping.
+#   pane send-keys     → exit 0, no stdout                   [spec: no output]
+#   pane process-info  → JSON  {"result":{"process_info":{…}}} [spec: JSON]
 echo "$*" >> "$FAKE_HERDR_LOG"
 
 # Parse subcommand path (e.g. "workspace list" → cmd1=workspace, cmd2=list)
@@ -409,6 +427,7 @@ cmd3="${3:-}"
 
 case "${cmd1}" in
   --version)
+    # plain text output (not JSON) — herdr version string
     echo "herdr 0.8.2"
     exit 0
     ;;
@@ -419,10 +438,12 @@ case "${cmd1}" in
   workspace)
     case "${cmd2}" in
       list)
+        # JSON response
         echo "{\"result\":{\"workspaces\":[{\"workspace_id\":\"${FAKE_WS_ID}\",\"label\":\"crewvia\"}]}}"
         exit 0
         ;;
       create)
+        # JSON response
         echo "{\"result\":{\"workspace\":{\"workspace_id\":\"${FAKE_WS_ID}\",\"label\":\"crewvia\"}}}"
         exit 0
         ;;
@@ -431,17 +452,21 @@ case "${cmd1}" in
   tab)
     case "${cmd2}" in
       create)
+        # JSON response
         echo "{\"result\":{\"tab\":{\"tab_id\":\"${FAKE_TAB_ID}\",\"label\":\"Omar-worker\"},\"root_pane\":{\"pane_id\":\"${FAKE_PANE_ID}\"}}}"
         exit 0
         ;;
       list)
+        # JSON response
         echo "{\"result\":{\"tabs\":[{\"tab_id\":\"${FAKE_TAB_ID}\",\"label\":\"Omar-worker\"}]}}"
         exit 0
         ;;
       close)
+        # no output
         exit 0
         ;;
       focus)
+        # JSON response
         echo "{\"result\":{\"type\":\"ok\"}}"
         exit 0
         ;;
@@ -450,34 +475,41 @@ case "${cmd1}" in
   pane)
     case "${cmd2}" in
       list)
+        # JSON response
         LABEL=$(cat "$FAKE_PANE_LABEL" 2>/dev/null)
         echo "{\"result\":{\"panes\":[{\"pane_id\":\"${FAKE_PANE_ID}\",\"tab_id\":\"${FAKE_TAB_ID}\",\"label\":\"${LABEL}\"}]}}"
         exit 0
         ;;
       get)
+        # JSON response
         echo "{\"result\":{\"pane\":{\"pane_id\":\"${FAKE_PANE_ID}\"}}}"
         exit 0
         ;;
       rename)
-        # Record that rename was called; update the label state.
+        # JSON response — record that rename was called; update the label state.
         echo "$4" > "$FAKE_PANE_LABEL"
         echo "{\"result\":{\"pane\":{\"pane_id\":\"${FAKE_PANE_ID}\",\"label\":\"$4\"}}}"
         exit 0
         ;;
       run)
+        # JSON response
         echo "{\"result\":{\"type\":\"ok\"}}"
         exit 0
         ;;
       read)
-        # Return the current fake screen content.
-        SCREEN=$(cat "$FAKE_PANE_SCREEN" 2>/dev/null)
-        echo "{\"result\":{\"output\":\"${SCREEN}\"}}"
+        # PLAIN TEXT output (NOT JSON).
+        # `herdr pane read <pane> --source visible` writes the pane's visible
+        # content directly to stdout as raw terminal text — no JSON wrapping.
+        # Returning JSON here would mask the _herdr_run_raw() bug (t006 guard).
+        cat "$FAKE_PANE_SCREEN" 2>/dev/null
         exit 0
         ;;
       send-keys)
+        # no output
         exit 0
         ;;
       process-info)
+        # JSON response
         echo "{\"result\":{\"process_info\":{\"shell_pid\":99999}}}"
         exit 0
         ;;
@@ -678,6 +710,39 @@ print('herdr backend selected OK')
     [[ "$output" == *"❯ prompt ready"* ]]
 }
 
+@test "herdr capture: returns non-empty plain text content (t006 regression)" {
+    # Regression guard for t006 bug:
+    #   _herdr_run() tried to JSON-parse pane read output which is plain text.
+    #   JSON parse failed → {} → .get("result",{}).get("output","") → "".
+    #   Fix: _capture_by_pane_id() now uses _herdr_run_raw() for pane read.
+    setup_fake_herdr
+    # Put multi-line terminal content in the pane screen.
+    printf "output line 1\noutput line 2\n❯ " > "$FAKE_PANE_SCREEN"
+
+    run python3 "$LIB_MUX_PY" capture "Omar-worker"
+    [ "$status" -eq 0 ]
+
+    # Must NOT be empty — this was the symptom of the bug.
+    [ -n "$output" ]
+    [[ "$output" == *"output line 1"* ]]
+    [[ "$output" == *"❯ "* ]]
+}
+
+@test "herdr send: Enter insurance uses plain text screen (t006 regression)" {
+    # Regression guard for t006 bug:
+    #   After the fix, the Enter insurance check works against actual plain-text
+    #   pane content rather than an always-empty string from JSON-parse failure.
+    setup_fake_herdr
+    # Set screen to show the text still in the input line.
+    printf "❯ echo MUX_OK" > "$FAKE_PANE_SCREEN"
+
+    python3 "$LIB_MUX_PY" send "Omar-worker" "echo MUX_OK" 2>/dev/null || true
+
+    # pane send-keys enter must fire because "echo MUX_OK" is in screen.
+    herdr_log_contains "pane send-keys"
+    herdr_log_contains "enter"
+}
+
 # ---------------------------------------------------------------------------
 # list()
 # ---------------------------------------------------------------------------
@@ -812,7 +877,7 @@ case "${cmd1}" in
       list)
         echo "{\"result\":{\"panes\":[{\"pane_id\":\"w1:p1\",\"tab_id\":\"w1:t1\",\"label\":\"Omar-worker\"}]}}"; exit 0 ;;
       run) echo "{\"result\":{\"type\":\"ok\"}}"; exit 0 ;;
-      read) echo "{\"result\":{\"output\":\"❯ \"}}"; exit 0 ;;
+      read) echo "❯ "; exit 0 ;;  # plain text, not JSON (t006 fix)
     esac ;;
 esac
 exit 2

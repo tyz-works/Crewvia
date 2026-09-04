@@ -28,6 +28,7 @@ Thumbs.db
 
 # Crewvia runtime state (per-session)
 queue/
+registry/mux/
 registry/heartbeats/
 registry/activity/
 registry/notifications/

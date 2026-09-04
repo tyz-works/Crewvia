@@ -30,7 +30,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 QUEUE_DIR="${CREWVIA_QUEUE:-${REPO_ROOT}/queue}"
 
 if [[ $# -eq 0 ]]; then
-  echo "Usage: plan.sh <init|add|pull|done|fail|update|ready-for-verification|verify-result|review|launch|lint|status|archive|dashboard|dashboard-data> [args...]" >&2
+  echo "Usage: plan.sh <init|add|pull|done|needs-director|fail|update|ready-for-verification|verify-result|review|launch|lint|status|archive|dashboard|dashboard-data> [args...]" >&2
   exit 1
 fi
 
@@ -273,6 +273,7 @@ STATUS_ICON = {
     'verifying': '🔎',
     'verification_failed': '⚠️',
     'needs_human_review': '👁️',
+    'needs_director': '🆘',
 }
 
 
@@ -471,6 +472,7 @@ TASK_META_KEY_ORDER = [
     'blocked_by', 'timeout', 'target_dir', 'worker', 'started_at', 'completed_at',
     'handoff_path',
     'acceptance_criteria', 'verification', 'rework_count', 'max_rework',
+    'qa_checkpoints', 'required_evidence', 'needs_director_reason',
 ]
 
 TASK_META_DEFAULTS = {
@@ -1430,6 +1432,118 @@ def cmd_pull(args):
     print(json.dumps(chosen_holder[0], ensure_ascii=False))
 
 
+# ---------------------------------------------------------------------------
+# QA Gate validation helpers
+# ---------------------------------------------------------------------------
+
+def _validate_qa_gate(result_text, has_qa_checkpoints):
+    """QA Gate セクションを解析して FAIL 理由を返す（空リスト = PASS）。
+
+    Director Fix 1:
+      - has_qa_checkpoints=True (frontmatter に qa_checkpoints あり)
+          → ## QA Gate セクションは必須。欠落 = FAIL
+      - has_qa_checkpoints=False (qa_checkpoints なし)
+          → 後方互換: セクションがなければスキップ、あれば検証する
+    """
+    section_match = re.search(r'^##\s+QA\s+Gate\s*$', result_text, re.MULTILINE | re.IGNORECASE)
+    if not section_match:
+        if has_qa_checkpoints:
+            return [
+                "  [missing] ## QA Gate セクションがありません。"
+                " qa_checkpoints が宣言されたタスクでは必須です。"
+            ]
+        # qa_checkpoints 未宣言の既存タスク → スキップ（後方互換）
+        return []
+
+    section_body = result_text[section_match.end():]
+
+    fails = []
+    pattern = re.compile(
+        r'checkpoint:\s*(?P<name>[^|]+?)\s*\|\s*required:\s*(?P<req>yes|no)\s*\|'
+        r'\s*result:\s*(?P<res>observed|not_run|failed)',
+        re.IGNORECASE,
+    )
+    found_any = False
+    for m in pattern.finditer(section_body):
+        found_any = True
+        req = m.group('req').lower()
+        res = m.group('res').lower()
+        name = m.group('name').strip()
+        if req == 'yes' and res != 'observed':
+            fails.append(f"  [{res}] {name}")
+
+    if has_qa_checkpoints and not found_any:
+        fails.append(
+            "  [missing] ## QA Gate セクションにチェックポイント行がありません。"
+            " 形式: checkpoint: <名前> | required: yes | result: observed"
+        )
+
+    return fails
+
+
+def _validate_required_evidence(result_text, required):
+    """required_evidence パターンの存在チェック。見つからないパターンのリストを返す。
+
+    Director Fix 2: [EVIDENCE EXEMPTION: ...] は実装しない。
+    証拠が出せない場合は Director が required_evidence: [] で作成するか、
+    Worker が plan.sh needs-director を使うこと。
+    """
+    missing = []
+    for pattern in (required or []):
+        if pattern and pattern not in result_text:
+            missing.append(f"  '{pattern}'")
+    return missing
+
+
+# ---------------------------------------------------------------------------
+# needs-director command
+# ---------------------------------------------------------------------------
+
+def cmd_needs_director(args):
+    """plan.sh needs-director <task_id> "<理由>"
+
+    in_progress タスクを needs_director 状態に遷移させる。
+    Director の介入を求める。
+    - TERMINAL_STATUSES に含まれないため、後続 blocked_by は解除されない
+    - Dispatcher は pending 以外の非終端ステータスと同じく割り当て対象外
+    """
+    opts, positional = parse_opts(args, {'--mission': 'value'})
+    if len(positional) < 2:
+        die("needs-director requires <task_id> and <reason>\\n"
+            "Usage: plan.sh needs-director <task_id> \"<理由>\"")
+    task_id = positional[0]
+    reason = positional[1]
+
+    def _do():
+        state = load_state()
+        slug = opts.get('--mission')
+        if not slug:
+            matches = [s for s in (state.get('active_missions') or [])
+                       if os.path.exists(task_path(s, task_id))]
+            if not matches:
+                die(f"task '{task_id}' not found in any active mission.")
+            if len(matches) > 1:
+                die(f"task '{task_id}' exists in multiple missions: {matches}. Use --mission.")
+            slug = matches[0]
+
+        if not os.path.exists(task_path(slug, task_id)):
+            die(f"task '{task_id}' not found in mission '{slug}'.")
+
+        meta, body = load_task(slug, task_id)
+        cur_status = meta.get('status')
+        if cur_status not in ('in_progress',):
+            die(f"needs-director requires in_progress task (current: {cur_status})")
+
+        meta['status'] = 'needs_director'
+        meta['needs_director_reason'] = reason
+        save_task(slug, task_id, meta, body)
+        print(f"[plan.sh] Task {task_id} → needs_director")
+        print(f"[plan.sh] Reason: {reason}")
+        print(f"[plan.sh] Director への通知: plan.sh status で確認してください")
+
+    with_lock(_do)
+
+
 def cmd_done(args):
     opts, positional = parse_opts(args, {'--mission': 'value'})
     if len(positional) < 2:
@@ -1475,6 +1589,46 @@ def cmd_done(args):
         cur_status = meta.get('status')
         if cur_status in ('done', 'verified', 'failed', 'skipped'):
             die(f"task '{task_id}' is already {cur_status}.")
+        if cur_status == 'needs_director':
+            reason = meta.get('needs_director_reason', '')
+            die(
+                f"task '{task_id}' is in needs_director state (理由: {reason})\n"
+                f"Director が plan.sh update {task_id} --status in_progress --reset で"
+                f" 差し戻してから再度 plan.sh done を呼んでください。"
+            )
+
+        # ── QA Gate 検証 ──────────────────────────────────────────────────────
+        # qa_checkpoints が frontmatter にある → ## QA Gate セクション必須
+        # qa_checkpoints がない → 後方互換（スキップ）
+        qa_cp = meta.get('qa_checkpoints')
+        has_qa_checkpoints = bool(qa_cp)  # None / [] はいずれも False
+        qa_fails = _validate_qa_gate(result, has_qa_checkpoints)
+        if qa_fails:
+            reasons = '\n'.join(qa_fails)
+            die(
+                f"[plan.sh] QA gate FAIL — 以下のチェックポイントが not_run / failed または欠落しています:\n"
+                f"{reasons}\n\n"
+                f"plan.sh done をブロックします。\n"
+                f"対処方法:\n"
+                f"  1. チェックポイントを完遂して再度 plan.sh done を呼ぶ\n"
+                f"  2. 完遂できない場合は以下で差し戻す:\n"
+                f"     plan.sh needs-director {task_id} \"<理由>\""
+            )
+
+        # ── required_evidence 検証 ──────────────────────────────────────────
+        req_ev = meta.get('required_evidence')
+        if isinstance(req_ev, list) and req_ev:
+            ev_missing = _validate_required_evidence(result, req_ev)
+            if ev_missing:
+                missing_str = '\n'.join(ev_missing)
+                die(
+                    f"[plan.sh] required_evidence が result に見つかりません:\n"
+                    f"{missing_str}\n\n"
+                    f"plan.sh done をブロックします。\n"
+                    f"証拠を result に含めてから再度実行するか、\n"
+                    f"証拠が存在しない場合は以下で差し戻してください:\n"
+                    f"  plan.sh needs-director {task_id} \"<理由>\""
+                )
 
         meta['status'] = 'done'
         meta['completed_at'] = now_iso()
@@ -2459,6 +2613,7 @@ dispatch = {
     'add': cmd_add,
     'pull': cmd_pull,
     'done': cmd_done,
+    'needs-director': cmd_needs_director,
     'fail': cmd_fail,
     'update': cmd_update,
     'ready-for-verification': cmd_ready_for_verification,

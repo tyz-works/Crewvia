@@ -239,6 +239,47 @@ QA タスクの `--description` に以下を明示すること:
 
 worktree 内で「動作 pass」と判定しても、主 WT での回帰が発生する可能性を常に考慮すること。
 
+#### QA ゲート: `qa_checkpoints` と `required_evidence` フィールド
+
+機械的な PASS/FAIL 判定が必要なタスクには `qa_checkpoints` を宣言する。
+`plan.sh add` にはこれらを渡せないため、`plan.sh update` で追記するか、
+タスクファイルを直接編集する。
+
+**`qa_checkpoints`** — Worker が `## QA Gate` セクションに記録すべき検証項目を宣言:
+
+```yaml
+# queue/missions/<slug>/tasks/tNNN.md のフロントマターに直接追記
+qa_checkpoints:
+  - /proc/PID/environ による env-var 確認
+  - smoke-test: real binary 実行
+  - ログファイル出力確認（任意）
+```
+
+- このフィールドが **存在する** タスクでは、Worker の result に `## QA Gate` セクションが **必須**
+- セクションが欠落していると `plan.sh done` が FAIL を返し done 遷移をブロックする
+- フィールドが **存在しない** タスクは後方互換として従来通りスキップ
+
+**`required_evidence`** — result 文字列に含まれていなければ done を拒否する証拠パターン:
+
+```yaml
+required_evidence:
+  - ".jsonl"
+  - "stat "
+  - "/proc/"
+```
+
+- 部分文字列の存在チェック（正規表現不使用）
+- 証拠が提出できないケースは Director が **事前に `required_evidence: []`（空リスト）** で作成する
+  — Worker が実行時に自己申告で例外扱いにすることはできない
+- Worker が詰まった場合は `plan.sh needs-director` で差し戻すこと
+
+**`needs_director` ステータスの扱い**:
+
+- Worker が `plan.sh needs-director <task_id> "<理由>"` を呼ぶと、タスクは `needs_director` 状態になる
+- `plan.sh status` で 🆘 アイコンとともに表示される
+- Director は reason を読んで対処方針を決定し、`plan.sh update <task_id> --status in_progress --reset` で差し戻す
+- 後続タスクの `blocked_by` は **解除されない**（needs_director は TERMINAL_STATUSES に含まれない）
+
 ---
 
 ## 4. タスク依存関係の設計指針

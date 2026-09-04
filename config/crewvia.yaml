@@ -36,7 +36,7 @@ worker_model: claude-sonnet-4-6
 #
 # 環境変数での上書き: CREWVIA_MUX=tmux|herdr (最優先) / CREWVIA_TMUX=1 (tmux) / CREWVIA_TMUX=0 (inline)
 # CREWVIA_MUX が設定されていれば CREWVIA_TMUX より優先される。
-mode: tmux
+mode: herdr  # 戻す時は tmux。切替日: 2026-09-04
 
 # ===== mux 設定 =====
 mux:

@@ -27,7 +27,8 @@ WINDOW_NAME="plan-reviewer-$$"
 source "${SCRIPT_DIR}/lib_mux.sh"
 
 # unset CLAUDE_CODE_CHILD_SESSION: herdr server 由来の汚染変数が Plan Reviewer に伝播しないよう除去。
-INLINE_CMD="unset CLAUDE_CODE_CHILD_SESSION; cd '$CREWVIA_DIR' && CLAUDE_SKILL=plan_review claude --model claude-opus-4-5 \
+# CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1: 二重防御として transcript 保存を公式 env var で保証 (→ t004)。
+INLINE_CMD="unset CLAUDE_CODE_CHILD_SESSION; export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1; cd '$CREWVIA_DIR' && CLAUDE_SKILL=plan_review claude --model claude-opus-4-5 \
      -p 'Mission slug: $SLUG. agents/plan_reviewer.md の手順に従い queue/missions/$SLUG/ の全タスクを検査し、queue/missions/$SLUG/plan_review.md を出力せよ。' \
      2>&1 | tee /tmp/plan_reviewer_$$.log"
 
@@ -39,6 +40,8 @@ else
     cd "$CREWVIA_DIR"
     # herdr server 汚染の伝播を防ぐため claude 実行直前に除去する。
     unset CLAUDE_CODE_CHILD_SESSION
+    # 二重防御: transcript 保存を公式 env var で保証する。
+    export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1
     CLAUDE_SKILL=plan_review claude --model claude-opus-4-5 \
         -p "Mission slug: $SLUG. agents/plan_reviewer.md の手順に従い queue/missions/$SLUG/ の全タスクを検査し、queue/missions/$SLUG/plan_review.md を出力せよ。" \
         2>&1 | tee /tmp/plan_reviewer_$$.log

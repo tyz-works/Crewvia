@@ -92,3 +92,17 @@ jobs:
 
       - name: scripts/test_registry_lock.sh
         run: bash scripts/test_registry_lock.sh
+
+  bats:
+    name: Bats Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install bats-core
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y bats
+
+      - name: Run bats tests
+        run: bats tests/*.bats

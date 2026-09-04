@@ -744,6 +744,57 @@ print('herdr backend selected OK')
 }
 
 # ---------------------------------------------------------------------------
+# t009 regression: Enter insurance scrollback false-positive fix
+#
+# send() previously used `if text in screen` which searched the ENTIRE
+# pane output.  An already-executed command appearing in the scrollback
+# would always match, causing a spurious extra Enter on every call.
+# The fix (_text_in_input_line) looks only at the last 5 lines and
+# distinguishes the active input line from scrollback history.
+# ---------------------------------------------------------------------------
+
+@test "herdr send: Enter insurance does NOT fire when text is only in scrollback (t009 regression)" {
+    # Simulate: text was previously executed and appears in the scrollback,
+    # but the current input line (❯) is empty — text was submitted successfully.
+    setup_fake_herdr
+    # Multi-line screen: scrollback has "echo MUX_OK", current prompt is "❯ ".
+    printf "$ echo MUX_OK\nMUX_OK\n❯ " > "$FAKE_PANE_SCREEN"
+
+    python3 "$LIB_MUX_PY" send "Omar-worker" "echo MUX_OK" 2>/dev/null || true
+
+    # pane send-keys must NOT fire — text is in scrollback, not input line.
+    ! herdr_log_contains "pane send-keys"
+}
+
+@test "herdr send: Enter insurance fires exactly once when text is in ❯ input line (t009)" {
+    # Simulate: pane run ran but Enter was dropped — text remains in the ❯ line.
+    setup_fake_herdr
+    # Screen: scrollback has a previous run, AND current ❯ line still has text.
+    printf "echo MUX_OK\nMUX_OK\n❯ echo MUX_OK" > "$FAKE_PANE_SCREEN"
+
+    python3 "$LIB_MUX_PY" send "Omar-worker" "echo MUX_OK" 2>/dev/null || true
+
+    # pane send-keys enter must fire exactly once.
+    herdr_log_contains "pane send-keys"
+    herdr_log_contains "enter"
+    count="$(herdr_log_count "pane send-keys")"
+    [ "$count" -eq 1 ]
+}
+
+@test "herdr send: Enter insurance does NOT fire when text is in scrollback, no ❯ line (bash pane, t009)" {
+    # Simulate bash pane: scrollback shows a previous "cmd" execution, and the
+    # current prompt line is "$ " (empty input) — text already submitted.
+    setup_fake_herdr
+    # No ❯ in screen; last line is blank bash prompt.
+    printf "$ echo hello\nhello\n$ " > "$FAKE_PANE_SCREEN"
+
+    python3 "$LIB_MUX_PY" send "Omar-worker" "echo hello" 2>/dev/null || true
+
+    # send-keys must NOT fire — "echo hello" only in scrollback, not last line.
+    ! herdr_log_contains "pane send-keys"
+}
+
+# ---------------------------------------------------------------------------
 # list()
 # ---------------------------------------------------------------------------
 

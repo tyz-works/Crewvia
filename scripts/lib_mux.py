@@ -468,6 +468,43 @@ def _herdr_run_raw(cmd_key: str, extra_args: List[str], timeout: int = 10) -> Op
     return r.stdout
 
 
+def _text_in_input_line(screen: str, text: str) -> bool:
+    """Check if ``text`` appears in the active input line of the pane.
+
+    Examines only the **last 5 lines** of the screen to avoid matching text
+    that already appears in the scrollback (i.e. a previously executed command
+    whose output is still visible).
+
+    Detection order (TUI-first, falls back to plain bash):
+
+    1. **Claude TUI mode**: scan the last 5 lines for any line that starts
+       with ``❯``.  If found, return ``True`` only if ``text`` appears in
+       one of those lines.  (Claude TUI renders a status/hint line *below*
+       the ``❯`` prompt, so the absolute-last line is unreliable.)
+
+    2. **Plain bash / other**: if no ``❯`` line is found, check the last
+       non-empty line.  Return ``True`` if ``text`` appears in it.
+
+    Returns ``False`` when ``text`` or ``screen`` is empty, or when the text
+    is not found in the detected input line(s).  This prevents the scrollback
+    false-positive where an already-executed ``text`` command appears in the
+    history and would cause ``text in screen`` to be always ``True``.
+    """
+    if not screen or not text:
+        return False
+    # Examine only the tail to avoid scrollback matches.
+    tail = screen.splitlines()[-5:]
+    # Claude TUI: prompt lines start with ❯.
+    prompt_lines = [line for line in tail if line.startswith("❯")]
+    if prompt_lines:
+        return any(text in line for line in prompt_lines)
+    # Plain bash / other: check last non-empty line.
+    non_empty = [line for line in tail if line.strip()]
+    if non_empty:
+        return text in non_empty[-1]
+    return False
+
+
 def _herdr_ping() -> bool:
     """Send a NDJSON ping to herdr socket and return True on pong."""
     sock_path = str(_HERDR_SOCK_PATH)
@@ -771,9 +808,15 @@ class HerdrBackend(_Backend):
         Phase 0 confirmed: pane run submits reliably only after '❯' appears.
         Without '❯', the text is inserted but Enter is dropped.
 
-        Enter insurance: after pane run, capture() is called once.  If `text`
-        is still visible in the input line (meaning Enter was not submitted),
-        one `pane send-keys enter` is appended.
+        Enter insurance: after pane run, capture() is called once.
+        ``_text_in_input_line()`` checks **only the last 5 lines** of the
+        screen (not the entire scrollback) to decide whether ``text`` is still
+        sitting in the active input line.  Searching the full screen caused a
+        false-positive: a previously-executed command with the same text would
+        appear in the scrollback and always trigger a spurious extra Enter.
+
+        See ``_text_in_input_line()`` for the exact detection algorithm
+        (Claude TUI ``❯`` lines vs. plain bash last-line fallback).
         """
         ids = self._resolve_ids(name)
         if ids is None:
@@ -786,11 +829,11 @@ class HerdrBackend(_Backend):
             self._warn(f"send {name!r}: pane run failed")
             return False
 
-        # Enter insurance: check if text remains in the input line.
+        # Enter insurance: check only the input line, not the full scrollback.
         time.sleep(0.1)
         screen = self._capture_by_pane_id(pane_id)
-        if text in screen:
-            # Text is still in input — append Enter.
+        if _text_in_input_line(screen, text):
+            # Text still in input line — Enter was not submitted, append it.
             _herdr_run("pane_send_keys", [pane_id, "enter"], timeout=5)
 
         return True

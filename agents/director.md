@@ -1047,6 +1047,7 @@ Dispatcher からの通知を受け取った時だけ対応すればよい。
 | `要求スキル [...] の Worker を起動してください (task {id}, mission={slug})` | 該当スキルを持つ Worker が存在しない | 必要スキルで `bash scripts/start.sh worker <skill>` を実行 |
 | `全ミッション完了` | 全 active mission が done 状態になった | `plan.sh archive <slug>` で退避 → ユーザーへ完了報告 |
 | `タスク {id} (mission={slug}) が failed になりました。handoff_path: {path} — ...。plan.sh add で継続タスクを追加してください。` | Worker が graceful handoff でタスクを中断した | 以下の Handoff 再計画フローを実行 |
+| `[Rule 5] Worker {name} が blocked / idle-with-task です (task {id}, mission={slug}, {n}秒継続)。画面末尾: ...` | herdr モードで Worker が承認待ち・質問待ち・停止状態 | 画面末尾を読み (1) 質問なら `python3 scripts/lib_mux.py send {name}-worker "<回答>"` (2) 承認ダイアログならユーザーへエスカレーション (3) 回復不能なら kill + `plan.sh update --reset` |
 
 ### Handoff 再計画フロー
 
@@ -1165,6 +1166,26 @@ Dispatcher は Worker のスキルに合う全 pending タスクが **600 秒以
 - しきい値: `BLOCKED_STUCK_THRESHOLD = 600` 秒（変更は dispatcher.sh 定数）
 - 判定頻度: 5 秒ごとの通常ポーリングに統合
 - 通知重複抑制: 同一 Worker への再通知は `NOTIFY_TTL` 秒後まで抑制
+
+### Dispatcher の herdr agent state 検知（Rule 5）
+
+herdr モードでのみ動作。Worker の `agent_status` を毎ポーリングで取得し、以下のいずれかが **grace 秒 (デフォルト 60 秒、config `mux.state_grace_seconds`、env `CREWVIA_STATE_GRACE` で変更可)** 連続して成立したら Director に通知する。
+
+| 条件名 | 条件 | 意味 |
+|---|---|---|
+| **A: blocked** | `agent_status == blocked` | 承認ダイアログ等で止まっている |
+| **B: idle-with-task** | `agent_status ∈ {idle, done}` かつ `queue/assignments/<name>` が存在 | task を持ったまま手が止まっている（質問待ち / hang 後の停止） |
+
+**Director の対応** (`[Rule 5]` 通知受信時):
+1. 通知に含まれる「画面末尾」で状況を判断する
+2. テキストで質問待ち → `python3 scripts/lib_mux.py send {name}-worker "<回答>"`
+3. 承認ダイアログ (`Enter to confirm · Esc to cancel`) → ユーザーへエスカレーション
+4. 回復不能な停止 → `python3 scripts/lib_mux.py kill {name}-worker` + `plan.sh update --reset`
+
+**注意事項**:
+- **自動対処はしない** — 通知を見て Director が判断する（誤判定リスクを避けるため）
+- **tmux モードでは発火しない** — `state()` が常に `unknown` を返すため、本番が tmux のままでも無害
+- Rule 2 (idle Worker の blocked-stuck) とは独立 — Rule 5 B は「task を持っているのに止まっている」を検知する
 
 ### Rule 1: shutdown 通知受信時の Worker 側義務（確認用）
 

@@ -38,6 +38,16 @@ worker_model: claude-sonnet-4-6
 # CREWVIA_MUX が設定されていれば CREWVIA_TMUX より優先される。
 mode: tmux
 
+# ===== mux 設定 =====
+mux:
+  # Rule 5 (herdr モードのみ): Worker の agent_status が blocked または
+  # idle-with-task (idle/done かつ assignment ファイルあり) の状態が
+  # この秒数連続して続いたとき、Director に通知する。
+  # tmux モードでは agent_status が取得できないため、この設定は使用されない。
+  #
+  # 環境変数での上書き: CREWVIA_STATE_GRACE=<秒数>
+  state_grace_seconds: 60
+
 # ===== Taskvia 連携 =====
 # Taskvia 承認フローの使用モードを指定します。
 #

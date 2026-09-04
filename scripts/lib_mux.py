@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Mux backend abstraction — spawn / send / capture / list / kill / pid / attach / state.
+"""Mux backend abstraction — spawn / send / capture / list / kill / pid / attach / attach_cmd / state.
 
 Backends:
   TmuxBackend  — wraps current tmux CLI calls verbatim (Phase 1)
@@ -20,6 +20,7 @@ Usage as module:
   m.kill("Omar-worker")
   pid = m.pid("Omar-worker")
   m.attach("Sora-director")
+  cmd = m.attach_cmd("Sora-director")  # list[str] | None
   ok = m.available()
   st = m.state("Omar-worker")  # "blocked"|"working"|"idle"|"done"|"unknown"
 
@@ -32,6 +33,7 @@ CLI usage (for bash callers):
   python3 lib_mux.py kill <name>
   python3 lib_mux.py pid  <name>          # prints integer PID
   python3 lib_mux.py attach <name>
+  python3 lib_mux.py attach-cmd <name>    # prints argv one arg per line, empty = use attach()
   python3 lib_mux.py state <name>         # prints agent state string
 """
 
@@ -139,6 +141,9 @@ class _Backend:
         raise NotImplementedError
 
     def attach(self, name: str) -> bool:
+        raise NotImplementedError
+
+    def attach_cmd(self, name: str) -> Optional[List[str]]:
         raise NotImplementedError
 
     def available(self) -> bool:
@@ -343,10 +348,12 @@ class TmuxBackend(_Backend):
             return None
 
     def attach(self, name: str) -> bool:
-        """Attach to the session.
+        """Attach to the session (called when already inside tmux).
 
-        If $TMUX is set (already inside tmux), use switch-client.
-        Otherwise use attach-session.
+        If $TMUX is set (already inside tmux), use switch-client to bring the
+        session into view.  When $TMUX is not set, the caller should have used
+        attach_cmd() + exec instead — this path returns False.
+
         Returns True on success, False on error.
         """
         session = _session()
@@ -356,15 +363,23 @@ class TmuxBackend(_Backend):
                     ["tmux", "switch-client", "-t", session],
                     capture_output=True, timeout=5,
                 )
-            else:
-                r = subprocess.run(
-                    ["tmux", "attach-session", "-t", self._target(name)],
-                    timeout=60,
-                )
-            return r.returncode == 0
+                return r.returncode == 0
+            # Not inside tmux — attach_cmd() + exec should have been used.
+            return False
         except Exception as e:
             self._warn(f"attach {name!r} failed: {e}")
             return False
+
+    def attach_cmd(self, name: str) -> Optional[List[str]]:
+        """Return the argv to exec in order to attach from outside the session.
+
+        - Inside tmux ($TMUX set): return None → caller uses attach() (switch-client).
+        - Outside tmux: return ['tmux', 'attach-session', '-t', '<session>:<name>']
+          so the bash caller can exec it, giving the TTY to tmux.
+        """
+        if os.environ.get("TMUX"):
+            return None
+        return ["tmux", "attach-session", "-t", self._target(name)]
 
     def state(self, name: str) -> str:
         """Return agent state — always 'unknown' for tmux (state not available)."""
@@ -925,11 +940,13 @@ class HerdrBackend(_Backend):
             return None
 
     def attach(self, name: str) -> bool:
-        """Attach / focus the named pane's tab.
+        """Attach / focus the named pane's tab (called when already inside herdr).
 
-        If HERDR_ENV=1 (already inside herdr), use tab focus.
-        Otherwise, herdr does not support nested attach: print a hint to stderr
-        and return False (start.sh continues regardless of return value).
+        If HERDR_ENV=1 (already inside herdr), use tab focus to bring the pane
+        into view.  When HERDR_ENV is not set, the caller should have used
+        attach_cmd() + exec instead — this path returns False.
+
+        Returns True on success, False on error.
         """
         if os.environ.get("HERDR_ENV") == "1":
             ids = self._resolve_ids(name)
@@ -941,12 +958,25 @@ class HerdrBackend(_Backend):
                 return False
             data = _herdr_run("tab_focus", [tab_id], timeout=5)
             return data is not None
-        else:
-            print(
-                f"[mux:herdr] herdr を実行すると {name!r} の画面に入れます。",
-                file=sys.stderr,
-            )
-            return False
+        # Not inside herdr — attach_cmd() + exec should have been used.
+        return False
+
+    def attach_cmd(self, name: str) -> Optional[List[str]]:
+        """Return the argv to exec in order to enter herdr from outside.
+
+        - Inside herdr (HERDR_ENV=1): return None → caller uses attach() (tab focus).
+        - Outside herdr: pre-focus the target tab so the user lands on it when
+          herdr opens, then return ['herdr'] so the bash caller can exec it.
+        """
+        if os.environ.get("HERDR_ENV") == "1":
+            return None
+        # Focus the target tab before returning — so exec 'herdr' lands on it.
+        ids = self._resolve_ids(name)
+        if ids:
+            tab_id = ids.get("tab_id")
+            if tab_id:
+                _herdr_run("tab_focus", [tab_id], timeout=5)
+        return ["herdr"]
 
     def state(self, name: str) -> str:
         """Return the agent state for the named pane.
@@ -1021,6 +1051,9 @@ class Mux:
     def attach(self, name: str) -> bool:
         return self._backend.attach(name)
 
+    def attach_cmd(self, name: str) -> Optional[List[str]]:
+        return self._backend.attach_cmd(name)
+
     def state(self, name: str) -> str:
         return self._backend.state(name)
 
@@ -1092,6 +1125,18 @@ def _cli_main(args: List[str]) -> int:
             print("Usage: lib_mux.py attach <name>", file=sys.stderr)
             return 2
         return 0 if m.attach(rest[0]) else 1
+
+    elif verb == "attach-cmd":
+        if not rest:
+            print("Usage: lib_mux.py attach-cmd <name>", file=sys.stderr)
+            return 2
+        cmd = m.attach_cmd(rest[0])
+        if cmd is not None:
+            # Print one argument per line so bash callers can reconstruct the argv.
+            for arg in cmd:
+                print(arg)
+        # Always exit 0 — empty output means "use attach() instead".
+        return 0
 
     elif verb == "state":
         if not rest:

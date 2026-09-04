@@ -12,7 +12,7 @@
 #   mux_list [<suffix>]         → one name per line
 #   mux_kill <name>
 #   mux_pid  <name>             → prints PID integer
-#   mux_attach <name>
+#   mux_attach <name>           → exec into the mux if outside; tab/switch if already inside
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 _LIB_MUX_PY="${SCRIPT_DIR}/lib_mux.py"
@@ -46,5 +46,21 @@ mux_pid() {
 }
 
 mux_attach() {
-    python3 "$_LIB_MUX_PY" attach "$@"
+    local name="${1:-}"
+    # Query attach-cmd: non-empty output = argv to exec (one arg per line).
+    # Empty output = already inside the mux session → use python attach().
+    #
+    # NOTE: start.sh calls mux_attach at the very end of the director branch,
+    # so exec here is safe — no clean-up code follows this call.
+    local cmd_output
+    cmd_output=$(python3 "$_LIB_MUX_PY" attach-cmd "$name" 2>/dev/null)
+    if [[ -n "$cmd_output" ]]; then
+        # Reconstruct argv from one-arg-per-line output and exec into the mux.
+        # exec gives the TTY to the mux process (tmux attach-session / herdr).
+        local -a argv
+        mapfile -t argv <<< "$cmd_output"
+        exec "${argv[@]}"
+    fi
+    # Already inside the mux — use python attach (switch-client / tab focus).
+    python3 "$_LIB_MUX_PY" attach "$name"
 }

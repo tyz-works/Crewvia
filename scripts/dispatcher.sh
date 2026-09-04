@@ -444,12 +444,18 @@ def _director_name():
 
 
 def tmux_send(target, message):
-    """Send a message to a mux window (Enter-terminated, 2-step for Claude TUI)."""
+    """Send a message to a mux window (Enter-terminated, 2-step for Claude TUI).
+
+    Returns True on success, False on failure.  Callers must check the return
+    value before calling record_notify() — recording a failed send as
+    'delivered' would suppress retries for NOTIFY_TTL seconds.
+    """
     ok = _mux.send(target, message)
     if ok:
         log(f"→ [{target}] {message[:120]}")
     else:
         log(f"WARNING: mux send to {target!r} failed")
+    return ok
 
 
 def tmux_kill_window(target):
@@ -742,11 +748,13 @@ def check_rule5(name: str, target: str, assignment_file: Path) -> None:
     )
 
     if director_live:
-        tmux_send(director, msg)
+        sent = tmux_send(director, msg)
     else:
         log(f'WARNING: Rule 5 — Director 不在のため通知スキップ: {msg[:200]}')
+        sent = False
 
-    record_notify(notify_key)
+    if sent:
+        record_notify(notify_key)
 
 
 def shutdown_idle_workers():
@@ -760,8 +768,8 @@ def shutdown_idle_workers():
         if is_idle:
             notify_key = f"shutdown_{agent_name}"
             if should_notify(notify_key):
-                tmux_send(target, 'タスクなし、shutdown')
-                record_notify(notify_key)
+                if tmux_send(target, 'タスクなし、shutdown'):
+                    record_notify(notify_key)
                 time.sleep(1)
                 tmux_kill_window(target)
 
@@ -823,8 +831,16 @@ def dispatch():
                       if dep not in done_ids
                       and task_statuses.get(dep) not in ('failed', 'cancelled')]
         if unmet_deps:
-            log(f"[blocked] task {meta.get('id')} (mission={slug}) — unmet deps: "
-                f"{unmet_deps} (statuses: {[task_statuses.get(d) for d in unmet_deps]})")
+            # Suppress repeated output of the same blocked state to avoid
+            # flooding the scrollback (same line every 5s → 40-line buffer fills
+            # up with identical rows, hiding diagnostic send logs).
+            # Log once on first detection, then at most once per NOTIFY_TTL
+            # (default 300s) as a heartbeat so the state remains visible.
+            _bkey = f"blocked_log_{slug}_{meta.get('id')}"
+            if should_notify(_bkey):
+                log(f"[blocked] task {meta.get('id')} (mission={slug}) — unmet deps: "
+                    f"{unmet_deps} (statuses: {[task_statuses.get(d) for d in unmet_deps]})")
+                record_notify(_bkey)
             continue
         task_skills = set(meta.get('skills') or [])
         if not task_skills:
@@ -899,15 +915,17 @@ def dispatch():
         if best:
             slug, meta = best
             task_id = meta['id']
-            notify_key = f"assign_{agent_name}_{task_id}"
+            # Include slug so task IDs that restart per-mission don't collide
+            # (e.g. assign_Haruto_20260905-mission-a_t001 vs _20260905-mission-b_t001)
+            notify_key = f"assign_{agent_name}_{slug}_{task_id}"
             if should_notify(notify_key):
                 msg = (
                     f"タスク {task_id} (mission={slug}) を実行して。"
                     f"plan.sh pull --task {task_id} --mission {slug} で取得後、"
                     f"作業→plan.sh done で完了。"
                 )
-                tmux_send(target, msg)
-                record_notify(notify_key)
+                if tmux_send(target, msg):
+                    record_notify(notify_key)
                 assigned_task_ids.add(task_id)
         else:
             # No unblocked pending task for this worker.
@@ -931,8 +949,8 @@ def dispatch():
             if not has_any and not has_in_progress:
                 notify_key = f"shutdown_{agent_name}"
                 if should_notify(notify_key):
-                    tmux_send(target, 'タスクなし、shutdown')
-                    record_notify(notify_key)
+                    if tmux_send(target, 'タスクなし、shutdown'):
+                        record_notify(notify_key)
                     time.sleep(1)  # allow the message to land before killing
                     tmux_kill_window(target)
             elif has_any and not has_in_progress:
@@ -957,8 +975,8 @@ def dispatch():
                             f"{stuck_secs:.0f}s ≥ {BLOCKED_STUCK_THRESHOLD}s "
                             f"— sending shutdown (blocked-stuck)"
                         )
-                        tmux_send(target, 'タスクなし、shutdown')
-                        record_notify(notify_key)
+                        if tmux_send(target, 'タスクなし、shutdown'):
+                            record_notify(notify_key)
                         time.sleep(1)
                         tmux_kill_window(target)
 
@@ -975,14 +993,15 @@ def dispatch():
             for w in windows
         )
         if not can_handle:
-            notify_key = f"no_worker_{task_id}"
+            # Include slug to avoid collision when missions reuse t001, t002, etc.
+            notify_key = f"no_worker_{slug}_{task_id}"
             if should_notify(notify_key):
                 msg = (
                     f"要求スキル {sorted(task_skills)} の Worker を起動してください "
                     f"(task {task_id}, mission={slug})"
                 )
-                tmux_send(_director_name(), msg)
-                record_notify(notify_key)
+                if tmux_send(_director_name(), msg):
+                    record_notify(notify_key)
 
 
     # Handoff detection: failed tasks with handoff_path → notify Director
@@ -1021,9 +1040,11 @@ def dispatch():
                     f"handoff_path: {handoff_path} — {handoff_summary[:200]}。"
                     f"plan.sh add で継続タスクを追加してください。"
                 )
-                tmux_send(_director_name(), msg)
-                record_notify(notify_key)
-                log(f"handoff detected: {slug}/{task_id} -> notified director")
+                if tmux_send(_director_name(), msg):
+                    record_notify(notify_key)
+                    log(f"handoff detected: {slug}/{task_id} -> notified director")
+                else:
+                    log(f"handoff detected but mux send failed: {slug}/{task_id} (will retry)")
 
 
 publish_agents()

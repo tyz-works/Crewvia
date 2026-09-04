@@ -1826,6 +1826,7 @@ def _print_mission_summary(slug, archived=False):
     total = len(tasks)
     done = sum(1 for (m, _) in tasks if m.get('status') == 'done')
     in_prog = [(m, b) for (m, b) in tasks if m.get('status') == 'in_progress']
+    needs_dir = [(m, b) for (m, b) in tasks if m.get('status') == 'needs_director']
 
     title = mission.get('title', '(unnamed)')
     status = mission.get('status', 'in_progress')
@@ -1835,6 +1836,11 @@ def _print_mission_summary(slug, archived=False):
     for (m, _) in in_prog:
         worker = m.get('worker') or '?'
         print(f"    🔄 {m['id']} {m['title']} ({worker})")
+    for (m, _) in needs_dir:
+        worker = m.get('worker') or '?'
+        reason = m.get('needs_director_reason', '')
+        reason_str = f" — {reason}" if reason else ''
+        print(f"    🆘 {m['id']} {m['title']} ({worker}){reason_str}")
 
 
 def _print_mission_detail(slug):

@@ -42,8 +42,8 @@ LOG_FILE="${REGISTRY_DIR}/dispatcher.log"
 NOTIFY_CACHE="/tmp/dispatcher-notify-cache.json"
 NOTIFY_TTL=300  # seconds before repeating the same notification (5 min)
 
-# Standalone-safe: silently exit when tmux is not installed
-if ! command -v tmux &>/dev/null; then
+# Standalone-safe: silently exit when no mux backend (tmux / herdr) is available
+if ! python3 "${SCRIPT_DIR}/lib_mux.py" available >/dev/null 2>&1; then
   exit 0
 fi
 
@@ -78,6 +78,12 @@ QUEUE_DIR      = Path(sys.argv[1])
 REGISTRY_DIR   = Path(sys.argv[2])
 NOTIFY_CACHE   = Path(sys.argv[3])
 NOTIFY_TTL     = int(sys.argv[4])
+
+# Import lib_mux from scripts/ (same dir as this script via REGISTRY_DIR.parent)
+_SCRIPTS_DIR = REGISTRY_DIR.parent / 'scripts'
+sys.path.insert(0, str(_SCRIPTS_DIR))
+from lib_mux import Mux  # noqa: E402
+_mux = Mux()
 
 MISSIONS_DIR   = QUEUE_DIR / 'missions'
 ARCHIVE_DIR    = QUEUE_DIR / 'archive'
@@ -394,62 +400,44 @@ def record_notify(key):
 
 
 # ---------------------------------------------------------------------------
-# tmux helpers
+# mux helpers (delegated to lib_mux.Mux via _mux instance)
 # ---------------------------------------------------------------------------
 
 def tmux_list_worker_windows():
-    """Return list of {'window_target': str, 'agent_name': str} for crewvia:*-worker windows."""
-    try:
-        r = subprocess.run(
-            ['tmux', 'list-windows', '-t', 'crewvia', '-F', '#{window_name}'],
-            capture_output=True, text=True, timeout=5,
-        )
-        if r.returncode != 0:
-            return []
-        windows = []
-        for line in r.stdout.splitlines():
-            name = line.strip()
-            if name.endswith('-worker'):
-                agent_name = name[:-len('-worker')]
-                windows.append({'window_target': f'crewvia:{name}', 'agent_name': agent_name})
-        return windows
-    except Exception as e:
-        log(f"WARNING: tmux list-windows failed: {e}")
-        return []
+    """Return list of {'window_target': str, 'agent_name': str} for *-worker windows.
+
+    window_target is the bare window name (no session prefix) — _mux.send/kill
+    accept names, not 'session:name' targets.
+    """
+    names = _mux.list(suffix='-worker')
+    return [
+        {'window_target': name, 'agent_name': name[:-len('-worker')]}
+        for name in names
+    ]
+
+
+def _director_name():
+    """Return the name of the live Director window, falling back to 'Sora-director'."""
+    names = _mux.list(suffix='-director')
+    return names[0] if names else 'Sora-director'
 
 
 def tmux_send(target, message):
-    """Send a message to a tmux window (Enter-terminated).
-
-    Split into two send-keys invocations: Claude TUI's bracketed paste
-    swallows Enter when message+Enter arrive in one burst, so Enter must
-    be delivered as a separate key event after the paste closes.
-    """
-    try:
-        subprocess.run(
-            ['tmux', 'send-keys', '-t', target, message],
-            capture_output=True, timeout=5,
-        )
-        time.sleep(0.1)
-        subprocess.run(
-            ['tmux', 'send-keys', '-t', target, 'Enter'],
-            capture_output=True, timeout=5,
-        )
+    """Send a message to a mux window (Enter-terminated, 2-step for Claude TUI)."""
+    ok = _mux.send(target, message)
+    if ok:
         log(f"→ [{target}] {message[:120]}")
-    except Exception as e:
-        log(f"WARNING: tmux send-keys to {target} failed: {e}")
+    else:
+        log(f"WARNING: mux send to {target!r} failed")
 
 
 def tmux_kill_window(target):
-    """Kill a tmux window."""
-    try:
-        subprocess.run(
-            ['tmux', 'kill-window', '-t', target],
-            capture_output=True, timeout=5,
-        )
+    """Kill a mux window."""
+    ok = _mux.kill(target)
+    if ok:
         log(f"killed window: {target}")
-    except Exception as e:
-        log(f"WARNING: tmux kill-window {target} failed: {e}")
+    else:
+        log(f"WARNING: mux kill {target!r} failed")
 
 
 # ---------------------------------------------------------------------------
@@ -660,7 +648,7 @@ def dispatch():
         # Bug2 fix: notify only on False→True transition, not every cycle
         prev_all_done = was_all_done_last_cycle()
         if not prev_all_done:
-            tmux_send('crewvia:Sora-director', '全ミッション完了')
+            tmux_send(_director_name(), '全ミッション完了')
             log("→ all missions done — notified director (one-shot)")
 
         set_all_done_state(True)
@@ -840,7 +828,7 @@ def dispatch():
                     f"要求スキル {sorted(task_skills)} の Worker を起動してください "
                     f"(task {task_id}, mission={slug})"
                 )
-                tmux_send('crewvia:Sora-director', msg)
+                tmux_send(_director_name(), msg)
                 record_notify(notify_key)
 
 
@@ -880,7 +868,7 @@ def dispatch():
                     f"handoff_path: {handoff_path} — {handoff_summary[:200]}。"
                     f"plan.sh add で継続タスクを追加してください。"
                 )
-                tmux_send('crewvia:Sora-director', msg)
+                tmux_send(_director_name(), msg)
                 record_notify(notify_key)
                 log(f"handoff detected: {slug}/{task_id} -> notified director")
 

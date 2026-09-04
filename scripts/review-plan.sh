@@ -20,14 +20,20 @@ if [[ ! -d "$MISSION_DIR" ]]; then
     exit 1
 fi
 
-SESSION="${TMUX_SESSION:-crewvia}"
 WINDOW_NAME="plan-reviewer-$$"
 
-tmux new-window -t "$SESSION" -n "$WINDOW_NAME" \
-    "cd '$CREWVIA_DIR' && CLAUDE_SKILL=plan_review claude --model claude-opus-4-5 \
+# Use lib_mux.sh for mux-backend-agnostic window management.
+# shellcheck source=lib_mux.sh
+source "${SCRIPT_DIR}/lib_mux.sh"
+
+INLINE_CMD="cd '$CREWVIA_DIR' && CLAUDE_SKILL=plan_review claude --model claude-opus-4-5 \
      -p 'Mission slug: $SLUG. agents/plan_reviewer.md の手順に従い queue/missions/$SLUG/ の全タスクを検査し、queue/missions/$SLUG/plan_review.md を出力せよ。' \
-     2>&1 | tee /tmp/plan_reviewer_$$.log; tmux kill-window" 2>/dev/null || {
-    echo "[review-plan.sh] WARNING: tmux session '$SESSION' not found — running Plan Reviewer inline" >&2
+     2>&1 | tee /tmp/plan_reviewer_$$.log"
+
+if mux_available && mux_spawn "$WINDOW_NAME" "$INLINE_CMD" "$CREWVIA_DIR"; then
+    : # launched in mux window
+else
+    echo "[review-plan.sh] WARNING: mux unavailable or spawn failed — running Plan Reviewer inline" >&2
     cd "$CREWVIA_DIR"
     CLAUDE_SKILL=plan_review claude --model claude-opus-4-5 \
         -p "Mission slug: $SLUG. agents/plan_reviewer.md の手順に従い queue/missions/$SLUG/ の全タスクを検査し、queue/missions/$SLUG/plan_review.md を出力せよ。" \
@@ -36,7 +42,7 @@ tmux new-window -t "$SESSION" -n "$WINDOW_NAME" \
         echo "[review-plan.sh] ERROR: Plan Reviewer exited with non-zero status" >&2
         exit 1
     fi
-}
+fi
 
 # Wait up to 600s for plan_review.md with verdict validation
 echo "[review-plan.sh] Waiting for plan_review.md with valid verdict (max 600s)..."

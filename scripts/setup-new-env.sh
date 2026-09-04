@@ -65,7 +65,7 @@ echo
 # ---- 3. 前提ツールのチェック ----
 echo "== 前提ツールチェック =="
 missing=()
-for tool in bash git curl jq python3 tmux gh claude; do
+for tool in bash git curl jq python3 gh claude; do
   if command -v "$tool" >/dev/null 2>&1; then
     printf "  [ok]   %-10s %s\n" "$tool" "$(command -v "$tool")"
   else
@@ -73,6 +73,15 @@ for tool in bash git curl jq python3 tmux gh claude; do
     missing+=("$tool")
   fi
 done
+# mux: tmux か herdr のどちらか一方あれば OK (Phase 2 で herdr が正式サポートされる)
+if command -v tmux >/dev/null 2>&1; then
+  printf "  [ok]   %-10s %s (mux backend)\n" "tmux" "$(command -v tmux)"
+elif command -v herdr >/dev/null 2>&1; then
+  printf "  [ok]   %-10s %s (mux backend)\n" "herdr" "$(command -v herdr)"
+else
+  printf "  [MISS] %-10s (tmux または herdr が必要)\n" "tmux/herdr"
+  missing+=("tmux")
+fi
 # dashboard を使うなら追加
 for tool in fzf gum yq; do
   if command -v "$tool" >/dev/null 2>&1; then
@@ -119,7 +128,7 @@ if [ ${#missing[@]} -gt 0 ]; then
   echo "[要インストール] ${missing[*]}"
   echo
   echo "Ubuntu/Debian の例:"
-  echo "  sudo apt install -y jq tmux curl python3"
+  echo "  sudo apt install -y jq tmux curl python3   # tmux の代わりに herdr も可"
   echo "  # gh: https://github.com/cli/cli/blob/trunk/docs/install_linux.md"
   echo "  # claude: https://docs.claude.com/claude-code"
   exit 1

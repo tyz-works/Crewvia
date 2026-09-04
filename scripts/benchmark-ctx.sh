@@ -28,6 +28,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+# Load mux abstraction layer (backend selected via CREWVIA_MUX or config/crewvia.yaml).
+# shellcheck source=lib_mux.sh
+source "${SCRIPT_DIR}/lib_mux.sh"
+
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 FIXTURE_DIR="$REPO_ROOT/bench/fixture"
@@ -186,14 +190,14 @@ _launch_worker_window() {
     local agent="$1" target_dir="$2"
     local window="${TMUX_SESSION}:${agent}-worker"
 
-    if ! command -v tmux >/dev/null 2>&1; then
-        die "tmux is required for benchmark execution"
+    if ! mux_available; then
+        die "mux backend (tmux / herdr) is required for benchmark execution"
     fi
 
-    tmux has-session -t "$TMUX_SESSION" 2>/dev/null || \
-        tmux new-session -d -s "$TMUX_SESSION" -n "_placeholder"
+    # Ensure the session/workspace exists by spawning a placeholder window if needed.
+    mux_spawn "_placeholder-$$" "true" "$REPO_ROOT" >/dev/null 2>&1 || true
 
-    tmux kill-window -t "$window" 2>/dev/null || true
+    mux_kill "${agent}-worker" 2>/dev/null || true
     sleep 1
 
     # Write a minimal settings.json for the bench Worker.
@@ -279,7 +283,7 @@ _send_task_kickoff() {
     local task_id="$1" mission="$2"
     # Use $CREWVIA_REPO absolute path — Worker CWD is bench/fixture, not crewvia root
     local msg="タスク ${task_id} (mission=${mission}) を実行して。\$CREWVIA_REPO/scripts/plan.sh pull --task ${task_id} --mission ${mission} で取得後、作業→\$CREWVIA_REPO/scripts/plan.sh done で完了。"
-    tmux send-keys -t "$TMUX_TARGET" "$msg" Enter
+    mux_send "$WORKER_WINDOW" "$msg"
     log "Kickoff sent: $task_id"
 }
 
@@ -293,7 +297,7 @@ _apply_strategy() {
         B)
             log "Strategy B: sending /clear to Worker..."
             touch "$GATE_FILE"
-            tmux send-keys -t "$TMUX_TARGET" "/clear" Enter
+            mux_send "$WORKER_WINDOW" "/clear"
             sleep 3
             rm -f "$GATE_FILE"
             log "Strategy B: context cleared, gate released"
@@ -306,7 +310,7 @@ _apply_strategy() {
             local before_restart
             before_restart=$(jsonl_snapshot)
 
-            tmux kill-window -t "$TMUX_TARGET" 2>/dev/null || true
+            mux_kill "$WORKER_WINDOW" 2>/dev/null || true
             sleep 2
 
             _launch_worker_window "$WORKER_NAME" "$FIXTURE_DIR"

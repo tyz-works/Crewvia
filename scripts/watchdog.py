@@ -32,6 +32,12 @@ import urllib.error
 from pathlib import Path
 from typing import Literal, Optional
 
+# Import lib_mux — assumes watchdog.py lives in scripts/ alongside lib_mux.py
+_SCRIPTS_DIR = Path(__file__).parent
+sys.path.insert(0, str(_SCRIPTS_DIR))
+from lib_mux import Mux  # noqa: E402
+_mux = Mux()
+
 __version__ = "2.0.0"
 
 # ---------------------------------------------------------------------------
@@ -255,38 +261,29 @@ class WorkerMonitor:
             "cleared_since_notification": cleared_since_notification,
         }
 
-    def _tmux_window_target(self) -> Optional[str]:
-        """Return tmux window target for this agent, or None if not found."""
-        try:
-            r = subprocess.run(
-                ["tmux", "list-windows", "-t", "crewvia", "-F", "#{window_name}"],
-                capture_output=True, text=True, timeout=5,
-            )
-            if r.returncode != 0:
-                return None
-            for line in r.stdout.splitlines():
-                name = line.strip()
-                if name == f"{self.agent_name}-worker" or name == self.agent_name:
-                    return f"crewvia:{name}"
-        except Exception:
-            pass
+    def _mux_window_name(self) -> Optional[str]:
+        """Return the mux window name for this agent, or None if not found."""
+        # Try '<agent>-worker' first, then bare agent name.
+        for candidate in (f"{self.agent_name}-worker", self.agent_name):
+            if candidate in _mux.list():
+                return candidate
         return None
 
+    # Keep old name as alias so graceful_terminate (which calls it) still works.
+    def _tmux_window_target(self) -> Optional[str]:
+        return self._mux_window_name()
+
     def _has_child_processes(self) -> bool:
-        """Return True if the tmux pane has live child processes (Claude is active)."""
-        target = self._tmux_window_target()
-        if not target:
+        """Return True if the mux pane has live child processes (Claude is active)."""
+        name = self._mux_window_name()
+        if not name:
+            return False
+        pane_pid = _mux.pid(name)
+        if pane_pid is None:
             return False
         try:
-            r = subprocess.run(
-                ["tmux", "display-message", "-p", "-t", target, "#{pane_pid}"],
-                capture_output=True, text=True, timeout=5,
-            )
-            if r.returncode != 0 or not r.stdout.strip():
-                return False
-            pane_pid = r.stdout.strip()
-            r2 = subprocess.run(["pgrep", "-P", pane_pid], capture_output=True, timeout=5)
-            return r2.returncode == 0
+            r = subprocess.run(["pgrep", "-P", str(pane_pid)], capture_output=True, timeout=5)
+            return r.returncode == 0
         except Exception:
             return False
 
@@ -335,52 +332,43 @@ class WorkerMonitor:
 # ---------------------------------------------------------------------------
 
 def graceful_terminate(monitor: WorkerMonitor) -> None:
-    """Send a shutdown message via tmux, wait, then SIGTERM → SIGKILL."""
-    target = monitor._tmux_window_target()
-    if not target:
+    """Send a shutdown message via mux, wait, then SIGTERM → SIGKILL."""
+    name = monitor._mux_window_name()
+    if not name:
         _log(f"[kill] {monitor.agent_name}/{monitor.task_id}: window already gone")
         return
 
     msg = "タイムアウトのため中断します。現在の状況を 1-2 行で記載して終了してください。"
-    try:
-        subprocess.run(["tmux", "send-keys", "-t", target, msg],
-                       capture_output=True, timeout=5)
-        time.sleep(0.1)
-        subprocess.run(["tmux", "send-keys", "-t", target, "Enter"],
-                       capture_output=True, timeout=5)
+    ok = _mux.send(name, msg)
+    if ok:
         _log(f"[terminate] {monitor.agent_name}/{monitor.task_id}: sent shutdown message, "
              f"waiting {TERMINATE_GRACE_PERIOD}s for graceful exit")
-    except Exception as e:
-        _log(f"[terminate] WARNING: tmux send failed for {target}: {e}")
+    else:
+        _log(f"[terminate] WARNING: mux send failed for {name!r}")
 
     # Wait grace period, checking if Worker exits on its own
     for _ in range(TERMINATE_GRACE_PERIOD):
         time.sleep(1)
-        if monitor._tmux_window_target() is None:
+        if monitor._mux_window_name() is None:
             _log(f"[terminate] {monitor.agent_name}/{monitor.task_id}: Worker exited gracefully")
             return
 
     # SIGTERM → wait → SIGKILL
-    try:
-        r = subprocess.run(
-            ["tmux", "display-message", "-p", "-t", target, "#{pane_pid}"],
-            capture_output=True, text=True, timeout=5,
-        )
-        if r.returncode == 0 and r.stdout.strip():
-            pane_pid = int(r.stdout.strip())
-            _log(f"[terminate] SIGTERM → pid {pane_pid}")
-            try:
-                os.kill(pane_pid, signal.SIGTERM)
-            except ProcessLookupError:
-                return
-            time.sleep(KILL_DELAY)
-            try:
-                os.kill(pane_pid, signal.SIGKILL)
-                _log(f"[terminate] SIGKILL → pid {pane_pid}")
-            except ProcessLookupError:
-                pass
-    except Exception as e:
-        _log(f"[terminate] WARNING: signal delivery failed: {e}")
+    pane_pid = _mux.pid(name)
+    if pane_pid is not None:
+        _log(f"[terminate] SIGTERM → pid {pane_pid}")
+        try:
+            os.kill(pane_pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+        time.sleep(KILL_DELAY)
+        try:
+            os.kill(pane_pid, signal.SIGKILL)
+            _log(f"[terminate] SIGKILL → pid {pane_pid}")
+        except ProcessLookupError:
+            pass
+    else:
+        _log(f"[terminate] WARNING: could not get pane pid for {name!r}")
 
 
 # ---------------------------------------------------------------------------

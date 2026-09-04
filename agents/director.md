@@ -278,7 +278,7 @@ worktree 内で「動作 pass」と判定しても、主 WT での回帰が発�
 - **独立タスクは `--blocked-by` を省略する** — 並列実行で全体時間を短縮できる
 - **依存は本当に必要な場合のみ設定する** — 過剰な依存は直列化を招く
 - **ファンアウトパターンを活用する** — 並列調査→集約が最も効率的
-- **並列 Worker 実行には tmux モードが必須** — Director 起動時に選択する（§6 参照）
+- **並列 Worker 実行には並列モード (tmux または herdr) が必須** — Director 起動時に選択する（§6 参照）
 
 ---
 
@@ -370,7 +370,7 @@ grep -A5 'planning:' config/skill-permissions.yaml
 Worker起動時は、まず `registry/workers.yaml` で同スキルの担当履歴を確認してから名前を決定せよ。
 担当履歴があるWorkerを優先することで、スキルの継続性とナレッジ継承を保証する。
 
-**前提**: 並列 Worker 実行は tmux モードが必須。Director 起動時のプロンプトで tmux モードを選ばなかった場合、`bash scripts/start.sh worker ...` は `exec claude` でカレントシェルを置き換えるため、Worker は1人しか起動できない。インラインモードで並列起動を試みると入力待ちでハングする。
+**前提**: 並列 Worker 実行は並列モード (tmux または herdr) が必須。Director 起動時のプロンプトで並列モードを選ばなかった場合、`bash scripts/start.sh worker ...` は `exec claude` でカレントシェルを置き換えるため、Worker は1人しか起動できない。インラインモードで並列起動を試みると入力待ちでハングする。
 
 ### 基本フロー
 
@@ -381,7 +381,7 @@ Worker起動時は、まず `registry/workers.yaml` で同スキルの担当履�
 
 2. 同スキルのタスクが複数ある場合:
    ├─ まず Worker 1人を起動してタスクを順番に pull させる
-   └─ 並列が必要な場合のみ 2人目を追加起動（WIP 上限 `$CREWVIA_WIP_LIMIT` 名以内、tmux モード必須）
+   └─ 並列が必要な場合のみ 2人目を追加起動（WIP 上限 `$CREWVIA_WIP_LIMIT` 名以内、並列モード必須）
 ```
 
 ### registry 参照手順
@@ -469,14 +469,15 @@ Worker に crewvia 以外のプロジェクト (例: `~/workspace/taskvia`) を�
 
 起動モードによる挙動の違い:
 
-- **tmux モード（`CREWVIA_TMUX=1`）**: 新しい tmux ウィンドウ `crewvia:${AGENT_NAME}-worker` が生成され、Worker がバックグラウンドで起動する。Director の制御は即座に返る。並列 Worker 起動が可能。`tmux attach -t crewvia` で出力を確認できる。
-- **インラインモード（`CREWVIA_TMUX=0` または未設定）**: `exec claude` でカレントシェルが Worker プロセスに置き換わるため、Director から Worker を spawn するとハングする。**1セッション1エージェント制限**。複数 Worker 起動はできない。
+- **tmux モード（`CREWVIA_MUX=tmux` または `CREWVIA_TMUX=1`）**: 新しい tmux ウィンドウ `crewvia:${AGENT_NAME}-worker` が生成され、Worker がバックグラウンドで起動する。Director の制御は即座に返る。並列 Worker 起動が可能。`tmux attach -t crewvia` で出力を確認できる。
+- **herdr モード（`CREWVIA_MUX=herdr`）**: 新しい herdr タブ `${AGENT_NAME}-worker` が生成され、Worker がバックグラウンドで起動する。Director の制御は即座に返る。並列 Worker 起動が可能。`herdr` を別ターミナルで実行すると出力を確認できる（herdr 内からの nested attach は不可）。
+- **インラインモード（`CREWVIA_TMUX=0` または未設定、かつ `CREWVIA_MUX` 未設定）**: `exec claude` でカレントシェルが Worker プロセスに置き換わるため、Director から Worker を spawn するとハングする。**1セッション1エージェント制限**。複数 Worker 起動はできない。
 
-モードは Director 起動時に `bash scripts/start.sh director` 実行直後のプロンプトで選択する。選択結果は `CREWVIA_TMUX` env として Director Claude プロセスに引き継がれ、後続の Worker 起動に自動で反映される。
+モードは Director 起動時に `bash scripts/start.sh director` 実行直後のプロンプト「並列モードにしますか？」で選択する。選択結果は `CREWVIA_MUX` env として Director Claude プロセスに引き継がれ、後続の Worker 起動に自動で反映される。
 
 ### 複数Workerが必要な場合
 
-**tmux モード必須**。同じ registry 登録名の重複起動は避ける。
+**並列モード必須** (tmux または herdr)。同じ registry 登録名の重複起動は避ける。
 `assign-name.sh` の `--exclude` / `--fresh` フラグを使って別名を確実に割り当てる。
 
 **方法A: `--exclude` で1人目を除外して2人目を採番**（推奨）
@@ -1033,7 +1034,7 @@ for r in data.get('requests', []):
 
 ## 16. Dispatcher からの通知受け取り
 
-tmux モードでは `scripts/dispatcher.sh` が `crewvia:dispatcher` ウィンドウで常駐し、
+並列モード (tmux / herdr) では `scripts/dispatcher.sh` が `dispatcher` ウィンドウ/タブで常駐し、
 5秒ごとにタスク状況を確認して Director に通知を送る。
 
 **Director はポーリングや Workers への個別メッセージ送信は不要。**
@@ -1142,19 +1143,20 @@ Worker が idle のまま WIP 枠を消費し続ける問題を防ぐため、Di
 ```bash
 AGENT_NAME=<対象Workerの名前>   # 例: Tariq
 
-# shutdown 通知を送信
-tmux send-keys -t "crewvia:${AGENT_NAME}-worker" "タスクなし、shutdown" Enter
+# shutdown 通知を送信 (lib_mux 経由)
+python3 scripts/lib_mux.py send "${AGENT_NAME}-worker" "タスクなし、shutdown"
 sleep 2
 
-# ウィンドウを閉じる（Worker が自発終了しなかった場合）
-tmux kill-window -t "crewvia:${AGENT_NAME}-worker" 2>/dev/null || true
+# ウィンドウ/タブを閉じる（Worker が自発終了しなかった場合）
+python3 scripts/lib_mux.py kill "${AGENT_NAME}-worker" 2>/dev/null || true
 
 # heartbeat ファイルを削除
 rm -f "registry/heartbeats/${AGENT_NAME}"
 ```
 
 > **注意**: Worker は shutdown 通知を受けたら **即座に** セッションを終了しなければならない（Rule 1）。
-> ただし LLM の個体差で無視することがある → 2 秒後に `tmux kill-window` で強制終了する。
+> ただし LLM の個体差で無視することがある → 2 秒後に mux kill で強制終了する。
+> herdr モードで覗く場合: 別ターミナルで `herdr` を実行（herdr 内からの nested attach は不可）。
 
 ### Dispatcher の自動 blocked-stuck 検出（Rule 2）
 

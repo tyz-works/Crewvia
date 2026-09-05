@@ -1093,7 +1093,7 @@ def cmd_add(args):
 
     skills = [s.strip() for s in opts.get('--skills', '').split(',') if s.strip()]
     if not skills:
-        print("WARNING: task added with no skills — dispatcher will not be able to assign it automatically", file=sys.stderr)
+        die("--skills is required. Dispatcher cannot assign tasks without skills.")
     blocked_by = [s.strip() for s in opts.get('--blocked-by', '').split(',') if s.strip()]
     priority = opts.get('--priority', 'medium')
     if priority not in PRIORITY_ORDER:
@@ -1883,6 +1883,20 @@ def _print_mission_detail(slug):
             suffix = "(検証失敗)"
         elif st == 'needs_human_review':
             suffix = "(要人間レビュー)"
+        elif st == 'skipped':
+            suffix = "(スキップ)"
+        elif st == 'needs_director':
+            worker = m.get('worker') or ''
+            reason = m.get('needs_director_reason', '')
+            reason_str = f" — {reason}" if reason else ''
+            suffix = f"({worker}, 要Director){reason_str}" if worker else f"(要Director){reason_str}"
+        elif st == 'failed':
+            worker = m.get('worker') or ''
+            suffix = f"({worker}, 失敗)" if worker else "(失敗)"
+        elif st == 'blocked':
+            reason = m.get('blocked_reason', '')
+            reason_str = f" — {reason}" if reason else ''
+            suffix = f"(ブロック中){reason_str}"
         elif bb:
             unmet = [d for d in bb if d not in done_ids]
             suffix = f"(blocked: {', '.join(unmet)})" if unmet else "(pending)"
@@ -2594,8 +2608,9 @@ def cmd_update(args):
             changed.append(f"priority={priority}")
 
         if opts.get('--worker') is not None:
-            meta['worker'] = opts['--worker'] or None
-            changed.append(f"worker={meta['worker']}")
+            worker_val = opts['--worker']
+            meta['worker'] = None if worker_val.lower() in ('null', 'none', '') else worker_val
+            changed.append(f"worker={'null' if meta['worker'] is None else meta['worker']}")
 
         if status:
             meta['status'] = status

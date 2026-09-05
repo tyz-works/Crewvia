@@ -112,34 +112,20 @@ cleanup_queue() {
   cleanup_queue
 }
 
-@test "--worker null: YAML parses worker as Python None (not the string 'null')" {
+@test "--worker null: file has unquoted null and grep confirms no quoted string" {
   setup_queue "wn-yaml-parse"
   add_task t001 in_progress Alice
 
   # Reset worker to null
-  CREWVIA_QUEUE="$TEST_QUEUE" bash "$PLAN_SH" update t001 --worker null \
-    --mission "$TEST_MISSION" >/dev/null 2>&1
+  run plan_update t001 --worker null --mission "$TEST_MISSION"
+  [ "$status" -eq 0 ]
 
   # File must have unquoted null
   grep -q '^worker: null$' "$TASKS_DIR/t001.md"
 
-  # Python must parse it as None (not as the string "null")
-  worker_type="$(python3 - "$TASKS_DIR/t001.md" <<'EOF'
-import sys, re, json
-path = sys.argv[1]
-with open(path) as f:
-    content = f.read()
-# Extract frontmatter between --- delimiters
-m = re.match(r'^---\n(.*?)\n---', content, re.DOTALL)
-if not m:
-    print("no_frontmatter"); sys.exit(1)
-import yaml
-meta = yaml.safe_load(m.group(1))
-w = meta.get("worker")
-print("none" if w is None else f"string:{w!r}")
-EOF
-)"
-  [ "$worker_type" = "none" ]
+  # Must NOT contain quoted "null" (PyYAML would parse quoted as string)
+  ! grep -q '^worker: "null"' "$TASKS_DIR/t001.md"
+  ! grep -q "^worker: 'null'" "$TASKS_DIR/t001.md"
 
   cleanup_queue
 }
@@ -165,6 +151,79 @@ EOF
   [ "$status" -eq 0 ]
 
   grep -q '^worker: null$' "$TASKS_DIR/t001.md"
+
+  cleanup_queue
+}
+
+# ---------------------------------------------------------------------------
+# F1: case-insensitive sentinel matching
+# ---------------------------------------------------------------------------
+
+@test "--worker Null (capital N) writes 'worker: null' unquoted" {
+  setup_queue "wn-capital-null"
+  add_task t001 in_progress Alice
+
+  run plan_update t001 --worker Null --mission "$TEST_MISSION"
+  [ "$status" -eq 0 ]
+
+  grep -q '^worker: null$' "$TASKS_DIR/t001.md"
+  ! grep -q '^worker: "Null"' "$TASKS_DIR/t001.md"
+
+  cleanup_queue
+}
+
+@test "--worker None (capital N) writes 'worker: null' unquoted" {
+  setup_queue "wn-capital-none"
+  add_task t001 in_progress Alice
+
+  run plan_update t001 --worker None --mission "$TEST_MISSION"
+  [ "$status" -eq 0 ]
+
+  grep -q '^worker: null$' "$TASKS_DIR/t001.md"
+  ! grep -q '^worker: "None"' "$TASKS_DIR/t001.md"
+
+  cleanup_queue
+}
+
+@test "--worker NONE (all caps) writes 'worker: null' unquoted" {
+  setup_queue "wn-allcaps-none"
+  add_task t001 in_progress Alice
+
+  run plan_update t001 --worker NONE --mission "$TEST_MISSION"
+  [ "$status" -eq 0 ]
+
+  grep -q '^worker: null$' "$TASKS_DIR/t001.md"
+  ! grep -q '^worker: "NONE"' "$TASKS_DIR/t001.md"
+
+  cleanup_queue
+}
+
+# ---------------------------------------------------------------------------
+# F4: stdout displays 'worker=null' (not Python repr 'worker=None')
+# ---------------------------------------------------------------------------
+
+@test "--worker null: stdout shows 'worker=null' not 'worker=None'" {
+  setup_queue "wn-stdout-null"
+  add_task t001 in_progress Alice
+
+  run plan_update t001 --worker null --mission "$TEST_MISSION"
+  [ "$status" -eq 0 ]
+
+  [[ "$output" == *"worker=null"* ]]
+  [[ "$output" != *"worker=None"* ]]
+
+  cleanup_queue
+}
+
+@test "--worker Null: stdout shows 'worker=null' not 'worker=None'" {
+  setup_queue "wn-stdout-capital-null"
+  add_task t001 in_progress Alice
+
+  run plan_update t001 --worker Null --mission "$TEST_MISSION"
+  [ "$status" -eq 0 ]
+
+  [[ "$output" == *"worker=null"* ]]
+  [[ "$output" != *"worker=None"* ]]
 
   cleanup_queue
 }

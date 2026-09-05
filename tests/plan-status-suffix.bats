@@ -178,6 +178,70 @@ cleanup_queue() {
 }
 
 # ---------------------------------------------------------------------------
+# Tests: failed
+# ---------------------------------------------------------------------------
+
+@test "failed task shows (失敗) suffix" {
+  setup_queue "suffix-failed"
+  add_task t001 failed ""
+
+  run plan_status
+  cleanup_queue
+
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"(失敗)"* ]]
+}
+
+@test "failed task does NOT show (pending) suffix" {
+  setup_queue "suffix-failed-not-pending"
+  add_task t001 failed ""
+
+  run plan_status
+  cleanup_queue
+
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"t001"*"(pending)"* ]]
+}
+
+@test "failed task with worker shows worker name in suffix" {
+  setup_queue "suffix-failed-with-worker"
+  add_task t001 failed "Astrid"
+
+  run plan_status
+  cleanup_queue
+
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Astrid"* ]]
+  [[ "$output" == *"失敗"* ]]
+}
+
+# ---------------------------------------------------------------------------
+# Tests: blocked (explicit status, not blocked_by dependency)
+# ---------------------------------------------------------------------------
+
+@test "blocked task shows (ブロック中) suffix" {
+  setup_queue "suffix-blocked"
+  add_task t001 blocked ""
+
+  run plan_status
+  cleanup_queue
+
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"(ブロック中)"* ]]
+}
+
+@test "blocked task does NOT show (pending) suffix" {
+  setup_queue "suffix-blocked-not-pending"
+  add_task t001 blocked ""
+
+  run plan_status
+  cleanup_queue
+
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"t001"*"(pending)"* ]]
+}
+
+# ---------------------------------------------------------------------------
 # Regression: pending / in_progress は壊れていない
 # ---------------------------------------------------------------------------
 

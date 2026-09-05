@@ -1093,7 +1093,7 @@ def cmd_add(args):
 
     skills = [s.strip() for s in opts.get('--skills', '').split(',') if s.strip()]
     if not skills:
-        print("WARNING: task added with no skills — dispatcher will not be able to assign it automatically", file=sys.stderr)
+        die("ERROR: --skills is required. Dispatcher cannot assign tasks without skills.")
     blocked_by = [s.strip() for s in opts.get('--blocked-by', '').split(',') if s.strip()]
     priority = opts.get('--priority', 'medium')
     if priority not in PRIORITY_ORDER:

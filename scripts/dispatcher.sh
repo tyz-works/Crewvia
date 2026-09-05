@@ -863,8 +863,28 @@ def dispatch():
     # All pending tasks (including blocked), for shutdown eligibility check
     all_pending = [(slug, meta) for slug, meta in all_tasks if meta.get('status') == 'pending']
 
-    # Live Worker windows
+    # Live Worker windows (herdr pane list — used for assignment and Rule 5)
     windows = tmux_list_worker_windows()
+
+    # Alive workers from heartbeat files — used for "can_handle" check only.
+    # More reliable than windows for this purpose: herdr pane_list can
+    # transiently return [] (e.g. during state transitions), which would
+    # cause can_handle=False → false "no worker" notification to Director.
+    # Heartbeat files are written by Workers every HEARTBEAT_INTERVAL seconds
+    # and are independent of herdr's runtime state.
+    # A worker is considered alive if its heartbeat file mtime is within
+    # AGENT_PRESENCE_TTL (600s = 10 minutes).
+    _hb_dir = REGISTRY_DIR / 'heartbeats'
+    _alive_workers: set = set()
+    if _hb_dir.exists():
+        _now_hb = time.time()
+        for _hb_file in _hb_dir.iterdir():
+            if _hb_file.is_file() and not _hb_file.name.startswith('.'):
+                try:
+                    if _now_hb - _hb_file.stat().st_mtime <= AGENT_PRESENCE_TTL:
+                        _alive_workers.add(_hb_file.name)
+                except OSError:
+                    pass
 
     # Track which tasks were assigned this cycle to avoid double-dispatch.
     # Keyed as (slug, task_id) tuples so that missions reusing the same
@@ -975,22 +995,61 @@ def dispatch():
                     except OSError:
                         return time.time()  # file missing → treat as fresh
 
-                newest_mtime = max(_task_mtime(s, m) for s, m in matching_pending)
-                stuck_secs = time.time() - newest_mtime
-                if stuck_secs >= BLOCKED_STUCK_THRESHOLD:
-                    notify_key = f"blocked_stuck_{agent_name}"
-                    if should_notify(notify_key):
-                        log(
-                            f"[Rule 2] {agent_name}: all matching tasks blocked for "
-                            f"{stuck_secs:.0f}s ≥ {BLOCKED_STUCK_THRESHOLD}s "
-                            f"— sending shutdown (blocked-stuck)"
-                        )
-                        if tmux_send(target, 'タスクなし、shutdown'):
-                            record_notify(notify_key)
-                        time.sleep(1)
-                        tmux_kill_window(target)
+                def _chain_newest_mtime(slug, meta):
+                    """Max of pending task mtime AND its direct blockers' mtimes.
 
-    # Notify Sora about unblocked pending tasks that NO live worker can handle
+                    Fix (Rule 2 mtime race): when a blocker task just completed
+                    (status→done), the blocker file mtime is fresh even if the
+                    pending task file itself was written long ago.  Checking
+                    blocker mtimes prevents false stuck-detection in the window
+                    between blocker completion and the pending task becoming
+                    unblocked (the next dispatcher cycle may lag by a few seconds).
+                    """
+                    mtimes = [_task_mtime(slug, meta)]
+                    for dep_id in (meta.get('blocked_by') or []):
+                        dep_file = MISSIONS_DIR / slug / 'tasks' / f"{dep_id}.md"
+                        try:
+                            mtimes.append(dep_file.stat().st_mtime)
+                        except OSError:
+                            pass
+                    return max(mtimes)
+
+                # Fix (Rule 2 mtime race): if any direct blocker task is
+                # in_progress, the chain is actively progressing — do NOT kill
+                # the worker, even if the pending task files have old mtimes.
+                has_active_blocker = any(
+                    task_statuses_by_mission.get(s, {}).get(dep) == 'in_progress'
+                    for s, m in matching_pending
+                    for dep in (m.get('blocked_by') or [])
+                )
+                if has_active_blocker:
+                    log(
+                        f"[Rule 2 skip] {agent_name}: blocker task is in_progress "
+                        f"→ chain progressing, worker kept alive"
+                    )
+                else:
+                    newest_mtime = max(_chain_newest_mtime(s, m) for s, m in matching_pending)
+                    stuck_secs = time.time() - newest_mtime
+                    if stuck_secs >= BLOCKED_STUCK_THRESHOLD:
+                        notify_key = f"blocked_stuck_{agent_name}"
+                        if should_notify(notify_key):
+                            log(
+                                f"[Rule 2] {agent_name}: all matching tasks blocked for "
+                                f"{stuck_secs:.0f}s ≥ {BLOCKED_STUCK_THRESHOLD}s "
+                                f"— sending shutdown (blocked-stuck)"
+                            )
+                            if tmux_send(target, 'タスクなし、shutdown'):
+                                record_notify(notify_key)
+                            time.sleep(1)
+                            tmux_kill_window(target)
+
+    # Notify Sora about unblocked pending tasks that NO live worker can handle.
+    # Fix (herdr pane_list failure): use heartbeat-based alive_workers instead
+    # of windows to determine can_handle.  windows (herdr pane list) can
+    # transiently return [] right after a task completes (state transition in
+    # herdr), causing can_handle=False → false "no worker" notification.
+    # Heartbeat files are written by Workers independently of herdr, so they
+    # remain accurate even when herdr momentarily returns an empty pane list.
     for slug, meta in unblocked_pending:
         task_id = meta['id']
         task_skills = set(meta.get('skills') or [])
@@ -998,9 +1057,11 @@ def dispatch():
         # startup request — skip them regardless of how they reached this loop.
         if task_skills & DIRECTOR_ONLY_SKILLS:
             continue
+        # can_handle: True if any alive worker (heartbeat recent) has skills ⊇ task_skills
         can_handle = any(
-            task_skills.issubset(set((workers.get(w['agent_name']) or {}).get('skills') or []))
-            for w in windows
+            task_skills.issubset(set((workers.get(name) or {}).get('skills') or []))
+            for name in _alive_workers
+            if (workers.get(name) or {}).get('role', 'worker') == 'worker'
         )
         if not can_handle:
             # Include slug to avoid collision when missions reuse t001, t002, etc.

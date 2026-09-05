@@ -38,7 +38,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 QUEUE_DIR="${CREWVIA_QUEUE:-${REPO_ROOT}/queue}"
 REGISTRY_DIR="${REPO_ROOT}/registry"
-LOG_FILE="${REGISTRY_DIR}/dispatcher.log"
+LOG_DIR="${REPO_ROOT}/logs/dispatcher"
+LOG_FILE="${LOG_DIR}/dispatcher-$(date +%Y%m%d).log"
 NOTIFY_CACHE="/tmp/dispatcher-notify-cache.json"
 NOTIFY_TTL=300  # seconds before repeating the same notification (5 min)
 
@@ -64,6 +65,7 @@ if ! python3 "${SCRIPT_DIR}/lib_mux.py" available >/dev/null 2>&1; then
 fi
 
 mkdir -p "$REGISTRY_DIR"
+mkdir -p "$LOG_DIR"
 
 log() {
   local msg
@@ -78,7 +80,7 @@ log "Starting dispatcher (PID $$, queue=$QUEUE_DIR)"
 # One dispatch cycle — implemented in Python for YAML / file parsing
 # ---------------------------------------------------------------------------
 run_dispatch() {
-  python3 - "$QUEUE_DIR" "$REGISTRY_DIR" "$NOTIFY_CACHE" "$NOTIFY_TTL" "$STATE_GRACE" <<'PYEOF'
+  python3 - "$QUEUE_DIR" "$REGISTRY_DIR" "$NOTIFY_CACHE" "$NOTIFY_TTL" "$STATE_GRACE" "$LOG_FILE" <<'PYEOF'
 import sys
 import os
 import re
@@ -95,6 +97,11 @@ REGISTRY_DIR   = Path(sys.argv[2])
 NOTIFY_CACHE   = Path(sys.argv[3])
 NOTIFY_TTL     = int(sys.argv[4])
 STATE_GRACE    = int(sys.argv[5]) if len(sys.argv) > 5 else 60
+# LOG_FILE is passed from bash (argv[6]) so the date-based path stays consistent
+# within a single dispatch cycle.  The bash wrapper updates it each cycle for
+# midnight rotation.
+LOG_FILE       = Path(sys.argv[6]) if len(sys.argv) > 6 else REGISTRY_DIR / 'dispatcher.log'
+LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
 
 # Import lib_mux from scripts/ (same dir as this script via REGISTRY_DIR.parent)
 _SCRIPTS_DIR = REGISTRY_DIR.parent / 'scripts'
@@ -107,7 +114,7 @@ ARCHIVE_DIR    = QUEUE_DIR / 'archive'
 STATE_FILE     = QUEUE_DIR / 'state.yaml'
 ASSIGNMENTS_DIR = QUEUE_DIR / 'assignments'
 WORKERS_FILE   = REGISTRY_DIR / 'workers.yaml'
-LOG_FILE       = REGISTRY_DIR / 'dispatcher.log'
+# LOG_FILE is set above from sys.argv[6] (date-based path from bash wrapper).
 # Bug2 fix: persistent flag to track all_done state across dispatch cycles
 ALL_DONE_STATE_FILE = REGISTRY_DIR / 'dispatcher_all_done.flag'
 
@@ -1056,6 +1063,9 @@ PYEOF
 # Main loop
 # ---------------------------------------------------------------------------
 while true; do
+  # Recompute log file path on each cycle so midnight date-rollover creates a
+  # new file automatically (e.g. dispatcher-20260905.log → dispatcher-20260906.log).
+  LOG_FILE="${LOG_DIR}/dispatcher-$(date +%Y%m%d).log"
   run_dispatch || log "dispatch cycle error (exit $?)"
   sleep 5
 done

@@ -39,24 +39,24 @@ workers:
     last_active: 2026-05-12
   - name: Haruto
     skills: [bash, code]
-    task_count: 15
-    last_active: 2026-09-02
+    task_count: 23
+    last_active: 2026-09-05
   - name: Seo
     skills: [review]
-    task_count: 31
-    last_active: 2026-09-02
+    task_count: 49
+    last_active: 2026-09-05
   - name: Jiwon
     skills: [docs, research]
     task_count: 5
     last_active: 2026-09-02
   - name: Minjun
     skills: [docs]
-    task_count: 5
-    last_active: 2026-08-30
+    task_count: 6
+    last_active: 2026-09-05
   - name: Wei
     skills: [bash, code, docs]
-    task_count: 27
-    last_active: 2026-09-02
+    task_count: 31
+    last_active: 2026-09-05
   - name: Lin
     skills: [code, research, typescript]
     task_count: 4
@@ -67,12 +67,12 @@ workers:
     last_active: 2026-08-25
   - name: Arjun
     skills: [qa]
-    task_count: 12
-    last_active: 2026-09-02
+    task_count: 27
+    last_active: 2026-09-05
   - name: Priya
     skills: [planning]
-    task_count: 9
-    last_active: 2026-09-02
+    task_count: 17
+    last_active: 2026-09-05
   - name: Anika
     skills: [research]
     task_count: 3
@@ -100,7 +100,7 @@ workers:
   - name: Omar
     skills: [bash, research]
     task_count: 1
-    last_active: 2026-09-02
+    last_active: 2026-09-03
   - name: Yasmin
     skills: [bash, research]
     task_count: 1
@@ -113,3 +113,15 @@ workers:
     skills: [code]
     task_count: 1
     last_active: 2026-09-02
+  - name: Luca
+    skills: [bash, docs, research]
+    task_count: 3
+    last_active: 2026-09-04
+  - name: Sofia
+    skills: [bash, code, python]
+    task_count: 10
+    last_active: 2026-09-04
+  - name: Finn
+    skills: [qa]
+    task_count: 4
+    last_active: 2026-09-05

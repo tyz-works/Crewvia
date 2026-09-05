@@ -9,7 +9,8 @@
 
 ### インストール
 
-`scripts/observe-notify.sh` は PR #149 で導入された dispatcher ログ集計ツール。
+`scripts/observe-notify.sh` は PR #152 でリポジトリに追加された dispatcher ログ集計ツール。
+**PR #152 が merge された後に使用可能**（PR #149 は dispatcher ログの永続化機能であり、本スクリプトとは別）。
 リポジトリルートの `scripts/` に配置済みのため、追加インストール不要。
 
 ```bash
@@ -58,6 +59,8 @@ bash scripts/observe-notify.sh --help
 | ③Director 実受信 | `→ [*director*]` の行数 | ① と一致が理想 |
 
 **①=③ であれば、送信した全通知が Director に到達している**ことを示す。
+ただし、通常運用では Worker 宛通知 (assign/shutdown/handoff) も ① に含まれるため **①>③ が正常**。
+`①−③ = Worker 宛通知件数` として読むこと。
 suppress (cache ヒット) があっても Director が正しいタイミングで受信していれば問題なし。
 
 ---
@@ -77,13 +80,13 @@ Dispatcher が発火していない               ntfy 配送問題 / Director �
     │                                     │
     ▼                                     ▼
 [Step 1a] dispatcher プロセス確認         [Step 2a] ntfy サーバー疎通確認
-  ps aux | grep dispatcher.py               curl -s $NTFY_URL/health
+  pgrep -f dispatcher.sh                    curl -s $NTFY_URL/health
   → 起動していない → ./crewvia で再起動     → 応答なし → ntfy 障害
                                           [Step 2b] ntfy トピック確認
 [Step 1b] notify cache を確認               echo $NTFY_TOPIC
   cat /tmp/dispatcher-notify-cache.json     → 空 → NTFY_TOPIC 未設定
   | python3 -m json.tool                  [Step 2c] Director tab の存在確認
-  → task のエントリがある = suppress 中     plan.sh status で Director 稼働確認
+  → task のエントリがある = suppress 中     herdr list または tmux list-windows -t crewvia で Director tab 確認
     → キャッシュ TTL (300s) 待ち
     → または docker/herdr 再起動で解消
          │
@@ -96,8 +99,10 @@ Dispatcher が発火していない               ntfy 配送問題 / Director �
                                             [Step 3b] Director tab の割当状況を確認
                                               plan.sh status (in_progress task がないか)
                                             [Step 3c] PR #150 fix (c) タプル化を確認
-                                              notify cache のキー名が
-                                              no_worker_{slug}_{task_id} 形式か確認
+                                              dispatcher.sh の assigned_task_ids が
+                                              タプル化されているか確認:
+                                              grep 'assigned_task_ids' scripts/dispatcher.sh
+                                              (cache key 形式の確認は PR #144 検証 → §6 参照)
 ```
 
 ---
@@ -134,7 +139,7 @@ per-task 出力間隔: **301〜303s** (設計値 300s に対して ±3s 以内)
 |------|------|------|
 | 5 分で 1 task あたり 1 行以下 | **仕様通り — 問題なし** | 対応不要 |
 | 5 分で 1 task あたり複数行 | bug (suppression 不備) | PR で追加 fix |
-| 40 task 同時 blocked → 40 行/5min | リスクあるが自然分散で軽減 | NOTIFY_TTL を 600s に伸ばすことを検討 |
+| 40 task 同時 blocked → 40 行/5min | リスクあるが自然分散で軽減 | NOTIFY_TTL を 600s に伸ばすことを検討 (副作用: 通知 recovery latency も 5min → 10min に増加。この副作用を許容できる場合のみ) |
 | 現在規模 (4〜10 task) での flooding | **なし** (4 行/5min, 数十秒スプレッド) | WONTFIX |
 
 > **結論 (2026-09-05)**: 現在の運用規模では PR #144 の blocked ログ抑制は仕様通りに機能しており、追加 fix は不要 (WONTFIX)。40 task 超の mission が増えた場合は再評価すること。
@@ -223,7 +228,10 @@ cat /tmp/dispatcher-notify-cache.json | python3 -c "
 import json, sys, time
 cache = json.load(sys.stdin)
 now = time.time()
-for k, ts in sorted(cache.items(), key=lambda x: x[1], reverse=True):
+for k, ts in sorted(
+    [(k, ts) for k, ts in cache.items() if isinstance(ts, (int, float))],
+    key=lambda x: x[1], reverse=True
+):
     age = int(now - ts)
     remaining = max(0, 300 - age)
     print(f'{k}: age={age}s, next_in={remaining}s')
@@ -235,14 +243,21 @@ TTL (300s) が明けるまで待つか、`/tmp/dispatcher-notify-cache.json` を
 ### 2 mission 並走で片方の通知が届かない
 
 PR #150 fix (c) 以降、`assigned_task_ids` は `(slug, task_id)` タプルで一意化されている。
-notify cache のキーが `no_worker_{slug}_{task_id}` 形式になっているか確認する:
+fix (c) が適用されているか確認:
+
+```bash
+grep 'assigned_task_ids' scripts/dispatcher.sh
+# 期待: assigned_task_ids.add((slug, task_id)) と (slug, meta['id']) in assigned_task_ids
+```
+
+**notify cache のキー名確認 (PR #144 導入の機能)**:
 
 ```bash
 # cache キーの確認
 cat /tmp/dispatcher-notify-cache.json | python3 -m json.tool | grep "no_worker"
 ```
 
-期待形式: `"no_worker_<mission-slug>_<task-id>"`
+期待形式: `"no_worker_<mission-slug>_<task-id>"` — PR #144 で導入されたキー名形式
 
 ### observe-notify.sh が「ログファイルが見つかりません」と表示する
 

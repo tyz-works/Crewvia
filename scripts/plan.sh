@@ -1883,6 +1883,13 @@ def _print_mission_detail(slug):
             suffix = "(検証失敗)"
         elif st == 'needs_human_review':
             suffix = "(要人間レビュー)"
+        elif st == 'skipped':
+            suffix = "(スキップ)"
+        elif st == 'needs_director':
+            worker = m.get('worker') or ''
+            reason = m.get('needs_director_reason', '')
+            reason_str = f" — {reason}" if reason else ''
+            suffix = f"({worker}, 要Director){reason_str}" if worker else f"(要Director){reason_str}"
         elif bb:
             unmet = [d for d in bb if d not in done_ids]
             suffix = f"(blocked: {', '.join(unmet)})" if unmet else "(pending)"

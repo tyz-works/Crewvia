@@ -865,6 +865,9 @@ def dispatch():
 
     # Live Worker windows
     windows = tmux_list_worker_windows()
+    # [DIAG] Log windows list every cycle — key for detecting empty-windows bug
+    log(f"[diag] windows={[w['agent_name'] for w in windows]} "
+        f"unblocked_pending={[(s, m['id']) for s, m in unblocked_pending]}")
 
     # Track which tasks were assigned this cycle to avoid double-dispatch.
     # Keyed as (slug, task_id) tuples so that missions reusing the same
@@ -886,6 +889,10 @@ def dispatch():
         # Idle = no assignment file
         assignment_file = ASSIGNMENTS_DIR / agent_name
         is_idle = not assignment_file.exists()
+        # [DIAG] Log per-worker idle state
+        log(f"[diag] worker={agent_name} is_idle={is_idle} "
+            f"assignment_file={assignment_file.name}(exists={assignment_file.exists()}) "
+            f"skills={sorted(worker_skills)}")
 
         # Rule 5 (herdr only): check agent state for blocked / idle-with-task.
         # Runs for ALL workers (busy and idle) before the is_idle gate below.
@@ -998,10 +1005,19 @@ def dispatch():
         # startup request — skip them regardless of how they reached this loop.
         if task_skills & DIRECTOR_ONLY_SKILLS:
             continue
+        # [DIAG] Log can_handle computation details
+        _worker_skill_map = {
+            w['agent_name']: sorted(set((workers.get(w['agent_name']) or {}).get('skills') or []))
+            for w in windows
+        }
         can_handle = any(
             task_skills.issubset(set((workers.get(w['agent_name']) or {}).get('skills') or []))
             for w in windows
         )
+        log(f"[diag] can_handle check: task={task_id}({sorted(task_skills)}) "
+            f"windows={list(_worker_skill_map.keys())} "
+            f"worker_skills={_worker_skill_map} "
+            f"can_handle={can_handle}")
         if not can_handle:
             # Include slug to avoid collision when missions reuse t001, t002, etc.
             notify_key = f"no_worker_{slug}_{task_id}"

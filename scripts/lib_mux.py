@@ -925,16 +925,34 @@ class HerdrBackend(_Backend):
 
         Always queries herdr live (does not use cache) for accurate liveness.
         """
+        _t0 = time.monotonic()
         ws_id = self._workspace_id()
         if ws_id is None:
+            print(
+                f"[mux:herdr:diag] list(suffix={suffix!r}): ws_id=None "
+                f"elapsed={time.monotonic()-_t0:.3f}s → returning []",
+                file=sys.stderr,
+            )
             return []
         data = _herdr_run("pane_list", ["--workspace", ws_id], timeout=10)
         if data is None:
+            print(
+                f"[mux:herdr:diag] list(suffix={suffix!r}): ws_id={ws_id!r} "
+                f"pane_list=None elapsed={time.monotonic()-_t0:.3f}s → returning []",
+                file=sys.stderr,
+            )
             return []
         panes = data.get("result", {}).get("panes", [])
         names = [p.get("label") for p in panes if p.get("label")]
         if suffix:
             names = [n for n in names if n.endswith(suffix)]
+        # [DIAG] Always log list() result so empty-windows bug is detectable
+        print(
+            f"[mux:herdr:diag] list(suffix={suffix!r}): ws_id={ws_id!r} "
+            f"total_panes={len(panes)} matched={names} "
+            f"elapsed={time.monotonic()-_t0:.3f}s",
+            file=sys.stderr,
+        )
         return names
 
     def kill(self, name: str) -> bool:

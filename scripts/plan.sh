@@ -2552,6 +2552,10 @@ def cmd_update(args):
     if status and status not in valid_statuses:
         die(f"invalid status '{status}'. Valid statuses: {', '.join(sorted(valid_statuses))}")
 
+    # Holder for reset worker info (populated inside _do, used after with_lock)
+    # [0] = old worker name, [1] = slug (for assignment content verification)
+    reset_worker_holder = [None, None]
+
     def _do():
         state = load_state()
         slug = opts.get('--mission') or state.get('default_mission')
@@ -2565,6 +2569,9 @@ def cmd_update(args):
         changed = []
 
         if opts.get('--reset'):
+            # Capture old worker BEFORE nulling it (needed to clean up assignment file)
+            reset_worker_holder[0] = meta.get('worker')
+            reset_worker_holder[1] = slug
             meta['status'] = 'pending'
             meta['worker'] = None
             meta['started_at'] = None
@@ -2608,6 +2615,33 @@ def cmd_update(args):
         print(f"Updated: {slug}/{task_id} — {', '.join(changed)}")
 
     with_lock(_do)
+
+    # Remove assignment file for the reset worker to prevent Dispatcher Rule 5 false alarm.
+    # (The Dispatcher fires Rule 5 when: agent_status=idle AND assignment file exists.)
+    # Only delete if the file's content matches <slug>:<task_id> — guard against accidentally
+    # removing the assignment of a Worker who was already reused for a different task.
+    old_worker = reset_worker_holder[0]
+    reset_slug = reset_worker_holder[1]
+    if opts.get('--reset') and old_worker and reset_slug:
+        assignment_file = os.path.join(QUEUE_DIR, 'assignments', old_worker)
+        if os.path.exists(assignment_file):
+            try:
+                content = open(assignment_file).read().strip()
+                expected = f"{reset_slug}:{task_id}"
+                if content == expected:
+                    os.remove(assignment_file)
+                    print(f"[plan.sh] Removed stale assignment: {old_worker} → {content}")
+                else:
+                    print(
+                        f"[plan.sh warn] assignment/{old_worker} contains '{content}',"
+                        f" expected '{expected}' — not removed (worker may have a new task)",
+                        file=sys.stderr,
+                    )
+            except OSError as _e:
+                print(
+                    f"[plan.sh warn] failed to read/remove assignment/{old_worker}: {_e}",
+                    file=sys.stderr,
+                )
 
 
 # ---------------------------------------------------------------------------

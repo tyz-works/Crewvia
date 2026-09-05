@@ -2594,7 +2594,8 @@ def cmd_update(args):
             changed.append(f"priority={priority}")
 
         if opts.get('--worker') is not None:
-            meta['worker'] = opts['--worker'] or None
+            worker_val = opts['--worker']
+            meta['worker'] = None if worker_val in ('null', 'none', '') else worker_val
             changed.append(f"worker={meta['worker']}")
 
         if status:

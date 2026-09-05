@@ -502,30 +502,44 @@ def _text_in_input_line(screen: str, text: str) -> bool:
     Detection order (TUI-first, falls back to plain bash):
 
     1. **Claude TUI mode**: scan the last 5 lines for any line that starts
-       with ``❯``.  If found, return ``True`` only if ``text`` appears in
-       one of those lines.  (Claude TUI renders a status/hint line *below*
-       the ``❯`` prompt, so the absolute-last line is unreliable.)
+       with ``❯``.  If found, return ``True`` only if the first 30 characters
+       of ``text`` appear in one of those lines.  (Claude TUI renders a
+       status/hint line *below* the ``❯`` prompt, so the absolute-last line
+       is unreliable.)
 
     2. **Plain bash / other**: if no ``❯`` line is found, check the last
-       non-empty line.  Return ``True`` if ``text`` appears in it.
+       non-empty line.  Return ``True`` if the first 30 characters of
+       ``text`` appear in it.
+
+    **Why 30 characters instead of the full text**: notification messages
+    sent to the director (e.g. "要求スキル ['review'] の Worker を起動して…")
+    often exceed terminal column width and wrap across multiple display lines.
+    Matching the entire string against a single line always fails for wrapped
+    text, causing the Enter insurance to miss the case where Enter was dropped.
+    Using a 30-character prefix is long enough to distinguish from unrelated
+    scrollback entries while being short enough to fit on any prompt line.
 
     Returns ``False`` when ``text`` or ``screen`` is empty, or when the text
-    is not found in the detected input line(s).  This prevents the scrollback
-    false-positive where an already-executed ``text`` command appears in the
-    history and would cause ``text in screen`` to be always ``True``.
+    prefix is not found in the detected input line(s).  This prevents the
+    scrollback false-positive where an already-executed ``text`` command
+    appears in the history and would cause ``text in screen`` to be always
+    ``True``.
     """
     if not screen or not text:
         return False
+    # Use only the first 30 chars so long text that wraps across columns still
+    # matches the prompt line that carries the beginning of the input.
+    prefix = text[:30]
     # Examine only the tail to avoid scrollback matches.
     tail = screen.splitlines()[-5:]
     # Claude TUI: prompt lines start with ❯.
     prompt_lines = [line for line in tail if line.startswith("❯")]
     if prompt_lines:
-        return any(text in line for line in prompt_lines)
+        return any(prefix in line for line in prompt_lines)
     # Plain bash / other: check last non-empty line.
     non_empty = [line for line in tail if line.strip()]
     if non_empty:
-        return text in non_empty[-1]
+        return prefix in non_empty[-1]
     return False
 
 
@@ -570,11 +584,11 @@ class HerdrBackend(_Backend):
       6. Cache tab_id + pane_id.
 
     Call order for send():
-      IMPORTANT — callers must capture() and wait for '❯' before calling send().
-      pane run with '❯' present submits reliably; without it, Enter is dropped
-      (Phase 0 finding).  send() adds an Enter insurance: if capture() after
-      pane run still shows the text in the input line, one pane send-keys enter
-      is appended.
+      send() internally waits up to 5 s for '❯' to appear before calling
+      pane run.  pane run with '❯' present submits reliably; without it,
+      Enter is dropped (Phase 0 finding).  send() adds an Enter insurance:
+      if capture() after pane run still shows the text prefix in the input
+      line, one pane send-keys enter is appended.
 
     Herdr CLI subcommands are collected in _HERDR_CLI table (module level) so
     a CLI rename requires editing only that table.
@@ -826,25 +840,50 @@ class HerdrBackend(_Backend):
     def send(self, name: str, text: str) -> bool:
         """Send `text` to the named pane via pane run.
 
-        CALLER CONTRACT: capture() and wait for '❯' before calling send().
-        Phase 0 confirmed: pane run submits reliably only after '❯' appears.
-        Without '❯', the text is inserted but Enter is dropped.
+        Waits up to ``_SEND_PROMPT_TIMEOUT`` seconds for the ``❯`` prompt to
+        appear before calling ``pane run``.  Phase 0 confirmed: ``pane run``
+        submits reliably only after ``❯`` is visible; without it, Enter is
+        dropped and the text sits in the input buffer unsent.
 
-        Enter insurance: after pane run, capture() is called once.
-        ``_text_in_input_line()`` checks **only the last 5 lines** of the
-        screen (not the entire scrollback) to decide whether ``text`` is still
-        sitting in the active input line.  Searching the full screen caused a
-        false-positive: a previously-executed command with the same text would
-        appear in the scrollback and always trigger a spurious extra Enter.
+        If ``❯`` does not appear within the timeout (pane is busy with a long
+        task), ``pane run`` is called anyway as a best-effort — the text is
+        inserted but Enter may be dropped.
+
+        Enter insurance: after ``pane run``, ``capture()`` is called once.
+        ``_text_in_input_line()`` checks the **last 5 lines** for the first
+        30 characters of ``text`` to detect whether Enter was dropped despite
+        the wait (e.g., timeout fired or pane state changed mid-send).
+        Searching the full screen caused a false-positive: a
+        previously-executed command with the same text would appear in the
+        scrollback and always trigger a spurious extra Enter.
 
         See ``_text_in_input_line()`` for the exact detection algorithm
-        (Claude TUI ``❯`` lines vs. plain bash last-line fallback).
+        (Claude TUI ``❯`` lines vs. plain bash last-line fallback, 30-char
+        prefix matching).
         """
+        _SEND_PROMPT_TIMEOUT = 5.0   # seconds to wait for '❯'
+        _SEND_PROMPT_INTERVAL = 0.5  # poll interval in seconds
+
         ids = self._resolve_ids(name)
         if ids is None:
             self._warn(f"send {name!r}: pane not found")
             return False
         pane_id = ids["pane_id"]
+
+        # Wait for '❯' prompt so pane_run can submit with Enter (Phase 0).
+        deadline = time.time() + _SEND_PROMPT_TIMEOUT
+        while True:
+            screen = self._capture_by_pane_id(pane_id)
+            tail = screen.splitlines()[-5:] if screen else []
+            if any(line.startswith("❯") for line in tail):
+                break  # prompt ready — pane_run will type and press Enter
+            if time.time() >= deadline:
+                self._warn(
+                    f"send {name!r}: '❯' not found after "
+                    f"{_SEND_PROMPT_TIMEOUT:.0f}s (pane busy) — sending best-effort"
+                )
+                break
+            time.sleep(_SEND_PROMPT_INTERVAL)
 
         run_data = _herdr_run("pane_run", [pane_id, text], timeout=10)
         if run_data is None:

@@ -859,8 +859,11 @@ def dispatch():
     # Live Worker windows
     windows = tmux_list_worker_windows()
 
-    # Track which tasks were assigned this cycle to avoid double-dispatch
-    assigned_task_ids = set()
+    # Track which tasks were assigned this cycle to avoid double-dispatch.
+    # Keyed as (slug, task_id) tuples so that missions reusing the same
+    # task IDs (e.g. t001 in both mission-a and mission-b) do not block
+    # each other within the same dispatch cycle.
+    assigned_task_ids = set()  # set of (slug, task_id) tuples
 
     for window in windows:
         agent_name = window['agent_name']
@@ -901,7 +904,7 @@ def dispatch():
         # Find best unblocked pending task with skill match
         best = None
         for slug, meta in unblocked_pending:
-            if meta['id'] in assigned_task_ids:
+            if (slug, meta['id']) in assigned_task_ids:
                 continue
             task_skills = set(meta.get('skills') or [])
             # Defense-in-depth: skip director-only tasks even if the gate above
@@ -926,7 +929,7 @@ def dispatch():
                 )
                 if tmux_send(target, msg):
                     record_notify(notify_key)
-                assigned_task_ids.add(task_id)
+                assigned_task_ids.add((slug, task_id))
         else:
             # No unblocked pending task for this worker.
             # If there are ZERO tasks (even blocked) matching this worker's skills

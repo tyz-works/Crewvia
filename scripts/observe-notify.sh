@@ -80,7 +80,8 @@ while [[ $# -gt 0 ]]; do
       DATE_ARG="$2"; shift 2 ;;
     --last)
       [[ $# -ge 2 ]] || { echo "ERROR: --last には引数が必要です" >&2; exit 1; }
-      LAST_N="$2"; shift 2 ;;
+      LAST_N="$2"; shift 2
+      [[ "$LAST_N" =~ ^[0-9]+$ ]] || { echo "ERROR: --last must be a positive integer" >&2; exit 1; } ;;
     --json)
       OUTPUT_JSON=true; shift ;;
     --notify-cache)
@@ -122,20 +123,20 @@ if [[ -f "$LOG_FILE" ]]; then
 
   # --last N オプション: 末尾 N 件に絞る
   if [[ -n "$LAST_N" ]]; then
-    NOTIFY_LINES="$(echo "$NOTIFY_LINES" | tail -n "$LAST_N")"
+    NOTIFY_LINES="$(printf '%s\n' "$NOTIFY_LINES" | tail -n "$LAST_N")"
   fi
 fi
 
 # ①通知送信件数
 if [[ -n "$NOTIFY_LINES" ]]; then
-  NOTIFY_SENT="$(echo "$NOTIFY_LINES" | wc -l | tr -d ' ')"
+  NOTIFY_SENT="$(printf '%s\n' "$NOTIFY_LINES" | grep -c '.')"
 else
   NOTIFY_SENT=0
 fi
 
-# ③Director 実受信確認件数 (target 名に "director" を含む行)
+# ③Director 実受信確認件数 (target フィールド「→ [*director*]」に限定)
 if [[ -n "$NOTIFY_LINES" ]]; then
-  DIRECTOR_RECEIVED="$(echo "$NOTIFY_LINES" | grep -c 'director' || true)"
+  DIRECTOR_RECEIVED="$(printf '%s\n' "$NOTIFY_LINES" | grep -cE '→ \[[^]]*director[^]]*\]' || true)"
 else
   DIRECTOR_RECEIVED=0
 fi
@@ -161,16 +162,18 @@ ttl = float(sys.argv[3])
 try:
     with open(cache_file) as f:
         cache = json.load(f)
+    if not isinstance(cache, dict):
+        print("0 0")
+        sys.exit(0)
+    total = len(cache)
+    active = sum(
+        1 for ts in cache.values()
+        if isinstance(ts, (int, float)) and (now - ts) <= ttl
+    )
+    print(f"{total} {active}")
 except Exception:
     print("0 0")
     sys.exit(0)
-
-total = len(cache)
-active = sum(
-    1 for ts in cache.values()
-    if isinstance(ts, (int, float)) and (now - ts) <= ttl
-)
-print(f"{total} {active}")
 PYEOF
 )"
 fi

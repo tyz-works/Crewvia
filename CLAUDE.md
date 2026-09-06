@@ -87,6 +87,7 @@
 | `CREWVIA_MUX` | mux バックエンド選択: `tmux` / `herdr`。config `mode:` より優先 |
 | `CREWVIA_TMUX_SESSION` | tmux backend が使うセッション名（デフォルト: `crewvia`） |
 | `CREWVIA_HERDR_WORKSPACE` | herdr backend が使うワークスペース名（デフォルト: `crewvia`） |
+| `CREWVIA_HERDR_SOCK` | herdr API socket のパス（デフォルト: `~/.config/herdr/herdr.sock`）。テスト用の上書き口 |
 | `NTFY_URL` | ntfy サーバーの URL。`approval_channel.ntfy.url` より優先 |
 | `NTFY_TOPIC` | ntfy 通知トピック名。**必須** — 空のまま運用すると通知が silent skip される |
 | `NTFY_USER` | ntfy Basic 認証ユーザー名。`auth-default-access: deny-all` サーバーでは必須 |

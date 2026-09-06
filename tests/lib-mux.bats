@@ -108,11 +108,17 @@ FAKESCRIPT
 }
 
 teardown() {
-    # Clean temp dir without rm -rf (security rule).
-    if [[ -n "${FAKE_TMUX_DIR:-}" && -d "$FAKE_TMUX_DIR" ]]; then
-        find "$FAKE_TMUX_DIR" -type f -delete 2>/dev/null || true
-        find "$FAKE_TMUX_DIR" -type d -delete 2>/dev/null || true
+    # Stop the fake herdr server if one was started (it is detached on purpose,
+    # so nothing else reaps it).
+    if [[ -n "${FAKE_SRV_PID:-}" && -f "$FAKE_SRV_PID" ]]; then
+        kill "$(cat "$FAKE_SRV_PID")" 2>/dev/null || true
     fi
+    # Clean temp dirs without rm -rf (security rule).
+    for dir in "${FAKE_TMUX_DIR:-}" "${FAKE_SRV_DIR:-}"; do
+        [[ -n "$dir" && -d "$dir" ]] || continue
+        find "$dir" -mindepth 1 -delete 2>/dev/null || true
+        rmdir "$dir" 2>/dev/null || true
+    done
 }
 
 # Assert the call log contains a string.
@@ -1282,4 +1288,160 @@ FAKESCRIPT_NOFIELD
     run python3 "$LIB_MUX_PY" state "Omar-worker"
     [ "$status" -eq 0 ]
     [[ "$output" == "unknown" ]]
+}
+
+
+# ---------------------------------------------------------------------------
+# herdr server auto-start
+#
+# The generic fake herdr above returns from `herdr server` immediately, which
+# hides the actual failure mode: the real `herdr server` self-daemonizes only
+# on a TTY, and otherwise holds stdout/stderr open forever.  A start that waits
+# on those streams therefore blocks until its timeout and then kills the server
+# it just spawned.  These tests use a fake that reproduces that behaviour and
+# a real (temp-path) unix socket so the ping path is exercised end to end.
+# ---------------------------------------------------------------------------
+
+setup_fake_herdr_server() {
+    FAKE_SRV_DIR="$(mktemp -d)"
+    FAKE_SRV_SOCK="${FAKE_SRV_DIR}/herdr.sock"
+    FAKE_SRV_ENV="${FAKE_SRV_DIR}/server.env"
+    FAKE_SRV_PID="${FAKE_SRV_DIR}/server.pid"
+
+    # Ping daemon: answers the NDJSON ping that _herdr_ping() sends, and never
+    # closes stdout/stderr — exactly like the real herdr server.
+    cat > "${FAKE_SRV_DIR}/pingd.py" <<'PINGD'
+import json, os, socket, sys
+
+sock_path = sys.argv[1]
+srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+srv.bind(sock_path)
+srv.listen(8)
+while True:
+    conn, _ = srv.accept()
+    with conn:
+        data = conn.recv(4096)
+        if not data:
+            continue
+        req = json.loads(data.decode().splitlines()[0])
+        conn.sendall(
+            (json.dumps({"id": req.get("id"), "result": {"type": "pong"}}) + "\n").encode()
+        )
+PINGD
+
+    # Fake herdr binary — paths are baked in so it needs no env of its own
+    # (the server env is scrubbed, so it could not read CREWVIA_* anyway).
+    cat > "${FAKE_SRV_DIR}/herdr" <<FAKESRV
+#!/usr/bin/env bash
+case "\${1:-}" in
+  --version)
+    echo "herdr 0.8.2"
+    exit 0
+    ;;
+  server)
+    # Record the env the server was started with, then become the ping daemon
+    # without ever closing stdout/stderr.
+    env > "${FAKE_SRV_ENV}"
+    echo \$\$ > "${FAKE_SRV_PID}"
+    exec python3 "${FAKE_SRV_DIR}/pingd.py" "${FAKE_SRV_SOCK}"
+    ;;
+esac
+exit 0
+FAKESRV
+    chmod +x "${FAKE_SRV_DIR}/herdr"
+}
+
+# Run lib_mux.py with the fake herdr in front of PATH and extra env vars.
+run_with_fake_server() {
+    run env CREWVIA_MUX=herdr \
+        CREWVIA_HERDR_SOCK="$FAKE_SRV_SOCK" \
+        PATH="${FAKE_SRV_DIR}:${PATH}" \
+        "$@"
+}
+
+@test "herdr: available starts the server detached and leaves it running (regression)" {
+    setup_fake_herdr_server
+
+    run_with_fake_server python3 "$LIB_MUX_PY" available
+    [ "$status" -eq 0 ]
+
+    # The server must have been started...
+    [ -f "$FAKE_SRV_PID" ]
+    # ...and must still be alive.  A blocking start (capture_output + timeout)
+    # kills it on timeout, which is the bug this guards against.
+    kill -0 "$(cat "$FAKE_SRV_PID")"
+}
+
+@test "herdr: available returns 0 immediately when the server already pings" {
+    setup_fake_herdr_server
+
+    # First call starts it.
+    run_with_fake_server python3 "$LIB_MUX_PY" available
+    [ "$status" -eq 0 ]
+    first_pid="$(cat "$FAKE_SRV_PID")"
+
+    # Second call must reuse it, not spawn a second server.
+    run_with_fake_server python3 "$LIB_MUX_PY" available
+    [ "$status" -eq 0 ]
+    [ "$(cat "$FAKE_SRV_PID")" = "$first_pid" ]
+}
+
+@test "herdr: server-running is 1 when down and never starts the server" {
+    setup_fake_herdr_server
+
+    run_with_fake_server python3 "$LIB_MUX_PY" server-running
+    [ "$status" -eq 1 ]
+    [ ! -f "$FAKE_SRV_PID" ]
+}
+
+@test "herdr: server-running is 0 after the server has been started" {
+    setup_fake_herdr_server
+
+    run_with_fake_server python3 "$LIB_MUX_PY" available
+    [ "$status" -eq 0 ]
+
+    run_with_fake_server python3 "$LIB_MUX_PY" server-running
+    [ "$status" -eq 0 ]
+}
+
+@test "herdr: session-scoped env vars are scrubbed from the started server" {
+    setup_fake_herdr_server
+
+    run env CREWVIA_MUX=herdr \
+        CREWVIA_HERDR_SOCK="$FAKE_SRV_SOCK" \
+        PATH="${FAKE_SRV_DIR}:${PATH}" \
+        CLAUDE_CODE_CHILD_SESSION=1 \
+        CLAUDE_EFFORT=high \
+        CLAUDECODE=1 \
+        AI_AGENT=claude-code_agent \
+        CODEX_COMPANION_SESSION_ID=abc \
+        CREWVIA_TASK_ID=t042 \
+        TASK_TITLE="some task" \
+        AGENT_NAME=Omar \
+        TMUX=/tmp/tmux-1000/default \
+        CREWVIA_KEEP_ME_OUT=1 \
+        SSH_AUTH_SOCK=/tmp/ssh-agent.sock \
+        TASKVIA_URL=https://example.invalid \
+        python3 "$LIB_MUX_PY" available
+    [ "$status" -eq 0 ]
+    [ -f "$FAKE_SRV_ENV" ]
+
+    # Session-scoped vars must not be baked into the long-lived server, since
+    # it hands its env to every pane it will ever spawn.
+    ! grep -q "^CLAUDE_CODE_CHILD_SESSION=" "$FAKE_SRV_ENV"
+    ! grep -q "^CLAUDE_EFFORT=" "$FAKE_SRV_ENV"
+    ! grep -q "^CLAUDECODE=" "$FAKE_SRV_ENV"
+    ! grep -q "^AI_AGENT=" "$FAKE_SRV_ENV"
+    ! grep -q "^CODEX_COMPANION_SESSION_ID=" "$FAKE_SRV_ENV"
+    ! grep -q "^CREWVIA_TASK_ID=" "$FAKE_SRV_ENV"
+    ! grep -q "^TASK_TITLE=" "$FAKE_SRV_ENV"
+    ! grep -q "^AGENT_NAME=" "$FAKE_SRV_ENV"
+    ! grep -q "^TMUX=" "$FAKE_SRV_ENV"
+    ! grep -q "^CREWVIA_KEEP_ME_OUT=" "$FAKE_SRV_ENV"
+
+    # ...but unrelated vars the panes need must survive (denylist, not allowlist).
+    grep -q "^SSH_AUTH_SOCK=/tmp/ssh-agent.sock$" "$FAKE_SRV_ENV"
+    grep -q "^TASKVIA_URL=https://example.invalid$" "$FAKE_SRV_ENV"
+    grep -q "^HOME=" "$FAKE_SRV_ENV"
+    grep -q "^PATH=" "$FAKE_SRV_ENV"
 }

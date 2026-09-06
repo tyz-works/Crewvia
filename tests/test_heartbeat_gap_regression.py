@@ -131,19 +131,21 @@ class MockDispatcherWithWindows:
 
     def _get_alive_workers_fixed(self) -> set:
         """
-        修正案: heartbeat fresh OR window exists の OR 条件。
-        heartbeat gap バグ (OBS-1) を解消する。
+        修正案 (window seed + heartbeat-fresh union):
+        window 存在で seed → heartbeat-fresh で union。完全 OR 条件。
+
+        変更点: heartbeat file を持たない fresh-spawn Worker も window seed で alive。
+        dispatcher.sh Lines 882-897 の新実装を再現。
         """
-        alive = set()
+        # Seed: all window-present workers are alive (covers fresh-spawn Workers)
+        alive = set(name for name, exists in self.windows.items() if exists)
         now = time.time()
         if self.hb_dir.exists():
             for hb_file in self.hb_dir.iterdir():
                 if hb_file.is_file() and not hb_file.name.startswith("."):
                     try:
-                        hb_fresh = now - hb_file.stat().st_mtime <= AGENT_PRESENCE_TTL
-                        window_exists = self.windows.get(hb_file.name, False)
-                        if hb_fresh or window_exists:
-                            alive.add(hb_file.name)
+                        if now - hb_file.stat().st_mtime <= AGENT_PRESENCE_TTL:
+                            alive.add(hb_file.name)  # union: heartbeat fresh → also alive
                     except OSError:
                         pass
         return alive
@@ -383,10 +385,10 @@ def test_D_heartbeat_fresh_no_window_alive():
 
 def test_E_dispatcher_sh_contains_or_condition_fix():
     """
-    test_E: dispatcher.sh に heartbeat gap fix (OR 条件) が適用済みであることを確認。
+    test_E: dispatcher.sh に heartbeat gap fix (window seed + heartbeat union) が適用済みであることを確認。
 
     dispatcher.sh 参照:
-      Lines 869-887: _hb_fresh or _win_exists の OR 条件
+      Lines 880-897: _alive_workers = set(_window_agent_names) seed + heartbeat-fresh union
       _window_agent_names の構築
     """
     dispatcher_path = Path(__file__).parent.parent / "scripts" / "dispatcher.sh"
@@ -394,15 +396,16 @@ def test_E_dispatcher_sh_contains_or_condition_fix():
 
     content = dispatcher_path.read_text()
 
-    # OR 条件の実装確認
+    # window seed の実装確認
     assert "_window_agent_names" in content, \
         "Fix: _window_agent_names (window set) not found in dispatcher.sh"
+    assert "set(_window_agent_names)" in content, \
+        "Fix: _alive_workers seeded with set(_window_agent_names) not found in dispatcher.sh"
     assert "_hb_fresh" in content, \
         "Fix: _hb_fresh variable not found in dispatcher.sh"
-    assert "_win_exists" in content, \
-        "Fix: _win_exists variable not found in dispatcher.sh"
-    assert "_hb_fresh or _win_exists" in content, \
-        "Fix: 'heartbeat fresh OR window exists' OR condition not found in dispatcher.sh"
+    # _win_exists is no longer needed — windows are pre-seeded
+    assert "_win_exists" not in content, \
+        "Old: _win_exists still present in dispatcher.sh (should be removed with window seed fix)"
 
     # 既存の構造が維持されていることを確認
     assert "_alive_workers" in content, \
@@ -412,7 +415,65 @@ def test_E_dispatcher_sh_contains_or_condition_fix():
     assert "for name in _alive_workers" in content, \
         "can_handle loop over _alive_workers not found"
 
-    print("✓ test_E: dispatcher.sh に heartbeat gap OR fix が適用済みであることを確認")
+    print("✓ test_E: dispatcher.sh に window seed + heartbeat union fix が適用済みであることを確認")
+
+
+# ---------------------------------------------------------------------------
+# test_F: heartbeat file なし + window 存在 → alive ✓ (fresh-spawn edge case)
+# ---------------------------------------------------------------------------
+
+def test_F_no_heartbeat_file_window_exists_alive():
+    """
+    test_F: heartbeat file なし + window 存在 → alive ✓ (fresh-spawn edge case)
+
+    新規 spawn Worker は first tool invocation まで heartbeat file を書かない
+    (hooks/post-tool-use.sh)。heartbeat loop のみでは alive 判定不可。
+    window seed により fresh-spawn Worker も alive として正しく扱われる。
+
+    旧実装 (heartbeat file iterate のみ):
+      heartbeat file なし → _alive_workers に追加されない → can_handle = False (誤判定)
+    新実装 (window seed + heartbeat union):
+      window あり → seed で alive → can_handle = True (正しい)
+
+    dispatcher.sh 参照:
+      Lines 882-897: _alive_workers = set(_window_agent_names) seed (F1 fix)
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        disp = MockDispatcherWithWindows(tmpdir)
+
+        # Haruto: heartbeat file なし (fresh-spawn) + window 存在
+        # NOTE: set_heartbeat_fresh/stale は呼ばない — ファイルを作らない
+        disp.set_window_exists("Haruto", True)
+
+        task_skills = {"bash", "code"}
+
+        # 旧実装: heartbeat file なし → iterate で見つからない → can_handle = False (バグ)
+        result_old = disp.can_handle_current(task_skills)
+        alive_old = disp._get_alive_workers_current()
+
+        # 新実装 (window seed): window あり → seed で alive → can_handle = True
+        result_fixed = disp.can_handle_fixed(task_skills)
+        alive_fixed = disp._get_alive_workers_fixed()
+
+        print(
+            f"  test_F: no_heartbeat_file=True, window_exists=True "
+            f"→ old logic can_handle={result_old} (alive={alive_old}) [fresh-spawn bug], "
+            f"fixed logic can_handle={result_fixed} (alive={alive_fixed})"
+        )
+
+        # 旧実装がバグ (False) だったことを記録
+        assert result_old is False, (
+            f"test_F: old logic should return False (heartbeat file なし → iterate で見つからない), "
+            f"got {result_old}, alive={alive_old}"
+        )
+
+        # 新実装: window seed により alive → True (PASS = fresh-spawn fix 検証)
+        assert result_fixed is True, (
+            f"test_F FIX FAILED: no heartbeat file + window exists "
+            f"→ fixed can_handle={result_fixed} (expected True). "
+            f"alive_workers={alive_fixed}. "
+            f"Window seed fix not working for fresh-spawn Workers."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -430,7 +491,8 @@ if __name__ == "__main__":
     print("  test_B: PASS (heartbeat stale + window → OR fix により alive ✓)")
     print("  test_C: PASS (heartbeat stale + no window → dead ✓)")
     print("  test_D: PASS (heartbeat fresh + no window → alive via heartbeat ✓)")
-    print("  test_E: PASS (dispatcher.sh に OR fix が適用済み ✓)")
+    print("  test_E: PASS (dispatcher.sh に window seed + heartbeat union fix が適用済み ✓)")
+    print("  test_F: PASS (heartbeat file なし + window → window seed により alive ✓)")
     print()
 
     results = {}
@@ -440,6 +502,7 @@ if __name__ == "__main__":
         ("test_C", test_C_heartbeat_stale_no_window_dead),
         ("test_D", test_D_heartbeat_fresh_no_window_alive),
         ("test_E", test_E_dispatcher_sh_contains_or_condition_fix),
+        ("test_F", test_F_no_heartbeat_file_window_exists_alive),
     ]
 
     failures = []
@@ -470,9 +533,11 @@ if __name__ == "__main__":
         print("✓ 全テスト PASS — heartbeat gap バグ (OBS-1) の fix が正しく適用済み")
         print()
         print("CONCLUSION:")
-        print("  dispatcher.sh の _alive_workers 構築を OR 条件に変更した:")
-        print("  'heartbeat fresh OR window exists'")
+        print("  dispatcher.sh の _alive_workers 構築を window seed + heartbeat union に変更した:")
+        print("  seed: _alive_workers = set(_window_agent_names)  # window present → alive")
+        print("  union: heartbeat-fresh → also alive")
         print("  idle Worker (heartbeat gap) でも window が存在すれば alive とみなす。")
+        print("  fresh-spawn Worker (heartbeat file なし) でも window があれば alive とみなす。")
         sys.exit(0)
     else:
         print(f"✗ {len(failures)} tests FAILED: {failures}")

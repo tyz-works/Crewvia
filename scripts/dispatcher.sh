@@ -1083,6 +1083,43 @@ def dispatch():
                     record_notify(notify_key)
 
 
+    # Vanished worker detection: in_progress tasks whose worker tab has disappeared.
+    # Condition: status==in_progress AND worker recorded AND tab absent AND heartbeat stale.
+    # When all four conditions hold, the Worker process is truly gone — the task will
+    # never complete on its own.  Notify Director with a recovery recipe.
+    _hb_dir_vanish = REGISTRY_DIR / 'heartbeats'
+    _now_vanish = time.time()
+    for slug, meta in all_tasks:
+        if meta.get('status') != 'in_progress':
+            continue
+        worker_name = meta.get('worker')
+        if not worker_name:
+            continue  # no worker recorded yet (pull not done) — skip
+        # Condition C: worker tab absent from live windows
+        if worker_name in _window_agent_names:
+            continue  # tab exists → worker is running, no alert
+        # Condition D: heartbeat stale or missing
+        hb_file = _hb_dir_vanish / worker_name
+        hb_stale = True
+        if hb_file.exists():
+            try:
+                hb_stale = _now_vanish - hb_file.stat().st_mtime > AGENT_PRESENCE_TTL
+            except OSError:
+                hb_stale = True
+        if not hb_stale:
+            continue  # heartbeat fresh → worker may still be alive (transient mux glitch)
+        task_id = meta.get('id', '?')
+        notify_key = f'vanished_worker_{slug}_{task_id}'
+        if should_notify(notify_key):
+            msg = (
+                f"task {task_id} (mission: {slug}) の worker {worker_name} の tab が消滅しています。"
+                f"plan.sh update {task_id} --status pending --reset --mission {slug} で復旧してください。"
+            )
+            if tmux_send(_director_name(), msg):
+                record_notify(notify_key)
+                log(f"[vanished_worker] {slug}/{task_id}: worker {worker_name} tab gone + heartbeat stale — notified director")
+
+
     # Handoff detection: failed tasks with handoff_path → notify Director
     for slug in active_missions:
         tasks_for_slug = list_tasks_for_mission(slug)

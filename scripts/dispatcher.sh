@@ -866,14 +866,18 @@ def dispatch():
     # Live Worker windows (herdr pane list — used for assignment and Rule 5)
     windows = tmux_list_worker_windows()
 
-    # Alive workers from heartbeat files — used for "can_handle" check only.
-    # More reliable than windows for this purpose: herdr pane_list can
-    # transiently return [] (e.g. during state transitions), which would
-    # cause can_handle=False → false "no worker" notification to Director.
-    # Heartbeat files are written by Workers every HEARTBEAT_INTERVAL seconds
-    # and are independent of herdr's runtime state.
-    # A worker is considered alive if its heartbeat file mtime is within
-    # AGENT_PRESENCE_TTL (600s = 10 minutes).
+    # Alive workers — used for "can_handle" check only.
+    # OR condition: heartbeat fresh OR window exists (fix for heartbeat gap, PR #159 follow-up).
+    #
+    # Rationale:
+    #   - heartbeat fresh alone (PR #154): handles herdr pane_list transient [] case.
+    #     Workers write heartbeat every HEARTBEAT_INTERVAL s, independent of herdr state.
+    #   - window exists alone: handles idle Workers whose heartbeat aged past
+    #     AGENT_PRESENCE_TTL (600s) but are still running (herdr window present).
+    #     Without this, a Worker idle for >10 min is misclassified as dead →
+    #     false "no worker" notification fired (OBS-1 symptom).
+    #   - Both stale + no window → truly dead → can_handle=False (correct).
+    _window_agent_names: set = {w['agent_name'] for w in windows}
     _hb_dir = REGISTRY_DIR / 'heartbeats'
     _alive_workers: set = set()
     if _hb_dir.exists():
@@ -881,7 +885,9 @@ def dispatch():
         for _hb_file in _hb_dir.iterdir():
             if _hb_file.is_file() and not _hb_file.name.startswith('.'):
                 try:
-                    if _now_hb - _hb_file.stat().st_mtime <= AGENT_PRESENCE_TTL:
+                    _hb_fresh = _now_hb - _hb_file.stat().st_mtime <= AGENT_PRESENCE_TTL
+                    _win_exists = _hb_file.name in _window_agent_names
+                    if _hb_fresh or _win_exists:  # OR: heartbeat fresh OR window exists
                         _alive_workers.add(_hb_file.name)
                 except OSError:
                     pass

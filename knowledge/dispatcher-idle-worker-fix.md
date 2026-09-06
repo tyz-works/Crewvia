@@ -144,6 +144,26 @@ Fix 2 のバグは Rule 2 ログで切り分け：
 
 ---
 
+## heartbeat freshness gap (2026-09-06)
+
+### 問題
+PR #154 Fix 1 (heartbeat-based can_handle) で新たに生まれた失敗モード。
+Claude Code Worker は idle (❯ prompt) 中に heartbeat を publish しない。
+10 分経過後、heartbeat mtime > AGENT_PRESENCE_TTL → _alive_workers から脱落 → OBS-1 症状復活。
+
+### 修正 (方針A: OR 条件)
+alive = (heartbeat mtime ≤ TTL) OR (window exists in mux list)
+
+二重防御:
+- heartbeat fresh → transient window failure をカバー (PR #154 元の fix)
+- window exists → idle heartbeat gap をカバー (本 fix)
+- 両方 false → 真に dead (正しい dead 判定)
+
+### 再現条件
+Worker idle > 600s + dispatcher サイクル実行 → can_handle=False → 誤通知発火
+
+---
+
 ## 関連メモリ
 
 - `~/.claude/projects/-home-tkadmin-workspace-crewvia/memory/dispatcher-idle-worker-recognition-bug.md`

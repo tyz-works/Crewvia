@@ -121,10 +121,21 @@ if [[ -z "${CREWVIA_TMUX:-}" ]]; then
   fi
 fi
 
+# --- サブコマンド ---
+SUBCMD="${1:-director}"
+
 # --- herdr 到達チェック / 自動起動（herdr モード時） ---
 # start.sh と同じ判定を ./crewvia でも行う。
 # server が落ちていれば起動してから crewvia を続行し、起動できなければ早期 exit する。
-if [[ "${CREWVIA_MUX:-}" == "herdr" ]]; then
+#
+# mux を必要とするサブコマンドに限定する。help / status は plan.sh を読むだけなので、
+# スクリプトや cron から `./crewvia status` を叩くだけで常駐 daemon が生えるのを避ける。
+NEEDS_MUX=0
+case "$SUBCMD" in
+  director|orchestrator|start|worker) NEEDS_MUX=1 ;;
+esac
+
+if [[ "$NEEDS_MUX" == "1" ]] && [[ "${CREWVIA_MUX:-}" == "herdr" ]]; then
   if ! command -v herdr >/dev/null 2>&1; then
     echo "[crewvia] ERROR: CREWVIA_MUX=herdr が設定されていますが herdr バイナリが見つかりません。" >&2
     echo "          herdr をインストールするか CREWVIA_MUX=tmux に変更してください。" >&2
@@ -145,9 +156,6 @@ if [[ "${CREWVIA_MUX:-}" == "herdr" ]]; then
     echo "[crewvia] herdr server を起動しました。"
   fi
 fi
-
-# --- サブコマンド ---
-SUBCMD="${1:-director}"
 
 case "$SUBCMD" in
   status)

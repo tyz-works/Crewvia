@@ -200,8 +200,8 @@ class TmuxBackend(_Backend):
         True if `tmux` binary is found in PATH.
 
     server_running() -> bool
-        True if the mux server is already up. Same as available() for tmux,
-        which starts its server implicitly.
+        True if a tmux server is up (`tmux list-sessions` exits 0). Never
+        starts one.
     """
 
     BACKEND_NAME = "tmux"
@@ -213,12 +213,21 @@ class TmuxBackend(_Backend):
         return shutil.which("tmux") is not None
 
     def server_running(self) -> bool:
-        """True if the backend's server is already up (never starts it).
+        """True if a tmux server is up right now (never starts one).
 
-        tmux starts its server implicitly on the first command, so there is
-        nothing to pre-start — availability is the honest answer here.
+        `tmux list-sessions` exits non-zero when no server is running, so it
+        answers the same question _herdr_ping() does for herdr.  Deliberately
+        not available(), which would report "up" for a mere binary in PATH.
         """
-        return self.available()
+        if shutil.which("tmux") is None:
+            return False
+        try:
+            r = subprocess.run(
+                ["tmux", "list-sessions"], capture_output=True, timeout=5
+            )
+            return r.returncode == 0
+        except Exception:
+            return False
 
     def spawn(self, name: str, cmd: str, cwd: Optional[str] = None,
               env: Optional[dict] = None) -> bool:
@@ -433,11 +442,12 @@ _HERDR_CLI = {
     "pane_process_info":  ["herdr", "pane", "process-info", "--pane"],
 }
 
+# CREWVIA_HERDR_SOCK is a test-only override (see tests/lib-mux.bats).  `or` —
+# not a .get() default — so that an exported-but-empty value falls back instead
+# of resolving to Path("") == ".", which would make every ping fail.
 _HERDR_SOCK_PATH = Path(
-    os.environ.get(
-        "CREWVIA_HERDR_SOCK",
-        str(Path.home() / ".config" / "herdr" / "herdr.sock"),
-    )
+    os.environ.get("CREWVIA_HERDR_SOCK")
+    or str(Path.home() / ".config" / "herdr" / "herdr.sock")
 )
 
 # Env vars that must never be baked into the herdr server process.
@@ -453,6 +463,13 @@ _HERDR_SERVER_ENV_DENY_PREFIXES = (
     "TASK_",        # TASK_ID / TASK_TITLE (not TASKVIA_URL)
 )
 _HERDR_SERVER_ENV_DENY_EXACT = frozenset({
+    # Secrets.  ./crewvia exports TASKVIA_TOKEN before it may start the server,
+    # and start.sh re-exports all of these per pane in LAUNCH_CMD, so nothing
+    # needs them in the server env — where they would sit in
+    # /proc/<pid>/environ and reach every pane the server ever spawns.
+    "TASKVIA_TOKEN",
+    "NTFY_USER",
+    "NTFY_PASS",
     "CLAUDECODE",
     "AI_AGENT",
     "AGENT_NAME",

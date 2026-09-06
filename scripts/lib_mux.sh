@@ -6,7 +6,8 @@
 #
 # Functions:
 #   mux_available               → exit 0 if backend available (herdr: starts server if down)
-#   mux_server_running          → exit 0 if the mux server is already up (never starts it)
+#   mux_server_running          → exit 0 if the mux server is already up (never starts it;
+#                                 tmux: `tmux list-sessions`, herdr: socket ping)
 #   mux_spawn <name> <cmd> [<cwd>]
 #   mux_send  <name> <text>
 #   mux_capture <name>          → prints screen contents

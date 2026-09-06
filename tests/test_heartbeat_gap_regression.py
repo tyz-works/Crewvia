@@ -416,6 +416,168 @@ def test_E_dispatcher_sh_contains_or_condition_fix():
 
 
 # ---------------------------------------------------------------------------
+# シナリオ a: 既存維持 (PR #154 regression) — OR 条件適用後も 5連続 done → 誤通知 0
+# ---------------------------------------------------------------------------
+
+def test_scenario_a_five_consecutive_done_zero_false_notify_or_condition():
+    """
+    シナリオ a: 5連続 task done → 誤通知 0 (PR #154 regression を OR 条件で再確認)
+
+    test_regression_no_false_notify.py の test_five_consecutive_task_done_zero_false_notifications
+    を MockDispatcherWithWindows + can_handle_fixed() で再検証する。
+    OR 条件 fix (このブランチ) 適用後も PR #154 fix が維持されていることを保証。
+
+    シナリオ:
+      - Haruto (bash+code) が fresh heartbeat + window あり で稼働
+      - 5 タスクを順番に done → 各 done 後に次タスクが unblocked
+      - OR 条件: heartbeat fresh → alive → can_handle = True → 誤通知なし
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        disp = MockDispatcherWithWindows(tmpdir)
+
+        # Haruto: fresh heartbeat + window あり (通常稼働状態)
+        disp.set_heartbeat_fresh("Haruto")
+        disp.set_window_exists("Haruto", True)
+
+        tasks = [
+            {"id": f"t{i:03d}", "skills": {"bash", "code"}}
+            for i in range(1, 6)
+        ]
+
+        false_count = 0
+        for i in range(len(tasks) - 1):
+            # task i 完了: done 後も heartbeat を fresh に更新 (Worker はまだ稼働中)
+            disp.set_heartbeat_fresh("Haruto")
+
+            # 次 task が unblocked → OR 条件 can_handle チェック
+            next_task_skills = tasks[i + 1]["skills"]
+            ch = disp.can_handle_fixed(next_task_skills)
+            if not ch:
+                false_count += 1
+
+        assert false_count == 0, (
+            f"シナリオ a FAIL: 5連続 done で誤通知 {false_count} 件 (expected 0). "
+            f"PR #154 regression — OR 条件 fix 後も heartbeat fresh → alive が機能すること"
+        )
+        print(
+            f"✓ test_scenario_a_five_consecutive_done_zero_false_notify_or_condition: "
+            f"false_notifications={false_count}/4 (5 done, 4 dispatch checks)"
+        )
+
+
+# ---------------------------------------------------------------------------
+# シナリオ b: heartbeat stale + window あり → 誤通知 0 (heartbeat gap regression fix)
+# ---------------------------------------------------------------------------
+
+def test_idle_worker_stale_heartbeat_window_exists_no_false_notify():
+    """
+    シナリオ b: idle Worker が heartbeat stale (>TTL) でも window があれば誤通知なし
+
+    heartbeat gap バグ (OBS-1) の修正検証テスト。
+
+    状態:
+      - Worker を spawn → heartbeat を 660s 前 (TTL=600s 超) に設定
+      - window は存在する (Worker は実際には alive だが heartbeat が gap に入っている)
+      - task done 後に dispatch cycle 実行
+
+    期待:
+      - OR 条件: window exists → _alive_workers に含まれる → can_handle = True
+      - 誤通知なし (false notification = 0)
+
+    旧実装 (heartbeat のみ):
+      - heartbeat stale → _alive_workers に含まれない → can_handle = False → 誤通知発火 (バグ)
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        disp = MockDispatcherWithWindows(tmpdir)
+
+        # Worker を spawn し heartbeat を 660s 前に設定 (TTL=600s 超過)
+        disp.set_heartbeat_stale("Haruto", age_seconds=660)
+        # window は存在する (OR 条件がカバーするケース)
+        disp.set_window_exists("Haruto", True)
+
+        task_skills = {"bash", "code"}
+
+        # task done 後のディスパッチサイクル実行
+        can_handle = disp.can_handle_fixed(task_skills)
+
+        # OR 条件: window exists → alive → can_handle = True → 誤通知なし
+        assert can_handle is True, (
+            f"シナリオ b FAIL: heartbeat stale (660s > TTL=600s) + window exists → "
+            f"can_handle={can_handle} (expected True). "
+            f"OR 条件 fix が機能していない: window exists が alive 判定に使われていない。"
+        )
+
+        # 旧実装 (heartbeat のみ) では False だったことを参考確認
+        can_handle_old = disp.can_handle_current(task_skills)
+        assert can_handle_old is False, (
+            f"参考確認: old logic (heartbeat only) should return False for stale heartbeat, "
+            f"got {can_handle_old}"
+        )
+
+        print(
+            f"✓ test_idle_worker_stale_heartbeat_window_exists_no_false_notify: "
+            f"heartbeat_age=660s > TTL=600s, window_exists=True "
+            f"→ fixed can_handle={can_handle} (誤通知なし), "
+            f"old can_handle={can_handle_old} (旧バグ確認)"
+        )
+
+
+# ---------------------------------------------------------------------------
+# シナリオ c: heartbeat stale + window なし → dead 正判定 → Director 通知発火
+# ---------------------------------------------------------------------------
+
+def test_dead_worker_stale_heartbeat_no_window_triggers_notify():
+    """
+    シナリオ c: heartbeat stale + window なし → dead 正判定 → Director への通知が発火
+
+    真の dead Worker を正しく検出することを確認。
+    OR 条件 fix 後も、両方の条件が満たされない場合は can_handle = False (正しい挙動)。
+
+    状態:
+      - Worker heartbeat を TTL 超過 (700s 前) に設定
+      - window も存在しない (Worker は本当に dead)
+      - task pending に対して dispatch cycle 実行
+
+    期待:
+      - OR 条件: heartbeat stale AND no window → _alive_workers に含まれない
+      - can_handle = False → Director への通知が正当に発火 (true dead detection)
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        disp = MockDispatcherWithWindows(tmpdir)
+
+        # Worker heartbeat を TTL 超過 (700s 前) に設定
+        disp.set_heartbeat_stale("Haruto", age_seconds=700)
+        # window も消去 (Worker は本当に dead)
+        disp.set_window_exists("Haruto", False)
+
+        task_skills = {"bash", "code"}
+
+        # dispatch cycle: OR 条件でも両方 stale/なし → can_handle = False
+        can_handle = disp.can_handle_fixed(task_skills)
+        alive_workers = disp._get_alive_workers_fixed()
+
+        # can_handle = False → Director への通知が発火すべき (正しい挙動)
+        assert can_handle is False, (
+            f"シナリオ c FAIL: heartbeat stale (700s) + no window → "
+            f"can_handle={can_handle} (expected False = dead 正判定). "
+            f"alive_workers={alive_workers}"
+        )
+
+        # 通知発火のシミュレート: can_handle=False → notify fires
+        notify_should_fire = not can_handle
+        assert notify_should_fire is True, (
+            f"シナリオ c FAIL: dead worker なのに notify が発火しない"
+        )
+
+        print(
+            f"✓ test_dead_worker_stale_heartbeat_no_window_triggers_notify: "
+            f"heartbeat_age=700s > TTL=600s, window_exists=False "
+            f"→ can_handle={can_handle}, alive_workers={alive_workers} "
+            f"→ notify_fires={notify_should_fire} (dead 正判定 ✓)"
+        )
+
+
+# ---------------------------------------------------------------------------
 # エントリポイント (直接実行用)
 # ---------------------------------------------------------------------------
 
@@ -431,6 +593,9 @@ if __name__ == "__main__":
     print("  test_C: PASS (heartbeat stale + no window → dead ✓)")
     print("  test_D: PASS (heartbeat fresh + no window → alive via heartbeat ✓)")
     print("  test_E: PASS (dispatcher.sh に OR fix が適用済み ✓)")
+    print("  シナリオ a: PASS (5連続 done → 誤通知 0, OR 条件維持 ✓)")
+    print("  シナリオ b: PASS (heartbeat stale + window → 誤通知なし ✓)")
+    print("  シナリオ c: PASS (heartbeat stale + no window → dead 正判定 + notify 発火 ✓)")
     print()
 
     results = {}
@@ -440,6 +605,9 @@ if __name__ == "__main__":
         ("test_C", test_C_heartbeat_stale_no_window_dead),
         ("test_D", test_D_heartbeat_fresh_no_window_alive),
         ("test_E", test_E_dispatcher_sh_contains_or_condition_fix),
+        ("scenario_a", test_scenario_a_five_consecutive_done_zero_false_notify_or_condition),
+        ("scenario_b", test_idle_worker_stale_heartbeat_window_exists_no_false_notify),
+        ("scenario_c", test_dead_worker_stale_heartbeat_no_window_triggers_notify),
     ]
 
     failures = []

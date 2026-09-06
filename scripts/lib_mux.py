@@ -25,7 +25,8 @@ Usage as module:
   st = m.state("Omar-worker")  # "blocked"|"working"|"idle"|"done"|"unknown"
 
 CLI usage (for bash callers):
-  python3 lib_mux.py available            # exit 0 = available
+  python3 lib_mux.py available            # exit 0 = available (starts herdr server if needed)
+  python3 lib_mux.py server-running       # exit 0 = mux server already up (never starts it)
   python3 lib_mux.py spawn <name> <cmd> [<cwd>]
   python3 lib_mux.py send  <name> <text>
   python3 lib_mux.py capture <name>       # prints raw screen text
@@ -149,6 +150,9 @@ class _Backend:
     def available(self) -> bool:
         raise NotImplementedError
 
+    def server_running(self) -> bool:
+        raise NotImplementedError
+
     def state(self, name: str) -> str:
         raise NotImplementedError
 
@@ -194,6 +198,10 @@ class TmuxBackend(_Backend):
 
     available() -> bool
         True if `tmux` binary is found in PATH.
+
+    server_running() -> bool
+        True if a tmux server is up (`tmux list-sessions` exits 0). Never
+        starts one.
     """
 
     BACKEND_NAME = "tmux"
@@ -203,6 +211,23 @@ class TmuxBackend(_Backend):
 
     def available(self) -> bool:
         return shutil.which("tmux") is not None
+
+    def server_running(self) -> bool:
+        """True if a tmux server is up right now (never starts one).
+
+        `tmux list-sessions` exits non-zero when no server is running, so it
+        answers the same question _herdr_ping() does for herdr.  Deliberately
+        not available(), which would report "up" for a mere binary in PATH.
+        """
+        if shutil.which("tmux") is None:
+            return False
+        try:
+            r = subprocess.run(
+                ["tmux", "list-sessions"], capture_output=True, timeout=5
+            )
+            return r.returncode == 0
+        except Exception:
+            return False
 
     def spawn(self, name: str, cmd: str, cwd: Optional[str] = None,
               env: Optional[dict] = None) -> bool:
@@ -417,7 +442,44 @@ _HERDR_CLI = {
     "pane_process_info":  ["herdr", "pane", "process-info", "--pane"],
 }
 
-_HERDR_SOCK_PATH = Path.home() / ".config" / "herdr" / "herdr.sock"
+# CREWVIA_HERDR_SOCK is a test-only override (see tests/lib-mux.bats).  `or` —
+# not a .get() default — so that an exported-but-empty value falls back instead
+# of resolving to Path("") == ".", which would make every ping fail.
+_HERDR_SOCK_PATH = Path(
+    os.environ.get("CREWVIA_HERDR_SOCK")
+    or str(Path.home() / ".config" / "herdr" / "herdr.sock")
+)
+
+# Env vars that must never be baked into the herdr server process.
+# herdr server keeps its startup env for its whole lifetime and hands it to
+# every pane it spawns, so a session-scoped variable picked up here leaks
+# into every future Director / Worker (see knowledge: herdr server stale env
+# inheritance).  ./crewvia may now start the server itself, possibly from
+# inside an agent pane, so the env is scrubbed at spawn time.
+_HERDR_SERVER_ENV_DENY_PREFIXES = (
+    "CLAUDE_",      # CLAUDE_CODE_*, CLAUDE_EFFORT, CLAUDE_PID, ...
+    "CODEX_",
+    "CREWVIA_",
+    "TASK_",        # TASK_ID / TASK_TITLE (not TASKVIA_URL)
+)
+_HERDR_SERVER_ENV_DENY_EXACT = frozenset({
+    # Secrets.  ./crewvia exports TASKVIA_TOKEN before it may start the server,
+    # and start.sh re-exports all of these per pane in LAUNCH_CMD, so nothing
+    # needs them in the server env — where they would sit in
+    # /proc/<pid>/environ and reach every pane the server ever spawns.
+    "TASKVIA_TOKEN",
+    "NTFY_USER",
+    "NTFY_PASS",
+    "CLAUDECODE",
+    "AI_AGENT",
+    "AGENT_NAME",
+    "ROLE",
+    "SKILLS",
+    "TARGET_DIR",
+    "TMUX",
+    "TMUX_PANE",
+    "HERDR_ENV",
+})
 
 
 def _herdr_run(cmd_key: str, extra_args: List[str], timeout: int = 10) -> Optional[dict]:
@@ -541,6 +603,45 @@ def _text_in_input_line(screen: str, text: str) -> bool:
     if non_empty:
         return prefix in non_empty[-1]
     return False
+
+
+def _herdr_server_env() -> dict:
+    """Return a copy of os.environ with session-scoped variables removed.
+
+    See _HERDR_SERVER_ENV_DENY_* for why.  A denylist (not a whitelist) is used
+    so that things the panes legitimately need — SSH_AUTH_SOCK, XDG_*, WSL and
+    proxy vars — survive.
+    """
+    return {
+        k: v
+        for k, v in os.environ.items()
+        if k not in _HERDR_SERVER_ENV_DENY_EXACT
+        and not k.startswith(_HERDR_SERVER_ENV_DENY_PREFIXES)
+    }
+
+
+def _herdr_start_server() -> None:
+    """Start `herdr server` detached, without waiting for it.
+
+    `herdr server` only self-daemonizes when its stdout/stderr are a TTY.  With
+    a pipe or a file it holds the fd open and never returns, so running it via
+    ``subprocess.run(capture_output=True, timeout=N)`` blocks for the full
+    timeout and then *kills the server it just started* — auto-start could
+    never succeed.  Spawn it in its own session with the streams on /dev/null
+    and return immediately; herdr keeps its own log at
+    ~/.config/herdr/herdr-server.log.  Never raises.
+    """
+    try:
+        subprocess.Popen(
+            _HERDR_CLI["server_start"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            env=_herdr_server_env(),
+        )
+    except Exception:
+        pass
 
 
 def _herdr_ping() -> bool:
@@ -701,14 +802,7 @@ class HerdrBackend(_Backend):
         """Ensure herdr server is running.  Start it if not, wait up to 10s."""
         if _herdr_ping():
             return True
-        # Start server (daemon-izes automatically — Phase 0 confirmed).
-        try:
-            subprocess.run(
-                _HERDR_CLI["server_start"],
-                capture_output=True, timeout=15,
-            )
-        except Exception:
-            pass
+        _herdr_start_server()
 
         deadline = time.time() + 10
         while time.time() < deadline:
@@ -780,6 +874,14 @@ class HerdrBackend(_Backend):
             pass
 
         return self._ensure_server()
+
+    def server_running(self) -> bool:
+        """True if the herdr server answers a ping right now.
+
+        Unlike available(), this never starts the server — callers use it to
+        tell 'already running' from 'we had to start it' for the user.
+        """
+        return _herdr_ping()
 
     def spawn(self, name: str, cmd: str, cwd: Optional[str] = None,
               env: Optional[dict] = None) -> bool:
@@ -1068,6 +1170,9 @@ class Mux:
     def available(self) -> bool:
         return self._backend.available()
 
+    def server_running(self) -> bool:
+        return self._backend.server_running()
+
     def spawn(self, name: str, cmd: str, cwd: Optional[str] = None,
               env: Optional[dict] = None) -> bool:
         return self._backend.spawn(name, cmd, cwd=cwd, env=env)
@@ -1112,6 +1217,9 @@ def _cli_main(args: List[str]) -> int:
 
     if verb == "available":
         return 0 if m.available() else 1
+
+    elif verb == "server-running":
+        return 0 if m.server_running() else 1
 
     elif verb == "spawn":
         if len(rest) < 2:

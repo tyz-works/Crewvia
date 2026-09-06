@@ -264,7 +264,7 @@ parallel execution backend. Set `mode: herdr` in `config/crewvia.yaml` (or use
 
 ```bash
 # Launch from a plain terminal (outside any existing herdr session).
-# ./crewvia handles herdr server check and auto-attaches after startup.
+# ./crewvia starts the herdr server if it is not running, then auto-attaches.
 ./crewvia
 ```
 

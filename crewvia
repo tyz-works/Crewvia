@@ -121,23 +121,41 @@ if [[ -z "${CREWVIA_TMUX:-}" ]]; then
   fi
 fi
 
-# --- herdr 到達チェック（herdr モード時） ---
-# start.sh と同じ判定を ./crewvia でも行い、起動前に早期 exit する。
-if [[ "${CREWVIA_MUX:-}" == "herdr" ]]; then
+# --- サブコマンド ---
+SUBCMD="${1:-director}"
+
+# --- herdr 到達チェック / 自動起動（herdr モード時） ---
+# start.sh と同じ判定を ./crewvia でも行う。
+# server が落ちていれば起動してから crewvia を続行し、起動できなければ早期 exit する。
+#
+# mux を必要とするサブコマンドに限定する。help / status は plan.sh を読むだけなので、
+# スクリプトや cron から `./crewvia status` を叩くだけで常駐 daemon が生えるのを避ける。
+NEEDS_MUX=0
+case "$SUBCMD" in
+  director|orchestrator|start|worker) NEEDS_MUX=1 ;;
+esac
+
+if [[ "$NEEDS_MUX" == "1" ]] && [[ "${CREWVIA_MUX:-}" == "herdr" ]]; then
   if ! command -v herdr >/dev/null 2>&1; then
     echo "[crewvia] ERROR: CREWVIA_MUX=herdr が設定されていますが herdr バイナリが見つかりません。" >&2
     echo "          herdr をインストールするか CREWVIA_MUX=tmux に変更してください。" >&2
     exit 1
   fi
+  HERDR_WAS_DOWN=0
+  if ! python3 "${SCRIPT_DIR}/scripts/lib_mux.py" server-running >/dev/null 2>&1; then
+    HERDR_WAS_DOWN=1
+    echo "[crewvia] herdr server が起動していません。起動します..."
+  fi
+  # available() が未起動なら 'herdr server' を detached で起動し、最大 10 秒 ping を待つ。
   if ! python3 "${SCRIPT_DIR}/scripts/lib_mux.py" available >/dev/null 2>&1; then
-    echo "[crewvia] ERROR: herdr server に接続できません。" >&2
-    echo "          'herdr server' を起動してから再試行してください。" >&2
+    echo "[crewvia] ERROR: herdr server を起動できませんでした。" >&2
+    echo "          手動で 'herdr server' を実行し、~/.config/herdr/herdr-server.log を確認してください。" >&2
     exit 1
   fi
+  if [[ "$HERDR_WAS_DOWN" == "1" ]]; then
+    echo "[crewvia] herdr server を起動しました。"
+  fi
 fi
-
-# --- サブコマンド ---
-SUBCMD="${1:-director}"
 
 case "$SUBCMD" in
   status)
@@ -185,7 +203,7 @@ Behavior:
   tmux モード: kickoff + Dispatcher 起動後に Director 窓に attach します。
     tmux 内から起動した場合は switch-client、外からなら attach-session (exec) を使用します。
   herdr モード: 普通のターミナルから ./crewvia を実行してください。
-    ./crewvia が herdr server 到達チェックを行い、起動後に 'herdr' へ exec します。
+    herdr server が起動していなければ ./crewvia が自動で起動し、その後 'herdr' へ exec します。
     herdr の pane 内から実行した場合は tab focus のみ（自動 attach なし）。
 HELP
     ;;

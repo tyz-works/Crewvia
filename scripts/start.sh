@@ -126,7 +126,8 @@ fi
 # Director が後続で起動する Worker もすべて mux ウィンドウ (tmux or herdr) で動く。
 # backend は CREWVIA_MUX env または config/crewvia.yaml の mode: で決まる。
 #
-# herdr backend を要求しているのに herdr が不在 / server 不通なら exit 1。
+# herdr backend を要求しているのに herdr が不在 / server を起動できないなら exit 1。
+# （server 未起動なら lib_mux.py available が detached で起動する）
 # tmux にフォールバックしない（異なる mux に分散する事故防止）。
 if [[ "${ROLE}" == "director" ]] && [[ -z "${CREWVIA_TMUX:-}" ]]; then
   # CREWVIA_MUX が明示指定されている場合は herdr 不在チェックを先に行う
@@ -137,8 +138,8 @@ if [[ "${ROLE}" == "director" ]] && [[ -z "${CREWVIA_TMUX:-}" ]]; then
       exit 1
     fi
     if ! python3 "${SCRIPT_DIR}/lib_mux.py" available >/dev/null 2>&1; then
-      echo "[crewvia] ERROR: CREWVIA_MUX=herdr が設定されていますが herdr server に接続できません。" >&2
-      echo "          'herdr server' を起動してから再試行してください。" >&2
+      echo "[crewvia] ERROR: CREWVIA_MUX=herdr が設定されていますが herdr server を起動できません。" >&2
+      echo "          手動で 'herdr server' を実行し、~/.config/herdr/herdr-server.log を確認してください。" >&2
       exit 1
     fi
   fi

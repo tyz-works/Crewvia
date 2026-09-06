@@ -58,6 +58,12 @@ case "$cmd" in
     [[ "${FAKE_HAS_SESSION:-0}" == "1" ]] && exit 1
     exit 0
     ;;
+  list-sessions)
+    # FAKE_HAS_SESSION=1 → simulate "no server running" (exit 1).
+    [[ "${FAKE_HAS_SESSION:-0}" == "1" ]] && exit 1
+    echo "crewvia: 3 windows"
+    exit 0
+    ;;
   new-session)
     exit 0
     ;;
@@ -108,11 +114,17 @@ FAKESCRIPT
 }
 
 teardown() {
-    # Clean temp dir without rm -rf (security rule).
-    if [[ -n "${FAKE_TMUX_DIR:-}" && -d "$FAKE_TMUX_DIR" ]]; then
-        find "$FAKE_TMUX_DIR" -type f -delete 2>/dev/null || true
-        find "$FAKE_TMUX_DIR" -type d -delete 2>/dev/null || true
+    # Stop the fake herdr server if one was started (it is detached on purpose,
+    # so nothing else reaps it).
+    if [[ -n "${FAKE_SRV_PID:-}" && -f "$FAKE_SRV_PID" ]]; then
+        kill "$(cat "$FAKE_SRV_PID")" 2>/dev/null || true
     fi
+    # Clean temp dirs without rm -rf (security rule).
+    for dir in "${FAKE_TMUX_DIR:-}" "${FAKE_SRV_DIR:-}" "${FAKE_TREE:-}"; do
+        [[ -n "$dir" && -d "$dir" ]] || continue
+        find "$dir" -mindepth 1 -delete 2>/dev/null || true
+        rmdir "$dir" 2>/dev/null || true
+    done
 }
 
 # Assert the call log contains a string.
@@ -1282,4 +1294,287 @@ FAKESCRIPT_NOFIELD
     run python3 "$LIB_MUX_PY" state "Omar-worker"
     [ "$status" -eq 0 ]
     [[ "$output" == "unknown" ]]
+}
+
+
+# ---------------------------------------------------------------------------
+# herdr server auto-start
+#
+# The generic fake herdr above returns from `herdr server` immediately, which
+# hides the actual failure mode: the real `herdr server` self-daemonizes only
+# on a TTY, and otherwise holds stdout/stderr open forever.  A start that waits
+# on those streams therefore blocks until its timeout and then kills the server
+# it just spawned.  These tests use a fake that reproduces that behaviour and
+# a real (temp-path) unix socket so the ping path is exercised end to end.
+# ---------------------------------------------------------------------------
+
+setup_fake_herdr_server() {
+    FAKE_SRV_DIR="$(mktemp -d)"
+    FAKE_SRV_SOCK="${FAKE_SRV_DIR}/herdr.sock"
+    FAKE_SRV_ENV="${FAKE_SRV_DIR}/server.env"
+    FAKE_SRV_PID="${FAKE_SRV_DIR}/server.pid"
+
+    # Ping daemon: answers the NDJSON ping that _herdr_ping() sends, and never
+    # closes stdout/stderr — exactly like the real herdr server.
+    cat > "${FAKE_SRV_DIR}/pingd.py" <<'PINGD'
+import json, os, socket, sys
+
+sock_path = sys.argv[1]
+srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+srv.bind(sock_path)
+srv.listen(8)
+while True:
+    conn, _ = srv.accept()
+    with conn:
+        data = conn.recv(4096)
+        if not data:
+            continue
+        req = json.loads(data.decode().splitlines()[0])
+        conn.sendall(
+            (json.dumps({"id": req.get("id"), "result": {"type": "pong"}}) + "\n").encode()
+        )
+PINGD
+
+    # Fake herdr binary — paths are baked in so it needs no env of its own
+    # (the server env is scrubbed, so it could not read CREWVIA_* anyway).
+    cat > "${FAKE_SRV_DIR}/herdr" <<FAKESRV
+#!/usr/bin/env bash
+case "\${1:-}" in
+  --version)
+    echo "herdr 0.8.2"
+    exit 0
+    ;;
+  server)
+    # Record the env the server was started with, then become the ping daemon
+    # without ever closing stdout/stderr.
+    env > "${FAKE_SRV_ENV}"
+    echo \$\$ > "${FAKE_SRV_PID}"
+    exec python3 "${FAKE_SRV_DIR}/pingd.py" "${FAKE_SRV_SOCK}"
+    ;;
+esac
+exit 0
+FAKESRV
+    chmod +x "${FAKE_SRV_DIR}/herdr"
+}
+
+# Run lib_mux.py with the fake herdr in front of PATH and extra env vars.
+run_with_fake_server() {
+    run env CREWVIA_MUX=herdr \
+        CREWVIA_HERDR_SOCK="$FAKE_SRV_SOCK" \
+        PATH="${FAKE_SRV_DIR}:${PATH}" \
+        "$@"
+}
+
+@test "herdr: available starts the server detached and leaves it running (regression)" {
+    setup_fake_herdr_server
+
+    run_with_fake_server python3 "$LIB_MUX_PY" available
+    [ "$status" -eq 0 ]
+
+    # The server must have been started...
+    [ -f "$FAKE_SRV_PID" ]
+    # ...and must still be alive.  A blocking start (capture_output + timeout)
+    # kills it on timeout, which is the bug this guards against.
+    kill -0 "$(cat "$FAKE_SRV_PID")"
+}
+
+@test "herdr: available returns 0 immediately when the server already pings" {
+    setup_fake_herdr_server
+
+    # First call starts it.
+    run_with_fake_server python3 "$LIB_MUX_PY" available
+    [ "$status" -eq 0 ]
+    first_pid="$(cat "$FAKE_SRV_PID")"
+
+    # Second call must reuse it, not spawn a second server.
+    run_with_fake_server python3 "$LIB_MUX_PY" available
+    [ "$status" -eq 0 ]
+    [ "$(cat "$FAKE_SRV_PID")" = "$first_pid" ]
+}
+
+@test "herdr: server-running is 1 when down and never starts the server" {
+    setup_fake_herdr_server
+
+    run_with_fake_server python3 "$LIB_MUX_PY" server-running
+    [ "$status" -eq 1 ]
+    [ ! -f "$FAKE_SRV_PID" ]
+}
+
+@test "herdr: server-running is 0 after the server has been started" {
+    setup_fake_herdr_server
+
+    run_with_fake_server python3 "$LIB_MUX_PY" available
+    [ "$status" -eq 0 ]
+
+    run_with_fake_server python3 "$LIB_MUX_PY" server-running
+    [ "$status" -eq 0 ]
+}
+
+@test "herdr: session-scoped env vars are scrubbed from the started server" {
+    setup_fake_herdr_server
+
+    run env CREWVIA_MUX=herdr \
+        CREWVIA_HERDR_SOCK="$FAKE_SRV_SOCK" \
+        PATH="${FAKE_SRV_DIR}:${PATH}" \
+        CLAUDE_CODE_CHILD_SESSION=1 \
+        CLAUDE_EFFORT=high \
+        CLAUDECODE=1 \
+        AI_AGENT=claude-code_agent \
+        CODEX_COMPANION_SESSION_ID=abc \
+        CREWVIA_TASK_ID=t042 \
+        TASK_TITLE="some task" \
+        AGENT_NAME=Omar \
+        TMUX=/tmp/tmux-1000/default \
+        CREWVIA_KEEP_ME_OUT=1 \
+        SSH_AUTH_SOCK=/tmp/ssh-agent.sock \
+        TASKVIA_URL=https://example.invalid \
+        TASKVIA_TOKEN=sk-should-not-leak \
+        NTFY_USER=nuser \
+        NTFY_PASS=npass \
+        python3 "$LIB_MUX_PY" available
+    [ "$status" -eq 0 ]
+    [ -f "$FAKE_SRV_ENV" ]
+
+    # Session-scoped vars must not be baked into the long-lived server, since
+    # it hands its env to every pane it will ever spawn.
+    ! grep -q "^CLAUDE_CODE_CHILD_SESSION=" "$FAKE_SRV_ENV"
+    ! grep -q "^CLAUDE_EFFORT=" "$FAKE_SRV_ENV"
+    ! grep -q "^CLAUDECODE=" "$FAKE_SRV_ENV"
+    ! grep -q "^AI_AGENT=" "$FAKE_SRV_ENV"
+    ! grep -q "^CODEX_COMPANION_SESSION_ID=" "$FAKE_SRV_ENV"
+    ! grep -q "^CREWVIA_TASK_ID=" "$FAKE_SRV_ENV"
+    ! grep -q "^TASK_TITLE=" "$FAKE_SRV_ENV"
+    ! grep -q "^AGENT_NAME=" "$FAKE_SRV_ENV"
+    ! grep -q "^TMUX=" "$FAKE_SRV_ENV"
+    ! grep -q "^CREWVIA_KEEP_ME_OUT=" "$FAKE_SRV_ENV"
+
+    # Secrets: ./crewvia exports TASKVIA_TOKEN before it may start the server,
+    # and start.sh re-exports these per pane — they must not be baked in.
+    ! grep -q "^TASKVIA_TOKEN=" "$FAKE_SRV_ENV"
+    ! grep -q "^NTFY_USER=" "$FAKE_SRV_ENV"
+    ! grep -q "^NTFY_PASS=" "$FAKE_SRV_ENV"
+
+    # ...but unrelated vars the panes need must survive (denylist, not allowlist).
+    grep -q "^SSH_AUTH_SOCK=/tmp/ssh-agent.sock$" "$FAKE_SRV_ENV"
+    grep -q "^TASKVIA_URL=https://example.invalid$" "$FAKE_SRV_ENV"
+    grep -q "^HOME=" "$FAKE_SRV_ENV"
+    grep -q "^PATH=" "$FAKE_SRV_ENV"
+}
+
+
+@test "tmux: server-running is 0 when a server is up" {
+    setup_fake_tmux
+    run python3 "$LIB_MUX_PY" server-running
+    [ "$status" -eq 0 ]
+    log_contains "list-sessions"
+}
+
+@test "tmux: server-running is 1 when no server is running (not merely 'tmux installed')" {
+    setup_fake_tmux
+    export FAKE_HAS_SESSION=1
+    run python3 "$LIB_MUX_PY" server-running
+    [ "$status" -eq 1 ]
+}
+
+@test "CREWVIA_HERDR_SOCK: exported-but-empty falls back to the default socket path" {
+    # An empty value must not resolve to Path("") == "." — that would make every
+    # ping fail and turn autostart into a guaranteed 10s hang + exit 1.
+    run env CREWVIA_HERDR_SOCK= python3 -c "
+import sys
+sys.path.insert(0, '${REPO_ROOT}/scripts')
+import lib_mux
+print(lib_mux._HERDR_SOCK_PATH)
+"
+    [ "$status" -eq 0 ]
+    [[ "$output" == */.config/herdr/herdr.sock ]]
+}
+
+# ---------------------------------------------------------------------------
+# ./crewvia herdr autostart wiring
+#
+# A throwaway tree holding the real ./crewvia + lib_mux.py, with start.sh and
+# plan.sh stubbed out so the launcher can run end to end without spawning an
+# agent.  Guards which subcommands are allowed to start a daemon.
+# ---------------------------------------------------------------------------
+
+setup_fake_crewvia_tree() {
+    FAKE_TREE="$(mktemp -d)"
+    mkdir -p "${FAKE_TREE}/config" "${FAKE_TREE}/scripts"
+    cp "${REPO_ROOT}/crewvia" "${FAKE_TREE}/crewvia"
+    cp "${REPO_ROOT}/scripts/lib_mux.py" "${FAKE_TREE}/scripts/lib_mux.py"
+    printf 'mode: herdr\ntaskvia: disabled\n' > "${FAKE_TREE}/config/crewvia.yaml"
+
+    FAKE_TREE_DISPATCH="${FAKE_TREE}/dispatch.log"
+    for stub in start.sh plan.sh; do
+        cat > "${FAKE_TREE}/scripts/${stub}" <<STUB
+#!/usr/bin/env bash
+echo "${stub} \$*" >> "${FAKE_TREE_DISPATCH}"
+STUB
+        chmod +x "${FAKE_TREE}/scripts/${stub}"
+    done
+}
+
+# Run ./crewvia from the throwaway tree with the fake herdr in front of PATH.
+run_fake_crewvia() {
+    run env CREWVIA_MUX=herdr \
+        CREWVIA_TASKVIA=disabled \
+        CREWVIA_HERDR_SOCK="$FAKE_SRV_SOCK" \
+        PATH="${FAKE_SRV_DIR}:${PATH}" \
+        "${FAKE_TREE}/crewvia" "$@"
+}
+
+@test "crewvia: 'help' does not start a herdr server" {
+    setup_fake_herdr_server
+    setup_fake_crewvia_tree
+
+    run_fake_crewvia help
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"crewvia — マルチエージェントシステム ランチャー"* ]]
+    [ ! -f "$FAKE_SRV_PID" ]
+}
+
+@test "crewvia: 'status' does not start a herdr server" {
+    setup_fake_herdr_server
+    setup_fake_crewvia_tree
+
+    run_fake_crewvia status
+    [ "$status" -eq 0 ]
+    grep -q "^plan.sh status" "$FAKE_TREE_DISPATCH"
+    [ ! -f "$FAKE_SRV_PID" ]
+}
+
+@test "crewvia: 'worker' starts the herdr server, then dispatches to start.sh" {
+    setup_fake_herdr_server
+    setup_fake_crewvia_tree
+
+    run_fake_crewvia worker code typescript
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"herdr server が起動していません"* ]]
+    [[ "$output" == *"herdr server を起動しました"* ]]
+    [ -f "$FAKE_SRV_PID" ]
+    kill -0 "$(cat "$FAKE_SRV_PID")"
+    grep -q "^start.sh worker code typescript" "$FAKE_TREE_DISPATCH"
+}
+
+@test "crewvia: default (director) starts the herdr server" {
+    setup_fake_herdr_server
+    setup_fake_crewvia_tree
+
+    run_fake_crewvia
+    [ "$status" -eq 0 ]
+    [ -f "$FAKE_SRV_PID" ]
+    grep -q "^start.sh director" "$FAKE_TREE_DISPATCH"
+}
+
+@test "crewvia: an already-running server produces no start messages" {
+    setup_fake_herdr_server
+    setup_fake_crewvia_tree
+
+    run_fake_crewvia worker code
+    [ "$status" -eq 0 ]
+
+    run_fake_crewvia worker code
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"herdr server が起動していません"* ]]
+    [[ "$output" != *"herdr server を起動しました"* ]]
 }

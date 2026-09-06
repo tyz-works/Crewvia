@@ -5,7 +5,9 @@
 #   source "$(dirname "${BASH_SOURCE[0]}")/lib_mux.sh"
 #
 # Functions:
-#   mux_available               → exit 0 if backend available
+#   mux_available               → exit 0 if backend available (herdr: starts server if down)
+#   mux_server_running          → exit 0 if the mux server is already up (never starts it;
+#                                 tmux: `tmux list-sessions`, herdr: socket ping)
 #   mux_spawn <name> <cmd> [<cwd>]
 #   mux_send  <name> <text>
 #   mux_capture <name>          → prints screen contents
@@ -19,6 +21,10 @@ _LIB_MUX_PY="${SCRIPT_DIR}/lib_mux.py"
 
 mux_available() {
     python3 "$_LIB_MUX_PY" available
+}
+
+mux_server_running() {
+    python3 "$_LIB_MUX_PY" server-running
 }
 
 mux_spawn() {

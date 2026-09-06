@@ -866,22 +866,31 @@ def dispatch():
     # Live Worker windows (herdr pane list — used for assignment and Rule 5)
     windows = tmux_list_worker_windows()
 
-    # Alive workers from heartbeat files — used for "can_handle" check only.
-    # More reliable than windows for this purpose: herdr pane_list can
-    # transiently return [] (e.g. during state transitions), which would
-    # cause can_handle=False → false "no worker" notification to Director.
-    # Heartbeat files are written by Workers every HEARTBEAT_INTERVAL seconds
-    # and are independent of herdr's runtime state.
-    # A worker is considered alive if its heartbeat file mtime is within
-    # AGENT_PRESENCE_TTL (600s = 10 minutes).
+    # Alive workers — used for "can_handle" check only.
+    # OR condition: heartbeat fresh OR window exists (fix for heartbeat gap, PR #154 follow-up).
+    #
+    # Rationale:
+    #   - heartbeat fresh alone (PR #154): handles herdr pane_list transient [] case.
+    #     Workers write heartbeat every HEARTBEAT_INTERVAL s, independent of herdr state.
+    #   - window exists alone: handles idle Workers whose heartbeat aged past
+    #     AGENT_PRESENCE_TTL (600s) but are still running (herdr window present).
+    #     Without this, a Worker idle for >10 min is misclassified as dead →
+    #     false "no worker" notification fired (OBS-1 symptom).
+    #   - Both stale + no window → truly dead → can_handle=False (correct).
+    _window_agent_names: set = {w['agent_name'] for w in windows}
     _hb_dir = REGISTRY_DIR / 'heartbeats'
-    _alive_workers: set = set()
+    # Seed with all window-present workers first: window exists → alive (OR condition, complete).
+    # Fresh-spawn Workers write their first heartbeat only on their first tool invocation
+    # (hooks/post-tool-use.sh line 79), so iterating heartbeat files alone misses them.
+    # The heartbeat loop below unions in heartbeat-fresh Workers (e.g. herdr transient []).
+    _alive_workers: set = set(_window_agent_names)
     if _hb_dir.exists():
         _now_hb = time.time()
         for _hb_file in _hb_dir.iterdir():
             if _hb_file.is_file() and not _hb_file.name.startswith('.'):
                 try:
-                    if _now_hb - _hb_file.stat().st_mtime <= AGENT_PRESENCE_TTL:
+                    _hb_fresh = _now_hb - _hb_file.stat().st_mtime <= AGENT_PRESENCE_TTL
+                    if _hb_fresh:  # heartbeat fresh → alive (union with window seed above)
                         _alive_workers.add(_hb_file.name)
                 except OSError:
                     pass
@@ -1044,12 +1053,11 @@ def dispatch():
                             tmux_kill_window(target)
 
     # Notify Sora about unblocked pending tasks that NO live worker can handle.
-    # Fix (herdr pane_list failure): use heartbeat-based alive_workers instead
-    # of windows to determine can_handle.  windows (herdr pane list) can
-    # transiently return [] right after a task completes (state transition in
-    # herdr), causing can_handle=False → false "no worker" notification.
-    # Heartbeat files are written by Workers independently of herdr, so they
-    # remain accurate even when herdr momentarily returns an empty pane list.
+    # alive_workers uses OR condition: window seed + heartbeat-fresh union.
+    #   - window seed covers fresh-spawn Workers (no heartbeat file until first tool call).
+    #   - heartbeat union covers Workers whose herdr window transiently disappeared (PR #154).
+    #   - Neither window nor fresh heartbeat → truly dead → can_handle=False (correct).
+    # See: PR #154 (heartbeat-only fix), this PR (full OR: window seed + heartbeat union).
     for slug, meta in unblocked_pending:
         task_id = meta['id']
         task_skills = set(meta.get('skills') or [])
@@ -1057,7 +1065,7 @@ def dispatch():
         # startup request — skip them regardless of how they reached this loop.
         if task_skills & DIRECTOR_ONLY_SKILLS:
             continue
-        # can_handle: True if any alive worker (heartbeat recent) has skills ⊇ task_skills
+        # can_handle: True if any alive worker (window exists OR heartbeat recent) has skills ⊇ task_skills
         can_handle = any(
             task_skills.issubset(set((workers.get(name) or {}).get('skills') or []))
             for name in _alive_workers

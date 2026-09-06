@@ -866,6 +866,40 @@ AGENT_NAME=$REVIEWER bash scripts/start.sh worker review
 
 ---
 
+### ⚠️ PR merge 後の稼働 tab restart 必須
+
+`scripts/dispatcher.sh` / `scripts/watchdog.py` / `hooks/*.sh` などの **常駐プロセスが読み込むファイル** の fix を PR で main に merge した後は、**稼働中の tab を必ず restart** すること。
+
+restart しないと、稼働 tab は旧コードで動き続け、fix が反映されていないように見える（誤診断の原因）。
+
+**restart が必要なプロセス**:
+
+| プロセス | 対象ファイル変更時 |
+|----------|-----------------|
+| `dispatcher` tab | `scripts/dispatcher.sh` / `scripts/lib_mux.py` |
+| `watchdog` tab | `scripts/watchdog.py` / `scripts/watchdog.sh` |
+| Worker tab | `scripts/start.sh` |
+| `Sora-director` | `agents/director.md` / `hooks/*.sh` |
+
+**restart 手順（dispatcher の例）**:
+
+```bash
+# 1. fix を pull
+git fetch origin main && git pull --ff-only origin main
+
+# 2. kill → respawn
+python3 scripts/lib_mux.py kill dispatcher
+python3 scripts/lib_mux.py spawn dispatcher \
+  "cd '$PWD' && bash '$PWD/scripts/dispatcher.sh'" "$PWD"
+
+# 3. 起動確認
+tail -3 logs/dispatcher/dispatcher-$(date +%Y%m%d).log
+```
+
+詳細は `knowledge/dispatcher-restart-after-merge.md` を参照。
+
+---
+
 ## 13. 行動規範
 
 - **Workerに指示するが、Workerの仕事はしない** — 自分でコードを書いたりコマンドを実行したりしない

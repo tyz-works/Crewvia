@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# crewvia-stop — repo root wrapper for scripts/crewvia-stop.sh
+# (./crewvia とペアで ./crewvia-stop として使う thin launcher)
+exec "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/scripts/crewvia-stop.sh" "$@"

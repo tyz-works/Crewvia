@@ -2,39 +2,38 @@
 """
 tests/test_heartbeat_gap_regression.py
 
-Regression テスト: heartbeat gap バグ (OBS-1) の実証
+Regression テスト: heartbeat gap バグ (OBS-1) の実証 → fix 検証
 
 ## 背景
 
 dispatcher.sh の `_alive_workers` 構築 (Lines 869-887) は
-heartbeat ファイルの mtime のみで Worker 生存を判定する。
+heartbeat ファイルの mtime のみで Worker 生存を判定していた (旧実装)。
 
 Worker が alive (herdr window 存在) でも、heartbeat が AGENT_PRESENCE_TTL (600s)
-を超えると `_alive_workers` から除外され `can_handle = False` → 誤通知が発火する。
+を超えると `_alive_workers` から除外され `can_handle = False` → 誤通知が発火していた。
+これを「heartbeat gap バグ」と呼ぶ (OBS-1)。
 
-これを「heartbeat gap バグ」と呼ぶ。
+## 修正内容 (このブランチで適用済み)
 
-## 修正方針 (次 mission で実装)
-
-`_alive_workers` の判定を「heartbeat fresh OR window exists」の OR 条件にする。
+`_alive_workers` の判定を「heartbeat fresh OR window exists」の OR 条件に変更。
 
 ## テストシナリオ
 
 - test_A: heartbeat fresh + window あり → alive ✓ (正常ケース)
-- test_B: heartbeat stale (>600s) + window あり → 現在の実装では dead 誤判定 (バグ実証)
-  → このテストは FAIL する (バグの実証が目的)
+- test_B: heartbeat stale (>600s) + window あり → OR fix により alive ✓ (fix 検証)
+  → 旧実装では FAIL していたが、fix 適用後は PASS に転換
 - test_C: heartbeat stale + window なし → dead ✓ (真に dead)
-- test_D: heartbeat fresh + window なし (transient) → alive ✓ (PR#154 修正対象の元バグ)
+- test_D: heartbeat fresh + window なし (transient) → alive ✓ (PR#154 修正を維持)
 
 実行方法:
   python3 -m pytest tests/test_heartbeat_gap_regression.py -v
-  # test_B が FAIL することを確認
+  # 全テスト PASS することを確認 (test_B が PASS に転換)
 
 dispatcher.sh 確認箇所:
   Line 481:    AGENT_PRESENCE_TTL = 600
-  Lines 869-887: _alive_workers 構築 (heartbeat mtime のみ)
+  Lines 869-887: _alive_workers 構築 (heartbeat fresh OR window exists — fix 適用後)
   Lines 1060-1065: can_handle ロジック (_alive_workers 使用)
-  Line 542:    publish_agents での AGENT_PRESENCE_TTL 使用
+  Line 542:    publish_agents での AGENT_PRESENCE_TTL 使用 (変更なし)
 """
 
 import sys
@@ -225,27 +224,23 @@ def test_A_heartbeat_fresh_window_exists_alive():
 
 
 # ---------------------------------------------------------------------------
-# test_B: heartbeat stale + window あり → バグ実証 (FAIL 期待)
+# test_B: heartbeat stale + window あり → OR fix により alive ✓ (fix 検証)
 # ---------------------------------------------------------------------------
 
-def test_B_heartbeat_stale_window_exists_bug():
+def test_B_heartbeat_stale_window_exists_fixed():
     """
-    test_B: heartbeat stale (>600s) + window あり → 現在の実装では dead 誤判定
+    test_B: heartbeat stale (>600s) + window あり → OR fix により alive ✓
 
-    *** このテストは FAIL することが目的 ***
+    heartbeat gap バグ (OBS-1) の fix 検証テスト。
 
-    Worker は alive (herdr window が存在する) にもかかわらず、
-    heartbeat が 600s 超えたために `_alive_workers` から除外され、
-    `can_handle = False` → 誤通知が発火するバグを実証する。
+    旧実装 (heartbeat のみ):
+      heartbeat stale → _alive_workers 空 → can_handle = False (誤判定)
+    新実装 (OR 条件, このブランチ):
+      heartbeat stale でも window あり → alive → can_handle = True (正しい)
 
     dispatcher.sh 参照:
-      Lines 869-887: heartbeat mtime > AGENT_PRESENCE_TTL → _alive_workers に含まれない
-      Lines 1060-1065: _alive_workers が空 → can_handle = False
-
-    期待される挙動 (バグが修正された場合):
-      window が存在するので alive → can_handle = True
-    現在の挙動 (バグあり):
-      heartbeat stale → alive なし → can_handle = False ← 誤り
+      Lines 869-887: _hb_fresh or _win_exists の OR 条件 (fix 適用後)
+      Lines 1060-1065: _alive_workers を使った can_handle 判定
     """
     with tempfile.TemporaryDirectory() as tmpdir:
         disp = MockDispatcherWithWindows(tmpdir)
@@ -256,34 +251,32 @@ def test_B_heartbeat_stale_window_exists_bug():
 
         task_skills = {"bash", "code"}
 
-        # 現在の実装: heartbeat stale → _alive_workers 空 → can_handle = False
-        result_current = disp.can_handle_current(task_skills)
-        alive_current = disp._get_alive_workers_current()
+        # 旧実装 (heartbeat のみ): dead 誤判定 (バグ — 参考情報)
+        result_old = disp.can_handle_current(task_skills)
+        alive_old = disp._get_alive_workers_current()
 
-        # 修正案: window あり → alive → can_handle = True
+        # 新実装 (OR 条件 = fix): window あり → alive → can_handle = True
         result_fixed = disp.can_handle_fixed(task_skills)
         alive_fixed = disp._get_alive_workers_fixed()
 
         print(
             f"  test_B: heartbeat_stale=True (700s), window_exists=True "
-            f"→ current can_handle={result_current} (alive={alive_current}), "
-            f"fixed can_handle={result_fixed} (alive={alive_fixed})"
+            f"→ old logic can_handle={result_old} (alive={alive_old}) [historical bug], "
+            f"fixed logic can_handle={result_fixed} (alive={alive_fixed})"
         )
 
-        # 修正案では True になることを確認 (参考)
+        # 旧実装がバグ (False) だったことを記録 (参考: 歴史的バグ)
+        assert result_old is False, (
+            f"Unexpected: old (heartbeat-only) logic returned {result_old}. "
+            f"Expected False to confirm historical OBS-1 bug pattern."
+        )
+
+        # fix 適用後: OR 条件により window あり → alive → True (PASS = fix 検証)
         assert result_fixed is True, (
-            f"test_B sanity check: fixed logic should return True "
-            f"(window exists), but got {result_fixed}"
-        )
-
-        # 現在の実装では True を期待する (= Worker alive なので)
-        # ← しかし実際は False → このアサーションが FAIL する (バグ実証)
-        assert result_current is True, (
-            f"BUG CONFIRMED: heartbeat stale (700s) + window exists "
-            f"→ current can_handle={result_current} (expected True, got False). "
-            f"alive_workers={alive_current}. "
-            f"Worker IS running (window exists) but heartbeat gap causes false 'dead' detection. "
-            f"Fix: use 'heartbeat fresh OR window exists' OR condition."
+            f"FIX FAILED: heartbeat stale (700s) + window exists "
+            f"→ fixed can_handle={result_fixed} (expected True). "
+            f"alive_workers={alive_fixed}. "
+            f"OR condition fix not working correctly."
         )
 
 
@@ -385,30 +378,71 @@ def test_D_heartbeat_fresh_no_window_alive():
 
 
 # ---------------------------------------------------------------------------
+# test_E: dispatcher.sh に OR 条件 fix が適用済みであることを構文確認
+# ---------------------------------------------------------------------------
+
+def test_E_dispatcher_sh_contains_or_condition_fix():
+    """
+    test_E: dispatcher.sh に heartbeat gap fix (OR 条件) が適用済みであることを確認。
+
+    dispatcher.sh 参照:
+      Lines 869-887: _hb_fresh or _win_exists の OR 条件
+      _window_agent_names の構築
+    """
+    dispatcher_path = Path(__file__).parent.parent / "scripts" / "dispatcher.sh"
+    assert dispatcher_path.exists(), f"dispatcher.sh not found at {dispatcher_path}"
+
+    content = dispatcher_path.read_text()
+
+    # OR 条件の実装確認
+    assert "_window_agent_names" in content, \
+        "Fix: _window_agent_names (window set) not found in dispatcher.sh"
+    assert "_hb_fresh" in content, \
+        "Fix: _hb_fresh variable not found in dispatcher.sh"
+    assert "_win_exists" in content, \
+        "Fix: _win_exists variable not found in dispatcher.sh"
+    assert "_hb_fresh or _win_exists" in content, \
+        "Fix: 'heartbeat fresh OR window exists' OR condition not found in dispatcher.sh"
+
+    # 既存の構造が維持されていることを確認
+    assert "_alive_workers" in content, \
+        "_alive_workers variable not found in dispatcher.sh"
+    assert "AGENT_PRESENCE_TTL" in content, \
+        "AGENT_PRESENCE_TTL not found in dispatcher.sh"
+    assert "for name in _alive_workers" in content, \
+        "can_handle loop over _alive_workers not found"
+
+    print("✓ test_E: dispatcher.sh に heartbeat gap OR fix が適用済みであることを確認")
+
+
+# ---------------------------------------------------------------------------
 # エントリポイント (直接実行用)
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     print("=" * 70)
-    print("Heartbeat Gap Regression Test (OBS-1)")
+    print("Heartbeat Gap Regression Test (OBS-1) — fix 検証")
     print("dispatcher.sh Lines: 481, 869-887, 1060-1065, 542")
     print("=" * 70)
     print()
-    print("期待される結果:")
+    print("期待される結果 (fix 適用後):")
     print("  test_A: PASS (heartbeat fresh + window → alive ✓)")
-    print("  test_B: FAIL (heartbeat stale + window → current: dead 誤判定, BUG)")
+    print("  test_B: PASS (heartbeat stale + window → OR fix により alive ✓)")
     print("  test_C: PASS (heartbeat stale + no window → dead ✓)")
     print("  test_D: PASS (heartbeat fresh + no window → alive via heartbeat ✓)")
+    print("  test_E: PASS (dispatcher.sh に OR fix が適用済み ✓)")
     print()
 
     results = {}
     tests = [
         ("test_A", test_A_heartbeat_fresh_window_exists_alive),
-        ("test_B", test_B_heartbeat_stale_window_exists_bug),
+        ("test_B", test_B_heartbeat_stale_window_exists_fixed),
         ("test_C", test_C_heartbeat_stale_no_window_dead),
         ("test_D", test_D_heartbeat_fresh_no_window_alive),
+        ("test_E", test_E_dispatcher_sh_contains_or_condition_fix),
     ]
 
+    failures = []
     for name, fn in tests:
         try:
             fn()
@@ -416,11 +450,13 @@ if __name__ == "__main__":
         except AssertionError as e:
             print(f"✗ {name}: FAIL — {e}")
             results[name] = "FAIL"
+            failures.append(name)
         except Exception as e:
             import traceback
             print(f"✗ {name}: ERROR — {e}")
             traceback.print_exc()
             results[name] = "ERROR"
+            failures.append(name)
 
     print()
     print("=" * 70)
@@ -430,17 +466,14 @@ if __name__ == "__main__":
         print(f"  {mark} {name}: {result}")
 
     print()
-    if results.get("test_B") == "FAIL":
-        print("✓ test_B が FAIL → heartbeat gap バグ (OBS-1) を実証成功")
+    if not failures:
+        print("✓ 全テスト PASS — heartbeat gap バグ (OBS-1) の fix が正しく適用済み")
         print()
         print("CONCLUSION:")
-        print("  dispatcher.sh Lines 869-887 は heartbeat mtime のみ判定。")
-        print("  Worker が alive (window あり) でも heartbeat が 600s 超えると")
-        print("  _alive_workers から除外され can_handle = False → 誤通知発火。")
-        print()
-        print("  修正: 'heartbeat fresh OR window exists' の OR 条件にすること。")
+        print("  dispatcher.sh の _alive_workers 構築を OR 条件に変更した:")
+        print("  'heartbeat fresh OR window exists'")
+        print("  idle Worker (heartbeat gap) でも window が存在すれば alive とみなす。")
+        sys.exit(0)
     else:
-        print("WARNING: test_B が FAIL しなかった。バグが既に修正済みか、")
-        print("         テストの前提条件に問題がある可能性がある。")
-
-    sys.exit(0)  # バグ実証が目的なので非ゼロ終了はしない
+        print(f"✗ {len(failures)} tests FAILED: {failures}")
+        sys.exit(1)

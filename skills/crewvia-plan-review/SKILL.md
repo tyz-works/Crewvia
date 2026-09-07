@@ -172,6 +172,62 @@ review skill の Worker がタスク完了を報告する際の verdict 表現�
 
 ---
 
+## Codex reviewer (Kai) の使い分け
+
+> Phase 1 (2026-09-07) で導入。`knowledge/codex-reviewer.md` に詳細手順あり。
+
+Priya がプラン設計時に **Claude (Seo) のみ / Seo + Kai の 2 人体制** を判断する基準：
+
+### 2 人体制を推奨するケース
+
+- **重要 mission**（main / staging に影響する code 変更）
+- **Claude 生成コードの review**（同一モデル bias を避けたい）
+- **critical bug 疑いのある大きな diff**（大規模リファクタリング / auth / billing 等）
+- **LLM 特有の誤りパターンが懸念される場面**（hallucination / edge case 見落とし）
+
+### Claude (Seo) 1 人で十分なケース
+
+- docs-only の変更（MEMORY 更新 / README / knowledge 追記等）
+- minor fix（1-5 行程度の typo fix / コメント修正）
+- 設定ファイルの単純変更
+
+### verdict 突合フロー
+
+2 人体制の場合、review task を 2 つ積む（`skills: [review]` のタスクを Seo 用・Kai 用それぞれ）：
+
+```yaml
+# Seo review task 例
+skills: [review]
+blocked_by: [<実装 task の ID>]
+description: |
+  対象 PR: #XXX
+  verdict rule: LGTM → plan.sh done / 要修正 → plan.sh needs-director
+
+# Kai review task 例（kai-review.sh 経由）
+skills: [review]
+blocked_by: [<実装 task の ID>]
+description: |
+  対象 PR: #XXX
+  Director が bash scripts/kai-review.sh --pr XXX --task <id> を実行
+  verdict rule: LGTM → plan.sh done / 要修正 → plan.sh needs-director
+```
+
+| 突合結果 | Director の対応 |
+|---|---|
+| 両方 LGTM | merge 承認（Seo に gh pr merge 指示） |
+| どちらか NEEDS FIX | findings を統合して修正タスクを判断 |
+| BRANCH MISMATCH | 優先度最高、即対応 |
+
+### Phase 1 制約（Priya への注意）
+
+Kai (Codex) は Phase 1 では **hook なし**。以下を plan に明記すること：
+
+- Kai の review task は Taskvia カンバンに出ない（Director が手動で kai-review.sh を実行）
+- Kai の task_count は自動更新されない（Phase 1 は許容）
+- Kai タイムアウト時は Director が手動で `plan.sh needs-director` を呼ぶ
+
+---
+
 ## 注意事項
 
 - プランレビューはコードレビューではない。コードの中身ではなく、タスク設計の妥当性を見る

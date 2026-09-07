@@ -18,7 +18,10 @@ from pathlib import Path
 import pytest
 
 # scripts/ を sys.path に追加して lib_model をインポート
-SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts"
+REPO_ROOT = Path(__file__).resolve().parent.parent
+SCRIPTS_DIR = REPO_ROOT / "scripts"
+REAL_CONFIG = REPO_ROOT / "config" / "crewvia.yaml"
+
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 import lib_model  # noqa: E402
@@ -165,6 +168,114 @@ class TestEdgeCases:
         p.write_text("worker_model:\n", encoding="utf-8")
         result = lib_model.resolve(str(p), "code")
         assert result == ""
+
+
+# ---------------------------------------------------------------------------
+# Fix 6: 実 config/crewvia.yaml を読む assertion
+# 手写し STANDARD_CONFIG と実ファイルの乖離を早期検出するための保護テスト。
+# タイブレーク検証は同ランクの異なるモデル ID を持つ fixture を使う。
+# ---------------------------------------------------------------------------
+@pytest.mark.skipif(not REAL_CONFIG.exists(), reason="config/crewvia.yaml not found")
+class TestRealConfig:
+    """実 config/crewvia.yaml に対して解決結果を検証する。"""
+
+    def test_planning_returns_opus(self):
+        assert lib_model.resolve(str(REAL_CONFIG), "planning") == "claude-opus-5"
+
+    def test_docs_returns_haiku(self):
+        assert lib_model.resolve(str(REAL_CONFIG), "docs") == "claude-haiku-4-5-20251001"
+
+    def test_code_falls_back_to_worker_model(self):
+        # code は model_per_skill 未定義 → worker_model を返す
+        result = lib_model.resolve(str(REAL_CONFIG), "code")
+        assert "sonnet" in result.lower() or "haiku" in result.lower() or "opus" in result.lower()
+
+    def test_planning_and_code_returns_opus(self):
+        # 最高ランク選択: planning=opus, code=worker_model → opus
+        assert lib_model.resolve(str(REAL_CONFIG), "planning,code") == "claude-opus-5"
+
+    def test_docs_and_qa_returns_haiku(self):
+        # 同ランク: docs=haiku, qa=haiku → haiku
+        assert lib_model.resolve(str(REAL_CONFIG), "docs,qa") == "claude-haiku-4-5-20251001"
+
+
+class TestTiebreakWithFixture:
+    """同ランク複数 skill のタイブレーク検証 (実 config と乖離しない独立 fixture)。"""
+
+    def test_same_rank_sorted_first_wins(self, tmp_path):
+        """同ランク・異なるモデル ID が指定された時、スキル名ソート順の最初が選ばれる。"""
+        p = tmp_path / "cfg.yaml"
+        p.write_text(
+            "worker_model: claude-sonnet-5\n"
+            "model_per_skill:\n"
+            "  aaa: claude-haiku-4-5-20251001\n"
+            "  zzz: claude-haiku-4-3\n",  # 同じ haiku ランクだが別 ID
+            encoding="utf-8",
+        )
+        # ソート: aaa < zzz → aaa のモデルが採用される
+        result = lib_model.resolve(str(p), "zzz,aaa")
+        assert result == "claude-haiku-4-5-20251001"
+
+    def test_higher_rank_wins_regardless_of_sort_order(self, tmp_path):
+        """上位ランクのモデルはソート順に関係なく常に勝つ。"""
+        p = tmp_path / "cfg.yaml"
+        p.write_text(
+            "worker_model: claude-sonnet-5\n"
+            "model_per_skill:\n"
+            "  aaa: claude-haiku-4-5-20251001\n"
+            "  zzz: claude-opus-5\n",
+            encoding="utf-8",
+        )
+        # zzz は ソート順で後だが、opus ランクが高い → zzz が勝つ
+        result = lib_model.resolve(str(p), "aaa,zzz")
+        assert result == "claude-opus-5"
+
+
+# ---------------------------------------------------------------------------
+# _parse_yaml_fallback のユニットテスト (Fix 5)
+# ---------------------------------------------------------------------------
+class TestParseYamlFallback:
+    def test_parses_worker_model(self, tmp_path):
+        p = tmp_path / "cfg.yaml"
+        p.write_text("worker_model: claude-sonnet-5\n", encoding="utf-8")
+        result = lib_model._parse_yaml_fallback(str(p))
+        assert result.get("worker_model") == "claude-sonnet-5"
+
+    def test_parses_model_per_skill(self, tmp_path):
+        p = tmp_path / "cfg.yaml"
+        p.write_text(
+            "worker_model: claude-sonnet-5\n"
+            "model_per_skill:\n"
+            "  docs: claude-haiku-4-5-20251001\n"
+            "  planning: claude-opus-5\n",
+            encoding="utf-8",
+        )
+        result = lib_model._parse_yaml_fallback(str(p))
+        assert result["model_per_skill"]["docs"] == "claude-haiku-4-5-20251001"
+        assert result["model_per_skill"]["planning"] == "claude-opus-5"
+
+    def test_ignores_comments(self, tmp_path):
+        p = tmp_path / "cfg.yaml"
+        p.write_text(
+            "# comment\n"
+            "worker_model: claude-sonnet-5  # inline comment\n"
+            "model_per_skill:\n"
+            "  docs: claude-haiku-4-5-20251001  # haiku\n",
+            encoding="utf-8",
+        )
+        result = lib_model._parse_yaml_fallback(str(p))
+        assert result["worker_model"] == "claude-sonnet-5"
+        assert result["model_per_skill"]["docs"] == "claude-haiku-4-5-20251001"
+
+    def test_real_config_parseable(self):
+        """実 config/crewvia.yaml が fallback パーサーで正しく解析される。"""
+        if not REAL_CONFIG.exists():
+            pytest.skip("config/crewvia.yaml not found")
+        result = lib_model._parse_yaml_fallback(str(REAL_CONFIG))
+        assert "worker_model" in result
+        assert "model_per_skill" in result
+        assert result["model_per_skill"].get("planning") == "claude-opus-5"
+        assert result["model_per_skill"].get("docs") == "claude-haiku-4-5-20251001"
 
 
 # ---------------------------------------------------------------------------

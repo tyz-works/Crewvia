@@ -54,7 +54,8 @@ def _parse_yaml_fallback(path: str) -> dict:
                 if ":" in stripped:
                     key, _, val = stripped.partition(":")
                     key = key.strip()
-                    val = val.strip().strip('"\'')
+                    # インラインコメントを除去してから quotes を剥がす
+                    val = val.split("#")[0].strip().strip('"\'')
                     if key == "worker_model" and val:
                         result["worker_model"] = val
                     elif key == "model_per_skill":

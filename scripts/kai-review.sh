@@ -126,7 +126,9 @@ codex exec review \
   2>&1 | tee /tmp/kai-review-stderr.txt || CODEX_EXIT=$?
 
 if [[ $CODEX_EXIT -ne 0 ]]; then
-  _warn "codex exec review exited with code ${CODEX_EXIT}"
+  _error "codex exec failed with exit code ${CODEX_EXIT} — cannot trust review output"
+  "$PLAN_SH" needs-director "$TASK_ID" ${MISSION_SLUG:+--mission "$MISSION_SLUG"} "CODEX FAILURE: exit=${CODEX_EXIT} — review not completed reliably"
+  exit 1
 fi
 
 # --- 出力ファイル確認 ---
@@ -149,12 +151,13 @@ if echo "$REVIEW_CONTENT" | grep -qiE 'critical|high severity|security vulnerabi
   NEEDS_FIX=1
 fi
 
-# "no issues" / "LGTM" / "looks good" の場合は修正不要とみなす
+# LGTM 判定: 明示的 LGTM パターンが一致し、かつ critical/high 系 keyword がない場合のみ LGTM
+# 明示的 LGTM なし → Kai の意図不明として保守的に needs-director とする
 LGTM_PATTERN='no issues|lgtm|looks good|no findings|no problems|no concerns|nothing to report'
-if echo "$REVIEW_CONTENT" | grep -qiE "$LGTM_PATTERN"; then
-  # LGTM パターンがあっても critical があれば要修正
-  if [[ $NEEDS_FIX -eq 0 ]]; then
-    NEEDS_FIX=0  # 明示的に確認
+if [[ $NEEDS_FIX -eq 0 ]]; then
+  if ! echo "$REVIEW_CONTENT" | grep -qiE "$LGTM_PATTERN"; then
+    _warn "No explicit LGTM pattern found and no critical keywords — treating as needs-director for safety"
+    NEEDS_FIX=1
   fi
 fi
 
@@ -171,10 +174,10 @@ SUMMARY="${SUMMARY//$'\n'/ }"  # 改行をスペースに置換
 
 if [[ $NEEDS_FIX -eq 1 ]]; then
   _info "Review found issues requiring fixes"
-  "$PLAN_SH" needs-director "$TASK_ID" "NEEDS FIX: PR#${PR_NUM} ${HEAD_BRANCH} — ${SUMMARY}"
+  "$PLAN_SH" needs-director "$TASK_ID" ${MISSION_SLUG:+--mission "$MISSION_SLUG"} "NEEDS FIX: PR#${PR_NUM} ${HEAD_BRANCH} — ${SUMMARY}"
 else
   _info "Review passed (LGTM or no critical issues)"
-  "$PLAN_SH" done "$TASK_ID" "LGTM: PR#${PR_NUM} ${HEAD_BRANCH} reviewed by Kai (model=${MODEL}) — ${SUMMARY}"
+  "$PLAN_SH" done "$TASK_ID" ${MISSION_SLUG:+--mission "$MISSION_SLUG"} "LGTM: PR#${PR_NUM} ${HEAD_BRANCH} reviewed by Kai (model=${MODEL}) — ${SUMMARY}"
 fi
 
 _info "Review complete."

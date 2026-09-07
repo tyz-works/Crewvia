@@ -88,11 +88,6 @@ def _select_backend() -> "type":
     if env_mux == "tmux":
         return TmuxBackend
 
-    # Legacy compat: CREWVIA_TMUX=1 → tmux
-    crewvia_tmux = os.environ.get("CREWVIA_TMUX", "")
-    if crewvia_tmux == "1":
-        return TmuxBackend
-
     config = _config_mode()
     if config == "herdr":
         return HerdrBackend

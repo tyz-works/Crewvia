@@ -121,15 +121,15 @@ else
   fi
 fi
 
-# --- 並列モード選択（Director 起動時のみ、CREWVIA_TMUX 未設定時のみ） ---
-# Director が並列モードを選ぶと、CREWVIA_TMUX=1 が exec claude に引き継がれ、
+# --- 並列モード選択（Director 起動時のみ、CREWVIA_MUX_ENABLED 未設定時のみ） ---
+# Director が並列モードを選ぶと、CREWVIA_MUX_ENABLED=1 が exec claude に引き継がれ、
 # Director が後続で起動する Worker もすべて mux ウィンドウ (tmux or herdr) で動く。
 # backend は CREWVIA_MUX env または config/crewvia.yaml の mode: で決まる。
 #
 # herdr backend を要求しているのに herdr が不在 / server を起動できないなら exit 1。
 # （server 未起動なら lib_mux.py available が detached で起動する）
 # tmux にフォールバックしない（異なる mux に分散する事故防止）。
-if [[ "${ROLE}" == "director" ]] && [[ -z "${CREWVIA_TMUX:-}" ]]; then
+if [[ "${ROLE}" == "director" ]] && [[ -z "${CREWVIA_MUX_ENABLED:-}" ]]; then
   # CREWVIA_MUX が明示指定されている場合は herdr 不在チェックを先に行う
   if [[ "${CREWVIA_MUX:-}" == "herdr" ]]; then
     if ! command -v herdr >/dev/null 2>&1; then
@@ -153,21 +153,21 @@ if [[ "${ROLE}" == "director" ]] && [[ -z "${CREWVIA_TMUX:-}" ]]; then
       exit 1
     fi
     export CREWVIA_MUX=herdr
-    export CREWVIA_TMUX=1
+    export CREWVIA_MUX_ENABLED=1
     echo "[crewvia] herdr 並列モードで起動します（config 設定）。"
   elif [[ "$MODE_FROM_CONFIG" == "tmux" ]]; then
-    export CREWVIA_TMUX=1
+    export CREWVIA_MUX_ENABLED=1
     echo "[crewvia] tmux モードで起動します（config 設定）。"
   elif [[ "$MODE_FROM_CONFIG" == "inline" ]]; then
-    export CREWVIA_TMUX=0
+    export CREWVIA_MUX_ENABLED=0
     echo "[crewvia] インラインモードで起動します（config 設定）。"
   elif ! python3 "${SCRIPT_DIR}/lib_mux.py" available >/dev/null 2>&1; then
     echo "[crewvia] mux backend (tmux / herdr) 未検出 → インラインモードで起動します。" >&2
     echo "          （並列 Worker 起動には 'brew install tmux' を推奨）" >&2
-    export CREWVIA_TMUX=0
+    export CREWVIA_MUX_ENABLED=0
   elif [[ ! -e /dev/tty ]]; then
     # 非対話環境（CI など）: 並列モードはスキップ
-    export CREWVIA_TMUX=0
+    export CREWVIA_MUX_ENABLED=0
   else
     echo ""
     echo "[crewvia] 並列モードにしますか？（mux backend: ${CREWVIA_MUX:-自動検出}）"
@@ -177,11 +177,11 @@ if [[ "${ROLE}" == "director" ]] && [[ -z "${CREWVIA_TMUX:-}" ]]; then
     read -r TMUX_CHOICE </dev/tty || TMUX_CHOICE=""
     case "$TMUX_CHOICE" in
       n|N|no|No|NO)
-        export CREWVIA_TMUX=0
+        export CREWVIA_MUX_ENABLED=0
         echo "[crewvia] インラインモードで起動します。"
         ;;
       *)
-        export CREWVIA_TMUX=1
+        export CREWVIA_MUX_ENABLED=1
         echo "[crewvia] 並列モードで起動します。"
         ;;
     esac
@@ -446,7 +446,7 @@ if [[ "${ROLE}" == "worker" ]] && [[ "$WORK_DIR" != "$REPO_ROOT" ]]; then
 fi
 
 # Launch with or without mux (tmux / herdr)
-if [[ "${CREWVIA_TMUX:-0}" == "1" ]]; then
+if [[ "${CREWVIA_MUX_ENABLED:-0}" == "1" ]]; then
   # Load mux abstraction layer (backend selected via CREWVIA_MUX or config/crewvia.yaml).
   # shellcheck source=lib_mux.sh
   source "${SCRIPT_DIR}/lib_mux.sh"

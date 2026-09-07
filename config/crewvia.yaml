@@ -17,16 +17,34 @@ wip_limit: 8
 # Director と Worker が起動時に使う Claude モデルを指定します。
 # 空にすると claude CLI のデフォルト（ユーザーの /model 設定）に従います。
 #
-# 利用可能な ID:
-#   claude-opus-4-6            ← 複雑な調整・計画向き
-#   claude-sonnet-4-6          ← バランス型、実装作業向き
-#   claude-haiku-4-5-20251001  ← 高速・低コスト、軽タスク向き
+# 利用可能な ID (2026-09 時点で claude CLI 2.1.263 に受理確認済み):
+#   claude-opus-5              ← 最高性能。計画・調整・レビュー向き
+#   claude-sonnet-5            ← バランス型。実装・汎用作業向き (worker_model のデフォルト)
+#   claude-haiku-4-5-20251001  ← 高速・低コスト。軽タスク向き
 #
 # 環境変数での上書き:
-#   CREWVIA_DIRECTOR_MODEL=claude-opus-4-6
-#   CREWVIA_WORKER_MODEL=claude-sonnet-4-6
-director_model: claude-opus-4-7
-worker_model: claude-sonnet-4-6
+#   CREWVIA_DIRECTOR_MODEL=claude-opus-5
+#   CREWVIA_WORKER_MODEL=claude-sonnet-5
+director_model: claude-opus-5
+worker_model: claude-sonnet-5
+
+# ===== skill 別モデル選択 =====
+# skill に応じて Worker のモデルを自動で切り替えます。
+# 複数 skill が指定された場合は、最も要求の高いモデル (opus > sonnet > haiku) が採用されます。
+# ここに列挙されていない skill は worker_model にフォールバックします。
+#
+# Worker 起動時に CREWVIA_WORKER_MODEL が明示的に設定されていれば、
+# この設定より優先されます（env var 最優先）。
+model_per_skill:
+  planning:    claude-opus-5
+  plan_review: claude-opus-5
+  review:      claude-opus-5
+  research:    claude-opus-5
+  docs:        claude-haiku-4-5-20251001
+  qa:          claude-haiku-4-5-20251001
+  verify:      claude-haiku-4-5-20251001
+  # 未定義の skill (bash / code / typescript / python / database / cloud / ops)
+  # は worker_model にフォールバックする
 
 # ===== 起動モード =====
 # tmux   — Director + Worker を tmux セッション "crewvia" 内に展開（並列 Worker 可）

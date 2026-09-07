@@ -21,6 +21,13 @@ if [[ -f "${REPO_ROOT}/.env" ]]; then
   done < "${REPO_ROOT}/.env"
 fi
 
+# --- ユーザー由来の CREWVIA_WORKER_MODEL をフラグとして記録 ---
+# config 読み込みブロックより前に記録しないと、config が CREWVIA_WORKER_MODEL を
+# 上書き export した後では「ユーザーが設定した」か「config のデフォルト」かが区別できなくなる。
+# このフラグを使って model_per_skill の適用可否を判定する（実装C参照）。
+WORKER_MODEL_EXPLICIT=0
+[[ -n "${CREWVIA_WORKER_MODEL:-}" ]] && WORKER_MODEL_EXPLICIT=1
+
 # --- crewvia.yaml からシステム設定を読み込む ---
 # 環境変数が既に設定されていれば config より優先される。
 # 設定を追加する場合はここにロード処理を足す。
@@ -38,11 +45,14 @@ if [[ -f "$CONFIG_FILE" ]]; then
       export CREWVIA_DIRECTOR_MODEL="$ORCH_MODEL_FROM_CONFIG"
     fi
   fi
+  # WORKER_MODEL_FROM_CONFIG はローカル変数のみ (export しない)。
+  # export すると tmux server env に継承され、Director tab や他 Worker tab が
+  # WORKER_MODEL_EXPLICIT=1 として誤検知し、model_per_skill が silent 無効化される。
+  # herdr は _HERDR_SERVER_ENV_DENY_PREFIXES で保護済みだが、tmux / inline は
+  # この export だけで守る必要があるため、ここではローカル保持に留める。
+  WORKER_MODEL_FROM_CONFIG=""
   if [[ -z "${CREWVIA_WORKER_MODEL:-}" ]]; then
     WORKER_MODEL_FROM_CONFIG=$(grep -E '^worker_model:[[:space:]]*\S' "$CONFIG_FILE" | awk '{print $2}' | tr -d '"' | head -1)
-    if [[ -n "$WORKER_MODEL_FROM_CONFIG" ]]; then
-      export CREWVIA_WORKER_MODEL="$WORKER_MODEL_FROM_CONFIG"
-    fi
   fi
 fi
 # Default fallback（config ファイル無しでも必ず値が入る）
@@ -80,6 +90,36 @@ case "$ROLE" in
     exit 1
     ;;
 esac
+
+# --- Worker モデル解決ヘルパー ---
+# dry-run と実経路の両方から呼び、挙動を統一する。
+# lib_model.py が空を返した場合は WORKER_MODEL_FROM_CONFIG にフォールバック。
+# 2>/dev/null は使わない — config 不在 / PyYAML 未導入 / YAML 破損の警告は
+# 起動端末に表示させることで Director が異常検知できるようにする。
+_resolve_worker_model() {
+  local skills_csv="${1:-}"
+  local result
+  result="$(python3 "${SCRIPT_DIR}/lib_model.py" resolve --config "${CONFIG_FILE}" --skills "${skills_csv}")"
+  if [[ -z "${result}" ]]; then
+    result="${WORKER_MODEL_FROM_CONFIG:-}"
+  fi
+  printf '%s' "${result}"
+}
+
+# --- dry-run モード: CREWVIA_PRINT_MODEL=1 ---
+# AGENT_NAME 割り当て・registry 書き込みなど副作用のある処理より前に exit する。
+# QA が何度実行しても registry / worktree を汚さない。
+if [[ "${CREWVIA_PRINT_MODEL:-0}" == "1" ]]; then
+  if [[ "${ROLE}" == "director" ]]; then
+    echo "${CREWVIA_DIRECTOR_MODEL:-}"
+  elif [[ "${WORKER_MODEL_EXPLICIT}" == "1" ]]; then
+    echo "${CREWVIA_WORKER_MODEL:-}"
+  else
+    _SKILLS_CSV="$(IFS=,; echo "${SKILLS_ARR[*]:-}")"
+    echo "$(_resolve_worker_model "${_SKILLS_CSV}")"
+  fi
+  exit 0
+fi
 
 # Determine AGENT_NAME
 REGISTRY_YAML="${REPO_ROOT}/registry/workers.yaml"
@@ -416,11 +456,21 @@ if [[ -n "$FULL_PROMPT" ]]; then
   PROMPT_FLAG=(--append-system-prompt "$FULL_PROMPT")
 fi
 
-# Resolve model per role (config / env で指定されていれば --model を渡す)
+# Resolve model per role
+# Director: CREWVIA_DIRECTOR_MODEL (env > config) をそのまま使う
+# Worker 優先順位:
+#   1. CREWVIA_WORKER_MODEL が起動前から明示的に設定されていた (WORKER_MODEL_EXPLICIT=1) → 最優先
+#   2. それ以外 → _resolve_worker_model() で skill に応じたモデルを解決 (model_per_skill 適用)
+#   3. resolver が空を返した → --model を付けない (claude CLI のデフォルトに委ねる)
 if [[ "${ROLE}" == "director" ]]; then
   SELECTED_MODEL="${CREWVIA_DIRECTOR_MODEL:-}"
-else
+elif [[ "${WORKER_MODEL_EXPLICIT}" == "1" ]]; then
+  # ユーザーが env var で明示指定 → skill mapping を使わず env var を尊重
   SELECTED_MODEL="${CREWVIA_WORKER_MODEL:-}"
+else
+  # skill に応じてモデルを自動選択 (_resolve_worker_model は dry-run と同じ helper を使う)
+  SKILLS_CSV="$(IFS=,; echo "${SKILLS_ARR[*]:-}")"
+  SELECTED_MODEL="$(_resolve_worker_model "${SKILLS_CSV}")"
 fi
 MODEL_FLAG=()
 if [[ -n "$SELECTED_MODEL" ]]; then

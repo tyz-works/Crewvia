@@ -20,8 +20,8 @@
 | 項目 | Claude Kai (既存) | Codex Kai (本ドキュメント) |
 |---|---|---|
 | 実体 | Claude Code Worker | Codex CLI (`codex exec`) |
-| スキル | code / database / typescript | review（Phase 1 限定） |
-| 起動方法 | `bash scripts/start.sh worker code` | `bash scripts/kai-review.sh` |
+| スキル | code / database / typescript | **なし（Phase 1 は Director 手動起動のみ）** |
+| 起動方法 | `bash scripts/start.sh worker code` | `bash scripts/kai-review.sh`（Director が直接呼ぶ） |
 | registry エントリ | あり（既存） | なし（Phase 1 では手動管理） |
 | Taskvia sync | あり（hook 経由） | **なし**（Phase 1 制約、詳細後述） |
 
@@ -29,7 +29,11 @@
 
 ## Phase 1 スコープ
 
-Phase 1 では **review skill のみ**。以下は **Phase 2 以降に判断**：
+Phase 1 では **Kai は plan.sh のタスクとして組み込まず、Director が重要 PR に対して手動で `kai-review.sh` を呼ぶ helper** として運用する。
+
+> **重要**: Kai を `skills: [review]` の task として Priya のプランに載せると、Dispatcher が Seo (Claude) に誤 assign するリスクがある。Phase 2 で `codex-review` 専用 skill 名を導入するまでは手動起動に留める。
+
+以下は **Phase 2 以降に判断**：
 
 - bash / code / docs / qa スキルの Codex 化
 - worker-names.yaml への Kai 登録
@@ -51,12 +55,12 @@ codex --version
 ### 起動コマンド
 
 ```bash
-# PR 番号と task_id・mission slug を Director が指定する
+# PR 番号と task_id を Director が指定する（mission slug は指定推奨）
 bash scripts/kai-review.sh \
   --pr <PR番号> \
   --task <task_id> \
-  --mission <mission-slug> \
-  [--model o4-mini]   # デフォルト: o4-mini / 重要 review は o3
+  [--mission <mission-slug>] \   # 省略時は plan.sh の auto-detect に依存（指定推奨）
+  [--model o4-mini]              # デフォルト: o4-mini / 重要 review は o3
 ```
 
 ### モデル選択の目安
@@ -126,12 +130,15 @@ Kai が特に注目する 3 つの観点と verdict rule：
 
 ## Claude (Seo) との 2 人体制フロー
 
-Phase 1 では Claude Seo と Codex Kai の **2 人体制**で review する：
+Phase 1 では Claude Seo と Codex Kai の **2 人体制**で review する。
+
+**運用上の分担**:
+- **Seo (Claude)**: 通常の `skills: [review]` タスクとして Dispatcher 経由で assign
+- **Kai (Codex)**: Director が対象 PR を決定後、手動で `kai-review.sh` を呼び出す（plan task として組み込まない）
 
 ```
-[Director]
-  ├─ Seo (Claude)  → plan.sh done "LGTM" / needs-director "NEEDS FIX"
-  └─ Kai (Codex)   → plan.sh done "LGTM" / needs-director "NEEDS FIX"
+[Seo task]  plan.sh done "LGTM" / needs-director "NEEDS FIX"
+[Director が kai-review.sh 手動実行]  exit 0 → plan.sh done / NEEDS FIX なら plan.sh needs-director
 
 [2人の verdict 突合]
   両方 LGTM         → merge 承認（Director が Seo に merge 指示）

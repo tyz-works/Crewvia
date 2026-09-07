@@ -34,8 +34,8 @@ worker_model: claude-sonnet-4-6
 #          herdr モードでは先に herdr を起動し、その中で bash scripts/start.sh director を実行すること
 # inline — 単独プロセスで起動（Worker 並列不可、デバッグ向き）
 #
-# 環境変数での上書き: CREWVIA_MUX=tmux|herdr (最優先) / CREWVIA_TMUX=1 (tmux) / CREWVIA_TMUX=0 (inline)
-# CREWVIA_MUX が設定されていれば CREWVIA_TMUX より優先される。
+# 環境変数での上書き: CREWVIA_MUX=tmux|herdr (最優先) / CREWVIA_MUX_ENABLED=1 (並列 ON) / CREWVIA_MUX_ENABLED=0 (inline)
+# CREWVIA_MUX が設定されていれば CREWVIA_MUX_ENABLED より優先される。
 mode: herdr  # 戻す時は tmux。切替日: 2026-09-04
 
 # ===== mux 設定 =====

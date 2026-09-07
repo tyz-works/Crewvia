@@ -510,9 +510,9 @@ Worker に crewvia 以外のプロジェクト (例: `~/workspace/taskvia`) を�
 
 起動モードによる挙動の違い:
 
-- **tmux モード（`CREWVIA_MUX=tmux` または `CREWVIA_TMUX=1`）**: 新しい tmux ウィンドウ `crewvia:${AGENT_NAME}-worker` が生成され、Worker がバックグラウンドで起動する。Director の制御は即座に返る。並列 Worker 起動が可能。`tmux attach -t crewvia` で出力を確認できる。
+- **tmux モード（`CREWVIA_MUX=tmux` または `CREWVIA_MUX_ENABLED=1`）**: 新しい tmux ウィンドウ `crewvia:${AGENT_NAME}-worker` が生成され、Worker がバックグラウンドで起動する。Director の制御は即座に返る。並列 Worker 起動が可能。`tmux attach -t crewvia` で出力を確認できる。
 - **herdr モード（`CREWVIA_MUX=herdr`）**: 新しい herdr タブ `${AGENT_NAME}-worker` が生成され、Worker がバックグラウンドで起動する。Director の制御は即座に返る。並列 Worker 起動が可能。普通のターミナルから `./crewvia` を実行すると起動後に herdr へ自動 attach する（herdr の pane 内から実行した場合は tab focus のみ）。
-- **インラインモード（`CREWVIA_TMUX=0` または未設定、かつ `CREWVIA_MUX` 未設定）**: `exec claude` でカレントシェルが Worker プロセスに置き換わるため、Director から Worker を spawn するとハングする。**1セッション1エージェント制限**。複数 Worker 起動はできない。
+- **インラインモード（`CREWVIA_MUX_ENABLED=0` または未設定、かつ `CREWVIA_MUX` 未設定）**: `exec claude` でカレントシェルが Worker プロセスに置き換わるため、Director から Worker を spawn するとハングする。**1セッション1エージェント制限**。複数 Worker 起動はできない。
 
 モードは Director 起動時に `bash scripts/start.sh director` 実行直後のプロンプト「並列モードにしますか？」で選択する。選択結果は `CREWVIA_MUX` env として Director Claude プロセスに引き継がれ、後続の Worker 起動に自動で反映される。
 

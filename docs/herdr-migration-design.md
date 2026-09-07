@@ -1,5 +1,9 @@
 # tmux → herdr 移行設計 (mux backend 抽象化)
 
+> **注**: このドキュメントは tmux → herdr 移行の設計過程を記録した歴史文書です。
+> 現在 crewvia は主に herdr backend で稼働しています。
+> コード中の `CREWVIA_TMUX` は `CREWVIA_MUX_ENABLED` に改名されました。
+
 作成日: 2026-09-04
 作成者: Sora (Director)
 ステータス: 承認済み設計 (実装前)

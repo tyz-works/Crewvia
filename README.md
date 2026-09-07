@@ -3,7 +3,7 @@
 **Crewvia** is a portable, task-driven multi-agent system built on top of Claude Code CLI.
 Agents are dynamically assigned names, collaborate on kanban-style task cards, and integrate
 with [Taskvia](https://taskvia.vercel.app) for approval flows and knowledge logging.
-No tmux required — it works standalone or with any terminal multiplexer.
+No mux required — it works standalone or with any terminal multiplexer (tmux or herdr).
 
 ---
 
@@ -35,7 +35,7 @@ Key design principles:
 - **Task-first** — Agents are card executors; the task card is the unit of work
 - **Name continuity** — Workers with the same skill set inherit the same name across sessions (e.g., all `[ops, bash]` Workers are called "Kai"), enabling knowledge accumulation
 - **Taskvia-optional** — The system runs in standalone mode when `TASKVIA_TOKEN` is not set
-- **tmux-optional** — tmux is supported but not required; any terminal works
+- **mux-optional** — tmux/herdr is supported but not required; any terminal works
 
 ---
 
@@ -570,7 +570,7 @@ Set `max_per_day: 0` to disable autonomous improvements entirely.
 │              │   │   "Kai"      │       │   "Luca"     │
 └──────┬───────┘   └──────┬───────┘       └──────┬───────┘
        │ ▲                │ ▲ assign              │ ▲ assign
-       │ │notify          │ │ (tmux send-keys)    │ │ (tmux send-keys)
+       │ │notify          │ │ (mux send)          │ │ (mux send)
        │ │                └─┴─────────────────────┘─┘
        │ │                          │
        │ └──────────────────────────┤
@@ -582,9 +582,9 @@ Set `max_per_day: 0` to disable autonomous improvements entirely.
           needed / done)
 ```
 
-### Dispatcher モデル（tmux モード）
+### Dispatcher モデル（並列モード）
 
-tmux モードでは `scripts/dispatcher.sh` が常駐バックグラウンドプロセスとして動作する。
+並列モード (tmux または herdr) では `scripts/dispatcher.sh` が常駐バックグラウンドプロセスとして動作する。
 Director が直接 Worker にタスクを送る代わりに、Dispatcher がタスクを割り当てる。
 
 | コンポーネント | 役割 |
@@ -598,7 +598,7 @@ Director が直接 Worker にタスクを送る代わりに、Dispatcher がタ�
 1. Director decomposes mission → registers tasks with `plan.sh add`
 2. Director spawns Workers with required skills via `bash scripts/start.sh worker <skill>`
 3. Dispatcher (started automatically) polls every 5 seconds for idle Workers + unblocked tasks
-4. Dispatcher assigns tasks to idle Workers via `tmux send-keys`
+4. Dispatcher assigns tasks to idle Workers via mux backend (`tmux send-keys` or `herdr pane run`)
 5. Worker pulls assigned task via `plan.sh pull --task <id> --mission <slug>`, executes it
 6. Before risky tool calls, PreToolUse hook requests approval from Taskvia
 7. Worker reports completion via `plan.sh done`, then waits for next Dispatcher assign

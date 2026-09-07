@@ -27,6 +27,50 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
+# PyYAML fallback: crewvia.yaml の必要部分だけ解析する簡易パーサー
+# hooks/lib_skill_perms.py の _parse_yaml_fallback() と同パターン。
+# ---------------------------------------------------------------------------
+def _parse_yaml_fallback(path: str) -> dict:
+    """PyYAML 不在時の簡易 YAML パーサー。
+
+    crewvia.yaml の中から worker_model と model_per_skill だけを抽出する。
+    対応するスキーマ:
+      worker_model: <value>
+      model_per_skill:
+        <skill>: <value>   # 2-space indent
+    """
+    result: dict = {}
+    in_model_per_skill = False
+
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            stripped = line.rstrip()
+            if not stripped or stripped.lstrip().startswith("#"):
+                continue
+            indent = len(line) - len(line.lstrip())
+
+            if indent == 0:
+                in_model_per_skill = False
+                if ":" in stripped:
+                    key, _, val = stripped.partition(":")
+                    key = key.strip()
+                    val = val.strip().strip('"\'')
+                    if key == "worker_model" and val:
+                        result["worker_model"] = val
+                    elif key == "model_per_skill":
+                        result.setdefault("model_per_skill", {})
+                        in_model_per_skill = True
+            elif in_model_per_skill and indent >= 2 and ":" in stripped:
+                key, _, val = stripped.partition(":")
+                key = key.strip()
+                val = val.strip().strip('"\'').split("#")[0].strip()  # strip inline comment
+                if key and val:
+                    result.setdefault("model_per_skill", {})[key] = val
+
+    return result
+
+
+# ---------------------------------------------------------------------------
 # モデルランク: 高い方が優先される
 # ---------------------------------------------------------------------------
 def _model_rank(model_id: str) -> int:
@@ -70,16 +114,17 @@ def resolve(config_path: str, skills_str: str) -> str:
         )
         return ""
 
-    if yaml is None:
-        print(
-            "[lib_model] WARNING: PyYAML not installed; cannot parse config",
-            file=sys.stderr,
-        )
-        return ""
-
     try:
-        with p.open(encoding="utf-8") as f:
-            config = yaml.safe_load(f) or {}
+        if yaml is not None:
+            with p.open(encoding="utf-8") as f:
+                config = yaml.safe_load(f) or {}
+        else:
+            # PyYAML 未導入時は簡易 fallback パーサーを使う
+            print(
+                "[lib_model] INFO: PyYAML not installed; using fallback parser",
+                file=sys.stderr,
+            )
+            config = _parse_yaml_fallback(str(p))
     except Exception as exc:  # noqa: BLE001
         print(f"[lib_model] WARNING: failed to parse config: {exc}", file=sys.stderr)
         return ""

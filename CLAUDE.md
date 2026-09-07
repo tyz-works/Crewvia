@@ -84,6 +84,8 @@
 | `CREWVIA_TASK_SLUG` | タスクタイトルを kebab-case 化した slug（worktree パス末尾に使用） |
 | `CREWVIA_PROJECT` | Taskvia に送るプロジェクト識別子。デフォルト: `crewvia` |
 | `CREWVIA_APPROVAL_CHANNEL` | 承認通知チャネル: `taskvia` / `ntfy` / `both`（config `approval_channel.mode` より優先） |
+| `CREWVIA_DIRECTOR_MODEL` | Director が使用するモデル。`config/crewvia.yaml` の `director_model` より優先。空の場合は claude CLI のデフォルト |
+| `CREWVIA_WORKER_MODEL` | Worker が使用するモデルを強制指定。`config/crewvia.yaml` の `model_per_skill` による skill 別自動選択より優先（最優先）。空にするか未設定の場合は skill に応じて自動選択される |
 | `CREWVIA_MUX` | mux バックエンド選択: `tmux` / `herdr`。config `mode:` より優先 |
 | `CREWVIA_MUX_ENABLED` | 並列モード有効化: `1` で並列 ON（`CREWVIA_MUX` 未設定時の tmux fallback）/ `0` でインラインモード強制。`CREWVIA_MUX` が設定済みなら不要 |
 | `CREWVIA_TMUX_SESSION` | tmux backend が使うセッション名（デフォルト: `crewvia`） |

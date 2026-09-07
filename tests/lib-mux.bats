@@ -669,8 +669,8 @@ FAKESCRIPT
     export CREWVIA_MUX=herdr
     export CREWVIA_HERDR_WORKSPACE=crewvia
 
-    # Unset tmux-related vars that would interfere with backend selection.
-    unset CREWVIA_TMUX
+    # Unset mux-related vars that would interfere with backend selection.
+    unset CREWVIA_MUX_ENABLED
     unset CREWVIA_TMUX_SESSION
     unset TMUX
     unset HERDR_ENV
@@ -1090,14 +1090,15 @@ STALE_FAKE
 # CREWVIA_MUX priority
 # ---------------------------------------------------------------------------
 
-@test "CREWVIA_MUX=herdr overrides CREWVIA_TMUX=1 and tmux in PATH" {
+@test "CREWVIA_MUX=herdr overrides CREWVIA_MUX_ENABLED=1 and tmux in PATH" {
     setup_fake_herdr
     # Even with tmux available, herdr must be selected.
+    # CREWVIA_MUX_ENABLED is a start.sh parallel-mode flag; lib_mux.py ignores it.
     run python3 -c "
 import sys, os
 sys.path.insert(0, '${REPO_ROOT}/scripts')
 os.environ['CREWVIA_MUX'] = 'herdr'
-os.environ['CREWVIA_TMUX'] = '1'
+os.environ['CREWVIA_MUX_ENABLED'] = '1'
 from lib_mux import _select_backend, HerdrBackend
 assert _select_backend() is HerdrBackend, 'Expected HerdrBackend, got ' + str(_select_backend())
 print('CREWVIA_MUX=herdr wins')
@@ -1118,22 +1119,6 @@ print('CREWVIA_MUX=tmux wins')
 "
     [ "$status" -eq 0 ]
     [[ "$output" == *"wins"* ]]
-}
-
-@test "CREWVIA_TMUX=1 without CREWVIA_MUX selects TmuxBackend (legacy compat)" {
-    setup_fake_herdr
-    unset CREWVIA_MUX
-    run python3 -c "
-import sys, os
-sys.path.insert(0, '${REPO_ROOT}/scripts')
-os.environ.pop('CREWVIA_MUX', None)
-os.environ['CREWVIA_TMUX'] = '1'
-from lib_mux import _select_backend, TmuxBackend
-assert _select_backend() is TmuxBackend, 'Expected TmuxBackend (legacy CREWVIA_TMUX=1)'
-print('legacy compat OK')
-"
-    [ "$status" -eq 0 ]
-    [[ "$output" == *"OK"* ]]
 }
 
 # ---------------------------------------------------------------------------

@@ -230,7 +230,7 @@ PYEOF
 
     # Launch via start.sh — pass AGENT_NAME so start.sh uses it instead of assign-name.sh.
     # CREWVIA_BENCH_MODE=1 suppresses start.sh auto-kickoff and settings.json overwrite.
-    AGENT_NAME="$agent" TARGET_DIR="$target_dir" CREWVIA_TMUX=1 CREWVIA_TASKVIA=disabled \
+    AGENT_NAME="$agent" TARGET_DIR="$target_dir" CREWVIA_MUX_ENABLED=1 CREWVIA_TASKVIA=disabled \
         CREWVIA_BENCH_MODE=1 bash "$SCRIPT_DIR/start.sh" worker code bash &
     disown $!
 

@@ -81,7 +81,6 @@ Kai発見: oci compute instance list で --compartment-id を省略すると全�
 | `CREWVIA_TASK_ID` | 担当中のタスク ID（plan.sh pull 後に設定） |
 | `CREWVIA_TASK_SLUG` | タスクタイトルを kebab-case 化した slug（worktree パスの末尾部分に使用） |
 | `TARGET_DIR` | 他プロジェクトを触るタスクの場合にそのプロジェクトの絶対パスが入る。未設定なら `$CREWVIA_REPO/.claude/worktrees/` 配下に worktree が作成され Worker はその中で作業する。セットされている場合は worktree は作成されず Worker は TARGET_DIR で直接作業する |
-| `CREWVIA_WORKER_MODEL` | Worker に使用させるモデルを強制指定する env var。**最優先** — 設定されていると skill 別自動選択 (`model_per_skill`) より優先される。一時的なモデル変更に使う |
 
 ### 使用モデルの決まり方
 

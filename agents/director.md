@@ -338,8 +338,8 @@ required_evidence:
 | `docs` | ドキュメント作成 |
 | `review` | コードレビュー・PR承認 |
 | `qa` | QA・動作検証（実装者とは別Workerが担当） |
-| `planning` | プランレビュー（タスク分解・依存関係・スキル割り当ての妥当性検証） |
-| `plan_review` | planning の別名。crewvia-plan-review skill 参照 |
+| `planning` | プランレビュー（タスク分解・依存関係・スキル割り当ての妥当性検証）。Bash(plan.sh status/pull), git log/diff は可。Edit/Write は deny |
+| `plan_review` | plan_review.md への verdict 出力専用（Write 可 / Edit・Bash 全面 deny）。planning とは権限が異なる。crewvia-plan-review skill 参照 |
 | `verify` | 実機検証・smoke test |
 
 ### skill 別デフォルトモデル

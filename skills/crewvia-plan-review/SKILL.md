@@ -62,6 +62,70 @@ Director が作成したミッションプランをレビューし、問題点�
 - [ ] 最終成果物（PR merged / デプロイ完了 等）までカバーされているか
 - [ ] review タスクが含まれているか（PR を伴う場合）
 
+### 2-7. review タスク必須チェック
+
+- [ ] code / docs / typescript / python / bash 等の skill を持つ task が 1 つでも存在する場合、
+      その後段に review skill の task が設定されているか
+- [ ] review task の blocked_by が対象 task を正しく指しているか
+- [ ] review task の description に「verdict LGTM → plan.sh done、
+      要修正 → plan.sh needs-director」が明示されているか
+
+---
+
+## 推奨 task template
+
+### review task
+
+タイトル例: `PR #XXX code review findings 確認`
+
+```yaml
+skills: [review]
+blocked_by: [<PR を作った task の ID>]
+priority: high
+description: |
+  対象 PR: #XXX (branch: <branch-name>)
+
+  review 観点:
+  - correctness: バグ・ロジックエラー
+  - reuse/efficiency: 重複・非効率なコード
+  - doc cross-reference: ドキュメントとコードの整合性
+  - test: テストカバレッジ・テストの妥当性
+
+  required_evidence:
+  - findings 一覧（severity: critical/high/medium/low 付き）
+  - 各 finding の修正/放置判断
+
+  verdict rule:
+  - findings なし、または全て low で放置可 → plan.sh done (「LGTM: 問題なし」を明記)
+  - 修正が必要な finding あり → plan.sh needs-director (finding 一覧と修正提案を記載)
+```
+
+### PR fix task
+
+タイトル例: `PR #XXX fix: <内容>`
+
+```yaml
+skills: [<対象 PR と同じ skill>]
+blocked_by: [<review task の ID>]
+priority: high
+description: |
+  対象 PR: #XXX (head branch: <branch-name>)
+
+  作業手順:
+  1. worktree に cd する (または既存 worktree を利用)
+  2. git checkout <branch-name>  # branch mismatch 防止のため PR head branch を明示的に checkout
+  3. 実装・修正を行う
+  4. git push origin <branch-name>
+
+  required_evidence:
+  - push 済み commit hash
+  - gh pr view #XXX --json commits で commit が PR に含まれることを確認
+
+  verdict rule:
+  - PR commits に自分の commit が含まれる → plan.sh done
+  - 含まれない (branch mismatch 等) → plan.sh needs-director (branch mismatch として報告)
+```
+
 ---
 
 ## Step 3: レビュー結果を報告する
@@ -93,6 +157,18 @@ Director が作成したミッションプランをレビューし、問題点�
 | **GO** | 問題なし。Worker 起動してよい |
 | **修正後 GO** | 軽微な修正が必要。Director が修正すれば即実行可 |
 | **STOP** | 重大な問題あり。タスク分解をやり直すべき |
+
+### verdict expression rule (review Worker 向け)
+
+review skill の Worker がタスク完了を報告する際の verdict 表現ルール:
+
+| 状況 | verdict | plan.sh コマンド |
+|------|---------|----------------|
+| findings なし / 全て low で放置可 | LGTM: 問題なし（理由を明記） | `plan.sh done` |
+| 修正が必要な finding あり | NEEDS FIX: <finding 一覧と修正提案> | `plan.sh needs-director` |
+| PR commits に自分の commit が含まれない | BRANCH MISMATCH: <branch 名と状況> | `plan.sh needs-director` |
+
+**重要**: 「修正すれば問題ない」と自己判断して `plan.sh done` しない。修正要否の判断は Director に委ねる。
 
 ---
 

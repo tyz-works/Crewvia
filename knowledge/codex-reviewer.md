@@ -1,29 +1,49 @@
-# Codex Reviewer (Kai) ナレッジベース
+# Codex Reviewer (Kai-codex) ナレッジベース
 
-> Codex (Kai) を reviewer として使う際の手順・制約・運用ノウハウ。
-> Phase 1 (review 限定) で導入。mission: 20260907-codex-reviewer-phase1
+> Codex CLI を reviewer として使う際の手順・制約・運用ノウハウ。
+> Phase 1 (review 限定) で導入 (mission: 20260907-codex-reviewer-phase1)。
+> **Phase 2 (2026-09-08)**: Dispatcher が `codex-review` skill task を自動 spawn するようになった。
+> Kai-codex は registry/workers.yaml に登録された正規 worker で、plan.sh pull/done 経由で Taskvia 同期と task_count bump が自動で走る。
 
 ---
 
-## Kai の起動手順
+## Kai-codex の起動手順
 
-### 基本コマンド
+### Phase 2: Priya が plan に codex-review task を積むだけ（常用パス）
+
+```bash
+plan.sh add "PR#<N> Codex review (Kai)" \
+  --skills codex-review \
+  --blocked-by t<impl_task_id> \
+  --pr-number <N> \
+  --priority medium
+```
+
+- `--skills codex-review` — 専用 skill 名。Dispatcher がこの skill を検知して `kai-review.sh` を自動 spawn する
+- `--pr-number <N>` — frontmatter に PR 番号を刻む。Dispatcher が spawn 時に `--pr` として渡す。**必須**（無いと spawn せず warning）
+- `--blocked-by` — 実装 task の完了後に review を走らせる典型パターン
+
+Dispatcher spawn 後のフロー: `kai-review.sh` が `plan.sh pull` → `codex exec review` → `plan.sh done` を実行。Director の手動介入は不要。
+
+### 手動起動（フォールバック）
+
+自動 spawn が失敗したとき、または smoke test で個別に呼ぶとき:
 
 ```bash
 bash scripts/kai-review.sh \
   --pr <PR番号> \
   --task <task_id> \
-  [--mission <mission-slug>] \   # 省略時は plan.sh の auto-detect に依存（指定推奨）
-  [--model o4-mini]              # 省略時デフォルト: o4-mini
+  --mission <mission-slug> \
+  [--agent Kai-codex] \
+  [--model o3] \
+  [--skip-pull]                  # task が既に in_progress の場合
 ```
-
-> **⚠️ Kai review は Priya のプランの task として組み込まない**。`skills: [review]` で積むと Dispatcher が Seo (Claude) に誤 assign するリスクがある。Director が重要 PR を判断して手動で呼び出すこと。Phase 2 で `codex-review` 専用 skill 名が導入されたらこの制約は解除される。
 
 ### モデル選択の目安
 
 | モデル | 用途 |
 |---|---|
-| `o4-mini`（デフォルト） | 通常 review・速度重視 |
+| デフォルト（codex CLI が決定） | 通常 review・速度重視 |
 | `o3` | 重要 mission・大きな diff・クリティカルバグ疑い |
 
 ### 前提確認
@@ -90,34 +110,39 @@ codex exec review --base main \
 
 ---
 
-## hook 不足の制約と workaround（Phase 1）
+## hook 不足の制約と workaround
 
-Codex CLI は Claude Code の pre/post-tool-use hook を**持たない**。
+Codex CLI は Claude Code の pre/post-tool-use hook を**持たない**。Phase 2 では plan.sh + dispatcher でカバーできる箇所を全て埋めた:
 
-| 機能 | Claude Worker | Codex Kai (Phase 1) |
+| 機能 | Claude Worker | Kai-codex (Phase 2) |
 |---|---|---|
-| Taskvia approval リクエスト | 自動（hook） | **なし**（Director 手動判断） |
-| Taskvia カンバン表示 | あり | **なし**（Kai カードは出ない） |
-| knowledge ログ自動投稿 | あり（hook） | **なし**（findings は task ファイルに残る） |
-| heartbeat / watchdog 連携 | あり | **なし**（Director が目視でタイムアウト管理） |
-| registry task_count 更新 | 自動（plan.sh done 内） | **手動 or スキップ**（Phase 1 許容） |
+| Taskvia approval リクエスト | 自動（hook） | **なし** — Codex CLI に該当機構が無い（Phase 3 検討） |
+| Taskvia カンバン表示 | あり（hook） | **あり** — plan.sh pull が taskvia_sync_pull を発火 |
+| Taskvia agents 表示 | あり（heartbeat） | **あり** — kai-review.sh が起動時に registry/heartbeats/Kai-codex を touch |
+| knowledge ログ自動投稿 | あり（hook） | **なし** — findings は plan.sh 経由で task ファイル Result に残る |
+| heartbeat / watchdog 連携 | あり | **限定的** — 起動時 touch のみ（review 中は更新なし） |
+| registry task_count 更新 | 自動（plan.sh done 内） | **自動** — Kai-codex が registry 登録済みなので同経路 |
 
 **運用上の対処**:
-- `kai-review.sh` の終了 exit code で成否を確認（exit 0 = plan.sh 呼び出し成功）
-- findings は `/tmp/kai-review-output.txt` と task の Result セクションに残る
-- Kai が止まった場合は Director が手動で `plan.sh needs-director` を呼ぶ
+- Dispatcher の spawn ログ: `logs/kai-spawn/<slug>-<task_id>-<epoch>.log`
+- review findings は `/tmp/kai-review-output.txt` と task の Result セクションに残る
+- Kai-codex がハングしたら:
+  ```bash
+  rm queue/assignments/Kai-codex   # spawn ロック解除
+  plan.sh update <task_id> --status pending --reset --mission <slug>   # task 復旧
+  ```
 
 ---
 
-## Phase 2 予定（dispatcher 統合後）
+## Phase 3 予定
 
-Phase 2 で検討する拡張（実運用 smoke test 後に判断）:
+Phase 2 の実運用結果を見て、Phase 3 で以下を検討する:
 
 - `start.sh --engine codex` で bash / code / docs / qa の Codex 化
-- `kai-review.sh` 内から Taskvia API を直接呼び出す wrapper 実装
-- Dispatcher が Kai に直接 assign 通知（現在は Director が手動起動）
-- `plan.sh done` が Codex Kai の task_count も自動インクリメント
+- kai-review.sh 内で Taskvia の /api/request (approval) と /api/knowledge を直接呼ぶ
 - `worker-names.yaml` に engine 情報（codex / claude）を含める
+- LGTM 一致時の自動 merge 承認
+- heartbeat 継続更新（長時間 review のタイムアウト管理）
 
 ---
 

@@ -172,11 +172,11 @@ review skill の Worker がタスク完了を報告する際の verdict 表現�
 
 ---
 
-## Codex reviewer (Kai) の使い分け
+## Codex reviewer (Kai-codex) の使い分け
 
-> Phase 1 (2026-09-07) で導入。`knowledge/codex-reviewer.md` に詳細手順あり。
+> Phase 1 (2026-09-07) で導入、**Phase 2 (2026-09-08) で自動化**。詳細手順は `knowledge/codex-reviewer.md` 参照。
 
-Priya がプラン設計時に **Claude (Seo) のみ / Seo + Kai の 2 人体制** を判断する基準：
+Priya がプラン設計時に **Claude (Seo) のみ / Seo + Kai-codex の 2 人体制** を判断する基準：
 
 ### 2 人体制を推奨するケース
 
@@ -193,21 +193,30 @@ Priya がプラン設計時に **Claude (Seo) のみ / Seo + Kai の 2 人体制
 
 ### verdict 突合フロー
 
-2 人体制の場合、**Priya のプランに積むのは Seo 用 review task のみ**。Kai は plan.sh の task として組み込まない。
-
-> **⚠️ 注意**: Kai review task に `skills: [review]` を付けて plan に積むと、Dispatcher が Seo (Claude) に誤 assign するリスクがある。Kai (Codex) は Phase 2 で `codex-review` 専用 skill 名が導入されるまで **Director 手動起動 helper** として運用すること。
+2 人体制の場合、**Priya は Seo と Kai-codex の両方の review task をプランに積む**（Phase 2 以降）。
 
 ```yaml
-# Seo review task（plan に積む）
-skills: [review]
-blocked_by: [<実装 task の ID>]
-description: |
-  対象 PR: #XXX
-  verdict rule: LGTM → plan.sh done / 要修正 → plan.sh needs-director
+# Seo review task（Claude が実行）
+- title: "PR#XXX review (Seo)"
+  skills: [review]
+  blocked_by: [<実装 task の ID>]
+  description: |
+    対象 PR: #XXX
+    verdict rule: LGTM → plan.sh done / 要修正 → plan.sh needs-director
 
-# Kai review（plan には積まない — Director が Seo review 完了後に手動実行）
-# bash scripts/kai-review.sh --pr XXX --task <id> [--mission <slug>]
-# Kai の verdict は Director が plan.sh needs-director or done で反映する
+# Kai-codex review task（Dispatcher が自動 spawn）
+- title: "PR#XXX Codex review (Kai)"
+  skills: [codex-review]
+  blocked_by: [<実装 task の ID>]
+  pr_number: XXX          # ★ 必須。dispatcher が --pr で渡す
+  description: |
+    Codex CLI による adversarial review。Seo と独立に判定する。
+```
+
+`plan.sh add` の呼び出し例:
+```bash
+plan.sh add "PR#42 review (Seo)"      --skills review        --blocked-by t003
+plan.sh add "PR#42 Codex review (Kai)" --skills codex-review  --blocked-by t003 --pr-number 42
 ```
 
 | 突合結果 | Director の対応 |
@@ -216,14 +225,12 @@ description: |
 | どちらか NEEDS FIX | findings を統合して修正タスクを判断 |
 | BRANCH MISMATCH | 優先度最高、即対応 |
 
-### Phase 1 制約（Priya への注意）
+### Phase 2 の Priya への注意
 
-Kai (Codex) は Phase 1 では **hook なし・plan task なし**。Priya がプランを設計する際は以下を守ること：
-
-- **Kai review task を plan に積まない**（`skills: [review]` で積むと Seo に誤 assign される）
-- Kai review は plan の description に「Director が重要 PR に対して手動で kai-review.sh を実行」と注記するだけでよい
-- Kai の task_count は自動更新されない（Phase 1 は許容）
-- Kai タイムアウト時は Director が手動で `plan.sh needs-director` を呼ぶ
+- **codex-review skill task には `--pr-number` を必ず指定する**。指定なしだと dispatcher は spawn せず warning を出す
+- Kai-codex は registry に登録済みなので `plan.sh done` で task_count が自動 bump される
+- Kai-codex のカードは Taskvia カンバンに表示される（plan.sh pull 経由で in_progress → done が sync される）
+- タイムアウト時は Director が `rm queue/assignments/Kai-codex` + `plan.sh update <task> --reset` で復旧する
 
 ---
 

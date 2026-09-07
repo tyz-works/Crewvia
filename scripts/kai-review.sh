@@ -4,22 +4,28 @@ set -euo pipefail
 # kai-review.sh — codex exec review ラッパー (Kai reviewer 専用)
 #
 # Usage:
-#   bash scripts/kai-review.sh --pr <PR#> --task <task_id> [--mission <slug>] [--model <model>]
+#   bash scripts/kai-review.sh --pr <PR#> --task <task_id>
+#                              [--mission <slug>] [--model <model>] [--agent <name>]
 #
-# 処理フロー:
-#   1. 引数パース (--pr, --task, --mission, --model)
-#   2. gh pr view <PR#> --json headRefName で head branch 取得
-#   3. 対象 branch を checkout して diff を確認
-#   4. codex exec review --base main -m <model> -o /tmp/kai-review-output.txt を実行
-#   5. /tmp/kai-review-output.txt を読み込み findings を判定
-#   6. findings なし / all low → plan.sh done
+# 処理フロー (Phase 2):
+#   1. 引数パース (--pr, --task, --mission, --model, --agent)
+#   2. heartbeat 更新 (dispatcher.publish_agents が Kai-codex を認識するため)
+#   3. plan.sh pull --task <task> --agent <agent> --skills codex-review
+#      → task.status: pending → in_progress + Taskvia PATCH + assignment file
+#   4. gh pr view <PR#> --json headRefName で head branch 取得
+#   5. 対象 branch を checkout して diff を確認
+#   6. codex exec review --base main -m <model> -o /tmp/kai-review-output.txt を実行
+#   7. /tmp/kai-review-output.txt を読み込み findings を判定
+#   8. findings なし / all low → plan.sh done
 #      修正必要 → plan.sh needs-director
+#      (plan.sh done は Taskvia sync + registry.workers.yaml の task_count 自動 bump)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # --- 定数 ---
 DEFAULT_MODEL=""  # 空 = codex CLI のデフォルトモデルに任せる (--model 未指定)
+DEFAULT_AGENT="Kai-codex"  # registry/workers.yaml に登録済みの Codex 用 worker 名
 OUTPUT_FILE="/tmp/kai-review-output.txt"
 
 # --- カラー出力 ---
@@ -32,15 +38,19 @@ PR_NUM=""
 TASK_ID=""
 MISSION_SLUG=""
 MODEL="$DEFAULT_MODEL"
+AGENT="$DEFAULT_AGENT"
+SKIP_PULL=0  # デバッグ用: plan.sh pull を skip する (task が既に in_progress の場合の再実行時など)
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --pr)       PR_NUM="$2";      shift 2 ;;
-    --task)     TASK_ID="$2";     shift 2 ;;
-    --mission)  MISSION_SLUG="$2"; shift 2 ;;
-    --model)    MODEL="$2";       shift 2 ;;
+    --pr)         PR_NUM="$2";       shift 2 ;;
+    --task)       TASK_ID="$2";      shift 2 ;;
+    --mission)    MISSION_SLUG="$2"; shift 2 ;;
+    --model)      MODEL="$2";        shift 2 ;;
+    --agent)      AGENT="$2";        shift 2 ;;
+    --skip-pull)  SKIP_PULL=1;       shift 1 ;;
     -h|--help)
-      sed -n '3,8p' "$0" | sed 's/^# //'
+      sed -n '3,20p' "$0" | sed 's/^# //'
       exit 0
       ;;
     *)
@@ -53,11 +63,14 @@ done
 # --- 必須引数チェック ---
 if [[ -z "$PR_NUM" || -z "$TASK_ID" ]]; then
   _error "--pr <PR#> and --task <task_id> are required"
-  echo "Usage: bash scripts/kai-review.sh --pr <PR#> --task <task_id> [--mission <slug>] [--model <model>]" >&2
+  echo "Usage: bash scripts/kai-review.sh --pr <PR#> --task <task_id> [--mission <slug>] [--model <model>] [--agent <name>]" >&2
   exit 1
 fi
 
-_info "Starting review: PR#${PR_NUM} task=${TASK_ID} model=${MODEL}"
+# AGENT_NAME を export しておくと plan.sh done が assignment file を掃除できる
+export AGENT_NAME="$AGENT"
+
+_info "Starting review: PR#${PR_NUM} task=${TASK_ID} agent=${AGENT} model=${MODEL}"
 
 # --- plan.sh パス解決 ---
 PLAN_SH="${CREWVIA_REPO_ROOT:-$REPO_ROOT}/scripts/plan.sh"
@@ -66,16 +79,51 @@ if [[ ! -f "$PLAN_SH" ]]; then
   exit 1
 fi
 
+# --- heartbeat 更新 (Phase 2) ---
+# dispatcher.publish_agents は registry/heartbeats/<agent> の mtime を見て
+# Taskvia に agent presence を送る。ここで touch しないと Kai-codex が
+# カンバンに表示されない。alive 判定閾値は AGENT_PRESENCE_TTL=600s。
+HEARTBEATS_DIR="${CREWVIA_REPO_ROOT:-$REPO_ROOT}/registry/heartbeats"
+mkdir -p "$HEARTBEATS_DIR"
+touch "$HEARTBEATS_DIR/$AGENT"
+
+# --- plan.sh pull で task を in_progress に遷移させる (Phase 2) ---
+# これにより:
+#   - task.status: pending → in_progress
+#   - task.worker: null → $AGENT (plan.sh done の bump_task_count が発火する条件)
+#   - queue/assignments/$AGENT: dispatcher に「in-flight」を伝える
+#   - Taskvia PATCH (taskvia_sync_pull) が発火
+#
+# 既に in_progress の task を dispatcher が誤って再 spawn した場合、
+# plan.sh pull は「already in_progress」で exit 1 する。今回の実行は abort する。
+# 手動で再実行するときは --skip-pull を指定する。
+if [[ $SKIP_PULL -eq 0 ]]; then
+  _info "Pulling task ${TASK_ID} as ${AGENT}..."
+  PULL_ARGS=(pull --task "$TASK_ID" --agent "$AGENT" --skills codex-review)
+  if [[ -n "$MISSION_SLUG" ]]; then
+    PULL_ARGS+=(--mission "$MISSION_SLUG")
+  fi
+  # plan.sh pull は結果を stdout に JSON で吐くが、ここでは status/assignment 更新が
+  # 主目的なので出力は捨てる。ただし失敗時は stderr が見える方が良いので tee はしない。
+  if ! "$PLAN_SH" "${PULL_ARGS[@]}" >/dev/null; then
+    _error "plan.sh pull failed for task ${TASK_ID} — aborting review"
+    exit 1
+  fi
+else
+  _info "SKIP_PULL=1: skipping plan.sh pull (assumes task is already in_progress with worker=${AGENT})"
+fi
+
 # --- gh コマンド確認 ---
 if ! command -v gh &>/dev/null; then
   _error "gh command not found. Please install GitHub CLI."
+  "$PLAN_SH" needs-director "$TASK_ID" ${MISSION_SLUG:+--mission "$MISSION_SLUG"} "NEEDS FIX: gh command not found on this machine"
   exit 1
 fi
 
 # --- codex コマンド確認 ---
 if ! command -v codex &>/dev/null; then
   _error "codex command not found. Please install Codex CLI."
-  "$PLAN_SH" needs-director "$TASK_ID" "NEEDS FIX: codex command not found on this machine"
+  "$PLAN_SH" needs-director "$TASK_ID" ${MISSION_SLUG:+--mission "$MISSION_SLUG"} "NEEDS FIX: codex command not found on this machine"
   exit 1
 fi
 

@@ -470,7 +470,7 @@ def _dump_inline(val):
 TASK_META_KEY_ORDER = [
     'id', 'title', 'skills', 'priority', 'status',
     'blocked_by', 'timeout', 'target_dir', 'worker', 'started_at', 'completed_at',
-    'handoff_path',
+    'handoff_path', 'pr_number',
     'acceptance_criteria', 'verification', 'rework_count', 'max_rework',
     'qa_checkpoints', 'required_evidence', 'needs_director_reason',
 ]
@@ -1085,6 +1085,7 @@ def cmd_add(args):
         '--target-dir': 'value',
         '--idle-timeout': 'value',
         '--max-timeout': 'value',
+        '--pr-number': 'value',
     })
     if not positional:
         die("add requires a task title")
@@ -1110,6 +1111,17 @@ def cmd_add(args):
             die(f"--target-dir does not exist or is not a directory: {target_dir}")
     else:
         target_dir = None
+
+    # --pr-number: codex-review skill task で dispatcher が kai-review.sh に
+    # 渡すための PR 番号。指定しない場合 None (frontmatter に pr_number 行を出さない)。
+    pr_number = None
+    if opts.get('--pr-number'):
+        try:
+            pr_number = int(opts['--pr-number'])
+        except ValueError:
+            die("--pr-number must be a positive integer")
+        if pr_number <= 0:
+            die("--pr-number must be a positive integer")
 
     # --idle-timeout / --max-timeout: タスクごとの timeout 秒数（省略可）
     timeout = {}
@@ -1151,6 +1163,8 @@ def cmd_add(args):
         }
         if timeout:
             meta['timeout'] = timeout
+        if pr_number is not None:
+            meta['pr_number'] = pr_number
         body = build_task_body(description, '')
         save_task(slug, task_id, meta, body)
         sync_holder[0] = (slug, task_id, title, skills, priority, blocked_by)
@@ -2542,6 +2556,7 @@ def cmd_update(args):
         '--status': 'value',
         '--description': 'value',
         '--reset': 'bool',
+        '--pr-number': 'value',
     })
 
     if not positional:
@@ -2621,6 +2636,22 @@ def cmd_update(args):
             _, result_text = parse_task_body(body)
             body = build_task_body(opts['--description'], result_text)
             changed.append('description=<updated>')
+
+        if opts.get('--pr-number') is not None:
+            raw_pr = opts['--pr-number'].strip()
+            if raw_pr.lower() in ('null', 'none', ''):
+                if 'pr_number' in meta:
+                    del meta['pr_number']
+                changed.append('pr_number=null')
+            else:
+                try:
+                    n = int(raw_pr)
+                except ValueError:
+                    die("--pr-number must be a positive integer (or 'null' to clear)")
+                if n <= 0:
+                    die("--pr-number must be a positive integer (or 'null' to clear)")
+                meta['pr_number'] = n
+                changed.append(f"pr_number={n}")
 
         if not changed:
             print(f"update {slug}/{task_id}: nothing to do (no fields specified)", file=sys.stderr)

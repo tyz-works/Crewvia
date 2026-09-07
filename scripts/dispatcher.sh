@@ -126,6 +126,16 @@ TERMINAL_STATUSES = {'done', 'verified', 'skipped'}
 # the "no worker available" notification loop so the Director is not spammed.
 DIRECTOR_ONLY_SKILLS = {'director-only'}
 
+# Skills routed to the Codex reviewer (Kai-codex) via kai-review.sh.
+# When a task with any of these skills becomes unblocked-pending, the dispatcher
+# background-spawns kai-review.sh instead of sending "no worker" to the Director.
+# The task must carry a pr_number field in its frontmatter; otherwise the
+# dispatcher logs a warning and leaves the task alone (Director escalation).
+CODEX_REVIEW_SKILLS = {'codex-review'}
+CODEX_REVIEW_AGENT = 'Kai-codex'  # must match registry/workers.yaml entry
+KAI_REVIEW_SH = REGISTRY_DIR.parent / 'scripts' / 'kai-review.sh'
+KAI_SPAWN_LOG_DIR = REGISTRY_DIR.parent / 'logs' / 'kai-spawn'
+
 # Rule 2: blocked-stuck threshold (seconds).  If an idle Worker's only matching
 # tasks have been blocked for longer than this, the Worker is sent shutdown.
 # Uses task file mtime as a proxy for last_status_change.
@@ -764,6 +774,79 @@ def check_rule5(name: str, target: str, assignment_file: Path) -> None:
         record_notify(notify_key)
 
 
+def spawn_kai_review(slug, meta):
+    """Background-spawn kai-review.sh for a codex-review task.
+
+    Preconditions:
+      - meta['skills'] contains 'codex-review'
+      - task is unblocked and pending
+      - caller has already checked notify dedup (via should_notify)
+
+    Behavior:
+      - Extracts pr_number from frontmatter; if absent, logs warning and returns.
+      - Refuses to spawn while queue/assignments/Kai-codex exists (another run
+        of the same agent is already in flight — either this task or another).
+      - Launches nohup kai-review.sh in a detached process group so the 5s
+        poll loop does not block waiting for the codex CLI to finish.
+      - stdout/stderr go to logs/kai-spawn/<slug>-<task_id>-<epoch>.log so
+        crashes are diagnosable after the fact.
+    """
+    task_id = meta.get('id', '?')
+    pr = meta.get('pr_number')
+    if not pr:
+        # No PR number → cannot review.  Log once (dedup'd) and let the Director
+        # notice via the standard "no worker" fallback (also dedup'd).
+        _key = f'kai_no_pr_{slug}_{task_id}'
+        if should_notify(_key):
+            log(
+                f"WARNING: codex-review task {slug}/{task_id} has no pr_number "
+                f"in frontmatter — cannot spawn kai-review.sh. "
+                f"Set it via `plan.sh update {task_id} --pr-number <N> --mission {slug}`."
+            )
+            record_notify(_key)
+        return False
+    # Only one Kai-codex run at a time.
+    if (ASSIGNMENTS_DIR / CODEX_REVIEW_AGENT).exists():
+        return False
+    if not KAI_REVIEW_SH.exists():
+        log(f"ERROR: kai-review.sh not found at {KAI_REVIEW_SH} — cannot spawn Codex review")
+        return False
+
+    try:
+        KAI_SPAWN_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        log(f"WARNING: cannot create kai-spawn log dir {KAI_SPAWN_LOG_DIR}: {e}")
+        return False
+    log_path = KAI_SPAWN_LOG_DIR / f"{slug}-{task_id}-{int(time.time())}.log"
+
+    cmd = [
+        'bash', str(KAI_REVIEW_SH),
+        '--pr', str(pr),
+        '--task', task_id,
+        '--mission', slug,
+        '--agent', CODEX_REVIEW_AGENT,
+    ]
+    try:
+        # Detach: start_new_session=True + close stdin + redirect stdout/stderr
+        # so the child survives the dispatcher's next cycle.  Do NOT wait().
+        logf = open(log_path, 'ab')
+        subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=logf,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            cwd=str(REGISTRY_DIR.parent),
+        )
+        # Close in the parent — child inherits its own fd.
+        logf.close()
+        log(f"→ spawned kai-review.sh for {slug}/{task_id} (PR#{pr}, log={log_path.name})")
+        return True
+    except Exception as e:
+        log(f"ERROR: failed to spawn kai-review.sh for {slug}/{task_id}: {e}")
+        return False
+
+
 def shutdown_idle_workers():
     """Send shutdown message and kill idle Worker windows."""
     windows = tmux_list_worker_windows()
@@ -947,6 +1030,13 @@ def dispatch():
             # let them through (e.g. scalar-typed skills field edge case).
             if task_skills & DIRECTOR_ONLY_SKILLS:
                 continue
+            # Codex-review tasks go through kai-review.sh (spawned below in the
+            # no-worker loop), never through a regular Worker window.  Even if a
+            # human accidentally adds `codex-review` to a Worker's skills in
+            # registry/workers.yaml, this guard keeps Claude Workers out of the
+            # Codex path.
+            if task_skills & CODEX_REVIEW_SKILLS:
+                continue
             if task_skills.issubset(worker_skills):
                 best = (slug, meta)
                 break
@@ -1064,6 +1154,16 @@ def dispatch():
         # Defense-in-depth: director-only tasks must never trigger a Worker
         # startup request — skip them regardless of how they reached this loop.
         if task_skills & DIRECTOR_ONLY_SKILLS:
+            continue
+        # Codex-review path (Phase 2): background-spawn kai-review.sh instead
+        # of asking the Director to start a Worker.  spawn_kai_review is a
+        # no-op when Kai-codex is already in flight (assignment file exists)
+        # or when pr_number is missing (warning logged, Director escalates).
+        if task_skills & CODEX_REVIEW_SKILLS:
+            spawn_key = f'kai_spawn_{slug}_{task_id}'
+            if should_notify(spawn_key):
+                if spawn_kai_review(slug, meta):
+                    record_notify(spawn_key)
             continue
         # can_handle: True if any alive worker (window exists OR heartbeat recent) has skills ⊇ task_skills
         can_handle = any(

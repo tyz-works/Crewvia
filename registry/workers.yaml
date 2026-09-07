@@ -10,6 +10,7 @@
 #   last_active  - 最終稼働日（YYYY-MM-DD 形式・自動更新）
 #
 # スキルタグ一覧: ops / bash / code / python / typescript / research / database / cloud / docs
+#   / codex-review (Codex CLI reviewer 専用 — Kai-codex worker, Phase 2 追加)
 
 workers:
   - name: Hana
@@ -33,6 +34,10 @@ workers:
     skills: [code, database, typescript]
     task_count: 1
     last_active: 2026-08-25
+  - name: Kai-codex
+    skills: [codex-review]
+    task_count: 0
+    last_active: 2026-09-08
   - name: Mika
     skills: [code, typescript]
     task_count: 13

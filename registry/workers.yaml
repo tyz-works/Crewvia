@@ -43,20 +43,20 @@ workers:
     last_active: 2026-09-06
   - name: Seo
     skills: [review]
-    task_count: 50
-    last_active: 2026-09-06
+    task_count: 53
+    last_active: 2026-09-07
   - name: Jiwon
     skills: [docs, research]
     task_count: 5
     last_active: 2026-09-02
   - name: Minjun
     skills: [docs]
-    task_count: 6
-    last_active: 2026-09-05
+    task_count: 10
+    last_active: 2026-09-07
   - name: Wei
     skills: [bash, code, docs]
-    task_count: 31
-    last_active: 2026-09-05
+    task_count: 33
+    last_active: 2026-09-07
   - name: Lin
     skills: [code, research, typescript]
     task_count: 4
@@ -67,12 +67,12 @@ workers:
     last_active: 2026-08-25
   - name: Arjun
     skills: [qa]
-    task_count: 27
-    last_active: 2026-09-05
+    task_count: 28
+    last_active: 2026-09-07
   - name: Priya
     skills: [planning]
-    task_count: 18
-    last_active: 2026-09-06
+    task_count: 19
+    last_active: 2026-09-07
   - name: Anika
     skills: [research]
     task_count: 3

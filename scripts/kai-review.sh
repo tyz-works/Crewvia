@@ -19,7 +19,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # --- 定数 ---
-DEFAULT_MODEL="o4-mini"
+DEFAULT_MODEL=""  # 空 = codex CLI のデフォルトモデルに任せる (--model 未指定)
 OUTPUT_FILE="/tmp/kai-review-output.txt"
 
 # --- カラー出力 ---
@@ -116,11 +116,11 @@ git -C "$WORK_DIR" checkout "$HEAD_BRANCH" 2>&1 || {
 : > "$OUTPUT_FILE"
 
 # --- codex exec review 実行 ---
-_info "Running codex exec review --base main -m ${MODEL} ..."
+_info "Running codex exec review --base main ${MODEL:+-m $MODEL} ..."
 CODEX_EXIT=0
 codex exec review \
   --base main \
-  -m "$MODEL" \
+  ${MODEL:+-m "$MODEL"} \
   --ephemeral \
   -o "$OUTPUT_FILE" \
   2>&1 | tee /tmp/kai-review-stderr.txt || CODEX_EXIT=$?

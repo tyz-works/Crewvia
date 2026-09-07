@@ -13,9 +13,11 @@
 bash scripts/kai-review.sh \
   --pr <PR番号> \
   --task <task_id> \
-  --mission <mission-slug> \
-  [--model o4-mini]     # 省略時デフォルト: o4-mini
+  [--mission <mission-slug>] \   # 省略時は plan.sh の auto-detect に依存（指定推奨）
+  [--model o4-mini]              # 省略時デフォルト: o4-mini
 ```
+
+> **⚠️ Kai review は Priya のプランの task として組み込まない**。`skills: [review]` で積むと Dispatcher が Seo (Claude) に誤 assign するリスクがある。Director が重要 PR を判断して手動で呼び出すこと。Phase 2 で `codex-review` 専用 skill 名が導入されたらこの制約は解除される。
 
 ### モデル選択の目安
 
@@ -58,6 +60,8 @@ Phase 1 では Claude (Seo) と Codex (Kai) の **2 人体制**で review する
   - Claude 生成コードの review（同一モデル bias 回避）
   - critical bug 疑いのある大きな diff
   - LLM 特有の誤りパターン（hallucination / edge case 見落とし）
+
+**使い方の流れ**: Seo の review task が完了したタイミングで Director が手動で `kai-review.sh` を呼ぶ。Kai review は plan task には載せない（Dispatcher の誤 assign を防ぐため）。
 
 ---
 

@@ -338,7 +338,21 @@ required_evidence:
 | `docs` | ドキュメント作成 |
 | `review` | コードレビュー・PR承認 |
 | `qa` | QA・動作検証（実装者とは別Workerが担当） |
-| `planning` | プランレビュー（タスク分解・依存関係・スキル割り当ての妥当性検証） |
+| `planning` | プランレビュー（タスク分解・依存関係・スキル割り当ての妥当性検証）。Bash(plan.sh status/pull), git log/diff は可。Edit/Write は deny |
+| `plan_review` | plan_review.md への verdict 出力専用（Write 可 / Edit・Bash 全面 deny）。planning とは権限が異なる。crewvia-plan-review skill 参照 |
+| `verify` | 実機検証・smoke test |
+
+### skill 別デフォルトモデル
+
+Worker 起動時のモデルは `config/crewvia.yaml` の `model_per_skill` で自動決定される。カスタマイズはそのファイルを編集すること。
+
+| skill | デフォルトモデル | 理由 |
+|---|---|---|
+| `planning` / `plan_review` / `review` / `research` | `claude-opus-5` | 深い推論で誤判断を減らす |
+| `docs` / `qa` / `verify` | `claude-haiku-4-5-20251001` | 軽タスク・コスト削減 |
+| `code` / `bash` / `python` / `typescript` / `database` / `cloud` / `ops` | `claude-sonnet-5` | worker_model フォールバック (model_per_skill に定義なし) |
+
+複数 skill が指定された場合は最も要求の高いモデル (`opus > sonnet > haiku`) が選ばれる。詳細は `knowledge/model-per-skill.md` を参照。
 
 ### Edit/Write 可否一覧
 
@@ -465,6 +479,13 @@ AGENT_NAME=$WORKER_NAME bash scripts/start.sh worker code typescript
 
 # 複数スキルが必要な場合はスペース区切りで指定
 AGENT_NAME=$WORKER_NAME bash scripts/start.sh worker ops bash cloud
+```
+
+使用モデルは `config/crewvia.yaml` の `model_per_skill` から skill に応じて **自動選択** される。特定の task で別モデルを使わせたい場合は `CREWVIA_WORKER_MODEL` で上書きできる:
+
+```bash
+# docs Worker に Opus を使わせる（一時的な上書き）
+CREWVIA_WORKER_MODEL=claude-opus-5 AGENT_NAME=$WORKER_NAME bash scripts/start.sh worker docs
 ```
 
 Worker 起動後、Dispatcher が自動的にスキルマッチしたタスクを Worker に割り当てる。

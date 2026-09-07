@@ -230,6 +230,28 @@ Examples:
 The skill set is hashed to a consistent name from `config/worker-names.yaml`,
 so the same skills always produce the same name (e.g., `ops bash` → "Kai").
 
+#### Automatic model selection by skill
+
+Crewvia automatically picks the optimal Claude model for each Worker based on its skills.
+The mapping is defined in `config/crewvia.yaml` under `model_per_skill`:
+
+| Skill | Default model | Rationale |
+|---|---|---|
+| `planning`, `plan_review`, `review`, `research` | `claude-opus-5` | Deep reasoning reduces errors |
+| `docs`, `qa`, `verify` | `claude-haiku-4-5-20251001` | Lightweight tasks, cost savings |
+| `code`, `bash`, `python`, `typescript`, `database`, `cloud`, `ops` | `claude-sonnet-5` | worker_model fallback (not in model_per_skill) |
+
+When multiple skills are specified, the strongest model wins (`opus > sonnet > haiku`).
+
+To override the model for a specific Worker launch, set `CREWVIA_WORKER_MODEL`:
+
+```bash
+# Force Opus for a docs Worker
+CREWVIA_WORKER_MODEL=claude-opus-5 ./scripts/start.sh worker docs
+```
+
+To permanently change the mapping, edit `model_per_skill` in `config/crewvia.yaml`.
+
 ### Running with tmux (optional)
 
 When `./crewvia` starts in tmux mode, it automatically attaches you to the Director

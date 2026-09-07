@@ -82,6 +82,25 @@ Kai発見: oci compute instance list で --compartment-id を省略すると全�
 | `CREWVIA_TASK_SLUG` | タスクタイトルを kebab-case 化した slug（worktree パスの末尾部分に使用） |
 | `TARGET_DIR` | 他プロジェクトを触るタスクの場合にそのプロジェクトの絶対パスが入る。未設定なら `$CREWVIA_REPO/.claude/worktrees/` 配下に worktree が作成され Worker はその中で作業する。セットされている場合は worktree は作成されず Worker は TARGET_DIR で直接作業する |
 
+### 使用モデルの決まり方
+
+Worker 起動時に使用するモデルは以下の優先順位で決まる:
+
+1. **`CREWVIA_WORKER_MODEL` が明示設定されている** → その値を使う（最優先）
+2. **未設定** → `config/crewvia.yaml` の `model_per_skill` から skill に応じてモデルを自動選択
+3. **`model_per_skill` に該当 skill がない** → `config/crewvia.yaml` の `worker_model` にフォールバック
+4. **`worker_model` も空** → `--model` なしで起動（claude CLI のデフォルトを使用）
+
+複数 skill が指定された場合は **最も要求の高いモデル** が選ばれる（`opus > sonnet > haiku`）。
+
+| skill | デフォルトモデル |
+|---|---|
+| `planning` / `plan_review` / `review` / `research` | `claude-opus-5` (深い推論が必要) |
+| `docs` / `qa` / `verify` | `claude-haiku-4-5-20251001` (軽タスク・コスト削減) |
+| `code` / `bash` / `python` / `typescript` / `database` / `cloud` / `ops` | `claude-sonnet-5` (worker_model フォールバック — model_per_skill に定義なし) |
+
+> ℹ️ 詳細な設計判断は `knowledge/model-per-skill.md` を参照。カスタマイズは `config/crewvia.yaml` の `model_per_skill` を編集すること。
+
 ---
 
 ## 基本フロー

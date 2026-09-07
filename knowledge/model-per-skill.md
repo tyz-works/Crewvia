@@ -77,9 +77,10 @@ model_per_skill:
 
 ## 実装の落とし穴: `WORKER_MODEL_EXPLICIT` フラグ
 
-`scripts/start.sh` は config 読み込みブロック (L34-47) で `CREWVIA_WORKER_MODEL` に
-config の `worker_model` を export してしまう。このため、L419 の解決ロジックに到達した時点で
-`CREWVIA_WORKER_MODEL` は常に非空になり、「ユーザーが明示指定した」か「config のデフォルトが入っただけ」かが区別できなくなる。
+`scripts/start.sh` は config 読み込みブロックで `WORKER_MODEL_FROM_CONFIG` に
+config の `worker_model` を**ローカル変数**として保持する（t007 fix: export を廃止して tmux env 汚染を排除）。
+`SELECTED_MODEL` の解決ロジックに到達した時点で `CREWVIA_WORKER_MODEL` が非空かどうかは
+「ユーザーが起動前に設定した」ことを確実に示す。
 
 この問題を回避するため、**config 読み込みより前**に `WORKER_MODEL_EXPLICIT` フラグを記録する:
 
@@ -88,8 +89,10 @@ WORKER_MODEL_EXPLICIT=0
 [[ -n "${CREWVIA_WORKER_MODEL:-}" ]] && WORKER_MODEL_EXPLICIT=1
 ```
 
-`WORKER_MODEL_EXPLICIT=1` のときのみ env 優先を適用し、それ以外は `lib_model.py` による
-skill 別解決を行う。これにより `model_per_skill` が dead code になる問題を回避している。
+`WORKER_MODEL_EXPLICIT=1` のときのみ env 優先を適用し、それ以外は `_resolve_worker_model()` helper
+（内部で `lib_model.py` を呼ぶ）による skill 別解決を行う。dry-run (`CREWVIA_PRINT_MODEL=1`) も
+同じ helper を使うため、dry-run と実際の起動で挙動が一致する。
+これにより `model_per_skill` が dead code になる問題を回避している。
 
 ---
 

@@ -19,6 +19,9 @@
 # このテストで検証:
 #   1. worktree Worker が main checkout 直下のファイルを Edit → deny
 #   2. worktree Worker が main checkout 直下のファイルを Write → deny
+#   2b. 同じことを MultiEdit で行っても → deny (commit security review で検出した
+#       control-bypass の回帰テスト。Edit/Write だけを見るガードは MultiEdit
+#       という別名の同格ツール経由で素通りしていた)
 #   3. 同じ Worker が自分の worktree 内のファイルを Edit → ブロックされない
 #   4. 同じ Worker が queue/ 配下を Write → ブロックされない (plan.sh 経由の正当な書き込みを模擬)
 #   5. 同じ Worker が registry/ 配下を Write → ブロックされない
@@ -102,6 +105,10 @@ _write_payload() {
   local path="$1"
   printf '{"tool_name":"Write","tool_input":{"file_path":"%s"}}' "$path"
 }
+_multiedit_payload() {
+  local path="$1"
+  printf '{"tool_name":"MultiEdit","tool_input":{"file_path":"%s","edits":[{"old_string":"a","new_string":"b"}]}}' "$path"
+}
 
 _decision_of() {
   echo "$1" | jq -r '.hookSpecificOutput.permissionDecision // "none"' 2>/dev/null || echo "none"
@@ -150,6 +157,18 @@ STDOUT=$(_run_hook "$(_write_payload "${FAKE_REPO}/scripts/plan.sh")" \
   CREWVIA_TASK_ID=t001 AGENT_NAME=Sofia CREWVIA_TASKVIA=disabled TASKVIA_TOKEN="" SKILLS=bash \
   ); EXIT=$?
 _assert_blocked "main checkout Write" "$EXIT" "$STDOUT"
+
+# commit security review で検出された control-bypass の回帰テスト:
+# Edit/Write だけを見るガードは MultiEdit 経由で素通しになっていた。
+# config/skill-permissions.yaml は全 skill で Edit/Write/MultiEdit を常に
+# 三点セットで許可しており、ファイル書き込みという意味では Edit と全く同じ
+# 権限を持つ別名ツールのため、同様に deny されなければならない。
+echo ""
+echo "--- Test 2b (security review fix): worktree Worker MultiEdits main checkout scripts/plan.sh ---"
+STDOUT=$(_run_hook "$(_multiedit_payload "${FAKE_REPO}/scripts/plan.sh")" \
+  CREWVIA_TASK_ID=t001 AGENT_NAME=Sofia CREWVIA_TASKVIA=disabled TASKVIA_TOKEN="" SKILLS=bash \
+  ); EXIT=$?
+_assert_blocked "main checkout MultiEdit" "$EXIT" "$STDOUT"
 
 # ---------------------------------------------------------------------------
 # Test 3-5: 正当な経路はブロックされない

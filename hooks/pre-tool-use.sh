@@ -170,10 +170,19 @@ fi
 # 構造的なガードをここに入れる。_global.deny と同様、skill 設定や urgent 例外では
 # バイパスできない絶対安全弁として扱う（skill/Taskvia チェックより前に判定する）。
 #
-# 対象: 「worktree を持つ Worker」の Edit/Write のみ
+# 対象: 「worktree を持つ Worker」の Edit/Write/MultiEdit のみ
 #   = CREWVIA_TASK_ID がセットされている (タスクを pull 済み)
 #   AND TARGET_DIR が未設定 (target project モードではない = worktree モードのはず)
 #   AND 編集先が $CREWVIA_REPO 配下 かつ queue/ registry/ .claude/worktrees/ 以外
+# ★ MultiEdit を含めること: config/skill-permissions.yaml は全 skill で
+#   Edit/Write/MultiEdit を常に三点セットで許可しており、ファイル書き込みという
+#   意味では Edit と全く同じ権限を持つ別名ツール。Edit/Write だけを見るガードは
+#   MultiEdit 経由で素通しになる control-bypass だった (commit security review
+#   で検出、t011 で修正)。
+#   ※ Bash 経由での書き込み (heredoc / sed -i / tee 等) はこのガードの対象外
+#   のまま残る既知の残存リスク。Edit/Write/MultiEdit という「ツールベースの
+#   最終防波堤」であり、worker.md の明文化 (呼び出しは $CREWVIA_REPO、編集は
+#   worktree 内) が一次防御である前提は変わらない。
 # 対象外 (誤爆防止。いずれかに該当すれば即スキップ):
 #   - Director (この関数より前の role チェックで既に exit 済み)
 #   - TARGET_DIR モードの Worker (worktree を持たない。上記条件で自動的に除外)
@@ -187,7 +196,7 @@ fi
 # 未設定なのに worktree の外を指すパスを編集しようとしている時点で、cwd が実際どこに
 # あるかによらず既に異常な状態 — パスだけで判定して構わない（むしろ「cwd も main に
 # 迷い込んでいる」というより深刻なケースも同時に拾える）。
-if { [ "$TOOL_NAME" = "Edit" ] || [ "$TOOL_NAME" = "Write" ]; } \
+if { [ "$TOOL_NAME" = "Edit" ] || [ "$TOOL_NAME" = "Write" ] || [ "$TOOL_NAME" = "MultiEdit" ]; } \
    && [ -n "${CREWVIA_TASK_ID:-}" ] && [ -z "${TARGET_DIR:-}" ] && [ -n "$FILE_PATH" ]; then
   case "$FILE_PATH" in
     /*) _GUARD_ABS_FILE="$FILE_PATH" ;;

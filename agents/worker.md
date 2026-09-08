@@ -169,7 +169,7 @@ crewvia 自身のツール (`scripts/plan.sh` / `scripts/dispatcher.sh` / `hooks
 - 一方 `scripts/plan.sh` 自体を**改修する** task では、あなたが変更しているのは worktree 側の作業コピーである。Edit/Write の対象を `$CREWVIA_REPO` の絶対パスにしてしまうと、専用 worktree ではなく **main checkout (branch=main) を直接編集してしまう**。commit 前に `git status` で気づけば復旧できるが、気づかなければ main に直接混入する（実際に t009 で発生。git status で自己復旧し実害は無かったが、約20分のミッション停止を招いた事故の遠因になった）。
 - 自分の修正を動作確認したい場合も同様に、worktree 内のパス（`./scripts/plan.sh` や `$(pwd)/scripts/plan.sh`）を明示的に指定すること。`$CREWVIA_REPO/scripts/plan.sh` を使うと、あなたが今まさに直している**未修正の main 版**を実行してしまい、修正の検証にならない。
 
-**構造的なガード（最後の安全網）**: `hooks/pre-tool-use.sh` は、worktree を持つ Worker（`CREWVIA_TASK_ID` セット済み・`TARGET_DIR` 未設定）が `$CREWVIA_REPO` 配下（`queue/` `registry/` `.claude/worktrees/` を除く）を Edit/Write しようとすると拒否する（t011 で追加）。ブロックされたら「Edit/Write のパスが worktree 内かどうか」を見直すこと。ただしこれは事故の最終防波堤であり、**最初から worktree 内のパスを使う**のが正しい進め方であることに変わりはない。
+**構造的なガード（最後の安全網）**: `hooks/pre-tool-use.sh` は、worktree を持つ Worker（`CREWVIA_TASK_ID` セット済み・`TARGET_DIR` 未設定）が `$CREWVIA_REPO` 配下（`queue/` `registry/` `.claude/worktrees/` を除く）を Edit/Write/MultiEdit しようとすると拒否する（t011 で追加。MultiEdit も対象 — Edit/Write だけでは同格の別ツールを見落とす control-bypass になるため必ず含めること）。ブロックされたら「編集先のパスが worktree 内かどうか」を見直すこと。ただしこれは事故の最終防波堤であり、**最初から worktree 内のパスを使う**のが正しい進め方であることに変わりはない。なお `Bash` 経由の書き込み（heredoc / `sed -i` / `tee` 等）はこのガードの対象外として残る既知の限界 — ツール名を偽装できない Edit/Write/MultiEdit だけを機械的に守る仕組みであり、Bash を使った書き込みは引き続き自分の規律で避けること。
 
 迷ったら `pwd` と `git rev-parse --show-toplevel` を実行し、今の cwd がどちらの checkout を指しているか確認すること。
 

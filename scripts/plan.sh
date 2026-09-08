@@ -459,7 +459,13 @@ def _dump_scalar(s):
         # `plan.sh status` and dispatch for the entire mission). Collapse
         # line breaks to keep every frontmatter value on one line — callers
         # that want to preserve the full text should put it in the task body
-        # instead (see cmd_needs_director's use of _split_long_freeform).
+        # instead (see cmd_needs_director's use of split_long_freeform).
+        #
+        # Drop trailing newline(s) first: values captured from a bash command
+        # substitution routinely carry one, and collapsing it along with any
+        # embedded ones would otherwise leave a dangling " / " at the end
+        # (t013 P3 fix — e.g. "QA FAIL: xxx\n" became "QA FAIL: xxx / ").
+        s = re.sub(r'(?:\r\n|\r|\n)+$', '', s)
         s = re.sub(r'\r\n|\r|\n', ' / ', s)
     if any(ch in _NEEDS_QUOTE for ch in s):
         escaped = s.replace('\\', '\\\\').replace('"', '\\"')
@@ -567,6 +573,50 @@ def build_task_body(description, result):
     return f"## Description\n{desc}\n\n## Result\n{res}\n"
 
 
+def extract_trailing_body_section(body):
+    """Return any appendix that follows the Result section under its own
+    `## <heading>` (other than a literal Description/Result reappearing,
+    which parse_task_body already treats as part of Result — see its
+    docstring), or '' if there is none.
+
+    cmd_needs_director appends a `## Needs-Director 詳細` appendix to the body
+    to preserve a long/multi-line reason (split_long_freeform). But
+    parse_task_body has no notion of a third section: everything after the
+    first `## Result` header — including that appendix — is captured as one
+    opaque `result` string. cmd_done/cmd_fail then discard that entire string
+    (`desc, _ = parse_task_body(body)`) and rebuild the body from just
+    `description` and the new CLI-supplied result, silently destroying the
+    appendix along with it. This is not a rare case — it's the normal
+    `needs_director → update --reset → re-run → done` flow (t013 P2 fix).
+
+    Callers that are about to discard the old body via build_task_body should
+    call this first and re-append the result (if any) to the new body, so the
+    appendix survives independently of whatever the new Result text is.
+    """
+    lines = body.splitlines()
+    result_seen = False
+    trailing_start = None
+    for i, line in enumerate(lines):
+        if re.match(r'^##\s+(Description|Result)\s*$', line, re.IGNORECASE):
+            if re.match(r'^##\s+Result\s*$', line, re.IGNORECASE):
+                result_seen = True
+            continue
+        if result_seen and re.match(r'^##\s+\S', line):
+            trailing_start = i
+            break
+    if trailing_start is None:
+        return ''
+    return '\n'.join(lines[trailing_start:]).strip()
+
+
+def append_trailing_body_section(body, trailing):
+    """Re-append a trailing appendix (from extract_trailing_body_section)
+    onto a freshly rebuilt body, if there is one."""
+    if not trailing:
+        return body
+    return body.rstrip() + '\n\n' + trailing + '\n'
+
+
 FREEFORM_SUMMARY_LIMIT = 200
 
 
@@ -586,9 +636,14 @@ def split_long_freeform(text, limit=FREEFORM_SUMMARY_LIMIT):
     if not has_newline and len(text) <= limit:
         return text, None
     normalized = re.sub(r'\r\n|\r|\n', ' / ', text).strip()
-    summary = normalized[:limit].rstrip()
-    if len(normalized) > limit or has_newline:
-        summary += '…(全文は本文を参照)'
+    if len(normalized) <= limit:
+        # Short multi-line input: the ' / '-joined summary already carries
+        # everything losslessly, so appending a "full text in body" marker
+        # (and duplicating the text into the body) would be misleading and
+        # redundant (t013 P3 fix — e.g. "a\nb" used to become "a / b…(全文は
+        # 本文を参照)" even though nothing was actually lost).
+        return normalized, None
+    summary = normalized[:limit].rstrip() + '…(全文は本文を参照)'
     return summary, text
 
 
@@ -1714,8 +1769,9 @@ def cmd_done(args):
 
         meta['status'] = 'done'
         meta['completed_at'] = now_iso()
+        trailing = extract_trailing_body_section(body)
         desc, _ = parse_task_body(body)
-        new_body = build_task_body(desc, result)
+        new_body = append_trailing_body_section(build_task_body(desc, result), trailing)
         save_task(slug, task_id, meta, new_body)
         worker_holder[0] = meta.get('worker') or ''  # capture worker for post-lock bump
         sync_holder[0] = (slug, task_id, result)
@@ -1822,8 +1878,11 @@ def cmd_fail(args):
         meta['completed_at'] = now_iso()
         if handoff_path:
             meta['handoff_path'] = handoff_path
+        trailing = extract_trailing_body_section(body)
         desc, _ = parse_task_body(body)
-        new_body = build_task_body(desc, f"FAILED — handoff: {handoff_path or 'none'}")
+        new_body = append_trailing_body_section(
+            build_task_body(desc, f"FAILED — handoff: {handoff_path or 'none'}"), trailing
+        )
         save_task(slug, task_id, meta, new_body)
         print(f"Failed: {slug}/{task_id}")
 
@@ -2486,6 +2545,18 @@ def _resync_one(slug):
     for meta, body in tasks:
         task_id = meta.get('id')
         if not task_id:
+            continue
+        if meta.get('status') == CORRUPT_TASK_STATUS:
+            # A [破損] placeholder is purely a local display artifact
+            # (list_tasks synthesizes it so one malformed tNNN.md can't take
+            # the rest of the mission down — see CORRUPT_TASK_STATUS). It
+            # must never leave the machine: syncing it out would overwrite
+            # the real card's title/assignee/blocked_by on Taskvia with the
+            # placeholder's blanked-out values, destroying information that
+            # is still perfectly recoverable by just fixing the local file
+            # (t013 P2 fix). Local-only consumers (_print_mission_summary /
+            # _print_mission_detail / dashboard-data) are unaffected.
+            print(f"[resync] skipping corrupted task {slug}/{task_id} (local display only, not synced)", file=sys.stderr)
             continue
 
         # Try to create the task; silently ignored if it already exists

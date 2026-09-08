@@ -106,10 +106,17 @@ run_plan_rc() {
 # ---------------------------------------------------------------------------
 # Test 1-3: 複数行 reason で needs-director
 # ---------------------------------------------------------------------------
+# 200文字を超える長さにすること — split_long_freeform は ' / ' 結合後に
+# FREEFORM_SUMMARY_LIMIT (200) 以下なら要約だけで完結する (t013 P3 fix:
+# 短い複数行入力に「…(全文は本文を参照)」マーカーを付けず body にも複製しない)。
+# ここは「全文が body に退避され、後で読み返せる」ことを検証したいので、
+# 実際に退避が発生する長さにしておく必要がある。
 MULTILINE_REASON="=== 環境 ===
 WSL, memory 6GB
 === 症状 ===
-plan.sh status crashed"
+plan.sh status crashed after a multi-line needs-director reason corrupted
+frontmatter parsing, blocking the whole mission from progressing for about
+20 minutes until manually recovered by the Director via git status inspection"
 
 echo ""
 echo "--- Test 1: needs-director with multi-line reason exits 0 ---"
@@ -147,7 +154,7 @@ echo ""
 echo "--- Test 4: full reason text preserved in body (## Needs-Director 詳細) ---"
 if grep -q '## Needs-Director 詳細' "$TASKS_DIR/t001.md" \
    && grep -q '=== 環境 ===' "$TASKS_DIR/t001.md" \
-   && grep -q 'plan.sh status crashed' "$TASKS_DIR/t001.md"; then
+   && grep -q 'git status inspection' "$TASKS_DIR/t001.md"; then
   pass "full multi-line reason text preserved in task body"
 else
   fail "full multi-line reason text should be preserved in task body"

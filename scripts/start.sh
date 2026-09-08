@@ -196,6 +196,7 @@ if [[ "${ROLE}" == "director" ]] && [[ -z "${CREWVIA_MUX_ENABLED:-}" ]]; then
     export CREWVIA_MUX_ENABLED=1
     echo "[crewvia] herdr 並列モードで起動します（config 設定）。"
   elif [[ "$MODE_FROM_CONFIG" == "tmux" ]]; then
+    export CREWVIA_MUX=tmux
     export CREWVIA_MUX_ENABLED=1
     echo "[crewvia] tmux モードで起動します（config 設定）。"
   elif [[ "$MODE_FROM_CONFIG" == "inline" ]]; then
@@ -604,12 +605,25 @@ PYEOF
     echo "[crewvia] BENCH_MODE: skipping auto-kickoff (benchmark-ctx.sh will control task dispatch)"
   fi
 
-  # Director: dispatcher を mux 窓で起動（二重起動防止）
+  # Director: dispatcher / watchdog を mux 窓で起動（二重起動防止）
   if [[ "${ROLE}" == "director" ]]; then
+    # CREWVIA_MUX を spawn するコマンド文字列自体に明示的に埋め込む。
+    # mux_spawn (→ lib_mux.py spawn → 各 backend の pane_run/send-keys) はどの
+    # backend でも呼び出し側プロセスの env を新しいペインへ自動伝播しない
+    # (spawn() は env= 引数を受け取るが両 backend とも未実装)。herdr は特に
+    # サーバー起動時の env スナップショットを全ペインへ継承するため、
+    # ambient env 継承に頼ると「dispatcher にはあるのに watchdog には無い」
+    # ような非対称が起こりうる (t016)。コマンド文字列へ直接埋め込めば、
+    # herdr/tmux のどちらでも、どのタイミングでペインが作られても確実に効く。
+    _MUX_ENV_PREFIX=""
+    if [[ -n "${CREWVIA_MUX:-}" ]]; then
+      _MUX_ENV_PREFIX="export CREWVIA_MUX='${CREWVIA_MUX}'; "
+    fi
+
     # A name-only check would also match a window the mux restored empty, which
     # is exactly how the dispatcher silently went missing.  mux_spawn answers
     # the real question: it returns non-zero only when a live one is in there.
-    if mux_spawn "dispatcher" "cd '${REPO_ROOT}' && bash '${SCRIPT_DIR}/dispatcher.sh'" "$REPO_ROOT"; then
+    if mux_spawn "dispatcher" "cd '${REPO_ROOT}' && ${_MUX_ENV_PREFIX}bash '${SCRIPT_DIR}/dispatcher.sh'" "$REPO_ROOT"; then
       echo "[crewvia] Dispatcher started in mux window: dispatcher"
     else
       echo "[crewvia] Dispatcher already running (dispatcher)"
@@ -618,7 +632,7 @@ PYEOF
     # Director: watchdog(v2)を mux 窓で起動（二重起動防止）
     # F6是正: tmuxモードでは従来watchdogが一度も起動していなかった。非tmuxブランチの
     # watchdog.sh(v1・DEPRECATED)ではなくwatchdog.py(v2)を起動する（v1は延命させない）。
-    if mux_spawn "watchdog" "cd '${REPO_ROOT}' && python3 '${SCRIPT_DIR}/watchdog.py'" "$REPO_ROOT"; then
+    if mux_spawn "watchdog" "cd '${REPO_ROOT}' && ${_MUX_ENV_PREFIX}python3 '${SCRIPT_DIR}/watchdog.py'" "$REPO_ROOT"; then
       echo "[crewvia] Watchdog(v2) started in mux window: watchdog"
     else
       echo "[crewvia] Watchdog already running (watchdog)"

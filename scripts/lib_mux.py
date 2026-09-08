@@ -60,19 +60,32 @@ def _session() -> str:
     return os.environ.get("CREWVIA_TMUX_SESSION", _DEFAULT_SESSION)
 
 
-def _config_mode() -> Optional[str]:
+def _config_mode(config_path: Optional[Path] = None) -> Optional[str]:
     """Read `mode:` key from config/crewvia.yaml relative to this script's repo root.
+
+    `config_path` overrides the file read — only ever passed by tests; every
+    real caller uses the default (this script's own repo root).
 
     Returns "tmux", "herdr", "inline", or None if not found / unreadable.
     """
-    script_dir = Path(__file__).parent
-    config_path = script_dir.parent / "config" / "crewvia.yaml"
+    if config_path is None:
+        script_dir = Path(__file__).parent
+        config_path = script_dir.parent / "config" / "crewvia.yaml"
     try:
         text = config_path.read_text(encoding="utf-8")
         for line in text.splitlines():
             stripped = line.strip()
             if stripped.startswith("mode:") and not stripped.startswith("#"):
-                value = stripped.split(":", 1)[1].strip().strip('"').strip("'")
+                value = stripped.split(":", 1)[1]
+                # Drop a trailing inline comment (`mode: herdr  # switched back
+                # on 2026-09-04`) before matching against the allowed values.
+                # Without this, a value like "herdr  # ..." never equals
+                # "herdr", _config_mode() silently returns None, and every
+                # process with no CREWVIA_MUX env falls back to TmuxBackend
+                # even though config says herdr (t016: this is what made the
+                # watchdog blind — mux.list() came back empty against a dead
+                # tmux session, so every live Worker looked "window gone").
+                value = value.split("#", 1)[0].strip().strip('"').strip("'")
                 if value in ("tmux", "herdr", "inline"):
                     return value
     except Exception:

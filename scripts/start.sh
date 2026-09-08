@@ -141,7 +141,10 @@ fi
 #     Taskvia 承認フローへ blocking で問い合わせ、必ず allow/deny を返す。
 #     emit_decision は "ask" を返さない) であり、これは permission mode の値に
 #     関わらず常に実行される（hook はモードから独立したチェックポイント）。
-#     つまり auto にしても Taskvia 承認ゲートは無効化されない。
+#     つまり auto にしても（横取り対象の Bash|Write|Edit|MultiEdit|NotebookEdit
+#     については）Taskvia 承認ゲートは無効化されない。ただし横取り対象は
+#     この 5 ツールのみで、WebFetch や Task 等は auto 下では無確認のまま
+#     実行される (t007, PR#189 レビュー指摘・Seo 補足)。
 #   - knowledge/pr-85-analysis.md は 2026-09-02 時点の `--permission-mode auto`
 #     (PR #85, 2026-05-12 作成) を「実質 bypass 相当」として明示的に却下しているが、
 #     これは当時の auto の意味論に基づく判断であり、現行 auto の意味論
@@ -695,9 +698,14 @@ PYEOF
     # 判定を再利用）、まだ入力行に残っていれば「届いていない」とみなして
     # リトライする。「送ったつもり」を無くすのが目的（今日 3 回発生した
     # Worker 消滅の真因）。
+    #
+    # stderr は握り潰さない (t007, PR#189 レビュー指摘 F2): mux_send が
+    # "pane not found" 等の warning を stderr に出しても、旧実装は
+    # `2>&1 | 標準出力ごと /dev/null` してしまい、pane 消滅が完全に無音に
+    # なっていた。stdout だけを捨て、warning はターミナル/ログに残す。
     _KICKOFF_LANDED=0
     for _kickoff_attempt in 1 2 3; do
-      mux_send "$WINDOW_NAME" "$KICKOFF_MSG" >/dev/null 2>&1 || true
+      mux_send "$WINDOW_NAME" "$KICKOFF_MSG" >/dev/null || true
       sleep 1.5
       if mux_verify_sent "$WINDOW_NAME" "$KICKOFF_MSG"; then
         _KICKOFF_LANDED=1

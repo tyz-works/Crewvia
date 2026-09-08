@@ -105,3 +105,56 @@ teardown() {
     count="$(grep -cF -- "ミッション開始" "$FAKE_TMUX_LOG" || true)"
     [ "$count" -eq 3 ]
 }
+
+# ---------------------------------------------------------------------------
+# t007 (PR#189 レビュー指摘 F2): "pane not found" 警告が握り潰されないこと
+#
+# 旧実装は `mux_send ... >/dev/null 2>&1 || true` で mux_send の stdout と
+# stderr を両方 /dev/null に捨てていたため、pane 消滅時に lib_mux が出す
+# "pane not found" WARNING (stderr) も完全に無音になっていた — 今回の事故
+# (pane 消滅) と最も近い状況で、いちばん危険な方向に倒れていた箇所。
+# 修正: stdout だけを捨て、stderr は素通しにする (`>/dev/null || true`)。
+# ---------------------------------------------------------------------------
+
+@test "start.sh source: kickoff retry no longer redirects mux_send's stderr to /dev/null (static regression guard)" {
+    # 'mux_send ... >/dev/null 2>&1' が復活していないことを直接確認する
+    # (herdr 環境を組み立てずに検証できる、安価で確実な回帰ガード)。
+    ! grep -qE 'mux_send "\$WINDOW_NAME" "\$KICKOFF_MSG" >/dev/null 2>&1' "$START_SH"
+    grep -qE 'mux_send "\$WINDOW_NAME" "\$KICKOFF_MSG" >/dev/null \|\| true' "$START_SH"
+}
+
+@test "mux_send idiom used by start.sh's kickoff retry surfaces herdr's 'pane not found' warning (t007 F2)" {
+    # Reproduces the exact shell idiom start.sh uses for the kickoff retry
+    # ('mux_send ... >/dev/null || true') against a herdr backend whose pane
+    # has vanished, and confirms the warning is NOT swallowed.
+    FAKE_HERDR_DIR="$(mktemp -d)"
+    cat > "${FAKE_HERDR_DIR}/herdr" << 'FAKESCRIPT'
+#!/usr/bin/env bash
+cmd1="${1:-}"; cmd2="${2:-}"
+case "${cmd1}" in
+  --version) echo "herdr 0.9.0"; exit 0 ;;
+  server) exit 0 ;;
+  workspace)
+    case "${cmd2}" in
+      list) echo '{"result":{"workspaces":[{"workspace_id":"w1","label":"crewvia"}]}}'; exit 0 ;;
+    esac ;;
+  pane)
+    case "${cmd2}" in
+      list) echo '{"result":{"panes":[]}}'; exit 0 ;;
+    esac ;;
+esac
+exit 2
+FAKESCRIPT
+    chmod +x "${FAKE_HERDR_DIR}/herdr"
+
+    export PATH="${FAKE_HERDR_DIR}:${PATH}"
+    export CREWVIA_MUX=herdr
+    export CREWVIA_HERDR_WORKSPACE=crewvia
+    unset CREWVIA_MUX_ENABLED CREWVIA_TMUX_SESSION TMUX HERDR_ENV
+
+    run bash -c "source '${REPO_ROOT}/scripts/lib_mux.sh'; mux_send 'Omar-worker' 'hello' >/dev/null || true"
+
+    [[ "$output" == *"pane not found"* ]]
+
+    rm -rf "$FAKE_HERDR_DIR"
+}

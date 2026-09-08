@@ -78,6 +78,11 @@ case "$cmd" in
     exit 0
     ;;
   capture-pane)
+    # FAKE_TMUX_CAPTURE_FAIL=1 → simulate a capture-pane failure (pane
+    # vanished / tmux error) — used by t007 F2 regression tests.
+    if [[ "${FAKE_TMUX_CAPTURE_FAIL:-0}" == "1" ]]; then
+      exit 1
+    fi
     # FAKE_TMUX_SCREEN, if set to an existing file, overrides the fixed
     # default response — used by verify-sent tests to simulate an input
     # line that still (or no longer) holds the sent text.
@@ -217,19 +222,22 @@ log_count() {
 # send()
 # ---------------------------------------------------------------------------
 
-@test "send: issues 2 send-keys calls (text then Enter) with correct target" {
+@test "send: issues 3 send-keys calls (C-u, then text, then Enter) with correct target" {
+    # t007 F3: a leading "C-u" clear call was added ahead of text+Enter, so
+    # this now expects 3 send-keys invocations rather than the original 2.
     setup_fake_tmux
 
     run python3 "$LIB_MUX_PY" send "Omar-worker" "タスクなし、shutdown"
     [ "$status" -eq 0 ]
 
-    # Both send-keys invocations must be present.
+    # All three send-keys invocations must be present.
+    log_contains "send-keys -t crewvia:Omar-worker C-u"
     log_contains "send-keys -t crewvia:Omar-worker タスクなし、shutdown"
     log_contains "send-keys -t crewvia:Omar-worker Enter"
 
-    # There must be exactly 2 send-keys lines total.
+    # There must be exactly 3 send-keys lines total.
     count="$(log_count "send-keys")"
-    [ "$count" -eq 2 ]
+    [ "$count" -eq 3 ]
 }
 
 @test "send: text send-keys appears before Enter in call log (ordering)" {
@@ -960,8 +968,11 @@ print('herdr backend selected OK')
 
     python3 "$LIB_MUX_PY" send "Omar-worker" "hello" 2>/dev/null || true
 
-    # pane send-keys should NOT appear.
-    ! herdr_log_contains "pane send-keys"
+    # The Enter-insurance "pane send-keys ... enter" call should NOT appear.
+    # (t007 F3: a "pane send-keys ... ctrl+u" call now always precedes typing
+    # — that is unrelated, intentional input-line clearing, not the Enter
+    # insurance this test targets.)
+    ! herdr_log_contains "pane send-keys ${FAKE_PANE_ID} enter"
 }
 
 # ---------------------------------------------------------------------------
@@ -1032,8 +1043,10 @@ print('herdr backend selected OK')
 
     python3 "$LIB_MUX_PY" send "Omar-worker" "echo MUX_OK" 2>/dev/null || true
 
-    # pane send-keys must NOT fire — text is in scrollback, not input line.
-    ! herdr_log_contains "pane send-keys"
+    # The Enter-insurance call must NOT fire — text is in scrollback, not
+    # the input line. (t007 F3's unconditional "ctrl+u" clear call is
+    # unrelated — see comment above.)
+    ! herdr_log_contains "pane send-keys ${FAKE_PANE_ID} enter"
 }
 
 @test "herdr send: Enter insurance fires exactly once when text is in ❯ input line (t009)" {
@@ -1044,10 +1057,12 @@ print('herdr backend selected OK')
 
     python3 "$LIB_MUX_PY" send "Omar-worker" "echo MUX_OK" 2>/dev/null || true
 
-    # pane send-keys enter must fire exactly once.
+    # pane send-keys enter must fire exactly once (t007 F3: the unconditional
+    # "ctrl+u" clear call also appears in the log now, so count the
+    # enter-insurance call specifically rather than "pane send-keys" overall).
     herdr_log_contains "pane send-keys"
     herdr_log_contains "enter"
-    count="$(herdr_log_count "pane send-keys")"
+    count="$(herdr_log_count "pane send-keys ${FAKE_PANE_ID} enter")"
     [ "$count" -eq 1 ]
 }
 
@@ -1060,8 +1075,9 @@ print('herdr backend selected OK')
 
     python3 "$LIB_MUX_PY" send "Omar-worker" "echo hello" 2>/dev/null || true
 
-    # send-keys must NOT fire — "echo hello" only in scrollback, not last line.
-    ! herdr_log_contains "pane send-keys"
+    # send-keys enter must NOT fire — "echo hello" only in scrollback, not
+    # last line. (t007 F3's "ctrl+u" clear call is unrelated.)
+    ! herdr_log_contains "pane send-keys ${FAKE_PANE_ID} enter"
 }
 
 # ---------------------------------------------------------------------------
@@ -1772,4 +1788,185 @@ run_fake_crewvia() {
 
     run bash -c "source '${REPO_ROOT}/scripts/lib_mux.sh'; mux_verify_sent 'Omar-worker' 'hello'"
     [ "$status" -eq 0 ]
+}
+
+# ===========================================================================
+# t007 (PR#189 レビュー指摘 F1/F2/F3) regression tests
+#
+# F1: verify_sent() が既定の 5 行しか見ないと、実ペイン (入力欄の下に
+#     下罫線/status/auto-mode の 3 行が常にあり、かつ日本語主体の kickoff が
+#     狭い端末幅で折り返す) では ❯ 行が末尾 5 行の窓から押し出され、
+#     「まだ入力欄に残っている」のに verify_sent が True (landed) を返す。
+#     以前の疑似画面 (1〜3 行、TUI フッターも折り返しも無し) はこの穴を
+#     構造的に隠していた。以下のテストは下罫線+status+auto-mode の3行と
+#     複数行に折り返した入力欄を持つ「実ペイン相当」の画面を使う。
+#
+# F2: capture() は pane not found・エラー・timeout のいずれでも "" を返す。
+#     verify_sent() が "" を「入力欄にテキストなし = landed」と解釈すると、
+#     pane が消滅していても「verified」と報告してしまう (fail-open)。
+#
+# F3: リトライ時に入力行をクリアせず再送すると、前回の未送信テキストと
+#     連結される。send() は毎回 (リトライか初回かに関わらず) 打鍵前に
+#     入力行をクリアする。
+# ===========================================================================
+
+# 実ペイン相当の画面を作るヘルパー。入力欄が N 行に折り返し、その下に
+# 下罫線・空行・auto-mode の3行 (実ペインで常に見える TUI フッター) が続く。
+# 合計 (N + 3) 行になるので、tail_lines=5 では ❯ 行 (先頭行) が窓から
+# 押し出される (N >= 3 で確実に発生)。
+_write_wrapped_pane_fixture() {
+    local out_file="$1"
+    cat > "$out_file" << 'EOF'
+❯ ミッション開始。plan pull --agent Sofia --skills bash,code,python
+  でタスクを取得し、指示に従って作業してください。JSON に worktree_path
+  が含まれる場合はそのディレクトリに cd し、.crewvia-env を source して
+  ください。完了したら plan done で報告してください。
+────────────────────────────────────────────────
+
+⏵⏵ auto mode on (shift+tab to cycle)
+EOF
+}
+
+_KICKOFF_FIXTURE_TEXT="ミッション開始。plan pull --agent Sofia --skills bash,code,python でタスクを取得し、指示に従って作業してください。"
+
+@test "herdr verify-sent: F1 regression — wrapped input + TUI footer pushes ❯ past a 5-line window, still detected as stuck" {
+    setup_fake_herdr
+    _write_wrapped_pane_fixture "$FAKE_PANE_SCREEN"
+
+    # last 5 lines of the fixture do NOT include the ❯ line — before the F1
+    # fix this made verify_sent() fall back to the last non-empty line
+    # ("⏵⏵ auto mode on…"), find no match, and incorrectly report "landed".
+    run python3 "$LIB_MUX_PY" verify-sent "Omar-worker" "$_KICKOFF_FIXTURE_TEXT"
+    [ "$status" -eq 1 ]
+}
+
+@test "tmux verify-sent: F1 regression — wrapped input + TUI footer pushes ❯ past a 5-line window, still detected as stuck" {
+    setup_fake_tmux
+    FAKE_TMUX_SCREEN="${FAKE_TMUX_DIR}/screen"
+    _write_wrapped_pane_fixture "$FAKE_TMUX_SCREEN"
+    export FAKE_TMUX_SCREEN
+
+    run python3 "$LIB_MUX_PY" verify-sent "Omar-worker" "$_KICKOFF_FIXTURE_TEXT"
+    [ "$status" -eq 1 ]
+}
+
+@test "herdr send: F1 regression guard — Enter insurance still uses only the last 5 lines (unchanged default)" {
+    # send()'s own Enter insurance must NOT change behavior — only
+    # verify_sent() gets the wider window. Confirm the text is still found
+    # when it's within the 5-line tail (existing behavior, unaffected).
+    setup_fake_herdr
+    printf "❯ ミッション開始。plan pull" > "$FAKE_PANE_SCREEN"
+
+    python3 "$LIB_MUX_PY" send "Omar-worker" "ミッション開始。plan pull" 2>/dev/null || true
+
+    herdr_log_contains "pane send-keys"
+    herdr_log_contains "enter"
+}
+
+@test "herdr verify-sent: F2 regression — pane not found (empty pane list) is NOT reported as landed" {
+    setup_fake_herdr
+    # Simulate the pane having vanished: `pane list` returns no panes, so
+    # _resolve_ids() fails and capture() returns "" with a "pane not found"
+    # warning — this must NOT be interpreted as "text not in input line".
+    cat > "${FAKE_HERDR_DIR}/herdr" << 'FAKESCRIPT_NOPANE'
+#!/usr/bin/env bash
+echo "$*" >> "$FAKE_HERDR_LOG"
+cmd1="${1:-}"; cmd2="${2:-}"
+case "${cmd1}" in
+  --version) echo "herdr 0.9.0"; exit 0 ;;
+  server) exit 0 ;;
+  workspace)
+    case "${cmd2}" in
+      list) echo '{"result":{"workspaces":[{"workspace_id":"w1","label":"crewvia"}]}}'; exit 0 ;;
+    esac ;;
+  pane)
+    case "${cmd2}" in
+      list) echo '{"result":{"panes":[]}}'; exit 0 ;;
+    esac ;;
+esac
+exit 2
+FAKESCRIPT_NOPANE
+    chmod +x "${FAKE_HERDR_DIR}/herdr"
+
+    run python3 "$LIB_MUX_PY" verify-sent "Omar-worker" "ミッション開始。plan pull"
+    [ "$status" -eq 1 ]
+}
+
+@test "herdr verify-sent: F2 regression — pane read failure (pane resolves but capture errors) is NOT reported as landed" {
+    setup_fake_herdr
+    # pane list resolves fine, but `pane read` (the actual capture call)
+    # fails — must still be treated as "cannot confirm", not "landed".
+    cat > "${FAKE_HERDR_DIR}/herdr" << 'FAKESCRIPT_READFAIL'
+#!/usr/bin/env bash
+echo "$*" >> "$FAKE_HERDR_LOG"
+cmd1="${1:-}"; cmd2="${2:-}"
+case "${cmd1}" in
+  --version) echo "herdr 0.9.0"; exit 0 ;;
+  server) exit 0 ;;
+  workspace)
+    case "${cmd2}" in
+      list) echo '{"result":{"workspaces":[{"workspace_id":"w1","label":"crewvia"}]}}'; exit 0 ;;
+    esac ;;
+  pane)
+    case "${cmd2}" in
+      list) echo '{"result":{"panes":[{"pane_id":"w1:p1","tab_id":"w1:t1","label":"Omar-worker"}]}}'; exit 0 ;;
+      read) echo '{"error":"pane not found"}' >&2; exit 1 ;;
+    esac ;;
+esac
+exit 2
+FAKESCRIPT_READFAIL
+    chmod +x "${FAKE_HERDR_DIR}/herdr"
+
+    run python3 "$LIB_MUX_PY" verify-sent "Omar-worker" "ミッション開始。plan pull"
+    [ "$status" -eq 1 ]
+}
+
+@test "tmux verify-sent: F2 regression — capture-pane failure is NOT reported as landed" {
+    setup_fake_tmux
+    export FAKE_TMUX_CAPTURE_FAIL=1
+
+    run python3 "$LIB_MUX_PY" verify-sent "Omar-worker" "ミッション開始。plan pull"
+    [ "$status" -eq 1 ]
+}
+
+@test "herdr send: F3 — clears the input line (ctrl+u) before typing, ahead of pane run" {
+    setup_fake_herdr
+    echo "❯ " > "$FAKE_PANE_SCREEN"
+
+    run python3 "$LIB_MUX_PY" send "Omar-worker" "hello"
+    [ "$status" -eq 0 ]
+
+    herdr_log_contains "pane send-keys ${FAKE_PANE_ID} ctrl+u"
+    # ctrl+u must be sent before "pane run" (retry-safety ordering) — a
+    # clear issued after typing would erase the text instead of protecting
+    # against concatenation with a previous unsent attempt.
+    CTRLU_LINE="$(grep -nF "ctrl+u" "$FAKE_HERDR_LOG" | head -1 | cut -d: -f1)"
+    RUN_LINE="$(grep -nF "pane run" "$FAKE_HERDR_LOG" | head -1 | cut -d: -f1)"
+    [ -n "$CTRLU_LINE" ]
+    [ -n "$RUN_LINE" ]
+    [ "$CTRLU_LINE" -lt "$RUN_LINE" ]
+}
+
+@test "tmux send: F3 — clears the input line (C-u) before typing, ahead of the text" {
+    setup_fake_tmux
+
+    run python3 "$LIB_MUX_PY" send "Omar-worker" "hello"
+    [ "$status" -eq 0 ]
+
+    CTRLU_LINE="$(grep -nF "send-keys -t crewvia:Omar-worker C-u" "$FAKE_TMUX_LOG" | head -1 | cut -d: -f1)"
+    TEXT_LINE="$(grep -nF "send-keys -t crewvia:Omar-worker hello" "$FAKE_TMUX_LOG" | head -1 | cut -d: -f1)"
+    [ -n "$CTRLU_LINE" ]
+    [ -n "$TEXT_LINE" ]
+    [ "$CTRLU_LINE" -lt "$TEXT_LINE" ]
+}
+
+@test "herdr send: F3 regression guard — clearing an already-empty line does not cause double text (no duplicate send in normal case)" {
+    setup_fake_herdr
+    echo "❯ " > "$FAKE_PANE_SCREEN"
+
+    run python3 "$LIB_MUX_PY" send "Omar-worker" "hello"
+    [ "$status" -eq 0 ]
+
+    # "pane run" (the actual text submission) must appear exactly once.
+    [ "$(herdr_log_count "pane run ${FAKE_PANE_ID} hello")" -eq 1 ]
 }

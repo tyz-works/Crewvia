@@ -299,9 +299,20 @@ class TmuxBackend(_Backend):
 
         Uses 2-step send-keys with 0.1 s sleep between text and Enter to work
         around Claude TUI's bracketed paste handling (same as dispatcher.sh).
+
+        Clears the input line (``C-u``) immediately before typing (t007,
+        PR#189 レビュー指摘 F3): a caller that retries after `verify_sent()`
+        reports the previous attempt as not-landed would otherwise type on
+        top of the still-present text, concatenating messages
+        ("ミッション開始…ミッション開始…"). Clearing first is a no-op when the
+        line is already empty, so this is safe on a first attempt too.
         """
         target = self._target(name)
         try:
+            subprocess.run(
+                ["tmux", "send-keys", "-t", target, "C-u"],
+                capture_output=True, timeout=5,
+            )
             subprocess.run(
                 ["tmux", "send-keys", "-t", target, text],
                 capture_output=True, timeout=5,
@@ -596,24 +607,46 @@ def _herdr_run_raw(cmd_key: str, extra_args: List[str], timeout: int = 10) -> Op
     return r.stdout
 
 
-def _text_in_input_line(screen: str, text: str) -> bool:
+
+# t007 (PR#189 レビュー指摘 F1, Seo 実測): verify_sent() が使う既定の 5 行では、
+# 実ペイン (入力欄の下に下罫線/status/auto-mode の 3 行が常にあり、かつ
+# kickoff 本文が日本語主体で表示幅 358 桁あるため狭い端末幅では折り返す) で
+# ❯ 行が末尾 5 行の窓から押し出されてしまう (worker kickoff は端末幅 182 桁
+# 以下、TARGET_DIR worker は 111 桁以下で壊れ始めることを実測)。send() の
+# Enter insurance (既存の default 5) はそのままにし、verify_sent() 側だけ
+# より広い窓 (_VERIFY_SENT_TAIL_LINES) を渡せるよう tail_lines を引数化する。
+_DEFAULT_TAIL_LINES = 5
+_VERIFY_SENT_TAIL_LINES = 30
+
+
+def _text_in_input_line(screen: str, text: str, tail_lines: int = _DEFAULT_TAIL_LINES) -> bool:
     """Check if ``text`` appears in the active input line of the pane.
 
-    Examines only the **last 5 lines** of the screen to avoid matching text
-    that already appears in the scrollback (i.e. a previously executed command
-    whose output is still visible).
+    Examines only the **last ``tail_lines`` lines** of the screen to avoid
+    matching text that already appears in the scrollback (i.e. a previously
+    executed command whose output is still visible).
 
     Detection order (TUI-first, falls back to plain bash):
 
-    1. **Claude TUI mode**: scan the last 5 lines for any line that starts
-       with ``❯``.  If found, return ``True`` only if the first 30 characters
-       of ``text`` appear in one of those lines.  (Claude TUI renders a
-       status/hint line *below* the ``❯`` prompt, so the absolute-last line
-       is unreliable.)
+    1. **Claude TUI mode**: scan the last ``tail_lines`` lines for any line
+       that starts with ``❯``.  If found, return ``True`` only if the first
+       30 characters of ``text`` appear in one of those lines.  (Claude TUI
+       renders a status/hint line *below* the ``❯`` prompt, so the
+       absolute-last line is unreliable.)
 
     2. **Plain bash / other**: if no ``❯`` line is found, check the last
        non-empty line.  Return ``True`` if the first 30 characters of
        ``text`` appear in it.
+
+    **Why ``tail_lines`` is configurable (t007, F1)**: ``send()``'s own Enter
+    insurance only needs to look a few lines back (the pane was just written
+    to, so the ``❯`` line is near the bottom) and keeps the original default
+    of 5 to preserve existing behavior. ``verify_sent()``, however, is called
+    well after send() and against a pane that may show a TUI footer (status /
+    auto-mode lines) below the input line plus multiple wrapped lines of a
+    long kickoff message above it — both of which can push the ``❯`` line
+    past a 5-line window on narrower terminals. Callers that need to see
+    further back (currently only ``verify_sent()``) pass a larger value.
 
     **Why 30 characters instead of the full text**: notification messages
     sent to the director (e.g. "要求スキル ['review'] の Worker を起動して…")
@@ -635,7 +668,7 @@ def _text_in_input_line(screen: str, text: str) -> bool:
     # matches the prompt line that carries the beginning of the input.
     prefix = text[:30]
     # Examine only the tail to avoid scrollback matches.
-    tail = screen.splitlines()[-5:]
+    tail = screen.splitlines()[-tail_lines:]
     # Claude TUI: prompt lines start with ❯.
     prompt_lines = [line for line in tail if line.startswith("❯")]
     if prompt_lines:
@@ -1057,6 +1090,14 @@ class HerdrBackend(_Backend):
         See ``_text_in_input_line()`` for the exact detection algorithm
         (Claude TUI ``❯`` lines vs. plain bash last-line fallback, 30-char
         prefix matching).
+
+        Clears the input line (``ctrl+u``) immediately before ``pane_run``
+        (t007, PR#189 レビュー指摘 F3): a caller that retries after
+        `verify_sent()` reports the previous attempt as not-landed would
+        otherwise type on top of the still-present text, concatenating
+        messages ("ミッション開始…ミッション開始…"). Clearing first is a no-op
+        when the line is already empty, so this is safe on a first attempt
+        too.
         """
         _SEND_PROMPT_TIMEOUT = 5.0   # seconds to wait for '❯'
         _SEND_PROMPT_INTERVAL = 0.5  # poll interval in seconds
@@ -1081,6 +1122,9 @@ class HerdrBackend(_Backend):
                 )
                 break
             time.sleep(_SEND_PROMPT_INTERVAL)
+
+        # t007 F3: clear any leftover input before typing (see docstring).
+        _herdr_run("pane_send_keys", [pane_id, "ctrl+u"], timeout=5)
 
         run_data = _herdr_run("pane_run", [pane_id, text], timeout=10)
         if run_data is None:
@@ -1308,12 +1352,26 @@ class Mux:
         that never left the input line and retry instead of trusting the
         `True` that `send()` already returned.
 
+        Uses a wider ``tail_lines`` window than send()'s own Enter insurance
+        (see ``_VERIFY_SENT_TAIL_LINES`` / t007 F1) since a real pane has a
+        multi-line TUI footer below the input line and a long kickoff message
+        may wrap across several lines above it, both of which can push the
+        ``❯`` prompt line out of a narrow tail window on smaller terminals.
+
         Returns True when `text` is NOT sitting unsent in the input line
         (i.e. it was submitted, or the pane never had it to begin with).
-        Returns False when it is still stuck there — the caller should retry.
+        Returns False when it is still stuck there, OR when the pane could
+        not be captured at all (pane not found / backend error / timeout —
+        t007 F2) — the caller should retry in either case. Capture failure
+        must never be reported as "verified": `capture()` returns `""` both
+        when the pane is genuinely empty and when it could not be reached at
+        all, and there is no way to tell those apart here — so an empty
+        capture is treated as "cannot confirm delivery", not as "landed".
         """
         screen = self.capture(name)
-        return not _text_in_input_line(screen, text)
+        if not screen:
+            return False
+        return not _text_in_input_line(screen, text, tail_lines=_VERIFY_SENT_TAIL_LINES)
 
 
 # ---------------------------------------------------------------------------

@@ -484,6 +484,67 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# [P2] (Seo 最終レビュー, PR#180 / t018): JSON 判定の「入口ゲート」自体が
+# fail-open だった (同一構造の 3 度目: F-1 → [P1]/t012 → 今回)。
+# `.findings` が存在しない/null の場合でも旧 `jq -e '.findings | length'` は
+# exit 0 になり JSON 経路に入って自動 done + critical keyword safety net 無効化
+# されていた。`.findings | arrays | length` へ変更し、`.findings` が真に配列で
+# ある場合のみ JSON 経路に入るよう修正した回帰テスト。
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- [P2] t018: findings フィールド自体が欠損 → JSON 経路に入らず散文判定へ fallback (旧実装は自動 done, Seo実測値) ---"
+cat > "$FIXTURES_DIR/json_missing_findings_field.txt" <<'FIX'
+{"issues":[{"severity":"critical"}]}
+FIX
+write_task t190 "P2 t018 missing findings field"
+out=$(FAKE_GH_HEAD_BRANCH="feature-branch" FAKE_CODEX_FIXTURE="$FIXTURES_DIR/json_missing_findings_field.txt" \
+  run_kai --pr 1 --task t190 --mission "$MISSION_SLUG" --dry-run 2>&1) && rc=0 || rc=$?
+if [[ $rc -eq 0 ]] && echo "$out" | grep -q "method=tags needs_fix=1" && echo "$out" | grep -q "NEEDS-DIRECTOR相当"; then
+  pass "findings フィールド欠損 (.issues のみ) → JSON 経路に入らず method=tags にフォールバック、critical キーワードで NEEDS-DIRECTOR相当 (P2/t018 修正確認)"
+else
+  fail "REGRESSION (P2/t018): missing 'findings' field should NOT enter JSON path (fail-open gate) — rc=$rc out=$out"
+fi
+
+echo ""
+echo "--- [P2] t018: findings が null → JSON 経路に入らず散文判定へ fallback (旧実装は自動 done, Seo実測値) ---"
+cat > "$FIXTURES_DIR/json_null_findings.txt" <<'FIX'
+{"findings":null,"summary":"3 critical bugs found"}
+FIX
+write_task t191 "P2 t018 null findings"
+out=$(FAKE_GH_HEAD_BRANCH="feature-branch" FAKE_CODEX_FIXTURE="$FIXTURES_DIR/json_null_findings.txt" \
+  run_kai --pr 1 --task t191 --mission "$MISSION_SLUG" --dry-run 2>&1) && rc=0 || rc=$?
+if [[ $rc -eq 0 ]] && echo "$out" | grep -q "method=tags needs_fix=1" && echo "$out" | grep -q "NEEDS-DIRECTOR相当"; then
+  pass "findings: null → JSON 経路に入らず method=tags にフォールバック、critical キーワードで NEEDS-DIRECTOR相当 (P2/t018 修正確認)"
+else
+  fail "REGRESSION (P2/t018): findings:null should NOT enter JSON path (fail-open gate) — rc=$rc out=$out"
+fi
+
+echo ""
+echo "--- [P2] t018: findings が正当な空配列 → 引き続き JSON 経路で DONE相当 (ゲート修正で壊れていないこと) ---"
+write_task t192 "P2 t018 legit empty findings array"
+out=$(FAKE_GH_HEAD_BRANCH="feature-branch" FAKE_CODEX_FIXTURE="$FIXTURES_DIR/json_empty.txt" \
+  run_kai --pr 1 --task t192 --mission "$MISSION_SLUG" --dry-run 2>&1) && rc=0 || rc=$?
+if [[ $rc -eq 0 ]] && echo "$out" | grep -q "method=json needs_fix=0" && echo "$out" | grep -q "DONE/LGTM相当"; then
+  pass "findings: [] (正当な空配列) → 引き続き method=json, DONE相当 (ゲート修正で壊れていない)"
+else
+  fail "REGRESSION (P2/t018): legit empty findings array should still enter JSON path and judge DONE — rc=$rc out=$out"
+fi
+
+echo ""
+echo "--- [P2] t018: findings に未知 severity あり → 引き続き JSON 経路で NEEDS-DIRECTOR相当 (t012 の denylist が効き続けること) ---"
+cat > "$FIXTURES_DIR/json_gate_and_denylist.txt" <<'FIX'
+{"findings":[{"severity":"major"}]}
+FIX
+write_task t193 "P2 t018 gate plus denylist still works"
+out=$(FAKE_GH_HEAD_BRANCH="feature-branch" FAKE_CODEX_FIXTURE="$FIXTURES_DIR/json_gate_and_denylist.txt" \
+  run_kai --pr 1 --task t193 --mission "$MISSION_SLUG" --dry-run 2>&1) && rc=0 || rc=$?
+if [[ $rc -eq 0 ]] && echo "$out" | grep -q "method=json needs_fix=1" && echo "$out" | grep -q "NEEDS-DIRECTOR相当"; then
+  pass "findings に severity='major' のみ → 引き続き method=json, NEEDS-DIRECTOR相当 (ゲート修正後も t012 の denylist が効き続ける)"
+else
+  fail "REGRESSION (P2/t018): denylist inside the JSON path should still catch unknown severity after gate fix — rc=$rc out=$out"
+fi
+
+# ---------------------------------------------------------------------------
 # [P2] (Seo review, PR#180 / t012): mktemp 導入後は `-f "$OUTPUT_FILE"` チェックが
 # 到達不能になっていた (ファイルは常に存在するため)。`-s` (非空) 判定に変更した
 # 修正の回帰テスト。codex が exit 0 で終わったのに出力が空のままのケースを検証。

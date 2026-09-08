@@ -308,11 +308,43 @@ _info "Review output length: ${#REVIEW_CONTENT} chars"
 #   まさにこの経路 (タグ無し・散文のみ) で誤爆していたため。同一行に
 #   no/not/none/nothing/without/clean/zero 等の否定語が同居する行は「~の問題は
 #   無い」という健全な報告と判断し除外する。
+#
+#   [P2] (Seo 最終レビュー, t018): JSON 経路の「入口ゲート」自体が fail-open
+#   だった。旧 `jq -e '.findings | length'` は `.findings` が存在しないスキーマ
+#   でも `null` でも `length` が `0` を返し (jq の `length` は null に対して
+#   エラーではなく 0 を返す仕様)、`0` は `-e` にとって false/null ではないため
+#   exit 0 になる。結果 FINDINGS_COUNT=0 → JSON 経路に入ったまま NEEDS_FIX=0
+#   (自動 done)、しかも HAD_SIGNAL=1 が立つため critical keyword safety net
+#   まで無効化されていた。これは **同一構造 (倒れる方向が常に自動承認) の
+#   3 度目**: F-1 ([P0] タグ取りこぼし) → [P1]/t012 (JSON 内側の allowlist) →
+#   今回 (JSON 経路への入口ゲート)。`.findings | arrays | length` に変更し、
+#   `.findings` が真に配列である場合のみ (空配列 `[]` も含む) JSON 経路に
+#   入るようにした。配列でない/存在しない/null の場合は `arrays` がフィルタで
+#   除外して jq が何も出力せず exit 非 0 になるため、`if` が false になって
+#   [P#] タグ判定 (→ タグ無しなら critical keyword safety net) へ確実に
+#   フォールバックする。
+#
+#   [P2] 対応時に判定フロー全体 (入口・内側・fallback) を通しで洗い直した結果:
+#   - 入口: 上記で修正。findings が配列でない限り JSON 経路に入らない。
+#   - 内側 (findings > 0 の denylist, t012): 未知の priority/severity・欠損・
+#     jq 自体の失敗はいずれも危険側 (NEEDS_FIX=1) に倒れることを確認済み。
+#     さらに finding の要素が object でない (例: 文字列が混在する配列) 場合も
+#     denylist 側の jq が `.priority`/`.severity` のインデックス参照で
+#     エラーになり、`else HIGH_COUNT=1` の fail-safe 分岐に落ちることを実測確認
+#     (`echo '{"findings":["str",{"severity":"critical"}]}' | jq '...'` が
+#     nonzero exit することを確認済み)。
+#   - jq 不在環境: `command -v jq` チェックは無いが、jq が無ければ exit 127 で
+#     入口の `if` が false になり [P#] タグ判定へフォールバックするため安全
+#     (PR#180 Seo レビューで確認済み)。
+#   - fallback (critical keyword, F-3): 上記の通り HAD_SIGNAL は「配列として
+#     JSON 判定できた」場合と「[P#] タグが見つかった」場合のみ 1 になるため、
+#     入口ゲート修正後は fail-open な抜け道が無い。
+#   洗い直しの結果、[P2] の入口ゲート以外に追加の fail-open は見つからなかった。
 NEEDS_FIX=0
 JUDGE_METHOD="tags"
 HAD_SIGNAL=0
 
-if FINDINGS_COUNT=$(echo "$REVIEW_CONTENT" | jq -e '.findings | length' 2>/dev/null); then
+if FINDINGS_COUNT=$(echo "$REVIEW_CONTENT" | jq -e '.findings | arrays | length' 2>/dev/null); then
   JUDGE_METHOD="json"
   HAD_SIGNAL=1
   HIGH_COUNT=0

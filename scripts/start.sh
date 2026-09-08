@@ -310,11 +310,22 @@ else
 fi
 
 # CREWVIA_REPO: crewvia 本体のパス。Worker の cwd が target project に
-# 切り替わった後も、plan.sh / registry / knowledge / hooks などを絶対パスで
+# 切り替わった後も、registry / knowledge / hooks などを絶対パスで
 # 呼び出せるように、常に export する。
 export CREWVIA_REPO="$REPO_ROOT"
 export CREWVIA_REPO_ROOT="$REPO_ROOT"
 export CREWVIA_QUEUE="${REPO_ROOT}/queue"
+
+# --- plan コマンド: scripts/bin/plan を PATH に追加する ---
+# Worker/Director が `plan <subcommand> ...` だけで plan.sh を呼べるようにする。
+# 狙いは「呼び出しのために $CREWVIA_REPO_ROOT の絶対パスを覚え/打つ」習慣そのもの
+# を無くすこと — この習慣が編集・git 操作にまで無意識に持ち込まれ、Worker が
+# main checkout を直接編集してしまう事故（2026-09-08）の誘因になった。
+# scripts/bin/plan は $CREWVIA_REPO_ROOT/scripts/plan.sh へ exec するだけの薄い
+# ラッパーで、引数・終了コード・stdout/stderr は完全に透過する。
+# 後方互換: 既存の "$CREWVIA_REPO_ROOT/scripts/plan.sh ..." 呼び出しは変更なしで
+# 引き続き動く。
+export PATH="${REPO_ROOT}/scripts/bin:${PATH}"
 
 # Export SKILLS as comma-separated env var
 if [[ ${#SKILLS_ARR[@]} -gt 0 ]]; then
@@ -551,7 +562,12 @@ PYEOF
   fi
   # unset CLAUDE_CODE_CHILD_SESSION: herdr server が陳腐化した環境変数を引き継いでいる場合に
   # Director/Worker の claude プロセスへ汚染が伝播しないよう、起動直前に必ず除去する。
-  LAUNCH_CMD="$ENV_EXPORTS; unset CLAUDE_CODE_CHILD_SESSION; cd '$WORK_DIR'; claude${MODEL_CLI_ARG}${SETTINGS_CLI_ARG}"
+  #
+  # export PATH: mux (tmux/herdr) が spawn する新しいペインは、この start.sh
+  # プロセスが export した PATH を継承しない（spawn() の env= 引数はどちらの
+  # backend でも未実装 — 上の ENV_EXPORTS と同じ理由）。scripts/bin/plan を
+  # 使えるようにするため、ペイン側の $PATH に対して明示的に prepend する。
+  LAUNCH_CMD="$ENV_EXPORTS; export PATH='${REPO_ROOT}/scripts/bin:'\"\$PATH\"; unset CLAUDE_CODE_CHILD_SESSION; cd '$WORK_DIR'; claude${MODEL_CLI_ARG}${SETTINGS_CLI_ARG}"
 
   # Spawn agent window (mux_spawn handles has-session/new-session/new-window internally).
   # mux_spawn only refuses when the window still holds a live agent; a window
@@ -592,12 +608,12 @@ PYEOF
     if [[ "${ROLE}" == "worker" ]]; then
       # TARGET_DIR が設定されている場合は --target-dir を渡して target 不一致タスクをスキップ
       if [[ -n "${TARGET_DIR:-}" ]]; then
-        KICKOFF_MSG="ミッション開始。${CREWVIA_REPO_ROOT}/scripts/plan.sh pull --agent ${AGENT_NAME} --skills ${SKILLS} --target-dir ${TARGET_DIR} でタスクを取得し、指示に従って作業してください。完了したら ${CREWVIA_REPO_ROOT}/scripts/plan.sh done で報告し、待機してください（Dispatcher が次のタスクを自動割り当てします）。"
+        KICKOFF_MSG="ミッション開始。plan pull --agent ${AGENT_NAME} --skills ${SKILLS} --target-dir ${TARGET_DIR} でタスクを取得し、指示に従って作業してください。完了したら plan done で報告し、待機してください（Dispatcher が次のタスクを自動割り当てします）。"
       else
-        KICKOFF_MSG="ミッション開始。${CREWVIA_REPO_ROOT}/scripts/plan.sh pull --agent ${AGENT_NAME} --skills ${SKILLS} でタスクを取得し、指示に従って作業してください。JSON に worktree_path が含まれる場合はそのディレクトリに cd し、.crewvia-env を source してから作業してください（例: cd <worktree_path> && source .crewvia-env）。完了したら ${CREWVIA_REPO_ROOT}/scripts/plan.sh done で報告し、待機してください（Dispatcher が次のタスクを自動割り当てします）。"
+        KICKOFF_MSG="ミッション開始。plan pull --agent ${AGENT_NAME} --skills ${SKILLS} でタスクを取得し、指示に従って作業してください。JSON に worktree_path が含まれる場合はそのディレクトリに cd し、.crewvia-env を source してから作業してください（例: cd <worktree_path> && source .crewvia-env）。完了したら plan done で報告し、待機してください（Dispatcher が次のタスクを自動割り当てします）。"
       fi
     else
-      KICKOFF_MSG="ミッション開始。${CREWVIA_REPO_ROOT}/scripts/plan.sh status で状態を確認し、タスク分解・Worker 割り当て・全体管理を開始してください。"
+      KICKOFF_MSG="ミッション開始。plan status で状態を確認し、タスク分解・Worker 割り当て・全体管理を開始してください。"
     fi
     mux_send "$WINDOW_NAME" "$KICKOFF_MSG"
     echo "[crewvia] Kickoff message sent to $WINDOW_NAME"

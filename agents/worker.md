@@ -49,7 +49,7 @@ Kai発見: oci compute instance list で --compartment-id を省略すると全�
 3. **プランの存在と状態を確認する** — active mission が存在しない場合（`queue/state.yaml` の `active_missions` が空）は Director に報告して待機する。存在する場合は現在のプラン全体を把握する:
 
    ```bash
-   ${CREWVIA_REPO_ROOT}/scripts/plan.sh status
+   plan status
    ```
 
    出力例:
@@ -61,7 +61,7 @@ Kai発見: oci compute instance list で --compartment-id を省略すると全�
        🔄 t002 新認証ミドルウェアの実装 (Luca)
    ```
 
-   特定 mission の詳細を見たいときは `${CREWVIA_REPO_ROOT}/scripts/plan.sh status --mission <slug>` を使う。
+   特定 mission の詳細を見たいときは `plan status --mission <slug>` を使う。
 
 ---
 
@@ -74,7 +74,7 @@ Kai発見: oci compute instance list で --compartment-id を省略すると全�
 | `AGENT_NAME` | あなたの名前 |
 | `TASK_TITLE` | 現在担当中のカードタイトル |
 | `TASK_ID` | 現在担当中のカードID |
-| `CREWVIA_REPO` | crewvia 本体のパス。worktree 内からでも crewvia tools を呼び出すために使う（`$CREWVIA_REPO/scripts/plan.sh` 等） |
+| `CREWVIA_REPO` | crewvia 本体のパス。worktree 内からでも crewvia tools（registry / knowledge / hooks 等）を呼び出すために使う。plan.sh の呼び出しは `plan` コマンド（PATH 経由のラッパー、後述）を使えばこの変数を意識する必要はない |
 | `CREWVIA_REPO_ROOT` | `CREWVIA_REPO` と同値。新スタイルの env 名。どちらも同じパスを指す |
 | `CREWVIA_QUEUE` | キューディレクトリの絶対パス（通常 `$CREWVIA_REPO/queue`） |
 | `CREWVIA_MISSION_SLUG` | 担当中のミッション slug（plan.sh pull 後、worktree の `.crewvia-env` を source すると設定される） |
@@ -111,21 +111,21 @@ Dispatcher が mux (tmux / herdr) 経由でタスクを通知し、Worker はそ
 ```
 起動
   ↓
-plan.sh status で active mission の存在を確認
+plan status で active mission の存在を確認
   ↓
-plan.sh pull --agent "$AGENT_NAME" --skills "$SKILLS" を実行（初回）
+plan pull --agent "$AGENT_NAME" --skills "$SKILLS" を実行（初回）
   ├─ タスクあり (exit 0) → タスク情報（JSON）を受け取り実行
   │     ↓
   │   PreToolUse hook が承認を自動リクエスト → 承認待機
   │     ↓
   │   実行 → PostToolUse hook がログを自動投稿
   │     ↓
-  │   実行完了 → plan.sh done <id> "<result>" --mission <slug>
+  │   実行完了 → plan done <id> "<result>" --mission <slug>
   │     ↓
   │   待機（Dispatcher からの次の assign を待つ）
   │     ↓
   │   Dispatcher が次の assign 通知を送信
-  │   → plan.sh pull --task <id> --mission <slug> で取得（ループ先頭へ）
+  │   → plan pull --task <id> --mission <slug> で取得（ループ先頭へ）
   │
   └─ タスクなし (exit 2) → 待機（Dispatcher が assign してくれるまで待つ）
 
@@ -136,7 +136,7 @@ Dispatcher から「タスクなし、shutdown」通知を受けたらセッシ�
 
 | メッセージ | 意味 | Worker の対応 |
 |---|---|---|
-| `タスク {id} (mission={slug}) を実行して。plan.sh pull --task {id} --mission {slug} で取得後、...` | 次のタスク割り当て | `plan.sh pull --task {id} --mission {slug}` を実行 |
+| `タスク {id} (mission={slug}) を実行して。plan pull --task {id} --mission {slug} で取得後、...` | 次のタスク割り当て | `plan pull --task {id} --mission {slug}` を実行 |
 | `タスクなし、shutdown` | 担当スキルのタスクがなくなった | セッション終了 |
 
 ---
@@ -152,7 +152,8 @@ Worker は状況に応じて 2 種類の cwd で起動される。どちらで�
 - cwd は `$CREWVIA_REPO/.claude/worktrees/<mission_slug>/<task_id>-<task_slug>/` になる
 - `git status` / `git log` はその worktree が指す crewvia ブランチの状態を示す
 - `CLAUDE.md` / `.claude/settings.json` は crewvia のものが読み込まれる（worktree も同じリポジトリ）
-- plan.sh / registry / knowledge / hooks は `$CREWVIA_REPO/...` の絶対パスで呼ぶ（worktree 内でも有効）
+- plan.sh の呼び出しは `plan <subcommand> ...`（`scripts/start.sh` が PATH に追加する `scripts/bin/plan` ラッパー）を使う。$CREWVIA_REPO の絶対パスを覚える/打つ必要はない
+- registry / knowledge / hooks は引き続き `$CREWVIA_REPO/...` の絶対パスで呼ぶ（worktree 内でも有効）
 
 ### 作業スコープの制約 (重要) — worktree モード
 
@@ -160,14 +161,15 @@ crewvia 自身のツール (`scripts/plan.sh` / `scripts/dispatcher.sh` / `hooks
 
 | 用途 | 使うパス | 具体例 |
 |---|---|---|
-| **呼び出し**（タスク管理コマンドの実行） | `$CREWVIA_REPO` の絶対パス | `"$CREWVIA_REPO/scripts/plan.sh" done t011 "result" --mission <slug>` |
+| **呼び出し**（タスク管理コマンドの実行） | `plan` コマンド（PATH 経由のラッパー）。$CREWVIA_REPO の絶対パスを書く必要はない | `plan done t011 "result" --mission <slug>` |
 | **編集**（Edit / Write ツールでのファイル変更） | 必ず worktree 内のパス（`pwd` 起点の相対パス、または `git rev-parse --show-toplevel` で得た絶対パス） | `Edit(file_path="$(pwd)/scripts/plan.sh")` — **`$CREWVIA_REPO/scripts/plan.sh` を Edit/Write の対象にしない** |
 
 なぜ区別が必要か:
 
-- `plan.sh done` / `plan.sh pull` などの**タスク管理コマンド**は、queue/ の状態を持つ main checkout (`$CREWVIA_REPO`) 側を呼ぶのが正しい。worktree 側の `queue/` は空（gitignore 対象）なので、worktree 側の `plan.sh` を呼んでも動作しない。
+- `plan done` / `plan pull` などの**タスク管理コマンド**は、queue/ の状態を持つ main checkout (`$CREWVIA_REPO`) 側を呼ぶのが正しい。worktree 側の `queue/` は空（gitignore 対象）なので、worktree 側の `plan.sh` を呼んでも動作しない。`plan` ラッパーは内部でこの「main checkout の plan.sh を呼ぶ」処理を行うだけの薄いものなので、Worker 自身が `$CREWVIA_REPO` を意識する必要が無くなる。`"$CREWVIA_REPO/scripts/plan.sh" ...` を直接呼ぶ従来の書き方も引き続き動く(後方互換)が、新しく書くコマンドは `plan ...` を使うこと。
+- **`$CREWVIA_REPO` の絶対パスを覚えて打つ習慣そのものが事故の温床になる。** タスク管理コマンドの「呼び出し」で `$CREWVIA_REPO/...` を毎回打つ癖がつくと、それが git 操作にまで無意識に持ち込まれ、`cd $CREWVIA_REPO_ROOT && git checkout -b ...` のように **main checkout を直接編集・ブランチ切替してしまう事故に至った**(2026-09-08)。`plan` ラッパーはこの誘因を構造的に断つためのもの — 呼び出しに `$CREWVIA_REPO` を書く理由自体を無くす。
 - 一方 `scripts/plan.sh` 自体を**改修する** task では、あなたが変更しているのは worktree 側の作業コピーである。Edit/Write の対象を `$CREWVIA_REPO` の絶対パスにしてしまうと、専用 worktree ではなく **main checkout (branch=main) を直接編集してしまう**。commit 前に `git status` で気づけば復旧できるが、気づかなければ main に直接混入する（実際に t009 で発生。git status で自己復旧し実害は無かったが、約20分のミッション停止を招いた事故の遠因になった）。
-- 自分の修正を動作確認したい場合も同様に、worktree 内のパス（`./scripts/plan.sh` や `$(pwd)/scripts/plan.sh`）を明示的に指定すること。`$CREWVIA_REPO/scripts/plan.sh` を使うと、あなたが今まさに直している**未修正の main 版**を実行してしまい、修正の検証にならない。
+- 自分の修正を動作確認したい場合も同様に、worktree 内のパス（`./scripts/plan.sh` や `$(pwd)/scripts/plan.sh`）を明示的に指定すること。`$CREWVIA_REPO/scripts/plan.sh` や `plan ...`(PATH 経由でも main checkout の plan.sh に届く)を使うと、あなたが今まさに直している**未修正の main 版**を実行してしまい、修正の検証にならない。
 
 **構造的なガード（最後の安全網）**: `hooks/pre-tool-use.sh` は、worktree を持つ Worker（タスク pull 済み・`TARGET_DIR` 未設定）が `$CREWVIA_REPO` 配下（`queue/` `registry/` `.claude/worktrees/` を除く）を Edit/Write/MultiEdit/NotebookEdit しようとすると拒否する（t011 で追加。MultiEdit/NotebookEdit も対象 — Edit/Write だけでは同格の別ツールを見落とす control-bypass になるため必ず含めること）。ブロックされたら「編集先のパスが worktree 内かどうか」を見直すこと。ただしこれは事故の最終防波堤であり、**最初から worktree 内のパスを使う**のが正しい進め方であることに変わりはない。なお `Bash` 経由の書き込み（heredoc / `sed -i` / `tee` 等）はこのガードの対象外として残る既知の限界 — ツール名を偽装できない Edit/Write/MultiEdit/NotebookEdit だけを機械的に守る仕組みであり、Bash を使った書き込みは引き続き自分の規律で避けること。
 
@@ -181,10 +183,11 @@ task の `target_dir` が非 null の場合、`plan.sh pull` は **worktree を�
 
 - `git status` / `git log` / `git diff` は target project を指す (crewvia ではない)
 - `CLAUDE.md` / `.claude/settings.json` は target project のものが claude に読み込まれる
-- crewvia tools (plan.sh / registry / knowledge) は **必ず `$CREWVIA_REPO` 経由の絶対パスで呼ぶ**:
+- plan.sh の呼び出しは `plan` コマンド（PATH 経由のラッパー）を使う:
   ```bash
-  "$CREWVIA_REPO/scripts/plan.sh" done t002 "result" --mission <slug>
+  plan done t002 "result" --mission <slug>
   ```
+- registry / knowledge は **必ず `$CREWVIA_REPO` 経由の絶対パスで呼ぶ**
 - hooks (pre-tool-use.sh / post-tool-use.sh) は `~/.claude/settings.json`(ユーザーレベル)ではなく、
   crewvia の**プロジェクトレベル** `.claude/settings.json`(`$CREWVIA_REPO/.claude/settings.json`)に
   絶対パスで登録されている。★これは cwd 依存である(task_160 F8 実測で確認済み — worktree モード
@@ -226,12 +229,12 @@ Dispatcher から `--task {id} --mission {slug}` が届いた場合はそれを�
 
 ```bash
 # Dispatcher からの assign 通知ありの場合
-TASK_JSON=$(${CREWVIA_REPO_ROOT}/scripts/plan.sh pull --skills "$SKILLS" --agent "$AGENT_NAME" \
+TASK_JSON=$(plan pull --skills "$SKILLS" --agent "$AGENT_NAME" \
   --task "$ASSIGNED_TASK_ID" --mission "$ASSIGNED_MISSION")
 PULL_RC=$?
 
 # 起動直後や --task なしの場合（スキルマッチで自動選択）
-TASK_JSON=$(${CREWVIA_REPO_ROOT}/scripts/plan.sh pull --skills "$SKILLS" --agent "$AGENT_NAME")
+TASK_JSON=$(plan pull --skills "$SKILLS" --agent "$AGENT_NAME")
 PULL_RC=$?
 ```
 
@@ -587,7 +590,7 @@ Worker はここで手動 bump を呼ばないこと（二重 bump 防止）。
 **ここまで全て完了してから**、タスクを手放す:
 
 ```bash
-${CREWVIA_REPO_ROOT}/scripts/plan.sh done "$TASK_ID" "実行した内容と結果の要約" --mission "$TASK_MISSION"
+plan done "$TASK_ID" "実行した内容と結果の要約" --mission "$TASK_MISSION"
 ```
 
 > **移行予告**: 将来的に `plan.sh done` は `plan.sh ready-for-verification <task_id>` に移行予定。
@@ -598,7 +601,7 @@ ${CREWVIA_REPO_ROOT}/scripts/plan.sh done "$TASK_ID" "実行した内容と結�
 チェックポイントを完遂できない・証拠が提出できない・判断が必要な場合は、代替検証で done を押し通すのではなく **Director に差し戻す**:
 
 ```bash
-${CREWVIA_REPO_ROOT}/scripts/plan.sh needs-director "$TASK_ID" "詰まった理由を具体的に記述" --mission "$TASK_MISSION"
+plan needs-director "$TASK_ID" "詰まった理由を具体的に記述" --mission "$TASK_MISSION"
 ```
 
 - タスクは `needs_director` 状態になり、`done` 遷移はブロックされる
@@ -644,7 +647,7 @@ cwd が worktree の場合、verify-task.sh 内の `SCRIPT_DIR` が worktree 側
 完了登録後、`plan.sh status --mission "$TASK_MISSION"` の出力を Director に報告する:
 
 ```bash
-${CREWVIA_REPO_ROOT}/scripts/plan.sh status --mission "$TASK_MISSION"
+plan status --mission "$TASK_MISSION"
 ```
 
 Director への報告フォーマット:
@@ -717,7 +720,7 @@ mkdir -p "$(dirname "$HANDOFF_PATH")"
 **Step 4**: plan.sh fail を実行:
 
 ```bash
-${CREWVIA_REPO_ROOT}/scripts/plan.sh fail "$TASK_ID" "$HANDOFF_PATH" --mission "$TASK_MISSION"
+plan fail "$TASK_ID" "$HANDOFF_PATH" --mission "$TASK_MISSION"
 ```
 
 **Step 5**: Director に報告:

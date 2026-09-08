@@ -1050,8 +1050,8 @@ def dispatch():
             if should_notify(notify_key):
                 msg = (
                     f"タスク {task_id} (mission={slug}) を実行して。"
-                    f"plan.sh pull --task {task_id} --mission {slug} で取得後、"
-                    f"作業→plan.sh done で完了。"
+                    f"plan pull --task {task_id} --mission {slug} で取得後、"
+                    f"作業→plan done で完了。"
                 )
                 if tmux_send(target, msg):
                     record_notify(notify_key)

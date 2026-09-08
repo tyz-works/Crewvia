@@ -240,5 +240,108 @@ else
 fi
 
 echo ""
+echo "--- Test 13 (t008 追加, QA t003 FINDING-2, 実運用で観測): 実際に plan-reviewer が書いた「修正後 GO」→ NOT approve, exit 1, file unchanged ---"
+F13="$TMPDIR_TEST/t13.md"
+cat > "$F13" << 'EOF'
+# Plan Review: test-mission
+
+## 総合判定
+
+**修正後 GO**
+
+理由:
+- タスク構成自体は正しい（実装 → review の流れ）
+- スキル割り当ても妥当
+
+Director が上記の Description 補記を行えば即実行可。
+EOF
+ORIG13="$(cat "$F13")"
+python3 "$NORMALIZE" "$F13" >/tmp/test_normalize_stdout 2>&1
+RC=$?
+NEW13="$(cat "$F13")"
+if [[ "$RC" -eq 1 && "$NEW13" == "$ORIG13" ]]; then
+  pass "修正後 GO (実運用の実例) → not misdetected as approve, exit 1, file untouched"
+else
+  fail "修正後 GO should NOT normalize to approve — rc=$RC content=$(cat "$F13")"
+fi
+
+echo ""
+echo "--- Test 14 (t008 追加): '## 総合判定: 条件付き GO' → NOT approve, exit 1 ---"
+F14="$TMPDIR_TEST/t14.md"
+cat > "$F14" << 'EOF'
+# Plan Review: test-mission
+
+## 総合判定: 条件付き GO
+EOF
+ORIG14="$(cat "$F14")"
+python3 "$NORMALIZE" "$F14" >/tmp/test_normalize_stdout 2>&1
+RC=$?
+NEW14="$(cat "$F14")"
+if [[ "$RC" -eq 1 && "$NEW14" == "$ORIG14" ]]; then
+  pass "条件付き GO → not misdetected as approve, exit 1, file untouched"
+else
+  fail "条件付き GO should NOT normalize to approve — rc=$RC content=$(cat "$F14")"
+fi
+
+echo ""
+echo "--- Test 15 (t008 追加): '## 総合判定: GO（ただし t002 の Description 追記が前提）' → NOT approve, exit 1 ---"
+F15="$TMPDIR_TEST/t15.md"
+cat > "$F15" << 'EOF'
+# Plan Review: test-mission
+
+## 総合判定: GO（ただし t002 の Description 追記が前提）
+EOF
+ORIG15="$(cat "$F15")"
+python3 "$NORMALIZE" "$F15" >/tmp/test_normalize_stdout 2>&1
+RC=$?
+NEW15="$(cat "$F15")"
+if [[ "$RC" -eq 1 && "$NEW15" == "$ORIG15" ]]; then
+  pass "GO（ただし...が前提） → not misdetected as approve, exit 1, file untouched"
+else
+  fail "GO（ただし...が前提） should NOT normalize to approve — rc=$RC content=$(cat "$F15")"
+fi
+
+echo ""
+echo "--- Test 16 (t008 guard-rail, Director 指摘): '## 総合判定: **GO**。ただし Codex review は Director 判断' → 留保が付随情報のみ、approve のまま ---"
+F16="$TMPDIR_TEST/t16.md"
+cat > "$F16" << 'EOF'
+# Plan Review: test-mission
+
+## 総合判定: **GO**。ただし Codex review は Director 判断とする。
+EOF
+python3 "$NORMALIZE" "$F16" >/tmp/test_normalize_stdout 2>&1
+RC=$?
+if [[ "$RC" -eq 0 ]] && grep -q '^\*\*Verdict:\*\* approve' "$F16"; then
+  pass "GO。ただし(付随情報) → HEDGE_RE が文をまたいで誤爆せず approve のまま (over-broad guard)"
+else
+  fail "GO。ただし(付随情報のみ) は approve のままであるべき — rc=$RC content=$(cat "$F16")"
+fi
+
+echo ""
+echo "--- Test 17: 既存の NO-GO / 却下 / 要修正 / LGTM が引き続き正しく判定される (regression) ---"
+declare -A T17_CASES=(
+  ["**NO-GO**"]="reject"
+  ["**却下**"]="reject"
+  ["**要修正**"]="revise"
+  ["**LGTM**"]="approve"
+)
+T17_OK=1
+for content17 in "${!T17_CASES[@]}"; do
+  expected="${T17_CASES[$content17]}"
+  F17="$TMPDIR_TEST/t17-$(echo "$expected" | tr -d '*').md"
+  printf '# Plan Review: test-mission\n\n## 総合判定\n%s\n' "$content17" > "$F17"
+  python3 "$NORMALIZE" "$F17" >/tmp/test_normalize_stdout 2>&1
+  if ! grep -q "^\*\*Verdict:\*\* ${expected}" "$F17"; then
+    T17_OK=0
+    echo "    (unexpected) '$content17' did not normalize to $expected — content=$(cat "$F17")"
+  fi
+done
+if [[ "$T17_OK" -eq 1 ]]; then
+  pass "NO-GO / 却下 / 要修正 / LGTM は引き続き正しく判定される (regression)"
+else
+  fail "正当な NO-GO / 却下 / 要修正 / LGTM の判定に regression がある"
+fi
+
+echo ""
 echo "== Results: $PASS_COUNT passed, $FAIL_COUNT failed =="
 [[ "$FAIL_COUNT" -eq 0 ]]

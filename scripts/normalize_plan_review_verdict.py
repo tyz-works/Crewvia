@@ -60,6 +60,34 @@ NEG_RE = re.compile(
     re.IGNORECASE,
 )
 
+# t008 追加 (QA t003 FINDING-2, 実運用で観測): 「修正後 GO」「条件付き GO」
+# 「GO（ただし...が前提）」のような留保付き判定も、NEG_RE と同じ穴で無条件
+# approve に化けていた。plan-reviewer が実際に書いた例:
+#   ## 総合判定
+#   **修正後 GO**
+#   理由: ... Director が上記の Description 補記を行えば即実行可。
+# 「修正してから GO」は実質 revise 相当であり、これが無条件 approve として
+# launch まで通っていた。normalize の docstring が謳う「倒れる方向は必ず
+# 待つ / 失敗側」から外れる退行 — 修正前は 600s タイムアウトして Director が
+# 手で見ていたものが、この PR で「静かな誤 approve」に変わっていた。
+HEDGE_RE = re.compile(r"(修正後|条件付|ただし|前提)")
+
+# NEG_RE / HEDGE_RE は判定語 (verdict) と同じ「文」または「段落」の中に
+# ある場合だけ approve を無効化する。scope はヘッダー行から 200 文字先まで
+# 見るため、無関係な離れた文にある否定語・留保表現 (例: 別の話題の「ただし」)
+# で誤爆しないようにするための局所化。区切りは句点 (。) または空行。
+_UNIT_SPLIT_RE = re.compile(r"。|\n[ \t]*\n")
+
+
+def _unit_around(scope: str, pos: int) -> str:
+    """`scope` 内で index `pos` を含む「文/段落」単位を返す。"""
+    start = 0
+    for m in _UNIT_SPLIT_RE.finditer(scope):
+        if m.start() >= pos:
+            return scope[start:m.start()]
+        start = m.end()
+    return scope[start:]
+
 
 def find_alt_verdict(content: str) -> str | None:
     m = SCOPE_RE.search(content)
@@ -67,12 +95,20 @@ def find_alt_verdict(content: str) -> str | None:
         return None
     scope = content[m.start(): m.start() + SCOPE_WINDOW]
     for verdict, pattern in ALT_PATTERNS:
-        if pattern.search(scope):
-            # approve は否定文脈 (「承認しない」等) で誤爆しやすい —
-            # 否定語が scope 内にあれば判定不能扱いにして安全側に倒す。
-            if verdict == "approve" and NEG_RE.search(scope):
+        vm = pattern.search(scope)
+        if not vm:
+            continue
+        if verdict == "approve":
+            # approve は否定文脈 (「承認しない」等) と留保文脈
+            # (「修正後 GO」等) の両方で誤爆しやすい — 判定語と同じ文/段落に
+            # 否定語または留保表現があれば判定不能扱いにして安全側に倒す。
+            # 例外: 「GO。ただし Codex review は Director 判断」のように、
+            # 句点で文が切れた後の別の話題は同じ unit に含まれないため
+            # 誤爆しない。
+            unit = _unit_around(scope, vm.start())
+            if NEG_RE.search(unit) or HEDGE_RE.search(unit):
                 return None
-            return verdict
+        return verdict
     return None
 
 

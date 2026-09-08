@@ -26,6 +26,28 @@
 #      連呼せず「設定エラー」として1行の警告にまとめ、cleanup をスキップする
 #      (_is_mass_kill()、watchdog.py)。
 #
+# t020 (P1 追加修正、Seo 最終レビュー): 上記「設計改善」自体に穴があった。
+# _is_mass_kill() は「監視中の全員が kill」で True を返す実装だったため、
+# **監視 Worker が1名の時、その1名が本当に window を失うと必ず all-kill に
+# なり常に True になる**。crewvia の通常運用は in_progress が1〜2名なので、
+# N=1/N=2 はレアケースではなく最頻ケース。この経路に入ると cleanup せず
+# continue するため、vanished worker が永久に回収されず、alert も interval
+# ごとに永久連投されていた。この Director 指示 (t016) 自体に N=1 の考慮が
+# 抜けていたための欠陥であり、実装の責任ではない (Director 確認済み)。
+#
+# 対応 (Seo 提案、件数からの推論ではなく backend の直接シグナルで裏を取る):
+#   - _is_mass_kill() に len(results) >= 2 を必須化 (N=1 を対象外に)
+#   - かつ mux.available() が False、または mux.list() が空であることを
+#     backend 側の直接シグナルとして必須化 (list() は元々メッセージ生成で
+#     呼んでいたので、cheap pre-check の後にのみ呼ぶ形で追加コスト最小化)
+#   - alert に _should_alert_mass_kill() による backoff を追加 (連投防止)
+#
+# 旧テスト (Test 14-16) は N=3 all-kill / N=3 mixed / N=0 の3ケースのみで
+# **N=1 を構造的に除外**しており、実装の言い分をそのまま期待値にしていた
+# (PR#182 Test 8 と同じ穴のパターン、Seo 指摘)。Test 14-22 として、
+# 「件数」と「backend の直接シグナル」を独立した軸で組み合わせた網羅的な
+# ケース (特に N=1 実死 / N=2 実死) に置き換えた。
+#
 # このテストで検証:
 #   1-8. _config_mode() がインラインコメント付き/無し/quote付きの mode 行を
 #        正しくパースすること (herdr/tmux/inline/不正値/ファイル無し)
@@ -38,12 +60,16 @@
 #        Worker を正しく "alive" と判定すること (誤 kill しないこと)
 #   13.  WorkerMonitor.check(): mux window が本当に存在しない場合は "kill"
 #        (回帰確認 — 正しい kill 判定自体は壊していないこと)
-#   14-16. _is_mass_kill(): 全員 kill → True / 一部のみ kill → False /
-#        空 → False
-#   17.  scripts/start.sh: dispatcher と watchdog 両方の mux_spawn 呼び出しに
+#   14-22. _is_mass_kill(): N=3 all-kill+backend down → True / N=3 mixed →
+#        False / N=0 → False / **N=1 実死 (backend 健全でも壊れて見えても
+#        常に False)** / **N=2 実死・backend 健全 → False** /
+#        N=2・backend 実際に壊れている → True (2ケース)
+#   23-25. _should_alert_mass_kill(): backoff 内は False、backoff 到達/超過
+#        で True (alert 連投防止の検証)
+#   26.  scripts/start.sh: dispatcher と watchdog 両方の mux_spawn 呼び出しに
 #        CREWVIA_MUX 明示伝播 (_MUX_ENV_PREFIX) が入っていること (静的チェック
 #        — 非対称の再発防止)
-#   18.  scripts/watchdog.py: ログ文言に 'tmux window gone' のハードコードが
+#   27.  scripts/watchdog.py: ログ文言に 'tmux window gone' のハードコードが
 #        残っていないこと (静的チェック)
 #
 # 実行: bash scripts/test_watchdog_config_mode.sh
@@ -246,48 +272,97 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Test 14-16: _is_mass_kill() (設計改善)
+# Test 14-22: _is_mass_kill() — t020 (P1) fix
+#
+# PR#184 の元テストは N=3 all-kill / N=3 mixed / N=0 の3ケースのみで、
+# 「監視 Worker が1名の時、その1名が本当に死ぬと必ず all-kill になる」
+# という N=1 のケースを構造的に除外していた (Seo 指摘、PR#182 Test 8 と
+# 同じ穴のパターン)。ここでは実装の言い分をなぞるのではなく、
+# 「件数」と「backend の直接シグナル」を独立した軸として組み合わせた
+# 網羅的なケースで検証する。
 # ---------------------------------------------------------------------------
 echo ""
-echo "--- Test 14-16: _is_mass_kill() distinguishes config-error from isolated kill ---"
+echo "--- Test 14-22: _is_mass_kill() requires len>=2 AND backend corroboration (t020 P1 fix) ---"
 PYOUT3=$(python3 - "$OWN_CHECKOUT_ROOT/scripts" <<'PYEOF'
 import sys
 sys.path.insert(0, sys.argv[1])
 import watchdog
 
-all_kill = {("m", "t1"): "kill", ("m", "t2"): "kill", ("m", "t3"): "kill"}
-mixed = {("m", "t1"): "alive", ("m", "t2"): "kill", ("m", "t3"): "warn"}
-empty = {}
+def r(*statuses):
+    return {("m", f"t{i}"): s for i, s in enumerate(statuses)}
 
-print(f"{'PASS' if watchdog._is_mass_kill(all_kill) is True else 'FAIL'}\tall-kill\tgot={watchdog._is_mass_kill(all_kill)!r}")
-print(f"{'PASS' if watchdog._is_mass_kill(mixed) is False else 'FAIL'}\tmixed\tgot={watchdog._is_mass_kill(mixed)!r}")
-print(f"{'PASS' if watchdog._is_mass_kill(empty) is False else 'FAIL'}\tempty\tgot={watchdog._is_mass_kill(empty)!r}")
+cases = [
+    # (name, results, mux_available, mux_list_empty, expected)
+    ("n3-all-kill-backend-down", r("kill", "kill", "kill"), False, True, True),
+    ("n3-mixed", r("alive", "kill", "warn"), True, False, False),
+    ("n0-empty", {}, True, False, False),
+    # t020 P1 の核心: N=1 は backend シグナルが何であろうと絶対に True にならない
+    # (件数が1では「全員死んだ」と「backend が壊れている」を区別する材料が無い)
+    ("n1-real-death-backend-fine", r("kill"), True, False, False),
+    ("n1-real-death-backend-looks-down", r("kill"), False, True, False),
+    # N=2 の実死: backend は健全 (available かつ list 非空) なので corroboration が
+    # 無い → 2人が同時にたまたま死んだだけの本物の kill として扱われるべき
+    ("n2-real-death-backend-fine", r("kill", "kill"), True, False, False),
+    # N=2 かつ backend が実際に壊れている場合は従来通り config error 扱い
+    ("n2-backend-down", r("kill", "kill"), False, True, True),
+    ("n2-backend-list-empty-but-available", r("kill", "kill"), True, True, True),
+]
+for name, results, avail, list_empty, expected in cases:
+    got = watchdog._is_mass_kill(results, mux_available=avail, mux_list_empty=list_empty)
+    status = "PASS" if got is expected else "FAIL"
+    print(f"{status}\t{name}\tgot={got!r}\texpected={expected!r}")
 PYEOF
 )
+PYEXIT3=$?
 echo "$PYOUT3" | while IFS=$'\t' read -r result rest; do
   echo "  [$result] $rest"
 done
-if echo "$PYOUT3" | grep -Pq "^PASS\tall-kill"; then
-  pass "_is_mass_kill() is True when every monitored Worker reports kill"
+if [[ "$PYEXIT3" -ne 0 ]] || echo "$PYOUT3" | grep -q "^FAIL"; then
+  fail "_is_mass_kill() case matrix (exit=$PYEXIT3) — see cases above"
 else
-  fail "_is_mass_kill(all-kill) should be True — output: $PYOUT3"
+  pass "_is_mass_kill() correctly requires len>=2 AND backend corroboration (8 cases incl. N=1/N=2 real death)"
 fi
-if echo "$PYOUT3" | grep -Pq "^PASS\tmixed"; then
-  pass "_is_mass_kill() is False for a mix of statuses (isolated real kill)"
+
+# ---------------------------------------------------------------------------
+# Test 23-25: _should_alert_mass_kill() — alert backoff (t020)
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- Test 23-25: _should_alert_mass_kill() throttles repeated Taskvia alerts (t020) ---"
+PYOUT4=$(python3 - "$OWN_CHECKOUT_ROOT/scripts" <<'PYEOF'
+import sys
+sys.path.insert(0, sys.argv[1])
+import watchdog
+
+cases = [
+    ("just-alerted", 0.0, 100.0, 300, False),   # 100s < 300s backoff -> suppress
+    ("exactly-at-backoff", 0.0, 300.0, 300, True),
+    ("well-past-backoff", 0.0, 900.0, 300, True),
+    # last_alert_at=0.0 (never alerted) with a realistic "now" far past epoch
+    # is trivially >= backoff — this is what run() actually passes on its
+    # first-ever mass-kill cycle (last_mass_kill_alert_at starts at 0.0).
+    ("never-alerted-yet", 0.0, 1_700_000_000.0, 300, True),
+]
+for name, last_at, now, backoff, expected in cases:
+    got = watchdog._should_alert_mass_kill(last_at, now, backoff_seconds=backoff)
+    status = "PASS" if got is expected else "FAIL"
+    print(f"{status}\t{name}\tgot={got!r}\texpected={expected!r}")
+PYEOF
+)
+PYEXIT4=$?
+echo "$PYOUT4" | while IFS=$'\t' read -r result rest; do
+  echo "  [$result] $rest"
+done
+if [[ "$PYEXIT4" -ne 0 ]] || echo "$PYOUT4" | grep -q "^FAIL"; then
+  fail "_should_alert_mass_kill() backoff cases (exit=$PYEXIT4) — see cases above"
 else
-  fail "_is_mass_kill(mixed) should be False — output: $PYOUT3"
-fi
-if echo "$PYOUT3" | grep -Pq "^PASS\tempty"; then
-  pass "_is_mass_kill() is False when nothing is monitored"
-else
-  fail "_is_mass_kill(empty) should be False — output: $PYOUT3"
+  pass "_should_alert_mass_kill() correctly throttles repeated alerts"
 fi
 
 # ---------------------------------------------------------------------------
 # Test 17-18: 静的チェック (start.sh の非対称解消 / ログ文言のハードコード除去)
 # ---------------------------------------------------------------------------
 echo ""
-echo "--- Test 17: start.sh passes CREWVIA_MUX explicitly to both dispatcher and watchdog spawns ---"
+echo "--- Test 26: start.sh passes CREWVIA_MUX explicitly to both dispatcher and watchdog spawns ---"
 START_SH="$OWN_CHECKOUT_ROOT/scripts/start.sh"
 DISPATCHER_LINE=$(grep -n 'mux_spawn "dispatcher"' "$START_SH")
 WATCHDOG_LINE=$(grep -n 'mux_spawn "watchdog"' "$START_SH")
@@ -298,7 +373,7 @@ else
 fi
 
 echo ""
-echo "--- Test 18: watchdog.py no longer hardcodes 'tmux window gone' in log/alert text ---"
+echo "--- Test 27: watchdog.py no longer hardcodes 'tmux window gone' in log/alert text ---"
 if grep -q "tmux window gone\|tmux window が消失" "$OWN_CHECKOUT_ROOT/scripts/watchdog.py"; then
   fail "watchdog.py still contains a hardcoded 'tmux window' log/alert string"
 else

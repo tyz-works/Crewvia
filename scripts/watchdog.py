@@ -54,6 +54,7 @@ DEFAULT_PROFILE = "feature_impl"
 TERMINATE_GRACE_PERIOD = 60   # seconds to wait after sending graceful shutdown message
 KILL_DELAY = 10               # seconds after SIGTERM before SIGKILL
 DEFAULT_CHECK_INTERVAL = 30   # main loop interval in seconds
+MASS_KILL_ALERT_BACKOFF_SECONDS = 300  # t020: min gap between mass-kill Taskvia alerts
 
 
 # ---------------------------------------------------------------------------
@@ -331,21 +332,45 @@ class WorkerMonitor:
 # Mass-kill guard (t016)
 # ---------------------------------------------------------------------------
 
-def _is_mass_kill(results: dict) -> bool:
-    """True when every currently-monitored Worker's check() came back "kill"
-    in the same cycle.
+def _is_mass_kill(results: dict, mux_available: bool, mux_list_empty: bool) -> bool:
+    """True when "every monitored Worker reports kill" is a config error
+    rather than N real Worker deaths.
 
-    A real Worker's mux window closing on its own is rare and happens to one
-    Worker at a time. Every single monitored Worker reporting "kill" at once
-    is a far stronger signal that the mux backend itself is misconfigured
-    (mux.list() coming back empty against the wrong backend — exactly what
-    the config-mode inline-comment bug caused) than that N independent
-    Workers all died simultaneously. Empty input (nothing monitored) is not
-    a mass-kill — there's nothing to be wrong about yet.
+    t020 (P1 fix): the original version returned True whenever every
+    monitored Worker's check() came back "kill" — but with exactly one
+    Worker monitored, its lone real death is *always* "100% kill" too.
+    crewvia's normal operation has 1-2 in_progress Workers, so N=1/N=2 are
+    the common case, not the edge case the original docstring assumed away.
+    Falling into this branch skips `del monitors[...]`, so a genuinely
+    vanished Worker was never cleaned up (the watchdog's whole purpose,
+    defeated in its most common operating condition) and the Taskvia alert
+    fired every cycle forever.
+
+    Kill-count alone can never distinguish "the backend is misconfigured"
+    from "this one Worker really died" when there's only one data point, so
+    this now requires two independent things instead of guessing from count:
+      1. len(results) >= 2 — with only one Worker monitored there is no
+         corroborating signal at all; always treat it as a real, isolated
+         kill (the pre-t016 behavior, and the correct one for N=1).
+      2. A direct backend signal corroborates a config problem: the backend
+         reports itself unavailable, or mux.list() came back completely
+         empty. A live backend that still lists panes/windows (just not this
+         Worker's) means the Worker really is gone, not the backend.
     """
-    if not results:
+    if len(results) < 2:
         return False
-    return all(status == "kill" for status in results.values())
+    if not all(status == "kill" for status in results.values()):
+        return False
+    return (not mux_available) or mux_list_empty
+
+
+def _should_alert_mass_kill(
+    last_alert_at: float, now: float, backoff_seconds: float = MASS_KILL_ALERT_BACKOFF_SECONDS
+) -> bool:
+    """True if enough time has passed since the last mass-kill Taskvia alert
+    to send another one (t020: a persistent misconfiguration must not
+    re-alert Taskvia every single watchdog cycle forever)."""
+    return (now - last_alert_at) >= backoff_seconds
 
 
 # ---------------------------------------------------------------------------
@@ -509,6 +534,11 @@ def run(repo_root: Path, interval: int) -> None:
     # Track active monitors: (slug, task_id) → WorkerMonitor
     monitors: dict[tuple[str, str], WorkerMonitor] = {}
 
+    # t020: last time the mass-kill CONFIG ERROR alert actually fired.
+    # Without this, a persistent misconfiguration re-sends the Taskvia alert
+    # every single cycle forever.
+    last_mass_kill_alert_at = 0.0
+
     # t016: log which mux backend got selected at startup. A silent
     # misconfiguration here (e.g. config/crewvia.yaml `mode:` failing to
     # parse because of a trailing inline comment) used to be invisible until
@@ -565,28 +595,51 @@ def run(repo_root: Path, interval: int) -> None:
                 key: monitor.check() for key, monitor in monitors.items()
             }
 
-            # See _is_mass_kill() docstring: treat "every monitored Worker
-            # reports kill at once" as a config error, not N real deaths —
-            # warn once per cycle instead of spamming N per-worker KILLs, and
-            # skip cleanup so real state isn't discarded while the backend is
-            # unusable (once fixed, the next cycle's check() calls simply
-            # start returning real results again).
-            if _is_mass_kill(results):
-                backend_name = type(_mux._backend).__name__
-                msg = (
-                    f"CONFIG ERROR: all {len(results)} monitored Worker(s) report "
-                    f"their mux window gone in the same cycle (mux_backend={backend_name}, "
-                    f"mux.list()={_mux.list()!r}). This almost always means the mux "
-                    f"backend is misconfigured (CREWVIA_MUX / config/crewvia.yaml "
-                    f"`mode:` / backend not actually running), not that every Worker "
-                    f"died at once. Skipping cleanup this cycle."
-                )
-                _log(msg)
-                taskvia_alert(taskvia_url, taskvia_token, "watchdog", msg)
-                for key, monitor in monitors.items():
-                    _log_observation(monitor, results[key])
-                time.sleep(interval)
-                continue
+            # Cheap pre-check (no extra backend calls) before paying for the
+            # corroborating _mux.available()/.list() probes below — only
+            # bother when every monitored Worker already looks dead.
+            kill_count = sum(1 for s in results.values() if s == "kill")
+            maybe_mass_kill = len(results) >= 2 and kill_count == len(results)
+
+            if maybe_mass_kill:
+                mux_list_now = _mux.list()
+                mux_available_now = _mux.available()
+                # See _is_mass_kill() docstring (t020): count alone is never
+                # enough — corroborate with a direct backend signal before
+                # treating this as a config error instead of N real deaths.
+                if _is_mass_kill(
+                    results,
+                    mux_available=mux_available_now,
+                    mux_list_empty=(len(mux_list_now) == 0),
+                ):
+                    backend_name = type(_mux._backend).__name__
+                    msg = (
+                        f"CONFIG ERROR: all {len(results)} monitored Worker(s) report "
+                        f"their mux window gone in the same cycle (mux_backend={backend_name}, "
+                        f"mux.available()={mux_available_now}, mux.list()={mux_list_now!r}). "
+                        f"This almost always means the mux backend is misconfigured "
+                        f"(CREWVIA_MUX / config/crewvia.yaml `mode:` / backend not actually "
+                        f"running), not that every Worker died at once. Skipping cleanup "
+                        f"this cycle."
+                    )
+                    _log(msg)
+                    # t020: throttle the outbound alert — the log line above still
+                    # fires every cycle for local debugging, but Taskvia only hears
+                    # about it at most once per MASS_KILL_ALERT_BACKOFF_SECONDS
+                    # instead of every single interval forever.
+                    now_ts = time.time()
+                    if _should_alert_mass_kill(last_mass_kill_alert_at, now_ts):
+                        taskvia_alert(taskvia_url, taskvia_token, "watchdog", msg)
+                        last_mass_kill_alert_at = now_ts
+                    else:
+                        _log(
+                            f"(mass-kill alert suppressed — backoff, "
+                            f"{now_ts - last_mass_kill_alert_at:.0f}s since last)"
+                        )
+                    for key, monitor in monitors.items():
+                        _log_observation(monitor, results[key])
+                    time.sleep(interval)
+                    continue
 
             # Check each monitor
             for (slug, task_id), monitor in list(monitors.items()):

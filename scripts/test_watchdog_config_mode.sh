@@ -48,6 +48,17 @@
 # 「件数」と「backend の直接シグナル」を独立した軸で組み合わせた網羅的な
 # ケース (特に N=1 実死 / N=2 実死) に置き換えた。
 #
+# t024 (P2 追加修正、Seo 再レビュー): t020 の対応自体にも穴があった。Seo が
+# 自ら前回提案 (len>=2 と backend シグナルの AND) の詰めの甘さを指摘:
+# 実死は必ず backend が健全 (list 非空) なので、backend シグナル単独でも
+# 実死と config error は区別できる。len>=2 は「区別」には何も寄与しておらず、
+# **N=1 + backend 実際に壊れている**というただ1ケースで False を強制する
+# だけだった — このケースこそ生きている唯一の Worker が誤 KILL され続ける、
+# t016 が防ごうとした症状の再現 (かつ crewvia の最頻ケース)。
+# 対応: len(results) >= 2 を撤去し backend シグナルのみで判定。性能配慮
+# (cheap pre-check → 重い available() は必要な時だけ) は「全員 kill か」
+# だけの判定に変えて維持した。
+#
 # このテストで検証:
 #   1-8. _config_mode() がインラインコメント付き/無し/quote付きの mode 行を
 #        正しくパースすること (herdr/tmux/inline/不正値/ファイル無し)
@@ -61,9 +72,10 @@
 #   13.  WorkerMonitor.check(): mux window が本当に存在しない場合は "kill"
 #        (回帰確認 — 正しい kill 判定自体は壊していないこと)
 #   14-22. _is_mass_kill(): N=3 all-kill+backend down → True / N=3 mixed →
-#        False / N=0 → False / **N=1 実死 (backend 健全でも壊れて見えても
-#        常に False)** / **N=2 実死・backend 健全 → False** /
-#        N=2・backend 実際に壊れている → True (2ケース)
+#        False / N=0 → False / **N=1 実死・backend 健全 → False** /
+#        **N=1・backend 実際に壊れている → True (t024 で追加)** /
+#        N=2 実死・backend 健全 → False / N=2・backend 実際に壊れている →
+#        True (2ケース)
 #   23-25. _should_alert_mass_kill(): backoff 内は False、backoff 到達/超過
 #        で True (alert 連投防止の検証)
 #   26.  scripts/start.sh: dispatcher と watchdog 両方の mux_spawn 呼び出しに
@@ -272,17 +284,25 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Test 14-22: _is_mass_kill() — t020 (P1) fix
+# Test 14-22: _is_mass_kill() — t020 (P1) + t024 (P2) fixes
 #
 # PR#184 の元テストは N=3 all-kill / N=3 mixed / N=0 の3ケースのみで、
 # 「監視 Worker が1名の時、その1名が本当に死ぬと必ず all-kill になる」
 # という N=1 のケースを構造的に除外していた (Seo 指摘、PR#182 Test 8 と
-# 同じ穴のパターン)。ここでは実装の言い分をなぞるのではなく、
-# 「件数」と「backend の直接シグナル」を独立した軸として組み合わせた
-# 網羅的なケースで検証する。
+# 同じ穴のパターン)。t020 でこれを直したが、その修正 (len(results)>=2 を
+# 必須化) 自体にも穴があった: N=1 で backend が実際に壊れている場合、
+# len>=2 ゲートが常に False を強制するため、生きている唯一の Worker が
+# 誤って KILL 判定され monitors から削除される — t016 が防ごうとした症状
+# そのものが、crewvia の最頻ケース (in_progress 1名) で再現していた
+# (Seo 自身が前回提案の詰めの甘さを指摘、t024)。
+#
+# t024 で len(results) >= 2 ゲートを撤去し、backend の直接シグナルのみで
+# 判定するよう修正。ここでは「件数」と「backend の直接シグナル」を
+# 独立した軸として組み合わせた網羅的なケースで検証する
+# (n1-backend-down が t024 で新規追加した核心ケース)。
 # ---------------------------------------------------------------------------
 echo ""
-echo "--- Test 14-22: _is_mass_kill() requires len>=2 AND backend corroboration (t020 P1 fix) ---"
+echo "--- Test 14-22: _is_mass_kill() uses backend signal alone, no count gate (t020 P1 + t024 P2 fix) ---"
 PYOUT3=$(python3 - "$OWN_CHECKOUT_ROOT/scripts" <<'PYEOF'
 import sys
 sys.path.insert(0, sys.argv[1])
@@ -296,10 +316,14 @@ cases = [
     ("n3-all-kill-backend-down", r("kill", "kill", "kill"), False, True, True),
     ("n3-mixed", r("alive", "kill", "warn"), True, False, False),
     ("n0-empty", {}, True, False, False),
-    # t020 P1 の核心: N=1 は backend シグナルが何であろうと絶対に True にならない
-    # (件数が1では「全員死んだ」と「backend が壊れている」を区別する材料が無い)
+    # 実死は常に backend が健全 (list 非空) なので、件数によらず backend
+    # シグナルだけで False と判定できる — 件数ゲートは元々不要だった
     ("n1-real-death-backend-fine", r("kill"), True, False, False),
-    ("n1-real-death-backend-looks-down", r("kill"), False, True, False),
+    # t024 の核心修正: N=1 + backend 実際に壊れている -> True (t020 の
+    # len>=2 ゲートでは False になり誤って cleanup されていたケース)。
+    # 1件だけでは「本当に死んだ」か「backend 誤設定」か区別できないため、
+    # config error 側に倒して monitors から誤って消さないようにする
+    ("n1-backend-down", r("kill"), False, True, True),
     # N=2 の実死: backend は健全 (available かつ list 非空) なので corroboration が
     # 無い → 2人が同時にたまたま死んだだけの本物の kill として扱われるべき
     ("n2-real-death-backend-fine", r("kill", "kill"), True, False, False),
@@ -320,7 +344,7 @@ done
 if [[ "$PYEXIT3" -ne 0 ]] || echo "$PYOUT3" | grep -q "^FAIL"; then
   fail "_is_mass_kill() case matrix (exit=$PYEXIT3) — see cases above"
 else
-  pass "_is_mass_kill() correctly requires len>=2 AND backend corroboration (8 cases incl. N=1/N=2 real death)"
+  pass "_is_mass_kill() correctly uses backend signal alone, no count gate (8 cases incl. N=1 real death and N=1 backend-down)"
 fi
 
 # ---------------------------------------------------------------------------

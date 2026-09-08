@@ -344,20 +344,41 @@ def _is_mass_kill(results: dict, mux_available: bool, mux_list_empty: bool) -> b
     Falling into this branch skips `del monitors[...]`, so a genuinely
     vanished Worker was never cleaned up (the watchdog's whole purpose,
     defeated in its most common operating condition) and the Taskvia alert
-    fired every cycle forever.
+    fired every cycle forever. t020's fix added two independent gates:
+    `len(results) >= 2` and a direct backend signal (`not mux_available` or
+    `mux_list_empty`).
 
-    Kill-count alone can never distinguish "the backend is misconfigured"
-    from "this one Worker really died" when there's only one data point, so
-    this now requires two independent things instead of guessing from count:
-      1. len(results) >= 2 — with only one Worker monitored there is no
-         corroborating signal at all; always treat it as a real, isolated
-         kill (the pre-t016 behavior, and the correct one for N=1).
-      2. A direct backend signal corroborates a config problem: the backend
-         reports itself unavailable, or mux.list() came back completely
-         empty. A live backend that still lists panes/windows (just not this
-         Worker's) means the Worker really is gone, not the backend.
+    t024 (P2 fix — Seo caught their own t020 proposal being too conservative):
+    ANDing `len(results) >= 2` with the backend signal reintroduces exactly
+    the bug this whole guard exists to prevent, for the one case it doesn't
+    cover — N=1 with the backend genuinely broken. There, `len(results) >= 2`
+    forces False, so the lone live Worker (whose window merely *looks* gone
+    because the backend is misconfigured, not because it actually died) goes
+    through the normal kill path: `del monitors[...]`, then re-created next
+    cycle from the still-in_progress task file with a fresh `started_at` —
+    the exact "KILL every cycle, forever" symptom t016 was written to fix,
+    now reproduced specifically at the most common Worker count. Comparing
+    every (count, backend) combination against `len(results) >= 2` removed
+    shows they agree everywhere except that one cell:
+
+        case                        with len>=2   without len>=2
+        N=1 real death, backend OK     False          False
+        N=1, backend broken            False          True   <- only diff
+        N=2 real death, backend OK     False          False
+        N=2, backend broken            True           True
+        N=3 real death, backend OK     False          False
+        N=3, backend broken            True           True
+
+    `len(results) >= 2` never helped tell a real death from a config error —
+    a real death always leaves the backend healthy (mux_list_empty=False),
+    so the backend signal alone already returns False for it regardless of
+    count. The count gate only ever *suppressed* the one case where the
+    backend signal is what actually matters. So it's gone: this now checks
+    the backend signal alone, for any count >= 1 (still 0 for the N=0 case —
+    "nothing monitored" is never a mass-kill, there's nothing to be wrong
+    about yet).
     """
-    if len(results) < 2:
+    if not results:
         return False
     if not all(status == "kill" for status in results.values()):
         return False
@@ -597,9 +618,12 @@ def run(repo_root: Path, interval: int) -> None:
 
             # Cheap pre-check (no extra backend calls) before paying for the
             # corroborating _mux.available()/.list() probes below — only
-            # bother when every monitored Worker already looks dead.
+            # bother when every monitored Worker already looks dead. t024:
+            # deliberately just "all kill", no count threshold — see
+            # _is_mass_kill()'s docstring for why a count gate here would
+            # reintroduce the bug this guard exists to prevent.
             kill_count = sum(1 for s in results.values() if s == "kill")
-            maybe_mass_kill = len(results) >= 2 and kill_count == len(results)
+            maybe_mass_kill = len(results) > 0 and kill_count == len(results)
 
             if maybe_mass_kill:
                 mux_list_now = _mux.list()

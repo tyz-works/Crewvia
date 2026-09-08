@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# scripts/bin/plan — thin PATH wrapper around the crewvia plan.sh CLI.
+#
+# Why this exists (2026-09-08 main-repo-protection mission, t002):
+# agents/worker.md used to teach Workers to always invoke plan.sh via the
+# main checkout's absolute path ("$CREWVIA_REPO_ROOT/scripts/plan.sh ...").
+# That's correct for *invoking* task-management commands, but it trained
+# Workers to reach for $CREWVIA_REPO_ROOT reflexively — which is exactly
+# what led a Worker to also `cd $CREWVIA_REPO_ROOT && git checkout -b ...`
+# against the main checkout instead of staying in their worktree (the
+# incident this mission fixes).
+#
+# scripts/start.sh puts this directory on PATH for both Director and Worker
+# sessions, so `plan <subcommand> ...` reaches this file without anyone
+# needing to know or type the main repo's absolute path. This wrapper does
+# nothing but locate the real plan.sh (via $CREWVIA_REPO_ROOT, which is env
+# state, not something typed) and exec straight into it.
+#
+# Backward compatible: "$CREWVIA_REPO_ROOT/scripts/plan.sh ..." keeps
+# working unchanged — this only adds a second, path-free way to reach it.
+# Args, exit code, stdout and stderr all pass through unchanged (exec, no
+# subshell, no output captured/altered here) so nothing that parses
+# plan.sh's output needs to change.
+
+set -euo pipefail
+
+REPO_ROOT="${CREWVIA_REPO_ROOT:-${CREWVIA_REPO:-}}"
+if [[ -z "$REPO_ROOT" ]]; then
+  echo "[plan wrapper] ERROR: neither CREWVIA_REPO_ROOT nor CREWVIA_REPO is set — cannot locate plan.sh" >&2
+  exit 1
+fi
+
+exec "${REPO_ROOT}/scripts/plan.sh" "$@"

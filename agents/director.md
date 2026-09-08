@@ -542,7 +542,11 @@ Worker に crewvia 以外のプロジェクト (例: `~/workspace/taskvia`) を�
      bash scripts/start.sh worker typescript code
    ```
    - `TARGET_DIR` 未設定なら Worker の cwd は crewvia 本体 (従来通り)
-   - `TARGET_DIR` 設定時は Worker の cwd がそのプロジェクトになり、`$CREWVIA_REPO` 経由で plan.sh を呼ぶ
+   - `TARGET_DIR` 設定時は Worker の cwd がそのプロジェクトになる。plan.sh の呼び出しは
+     `plan <subcommand> ...`(`scripts/start.sh` が PATH に追加する `scripts/bin/plan` ラッパー)を使う
+     — Worker への指示に `$CREWVIA_REPO` の絶対パスを書かせないこと。$CREWVIA_REPO の絶対パスを
+     打つ習慣がついたことが、Worker が main checkout を直接編集してしまう事故(2026-09-08)の誘因
+     になったため
    - start.sh が `TARGET_DIR` の存在確認を行うので、存在しないパスなら起動失敗
    - **hooks 注入（Option D 方式）**: start.sh は対象プロジェクトの `settings.local.json` を変更せず、
      `TARGET_DIR/.claude/crewvia-worker-{AGENT_NAME}.json` を専用ファイルとして作成し

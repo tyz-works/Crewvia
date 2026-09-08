@@ -258,6 +258,71 @@ if { [ "$TOOL_NAME" = "Edit" ] || [ "$TOOL_NAME" = "Write" ] || [ "$TOOL_NAME" =
   fi
 fi
 
+# --- Main repo Bash git guard: worktree Worker が Bash 経由で主リポジトリに対して
+#     破壊的 git 操作を行うのを防ぐ (t001, mission 20260908-main-repo-protection) ---
+# 背景: 2026-09-08、docs Worker (worktree モードで作業中) が
+#   cd $CREWVIA_REPO_ROOT && git fetch origin main && git checkout -b docs/...
+# を実行し、主リポジトリ (main checkout) のブランチを main から切り替える事故が
+# 発生した (Director が検知・復旧、実害なし。Sofia でも同種の事故があり2回目)。
+#
+# 上記の worktree scope guard (t011/t014) は Edit/Write/MultiEdit/NotebookEdit
+# のみを対象としており、任意の git 操作を含む Bash コマンド全般は対象外だった。
+# 実装者もこれを既知の残存リスクとして明記していた (この関数直上のコメント参照)。
+#
+# 検証済み (Director, git 2.43.0。再調査不要): git の reference-transaction
+# hook は `git checkout <existing>` / `git switch <existing>` に一切発火しない
+# (`checkout -b <new>` は新ブランチ ref の「作成」に対して発火するだけで、
+# HEAD 更新そのものには一切発火しない。HEAD は symbolic ref であり ref
+# transaction を通らない)。したがって「HEAD の移動そのものを止める」手段は
+# git hook 経由では原理的に存在せず、主防御はこの Bash コマンド文字列ガードで
+# 行う。
+#
+# 判定方式 (詳細・既知の限界は hooks/lib_main_repo_git_guard.py 参照):
+# コマンド文字列に「主リポジトリへの参照」($CREWVIA_REPO_ROOT / $CREWVIA_REPO の
+# 変数表記、または主リポジトリの絶対パス) と「破壊的 git 動詞」(checkout/switch/
+# reset/merge/rebase/commit/clean/stash/branch -D/worktree add) が同居していたら
+# deny する。読み取り系 (status/log/diff/show) は対象外。
+#
+# 主リポジトリへの参照が `.claude/worktrees/` へ続く場合は対象外 — それは別の
+# 独立した worktree checkout (別の .git を持つ) への参照であり、そこでの通常の
+# git 操作 (checkout -b / commit / merge 等) を誤ってブロックしないため。これが
+# 誤爆防止の最重要ポイント (誤爆すると worktree Worker が一切作業できなくなる)。
+#
+# 判定は python 側でコマンド文字列内のクォート区間をマスクした上で行う —
+# plan.sh done の Result 引数のように、事故を説明する文章の中で偶然
+# "git checkout" や "$CREWVIA_REPO_ROOT" という文字列が引用されただけのケース
+# (このタスク自身の Result がまさにそれに該当しうる) を誤検知しないため。
+#
+# 対象外 (誤爆防止。いずれかに該当すれば即スキップ):
+#   - Director (この関数より前の role チェックで既に exit 済み)
+#   - TARGET_DIR モードの Worker (worktree を持たない)
+#   - TASK_ID 未解決のセッション (対話デバッグ等)
+#   - anchor ($CREWVIA_REPO) の .git がディレクトリでない場合 (t014 と同じ理由:
+#     fallback が worktree に化けていた場合にガードを安全に無効化する。誤爆で
+#     止まるより、ガードが効かないほうがはるかにマシという判断)
+#   - 主リポジトリへの参照が無いコマンド、または破壊的 git 動詞が無いコマンド
+#     (read-only git や $CREWVIA_REPO_ROOT/scripts/plan.sh 呼び出しはこちら)
+#
+# 既知の限界 (Result にも明記する。worker.md の明文化が一次防御である前提は
+# 変わらない): 文字列マッチなので、変数に一度代入してから使う形
+# (`R=$CREWVIA_REPO_ROOT; cd $R && git ...`) や相対パスでの到達
+# (`cd ../../.. && git checkout ...`) は検出できない。
+if [ "$TOOL_NAME" = "Bash" ] && [ -n "$COMMAND" ] \
+   && { [ -n "${TASK_ID:-}" ] || [ -n "${CREWVIA_TASK_ID:-}" ]; } && [ -z "${TARGET_DIR:-}" ]; then
+  _MRG_REPO_REAL="$(realpath -m "$_CREWVIA_REPO" 2>/dev/null || echo "$_CREWVIA_REPO")"
+  if [ -d "${_MRG_REPO_REAL}/.git" ]; then
+    _MRG_GUARD_PY="${_CREWVIA_REPO}/hooks/lib_main_repo_git_guard.py"
+    if [ -f "$_MRG_GUARD_PY" ]; then
+      _MRG_RESULT="$(python3 "$_MRG_GUARD_PY" "$COMMAND" "$_MRG_REPO_REAL" 2>/dev/null || echo OK)"
+      if [ "$_MRG_RESULT" = "DENY" ]; then
+        echo "[pre-tool-use] 🚫 main repo destructive git op via Bash blocked: $(echo "$COMMAND" | head -c 200)" >&2
+        emit_decision "deny" "worktree Worker が主リポジトリ (${_CREWVIA_REPO}) に対して破壊的な git 操作を Bash 経由で実行しようとしました。worktree 内 (cwd: $(pwd)) で git 操作してください。"
+        exit 0
+      fi
+    fi
+  fi
+fi
+
 # --- Task file direct-write guard: Bash 経由の task ファイル書き込みを防ぐ (t015) ---
 # 背景: t004 で review skill の Worker (review/research/verify/planning は
 # config/skill-permissions.yaml で Edit/Write/MultiEdit を deny されており、

@@ -19,6 +19,16 @@
 #        抜け穴になっていないこと)
 #   11.  Director はこのガードをバイパスすること (t011/t014 と同じ前提)
 #
+# t019 (Seo/Opus 5 最終レビュー [P2] の修正):
+#   12-13. 報告コマンドの引数として該当パスを**引用しただけ**の
+#          plan.sh done / gh pr comment は deny されないこと (本インシデントを
+#          報告しようとする行為自体が deny される自己矛盾の回帰テスト)
+#   14.    上記の「クォート内は無視する」対策を悪用した compound command での
+#          迂回 (`; ./scripts/plan.sh --help; cat >> ... <<EOF` を 1 コマンドに
+#          混ぜる) が deny されたままであること — Director 指摘のバイパス懸念
+#   15.    コマンド置換 `$(...)` の中に実際の書き込みを隠しても deny された
+#          ままであること (クォート除去を意図的に無効化しているため)
+#
 # 使い方: bash scripts/test_task_file_write_guard.sh
 # 終了コード: 0 = 全パス, 1 = 1件以上失敗
 
@@ -167,6 +177,45 @@ else
   echo "FAIL [11. Director bypass]: exit $EXIT"
   FAIL=$((FAIL + 1))
 fi
+
+# ---------------------------------------------------------------------------
+# 12-13 (t019 fix): 報告コマンドの引用テキストは deny されない
+# ---------------------------------------------------------------------------
+
+INPUT="$(_bash_input_json './scripts/plan.sh done t017 "原因は cat >> queue/missions/m1/tasks/t004.md の heredoc"')"
+STDOUT=$(_run_hook "$INPUT" CREWVIA_TASKVIA=disabled TASKVIA_TOKEN="" SKILLS=bash AGENT_NAME=Haruto || true)
+EXIT=$?
+_assert_decision "12. plan.sh done の引数に該当パスを引用 → allow (t019: Seo 実測の回帰テスト)" "allow" "$STDOUT" "$EXIT"
+
+INPUT="$(_bash_input_json 'gh pr comment 183 --body "guard blocks: cat >> queue/missions/m1/tasks/t004.md"')"
+STDOUT=$(_run_hook "$INPUT" CREWVIA_TASKVIA=disabled TASKVIA_TOKEN="" SKILLS=bash AGENT_NAME=Haruto || true)
+EXIT=$?
+_assert_decision "13. gh pr comment --body に該当パスを引用 → allow (t019: Seo 実測の回帰テスト)" "allow" "$STDOUT" "$EXIT"
+
+# ---------------------------------------------------------------------------
+# 14 (t019 fix): 12-13 の「クォート内は無視」対策を compound command で悪用した
+# 迂回が引き続き deny されること (Director 指摘のバイパス懸念への回答)
+# ---------------------------------------------------------------------------
+
+INPUT="$(_bash_input_json "X; ./scripts/plan.sh --help; cat >> queue/missions/foo/tasks/t001.md <<'EOF'
+malicious
+EOF")"
+STDOUT=$(_run_hook "$INPUT" CREWVIA_TASKVIA=disabled TASKVIA_TOKEN="" SKILLS=bash AGENT_NAME=Haruto || true)
+EXIT=$?
+_assert_decision "14. plan.sh を騙った compound command での偽装 → deny (クォート除去を使わせない)" "deny" "$STDOUT" "$EXIT"
+
+# ---------------------------------------------------------------------------
+# 15 (t019 fix): コマンド置換 \$(...) の中に実際の書き込みを隠しても deny
+# されること (\$( を含む場合はクォート除去自体を行わない設計の検証)
+# ---------------------------------------------------------------------------
+
+INPUT="$(_bash_input_json './scripts/plan.sh done t001 "$(cat >> queue/missions/foo/tasks/t001.md <<EOF
+malicious
+EOF
+)"')"
+STDOUT=$(_run_hook "$INPUT" CREWVIA_TASKVIA=disabled TASKVIA_TOKEN="" SKILLS=bash AGENT_NAME=Haruto || true)
+EXIT=$?
+_assert_decision "15. \$(...) コマンド置換の中に実際の書き込みを隠す → deny (クォート除去を無効化)" "deny" "$STDOUT" "$EXIT"
 
 echo ""
 echo "================================"

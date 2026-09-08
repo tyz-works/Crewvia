@@ -196,17 +196,74 @@ fi
 #   マッチしない (誤検知しない)。
 # ★ 既知の残存リスク (worker.md に明記する): `cd queue/missions/<slug> && sed -i
 #   ... tasks/t001.md` のように相対パスの先頭に `queue/missions/` が現れない
-#   形は、シェルの cwd 状態を追跡していないためこのガードでは捕捉できない。
-#   t011/t014 の Bash 経由書き込みと同様、ツールベースの構造的ガードは
-#   「最終防波堤」であり、worker.md の明文化 (Result は plan.sh 経由) が
-#   一次防御である前提は変わらない。
+#   形、変数展開 (`F=queue/missions/.../t001.md; cat >> "$F"`)、`dd of=...`、
+#   `python3 -c "open('...').write(...)"` はシェルの cwd/変数状態を追跡したり
+#   コマンドの意味を解釈したりしないため、このガードでは捕捉できない (t019:
+#   Seo 最終レビューで実測)。t011/t014 の Bash 経由書き込みと同様、
+#   ツールベースの構造的ガードは「最終防波堤」であり、worker.md の明文化
+#   (Result は plan.sh 経由) が一次防御である前提は変わらない。
+#
+# t019 (Seo/Opus 5 最終レビュー [P2]) での修正: 上記 3 つの grep はコマンド
+# 文字列全体を対象にしているため、リダイレクトが実際のリダイレクトなのか
+# クォート内の引用テキストなのかを区別できず、`./scripts/plan.sh done t017
+# "原因は cat >> queue/missions/.../t004.md の heredoc"` や `gh pr comment
+# 183 --body "guard blocks: cat >> queue/missions/.../t004.md"` のように
+# 該当パスを**報告のために引用しただけ**のコマンドまで deny していた (本イン
+# シデントを Result / PR コメントで報告しようとする行為そのものが deny され
+# る自己矛盾)。
+#
+# 対策: シングル/ダブルクォートで囲まれた区間を除去した「クォート除去後の
+# コマンド文字列」に対して判定する。これにより引用テキストの中に現れる
+# `>>`/`sed -i`/`tee` は判定対象から外れる。
+#
+# ただし「先頭トークンが plan.sh / gh なら丸ごとスキップ」という素朴な除外は
+# 採用しない — その除外文字列がコマンドのどこかに含まれていれば良い
+# (glob `*plan.sh\ *` は先頭以外にもマッチする) ため、
+# `X; ./scripts/plan.sh --help; cat >> queue/missions/.../t004.md <<EOF`
+# のような compound command で偽装すればガードを丸ごと迂回できてしまう
+# (Director 指摘)。代わりに「クォート除去が安全と判断できる場合に限り
+# クォート除去後の文字列で判定し、そうでなければ常に元の $COMMAND 全体を
+# 判定する (= 何もしなければ従来どおり検出できる、フェイルセーフな設計)」
+# という方式にする。安全と判断できないケース (= 常に元の $COMMAND で判定):
+#   - `$(...)` / `` `...` `` (コマンド置換) を含む場合: クォート内であって
+#     も実際にシェルへ渡されて実行されるため、除去すると置換内部の本物の
+#     書き込みコマンドを見逃してしまう (=検出漏れ)。したがって除去自体を
+#     行わない。
+#   - クォート除去後もなお `;` `&&` `||` `|` が残っている場合: これらは元々
+#     クォートの外側にあった実際の制御演算子であり、compound command で
+#     偽装した別コマンドが続いている可能性がある。したがってこの場合も
+#     除去した文字列は使わず、元の $COMMAND 全体で判定する
+#     (`X; ./scripts/plan.sh --help; cat >> .../t004.md <<EOF` は
+#     `;` が残るため除去版は使われず、元の $COMMAND に対する grep が
+#     `cat >> .../t004.md` を検出して deny する)。
+# いずれの場合も「除去しない」を選ぶだけなので、最悪でも従来と同じ検出力
+# (=常に $COMMAND 全体を判定) に戻るだけであり、新たな見逃しは生まれない。
 if [ "$TOOL_NAME" = "Bash" ] && [ -n "$COMMAND" ]; then
+  _QM_CHECK_CMD="$COMMAND"
+  case "$COMMAND" in
+    *'$('*|*'`'*)
+      : # コマンド置換あり → クォート除去は行わず元の $COMMAND のまま判定
+      ;;
+    *)
+      _CMD_NO_QUOTES="$(printf '%s' "$COMMAND" | sed "s/'[^']*'//g; s/\"[^\"]*\"//g")"
+      case "$_CMD_NO_QUOTES" in
+        *';'*|*'&&'*|*'||'*|*'|'*)
+          : # クォート除去後も制御演算子が残る (=元からクォート外) →
+          #   compound command の可能性があるため元の $COMMAND のまま判定
+          ;;
+        *)
+          _QM_CHECK_CMD="$_CMD_NO_QUOTES"
+          ;;
+      esac
+      ;;
+  esac
+
   _TASK_FILE_WRITE=0
-  if echo "$COMMAND" | grep -qE '>{1,2}[[:space:]]*['"'"'\"]?[A-Za-z0-9_./-]*queue/missions/[A-Za-z0-9_.-]+/tasks/[A-Za-z0-9_-]+\.md'; then
+  if echo "$_QM_CHECK_CMD" | grep -qE '>{1,2}[[:space:]]*['"'"'\"]?[A-Za-z0-9_./-]*queue/missions/[A-Za-z0-9_.-]+/tasks/[A-Za-z0-9_-]+\.md'; then
     _TASK_FILE_WRITE=1
-  elif echo "$COMMAND" | grep -qE 'sed[[:space:]]+-i[^|;&]*queue/missions/[A-Za-z0-9_.-]+/tasks/[A-Za-z0-9_-]+\.md'; then
+  elif echo "$_QM_CHECK_CMD" | grep -qE 'sed[[:space:]]+-i[^|;&]*queue/missions/[A-Za-z0-9_.-]+/tasks/[A-Za-z0-9_-]+\.md'; then
     _TASK_FILE_WRITE=1
-  elif echo "$COMMAND" | grep -qE '\btee\b[^|;&]*queue/missions/[A-Za-z0-9_.-]+/tasks/[A-Za-z0-9_-]+\.md'; then
+  elif echo "$_QM_CHECK_CMD" | grep -qE '\btee\b[^|;&]*queue/missions/[A-Za-z0-9_.-]+/tasks/[A-Za-z0-9_-]+\.md'; then
     _TASK_FILE_WRITE=1
   fi
   if [ "$_TASK_FILE_WRITE" = "1" ]; then

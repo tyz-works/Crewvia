@@ -359,6 +359,7 @@ Worker に指示を出す際は:
 | `planning` | プランレビュー（タスク分解・依存関係・スキル割り当ての妥当性検証）。Bash(plan.sh status/pull), git log/diff は可。Edit/Write は deny |
 | `plan_review` | plan_review.md への verdict 出力専用（Write 可 / Edit・Bash 全面 deny）。planning とは権限が異なる。crewvia-plan-review skill 参照 |
 | `verify` | 実機検証・smoke test |
+| `codex-review` | Codex CLI (Kai-codex) による自動 review 専用。plan task には積むだけで良く、Dispatcher が `kai-review.sh` を自動 spawn する（Director が Worker を起動する必要はない）。`--pr-number` 必須。詳細は `knowledge/codex-reviewer.md` |
 
 ### skill 別デフォルトモデル
 
@@ -941,6 +942,26 @@ tail -3 logs/dispatcher/dispatcher-$(date +%Y%m%d).log
 ```
 
 詳細は `knowledge/dispatcher-restart-after-merge.md` を参照。
+
+### ⚠️ `kai-review.sh` 自体を直す PR は「鶏と卵」— codex-review task は merge 後に積む
+
+Dispatcher は常に **main 版の `scripts/kai-review.sh`**（$CREWVIA_REPO_ROOT 配下の絶対パス）を
+起動する。したがって `kai-review.sh` 自体を修正する PR は、**main に merge されるまで
+自分自身を codex-review task で dogfood できない**（Phase 3 で実際に 4 回空振りした）。
+
+- `kai-review.sh` の fix PR に対する `codex-review` task（自己レビュー用）は、
+  fix PR が merge された**後**に積むこと。merge 前に積んでも旧コードでレビューされ、
+  修正の検証にならない
+- これは上記「PR merge 後の稼働 tab restart 必須」と同じ根本原因（常駐/共有プロセスが
+  読み込むファイルは、merge するまで新コードで動かない）の一亜種
+- 詳細: `knowledge/codex-reviewer.md` §運用上の注意
+
+### `codex-review` skill task の積み方（通常パス）
+
+`review`（Seo）とは別に、`--skills codex-review --pr-number <N>` で task を積むだけでよい。
+Worker 起動は不要 — Dispatcher が `kai-review.sh` を自動 spawn し、`plan.sh pull` → `codex exec review`
+→ `plan.sh done`/`needs-director` まで完走する。重要 mission では Seo（Claude）と Kai-codex（Codex）の
+**2 人体制**での verdict 突合も検討すること。詳細は `knowledge/codex-reviewer.md` を参照。
 
 ### herdr server が落ちた後の復帰
 

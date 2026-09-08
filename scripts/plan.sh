@@ -2402,12 +2402,26 @@ def cmd_review(args):
                 print(f"[review] rollback: mission '{slug}' → drafting ({reason})", file=sys.stderr)
         with_lock(_do_rollback)
 
+    review_output = os.path.join(MISSIONS_DIR, slug, 'plan_review.md')
+
     if proc.returncode != 0:
+        # t002: plan_review.md 自体は書かれているのにフォーマットだけが原因で
+        # review-plan.sh がタイムアウトすることがある (別表記の verdict がさらに
+        # normalize_plan_review_verdict.py でも判定できなかったケース)。この場合
+        # 判定内容自体は活かせる可能性が高く、cycle_count を無駄にもう1回消費
+        # させるより Director に手動確認を促す方が安全側。
+        if os.path.exists(review_output):
+            _rollback_to_drafting("review-plan.sh timed out but plan_review.md exists")
+            die(
+                f"review-plan.sh failed or timed out for mission '{slug}', but "
+                f"{review_output} was written — inspect it by hand before re-running "
+                f"review. If the verdict itself is legible but just in a non-standard "
+                f"format, fix the format manually instead of consuming another review cycle."
+            )
         _rollback_to_drafting("review-plan.sh failed")
         die(f"review-plan.sh failed or timed out for mission '{slug}'")
 
     # --- Step 4: read verdict from plan_review.md ---
-    review_output = os.path.join(MISSIONS_DIR, slug, 'plan_review.md')
     if not os.path.exists(review_output):
         _rollback_to_drafting("plan_review.md not found")
         die(f"plan_review.md not found for mission '{slug}' after review-plan.sh completed")

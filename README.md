@@ -55,6 +55,13 @@ Optional but recommended (one of the following for parallel agent execution):
 - **herdr** — agent-oriented terminal multiplexer (alternative to tmux)
   - Install: `curl -fsSL https://herdr.dev/install.sh | sh` / `brew install herdr` / `mise use herdr`
 
+Optional, only if you use the `codex-review` skill (automated PR review via Codex CLI, see
+[Skills reference](#skills-reference)):
+
+- **codex** — OpenAI Codex CLI, invoked by `scripts/kai-review.sh` as `codex exec review`.
+  Without it, `codex-review` tasks fail with `codex command not found` and fall back to
+  `needs-director`. See `knowledge/codex-reviewer.md` for setup and usage.
+
 ---
 
 ## Setup
@@ -527,6 +534,7 @@ the Americas, Africa, and Slavic regions — 50 names by default.
 | `database` | DB operations, queries |
 | `cloud` | Cloud platforms (AWS, OCI, GCP) |
 | `docs` | Documentation writing |
+| `codex-review` | Automated PR review via Codex CLI (Kai-codex). No Worker needed — the Dispatcher spawns `scripts/kai-review.sh` directly when a task with this skill and a `--pr-number` is unblocked. Requires the `codex` CLI (see [Prerequisites](#prerequisites)). See `knowledge/codex-reviewer.md` |
 
 ---
 

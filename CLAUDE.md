@@ -48,6 +48,9 @@
   scripts/
     start.sh            マルチエージェント起動スクリプト
     plan.sh             タスクプラン管理 CLI（per-task / multi-mission）
+    dispatcher.sh       並列モードの常駐割り当てデーモン（idle Worker への自動 assign + codex-review spawn）
+    watchdog.py         Worker 生存監視デーモン（heartbeat 断・herdr pane 消滅の検知と kill）
+    kai-review.sh       Codex reviewer (Kai-codex) 起動ラッパー。詳細は `knowledge/codex-reviewer.md`
     taskvia-sync.sh     queue → Taskvia 同期
     lib_mux.py          mux 抽象化モジュール（TmuxBackend / HerdrBackend）
     lib_mux.sh          bash 向け薄いラッパー（mux_spawn / mux_send 等）

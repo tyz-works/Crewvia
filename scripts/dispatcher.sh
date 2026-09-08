@@ -145,6 +145,21 @@ BLOCKED_STUCK_THRESHOLD = 600  # 10 minutes
 # Format: {"state": "<blocked|working|idle|done|unknown>", "since": <epoch_float>}
 STATE_JSON_DIR = REGISTRY_DIR / 'mux'
 
+# Spawn grace period (seconds).  A freshly-spawned Worker needs ~10-30s
+# (measured) to boot its TUI, run kickoff, and call `plan.sh pull` — until
+# that pull writes queue/assignments/<agent>, the Worker looks idle to
+# shutdown_idle_workers()/dispatch() even though it is only just starting.
+# The dispatcher's 5s poll loop can catch a Worker mid-boot well before the
+# pull lands, sending "タスクなし、shutdown" and killing the window — which
+# throws away the ~48KB spawn prompt (start.sh) and forces Director to
+# respawn + re-send, wasting far more tokens than a truly-idle Worker sitting
+# for an extra cycle would.  So this constant deliberately leans toward NOT
+# killing (grace generous, not tight): 90s is 3x the observed 10-30s startup
+# time, while still being short enough that a genuinely-idle Worker is
+# reaped within ~1-2 minutes of spawn, not left lingering indefinitely.
+# Override via CREWVIA_SPAWN_GRACE for tests / tuning.
+SPAWN_GRACE_SECONDS = int(os.environ.get('CREWVIA_SPAWN_GRACE', '90'))
+
 # Circuit breaker for Taskvia API calls
 TASKVIA_CB_FAILURES = 0
 TASKVIA_CB_THRESHOLD = 3        # consecutive failures to trip
@@ -482,6 +497,62 @@ def tmux_kill_window(target):
         log(f"killed window: {target}")
     else:
         log(f"WARNING: mux kill {target!r} failed")
+
+
+def _mux_created_at(window_target: str):
+    """Return the spawn epoch (float) for `window_target` from the Herdr
+    cache (registry/mux/<window_target>.json, written by lib_mux.py
+    HerdrBackend._write_cache), or None if unavailable.
+
+    None covers: tmux backend (no such cache), a missing file, or a
+    corrupt/unparseable one — callers fall back to _spawn_time_fallback().
+    """
+    p = STATE_JSON_DIR / f'{window_target}.json'
+    try:
+        data = json.loads(p.read_text(encoding='utf-8'))
+        ts = data.get('created_at')
+        if not ts:
+            return None
+        dt = datetime.strptime(ts, '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except Exception:
+        return None
+
+
+def _spawn_time_fallback(window_target: str) -> float:
+    """Backend-agnostic fallback spawn timestamp for `window_target`.
+
+    Used when _mux_created_at() has nothing (tmux backend has no created_at
+    cache; a Herdr cache can also be missing/stale).  Records the first
+    dispatch cycle this process observed the window and reuses it afterward,
+    so grace stays time-bounded instead of depending on a Herdr-only file —
+    a Worker with no cache does not get indefinite protection, just the same
+    SPAWN_GRACE_SECONDS window measured from first sighting.
+    """
+    p = STATE_JSON_DIR / f'{window_target}.firstseen'
+    try:
+        return float(p.read_text().strip())
+    except Exception:
+        now = time.time()
+        try:
+            STATE_JSON_DIR.mkdir(parents=True, exist_ok=True)
+            p.write_text(str(now))
+        except OSError:
+            pass
+        return now
+
+
+def in_spawn_grace(window_target: str) -> bool:
+    """True if `window_target` was spawned within SPAWN_GRACE_SECONDS.
+
+    Guards shutdown_idle_workers() and dispatch()'s no-task branch from
+    killing a Worker that has not had time to run `plan.sh pull` yet (see
+    SPAWN_GRACE_SECONDS comment for rationale / trade-off).
+    """
+    created = _mux_created_at(window_target)
+    if created is None:
+        created = _spawn_time_fallback(window_target)
+    return (time.time() - created) < SPAWN_GRACE_SECONDS
 
 
 # ---------------------------------------------------------------------------
@@ -856,6 +927,9 @@ def shutdown_idle_workers():
         assignment_file = ASSIGNMENTS_DIR / agent_name
         is_idle = not assignment_file.exists()
         if is_idle:
+            if in_spawn_grace(target):
+                log(f"[spawn_grace] {agent_name}: within {SPAWN_GRACE_SECONDS}s spawn grace — skip shutdown")
+                continue
             notify_key = f"shutdown_{agent_name}"
             if should_notify(notify_key):
                 if tmux_send(target, 'タスクなし、shutdown'):
@@ -1076,12 +1150,15 @@ def dispatch():
                 if meta.get('status') == 'in_progress'
             )
             if not has_any and not has_in_progress:
-                notify_key = f"shutdown_{agent_name}"
-                if should_notify(notify_key):
-                    if tmux_send(target, 'タスクなし、shutdown'):
-                        record_notify(notify_key)
-                    time.sleep(1)  # allow the message to land before killing
-                    tmux_kill_window(target)
+                if in_spawn_grace(target):
+                    log(f"[spawn_grace] {agent_name}: within {SPAWN_GRACE_SECONDS}s spawn grace — skip shutdown")
+                else:
+                    notify_key = f"shutdown_{agent_name}"
+                    if should_notify(notify_key):
+                        if tmux_send(target, 'タスクなし、shutdown'):
+                            record_notify(notify_key)
+                        time.sleep(1)  # allow the message to land before killing
+                        tmux_kill_window(target)
             elif has_any and not has_in_progress:
                 # Rule 2: all matching tasks are blocked.  If the most recently
                 # modified matching task file is older than BLOCKED_STUCK_THRESHOLD,

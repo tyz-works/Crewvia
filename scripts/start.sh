@@ -121,6 +121,63 @@ if [[ "${CREWVIA_PRINT_MODEL:-0}" == "1" ]]; then
   exit 0
 fi
 
+# --- permission mode 解決ヘルパー（課題2） ---
+# dry-run と実経路の両方から呼び、挙動を統一する（_resolve_worker_model と同じ設計）。
+#
+# 背景: grep で確認した通り、旧 start.sh には --permission-mode 指定が一切なく、
+# claude CLI の permission mode は「起動ディレクトリごとの永続設定」(過去にその
+# ディレクトリで対話選択した値、無ければ CLI 既定値) に依存していた。
+# 2026-09-08 に別 skill の Worker 2 名 (qa の Arjun, docs の Minjun) が
+# 「default (= 旧称 manual, ask each time)」で起動し、ツール呼び出しのたびに
+# 対話式の番号選択プロンプトで停止する事故が発生（$0 --help 上のエイリアス表
+# `manual` → `default` は claude 2.1.263 のバンドルで確認済み）。
+#
+# 対応: Worker には --permission-mode auto を明示指定する。
+#   - auto は claude --help / 対話メニュー文言 (claude 2.1.263 実測) で
+#     "no routine prompts; a reviewer model screens actions" と説明されており、
+#     bypassPermissions ("no further prompts" = 全チェック無効) とは別の値。
+#   - crewvia の実質的な安全弁は hooks/pre-tool-use.sh (Bash|Write|Edit|MultiEdit
+#     を横取りし、config/skill-permissions.yaml の allow/deny → 不一致なら
+#     Taskvia 承認フローへ blocking で問い合わせ、必ず allow/deny を返す。
+#     emit_decision は "ask" を返さない) であり、これは permission mode の値に
+#     関わらず常に実行される（hook はモードから独立したチェックポイント）。
+#     つまり auto にしても Taskvia 承認ゲートは無効化されない。
+#   - knowledge/pr-85-analysis.md は 2026-09-02 時点の `--permission-mode auto`
+#     (PR #85, 2026-05-12 作成) を「実質 bypass 相当」として明示的に却下しているが、
+#     これは当時の auto の意味論に基づく判断であり、現行 auto の意味論
+#     ("reviewer model screens actions") には当てはまらない。念のため、より緩い
+#     bypassPermissions は採用しない。
+#
+# Director には明示指定しない (デフォルトのまま = 対話確認が残る)。理由:
+#   hooks/pre-tool-use.sh は起動直後に registry から role: director を検出すると
+#   Taskvia 承認を完全スキップする（ソース冒頭のコメント参照）。つまり Director に
+#   とっては CLI 側の対話確認こそが唯一の安全弁であり、ここまで緩めると
+#   "緩すぎると危険" 側に倒れる。Director は Taizo が mux_attach で直接監視する
+#   運用が前提（start.sh 末尾で kickoff 後に自動 attach）で、今回報告された事故も
+#   Worker 限定のため、Director の挙動は変更しない。
+#
+# env var で上書き可能（config.yaml 化はスコープ外 — 必要になったら追加）。
+_resolve_permission_mode() {
+  local role="$1"
+  if [[ "${role}" == "director" ]]; then
+    printf '%s' "${CREWVIA_DIRECTOR_PERMISSION_MODE:-}"
+  else
+    # ${VAR-default} (コロン無し) を使う: 未設定なら auto、明示的に空文字を
+    # export した場合はそれを尊重し空のままにする（CLI 既定への opt-out 手段
+    # として残す）。他の env var (CREWVIA_WORKER_MODEL 等) は空文字=未設定
+    # 扱いが慣例だが、ここは対話プロンプト停止事故の恒久対策としての既定値
+    # 上書きなので、意図的に空 export した運用者の判断を優先する。
+    printf '%s' "${CREWVIA_WORKER_PERMISSION_MODE-auto}"
+  fi
+}
+
+# --- dry-run モード: CREWVIA_PRINT_PERMISSION_MODE=1 ---
+# CREWVIA_PRINT_MODEL と同じく副作用のある処理より前に exit する。
+if [[ "${CREWVIA_PRINT_PERMISSION_MODE:-0}" == "1" ]]; then
+  echo "$(_resolve_permission_mode "${ROLE}")"
+  exit 0
+fi
+
 # Determine AGENT_NAME
 REGISTRY_YAML="${REPO_ROOT}/registry/workers.yaml"
 
@@ -490,6 +547,14 @@ if [[ -n "$SELECTED_MODEL" ]]; then
   echo "[crewvia] Model: $SELECTED_MODEL"
 fi
 
+# permission mode（課題2）: 解決ロジック・理由は _resolve_permission_mode 定義を参照。
+SELECTED_PERMISSION_MODE="$(_resolve_permission_mode "${ROLE}")"
+PERMISSION_MODE_FLAG=()
+if [[ -n "$SELECTED_PERMISSION_MODE" ]]; then
+  PERMISSION_MODE_FLAG=(--permission-mode "$SELECTED_PERMISSION_MODE")
+  echo "[crewvia] Permission mode: $SELECTED_PERMISSION_MODE"
+fi
+
 # task_160 F8是正: TARGET_DIRモードではcwdがcrewvia配下から外れるため、crewviaの
 # プロジェクトレベル .claude/settings.json(hooks含む)がclaude本体に読み込まれず
 # hooksが発火しない(実測確認済み)。--settings で crewvia 自身の settings.json を
@@ -535,6 +600,12 @@ if [[ "${CREWVIA_MUX_ENABLED:-0}" == "1" ]]; then
     SETTINGS_CLI_ARG=" --settings '${REPO_ROOT}/.claude/settings.json' --settings '${WORK_DIR}/.claude/crewvia-worker-${AGENT_NAME}.json'"
   fi
 
+  # --permission-mode flag (空なら省略。課題2 — 理由は _resolve_permission_mode 定義を参照)
+  PERMISSION_MODE_CLI_ARG=""
+  if [[ -n "$SELECTED_PERMISSION_MODE" ]]; then
+    PERMISSION_MODE_CLI_ARG=" --permission-mode '$SELECTED_PERMISSION_MODE'"
+  fi
+
   if [[ -n "$FULL_PROMPT" ]] && [[ "${CREWVIA_BENCH_MODE:-0}" != "1" ]]; then
     # Write the system prompt to .claude/settings.local.json in the target dir so
     # claude picks it up without shell-expansion issues (the prompt contains $ /
@@ -567,7 +638,7 @@ PYEOF
   # プロセスが export した PATH を継承しない（spawn() の env= 引数はどちらの
   # backend でも未実装 — 上の ENV_EXPORTS と同じ理由）。scripts/bin/plan を
   # 使えるようにするため、ペイン側の $PATH に対して明示的に prepend する。
-  LAUNCH_CMD="$ENV_EXPORTS; export PATH='${REPO_ROOT}/scripts/bin:'\"\$PATH\"; unset CLAUDE_CODE_CHILD_SESSION; cd '$WORK_DIR'; claude${MODEL_CLI_ARG}${SETTINGS_CLI_ARG}"
+  LAUNCH_CMD="$ENV_EXPORTS; export PATH='${REPO_ROOT}/scripts/bin:'\"\$PATH\"; unset CLAUDE_CODE_CHILD_SESSION; cd '$WORK_DIR'; claude${MODEL_CLI_ARG}${SETTINGS_CLI_ARG}${PERMISSION_MODE_CLI_ARG}"
 
   # Spawn agent window (mux_spawn handles has-session/new-session/new-window internally).
   # mux_spawn only refuses when the window still holds a live agent; a window
@@ -615,8 +686,36 @@ PYEOF
     else
       KICKOFF_MSG="ミッション開始。plan status で状態を確認し、タスク分解・Worker 割り当て・全体管理を開始してください。"
     fi
-    mux_send "$WINDOW_NAME" "$KICKOFF_MSG"
-    echo "[crewvia] Kickoff message sent to $WINDOW_NAME"
+    # --- kickoff 着弾検証 + リトライ ---
+    # mux_send の戻り値だけでは着弾を検知できない: lib_mux.send は "❯" を最大 5s
+    # 待って best-effort で送信し、その後の Enter insurance チェックも
+    # rc=0 を返す前提で作られている（プロンプト未検出でも rc=0）。
+    # そのため送信後に capture で入力行を再確認し（mux_verify_sent =
+    # verify-sent verb、send() の Enter insurance と同じ _text_in_input_line
+    # 判定を再利用）、まだ入力行に残っていれば「届いていない」とみなして
+    # リトライする。「送ったつもり」を無くすのが目的（今日 3 回発生した
+    # Worker 消滅の真因）。
+    _KICKOFF_LANDED=0
+    for _kickoff_attempt in 1 2 3; do
+      mux_send "$WINDOW_NAME" "$KICKOFF_MSG" >/dev/null 2>&1 || true
+      sleep 1.5
+      if mux_verify_sent "$WINDOW_NAME" "$KICKOFF_MSG"; then
+        _KICKOFF_LANDED=1
+        break
+      fi
+      echo "[crewvia] WARNING: kickoff message not confirmed in $WINDOW_NAME (attempt ${_kickoff_attempt}/3)" >&2
+      sleep 2
+    done
+
+    if [[ "$_KICKOFF_LANDED" -eq 1 ]]; then
+      echo "[crewvia] Kickoff message sent to $WINDOW_NAME (verified)"
+    else
+      # 「送ったつもり」を出さない — 失敗として明示的に報告する。
+      # ここで pane を放置すると Worker は指示も task も無いまま idle になり、
+      # 個体差で数十秒後に自主終了して pane ごと消える (今日 3 回発生)。
+      echo "[crewvia] ERROR: kickoff message did NOT land in $WINDOW_NAME after 3 attempts." >&2
+      echo "          $ROLE は指示なしで idle の可能性があります。手動確認してください: mux_capture $WINDOW_NAME / mux_attach $WINDOW_NAME" >&2
+    fi
   else
     echo "[crewvia] BENCH_MODE: skipping auto-kickoff (benchmark-ctx.sh will control task dispatch)"
   fi
@@ -679,5 +778,5 @@ else
   unset CLAUDE_CODE_CHILD_SESSION
   # 二重防御: unset が漏れても transcript 保存を公式 env var で保証する (→ t004)。
   export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1
-  exec claude "${MODEL_FLAG[@]+"${MODEL_FLAG[@]}"}" "${PROMPT_FLAG[@]+"${PROMPT_FLAG[@]}"}" "${SETTINGS_FLAG[@]+"${SETTINGS_FLAG[@]}"}"
+  exec claude "${MODEL_FLAG[@]+"${MODEL_FLAG[@]}"}" "${PROMPT_FLAG[@]+"${PROMPT_FLAG[@]}"}" "${SETTINGS_FLAG[@]+"${SETTINGS_FLAG[@]}"}" "${PERMISSION_MODE_FLAG[@]+"${PERMISSION_MODE_FLAG[@]}"}"
 fi

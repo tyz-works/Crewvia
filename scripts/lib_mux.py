@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Mux backend abstraction — spawn / send / capture / list / kill / pid / attach / attach_cmd / state.
+"""Mux backend abstraction — spawn / send / capture / list / kill / pid / attach / attach_cmd / state / verify_sent.
 
 Backends:
   TmuxBackend  — wraps current tmux CLI calls verbatim (Phase 1)
@@ -23,6 +23,7 @@ Usage as module:
   cmd = m.attach_cmd("Sora-director")  # list[str] | None
   ok = m.available()
   st = m.state("Omar-worker")  # "blocked"|"working"|"idle"|"done"|"unknown"
+  landed = m.verify_sent("Omar-worker", kickoff_text)  # False = still stuck in input line, retry send()
 
 CLI usage (for bash callers):
   python3 lib_mux.py available            # exit 0 = available (starts herdr server if needed)
@@ -36,6 +37,7 @@ CLI usage (for bash callers):
   python3 lib_mux.py attach <name>
   python3 lib_mux.py attach-cmd <name>    # prints argv one arg per line, empty = use attach()
   python3 lib_mux.py state <name>         # prints agent state string
+  python3 lib_mux.py verify-sent <name> <text>  # exit 0 = text left the input line (landed)
 """
 
 import json
@@ -1294,6 +1296,25 @@ class Mux:
     def state(self, name: str) -> str:
         return self._backend.state(name)
 
+    def verify_sent(self, name: str, text: str) -> bool:
+        """Return True if `text` has left the pane's active input line.
+
+        `send()` on both backends is best-effort: TmuxBackend.send() never
+        confirms delivery at all, and HerdrBackend.send() only patches a
+        dropped Enter — neither actually proves the caller's message reached
+        Claude.  This re-captures the pane and re-runs the same
+        `_text_in_input_line()` heuristic `send()` uses internally for its
+        Enter insurance, so callers (start.sh kickoff) can detect a message
+        that never left the input line and retry instead of trusting the
+        `True` that `send()` already returned.
+
+        Returns True when `text` is NOT sitting unsent in the input line
+        (i.e. it was submitted, or the pane never had it to begin with).
+        Returns False when it is still stuck there — the caller should retry.
+        """
+        screen = self.capture(name)
+        return not _text_in_input_line(screen, text)
+
 
 # ---------------------------------------------------------------------------
 # CLI entry point (for bash callers via lib_mux.sh)
@@ -1384,6 +1405,13 @@ def _cli_main(args: List[str]) -> int:
             return 2
         print(m.state(rest[0]))
         return 0
+
+    elif verb == "verify-sent":
+        if len(rest) < 2:
+            print("Usage: lib_mux.py verify-sent <name> <text>", file=sys.stderr)
+            return 2
+        name, text = rest[0], " ".join(rest[1:])
+        return 0 if m.verify_sent(name, text) else 1
 
     else:
         print(f"Unknown verb: {verb!r}", file=sys.stderr)

@@ -78,7 +78,14 @@ case "$cmd" in
     exit 0
     ;;
   capture-pane)
-    echo "❯ prompt line"
+    # FAKE_TMUX_SCREEN, if set to an existing file, overrides the fixed
+    # default response — used by verify-sent tests to simulate an input
+    # line that still (or no longer) holds the sent text.
+    if [[ -n "${FAKE_TMUX_SCREEN:-}" && -f "${FAKE_TMUX_SCREEN}" ]]; then
+      cat "$FAKE_TMUX_SCREEN"
+    else
+      echo "❯ prompt line"
+    fi
     exit 0
     ;;
   kill-window)
@@ -1691,4 +1698,78 @@ run_fake_crewvia() {
     [ "$status" -eq 0 ]
     [[ "$output" != *"herdr server が起動していません"* ]]
     [[ "$output" != *"herdr server を起動しました"* ]]
+}
+
+# ===========================================================================
+# verify-sent() verb tests (t001, mission 20260908-launch-reliability)
+#
+# mux_send()'s own return value cannot be trusted as delivery proof: it is
+# best-effort on both backends (TmuxBackend.send() never checks at all;
+# HerdrBackend.send() only patches a dropped Enter, still returning True even
+# when the "❯" prompt never appeared).  verify-sent re-captures the pane and
+# reuses the exact _text_in_input_line() heuristic send()'s own Enter
+# insurance relies on, so callers like start.sh's kickoff loop can tell a
+# stuck message from a delivered one and retry instead of trusting rc=0.
+# ===========================================================================
+
+@test "tmux verify-sent: exit 0 when text is not in the input line (landed)" {
+    setup_fake_tmux
+    FAKE_TMUX_SCREEN="${FAKE_TMUX_DIR}/screen"
+    printf '%s\n' "❯ " > "$FAKE_TMUX_SCREEN"
+    export FAKE_TMUX_SCREEN
+
+    run python3 "$LIB_MUX_PY" verify-sent "Omar-worker" "ミッション開始。plan pull"
+    [ "$status" -eq 0 ]
+}
+
+@test "tmux verify-sent: exit 1 when text is still stuck in the ❯ input line" {
+    setup_fake_tmux
+    FAKE_TMUX_SCREEN="${FAKE_TMUX_DIR}/screen"
+    printf '%s' "❯ ミッション開始。plan pull" > "$FAKE_TMUX_SCREEN"
+    export FAKE_TMUX_SCREEN
+
+    run python3 "$LIB_MUX_PY" verify-sent "Omar-worker" "ミッション開始。plan pull"
+    [ "$status" -eq 1 ]
+}
+
+@test "tmux verify-sent: exit 0 when text only appears in scrollback, not the input line" {
+    setup_fake_tmux
+    FAKE_TMUX_SCREEN="${FAKE_TMUX_DIR}/screen"
+    printf 'ミッション開始。plan pull\nsome output\n❯ ' > "$FAKE_TMUX_SCREEN"
+    export FAKE_TMUX_SCREEN
+
+    run python3 "$LIB_MUX_PY" verify-sent "Omar-worker" "ミッション開始。plan pull"
+    [ "$status" -eq 0 ]
+}
+
+@test "herdr verify-sent: exit 0 when text is not in the input line (landed)" {
+    setup_fake_herdr
+    echo "❯ " > "$FAKE_PANE_SCREEN"
+
+    run python3 "$LIB_MUX_PY" verify-sent "Omar-worker" "ミッション開始。plan pull"
+    [ "$status" -eq 0 ]
+}
+
+@test "herdr verify-sent: exit 1 when text is still stuck in the ❯ input line" {
+    setup_fake_herdr
+    printf "❯ ミッション開始。plan pull" > "$FAKE_PANE_SCREEN"
+
+    run python3 "$LIB_MUX_PY" verify-sent "Omar-worker" "ミッション開始。plan pull"
+    [ "$status" -eq 1 ]
+}
+
+@test "herdr verify-sent: exit 0 when text only appears in scrollback, not the input line" {
+    setup_fake_herdr
+    printf "ミッション開始。plan pull\nsome output\n❯ " > "$FAKE_PANE_SCREEN"
+
+    run python3 "$LIB_MUX_PY" verify-sent "Omar-worker" "ミッション開始。plan pull"
+    [ "$status" -eq 0 ]
+}
+
+@test "mux_verify_sent shell wrapper: delegates to lib_mux.py verify-sent" {
+    setup_fake_herdr
+    echo "❯ " > "$FAKE_PANE_SCREEN"
+
+    run bash -c "source '${REPO_ROOT}/scripts/lib_mux.sh'; mux_verify_sent 'Omar-worker' 'hello'"
+    [ "$status" -eq 0 ]
 }

@@ -162,6 +162,60 @@ elif [ -n "$FILE_PATH" ]; then
   TOOL_SUMMARY="${TOOL_NAME}(${FILE_PATH})"
 fi
 
+# --- Task file direct-write guard: Bash 経由の task ファイル書き込みを防ぐ (t015) ---
+# 背景: t004 で review skill の Worker (review/research/verify/planning は
+# config/skill-permissions.yaml で Edit/Write/MultiEdit を deny されており、
+# ファイルを書く手段が Bash しか無い) が Result を
+# `cat >> queue/missions/<slug>/tasks/t004.md <<'EOF' ... EOF` で書き込もうとして
+# ハングした (CPU は回っていたが 42 分間無応答)。過去にも research skill Worker が
+# 同じパターンで 9 分以上ハングした記録がある (再発)。
+#
+# 根本原因は plan.sh を経由せず task ファイルを直接シェルリダイレクトで書こうと
+# したこと自体にある。cmd_done は result を build_task_body 経由で body に
+# 書くだけで frontmatter には触れないため、`plan.sh done <task_id> "<全文>"` に
+# 複数行を渡すのは完全に安全 (1 行制約が必要なのは `needs-director` の reason
+# だけ)。つまり task ファイルへの直接書き込みには正規の用途が存在しない。
+#
+# 対象: TOOL_NAME=Bash の COMMAND が、以下のいずれかの書き込み系構文で
+#   `queue/missions/**/tasks/*.md` を対象にしている場合のみ deny する
+#   - `>` / `>>` によるリダイレクト (heredoc と組み合わせた `cat >> file <<EOF` /
+#     `cat <<EOF > file` のどちらの語順でも、最終的にリダイレクト演算子の直後に
+#     パスが来る点は変わらないため、この 1 パターンで両方を捕捉できる)
+#   - `sed -i`
+#   - `tee`
+# t011/t014 の worktree edit guard と同じ配置・crash guard 作法 (skill チェック
+# より前、emit_decision "deny" + exit 0) に従う。Director はこの関数より前の
+# role チェックで既に exit 済みのため対象外 (t011/t014 と同じ前提)。
+#
+# ★ スコープを意図的に絞っている: heredoc 自体はテストスクリプト作成等で
+#   正当に使われるため、対象は「queue/missions/**/tasks/*.md への書き込み」
+#   のみに限定する。他の heredoc / リダイレクトは一切対象にしない。
+# ★ plan.sh 自身の書き込みは対象外: plan.sh は task ファイルを Python の
+#   open()/write() で書いており、シェルリダイレクト構文を一切使わないため、
+#   `./scripts/plan.sh done ...` のようなコマンド文字列はそもそもこのパターンに
+#   マッチしない (誤検知しない)。
+# ★ 既知の残存リスク (worker.md に明記する): `cd queue/missions/<slug> && sed -i
+#   ... tasks/t001.md` のように相対パスの先頭に `queue/missions/` が現れない
+#   形は、シェルの cwd 状態を追跡していないためこのガードでは捕捉できない。
+#   t011/t014 の Bash 経由書き込みと同様、ツールベースの構造的ガードは
+#   「最終防波堤」であり、worker.md の明文化 (Result は plan.sh 経由) が
+#   一次防御である前提は変わらない。
+if [ "$TOOL_NAME" = "Bash" ] && [ -n "$COMMAND" ]; then
+  _TASK_FILE_WRITE=0
+  if echo "$COMMAND" | grep -qE '>{1,2}[[:space:]]*['"'"'\"]?[A-Za-z0-9_./-]*queue/missions/[A-Za-z0-9_.-]+/tasks/[A-Za-z0-9_-]+\.md'; then
+    _TASK_FILE_WRITE=1
+  elif echo "$COMMAND" | grep -qE 'sed[[:space:]]+-i[^|;&]*queue/missions/[A-Za-z0-9_.-]+/tasks/[A-Za-z0-9_-]+\.md'; then
+    _TASK_FILE_WRITE=1
+  elif echo "$COMMAND" | grep -qE '\btee\b[^|;&]*queue/missions/[A-Za-z0-9_.-]+/tasks/[A-Za-z0-9_-]+\.md'; then
+    _TASK_FILE_WRITE=1
+  fi
+  if [ "$_TASK_FILE_WRITE" = "1" ]; then
+    echo "[pre-tool-use] 🚫 task file direct write blocked: $(echo "$COMMAND" | head -c 200)" >&2
+    emit_decision "deny" "task ファイル (queue/missions/**/tasks/*.md) への直接書き込みは禁止されています (過去に heredoc がハングした事故が複数回あります)。'./scripts/plan.sh done <task_id> \"<Result全文>\"' で記録してください (複数行可。1行制約が必要なのは needs-director の reason だけです)。"
+    exit 0
+  fi
+fi
+
 # --- Skill-based permission check ---
 _SKILL_PERMS_YAML="${_CREWVIA_REPO}/config/skill-permissions.yaml"
 _SKILL_PERMS_PY="${_CREWVIA_REPO}/hooks/lib_skill_perms.py"

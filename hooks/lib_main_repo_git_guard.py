@@ -43,6 +43,38 @@ $CREWVIA_REPO の変数表記、または主リポジトリの絶対パス) と�
   - クォートの対応を厳密にパースしていない (エスケープされたクォート等は
     考慮しない) ベストエフォートのヒューリスティックである。
 
+t005 (Seo/Opus 5 レビュー [P1][P2] への対応。PR#186 の同 branch に追加):
+
+[P1] 当初の判定は「参照」と「破壊的動詞」が同一コマンド文字列のどこかに
+同居していれば DENY としていたが、これは「参照が main repo を操作対象に
+している」ことを見ておらず、read-only な呼び出し (`cat $CREWVIA_REPO_ROOT/
+knowledge/bash.md` 等) の隣に別コマンドとして破壊的 git 操作 (worktree 内・
+main repo 非対象) があるだけで誤爆していた。加えて DESTRUCTIVE_VERB_RE の
+`[^|;&]*` に改行が含まれておらず、複数行スクリプトでは行をまたいだ誤マッチ
+(1 行目の `git` と 3 行目の `stash` が「同一コマンド」として結合される等) も
+発生していた。Seo 実測 (本番同形 env) で 5 パターンの誤爆を確認、修正案の
+「検出 14/14 を維持したまま誤爆だけ消える」ことも実測で裏取り済み。
+
+修正:
+  - `[^|;&]*` → `[^|;&\n]*` (改行を制御演算子と同格に扱う)
+  - has_main_repo_reference() を「参照の直前が操作対象を指定する構文
+    (`cd `/`pushd `/`git -C `/`--git-dir=`/`--work-tree=`) の場合のみ真」に
+    変更。QA (t003) が確認した検出 14 ケースはすべて `cd <ref> &&` 形か
+    `git -C <ref>` 形であり、この条件を満たす。
+
+[P2] decide() は `$(` またはバッククォートがコマンド文字列に 1 つでもあれば
+クォートマスクを丸ごとスキップしていたが、シングルクォート内のバッククォート
+はシェル的に完全に無害 (展開されない) であるにも関わらず区別していなかった。
+結果、事故コマンドをシングルクォートで引用しただけの報告コマンド
+(plan done t003 '(バッククォート)cd $CREWVIA_REPO_ROOT && git checkout -b x(バッククォート) を確認')
+まで誤って DENY していた (PR#183 [P2] と同型の自己矛盾)。
+
+修正: コマンド置換記法 (`$(` / バッククォート) が **シングルクォート区間の
+外** (裸の位置、またはダブルクォート内 — ダブルクォート内でもシェルは実際に
+展開・実行するため「外」扱いにする) にある場合だけフェイルセーフ (マスク
+省略) に倒す。シングルクォート区間の外に実在する場合のみ意味があるため、
+検出漏れは生まれない。
+
 使い方: python3 lib_main_repo_git_guard.py "<command>" "<main_repo_abs_path>"
   stdout に "DENY" または "OK" を1行出力する。
 """
@@ -50,16 +82,31 @@ import re
 import sys
 
 
-# `git <...破壊的動詞...>` — 制御演算子 (|;&) を挟まない範囲で動詞を探す。
+# `git <...破壊的動詞...>` — 制御演算子 (|;&) および改行を挟まない範囲で動詞を
+# 探す。改行を除外するのは t005 の修正: bash では改行は `;` と同格の区切りだが
+# 正規表現上は素通りするため、除外しないと複数行スクリプトが事実上ひとつの窓に
+# なり、無関係な行の動詞まで拾ってしまう。
 # `git -C $X branch -D foo` / `git -C $X worktree add ...` のように git と動詞の
 # 間にオプション (-C ${CREWVIA_REPO_ROOT} 等) が挟まるケースもあるため、
-# `branch`/`worktree` と `-D`/`add` の間も同様に [^|;&]* で緩く許容する
+# `branch`/`worktree` と `-D`/`add` の間も同様に [^|;&\n]* で緩く許容する
 # (実測: `\bgit\s+branch\b` のように git 直後の空白必須にすると
 # `git -C ${CREWVIA_REPO_ROOT} branch -D x` を見逃していた)。
 DESTRUCTIVE_VERB_RE = re.compile(
-    r'\bgit\b[^|;&]*\b(?:checkout|switch|reset|merge|rebase|commit|clean|stash)\b'
-    r'|\bgit\b[^|;&]*\bbranch\b[^|;&]*-D\b'
-    r'|\bgit\b[^|;&]*\bworktree\b[^|;&]*\badd\b'
+    r'\bgit\b[^|;&\n]*\b(?:checkout|switch|reset|merge|rebase|commit|clean|stash)\b'
+    r'|\bgit\b[^|;&\n]*\bbranch\b[^|;&\n]*-D\b'
+    r'|\bgit\b[^|;&\n]*\bworktree\b[^|;&\n]*\badd\b'
+)
+
+# t005 [P1]: 主リポジトリへの参照は、その直前が「操作対象を指定する構文」の
+# 場合のみ「main repo を操作対象にしている」とみなす。単に文字列中のどこかに
+# 参照が出現するだけ (read-only コマンドの引数、他コマンドの一部等) では
+# 真としない。クォート文字 (`'`/`"`) が参照の直前に挟まるケース
+# (`cd "$CREWVIA_REPO_ROOT"` 等) も許容する。
+_OPERAND_PREFIX_RE = re.compile(
+    r'(?:\bcd|\bpushd)[ \t]+[\'"]?$'
+    r'|\bgit[ \t]+-C[ \t]+[\'"]?$'
+    r'|--git-dir=[\'"]?$'
+    r'|--work-tree=[\'"]?$'
 )
 
 
@@ -99,13 +146,38 @@ def has_main_repo_reference(command: str, repo_abs: str) -> bool:
         tail = command[m.end():]
         if tail.startswith('/.claude/worktrees'):
             continue  # 別の独立した worktree checkout への参照 — 対象外
+        head = command[:m.start()]
+        if not _OPERAND_PREFIX_RE.search(head):
+            continue  # main repo を操作対象にしていない (t005 [P1]) — 対象外
         return True
     return False
 
 
+def _has_command_substitution_outside_single_quotes(command: str) -> bool:
+    """`$(` または `` ` `` がシングルクォート区間の外にあるかを判定する (t005 [P2])。
+
+    シングルクォート区間の中は展開が一切発生しない安全な位置なので対象外とする。
+    ダブルクォート区間の中はシェルが実際にコマンド置換を展開・実行するため、
+    「外」として扱う (裸の位置と同様にフェイルセーフの対象とする)。
+    エスケープされたクォート等は考慮しないベストエフォート実装 (mask_quotes と
+    同じ前提)。
+    """
+    in_single = False
+    i, n = 0, len(command)
+    while i < n:
+        ch = command[i]
+        if ch == "'":
+            in_single = not in_single
+        elif not in_single and (ch == '`' or command[i:i + 2] == '$('):
+            return True
+        i += 1
+    return False
+
+
 def decide(command: str, repo_abs: str) -> str:
-    if '$(' in command or '`' in command:
-        # コマンド置換はクォート内でも実行されるため、見逃しを避けて元の文字列で判定する
+    if _has_command_substitution_outside_single_quotes(command):
+        # クォート外 (またはダブルクォート内) のコマンド置換はクォートマスクを
+        # 素通りして実際にシェルへ渡されるため、見逃しを避けて元の文字列で判定する
         check_cmd = command
     else:
         check_cmd = mask_quotes(command)

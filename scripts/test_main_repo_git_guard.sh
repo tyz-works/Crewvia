@@ -44,6 +44,14 @@
 #   13. anchor ($CREWVIA_REPO 相当) が main checkout ではなく worktree を指す
 #       場合、ガードそのものが安全に無効化される (t014 と同じ P2 対策の踏襲)
 #
+# t005 (Seo/Opus 5 レビュー [P1][P2] への対応。mission 20260908-main-repo-protection):
+#   14. [P1] Seo が本番同形 env で実測した誤爆 5 例 (参照と破壊的動詞が別コマンド
+#       /別行にあるだけで同居判定されていたケース) → not blocked に修正
+#   15. [P1] QA (t003) が確認した検出 14 ケースの回帰 (検出力の退行がないこと)
+#   16. [P2] 事故コマンドをシングルクォートで引用しただけの報告コマンド →
+#       not blocked。ダブルクォート内 / 裸のバッククォートは引き続き deny
+#   17. 複数行スクリプトのケース (修正前はゼロだった)
+#
 # 実行: bash scripts/test_main_repo_git_guard.sh
 # 副作用: /tmp 配下に合成の「main repo」ディレクトリを作成し終了時に削除する
 #         (crewvia の実 repo / registry / queue には一切触れない)
@@ -252,6 +260,113 @@ else
   ); EXIT=$?
   _assert_not_blocked "anchor-is-worktree Bash git op (guard self-disables via .git type check)" "$EXIT" "$STDOUT"
 fi
+
+# ---------------------------------------------------------------------------
+# Test 14 (t005 [P1]): Seo (Opus 5) が本番同形 env で実測した誤爆 5 例 →
+# not blocked。「参照」と「破壊的動詞」が同居していても、参照が main repo を
+# 操作対象にしていなければブロックしない (worktree 内の正常作業 + 主リポジトリ
+# の読み取り/呼び出しを 1 コマンドにまとめただけのケース)。
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- Test 14: t005 [P1] Seo 実測の誤爆 5 例 → not blocked ---"
+
+STDOUT=$(_run_hook "$(_bash_payload 'git add -A && git commit -m wip && $CREWVIA_REPO_ROOT/scripts/plan.sh done t004 "ok"')" \
+  "${_worker_env[@]}"); EXIT=$?
+_assert_not_blocked "P1-1: commit (worktree) && plan.sh done (main repo call)" "$EXIT" "$STDOUT"
+
+STDOUT=$(_run_hook "$(_bash_payload 'git commit -m "fix" && cat $CREWVIA_REPO_ROOT/knowledge/bash.md')" \
+  "${_worker_env[@]}"); EXIT=$?
+_assert_not_blocked "P1-2: commit (worktree) && cat (main repo read-only)" "$EXIT" "$STDOUT"
+
+STDOUT=$(_run_hook "$(_bash_payload $'git fetch origin main\ngit merge origin/main\ncat $CREWVIA_REPO_ROOT/knowledge/code.md')" \
+  "${_worker_env[@]}"); EXIT=$?
+_assert_not_blocked "P1-3: multi-line fetch/merge (worktree) + cat (main repo read-only)" "$EXIT" "$STDOUT"
+
+STDOUT=$(_run_hook "$(_bash_payload $'git status\ngrep -rn checkout $CREWVIA_REPO_ROOT/hooks')" \
+  "${_worker_env[@]}"); EXIT=$?
+_assert_not_blocked "P1-4: multi-line status + grep (main repo, 完全に読み取り専用)" "$EXIT" "$STDOUT"
+
+STDOUT=$(_run_hook "$(_bash_payload $'git status\nsed -n 1,50p $CREWVIA_REPO_ROOT/hooks/pre-tool-use.sh\ngit stash list')" \
+  "${_worker_env[@]}"); EXIT=$?
+_assert_not_blocked "P1-5: multi-line status/sed(main repo 読み取り)/stash list(worktree)" "$EXIT" "$STDOUT"
+
+# ---------------------------------------------------------------------------
+# Test 15 (t005 [P1] 回帰): QA (t003) が確認した検出 14 ケースがすべて deny の
+# ままであること (検出力の退行がないこと)。すべて `cd <ref> &&` 形か
+# `git -C <ref>` 形 (Test 1-3b で既に一部カバー済みだが、ここで 14 件全量を
+# 通しで再確認する)。
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- Test 15: QA 検出 14 ケースの回帰 (すべて deny) ---"
+
+_DETECTION_14=(
+  'cd $CREWVIA_REPO_ROOT && git fetch origin main && git checkout -b docs/codex-reviewer-phase3-docs'
+  'cd $CREWVIA_REPO_ROOT && git checkout main'
+  'cd $CREWVIA_REPO_ROOT && git switch main'
+  'cd $CREWVIA_REPO_ROOT && git reset --hard origin/main'
+  'cd ${CREWVIA_REPO_ROOT} && git rebase origin/main'
+  'cd $CREWVIA_REPO && git merge origin/main'
+  'cd $CREWVIA_REPO_ROOT && git commit -am "oops"'
+  'cd $CREWVIA_REPO_ROOT && git clean -fd'
+  'cd $CREWVIA_REPO_ROOT && git stash push -u'
+  'git -C $CREWVIA_REPO_ROOT branch -D task/foo'
+  'git -C $CREWVIA_REPO_ROOT worktree add /tmp/x main'
+)
+for cmd in "${_DETECTION_14[@]}"; do
+  STDOUT=$(_run_hook "$(_bash_payload "$cmd")" "${_worker_env[@]}"); EXIT=$?
+  _assert_blocked "detection-14 (\$CREWVIA_REPO_ROOT form): $cmd" "$EXIT" "$STDOUT"
+done
+
+_DETECTION_14_ABS=(
+  "cd ${FAKE_REPO} && git checkout -b docs/xxx"
+  "git -C ${FAKE_REPO} switch main"
+  "cd ${FAKE_REPO} && git reset --hard HEAD~3"
+)
+for cmd in "${_DETECTION_14_ABS[@]}"; do
+  STDOUT=$(_run_hook "$(_bash_payload "$cmd")" "${_worker_env[@]}"); EXIT=$?
+  _assert_blocked "detection-14 (絶対パス形): $cmd" "$EXIT" "$STDOUT"
+done
+
+# ---------------------------------------------------------------------------
+# Test 16 (t005 [P2]): 事故コマンドをシングルクォートで引用しただけの報告
+# コマンドは not blocked。一方、クォート外 (裸の位置 / ダブルクォート内) の
+# 本物のコマンド置換は引き続き deny (フェイルセーフ維持)。
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- Test 16: t005 [P2] シングルクォート引用の報告コマンド → not blocked ---"
+
+STDOUT=$(_run_hook "$(_bash_payload "\$CREWVIA_REPO_ROOT/scripts/plan.sh done t003 'バッククォート引用: \`cd \$CREWVIA_REPO_ROOT && git checkout -b docs/x\` が deny されることを確認した'")" \
+  "${_worker_env[@]}"); EXIT=$?
+_assert_not_blocked "P2: single-quoted incident report containing backticks" "$EXIT" "$STDOUT"
+
+echo ""
+echo "--- Test 16b: ダブルクォート内のバッククォート (実際に展開される) → 引き続き deny ---"
+STDOUT=$(_run_hook "$(_bash_payload 'echo "$(cd $CREWVIA_REPO_ROOT && git checkout -b evil)"')" \
+  "${_worker_env[@]}"); EXIT=$?
+_assert_blocked "P2 regression: command substitution inside double quotes still executes" "$EXIT" "$STDOUT"
+
+echo ""
+echo "--- Test 16c: 裸のバッククォート (シングルクォート外) → 引き続き deny ---"
+STDOUT=$(_run_hook "$(_bash_payload 'echo `cd $CREWVIA_REPO_ROOT && git checkout -b evil`')" \
+  "${_worker_env[@]}"); EXIT=$?
+_assert_blocked "P2 regression: bare backtick command substitution outside quotes" "$EXIT" "$STDOUT"
+
+# ---------------------------------------------------------------------------
+# Test 17 (t005): 複数行スクリプトのケース (修正前はゼロだった)。正当な
+# 複数行操作 (worktree 内のみ) はブロックせず、複数行にまたがる本物の事故
+# パターン (同一行内に参照+動詞が同居) は引き続き検出する。
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- Test 17a: 複数行の正当な worktree 操作 (主リポジトリ参照なし) → not blocked ---"
+STDOUT=$(_run_hook "$(_bash_payload $'git fetch origin main\ngit merge origin/main\ngit push')" \
+  "${_worker_env[@]}"); EXIT=$?
+_assert_not_blocked "multi-line worktree fetch/merge/push (no main repo reference)" "$EXIT" "$STDOUT"
+
+echo ""
+echo "--- Test 17b: 複数行で、危険な行そのものは単独でも main repo 参照+動詞が同居 → deny ---"
+STDOUT=$(_run_hook "$(_bash_payload $'git status\ncd $CREWVIA_REPO_ROOT && git checkout -b docs/x\ngit log')" \
+  "${_worker_env[@]}"); EXIT=$?
+_assert_blocked "multi-line: one line itself has reference+verb co-located" "$EXIT" "$STDOUT"
 
 echo ""
 echo "================================"

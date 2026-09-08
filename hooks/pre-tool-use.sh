@@ -156,10 +156,106 @@ done
 TOOL_SUMMARY="${TOOL_NAME}"
 COMMAND="$(echo "$TOOL_INPUT" | jq -r '.command // empty' 2>/dev/null || true)"
 FILE_PATH="$(echo "$TOOL_INPUT" | jq -r '.file_path // empty' 2>/dev/null || true)"
+# NotebookEdit は file_path ではなく notebook_path を使う (t014: Edit/Write/MultiEdit
+# と同じ書き込み系ツールなのにフィールド名が違うため下記ガードで二重に漏れていた)
+NOTEBOOK_PATH="$(echo "$TOOL_INPUT" | jq -r '.notebook_path // empty' 2>/dev/null || true)"
 if [ -n "$COMMAND" ]; then
   TOOL_SUMMARY="${TOOL_NAME}($(echo "$COMMAND" | head -c 80))"
 elif [ -n "$FILE_PATH" ]; then
   TOOL_SUMMARY="${TOOL_NAME}(${FILE_PATH})"
+elif [ -n "$NOTEBOOK_PATH" ]; then
+  TOOL_SUMMARY="${TOOL_NAME}(${NOTEBOOK_PATH})"
+fi
+
+# --- Worktree scope guard: crewvia 自身の main checkout への直接書き込みを防ぐ ---
+# 背景 (t009/t011): worktree モードで作業中の Worker が Edit/Write ツールに main repo
+# ($CREWVIA_REPO) の絶対パスを渡してしまい、専用 worktree ではなく main checkout
+# (branch=main) を直接編集する事故が発生した (git status で気づき自己復旧、実害なし。
+# 気づかなければ main に混入していた)。worker.md の明文化だけでは再発を防げないため、
+# 構造的なガードをここに入れる。_global.deny と同様、skill 設定や urgent 例外では
+# バイパスできない絶対安全弁として扱う（skill/Taskvia チェックより前に判定する）。
+#
+# 対象: 「worktree を持つ Worker」の Edit/Write/MultiEdit/NotebookEdit のみ
+#   = TASK_ID が解決済み (タスクを pull 済み。下記 t014 の注記参照)
+#   AND TARGET_DIR が未設定 (target project モードではない = worktree モードのはず)
+#   AND anchor ($CREWVIA_REPO) が main checkout であることを .git の種別で確認できる
+#     (下記 t014 の注記参照)
+#   AND 編集先が $CREWVIA_REPO 配下 かつ queue/ registry/ .claude/worktrees/ 以外
+# ★ 新しい書き込み系ツールが増えたら必ずここに追加すること。現状の対象:
+#   - Edit/Write/MultiEdit: config/skill-permissions.yaml は全 skill で三点セットで
+#     常に許可しており、ファイル書き込みという意味では全く同格のツール。Edit/Write
+#     だけを見るガードは MultiEdit 経由で素通しになる control-bypass だった
+#     (commit security review で検出、t011 で修正)。
+#   - NotebookEdit: 上と全く同じ理由に加え、パスが file_path ではなく notebook_path
+#     なので抽出ロジックも二重に漏れていた (t014 で判明。$FILE_PATH の代わりに
+#     ${FILE_PATH:-$NOTEBOOK_PATH} を使うことで対応)。
+#   ※ Bash 経由での書き込み (heredoc / sed -i / tee 等) はこのガードの対象外
+#   のまま残る既知の残存リスク。ツールベースの最終防波堤であり、worker.md の
+#   明文化 (呼び出しは $CREWVIA_REPO、編集は worktree 内) が一次防御である
+#   前提は変わらない。
+# 対象外 (誤爆防止。いずれかに該当すれば即スキップ):
+#   - Director (この関数より前の role チェックで既に exit 済み)
+#   - TARGET_DIR モードの Worker (worktree を持たない。上記条件で自動的に除外)
+#   - TASK_ID 未解決のセッション (対話デバッグ等。上記条件で自動的に除外)
+#   - anchor の .git がディレクトリでない場合 (下記 t014 の注記参照)
+#   - queue/ registry/ 配下 (plan.sh 等が書く共有領域。正当な経路)
+#   - .claude/worktrees/ 配下 (= 自分の worktree、または他 Worker の worktree。
+#     いずれも main checkout そのものではないので対象外)
+#   - $CREWVIA_REPO の外 (target project 等、無関係のパス)
+# 注意: cwd は見ない。「TARGET_DIR 未設定なら plan.sh pull は必ず worktree を作り
+# worktree_path を返す」という不変条件があるため、TASK_ID 解決済み + TARGET_DIR
+# 未設定なのに worktree の外を指すパスを編集しようとしている時点で、cwd が実際どこに
+# あるかによらず既に異常な状態 — パスだけで判定して構わない（むしろ「cwd も main に
+# 迷い込んでいる」というより深刻なケースも同時に拾える）。
+#
+# t014 (Seo/Opus 5 レビュー指摘) での修正:
+#   [P1] トリガ条件が env の CREWVIA_TASK_ID 単独だと本番で dead code だった。
+#     CREWVIA_TASK_ID を設定する経路 (plan.sh の .crewvia-env 書き出し、worker.md の
+#     source) はいずれも Bash tool の subshell 内であり、hook は Claude Code の
+#     子プロセスとして起動されるため subshell の export は届かない。実測でも
+#     「実運用と同じ env (未設定) → 発火せず素通り」「テストと同じ env (明示付与)
+#     → 発火」の差が確認された。実際には TASK_ID は :127-140 の assignments
+#     ファイル ($CREWVIA_REPO/queue/assignments/<agent>) fallback で既にここまで
+#     に解決済みなので、TASK_ID (env の TASK_ID か assignments 解決結果) を見る
+#     ことで本番でも発火するようにする。env の CREWVIA_TASK_ID も (source 済みの
+#     同一呼び出し内など稀に届くケース向けに) OR で残す。
+#   [P2] _CREWVIA_REPO の fallback (:77) が worktree を指すと、worktree には
+#     .claude/worktrees/ が存在せず除外句がどれもヒットしないため、その Worker は
+#     自分の worktree すら一切 Edit できなくなる (誤爆で運用停止)。main checkout の
+#     .git はディレクトリ、linked worktree の .git はファイルなので、anchor の
+#     .git がディレクトリであることを確認できた場合のみガードを有効にする。
+#     誤爆で止まるより、ガードが効かないほうがはるかにマシという判断。
+if { [ "$TOOL_NAME" = "Edit" ] || [ "$TOOL_NAME" = "Write" ] || [ "$TOOL_NAME" = "MultiEdit" ] || [ "$TOOL_NAME" = "NotebookEdit" ]; } \
+   && { [ -n "${TASK_ID:-}" ] || [ -n "${CREWVIA_TASK_ID:-}" ]; } && [ -z "${TARGET_DIR:-}" ]; then
+  _GUARD_PATH="${FILE_PATH:-${NOTEBOOK_PATH:-}}"
+  if [ -n "$_GUARD_PATH" ]; then
+    case "$_GUARD_PATH" in
+      /*) _GUARD_ABS_FILE="$_GUARD_PATH" ;;
+      *)  _GUARD_ABS_FILE="$(pwd)/$_GUARD_PATH" ;;
+    esac
+    # realpath -m: パス正規化のみ (存在チェックなし。Write は新規ファイル作成のため
+    # 対象ファイルが存在しないケースがある)
+    _GUARD_REPO_REAL="$(realpath -m "$_CREWVIA_REPO" 2>/dev/null || echo "$_CREWVIA_REPO")"
+    # [P2] anchor が本当に main checkout かどうかを .git の種別で自己確認する。
+    # fallback が worktree に化けていた場合はここで .git がファイルになり、
+    # ガードそのものを安全に無効化する。
+    if [ -d "${_GUARD_REPO_REAL}/.git" ]; then
+      _GUARD_FILE_REAL="$(realpath -m "$_GUARD_ABS_FILE" 2>/dev/null || echo "$_GUARD_ABS_FILE")"
+      case "$_GUARD_FILE_REAL" in
+        "${_GUARD_REPO_REAL}"/queue/*|"${_GUARD_REPO_REAL}"/registry/*|"${_GUARD_REPO_REAL}"/.claude/worktrees/*)
+          : # 正当な経路 — 対象外
+          ;;
+        "${_GUARD_REPO_REAL}"/*)
+          echo "[pre-tool-use] 🚫 main repo direct edit blocked: ${_GUARD_FILE_REAL}" >&2
+          emit_decision "deny" "worktree Worker が main checkout (${_CREWVIA_REPO}) を直接編集しようとしました。worktree 内のパスを使ってください (cwd: $(pwd))。"
+          exit 0
+          ;;
+        *)
+          : # $CREWVIA_REPO の外 (target project 等) — 対象外
+          ;;
+      esac
+    fi
+  fi
 fi
 
 # --- Skill-based permission check ---

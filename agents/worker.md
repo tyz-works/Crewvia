@@ -154,6 +154,27 @@ Worker は状況に応じて 2 種類の cwd で起動される。どちらで�
 - `CLAUDE.md` / `.claude/settings.json` は crewvia のものが読み込まれる（worktree も同じリポジトリ）
 - plan.sh / registry / knowledge / hooks は `$CREWVIA_REPO/...` の絶対パスで呼ぶ（worktree 内でも有効）
 
+### 作業スコープの制約 (重要) — worktree モード
+
+crewvia 自身のツール (`scripts/plan.sh` / `scripts/dispatcher.sh` / `hooks/*.sh` 等) を**改修する** task では、**「呼び出し」と「編集」を混同しないこと**。両者は同じファイル名を指すが、実体は別物:
+
+| 用途 | 使うパス | 具体例 |
+|---|---|---|
+| **呼び出し**（タスク管理コマンドの実行） | `$CREWVIA_REPO` の絶対パス | `"$CREWVIA_REPO/scripts/plan.sh" done t011 "result" --mission <slug>` |
+| **編集**（Edit / Write ツールでのファイル変更） | 必ず worktree 内のパス（`pwd` 起点の相対パス、または `git rev-parse --show-toplevel` で得た絶対パス） | `Edit(file_path="$(pwd)/scripts/plan.sh")` — **`$CREWVIA_REPO/scripts/plan.sh` を Edit/Write の対象にしない** |
+
+なぜ区別が必要か:
+
+- `plan.sh done` / `plan.sh pull` などの**タスク管理コマンド**は、queue/ の状態を持つ main checkout (`$CREWVIA_REPO`) 側を呼ぶのが正しい。worktree 側の `queue/` は空（gitignore 対象）なので、worktree 側の `plan.sh` を呼んでも動作しない。
+- 一方 `scripts/plan.sh` 自体を**改修する** task では、あなたが変更しているのは worktree 側の作業コピーである。Edit/Write の対象を `$CREWVIA_REPO` の絶対パスにしてしまうと、専用 worktree ではなく **main checkout (branch=main) を直接編集してしまう**。commit 前に `git status` で気づけば復旧できるが、気づかなければ main に直接混入する（実際に t009 で発生。git status で自己復旧し実害は無かったが、約20分のミッション停止を招いた事故の遠因になった）。
+- 自分の修正を動作確認したい場合も同様に、worktree 内のパス（`./scripts/plan.sh` や `$(pwd)/scripts/plan.sh`）を明示的に指定すること。`$CREWVIA_REPO/scripts/plan.sh` を使うと、あなたが今まさに直している**未修正の main 版**を実行してしまい、修正の検証にならない。
+
+**構造的なガード（最後の安全網）**: `hooks/pre-tool-use.sh` は、worktree を持つ Worker（タスク pull 済み・`TARGET_DIR` 未設定）が `$CREWVIA_REPO` 配下（`queue/` `registry/` `.claude/worktrees/` を除く）を Edit/Write/MultiEdit/NotebookEdit しようとすると拒否する（t011 で追加。MultiEdit/NotebookEdit も対象 — Edit/Write だけでは同格の別ツールを見落とす control-bypass になるため必ず含めること）。ブロックされたら「編集先のパスが worktree 内かどうか」を見直すこと。ただしこれは事故の最終防波堤であり、**最初から worktree 内のパスを使う**のが正しい進め方であることに変わりはない。なお `Bash` 経由の書き込み（heredoc / `sed -i` / `tee` 等）はこのガードの対象外として残る既知の限界 — ツール名を偽装できない Edit/Write/MultiEdit/NotebookEdit だけを機械的に守る仕組みであり、Bash を使った書き込みは引き続き自分の規律で避けること。
+
+タスク pull 済みかどうかの判定は `TASK_ID`（env の `TASK_ID`/`CREWVIA_TASK_ID`、または `queue/assignments/<agent>` からの解決のいずれか）を見ている。`CREWVIA_TASK_ID` の `export` は Bash tool の subshell 内で行われるため hook プロセスには届かず、env だけを見る実装では本番で一度も発火しない dead code になっていた（t014 で判明・修正）。
+
+迷ったら `pwd` と `git rev-parse --show-toplevel` を実行し、今の cwd がどちらの checkout を指しているか確認すること。
+
 ### 他プロジェクトを触るタスク — worktree なし
 
 task の `target_dir` が非 null の場合、`plan.sh pull` は **worktree を作成せず** `worktree_path=null` を返す。Worker は `TARGET_DIR` に直接移動して作業する。
@@ -173,7 +194,7 @@ task の `target_dir` が非 null の場合、`plan.sh pull` は **worktree を�
   `~/.claude/settings.json` へのユーザーレベル登録は行わない)。手動で `claude` を起動する場合は
   この `--settings` フラグを自分で付け忘れないこと。
 
-### 作業スコープの制約 (重要)
+### 作業スコープの制約 (重要) — TARGET_DIR モード
 
 他プロジェクトを触るタスクを実行している時:
 

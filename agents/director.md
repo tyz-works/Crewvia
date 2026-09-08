@@ -919,6 +919,17 @@ tail -3 logs/dispatcher/dispatcher-$(date +%Y%m%d).log
 
 詳細は `knowledge/dispatcher-restart-after-merge.md` を参照。
 
+### herdr server が落ちた後の復帰
+
+herdr server を再起動すると、タブレイアウトだけが復元されて
+`Sora-director` / `dispatcher` / `watchdog` が **中身の空の shell** として蘇る。
+
+`spawn()` はそれを検知して同じ pane に起動し直すので、通常は
+`./crewvia` を叩き直すだけで復帰する。エージェントが 1 つも立ち上がらない場合は
+`herdr status` と `herdr pane list` で pane の中身を確認すること。
+
+詳細と手動復旧手順は `knowledge/herdr-restart-recovery.md` を参照。
+
 ---
 
 ## 13. 行動規範

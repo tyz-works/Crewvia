@@ -553,10 +553,18 @@ PYEOF
   LAUNCH_CMD="$ENV_EXPORTS; unset CLAUDE_CODE_CHILD_SESSION; cd '$WORK_DIR'; claude${MODEL_CLI_ARG}${SETTINGS_CLI_ARG}"
 
   # Spawn agent window (mux_spawn handles has-session/new-session/new-window internally).
+  # mux_spawn only refuses when the window still holds a live agent; a window
+  # left behind empty by a mux restart is relaunched in place and succeeds.
   if ! mux_spawn "$WINDOW_NAME" "$LAUNCH_CMD" "$WORK_DIR"; then
     # Check if the window already exists (safe no-op) vs a real error.
     if mux_list | grep -qx "$WINDOW_NAME"; then
-      echo "[crewvia] Window $WINDOW_NAME already exists, skipping launch"
+      echo "[crewvia] $WINDOW_NAME is already running — not launching a second one"
+      # An existing Director is what the user wanted to reach, so attach to it
+      # instead of exiting silently.
+      if [[ "${ROLE}" == "director" ]]; then
+        echo "[crewvia] Attaching to $WINDOW_NAME ..."
+        mux_attach "$WINDOW_NAME"
+      fi
     else
       echo "[crewvia] ERROR: Failed to spawn mux window: $WINDOW_NAME" >&2
     fi
@@ -598,21 +606,22 @@ PYEOF
 
   # Director: dispatcher を mux 窓で起動（二重起動防止）
   if [[ "${ROLE}" == "director" ]]; then
-    if mux_list | grep -qx 'dispatcher'; then
-      echo "[crewvia] Dispatcher already running (dispatcher)"
-    else
-      mux_spawn "dispatcher" "cd '${REPO_ROOT}' && bash '${SCRIPT_DIR}/dispatcher.sh'" "$REPO_ROOT"
+    # A name-only check would also match a window the mux restored empty, which
+    # is exactly how the dispatcher silently went missing.  mux_spawn answers
+    # the real question: it returns non-zero only when a live one is in there.
+    if mux_spawn "dispatcher" "cd '${REPO_ROOT}' && bash '${SCRIPT_DIR}/dispatcher.sh'" "$REPO_ROOT"; then
       echo "[crewvia] Dispatcher started in mux window: dispatcher"
+    else
+      echo "[crewvia] Dispatcher already running (dispatcher)"
     fi
 
     # Director: watchdog(v2)を mux 窓で起動（二重起動防止）
     # F6是正: tmuxモードでは従来watchdogが一度も起動していなかった。非tmuxブランチの
     # watchdog.sh(v1・DEPRECATED)ではなくwatchdog.py(v2)を起動する（v1は延命させない）。
-    if mux_list | grep -qx 'watchdog'; then
-      echo "[crewvia] Watchdog already running (watchdog)"
-    else
-      mux_spawn "watchdog" "cd '${REPO_ROOT}' && python3 '${SCRIPT_DIR}/watchdog.py'" "$REPO_ROOT"
+    if mux_spawn "watchdog" "cd '${REPO_ROOT}' && python3 '${SCRIPT_DIR}/watchdog.py'" "$REPO_ROOT"; then
       echo "[crewvia] Watchdog(v2) started in mux window: watchdog"
+    else
+      echo "[crewvia] Watchdog already running (watchdog)"
     fi
 
     # Auto-attach to Director window after kickoff + dispatcher launch.

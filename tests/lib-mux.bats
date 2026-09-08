@@ -531,12 +531,19 @@ setup_fake_herdr() {
     FAKE_PANE_SCREEN="${FAKE_HERDR_DIR}/pane_screen"
     echo "❯ " > "$FAKE_PANE_SCREEN"
 
+    # foreground_processes that `pane process-info` reports for the fake pane.
+    # Default is a live agent, so a pane that already carries the requested
+    # label reads as genuinely occupied (the pre-existing no-op behaviour).
+    # Tests that need a husk pane overwrite this with a bare shell.
+    FAKE_PANE_PROCS="${FAKE_HERDR_DIR}/pane_procs"
+    echo '[{"name":"claude","pid":4242,"argv":["claude"],"cmdline":"claude"}]' > "$FAKE_PANE_PROCS"
+
     cat > "${FAKE_HERDR_DIR}/herdr" << 'FAKESCRIPT'
 #!/usr/bin/env bash
 # Fake herdr: log all calls, return fixed responses.
 #
-# Response format reference (verified against herdr 0.8.2 docs / Phase 0 spike):
-#   --version          → plain text ("herdr 0.8.2")         [spec: plain]
+# Response format reference (verified against herdr 0.9.0 CLI / Phase 0 spike):
+#   --version          → plain text ("herdr 0.9.0")         [spec: plain]
 #   workspace list     → JSON  {"result":{"workspaces":[…]}} [spec: JSON]
 #   workspace create   → JSON  {"result":{"workspace":{…}}}  [spec: JSON]
 #   tab create         → JSON  {"result":{"tab":{…},"root_pane":{…}}} [spec: JSON]
@@ -562,7 +569,7 @@ cmd3="${3:-}"
 case "${cmd1}" in
   --version)
     # plain text output (not JSON) — herdr version string
-    echo "herdr 0.8.2"
+    echo "herdr 0.9.0"
     exit 0
     ;;
   server)
@@ -644,7 +651,14 @@ case "${cmd1}" in
         ;;
       process-info)
         # JSON response
-        echo "{\"result\":{\"process_info\":{\"shell_pid\":99999}}}"
+        PROCS=$(cat "$FAKE_PANE_PROCS" 2>/dev/null)
+        [[ -z "$PROCS" ]] && PROCS="[]"
+        # FAKE_PROCESS_INFO_FAIL=1 simulates herdr refusing to answer.
+        if [[ "${FAKE_PROCESS_INFO_FAIL:-0}" == "1" ]]; then
+          echo "{\"error\":\"pane not found\"}" >&2
+          exit 2
+        fi
+        echo "{\"result\":{\"process_info\":{\"shell_pid\":99999,\"foreground_processes\":${PROCS}}}}"
         exit 0
         ;;
     esac
@@ -665,6 +679,7 @@ FAKESCRIPT
     export FAKE_PANE_ID
     export FAKE_PANE_LABEL
     export FAKE_PANE_SCREEN
+    export FAKE_PANE_PROCS
     export PATH="${FAKE_HERDR_DIR}:${PATH}"
     export CREWVIA_MUX=herdr
     export CREWVIA_HERDR_WORKSPACE=crewvia
@@ -762,15 +777,129 @@ print('herdr backend selected OK')
     rm -f "${REPO_ROOT}/registry/mux/New-worker.json"
 }
 
-@test "herdr spawn: existing pane returns exit 1 (no-op)" {
+@test "herdr spawn: existing pane running a live agent returns exit 1 (no-op)" {
     setup_fake_herdr
-    # Default pane list returns Omar-worker → already exists.
+    # Default pane list returns Omar-worker → already exists, and the default
+    # foreground process is a live `claude`.
 
     run python3 "$LIB_MUX_PY" spawn "Omar-worker" "claude"
     [ "$status" -eq 1 ]
 
-    # tab create must NOT have been called.
+    # Neither a new tab nor a relaunch may happen on top of a live agent.
     ! herdr_log_contains "tab create"
+    ! herdr_log_contains "pane run"
+}
+
+# --- stale husk panes (herdr server restart) ------------------------------
+#
+# When the herdr server restarts it restores a workspace's tab layout but not
+# the processes inside it, leaving labelled panes that are bare shells.  spawn()
+# must relaunch into such a husk instead of reporting "already exists", which
+# left ./crewvia starting no agents at all.
+
+@test "herdr spawn: relaunches into an idle shell pane left by a herdr restart" {
+    setup_fake_herdr
+    # Pane carries the requested label but only runs its shell.
+    echo "Omar-worker" > "$FAKE_PANE_LABEL"
+    echo '[{"name":"bash","pid":3827260,"argv":["/bin/bash"],"cmdline":"/bin/bash"}]' > "$FAKE_PANE_PROCS"
+
+    run python3 "$LIB_MUX_PY" spawn "Omar-worker" "claude --revived"
+    [ "$status" -eq 0 ]
+
+    # Relaunched in place: the existing pane is reused, no new tab is created.
+    herdr_log_contains "pane run ${FAKE_PANE_ID} claude --revived"
+    ! herdr_log_contains "tab create"
+
+    rm -f "${REPO_ROOT}/registry/mux/Omar-worker.json"
+}
+
+@test "herdr spawn: a login shell (-bash) also counts as an idle husk" {
+    setup_fake_herdr
+    echo "Omar-worker" > "$FAKE_PANE_LABEL"
+    echo '[{"name":"-bash","pid":3827260,"argv":["-bash"],"cmdline":"-bash"}]' > "$FAKE_PANE_PROCS"
+
+    run python3 "$LIB_MUX_PY" spawn "Omar-worker" "claude"
+    [ "$status" -eq 0 ]
+    herdr_log_contains "pane run"
+
+    rm -f "${REPO_ROOT}/registry/mux/Omar-worker.json"
+}
+
+@test "herdr spawn: a pane with no foreground process is an idle husk" {
+    setup_fake_herdr
+    echo "Omar-worker" > "$FAKE_PANE_LABEL"
+    echo '[]' > "$FAKE_PANE_PROCS"
+
+    run python3 "$LIB_MUX_PY" spawn "Omar-worker" "claude"
+    [ "$status" -eq 0 ]
+    herdr_log_contains "pane run"
+
+    rm -f "${REPO_ROOT}/registry/mux/Omar-worker.json"
+}
+
+@test "herdr spawn: a pane running 'bash <script>' is busy, not a husk" {
+    setup_fake_herdr
+    echo "dispatcher" > "$FAKE_PANE_LABEL"
+    # dispatcher.sh runs as `bash /…/dispatcher.sh`, so process *name* is still
+    # "bash".  Matching on the name alone would restart a live dispatcher on top
+    # of itself; only the argv length tells the two apart.
+    echo '[{"name":"bash","pid":3854037,"argv":["bash","/repo/scripts/dispatcher.sh"],"cmdline":"bash /repo/scripts/dispatcher.sh"}]' > "$FAKE_PANE_PROCS"
+
+    run python3 "$LIB_MUX_PY" spawn "dispatcher" "bash /repo/scripts/dispatcher.sh"
+    [ "$status" -eq 1 ]
+
+    ! herdr_log_contains "pane run"
+    ! herdr_log_contains "tab create"
+}
+
+@test "herdr spawn: a shell with no argv reported is treated as busy (fail-safe)" {
+    setup_fake_herdr
+    echo "Omar-worker" > "$FAKE_PANE_LABEL"
+    echo '[{"name":"bash","pid":1,"cmdline":"/bin/bash"}]' > "$FAKE_PANE_PROCS"
+
+    run python3 "$LIB_MUX_PY" spawn "Omar-worker" "claude"
+    [ "$status" -eq 1 ]
+    ! herdr_log_contains "pane run"
+}
+
+@test "herdr spawn: an idle shell beside a live child process is busy" {
+    setup_fake_herdr
+    echo "Omar-worker" > "$FAKE_PANE_LABEL"
+    echo '[{"name":"bash","pid":1,"argv":["/bin/bash"],"cmdline":"/bin/bash"},{"name":"claude","pid":2,"argv":["claude"],"cmdline":"claude"}]' > "$FAKE_PANE_PROCS"
+
+    run python3 "$LIB_MUX_PY" spawn "Omar-worker" "claude"
+    [ "$status" -eq 1 ]
+    ! herdr_log_contains "pane run"
+}
+
+@test "herdr spawn: unreadable process-info is treated as busy (fail-safe)" {
+    setup_fake_herdr
+    echo "Omar-worker" > "$FAKE_PANE_LABEL"
+    export FAKE_PROCESS_INFO_FAIL=1
+
+    run python3 "$LIB_MUX_PY" spawn "Omar-worker" "claude"
+    [ "$status" -eq 1 ]
+
+    # Never relaunch when we cannot prove the pane is idle.
+    ! herdr_log_contains "pane run"
+    ! herdr_log_contains "tab create"
+}
+
+@test "herdr spawn: reusing a husk refreshes the pane id cache" {
+    setup_fake_herdr
+    echo "Omar-worker" > "$FAKE_PANE_LABEL"
+    echo '[{"name":"bash","pid":1,"argv":["/bin/bash"],"cmdline":"/bin/bash"}]' > "$FAKE_PANE_PROCS"
+
+    CACHE_FILE="${REPO_ROOT}/registry/mux/Omar-worker.json"
+    rm -f "$CACHE_FILE"
+
+    python3 "$LIB_MUX_PY" spawn "Omar-worker" "claude" 2>/dev/null
+
+    [ -f "$CACHE_FILE" ]
+    grep -q "\"pane_id\": \"${FAKE_PANE_ID}\"" "$CACHE_FILE"
+    grep -q "\"tab_id\": \"${FAKE_TAB_ID}\"" "$CACHE_FILE"
+
+    rm -f "$CACHE_FILE"
 }
 
 @test "herdr spawn: cache file is written after successful spawn" {
@@ -949,7 +1078,7 @@ print('herdr backend selected OK')
 echo "$*" >> "$FAKE_HERDR_LOG"
 cmd1="${1:-}"; cmd2="${2:-}"
 case "${cmd1}" in
-  --version) echo "herdr 0.8.2"; exit 0 ;;
+  --version) echo "herdr 0.9.0"; exit 0 ;;
   server) exit 0 ;;
   workspace)
     case "${cmd2}" in
@@ -1048,7 +1177,7 @@ FAKESCRIPT2
 echo "$*" >> "$FAKE_HERDR_LOG"
 cmd1="${1:-}"; cmd2="${2:-}"; arg3="${3:-}"
 case "${cmd1}" in
-  --version) echo "herdr 0.8.2"; exit 0 ;;
+  --version) echo "herdr 0.9.0"; exit 0 ;;
   server) exit 0 ;;
   workspace)
     case "${cmd2}" in
@@ -1169,7 +1298,7 @@ setup_fake_herdr_with_state() {
 echo "\$*" >> "\$FAKE_HERDR_LOG"
 cmd1="\${1:-}"; cmd2="\${2:-}"; cmd3="\${3:-}"
 case "\${cmd1}" in
-  --version) echo "herdr 0.8.2"; exit 0 ;;
+  --version) echo "herdr 0.9.0"; exit 0 ;;
   server) exit 0 ;;
   workspace)
     case "\${cmd2}" in
@@ -1230,7 +1359,7 @@ FAKESCRIPT_STATE
 echo "$*" >> "$FAKE_HERDR_LOG"
 cmd1="${1:-}"; cmd2="${2:-}"
 case "${cmd1}" in
-  --version) echo "herdr 0.8.2"; exit 0 ;;
+  --version) echo "herdr 0.9.0"; exit 0 ;;
   server) exit 0 ;;
   workspace)
     case "${cmd2}" in
@@ -1260,7 +1389,7 @@ FAKESCRIPT_FAIL
 echo "$*" >> "$FAKE_HERDR_LOG"
 cmd1="${1:-}"; cmd2="${2:-}"
 case "${cmd1}" in
-  --version) echo "herdr 0.8.2"; exit 0 ;;
+  --version) echo "herdr 0.9.0"; exit 0 ;;
   server) exit 0 ;;
   workspace)
     case "${cmd2}" in
@@ -1326,7 +1455,7 @@ PINGD
 #!/usr/bin/env bash
 case "\${1:-}" in
   --version)
-    echo "herdr 0.8.2"
+    echo "herdr 0.9.0"
     exit 0
     ;;
   server)

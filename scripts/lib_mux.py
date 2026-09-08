@@ -414,7 +414,39 @@ class TmuxBackend(_Backend):
 _HERDR_CACHE_DIR_NAME = Path("registry") / "mux"
 
 # Verified herdr version.
-_HERDR_VERIFIED_VERSION = "0.8.2"
+_HERDR_VERIFIED_VERSION = "0.9.0"
+
+# Process names that can be a pane's *idle* shell.  A leading '-' (login shell,
+# e.g. "-bash") is stripped before the lookup.  The name alone is not enough:
+# `bash scripts/dispatcher.sh` also reports name "bash", so the argv length is
+# what separates an idle shell from a shell running a script (see
+# _is_idle_shell_process).
+_SHELL_PROCESS_NAMES = frozenset({
+    "bash", "sh", "zsh", "fish", "dash", "ksh", "tcsh", "csh",
+})
+
+
+def _is_idle_shell_process(proc: dict) -> bool:
+    """True if `proc` is a shell sitting at its prompt rather than running work.
+
+    Verified against herdr 0.9.0 `pane process-info`:
+      idle prompt      → {"name": "bash", "argv": ["/bin/bash"]}
+      running a script → {"name": "bash", "argv": ["bash", "…/dispatcher.sh"]}
+
+    So the name must be a shell *and* it must have been invoked with no
+    arguments.  Matching on the name alone would read a live `bash
+    scripts/dispatcher.sh` pane as idle and start a second dispatcher on top
+    of it.  Anything we cannot classify answers False (= treat as busy).
+    """
+    if not isinstance(proc, dict):
+        return False
+    if (proc.get("name") or "").lstrip("-") not in _SHELL_PROCESS_NAMES:
+        return False
+    argv = proc.get("argv")
+    if not isinstance(argv, list) or not argv:
+        return False  # argv unavailable → cannot prove idle
+    return len(argv) == 1
+
 
 # Herdr CLI subcommand table — single place to update on CLI rename.
 # Format: {key: (subcommand_parts...)} where subcommand_parts is joined with
@@ -789,6 +821,38 @@ class HerdrBackend(_Backend):
                 }
         return None
 
+    def _pane_has_live_process(self, pane_id: str) -> bool:
+        """True if `pane_id` runs anything beyond its idle shell.
+
+        When the herdr server restarts it restores a workspace's tab layout but
+        not the processes inside it, so panes keep their <Agent>-<role> label
+        while holding nothing but a bare shell.  spawn() uses this to tell such
+        a husk (safe to relaunch into) from a pane where an agent is still
+        running.
+
+        Fail-safe: any error answers True, so a pane we cannot read is treated
+        as occupied and never relaunched on top of.
+        """
+        data = _herdr_run("pane_process_info", [pane_id], timeout=10)
+        if data is None:
+            self._warn(f"process-info failed for {pane_id!r} — treating pane as busy")
+            return True
+        try:
+            procs = data["result"]["process_info"]["foreground_processes"]
+        except (KeyError, TypeError):
+            self._warn(
+                f"process-info for {pane_id!r} has no foreground_processes "
+                "— treating pane as busy"
+            )
+            return True
+        if not isinstance(procs, list):
+            self._warn(
+                f"process-info for {pane_id!r} returned a non-list "
+                "foreground_processes — treating pane as busy"
+            )
+            return True
+        return not all(_is_idle_shell_process(proc) for proc in procs)
+
     # ------------------------------------------------------------------
     # Server / workspace helpers
     # ------------------------------------------------------------------
@@ -845,7 +909,7 @@ class HerdrBackend(_Backend):
     def available(self) -> bool:
         """True if herdr binary exists and server is running (or can be started).
 
-        Also performs version guard — warns (does not stop) if version != 0.8.2.
+        Also performs version guard — warns (does not stop) if version != 0.9.0.
         ``herdr --version`` outputs plain text (not JSON), so subprocess is used
         directly rather than _herdr_run().
         """
@@ -858,7 +922,7 @@ class HerdrBackend(_Backend):
                 _HERDR_CLI["version"], capture_output=True, text=True, timeout=5
             )
             ver_line = (r.stdout + r.stderr).strip()
-            # Expected: "herdr 0.8.2"
+            # Expected: "herdr 0.9.0"
             ver = ver_line.split()[-1] if ver_line else ""
             if ver and ver != _HERDR_VERIFIED_VERSION:
                 self._warn(
@@ -889,7 +953,10 @@ class HerdrBackend(_Backend):
           4. pane run <pane_id> <cmd>.
           5. Cache tab_id + pane_id.
 
-        Returns False (without error) if a pane with this name already exists.
+        Returns False (without error) if a pane with this name already exists
+        and still runs a live agent.  If the pane exists but holds nothing but
+        an idle shell — the husk a herdr server restart leaves behind — the
+        command is relaunched into that pane and True is returned.
         """
         ws_id = self._workspace_id()
         if ws_id is None:
@@ -900,8 +967,26 @@ class HerdrBackend(_Backend):
         existing = _herdr_run("pane_list", ["--workspace", ws_id], timeout=10)
         if existing is not None:
             panes = existing.get("result", {}).get("panes", [])
-            if any(p.get("label") == name for p in panes):
-                return False  # Already exists → no-op
+            for pane in panes:
+                if pane.get("label") != name:
+                    continue
+                existing_pane_id = pane.get("pane_id") or ""
+                if not existing_pane_id or self._pane_has_live_process(existing_pane_id):
+                    return False  # Live agent in there → no-op
+                # Husk pane: herdr restored the label but not the process.
+                # Relaunching in place keeps the tab (and its position) and is
+                # what makes ./crewvia recover on its own after a server
+                # restart — before this, spawn reported "already exists" and
+                # start.sh went on to launch nothing at all.
+                self._warn(
+                    f"spawn {name!r}: pane {existing_pane_id} is an idle shell "
+                    "(herdr restart?) — relaunching in place"
+                )
+                if _herdr_run("pane_run", [existing_pane_id, cmd], timeout=10) is None:
+                    self._warn(f"spawn {name!r}: pane run failed on reused pane")
+                    return False
+                self._write_cache(name, pane.get("tab_id") or "", existing_pane_id)
+                return True
 
         # tab create.
         tab_args = ["--workspace", ws_id, "--label", name, "--no-focus"]

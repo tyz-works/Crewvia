@@ -137,7 +137,7 @@ build_fake_herdr() {
 #!/usr/bin/env bash
 cmd1="\${1:-}"; cmd2="\${2:-}"
 case "\${cmd1}" in
-  --version) echo "herdr 0.8.2"; exit 0 ;;
+  --version) echo "herdr 0.9.0"; exit 0 ;;
   server) exit 0 ;;
   workspace)
     case "\${cmd2}" in

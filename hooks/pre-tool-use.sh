@@ -162,6 +162,56 @@ elif [ -n "$FILE_PATH" ]; then
   TOOL_SUMMARY="${TOOL_NAME}(${FILE_PATH})"
 fi
 
+# --- Worktree scope guard: crewvia 自身の main checkout への直接書き込みを防ぐ ---
+# 背景 (t009/t011): worktree モードで作業中の Worker が Edit/Write ツールに main repo
+# ($CREWVIA_REPO) の絶対パスを渡してしまい、専用 worktree ではなく main checkout
+# (branch=main) を直接編集する事故が発生した (git status で気づき自己復旧、実害なし。
+# 気づかなければ main に混入していた)。worker.md の明文化だけでは再発を防げないため、
+# 構造的なガードをここに入れる。_global.deny と同様、skill 設定や urgent 例外では
+# バイパスできない絶対安全弁として扱う（skill/Taskvia チェックより前に判定する）。
+#
+# 対象: 「worktree を持つ Worker」の Edit/Write のみ
+#   = CREWVIA_TASK_ID がセットされている (タスクを pull 済み)
+#   AND TARGET_DIR が未設定 (target project モードではない = worktree モードのはず)
+#   AND 編集先が $CREWVIA_REPO 配下 かつ queue/ registry/ .claude/worktrees/ 以外
+# 対象外 (誤爆防止。いずれかに該当すれば即スキップ):
+#   - Director (この関数より前の role チェックで既に exit 済み)
+#   - TARGET_DIR モードの Worker (worktree を持たない。上記条件で自動的に除外)
+#   - CREWVIA_TASK_ID 未設定のセッション (対話デバッグ等。上記条件で自動的に除外)
+#   - queue/ registry/ 配下 (plan.sh 等が書く共有領域。正当な経路)
+#   - .claude/worktrees/ 配下 (= 自分の worktree、または他 Worker の worktree。
+#     いずれも main checkout そのものではないので対象外)
+#   - $CREWVIA_REPO の外 (target project 等、無関係のパス)
+# 注意: cwd は見ない。「TARGET_DIR 未設定なら plan.sh pull は必ず worktree を作り
+# worktree_path を返す」という不変条件があるため、CREWVIA_TASK_ID セット + TARGET_DIR
+# 未設定なのに worktree の外を指すパスを編集しようとしている時点で、cwd が実際どこに
+# あるかによらず既に異常な状態 — パスだけで判定して構わない（むしろ「cwd も main に
+# 迷い込んでいる」というより深刻なケースも同時に拾える）。
+if { [ "$TOOL_NAME" = "Edit" ] || [ "$TOOL_NAME" = "Write" ]; } \
+   && [ -n "${CREWVIA_TASK_ID:-}" ] && [ -z "${TARGET_DIR:-}" ] && [ -n "$FILE_PATH" ]; then
+  case "$FILE_PATH" in
+    /*) _GUARD_ABS_FILE="$FILE_PATH" ;;
+    *)  _GUARD_ABS_FILE="$(pwd)/$FILE_PATH" ;;
+  esac
+  # realpath -m: パス正規化のみ (存在チェックなし。Write は新規ファイル作成のため
+  # 対象ファイルが存在しないケースがある)
+  _GUARD_REPO_REAL="$(realpath -m "$_CREWVIA_REPO" 2>/dev/null || echo "$_CREWVIA_REPO")"
+  _GUARD_FILE_REAL="$(realpath -m "$_GUARD_ABS_FILE" 2>/dev/null || echo "$_GUARD_ABS_FILE")"
+  case "$_GUARD_FILE_REAL" in
+    "${_GUARD_REPO_REAL}"/queue/*|"${_GUARD_REPO_REAL}"/registry/*|"${_GUARD_REPO_REAL}"/.claude/worktrees/*)
+      : # 正当な経路 — 対象外
+      ;;
+    "${_GUARD_REPO_REAL}"/*)
+      echo "[pre-tool-use] 🚫 main repo direct edit blocked: ${_GUARD_FILE_REAL}" >&2
+      emit_decision "deny" "worktree Worker が main checkout (${_CREWVIA_REPO}) を直接編集しようとしました。worktree 内のパスを使ってください (cwd: $(pwd))。"
+      exit 0
+      ;;
+    *)
+      : # $CREWVIA_REPO の外 (target project 等) — 対象外
+      ;;
+  esac
+fi
+
 # --- Skill-based permission check ---
 _SKILL_PERMS_YAML="${_CREWVIA_REPO}/config/skill-permissions.yaml"
 _SKILL_PERMS_PY="${_CREWVIA_REPO}/hooks/lib_skill_perms.py"

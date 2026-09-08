@@ -56,9 +56,22 @@ REVIEW_START_EPOCH=$(date +%s)
 # 手順を Glob ツールに置き換えてある (Bash 前提の手順のままだと reviewer が
 # Step 1 から動けなくなる)。
 #
+# AGENT_NAME='Plan-Reviewer' (t008, PR#188 レビュー指摘 P1・Codex 指摘):
+# review-plan.sh は Director セッションの子プロセスとして起動されるため、
+# ここで AGENT_NAME を上書きしないと Director の AGENT_NAME (registry で
+# role: director) がそのまま継承される。hooks/pre-tool-use.sh の Director
+# bypass (role: director を見て即 allow) は SKILLS=plan_review の per-skill
+# チェックより前に評価されるため、上書きしないと reviewer セッションは
+# 「登録済み Director」として全ツールが即通過し、上の SKILLS=plan_review が
+# 実質 dead code になっていた (mission.yaml を書き換えられる事故の未解決分)。
+# registry/workers.yaml に登録の無い名前を使うことで role: director 判定に
+# 一致させず、SKILLS ベースの per-skill チェックを必ず通過させる
+# (scripts/kai-review.sh / scripts/start.sh と同じ「非 Director identity で
+# 起動する」パターン)。
+#
 # unset CLAUDE_CODE_CHILD_SESSION: herdr server 由来の汚染変数が Plan Reviewer に伝播しないよう除去。
 # CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1: 二重防御として transcript 保存を公式 env var で保証 (→ t004)。
-INLINE_CMD="unset CLAUDE_CODE_CHILD_SESSION; export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1; export SKILLS=plan_review; cd '$CREWVIA_DIR' && CLAUDE_SKILL=plan_review claude --model claude-opus-4-5 \
+INLINE_CMD="unset CLAUDE_CODE_CHILD_SESSION; export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1; export AGENT_NAME='Plan-Reviewer'; export SKILLS=plan_review; cd '$CREWVIA_DIR' && CLAUDE_SKILL=plan_review claude --model claude-opus-4-5 \
      -p 'Mission slug: $SLUG. agents/plan_reviewer.md の手順に従い queue/missions/$SLUG/ の全タスクを検査し、queue/missions/$SLUG/plan_review.md を出力せよ。' \
      2>&1 | tee /tmp/plan_reviewer_$$.log"
 
@@ -72,6 +85,9 @@ else
     unset CLAUDE_CODE_CHILD_SESSION
     # 二重防御: transcript 保存を公式 env var で保証する。
     export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1
+    # 上の INLINE_CMD と同じ理由 (Director identity 継承による
+    # skill-permissions.yaml バイパスを防ぐため)。
+    export AGENT_NAME='Plan-Reviewer'
     # 上の INLINE_CMD と同じ理由 (skill-permissions.yaml の plan_review 制限を
     # 実際に適用するため)。
     export SKILLS=plan_review

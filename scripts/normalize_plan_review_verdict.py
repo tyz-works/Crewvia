@@ -49,6 +49,17 @@ ALT_PATTERNS: list[tuple[str, re.Pattern]] = [
 SCOPE_RE = re.compile(r"総合判定[^\n]*")
 SCOPE_WINDOW = 200  # 見出し以降、何文字まで判定語を探すか
 
+# t008 (PR#188 レビュー指摘 F5, Seo 実測): ALT_PATTERNS の優先順
+# (reject > revise > approve) は複数パターンが同時にヒットしたときにしか
+# 効かない。「承認しない」「承認できない」「LGTM とは言えない」のように
+# 「承認」系の語が否定文脈で単独ヒットすると、そのまま approve に化けていた。
+# scope 内に否定語があり、かつ approve 以外の判定語が当たらない場合は
+# 「判定不能」として安全側 (None) に倒す。
+NEG_RE = re.compile(
+    r"(しない|しません|できない|できません|ではない|ではありません|とは言えな|見送|不可|NG)",
+    re.IGNORECASE,
+)
+
 
 def find_alt_verdict(content: str) -> str | None:
     m = SCOPE_RE.search(content)
@@ -57,6 +68,10 @@ def find_alt_verdict(content: str) -> str | None:
     scope = content[m.start(): m.start() + SCOPE_WINDOW]
     for verdict, pattern in ALT_PATTERNS:
         if pattern.search(scope):
+            # approve は否定文脈 (「承認しない」等) で誤爆しやすい —
+            # 否定語が scope 内にあれば判定不能扱いにして安全側に倒す。
+            if verdict == "approve" and NEG_RE.search(scope):
+                return None
             return verdict
     return None
 

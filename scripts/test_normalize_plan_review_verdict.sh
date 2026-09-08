@@ -164,5 +164,81 @@ else
 fi
 
 echo ""
+echo "--- Test 9 (t008 F5): '## 総合判定: 承認しない' → NOT approve, exit 1, file unchanged ---"
+F9="$TMPDIR_TEST/t9.md"
+cat > "$F9" << 'EOF'
+# Plan Review: test-mission
+
+## 総合判定: 承認しない
+
+## Summary
+致命的な問題があるため承認しない。
+EOF
+ORIG9="$(cat "$F9")"
+python3 "$NORMALIZE" "$F9" >/tmp/test_normalize_stdout 2>&1
+RC=$?
+NEW9="$(cat "$F9")"
+if [[ "$RC" -eq 1 && "$NEW9" == "$ORIG9" ]]; then
+  pass "承認しない → not misdetected as approve, exit 1, file untouched"
+else
+  fail "承認しない should NOT normalize to approve — rc=$RC content=$(cat "$F9")"
+fi
+
+echo ""
+echo "--- Test 10 (t008 F5): '## 総合判定: 承認できない' → NOT approve, exit 1 ---"
+F10="$TMPDIR_TEST/t10.md"
+cat > "$F10" << 'EOF'
+# Plan Review: test-mission
+
+## 総合判定: 承認できない
+EOF
+ORIG10="$(cat "$F10")"
+python3 "$NORMALIZE" "$F10" >/tmp/test_normalize_stdout 2>&1
+RC=$?
+NEW10="$(cat "$F10")"
+if [[ "$RC" -eq 1 && "$NEW10" == "$ORIG10" ]]; then
+  pass "承認できない → not misdetected as approve, exit 1, file untouched"
+else
+  fail "承認できない should NOT normalize to approve — rc=$RC content=$(cat "$F10")"
+fi
+
+echo ""
+echo "--- Test 11 (t008 F5): '## 総合判定: LGTM とは言えない' → NOT approve, exit 1 ---"
+F11="$TMPDIR_TEST/t11.md"
+cat > "$F11" << 'EOF'
+# Plan Review: test-mission
+
+## 総合判定: LGTM とは言えない
+EOF
+ORIG11="$(cat "$F11")"
+python3 "$NORMALIZE" "$F11" >/tmp/test_normalize_stdout 2>&1
+RC=$?
+NEW11="$(cat "$F11")"
+if [[ "$RC" -eq 1 && "$NEW11" == "$ORIG11" ]]; then
+  pass "LGTM とは言えない → not misdetected as approve, exit 1, file untouched"
+else
+  fail "LGTM とは言えない should NOT normalize to approve — rc=$RC content=$(cat "$F11")"
+fi
+
+echo ""
+echo "--- Test 12 (t008 F5 guard-rail): positive context containing negation word ('問題はないため承認') → still normalizes to approve ---"
+F12="$TMPDIR_TEST/t12.md"
+cat > "$F12" << 'EOF'
+# Plan Review: test-mission
+
+## 総合判定: 重大な問題はないため承認
+
+## Summary
+問題なし。
+EOF
+python3 "$NORMALIZE" "$F12" >/tmp/test_normalize_stdout 2>&1
+RC=$?
+if [[ "$RC" -eq 0 ]] && grep -q '^\*\*Verdict:\*\* approve' "$F12"; then
+  pass "positive context with negation word still normalizes to approve (NEG_RE not over-broad)"
+else
+  fail "positive '問題はないため承認' should still normalize to approve — rc=$RC content=$(cat "$F12")"
+fi
+
+echo ""
 echo "== Results: $PASS_COUNT passed, $FAIL_COUNT failed =="
 [[ "$FAIL_COUNT" -eq 0 ]]

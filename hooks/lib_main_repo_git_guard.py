@@ -75,6 +75,24 @@ main repo 非対象) があるだけで誤爆していた。加えて DESTRUCTIV
 省略) に倒す。シングルクォート区間の外に実在する場合のみ意味があるため、
 検出漏れは生まれない。
 
+t007 (Seo の差分検証 (旧 d331ba6 vs 新 3ed0e13) が検出した検出力の退行への対応。
+PR#186 の同 branch に追加):
+
+t005 [P1] の `_OPERAND_PREFIX_RE` は「操作対象指定トークンの直後に参照が直接
+隣接している」ことを要求していたため、間にオプションが1語でも入ると判定が
+外れていた (`cd -- <ref>` / `cd -P <ref>` / `pushd -n <ref>` /
+`git --no-pager -C <ref>` がいずれも旧 DENY → 新 OK に劣化)。
+`git -C<ref>` の密着形は git 自身が unknown option で拒否するため到達経路で
+はない (Director 実測確認済み)。
+
+修正: `_OPERAND_PREFIX_RE` の cd/pushd/git -C いずれも「ハイフンで始まる
+オプション語の連続 (`(?:[ \t]+-[^ \t]*)*`) を挟んでよい」形に緩和した。
+git 側は `-C` までの任意文字列で緩めるのではなく、cd/pushd と同じ「オプション
+語の連続のみ」に絞った — `git log -C` / `git diff -C` / `git blame -C`
+(コピー検出オプションで repo path 指定ではない) まで誤って main repo 操作
+とみなし、同一文字列中の無関係な別コマンドの破壊的動詞と組み合わさって誤 DENY
+する新規の P1 型退行を避けるため (詳細は _OPERAND_PREFIX_RE のコメント参照)。
+
 使い方: python3 lib_main_repo_git_guard.py "<command>" "<main_repo_abs_path>"
   stdout に "DENY" または "OK" を1行出力する。
 """
@@ -102,9 +120,29 @@ DESTRUCTIVE_VERB_RE = re.compile(
 # 参照が出現するだけ (read-only コマンドの引数、他コマンドの一部等) では
 # 真としない。クォート文字 (`'`/`"`) が参照の直前に挟まるケース
 # (`cd "$CREWVIA_REPO_ROOT"` 等) も許容する。
+#
+# t007 (t005 [P1] の検出力退行への対応。Seo の差分検証で発覚。PR#186 の同
+# branch に追加): 上記は「cd/pushd/git -C の直後に参照が続く」ことを要求して
+# おり、間にオプションが1語でも挟まると検出できなかった (`cd -- <ref>` /
+# `cd -P <ref>` / `pushd -n <ref>` / `git --no-pager -C <ref>`)。
+# `(?:[ \t]+-[^ \t]*)*` で「ハイフンで始まるオプション語の連続」だけを許容
+# するよう緩和した (cd/pushd 側・git 側とも同じ形)。
+#
+# git 側を `\bgit\b[^|;&\n]*?[ \t]-C` のように「-C までの任意文字列」で緩め
+# なかったのは意図的: それだと `git log -C <ref>` / `git diff -C <ref>` /
+# `git blame -C <ref>` (これらの `-C` はコピー検出オプションで repo path
+# 指定ではない) まで「main repo を操作対象にしている」と誤認し、同一コマンド
+# 文字列中の無関係な箇所 (worktree ローカルの `git checkout -b` 等、`&&` で
+# つながれた別コマンド) と組み合わさって誤 DENY するリスクがあった
+# (P1 で直したばかりの「read-only な参照 + 別コマンドの破壊的動詞」誤爆の
+# 再発)。実測: `git log -C $CREWVIA_REPO_ROOT -- f && git checkout -b x`
+# ( worktree ローカルの正当な branch 作成) が緩めた版では DENY になることを
+# 確認済み。オプション語 (`-` で始まるトークン) の連続のみを許容する形なら
+# `log`/`diff`/`blame` のようなサブコマンド語でチェーンが途切れるため、
+# この誤爆を避けつつ 4 パターンの検出も回復できる。
 _OPERAND_PREFIX_RE = re.compile(
-    r'(?:\bcd|\bpushd)[ \t]+[\'"]?$'
-    r'|\bgit[ \t]+-C[ \t]+[\'"]?$'
+    r'(?:\bcd|\bpushd)(?:[ \t]+-[^ \t]*)*[ \t]+[\'"]?$'
+    r'|\bgit\b(?:[ \t]+-[^ \t]*)*[ \t]+-C[ \t]+[\'"]?$'
     r'|--git-dir=[\'"]?$'
     r'|--work-tree=[\'"]?$'
 )

@@ -368,6 +368,50 @@ STDOUT=$(_run_hook "$(_bash_payload $'git status\ncd $CREWVIA_REPO_ROOT && git c
   "${_worker_env[@]}"); EXIT=$?
 _assert_blocked "multi-line: one line itself has reference+verb co-located" "$EXIT" "$STDOUT"
 
+# ---------------------------------------------------------------------------
+# Test 18 (t007): Seo が旧版 d331ba6 と新版 3ed0e13 の decide() を同一入力に
+# 通す差分検証で検出した検出力の退行 4 パターン → deny に回復すること。
+# t005 [P1] の _OPERAND_PREFIX_RE が「操作対象指定トークンの直後に参照が直接
+# 隣接」を要求していたため、間にオプションが1語入ると判定が外れていた。
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- Test 18: t007 検出力退行 4 パターン → deny に回復 ---"
+
+STDOUT=$(_run_hook "$(_bash_payload "cd -- ${FAKE_REPO} && git checkout -b x")" \
+  "${_worker_env[@]}"); EXIT=$?
+_assert_blocked "regression-18a: cd -- <main repo> && git checkout -b" "$EXIT" "$STDOUT"
+
+STDOUT=$(_run_hook "$(_bash_payload "cd -P ${FAKE_REPO} && git checkout -b x")" \
+  "${_worker_env[@]}"); EXIT=$?
+_assert_blocked "regression-18b: cd -P <main repo> && git checkout -b" "$EXIT" "$STDOUT"
+
+STDOUT=$(_run_hook "$(_bash_payload "pushd -n ${FAKE_REPO} && git checkout -b x")" \
+  "${_worker_env[@]}"); EXIT=$?
+_assert_blocked "regression-18c: pushd -n <main repo> && git checkout -b" "$EXIT" "$STDOUT"
+
+STDOUT=$(_run_hook "$(_bash_payload "git --no-pager -C ${FAKE_REPO} checkout main")" \
+  "${_worker_env[@]}"); EXIT=$?
+_assert_blocked "regression-18d: git --no-pager -C <main repo> checkout" "$EXIT" "$STDOUT"
+
+# ---------------------------------------------------------------------------
+# Test 19 (t007): 上記修正で git 側を `-C` までの任意文字列で緩めると新規に
+# 誤爆する経路がある (Seo の修正案そのままでは再発する)。`git log -C` /
+# `git diff -C` / `git blame -C` の `-C` はコピー検出オプションであり repo
+# path 指定ではないため、main repo 操作とみなしてはならない。オプション語
+# (`-` で始まるトークン) の連続のみを許容する形にしたことでこれを回避できて
+# いることを回帰として固定する。
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- Test 19: git log/diff/blame -C <main repo> は操作対象扱いしない (新規誤爆防止) ---"
+
+STDOUT=$(_run_hook "$(_bash_payload "git log -C ${FAKE_REPO} -- f.txt && git checkout -b task/my-fix")" \
+  "${_worker_env[@]}"); EXIT=$?
+_assert_not_blocked "regression-19a: git log -C <main repo> (copy-detect) + unrelated worktree checkout -b" "$EXIT" "$STDOUT"
+
+STDOUT=$(_run_hook "$(_bash_payload "git diff -C ${FAKE_REPO} && git commit -m wip")" \
+  "${_worker_env[@]}"); EXIT=$?
+_assert_not_blocked "regression-19b: git diff -C <main repo> (copy-detect) + unrelated worktree commit" "$EXIT" "$STDOUT"
+
 echo ""
 echo "================================"
 echo "Results: ${PASS_COUNT} passed, ${FAIL_COUNT} failed"

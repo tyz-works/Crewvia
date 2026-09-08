@@ -41,6 +41,11 @@ _read_approval_yaml() {
 
       if (tk == "mode" && sk == "" && /^  mode:/) {
         val = $0; gsub(/^  mode:[[:space:]]*/, "", val)
+        # Drop a trailing inline comment (`mode: taskvia  # comment`) before
+        # quote-stripping — same defect class as t016 (lib_mux.py
+        # _config_mode()): without this, a commented mode/value line never
+        # matches its expected value and silently falls back to the default.
+        sub(/[[:space:]]*#.*$/, "", val)
         gsub(/^['"'"'"]|['"'"'"]$/, "", val); print val; exit
       }
       if (tk == "ntfy" && in_ntfy) {
@@ -48,6 +53,7 @@ _read_approval_yaml() {
         if (index($0, pfx) == 1) {
           val = substr($0, length(pfx) + 1)
           gsub(/^[[:space:]]+/, "", val)
+          sub(/[[:space:]]*#.*$/, "", val)
           gsub(/^['"'"'"]|['"'"'"]$/, "", val); print val; exit
         }
       }

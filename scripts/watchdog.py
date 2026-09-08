@@ -328,6 +328,27 @@ class WorkerMonitor:
 
 
 # ---------------------------------------------------------------------------
+# Mass-kill guard (t016)
+# ---------------------------------------------------------------------------
+
+def _is_mass_kill(results: dict) -> bool:
+    """True when every currently-monitored Worker's check() came back "kill"
+    in the same cycle.
+
+    A real Worker's mux window closing on its own is rare and happens to one
+    Worker at a time. Every single monitored Worker reporting "kill" at once
+    is a far stronger signal that the mux backend itself is misconfigured
+    (mux.list() coming back empty against the wrong backend — exactly what
+    the config-mode inline-comment bug caused) than that N independent
+    Workers all died simultaneously. Empty input (nothing monitored) is not
+    a mass-kill — there's nothing to be wrong about yet.
+    """
+    if not results:
+        return False
+    return all(status == "kill" for status in results.values())
+
+
+# ---------------------------------------------------------------------------
 # Graceful terminate
 # ---------------------------------------------------------------------------
 
@@ -488,7 +509,23 @@ def run(repo_root: Path, interval: int) -> None:
     # Track active monitors: (slug, task_id) → WorkerMonitor
     monitors: dict[tuple[str, str], WorkerMonitor] = {}
 
-    _log(f"Starting Watchdog v2 (PID {os.getpid()}, interval={interval}s, repo={repo_root})")
+    # t016: log which mux backend got selected at startup. A silent
+    # misconfiguration here (e.g. config/crewvia.yaml `mode:` failing to
+    # parse because of a trailing inline comment) used to be invisible until
+    # every live Worker started getting falsely reported as "window gone" —
+    # this one line turns that into an immediate, obvious startup fact.
+    _backend_name = type(_mux._backend).__name__
+    _log(
+        f"Starting Watchdog v2 (PID {os.getpid()}, interval={interval}s, "
+        f"repo={repo_root}, mux_backend={_backend_name})"
+    )
+    if not _mux.available():
+        _log(
+            f"WARNING: mux backend ({_backend_name}) reports unavailable at startup. "
+            f"Every Worker will look like its window is gone until this is fixed — "
+            f"check CREWVIA_MUX / config/crewvia.yaml `mode:` and that the backend "
+            f"(tmux / herdr) is actually running."
+        )
 
     # Graceful exit on SIGTERM / SIGINT
     def _on_signal(signum, _frame):
@@ -519,9 +556,41 @@ def run(repo_root: Path, interval: int) -> None:
                         repo_root=repo_root,
                     )
 
+            # Evaluate every monitor's status up front (side-effect free) before
+            # acting on any of them. This lets us tell "every single monitored
+            # Worker's window looks gone in the same cycle" apart from an
+            # isolated, real window closure — see the mass-kill guard below
+            # (t016).
+            results: dict[tuple[str, str], "Literal['alive', 'warn', 'terminate', 'kill']"] = {
+                key: monitor.check() for key, monitor in monitors.items()
+            }
+
+            # See _is_mass_kill() docstring: treat "every monitored Worker
+            # reports kill at once" as a config error, not N real deaths —
+            # warn once per cycle instead of spamming N per-worker KILLs, and
+            # skip cleanup so real state isn't discarded while the backend is
+            # unusable (once fixed, the next cycle's check() calls simply
+            # start returning real results again).
+            if _is_mass_kill(results):
+                backend_name = type(_mux._backend).__name__
+                msg = (
+                    f"CONFIG ERROR: all {len(results)} monitored Worker(s) report "
+                    f"their mux window gone in the same cycle (mux_backend={backend_name}, "
+                    f"mux.list()={_mux.list()!r}). This almost always means the mux "
+                    f"backend is misconfigured (CREWVIA_MUX / config/crewvia.yaml "
+                    f"`mode:` / backend not actually running), not that every Worker "
+                    f"died at once. Skipping cleanup this cycle."
+                )
+                _log(msg)
+                taskvia_alert(taskvia_url, taskvia_token, "watchdog", msg)
+                for key, monitor in monitors.items():
+                    _log_observation(monitor, results[key])
+                time.sleep(interval)
+                continue
+
             # Check each monitor
             for (slug, task_id), monitor in list(monitors.items()):
-                status = monitor.check()
+                status = results[(slug, task_id)]
                 agent = monitor.agent_name
 
                 # ★task_162 案C(観測専用): check() の戻り値・分岐には一切影響しない
@@ -555,10 +624,14 @@ def run(repo_root: Path, interval: int) -> None:
                     del monitors[(slug, task_id)]
 
                 elif status == "kill":
-                    _log(f"KILL: {agent}/{task_id} (mission={slug}) tmux window gone, cleanup only")
+                    backend_name = type(_mux._backend).__name__
+                    _log(
+                        f"KILL: {agent}/{task_id} (mission={slug}) mux window gone "
+                        f"(backend={backend_name}), cleanup only"
+                    )
                     taskvia_alert(
                         taskvia_url, taskvia_token, agent,
-                        f"KILL: {agent}/{task_id} tmux window が消失",
+                        f"KILL: {agent}/{task_id} mux window が消失 (backend={backend_name})",
                     )
                     del monitors[(slug, task_id)]
 

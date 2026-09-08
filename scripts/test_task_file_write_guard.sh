@@ -29,6 +29,15 @@
 #   15.    コマンド置換 `$(...)` の中に実際の書き込みを隠しても deny された
 #          ままであること (クォート除去を意図的に無効化しているため)
 #
+# t023 (Seo/Opus 5 再レビュー [P2] の修正): t019 のクォート一括除去は、
+# パス自体をクォートで囲んだ**本物の書き込み**まで判定対象から消してしまう
+# 検出力の退行を生んでいた (`cat >> "queue/missions/.../t004.md" <<EOF` 等)。
+#   16-20. パスをクォートで囲んだ 5 パターンの本物の書き込みが deny に戻る
+#          こと (退行の回帰テスト。修正前 (t019 時点) はいずれも allow だった)
+#   21.    16-20 の修正 (クォート内の中身が丸ごとパスの場合だけクォートを
+#          剥がす) を入れても、12-13 の allow ケースは引き続き allow のまま
+#          であること (t019 の誤 deny 修正が壊れていないことの回帰)
+#
 # 使い方: bash scripts/test_task_file_write_guard.sh
 # 終了コード: 0 = 全パス, 1 = 1件以上失敗
 
@@ -216,6 +225,49 @@ EOF
 STDOUT=$(_run_hook "$INPUT" CREWVIA_TASKVIA=disabled TASKVIA_TOKEN="" SKILLS=bash AGENT_NAME=Haruto || true)
 EXIT=$?
 _assert_decision "15. \$(...) コマンド置換の中に実際の書き込みを隠す → deny (クォート除去を無効化)" "deny" "$STDOUT" "$EXIT"
+
+# ---------------------------------------------------------------------------
+# 16-20 (t023 fix): パスをクォートで囲んだ本物の書き込みが deny に戻ること
+# (Seo 実測による退行の回帰テスト。t019 時点ではいずれも allow に退行していた)
+# ---------------------------------------------------------------------------
+
+INPUT="$(_bash_input_json 'cat >> "queue/missions/m1/tasks/t004.md" <<EOF
+x
+EOF')"
+STDOUT=$(_run_hook "$INPUT" CREWVIA_TASKVIA=disabled TASKVIA_TOKEN="" SKILLS=bash AGENT_NAME=Haruto || true)
+EXIT=$?
+_assert_decision "16. cat >> \"...\" <<EOF (ダブルクォートで囲んだパスへの実書き込み) → deny (t023 退行修正)" "deny" "$STDOUT" "$EXIT"
+
+INPUT="$(_bash_input_json "cat >> 'queue/missions/m1/tasks/t004.md' <<EOF
+x
+EOF")"
+STDOUT=$(_run_hook "$INPUT" CREWVIA_TASKVIA=disabled TASKVIA_TOKEN="" SKILLS=bash AGENT_NAME=Haruto || true)
+EXIT=$?
+_assert_decision "17. cat >> '...' <<EOF (シングルクォートで囲んだパスへの実書き込み) → deny (t023 退行修正)" "deny" "$STDOUT" "$EXIT"
+
+INPUT="$(_bash_input_json 'cat >> "/home/x/crewvia/queue/missions/m1/tasks/t004.md"')"
+STDOUT=$(_run_hook "$INPUT" CREWVIA_TASKVIA=disabled TASKVIA_TOKEN="" SKILLS=bash AGENT_NAME=Haruto || true)
+EXIT=$?
+_assert_decision "18. 絶対パスをダブルクォートで囲んだ実書き込み → deny (t023 退行修正)" "deny" "$STDOUT" "$EXIT"
+
+INPUT="$(_bash_input_json "sed -i 's/a/b/' 'queue/missions/m1/tasks/t004.md'")"
+STDOUT=$(_run_hook "$INPUT" CREWVIA_TASKVIA=disabled TASKVIA_TOKEN="" SKILLS=bash AGENT_NAME=Haruto || true)
+EXIT=$?
+_assert_decision "19. sed -i '...' 'クォートで囲んだパス' → deny (t023 退行修正)" "deny" "$STDOUT" "$EXIT"
+
+INPUT="$(_bash_input_json 'tee -a "queue/missions/m1/tasks/t004.md"')"
+STDOUT=$(_run_hook "$INPUT" CREWVIA_TASKVIA=disabled TASKVIA_TOKEN="" SKILLS=bash AGENT_NAME=Haruto || true)
+EXIT=$?
+_assert_decision "20. tee -a \"クォートで囲んだパス\" → deny (t023 退行修正)" "deny" "$STDOUT" "$EXIT"
+
+# ---------------------------------------------------------------------------
+# 21 (t023 fix): 16-20 の修正後も t019 の allow ケースが壊れていないこと
+# ---------------------------------------------------------------------------
+
+INPUT="$(_bash_input_json './scripts/plan.sh done t021 "#183 は cat >> queue/missions/m1/tasks/t004.md を deny する"')"
+STDOUT=$(_run_hook "$INPUT" CREWVIA_TASKVIA=disabled TASKVIA_TOKEN="" SKILLS=bash AGENT_NAME=Haruto || true)
+EXIT=$?
+_assert_decision "21. plan.sh done への引用テキストは引き続き allow (t023 修正後も t019 の修正が壊れていない)" "allow" "$STDOUT" "$EXIT"
 
 echo ""
 echo "================================"

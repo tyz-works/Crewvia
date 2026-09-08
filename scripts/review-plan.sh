@@ -131,4 +131,9 @@ if [[ "$WAIT_STATUS" == "TIMEOUT_FRESH" ]]; then
 else
     echo "[review-plan.sh] Timeout: plan_review.md was not produced within 600s" >&2
 fi
+
+# t011 (QA t009 FINDING-B, pane leak): 成功時 (上の exit 0) しか mux_kill して
+# いなかったため、timeout / 異常終了の経路では Plan Reviewer の mux window が
+# 残り続けていた (QA が手動 kill して発見)。タイムアウト経路でも同様に kill する。
+[[ $MUX_LAUNCHED -eq 1 ]] && mux_kill "$WINDOW_NAME" 2>/dev/null || true
 exit 1

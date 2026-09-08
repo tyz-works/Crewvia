@@ -28,6 +28,16 @@
 #   TIMEOUT_NONE   — このレビュー実行で書かれたファイルが一度も観測できなかった
 # exit code: 0 = OK, 1 = TIMEOUT (fresh/none いずれも)
 #
+# t011 (mission 20260908-launch-reliability, QA t009 FINDING-B) 早期打ち切り:
+# reviewer が既知の別表記にない語彙 (例 `**STOP**`) を書いた場合、normalize は
+# 何度呼んでも判定不能 (exit 1) のままであり、待っても結果は変わらない。
+# 「fresh なファイルの mtime が 2 回連続で変化していない (=書き込みが止まって
+# いる) のに verdict が読めない」ことを検出したら、残りの max_wait を待たずに
+# ループを抜けて TIMEOUT_FRESH を返す。mtime が変化し続けている間は reviewer が
+# まだ書いている可能性があるため打ち切らない (誤って早すぎる打ち切りをしない
+# ための安全策)。
+_EARLY_BREAK_STREAK=2
+
 # Usage: wait_for_plan_review.sh <review_output_path> <start_epoch> [max_wait_seconds=600] [poll_interval=5]
 set -uo pipefail
 
@@ -48,6 +58,8 @@ _iterations=$(( (MAX_WAIT + POLL_INTERVAL - 1) / POLL_INTERVAL ))
 [ "$_iterations" -lt 1 ] && _iterations=1
 
 _fresh_seen=0
+_last_unreadable_mtime=""
+_unreadable_streak=0
 _i=0
 while [ "$_i" -lt "$_iterations" ]; do
   _i=$((_i + 1))
@@ -65,8 +77,19 @@ while [ "$_i" -lt "$_iterations" ]; do
         echo "[wait_for_plan_review] verdict normalized to standard format in $REVIEW_OUTPUT" >&2
         exit 0
       fi
-      # 別表記も見つからなかった — このまま次のポーリングへ (reviewer が
-      # まだ書き終えていない可能性があるため、即座には諦めない)
+      # 別表記も見つからなかった — reviewer がまだ書き終えていない可能性が
+      # あるため即座には諦めないが、mtime が前回と同じ (書き込みが止まって
+      # いる) 場合はストリークを積み、2回連続で止まっていれば早期打ち切り。
+      if [ "$_mtime" = "$_last_unreadable_mtime" ]; then
+        _unreadable_streak=$((_unreadable_streak + 1))
+      else
+        _unreadable_streak=1
+        _last_unreadable_mtime="$_mtime"
+      fi
+      if [ "$_unreadable_streak" -ge "$_EARLY_BREAK_STREAK" ]; then
+        echo "[wait_for_plan_review] $REVIEW_OUTPUT stopped changing (mtime stable across ${_unreadable_streak} polls) with no readable verdict — breaking early instead of waiting the full ${MAX_WAIT}s" >&2
+        break
+      fi
     fi
     # _mtime < START_EPOCH: 前 cycle の残骸。無視して待ち続ける (t002 パターン3対策)
   fi

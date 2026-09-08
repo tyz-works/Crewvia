@@ -116,5 +116,30 @@ else
 fi
 
 echo ""
+echo "--- Test 6 (t011, QA t009 FINDING-B): unknown vocabulary ('**STOP**') with a large max_wait → breaks early instead of waiting the full timeout ---"
+F6="$TMPDIR_TEST/t6.md"
+cat > "$F6" << 'EOF'
+# Plan Review: test-mission
+
+## 総合判定
+
+**STOP**
+EOF
+START=$(date +%s)
+T0=$(date +%s)
+# MAX_WAIT=600 (実運用と同じ) だが、mtime が動かず判定不能が続くため
+# 早期打ち切りされるはず — 実測の経過時間が MAX_WAIT よりずっと短いことを
+# 検証する (POLL_INTERVAL=1 でテストを高速化)。
+OUT="$(bash "$WAIT_SCRIPT" "$F6" "$START" 600 1)"; RC=$?
+T1=$(date +%s)
+ELAPSED=$((T1 - T0))
+STATUS="$(echo "$OUT" | head -1)"
+if [[ "$RC" -eq 1 && "$STATUS" == "TIMEOUT_FRESH" && "$ELAPSED" -lt 30 ]]; then
+  pass "unknown vocabulary breaks early (elapsed ${ELAPSED}s << 600s max_wait), status=TIMEOUT_FRESH"
+else
+  fail "expected early TIMEOUT_FRESH well under 600s, got rc=$RC status=$STATUS elapsed=${ELAPSED}s"
+fi
+
+echo ""
 echo "== Results: $PASS_COUNT passed, $FAIL_COUNT failed =="
 [[ "$FAIL_COUNT" -eq 0 ]]

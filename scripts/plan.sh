@@ -2392,12 +2392,27 @@ def cmd_review(args):
     print(f"[review] invoking review-plan.sh...", file=sys.stderr)
     proc = subprocess.run(['bash', review_script, slug])
 
-    def _rollback_to_drafting(reason):
-        """P2: rollback mission from reviewing → drafting on failure."""
+    def _rollback_to_drafting(reason, refund_cycle=False):
+        """P2: rollback mission from reviewing → drafting on failure.
+
+        refund_cycle=True (t011, QA t009 FINDING-B): Step 2 (_do_start) が
+        review-plan.sh 呼び出し前に cycle_count を先食いしているため、判定不能
+        (reviewer の書式ミスで verdict が読めなかった) で打ち切った場合は
+        その先食いを元に戻す。reviewer の書式ミスで Director が review cycle を
+        失うのは筋が悪いため。
+        """
         def _do_rollback():
             m = load_mission(slug)
             if m.get('status') == 'reviewing':
                 m['status'] = 'drafting'
+                if refund_cycle:
+                    review = m.get('review') or {}
+                    if not isinstance(review, dict):
+                        review = {}
+                    cc = review.get('cycle_count') or 0
+                    if cc > 0:
+                        review['cycle_count'] = cc - 1
+                    m['review'] = review
                 save_mission(slug, m)
                 print(f"[review] rollback: mission '{slug}' → drafting ({reason})", file=sys.stderr)
         with_lock(_do_rollback)
@@ -2411,7 +2426,10 @@ def cmd_review(args):
         # 判定内容自体は活かせる可能性が高く、cycle_count を無駄にもう1回消費
         # させるより Director に手動確認を促す方が安全側。
         if os.path.exists(review_output):
-            _rollback_to_drafting("review-plan.sh timed out but plan_review.md exists")
+            _rollback_to_drafting(
+                "review-plan.sh timed out but plan_review.md exists",
+                refund_cycle=True,
+            )
             die(
                 f"review-plan.sh failed or timed out for mission '{slug}', but "
                 f"{review_output} was written — inspect it by hand before re-running "

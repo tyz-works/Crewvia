@@ -221,7 +221,12 @@ else
 fi
 
 echo ""
-echo "--- Test 12 (t008 F5 guard-rail): positive context containing negation word ('問題はないため承認') → still normalizes to approve ---"
+echo "--- Test 12 (t011 design change, was t008 F5 guard-rail): long sentence containing an approve word ('重大な問題はないため承認') → allowlist inversion means this is no longer a bare canonical form, so it is judged 判定不能 (exit 1), not approve ---"
+# t011 (QA t009 FINDING-A): 旧実装 (NEG_RE denylist) はこのケースを「否定語が
+# 無いので approve」と判定していた。allowlist 反転後は「unit が既知の短い
+# 肯定形そのものと完全一致するときだけ approve」になったため、長い文の中に
+# 「承認」が混じっているだけでは approve にならない — これは意図した挙動
+# 変化であり退行ではない (危険な結論ほど厳しい側に倒す設計)。
 F12="$TMPDIR_TEST/t12.md"
 cat > "$F12" << 'EOF'
 # Plan Review: test-mission
@@ -231,12 +236,14 @@ cat > "$F12" << 'EOF'
 ## Summary
 問題なし。
 EOF
+ORIG12="$(cat "$F12")"
 python3 "$NORMALIZE" "$F12" >/tmp/test_normalize_stdout 2>&1
 RC=$?
-if [[ "$RC" -eq 0 ]] && grep -q '^\*\*Verdict:\*\* approve' "$F12"; then
-  pass "positive context with negation word still normalizes to approve (NEG_RE not over-broad)"
+NEW12="$(cat "$F12")"
+if [[ "$RC" -eq 1 && "$NEW12" == "$ORIG12" ]]; then
+  pass "long sentence with embedded '承認' is judged 判定不能 under allowlist inversion (not approve)"
 else
-  fail "positive '問題はないため承認' should still normalize to approve — rc=$RC content=$(cat "$F12")"
+  fail "'重大な問題はないため承認' should NOT normalize to approve under allowlist design — rc=$RC content=$(cat "$F12")"
 fi
 
 echo ""
@@ -312,7 +319,7 @@ EOF
 python3 "$NORMALIZE" "$F16" >/tmp/test_normalize_stdout 2>&1
 RC=$?
 if [[ "$RC" -eq 0 ]] && grep -q '^\*\*Verdict:\*\* approve' "$F16"; then
-  pass "GO。ただし(付随情報) → HEDGE_RE が文をまたいで誤爆せず approve のまま (over-broad guard)"
+  pass "GO。ただし(付随情報) → 句点で区切られた unit だけを見るため誤爆せず approve のまま (allowlist でも regression なし)"
 else
   fail "GO。ただし(付随情報のみ) は approve のままであるべき — rc=$RC content=$(cat "$F16")"
 fi
@@ -340,6 +347,35 @@ if [[ "$T17_OK" -eq 1 ]]; then
   pass "NO-GO / 却下 / 要修正 / LGTM は引き続き正しく判定される (regression)"
 else
   fail "正当な NO-GO / 却下 / 要修正 / LGTM の判定に regression がある"
+fi
+
+echo ""
+echo "--- Test 18 (t011, QA t009 FINDING-A: 実測6件) — 未知の否定形は allowlist に無いため自動的に判定不能になる (NEG_RE の列挙不要) ---"
+T18_PHRASES=(
+  "GO は出せない"
+  "GO を出せません"
+  "承認は難しい"
+  "承認する段階にない"
+  "approve しかねる"
+  "GO とは判断しなかった"
+)
+T18_OK=1
+for phrase18 in "${T18_PHRASES[@]}"; do
+  F18="$TMPDIR_TEST/t18-$(echo "$phrase18" | tr -cd '[:alnum:]').md"
+  printf '# Plan Review: test-mission\n\n## 総合判定: %s\n' "$phrase18" > "$F18"
+  ORIG18="$(cat "$F18")"
+  python3 "$NORMALIZE" "$F18" >/tmp/test_normalize_stdout 2>&1
+  RC18=$?
+  NEW18="$(cat "$F18")"
+  if [[ "$RC18" -ne 1 || "$NEW18" != "$ORIG18" ]]; then
+    T18_OK=0
+    echo "    (FAIL) '$phrase18' → rc=$RC18 content=$(cat "$F18") (expected exit 1, unchanged)"
+  fi
+done
+if [[ "$T18_OK" -eq 1 ]]; then
+  pass "QA t009 FINDING-A の6件すべてが approve にならない (判定不能, exit 1)"
+else
+  fail "QA t009 FINDING-A の6件のいずれかが approve に化けている (allowlist 反転が機能していない)"
 fi
 
 echo ""

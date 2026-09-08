@@ -435,6 +435,89 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# [P1] (Seo review, PR#180 / t012): JSON 経路が「危険な値」の allowlist だった
+# ため、列挙外の severity ("major"/"medium" 等) や priority/severity が丸ごと
+# 欠損した finding が全て安全側 (自動 done) に落ちる fail-open 構造だった。
+# denylist へ反転した修正の回帰テスト。Seo の実測値 (severity="major"/"medium"
+# の組、severity/priority 欠損) をそのまま fixture 化している。
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- [P1]: 分類外 severity ('major'/'medium') → NEEDS-DIRECTOR相当 (旧実装は auto done, Seo実測値) ---"
+cat > "$FIXTURES_DIR/json_unclassified_severity.txt" <<'FIX'
+{"findings":[{"severity":"major","message":"a"},{"severity":"medium","message":"b"}],"overall_correctness":"patch has issues"}
+FIX
+write_task t163 "P1 json unclassified severity"
+out=$(FAKE_GH_HEAD_BRANCH="feature-branch" FAKE_CODEX_FIXTURE="$FIXTURES_DIR/json_unclassified_severity.txt" \
+  run_kai --pr 1 --task t163 --mission "$MISSION_SLUG" --dry-run 2>&1) && rc=0 || rc=$?
+if [[ $rc -eq 0 ]] && echo "$out" | grep -q "method=json needs_fix=1" && echo "$out" | grep -q "NEEDS-DIRECTOR相当"; then
+  pass "severity='major'/'medium' (denylist 外) → NEEDS-DIRECTOR相当 (P1 修正確認: allowlist→denylist 反転)"
+else
+  fail "REGRESSION (P1): unclassified severity ('major'/'medium') should judge as NEEDS-DIRECTOR, not auto-done — rc=$rc out=$out"
+fi
+
+echo ""
+echo "--- [P1]: priority/severity 欠損の finding → NEEDS-DIRECTOR相当 (旧実装は auto done, Seo実測値) ---"
+cat > "$FIXTURES_DIR/json_missing_classification.txt" <<'FIX'
+{"findings":[{"message":"something is wrong here but no priority or severity field"}],"overall_correctness":"patch has issues"}
+FIX
+write_task t164 "P1 json missing classification"
+out=$(FAKE_GH_HEAD_BRANCH="feature-branch" FAKE_CODEX_FIXTURE="$FIXTURES_DIR/json_missing_classification.txt" \
+  run_kai --pr 1 --task t164 --mission "$MISSION_SLUG" --dry-run 2>&1) && rc=0 || rc=$?
+if [[ $rc -eq 0 ]] && echo "$out" | grep -q "method=json needs_fix=1" && echo "$out" | grep -q "NEEDS-DIRECTOR相当"; then
+  pass "priority/severity 欠損 → NEEDS-DIRECTOR相当 (P1 修正確認: 分類不能は危険側に倒す)"
+else
+  fail "REGRESSION (P1): finding with missing priority/severity should judge as NEEDS-DIRECTOR — rc=$rc out=$out"
+fi
+
+echo ""
+echo "--- [P1]: 既知の安全値 (severity='low') は引き続き DONE相当 (denylist 反転後も安全値は通ること) ---"
+cat > "$FIXTURES_DIR/json_low_severity.txt" <<'FIX'
+{"findings":[{"severity":"low","message":"minor nit"}],"overall_correctness":"patch is correct"}
+FIX
+write_task t165 "P1 json low severity"
+out=$(FAKE_GH_HEAD_BRANCH="feature-branch" FAKE_CODEX_FIXTURE="$FIXTURES_DIR/json_low_severity.txt" \
+  run_kai --pr 1 --task t165 --mission "$MISSION_SLUG" --dry-run 2>&1) && rc=0 || rc=$?
+if [[ $rc -eq 0 ]] && echo "$out" | grep -q "method=json needs_fix=0" && echo "$out" | grep -q "DONE/LGTM相当"; then
+  pass "severity='low' (既知の安全値) → DONE相当 (denylist 反転後も安全値は正しく通る)"
+else
+  fail "REGRESSION (P1): known-safe severity='low' should still judge as DONE — rc=$rc out=$out"
+fi
+
+# ---------------------------------------------------------------------------
+# [P2] (Seo review, PR#180 / t012): mktemp 導入後は `-f "$OUTPUT_FILE"` チェックが
+# 到達不能になっていた (ファイルは常に存在するため)。`-s` (非空) 判定に変更した
+# 修正の回帰テスト。codex が exit 0 で終わったのに出力が空のままのケースを検証。
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- [P2]: codex が exit 0 だが出力ファイルが空のまま → NEEDS-DIRECTOR相当 (旧 '-f' 判定では検出不能だった) ---"
+: > "$FIXTURES_DIR/empty.txt"
+write_task t166 "P2 empty output file"
+out=$(FAKE_GH_HEAD_BRANCH="feature-branch" FAKE_CODEX_FIXTURE="$FIXTURES_DIR/empty.txt" \
+  run_kai --pr 1 --task t166 --mission "$MISSION_SLUG" --dry-run 2>&1) && rc=0 || rc=$?
+if [[ $rc -eq 1 ]] && echo "$out" | grep -q "produced no output"; then
+  pass "codex exit 0 + 空ファイル → needs-director相当 (P2 修正確認: -s 判定で検出できる)"
+else
+  fail "REGRESSION (P2): empty (but existing) output file should be detected as failure — rc=$rc out=$out"
+fi
+
+# ---------------------------------------------------------------------------
+# [P3] (Seo review, PR#180 / t012): call_needs_director の --dry-run ログ表示に、
+# 実際の plan.sh 呼び出し (call_needs_director 末尾の非 dry-run 分岐) には
+# 存在しない '--' 区切りが混ざっていた不整合の回帰テスト。この行は
+# fail_needs_director 経由の failure path (F4 のケース群) で必ず通る。
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- [P3]: --dry-run の needs-director ログに実呼び出しに無い '--' が混ざらないこと (gh 失敗パスで確認) ---"
+write_task t167 "P3 dry-run no stray dashes"
+out=$(FAKE_GH_FAIL=1 run_kai --pr 1 --task t167 --mission "$MISSION_SLUG" --dry-run 2>&1) && rc=0 || rc=$?
+if [[ $rc -eq 1 ]] \
+  && echo "$out" | grep -q "would call: plan.sh needs-director t167 --mission $MISSION_SLUG NEEDS FIX"; then
+  pass "dry-run ログに実呼び出しと同じ引数列 (余計な '--' 無し) が表示される (P3 修正確認)"
+else
+  fail "REGRESSION (P3): dry-run log should not contain a stray '--' before the reason — rc=$rc out=$out"
+fi
+
+# ---------------------------------------------------------------------------
 # F-2 (QA FAIL, PR#180): fork PR / マージ後に削除済みの branch を review できない
 # 欠陥の回帰テスト。fixture repo の feature-branch は Setup 1 で既に削除済みで
 # refs/pull/1/head 経由でしか到達できない状態になっている (実機再現: PR#179)。
@@ -570,7 +653,7 @@ echo "--- F4: output file 未生成 (codex は exit 0 だがファイルが無�
 write_task t123 "F4 no output"
 out=$(FAKE_GH_HEAD_BRANCH="feature-branch" FAKE_CODEX_EXIT=0 FAKE_CODEX_NO_OUTPUT=1 \
   run_kai --pr 1 --task t123 --mission "$MISSION_SLUG" --dry-run 2>&1) && rc=0 || rc=$?
-if [[ $rc -eq 1 ]] && echo "$out" | grep -q "would call: plan.sh needs-director t123 --mission $MISSION_SLUG" && echo "$out" | grep -q "produced no output file"; then
+if [[ $rc -eq 1 ]] && echo "$out" | grep -q "would call: plan.sh needs-director t123 --mission $MISSION_SLUG" && echo "$out" | grep -q "produced no output"; then
   pass "output file 未生成 → --mission $MISSION_SLUG 付きで needs-director 相当を呼ぶ (exit=1)"
 else
   fail "missing-output-file path should forward --mission — rc=$rc out=$out"

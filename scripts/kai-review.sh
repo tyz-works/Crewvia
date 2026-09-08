@@ -111,7 +111,10 @@ fi
 #   完走できなかった failure path 用。
 call_needs_director() {
   if [[ $DRY_RUN -eq 1 ]]; then
-    _info "[DRY-RUN] would call: plan.sh needs-director ${TASK_ID} ${MISSION_SLUG:+--mission ${MISSION_SLUG} }-- ${1}"
+    # P3 fix (PR#180 Seo review): 実呼び出し (下の行) には `--` 区切りが無いため、
+    # ここでも付けない。付けたままだと dry-run ログを見て手で再現しようとした際に
+    # 実際のコマンドと食い違う。
+    _info "[DRY-RUN] would call: plan.sh needs-director ${TASK_ID} ${MISSION_SLUG:+--mission ${MISSION_SLUG} }${1}"
     return 0
   fi
   "$PLAN_SH" needs-director "$TASK_ID" ${MISSION_SLUG:+--mission "$MISSION_SLUG"} "$1"
@@ -263,9 +266,14 @@ if [[ $CODEX_EXIT -ne 0 ]]; then
   fail_needs_director "CODEX FAILURE: exit=${CODEX_EXIT} — review not completed reliably"
 fi
 
-# --- 出力ファイル確認 ---
-if [[ ! -f "$OUTPUT_FILE" ]]; then
-  fail_needs_director "NEEDS FIX: codex review produced no output file (exit=${CODEX_EXIT})"
+# --- 出力ファイル確認 (P2 fix, PR#180 Seo review) ---
+# OUTPUT_FILE は F3 で mktemp 導入済みのため、`-f` (存在するか) だけでは
+# codex 実行前から既に true になっており、このチェックは原理的に発火しない
+# (到達不能な dead code だった)。`-s` (非空かどうか) に変えることで、
+# 「codex が exit 0 で終わったのにファイルが空/未書き込みのまま」という
+# 実際に起こり得るケースを検出できるようにする。
+if [[ ! -s "$OUTPUT_FILE" ]]; then
+  fail_needs_director "NEEDS FIX: codex review produced no output (file missing or empty, exit=${CODEX_EXIT})"
 fi
 
 REVIEW_CONTENT="$(cat "$OUTPUT_FILE")"
@@ -309,16 +317,33 @@ if FINDINGS_COUNT=$(echo "$REVIEW_CONTENT" | jq -e '.findings | length' 2>/dev/n
   HAD_SIGNAL=1
   HIGH_COUNT=0
   if [[ "$FINDINGS_COUNT" -gt 0 ]]; then
-    HIGH_COUNT=$(echo "$REVIEW_CONTENT" | jq '[
+    # denylist で判定する (P1 fix, PR#180 Seo review): 旧実装は「危険な値」の
+    # allowlist (priority 0/1/2, severity high/critical) だったため、列挙外の
+    # 値 (例: severity="major"/"medium") や priority/severity が丸ごと欠損した
+    # finding が全て安全側 (自動 done) に落ちる fail-open 構造だった。
+    # findings が 1 件でもある以上、「安全と確認できたものだけ」を安全とし、
+    # それ以外 (未知の値・分類不能・欠損・jq 自体の失敗) は全て危険側
+    # (NEEDS_FIX=1) に倒す。F-1 で採った「倒れる方向が自動承認である以上
+    # マージ前に塞ぐ」という判断基準を JSON 経路全体に適用する。
+    if HIGH_COUNT=$(echo "$REVIEW_CONTENT" | jq '[
         .findings[]
         | ((.priority // "") | tostring | ascii_downcase | ltrimstr("p")) as $pr
         | ((.severity // "") | tostring | ascii_downcase) as $sev
-        | select($pr == "0" or $pr == "1" or $pr == "2" or $sev == "high" or $sev == "critical")
-      ] | length' 2>/dev/null || echo 0)
-    HIGH_COUNT="${HIGH_COUNT:-0}"
+        | select(
+            ($pr == "" and $sev == "")
+            or ($pr != "" and $pr != "3")
+            or ($sev != "" and ($sev | IN("low", "info", "none") | not))
+          )
+      ] | length' 2>/dev/null); then
+      HIGH_COUNT="${HIGH_COUNT:-1}"
+    else
+      # jq 自体が失敗した場合も、findings>0 は既に確定しているので
+      # 安全側 (0) には倒さず危険側 (1 以上) に倒す。
+      HIGH_COUNT=1
+    fi
     [[ "$HIGH_COUNT" -gt 0 ]] && NEEDS_FIX=1
   fi
-  _info "Judged via structured JSON output (findings=${FINDINGS_COUNT}, high_or_critical=${HIGH_COUNT})"
+  _info "Judged via structured JSON output (findings=${FINDINGS_COUNT}, unsafe_or_unclassified=${HIGH_COUNT})"
 else
   P_TAGS="$(echo "$REVIEW_CONTENT" | grep -oiE '\[P[0-3]\]' | tr '[:upper:]' '[:lower:]' | sort -u || true)"
   if [[ -n "$P_TAGS" ]]; then

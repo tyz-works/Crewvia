@@ -24,20 +24,23 @@ set -euo pipefail
 #   3. plan.sh pull --task <task> --agent <agent> --skills codex-review
 #      → task.status: pending → in_progress + Taskvia PATCH + assignment file
 #      (--skip-pull / --dry-run 時はスキップ)
-#   4. gh pr view <PR#> --json headRefName で head branch 取得
-#   5. 対象 branch を origin から fetch → 専用 git worktree (mktemp -d) を
-#      --detach で作成し、そこで diff を確認する。主 working tree
-#      ($CREWVIA_REPO_ROOT) の HEAD は一切動かさない (F1/F1b, PR#180)
+#   4. gh pr view <PR#> --json headRefName で head branch 取得 (存在確認・ログ用)
+#   5. refs/pull/<PR#>/head を origin から一意な local ref に fetch し (F-2, PR#180 —
+#      fork PR や削除済み branch でも動く)、そこから専用 git worktree (mktemp -d) を
+#      --detach で作成し diff を確認する。主 working tree ($CREWVIA_REPO_ROOT) の
+#      HEAD は一切動かさない (F1/F1b, PR#180)
 #   6. codex exec -C <review-worktree> review --base main -m <model>
 #      -o <mktemp output file> を実行
-#   7. 出力ファイルを読み込み findings を判定 ([P1]/[P2]/[P3] タグ判定が主経路。
-#      JSON 構造化出力にも対応し、旧来の散文キーワード判定は critical 系の
-#      defense-in-depth として残す。詳細は「findings 判定」セクション参照)
+#   7. 出力ファイルを読み込み findings を判定 ([P0]/[P1]/[P2]/[P3] タグ判定が主経路。
+#      JSON 構造化出力にも対応し、構造化シグナルが一切得られない場合のみ、否定文脈
+#      (no/not/none 等) を除外した散文キーワード判定を safety net として使う
+#      (F-1/F-3, PR#180)。詳細は「findings 判定」セクション参照)
 #   8. findings なし / all-low(P3) → plan.sh done
-#      修正必要 (P1/P2 or critical keyword) → plan.sh needs-director
+#      修正必要 (P0/P1/P2 or critical keyword) → plan.sh needs-director
 #      (plan.sh done は Taskvia sync + registry.workers.yaml の task_count 自動 bump)
 #      --dry-run 時はどちらも実行せず、判定結果を表示するのみ
-#   9. レビュー用 worktree・出力/stderr の一時ファイルは trap で必ず後始末する
+#   9. レビュー用 worktree・fetch した一時 ref・出力/stderr の一時ファイルは
+#      trap で必ず後始末する
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -70,7 +73,7 @@ while [[ $# -gt 0 ]]; do
     --skip-pull)  SKIP_PULL=1;       shift 1 ;;
     --dry-run)    DRY_RUN=1;         shift 1 ;;
     -h|--help)
-      sed -n '3,40p' "$0" | sed 's/^# //'
+      sed -n '3,43p' "$0" | sed 's/^# //'
       exit 0
       ;;
     *)
@@ -120,13 +123,14 @@ fail_needs_director() {
   exit 1
 }
 
-# --- 一時リソースの後始末 (F1b/F3, PR#180) ---
-# レビュー用 worktree と出力/stderr の一時ファイルは、成功・失敗どちらの経路でも
-# 必ず削除する。REVIEW_WT はここで空文字初期化しておき、set -u 下でも
+# --- 一時リソースの後始末 (F1b/F2/F3, PR#180) ---
+# レビュー用 worktree・fetch した一時 local ref・出力/stderr の一時ファイルは、
+# 成功・失敗どちらの経路でも必ず削除する。ここで空文字初期化しておき、set -u 下でも
 # cleanup が安全に参照できるようにする。
 REVIEW_WT=""
 OUTPUT_FILE=""
 STDERR_FILE=""
+FETCH_LOCAL_REF=""
 
 cleanup() {
   if [[ -n "$OUTPUT_FILE" ]]; then
@@ -138,6 +142,9 @@ cleanup() {
   if [[ -n "$REVIEW_WT" && -d "$REVIEW_WT" ]]; then
     git -C "${WORK_DIR:-$REPO_ROOT}" worktree remove --force "$REVIEW_WT" 2>/dev/null \
       || rm -rf "$REVIEW_WT"
+  fi
+  if [[ -n "$FETCH_LOCAL_REF" ]]; then
+    git -C "${WORK_DIR:-$REPO_ROOT}" update-ref -d "$FETCH_LOCAL_REF" 2>/dev/null || true
   fi
 }
 trap cleanup EXIT
@@ -210,23 +217,28 @@ _info "PR#${PR_NUM} head branch: ${HEAD_BRANCH}"
 WORK_DIR="${CREWVIA_REPO_ROOT:-$REPO_ROOT}"
 _info "Repo root (unaffected by review): ${WORK_DIR}"
 
-# --- head branch を fetch ---
-# 旧実装は fetch 失敗時に「既存 local branch で続行」していたが、それこそが F1
-# (stale branch を review してしまう) の原因だった。fetch が失敗したら安全側に倒して
-# needs-director にする。
-_info "Fetching origin/${HEAD_BRANCH}..."
-if ! git -C "$WORK_DIR" fetch origin "$HEAD_BRANCH" 2>&1; then
-  fail_needs_director "NEEDS FIX: git fetch origin ${HEAD_BRANCH} failed for PR#${PR_NUM}"
+# --- PR の head commit を fetch (F-2, PR#180) ---
+# 旧実装は `git fetch origin "$HEAD_BRANCH"` + `origin/<branch>` を参照していたが、
+# これは headRefName が origin 上に生きているブランチであることが前提になる。
+# fork からの PR や、マージ後に削除済みの branch (実機再現: PR#179) では
+# `fatal: couldn't find remote ref ...` で必ず失敗する。
+# GitHub は PR がある限り `refs/pull/<PR#>/head` を必ず公開しているため、
+# こちらを直接 fetch する方式に変更する (fork PR・削除済み branch 双方で動く)。
+# fetch 先は $WORK_DIR (主リポジトリ) 内の一意な local ref に固定する:
+#   - FETCH_HEAD は $WORK_DIR 単位で共有される 1 ファイルなので、他プロセスが
+#     同時に fetch すると上書きされ得る (F1 で origin/<branch> に変更した際と同じ理由)。
+#   - PR番号を含む固定名だと同一 PR の同時 review で衝突し得るため $$ (PID) で一意化する。
+FETCH_LOCAL_REF="refs/kai-review-fetch/pr-${PR_NUM}-$$"
+_info "Fetching refs/pull/${PR_NUM}/head → ${FETCH_LOCAL_REF} ..."
+if ! git -C "$WORK_DIR" fetch --force origin "refs/pull/${PR_NUM}/head:${FETCH_LOCAL_REF}" 2>&1; then
+  fail_needs_director "NEEDS FIX: git fetch origin refs/pull/${PR_NUM}/head failed for PR#${PR_NUM}"
 fi
 
 # --- 専用 review worktree を作成 (F1/F1b, PR#180) ---
-# FETCH_HEAD ではなく origin/<branch> を使う: FETCH_HEAD は $WORK_DIR (主リポジトリ)
-# 単位で共有される 1 ファイルなので、他プロセスが同時に fetch すると上書きされ得る。
-# 直前の fetch で更新された remote-tracking ref を直接指す方が競合を避けられる。
 REVIEW_WT="$(mktemp -d "${TMPDIR:-/tmp}/kai-review-wt.XXXXXX")"
-_info "Creating isolated review worktree at ${REVIEW_WT} (detached at origin/${HEAD_BRANCH})..."
-if ! git -C "$WORK_DIR" worktree add --detach "$REVIEW_WT" "origin/${HEAD_BRANCH}" 2>&1; then
-  fail_needs_director "NEEDS FIX: git worktree add failed for PR#${PR_NUM} (${HEAD_BRANCH})"
+_info "Creating isolated review worktree at ${REVIEW_WT} (detached at ${FETCH_LOCAL_REF})..."
+if ! git -C "$WORK_DIR" worktree add --detach "$REVIEW_WT" "$FETCH_LOCAL_REF" 2>&1; then
+  fail_needs_director "NEEDS FIX: git worktree add failed for PR#${PR_NUM} (${FETCH_LOCAL_REF})"
 fi
 
 # --- 出力/stderr ファイル (F3, PR#180) ---
@@ -259,53 +271,80 @@ fi
 REVIEW_CONTENT="$(cat "$OUTPUT_FILE")"
 _info "Review output length: ${#REVIEW_CONTENT} chars"
 
-# --- findings 判定 (F2, PR#180) ---
+# --- findings 判定 (F2, PR#180 / F-1, F-3, PR#180 QA fix) ---
 # 判定方針 (2026-09-08 現物確認: codex-cli 0.144.5 の `codex exec review`):
 #   実際の出力は JSON ではなく自然文 + Markdown 箇条書きだった。finding がある場合は
-#   各行に `- [P1]` / `- [P2]` / `- [P3]` という優先度タグが付き、finding が無い場合は
-#   タグなしの説明文のみで、"LGTM" 等のキーワードは一切出ない (現物例は knowledge/codex-reviewer.md
-#   および本 task の Result 参照)。
+#   各行に `- [P0]` / `- [P1]` / `- [P2]` / `- [P3]` という優先度タグが付き、finding が
+#   無い場合はタグなしの説明文のみで、"LGTM" 等のキーワードは一切出ない (現物例は
+#   knowledge/codex-reviewer.md および本 task の Result 参照)。
 #   旧ロジックの「明示的 LGTM キーワードが無ければ needs-director」というルールは、
 #   clean な review でも LGTM と言わないため常に発火してしまう既知バグ (F2 そのもの) だったため、
-#   このルールは廃止し [P#] タグの有無で判定する。critical 系キーワードは
-#   defense-in-depth として引き続き検出し、tag 判定の結果を上書きできるようにする。
+#   このルールは廃止し [P#] タグの有無で判定する。
 #   将来 / 別環境の codex CLI が構造化 JSON ({"findings":[...], ...}) を返すケースに備え、
 #   JSON 判定を最優先で試す (forward-compat パス。現行 CLI では通らない想定)。
+#
+#   F-1 (P0 抜け, QA FAIL): タグ抽出が `[P1-3]` のみで P0 を拾わず、[P0] だけの
+#   findings が LGTM 誤判定 (自動 done) されていた。レビューゲートが「危険な方向
+#   (自動承認)」に倒れる欠陥のため、P0 もタグ抽出・JSON priority 判定の両方に含める。
+#
+#   F-3 (critical keyword 誤発火, QA FAIL): 旧ロジックは critical 系キーワードを
+#   タグ/JSON 判定の結果によらず常に上書き適用していたため、"No critical issues
+#   found." のような**否定文脈の健全な報告文**まで拾って clean な review を
+#   needs-director に誤発火させ、F2 の目的 (誤 needs-director を減らす) を部分的に
+#   打ち消していた。対応 (t008 Description の一案を採用): (a) JSON 判定が成功した場合、
+#   または [P#] タグが 1 つでも見つかった場合は、それらの判定に自信があるとみなし
+#   keyword fallback を一切適用しない (HAD_SIGNAL=1)。(b) [P#] タグが 1 つも
+#   見つからなかった場合のみ、critical キーワードを safety net として見る
+#   (HAD_SIGNAL=0 のまま) — この「タグ不在」の状況こそ、コード側の判定材料が
+#   無いためキーワードに頼らざるを得ないケースであり、かつ QA の再現例 3 件が
+#   まさにこの経路 (タグ無し・散文のみ) で誤爆していたため。同一行に
+#   no/not/none/nothing/without/clean/zero 等の否定語が同居する行は「~の問題は
+#   無い」という健全な報告と判断し除外する。
 NEEDS_FIX=0
 JUDGE_METHOD="tags"
+HAD_SIGNAL=0
 
 if FINDINGS_COUNT=$(echo "$REVIEW_CONTENT" | jq -e '.findings | length' 2>/dev/null); then
   JUDGE_METHOD="json"
+  HAD_SIGNAL=1
   HIGH_COUNT=0
   if [[ "$FINDINGS_COUNT" -gt 0 ]]; then
     HIGH_COUNT=$(echo "$REVIEW_CONTENT" | jq '[
         .findings[]
         | ((.priority // "") | tostring | ascii_downcase | ltrimstr("p")) as $pr
         | ((.severity // "") | tostring | ascii_downcase) as $sev
-        | select($pr == "1" or $pr == "2" or $sev == "high" or $sev == "critical")
+        | select($pr == "0" or $pr == "1" or $pr == "2" or $sev == "high" or $sev == "critical")
       ] | length' 2>/dev/null || echo 0)
     HIGH_COUNT="${HIGH_COUNT:-0}"
     [[ "$HIGH_COUNT" -gt 0 ]] && NEEDS_FIX=1
   fi
   _info "Judged via structured JSON output (findings=${FINDINGS_COUNT}, high_or_critical=${HIGH_COUNT})"
 else
-  P_TAGS="$(echo "$REVIEW_CONTENT" | grep -oiE '\[P[1-3]\]' | tr '[:upper:]' '[:lower:]' | sort -u || true)"
+  P_TAGS="$(echo "$REVIEW_CONTENT" | grep -oiE '\[P[0-3]\]' | tr '[:upper:]' '[:lower:]' | sort -u || true)"
   if [[ -n "$P_TAGS" ]]; then
-    if echo "$P_TAGS" | grep -qE '\[p[12]\]'; then
+    HAD_SIGNAL=1
+    if echo "$P_TAGS" | grep -qE '\[p[012]\]'; then
       NEEDS_FIX=1
     fi
     _info "Judged via [P#] priority tags: $(echo "$P_TAGS" | tr '\n' ' ')"
   else
-    _info "No [P#] tags found in review output — treating as clean (no findings reported)"
+    # タグが 1 つも無い場合は HAD_SIGNAL=0 のままにし、後段の critical キーワード
+    # safety net を働かせる (F-3)。ほとんどの clean review はここに来るが、
+    # 否定語同居行を除外する判定と組み合わせることで誤発火を防ぐ。
+    _info "No [P#] tags found in review output — treating as clean unless a critical keyword safety net fires"
   fi
 fi
 
-# 散文キーワード fallback: critical 系キーワードは常に defense-in-depth として上書きする
-if echo "$REVIEW_CONTENT" | grep -qiE 'critical|high severity|security vulnerability|must fix|must be fixed|breaking change|data loss'; then
-  if [[ $NEEDS_FIX -eq 0 ]]; then
-    _warn "Critical keyword found in review output — overriding to needs-director as a safety net"
+# 散文キーワード fallback (F-3): 構造化シグナルが一切得られなかった場合のみの
+# safety net。かつ同一行に否定語が同居する場合は健全な報告文として除外する。
+if [[ $HAD_SIGNAL -eq 0 ]]; then
+  CRITICAL_PATTERN='critical|high severity|security vulnerability|must fix|must be fixed|breaking change|data loss'
+  NEGATION_PATTERN='\bno\b|\bnot\b|n'"'"'t\b|\bnone\b|\bnothing\b|\bwithout\b|\bclean\b|\bzero\b'
+  CRIT_LINES="$(echo "$REVIEW_CONTENT" | grep -iE "$CRITICAL_PATTERN" | grep -viE "$NEGATION_PATTERN" || true)"
+  if [[ -n "$CRIT_LINES" ]]; then
+    _warn "Critical keyword found (without negation) in review output — treating as needs-director as a safety net"
+    NEEDS_FIX=1
   fi
-  NEEDS_FIX=1
 fi
 
 # レビュー内容が空 or 極端に短い場合は要確認

@@ -71,7 +71,17 @@ git -C "$UPSTREAM" checkout -q -b feature-branch
 echo "feature change" >> "$UPSTREAM/README.md"
 git -C "$UPSTREAM" commit -q -am "feature commit"
 FEATURE_TIP="$(git -C "$UPSTREAM" rev-parse feature-branch)"
+
+# F-2 (PR#180 QA fix): GitHub は PR が存在する限り refs/pull/<PR#>/head を必ず
+# 公開する。ここでは refs/pull/1/head と refs/pull/2/head (F3 並列テストの 2 本目
+# 用) を作ってから feature-branch そのものは削除し、「fork PR / マージ後に
+# 削除済みの branch」を模す (実機再現: PR#179)。kai-review.sh がもう
+# origin/<branch> 名を一切参照しないこと (常に refs/pull/<PR#>/head を fetch
+# すること) を、この状態でレビューが成功することによって検証する。
+git -C "$UPSTREAM" update-ref refs/pull/1/head feature-branch
+git -C "$UPSTREAM" update-ref refs/pull/2/head feature-branch
 git -C "$UPSTREAM" checkout -q main
+git -C "$UPSTREAM" branch -D feature-branch >/dev/null
 
 git clone -q "$UPSTREAM" "$FIXTURE_REPO"
 git -C "$FIXTURE_REPO" config user.email test@example.com
@@ -204,10 +214,18 @@ run_kai() {
 #                       `bash scripts/kai-review.sh --pr 175 --task t001 --dry-run`
 #                       を実行した際に、実際の codex-cli 0.144.5 が書き出した
 #                       出力ファイル ($OUTPUT_FILE) の内容そのもの。
-#   json_*.txt / prose_critical_no_tag.txt — 現行 codex-cli (0.144.5) では
-#                       再現できない仮想シナリオ (JSON forward-compat パス /
-#                       タグ無し critical キーワードの safety net) を検証する
-#                       ための意図的な合成 fixture。実測ではない。
+#   json_*.txt / prose_critical_no_tag.txt / tag_and_critical_keyword.txt —
+#                       現行 codex-cli (0.144.5) では再現できない仮想シナリオ
+#                       (JSON forward-compat パス / critical キーワードの
+#                       safety net・上書き非適用の確認) を検証するための
+#                       意図的な合成 fixture。実測ではない。
+#   p0_findings.txt   — 合成 fixture。実機で codex が [P0] を出す場面は
+#                       t008 時点で未観測 (潜在バグ) だが、実際の出力書式
+#                       (`- [P#] タイトル — file:line` + 本文) を模して
+#                       F-1 (P0 抜けバグ) を検証する。
+#   f3_repro_*.txt    — t008 (QA FAIL) の Description に記載された F-3 の
+#                       再現例 3 件をそのまま fixture 化したもの (QA が実機で
+#                       観測した誤発火パターン)。
 # ---------------------------------------------------------------------------
 FIXTURES_DIR="$TMPDIR_TEST/fixtures"
 mkdir -p "$FIXTURES_DIR"
@@ -238,7 +256,35 @@ cat > "$FIXTURES_DIR/json_p1.txt" <<'FIX'
 FIX
 
 cat > "$FIXTURES_DIR/prose_critical_no_tag.txt" <<'FIX'
-This change introduces a critical security vulnerability in the auth flow, but no priority tag was attached to this comment.
+This change introduces a critical security vulnerability in the auth flow.
+FIX
+
+# p0_findings.txt: 合成 fixture。t008 (QA FAIL 対応) の Description に記載の通り、
+# 実機で codex が [P0] を出す場面は現時点で未観測 (潜在バグ) だが、タグ抽出の
+# 正規表現が [P0] を拾い落とすと「危険な方向 (自動承認)」に倒れるため、実際の
+# codex 出力書式 (`- [P#] タイトル — file:line` + 本文) を模して検証する。
+cat > "$FIXTURES_DIR/p0_findings.txt" <<'FIX'
+This introduces a release-blocking defect that must be caught before merge.
+
+Review comment:
+
+- [P0] Data loss on concurrent writes — scripts/example.sh:42
+  Two workers writing to the same file without locking will silently corrupt state, losing previously written data. This must be fixed before merge.
+FIX
+
+# F-3 (QA FAIL 再現, PR#180): t008 Description に記載された 3 つの再現例そのもの。
+# いずれも [P#] タグの無い「否定文脈の健全な報告文」であり、旧ロジックでは
+# critical キーワード fallback がここに誤爆して needs-director になっていた。
+cat > "$FIXTURES_DIR/f3_repro_no_critical_issues.txt" <<'FIX'
+No critical issues found. The change looks good.
+FIX
+
+cat > "$FIXTURES_DIR/f3_repro_no_security_vuln.txt" <<'FIX'
+This is a clean patch with no security vulnerability.
+FIX
+
+cat > "$FIXTURES_DIR/f3_repro_nothing_must_be_fixed.txt" <<'FIX'
+Overall LGTM, nothing must be fixed.
 FIX
 
 # ---------------------------------------------------------------------------
@@ -344,6 +390,145 @@ if [[ $rc111 -eq 0 && "$st111" == "needs_director" ]] && grep -q "NEEDS FIX" "$T
   pass "P1 findings fixture → 実行後 status=needs_director, Result に NEEDS FIX 記載"
 else
   fail "p1_findings real-run should set status=needs_director — rc=$rc111 status=$st111 (see $TMPDIR_TEST/t111.out)"
+fi
+
+# ---------------------------------------------------------------------------
+# F-1 (QA FAIL, PR#180): [P0] findings が LGTM 誤判定されていた欠陥の回帰テスト。
+# レビューゲートが「危険な方向 (自動承認)」に倒れる欠陥だったため、これが最重要。
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- F-1 [最重要]: [P0] findings のみ → NEEDS-DIRECTOR相当になること (旧実装は自動 done していた) ---"
+write_task t160 "F-1 p0 findings"
+out=$(FAKE_GH_HEAD_BRANCH="feature-branch" FAKE_CODEX_FIXTURE="$FIXTURES_DIR/p0_findings.txt" \
+  run_kai --pr 1 --task t160 --mission "$MISSION_SLUG" --dry-run 2>&1) && rc=0 || rc=$?
+if [[ $rc -eq 0 ]] && echo "$out" | grep -q "method=tags needs_fix=1" && echo "$out" | grep -q "NEEDS-DIRECTOR相当"; then
+  pass "[P0] のみの finding → method=tags, NEEDS-DIRECTOR相当 (F-1 修正確認)"
+else
+  fail "REGRESSION (F-1): [P0]-only finding should judge as NEEDS-DIRECTOR, not auto-done — rc=$rc out=$out"
+fi
+
+echo ""
+echo "--- F-1 (実行系): [P0] findings → 実際に plan.sh needs-director が呼ばれ status=needs_director になる ---"
+write_task_in_progress t161 "F-1 p0 real needs-director"
+FAKE_GH_HEAD_BRANCH="feature-branch" FAKE_CODEX_FIXTURE="$FIXTURES_DIR/p0_findings.txt" \
+  run_kai --pr 1 --task t161 --mission "$MISSION_SLUG" --skip-pull > "$TMPDIR_TEST/t161.out" 2>&1
+rc161=$?
+st161="$(task_status t161)"
+if [[ $rc161 -eq 0 && "$st161" == "needs_director" ]]; then
+  pass "[P0] finding (実行系) → 実際に status=needs_director になる (旧実装なら誤って done になっていた)"
+else
+  fail "REGRESSION (F-1): [P0]-only finding real-run should set status=needs_director — rc=$rc161 status=$st161"
+fi
+
+echo ""
+echo "--- F-1: JSON 経路でも priority:0 が needs-director になること ---"
+cat > "$FIXTURES_DIR/json_p0.txt" <<'FIX'
+{"findings":[{"title":"boom","body":"data loss on crash","priority":0}],"overall_correctness":"patch has issues"}
+FIX
+write_task t162 "F-1 json p0"
+out=$(FAKE_GH_HEAD_BRANCH="feature-branch" FAKE_CODEX_FIXTURE="$FIXTURES_DIR/json_p0.txt" \
+  run_kai --pr 1 --task t162 --mission "$MISSION_SLUG" --dry-run 2>&1) && rc=0 || rc=$?
+if [[ $rc -eq 0 ]] && echo "$out" | grep -q "method=json needs_fix=1" && echo "$out" | grep -q "NEEDS-DIRECTOR相当"; then
+  pass "JSON priority:0 finding → method=json, NEEDS-DIRECTOR相当 (F-1 JSON 経路修正確認)"
+else
+  fail "REGRESSION (F-1 JSON path): priority:0 finding should judge as NEEDS-DIRECTOR — rc=$rc out=$out"
+fi
+
+# ---------------------------------------------------------------------------
+# F-2 (QA FAIL, PR#180): fork PR / マージ後に削除済みの branch を review できない
+# 欠陥の回帰テスト。fixture repo の feature-branch は Setup 1 で既に削除済みで
+# refs/pull/1/head 経由でしか到達できない状態になっている (実機再現: PR#179)。
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- F-2: origin に branch が存在しなくても refs/pull/<PR#>/head 経由でレビューできる ---"
+# Setup 1 で `git -C "$UPSTREAM" branch -D feature-branch` 済み。
+# origin/feature-branch が存在しないことをまず確認する (前提条件のセルフチェック)。
+if git -C "$FIXTURE_REPO" rev-parse --verify -q "origin/feature-branch" >/dev/null 2>&1; then
+  fail "test precondition broken: origin/feature-branch should NOT exist (branch was deleted in Setup 1)"
+else
+  pass "前提確認: origin/feature-branch は存在しない (branch 削除済みを確認)"
+fi
+
+write_task t170 "F-2 deleted branch"
+out=$(FAKE_GH_HEAD_BRANCH="feature-branch" FAKE_CODEX_FIXTURE="$FIXTURES_DIR/clean.txt" \
+  run_kai --pr 1 --task t170 --mission "$MISSION_SLUG" --dry-run 2>&1) && rc=0 || rc=$?
+if [[ $rc -eq 0 ]] && echo "$out" | grep -q "DONE/LGTM相当"; then
+  pass "origin に branch が無くても refs/pull/1/head 経由でレビュー成功 (F-2 修正確認)"
+else
+  fail "REGRESSION (F-2): review should succeed via refs/pull/<PR#>/head even without origin branch — rc=$rc out=$out"
+fi
+
+echo ""
+echo "--- F-2: refs/pull/<PR#>/head の fetch に使った一時 local ref が後片付けされる ---"
+leftover_refs="$(git -C "$FIXTURE_REPO" for-each-ref refs/kai-review-fetch/ 2>/dev/null)"
+if [[ -z "$leftover_refs" ]]; then
+  pass "refs/kai-review-fetch/* に後片付け漏れなし"
+else
+  fail "leftover refs found under refs/kai-review-fetch/: $leftover_refs"
+fi
+
+# ---------------------------------------------------------------------------
+# F-3 (QA FAIL, PR#180): critical キーワード fallback が否定文脈を拾い、clean な
+# review を誤って needs-director にしていた欠陥の回帰テスト。t008 Description の
+# 再現例 3 件すべてが DONE 相当 (誤 needs-director にならない) ことを検証する。
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- F-3: 'No critical issues found. The change looks good.' → DONE相当 (旧実装は誤 needs-director) ---"
+write_task t180 "F-3 repro 1"
+out=$(FAKE_GH_HEAD_BRANCH="feature-branch" FAKE_CODEX_FIXTURE="$FIXTURES_DIR/f3_repro_no_critical_issues.txt" \
+  run_kai --pr 1 --task t180 --mission "$MISSION_SLUG" --dry-run 2>&1) && rc=0 || rc=$?
+if [[ $rc -eq 0 ]] && echo "$out" | grep -q "DONE/LGTM相当"; then
+  pass "'No critical issues found...' → DONE相当 (F-3 修正確認: 否定文脈は誤爆しない)"
+else
+  fail "REGRESSION (F-3): negated 'critical' phrase should NOT trigger needs-director — rc=$rc out=$out"
+fi
+
+echo ""
+echo "--- F-3: 'This is a clean patch with no security vulnerability.' → DONE相当 ---"
+write_task t181 "F-3 repro 2"
+out=$(FAKE_GH_HEAD_BRANCH="feature-branch" FAKE_CODEX_FIXTURE="$FIXTURES_DIR/f3_repro_no_security_vuln.txt" \
+  run_kai --pr 1 --task t181 --mission "$MISSION_SLUG" --dry-run 2>&1) && rc=0 || rc=$?
+if [[ $rc -eq 0 ]] && echo "$out" | grep -q "DONE/LGTM相当"; then
+  pass "'...no security vulnerability.' → DONE相当 (F-3 修正確認)"
+else
+  fail "REGRESSION (F-3): negated 'security vulnerability' phrase should NOT trigger needs-director — rc=$rc out=$out"
+fi
+
+echo ""
+echo "--- F-3: 'Overall LGTM, nothing must be fixed.' → DONE相当 ---"
+write_task t182 "F-3 repro 3"
+out=$(FAKE_GH_HEAD_BRANCH="feature-branch" FAKE_CODEX_FIXTURE="$FIXTURES_DIR/f3_repro_nothing_must_be_fixed.txt" \
+  run_kai --pr 1 --task t182 --mission "$MISSION_SLUG" --dry-run 2>&1) && rc=0 || rc=$?
+if [[ $rc -eq 0 ]] && echo "$out" | grep -q "DONE/LGTM相当"; then
+  pass "'...nothing must be fixed.' → DONE相当 (F-3 修正確認)"
+else
+  fail "REGRESSION (F-3): negated 'must be fixed' phrase should NOT trigger needs-director — rc=$rc out=$out"
+fi
+
+echo ""
+echo "--- F-3: 否定語を伴わない本物の critical キーワードは引き続き needs-director になる (安全弁の健全性確認) ---"
+write_task t183 "F-3 genuine critical"
+out=$(FAKE_GH_HEAD_BRANCH="feature-branch" FAKE_CODEX_FIXTURE="$FIXTURES_DIR/prose_critical_no_tag.txt" \
+  run_kai --pr 1 --task t183 --mission "$MISSION_SLUG" --dry-run 2>&1) && rc=0 || rc=$?
+if [[ $rc -eq 0 ]] && echo "$out" | grep -q "NEEDS-DIRECTOR相当"; then
+  pass "否定語なしの genuine critical キーワード → 引き続き NEEDS-DIRECTOR相当 (safety net は生きている)"
+else
+  fail "genuine critical keyword (no negation) should still trigger NEEDS-DIRECTOR — rc=$rc out=$out"
+fi
+
+echo ""
+echo "--- F-3: [P#] タグがあれば critical キーワードの有無に関わらずタグ判定を信頼する ---"
+cat > "$FIXTURES_DIR/tag_and_critical_keyword.txt" <<'FIX'
+- [P3] Minor nit — foo.sh:1
+  This is a very minor style nit and not a critical issue at all.
+FIX
+write_task t184 "F-3 tag trusted over keyword"
+out=$(FAKE_GH_HEAD_BRANCH="feature-branch" FAKE_CODEX_FIXTURE="$FIXTURES_DIR/tag_and_critical_keyword.txt" \
+  run_kai --pr 1 --task t184 --mission "$MISSION_SLUG" --dry-run 2>&1) && rc=0 || rc=$?
+if [[ $rc -eq 0 ]] && echo "$out" | grep -q "method=tags needs_fix=0" && echo "$out" | grep -q "DONE/LGTM相当"; then
+  pass "[P3] タグのみ (critical という単語を含むが否定文脈) → タグ判定を信頼し DONE相当 (keyword fallback は適用されない)"
+else
+  fail "when a tag is present, keyword fallback should not override — rc=$rc out=$out"
 fi
 
 # ---------------------------------------------------------------------------

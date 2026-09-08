@@ -258,6 +258,140 @@ if { [ "$TOOL_NAME" = "Edit" ] || [ "$TOOL_NAME" = "Write" ] || [ "$TOOL_NAME" =
   fi
 fi
 
+# --- Task file direct-write guard: Bash 経由の task ファイル書き込みを防ぐ (t015) ---
+# 背景: t004 で review skill の Worker (review/research/verify/planning は
+# config/skill-permissions.yaml で Edit/Write/MultiEdit を deny されており、
+# ファイルを書く手段が Bash しか無い) が Result を
+# `cat >> queue/missions/<slug>/tasks/t004.md <<'EOF' ... EOF` で書き込もうとして
+# ハングした (CPU は回っていたが 42 分間無応答)。過去にも research skill Worker が
+# 同じパターンで 9 分以上ハングした記録がある (再発)。
+#
+# 根本原因は plan.sh を経由せず task ファイルを直接シェルリダイレクトで書こうと
+# したこと自体にある。cmd_done は result を build_task_body 経由で body に
+# 書くだけで frontmatter には触れないため、`plan.sh done <task_id> "<全文>"` に
+# 複数行を渡すのは完全に安全 (1 行制約が必要なのは `needs-director` の reason
+# だけ)。つまり task ファイルへの直接書き込みには正規の用途が存在しない。
+#
+# 対象: TOOL_NAME=Bash の COMMAND が、以下のいずれかの書き込み系構文で
+#   `queue/missions/**/tasks/*.md` を対象にしている場合のみ deny する
+#   - `>` / `>>` によるリダイレクト (heredoc と組み合わせた `cat >> file <<EOF` /
+#     `cat <<EOF > file` のどちらの語順でも、最終的にリダイレクト演算子の直後に
+#     パスが来る点は変わらないため、この 1 パターンで両方を捕捉できる)
+#   - `sed -i`
+#   - `tee`
+# t011/t014 の worktree edit guard と同じ配置・crash guard 作法 (skill チェック
+# より前、emit_decision "deny" + exit 0) に従う。Director はこの関数より前の
+# role チェックで既に exit 済みのため対象外 (t011/t014 と同じ前提)。
+#
+# ★ スコープを意図的に絞っている: heredoc 自体はテストスクリプト作成等で
+#   正当に使われるため、対象は「queue/missions/**/tasks/*.md への書き込み」
+#   のみに限定する。他の heredoc / リダイレクトは一切対象にしない。
+# ★ plan.sh 自身の書き込みは対象外: plan.sh は task ファイルを Python の
+#   open()/write() で書いており、シェルリダイレクト構文を一切使わないため、
+#   `./scripts/plan.sh done ...` のようなコマンド文字列はそもそもこのパターンに
+#   マッチしない (誤検知しない)。
+# ★ 既知の残存リスク (worker.md に明記する): `cd queue/missions/<slug> && sed -i
+#   ... tasks/t001.md` のように相対パスの先頭に `queue/missions/` が現れない
+#   形、変数展開 (`F=queue/missions/.../t001.md; cat >> "$F"`)、`dd of=...`、
+#   `python3 -c "open('...').write(...)"` はシェルの cwd/変数状態を追跡したり
+#   コマンドの意味を解釈したりしないため、このガードでは捕捉できない (t019:
+#   Seo 最終レビューで実測)。t011/t014 の Bash 経由書き込みと同様、
+#   ツールベースの構造的ガードは「最終防波堤」であり、worker.md の明文化
+#   (Result は plan.sh 経由) が一次防御である前提は変わらない。
+#
+# t019 (Seo/Opus 5 最終レビュー [P2]) での修正: 上記 3 つの grep はコマンド
+# 文字列全体を対象にしているため、リダイレクトが実際のリダイレクトなのか
+# クォート内の引用テキストなのかを区別できず、`./scripts/plan.sh done t017
+# "原因は cat >> queue/missions/.../t004.md の heredoc"` や `gh pr comment
+# 183 --body "guard blocks: cat >> queue/missions/.../t004.md"` のように
+# 該当パスを**報告のために引用しただけ**のコマンドまで deny していた (本イン
+# シデントを Result / PR コメントで報告しようとする行為そのものが deny され
+# る自己矛盾)。
+#
+# 対策: シングル/ダブルクォートで囲まれた区間を除去した「クォート除去後の
+# コマンド文字列」に対して判定する。これにより引用テキストの中に現れる
+# `>>`/`sed -i`/`tee` は判定対象から外れる。
+#
+# ただし「先頭トークンが plan.sh / gh なら丸ごとスキップ」という素朴な除外は
+# 採用しない — その除外文字列がコマンドのどこかに含まれていれば良い
+# (glob `*plan.sh\ *` は先頭以外にもマッチする) ため、
+# `X; ./scripts/plan.sh --help; cat >> queue/missions/.../t004.md <<EOF`
+# のような compound command で偽装すればガードを丸ごと迂回できてしまう
+# (Director 指摘)。代わりに「クォート除去が安全と判断できる場合に限り
+# クォート除去後の文字列で判定し、そうでなければ常に元の $COMMAND 全体を
+# 判定する (= 何もしなければ従来どおり検出できる、フェイルセーフな設計)」
+# という方式にする。安全と判断できないケース (= 常に元の $COMMAND で判定):
+#   - `$(...)` / `` `...` `` (コマンド置換) を含む場合: クォート内であって
+#     も実際にシェルへ渡されて実行されるため、除去すると置換内部の本物の
+#     書き込みコマンドを見逃してしまう (=検出漏れ)。したがって除去自体を
+#     行わない。
+#   - クォート除去後もなお `;` `&&` `||` `|` が残っている場合: これらは元々
+#     クォートの外側にあった実際の制御演算子であり、compound command で
+#     偽装した別コマンドが続いている可能性がある。したがってこの場合も
+#     除去した文字列は使わず、元の $COMMAND 全体で判定する
+#     (`X; ./scripts/plan.sh --help; cat >> .../t004.md <<EOF` は
+#     `;` が残るため除去版は使われず、元の $COMMAND に対する grep が
+#     `cat >> .../t004.md` を検出して deny する)。
+#
+# t023 (Seo/Opus 5 再レビュー [P2]) での追加修正: 上の「いずれの場合も除去
+# しないだけなので新たな見逃しは生まれない」という当初の想定は誤りだった。
+# `cat >> "queue/missions/m1/tasks/t004.md" <<EOF` のように**パス自体を
+# クォートで囲む**ごく自然な書き方は、`$(...)` も制御演算子も含まないため
+# フェイルセーフ分岐に入らず、クォート除去版がそのまま判定に使われる。
+# するとクォートで囲まれた本物のパスがクォートごと丸ごと消え、判定から
+# 抜け落ちてしまう (t004 の再発防止という本来の目的に対して最も素直な書き方
+# が抜ける、という Seo 実測による指摘。元の 3 つの grep が `['"]?` を持って
+# クォート付きパスを明示的に想定していたのに、その想定を一括除去が壊した形)。
+#
+# 対策: 一括除去の**前に**、「クォート区間の中身が丸ごと task ファイルパスと
+# 一致する場合に限り」そのクォートだけを外す (中身は残す) 前処理を挟む。
+# 散文 (`"原因は cat >> .../t004.md の heredoc"` 等) はパスの前後に他の語を
+# 含むため `^パスだけ$` に一致せずクォートが外れない → 続く一括除去で丸ごと
+# 消える (t019 の誤 deny 修正は維持)。一方 `cat >> "queue/missions/.../t004.md"`
+# のようにクォートの中身がパスそのものである場合は、このクォートだけが先に
+# 外れてパスが裸のテキストとして残るため、続く一括除去の対象にならず生き残る
+# (Seo が実測で 10 ケース全通過を確認済みの方式)。
+if [ "$TOOL_NAME" = "Bash" ] && [ -n "$COMMAND" ]; then
+  _QM_CHECK_CMD="$COMMAND"
+  case "$COMMAND" in
+    *'$('*|*'`'*)
+      : # コマンド置換あり → クォート除去は行わず元の $COMMAND のまま判定
+      ;;
+    *)
+      # クォート区間の中身が丸ごと task ファイルパスに一致する場合のみ、
+      # そのクォートだけを剥がす (中身のパスは残す)。sed の区切り文字は
+      # パスに `/` を含むため `@` を使う。
+      _QM_PATH_RE='[A-Za-z0-9_./-]*queue/missions/[A-Za-z0-9_.-]+/tasks/[A-Za-z0-9_-]+\.md'
+      _CMD_UNQUOTE_PATH="$(printf '%s' "$COMMAND" | sed -E \
+        "s@'(${_QM_PATH_RE})'@\1@g; s@\"(${_QM_PATH_RE})\"@\1@g")"
+      _CMD_NO_QUOTES="$(printf '%s' "$_CMD_UNQUOTE_PATH" | sed "s/'[^']*'//g; s/\"[^\"]*\"//g")"
+      case "$_CMD_NO_QUOTES" in
+        *';'*|*'&&'*|*'||'*|*'|'*)
+          : # クォート除去後も制御演算子が残る (=元からクォート外) →
+          #   compound command の可能性があるため元の $COMMAND のまま判定
+          ;;
+        *)
+          _QM_CHECK_CMD="$_CMD_NO_QUOTES"
+          ;;
+      esac
+      ;;
+  esac
+
+  _TASK_FILE_WRITE=0
+  if echo "$_QM_CHECK_CMD" | grep -qE '>{1,2}[[:space:]]*['"'"'\"]?[A-Za-z0-9_./-]*queue/missions/[A-Za-z0-9_.-]+/tasks/[A-Za-z0-9_-]+\.md'; then
+    _TASK_FILE_WRITE=1
+  elif echo "$_QM_CHECK_CMD" | grep -qE 'sed[[:space:]]+-i[^|;&]*queue/missions/[A-Za-z0-9_.-]+/tasks/[A-Za-z0-9_-]+\.md'; then
+    _TASK_FILE_WRITE=1
+  elif echo "$_QM_CHECK_CMD" | grep -qE '\btee\b[^|;&]*queue/missions/[A-Za-z0-9_.-]+/tasks/[A-Za-z0-9_-]+\.md'; then
+    _TASK_FILE_WRITE=1
+  fi
+  if [ "$_TASK_FILE_WRITE" = "1" ]; then
+    echo "[pre-tool-use] 🚫 task file direct write blocked: $(echo "$COMMAND" | head -c 200)" >&2
+    emit_decision "deny" "task ファイル (queue/missions/**/tasks/*.md) への直接書き込みは禁止されています (過去に heredoc がハングした事故が複数回あります)。'./scripts/plan.sh done <task_id> \"<Result全文>\"' で記録してください (複数行可。1行制約が必要なのは needs-director の reason だけです)。"
+    exit 0
+  fi
+fi
+
 # --- Skill-based permission check ---
 _SKILL_PERMS_YAML="${_CREWVIA_REPO}/config/skill-permissions.yaml"
 _SKILL_PERMS_PY="${_CREWVIA_REPO}/hooks/lib_skill_perms.py"

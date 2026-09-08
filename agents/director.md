@@ -280,6 +280,24 @@ required_evidence:
 - Director は reason を読んで対処方針を決定し、`plan.sh update <task_id> --status in_progress --reset` で差し戻す
 - 後続タスクの `blocked_by` は **解除されない**（needs_director は TERMINAL_STATUSES に含まれない）
 
+### ⚠️ Worker への指示で「task ファイルの直接編集」を促さないこと (t015)
+
+**過去の事故**: Director が Worker に「reason は 1 行に、長文は Result セクションへ」とだけ伝えたところ、
+Write を deny されている skill (review 等) の Worker が「Result セクション」を task ファイルへの
+直接編集と解釈し、`cat >> queue/missions/<slug>/tasks/tNNN.md <<'EOF'` の heredoc でハングした
+（42 分間無応答）。**これは Director の指示ミスだった** — `cmd_done` は result を
+`build_task_body` 経由で body に書くだけで frontmatter には触れないため、
+**`plan.sh done <task_id> "<全文>"` に複数行を渡すのは完全に安全**。1 行制約が必要なのは
+`plan.sh needs-director` の reason だけ（frontmatter の `needs_director_reason` に直接書かれるため）。
+
+Worker に指示を出す際は:
+- **Result は `plan.sh done` の引数で渡させる**。複数行で構わない
+- **task ファイル (`queue/missions/**/tasks/tNNN.md`) を Worker 自身に編集させる指示を書かない**
+  （Director 自身が qa_checkpoints 等の frontmatter を事前設定する分には問題ない。上記 §3 参照）
+- `hooks/pre-tool-use.sh` に task ファイルへの Bash 経由書き込み (`>` / `>>` / heredoc / `sed -i` /
+  `tee`) を deny する構造的ガードがあるため、万一同種の指示を出しても Worker 側で弾かれ
+  `plan.sh done` へ誘導されるが、指示自体で誤解を生まないようにすること
+
 ---
 
 ## 4. タスク依存関係の設計指針
@@ -375,6 +393,11 @@ Worker がファイルを編集・作成できるかはスキルで決まる。
 | `planning` | ❌ deny | プランレビューのみ |
 
 > **ソース**: `config/skill-permissions.yaml` が実際の権限定義ソース。スキルを追加・変更した場合は必ずそちらを更新し、この表と同期すること。
+
+> ⚠️ `review` / `research` / `verify` / `planning` (❌ deny) の Worker は **ファイルを書く手段が Bash しか無い**。
+> だからといって task ファイルへの直接書き込みを指示しないこと — Result の記録は必ず
+> `plan.sh done <task_id> "<全文>"` に一本化する（§3「Worker への指示で『task ファイルの直接編集』を
+> 促さないこと」参照）。
 
 ### 実装タスクの skills 命名パターン
 

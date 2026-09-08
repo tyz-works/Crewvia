@@ -512,6 +512,16 @@ requires_approval に該当 → type: improvement でTaskvia /api/log に投稿�
 
 逆に done を忘れて idle 待機するのも最悪。以下の Pre-Done チェックリストを順番に実行し、最後に done を呼べ。
 
+### 🚨 Result の記録方法: `plan.sh` 経由のみ (task ファイルの直接編集は禁止)
+
+**Result（完了報告の全文）は必ず `plan.sh done <task_id> "<全文>"` の引数で渡すこと。複数行で構わない。**
+`cmd_done` は渡された result を `build_task_body` 経由で **task ファイルの body に書くだけで frontmatter には一切触れない**単純な文字列補間なので、複数行を渡しても安全である。
+
+**`queue/missions/**/tasks/tNNN.md` を自分で直接編集してはいけない。** 特に `cat >> ... <<'EOF'` のような heredoc での追記は、**過去に 2 回、実際に Worker をハングさせている**（review skill の Worker が 42 分間、research skill の Worker が 9 分以上、CPU は回ったまま無応答になった）。この禁止は `hooks/pre-tool-use.sh` の構造的ガードでも強制されており（`queue/missions/**/tasks/*.md` への `>` / `>>` / heredoc / `sed -i` / `tee` は deny され、`plan.sh done` を使うよう促すメッセージが返る）、Bash しか使えない skill（次項）にとっては唯一の正規記録手段でもある。このガードは `plan.sh done` / `gh pr comment` の引数として該当パスを引用しただけの報告コマンドまで deny しないよう、クォート内の引用テキストを判定対象から除外している（t019）。ただし変数展開（`F=queue/missions/.../t001.md; cat >> "$F"`）、`dd of=...`、`python3 -c "open(...).write(...)"`、相対パスの先頭に `queue/missions/` が現れない `cd` 併用形は捕捉できない既知の残存リスク — このガードは最終防波堤であり、`plan.sh done` 経由での記録が一次防御である前提は変わらない。
+
+- **`review` / `research` / `verify` / `planning` skill は要注意**: `config/skill-permissions.yaml` でこれらの skill は `Edit` / `Write` / `MultiEdit` を deny されており、**ファイルを書く手段が Bash しかない**。だからといって heredoc で task ファイルに直接書き込もうとせず、`plan.sh done` の引数として結果を渡すこと。他のファイル（レポート・knowledge 追記等、書き込みが許可された対象）には通常通り Bash 経由での作成も選択肢になるが、task ファイルだけは例外なく `plan.sh` 経由にすること。
+- **1 行制約があるのは `plan.sh needs-director` の reason だけ**（frontmatter の `needs_director_reason` フィールドに直接書かれるため、改行を含めると task ファイルの frontmatter が壊れミッション全体が停止する）。`plan.sh done` の result にはこの制約は無い。長い説明・複数の見出し・箇条書きを含む Result 全文をそのまま `plan.sh done` に渡してよい。
+
 ### Pre-Done チェックリスト
 
 **この順序を守ること。done は Step 5 の最後。**
@@ -595,6 +605,7 @@ ${CREWVIA_REPO_ROOT}/scripts/plan.sh needs-director "$TASK_ID" "詰まった理�
 - 後続タスクの `blocked_by` は解除されない（依存関係を保つ）
 - Director が `plan.sh update <task_id> --status in_progress --reset` で差し戻し、追加指示を出す
 - `plan.sh needs-director` は「代替検証して done を無理やり呼ぶ」より **常に安い選択肢**であること
+- ⚠️ **reason は必ず 1 行に収めること**（frontmatter の `needs_director_reason` に直接書かれるため、改行を含めると task ファイルの frontmatter が壊れる）。長い説明が必要な場合でも、詰まった経緯の詳細は次の `plan.sh done` (または Director への直接連絡) で補うこと。`plan.sh done` の result にはこの 1 行制約は無い（上記「Result の記録方法」参照）
 
 **QA タスクの結果フォーマット** (`qa_checkpoints` が宣言されたタスクの場合):
 

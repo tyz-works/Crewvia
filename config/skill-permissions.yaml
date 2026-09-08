@@ -134,6 +134,18 @@ skills:
       - "Write"
       - "MultiEdit"
 
+  # codex-review: Kai-codex (scripts/kai-review.sh) 専用 skill。
+  # 実際の実行は Codex CLI プロセスであり Claude Code の PreToolUse hook
+  # (hooks/pre-tool-use.sh) を一切経由しないため、ここでの allow/deny は
+  # 実行時には適用されない。`plan.sh lint` の
+  # 「skill 'codex-review' not in skill-permissions.yaml」警告 (Phase 2 の
+  # 積み残し) を解消するための、既知スキル一覧への登録のみが目的。
+  # 参考として review skill 相当の意図 (read-only な gh/git 操作 + レビュー
+  # レポート) をコメントで残す。
+  codex-review:
+    allow: []
+    deny: []
+
   database:
     allow:
       - "Edit"

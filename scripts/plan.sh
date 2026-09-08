@@ -262,6 +262,14 @@ LOCK_FILE = os.path.join(QUEUE_DIR, '.lock')
 PRIORITY_ORDER = {'high': 0, 'medium': 1, 'low': 2}
 TERMINAL_STATUSES = {'done', 'verified', 'skipped'}
 
+# Pseudo-status for a task file that failed to parse (see list_tasks). Never
+# 'pending', so pull/dispatch skip it automatically; never in
+# TERMINAL_STATUSES, so a mission with a corrupted task is never mistaken for
+# complete. It exists purely so ONE malformed tNNN.md cannot take the rest of
+# the mission down with it (t009: a multi-line needs-director reason broke
+# frontmatter parsing and froze plan.sh status / dispatch entirely).
+CORRUPT_TASK_STATUS = 'corrupted'
+
 STATUS_ICON = {
     'done': '✅',
     'verified': '✅',
@@ -274,6 +282,7 @@ STATUS_ICON = {
     'verification_failed': '⚠️',
     'needs_human_review': '👁️',
     'needs_director': '🆘',
+    CORRUPT_TASK_STATUS: '💥',
 }
 
 
@@ -441,6 +450,23 @@ _NEEDS_QUOTE = set(':#[]{},\'"\n&*!|>%@`')
 def _dump_scalar(s):
     if s == '':
         return '""'
+    if '\n' in s or '\r' in s:
+        # A raw embedded newline breaks the line-oriented parse_yaml above no
+        # matter how it's quoted (this hand-rolled parser has no block-scalar
+        # support), so a value like a multi-line needs-director reason would
+        # get written as a literal newline inside a quoted scalar and corrupt
+        # the whole file the moment it's read back (t009: took down
+        # `plan.sh status` and dispatch for the entire mission). Collapse
+        # line breaks to keep every frontmatter value on one line — callers
+        # that want to preserve the full text should put it in the task body
+        # instead (see cmd_needs_director's use of split_long_freeform).
+        #
+        # Drop trailing newline(s) first: values captured from a bash command
+        # substitution routinely carry one, and collapsing it along with any
+        # embedded ones would otherwise leave a dangling " / " at the end
+        # (t013 P3 fix — e.g. "QA FAIL: xxx\n" became "QA FAIL: xxx / ").
+        s = re.sub(r'(?:\r\n|\r|\n)+$', '', s)
+        s = re.sub(r'\r\n|\r|\n', ' / ', s)
     if any(ch in _NEEDS_QUOTE for ch in s):
         escaped = s.replace('\\', '\\\\').replace('"', '\\"')
         return f'"{escaped}"'
@@ -545,6 +571,80 @@ def build_task_body(description, result):
     desc = (description or '').rstrip()
     res = (result or '').rstrip()
     return f"## Description\n{desc}\n\n## Result\n{res}\n"
+
+
+def extract_trailing_body_section(body):
+    """Return any appendix that follows the Result section under its own
+    `## <heading>` (other than a literal Description/Result reappearing,
+    which parse_task_body already treats as part of Result — see its
+    docstring), or '' if there is none.
+
+    cmd_needs_director appends a `## Needs-Director 詳細` appendix to the body
+    to preserve a long/multi-line reason (split_long_freeform). But
+    parse_task_body has no notion of a third section: everything after the
+    first `## Result` header — including that appendix — is captured as one
+    opaque `result` string. cmd_done/cmd_fail then discard that entire string
+    (`desc, _ = parse_task_body(body)`) and rebuild the body from just
+    `description` and the new CLI-supplied result, silently destroying the
+    appendix along with it. This is not a rare case — it's the normal
+    `needs_director → update --reset → re-run → done` flow (t013 P2 fix).
+
+    Callers that are about to discard the old body via build_task_body should
+    call this first and re-append the result (if any) to the new body, so the
+    appendix survives independently of whatever the new Result text is.
+    """
+    lines = body.splitlines()
+    result_seen = False
+    trailing_start = None
+    for i, line in enumerate(lines):
+        if re.match(r'^##\s+(Description|Result)\s*$', line, re.IGNORECASE):
+            if re.match(r'^##\s+Result\s*$', line, re.IGNORECASE):
+                result_seen = True
+            continue
+        if result_seen and re.match(r'^##\s+\S', line):
+            trailing_start = i
+            break
+    if trailing_start is None:
+        return ''
+    return '\n'.join(lines[trailing_start:]).strip()
+
+
+def append_trailing_body_section(body, trailing):
+    """Re-append a trailing appendix (from extract_trailing_body_section)
+    onto a freshly rebuilt body, if there is one."""
+    if not trailing:
+        return body
+    return body.rstrip() + '\n\n' + trailing + '\n'
+
+
+FREEFORM_SUMMARY_LIMIT = 200
+
+
+def split_long_freeform(text, limit=FREEFORM_SUMMARY_LIMIT):
+    """Split free-form text into (frontmatter_summary, full_text_or_None).
+
+    frontmatter values must be single-line (see _dump_scalar) and short —
+    dumping a long or multi-line string straight into frontmatter is exactly
+    what broke t009 (a multi-line needs-director reason corrupted the task
+    file and froze the whole mission). Callers that accept free-form text
+    from the user (needs-director reason, etc.) should route it through this
+    helper: write the returned summary to frontmatter, and when full_text is
+    not None, append it to the task body instead so nothing is lost.
+    """
+    text = text or ''
+    has_newline = '\n' in text or '\r' in text
+    if not has_newline and len(text) <= limit:
+        return text, None
+    normalized = re.sub(r'\r\n|\r|\n', ' / ', text).strip()
+    if len(normalized) <= limit:
+        # Short multi-line input: the ' / '-joined summary already carries
+        # everything losslessly, so appending a "full text in body" marker
+        # (and duplicating the text into the body) would be misleading and
+        # redundant (t013 P3 fix — e.g. "a\nb" used to become "a / b…(全文は
+        # 本文を参照)" even though nothing was actually lost).
+        return normalized, None
+    summary = normalized[:limit].rstrip() + '…(全文は本文を参照)'
+    return summary, text
 
 
 # ---------------------------------------------------------------------------
@@ -678,11 +778,29 @@ def list_tasks(slug, base_dir=None):
         try:
             meta, body = parse_frontmatter(text, source=path)
         except ValueError as e:
-            die(
-                f"failed to parse {path}: {e}\n"
+            # A single malformed task file must not blank out `plan.sh status`
+            # or freeze dispatch for the whole mission (t009). Surface it as a
+            # [破損] pseudo-task — visible, but never 'pending' or terminal —
+            # and keep going so every other task file is still usable.
+            print(
+                f"[plan.sh warn] failed to parse {path}: {e}\n"
                 f"  hint: task files start with `---` / frontmatter / `---` / "
-                f"`## Description` / `## Result` (see existing tNNN.md for the template)."
+                f"`## Description` / `## Result` (see existing tNNN.md for the template).\n"
+                f"  showing as [破損] task; other tasks are unaffected.",
+                file=sys.stderr,
             )
+            task_id = fn[:-len('.md')]
+            meta = {
+                'id': task_id,
+                'title': '[破損] frontmatter parse error',
+                'status': CORRUPT_TASK_STATUS,
+                'skills': [],
+                'blocked_by': [],
+                'parse_error': str(e),
+            }
+            body = ''
+            out.append((meta, body))
+            continue
         # Normalize defaults
         meta.setdefault('skills', [])
         meta.setdefault('blocked_by', [])
@@ -1548,11 +1666,16 @@ def cmd_needs_director(args):
         if cur_status not in ('in_progress',):
             die(f"needs-director requires in_progress task (current: {cur_status})")
 
+        summary, full_text = split_long_freeform(reason)
         meta['status'] = 'needs_director'
-        meta['needs_director_reason'] = reason
+        meta['needs_director_reason'] = summary
+        if full_text is not None:
+            body = body.rstrip() + '\n\n## Needs-Director 詳細\n' + full_text.strip() + '\n'
         save_task(slug, task_id, meta, body)
         print(f"[plan.sh] Task {task_id} → needs_director")
-        print(f"[plan.sh] Reason: {reason}")
+        print(f"[plan.sh] Reason: {summary}")
+        if full_text is not None:
+            print(f"[plan.sh] 全文は task body の '## Needs-Director 詳細' セクションに保存しました。")
         print(f"[plan.sh] Director への通知: plan.sh status で確認してください")
 
     with_lock(_do)
@@ -1646,8 +1769,9 @@ def cmd_done(args):
 
         meta['status'] = 'done'
         meta['completed_at'] = now_iso()
+        trailing = extract_trailing_body_section(body)
         desc, _ = parse_task_body(body)
-        new_body = build_task_body(desc, result)
+        new_body = append_trailing_body_section(build_task_body(desc, result), trailing)
         save_task(slug, task_id, meta, new_body)
         worker_holder[0] = meta.get('worker') or ''  # capture worker for post-lock bump
         sync_holder[0] = (slug, task_id, result)
@@ -1754,8 +1878,11 @@ def cmd_fail(args):
         meta['completed_at'] = now_iso()
         if handoff_path:
             meta['handoff_path'] = handoff_path
+        trailing = extract_trailing_body_section(body)
         desc, _ = parse_task_body(body)
-        new_body = build_task_body(desc, f"FAILED — handoff: {handoff_path or 'none'}")
+        new_body = append_trailing_body_section(
+            build_task_body(desc, f"FAILED — handoff: {handoff_path or 'none'}"), trailing
+        )
         save_task(slug, task_id, meta, new_body)
         print(f"Failed: {slug}/{task_id}")
 
@@ -1841,6 +1968,7 @@ def _print_mission_summary(slug, archived=False):
     done = sum(1 for (m, _) in tasks if m.get('status') == 'done')
     in_prog = [(m, b) for (m, b) in tasks if m.get('status') == 'in_progress']
     needs_dir = [(m, b) for (m, b) in tasks if m.get('status') == 'needs_director']
+    corrupted = [(m, b) for (m, b) in tasks if m.get('status') == CORRUPT_TASK_STATUS]
 
     title = mission.get('title', '(unnamed)')
     status = mission.get('status', 'in_progress')
@@ -1855,6 +1983,10 @@ def _print_mission_summary(slug, archived=False):
         reason = m.get('needs_director_reason', '')
         reason_str = f" — {reason}" if reason else ''
         print(f"    🆘 {m['id']} {m['title']} ({worker}){reason_str}")
+    for (m, _) in corrupted:
+        err = m.get('parse_error', '')
+        err_str = f" — {err}" if err else ''
+        print(f"    💥 {m['id']} [破損]{err_str}")
 
 
 def _print_mission_detail(slug):
@@ -1911,6 +2043,10 @@ def _print_mission_detail(slug):
             reason = m.get('blocked_reason', '')
             reason_str = f" — {reason}" if reason else ''
             suffix = f"(ブロック中){reason_str}"
+        elif st == CORRUPT_TASK_STATUS:
+            err = m.get('parse_error', '')
+            err_str = f" — {err}" if err else ''
+            suffix = f"(破損 — 手動修復が必要){err_str}"
         elif bb:
             unmet = [d for d in bb if d not in done_ids]
             suffix = f"(blocked: {', '.join(unmet)})" if unmet else "(pending)"
@@ -2409,6 +2545,18 @@ def _resync_one(slug):
     for meta, body in tasks:
         task_id = meta.get('id')
         if not task_id:
+            continue
+        if meta.get('status') == CORRUPT_TASK_STATUS:
+            # A [破損] placeholder is purely a local display artifact
+            # (list_tasks synthesizes it so one malformed tNNN.md can't take
+            # the rest of the mission down — see CORRUPT_TASK_STATUS). It
+            # must never leave the machine: syncing it out would overwrite
+            # the real card's title/assignee/blocked_by on Taskvia with the
+            # placeholder's blanked-out values, destroying information that
+            # is still perfectly recoverable by just fixing the local file
+            # (t013 P2 fix). Local-only consumers (_print_mission_summary /
+            # _print_mission_detail / dashboard-data) are unaffected.
+            print(f"[resync] skipping corrupted task {slug}/{task_id} (local display only, not synced)", file=sys.stderr)
             continue
 
         # Try to create the task; silently ignored if it already exists

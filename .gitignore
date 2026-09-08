@@ -27,6 +27,11 @@ Thumbs.db
 *.secret
 
 # Crewvia runtime state (per-session)
+# .crewvia-env: worktree ごとの一時状態 (CREWVIA_MISSION_SLUG/TASK_ID/TASK_SLUG)。
+# plan.sh pull がタスクごとに書き換えるため、追跡下のままだと全 PR に無関係な
+# diff が混入する (t007, PR#180)。追跡解除のみ (git rm --cached) — ファイル自体は
+# 各 worktree に residual として残り、plan.sh はこれまで通り source される前提で動く。
+.crewvia-env
 queue/
 registry/mux/
 registry/heartbeats/

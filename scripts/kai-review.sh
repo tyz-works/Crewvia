@@ -32,11 +32,12 @@ set -euo pipefail
 #   6. codex exec -C <review-worktree> review --base main -m <model>
 #      -o <mktemp output file> を実行
 #   7. 出力ファイルを読み込み findings を判定 ([P0]/[P1]/[P2]/[P3] タグ判定が主経路。
-#      JSON 構造化出力にも対応し、構造化シグナルが一切得られない場合のみ、否定文脈
-#      (no/not/none 等) を除外した散文キーワード判定を safety net として使う
-#      (F-1/F-3, PR#180)。詳細は「findings 判定」セクション参照)
+#      JSON 構造化出力にも対応する。JSON findings 配列も [P#] タグも一切
+#      見つからない場合 (HAD_SIGNAL=0) は、内容に関わらず無条件で
+#      needs-director 側に倒す (fail-closed, R-1, mission 20260909-safety-gate-hardening)。
+#      詳細は「findings 判定」セクション参照)
 #   8. findings なし / all-low(P3) → plan.sh done
-#      修正必要 (P0/P1/P2 or critical keyword) → plan.sh needs-director
+#      修正必要 (P0/P1/P2 or 構造化シグナル無し) → plan.sh needs-director
 #      (plan.sh done は Taskvia sync + registry.workers.yaml の task_count 自動 bump)
 #      --dry-run 時はどちらも実行せず、判定結果を表示するのみ
 #   9. レビュー用 worktree・fetch した一時 ref・出力/stderr の一時ファイルは
@@ -314,32 +315,64 @@ _info "Review output length: ${#REVIEW_CONTENT} chars"
 #   でも `null` でも `length` が `0` を返し (jq の `length` は null に対して
 #   エラーではなく 0 を返す仕様)、`0` は `-e` にとって false/null ではないため
 #   exit 0 になる。結果 FINDINGS_COUNT=0 → JSON 経路に入ったまま NEEDS_FIX=0
-#   (自動 done)、しかも HAD_SIGNAL=1 が立つため critical keyword safety net
-#   まで無効化されていた。これは **同一構造 (倒れる方向が常に自動承認) の
-#   3 度目**: F-1 ([P0] タグ取りこぼし) → [P1]/t012 (JSON 内側の allowlist) →
-#   今回 (JSON 経路への入口ゲート)。`.findings | arrays | length` に変更し、
+#   (自動 done)、しかも HAD_SIGNAL=1 が立つため後段の safety net まで無効化
+#   されていた。これは **同一構造 (倒れる方向が常に自動承認) の 3 度目**:
+#   F-1 ([P0] タグ取りこぼし) → [P1]/t012 (JSON 内側の allowlist) → 今回
+#   (JSON 経路への入口ゲート)。`.findings | arrays | length` に変更し、
 #   `.findings` が真に配列である場合のみ (空配列 `[]` も含む) JSON 経路に
 #   入るようにした。配列でない/存在しない/null の場合は `arrays` がフィルタで
 #   除外して jq が何も出力せず exit 非 0 になるため、`if` が false になって
-#   [P#] タグ判定 (→ タグ無しなら critical keyword safety net) へ確実に
+#   [P#] タグ判定 (→ タグも無ければ下記の fail-closed 分岐) へ確実に
 #   フォールバックする。
 #
-#   [P2] 対応時に判定フロー全体 (入口・内側・fallback) を通しで洗い直した結果:
-#   - 入口: 上記で修正。findings が配列でない限り JSON 経路に入らない。
+#   R-1 (t001, mission 20260909-safety-gate-hardening): PR#180 で F-3 として
+#   導入した「critical キーワード + 同一行否定語除外」の散文 safety net は、
+#   これ自体が **4 度目の「倒れる方向が自動承認」欠陥**の温床だった。
+#   同一行内のどこかに no/not/none/without 等の否定語があれば行ごと除外する
+#   実装は、否定語が critical な指摘と無関係な箇所を否定しているだけの場合
+#   (再現例: "This introduces a critical race condition ... that does not
+#   have a workaround, and callers cannot recover once it triggers." —
+#   "not"/"cannot" は "critical race condition" ではなく別の節を否定して
+#   いる) に、本物の critical finding ごと安全側 (auto-done) に倒してしまう
+#   (実測: Phase 3 QA t010)。「同一行」という判定 unit が粗すぎ、かつ
+#   「危険パターンに一致しなければ自動 done」という default-safe な構造
+#   自体が、設計原則 (危険な結論=自動 done は allowlist であるべき) に反して
+#   いた。個別のキーワード/否定語調整では同種の欠陥を再発させるだけと判断し、
+#   safety net を全廃した。
+#
+#   実機検証 (t001, 2026-09-09, codex-cli 0.144.5): 代替案として「codex に
+#   必ず [P#] タグ (finding 無しでも明示マーカー) を出力させるカスタム
+#   prompt を渡す」ことを検討したが、`codex exec review --base <BRANCH>` は
+#   `--base` と `[PROMPT]` (カスタム指示) を同時指定できないことを実機で
+#   確認した (`error: the argument '--base <BRANCH>' cannot be used with
+#   '[PROMPT]'`)。`--output-schema <FILE>` (JSON Schema 強制) も試したが、
+#   空 diff / 実質的な diff の双方で review サブコマンドの最終出力書式
+#   (自然文 + [P#] タグ) は一切変化しないことを確認した。つまり現行
+#   codex-cli は `--base` を使う限り「finding が無い場合の明示マーカー」を
+#   強制する手段が無く、clean な review は今後も引き続きタグ無しの自然文
+#   のみを返す。
+#
+#   そのため本修正は「JSON findings 配列も [P#] タグも一切見つからない
+#   (HAD_SIGNAL=0) 場合は、内容に関わらず無条件で needs-director に倒す」
+#   という形にした (allowlist: 構造化シグナルによる確認が取れた場合のみ
+#   auto-done を許可する。判定 unit は「JSON findings 配列」と「[P#] タグ」
+#   の 2 つに絞り、それ以外の判定材料は一切見ない)。副作用として、clean な
+#   review (タグ無し) も含めて一律 needs-director 相当になる — これは
+#   Phase 3 の F2 が解消した「LGTM キーワードが無ければ needs-director」
+#   問題を実質的に復活させるトレードオフだが、「危険な方向への誤判定を
+#   繰り返さない」という本 mission (safety-gate-hardening) の意図を汲んで
+#   意図的に選択した。将来的な改善余地は Result 参照 (--commit + 手動 diff
+#   取得 + --output-schema の組み合わせ等)。
+#
+#   洗い直しの結果 (入口・内側・fallback):
+#   - 入口: [P2] で修正済み。findings が配列でない限り JSON 経路に入らない。
 #   - 内側 (findings > 0 の denylist, t012): 未知の priority/severity・欠損・
 #     jq 自体の失敗はいずれも危険側 (NEEDS_FIX=1) に倒れることを確認済み。
-#     さらに finding の要素が object でない (例: 文字列が混在する配列) 場合も
-#     denylist 側の jq が `.priority`/`.severity` のインデックス参照で
-#     エラーになり、`else HIGH_COUNT=1` の fail-safe 分岐に落ちることを実測確認
-#     (`echo '{"findings":["str",{"severity":"critical"}]}' | jq '...'` が
-#     nonzero exit することを確認済み)。
-#   - jq 不在環境: `command -v jq` チェックは無いが、jq が無ければ exit 127 で
-#     入口の `if` が false になり [P#] タグ判定へフォールバックするため安全
-#     (PR#180 Seo レビューで確認済み)。
-#   - fallback (critical keyword, F-3): 上記の通り HAD_SIGNAL は「配列として
-#     JSON 判定できた」場合と「[P#] タグが見つかった」場合のみ 1 になるため、
-#     入口ゲート修正後は fail-open な抜け道が無い。
-#   洗い直しの結果、[P2] の入口ゲート以外に追加の fail-open は見つからなかった。
+#   - jq 不在環境: jq が無ければ exit 127 で入口の `if` が false になり
+#     [P#] タグ判定へフォールバックするため安全。
+#   - fallback: HAD_SIGNAL が「配列として JSON 判定できた」場合と「[P#] タグ
+#     が見つかった」場合のみ 1 になり、それ以外 (HAD_SIGNAL=0) は下記の通り
+#     無条件で needs-director に倒れるため、fail-open な抜け道は無い。
 NEEDS_FIX=0
 JUDGE_METHOD="tags"
 HAD_SIGNAL=0
@@ -385,23 +418,25 @@ else
     fi
     _info "Judged via [P#] priority tags: $(echo "$P_TAGS" | tr '\n' ' ')"
   else
-    # タグが 1 つも無い場合は HAD_SIGNAL=0 のままにし、後段の critical キーワード
-    # safety net を働かせる (F-3)。ほとんどの clean review はここに来るが、
-    # 否定語同居行を除外する判定と組み合わせることで誤発火を防ぐ。
-    _info "No [P#] tags found in review output — treating as clean unless a critical keyword safety net fires"
+    # タグが 1 つも無い場合は HAD_SIGNAL=0 のままにし、下の fail-closed 分岐に
+    # 委ねる (R-1)。
+    _info "No [P#] tags found in review output"
   fi
 fi
 
-# 散文キーワード fallback (F-3): 構造化シグナルが一切得られなかった場合のみの
-# safety net。かつ同一行に否定語が同居する場合は健全な報告文として除外する。
+# fail-closed (R-1): JSON findings 配列も [P#] タグも一切見つからなかった
+# (HAD_SIGNAL=0) 場合、内容に関わらず無条件で needs-director に倒す。
+# 旧実装 (F-3) はここで critical キーワード + 同一行否定語除外の散文
+# ヒューリスティクスを safety net として使っていたが、これ自体が「無関係な
+# 否定語が同一行にあると本物の critical finding を見逃す」欠陥 (R-1) の
+# 温床だった。HAD_SIGNAL=0 は「codex が指示に従わなかった/出力が壊れた/
+# API エラー/clean review でタグを出さなかった」のいずれかを意味し、いずれの
+# 場合も「安全と確認できた」わけではないため、危険な結論 (auto-done) の
+# allowlist には入れない。
 if [[ $HAD_SIGNAL -eq 0 ]]; then
-  CRITICAL_PATTERN='critical|high severity|security vulnerability|must fix|must be fixed|breaking change|data loss'
-  NEGATION_PATTERN='\bno\b|\bnot\b|n'"'"'t\b|\bnone\b|\bnothing\b|\bwithout\b|\bclean\b|\bzero\b'
-  CRIT_LINES="$(echo "$REVIEW_CONTENT" | grep -iE "$CRITICAL_PATTERN" | grep -viE "$NEGATION_PATTERN" || true)"
-  if [[ -n "$CRIT_LINES" ]]; then
-    _warn "Critical keyword found (without negation) in review output — treating as needs-director as a safety net"
-    NEEDS_FIX=1
-  fi
+  JUDGE_METHOD="no-signal"
+  _warn "No structured signal ([P#] tags or JSON findings array) found in review output — treating as needs-director (fail-closed, R-1)"
+  NEEDS_FIX=1
 fi
 
 # レビュー内容が空 or 極端に短い場合は要確認
@@ -441,7 +476,7 @@ elif [[ $NEEDS_FIX -eq 1 ]]; then
   _info "Review found issues requiring fixes"
   call_needs_director "$NEEDS_FIX_MSG"
 else
-  _info "Review passed (no P1/P2 findings, no critical keywords)"
+  _info "Review passed (structured signal confirmed safe: no P0-P2 findings)"
   "$PLAN_SH" done "$TASK_ID" ${MISSION_SLUG:+--mission "$MISSION_SLUG"} "$DONE_MSG"
 fi
 

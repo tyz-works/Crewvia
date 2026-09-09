@@ -7,6 +7,12 @@
 > **Phase 3 (2026-09-08, mission: 20260908-codex-reviewer-phase3, PR#180)**: Codex 自身の self-review で見つかった
 > kai-review.sh の欠陥 (主 working tree 汚染・stale branch review・findings 判定の fail-open・固定 /tmp パス衝突) を
 > まとめて修正。詳細は下記「Phase 3: kai-review.sh 安定化」を参照。
+> **R-1 (2026-09-09, mission: 20260909-safety-gate-hardening, t001)**: Phase 3 (F-3) で導入した散文
+> critical キーワード safety net が、無関係な否定語で本物の critical finding を見逃す欠陥を持っていた
+> (4 度目の「自動承認側に倒れる」欠陥)。safety net を全廃し、構造化シグナル (JSON findings 配列 or
+> [P#] タグ) が一切無い場合は無条件で needs-director に倒す fail-closed 方式に変更。
+> トレードオフとして clean review もタグ無しの限り needs-director 相当になる。詳細は下記
+> 「findings 判定ロジックの変遷」の R-1 節を参照。
 
 ---
 
@@ -154,10 +160,10 @@ Kai-codex 自身に PR#173 (kai-review.sh 初版) を self-review させたと�
   (旧実装の `origin/<branch>` 参照は fork PR や削除済み branch で必ず失敗していた)。
 - worktree・fetch した一時 ref は `trap cleanup EXIT` で成功/失敗どちらの経路でも必ず削除する。
 
-### findings 判定ロジックの変遷 (F2 → F-1/F-3 → [P2])
+### findings 判定ロジックの変遷 (F2 → F-1/F-3 → [P2] → R-1)
 
 現物確認 (codex-cli 0.144.5) の結果、`codex exec review` の実際の出力は JSON ではなく自然文 +
-`- [P0]`〜`- [P3]` タグ付き箇条書きだった。判定ロジックは QA re-review を重ねて 3 段階で堅牢化した:
+`- [P0]`〜`- [P3]` タグ付き箇条書きだった。判定ロジックは QA re-review を重ねて堅牢化した:
 
 1. **F2**: 「LGTM キーワードが無ければ needs-director」という旧ルールは、clean な review でも
    LGTM と言わないため常に誤発火していた。`[P#]` タグの有無を主判定に切り替えた。
@@ -170,10 +176,33 @@ Kai-codex 自身に PR#173 (kai-review.sh 初版) を self-review させたと�
    (**3 回連続で同じ「自動承認側に倒れる」構造の欠陥**: [P0] 抜け → JSON 内側の allowlist →
    JSON 入口ゲート)。`.findings | arrays | length` に変更し、真の配列でない限り JSON 経路に
    入らないようにした。
+4. **R-1 (t001, mission 20260909-safety-gate-hardening, 4 度目)**: F-3 で導入した「critical
+   キーワード + 同一行否定語除外」の散文 safety net が、否定語が critical な指摘と無関係な箇所を
+   否定しているだけの行 (実測例: "This introduces a critical race condition ... that does not
+   have a workaround, and callers cannot recover once it triggers.") まで行ごと除外し、本物の
+   critical finding を見逃して auto-done してしまう欠陥を持っていた (実測: Phase 3 QA t010)。
+   「同一行のどこかに否定語があれば安全」という default-safe な構造自体が
+   allowlist/denylist の原則に反していたため、個別のキーワード調整では終わらないと判断し、
+   散文 safety net を全廃した。代わりに **JSON findings 配列も [P#] タグも一切見つからない
+   (`HAD_SIGNAL=0`) 場合は、内容に関わらず無条件で needs-director に倒す** (fail-closed) 方式に
+   変更した。
+   - 実機検証: 代替案として「codex に必ず [P#] タグを出力させるカスタム prompt を渡す」ことを
+     検討したが、`codex exec review --base <BRANCH>` は `--base` と `[PROMPT]` を同時指定できない
+     (CLI が拒否する) ことを確認した。`--output-schema` を付けても review サブコマンドの最終出力
+     書式は変化しないことも確認済み。つまり現行 codex-cli は `--base` を使う限り「clean な
+     review でもタグを出す」ことを強制できない。
+   - **トレードオフ**: 副作用として clean な review (タグ無し) も一律 needs-director 相当になる
+     — これは F2 が解消した「LGTM キーワードが無ければ needs-director」問題を実質的に部分的に
+     復活させる。safety-gate-hardening mission の意図 (危険な方向への誤判定を繰り返さない) を
+     優先して意図的に選択した。改善余地: `--commit` + 手動 diff 取得 + `--output-schema` の
+     組み合わせで custom prompt と構造化出力の両立を図る、等。
 
 **教訓**: レビューゲートの判定ロジックは、迷ったら「修正必要」側に倒す（fail-closed）ことを
 毎回明示的に確認すること。denylist（危険と確認できないものは全部危険側）で組むほうが、
-allowlist（安全と確認できたものだけ安全側）より事故りにくい。
+allowlist（安全と確認できたものだけ安全側）より事故りにくい。**「危険パターンに一致しなければ
+安全」という default-safe な構造は、そのパターンがどれだけ精緻でも denylist ではなく
+allowlist 違反であり、同種の欠陥を再発させる** (F-3 → R-1 で実証済み)。auto-done のような
+危険な結論は、構造化シグナルによる積極的な確認が取れた場合のみ許可すること。
 
 ### `--dry-run` (F6, Director 指示)
 

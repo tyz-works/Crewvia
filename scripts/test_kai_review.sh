@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# test_kai_review.sh — kai-review.sh (PR#180) の F1-F4 / F6 回帰テスト
+# test_kai_review.sh — kai-review.sh (PR#180, R-1) の F1-F4 / F6 / R-1 回帰テスト
 #
 # 背景: scripts/kai-review.sh に対する Codex 自身の self-review findings
 #   (F1/F1b/F2/F3/F4) と、Director 追加指示の F6 (--dry-run) を PR#180 で
@@ -8,12 +8,25 @@
 #   バグを見逃した事例あり) なので、fake codex の出力 fixture は手書きの
 #   想像ではなく、t001 で実測した codex-cli 0.144.5 (`codex exec review`) の
 #   実出力をそのまま使う。fixture の出所は各 fixture の直前コメントに記載する。
-#   （JSON forward-compat パスと critical-keyword-no-tag パスのみ、現行 CLI
-#   では再現できない仮想シナリオなので意図的に合成した — 該当箇所に明記）
+#   （JSON forward-compat パスのみ、現行 CLI では再現できない仮想シナリオなので
+#   意図的に合成した — 該当箇所に明記）
+#
+# R-1 (t001, mission 20260909-safety-gate-hardening): PR#180 の F-3 が導入した
+# 「critical キーワード + 同一行否定語除外」の safety net は、critical な
+# 指摘と無関係な否定語が同一行に同居すると健全な報告と誤判定し、本物の
+# critical finding を見逃して auto-done してしまう欠陥 (R-1) を持っていた
+# (これで「倒れる方向が自動承認」の欠陥は 4 回目)。R-1 でこの safety net を
+# 全廃し、JSON findings 配列も [P#] タグも一切見つからない場合
+# (HAD_SIGNAL=0) は内容に関わらず無条件で NEEDS-DIRECTOR相当 (fail-closed) に
+# 倒すよう変更した。詳細は scripts/kai-review.sh のヘッダー / 判定ロジック
+# コメントと本ファイル中の R-1 セクションを参照。
 #
 # 検証内容:
 #   F2  findings 判定: [P#] タグ判定 (findings 空→done, P1 あり→needs-director) +
-#       JSON forward-compat 判定 + 散文 critical キーワード fallback (defense-in-depth)
+#       JSON forward-compat 判定
+#   R-1 構造化シグナル無し (HAD_SIGNAL=0) の fail-closed 化: タグ無し・JSON
+#       findings 配列無しの出力は内容 (critical キーワードの有無や文脈) に
+#       関わらず一律 NEEDS-DIRECTOR相当になること
 #   F3  並列衝突: kai-review.sh を 2 本同時実行し、出力ファイルが独立していること
 #   F4  --mission forward: gh 失敗 / headRefName 空 / codex 失敗 / output file 未生成の
 #       各 failure path で plan.sh needs-director に --mission が渡ること
@@ -22,7 +35,10 @@
 #   F6  --dry-run: plan.sh への書き込み (pull/done/needs-director) が一切発生しないこと
 #
 # 実機動作確認 (実際の gh/codex CLI) は t003 (QA) が担当する。ここは fake CLI で
-# ロジックを網羅する側に徹する。
+# ロジックを網羅する側に徹する。R-1 の設計判断そのもの (codex exec review の
+# --base と カスタム PROMPT が併用不可であること、--output-schema が review
+# サブコマンドの出力書式を変えないこと) は t001 で実際の codex-cli 0.144.5 に
+# 対して実機確認済み (Result 参照)。
 #
 # 実行: bash scripts/test_kai_review.sh
 # 副作用: /tmp 配下に一時ディレクトリ (git fixture repo 含む) を作成し終了時に削除する
@@ -225,7 +241,11 @@ run_kai() {
 #                       F-1 (P0 抜けバグ) を検証する。
 #   f3_repro_*.txt    — t008 (QA FAIL) の Description に記載された F-3 の
 #                       再現例 3 件をそのまま fixture 化したもの (QA が実機で
-#                       観測した誤発火パターン)。
+#                       観測した誤発火パターン)。#   r1_repro_*.txt    (t001, R-1) t001 の Description に記載された再現例をそのまま
+#                       fixture 化したもの。critical な指摘と無関係な否定語 (別の
+#                       節にある "not"/"cannot" 等) が同一行に同居し、旧ロジック
+#                       (同一行否定語除外) が健全な報告と誤判定して auto-done
+#                       していた実例。
 # ---------------------------------------------------------------------------
 FIXTURES_DIR="$TMPDIR_TEST/fixtures"
 mkdir -p "$FIXTURES_DIR"
@@ -287,18 +307,56 @@ cat > "$FIXTURES_DIR/f3_repro_nothing_must_be_fixed.txt" <<'FIX'
 Overall LGTM, nothing must be fixed.
 FIX
 
+# R-1 (t001) 再現例そのもの: t001 Description に記載された、Phase 3 の QA t010 が
+# 実測した誤判定パターン。"critical" は本物の指摘だが、同一行にある否定語
+# ("does not"/"cannot") は別の節 ("a workaround"/"recover") を否定しているだけで
+# "critical" 自体を否定していない。旧ロジック (同一行否定語除外) はこの区別が
+# できず、行ごと除外して安全側 (auto-done) に倒していた。
+cat > "$FIXTURES_DIR/r1_repro_unrelated_negation.txt" <<'FIX'
+This introduces a critical race condition in the queue writer that does not
+have a workaround, and callers cannot recover once it triggers.
+FIX
+
+# [P3] タグのみの合成 fixture。「構造化シグナルがある場合の auto-done 経路」を
+# 検証する実行系テスト (F2 実行系) で使う。critical という単語を本文に含むが
+# タグ判定を信頼する (F-3 由来の確認観点を維持)。
+cat > "$FIXTURES_DIR/tag_and_critical_keyword.txt" <<'FIX'
+- [P3] Minor nit — foo.sh:1
+  This is a very minor style nit and not a critical issue at all.
+FIX
+
 # ---------------------------------------------------------------------------
-# F2: findings 判定 (dry-run で判定結果のみ検証)
+# F2 / R-1: findings 判定 (dry-run で判定結果のみ検証)
+#
+# R-1 (t001, mission 20260909-safety-gate-hardening) で、prose critical
+# キーワード + 同一行否定語除外の safety net を全廃した。JSON findings 配列も
+# [P#] タグも一切見つからない (HAD_SIGNAL=0) 場合は、内容に関わらず無条件で
+# NEEDS-DIRECTOR相当 (fail-closed) に倒す。設計方針: 危険な結論 (自動 done) は
+# allowlist (構造化シグナルによる確認が取れた場合のみ)、判定 unit は「JSON
+# findings 配列」と「[P#] タグ」の 2 つに絞る。
+#
+# 実機検証 (t001, 2026-09-09, codex-cli 0.144.5): 当初案 (a)「codex に必ず
+# 構造化タグを出力させるカスタム prompt を渡す」は、`codex exec review
+# --base <BRANCH>` が `--base` と `[PROMPT]` (カスタム指示) の同時指定を
+# CLI レベルで拒否する (`the argument '--base <BRANCH>' cannot be used with
+# '[PROMPT]'`) ため実現不可能と判明した。`--output-schema` を付けても
+# review サブコマンドの最終出力書式 (自然文 + [P#] タグ) は変化しないことも
+# 実機で確認済み (空 diff / 実質的な diff の両方で検証)。現行 codex-cli は
+# clean な review では常にタグ無しの自然文のみを返す (下記 clean.txt は
+# その実測データ)。したがって本修正は、「clean review も含めタグの無い
+# 出力は一律 needs-director に倒れる」という意図的なトレードオフである
+# (詳細は Result 参照。将来的な改善余地: --commit や手動 diff 取得と
+# --output-schema の組み合わせ)。
 # ---------------------------------------------------------------------------
 echo ""
-echo "--- F2: [P#] タグ判定 — findings 空 (実測 fixture) → DONE 相当 ---"
-write_task t101 "F2 clean"
+echo "--- F2/R-1 [最重要]: [P#] タグ無し (実測 clean fixture) → NEEDS-DIRECTOR相当 (fail-closed。旧実装は誤って DONE にしていた) ---"
+write_task t101 "F2 clean no signal"
 out=$(FAKE_GH_HEAD_BRANCH="feature-branch" FAKE_CODEX_FIXTURE="$FIXTURES_DIR/clean.txt" \
   run_kai --pr 1 --task t101 --mission "$MISSION_SLUG" --dry-run 2>&1) && rc=0 || rc=$?
-if [[ $rc -eq 0 ]] && echo "$out" | grep -q "method=tags needs_fix=0" && echo "$out" | grep -q "DONE/LGTM相当"; then
-  pass "clean fixture (実測) → method=tags, DONE相当"
+if [[ $rc -eq 0 ]] && echo "$out" | grep -q "method=no-signal needs_fix=1" && echo "$out" | grep -q "NEEDS-DIRECTOR相当"; then
+  pass "実測 clean fixture (タグ無し) → method=no-signal, NEEDS-DIRECTOR相当 (fail-closed, R-1 修正確認)"
 else
-  fail "clean fixture should judge as DONE via tags — rc=$rc out=$out"
+  fail "REGRESSION (R-1): tag-less clean fixture should fail closed to NEEDS-DIRECTOR, not auto-done — rc=$rc out=$out"
 fi
 
 echo ""
@@ -335,31 +393,25 @@ else
 fi
 
 echo ""
-echo "--- F2: 散文 fallback (critical キーワード, タグ無し) → NEEDS-DIRECTOR相当 (合成 fixture) ---"
-write_task t105 "F2 prose critical"
+echo "--- R-1: 散文 critical キーワードあり・タグ無し → NEEDS-DIRECTOR相当 (fail-closed。旧 keyword safety net は廃止) ---"
+write_task t105 "R-1 prose critical no tag"
 out=$(FAKE_GH_HEAD_BRANCH="feature-branch" FAKE_CODEX_FIXTURE="$FIXTURES_DIR/prose_critical_no_tag.txt" \
   run_kai --pr 1 --task t105 --mission "$MISSION_SLUG" --dry-run 2>&1) && rc=0 || rc=$?
-if [[ $rc -eq 0 ]] && echo "$out" | grep -q "needs_fix=1" && echo "$out" | grep -q "NEEDS-DIRECTOR相当"; then
-  pass "critical キーワード defense-in-depth (合成) → NEEDS-DIRECTOR相当"
+if [[ $rc -eq 0 ]] && echo "$out" | grep -q "method=no-signal needs_fix=1" && echo "$out" | grep -q "NEEDS-DIRECTOR相当"; then
+  pass "critical キーワードのみ (タグ無し) → method=no-signal, NEEDS-DIRECTOR相当 (fail-closed)"
 else
   fail "prose_critical_no_tag fixture should judge as NEEDS-DIRECTOR — rc=$rc out=$out"
 fi
 
 echo ""
-echo "--- F2: 散文 fallback (タグ無し・critical キーワード無し, 実測 clean fixture 再確認) → DONE相当 ---"
-# clean.txt は実測データでは [P#] タグが一切無い自然文のみ。これが「散文かつ
-# critical キーワードも無い」ケースの実例そのものであり、prose fallback の
-# 「both パターン」のうち clean 側を兼ねる。
-if echo "$out" | grep -q "NEEDS-DIRECTOR相当"; then
-  : # (上の t105 検証で critical 側は確認済み)
-fi
-write_task t106 "F2 clean prose recheck"
-out106=$(FAKE_GH_HEAD_BRANCH="feature-branch" FAKE_CODEX_FIXTURE="$FIXTURES_DIR/clean.txt" \
+echo "--- R-1 [再現例そのもの]: critical + 無関係な否定語同居 → NEEDS-DIRECTOR相当 (旧実装は誤って auto-done していた) ---"
+write_task t106 "R-1 repro unrelated negation"
+out106=$(FAKE_GH_HEAD_BRANCH="feature-branch" FAKE_CODEX_FIXTURE="$FIXTURES_DIR/r1_repro_unrelated_negation.txt" \
   run_kai --pr 1 --task t106 --mission "$MISSION_SLUG" --dry-run 2>&1) && rc106=0 || rc106=$?
-if [[ $rc106 -eq 0 ]] && echo "$out106" | grep -q "No \[P#\] tags found" && echo "$out106" | grep -q "DONE/LGTM相当"; then
-  pass "実測 clean fixture: タグ無し・critical キーワード無し → DONE相当 (prose fallback 側の確認)"
+if [[ $rc106 -eq 0 ]] && echo "$out106" | grep -q "method=no-signal needs_fix=1" && echo "$out106" | grep -q "NEEDS-DIRECTOR相当"; then
+  pass "R-1 再現例 (critical + 無関係な否定語同居) → NEEDS-DIRECTOR相当 (R-1 修正確認: 旧ロジックは同一行否定語除外で誤って auto-done していた)"
 else
-  fail "clean fixture (prose, no tags) should judge as DONE — rc=$rc106 out=$out106"
+  fail "REGRESSION (R-1): critical finding with unrelated same-line negation should judge as NEEDS-DIRECTOR, not auto-done — rc=$rc106 out=$out106"
 fi
 
 # ---------------------------------------------------------------------------
@@ -367,16 +419,16 @@ fi
 # 走らせて task の status が正しく更新されることを確認する。
 # ---------------------------------------------------------------------------
 echo ""
-echo "--- F2 (実行系): clean fixture → 実際に plan.sh done が呼ばれ status=done になる ---"
-write_task_in_progress t110 "F2 real done"
-FAKE_GH_HEAD_BRANCH="feature-branch" FAKE_CODEX_FIXTURE="$FIXTURES_DIR/clean.txt" \
+echo "--- F2 (実行系): [P3] タグのみの findings → 実際に plan.sh done が呼ばれ status=done になる (構造化シグナルがある場合の auto-done 経路は健在) ---"
+write_task_in_progress t110 "F2 real done via tag"
+FAKE_GH_HEAD_BRANCH="feature-branch" FAKE_CODEX_FIXTURE="$FIXTURES_DIR/tag_and_critical_keyword.txt" \
   run_kai --pr 1 --task t110 --mission "$MISSION_SLUG" --skip-pull > "$TMPDIR_TEST/t110.out" 2>&1
 rc110=$?
 st110="$(task_status t110)"
 if [[ $rc110 -eq 0 && "$st110" == "done" ]] && grep -q "LGTM" "$TASKS_DIR/t110.md"; then
-  pass "clean fixture → 実行後 status=done, Result に LGTM 記載"
+  pass "[P3] タグのみ → 実行後 status=done, Result に LGTM 記載 (構造化シグナルがある auto-done 経路は健在)"
 else
-  fail "clean fixture real-run should set status=done — rc=$rc110 status=$st110 (see $TMPDIR_TEST/t110.out)"
+  fail "[P3]-only tagged fixture real-run should set status=done — rc=$rc110 status=$st110 (see $TMPDIR_TEST/t110.out)"
 fi
 
 echo ""
@@ -390,6 +442,19 @@ if [[ $rc111 -eq 0 && "$st111" == "needs_director" ]] && grep -q "NEEDS FIX" "$T
   pass "P1 findings fixture → 実行後 status=needs_director, Result に NEEDS FIX 記載"
 else
   fail "p1_findings real-run should set status=needs_director — rc=$rc111 status=$st111 (see $TMPDIR_TEST/t111.out)"
+fi
+
+echo ""
+echo "--- F2 (実行系) [R-1]: タグ無しの clean fixture → 実際に plan.sh needs-director が呼ばれ status=needs_director になる (旧実装は誤って status=done にしていた) ---"
+write_task_in_progress t112 "R-1 real needs-director on no-signal"
+FAKE_GH_HEAD_BRANCH="feature-branch" FAKE_CODEX_FIXTURE="$FIXTURES_DIR/clean.txt" \
+  run_kai --pr 1 --task t112 --mission "$MISSION_SLUG" --skip-pull > "$TMPDIR_TEST/t112.out" 2>&1
+rc112=$?
+st112="$(task_status t112)"
+if [[ $rc112 -eq 0 && "$st112" == "needs_director" ]] && grep -q "NEEDS FIX" "$TASKS_DIR/t112.md"; then
+  pass "タグ無し clean fixture (実行系) → 実際に status=needs_director になる (R-1 修正確認: 旧実装は誤って done にしていた)"
+else
+  fail "REGRESSION (R-1): tag-less clean fixture real-run should set status=needs_director, not done — rc=$rc112 status=$st112 (see $TMPDIR_TEST/t112.out)"
 fi
 
 # ---------------------------------------------------------------------------
@@ -492,29 +557,29 @@ fi
 # ある場合のみ JSON 経路に入るよう修正した回帰テスト。
 # ---------------------------------------------------------------------------
 echo ""
-echo "--- [P2] t018: findings フィールド自体が欠損 → JSON 経路に入らず散文判定へ fallback (旧実装は自動 done, Seo実測値) ---"
+echo "--- [P2] t018: findings フィールド自体が欠損 → JSON 経路に入らず [P#] タグ判定へ fallback → 構造化シグナル無しで fail-closed (Seo実測値) ---"
 cat > "$FIXTURES_DIR/json_missing_findings_field.txt" <<'FIX'
 {"issues":[{"severity":"critical"}]}
 FIX
 write_task t190 "P2 t018 missing findings field"
 out=$(FAKE_GH_HEAD_BRANCH="feature-branch" FAKE_CODEX_FIXTURE="$FIXTURES_DIR/json_missing_findings_field.txt" \
   run_kai --pr 1 --task t190 --mission "$MISSION_SLUG" --dry-run 2>&1) && rc=0 || rc=$?
-if [[ $rc -eq 0 ]] && echo "$out" | grep -q "method=tags needs_fix=1" && echo "$out" | grep -q "NEEDS-DIRECTOR相当"; then
-  pass "findings フィールド欠損 (.issues のみ) → JSON 経路に入らず method=tags にフォールバック、critical キーワードで NEEDS-DIRECTOR相当 (P2/t018 修正確認)"
+if [[ $rc -eq 0 ]] && echo "$out" | grep -q "method=no-signal needs_fix=1" && echo "$out" | grep -q "NEEDS-DIRECTOR相当"; then
+  pass "findings フィールド欠損 (.issues のみ) → JSON 経路に入らず [P#] タグも無いため method=no-signal で fail-closed NEEDS-DIRECTOR相当 (P2/t018 + R-1 修正確認)"
 else
   fail "REGRESSION (P2/t018): missing 'findings' field should NOT enter JSON path (fail-open gate) — rc=$rc out=$out"
 fi
 
 echo ""
-echo "--- [P2] t018: findings が null → JSON 経路に入らず散文判定へ fallback (旧実装は自動 done, Seo実測値) ---"
+echo "--- [P2] t018: findings が null → JSON 経路に入らず [P#] タグ判定へ fallback → 構造化シグナル無しで fail-closed (Seo実測値) ---"
 cat > "$FIXTURES_DIR/json_null_findings.txt" <<'FIX'
 {"findings":null,"summary":"3 critical bugs found"}
 FIX
 write_task t191 "P2 t018 null findings"
 out=$(FAKE_GH_HEAD_BRANCH="feature-branch" FAKE_CODEX_FIXTURE="$FIXTURES_DIR/json_null_findings.txt" \
   run_kai --pr 1 --task t191 --mission "$MISSION_SLUG" --dry-run 2>&1) && rc=0 || rc=$?
-if [[ $rc -eq 0 ]] && echo "$out" | grep -q "method=tags needs_fix=1" && echo "$out" | grep -q "NEEDS-DIRECTOR相当"; then
-  pass "findings: null → JSON 経路に入らず method=tags にフォールバック、critical キーワードで NEEDS-DIRECTOR相当 (P2/t018 修正確認)"
+if [[ $rc -eq 0 ]] && echo "$out" | grep -q "method=no-signal needs_fix=1" && echo "$out" | grep -q "NEEDS-DIRECTOR相当"; then
+  pass "findings: null → JSON 経路に入らず [P#] タグも無いため method=no-signal で fail-closed NEEDS-DIRECTOR相当 (P2/t018 + R-1 修正確認)"
 else
   fail "REGRESSION (P2/t018): findings:null should NOT enter JSON path (fail-open gate) — rc=$rc out=$out"
 fi
@@ -594,7 +659,10 @@ else
 fi
 
 write_task t170 "F-2 deleted branch"
-out=$(FAKE_GH_HEAD_BRANCH="feature-branch" FAKE_CODEX_FIXTURE="$FIXTURES_DIR/clean.txt" \
+# 検証対象は「refs/pull 経由の fetch/worktree が完走するか」であり判定内容ではない
+# ため、fixture は構造化シグナルがあり判定が安定する tag_and_critical_keyword.txt
+# を使う (R-1 以降、タグ無し clean.txt は fail-closed で NEEDS-DIRECTOR相当になる)。
+out=$(FAKE_GH_HEAD_BRANCH="feature-branch" FAKE_CODEX_FIXTURE="$FIXTURES_DIR/tag_and_critical_keyword.txt" \
   run_kai --pr 1 --task t170 --mission "$MISSION_SLUG" --dry-run 2>&1) && rc=0 || rc=$?
 if [[ $rc -eq 0 ]] && echo "$out" | grep -q "DONE/LGTM相当"; then
   pass "origin に branch が無くても refs/pull/1/head 経由でレビュー成功 (F-2 修正確認)"
@@ -612,67 +680,69 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# F-3 (QA FAIL, PR#180): critical キーワード fallback が否定文脈を拾い、clean な
-# review を誤って needs-director にしていた欠陥の回帰テスト。t008 Description の
-# 再現例 3 件すべてが DONE 相当 (誤 needs-director にならない) ことを検証する。
+# F-3 → R-1 (t001): PR#180 の F-3 は「critical キーワード fallback の同一行
+# 否定語除外」で clean review の誤 needs-director を防いでいたが、この
+# ヒューリスティクス自体が R-1 (無関係な否定語で本物の critical 指摘を
+# 見逃す = 危険な方向への誤判定) の温床だったため、R-1 (t001) で
+# fallback を全廃した。t008 の 3 つの再現例は「タグ無し」という点で
+# 今や区別なく fail-closed の対象であり、いずれも NEEDS-DIRECTOR相当に
+# 倒れることを確認する (F-3 時点の「DONE相当であるべき」という前提は
+# R-1 の設計変更により意図的に覆された — 危険な結論=自動doneはallowlist
+# である以上、構造化シグナルが無い限り安全側と確認できない)。
 # ---------------------------------------------------------------------------
 echo ""
-echo "--- F-3: 'No critical issues found. The change looks good.' → DONE相当 (旧実装は誤 needs-director) ---"
-write_task t180 "F-3 repro 1"
+echo "--- F-3→R-1: 'No critical issues found. The change looks good.' → NEEDS-DIRECTOR相当 (タグ無しは fail-closed。F-3 時点の DONE 判定は R-1 で意図的に変更) ---"
+write_task t180 "F-3 repro 1 (R-1 fail-closed)"
 out=$(FAKE_GH_HEAD_BRANCH="feature-branch" FAKE_CODEX_FIXTURE="$FIXTURES_DIR/f3_repro_no_critical_issues.txt" \
   run_kai --pr 1 --task t180 --mission "$MISSION_SLUG" --dry-run 2>&1) && rc=0 || rc=$?
-if [[ $rc -eq 0 ]] && echo "$out" | grep -q "DONE/LGTM相当"; then
-  pass "'No critical issues found...' → DONE相当 (F-3 修正確認: 否定文脈は誤爆しない)"
+if [[ $rc -eq 0 ]] && echo "$out" | grep -q "method=no-signal needs_fix=1" && echo "$out" | grep -q "NEEDS-DIRECTOR相当"; then
+  pass "'No critical issues found...' → method=no-signal, NEEDS-DIRECTOR相当 (R-1: タグ無し fail-closed)"
 else
-  fail "REGRESSION (F-3): negated 'critical' phrase should NOT trigger needs-director — rc=$rc out=$out"
+  fail "tag-less output should fail closed to NEEDS-DIRECTOR regardless of content — rc=$rc out=$out"
 fi
 
 echo ""
-echo "--- F-3: 'This is a clean patch with no security vulnerability.' → DONE相当 ---"
-write_task t181 "F-3 repro 2"
+echo "--- F-3→R-1: 'This is a clean patch with no security vulnerability.' → NEEDS-DIRECTOR相当 ---"
+write_task t181 "F-3 repro 2 (R-1 fail-closed)"
 out=$(FAKE_GH_HEAD_BRANCH="feature-branch" FAKE_CODEX_FIXTURE="$FIXTURES_DIR/f3_repro_no_security_vuln.txt" \
   run_kai --pr 1 --task t181 --mission "$MISSION_SLUG" --dry-run 2>&1) && rc=0 || rc=$?
-if [[ $rc -eq 0 ]] && echo "$out" | grep -q "DONE/LGTM相当"; then
-  pass "'...no security vulnerability.' → DONE相当 (F-3 修正確認)"
+if [[ $rc -eq 0 ]] && echo "$out" | grep -q "method=no-signal needs_fix=1" && echo "$out" | grep -q "NEEDS-DIRECTOR相当"; then
+  pass "'...no security vulnerability.' → method=no-signal, NEEDS-DIRECTOR相当 (R-1: タグ無し fail-closed)"
 else
-  fail "REGRESSION (F-3): negated 'security vulnerability' phrase should NOT trigger needs-director — rc=$rc out=$out"
+  fail "tag-less output should fail closed to NEEDS-DIRECTOR regardless of content — rc=$rc out=$out"
 fi
 
 echo ""
-echo "--- F-3: 'Overall LGTM, nothing must be fixed.' → DONE相当 ---"
-write_task t182 "F-3 repro 3"
+echo "--- F-3→R-1: 'Overall LGTM, nothing must be fixed.' → NEEDS-DIRECTOR相当 ---"
+write_task t182 "F-3 repro 3 (R-1 fail-closed)"
 out=$(FAKE_GH_HEAD_BRANCH="feature-branch" FAKE_CODEX_FIXTURE="$FIXTURES_DIR/f3_repro_nothing_must_be_fixed.txt" \
   run_kai --pr 1 --task t182 --mission "$MISSION_SLUG" --dry-run 2>&1) && rc=0 || rc=$?
-if [[ $rc -eq 0 ]] && echo "$out" | grep -q "DONE/LGTM相当"; then
-  pass "'...nothing must be fixed.' → DONE相当 (F-3 修正確認)"
+if [[ $rc -eq 0 ]] && echo "$out" | grep -q "method=no-signal needs_fix=1" && echo "$out" | grep -q "NEEDS-DIRECTOR相当"; then
+  pass "'...nothing must be fixed.' → method=no-signal, NEEDS-DIRECTOR相当 (R-1: タグ無し fail-closed)"
 else
-  fail "REGRESSION (F-3): negated 'must be fixed' phrase should NOT trigger needs-director — rc=$rc out=$out"
+  fail "tag-less output should fail closed to NEEDS-DIRECTOR regardless of content — rc=$rc out=$out"
 fi
 
 echo ""
-echo "--- F-3: 否定語を伴わない本物の critical キーワードは引き続き needs-director になる (安全弁の健全性確認) ---"
-write_task t183 "F-3 genuine critical"
+echo "--- R-1: 否定語を伴わない本物の critical キーワードも引き続き needs-director になる (fail-closed の健全性確認) ---"
+write_task t183 "R-1 genuine critical no tag"
 out=$(FAKE_GH_HEAD_BRANCH="feature-branch" FAKE_CODEX_FIXTURE="$FIXTURES_DIR/prose_critical_no_tag.txt" \
   run_kai --pr 1 --task t183 --mission "$MISSION_SLUG" --dry-run 2>&1) && rc=0 || rc=$?
-if [[ $rc -eq 0 ]] && echo "$out" | grep -q "NEEDS-DIRECTOR相当"; then
-  pass "否定語なしの genuine critical キーワード → 引き続き NEEDS-DIRECTOR相当 (safety net は生きている)"
+if [[ $rc -eq 0 ]] && echo "$out" | grep -q "method=no-signal needs_fix=1" && echo "$out" | grep -q "NEEDS-DIRECTOR相当"; then
+  pass "否定語なしの genuine critical キーワード (タグ無し) → 引き続き NEEDS-DIRECTOR相当"
 else
-  fail "genuine critical keyword (no negation) should still trigger NEEDS-DIRECTOR — rc=$rc out=$out"
+  fail "genuine critical keyword (no tag) should still trigger NEEDS-DIRECTOR — rc=$rc out=$out"
 fi
 
 echo ""
-echo "--- F-3: [P#] タグがあれば critical キーワードの有無に関わらずタグ判定を信頼する ---"
-cat > "$FIXTURES_DIR/tag_and_critical_keyword.txt" <<'FIX'
-- [P3] Minor nit — foo.sh:1
-  This is a very minor style nit and not a critical issue at all.
-FIX
-write_task t184 "F-3 tag trusted over keyword"
+echo "--- R-1: [P#] タグがあれば本文の critical という単語の有無に関わらずタグ判定を信頼する ---"
+write_task t184 "R-1 tag trusted over prose content"
 out=$(FAKE_GH_HEAD_BRANCH="feature-branch" FAKE_CODEX_FIXTURE="$FIXTURES_DIR/tag_and_critical_keyword.txt" \
   run_kai --pr 1 --task t184 --mission "$MISSION_SLUG" --dry-run 2>&1) && rc=0 || rc=$?
 if [[ $rc -eq 0 ]] && echo "$out" | grep -q "method=tags needs_fix=0" && echo "$out" | grep -q "DONE/LGTM相当"; then
-  pass "[P3] タグのみ (critical という単語を含むが否定文脈) → タグ判定を信頼し DONE相当 (keyword fallback は適用されない)"
+  pass "[P3] タグのみ (本文に critical という単語を含む) → タグ判定を信頼し DONE相当 (構造化シグナルがあれば prose 内容は見ない)"
 else
-  fail "when a tag is present, keyword fallback should not override — rc=$rc out=$out"
+  fail "when a tag is present, its priority should be trusted over prose content — rc=$rc out=$out"
 fi
 
 # ---------------------------------------------------------------------------
@@ -769,13 +839,15 @@ fi
 # ---------------------------------------------------------------------------
 echo ""
 echo "--- F3: kai-review.sh を 2 本同時実行しても出力ファイルが独立している ---"
-write_task t140 "F3 parallel clean"
+write_task t140 "F3 parallel tagged done"
 write_task t141 "F3 parallel p1"
 LOG_A="$TMPDIR_TEST/f3_a.log"
 LOG_B="$TMPDIR_TEST/f3_b.log"
 
 (
-  FAKE_GH_HEAD_BRANCH="feature-branch" FAKE_CODEX_FIXTURE="$FIXTURES_DIR/clean.txt" FAKE_CODEX_LOG="$LOG_A" \
+  # R-1 以降、タグ無し clean 出力は fail-closed で NEEDS-DIRECTOR相当になるため、
+  # このテストの「DONE 側」は [P#] タグ付きの構造化シグナルがある fixture を使う。
+  FAKE_GH_HEAD_BRANCH="feature-branch" FAKE_CODEX_FIXTURE="$FIXTURES_DIR/tag_and_critical_keyword.txt" FAKE_CODEX_LOG="$LOG_A" \
     run_kai --pr 1 --task t140 --mission "$MISSION_SLUG" --dry-run > "$TMPDIR_TEST/f3_a.out" 2>&1
   echo $? > "$TMPDIR_TEST/f3_a.rc"
 ) &

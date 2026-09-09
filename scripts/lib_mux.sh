@@ -10,6 +10,7 @@
 #                                 tmux: `tmux list-sessions`, herdr: socket ping)
 #   mux_spawn <name> <cmd> [<cwd>]
 #   mux_send  <name> <text>
+#   mux_verify_sent <name> <text> → exit 0 if <text> left the input line (landed), 1 if still stuck
 #   mux_capture <name>          → prints screen contents
 #   mux_list [<suffix>]         → one name per line
 #   mux_kill <name>
@@ -33,6 +34,10 @@ mux_spawn() {
 
 mux_send() {
     python3 "$_LIB_MUX_PY" send "$@"
+}
+
+mux_verify_sent() {
+    python3 "$_LIB_MUX_PY" verify-sent "$@"
 }
 
 mux_capture() {

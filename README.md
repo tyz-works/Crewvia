@@ -95,6 +95,8 @@ Crewvia uses the following environment variables. Add them to your shell profile
 | `APPROVAL_TOKEN_TTL_SECONDS` | Optional | One-time token TTL in seconds (default: `900`) |
 | `CREWVIA_VERIFICATION_UI` | Optional | Set in **Taskvia's** Vercel env (not crewvia). `disabled` hides all verification UI and redirects `/verification-queue` to `/` |
 | `CREWVIA_MUX` | Optional | Mux backend override: `tmux` or `herdr`. Overrides `mode:` in `config/crewvia.yaml` |
+| `CREWVIA_WORKER_PERMISSION_MODE` | Optional | `claude --permission-mode` value for Worker sessions (default: `auto`). Set empty to fall back to the CLI's own default/manual mode |
+| `CREWVIA_DIRECTOR_PERMISSION_MODE` | Optional | `claude --permission-mode` value for the Director session (default: unset — CLI's own default/manual mode, since the Director bypasses the Taskvia approval hook entirely and relies on this as its only gate) |
 
 Example `.env`-style configuration:
 

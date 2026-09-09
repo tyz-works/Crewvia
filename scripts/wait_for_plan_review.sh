@@ -67,7 +67,14 @@ while [ "$_i" -lt "$_iterations" ]; do
     _mtime="$(_mtime_of "$REVIEW_OUTPUT")"
     if [ "$_mtime" -ge "$START_EPOCH" ]; then
       _fresh_seen=1
-      if grep -q '^\*\*Verdict:\*\*' "$REVIEW_OUTPUT" 2>/dev/null; then
+      # F2 (PR#188 t012 Seo 指摘): 以前は `^\*\*Verdict:\*\*` の存在だけを
+      # 見ていたため、reviewer が `**Verdict:** STOP` のような判定語以外を
+      # 書いた場合でも OK (exit 0) を返していた。呼び出し元 (scripts/plan.sh
+      # cmd_review) は `(approve|revise|reject)` を要求するため、そこで
+      # 「no valid verdict」として弾かれ、書式ミスなのに review cycle を
+      # 消費する経路になっていた。ここも同じ判定語セットを要求するように
+      # 揃え、OK 判定と最終判定の条件を一致させる。
+      if grep -Eq '^\*\*Verdict:\*\*[[:space:]]*(approve|revise|reject)\b' "$REVIEW_OUTPUT" 2>/dev/null; then
         echo "OK"
         echo "[wait_for_plan_review] valid verdict found in $REVIEW_OUTPUT" >&2
         exit 0

@@ -141,5 +141,24 @@ else
 fi
 
 echo ""
+echo "--- Test 7 (F2, PR#188 t012 Seo 指摘): fresh file already has a literal '**Verdict:**' line but with an unrecognized word (STOP) → NOT accepted as OK (grep must also match a known verdict word) ---"
+F7="$TMPDIR_TEST/t7.md"
+cat > "$F7" << 'EOF'
+**Verdict:** STOP
+EOF
+START=$(date +%s)
+OUT="$(bash "$WAIT_SCRIPT" "$F7" "$START" 1 1)"; RC=$?
+STATUS="$(echo "$OUT" | head -1)"
+# 以前は `^\*\*Verdict:\*\*` の存在だけで OK にしていたため、下流の
+# plan.sh cmd_review (approve|revise|reject を要求) と不整合になり、
+# 書式ミスなのに review cycle を消費していた (F2)。ここでは OK にならず
+# TIMEOUT_FRESH (判定語不明の別経路) に落ちることを検証する。
+if [[ "$RC" -eq 1 && "$STATUS" == "TIMEOUT_FRESH" ]]; then
+  pass "'**Verdict:** STOP' (未知の判定語) は OK にならず TIMEOUT_FRESH (F2 fix)"
+else
+  fail "未知の判定語が OK として受理されている (F2 regression) — rc=$RC status=$STATUS"
+fi
+
+echo ""
 echo "== Results: $PASS_COUNT passed, $FAIL_COUNT failed =="
 [[ "$FAIL_COUNT" -eq 0 ]]

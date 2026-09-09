@@ -105,5 +105,41 @@ echo "--- Case 3 (t011 FINDING-B): WAIT_STATUS=TIMEOUT_NONE → mux_kill called 
 _run_case "TIMEOUT_NONE" 1 "TIMEOUT_NONE"
 
 echo ""
+echo "--- Case 4 (F4, PR#188 t012 Seo 指摘): SIGTERM で中断された場合も mux_kill が呼ばれる (以前は成功時/タイムアウト時の明示 kill だけで、割り込み経路は未カバーだった) ---"
+TMPDIR_TEST="/tmp/crewvia-test-review-plan-pane-leak-$$-SIGTERM"
+rm -rf "$TMPDIR_TEST"
+mkdir -p "$TMPDIR_TEST/scripts" "$TMPDIR_TEST/queue/missions/testmission"
+cp "$REAL_REVIEW_PLAN" "$TMPDIR_TEST/scripts/review-plan.sh"
+KILL_LOG="$TMPDIR_TEST/mux_kill.log"
+: > "$KILL_LOG"
+cat > "$TMPDIR_TEST/scripts/lib_mux.sh" << EOF
+mux_available() { return 0; }
+mux_spawn() { return 0; }
+mux_kill() { echo "killed:\$1" >> "$KILL_LOG"; return 0; }
+EOF
+# wait_for_plan_review.sh の代わりに、spawn 後〜末尾の間 (待機中) を模した
+# 長時間 sleep のスタブを置く — この間に外側から SIGTERM を送る。
+cat > "$TMPDIR_TEST/scripts/wait_for_plan_review.sh" << 'EOF'
+#!/usr/bin/env bash
+sleep 30
+echo "OK"
+exit 0
+EOF
+chmod +x "$TMPDIR_TEST/scripts/wait_for_plan_review.sh"
+
+bash "$TMPDIR_TEST/scripts/review-plan.sh" testmission >/tmp/test_review_plan_stdout 2>&1 &
+CHILD_PID=$!
+# wait_for_plan_review.sh の sleep に入っているタイミングを見計らって SIGTERM
+sleep 1
+kill -TERM "$CHILD_PID" 2>/dev/null || true
+wait "$CHILD_PID" 2>/dev/null
+if grep -q '^killed:' "$KILL_LOG"; then
+  pass "SIGTERM 中断 → mux_kill called via trap (F4 fix, no pane leak)"
+else
+  fail "SIGTERM 中断で mux_kill が呼ばれていない (F4 regression, pane leak) — output=$(cat /tmp/test_review_plan_stdout)"
+fi
+rm -rf "$TMPDIR_TEST"
+
+echo ""
 echo "== Results: $PASS_COUNT passed, $FAIL_COUNT failed =="
 [[ "$FAIL_COUNT" -eq 0 ]]

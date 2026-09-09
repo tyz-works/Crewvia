@@ -61,9 +61,12 @@ SCOPE_WINDOW = 200  # 見出し以降、何文字まで判定語を探すか
 # だけの同じ穴を 6 件実測で再現した。
 #
 # 対応: 判定方向を反転する (QA 提案・採用)。「approve キーワードがあり
-# 否定語が無ければ approve」ではなく「判定 unit を整形した結果が既知の
-# 短い肯定形そのものと完全一致する場合にだけ approve、それ以外は判定不能」
-# にする。危険な結論 (approve) は allowlist、安全な結論 (reject/revise) は
+# 否定語が無ければ approve」ではなく「判定 unit (scope 内で最初に中身の
+# ある unit) を整形した結果が既知の短い肯定形そのものと完全一致する場合に
+# だけ approve、それ以外は判定不能」にする (F1, PR#188 t012/t014 で「scope
+# 内のどの unit でもよい」から「最初の1つだけ」に限定。旧実装は否定判定の
+# 下に並ぶチェック項目の一行が approve を確定させる穴があった)。
+# 危険な結論 (approve) は allowlist、安全な結論 (reject/revise) は
 # denylist、という non-symmetric な倒れ方 — 本ミッションで繰り返し出ている
 # 「倒れる方向」の考え方をそのまま適用したもの。
 #
@@ -116,11 +119,21 @@ def find_alt_verdict(content: str) -> str | None:
         if pattern.search(scope):
             return verdict
 
-    # approve だけ allowlist に反転 (t011) — unit 全体が既知の短い肯定形
-    # そのものと完全一致する場合にだけ approve。
+    # approve だけ allowlist に反転 (t011)。ただし「scope 内のどれか1つの
+    # unit が一致すれば approve」だと、否定判定の下に並ぶチェック項目の一行
+    # (例: 「問題なし」) が approve を確定させてしまう (F1, PR#188 t012 Seo
+    # 実測: 「GO は出せない。... **GO**」の末尾 unit だけを見て誤 approve)。
+    #
+    # 判定 unit = 「scope 内で最初に中身のある unit」だけを見る。見出し行
+    # だけの unit (総合判定ラベルを剥がすと空になるもの) は判定そのものでは
+    # ないため読み飛ばすが、それ以外の最初の unit が判定そのものであり、
+    # そこより後ろの unit (チェック項目の箇条書き等) は一切見ない。
     for unit in _iter_units(scope):
-        if _canonical_unit(unit).lower() in APPROVE_EXACT:
-            return "approve"
+        canon = _canonical_unit(unit)
+        if not canon:
+            continue  # 見出しラベルだけの unit (中身が空) は読み飛ばす
+        # 最初の中身のある unit = 判定そのもの。ここだけを見て確定する。
+        return "approve" if canon.lower() in APPROVE_EXACT else None
     return None
 
 

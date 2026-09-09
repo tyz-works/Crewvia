@@ -142,6 +142,39 @@ else
   fail "approve 正常系の期待値と不一致 (regression) — rc=$RC2 before=$BEFORE2 after=$AFTER2 expected=$EXPECTED2 status=$STATUS2 output=$OUT2"
 fi
 
+echo ""
+echo "--- Case 3 (F2, PR#188 t012 Seo 指摘): review-plan.sh は exit 0 (成功) を返すが plan_review.md の判定語が不正 (approve/revise/reject のいずれでもない) → cycle_count は消費されない ---"
+# review-plan.sh 自身が「OK」と判断して exit 0 で返したのに、plan.sh 側の
+# 厳密な正規表現 (approve|revise|reject) では読めない、という不整合を直接
+# 再現する。以前は _rollback_to_drafting に refund_cycle=True が付いていな
+# かったため、reviewer の書式ミスだけで cycle_count が消費されていた。
+_setup
+BEFORE3="$(_cycle_count_of)"
+cat > "$TMPDIR_TEST/scripts/review-plan.sh" << 'EOF'
+#!/usr/bin/env bash
+SLUG="$1"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+MISSION_DIR="$(cd "$SCRIPT_DIR/.." && pwd)/queue/missions/$SLUG"
+cat > "$MISSION_DIR/plan_review.md" << 'INNER'
+**Verdict:** STOP
+INNER
+exit 0
+EOF
+chmod +x "$TMPDIR_TEST/scripts/review-plan.sh"
+
+set +e
+OUT3="$("$PLAN_SH" review testmission 2>&1)"
+RC3=$?
+set -e
+AFTER3="$(_cycle_count_of)"
+STATUS3="$(_status_of)"
+
+if [[ "$RC3" -ne 0 && "$AFTER3" == "$BEFORE3" && "$STATUS3" == "drafting" ]]; then
+  pass "不正な判定語 (STOP) → cycle_count 消費なし (before=$BEFORE3 after=$AFTER3), status=drafting に復帰 (F2 fix)"
+else
+  fail "不正な判定語での期待値と不一致 (F2 regression) — rc=$RC3 before=$BEFORE3 after=$AFTER3 status=$STATUS3 output=$OUT3"
+fi
+
 unset CREWVIA_QUEUE
 
 echo ""

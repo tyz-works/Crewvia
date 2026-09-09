@@ -2452,7 +2452,17 @@ def cmd_review(args):
                 verdict = vm.group(1)
                 break
     if not verdict:
-        _rollback_to_drafting("no valid verdict in plan_review.md")
+        # F2 (PR#188 t012 Seo 指摘): wait_for_plan_review.sh の OK 判定は
+        # `^\*\*Verdict:\*\*` の存在だけを見ており判定語 (approve/revise/
+        # reject) までは検証しない。そのため reviewer が
+        # `**Verdict:** STOP` のような未知の判定語を書くと wait_for は OK
+        # (exit 0) を返すが、ここ (plan.sh 側) は判定語を要求するため
+        # verdict が None になる — つまりこの分岐は「reviewer の書式ミス
+        # (判定語自体が不正)」で到達しうる、review-plan.sh 失敗時と同種の
+        # ケース。cycle_count の先食いを refund しないと、書式ミスだけで
+        # Director が review cycle を失う (上の "review-plan.sh timed out
+        # but plan_review.md exists" 分岐と同じ理由で refund_cycle=True)。
+        _rollback_to_drafting("no valid verdict in plan_review.md", refund_cycle=True)
         die(f"No valid verdict found in plan_review.md for mission '{slug}'")
 
     # --- Step 5: update mission based on verdict ---

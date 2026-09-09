@@ -379,5 +379,75 @@ else
 fi
 
 echo ""
+echo "--- Test 19 (F1, PR#188 t012 Seo 実測 1例目): 否定判定 + scope 内に離れた肯定 unit ('GO は出せない。... **GO**') → approve にならず判定不能, exit 1 ---"
+F19="$TMPDIR_TEST/t19.md"
+cat > "$F19" << 'EOF'
+# Plan Review: test-mission
+
+## 総合判定
+
+GO は出せない。理由は t003 の Description が空であること。
+
+- 粒度: 適切
+- 依存: 適切
+
+**GO**
+EOF
+ORIG19="$(cat "$F19")"
+python3 "$NORMALIZE" "$F19" >/tmp/test_normalize_stdout 2>&1
+RC19=$?
+NEW19="$(cat "$F19")"
+if [[ "$RC19" -eq 1 && "$NEW19" == "$ORIG19" ]]; then
+  pass "'GO は出せない。... **GO**' → 末尾の孤立した肯定 unit に釣られず判定不能のまま (F1 fix)"
+else
+  fail "'GO は出せない。... **GO**' が approve に化けている (F1 regression) — rc=$RC19 content=$(cat "$F19")"
+fi
+
+echo ""
+echo "--- Test 20 (F1, PR#188 t012 Seo 実測 2例目): 保留判定 + scope 内に離れた '問題なし' unit → approve にならず判定不能, exit 1 ---"
+F20="$TMPDIR_TEST/t20.md"
+cat > "$F20" << 'EOF'
+# Plan Review: test-mission
+
+## 総合判定
+
+判定は保留。
+
+問題なし。
+
+指摘事項を参照。
+EOF
+ORIG20="$(cat "$F20")"
+python3 "$NORMALIZE" "$F20" >/tmp/test_normalize_stdout 2>&1
+RC20=$?
+NEW20="$(cat "$F20")"
+if [[ "$RC20" -eq 1 && "$NEW20" == "$ORIG20" ]]; then
+  pass "'判定は保留。問題なし。指摘事項を参照。' → 離れた '問題なし' unit に釣られず判定不能のまま (F1 fix)"
+else
+  fail "'判定は保留。問題なし。...' が approve に化けている (F1 regression) — rc=$RC20 content=$(cat "$F20")"
+fi
+
+echo ""
+echo "--- Test 21 (F1, scope に複数 unit があるケースの一般形): 最初の中身のある unit が肯定形と一致する場合のみ approve、後続 unit は無視される ---"
+F21="$TMPDIR_TEST/t21.md"
+cat > "$F21" << 'EOF'
+# Plan Review: test-mission
+
+## 総合判定
+
+問題なし。
+
+- 粒度: 不適切
+- 依存: 循環あり
+EOF
+python3 "$NORMALIZE" "$F21" >/tmp/test_normalize_stdout 2>&1
+RC21=$?
+if [[ "$RC21" -eq 0 ]] && grep -q '^\*\*Verdict:\*\* approve' "$F21"; then
+  pass "最初の unit が '問題なし' と完全一致 → approve (後続 unit の中身は判定に影響しない)"
+else
+  fail "最初の unit が肯定形そのものの場合は approve であるべき — rc=$RC21 content=$(cat "$F21")"
+fi
+
+echo ""
 echo "== Results: $PASS_COUNT passed, $FAIL_COUNT failed =="
 [[ "$FAIL_COUNT" -eq 0 ]]

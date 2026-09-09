@@ -76,6 +76,15 @@ INLINE_CMD="unset CLAUDE_CODE_CHILD_SESSION; export CLAUDE_CODE_FORCE_SESSION_PE
      2>&1 | tee /tmp/plan_reviewer_$$.log"
 
 MUX_LAUNCHED=0
+# F4 (PR#188 t012 Seo 指摘): 以前は成功時とタイムアウト時の2箇所に明示的な
+# mux_kill を置いていたが、それでは Director の Ctrl-C (SIGINT) / SIGTERM /
+# spawn 後〜末尾の間で set -e により中断した場合の経路をカバーできず、
+# plan-reviewer の pane が残り続けていた。EXIT/INT/TERM の trap 1箇所に
+# 集約することで、スクリプトがどう終わっても (正常終了・タイムアウト・
+# 中断) 必ず1回だけ kill されるようにする (成功時・タイムアウト時の個別
+# kill は不要になったため削除)。
+trap '[[ $MUX_LAUNCHED -eq 1 ]] && mux_kill "$WINDOW_NAME" 2>/dev/null || true' EXIT INT TERM
+
 if mux_available && mux_spawn "$WINDOW_NAME" "$INLINE_CMD" "$CREWVIA_DIR"; then
     MUX_LAUNCHED=1
 else
@@ -118,7 +127,7 @@ printf '%s\n' "$WAIT_OUTPUT" | tail -n +2 >&2 || true
 
 if [[ "$WAIT_RC" -eq 0 && "$WAIT_STATUS" == "OK" ]]; then
     echo "[review-plan.sh] plan_review.md output complete"
-    [[ $MUX_LAUNCHED -eq 1 ]] && mux_kill "$WINDOW_NAME" 2>/dev/null || true
+    # kill は上の EXIT trap (F4) が exit 時に自動で行うため、ここでは呼ばない。
     exit 0
 fi
 
@@ -132,8 +141,5 @@ else
     echo "[review-plan.sh] Timeout: plan_review.md was not produced within 600s" >&2
 fi
 
-# t011 (QA t009 FINDING-B, pane leak): 成功時 (上の exit 0) しか mux_kill して
-# いなかったため、timeout / 異常終了の経路では Plan Reviewer の mux window が
-# 残り続けていた (QA が手動 kill して発見)。タイムアウト経路でも同様に kill する。
-[[ $MUX_LAUNCHED -eq 1 ]] && mux_kill "$WINDOW_NAME" 2>/dev/null || true
+# kill は上の EXIT trap (F4) が exit 時に自動で行うため、ここでは呼ばない。
 exit 1

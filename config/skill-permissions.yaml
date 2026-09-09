@@ -247,8 +247,13 @@ skills:
       - "Grep(**)"
       - "Glob(**)"
       # hook (pre-tool-use.sh) は非 Bash ツールに bare な tool 名 (`Write` 等) を
-      # signature として渡すため、bare token で記述する。パス制限は agents/plan_reviewer.md
-      # で「plan_review.md 以外への出力禁止」として agent prompt 層で担保している。
+      # signature として渡すため、bare token で記述する。ここでの allow はパスを
+      # 区別しない (どの Write でも許可) が、pre-tool-use.sh 側に専用の構造的
+      # ガード ("Plan-review write scope guard", t002) があり、実際に書き込める
+      # のは queue/missions/<slug>/plan_review.md だけに制限されている。
+      # このセクションの allow だけを見て「mission.yaml にも書ける」と誤解しない
+      # こと — 過去に agent prompt 層のお願いだけに頼っていた頃、実際に
+      # mission.yaml が規格外の値に書き換えられた事故がある (t002 Description 参照)。
       - "Write"
     deny:
       # bare token は hook signature と完全一致。`Edit(**)` 等は将来 hook が

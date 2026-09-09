@@ -2392,22 +2392,54 @@ def cmd_review(args):
     print(f"[review] invoking review-plan.sh...", file=sys.stderr)
     proc = subprocess.run(['bash', review_script, slug])
 
-    def _rollback_to_drafting(reason):
-        """P2: rollback mission from reviewing → drafting on failure."""
+    def _rollback_to_drafting(reason, refund_cycle=False):
+        """P2: rollback mission from reviewing → drafting on failure.
+
+        refund_cycle=True (t011, QA t009 FINDING-B): Step 2 (_do_start) が
+        review-plan.sh 呼び出し前に cycle_count を先食いしているため、判定不能
+        (reviewer の書式ミスで verdict が読めなかった) で打ち切った場合は
+        その先食いを元に戻す。reviewer の書式ミスで Director が review cycle を
+        失うのは筋が悪いため。
+        """
         def _do_rollback():
             m = load_mission(slug)
             if m.get('status') == 'reviewing':
                 m['status'] = 'drafting'
+                if refund_cycle:
+                    review = m.get('review') or {}
+                    if not isinstance(review, dict):
+                        review = {}
+                    cc = review.get('cycle_count') or 0
+                    if cc > 0:
+                        review['cycle_count'] = cc - 1
+                    m['review'] = review
                 save_mission(slug, m)
                 print(f"[review] rollback: mission '{slug}' → drafting ({reason})", file=sys.stderr)
         with_lock(_do_rollback)
 
+    review_output = os.path.join(MISSIONS_DIR, slug, 'plan_review.md')
+
     if proc.returncode != 0:
+        # t002: plan_review.md 自体は書かれているのにフォーマットだけが原因で
+        # review-plan.sh がタイムアウトすることがある (別表記の verdict がさらに
+        # normalize_plan_review_verdict.py でも判定できなかったケース)。この場合
+        # 判定内容自体は活かせる可能性が高く、cycle_count を無駄にもう1回消費
+        # させるより Director に手動確認を促す方が安全側。
+        if os.path.exists(review_output):
+            _rollback_to_drafting(
+                "review-plan.sh timed out but plan_review.md exists",
+                refund_cycle=True,
+            )
+            die(
+                f"review-plan.sh failed or timed out for mission '{slug}', but "
+                f"{review_output} was written — inspect it by hand before re-running "
+                f"review. If the verdict itself is legible but just in a non-standard "
+                f"format, fix the format manually instead of consuming another review cycle."
+            )
         _rollback_to_drafting("review-plan.sh failed")
         die(f"review-plan.sh failed or timed out for mission '{slug}'")
 
     # --- Step 4: read verdict from plan_review.md ---
-    review_output = os.path.join(MISSIONS_DIR, slug, 'plan_review.md')
     if not os.path.exists(review_output):
         _rollback_to_drafting("plan_review.md not found")
         die(f"plan_review.md not found for mission '{slug}' after review-plan.sh completed")
@@ -2420,7 +2452,17 @@ def cmd_review(args):
                 verdict = vm.group(1)
                 break
     if not verdict:
-        _rollback_to_drafting("no valid verdict in plan_review.md")
+        # F2 (PR#188 t012 Seo 指摘): wait_for_plan_review.sh の OK 判定は
+        # `^\*\*Verdict:\*\*` の存在だけを見ており判定語 (approve/revise/
+        # reject) までは検証しない。そのため reviewer が
+        # `**Verdict:** STOP` のような未知の判定語を書くと wait_for は OK
+        # (exit 0) を返すが、ここ (plan.sh 側) は判定語を要求するため
+        # verdict が None になる — つまりこの分岐は「reviewer の書式ミス
+        # (判定語自体が不正)」で到達しうる、review-plan.sh 失敗時と同種の
+        # ケース。cycle_count の先食いを refund しないと、書式ミスだけで
+        # Director が review cycle を失う (上の "review-plan.sh timed out
+        # but plan_review.md exists" 分岐と同じ理由で refund_cycle=True)。
+        _rollback_to_drafting("no valid verdict in plan_review.md", refund_cycle=True)
         die(f"No valid verdict found in plan_review.md for mission '{slug}'")
 
     # --- Step 5: update mission based on verdict ---

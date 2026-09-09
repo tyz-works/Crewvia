@@ -457,6 +457,56 @@ if [ "$TOOL_NAME" = "Bash" ] && [ -n "$COMMAND" ]; then
   fi
 fi
 
+# --- Plan-review write scope guard: plan_review スキルは plan_review.md 以外への
+#     書き込みを一切許可しない (t002, mission 20260908-launch-reliability) ---
+# 背景: plan-reviewer (scripts/review-plan.sh が起動する Opus セッション) は
+# config/skill-permissions.yaml の plan_review セクションで Write を許可されて
+# いるが、hook は非 Bash ツールに bare な tool 名 ("Write" 等、file_path を含ま
+# ない) を signature として渡すため、その allow はパスを一切区別できず「どの
+# パスへの Write でも通す」ことと同義になっていた。agents/plan_reviewer.md の
+# 「plan_review.md 以外への出力禁止」はプロンプト層のお願いに過ぎず、構造的な
+# 強制力が無かった。
+#
+# 実際に発生した事故 (20260908-codex-reviewer-phase3): plan-reviewer が
+# plan_review.md だけでなく mission.yaml も書き換え、status/last_verdict に
+# 規格外の値 (active / GO) を書き込んだ。plan.sh launch は status=='ready' 以外
+# を拒否するため、mission の launch まで壊れる二次被害が出た。
+#
+# 対策: SKILLS に plan_review が含まれるセッションの Write/Edit/MultiEdit/
+# NotebookEdit を、書き込み先が queue/missions/<slug>/plan_review.md である
+# 場合のみ許可し、それ以外は deny する。skill-permissions.yaml 側の bare
+# "Write" allow より前に評価される構造的ガードなので、config の記述ミスや
+# 将来の変更（skill 側だけの緩和）ではバイパスできない。
+#
+# 対象外 (誤爆防止): SKILLS に plan_review が含まれないセッション。
+case ",${SKILLS:-}," in
+  *,plan_review,*)
+    if { [ "$TOOL_NAME" = "Edit" ] || [ "$TOOL_NAME" = "Write" ] || [ "$TOOL_NAME" = "MultiEdit" ] || [ "$TOOL_NAME" = "NotebookEdit" ]; }; then
+      _PR_GUARD_PATH="${FILE_PATH:-${NOTEBOOK_PATH:-}}"
+      _PR_ALLOWED=0
+      if [ -n "$_PR_GUARD_PATH" ]; then
+        case "$_PR_GUARD_PATH" in
+          /*) _PR_ABS="$_PR_GUARD_PATH" ;;
+          *)  _PR_ABS="$(pwd)/$_PR_GUARD_PATH" ;;
+        esac
+        _PR_REPO_REAL="$(realpath -m "$_CREWVIA_REPO" 2>/dev/null || echo "$_CREWVIA_REPO")"
+        # realpath -m: 存在チェックなし (Write は新規ファイル作成のケースがある)
+        _PR_ABS_REAL="$(realpath -m "$_PR_ABS" 2>/dev/null || echo "$_PR_ABS")"
+        case "$_PR_ABS_REAL" in
+          "${_PR_REPO_REAL}"/queue/missions/*/plan_review.md)
+            _PR_ALLOWED=1
+            ;;
+        esac
+      fi
+      if [ "$_PR_ALLOWED" -ne 1 ]; then
+        echo "[pre-tool-use] 🚫 plan_review write scope violation: ${TOOL_NAME}(${_PR_GUARD_PATH:-unknown})" >&2
+        emit_decision "deny" "plan_review スキルは queue/missions/<slug>/plan_review.md 以外への書き込みが禁止されています (mission.yaml や task ファイルを直接変更しないでください)。"
+        exit 0
+      fi
+    fi
+    ;;
+esac
+
 # --- Skill-based permission check ---
 _SKILL_PERMS_YAML="${_CREWVIA_REPO}/config/skill-permissions.yaml"
 _SKILL_PERMS_PY="${_CREWVIA_REPO}/hooks/lib_skill_perms.py"

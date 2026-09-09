@@ -1043,6 +1043,66 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# F-A (t007, Seo 指摘): [P#] タグ抽出が出力全体への無アンカー grep だったため、
+# レビュー対象の diff/コードが文字列 "[P3]" 等を含んでいて codex がそれを
+# 地の文で引用しただけで HAD_SIGNAL=1 が立ち、同じ出力中の散文 critical
+# finding が丸ごと無視される欠陥があった。
+#   fa_repro_quoted_tag.txt — t007 Description に記載された再現例そのもの
+#   (Seo が隔離ハーネスで実測。現行 codex-cli では `kai-review.sh` /
+#   `test_kai_review.sh` 自身を触る PR の diff に "[P0]"-"[P3]" のリテラルが
+#   実際に含まれるため、机上の想定ではなく実際に起こりうる入力)。
+# ---------------------------------------------------------------------------
+cat > "$FIXTURES_DIR/fa_repro_quoted_tag.txt" <<'FIX'
+The diff adds a comment mentioning [P3] priority tags to kai-review.sh.
+Separately, this introduces a critical data-loss bug in the queue writer.
+FIX
+
+# 対比用: 同じ内容を正しい finding 行形式 (行頭 "- [P#]") で書いた場合は
+# 引き続き検出されること (アンカー化が本物の finding まで取りこぼしていないか)。
+cat > "$FIXTURES_DIR/fa_properly_tagged.txt" <<'FIX'
+This introduces a critical data-loss bug in the queue writer.
+
+- [P0] Data loss in queue writer — queue.sh:10
+  Separately, the diff also adds a comment mentioning [P3] priority tags to
+  kai-review.sh, but that citation must not be mistaken for a real finding.
+FIX
+
+echo ""
+echo "--- F-A [最重要]: 出力全体を引用した無関係な [P3] → 旧実装は auto-done していたが、アンカー化で fail-closed (地の文の critical finding は無視されない) ---"
+write_task t230 "F-A repro quoted tag"
+out=$(FAKE_GH_HEAD_BRANCH="feature-branch" FAKE_CODEX_FIXTURE="$FIXTURES_DIR/fa_repro_quoted_tag.txt" \
+  run_kai --pr 1 --task t230 --mission "$MISSION_SLUG" --dry-run 2>&1) && rc=0 || rc=$?
+if [[ $rc -eq 0 ]] && echo "$out" | grep -q "method=no-signal needs_fix=1" && echo "$out" | grep -q "NEEDS-DIRECTOR相当"; then
+  pass "地の文で引用された [P3] のみ (finding 行の形式ではない) → method=no-signal, NEEDS-DIRECTOR相当 (F-A 修正確認: 旧実装は method=tags needs_fix=0 で auto-done していた)"
+else
+  fail "REGRESSION (F-A): a bare-prose citation of [P3] must not be treated as a structured signal — rc=$rc out=$out"
+fi
+
+echo ""
+echo "--- F-A (実行系): 引用のみの [P3] → 実際に plan.sh needs-director が呼ばれ status=needs_director になる ---"
+write_task_in_progress t231 "F-A repro quoted tag real needs-director"
+FAKE_GH_HEAD_BRANCH="feature-branch" FAKE_CODEX_FIXTURE="$FIXTURES_DIR/fa_repro_quoted_tag.txt" \
+  run_kai --pr 1 --task t231 --mission "$MISSION_SLUG" --skip-pull > "$TMPDIR_TEST/t231.out" 2>&1
+rc231=$?
+st231="$(task_status t231)"
+if [[ $rc231 -eq 0 && "$st231" == "needs_director" ]]; then
+  pass "引用のみの [P3] (実行系) → 実際に status=needs_director になる (旧実装なら誤って done になっていた)"
+else
+  fail "REGRESSION (F-A): quoted-tag-only real-run should set status=needs_director — rc=$rc231 status=$st231 (see $TMPDIR_TEST/t231.out)"
+fi
+
+echo ""
+echo "--- F-A (取りこぼし確認): 行頭アンカーの finding 行 + 本文中に無関係な [P3] 引用が同居 → 引き続き検出されること (アンカー化で本物の finding まで落としていないか) ---"
+write_task t232 "F-A properly tagged with unrelated citation"
+out=$(FAKE_GH_HEAD_BRANCH="feature-branch" FAKE_CODEX_FIXTURE="$FIXTURES_DIR/fa_properly_tagged.txt" \
+  run_kai --pr 1 --task t232 --mission "$MISSION_SLUG" --dry-run 2>&1) && rc=0 || rc=$?
+if [[ $rc -eq 0 ]] && echo "$out" | grep -q "method=tags needs_fix=1" && echo "$out" | grep -q "NEEDS-DIRECTOR相当"; then
+  pass "行頭アンカーの [P0] finding は本文中の無関係な [P3] 引用と混在していても正しく検出される (F-A: アンカー化が過剰検出を招いていないこと)"
+else
+  fail "REGRESSION (F-A): a properly line-anchored finding must still be detected even alongside an unrelated in-body citation — rc=$rc out=$out"
+fi
+
+# ---------------------------------------------------------------------------
 # F-B (t006, Seo 指摘): 出力が複数 JSON ドキュメント (JSONL) の場合、JSON 経路の
 # 入口ゲート自体に入らせず fail-closed (no-signal) に倒れること。
 # 現行 codex-cli は --output-schema 下で単一 JSON しか返さないため実機再現は

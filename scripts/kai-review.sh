@@ -490,6 +490,19 @@ _info "Review output length: ${#REVIEW_CONTENT} chars"
 #   不能) の場合は JSON 経路そのものに入らず fail-closed 側 (下記 [P#] タグ
 #   判定 → 見つからなければ no-signal) に確実にフォールバックするようにした。
 #
+#   F-A (Seo 指摘, t007): [P#] タグ抽出 (下記 [P#] タグ判定分岐) が出力全体への
+#   無アンカー grep だったため、レビュー対象の diff/コードが (`kai-review.sh` /
+#   `test_kai_review.sh` 自身のように) 文字列 `[P3]` 等を含んでいて codex が
+#   それを地の文で引用しただけで `HAD_SIGNAL=1` が立ち、同じ出力中に散文で
+#   述べられた本物の critical finding が丸ごと無視されていた (実測:
+#   "...mentioning [P3] priority tags... critical data-loss bug..." →
+#   method=tags needs_fix=0 で auto-done)。R-1 (t001) で auto-done 経路が
+#   「JSON 空配列」と「[P#] タグ」の 2 本に絞られた結果、この偽造されうる
+#   トークンが auto-done への最安経路になっていた。タグ抽出を finding 行
+#   (行頭の箇条書きマーカーに続くタグ) にアンカーし、地の文への引用を
+#   拾わないようにした。取りこぼしは HAD_SIGNAL=0 → fail-closed に倒れるため
+#   安全側 (「どこを見るか」を 1 箇所に絞る = allowlist の scope を絞る)。
+#
 #   洗い直しの結果 (入口・内側・fallback):
 #   - 入口: [P2] で修正済み。findings が配列でない限り JSON 経路に入らない。
 #     F-B (t006) で「JSON ドキュメントがちょうど 1 つであること」も追加ゲート。
@@ -497,9 +510,11 @@ _info "Review output length: ${#REVIEW_CONTENT} chars"
 #     jq 自体の失敗はいずれも危険側 (NEEDS_FIX=1) に倒れることを確認済み。
 #   - jq 不在環境: jq が無ければ exit 127 で入口の `if` が false になり
 #     [P#] タグ判定へフォールバックするため安全。
-#   - fallback: HAD_SIGNAL が「配列として JSON 判定できた」場合と「[P#] タグ
-#     が見つかった」場合のみ 1 になり、それ以外 (HAD_SIGNAL=0) は下記の通り
-#     無条件で needs-director に倒れるため、fail-open な抜け道は無い。
+#   - fallback ([P#] タグ判定, F-A で行アンカー化): HAD_SIGNAL が「配列として
+#     JSON 判定できた」場合と「finding 行にアンカーされた [P#] タグが
+#     見つかった」場合のみ 1 になり、それ以外 (HAD_SIGNAL=0 — 地の文への
+#     引用しか無い場合も含む) は下記の通り無条件で needs-director に倒れる
+#     ため、fail-open な抜け道は無い。
 NEEDS_FIX=0
 JUDGE_METHOD="tags"
 HAD_SIGNAL=0
@@ -549,17 +564,35 @@ if [[ "$JSON_DOC_COUNT" -eq 1 ]] && FINDINGS_COUNT=$(printf '%s' "$REVIEW_CONTEN
   fi
   _info "Judged via structured JSON output (findings=${FINDINGS_COUNT}, unsafe_or_unclassified=${HIGH_COUNT})"
 else
-  P_TAGS="$(echo "$REVIEW_CONTENT" | grep -oiE '\[P[0-3]\]' | tr '[:upper:]' '[:lower:]' | sort -u || true)"
+  # F-A (t007, Seo 指摘): 旧実装は `[P0]`-`[P3]` を出力全体に対して無アンカーで
+  # grep していたため、レビュー対象の diff/コードが (このファイル自身のように)
+  # 文字列 "[P3]" を含んでいて codex がそれを引用しただけで HAD_SIGNAL=1 が
+  # 立ち、同じ出力内で散文として述べられた本物の critical finding が丸ごと
+  # 無視されていた (実測: "The diff adds a comment mentioning [P3] priority
+  # tags... critical data-loss bug..." → 旧実装は method=tags needs_fix=0 で
+  # auto-done)。`kai-review.sh`/`test_kai_review.sh` 自身を触る PR の diff には
+  # `[P0]`-`[P3]` のリテラルが実際に含まれるため机上の話ではない。
+  #
+  # 対処: タグ抽出を finding 行 (行頭の箇条書きマーカーに続くタグ) にアンカー
+  # する。実測 fixture (p1_findings.txt / p0_findings.txt / tag_and_critical_keyword.txt)
+  # はいずれも `- [P#] <title> — <file>:<line>` の形式だったため、行頭の
+  # 任意の空白 + 任意の `-` 箇条書きマーカー + 任意の空白 + `[P#]` にアンカーする。
+  # 取りこぼしは HAD_SIGNAL=0 → fail-closed (R-1) に倒れて安全側なので、
+  # フォーマットの揺れには厳しい側に寄せる (「引用された [P#] を拾う」方向の
+  # 緩さは危険側なので許容しない)。
+  FINDING_LINES="$(echo "$REVIEW_CONTENT" | grep -iE '^[[:space:]]*-?[[:space:]]*\[P[0-3]\]' || true)"
+  P_TAGS="$(echo "$FINDING_LINES" | grep -oiE '\[P[0-3]\]' | tr '[:upper:]' '[:lower:]' | sort -u || true)"
   if [[ -n "$P_TAGS" ]]; then
     HAD_SIGNAL=1
     if echo "$P_TAGS" | grep -qE '\[p[012]\]'; then
       NEEDS_FIX=1
     fi
-    _info "Judged via [P#] priority tags: $(echo "$P_TAGS" | tr '\n' ' ')"
+    _info "Judged via [P#] priority tags (anchored to finding lines): $(echo "$P_TAGS" | tr '\n' ' ')"
   else
     # タグが 1 つも無い場合は HAD_SIGNAL=0 のままにし、下の fail-closed 分岐に
-    # 委ねる (R-1)。
-    _info "No [P#] tags found in review output"
+    # 委ねる (R-1)。行頭アンカーに一致しない (=引用や地の文にしか [P#] が
+    # 現れない) 場合もここに落ちる — 取りこぼしは安全側 (F-A)。
+    _info "No [P#] tags found anchored to a finding line in review output"
   fi
 fi
 

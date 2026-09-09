@@ -20,6 +20,13 @@
 > 維持)。あわせて Seo 指摘の F-B (JSONL 出力が bash 数値比較のエラーで握りつぶされ auto-done する
 > 欠陥) を修正し、diff の非空性・サイズ上限・取得失敗を codex 呼び出し前にゲートする受け入れ基準を
 > 実装した。詳細は下記「t006: `codex exec review` → `codex exec --output-schema` 移行」を参照。
+> **F-A (2026-09-09, mission: 20260909-safety-gate-hardening, t007)**: `[P#]` タグ抽出が出力全体への
+> 無アンカー grep だったため、レビュー対象の diff/コードが `[P3]` 等の文字列を含んでいて codex が
+> それを地の文で引用しただけで `HAD_SIGNAL=1` が立ち、同じ出力中の散文 critical finding が丸ごと
+> 無視される欠陥があった (`kai-review.sh`/`test_kai_review.sh` 自身を触る PR の diff には
+> `[P0]`-`[P3]` のリテラルが実際に含まれるため机上の話ではない)。タグ抽出を finding 行
+> (行頭の箇条書きマーカーに続くタグ) にアンカーして修正。詳細は下記「F-A: `[P#]` タグ抽出の
+> アンカー化」を参照。
 
 ---
 
@@ -312,6 +319,49 @@ false 扱いになり、**`NEEDS_FIX=0` のまま `HAD_SIGNAL=1` が立って au
   想定されていなかった。
 - **ローカルブランチの参照は陳腐化しうる**。`--base main` (ローカル) をそのまま信用せず、
   自動化スクリプトが diff base に使う ref は都度 origin から fetch する方が安全。
+
+## F-A: `[P#]` タグ抽出のアンカー化 (2026-09-09, mission 20260909-safety-gate-hardening, t007)
+
+t006 で JSON 経路が主経路になったが、`[P#]` タグ判定は依然として fallback (JSON 判定が
+成立しない場合の forward/backward-compat 経路) として残っている。この fallback 自体に
+Seo が隔離ハーネスで発見した欠陥があった:
+
+**欠陥**: タグ抽出が `grep -oiE '\[P[0-3]\]'` という**出力全体への無アンカー grep**
+だったため、レビュー対象の diff やコードそのものが `[P0]`-`[P3]` という文字列を含んで
+いて codex がそれを地の文で引用しただけで `HAD_SIGNAL=1` が立ってしまう。実測:
+
+```
+入力:
+  The diff adds a comment mentioning [P3] priority tags to kai-review.sh.
+  Separately, this introduces a critical data-loss bug in the queue writer.
+結果 (修正前): method=tags needs_fix=0   (= auto-done)
+```
+
+散文で述べられた本物の critical finding が丸ごと無視される。`kai-review.sh` /
+`test_kai_review.sh` 自身を触る PR の diff には `[P0]`-`[P3]` のリテラルが実際に含まれる
+ため (このファイル自身がまさにそれ)、机上の想定ではなく実際に起こりうる入力である。
+R-1 (t001) で auto-done 経路が「JSON 空配列」と「`[P#]` タグ」の 2 本に絞られたことで、
+この偽造されうるトークンが auto-done への最安経路になっていた。
+
+**対処**: タグ抽出を **finding 行** (行頭の箇条書きマーカーに続くタグ) にアンカーした。
+実測 fixture (`p1_findings.txt` / `p0_findings.txt` / `tag_and_critical_keyword.txt`) は
+いずれも `- [P#] <title> — <file>:<line>` という形式だったため、行頭の任意の空白 + 任意の
+`-` 箇条書きマーカー + 任意の空白 + `[P#]` にアンカーする正規表現 (`^[[:space:]]*-?[[:space:]]*\[P[0-3]\]`)
+に変更し、行として一致したものだけからタグを抽出するようにした。地の文での引用は
+行頭に来ないため拾われなくなる。
+
+**倒れる方向**: アンカーに一致しない場合は `HAD_SIGNAL=0` のまま R-1 の fail-closed
+分岐 (無条件で needs-director) に委ねられるため、取りこぼしは安全側に倒れる。「引用され
+た `[P#]` を拾う」方向の緩さのみを塞ぎ、本物の finding 行 (行頭アンカーに一致するもの) は
+本文中に無関係な `[P#]` 引用が同居していても引き続き検出されることを regression test で
+確認済み (`scripts/test_kai_review.sh` の F-A 節)。
+
+**設計原則との対応**: このミッション (`safety-gate-hardening`) の中心テーマである
+「危険な結論 (auto-done) は allowlist、かつ判定 unit (どこを見るか) も 1 つに絞る」の
+実例。F-A は「allowlist にはしていたが scope を絞らなかった」ことによる欠陥だった —
+出力全体を走査して「どれか 1 つでも `[P#]` があれば構造化シグナルあり」と見なしていたのを、
+判定 unit を「finding 行」に絞ることで閉じた。`plan_review.md` の verdict 正規化で同種の
+欠陥を 3 回踏んで「判定 unit を最初の中身のある unit 1 つに絞る」に落ち着いたのと同じ構造。
 
 ### `--dry-run` (F6, Director 指示)
 

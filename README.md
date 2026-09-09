@@ -58,7 +58,8 @@ Optional but recommended (one of the following for parallel agent execution):
 Optional, only if you use the `codex-review` skill (automated PR review via Codex CLI, see
 [Skills reference](#skills-reference)):
 
-- **codex** — OpenAI Codex CLI, invoked by `scripts/kai-review.sh` as `codex exec review`.
+- **codex** — OpenAI Codex CLI, invoked by `scripts/kai-review.sh` as
+  `codex exec --output-schema ...` (diff piped via stdin; see `knowledge/codex-reviewer.md`).
   Without it, `codex-review` tasks fail with `codex command not found` and fall back to
   `needs-director`. See `knowledge/codex-reviewer.md` for setup and usage.
 

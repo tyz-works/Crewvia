@@ -99,6 +99,49 @@ git -C "$UPSTREAM" update-ref refs/pull/2/head feature-branch
 git -C "$UPSTREAM" checkout -q main
 git -C "$UPSTREAM" branch -D feature-branch >/dev/null
 
+# t006 受け入れ基準(i) 用の追加 PR ref (Seo 指摘: 空 diff / 巨大 diff / diff 取得
+# 失敗のいずれでも、codex の応答内容に関わらず fail-closed に倒れることを検証する):
+#   refs/pull/3/head — main の tip と同一コミット (diff が空になるケースを再現)
+#   refs/pull/4/head — main と共通祖先を持たない orphan commit
+#                      (`git diff main...HEAD` 自体が "no merge base" で失敗する
+#                      ケースを再現。実測: 別リポジトリで exit=128 を確認済み)
+#   refs/pull/5/head — 巨大ファイル追加 (MAX_DIFF_BYTES 超過を再現)
+#   refs/pull/6/head — マルチバイト文字の巨大ファイル追加 (t010: DIFF_BYTES=${#DIFF_CONTENT}
+#                      が文字数を数える bash の挙動を突く回帰再現。文字数は
+#                      MAX_DIFF_BYTES 未満だが実バイト数は超過する)
+MAIN_TIP="$(git -C "$UPSTREAM" rev-parse main)"
+git -C "$UPSTREAM" update-ref refs/pull/3/head "$MAIN_TIP"
+
+git -C "$UPSTREAM" checkout -q --orphan unrelated-history-tmp
+echo "unrelated" > "$UPSTREAM/unrelated.txt"
+git -C "$UPSTREAM" add -A
+git -C "$UPSTREAM" commit -q -m "orphan commit (no common ancestor with main)"
+git -C "$UPSTREAM" update-ref refs/pull/4/head unrelated-history-tmp
+git -C "$UPSTREAM" checkout -q main
+git -C "$UPSTREAM" branch -D unrelated-history-tmp >/dev/null
+
+git -C "$UPSTREAM" checkout -q -b big-file-tmp
+# MAX_DIFF_BYTES (300KB) を超える追加行を作る。1行50バイト相当 x 8000行 ≈ 400KB。
+awk 'BEGIN { for (i = 0; i < 8000; i++) print "line-" i "-0123456789012345678901234567890123456789" }' > "$UPSTREAM/big-file.txt"
+git -C "$UPSTREAM" add -A
+git -C "$UPSTREAM" commit -q -m "huge addition (exceeds MAX_DIFF_BYTES)"
+git -C "$UPSTREAM" update-ref refs/pull/5/head big-file-tmp
+git -C "$UPSTREAM" checkout -q main
+git -C "$UPSTREAM" branch -D big-file-tmp >/dev/null
+
+git -C "$UPSTREAM" checkout -q -b big-file-mb-tmp
+# t010: 文字数は MAX_DIFF_BYTES (300 * 1024 = 307200) 未満だが、UTF-8 3バイト文字
+# のため実バイト数は超過する fixture。8000 行 x マルチバイト文字で
+# 実測 (このファイル生成コマンドと同一条件): 約 270,890 文字 / 702,890 バイト
+# (diff の "+" プレフィックス等を足しても文字数は 307200 を十分下回り、
+# バイト数は大きく上回る)。
+awk 'BEGIN { for (i = 0; i < 8000; i++) print "行-" i "-日本語のダミーテキストです日本語のダミーテキストです" }' > "$UPSTREAM/big-file-mb.txt"
+git -C "$UPSTREAM" add -A
+git -C "$UPSTREAM" commit -q -m "huge multibyte addition (chars < MAX_DIFF_BYTES, bytes > MAX_DIFF_BYTES)"
+git -C "$UPSTREAM" update-ref refs/pull/6/head big-file-mb-tmp
+git -C "$UPSTREAM" checkout -q main
+git -C "$UPSTREAM" branch -D big-file-mb-tmp >/dev/null
+
 git clone -q "$UPSTREAM" "$FIXTURE_REPO"
 git -C "$FIXTURE_REPO" config user.email test@example.com
 git -C "$FIXTURE_REPO" config user.name "Test"
@@ -111,6 +154,13 @@ MAIN_WT_HEAD_BEFORE_ALL="$(git -C "$FIXTURE_REPO" rev-parse HEAD)"
 # 余計な worktree を作らないようにする。plan.sh 本体のロジックは本物のまま。
 mkdir -p "$FIXTURE_REPO/scripts"
 cp "$REAL_PLAN_SH" "$FIXTURE_REPO/scripts/plan.sh"
+
+# t006: kai-review.sh は SCHEMA_FILE を ${CREWVIA_REPO_ROOT:-$REPO_ROOT}/config/... で
+# 解決する。run_kai() は CREWVIA_REPO_ROOT=$FIXTURE_REPO を渡すため、本物の schema
+# ファイルをこの fixture repo にもコピーしておく (fake codex も --output-schema に
+# 実在パスが渡ることを検証している)。
+mkdir -p "$FIXTURE_REPO/config"
+cp "$OWN_CHECKOUT_ROOT/config/kai-review-findings.schema.json" "$FIXTURE_REPO/config/kai-review-findings.schema.json"
 
 QUEUE="$FIXTURE_REPO/queue"
 MISSION_SLUG="test-mission"
@@ -174,29 +224,46 @@ chmod +x "$FAKE_BIN_DIR/gh"
 cat > "$FAKE_BIN_DIR/codex" <<'EOS'
 #!/usr/bin/env bash
 # Fake codex CLI for kai-review.sh regression tests.
-# 実際の呼び出し形式: codex exec -C <dir> review --base main [-m <model>] --ephemeral -o <file>
+# 実際の呼び出し形式 (t006): diff を stdin で渡す形式に変更されたため、
+#   codex exec -C <dir> --sandbox read-only --output-schema <schema> [-m <model>]
+#     --ephemeral -o <file> "<prompt>"        (diff は stdin 経由)
 #   FAKE_CODEX_FIXTURE   - -o <file> にコピーするフィクスチャファイル
 #   FAKE_CODEX_EXIT      - 終了コード (default 0)
 #   FAKE_CODEX_NO_OUTPUT - "1" なら -o ファイルを書いた後に削除する
 #                          (「codex は exit 0 だが出力ファイルが無い」を再現)
-#   FAKE_CODEX_LOG       - 設定時、"<-C dir>|<-o file>|<-C dir の HEAD sha>" を追記する
-#                          (F1/F3 の並列・isolation 検証用)
+#   FAKE_CODEX_LOG       - 設定時、"<-C dir>|<-o file>|<-C dir の HEAD sha>|<stdin bytes>"
+#                          を追記する (F1/F3 の並列・isolation 検証、および t006 の
+#                          diff が実際に stdin 経由で渡っていることの検証用)
 args=("$@")
 cd_dir=""
 out_file=""
+schema_file=""
 for ((i = 0; i < ${#args[@]}; i++)); do
   case "${args[$i]}" in
     -C) cd_dir="${args[$((i + 1))]}" ;;
     -o) out_file="${args[$((i + 1))]}" ;;
+    --output-schema) schema_file="${args[$((i + 1))]}" ;;
   esac
 done
+
+# t006: diff は stdin 経由で渡される。読み捨てないと呼び出し元の printf が
+# パイプの書き込みでブロックし得るため、必ず読み切る。
+STDIN_CONTENT="$(cat -)"
 
 if [[ -n "${FAKE_CODEX_LOG:-}" ]]; then
   head_sha=""
   if [[ -n "$cd_dir" && -d "$cd_dir" ]]; then
     head_sha="$(git -C "$cd_dir" rev-parse HEAD 2>/dev/null || echo "?")"
   fi
-  echo "${cd_dir}|${out_file}|${head_sha}" >> "$FAKE_CODEX_LOG"
+  echo "${cd_dir}|${out_file}|${head_sha}|${#STDIN_CONTENT}" >> "$FAKE_CODEX_LOG"
+fi
+
+# t006: schema ファイルが実際に渡されていること・存在することを検証する
+# (呼び出し元がパスを渡し忘れる/存在しないファイルを渡す退行を検知する)
+REQUIRE_SCHEMA="${FAKE_CODEX_REQUIRE_SCHEMA:-1}"
+if [[ "$REQUIRE_SCHEMA" == "1" && ( -z "$schema_file" || ! -f "$schema_file" ) ]]; then
+  echo "fake codex: --output-schema missing or file not found: '$schema_file'" >&2
+  exit 90
 fi
 
 if [[ -n "$out_file" && -n "${FAKE_CODEX_FIXTURE:-}" ]]; then
@@ -926,6 +993,168 @@ if [[ $rc152 -eq 1 && "$sha_before3" == "$sha_after3" ]]; then
   pass "gh 失敗 + --dry-run でも task ファイルは不変 (exit=1 は維持)"
 else
   fail "dry-run failure path mutated task file — rc=$rc152 before=$sha_before3 after=$sha_after3"
+fi
+
+# ---------------------------------------------------------------------------
+# t006 実機確認: 現行 CLI (codex-cli 0.153.4) の実際の主経路 (--output-schema
+# 強制下の JSON) の実測 fixture。
+#   real_json_clean.txt    — 2026-09-09, `printf '<diff>' | codex exec -C <repo>
+#                             --sandbox read-only --output-schema
+#                             config/kai-review-findings.schema.json --ephemeral
+#                             -o out.json "<REVIEW_PROMPT>"` を、見出し変更のみの
+#                             clean diff に対して実行した際の実際の出力
+#                             ({"findings": []})。R-1 時点 (codex exec review) は
+#                             clean review でもタグ無し自然文しか返せなかったが、
+#                             --output-schema 移行後は clean review でも信頼できる
+#                             空配列を返すことを実機で確認した。
+#   real_json_findings.txt — 同日、`mv $SRC/* $DEST` という未クォート変数展開の
+#                             脆弱な deploy.sh (word splitting / glob expansion /
+#                             引数未検証 / エラー握り潰し / hidden files 除外) を
+#                             含む diff に対して実行した際の実際の出力。P0 1件 +
+#                             P1 2件 + P2 1件 が実際に検出された (検出力は
+#                             review サブコマンド時代と同等以上— 受け入れ基準(ii)
+#                             の直接的な実機根拠)。詳細は本 task の Result 参照。
+# ---------------------------------------------------------------------------
+cat > "$FIXTURES_DIR/real_json_clean.txt" <<'FIX'
+{"findings": []}
+FIX
+
+cat > "$FIXTURES_DIR/real_json_findings.txt" <<'FIX'
+{"findings":[{"priority":"P0","title":"Validate arguments before expanding the source glob","body":"With no arguments, SRC and DEST are empty, so the command becomes `mv /*`. This can move root-level entries into the last matched directory when permissions allow. Reject missing or empty arguments and invalid directories before invoking mv.","file":"deploy.sh"},{"priority":"P1","title":"Quote paths and terminate mv option parsing","body":"On line 4, unquoted variables undergo word splitting and wildcard expansion, so paths containing spaces or glob characters can move unintended files or fail. A path beginning with '-' can also be interpreted as an option. After validation, use `mv -- \"$SRC\"/* \"$DEST\"`.","file":"deploy.sh"},{"priority":"P1","title":"Propagate move failures instead of reporting success","body":"The script always prints 'moved' and exits with the successful echo status, even when mv fails because of permissions, a missing destination, or other errors. Deployment callers therefore receive a false success signal. Check mv's status and exit nonzero on failure.","file":"deploy.sh"},{"priority":"P2","title":"Include hidden files when moving directory contents","body":"The `*` glob excludes dotfiles and hidden directories, leaving items such as `.env` and `.well-known` behind while reporting the source as moved. If this script deploys the directory's contents, this can produce an incomplete deployment; handle hidden entries explicitly.","file":"deploy.sh"}]}
+FIX
+
+echo ""
+echo "--- t006 実機確認 [最重要]: 実測 clean JSON ({\"findings\":[]}) → DONE相当 (--output-schema 移行で clean review も信頼できる空配列を返すことを実証) ---"
+write_task t220 "t006 real clean json"
+out=$(FAKE_GH_HEAD_BRANCH="feature-branch" FAKE_CODEX_FIXTURE="$FIXTURES_DIR/real_json_clean.txt" \
+  run_kai --pr 1 --task t220 --mission "$MISSION_SLUG" --dry-run 2>&1) && rc=0 || rc=$?
+if [[ $rc -eq 0 ]] && echo "$out" | grep -q "method=json needs_fix=0" && echo "$out" | grep -q "DONE/LGTM相当"; then
+  pass "実測 clean JSON (codex-cli 0.153.4, --output-schema) → method=json, DONE相当 (R-1 の制約解消を実機確認)"
+else
+  fail "real_json_clean fixture should judge as DONE via json — rc=$rc out=$out"
+fi
+
+echo ""
+echo "--- t006 実機確認 [最重要]: 実測 findings JSON (未クォート変数展開の脆弱な deploy.sh, P0/P1/P1/P2) → NEEDS-DIRECTOR相当 (検出力の実機確認, 受け入れ基準ii) ---"
+write_task t221 "t006 real findings json"
+out=$(FAKE_GH_HEAD_BRANCH="feature-branch" FAKE_CODEX_FIXTURE="$FIXTURES_DIR/real_json_findings.txt" \
+  run_kai --pr 1 --task t221 --mission "$MISSION_SLUG" --dry-run 2>&1) && rc=0 || rc=$?
+if [[ $rc -eq 0 ]] && echo "$out" | grep -q "method=json needs_fix=1" && echo "$out" | grep -q "NEEDS-DIRECTOR相当"; then
+  pass "実測 findings JSON (P0 1件含む実際の codex 検出結果) → method=json, NEEDS-DIRECTOR相当"
+else
+  fail "real_json_findings fixture should judge as NEEDS-DIRECTOR via json — rc=$rc out=$out"
+fi
+
+echo ""
+echo "--- t006 実機確認 (実行系): 実測 clean JSON → 実際に plan.sh done が呼ばれ status=done になる ---"
+write_task_in_progress t222 "t006 real clean json real-run"
+FAKE_GH_HEAD_BRANCH="feature-branch" FAKE_CODEX_FIXTURE="$FIXTURES_DIR/real_json_clean.txt" \
+  run_kai --pr 1 --task t222 --mission "$MISSION_SLUG" --skip-pull > "$TMPDIR_TEST/t222.out" 2>&1
+rc222=$?
+st222="$(task_status t222)"
+if [[ $rc222 -eq 0 && "$st222" == "done" ]]; then
+  pass "実測 clean JSON (実行系) → 実際に status=done になる"
+else
+  fail "real_json_clean real-run should set status=done — rc=$rc222 status=$st222 (see $TMPDIR_TEST/t222.out)"
+fi
+
+# ---------------------------------------------------------------------------
+# F-B (t006, Seo 指摘): 出力が複数 JSON ドキュメント (JSONL) の場合、JSON 経路の
+# 入口ゲート自体に入らせず fail-closed (no-signal) に倒れること。
+# 現行 codex-cli は --output-schema 下で単一 JSON しか返さないため実機再現は
+# できない (旧 review サブコマンドも JSON を返さなかった) — Seo の隔離ハーネス
+# 実測 (bash 数値比較の構文エラーで auto-done してしまう欠陥) をそのまま
+# 合成 fixture として再現する。
+# ---------------------------------------------------------------------------
+cat > "$FIXTURES_DIR/jsonl_multi_doc.txt" <<'FIX'
+{"findings":[]}
+{"findings":[{"priority":"P0","title":"real bug hidden behind a second JSON document"}]}
+FIX
+
+echo ""
+echo "--- F-B [最重要]: 複数 JSON ドキュメント (JSONL) → JSON 経路に入らず fail-closed (旧実装は bash 構文エラーで auto-done していた) ---"
+write_task t200 "F-B jsonl multi doc"
+out=$(FAKE_GH_HEAD_BRANCH="feature-branch" FAKE_CODEX_FIXTURE="$FIXTURES_DIR/jsonl_multi_doc.txt" \
+  run_kai --pr 1 --task t200 --mission "$MISSION_SLUG" --dry-run 2>&1) && rc=0 || rc=$?
+if [[ $rc -eq 0 ]] && echo "$out" | grep -q "method=no-signal needs_fix=1" && echo "$out" | grep -q "NEEDS-DIRECTOR相当" \
+  && echo "$out" | grep -q "F-B: expected exactly 1"; then
+  pass "JSONL (2 ドキュメント) → JSON 経路をスキップし method=no-signal, NEEDS-DIRECTOR相当 (F-B 修正確認)"
+else
+  fail "REGRESSION (F-B): multi-document JSON output should not enter the JSON path and must fail closed — rc=$rc out=$out"
+fi
+
+echo ""
+echo "--- F-B (実行系): JSONL → 実際に plan.sh needs-director が呼ばれ status=needs_director になる ---"
+write_task_in_progress t201 "F-B jsonl real needs-director"
+FAKE_GH_HEAD_BRANCH="feature-branch" FAKE_CODEX_FIXTURE="$FIXTURES_DIR/jsonl_multi_doc.txt" \
+  run_kai --pr 1 --task t201 --mission "$MISSION_SLUG" --skip-pull > "$TMPDIR_TEST/t201.out" 2>&1
+rc201=$?
+st201="$(task_status t201)"
+if [[ $rc201 -eq 0 && "$st201" == "needs_director" ]]; then
+  pass "JSONL (実行系) → 実際に status=needs_director になる (旧実装なら bash 構文エラーで auto-done していた)"
+else
+  fail "REGRESSION (F-B): JSONL real-run should set status=needs_director — rc=$rc201 status=$st201 (see $TMPDIR_TEST/t201.out)"
+fi
+
+# ---------------------------------------------------------------------------
+# 受け入れ基準(i) (t006, Seo 指摘): diff 取得の失敗 / 空 diff / 巨大 diff (context
+# 超過の切り詰めリスク) のいずれでも、codex が実際に返す内容に関わらず
+# needs-director に倒れること。3 ケースとも FAKE_CODEX_FIXTURE に
+# json_empty.txt ("findings":[]) を指定した上で検証する — これは「diff が
+# 無効なら、codex がたとえ空配列を返しても信用しない」という受け入れ基準(i)の
+# 核心を、fixture レベルで裏付けるため (kai-review.sh が diff 検証を通れなければ
+# codex を一切呼ばないため、実際にはこの fixture は使われないはずである。これを
+# FAKE_CODEX_LOG で確認する)。
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- 受け入れ基準(i)-a [最重要]: 空 diff (PR head == main tip) → codex を呼ばず needs-director (旧懸念: 空配列は信用できない) ---"
+write_task t210 "acceptance-i empty diff"
+LOG_210="$TMPDIR_TEST/t210_codex.log"
+out=$(FAKE_GH_HEAD_BRANCH="feature-branch" FAKE_CODEX_FIXTURE="$FIXTURES_DIR/json_empty.txt" FAKE_CODEX_LOG="$LOG_210" \
+  run_kai --pr 3 --task t210 --mission "$MISSION_SLUG" --dry-run 2>&1) && rc=0 || rc=$?
+if [[ $rc -eq 1 ]] && echo "$out" | grep -q "diff .* is empty" && [[ ! -s "$LOG_210" ]]; then
+  pass "空 diff → codex を呼ばず needs-director相当 (exit=1)、codex 未起動を FAKE_CODEX_LOG 不在で確認 (受け入れ基準i)"
+else
+  fail "REGRESSION (acceptance-i): empty diff should fail closed WITHOUT invoking codex — rc=$rc log_exists=$([[ -s "$LOG_210" ]] && echo yes || echo no) out=$out"
+fi
+
+echo ""
+echo "--- 受け入れ基準(i)-b [最重要・negative test]: diff 取得失敗 (共通祖先無し) → codex が空配列 fixture を用意していても呼ばれず needs-director ---"
+write_task t211 "acceptance-i diff retrieval failure"
+LOG_211="$TMPDIR_TEST/t211_codex.log"
+out=$(FAKE_GH_HEAD_BRANCH="feature-branch" FAKE_CODEX_FIXTURE="$FIXTURES_DIR/json_empty.txt" FAKE_CODEX_LOG="$LOG_211" \
+  run_kai --pr 4 --task t211 --mission "$MISSION_SLUG" --dry-run 2>&1) && rc=0 || rc=$?
+if [[ $rc -eq 1 ]] && echo "$out" | grep -qi "git diff.*failed" && [[ ! -s "$LOG_211" ]]; then
+  pass "diff 取得失敗 (no merge base) → codex 未起動 (空配列 fixture は使われない) のまま needs-director相当 (受け入れ基準i, negative test)"
+else
+  fail "REGRESSION (acceptance-i negative test): diff retrieval failure must fail closed even though codex fixture claims empty findings — rc=$rc log_exists=$([[ -s "$LOG_211" ]] && echo yes || echo no) out=$out"
+fi
+
+echo ""
+echo "--- 受け入れ基準(i)-c: MAX_DIFF_BYTES 超過 (巨大 diff) → codex を呼ばず needs-director (context切り詰めリスクの回避) ---"
+write_task t212 "acceptance-i oversized diff"
+LOG_212="$TMPDIR_TEST/t212_codex.log"
+out=$(FAKE_GH_HEAD_BRANCH="feature-branch" FAKE_CODEX_FIXTURE="$FIXTURES_DIR/json_empty.txt" FAKE_CODEX_LOG="$LOG_212" \
+  run_kai --pr 5 --task t212 --mission "$MISSION_SLUG" --dry-run 2>&1) && rc=0 || rc=$?
+if [[ $rc -eq 1 ]] && echo "$out" | grep -q "too large to trust against silent context truncation" && [[ ! -s "$LOG_212" ]]; then
+  pass "巨大 diff (> MAX_DIFF_BYTES) → codex 未起動のまま needs-director相当 (受け入れ基準i)"
+else
+  fail "REGRESSION (acceptance-i): oversized diff should fail closed WITHOUT invoking codex — rc=$rc log_exists=$([[ -s "$LOG_212" ]] && echo yes || echo no) out=$out"
+fi
+
+echo ""
+echo "--- 受け入れ基準(i)-d [t010]: マルチバイト文字の巨大 diff (文字数 < MAX_DIFF_BYTES だがバイト数 > MAX_DIFF_BYTES) → codex を呼ばず needs-director ---"
+# 旧実装 (DIFF_BYTES=\${#DIFF_CONTENT}) は bash の \${#var} が UTF-8 文字数を
+# 数えるため、この fixture の文字数 (約27万) が閾値 307200 を下回りゲートを
+# 素通りし、codex が呼ばれてしまっていた (t008 QA 実測: 実バイト数は約80万)。
+write_task t213 "acceptance-i multibyte oversized diff (t010)"
+LOG_213="$TMPDIR_TEST/t213_codex.log"
+out=$(FAKE_GH_HEAD_BRANCH="feature-branch" FAKE_CODEX_FIXTURE="$FIXTURES_DIR/json_empty.txt" FAKE_CODEX_LOG="$LOG_213" \
+  run_kai --pr 6 --task t213 --mission "$MISSION_SLUG" --dry-run 2>&1) && rc=0 || rc=$?
+if [[ $rc -eq 1 ]] && echo "$out" | grep -q "too large to trust against silent context truncation" && [[ ! -s "$LOG_213" ]]; then
+  pass "マルチバイト巨大 diff (文字数<閾値, バイト数>閾値) → codex 未起動のまま needs-director相当 (t010 回帰)"
+else
+  fail "REGRESSION (t010): multibyte diff whose byte count exceeds MAX_DIFF_BYTES (while char count does not) should fail closed WITHOUT invoking codex — rc=$rc log_exists=$([[ -s "$LOG_213" ]] && echo yes || echo no) out=$out"
 fi
 
 # ---------------------------------------------------------------------------

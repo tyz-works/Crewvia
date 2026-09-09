@@ -42,7 +42,7 @@ Phase 2 では **Kai-codex を dispatcher が自動 spawn する**。Priya は `
    ```
 2. Dispatcher が 5s poll で検知 → `nohup kai-review.sh --pr 42 --task tXXX --mission <slug> --agent Kai-codex` を background spawn
 3. kai-review.sh が `plan.sh pull` で task を in_progress にし、Taskvia PATCH を発火
-4. codex exec review が完了したら `plan.sh done` または `plan.sh needs-director` で状態遷移 + Taskvia sync + registry の task_count 自動 bump
+4. codex exec (--output-schema, t006 以降) が完了したら `plan.sh done` または `plan.sh needs-director` で状態遷移 + Taskvia sync + registry の task_count 自動 bump
 
 **Dispatcher の安全策**:
 
@@ -116,9 +116,13 @@ bash scripts/kai-review.sh \
    → queue/assignments/Kai-codex 生成
    → Taskvia PATCH (in_progress) 発火
 3. gh pr view <PR#> --json headRefName で head branch 取得
-4. head branch を git checkout
-5. codex exec review --base main -m <model> -o /tmp/kai-review-output.txt を実行
-6. /tmp/kai-review-output.txt の findings を読み込み
+4. refs/pull/<PR#>/head を fetch し、専用の使い捨て worktree を --detach で作成
+   (主 working tree の HEAD は動かさない)
+5. origin/main との diff を自前取得し、stdin で
+   codex exec --output-schema config/kai-review-findings.schema.json -m <model>
+   -o <mktemp output file> "<review prompt>" を実行 (t006 以降。旧 `review`
+   サブコマンドは使わない)
+6. 出力ファイル (JSON) の findings を読み込み
 7. 判定:
    ├─ findings なし / all low  → plan.sh done <task_id> "LGTM: ..."
    ├─ 修正必要                 → plan.sh needs-director <task_id> "NEEDS FIX: <findings>"

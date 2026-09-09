@@ -13,6 +13,13 @@
 > [P#] タグ) が一切無い場合は無条件で needs-director に倒す fail-closed 方式に変更。
 > トレードオフとして clean review もタグ無しの限り needs-director 相当になる。詳細は下記
 > 「findings 判定ロジックの変遷」の R-1 節を参照。
+> **t006 (2026-09-09, mission: 20260909-safety-gate-hardening)**: `codex exec review` サブコマンドの
+> 使用をやめ、diff を自前取得して `codex exec --output-schema` に渡す方式に移行した。これにより
+> R-1 が抱えていた制約 (clean review でも構造化シグナルを強制する手段が無い) を解消し、clean review
+> でも信頼できる空配列 `{"findings":[]}` を実機で確認できるようになった (fail-closed の設計原則自体は
+> 維持)。あわせて Seo 指摘の F-B (JSONL 出力が bash 数値比較のエラーで握りつぶされ auto-done する
+> 欠陥) を修正し、diff の非空性・サイズ上限・取得失敗を codex 呼び出し前にゲートする受け入れ基準を
+> 実装した。詳細は下記「t006: `codex exec review` → `codex exec --output-schema` 移行」を参照。
 
 ---
 
@@ -96,25 +103,36 @@ Phase 1 では Claude (Seo) と Codex (Kai) の **2 人体制**で review する
 
 ## Codex CLI の特徴
 
-Phase 1 で使用する呼び出し形式:
+**t006 (2026-09-09) で呼び出し形式を変更した。** 現行 (t006 以降) の実際の呼び出し形式:
 
 ```bash
-codex exec review --base main \
+git diff <origin/main>...HEAD | codex exec -C <review-worktree> \
+  --sandbox read-only \
+  --output-schema config/kai-review-findings.schema.json \
   -m <model> \
   --ephemeral \            # セッション保存を省略
-  -o /tmp/kai-review-output.txt
+  -o <output-file> \
+  "<review prompt>"
 ```
 
-- **`exec review`**: 非インタラクティブ review モード（`-p` 相当）
-- **`--base main`**: main との diff を対象にする
+- **`exec` (review サブコマンドではない方)**: `[PROMPT]` 位置引数・stdin パイプ・
+  `--output-schema`・`-o` を同時に受け付ける。旧 `exec review` サブコマンドは
+  `--base <BRANCH>` とカスタム `[PROMPT]` を同時指定できない制約があった
+  (詳細は「t006」節参照)
+- **diff は stdin で渡す**: `<stdin>` ブロックとして prompt に追記される
+- **`--output-schema`**: 最終応答の JSON Schema を強制する (`config/kai-review-findings.schema.json`)。
+  clean review でも `{"findings":[]}` という信頼できる空配列を返させることができる
+- **`--sandbox read-only`**: レビューは書き込みを必要としないため明示的に読み取り専用にする
 - **`--ephemeral`**: セッション状態を保存しない（CI 相当の使い方）
-- **出力先 `-o`**: findings を指定ファイルに書き出す
+- **出力先 `-o`**: 最終応答 (JSON) を指定ファイルに書き出す
+
+旧呼び出し形式 (Phase 1〜R-1, `codex exec review --base main ...`) は git blame 参照。
 
 ### codex rescue との違い
 
 | 用途 | コマンド |
 |---|---|
-| Codex Reviewer (Kai) | `codex exec review --base main ...` |
+| Codex Reviewer (Kai) | `codex exec --output-schema ... "<prompt>"` (diff は stdin, t006 以降) |
 | Codex Rescue (既存 skill) | `codex:codex-rescue` skill 経由の対話的セッション |
 
 ---
@@ -203,6 +221,97 @@ allowlist（安全と確認できたものだけ安全側）より事故りに�
 安全」という default-safe な構造は、そのパターンがどれだけ精緻でも denylist ではなく
 allowlist 違反であり、同種の欠陥を再発させる** (F-3 → R-1 で実証済み)。auto-done のような
 危険な結論は、構造化シグナルによる積極的な確認が取れた場合のみ許可すること。
+
+## t006: `codex exec review` → `codex exec --output-schema` 移行 (2026-09-09, mission 20260909-safety-gate-hardening)
+
+R-1 は「`review` サブコマンドの `--base` はカスタム `[PROMPT]` と併用できず、clean review に
+構造化シグナルを強制する手段が無い」ことを根拠に fail-closed 方式を採ったが、これは
+「clean review もタグ無し = 一律 needs-director」という副作用を伴っていた (F2 が解消した問題の
+部分的な復活)。t006 で `review` サブコマンドの使用そのものをやめ、次の方式に移行した:
+
+1. `git diff <origin/main>...HEAD` で diff を自前取得する (`main` ローカルブランチではなく、
+   都度 `origin` から一意な local ref に fetch した最新の main を base にする。**実機で
+   local main が origin/main より 2 commit 遅れているケースを観測した** — Director が
+   review/自動化を頻繁に回す一方で明示的な `git pull` は都度行わないため、ローカル main は
+   容易に陳腐化する。診断できない不完全な base を使うと受け入れ基準(i)の趣旨に反するため、
+   PR head の fetch と同じパターンで base も都度 fetch するようにした)
+2. 取得した diff を stdin で `codex exec -C <worktree> --output-schema <schema> -o <file>
+   "<prompt>"` に渡す。`--output-schema` (`config/kai-review-findings.schema.json`) が
+   最終応答を `{"findings":[...]}` 形式に強制する。OpenAI の strict structured outputs は
+   「`additionalProperties:false` の場合、`required` は `properties` の全キーを含まなければ
+   ならない」制約があるため、`body`/`file` のような「省略したい」フィールドは
+   `required` に含めた上で型を `["string","null"]` にして null 許容にする必要がある
+   (最初 `body`/`file` を optional のまま `required` から外して実機で
+   `invalid_json_schema: ... 'required' ... Missing 'body'` エラーを実際に踏んだ)。
+
+### 受け入れ基準(i): 空配列を信用する前に diff の健全性を検証する
+
+diff 取得の失敗 / 空 diff / 巨大すぎる diff (context 切り詰めリスク) のいずれでも、
+codex が返す空配列 `{"findings":[]}` は「clean」と「レビューできていない」を区別できない。
+kai-review.sh は codex を呼ぶ**前**に以下を検証し、満たさなければ codex を一切呼ばず
+needs-director に倒す:
+
+- diff が非空であること (空 diff は base 解決ミス等の兆候であり、レビュー対象が無いことを
+  意味する。`git diff` の三点記法は共通祖先が無い場合 `fatal: ...: no merge base` で
+  exit 128 になることを実機で確認済み — fork 元が全く異なる場合などに起こりうる)
+- diff サイズが `MAX_DIFF_BYTES` (300KB) 以下であること (context 切り詰めを直接検知する
+  手段が無いための実測ベースの安全マージン。切り詰めが疑われるほど巨大な diff は
+  そもそも自動レビューに向かないと判断し、needs-director で人間判断に委ねる)
+
+いずれのケースも、regression test (`scripts/test_kai_review.sh` の「受け入れ基準(i)」節) で
+「codex 側に空配列を返す fixture を用意していても、codex が実際には一度も呼ばれないこと」を
+negative test として確認している (診断できない diff は codex の応答内容を一切信用しない
+という設計を、fixture レベルでも裏付ける)。
+
+### F-B (Seo 指摘): JSON が複数ドキュメント (JSONL) の場合の fail-open
+
+`--output-schema` 移行で JSON 経路が本番の主経路になったことで、Seo が隔離ハーネスで
+実測した潜在欠陥が現実的なリスクになった: 出力が 2 つ以上の JSON ドキュメントの場合、
+旧実装の `jq -e '.findings | arrays | length'` は複数行を返し、後続の
+`[[ "$FINDINGS_COUNT" -gt 0 ]]` が bash の構文エラー (`syntax error in expression`) になって
+false 扱いになり、**`NEEDS_FIX=0` のまま `HAD_SIGNAL=1` が立って auto-done してしまう**
+(実機で `{"findings":[]}` + `{"findings":[{"severity":"critical"}]}` の 2 行入力を使い、
+旧ロジックを単体で再現して確認済み)。JSON 経路に入る前に「出力がちょうど 1 つの JSON
+ドキュメントであること」を `jq -c '.' | grep -c .` でゲートし、2 つ以上 (または 0、パース
+不能) の場合は JSON 経路そのものをスキップして `[P#]` タグ判定 → fail-closed にフォール
+バックするよう修正した。
+
+### 実機確認 (2026-09-09, codex-cli 0.153.4)
+
+- **基本動作**: 未クォート変数展開 (`mv $SRC/* $DEST`) を含む合成の脆弱な `deploy.sh` に対し
+  実行した結果、P0 1件 (引数未検証によるルート削除リスク) + P1 2件 (word splitting / エラー
+  握り潰し) + P2 1件 (hidden files 除外) を実際に検出。無害な README 見出し変更の diff では
+  `{"findings": []}` を実際に返した (fixture として `scripts/test_kai_review.sh` に採用)。
+- **短い出力の誤判定を発見・修正**: 実測 `{"findings": []}` はわずか 16 文字であり、旧来の
+  「出力が20文字未満なら要確認」という safety net (元は `review` サブコマンドの自然文出力を
+  前提にしたもの) に誤ってひっかかり needs-director に倒れることを regression test で
+  検出した。JSON 経路で確定判定できた場合はこの長さチェックを適用しないよう修正した
+  (JSON パース成功時点で構造的な信頼性は担保済みであり、文字数は無関係なため)。
+- **受け入れ基準(ii) (検出力の比較検証)**: crewvia 本体の実 PR (#191,
+  `hooks/pre-tool-use.sh` の task file write guard 修正, diff 5150 bytes) に対し、
+  新方式 (`kai-review.sh --pr 191 --dry-run`) と旧方式 (`codex exec review --base main`,
+  同一 worktree/diff) を両方実際に実行して比較した:
+  - 旧方式: [P2] 1件 (mixed quote での quote-stripping bypass)
+  - 新方式: P1 1件 (escaped quote での quote-stripping bypass) + P2 1件
+    (`-lc` 等の combined flags でのインタプリタ判定バイパス)
+  - 新方式は旧方式が見つけた種類の指摘 (quote-stripping の頑健性問題) を再現できただけでなく、
+    旧方式が見つけていない追加の実指摘 (combined flags バイパス) も検出した。新方式が
+    codex にワーキングディレクトリ内のファイルを読ませ、実際に python で正規表現の挙動を
+    検証するコマンドを実行させて確証を取っていたことも観測した (単純な diff 読解を超えた
+    調査を行っている)。この結果から、少なくともこのケースでは検出力の低下は無く、
+    むしろ向上したと判断した。
+
+### 教訓
+
+- **strict JSON Schema の "optional" フィールドは `required` + nullable型で表現する**。
+  `additionalProperties:false` 下で `required` から漏れたフィールドがあると
+  `invalid_json_schema` エラーで即座に失敗する (実機で踏んだ)。
+- **判定ロジックの前提を変えたら、既存の safety net が新しい正常系と衝突しないか
+  実機フィクスチャで確認すること**。「20文字未満は疑わしい」という heuristic は自然文が
+  前提なら妥当だが、正当な最小 JSON 応答 (`{"findings": []}`) の方が短いことがあるとは
+  想定されていなかった。
+- **ローカルブランチの参照は陳腐化しうる**。`--base main` (ローカル) をそのまま信用せず、
+  自動化スクリプトが diff base に使う ref は都度 origin から fetch する方が安全。
 
 ### `--dry-run` (F6, Director 指示)
 

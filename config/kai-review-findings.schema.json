@@ -1,0 +1,35 @@
+{
+  "$comment": "kai-review.sh (t006, mission 20260909-safety-gate-hardening) が codex exec --output-schema に渡す JSON Schema。空 findings 配列は「レビューした結果、指摘が無かった」ことを表す信頼できるシグナルとして扱われるため、codex の最終応答をこの形に強制する。additionalProperties:false で未知のトップレベル/finding フィールドを拒否し、スキーマ不適合の出力は kai-review.sh 側で JSON パースが失敗するかフィールドが欠けるため fail-closed (needs-director) に倒れる。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["findings"],
+  "properties": {
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["priority", "title", "body", "file"],
+        "properties": {
+          "priority": {
+            "type": "string",
+            "enum": ["P0", "P1", "P2", "P3"],
+            "description": "P0=release-blocking (crash/data loss/security), P1=must-fix functional bug, P2=should-fix, P3=minor nit"
+          },
+          "title": {
+            "type": "string",
+            "description": "Short one-line summary of the finding"
+          },
+          "body": {
+            "type": ["string", "null"],
+            "description": "More detail on the finding, including why it matters. null if not needed."
+          },
+          "file": {
+            "type": ["string", "null"],
+            "description": "Path most relevant to the finding. null if not applicable."
+          }
+        }
+      }
+    }
+  }
+}

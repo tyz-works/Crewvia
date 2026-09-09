@@ -137,6 +137,95 @@ echo ""
 echo "--- Case 4 (正常系への非干渉確認): WAIT_STATUS=OK → rescue を経由せず exit 0 ---"
 _run_case "OK" "" 0 "false" "OK (prose already succeeded, rescue untouched — this stub never writes plan_review.md itself, only Case 1/2's own mechanism does)"
 
+# --- t012: 構造化出力を「プローズ失敗時の rescue」から「常に読む権威」へ ---
+# $1 = wait_status, $2 = ログ内容, $3 = plan_review.md に書いておく本文
+# ("" なら書かない), $4 = expect_rc, $5 = 期待する plan_review.md の1行目の
+# verdict ("" なら「規定形式の1行目が無いこと」を期待), $6 = label
+#
+# plan_review.md は review-plan.sh 冒頭の `rm -f` より後に書かれる必要があるため、
+# ログと同じく mux_spawn スタブの中で書く (mux_spawn は rm -f の後に呼ばれる)。
+_run_case_ex() {
+  local wait_status="$1" log_body="$2" review_body="$3" expect_rc="$4" expect_verdict="$5" label="$6"
+
+  TMPDIR_TEST="/tmp/crewvia-test-review-plan-json-rescue-ex-$$-$(date +%s%N)"
+  rm -rf "$TMPDIR_TEST"
+  mkdir -p "$TMPDIR_TEST/scripts" "$TMPDIR_TEST/config" "$TMPDIR_TEST/queue/missions/testmission"
+
+  cp "$REAL_REVIEW_PLAN" "$TMPDIR_TEST/scripts/review-plan.sh"
+  cp "$SCRIPT_DIR/lib_verdict.py" "$TMPDIR_TEST/scripts/lib_verdict.py"
+  cp "$REAL_SCHEMA" "$TMPDIR_TEST/config/plan-review-verdict.schema.json"
+
+  local review_output="$TMPDIR_TEST/queue/missions/testmission/plan_review.md"
+  cat > "$TMPDIR_TEST/scripts/lib_mux.sh" << EOF
+mux_available() { return 0; }
+mux_spawn() {
+  printf '%s\n' '${log_body}' > "/tmp/plan_reviewer_\$\$.log"
+  if [[ -n "${review_body}" ]]; then
+    printf '%s\n' '${review_body}' > "${review_output}"
+  fi
+  return 0
+}
+mux_kill() { return 0; }
+EOF
+
+  local wait_rc=0
+  [[ "$wait_status" != "OK" ]] && wait_rc=1
+  cat > "$TMPDIR_TEST/scripts/wait_for_plan_review.sh" << EOF
+#!/usr/bin/env bash
+echo "$wait_status"
+exit $wait_rc
+EOF
+  chmod +x "$TMPDIR_TEST/scripts/wait_for_plan_review.sh"
+
+  set +e
+  bash "$TMPDIR_TEST/scripts/review-plan.sh" testmission >/tmp/test_review_plan_json_rescue_stdout 2>&1
+  local rc=$?
+  set -e
+
+  local got=""
+  if [[ -f "$review_output" ]]; then
+    got="$(python3 "$TMPDIR_TEST/scripts/lib_verdict.py" "$review_output" 2>/dev/null || true)"
+  fi
+
+  if [[ "$rc" -eq "$expect_rc" && "$got" == "$expect_verdict" ]]; then
+    pass "$label — exit=$rc, plan_review.md の判定='${got:-<none>}' (期待どおり)"
+  else
+    fail "$label — expected exit=$expect_rc verdict='${expect_verdict:-<none>}', got exit=$rc verdict='${got:-<none>}'. plan_review.md: $(cat "$review_output" 2>/dev/null || echo '<missing>')"
+  fi
+  rm -rf "$TMPDIR_TEST"
+}
+
+RESULT_JSON_APPROVE='{"type":"result","subtype":"success","is_error":false,"result":"{\"verdict\":\"approve\"}","structured_output":{"verdict":"approve"}}'
+
+echo ""
+echo "--- Case 5 (t012): プローズ成功 + 構造化出力が同じ値 → そのまま採用 (干渉しない) ---"
+_run_case_ex "OK" "$RESULT_JSON_APPROVE" '**Verdict:** approve' 0 "approve" \
+  "prose=approve / structured=approve → approve のまま"
+
+echo ""
+echo "--- Case 6 (t012 [最重要]): プローズ成功 + 構造化出力が食い違う → どちらも採らず判定不能 ---"
+# 同じ plan-reviewer が plan_review.md と最終応答で違うことを言った場合、
+# 判定は曖昧であり、危険な側 (approve) に倒してはならない。exit 1 にすると
+# scripts/plan.sh が cycle を refund した上で Director に手動確認を促す。
+_run_case_ex "OK" "$RESULT_JSON_REVISE" '**Verdict:** approve' 1 "approve" \
+  "prose=approve / structured=revise → どちらも採らず exit 1 (plan_review.md は書き換えない)"
+
+echo ""
+echo "--- Case 7 (t012): プローズが書式を外した (判定不能) → 構造化出力が1行目に書き戻して回収 ---"
+# t012 で lib_verdict を「1行目・完全一致」に絞ったため、書式を外した
+# plan_review.md はすべて判定不能になる。その回収が効くことの確認。
+_run_case_ex "TIMEOUT_FRESH" "$RESULT_JSON_APPROVE" '# Plan Review: test
+
+**Verdict:** approve' 0 "approve" \
+  "1行目が判定行でない plan_review.md → 構造化出力から回収して approve"
+
+echo ""
+echo "--- Case 8 (t012 fail-closed): 構造化出力が無く、プローズも書式を外している → 判定不能のまま exit 1 ---"
+_run_case_ex "TIMEOUT_FRESH" "no json here" '# Plan Review: test
+
+**Verdict:** approve' 1 "" \
+  "構造化出力なし + 1行目が判定行でない → verdict を捏造せず exit 1"
+
 echo ""
 echo "== Results: $PASS_COUNT passed, $FAIL_COUNT failed =="
 [[ "$FAIL_COUNT" -eq 0 ]]

@@ -8,23 +8,39 @@
 `claude --json-schema` (`config/plan-review-verdict.schema.json`) で
 `{"verdict": "approve" | "revise" | "reject"}` 形式に機械的に強制する。**
 これは CLI 自身が保証する構造化出力であり、あなたが書式を守るかどうかに
-依存しない — 特別な書き方を覚える必要はなく、Step 3 の作業を終えたら普段どおり
-総括の返答をすればよい。
+依存しない。**これが判定の主経路であり、権威**である
+(t012, mission 20260909-dead-config-sweep)。
 
-- （t004, mission 20260909-dead-config-sweep 以前の版）以前はここで
-  `queue/missions/<slug>/plan_review.md` の1行目に規定形式の `**Verdict:**` 行を
-  手動で書くよう厳格に指示していたが、この散文フォーマット指示だけに頼る方式は
-  plan-reviewer (Opus) が `## 総合判定: **GO**` のような別表記で書いてしまう事故が
-  繰り返し発生し (複数ミッションで実測)、`scripts/normalize_plan_review_verdict.py`
-  のヒューリスティックでも拾えないケースでは 600s タイムアウトして Director の
-  手動介入が必要になっていた。「プロンプト指示だけでは機構として成立しない」
-  という教訓 (先例: PR #193 の kai-review.sh `codex exec --output-schema` 移行)
-  から、判定そのものは CLI のスキーマ強制に委ね、散文の書式に依存しない形に
-  変更した。
-- とはいえ Step 3 で `plan_review.md` に書く内容 (Summary/Issues 等) の書式は
-  従来どおり重要。`**Verdict:**` 行を1行目に含めても構わない（人間が
-  `plan_review.md` を直接読む際の可読性のため）が、たとえ省略・別表記でも
-  自動判定は壊れない（`review-plan.sh` が構造化出力から機械的に補完する）。
+その上で、`plan_review.md` に判定を書く場合は次の 1 形式だけが機械的に
+読み取られる:
+
+- **`queue/missions/<slug>/plan_review.md` の 1 行目 (ファイル先頭の最初の
+  非空行) に、次の形ちょうどで書く**:
+
+      **Verdict:** approve
+
+  値は `approve` / `revise` / `reject` の**いずれか 1 語だけ**。小文字。
+  同じ行に註釈・理由・複数の候補語を書かないこと。
+  (`**Verdict:** approve (軽微な指摘あり)` は**判定不能**として扱われる。
+   註釈は次の行以降に書くこと。)
+- **1 行目以外の場所に書いた `**Verdict:**` 行は判定として読まれない。**
+  さらに、1 行目と**異なる値**の `**Verdict:**` 行が本文中にあると、
+  自己矛盾とみなして判定不能に倒れる。書式例として `**Verdict:**` 行を
+  引用する必要がある場合は、1 行目の判定と同じ値にするか、そもそも
+  引用しないこと。
+- 判定が読めなかった場合でも自動判定は壊れない — `review-plan.sh` が
+  上記の構造化出力から verdict を取り、`plan_review.md` の 1 行目に
+  規定形式で書き戻す。**書式を外したときに勝手に approve になることは無く、
+  必ず「判定不能 = 差し戻し/手動確認」側に倒れる。**
+
+### なぜこの形なのか (t012)
+
+以前は「ファイル全体から `**Verdict:**` 行を探し、その行に approve という語が
+含まれていれば approve」という形で読んでいた。この形は
+`**Verdict:** not approve` のような否定形や、コードフェンス・HTML コメントの
+中に書かれた書式例まで approve として採用してしまい、**同じ型の誤 approve が
+7 回再発した**。読む場所を 1 行目に固定し、値を完全一致に限定することで、
+記法や言い回しをいくら変えても誤 approve が作れない形にしてある。
 
 ## 基本原則
 
@@ -62,41 +78,42 @@
 
 ### Step 3: `queue/missions/<slug>/plan_review.md` に結果を出力する
 
-以下のフォーマットで出力すること（`**Verdict:**` 行は任意。上記「★ 最重要」参照 —
-verdict 自体は最終応答の構造化出力で機械的に判定されるため、書いても書かなくても
-自動判定には影響しない。書く場合はタイトルより前、1行目に置くと人間が読みやすい）:
+**1 行目は判定行だけにすること**（上記「★ 最重要」参照）。2 行目以降を
+以下のフォーマットで書く:
 
-```markdown
-<!-- **Verdict:** 行は任意。書く場合は approve / revise / reject のうち
-     一つだけを記入すること（このテンプレート行自体をそのままコピペしない。
-     t010, QA t008 FINDING-3: 3語を1行に並べたテンプレート行をそのまま
-     貼ると自動判定は「未編集のテンプレート」として判定不能に倒す） -->
+    **Verdict:** revise
 
-# Plan Review: <slug>
+    # Plan Review: <slug>
 
-**Reviewed at:** <timestamp>
+    **Reviewed at:** <timestamp>
 
-## Summary
-<1-3 文で総評>
+    ## Summary
+    <1-3 文で総評>
 
-## Issues
-<!-- verdict が revise/reject の場合のみ記載 -->
-- task: <id>
-  severity: high | medium | low
-  category: granularity | acceptance_criteria | coverage | risk | skill_mismatch
-  detail: <問題の説明>
-  recommended_action: <修正提案>
+    ## Issues
+    (verdict が revise/reject の場合のみ記載)
+    - task: <id>
+      severity: high | medium | low
+      category: granularity | acceptance_criteria | coverage | risk | skill_mismatch
+      detail: <問題の説明>
+      recommended_action: <修正提案>
 
-## Missing Tasks
-<!-- 欠落タスクがある場合 -->
-- <欠落タスクの説明>
+    ## Missing Tasks
+    (欠落タスクがある場合)
+    - <欠落タスクの説明>
 
-## Risk Flags
-<!-- 高リスクタスクがある場合 -->
-- task: <id>
-  reason: <リスクの説明>
-  recommended_mode: strict
-```
+    ## Risk Flags
+    (高リスクタスクがある場合)
+    - task: <id>
+      reason: <リスクの説明>
+      recommended_mode: strict
+
+上の例の 1 行目は `revise` にしてある。**この雛形をそのまま貼らず、
+1 行目は必ず自分の判定に書き換えること。**
+（t010/QA t008 FINDING-3: かつてここには `approve | revise | reject` と
+3 語を並べた行が載っており、未編集のままコピペされて誤 approve になった。
+現在は 3 語を並べた行を雛形に置かない。仮にコピペされても、値が
+`approve | revise | reject` では完全一致しないため判定不能に倒れる。）
 
 **verdict の基準**:
 - `approve`: 重大な問題なし。軽微な WARN があっても合格

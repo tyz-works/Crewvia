@@ -160,16 +160,23 @@ WAIT_STATUS="$(printf '%s\n' "$WAIT_OUTPUT" | head -1)"
 # 拾えれば十分だが、標準出力に紛れ込んだ場合に備えて残りも表示しておく。
 printf '%s\n' "$WAIT_OUTPUT" | tail -n +2 >&2 || true
 
-# --- t004: 構造化出力による verdict rescue ---
-# 上の polling/normalize 経路 (規定形式 or 既知の別表記のプローズ解析) が
-# 判定不能だった場合のみ、$PLAN_REVIEWER_LOG に書かれた claude --json-schema
-# の最終応答から verdict を機械的に取り出せないか試す。プローズをヒューリ
-# スティックに解釈するのではなく、CLI 自身がスキーマ適合を保証した構造化
-# 出力を単一の判定 unit として使うため、当て推量で approve に倒す余地が無い。
+# --- t004 / t012: 構造化出力を verdict の主経路にする ---
+# claude --json-schema が返す structured_output.verdict は
+# config/plan-review-verdict.schema.json の enum ("approve"|"revise"|"reject")
+# に CLI 自身が適合を保証した値であり、「フェンスの内側か」「否定文か」
+# といった曖昧性が原理的に存在しない単一の判定 unit である
+# (QA t008 が自作入力 25/25 で fail-closed を実測済み)。
+#
+# t004 版はこれを「プローズ解析が失敗したときだけ動く後段の rescue」として
+# 置いていた。t012 でその位置づけを変え、**プローズの成否に関わらず必ず
+# 読み、判定の権威とする** — plan_review.md 側の規定形式解析
+# (scripts/lib_verdict.py) は t012 で「ファイルの最初の非空行だけを完全一致で
+# 見る」形に絞り込まれており (QA t011 NEW-1/NEW-2 対応)、書式を外した
+# plan_review.md は意図的にすべて判定不能になる。その回収をこの経路が担う。
 #
 # 倒れる方向: ログが無い/JSON としてパースできない/ドキュメントが複数ある/
-# verdict が既知の3値以外、のいずれでも rescue は何もしない (WAIT_STATUS を
-# 変更しない) — 既存の判定 (失敗ならタイムアウト) をそのまま採用する。
+# verdict が既知の3値以外、のいずれでも何もしない (WAIT_STATUS を変更しない)
+# — 既存の判定 (失敗ならタイムアウト) をそのまま採用する。
 _rescue_verdict_from_structured_output() {
     local log="$1"
     [[ -f "$log" ]] || return 1
@@ -193,49 +200,80 @@ _rescue_verdict_from_structured_output() {
     printf '%s\n' "$verdict"
 }
 
-if [[ -n "$VERDICT_SCHEMA" ]] && [[ "$WAIT_RC" -ne 0 || "$WAIT_STATUS" != "OK" ]]; then
-    # mux 経路では review-plan.sh は plan-reviewer プロセスの終了を直接
-    # 待たない (plan_review.md の mtime 安定化だけで判定している) ため、
-    # 上の polling が抜けた時点で最終ターン (構造化出力) がまだ書き終わって
-    # いない可能性がある。短い bounded retry で追いつくのを待つ (最大
-    # 8 * 3 = 24秒。失敗経路でしか発火しないため通常ケースの所要時間には
-    # 影響しない)。
-    RESCUED_VERDICT=""
-    _rescue_i=0
-    while [[ "$_rescue_i" -lt 8 ]]; do
-        if RESCUED_VERDICT="$(_rescue_verdict_from_structured_output "$PLAN_REVIEWER_LOG")"; then
-            break
-        fi
-        RESCUED_VERDICT=""
-        _rescue_i=$((_rescue_i + 1))
-        sleep 3
-    done
+# plan_review.md 側 (規定形式の1行目) から読める verdict。
+# 読めなければ空文字 (判定不能)。
+PROSE_VERDICT="$(python3 "${SCRIPT_DIR}/lib_verdict.py" "$REVIEW_OUTPUT" 2>/dev/null || true)"
 
-    if [[ -n "$RESCUED_VERDICT" ]]; then
-        echo "[review-plan.sh] rescue: recovered verdict '$RESCUED_VERDICT' from structured output (${PLAN_REVIEWER_LOG}) after prose parsing failed (was: $WAIT_STATUS)" >&2
-        # t010 (QA t008 FINDING-1/2/3): 生の grep ではなく scripts/lib_verdict.py
-        # の抽出ロジック (フェンス除去 + 複数判定混在の検出) と揃える。
-        if ! python3 "${SCRIPT_DIR}/lib_verdict.py" "$REVIEW_OUTPUT" >/dev/null 2>&1; then
-            # 既存の plan_review.md (規定形式・既知の別表記のいずれも無し、
-            # または未書き込み) の冒頭に規定形式の行を機械的に追記する。
-            # normalize_plan_review_verdict.py と同じ「原文は残す」idempotent
-            # な prepend パターン。
-            TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-            # NOTE: 最後の文を `[[ -f ]] && cat` の短絡形にすると、ファイルが
-            # 無い場合に `{ ... }` グループ自体が非0を返し、後続の `&& mv` が
-            # 発火しない (mv されず .tmp のまま残る) 実害があったため、if 文で
-            # グループの終了ステータスを常に0に固定する。
-            {
-                printf '**Verdict:** %s\n' "$RESCUED_VERDICT"
-                printf '<!-- rescued by scripts/review-plan.sh from claude --json-schema structured output at %s; original content (if any) preserved below (t004) -->\n\n' "$TS"
-                if [[ -f "$REVIEW_OUTPUT" ]]; then
-                    cat "$REVIEW_OUTPUT"
-                fi
-            } > "${REVIEW_OUTPUT}.tmp" && mv "${REVIEW_OUTPUT}.tmp" "$REVIEW_OUTPUT"
-        fi
-        WAIT_STATUS="OK"
-        WAIT_RC=0
+STRUCTURED_VERDICT=""
+if [[ -n "$VERDICT_SCHEMA" ]]; then
+    if [[ "$WAIT_RC" -ne 0 || "$WAIT_STATUS" != "OK" ]]; then
+        # mux 経路では review-plan.sh は plan-reviewer プロセスの終了を直接
+        # 待たない (plan_review.md の mtime 安定化だけで判定している) ため、
+        # 上の polling が抜けた時点で最終ターン (構造化出力) がまだ書き終わって
+        # いない可能性がある。短い bounded retry で追いつくのを待つ (最大
+        # 8 * 3 = 24秒。プローズが判定不能だった経路でしか発火しないため
+        # 通常ケースの所要時間には影響しない)。
+        _rescue_i=0
+        while [[ "$_rescue_i" -lt 8 ]]; do
+            if STRUCTURED_VERDICT="$(_rescue_verdict_from_structured_output "$PLAN_REVIEWER_LOG")"; then
+                break
+            fi
+            STRUCTURED_VERDICT=""
+            _rescue_i=$((_rescue_i + 1))
+            sleep 3
+        done
+    else
+        # プローズ側が既に判定できている場合は retry せず1回だけ読む
+        # (正常系の所要時間を 24 秒伸ばさないため)。読めなければ
+        # プローズの判定をそのまま使う。
+        STRUCTURED_VERDICT="$(_rescue_verdict_from_structured_output "$PLAN_REVIEWER_LOG")" || STRUCTURED_VERDICT=""
     fi
+fi
+
+# 採用する verdict を1つに決める。
+# 構造化出力とプローズが食い違った場合は**どちらも採らない** — 同じ
+# plan-reviewer セッションが plan_review.md と最終応答で違うことを言った
+# なら判定は曖昧であり、本ミッションで繰り返し確認している
+# 「曖昧なら安全側 (判定不能) に倒す」原則をそのまま適用する。
+# 「厳しい側を選んで書き戻す」案も検討したが却下した: 書き戻すと
+# plan_review.md 内に異なる値の verdict 行が併存し、lib_verdict の
+# 自己矛盾チェックで結局判定不能になる (二度手間かつ挙動が分かりにくい)。
+# ここで判定不能に倒せば scripts/plan.sh が cycle を refund した上で
+# Director に手動確認を促すため、review cycle も失われない。
+FINAL_VERDICT=""
+VERDICT_CONFLICT=0
+if [[ -n "$STRUCTURED_VERDICT" && -n "$PROSE_VERDICT" && "$STRUCTURED_VERDICT" != "$PROSE_VERDICT" ]]; then
+    VERDICT_CONFLICT=1
+    echo "[review-plan.sh] WARNING: structured output verdict ('$STRUCTURED_VERDICT') disagrees with the verdict written in ${REVIEW_OUTPUT} ('$PROSE_VERDICT') — refusing both and falling back to manual inspection (fail-closed)" >&2
+elif [[ -n "$STRUCTURED_VERDICT" ]]; then
+    FINAL_VERDICT="$STRUCTURED_VERDICT"
+fi
+
+if [[ "$VERDICT_CONFLICT" -eq 1 ]]; then
+    WAIT_STATUS="TIMEOUT_FRESH"
+    WAIT_RC=1
+elif [[ -n "$FINAL_VERDICT" ]]; then
+    if [[ "$FINAL_VERDICT" != "$PROSE_VERDICT" ]]; then
+        echo "[review-plan.sh] recovered verdict '$FINAL_VERDICT' from structured output (${PLAN_REVIEWER_LOG}); plan_review.md had no verdict readable in the canonical form (wait status was: $WAIT_STATUS)" >&2
+        # plan_review.md の**1行目**に規定形式の行を機械的に書き込む。
+        # scripts/lib_verdict.py は最初の非空行だけを見るため、この prepend が
+        # そのまま plan.sh cmd_review の読む唯一の判定になる。
+        # normalize_plan_review_verdict.py と同じ「原文は残す」prepend パターン。
+        TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        # NOTE: 最後の文を `[[ -f ]] && cat` の短絡形にすると、ファイルが
+        # 無い場合に `{ ... }` グループ自体が非0を返し、後続の `&& mv` が
+        # 発火しない (mv されず .tmp のまま残る) 実害があったため、if 文で
+        # グループの終了ステータスを常に0に固定する。
+        {
+            printf '**Verdict:** %s\n' "$FINAL_VERDICT"
+            printf '<!-- authoritative verdict written by scripts/review-plan.sh from the claude --json-schema structured output at %s; original content (if any) preserved below (t004/t012) -->\n\n' "$TS"
+            if [[ -f "$REVIEW_OUTPUT" ]]; then
+                cat "$REVIEW_OUTPUT"
+            fi
+        } > "${REVIEW_OUTPUT}.tmp" && mv "${REVIEW_OUTPUT}.tmp" "$REVIEW_OUTPUT"
+    fi
+    WAIT_STATUS="OK"
+    WAIT_RC=0
 fi
 
 if [[ "$WAIT_RC" -eq 0 && "$WAIT_STATUS" == "OK" ]]; then

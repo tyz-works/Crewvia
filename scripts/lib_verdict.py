@@ -1,107 +1,139 @@
 #!/usr/bin/env python3
 """scripts/lib_verdict.py — plan_review.md の規定形式 verdict 抽出の単一実装。
 
-t010 (mission 20260909-dead-config-sweep, QA t008 FINDING-1/2/3) の対応。
+t012 (mission 20260909-dead-config-sweep, QA t011 NEW-1/NEW-2 + 未閉塞の同型穴)
+による全面的な作り直し。t010 版 (フェンス除去 + 判定語の集合を数える方式) は
+QA t011 が新規 fail-open を 3 件実測したため破棄した。
 
-## 背景
+## この機構が 7 回同じ形で破られてきた理由
 
-plan_review.md の verdict 抽出は従来、以下の3層がそれぞれ独自の正規表現を
-持っていた:
-  - scripts/wait_for_plan_review.sh: `grep -E '^\\*\\*Verdict:\\*\\*...'`
-  - scripts/normalize_plan_review_verdict.py: `CANON_RE` (`^...`, re.MULTILINE)
-  - scripts/plan.sh cmd_review: `re.search(r'\\*\\*Verdict:\\*\\*...')`（アンカー無し）
+plan_review.md の verdict 抽出は、これまで一貫して
+「**ファイル全体を走査して**、verdict らしき行を見つけ、
+  その行の**中に** approve という語が**含まれていれば** approve」
+という形をしていた。この形には原理的に 2 つの無限集合が入り込む:
 
-3層とも次の穴を共有していた (QA t008 が実 plan.sh review をエンドツーエンドで
-走らせて実測):
-  - FINDING-1: コードフェンス (```) を除去していないため、フェンス内の
-    書式例だけが「有効な verdict」として誤って採用される。
-  - FINDING-2: ファイル内で最初に一致した行を採用するだけで、複数の判定が
-    混在していても検出しない。フェンス内の書式例 approve が、後続の本物の
-    revise を上書きしてしまう。
-  - FINDING-3: `**Verdict:** approve | revise | reject` のように1行に複数の
-    判定語が並ぶテンプレート行 (agents/plan_reviewer.md 由来) を、最初に
-    一致した語 (approve) だけで確定させてしまう。
+  1. **値の側**: `not approve` / `approve できません` / `pending — do not
+     approve yet` のように、approve を含みながら意味が反転する表現は
+     いくらでも作れる。否定形を列挙して塞ぐことはできない
+     (この結論は normalize_plan_review_verdict.py 側で先に出ており、
+     そちらは既に APPROVE_EXACT の完全一致 = allowlist に反転済み)。
+  2. **場所の側**: ``` / ~~~ / 入れ子フェンス / 閉じ忘れフェンス /
+     HTML コメント / 引用 と、「本文に見えるが本文でない領域」の記法も
+     いくらでもある。除去ヒューリスティクスを足すたびに別の記法で抜けられ、
+     t010 版ではフェンス除去の正規表現 (```` ```.*?``` ````) がペア位置ずれを
+     起こして**本物の revise を消し approve だけを残す**という、
+     除去しなかった頃より悪い挙動まで作った (QA t011 NEW-2)。
 
-## 設計
+したがって「除去を賢くする」方向は本質的に袋小路である。
 
-判定 unit を1本に絞る (このミッションで繰り返し採用している「危険な結論は
-allowlist・判定 unit は1つ」の原則をそのまま適用):
-  1. まずコードフェンス (```...```) を全て取り除く。フェンス内の内容は
-     判定の対象にしない (書式例として提示されただけの可能性が高いため)。
-  2. 残った本文から `^\\*\\*Verdict:\\*\\*` で始まる行を全て集める。
-  3. 各行について、行の値部分に approve/revise/reject のうち何種類の
-     判定語が含まれるかを数える。2種類以上含まれる行 (テンプレート行の
-     コピペ等) は「その行からは判定を読み取らない」として捨てる。
-  4. 全行を通じて有効な判定語の集合を作る。集合の要素数が exactly 1 の
-     場合だけ、その値を verdict として確定する。0件 (判定語なし) でも
-     2件以上 (異なる判定が混在) でも判定不能として None を返す —
-     「最初に見つかった approve を採る」という倒れ方は絶対にしない。
+## 設計 (t012): 判定を読む場所も値も、閉じた文法に限定する
 
-正常系 (`**Verdict:** approve` 1行だけ、フェンスなし) は現状と完全に同じ
-挙動になる。既存の呼び出し元 (wait_for_plan_review.sh の grep 相当,
-normalize_plan_review_verdict.py の CANON_RE 相当, plan.sh cmd_review の
-re.search 相当) はいずれもこのモジュールの `extract_canonical_verdict()` に
-置き換える。
+  1. **場所を 1 点に固定する** — ファイルの**最初の非空行だけ**を判定の
+     対象にする。ファイル全体の走査をやめる。
+     フェンスや HTML コメントが本文のどこにあっても、判定の対象領域に
+     入り込む余地が原理的に無くなる (フェンス内・コメント内の行が
+     「最初の非空行」になるには、その開始記号 ``` / ~~~ / <!-- 自身が
+     さらに手前の非空行として現れるため、開始記号の行が読まれて不一致に
+     なる)。フェンス記法の列挙も除去も一切不要になる。
+  2. **値を完全一致の allowlist にする** — 行の値部分を前後の空白だけ
+     取り除き、`approve` / `revise` / `reject` の**いずれか 1 語ちょうど**と
+     完全一致する場合だけ採用する。部分一致・包含判定は一切しない。
+     大文字小文字も区別する (config/plan-review-verdict.schema.json の
+     enum が小文字のみであり、`APPROVE` を通すのは危険側への緩和になる。
+     QA t011 NEW-3 で指摘された緩和をここで戻す)。
+  3. **それ以外はすべて判定不能 (None)** — 呼び出し側は「待つ / 失敗」側に
+     倒すこと。approve に倒れる経路をこのモジュールは一つも持たない。
+  4. **拒否専用の追加スキャン** — 1 で確定した値と**異なる値**の完全一致
+     verdict 行がファイル内の他の場所にもある場合は、判定不能に落とす
+     (reviewer が自己矛盾している = 曖昧なので安全側)。
+     これはファイル全体を見るが、**判定を「読む」のではなく「拒否する」
+     ためだけに使う**: 出力は None 方向にしか動かないので、この走査が
+     approve を生むことは原理的にありえない (単調に安全側)。
+     フェンス記法の解釈は一切していない — 「値が完全一致の verdict 行か
+     どうか」しか見ないため、記法を変えて抜けるという攻撃面が無い。
+
+この形は「危険な結論は allowlist・判定 unit は 1 つ」という本ミッションの
+原則を、**値と場所の両方**に適用したものである (t010 版は本数だけに適用し、
+値と場所には適用していなかった)。
+
+## 書式が守られなかった場合にどう回収するか
+
+上記のとおり本モジュールは意図的に厳しい。規定形式を外した plan_review.md
+(例: タイトル行が先にある / 値に註釈が付く / 判定が本文中にある) は
+すべて判定不能になる。**その回収は scripts/review-plan.sh の構造化出力経路
+(`claude --json-schema` + config/plan-review-verdict.schema.json) が行う** —
+CLI 自身が enum 適合を保証した JSON の `verdict` フィールドという、
+曖昧性が原理的に存在しない単一の判定 unit から verdict を取り、
+plan_review.md の 1 行目に規定形式で書き戻す。
+つまり散文の解釈を賢くするのではなく、
+**散文を読む場所を 1 点に固定し、書式が外れたら構造化出力に委ねる**
+というのが t012 の全体設計である。
 
 Usage (CLI):
   python3 lib_verdict.py <plan_review.md path>
   → 有効な verdict が一意に確定すれば標準出力に書いて exit 0。
-    判定不能 (0件 / 複数混在 / ファイルが読めない) なら何も出さず exit 1。
+    判定不能 (規定形式でない / 値が完全一致でない / ファイルが読めない)
+    なら何も出さず exit 1。
 """
 from __future__ import annotations
 
 import re
 import sys
 
-# コードフェンス (```...```、言語指定の有無を問わない) を除去する。
-# DOTALL で複数行にまたがるフェンスも1つのブロックとして扱う。
-# 閉じられていないフェンス (``` が奇数個) は保守的にそのまま残す —
-# 「フェンス内かもしれない」だけで本文まで巻き込んで消してしまうと、
-# 逆に正規の verdict が読めなくなる事故につながるため。
-_FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
+# 許容する verdict は この 3 語ちょうどのみ (完全一致 allowlist)。
+# config/plan-review-verdict.schema.json の enum と同一・同順。
+CANONICAL_VERDICTS = ("approve", "revise", "reject")
 
-# 規定形式の verdict 行 (値部分は行末までまるごと捕捉し、値の解釈は
-# _parse_verdict_words() に委ねる)。ラベル自体の大文字小文字は区別しない
-# 呼び出し元が過去に無かった (bash grep / plan.sh の re.search はどちらも
-# 大文字小文字を区別していた) ため、ここでも区別しない (完全一致のみ)。
-_VERDICT_LINE_RE = re.compile(r"^\*\*Verdict:\*\*[ \t]*(.*)$", re.MULTILINE)
-
-# 判定語そのものは表記ゆれ (Approve / APPROVE 等) を許容する。大文字小文字を
-# 区別しても実運用上の安全性は変わらず (許容語彙自体は3語で固定)、むしろ
-# 表記ゆれで判定不能に落ちる方が Director の手間を増やすだけなので緩める。
-_KNOWN_WORDS = ("approve", "revise", "reject")
-_WORD_RE = re.compile(r"\b(" + "|".join(_KNOWN_WORDS) + r")\b", re.IGNORECASE)
+# 規定形式の verdict 行。行頭アンカー (re.match) で、インデントも引用符 (>) も
+# 許容しない。値部分は行末までまるごと捕捉し、完全一致判定は呼び出し側で行う。
+_VERDICT_LINE_RE = re.compile(r"\*\*Verdict:\*\*(.*)$")
 
 
-def strip_code_fences(text: str) -> str:
-    """コードフェンスで囲まれた範囲を除去したテキストを返す。"""
-    return _FENCE_RE.sub("", text)
+def first_content_line(text: str) -> str | None:
+    """先頭の空行を読み飛ばし、最初の非空行を返す。1 行も無ければ None。
+
+    「非空」= 前後の空白 (改行・タブ・全角空白を含む) を除いて 1 文字以上残る行。
+    """
+    for line in text.splitlines():
+        if line.strip():
+            return line
+    return None
 
 
-def _words_in_line(value: str) -> set[str]:
-    """verdict 行の値部分に含まれる判定語 (小文字正規化済み) の集合を返す。"""
-    return {m.group(1).lower() for m in _WORD_RE.finditer(value)}
+def _canonical_value_of(line: str) -> str | None:
+    """1 行が完全一致の規定形式 verdict 行なら、その値を返す。でなければ None。"""
+    m = _VERDICT_LINE_RE.match(line)
+    if not m:
+        return None
+    value = m.group(1).strip()
+    return value if value in CANONICAL_VERDICTS else None
 
 
 def extract_canonical_verdict(text: str) -> str | None:
-    """規定形式 `**Verdict:** approve|revise|reject` から verdict を1つ確定する。
+    """規定形式 `**Verdict:** approve|revise|reject` から verdict を 1 つ確定する。
 
-    フェンス除去 → 各 verdict 行ごとに判定語を数える → 1行に2種類以上の
-    判定語が混在する行は捨てる → 全行を通じて有効な判定語の集合を作る →
-    集合の要素数が exactly 1 の場合だけ確定。それ以外 (0件 / 複数混在) は
-    None (判定不能。呼び出し側は「待つ / 失敗」側に倒すこと)。
+    判定対象は**ファイルの最初の非空行だけ**。その行が
+    `**Verdict:**` で始まり、続く値が前後の空白を除いて
+    CANONICAL_VERDICTS のいずれかと完全一致する場合にのみ、その語を候補にする。
+    それ以外は例外なく None (判定不能)。
+
+    候補が決まった後、ファイル内の他の行に**異なる値**の完全一致 verdict 行が
+    あれば None に落とす (reviewer の自己矛盾 = 曖昧 → 安全側)。同じ値の
+    重複は矛盾ではないので許容する。この追加走査は結果を None 方向にしか
+    動かさないため、判定を「1 箇所からのみ読む」性質は保たれている。
     """
-    stripped = strip_code_fences(text)
-    found: set[str] = set()
-    for m in _VERDICT_LINE_RE.finditer(stripped):
-        words = _words_in_line(m.group(1))
-        if len(words) == 1:
-            found |= words
-        # len(words) == 0 (未知の判定語) / >= 2 (テンプレート行等、
-        # FINDING-3) の行は判定材料として採用しない — 黙って捨てる。
-    if len(found) == 1:
-        return next(iter(found))
-    return None
+    first = first_content_line(text)
+    if first is None:
+        return None
+    verdict = _canonical_value_of(first)
+    if verdict is None:
+        return None
+
+    for line in text.splitlines():
+        other = _canonical_value_of(line)
+        if other is not None and other != verdict:
+            return None  # 自己矛盾 — 判定不能に倒す
+    return verdict
 
 
 def main(argv: list[str]) -> int:

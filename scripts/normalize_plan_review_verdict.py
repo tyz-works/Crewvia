@@ -32,7 +32,7 @@ import sys
 from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from lib_verdict import extract_canonical_verdict, strip_code_fences  # noqa: E402
+from lib_verdict import extract_canonical_verdict  # noqa: E402
 
 # t010 (QA t008 FINDING-1/2/3): 規定形式 `**Verdict:**` の抽出は
 # scripts/lib_verdict.py の extract_canonical_verdict() に一本化した
@@ -40,6 +40,82 @@ from lib_verdict import extract_canonical_verdict, strip_code_fences  # noqa: E4
 # 使う)。以前はこのファイル・wait_for_plan_review.sh・plan.sh の3箇所が
 # それぞれ独自の正規表現を持ち、コードフェンスを除去しない・アンカーの
 # 有無が食い違う、といった不一致がそのまま誤 approve の温床になっていた。
+#
+# t012 (QA t011): その extract_canonical_verdict() は「ファイルの最初の非空行
+# だけを見る」形に作り直され、フェンス除去ヒューリスティクスを一切持たなく
+# なった (理由は lib_verdict.py の docstring 参照)。下の別表記 (`## 総合判定:
+# **GO**`) 探索だけは性質上ファイル中の見出しを探す必要があるため、この
+# ファイル内に閉じた前処理として _strip_non_prose_regions() を持つ。
+# **これは規定形式の判定 (主機構) には一切関与しない** — 主機構は場所を
+# 1 点に固定することで、除去処理そのものを不要にしている。
+
+
+# --- t012 (QA t011 NEW-2 / tilde_fence / nested_fence / unclosed_fence) ---
+# 旧実装は lib_verdict.strip_code_fences() = `re.compile(r"```.*?```", DOTALL)`
+# を使っていた。この正規表現には 2 つの欠陥があった:
+#   - ``` が奇数個あると 1-2, 3-4 とペアリングがずれ、**フェンスの外にある
+#     本物の判定を消して、書式例だけを残す**ことがある (QA t011 NEW-2 で
+#     実測。除去しなかった場合より悪い方向に倒れる)。
+#   - ~~~ フェンス (markdown の正式な代替記法) と入れ子フェンスを扱えない。
+#
+# ここでは正規表現のペアリングをやめ、**行単位のスキャナ**にする:
+#   - ``` または ~~~ が 3 個以上連続する行でフェンスを開き、同じ記号で
+#     開いたときと同じ長さ以上の行が来るまでフェンス内とみなす
+#     (CommonMark の閉じフェンス規則と同じ。これにより入れ子も扱える)。
+#   - **閉じられていないフェンスは EOF までフェンス内**とみなして捨てる
+#     (fail-closed)。旧実装はここを「保守的にそのまま残す」としていたが、
+#     安全ゲートにおける「保守的」は捨てる側であって残す側ではない。
+# 除去は「捨てる」方向にしか働かないため、この前処理が新しい approve を
+# 生むことはない (捨てすぎた場合は判定不能 = 安全側に倒れる)。
+_FENCE_OPEN_RE = re.compile(r"^[ \t]*(`{3,}|~{3,})")
+
+
+def _strip_fenced_lines(text: str) -> str:
+    out: list[str] = []
+    fence: str | None = None  # 開いているフェンスの記号 (例 "```")
+    for line in text.splitlines():
+        m = _FENCE_OPEN_RE.match(line)
+        if fence is None:
+            if m:
+                fence = m.group(1)
+                continue  # 開始行自体も捨てる
+            out.append(line)
+            continue
+        # フェンス内: 閉じフェンス (同じ記号・同じ長さ以上・後ろは空白のみ) を探す
+        if m and m.group(1)[0] == fence[0] and len(m.group(1)) >= len(fence):
+            if not line[m.end():].strip():
+                fence = None
+        # 閉じたかどうかに関わらずフェンス内の行は捨てる
+    # fence が None のまま終わらなかった場合 = 閉じ忘れ。残りは既に捨てられている。
+    return "\n".join(out)
+
+
+def _strip_html_comments(text: str) -> str:
+    """`<!-- ... -->` を除去する。終端の無いコメントは EOF まで捨てる (fail-closed)。"""
+    out: list[str] = []
+    rest = text
+    while True:
+        i = rest.find("<!--")
+        if i < 0:
+            out.append(rest)
+            break
+        out.append(rest[:i])
+        j = rest.find("-->", i + 4)
+        if j < 0:
+            break  # 閉じられていない — 以降は全部捨てる
+        rest = rest[j + 3:]
+    return "".join(out)
+
+
+def _strip_non_prose_regions(text: str) -> str:
+    """別表記探索の前処理: コードフェンスと HTML コメントを落とす。
+
+    **規定形式 (`**Verdict:**`) の判定には使わない。** 規定形式側は
+    lib_verdict.extract_canonical_verdict() が「最初の非空行だけ」を読むため、
+    この種の除去処理を必要としない (invariant: 除去ヒューリスティクスを
+    主機構にしない)。
+    """
+    return _strip_html_comments(_strip_fenced_lines(text))
 
 # reject / revise はこれまでと同じ denylist 方式のまま (今回の変更対象外) —
 # 「安全な結論 (reject/revise) は denylist、危険な結論 (approve) は allowlist」
@@ -116,10 +192,12 @@ def _canonical_unit(unit: str) -> str:
 
 
 def find_alt_verdict(content: str) -> str | None:
-    # t010 (QA t008 FINDING-1 系の防御的一般化): 別表記探索もフェンス除去後の
-    # テキストに対して行う。フェンス内に書式例として別表記 (`## 総合判定: **GO**`
+    # t010 (QA t008 FINDING-1 系の防御的一般化) / t012 (QA t011 NEW-2 系):
+    # 別表記探索は、コードフェンスと HTML コメントを落としたテキストに対して
+    # 行う。フェンス内・コメント内に書式例として別表記 (`## 総合判定: **GO**`
     # 等) が書かれているだけのケースを本物の判定として拾わないため。
-    content = strip_code_fences(content)
+    # 除去は捨てる方向にしか働かない (捨てすぎたら判定不能 = 安全側)。
+    content = _strip_non_prose_regions(content)
     m = SCOPE_RE.search(content)
     if not m:
         return None

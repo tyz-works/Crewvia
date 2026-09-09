@@ -126,7 +126,13 @@ _run_variant "fence_only" '見本:
   "フェンス内だけの approve → status: drafting (誤 approve だった旧挙動の修正確認)"
 
 echo ""
-echo "--- FINDING-2 [最重要]: フェンス内 approve が後続の本物の revise を上書きしない ---"
+echo "--- FINDING-2 [最重要]: フェンス内 approve が本物の判定として採用されない ---"
+# t010 版はここで「フェンスを除去して本文末尾の revise を採用する」ことを
+# 期待していた。t012 で判定を読む場所を「ファイルの最初の非空行」1点に
+# 固定したため、この入力は 1 行目が判定行でなく **判定不能** になる
+# (誤 approve にならないという要件は満たしたまま、フェンス記法の解釈を
+#  やめた分だけ厳しい側に倒れる)。本番では review-plan.sh が構造化出力から
+# verdict を回収して 1 行目に書き戻すため、reviewer の本当の判定は失われない。
 _run_variant "mixed_fence" '書式例:
 
 ```
@@ -135,8 +141,8 @@ _run_variant "mixed_fence" '書式例:
 
 実際の判定は以下です。
 
-**Verdict:** revise' "drafting" "revise" \
-  "フェンス内approve + 本物のrevise → revise が採用される (旧挙動は誤って approve になっていた)"
+**Verdict:** revise' "drafting" "" \
+  "フェンス内approve + 本文末尾のrevise → 誤 approve にならず判定不能 (status: drafting)"
 
 echo ""
 echo "--- FINDING-3: テンプレート行をそのまま貼ると誤 approve にならない ---"
@@ -144,6 +150,69 @@ _run_variant "template_line" '**Verdict:** approve | revise | reject
 
 # Plan Review: test' "drafting" "" \
   "未編集のテンプレート行 (approve | revise | reject) → status: drafting (旧挙動は誤って approve だった)"
+
+echo ""
+echo "--- t012 (QA t011): 実測された危険側入力が end-to-end で誤 approve にならないこと ---"
+# t011 は lib_verdict 単体 8 件を実 plan.sh review に流し、全件が
+# 「reviewer が approve を選んでいないのに status: ready / verdict: approve」
+# に到達することを実測した。その 8 件 + 既存穴 1 件をそのまま恒久テスト化する。
+_run_variant "not_approve" '**Verdict:** not approve' "drafting" "" \
+  "値の否定形 (not approve) → drafting (t011 NEW-1)"
+_run_variant "pending_no_approve" '**Verdict:** pending — do not approve yet' "drafting" "" \
+  "値の否定形 (do not approve yet) → drafting (t011 NEW-1)"
+_run_variant "cannot_approve_ja" '**Verdict:** approve できません' "drafting" "" \
+  "値の否定形 (approve できません) → drafting (t011 既存穴)"
+_run_variant "upper_approve" '**Verdict:** APPROVE' "drafting" "" \
+  "大文字 APPROVE → drafting (t011 NEW-3: 危険側への緩和を戻した)"
+_run_variant "odd_fence_mispair" 'A
+
+```
+**Verdict:** revise
+```
+
+```
+**Verdict:** approve' "drafting" "" \
+  "フェンスが奇数個 (旧実装はペア位置ずれで本物の revise を消していた) → drafting (t011 NEW-2)"
+_run_variant "nested_fence" '````
+
+```
+**Verdict:** approve
+```
+
+````' "drafting" "" \
+  "入れ子フェンス → drafting (t011 未閉塞だった既存穴)"
+_run_variant "tilde_fence_only" '~~~
+**Verdict:** approve
+~~~' "drafting" "" \
+  "~~~ フェンス → drafting (t011 未閉塞だった既存穴)"
+_run_variant "unclosed_fence" '```
+**Verdict:** approve' "drafting" "" \
+  "閉じ忘れフェンス → drafting (t011 未閉塞だった既存穴)"
+_run_variant "html_comment_ml" '<!--
+**Verdict:** approve
+-->' "drafting" "" \
+  "複数行 HTML コメント内の判定 → drafting (t011 未閉塞だった既存穴)"
+
+echo ""
+echo "--- t012: 判定を読む場所は1行目のみ / 自己矛盾は判定不能 ---"
+_run_variant "title_first" '# Plan Review: test
+
+**Verdict:** approve' "drafting" "" \
+  "タイトル行が先にある → 1行目が判定行でないため drafting (不変条件2)"
+_run_variant "approve_with_comment" '**Verdict:** approve (軽微な指摘はあるが問題なし)' "drafting" "" \
+  "値に註釈が付く → 完全一致しないため drafting (不変条件1。本番は構造化出力が回収する)"
+_run_variant "self_contradiction" '**Verdict:** approve
+
+note
+
+**Verdict:** revise' "drafting" "" \
+  "1行目 approve + 本文に revise → 自己矛盾として drafting"
+_run_variant "dup_same_approve" '**Verdict:** approve
+
+note
+
+**Verdict:** approve' "ready" "approve" \
+  "同じ approve の重複は矛盾ではない → ready + approve (過剰な安全側倒れをしない)"
 
 echo ""
 echo "--- 判定不能の一般化 (regression なし) ---"

@@ -93,6 +93,11 @@ cp "$REAL_REPO/scripts/lib_mux.sh" "$SCRATCH_DIR/scripts/"
 cp "$REAL_REPO/scripts/lib_mux.py" "$SCRATCH_DIR/scripts/"
 cp "$REAL_REPO/scripts/wait_for_plan_review.sh" "$SCRATCH_DIR/scripts/"
 cp "$REAL_REPO/scripts/normalize_plan_review_verdict.py" "$SCRATCH_DIR/scripts/"
+# t001 (mission 20260909-dead-config-sweep): review-plan.sh はモデル解決に
+# scripts/lib_model.py と config/crewvia.yaml を必須で読むようになった。
+mkdir -p "$SCRATCH_DIR/config"
+cp "$REAL_REPO/scripts/lib_model.py" "$SCRATCH_DIR/scripts/"
+cp "$REAL_REPO/config/crewvia.yaml" "$SCRATCH_DIR/config/"
 
 RESULT_DIR="$(mktemp -d /tmp/crewvia-test-review-plan-result-XXXXXX)"
 

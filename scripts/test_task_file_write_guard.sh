@@ -38,6 +38,14 @@
 #          剥がす) を入れても、12-13 の allow ケースは引き続き allow のまま
 #          であること (t019 の誤 deny 修正が壊れていないことの回帰)
 #
+# t002 (#183 方針決定タスク) での修正: 「クォート除去後も制御演算子が残るなら
+# 常に生コマンドで判定する」フェイルセーフが、報告コマンドへの後続パイプだけで
+# t019 の誤 deny を再発させていた (方針・根拠は PR 本文参照)。
+#   22-23. plan.sh done / gh pr comment --body の引用テキストに後続
+#          `| tee log` が付いても allow のままであること (誤 deny 修正)
+#   24.    フェイルセーフの本来の目的 (`bash -c "..."` でクォートの中身が
+#          実際に実行される場合) は維持され、deny されたままであること
+#
 # 使い方: bash scripts/test_task_file_write_guard.sh
 # 終了コード: 0 = 全パス, 1 = 1件以上失敗
 
@@ -268,6 +276,34 @@ INPUT="$(_bash_input_json './scripts/plan.sh done t021 "#183 は cat >> queue/mi
 STDOUT=$(_run_hook "$INPUT" CREWVIA_TASKVIA=disabled TASKVIA_TOKEN="" SKILLS=bash AGENT_NAME=Haruto || true)
 EXIT=$?
 _assert_decision "21. plan.sh done への引用テキストは引き続き allow (t023 修正後も t019 の修正が壊れていない)" "allow" "$STDOUT" "$EXIT"
+
+# ---------------------------------------------------------------------------
+# 22-24 (t002/#183 B の修正): 「クォート除去後も制御演算子が残る→常に生コマンド
+# で判定する」フェイルセーフが、報告コマンドへの後続パイプだけで t019 の誤 deny
+# を再発させていた問題の回帰テスト。
+# ---------------------------------------------------------------------------
+
+INPUT="$(_bash_input_json './scripts/plan.sh done t001 "原因は cat >> queue/missions/m1/tasks/t004.md の heredoc" | tee /tmp/log')"
+STDOUT=$(_run_hook "$INPUT" CREWVIA_TASKVIA=disabled TASKVIA_TOKEN="" SKILLS=bash AGENT_NAME=Haruto || true)
+EXIT=$?
+_assert_decision "22. plan.sh done の引用テキスト + 後続 '| tee log' → allow (B の誤 deny 修正)" "allow" "$STDOUT" "$EXIT"
+
+INPUT="$(_bash_input_json 'gh pr comment 183 --body "guard blocks: cat >> queue/missions/m1/tasks/t004.md" | tee /tmp/log')"
+STDOUT=$(_run_hook "$INPUT" CREWVIA_TASKVIA=disabled TASKVIA_TOKEN="" SKILLS=bash AGENT_NAME=Haruto || true)
+EXIT=$?
+_assert_decision "23. gh pr comment --body の引用テキスト + 後続 '| tee log' → allow (B の誤 deny 修正)" "allow" "$STDOUT" "$EXIT"
+
+# ---------------------------------------------------------------------------
+# 24: 22-23 で「制御演算子が残る→生コマンドに戻す」フェイルセーフを狭めた後も、
+# ネストインタプリタへの丸投げ (bash -c "...") でクォートの中身が実際に実行
+# される本物の書き込みは引き続き deny されること (フェイルセーフの本来の目的が
+# 壊れていないことの回帰テスト)。
+# ---------------------------------------------------------------------------
+
+INPUT="$(_bash_input_json 'bash -c "cat >> queue/missions/m1/tasks/t004.md"; true')"
+STDOUT=$(_run_hook "$INPUT" CREWVIA_TASKVIA=disabled TASKVIA_TOKEN="" SKILLS=bash AGENT_NAME=Haruto || true)
+EXIT=$?
+_assert_decision "24. bash -c \"cat >> ...\"; true → deny (ネストインタプリタのフェイルセーフは維持)" "deny" "$STDOUT" "$EXIT"
 
 echo ""
 echo "================================"

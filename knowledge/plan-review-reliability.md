@@ -100,3 +100,67 @@ Edit・MultiEdit 禁止) を **完全にバイパスして** 動いていた。
 claude を一切起動せずに3パターン (規定形式 / 別表記 / 前 cycle の残骸) を
 決定論的に回帰テストできるようにした。同じ理由で verdict 正規化ロジックも
 独立した Python スクリプトに切り出してある。
+
+---
+
+## 追記 (t004, mission 20260909-dead-config-sweep): 散文パースから構造化出力への移行
+
+**症状**: 上記パターン1 (verdict 形式不一致) を PR #188 で「対応」したはずが、
+その後も plan-reviewer (Opus) が禁止形式 (`## 総合判定: **GO**`) で出力する
+事故が再発し、`normalize_plan_review_verdict.py` の別表記救済でも拾えず
+600s タイムアウト → Director が capture して手動で `plan_review.md` /
+`mission.yaml` を書く事態になった。**「プロンプト指示 (`★ 最重要` セクション)
+だけでは機構として成立していない」ことの再実証**。
+
+**検討した案** (Description 記載の A〜D):
+- **(A) 別ファイルに1語だけ書かせる**: 採用せず。`skill-permissions.yaml` の
+  `plan_review.allow: Write` が bare token signature (file_path 無し) にしか
+  マッチできず「plan_review.md だけ書ける」制約が技術的に表現不可能な設計
+  (このファイル冒頭「根本原因」参照) のため、追加ファイルを許可するには
+  hook 権限をさらに緩めるか複雑化させる必要があり、新しい攻撃面/バグ面が増える。
+- **(B) claude CLI の構造化出力機能を使う**: **採用**。`claude --help` で
+  `--json-schema <schema>` (structured output validation) の実在を確認し、
+  `claude --output-format json --json-schema '...'` を実機で検証 (Haiku で
+  実行、`structured_output` フィールドにスキーマ通りの `{"verdict":...}` が
+  返ることを確認)。Write 権限を一切変更せずに済む — 検証されるのは「セッション
+  の最終応答」であり、`plan_review.md` への Write tool 呼び出しとは独立した
+  チャネルのため。
+- **(C) normalizer を賢くする**: 不採用。Description が明示するとおり、
+  本 mission 内で kai-review.sh が「散文の判定は本質的にヒューリスティックで
+  完全解が無い」ことを 6 回の実測欠陥で示した教訓と同型であり、normalize 側の
+  対症療法をこれ以上重ねても同じ穴が別表記で再発するだけと判断。
+- **(D) 現状維持**: 不採用。早期打ち切り (`_EARLY_BREAK_STREAK`) で待ち時間
+  自体は既に軽減されているが、「Director の手動介入」自体は解消されておらず、
+  実機で再発が確認されている以上、機構化の価値がある。
+
+**実装**: `scripts/review-plan.sh` の plan-reviewer 起動コマンド (mux 経路・
+inline フォールバック経路の両方) に `--output-format json --json-schema
+<config/plan-review-verdict.schema.json>` を追加。既存の polling
+(`wait_for_plan_review.sh`) / normalize 経路は**そのまま残し、置き換えない**
+— これらが失敗した場合 (`WAIT_STATUS != OK`) のみ、`review-plan.sh` が
+plan-reviewer プロセスの stdout ログ (`/tmp/plan_reviewer_$$.log`) から
+`structured_output.verdict` を機械的に取り出し、`plan_review.md` 冒頭に
+規定形式の行を追記して rescue する（`normalize_plan_review_verdict.py` と
+同じ「原文は残す」idempotent な prepend パターン）。
+
+**倒れる方向**: スキーマファイル欠如・JSON パース失敗・`"type":"result"` 行が
+0件/複数件・verdict が3値以外、のいずれでも rescue は何もしない
+(fail-closed。既存の polling/normalize 経路の判定をそのまま採用し、タイムアウト
+なら Director 手動確認に倒れる — 当て推量で verdict を捏造しない)。mux 経路は
+`review-plan.sh` が plan-reviewer プロセスの終了を直接待たない (`plan_review.md`
+の mtime 安定化だけで判定) ため、rescue 実行前に短い bounded retry (最大 24秒、
+失敗経路でのみ発火) を挟んで構造化出力の書き込みタイミングを待つ。
+
+**副次効果**: `agents/plan_reviewer.md` の「★ 最重要」セクションから、散文
+フォーマットの厳格な指示 (`**Verdict:**` を1行目に書けという命令) を撤去。
+plan-reviewer は verdict の書式を一切気にする必要がなくなった (Write する
+`plan_review.md` の内容は Summary/Issues として従来どおり重要だが、判定その
+ものは CLI が強制する)。
+
+**関連ファイル (追加分)**: `config/plan-review-verdict.schema.json` (新規),
+`scripts/test_review_plan_json_rescue.sh` (新規)。既存の
+`scripts/test_wait_for_plan_review.sh` / `scripts/test_normalize_plan_review_verdict.sh`
+/ `scripts/test_review_plan_pane_leak.sh` / `scripts/test_review_plan_director_identity.sh`
+は無改修のまま green (スキーマファイル欠如時は自動で機能を無効化し、既存の
+scratch テストセットアップ — config/ を用意していない — でも review-plan.sh
+全体を落とさない設計にしたため)。

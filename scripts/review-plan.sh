@@ -39,6 +39,39 @@ source "${SCRIPT_DIR}/lib_mux.sh"
 rm -f "$REVIEW_OUTPUT"
 REVIEW_START_EPOCH=$(date +%s)
 
+# --- t004 (mission 20260909-dead-config-sweep) ---
+# plan-reviewer の最終応答を `claude --json-schema` で
+# config/plan-review-verdict.schema.json 形式に強制する。散文プロンプト指示
+# (`**Verdict:** approve` を1行目に書け) だけに頼っていた従来方式は
+# plan-reviewer (Opus) が規定形式を外すことが繰り返し起きていた
+# (agents/plan_reviewer.md の「★ 最重要」参照)。CLI 自身がスキーマ適合を
+# 保証する構造化出力を rescue 経路として使うことで、下記の既存 polling/
+# normalize 経路 (`scripts/wait_for_plan_review.sh` 呼び出し以降) が失敗した
+# 場合でも verdict を機械的に回収できるようにする (先例: kai-review.sh の
+# codex exec --output-schema 移行、PR #193)。既存 polling/normalize 経路は
+# そのまま残す (プロンプト指示だけで規定形式が書かれた通常ケースでは rescue
+# は何もしない no-op)。
+# スキーマファイルが無い/壊れている場合でも review-plan.sh 全体を落とさない
+# (rescue 機構は既存 polling/normalize 経路の上に乗る追加の保険であり、
+# 必須依存にすると新規ファイルの取り違え/削除だけで正規のレビュー実行が
+# 止まってしまう。t001 の config/crewvia.yaml 欠如時のフォールバック方針
+# (grep が空を返すだけで exit しない) と同じ考え方)。
+SCHEMA_FILE="$CREWVIA_DIR/config/plan-review-verdict.schema.json"
+VERDICT_SCHEMA=""
+if [[ -f "$SCHEMA_FILE" ]]; then
+    VERDICT_SCHEMA="$(jq -c . "$SCHEMA_FILE" 2>/dev/null || true)"
+fi
+if [[ -z "$VERDICT_SCHEMA" ]]; then
+    echo "[review-plan.sh] WARNING: verdict schema unavailable ($SCHEMA_FILE not found or invalid JSON) — structured-output rescue disabled, falling back to prose-only verdict parsing" >&2
+fi
+# mux 経路 (INLINE_CMD は文字列として後で実行されるため single-quote で
+# 埋め込む)。inline フォールバック経路は配列展開でそのまま渡す。
+SCHEMA_CLI_ARG=""
+[[ -n "$VERDICT_SCHEMA" ]] && SCHEMA_CLI_ARG=" --output-format json --json-schema '$VERDICT_SCHEMA'"
+SCHEMA_FLAG=()
+[[ -n "$VERDICT_SCHEMA" ]] && SCHEMA_FLAG=(--output-format json --json-schema "$VERDICT_SCHEMA")
+PLAN_REVIEWER_LOG="/tmp/plan_reviewer_$$.log"
+
 # SKILLS=plan_review: config/skill-permissions.yaml の plan_review セクション
 # (Bash 全面禁止 / Edit・MultiEdit 禁止 / Write は plan_review.md 限定) が
 # 実際に適用されるようにするための必須設定。
@@ -72,8 +105,9 @@ REVIEW_START_EPOCH=$(date +%s)
 # unset CLAUDE_CODE_CHILD_SESSION: herdr server 由来の汚染変数が Plan Reviewer に伝播しないよう除去。
 # CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1: 二重防御として transcript 保存を公式 env var で保証 (→ t004)。
 INLINE_CMD="unset CLAUDE_CODE_CHILD_SESSION; export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1; export AGENT_NAME='Plan-Reviewer'; export SKILLS=plan_review; cd '$CREWVIA_DIR' && CLAUDE_SKILL=plan_review claude --model claude-opus-4-5 \
+     ${SCHEMA_CLI_ARG} \
      -p 'Mission slug: $SLUG. agents/plan_reviewer.md の手順に従い queue/missions/$SLUG/ の全タスクを検査し、queue/missions/$SLUG/plan_review.md を出力せよ。' \
-     2>&1 | tee /tmp/plan_reviewer_$$.log"
+     2>&1 | tee '$PLAN_REVIEWER_LOG'"
 
 MUX_LAUNCHED=0
 # F4 (PR#188 t012 Seo 指摘): 以前は成功時とタイムアウト時の2箇所に明示的な
@@ -101,8 +135,9 @@ else
     # 実際に適用するため)。
     export SKILLS=plan_review
     CLAUDE_SKILL=plan_review claude --model claude-opus-4-5 \
+        "${SCHEMA_FLAG[@]+"${SCHEMA_FLAG[@]}"}" \
         -p "Mission slug: $SLUG. agents/plan_reviewer.md の手順に従い queue/missions/$SLUG/ の全タスクを検査し、queue/missions/$SLUG/plan_review.md を出力せよ。" \
-        2>&1 | tee /tmp/plan_reviewer_$$.log
+        2>&1 | tee "$PLAN_REVIEWER_LOG"
     if [[ $? -ne 0 ]]; then
         echo "[review-plan.sh] ERROR: Plan Reviewer exited with non-zero status" >&2
         exit 1
@@ -124,6 +159,82 @@ WAIT_STATUS="$(printf '%s\n' "$WAIT_OUTPUT" | head -1)"
 # wait_for_plan_review.sh 自身も stderr に出しているため、ここでは1行目だけ
 # 拾えれば十分だが、標準出力に紛れ込んだ場合に備えて残りも表示しておく。
 printf '%s\n' "$WAIT_OUTPUT" | tail -n +2 >&2 || true
+
+# --- t004: 構造化出力による verdict rescue ---
+# 上の polling/normalize 経路 (規定形式 or 既知の別表記のプローズ解析) が
+# 判定不能だった場合のみ、$PLAN_REVIEWER_LOG に書かれた claude --json-schema
+# の最終応答から verdict を機械的に取り出せないか試す。プローズをヒューリ
+# スティックに解釈するのではなく、CLI 自身がスキーマ適合を保証した構造化
+# 出力を単一の判定 unit として使うため、当て推量で approve に倒す余地が無い。
+#
+# 倒れる方向: ログが無い/JSON としてパースできない/ドキュメントが複数ある/
+# verdict が既知の3値以外、のいずれでも rescue は何もしない (WAIT_STATUS を
+# 変更しない) — 既存の判定 (失敗ならタイムアウト) をそのまま採用する。
+_rescue_verdict_from_structured_output() {
+    local log="$1"
+    [[ -f "$log" ]] || return 1
+
+    # F-B (kai-review.sh 同型対策, PR #193): "type":"result" 行がちょうど1件
+    # でなければ判定不能として諦める (2>&1 でマージされた stderr の混入や、
+    # 複数ドキュメントの誤採用を防ぐ)。
+    local candidates
+    candidates="$(grep -c '"type":"result"' "$log" 2>/dev/null || true)"
+    [[ "$candidates" -eq 1 ]] || return 1
+
+    local line verdict
+    line="$(grep '"type":"result"' "$log" 2>/dev/null)"
+    verdict="$(printf '%s' "$line" | jq -er 'select(.structured_output.verdict | type == "string") | .structured_output.verdict' 2>/dev/null)" || return 1
+
+    case "$verdict" in
+        approve|revise|reject) ;;
+        *) return 1 ;;
+    esac
+
+    printf '%s\n' "$verdict"
+}
+
+if [[ -n "$VERDICT_SCHEMA" ]] && [[ "$WAIT_RC" -ne 0 || "$WAIT_STATUS" != "OK" ]]; then
+    # mux 経路では review-plan.sh は plan-reviewer プロセスの終了を直接
+    # 待たない (plan_review.md の mtime 安定化だけで判定している) ため、
+    # 上の polling が抜けた時点で最終ターン (構造化出力) がまだ書き終わって
+    # いない可能性がある。短い bounded retry で追いつくのを待つ (最大
+    # 8 * 3 = 24秒。失敗経路でしか発火しないため通常ケースの所要時間には
+    # 影響しない)。
+    RESCUED_VERDICT=""
+    _rescue_i=0
+    while [[ "$_rescue_i" -lt 8 ]]; do
+        if RESCUED_VERDICT="$(_rescue_verdict_from_structured_output "$PLAN_REVIEWER_LOG")"; then
+            break
+        fi
+        RESCUED_VERDICT=""
+        _rescue_i=$((_rescue_i + 1))
+        sleep 3
+    done
+
+    if [[ -n "$RESCUED_VERDICT" ]]; then
+        echo "[review-plan.sh] rescue: recovered verdict '$RESCUED_VERDICT' from structured output (${PLAN_REVIEWER_LOG}) after prose parsing failed (was: $WAIT_STATUS)" >&2
+        if ! grep -Eq '^\*\*Verdict:\*\*[[:space:]]*(approve|revise|reject)\b' "$REVIEW_OUTPUT" 2>/dev/null; then
+            # 既存の plan_review.md (規定形式・既知の別表記のいずれも無し、
+            # または未書き込み) の冒頭に規定形式の行を機械的に追記する。
+            # normalize_plan_review_verdict.py と同じ「原文は残す」idempotent
+            # な prepend パターン。
+            TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            # NOTE: 最後の文を `[[ -f ]] && cat` の短絡形にすると、ファイルが
+            # 無い場合に `{ ... }` グループ自体が非0を返し、後続の `&& mv` が
+            # 発火しない (mv されず .tmp のまま残る) 実害があったため、if 文で
+            # グループの終了ステータスを常に0に固定する。
+            {
+                printf '**Verdict:** %s\n' "$RESCUED_VERDICT"
+                printf '<!-- rescued by scripts/review-plan.sh from claude --json-schema structured output at %s; original content (if any) preserved below (t004) -->\n\n' "$TS"
+                if [[ -f "$REVIEW_OUTPUT" ]]; then
+                    cat "$REVIEW_OUTPUT"
+                fi
+            } > "${REVIEW_OUTPUT}.tmp" && mv "${REVIEW_OUTPUT}.tmp" "$REVIEW_OUTPUT"
+        fi
+        WAIT_STATUS="OK"
+        WAIT_RC=0
+    fi
+fi
 
 if [[ "$WAIT_RC" -eq 0 && "$WAIT_STATUS" == "OK" ]]; then
     echo "[review-plan.sh] plan_review.md output complete"

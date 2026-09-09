@@ -2320,6 +2320,34 @@ def _load_lint_module():
     return mod, os.path.join(repo_root, 'config')
 
 
+def _load_verdict_module():
+    """Load lib_verdict.py dynamically, lazily, from inside cmd_review only.
+
+    t010 (QA t008 FINDING-1/2/3): plan_review.md の verdict 抽出は
+    scripts/lib_verdict.py に一本化した (wait_for_plan_review.sh /
+    normalize_plan_review_verdict.py も同じ関数を使う)。
+
+    重要: これをモジュールのトップレベルで `import` すると、review 以外の
+    全サブコマンド (pull/done/needs-director 等) が、lib_verdict.py を
+    持たない fixture 経由で plan.sh を実行するテスト (例:
+    scripts/test_kai_review.sh は scripts/plan.sh だけをコピーした
+    FIXTURE_REPO で `plan.sh needs-director` 等を呼ぶ) まで巻き込んで
+    ImportError で壊してしまう。cmd_review の中でだけ、必要になった時点で
+    遅延 import する (_load_lint_module と同じ「per-command 動的ロード」の
+    考え方)。REPO_ROOT (sys.argv[3]) を使う — QUEUE_DIR ベースの repo_root
+    (テストで scratch に差し替え可能、review-plan.sh のスタブ差し替えに使う
+    ものと同じ) ではなく、常に「実際に起動された plan.sh 自身」の
+    scripts/ ディレクトリから読む。stub 差し替えの対象ではない、判定
+    ロジックの本体だからである。
+    """
+    import importlib.util, pathlib
+    verdict_path = pathlib.Path(REPO_ROOT) / 'scripts' / 'lib_verdict.py'
+    spec = importlib.util.spec_from_file_location('lib_verdict', verdict_path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def cmd_review(args):
     """
     Usage: plan.sh review <slug>
@@ -2444,13 +2472,14 @@ def cmd_review(args):
         _rollback_to_drafting("plan_review.md not found")
         die(f"plan_review.md not found for mission '{slug}' after review-plan.sh completed")
 
-    verdict = None
-    with open(review_output) as f:
-        for line in f:
-            vm = re.search(r'\*\*Verdict:\*\*\s*(approve|revise|reject)', line)
-            if vm:
-                verdict = vm.group(1)
-                break
+    # t010 (QA t008 FINDING-1/2/3): 以前はここで独自の re.search (アンカー
+    # 無し、ファイル内で最初に一致した行を無条件採用) を使っており、
+    # wait_for_plan_review.sh とも条件が食い違っていた (root cause 3)。
+    # scripts/lib_verdict.py の extract_canonical_verdict() に一本化する —
+    # コードフェンスを除去し、複数の判定が混在する場合は判定不能に倒す。
+    verdict_mod = _load_verdict_module()
+    with open(review_output, encoding='utf-8') as f:
+        verdict = verdict_mod.extract_canonical_verdict(f.read())
     if not verdict:
         # F2 (PR#188 t012 Seo 指摘): wait_for_plan_review.sh の OK 判定は
         # `^\*\*Verdict:\*\*` の存在だけを見ており判定語 (approve/revise/

@@ -48,6 +48,7 @@ POLL_INTERVAL="${4:-5}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 NORMALIZE_SCRIPT="${SCRIPT_DIR}/normalize_plan_review_verdict.py"
+VERDICT_LIB="${SCRIPT_DIR}/lib_verdict.py"
 
 # GNU (Linux/WSL) と BSD/macOS の stat 引数差を吸収する。
 _mtime_of() {
@@ -74,7 +75,13 @@ while [ "$_i" -lt "$_iterations" ]; do
       # 「no valid verdict」として弾かれ、書式ミスなのに review cycle を
       # 消費する経路になっていた。ここも同じ判定語セットを要求するように
       # 揃え、OK 判定と最終判定の条件を一致させる。
-      if grep -Eq '^\*\*Verdict:\*\*[[:space:]]*(approve|revise|reject)\b' "$REVIEW_OUTPUT" 2>/dev/null; then
+      #
+      # t010 (QA t008 FINDING-1/2/3): 以前はここで直接 grep していたが、
+      # コードフェンスを除去せず・複数判定の混在も検出しなかったため
+      # 誤 approve になる経路があった。scripts/plan.sh 側と全く同じ抽出
+      # ロジックを scripts/lib_verdict.py に一本化し、ここも同じ関数を
+      # 呼ぶことで両者の条件不一致 (root cause 3) 自体を無くす。
+      if python3 "$VERDICT_LIB" "$REVIEW_OUTPUT" >/dev/null 2>&1; then
         echo "OK"
         echo "[wait_for_plan_review] valid verdict found in $REVIEW_OUTPUT" >&2
         exit 0

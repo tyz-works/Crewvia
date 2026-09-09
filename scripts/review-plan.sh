@@ -213,7 +213,9 @@ if [[ -n "$VERDICT_SCHEMA" ]] && [[ "$WAIT_RC" -ne 0 || "$WAIT_STATUS" != "OK" ]
 
     if [[ -n "$RESCUED_VERDICT" ]]; then
         echo "[review-plan.sh] rescue: recovered verdict '$RESCUED_VERDICT' from structured output (${PLAN_REVIEWER_LOG}) after prose parsing failed (was: $WAIT_STATUS)" >&2
-        if ! grep -Eq '^\*\*Verdict:\*\*[[:space:]]*(approve|revise|reject)\b' "$REVIEW_OUTPUT" 2>/dev/null; then
+        # t010 (QA t008 FINDING-1/2/3): 生の grep ではなく scripts/lib_verdict.py
+        # の抽出ロジック (フェンス除去 + 複数判定混在の検出) と揃える。
+        if ! python3 "${SCRIPT_DIR}/lib_verdict.py" "$REVIEW_OUTPUT" >/dev/null 2>&1; then
             # 既存の plan_review.md (規定形式・既知の別表記のいずれも無し、
             # または未書き込み) の冒頭に規定形式の行を機械的に追記する。
             # normalize_plan_review_verdict.py と同じ「原文は残す」idempotent

@@ -26,13 +26,20 @@ Exit codes:
 """
 from __future__ import annotations
 
+import os
 import re
 import sys
 from datetime import datetime, timezone
 
-# scripts/plan.sh cmd_review と scripts/wait_for_plan_review.sh が期待する
-# 正規表現と完全に同じ形式であること (どちらも `^\*\*Verdict:\*\*` を行頭で見る)。
-CANON_RE = re.compile(r"^\*\*Verdict:\*\*\s*(approve|revise|reject)\b", re.MULTILINE | re.IGNORECASE)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from lib_verdict import extract_canonical_verdict, strip_code_fences  # noqa: E402
+
+# t010 (QA t008 FINDING-1/2/3): 規定形式 `**Verdict:**` の抽出は
+# scripts/lib_verdict.py の extract_canonical_verdict() に一本化した
+# (scripts/plan.sh cmd_review / scripts/wait_for_plan_review.sh も同じ関数を
+# 使う)。以前はこのファイル・wait_for_plan_review.sh・plan.sh の3箇所が
+# それぞれ独自の正規表現を持ち、コードフェンスを除去しない・アンカーの
+# 有無が食い違う、といった不一致がそのまま誤 approve の温床になっていた。
 
 # reject / revise はこれまでと同じ denylist 方式のまま (今回の変更対象外) —
 # 「安全な結論 (reject/revise) は denylist、危険な結論 (approve) は allowlist」
@@ -109,6 +116,10 @@ def _canonical_unit(unit: str) -> str:
 
 
 def find_alt_verdict(content: str) -> str | None:
+    # t010 (QA t008 FINDING-1 系の防御的一般化): 別表記探索もフェンス除去後の
+    # テキストに対して行う。フェンス内に書式例として別表記 (`## 総合判定: **GO**`
+    # 等) が書かれているだけのケースを本物の判定として拾わないため。
+    content = strip_code_fences(content)
     m = SCOPE_RE.search(content)
     if not m:
         return None
@@ -150,8 +161,8 @@ def main(argv: list[str]) -> int:
         print(f"normalize_plan_review_verdict: cannot read {path}: {e}", file=sys.stderr)
         return 2
 
-    if CANON_RE.search(content):
-        return 0  # 既に規定形式 — 何もしない
+    if extract_canonical_verdict(content) is not None:
+        return 0  # 既に規定形式 (かつ一意に確定できる) — 何もしない
 
     verdict = find_alt_verdict(content)
     if verdict is None:

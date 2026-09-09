@@ -74,17 +74,32 @@ def _mux_created_at(state_json_dir: Path, window_target: str):
 
 
 def _spawn_time_fallback(state_json_dir: Path, window_target: str) -> float:
+    """t015 F3 fix: on a persistent write failure, lean toward grace-expired
+    (return an already-past epoch) instead of `now` (which used to grant
+    indefinite grace — `in_spawn_grace()` would read True every cycle)."""
     p = state_json_dir / f'{window_target}.firstseen'
     try:
         return float(p.read_text().strip())
     except Exception:
-        now = time.time()
-        try:
-            state_json_dir.mkdir(parents=True, exist_ok=True)
-            p.write_text(str(now))
-        except OSError:
-            pass
+        pass
+    now = time.time()
+    try:
+        state_json_dir.mkdir(parents=True, exist_ok=True)
+        p.write_text(str(now))
         return now
+    except OSError:
+        return 0.0
+
+
+def _parse_spawn_grace_seconds(env_value, default=SPAWN_GRACE_SECONDS) -> int:
+    """t015 F4 fix: scripts/dispatcher.sh module-level `int(os.environ.get(...))`
+    used to raise ValueError (killing the whole daemon at import time, before
+    log()/LOG_FILE exist) on a non-numeric CREWVIA_SPAWN_GRACE. Falls back to
+    the default instead."""
+    try:
+        return int(env_value)
+    except (TypeError, ValueError):
+        return default
 
 
 def in_spawn_grace(state_json_dir: Path, window_target: str, grace=SPAWN_GRACE_SECONDS) -> bool:
@@ -107,17 +122,35 @@ def _write_herdr_cache(state_json_dir: Path, window_target: str, created_at_epoc
 # ---------------------------------------------------------------------------
 
 class MockMux:
-    def __init__(self):
+    def __init__(self, kill_ok=True):
         self.sent = []
         self.killed = []
+        self._kill_ok = kill_ok
 
     def send(self, target, msg):
         self.sent.append((target, msg))
         return True
 
     def kill(self, target):
-        self.killed.append(target)
-        return True
+        if self._kill_ok:
+            self.killed.append(target)
+        return self._kill_ok
+
+
+def tmux_kill_window_sim(state_json_dir: Path, target: str, mux: MockMux):
+    """scripts/dispatcher.sh tmux_kill_window() の複製 (t015 F2 fix).
+
+    Deletes `<target>.firstseen` after a *successful* kill so a Worker
+    respawned under the same name (crewvia reuses names) gets a fresh
+    grace window instead of inheriting this dead Worker's stale marker."""
+    ok = mux.kill(target)
+    if ok:
+        firstseen = state_json_dir / f'{target}.firstseen'
+        try:
+            firstseen.unlink(missing_ok=True)
+        except OSError:
+            pass
+    return ok
 
 
 def shutdown_idle_workers_sim(state_json_dir, windows, assignment_files, mux: MockMux):
@@ -130,7 +163,7 @@ def shutdown_idle_workers_sim(state_json_dir, windows, assignment_files, mux: Mo
             if in_spawn_grace(state_json_dir, target):
                 continue  # skip shutdown — spawn grace
             mux.send(target, 'タスクなし、shutdown')
-            mux.kill(target)
+            tmux_kill_window_sim(state_json_dir, target, mux)
 
 
 def dispatch_no_task_branch_sim(state_json_dir, agent_name, target, has_any, has_in_progress, mux: MockMux):
@@ -139,7 +172,18 @@ def dispatch_no_task_branch_sim(state_json_dir, agent_name, target, has_any, has
         if in_spawn_grace(state_json_dir, target):
             return  # skip shutdown — spawn grace
         mux.send(target, 'タスクなし、shutdown')
-        mux.kill(target)
+        tmux_kill_window_sim(state_json_dir, target, mux)
+
+
+def rule2_blocked_stuck_sim(state_json_dir, target, stuck_secs, threshold, mux: MockMux):
+    """scripts/dispatcher.sh Rule 2 (blocked-stuck) 分岐の複製 (t015 F1 fix:
+    3rd kill path, previously had no in_spawn_grace() guard at all)."""
+    if stuck_secs < threshold:
+        return
+    if in_spawn_grace(state_json_dir, target):
+        return  # skip shutdown — spawn grace
+    mux.send(target, 'タスクなし、shutdown')
+    tmux_kill_window_sim(state_json_dir, target, mux)
 
 
 # ---------------------------------------------------------------------------
@@ -240,6 +284,171 @@ def test_worker_with_task_never_touches_grace(tmp_state_dir):
         has_any=False, has_in_progress=True, mux=mux2,
     )
     assert mux2.killed == []
+
+
+# ---------------------------------------------------------------------------
+# t015 regression tests (QA FAIL on PR#190 + Seo review F1/F3/F4)
+# ---------------------------------------------------------------------------
+
+def test_kill_deletes_firstseen_marker(tmp_state_dir):
+    """t015 F2 (QA FAIL, root cause): a successful kill must remove the
+    `.firstseen` marker so it cannot outlive the Worker it was recorded for."""
+    in_spawn_grace(tmp_state_dir, 'Haruto-worker')  # records firstseen=now
+    fs_path = tmp_state_dir / 'Haruto-worker.firstseen'
+    assert fs_path.exists()
+
+    mux = MockMux()
+    tmux_kill_window_sim(tmp_state_dir, 'Haruto-worker', mux)
+    assert 'Haruto-worker' in mux.killed
+    assert not fs_path.exists()
+
+
+def test_kill_failure_does_not_delete_firstseen(tmp_state_dir):
+    """If the underlying mux kill fails (window may still be alive), the
+    grace marker must be left alone — no reason to reset a live Worker's
+    grace window on a failed kill attempt."""
+    in_spawn_grace(tmp_state_dir, 'Haruto-worker')
+    fs_path = tmp_state_dir / 'Haruto-worker.firstseen'
+    assert fs_path.exists()
+
+    mux = MockMux(kill_ok=False)
+    tmux_kill_window_sim(tmp_state_dir, 'Haruto-worker', mux)
+    assert fs_path.exists()
+
+
+def test_respawn_after_kill_gets_fresh_grace(tmp_state_dir):
+    """t015 core regression (QA FAIL repro): kill a Worker, then respawn a
+    Worker under the SAME name (crewvia reuses names) — the new spawn must
+    get the full SPAWN_GRACE_SECONDS window, not zero.
+
+    Before the fix: the stale `.firstseen` from the killed Worker survived,
+    so the respawned Worker was born already "past grace" and got killed
+    within one dispatch cycle (QA measured 151616Z spawn -> 151649Z kill,
+    33s, no spawn_grace log line)."""
+    name = 'Seo-worker'
+
+    # --- Worker #1: spawned long ago (its firstseen is already past
+    # SPAWN_GRACE_SECONDS — e.g. it did real work for 30+ minutes before
+    # finally going idle), then genuinely reaped for being idle too long.
+    fs_path = tmp_state_dir / f'{name}.firstseen'
+    tmp_state_dir.mkdir(parents=True, exist_ok=True)
+    fs_path.write_text(str(time.time() - (SPAWN_GRACE_SECONDS + 1200)))
+    assert in_spawn_grace(tmp_state_dir, name) is False  # correctly past grace
+
+    mux1 = MockMux()
+    tmux_kill_window_sim(tmp_state_dir, name, mux1)
+    assert name in mux1.killed
+    assert not fs_path.exists()
+
+    # --- Worker #2: respawned under the identical name. Before the fix,
+    # `in_spawn_grace()` would have read the dead Worker's leftover
+    # `.firstseen` (already old) and returned False immediately — zero
+    # grace for a Worker that just started.
+    windows = [{'agent_name': 'Seo', 'window_target': name}]
+    mux2 = MockMux()
+    shutdown_idle_workers_sim(tmp_state_dir, windows, assignment_files=set(), mux=mux2)
+    assert name not in mux2.killed, (
+        "respawned Worker under a reused name was killed with zero grace "
+        "-- .firstseen from the previous (killed) Worker was not cleared"
+    )
+
+
+def test_grace_period_still_expires_normally_after_respawn(tmp_state_dir):
+    """The fix must not create indefinite protection: a respawned Worker
+    that genuinely sits idle past SPAWN_GRACE_SECONDS is still reaped."""
+    name = 'Seo-worker'
+    in_spawn_grace(tmp_state_dir, name)
+    tmux_kill_window_sim(tmp_state_dir, name, MockMux())
+
+    # Respawn, then simulate SPAWN_GRACE_SECONDS+ having elapsed since the
+    # new firstseen was recorded.
+    in_spawn_grace(tmp_state_dir, name)  # records fresh firstseen=now
+    fs_path = tmp_state_dir / f'{name}.firstseen'
+    fs_path.write_text(str(time.time() - (SPAWN_GRACE_SECONDS + 5)))
+
+    windows = [{'agent_name': 'Seo', 'window_target': name}]
+    mux = MockMux()
+    shutdown_idle_workers_sim(tmp_state_dir, windows, assignment_files=set(), mux=mux)
+    assert name in mux.killed
+
+
+def test_kill_does_not_touch_herdr_created_at_cache(tmp_state_dir):
+    """t015 (QA prerequisite (c)): deleting `.firstseen` on kill must never
+    touch `<target>.json` (herdr's created_at cache, rewritten by lib_mux.py
+    on every spawn) -- the two files are independent."""
+    _write_herdr_cache(tmp_state_dir, 'Arjun-worker', time.time() - 5)
+    json_path = tmp_state_dir / 'Arjun-worker.json'
+    assert json_path.exists()
+
+    mux = MockMux()
+    tmux_kill_window_sim(tmp_state_dir, 'Arjun-worker', mux)
+    assert json_path.exists()  # untouched
+    assert json.loads(json_path.read_text())['backend'] == 'herdr'
+
+
+def test_rule2_blocked_stuck_respects_grace(tmp_state_dir):
+    """t015 F1 (Seo review, MEDIUM): the 3rd kill path (Rule 2 /
+    blocked-stuck) previously had no in_spawn_grace() guard at all -- a
+    Worker pre-spawned for a task whose blocker looked stale from cycle one
+    was killed immediately, same real damage as the bug this PR fixes for
+    the other two paths."""
+    name = 'Priya-worker'
+    _write_herdr_cache(tmp_state_dir, name, time.time() - 10)  # fresh spawn
+
+    mux = MockMux()
+    rule2_blocked_stuck_sim(
+        tmp_state_dir, name,
+        stuck_secs=700, threshold=600,  # over BLOCKED_STUCK_THRESHOLD
+        mux=mux,
+    )
+    assert name not in mux.killed  # spawn grace protects it
+
+    # Existing behavior preserved: past grace AND past threshold -> killed.
+    _write_herdr_cache(tmp_state_dir, name, time.time() - 200)
+    mux2 = MockMux()
+    rule2_blocked_stuck_sim(
+        tmp_state_dir, name,
+        stuck_secs=700, threshold=600,
+        mux=mux2,
+    )
+    assert name in mux2.killed
+
+    # Under threshold -> never reaches the grace check, never killed.
+    mux3 = MockMux()
+    rule2_blocked_stuck_sim(
+        tmp_state_dir, name,
+        stuck_secs=100, threshold=600,
+        mux=mux3,
+    )
+    assert name not in mux3.killed
+
+
+def test_write_failure_treated_as_grace_expired(tmp_state_dir, monkeypatch):
+    """t015 F3 (Seo review, LOW): if registry/mux is not writable, grace must
+    NOT become indefinite (old code returned `now` every cycle -> always
+    "within grace"). It must lean toward "expired" instead."""
+    import pathlib
+
+    real_write_text = pathlib.Path.write_text
+
+    def failing_write_text(self, *a, **kw):
+        if self.name.endswith('.firstseen'):
+            raise OSError("read-only filesystem (simulated)")
+        return real_write_text(self, *a, **kw)
+
+    monkeypatch.setattr(pathlib.Path, 'write_text', failing_write_text)
+
+    ts = _spawn_time_fallback(tmp_state_dir, 'Wei-worker')
+    assert ts == 0.0
+    assert (time.time() - ts) >= SPAWN_GRACE_SECONDS  # in_spawn_grace() -> False
+
+
+def test_parse_spawn_grace_env_invalid_falls_back_to_default():
+    """t015 F4 (Seo review, LOW): a non-numeric CREWVIA_SPAWN_GRACE must not
+    crash the dispatcher at import time -- it must fall back to the default."""
+    assert _parse_spawn_grace_seconds('90s') == SPAWN_GRACE_SECONDS
+    assert _parse_spawn_grace_seconds(None) == SPAWN_GRACE_SECONDS
+    assert _parse_spawn_grace_seconds('120') == 120
 
 
 if __name__ == '__main__':

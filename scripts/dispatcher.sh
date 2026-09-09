@@ -158,7 +158,16 @@ STATE_JSON_DIR = REGISTRY_DIR / 'mux'
 # time, while still being short enough that a genuinely-idle Worker is
 # reaped within ~1-2 minutes of spawn, not left lingering indefinitely.
 # Override via CREWVIA_SPAWN_GRACE for tests / tuning.
-SPAWN_GRACE_SECONDS = int(os.environ.get('CREWVIA_SPAWN_GRACE', '90'))
+# t015 F4 (Seo review, LOW): int() on a non-numeric override used to raise
+# ValueError at import time, before log()/LOG_FILE exist — the whole
+# dispatcher daemon died silently on a typo'd env var. Fall back to the
+# documented default instead (stderr only; log() isn't defined yet here).
+try:
+    SPAWN_GRACE_SECONDS = int(os.environ.get('CREWVIA_SPAWN_GRACE', '90'))
+except ValueError:
+    _bad = os.environ.get('CREWVIA_SPAWN_GRACE')
+    print(f"[dispatcher] WARNING: invalid CREWVIA_SPAWN_GRACE={_bad!r} — using default 90", file=sys.stderr)
+    SPAWN_GRACE_SECONDS = 90
 
 # Circuit breaker for Taskvia API calls
 TASKVIA_CB_FAILURES = 0
@@ -491,10 +500,32 @@ def tmux_send(target, message):
 
 
 def tmux_kill_window(target):
-    """Kill a mux window."""
+    """Kill a mux window.
+
+    t015 (QA FAIL on PR#190): also unlinks the `.firstseen` spawn-grace
+    marker (see _spawn_time_fallback) on a successful kill. crewvia reuses
+    Worker names (Haruto / Seo / Arjun / ...), so on the tmux backend
+    (no created_at cache) a stale `.firstseen` from this dead Worker would
+    make the *next* Worker spawned under the same name look already past
+    SPAWN_GRACE_SECONDS — zero grace, killed within one dispatch cycle
+    (measured: 33s from spawn). Deleting it here lets the next spawn under
+    this name record a fresh firstseen and get the full grace window again.
+    Only done when the kill actually succeeded — if it failed the window
+    may still be alive, and touching its grace marker could either extend
+    or reset protection it hasn't earned yet either way.
+    Herdr backend: unaffected — its created_at lives in `<target>.json`,
+    rewritten by lib_mux.py on every spawn, never in `.firstseen`.
+    Best-effort: a failed unlink is logged, never raised (dispatcher must
+    not crash on a kill path).
+    """
     ok = _mux.kill(target)
     if ok:
         log(f"killed window: {target}")
+        firstseen = STATE_JSON_DIR / f'{target}.firstseen'
+        try:
+            firstseen.unlink(missing_ok=True)
+        except OSError as e:
+            log(f"WARNING: failed to remove spawn-grace marker {firstseen}: {e}")
     else:
         log(f"WARNING: mux kill {target!r} failed")
 
@@ -533,13 +564,22 @@ def _spawn_time_fallback(window_target: str) -> float:
     try:
         return float(p.read_text().strip())
     except Exception:
-        now = time.time()
-        try:
-            STATE_JSON_DIR.mkdir(parents=True, exist_ok=True)
-            p.write_text(str(now))
-        except OSError:
-            pass
+        pass
+    now = time.time()
+    try:
+        STATE_JSON_DIR.mkdir(parents=True, exist_ok=True)
+        p.write_text(str(now))
         return now
+    except OSError as e:
+        # t015 F3 (Seo review, LOW): if registry/mux is not writable, the old
+        # code still returned `now` every cycle, so in_spawn_grace() was
+        # always True — a Worker with no task would never be reaped
+        # (indefinite grace, the exact "無期限延命" this feature is meant to
+        # avoid). Lean the other way instead: report an already-expired
+        # timestamp (epoch 0) so grace reads as False and normal idle
+        # shutdown still applies, per PR#190's "倒す方向" design intent.
+        log(f"WARNING: cannot persist spawn-grace marker {p}: {e} — treating grace as expired")
+        return 0.0
 
 
 def in_spawn_grace(window_target: str) -> bool:
@@ -1207,17 +1247,28 @@ def dispatch():
                     newest_mtime = max(_chain_newest_mtime(s, m) for s, m in matching_pending)
                     stuck_secs = time.time() - newest_mtime
                     if stuck_secs >= BLOCKED_STUCK_THRESHOLD:
-                        notify_key = f"blocked_stuck_{agent_name}"
-                        if should_notify(notify_key):
-                            log(
-                                f"[Rule 2] {agent_name}: all matching tasks blocked for "
-                                f"{stuck_secs:.0f}s ≥ {BLOCKED_STUCK_THRESHOLD}s "
-                                f"— sending shutdown (blocked-stuck)"
-                            )
-                            if tmux_send(target, 'タスクなし、shutdown'):
-                                record_notify(notify_key)
-                            time.sleep(1)
-                            tmux_kill_window(target)
+                        # t015 F1 (Seo review, MEDIUM): this 3rd kill path had no
+                        # spawn-grace guard at all. Director may pre-spawn a
+                        # Worker for a task whose blocker is still pending with
+                        # an old mtime (common in long missions) — that reads as
+                        # "blocked stuck" from cycle one and this branch killed
+                        # the Worker seconds after spawn, same real-world damage
+                        # (lost ~48KB prompt) as the bug PR#190 itself fixes for
+                        # the other two paths.
+                        if in_spawn_grace(target):
+                            log(f"[spawn_grace] {agent_name}: within {SPAWN_GRACE_SECONDS}s spawn grace — skip Rule 2 shutdown")
+                        else:
+                            notify_key = f"blocked_stuck_{agent_name}"
+                            if should_notify(notify_key):
+                                log(
+                                    f"[Rule 2] {agent_name}: all matching tasks blocked for "
+                                    f"{stuck_secs:.0f}s ≥ {BLOCKED_STUCK_THRESHOLD}s "
+                                    f"— sending shutdown (blocked-stuck)"
+                                )
+                                if tmux_send(target, 'タスクなし、shutdown'):
+                                    record_notify(notify_key)
+                                time.sleep(1)
+                                tmux_kill_window(target)
 
     # Notify Sora about unblocked pending tasks that NO live worker can handle.
     # alive_workers uses OR condition: window seed + heartbeat-fresh union.

@@ -576,7 +576,29 @@ if [[ "${ROLE}" == "worker" ]] && [[ "$WORK_DIR" != "$REPO_ROOT" ]]; then
 fi
 
 # Launch with or without mux (tmux / herdr)
-if [[ "${CREWVIA_MUX_ENABLED:-0}" == "1" ]]; then
+#
+# t002 (mission 20260909-dead-config-sweep) 設計判断 (A): 実装を docs に合わせる。
+# CLAUDE.md / config/crewvia.yaml の環境変数表は元々「CREWVIA_MUX が設定済みなら
+# CREWVIA_MUX_ENABLED は不要」と説明していたが、実際にこの値を消費する唯一の
+# 箇所である本行は CREWVIA_MUX_ENABLED しか見ていなかった。CREWVIA_MUX_ENABLED を
+# 設定する処理は L232 の `ROLE == director` ブロック内にしか無いため、
+# ROLE=worker で CREWVIA_MUX=herdr/tmux を明示しても未設定のまま本行に到達し、
+# インラインモード (exec claude) に転落していた（「設定したのに効かない」の
+# 実例そのもの — 本ミッションが潰す対象）。
+#
+# (B) docs を実装に合わせる／(C) 二重ゲートを単一判定に統合する、も検討したが:
+#   - (B) は「設定したのに効かない」を追認するだけで、本ミッションの目的に反する。
+#   - (C) は L232 の director 専用ブロック（interactive prompt / config fallback）
+#     ごと再設計する必要があり、本番の起動経路 (start.sh) への変更範囲が
+#     不必要に広がる。消費箇所はここ 1 箇所しか無いため、ここで一度だけ
+#     実効値を解決すれば二重ゲートの実害（ROLE=worker で無効）は解消できる。
+# よって (A): CREWVIA_MUX_ENABLED が明示されていれば最優先でそれを尊重し
+# (0 での強制インラインも含む)、未設定時のみ CREWVIA_MUX の有無にフォールバックする。
+_EFFECTIVE_MUX_ENABLED="${CREWVIA_MUX_ENABLED:-}"
+if [[ -z "$_EFFECTIVE_MUX_ENABLED" ]] && [[ -n "${CREWVIA_MUX:-}" ]]; then
+  _EFFECTIVE_MUX_ENABLED=1
+fi
+if [[ "${_EFFECTIVE_MUX_ENABLED:-0}" == "1" ]]; then
   # Load mux abstraction layer (backend selected via CREWVIA_MUX or config/crewvia.yaml).
   # shellcheck source=lib_mux.sh
   source "${SCRIPT_DIR}/lib_mux.sh"

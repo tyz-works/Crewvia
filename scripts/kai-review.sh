@@ -305,7 +305,10 @@ fi
 # 直接検知する手段が無いため、実測ベースの安全マージンを上限として設け、
 # 超過時は codex を呼ばず needs-director に倒す(完全automated な代替が無いため、
 # diff を分割する等の運用は Director 判断に委ねる)。
-DIFF_BYTES=${#DIFF_CONTENT}
+# t010 (t008 QA 実測): bash の ${#var} は UTF-8 文字数を数えるため、日本語コメント
+# の多い diff では文字数がバイト数の約1/3になり、閾値素通り→codex呼び出し→
+# 空配列 auto-done という危険側に倒れていた。printf | wc -c で実バイト数を数える。
+DIFF_BYTES=$(printf '%s' "$DIFF_CONTENT" | wc -c)
 MAX_DIFF_BYTES=$((300 * 1024))  # 300KB
 if [[ $DIFF_BYTES -gt $MAX_DIFF_BYTES ]]; then
   fail_needs_director "NEEDS FIX: diff is ${DIFF_BYTES} bytes (> ${MAX_DIFF_BYTES}) — too large to trust against silent context truncation (fail-closed, t006 acceptance criterion i)"

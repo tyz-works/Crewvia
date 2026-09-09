@@ -106,6 +106,9 @@ git -C "$UPSTREAM" branch -D feature-branch >/dev/null
 #                      (`git diff main...HEAD` 自体が "no merge base" で失敗する
 #                      ケースを再現。実測: 別リポジトリで exit=128 を確認済み)
 #   refs/pull/5/head — 巨大ファイル追加 (MAX_DIFF_BYTES 超過を再現)
+#   refs/pull/6/head — マルチバイト文字の巨大ファイル追加 (t010: DIFF_BYTES=${#DIFF_CONTENT}
+#                      が文字数を数える bash の挙動を突く回帰再現。文字数は
+#                      MAX_DIFF_BYTES 未満だが実バイト数は超過する)
 MAIN_TIP="$(git -C "$UPSTREAM" rev-parse main)"
 git -C "$UPSTREAM" update-ref refs/pull/3/head "$MAIN_TIP"
 
@@ -125,6 +128,19 @@ git -C "$UPSTREAM" commit -q -m "huge addition (exceeds MAX_DIFF_BYTES)"
 git -C "$UPSTREAM" update-ref refs/pull/5/head big-file-tmp
 git -C "$UPSTREAM" checkout -q main
 git -C "$UPSTREAM" branch -D big-file-tmp >/dev/null
+
+git -C "$UPSTREAM" checkout -q -b big-file-mb-tmp
+# t010: 文字数は MAX_DIFF_BYTES (300 * 1024 = 307200) 未満だが、UTF-8 3バイト文字
+# のため実バイト数は超過する fixture。8000 行 x マルチバイト文字で
+# 実測 (このファイル生成コマンドと同一条件): 約 270,890 文字 / 702,890 バイト
+# (diff の "+" プレフィックス等を足しても文字数は 307200 を十分下回り、
+# バイト数は大きく上回る)。
+awk 'BEGIN { for (i = 0; i < 8000; i++) print "行-" i "-日本語のダミーテキストです日本語のダミーテキストです" }' > "$UPSTREAM/big-file-mb.txt"
+git -C "$UPSTREAM" add -A
+git -C "$UPSTREAM" commit -q -m "huge multibyte addition (chars < MAX_DIFF_BYTES, bytes > MAX_DIFF_BYTES)"
+git -C "$UPSTREAM" update-ref refs/pull/6/head big-file-mb-tmp
+git -C "$UPSTREAM" checkout -q main
+git -C "$UPSTREAM" branch -D big-file-mb-tmp >/dev/null
 
 git clone -q "$UPSTREAM" "$FIXTURE_REPO"
 git -C "$FIXTURE_REPO" config user.email test@example.com
@@ -1124,6 +1140,21 @@ if [[ $rc -eq 1 ]] && echo "$out" | grep -q "too large to trust against silent c
   pass "巨大 diff (> MAX_DIFF_BYTES) → codex 未起動のまま needs-director相当 (受け入れ基準i)"
 else
   fail "REGRESSION (acceptance-i): oversized diff should fail closed WITHOUT invoking codex — rc=$rc log_exists=$([[ -s "$LOG_212" ]] && echo yes || echo no) out=$out"
+fi
+
+echo ""
+echo "--- 受け入れ基準(i)-d [t010]: マルチバイト文字の巨大 diff (文字数 < MAX_DIFF_BYTES だがバイト数 > MAX_DIFF_BYTES) → codex を呼ばず needs-director ---"
+# 旧実装 (DIFF_BYTES=\${#DIFF_CONTENT}) は bash の \${#var} が UTF-8 文字数を
+# 数えるため、この fixture の文字数 (約27万) が閾値 307200 を下回りゲートを
+# 素通りし、codex が呼ばれてしまっていた (t008 QA 実測: 実バイト数は約80万)。
+write_task t213 "acceptance-i multibyte oversized diff (t010)"
+LOG_213="$TMPDIR_TEST/t213_codex.log"
+out=$(FAKE_GH_HEAD_BRANCH="feature-branch" FAKE_CODEX_FIXTURE="$FIXTURES_DIR/json_empty.txt" FAKE_CODEX_LOG="$LOG_213" \
+  run_kai --pr 6 --task t213 --mission "$MISSION_SLUG" --dry-run 2>&1) && rc=0 || rc=$?
+if [[ $rc -eq 1 ]] && echo "$out" | grep -q "too large to trust against silent context truncation" && [[ ! -s "$LOG_213" ]]; then
+  pass "マルチバイト巨大 diff (文字数<閾値, バイト数>閾値) → codex 未起動のまま needs-director相当 (t010 回帰)"
+else
+  fail "REGRESSION (t010): multibyte diff whose byte count exceeds MAX_DIFF_BYTES (while char count does not) should fail closed WITHOUT invoking codex — rc=$rc log_exists=$([[ -s "$LOG_213" ]] && echo yes || echo no) out=$out"
 fi
 
 # ---------------------------------------------------------------------------

@@ -104,9 +104,10 @@ LOG_FILE       = Path(sys.argv[6]) if len(sys.argv) > 6 else REGISTRY_DIR / 'dis
 LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
 
 # Import lib_mux from scripts/ (same dir as this script via REGISTRY_DIR.parent)
-_SCRIPTS_DIR = REGISTRY_DIR.parent / 'scripts'
+REPO_ROOT = REGISTRY_DIR.parent
+_SCRIPTS_DIR = REPO_ROOT / 'scripts'
 sys.path.insert(0, str(_SCRIPTS_DIR))
-from lib_mux import Mux  # noqa: E402
+from lib_mux import Mux, repo_identity_ok  # noqa: E402
 _mux = Mux()
 
 MISSIONS_DIR   = QUEUE_DIR / 'missions'
@@ -232,6 +233,26 @@ def log(msg):
             f.write(line + '\n')
     except OSError:
         pass
+
+
+# t003: self-identity check, once per dispatch cycle (this Python process is
+# spawned fresh every cycle by the bash wrapper — see run_dispatch() in
+# dispatcher.sh — so this doubles as both the "once at startup" and "once
+# per loop" guard). A dispatcher started against a git worktree that has
+# since been removed must stop dispatching (and, crucially, stop being
+# *able* to kill anything) rather than keep running on inherited mux env
+# pointing at a workspace it can no longer prove it owns. See
+# repo_identity_ok() in lib_mux.py for the full rationale. This is the
+# coarse half of the guard; tmux_kill_window() re-checks immediately before
+# the actual kill for the fine-grained half (a worktree can be removed
+# mid-cycle, after this check already passed).
+if not repo_identity_ok(REPO_ROOT):
+    log(
+        f"FATAL: repo_root {REPO_ROOT} no longer exists or is not a git "
+        f"checkout (worktree removed?). A stale dispatcher must not keep "
+        f"running against inherited mux env — skipping this cycle entirely."
+    )
+    sys.exit(1)
 
 
 # ---------------------------------------------------------------------------
@@ -517,7 +538,23 @@ def tmux_kill_window(target):
     rewritten by lib_mux.py on every spawn, never in `.firstseen`.
     Best-effort: a failed unlink is logged, never raised (dispatcher must
     not crash on a kill path).
+
+    t003: re-checks repo_identity_ok() immediately before the actual kill —
+    the single choke point all three call sites (idle-worker shutdown,
+    blocked-stuck shutdown, vanished-worker cleanup) funnel through. The
+    once-per-cycle check at module load time (see repo_identity_ok(REPO_ROOT)
+    above) only proves this process's identity was valid when the cycle
+    started; a long-running cycle can still straddle a worktree removal.
+    Fails closed: a failed check skips the kill entirely, it does not retry
+    or escalate.
     """
+    if not repo_identity_ok(REPO_ROOT):
+        log(
+            f"REFUSING to kill window {target!r}: self-identity check failed "
+            f"for repo_root={REPO_ROOT} (missing or no longer a git checkout "
+            f"— likely a removed worktree). Skipping this kill entirely."
+        )
+        return
     ok = _mux.kill(target)
     if ok:
         log(f"killed window: {target}")

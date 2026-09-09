@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# kai-review.sh — codex exec review ラッパー (Kai reviewer 専用)
+# kai-review.sh — codex exec ラッパー (Kai reviewer 専用)
+# t006 (mission 20260909-safety-gate-hardening) で `codex exec review` サブコマンド
+# から `codex exec --output-schema` (diff は自前取得して stdin で渡す) に移行した。
 #
 # Usage:
 #   bash scripts/kai-review.sh --pr <PR#> --task <task_id>
@@ -18,7 +20,9 @@ set -euo pipefail
 #                 人が読める形で表示するだけ。実 PR に対する動作確認・
 #                 smoke test 用途（実タスクの status を壊さない）。
 #
-# 処理フロー (Phase 3):
+# 処理フロー (t006, mission 20260909-safety-gate-hardening で `codex exec review`
+# サブコマンドから `codex exec` 本体 + `--output-schema` へ移行。旧フローは
+# git blame 参照):
 #   1. 引数パース (--pr, --task, --mission, --model, --agent, --skip-pull, --dry-run)
 #   2. heartbeat 更新 (dispatcher.publish_agents が Kai-codex を認識するため)
 #   3. plan.sh pull --task <task> --agent <agent> --skills codex-review
@@ -27,20 +31,35 @@ set -euo pipefail
 #   4. gh pr view <PR#> --json headRefName で head branch 取得 (存在確認・ログ用)
 #   5. refs/pull/<PR#>/head を origin から一意な local ref に fetch し (F-2, PR#180 —
 #      fork PR や削除済み branch でも動く)、そこから専用 git worktree (mktemp -d) を
-#      --detach で作成し diff を確認する。主 working tree ($CREWVIA_REPO_ROOT) の
+#      --detach で作成する。主 working tree ($CREWVIA_REPO_ROOT) の
 #      HEAD は一切動かさない (F1/F1b, PR#180)
-#   6. codex exec -C <review-worktree> review --base main -m <model>
-#      -o <mktemp output file> を実行
-#   7. 出力ファイルを読み込み findings を判定 ([P0]/[P1]/[P2]/[P3] タグ判定が主経路。
-#      JSON 構造化出力にも対応する。JSON findings 配列も [P#] タグも一切
-#      見つからない場合 (HAD_SIGNAL=0) は、内容に関わらず無条件で
-#      needs-director 側に倒す (fail-closed, R-1, mission 20260909-safety-gate-hardening)。
-#      詳細は「findings 判定」セクション参照)
-#   8. findings なし / all-low(P3) → plan.sh done
+#   6. (t006) `origin/main` を一意な local ref へ都度 fetch し (local main の
+#      陳腐化を避ける。実機で 2 commit 差の乖離を観測済み)、`git diff
+#      <fetched-main>...HEAD` で diff を自前取得する。`codex exec review
+#      --base <BRANCH>` はカスタム [PROMPT] と同時指定できない (実機確認済み、
+#      t001 Result 参照) ため、clean review でも必ず構造化シグナルを出させる
+#      手段が review サブコマンドには無かった。diff が空 / 異常に巨大
+#      (context 切り詰めリスク) な場合は codex を呼ばず無条件で needs-director
+#      に倒す (受け入れ基準(i), t006 Description 参照 — 空配列は「clean」と
+#      「レビューできていない」を区別しないため)。
+#   7. 取得した diff を stdin で `codex exec -C <review-worktree>
+#      --output-schema <schema> -o <mktemp output file> "<review prompt>"` に渡す。
+#      `--output-schema` で最終応答を `{"findings":[...]}`  形式の JSON に強制する
+#      ことで、「clean review 相当」は信頼できる空配列として、finding ありは
+#      構造化データとして返る (詳細: config/kai-review-findings.schema.json)。
+#   8. 出力ファイルを読み込み findings を判定。JSON 経路 (`.findings` が
+#      ちょうど 1 つの JSON ドキュメントとして得られ、かつ配列である場合) が
+#      主経路。[P0]-[P3] タグ判定は forward-compat の fallback として残す。
+#      JSON findings 配列も [P#] タグも一切見つからない場合 (HAD_SIGNAL=0) は、
+#      内容に関わらず無条件で needs-director 側に倒す (fail-closed, R-1,
+#      mission 20260909-safety-gate-hardening)。JSON が複数ドキュメント
+#      (JSONL 等、スキーマ違反) の場合も同様に fail-closed に倒す
+#      (F-B, t006 — 詳細は「findings 判定」セクション参照)
+#   9. findings なし / all-low(P3) → plan.sh done
 #      修正必要 (P0/P1/P2 or 構造化シグナル無し) → plan.sh needs-director
 #      (plan.sh done は Taskvia sync + registry.workers.yaml の task_count 自動 bump)
 #      --dry-run 時はどちらも実行せず、判定結果を表示するのみ
-#   9. レビュー用 worktree・fetch した一時 ref・出力/stderr の一時ファイルは
+#  10. レビュー用 worktree・fetch した一時 ref・出力/stderr の一時ファイルは
 #      trap で必ず後始末する
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -135,6 +154,7 @@ REVIEW_WT=""
 OUTPUT_FILE=""
 STDERR_FILE=""
 FETCH_LOCAL_REF=""
+BASE_FETCH_LOCAL_REF=""  # t006: origin/main を都度 fetch する一時 ref (下記参照)
 
 cleanup() {
   if [[ -n "$OUTPUT_FILE" ]]; then
@@ -149,6 +169,9 @@ cleanup() {
   fi
   if [[ -n "$FETCH_LOCAL_REF" ]]; then
     git -C "${WORK_DIR:-$REPO_ROOT}" update-ref -d "$FETCH_LOCAL_REF" 2>/dev/null || true
+  fi
+  if [[ -n "$BASE_FETCH_LOCAL_REF" ]]; then
+    git -C "${WORK_DIR:-$REPO_ROOT}" update-ref -d "$BASE_FETCH_LOCAL_REF" 2>/dev/null || true
   fi
 }
 trap cleanup EXIT
@@ -245,6 +268,48 @@ if ! git -C "$WORK_DIR" worktree add --detach "$REVIEW_WT" "$FETCH_LOCAL_REF" 2>
   fail_needs_director "NEEDS FIX: git worktree add failed for PR#${PR_NUM} (${FETCH_LOCAL_REF})"
 fi
 
+# --- diff base の取得 (t006) ---
+# 旧実装 (`codex exec review --base main`) はローカルの `main` ブランチを直接
+# 参照していた。実機確認 (t006, 2026-09-09): 本番の主リポジトリで local main
+# (348fa96) が origin/main (06fb70d, 2 commit 差) より古いまま放置されている
+# ケースを実際に観測した — Director が review/自動化を頻繁に回す一方で
+# 明示的な `git pull` は都度行われないため、local main が容易に陳腐化する。
+# diff の base が古いと「レビュー対象外の差分まで含む」または「本来レビュー
+# すべき差分の一部を merge-base 計算で除外する」方向に誤る可能性があり、
+# 受け入れ基準(i) (診断できない不完全な diff は信用しない) の趣旨に反する。
+# そのため origin から都度 `main` を一意な local ref へ fetch し、必ず最新の
+# origin/main を diff base とする (旧実装からの意図的な改善。PR head の
+# fetch と同じパターンを流用)。
+BASE_FETCH_LOCAL_REF="refs/kai-review-fetch/base-main-$$"
+if ! git -C "$WORK_DIR" fetch --force origin "main:${BASE_FETCH_LOCAL_REF}" 2>&1; then
+  fail_needs_director "NEEDS FIX: git fetch origin main failed while resolving diff base"
+fi
+DIFF_BASE="$BASE_FETCH_LOCAL_REF"
+_info "Computing diff (origin/main...HEAD) in ${REVIEW_WT} ..."
+if ! DIFF_CONTENT="$(git -C "$REVIEW_WT" diff "${DIFF_BASE}...HEAD" 2>&1)"; then
+  fail_needs_director "NEEDS FIX: git diff ${DIFF_BASE}...HEAD failed in review worktree — ${DIFF_CONTENT}"
+fi
+
+# 受け入れ基準(i) (Seo 指摘, t006): diff 取得の失敗 / 空 diff / context 超過による
+# 切り詰め のいずれでも codex の空配列は「clean」と区別のつかない信頼できない
+# シグナルになる。空 diff はレビュー対象が無い = review が成立していないことを
+# 意味するため、codex を一切呼ばず無条件で needs-director に倒す。
+if [[ -z "$DIFF_CONTENT" ]]; then
+  fail_needs_director "NEEDS FIX: diff ${DIFF_BASE}...HEAD is empty — cannot trust an empty findings array without a genuine diff (fail-closed, t006 acceptance criterion i)"
+fi
+
+# 巨大すぎる diff は codex の context window 内で切り詰められ、「見えていない
+# 部分に finding が無い」という誤った安全確認につながりうる。切り詰めの発生を
+# 直接検知する手段が無いため、実測ベースの安全マージンを上限として設け、
+# 超過時は codex を呼ばず needs-director に倒す(完全automated な代替が無いため、
+# diff を分割する等の運用は Director 判断に委ねる)。
+DIFF_BYTES=${#DIFF_CONTENT}
+MAX_DIFF_BYTES=$((300 * 1024))  # 300KB
+if [[ $DIFF_BYTES -gt $MAX_DIFF_BYTES ]]; then
+  fail_needs_director "NEEDS FIX: diff is ${DIFF_BYTES} bytes (> ${MAX_DIFF_BYTES}) — too large to trust against silent context truncation (fail-closed, t006 acceptance criterion i)"
+fi
+_info "Diff size: ${DIFF_BYTES} bytes"
+
 # --- 出力/stderr ファイル (F3, PR#180) ---
 # 固定 /tmp パスは codex-review task が並列実行された場合に相互上書きする事故を招く
 # (Kai-codex は dispatcher 側で同時 1 本しか spawn しないが、手動起動との衝突も
@@ -252,15 +317,52 @@ fi
 OUTPUT_FILE="$(mktemp "${TMPDIR:-/tmp}/kai-review-output.XXXXXX")"
 STDERR_FILE="$(mktemp "${TMPDIR:-/tmp}/kai-review-stderr.XXXXXX")"
 
-# --- codex exec review 実行 ---
-# -C "$REVIEW_WT" で review 対象ディレクトリを指定する (プロセスの cwd はどこでもよい)。
-_info "Running codex exec -C ${REVIEW_WT} review --base main ${MODEL:+-m $MODEL} ..."
+# --- schema ファイル (t006) ---
+SCHEMA_FILE="${CREWVIA_REPO_ROOT:-$REPO_ROOT}/config/kai-review-findings.schema.json"
+if [[ ! -f "$SCHEMA_FILE" ]]; then
+  fail_needs_director "NEEDS FIX: findings schema file not found: ${SCHEMA_FILE}"
+fi
+
+REVIEW_PROMPT="$(cat <<'PROMPT_EOF'
+Review the diff provided in the <stdin> block below (a unified git diff, base
+against HEAD, in this checkout's working directory). Read any files referenced
+by the diff in this working directory as needed to understand the surrounding
+context before judging correctness — do not judge from the diff hunks alone.
+
+Focus on:
+  - correctness bugs (crashes, wrong output, logic errors, off-by-one, race
+    conditions, fail-open defaults where fail-closed is required)
+  - security issues (injection, unsafe shell quoting/expansion, path
+    traversal, secrets)
+  - other issues worth a human's attention before merge
+
+For every issue found, add an entry to the JSON `findings` array with:
+  - "priority": "P0" (release-blocking: crash / data loss / security) through
+    "P3" (minor nit)
+  - "title": a short one-line summary
+  - "body": more detail, including why it matters (or null if not needed)
+  - "file": the path most relevant to the finding (or null if not applicable)
+
+Only return an empty `findings` array after you have actually read and
+reasoned about the diff and found nothing worth flagging. Do not guess; if you
+are unsure whether something is a real bug, report it at a lower priority
+rather than omitting it.
+PROMPT_EOF
+)"
+
+# --- codex exec 実行 (t006: review サブコマンドではなく exec 本体 + --output-schema) ---
+# -C "$REVIEW_WT" で作業ディレクトリを指定する (codex が周辺コードを読む際の cwd)。
+# --sandbox read-only: レビューは書き込みを必要としないため、誤って
+# ファイルを変更されるリスクを構造的に無くす。
+_info "Running codex exec -C ${REVIEW_WT} --output-schema ... ${MODEL:+-m $MODEL} (diff=${DIFF_BYTES} bytes) ..."
 CODEX_EXIT=0
-codex exec -C "$REVIEW_WT" review \
-  --base main \
+printf '%s' "$DIFF_CONTENT" | codex exec -C "$REVIEW_WT" \
+  --sandbox read-only \
+  --output-schema "$SCHEMA_FILE" \
   ${MODEL:+-m "$MODEL"} \
   --ephemeral \
   -o "$OUTPUT_FILE" \
+  "$REVIEW_PROMPT" \
   2>&1 | tee "$STDERR_FILE" || CODEX_EXIT=$?
 
 if [[ $CODEX_EXIT -ne 0 ]]; then
@@ -364,8 +466,33 @@ _info "Review output length: ${#REVIEW_CONTENT} chars"
 #   意図的に選択した。将来的な改善余地は Result 参照 (--commit + 手動 diff
 #   取得 + --output-schema の組み合わせ等)。
 #
+#   t006 (mission 20260909-safety-gate-hardening) での更新: 上記 R-1 は
+#   「`--base` を使う限りタグを強制する手段が無い」ことを根拠に fail-closed
+#   方式を採ったが、`review` サブコマンドを使うのをやめ diff を自前取得して
+#   `codex exec --output-schema` に渡す方式に移行することで、clean review も
+#   含めて **常に構造化 JSON (信頼できる空配列) を返させる**ことができた
+#   (Director 実機検証・本 task の実機検証 Result 参照)。fail-closed の設計
+#   原則自体 (構造化シグナルが無ければ needs-director) は変更していない —
+#   単に「clean review でもタグ相当のシグナルが得られない」という R-1 時点の
+#   制約が解消されたため、実運用上 no-signal に落ちる頻度が下がるだけである。
+#
+#   F-B (Seo 指摘, t006): `--output-schema` 経路では codex の最終応答が常に
+#   JSON になる前提だが、複数 JSON ドキュメント (JSONL 等、スキーマ違反) が
+#   返った場合、旧実装は `jq -e '.findings | arrays | length'` が複数行を
+#   出力し、後続の `[[ "$FINDINGS_COUNT" -gt 0 ]]` が bash の構文エラーに
+#   なって false 扱いになり、**`NEEDS_FIX=0` のまま `HAD_SIGNAL=1` が
+#   立って auto-done してしまう**欠陥を持っていた (Seo 隔離ハーネス実測:
+#   `{"findings":[]}` と `{"findings":[{"severity":"critical"}]}` の 2 行
+#   入力で `[[: 0 1: syntax error in expression` → method=json needs_fix=0)。
+#   `codex exec review` (JSON を返さない) では休眠していたが、`--output-schema`
+#   移行でこの経路が本番化するため、JSON 経路に入る前に「出力がちょうど 1 つの
+#   JSON ドキュメントであること」を jq でゲートし、2 つ以上 (または 0、パース
+#   不能) の場合は JSON 経路そのものに入らず fail-closed 側 (下記 [P#] タグ
+#   判定 → 見つからなければ no-signal) に確実にフォールバックするようにした。
+#
 #   洗い直しの結果 (入口・内側・fallback):
 #   - 入口: [P2] で修正済み。findings が配列でない限り JSON 経路に入らない。
+#     F-B (t006) で「JSON ドキュメントがちょうど 1 つであること」も追加ゲート。
 #   - 内側 (findings > 0 の denylist, t012): 未知の priority/severity・欠損・
 #     jq 自体の失敗はいずれも危険側 (NEEDS_FIX=1) に倒れることを確認済み。
 #   - jq 不在環境: jq が無ければ exit 127 で入口の `if` が false になり
@@ -377,7 +504,19 @@ NEEDS_FIX=0
 JUDGE_METHOD="tags"
 HAD_SIGNAL=0
 
-if FINDINGS_COUNT=$(echo "$REVIEW_CONTENT" | jq -e '.findings | arrays | length' 2>/dev/null); then
+# F-B (t006): 出力に含まれる JSON ドキュメント数を数える。ちょうど 1 つの
+# 場合のみ JSON 経路の対象とする (JSONL/破損出力は bash 数値比較のエラーで
+# 握りつぶされる余地を残すため、根本から入口を絞る)。
+JSON_LINES="$(printf '%s' "$REVIEW_CONTENT" | jq -c '.' 2>/dev/null)" || true
+JSON_DOC_COUNT=0
+if [[ -n "$JSON_LINES" ]]; then
+  JSON_DOC_COUNT=$(printf '%s\n' "$JSON_LINES" | grep -c '.')
+fi
+if [[ "$JSON_DOC_COUNT" -gt 1 ]]; then
+  _warn "codex output contains ${JSON_DOC_COUNT} JSON documents (F-B: expected exactly 1) — schema violation, skipping JSON path"
+fi
+
+if [[ "$JSON_DOC_COUNT" -eq 1 ]] && FINDINGS_COUNT=$(printf '%s' "$REVIEW_CONTENT" | jq -e '.findings | arrays | length' 2>/dev/null); then
   JUDGE_METHOD="json"
   HAD_SIGNAL=1
   HIGH_COUNT=0
@@ -439,8 +578,15 @@ if [[ $HAD_SIGNAL -eq 0 ]]; then
   NEEDS_FIX=1
 fi
 
-# レビュー内容が空 or 極端に短い場合は要確認
-if [[ ${#REVIEW_CONTENT} -lt 20 ]]; then
+# レビュー内容が空 or 極端に短い場合は要確認。
+# t006 で判明: この閾値は `codex exec review` の自然文出力 (どんな内容でも
+# 数十文字は超える) を前提にしていたため、`--output-schema` 移行後の正当な
+# clean review `{"findings": []}` (16 文字) まで誤って needs-director に
+# 倒してしまっていた (実機確認で検出)。JSON 経路で確定判定できた場合は
+# 「ちょうど 1 つの JSON ドキュメントとして構造的に検証済み」であることが
+# 既に信頼の根拠であり、文字数は無関係なので、この長さチェックは JSON 以外の
+# 経路 (タグ判定 / no-signal) にのみ適用する。
+if [[ "$JUDGE_METHOD" != "json" && ${#REVIEW_CONTENT} -lt 20 ]]; then
   _warn "Review output is very short (${#REVIEW_CONTENT} chars), treating as needs-director"
   NEEDS_FIX=1
 fi

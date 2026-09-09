@@ -963,7 +963,7 @@ Dispatcher は常に **main 版の `scripts/kai-review.sh`**（$CREWVIA_REPO_ROO
 ### `codex-review` skill task の積み方（通常パス）
 
 `review`（Seo）とは別に、`--skills codex-review --pr-number <N>` で task を積むだけでよい。
-Worker 起動は不要 — Dispatcher が `kai-review.sh` を自動 spawn し、`plan.sh pull` → `codex exec review`
+Worker 起動は不要 — Dispatcher が `kai-review.sh` を自動 spawn し、`plan.sh pull` → `codex exec --output-schema`
 → `plan.sh done`/`needs-director` まで完走する。重要 mission では Seo（Claude）と Kai-codex（Codex）の
 **2 人体制**での verdict 突合も検討すること。詳細は `knowledge/codex-reviewer.md` を参照。
 

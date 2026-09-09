@@ -35,7 +35,7 @@ from typing import Literal, Optional
 # Import lib_mux — assumes watchdog.py lives in scripts/ alongside lib_mux.py
 _SCRIPTS_DIR = Path(__file__).parent
 sys.path.insert(0, str(_SCRIPTS_DIR))
-from lib_mux import Mux  # noqa: E402
+from lib_mux import Mux, repo_identity_ok  # noqa: E402
 _mux = Mux()
 
 __version__ = "2.0.0"
@@ -399,7 +399,25 @@ def _should_alert_mass_kill(
 # ---------------------------------------------------------------------------
 
 def graceful_terminate(monitor: WorkerMonitor) -> None:
-    """Send a shutdown message via mux, wait, then SIGTERM → SIGKILL."""
+    """Send a shutdown message via mux, wait, then SIGTERM → SIGKILL.
+
+    t003: guarded by repo_identity_ok() at entry AND again immediately before
+    each destructive step (SIGTERM, SIGKILL). A single check at entry is not
+    enough — TERMINATE_GRACE_PERIOD (60s) and KILL_DELAY (10s) are both long
+    enough for this process's own repo_root (a worktree, in the scenario this
+    guards against) to be removed mid-wait. Any check failing means this
+    process can no longer prove it owns the mux workspace it is about to act
+    on — it fails closed: skip the remaining steps, never kill.
+    """
+    if not repo_identity_ok(monitor.repo_root):
+        _log(
+            f"[terminate] REFUSING to act on {monitor.agent_name}/{monitor.task_id}: "
+            f"self-identity check failed for repo_root={monitor.repo_root} "
+            f"(missing or no longer a git checkout — likely a removed worktree). "
+            f"Skipping shutdown message and kill entirely."
+        )
+        return
+
     name = monitor._mux_window_name()
     if not name:
         _log(f"[kill] {monitor.agent_name}/{monitor.task_id}: window already gone")
@@ -420,6 +438,16 @@ def graceful_terminate(monitor: WorkerMonitor) -> None:
             _log(f"[terminate] {monitor.agent_name}/{monitor.task_id}: Worker exited gracefully")
             return
 
+    # Re-verify immediately before SIGTERM — the 60s wait above is long
+    # enough for the worktree behind repo_root to have been removed since
+    # the entry check.
+    if not repo_identity_ok(monitor.repo_root):
+        _log(
+            f"[terminate] REFUSING SIGTERM for {monitor.agent_name}/{monitor.task_id}: "
+            f"self-identity check failed after grace period (repo_root={monitor.repo_root})"
+        )
+        return
+
     # SIGTERM → wait → SIGKILL
     pane_pid = _mux.pid(name)
     if pane_pid is not None:
@@ -429,6 +457,14 @@ def graceful_terminate(monitor: WorkerMonitor) -> None:
         except ProcessLookupError:
             return
         time.sleep(KILL_DELAY)
+        # Re-verify once more immediately before SIGKILL — same rationale,
+        # smaller window (KILL_DELAY=10s).
+        if not repo_identity_ok(monitor.repo_root):
+            _log(
+                f"[terminate] REFUSING SIGKILL for {monitor.agent_name}/{monitor.task_id}: "
+                f"self-identity check failed during KILL_DELAY wait (repo_root={monitor.repo_root})"
+            )
+            return
         try:
             os.kill(pane_pid, signal.SIGKILL)
             _log(f"[terminate] SIGKILL → pid {pane_pid}")
@@ -541,6 +577,33 @@ def _log_observation(monitor: "WorkerMonitor", check_result: str) -> None:
 # Main loop
 # ---------------------------------------------------------------------------
 
+def _assert_repo_identity_or_exit(repo_root: Path) -> None:
+    """t003: self-identity check, once per main-loop cycle.
+
+    A watchdog started against a git worktree that has since been removed
+    must stop monitoring (and, crucially, stop being *able* to kill
+    anything) rather than keep running on inherited mux env pointing at a
+    workspace it can no longer prove it owns. See repo_identity_ok() in
+    lib_mux.py for the full rationale. This is the coarse, once-per-cycle
+    half of the guard; graceful_terminate() re-checks immediately before
+    each destructive step for the fine-grained half (a worktree can be
+    removed mid-wait, inside a single cycle, after this check already
+    passed).
+
+    Exits the whole process (sys.exit(1)) rather than merely skipping the
+    cycle: an invalid repo_root means every path derived from it (queue_dir,
+    registry_dir, ...) is suspect too, not just the kill actions.
+    """
+    if repo_identity_ok(repo_root):
+        return
+    _log(
+        f"FATAL: repo_root {repo_root} no longer exists or is not a "
+        f"git checkout (worktree removed?). A stale watchdog must "
+        f"not keep running against inherited mux env — exiting."
+    )
+    sys.exit(1)
+
+
 def run(repo_root: Path, interval: int) -> None:
     global _LOG_FILE, _OBSERVATION_LOG_FILE
     registry_dir = repo_root / "registry"
@@ -588,6 +651,8 @@ def run(repo_root: Path, interval: int) -> None:
 
     while True:
         try:
+            _assert_repo_identity_or_exit(repo_root)
+
             active_tasks = load_active_tasks(queue_dir)
             active_keys = {(slug, tid) for slug, tid, _ in active_tasks}
 

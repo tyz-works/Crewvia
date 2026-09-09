@@ -21,12 +21,22 @@
 # 倒すよう変更した。詳細は scripts/kai-review.sh のヘッダー / 判定ロジック
 # コメントと本ファイル中の R-1 セクションを参照。
 #
+# t011 (mission 20260909-safety-gate-hardening) 追記: 上記の「[P#] タグ」経路
+# 自体を本ファイルの対象コードから削除した。t009 QA が fenced / インデント
+# コードブロック内の bullet 形式の引用が依然として finding 行アンカーに
+# 一致してしまう欠陥 (D2/D4) を実測したため — 「引用かどうか」は行単位では
+# 判別できないのに判定 unit を行に置いたままだった構造的な欠陥。本ファイル中
+# 「タグ判定」「method=tags」を前提にしていたテストは、判定材料が JSON
+# findings 配列 1 つに絞られたことを反映して期待値・fixture を更新した
+# (該当箇所に t011 の注記あり)。D2/D4 の回帰テストは下記 F-A→t011 セクション
+# 参照。
+#
 # 検証内容:
-#   F2  findings 判定: [P#] タグ判定 (findings 空→done, P1 あり→needs-director) +
-#       JSON forward-compat 判定
-#   R-1 構造化シグナル無し (HAD_SIGNAL=0) の fail-closed 化: タグ無し・JSON
-#       findings 配列無しの出力は内容 (critical キーワードの有無や文脈) に
-#       関わらず一律 NEEDS-DIRECTOR相当になること
+#   F2  findings 判定: JSON findings 配列の判定 (findings 空→done, P1 あり→
+#       needs-director)。[P#] タグ判定は t011 で廃止済み (下記参照)
+#   R-1 構造化シグナル無し (HAD_SIGNAL=0) の fail-closed 化: JSON findings
+#       配列が得られない出力は内容 (critical キーワードの有無や文脈、[P#]
+#       タグの有無) に関わらず一律 NEEDS-DIRECTOR相当になること
 #   F3  並列衝突: kai-review.sh を 2 本同時実行し、出力ファイルが独立していること
 #   F4  --mission forward: gh 失敗 / headRefName 空 / codex 失敗 / output file 未生成の
 #       各 failure path で plan.sh needs-director に --mission が渡ること
@@ -297,7 +307,7 @@ run_kai() {
 #                       `bash scripts/kai-review.sh --pr 175 --task t001 --dry-run`
 #                       を実行した際に、実際の codex-cli 0.144.5 が書き出した
 #                       出力ファイル ($OUTPUT_FILE) の内容そのもの。
-#   json_*.txt / prose_critical_no_tag.txt / tag_and_critical_keyword.txt —
+#   json_*.txt / prose_critical_no_tag.txt —
 #                       現行 codex-cli (0.144.5) では再現できない仮想シナリオ
 #                       (JSON forward-compat パス / critical キーワードの
 #                       safety net・上書き非適用の確認) を検証するための
@@ -384,13 +394,9 @@ This introduces a critical race condition in the queue writer that does not
 have a workaround, and callers cannot recover once it triggers.
 FIX
 
-# [P3] タグのみの合成 fixture。「構造化シグナルがある場合の auto-done 経路」を
-# 検証する実行系テスト (F2 実行系) で使う。critical という単語を本文に含むが
-# タグ判定を信頼する (F-3 由来の確認観点を維持)。
-cat > "$FIXTURES_DIR/tag_and_critical_keyword.txt" <<'FIX'
-- [P3] Minor nit — foo.sh:1
-  This is a very minor style nit and not a critical issue at all.
-FIX
+# t011: 旧 tag_and_critical_keyword.txt ([P3] タグのみの合成 fixture) はここに
+# あったが、[P#] タグ判定の削除により「構造化シグナルがある場合の auto-done
+# 経路」は JSON fixture (json_empty.txt 等) でのみ検証できるため削除した。
 
 # ---------------------------------------------------------------------------
 # F2 / R-1: findings 判定 (dry-run で判定結果のみ検証)
@@ -427,14 +433,14 @@ else
 fi
 
 echo ""
-echo "--- F2: [P#] タグ判定 — P1 finding あり (実測 fixture) → NEEDS-DIRECTOR相当 ---"
+echo "--- F2 (t011): [P#] タグ形式の散文 (実測 fixture, JSON 無し) → method=no-signal で NEEDS-DIRECTOR相当 (タグ経路廃止後も安全側の結論は不変) ---"
 write_task t102 "F2 p1"
 out=$(FAKE_GH_HEAD_BRANCH="feature-branch" FAKE_CODEX_FIXTURE="$FIXTURES_DIR/p1_findings.txt" \
   run_kai --pr 1 --task t102 --mission "$MISSION_SLUG" --dry-run 2>&1) && rc=0 || rc=$?
-if [[ $rc -eq 0 ]] && echo "$out" | grep -q "method=tags needs_fix=1" && echo "$out" | grep -q "NEEDS-DIRECTOR相当"; then
-  pass "P1 findings fixture (実測, PR#175 dry-run で取得) → method=tags, NEEDS-DIRECTOR相当"
+if [[ $rc -eq 0 ]] && echo "$out" | grep -q "method=no-signal needs_fix=1" && echo "$out" | grep -q "NEEDS-DIRECTOR相当"; then
+  pass "P1 findings fixture (実測, PR#175 dry-run で取得) → JSON 無し/タグ経路廃止済みのため method=no-signal, NEEDS-DIRECTOR相当"
 else
-  fail "p1_findings fixture should judge as NEEDS-DIRECTOR via tags — rc=$rc out=$out"
+  fail "p1_findings fixture should judge as NEEDS-DIRECTOR (no-signal) — rc=$rc out=$out"
 fi
 
 echo ""
@@ -486,16 +492,16 @@ fi
 # 走らせて task の status が正しく更新されることを確認する。
 # ---------------------------------------------------------------------------
 echo ""
-echo "--- F2 (実行系): [P3] タグのみの findings → 実際に plan.sh done が呼ばれ status=done になる (構造化シグナルがある場合の auto-done 経路は健在) ---"
-write_task_in_progress t110 "F2 real done via tag"
-FAKE_GH_HEAD_BRANCH="feature-branch" FAKE_CODEX_FIXTURE="$FIXTURES_DIR/tag_and_critical_keyword.txt" \
+echo "--- F2 (実行系, t011): JSON findings=[] → 実際に plan.sh done が呼ばれ status=done になる (構造化シグナルがある場合の auto-done 経路は健在。t011 で [P#] タグ経由の auto-done 経路は廃止したため JSON 経由のみで検証する) ---"
+write_task_in_progress t110 "F2 real done via json"
+FAKE_GH_HEAD_BRANCH="feature-branch" FAKE_CODEX_FIXTURE="$FIXTURES_DIR/json_empty.txt" \
   run_kai --pr 1 --task t110 --mission "$MISSION_SLUG" --skip-pull > "$TMPDIR_TEST/t110.out" 2>&1
 rc110=$?
 st110="$(task_status t110)"
 if [[ $rc110 -eq 0 && "$st110" == "done" ]] && grep -q "LGTM" "$TASKS_DIR/t110.md"; then
-  pass "[P3] タグのみ → 実行後 status=done, Result に LGTM 記載 (構造化シグナルがある auto-done 経路は健在)"
+  pass "JSON findings=[] → 実行後 status=done, Result に LGTM 記載 (構造化シグナルがある auto-done 経路は健在)"
 else
-  fail "[P3]-only tagged fixture real-run should set status=done — rc=$rc110 status=$st110 (see $TMPDIR_TEST/t110.out)"
+  fail "json_empty fixture real-run should set status=done — rc=$rc110 status=$st110 (see $TMPDIR_TEST/t110.out)"
 fi
 
 echo ""
@@ -529,12 +535,12 @@ fi
 # レビューゲートが「危険な方向 (自動承認)」に倒れる欠陥だったため、これが最重要。
 # ---------------------------------------------------------------------------
 echo ""
-echo "--- F-1 [最重要]: [P0] findings のみ → NEEDS-DIRECTOR相当になること (旧実装は自動 done していた) ---"
+echo "--- F-1 [最重要]: [P0] findings のみ (JSON 無しの散文) → NEEDS-DIRECTOR相当になること (旧実装は自動 done していた。t011 でタグ経路廃止後は method=no-signal 経由) ---"
 write_task t160 "F-1 p0 findings"
 out=$(FAKE_GH_HEAD_BRANCH="feature-branch" FAKE_CODEX_FIXTURE="$FIXTURES_DIR/p0_findings.txt" \
   run_kai --pr 1 --task t160 --mission "$MISSION_SLUG" --dry-run 2>&1) && rc=0 || rc=$?
-if [[ $rc -eq 0 ]] && echo "$out" | grep -q "method=tags needs_fix=1" && echo "$out" | grep -q "NEEDS-DIRECTOR相当"; then
-  pass "[P0] のみの finding → method=tags, NEEDS-DIRECTOR相当 (F-1 修正確認)"
+if [[ $rc -eq 0 ]] && echo "$out" | grep -q "method=no-signal needs_fix=1" && echo "$out" | grep -q "NEEDS-DIRECTOR相当"; then
+  pass "[P0] のみの finding (散文, JSON 無し) → method=no-signal, NEEDS-DIRECTOR相当 (F-1 修正確認, t011 でタグ経路廃止後も安全側不変)"
 else
   fail "REGRESSION (F-1): [P0]-only finding should judge as NEEDS-DIRECTOR, not auto-done — rc=$rc out=$out"
 fi
@@ -727,9 +733,11 @@ fi
 
 write_task t170 "F-2 deleted branch"
 # 検証対象は「refs/pull 経由の fetch/worktree が完走するか」であり判定内容ではない
-# ため、fixture は構造化シグナルがあり判定が安定する tag_and_critical_keyword.txt
-# を使う (R-1 以降、タグ無し clean.txt は fail-closed で NEEDS-DIRECTOR相当になる)。
-out=$(FAKE_GH_HEAD_BRANCH="feature-branch" FAKE_CODEX_FIXTURE="$FIXTURES_DIR/tag_and_critical_keyword.txt" \
+# ため、fixture は判定が安定する json_empty.txt を使う (R-1 以降、タグ無し
+# clean.txt は fail-closed で NEEDS-DIRECTOR相当になる。t011 で [P#] タグ経路
+# 自体を削除したため、構造化シグナルを安定して得るには JSON fixture を使う
+# 必要がある)。
+out=$(FAKE_GH_HEAD_BRANCH="feature-branch" FAKE_CODEX_FIXTURE="$FIXTURES_DIR/json_empty.txt" \
   run_kai --pr 1 --task t170 --mission "$MISSION_SLUG" --dry-run 2>&1) && rc=0 || rc=$?
 if [[ $rc -eq 0 ]] && echo "$out" | grep -q "DONE/LGTM相当"; then
   pass "origin に branch が無くても refs/pull/1/head 経由でレビュー成功 (F-2 修正確認)"
@@ -801,16 +809,10 @@ else
   fail "genuine critical keyword (no tag) should still trigger NEEDS-DIRECTOR — rc=$rc out=$out"
 fi
 
-echo ""
-echo "--- R-1: [P#] タグがあれば本文の critical という単語の有無に関わらずタグ判定を信頼する ---"
-write_task t184 "R-1 tag trusted over prose content"
-out=$(FAKE_GH_HEAD_BRANCH="feature-branch" FAKE_CODEX_FIXTURE="$FIXTURES_DIR/tag_and_critical_keyword.txt" \
-  run_kai --pr 1 --task t184 --mission "$MISSION_SLUG" --dry-run 2>&1) && rc=0 || rc=$?
-if [[ $rc -eq 0 ]] && echo "$out" | grep -q "method=tags needs_fix=0" && echo "$out" | grep -q "DONE/LGTM相当"; then
-  pass "[P3] タグのみ (本文に critical という単語を含む) → タグ判定を信頼し DONE相当 (構造化シグナルがあれば prose 内容は見ない)"
-else
-  fail "when a tag is present, its priority should be trusted over prose content — rc=$rc out=$out"
-fi
+# t011: 旧 "R-1: [P#] タグがあれば...タグ判定を信頼する" テストはここにあったが、
+# [P#] タグ判定自体を削除したため前提が成立しなくなり削除した。「構造化シグナル
+# があれば prose 内容は見ない」という設計原則は JSON 経路にのみ残っている
+# ([P1]/[P2] の denylist テスト群 (t163-t165, t190-t193) で検証済み)。
 
 # ---------------------------------------------------------------------------
 # F4: --mission forward — 各 failure path
@@ -913,8 +915,9 @@ LOG_B="$TMPDIR_TEST/f3_b.log"
 
 (
   # R-1 以降、タグ無し clean 出力は fail-closed で NEEDS-DIRECTOR相当になるため、
-  # このテストの「DONE 側」は [P#] タグ付きの構造化シグナルがある fixture を使う。
-  FAKE_GH_HEAD_BRANCH="feature-branch" FAKE_CODEX_FIXTURE="$FIXTURES_DIR/tag_and_critical_keyword.txt" FAKE_CODEX_LOG="$LOG_A" \
+  # このテストの「DONE 側」は構造化シグナルがある JSON fixture を使う
+  # (t011 で [P#] タグ経路自体を削除したため、JSON 以外に安定した DONE 経路は無い)。
+  FAKE_GH_HEAD_BRANCH="feature-branch" FAKE_CODEX_FIXTURE="$FIXTURES_DIR/json_empty.txt" FAKE_CODEX_LOG="$LOG_A" \
     run_kai --pr 1 --task t140 --mission "$MISSION_SLUG" --dry-run > "$TMPDIR_TEST/f3_a.out" 2>&1
   echo $? > "$TMPDIR_TEST/f3_a.rc"
 ) &
@@ -1056,6 +1059,139 @@ if [[ $rc222 -eq 0 && "$st222" == "done" ]]; then
   pass "実測 clean JSON (実行系) → 実際に status=done になる"
 else
   fail "real_json_clean real-run should set status=done — rc=$rc222 status=$st222 (see $TMPDIR_TEST/t222.out)"
+fi
+
+# ---------------------------------------------------------------------------
+# F-A (t007, Seo 指摘): [P#] タグ抽出が出力全体への無アンカー grep だったため、
+# レビュー対象の diff/コードが文字列 "[P3]" 等を含んでいて codex がそれを
+# 地の文で引用しただけで HAD_SIGNAL=1 が立ち、同じ出力中の散文 critical
+# finding が丸ごと無視される欠陥があった。
+#   fa_repro_quoted_tag.txt — t007 Description に記載された再現例そのもの
+#   (Seo が隔離ハーネスで実測。現行 codex-cli では `kai-review.sh` /
+#   `test_kai_review.sh` 自身を触る PR の diff に "[P0]"-"[P3]" のリテラルが
+#   実際に含まれるため、机上の想定ではなく実際に起こりうる入力)。
+# ---------------------------------------------------------------------------
+cat > "$FIXTURES_DIR/fa_repro_quoted_tag.txt" <<'FIX'
+The diff adds a comment mentioning [P3] priority tags to kai-review.sh.
+Separately, this introduces a critical data-loss bug in the queue writer.
+FIX
+
+echo ""
+echo "--- F-A [最重要]: 出力全体を引用した無関係な [P3] → JSON が無いため method=no-signal で fail-closed (地の文の critical finding は無視されない) ---"
+write_task t230 "F-A repro quoted tag"
+out=$(FAKE_GH_HEAD_BRANCH="feature-branch" FAKE_CODEX_FIXTURE="$FIXTURES_DIR/fa_repro_quoted_tag.txt" \
+  run_kai --pr 1 --task t230 --mission "$MISSION_SLUG" --dry-run 2>&1) && rc=0 || rc=$?
+if [[ $rc -eq 0 ]] && echo "$out" | grep -q "method=no-signal needs_fix=1" && echo "$out" | grep -q "NEEDS-DIRECTOR相当"; then
+  pass "地の文で引用された [P3] のみ (finding 行の形式ではない) → method=no-signal, NEEDS-DIRECTOR相当 (F-A 修正確認: 旧実装は method=tags needs_fix=0 で auto-done していた)"
+else
+  fail "REGRESSION (F-A): a bare-prose citation of [P3] must not be treated as a structured signal — rc=$rc out=$out"
+fi
+
+echo ""
+echo "--- F-A (実行系): 引用のみの [P3] → 実際に plan.sh needs-director が呼ばれ status=needs_director になる ---"
+write_task_in_progress t231 "F-A repro quoted tag real needs-director"
+FAKE_GH_HEAD_BRANCH="feature-branch" FAKE_CODEX_FIXTURE="$FIXTURES_DIR/fa_repro_quoted_tag.txt" \
+  run_kai --pr 1 --task t231 --mission "$MISSION_SLUG" --skip-pull > "$TMPDIR_TEST/t231.out" 2>&1
+rc231=$?
+st231="$(task_status t231)"
+if [[ $rc231 -eq 0 && "$st231" == "needs_director" ]]; then
+  pass "引用のみの [P3] (実行系) → 実際に status=needs_director になる (旧実装なら誤って done になっていた)"
+else
+  fail "REGRESSION (F-A): quoted-tag-only real-run should set status=needs_director — rc=$rc231 status=$st231 (see $TMPDIR_TEST/t231.out)"
+fi
+
+# t011: 旧 "F-A (取りこぼし確認)" テスト (fa_properly_tagged.txt, 行頭アンカーの
+# [P0] finding が本文中の無関係な [P3] 引用と混在しても検出されることを確認
+# するテスト) はここにあったが、[P#] タグのアンカー判定自体を削除したため
+# 前提が成立しなくなり削除した。
+
+# ---------------------------------------------------------------------------
+# F-A → t011 (t009 QA FAIL): F-A (t007) の行頭アンカー化は「引用かどうか」を
+# 行単位で判別しようとしたが、t009 QA の実測 (18 ケース) で **fenced コード
+# ブロック (```) / 4 スペースインデントのコードブロック内の bullet 形式
+# `[P#]` は依然として finding 行アンカーに一致してしまう**ことが判明した
+# (D2: fenced, D4: インデント)。最悪ケースでは codex が構造化 JSON で報告した
+# P0 finding が、地の文 + fenced 引用 + JSON の混在により JSON ドキュメントが
+# 1 つに切り出せず F-B ゲートで tag fallback に落ち、引用された [P3] を拾って
+# 丸ごと捨てられた (自動承認) ことも実機で確認された。t011 で [P#] タグ経路
+# そのものを削除したことで、D2/D4 はどちらも「JSON が無い」という理由だけで
+# method=no-signal に倒れるようになった (アンカー形式を問わない)。
+#
+# 検証方法: 旧スクリプト (tag 経路あり) に対してこの 2 fixture を直接
+# 判定ロジックだけ抜き出して実行し、`method=tags needs_fix=0` (auto-done) に
+# なることを実機確認済み (t011 Result 参照。変更前のコードでは本テストが
+# 期待する NEEDS-DIRECTOR相当にはならず fail する)。
+# ---------------------------------------------------------------------------
+cat > "$FIXTURES_DIR/d2_fenced_quoted_tag.txt" <<'FIX'
+This review also found a critical issue: the deploy script silently swallows
+mv failures and can corrupt the deployment target.
+
+For reference, here is how priority tags are typically formatted in this repo:
+
+```
+- [P3] Example minor nit — foo.sh:1
+```
+
+That formatting note is unrelated to the finding above.
+FIX
+
+cat > "$FIXTURES_DIR/d4_indented_quoted_tag.txt" <<'FIX'
+This change introduces a critical race condition in the queue writer that
+can silently drop in-flight work.
+
+Example of the tag format used elsewhere in this repo:
+
+    - [P3] Example minor nit — foo.sh:1
+
+That formatting note is unrelated to the finding above.
+FIX
+
+echo ""
+echo "--- D2 (t009 QA FAIL → t011) [最重要]: fenced コードブロック内の bullet [P3] 引用 + 散文 critical → method=no-signal で fail-closed (旧実装は method=tags needs_fix=0 で auto-done していた) ---"
+write_task t240 "D2 fenced codeblock quoted tag"
+out=$(FAKE_GH_HEAD_BRANCH="feature-branch" FAKE_CODEX_FIXTURE="$FIXTURES_DIR/d2_fenced_quoted_tag.txt" \
+  run_kai --pr 1 --task t240 --mission "$MISSION_SLUG" --dry-run 2>&1) && rc=0 || rc=$?
+if [[ $rc -eq 0 ]] && echo "$out" | grep -q "method=no-signal needs_fix=1" && echo "$out" | grep -q "NEEDS-DIRECTOR相当"; then
+  pass "fenced コードブロック内の [P3] 引用 + 散文 critical → method=no-signal, NEEDS-DIRECTOR相当 (D2 修正確認: タグ経路廃止により fenced 引用も無条件で no-signal)"
+else
+  fail "REGRESSION (D2/t011): a [P#] tag quoted inside a fenced code block must not be treated as a structured signal — rc=$rc out=$out"
+fi
+
+echo ""
+echo "--- D2 (実行系): fenced コードブロック内の引用 → 実際に plan.sh needs-director が呼ばれ status=needs_director になる ---"
+write_task_in_progress t241 "D2 fenced codeblock quoted tag real needs-director"
+FAKE_GH_HEAD_BRANCH="feature-branch" FAKE_CODEX_FIXTURE="$FIXTURES_DIR/d2_fenced_quoted_tag.txt" \
+  run_kai --pr 1 --task t241 --mission "$MISSION_SLUG" --skip-pull > "$TMPDIR_TEST/t241.out" 2>&1
+rc241=$?
+st241="$(task_status t241)"
+if [[ $rc241 -eq 0 && "$st241" == "needs_director" ]]; then
+  pass "fenced コードブロック内の引用 (実行系) → 実際に status=needs_director になる (旧実装なら誤って done になっていた)"
+else
+  fail "REGRESSION (D2/t011): fenced-codeblock-quoted-tag real-run should set status=needs_director — rc=$rc241 status=$st241 (see $TMPDIR_TEST/t241.out)"
+fi
+
+echo ""
+echo "--- D4 (t009 QA FAIL → t011) [最重要]: 4 スペースインデントのコードブロック内の bullet [P3] 引用 + 散文 critical → method=no-signal で fail-closed (旧実装は method=tags needs_fix=0 で auto-done していた) ---"
+write_task t242 "D4 indented codeblock quoted tag"
+out=$(FAKE_GH_HEAD_BRANCH="feature-branch" FAKE_CODEX_FIXTURE="$FIXTURES_DIR/d4_indented_quoted_tag.txt" \
+  run_kai --pr 1 --task t242 --mission "$MISSION_SLUG" --dry-run 2>&1) && rc=0 || rc=$?
+if [[ $rc -eq 0 ]] && echo "$out" | grep -q "method=no-signal needs_fix=1" && echo "$out" | grep -q "NEEDS-DIRECTOR相当"; then
+  pass "インデントコードブロック内の [P3] 引用 + 散文 critical → method=no-signal, NEEDS-DIRECTOR相当 (D4 修正確認: タグ経路廃止によりインデント引用も無条件で no-signal)"
+else
+  fail "REGRESSION (D4/t011): a [P#] tag quoted inside an indented code block must not be treated as a structured signal — rc=$rc out=$out"
+fi
+
+echo ""
+echo "--- D4 (実行系): インデントコードブロック内の引用 → 実際に plan.sh needs-director が呼ばれ status=needs_director になる ---"
+write_task_in_progress t243 "D4 indented codeblock quoted tag real needs-director"
+FAKE_GH_HEAD_BRANCH="feature-branch" FAKE_CODEX_FIXTURE="$FIXTURES_DIR/d4_indented_quoted_tag.txt" \
+  run_kai --pr 1 --task t243 --mission "$MISSION_SLUG" --skip-pull > "$TMPDIR_TEST/t243.out" 2>&1
+rc243=$?
+st243="$(task_status t243)"
+if [[ $rc243 -eq 0 && "$st243" == "needs_director" ]]; then
+  pass "インデントコードブロック内の引用 (実行系) → 実際に status=needs_director になる (旧実装なら誤って done になっていた)"
+else
+  fail "REGRESSION (D4/t011): indented-codeblock-quoted-tag real-run should set status=needs_director — rc=$rc243 status=$st243 (see $TMPDIR_TEST/t243.out)"
 fi
 
 # ---------------------------------------------------------------------------

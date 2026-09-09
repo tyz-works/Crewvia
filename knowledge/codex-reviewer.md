@@ -27,6 +27,13 @@
 > `[P0]`-`[P3]` のリテラルが実際に含まれるため机上の話ではない)。タグ抽出を finding 行
 > (行頭の箇条書きマーカーに続くタグ) にアンカーして修正。詳細は下記「F-A: `[P#]` タグ抽出の
 > アンカー化」を参照。
+> **t011 (2026-09-09, mission: 20260909-safety-gate-hardening)**: F-A のアンカー化でも、
+> fenced コードブロック (` ``` `) / 4 スペースインデントのコードブロック内の bullet 形式
+> `[P#]` は依然として finding 行アンカーに一致してしまうことが t009 QA の実測 (18 ケース)
+> で判明した (D2/D4)。「引用かどうか」は行単位では判別できないのに判定 unit を行に置いた
+> ままだった構造的な欠陥のため、個別の引用形式を塞ぐのではなく **`[P#]` タグ経路そのもの
+> を削除**し、auto-done 経路を JSON findings 配列 1 本に絞った。詳細は下記「t011: `[P#]`
+> タグ経路の廃止」を参照。
 
 ---
 
@@ -185,7 +192,7 @@ Kai-codex 自身に PR#173 (kai-review.sh 初版) を self-review させたと�
   (旧実装の `origin/<branch>` 参照は fork PR や削除済み branch で必ず失敗していた)。
 - worktree・fetch した一時 ref は `trap cleanup EXIT` で成功/失敗どちらの経路でも必ず削除する。
 
-### findings 判定ロジックの変遷 (F2 → F-1/F-3 → [P2] → R-1)
+### findings 判定ロジックの変遷 (F2 → F-1/F-3 → [P2] → R-1 → F-A → t011)
 
 現物確認 (codex-cli 0.144.5) の結果、`codex exec review` の実際の出力は JSON ではなく自然文 +
 `- [P0]`〜`- [P3]` タグ付き箇条書きだった。判定ロジックは QA re-review を重ねて堅牢化した:
@@ -221,6 +228,13 @@ Kai-codex 自身に PR#173 (kai-review.sh 初版) を self-review させたと�
      復活させる。safety-gate-hardening mission の意図 (危険な方向への誤判定を繰り返さない) を
      優先して意図的に選択した。改善余地: `--commit` + 手動 diff 取得 + `--output-schema` の
      組み合わせで custom prompt と構造化出力の両立を図る、等。
+5. **F-A → t011**: t006 で `--output-schema` への移行後も `[P#]` タグ判定を fallback として
+   残していたが (下記「F-A: `[P#]` タグ抽出のアンカー化」参照)、t007 のアンカー化
+   (`^[[:space:]]*-?[[:space:]]*\[P[0-3]\]`) は行単位の判別に過ぎず、fenced / インデント
+   コードブロック内の bullet 形式の引用までは塞げなかった (t009 QA FAIL, D2/D4)。
+   **「表現の列挙で網羅するのは原理的に不可能」という、この一連の欠陥が 5 回 (F-1 →
+   [P1]/t012 → [P2] → F-A → t009) 繰り返し示した教訓**に基づき、t011 で `[P#]` タグ経路
+   そのものを削除した。詳細は下記「t011: `[P#]` タグ経路の廃止」を参照。
 
 **教訓**: レビューゲートの判定ロジックは、迷ったら「修正必要」側に倒す（fail-closed）ことを
 毎回明示的に確認すること。denylist（危険と確認できないものは全部危険側）で組むほうが、
@@ -362,6 +376,59 @@ R-1 (t001) で auto-done 経路が「JSON 空配列」と「`[P#]` タグ」の 
 出力全体を走査して「どれか 1 つでも `[P#]` があれば構造化シグナルあり」と見なしていたのを、
 判定 unit を「finding 行」に絞ることで閉じた。`plan_review.md` の verdict 正規化で同種の
 欠陥を 3 回踏んで「判定 unit を最初の中身のある unit 1 つに絞る」に落ち着いたのと同じ構造。
+
+## t011: `[P#]` タグ経路の廃止 (2026-09-09, mission 20260909-safety-gate-hardening)
+
+F-A (t007) の行頭アンカー化は「引用かどうか」を行単位で判別しようとしたが、t009 QA の
+実測 (18 ケース) でこのアプローチ自体の限界が露呈した:
+
+    D2 (fenced コードブロック内の bullet [P3] + 散文 critical):
+      入力:
+        This review also found a critical issue: the deploy script silently
+        swallows mv failures and can corrupt the deployment target.
+
+        For reference, here is how priority tags are typically formatted:
+
+        (3連バッククォートで囲まれた fenced block)
+        - [P3] Example minor nit — foo.sh:1
+        (/fenced block)
+      結果 (修正前): method=tags needs_fix=0   (= auto-done。散文中の critical
+      finding が丸ごと無視される)
+
+    D4 (4 スペースインデントのコードブロック内の bullet [P3]): 同様の構造で同じ欠陥。
+
+**最悪ケース (実機確認)**: codex が構造化 JSON で報告した P0 finding が、地の文 +
+fenced 引用 + JSON の混在により出力全体が単一 JSON ドキュメントに切り出せず、F-B
+ゲートでタグ fallback に落ち、引用された `[P3]` を拾って**本物の P0 finding ごと
+丸ごと破棄され自動承認された** (本 mission が根絶対象としている構造そのもの)。
+
+**構造的な問題**: fenced fence / インデント / チルダ fence `~~~` / HTML `<pre>` 等、
+引用を表す markdown の表現は列挙しきれない。前処理でコードブロックを剥がす案も
+markdown パースの完全性に依存するため、別の引用形式で同じ形の穴が再発するだけである。
+「表現の列挙で網羅するのは原理的に不可能」という教訓は、この一連の欠陥 (F-1 →
+[P1]/t012 → [P2] → F-A → t009) が 5 回にわたって示してきたものであり、個別の
+パターン調整をこれ以上重ねても同種の欠陥を再発させるだけと判断した。
+
+**対処**: `[P#]` タグ抽出・判定ロジックを丸ごと削除した。t006 以降 codex は
+`--output-schema` により schema 準拠の JSON を必ず返すため、タグ経路は「JSON 解析が
+失敗したときの fallback」という位置づけ以上の価値を既に持っていなかった。削除後、
+auto-done に到達する経路は **「codex が単一 JSON ドキュメントを返し、`.findings` が
+配列で、denylist 判定で危険な finding が 0 件」の 1 本だけ**になった。JSON 経路に
+入れなかった出力は理由を問わず (JSON 解析失敗・複数ドキュメント・codex 未起動・
+clean review でもタグ相当のシグナルを出さなかった、等すべて) 無条件で
+needs-director に倒れる (fail-closed, R-1 の原則を継承)。
+
+**倒れる方向**: 「取りこぼしが増える方向」は明示的に許容した — タグ経路の削除により、
+以前タグ判定で auto-done できていた一部の出力 (例: `[P3]` タグのみの散文出力) も
+now needs-director に倒れる。これは安全側へのトレードオフであり、意図した挙動。
+実 PR で JSON 経路が正常動作することは `--output-schema` 移行時点 (t006) から実機で
+継続確認している (下記「実機確認」節、および本 task (t011) の Result 参照)。
+
+**設計原則との対応**: 「危険な結論 (auto-done) は allowlist、かつ判定 unit (どこを
+見るか) も 1 つに絞る」という本 mission の中心原則の最終形。F-A は「判定 unit を
+finding 行に絞った」が、unit の置き場所 (行) 自体が引用との区別に向かない場所
+だった。t011 は判定 unit を「JSON findings 配列」という、引用に化けえない
+構造化データそのものに絞ることで、この種の欠陥のクラス自体を閉じた。
 
 ### `--dry-run` (F6, Director 指示)
 

@@ -49,9 +49,11 @@ set -euo pipefail
 #      構造化データとして返る (詳細: config/kai-review-findings.schema.json)。
 #   8. 出力ファイルを読み込み findings を判定。JSON 経路 (`.findings` が
 #      ちょうど 1 つの JSON ドキュメントとして得られ、かつ配列である場合) が
-#      主経路。[P0]-[P3] タグ判定は forward-compat の fallback として残す。
-#      JSON findings 配列も [P#] タグも一切見つからない場合 (HAD_SIGNAL=0) は、
-#      内容に関わらず無条件で needs-director 側に倒す (fail-closed, R-1,
+#      唯一の auto-done 経路 (t011: `[P0]`-`[P3]` タグ判定の fallback は
+#      廃止済み — 「引用かどうか」を行単位で判別しようとする設計自体が
+#      再発可能な穴だったため。詳細は「findings 判定」セクション参照)。
+#      JSON findings 配列が得られない場合 (HAD_SIGNAL=0) は、内容に関わらず
+#      無条件で needs-director 側に倒す (fail-closed, R-1,
 #      mission 20260909-safety-gate-hardening)。JSON が複数ドキュメント
 #      (JSONL 等、スキーマ違反) の場合も同様に fail-closed に倒す
 #      (F-B, t006 — 詳細は「findings 判定」セクション参照)
@@ -390,13 +392,13 @@ _info "Review output length: ${#REVIEW_CONTENT} chars"
 #   knowledge/codex-reviewer.md および本 task の Result 参照)。
 #   旧ロジックの「明示的 LGTM キーワードが無ければ needs-director」というルールは、
 #   clean な review でも LGTM と言わないため常に発火してしまう既知バグ (F2 そのもの) だったため、
-#   このルールは廃止し [P#] タグの有無で判定する。
-#   将来 / 別環境の codex CLI が構造化 JSON ({"findings":[...], ...}) を返すケースに備え、
-#   JSON 判定を最優先で試す (forward-compat パス。現行 CLI では通らない想定)。
+#   このルールは廃止し [P#] タグの有無で判定する方式に移った (t011 で [P#] タグ経路
+#   自体を廃止済み。下記参照。このパラグラフ以下は当時の判断の記録として残す)。
 #
 #   F-1 (P0 抜け, QA FAIL): タグ抽出が `[P1-3]` のみで P0 を拾わず、[P0] だけの
 #   findings が LGTM 誤判定 (自動 done) されていた。レビューゲートが「危険な方向
-#   (自動承認)」に倒れる欠陥のため、P0 もタグ抽出・JSON priority 判定の両方に含める。
+#   (自動承認)」に倒れる欠陥のため、P0 もタグ抽出・JSON priority 判定の両方に含めた
+#   (タグ抽出自体は t011 で廃止済み)。
 #
 #   F-3 (critical keyword 誤発火, QA FAIL): 旧ロジックは critical 系キーワードを
 #   タグ/JSON 判定の結果によらず常に上書き適用していたため、"No critical issues
@@ -424,8 +426,7 @@ _info "Review output length: ${#REVIEW_CONTENT} chars"
 #   `.findings` が真に配列である場合のみ (空配列 `[]` も含む) JSON 経路に
 #   入るようにした。配列でない/存在しない/null の場合は `arrays` がフィルタで
 #   除外して jq が何も出力せず exit 非 0 になるため、`if` が false になって
-#   [P#] タグ判定 (→ タグも無ければ下記の fail-closed 分岐) へ確実に
-#   フォールバックする。
+#   (t011 以降は) fail-closed 分岐 (no-signal) へ確実にフォールバックする。
 #
 #   R-1 (t001, mission 20260909-safety-gate-hardening): PR#180 で F-3 として
 #   導入した「critical キーワード + 同一行否定語除外」の散文 safety net は、
@@ -449,22 +450,17 @@ _info "Review output length: ${#REVIEW_CONTENT} chars"
 #   確認した (`error: the argument '--base <BRANCH>' cannot be used with
 #   '[PROMPT]'`)。`--output-schema <FILE>` (JSON Schema 強制) も試したが、
 #   空 diff / 実質的な diff の双方で review サブコマンドの最終出力書式
-#   (自然文 + [P#] タグ) は一切変化しないことを確認した。つまり現行
+#   (自然文 + [P#] タグ) は一切変化しないことを確認した。つまり当時の
 #   codex-cli は `--base` を使う限り「finding が無い場合の明示マーカー」を
 #   強制する手段が無く、clean な review は今後も引き続きタグ無しの自然文
-#   のみを返す。
+#   のみを返すと考えられていた (t006 で `--output-schema` への移行によりこの
+#   制約自体が解消された。下記参照)。
 #
-#   そのため本修正は「JSON findings 配列も [P#] タグも一切見つからない
+#   当時の結論だった「JSON findings 配列も [P#] タグも一切見つからない
 #   (HAD_SIGNAL=0) 場合は、内容に関わらず無条件で needs-director に倒す」
-#   という形にした (allowlist: 構造化シグナルによる確認が取れた場合のみ
-#   auto-done を許可する。判定 unit は「JSON findings 配列」と「[P#] タグ」
-#   の 2 つに絞り、それ以外の判定材料は一切見ない)。副作用として、clean な
-#   review (タグ無し) も含めて一律 needs-director 相当になる — これは
-#   Phase 3 の F2 が解消した「LGTM キーワードが無ければ needs-director」
-#   問題を実質的に復活させるトレードオフだが、「危険な方向への誤判定を
-#   繰り返さない」という本 mission (safety-gate-hardening) の意図を汲んで
-#   意図的に選択した。将来的な改善余地は Result 参照 (--commit + 手動 diff
-#   取得 + --output-schema の組み合わせ等)。
+#   という fail-closed の原則は、t011 で [P#] タグ経路を廃止した後も
+#   変わらず継続している — 判定材料が「JSON findings 配列」1 つだけに
+#   絞られた点が変更点である。
 #
 #   t006 (mission 20260909-safety-gate-hardening) での更新: 上記 R-1 は
 #   「`--base` を使う限りタグを強制する手段が無い」ことを根拠に fail-closed
@@ -487,36 +483,57 @@ _info "Review output length: ${#REVIEW_CONTENT} chars"
 #   `codex exec review` (JSON を返さない) では休眠していたが、`--output-schema`
 #   移行でこの経路が本番化するため、JSON 経路に入る前に「出力がちょうど 1 つの
 #   JSON ドキュメントであること」を jq でゲートし、2 つ以上 (または 0、パース
-#   不能) の場合は JSON 経路そのものに入らず fail-closed 側 (下記 [P#] タグ
-#   判定 → 見つからなければ no-signal) に確実にフォールバックするようにした。
+#   不能) の場合は JSON 経路そのものに入らず fail-closed 側 (no-signal) に
+#   確実にフォールバックするようにした。
 #
-#   F-A (Seo 指摘, t007): [P#] タグ抽出 (下記 [P#] タグ判定分岐) が出力全体への
-#   無アンカー grep だったため、レビュー対象の diff/コードが (`kai-review.sh` /
-#   `test_kai_review.sh` 自身のように) 文字列 `[P3]` 等を含んでいて codex が
-#   それを地の文で引用しただけで `HAD_SIGNAL=1` が立ち、同じ出力中に散文で
-#   述べられた本物の critical finding が丸ごと無視されていた (実測:
-#   "...mentioning [P3] priority tags... critical data-loss bug..." →
-#   method=tags needs_fix=0 で auto-done)。R-1 (t001) で auto-done 経路が
-#   「JSON 空配列」と「[P#] タグ」の 2 本に絞られた結果、この偽造されうる
-#   トークンが auto-done への最安経路になっていた。タグ抽出を finding 行
-#   (行頭の箇条書きマーカーに続くタグ) にアンカーし、地の文への引用を
-#   拾わないようにした。取りこぼしは HAD_SIGNAL=0 → fail-closed に倒れるため
-#   安全側 (「どこを見るか」を 1 箇所に絞る = allowlist の scope を絞る)。
+#   F-A (Seo 指摘, t007): [P#] タグ抽出 (当時存在した [P#] タグ判定分岐) が
+#   出力全体への無アンカー grep だったため、レビュー対象の diff/コードが
+#   (`kai-review.sh` / `test_kai_review.sh` 自身のように) 文字列 `[P3]` 等を
+#   含んでいて codex がそれを地の文で引用しただけで `HAD_SIGNAL=1` が立ち、
+#   同じ出力中に散文で述べられた本物の critical finding が丸ごと無視されて
+#   いた (実測: "...mentioning [P3] priority tags... critical data-loss
+#   bug..." → method=tags needs_fix=0 で auto-done)。R-1 (t001) で auto-done
+#   経路が「JSON 空配列」と「[P#] タグ」の 2 本に絞られた結果、この偽造され
+#   うるトークンが auto-done への最安経路になっていた。t007 では「タグ抽出を
+#   finding 行 (行頭の箇条書きマーカーに続くタグ) にアンカーする」対処を
+#   採ったが、t009 QA の実測 (18 ケース) で **fenced コードブロック /
+#   インデント コードブロック内の bullet 形式の引用は依然として行頭アンカー
+#   に一致してしまう**ことが判明した (D2/D4)。最悪ケースでは codex が構造化
+#   JSON で報告した P0 finding が、地の文 + fenced 引用 + JSON の混在により
+#   JSON ドキュメントが 1 つに切り出せず F-B ゲートで tag fallback に落ち、
+#   引用された [P3] を拾って丸ごと捨てられた (自動承認) ことも実機で確認
+#   された。
 #
-#   洗い直しの結果 (入口・内側・fallback):
+#   t011 (mission 20260909-safety-gate-hardening): 「引用かどうか」は行単位
+#   では判別できないのに、判定 unit を行に置いたまま解決したつもりになって
+#   いた、という t009 QA の構造的な指摘を受け、コードブロックを剥がす前処理
+#   を追加する案ではなく **[P#] タグ経路そのものを削除する**方針を採った。
+#   前処理追加案は markdown パースの完全性に依存するため、同じ形の穴が別の
+#   引用形式 (ネストした fence、チルダ fence `~~~`、HTML `<pre>` 等) で再発
+#   する — 「表現の列挙で網羅するのは原理的に不可能」という、本 mission が
+#   F-1 → [P1]/t012 → [P2] → F-A → t009 で 5 回学んだ教訓そのものである。
+#   t006 以降 codex は `--output-schema` により schema 準拠の JSON を必ず
+#   返すため、タグ経路は「JSON 解析が失敗したときの fallback」という位置づけ
+#   以上の価値を持たなくなっていた。JSON 解析の失敗自体が異常であり、
+#   needs-director が正しい結論である。削除後、auto-done に到達する経路は
+#   「codex が単一 JSON ドキュメントを返し、`.findings` が配列で、denylist
+#   判定で危険な finding が 0 件」の 1 本だけになった (判定 unit を 1 つに
+#   絞る、という本 mission の中心原則の直接適用)。
+#
+#   現在の判定ロジック (入口・内側・fallback):
 #   - 入口: [P2] で修正済み。findings が配列でない限り JSON 経路に入らない。
 #     F-B (t006) で「JSON ドキュメントがちょうど 1 つであること」も追加ゲート。
 #   - 内側 (findings > 0 の denylist, t012): 未知の priority/severity・欠損・
 #     jq 自体の失敗はいずれも危険側 (NEEDS_FIX=1) に倒れることを確認済み。
 #   - jq 不在環境: jq が無ければ exit 127 で入口の `if` が false になり
-#     [P#] タグ判定へフォールバックするため安全。
-#   - fallback ([P#] タグ判定, F-A で行アンカー化): HAD_SIGNAL が「配列として
-#     JSON 判定できた」場合と「finding 行にアンカーされた [P#] タグが
-#     見つかった」場合のみ 1 になり、それ以外 (HAD_SIGNAL=0 — 地の文への
-#     引用しか無い場合も含む) は下記の通り無条件で needs-director に倒れる
-#     ため、fail-open な抜け道は無い。
+#     fail-closed 分岐 (no-signal) に落ちるため安全。
+#   - fallback (no-signal, t011 で [P#] タグ判定を削除): HAD_SIGNAL は
+#     「配列として JSON 判定できた」場合のみ 1 になり、それ以外
+#     (HAD_SIGNAL=0 — JSON 解析失敗・複数ドキュメント・codex 未起動・
+#     clean review でも JSON を返さなかった、等すべて) は下記の通り
+#     無条件で needs-director に倒れるため、fail-open な抜け道は無い。
 NEEDS_FIX=0
-JUDGE_METHOD="tags"
+JUDGE_METHOD="pending"
 HAD_SIGNAL=0
 
 # F-B (t006): 出力に含まれる JSON ドキュメント数を数える。ちょうど 1 つの
@@ -564,50 +581,31 @@ if [[ "$JSON_DOC_COUNT" -eq 1 ]] && FINDINGS_COUNT=$(printf '%s' "$REVIEW_CONTEN
   fi
   _info "Judged via structured JSON output (findings=${FINDINGS_COUNT}, unsafe_or_unclassified=${HIGH_COUNT})"
 else
-  # F-A (t007, Seo 指摘): 旧実装は `[P0]`-`[P3]` を出力全体に対して無アンカーで
-  # grep していたため、レビュー対象の diff/コードが (このファイル自身のように)
-  # 文字列 "[P3]" を含んでいて codex がそれを引用しただけで HAD_SIGNAL=1 が
-  # 立ち、同じ出力内で散文として述べられた本物の critical finding が丸ごと
-  # 無視されていた (実測: "The diff adds a comment mentioning [P3] priority
-  # tags... critical data-loss bug..." → 旧実装は method=tags needs_fix=0 で
-  # auto-done)。`kai-review.sh`/`test_kai_review.sh` 自身を触る PR の diff には
-  # `[P0]`-`[P3]` のリテラルが実際に含まれるため机上の話ではない。
-  #
-  # 対処: タグ抽出を finding 行 (行頭の箇条書きマーカーに続くタグ) にアンカー
-  # する。実測 fixture (p1_findings.txt / p0_findings.txt / tag_and_critical_keyword.txt)
-  # はいずれも `- [P#] <title> — <file>:<line>` の形式だったため、行頭の
-  # 任意の空白 + 任意の `-` 箇条書きマーカー + 任意の空白 + `[P#]` にアンカーする。
-  # 取りこぼしは HAD_SIGNAL=0 → fail-closed (R-1) に倒れて安全側なので、
-  # フォーマットの揺れには厳しい側に寄せる (「引用された [P#] を拾う」方向の
-  # 緩さは危険側なので許容しない)。
-  FINDING_LINES="$(echo "$REVIEW_CONTENT" | grep -iE '^[[:space:]]*-?[[:space:]]*\[P[0-3]\]' || true)"
-  P_TAGS="$(echo "$FINDING_LINES" | grep -oiE '\[P[0-3]\]' | tr '[:upper:]' '[:lower:]' | sort -u || true)"
-  if [[ -n "$P_TAGS" ]]; then
-    HAD_SIGNAL=1
-    if echo "$P_TAGS" | grep -qE '\[p[012]\]'; then
-      NEEDS_FIX=1
-    fi
-    _info "Judged via [P#] priority tags (anchored to finding lines): $(echo "$P_TAGS" | tr '\n' ' ')"
-  else
-    # タグが 1 つも無い場合は HAD_SIGNAL=0 のままにし、下の fail-closed 分岐に
-    # 委ねる (R-1)。行頭アンカーに一致しない (=引用や地の文にしか [P#] が
-    # 現れない) 場合もここに落ちる — 取りこぼしは安全側 (F-A)。
-    _info "No [P#] tags found anchored to a finding line in review output"
-  fi
+  # t011: [P#] タグ判定 (旧 F-A fallback) を削除した。JSON 経路に入れなかった
+  # 出力は理由を問わず HAD_SIGNAL=0 のままにし、下の fail-closed 分岐
+  # (no-signal → needs-director) に委ねる。[P#] タグは codex の地の文や
+  # fenced/インデント コードブロック内の引用にも現れ得るため、「引用かどうか」
+  # を行単位のアンカリングで判別しようとする設計自体が再発可能な穴だった
+  # (F-A → t009 QA FAIL)。判定 unit を JSON 経路 1 つに絞ることで、この種の
+  # 「引用に化けうるトークン」を根本から判定材料の対象外にする。
+  _info "No valid JSON findings array in review output (doc_count=${JSON_DOC_COUNT}) — no structured signal"
 fi
 
-# fail-closed (R-1): JSON findings 配列も [P#] タグも一切見つからなかった
-# (HAD_SIGNAL=0) 場合、内容に関わらず無条件で needs-director に倒す。
+# fail-closed (R-1, t011 で判定材料を JSON findings 配列 1 つに絞った):
+# JSON findings 配列が得られなかった (HAD_SIGNAL=0) 場合、内容に関わらず
+# 無条件で needs-director に倒す。
 # 旧実装 (F-3) はここで critical キーワード + 同一行否定語除外の散文
 # ヒューリスティクスを safety net として使っていたが、これ自体が「無関係な
 # 否定語が同一行にあると本物の critical finding を見逃す」欠陥 (R-1) の
-# 温床だった。HAD_SIGNAL=0 は「codex が指示に従わなかった/出力が壊れた/
-# API エラー/clean review でタグを出さなかった」のいずれかを意味し、いずれの
-# 場合も「安全と確認できた」わけではないため、危険な結論 (auto-done) の
-# allowlist には入れない。
+# 温床だった。さらに旧実装 (F-A, t007) は [P#] タグを fallback の判定材料と
+# していたが、「引用かどうか」を行単位で判別するのは原理的に不可能だったため
+# t011 で廃止した。HAD_SIGNAL=0 は「codex が JSON を返さなかった/出力が
+# 壊れた/API エラー/JSON が複数ドキュメントだった」のいずれかを意味し、
+# いずれの場合も「安全と確認できた」わけではないため、危険な結論
+# (auto-done) の allowlist には入れない。
 if [[ $HAD_SIGNAL -eq 0 ]]; then
   JUDGE_METHOD="no-signal"
-  _warn "No structured signal ([P#] tags or JSON findings array) found in review output — treating as needs-director (fail-closed, R-1)"
+  _warn "No structured JSON findings array found in review output — treating as needs-director (fail-closed, R-1/t011)"
   NEEDS_FIX=1
 fi
 

@@ -26,6 +26,8 @@ tags: [audit, dead-code, configuration, instructions]
 ### 4. hooks/ の deny/allow ルール
 宣言されたガードが実際の呼び出し経路で発火するか。dead code になっていないか。
 
+**【訂正・追記】** 上記4観点には `.github/workflows/`（CI 設定）が含まれていなかった。そのため「テストファイルが存在する」ことだけを確認し、CI で実際に実行されているかを検証していなかった。この scope 漏れにより tests/*.py (pytest 8本) が CI で一度も実行されていない事実を見落としていた（詳細: [E. Scope からの漏れ](#e-scope-からの漏れ---ciがテストを一度も実行していなかった)）。
+
 ---
 
 ## 監査結果
@@ -184,13 +186,13 @@ cd $R && git checkout origin/main && git checkout -b new-fix-branch
 
 ---
 
-### C. 不完全な検証
+### C. 修正済みの欠陥（監査時点では「未検証」としていたが、詳細検証の結果は危険側の実欠陥だった）
 
-#### C-1: CREWVIA_MUX / CREWVIA_MUX_ENABLED の優先順位ドキュメント
+#### C-1: CREWVIA_MUX / CREWVIA_MUX_ENABLED の優先順位 — 「未検証」ではなく実欠陥が2箇所あった。いずれも修正済み
 
-**状態**: 実装と CLAUDE.md 記載に齟齬の可能性（未検証）
+**状態（訂正）**: 本監査 (2026-09-09) 時点では「未検証・危険にはならない・LOW」と結論していたが、これは誤りだった。「後続検証候補」として詳細検証した結果、**docs の説明どおりに動いていない箇所が2箇所**見つかり、いずれも危険側（設定したのに並列モードに入らずインラインへ転落）だった。両方とも本ミッション内の別 task で修正済み。
 
-**宣言箇所**:
+**宣言箇所**（監査時点から変更なし）:
 - CLAUDE.md 環境変数表:
   ```
   CREWVIA_MUX: mux バックエンド選択: tmux / herdr。config `mode:` より優先
@@ -208,34 +210,39 @@ cd $R && git checkout origin/main && git checkout -b new-fix-branch
 - CREWVIA_MUX が設定されている場合、CREWVIA_MUX_ENABLED は無視される
 - CREWVIA_MUX が未設定の場合のみ CREWVIA_MUX_ENABLED が有効
 
-**実装検証** (scripts/start.sh:248-264):
+**実欠陥 1: scripts/start.sh の並列モードゲートが ROLE=worker で機能していなかった（修正済み: PR #196, merge commit `1581d11`）**
+
+- 並列モードを実際にゲートしていたのは `CREWVIA_MUX_ENABLED == 1` 判定 1 箇所のみだったが、`CREWVIA_MUX_ENABLED` を設定する処理は「ROLE=director かつ未設定」の対話選択ブロック内にしか無かった
+- そのため ROLE=worker では `CREWVIA_MUX=herdr/tmux` を明示していても `CREWVIA_MUX_ENABLED` が設定されず、ゲート判定でインラインモードに転落していた（docs が謳う「CREWVIA_MUX 設定済みなら不要」が worker 経路では成立していなかった）
+- 修正: ゲート判定の直前で実効値を解決 — `CREWVIA_MUX_ENABLED` の明示があれば最優先、未設定なら `CREWVIA_MUX` の有無にフォールバック
+- 回帰テスト: `tests/start-sh-mux-gate.bats`（ROLE=worker + CREWVIA_MUX=tmux + CREWVIA_MUX_ENABLED 未設定で並列モードに入ることを含む3ケース）
+
+**実欠陥 2: 呼び出し元の `./crewvia` ランチャが mode: tmux で `CREWVIA_MUX` を export していなかった（修正済み: PR #201, merge commit `a26b60a`）**
+
+- `./crewvia` は改名済みで誰も読まない旧変数 `CREWVIA_TMUX`（mission 20260907-tmux-name-cleanup で `CREWVIA_MUX_ENABLED` に改名済み）だけを export しており、`mode: tmux` / 不明値のケースで `CREWVIA_MUX` を export していなかった
+- `scripts/start.sh` の worker 起動ゲートは `CREWVIA_MUX` の有無で並列モードを決めるため、config を `mode: tmux` に戻すと `./crewvia worker` はインラインモードに落ちていた（PR #196 が start.sh 側を直しても、呼び出し元がそもそも `CREWVIA_MUX` を渡していなければ同じ症状が再発する構造）
+- 修正: `mode: tmux` / 不明値 → `CREWVIA_MUX=tmux` を export（herdr は従来通り）。`mode: inline` は `CREWVIA_MUX` を export しない。旧 `CREWVIA_TMUX` は値を参照せず、設定されていれば無視される旨の WARNING のみ出す
+- 回帰テスト: `tests/crewvia-launcher-mux-mode.bats`（mode 4通り × CREWVIA_MUX env 有無 × 旧 CREWVIA_TMUX env 有無。修正前は 10 件中 5 件が red、修正後は全 green）
+
+**倒れる方向**: 修正前は危険側（設定したのに並列モードに入らずインラインへ転落）。両修正の適用後は解消。
+
+**再現手順（検証済みの優先順位）**:
 ```bash
-MODE_FROM_CONFIG=$(grep -E '^mode:[[:space:]]*\S' "$CONFIG_FILE" 2>/dev/null | awk '{print $2}' | tr -d '"' | head -1)
-if [[ "$MODE_FROM_CONFIG" == "herdr" ]]; then
-  export CREWVIA_MUX=herdr
-  export CREWVIA_MUX_ENABLED=1
-```
+# 1. scripts/start.sh のゲート判定 (修正後: 24-29行のコメント参照)
+git show 1581d11 -- scripts/start.sh
 
-コード側の確認:
-- config から mode: を読む
-- その前に CREWVIA_MUX env var がチェックされるか？ → **詳細検証必要**（未検証項目）
+# 2. ./crewvia ランチャの export 分岐 (修正後)
+git show a26b60a -- crewvia
 
-**倒れる方向**: 未検証（推測域）
-
-**再現手順**:
-```bash
-# start.sh の行順を追跡
-grep -n "CREWVIA_MUX\|CREWVIA_MUX_ENABLED" scripts/start.sh | head -20
-
-# 優先順位が明確か確認
-# 1. env var CREWVIA_MUX が優先されるか？
-# 2. config mode が次か？
-# 3. CREWVIA_MUX_ENABLED がその次か？
+# 優先順位（両修正適用後、実装で確認済み）:
+# 1. env の CREWVIA_MUX_ENABLED 明示（0 も含め最優先。start.sh ゲート）
+# 2. env の CREWVIA_MUX 明示（config より優先。crewvia ランチャ / start.sh フォールバック双方）
+# 3. config/crewvia.yaml の mode:（crewvia ランチャが CREWVIA_MUX に変換）
 ```
 
 **注記**:
-- 実装されており動作しているが、env var 優先順位の詳細な検証は scope 外
-- 複数の情報源（CLAUDE.md 表 vs config ファイル vs scripts）で説明があり、一貫性確認が必要
+- 本節は Director の要約ではなく `git show 1581d11` / `git show a26b60a` の実 diff とコミットメッセージに基づく
+- 監査時点の「未検証・低・LOW」という結論自体が本監査の同型欠陥（宣言と実装の食い違いを検証せずに楽観側で評価した）に該当する
 
 ---
 
@@ -287,6 +294,64 @@ grep "NTFY_USER\|NTFY_PASS" scripts/start.sh
 
 ---
 
+### E. Scope からの漏れ — CI がテストを一度も実行していなかった
+
+**状態**: 本監査の scope（config/*.yaml, agents/*.md, CLAUDE.md, hooks/ の4観点。「監査対象と観点」節参照）に `.github/workflows/` が含まれておらず、CI が実際に何を実行しているかを見ないまま「テストはある」で済ませていた。これも「宣言（テストファイルが存在する）≠ 実装（CI で実行される）」という本監査と同型の欠陥。
+
+#### E-1: `tests/*.py` (pytest 8本) が CI で一度も実行されていなかった（修正済み: PR #200 / t006, merge commit `abcd434`）
+
+**宣言箇所**: `tests/test_*.py` 8ファイル（163 テストケース）が存在
+
+**実際の状態（監査時点）**: `.github/workflows/ci.yml` には bats (`tests/*.bats`) と `scripts/test_handoff_path.sh` / `scripts/test_registry_lock.sh` を実行するジョブしかなく、pytest を実行するジョブが無かった。163件のテストコードは書かれていたが CI では一度も走っていなかった（ローカルで手動実行しない限り regression を検知できない状態）。
+
+**修正**: `.github/workflows/ci.yml` に `pytest` ジョブを追加（`actions/setup-python@v5` (3.12) → `pip install pytest pyyaml` → `python3 -m pytest tests/ -v`）。`continue-on-error` 等は使っておらず、テスト失敗はそのまま job 失敗になる。163件 collect / 163件 pass を確認済み（PR #200 本文）。
+
+**倒れる方向**: 危険側（regression が CI で検知されずに merge される）。修正後は解消。
+
+#### E-2: `scripts/test_*.sh` は 21本中 2本しか CI で実行されていない（未対応・open）
+
+**宣言箇所**: `scripts/test_*.sh` 21本（bash による回帰テスト群）
+
+**実際の状態**: main `1e8be200e61d952884b294d75d7c93798e246e28` 時点（PR #200 棚卸し時点。#199 の merge で本数が変わり得るため commit hash を明記する）で CI 実行中なのは `test_handoff_path.sh` / `test_registry_lock.sh` の2本のみ。残り19本は静的調査（各ファイルの grep + 抜粋読み。実行しての検証はしていない）では概ね外部バイナリ不要に見えるが、CI には追加されていない。PR #200 の棚卸し表（t008 レビューで #9 `test_phase_e.sh` の外部依存記述を Upstash Redis REST に訂正済み）を引用する:
+
+| # | ファイル | CI実行中 | CI実行可能性(簡易調査) | 外部依存 |
+|---|---|---|---|---|
+| 1 | test_blocked_by_guard.sh | – | 可能 | なし (plan.sh ロジックのみ) |
+| 2 | test_dispatcher_notify.sh | – | 可能 | なし (tmux はコメント中のみ、実spawnなし) |
+| 3 | test_handoff_path.sh | ✅ | (実行中) | git worktree (実行、CI で問題なし) |
+| 4 | test_hooks.sh | – | 可能 | curl は接続失敗ケースのテストのみ (127.0.0.1:19999 へ) |
+| 5 | test_kai_review.sh | – | 可能 | gh/codex は FAKE_BIN_DIR でスタブ化済み、実バイナリ不要 |
+| 6 | test_main_repo_git_guard.sh | – | 可能 | `git worktree add` は hook 判定用の入力文字列 (実際には作らない) |
+| 7 | test_normalize_plan_review_verdict.sh | – | 可能 | なし |
+| 8 | test_phase_c.sh | – | **不可** | 実ネットワーク (`https://ntfy.elni.net`) + localhost dev server 必須 |
+| 9 | test_phase_e.sh | – | **不可** | Upstash Redis REST (`UPSTASH_REDIS_REST_URL`/`TOKEN` 必須) + localhost:3000 dev server 必須 (ntfy は不使用。t008 レビューで訂正) |
+| 10 | test_plan_reason_frontmatter.sh | – | 可能 | なし |
+| 11 | test_plan_review_cycle_refund.sh | – | 可能 | なし |
+| 12 | test_plan_review_write_guard.sh | – | 可能 | なし (codex はコメント中のみ) |
+| 13 | test_pr181_review_fixes.sh | – | 可能 | ローカル python ソケットサーバーのみ (外部ネットワーク不要) |
+| 14 | test_registry_lock.sh | ✅ | (実行中) | なし |
+| 15 | test_review_plan_director_identity.sh | – | 可能 | claude CLI は FAKE_BIN_DIR でスタブ化、herdr は到達不能 socket で意図的 fallback |
+| 16 | test_review_plan_model.sh | – | 可能 | 同上 (claude スタブ化) |
+| 17 | test_review_plan_pane_leak.sh | – | 可能 | claude CLI 起動せず (ファイル自身の注記あり) |
+| 18 | test_task_file_write_guard.sh | – | 可能 | gh/codex は hook 判定用の入力文字列のみ |
+| 19 | test_wait_for_plan_review.sh | – | 可能 | claude CLI 起動せず (ファイル自身の注記あり) |
+| 20 | test_watchdog_config_mode.sh | – | 可能 | herdr/tmux は mode 文字列パースのテストのみ、実 spawn なし |
+| 21 | test_worktree_edit_guard.sh | – | 可能 | git worktree は実際には作らない方針 (ファイル自身の注記あり) |
+
+CI実行不可と判定: 2本 (`test_phase_c.sh`, `test_phase_e.sh` — 実ネットワーク + localhost dev server 必須)。残り19本は CI 追加の候補だが未着手（本 task の scope 外。CI 追加は Director が別途判断）。
+
+**倒れる方向**: 危険側（19本の回帰テストが regression を検知できない状態のまま残っている）。**未対応 — この audit doc 上は open のまま**。
+
+**再現手順**:
+```bash
+ls scripts/test_*.sh | wc -l   # 21
+grep -n "test_handoff_path.sh\|test_registry_lock.sh\|pytest" .github/workflows/ci.yml
+```
+
+**原因（scope 漏れ）**: 本監査の「監査対象と観点」節（1. config/*.yaml、2. agents/*.md、3. CLAUDE.md、4. hooks/）に CI 設定 (`.github/workflows/`) が含まれていなかったため、テストファイルの存在確認だけで「テストはある」と判断し、CI で実際に実行されているかを検証していなかった。
+
+---
+
 ## 優先度マトリクス
 
 | ID | 項目 | 倒れる方向 | 影響度 | 優先度 |
@@ -294,8 +359,10 @@ grep "NTFY_USER\|NTFY_PASS" scripts/start.sh
 | A-1 | verification-profiles.yaml | 安全側 | 低（未実装機能） | LOW |
 | A-2 | autonomous-improvement.yaml | 安全側 | 中（指示と実装ギャップ） | MEDIUM |
 | B-1 | worktree edit ガード Bash抜け道 | 危険側 | 高（t009/t011 過去事故） | HIGH |
-| C-1 | CREWVIA_MUX 優先順位 | 未検証 | 低（実装動作中） | LOW ※検証必要 |
+| C-1 | CREWVIA_MUX 優先順位 | 危険側（修正済み） | 高（並列モードが無効化していた） | 修正済み（PR #196, #201） |
 | D-1 | NTFY 認証情報設定 | 安全側 | 低（設計OK） | - |
+| E-1 | pytest が CI 未実行 | 危険側（修正済み） | 高（163件が regression 検知不能だった） | 修正済み（PR #200） |
+| E-2 | scripts/test_*.sh 19本が CI 未実行 | 危険側 | 中〜高（未検証） | 未対応（open） |
 
 ---
 
@@ -303,9 +370,8 @@ grep "NTFY_USER\|NTFY_PASS" scripts/start.sh
 
 以下は audit scope 外だが、Director の次ミッション判断時に検討すること：
 
-1. **C-1 優先順位検証**: CREWVIA_MUX 環境変数と config mode の正確な優先順位確認
-   - 実装: scripts/start.sh:224-290
-   - 検証方法: tmux/herdr の並列モード選択フローを step-by-step trace
+1. ~~**C-1 優先順位検証**: CREWVIA_MUX 環境変数と config mode の正確な優先順位確認~~
+   - **完了**: mission 20260912-verdict-ci-launcher で検証・修正済み（PR #196 merge commit `1581d11`, PR #201 merge commit `a26b60a`）。詳細は [C-1](#c-1-crewvia_mux--crewvia_mux_enabled-の優先順位--未検証ではなく実欠陥が2箇所あった-いずれも修正済み) 参照
 
 2. **A-2 autonomous-improvement.yaml 実装検討**:
    - Option 1: Worker が手動判定する現状を保持し、ドキュメント確認
@@ -316,6 +382,8 @@ grep "NTFY_USER\|NTFY_PASS" scripts/start.sh
    - verifier.md の指示とコード実装が不在
    - 実装予定があるか確認し、無いなら削除 or タスク化
 
+4. **E-2 scripts/test_*.sh 19本の CI 追加**: 静的調査上は外部バイナリ不要に見える19本を CI に追加するか判断。実行しての検証はしていないため、追加時に想定外の失敗が出る可能性はある
+
 ---
 
 ## まとめ
@@ -323,8 +391,10 @@ grep "NTFY_USER\|NTFY_PASS" scripts/start.sh
 ### 発見件数
 - **Dead config**: 2 件（verification-profiles.yaml, autonomous-improvement.yaml 実装部）
 - **Partial dead / 限界あり**: 1 件（worktree edit ガード Bash 抜け道）
-- **未検証**: 1 件（CREWVIA_MUX 優先順位）
+- **修正済み**: 2 件（CREWVIA_MUX 優先順位 [C-1] — PR #196/#201、pytest CI 未実行 [E-1] — PR #200）
+- **未対応 (open)**: 1 件（scripts/test_*.sh 19本の CI 未実行 [E-2]）
 - **健全**: 1 件（NTFY 認証情報 env 優先）
+- **scope 漏れの訂正**: 監査対象の4観点に `.github/workflows/` が含まれておらず、CI 未実行の finding (E-1/E-2) を当初見落としていた
 
 ### t001-t004 との共通パターン
 
@@ -338,15 +408,26 @@ grep "NTFY_USER\|NTFY_PASS" scripts/start.sh
 3. **設計健全（env > config）だが指示ドキュメント曖昧**: NTFY 認証情報
    - 実装は正しいが、CLAUDE.md で「config に書かない」と明記されていない
 
+4. **「未検証」の楽観評価も同型欠陥になり得る**: C-1 は監査時点で「未検証・低・LOW」と結論したが、実際には危険側の実欠陥が2箇所あった。「効いているように見える／確認していないが低リスクだろう」という評価そのものが t001-t004 と同じ「検証せずに安全側だと仮定する」パターンに該当する
+
+5. **scope 設計に監査対象を検証する経路 (CI) が抜けていた**: E-1/E-2 はテストファイルの存在確認だけで「テストはある」と判断し、CI で実行されているかを見ていなかった。宣言（テストコード）と実装（CI 実行）のギャップという点で A-1/A-2 と同型
+
 ### 次アクション
 
 - **HIGH**: B-1 worktree edit ガード Bash 抜け道を次ミッションで検討（PR #180 検討対象か）
 - **MEDIUM**: A-2 autonomous-improvement.yaml 実装 OR 指示確認・修正
+- **MEDIUM**: E-2 scripts/test_*.sh 19本の CI 追加を次ミッションで検討
 - **LOW**: A-1 verification-profiles.yaml の方針確認（実装か削除か）
-- **LOW**: C-1 CREWVIA_MUX 優先順位を詳細検証
+- ~~**LOW**: C-1 CREWVIA_MUX 優先順位を詳細検証~~ → **完了**（PR #196, #201 で修正済み）
 
 ---
 
 **監査者**: Haiku 4.5  
 **監査日**: 2026-09-09  
 **対象リポジトリ**: crewvia (main 8df15a3)
+
+---
+
+**訂正・追記者**: Mei（Sonnet 5）  
+**訂正日**: 2026-09-12（mission 20260912-verdict-ci-launcher, t012）  
+**訂正内容**: C-1 の結論を「未検証・低・LOW」から「実欠陥2箇所・修正済み」に訂正（PR #196 merge commit `1581d11`, PR #201 merge commit `a26b60a`）。CI がテストを実行していない finding (E-1 pytest / E-2 scripts/test_*.sh) を追加。監査対象の4観点に `.github/workflows/` が含まれていなかった scope 漏れを明記。

@@ -125,6 +125,11 @@ cp "$REAL_REVIEW_PLAN" "$TMPDIR_TEST/scripts/review-plan.sh"
 # scripts/lib_model.py と config/crewvia.yaml を必須で読むようになった。
 cp "${SCRIPT_DIR}/lib_model.py" "$TMPDIR_TEST/scripts/"
 cp "$(dirname "$SCRIPT_DIR")/config/crewvia.yaml" "$TMPDIR_TEST/config/"
+# t020 (mission 20260912-verdict-ci-launcher): Case 1-3 と同じ兆候なしスタブを置く。
+# schema 不在のフォールバック経路もプローズを 3 状態で分類するようになり、
+# lib_verdict.py が無い (rc 2) と書式違反扱いで exit 1 になる。このケースは
+# mux_kill だけを見るため、review-plan.sh の終了コードには依存させない。
+printf '%s\n' 'import sys' 'sys.exit(10)' > "$TMPDIR_TEST/scripts/lib_verdict.py"
 KILL_LOG="$TMPDIR_TEST/mux_kill.log"
 : > "$KILL_LOG"
 cat > "$TMPDIR_TEST/scripts/lib_mux.sh" << EOF
@@ -147,7 +152,9 @@ CHILD_PID=$!
 # wait_for_plan_review.sh の sleep に入っているタイミングを見計らって SIGTERM
 sleep 1
 kill -TERM "$CHILD_PID" 2>/dev/null || true
-wait "$CHILD_PID" 2>/dev/null
+# _run_case が残した set -e の下で、子の終了コードが非 0 だと grep の前に
+# このテスト自体が無言で終了していた (t020 で実測)。
+wait "$CHILD_PID" 2>/dev/null || true
 if grep -q '^killed:' "$KILL_LOG"; then
   pass "SIGTERM 中断 → mux_kill called via trap (F4 fix, no pane leak)"
 else

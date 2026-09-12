@@ -45,6 +45,18 @@
 #        plan.sh を置いてこのスクリプト自身を --verify-red で実行し、
 #        本体の失敗が非 0 終了に反映されることを確認する。
 #
+# t020 (PR #199 fix 4) 追記:
+#   本体: 兆候なし × structured=approve は refund (ユーザー決定。RESCUE は挙動変更) /
+#         schema 不在・不正・jq 不在でも revise・reject を確定 (FB_*) /
+#         schema を pane のコマンド文字列に安全に渡す (SQ_*、コマンド文字列を bash -c で実行) /
+#         旧パスの古い approve envelope を読まない (LOG_stale) /
+#         違反 × structured=revise も救済しない (B_k*r)
+#   --verify-red: a9f2ba3 (t018) で上の危険側 (ready/approve・revise 未確定・注入の実行・
+#         古い approve の束縛) が再現することを確認する
+#   呼び出し側の変数 (関数呼び出しの前置代入で渡す): CASE_SCHEMA_MODE
+#   (missing|invalid|nojq|hostile) / CASE_SPAWN_MODE (exec|stale_old_path) /
+#   CASE_INJECTION_EXPECT (none|reproduced)
+#
 # 環境変数 (主にメタテスト用):
 #   BINDING_E2E_GIT_REPO     脆弱版を取り出す git リポジトリ (既定: このスクリプトのリポジトリ)
 #   BINDING_E2E_CASE_FILTER  ラベルに対する正規表現。指定時は一致するケースだけ実行
@@ -66,6 +78,7 @@ VERIFY_RED=0
 # 脆弱版として固定する commit (PR #199 の履歴上の実在 commit)。
 RED_SHA_T002="3388334"   # t002: TOCTOU / envelope / CR が未修正
 RED_SHA_T015="b21d4b4"   # t015: 自己矛盾・書式違反を構造化出力で救済してしまう
+RED_SHA_T018="a9f2ba3"   # t018: 兆候なし × approve の救済 / schema 不在時に確定しない / schema の引用 / 旧パスのログ
 
 # 本番の mux / queue / Taskvia に触れないための保険 (呼び出し側でも env -u すること)。
 unset CREWVIA_MUX CREWVIA_MUX_ENABLED CREWVIA_TMUX HERDR_ENV TMUX CREWVIA_REPO_ROOT \
@@ -125,6 +138,8 @@ _run_case() {
   mkdir -p "$T/scripts" "$T/config" "$T/stubbin"
   export CREWVIA_QUEUE="$T/queue"
 
+  local schema_mode="${CASE_SCHEMA_MODE:-}" spawn_mode="${CASE_SPAWN_MODE:-}" inj_expect="${CASE_INJECTION_EXPECT:-}"
+
   local f
   for f in lint_plan.py lib_verdict.py lib_model.py wait_for_plan_review.sh review-plan.sh; do
     if ! cp "$src/scripts/$f" "$T/scripts/"; then
@@ -143,10 +158,13 @@ _run_case() {
   local spawn_marker="$T/stub_mux_spawn_called"
   local binary_marker="$T/stub_binary_called"
   local pid_file="$T/review_plan_pid"
+  local log_path_file="$T/review_plan_log_path"
+  local schema_path="$T/config/plan-review-verdict.schema.json"
 
   printf '%s\n' "$initial_prose" > "$T/initial_prose"
   [[ -n "$rewrite_prose" ]] && printf '%s\n' "$rewrite_prose" > "$T/rewrite_prose"
   [[ -n "$log_body" ]] && printf '%s\n' "$log_body" > "$T/log_body"
+  printf '%s\n' "$RESULT_JSON_APPROVE" > "$T/stale_body"
 
   local b
   for b in claude herdr tmux; do
@@ -154,23 +172,76 @@ _run_case() {
     chmod +x "$T/stubbin/$b"
   done
 
+  # t020: schema の差し替え (CASE_SCHEMA_MODE)。
+  #   missing / invalid / nojq — Kai-codex 3 回目 #1 (schema を使えない経路)
+  #   hostile — Kai-codex 3 回目 #2。$comment にアポストロフィ 2 個・$(...)・
+  #             バッククォートを入れる (個数を偶数にして、引用が壊れた版でも
+  #             構文エラーにならず注入が実際に実行される形にする)
+  case "$schema_mode" in
+    missing) rm -f "$schema_path" ;;
+    invalid) printf '{"type": "object", "properties": \n' > "$schema_path" ;;
+    nojq)
+      printf '#!/usr/bin/env bash\nexit 127\n' > "$T/stubbin/jq"
+      chmod +x "$T/stubbin/jq"
+      ;;
+    hostile)
+      python3 - "$schema_path" "$T/inj_dollar" "$T/inj_backtick" << 'PY'
+import json, sys
+path, m1, m2 = sys.argv[1:4]
+with open(path, encoding="utf-8") as f:
+    schema = json.load(f)
+schema["$comment"] = f"it' $(touch {m1}) `touch {m2}` '"
+with open(path, "w", encoding="utf-8") as f:
+    json.dump(schema, f, ensure_ascii=False)
+PY
+      ;;
+  esac
+  # exec モードの claude スタブ: 受け取った argv を記録し、ログ本文を出力する
+  # (claude の代わりに pane のコマンド文字列の中で実際に起動される)。
+  if [[ "$spawn_mode" == "exec" ]]; then
+    cat > "$T/stubbin/claude" << EOF
+#!/usr/bin/env bash
+printf '%s\0' "\$@" > "${T}/claude_argv"
+[[ -f "${T}/log_body" ]] && cat "${T}/log_body"
+exit 0
+EOF
+    chmod +x "$T/stubbin/claude"
+  fi
+
   # スタブ lib_mux.sh。mux_* は sourced function として review-plan.sh 自身の
-  # プロセスで実行されるため、中の $$ は review-plan.sh の PID
-  # (= PLAN_REVIEWER_LOG の実際のパス) と一致する。
+  # プロセスで実行されるため、中の $$ は review-plan.sh の PID と、
+  # $PLAN_REVIEWER_LOG は review-plan.sh が実際に読むログのパスと一致する
+  # (t020: ログは mktemp の実行専用ファイルになったため、パスを推測せず変数を使う)。
+  # CASE_SPAWN_MODE (t020):
+  #   exec           — 渡されたコマンド文字列 ($2) を bash -c でそのまま実行する (#2)
+  #   stale_old_path — 旧パス /tmp/plan_reviewer_$$.log に古い success envelope
+  #                    (approve) を置き、今回のログには何も書かない = pane の
+  #                    コマンドが tee より前に失敗した状態 (#3)
   cat > "$T/scripts/lib_mux.sh" << EOF
 mux_available() { return 0; }
 mux_spawn() {
   touch "${spawn_marker}"
   echo "\$\$" > "${pid_file}"
+  echo "\$PLAN_REVIEWER_LOG" > "${log_path_file}"
   cp "${T}/initial_prose" "${review_output}.stubtmp" && mv "${review_output}.stubtmp" "${review_output}"
-  if [[ -f "${T}/log_body" ]]; then
-    if [[ "${log_delay}" -gt 0 ]]; then
-      ( sleep ${log_delay}; cp "${T}/log_body" "/tmp/plan_reviewer_\$\$.log.stubtmp" && mv "/tmp/plan_reviewer_\$\$.log.stubtmp" "/tmp/plan_reviewer_\$\$.log" ) &
-      disown 2>/dev/null || true
-    else
-      cp "${T}/log_body" "/tmp/plan_reviewer_\$\$.log"
-    fi
-  fi
+  case "${spawn_mode}" in
+    exec)
+      bash -c "\$2" > "${T}/pane_output" 2>&1
+      ;;
+    stale_old_path)
+      cp "${T}/stale_body" "/tmp/plan_reviewer_\$\$.log"
+      ;;
+    *)
+      if [[ -f "${T}/log_body" ]]; then
+        if [[ "${log_delay}" -gt 0 ]]; then
+          ( sleep ${log_delay}; cp "${T}/log_body" "\$PLAN_REVIEWER_LOG.stubtmp" && mv "\$PLAN_REVIEWER_LOG.stubtmp" "\$PLAN_REVIEWER_LOG" ) &
+          disown 2>/dev/null || true
+        else
+          cp "${T}/log_body" "\$PLAN_REVIEWER_LOG"
+        fi
+      fi
+      ;;
+  esac
   return 0
 }
 mux_kill() {
@@ -213,6 +284,33 @@ EOF
   [[ -z "$expect_verdict" ]] && expect_cycle=0
   [[ "$cycle" == "$expect_cycle" ]] || problems+=("cycle_count=$cycle (expected $expect_cycle)")
 
+  # t020 (#2): CASE_INJECTION_EXPECT=none なら「注入が実行されず、claude が
+  # --json-schema の直後に schema (jq -c) とバイト単位で同じ 1 引数を受け取った」、
+  # reproduced なら「注入が実行された」(= 脆弱版の再現) を要求する。
+  if [[ -n "$inj_expect" ]]; then
+    local injected="no" schema_arg
+    [[ -e "$T/inj_dollar" || -e "$T/inj_backtick" ]] && injected="yes"
+    jq -c . "$schema_path" > "$T/expected_schema_arg" 2>/dev/null
+    schema_arg="$(python3 - "$T/claude_argv" "$T/expected_schema_arg" << 'PY'
+import sys
+try:
+    argv = open(sys.argv[1], "rb").read().split(b"\0")[:-1]
+except FileNotFoundError:
+    print("claude-not-called"); sys.exit(0)
+want = open(sys.argv[2], "rb").read().rstrip(b"\n")
+i = argv.index(b"--json-schema") if b"--json-schema" in argv else -1
+print("exact" if want and 0 <= i < len(argv) - 1 and argv[i + 1] == want else "mismatch")
+PY
+)"
+    if [[ "$inj_expect" == "none" ]]; then
+      [[ "$injected" == "no" ]] || problems+=("shell injection from the schema was executed")
+      [[ "$schema_arg" == "exact" ]] || problems+=("claude --json-schema argument: $schema_arg (pane output: $(head -c 300 "$T/pane_output" 2>/dev/null))")
+    else
+      [[ "$injected" == "yes" ]] || problems+=("injection was NOT reproduced (schema argument: $schema_arg)")
+    fi
+    echo "    injection executed=$injected, claude --json-schema argument=$schema_arg"
+  fi
+
   if [[ -n "$PINNED_SHA" ]]; then
     local pair path executed want got under_test
     for pair in \
@@ -241,6 +339,9 @@ EOF
 
   if [[ -f "$pid_file" ]]; then
     rm -f "/tmp/plan_reviewer_$(cat "$pid_file").log"
+  fi
+  if [[ -s "$log_path_file" ]]; then
+    rm -f "$(cat "$log_path_file")"
   fi
   _cleanup_dir "$T"
   unset CREWVIA_QUEUE
@@ -336,11 +437,63 @@ _run_case "VIOL_NOSTRUCT: B_k1 + structured 無し → drafting/null" \
   "$PROSE_K1" '' '' 0 "drafting" ""
 
 echo ""
-echo "--- t018: 救済と正常系は残る ---"
-_run_case "RESCUE: 兆候なしの別表記 (## 総合判定: GO) + structured=approve → ready/approve" \
-  $'# Plan Review: testmission\n\n## 総合判定: GO' '' "$RESULT_JSON_APPROVE" 0 "ready" "approve"
+echo "--- t018 の不変条件を revise でも確認 (t020: approve の救済を廃止したため、structured=approve だけでは「兆候があれば救済しない」の回帰を検出できない) ---"
+_run_case "B_k1r: 1行目 revise + 本文に approve + structured=revise → drafting/null" \
+  "$PROSE_K1" '' "$RESULT_JSON_REVISE" 0 "drafting" ""
+_run_case "B_k2r: 1行目 approve + 本文に revise + structured=revise → drafting/null" \
+  "$PROSE_K2" '' "$RESULT_JSON_REVISE" 0 "drafting" ""
+_run_case "B_k4r: '**Verdict:** REVISE' + structured=revise → drafting/null" \
+  "$PROSE_K4" '' "$RESULT_JSON_REVISE" 0 "drafting" ""
+
+echo ""
+echo "--- t018: 救済と正常系は残る (t020: 救済は revise / reject に限る) ---"
+# t020 挙動変更 (ユーザー決定により approve 救済を廃止): t018 ではこの入力が ready/approve だった。
+_run_case "RESCUE: 兆候なしの別表記 (## 総合判定: GO) + structured=approve → drafting/null (t020: approve は救済しない)" \
+  $'# Plan Review: testmission\n\n## 総合判定: GO' '' "$RESULT_JSON_APPROVE" 0 "drafting" ""
 _run_case "RESCUE_REVISE: 兆候なしの別表記 + structured=revise → drafting/revise" \
   $'# Plan Review: testmission\n\n## 総合判定: 要修正' '' "$RESULT_JSON_REVISE" 0 "drafting" "revise"
+
+# t020 のケース。本体スイートと --verify-red (a9f2ba3) の両方で使う。
+PROSE_N_JA='判定: revise'
+PROSE_N_RATIO=$'**Verdict∶** revise'
+PROSE_N_CYR=$'**Vеrdict:** revise'
+PROSE_N_ALT=$'# Plan Review: testmission\n\n## 総合判定: GO'
+
+echo ""
+echo "--- t020 (1, ユーザー決定 / QA t019 残余): 兆候の定義の外の revise 表記 + structured=approve → ready にならず refund ---"
+_run_case "N_ja: '判定: revise' + structured=approve → drafting/null" \
+  "$PROSE_N_JA" '' "$RESULT_JSON_APPROVE" 0 "drafting" ""
+_run_case "N_ratio: '**Verdict∶** revise' (U+2236) + structured=approve → drafting/null" \
+  "$PROSE_N_RATIO" '' "$RESULT_JSON_APPROVE" 0 "drafting" ""
+_run_case "N_cyr: '**Vеrdict:** revise' (キリル文字の е) + structured=approve (1秒遅延) → drafting/null" \
+  "$PROSE_N_CYR" '' "$RESULT_JSON_APPROVE" 1 "drafting" ""
+
+echo ""
+echo "--- t020 (#1, Kai-codex 3 回目): schema を使えない経路でも revise / reject は確定し、approve は成立しない ---"
+CASE_SCHEMA_MODE=missing _run_case "FB_missing: schema 不在 + 1行目 revise → drafting/revise" \
+  '**Verdict:** revise' '' '' 0 "drafting" "revise"
+CASE_SCHEMA_MODE=invalid _run_case "FB_invalid: schema が不正な JSON + 1行目 reject → drafting/reject" \
+  '**Verdict:** reject' '' '' 0 "drafting" "reject"
+CASE_SCHEMA_MODE=nojq _run_case "FB_nojq: jq を実行できない + 1行目 revise → drafting/revise" \
+  '**Verdict:** revise' '' '' 0 "drafting" "revise"
+CASE_SCHEMA_MODE=missing _run_case "FB_approve: schema 不在 + 1行目 approve → drafting/null (構造化出力が無いので approve は成立しない)" \
+  '**Verdict:** approve' '' '' 0 "drafting" ""
+CASE_SCHEMA_MODE=missing _run_case "FB_toctou: schema 不在 + revise → kill 中に approve へ再Write → drafting/null (停止確認後に読む)" \
+  '**Verdict:** revise' '**Verdict:** approve' '' 0 "drafting" ""
+CASE_SCHEMA_MODE=missing _run_case "FB_violation: schema 不在 + B_k1 → drafting/null" \
+  "$PROSE_K1" '' '' 0 "drafting" ""
+
+echo ""
+echo "--- t020 (#2, Kai-codex 3 回目): schema を pane のコマンド文字列に安全に渡す (コマンド文字列を実際に bash で実行) ---"
+CASE_SPAWN_MODE=exec CASE_INJECTION_EXPECT=none _run_case "SQ_real: 本物の schema (日本語入り) + revise → drafting/revise、claude が schema をバイト単位で受け取る" \
+  '**Verdict:** revise' '' "$RESULT_JSON_REVISE" 0 "drafting" "revise"
+CASE_SCHEMA_MODE=hostile CASE_SPAWN_MODE=exec CASE_INJECTION_EXPECT=none _run_case "SQ_hostile: schema に ' / \$(...) / バッククォート + revise → 注入されず drafting/revise" \
+  '**Verdict:** revise' '' "$RESULT_JSON_REVISE" 0 "drafting" "revise"
+
+echo ""
+echo "--- t020 (#3, Kai-codex 3 回目): 旧パスに古い approve envelope + pane のコマンドが tee 前に失敗 → 束縛しない ---"
+CASE_SPAWN_MODE=stale_old_path _run_case "LOG_stale: 旧パスの古い approve + 今回のログ無し + 兆候なしの別表記 → drafting/null" \
+  "$PROSE_N_ALT" '' '' 0 "drafting" ""
 _run_case "NORMAL: 1行目 approve のみ + 雛形の注記 '(verdict が…)' + structured=approve (1秒遅延) → ready/approve" \
   $'**Verdict:** approve\n\n# Plan Review: testmission\n\n## Issues\n(verdict が revise/reject の場合のみ記載)' '' "$RESULT_JSON_APPROVE" 1 "ready" "approve"
 
@@ -459,6 +612,35 @@ if [[ "$VERIFY_RED" -eq 1 ]]; then
     fail "[RED $RED_SHA_T015] could not extract pinned revision $RED_SHA_T015 from $GIT_REPO (git archive failed or commit missing)"
   fi
   _cleanup_dir "$RED_ROOT_T015"
+
+  # --- a9f2ba3 (t018) ---
+  RED_ROOT_T018="/tmp/crewvia-test-verdict-binding-red-t018-$$"
+  if FULL_T018="$(_prepare_pinned_root "$RED_SHA_T018" "$RED_ROOT_T018")"; then
+    echo "  pinned $RED_SHA_T018 = $FULL_T018 (extracted with git archive into $RED_ROOT_T018)"
+    SRC_ROOT="$RED_ROOT_T018"
+    PINNED_SHA="$FULL_T018"
+    # 1 (ユーザー決定): 兆候なし × structured=approve が救済されて ready/approve になる
+    _run_case "[RED $RED_SHA_T018] N_ja ('判定: revise' + structured=approve) must reproduce ready/approve" \
+      "$PROSE_N_JA" '' "$RESULT_JSON_APPROVE" 0 "ready" "approve"
+    _run_case "[RED $RED_SHA_T018] N_ratio ('**Verdict∶** revise' + structured=approve) must reproduce ready/approve" \
+      "$PROSE_N_RATIO" '' "$RESULT_JSON_APPROVE" 0 "ready" "approve"
+    _run_case "[RED $RED_SHA_T018] N_cyr ('**Vеrdict:** revise' + structured=approve) must reproduce ready/approve" \
+      "$PROSE_N_CYR" '' "$RESULT_JSON_APPROVE" 1 "ready" "approve"
+    # #1: schema を使えない経路では 1 行目 revise でも確定しない (refund)
+    CASE_SCHEMA_MODE=missing _run_case "[RED $RED_SHA_T018] FB_missing (schema 不在 + revise) must reproduce drafting/null (revise not bound)" \
+      '**Verdict:** revise' '' '' 0 "drafting" ""
+    CASE_SCHEMA_MODE=nojq _run_case "[RED $RED_SHA_T018] FB_nojq (jq 不在 + revise) must reproduce drafting/null (revise not bound)" \
+      '**Verdict:** revise' '' '' 0 "drafting" ""
+    # #2: schema のアポストロフィで引用が壊れ、$(...) / バッククォートが実行される
+    CASE_SCHEMA_MODE=hostile CASE_SPAWN_MODE=exec CASE_INJECTION_EXPECT=reproduced _run_case "[RED $RED_SHA_T018] SQ_hostile must reproduce the shell injection" \
+      '**Verdict:** revise' '' "$RESULT_JSON_REVISE" 0 "drafting" "revise"
+    # #3: 旧パスの古い approve envelope を今回の verdict として束縛する
+    CASE_SPAWN_MODE=stale_old_path _run_case "[RED $RED_SHA_T018] LOG_stale (旧パスの古い approve + 今回のログ無し) must reproduce ready/approve" \
+      "$PROSE_N_ALT" '' '' 0 "ready" "approve"
+  else
+    fail "[RED $RED_SHA_T018] could not extract pinned revision $RED_SHA_T018 from $GIT_REPO (git archive failed or commit missing)"
+  fi
+  _cleanup_dir "$RED_ROOT_T018"
   SRC_ROOT="$OWN_CHECKOUT_ROOT"
   PINNED_SHA=""
 

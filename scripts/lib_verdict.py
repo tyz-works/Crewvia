@@ -89,9 +89,12 @@ approve が消費される (k3/k4 と同じ型) ためである。
 ### 意図的に扱わない残余
 
 `## 総合判定: NO-GO` のような verdict 語を使わない別表記、他言語、
-同形異字 (キリル文字の е 等) は兆候にならず NO_SIGN として構造化出力に
-委ねられる。Director 設計判断「兆候なしの別表記 + structured=approve → ready
-(救済は残る)」の範囲であり、この場合は構造化出力が唯一の判定 unit になる。
+同形異字 (キリル文字の е 等) は兆候にならず NO_SIGN になる。
+t020 (PR #199 fix 4, ユーザー決定「approve は救済しない」) 以降、
+scripts/review-plan.sh は NO_SIGN を構造化出力で救済するとき revise / reject
+だけを束縛し、structured=approve は確定しない (refund)。approve が成立するのは
+1 行目が VALID の approve で、かつ構造化出力も approve のときだけなので、
+この残余から approve は生まれない。
 
 ## 呼び出し側の約束
 

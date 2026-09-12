@@ -619,3 +619,34 @@ t015 の `test_review_plan_verdict_binding_e2e.sh --verify-red` には次の問�
   - `scripts/test_plan_review_verdict_e2e_variants.sh`
   - `scripts/test_review_plan_verdict_binding_e2e.sh`
 - テスト (隔離の修正): `scripts/test_review_plan_director_identity.sh` / `scripts/test_review_plan_pane_leak.sh` / `scripts/test_review_plan_model.sh`
+
+---
+
+## t020 (mission 20260912-verdict-ci-launcher, PR #199 fix 4): approve を救済しない / schema を使えない経路 / schema の引用 / 実行専用ログ
+
+t018 の head (a9f2ba3) は QA 3 (t019, Finn) が PASS、Kai-codex 3 回目 (t004) が P2 3 件で needs-director。
+ユーザー判断「4 巡目を小さく回す」「approve は救済しない」による最小差分。t018 までの不変条件
+(束縛 + run_id 鮮度 / 3 状態 / 兆候があれば救済しない / TOCTOU / CR / envelope allowlist /
+--verify-red の sha 固定) は変えていない。
+
+- **approve の救済を廃止 (ユーザー決定)**: approve を束縛するのは「1 行目が VALID の approve」かつ「構造化出力が approve (成功 envelope)」のときだけ。
+  - NO_SIGN × structured=revise/reject は従来どおり救済する (1 行目に書き戻す)。
+  - NO_SIGN × structured=approve は確定しない。review-plan.sh は exit 0 + `plan_review.verdict` 無しで返す。
+  - exit 1 にしない理由: plan.sh は exit 1 のとき plan_review.md が無いと refund しない。exit 0 + verdict 無しなら plan_review.md の有無に関係なく refund する。
+  - これで t018 の意図的な残余 (QA t019: `判定: revise` / `**Verdict∶** revise` (U+2236) / キリル文字の е × structured=approve → ready) が構造ごと消える。兆候の定義を広げる方向はとらない。
+- **#1 schema 不在 / 不正 / jq 不在**: 以前は PROSE_STATE が unread のまま残り、規定形式の revise/reject でも確定しなかった (毎回 refund)。reviewer を止めて停止を確認した後に 3 状態で分類する。確認できなければ読まない (t015 設計判断 3)。approve は構造化出力が無いので成立しない (F2)。
+- **#2 schema のシェル引用**: `--json-schema '<jq の出力>'` は schema 内の `'` で壊れ、`$(...)` / バッククォートが実行されえた。`printf %q` で引用する (ログパスも同様)。pane のシェルは bash / zsh 前提 (C ロケールでは `%q` が `$'...'` を出すため)。
+- **#3 実行専用ログ**: `/tmp/plan_reviewer_$$.log` (推測可能・作り直さない) をやめ、起動前に `mktemp` で新規・0600 のファイルを作ってそれだけを読む。作れなければ reviewer を起動しない (exit 1)。
+- lib_verdict.py を実行できない (rc 2 等) ときの拒否理由を「verdict-line sign を含む」から実態に合わせた (終了コードの扱いは不変)。
+- `agents/plan_reviewer.md`: 「1 行目の正規 `**Verdict:** approve` が無いと approve は成立しない」を明記。註釈付き approve は「判定不能」ではなく「書式違反」。
+
+### テスト
+
+- `test_review_plan_verdict_binding_e2e.sh`: N_ja / N_ratio / N_cyr、FB_*、SQ_real / SQ_hostile (pane のコマンド文字列を `bash -c` で実際に実行し、claude スタブが受け取った argv を schema とバイト比較)、LOG_stale、B_k*r (違反 × structured=revise) を追加。`--verify-red` に a9f2ba3 を追加し、危険側 (ready/approve・revise 未確定・注入の実行・古い approve の束縛) の再現を確認する。
+- `test_review_plan_json_rescue.sh`: Case 7c / 13b / 19 / 20 / 21 を追加。
+- 期待値の変更はユーザー決定による 2 件だけ (json_rescue Case 7b、binding e2e RESCUE)。
+- json_rescue Case 14-17 は構造化出力を approve から revise に変えた (期待値は同じ)。approve のままだと、allowlist が壊れても exit 1 になってしまい、何も検証しないため。
+- スタブはログを `$PLAN_REVIEWER_LOG` (review-plan.sh のシェル変数) に書く。旧版の review-plan.sh でも同じ変数名なので、red 実行でも同じスタブが使える。
+- `test_review_plan_pane_leak.sh` Case 4 (SIGTERM): Case 1-3 と同じ兆候なしの lib_verdict.py スタブを置いた。
+  - schema 不在のフォールバックもプローズを分類するようになり、lib_verdict.py が無い (rc 2) と exit 1 になる。
+  - このテストは `_run_case` が残した `set -e` の下で `wait` するため、子が非 0 で終わると grep の前に無言で終了していた。`wait ... || true` にした。期待値 (mux_kill が呼ばれる) は同じ。

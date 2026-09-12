@@ -62,6 +62,14 @@
 #   14〜17. (t018) lib_verdict.py が想定外の終了コード/出力を返す → 救済しない
 #   18. (t018) 書式違反 + 構造化出力なし → exit 1
 #
+# t020 (mission 20260912-verdict-ci-launcher, PR #199 fix 4) 追記:
+#   - ユーザー決定「approve は救済しない」: 兆候なし × structured=approve は
+#     exit 0 + plan_review.verdict 無し (plan.sh が refund)。Case 7b は挙動変更、
+#     Case 7c / 13b / 19 を追加。Case 14-17 は構造化出力を revise に変えた (期待値は同じ)
+#   - スタブはログを review-plan.sh の PLAN_REVIEWER_LOG (mktemp) に書く
+#   20. schema 不在 / 不正 / jq 不在でも停止確認後に 3 状態で分類し revise/reject を束縛
+#   21. 起動時点のログが実行専用の新規ファイル (空・0600・旧パスでない)
+#
 # 実行: bash scripts/test_review_plan_json_rescue.sh
 
 set -uo pipefail
@@ -98,6 +106,13 @@ cleanup() {
   if [[ -n "$TMPDIR_TEST" && -d "$TMPDIR_TEST" ]]; then
     rm -rf "$TMPDIR_TEST"
   fi
+  # t020: スタブが記録した review-plan.sh の実行専用ログ (mktemp) を片付ける。
+  if [[ -f "/tmp/test_review_plan_json_rescue_logs_$$" ]]; then
+    while IFS= read -r _log; do
+      [[ -n "$_log" ]] && rm -f "$_log"
+    done < "/tmp/test_review_plan_json_rescue_logs_$$"
+    rm -f "/tmp/test_review_plan_json_rescue_logs_$$"
+  fi
 }
 trap cleanup EXIT
 
@@ -121,15 +136,17 @@ _run_case() {
 
   # スタブ lib_mux.sh: mux_available/mux_spawn は常に成功 (no-op)。mux_spawn は
   # sourced function として review-plan.sh 自身のプロセスで実行されるため、
-  # 中で使う $$ は review-plan.sh の PID と一致する — これを使って本物の
-  # PLAN_REVIEWER_LOG (/tmp/plan_reviewer_$$.log) にログを書き込める。
+  # review-plan.sh のシェル変数 PLAN_REVIEWER_LOG をそのまま参照できる —
+  # これを使って本物のログパスにログを書き込む (t020: ログは mktemp で作る
+  # 実行専用のファイルになり、パスは推測できないため)。
   cat > "$TMPDIR_TEST/scripts/lib_mux.sh" << EOF
 mux_available() { return 0; }
 mux_spawn() {
+  echo "\$PLAN_REVIEWER_LOG" >> "/tmp/test_review_plan_json_rescue_logs_$$"
   if [[ -n "${log_body}" ]]; then
-    printf '%s\n' '${log_body}' > "/tmp/plan_reviewer_\$\$.log"
+    printf '%s\n' '${log_body}' > "\$PLAN_REVIEWER_LOG"
   else
-    : > "/tmp/plan_reviewer_\$\$.log"
+    : > "\$PLAN_REVIEWER_LOG"
   fi
   return 0
 }
@@ -199,12 +216,29 @@ _run_case "TIMEOUT_FRESH" "not valid json at all" 1 "false" "prose unreadable + 
 #
 # plan_review.md は review-plan.sh 冒頭の `rm -f` より後に書かれる必要があるため、
 # ログと同じく mux_spawn スタブの中で書く (mux_spawn は rm -f の後に呼ばれる)。
+#
+# t020 で追加した呼び出し側の変数 (関数呼び出しの前置代入で渡す):
+#   CASE_SCHEMA_MODE   missing (schema を置かない) / invalid (壊れた JSON) /
+#                      nojq (PATH 先頭の jq が exit 127)。省略時は本物の schema
+#   CASE_MUX_PID_ALIVE 1 なら mux_pid が「まだ動いている」を返し続ける (停止確認不可)
+#   CASE_EXPECT_BOUND  plan_review.verdict に束縛される値の期待。省略時は
+#                      exit 0 なら $5 と同じ、exit 1 なら無し。"none" は「無し」
+#   CASE_LOG_CHECK     1 ならスタブが起動時点のログファイルの状態を記録し、
+#                      「新規・空・0600・旧パス (/tmp/plan_reviewer_$$.log) でない」を確認する
 _run_case_ex() {
   local wait_status="$1" log_body="$2" review_body="$3" expect_rc="$4" expect_verdict="$5" label="$6" log_delay="${7:-0}" lib_stub="${8:-}"
+  local schema_mode="${CASE_SCHEMA_MODE:-}" pid_alive="${CASE_MUX_PID_ALIVE:-0}" log_check="${CASE_LOG_CHECK:-0}"
+  local expect_bound="${CASE_EXPECT_BOUND-__default__}"
+  if [[ "$expect_bound" == "__default__" ]]; then
+    expect_bound=""
+    [[ "$expect_rc" -eq 0 ]] && expect_bound="$expect_verdict"
+  elif [[ "$expect_bound" == "none" ]]; then
+    expect_bound=""
+  fi
 
   TMPDIR_TEST="/tmp/crewvia-test-review-plan-json-rescue-ex-$$-$(date +%s%N)"
   rm -rf "$TMPDIR_TEST"
-  mkdir -p "$TMPDIR_TEST/scripts" "$TMPDIR_TEST/config" "$TMPDIR_TEST/queue/missions/testmission"
+  mkdir -p "$TMPDIR_TEST/scripts" "$TMPDIR_TEST/config" "$TMPDIR_TEST/queue/missions/testmission" "$TMPDIR_TEST/stubbin"
 
   cp "$REAL_REVIEW_PLAN" "$TMPDIR_TEST/scripts/review-plan.sh"
   if [[ -n "$lib_stub" ]]; then
@@ -212,18 +246,31 @@ _run_case_ex() {
   else
     cp "$REAL_LIB_VERDICT" "$TMPDIR_TEST/scripts/lib_verdict.py"
   fi
-  cp "$REAL_SCHEMA" "$TMPDIR_TEST/config/plan-review-verdict.schema.json"
+  case "$schema_mode" in
+    missing) ;;
+    invalid) printf '{"type": "object", "properties": \n' > "$TMPDIR_TEST/config/plan-review-verdict.schema.json" ;;
+    *) cp "$REAL_SCHEMA" "$TMPDIR_TEST/config/plan-review-verdict.schema.json" ;;
+  esac
+  local path_prefix=""
+  if [[ "$schema_mode" == "nojq" ]]; then
+    printf '#!/usr/bin/env bash\nexit 127\n' > "$TMPDIR_TEST/stubbin/jq"
+    chmod +x "$TMPDIR_TEST/stubbin/jq"
+    path_prefix="$TMPDIR_TEST/stubbin:"
+  fi
   cp "$REAL_LIB_MODEL" "$TMPDIR_TEST/scripts/lib_model.py"
   cp "$REAL_CREWVIA_YAML" "$TMPDIR_TEST/config/crewvia.yaml"
 
   local review_output="$TMPDIR_TEST/queue/missions/testmission/plan_review.md"
   local verdict_file="$TMPDIR_TEST/queue/missions/testmission/plan_review.verdict"
+  local log_state="$TMPDIR_TEST/log_state"
+  local mux_pid_body="return 1;"
+  [[ "$pid_alive" == "1" ]] && mux_pid_body="echo 999999; return 0;"
   if [[ "$log_delay" -gt 0 ]]; then
     cat > "$TMPDIR_TEST/scripts/lib_mux.sh" << EOF
 mux_available() { return 0; }
 mux_spawn() {
-  local self_pid="\$\$"
-  ( sleep ${log_delay}; printf '%s\n' '${log_body}' > "/tmp/plan_reviewer_\${self_pid}.log" ) &
+  echo "\$PLAN_REVIEWER_LOG" >> "/tmp/test_review_plan_json_rescue_logs_$$"
+  ( sleep ${log_delay}; printf '%s\n' '${log_body}' > "\$PLAN_REVIEWER_LOG" ) &
   disown 2>/dev/null || true
   if [[ -n "${review_body}" ]]; then
     printf '%s\n' '${review_body}' > "${review_output}"
@@ -231,20 +278,25 @@ mux_spawn() {
   return 0
 }
 mux_kill() { return 0; }
-mux_pid() { return 1; }
+mux_pid() { ${mux_pid_body} }
 EOF
   else
     cat > "$TMPDIR_TEST/scripts/lib_mux.sh" << EOF
 mux_available() { return 0; }
 mux_spawn() {
-  printf '%s\n' '${log_body}' > "/tmp/plan_reviewer_\$\$.log"
+  echo "\$PLAN_REVIEWER_LOG" >> "/tmp/test_review_plan_json_rescue_logs_$$"
+  if [[ "${log_check}" == "1" ]]; then
+    python3 -c 'import os, stat, sys; s = os.lstat(sys.argv[1]); print(oct(stat.S_IMODE(s.st_mode)), s.st_size, stat.S_ISREG(s.st_mode), sys.argv[1] == sys.argv[2])' \
+      "\$PLAN_REVIEWER_LOG" "/tmp/plan_reviewer_\$\$.log" > "${log_state}" 2>&1
+  fi
+  printf '%s\n' '${log_body}' > "\$PLAN_REVIEWER_LOG"
   if [[ -n "${review_body}" ]]; then
     printf '%s\n' '${review_body}' > "${review_output}"
   fi
   return 0
 }
 mux_kill() { return 0; }
-mux_pid() { return 1; }
+mux_pid() { ${mux_pid_body} }
 EOF
   fi
 
@@ -258,7 +310,7 @@ EOF
   chmod +x "$TMPDIR_TEST/scripts/wait_for_plan_review.sh"
 
   set +e
-  bash "$TMPDIR_TEST/scripts/review-plan.sh" testmission >/tmp/test_review_plan_json_rescue_stdout 2>&1
+  PATH="${path_prefix}$PATH" bash "$TMPDIR_TEST/scripts/review-plan.sh" testmission >/tmp/test_review_plan_json_rescue_stdout 2>&1
   local rc=$?
   set -e
 
@@ -271,16 +323,24 @@ EOF
   local problems=""
   [[ "$rc" -eq "$expect_rc" ]] || problems+="exit=$rc (expected $expect_rc); "
   [[ "$got" == "$expect_verdict" ]] || problems+="plan_review.md verdict='${got:-<none>}' (expected '${expect_verdict:-<none>}'); "
-  if [[ "$expect_rc" -eq 0 ]]; then
+  if [[ -n "$expect_bound" ]]; then
     if ! python3 -c 'import sys; sys.exit(0 if open(sys.argv[1], encoding="utf-8", newline="").read() == f"{sys.argv[2]}\nrun_id={sys.argv[3]}\n" else 1)' \
-        "$verdict_file" "$expect_verdict" "$CREWVIA_PLAN_REVIEW_RUN_ID" 2>/dev/null; then
-      problems+="plan_review.verdict is not exactly '${expect_verdict}\\nrun_id=${CREWVIA_PLAN_REVIEW_RUN_ID}\\n' (got: $(od -c "$verdict_file" 2>/dev/null | head -3 | tr '\n' ' ' || echo '<missing>')); "
+        "$verdict_file" "$expect_bound" "$CREWVIA_PLAN_REVIEW_RUN_ID" 2>/dev/null; then
+      problems+="plan_review.verdict is not exactly '${expect_bound}\\nrun_id=${CREWVIA_PLAN_REVIEW_RUN_ID}\\n' (got: $(od -c "$verdict_file" 2>/dev/null | head -3 | tr '\n' ' ' || echo '<missing>')); "
     fi
   else
+    # 拒否 (exit 1) または確定しなかった (t020: exit 0 + plan_review.verdict 無し)。
     [[ ! -e "$verdict_file" ]] || problems+="plan_review.verdict was written on a refusal path ($(tr '\n' '|' < "$verdict_file")); "
     if [[ -n "$review_body" ]]; then
       [[ "$(cat "$review_output" 2>/dev/null)" == "$review_body" ]] || problems+="plan_review.md was rewritten on a refusal path; "
+    else
+      [[ ! -e "$review_output" ]] || problems+="plan_review.md was created on a refusal path; "
     fi
+  fi
+  if [[ "$log_check" == "1" ]]; then
+    local state
+    state="$(cat "$log_state" 2>/dev/null)"
+    [[ "$state" == "0o600 0 True False" ]] || problems+="log file at launch was not a fresh private file (mode size is_regular is_old_path = '${state:-<not recorded>}', expected '0o600 0 True False'); "
   fi
 
   if [[ -z "$problems" ]]; then
@@ -315,11 +375,22 @@ _run_case_ex "TIMEOUT_FRESH" "$RESULT_JSON_APPROVE" '# Plan Review: test
   "1行目が判定行でない plan_review.md + structured=approve → 書式違反として exit 1 (救済しない)"
 
 echo ""
-echo "--- Case 7b (t018): verdict 行の兆候が無い別表記だけ → 構造化出力による救済は残る ---"
+echo "--- Case 7b (t020 挙動変更): verdict 行の兆候が無い別表記 + structured=approve → approve は救済しない ---"
+# t018 ではこの入力を 1 行目に approve を書き戻して exit 0 / plan_review.verdict=approve
+# にしていた。ユーザー決定により approve の救済を廃止 (t020)。exit 0 +
+# plan_review.verdict 無し (plan.sh は plan_review.md の有無に関係なく refund) で、
+# plan_review.md も書き換えない。
 _run_case_ex "TIMEOUT_FRESH" "$RESULT_JSON_APPROVE" '# Plan Review: test
 
-## 総合判定: GO' 0 "approve" \
-  "兆候なしの別表記 (## 総合判定: GO) + structured=approve → 1行目に書き戻して approve"
+## 総合判定: GO' 0 "" \
+  "兆候なしの別表記 (## 総合判定: GO) + structured=approve → 書き戻さず exit 0、plan_review.verdict 無し (refund)"
+
+echo ""
+echo "--- Case 7c (t020): verdict 行の兆候が無い別表記 + structured=revise → 救済は revise / reject に限って残る ---"
+_run_case_ex "TIMEOUT_FRESH" "$RESULT_JSON_REVISE" '# Plan Review: test
+
+## 総合判定: 要修正' 0 "revise" \
+  "兆候なしの別表記 + structured=revise → 1行目に書き戻して revise"
 
 echo ""
 echo "--- Case 8 (t012 fail-closed): 構造化出力が無く、プローズも書式を外している → 判定不能のまま exit 1 ---"
@@ -369,26 +440,80 @@ _run_case_ex "TIMEOUT_FRESH" "$RESULT_JSON_APPROVE" '**Verdict:** revise
   "自己矛盾 (revise + 本文 approve) + structured=approve → exit 1、plan_review.verdict も plan_review.md の書き換えも無し"
 
 echo ""
+echo "--- Case 13b (t018 の不変条件を revise でも確認): 1行目 revise + 本文に approve + structured=revise → 救済せず exit 1 ---"
+# t020 で approve の救済自体を廃止したため、structured=approve の Case 13 は
+# 「兆候があれば救済しない」が壊れても exit 1 のままになる。revise でも救済しないことを別に確認する。
+_run_case_ex "TIMEOUT_FRESH" "$RESULT_JSON_REVISE" '**Verdict:** approve
+
+書式例として:
+
+**Verdict:** revise' 1 "" \
+  "自己矛盾 (approve + 本文 revise) + structured=revise → exit 1、plan_review.verdict も plan_review.md の書き換えも無し"
+
+echo ""
 echo "--- Case 14-17 (t018): lib_verdict.py が想定外の結果を返したら救済しない (終了コードの allowlist) ---"
 # プローズは兆候の無い別表記 (本物の lib_verdict.py なら救済される入力) にし、
 # 差し替えたスタブの結果だけで exit 1 に倒れることを確認する。
-_run_case_ex "TIMEOUT_FRESH" "$RESULT_JSON_APPROVE" '## 総合判定: GO' 1 "" \
-  "lib_verdict.py が落ちた (未捕捉例外 = rc 1) + structured=approve → exit 1" 0 \
+# t020: 構造化出力を approve から revise に変えた (期待値は同じ)。approve は t020 で
+# no_sign でも救済されなくなったため、approve のままだと allowlist が壊れても exit 1 に
+# なり、このケースが何も検証しなくなる。
+_run_case_ex "TIMEOUT_FRESH" "$RESULT_JSON_REVISE" '## 総合判定: GO' 1 "" \
+  "lib_verdict.py が落ちた (未捕捉例外 = rc 1) + structured=revise → exit 1" 0 \
   $'import sys\nsys.exit(1)'
-_run_case_ex "TIMEOUT_FRESH" "$RESULT_JSON_APPROVE" '## 総合判定: GO' 1 "" \
-  "lib_verdict.py が rc 2 (python3 がスクリプトを開けないときと同じ) + structured=approve → exit 1" 0 \
+_run_case_ex "TIMEOUT_FRESH" "$RESULT_JSON_REVISE" '## 総合判定: GO' 1 "" \
+  "lib_verdict.py が rc 2 (python3 がスクリプトを開けないときと同じ) + structured=revise → exit 1" 0 \
   $'import sys\nsys.exit(2)'
-_run_case_ex "TIMEOUT_FRESH" "$RESULT_JSON_APPROVE" '## 総合判定: GO' 1 "" \
-  "lib_verdict.py が rc 0 で正規でない出力 ('APPROVE') + structured=approve → exit 1" 0 \
+# t020 (t019 軽微指摘): rc 2 の拒否理由が「verdict-line sign を含む」ではなく実態を言うこと。
+if grep -q 'lib_verdict.py could not be run or failed (rc=2)' /tmp/test_review_plan_json_rescue_stdout \
+    && ! grep -q 'contains a verdict-line sign' /tmp/test_review_plan_json_rescue_stdout; then
+  pass "lib_verdict.py rc 2 の拒否理由は「lib_verdict.py を実行できなかった」(verdict-line sign とは言わない)"
+else
+  fail "lib_verdict.py rc 2 の拒否理由が実態と合わない: $(grep 'review-plan.sh' /tmp/test_review_plan_json_rescue_stdout | head -3)"
+fi
+_run_case_ex "TIMEOUT_FRESH" "$RESULT_JSON_REVISE" '## 総合判定: GO' 1 "" \
+  "lib_verdict.py が rc 0 で正規でない出力 ('APPROVE') + structured=revise → exit 1" 0 \
   'print("APPROVE")'
-_run_case_ex "TIMEOUT_FRESH" "$RESULT_JSON_APPROVE" '## 総合判定: GO' 1 "" \
-  "lib_verdict.py が rc 10 (兆候なし) なのに出力がある + structured=approve → exit 1" 0 \
+_run_case_ex "TIMEOUT_FRESH" "$RESULT_JSON_REVISE" '## 総合判定: GO' 1 "" \
+  "lib_verdict.py が rc 10 (兆候なし) なのに出力がある + structured=revise → exit 1" 0 \
   $'import sys\nprint("approve")\nsys.exit(10)'
 
 echo ""
 echo "--- Case 18 (t018): 書式違反 (**Verdict:** REVISE) + 構造化出力なし → exit 1 ---"
 _run_case_ex "TIMEOUT_FRESH" "no json here" '**Verdict:** REVISE' 1 "" \
   "書式違反 + structured 皆無 → exit 1"
+
+echo ""
+echo "--- Case 19 (t020, QA t019 残余 / ユーザー決定): 兆候の定義の外の revise 表記 + structured=approve → approve を束縛しない ---"
+# いずれも lib_verdict.py では NO_SIGN (兆候なし)。t018 までは structured=approve で救済されていた。
+_run_case_ex "TIMEOUT_FRESH" "$RESULT_JSON_APPROVE" '判定: revise' 0 "" \
+  "'判定: revise' + structured=approve → exit 0、plan_review.verdict 無し、書き換え無し"
+_run_case_ex "TIMEOUT_FRESH" "$RESULT_JSON_APPROVE" $'**Verdict∶** revise' 0 "" \
+  "'**Verdict∶** revise' (U+2236) + structured=approve → exit 0、plan_review.verdict 無し、書き換え無し"
+_run_case_ex "TIMEOUT_FRESH" "$RESULT_JSON_APPROVE" $'**Vеrdict:** revise' 0 "" \
+  "'**Vеrdict:** revise' (キリル文字の е) + structured=approve → exit 0、plan_review.verdict 無し、書き換え無し"
+# plan_review.md が無い場合も exit 0 (exit 1 だと plan.sh は plan_review.md が無いときに refund しない)。
+_run_case_ex "TIMEOUT_NONE" "$RESULT_JSON_APPROVE" '' 0 "" \
+  "plan_review.md 未作成 + structured=approve → exit 0、plan_review.md を作らず plan_review.verdict 無し"
+
+echo ""
+echo "--- Case 20 (t020, Kai-codex 3 回目 #1): schema 不在 / 不正 / jq 不在でも、停止確認後にプローズを 3 状態で分類する ---"
+CASE_SCHEMA_MODE=missing _run_case_ex "OK" "" '**Verdict:** revise' 0 "revise" \
+  "schema 不在 + 1行目 revise → revise を束縛して exit 0"
+CASE_SCHEMA_MODE=invalid _run_case_ex "OK" "" '**Verdict:** reject' 0 "reject" \
+  "schema が不正な JSON + 1行目 reject → reject を束縛して exit 0"
+CASE_SCHEMA_MODE=nojq _run_case_ex "OK" "" '**Verdict:** revise' 0 "revise" \
+  "jq を実行できない + 1行目 revise → revise を束縛して exit 0"
+CASE_SCHEMA_MODE=missing _run_case_ex "OK" "" '**Verdict:** approve' 1 "approve" \
+  "schema 不在 + 1行目 approve → 構造化出力が無いので approve は成立しない (exit 1、束縛無し)"
+CASE_SCHEMA_MODE=missing _run_case_ex "TIMEOUT_FRESH" "" $'**Verdict:** revise\n\n**Verdict:** approve' 1 "" \
+  "schema 不在 + 自己矛盾 → 書式違反として exit 1"
+CASE_SCHEMA_MODE=missing CASE_MUX_PID_ALIVE=1 CASE_EXPECT_BOUND=none _run_case_ex "OK" "" '**Verdict:** revise' 0 "revise" \
+  "schema 不在 + reviewer の停止を確認できない → plan_review.md を読まず束縛しない (t015 設計判断 3)"
+
+echo ""
+echo "--- Case 21 (t020, Kai-codex 3 回目 #3): reviewer 起動時点のログは実行専用の新規ファイル (空・0600・旧パスでない) ---"
+CASE_LOG_CHECK=1 _run_case_ex "OK" "$RESULT_JSON_REVISE" '**Verdict:** revise' 0 "revise" \
+  "起動時のログが空・0600・/tmp/plan_reviewer_\$\$.log でない + revise の正常系は変わらない"
 
 echo ""
 echo "== Results: $PASS_COUNT passed, $FAIL_COUNT failed =="

@@ -104,13 +104,29 @@ fi
 if [[ -z "$VERDICT_SCHEMA" ]]; then
     echo "[review-plan.sh] WARNING: verdict schema unavailable ($SCHEMA_FILE not found or invalid JSON) — structured-output rescue disabled, falling back to prose-only verdict parsing" >&2
 fi
-# mux 経路 (INLINE_CMD は文字列として後で実行されるため single-quote で
-# 埋め込む)。inline フォールバック経路は配列展開でそのまま渡す。
+# mux 経路 (INLINE_CMD は文字列として後で pane のシェルに解釈される)。
+# t020 (PR #199 fix 4, Kai-codex 3 回目 #2): 以前は jq の出力を '...' の中に
+# そのまま埋め込んでいた。JSON の直列化はアポストロフィをシェル向けに
+# エスケープしないため、schema の description / $comment に ' が 1 つあるだけで
+# コマンドが壊れ、細工した文字列ならシェルコマンドとして実行されていた。
+# printf %q でシェル引用し、pane 側で 1 語のまま復元させる。
+# inline フォールバック経路は配列展開でそのまま渡す。
 SCHEMA_CLI_ARG=""
-[[ -n "$VERDICT_SCHEMA" ]] && SCHEMA_CLI_ARG=" --output-format json --json-schema '$VERDICT_SCHEMA'"
+[[ -n "$VERDICT_SCHEMA" ]] && SCHEMA_CLI_ARG=" --output-format json --json-schema $(printf '%q' "$VERDICT_SCHEMA")"
 SCHEMA_FLAG=()
 [[ -n "$VERDICT_SCHEMA" ]] && SCHEMA_FLAG=(--output-format json --json-schema "$VERDICT_SCHEMA")
-PLAN_REVIEWER_LOG="/tmp/plan_reviewer_$$.log"
+# t020 (Kai-codex 3 回目 #3): 以前は /tmp/plan_reviewer_$$.log という推測できる
+# 共有パスを、起動前に作り直さずに読んでいた。ログは残り PID は再利用されるため、
+# pane のコマンドが tee より前に失敗すると、前の実行のログ (や他のローカル
+# ユーザーが先に置いたファイル) の success envelope を今回の verdict として
+# 読んでいた。起動前に mktemp でこの実行専用のファイル (推測できない名前・
+# 所有者のみ読み書き可・O_EXCL で新規作成) を作り、このファイルだけを読む。
+# 作れなければ reviewer を起動しない。
+if ! PLAN_REVIEWER_LOG="$(umask 077 && mktemp "${TMPDIR:-/tmp}/plan_reviewer_$$.XXXXXXXXXX")"; then
+    echo "[review-plan.sh] ERROR: could not create a private log file for the plan-reviewer output — refusing to launch the reviewer" >&2
+    exit 1
+fi
+PLAN_REVIEWER_LOG_Q="$(printf '%q' "$PLAN_REVIEWER_LOG")"
 
 # SKILLS=plan_review: config/skill-permissions.yaml の plan_review セクション
 # (Bash 全面禁止 / Edit・MultiEdit 禁止 / Write は plan_review.md 限定) が
@@ -147,7 +163,7 @@ PLAN_REVIEWER_LOG="/tmp/plan_reviewer_$$.log"
 INLINE_CMD="unset CLAUDE_CODE_CHILD_SESSION; export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1; export AGENT_NAME='Plan-Reviewer'; export SKILLS=plan_review; cd '$CREWVIA_DIR' && CLAUDE_SKILL=plan_review claude${MODEL_CLI_ARG} \
      ${SCHEMA_CLI_ARG} \
      -p 'Mission slug: $SLUG. agents/plan_reviewer.md の手順に従い queue/missions/$SLUG/ の全タスクを検査し、queue/missions/$SLUG/plan_review.md を出力せよ。' \
-     2>&1 | tee '$PLAN_REVIEWER_LOG'"
+     2>&1 | tee ${PLAN_REVIEWER_LOG_Q}"
 
 MUX_LAUNCHED=0
 # F4 (PR#188 t012 Seo 指摘): 以前は成功時とタイムアウト時の2箇所に明示的な
@@ -395,6 +411,13 @@ STRUCTURED_VERDICT=""
 #   unread    — reviewer の停止を確認できず、読んでいない (decision 3)
 PROSE_STATE="unread"
 PROSE_VERDICT=""
+# t020 (t019 軽微指摘): violation の中身。拒否理由のメッセージだけに使う
+# (状態と終了コードの扱いは変えない)。
+#   sign       — lib_verdict.py が rc 20 で書式違反・自己矛盾を報告した
+#   unexpected — lib_verdict.py は動いたが、allowlist 外の出力を返した
+#   lib_failed — lib_verdict.py を実行できなかった / 落ちた (不在の rc 2 など)
+PROSE_VIOLATION_KIND=""
+PROSE_LIB_RC=""
 
 # lib_verdict.py の終了コードは allowlist で解釈する: 0 + 正規の 1 語 = valid、
 # 10 + 出力なし = no_sign、それ以外はすべて violation。Python の未捕捉例外
@@ -404,6 +427,7 @@ _read_prose_verdict() {
     local out="" rc=0
     out="$(python3 "${SCRIPT_DIR}/lib_verdict.py" "$REVIEW_OUTPUT")" || rc=$?
     PROSE_VERDICT=""
+    PROSE_LIB_RC="$rc"
     if [[ "$rc" -eq 0 ]]; then
         case "$out" in
             approve|revise|reject)
@@ -412,12 +436,20 @@ _read_prose_verdict() {
                 ;;
             *)
                 PROSE_STATE="violation"
+                PROSE_VIOLATION_KIND="unexpected"
                 ;;
         esac
     elif [[ "$rc" -eq 10 && -z "$out" ]]; then
         PROSE_STATE="no_sign"
+    elif [[ "$rc" -eq 20 && -z "$out" ]]; then
+        PROSE_STATE="violation"
+        PROSE_VIOLATION_KIND="sign"
+    elif [[ "$rc" -eq 10 || "$rc" -eq 20 ]]; then
+        PROSE_STATE="violation"
+        PROSE_VIOLATION_KIND="unexpected"
     else
         PROSE_STATE="violation"
+        PROSE_VIOLATION_KIND="lib_failed"
     fi
 }
 
@@ -439,12 +471,23 @@ if [[ -n "$VERDICT_SCHEMA" ]]; then
         echo "[review-plan.sh] WARNING: plan-reviewer session end could not be confirmed — refusing to read ${REVIEW_OUTPUT} (fail-closed, decision 3)" >&2
     fi
 else
-    # スキーマ不在時のフォールバック (t004 以前と同じ挙動): 構造化出力による
-    # 確認は原理的に不可能なので、この経路では待ちも kill-confirm もしない。
-    # プローズをそのまま読む (t004 以前の挙動と同じ。approve を含め、schema
-    # 不在時の安全性は wait_for_plan_review.sh 側の判定・下の WAIT_STATUS
-    # フォールバック分岐に委ねられている)。
-    PROSE_VERDICT="$(python3 "${SCRIPT_DIR}/lib_verdict.py" "$REVIEW_OUTPUT" 2>/dev/null || true)"
+    # スキーマ不在・不正・jq 不在時のフォールバック。構造化出力による確認は
+    # 原理的に不可能なので、構造化出力は待たない。
+    #
+    # t020 (PR #199 fix 4, Kai-codex 3 回目 #1): 以前はここで PROSE_VERDICT だけを
+    # 入れ、PROSE_STATE を unread のまま残していた。下の確定分岐はどれも
+    # valid / no_sign を要求するため、規定形式の revise / reject でも
+    # plan_review.verdict が一度も書かれず、このフォールバックでは review が
+    # 完了しなかった (plan.sh が毎回 refund するだけ)。
+    # 構造化出力経路と同じ規則で読む: reviewer を止めて停止を確認できたときだけ
+    # 3 状態に分類する。確認できなければ読まない (t015 設計判断 3 のまま)。
+    # 構造化出力が無いので、approve は下の分岐 (F2) で成立しない。束縛されうるのは
+    # valid の revise / reject だけ。
+    if _stop_reviewer_and_confirm; then
+        _read_prose_verdict
+    else
+        echo "[review-plan.sh] WARNING: plan-reviewer session end could not be confirmed — refusing to read ${REVIEW_OUTPUT} (fail-closed, decision 3)" >&2
+    fi
 fi
 
 # 採用する verdict を1つに決める。
@@ -480,10 +523,37 @@ fi
 # t015 までは「prose が空 = 判定不能」の 1 状態しか無く、自己矛盾・書式違反も
 # 救済の行に流れていた (QA t016 FAIL-A: 1 行目 revise + 本文 approve +
 # structured=approve → ready)。救済してよいのは no_sign だけに絞る。
+#
+# t020 (PR #199 fix 4, ユーザー決定「approve は救済しない」): 上の t018 マトリクスの
+# no_sign 行を次のように置き換える (他の行は変えない):
+#   prose=no_sign & structured=revise/reject → structured (救済。1 行目に書き戻す)
+#   prose=no_sign & structured=approve       → 確定しない (refund)
+#   prose=no_sign & structured 無し          → 判定不能
+# approve を束縛してよいのは「prose=valid の approve」と「structured=approve
+# (成功 envelope)」の両方がそろったときだけになる。t018 の no_sign 救済には
+# 「兆候の定義の外にある revise 表記」(`判定: revise` / `**Verdict∶** revise`
+# (U+2236) / キリル文字の е 入りの Verdict) が structured=approve で ready になる
+# 残余があった (QA t019)。兆候の定義を広げ続けても同じ形の穴は閉じないため、
+# approve 側の救済自体をやめてこの型を構造ごと消す。
+# no_sign & structured=approve は終了コード 0 + plan_review.verdict 無しで返す。
+# plan.sh はこの形を plan_review.md の有無に関係なく refund する (exit 1 は
+# plan_review.md が無いと refund しないため、reviewer が plan_review.md を書かずに
+# structured=approve だけ返した場合に cycle を消費してしまう)。
 FINAL_VERDICT=""
 REFUSAL_REASON=""
+APPROVE_RESCUE_REFUSED=0
 if [[ "$PROSE_STATE" == "violation" ]]; then
-    REFUSAL_REASON="${REVIEW_OUTPUT} contains a verdict-line sign but is not exactly one canonical '**Verdict:** approve|revise|reject' on its first line (format violation or self-contradiction; structured output verdict: '${STRUCTURED_VERDICT:-none}')"
+    case "$PROSE_VIOLATION_KIND" in
+        lib_failed)
+            REFUSAL_REASON="scripts/lib_verdict.py could not be run or failed (rc=${PROSE_LIB_RC}) — could not determine whether ${REVIEW_OUTPUT} has a canonical verdict line or any verdict-line sign (structured output verdict: '${STRUCTURED_VERDICT:-none}')"
+            ;;
+        unexpected)
+            REFUSAL_REASON="scripts/lib_verdict.py returned an unexpected result (rc=${PROSE_LIB_RC}) for ${REVIEW_OUTPUT} — its verdict-line state could not be determined (structured output verdict: '${STRUCTURED_VERDICT:-none}')"
+            ;;
+        *)
+            REFUSAL_REASON="${REVIEW_OUTPUT} contains a verdict-line sign but is not exactly one canonical '**Verdict:** approve|revise|reject' on its first line (format violation or self-contradiction; structured output verdict: '${STRUCTURED_VERDICT:-none}')"
+            ;;
+    esac
     echo "[review-plan.sh] WARNING: ${REFUSAL_REASON} — the structured output is NOT used to rescue it (fail-closed, t018)" >&2
 elif [[ "$PROSE_STATE" == "valid" && -n "$STRUCTURED_VERDICT" && "$STRUCTURED_VERDICT" != "$PROSE_VERDICT" ]]; then
     REFUSAL_REASON="structured output verdict ('$STRUCTURED_VERDICT') disagrees with the verdict written in ${REVIEW_OUTPUT} ('$PROSE_VERDICT')"
@@ -500,6 +570,10 @@ elif [[ "$PROSE_STATE" == "valid" ]]; then
     # 構造化出力による確認を必須にする。
     REFUSAL_REASON="prose verdict was 'approve' but no confirming structured output verdict could be obtained after waiting"
     echo "[review-plan.sh] WARNING: ${REFUSAL_REASON} — refusing to approve without confirmation (fail-closed, F2)" >&2
+elif [[ "$PROSE_STATE" == "no_sign" && "$STRUCTURED_VERDICT" == "approve" ]]; then
+    # t020: approve は救済しない (上のマトリクス参照)。
+    APPROVE_RESCUE_REFUSED=1
+    echo "[review-plan.sh] WARNING: structured output verdict is 'approve' but ${REVIEW_OUTPUT} has no canonical '**Verdict:** approve' on its first line — approve requires both, so it is NOT rescued (fail-closed, t020)" >&2
 elif [[ "$PROSE_STATE" == "no_sign" && -n "$STRUCTURED_VERDICT" ]]; then
     FINAL_VERDICT="$STRUCTURED_VERDICT"
 fi
@@ -508,8 +582,14 @@ VERDICT_BOUND=0
 if [[ -n "$REFUSAL_REASON" ]]; then
     WAIT_STATUS="TIMEOUT_FRESH"
     WAIT_RC=1
+elif [[ "$APPROVE_RESCUE_REFUSED" -eq 1 ]]; then
+    # 終了コード 0 + plan_review.verdict 無し = plan.sh が必ず refund する形
+    # (上のマトリクスの注記参照)。下の exit 0 分岐が「verdict を確定しなかった」ことを出す。
+    WAIT_STATUS="OK"
+    WAIT_RC=0
 elif [[ -n "$FINAL_VERDICT" ]]; then
     if [[ "$PROSE_STATE" == "no_sign" ]]; then
+        # t020: ここに来るのは structured=revise/reject だけ (approve は上で拒否済み)。
         echo "[review-plan.sh] recovered verdict '$FINAL_VERDICT' from structured output (${PLAN_REVIEWER_LOG}); plan_review.md had no verdict-line sign anywhere (wait status was: $WAIT_STATUS)" >&2
         # plan_review.md の**1行目**に規定形式の行を機械的に書き込む。
         # scripts/lib_verdict.py は最初の非空行だけを見るため、この prepend が

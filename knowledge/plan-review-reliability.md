@@ -588,7 +588,9 @@ t015 の `test_review_plan_verdict_binding_e2e.sh --verify-red` には次の問�
 - G2 のメタテストを追加した: 作業ツリーのコピーに 3388334 の review-plan.sh / plan.sh を置き、このハーネス自身を `--verify-red` で実行する。本体 T1 が FAIL し red T1 が PASS した状態でも非 0 終了になることを確認する。
 - 各ケースで「スタブ mux_spawn が呼ばれた」「claude/herdr/tmux のバイナリが呼ばれていない」を確認する。全ケースの前には SANITY ケースを通す。
 - `tests/test_lib_verdict.py::test_splitlines_only_separator_regression_would_fail_on_old_splitlines` は削除した。旧ロジックを書き写して実行していただけで、旧コードを動かしていなかったため。
-- 注記: CI (`.github/workflows/ci.yml`) は pytest を実行しない。t002 の「pytest は CI で拾われる」は誤り。
+- 注記: PR の CI では "Python Unit Tests (pytest)" job が `tests/` を実行する (run 34691557924 で確認)。
+  - PR ブランチ上の `.github/workflows/ci.yml` だけを見ると pytest job が無いように見えるが、それで判断しないこと。
+  - `scripts/test_*.sh` の大半 (本 PR の verdict 系テストを含む) は CI で実行されない。CI で守りたい回帰は `tests/` (pytest) か bats に置く。
 
 ### 低優先度 (同 task で対応)
 

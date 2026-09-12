@@ -7,10 +7,9 @@ scripts/lib_verdict.py の pytest 回帰テスト (t002, mission
 t015 FAIL-2 / t018 FAIL-A)。
 
 scripts/test_lib_verdict.sh (bash, CLI 経由) と同じ不変条件を、関数呼び出しと
-CLI の両方から確認する。注意: CI (.github/workflows/ci.yml) が実行するのは
-bats と一部の scripts/test_*.sh だけで、pytest は実行されない (t002 時点の
-「CI から拾われる」という記述は誤りだった)。手元で
-`python3 -m pytest tests/` を実行すること。
+CLI の両方から確認する。PR の CI では "Python Unit Tests (pytest)" job が
+`tests/` を実行する (PR #199 の run 34691557924 で確認)。scripts/test_*.sh の
+大半は CI で実行されないため、CI で守りたい回帰はこちらに置く。
 
 t018 (QA t016 Finn FAIL-A / Kai-codex t004 2 回目 P1): lib_verdict は
 VALID / NO_SIGN / VIOLATION の 3 状態を返す。救済 (構造化出力で plan_review.md の

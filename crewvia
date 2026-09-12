@@ -90,35 +90,36 @@ if [[ -z "${TASKVIA_URL:-}" ]]; then
 fi
 
 # --- 起動モード ---
-# CREWVIA_MUX が既に env で指定されていれば尊重し、CREWVIA_TMUX のみ補完する。
-# CREWVIA_MUX 未設定の場合は config/crewvia.yaml の mode: を読む。
-if [[ -z "${CREWVIA_TMUX:-}" ]]; then
-  if [[ -n "${CREWVIA_MUX:-}" ]]; then
-    # CREWVIA_MUX が env で明示指定済み → CREWVIA_TMUX を合わせるだけ
-    case "${CREWVIA_MUX}" in
-      herdr)  export CREWVIA_TMUX=1 ;;
-      tmux)   export CREWVIA_TMUX=1 ;;
-      *)      export CREWVIA_TMUX=0 ;;
-    esac
-  else
-    MODE="$(read_config mode "tmux")"
-    case "$MODE" in
-      tmux)
-        export CREWVIA_TMUX=1
-        ;;
-      herdr)
-        export CREWVIA_MUX=herdr
-        export CREWVIA_TMUX=1
-        ;;
-      inline)
-        export CREWVIA_TMUX=0
-        ;;
-      *)
-        echo "[crewvia] WARNING: 不明な mode '$MODE'。tmux で起動します。" >&2
-        export CREWVIA_TMUX=1
-        ;;
-    esac
-  fi
+# CREWVIA_MUX が既に env で指定されていればそれを常に優先する (config より優先)。
+# 未設定の場合のみ config/crewvia.yaml の mode: を読んで CREWVIA_MUX を決める。
+#
+# 旧 CREWVIA_TMUX は mission 20260907-tmux-name-cleanup で CREWVIA_MUX_ENABLED に
+# 改名され、現在 CREWVIA_TMUX を読むコードはこのファイル以外に存在しない死んだ
+# 変数。互換読み込みはせず値も参照しない — env にあっても config 読み込みを
+# ブロックしない (以前は `[[ -z "${CREWVIA_TMUX:-}" ]]` で config 読み込み自体を
+# スキップしており、旧変数が残っているだけで mode: の変更が無視される事故が
+# あった)。存在すれば無視される旨だけ警告する。
+if [[ -n "${CREWVIA_TMUX:-}" ]]; then
+  echo "[crewvia] WARNING: CREWVIA_TMUX は廃止されました（無視されます）。CREWVIA_MUX=tmux|herdr を使用してください。" >&2
+fi
+
+if [[ -z "${CREWVIA_MUX:-}" ]]; then
+  MODE="$(read_config mode "tmux")"
+  case "$MODE" in
+    tmux)
+      export CREWVIA_MUX=tmux
+      ;;
+    herdr)
+      export CREWVIA_MUX=herdr
+      ;;
+    inline)
+      : # CREWVIA_MUX は export しない → start.sh 側がインラインモードにフォールバックする
+      ;;
+    *)
+      echo "[crewvia] WARNING: 不明な mode '$MODE'。tmux で起動します。" >&2
+      export CREWVIA_MUX=tmux
+      ;;
+  esac
 fi
 
 # --- サブコマンド ---
@@ -195,9 +196,10 @@ Token:   config/.taskvia-token  (1行にトークンを書く、gitignore 済み
 Environment variables (config より優先):
   CREWVIA_TASKVIA=enabled|disabled|ask  Taskvia 連携モード（最優先）
   CREWVIA_MUX=tmux|herdr                mux バックエンド（config の mode: より優先）
-  CREWVIA_TMUX=1|0                      起動モード（CREWVIA_MUX から自動設定）
   TASKVIA_TOKEN=sk-...                  API トークン
   TASKVIA_URL=https://...               Taskvia URL
+
+  ※ CREWVIA_TMUX は廃止されました（無視されます）。CREWVIA_MUX を使用してください。
 
 Behavior:
   tmux モード: kickoff + Dispatcher 起動後に Director 窓に attach します。

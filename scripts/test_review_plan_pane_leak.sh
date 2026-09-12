@@ -50,9 +50,13 @@ _run_case() {
 
   TMPDIR_TEST="/tmp/crewvia-test-review-plan-pane-leak-$$-${wait_status}"
   rm -rf "$TMPDIR_TEST"
-  mkdir -p "$TMPDIR_TEST/scripts" "$TMPDIR_TEST/queue/missions/testmission"
+  mkdir -p "$TMPDIR_TEST/scripts" "$TMPDIR_TEST/config" "$TMPDIR_TEST/queue/missions/testmission"
 
   cp "$REAL_REVIEW_PLAN" "$TMPDIR_TEST/scripts/review-plan.sh"
+  # t001 (mission 20260909-dead-config-sweep): review-plan.sh はモデル解決に
+  # scripts/lib_model.py と config/crewvia.yaml を必須で読むようになった。
+  cp "${SCRIPT_DIR}/lib_model.py" "$TMPDIR_TEST/scripts/"
+  cp "$(dirname "$SCRIPT_DIR")/config/crewvia.yaml" "$TMPDIR_TEST/config/"
 
   local kill_log="$TMPDIR_TEST/mux_kill.log"
   : > "$kill_log"
@@ -108,8 +112,12 @@ echo ""
 echo "--- Case 4 (F4, PR#188 t012 Seo 指摘): SIGTERM で中断された場合も mux_kill が呼ばれる (以前は成功時/タイムアウト時の明示 kill だけで、割り込み経路は未カバーだった) ---"
 TMPDIR_TEST="/tmp/crewvia-test-review-plan-pane-leak-$$-SIGTERM"
 rm -rf "$TMPDIR_TEST"
-mkdir -p "$TMPDIR_TEST/scripts" "$TMPDIR_TEST/queue/missions/testmission"
+mkdir -p "$TMPDIR_TEST/scripts" "$TMPDIR_TEST/config" "$TMPDIR_TEST/queue/missions/testmission"
 cp "$REAL_REVIEW_PLAN" "$TMPDIR_TEST/scripts/review-plan.sh"
+# t001 (mission 20260909-dead-config-sweep): review-plan.sh はモデル解決に
+# scripts/lib_model.py と config/crewvia.yaml を必須で読むようになった。
+cp "${SCRIPT_DIR}/lib_model.py" "$TMPDIR_TEST/scripts/"
+cp "$(dirname "$SCRIPT_DIR")/config/crewvia.yaml" "$TMPDIR_TEST/config/"
 KILL_LOG="$TMPDIR_TEST/mux_kill.log"
 : > "$KILL_LOG"
 cat > "$TMPDIR_TEST/scripts/lib_mux.sh" << EOF

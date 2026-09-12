@@ -106,3 +106,20 @@ jobs:
 
       - name: Run bats tests
         run: bats tests/*.bats
+
+  pytest:
+    name: Python Unit Tests (pytest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install pytest pyyaml
+
+      - name: Run pytest
+        run: python3 -m pytest tests/ -v

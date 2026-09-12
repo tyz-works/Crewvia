@@ -186,11 +186,11 @@ cd $R && git checkout origin/main && git checkout -b new-fix-branch
 
 ---
 
-### C. 修正済みの欠陥（監査時点では「未検証」としていたが、詳細検証の結果は危険側の実欠陥だった）
+### C. 実欠陥（Worker 経路は修正済み、Director 経路は宣言と実装の食い違いが未解決）
 
-#### C-1: CREWVIA_MUX / CREWVIA_MUX_ENABLED の優先順位 — 「未検証」ではなく実欠陥が2箇所あった。いずれも修正済み
+#### C-1: CREWVIA_MUX / CREWVIA_MUX_ENABLED の優先順位 — Worker 経路の実欠陥2箇所は修正済み。Director 経路は別の食い違いが未解決 (open)
 
-**状態（訂正）**: 本監査 (2026-09-09) 時点では「未検証・危険にはならない・LOW」と結論していたが、これは誤りだった。「後続検証候補」として詳細検証した結果、**docs の説明どおりに動いていない箇所が2箇所**見つかり、いずれも危険側（設定したのに並列モードに入らずインラインへ転落）だった。両方とも本ミッション内の別 task で修正済み。
+**状態（再訂正、t014）**: 本監査 (2026-09-09) 時点では「未検証・危険にはならない・LOW」と結論していたが誤りだった。t012 (mission 20260912-verdict-ci-launcher) の詳細検証で **Worker が並列モードに入る経路**（start.sh のゲート判定 + `./crewvia` ランチャの export）に危険側の実欠陥が2箇所見つかり、いずれも本ミッション内の別 task で修正済み（下記 実欠陥1・2）。ただし t012 は「両方とも修正済み」と C-1 全体を解消扱いにしていたが、これは Worker 経路のみを指す表現で不正確だった。**Director 経路**（`scripts/start.sh` の `ROLE=director` ブロック）には別の食い違いが残っており、こちらはコード修正が未実施の open 残件（下記 実欠陥3。本 task = t014 で発見・訂正）。
 
 **宣言箇所**（監査時点から変更なし）:
 - CLAUDE.md 環境変数表:
@@ -200,15 +200,16 @@ cd $R && git checkout origin/main && git checkout -b new-fix-branch
     `CREWVIA_MUX` が設定済みなら不要
   ```
 
-- config/crewvia.yaml コメント (L55):
+- config/crewvia.yaml コメント (L55-56):
   ```
   環境変数での上書き: CREWVIA_MUX=tmux|herdr (最優先) / CREWVIA_MUX_ENABLED=1 (並列 ON) / CREWVIA_MUX_ENABLED=0 (inline)
   CREWVIA_MUX が設定されていれば CREWVIA_MUX_ENABLED より優先される。
   ```
 
-**期待される効果**:
+**期待される効果（宣言どおりに動くなら）**:
 - CREWVIA_MUX が設定されている場合、CREWVIA_MUX_ENABLED は無視される
 - CREWVIA_MUX が未設定の場合のみ CREWVIA_MUX_ENABLED が有効
+- **この「期待される効果」は Worker 経路の実装 (start.sh:597-601) とは逆**。実装の優先順位1位は `CREWVIA_MUX_ENABLED` の明示（`0` も含む）であり、`CREWVIA_MUX` はそれより優先されない（PR #196, t002 の設計判断 A: 「実装を docs に合わせる」ではなく「二重ゲートを実効値解決で統合する」を採用）。config コメントはこの修正後も訂正されておらず、Director 経路（実欠陥3）の open 残件としてここに記載する
 
 **実欠陥 1: scripts/start.sh の並列モードゲートが ROLE=worker で機能していなかった（修正済み: PR #196, merge commit `1581d11`）**
 
@@ -224,25 +225,42 @@ cd $R && git checkout origin/main && git checkout -b new-fix-branch
 - 修正: `mode: tmux` / 不明値 → `CREWVIA_MUX=tmux` を export（herdr は従来通り）。`mode: inline` は `CREWVIA_MUX` を export しない。旧 `CREWVIA_TMUX` は値を参照せず、設定されていれば無視される旨の WARNING のみ出す
 - 回帰テスト: `tests/crewvia-launcher-mux-mode.bats`（mode 4通り × CREWVIA_MUX env 有無 × 旧 CREWVIA_TMUX env 有無。修正前は 10 件中 5 件が red、修正後は全 green）
 
-**倒れる方向**: 修正前は危険側（設定したのに並列モードに入らずインラインへ転落）。両修正の適用後は解消。
+**実欠陥 3 (open, コード修正は未実施 — Director backlog): Director 経路では env の `CREWVIA_MUX` よりも config の `mode:` が優先されてしまう**
 
-**再現手順（検証済みの優先順位）**:
+- `scripts/start.sh:232` `[[ "${ROLE}" == "director" ]] && [[ -z "${CREWVIA_MUX_ENABLED:-}" ]]` のブロックは `CREWVIA_MUX_ENABLED` が未設定なら実行され、env の `CREWVIA_MUX` の値に関係なく config `mode:` で上書きする（origin/main 実物 (`git show origin/main:scripts/start.sh`) で確認済み、行番号付き抜粋）:
+  - `:249-257` `mode: herdr` → `export CREWVIA_MUX=herdr`（env が tmux でも上書き）
+  - `:258-261` `mode: tmux` → `export CREWVIA_MUX=tmux`（env が herdr でも上書き）
+  - `:262-263` `mode: inline` → `export CREWVIA_MUX_ENABLED=0`（env に CREWVIA_MUX があってもインライン）
+- `scripts/start.sh:1-231` に `CREWVIA_MUX` / `CREWVIA_MUX_ENABLED` への代入は無い（`grep -n` で確認、0 件）。呼び出し元 `crewvia` ランチャ (origin/main:106) は env の `CREWVIA_MUX` が既に設定されていればそのまま（`export` し直さず）`exec bash scripts/start.sh director` するだけで、`CREWVIA_MUX_ENABLED` は一度も export しない（`crewvia` に代入なし、grep 確認）。つまり `./crewvia` 経由の Director でも `CREWVIA_MUX_ENABLED` は未設定のまま L232 に到達し、config が env の `CREWVIA_MUX` に勝つ
+- 宣言側 `CLAUDE.md:94`「`CREWVIA_MUX` … config `mode:` より優先」と食い違う。`config/crewvia.yaml:55-56` のコメントも同じ食い違いを繰り返している（上記「宣言箇所」「期待される効果」参照。t013 レビュー指摘の F2 相当）
+- 具体的に困る場面: herdr pane は `CREWVIA_MUX=herdr` を継承するが `CREWVIA_MUX_ENABLED` は継承しない。この状態で config を `mode: tmux` に変えて `./crewvia` を実行すると、Director は tmux (`:258-261`) になり、同じ pane からの `./crewvia worker` は Worker 経路のフォールバック (`start.sh:597-601`。env の `CREWVIA_MUX=herdr` を検出して `CREWVIA_MUX_ENABLED` を 1 にフォールバック) で herdr のままになるため、Director と Worker が別 mux に分散しうる（`start.sh:231` のコメントが防ぎたいとしている事故そのもの）
+- 根拠: 静的読解 + origin/main 実物への `git show` / `grep` による直接確認（2026-09-12, 本 task t014 で実施）。実行してのハーネス検証は未実施
+- **コード修正は未実施**。修正方針（config を尊重する／env を常に優先する／二重ゲートを統合する、等）の検討と実装は次ミッションで Director が扱う
+
+**倒れる方向**:
+- Worker 経路 (実欠陥1・2): 修正前は危険側（設定したのに並列モードに入らずインラインへ転落）。両修正の適用後は解消
+- Director 経路 (実欠陥3): 未解決の open 残件。危険側（Director と Worker が異なる mux に分散する事故）だが、発生には「herdr pane から config を tmux/inline に変えて `./crewvia` する」等の特定条件が必要なため、Worker 経路の実欠陥よりは影響範囲が限定的
+
+**再現手順**:
 ```bash
-# 1. scripts/start.sh のゲート判定 (修正後: 24-29行のコメント参照)
+# 1. Worker 経路のゲート判定 (修正後の実体: start.sh:578-596 のコメント + 597-601 のコード。
+#    1581d11 のコミットメッセージ 24-29 行はこの修正の説明文であり、コード実体ではない)
 git show 1581d11 -- scripts/start.sh
 
 # 2. ./crewvia ランチャの export 分岐 (修正後)
 git show a26b60a -- crewvia
 
-# 優先順位（両修正適用後、実装で確認済み）:
-# 1. env の CREWVIA_MUX_ENABLED 明示（0 も含め最優先。start.sh ゲート）
-# 2. env の CREWVIA_MUX 明示（config より優先。crewvia ランチャ / start.sh フォールバック双方）
-# 3. config/crewvia.yaml の mode:（crewvia ランチャが CREWVIA_MUX に変換）
+# 3. Director 経路 (未修正, open): config が env を上書きするブロックの実体
+git show origin/main:scripts/start.sh | sed -n '232,263p'
 ```
 
+優先順位（実装で確認済み）:
+- **Worker 経路**（両修正適用後）: 1. env の `CREWVIA_MUX_ENABLED` 明示（`0` も含め最優先。start.sh:597-601） → 2. env の `CREWVIA_MUX` 明示（config より優先。crewvia ランチャ / start.sh フォールバック双方） → 3. config/crewvia.yaml の `mode:`（crewvia ランチャが `CREWVIA_MUX` に変換）
+- **Director 経路**（open）: 1. config/crewvia.yaml の `mode:`（`CREWVIA_MUX_ENABLED` 未設定なら env の `CREWVIA_MUX` を無視して上書き。start.sh:232-263） → 2. env の `CREWVIA_MUX_ENABLED` 明示（設定済みならブロック自体をスキップするので事実上勝つが、Director 起動元の `crewvia` ランチャはこれを一度も export しないため実運用では到達しない）
+
 **注記**:
-- 本節は Director の要約ではなく `git show 1581d11` / `git show a26b60a` の実 diff とコミットメッセージに基づく
-- 監査時点の「未検証・低・LOW」という結論自体が本監査の同型欠陥（宣言と実装の食い違いを検証せずに楽観側で評価した）に該当する
+- 本節は Director の要約ではなく、`git show 1581d11` / `git show a26b60a` の実 diff・コミットメッセージ、および origin/main 実物 (`scripts/start.sh`, `crewvia`, `config/crewvia.yaml`, `CLAUDE.md`) への直接確認に基づく
+- 監査時点の「未検証・低・LOW」という結論、および t012 の「両方とも修正済み」という結論（Director 経路を見落とした点）は、いずれも本監査の同型欠陥（宣言と実装の食い違いを十分に検証せずに楽観側で評価した）に該当する
 
 ---
 
@@ -298,13 +316,15 @@ grep "NTFY_USER\|NTFY_PASS" scripts/start.sh
 
 **状態**: 本監査の scope（config/*.yaml, agents/*.md, CLAUDE.md, hooks/ の4観点。「監査対象と観点」節参照）に `.github/workflows/` が含まれておらず、CI が実際に何を実行しているかを見ないまま「テストはある」で済ませていた。これも「宣言（テストファイルが存在する）≠ 実装（CI で実行される）」という本監査と同型の欠陥。
 
-#### E-1: `tests/*.py` (pytest 8本) が CI で一度も実行されていなかった（修正済み: PR #200 / t006, merge commit `abcd434`）
+#### E-1: `tests/*.py` が CI で一度も実行されていなかった（修正済み: PR #200 / t006, merge commit `abcd434`）
 
-**宣言箇所**: `tests/test_*.py` 8ファイル（163 テストケース）が存在
+**宣言箇所（時点により件数が異なる。t014 で `git worktree add --detach <tmp> 8df15a3` + `python3 -m pytest tests/ --collect-only -q` を実行し実測、混在を訂正）**:
+- 監査時点 (8df15a3): `tests/test_*.py` 7ファイル・149テストケース（`test_orphan_daemon_guard.py` はまだ存在しない）
+- 現時点 (origin/main。#197 = `1e8be20` で `test_orphan_daemon_guard.py` が追加された後): `tests/test_*.py` 8ファイル・163テストケース
 
-**実際の状態（監査時点）**: `.github/workflows/ci.yml` には bats (`tests/*.bats`) と `scripts/test_handoff_path.sh` / `scripts/test_registry_lock.sh` を実行するジョブしかなく、pytest を実行するジョブが無かった。163件のテストコードは書かれていたが CI では一度も走っていなかった（ローカルで手動実行しない限り regression を検知できない状態）。
+**実際の状態（監査時点）**: `.github/workflows/ci.yml` には bats (`tests/*.bats`) と `scripts/test_handoff_path.sh` / `scripts/test_registry_lock.sh` を実行するジョブしかなく、pytest を実行するジョブが無かった。監査時点で書かれていた149件のテストコード（7ファイル）は CI では一度も走っていなかった（ローカルで手動実行しない限り regression を検知できない状態）。
 
-**修正**: `.github/workflows/ci.yml` に `pytest` ジョブを追加（`actions/setup-python@v5` (3.12) → `pip install pytest pyyaml` → `python3 -m pytest tests/ -v`）。`continue-on-error` 等は使っておらず、テスト失敗はそのまま job 失敗になる。163件 collect / 163件 pass を確認済み（PR #200 本文）。
+**修正**: `.github/workflows/ci.yml` に `pytest` ジョブを追加（`actions/setup-python@v5` (3.12) → `pip install pytest pyyaml` → `python3 -m pytest tests/ -v`）。`continue-on-error` 等は使っておらず、テスト失敗はそのまま job 失敗になる。PR #200 は #197 (`test_orphan_daemon_guard.py` 追加) の後に作られたため、163件 collect / 163件 pass を確認済み（PR #200 本文）。
 
 **倒れる方向**: 危険側（regression が CI で検知されずに merge される）。修正後は解消。
 
@@ -359,9 +379,9 @@ grep -n "test_handoff_path.sh\|test_registry_lock.sh\|pytest" .github/workflows/
 | A-1 | verification-profiles.yaml | 安全側 | 低（未実装機能） | LOW |
 | A-2 | autonomous-improvement.yaml | 安全側 | 中（指示と実装ギャップ） | MEDIUM |
 | B-1 | worktree edit ガード Bash抜け道 | 危険側 | 高（t009/t011 過去事故） | HIGH |
-| C-1 | CREWVIA_MUX 優先順位 | 危険側（修正済み） | 高（並列モードが無効化していた） | 修正済み（PR #196, #201） |
+| C-1 | CREWVIA_MUX 優先順位 | 危険側（Worker 経路は修正済み／Director 経路は open） | 高（並列モードが無効化していた。Director 経路は mux 分散事故が残存） | Worker 経路: 修正済み（PR #196, #201）／Director 経路: 未対応（open, Director backlog） |
 | D-1 | NTFY 認証情報設定 | 安全側 | 低（設計OK） | - |
-| E-1 | pytest が CI 未実行 | 危険側（修正済み） | 高（163件が regression 検知不能だった） | 修正済み（PR #200） |
+| E-1 | pytest が CI 未実行 | 危険側（修正済み） | 高（監査時点149件・修正時点163件が regression 検知不能だった） | 修正済み（PR #200） |
 | E-2 | scripts/test_*.sh 19本が CI 未実行 | 危険側 | 中〜高（未検証） | 未対応（open） |
 
 ---
@@ -370,8 +390,8 @@ grep -n "test_handoff_path.sh\|test_registry_lock.sh\|pytest" .github/workflows/
 
 以下は audit scope 外だが、Director の次ミッション判断時に検討すること：
 
-1. ~~**C-1 優先順位検証**: CREWVIA_MUX 環境変数と config mode の正確な優先順位確認~~
-   - **完了**: mission 20260912-verdict-ci-launcher で検証・修正済み（PR #196 merge commit `1581d11`, PR #201 merge commit `a26b60a`）。詳細は [C-1](#c-1-crewvia_mux--crewvia_mux_enabled-の優先順位--未検証ではなく実欠陥が2箇所あった-いずれも修正済み) 参照
+1. **C-1 優先順位検証**: CREWVIA_MUX 環境変数と config mode の正確な優先順位確認
+   - **部分完了**: Worker 経路の実欠陥2箇所は mission 20260912-verdict-ci-launcher で検証・修正済み（PR #196 merge commit `1581d11`, PR #201 merge commit `a26b60a`）。**Director 経路** (`scripts/start.sh` の `ROLE=director` ブロック) は env の `CREWVIA_MUX` より config `mode:` が優先されてしまう食い違いが未解決 (open) — 次ミッションで Director が修正方針を検討すること。詳細は上記 C-1 参照
 
 2. **A-2 autonomous-improvement.yaml 実装検討**:
    - Option 1: Worker が手動判定する現状を保持し、ドキュメント確認
@@ -391,8 +411,9 @@ grep -n "test_handoff_path.sh\|test_registry_lock.sh\|pytest" .github/workflows/
 ### 発見件数
 - **Dead config**: 2 件（verification-profiles.yaml, autonomous-improvement.yaml 実装部）
 - **Partial dead / 限界あり**: 1 件（worktree edit ガード Bash 抜け道）
-- **修正済み**: 2 件（CREWVIA_MUX 優先順位 [C-1] — PR #196/#201、pytest CI 未実行 [E-1] — PR #200）
-- **未対応 (open)**: 1 件（scripts/test_*.sh 19本の CI 未実行 [E-2]）
+- **修正済み**: 1 件（pytest CI 未実行 [E-1] — PR #200）
+- **部分修正済み（一部 open）**: 1 件（CREWVIA_MUX 優先順位 [C-1] — Worker 経路は PR #196/#201 で修正済み、Director 経路は未解決）
+- **未対応 (open)**: 2 件（CREWVIA_MUX 優先順位 Director 経路 [C-1 実欠陥3]、scripts/test_*.sh 19本の CI 未実行 [E-2]）
 - **健全**: 1 件（NTFY 認証情報 env 優先）
 - **scope 漏れの訂正**: 監査対象の4観点に `.github/workflows/` が含まれておらず、CI 未実行の finding (E-1/E-2) を当初見落としていた
 
@@ -408,7 +429,7 @@ grep -n "test_handoff_path.sh\|test_registry_lock.sh\|pytest" .github/workflows/
 3. **設計健全（env > config）だが指示ドキュメント曖昧**: NTFY 認証情報
    - 実装は正しいが、CLAUDE.md で「config に書かない」と明記されていない
 
-4. **「未検証」の楽観評価も同型欠陥になり得る**: C-1 は監査時点で「未検証・低・LOW」と結論したが、実際には危険側の実欠陥が2箇所あった。「効いているように見える／確認していないが低リスクだろう」という評価そのものが t001-t004 と同じ「検証せずに安全側だと仮定する」パターンに該当する
+4. **「未検証」の楽観評価も同型欠陥になり得る（訂正それ自体でも再発した）**: C-1 は監査時点で「未検証・低・LOW」と結論したが、実際には危険側の実欠陥が2箇所（Worker 経路）あった。「効いているように見える／確認していないが低リスクだろう」という評価そのものが t001-t004 と同じ「検証せずに安全側だと仮定する」パターンに該当する。さらに、この訂正 (t012) 自体も Worker 経路の2箇所を直しただけで「C-1 は解消」と結論し、別に残っていた Director 経路の食い違いを見落としていた（t014 で発見・訂正）。楽観評価パターンは1回訂正すれば終わりではなく、訂正のたびに再検証が必要
 
 5. **scope 設計に監査対象を検証する経路 (CI) が抜けていた**: E-1/E-2 はテストファイルの存在確認だけで「テストはある」と判断し、CI で実行されているかを見ていなかった。宣言（テストコード）と実装（CI 実行）のギャップという点で A-1/A-2 と同型
 
@@ -418,7 +439,8 @@ grep -n "test_handoff_path.sh\|test_registry_lock.sh\|pytest" .github/workflows/
 - **MEDIUM**: A-2 autonomous-improvement.yaml 実装 OR 指示確認・修正
 - **MEDIUM**: E-2 scripts/test_*.sh 19本の CI 追加を次ミッションで検討
 - **LOW**: A-1 verification-profiles.yaml の方針確認（実装か削除か）
-- ~~**LOW**: C-1 CREWVIA_MUX 優先順位を詳細検証~~ → **完了**（PR #196, #201 で修正済み）
+- ~~**LOW**: C-1 CREWVIA_MUX 優先順位を詳細検証~~ → **Worker 経路は完了**（PR #196, #201 で修正済み）
+- **MEDIUM**: C-1 Director 経路 (`scripts/start.sh:232-263` の `ROLE=director` ブロック) の env/config 優先順位食い違いを次ミッションで修正検討（open, Director backlog。t014 で発見）
 
 ---
 
@@ -431,3 +453,13 @@ grep -n "test_handoff_path.sh\|test_registry_lock.sh\|pytest" .github/workflows/
 **訂正・追記者**: Mei（Sonnet 5）  
 **訂正日**: 2026-09-12（mission 20260912-verdict-ci-launcher, t012）  
 **訂正内容**: C-1 の結論を「未検証・低・LOW」から「実欠陥2箇所・修正済み」に訂正（PR #196 merge commit `1581d11`, PR #201 merge commit `a26b60a`）。CI がテストを実行していない finding (E-1 pytest / E-2 scripts/test_*.sh) を追加。監査対象の4観点に `.github/workflows/` が含まれていなかった scope 漏れを明記。
+
+---
+
+**再訂正・追記者**: Mei（Sonnet 5）  
+**訂正日**: 2026-09-12（mission 20260912-verdict-ci-launcher, t014。PR #198 の t013 (Seo) fact-check レビュー F1-F5 対応）  
+**訂正内容**:
+- **F1/F2**: t012 の「C-1 は両実欠陥とも修正済みで解消」という結論は Worker 経路のみを指すもので不正確だった。Director 経路 (`scripts/start.sh:232-263` の `ROLE=director` ブロック) では env の `CREWVIA_MUX` に関係なく config `mode:` が優先されてしまう食い違いが別に存在し、未修正 (open, Director backlog)。origin/main の `scripts/start.sh` / `crewvia` / `config/crewvia.yaml` / `CLAUDE.md` を実物で確認し、C-1 を「Worker 経路: 修正済み」「Director 経路: open」に書き分けた（サマリ表・後続検証候補・まとめ件数・次アクションの全 `grep -n 'C-1'` 箇所を統一）
+- **F3**: 再現手順の `git show 1581d11 -- scripts/start.sh (修正後: 24-29行のコメント参照)` は誤り（24-29行はコミットメッセージ）。実体は `start.sh:578-596`（コメント）+ `597-601`（コード）と訂正
+- **F4**: E-1「監査時点で163件」の混在を訂正。監査対象 `8df15a3` 時点の `tests/*.py` は7ファイル・149テストケース（`git worktree add --detach` で当時のツリーを再現し `pytest --collect-only` で実測）。163件（8ファイル）は `test_orphan_daemon_guard.py` (#197 = `1e8be20`) 追加後の現在の件数
+- **F5**: 本 task では PR #198 のタイトル・本文を本ドキュメントの最終状態に合わせて更新（`gh pr edit 198`）

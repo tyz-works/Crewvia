@@ -54,6 +54,13 @@ _setup_scratch() {
   mkdir -p "$dir/scripts" "$dir/config" "$dir/queue/missions/testmission"
   cp "$REAL_REPO/scripts/review-plan.sh" "$dir/scripts/"
   cp "$REAL_REPO/scripts/lib_model.py" "$dir/scripts/"
+  # t018 (mission 20260912-verdict-ci-launcher): review-plan.sh は lib_verdict.py の
+  # 終了コード 10 (verdict 行の兆候なし) だけを「判定不能」とみなし、それ以外
+  # (スクリプト不在で python3 が返す 2 を含む) は書式違反として fail-closed に
+  # するようになった。このテストはモデル解決だけを見るため、以前は暗黙に
+  # 依存していた「lib_verdict.py が無い」状態の代わりに、兆候なしを返す
+  # スタブを明示的に置く。
+  printf '%s\n' 'import sys' 'sys.exit(10)' > "$dir/scripts/lib_verdict.py"
   # wait_for_plan_review.sh は即座に OK を返すスタブに差し替える
   # (ポーリング判定自体は scripts/test_wait_for_plan_review.sh が別途検証済み)。
   cat > "$dir/scripts/wait_for_plan_review.sh" << 'EOF'

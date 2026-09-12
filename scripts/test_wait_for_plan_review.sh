@@ -172,5 +172,60 @@ else
 fi
 
 echo ""
+echo "--- Test 8 (t018, Director 設計判断4): 書式違反・自己矛盾 (1行目 revise + 本文に approve) → OK にしない ---"
+F8="$TMPDIR_TEST/t8.md"
+START=$(date +%s)
+printf '%s\n' '**Verdict:** revise' '' '書式例:' '' '**Verdict:** approve' > "$F8"
+OUT="$(bash "$WAIT_SCRIPT" "$F8" "$START" 1 1)"; RC=$?
+STATUS="$(echo "$OUT" | head -1)"
+if [[ "$RC" -eq 1 && "$STATUS" == "TIMEOUT_FRESH" ]]; then
+  pass "書式違反 (lib_verdict rc=20) は OK にならず TIMEOUT_FRESH"
+else
+  fail "書式違反が OK として受理されている — rc=$RC status=$STATUS"
+fi
+
+# Test 9-11: lib_verdict.py の終了コード/出力を allowlist で解釈していることの確認。
+# wait_for_plan_review.sh は自分の隣の lib_verdict.py を呼ぶため、コピーした
+# ディレクトリにスタブを置く。
+_run_with_stub_lib() {
+  local dir="$1" stub_body="$2"
+  mkdir -p "$dir"
+  cp "$WAIT_SCRIPT" "$dir/wait_for_plan_review.sh"
+  printf '%s\n' "$stub_body" > "$dir/lib_verdict.py"
+  local start
+  start=$(date +%s)
+  printf '%s\n' '**Verdict:** approve' > "$dir/plan_review.md"
+  OUT="$(bash "$dir/wait_for_plan_review.sh" "$dir/plan_review.md" "$start" 1 1)"; RC=$?
+  STATUS="$(echo "$OUT" | head -1)"
+}
+
+echo ""
+echo "--- Test 9 (t018): lib_verdict.py が落ちた (未捕捉例外 = rc 1) → OK にしない ---"
+_run_with_stub_lib "$TMPDIR_TEST/w9" $'import sys\nsys.exit(1)'
+if [[ "$RC" -eq 1 && "$STATUS" == "TIMEOUT_FRESH" ]]; then
+  pass "lib_verdict rc=1 は OK にならない"
+else
+  fail "lib_verdict rc=1 で rc=$RC status=$STATUS"
+fi
+
+echo ""
+echo "--- Test 10 (t018): lib_verdict.py が rc 0 でも出力が正規の 1 語でない ('APPROVE') → OK にしない ---"
+_run_with_stub_lib "$TMPDIR_TEST/w10" 'print("APPROVE")'
+if [[ "$RC" -eq 1 && "$STATUS" == "TIMEOUT_FRESH" ]]; then
+  pass "rc 0 + 'APPROVE' は OK にならない"
+else
+  fail "rc 0 + 'APPROVE' で rc=$RC status=$STATUS"
+fi
+
+echo ""
+echo "--- Test 11 (対照): スタブが rc 0 + 'approve' を返す → OK (Test 9/10 のスタブ差し替えが効いていることの確認) ---"
+_run_with_stub_lib "$TMPDIR_TEST/w11" 'print("approve")'
+if [[ "$RC" -eq 0 && "$STATUS" == "OK" ]]; then
+  pass "rc 0 + 'approve' は OK"
+else
+  fail "対照が OK にならない (スタブが呼ばれていない可能性) — rc=$RC status=$STATUS"
+fi
+
+echo ""
 echo "== Results: $PASS_COUNT passed, $FAIL_COUNT failed =="
 [[ "$FAIL_COUNT" -eq 0 ]]

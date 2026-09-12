@@ -94,7 +94,9 @@ if [[ "\$WAIT_RC" -eq 0 && "\$WAIT_STATUS" == "OK" ]]; then
   # plan_review.verdict にアトミックに書く。plan.sh はこれだけを読む。
   VERDICT="\$(python3 "\$SCRIPT_DIR/lib_verdict.py" "\$REVIEW_OUTPUT" 2>/dev/null || true)"
   if [[ -n "\$VERDICT" ]]; then
-    printf '%s\n' "\$VERDICT" > "\${VERDICT_FILE}.tmp" && mv "\${VERDICT_FILE}.tmp" "\$VERDICT_FILE"
+    # t018: plan.sh が渡す実行ごとの識別子 (CREWVIA_PLAN_REVIEW_RUN_ID) を
+    # 2 行目に書く (本物の review-plan.sh と同じ形式。plan.sh は一致しなければ消費しない)。
+    printf '%s\nrun_id=%s\n' "\$VERDICT" "\${CREWVIA_PLAN_REVIEW_RUN_ID:-}" > "\${VERDICT_FILE}.tmp" && mv "\${VERDICT_FILE}.tmp" "\$VERDICT_FILE"
     exit 0
   fi
 fi
@@ -240,12 +242,17 @@ note
 
 **Verdict:** revise' "drafting" "" \
   "1行目 approve + 本文に revise → 自己矛盾として drafting"
+# t018 (mission 20260912-verdict-ci-launcher, Director 設計判断2) で挙動変更:
+# 以前は「同じ値の重複は矛盾ではない」として ready/approve だったが、verdict 行の
+# 兆候が 2 つ以上あるファイルは値によらず書式違反として扱う。値が同じかどうかを
+# 見ると、本文中の verdict 行の「値を読む」経路がもう 1 つ増え、1 行目 revise +
+# 本文 approve (QA t016 B_k1) と同じ形の読み違いの余地が残るため。
 _run_variant "dup_same_approve" '**Verdict:** approve
 
 note
 
-**Verdict:** approve' "ready" "approve" \
-  "同じ approve の重複は矛盾ではない → ready + approve (過剰な安全側倒れをしない)"
+**Verdict:** approve' "drafting" "" \
+  "同じ approve の重複 → t018 で書式違反 (兆候が 2 行) として drafting (挙動変更、安全側)"
 
 echo ""
 echo "--- 判定不能の一般化 (regression なし) ---"

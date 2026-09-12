@@ -1,47 +1,75 @@
 #!/usr/bin/env bash
 # scripts/test_review_plan_verdict_binding_e2e.sh
-# t015 (mission 20260912-verdict-ci-launcher) の回帰テスト。
+# t015 / t018 (mission 20260912-verdict-ci-launcher) の e2e 回帰テスト。
 #
-# 背景: PR #199 head 3388334 (t002 の修正) を Kai-codex (t004) と Finn (t003,
-# Opus QA) がそれぞれ独立に検証し、fail-open の欠陥を実測した:
-#
-#   FAIL-1 / Kai-codex P1 (TOCTOU): scripts/review-plan.sh:300 で
-#   PROSE_VERDICT を1回だけ読み、prose=revise/reject の場合は構造化出力を
-#   待たずに FINAL=prose で exit 0 する。EXIT trap の mux_kill が走る間に
-#   reviewer が plan_review.md の1行目を approve に再 Write すると、
-#   scripts/plan.sh (cmd_review) はその**書き換わった後の** plan_review.md を
-#   独立に読み直すため、構造化出力の確認なしに approve が消費される
-#   (Finn の T1/T1r で decisive に再現)。
-#
-# 本テストは、実物の `scripts/plan.sh review` → `scripts/review-plan.sh` →
-# `scripts/wait_for_plan_review.sh` / `scripts/lib_verdict.py` を通す e2e
-# ハーネス (Finn の QA t003 ハーネスと同じ設計) で T1/T1r を再現する。
-# 差し替えるのは scratch 側の scripts/lib_mux.sh だけ:
+# 実物の `scripts/plan.sh review` → `scripts/review-plan.sh` →
+# `scripts/wait_for_plan_review.sh` / `scripts/lib_verdict.py` を通す
+# (QA t003/t016 Finn のハーネスと同じ設計)。差し替えるのは scratch 側の
+# scripts/lib_mux.sh と、PATH 先頭の claude / herdr / tmux スタブだけ:
 #   - mux_spawn: reviewer の代わりに plan_review.md と PLAN_REVIEWER_LOG を
-#     同期的に書く (プローズは最初から読める規定形式にしておく)。
-#   - mux_kill: 呼ばれた**その場で** (同期的に) plan_review.md を書き換える
-#     — herdr の tab close が SIGHUP 後 2 秒以内に効くまでの間に reviewer が
-#     もう1ターン書き込む、という本番の窓を「kill が返る前に書き込みが必ず
-#     終わっている」形で決定論的に再現する (Finn の QA t003 と同じ考え方:
-#     「kill 開始をシナリオに通知し、書き込み完了を待つ」)。
-#   - mux_pid: 書き換えが完了済みなら「見つからない (=停止確認できる)」を
-#     返す。
+#     書く (log_delay > 0 ならログはバックグラウンドで遅れて書く)。
+#     呼ばれた印 (stub_mux_spawn_called) を残す。
+#   - mux_kill: 呼ばれたその場で (同期的に) plan_review.md を書き換える —
+#     herdr の tab close が効くまでの間に reviewer がもう 1 回 Write する、
+#     という本番の窓を決定論的に再現する。
+#   - mux_pid: 書き換えが完了済みなら「見つからない (=停止確認できる)」を返す。
+#   - claude / herdr / tmux: 呼ばれたら記録して exit 97。1 回でも呼ばれたら FAIL。
+# 各ケースで「スタブ mux_spawn が呼ばれた」「実物/スタブのバイナリが呼ばれて
+# いない」を確認し、さらに全ケースの前に SANITY ケースが通ることを確認する
+# (通らなければ以降を実行せず exit 1)。
 #
-# 3388334 (修正前) は T1/T1r で status: ready / last_verdict: approve に
-# なることを、本テストで実際に検証している (下記 _verify_regression_on_old
-# 参照 — 実行すると一時的に review-plan.sh を旧版に差し替えて red を確認し、
-# 元に戻す)。
+# 本体スイート (現在の作業ツリーのコード):
+#   - t015: T1/T1r (TOCTOU) / F2c / F2g / E1 (envelope) / Decision1 (束縛)
+#   - t018 (QA t016 Finn FAIL-A / Kai-codex P1, Director 設計判断1-4):
+#     B_k1〜B_k5 × structured=approve / blockquote・インデント・リスト・フェンス内の
+#     approve 引用 + 1 行目 revise / 同じ値の重複 / 太字なし / 不正 UTF-8
+#     → いずれも ready にならず refund (cycle_count=0)。
+#     兆候なしの別表記 + structured=approve → ready (救済は残る)。
+#
+# --verify-red (t018, QA t016 Finn FAIL-B / Kai-codex P2 で作り直し):
+#   t015 版はここで `git show HEAD:...` を読んでいたため、修正版を commit した
+#   後は修正版そのものを「旧版」として実行していた。さらに本体スイートの
+#   PASS/FAIL カウンタを 0 にリセットしていたため、本体の失敗があっても
+#   exit 0 になっていた (Finn G2)。作り直した内容:
+#     1. 脆弱版を commit sha で固定し、`git archive <sha>` で scripts/ と config/
+#        を丸ごと取り出して実行する (現在のツリーのファイルを混ぜない)。
+#        実行したファイルの blob id を表示し、固定した sha の blob id と一致
+#        しなければ FAIL にする。
+#          3388334 (t002): T1 / T1r (TOCTOU) / E1 (envelope) / CR (lib_verdict CLI)
+#          b21d4b4 (t015): B_k1〜B_k5 (自己矛盾・書式違反の救済)
+#     2. 期待するのは「脆弱な結果 (status=ready / verdict=approve) が再現する
+#        こと」。再現しなければ red 確認そのものを FAIL にする。
+#     3. red のカウンタは本体スイートと別に持ち、本体をリセットしない。
+#        終了コードは「本体の失敗 0 件 かつ red の未再現 0 件」のときだけ 0。
+#     4. G2 のメタテスト: 作業ツリーのコピーに 3388334 の review-plan.sh と
+#        plan.sh を置いてこのスクリプト自身を --verify-red で実行し、
+#        本体の失敗が非 0 終了に反映されることを確認する。
+#
+# 環境変数 (主にメタテスト用):
+#   BINDING_E2E_GIT_REPO     脆弱版を取り出す git リポジトリ (既定: このスクリプトのリポジトリ)
+#   BINDING_E2E_CASE_FILTER  ラベルに対する正規表現。指定時は一致するケースだけ実行
+#   BINDING_E2E_SKIP_META=1  G2 メタテストを実行しない
 #
 # 実行: bash scripts/test_review_plan_verdict_binding_e2e.sh
 #       bash scripts/test_review_plan_verdict_binding_e2e.sh --verify-red
-#         (追加で 3388334 相当の review-plan.sh を使い、T1 が red で
-#          あることを確認してから元のスクリプトで再実行する)
 
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OWN_CHECKOUT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-PLAN_SH="$OWN_CHECKOUT_ROOT/scripts/plan.sh"
+GIT_REPO="${BINDING_E2E_GIT_REPO:-$OWN_CHECKOUT_ROOT}"
+CASE_FILTER="${BINDING_E2E_CASE_FILTER:-}"
+
+VERIFY_RED=0
+[[ "${1:-}" == "--verify-red" ]] && VERIFY_RED=1
+
+# 脆弱版として固定する commit (PR #199 の履歴上の実在 commit)。
+RED_SHA_T002="3388334"   # t002: TOCTOU / envelope / CR が未修正
+RED_SHA_T015="b21d4b4"   # t015: 自己矛盾・書式違反を構造化出力で救済してしまう
+
+# 本番の mux / queue / Taskvia に触れないための保険 (呼び出し側でも env -u すること)。
+unset CREWVIA_MUX CREWVIA_MUX_ENABLED CREWVIA_TMUX HERDR_ENV TMUX CREWVIA_REPO_ROOT \
+      TASKVIA_URL TASKVIA_TOKEN 2>/dev/null || true
 
 # 実行を速くするためだけに、構造化出力待ちの上限を縮める (本番デフォルトは
 # 3秒/180秒)。見つかった場合は即座に抜けるので正常系には影響しない。
@@ -52,75 +80,109 @@ export REVIEW_PLAN_STOP_CONFIRM_MAX_SECONDS=2
 
 PASS_COUNT=0
 FAIL_COUNT=0
-pass() { PASS_COUNT=$((PASS_COUNT + 1)); echo "  PASS: $1"; }
-fail() { FAIL_COUNT=$((FAIL_COUNT + 1)); echo "  FAIL: $1"; }
+RED_PASS_COUNT=0
+RED_FAIL_COUNT=0
+COUNTER_GROUP="main"
+pass() {
+  if [[ "$COUNTER_GROUP" == "red" ]]; then RED_PASS_COUNT=$((RED_PASS_COUNT + 1)); else PASS_COUNT=$((PASS_COUNT + 1)); fi
+  echo "  PASS: $1"
+}
+fail() {
+  if [[ "$COUNTER_GROUP" == "red" ]]; then RED_FAIL_COUNT=$((RED_FAIL_COUNT + 1)); else FAIL_COUNT=$((FAIL_COUNT + 1)); fi
+  echo "  FAIL: $1"
+}
 
-echo "== test_review_plan_verdict_binding_e2e.sh (t015, QA t003 Finn FAIL-1 T1/T1r 実測の恒久化) =="
+# 実行するコードの出どころ。SRC_ROOT/scripts/plan.sh を起動し、
+# SRC_ROOT/scripts/* と SRC_ROOT/config/* を scratch にコピーする。
+# PINNED_SHA が空でなければ、実行したファイルの blob id をその sha と照合する。
+SRC_ROOT="$OWN_CHECKOUT_ROOT"
+PINNED_SHA=""
+
+echo "== test_review_plan_verdict_binding_e2e.sh (t015 T1/T1r TOCTOU + t018 FAIL-A 自己矛盾の救済 / FAIL-B red ハーネス) =="
 
 _cleanup_dir() {
   python3 -c "import shutil,sys; shutil.rmtree(sys.argv[1], ignore_errors=True)" "$1" 2>/dev/null || true
 }
 
-# $1 = label, $2 = initial_prose (mux_spawn が同期的に書く plan_review.md の
-# 本文), $3 = rewrite_prose ("" なら mux_kill は何もしない。非空なら
-# mux_kill が同期的にこの内容へ書き換える), $4 = log_body ("" なら構造化
-# 出力は一切出さない), $5 = log_delay_seconds (0 なら mux_spawn が同期的に
-# 書く。>0 ならバックグラウンドで指定秒後に書く — F2g 用),
-# $6 = expect_status (ready|drafting), $7 = expect_verdict ("" は null 期待),
-# $8 = review_plan_sh_path (省略時は実物)
+_selected() {
+  [[ -z "$CASE_FILTER" || "$1" =~ $CASE_FILTER ]]
+}
+
+# $1 = label, $2 = initial_prose (mux_spawn が書く plan_review.md の本文),
+# $3 = rewrite_prose ("" なら mux_kill は何もしない), $4 = log_body
+# ("" なら構造化出力は一切出さない), $5 = log_delay_seconds,
+# $6 = expect_status (ready|drafting), $7 = expect_verdict ("" は null 期待)。
+# cycle_count は verdict が null なら 0 (refund)、それ以外は 1 を期待する。
 _run_case() {
   local label="$1" initial_prose="$2" rewrite_prose="$3" log_body="$4" \
-        log_delay="$5" expect_status="$6" expect_verdict="$7" \
-        review_plan_sh_path="${8:-$OWN_CHECKOUT_ROOT/scripts/review-plan.sh}"
+        log_delay="$5" expect_status="$6" expect_verdict="$7"
+  _selected "$label" || return 0
 
+  local src="$SRC_ROOT"
+  local plan_sh="$src/scripts/plan.sh"
   local T="/tmp/crewvia-test-verdict-binding-e2e-$$-$(date +%s%N)"
   _cleanup_dir "$T"
-  mkdir -p "$T/scripts" "$T/config"
+  mkdir -p "$T/scripts" "$T/config" "$T/stubbin"
   export CREWVIA_QUEUE="$T/queue"
-  unset TASKVIA_URL TASKVIA_TOKEN 2>/dev/null || true
 
-  cp "$OWN_CHECKOUT_ROOT/scripts/lint_plan.py" "$T/scripts/"
-  cp "$OWN_CHECKOUT_ROOT/scripts/lib_verdict.py" "$T/scripts/"
-  cp "$OWN_CHECKOUT_ROOT/scripts/lib_model.py" "$T/scripts/"
-  cp "$OWN_CHECKOUT_ROOT/scripts/wait_for_plan_review.sh" "$T/scripts/"
-  cp "$review_plan_sh_path" "$T/scripts/review-plan.sh"
-  cp -r "$OWN_CHECKOUT_ROOT/config/." "$T/config/"
-  "$PLAN_SH" init "Test Mission" --mission testmission >/dev/null 2>&1
+  local f
+  for f in lint_plan.py lib_verdict.py lib_model.py wait_for_plan_review.sh review-plan.sh; do
+    if ! cp "$src/scripts/$f" "$T/scripts/"; then
+      fail "$label — setup: could not copy scripts/$f from $src"
+      _cleanup_dir "$T"
+      return 0
+    fi
+  done
+  cp -r "$src/config/." "$T/config/"
+  "$plan_sh" init "Test Mission" --mission testmission >/dev/null 2>&1
 
-  local review_output="$T/queue/missions/testmission/plan_review.md"
-  local verdict_file="$T/queue/missions/testmission/plan_review.verdict"
+  local mission_dir="$T/queue/missions/testmission"
+  local review_output="$mission_dir/plan_review.md"
+  local verdict_file="$mission_dir/plan_review.verdict"
   local rewrite_flag="$T/rewrite_done.flag"
+  local spawn_marker="$T/stub_mux_spawn_called"
+  local binary_marker="$T/stub_binary_called"
+  local pid_file="$T/review_plan_pid"
 
-  # スタブ lib_mux.sh。mux_spawn/mux_kill は sourced function として
-  # review-plan.sh 自身のプロセスで実行されるため、中で使う $$ は
-  # review-plan.sh の PID と一致する (PLAN_REVIEWER_LOG の実際のパスと合わせる
-  # ため)。
+  printf '%s\n' "$initial_prose" > "$T/initial_prose"
+  [[ -n "$rewrite_prose" ]] && printf '%s\n' "$rewrite_prose" > "$T/rewrite_prose"
+  [[ -n "$log_body" ]] && printf '%s\n' "$log_body" > "$T/log_body"
+
+  local b
+  for b in claude herdr tmux; do
+    printf '#!/usr/bin/env bash\necho "%s $*" >> "%s"\nexit 97\n' "$b" "$binary_marker" > "$T/stubbin/$b"
+    chmod +x "$T/stubbin/$b"
+  done
+
+  # スタブ lib_mux.sh。mux_* は sourced function として review-plan.sh 自身の
+  # プロセスで実行されるため、中の $$ は review-plan.sh の PID
+  # (= PLAN_REVIEWER_LOG の実際のパス) と一致する。
   cat > "$T/scripts/lib_mux.sh" << EOF
 mux_available() { return 0; }
 mux_spawn() {
-  printf '%s\n' '${initial_prose}' > "${review_output}"
-  if [[ "${log_delay}" -gt 0 ]]; then
-    ( sleep ${log_delay}; printf '%s\n' '${log_body}' > "/tmp/plan_reviewer_\$\$.log" ) &
-    disown 2>/dev/null || true
-  else
-    printf '%s\n' '${log_body}' > "/tmp/plan_reviewer_\$\$.log"
+  touch "${spawn_marker}"
+  echo "\$\$" > "${pid_file}"
+  cp "${T}/initial_prose" "${review_output}.stubtmp" && mv "${review_output}.stubtmp" "${review_output}"
+  if [[ -f "${T}/log_body" ]]; then
+    if [[ "${log_delay}" -gt 0 ]]; then
+      ( sleep ${log_delay}; cp "${T}/log_body" "/tmp/plan_reviewer_\$\$.log.stubtmp" && mv "/tmp/plan_reviewer_\$\$.log.stubtmp" "/tmp/plan_reviewer_\$\$.log" ) &
+      disown 2>/dev/null || true
+    else
+      cp "${T}/log_body" "/tmp/plan_reviewer_\$\$.log"
+    fi
   fi
   return 0
 }
 mux_kill() {
-  # Finn の QA t003 と同じ考え方: kill が返る前に、herdr の SIGHUP 猶予
-  # (最大2秒) の間に起きうる reviewer のもう1回の Write を**同期的に**
-  # 完了させてから返す。これにより「kill 呼び出し後・停止確認前」の窓を
-  # 決定論的に踏む。
-  if [[ -n "${rewrite_prose}" ]]; then
-    printf '%s\n' '${rewrite_prose}' > "${review_output}"
+  # kill が返る前に、herdr の SIGHUP 猶予 (最大2秒) の間に起きうる reviewer の
+  # もう1回の Write を同期的に完了させてから返す。
+  if [[ -f "${T}/rewrite_prose" ]]; then
+    cp "${T}/rewrite_prose" "${review_output}"
   fi
   touch "${rewrite_flag}"
   return 0
 }
 mux_pid() {
-  # 書き換え (または no-op の場合はそもそも rewrite_flag) が完了していれば
-  # 「見つからない」(exit 1) = 停止確認できる。
   if [[ -f "${rewrite_flag}" ]]; then
     return 1
   fi
@@ -129,88 +191,173 @@ mux_pid() {
 }
 EOF
 
-  set +e
-  OUT="$("$PLAN_SH" review testmission 2>&1)"
-  set -e
+  local out rc=0
+  out="$(PATH="$T/stubbin:$PATH" "$plan_sh" review testmission 2>&1)" || rc=$?
 
-  local status verdict got_verdict_file="<none>"
-  status="$(awk '/^status:/ { print $2; exit }' "$T/queue/missions/testmission/mission.yaml" 2>/dev/null)"
-  verdict="$(awk '/^  last_verdict:/ { print $2; exit }' "$T/queue/missions/testmission/mission.yaml" 2>/dev/null)"
-  [[ -f "$verdict_file" ]] && got_verdict_file="$(cat "$verdict_file")"
+  local status verdict cycle got_verdict_file="<none>"
+  status="$(awk '/^status:/ { print $2; exit }' "$mission_dir/mission.yaml" 2>/dev/null)"
+  verdict="$(awk '/^  last_verdict:/ { print $2; exit }' "$mission_dir/mission.yaml" 2>/dev/null)"
+  cycle="$(awk '/^  cycle_count:/ { print $2; exit }' "$mission_dir/mission.yaml" 2>/dev/null)"
+  [[ -f "$verdict_file" ]] && got_verdict_file="$(tr '\n' '|' < "$verdict_file")"
 
-  local status_ok="false" verdict_ok="false"
-  [[ "$status" == "$expect_status" ]] && status_ok="true"
+  local problems=()
+  [[ -f "$spawn_marker" ]] || problems+=("stub mux_spawn was NOT called — the pipeline was not exercised")
+  [[ -s "$binary_marker" ]] && problems+=("a claude/herdr/tmux binary was invoked: $(tr '\n' ';' < "$binary_marker")")
+  [[ "$status" == "$expect_status" ]] || problems+=("status=$status (expected $expect_status)")
   if [[ -z "$expect_verdict" ]]; then
-    [[ "$verdict" == "null" || -z "$verdict" ]] && verdict_ok="true"
+    [[ "$verdict" == "null" || -z "$verdict" ]] || problems+=("last_verdict=$verdict (expected null)")
   else
-    [[ "$verdict" == "$expect_verdict" ]] && verdict_ok="true"
+    [[ "$verdict" == "$expect_verdict" ]] || problems+=("last_verdict=$verdict (expected $expect_verdict)")
+  fi
+  local expect_cycle=1
+  [[ -z "$expect_verdict" ]] && expect_cycle=0
+  [[ "$cycle" == "$expect_cycle" ]] || problems+=("cycle_count=$cycle (expected $expect_cycle)")
+
+  if [[ -n "$PINNED_SHA" ]]; then
+    local pair path executed want got under_test
+    for pair in \
+        "scripts/plan.sh|$plan_sh" \
+        "scripts/lib_verdict.py|$src/scripts/lib_verdict.py" \
+        "scripts/review-plan.sh|$T/scripts/review-plan.sh" \
+        "scripts/wait_for_plan_review.sh|$T/scripts/wait_for_plan_review.sh" \
+        "scripts/lib_verdict.py|$T/scripts/lib_verdict.py"; do
+      path="${pair%%|*}"
+      executed="${pair#*|}"
+      want="$(git -C "$GIT_REPO" rev-parse "$PINNED_SHA:$path" 2>/dev/null)"
+      got="$(git -C "$GIT_REPO" hash-object --no-filters "$executed" 2>/dev/null)"
+      under_test="$(git -C "$GIT_REPO" hash-object --no-filters "$OWN_CHECKOUT_ROOT/$path" 2>/dev/null)"
+      echo "    executed ${executed#/tmp/} blob=${got:-?} | $PINNED_SHA:$path=${want:-?} | tree under test=${under_test:-?}"
+      [[ -n "$want" && "$got" == "$want" ]] || problems+=("executed $path does not match $PINNED_SHA")
+    done
   fi
 
-  if [[ "$status_ok" == "true" && "$verdict_ok" == "true" ]]; then
-    pass "$label — status=$status verdict=$verdict (plan_review.verdict=$got_verdict_file)"
+  if [[ "${#problems[@]}" -eq 0 ]]; then
+    pass "$label — status=$status verdict=$verdict cycle_count=$cycle (plan_review.verdict=$got_verdict_file)"
   else
-    fail "$label — expected status=$expect_status verdict=${expect_verdict:-null}, got status=$status verdict=$verdict (plan_review.verdict=$got_verdict_file). plan.sh review output: $OUT"
+    local joined
+    joined="$(printf '%s; ' "${problems[@]}")"
+    fail "$label — ${joined}plan.sh review output: $out"
+  fi
+
+  if [[ -f "$pid_file" ]]; then
+    rm -f "/tmp/plan_reviewer_$(cat "$pid_file").log"
   fi
   _cleanup_dir "$T"
+  unset CREWVIA_QUEUE
+  return 0
 }
 
 RESULT_JSON_APPROVE='{"type":"result","subtype":"success","is_error":false,"structured_output":{"verdict":"approve"}}'
+RESULT_JSON_REVISE='{"type":"result","subtype":"success","is_error":false,"structured_output":{"verdict":"revise"}}'
+RESULT_JSON_ERROR_APPROVE='{"type":"result","subtype":"error_during_execution","is_error":true,"structured_output":{"verdict":"approve"}}'
+
+PROSE_K1=$'**Verdict:** revise\n\n# Plan Review: testmission\n\n書式例として:\n\n**Verdict:** approve'
+PROSE_K2=$'**Verdict:** approve\n\n# Plan Review: testmission\n\n**Verdict:** revise'
+PROSE_K3='**Verdict:** revise (重大な指摘あり)'
+PROSE_K4='**Verdict:** REVISE'
+PROSE_K5=$'**Verdict:** reject\n\n# Plan Review: testmission\n\n**Verdict:** approve'
 
 echo ""
-echo "--- T1 (FAIL-1, Kai-codex P1): prose=revise で検証 → kill 中に reviewer が approve へ再 Write, structured 無し ---"
-echo "    修正前 (3388334) は status: ready / verdict: approve になっていた (下の --verify-red 参照)。"
+echo "--- SANITY: スタブ経由でパイプラインが動くこと (prose=approve + structured=approve → ready/approve) ---"
+SANITY_FAIL_BEFORE="$FAIL_COUNT"
+CASE_FILTER_SAVED="$CASE_FILTER"
+CASE_FILTER=""
+_run_case "SANITY: approve + structured=approve (即時) → ready/approve" \
+  '**Verdict:** approve' '' "$RESULT_JSON_APPROVE" 0 "ready" "approve"
+CASE_FILTER="$CASE_FILTER_SAVED"
+if [[ "$FAIL_COUNT" -ne "$SANITY_FAIL_BEFORE" ]]; then
+  echo "  ABORT: sanity case failed — the stubbed pipeline is not working, refusing to run the real cases"
+  exit 1
+fi
+
+echo ""
+echo "--- T1 (t015 FAIL-1, Kai-codex P1): prose=revise で検証 → kill 中に reviewer が approve へ再 Write, structured 無し ---"
 _run_case "T1 (revise → kill 中に approve へ再Write, structured無し)" \
-  '**Verdict:** revise' '**Verdict:** approve' '' 0 \
-  "drafting" ""
+  '**Verdict:** revise' '**Verdict:** approve' '' 0 "drafting" ""
 
 echo ""
 echo "--- T1r (FAIL-1 亜種): prose=reject で検証 → kill 中に approve へ再 Write ---"
 _run_case "T1r (reject → kill 中に approve へ再Write, structured無し)" \
-  '**Verdict:** reject' '**Verdict:** approve' '' 0 \
-  "drafting" ""
+  '**Verdict:** reject' '**Verdict:** approve' '' 0 "drafting" ""
 
 echo ""
-echo "--- 対照 (regression なし): prose=revise で検証 → 書き換えなし、structured 無し → 正しく revise として消費 ---"
-_run_case "対照: revise, 書き換えなし → drafting/revise" \
-  '**Verdict:** revise' '' '' 0 \
-  "drafting" "revise"
+echo "--- 対照: prose=revise, 書き換えなし, structured 無し → revise として消費 ---"
+_run_case "対照: revise, 書き換えなし, structured無し → drafting/revise" \
+  '**Verdict:** revise' '' '' 0 "drafting" "revise"
 
 echo ""
-echo "--- 対照 (regression なし): prose=approve, structured=approve 即時 → ready/approve (正常系が壊れていないこと) ---"
-_run_case "対照: approve + structured=approve (即時) → ready/approve" \
-  '**Verdict:** approve' '' "$RESULT_JSON_APPROVE" 0 \
-  "ready" "approve"
-
-echo ""
-echo "--- F2c (Director 設計判断2/3 の正常系): prose=approve, structured=approve が遅延到着 → ready/approve (手動確認に落ちない) ---"
+echo "--- F2c (正常系): prose=approve, structured=approve が遅延到着 → ready/approve ---"
 _run_case "F2c: approve + structured=approve (1秒遅延) → ready/approve" \
-  '**Verdict:** approve' '' "$RESULT_JSON_APPROVE" 1 \
-  "ready" "approve"
+  '**Verdict:** approve' '' "$RESULT_JSON_APPROVE" 1 "ready" "approve"
 
 echo ""
-echo "--- F2g (Finn 実測, Director 設計判断2): prose=revise, structured=approve が遅延到着 → 食い違いとして fail-closed (以前は revise を待たず消費し、この食い違いを検出できなかった) ---"
-RESULT_JSON_APPROVE_FOR_F2G='{"type":"result","subtype":"success","is_error":false,"structured_output":{"verdict":"approve"}}'
-_run_case "F2g: revise(prose) + structured=approve (1秒遅延) → 食い違い検出、drafting/null (cycle refund)" \
-  '**Verdict:** revise' '' "$RESULT_JSON_APPROVE_FOR_F2G" 1 \
-  "drafting" ""
+echo "--- F2g: prose=revise, structured=approve が遅延到着 → 食い違いとして fail-closed ---"
+_run_case "F2g: revise(prose) + structured=approve (1秒遅延) → drafting/null (refund)" \
+  '**Verdict:** revise' '' "$RESULT_JSON_APPROVE" 1 "drafting" ""
 
 echo ""
-echo "--- Decision1 直接確認: plan_review.md が review-plan.sh 終了後に外部から書き換わっても、plan.sh は plan_review.verdict の値だけを使う ---"
-# review-plan.sh 自体は正常終了 (revise, 書き換えなし) させ、plan.sh が
-# plan_review.md を読む**前**に plan_review.md を外部から approve に
-# 書き換える — もし plan.sh が (t015 以前のように) plan_review.md を
-# 独立に読み直していたら、これは approve になってしまう。
-T_BIND="/tmp/crewvia-test-verdict-binding-direct-$$"
-_cleanup_dir "$T_BIND"
-mkdir -p "$T_BIND/scripts" "$T_BIND/config"
-export CREWVIA_QUEUE="$T_BIND/queue"
-cp "$OWN_CHECKOUT_ROOT/scripts/lint_plan.py" "$T_BIND/scripts/"
-cp "$OWN_CHECKOUT_ROOT/scripts/lib_verdict.py" "$T_BIND/scripts/"
-cp -r "$OWN_CHECKOUT_ROOT/config/." "$T_BIND/config/"
-"$PLAN_SH" init "Test Mission" --mission testmission >/dev/null 2>&1
-BIND_REVIEW_OUTPUT="$T_BIND/queue/missions/testmission/plan_review.md"
-BIND_VERDICT_FILE="$T_BIND/queue/missions/testmission/plan_review.verdict"
-cat > "$T_BIND/scripts/review-plan.sh" << EOF
+echo "--- E1 (t015 Codex P2): prose=approve + envelope is_error:true → 信頼しない ---"
+_run_case "E1: approve + structured envelope is_error:true → drafting/null (refund)" \
+  '**Verdict:** approve' '' "$RESULT_JSON_ERROR_APPROVE" 0 "drafting" ""
+
+echo ""
+echo "--- t018 FAIL-A (QA t016 B_k1〜B_k5 × structured=approve): ready にならず refund ---"
+_run_case "B_k1: 1行目 revise + 本文に approve + structured=approve (1秒遅延) → drafting/null" \
+  "$PROSE_K1" '' "$RESULT_JSON_APPROVE" 1 "drafting" ""
+_run_case "B_k2: 1行目 approve + 本文に revise + structured=approve → drafting/null" \
+  "$PROSE_K2" '' "$RESULT_JSON_APPROVE" 0 "drafting" ""
+_run_case "B_k3: '**Verdict:** revise (重大な指摘あり)' + structured=approve → drafting/null" \
+  "$PROSE_K3" '' "$RESULT_JSON_APPROVE" 0 "drafting" ""
+_run_case "B_k4: '**Verdict:** REVISE' + structured=approve → drafting/null" \
+  "$PROSE_K4" '' "$RESULT_JSON_APPROVE" 0 "drafting" ""
+_run_case "B_k5: 1行目 reject + 本文に approve + structured=approve → drafting/null" \
+  "$PROSE_K5" '' "$RESULT_JSON_APPROVE" 0 "drafting" ""
+
+echo ""
+echo "--- t018: approve 引用の記法を問わない (1行目 revise + 引用 approve + structured=approve) ---"
+_run_case "Q_blockquote: 1行目 revise + '> **Verdict:** approve' → drafting/null" \
+  $'**Verdict:** revise\n\n前回の判定:\n\n> **Verdict:** approve' '' "$RESULT_JSON_APPROVE" 0 "drafting" ""
+_run_case "Q_indent: 1行目 revise + '    **Verdict:** approve' → drafting/null" \
+  $'**Verdict:** revise\n\n書式:\n\n    **Verdict:** approve' '' "$RESULT_JSON_APPROVE" 0 "drafting" ""
+_run_case "Q_list: 1行目 revise + '- **Verdict:** approve' → drafting/null" \
+  $'**Verdict:** revise\n\n- **Verdict:** approve' '' "$RESULT_JSON_APPROVE" 0 "drafting" ""
+_run_case "Q_fence: 1行目 revise + フェンス内 approve → drafting/null" \
+  $'**Verdict:** revise\n\n```\n**Verdict:** approve\n```' '' "$RESULT_JSON_APPROVE" 0 "drafting" ""
+
+echo ""
+echo "--- t018: その他の書式違反 × structured=approve ---"
+_run_case "DUP: 1行目 approve + 本文にも approve (同じ値の重複, Director 設計判断2) → drafting/null" \
+  $'**Verdict:** approve\n\nnote\n\n**Verdict:** approve' '' "$RESULT_JSON_APPROVE" 0 "drafting" ""
+_run_case "NOBOLD: 'Verdict: revise' (太字なし, 兆候の上位集合) → drafting/null" \
+  'Verdict: revise' '' "$RESULT_JSON_APPROVE" 0 "drafting" ""
+_run_case "BADUTF8: 兆候の無い別表記 + 不正な UTF-8 バイト (兆候の有無を確認できない) → drafting/null" \
+  $'## 総合判定: GO\n\xff\xfe' '' "$RESULT_JSON_APPROVE" 0 "drafting" ""
+_run_case "VIOL_NOSTRUCT: B_k1 + structured 無し → drafting/null" \
+  "$PROSE_K1" '' '' 0 "drafting" ""
+
+echo ""
+echo "--- t018: 救済と正常系は残る ---"
+_run_case "RESCUE: 兆候なしの別表記 (## 総合判定: GO) + structured=approve → ready/approve" \
+  $'# Plan Review: testmission\n\n## 総合判定: GO' '' "$RESULT_JSON_APPROVE" 0 "ready" "approve"
+_run_case "RESCUE_REVISE: 兆候なしの別表記 + structured=revise → drafting/revise" \
+  $'# Plan Review: testmission\n\n## 総合判定: 要修正' '' "$RESULT_JSON_REVISE" 0 "drafting" "revise"
+_run_case "NORMAL: 1行目 approve のみ + 雛形の注記 '(verdict が…)' + structured=approve (1秒遅延) → ready/approve" \
+  $'**Verdict:** approve\n\n# Plan Review: testmission\n\n## Issues\n(verdict が revise/reject の場合のみ記載)' '' "$RESULT_JSON_APPROVE" 1 "ready" "approve"
+
+if _selected "Decision1"; then
+  echo ""
+  echo "--- Decision1 直接確認: plan_review.md が review-plan.sh 終了後に外部から書き換わっても、plan.sh は plan_review.verdict の値だけを使う ---"
+  # review-plan.sh 自体は正常終了 (revise) させ、plan.sh が plan_review.verdict を
+  # 読む前に plan_review.md を外部から approve に書き換える。
+  T_BIND="/tmp/crewvia-test-verdict-binding-direct-$$"
+  _cleanup_dir "$T_BIND"
+  mkdir -p "$T_BIND/scripts" "$T_BIND/config"
+  export CREWVIA_QUEUE="$T_BIND/queue"
+  cp "$OWN_CHECKOUT_ROOT/scripts/lint_plan.py" "$T_BIND/scripts/"
+  cp "$OWN_CHECKOUT_ROOT/scripts/lib_verdict.py" "$T_BIND/scripts/"
+  cp -r "$OWN_CHECKOUT_ROOT/config/." "$T_BIND/config/"
+  "$OWN_CHECKOUT_ROOT/scripts/plan.sh" init "Test Mission" --mission testmission >/dev/null 2>&1
+  cat > "$T_BIND/scripts/review-plan.sh" << EOF
 #!/usr/bin/env bash
 set -uo pipefail
 SLUG="\$1"
@@ -220,58 +367,136 @@ REVIEW_OUTPUT="\$MISSION_DIR/plan_review.md"
 VERDICT_FILE="\$MISSION_DIR/plan_review.verdict"
 rm -f "\$REVIEW_OUTPUT" "\$VERDICT_FILE"
 printf '%s\n' '**Verdict:** revise' > "\$REVIEW_OUTPUT"
-printf '%s\n' 'revise' > "\${VERDICT_FILE}.tmp" && mv "\${VERDICT_FILE}.tmp" "\$VERDICT_FILE"
-# review-plan.sh が確定して exit した**後**に、何者か (herdr の遅延書き込み・
-# 別プロセス等) が plan_review.md を書き換える、という最悪ケースを模す。
+printf '%s\nrun_id=%s\n' 'revise' "\${CREWVIA_PLAN_REVIEW_RUN_ID:-}" > "\${VERDICT_FILE}.tmp" && mv "\${VERDICT_FILE}.tmp" "\$VERDICT_FILE"
+# review-plan.sh が確定して exit した後に、何者かが plan_review.md を書き換える最悪ケース。
 printf '%s\n' '**Verdict:** approve' > "\$REVIEW_OUTPUT"
 exit 0
 EOF
-chmod +x "$T_BIND/scripts/review-plan.sh"
-set +e
-BIND_OUT="$("$PLAN_SH" review testmission 2>&1)"
-set -e
-BIND_STATUS="$(awk '/^status:/ { print $2; exit }' "$T_BIND/queue/missions/testmission/mission.yaml" 2>/dev/null)"
-BIND_VERDICT="$(awk '/^  last_verdict:/ { print $2; exit }' "$T_BIND/queue/missions/testmission/mission.yaml" 2>/dev/null)"
-if [[ "$BIND_STATUS" == "drafting" && "$BIND_VERDICT" == "revise" ]]; then
-  pass "Decision1: plan_review.md の事後書き換え (revise→approve) は無視され、plan_review.verdict の revise が消費される — status=$BIND_STATUS verdict=$BIND_VERDICT"
-else
-  fail "Decision1: plan_review.md の事後書き換えが消費されてしまった (TOCTOU regression) — status=$BIND_STATUS verdict=$BIND_VERDICT (output: $BIND_OUT)"
+  chmod +x "$T_BIND/scripts/review-plan.sh"
+  BIND_RC=0
+  BIND_OUT="$("$OWN_CHECKOUT_ROOT/scripts/plan.sh" review testmission 2>&1)" || BIND_RC=$?
+  BIND_STATUS="$(awk '/^status:/ { print $2; exit }' "$T_BIND/queue/missions/testmission/mission.yaml" 2>/dev/null)"
+  BIND_VERDICT="$(awk '/^  last_verdict:/ { print $2; exit }' "$T_BIND/queue/missions/testmission/mission.yaml" 2>/dev/null)"
+  if [[ "$BIND_STATUS" == "drafting" && "$BIND_VERDICT" == "revise" ]]; then
+    pass "Decision1: plan_review.md の事後書き換え (revise→approve) は無視され、plan_review.verdict の revise が消費される — status=$BIND_STATUS verdict=$BIND_VERDICT rc=$BIND_RC"
+  else
+    fail "Decision1: plan_review.md の事後書き換えが消費されてしまった (TOCTOU regression) — status=$BIND_STATUS verdict=$BIND_VERDICT (output: $BIND_OUT)"
+  fi
+  _cleanup_dir "$T_BIND"
+  unset CREWVIA_QUEUE
 fi
-_cleanup_dir "$T_BIND"
-
-unset CREWVIA_QUEUE
 
 echo ""
 echo "== Results: $PASS_COUNT passed, $FAIL_COUNT failed =="
 
-if [[ "${1:-}" == "--verify-red" ]]; then
+if [[ "$VERIFY_RED" -eq 1 ]]; then
+  COUNTER_GROUP="red"
   echo ""
-  echo "== --verify-red: 3388334 相当の review-plan.sh + 旧 plan.sh (plan_review.md 独立読み直し) で T1 が red になることを確認 =="
-  # 旧 plan.sh は自分自身の場所から REPO_ROOT (= dirname(plan.sh)/..) を
-  # 解決し、そこから scripts/lib_verdict.py 等を動的 import するため、
-  # 単なる裸ファイルではなく scripts/ ディレクトリ構造の中に置く必要がある。
-  OLD_REPO="/tmp/crewvia-test-verdict-binding-old-repo-$$"
-  _cleanup_dir "$OLD_REPO"
-  mkdir -p "$OLD_REPO/scripts"
-  git -C "$OWN_CHECKOUT_ROOT" show HEAD:scripts/review-plan.sh > "$OLD_REPO/scripts/review-plan.sh" 2>/dev/null
-  git -C "$OWN_CHECKOUT_ROOT" show HEAD:scripts/plan.sh > "$OLD_REPO/scripts/plan.sh" 2>/dev/null
-  cp "$OWN_CHECKOUT_ROOT/scripts/lint_plan.py" "$OLD_REPO/scripts/"
-  git -C "$OWN_CHECKOUT_ROOT" show HEAD:scripts/lib_verdict.py > "$OLD_REPO/scripts/lib_verdict.py" 2>/dev/null
-  chmod +x "$OLD_REPO/scripts/plan.sh" "$OLD_REPO/scripts/review-plan.sh"
-  ORIG_PLAN_SH="$PLAN_SH"
-  PLAN_SH="$OLD_REPO/scripts/plan.sh"
-  PASS_COUNT=0
-  FAIL_COUNT=0
-  _run_case "[RED CHECK] T1 on 3388334 (旧 review-plan.sh + 旧 plan.sh)" \
-    '**Verdict:** revise' '**Verdict:** approve' '' 0 \
-    "drafting" "" "$OLD_REPO/scripts/review-plan.sh"
-  if [[ "$FAIL_COUNT" -ge 1 ]]; then
-    echo "  (confirmed) 旧コードでは T1 が期待どおり FAIL する = fail-open regression を再現できている"
+  echo "== --verify-red: 脆弱版を commit sha で固定して実行し、fail-open が再現することを確認する (本体スイートのカウンタは変えない) =="
+
+  # $1 = short sha, $2 = 取り出し先。成功したら full sha を標準出力に出す。
+  _prepare_pinned_root() {
+    local sha="$1" dest="$2" full
+    full="$(git -C "$GIT_REPO" rev-parse --verify "${sha}^{commit}" 2>/dev/null)" || return 1
+    _cleanup_dir "$dest"
+    mkdir -p "$dest"
+    git -C "$GIT_REPO" archive "$full" scripts config | tar -x -C "$dest" || return 1
+    printf '%s\n' "$full"
+  }
+
+  # --- 3388334 (t002) ---
+  RED_ROOT_T002="/tmp/crewvia-test-verdict-binding-red-t002-$$"
+  if FULL_T002="$(_prepare_pinned_root "$RED_SHA_T002" "$RED_ROOT_T002")"; then
+    echo "  pinned $RED_SHA_T002 = $FULL_T002 (extracted with git archive into $RED_ROOT_T002)"
+    SRC_ROOT="$RED_ROOT_T002"
+    PINNED_SHA="$FULL_T002"
+    _run_case "[RED $RED_SHA_T002] T1 (revise → kill 中に approve へ再Write) must reproduce ready/approve" \
+      '**Verdict:** revise' '**Verdict:** approve' '' 0 "ready" "approve"
+    _run_case "[RED $RED_SHA_T002] T1r (reject → kill 中に approve へ再Write) must reproduce ready/approve" \
+      '**Verdict:** reject' '**Verdict:** approve' '' 0 "ready" "approve"
+    _run_case "[RED $RED_SHA_T002] E1 (approve + envelope is_error:true) must reproduce ready/approve" \
+      '**Verdict:** approve' '' "$RESULT_JSON_ERROR_APPROVE" 0 "ready" "approve"
+
+    if _selected "[RED $RED_SHA_T002] CR"; then
+      CR_FILE="$RED_ROOT_T002/cr_case.md"
+      printf '**Verdict:** approve\rNOT approved; revisions required' > "$CR_FILE"
+      CR_WANT="$(git -C "$GIT_REPO" rev-parse "$FULL_T002:scripts/lib_verdict.py" 2>/dev/null)"
+      CR_GOT="$(git -C "$GIT_REPO" hash-object --no-filters "$RED_ROOT_T002/scripts/lib_verdict.py" 2>/dev/null)"
+      CR_OLD_RC=0
+      CR_OLD_OUT="$(python3 "$RED_ROOT_T002/scripts/lib_verdict.py" "$CR_FILE" 2>/dev/null)" || CR_OLD_RC=$?
+      CR_NEW_RC=0
+      CR_NEW_OUT="$(python3 "$OWN_CHECKOUT_ROOT/scripts/lib_verdict.py" "$CR_FILE" 2>/dev/null)" || CR_NEW_RC=$?
+      echo "    executed scripts/lib_verdict.py blob=${CR_GOT:-?} | $FULL_T002:scripts/lib_verdict.py=${CR_WANT:-?}"
+      echo "    tree under test: rc=$CR_NEW_RC out='${CR_NEW_OUT}'"
+      if [[ -n "$CR_WANT" && "$CR_GOT" == "$CR_WANT" && "$CR_OLD_RC" -eq 0 && "$CR_OLD_OUT" == "approve" ]]; then
+        pass "[RED $RED_SHA_T002] CR (FAIL-2): pinned lib_verdict.py CLI reads '**Verdict:** approve<CR>NOT approved…' as approve (rc=0) — red reproduced"
+      else
+        fail "[RED $RED_SHA_T002] CR (FAIL-2): expected pinned lib_verdict.py to return approve rc=0, got rc=$CR_OLD_RC out='$CR_OLD_OUT' (blob ok: $([[ "$CR_GOT" == "$CR_WANT" ]] && echo yes || echo no))"
+      fi
+    fi
   else
-    echo "  (info) 旧コードでも T1 が PASS した — 旧コードの再現条件を見直す必要がある"
+    fail "[RED $RED_SHA_T002] could not extract pinned revision $RED_SHA_T002 from $GIT_REPO (git archive failed or commit missing)"
   fi
-  _cleanup_dir "$OLD_REPO"
-  PLAN_SH="$ORIG_PLAN_SH"
+  _cleanup_dir "$RED_ROOT_T002"
+
+  # --- b21d4b4 (t015) ---
+  RED_ROOT_T015="/tmp/crewvia-test-verdict-binding-red-t015-$$"
+  if FULL_T015="$(_prepare_pinned_root "$RED_SHA_T015" "$RED_ROOT_T015")"; then
+    echo "  pinned $RED_SHA_T015 = $FULL_T015 (extracted with git archive into $RED_ROOT_T015)"
+    SRC_ROOT="$RED_ROOT_T015"
+    PINNED_SHA="$FULL_T015"
+    _run_case "[RED $RED_SHA_T015] B_k1 (revise + 本文 approve + structured=approve) must reproduce ready/approve" \
+      "$PROSE_K1" '' "$RESULT_JSON_APPROVE" 1 "ready" "approve"
+    _run_case "[RED $RED_SHA_T015] B_k2 (approve + 本文 revise + structured=approve) must reproduce ready/approve" \
+      "$PROSE_K2" '' "$RESULT_JSON_APPROVE" 0 "ready" "approve"
+    _run_case "[RED $RED_SHA_T015] B_k3 (revise (重大な指摘あり) + structured=approve) must reproduce ready/approve" \
+      "$PROSE_K3" '' "$RESULT_JSON_APPROVE" 0 "ready" "approve"
+    _run_case "[RED $RED_SHA_T015] B_k4 (REVISE + structured=approve) must reproduce ready/approve" \
+      "$PROSE_K4" '' "$RESULT_JSON_APPROVE" 0 "ready" "approve"
+    _run_case "[RED $RED_SHA_T015] B_k5 (reject + 本文 approve + structured=approve) must reproduce ready/approve" \
+      "$PROSE_K5" '' "$RESULT_JSON_APPROVE" 0 "ready" "approve"
+  else
+    fail "[RED $RED_SHA_T015] could not extract pinned revision $RED_SHA_T015 from $GIT_REPO (git archive failed or commit missing)"
+  fi
+  _cleanup_dir "$RED_ROOT_T015"
+  SRC_ROOT="$OWN_CHECKOUT_ROOT"
+  PINNED_SHA=""
+
+  # --- G2 メタテスト (QA t016 Finn G2) ---
+  if [[ "${BINDING_E2E_SKIP_META:-0}" != "1" ]] && _selected "[META] G2"; then
+    echo ""
+    echo "--- [META] G2: 作業ツリーに脆弱版 ($RED_SHA_T002 の review-plan.sh / plan.sh) を置いて --verify-red で実行 → 本体の失敗が非 0 終了に反映される ---"
+    META="/tmp/crewvia-test-verdict-binding-meta-$$"
+    _cleanup_dir "$META"
+    mkdir -p "$META"
+    cp -r "$OWN_CHECKOUT_ROOT/scripts" "$META/scripts"
+    cp -r "$OWN_CHECKOUT_ROOT/config" "$META/config"
+    if git -C "$GIT_REPO" show "${RED_SHA_T002}:scripts/review-plan.sh" > "$META/scripts/review-plan.sh" \
+        && git -C "$GIT_REPO" show "${RED_SHA_T002}:scripts/plan.sh" > "$META/scripts/plan.sh"; then
+      chmod +x "$META/scripts/review-plan.sh" "$META/scripts/plan.sh"
+      META_RC=0
+      META_OUT="$(BINDING_E2E_GIT_REPO="$GIT_REPO" BINDING_E2E_SKIP_META=1 \
+        BINDING_E2E_CASE_FILTER='(^|\] )T1 \(' \
+        bash "$META/scripts/test_review_plan_verdict_binding_e2e.sh" --verify-red 2>&1)" || META_RC=$?
+      printf '%s\n' "$META_OUT" | grep -E '^(  PASS|  FAIL|== )' | sed 's/^/    [meta] /' | cut -c1-240
+      if [[ "$META_RC" -ne 0 ]] \
+          && printf '%s\n' "$META_OUT" | grep -q '^  FAIL: T1 (' \
+          && printf '%s\n' "$META_OUT" | grep -q "^  PASS: \[RED $RED_SHA_T002\] T1 ("; then
+        pass "[META] G2: 本体 T1 が FAIL し red 確認が PASS した状態でも exit=$META_RC (非 0) — 本体の失敗は握り潰されない"
+      else
+        fail "[META] G2: 期待 = 本体 T1 FAIL かつ red T1 PASS かつ非 0 終了。実際 exit=$META_RC"
+      fi
+    else
+      fail "[META] G2: could not extract $RED_SHA_T002 scripts for the meta test"
+    fi
+    _cleanup_dir "$META"
+  fi
+
+  COUNTER_GROUP="main"
+  echo ""
+  echo "== RED results (pinned vulnerable revisions must reproduce the fail-open): $RED_PASS_COUNT reproduced/confirmed, $RED_FAIL_COUNT NOT reproduced =="
 fi
 
-[[ "$FAIL_COUNT" -eq 0 ]]
+echo ""
+echo "== Final: main $PASS_COUNT passed / $FAIL_COUNT failed; red failures $RED_FAIL_COUNT =="
+[[ "$FAIL_COUNT" -eq 0 && "$RED_FAIL_COUNT" -eq 0 ]]

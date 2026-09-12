@@ -2360,8 +2360,9 @@ def cmd_review(args):
     1. Runs lint as a pre-step (FAIL → treated as revise, exit 1)
     2. Checks max_review_cycles
     3. Sets mission status to reviewing, increments cycle_count
-    4. Invokes scripts/review-plan.sh <slug>
-    5. Reads plan_review.md verdict and updates mission:
+    4. Invokes scripts/review-plan.sh <slug> (with CREWVIA_PLAN_REVIEW_RUN_ID)
+    5. Reads the verdict review-plan.sh bound to plan_review.verdict for this
+       run (never re-reads plan_review.md) and updates mission:
        - approve → status: ready
        - revise  → status: drafting, cycle_count++
        - reject  → status: drafting, cycle_count++
@@ -2420,10 +2421,37 @@ def cmd_review(args):
 
     # --- Step 3: invoke review-plan.sh ---
     import subprocess
+    import secrets
     repo_root = os.path.dirname(QUEUE_DIR)
     review_script = os.path.join(repo_root, 'scripts', 'review-plan.sh')
+    verdict_file = os.path.join(MISSIONS_DIR, slug, 'plan_review.verdict')
+
+    # t018 (mission 20260912-verdict-ci-launcher, QA t016 Finn E_A3): plan.sh は
+    # plan_review.verdict が「今回の review-plan.sh 実行で書かれた」ことを
+    # 自分で確認する。t015 時点では review-plan.sh 冒頭の `rm -f` だけが
+    # 前 cycle の古い approve を消す唯一の仕組みで、rm も書き込みもせずに
+    # exit 0 する review-plan.sh (差し替え・将来の改修ミス) があれば古い
+    # approve がそのまま消費されていた。
+    #   1. 実行ごとの識別子 (run_id) を作って環境変数で渡し、review-plan.sh は
+    #      verdict と一緒に書く。Step 4 で一致しなければ fail-closed。
+    #   2. 呼び出し前に自分でも古いファイルを消す (多重防御。消せなくても
+    #      1 の照合で弾かれる)。
+    review_run_id = secrets.token_hex(16)
+    try:
+        os.remove(verdict_file)
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        print(
+            f"[review] WARNING: could not remove stale {verdict_file} ({e}); "
+            f"the run id check still rejects it",
+            file=sys.stderr,
+        )
+    review_env = dict(os.environ)
+    review_env['CREWVIA_PLAN_REVIEW_RUN_ID'] = review_run_id
+
     print(f"[review] invoking review-plan.sh...", file=sys.stderr)
-    proc = subprocess.run(['bash', review_script, slug])
+    proc = subprocess.run(['bash', review_script, slug], env=review_env)
 
     def _rollback_to_drafting(reason, refund_cycle=False):
         """P2: rollback mission from reviewing → drafting on failure.
@@ -2491,7 +2519,6 @@ def cmd_review(args):
     # 専用ファイル queue/missions/<slug>/plan_review.verdict に書かせ、
     # plan.sh はそれだけを消費する。plan_review.md はもう判定には使わない
     # (人間向けの記録としては残る)。
-    verdict_file = os.path.join(MISSIONS_DIR, slug, 'plan_review.verdict')
     if not os.path.exists(verdict_file):
         _rollback_to_drafting("no valid verdict (plan_review.verdict not found)", refund_cycle=True)
         die(
@@ -2502,12 +2529,34 @@ def cmd_review(args):
         )
 
     # newline='' (F2/FAIL-2 と同じ理由): 万一ファイルが破損していても改行
-    # 変換で誤って読み取らないようにする。とはいえこのファイルは
-    # review-plan.sh 自身が printf で書く既知の安全な値のみが入る想定であり、
-    # 以下の allowlist チェックが実質的な安全弁になる。
-    with open(verdict_file, encoding='utf-8', newline='') as f:
-        verdict_raw = f.read()
-    verdict = verdict_raw.strip()
+    # 変換で誤って読み取らないようにする。
+    #
+    # t018 (鮮度): 形式は 2 行ちょうど "<verdict>\nrun_id=<Step 3 で渡した識別子>\n"。
+    # 識別子が一致しない (前 cycle の残骸・別の実行が書いたもの・識別子を知らない
+    # 旧形式の 1 行ファイル) なら、値が正しくても消費せず fail-closed。
+    # 読めない / UTF-8 として解釈できない場合も、mission を reviewing のまま
+    # 残さないよう rollback してから止める。
+    try:
+        with open(verdict_file, encoding='utf-8', newline='') as f:
+            verdict_raw = f.read()
+    except (OSError, UnicodeDecodeError) as e:
+        _rollback_to_drafting("plan_review.verdict is unreadable", refund_cycle=True)
+        die(f"could not read {verdict_file} ({e}) — refusing to guess (fail-closed).")
+    verdict_lines = verdict_raw.split('\n')
+    if (
+        len(verdict_lines) != 3
+        or verdict_lines[1] != f'run_id={review_run_id}'
+        or verdict_lines[2] != ''
+    ):
+        _rollback_to_drafting(
+            "plan_review.verdict was not written by this review run", refund_cycle=True
+        )
+        die(
+            f"plan_review.verdict for mission '{slug}' was not written by this review run "
+            f"(expected '<verdict>\\nrun_id={review_run_id}\\n', got {verdict_raw[:200]!r}) "
+            f"— refusing a stale or foreign verdict (fail-closed)."
+        )
+    verdict = verdict_lines[0]
 
     # 防御的 allowlist チェック (review-plan.sh は既に enum 適合を検証済みの
     # 値しか書かないはずだが、ファイル破損・部分書き込み等に備えて plan.sh

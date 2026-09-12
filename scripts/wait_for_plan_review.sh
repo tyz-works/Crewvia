@@ -28,10 +28,17 @@
 #
 # 標準出力の1行目で結果種別を返す (2行目以降は人間向けログ、stderr にも複製):
 #   OK             — 有効な verdict が見つかった (規定形式のみ。F1 以降、
-#                    別表記の正規化はこのスクリプトの責務ではない)
+#                    別表記の正規化はこのスクリプトの責務ではない)。
+#                    lib_verdict.py が終了コード 0 かつ正規の 1 語を返したときだけ
 #   TIMEOUT_FRESH  — このレビュー実行で書かれたファイルは観測できたが、
 #                    最後まで有効な verdict が見つからなかった
-#                    (フォーマット不明で判定不能。内容自体は活かせる可能性あり)
+#                    (verdict 行の兆候が無い / 書式違反・自己矛盾 のどちらも。
+#                    内容自体は活かせる可能性あり)
+#
+# t018: 結果種別はあくまで待ちの目安であり、判定の権威ではない。
+# scripts/review-plan.sh は reviewer の停止を確認してから lib_verdict.py を
+# 自分で呼び直し、3 状態 (有効 / 兆候なし / 書式違反) に従って救済の可否を
+# 決める。ここで書式違反を OK にしないこと (Director 設計判断4)。
 #   TIMEOUT_NONE   — このレビュー実行で書かれたファイルが一度も観測できなかった
 # exit code: 0 = OK, 1 = TIMEOUT (fresh/none いずれも)
 #
@@ -87,10 +94,29 @@ while [ "$_i" -lt "$_iterations" ]; do
       # 誤 approve になる経路があった。scripts/plan.sh 側と全く同じ抽出
       # ロジックを scripts/lib_verdict.py に一本化し、ここも同じ関数を
       # 呼ぶことで両者の条件不一致 (root cause 3) 自体を無くす。
-      if python3 "$VERDICT_LIB" "$REVIEW_OUTPUT" >/dev/null 2>&1; then
-        echo "OK"
-        echo "[wait_for_plan_review] valid verdict found in $REVIEW_OUTPUT" >&2
-        exit 0
+      #
+      # t018 (mission 20260912-verdict-ci-launcher, Director 設計判断4):
+      # lib_verdict.py の終了コードを allowlist で解釈する。OK にするのは
+      # 「終了コード 0 かつ標準出力が正規の 1 語」だけ。書式違反・自己矛盾
+      # (終了コード 20) はもちろん、想定外の終了コード (Python の未捕捉例外 = 1、
+      # スクリプトが無い = 2 など) も OK にしない。どちらも「まだ書いている
+      # 途中かもしれない」ので即座には諦めず、下の早期打ち切りロジックに任せる
+      # (待ち・停止確認・読み取りの順序は review-plan.sh 側で t015 のまま)。
+      _verdict_rc=0
+      _verdict_out="$(python3 "$VERDICT_LIB" "$REVIEW_OUTPUT" 2>/dev/null)" || _verdict_rc=$?
+      if [ "$_verdict_rc" -eq 0 ]; then
+        case "$_verdict_out" in
+          approve|revise|reject)
+            echo "OK"
+            echo "[wait_for_plan_review] valid verdict found in $REVIEW_OUTPUT" >&2
+            exit 0
+            ;;
+        esac
+      fi
+      if [ "$_verdict_rc" -eq 10 ] && [ -z "$_verdict_out" ]; then
+        _last_state="no verdict-line sign"
+      else
+        _last_state="verdict-line format violation / self-contradiction (lib_verdict rc=$_verdict_rc)"
       fi
       # F1 (t002, mission 20260912-verdict-ci-launcher): 以前はここで
       # normalize_plan_review_verdict.py がファイル全体を走査して別表記
@@ -123,7 +149,7 @@ done
 
 if [ "$_fresh_seen" -eq 1 ]; then
   echo "TIMEOUT_FRESH"
-  echo "[wait_for_plan_review] $REVIEW_OUTPUT was written during this run but no verdict (standard or recognized alternate wording) could be found — inspect it by hand, the content may still be usable without consuming another review cycle" >&2
+  echo "[wait_for_plan_review] $REVIEW_OUTPUT was written during this run but no valid verdict could be found (last state: ${_last_state:-unknown}) — inspect it by hand, the content may still be usable without consuming another review cycle" >&2
 else
   echo "TIMEOUT_NONE"
   echo "[wait_for_plan_review] $REVIEW_OUTPUT was not produced within ${MAX_WAIT}s" >&2

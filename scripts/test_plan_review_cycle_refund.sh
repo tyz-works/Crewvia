@@ -33,11 +33,14 @@
 # t015 (mission 20260912-verdict-ci-launcher, Director 設計判断1) 追記:
 # plan.sh はもう plan_review.md を独立に読み直さない — review-plan.sh が
 # 書く queue/missions/<slug>/plan_review.verdict だけを消費する (QA t003
-# Finn 実測 FAIL-1 の TOCTOU 対策)。Case 2 のスタブは新しい契約 (exit 0 なら
-# plan_review.verdict も書く) に合わせて更新した。Case 3 は「review-plan.sh
-# が exit 0 なのに verdict が不正」という、新しい契約では
-# plan_review.verdict 自体に不正な値が書かれるケースとして再現する
-# (plan.sh 側の防御的 allowlist チェックの確認)。
+# Finn 実測 FAIL-1 の TOCTOU 対策)。
+#
+# t018 (同 mission, QA t016 Finn E_A3 / Director 追記の低優先度項目) 追記:
+# plan.sh は plan_review.verdict が「今回の review-plan.sh 実行で書かれた」
+# ことを自分で確認する。実行ごとの識別子を CREWVIA_PLAN_REVIEW_RUN_ID で
+# 渡し、ファイルは "<verdict>\nrun_id=<識別子>\n" の 2 行ちょうどで
+# なければ消費しない (呼び出し前に古いファイルも消す)。Case 2/3 のスタブは
+# この形式で書く。Case 4-6 は鮮度確認そのものの回帰テスト。
 
 set -uo pipefail
 
@@ -67,6 +70,10 @@ _cycle_count_of() {
 
 _status_of() {
   awk '/^status:/ { print $2; exit }' "$TMPDIR_TEST/queue/missions/testmission/mission.yaml"
+}
+
+_last_verdict_of() {
+  awk '/^  last_verdict:/ { print $2; exit }' "$TMPDIR_TEST/queue/missions/testmission/mission.yaml"
 }
 
 _setup() {
@@ -133,7 +140,7 @@ MISSION_DIR="$(cd "$SCRIPT_DIR/.." && pwd)/queue/missions/$SLUG"
 cat > "$MISSION_DIR/plan_review.md" << 'INNER'
 **Verdict:** approve
 INNER
-printf '%s\n' 'approve' > "$MISSION_DIR/plan_review.verdict"
+printf '%s\nrun_id=%s\n' 'approve' "$CREWVIA_PLAN_REVIEW_RUN_ID" > "$MISSION_DIR/plan_review.verdict"
 exit 0
 EOF
 chmod +x "$TMPDIR_TEST/scripts/review-plan.sh"
@@ -161,7 +168,7 @@ echo "--- Case 3 (F2, PR#188 t012 Seo 指摘 / t015 で plan_review.verdict 契�
 # t015: 正しく実装された review-plan.sh はもう plan_review.verdict に不正
 # な値を書いて exit 0 することは無いはずだが、plan.sh 側の防御的
 # allowlist チェック (ファイル破損等への備え) がまだ効いていることを
-# 直接確認する。
+# 直接確認する。run_id は正しく書く (鮮度確認ではなく値の確認を通すため)。
 _setup
 BEFORE3="$(_cycle_count_of)"
 cat > "$TMPDIR_TEST/scripts/review-plan.sh" << 'EOF'
@@ -172,7 +179,7 @@ MISSION_DIR="$(cd "$SCRIPT_DIR/.." && pwd)/queue/missions/$SLUG"
 cat > "$MISSION_DIR/plan_review.md" << 'INNER'
 **Verdict:** STOP
 INNER
-printf '%s\n' 'STOP' > "$MISSION_DIR/plan_review.verdict"
+printf '%s\nrun_id=%s\n' 'STOP' "$CREWVIA_PLAN_REVIEW_RUN_ID" > "$MISSION_DIR/plan_review.verdict"
 exit 0
 EOF
 chmod +x "$TMPDIR_TEST/scripts/review-plan.sh"
@@ -189,6 +196,64 @@ if [[ "$RC3" -ne 0 && "$AFTER3" == "$BEFORE3" && "$STATUS3" == "drafting" ]]; th
 else
   fail "不正な判定語での期待値と不一致 (F2 regression) — rc=$RC3 before=$BEFORE3 after=$AFTER3 status=$STATUS3 output=$OUT3"
 fi
+
+# $1 = ラベル, $2 = 事前に置く plan_review.verdict の内容 ("" なら置かない),
+# $3 = スタブ review-plan.sh が書く plan_review.verdict の内容 (printf の
+# フォーマット文字列。"__NONE__" なら書かない。%s は CREWVIA_PLAN_REVIEW_RUN_ID)
+_run_freshness_case() {
+  local label="$1" preexisting="$2" stub_format="$3"
+  _setup
+  local before after status verdict out rc
+  before="$(_cycle_count_of)"
+  if [[ -n "$preexisting" ]]; then
+    printf '%s' "$preexisting" > "$TMPDIR_TEST/queue/missions/testmission/plan_review.verdict"
+  fi
+  cat > "$TMPDIR_TEST/scripts/review-plan.sh" << EOF
+#!/usr/bin/env bash
+SLUG="\$1"
+SCRIPT_DIR="\$(cd "\$(dirname "\$0")" && pwd)"
+MISSION_DIR="\$(cd "\$SCRIPT_DIR/.." && pwd)/queue/missions/\$SLUG"
+printf '%s\n' '**Verdict:** approve' > "\$MISSION_DIR/plan_review.md"
+if [[ '$stub_format' != "__NONE__" ]]; then
+  printf '$stub_format' "\${CREWVIA_PLAN_REVIEW_RUN_ID:-}" > "\$MISSION_DIR/plan_review.verdict"
+fi
+exit 0
+EOF
+  chmod +x "$TMPDIR_TEST/scripts/review-plan.sh"
+
+  set +e
+  out="$("$PLAN_SH" review testmission 2>&1)"
+  rc=$?
+  set -e
+  after="$(_cycle_count_of)"
+  status="$(_status_of)"
+  verdict="$(_last_verdict_of)"
+  if [[ "$rc" -ne 0 && "$after" == "$before" && "$status" == "drafting" && ( "$verdict" == "null" || -z "$verdict" ) ]]; then
+    pass "$label → 消費されず refund (rc=$rc before=$before after=$after status=$status last_verdict=${verdict:-null})"
+  else
+    fail "$label → refund を期待したが rc=$rc before=$before after=$after status=$status last_verdict=$verdict output=$out"
+  fi
+}
+
+echo ""
+echo "--- Case 4 (t018, Finn E_A3): 前 cycle の approve が残っていて、review-plan.sh が rm も書き込みもせず exit 0 → 古い approve を消費しない ---"
+_run_freshness_case "E_A3: 古い plan_review.verdict (approve) + 何も書かない review-plan.sh" \
+  $'approve\nrun_id=0123456789abcdef0123456789abcdef\n' "__NONE__"
+
+echo ""
+echo "--- Case 5 (t018): review-plan.sh が値は正しいが別の実行の識別子で書いた → 消費しない ---"
+_run_freshness_case "run_id 不一致 (approve / run_id=not-this-run)" \
+  "" 'approve\nrun_id=not-this-run\n'
+
+echo ""
+echo "--- Case 6 (t018): 識別子の無い旧形式 (t015 の 1 行ファイル) → 消費しない ---"
+_run_freshness_case "旧形式 1 行 (approve\\n)" \
+  "" 'approve\n'
+
+echo ""
+echo "--- Case 7 (t018): 識別子の後に余計な行がある → 消費しない (2 行ちょうどでなければ fail-closed) ---"
+_run_freshness_case "余計な 3 行目 (approve / run_id=<正> / approve)" \
+  "" 'approve\nrun_id=%s\napprove\n'
 
 unset CREWVIA_QUEUE
 

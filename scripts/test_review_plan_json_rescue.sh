@@ -16,14 +16,9 @@
 #
 # F2 追記 (t002, mission 20260912-verdict-ci-launcher): 以前はプローズが
 # 既に読めていた (=WAIT_STATUS=="OK") 場合、構造化出力の確認を一度も
-# 待たずに (1回だけ非同期に読んで) プローズをそのまま採用していた。
-# 構造化出力は必ずプローズより後に届くため、prose=approve の経路では
-# この「食い違い検出」が実質 armed されず、reviewer が最終応答で revise/
-# reject と言っていても mission が ready になってしまっていた。
-# 修正後は、プローズが approve (=危険な結論) または判定不能の場合は
-# 構造化出力の到着を (固定間隔ポーリング、最大 REVIEW_PLAN_STRUCTURED_MAX_WAIT
-# 秒) 待ち、確認できなければ approve を通さない。revise/reject はプローズを
-# 直接信頼してよい (安全な結論のため待たない)。
+# 待たずにプローズをそのまま採用していた。修正後は構造化出力の到着を
+# (固定間隔ポーリング、最大 REVIEW_PLAN_STRUCTURED_MAX_WAIT 秒) 待ち、
+# 確認できなければ approve を通さない。
 #
 # テスト方法: scripts/test_review_plan_pane_leak.sh と同じ手法 —
 # scripts/review-plan.sh 本体を scratch ディレクトリにコピーし、
@@ -36,37 +31,36 @@
 # t015 (mission 20260912-verdict-ci-launcher, Director 設計判断3) 追記:
 # 構造化出力が届かないケースでは review-plan.sh が明示的に mux_kill →
 # mux_pid で停止確認をしてから plan_review.md を読む。このスタブは
-# mux_pid を「常に見つからない (= 即座に停止確認できる)」に固定し、
-# 実際の herdr/tmux の停止待ちをテストの実行時間に持ち込まない
-# (停止待ちのポーリング挙動そのものは実装コメント参照。ここでは
-# review-plan.sh 側の「確認できてから読む」制御フローだけを検証する)。
+# mux_pid を「常に見つからない (= 即座に停止確認できる)」に固定する。
+#
+# t018 (mission 20260912-verdict-ci-launcher, QA t016 Finn FAIL-A / Kai-codex
+# t004 2 回目 P1, Director 設計判断1-4) 追記:
+# review-plan.sh は lib_verdict.py の 3 状態 (有効 / 兆候なし / 書式違反) に
+# 従い、構造化出力による救済を「兆候なし」のときだけに絞った。
+# lib_verdict.py の終了コードは allowlist で解釈する (10 以外の「読めない」は
+# すべて書式違反扱い)。Case 7 は挙動変更、Case 7b/13-18 を追加。
+# さらに review-plan.sh が書く plan_review.verdict の形式
+# ("<verdict>\nrun_id=<CREWVIA_PLAN_REVIEW_RUN_ID>\n") と、判定不能のときに
+# plan_review.verdict を書かず plan_review.md も書き換えないことを
+# _run_case_ex の中で毎回確認する。
 #
 # 検証内容:
-#   1. プローズ判定不能 + ログに有効な structured_output.verdict
-#      → rescue が発火し、plan_review.md 冒頭に規定形式の行が書かれ、
-#      review-plan.sh は exit 0 (Director の手動介入を回避できる本体)
-#   2. 同上 (plan_review.md が一度も書かれなかった場合でも rescue で
-#      新規作成できる)
-#   3. プローズ判定不能 + ログが空/JSON として壊れている
-#      → rescue は発火せず、既存どおり exit 1 (当て推量で verdict を
-#      捏造しない、既存のフェイルクローズ挙動に回帰がないことの確認)
-#   4. プローズ=revise (真の判定行あり) + 構造化出力が一切無い
-#      → t015 で挙動変更: 同じ MAX_WAIT だけ待ってから revise を採用する
-#      (以前は待たずに即採用していたが、Director 設計判断2 でこの近道を
-#      廃止した。安全な結論であること自体は変わらない)
-#   5〜8. t012 由来 (食い違い検出・rescue・fail-closed の既存回帰、変更なし)
-#   9 (F2 コア回帰): プローズ=approve + 構造化出力が最後まで確認できない
-#      → 確認なしに approve を通さない (安全側)。これが本 PR の直接の動機。
-#      7642f9b (修正前) では WAIT_STATUS=="OK" 経路がこの確認を一度もせず
-#      exit 0 のまま approve を通していた。
-#   10 (F2 コア回帰・遅延到着): プローズ=approve が即座に読める一方、
-#      構造化出力 (=revise, 食い違い) がわずかに遅れて書かれる
-#      → 7642f9b は「プローズが既に読めていれば1回だけ非同期に読んで
-#      終わり」だったため、この遅延書き込みを永遠に見逃し exit 0 のまま
-#      approve を通していた。修正後は固定間隔ポーリングが遅延書き込みに
-#      追いつき、食い違いを検出して exit 1 になることを確認する。
-#   11〜12 (Codex P2, t015): 構造化出力の envelope 自体が失敗している
-#      (is_error:true / subtype が success 以外) 場合は verdict を信頼しない。
+#   1. プローズ判定不能 (兆候なし) + ログに有効な structured_output.verdict
+#      → rescue が発火し、plan_review.md 冒頭に規定形式の行が書かれ exit 0
+#   2. 同上 (plan_review.md が一度も書かれなかった場合でも rescue で新規作成)
+#   3. プローズ判定不能 + ログが空/JSON として壊れている → exit 1
+#   4. プローズ=revise + 構造化出力が一切無い → 待ち切った後 revise のまま exit 0
+#   5〜6. t012 由来 (同じ値なら採用 / 食い違えば判定不能)
+#   7. (t018 挙動変更) 1 行目が判定行でなく本文に規定形式の approve がある
+#      → 兆候が 1 行目以外にある書式違反なので、structured=approve でも exit 1
+#   7b. (t018) 兆候の無い別表記だけ → 救済は残る (exit 0 / approve)
+#   8. 構造化出力が無く、プローズも書式を外している → exit 1
+#   9. プローズ=approve + 構造化出力が最後まで確認できない → exit 1
+#   10. プローズ=approve 即時 + 構造化出力=revise 遅延 → 食い違い検出 exit 1
+#   11〜12. 構造化出力の envelope 自体が失敗している → 信頼しない
+#   13. (t018) 1 行目 revise + 本文 approve (QA t016 B_k1) + structured=approve → exit 1
+#   14〜17. (t018) lib_verdict.py が想定外の終了コード/出力を返す → 救済しない
+#   18. (t018) 書式違反 + 構造化出力なし → exit 1
 #
 # 実行: bash scripts/test_review_plan_json_rescue.sh
 
@@ -74,6 +68,7 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REAL_REVIEW_PLAN="${SCRIPT_DIR}/review-plan.sh"
+REAL_LIB_VERDICT="${SCRIPT_DIR}/lib_verdict.py"
 REAL_SCHEMA="${SCRIPT_DIR}/../config/plan-review-verdict.schema.json"
 # t001 (mission 20260909-dead-config-sweep): review-plan.sh はモデル解決に
 # scripts/lib_model.py と config/crewvia.yaml を必須で読むようになった
@@ -82,12 +77,14 @@ REAL_LIB_MODEL="${SCRIPT_DIR}/lib_model.py"
 REAL_CREWVIA_YAML="${SCRIPT_DIR}/../config/crewvia.yaml"
 
 # review-plan.sh の構造化出力待ちループの poll 間隔・上限を、テスト実行を
-# 速くするためだけに縮める (本番デフォルトは 3 秒 / 180 秒)。「待っても
-# 見つからず諦める」ケース (Case 3, 8, 9) が本番の上限のまま待つと大幅に
-# 遅くなるため。見つかった場合は即座に抜けるので、成功系のケースには
-# 影響しない。
+# 速くするためだけに縮める (本番デフォルトは 3 秒 / 180 秒)。見つかった場合は
+# 即座に抜けるので、成功系のケースには影響しない。
 export REVIEW_PLAN_STRUCTURED_POLL_INTERVAL=1
 export REVIEW_PLAN_STRUCTURED_MAX_WAIT=2
+
+# t018: review-plan.sh は plan.sh から渡される実行ごとの識別子を
+# plan_review.verdict の 2 行目に書く。
+export CREWVIA_PLAN_REVIEW_RUN_ID="json-rescue-$$"
 
 PASS_COUNT=0
 FAIL_COUNT=0
@@ -114,6 +111,10 @@ _run_case() {
   mkdir -p "$TMPDIR_TEST/scripts" "$TMPDIR_TEST/config" "$TMPDIR_TEST/queue/missions/testmission"
 
   cp "$REAL_REVIEW_PLAN" "$TMPDIR_TEST/scripts/review-plan.sh"
+  # t018: 以前はここで lib_verdict.py をコピーしておらず、python3 がスクリプト
+  # 不在で返す rc=2 が「判定不能 = 救済可」として扱われていた。本物の
+  # lib_verdict.py を置く (plan_review.md が無いので「兆候なし」になる)。
+  cp "$REAL_LIB_VERDICT" "$TMPDIR_TEST/scripts/lib_verdict.py"
   cp "$REAL_SCHEMA" "$TMPDIR_TEST/config/plan-review-verdict.schema.json"
   cp "$REAL_LIB_MODEL" "$TMPDIR_TEST/scripts/lib_model.py"
   cp "$REAL_CREWVIA_YAML" "$TMPDIR_TEST/config/crewvia.yaml"
@@ -184,28 +185,39 @@ _run_case "TIMEOUT_FRESH" "not valid json at all" 1 "false" "prose unreadable + 
 
 # --- t012: 構造化出力を「プローズ失敗時の rescue」から「常に読む権威」へ ---
 # $1 = wait_status, $2 = ログ内容, $3 = plan_review.md に書いておく本文
-# ("" なら書かない), $4 = expect_rc, $5 = 期待する plan_review.md の1行目の
-# verdict ("" なら「規定形式の1行目が無いこと」を期待), $6 = label,
-# $7 = log_delay (秒。省略時0 = 同期書き。>0 の場合、mux_spawn は即座に
-# 戻るが、ログの書き込みはバックグラウンドで指定秒数後に行う — F2 の
-# 「構造化出力がプローズより後に遅れて届く」本番の非同期性を再現する)。
+# ("" なら書かない), $4 = expect_rc, $5 = 期待する plan_review.md の判定
+# (本物の lib_verdict.py で読んだ結果。"" なら「有効な判定なし」を期待),
+# $6 = label, $7 = log_delay (秒。省略時0 = 同期書き。>0 の場合、mux_spawn は
+# 即座に戻るが、ログの書き込みはバックグラウンドで指定秒数後に行う),
+# $8 = lib_verdict.py の差し替え内容 (t018。省略時は本物をコピー。
+# Python ソースを渡すとそれを scratch の lib_verdict.py として置く)。
+#
+# t018 で毎回追加で確認すること:
+#   - exit 0 のとき: plan_review.verdict が "<期待値>\nrun_id=$CREWVIA_PLAN_REVIEW_RUN_ID\n" ちょうど
+#   - exit 1 のとき: plan_review.verdict が存在しない、かつ plan_review.md が
+#     スタブの書いた内容から書き換わっていない (救済の prepend が起きていない)
 #
 # plan_review.md は review-plan.sh 冒頭の `rm -f` より後に書かれる必要があるため、
 # ログと同じく mux_spawn スタブの中で書く (mux_spawn は rm -f の後に呼ばれる)。
 _run_case_ex() {
-  local wait_status="$1" log_body="$2" review_body="$3" expect_rc="$4" expect_verdict="$5" label="$6" log_delay="${7:-0}"
+  local wait_status="$1" log_body="$2" review_body="$3" expect_rc="$4" expect_verdict="$5" label="$6" log_delay="${7:-0}" lib_stub="${8:-}"
 
   TMPDIR_TEST="/tmp/crewvia-test-review-plan-json-rescue-ex-$$-$(date +%s%N)"
   rm -rf "$TMPDIR_TEST"
   mkdir -p "$TMPDIR_TEST/scripts" "$TMPDIR_TEST/config" "$TMPDIR_TEST/queue/missions/testmission"
 
   cp "$REAL_REVIEW_PLAN" "$TMPDIR_TEST/scripts/review-plan.sh"
-  cp "$SCRIPT_DIR/lib_verdict.py" "$TMPDIR_TEST/scripts/lib_verdict.py"
+  if [[ -n "$lib_stub" ]]; then
+    printf '%s\n' "$lib_stub" > "$TMPDIR_TEST/scripts/lib_verdict.py"
+  else
+    cp "$REAL_LIB_VERDICT" "$TMPDIR_TEST/scripts/lib_verdict.py"
+  fi
   cp "$REAL_SCHEMA" "$TMPDIR_TEST/config/plan-review-verdict.schema.json"
   cp "$REAL_LIB_MODEL" "$TMPDIR_TEST/scripts/lib_model.py"
   cp "$REAL_CREWVIA_YAML" "$TMPDIR_TEST/config/crewvia.yaml"
 
   local review_output="$TMPDIR_TEST/queue/missions/testmission/plan_review.md"
+  local verdict_file="$TMPDIR_TEST/queue/missions/testmission/plan_review.verdict"
   if [[ "$log_delay" -gt 0 ]]; then
     cat > "$TMPDIR_TEST/scripts/lib_mux.sh" << EOF
 mux_available() { return 0; }
@@ -250,15 +262,31 @@ EOF
   local rc=$?
   set -e
 
+  # 判定は常に本物の lib_verdict.py で読む (差し替えたスタブに引きずられないため)。
   local got=""
   if [[ -f "$review_output" ]]; then
-    got="$(python3 "$TMPDIR_TEST/scripts/lib_verdict.py" "$review_output" 2>/dev/null || true)"
+    got="$(python3 "$REAL_LIB_VERDICT" "$review_output" 2>/dev/null || true)"
   fi
 
-  if [[ "$rc" -eq "$expect_rc" && "$got" == "$expect_verdict" ]]; then
+  local problems=""
+  [[ "$rc" -eq "$expect_rc" ]] || problems+="exit=$rc (expected $expect_rc); "
+  [[ "$got" == "$expect_verdict" ]] || problems+="plan_review.md verdict='${got:-<none>}' (expected '${expect_verdict:-<none>}'); "
+  if [[ "$expect_rc" -eq 0 ]]; then
+    if ! python3 -c 'import sys; sys.exit(0 if open(sys.argv[1], encoding="utf-8", newline="").read() == f"{sys.argv[2]}\nrun_id={sys.argv[3]}\n" else 1)' \
+        "$verdict_file" "$expect_verdict" "$CREWVIA_PLAN_REVIEW_RUN_ID" 2>/dev/null; then
+      problems+="plan_review.verdict is not exactly '${expect_verdict}\\nrun_id=${CREWVIA_PLAN_REVIEW_RUN_ID}\\n' (got: $(od -c "$verdict_file" 2>/dev/null | head -3 | tr '\n' ' ' || echo '<missing>')); "
+    fi
+  else
+    [[ ! -e "$verdict_file" ]] || problems+="plan_review.verdict was written on a refusal path ($(tr '\n' '|' < "$verdict_file")); "
+    if [[ -n "$review_body" ]]; then
+      [[ "$(cat "$review_output" 2>/dev/null)" == "$review_body" ]] || problems+="plan_review.md was rewritten on a refusal path; "
+    fi
+  fi
+
+  if [[ -z "$problems" ]]; then
     pass "$label — exit=$rc, plan_review.md の判定='${got:-<none>}' (期待どおり)"
   else
-    fail "$label — expected exit=$expect_rc verdict='${expect_verdict:-<none>}', got exit=$rc verdict='${got:-<none>}'. plan_review.md: $(cat "$review_output" 2>/dev/null || echo '<missing>')"
+    fail "$label — ${problems}plan_review.md: $(cat "$review_output" 2>/dev/null || echo '<missing>') / log: $(cat /tmp/test_review_plan_json_rescue_stdout)"
   fi
   rm -rf "$TMPDIR_TEST"
 }
@@ -272,20 +300,26 @@ _run_case_ex "OK" "$RESULT_JSON_APPROVE" '**Verdict:** approve' 0 "approve" \
 
 echo ""
 echo "--- Case 6 (t012 [最重要]): プローズ成功 + 構造化出力が食い違う → どちらも採らず判定不能 ---"
-# 同じ plan-reviewer が plan_review.md と最終応答で違うことを言った場合、
-# 判定は曖昧であり、危険な側 (approve) に倒してはならない。exit 1 にすると
-# scripts/plan.sh が cycle を refund した上で Director に手動確認を促す。
 _run_case_ex "OK" "$RESULT_JSON_REVISE" '**Verdict:** approve' 1 "approve" \
   "prose=approve / structured=revise → どちらも採らず exit 1 (plan_review.md は書き換えない)"
 
 echo ""
-echo "--- Case 7 (t012): プローズが書式を外した (判定不能) → 構造化出力が1行目に書き戻して回収 ---"
-# t012 で lib_verdict を「1行目・完全一致」に絞ったため、書式を外した
-# plan_review.md はすべて判定不能になる。その回収が効くことの確認。
+echo "--- Case 7 (t018 挙動変更): 1行目が判定行でなく、本文に規定形式の approve がある → 書式違反として救済しない ---"
+# t012〜t015 はこの入力を「判定不能」として構造化出力から回収していた (exit 0)。
+# t018 (Director 設計判断2) で「兆候が 1 行目以外にある」は書式違反になり、
+# 構造化出力の値に関係なく fail-closed。本物の lib_verdict.py で読むと
+# 書式違反なので判定は '' (<none>)。
 _run_case_ex "TIMEOUT_FRESH" "$RESULT_JSON_APPROVE" '# Plan Review: test
 
-**Verdict:** approve' 0 "approve" \
-  "1行目が判定行でない plan_review.md → 構造化出力から回収して approve"
+**Verdict:** approve' 1 "" \
+  "1行目が判定行でない plan_review.md + structured=approve → 書式違反として exit 1 (救済しない)"
+
+echo ""
+echo "--- Case 7b (t018): verdict 行の兆候が無い別表記だけ → 構造化出力による救済は残る ---"
+_run_case_ex "TIMEOUT_FRESH" "$RESULT_JSON_APPROVE" '# Plan Review: test
+
+## 総合判定: GO' 0 "approve" \
+  "兆候なしの別表記 (## 総合判定: GO) + structured=approve → 1行目に書き戻して approve"
 
 echo ""
 echo "--- Case 8 (t012 fail-closed): 構造化出力が無く、プローズも書式を外している → 判定不能のまま exit 1 ---"
@@ -296,34 +330,18 @@ _run_case_ex "TIMEOUT_FRESH" "no json here" '# Plan Review: test
 
 echo ""
 echo "--- Case 4 (安全な結論は待った上で確定してよい): プローズ=revise (真の判定行) + 構造化出力が一切無い → 待ち切った後 revise のまま exit 0 ---"
-# t015 (Director 設計判断2, mission 20260912-verdict-ci-launcher) で挙動変更:
-# 以前はここで「revise/reject は安全な結論なので待たない」という近道が
-# あったが、これが QA t003 (Finn) の F2g (prose=revise / structured=approve
-# 遅延、を検出できない) の原因の一つだった。修正後は revise/reject でも
-# approve と**同じ MAX_WAIT** だけ構造化出力の到着を待ってから確定する
-# (このケースでは構造化出力が最後まで来ないので、ファイル冒頭で縮めた
-# REVIEW_PLAN_STRUCTURED_MAX_WAIT 分だけ待ってから revise を採用する —
-# 「待たない」ではなく「待っても食い違いが無ければ安全な結論を採用する」
-# に変わった)。
+# t015 (Director 設計判断2) で挙動変更: revise/reject でも approve と同じ
+# MAX_WAIT だけ構造化出力の到着を待ってから確定する。
 _run_case_ex "OK" "" '**Verdict:** revise' 0 "revise" \
-  "prose=revise / structured 皆無 → 同じ MAX_WAIT だけ待った上で revise を採用 (安全な結論に確認は不要だが、待つこと自体は他の verdict と揃える)"
+  "prose=revise / structured 皆無 → 同じ MAX_WAIT だけ待った上で revise を採用"
 
 echo ""
 echo "--- Case 9 (F2 コア回帰 — 本 PR の直接の動機): プローズ=approve + 構造化出力が最後まで確認できない → 確認なしに approve を通さない ---"
-# 7642f9b (修正前) はここで WAIT_STATUS=="OK" (プローズ側は読めていた) の
-# 一点だけを見て exit 0 のまま approve を通していた — 構造化出力による
-# 確認を一度も試みていなかった。ログが永遠に来ないケースなので、
-# ファイル冒頭で縮めた REVIEW_PLAN_STRUCTURED_MAX_WAIT により待ち切る
-# ことそのものを確認する。
 _run_case_ex "OK" "" '**Verdict:** approve' 1 "approve" \
   "prose=approve / structured 皆無 → 待っても確認できず exit 1 (plan_review.md 自体は書き換えない)"
 
 echo ""
 echo "--- Case 11 (Codex P2, t015): 構造化出力の envelope が失敗している (is_error:true) → verdict を信頼しない ---"
-# Kai-codex t004 review: 以前は .structured_output.verdict の型だけを見て
-# おり、is_error/subtype を確認していなかったため、実行が失敗したターンに
-# たまたま structured_output だけ残っている envelope でも approve を
-# 信頼してしまっていた。
 RESULT_JSON_ERROR_ENVELOPE='{"type":"result","subtype":"error_during_execution","is_error":true,"structured_output":{"verdict":"approve"}}'
 _run_case_ex "OK" "$RESULT_JSON_ERROR_ENVELOPE" '**Verdict:** approve' 1 "approve" \
   "structured envelope が is_error:true (実行失敗) → verdict を信頼せず exit 1 (plan_review.md は書き換えない)"
@@ -336,15 +354,41 @@ _run_case_ex "OK" "$RESULT_JSON_BAD_SUBTYPE" '**Verdict:** approve' 1 "approve" 
 
 echo ""
 echo "--- Case 10 (F2 コア回帰・遅延到着): プローズ=approve が即座に読める一方、構造化出力 (=revise, 食い違い) が遅れて届く → 食い違いを検出して exit 1 ---"
-# 7642f9b (修正前) は「プローズが既に読めていれば1回だけ非同期に読んで
-# 終わり」だったため、この遅延書き込みを永遠に見逃し exit 0 のまま approve
-# を通していた (memory: pr199-verdict-mechanism-handoff.md の
-# log_late(delay=6) と同型)。修正後は log_delay 秒後に届く structured
-# output にも追いつき、食い違いを検出できることを確認する。ファイル冒頭で
-# 縮めたデフォルト上限 (2秒) では書き込み前に諦めてしまうため、このケース
-# だけ余裕を持って上書きする (1秒遅延・5秒上限)。
 REVIEW_PLAN_STRUCTURED_MAX_WAIT=5 _run_case_ex "OK" "$RESULT_JSON_REVISE" '**Verdict:** approve' 1 "approve" \
   "prose=approve (即時) / structured=revise (1秒遅延) → 遅延に追いつき食い違いを検出して exit 1" 1
+
+echo ""
+echo "--- Case 13 (t018, QA t016 B_k1 / Kai-codex P1): 1行目 revise + 本文に approve + structured=approve → 救済せず exit 1 ---"
+# b21d4b4 (t015) では lib_verdict が自己矛盾を None (判定不能) に丸め、
+# structured=approve で救済して exit 0 / plan_review.verdict=approve になっていた。
+_run_case_ex "TIMEOUT_FRESH" "$RESULT_JSON_APPROVE" '**Verdict:** revise
+
+書式例として:
+
+**Verdict:** approve' 1 "" \
+  "自己矛盾 (revise + 本文 approve) + structured=approve → exit 1、plan_review.verdict も plan_review.md の書き換えも無し"
+
+echo ""
+echo "--- Case 14-17 (t018): lib_verdict.py が想定外の結果を返したら救済しない (終了コードの allowlist) ---"
+# プローズは兆候の無い別表記 (本物の lib_verdict.py なら救済される入力) にし、
+# 差し替えたスタブの結果だけで exit 1 に倒れることを確認する。
+_run_case_ex "TIMEOUT_FRESH" "$RESULT_JSON_APPROVE" '## 総合判定: GO' 1 "" \
+  "lib_verdict.py が落ちた (未捕捉例外 = rc 1) + structured=approve → exit 1" 0 \
+  $'import sys\nsys.exit(1)'
+_run_case_ex "TIMEOUT_FRESH" "$RESULT_JSON_APPROVE" '## 総合判定: GO' 1 "" \
+  "lib_verdict.py が rc 2 (python3 がスクリプトを開けないときと同じ) + structured=approve → exit 1" 0 \
+  $'import sys\nsys.exit(2)'
+_run_case_ex "TIMEOUT_FRESH" "$RESULT_JSON_APPROVE" '## 総合判定: GO' 1 "" \
+  "lib_verdict.py が rc 0 で正規でない出力 ('APPROVE') + structured=approve → exit 1" 0 \
+  'print("APPROVE")'
+_run_case_ex "TIMEOUT_FRESH" "$RESULT_JSON_APPROVE" '## 総合判定: GO' 1 "" \
+  "lib_verdict.py が rc 10 (兆候なし) なのに出力がある + structured=approve → exit 1" 0 \
+  $'import sys\nprint("approve")\nsys.exit(10)'
+
+echo ""
+echo "--- Case 18 (t018): 書式違反 (**Verdict:** REVISE) + 構造化出力なし → exit 1 ---"
+_run_case_ex "TIMEOUT_FRESH" "no json here" '**Verdict:** REVISE' 1 "" \
+  "書式違反 + structured 皆無 → exit 1"
 
 echo ""
 echo "== Results: $PASS_COUNT passed, $FAIL_COUNT failed =="

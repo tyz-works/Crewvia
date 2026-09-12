@@ -447,6 +447,13 @@ Finn の e2e ハーネスと同じ設計 (本物の `plan.sh review` パイプ�
 T1 が `status=ready/verdict=approve` になる (red) ことを確認してから元の
 コードで再実行できる。
 
+**訂正 (t018, QA t016 Finn FAIL-B / Kai-codex P2)**: t015 時点の `--verify-red` は
+`git show HEAD:...` を読んでおり、修正を commit した後は修正版そのものを
+「旧版」として実行していた (さらに本体のカウンタを 0 にリセットしていた)。
+したがって上の「red を確認できる」は、t015 のハーネスの出力としては成り立たない。
+t018 でハーネスを脆弱版の commit sha に固定する形に作り直し、red を取り直した
+(下記「t018」セクション参照)。
+
 ### FAIL-2 [高] / Kai-codex P2: universal newlines による CR (`\r`) 単体の誤判定
 
 上記「F3」セクションの訂正のとおり、`scripts/lib_verdict.py` の CLI
@@ -505,3 +512,108 @@ t002 で「prose=revise/reject → そのまま採用 (待たない)」を許可
 (スタブが `plan_review.verdict` も書くよう更新)、
 `scripts/test_review_plan_verdict_binding_e2e.sh` (新規、T1/T1r/F2g/F2c/
 Decision1 の e2e 回帰)。
+
+---
+
+## t018 (mission 20260912-verdict-ci-launcher, PR #199 fix 3): 自己矛盾・書式違反を救済前に分離 / red ハーネスを脆弱版に固定
+
+t015 の head (b21d4b4) を Kai-codex (t004 2 回目) と Finn (t016, Opus QA) が
+独立に検証し、2 件を実測した (QA 全文:
+https://github.com/tyz-works/Crewvia/pull/199#issuecomment-5645454359)。
+t015 の設計 (plan_review.verdict への束縛 / revise でも構造化出力を待つ /
+書き手の停止後に 1 回だけ読む / 雛形 1 行目 / newline="" / envelope allowlist)
+は崩していない。
+
+### FAIL-A [高] / Kai-codex P1: 自己矛盾が「判定不能」に丸められ、構造化出力で救済されていた (t015 による回帰)
+
+`lib_verdict` は「有効な 1 語」以外をすべて None (CLI rc=1) にしていた。
+review-plan.sh は None を「プローズに verdict が無い」とみなして
+structured=approve で救済するため、次の入力がすべて ready/approve になった:
+
+    B_k1: 1 行目 **Verdict:** revise + 本文に **Verdict:** approve (書式例の引用)
+    B_k2: 1 行目 approve + 本文 revise
+    B_k3: **Verdict:** revise (重大な指摘あり)
+    B_k4: **Verdict:** REVISE
+    B_k5: 1 行目 reject + 本文 approve
+
+k1/k2/k5 は t015 による回帰。3388334 では plan.sh が plan_review.md を
+**読み直していた**ため、prepend 後のファイルの自己矛盾を拾って refund していた。
+t015 の束縛 (plan.sh は読み直さない) がこの偶然の安全弁を消した。
+k3/k4 は 3388334 でも ready で、回帰ではなく設計上の穴。
+
+**Director の指示ミス (認める)**: t015 で束縛を必須にした際、plan.sh の読み直しが
+持っていた「自己矛盾なら refund」という副次的な安全弁が消えることを見落とした。
+その前のプランレビューで「prose 判定不能 & structured=approve → approve (救済)」を
+追加したときも、「判定不能」と「自己矛盾」を区別する要件を書いていなかった。
+
+**対応 (Director 設計判断1-6)**: 救済を allowlist 方向に絞った。
+
+- `lib_verdict.classify_verdict()` は次の 3 状態を返す。CLI は終了コードで区別する:
+  - **VALID** (rc 0 + 1 語): 「verdict 行の兆候」を持つ行がちょうど 1 行あり、それが最初の非空行で、値が正規
+  - **NO_SIGN** (rc 10、出力なし): 兆候がどこにも無い。ファイルが存在しない場合も含む
+  - **VIOLATION** (rc 20、出力なし): それ以外すべて
+    - 兆候が 1 行目以外にある / 余計な文字 / 大文字 / 複数 (値が同じでも)
+    - 読めない、または UTF-8 として不正
+- **兆候**の判定では、行を NFKD・casefold してから、空白・`*`・`_`・`` ` ``・`\`・書式文字 (Cf)・結合文字 (Mn) を除く。残った文字列に `verdict:` が含まれていれば兆候とする。
+  - Director の最低要件 (記法を問わず `**verdict:**` を含む行) の**上位集合**であり、`Verdict: revise` (太字なし) / `**Verdict**: revise` / 全角 / ゼロ幅空白入りも拾う。
+  - Director 定義そのままだと、太字なしの `Verdict: revise` + structured=approve が NO_SIGN として救済され、k3/k4 と同じ型が残るため。
+  - 兆候は救済を**拒否する方向にしか使わない**ので、広く拾っても approve は生まれない。
+  - コロンの無い言及 (雛形の注記 `(verdict が revise/reject の場合のみ記載)`) は拾わない。これは正常系を守るため。
+- review-plan.sh は **NO_SIGN のときだけ**構造化出力で救済する。
+  - VIOLATION は構造化出力の値に関係なく fail-closed にする (exit 1、plan.sh が cycle を refund)。
+  - lib_verdict の終了コードも allowlist で解釈し、0 と 10 以外 (Python の未捕捉例外 = 1、スクリプト不在 = 2) はすべて VIOLATION 扱い。
+  - t015 までは「0 以外 = 救済可」だったため、`lib_verdict.py` が落ちるだけで救済経路に入れた。例えば UTF-8 として不正な plan_review.md は未捕捉例外で rc=1 になっていた。
+- wait_for_plan_review.sh は「rc 0 かつ正規の 1 語」だけを OK にする。書式違反は OK にしない (待ち・停止確認・読み取りの順序は t015 のまま)。
+- 同じ値の重複 (`approve` が 2 行) も VIOLATION とした。
+  - 理由: 値が同じかどうかを見ると、本文中の verdict 行の**値を読む**経路がもう 1 つ増える。
+  - その経路には B_k1 と同じ形の読み違いの余地が残る。「兆候は値によらず 1 行だけ」にすれば、判定 unit を 1 つに保てる。
+- `agents/plan_reviewer.md` は「本文中に `**Verdict:**` 行を書かない (書くと判定不能ではなく書式違反として差し戻される)」に改めた。
+- 意図的な残余: `## 総合判定: NO-GO` のような verdict 語を使わない別表記、他言語、同形異字は NO_SIGN になり、構造化出力が唯一の判定 unit になる (Director 設計判断「兆候なしの別表記 + structured=approve → ready」の範囲)。
+
+### FAIL-B [中] / Kai-codex P2: `--verify-red` が脆弱版を実行していなかった
+
+t015 の `test_review_plan_verdict_binding_e2e.sh --verify-red` には次の問題があった:
+
+- `git show HEAD:scripts/...` を読んでいた。修正を commit した後の HEAD は修正版なので、修正版を「旧版」として実行していた。
+- さらに本体スイートの PASS/FAIL カウンタを 0 にリセットしていた。そのため作業ツリーに脆弱版を置いて本体が 4 件 FAIL しても exit 0 になった (Finn G2)。
+- 結果として、t015 の Result / PR 本文の「--verify-red で 3388334 相当のコードを実行 → ready/approve (red)」は、**このハーネスの出力としては証拠にならない**。3388334 で red になること自体は Finn が別途 hybrid コピーで実測している。
+
+**対応**:
+
+- 脆弱版を commit sha で固定し、`git archive <sha> scripts config` で丸ごと取り出して実行する。現在のツリーのファイルは混ぜない。実行したファイルの blob id を表示し、固定 sha の blob id と一致しなければ FAIL にする。
+  - 3388334: T1 / T1r (TOCTOU)、E1 (envelope is_error:true)、CR (lib_verdict CLI)
+  - b21d4b4: B_k1〜B_k5
+- red 側で期待するのは「脆弱な結果 (ready/approve、CR は approve rc=0) が再現すること」。再現しなければ red 確認そのものを FAIL にする。
+- red のカウンタは本体と別に持つ。終了コードは本体の失敗 0 件かつ red の未再現 0 件のときだけ 0。
+- G2 のメタテストを追加した: 作業ツリーのコピーに 3388334 の review-plan.sh / plan.sh を置き、このハーネス自身を `--verify-red` で実行する。本体 T1 が FAIL し red T1 が PASS した状態でも非 0 終了になることを確認する。
+- 各ケースで「スタブ mux_spawn が呼ばれた」「claude/herdr/tmux のバイナリが呼ばれていない」を確認する。全ケースの前には SANITY ケースを通す。
+- `tests/test_lib_verdict.py::test_splitlines_only_separator_regression_would_fail_on_old_splitlines` は削除した。旧ロジックを書き写して実行していただけで、旧コードを動かしていなかったため。
+- 注記: CI (`.github/workflows/ci.yml`) は pytest を実行しない。t002 の「pytest は CI で拾われる」は誤り。
+
+### 低優先度 (同 task で対応)
+
+- **plan_review.verdict の鮮度** (Finn E_A3): plan.sh は実行ごとの識別子を作り、`CREWVIA_PLAN_REVIEW_RUN_ID` で review-plan.sh に渡す。
+  - review-plan.sh は `<verdict>\nrun_id=<識別子>\n` の 2 行ちょうどで書く。
+  - plan.sh は識別子が一致しない (前 cycle の残骸・旧形式・余計な行) ファイルを消費せず、refund して止まる。
+  - 呼び出し前には plan.sh 自身も古いファイルを消す。
+  - これで安全性が review-plan.sh の `rm -f` だけに依存しなくなった。
+- **exit 0 なのに verdict を書かない経路** (Finn E_A1/E_A2): 終了コードは 0 のまま変えず、「plan_review.md output complete」とは言わないようにした。代わりに plan_review.verdict を書いていないこと・状態・plan.sh が refund することを出力する。
+- **テスト隔離**: `test_review_plan_director_identity.sh` は `CREWVIA_MUX=herdr` + 存在しない socket で `mux_available` を呼ぶ。そのため lib_mux.py が **実物の `herdr server` を起動しうる** 状態だった。何もしない herdr / tmux スタブを PATH 先頭に置いた。
+- `test_review_plan_pane_leak.sh` / `test_review_plan_model.sh` は「lib_verdict.py が無い (rc=2) = 判定不能」に暗黙に依存していた。兆候なし (rc 10) を返すスタブを明示的に置いた。
+
+### 関連ファイル (t018 分)
+
+- `scripts/lib_verdict.py`: 3 状態、兆候判定、CLI 終了コード
+- `scripts/review-plan.sh`: PROSE_STATE、救済を no_sign に限定、run_id、メッセージ
+- `scripts/wait_for_plan_review.sh`: 終了コード allowlist
+- `scripts/plan.sh`: run_id の発行と照合
+- `agents/plan_reviewer.md`
+- テスト (新規ケースと契約変更):
+  - `scripts/test_lib_verdict.sh`
+  - `tests/test_lib_verdict.py`
+  - `scripts/test_wait_for_plan_review.sh`
+  - `scripts/test_review_plan_json_rescue.sh`
+  - `scripts/test_plan_review_cycle_refund.sh`
+  - `scripts/test_plan_review_verdict_e2e_variants.sh`
+  - `scripts/test_review_plan_verdict_binding_e2e.sh`
+- テスト (隔離の修正): `scripts/test_review_plan_director_identity.sh` / `scripts/test_review_plan_pane_leak.sh` / `scripts/test_review_plan_model.sh`

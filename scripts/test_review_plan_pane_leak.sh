@@ -57,6 +57,13 @@ _run_case() {
   # scripts/lib_model.py と config/crewvia.yaml を必須で読むようになった。
   cp "${SCRIPT_DIR}/lib_model.py" "$TMPDIR_TEST/scripts/"
   cp "$(dirname "$SCRIPT_DIR")/config/crewvia.yaml" "$TMPDIR_TEST/config/"
+  # t018 (mission 20260912-verdict-ci-launcher): review-plan.sh は lib_verdict.py の
+  # 終了コード 10 (verdict 行の兆候なし) だけを「判定不能」とみなし、それ以外
+  # (スクリプト不在で python3 が返す 2 を含む) は書式違反として fail-closed に
+  # するようになった。このテストは verdict 判定ではなく mux_kill だけを見るため、
+  # 以前は暗黙に依存していた「lib_verdict.py が無い」状態の代わりに、兆候なしを
+  # 返すスタブを明示的に置く。
+  printf '%s\n' 'import sys' 'sys.exit(10)' > "$TMPDIR_TEST/scripts/lib_verdict.py"
 
   local kill_log="$TMPDIR_TEST/mux_kill.log"
   : > "$kill_log"

@@ -382,7 +382,45 @@ _stop_reviewer_and_confirm() {
 #      する。到着しない場合は reviewer を明示的に止め、停止を確認できてから
 #      読む。停止を確認できなければ読まない (=判定不能に倒れる)。
 STRUCTURED_VERDICT=""
+# --- t018 (mission 20260912-verdict-ci-launcher, PR #199 QA t016 Finn FAIL-A /
+# Kai-codex t004 2 回目 P1, Director 設計判断1-4) ---
+# plan_review.md の読み取り結果を「判定不能」1 種類にまとめず、状態として持つ。
+# t015 までは lib_verdict.py の出力が空なら一律「判定不能 → 構造化出力で救済」
+# としていたため、1 行目 revise + 本文に approve の自己矛盾ファイルや
+# `**Verdict:** REVISE` が structured=approve で ready になっていた。
+#   valid     — 1 行目だけに正規の verdict がある (PROSE_VERDICT に値が入る)
+#   no_sign   — verdict 行の兆候がファイルのどこにも無い (救済してよい唯一の状態)
+#   violation — 兆候はあるが規定形式でない / 自己矛盾 / lib_verdict.py が
+#               想定外の終了コードや出力を返した (落ちた場合を含む)
+#   unread    — reviewer の停止を確認できず、読んでいない (decision 3)
+PROSE_STATE="unread"
 PROSE_VERDICT=""
+
+# lib_verdict.py の終了コードは allowlist で解釈する: 0 + 正規の 1 語 = valid、
+# 10 + 出力なし = no_sign、それ以外はすべて violation。Python の未捕捉例外
+# (終了コード 1) やスクリプト不在 (2) を no_sign に丸めると、lib_verdict.py が
+# 落ちるだけで救済経路に入れてしまう。stderr は理由のログとしてそのまま流す。
+_read_prose_verdict() {
+    local out="" rc=0
+    out="$(python3 "${SCRIPT_DIR}/lib_verdict.py" "$REVIEW_OUTPUT")" || rc=$?
+    PROSE_VERDICT=""
+    if [[ "$rc" -eq 0 ]]; then
+        case "$out" in
+            approve|revise|reject)
+                PROSE_STATE="valid"
+                PROSE_VERDICT="$out"
+                ;;
+            *)
+                PROSE_STATE="violation"
+                ;;
+        esac
+    elif [[ "$rc" -eq 10 && -z "$out" ]]; then
+        PROSE_STATE="no_sign"
+    else
+        PROSE_STATE="violation"
+    fi
+}
+
 if [[ -n "$VERDICT_SCHEMA" ]]; then
     STOPPED_CONFIRMED=0
     if STRUCTURED_VERDICT="$(_wait_for_structured_verdict "$PLAN_REVIEWER_LOG")"; then
@@ -396,7 +434,7 @@ if [[ -n "$VERDICT_SCHEMA" ]]; then
     fi
 
     if [[ "$STOPPED_CONFIRMED" -eq 1 ]]; then
-        PROSE_VERDICT="$(python3 "${SCRIPT_DIR}/lib_verdict.py" "$REVIEW_OUTPUT" 2>/dev/null || true)"
+        _read_prose_verdict
     else
         echo "[review-plan.sh] WARNING: plan-reviewer session end could not be confirmed — refusing to read ${REVIEW_OUTPUT} (fail-closed, decision 3)" >&2
     fi
@@ -428,28 +466,51 @@ fi
 #   prose 判定不能   & structured 無し           → 判定不能 (上と同じ経路)
 #   prose=revise/reject                          → 従来通りそのまま採用
 #                                                   (構造化出力との食い違いだけは検出する)
+#
+# t018 判定マトリクス (Director 設計判断1-4。上の F2 マトリクスを置き換える):
+#   prose=violation (兆候はあるが規定形式でない / 自己矛盾 / lib_verdict 異常)
+#                                         → 判定不能 (structured の値に関係なく。救済しない)
+#   prose=unread (停止を確認できず読んでいない) → 判定不能 (救済しない)
+#   prose=valid & structured が食い違う      → 判定不能 (conflict)
+#   prose=valid & structured が同じ値        → その値
+#   prose=valid(revise/reject) & structured 無し → prose をそのまま採用
+#   prose=valid(approve) & structured 無し   → 判定不能 (F2)
+#   prose=no_sign & structured あり          → structured (救済。本旨なので残す)
+#   prose=no_sign & structured 無し          → 判定不能
+# t015 までは「prose が空 = 判定不能」の 1 状態しか無く、自己矛盾・書式違反も
+# 救済の行に流れていた (QA t016 FAIL-A: 1 行目 revise + 本文 approve +
+# structured=approve → ready)。救済してよいのは no_sign だけに絞る。
 FINAL_VERDICT=""
-VERDICT_CONFLICT=0
-if [[ -n "$STRUCTURED_VERDICT" && -n "$PROSE_VERDICT" && "$STRUCTURED_VERDICT" != "$PROSE_VERDICT" ]]; then
-    VERDICT_CONFLICT=1
-    echo "[review-plan.sh] WARNING: structured output verdict ('$STRUCTURED_VERDICT') disagrees with the verdict written in ${REVIEW_OUTPUT} ('$PROSE_VERDICT') — refusing both and falling back to manual inspection (fail-closed)" >&2
-elif [[ -n "$STRUCTURED_VERDICT" ]]; then
+REFUSAL_REASON=""
+if [[ "$PROSE_STATE" == "violation" ]]; then
+    REFUSAL_REASON="${REVIEW_OUTPUT} contains a verdict-line sign but is not exactly one canonical '**Verdict:** approve|revise|reject' on its first line (format violation or self-contradiction; structured output verdict: '${STRUCTURED_VERDICT:-none}')"
+    echo "[review-plan.sh] WARNING: ${REFUSAL_REASON} — the structured output is NOT used to rescue it (fail-closed, t018)" >&2
+elif [[ "$PROSE_STATE" == "valid" && -n "$STRUCTURED_VERDICT" && "$STRUCTURED_VERDICT" != "$PROSE_VERDICT" ]]; then
+    REFUSAL_REASON="structured output verdict ('$STRUCTURED_VERDICT') disagrees with the verdict written in ${REVIEW_OUTPUT} ('$PROSE_VERDICT')"
+    echo "[review-plan.sh] WARNING: ${REFUSAL_REASON} — refusing both and falling back to manual inspection (fail-closed)" >&2
+elif [[ "$PROSE_STATE" == "valid" && -n "$STRUCTURED_VERDICT" ]]; then
     FINAL_VERDICT="$STRUCTURED_VERDICT"
-elif [[ -n "$PROSE_VERDICT" && "$PROSE_VERDICT" != "approve" ]]; then
+elif [[ "$PROSE_STATE" == "valid" && "$PROSE_VERDICT" != "approve" ]]; then
     # revise/reject は安全な結論なので、構造化出力による確認が無くても
-    # プローズをそのまま採用してよい (F2 マトリクス最終行)。
+    # プローズをそのまま採用してよい。
     FINAL_VERDICT="$PROSE_VERDICT"
+elif [[ "$PROSE_STATE" == "valid" ]]; then
+    # F2 (本 PR の直接の動機): プローズは approve だったが、待ち切っても
+    # 構造化出力による確認が得られなかった。危険な結論 (approve) は
+    # 構造化出力による確認を必須にする。
+    REFUSAL_REASON="prose verdict was 'approve' but no confirming structured output verdict could be obtained after waiting"
+    echo "[review-plan.sh] WARNING: ${REFUSAL_REASON} — refusing to approve without confirmation (fail-closed, F2)" >&2
+elif [[ "$PROSE_STATE" == "no_sign" && -n "$STRUCTURED_VERDICT" ]]; then
+    FINAL_VERDICT="$STRUCTURED_VERDICT"
 fi
-# NOTE: PROSE_VERDICT=="approve" だが STRUCTURED_VERDICT が最後まで空のまま
-# だった場合、FINAL_VERDICT もここまで空のまま残る — 意図的 (F2 マトリクス
-# 3行目「prose=approve & structured 無し → 判定不能」)。下の分岐で拾う。
 
-if [[ "$VERDICT_CONFLICT" -eq 1 ]]; then
+VERDICT_BOUND=0
+if [[ -n "$REFUSAL_REASON" ]]; then
     WAIT_STATUS="TIMEOUT_FRESH"
     WAIT_RC=1
 elif [[ -n "$FINAL_VERDICT" ]]; then
-    if [[ "$FINAL_VERDICT" != "$PROSE_VERDICT" ]]; then
-        echo "[review-plan.sh] recovered verdict '$FINAL_VERDICT' from structured output (${PLAN_REVIEWER_LOG}); plan_review.md had no verdict readable in the canonical form (wait status was: $WAIT_STATUS)" >&2
+    if [[ "$PROSE_STATE" == "no_sign" ]]; then
+        echo "[review-plan.sh] recovered verdict '$FINAL_VERDICT' from structured output (${PLAN_REVIEWER_LOG}); plan_review.md had no verdict-line sign anywhere (wait status was: $WAIT_STATUS)" >&2
         # plan_review.md の**1行目**に規定形式の行を機械的に書き込む。
         # scripts/lib_verdict.py は最初の非空行だけを見るため、この prepend が
         # そのまま plan.sh cmd_review の読む唯一の判定になる。
@@ -474,25 +535,37 @@ elif [[ -n "$FINAL_VERDICT" ]]; then
     # FINAL_VERDICT だけを、review-plan.sh 以外の誰にも書き換えられない
     # 専用ファイルにアトミックに書き (tmp → mv)、plan.sh はこれだけを消費する。
     # plan_review.md 自体は人間向けの記録として残るが、判定には使われない。
-    printf '%s\n' "$FINAL_VERDICT" > "${VERDICT_FILE}.tmp" && mv "${VERDICT_FILE}.tmp" "$VERDICT_FILE"
-    WAIT_STATUS="OK"
-    WAIT_RC=0
-elif [[ "$PROSE_VERDICT" == "approve" ]]; then
-    # F2 (本 PR の直接の動機): プローズは approve だったが、待ち切っても
-    # 構造化出力による確認が得られなかった。WAIT_STATUS がここまで "OK"
-    # (プローズ単体は読めていた) であっても、確認なしに approve を通さない
-    # — 危険な結論 (approve) は構造化出力による確認を必須にする、という
-    # F2 マトリクスの安全側の行をここで実際に enforcement する。
-    echo "[review-plan.sh] WARNING: prose verdict was 'approve' but no confirming structured output verdict could be obtained after waiting — refusing to approve without confirmation (fail-closed, F2)" >&2
-    WAIT_STATUS="TIMEOUT_FRESH"
-    WAIT_RC=1
+    #
+    # t018 (鮮度, QA t016 Finn E_A3): 2 行目に plan.sh から渡された実行ごとの
+    # 識別子 (CREWVIA_PLAN_REVIEW_RUN_ID) を書く。plan.sh は識別子が一致しない
+    # ファイルを消費しない。書き込みに失敗した場合は bound 扱いにしない。
+    if printf '%s\nrun_id=%s\n' "$FINAL_VERDICT" "${CREWVIA_PLAN_REVIEW_RUN_ID:-}" > "${VERDICT_FILE}.tmp" \
+        && mv "${VERDICT_FILE}.tmp" "$VERDICT_FILE"; then
+        VERDICT_BOUND=1
+        WAIT_STATUS="OK"
+        WAIT_RC=0
+    else
+        REFUSAL_REASON="could not write ${VERDICT_FILE}"
+        echo "[review-plan.sh] ERROR: ${REFUSAL_REASON}" >&2
+        WAIT_STATUS="TIMEOUT_FRESH"
+        WAIT_RC=1
+    fi
 fi
-# else: FINAL_VERDICT も PROSE_VERDICT も空 (かつ conflict でもない) —
-# wait_for_plan_review.sh が返した元の WAIT_STATUS/WAIT_RC (通常は
-# TIMEOUT_FRESH/TIMEOUT_NONE) をそのまま使う。
+# else: 確定も拒否もしていない (prose=unread、または prose=no_sign で
+# 構造化出力も無い) — wait_for_plan_review.sh が返した元の WAIT_STATUS/WAIT_RC
+# をそのまま使う。
 
 if [[ "$WAIT_RC" -eq 0 && "$WAIT_STATUS" == "OK" ]]; then
-    echo "[review-plan.sh] plan_review.md output complete"
+    if [[ "$VERDICT_BOUND" -eq 1 ]]; then
+        echo "[review-plan.sh] plan_review.md output complete — verdict '${FINAL_VERDICT}' bound to ${VERDICT_FILE}"
+    else
+        # t018 (QA t016 Finn E_A1/E_A2): wait_for_plan_review.sh が途中で一度
+        # 規定形式の verdict を見た (OK) が、停止確認後の読み取りでは確定
+        # できなかった経路。終了コードは従来どおり 0 のまま (plan.sh は
+        # plan_review.verdict が無いことで rollback + cycle refund する) だが、
+        # 「output complete」とは言わない。
+        echo "[review-plan.sh] WARNING: no verdict was confirmed in this run — ${VERDICT_FILE} was NOT written (plan_review.md state: ${PROSE_STATE}, structured output verdict: ${STRUCTURED_VERDICT:-none}). scripts/plan.sh will roll the mission back to drafting without consuming a review cycle; inspect ${REVIEW_OUTPUT} by hand." >&2
+    fi
     # kill は上の EXIT trap (F4) が exit 時に自動で行うため、ここでは呼ばない。
     exit 0
 fi
@@ -501,7 +574,11 @@ fi
 # plan_review.md 自体は書かれていた場合 (TIMEOUT_FRESH) は「判定が読めなかった
 # だけ」であり、内容自体は活かせる可能性が高い。scripts/plan.sh 側 (cmd_review)
 # がこのメッセージを拾って Director に「再レビューではなく手動確認」を促す。
-if [[ "$WAIT_STATUS" == "TIMEOUT_FRESH" ]]; then
+if [[ -n "$REFUSAL_REASON" ]]; then
+    # t018: 書式違反・食い違い・F2 で拒否した場合はタイムアウトではないので、
+    # 拒否の理由をそのまま出す。
+    echo "[review-plan.sh] No verdict bound: ${REFUSAL_REASON}. Inspect ${REVIEW_OUTPUT} by hand — scripts/plan.sh rolls the mission back to drafting without consuming a review cycle." >&2
+elif [[ "$WAIT_STATUS" == "TIMEOUT_FRESH" ]]; then
     echo "[review-plan.sh] Timeout: plan_review.md was written during this run but no verdict (standard or recognized alternate wording) could be found. Inspect ${REVIEW_OUTPUT} by hand — the judgement content may still be usable without consuming another review cycle." >&2
 else
     echo "[review-plan.sh] Timeout: plan_review.md was not produced within 600s" >&2

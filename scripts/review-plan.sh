@@ -20,6 +20,35 @@ if [[ ! -d "$MISSION_DIR" ]]; then
     exit 1
 fi
 
+# --- モデル解決 (t001, mission 20260909-dead-config-sweep) ---
+# 以前は claude 起動時の --model に claude-opus-4-5 を直書きしており、
+# config/crewvia.yaml の model_per_skill.plan_review 設定が完全に無視される
+# dead config になっていた (しかも claude-opus-4-5 は存在しない世代の ID)。
+# scripts/start.sh の _resolve_worker_model / MODEL_CLI_ARG と同じ規約に倣う:
+#   1. scripts/lib_model.py resolve --skills plan_review で解決
+#   2. 空なら config の worker_model にフォールバック (lib_model.py 自体が
+#      config 不在・PyYAML 不在・YAML 破損時に空文字を返す設計のため)
+#   3. それでも空なら --model を付けず claude CLI のデフォルトに委ねる
+CONFIG_FILE="${CREWVIA_DIR}/config/crewvia.yaml"
+WORKER_MODEL_FROM_CONFIG=""
+if [[ -f "$CONFIG_FILE" ]]; then
+    WORKER_MODEL_FROM_CONFIG=$(grep -E '^worker_model:[[:space:]]*\S' "$CONFIG_FILE" | awk '{print $2}' | tr -d '"' | head -1)
+fi
+SELECTED_MODEL="$(python3 "${SCRIPT_DIR}/lib_model.py" resolve --config "$CONFIG_FILE" --skills plan_review)"
+if [[ -z "$SELECTED_MODEL" ]]; then
+    SELECTED_MODEL="$WORKER_MODEL_FROM_CONFIG"
+fi
+if [[ -n "$SELECTED_MODEL" ]]; then
+    echo "[review-plan.sh] Model: $SELECTED_MODEL"
+fi
+# mux 経路 (INLINE_CMD は文字列として eval されるため single-quote で囲む。
+# start.sh の MODEL_CLI_ARG と同じ規約)。
+MODEL_CLI_ARG=""
+[[ -n "$SELECTED_MODEL" ]] && MODEL_CLI_ARG=" --model '$SELECTED_MODEL'"
+# inline フォールバック経路 (実配列展開のため単純な --model フラグでよい)。
+MODEL_FLAG=()
+[[ -n "$SELECTED_MODEL" ]] && MODEL_FLAG=(--model "$SELECTED_MODEL")
+
 WINDOW_NAME="plan-reviewer-$$"
 
 # Use lib_mux.sh for mux-backend-agnostic window management.
@@ -71,7 +100,7 @@ REVIEW_START_EPOCH=$(date +%s)
 #
 # unset CLAUDE_CODE_CHILD_SESSION: herdr server 由来の汚染変数が Plan Reviewer に伝播しないよう除去。
 # CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1: 二重防御として transcript 保存を公式 env var で保証 (→ t004)。
-INLINE_CMD="unset CLAUDE_CODE_CHILD_SESSION; export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1; export AGENT_NAME='Plan-Reviewer'; export SKILLS=plan_review; cd '$CREWVIA_DIR' && CLAUDE_SKILL=plan_review claude --model claude-opus-4-5 \
+INLINE_CMD="unset CLAUDE_CODE_CHILD_SESSION; export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1; export AGENT_NAME='Plan-Reviewer'; export SKILLS=plan_review; cd '$CREWVIA_DIR' && CLAUDE_SKILL=plan_review claude${MODEL_CLI_ARG} \
      -p 'Mission slug: $SLUG. agents/plan_reviewer.md の手順に従い queue/missions/$SLUG/ の全タスクを検査し、queue/missions/$SLUG/plan_review.md を出力せよ。' \
      2>&1 | tee /tmp/plan_reviewer_$$.log"
 
@@ -100,7 +129,9 @@ else
     # 上の INLINE_CMD と同じ理由 (skill-permissions.yaml の plan_review 制限を
     # 実際に適用するため)。
     export SKILLS=plan_review
-    CLAUDE_SKILL=plan_review claude --model claude-opus-4-5 \
+    # start.sh の exec claude "${MODEL_FLAG[@]+...}" と同じ規約: 空配列を
+    # set -u 下で展開してもエラーにならないよう ${arr[@]+"${arr[@]}"} で守る。
+    CLAUDE_SKILL=plan_review claude "${MODEL_FLAG[@]+"${MODEL_FLAG[@]}"}" \
         -p "Mission slug: $SLUG. agents/plan_reviewer.md の手順に従い queue/missions/$SLUG/ の全タスクを検査し、queue/missions/$SLUG/plan_review.md を出力せよ。" \
         2>&1 | tee /tmp/plan_reviewer_$$.log
     if [[ $? -ne 0 ]]; then

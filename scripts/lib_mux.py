@@ -11,7 +11,7 @@ Backend selection (highest priority first):
   3. Auto: use tmux if `tmux` is in PATH
 
 Usage as module:
-  from lib_mux import Mux
+  from lib_mux import Mux, repo_identity_ok
   m = Mux()
   m.spawn("Omar-worker", "claude ...", cwd="/path/to/repo")
   m.send("Omar-worker", "タスクなし、shutdown")
@@ -24,6 +24,7 @@ Usage as module:
   ok = m.available()
   st = m.state("Omar-worker")  # "blocked"|"working"|"idle"|"done"|"unknown"
   landed = m.verify_sent("Omar-worker", kickoff_text)  # False = still stuck in input line, retry send()
+  safe = repo_identity_ok("/path/to/repo")  # False = refuse to act (deleted worktree etc.)
 
 CLI usage (for bash callers):
   python3 lib_mux.py available            # exit 0 = available (starts herdr server if needed)
@@ -38,6 +39,7 @@ CLI usage (for bash callers):
   python3 lib_mux.py attach-cmd <name>    # prints argv one arg per line, empty = use attach()
   python3 lib_mux.py state <name>         # prints agent state string
   python3 lib_mux.py verify-sent <name> <text>  # exit 0 = text left the input line (landed)
+  python3 lib_mux.py identity-ok <repo_root>    # exit 0 = repo_root still a valid git checkout
 """
 
 import json
@@ -60,6 +62,38 @@ _DEFAULT_SESSION = "crewvia"
 def _session() -> str:
     """Return the tmux session name (CREWVIA_TMUX_SESSION overrides default)."""
     return os.environ.get("CREWVIA_TMUX_SESSION", _DEFAULT_SESSION)
+
+
+def repo_identity_ok(repo_root) -> bool:
+    """Self-identity guard for long-running daemons (watchdog.py, dispatcher.sh).
+
+    Both daemons resolve their own repo_root once (from their own script
+    path, or from an explicit --repo-root / CREWVIA_QUEUE override) and then
+    trust it for the rest of their life — including when deciding whether
+    it's safe to kill a Worker pane. herdr additionally snapshots the
+    environment of whichever shell first started its server and replays it
+    onto every pane spawned afterwards (see herdr-server-stale-env-inheritance
+    knowledge doc), so a daemon launched from a throwaway git worktree (e.g.
+    for isolated dispatcher/watchdog testing) can end up operating against
+    the *production* mux workspace while its own repo_root still points at
+    that worktree. If the worktree is later removed (`git worktree remove`,
+    mission cleanup, ...), the daemon process itself does not die — it just
+    has no valid checkout left to claim ownership from, and must refuse to
+    act rather than keep killing panes in whatever workspace it inherited.
+
+    Returns True only if repo_root still exists on disk and is still a git
+    working tree (has a `.git` entry — file for a linked worktree, directory
+    for a normal checkout). Anything else (deleted, recreated as an empty
+    directory, a permission error) returns False so callers can fail closed:
+    skip the action (do not kill) rather than proceed with a repo_root they
+    can no longer prove is real. Deliberately conservative — a false "not
+    ok" only costs a skipped cycle; a false "ok" can kill a live Worker.
+    """
+    try:
+        root = Path(repo_root)
+        return root.is_dir() and (root / ".git").exists()
+    except OSError:
+        return False
 
 
 def _config_mode(config_path: Optional[Path] = None) -> Optional[str]:
@@ -1470,6 +1504,12 @@ def _cli_main(args: List[str]) -> int:
             return 2
         name, text = rest[0], " ".join(rest[1:])
         return 0 if m.verify_sent(name, text) else 1
+
+    elif verb == "identity-ok":
+        if not rest:
+            print("Usage: lib_mux.py identity-ok <repo_root>", file=sys.stderr)
+            return 2
+        return 0 if repo_identity_ok(rest[0]) else 1
 
     else:
         print(f"Unknown verb: {verb!r}", file=sys.stderr)

@@ -92,7 +92,6 @@ cp "$REAL_REPO/scripts/review-plan.sh" "$SCRATCH_DIR/scripts/"
 cp "$REAL_REPO/scripts/lib_mux.sh" "$SCRATCH_DIR/scripts/"
 cp "$REAL_REPO/scripts/lib_mux.py" "$SCRATCH_DIR/scripts/"
 cp "$REAL_REPO/scripts/wait_for_plan_review.sh" "$SCRATCH_DIR/scripts/"
-cp "$REAL_REPO/scripts/normalize_plan_review_verdict.py" "$SCRATCH_DIR/scripts/"
 # t001 (mission 20260909-dead-config-sweep): review-plan.sh はモデル解決に
 # scripts/lib_model.py と config/crewvia.yaml を必須で読むようになった。
 mkdir -p "$SCRATCH_DIR/config"
@@ -123,6 +122,15 @@ EOF
 exit 0
 FAKESCRIPT
 chmod +x "$FAKE_BIN_DIR/claude"
+# t018 (mission 20260912-verdict-ci-launcher): CREWVIA_MUX=herdr で socket が
+# 見つからないと、lib_mux.py の mux_available は `herdr server` を起動しようと
+# する (_ensure_server → _herdr_start_server)。実物の herdr が PATH にある
+# マシンでは、テストが本番の herdr server を起動しうる。何もせず失敗する
+# herdr / tmux スタブを PATH の先頭に置いて、実物に到達させない。
+for _mux_bin in herdr tmux; do
+  printf '#!/usr/bin/env bash\nexit 97\n' > "$FAKE_BIN_DIR/$_mux_bin"
+  chmod +x "$FAKE_BIN_DIR/$_mux_bin"
+done
 
 # review-plan.sh は mux_available && mux_spawn を先に試す。CREWVIA_HERDR_SOCK
 # はテスト専用の socket 上書き変数 (README/CLAUDE.md に明記) — 実在しない

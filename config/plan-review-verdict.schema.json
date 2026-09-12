@@ -1,0 +1,13 @@
+{
+  "$comment": "scripts/review-plan.sh (t004, mission 20260909-dead-config-sweep) が plan-reviewer 起動時の `claude --json-schema` に渡す JSON Schema。plan-reviewer の最終応答をこの形に強制することで、散文プロンプト指示 (`**Verdict:** approve` を1行目に書け) だけに頼らず verdict を機械的に取り出せるようにする。先例: config/kai-review-findings.schema.json (PR #193, codex exec --output-schema)。additionalProperties:false で未知フィールドを拒否し、スキーマ不適合の出力は scripts/review-plan.sh 側で jq パースが失敗して fail-closed (verdict 未確定のまま既存の polling/normalize 経路にフォールバック) に倒れる。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["verdict"],
+  "properties": {
+    "verdict": {
+      "type": "string",
+      "enum": ["approve", "revise", "reject"],
+      "description": "approve=重大な問題なし。revise=high severity issue 1つ以上または missing task あり。reject=Mission ゴール自体が不明確・矛盾、またはタスク数が極端に少ない。詳細は agents/plan_reviewer.md 参照。"
+    }
+  }
+}

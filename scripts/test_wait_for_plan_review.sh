@@ -6,8 +6,13 @@
 #
 # 検証内容 (t002 で実際に観測した3パターン + 正常系):
 #   1. 規定形式の verdict が既にある新しいファイル → 即 OK
-#   2. 別表記 (`## 総合判定: **GO**`) の新しいファイル → 正規化されて OK
-#      (side effect: ファイルに規定形式の Verdict 行が追記されること)
+#   2. 別表記 (`## 総合判定: **GO**`) の新しいファイル → TIMEOUT_FRESH
+#      (F1, mission 20260912-verdict-ci-launcher で挙動変更。以前はここで
+#      normalize_plan_review_verdict.py がファイル全体走査で別表記を救済して
+#      いたが、その走査が判定を1点だけ完全一致で読むという不変条件を迂回する
+#      唯一の穴だったため削除した。別表記の救済は scripts/review-plan.sh の
+#      構造化出力経路 (`claude --json-schema`) に一本化されている — このテスト
+#      は wait_for_plan_review.sh 単体を見るため、その rescue は経由しない)
 #   3. start_epoch より古い plan_review.md (前 cycle の残骸、規定形式の verdict
 #      入り) だけが存在し、新しいファイルが来ない → 古い判定を採用せず
 #      TIMEOUT_NONE で終わること (t002 の必須パターン3の直接再現)
@@ -52,7 +57,14 @@ else
 fi
 
 echo ""
-echo "--- Test 2: alt-wording fresh file → normalized to OK ---"
+echo "--- Test 2 (F1, mission 20260912-verdict-ci-launcher: 挙動変更): alt-wording fresh file → TIMEOUT_FRESH (もう正規化されない) ---"
+# 旧挙動 (削除前): normalize_plan_review_verdict.py がファイル全体を走査して
+# 別表記を救済し OK を返していた。その走査が「判定は1点だけを完全一致で
+# 読む」という lib_verdict.py の不変条件を丸ごと迂回する唯一の経路だった
+# ため削除した (F1)。別表記の救済は scripts/review-plan.sh の構造化出力
+# 経路 (`claude --json-schema`) に一本化されており、wait_for_plan_review.sh
+# 単体では別表記は判定不能のまま — 危険側 (OK) ではなく安全側
+# (TIMEOUT_FRESH) に倒れることを確認する。
 F2="$TMPDIR_TEST/t2.md"
 cat > "$F2" << 'EOF'
 # Plan Review: test-mission
@@ -62,10 +74,10 @@ EOF
 START=$(date +%s)
 OUT="$(bash "$WAIT_SCRIPT" "$F2" "$START" 1 1)"; RC=$?
 STATUS="$(echo "$OUT" | head -1)"
-if [[ "$RC" -eq 0 && "$STATUS" == "OK" ]] && grep -q '^\*\*Verdict:\*\* approve' "$F2"; then
-  pass "alt-wording fresh file → normalized to OK"
+if [[ "$RC" -eq 1 && "$STATUS" == "TIMEOUT_FRESH" ]]; then
+  pass "alt-wording fresh file → TIMEOUT_FRESH (F1: no longer silently normalized to approve)"
 else
-  fail "expected normalized OK, got rc=$RC status=$STATUS content=$(cat "$F2")"
+  fail "expected TIMEOUT_FRESH (safe side, F1 regression check), got rc=$RC status=$STATUS content=$(cat "$F2")"
 fi
 
 echo ""
@@ -157,6 +169,61 @@ if [[ "$RC" -eq 1 && "$STATUS" == "TIMEOUT_FRESH" ]]; then
   pass "'**Verdict:** STOP' (未知の判定語) は OK にならず TIMEOUT_FRESH (F2 fix)"
 else
   fail "未知の判定語が OK として受理されている (F2 regression) — rc=$RC status=$STATUS"
+fi
+
+echo ""
+echo "--- Test 8 (t018, Director 設計判断4): 書式違反・自己矛盾 (1行目 revise + 本文に approve) → OK にしない ---"
+F8="$TMPDIR_TEST/t8.md"
+START=$(date +%s)
+printf '%s\n' '**Verdict:** revise' '' '書式例:' '' '**Verdict:** approve' > "$F8"
+OUT="$(bash "$WAIT_SCRIPT" "$F8" "$START" 1 1)"; RC=$?
+STATUS="$(echo "$OUT" | head -1)"
+if [[ "$RC" -eq 1 && "$STATUS" == "TIMEOUT_FRESH" ]]; then
+  pass "書式違反 (lib_verdict rc=20) は OK にならず TIMEOUT_FRESH"
+else
+  fail "書式違反が OK として受理されている — rc=$RC status=$STATUS"
+fi
+
+# Test 9-11: lib_verdict.py の終了コード/出力を allowlist で解釈していることの確認。
+# wait_for_plan_review.sh は自分の隣の lib_verdict.py を呼ぶため、コピーした
+# ディレクトリにスタブを置く。
+_run_with_stub_lib() {
+  local dir="$1" stub_body="$2"
+  mkdir -p "$dir"
+  cp "$WAIT_SCRIPT" "$dir/wait_for_plan_review.sh"
+  printf '%s\n' "$stub_body" > "$dir/lib_verdict.py"
+  local start
+  start=$(date +%s)
+  printf '%s\n' '**Verdict:** approve' > "$dir/plan_review.md"
+  OUT="$(bash "$dir/wait_for_plan_review.sh" "$dir/plan_review.md" "$start" 1 1)"; RC=$?
+  STATUS="$(echo "$OUT" | head -1)"
+}
+
+echo ""
+echo "--- Test 9 (t018): lib_verdict.py が落ちた (未捕捉例外 = rc 1) → OK にしない ---"
+_run_with_stub_lib "$TMPDIR_TEST/w9" $'import sys\nsys.exit(1)'
+if [[ "$RC" -eq 1 && "$STATUS" == "TIMEOUT_FRESH" ]]; then
+  pass "lib_verdict rc=1 は OK にならない"
+else
+  fail "lib_verdict rc=1 で rc=$RC status=$STATUS"
+fi
+
+echo ""
+echo "--- Test 10 (t018): lib_verdict.py が rc 0 でも出力が正規の 1 語でない ('APPROVE') → OK にしない ---"
+_run_with_stub_lib "$TMPDIR_TEST/w10" 'print("APPROVE")'
+if [[ "$RC" -eq 1 && "$STATUS" == "TIMEOUT_FRESH" ]]; then
+  pass "rc 0 + 'APPROVE' は OK にならない"
+else
+  fail "rc 0 + 'APPROVE' で rc=$RC status=$STATUS"
+fi
+
+echo ""
+echo "--- Test 11 (対照): スタブが rc 0 + 'approve' を返す → OK (Test 9/10 のスタブ差し替えが効いていることの確認) ---"
+_run_with_stub_lib "$TMPDIR_TEST/w11" 'print("approve")'
+if [[ "$RC" -eq 0 && "$STATUS" == "OK" ]]; then
+  pass "rc 0 + 'approve' は OK"
+else
+  fail "対照が OK にならない (スタブが呼ばれていない可能性) — rc=$RC status=$STATUS"
 fi
 
 echo ""

@@ -2320,6 +2320,39 @@ def _load_lint_module():
     return mod, os.path.join(repo_root, 'config')
 
 
+def _load_verdict_module():
+    """Load lib_verdict.py dynamically, lazily, from inside cmd_review only.
+
+    t010 (QA t008 FINDING-1/2/3): plan_review.md の verdict 抽出は
+    scripts/lib_verdict.py に一本化した (wait_for_plan_review.sh も同じ
+    関数を使う)。F1 (t002, mission 20260912-verdict-ci-launcher):
+    以前はここで判定できなかった場合に normalize_plan_review_verdict.py が
+    ファイル全体を走査して別表記を救済していたが、その経路が不変条件
+    (判定は1点だけを完全一致で読む) を迂回する唯一の抜け道になっていたため
+    削除した。別表記の救済は scripts/review-plan.sh の構造化出力経路
+    (`claude --json-schema`) に一本化されている。
+
+    重要: これをモジュールのトップレベルで `import` すると、review 以外の
+    全サブコマンド (pull/done/needs-director 等) が、lib_verdict.py を
+    持たない fixture 経由で plan.sh を実行するテスト (例:
+    scripts/test_kai_review.sh は scripts/plan.sh だけをコピーした
+    FIXTURE_REPO で `plan.sh needs-director` 等を呼ぶ) まで巻き込んで
+    ImportError で壊してしまう。cmd_review の中でだけ、必要になった時点で
+    遅延 import する (_load_lint_module と同じ「per-command 動的ロード」の
+    考え方)。REPO_ROOT (sys.argv[3]) を使う — QUEUE_DIR ベースの repo_root
+    (テストで scratch に差し替え可能、review-plan.sh のスタブ差し替えに使う
+    ものと同じ) ではなく、常に「実際に起動された plan.sh 自身」の
+    scripts/ ディレクトリから読む。stub 差し替えの対象ではない、判定
+    ロジックの本体だからである。
+    """
+    import importlib.util, pathlib
+    verdict_path = pathlib.Path(REPO_ROOT) / 'scripts' / 'lib_verdict.py'
+    spec = importlib.util.spec_from_file_location('lib_verdict', verdict_path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def cmd_review(args):
     """
     Usage: plan.sh review <slug>
@@ -2327,8 +2360,9 @@ def cmd_review(args):
     1. Runs lint as a pre-step (FAIL → treated as revise, exit 1)
     2. Checks max_review_cycles
     3. Sets mission status to reviewing, increments cycle_count
-    4. Invokes scripts/review-plan.sh <slug>
-    5. Reads plan_review.md verdict and updates mission:
+    4. Invokes scripts/review-plan.sh <slug> (with CREWVIA_PLAN_REVIEW_RUN_ID)
+    5. Reads the verdict review-plan.sh bound to plan_review.verdict for this
+       run (never re-reads plan_review.md) and updates mission:
        - approve → status: ready
        - revise  → status: drafting, cycle_count++
        - reject  → status: drafting, cycle_count++
@@ -2387,10 +2421,37 @@ def cmd_review(args):
 
     # --- Step 3: invoke review-plan.sh ---
     import subprocess
+    import secrets
     repo_root = os.path.dirname(QUEUE_DIR)
     review_script = os.path.join(repo_root, 'scripts', 'review-plan.sh')
+    verdict_file = os.path.join(MISSIONS_DIR, slug, 'plan_review.verdict')
+
+    # t018 (mission 20260912-verdict-ci-launcher, QA t016 Finn E_A3): plan.sh は
+    # plan_review.verdict が「今回の review-plan.sh 実行で書かれた」ことを
+    # 自分で確認する。t015 時点では review-plan.sh 冒頭の `rm -f` だけが
+    # 前 cycle の古い approve を消す唯一の仕組みで、rm も書き込みもせずに
+    # exit 0 する review-plan.sh (差し替え・将来の改修ミス) があれば古い
+    # approve がそのまま消費されていた。
+    #   1. 実行ごとの識別子 (run_id) を作って環境変数で渡し、review-plan.sh は
+    #      verdict と一緒に書く。Step 4 で一致しなければ fail-closed。
+    #   2. 呼び出し前に自分でも古いファイルを消す (多重防御。消せなくても
+    #      1 の照合で弾かれる)。
+    review_run_id = secrets.token_hex(16)
+    try:
+        os.remove(verdict_file)
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        print(
+            f"[review] WARNING: could not remove stale {verdict_file} ({e}); "
+            f"the run id check still rejects it",
+            file=sys.stderr,
+        )
+    review_env = dict(os.environ)
+    review_env['CREWVIA_PLAN_REVIEW_RUN_ID'] = review_run_id
+
     print(f"[review] invoking review-plan.sh...", file=sys.stderr)
-    proc = subprocess.run(['bash', review_script, slug])
+    proc = subprocess.run(['bash', review_script, slug], env=review_env)
 
     def _rollback_to_drafting(reason, refund_cycle=False):
         """P2: rollback mission from reviewing → drafting on failure.
@@ -2421,8 +2482,8 @@ def cmd_review(args):
 
     if proc.returncode != 0:
         # t002: plan_review.md 自体は書かれているのにフォーマットだけが原因で
-        # review-plan.sh がタイムアウトすることがある (別表記の verdict がさらに
-        # normalize_plan_review_verdict.py でも判定できなかったケース)。この場合
+        # review-plan.sh がタイムアウトすることがある (別表記の verdict が
+        # 構造化出力経路でも判定できなかったケース)。この場合
         # 判定内容自体は活かせる可能性が高く、cycle_count を無駄にもう1回消費
         # させるより Director に手動確認を促す方が安全側。
         if os.path.exists(review_output):
@@ -2439,31 +2500,75 @@ def cmd_review(args):
         _rollback_to_drafting("review-plan.sh failed")
         die(f"review-plan.sh failed or timed out for mission '{slug}'")
 
-    # --- Step 4: read verdict from plan_review.md ---
-    if not os.path.exists(review_output):
-        _rollback_to_drafting("plan_review.md not found")
-        die(f"plan_review.md not found for mission '{slug}' after review-plan.sh completed")
+    # --- Step 4: read the verdict review-plan.sh bound to plan_review.verdict ---
+    # t015 (mission 20260912-verdict-ci-launcher, Director 設計判断1 — QA t003
+    # Finn FAIL-1 実測 / Kai-codex P1 TOCTOU への対応): plan.sh はもう
+    # plan_review.md を独立に読み直さない。
+    #
+    # 旧実装 (t010〜t012) はここで scripts/lib_verdict.py の
+    # extract_canonical_verdict() を plan_review.md に対して**独立に**再実行
+    # していた。review-plan.sh 側で FINAL_VERDICT が確定してから
+    # (mux_kill による) reviewer プロセスの終了までの間に plan_review.md の
+    # 1行目が書き換わると、review-plan.sh が検証した値と plan.sh がここで
+    # 読む値がずれてしまう — QA t003 (Finn) が「prose=revise で検証 →
+    # mux_kill 中に reviewer が1行目を approve に再 Write、structured 出力の
+    # 確認なしに approve が消費される」ことを decisive に実測した (T1/T1r)。
+    #
+    # 修正: review-plan.sh が確定した verdict だけを、review-plan.sh 以外の
+    # 誰にも (plan-reviewer セッションにも mux_kill にも) 書き換えられない
+    # 専用ファイル queue/missions/<slug>/plan_review.verdict に書かせ、
+    # plan.sh はそれだけを消費する。plan_review.md はもう判定には使わない
+    # (人間向けの記録としては残る)。
+    if not os.path.exists(verdict_file):
+        _rollback_to_drafting("no valid verdict (plan_review.verdict not found)", refund_cycle=True)
+        die(
+            f"No valid verdict found for mission '{slug}' — review-plan.sh did not "
+            f"produce {verdict_file}. If {review_output} exists, inspect it by hand "
+            f"(review-plan.sh may have refused to confirm a verdict without structured "
+            f"output; see its stderr log for the reason)."
+        )
 
-    verdict = None
-    with open(review_output) as f:
-        for line in f:
-            vm = re.search(r'\*\*Verdict:\*\*\s*(approve|revise|reject)', line)
-            if vm:
-                verdict = vm.group(1)
-                break
-    if not verdict:
-        # F2 (PR#188 t012 Seo 指摘): wait_for_plan_review.sh の OK 判定は
-        # `^\*\*Verdict:\*\*` の存在だけを見ており判定語 (approve/revise/
-        # reject) までは検証しない。そのため reviewer が
-        # `**Verdict:** STOP` のような未知の判定語を書くと wait_for は OK
-        # (exit 0) を返すが、ここ (plan.sh 側) は判定語を要求するため
-        # verdict が None になる — つまりこの分岐は「reviewer の書式ミス
-        # (判定語自体が不正)」で到達しうる、review-plan.sh 失敗時と同種の
-        # ケース。cycle_count の先食いを refund しないと、書式ミスだけで
-        # Director が review cycle を失う (上の "review-plan.sh timed out
-        # but plan_review.md exists" 分岐と同じ理由で refund_cycle=True)。
-        _rollback_to_drafting("no valid verdict in plan_review.md", refund_cycle=True)
-        die(f"No valid verdict found in plan_review.md for mission '{slug}'")
+    # newline='' (F2/FAIL-2 と同じ理由): 万一ファイルが破損していても改行
+    # 変換で誤って読み取らないようにする。
+    #
+    # t018 (鮮度): 形式は 2 行ちょうど "<verdict>\nrun_id=<Step 3 で渡した識別子>\n"。
+    # 識別子が一致しない (前 cycle の残骸・別の実行が書いたもの・識別子を知らない
+    # 旧形式の 1 行ファイル) なら、値が正しくても消費せず fail-closed。
+    # 読めない / UTF-8 として解釈できない場合も、mission を reviewing のまま
+    # 残さないよう rollback してから止める。
+    try:
+        with open(verdict_file, encoding='utf-8', newline='') as f:
+            verdict_raw = f.read()
+    except (OSError, UnicodeDecodeError) as e:
+        _rollback_to_drafting("plan_review.verdict is unreadable", refund_cycle=True)
+        die(f"could not read {verdict_file} ({e}) — refusing to guess (fail-closed).")
+    verdict_lines = verdict_raw.split('\n')
+    if (
+        len(verdict_lines) != 3
+        or verdict_lines[1] != f'run_id={review_run_id}'
+        or verdict_lines[2] != ''
+    ):
+        _rollback_to_drafting(
+            "plan_review.verdict was not written by this review run", refund_cycle=True
+        )
+        die(
+            f"plan_review.verdict for mission '{slug}' was not written by this review run "
+            f"(expected '<verdict>\\nrun_id={review_run_id}\\n', got {verdict_raw[:200]!r}) "
+            f"— refusing a stale or foreign verdict (fail-closed)."
+        )
+    verdict = verdict_lines[0]
+
+    # 防御的 allowlist チェック (review-plan.sh は既に enum 適合を検証済みの
+    # 値しか書かないはずだが、ファイル破損・部分書き込み等に備えて plan.sh
+    # 側でも独立に値そのものを検証する — plan_review.md の書式解析はしない、
+    # 値の完全一致だけを見る「判定 unit を1つに絞る」原則の延長)。
+    verdict_mod = _load_verdict_module()
+    if verdict not in verdict_mod.CANONICAL_VERDICTS:
+        _rollback_to_drafting("plan_review.verdict has an invalid value", refund_cycle=True)
+        die(
+            f"plan_review.verdict for mission '{slug}' has an unexpected value "
+            f"({verdict_raw!r}) — refusing to guess (fail-closed)."
+        )
 
     # --- Step 5: update mission based on verdict ---
     def _do_verdict():

@@ -264,3 +264,98 @@ t012 で**プローズの成否に関わらず必ず読み、判定の権威と�
 `scripts/test_plan_review_verdict_e2e_variants.sh` (25 variants に拡張。
 QA t011 の危険側入力 8 件を e2e で恒久化),
 `scripts/test_review_plan_json_rescue.sh` (8 cases に拡張)。
+
+---
+
+## 追記 (F1/F2/F3, t002 mission 20260912-verdict-ci-launcher): PR #199 QA (Finn) が実測した未解決3件の恒久化
+
+t012 の後も、PR #199 (このブランチ) は QA で 3 回連続 FAIL していた
+(memory: pr199-verdict-mechanism-handoff.md)。実測された3件をここで閉じた。
+
+### F1 [高]: 不変条件が normalize 側に適用されていなかった (真の判定源)
+
+`lib_verdict.extract_canonical_verdict()` は「最初の非空行だけを完全一致で
+読む」形に閉じていたが、**その1行目を書き込む
+`scripts/normalize_plan_review_verdict.py` の `find_alt_verdict()` は
+今もファイル全体を走査し、`_strip_fenced_lines` / `_strip_html_comments` と
+いう記法列挙の除去ヒューリスティクスを通していた**。blockquote と
+インデントコードブロックを知らないため、前 cycle の判定を引用しただけの
+入力 (`> ## 総合判定: **GO**` の後に保留の意思表示が続く) を誤って approve
+と判定していた。t012 で主機構を厳しくした分、プローズで読めなくなった
+ファイルが全部この経路に流れ込むようになっており、実質的な判定源は
+lib_verdict ではなくここだった。
+
+**対応**: `find_alt_verdict()` と、それ専用の stripper
+(`_strip_fenced_lines` / `_strip_html_comments` / `_strip_non_prose_regions`)
+を丸ごと削除。別表記の救済は `scripts/review-plan.sh` の構造化出力経路
+(`claude --json-schema`) に一本化されており、この経路と役割が重複していた
+うえ、不変条件を丸ごと迂回する唯一の穴になっていた。**`scripts/
+normalize_plan_review_verdict.py` 自体を削除**し、
+`scripts/wait_for_plan_review.sh` からの呼び出しも除去した (削除後は
+lib_verdict が判定できなければ素直に判定不能 = 安全側に倒れる)。
+
+### F2 [高]: 食い違い検出が approve 経路でだけ armed されない
+
+`review-plan.sh` は「プローズが読めなかったとき (`WAIT_STATUS != OK`)」
+だけ構造化出力の到着を待っていた。プローズが読めた瞬間 (=多くの場合
+approve) は待たずに1回だけ非同期に読んでいたが、mux 経路では
+`wait_for_plan_review.sh` が plan_review.md に verdict が現れた時点で即 OK
+を返し、`"type":"result"` の JSON はセッション終了時に出るため**構造化ログは
+必ず後から届く** — つまり approve 経路では構造化出力による確認が実質
+一度も行われず、reviewer の最終応答が revise/reject でも mission が ready
+になってしまっていた。
+
+**対応**: 待つかどうかの分岐を `WAIT_STATUS` ではなく実際のプローズ判定
+(`PROSE_VERDICT`) で決めるように変更。プローズが `approve` または判定不能の
+場合は必ず構造化出力の到着を待ち、確認できなければ approve を通さない。
+revise/reject は安全な結論なので従来どおり待たずにプローズを直接信頼する。
+
+判定マトリクス (最終形):
+
+    prose=approve   & structured=approve         → approve
+    prose と structured が食い違う                 → 判定不能 (conflict)
+    prose=approve   & 待ち切っても structured 無し  → 判定不能 (安全側)
+    prose 判定不能   & structured=approve         → approve (救済、残す)
+    prose 判定不能   & structured 無し            → 判定不能 (上と同じ経路)
+    prose=revise/reject                          → そのまま採用
+
+**待ち時間の設計**: 旧実装は固定 8×3=24秒 (プローズ失敗経路専用の値)。
+Director 指摘: 「本番の実遅延を測るか、reviewer プロセス/pane の終了を
+待つ設計にする」。実測手段が無かったため、ログサイズの quiescence を
+完了の代理シグナルにする案を検討したが**却下**した — claude セッションは
+長い思考や道具の実行で出力が止まることがあり、一時的な静止と本当の終了を
+区別できない (F2 と同型の「見積もりが正常系を下回って安全側に誤爆する」
+失敗を作る)。代わりに **「正常系の所要時間を言い当てる」ことを諦め、
+失敗方向にしか効かない固定間隔ポーリング** にした
+(`scripts/review-plan.sh` の `_wait_for_structured_verdict`)。見つかれば
+即座に抜けるため正常系には影響せず、見つからない場合だけ
+`REVIEW_PLAN_STRUCTURED_MAX_WAIT` (デフォルト180秒。正常系の見積もりでは
+なく暴走防止の安全弁) を待ってから諦める。
+
+### F3 [中]: `str.splitlines()` が `\n` 以外の8種+`\r`の行区切りを扱ってしまう
+
+`scripts/lib_verdict.py` の `first_content_line()` / `extract_canonical_verdict()`
+の自己矛盾チェックが `str.splitlines()` を使っていた。splitlines() は `\n`
+以外にも `\r` / `\x0b` (VT) / `\x0c` (FF) / `\x1c` (FS) / `\x1d` (GS) /
+`\x1e` (RS) / U+0085 (NEL) / U+2028 (LS) / U+2029 (PS) の計9種で分割するが、
+呼び出し元 (grep・シェルの文字列比較) はいずれも `\n` だけを行区切りと
+みなすため、`**Verdict:** approve<SEP>ではない。修正が必要です` の
+`<SEP>` にこれらの文字を使うと lib_verdict だけが1行目を短く区切って
+しまい、完全一致 allowlist を素通りしていた (ファイル経由の呼び出しでは
+Python の universal newlines が `\r` を先に `\n` へ変換してしまうため、
+`\r` 単体は file I/O 越しには顕在化しない — 直接 `extract_canonical_verdict()`
+を呼ぶ経路や `newline=""` で開く将来の呼び出し元に対する防御)。
+
+**対応**: `text.splitlines()` → `text.split("\n")` に置換 (2箇所)。9種
+すべての回帰テストは `tests/test_lib_verdict.py` (pytest) に置いた —
+`scripts/test_*.sh` は CI で実行されないため。
+
+### 関連ファイル (F1/F2/F3 分)
+
+`scripts/lib_verdict.py` (splitlines → split("\n")), `scripts/
+normalize_plan_review_verdict.py` (削除), `scripts/wait_for_plan_review.sh`
+(normalize 呼び出しの除去), `scripts/review-plan.sh` (F2 判定マトリクス +
+`_wait_for_structured_verdict`), `tests/test_lib_verdict.py` (新規、pytest)、
+`scripts/test_review_plan_json_rescue.sh` / `scripts/test_wait_for_plan_review.sh`
+/ `scripts/test_plan_review_verdict_e2e_variants.sh` (F1/F2 の挙動変更に
+合わせて期待値を更新・新規ケース追加)。

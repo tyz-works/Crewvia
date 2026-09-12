@@ -206,8 +206,7 @@ printf '%s\n' "$WAIT_OUTPUT" | tail -n +2 >&2 || true
 # plan_review.md は意図的にすべて判定不能になる。その回収をこの経路が担う。
 #
 # 倒れる方向: ログが無い/JSON としてパースできない/ドキュメントが複数ある/
-# verdict が既知の3値以外、のいずれでも何もしない (WAIT_STATUS を変更しない)
-# — 既存の判定 (失敗ならタイムアウト) をそのまま採用する。
+# verdict が既知の3値以外、のいずれでも何もしない (呼び出し元が判定不能として扱う)。
 _rescue_verdict_from_structured_output() {
     local log="$1"
     [[ -f "$log" ]] || return 1
@@ -231,32 +230,85 @@ _rescue_verdict_from_structured_output() {
     printf '%s\n' "$verdict"
 }
 
+# --- F2 (t002, mission 20260912-verdict-ci-launcher) ---
+# 構造化出力の到着を待つ。mux 経路では review-plan.sh は plan-reviewer
+# プロセスの終了を直接待たない (plan_review.md の mtime 安定化だけで判定
+# している) ため、プローズが読めた時点でもまだ最終ターン (構造化出力) が
+# 書き終わっていない可能性がある。
+#
+# 旧実装は「プローズが判定不能だったときだけ」固定 8*3=24秒の retry を
+# 挟んでいた。これは2つの意味で誤りだった:
+#   1. プローズ=approve (=WAIT_STATUS==OK) の経路では retry 自体が
+#      スキップされ、構造化出力による食い違い検出が一度も armed されない
+#      まま「プローズの approve」だけで確定してしまっていた (F2 本体の
+#      バグ — 本番では構造化出力は必ずプローズより後に届くため、
+#      この経路は実質的に無検証だった)。
+#   2. 24秒という上限は「救済経路 (プローズ失敗時) でしか発火しない」
+#      という前提で決めた値であり、approve 経路の正常系の所要時間を
+#      測って決めた値ではない。
+#
+# 対応: 待つかどうかを WAIT_STATUS ではなく実際のプローズ判定 (下の
+# PROSE_VERDICT) で決める。プローズが revise/reject の場合は安全な結論
+# なので従来どおり retry せず1回だけ読む。プローズが approve、または
+# 判定不能の場合は必ず待つ。
+#
+# 待ち時間: Director 指摘 — 固定秒数は本番の実遅延を実測して決めるべきだが、
+# 過去の plan-reviewer ログから実測する手段が無かった。「reviewer プロセス/
+# pane の終了を待つ」の代替として、当初はログサイズの変化が止まったこと
+# (quiescence) を「セッション終了」の代理シグナルにする案を検討したが、
+# 却下した: claude セッションは長い思考や道具の実行で出力が数十秒単位で
+# 止まることがあり、その「一時的な静止」と「本当にセッションが終わった」を
+# 外から区別する手段が無い。static な安定判定 (例: 2 回連続無変化) を使うと、
+# 正常系でもまだ書いている途中のセッションを「終わった」と誤認して諦める
+# 経路が生まれ、これは F2 本体と同じ形の失敗 (見積もりが正常系の実際の
+# 遅延を下回って安全側に誤爆する) になる。
+#
+# 採用した方針: 「正常系の所要時間を言い当てる」ことを諦め、代わりに
+# **失敗方向にしか効かない**単純な固定間隔ポーリングにする。max_wait は
+# 正常系の所要時間の見積もりではなく、壊れた/応答不能なセッションを
+# 無限に待たないための安全弁 (暴走防止) として十分長い値
+# (デフォルト180秒 = wait_for_plan_review.sh の 600秒 timeoutより十分短い)
+# を置くだけで、量を上げても安全側が壊れることはない (見つかれば即座に
+# 抜けるため正常系の待ち時間には影響しない。見つからない場合だけ
+# max_wait 分待ってから諦める — 待たされる分には approve が誤って
+# 通ることはなく、F2 が守りたい性質を壊さない)。
+_STRUCTURED_WAIT_POLL_INTERVAL="${REVIEW_PLAN_STRUCTURED_POLL_INTERVAL:-3}"
+_STRUCTURED_WAIT_MAX_SECONDS="${REVIEW_PLAN_STRUCTURED_MAX_WAIT:-180}"
+
+_wait_for_structured_verdict() {
+    local log="$1"
+    local poll_interval="$_STRUCTURED_WAIT_POLL_INTERVAL"
+    local max_wait="$_STRUCTURED_WAIT_MAX_SECONDS"
+    local verdict
+    local elapsed=0
+
+    while :; do
+        if verdict="$(_rescue_verdict_from_structured_output "$log")"; then
+            printf '%s\n' "$verdict"
+            return 0
+        fi
+        [[ "$elapsed" -ge "$max_wait" ]] && break
+        sleep "$poll_interval"
+        elapsed=$((elapsed + poll_interval))
+    done
+    echo "[review-plan.sh] $log: no confirming structured output verdict found within ${max_wait}s" >&2
+    return 1
+}
+
 # plan_review.md 側 (規定形式の1行目) から読める verdict。
 # 読めなければ空文字 (判定不能)。
 PROSE_VERDICT="$(python3 "${SCRIPT_DIR}/lib_verdict.py" "$REVIEW_OUTPUT" 2>/dev/null || true)"
 
 STRUCTURED_VERDICT=""
 if [[ -n "$VERDICT_SCHEMA" ]]; then
-    if [[ "$WAIT_RC" -ne 0 || "$WAIT_STATUS" != "OK" ]]; then
-        # mux 経路では review-plan.sh は plan-reviewer プロセスの終了を直接
-        # 待たない (plan_review.md の mtime 安定化だけで判定している) ため、
-        # 上の polling が抜けた時点で最終ターン (構造化出力) がまだ書き終わって
-        # いない可能性がある。短い bounded retry で追いつくのを待つ (最大
-        # 8 * 3 = 24秒。プローズが判定不能だった経路でしか発火しないため
-        # 通常ケースの所要時間には影響しない)。
-        _rescue_i=0
-        while [[ "$_rescue_i" -lt 8 ]]; do
-            if STRUCTURED_VERDICT="$(_rescue_verdict_from_structured_output "$PLAN_REVIEWER_LOG")"; then
-                break
-            fi
-            STRUCTURED_VERDICT=""
-            _rescue_i=$((_rescue_i + 1))
-            sleep 3
-        done
+    if [[ -z "$PROSE_VERDICT" || "$PROSE_VERDICT" == "approve" ]]; then
+        # プローズが判定不能、または approve (=危険な結論。構造化出力による
+        # 確認を必須にする、F2) の場合は待つ。
+        STRUCTURED_VERDICT="$(_wait_for_structured_verdict "$PLAN_REVIEWER_LOG")" || STRUCTURED_VERDICT=""
     else
-        # プローズ側が既に判定できている場合は retry せず1回だけ読む
-        # (正常系の所要時間を 24 秒伸ばさないため)。読めなければ
-        # プローズの判定をそのまま使う。
+        # revise/reject は安全な結論なのでプローズを直接信頼してよい。待ちは
+        # せず、機会があれば1回だけ読んで矛盾検出にだけ使う (正常系の所要
+        # 時間を伸ばさないため)。読めなければプローズの判定をそのまま使う。
         STRUCTURED_VERDICT="$(_rescue_verdict_from_structured_output "$PLAN_REVIEWER_LOG")" || STRUCTURED_VERDICT=""
     fi
 fi
@@ -271,6 +323,15 @@ fi
 # 自己矛盾チェックで結局判定不能になる (二度手間かつ挙動が分かりにくい)。
 # ここで判定不能に倒せば scripts/plan.sh が cycle を refund した上で
 # Director に手動確認を促すため、review cycle も失われない。
+#
+# F2 判定マトリクス (Director 追記):
+#   prose=approve   & structured=approve        → approve
+#   prose と structured が食い違う               → 判定不能 (conflict)
+#   prose=approve   & 待ち切っても structured 無し → 判定不能 (安全側)
+#   prose 判定不能   & structured=approve        → approve (救済。本旨なので残す)
+#   prose 判定不能   & structured 無し           → 判定不能 (上と同じ経路)
+#   prose=revise/reject                          → 従来通りそのまま採用
+#                                                   (構造化出力との食い違いだけは検出する)
 FINAL_VERDICT=""
 VERDICT_CONFLICT=0
 if [[ -n "$STRUCTURED_VERDICT" && -n "$PROSE_VERDICT" && "$STRUCTURED_VERDICT" != "$PROSE_VERDICT" ]]; then
@@ -278,7 +339,14 @@ if [[ -n "$STRUCTURED_VERDICT" && -n "$PROSE_VERDICT" && "$STRUCTURED_VERDICT" !
     echo "[review-plan.sh] WARNING: structured output verdict ('$STRUCTURED_VERDICT') disagrees with the verdict written in ${REVIEW_OUTPUT} ('$PROSE_VERDICT') — refusing both and falling back to manual inspection (fail-closed)" >&2
 elif [[ -n "$STRUCTURED_VERDICT" ]]; then
     FINAL_VERDICT="$STRUCTURED_VERDICT"
+elif [[ -n "$PROSE_VERDICT" && "$PROSE_VERDICT" != "approve" ]]; then
+    # revise/reject は安全な結論なので、構造化出力による確認が無くても
+    # プローズをそのまま採用してよい (F2 マトリクス最終行)。
+    FINAL_VERDICT="$PROSE_VERDICT"
 fi
+# NOTE: PROSE_VERDICT=="approve" だが STRUCTURED_VERDICT が最後まで空のまま
+# だった場合、FINAL_VERDICT もここまで空のまま残る — 意図的 (F2 マトリクス
+# 3行目「prose=approve & structured 無し → 判定不能」)。下の分岐で拾う。
 
 if [[ "$VERDICT_CONFLICT" -eq 1 ]]; then
     WAIT_STATUS="TIMEOUT_FRESH"
@@ -289,7 +357,9 @@ elif [[ -n "$FINAL_VERDICT" ]]; then
         # plan_review.md の**1行目**に規定形式の行を機械的に書き込む。
         # scripts/lib_verdict.py は最初の非空行だけを見るため、この prepend が
         # そのまま plan.sh cmd_review の読む唯一の判定になる。
-        # normalize_plan_review_verdict.py と同じ「原文は残す」prepend パターン。
+        # normalize_plan_review_verdict.py と同じ「原文は残す」prepend パターン
+        # (F1 で normalize_plan_review_verdict.py 自体は削除したが、prepend
+        # パターンはここに移植済みなので影響しない)。
         TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
         # NOTE: 最後の文を `[[ -f ]] && cat` の短絡形にすると、ファイルが
         # 無い場合に `{ ... }` グループ自体が非0を返し、後続の `&& mv` が
@@ -305,7 +375,19 @@ elif [[ -n "$FINAL_VERDICT" ]]; then
     fi
     WAIT_STATUS="OK"
     WAIT_RC=0
+elif [[ "$PROSE_VERDICT" == "approve" ]]; then
+    # F2 (本 PR の直接の動機): プローズは approve だったが、待ち切っても
+    # 構造化出力による確認が得られなかった。WAIT_STATUS がここまで "OK"
+    # (プローズ単体は読めていた) であっても、確認なしに approve を通さない
+    # — 危険な結論 (approve) は構造化出力による確認を必須にする、という
+    # F2 マトリクスの安全側の行をここで実際に enforcement する。
+    echo "[review-plan.sh] WARNING: prose verdict was 'approve' but no confirming structured output verdict could be obtained after waiting — refusing to approve without confirmation (fail-closed, F2)" >&2
+    WAIT_STATUS="TIMEOUT_FRESH"
+    WAIT_RC=1
 fi
+# else: FINAL_VERDICT も PROSE_VERDICT も空 (かつ conflict でもない) —
+# wait_for_plan_review.sh が返した元の WAIT_STATUS/WAIT_RC (通常は
+# TIMEOUT_FRESH/TIMEOUT_NONE) をそのまま使う。
 
 if [[ "$WAIT_RC" -eq 0 && "$WAIT_STATUS" == "OK" ]]; then
     echo "[review-plan.sh] plan_review.md output complete"

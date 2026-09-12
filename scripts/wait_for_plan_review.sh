@@ -9,7 +9,13 @@
 # end-to-end ではテストしにくい。ポーリング判定だけを独立スクリプトにする
 # ことで、claude を一切起動せずに以下の回帰テストができる:
 #   1. 有効な verdict (規定形式 `**Verdict:** approve` 等) → 即成功
-#   2. 別表記の verdict (`## 総合判定: **GO**` 等) → 正規化して成功
+#   2. 別表記の verdict (`## 総合判定: **GO**` 等) → タイムアウト
+#      (F1, t002 mission 20260912-verdict-ci-launcher: 別表記をファイル全体
+#      走査で救済する旧 normalize_plan_review_verdict.py 経路は、判定は1点
+#      だけを完全一致で読むという不変条件を迂回する唯一の穴だったため削除
+#      した。別表記の救済は scripts/review-plan.sh の構造化出力経路
+#      (`claude --json-schema`) に一本化されている — このスクリプトは
+#      規定形式の有無だけを見る)
 #   3. start_epoch より古い plan_review.md (前 cycle の残骸) → 無視して待ち
 #      続け、新しいファイルが来なければタイムアウトすること (誤って古い
 #      判定を新しい判定として採用しない。t002 で実際に発生したパターン3)
@@ -21,7 +27,8 @@
 # であり、削除自体の代替ではない。
 #
 # 標準出力の1行目で結果種別を返す (2行目以降は人間向けログ、stderr にも複製):
-#   OK             — 有効な verdict が見つかった (規定形式 or 正規化成功)
+#   OK             — 有効な verdict が見つかった (規定形式のみ。F1 以降、
+#                    別表記の正規化はこのスクリプトの責務ではない)
 #   TIMEOUT_FRESH  — このレビュー実行で書かれたファイルは観測できたが、
 #                    最後まで有効な verdict が見つからなかった
 #                    (フォーマット不明で判定不能。内容自体は活かせる可能性あり)
@@ -29,7 +36,7 @@
 # exit code: 0 = OK, 1 = TIMEOUT (fresh/none いずれも)
 #
 # t011 (mission 20260908-launch-reliability, QA t009 FINDING-B) 早期打ち切り:
-# reviewer が既知の別表記にない語彙 (例 `**STOP**`) を書いた場合、normalize は
+# reviewer が規定形式にない語彙 (例 `**STOP**`) を書いた場合、lib_verdict は
 # 何度呼んでも判定不能 (exit 1) のままであり、待っても結果は変わらない。
 # 「fresh なファイルの mtime が 2 回連続で変化していない (=書き込みが止まって
 # いる) のに verdict が読めない」ことを検出したら、残りの max_wait を待たずに
@@ -47,7 +54,6 @@ MAX_WAIT="${3:-600}"
 POLL_INTERVAL="${4:-5}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-NORMALIZE_SCRIPT="${SCRIPT_DIR}/normalize_plan_review_verdict.py"
 VERDICT_LIB="${SCRIPT_DIR}/lib_verdict.py"
 
 # GNU (Linux/WSL) と BSD/macOS の stat 引数差を吸収する。
@@ -86,12 +92,17 @@ while [ "$_i" -lt "$_iterations" ]; do
         echo "[wait_for_plan_review] valid verdict found in $REVIEW_OUTPUT" >&2
         exit 0
       fi
-      if [ -f "$NORMALIZE_SCRIPT" ] && python3 "$NORMALIZE_SCRIPT" "$REVIEW_OUTPUT"; then
-        echo "OK"
-        echo "[wait_for_plan_review] verdict normalized to standard format in $REVIEW_OUTPUT" >&2
-        exit 0
-      fi
-      # 別表記も見つからなかった — reviewer がまだ書き終えていない可能性が
+      # F1 (t002, mission 20260912-verdict-ci-launcher): 以前はここで
+      # normalize_plan_review_verdict.py がファイル全体を走査して別表記
+      # (`## 総合判定: **GO**` 等) を救済していたが、その走査が「判定は1点
+      # だけを完全一致で読む」という lib_verdict.py の不変条件を丸ごと迂回
+      # する唯一の経路になっていた (blockquote で引用された前 cycle の判定を
+      # 拾って誤って ready/approve に倒すケースを実測)。削除して、別表記の
+      # 救済は scripts/review-plan.sh の構造化出力経路 (`claude
+      # --json-schema`) に一本化した — ここでは規定形式が読めなければ
+      # 素直に「判定不能」に倒す。
+      #
+      # 規定形式が読めなかった — reviewer がまだ書き終えていない可能性が
       # あるため即座には諦めないが、mtime が前回と同じ (書き込みが止まって
       # いる) 場合はストリークを積み、2回連続で止まっていれば早期打ち切り。
       if [ "$_mtime" = "$_last_unreadable_mtime" ]; then

@@ -16,11 +16,12 @@
 # scripts/plan.sh を CREWVIA_QUEUE=<scratch> で実行し、scratch 側の
 # scripts/review-plan.sh だけを差し替える。差し替え版は claude を一切
 # 起動せず、plan_review.md を指定内容で書いた後、**本物の**
-# scripts/wait_for_plan_review.sh (内部で本物の lib_verdict.py /
-# normalize_plan_review_verdict.py を呼ぶ) を実行し、その OK/TIMEOUT 判定を
-# review-plan.sh の終了コード規約 (OK なら0、それ以外1) として再現する。
-# plan.sh 側の verdict 抽出・rollback・cycle refund・mission 更新はすべて
-# 本物のコードパスを通る。claude CLI は一切起動しない。
+# scripts/wait_for_plan_review.sh (内部で本物の lib_verdict.py を呼ぶ。
+# F1, mission 20260912-verdict-ci-launcher で
+# normalize_plan_review_verdict.py は削除済み) を実行し、その OK/TIMEOUT
+# 判定を review-plan.sh の終了コード規約 (OK なら0、それ以外1) として
+# 再現する。plan.sh 側の verdict 抽出・rollback・cycle refund・mission 更新は
+# すべて本物のコードパスを通る。claude CLI は一切起動しない。
 #
 # 実行: bash scripts/test_plan_review_verdict_e2e_variants.sh
 
@@ -104,15 +105,26 @@ EOF
 }
 
 echo ""
-echo "--- 正常系 (regression: approve/revise/reject/GO表記 は従来どおり動く) ---"
+echo "--- 正常系 (regression: approve/revise/reject は従来どおり動く) ---"
 _run_variant "canon_approve" '**Verdict:** approve' "ready" "approve" \
   "規定形式 approve → status: ready, verdict: approve"
 _run_variant "canon_revise" '**Verdict:** revise' "drafting" "revise" \
   "規定形式 revise → status: drafting, verdict: revise"
 _run_variant "canon_reject" '**Verdict:** reject' "drafting" "reject" \
   "規定形式 reject → status: drafting, verdict: reject"
-_run_variant "go_normalized" '## 総合判定: **GO**' "ready" "approve" \
-  "別表記 (## 総合判定: **GO**) → normalize されて approve のまま (regression なし)"
+
+echo ""
+echo "--- F1 (t002, mission 20260912-verdict-ci-launcher): 挙動変更 — 別表記の救済経路 (normalize_plan_review_verdict.py) を削除した ---"
+_run_variant "go_normalized" '## 総合判定: **GO**' "drafting" "" \
+  "別表記 (## 総合判定: **GO**) → もう正規化されず drafting (find_alt_verdict 削除。挙動変更、安全側)。本番は review-plan.sh の構造化出力経路が回収する"
+_run_variant "blockquote_quoted_go" '# Plan Review (cycle 2)
+
+前回のレビュー:
+
+> ## 総合判定: **GO**
+
+今回は判断を保留します。追加情報待ち。' "drafting" "" \
+  "F1 blockquote (前 cycle の判定を引用): 旧 find_alt_verdict は blockquote を知らず誤 approve していた (7642f9b で実測再現済み) → drafting (削除後は安全側)"
 
 echo ""
 echo "--- FINDING-1: コードフェンス内にだけ判定がある → 誤 approve にならない ---"

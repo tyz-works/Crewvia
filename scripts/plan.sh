@@ -2324,8 +2324,13 @@ def _load_verdict_module():
     """Load lib_verdict.py dynamically, lazily, from inside cmd_review only.
 
     t010 (QA t008 FINDING-1/2/3): plan_review.md の verdict 抽出は
-    scripts/lib_verdict.py に一本化した (wait_for_plan_review.sh /
-    normalize_plan_review_verdict.py も同じ関数を使う)。
+    scripts/lib_verdict.py に一本化した (wait_for_plan_review.sh も同じ
+    関数を使う)。F1 (t002, mission 20260912-verdict-ci-launcher):
+    以前はここで判定できなかった場合に normalize_plan_review_verdict.py が
+    ファイル全体を走査して別表記を救済していたが、その経路が不変条件
+    (判定は1点だけを完全一致で読む) を迂回する唯一の抜け道になっていたため
+    削除した。別表記の救済は scripts/review-plan.sh の構造化出力経路
+    (`claude --json-schema`) に一本化されている。
 
     重要: これをモジュールのトップレベルで `import` すると、review 以外の
     全サブコマンド (pull/done/needs-director 等) が、lib_verdict.py を
@@ -2449,8 +2454,8 @@ def cmd_review(args):
 
     if proc.returncode != 0:
         # t002: plan_review.md 自体は書かれているのにフォーマットだけが原因で
-        # review-plan.sh がタイムアウトすることがある (別表記の verdict がさらに
-        # normalize_plan_review_verdict.py でも判定できなかったケース)。この場合
+        # review-plan.sh がタイムアウトすることがある (別表記の verdict が
+        # 構造化出力経路でも判定できなかったケース)。この場合
         # 判定内容自体は活かせる可能性が高く、cycle_count を無駄にもう1回消費
         # させるより Director に手動確認を促す方が安全側。
         if os.path.exists(review_output):

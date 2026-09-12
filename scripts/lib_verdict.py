@@ -93,8 +93,19 @@ def first_content_line(text: str) -> str | None:
     """先頭の空行を読み飛ばし、最初の非空行を返す。1 行も無ければ None。
 
     「非空」= 前後の空白 (改行・タブ・全角空白を含む) を除いて 1 文字以上残る行。
+
+    F3 (t002, mission 20260912-verdict-ci-launcher, QA Finn 実測): 行の分割に
+    `str.splitlines()` を使わないこと。splitlines() は `\n` 以外にも
+    `\r` / `\x0b` / `\x0c` / `\x1c` / `\x1d` / `\x1e` / U+0085 / U+2028 /
+    U+2029 の 9 種すべてで分割する。呼び出し元 (review-plan.sh の grep /
+    wait_for_plan_review.sh) はいずれも `\n` だけを行区切りとみなすため、
+    `**Verdict:** approve<CR>ではない。修正が必要です` のような入力で
+    lib_verdict だけが1行目を `**Verdict:** approve` に短く区切ってしまい
+    完全一致 allowlist を素通りしていた。`str.split("\n")` は `\n` だけで
+    分割するため、他の行区切り文字は行の中身の一部として残り
+    (`_canonical_value_of` の完全一致判定で弾かれる)、この食い違いが無くなる。
     """
-    for line in text.splitlines():
+    for line in text.split("\n"):
         if line.strip():
             return line
     return None
@@ -129,7 +140,7 @@ def extract_canonical_verdict(text: str) -> str | None:
     if verdict is None:
         return None
 
-    for line in text.splitlines():
+    for line in text.split("\n"):
         other = _canonical_value_of(line)
         if other is not None and other != verdict:
             return None  # 自己矛盾 — 判定不能に倒す

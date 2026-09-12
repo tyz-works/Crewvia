@@ -209,7 +209,7 @@ cd $R && git checkout origin/main && git checkout -b new-fix-branch
 **期待される効果（宣言どおりに動くなら）**:
 - CREWVIA_MUX が設定されている場合、CREWVIA_MUX_ENABLED は無視される
 - CREWVIA_MUX が未設定の場合のみ CREWVIA_MUX_ENABLED が有効
-- **この「期待される効果」は Worker 経路の実装 (start.sh:597-601) とは逆**。実装の優先順位1位は `CREWVIA_MUX_ENABLED` の明示（`0` も含む）であり、`CREWVIA_MUX` はそれより優先されない（PR #196, t002 の設計判断 A: 「実装を docs に合わせる」ではなく「二重ゲートを実効値解決で統合する」を採用）。config コメントはこの修正後も訂正されておらず、Director 経路（実欠陥3）の open 残件としてここに記載する
+- **この「期待される効果」は Worker 経路の実装 (start.sh:597-601) とは逆**。実装の優先順位1位は `CREWVIA_MUX_ENABLED` の明示（`0` も含む）であり、`CREWVIA_MUX` はそれより優先されない（PR #196, t002 の設計判断 (A) 「実装を docs に合わせる」を採用。(C) 二重ゲートを単一判定に統合する案は却下）。config コメントはこの修正後も訂正されておらず、Director 経路（実欠陥3）の open 残件としてここに記載する
 
 **実欠陥 1: scripts/start.sh の並列モードゲートが ROLE=worker で機能していなかった（修正済み: PR #196, merge commit `1581d11`）**
 
@@ -256,7 +256,7 @@ git show origin/main:scripts/start.sh | sed -n '232,263p'
 
 優先順位（実装で確認済み）:
 - **Worker 経路**（両修正適用後）: 1. env の `CREWVIA_MUX_ENABLED` 明示（`0` も含め最優先。start.sh:597-601） → 2. env の `CREWVIA_MUX` 明示（config より優先。crewvia ランチャ / start.sh フォールバック双方） → 3. config/crewvia.yaml の `mode:`（crewvia ランチャが `CREWVIA_MUX` に変換）
-- **Director 経路**（open）: 1. config/crewvia.yaml の `mode:`（`CREWVIA_MUX_ENABLED` 未設定なら env の `CREWVIA_MUX` を無視して上書き。start.sh:232-263） → 2. env の `CREWVIA_MUX_ENABLED` 明示（設定済みならブロック自体をスキップするので事実上勝つが、Director 起動元の `crewvia` ランチャはこれを一度も export しないため実運用では到達しない）
+- **Director 経路**（open）: 1. config/crewvia.yaml の `mode:`（`CREWVIA_MUX_ENABLED` 未設定なら env の `CREWVIA_MUX` を無視して上書き。start.sh:232-263） → 2. env の `CREWVIA_MUX_ENABLED` 明示（設定済みならブロック自体をスキップするので事実上勝つ。`crewvia` ランチャ自体はこれを export しないが、利用者が env に置けば到達する — CLAUDE.md:95 参照）
 
 **注記**:
 - 本節は Director の要約ではなく、`git show 1581d11` / `git show a26b60a` の実 diff・コミットメッセージ、および origin/main 実物 (`scripts/start.sh`, `crewvia`, `config/crewvia.yaml`, `CLAUDE.md`) への直接確認に基づく
@@ -392,6 +392,7 @@ grep -n "test_handoff_path.sh\|test_registry_lock.sh\|pytest" .github/workflows/
 
 1. **C-1 優先順位検証**: CREWVIA_MUX 環境変数と config mode の正確な優先順位確認
    - **部分完了**: Worker 経路の実欠陥2箇所は mission 20260912-verdict-ci-launcher で検証・修正済み（PR #196 merge commit `1581d11`, PR #201 merge commit `a26b60a`）。**Director 経路** (`scripts/start.sh` の `ROLE=director` ブロック) は env の `CREWVIA_MUX` より config `mode:` が優先されてしまう食い違いが未解決 (open) — 次ミッションで Director が修正方針を検討すること。詳細は上記 C-1 参照
+   - **未反映 (open)**: config/crewvia.yaml:56 のコメント（`CREWVIA_MUX` が `CREWVIA_MUX_ENABLED` より優先）も Worker 経路の実装と逆のまま訂正されていない。Director 経路の修正時に合わせて直すこと
 
 2. **A-2 autonomous-improvement.yaml 実装検討**:
    - Option 1: Worker が手動判定する現状を保持し、ドキュメント確認
@@ -441,6 +442,7 @@ grep -n "test_handoff_path.sh\|test_registry_lock.sh\|pytest" .github/workflows/
 - **LOW**: A-1 verification-profiles.yaml の方針確認（実装か削除か）
 - ~~**LOW**: C-1 CREWVIA_MUX 優先順位を詳細検証~~ → **Worker 経路は完了**（PR #196, #201 で修正済み）
 - **MEDIUM**: C-1 Director 経路 (`scripts/start.sh:232-263` の `ROLE=director` ブロック) の env/config 優先順位食い違いを次ミッションで修正検討（open, Director backlog。t014 で発見）
+- **LOW**: config/crewvia.yaml:56 のコメント（`CREWVIA_MUX` が `CREWVIA_MUX_ENABLED` より優先）は Worker 経路の実装と逆のまま。C-1 Director 経路の修正と合わせて訂正を検討（t017 で発見, open）
 
 ---
 

@@ -14,6 +14,17 @@ fi
 
 MISSION_DIR="$CREWVIA_DIR/queue/missions/$SLUG"
 REVIEW_OUTPUT="$MISSION_DIR/plan_review.md"
+# --- t015 (mission 20260912-verdict-ci-launcher, PR #199 QA(Finn) t003 FAIL-1 /
+# Kai-codex P1, Director 設計判断1) ---
+# plan_review.md とは別の、review-plan.sh だけが書く専用チャネル。
+# scripts/plan.sh は「review-plan.sh が検証した verdict そのもの」だけを
+# 消費するために、plan_review.md を独立に読み直すのをやめてこのファイルを
+# 読む (下記「Decision 1」参照)。plan-reviewer セッションは
+# SKILLS=plan_review の Write 権限が plan_review.md 限定であるため、この
+# ファイルには技術的にも書き込めない — mux_kill (プロセス終了) もファイルには
+# 触れないため、review-plan.sh がここに書いた後は何者にも書き換えられない
+# (=「検証した値」と「消費する値」が同一であることが構造的に保証される)。
+VERDICT_FILE="$MISSION_DIR/plan_review.verdict"
 
 if [[ ! -d "$MISSION_DIR" ]]; then
     echo "Mission not found: $SLUG" >&2
@@ -65,7 +76,7 @@ source "${SCRIPT_DIR}/lib_mux.sh"
 # REVIEW_START_EPOCH は、万一 rm が何らかの理由で効かなかった場合の二重の
 # 安全策として scripts/wait_for_plan_review.sh に渡す — mtime が
 # レビュー開始時刻より新しいファイルだけを「今回の実行の出力」とみなす。
-rm -f "$REVIEW_OUTPUT"
+rm -f "$REVIEW_OUTPUT" "$VERDICT_FILE"
 REVIEW_START_EPOCH=$(date +%s)
 
 # --- t004 (mission 20260909-dead-config-sweep) ---
@@ -220,7 +231,26 @@ _rescue_verdict_from_structured_output() {
 
     local line verdict
     line="$(grep '"type":"result"' "$log" 2>/dev/null)"
-    verdict="$(printf '%s' "$line" | jq -er 'select(.structured_output.verdict | type == "string") | .structured_output.verdict' 2>/dev/null)" || return 1
+    # P2 (t015, mission 20260912-verdict-ci-launcher, Kai-codex t004 review):
+    # 以前は .structured_output.verdict の型だけを見ており、result envelope
+    # 自体が成功したかどうか (is_error / subtype) を確認していなかった。
+    # {"type":"result","subtype":"error_during_execution","is_error":true,
+    #  "structured_output":{"verdict":"approve"}} のような「実行が失敗した
+    # ターンにたまたま structured_output だけ残っている」envelope でも
+    # verdict を信頼してしまっていた。is_error が明示的に false、かつ
+    # subtype が明示的に "success" の場合だけを信頼する allowlist にする
+    # (どちらかが欠落・想定外の値なら jq の select が失敗し return 1 = 判定不能。
+    # 「欠落は安全側」— 成功だと確証できないものは信頼しない)。
+    # mux 経路では claude プロセス自体の終了ステータスを review-plan.sh から
+    # 直接取得する手段が無い (バックグラウンドで spawn され、パイプの終了
+    # ステータスも herdr/tmux 側に閉じている) ため、envelope 自身が自己申告
+    # する is_error/subtype を唯一の成功シグナルとして使う。
+    verdict="$(printf '%s' "$line" | jq -er '
+        select(.is_error == false)
+        | select(.subtype == "success")
+        | select(.structured_output.verdict | type == "string")
+        | .structured_output.verdict
+    ' 2>/dev/null)" || return 1
 
     case "$verdict" in
         approve|revise|reject) ;;
@@ -295,22 +325,88 @@ _wait_for_structured_verdict() {
     return 1
 }
 
-# plan_review.md 側 (規定形式の1行目) から読める verdict。
-# 読めなければ空文字 (判定不能)。
-PROSE_VERDICT="$(python3 "${SCRIPT_DIR}/lib_verdict.py" "$REVIEW_OUTPUT" 2>/dev/null || true)"
+# --- Decision 3 (t015, Director 追記 — QA t003 Finn FAIL-1 実測への対応) ---
+# 構造化出力が届かなかった場合に reviewer を止め、止まったことを確認する。
+# 「止まったことを確認できたか」だけを返す (0=確認できた, 1=できなかった)。
+# 確認できない限り plan_review.md を読まない (呼び出し側で PROSE_VERDICT を
+# 空のままにする) — 停止を確認できないまま読むと、読んだ直後に reviewer が
+# まだ書き込み中だった、という T1/T1r と同型の窓が残ってしまうため。
+#
+# inline フォールバック経路 (MUX_LAUNCHED=0) では claude が
+# `... | tee ...` で既に同期的に完走済み (ここに到達した時点で reviewer
+# プロセスはこの review-plan.sh 自身の子プロセスとして既に終了している) の
+# で、確認は自明に真。mux 経路 (MUX_LAUNCHED=1) では明示的に mux_kill を呼び、
+# mux_pid が「見つからない (プロセス/ペインが消えた)」を返すまでポーリングする
+# (herdr の tab close は SIGHUP 後最大 2 秒かかるため、少し余裕を持って待つ)。
+# ここで実際に kill するため、EXIT trap による二重 kill を避けるべく
+# MUX_LAUNCHED を 0 に落とす (mux_kill 自体は再度呼ばれても no-op に近いが、
+# 呼び出し元によっては未定義 pane への kill で警告ログが出るため)。
+_STOP_CONFIRM_POLL_INTERVAL="${REVIEW_PLAN_STOP_CONFIRM_POLL_INTERVAL:-1}"
+_STOP_CONFIRM_MAX_SECONDS="${REVIEW_PLAN_STOP_CONFIRM_MAX_SECONDS:-5}"
 
-STRUCTURED_VERDICT=""
-if [[ -n "$VERDICT_SCHEMA" ]]; then
-    if [[ -z "$PROSE_VERDICT" || "$PROSE_VERDICT" == "approve" ]]; then
-        # プローズが判定不能、または approve (=危険な結論。構造化出力による
-        # 確認を必須にする、F2) の場合は待つ。
-        STRUCTURED_VERDICT="$(_wait_for_structured_verdict "$PLAN_REVIEWER_LOG")" || STRUCTURED_VERDICT=""
-    else
-        # revise/reject は安全な結論なのでプローズを直接信頼してよい。待ちは
-        # せず、機会があれば1回だけ読んで矛盾検出にだけ使う (正常系の所要
-        # 時間を伸ばさないため)。読めなければプローズの判定をそのまま使う。
-        STRUCTURED_VERDICT="$(_rescue_verdict_from_structured_output "$PLAN_REVIEWER_LOG")" || STRUCTURED_VERDICT=""
+_stop_reviewer_and_confirm() {
+    if [[ "$MUX_LAUNCHED" -ne 1 ]]; then
+        # inline 経路: ここに到達した時点で claude は既に完走している。
+        return 0
     fi
+
+    mux_kill "$WINDOW_NAME" 2>/dev/null || true
+    MUX_LAUNCHED=0
+
+    local elapsed=0
+    while [[ "$elapsed" -lt "$_STOP_CONFIRM_MAX_SECONDS" ]]; do
+        if ! mux_pid "$WINDOW_NAME" >/dev/null 2>&1; then
+            # pane/プロセスが見つからない = 停止確認。
+            return 0
+        fi
+        sleep "$_STOP_CONFIRM_POLL_INTERVAL"
+        elapsed=$((elapsed + _STOP_CONFIRM_POLL_INTERVAL))
+    done
+    echo "[review-plan.sh] WARNING: could not confirm plan-reviewer pane '$WINDOW_NAME' stopped within ${_STOP_CONFIRM_MAX_SECONDS}s after kill" >&2
+    return 1
+}
+
+# --- Decision 2/3 (t015, Director 追記) ---
+# QA t003 (Finn) が実測した FAIL-1 (TOCTOU) は、review-plan.sh がプローズを
+# 「reviewer がまだ書いている可能性がある時点」で読み、prose=revise/reject の
+# ときは構造化出力を待たずに確定していたことに起因する一部だった
+# (もう一部は plan.sh 側の独立読み直し — 下記 plan.sh 側の修正で対応)。
+#
+# ここでの修正:
+#   1. プローズの値 (approve/revise/reject/判定不能) に関わらず、**必ず**同じ
+#      MAX_WAIT だけ構造化出力の到着を待つ (以前は revise/reject だと待たな
+#      かった — F2g: prose=revise / structured=approve 遅延、を検出できない
+#      原因だった)。
+#   2. プローズは「書き手のセッションが終わった後」に**1回だけ**読む。
+#      構造化出力 ("type":"result") の到着そのものをセッション終了の合図と
+#      する。到着しない場合は reviewer を明示的に止め、停止を確認できてから
+#      読む。停止を確認できなければ読まない (=判定不能に倒れる)。
+STRUCTURED_VERDICT=""
+PROSE_VERDICT=""
+if [[ -n "$VERDICT_SCHEMA" ]]; then
+    STOPPED_CONFIRMED=0
+    if STRUCTURED_VERDICT="$(_wait_for_structured_verdict "$PLAN_REVIEWER_LOG")"; then
+        # 構造化出力の到着 = セッション終了の合図。
+        STOPPED_CONFIRMED=1
+    else
+        STRUCTURED_VERDICT=""
+        if _stop_reviewer_and_confirm; then
+            STOPPED_CONFIRMED=1
+        fi
+    fi
+
+    if [[ "$STOPPED_CONFIRMED" -eq 1 ]]; then
+        PROSE_VERDICT="$(python3 "${SCRIPT_DIR}/lib_verdict.py" "$REVIEW_OUTPUT" 2>/dev/null || true)"
+    else
+        echo "[review-plan.sh] WARNING: plan-reviewer session end could not be confirmed — refusing to read ${REVIEW_OUTPUT} (fail-closed, decision 3)" >&2
+    fi
+else
+    # スキーマ不在時のフォールバック (t004 以前と同じ挙動): 構造化出力による
+    # 確認は原理的に不可能なので、この経路では待ちも kill-confirm もしない。
+    # プローズをそのまま読む (t004 以前の挙動と同じ。approve を含め、schema
+    # 不在時の安全性は wait_for_plan_review.sh 側の判定・下の WAIT_STATUS
+    # フォールバック分岐に委ねられている)。
+    PROSE_VERDICT="$(python3 "${SCRIPT_DIR}/lib_verdict.py" "$REVIEW_OUTPUT" 2>/dev/null || true)"
 fi
 
 # 採用する verdict を1つに決める。
@@ -373,6 +469,12 @@ elif [[ -n "$FINAL_VERDICT" ]]; then
             fi
         } > "${REVIEW_OUTPUT}.tmp" && mv "${REVIEW_OUTPUT}.tmp" "$REVIEW_OUTPUT"
     fi
+    # --- Decision 1 (t015, Director 設計判断1) ---
+    # plan.sh はもう plan_review.md を独立に読み直さない。ここで確定した
+    # FINAL_VERDICT だけを、review-plan.sh 以外の誰にも書き換えられない
+    # 専用ファイルにアトミックに書き (tmp → mv)、plan.sh はこれだけを消費する。
+    # plan_review.md 自体は人間向けの記録として残るが、判定には使われない。
+    printf '%s\n' "$FINAL_VERDICT" > "${VERDICT_FILE}.tmp" && mv "${VERDICT_FILE}.tmp" "$VERDICT_FILE"
     WAIT_STATUS="OK"
     WAIT_RC=0
 elif [[ "$PROSE_VERDICT" == "approve" ]]; then

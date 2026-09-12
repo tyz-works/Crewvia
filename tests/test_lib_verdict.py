@@ -19,15 +19,22 @@ U+2029 の 9 種で分割する。lib_verdict.py の呼び出し元 (grep / bash
 分割し、`**Verdict:** approve<SEP>ではない。修正が必要です` を approve と
 誤判定していた。
 
-注意 (`\r` について): lib_verdict.py の実際の呼び出し元 (CLI の
+訂正 (t015, mission 20260912-verdict-ci-launcher, QA t003 Finn 実測 FAIL-2 /
+Kai-codex P2): 旧版のこの節は「lib_verdict.py の実際の呼び出し元 (CLI の
 `open(path, encoding="utf-8")`) は Python の universal newlines により
 ファイル読み込み時点で `\r` を `\n` に変換してしまうため、ファイル経由の
-呼び出しでは `\r` 単体の危険入力は (splitlines/split のどちらを使っても
-結果的に) 顕在化しない。本テストは `extract_canonical_verdict()` を
-関数として直接検証するため、その変換を経由しない生の `\r` も含めて全9種を
-検証する — 将来 `newline=""` で開く呼び出し元や、ファイルを経由しない
-呼び出し (今回のような直接呼び出しや、structured output 経由の文字列) が
-増えても安全側であることを保証するため。
+呼び出しでは `\r` 単体の危険入力は顕在化しない」と書いていたが、**これは
+事実と逆だった**。universal newlines による変換こそが問題の原因であり、
+`**Verdict:** approve\rNOT approved; revisions required` は文字列として
+直接呼ぶ場合 (下の `_SPLITLINES_ONLY_SEPARATORS` テスト) には1行のまま
+判定不能になるが、**ファイル経由** (`open()` のデフォルト) では \r が
+読み込み時点で \n に変換され2行に分割されるため、1行目
+`**Verdict:** approve` だけが読まれて approve と誤判定していた。
+修正 (scripts/lib_verdict.py の CLI エントリポイント) は `newline=""` で
+開き、この変換自体を無効化した。下の `test_file_based_*` 系テストは、
+直接呼び出しでは再現できないこの「ファイル経由の経路」を CLI
+(`python3 lib_verdict.py <file>`) 経由で再現し、修正が効いていることを
+確認する。
 
 F1 (normalize_plan_review_verdict.py の find_alt_verdict 削除): 削除に
 伴い、別表記の救済 (ファイル全体走査) 自体が無くなった。extract_canonical_verdict()
@@ -40,6 +47,7 @@ scripts/test_plan_review_verdict_e2e_variants.sh 側)。
   python3 -m pytest tests/test_lib_verdict.py -v
 """
 
+import subprocess
 import sys
 from pathlib import Path
 
@@ -47,6 +55,7 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = REPO_ROOT / "scripts"
+LIB_VERDICT_PY = SCRIPTS_DIR / "lib_verdict.py"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 import lib_verdict  # noqa: E402
@@ -192,3 +201,89 @@ def test_first_content_line_skips_leading_blank_lines_only():
 
 def test_first_content_line_none_for_blank_text():
     assert lib_verdict.first_content_line("\n\n   \n\t\n") is None
+
+
+# ---------------------------------------------------------------------------
+# FAIL-2 (t015, QA t003 Finn 実測 / Kai-codex P2): ファイル経由 (CLI) の
+# universal newlines 変換で \r だけが誤って approve を通してしまう問題。
+#
+# 上の test_splitlines_only_separator_does_not_split_first_line は
+# extract_canonical_verdict() を文字列として直接呼ぶため、open() の改行変換を
+# 経由しない。lib_verdict.py の実際の呼び出し元 (scripts/wait_for_plan_review.sh
+# 、scripts/review-plan.sh の PROSE_VERDICT 読み取り) はすべてこの CLI
+# (`python3 lib_verdict.py <file>`) を経由する。scripts/plan.sh は t015 で
+# plan_review.md を独立に読むのをやめ、review-plan.sh が書く
+# plan_review.verdict (このCLIの出力そのもの) を信頼するだけになったため、
+# 「CLI 経由」を検証すれば実際の呼び出し経路すべてを covers する。
+#
+# 9種の区切り文字それぞれをファイルに書き、CLI をサブプロセスとして呼ぶ。
+# 修正前 (open(path, encoding="utf-8"), newline 未指定) は CR (`\r`) だけが
+# universal newlines で `\n` に変換され、1行目が
+# `**Verdict:** approve` として完全一致してしまう (他8種は変換対象でないため
+# 元から安全)。修正後 (newline="") はどの区切り文字もファイル経由で approve
+# にならない。
+# ---------------------------------------------------------------------------
+
+def _run_lib_verdict_cli(path):
+    """lib_verdict.py を CLI としてサブプロセスで呼び、(stdout, returncode) を返す。"""
+    proc = subprocess.run(
+        [sys.executable, str(LIB_VERDICT_PY), str(path)],
+        capture_output=True,
+        text=True,
+    )
+    return proc.stdout.strip(), proc.returncode
+
+
+@pytest.mark.parametrize(
+    "name,sep", list(_SPLITLINES_ONLY_SEPARATORS.items()), ids=list(_SPLITLINES_ONLY_SEPARATORS.keys())
+)
+def test_file_based_cli_separator_does_not_approve(tmp_path, name, sep):
+    """9種の区切り文字すべてで、ファイル経由 (CLI) でも approve にならないこと。
+
+    FAIL-2 の再現条件そのもの: `**Verdict:** approve<SEP>否定文` というバイト列を
+    ファイルに書き、`python3 lib_verdict.py <file>` を実際に呼ぶ。修正前は
+    CR (`\\r`) だけがここで approve (exit 0) を返していた。
+    """
+    p = tmp_path / f"case_{name}.md"
+    # バイト列をそのまま書く (Python の text-mode write も改行変換をするため、
+    # newline="" で書き込み時の変換も避ける — 生の \r を確実にファイルへ残す)。
+    with open(p, "w", encoding="utf-8", newline="") as f:
+        f.write(f"**Verdict:** approve{sep}ではない。修正が必要です")
+
+    out, rc = _run_lib_verdict_cli(p)
+    assert rc != 0 and out == "", (
+        f"{name} ({sep!r}) がファイル経由 (CLI) で approve と誤判定された "
+        f"(FAIL-2 regression): stdout={out!r} rc={rc}"
+    )
+
+
+def test_file_based_cli_bare_cr_is_the_documented_fail2_repro(tmp_path):
+    """FAIL-2 の実測条件そのもの (bytes with a bare CR) が approve にならないこと。
+
+    QA t003 (Finn) の再現条件: `**Verdict:** approve\\rnot approved; revisions
+    required` というバイト列をファイルに書き、CLI 経由で読む。
+    """
+    p = tmp_path / "bare_cr.md"
+    with open(p, "wb") as f:
+        f.write(b"**Verdict:** approve\rnot approved; revisions required")
+
+    out, rc = _run_lib_verdict_cli(p)
+    assert rc != 0 and out == "", (
+        f"bare CR がファイル経由で approve と誤判定された (FAIL-2): stdout={out!r} rc={rc}"
+    )
+
+
+def test_file_based_cli_crlf_still_reads_as_approve(tmp_path):
+    """legitimate CRLF 行末 (`approve\\r\\n`) は修正後も approve のまま読めること。
+
+    newline="" で開いても、行末の \\r は `_canonical_value_of` の `.strip()` が
+    空白として除去するため、CRLF 改行そのものは regression にならない。
+    """
+    p = tmp_path / "crlf.md"
+    with open(p, "wb") as f:
+        f.write(b"**Verdict:** approve\r\n\r\n# Plan Review\r\nWindows-style CRLF file.\r\n")
+
+    out, rc = _run_lib_verdict_cli(p)
+    assert rc == 0 and out == "approve", (
+        f"CRLF ファイルが approve と読めなくなった (regression): stdout={out!r} rc={rc}"
+    )

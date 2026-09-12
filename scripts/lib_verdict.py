@@ -153,7 +153,25 @@ def main(argv: list[str]) -> int:
         return 2
     path = argv[1]
     try:
-        with open(path, encoding="utf-8") as f:
+        # F2 (t015, mission 20260912-verdict-ci-launcher, PR #199 QA(Finn) t003
+        # FAIL-2 / Kai-codex P2): newline="" で開き、universal newlines による
+        # 改行変換を無効にする。デフォルトの open() は \r 単体・\r\n・\n の
+        # いずれも読み込み時点で \n に変換してしまうため、
+        # `**Verdict:** approve\rNOT approved; revisions required` のような
+        # バイト列は、extract_canonical_verdict() を文字列として直接呼んだ
+        # 場合 (tests/test_lib_verdict.py) には 1 行のまま (完全一致せず
+        # 判定不能) だが、**ファイル経由** (このCLI, ひいては
+        # wait_for_plan_review.sh) では \r が \n に変換されて2行に分割され、
+        # 1行目 `**Verdict:** approve` だけが読まれて approve と誤判定していた
+        # (旧 docstring 22-30行の「ファイル経由では \r 単体は顕在化しない」は
+        # 事実と逆だった — 実際には approve として顕在化する)。
+        # newline="" にすると \r はそのまま文字列に残るため、
+        # extract_canonical_verdict() 側の `text.split("\n")` は \r を行区切り
+        # とみなさず (中間の \r は行の一部として残り完全一致で弾かれる)、
+        # 正規の CRLF 行末 (`approve\r\n`) は `_canonical_value_of` の
+        # `.strip()` が末尾の \r を空白として除去するため従来どおり approve
+        # と読める。
+        with open(path, encoding="utf-8", newline="") as f:
             content = f.read()
     except OSError as e:
         print(f"lib_verdict: cannot read {path}: {e}", file=sys.stderr)

@@ -140,6 +140,24 @@ _check $'**Verdict:** revise\n\n\x60\x60\x60\n**Verdict:** revise\n\x60\x60\x60'
   "1行目 revise + 同じ値の引用 → 矛盾ではないので revise のまま"
 
 echo ""
+echo "--- F (t015, mission 20260912-verdict-ci-launcher, QA t003 Finn FAIL-2 / Kai-codex P2): ---"
+echo "    ファイル経由 (このスクリプトは常にファイル経由) での universal newlines 変換 ---"
+# _check は printf '%s' でファイルに直接バイトを書くため、bash の $'...' で \r を
+# 埋め込めばそのまま「ファイル経由」の再現になる (このファイルの他のケースは
+# すべて \n のみを使っているため、これまで CR は一度も踏んでいなかった)。
+#
+# 修正前 (open(path, encoding="utf-8"), newline 未指定) は universal newlines
+# により \r が読み込み時点で \n に変換され、`**Verdict:** approve\rNOT
+# approved` が2行に分割されて1行目だけが完全一致し approve になっていた。
+_check $'**Verdict:** approve\rNOT approved; revisions required' "" \
+  "裸の CR (ファイル経由の universal newlines で approve に化けていた, FAIL-2)"
+_check $'**Verdict:** revise\rNOT approved either' "" \
+  "裸の CR (revise 側でも同様に誤判定されないこと)"
+# 正規の CRLF 行末は regression にしない (行末の \r は strip() で除去される)。
+_check $'**Verdict:** approve\r\n\r\n## Summary\r\nWindows-style CRLF file.' "approve" \
+  "正規の CRLF 行末 → approve のまま (regression ではない)"
+
+echo ""
 echo "--- 判定不能の一般化 ---"
 _check $'# Plan Review\n\nまだ検査中です。' "" "判定語なし"
 _check "" "" "空ファイル"

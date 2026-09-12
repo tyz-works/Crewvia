@@ -2472,32 +2472,54 @@ def cmd_review(args):
         _rollback_to_drafting("review-plan.sh failed")
         die(f"review-plan.sh failed or timed out for mission '{slug}'")
 
-    # --- Step 4: read verdict from plan_review.md ---
-    if not os.path.exists(review_output):
-        _rollback_to_drafting("plan_review.md not found")
-        die(f"plan_review.md not found for mission '{slug}' after review-plan.sh completed")
+    # --- Step 4: read the verdict review-plan.sh bound to plan_review.verdict ---
+    # t015 (mission 20260912-verdict-ci-launcher, Director 設計判断1 — QA t003
+    # Finn FAIL-1 実測 / Kai-codex P1 TOCTOU への対応): plan.sh はもう
+    # plan_review.md を独立に読み直さない。
+    #
+    # 旧実装 (t010〜t012) はここで scripts/lib_verdict.py の
+    # extract_canonical_verdict() を plan_review.md に対して**独立に**再実行
+    # していた。review-plan.sh 側で FINAL_VERDICT が確定してから
+    # (mux_kill による) reviewer プロセスの終了までの間に plan_review.md の
+    # 1行目が書き換わると、review-plan.sh が検証した値と plan.sh がここで
+    # 読む値がずれてしまう — QA t003 (Finn) が「prose=revise で検証 →
+    # mux_kill 中に reviewer が1行目を approve に再 Write、structured 出力の
+    # 確認なしに approve が消費される」ことを decisive に実測した (T1/T1r)。
+    #
+    # 修正: review-plan.sh が確定した verdict だけを、review-plan.sh 以外の
+    # 誰にも (plan-reviewer セッションにも mux_kill にも) 書き換えられない
+    # 専用ファイル queue/missions/<slug>/plan_review.verdict に書かせ、
+    # plan.sh はそれだけを消費する。plan_review.md はもう判定には使わない
+    # (人間向けの記録としては残る)。
+    verdict_file = os.path.join(MISSIONS_DIR, slug, 'plan_review.verdict')
+    if not os.path.exists(verdict_file):
+        _rollback_to_drafting("no valid verdict (plan_review.verdict not found)", refund_cycle=True)
+        die(
+            f"No valid verdict found for mission '{slug}' — review-plan.sh did not "
+            f"produce {verdict_file}. If {review_output} exists, inspect it by hand "
+            f"(review-plan.sh may have refused to confirm a verdict without structured "
+            f"output; see its stderr log for the reason)."
+        )
 
-    # t010 (QA t008 FINDING-1/2/3): 以前はここで独自の re.search (アンカー
-    # 無し、ファイル内で最初に一致した行を無条件採用) を使っており、
-    # wait_for_plan_review.sh とも条件が食い違っていた (root cause 3)。
-    # scripts/lib_verdict.py の extract_canonical_verdict() に一本化する —
-    # コードフェンスを除去し、複数の判定が混在する場合は判定不能に倒す。
+    # newline='' (F2/FAIL-2 と同じ理由): 万一ファイルが破損していても改行
+    # 変換で誤って読み取らないようにする。とはいえこのファイルは
+    # review-plan.sh 自身が printf で書く既知の安全な値のみが入る想定であり、
+    # 以下の allowlist チェックが実質的な安全弁になる。
+    with open(verdict_file, encoding='utf-8', newline='') as f:
+        verdict_raw = f.read()
+    verdict = verdict_raw.strip()
+
+    # 防御的 allowlist チェック (review-plan.sh は既に enum 適合を検証済みの
+    # 値しか書かないはずだが、ファイル破損・部分書き込み等に備えて plan.sh
+    # 側でも独立に値そのものを検証する — plan_review.md の書式解析はしない、
+    # 値の完全一致だけを見る「判定 unit を1つに絞る」原則の延長)。
     verdict_mod = _load_verdict_module()
-    with open(review_output, encoding='utf-8') as f:
-        verdict = verdict_mod.extract_canonical_verdict(f.read())
-    if not verdict:
-        # F2 (PR#188 t012 Seo 指摘): wait_for_plan_review.sh の OK 判定は
-        # `^\*\*Verdict:\*\*` の存在だけを見ており判定語 (approve/revise/
-        # reject) までは検証しない。そのため reviewer が
-        # `**Verdict:** STOP` のような未知の判定語を書くと wait_for は OK
-        # (exit 0) を返すが、ここ (plan.sh 側) は判定語を要求するため
-        # verdict が None になる — つまりこの分岐は「reviewer の書式ミス
-        # (判定語自体が不正)」で到達しうる、review-plan.sh 失敗時と同種の
-        # ケース。cycle_count の先食いを refund しないと、書式ミスだけで
-        # Director が review cycle を失う (上の "review-plan.sh timed out
-        # but plan_review.md exists" 分岐と同じ理由で refund_cycle=True)。
-        _rollback_to_drafting("no valid verdict in plan_review.md", refund_cycle=True)
-        die(f"No valid verdict found in plan_review.md for mission '{slug}'")
+    if verdict not in verdict_mod.CANONICAL_VERDICTS:
+        _rollback_to_drafting("plan_review.verdict has an invalid value", refund_cycle=True)
+        die(
+            f"plan_review.verdict for mission '{slug}' has an unexpected value "
+            f"({verdict_raw!r}) — refusing to guess (fail-closed)."
+        )
 
     # --- Step 5: update mission based on verdict ---
     def _do_verdict():

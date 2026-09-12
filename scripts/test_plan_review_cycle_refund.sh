@@ -29,6 +29,15 @@
 #
 # 実行: bash scripts/test_plan_review_cycle_refund.sh
 # 副作用: /tmp 配下に一時 queue を作成し終了時に削除する (実データ非破壊)
+#
+# t015 (mission 20260912-verdict-ci-launcher, Director 設計判断1) 追記:
+# plan.sh はもう plan_review.md を独立に読み直さない — review-plan.sh が
+# 書く queue/missions/<slug>/plan_review.verdict だけを消費する (QA t003
+# Finn 実測 FAIL-1 の TOCTOU 対策)。Case 2 のスタブは新しい契約 (exit 0 なら
+# plan_review.verdict も書く) に合わせて更新した。Case 3 は「review-plan.sh
+# が exit 0 なのに verdict が不正」という、新しい契約では
+# plan_review.verdict 自体に不正な値が書かれるケースとして再現する
+# (plan.sh 側の防御的 allowlist チェックの確認)。
 
 set -uo pipefail
 
@@ -124,6 +133,7 @@ MISSION_DIR="$(cd "$SCRIPT_DIR/.." && pwd)/queue/missions/$SLUG"
 cat > "$MISSION_DIR/plan_review.md" << 'INNER'
 **Verdict:** approve
 INNER
+printf '%s\n' 'approve' > "$MISSION_DIR/plan_review.verdict"
 exit 0
 EOF
 chmod +x "$TMPDIR_TEST/scripts/review-plan.sh"
@@ -143,11 +153,15 @@ else
 fi
 
 echo ""
-echo "--- Case 3 (F2, PR#188 t012 Seo 指摘): review-plan.sh は exit 0 (成功) を返すが plan_review.md の判定語が不正 (approve/revise/reject のいずれでもない) → cycle_count は消費されない ---"
+echo "--- Case 3 (F2, PR#188 t012 Seo 指摘 / t015 で plan_review.verdict 契約に更新): review-plan.sh は exit 0 (成功) を返すが plan_review.verdict の判定語が不正 (approve/revise/reject のいずれでもない) → cycle_count は消費されない ---"
 # review-plan.sh 自身が「OK」と判断して exit 0 で返したのに、plan.sh 側の
-# 厳密な正規表現 (approve|revise|reject) では読めない、という不整合を直接
+# allowlist (approve|revise|reject) では読めない、という不整合を直接
 # 再現する。以前は _rollback_to_drafting に refund_cycle=True が付いていな
 # かったため、reviewer の書式ミスだけで cycle_count が消費されていた。
+# t015: 正しく実装された review-plan.sh はもう plan_review.verdict に不正
+# な値を書いて exit 0 することは無いはずだが、plan.sh 側の防御的
+# allowlist チェック (ファイル破損等への備え) がまだ効いていることを
+# 直接確認する。
 _setup
 BEFORE3="$(_cycle_count_of)"
 cat > "$TMPDIR_TEST/scripts/review-plan.sh" << 'EOF'
@@ -158,6 +172,7 @@ MISSION_DIR="$(cd "$SCRIPT_DIR/.." && pwd)/queue/missions/$SLUG"
 cat > "$MISSION_DIR/plan_review.md" << 'INNER'
 **Verdict:** STOP
 INNER
+printf '%s\n' 'STOP' > "$MISSION_DIR/plan_review.verdict"
 exit 0
 EOF
 chmod +x "$TMPDIR_TEST/scripts/review-plan.sh"

@@ -23,6 +23,16 @@
 # 再現する。plan.sh 側の verdict 抽出・rollback・cycle refund・mission 更新は
 # すべて本物のコードパスを通る。claude CLI は一切起動しない。
 #
+# t015 (mission 20260912-verdict-ci-launcher, Director 設計判断1) 追記:
+# 本物の scripts/plan.sh はもう plan_review.md を独立に読み直さない —
+# review-plan.sh が書く queue/missions/<slug>/plan_review.verdict だけを
+# 消費する (QA t003 Finn 実測 FAIL-1 の TOCTOU 対策)。この差し替え版
+# review-plan.sh スタブは「本物の review-plan.sh が exit 0 する条件で
+# plan_review.verdict も書く」という新しい契約を模す (実際の判定計算
+# 自体は本物の scripts/lib_verdict.py を呼んで行うため、フェンス/否定形
+# 等の判定ロジックは一切変えていない — plan.sh 側が正しく
+# plan_review.verdict を信頼・拒否することを検証するのがこのテストの目的)。
+#
 # 実行: bash scripts/test_plan_review_verdict_e2e_variants.sh
 
 set -uo pipefail
@@ -53,6 +63,7 @@ _run_variant() {
   export CREWVIA_QUEUE="$T/queue"
   unset TASKVIA_URL TASKVIA_TOKEN 2>/dev/null || true
   cp "$OWN_CHECKOUT_ROOT/scripts/lint_plan.py" "$T/scripts/"
+  cp "$OWN_CHECKOUT_ROOT/scripts/lib_verdict.py" "$T/scripts/"
   cp -r "$OWN_CHECKOUT_ROOT/config/." "$T/config/"
   "$PLAN_SH" init "Test Mission" --mission testmission >/dev/null 2>&1
 
@@ -66,7 +77,8 @@ SLUG="\$1"
 SCRIPT_DIR="\$(cd "\$(dirname "\$0")" && pwd)"
 MISSION_DIR="\$(cd "\$SCRIPT_DIR/.." && pwd)/queue/missions/\$SLUG"
 REVIEW_OUTPUT="\$MISSION_DIR/plan_review.md"
-rm -f "\$REVIEW_OUTPUT"
+VERDICT_FILE="\$MISSION_DIR/plan_review.verdict"
+rm -f "\$REVIEW_OUTPUT" "\$VERDICT_FILE"
 START=\$(date +%s)
 if [[ "$write_file" == "true" ]]; then
 cat > "\$REVIEW_OUTPUT" << 'INNER'
@@ -76,7 +88,16 @@ fi
 WAIT_OUTPUT="\$(bash "$OWN_CHECKOUT_ROOT/scripts/wait_for_plan_review.sh" "\$REVIEW_OUTPUT" "\$START" 2 1)"
 WAIT_RC=\$?
 WAIT_STATUS="\$(printf '%s\n' "\$WAIT_OUTPUT" | head -1)"
-[[ "\$WAIT_RC" -eq 0 && "\$WAIT_STATUS" == "OK" ]] && exit 0
+if [[ "\$WAIT_RC" -eq 0 && "\$WAIT_STATUS" == "OK" ]]; then
+  # t015 (Director 設計判断1): 本物の review-plan.sh と同じ契約 —
+  # 判定計算 (lib_verdict.py) はここで実行し、確定した値だけを
+  # plan_review.verdict にアトミックに書く。plan.sh はこれだけを読む。
+  VERDICT="\$(python3 "\$SCRIPT_DIR/lib_verdict.py" "\$REVIEW_OUTPUT" 2>/dev/null || true)"
+  if [[ -n "\$VERDICT" ]]; then
+    printf '%s\n' "\$VERDICT" > "\${VERDICT_FILE}.tmp" && mv "\${VERDICT_FILE}.tmp" "\$VERDICT_FILE"
+    exit 0
+  fi
+fi
 exit 1
 EOF
   chmod +x "$T/scripts/review-plan.sh"

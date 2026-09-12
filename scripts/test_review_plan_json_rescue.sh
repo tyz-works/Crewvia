@@ -33,6 +33,14 @@
 # 書く) と wait_for_plan_review.sh (プローズ解析の結果を模して即座に返す)
 # をスタブに差し替える。claude CLI は一切起動しない。
 #
+# t015 (mission 20260912-verdict-ci-launcher, Director 設計判断3) 追記:
+# 構造化出力が届かないケースでは review-plan.sh が明示的に mux_kill →
+# mux_pid で停止確認をしてから plan_review.md を読む。このスタブは
+# mux_pid を「常に見つからない (= 即座に停止確認できる)」に固定し、
+# 実際の herdr/tmux の停止待ちをテストの実行時間に持ち込まない
+# (停止待ちのポーリング挙動そのものは実装コメント参照。ここでは
+# review-plan.sh 側の「確認できてから読む」制御フローだけを検証する)。
+#
 # 検証内容:
 #   1. プローズ判定不能 + ログに有効な structured_output.verdict
 #      → rescue が発火し、plan_review.md 冒頭に規定形式の行が書かれ、
@@ -43,7 +51,9 @@
 #      → rescue は発火せず、既存どおり exit 1 (当て推量で verdict を
 #      捏造しない、既存のフェイルクローズ挙動に回帰がないことの確認)
 #   4. プローズ=revise (真の判定行あり) + 構造化出力が一切無い
-#      → 待たずにプローズをそのまま採用し exit 0 (安全な結論は待たせない)
+#      → t015 で挙動変更: 同じ MAX_WAIT だけ待ってから revise を採用する
+#      (以前は待たずに即採用していたが、Director 設計判断2 でこの近道を
+#      廃止した。安全な結論であること自体は変わらない)
 #   5〜8. t012 由来 (食い違い検出・rescue・fail-closed の既存回帰、変更なし)
 #   9 (F2 コア回帰): プローズ=approve + 構造化出力が最後まで確認できない
 #      → 確認なしに approve を通さない (安全側)。これが本 PR の直接の動機。
@@ -55,6 +65,8 @@
 #      終わり」だったため、この遅延書き込みを永遠に見逃し exit 0 のまま
 #      approve を通していた。修正後は固定間隔ポーリングが遅延書き込みに
 #      追いつき、食い違いを検出して exit 1 になることを確認する。
+#   11〜12 (Codex P2, t015): 構造化出力の envelope 自体が失敗している
+#      (is_error:true / subtype が success 以外) 場合は verdict を信頼しない。
 #
 # 実行: bash scripts/test_review_plan_json_rescue.sh
 
@@ -121,6 +133,7 @@ mux_spawn() {
   return 0
 }
 mux_kill() { return 0; }
+mux_pid() { return 1; }
 EOF
 
   local wait_rc=0
@@ -206,6 +219,7 @@ mux_spawn() {
   return 0
 }
 mux_kill() { return 0; }
+mux_pid() { return 1; }
 EOF
   else
     cat > "$TMPDIR_TEST/scripts/lib_mux.sh" << EOF
@@ -218,6 +232,7 @@ mux_spawn() {
   return 0
 }
 mux_kill() { return 0; }
+mux_pid() { return 1; }
 EOF
   fi
 
@@ -280,9 +295,18 @@ _run_case_ex "TIMEOUT_FRESH" "no json here" '# Plan Review: test
   "構造化出力なし + 1行目が判定行でない → verdict を捏造せず exit 1"
 
 echo ""
-echo "--- Case 4 (安全な結論はプローズ単独で確定してよい): プローズ=revise (真の判定行) + 構造化出力が一切無い → 待たずに revise のまま exit 0 ---"
+echo "--- Case 4 (安全な結論は待った上で確定してよい): プローズ=revise (真の判定行) + 構造化出力が一切無い → 待ち切った後 revise のまま exit 0 ---"
+# t015 (Director 設計判断2, mission 20260912-verdict-ci-launcher) で挙動変更:
+# 以前はここで「revise/reject は安全な結論なので待たない」という近道が
+# あったが、これが QA t003 (Finn) の F2g (prose=revise / structured=approve
+# 遅延、を検出できない) の原因の一つだった。修正後は revise/reject でも
+# approve と**同じ MAX_WAIT** だけ構造化出力の到着を待ってから確定する
+# (このケースでは構造化出力が最後まで来ないので、ファイル冒頭で縮めた
+# REVIEW_PLAN_STRUCTURED_MAX_WAIT 分だけ待ってから revise を採用する —
+# 「待たない」ではなく「待っても食い違いが無ければ安全な結論を採用する」
+# に変わった)。
 _run_case_ex "OK" "" '**Verdict:** revise' 0 "revise" \
-  "prose=revise / structured 皆無 → 待たずに revise のまま (安全な結論は確認不要)"
+  "prose=revise / structured 皆無 → 同じ MAX_WAIT だけ待った上で revise を採用 (安全な結論に確認は不要だが、待つこと自体は他の verdict と揃える)"
 
 echo ""
 echo "--- Case 9 (F2 コア回帰 — 本 PR の直接の動機): プローズ=approve + 構造化出力が最後まで確認できない → 確認なしに approve を通さない ---"
@@ -293,6 +317,22 @@ echo "--- Case 9 (F2 コア回帰 — 本 PR の直接の動機): プローズ=a
 # ことそのものを確認する。
 _run_case_ex "OK" "" '**Verdict:** approve' 1 "approve" \
   "prose=approve / structured 皆無 → 待っても確認できず exit 1 (plan_review.md 自体は書き換えない)"
+
+echo ""
+echo "--- Case 11 (Codex P2, t015): 構造化出力の envelope が失敗している (is_error:true) → verdict を信頼しない ---"
+# Kai-codex t004 review: 以前は .structured_output.verdict の型だけを見て
+# おり、is_error/subtype を確認していなかったため、実行が失敗したターンに
+# たまたま structured_output だけ残っている envelope でも approve を
+# 信頼してしまっていた。
+RESULT_JSON_ERROR_ENVELOPE='{"type":"result","subtype":"error_during_execution","is_error":true,"structured_output":{"verdict":"approve"}}'
+_run_case_ex "OK" "$RESULT_JSON_ERROR_ENVELOPE" '**Verdict:** approve' 1 "approve" \
+  "structured envelope が is_error:true (実行失敗) → verdict を信頼せず exit 1 (plan_review.md は書き換えない)"
+
+echo ""
+echo "--- Case 12 (Codex P2, t015): subtype が success 以外 (is_error は false) → verdict を信頼しない ---"
+RESULT_JSON_BAD_SUBTYPE='{"type":"result","subtype":"error_max_turns","is_error":false,"structured_output":{"verdict":"approve"}}'
+_run_case_ex "OK" "$RESULT_JSON_BAD_SUBTYPE" '**Verdict:** approve' 1 "approve" \
+  "structured envelope の subtype が success でない → verdict を信頼せず exit 1"
 
 echo ""
 echo "--- Case 10 (F2 コア回帰・遅延到着): プローズ=approve が即座に読める一方、構造化出力 (=revise, 食い違い) が遅れて届く → 食い違いを検出して exit 1 ---"

@@ -341,14 +341,25 @@ Director 指摘: 「本番の実遅延を測るか、reviewer プロセス/pane 
 呼び出し元 (grep・シェルの文字列比較) はいずれも `\n` だけを行区切りと
 みなすため、`**Verdict:** approve<SEP>ではない。修正が必要です` の
 `<SEP>` にこれらの文字を使うと lib_verdict だけが1行目を短く区切って
-しまい、完全一致 allowlist を素通りしていた (ファイル経由の呼び出しでは
-Python の universal newlines が `\r` を先に `\n` へ変換してしまうため、
-`\r` 単体は file I/O 越しには顕在化しない — 直接 `extract_canonical_verdict()`
-を呼ぶ経路や `newline=""` で開く将来の呼び出し元に対する防御)。
+しまい、完全一致 allowlist を素通りしていた。
 
-**対応**: `text.splitlines()` → `text.split("\n")` に置換 (2箇所)。9種
-すべての回帰テストは `tests/test_lib_verdict.py` (pytest) に置いた —
-`scripts/test_*.sh` は CI で実行されないため。
+**訂正 (t015, mission 20260912-verdict-ci-launcher, QA t003 Finn 実測):**
+このセクションは元々「ファイル経由の呼び出しでは Python の universal
+newlines が `\r` を先に `\n` へ変換してしまうため、`\r` 単体は file I/O
+越しには顕在化しない」と書いていたが、**これは事実と逆だった**。
+universal newlines による変換こそが `\r` 単体を危険にする原因であり、
+`open(path, encoding="utf-8")` (newline 未指定) で読むファイル経由の
+呼び出し (`scripts/lib_verdict.py` の CLI、ひいては
+`wait_for_plan_review.sh` と `review-plan.sh` の PROSE_VERDICT 読み取り)
+では `\r` が読み込み時点で `\n` に変換されて2行に分割され、1行目
+`**Verdict:** approve` だけが完全一致して approve と誤判定されていた —
+詳細は下記「FAIL-2 / Kai-codex P2」参照。
+
+**対応 (t002 分)**: `text.splitlines()` → `text.split("\n")` に置換
+(2箇所)。9種すべての回帰テストは `tests/test_lib_verdict.py` (pytest) に
+置いた — `scripts/test_*.sh` は CI で実行されないため。ただしこの対応
+だけでは `\r` (CR) 単体はファイル経由で依然として顕在化していた
+(t015 で `newline=""` 対応が別途必要だった)。
 
 ### 関連ファイル (F1/F2/F3 分)
 
@@ -359,3 +370,138 @@ normalize_plan_review_verdict.py` (削除), `scripts/wait_for_plan_review.sh`
 `scripts/test_review_plan_json_rescue.sh` / `scripts/test_wait_for_plan_review.sh`
 / `scripts/test_plan_review_verdict_e2e_variants.sh` (F1/F2 の挙動変更に
 合わせて期待値を更新・新規ケース追加)。
+
+---
+
+## t015 (mission 20260912-verdict-ci-launcher, PR #199 fix 2): FAIL-1 (TOCTOU) / FAIL-2 (CR) の恒久修正
+
+t002 (直前のセクション) の修正後の head (3388334) を Kai-codex (t004) と
+Finn (t003, Opus QA) がそれぞれ独立に再検証し、fail-open の欠陥を実測した。
+t002 自体の設計判断に不備があったことが原因 (下記「Director 自身の指示
+ミス」参照)。
+
+### FAIL-1 [高] / Kai-codex P1: 検証した verdict と消費する verdict が一致しない (TOCTOU)
+
+`review-plan.sh:300` は `PROSE_VERDICT` を1回だけ読み、prose=revise/reject
+の場合は構造化出力を待たずに `FINAL=prose` で exit 0 していた。その後
+EXIT trap の `mux_kill` が走る間 (herdr の tab close は SIGHUP 後最大2秒)
+に reviewer が `plan_review.md` の1行目を approve に再 Write すると、
+`scripts/plan.sh` (`cmd_review`) は**その書き換わった後の** `plan_review.md`
+を `extract_canonical_verdict()` で独立に読み直していたため、構造化出力の
+確認なしに approve が消費されてしまう。
+
+Finn (QA t003) が e2e ハーネス (本物の `plan.sh review` → `review-plan.sh` →
+`wait_for_plan_review.sh` / `lib_verdict.py` を通し、コピー側の
+`lib_mux.sh` だけを差し替え) で decisive に再現した:
+
+    T1: prose=revise で検証 → mux_kill 中に reviewer が1行目を approve に
+        再 Write, structured 無し → status=ready last_verdict=approve
+    T1r: prose=reject で同じ → 同じく ready/approve
+
+**根本原因**: 「検証した値 (review-plan.sh が確定した FINAL_VERDICT)」と
+「消費する値 (plan.sh が独立に derive した値)」が**別の変数・別のタイミング
+の読み取り**であり、両者が同じ値であることを保証する仕組みが無かった。
+
+**対応 (Director 設計判断1 — 束縛)**: `review-plan.sh` は確定した
+`FINAL_VERDICT` を、`review-plan.sh` 以外の誰にも (plan-reviewer セッション
+にも mux_kill にも) 書き換えられない専用ファイル
+`queue/missions/<slug>/plan_review.verdict` にアトミックに書く (tmp → mv)。
+`plan.sh` は**もう `plan_review.md` を独立に読み直さない** — この専用
+ファイルだけを消費し、値が allowlist (`approve`/`revise`/`reject`) と完全
+一致しない・ファイルが存在しない場合は fail-closed (cycle refund)。
+`plan_review.md` 自体は人間向けの記録として残るが、判定には使わない。
+
+この束縛だけで FAIL-1 は原理的に閉じる: plan.sh がファイルから独立に別の
+verdict を導く経路自体が存在しなくなるため、`plan_review.md` がいつ・
+どう書き換わろうと、plan.sh が消費する値は review-plan.sh が確定した
+瞬間の値のまま変わらない。
+
+**対応 (Director 設計判断2 — 同じ MAX_WAIT を待つ)**: `review-plan.sh` 内部
+でも、プローズの値 (approve/revise/reject/判定不能) に関わらず**必ず**同じ
+`REVIEW_PLAN_STRUCTURED_MAX_WAIT` だけ構造化出力の到着を待つように変更
+(以前は revise/reject だと待たなかった)。Finn の F2g (prose=revise /
+structured=approve 遅延、を検出できない) がこの近道の直接の帰結だった。
+
+**対応 (Director 設計判断3 — 書き手が終わった後に1回だけ読む)**:
+構造化出力 (`"type":"result"`) の到着そのものを「reviewer セッションが
+終わった」合図とし、到着後に初めて `plan_review.md` を読む。到着しない
+場合は `review-plan.sh` が明示的に `mux_kill` を呼び、`mux_pid` が
+「見つからない」を返すまでポーリングして停止を確認してから読む。停止を
+確認できない場合は読まない (=判定不能に倒れる)。「先に読んでから待つ」
+という以前の順序 (`wait_for_plan_review.sh` のポーリング結果を使って
+`PROSE_VERDICT` を早期に確定する) を廃止した。実装は
+`scripts/review-plan.sh` の `_stop_reviewer_and_confirm()` /
+`_wait_for_structured_verdict()` 参照。
+
+**対応 (Director 設計判断4 — 雛形の1行目)**: `agents/plan_reviewer.md` の
+Step 3 の雛形1行目が `**Verdict:** revise` という**それ自体で完全一致する
+具体例**だったため、「雛形を書く → 判定を書き直す」という2段階の Write を
+誘発しやすく、TOCTOU の一因になっていた。雛形1行目を
+`**Verdict:** <approve|revise|reject のどれか1語>` という allowlist に
+一致しないプレースホルダに変更し、最終判定を1回の Write で書くよう明記した。
+
+**回帰テスト**: `scripts/test_review_plan_verdict_binding_e2e.sh` (新規) が
+Finn の e2e ハーネスと同じ設計 (本物の `plan.sh review` パイプライン、
+スタブは `lib_mux.sh` だけ) で T1/T1r/F2g/F2c/Decision1 の直接確認を再現
+する。`--verify-red` オプションで 3388334 相当のコードに一時的に差し替え、
+T1 が `status=ready/verdict=approve` になる (red) ことを確認してから元の
+コードで再実行できる。
+
+### FAIL-2 [高] / Kai-codex P2: universal newlines による CR (`\r`) 単体の誤判定
+
+上記「F3」セクションの訂正のとおり、`scripts/lib_verdict.py` の CLI
+エントリポイント (`open(path, encoding="utf-8")`, newline 未指定) は
+Python の universal newlines により `\r` を読み込み時点で `\n` に変換
+してしまう。`**Verdict:** approve\rNOT approved; revisions required` は
+文字列として直接 `extract_canonical_verdict()` を呼ぶ場合は1行のまま
+(完全一致せず判定不能) だが、**ファイル経由** (このCLI、ひいては
+`wait_for_plan_review.sh` の呼び出しと `review-plan.sh` の
+`PROSE_VERDICT` 読み取り) では \r が \n に変換されて2行に分割され、
+1行目 `**Verdict:** approve` だけが読まれて approve と誤判定していた。
+
+**対応**: `scripts/lib_verdict.py` の `open()` を `newline=""` に変更し、
+改行変換自体を無効化した。正規の CRLF 行末 (`approve\r\n`) は
+`_canonical_value_of()` の `.strip()` が末尾の \r を空白として除去する
+ため regression にはならない。回帰テストはバイト列をファイルに書いて
+CLI 経由で読む形で `tests/test_lib_verdict.py` (9種の区切り文字すべて)
+と `scripts/test_lib_verdict.sh` に追加した。
+
+### Codex t004 review の P2 その他 [高]: 構造化出力の失敗 envelope を信頼していた
+
+`_rescue_verdict_from_structured_output()` は `.structured_output.verdict`
+の型だけを見ており、result envelope 自体が成功したかどうか
+(`is_error` / `subtype`) を確認していなかった。
+`{"is_error":true,"subtype":"error_during_execution","structured_output":
+{"verdict":"approve"}}` のような、実行が失敗したターンにたまたま
+structured_output だけ残っている envelope でも verdict を信頼して
+しまっていた。
+
+**対応**: `is_error == false` かつ `subtype == "success"` の場合だけを
+信頼する allowlist にした (どちらか欠落・想定外の値なら判定不能)。
+mux 経路では claude プロセス自体の終了ステータスを取得する手段が無いため
+(バックグラウンドで spawn され、パイプの終了ステータスも herdr/tmux 側に
+閉じている)、envelope 自身が自己申告する `is_error`/`subtype` を唯一の
+成功シグナルとして使う。回帰テストは
+`scripts/test_review_plan_json_rescue.sh` Case 11/12。
+
+### Director 自身の指示ミス (Finn 指摘、認める)
+
+t002 で「prose=revise/reject → そのまま採用 (待たない)」を許可しながら
+「plan.sh が消費する値を review-plan.sh が検証した値に束縛する」ことを
+要求しなかったこと、F3 を「`str.splitlines()` → `str.split("\n")`」という
+関数の差し替えとして指定し `open()` の改行変換 (newline 引数) に触れな
+かったことが FAIL-1/FAIL-2 の一因だった。t015 の設計判断1-4 はその修正。
+
+### 関連ファイル (t015 分)
+
+`scripts/lib_verdict.py` (`open(..., newline="")`), `scripts/review-plan.sh`
+(`VERDICT_FILE` 束縛、`_stop_reviewer_and_confirm`、構造化出力待ちの
+無条件化、envelope 成否チェック)、`scripts/plan.sh`
+(`plan_review.verdict` を消費、`plan_review.md` の独立読み直しを削除)、
+`agents/plan_reviewer.md` (雛形1行目)、`tests/test_lib_verdict.py` /
+`scripts/test_lib_verdict.sh` (CR 回帰)、
+`scripts/test_review_plan_json_rescue.sh` (Case 11/12 追加、Case 4/9 の
+コメント訂正)、`scripts/test_plan_review_verdict_e2e_variants.sh`
+(スタブが `plan_review.verdict` も書くよう更新)、
+`scripts/test_review_plan_verdict_binding_e2e.sh` (新規、T1/T1r/F2g/F2c/
+Decision1 の e2e 回帰)。

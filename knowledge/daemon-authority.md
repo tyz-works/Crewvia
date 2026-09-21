@@ -12,6 +12,13 @@ crewvia には Worker を終了させうる主体が 2 つある。`scripts/disp
 ゼロで (`grep -i watchdog scripts/dispatcher.sh` → 0 件、逆も同じ)、`start.sh` が
 mux 窓で並べて起動するだけで supervisor は無い。
 
+(N2: 厳密には第 3 の主体がある。`scripts/benchmark-ctx.sh` が :199 / :312 で
+`<agent>-worker` を直接 `mux_kill` する。dispatcher 側は `bench_gate_active()` /
+`bench_worker_restarting()` (:1160-1172) で協調しているが、**watchdog にはこの
+ゲートが無い** (`grep -ic bench scripts/watchdog.py` → 0)。`CREWVIA_BENCH_MODE=1`
+のときだけ効く経路なので本文書のスコープ外として扱うが、「kill を一元化する」と
+述べる以上、協調していない kill 主体が 1 つ残ることをここに明記しておく。)
+
 この構造から 2 つの実害が出ている。
 
 1. **後始末の穴** — watchdog は Worker プロセスを殺すが、task を pending に戻さず
@@ -44,7 +51,12 @@ mux 窓で並べて起動するだけで supervisor は無い。
 D1 / D2 / D3 はいずれも `tmux_kill_window()` (:523) という単一の choke point を通る。
 この関数は破壊直前に `repo_identity_ok()` を再チェックし、失敗時は kill せず戻る
 (fail closed)。kill 成功時に spawn grace マーカー `registry/mux/<target>.firstseen`
-を削除する。
+を削除する (:561-566)。この unlink の意味は §3-4 で扱う。
+
+(N4: 同関数の docstring :543-544 は call site として "vanished-worker cleanup" を
+挙げているが、**これは stale**。D4 は通知のみで kill しない。`tmux_kill_window()` の
+呼び出しは :1015 / :1238 / :1308 の 3 箇所だけで、いずれも D1 / D2 / D3 である。
+上表の D4 行の方が正しい。コード側のコメント修正は t002 に申し送る → §6。)
 
 ### 2-2. watchdog.py (30 秒ポーリング)
 
@@ -125,7 +137,7 @@ dispatcher が「この Worker は用済み」と判断してから watchdog が
 |---|---|---|---|
 | 置き場 | `queue/missions/<slug>/tasks/tNNN.md` に `retire_worker:` を追加 | `registry/retirements/<agent>.json` を新設 | `queue/assignments/<agent>` に tombstone を書く |
 | 表現対象 | task | **Worker** | Worker |
-| 既存の所有権との衝突 | **あり** (frontmatter は `plan.sh` が排他ロック付きで所有) | 無し | **あり** (4 箇所が不変条件を共有) |
+| 既存の所有権との衝突 | **あり** (frontmatter は `plan.sh` が排他ロック付きで所有) | 無し | **あり** (5 箇所が不変条件を共有) |
 | 致命的な問題 | **対象 Worker には書き込む先の task が存在しない** | — | **「存在 = busy」の不変条件が壊れる** |
 
 **案A を否決する理由 (決定的)。** 引き渡しの対象は Worker であって task ではない。
@@ -139,8 +151,9 @@ Worker が複数居れば、誰の retire なのかを task 側では表現で�
 
 **案C を否決する理由。** `queue/assignments/<agent>` は「**存在 = busy / 不在 = idle**」
 という不変条件を、dispatcher の idle 判定 (D1 :1005、D2/D3 :1150-1151)、`plan.sh pull`
-の書き込み (:1514-1519)、`plan.sh done` の削除 (:1794-1797)、`plan.sh update --reset`
-の削除 (:2966-2984) の 4 箇所が共有している。tombstone を置くと「存在するが idle」と
+の書き込み (:1514-1519)、`plan.sh done` の削除 (:1794-1797)、`plan.sh fail` の削除
+(:1901-1906、コメントに "same as done")、`plan.sh update --reset` の削除 (:2966-2984)
+の **5 箇所**が共有している。tombstone を置くと「存在するが idle」と
 いう第 4 の状態が生まれ、**Rule 5 の条件 B (`idle`/`done` かつ assignment 有り) が
 即座に誤発火する** (:854)。
 
@@ -153,17 +166,56 @@ Worker 名をファイル名にできるので対象を自然に表現でき、`
 ```
 registry/retirements/<agent>.json          ← dispatcher のみが書き、dispatcher のみが消す
   {"agent","window_target","reason":"no-task|blocked-stuck|all-done",
-   "requested_at":<epoch>,"mission":<slug|null>,"task_id":<id|null>}
+   "requested_at":<epoch>,"mission":<slug|null>,"task_id":<id|null>,
+   "spawn_identity":{"pane_pid":<int|null>,"created_at":<epoch|null>}}
 
 registry/retirements/<agent>.progress.json ← watchdog のみが書く
-  {"phase":"notified|sigterm_sent|terminated","deadline":<epoch>,
-   "pane_pid":<int|null>,"updated_at":<epoch>,"window_gone":<bool>}
+  {"phase":"notified|sigterm_sent|terminated|discarded","deadline":<epoch>,
+   "pane_pid":<int|null>,"updated_at":<epoch>,"window_gone":<bool>,
+   "discard_reason":<str|null>}
 ```
 
 **1 ファイル 1 書き手**を規律にする。両デーモンが同一ファイルを更新する設計にすると
 lost update のリスクを排他制御で潰す必要が出るが、ファイルを分ければロックが要らない。
 書き込みは temp + `os.replace` の atomic rename に統一し、読み手が破損 JSON を見ない
 ようにする。削除は dispatcher が両ファイルまとめて行う (R4)。
+
+**`spawn_identity` が必須である理由 (F2)。** `{"agent","window_target",...}` だけでは
+「**どの Worker インスタンスか**」を特定できない。watchdog 側で窓を引くのは
+`_mux_window_name()` (:265-271) で、これは `<agent>-worker` → `<agent>` の順に名前解決
+するだけである。crewvia は Worker 名を再利用する (Haruto / Seo / Arjun ...) ので、
+marker が元の Worker より長生きすると**同名の別 Worker に着弾する**。発火列:
+
+1. T0 に dispatcher が `retirements/Seo.json` を書く
+2. watchdog が落ちる / 遅れる (ポーリング 30s、状態機械は R2 で最大 70s)
+3. 元の Seo が自力終了し、Director が**同名**の Seo を再起動
+4. watchdog 復帰 → R3 が `phase != terminated` を走査 → **窓が生きている**ので
+   deadline を張り直す → 新しい Seo に SIGTERM
+
+これは §5-2 が「先に watchdog に kill を足した場合」の最大の危険として挙げている事象
+そのもので、marker 方式でも識別子が無ければ同じ穴が残る。R3 の「窓が生きていれば
+deadline を張り直す (冪等)」は、**同名別インスタンスに対しては冪等ではない**。
+
+識別子の取り方は backend 非依存にする。`pane_pid` は両 backend で `_mux.pid(name)`
+(`lib_mux.py` の抽象メソッド :185) が返す。`created_at` は herdr なら
+`_mux_created_at()` (dispatcher.sh :570) の `registry/mux/<target>.json`、tmux なら
+`_spawn_time_fallback()` (:590) の `.firstseen` 値を使う。両方 null になる場合は
+**marker を書かない** (fail closed。居座り = §5-1 の方に倒す)。ただし
+**黙って捨てないこと** — dispatcher のログに理由付きで 1 行出す。出さないと
+「用済み Worker が閉じられない」が dedup (TTL 300s) の陰に隠れて無症状になり、
+§5-1 の発見が遅れる。再照合の規律は R7。
+
+`.firstseen` を tmux 側の identity トークンに使う点は、§3-4 の sweep と噛み合っている
+必要がある。sweep は**窓が `_mux.list()` に居ないときだけ** unlink するので、窓が
+生きている限りトークンは安定して残る。窓が消えていれば R7 以前に R3 の (1)
+(`window_gone`) で決着するため、トークンが消えていても困らない。`_mux.list()` の
+一時的な失敗で unlink → 再出現時に新しい値が書かれた場合は、R7 が不一致と判定して
+marker を捨てる = **殺さない**方向に倒れる。
+
+リポジトリには既に同型の防御規約がある — `plan.sh:2960-2984` は assignment を消す前に
+内容が `<slug>:<task_id>` と一致するかを確認する (コメント: "guard against accidentally
+removing the assignment of a Worker who was already reused for a different task")。
+R7 はこれと同じ考え方を破壊ステップに適用するものである。
 
 ### 3-4. 各経路の割り当て
 
@@ -178,11 +230,49 @@ lost update のリスクを排他制御で潰す必要が出るが、ファイ�
 | **W2** terminate | **watchdog のまま** | idle / max はプロセスの応答性の判定。ただし後始末の要件 (R4) を満たすよう改修 |
 | **W3** kill (窓消滅) | **watchdog のまま** | monitor の除外は watchdog の内部管理。ただし queue 側の帰結 (幽霊 task) は D4 が拾う — この二重観測は意図的に残す |
 | **新設** retirement 消費 | **watchdog** | `process_retirements()`。monitors とは独立したループ |
+| **新設** `.firstseen` 掃除 | **dispatcher** | 窓が消えた target の spawn-grace マーカーを毎 cycle 掃除する (下記 F1) |
 
 `graceful_terminate()` は現在 `WorkerMonitor` を引数に取るが、retirement には task が
 無い。`(agent_name, window_target, repo_root)` を取る形に切り出し、W2 と retirement の
 両方から使えるようにする。**monitor を捏造して渡す実装にしないこと** — `task_id` や
 `started_at` が偽値になり、E2 の再発防止を難しくする。
+
+**F1: `.firstseen` の後始末を落とさないこと。** D1/D2/D3 が通る
+`tmux_kill_window()` は kill だけの関数ではない。kill 成功時に
+`registry/mux/<target>.firstseen` を unlink する副作用を持つ (:561-566)。これは
+t015 (PR #190 の QA FAIL) の修正本体で、docstring :525-536 が理由を明記している —
+crewvia は Worker 名を再利用するため、tmux backend (`created_at` キャッシュが無い)
+では stale な `.firstseen` が残ると**次に同名で起動した Worker が spawn grace ゼロに
+なり 1 dispatch cycle で殺される (実測: spawn から 33 秒)**。
+
+一方 `graceful_terminate()` に unlink は無い (watchdog のファイル書き込みは
+`_LOG_FILE.open("a")` :554 と `_OBSERVATION_LOG_FILE.open("a")` :570、および
+`registry_dir.mkdir` :610 だけである)。したがって kill 権限をそのまま watchdog に
+移すと、**誰も `.firstseen` を消さなくなり、ゼロ猶予バグが再発する**。
+
+**決定: `.firstseen` の所有者は dispatcher のままとし、kill 経路から切り離して
+「窓が消えたら掃除する」sweep にする。**
+
+- dispatcher は毎 cycle、`registry/mux/*.firstseen` のうち対応する target が
+  `_mux.list()` に居ないものを unlink する。`_spawn_time_fallback()` が書き、
+  dispatcher が消す — 書き手と消し手が同じで、§3-3 の「1 ファイル 1 書き手」と揃う。
+- **kill の成否ではなく窓の不在をトリガにする**点が要点である。これにより D1/D2/D3
+  経由・W2 経由・W3 (窓消滅) 経由・BENCH_MODE の `mux_kill` 経由 (N2) のどれで窓が
+  消えても、掃除は同じ 1 箇所で閉じる。現状は W2 と BENCH_MODE で窓が消えた場合に
+  誰も unlink しておらず、**これは移行前から存在する穴でもある**。
+- `_mux.list()` が一時的に空を返した場合 (mux 不達・設定ミス) は全 `.firstseen` が
+  消えるが、結果は「次の spawn grace が満額に戻る」= 殺されにくくなる方向なので
+  fail-safe である。watchdog の `_is_mass_kill()` (:335) と同じ向きに倒れる。
+- 逆方向の案 (watchdog の `graceful_terminate()` に unlink を足す) は採らない。
+  watchdog が `registry/mux/` という dispatcher の状態ディレクトリに書き手として
+  加わることになり、しかも W3 / BENCH_MODE の経路は依然として拾えない。
+- **ロールバック経路 (`CREWVIA_KILL_AUTHORITY=dispatcher`) では `tmux_kill_window()`
+  が復活する。その中の unlink を「新経路があるから不要」として削除しないこと** (R5 と
+  同じ理由)。sweep との二重実行は unlink が冪等 (`missing_ok=True`) なので無害。
+
+影響範囲は tmux backend のみである。herdr は `created_at` を `<target>.json` に
+spawn ごとに書き直すため `.firstseen` に依存しない。ただし `mode: tmux` はサポート
+対象であり、落として良い穴ではない。
 
 ---
 
@@ -219,9 +309,15 @@ lost update のリスクを排他制御で潰す必要が出るが、ファイ�
   **これで中断耐性と「1 cycle の所要時間が有界」が同時に満たされる** — 状態が毎 phase
   ディスクにあるので、どこで落ちても次の起動が続きを引き取れる。
 - **R3 (再起動時の回収).** watchdog は起動時に `registry/retirements/*.progress.json` を
-  走査し、`phase != terminated` のものを引き継ぐ。窓が既に無ければ
-  `phase=terminated, window_gone=true` に進めて終端処理へ。窓が生きていれば当該 phase の
-  deadline を now 起点で張り直す (冪等 — 同じメッセージや SIGTERM が二度届いても害は無い)。
+  走査し、`phase != terminated` のものを引き継ぐ。判定はこの順に行う:
+  1. 窓が既に無ければ `phase=terminated, window_gone=true` に進めて終端処理へ。
+  2. 窓が生きていて **R7 の identity 再照合が不一致**なら `phase=discarded` にする
+     (同名の別 Worker に着弾させない)。
+  3. 一致した場合のみ、当該 phase の deadline を now 起点で張り直す。
+  **「窓が生きていれば張り直す」だけでは冪等にならない。** 同じ名前の窓が同じ
+  インスタンスである保証は無く、(2) を省くと復帰した watchdog が新しい同名 Worker を
+  殺す (§3-3 F2 の発火列そのもの)。冪等なのは「同一インスタンスに対して同じ
+  メッセージや SIGTERM が二度届くこと」までである。
 - **R4 (終端を dispatcher が読める形で残す).** watchdog は **`queue/` を書かない原則を
   維持する**。終端時は `progress.json` に `phase=terminated` と、殺したときに紐づいていた
   `mission` / `task_id` を残すだけにする。dispatcher は次 cycle でこれを読み、task が
@@ -236,6 +332,21 @@ lost update のリスクを排他制御で潰す必要が出るが、ファイ�
 - **R6 (fail closed の維持).** `repo_identity_ok()` の再チェックは各破壊ステップの直前に
   残す。状態機械化すると phase 間に cycle 境界が挟まるため、**チェック回数は減らさず
   増える**方向になる。これは正しい方向。
+- **R7 (Worker インスタンスの再照合).** `repo_identity_ok()` が「自分は正しいリポジトリか」
+  を確かめるのに対し、R7 は「**相手は marker を書いた時と同じ Worker インスタンスか**」を
+  確かめる。**R6 と同じ位置 — 各破壊ステップ (メッセージ送信 / SIGTERM / SIGKILL) の
+  直前 — に置く。**
+  - 照合対象は marker の `spawn_identity` (§3-3)。現在値は `pane_pid` = `_mux.pid(target)`、
+    `created_at` = `_mux_created_at()` → `_spawn_time_fallback()` の順で取る。
+  - **記録が非 null の項目が 1 つでも不一致なら不一致**と判定する。
+  - 不一致なら破壊ステップを実行せず `phase=discarded` + `discard_reason` を書いて終える。
+    dispatcher は `discarded` を読んだら **D4 の復旧レシピを送らずに** marker 2 本を
+    削除する (別インスタンスが元気に動いているのだから幽霊 task ではない)。
+  - 現在値が両方とも取れない (mux 不達等) 場合も **不一致扱い = 殺さない**。
+    fail closed の向きは §5-1 (居座り) であって §5-2 (誤 kill) ではない。
+  - **W2 (既存の idle / max terminate) にも同じ再照合を入れる。** W2 は monitor を
+    毎 cycle 作り直すので今は問題が表面化しにくいが、`graceful_terminate()` を状態機械に
+    するなら phase 間に cycle 境界が入るため、retirement と同じ穴がそのまま開く。
 
 ### 4-3. スコープ外として backlog に出す
 
@@ -291,6 +402,14 @@ dispatcher と watchdog が同一 Worker に独立して kill を打つ。単に
   同時に停止 → 両方 respawn** の手順を PR の説明に明記すること。
 - 検証は隔離環境で行う。本番の dispatcher / watchdog / Worker を巻き込まないこと
   (memory: `dispatcher-isolated-qa-harness`)。
+- **N3: t002 が merge されてから t005 (相互監視) が入るまでの間、Worker の通常
+  shutdown は watchdog の生存に完全に依存する。** 現状は D1/D2/D3 が dispatcher 側の
+  backstop になっているが、t002 はそれを watchdog へ一本化するため、watchdog が黙って
+  止まれば用済み Worker が誰にも閉じられなくなる (= §5-1 の常態化)。watchdog が実際に
+  一度も起動していなかった前例がある (`start.sh:778-779` の "F6是正: tmuxモードでは
+  従来watchdogが一度も起動していなかった")。`CREWVIA_KILL_AUTHORITY=dispatcher` への
+  一括切替が緩和策になるので blocking にはしないが、**t002 の実装者は t005 までの期間を
+  「watchdog 単一障害点」として認識し、PR 説明に明記すること**。
 
 ---
 
@@ -304,16 +423,30 @@ dispatcher と watchdog が同一 Worker に独立して kill を打つ。単に
 - [ ] 70 秒ブロッキングを phase + deadline の状態機械に置換する (R2)
 - [ ] 破壊ステップ直前の `repo_identity_ok()` 再チェックを全 phase で維持する (R6)
 - [ ] D4 (vanished 検知) を削除しない (R5)
+- [ ] **F1**: `.firstseen` 掃除を dispatcher 側の sweep として実装する (窓の不在が
+      トリガ、kill の成否ではない)。`tmux_kill_window()` 内の unlink は
+      `CREWVIA_KILL_AUTHORITY=dispatcher` 経路のために**残す**
+- [ ] **F2/R7**: marker に `spawn_identity` を持たせ、各破壊ステップ直前 (R6 と同位置) と
+      R3 の回収時に再照合する。不一致 / 取得不能はどちらも「殺さない」に倒す。W2 にも同じ
+      再照合を入れる
+- [ ] **N4**: `tmux_kill_window()` の docstring :543-544 から "vanished-worker cleanup" を
+      外す (D4 は kill しない)
 - [ ] `CREWVIA_KILL_AUTHORITY` による一括ロールバック経路
-- [ ] PR 説明に「両デーモンの同時 respawn 手順」を書く
+- [ ] PR 説明に「両デーモンの同時 respawn 手順」と、t005 までの watchdog 単一障害点
+      (§5-3 N3) を書く
 
 ## 7. 参照
 
 - `scripts/dispatcher.sh` — D1 :998、D2 :1210、D3 :1239、D4 :1351、D5 :819、
-  `tmux_kill_window()` :523
-- `scripts/watchdog.py` — `check()` :295、`graceful_terminate()` :401、
-  `load_active_tasks()` :509、`run()` :607
-- `scripts/plan.sh` — assignment 書き込み :1514、削除 (done) :1794、削除 (--reset) :2966
+  `tmux_kill_window()` :523 (`.firstseen` unlink :561-566)、`_mux_created_at()` :570、
+  `_spawn_time_fallback()` :590、BENCH_MODE ゲート :1160-1172
+- `scripts/watchdog.py` — `check()` :295、`_mux_window_name()` :265、
+  `graceful_terminate()` :401、`load_active_tasks()` :509、`run()` :607
+- `scripts/lib_mux.py` — `pid()` (backend 抽象メソッド) :185
+- `scripts/benchmark-ctx.sh` — 直接 `mux_kill` :199 / :312 (N2)
+- `scripts/start.sh` — dispatcher / watchdog の起動 :771 / :780、F6是正コメント :778-779
+- `scripts/plan.sh` — assignment 書き込み :1514、削除 (done) :1794、削除 (fail) :1904、
+  削除 (--reset) :2966、インスタンス一致確認の先例 :2960-2984
 - `knowledge/worker-shutdown-rules.md` — Rule 1-5 の確定仕様
 - `knowledge/worker-vanish-detection.md` — D4 の背景
 - `knowledge/dispatcher-restart-after-merge.md` — 常駐デーモンの反映手順

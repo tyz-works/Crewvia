@@ -324,15 +324,21 @@ MK
   else
     fail "identity 不一致にもかかわらず窓が殺された (R7 違反 — 同名の別 Worker 殺し)"
   fi
-  local phase=""
-  if [[ -f "$sb/registry/retirements/TestAgent.progress.json" ]]; then
-    phase="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("phase",""))' \
-            "$sb/registry/retirements/TestAgent.progress.json" 2>/dev/null)"
-  fi
-  if [[ "$phase" == "discarded" ]]; then
-    pass "phase=discarded が記録された"
+  # discarded は終端なので marker は次の cycle で消える。残骸を期待すると
+  # 「消える前に見に行けたか」というレースを検証することになるので、
+  # 判定そのものはログで、後始末は marker の不在で確かめる。
+  if grep -q 'NOT retiring' "$sb/logs/watchdog.out"; then
+    pass "identity 不一致として判定された"
+    info "$(grep -m1 'NOT retiring' "$sb/logs/watchdog.out")"
   else
-    fail "phase='${phase}' (期待: discarded) — 不一致 marker が捨てられていない"
+    fail "identity 不一致の判定がログに出ていない"
+    info "watchdog log tail: $(tail -5 "$sb/logs/watchdog.out")"
+  fi
+  if [[ ! -f "$sb/registry/retirements/TestAgent.json" \
+     && ! -f "$sb/registry/retirements/TestAgent.progress.json" ]]; then
+    pass "不一致 marker が片付けられた"
+  else
+    fail "不一致 marker が残っている — 次 cycle 以降も後継 Worker を狙い続ける"
   fi
 }
 

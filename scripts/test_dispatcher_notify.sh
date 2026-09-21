@@ -249,10 +249,16 @@ PYEOF
 # ---------------------------------------------------------------------------
 echo ""
 echo "-- Test 1: NOTIFY_CACHE は PID 非依存パス --"
-if grep -q 'NOTIFY_CACHE="/tmp/dispatcher-notify-cache\.json"' "$DISPATCHER_SH"; then
-  pass "NOTIFY_CACHE に PID (\$\$) が含まれない"
+# t002: CREWVIA_NOTIFY_CACHE による上書きを足したので、行の完全一致では
+# なく「既定値に PID が入らないこと」で判定する。元の欠陥は
+# /tmp/dispatcher-notify-cache-$$.json で dedup が再起動ごとにリセットされ、
+# 同じ通知が何度も飛んでいたこと。上書きは隔離 QA 用 (本番の共有キャッシュを
+# 読むと「抑止された通知」が「発火しなかった」に見えて偽 PASS になる)。
+notify_cache_line=$(grep -E '^NOTIFY_CACHE=' "$DISPATCHER_SH" | head -1)
+if [[ "$notify_cache_line" == *'dispatcher-notify-cache.json'* && "$notify_cache_line" != *'$$'* ]]; then
+  pass "NOTIFY_CACHE の既定値に PID (\$\$) が含まれない"
 else
-  fail "NOTIFY_CACHE がまだ PID 固有パス (\$\$.json) のまま"
+  fail "NOTIFY_CACHE がまだ PID 固有パス (\$\$.json) のまま: ${notify_cache_line}"
 fi
 
 # ---------------------------------------------------------------------------

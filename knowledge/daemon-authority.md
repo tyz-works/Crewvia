@@ -435,6 +435,71 @@ dispatcher と watchdog が同一 Worker に独立して kill を打つ。単に
 - [ ] PR 説明に「両デーモンの同時 respawn 手順」と、t005 までの watchdog 単一障害点
       (§5-3 N3) を書く
 
+## 6-2. 実装時に設計から変えた点 (t002, 2026-09-21)
+
+実装は `scripts/lib_retirement.py` + `scripts/watchdog.py` + `scripts/dispatcher.sh`。
+本文の決定に従ったが、3 点だけ設計と違う形になった。理由込みで残す。
+
+### (1) R4 — 後始末の担い手を watchdog にした
+
+本文 §4-2 R4 は「watchdog は `queue/` を書かない。`phase=terminated` を残し、
+dispatcher が読んで Director に復旧レシピを送り、marker を消す」だった。
+**タスク指示 (実装項目 3) とプランレビューがこれを上書きした** —
+「後始末を watchdog 自身が完結させる。Director への通知は結果の事後報告にする」。
+
+実装はプランレビューの指定どおり `plan.sh update <task> --status pending --reset
+--mission <slug>` を subprocess で呼ぶ。frontmatter を自前で書かないので
+R4 の本来の趣旨 (`queue/` の所有権を侵さない) は保たれている — 書き手は
+依然として plan.sh 1 つで、ロックも assignment のインスタンス照合も
+plan.sh の既存実装がそのまま効く。
+
+結果として **request 以降のライフサイクルは全部 watchdog が持つ**
+(marker 2 本の削除も含む)。dispatcher が落ちていても後始末が完結するので、
+E1 の穴が「dispatcher の生存」に依存しなくなった。D4 は R5 どおり残してある。
+
+### (2) 後始末の順序 — kill が先、reset が後
+
+プランレビューの「plan.sh の呼び出しに失敗した場合は kill せず通知に倒す」を
+**2 つに分けて**実装した。素直に「reset してから kill」にすると、kill が失敗
+したときに *pending に戻った task を持つ生きた Worker* ができ、dispatcher が
+同じ task を別の Worker に割り当てる (二重作業 + worktree 競合)。
+
+- **開始前のプリフライト**: task を持つ retirement は、`plan.sh` が使えなければ
+  **そもそも終了処理を始めない** (`_start()` の `REFUSING to start`)。
+  「殺してから plan.sh が無いと気付く」を封じる。これが「kill せず」の実装。
+- **実行時の失敗**: kill 後に plan.sh が落ちた場合は `phase=cleanup_failed` を
+  残し、毎 cycle 再試行しつつ Director に 1 度だけ手動レシピを送る。
+  marker を消さないので状態は残り、D4 も 600s 後に独立して同じ task を拾う。
+
+### (3) 「窓が消えた」の判定に pane_pid を使う (実装中に見つけた欠陥)
+
+本文は各ステップで「窓が生きているか」を `_mux.list()` で見る前提だった。
+実装してテストしたところ、**SIGTERM 直後に Worker が終了した場合**に
+以下が起きた:
+
+1. cycle 冒頭の窓スナップショットにはまだ窓が居る
+2. 直後の R7 再照合で `_mux.pid()` が None を返す
+3. `identity_matches()` は「記録した pane_pid があるのに現在読めない」を
+   **不一致**と判定する (これ自体は正しい — mux 不達で kill を許さないため)
+4. → `phase=discarded` になり、**後始末を飛ばして marker が消える**
+
+つまり R7 のガードが、まさに直そうとしている幽霊 task を再生産していた。
+修正は `process_alive()` — 記録済み pane_pid が生きているかを `/proc` で
+直接見る。mux を介さないので「インスタンスが終わった」と「backend が
+答えられない」を混同しない。各ステップはこの判定を R7 より**先に**行う。
+
+この欠陥は `tests/test_retirement.py::test_cleanup_failure_keeps_marker_and_notifies_once`
+が最初に捕まえた (marker が消えていた)。
+
+### (4) cycle 全体を `mux.available()` でゲートした
+
+`_mux.list()` が一時的に空を返すと全 marker が「窓消滅 → terminated →
+後始末」に進み、**生きている Worker の task を pending に戻す**。
+`_is_mass_kill()` と同じ考え方で、backend が答えられない cycle は
+1 件も処理しない (`test_mux_unavailable_processes_nothing`)。
+
+---
+
 ## 7. 参照
 
 - `scripts/dispatcher.sh` — D1 :998、D2 :1210、D3 :1239、D4 :1351、D5 :819、

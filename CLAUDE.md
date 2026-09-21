@@ -50,6 +50,9 @@
     plan.sh             タスクプラン管理 CLI（per-task / multi-mission）
     dispatcher.sh       並列モードの常駐割り当てデーモン（idle Worker への自動 assign + codex-review spawn）
     watchdog.py         Worker 生存監視デーモン（idle 判定・pane 消滅の検知と kill）
+                        **Worker を終了させる唯一の実行者**（t002 以降）。後始末まで担う
+    lib_retirement.py   retirement marker プロトコル（dispatcher が判定 → watchdog が実行）
+                        権限境界の設計は knowledge/daemon-authority.md
                         判定の設計は knowledge/watchdog-idle-judgment.md
                         ログ: logs/watchdog/watchdog-YYYYMMDD.log（日次）
     kai-review.sh       Codex reviewer (Kai-codex) 起動ラッパー。詳細は `knowledge/codex-reviewer.md`
@@ -66,6 +69,7 @@
     workers.yaml        Worker のスキル・経験値
     heartbeats/         watchdog 監視用
     mux/                mux バックエンドのタブ/ペイン ID キャッシュ（.gitignore 対象）
+    retirements/        Worker 終了要求と進捗（dispatcher→watchdog の引き渡し。.gitignore 対象）
   CLAUDE.md             このファイル
   README.md             公開向けセットアップガイド
 ```
@@ -93,6 +97,7 @@
 | `CREWVIA_WORKER_MODEL` | Worker が使用するモデルを強制指定。`config/crewvia.yaml` の `model_per_skill` による skill 別自動選択より優先（最優先）。空にするか未設定の場合は skill に応じて自動選択される |
 | `CREWVIA_WORKER_PERMISSION_MODE` | Worker 起動時の `claude --permission-mode` 値。デフォルト: `auto`（対話プロンプトなし。実質的な承認ゲートは hooks/pre-tool-use.sh + Taskvia が別途担う）。空にすると CLI 既定（対話確認あり）にフォールバック |
 | `CREWVIA_DIRECTOR_PERMISSION_MODE` | Director 起動時の `claude --permission-mode` 値。デフォルト: 未設定（CLI 既定 = 対話確認あり）。Director は Taskvia 承認 hook を role 判定でスキップするため、対話確認が唯一の安全弁 |
+| `CREWVIA_KILL_AUTHORITY` | Worker を終了させる主体: `watchdog`（デフォルト）/ `dispatcher`（ロールバック）。**両デーモンで同じ値にし、同時に再起動すること** — 片方だけ戻すと「誰も窓を閉じない」か「二重 kill で同名の別 Worker を殺す」のどちらかが必ず起きる（`knowledge/daemon-authority.md` §5） |
 | `CREWVIA_MUX` | mux バックエンド選択: `tmux` / `herdr`。config `mode:` より優先 |
 | `CREWVIA_MUX_ENABLED` | 並列モード有効化: `1` で並列 ON（`CREWVIA_MUX` 未設定時の tmux fallback）/ `0` でインラインモード強制。`CREWVIA_MUX` が設定済みなら不要 |
 | `CREWVIA_TMUX_SESSION` | tmux backend が使うセッション名（デフォルト: `crewvia`） |

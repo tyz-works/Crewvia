@@ -22,6 +22,11 @@ set -euo pipefail
 #   plan.sh update <task_id> [--mission <slug>] [--skills <csv>] [--blocked-by <csv>]
 #                            [--priority high|medium|low] [--worker <name>] [--status <status>]
 #                            [--description <text>] [--reset]
+#   plan.sh retire <task_id> --agent <name> --started-at <generation>
+#                            [--mission <slug>] [--outcome reset|needs-director]
+#                            [--reason "<1 行>"]
+#                              実行アイデンティティで束縛した後始末。前提が外れたら
+#                              1 バイトも書かずに exit 3 (詳細は cmd_retire)
 #   plan.sh status [--mission <slug>] [--all]
 #   plan.sh archive <slug>
 
@@ -30,7 +35,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 QUEUE_DIR="${CREWVIA_QUEUE:-${REPO_ROOT}/queue}"
 
 if [[ $# -eq 0 ]]; then
-  echo "Usage: plan.sh <init|add|pull|done|needs-director|fail|update|ready-for-verification|verify-result|review|launch|lint|status|archive|dashboard|dashboard-data> [args...]" >&2
+  echo "Usage: plan.sh <init|add|pull|done|needs-director|fail|update|retire|ready-for-verification|verify-result|review|launch|lint|status|archive|dashboard|dashboard-data> [args...]" >&2
   exit 1
 fi
 
@@ -293,6 +298,19 @@ def die(msg, code=1):
 
 def now_iso():
     return datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+
+def now_generation():
+    """`started_at` に入れる実行世代。
+
+    now_iso() の秒精度では、差し戻し直後の再 pull が同じ秒に収まった瞬間に
+    先任と後任の started_at が文字列として一致し、「別の実行」を区別できなく
+    なる。世代として突き合わせる値である以上、衝突してはいけないので小数秒まで
+    刻む (RFC3339 で valid、timezone は同じく UTC)。
+
+    値としては不透明な識別子であり、時刻として演算される想定ではない。
+    """
+    return datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%fZ')
 
 
 # ---------------------------------------------------------------------------
@@ -844,6 +862,187 @@ def with_lock(callback):
 
 
 # ---------------------------------------------------------------------------
+# Assignment files — execution identity
+# ---------------------------------------------------------------------------
+#
+# queue/assignments/<agent> は「存在 = busy / 不在 = idle」という一行の事実を
+# dispatcher に伝えるファイルである。中身は <mission>:<task> の 1 行で、hooks も
+# 同じ 1 行を読んで TASK_ID を復元している。
+#
+# ただし <mission>:<task> は *実行* を指していない。crewvia は Worker 名を
+# ポジションとして使い回すため、同じ card を同じ名前が pull し直すと、後任の
+# assignment は先任のものとバイト単位で同一になる。「内容が一致したから消して
+# よい」という判定はそこで壊れ、稼働中の後任の assignment を消してしまう。
+# assignment を失った Worker は dispatcher から idle に見えるので、これは
+# 「動いている Worker を殺す」経路である。
+#
+# そこで assignment には世代を添えたサイドカー <agent>.identity を並べ、
+# 「この実行の assignment か」を内容ではなく実行アイデンティティで判定する。
+# サイドカーを別ファイルに分けているのは、本体の 1 行フォーマットを読む既存の
+# consumer (hooks/pre-tool-use.sh, hooks/post-tool-use.sh, dispatcher.sh) を
+# 壊さないため。いずれも assignments ディレクトリを列挙せず名前で引くだけなので、
+# 隣にファイルが増えても影響しない (<agent>.restarting という先例がある)。
+
+ASSIGNMENTS_DIR = os.path.join(QUEUE_DIR, 'assignments')
+IDENTITY_SUFFIX = '.identity'
+
+#: 「前提が外れたので 1 バイトも書かなかった」を表す終了コード。
+#: 0 (書いた) とも 1 (plan.sh 側の異常 → 呼び出し側はリトライすべき) とも
+#: 区別できるようにしてあるので、呼び出し側は保留に倒せる。
+PRECONDITION_UNMET = 3
+
+# classify_assignment() の判定結果。撤去してよいのは ASSIGN_MINE だけ。
+ASSIGN_MINE = 'mine'                  # この実行が公開した assignment
+ASSIGN_ABSENT = 'absent'              # そもそも公開されていない
+ASSIGN_OTHER_TASK = 'other_task'      # 別の task を指している
+ASSIGN_SUCCESSOR = 'successor'        # 同じ task の別の実行 (後任) のもの
+ASSIGN_UNVERIFIABLE = 'unverifiable'  # 世代を読めない (旧形式 / 破損)
+
+
+#: assignments ディレクトリで別の意味を持つ suffix。Worker 名として使わせない。
+RESERVED_AGENT_SUFFIXES = (IDENTITY_SUFFIX, '.restarting', '.tmp')
+
+
+def agent_name_problem(agent):
+    """Worker 名が assignment ファイル名として使えない理由。使えるなら None。
+
+    ここは撤去 (os.remove) の対象パスを組み立てる根拠でもあるので、ディレクトリ
+    を抜けられる名前を弾くのは公開側だけでなく撤去側の防御でもある。
+    """
+    if not agent or '/' in agent or '\0' in agent or agent in ('.', '..') \
+            or agent.startswith('.'):
+        return "'/' や先頭の '.' を含まない名前にしてください"
+    for suffix in RESERVED_AGENT_SUFFIXES:
+        if agent.endswith(suffix):
+            return f"'{suffix}' で終わる名前は queue/assignments/ で予約済みです"
+    return None
+
+
+def require_valid_agent_name(agent):
+    """不正な名前ならここで止める。**書き込みを 1 バイトも始める前に**呼ぶこと。
+
+    公開側 (pull) の検証をロックの中の save_task() より後に置くと、card だけが
+    in_progress になって assignment が無い状態で死ぬ — まさにこの PR が潰した
+    「割れたトランザクション」を自分で作ることになる。
+    """
+    problem = agent_name_problem(agent)
+    if problem:
+        die(f"invalid agent name {agent!r}: {problem}")
+
+
+def assignment_path(agent):
+    require_valid_agent_name(agent)
+    return os.path.join(ASSIGNMENTS_DIR, agent)
+
+
+def assignment_identity_path(agent):
+    return assignment_path(agent) + IDENTITY_SUFFIX
+
+
+def _read_assignment_identity(agent):
+    """サイドカーを読む。読めない・形が違うときは None (= 世代不明)。"""
+    try:
+        with open(assignment_identity_path(agent)) as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def publish_assignment(agent, mission, task_id, started_at):
+    """<agent> の assignment とその実行アイデンティティを公開する。
+
+    呼び出し側はキューロックを保持していること。サイドカーを先に書くのは、
+    「存在 = busy」を意味する本体が、世代の分からない状態で一瞬でも観測され
+    ないようにするため。逆順にすると、その隙間に来た後始末が世代を証明できず
+    判定不能になる。
+    """
+    os.makedirs(ASSIGNMENTS_DIR, exist_ok=True)
+    _atomic_write(assignment_identity_path(agent), json.dumps({
+        'mission': mission,
+        'task': task_id,
+        'worker': agent,
+        'started_at': started_at,
+    }, ensure_ascii=False, sort_keys=True) + '\n')
+    _atomic_write(assignment_path(agent), f"{mission}:{task_id}\n")
+
+
+def classify_assignment(agent, mission, task_id, generation):
+    """公開中の assignment が「この実行のもの」かを判定する唯一の場所。
+
+    generation:
+      - 文字列 …… 呼び出し側が特定の実行 (card の started_at) を名指ししている。
+        ロックを取る前に対象を決めた後始末は必ずこちらを使う。世代を証明でき
+        ない場合は ASSIGN_UNVERIFIABLE を返し、決して「一致した」に倒さない。
+      - None …… 呼び出し側は「いま card が示している実行」を対象にしている。
+        同じロックの中で card を読んでから呼ぶ経路 (done / fail / update
+        --reset) 専用。読みと書きの間に隙間が無く後任が割り込めないので、
+        世代を問う必要がそもそも無い。
+    """
+    if agent_name_problem(agent):
+        # 不正な名前の assignment は存在しえない。撤去側で die すると、card を
+        # 書いたあとに落ちて片側だけ進むので、ここは「消さない」に倒す。
+        return ASSIGN_UNVERIFIABLE
+    try:
+        with open(assignment_path(agent)) as f:
+            published = f.read().strip()
+    except FileNotFoundError:
+        return ASSIGN_ABSENT
+    except OSError:
+        return ASSIGN_UNVERIFIABLE
+
+    if published != f"{mission}:{task_id}":
+        return ASSIGN_OTHER_TASK
+    if generation is None:
+        return ASSIGN_MINE
+
+    identity = _read_assignment_identity(agent)
+    if not identity:
+        # 旧 plan.sh が書いた assignment には世代が無い。証拠が無いことを
+        # 「一致した」に倒すと、まさに守りたかった後任の assignment を消す。
+        return ASSIGN_UNVERIFIABLE
+    if identity.get('mission') != mission or identity.get('task') != task_id:
+        return ASSIGN_UNVERIFIABLE
+    recorded = identity.get('started_at')
+    if recorded is None or str(recorded) != str(generation):
+        return ASSIGN_SUCCESSOR
+    return ASSIGN_MINE
+
+
+def retire_assignment(agent, mission, task_id, generation):
+    """assignment を撤去する唯一の入口。キューロック保持が前提。
+
+    撤去するのは「この実行のもの」と確定したときだけ。返り値は
+    classify_assignment() の判定そのもので、呼び出し側はそれを見て続行するか
+    保留に倒すかを決める。
+    """
+    verdict = classify_assignment(agent, mission, task_id, generation)
+    if verdict != ASSIGN_MINE:
+        return verdict
+    for path in (assignment_path(agent), assignment_identity_path(agent)):
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            print(f"[plan.sh warn] failed to remove {path}: {e}", file=sys.stderr)
+    return ASSIGN_MINE
+
+
+def describe_assignment_verdict(agent, verdict):
+    """撤去を見送った理由を人間に説明する 1 行。"""
+    return {
+        ASSIGN_ABSENT: f"assignment/{agent} は存在しません",
+        ASSIGN_OTHER_TASK: f"assignment/{agent} は別の task を指しています",
+        ASSIGN_SUCCESSOR: f"assignment/{agent} は同じ task の別の実行 (後任) のものです",
+        ASSIGN_UNVERIFIABLE: (
+            f"assignment/{agent} の実行世代を確認できません"
+            f" (旧形式か破損 — 世代が読めない以上、後任のものでないと断定できません)"
+        ),
+    }.get(verdict, f"assignment/{agent}: {verdict}")
+
+
+# ---------------------------------------------------------------------------
 # Slug generation
 # ---------------------------------------------------------------------------
 
@@ -1319,6 +1518,9 @@ def cmd_pull(args):
         env_td = os.environ.get('TARGET_DIR', '').strip()
         effective_target = os.path.abspath(env_td) if env_td else None
 
+    if agent:
+        require_valid_agent_name(agent)
+
     chosen_holder = [None]
     diag = {'reason': None, 'detail': ''}
 
@@ -1480,8 +1682,15 @@ def cmd_pull(args):
         slug, meta, body = candidates[0]
         meta['status'] = 'in_progress'
         meta['worker'] = agent or None
-        meta['started_at'] = now_iso()
+        meta['started_at'] = now_generation()
         save_task(slug, meta['id'], meta, body)
+
+        # assignment の公開は card の書き換えと同じトランザクションで行う。
+        # ロックの外に出すと、(a) card が in_progress なのに assignment が
+        # 無い瞬間が生まれて dispatcher に idle と誤認され、(b) 後始末側の
+        # 「判定してから消す」と直列化できなくなる。
+        if agent:
+            publish_assignment(agent, slug, meta['id'], meta['started_at'])
 
         desc, _result = parse_task_body(body)
         chosen_holder[0] = {
@@ -1506,17 +1715,9 @@ def cmd_pull(args):
         )
         sys.exit(2)
 
-    # Write assignment file BEFORE Taskvia sync to prevent a dispatcher race:
-    # the dispatcher checks assignment_file existence to decide "is worker idle?"
-    # If we write it after a slow Taskvia sync, the dispatcher may see
-    # task.status=in_progress (no longer pending) + no assignment file → shutdown.
-    if agent:
-        assignments_dir = os.path.join(QUEUE_DIR, 'assignments')
-        os.makedirs(assignments_dir, exist_ok=True)
-        assignment_file = os.path.join(assignments_dir, agent)
-        with open(assignment_file, 'w') as _f:
-            _f.write(f"{chosen_holder[0]['mission']}:{chosen_holder[0]['id']}\n")
-
+    # assignment は _do() の中 (キューロック内) で公開済み。ここから先の
+    # Taskvia sync / worktree 作成は subprocess や HTTP を伴うので、ロックを
+    # 抱えたまま実行してはいけない。
     ok = taskvia_sync_pull(chosen_holder[0]['mission'], chosen_holder[0]['id'], agent)
     _print_sync_summary(ok)
 
@@ -1776,6 +1977,19 @@ def cmd_done(args):
         worker_holder[0] = meta.get('worker') or ''  # capture worker for post-lock bump
         sync_holder[0] = (slug, task_id, result)
 
+        # assignment の撤去は card の書き換えと同じトランザクションで行う。
+        # generation=None なのは、この経路が「いま card が示している実行」を
+        # 同じロックの中で終了させているため (読みと書きの間に隙間が無い)。
+        agent_name = os.environ.get('AGENT_NAME', '')
+        if agent_name:
+            verdict = retire_assignment(agent_name, slug, task_id, None)
+            if verdict not in (ASSIGN_MINE, ASSIGN_ABSENT):
+                print(
+                    f"[plan.sh warn] {describe_assignment_verdict(agent_name, verdict)}"
+                    f" — 削除しませんでした ({agent_name} は別の作業に就いている可能性があります)",
+                    file=sys.stderr,
+                )
+
         # Mission complete?
         tasks = list_tasks(slug)
         if all(m.get('status') in TERMINAL_STATUSES for (m, _) in tasks):
@@ -1788,12 +2002,9 @@ def cmd_done(args):
 
     with_lock(_do)
 
-    # Remove assignment file on done
+    # assignment の撤去は _do() の中 (キューロック内) で完了している。
+    # ここから先はキューの外側 — TARGET_DIR と Taskvia の後始末。
     agent_name = os.environ.get('AGENT_NAME', '')
-    if agent_name:
-        assignment_file = os.path.join(QUEUE_DIR, 'assignments', agent_name)
-        if os.path.exists(assignment_file):
-            os.remove(assignment_file)
 
     # Clean up crewvia-worker-{AGENT_NAME}.json from TARGET_DIR (Option D revert)
     # This file is created by start.sh at Worker startup to inject crewvia hooks without
@@ -1886,6 +2097,17 @@ def cmd_fail(args):
         save_task(slug, task_id, meta, new_body)
         print(f"Failed: {slug}/{task_id}")
 
+        # done と同じく、撤去は card の書き換えと同じトランザクションの中で。
+        agent_name = os.environ.get('AGENT_NAME', '')
+        if agent_name:
+            verdict = retire_assignment(agent_name, slug, task_id, None)
+            if verdict not in (ASSIGN_MINE, ASSIGN_ABSENT):
+                print(
+                    f"[plan.sh warn] {describe_assignment_verdict(agent_name, verdict)}"
+                    f" — 削除しませんでした ({agent_name} は別の作業に就いている可能性があります)",
+                    file=sys.stderr,
+                )
+
         # Rework learning loop: record in knowledge/director.md if rework limit was reached
         rework = meta.get('rework_count') or 0
         max_rework = meta.get('max_rework') or 3
@@ -1897,13 +2119,6 @@ def cmd_fail(args):
     # Post-lock: write rework pattern to knowledge/director.md
     if knowledge_info[0]:
         _append_knowledge_director(*knowledge_info[0])
-
-    # Remove assignment file (same as done)
-    agent_name = os.environ.get('AGENT_NAME', '')
-    if agent_name:
-        assignment_file = os.path.join(QUEUE_DIR, 'assignments', agent_name)
-        if os.path.exists(assignment_file):
-            os.remove(assignment_file)
 
 
 def cmd_status(args):
@@ -2955,34 +3170,179 @@ def cmd_update(args):
         save_task(slug, task_id, meta, body)
         print(f"Updated: {slug}/{task_id} — {', '.join(changed)}")
 
-    with_lock(_do)
-
-    # Remove assignment file for the reset worker to prevent Dispatcher Rule 5 false alarm.
-    # (The Dispatcher fires Rule 5 when: agent_status=idle AND assignment file exists.)
-    # Only delete if the file's content matches <slug>:<task_id> — guard against accidentally
-    # removing the assignment of a Worker who was already reused for a different task.
-    old_worker = reset_worker_holder[0]
-    reset_slug = reset_worker_holder[1]
-    if opts.get('--reset') and old_worker and reset_slug:
-        assignment_file = os.path.join(QUEUE_DIR, 'assignments', old_worker)
-        if os.path.exists(assignment_file):
-            try:
-                content = open(assignment_file).read().strip()
-                expected = f"{reset_slug}:{task_id}"
-                if content == expected:
-                    os.remove(assignment_file)
-                    print(f"[plan.sh] Removed stale assignment: {old_worker} → {content}")
-                else:
-                    print(
-                        f"[plan.sh warn] assignment/{old_worker} contains '{content}',"
-                        f" expected '{expected}' — not removed (worker may have a new task)",
-                        file=sys.stderr,
-                    )
-            except OSError as _e:
+        # Dispatcher Rule 5 の誤報を防ぐため、差し戻した Worker の assignment も
+        # 撤去する。以前はこれを with_lock() の *外* で行っていたため、ロックを
+        # 離してから削除するまでの間に同名 Worker が pending になった card を
+        # pull すると、後任の assignment が「内容が一致する」という理由だけで
+        # 消えていた (Codex P1)。card の書き換えと同じトランザクションに入れた
+        # ことで、その隙間そのものが無くなっている。
+        old_worker = reset_worker_holder[0]
+        reset_slug = reset_worker_holder[1]
+        if opts.get('--reset') and old_worker and reset_slug:
+            verdict = retire_assignment(old_worker, reset_slug, task_id, None)
+            if verdict == ASSIGN_MINE:
+                print(f"[plan.sh] Removed stale assignment: {old_worker} → {reset_slug}:{task_id}")
+            elif verdict != ASSIGN_ABSENT:
                 print(
-                    f"[plan.sh warn] failed to read/remove assignment/{old_worker}: {_e}",
+                    f"[plan.sh warn] {describe_assignment_verdict(old_worker, verdict)}"
+                    f" — 削除しませんでした ({old_worker} は別の作業に就いている可能性があります)",
                     file=sys.stderr,
                 )
+
+    with_lock(_do)
+
+
+# ---------------------------------------------------------------------------
+# cmd_retire — 実行アイデンティティで束縛した単一のガード付きトランザクション
+# ---------------------------------------------------------------------------
+
+#: retire が終了扱いにできない (= 既に終わっている) card の状態。
+RETIRE_FINISHED_STATUSES = TERMINAL_STATUSES | {'failed', CORRUPT_TASK_STATUS}
+
+
+def cmd_retire(args):
+    """plan.sh retire <task_id> --agent <name> --started-at <generation>
+                                [--mission <slug>] [--outcome reset|needs-director]
+                                [--reason "<1 行>"]
+
+    「この実行 (mission, task, worker, 世代) を終了扱いにして後始末する」を
+    1 つの操作として提供する。card の status 書き換えと assignment の撤去は
+    同じキューロックの中で行われ、どちらも起きるか、どちらも起きないかのどちらか。
+
+    なぜ個別のフィールド指定ではなく 1 本の API なのか
+    ----------------------------------------------------
+    呼び出し側 (watchdog の retirement 等) は、ロックを取る *前* に「この
+    Worker を終了させる」と決める。決定から着弾までの間に card は動きうる:
+    Worker が最後に plan.sh done を通していたかもしれないし、人間が差し戻して
+    同名の後任が pull し直したかもしれない。呼び出し側が status / worker /
+    世代を個別に渡す形だと、どれを渡すか・渡さないかの判断が呼び出し側ごとに
+    分かれ、1 つ緩めた場所から同じ型の事故が再発する。判定を 1 箇所に集約し、
+    緩める余地を API から無くしてある。
+
+    --started-at が必須なのはそのためである。status と worker は、人間が
+    差し戻して同名 Worker が pull し直すと元の値にそのまま戻る (crewvia は
+    名前をポジションとして使い回す)。世代 = `pull` が毎回書き換える
+    started_at を突き合わせて初めて「この実行」を名指しできる。
+
+    証拠が足りないときの倒し方
+    --------------------------
+    前提が 1 つでも外れた場合、また assignment の世代を証明できない場合は、
+    1 バイトも書かずに exit 3 (PRECONDITION_UNMET) で返る。前提を弱めて
+    実行する経路は用意しない — 呼び出し側は保留に倒し、Director に上げること。
+    """
+    opts, positional = parse_opts(args, {
+        '--mission': 'value',
+        '--agent': 'value',
+        '--started-at': 'value',
+        '--outcome': 'value',
+        '--reason': 'value',
+    })
+
+    if not positional:
+        die("retire requires a task_id (e.g. t005)")
+    task_id = positional[0]
+    if not re.fullmatch(r't\d+', task_id):
+        die(f"invalid task_id '{task_id}': expected format tNNN (e.g. t001, t012)")
+
+    agent = (opts.get('--agent') or '').strip()
+    if not agent:
+        die("retire requires --agent <name> (終了させる実行の Worker 名)")
+    require_valid_agent_name(agent)
+
+    # 世代は省略不可。省略を許すと「名前だけで束縛された後始末」に戻ってしまう。
+    raw_generation = opts.get('--started-at')
+    if raw_generation is None or not raw_generation.strip():
+        die(
+            "retire requires --started-at <generation>\n"
+            "  card の started_at (plan.sh pull が毎回書き換える実行世代) を渡してください。\n"
+            "  世代を読めなかった場合は retire を呼ばず、Director に上げること —\n"
+            "  名前だけで束縛された後始末は、同名の後任の実行を巻き込みます。"
+        )
+    generation = raw_generation.strip()
+    if generation.lower() in ('null', 'none'):
+        die(
+            "--started-at null は実行を指していません "
+            "(started_at が null の card には終了させるべき実行がありません)"
+        )
+
+    outcome = (opts.get('--outcome') or 'reset').strip()
+    if outcome not in ('reset', 'needs-director'):
+        die(f"invalid --outcome '{outcome}'. Use reset|needs-director.")
+
+    reason = opts.get('--reason')
+    if outcome == 'needs-director' and not (reason or '').strip():
+        die("--outcome needs-director requires --reason \"<1 行の理由>\"")
+
+    def _do():
+        state = load_state()
+        slug = opts.get('--mission')
+        if not slug:
+            matches = [s for s in (state.get('active_missions') or [])
+                       if os.path.exists(task_path(s, task_id))]
+            if not matches:
+                die(f"task '{task_id}' not found in any active mission.")
+            if len(matches) > 1:
+                die(f"task '{task_id}' exists in multiple missions: {matches}. Use --mission.")
+            slug = matches[0]
+        if not os.path.exists(task_path(slug, task_id)):
+            die(f"task '{task_id}' not found in mission '{slug}'.")
+
+        meta, body = load_task(slug, task_id)
+
+        # ── 前提の確認。ここから下で 1 バイトでも書く前に、全部通す。 ──────
+        prefix = f"[plan.sh retire] 前提が外れています ({slug}/{task_id}): "
+        suffix = " — 何も変更していません"
+
+        cur_status = meta.get('status')
+        if cur_status in RETIRE_FINISHED_STATUSES:
+            die(f"{prefix}status が既に '{cur_status}' です"
+                f" (終了させるべき実行が残っていません){suffix}", PRECONDITION_UNMET)
+
+        cur_worker = meta.get('worker')
+        if cur_worker != agent:
+            die(f"{prefix}worker は {cur_worker!r} で、{agent!r} ではありません{suffix}",
+                PRECONDITION_UNMET)
+
+        cur_generation = meta.get('started_at')
+        if cur_generation is not None:
+            cur_generation = str(cur_generation).strip()
+        if cur_generation != generation:
+            die(f"{prefix}started_at は {cur_generation!r} で、指定された "
+                f"{generation!r} と異なります (同じ task の別の実行です){suffix}",
+                PRECONDITION_UNMET)
+
+        # assignment は「この実行のもの」と確定したときだけ撤去する。存在しない
+        # 場合 (既に片付いた card の取り残し) は撤去すべきものが無いだけなので
+        # 続行してよいが、それ以外 — 特に世代を証明できない場合 — は保留に倒す。
+        verdict = classify_assignment(agent, slug, task_id, generation)
+        if verdict not in (ASSIGN_MINE, ASSIGN_ABSENT):
+            die(f"{prefix}{describe_assignment_verdict(agent, verdict)}{suffix}",
+                PRECONDITION_UNMET)
+
+        # ── ここから書き込み。前提は全部通っている。 ──────────────────────
+        if outcome == 'reset':
+            meta['status'] = 'pending'
+            meta['worker'] = None
+            meta['started_at'] = None
+            meta['completed_at'] = None
+            applied = 'status=pending, worker=null, started_at=null, completed_at=null'
+        else:
+            summary, full_text = split_long_freeform(reason)
+            meta['status'] = 'needs_director'
+            meta['needs_director_reason'] = summary
+            if full_text is not None:
+                body = body.rstrip() + '\n\n## Needs-Director 詳細\n' + full_text.strip() + '\n'
+            applied = f'status=needs_director, needs_director_reason={summary}'
+
+        save_task(slug, task_id, meta, body)
+        retire_assignment(agent, slug, task_id, generation)
+
+        print(f"Retired: {slug}/{task_id} — {agent} @ {generation}")
+        print(f"[plan.sh] {applied}")
+        if verdict == ASSIGN_ABSENT:
+            print(f"[plan.sh] assignment/{agent} は既にありませんでした")
+
+    with_lock(_do)
 
 
 # ---------------------------------------------------------------------------
@@ -2997,6 +3357,7 @@ dispatch = {
     'needs-director': cmd_needs_director,
     'fail': cmd_fail,
     'update': cmd_update,
+    'retire': cmd_retire,
     'ready-for-verification': cmd_ready_for_verification,
     'verify-result': cmd_verify_result,
     'review': cmd_review,

@@ -498,6 +498,99 @@ E1 の穴が「dispatcher の生存」に依存しなくなった。D4 は R5 �
 `_is_mass_kill()` と同じ考え方で、backend が答えられない cycle は
 1 件も処理しない (`test_mux_unavailable_processes_nothing`)。
 
+> **このゲートだけでは閉じなかった (t019 で判明)。** `available()` は tmux
+> では `shutil.which("tmux")` しか見ないので、サーバーが死んでいても True。
+> herdr では ping するが `pane_list` とは別呼び出しで、ping が通ったまま
+> `pane_list` だけが 10s タイムアウトし得る。詳細は §6-3。
+
+---
+
+## 6-3. QA FAIL-1 / Codex P1 の修正 (t019, 2026-09-21)
+
+t003 (QA) の FAIL-1 と t012 (Codex) の P1 3 件は、**別々の症状だが根は 1 つ**
+だった: *Worker がまだ生きている / task がもう別の状態になっているのに、
+後始末が無条件に走る*。後始末 (`plan.sh update --status pending --reset`) は
+「task を他人に配り直してよい」という宣言なので、根拠が揃う前に到達しては
+いけない。3 件はその根拠が抜けていた 3 箇所である。
+
+### (1) 空の window list を死亡証明に使わない
+
+`_start()` だけが `mux.list()` の結果 (`_window_alive()`) で終端へ飛び、
+後続ステップが使っている `pane_pid` の `/proc` 確認 ((3) の解法) を通って
+いなかった。`list()` は**両 backend とも失敗・タイムアウトを黙って `[]` に
+潰す**ので、WSL のメモリ逼迫で 1 回詰まれば本番でも成立する。QA の実機ログ
+では同一 run の 3 秒差で、`_is_mass_kill()` が同じ `mux.list()=[]` を理由に
+cleanup を拒否している横で、新経路がその `[]` を鵜呑みにしていた。
+
+判定を `_exit_evidence()` に一本化した。証拠の強い順に:
+
+1. 記録済み `pane_pid` が `/proc` に居ない → **消滅確定**
+2. `pane_pid` が生きている → **生存確定** (backend の答えは要らない)
+3. `pane_pid` が未記録のときだけ window list に投票権がある。ただし
+   *裏の取れた* list に限る (`_listing_is_authoritative()`):
+   - 空でない list → 問い合わせが成功した証拠
+   - 空 + backend 自体が落ちている (`server_running()` が False) → 全滅の証拠
+   - 空 + backend は生きている → **outage と全滅が区別できない。保留**
+
+「空 + backend 生存」を無条件に保留に倒すと、最後の Worker が死んだ瞬間に
+marker が永久に残り、このモジュールが潰そうとしている幽霊 task が再発する。
+`server_running()` の例外がそれを塞いでいる (memory:
+`fail-closed-guard-can-recreate-the-defect` — 曖昧さの原因を分けて独立の
+証拠を取る)。保留中も dispatcher の D4 検知 (R5) は同じ task を独立に
+見つけるので、沈黙にはならない。
+
+### (2) 後始末を「元の割り当てがまだ有効か」に条件付けた
+
+`_settle_terminated()` は無条件に `--reset` を撃っていた。猶予期間 + 後始末
+リトライの間に task は動く — Worker が最後の `plan.sh done` を済ませて
+抜けた、人間が reset して後任が pull した。どちらでも「完了済みの成果を
+pending に戻す」「後任の assignment を消す」が起きる。plan.sh 既存の
+assignment 内容一致チェックは *別 task の* assignment しか守らず、
+*同じ task の別の実行* は素通りする。
+
+`plan.sh update` に前提条件フラグを足した:
+
+```
+plan.sh update <id> --status pending --reset --mission <slug> \
+    --expect-status in_progress --expect-worker <agent>
+```
+
+判定は **queue ロックの内側**、最初の書き換えの直前で行う (読んで決めて
+書く、の間に他の writer が入れない)。前提が外れたら 1 バイトも書かずに
+**exit 3** — 実エラーの exit 1 と区別できるので、呼び出し側は「世の中が
+変わった」と「plan.sh が壊れた」を取り違えない。リトライのたびに再評価
+される。`--expect-status` の typo は exit 1 (黙って永久 no-op にしない)。
+
+`expect-status` を `in_progress` だけに絞ったのは意図的:
+`needs_director` などは Director が握っている状態で、retirement が横から
+戻してよい対象ではない。外れた場合は Director に「queue は変更していない」
+と報告して settle する (assignment ファイルはそのまま残るが、dispatcher の
+D4 が独立に見つける)。
+
+### (3) SIGKILL の「送信成功」を「死亡」と読まない
+
+`_step_sigterm()` は `kill_process()` の戻り値を捨てて即 `PHASE_TERMINATED`
+を永続化していた。`os.kill` が失敗しても次 cycle で task が pending に戻り
+marker も消えるが、Worker は生きたまま。送信が成功しても即死は意味しない。
+
+`_await_exit()` で死を確認してから終端に進む。確認は
+`KILL_CONFIRM_WINDOW` (1.0s) で頭打ちにしてあり、R2 (cycle は詰まらない)
+を壊さない — 確認できなければ `sigterm_sent` のまま次 cycle で撃ち直す。
+`SIGKILL_REPORT_AFTER` (3 回) を超えても死なない場合は Director に 1 度
+だけ報告する。**黙って再試行し続けると「殺さない側に倒した」が「誰も
+気付かない居座り」になる** ので、保留は必ず声に出す。
+
+### 回帰テストの形
+
+3 件とも「ガードが誤発火したとき何が失われるか」を assert する
+(`tests/test_retirement.py` の t019 節 / `tests/plan-update-expect.bats`)。
+phase 名やフラグではなく、生きた Worker の task が `in_progress` のまま
+であること、完了済みの成果が pending に巻き戻らないこと、後任の
+assignment が残っていることを見る。逆向き (保留に倒しすぎて永久に
+終わらない) も
+`test_window_gone_is_concluded_when_the_backend_itself_is_down` と
+`test_red_sigkill_waits_for_the_process_to_actually_exit` の後半で押さえた。
+
 ---
 
 ## 7. 参照

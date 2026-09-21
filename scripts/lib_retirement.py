@@ -95,6 +95,24 @@ _PROGRESS_SUFFIX = ".progress.json"
 #: rather than for exact equality.
 _CREATED_AT_TOLERANCE = 1.5
 
+#: Seconds a SIGKILL step spends confirming that the process actually went
+#: away.  Signal delivery is not death: `os.kill` returns as soon as the
+#: signal is queued, and the terminal phase authorises a queue reset, so it
+#: must not be reached on the strength of a syscall that merely succeeded.
+#: Bounded on purpose (R2) — an unconfirmed kill simply stays in flight and is
+#: re-checked next cycle rather than blocking the daemon.
+KILL_CONFIRM_WINDOW = 1.0
+
+#: SIGKILL attempts to make before telling the Director the Worker will not
+#: die.  Retrying is right (a transient EPERM or a process in uninterruptible
+#: sleep may clear), but retrying *silently* forever would turn "we refused to
+#: assume a death" into a Worker squatting with nobody aware of it.
+SIGKILL_REPORT_AFTER = 3
+
+#: `plan.sh update` exit status for "the precondition did not hold".  Distinct
+#: from 1 (plan.sh is broken → retry) so cleanup can tell the two apart.
+PLAN_PRECONDITION_UNMET = 3
+
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -353,6 +371,8 @@ def build_progress(previous: Optional[dict], phase: str, **fields) -> dict:
         ("cleanup_error", None),
         ("cleanup_attempts", 0),
         ("director_notified", False),
+        ("sigkill_attempts", 0),
+        ("sigkill_report_sent", False),
     ):
         doc.setdefault(key, default)
     return doc
@@ -424,7 +444,9 @@ class RetirementExecutor:
         self.kill_process = kill_process or _default_kill_process
         self.now = now or time.time
         self._live_windows: set = set()
+        self._listing_authoritative = False
         self._unavailable_logged_at = 0.0
+        self._waiting_logged_at: dict = {}
 
     # ------------------------------------------------------------------
     # Requesting (called by dispatcher via CLI, and by watchdog for W2)
@@ -538,6 +560,7 @@ class RetirementExecutor:
             return []
 
         self._live_windows = set(self.mux.list())
+        self._listing_authoritative = self._listing_is_authoritative()
         actions = []
         for agent in agents:
             try:
@@ -584,23 +607,87 @@ class RetirementExecutor:
     def _window_alive(self, target: str) -> bool:
         return target in self._live_windows
 
-    def _instance_gone(self, req: dict, prog: Optional[dict], target: str) -> bool:
-        """Has the Worker we were retiring finished exiting?
+    def _listing_is_authoritative(self) -> bool:
+        """May "absent from this cycle's window list" be read as "it is gone"?
 
-        Checked *before* the identity guard on purpose.  The recorded pane_pid
-        is decisive on its own: if that pid is no longer a live process, this
-        instance is over, and the retirement should move to its terminal phase
-        so the queue gets repaired.  Asking the identity guard first would
-        instead read the very same situation — a pid we recorded, unreadable
-        now — as "somebody else owns this window", discard the marker, and
-        leave the task stranded in_progress.
+        A non-empty list proves the query worked.  An empty one proves
+        nothing: **both backends turn a failed or timed-out query into `[]`**
+        (`lib_mux.py` TmuxBackend.list returns [] on `returncode != 0` or on
+        its 5s timeout; HerdrBackend.list returns [] when the workspace lookup
+        or the 10s `pane_list` fails).  The `available()` gate in
+        `process_all()` does not catch that — tmux's only checks that the
+        binary is in PATH — which is exactly how a live Worker's task came to
+        be reset in QA (t003 FAIL-1) while watchdog's own `_is_mass_kill()`
+        was refusing to act on the very same empty list three seconds earlier.
+
+        The one reading that rescues an empty list is a backend that is itself
+        down: then there are no windows to list, so emptiness is the truth
+        rather than an outage.  Without that exception the death of the last
+        Worker would leave a marker nothing could ever settle — the ghost task
+        this module exists to remove.
+
+        A backend that cannot answer "are you up?" is treated as up, i.e. the
+        list stays unauthoritative: the cost is waiting a cycle, the cost of
+        the other direction is resetting a live Worker's task.
+        """
+        if self._live_windows:
+            return True
+        server_running = getattr(self.mux, "server_running", None)
+        if server_running is None:
+            return False
+        try:
+            return not server_running()
+        except Exception:  # noqa: BLE001 — an unanswerable probe is not proof
+            return False
+
+    def _exit_evidence(self, req: Optional[dict], prog: Optional[dict],
+                       target: str) -> Tuple[bool, str]:
+        """(gone, why) — and `gone` is True only when the exit is *proven*.
+
+        The recorded pane_pid is decisive on its own, and is asked first: if
+        that pid is no longer a live process the instance is over, and the
+        retirement should move to its terminal phase so the queue gets
+        repaired.  Asking the identity guard first would instead read the very
+        same situation — a pid we recorded, unreadable now — as "somebody else
+        owns this window", discard the marker, and strand the task in_progress.
+
+        Only when no pid was ever recorded does the window list get a vote,
+        and then only a list we have reason to trust (see
+        `_listing_is_authoritative()`).  "The backend did not mention it" is
+        not a death certificate.
         """
         recorded = (prog or {}).get("pane_pid")
         if recorded is None:
-            recorded = (req.get("spawn_identity") or {}).get("pane_pid")
+            recorded = ((req or {}).get("spawn_identity") or {}).get("pane_pid")
         if recorded is not None:
-            return not process_alive(recorded)
-        return not self._window_alive(target)
+            if process_alive(recorded):
+                return False, f"recorded pane_pid {recorded} is still running"
+            return True, f"recorded pane_pid {recorded} is gone"
+        if self._window_alive(target):
+            return False, f"window {target!r} is still listed"
+        if self._listing_authoritative:
+            return True, f"window {target!r} absent from a corroborated window list"
+        return False, (
+            "no pane_pid was recorded and the window list is empty without "
+            "corroboration — an outage and an exit look identical"
+        )
+
+    def _instance_gone(self, req: dict, prog: Optional[dict], target: str) -> bool:
+        """Has the Worker we were retiring finished exiting?  Proof only."""
+        gone, _why = self._exit_evidence(req, prog, target)
+        return gone
+
+    def _log_waiting(self, agent: str, message: str) -> None:
+        """Log a "cannot tell yet" once every 5 minutes per agent.
+
+        These repeat every cycle for as long as the backend stays confused, and
+        a line per 30s cycle would bury the events that matter.
+        """
+        now = self.now()
+        if now - self._waiting_logged_at.get(agent, 0.0) < 300:
+            return
+        self._waiting_logged_at[agent] = now
+        self.log(message)
 
     def _write_progress(self, agent: str, previous: Optional[dict], phase: str, **fields) -> bool:
         doc = build_progress(previous, phase, **fields)
@@ -644,15 +731,44 @@ class RetirementExecutor:
     def _start(self, agent: str, req: dict) -> Optional[str]:
         target = req.get("window_target") or f"{agent}-worker"
 
+        # Did it end before we did anything?  Only asked while the window is
+        # *not* listed.  A listed window is answered by the identity guard
+        # below instead, even when the recorded pid is dead — that combination
+        # means a same-named successor has taken the window over, and treating
+        # it as "our Worker exited, clean up its task" would reset the task the
+        # successor is working on (§5-2, the worst failure mode this module
+        # has).  The later steps read a dead recorded pid the opposite way on
+        # purpose: by then they have signalled that pid themselves, so its
+        # death is their doing and the cleanup is theirs to finish (§6-2 (3)).
         if not self._window_alive(target):
-            # Already gone before we did anything.  Nothing was killed here;
-            # the queue-side cleanup is still owed, so go to the terminal
-            # phase rather than dropping the marker.
-            self.log(f"[retire] {agent}: window {target!r} already gone before first step")
-            self._write_progress(agent, None, PHASE_TERMINATED, window_gone=True,
-                                 mission=req.get("mission"), task_id=req.get("task_id"),
-                                 reason=req.get("reason"))
-            return "terminated"
+            # The terminal phase authorises `plan.sh update --reset`, i.e.
+            # "this task may be handed to somebody else".  Reaching it because
+            # `mux.list()` hiccuped is how QA (t003 FAIL-1) saw a live
+            # Worker's task reset while it kept working, so require proof.
+            gone, evidence = self._exit_evidence(req, None, target)
+            if gone:
+                # Nothing was killed here; the queue-side cleanup is still
+                # owed, so go to the terminal phase rather than dropping the
+                # marker.
+                self.log(f"[retire] {agent}: window {target!r} already gone before "
+                         f"first step ({evidence})")
+                self._write_progress(agent, None, PHASE_TERMINATED, window_gone=True,
+                                     mission=req.get("mission"),
+                                     task_id=req.get("task_id"),
+                                     reason=req.get("reason"))
+                return "terminated"
+
+            # Missing from the list, but not proven gone.  Nothing can be sent
+            # to a window we cannot see, and nothing may be cleaned up on a
+            # death we cannot show, so let the marker stand and look again
+            # next cycle.  This resolves on its own the moment the backend
+            # answers properly — and while it does not, dispatcher's
+            # independent D4 detection (R5) still reports the task.
+            self._log_waiting(
+                agent,
+                f"[retire] {agent}: window {target!r} not listed but {evidence} — "
+                f"waiting instead of assuming a death (nothing killed, nothing reset)")
+            return "skipped"
 
         # Pre-flight (plan review, fail closed): a retirement that owes a
         # queue-side cleanup must not begin unless the tool that performs it
@@ -732,8 +848,15 @@ class RetirementExecutor:
                                     deadline=self.now() + self.kill_delay,
                                     pane_pid=int(pane_pid)):
             return "blocked"
-        self.kill_process(int(pane_pid), signal.SIGTERM)
-        self.log(f"[retire] {agent}: SIGTERM → pid {pane_pid}")
+        if self.kill_process(int(pane_pid), signal.SIGTERM):
+            self.log(f"[retire] {agent}: SIGTERM → pid {pane_pid}")
+        else:
+            # Not fatal to the machine — the SIGKILL step re-signals after
+            # kill_delay and, unlike here, refuses to conclude anything from a
+            # signal it could not deliver.  Said out loud because a SIGTERM
+            # that cannot be delivered usually means the pid is not ours.
+            self.log(f"[retire] {agent}: WARNING SIGTERM to pid {pane_pid} was not "
+                     f"delivered — escalating in {self.kill_delay}s")
         return "sigterm_sent"
 
     def _step_sigterm(self, agent: str, req: Optional[dict], prog: dict) -> Optional[str]:
@@ -762,15 +885,64 @@ class RetirementExecutor:
         if pane_pid is None:
             self.log(f"[retire] {agent}: no pane pid for SIGKILL — waiting")
             return "skipped"
-        self.kill_process(int(pane_pid), signal.SIGKILL)
-        self.log(f"[retire] {agent}: SIGKILL → pid {pane_pid}")
-        # Written after the signal deliberately: the intent to SIGKILL was
-        # already durable as "sigterm_sent with an expired deadline" (R1), and
-        # a crash between the two leaves that same state, which this cycle
-        # re-derives.  Writing "terminated" first would instead risk a marker
-        # that claims a Worker is dead while it is still running.
-        self._write_progress(agent, prog, PHASE_TERMINATED, pane_pid=int(pane_pid))
-        return "terminated"
+
+        pid = int(pane_pid)
+        attempts = int(prog.get("sigkill_attempts") or 0) + 1
+        delivered = self.kill_process(pid, signal.SIGKILL)
+        if delivered:
+            self.log(f"[retire] {agent}: SIGKILL → pid {pid}")
+        else:
+            self.log(f"[retire] {agent}: WARNING SIGKILL to pid {pid} was not delivered "
+                     f"(attempt {attempts})")
+
+        # A delivered signal is not a death.  `os.kill` returns once the
+        # signal is queued, and the phase we are about to write is the one
+        # that authorises `plan.sh update --reset` — so it has to be behind
+        # proof that the process is actually gone, not behind a syscall that
+        # merely succeeded.  Confirmation is bounded (R2): what cannot be
+        # shown this cycle is re-checked next cycle, with the marker still in
+        # flight, rather than blocking the daemon.
+        if self._await_exit(pid, KILL_CONFIRM_WINDOW if delivered else 0.0):
+            # Written after the signal deliberately: the intent to SIGKILL was
+            # already durable as "sigterm_sent with an expired deadline" (R1),
+            # and a crash between the two leaves that same state, which this
+            # cycle re-derives.
+            self._write_progress(agent, prog, PHASE_TERMINATED, pane_pid=pid,
+                                 sigkill_attempts=attempts)
+            return "terminated"
+
+        reported = bool(prog.get("sigkill_report_sent"))
+        if attempts >= SIGKILL_REPORT_AFTER and not reported:
+            reported = self._report(
+                agent, prog,
+                f"watchdog が Worker {agent} に SIGKILL を {attempts} 回送りましたが、"
+                f"pid {pid} が終了しません。Worker は動き続けている可能性があるため、"
+                f"task の後始末は保留しています (誤って別の Worker に配り直さないため)。"
+                f"手で `kill -9 {pid}` を試すか、pane の状態を確認してください。",
+            )
+        self._write_progress(agent, prog, PHASE_SIGTERM_SENT,
+                             deadline=self.now() + self.kill_delay,
+                             pane_pid=pid, sigkill_attempts=attempts,
+                             sigkill_report_sent=reported)
+        return "sigkill_unconfirmed"
+
+    def _await_exit(self, pid: int, window: float) -> bool:
+        """True once `pid` is gone; polls for at most `window` seconds.
+
+        Real time on purpose — `self.now` is the injectable clock the phase
+        deadlines run on, and this is not a deadline but the physical gap
+        between SIGKILL and the kernel finishing with the process, which a
+        fake clock cannot shorten.  The window is small and only ever paid on
+        a cycle that just killed something.
+        """
+        if not process_alive(pid):
+            return True
+        deadline = time.monotonic() + max(0.0, window)
+        while time.monotonic() < deadline:
+            time.sleep(0.05)
+            if not process_alive(pid):
+                return True
+        return not process_alive(pid)
 
     def _orphaned(self, agent: str, prog: dict) -> str:
         """Progress with no request: the request was deleted mid-flight.
@@ -818,29 +990,55 @@ class RetirementExecutor:
             if not self._plan_sh_usable():
                 return self._cleanup_failed(
                     agent, prog, f"plan.sh not usable at {self.plan_sh}", mission, task_id)
+            # Guarded, not unconditional.  A retirement takes a grace period
+            # plus however long the cleanup is retried, and the task can move
+            # underneath it: the Worker may have finished its last `plan.sh
+            # done` before exiting, or a human may have reset the task and a
+            # successor pulled it.  An unconditional `--reset` reopens
+            # finished work and clears the successor's assignment — plan.sh's
+            # own content check only rejects an assignment for a *different*
+            # task, never a different *execution* of this one.  The
+            # preconditions are evaluated inside plan.sh's queue lock, so the
+            # decision and the write cannot be split by another writer, and
+            # they are re-evaluated on every retry.
             argv = ["bash", str(self.plan_sh), "update", task_id,
-                    "--status", "pending", "--reset", "--mission", mission]
+                    "--status", "pending", "--reset", "--mission", mission,
+                    "--expect-status", "in_progress", "--expect-worker", agent]
             env = dict(os.environ)
             if self.queue_dir:
                 env["CREWVIA_QUEUE"] = str(self.queue_dir)
             env["CREWVIA_REPO_ROOT"] = str(self.repo_root)
             rc, output = self.run_command(argv, env)
-            if rc != 0:
+            if rc == PLAN_PRECONDITION_UNMET:
+                # Nothing is owed and nothing is broken: the task is no longer
+                # the one this retirement was about.  Settle quietly rather
+                # than retrying — a retry can only re-confirm the same answer.
+                detail = output.strip()[:300] or "task no longer matches the retirement"
+                self.log(f"[retire] {agent}: no queue cleanup owed for {mission}/{task_id} "
+                         f"— {detail}")
+                self._report(
+                    agent, prog,
+                    f"watchdog が Worker {agent} を終了しましたが、task {task_id} "
+                    f"(mission={mission}) は既に別の状態になっていたため queue は"
+                    f"変更していません ({detail})。確認だけお願いします。",
+                )
+            elif rc != 0:
                 return self._cleanup_failed(
                     agent, prog, f"plan.sh update exited {rc}: {output.strip()[:400]}",
                     mission, task_id)
-            self.log(
-                f"[retire] {agent}: cleaned up {mission}/{task_id} "
-                f"(status→pending, assignment removed)"
-            )
-            reason = (req or {}).get("reason") or prog.get("reason") or "unknown"
-            self._report(
-                agent, prog,
-                f"watchdog が Worker {agent} を終了しました "
-                f"(理由: {reason})。"
-                f"task {task_id} (mission={mission}) は pending に戻し、"
-                f"assignment も削除済みです。復旧作業は不要です。",
-            )
+            else:
+                self.log(
+                    f"[retire] {agent}: cleaned up {mission}/{task_id} "
+                    f"(status→pending, assignment removed)"
+                )
+                reason = (req or {}).get("reason") or prog.get("reason") or "unknown"
+                self._report(
+                    agent, prog,
+                    f"watchdog が Worker {agent} を終了しました "
+                    f"(理由: {reason})。"
+                    f"task {task_id} (mission={mission}) は pending に戻し、"
+                    f"assignment も削除済みです。復旧作業は不要です。",
+                )
         else:
             self.log(f"[retire] {agent}: retired, no task to clean up")
 

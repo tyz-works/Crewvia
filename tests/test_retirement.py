@@ -65,6 +65,21 @@ t018 backlog の小修正:
   test_verdict_logger_forget_drops_state
   test_verdict_logger_logs_reason_change_within_same_verdict
 
+t019 — 後始末の誤発火 (QA FAIL-1 / Codex P1 3 件。いずれも「Worker がまだ
+生きている / task がもう別の状態なのに後始末が無条件に走る」が根):
+  test_red_transient_list_failure_does_not_reset_a_live_worker
+  test_red_cleanup_does_not_reopen_work_finished_during_the_grace_period
+  test_red_cleanup_does_not_clear_a_successor_assignment
+  test_red_failed_sigkill_does_not_declare_the_worker_terminated
+  test_red_sigkill_waits_for_the_process_to_actually_exit
+  test_repeated_sigkill_failure_is_reported_once
+  test_empty_listing_with_a_live_backend_does_not_authorise_cleanup
+  test_dead_recorded_pid_with_a_live_window_is_a_successor_not_a_death
+  test_window_gone_is_concluded_when_the_backend_itself_is_down
+    ↑ 最後の 2 本は逆向きの担保: 安全側に倒しすぎて永久に終わらない経路を
+      作っていないこと / 後任を巻き込まないこと。
+  (plan.sh 側の前提条件は tests/plan-update-expect.bats)
+
 実行方法:
   python3 -m pytest tests/test_retirement.py -v
 """
@@ -72,6 +87,7 @@ t018 backlog の小修正:
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -889,6 +905,363 @@ def test_retirement_without_task_needs_no_cleanup(sandbox):
     assert not _pid_alive(pane_pid)
     assert not ex.has_marker(AGENT)
     assert sandbox.notes == [], f"不要な Director 通知: {sandbox.notes}"
+
+
+# ---------------------------------------------------------------------------
+# t019 — 「後始末が誤発火したとき何が失われるか」
+#
+# QA FAIL-1 と Codex P1 3 件は同じ根を持つ: **Worker がまだ生きている /
+# task がもう別の状態になっているのに、後始末が無条件に走る**。
+# だからここで assert するのはフラグや phase 名ではなく、誤発火したときに
+# 実際に失われるもの — 生きた Worker の task が in_progress のままであること、
+# 完了済みの成果が pending に巻き戻らないこと、後任の assignment が残ること。
+# (memory: fail-closed-guard-can-recreate-the-defect / recurring-defect-patterns)
+# ---------------------------------------------------------------------------
+
+
+class FlappingMux(FakeMux):
+    """`available()` は True、`list()` だけが空を返す backend。
+
+    tmux の `list()` は `returncode != 0` も例外も `[]` に潰し、herdr は
+    `pane_list` の 10s タイムアウトを `[]` に潰す (`scripts/lib_mux.py`)。
+    一方 outage ゲートの `available()` は tmux では binary が PATH にあるかしか
+    見ない。つまり「available=True かつ list=[] かつ Worker は生きている」は
+    本番で成立し得る組み合わせで、WSL のメモリ逼迫で 1 回タイムアウトすれば足りる。
+    """
+
+    def list(self, suffix=None):
+        return []
+
+    def server_running(self):
+        return True
+
+
+class NoPidMux(FakeMux):
+    """pane_pid を答えられない backend (identity は mux cache の created_at のみ)。
+
+    `pid()` が None を返すのは herdr の `pane_process_info` が失敗したときの
+    実挙動。このとき retirement は「記録した pid を /proc で見る」という
+    一番強い証拠を持てないので、窓の一覧だけが頼りになる。
+    """
+
+    def __init__(self, windows=None, available=True, server_up=True, listed=()):
+        super().__init__(windows, available)
+        self.server_up = server_up
+        self.listed = list(listed)
+
+    def pid(self, name):
+        return None
+
+    def list(self, suffix=None):
+        return list(self.listed)
+
+    def server_running(self):
+        return self.server_up
+
+
+def _set_task_field(sandbox, key: str, value: str) -> None:
+    """frontmatter の 1 行を書き換える (plan.sh を通さない外部変更の模擬)。"""
+    lines = sandbox.task_file.read_text().splitlines()
+    for i, line in enumerate(lines):
+        if line.startswith(f"{key}:"):
+            lines[i] = f"{key}: {value}"
+            break
+    else:
+        raise AssertionError(f"frontmatter に {key}: が無い")
+    sandbox.task_file.write_text("\n".join(lines) + "\n")
+
+
+def _wait_gone(pid: int, timeout: float = 5.0) -> None:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not _pid_alive(pid):
+            return
+        time.sleep(0.02)
+    raise AssertionError(f"pid {pid} が終了しない")
+
+
+def _phase(sandbox) -> str:
+    import lib_retirement
+    prog = lib_retirement.read_json(
+        lib_retirement.progress_path(sandbox.registry, AGENT))
+    return (prog or {}).get("phase", "<no progress>")
+
+
+def test_red_transient_list_failure_does_not_reset_a_live_worker(sandbox):
+    """window list が一度空を返しただけで、生きた Worker の task を pending に戻さない。
+
+    RED (QA FAIL-1 / Codex P1-3): `_start()` は `self._window_alive(target)` —
+    すなわち `mux.list()` の結果 — だけで `PHASE_TERMINATED(window_gone=True)`
+    を書き、次 cycle の `_settle_terminated()` が `plan.sh update --reset` を
+    実行する。Worker は生きたまま作業を続けるので、pending に戻った同じ task を
+    別の Worker が pull できてしまう (二重作業)。
+    """
+    import lib_retirement
+
+    pane_pid = sandbox.spawn_worker_process()
+    sandbox.record_identity(WINDOW, pane_pid)
+    mux = FlappingMux({WINDOW: pane_pid})
+    # 猶予期間は潰さない: エスカレーション自体は正当なので、ここで見たいのは
+    # 「最初の 1 手で終端へ飛ぶか」だけ。
+    ex = make_executor(sandbox, mux, grace_period=3600, kill_delay=3600)
+    assert ex.request(AGENT, WINDOW, "timeout", mission=SLUG, task_id=TASK_ID)
+
+    for _ in range(2):
+        ex.process_all()
+
+    assert _pid_alive(pane_pid), "生きている Worker を死んだことにした"
+    assert sandbox.task_status() == "in_progress", (
+        f"生きた Worker の task が pending に戻された (logs={sandbox.logs})")
+    assert sandbox.assignment_file.exists(), "生きた Worker の assignment を消した"
+    assert _phase(sandbox) != lib_retirement.PHASE_TERMINATED, (
+        "list() が空を返しただけで「終了済み」と記録した")
+
+
+def test_red_cleanup_does_not_reopen_work_finished_during_the_grace_period(sandbox):
+    """猶予期間中に Worker が仕事を終えていたら、その成果を pending に巻き戻さない。
+
+    RED (Codex P1-1): `_settle_terminated()` は無条件に
+    `plan.sh update --status pending --reset` を撃つ。shutdown メッセージを
+    受け取った Worker が最後の `plan.sh done` を済ませてから抜けた場合、
+    完了済みの task が pending に戻り、同じ仕事がもう一度配られる。
+    """
+    pane_pid = sandbox.spawn_worker_process()
+    sandbox.record_identity(WINDOW, pane_pid)
+    mux = FakeMux({WINDOW: pane_pid})
+    ex = make_executor(sandbox, mux)
+    assert ex.request(AGENT, WINDOW, "timeout", mission=SLUG, task_id=TASK_ID)
+    ex.process_all()  # → notified
+
+    # 猶予期間中に Worker が task を終わらせて自分で抜けた (plan.sh done 相当)
+    _set_task_field(sandbox, "status", "done")
+    sandbox.assignment_file.unlink()
+    os.kill(pane_pid, signal.SIGKILL)
+    _wait_gone(pane_pid)
+
+    for _ in range(6):
+        ex.process_all()
+        if not ex.has_marker(AGENT):
+            break
+
+    assert sandbox.task_status() == "done", (
+        f"完了済みの task を pending に戻した (logs={sandbox.logs})")
+    assert not ex.has_marker(AGENT), "settle できず marker が残り続けている"
+    # 「たまたま通った」を弾く: 前提チェックを踏んだことまで見る
+    assert any("no queue cleanup owed" in line for line in sandbox.logs), sandbox.logs
+    assert sandbox.notes and "既に別の状態" in sandbox.notes[-1], sandbox.notes
+
+
+def test_red_cleanup_does_not_clear_a_successor_assignment(sandbox):
+    """遅れて走った後始末が、後任 Worker の assignment を消さない。
+
+    RED (Codex P1-1): 人間が `--reset` して別 Worker に振り直した後に
+    cleanup が走ると、plan.sh は「同じ task の別の実行」を区別できないため
+    後任の assignment まで消える。plan.sh 側の content 一致チェックは
+    「別 task の assignment」しか守らない。
+    """
+    import lib_retirement
+
+    pane_pid = sandbox.spawn_worker_process()
+    sandbox.record_identity(WINDOW, pane_pid)
+    mux = FakeMux({WINDOW: pane_pid})
+    ex = make_executor(sandbox, mux)
+
+    # Worker は既に殺し終えていて、後始末だけが残っている状態
+    lib_retirement.write_json_atomic(
+        lib_retirement.progress_path(sandbox.registry, AGENT),
+        lib_retirement.build_progress(
+            None, lib_retirement.PHASE_TERMINATED,
+            window_gone=True, pane_pid=pane_pid,
+            mission=SLUG, task_id=TASK_ID, reason="timeout"))
+
+    # その間に人間が reset → 後任 Worker が同じ task を pull した
+    _set_task_field(sandbox, "worker", "Successor")
+    sandbox.assignment_file.unlink(missing_ok=True)
+    successor_assignment = sandbox.queue / "assignments" / "Successor"
+    successor_assignment.write_text(f"{SLUG}:{TASK_ID}")
+
+    ex.process_all()
+
+    assert sandbox.task_worker() == "Successor", (
+        f"後任の worker を消した (logs={sandbox.logs})")
+    assert sandbox.task_status() == "in_progress", "後任が作業中の task を pending に戻した"
+    assert successor_assignment.exists(), "後任の assignment を消した"
+    assert any("no queue cleanup owed" in line for line in sandbox.logs), sandbox.logs
+    assert not ex.has_marker(AGENT), "settle できず marker が残り続けている"
+
+
+def test_red_failed_sigkill_does_not_declare_the_worker_terminated(sandbox):
+    """SIGKILL が届かなかったら「終了した」と記録しない。
+
+    RED (Codex P1-2): `_step_sigterm()` は `kill_process()` の戻り値を捨てて
+    即 `PHASE_TERMINATED` を永続化する。`os.kill` が失敗しても次 cycle で
+    task が pending に戻り marker も消えるが、Worker は生きたままになる。
+    """
+    import lib_retirement
+
+    pane_pid = sandbox.spawn_worker_process()
+    sandbox.record_identity(WINDOW, pane_pid)
+    mux = FakeMux({WINDOW: pane_pid})
+    ex = make_executor(sandbox, mux, kill_process=lambda pid, sig: False)
+    assert ex.request(AGENT, WINDOW, "timeout", mission=SLUG, task_id=TASK_ID)
+
+    for _ in range(4):  # start → notified → sigterm_sent → sigkill(失敗)
+        ex.process_all()
+
+    assert _pid_alive(pane_pid), "シグナルは届いていないのに Worker が消えた"
+    assert sandbox.task_status() == "in_progress", (
+        f"Worker が生きたまま task が pending に戻された (logs={sandbox.logs})")
+    assert _phase(sandbox) == lib_retirement.PHASE_SIGTERM_SENT, (
+        "届かなかったシグナルを「終了」として記録した")
+
+
+def test_red_sigkill_waits_for_the_process_to_actually_exit(sandbox, monkeypatch):
+    """シグナル送信の成功は即死を意味しない。死を確認するまで終端に進まない。
+
+    RED (Codex P1-2): `kill_process()` が True を返しさえすれば、プロセスが
+    まだ走っていても `PHASE_TERMINATED` が書かれ、次 cycle で task が
+    pending に戻る。
+
+    後半で「本当に死んだら収束する」ことも確かめる — 確認を足したせいで
+    永久に終わらない経路を作っていないことの担保。
+    """
+    import lib_retirement
+
+    monkeypatch.setattr(lib_retirement, "KILL_CONFIRM_WINDOW", 0.0, raising=False)
+
+    pane_pid = sandbox.spawn_worker_process()
+    sandbox.record_identity(WINDOW, pane_pid)
+    mux = FakeMux({WINDOW: pane_pid})
+    # 「送信は成功したがプロセスは死なない」— D 状態や権限違いの模擬
+    ex = make_executor(sandbox, mux, kill_process=lambda pid, sig: True)
+    assert ex.request(AGENT, WINDOW, "timeout", mission=SLUG, task_id=TASK_ID)
+
+    for _ in range(4):
+        ex.process_all()
+
+    assert _pid_alive(pane_pid)
+    assert sandbox.task_status() == "in_progress", (
+        f"まだ動いている Worker の task を pending に戻した (logs={sandbox.logs})")
+    assert _phase(sandbox) == lib_retirement.PHASE_SIGTERM_SENT
+
+    # 本当に死ねば、同じ marker がそのまま後始末まで進む
+    os.kill(pane_pid, signal.SIGKILL)
+    _wait_gone(pane_pid)
+    for _ in range(6):
+        ex.process_all()
+        if not ex.has_marker(AGENT):
+            break
+
+    assert not ex.has_marker(AGENT), "死を確認したのに settle しない (居座り経路)"
+    assert sandbox.task_status() == "pending"
+    assert not sandbox.assignment_file.exists()
+
+
+def test_repeated_sigkill_failure_is_reported_once(sandbox, monkeypatch):
+    """死なない Worker は黙って諦めず、Director に 1 度だけ報告する。
+
+    「判断が付かないから殺さない」に倒した結果が沈黙だと、Worker が居座った
+    ことに誰も気付けない。再試行は続けつつ、通知は 1 回に抑える。
+    """
+    import lib_retirement
+
+    monkeypatch.setattr(lib_retirement, "KILL_CONFIRM_WINDOW", 0.0, raising=False)
+
+    pane_pid = sandbox.spawn_worker_process()
+    sandbox.record_identity(WINDOW, pane_pid)
+    mux = FakeMux({WINDOW: pane_pid})
+    ex = make_executor(sandbox, mux, kill_process=lambda pid, sig: False)
+    assert ex.request(AGENT, WINDOW, "timeout", mission=SLUG, task_id=TASK_ID)
+
+    for _ in range(10):
+        ex.process_all()
+
+    assert _pid_alive(pane_pid)
+    assert sandbox.task_status() == "in_progress"
+    assert len(sandbox.notes) == 1, f"Director への通知が重複/欠落: {sandbox.notes}"
+    assert "SIGKILL" in sandbox.notes[0]
+
+
+def test_empty_listing_with_a_live_backend_does_not_authorise_cleanup(sandbox):
+    """pane_pid を記録できていない request では、空の window list を証拠にしない。
+
+    backend が生きているのに一覧だけ空 = outage と全滅の区別が付かない状態。
+    ここで後始末に進むと FAIL-1 と同じ事故が pid なし経路で再発する。
+    """
+    pane_pid = sandbox.spawn_worker_process()
+    sandbox.record_identity(WINDOW, pane_pid)  # created_at だけが identity
+    mux = NoPidMux({WINDOW: pane_pid}, server_up=True, listed=[])
+    ex = make_executor(sandbox, mux, grace_period=3600, kill_delay=3600)
+    assert ex.request(AGENT, WINDOW, "timeout", mission=SLUG, task_id=TASK_ID)
+
+    for _ in range(2):
+        ex.process_all()
+
+    assert sandbox.task_status() == "in_progress", (
+        f"証拠が無いのに後始末した (logs={sandbox.logs})")
+    assert ex.has_marker(AGENT), "判断保留のはずなのに marker を捨てた"
+
+    # 一覧が回復すれば通常どおり進む (保留は一時的で、行き止まりではない)
+    mux.listed = [WINDOW]
+    ex.process_all()
+    assert _phase(sandbox) == "notified"
+
+
+def test_dead_recorded_pid_with_a_live_window_is_a_successor_not_a_death(sandbox):
+    """記録した pid が死んでいても、窓が生きている間は後始末に進まない。
+
+    同じ窓名を名乗る後任が既に立っている状態。ここで「元の Worker は死んだ
+    → task を pending に戻す」と読むと、後任が作業中の task を取り上げる
+    (`knowledge/daemon-authority.md` §5-2)。窓が見えている間は identity
+    guard が最終判断を持つ — 証拠の強さで pid を優先するのは、窓が見えない
+    ときに限る。
+
+    (t019 の最初の実装はここを踏み抜き、`scripts/test_retirement_authority.sh`
+    の case4 が捕まえた。)
+    """
+    import lib_retirement
+
+    old_pid = sandbox.spawn_worker_process()
+    sandbox.record_identity(WINDOW, old_pid)
+    mux = FakeMux({WINDOW: old_pid})
+    ex = make_executor(sandbox, mux)
+    assert ex.request(AGENT, WINDOW, "timeout", mission=SLUG, task_id=TASK_ID)
+
+    # 元の Worker が死に、同じ窓名で後任が立った
+    os.kill(old_pid, signal.SIGKILL)
+    _wait_gone(old_pid)
+    new_pid = sandbox.spawn_worker_process()
+    mux.windows[WINDOW] = new_pid
+
+    ex.process_all()
+
+    assert _pid_alive(new_pid), "後任を殺した"
+    assert sandbox.task_status() == "in_progress", (
+        f"後任が持っているかもしれない task を pending に戻した (logs={sandbox.logs})")
+    assert _phase(sandbox) == lib_retirement.PHASE_DISCARDED
+    assert any("NOT retiring" in line for line in sandbox.logs), sandbox.logs
+
+
+def test_window_gone_is_concluded_when_the_backend_itself_is_down(sandbox):
+    """backend ごと落ちているなら、空の一覧は outage ではなく全滅の証拠。
+
+    「曖昧なら待つ」を無条件にすると、最後の Worker が死んだ瞬間に marker が
+    永久に残り、このモジュールが潰そうとしている幽霊 task が再発する。
+    """
+    pane_pid = sandbox.spawn_worker_process()
+    sandbox.record_identity(WINDOW, pane_pid)
+    mux = NoPidMux({WINDOW: pane_pid}, server_up=False, listed=[])
+    ex = make_executor(sandbox, mux)
+    assert ex.request(AGENT, WINDOW, "timeout", mission=SLUG, task_id=TASK_ID)
+
+    for _ in range(4):
+        ex.process_all()
+        if not ex.has_marker(AGENT):
+            break
+
+    assert not ex.has_marker(AGENT), "全滅が確定しているのに marker が残った"
+    assert sandbox.task_status() == "pending", "幽霊 task が残った"
+    assert not sandbox.assignment_file.exists()
 
 
 # ---------------------------------------------------------------------------

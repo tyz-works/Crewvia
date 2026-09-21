@@ -438,5 +438,30 @@ assert d['started_at'] == '''$started''', d
   run plan pull --agent "Ren.identity" --skills bash --task t001 --mission "$TEST_MISSION"
   [ "$status" -ne 0 ]
 
+  # 名前の検証は書き込みを始める前に済ませること。save_task() の後に落ちると、
+  # card だけ in_progress で assignment 無し — この PR が潰した割れたトランザ
+  # クションを自分で作ってしまう。
+  [ "$(card_field t001 status)" = "pending" ]
+  [ "$(card_field t001 worker)" = "null" ]
+  [ ! -e "$ASSIGN_DIR/Ren.identity" ]
+
+  cleanup_queue
+}
+
+@test "a done with an unusable agent name leaves the card and the assignment alone" {
+  setup_queue "ai-done-bad-agent"
+  add_task t001
+
+  run plan pull --agent Ren --skills bash --task t001 --mission "$TEST_MISSION"
+  [ "$status" -eq 0 ]
+
+  # 撤去側は名前が不正でも die しない (die すると card を書いたあとに落ちて
+  # 片側だけ進む)。「消さない」に倒れること。
+  run plan_as "../../Ren" done t001 "result" --mission "$TEST_MISSION"
+  [ "$status" -eq 0 ]
+
+  [ "$(card_field t001 status)" = "done" ]
+  [ -f "$ASSIGN_DIR/Ren" ]
+
   cleanup_queue
 }

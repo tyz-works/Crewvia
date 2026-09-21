@@ -903,20 +903,35 @@ ASSIGN_UNVERIFIABLE = 'unverifiable'  # 世代を読めない (旧形式 / 破�
 RESERVED_AGENT_SUFFIXES = (IDENTITY_SUFFIX, '.restarting', '.tmp')
 
 
-def assignment_path(agent):
-    """assignment ファイルのパス。Worker 名の検証もここに集約する。
+def agent_name_problem(agent):
+    """Worker 名が assignment ファイル名として使えない理由。使えるなら None。
 
-    ここは撤去 (os.remove) の対象パスを組み立てる場所でもあるので、ディレクトリ
+    ここは撤去 (os.remove) の対象パスを組み立てる根拠でもあるので、ディレクトリ
     を抜けられる名前を弾くのは公開側だけでなく撤去側の防御でもある。
     """
     if not agent or '/' in agent or '\0' in agent or agent in ('.', '..') \
             or agent.startswith('.'):
-        die(f"invalid agent name {agent!r}: "
-            f"'/' や先頭の '.' を含まない名前にしてください")
+        return "'/' や先頭の '.' を含まない名前にしてください"
     for suffix in RESERVED_AGENT_SUFFIXES:
         if agent.endswith(suffix):
-            die(f"invalid agent name {agent!r}: "
-                f"'{suffix}' で終わる名前は queue/assignments/ で予約済みです")
+            return f"'{suffix}' で終わる名前は queue/assignments/ で予約済みです"
+    return None
+
+
+def require_valid_agent_name(agent):
+    """不正な名前ならここで止める。**書き込みを 1 バイトも始める前に**呼ぶこと。
+
+    公開側 (pull) の検証をロックの中の save_task() より後に置くと、card だけが
+    in_progress になって assignment が無い状態で死ぬ — まさにこの PR が潰した
+    「割れたトランザクション」を自分で作ることになる。
+    """
+    problem = agent_name_problem(agent)
+    if problem:
+        die(f"invalid agent name {agent!r}: {problem}")
+
+
+def assignment_path(agent):
+    require_valid_agent_name(agent)
     return os.path.join(ASSIGNMENTS_DIR, agent)
 
 
@@ -964,6 +979,10 @@ def classify_assignment(agent, mission, task_id, generation):
         --reset) 専用。読みと書きの間に隙間が無く後任が割り込めないので、
         世代を問う必要がそもそも無い。
     """
+    if agent_name_problem(agent):
+        # 不正な名前の assignment は存在しえない。撤去側で die すると、card を
+        # 書いたあとに落ちて片側だけ進むので、ここは「消さない」に倒す。
+        return ASSIGN_UNVERIFIABLE
     try:
         with open(assignment_path(agent)) as f:
             published = f.read().strip()
@@ -1498,6 +1517,9 @@ def cmd_pull(args):
     else:
         env_td = os.environ.get('TARGET_DIR', '').strip()
         effective_target = os.path.abspath(env_td) if env_td else None
+
+    if agent:
+        require_valid_agent_name(agent)
 
     chosen_holder = [None]
     diag = {'reason': None, 'detail': ''}
@@ -3225,6 +3247,7 @@ def cmd_retire(args):
     agent = (opts.get('--agent') or '').strip()
     if not agent:
         die("retire requires --agent <name> (終了させる実行の Worker 名)")
+    require_valid_agent_name(agent)
 
     # 世代は省略不可。省略を許すと「名前だけで束縛された後始末」に戻ってしまう。
     raw_generation = opts.get('--started-at')

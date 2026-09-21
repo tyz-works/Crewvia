@@ -869,6 +869,39 @@ def test_retirement_without_task_needs_no_cleanup(sandbox):
 # 既存ガードの回帰
 # ---------------------------------------------------------------------------
 
+def test_worker_being_retired_is_not_re_monitored(sandbox):
+    """終了処理中の Worker に monitor を作り直さない。
+
+    task は後始末が終わるまで in_progress のままなので、monitor を毎 cycle
+    作り直すと `started_at=now` で即 terminate 判定が再成立し、同じ終了に
+    対して「TERMINATE」の宣言と Taskvia alert が cycle ごとに出る
+    (e2e 実測で 1 回の終了に対し 12 回)。marker が既に意図の記録なので、
+    marker がある間はそもそも監視対象から外す。
+    """
+    import lib_retirement
+
+    import lib_retirement as _lr
+
+    ex = make_executor(sandbox, FakeMux({}))
+    card = {"worker": AGENT, "timeout": {"idle": 1, "max": 1}}
+    W = watchdog.KILL_AUTHORITY_WATCHDOG
+
+    assert watchdog.should_monitor(card, ex, W) is True, "marker が無いのに監視を外した"
+
+    marker = _lr.request_path(sandbox.registry, AGENT)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("{}")
+    assert watchdog.should_monitor(card, ex, W) is False, (
+        "retirement 中の Worker が監視対象に戻っている"
+    )
+
+    # ロールバック経路は旧挙動のまま — marker を消費しないので、監視を
+    # 外すと誰もその Worker を止めなくなる。
+    assert watchdog.should_monitor(card, ex, watchdog.KILL_AUTHORITY_DISPATCHER) is True
+    # worker 名が未記録の task は判断材料が無い → 監視は続ける
+    assert watchdog.should_monitor({"worker": None}, ex, W) is True
+
+
 def test_mass_kill_guard_conditions_unchanged():
     """`_is_mass_kill()` の発火条件は t002 で変えていない。
 

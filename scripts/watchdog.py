@@ -711,6 +711,24 @@ def _notify_director(message: str) -> bool:
     return bool(_mux.send(_director_name(), message))
 
 
+def should_monitor(task_card: dict, retirement, authority: str) -> bool:
+    """False for a Worker whose retirement is already in flight.
+
+    Its task stays in_progress until the retirement finishes the queue-side
+    cleanup, so without this the monitor is rebuilt every cycle with
+    `started_at = now`, immediately re-decides "terminate", and re-announces
+    it — one termination produced a dozen identical Taskvia alerts (measured
+    in the e2e harness) and a log that read as if watchdog kept changing its
+    mind.  The marker is already the durable record of that decision.
+    """
+    if authority != KILL_AUTHORITY_WATCHDOG:
+        return True
+    worker = task_card.get("worker")
+    if not worker:
+        return True
+    return not retirement.has_marker(str(worker))
+
+
 def make_retirement_executor(repo_root: Path, *, queue_dir: Optional[Path] = None,
                              mux=None, notify=None, log=None):
     """Build the phase machine that ends Workers and repairs the queue.
@@ -1072,13 +1090,16 @@ def run(repo_root: Path, interval: int) -> None:
             # Add monitors for new in_progress tasks
             for slug, task_id, meta in active_tasks:
                 key = (slug, task_id)
-                if key not in monitors:
-                    monitors[key] = WorkerMonitor(
-                        task_id=task_id,
-                        task_card=meta,
-                        profiles=PROFILES,
-                        repo_root=repo_root,
-                    )
+                if key in monitors:
+                    continue
+                if not should_monitor(meta, retirement, authority):
+                    continue
+                monitors[key] = WorkerMonitor(
+                    task_id=task_id,
+                    task_card=meta,
+                    profiles=PROFILES,
+                    repo_root=repo_root,
+                )
 
             # Evaluate every monitor's status up front (side-effect free) before
             # acting on any of them. This lets us tell "every single monitored
@@ -1169,6 +1190,20 @@ def run(repo_root: Path, interval: int) -> None:
                     taskvia_alert(taskvia_url, taskvia_token, agent, msg)
 
                 elif status == "terminate":
+                    # Checked before anything is logged or sent.  The monitor is
+                    # rebuilt from the task card every cycle and the task stays
+                    # in_progress until the retirement finishes its cleanup, so
+                    # this branch is re-entered on every cycle of a termination
+                    # that is already under way.  Announcing it each time turned
+                    # one termination into a dozen identical Taskvia alerts
+                    # (measured: 12 in a single e2e run) and made the log read as
+                    # if watchdog kept re-deciding.
+                    if (authority == KILL_AUTHORITY_WATCHDOG
+                            and retirement.has_marker(agent)):
+                        verdict_logger.forget(monitor)
+                        del monitors[(slug, task_id)]
+                        continue
+
                     elapsed = time.time() - monitor.started_at
                     _log(
                         f"TERMINATE: {agent}/{task_id} (mission={slug}) "
@@ -1180,13 +1215,6 @@ def run(repo_root: Path, interval: int) -> None:
                     )
                     if authority == KILL_AUTHORITY_DISPATCHER:
                         graceful_terminate(monitor)
-                        verdict_logger.forget(monitor)
-                        del monitors[(slug, task_id)]
-                    elif retirement.has_marker(agent):
-                        # Already being retired.  Re-requesting would reset the
-                        # phase and restart the escalation from the top every
-                        # cycle, so the Worker would never actually reach
-                        # SIGTERM.  Drop the monitor and let the machine run.
                         verdict_logger.forget(monitor)
                         del monitors[(slug, task_id)]
                     else:

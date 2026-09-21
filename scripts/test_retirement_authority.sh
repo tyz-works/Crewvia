@@ -201,6 +201,17 @@ case1() {
   else
     fail "assignment/TestAgent が残っている (E1)"
   fi
+
+  # task は後始末が終わるまで in_progress のままなので、monitor を毎 cycle
+  # 作り直すと同じ終了に対して TERMINATE 宣言と Taskvia alert が cycle ごとに
+  # 出る (この assert を入れる前の実測で 1 回の終了に 12 回)。
+  local n_term
+  n_term="$(grep -c 'TERMINATE:' "$sb/logs/watchdog.out" 2>/dev/null || echo 0)"
+  if (( n_term <= 2 )); then
+    pass "TERMINATE の宣言が ${n_term} 回に収まっている (重複通知なし)"
+  else
+    fail "TERMINATE が ${n_term} 回宣言された — 終了処理中の Worker を再監視している"
+  fi
   info "watchdog log: $sb/logs/watchdog.out"
 }
 

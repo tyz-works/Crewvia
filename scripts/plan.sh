@@ -23,6 +23,7 @@ set -euo pipefail
 #                            [--priority high|medium|low] [--worker <name>] [--status <status>]
 #                            [--description <text>] [--reset]
 #                            [--expect-status <csv>] [--expect-worker <name>]
+#                            [--expect-started-at <iso|null>]
 #                              前提が外れていたら何も書かずに exit 3 (詳細は cmd_update)
 #   plan.sh status [--mission <slug>] [--all]
 #   plan.sh archive <slug>
@@ -2847,18 +2848,19 @@ def cmd_update(args):
                                [--description <text>]
                                [--reset]
                                [--expect-status <csv>] [--expect-worker <name>]
+                               [--expect-started-at <iso|null>]
 
     --reset sets: status=pending, worker=null, started_at=null, completed_at=null
     Body (Description / Result sections) is never modified by this command.
 
-    --expect-status / --expect-worker are *preconditions*, not edits: the task
-    is only touched when it still looks the way the caller expects.  Both are
-    evaluated inside the queue lock, immediately before the first mutation, so
-    a caller cannot read the task, decide, and then write into a card someone
-    else changed in between.  When a precondition does not hold, nothing is
-    written (not even the assignment-file cleanup) and the command exits 3 —
-    distinct from exit 1 (a real error), so the caller can tell "the world
-    moved on" apart from "plan.sh is broken".
+    --expect-status / --expect-worker / --expect-started-at are *preconditions*,
+    not edits: the task is only touched when it still looks the way the caller
+    expects.  All three are evaluated inside the queue lock, immediately before
+    the first mutation, so a caller cannot read the task, decide, and then write
+    into a card someone else changed in between.  When a precondition does not
+    hold, nothing is written (not even the assignment-file cleanup) and the
+    command exits 3 — distinct from exit 1 (a real error), so the caller can
+    tell "the world moved on" apart from "plan.sh is broken".
 
     This exists because an unconditional `--reset` is destructive in two ways
     that the assignment-content check below cannot see: it reopens work that
@@ -2867,6 +2869,15 @@ def cmd_update(args):
     (the content check only rejects an assignment for a *different* task).
     watchdog's retirement cleanup (`scripts/lib_retirement.py`) is the caller
     that needs this; see `knowledge/daemon-authority.md` §3-5.
+
+    --expect-started-at is what makes that binding an *instance* rather than a
+    name.  status and worker are both restored to exactly their old values when
+    a human resets a task and the same Worker name pulls it again — crewvia
+    reuses Worker names on purpose — so a late cleanup matches the successor's
+    execution and resets work that is actively under way.  `started_at` is
+    rewritten by `pull` on every execution, so comparing it distinguishes "the
+    assignment this caller is talking about" from "another run of the same task
+    by the same name" (Codex P1-1, t020).
     """
     opts, positional = parse_opts(args, {
         '--mission': 'value',
@@ -2880,6 +2891,7 @@ def cmd_update(args):
         '--pr-number': 'value',
         '--expect-status': 'value',
         '--expect-worker': 'value',
+        '--expect-started-at': 'value',
     })
 
     if not positional:
@@ -2926,6 +2938,16 @@ def cmd_update(args):
         expected_worker = (None if expect_worker.strip().lower() in ('null', 'none', '')
                            else expect_worker.strip())
 
+    # Compared as an opaque string: it is an identity token here, not a time.
+    # `pull` writes it with now_iso(), so anything that reformats it would be a
+    # different execution as far as this check is concerned — which is the
+    # conservative direction (refuse the write, change nothing).
+    expect_started_at = opts.get('--expect-started-at')
+    expected_started_at = None
+    if expect_started_at is not None:
+        expected_started_at = (None if expect_started_at.strip().lower() in ('null', 'none', '')
+                               else expect_started_at.strip())
+
     # Holder for reset worker info (populated inside _do, used after with_lock)
     # [0] = old worker name, [1] = slug (for assignment content verification)
     reset_worker_holder = [None, None]
@@ -2957,6 +2979,16 @@ def cmd_update(args):
                 die(f"[plan.sh] precondition not met for {slug}/{task_id}: "
                     f"worker is {current_worker!r}, expected {expected_worker!r} "
                     f"— nothing changed",
+                    UPDATE_PRECONDITION_UNMET)
+        if expect_started_at is not None:
+            current_started_at = meta.get('started_at')
+            if current_started_at is not None:
+                current_started_at = str(current_started_at).strip()
+            if current_started_at != expected_started_at:
+                die(f"[plan.sh] precondition not met for {slug}/{task_id}: "
+                    f"started_at is {current_started_at!r}, expected "
+                    f"{expected_started_at!r} — this is a different execution of "
+                    f"the same task; nothing changed",
                     UPDATE_PRECONDITION_UNMET)
 
         changed = []

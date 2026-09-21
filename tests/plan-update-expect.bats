@@ -1,7 +1,8 @@
 #!/usr/bin/env bats
 # tests/plan-update-expect.bats
 #
-# `plan.sh update --expect-status / --expect-worker` (t019).
+# `plan.sh update --expect-status / --expect-worker` (t019)
+# `plan.sh update --expect-started-at` (t020, Codex P1-1).
 #
 # Why these exist: watchdog's retirement cleanup ran `update --status pending
 # --reset` unconditionally.  Between the moment a Worker is told to shut down
@@ -47,6 +48,7 @@ add_task() {
   local id="$1"
   local status="${2:-in_progress}"
   local worker="${3:-Alice}"
+  local started_at="${4:-null}"
 
   cat >"$TASKS_DIR/${id}.md" <<MD
 ---
@@ -58,7 +60,7 @@ status: $status
 blocked_by: []
 target_dir: null
 worker: $worker
-started_at: null
+started_at: $started_at
 completed_at: null
 ---
 
@@ -191,6 +193,77 @@ cleanup_queue() {
 
   run plan_update t001 --reset --mission "$TEST_MISSION" --expect-status ","
   [ "$status" -eq 1 ]
+
+  cleanup_queue
+}
+
+# ---------------------------------------------------------------------------
+# t020 / Codex P1-1 — 名前ではなく「その割り当て」に束縛する
+#
+# status と worker は reset → 同名 Worker が再 pull した後にちょうど元の値に
+# 戻る。crewvia は Worker 名を意図的に使い回すので、その 2 つだけでは「この
+# 呼び出しが話している割り当て」と「同じ task の別の実行」が区別できない。
+# started_at は pull のたびに書き換わるので、そこを見て初めて区別が付く。
+# ---------------------------------------------------------------------------
+
+@test "--expect-started-at rejects a second execution wearing the same worker name" {
+  setup_queue "expect-started-at-successor"
+  # 後任: status も worker も「元の割り当て」と同一。違うのは started_at だけ。
+  add_task t001 in_progress Alice '"2026-09-21T12:00:00Z"'
+  printf '%s:t001\n' "$TEST_MISSION" >"$TEST_QUEUE/assignments/Alice"
+
+  run plan_update t001 --status pending --reset --mission "$TEST_MISSION" \
+      --expect-status in_progress --expect-worker Alice \
+      --expect-started-at "2026-09-21T09:00:00Z"
+  [ "$status" -eq 3 ]
+  [[ "$output" == *"different execution"* ]]
+
+  # 後任の作業が 1 バイトも巻き戻っていないこと
+  grep -q '^status: in_progress$' "$TASKS_DIR/t001.md"
+  grep -q '^worker: Alice$' "$TASKS_DIR/t001.md"
+  grep -q '^started_at: "2026-09-21T12:00:00Z"$' "$TASKS_DIR/t001.md"
+  [ -f "$TEST_QUEUE/assignments/Alice" ]
+
+  cleanup_queue
+}
+
+@test "--expect-started-at lets the original execution through" {
+  setup_queue "expect-started-at-match"
+  add_task t001 in_progress Alice '"2026-09-21T09:00:00Z"'
+  printf '%s:t001\n' "$TEST_MISSION" >"$TEST_QUEUE/assignments/Alice"
+
+  run plan_update t001 --status pending --reset --mission "$TEST_MISSION" \
+      --expect-status in_progress --expect-worker Alice \
+      --expect-started-at "2026-09-21T09:00:00Z"
+  [ "$status" -eq 0 ]
+
+  grep -q '^status: pending$' "$TASKS_DIR/t001.md"
+  grep -q '^started_at: null$' "$TASKS_DIR/t001.md"
+  [ ! -f "$TEST_QUEUE/assignments/Alice" ]
+
+  cleanup_queue
+}
+
+@test "--expect-started-at null matches a task that never recorded one" {
+  setup_queue "expect-started-at-null"
+  add_task t001 in_progress Alice
+
+  run plan_update t001 --status pending --reset --mission "$TEST_MISSION" \
+      --expect-started-at null
+  [ "$status" -eq 0 ]
+  grep -q '^status: pending$' "$TASKS_DIR/t001.md"
+
+  cleanup_queue
+}
+
+@test "--expect-started-at null refuses once an execution has started" {
+  setup_queue "expect-started-at-null-mismatch"
+  add_task t001 in_progress Alice '"2026-09-21T12:00:00Z"'
+
+  run plan_update t001 --status pending --reset --mission "$TEST_MISSION" \
+      --expect-started-at null
+  [ "$status" -eq 3 ]
+  grep -q '^status: in_progress$' "$TASKS_DIR/t001.md"
 
   cleanup_queue
 }

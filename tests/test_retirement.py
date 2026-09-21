@@ -75,10 +75,20 @@ t019 — 後始末の誤発火 (QA FAIL-1 / Codex P1 3 件。いずれも「Work
   test_repeated_sigkill_failure_is_reported_once
   test_empty_listing_with_a_live_backend_does_not_authorise_cleanup
   test_dead_recorded_pid_with_a_live_window_is_a_successor_not_a_death
-  test_window_gone_is_concluded_when_the_backend_itself_is_down
-    ↑ 最後の 2 本は逆向きの担保: 安全側に倒しすぎて永久に終わらない経路を
-      作っていないこと / 後任を巻き込まないこと。
+    ↑ 最後の 1 本は逆向きの担保: 後任を巻き込まないこと。
   (plan.sh 側の前提条件は tests/plan-update-expect.bats)
+
+t020 — Codex P1 3 件 (identity 束縛と証拠の強度。いずれも「名前は同じでも
+中身が別物になりうる」「観測できないことは証拠にならない」が根):
+  test_red_cleanup_does_not_reset_a_same_named_successors_execution  (P1-1)
+  test_red_sigterm_goes_to_the_pid_that_passed_the_identity_check    (P1-3)
+  test_red_first_step_records_the_pid_it_verified                    (P1-3 同型)
+  test_red_failed_server_probe_is_not_proof_of_death                 (P1-2)
+  test_unresolvable_retirement_is_escalated_to_the_director_once
+    ↑ 逆向きの担保: P1-2 で増えた「保留」に出口があること。出口は自動 cleanup
+      ではなく Director への 1 度きりの報告 (t019 が server_running() を証拠に
+      使った動機はここにあった)。
+  (plan.sh 側の --expect-started-at は tests/plan-update-expect.bats)
 
 実行方法:
   python3 -m pytest tests/test_retirement.py -v
@@ -198,6 +208,12 @@ class Sandbox:
         for line in self.task_file.read_text().splitlines():
             if line.startswith("worker:"):
                 return line.split(":", 1)[1].strip()
+        return "?"
+
+    def task_started_at(self) -> str:
+        for line in self.task_file.read_text().splitlines():
+            if line.startswith("started_at:"):
+                return line.split(":", 1)[1].strip().strip('"')
         return "?"
 
     def spawn_worker_process(self) -> int:
@@ -1242,26 +1258,222 @@ def test_dead_recorded_pid_with_a_live_window_is_a_successor_not_a_death(sandbox
     assert any("NOT retiring" in line for line in sandbox.logs), sandbox.logs
 
 
-def test_window_gone_is_concluded_when_the_backend_itself_is_down(sandbox):
-    """backend ごと落ちているなら、空の一覧は outage ではなく全滅の証拠。
+# ---------------------------------------------------------------------------
+# t020 — Codex P1 3 件。いずれも「名前は同じでも中身が別物になりうる」
+# 「観測できないことは証拠にならない」の別の顔。
+#
+# P1-1 と P1-3 は TOCTOU なので、テストは**検査と使用の間に後任が現れる**状況を
+# 実際に作る。フラグや phase 名ではなく、誤発火したときに失われるもの —
+# 後任 Worker のプロセスと、後任が作業中の task — を assert する。
+# ---------------------------------------------------------------------------
 
-    「曖昧なら待つ」を無条件にすると、最後の Worker が死んだ瞬間に marker が
-    永久に残り、このモジュールが潰そうとしている幽霊 task が再発する。
+
+class SuccessorRaceMux(FakeMux):
+    """`pid()` の **2 回目** で同名の後任に入れ替わる backend。
+
+    窓名は使い回されるので、元の Worker が抜けた直後に同じ名前で後任が立つのは
+    本番の通常動作 (`knowledge/daemon-authority.md` §5-2)。identity check と
+    シグナル送信がそれぞれ独立に名前解決すると、その隙間がまるごと事故になる。
+    `arm()` を呼んだ時点から数え直すので、「どのステップの中で後任が現れたか」を
+    テスト側が正確に決められる。
     """
+
+    def __init__(self, windows, successor_pid):
+        super().__init__(windows)
+        self.successor_pid = successor_pid
+        self.armed = False
+        self.pid_calls = 0
+
+    def arm(self):
+        self.armed = True
+        self.pid_calls = 0
+
+    def pid(self, name):
+        if not self.armed:
+            return super().pid(name)
+        self.pid_calls += 1
+        if self.pid_calls >= 2:
+            self.windows[name] = self.successor_pid
+        return super().pid(name)
+
+
+def test_red_cleanup_does_not_reset_a_same_named_successors_execution(sandbox):
+    """同名の後任が同じ task を実行中なら、遅れて走った後始末は何も書き換えない。
+
+    RED (Codex P1-1): `--expect-status in_progress` と `--expect-worker <agent>`
+    は、人間が `--reset` して**同じ名前の Worker**が同じ task を pull し直した
+    後にちょうど両方とも成立する (crewvia は Worker 名を意図的に使い回す)。
+    後任が作業中の task が pending に戻り、assignment も消える。区別が付くのは
+    `started_at` — pull のたびに書き換わる「割り当ての世代」だけ。
+    """
+    first_started_at = sandbox.task_started_at()
     pane_pid = sandbox.spawn_worker_process()
     sandbox.record_identity(WINDOW, pane_pid)
+    mux = FakeMux({WINDOW: pane_pid})
+    ex = make_executor(sandbox, mux)
+    assert ex.request(AGENT, WINDOW, "timeout", mission=SLUG, task_id=TASK_ID)
+
+    ex.process_all()                      # → notified
+    os.kill(pane_pid, signal.SIGKILL)     # Worker は shutdown を受けて抜けた
+    _wait_gone(pane_pid)
+    ex.process_all()                      # → terminated (後始末だけが残る)
+
+    # その間に人間が reset し、**同名の** Worker が同じ task を pull し直した。
+    # status も worker も元と寸分違わない状態に戻っている。
+    second_started_at = '"2026-09-22T09:00:00Z"'
+    assert second_started_at.strip('"') != first_started_at
+    _set_task_field(sandbox, "started_at", second_started_at)
+    sandbox.assignment_file.write_text(f"{SLUG}:{TASK_ID}")
+
+    ex.process_all()                      # 後始末が走る cycle
+
+    assert sandbox.task_status() == "in_progress", (
+        f"後任が作業中の task を pending に戻した (logs={sandbox.logs})")
+    assert sandbox.task_worker() == AGENT
+    assert sandbox.task_started_at() == second_started_at.strip('"'), (
+        "後任の割り当てごと巻き戻した")
+    assert sandbox.assignment_file.exists(), "後任の assignment を消した"
+    assert any("no queue cleanup owed" in line for line in sandbox.logs), sandbox.logs
+    assert not ex.has_marker(AGENT), "settle できず marker が残り続けている"
+
+
+def test_red_sigterm_goes_to_the_pid_that_passed_the_identity_check(sandbox):
+    """identity check を通した PID にだけシグナルを送る。
+
+    RED (Codex P1-3): `_step_notified()` は `_guard()` で現在の PID を検証した
+    あと、**もう一度** `mux.pid(target)` を呼んでその結果に SIGTERM を送っていた。
+    2 つの呼び出しの間に同名の後任が現れると、request と一度も照合されていない
+    PID が marker に永続化され、そのまま殺される。
+    """
+    import lib_retirement
+
+    old_pid = sandbox.spawn_worker_process()
+    sandbox.record_identity(WINDOW, old_pid)
+    successor_pid = sandbox.spawn_worker_process()
+    mux = SuccessorRaceMux({WINDOW: old_pid}, successor_pid)
+
+    killed = []
+    ex = make_executor(
+        sandbox, mux,
+        kill_process=lambda pid, sig: (killed.append((pid, sig)), True)[1])
+    assert ex.request(AGENT, WINDOW, "timeout", mission=SLUG, task_id=TASK_ID)
+
+    ex.process_all()
+    assert _phase(sandbox) == lib_retirement.PHASE_NOTIFIED
+
+    mux.arm()          # この cycle の中で後任が現れる
+    ex.process_all()   # → sigterm_sent
+
+    assert killed == [(old_pid, signal.SIGTERM)], (
+        f"検証していない PID にシグナルを送った (killed={killed})")
+    assert _pid_alive(successor_pid), "同名の後任を殺した"
+    prog = lib_retirement.read_json(
+        lib_retirement.progress_path(sandbox.registry, AGENT))
+    assert prog["pane_pid"] == old_pid, "後任の PID を marker に書き込んだ"
+    assert mux.pid_calls == 1, (
+        "窓名を解決し直している — 名前は使い回されるので、検証と使用の間に"
+        "別のインスタンスが入り込む余地が残る")
+
+
+def test_red_first_step_records_the_pid_it_verified(sandbox):
+    """最初の一手でも、marker に書く PID は identity check を通したものにする。
+
+    RED (Codex P1-3 の同型): `_start()` も `_guard()` の後に
+    `current_spawn_identity()` を呼び直していた。ここで後任の PID を書くと、
+    以降のステップは全部その PID を正当な対象として扱う。
+    """
+    import lib_retirement
+
+    old_pid = sandbox.spawn_worker_process()
+    sandbox.record_identity(WINDOW, old_pid)
+    successor_pid = sandbox.spawn_worker_process()
+    mux = SuccessorRaceMux({WINDOW: old_pid}, successor_pid)
+
+    ex = make_executor(sandbox, mux, grace_period=3600)
+    assert ex.request(AGENT, WINDOW, "timeout", mission=SLUG, task_id=TASK_ID)
+
+    mux.arm()
+    ex.process_all()   # → notified
+
+    prog = lib_retirement.read_json(
+        lib_retirement.progress_path(sandbox.registry, AGENT))
+    assert prog["pane_pid"] == old_pid, "後任の PID を marker に書き込んだ"
+    assert mux.pid_calls == 1
+
+
+def test_red_failed_server_probe_is_not_proof_of_death(sandbox):
+    """backend の probe が黙ったからといって、Worker が死んだことにはしない。
+
+    RED (Codex P1-2): `_listing_is_authoritative()` は
+    `server_running() == False` を「裏の取れた死」として扱っていた。しかし
+    `TmuxBackend.server_running()` はタイムアウトでも例外でも False を返すし、
+    HerdrBackend のそれは socket への ping であってプロセスの終了証明ではない。
+    一覧と probe を同時に巻き込む outage が起きれば、生きている Worker の task を
+    pending に戻す権限が出てしまう — 一覧ゲートが塞いだはずの欠陥が 1 段下で
+    再発する (memory: fail-closed-guard-can-recreate-the-defect)。
+    """
+    pane_pid = sandbox.spawn_worker_process()
+    sandbox.record_identity(WINDOW, pane_pid)   # identity は created_at のみ
+    # pid も一覧も probe も同時に answers を失った状態。Worker は生きている。
     mux = NoPidMux({WINDOW: pane_pid}, server_up=False, listed=[])
     ex = make_executor(sandbox, mux)
     assert ex.request(AGENT, WINDOW, "timeout", mission=SLUG, task_id=TASK_ID)
 
     for _ in range(4):
         ex.process_all()
-        if not ex.has_marker(AGENT):
-            break
 
-    assert not ex.has_marker(AGENT), "全滅が確定しているのに marker が残った"
-    assert sandbox.task_status() == "pending", "幽霊 task が残った"
-    assert not sandbox.assignment_file.exists()
+    assert _pid_alive(pane_pid), "生きている Worker を殺した"
+    assert sandbox.task_status() == "in_progress", (
+        f"probe の沈黙を死亡証明にして task を pending に戻した (logs={sandbox.logs})")
+    assert sandbox.assignment_file.exists(), "生きている Worker の assignment を消した"
+    assert ex.has_marker(AGENT), "証拠が無いまま marker を捨てた"
+
+
+def test_unresolvable_retirement_is_escalated_to_the_director_once(sandbox):
+    """保留には必ず出口がある。自動で倒す先は常に「殺さない・書き換えない」側。
+
+    逆向きの担保。P1-2 の修正で「曖昧なら待つ」経路が増えた以上、永久に終わらない
+    marker を作っていないことを示す必要がある — t019 が `server_running()` を
+    証拠に使った動機はそこにあった。ただしその出口は自動 cleanup ではなく
+    Director への 1 度きりの報告。再起動を繰り返しても報告が増えないことまで見る。
+    """
+    import lib_retirement
+
+    pane_pid = sandbox.spawn_worker_process()
+    sandbox.record_identity(WINDOW, pane_pid)
+    mux = NoPidMux({WINDOW: pane_pid}, server_up=False, listed=[])
+
+    clock = [time.time()]
+    ex = make_executor(sandbox, mux, now=lambda: clock[0])
+    assert ex.request(AGENT, WINDOW, "timeout", mission=SLUG, task_id=TASK_ID)
+
+    ex.process_all()
+    assert not sandbox.notes, "まだ判断保留の範囲内なのに Director を呼んだ"
+
+    clock[0] += lib_retirement.STALL_REPORT_AFTER + 1
+    ex.process_all()
+
+    assert len(sandbox.notes) == 1, f"報告が 1 回に収まっていない: {sandbox.notes}"
+    note = sandbox.notes[0]
+    assert "何も kill せず queue も書き換えていません" in note, note
+    assert TASK_ID in note and "--reset" in note, "手作業の手順が書かれていない"
+
+    # 報告は報告であって後始末ではない
+    assert sandbox.task_status() == "in_progress"
+    assert _pid_alive(pane_pid)
+
+    # デーモンを何度回しても、再起動しても、2 通目は出ない
+    clock[0] += lib_retirement.STALL_REPORT_AFTER * 3
+    ex.process_all()
+    make_executor(sandbox, mux, now=lambda: clock[0]).process_all()
+    assert len(sandbox.notes) == 1, f"同じ marker で繰り返し報告した: {sandbox.notes}"
+
+    # 報告を受けた人間が marker を片付けたら、受領証も残らない。
+    # 残すと、次に同じ Worker が詰まったときの報告を黙らせてしまう。
+    assert lib_retirement.stall_path(sandbox.registry, AGENT).exists()
+    lib_retirement.request_path(sandbox.registry, AGENT).unlink()
+    ex.process_all()
+    assert not lib_retirement.stall_path(sandbox.registry, AGENT).exists()
 
 
 # ---------------------------------------------------------------------------

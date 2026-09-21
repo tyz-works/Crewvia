@@ -527,17 +527,18 @@ cleanup を拒否している横で、新経路がその `[]` を鵜呑みにし
 1. 記録済み `pane_pid` が `/proc` に居ない → **消滅確定**
 2. `pane_pid` が生きている → **生存確定** (backend の答えは要らない)
 3. `pane_pid` が未記録のときだけ window list に投票権がある。ただし
-   *裏の取れた* list に限る (`_listing_is_authoritative()`):
+   *裏の取れた* list に限る (`_listing_authority_for_cycle()`):
    - 空でない list → 問い合わせが成功した証拠
    - 空 + backend 自体が落ちている (`server_running()` が False) → 全滅の証拠
+     — **t020 で撤回。§6-4 (2) を参照**
    - 空 + backend は生きている → **outage と全滅が区別できない。保留**
 
 「空 + backend 生存」を無条件に保留に倒すと、最後の Worker が死んだ瞬間に
 marker が永久に残り、このモジュールが潰そうとしている幽霊 task が再発する。
-`server_running()` の例外がそれを塞いでいる (memory:
-`fail-closed-guard-can-recreate-the-defect` — 曖昧さの原因を分けて独立の
-証拠を取る)。保留中も dispatcher の D4 検知 (R5) は同じ task を独立に
-見つけるので、沈黙にはならない。
+t019 はその出口を `server_running()` の例外に求めたが、**probe は死亡証明に
+ならない** (§6-4 (2))。懸念自体は正しかったので、t020 で出口だけを
+「自動 cleanup」から「Director への 1 度きりの報告」に差し替えた。保留中も
+dispatcher の D4 検知 (R5) は同じ task を独立に見つけるので、沈黙にはならない。
 
 ### (2) 後始末を「元の割り当てがまだ有効か」に条件付けた
 
@@ -587,9 +588,88 @@ marker も消えるが、Worker は生きたまま。送信が成功しても即
 phase 名やフラグではなく、生きた Worker の task が `in_progress` のまま
 であること、完了済みの成果が pending に巻き戻らないこと、後任の
 assignment が残っていることを見る。逆向き (保留に倒しすぎて永久に
-終わらない) も
-`test_window_gone_is_concluded_when_the_backend_itself_is_down` と
-`test_red_sigkill_waits_for_the_process_to_actually_exit` の後半で押さえた。
+終わらない) も `test_red_sigkill_waits_for_the_process_to_actually_exit` の
+後半と、t020 で入れ替えた
+`test_unresolvable_retirement_is_escalated_to_the_director_once` で押さえた。
+
+---
+
+## 6-4. Codex P1 3 件 — identity の束縛と証拠の強度 (t020, 2026-09-22)
+
+t012 (Codex) の 2 巡目。§6-3 が「根拠が揃う前に後始末に到達しない」を入れた
+のに対し、こちらは**その根拠の貼り方**が甘かった 3 箇所。3 件とも
+「名前は同じでも中身が別物になりうる」「観測できないことは証拠にならない」
+という 1 つの弱点の別の顔である。
+
+### (1) 後始末を assignment インスタンスに束縛する (P1-1)
+
+§6-3 (2) の `--expect-status in_progress` + `--expect-worker <agent>` は、
+**同名の後任が同じ task を実行している場合にも一致する**。crewvia は Worker
+名を意図的に使い回すので、人間が `--reset` して同じ名前の Worker が pull し
+直すと、status も worker も元と寸分違わない状態に戻る。cleanup が遅れていれば
+後任の task が pending に戻り assignment も消える — §6-3 (2) が塞いだつもりの
+穴が、`worker` 欄では見えない形で残っていた。
+
+区別が付くのは `started_at` だけ。`plan.sh pull` が実行のたびに書き換える
+ので、これが **割り当ての世代** になる。
+
+```
+plan.sh update <id> --status pending --reset --mission <slug> \
+    --expect-status in_progress --expect-worker <agent> \
+    --expect-started-at <retirement 要求時の started_at>
+```
+
+`started_at` は retirement request を書く時点で `read_task_started_at()` が
+task カードから読み、request → progress と引き継ぐ。**呼び出し側に渡させない**
+のは、忘れた 1 箇所が黙って名前ベースの判定に落ちるため (memory:
+`approve-judgment-needs-allowlist-and-scope` — 判定 unit は 1 つに絞る)。
+カードが読めなかった場合はキーごと省略し、`null` を捏造しない: 捏造した
+`null` は「まだ実行が始まっていない task」に一致してしまう。
+
+### (2) probe の失敗を死亡の証拠にしない (P1-2)
+
+§6-3 (1) の 3 番目の箇条書き — `server_running() == False` を全滅の証拠と
+読む — を撤回した。`TmuxBackend.server_running()` は**タイムアウトでも例外でも
+False を返す** 5 秒の subprocess であり、HerdrBackend のそれは socket への
+ping でプロセスの終了証明ではない。つまり list を空にするほどの outage は
+probe も同時に黙らせる。**互いに裏を取り合っているつもりの 2 つの失敗**が
+「生きた Worker の task を pending に戻してよい」という結論を出す構図で、
+list ゲートが塞いだ欠陥が 1 段下で再発していた (memory:
+`fail-closed-guard-can-recreate-the-defect`)。
+
+`_listing_authority_for_cycle()` は `True` か `None` (unknown) しか返さない。
+cleanup には積極的な終了の証拠 (`/proc` で消えた pane_pid、または**何かを
+返した** list からの欠落) を要求する。
+
+**保留に出口を付ける。** t019 の懸念 (曖昧なら保留を無条件にすると最後の
+Worker が死んだ瞬間に marker が永久に残る) は正当なので捨てない。ただし出口は
+自動 cleanup ではなく `_check_stall()`: `STALL_REPORT_AFTER` (1800s) 動けない
+marker を Director に **1 度だけ** 上げ、queue には触れない。受領証は
+`registry/retirements/<agent>.stalled` に残すので、watchdog が再起動しても
+2 通目は出ない。人間が marker を手で片付けたら次の cycle が受領証も掃除する。
+
+> 自動で倒す先は常に「殺さない・書き換えない」側。曖昧さを queue の書き換えで
+> 解決しようとしたのが、このモジュールで 3 回続けて欠陥になった形である。
+
+### (3) identity check を通した PID にシグナルを送る (P1-3)
+
+`_step_notified()` は `_guard()` で現在の PID を検証したあと、**別途**
+`mux.pid(target)` を呼び直してその結果に SIGTERM を送っていた (`_start()` も
+同型で `current_spawn_identity()` を 2 度呼んでいた)。元の Worker が抜けて
+同名の後任がこの 2 呼び出しの間に現れると、**request と一度も照合されていない
+PID** が marker に永続化され、そのまま殺される。identity check は、その結果を
+使う対象が同じインスタンスでなければ意味がない。
+
+`_guard()` は判定に使った snapshot ごと返し、各ステップは
+`_verified_pid()` — request に記録された PID、無ければ検証済み snapshot の
+PID — にだけシグナルを送る。**窓名の再解決は禁止**。
+
+### 回帰テストの形
+
+P1-1 と P1-3 は TOCTOU なので、テストは「検査と使用の間に後任が現れる」状況を
+実際に作る (`SuccessorRaceMux` は `pid()` の 2 回目で後任に入れ替わる)。
+assert するのは「後任のプロセスが生きていること」「後任が作業中の task が
+`in_progress` のままであること」— 誤発火したときに実際に失われるもの。
 
 ---
 

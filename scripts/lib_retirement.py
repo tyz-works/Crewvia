@@ -18,6 +18,7 @@ to for an idle Worker; `queue/assignments/<agent>` carries an
 
     registry/retirements/<agent>.json           the request: written once, never updated
     registry/retirements/<agent>.progress.json  the phase machine's state
+    registry/retirements/<agent>.stalled        receipt: "the Director has been told"
 
 **One writer per file.**  Splitting request from progress removes the need for
 locking between the daemons: the request is written exactly once by whoever
@@ -58,6 +59,35 @@ same-named successor — the single most damaging failure mode in
 `knowledge/daemon-authority.md` §5-2.  Every destructive step re-checks, and
 every ambiguous answer (mux unreachable, no usable recorded field) is a
 *mismatch*, i.e. "do not kill".
+
+The check is only worth what the *use* is bound to, which is what t020
+(Codex P1-1 / P1-3) is about.  Two rules follow from it:
+
+  - **Act on what you verified.**  A step never resolves `window_target`
+    again after its guard has passed: window names are reused, so a second
+    `mux.pid()` can return a same-named successor the guard never saw.  The
+    pid comes out of the guard's own snapshot (`_verified_pid()`).
+  - **Bind the queue cleanup to the assignment, not the name.**  `status` and
+    `worker` both return to their old values when a human resets a task and
+    the same Worker name pulls it again, so the retirement also records the
+    task's `started_at` — the generation `plan.sh pull` rewrites on every
+    execution — and asserts it under plan.sh's lock.
+
+## Evidence (t020, Codex P1-2)
+
+Nothing here concludes a death from a *failure to observe* one.  Both mux
+backends collapse a timeout into an empty list, and `server_running()` is a
+5s subprocess on tmux and a socket ping on herdr — an outage big enough to
+empty the listing empties the probe too, and two failures that corroborate
+each other are not evidence.  So proof of an exit is a recorded pane_pid that
+`/proc` says is gone, or absence from a listing that returned *something*.
+
+Every other reading waits.  Waiting has one exit, and it is not automatic:
+`_check_stall()` escalates a retirement that has not moved in
+`STALL_REPORT_AFTER` seconds to the Director, once, and changes nothing.  The
+automatic direction is always "kill nothing, rewrite nothing" — resolving an
+ambiguity by rewriting the queue is how the last three defects in this module
+were built (memory: fail-closed-guard-can-recreate-the-defect).
 """
 
 import json
@@ -89,6 +119,10 @@ SHUTDOWN_MESSAGE = "タスクなし、shutdown"
 
 _REQUEST_SUFFIX = ".json"
 _PROGRESS_SUFFIX = ".progress.json"
+#: Deliberately not a `.json` suffix: `list_agents()` keys off those two, and a
+#: third `.json` file would be read as a retirement for an agent named
+#: "<agent>.stall".
+_STALL_SUFFIX = ".stalled"
 
 #: created_at values come from two different sources (an ISO string rounded to
 #: whole seconds on herdr, a float epoch on tmux), so compare with a tolerance
@@ -113,6 +147,18 @@ SIGKILL_REPORT_AFTER = 3
 #: from 1 (plan.sh is broken → retry) so cleanup can tell the two apart.
 PLAN_PRECONDITION_UNMET = 3
 
+#: How long a retirement may stay unsettled before the Director hears about it
+#: once.  Every fail-closed branch in this module ends in "wait and look again
+#: next cycle", and some of those waits cannot resolve on their own: a request
+#: whose Worker left no recorded pid, written while the backend was the last
+#: thing listing that window, has nothing left that can ever supply proof.
+#: Waiting forever would be the silent half of the ghost task this module
+#: exists to remove — so the wait gets an exit, and that exit is a human, not
+#: an automatic queue rewrite (t020, Codex P1-2).  Generous on purpose: the
+#: normal escalation is 70s and a slow cleanup retries for a few minutes, so
+#: anything still in flight at this age is genuinely stuck.
+STALL_REPORT_AFTER = 1800
+
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -130,8 +176,22 @@ def progress_path(registry_dir, agent: str) -> Path:
     return retirements_dir(registry_dir) / f"{agent}{_PROGRESS_SUFFIX}"
 
 
+def stall_path(registry_dir, agent: str) -> Path:
+    """Receipt for "the Director has already been told this one is stuck"."""
+    return retirements_dir(registry_dir) / f"{agent}{_STALL_SUFFIX}"
+
+
 def list_agents(registry_dir) -> list:
-    """Every agent name with a request and/or a progress marker on disk."""
+    """Every agent name with any retirement file on disk.
+
+    Includes the stall receipt, which outlives its marker whenever a human
+    clears the request by hand — which is precisely what the escalation asks
+    them to do.  Left behind, it would silence the *next* stall for the same
+    agent; listed here, the cycle that finds neither a request nor a progress
+    file sweeps it up (`_check_stall`).  Callers all tolerate an agent with no
+    request and no progress (dispatcher's `warn_on_unconsumed_retirements()`
+    skips a missing request; `_advance()` returns None).
+    """
     d = retirements_dir(registry_dir)
     agents = set()
     try:
@@ -143,6 +203,8 @@ def list_agents(registry_dir) -> list:
             continue
         if p.name.endswith(_PROGRESS_SUFFIX):
             agents.add(p.name[: -len(_PROGRESS_SUFFIX)])
+        elif p.name.endswith(_STALL_SUFFIX):
+            agents.add(p.name[: -len(_STALL_SUFFIX)])
         elif p.name.endswith(_REQUEST_SUFFIX):
             agents.add(p.name[: -len(_REQUEST_SUFFIX)])
     return sorted(agents)
@@ -230,6 +292,53 @@ def process_alive(pid) -> bool:
         return stat[stat.rindex(")") + 2] != "Z"
     except (ValueError, IndexError):
         return True
+
+
+# ---------------------------------------------------------------------------
+# Assignment identity
+# ---------------------------------------------------------------------------
+
+#: Returned by `read_task_started_at()` when the card could not be read at all.
+#: Distinct from `None`, which is the card saying "no execution has started" —
+#: a real value worth asserting later.  Collapsing the two would let an
+#: unreadable card be recorded as `started_at: null` and then match a card that
+#: genuinely has none.
+UNKNOWN_STARTED_AT = object()
+
+
+def read_task_started_at(queue_dir, mission: str, task_id: str):
+    """`started_at` from a task card, or `UNKNOWN_STARTED_AT`.
+
+    This is the *assignment generation*: `plan.sh pull` rewrites it on every
+    execution, so it is what separates "the assignment this retirement is
+    about" from "another run of the same task, by a Worker with the same
+    name".  status and worker both come back to their old values on a reset +
+    re-pull, which is why neither can play this role (Codex P1-1).
+
+    Read with a deliberately small parser rather than plan.sh: this runs on
+    every retirement request, inside watchdog's cycle, and must not be able to
+    block on the queue lock.  Only the frontmatter is scanned, and only for one
+    key whose value is a quoted scalar.
+    """
+    if not queue_dir or not mission or not task_id:
+        return UNKNOWN_STARTED_AT
+    path = Path(queue_dir) / "missions" / str(mission) / "tasks" / f"{task_id}.md"
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return UNKNOWN_STARTED_AT
+    in_frontmatter = False
+    for line in text.splitlines():
+        if line.strip() == "---":
+            if in_frontmatter:
+                break            # end of frontmatter, key absent
+            in_frontmatter = True
+            continue
+        if not in_frontmatter or not line.startswith("started_at:"):
+            continue
+        raw = line.split(":", 1)[1].strip().strip('"').strip("'").strip()
+        return None if raw.lower() in ("", "null", "none", "~") else raw
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -331,15 +440,22 @@ def identity_matches(recorded: Optional[dict], current: Optional[dict]) -> Tuple
 
 def build_request(agent: str, window_target: str, reason: str, identity: dict,
                   mission: Optional[str] = None, task_id: Optional[str] = None,
-                  message: str = SHUTDOWN_MESSAGE) -> dict:
+                  message: str = SHUTDOWN_MESSAGE,
+                  task_started_at=UNKNOWN_STARTED_AT) -> dict:
     """A dispatcher-side retirement request.
 
     `mission` / `task_id` are None for the idle / no-task / blocked-stuck
     paths — by definition those Workers hold neither an assignment nor an
     in_progress task, which is precisely why the request cannot live in task
     frontmatter (§3-3 案A).
+
+    `task_started_at` is the assignment generation this retirement is bound to.
+    The key is **omitted entirely** when it could not be read, so that a later
+    cleanup can tell "this task had no started_at" (assert it) apart from "we
+    never found out" (assert nothing, and fall back to the weaker name-based
+    preconditions).
     """
-    return {
+    req = {
         "agent": agent,
         "window_target": window_target,
         "reason": reason,
@@ -349,6 +465,30 @@ def build_request(agent: str, window_target: str, reason: str, identity: dict,
         "task_id": task_id,
         "spawn_identity": dict(identity),
     }
+    if task_started_at is not UNKNOWN_STARTED_AT:
+        req["task_started_at"] = task_started_at
+    return req
+
+
+def _carried_from_request(req: dict) -> dict:
+    """Fields the progress file must keep after the request is gone.
+
+    The terminal phase is where the queue gets repaired, and it must not
+    depend on a second file still being on disk — losing the request after the
+    Worker is already dead would otherwise mean nobody ever learns which task
+    to reset, or which *execution* of it this retirement was bound to.
+    `task_started_at` is carried by key presence for the same reason
+    `build_request()` omits it: absent means "never found out", and that has
+    to stay distinguishable from a recorded `None`.
+    """
+    carried = {
+        "mission": req.get("mission"),
+        "task_id": req.get("task_id"),
+        "reason": req.get("reason"),
+    }
+    if "task_started_at" in req:
+        carried["task_started_at"] = req["task_started_at"]
+    return carried
 
 
 def build_progress(previous: Optional[dict], phase: str, **fields) -> dict:
@@ -444,7 +584,7 @@ class RetirementExecutor:
         self.kill_process = kill_process or _default_kill_process
         self.now = now or time.time
         self._live_windows: set = set()
-        self._listing_authoritative = False
+        self._listing_authority: Optional[bool] = None
         self._unavailable_logged_at = 0.0
         self._waiting_logged_at: dict = {}
 
@@ -482,8 +622,23 @@ class RetirementExecutor:
                 f"Not writing a marker; will retry when identity is readable."
             )
             return False
+        # Read here rather than taken from the caller: every caller would have
+        # to remember, and the one that forgot would silently fall back to the
+        # name-only preconditions that Codex P1-1 is about.  One place decides.
+        started_at = read_task_started_at(self.queue_dir, mission, task_id)
+        if task_id and started_at is UNKNOWN_STARTED_AT:
+            # Not fatal — the name-based preconditions still hold most of the
+            # line — but it silently weakens the cleanup, so it is said out
+            # loud here, where the cause (an unreadable card, a missing
+            # queue_dir) is still visible.
+            self.log(
+                f"[retire] {agent}: WARNING could not read started_at for "
+                f"{mission}/{task_id} (queue_dir={self.queue_dir}) — the cleanup "
+                f"will not be bound to this execution of the task"
+            )
         req = build_request(agent, window_target, reason, identity,
-                            mission=mission, task_id=task_id, message=message)
+                            mission=mission, task_id=task_id, message=message,
+                            task_started_at=started_at)
         if not write_json_atomic(request_path(self.registry_dir, agent), req):
             self.log(f"[retire] {agent}: failed to write retirement request")
             return False
@@ -560,7 +715,7 @@ class RetirementExecutor:
             return []
 
         self._live_windows = set(self.mux.list())
-        self._listing_authoritative = self._listing_is_authoritative()
+        self._listing_authority = self._listing_authority_for_cycle()
         actions = []
         for agent in agents:
             try:
@@ -570,6 +725,12 @@ class RetirementExecutor:
                 action = "error"
             if action:
                 actions.append((agent, action))
+            try:
+                if self._check_stall(agent):
+                    actions.append((agent, "stall_reported"))
+            except Exception as e:  # noqa: BLE001 — reporting must not break the machine
+                self.log(f"[retire] {agent}: ERROR checking for a stalled retirement: "
+                         f"{type(e).__name__}: {e}")
         return actions
 
     # ------------------------------------------------------------------
@@ -607,8 +768,12 @@ class RetirementExecutor:
     def _window_alive(self, target: str) -> bool:
         return target in self._live_windows
 
-    def _listing_is_authoritative(self) -> bool:
+    def _listing_authority_for_cycle(self) -> Optional[bool]:
         """May "absent from this cycle's window list" be read as "it is gone"?
+
+        `True` = yes, `None` = unknown.  There is deliberately no `False`:
+        nothing here ever proves a Worker is *alive*, only that this cycle's
+        listing is or is not usable as a death certificate.
 
         A non-empty list proves the query worked.  An empty one proves
         nothing: **both backends turn a failed or timed-out query into `[]`**
@@ -620,25 +785,27 @@ class RetirementExecutor:
         be reset in QA (t003 FAIL-1) while watchdog's own `_is_mass_kill()`
         was refusing to act on the very same empty list three seconds earlier.
 
-        The one reading that rescues an empty list is a backend that is itself
-        down: then there are no windows to list, so emptiness is the truth
-        rather than an outage.  Without that exception the death of the last
-        Worker would leave a marker nothing could ever settle — the ghost task
-        this module exists to remove.
+        t019 rescued the empty list with a second probe: `server_running()`
+        returning False was read as "the backend is down, so emptiness is the
+        truth".  That probe cannot carry the weight (Codex P1-2).
+        `TmuxBackend.server_running()` returns False on a timeout or an
+        exception as readily as on a dead server, and HerdrBackend's is a ping
+        on a socket — neither is evidence that any Worker *process* exited.
+        A single outage that took out the listing would take out the probe
+        too, and the two failures would then corroborate each other into
+        authority to reset a live Worker's task: the same defect the listing
+        gate was added to close, one layer down (memory:
+        fail-closed-guard-can-recreate-the-defect).
 
-        A backend that cannot answer "are you up?" is treated as up, i.e. the
-        list stays unauthoritative: the cost is waiting a cycle, the cost of
-        the other direction is resetting a live Worker's task.
+        So an empty list stays `None` — unknown — and cleanup requires
+        positive evidence of an exit.  The concern t019 had was real, though:
+        without an exit, the death of the last Worker leaves a marker nothing
+        can ever settle, and a marker nobody looks at is the silent half of a
+        ghost task.  The exit is `_check_stall()`, which escalates to the
+        Director once.  A human is the right terminator for an ambiguity, and
+        the automatic direction stays "kill nothing, rewrite nothing".
         """
-        if self._live_windows:
-            return True
-        server_running = getattr(self.mux, "server_running", None)
-        if server_running is None:
-            return False
-        try:
-            return not server_running()
-        except Exception:  # noqa: BLE001 — an unanswerable probe is not proof
-            return False
+        return True if self._live_windows else None
 
     def _exit_evidence(self, req: Optional[dict], prog: Optional[dict],
                        target: str) -> Tuple[bool, str]:
@@ -653,7 +820,7 @@ class RetirementExecutor:
 
         Only when no pid was ever recorded does the window list get a vote,
         and then only a list we have reason to trust (see
-        `_listing_is_authoritative()`).  "The backend did not mention it" is
+        `_listing_authority_for_cycle()`).  "The backend did not mention it" is
         not a death certificate.
         """
         recorded = (prog or {}).get("pane_pid")
@@ -665,7 +832,7 @@ class RetirementExecutor:
             return True, f"recorded pane_pid {recorded} is gone"
         if self._window_alive(target):
             return False, f"window {target!r} is still listed"
-        if self._listing_authoritative:
+        if self._listing_authority is True:
             return True, f"window {target!r} absent from a corroborated window list"
         return False, (
             "no pane_pid was recorded and the window list is empty without "
@@ -676,6 +843,81 @@ class RetirementExecutor:
         """Has the Worker we were retiring finished exiting?  Proof only."""
         gone, _why = self._exit_evidence(req, prog, target)
         return gone
+
+    def _check_stall(self, agent: str) -> bool:
+        """Escalate a retirement that has been unable to move for too long.
+
+        This is the exit every "wait and look again next cycle" branch needs.
+        Most of them do resolve on their own — the backend answers, the pid
+        dies, plan.sh unlocks.  One class cannot: a request whose Worker never
+        had a pane_pid recorded, whose window stopped being listed, and whose
+        listing is therefore permanently unusable as evidence (see
+        `_listing_authority_for_cycle()`).  Nothing will ever arrive to settle
+        it, and the marker meanwhile blocks `has_marker()`, so dispatcher stops
+        asking too.  Silence there is the ghost task this module exists to
+        remove, just with the daemons keeping quiet about it.
+
+        The escalation is a message, **not** a queue rewrite.  An ambiguity
+        this old is exactly the thing a person should look at: if the Worker is
+        alive, an automatic reset hands its task to somebody else, and if it is
+        dead, a human `plan.sh update --reset` costs one command.  Automatic
+        always means "kill nothing, rewrite nothing".
+
+        Reported once, and durably so: a watchdog that restarts every few
+        minutes must not turn one stuck marker into a stream of alerts.
+        """
+        req = read_json(request_path(self.registry_dir, agent))
+        prog = read_json(progress_path(self.registry_dir, agent))
+        if req is None and prog is None:
+            unlink_quiet(stall_path(self.registry_dir, agent))
+            return False
+        # cleanup_failed has already told the Director, with a recipe; a second
+        # message about the same marker would only add noise.
+        if (prog or {}).get("phase") == PHASE_CLEANUP_FAILED:
+            return False
+        if stall_path(self.registry_dir, agent).exists():
+            return False
+
+        since = (req or {}).get("requested_at") or (prog or {}).get("updated_at")
+        try:
+            age = self.now() - float(since)
+        except (TypeError, ValueError):
+            return False
+        if age < STALL_REPORT_AFTER:
+            return False
+
+        phase = (prog or {}).get("phase") or "requested (no step taken yet)"
+        mission = (req or {}).get("mission") or (prog or {}).get("mission")
+        task_id = (req or {}).get("task_id") or (prog or {}).get("task_id")
+        target = (req or {}).get("window_target") or f"{agent}-worker"
+        if task_id and mission:
+            task_line = f"task {task_id} (mission={mission}) は in_progress のままです。"
+            recipe = (f"死んでいた場合の後始末: plan.sh update {task_id} --status pending "
+                      f"--reset --mission {mission} を手で実行し、")
+        else:
+            task_line = "この Worker は task を持っていないので、queue の後始末は不要です。"
+            recipe = "死んでいた場合は "
+        message = (
+            f"watchdog が Worker {agent} の終了処理を {age / 60:.0f} 分進められていません "
+            f"(phase={phase}, window={target})。Worker が生きているのか既に死んだのか "
+            f"裏が取れないため、**何も kill せず queue も書き換えていません**。{task_line}\n"
+            f"確認してください: 窓 {target} が実在するか / pane のプロセスが生きているか。\n"
+            f"{recipe}registry/retirements/{agent}.* を削除してください。"
+        )
+        reported = self._report(agent, prog or {}, message)
+        self.log(f"[retire] {agent}: retirement stalled for {age:.0f}s at phase={phase} "
+                 f"— escalated to the Director (director_reached={reported})")
+        # Written whether or not the notifier worked: the log line above is the
+        # fallback record, and retrying a broken notifier every cycle forever
+        # is the noise this receipt exists to prevent.
+        write_json_atomic(stall_path(self.registry_dir, agent), {
+            "agent": agent,
+            "reported_at": self.now(),
+            "phase": phase,
+            "age_seconds": round(age, 1),
+            "director_reached": reported,
+        })
+        return True
 
     def _log_waiting(self, agent: str, message: str) -> None:
         """Log a "cannot tell yet" once every 5 minutes per agent.
@@ -696,13 +938,22 @@ class RetirementExecutor:
             self.log(f"[retire] {agent}: failed to persist phase={phase} — not proceeding")
         return ok
 
-    def _guard(self, agent: str, req: dict, target: str) -> Tuple[str, str]:
-        """R6 + R7 + premise re-check, immediately before every destructive step."""
+    def _guard(self, agent: str, req: dict, target: str) -> Tuple[str, str, dict]:
+        """R6 + R7 + premise re-check, immediately before every destructive step.
+
+        Returns `(verdict, why, identity)`, where `identity` is **the very
+        snapshot the verdict was reached on**.  Callers must take the pid they
+        act on from it rather than resolving `target` again: window names are
+        reused, so a second `mux.pid(target)` can hand back a same-named
+        successor that this guard never saw, and that pid would then be
+        persisted and signalled without ever having been checked against the
+        request (Codex P1-3).
+        """
         if not self.repo_identity_check():
             return GUARD_SKIP, (
                 f"self-identity check failed for repo_root={self.repo_root} "
                 f"(missing or no longer a git checkout — likely a removed worktree)"
-            )
+            ), {}
 
         # The premise of an idle retirement is "this Worker has no work".  It
         # was true when dispatcher wrote the marker; it is checked again here
@@ -715,15 +966,37 @@ class RetirementExecutor:
         if not req.get("task_id") and self.queue_dir:
             try:
                 if (self.queue_dir / "assignments" / agent).exists():
-                    return GUARD_DISCARD, "Worker picked up a task after the request was written"
+                    return (GUARD_DISCARD,
+                            "Worker picked up a task after the request was written", {})
             except OSError:
                 pass
 
         current = current_spawn_identity(self.registry_dir, self.mux, target)
         ok, why = identity_matches(req.get("spawn_identity"), current)
         if not ok:
-            return GUARD_DISCARD, why
-        return GUARD_OK, ""
+            return GUARD_DISCARD, why, current
+        return GUARD_OK, "", current
+
+    @staticmethod
+    def _verified_pid(req: dict, identity: dict) -> Optional[int]:
+        """The pid this step is allowed to act on, or None.
+
+        Prefers the pid recorded in the request, which is the one the guard
+        just compared against; falls back to the guard's own snapshot for the
+        backends that record only a `created_at` (herdr's `pane_process_info`
+        can fail while the window is perfectly listable).  Either way the value
+        comes out of an identity check that has already passed — it is never a
+        fresh resolution of a reusable window name.
+        """
+        recorded = (req.get("spawn_identity") or {}).get("pane_pid")
+        if recorded is None:
+            recorded = (identity or {}).get("pane_pid")
+        if recorded is None:
+            return None
+        try:
+            return int(recorded)
+        except (TypeError, ValueError):
+            return None
 
     def _plan_sh_usable(self) -> bool:
         return bool(self.plan_sh) and self.plan_sh.is_file()
@@ -753,9 +1026,7 @@ class RetirementExecutor:
                 self.log(f"[retire] {agent}: window {target!r} already gone before "
                          f"first step ({evidence})")
                 self._write_progress(agent, None, PHASE_TERMINATED, window_gone=True,
-                                     mission=req.get("mission"),
-                                     task_id=req.get("task_id"),
-                                     reason=req.get("reason"))
+                                     **_carried_from_request(req))
                 return "terminated"
 
             # Missing from the list, but not proven gone.  Nothing can be sent
@@ -783,7 +1054,7 @@ class RetirementExecutor:
             )
             return "blocked"
 
-        verdict, why = self._guard(agent, req, target)
+        verdict, why, identity = self._guard(agent, req, target)
         if verdict == GUARD_SKIP:
             self.log(f"[retire] {agent}: skipping this cycle — {why}")
             return "skipped"
@@ -792,7 +1063,10 @@ class RetirementExecutor:
             self._write_progress(agent, None, PHASE_DISCARDED, discard_reason=why)
             return "discarded"
 
-        pane_pid = current_spawn_identity(self.registry_dir, self.mux, target).get("pane_pid")
+        # From the guard's snapshot, not a second lookup: this pid is what the
+        # later phases signal, and re-resolving the window name here is how a
+        # same-named successor's pid used to get persisted (Codex P1-3).
+        pane_pid = self._verified_pid(req, identity)
         # R1: the intent is durable before the act.  If the write fails we
         # have not sent anything, and next cycle starts over cleanly.
         #
@@ -804,9 +1078,7 @@ class RetirementExecutor:
         if not self._write_progress(agent, None, PHASE_NOTIFIED,
                                     deadline=self.now() + self.grace_period,
                                     pane_pid=pane_pid,
-                                    mission=req.get("mission"),
-                                    task_id=req.get("task_id"),
-                                    reason=req.get("reason")):
+                                    **_carried_from_request(req)):
             return "blocked"
         message = req.get("message") or SHUTDOWN_MESSAGE
         if not self.mux.send(target, message):
@@ -831,7 +1103,7 @@ class RetirementExecutor:
         if self.now() < (prog.get("deadline") or 0):
             return None  # still inside its grace period
 
-        verdict, why = self._guard(agent, req, target)
+        verdict, why, identity = self._guard(agent, req, target)
         if verdict == GUARD_SKIP:
             self.log(f"[retire] {agent}: REFUSING SIGTERM — {why}")
             return "skipped"
@@ -840,7 +1112,12 @@ class RetirementExecutor:
             self._write_progress(agent, prog, PHASE_DISCARDED, discard_reason=why)
             return "discarded"
 
-        pane_pid = self.mux.pid(target)
+        # The pid the guard just vouched for.  Asking `mux.pid(target)` again
+        # here was Codex P1-3: a Worker that exits between the two calls hands
+        # the window name to a same-named successor, whose pid would then be
+        # written to the marker and SIGTERM'd without ever being compared to
+        # the request.
+        pane_pid = self._verified_pid(req, identity)
         if pane_pid is None:
             self.log(f"[retire] {agent}: window {target!r} alive but pane pid unreadable — waiting")
             return "skipped"
@@ -872,7 +1149,7 @@ class RetirementExecutor:
         if self.now() < (prog.get("deadline") or 0):
             return None
 
-        verdict, why = self._guard(agent, req, target)
+        verdict, why, identity = self._guard(agent, req, target)
         if verdict == GUARD_SKIP:
             self.log(f"[retire] {agent}: REFUSING SIGKILL — {why}")
             return "skipped"
@@ -881,7 +1158,11 @@ class RetirementExecutor:
             self._write_progress(agent, prog, PHASE_DISCARDED, discard_reason=why)
             return "discarded"
 
-        pane_pid = prog.get("pane_pid") or self.mux.pid(target)
+        # The recorded pid first: it is the process this machine already sent
+        # SIGTERM to, so finishing the job on any other pid would be a second,
+        # unannounced kill.  The fallback is still the guard's own snapshot,
+        # never a fresh resolution of the window name (Codex P1-3).
+        pane_pid = prog.get("pane_pid") or self._verified_pid(req, identity)
         if pane_pid is None:
             self.log(f"[retire] {agent}: no pane pid for SIGKILL — waiting")
             return "skipped"
@@ -1004,6 +1285,28 @@ class RetirementExecutor:
             argv = ["bash", str(self.plan_sh), "update", task_id,
                     "--status", "pending", "--reset", "--mission", mission,
                     "--expect-status", "in_progress", "--expect-worker", agent]
+            # Bind the reset to *this* assignment, not merely to this name.
+            # status and worker both come back to exactly these values when a
+            # human resets the task and a same-named Worker pulls it again —
+            # crewvia reuses names by design — so without the generation the
+            # two preconditions above pass on the successor's execution and
+            # reset work that is under way (Codex P1-1).  Omitted, never
+            # guessed, when the card could not be read at request time: a
+            # fabricated `null` would match a genuinely unstarted task.
+            if "task_started_at" in (req or {}):
+                expected_started_at = (req or {})["task_started_at"]
+            elif "task_started_at" in prog:
+                expected_started_at = prog["task_started_at"]
+            else:
+                expected_started_at = UNKNOWN_STARTED_AT
+                self.log(
+                    f"[retire] {agent}: no assignment generation recorded for "
+                    f"{mission}/{task_id} — falling back to status/worker "
+                    f"preconditions only"
+                )
+            if expected_started_at is not UNKNOWN_STARTED_AT:
+                argv += ["--expect-started-at",
+                         "null" if expected_started_at is None else str(expected_started_at)]
             env = dict(os.environ)
             if self.queue_dir:
                 env["CREWVIA_QUEUE"] = str(self.queue_dir)
@@ -1047,6 +1350,7 @@ class RetirementExecutor:
         # instead of starting a second termination.
         unlink_quiet(request_path(self.registry_dir, agent))
         unlink_quiet(progress_path(self.registry_dir, agent))
+        unlink_quiet(stall_path(self.registry_dir, agent))
         return "cleaned"
 
     def _cleanup_failed(self, agent: str, prog: dict, why: str,
@@ -1089,6 +1393,7 @@ class RetirementExecutor:
         )
         unlink_quiet(request_path(self.registry_dir, agent))
         unlink_quiet(progress_path(self.registry_dir, agent))
+        unlink_quiet(stall_path(self.registry_dir, agent))
         return "discarded_cleared"
 
     def _report(self, agent: str, prog: dict, message: str) -> bool:

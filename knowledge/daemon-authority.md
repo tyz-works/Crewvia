@@ -604,24 +604,21 @@ pending に戻す」「後任の assignment を消す」が起きる。plan.sh �
 assignment 内容一致チェックは *別 task の* assignment しか守らず、
 *同じ task の別の実行* は素通りする。
 
-`plan.sh update` に前提条件フラグを足した:
-
-```
-plan.sh update <id> --status pending --reset --mission <slug> \
-    --expect-status in_progress --expect-worker <agent>
-```
-
-判定は **queue ロックの内側**、最初の書き換えの直前で行う (読んで決めて
-書く、の間に他の writer が入れない)。前提が外れたら 1 バイトも書かずに
+`plan.sh update` に前提条件フラグ (`--expect-status` / `--expect-worker`) を
+足した。判定は **queue ロックの内側**、最初の書き換えの直前で行う (読んで
+決めて書く、の間に他の writer が入れない)。前提が外れたら 1 バイトも書かずに
 **exit 3** — 実エラーの exit 1 と区別できるので、呼び出し側は「世の中が
-変わった」と「plan.sh が壊れた」を取り違えない。リトライのたびに再評価
-される。`--expect-status` の typo は exit 1 (黙って永久 no-op にしない)。
+変わった」と「plan.sh が壊れた」を取り違えない。
 
 `expect-status` を `in_progress` だけに絞ったのは意図的:
 `needs_director` などは Director が握っている状態で、retirement が横から
 戻してよい対象ではない。外れた場合は Director に「queue は変更していない」
-と報告して settle する (assignment ファイルはそのまま残るが、dispatcher の
-D4 が独立に見つける)。
+と報告して settle する。
+
+> **t024 で撤去。** このフラグ群は `plan.sh retire` (§3-5) に吸収した。
+> 前提を「どれを渡すか」という呼び出し側の選択として残したことが、次の 2 巡で
+> P1 を生む形そのものになったため (§6-5)。`in_progress` 限定も retire の
+> 内側に移してある。
 
 ### (3) SIGKILL の「送信成功」を「死亡」と読まない
 
@@ -639,7 +636,8 @@ marker も消えるが、Worker は生きたまま。送信が成功しても即
 ### 回帰テストの形
 
 3 件とも「ガードが誤発火したとき何が失われるか」を assert する
-(`tests/test_retirement.py` の t019 節 / `tests/plan-update-expect.bats`)。
+(`tests/test_retirement.py` の t019 節。plan.sh 側は t024 で
+`tests/plan-assignment-identity.bats` の retire 節に統合した)。
 phase 名やフラグではなく、生きた Worker の task が `in_progress` のまま
 であること、完了済みの成果が pending に巻き戻らないこと、後任の
 assignment が残っていることを見る。逆向き (保留に倒しすぎて永久に
@@ -666,13 +664,9 @@ t012 (Codex) の 2 巡目。§6-3 が「根拠が揃う前に後始末に到達�
 穴が、`worker` 欄では見えない形で残っていた。
 
 区別が付くのは `started_at` だけ。`plan.sh pull` が実行のたびに書き換える
-ので、これが **割り当ての世代** になる。
-
-```
-plan.sh update <id> --status pending --reset --mission <slug> \
-    --expect-status in_progress --expect-worker <agent> \
-    --expect-started-at <retirement 要求時の started_at>
-```
+ので、これが **割り当ての世代** になる。t020 ではこれを
+`--expect-started-at` として足し、t024 で `plan.sh retire --started-at`
+(§3-5) に吸収した。
 
 `started_at` は retirement request を書く時点で `read_task_started_at()` が
 task カードから読み、request → progress と引き継ぐ。**呼び出し側に渡させない**
@@ -680,6 +674,9 @@ task カードから読み、request → progress と引き継ぐ。**呼び出�
 `approve-judgment-needs-allowlist-and-scope` — 判定 unit は 1 つに絞る)。
 カードが読めなかった場合はキーごと省略し、`null` を捏造しない: 捏造した
 `null` は「まだ実行が始まっていない task」に一致してしまう。
+
+> **t020 の積み残し。** 省略した場合に「status と worker だけで reset する」
+> フォールバックを残したのが、3 巡目の P1-2 になった (§6-5 (2))。
 
 ### (2) probe の失敗を死亡の証拠にしない (P1-2)
 
@@ -725,6 +722,112 @@ P1-1 と P1-3 は TOCTOU なので、テストは「検査と使用の間に後�
 実際に作る (`SuccessorRaceMux` は `pid()` の 2 回目で後任に入れ替わる)。
 assert するのは「後任のプロセスが生きていること」「後任が作業中の task が
 `in_progress` のままであること」— 誤発火したときに実際に失われるもの。
+
+---
+
+## 6-5. 3 巡分を 1 本の API に畳む (t024, 2026-09-22)
+
+t012 (Codex) の 3 巡目。残った P1 は 2 件で、3 件目の
+「assignment の削除がロックの外」は t021 (§3-5) が先に潰していた。
+この節は**その 2 件の修正**と、**なぜ 9 件が同じ形だったのか**の記録である。
+
+### 9 件が同じ 1 つの形だった
+
+| 巡 | 指摘 | 弱めていた前提 | 閉じ方 |
+|---|---|---|---|
+| 1 (t019) | 空の window list を死亡証明にした | 「観測できない」=「死んだ」 | 積極的な終了の証拠を要求 (§6-3 (1)) |
+| 1 | `--reset` が無条件 | 前提を 1 つも置かなかった | ロック内の前提チェック (§6-3 (2)) |
+| 1 | SIGKILL の送信成功を死亡と読んだ | 「送った」=「死んだ」 | `_await_exit()` で確認 (§6-3 (3)) |
+| 2 (t020) | 後始末が名前にしか束縛されていない | 「同じ名前」=「同じ実行」 | 世代 (`started_at`) で束縛 (§6-4 (1)) |
+| 2 | probe の失敗を死亡証明にした | 「backend が黙った」=「死んだ」 | authority は `True` / `None` だけ (§6-4 (2)) |
+| 2 | 検証した PID と殺す PID が別 | 「同じ窓名」=「同じインスタンス」 | `_verified_pid()`、窓名の再解決を禁止 (§6-4 (3)) |
+| 3 (t021) | assignment の削除がロックの外 | 判定と書き込みが割れてよい | 単一トランザクション (§3-5) |
+| 3 (t024) | PID 不在を死亡の証拠にした | 「PID が無い」=「死んだ」 | 記録済み PID を要求、無ければ保留 (下 (1)) |
+| 3 (t024) | 世代不明なら前提を弱めて実行 | 証拠が無いときに実行してよい | 自動 cleanup を見送り escalate (下 (2)) |
+
+同じ文が 9 回書ける: **証拠が足りない状態を、足りているほうに読み替えて
+破壊的な一手に進んでいた。** 個別にガードを足し続けたから 9 回出た —
+ガードを足せる場所がそのたびに 1 つ増え、呼び出し側は「どれを渡すか」を
+選べてしまう。選べる以上、どこかは緩む。
+
+### (1) 記録済み PID の不在は死亡の証拠ではない (P1-1)
+
+`_orphaned()` は `process_alive(prog["pane_pid"])` だけを見ていた。
+`build_progress()` は `pane_pid` を既定値 `None` で必ず埋めるので、
+**PID を答えられない backend** で始まった retirement — herdr の
+`pane_process_info` が失敗し identity が `created_at` だけになった状態、
+§6-4 (2) で保留が増えたぶん現実に起きうる — は `process_alive(None) ==
+False` により即 `terminated` に飛ぶ。猶予期間中に request が消えるだけで、
+Worker が生きていても次 cycle が task を pending に戻す。
+
+`_orphaned()` の分岐を 3 つにした。記録済み PID が**死んでいる**なら後始末を
+完了し、**生きている**なら marker を discard し、**そもそも記録が無い**なら
+何も書かずに保留する。3 つ目を discard ではなく保留にしたのは、discard が
+「この task はまだ修復が要るかもしれない」という唯一の記録を捨てるため。
+出口は `_check_stall()` (§6-4 (2) と同じ形)。
+
+同型の穴が 1 つ隣にあったので同時に塞いだ: `process_alive()` は**解釈できない
+値にも False を返す**。「そのプロセスは動いているか」への答えとしては正しいが、
+「我々の Worker は終了したか」への答えとしては PID 不在と同じ間違いになる
+(marker は JSON なので途中で切れた書き込みや手編集で壊れうる)。破壊的な一手の
+直前に PID を問う側は `recorded_pid()` を通し、「読めない」を `None` で受け
+取って保留に倒す — `_orphaned()` と `_exit_evidence()` の両方。
+
+### (2) 世代が不明なら、前提を弱めずに Director へ上げる (P1-2)
+
+§6-4 (1) はカードを読めなかった場合に `--expect-started-at` を省き、status と
+worker だけで reset するフォールバックを残していた。その 2 つは人間が差し戻して
+同名 Worker が pull し直すと元の値に完全に戻る — つまり**世代を読めなかった
+ときだけ、世代チェックが防ぐはずだった後任レースが復活する**。証拠が無いときに
+だけガードが外れるのだから、外れる条件は「守りたい状況」と一致している。
+
+`_bound_generation()` が `None` を返したら `_cleanup_deferred()` に倒す。
+自動の後始末は**一切しない**。Director に 1 度だけ — 何を確認し、どう修復し、
+marker をどう片付けるかを添えて — 報告し、marker は残す (この task が幽霊で
+ある可能性の唯一の記録なので)。後から card を読み直して埋めることはできない:
+そのとき読めるのは後任の世代だからである。
+
+### (3) 後始末を 1 呼び出しに集約し、サイトのガードを消した
+
+`_settle_terminated()` は `plan.sh retire` (§3-5) を 1 回呼ぶだけになった。
+渡すのは証拠 (mission / task / agent / 世代) で、判定は API の内側・単一
+ロックの中にある。これに伴い **`plan.sh update` の `--expect-*` 3 つは撤去**
+した (`tests/plan-update-expect.bats` も削除)。二重に残すとどちらが効いて
+いるか分からなくなり、片方だけ緩んだときに気付けない。
+
+吸収の際、`--expect-status in_progress` が持っていた意味は
+`RETIRE_RETIRABLE_STATUS` として retire の内側に移した。「終了している状態を
+列挙して弾く」ではなく「`in_progress` だけ通す」にしてある: 列挙は必ず漏れ、
+`needs_director` / `ready_for_verification` はどれも worker と `started_at` を
+残したままなので、漏れた瞬間に世代まで一致する reset が成立して、Worker 自身が
+書いた結末が消える。
+
+`update --reset` はガード無しのまま残した。**人間が card を見て打つコマンド**
+だからで、デーモンからは呼ばない。
+
+### 回帰テストの形
+
+- `test_red_orphan_recovery_without_a_recorded_pid_does_not_assume_a_death`
+  — PID を答えない backend で始めた retirement の request を消し、Worker が
+  生きたまま・task が `in_progress` のままであることを見る。保留の出口
+  (`STALL_REPORT_AFTER` 後に 1 通) まで同じテストで押さえる。
+- `test_red_cleanup_without_a_recorded_generation_is_escalated_not_guessed`
+  — request の瞬間だけ card を読めなくし、後から同名の後任を立てる。
+  後任の `started_at` が残ること、報告が 1 通で止まることを見る。
+- `test_unparseable_recorded_pid_is_not_evidence_of_a_death`
+  — marker の `pane_pid` を壊し、生きた Worker の task が巻き戻らないことを見る。
+- `test_cleanup_is_bound_to_the_execution_by_a_single_plan_sh_call`
+  — 逆向きの担保。後始末が `retire` 1 呼び出しで、渡すのが証拠だけであることを
+  引数で固定する (`--expect` で始まる引数が 1 つも無いこと)。
+- `tests/plan-assignment-identity.bats` の
+  "retire writes nothing once the execution recorded its own outcome"
+  — `needs-director` を通した card が retire で巻き戻らないこと。
+
+RED であることは、同じテストファイルを修正前の `scripts/` に当てて確認した
+(4 本とも fail → 修正後 41 passed)。`scripts/test_retirement_authority.sh`
+(実 tmux + 実 watchdog) の fixture も本番に合わせた: `plan.sh pull` は
+assignment 本体と `.identity` サイドカー、card の `started_at` を必ず書くので、
+本体だけ置いた fixture は本番より弱い状態を試していた。
 
 ---
 

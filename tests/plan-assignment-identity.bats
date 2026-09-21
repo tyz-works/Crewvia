@@ -407,6 +407,34 @@ assert d['started_at'] == '''$started''', d
   cleanup_queue
 }
 
+# retire が終了させられるのは「まだ自分で結末を書いていない実行」だけ。
+# 呼び出し側が持っていた `--expect-status in_progress` を API の中に取り込んだ
+# ぶんで、これが無いと needs_director / ready_for_verification の card を
+# pending に巻き戻してしまう — Worker 自身が書いた結末を消すことになる (t024)。
+@test "retire writes nothing once the execution recorded its own outcome" {
+  setup_queue "ai-retire-left-in-progress"
+  add_task t001
+
+  run plan pull --agent Ren --skills bash --task t001 --mission "$TEST_MISSION"
+  [ "$status" -eq 0 ]
+  local gen
+  gen="$(card_field t001 started_at)"
+
+  run plan_as Ren needs-director t001 "人手の判断が要る" --mission "$TEST_MISSION"
+  [ "$status" -eq 0 ]
+  [ "$(card_field t001 status)" = "needs_director" ]
+
+  # worker も started_at も needs-director では変わらないので、世代まで一致する。
+  run plan retire t001 --agent Ren --started-at "$gen" --mission "$TEST_MISSION"
+  [ "$status" -eq "$PRECONDITION_UNMET" ]
+
+  [ "$(card_field t001 status)" = "needs_director" ]
+  [ "$(card_field t001 worker)" = "Ren" ]
+  [ -f "$ASSIGN_DIR/Ren" ]
+
+  cleanup_queue
+}
+
 # ---------------------------------------------------------------------------
 # 4. Worker 名が assignments ディレクトリから出られないこと
 # ---------------------------------------------------------------------------

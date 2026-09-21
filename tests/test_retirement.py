@@ -76,7 +76,7 @@ t019 — 後始末の誤発火 (QA FAIL-1 / Codex P1 3 件。いずれも「Work
   test_empty_listing_with_a_live_backend_does_not_authorise_cleanup
   test_dead_recorded_pid_with_a_live_window_is_a_successor_not_a_death
     ↑ 最後の 1 本は逆向きの担保: 後任を巻き込まないこと。
-  (plan.sh 側の前提条件は tests/plan-update-expect.bats)
+  (plan.sh 側の前提条件は tests/plan-assignment-identity.bats の retire 節)
 
 t020 — Codex P1 3 件 (identity 束縛と証拠の強度。いずれも「名前は同じでも
 中身が別物になりうる」「観測できないことは証拠にならない」が根):
@@ -88,7 +88,16 @@ t020 — Codex P1 3 件 (identity 束縛と証拠の強度。いずれも「名�
     ↑ 逆向きの担保: P1-2 で増えた「保留」に出口があること。出口は自動 cleanup
       ではなく Director への 1 度きりの報告 (t019 が server_running() を証拠に
       使った動機はここにあった)。
-  (plan.sh 側の --expect-started-at は tests/plan-update-expect.bats)
+  (plan.sh 側の世代チェックは tests/plan-assignment-identity.bats の retire 節)
+
+t024 — Codex 3 巡目の残り 2 件。どちらも「証拠が無いこと」を「証拠がある」に
+読み替えて破壊的な一手に進む、という 9 件に共通の形の最後の 2 つ:
+  test_red_orphan_recovery_without_a_recorded_pid_does_not_assume_a_death
+  test_red_cleanup_without_a_recorded_generation_is_escalated_not_guessed
+  test_cleanup_is_bound_to_the_execution_by_a_single_plan_sh_call
+    ↑ 逆向きの担保: 後始末が `plan.sh retire` 1 呼び出しで、渡すのが証拠だけで
+      あることを引数で固定する。サイトごとの個別ガードが復活すると落ちる。
+  (対応表と設計は knowledge/daemon-authority.md §6-5)
 
 実行方法:
   python3 -m pytest tests/test_retirement.py -v
@@ -198,6 +207,26 @@ class Sandbox:
     def assignment_file(self) -> Path:
         return self.queue / "assignments" / AGENT
 
+    @property
+    def assignment_identity_file(self) -> Path:
+        return self.queue / "assignments" / (AGENT + ".identity")
+
+    def publish_assignment(self, started_at: str) -> None:
+        """`plan.sh pull` が公開するもの一式 — 本体 + 実行アイデンティティ。
+
+        サイドカーを省くと `classify_assignment()` は「世代を証明できない」に
+        倒れ、後始末は (正しく) 何もしない。本番の pull は必ず両方書くので、
+        片方だけ置いた fixture は本番より弱い状態を試していることになる。
+        """
+        self.assignment_file.parent.mkdir(parents=True, exist_ok=True)
+        self.assignment_file.write_text(f"{SLUG}:{TASK_ID}\n")
+        self.assignment_identity_file.write_text(json.dumps({
+            "mission": SLUG,
+            "task": TASK_ID,
+            "worker": AGENT,
+            "started_at": started_at,
+        }, ensure_ascii=False, sort_keys=True) + "\n")
+
     def task_status(self) -> str:
         for line in self.task_file.read_text().splitlines():
             if line.startswith("status:"):
@@ -256,7 +285,7 @@ def sandbox(tmp_path):
         f'worker: {AGENT}\nstarted_at: "2026-09-21T00:00:00Z"\ncompleted_at: null\n'
         f"---\n\n## Description\nfixture\n\n## Result\n"
     )
-    (root / "queue" / "assignments" / AGENT).write_text(f"{SLUG}:{TASK_ID}")
+    sb.publish_assignment("2026-09-21T00:00:00Z")
 
     # git checkout: repo_identity_ok() は .git の存在を確かめる
     subprocess.run(["git", "init", "-q", str(root)], check=True,
@@ -996,6 +1025,16 @@ def _wait_gone(pid: int, timeout: float = 5.0) -> None:
     raise AssertionError(f"pid {pid} が終了しない")
 
 
+def _set_progress_field(sandbox, key: str, value) -> None:
+    """progress marker の 1 フィールドを外から書き換える (破損・手編集の模擬)。"""
+    import lib_retirement
+    path = lib_retirement.progress_path(sandbox.registry, AGENT)
+    doc = lib_retirement.read_json(path)
+    assert doc is not None, "progress marker が無い"
+    doc[key] = value
+    assert lib_retirement.write_json_atomic(path, doc)
+
+
 def _phase(sandbox) -> str:
     import lib_retirement
     prog = lib_retirement.read_json(
@@ -1082,13 +1121,17 @@ def test_red_cleanup_does_not_clear_a_successor_assignment(sandbox):
     mux = FakeMux({WINDOW: pane_pid})
     ex = make_executor(sandbox, mux)
 
-    # Worker は既に殺し終えていて、後始末だけが残っている状態
+    # Worker は既に殺し終えていて、後始末だけが残っている状態。世代は記録済み —
+    # ここで見たいのは「世代を持っていてなお後任を巻き込まないか」なので、
+    # 世代を落とすと後始末が保留に倒れてしまい、肝心の経路を通らない。
+    original_started_at = sandbox.task_started_at()
     lib_retirement.write_json_atomic(
         lib_retirement.progress_path(sandbox.registry, AGENT),
         lib_retirement.build_progress(
             None, lib_retirement.PHASE_TERMINATED,
             window_gone=True, pane_pid=pane_pid,
-            mission=SLUG, task_id=TASK_ID, reason="timeout"))
+            mission=SLUG, task_id=TASK_ID, reason="timeout",
+            task_started_at=original_started_at))
 
     # その間に人間が reset → 後任 Worker が同じ task を pull した
     _set_task_field(sandbox, "worker", "Successor")
@@ -1300,8 +1343,9 @@ class SuccessorRaceMux(FakeMux):
 def test_red_cleanup_does_not_reset_a_same_named_successors_execution(sandbox):
     """同名の後任が同じ task を実行中なら、遅れて走った後始末は何も書き換えない。
 
-    RED (Codex P1-1): `--expect-status in_progress` と `--expect-worker <agent>`
-    は、人間が `--reset` して**同じ名前の Worker**が同じ task を pull し直した
+    RED (Codex P1-1): 当時の前提は `--expect-status in_progress` と
+    `--expect-worker <agent>` の 2 つだけ (t024 で `plan.sh retire` に集約)。
+    これは人間が `--reset` して**同じ名前の Worker**が同じ task を pull し直した
     後にちょうど両方とも成立する (crewvia は Worker 名を意図的に使い回す)。
     後任が作業中の task が pending に戻り、assignment も消える。区別が付くのは
     `started_at` — pull のたびに書き換わる「割り当ての世代」だけ。
@@ -1323,7 +1367,7 @@ def test_red_cleanup_does_not_reset_a_same_named_successors_execution(sandbox):
     second_started_at = '"2026-09-22T09:00:00Z"'
     assert second_started_at.strip('"') != first_started_at
     _set_task_field(sandbox, "started_at", second_started_at)
-    sandbox.assignment_file.write_text(f"{SLUG}:{TASK_ID}")
+    sandbox.publish_assignment(second_started_at.strip('"'))
 
     ex.process_all()                      # 後始末が走る cycle
 
@@ -1474,6 +1518,200 @@ def test_unresolvable_retirement_is_escalated_to_the_director_once(sandbox):
     lib_retirement.request_path(sandbox.registry, AGENT).unlink()
     ex.process_all()
     assert not lib_retirement.stall_path(sandbox.registry, AGENT).exists()
+
+
+# ---------------------------------------------------------------------------
+# t024 — Codex 3 巡目の残り 2 件。どちらも「証拠が無いこと」を
+# 「証拠がある」に読み替えて後始末を走らせてしまう欠陥。
+# ---------------------------------------------------------------------------
+
+def test_red_orphan_recovery_without_a_recorded_pid_does_not_assume_a_death(sandbox):
+    """PID を記録できていない marker は、request を失っても死亡扱いにしない。
+
+    RED (Codex 3 巡目 P1-1): `_orphaned()` は `process_alive(prog["pane_pid"])`
+    だけを見ていた。`build_progress()` は `pane_pid` を必ず埋める (既定値 None)
+    ので、**PID を答えられない backend** — herdr の `pane_process_info` が
+    失敗し identity が created_at だけになった状態 — で始まった retirement は
+    `process_alive(None) == False` により即 `terminated` に飛ぶ。猶予期間中に
+    request が消える / 読めなくなるだけで、Worker が元気に動いていても次 cycle の
+    後始末が task を pending に戻す。
+
+    要求されるのは「記録済みの PID」と「積極的な終了の証拠」の両方。どちらも
+    無いなら倒す先は保留であって、死亡ではない。
+    """
+    import lib_retirement
+
+    pane_pid = sandbox.spawn_worker_process()
+    sandbox.record_identity(WINDOW, pane_pid)          # identity は created_at のみ
+    mux = NoPidMux({WINDOW: pane_pid}, listed=[WINDOW])  # 窓は見えるが pid は読めない
+
+    clock = [time.time()]
+    ex = make_executor(sandbox, mux, grace_period=3600, now=lambda: clock[0])
+    assert ex.request(AGENT, WINDOW, "timeout", mission=SLUG, task_id=TASK_ID)
+
+    ex.process_all()
+    assert _phase(sandbox) == lib_retirement.PHASE_NOTIFIED
+    prog = lib_retirement.read_json(
+        lib_retirement.progress_path(sandbox.registry, AGENT))
+    assert prog["pane_pid"] is None, "この backend では PID は記録できないはず"
+
+    # 猶予期間の途中で request が消える (手で片付けられた / 読めなくなった)。
+    lib_retirement.request_path(sandbox.registry, AGENT).unlink()
+
+    for _ in range(3):
+        ex.process_all()
+
+    assert _pid_alive(pane_pid), "生きている Worker を殺した"
+    assert sandbox.task_status() == "in_progress", (
+        f"PID 不在を死亡証明にして task を pending に戻した (logs={sandbox.logs})")
+    assert sandbox.task_worker() == AGENT
+    assert sandbox.assignment_file.exists(), "生きている Worker の assignment を消した"
+    assert _phase(sandbox) != lib_retirement.PHASE_TERMINATED, (
+        "証拠が無いまま終端 phase に進んだ — 次 cycle で queue が書き換わる")
+
+    # 保留には出口がある: 自動の後始末ではなく Director への 1 度きりの報告。
+    assert not sandbox.notes, "まだ判断保留の範囲内なのに Director を呼んだ"
+    clock[0] += lib_retirement.STALL_REPORT_AFTER + 1
+    ex.process_all()
+    assert len(sandbox.notes) == 1, f"報告が 1 回に収まっていない: {sandbox.notes}"
+    assert "何も kill せず queue も書き換えていません" in sandbox.notes[0]
+
+
+def test_unparseable_recorded_pid_is_not_evidence_of_a_death(sandbox):
+    """壊れた pane_pid は「読めない」であって「死んだ」ではない。
+
+    同型の穴が 1 つ隣にある: `process_alive()` は解釈できない値に False を
+    返す — 「そのプロセスは動いているか」への答えとしては正しく、「我々の
+    Worker は終了したか」への答えとしては P1-1 と同じ間違いになる。
+    marker は JSON なので、途中で切れた書き込みや手作業の編集で壊れうる。
+
+    ここでは窓も一覧も生きているので、正しい振る舞いは「pid は当てにせず、
+    裏の取れた一覧に従う」= まだ居るので何もしない。
+    """
+    import lib_retirement
+
+    pane_pid = sandbox.spawn_worker_process()
+    sandbox.record_identity(WINDOW, pane_pid)
+    mux = FakeMux({WINDOW: pane_pid})
+    ex = make_executor(sandbox, mux, grace_period=3600)
+    assert ex.request(AGENT, WINDOW, "timeout", mission=SLUG, task_id=TASK_ID)
+
+    ex.process_all()                                   # → notified
+    _set_progress_field(sandbox, "pane_pid", "corrupt")
+
+    for _ in range(3):
+        ex.process_all()
+
+    assert _pid_alive(pane_pid), "生きている Worker を殺した"
+    assert sandbox.task_status() == "in_progress", (
+        f"壊れた pid を死亡証明にして task を pending に戻した (logs={sandbox.logs})")
+    assert sandbox.assignment_file.exists()
+
+    # 判定そのものも固定しておく: 破壊的な一手の直前に pid を問う側は、
+    # 「解釈できない」を `process_alive()` の False に潰さず None で受け取る。
+    assert lib_retirement.recorded_pid("not-a-pid") is None
+    assert lib_retirement.recorded_pid(None) is None
+    assert lib_retirement.recorded_pid("4321") == 4321
+
+
+def test_red_cleanup_without_a_recorded_generation_is_escalated_not_guessed(sandbox):
+    """世代を記録できなかった retirement は、前提を弱めてでも実行したりしない。
+
+    RED (Codex 3 巡目 P1-2): request 時に card を読めないと
+    `task_started_at` は記録されず、`_settle_terminated()` は
+    `--expect-started-at` を**意図的に省いて** status と worker だけで reset して
+    いた。その 2 つは、人間が差し戻して同名の後任が pull し直すと元の値に完全に
+    戻る (crewvia は Worker 名を使い回す)。つまり世代を読めなかったときだけ、
+    世代チェックが防ぐはずだった後任レースがそのまま復活する。
+
+    証拠が無いときに倒す先は「弱めて実行」ではなく「実行を見送って Director に
+    上げる」。後から card を読み直して埋めることもできない — そのとき読めるのは
+    後任の世代だからである。
+    """
+    import lib_retirement
+
+    pane_pid = sandbox.spawn_worker_process()
+    sandbox.record_identity(WINDOW, pane_pid)
+    mux = FakeMux({WINDOW: pane_pid})
+    ex = make_executor(sandbox, mux)
+
+    # request の瞬間だけ card が読めない (queue が別 mount / 一時的な I/O 失敗)。
+    hidden = sandbox.task_file.parent / "hidden-during-request"
+    sandbox.task_file.rename(hidden)
+    assert ex.request(AGENT, WINDOW, "timeout", mission=SLUG, task_id=TASK_ID)
+    hidden.rename(sandbox.task_file)
+
+    req = lib_retirement.read_json(lib_retirement.request_path(sandbox.registry, AGENT))
+    assert "task_started_at" not in req, "世代が読めていたらこのテストは前提が違う"
+
+    ex.process_all()                      # → notified
+    os.kill(pane_pid, signal.SIGKILL)     # Worker は shutdown を受けて抜けた
+    _wait_gone(pane_pid)
+    ex.process_all()                      # → terminated (後始末だけが残る)
+
+    # その間に人間が差し戻し、**同名の** Worker が同じ task を pull し直した。
+    successor_started_at = "2026-09-22T09:00:00Z"
+    _set_task_field(sandbox, "started_at", f'"{successor_started_at}"')
+    sandbox.publish_assignment(successor_started_at)
+
+    ex.process_all()                      # 後始末が走るはずだった cycle
+
+    assert sandbox.task_status() == "in_progress", (
+        f"世代の証拠が無いまま後任の task を pending に戻した (logs={sandbox.logs})")
+    assert sandbox.task_worker() == AGENT
+    assert sandbox.task_started_at() == successor_started_at, "後任の割り当てごと巻き戻した"
+    assert sandbox.assignment_file.exists(), "後任の assignment を消した"
+
+    # 見送りには出口がある: Director への 1 度きりの報告 + 手順。
+    assert len(sandbox.notes) == 1, f"報告が 1 回に収まっていない: {sandbox.notes}"
+    note = sandbox.notes[0]
+    assert TASK_ID in note and "--reset" in note, f"手作業の手順が書かれていない: {note}"
+    assert "registry/retirements" in note, f"marker の片付け方が書かれていない: {note}"
+
+    # 何 cycle 回しても、再起動しても 2 通目は出ない (この曖昧さは自力では解けない)。
+    for _ in range(3):
+        ex.process_all()
+    make_executor(sandbox, mux).process_all()
+    assert len(sandbox.notes) == 1, f"同じ marker で繰り返し報告した: {sandbox.notes}"
+    assert sandbox.task_status() == "in_progress"
+
+
+def test_cleanup_is_bound_to_the_execution_by_a_single_plan_sh_call(sandbox):
+    """後始末は `plan.sh retire` 1 呼び出し。判定は plan.sh の中 (単一ロック内)。
+
+    逆向きの担保。証拠 (agent / 世代 / mission) を渡して結果を受け取るだけ、
+    という形になっていることを引数で固定する。status や worker を個別に指定する
+    形に戻ると、「どれを渡すか」の判断が呼び出し側ごとに分かれ、1 つ緩めた場所
+    から同じ型の事故が再発する (3 巡で 9 件の P1 がまさにそれだった)。
+    """
+    started_at = sandbox.task_started_at()
+    pane_pid = sandbox.spawn_worker_process()
+    sandbox.record_identity(WINDOW, pane_pid)
+    mux = FakeMux({WINDOW: pane_pid})
+
+    calls = []
+
+    def _run(argv, env):
+        calls.append(list(argv))
+        return 0, ""
+
+    ex = make_executor(sandbox, mux, run_command=_run)
+    assert ex.request(AGENT, WINDOW, "timeout", mission=SLUG, task_id=TASK_ID)
+
+    ex.process_all()
+    os.kill(pane_pid, signal.SIGKILL)
+    _wait_gone(pane_pid)
+    ex.process_all()          # → terminated
+    ex.process_all()          # → 後始末
+
+    assert len(calls) == 1, f"後始末が 1 呼び出しに収まっていない: {calls}"
+    argv = calls[0]
+    assert argv[2] == "retire", f"新 API を通っていない: {argv}"
+    assert argv[3] == TASK_ID
+    assert argv[4:] == ["--agent", AGENT, "--started-at", started_at, "--mission", SLUG], (
+        f"証拠以外のものを渡している: {argv}")
+    assert not any(a.startswith("--expect") for a in argv), (
+        "サイト側のガードが二重に残っている — どちらが効いているか分からなくなる")
 
 
 # ---------------------------------------------------------------------------

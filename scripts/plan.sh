@@ -22,9 +22,6 @@ set -euo pipefail
 #   plan.sh update <task_id> [--mission <slug>] [--skills <csv>] [--blocked-by <csv>]
 #                            [--priority high|medium|low] [--worker <name>] [--status <status>]
 #                            [--description <text>] [--reset]
-#                            [--expect-status <csv>] [--expect-worker <name>]
-#                            [--expect-started-at <iso|null>]
-#                              前提が外れていたら何も書かずに exit 3 (詳細は cmd_update)
 #   plan.sh retire <task_id> --agent <name> --started-at <generation>
 #                            [--mission <slug>] [--outcome reset|needs-director]
 #                            [--reason "<1 行>"]
@@ -3044,11 +3041,6 @@ def cmd_dashboard_data(args):
 # cmd_update — safe in-place task frontmatter editor
 # ---------------------------------------------------------------------------
 
-#: Exit status for "the precondition did not hold, so nothing was written".
-#: Deliberately neither 0 (which would claim the edit happened) nor 1 (which a
-#: caller must treat as a broken plan.sh and retry).
-UPDATE_PRECONDITION_UNMET = 3
-
 
 def cmd_update(args):
     """Update specific frontmatter fields of an existing task.
@@ -3062,37 +3054,20 @@ def cmd_update(args):
                                [--status <status>]
                                [--description <text>]
                                [--reset]
-                               [--expect-status <csv>] [--expect-worker <name>]
-                               [--expect-started-at <iso|null>]
 
     --reset sets: status=pending, worker=null, started_at=null, completed_at=null
     Body (Description / Result sections) is never modified by this command.
 
-    --expect-status / --expect-worker / --expect-started-at are *preconditions*,
-    not edits: the task is only touched when it still looks the way the caller
-    expects.  All three are evaluated inside the queue lock, immediately before
-    the first mutation, so a caller cannot read the task, decide, and then write
-    into a card someone else changed in between.  When a precondition does not
-    hold, nothing is written (not even the assignment-file cleanup) and the
-    command exits 3 — distinct from exit 1 (a real error), so the caller can
-    tell "the world moved on" apart from "plan.sh is broken".
+    前提の指定 (--expect-status / --expect-worker / --expect-started-at) は
+    ここには無い。デーモンが自動で走らせる後始末は `plan.sh retire` 1 本に
+    集約してあり、判定はその内側 — card の書き換えと同じロックの中 — で行う
+    (t024)。`update` に同じ前提指定を並べて置くと、「どれを渡すか / 渡さないか」
+    の判断が呼び出し側ごとに分かれ、1 つ緩めた場所から同じ型の事故が再発する。
+    3 巡のレビューで出た P1 9 件はすべてその形だった。
 
-    This exists because an unconditional `--reset` is destructive in two ways
-    that the assignment-content check below cannot see: it reopens work that
-    was finished between the caller's decision and its write, and it clears a
-    *successor's* assignment when the same task has since been reassigned
-    (the content check only rejects an assignment for a *different* task).
-    watchdog's retirement cleanup (`scripts/lib_retirement.py`) is the caller
-    that needs this; see `knowledge/daemon-authority.md` §3-5.
-
-    --expect-started-at is what makes that binding an *instance* rather than a
-    name.  status and worker are both restored to exactly their old values when
-    a human resets a task and the same Worker name pulls it again — crewvia
-    reuses Worker names on purpose — so a late cleanup matches the successor's
-    execution and resets work that is actively under way.  `started_at` is
-    rewritten by `pull` on every execution, so comparing it distinguishes "the
-    assignment this caller is talking about" from "another run of the same task
-    by the same name" (Codex P1-1, t020).
+    `update --reset` は**人間の手作業**用として残してある (Director が幽霊
+    task を片付ける経路)。ガードが無いのは弱さではなく、人間が card を見て
+    判断したうえで打つコマンドだからである。デーモンからは呼ばないこと。
     """
     opts, positional = parse_opts(args, {
         '--mission': 'value',
@@ -3104,9 +3079,6 @@ def cmd_update(args):
         '--description': 'value',
         '--reset': 'bool',
         '--pr-number': 'value',
-        '--expect-status': 'value',
-        '--expect-worker': 'value',
-        '--expect-started-at': 'value',
     })
 
     if not positional:
@@ -3131,38 +3103,6 @@ def cmd_update(args):
     if status and status not in valid_statuses:
         die(f"invalid status '{status}'. Valid statuses: {', '.join(sorted(valid_statuses))}")
 
-    # A precondition is only protective while it can still be satisfied: a
-    # typo'd status would never match, so every guarded update would silently
-    # turn into a no-op and the caller would conclude "the world moved on"
-    # forever.  Reject it as an error instead.
-    expectable_statuses = valid_statuses | {'needs_director'}
-    expect_status = opts.get('--expect-status')
-    expected_statuses = None
-    if expect_status is not None:
-        expected_statuses = {s.strip() for s in expect_status.split(',') if s.strip()}
-        if not expected_statuses:
-            die("--expect-status needs at least one status")
-        unknown = sorted(expected_statuses - expectable_statuses)
-        if unknown:
-            die(f"invalid --expect-status value(s): {', '.join(unknown)}. "
-                f"Valid statuses: {', '.join(sorted(expectable_statuses))}")
-
-    expect_worker = opts.get('--expect-worker')
-    expected_worker = None
-    if expect_worker is not None:
-        expected_worker = (None if expect_worker.strip().lower() in ('null', 'none', '')
-                           else expect_worker.strip())
-
-    # Compared as an opaque string: it is an identity token here, not a time.
-    # `pull` writes it with now_iso(), so anything that reformats it would be a
-    # different execution as far as this check is concerned — which is the
-    # conservative direction (refuse the write, change nothing).
-    expect_started_at = opts.get('--expect-started-at')
-    expected_started_at = None
-    if expect_started_at is not None:
-        expected_started_at = (None if expect_started_at.strip().lower() in ('null', 'none', '')
-                               else expect_started_at.strip())
-
     # Holder for reset worker info (populated inside _do, used after with_lock)
     # [0] = old worker name, [1] = slug (for assignment content verification)
     reset_worker_holder = [None, None]
@@ -3176,35 +3116,6 @@ def cmd_update(args):
             die(f"mission '{slug}' not found.")
 
         meta, body = load_task(slug, task_id)
-
-        # Preconditions, under the lock, before anything is mutated.  Checking
-        # here rather than in the caller is the whole point: between a caller's
-        # read and its write the task can be finished, reset, or handed to a
-        # successor, and the `--reset` below would silently undo that.
-        if expected_statuses is not None:
-            current_status = (meta.get('status') or '').strip()
-            if current_status not in expected_statuses:
-                die(f"[plan.sh] precondition not met for {slug}/{task_id}: "
-                    f"status is '{current_status}', expected "
-                    f"{' or '.join(sorted(expected_statuses))} — nothing changed",
-                    UPDATE_PRECONDITION_UNMET)
-        if expect_worker is not None:
-            current_worker = meta.get('worker')
-            if current_worker != expected_worker:
-                die(f"[plan.sh] precondition not met for {slug}/{task_id}: "
-                    f"worker is {current_worker!r}, expected {expected_worker!r} "
-                    f"— nothing changed",
-                    UPDATE_PRECONDITION_UNMET)
-        if expect_started_at is not None:
-            current_started_at = meta.get('started_at')
-            if current_started_at is not None:
-                current_started_at = str(current_started_at).strip()
-            if current_started_at != expected_started_at:
-                die(f"[plan.sh] precondition not met for {slug}/{task_id}: "
-                    f"started_at is {current_started_at!r}, expected "
-                    f"{expected_started_at!r} — this is a different execution of "
-                    f"the same task; nothing changed",
-                    UPDATE_PRECONDITION_UNMET)
 
         changed = []
 
@@ -3297,8 +3208,16 @@ def cmd_update(args):
 # cmd_retire — 実行アイデンティティで束縛した単一のガード付きトランザクション
 # ---------------------------------------------------------------------------
 
-#: retire が終了扱いにできない (= 既に終わっている) card の状態。
-RETIRE_FINISHED_STATUSES = TERMINAL_STATUSES | {'failed', CORRUPT_TASK_STATUS}
+#: retire が終了扱いにできる唯一の状態。
+#:
+#: 「終わっている状態」を列挙して弾くのではなく、**まだ自分で結末を書いていない
+#: 実行**だけを通す形にしてある。列挙は必ず漏れる: needs_director /
+#: ready_for_verification / verification_failed はどれも Worker 自身が書いた
+#: 結末で、worker も started_at もそのまま残るため、列挙から漏れた瞬間に
+#: 「世代まで一致する reset」が成立して結末が消える。
+#: これは呼び出し側 (lib_retirement) が持っていた `--expect-status in_progress`
+#: を API の内側に取り込んだものでもある (t024)。
+RETIRE_RETIRABLE_STATUS = 'in_progress'
 
 
 def cmd_retire(args):
@@ -3330,6 +3249,16 @@ def cmd_retire(args):
     前提が 1 つでも外れた場合、また assignment の世代を証明できない場合は、
     1 バイトも書かずに exit 3 (PRECONDITION_UNMET) で返る。前提を弱めて
     実行する経路は用意しない — 呼び出し側は保留に倒し、Director に上げること。
+
+    終了させられるのは in_progress の実行だけ
+    -----------------------------------------
+    status が in_progress 以外の card は、その実行が**自分で結末を書いた**
+    ものである (done / failed はもちろん、needs_director /
+    ready_for_verification / verification_failed も同じ)。いずれも worker と
+    started_at はそのまま残るので、世代まで一致する reset が成立してしまう。
+    ここで通してしまうと、Director に上げたはずの card が pending に戻る。
+    以前は呼び出し側が `update --expect-status in_progress` として持っていた
+    ガードで、t024 でこの API の内側に取り込んだ。
     """
     opts, positional = parse_opts(args, {
         '--mission': 'value',
@@ -3395,9 +3324,11 @@ def cmd_retire(args):
         suffix = " — 何も変更していません"
 
         cur_status = meta.get('status')
-        if cur_status in RETIRE_FINISHED_STATUSES:
-            die(f"{prefix}status が既に '{cur_status}' です"
-                f" (終了させるべき実行が残っていません){suffix}", PRECONDITION_UNMET)
+        if cur_status != RETIRE_RETIRABLE_STATUS:
+            die(f"{prefix}status が '{cur_status}' です"
+                f" (終了させられるのは '{RETIRE_RETIRABLE_STATUS}' の実行だけ —"
+                f" それ以外は実行自身が書いた結末なので、巻き戻しません){suffix}",
+                PRECONDITION_UNMET)
 
         cur_worker = meta.get('worker')
         if cur_worker != agent:

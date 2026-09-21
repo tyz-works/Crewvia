@@ -92,15 +92,24 @@ next_task_id: 2
 MIS
 }
 
+#: 割り当ての世代。`plan.sh pull` が実行のたびに書き換える `started_at` に
+#: あたる。card と assignment サイドカーの両方に同じ値を置かないと後始末は
+#: 「この実行のものだと証明できない」に倒れて何もしない — 本番の pull は必ず
+#: 両方を書くので、片方だけの fixture は本番より弱い状態を試すことになる。
+TASK_GENERATION="2026-09-21T00:00:00Z"
+
 # write_task <sandbox> <status> <worker|null> <max_seconds>
 write_task() {
   local sb="$1" status="$2" worker="$3" maxs="$4"
+  local started="\"${TASK_GENERATION}\""
+  [[ "$worker" == "null" ]] && started="null"
   cat > "$sb/queue/missions/${MISSION}/tasks/t001.md" <<TASK
 ---
 id: t001
 title: retirement test task
 status: ${status}
 worker: ${worker}
+started_at: ${started}
 skills: [bash]
 priority: high
 blocked_by: []
@@ -116,6 +125,18 @@ placeholder
 ## Result
 
 TASK
+}
+
+# publish_assignment <sandbox> <agent> — `plan.sh pull` が公開するもの一式。
+#
+# 本体 (`<agent>`) だけでなくサイドカー (`<agent>.identity`) も置く。後始末は
+# 「公開中の assignment がこの実行のものか」を世代で判定するので、サイドカーが
+# 無いと (正しく) 判定不能に倒れて何も消さない。本番の pull は両方書く。
+publish_assignment() {
+  local sb="$1" agent="$2"
+  echo "${MISSION}:t001" > "$sb/queue/assignments/${agent}"
+  printf '{"mission": "%s", "started_at": "%s", "task": "t001", "worker": "%s"}\n' \
+    "$MISSION" "$TASK_GENERATION" "$agent" > "$sb/queue/assignments/${agent}.identity"
 }
 
 # spawn_fake_worker <name> — create a tmux window running `sleep 9999`.
@@ -173,7 +194,7 @@ case1() {
   local sb; sb="$(make_sandbox case1)"
   write_state "$sb" "  - ${MISSION}"
   write_task "$sb" in_progress TestAgent 1
-  echo "${MISSION}:t001" > "$sb/queue/assignments/TestAgent"
+  publish_assignment "$sb" TestAgent
   spawn_fake_worker "TestAgent-worker"
 
   env $(daemon_env "$sb") \
@@ -223,7 +244,7 @@ case2() {
   local sb; sb="$(make_sandbox case2)"
   write_state "$sb" "  - ${MISSION}"
   write_task "$sb" in_progress TestAgent 1
-  echo "${MISSION}:t001" > "$sb/queue/assignments/TestAgent"
+  publish_assignment "$sb" TestAgent
   spawn_fake_worker "TestAgent-worker"
 
   env $(daemon_env "$sb") \

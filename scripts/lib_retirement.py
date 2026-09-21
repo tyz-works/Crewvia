@@ -42,7 +42,11 @@ detection is deliberately left in place as a backstop (R5).
     sigterm_sent  SIGTERM delivered;     deadline = when to escalate to SIGKILL
     terminated    process is gone; queue-side cleanup still owed
     discarded     identity re-check failed — deliberately NOT killed (R7)
-    cleanup_failed terminated, but plan.sh reset kept failing; left for a human
+    cleanup_failed terminated, but the queue repair did not happen; left for a
+                  human.  Two ways in: plan.sh kept failing (retried every
+                  cycle), or the assignment generation was never recorded, so
+                  no automatic repair is allowed at all (t024 — not retried,
+                  since re-asking can only reach the same answer)
 
 The phase is written to disk *before* the destructive step it authorises
 (R1), so a daemon restart mid-termination can always tell what it already
@@ -73,6 +77,15 @@ The check is only worth what the *use* is bound to, which is what t020
     task's `started_at` — the generation `plan.sh pull` rewrites on every
     execution — and asserts it under plan.sh's lock.
 
+t024 turned that binding into a single call.  The cleanup is
+`plan.sh retire <task> --agent <name> --started-at <generation> --mission
+<slug>`: this module hands over the evidence and reads the answer, and does
+not get to choose which preconditions are asserted.  Every one of the nine P1s
+these three review rounds produced was a caller deciding to assert less, so
+the choice is gone from the interface.  **No generation, no cleanup** — the
+marker goes to `cleanup_failed` and a human is told once, because a generation
+cannot be recovered afterwards (re-reading the card returns the successor's).
+
 ## Evidence (t020, Codex P1-2)
 
 Nothing here concludes a death from a *failure to observe* one.  Both mux
@@ -81,6 +94,9 @@ backends collapse a timeout into an empty list, and `server_running()` is a
 empty the listing empties the probe too, and two failures that corroborate
 each other are not evidence.  So proof of an exit is a recorded pane_pid that
 `/proc` says is gone, or absence from a listing that returned *something*.
+"Recorded" means a pid we can actually read (`recorded_pid()`): an absent or
+corrupt one is no evidence at all, and reading it as a death was the third
+round's P1-1.
 
 Every other reading waits.  Waiting has one exit, and it is not automatic:
 `_check_stall()` escalates a retirement that has not moved in
@@ -251,6 +267,24 @@ def unlink_quiet(path) -> None:
         Path(path).unlink(missing_ok=True)
     except OSError:
         pass
+
+
+def recorded_pid(value) -> Optional[int]:
+    """The pid a marker recorded, or None when it recorded none we can use.
+
+    `process_alive()` answers False for anything it cannot parse, which is the
+    right answer to "is this process running" and the wrong one to "did our
+    Worker exit" — an absent or corrupt pid is no evidence at all, and reading
+    it as a death is the shape of Codex 3 巡目 P1-1.  Callers that are about
+    to authorise something destructive ask this first and hold when it is
+    None, rather than handing a `None` straight to `process_alive()`.
+    """
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def process_alive(pid) -> bool:
@@ -451,9 +485,10 @@ def build_request(agent: str, window_target: str, reason: str, identity: dict,
 
     `task_started_at` is the assignment generation this retirement is bound to.
     The key is **omitted entirely** when it could not be read, so that a later
-    cleanup can tell "this task had no started_at" (assert it) apart from "we
-    never found out" (assert nothing, and fall back to the weaker name-based
-    preconditions).
+    cleanup can tell "this task had no started_at" apart from "we never found
+    out".  Neither one authorises an automatic cleanup — see
+    `RetirementExecutor._bound_generation()` — but keeping them distinguishable
+    is what stops a fabricated `null` from matching a genuinely unstarted card.
     """
     req = {
         "agent": agent,
@@ -510,6 +545,7 @@ def build_progress(previous: Optional[dict], phase: str, **fields) -> dict:
         ("discard_reason", None),
         ("cleanup_error", None),
         ("cleanup_attempts", 0),
+        ("cleanup_deferred", False),
         ("director_notified", False),
         ("sigkill_attempts", 0),
         ("sigkill_report_sent", False),
@@ -623,18 +659,23 @@ class RetirementExecutor:
             )
             return False
         # Read here rather than taken from the caller: every caller would have
-        # to remember, and the one that forgot would silently fall back to the
-        # name-only preconditions that Codex P1-1 is about.  One place decides.
+        # to remember, and the one that forgot would hand the cleanup to a
+        # human for no reason (Codex P1-1).  One place decides.  This is also
+        # the *only* moment the generation can be read — by cleanup time the
+        # card may belong to a successor.
         started_at = read_task_started_at(self.queue_dir, mission, task_id)
         if task_id and started_at is UNKNOWN_STARTED_AT:
-            # Not fatal — the name-based preconditions still hold most of the
-            # line — but it silently weakens the cleanup, so it is said out
-            # loud here, where the cause (an unreadable card, a missing
-            # queue_dir) is still visible.
+            # The Worker can still be retired — the reason for that is the
+            # timeout, not the card — but the *queue* cleanup afterwards will
+            # be deferred to a human, because nothing left can bind it to this
+            # execution (`_cleanup_deferred()`).  Said out loud here, where the
+            # cause (an unreadable card, a missing queue_dir) is still visible;
+            # by cleanup time all that is left is the absent key.
             self.log(
                 f"[retire] {agent}: WARNING could not read started_at for "
-                f"{mission}/{task_id} (queue_dir={self.queue_dir}) — the cleanup "
-                f"will not be bound to this execution of the task"
+                f"{mission}/{task_id} (queue_dir={self.queue_dir}) — the Worker will "
+                f"still be retired, but the queue cleanup will be handed to the "
+                f"Director instead of run automatically"
             )
         req = build_request(agent, window_target, reason, identity,
                             mission=mission, task_id=task_id, message=message,
@@ -823,9 +864,12 @@ class RetirementExecutor:
         `_listing_authority_for_cycle()`).  "The backend did not mention it" is
         not a death certificate.
         """
-        recorded = (prog or {}).get("pane_pid")
+        # `recorded_pid()`, not the raw field: a corrupt value is not a pid we
+        # can question, so it must fall through to the (corroborated) window
+        # list rather than answer "gone" via `process_alive()`'s parse failure.
+        recorded = recorded_pid((prog or {}).get("pane_pid"))
         if recorded is None:
-            recorded = ((req or {}).get("spawn_identity") or {}).get("pane_pid")
+            recorded = recorded_pid(((req or {}).get("spawn_identity") or {}).get("pane_pid"))
         if recorded is not None:
             if process_alive(recorded):
                 return False, f"recorded pane_pid {recorded} is still running"
@@ -1228,24 +1272,119 @@ class RetirementExecutor:
     def _orphaned(self, agent: str, prog: dict) -> str:
         """Progress with no request: the request was deleted mid-flight.
 
-        Which way this settles depends on whether the Worker is still there.
-        If the recorded pid is gone we already did the damage, so the queue
-        repair is still owed and dropping the marker would strand the task —
-        the progress file carries mission/task_id for exactly this case.  If
-        it is still running we have lost the identity record that authorises
-        further steps, so the only safe move left is to leave it alone.
+        Three outcomes, and which one applies turns entirely on what the
+        **recorded pid** says — not on its absence.
+
+        * recorded pid is gone → the damage is already done, the queue repair
+          is still owed, and dropping the marker would strand the task.  The
+          progress file carries mission/task_id for exactly this case.
+        * recorded pid is alive → we have lost the identity record that
+          authorises further steps; leave the Worker alone.
+        * **no pid was ever recorded** → we know nothing, and that is not a
+          death.  `build_progress()` fills `pane_pid` with `None` by default,
+          so `process_alive(prog["pane_pid"])` answers `False` for a marker
+          that simply never had one — which is the normal shape when the
+          backend could only supply a `created_at` (herdr's
+          `pane_process_info` failing while the window lists fine).  Reading
+          that `False` as "already gone" sent such a retirement straight to
+          the terminal phase, and the next cycle reset a live Worker's task
+          (Codex 3 巡目 P1-1).
+
+        The last case is deliberately a hold, not a discard: discarding would
+        drop the only record that this task may still need repairing.  The
+        exit from the hold is `_check_stall()`, which escalates once — the
+        same shape every other "cannot tell yet" branch here uses, and the
+        same direction: kill nothing, rewrite nothing.
         """
-        if not process_alive(prog.get("pane_pid")):
-            self.log(
-                f"[retire] {agent}: request marker vanished, but the Worker is already "
-                f"gone — completing the cleanup we still owe"
-            )
-            self._write_progress(agent, prog, PHASE_TERMINATED, window_gone=True)
-            return "terminated"
-        self.log(f"[retire] {agent}: request marker vanished mid-flight — settling as discarded")
-        self._write_progress(agent, prog, PHASE_DISCARDED,
-                             discard_reason="request marker vanished")
-        return "discarded"
+        recorded = recorded_pid(prog.get("pane_pid"))
+        if recorded is None:
+            self._log_waiting(
+                agent,
+                f"[retire] {agent}: request marker vanished and no usable pane_pid was "
+                f"ever recorded — waiting instead of assuming a death (nothing killed, "
+                f"nothing reset)")
+            return "skipped"
+        if process_alive(recorded):
+            self.log(f"[retire] {agent}: request marker vanished mid-flight but "
+                     f"pid {recorded} is still running — settling as discarded")
+            self._write_progress(agent, prog, PHASE_DISCARDED,
+                                 discard_reason="request marker vanished")
+            return "discarded"
+        self.log(
+            f"[retire] {agent}: request marker vanished, but recorded pid {recorded} "
+            f"is gone — completing the cleanup we still owe"
+        )
+        self._write_progress(agent, prog, PHASE_TERMINATED, window_gone=True)
+        return "terminated"
+
+    @staticmethod
+    def _bound_generation(req: Optional[dict], prog: Optional[dict]) -> Optional[str]:
+        """The assignment generation this retirement is bound to, or None.
+
+        `None` means "no evidence", and there is no way to acquire it later:
+        re-reading the card now would return whatever generation is current,
+        which is precisely the successor's when there is one.  A recorded
+        `null` is not evidence either — a card with no `started_at` names no
+        execution to end.
+
+        Request first, then progress: the request is where `request()` wrote
+        it, and the progress file carries it forward for the case where the
+        request is gone by the time the cleanup runs.  Key *presence* is what
+        distinguishes "never found out" from a recorded value, which is why
+        `build_request()` omits the key rather than storing a sentinel.
+        """
+        for source in ((req or {}), (prog or {})):
+            if "task_started_at" not in source:
+                continue
+            value = source["task_started_at"]
+            if value is None:
+                return None
+            text = str(value).strip()
+            return text or None
+        return None
+
+    def _cleanup_deferred(self, agent: str, prog: dict, mission: str,
+                          task_id: str) -> Optional[str]:
+        """Terminated, but nothing may be rewritten: the generation is unknown.
+
+        Without the generation the only preconditions left are status and
+        worker, and both come back to their original values when a human
+        resets the task and a same-named Worker pulls it again — crewvia
+        reuses names by design.  Asserting only those would reset the
+        successor's live execution, which is the exact race the generation
+        check exists to prevent; weakening the premise *is* the defect, not a
+        fallback (Codex 3 巡目 P1-2).
+
+        So: no automatic cleanup, ever, for this marker.  A human is told
+        once — with what to check, how to repair the task and how to clear the
+        marker — and the marker is kept, because it is the only record that
+        this task may still be a ghost.  Re-running the check every cycle
+        would only re-confirm the same answer, so later cycles say nothing.
+        """
+        why = (f"{mission}/{task_id} の実行世代 (started_at) を記録できていないため、"
+               f"自動の後始末は行いません")
+        if prog.get("cleanup_deferred"):
+            return None
+        self.log(
+            f"[retire] {agent}: {why} — 世代を後から読み直しても、そこにあるのは"
+            f"後任の世代なので埋め合わせにならない。Director に上げて保留する"
+        )
+        notified = self._report(
+            agent, prog,
+            f"watchdog が Worker {agent} を終了しましたが、その実行の世代 "
+            f"(started_at) を記録できていませんでした。前提を弱めて自動で "
+            f"reset すると、同名の後任が作業中の task を巻き戻す恐れがあるため、"
+            f"**queue は何も書き換えていません**。\n"
+            f"task {task_id} (mission={mission}) が in_progress のまま取り残されて"
+            f"いないか確認し、必要なら plan.sh update {task_id} --status pending "
+            f"--reset --mission {mission} を手で実行してください。"
+            f"そのうえで registry/retirements/{agent}.* を削除してください。",
+        )
+        self._write_progress(agent, prog, PHASE_CLEANUP_FAILED,
+                             cleanup_error=why, cleanup_deferred=True,
+                             director_notified=notified,
+                             mission=mission, task_id=task_id)
+        return "cleanup_deferred"
 
     # -- terminal handling ---------------------------------------------
 
@@ -1263,50 +1402,32 @@ class RetirementExecutor:
         delete an assignment that has been reused for a different task.  Two
         of this repo's worst outages came from writing frontmatter from
         outside it (PR #181's multi-line reason, the literal "null" worker).
+
+        One call, not a set of fields (t024).  `plan.sh retire` takes the
+        evidence — which mission, which task, which worker, which *generation*
+        — and decides for itself, inside the queue lock, whether anything is
+        owed.  This module hands over the evidence and reads the answer; it
+        does not get to choose which preconditions to assert.  That choice was
+        the shape of all nine P1s three rounds of review produced: wherever a
+        caller could decide to assert less, some path eventually did.
         """
         mission = (req or {}).get("mission") or prog.get("mission")
         task_id = (req or {}).get("task_id") or prog.get("task_id")
 
         if task_id and mission:
+            # Asked before plan.sh is even looked at: without the generation
+            # there is no call to make, so a missing plan.sh is not the thing
+            # to report, and reporting both would tell the Director twice
+            # about one marker.  See `_bound_generation()`.
+            generation = self._bound_generation(req, prog)
+            if generation is None:
+                return self._cleanup_deferred(agent, prog, mission, task_id)
             if not self._plan_sh_usable():
                 return self._cleanup_failed(
                     agent, prog, f"plan.sh not usable at {self.plan_sh}", mission, task_id)
-            # Guarded, not unconditional.  A retirement takes a grace period
-            # plus however long the cleanup is retried, and the task can move
-            # underneath it: the Worker may have finished its last `plan.sh
-            # done` before exiting, or a human may have reset the task and a
-            # successor pulled it.  An unconditional `--reset` reopens
-            # finished work and clears the successor's assignment — plan.sh's
-            # own content check only rejects an assignment for a *different*
-            # task, never a different *execution* of this one.  The
-            # preconditions are evaluated inside plan.sh's queue lock, so the
-            # decision and the write cannot be split by another writer, and
-            # they are re-evaluated on every retry.
-            argv = ["bash", str(self.plan_sh), "update", task_id,
-                    "--status", "pending", "--reset", "--mission", mission,
-                    "--expect-status", "in_progress", "--expect-worker", agent]
-            # Bind the reset to *this* assignment, not merely to this name.
-            # status and worker both come back to exactly these values when a
-            # human resets the task and a same-named Worker pulls it again —
-            # crewvia reuses names by design — so without the generation the
-            # two preconditions above pass on the successor's execution and
-            # reset work that is under way (Codex P1-1).  Omitted, never
-            # guessed, when the card could not be read at request time: a
-            # fabricated `null` would match a genuinely unstarted task.
-            if "task_started_at" in (req or {}):
-                expected_started_at = (req or {})["task_started_at"]
-            elif "task_started_at" in prog:
-                expected_started_at = prog["task_started_at"]
-            else:
-                expected_started_at = UNKNOWN_STARTED_AT
-                self.log(
-                    f"[retire] {agent}: no assignment generation recorded for "
-                    f"{mission}/{task_id} — falling back to status/worker "
-                    f"preconditions only"
-                )
-            if expected_started_at is not UNKNOWN_STARTED_AT:
-                argv += ["--expect-started-at",
-                         "null" if expected_started_at is None else str(expected_started_at)]
+            argv = ["bash", str(self.plan_sh), "retire", task_id,
+                    "--agent", agent, "--started-at", generation,
+                    "--mission", mission]
             env = dict(os.environ)
             if self.queue_dir:
                 env["CREWVIA_QUEUE"] = str(self.queue_dir)
@@ -1327,7 +1448,7 @@ class RetirementExecutor:
                 )
             elif rc != 0:
                 return self._cleanup_failed(
-                    agent, prog, f"plan.sh update exited {rc}: {output.strip()[:400]}",
+                    agent, prog, f"plan.sh retire exited {rc}: {output.strip()[:400]}",
                     mission, task_id)
             else:
                 self.log(

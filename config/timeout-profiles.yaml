@@ -12,8 +12,30 @@
 #   ops_long     実測: 633–21701s → idle 3600s / max 14400s
 #   review       実測: 55–6590s   → feature_impl 相当 (review は code タスクと同等視)
 #
-# Watchdog v2 はこのファイルを読み取り、タスク frontmatter の timeout 指定を優先、
-# 未指定なら skills → default_profile の順でフォールバックする。
+# !! 実装状況 (2026-09-21, t016 で確認) !!
+#
+# **scripts/watchdog.py はこのファイルを読んでいない。** 以前ここには
+# 「Watchdog v2 はこのファイルを読み取り、タスク frontmatter の timeout 指定を
+# 優先、未指定なら skills → default_profile の順でフォールバックする」と
+# 書かれていたが、実際には watchdog.py 側に同名の profile が 3 つだけ
+# ハードコードされている (PROFILES: feature_impl / research / quick)。
+#
+# 現在 watchdog が実際に使う idle / max はこの 2 つだけ:
+#   1. タスク frontmatter の `timeout:` (idle / max) — 効いている
+#   2. 無ければ watchdog.py の DEFAULT_PROFILE = feature_impl (idle 300 / max 3600)
+# `worker_profile:` を書けば watchdog.py 側の 3 つから選べるが、queue 内の
+# タスクで実際に使っているものは 0 件で、下の skills マッピングは一切参照されない。
+#
+# このファイルを実際に読んでいるのは以下の 2 つ (どちらも検証用であって、
+# watchdog の判定には影響しない):
+#   - scripts/lint_plan.py            … プランの timeout 値が妥当かの lint
+#   - scripts/run_verification_checks.py … verification の整合確認
+#
+# t016 で idle 判定が実際に発火するようになったため、ここの値と watchdog の
+# ハードコードが食い違うことの影響が初めて実害になりうる。両者の統合は
+# backlog (skills が複数一致するときの解決順など設計判断が要るうえ、
+# quick_edit の idle 120s は現行の既定 300s より **短い** ので、素直に
+# 繋ぐと逆に誤 terminate が増える)。
 
 profiles:
   quick_edit:

@@ -4,14 +4,21 @@ scripts/watchdog.py — Crewvia Worker Watchdog v2
 
 Monitors active Workers via three signal layers:
   - Tool layer   : registry/activity/<agent>/<task_id>.activity
-  - Thought layer: registry/notifications/<agent>/ (Notification hook, M1)
-  - Process layer: tmux pane_pid → pgrep -P child processes
+  - Thought layer: registry/heartbeats/<agent>, registry/notifications/<agent>/
+  - Process layer: mux pane_pid → /proc プロセス木の分類
 
 Multi-level judgment per WorkerMonitor:
   alive     → no action
   warn      → POST /api/log type=alert (soft idle threshold)
   terminate → graceful shutdown (hard idle threshold or absolute max)
   kill      → cleanup only (tmux session already gone)
+
+判定材料の組み合わせ方 (t016):
+  idle 秒数 (Tool + Thought 層の最新 mtime) が唯一の「働いていない」の根拠で、
+  **常に評価される**。プロセス層は terminate を *抑制する方向にだけ* 効く。
+  子プロセスの存在は「生存」の証拠にはならない — claude 本体も MCP サーバーも
+  ハング中・入力待ち・承認待ちのあいだ生き続けるからである。詳細は
+  knowledge/daemon-authority.md と classify_process_tree() の docstring 参照。
 
 Usage:
   python3 scripts/watchdog.py [--interval <s>] [--repo-root <path>]
@@ -24,13 +31,12 @@ import json
 import os
 import re
 import signal
-import subprocess
 import sys
 import time
 import urllib.request
 import urllib.error
 from pathlib import Path
-from typing import Literal, Optional
+from typing import Literal, NamedTuple, Optional
 
 # Import lib_mux — assumes watchdog.py lives in scripts/ alongside lib_mux.py
 _SCRIPTS_DIR = Path(__file__).parent
@@ -55,6 +61,19 @@ TERMINATE_GRACE_PERIOD = 60   # seconds to wait after sending graceful shutdown 
 KILL_DELAY = 10               # seconds after SIGTERM before SIGKILL
 DEFAULT_CHECK_INTERVAL = 30   # main loop interval in seconds
 MASS_KILL_ALERT_BACKOFF_SECONDS = 300  # t020: min gap between mass-kill Taskvia alerts
+
+# t016: プロセス層の分類しきい値。ペインのセッション (claude) 起動からこれ以上
+# 遅れて始まった子孫が居れば「Bash tool が実行中」とみなす。
+#
+# 下限の根拠: MCP サーバーは claude 起動の 1-2 秒後に立ち上がる (本番実測
+# 2026-09-21: claude et=119s に対し MCP 2 本が et=117s)。これを「実行中」と
+# 誤読すると idle 判定が永久に抑止され、今回直した欠陥がそのまま再発する。
+# 60 秒は実測値の 30 倍で、MCP の起動が多少遅れても誤読しない余裕がある。
+# 上限側は緩くて構わない — 誤読の向きが「殺さない」だからである。
+PROCESS_WORK_START_GRACE = 60
+
+# 同じ判定が続く間、何 cycle ごとに要約を 1 行残すか (30s * 10 = 5 分)。
+VERDICT_SUMMARY_EVERY = 10
 
 
 # ---------------------------------------------------------------------------
@@ -135,6 +154,128 @@ def parse_frontmatter(text: str) -> tuple[dict, str]:
 
 
 # ---------------------------------------------------------------------------
+# Process layer (t016)
+# ---------------------------------------------------------------------------
+
+ProcessSignal = Literal[
+    "no_window",     # mux 窓が無い
+    "not_probed",    # プロセス層を見るまでもなく判定が決まった (絶対上限など)
+    "unknown",       # 窓はあるが pane pid が引けない → terminate を抑制する
+    "no_process",    # 子プロセスが 1 つも無い
+    "idle_process",  # claude と MCP サーバーだけ = 木が有るだけ
+    "executing",     # セッション起動より十分後に始まった子孫が居る = tool 実行中
+]
+
+
+def _proc_stat(pid: int) -> Optional[tuple[int, int]]:
+    """/proc/<pid>/stat から (ppid, starttime_ticks) を返す。読めなければ None。
+
+    comm (field 2) は括弧で囲まれ、空白や ')' を含みうるので最後の ')' で
+    切ってから split する (例: "1234 (sh -c (x)) S 1 ..." )。
+    切った残りの先頭が field 3 なので、field N は rest[N - 3] になる:
+      ppid = field 4 = rest[1] / starttime = field 22 = rest[19]
+    """
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text()
+    except (OSError, ValueError):
+        return None
+    close = raw.rfind(")")
+    if close < 0:
+        return None
+    rest = raw[close + 1:].split()
+    if len(rest) < 20:
+        return None
+    try:
+        return int(rest[1]), int(rest[19])
+    except ValueError:
+        return None
+
+
+def classify_process_tree(
+    root_pid: int, grace_seconds: int = PROCESS_WORK_START_GRACE
+) -> ProcessSignal:
+    """mux ペインのプロセス木を 3 値に分類する。
+
+    本番のペインは常にこの形をしている (2026-09-21 実測, Ren-worker):
+
+        /bin/bash                      ← root_pid (pane_pid)
+          claude --model ...           ← セッション。Worker が生きている限り常駐
+            npm exec @playwright/mcp   ← MCP サーバー。claude の 1-2 秒後に起動
+            npm exec chrome-devtools   ← 同上
+            /bin/bash -c source ...    ← Bash tool の実行中だけ現れる
+
+    旧実装の `pgrep -P <pane_pid>` は常に claude 1 件を返すため「子プロセスが
+    居る = 作業中」が恒真になり、idle 判定に一度も到達しなかった。ここでは
+    **いつ生えたか** で区別する:
+
+      "executing"    … セッション起動から grace_seconds より後に始まった子孫が
+                       居る = Bash tool が今まさに走っている。長時間のビルド /
+                       学習 / CI 待ちで activity が stale になる正当なケース
+      "idle_process" … claude と MCP サーバーだけ。木が有ること自体は
+                       「働いている」の証拠にならない
+      "no_process"   … 子が 1 つも無い (claude が落ちた / 素のシェル)
+
+    基準時刻は **最も古い直下の子 (= claude) の起動時刻** にする。root 自身では
+    なく子を基準にするのは、ペインの bash が Worker より先に (crewvia 起動時に)
+    生まれていることがあり、それを基準にすると claude の起動自体が "executing"
+    に見えてしまうからである。深さは問わないので、ペイン直下に後から生えた
+    プロセスも拾える。
+
+    起動時刻は /proc の starttime (boot からの tick) 同士で比較する。壁時計に
+    依存しないので、NTP 補正やサスペンドの影響を受けない。
+    """
+    if _proc_stat(root_pid) is None:
+        return "no_process"
+
+    procs: dict[int, tuple[int, int]] = {}
+    try:
+        proc_entries = list(Path("/proc").iterdir())
+    except OSError:
+        return "unknown"
+    for entry in proc_entries:
+        if not entry.name.isdigit():
+            continue
+        st = _proc_stat(int(entry.name))
+        if st is not None:
+            procs[int(entry.name)] = st
+
+    children: dict[int, list[int]] = {}
+    for pid, (ppid, _) in procs.items():
+        children.setdefault(ppid, []).append(pid)
+
+    direct = children.get(root_pid, [])
+    if not direct:
+        return "no_process"
+
+    ticks_per_sec = os.sysconf("SC_CLK_TCK") or 100
+    threshold_ticks = grace_seconds * ticks_per_sec
+    session_start = min(procs[pid][1] for pid in direct)
+
+    # root 配下を幅優先で走査 (root 自身は含めない)
+    stack = list(direct)
+    seen: set[int] = set()
+    while stack:
+        pid = stack.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        if procs[pid][1] - session_start > threshold_ticks:
+            return "executing"
+        stack.extend(children.get(pid, []))
+
+    return "idle_process"
+
+
+class CheckResult(NamedTuple):
+    """check() の判定と、その根拠。ログ・観測ログはこれをそのまま書く。"""
+    verdict: Literal["alive", "warn", "terminate", "kill"]
+    reason: str
+    idle_seconds: float
+    process_signal: ProcessSignal
+    awaiting_human: bool
+
+
+# ---------------------------------------------------------------------------
 # WorkerMonitor
 # ---------------------------------------------------------------------------
 
@@ -187,6 +328,51 @@ class WorkerMonitor:
 
         return max(candidates) if candidates else self.started_at
 
+    def _non_notification_mtime(self) -> Optional[float]:
+        """notification を除いた「実活動」の最新 mtime。
+
+        _last_activity_mtime() は notification 自体を候補に含むため、通知の
+        解除判定 (_awaiting_human) には使えない — 通知が来ただけで「解除済み」に
+        見えてしまう。そのための別計算。
+        """
+        candidates: list[float] = []
+        activity_file = (
+            self.repo_root / "registry" / "activity" / self.agent_name
+            / f"{self.task_id}.activity"
+        )
+        if activity_file.exists():
+            candidates.append(activity_file.stat().st_mtime)
+        hb_file = self.repo_root / "registry" / "heartbeats" / self.agent_name
+        if hb_file.exists():
+            candidates.append(hb_file.stat().st_mtime)
+        return max(candidates) if candidates else None
+
+    def _newest_notification(self) -> tuple[Optional[float], Optional[str]]:
+        """直近の notification の (mtime, notification_type)。無ければ (None, None)。"""
+        notif_dir = self.repo_root / "registry" / "notifications" / self.agent_name
+        if not notif_dir.exists():
+            return None, None
+        newest_file = None
+        newest_mtime = -1.0
+        for f in notif_dir.iterdir():
+            if not f.is_file():
+                continue
+            try:
+                m = f.stat().st_mtime
+            except OSError:
+                continue
+            if m > newest_mtime:
+                newest_mtime = m
+                newest_file = f
+        if newest_file is None:
+            return None, None
+        try:
+            payload = json.loads(newest_file.read_text())
+            notif_type = payload.get("notification_type")
+        except Exception:
+            notif_type = "(unparseable)"
+        return newest_mtime, notif_type
+
     def _observation_snapshot(self) -> dict:
         """★task_162 案C(観測専用). check() の判定には一切使わない — 呼び出し元は
         check() の戻り値やロジックを変更しない別経路のログ専用スナップショットである。
@@ -197,48 +383,8 @@ class WorkerMonitor:
         記録する。「無音」と「人間待ちで無音」を区別するための情報(Picard指示)。
         """
         now = time.time()
-
-        activity_file = (
-            self.repo_root / "registry" / "activity" / self.agent_name
-            / f"{self.task_id}.activity"
-        )
-        activity_mtime = activity_file.stat().st_mtime if activity_file.exists() else None
-
-        hb_file = self.repo_root / "registry" / "heartbeats" / self.agent_name
-        heartbeat_mtime = hb_file.stat().st_mtime if hb_file.exists() else None
-
-        # notification を除いた「実活動」の最新mtime(通知の解除判定に使う。
-        # _last_activity_mtime() は notification 自体を候補に含めるため、
-        # ここでは意図的に別計算にしている — 通知が来ただけで「解除済み」と
-        # 誤認しないようにするため)
-        non_notification_candidates = [
-            m for m in (activity_mtime, heartbeat_mtime) if m is not None
-        ]
-        non_notification_mtime = max(non_notification_candidates) if non_notification_candidates else None
-
-        last_notif_type: Optional[str] = None
-        last_notif_mtime: Optional[float] = None
-        notif_dir = self.repo_root / "registry" / "notifications" / self.agent_name
-        if notif_dir.exists():
-            newest_file = None
-            newest_mtime = -1.0
-            for f in notif_dir.iterdir():
-                if not f.is_file():
-                    continue
-                try:
-                    m = f.stat().st_mtime
-                except OSError:
-                    continue
-                if m > newest_mtime:
-                    newest_mtime = m
-                    newest_file = f
-            if newest_file is not None:
-                last_notif_mtime = newest_mtime
-                try:
-                    payload = json.loads(newest_file.read_text())
-                    last_notif_type = payload.get("notification_type")
-                except Exception:
-                    last_notif_type = "(unparseable)"
+        non_notification_mtime = self._non_notification_mtime()
+        last_notif_mtime, last_notif_type = self._newest_notification()
 
         cleared_since_notification: Optional[bool] = None
         if last_notif_mtime is not None:
@@ -274,58 +420,103 @@ class WorkerMonitor:
     def _tmux_window_target(self) -> Optional[str]:
         return self._mux_window_name()
 
-    def _has_child_processes(self) -> bool:
-        """Return True if the mux pane has live child processes (Claude is active)."""
+    def _process_signal(self) -> ProcessSignal:
+        """プロセス層のシグナル。**生死の判定ではない** — classify_process_tree() 参照。"""
         name = self._mux_window_name()
         if not name:
-            return False
+            return "no_window"
         pane_pid = _mux.pid(name)
         if pane_pid is None:
+            # 窓はあるのに pane pid が引けない = mux backend の不調。実行中か
+            # ハング中かを見分ける材料が無いので "unknown" とし、terminate を
+            # 抑制する側に倒す (fail closed)。_is_mass_kill() と同じ向き。
+            return "unknown"
+        return classify_process_tree(pane_pid)
+
+    def _awaiting_human(self) -> bool:
+        """直近の Notification が未解除か = 人間の入力/承認待ちで無音か。
+
+        Notification hook は承認待ち・入力待ちで発火するが **1 回しか鳴らない**。
+        その後は activity も heartbeat も止まるため、無音の理由が「ハング」でも
+        「人間待ち」でも idle_seconds は同じように伸びる。両者を区別できるのは
+        「最後の通知より後に実活動があったか」だけである。
+
+        通知より後に activity / heartbeat が動いていれば解除済み = 待ちではない。
+        解除済みの古い通知が永久に terminate を抑止しないよう、比較は必ず
+        **通知を除いた** 実活動の mtime と行う (_last_activity_mtime() は通知
+        自体を候補に含むので、これに使うと常に「解除済み」に見えてしまう)。
+        """
+        notif_mtime, _ = self._newest_notification()
+        if notif_mtime is None:
             return False
-        try:
-            r = subprocess.run(["pgrep", "-P", str(pane_pid)], capture_output=True, timeout=5)
-            return r.returncode == 0
-        except Exception:
-            return False
+        real_mtime = self._non_notification_mtime()
+        return real_mtime is None or real_mtime <= notif_mtime
 
     # ------------------------------------------------------------------
     # Core check
     # ------------------------------------------------------------------
 
     def check(self) -> Literal["alive", "warn", "terminate", "kill"]:
+        """check_detail() の判定だけを返す薄いラッパー (既存呼び出し互換)。"""
+        return self.check_detail().verdict
+
+    def check_detail(self) -> CheckResult:
         """
         Evaluate Worker health across all signal layers.
 
-        Returns:
+        Returns (verdict, reason, idle_seconds, process_signal, awaiting_human):
           "alive"     — Worker is healthy, no action needed
           "warn"      — Soft idle threshold exceeded; send alert to Taskvia
           "terminate" — Hard idle threshold or absolute max exceeded; graceful shutdown
-          "kill"      — tmux session gone; cleanup only
+          "kill"      — mux window gone; cleanup only
+
+        t016: 旧実装はここで「子プロセスが居れば alive」と即返していたため、
+        以下の idle 判定に一度も到達しなかった。idle は常に評価し、プロセス層と
+        「人間待ち」は **terminate を warn に落とす方向にだけ** 効かせる。
+        判断が付かないケース (process_signal == "unknown") も殺さない側に倒す。
         """
         now = time.time()
-
-        # 1. 絶対上限チェック
-        if now - self.started_at > self.max_threshold:
-            return "terminate"
-
-        # 2. tmux session 生存チェック
-        target = self._tmux_window_target()
-        if target is None:
-            return "kill"
-
-        # 3. 子プロセス生存チェック (pgrep -P <pane_pid>)
-        if self._has_child_processes():
-            return "alive"
-
-        # 4. activity / heartbeat / notification の mtime チェック
         idle_seconds = now - self._last_activity_mtime()
 
-        if idle_seconds > self.idle_threshold * 2:
-            return "terminate"
-        if idle_seconds > self.idle_threshold:
-            return "warn"
+        # 1. 絶対上限チェック
+        #    idle とは独立した天井。プロセス層では抑制しない — 長時間 task は
+        #    task frontmatter の timeout.max で明示的に引き上げる運用のままにする
+        #    (knowledge/daemon-authority.md §4-3 で started_at の起点見直しは
+        #    backlog 送りと決まっている)。
+        if now - self.started_at > self.max_threshold:
+            return CheckResult("terminate", "max_exceeded", idle_seconds, "not_probed", False)
 
-        return "alive"
+        # 2. mux 窓の生存チェック
+        if self._tmux_window_target() is None:
+            return CheckResult("kill", "window_gone", idle_seconds, "no_window", False)
+
+        # 3. idle 判定 (常に評価する)
+        process_signal = self._process_signal()
+        awaiting_human = self._awaiting_human()
+
+        if idle_seconds > self.idle_threshold * 2:
+            # プロセス層が terminate を抑制するケース。理由をログで区別できるよう
+            # 別々の reason にする ("実行中だから見送った" と "見えないから見送った"
+            # は運用上まったく別の話なので、まとめると原因調査ができない)。
+            suppressed_by_process = {
+                "executing": "hard_idle_but_executing",
+                "unknown": "hard_idle_but_process_unknown",
+            }.get(process_signal)
+            if suppressed_by_process:
+                return CheckResult(
+                    "warn", suppressed_by_process, idle_seconds, process_signal, awaiting_human,
+                )
+            if awaiting_human:
+                return CheckResult(
+                    "warn", "hard_idle_but_awaiting_human",
+                    idle_seconds, process_signal, awaiting_human,
+                )
+            return CheckResult("terminate", "hard_idle", idle_seconds, process_signal, awaiting_human)
+
+        if idle_seconds > self.idle_threshold:
+            return CheckResult("warn", "soft_idle", idle_seconds, process_signal, awaiting_human)
+
+        return CheckResult("alive", "active", idle_seconds, process_signal, awaiting_human)
 
 
 # ---------------------------------------------------------------------------
@@ -541,23 +732,127 @@ def load_active_tasks(queue_dir: Path) -> list[tuple[str, str, dict]]:
 # Logging
 # ---------------------------------------------------------------------------
 
+# _LOG_FILE は「固定ファイルへの明示的な上書き」。テストが monkeypatch で使う。
+# 本番は _LOG_DIR を設定し、日付ごとにローテートする (dispatcher.sh と同じ規約)。
 _LOG_FILE: Optional[Path] = None
+_LOG_DIR: Optional[Path] = None
 _OBSERVATION_LOG_FILE: Optional[Path] = None
+
+
+def _current_log_file() -> Optional[Path]:
+    """今このタイミングで書くべきログファイル。
+
+    _LOG_DIR 側は呼ばれるたびに日付を評価するので、常駐したまま日付を跨いでも
+    自動で次の日のファイルに切り替わる (旧実装は run() で 1 度だけパスを決めて
+    いたため、単一ファイルが無限に伸び続けていた)。
+    """
+    if _LOG_FILE is not None:
+        return _LOG_FILE
+    if _LOG_DIR is None:
+        return None
+    return _LOG_DIR / f"watchdog-{time.strftime('%Y%m%d')}.log"
 
 
 def _log(msg: str) -> None:
     ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     line = f"[watchdog {ts}] {msg}"
     print(line, file=sys.stderr)
-    if _LOG_FILE:
+    path = _current_log_file()
+    if path:
         try:
-            with _LOG_FILE.open("a") as f:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a") as f:
                 f.write(line + "\n")
         except OSError:
             pass
 
 
-def _log_observation(monitor: "WorkerMonitor", check_result: str) -> None:
+class VerdictLogger:
+    """判定結果を watchdog のログに残す (t016)。
+
+    旧実装は warn / terminate / kill のときしか _log() を呼ばなかった。
+    check() が「子プロセスが居れば alive」で即返していたため非 alive の判定が
+    一度も起きず、結果として **30 秒ごとの判定が 1 行も残らなかった**
+    (registry/watchdog.log は 2026-09-18 の起動行以降が空)。判定が記録されない
+    限り QA も本番運用も「watchdog が何をどう判断したか」を検証できない。
+
+    ただし全 Worker 分を毎 cycle 書くとログが肥大するので:
+      - 判定が **変わった** 瞬間は必ず 1 行
+      - 同じ判定が続く間は summary_every cycle ごとに 1 行 ("still ...")
+    とする。これで「静かな時間も watchdog は生きていて alive と判定し続けて
+    いた」ことが後から確認でき、かつ行数は有界に保たれる。
+    """
+
+    def __init__(self, summary_every: int = VERDICT_SUMMARY_EVERY) -> None:
+        self.summary_every = summary_every
+        self._state: dict[tuple[str, str], tuple[str, int]] = {}
+
+    @staticmethod
+    def _line(monitor: "WorkerMonitor", detail: CheckResult, repeats: int) -> str:
+        head = (
+            f"still {detail.verdict} ({repeats} cycles)"
+            if repeats
+            else detail.verdict
+        )
+        return (
+            f"[verdict] {monitor.agent_name}/{monitor.task_id} {head} "
+            f"idle={detail.idle_seconds:.0f}s idle_threshold={monitor.idle_threshold} "
+            f"max_threshold={monitor.max_threshold} process={detail.process_signal} "
+            f"awaiting_human={str(detail.awaiting_human).lower()} reason={detail.reason}"
+        )
+
+    def record(self, monitor: "WorkerMonitor", detail: CheckResult) -> None:
+        key = (monitor.agent_name, monitor.task_id)
+        previous = self._state.get(key)
+        if previous is None or previous[0] != detail.verdict:
+            self._state[key] = (detail.verdict, 0)
+            _log(self._line(monitor, detail, repeats=0))
+            return
+        repeats = previous[1] + 1
+        self._state[key] = (detail.verdict, repeats)
+        if self.summary_every > 0 and repeats % self.summary_every == 0:
+            _log(self._line(monitor, detail, repeats=repeats))
+
+    def forget(self, monitor: "WorkerMonitor") -> None:
+        """監視対象から外れた Worker の状態を捨てる (同名で再起動したら初回扱い)。"""
+        self._state.pop((monitor.agent_name, monitor.task_id), None)
+
+
+_LEGACY_POINTER_MARK = "[moved]"
+
+
+def _leave_legacy_log_pointer(legacy: Path) -> None:
+    """旧ログパスに「引っ越し先」を 1 行だけ残す。
+
+    `registry/dispatcher.log` は dispatcher が `logs/dispatcher/` の日付別
+    ファイルへ移行した後も残り続け、2026-09-21 には「2026-09-05 以降更新されて
+    いない = ログ経路が壊れている」と誤読される原因になった (実際には新しい
+    パスに正常に出ていた)。watchdog で同じ引っ越しをする以上、同じ誤読を
+    仕込まないための一行。
+
+    既にマーカーが書かれていれば何もしない (再起動のたびに伸ばさない)。
+    """
+    try:
+        if not legacy.exists():
+            return
+        tail = legacy.read_text(errors="replace").rstrip().rsplit("\n", 1)[-1]
+        if _LEGACY_POINTER_MARK in tail:
+            return
+        ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        with legacy.open("a") as f:
+            f.write(
+                f"[watchdog {ts}] {_LEGACY_POINTER_MARK} このファイルはもう使われない。"
+                f"以降のログは logs/watchdog/watchdog-YYYYMMDD.log を見ること。\n"
+            )
+    except OSError:
+        pass
+
+
+def _log_observation(
+    monitor: "WorkerMonitor",
+    check_result: str,
+    detail: Optional[CheckResult] = None,
+) -> None:
     """★task_162 案C(観測専用). idle秒数・通知状況を registry/watchdog-observations.jsonl
     へ追記するだけの関数。check() の戻り値・判定条件には一切関与しない
     (check_result は記録のためだけに受け取る — この関数の失敗や有無で check() の
@@ -567,6 +862,13 @@ def _log_observation(monitor: "WorkerMonitor", check_result: str) -> None:
     try:
         snapshot = monitor._observation_snapshot()
         snapshot["check_result"] = check_result
+        if detail is not None:
+            # t016: 判定の根拠も残す。check_result だけだと「なぜ terminate
+            # しなかったのか」(executing / awaiting_human による抑制) が
+            # 後から追えない。
+            snapshot["reason"] = detail.reason
+            snapshot["process_signal"] = detail.process_signal
+            snapshot["awaiting_human"] = detail.awaiting_human
         with _OBSERVATION_LOG_FILE.open("a") as f:
             f.write(json.dumps(snapshot) + "\n")
     except Exception:
@@ -605,11 +907,12 @@ def _assert_repo_identity_or_exit(repo_root: Path) -> None:
 
 
 def run(repo_root: Path, interval: int) -> None:
-    global _LOG_FILE, _OBSERVATION_LOG_FILE
+    global _LOG_DIR, _OBSERVATION_LOG_FILE
     registry_dir = repo_root / "registry"
     registry_dir.mkdir(exist_ok=True)
-    _LOG_FILE = registry_dir / "watchdog.log"
+    _LOG_DIR = repo_root / "logs" / "watchdog"
     _OBSERVATION_LOG_FILE = registry_dir / "watchdog-observations.jsonl"
+    _leave_legacy_log_pointer(registry_dir / "watchdog.log")
 
     taskvia_url = os.environ.get("TASKVIA_URL", "https://taskvia.vercel.app")
     taskvia_token = os.environ.get("TASKVIA_TOKEN", "")
@@ -622,6 +925,11 @@ def run(repo_root: Path, interval: int) -> None:
     # Without this, a persistent misconfiguration re-sends the Taskvia alert
     # every single cycle forever.
     last_mass_kill_alert_at = 0.0
+
+    # t016: 判定結果を watchdog のログに残す。旧実装は非 alive のときしか
+    # ログを書かず、その非 alive が一度も起きなかったため判定が 1 行も残って
+    # いなかった。
+    verdict_logger = VerdictLogger()
 
     # t016: log which mux backend got selected at startup. A silent
     # misconfiguration here (e.g. config/crewvia.yaml `mode:` failing to
@@ -677,8 +985,11 @@ def run(repo_root: Path, interval: int) -> None:
             # Worker's window looks gone in the same cycle" apart from an
             # isolated, real window closure — see the mass-kill guard below
             # (t016).
+            details: dict[tuple[str, str], CheckResult] = {
+                key: monitor.check_detail() for key, monitor in monitors.items()
+            }
             results: dict[tuple[str, str], "Literal['alive', 'warn', 'terminate', 'kill']"] = {
-                key: monitor.check() for key, monitor in monitors.items()
+                key: detail.verdict for key, detail in details.items()
             }
 
             # Cheap pre-check (no extra backend calls) before paying for the
@@ -726,19 +1037,24 @@ def run(repo_root: Path, interval: int) -> None:
                             f"{now_ts - last_mass_kill_alert_at:.0f}s since last)"
                         )
                     for key, monitor in monitors.items():
-                        _log_observation(monitor, results[key])
+                        verdict_logger.record(monitor, details[key])
+                        _log_observation(monitor, results[key], details[key])
                     time.sleep(interval)
                     continue
 
             # Check each monitor
             for (slug, task_id), monitor in list(monitors.items()):
+                detail = details[(slug, task_id)]
                 status = results[(slug, task_id)]
                 agent = monitor.agent_name
+
+                # t016: 判定そのものをログに残す (変化時 + 一定間隔の要約)。
+                verdict_logger.record(monitor, detail)
 
                 # ★task_162 案C(観測専用): check() の戻り値・分岐には一切影響しない
                 # 独立した記録経路。この呼び出しを削除しても以下の判定ロジックは
                 # 完全に同一に動作する。
-                _log_observation(monitor, status)
+                _log_observation(monitor, status, detail)
 
                 if status == "alive":
                     pass  # healthy — no action

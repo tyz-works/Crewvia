@@ -49,7 +49,9 @@
     start.sh            マルチエージェント起動スクリプト
     plan.sh             タスクプラン管理 CLI（per-task / multi-mission）
     dispatcher.sh       並列モードの常駐割り当てデーモン（idle Worker への自動 assign + codex-review spawn）
-    watchdog.py         Worker 生存監視デーモン（heartbeat 断・herdr pane 消滅の検知と kill）
+    watchdog.py         Worker 生存監視デーモン（idle 判定・pane 消滅の検知と kill）
+                        判定の設計は knowledge/watchdog-idle-judgment.md
+                        ログ: logs/watchdog/watchdog-YYYYMMDD.log（日次）
     kai-review.sh       Codex reviewer (Kai-codex) 起動ラッパー。詳細は `knowledge/codex-reviewer.md`
     taskvia-sync.sh     queue → Taskvia 同期
     lib_mux.py          mux 抽象化モジュール（TmuxBackend / HerdrBackend）

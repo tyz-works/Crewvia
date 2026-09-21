@@ -150,12 +150,11 @@ Worker が複数居れば、誰の retire なのかを task 側では表現で�
 増やすことを意味する。
 
 **案C を否決する理由。** `queue/assignments/<agent>` は「**存在 = busy / 不在 = idle**」
-という不変条件を、dispatcher の idle 判定 (D1 :1005、D2/D3 :1150-1151)、`plan.sh pull`
-の書き込み (:1514-1519)、`plan.sh done` の削除 (:1794-1797)、`plan.sh fail` の削除
-(:1901-1906、コメントに "same as done")、`plan.sh update --reset` の削除 (:2966-2984)
-の **5 箇所**が共有している。tombstone を置くと「存在するが idle」と
-いう第 4 の状態が生まれ、**Rule 5 の条件 B (`idle`/`done` かつ assignment 有り) が
-即座に誤発火する** (:854)。
+という不変条件を、dispatcher の idle 判定 (D1 :1005、D2/D3 :1150-1151) と `plan.sh`
+側の公開・撤去が共有している (plan.sh 側は t021 で `publish_assignment()` /
+`retire_assignment()` の 2 関数に集約済み — §3-5)。tombstone を置くと「存在するが
+idle」という第 4 の状態が生まれ、**Rule 5 の条件 B (`idle`/`done` かつ assignment
+有り) が即座に誤発火する** (:854)。
 
 **案B を採用する。** `registry/` は既にデーモン間共有状態の置き場である
 (`heartbeats/`、`mux/`、`activity/`、`notifications/`、`watchdog-observations.jsonl`)。
@@ -275,6 +274,62 @@ spawn ごとに書き直すため `.firstseen` に依存しない。ただし `m
 対象であり、落として良い穴ではない。
 
 ---
+
+### 3-5. assignment の所有権 — 実行アイデンティティでの束縛 (t021 で実装)
+
+案B が `registry/` に retirement marker を置くのとは別に、**`queue/assignments/<agent>`
+側にも不変条件が要る**。案B のマーカーは「誰を終了させるか」を表すが、終了させたあとに
+誰の assignment を消すかは依然 `plan.sh` の仕事であり、ここが実行で束縛されていないと
+後始末が**稼働中の後任を巻き込む**。
+
+**問題。** `<mission>:<task>` は *実行* を指していない。crewvia は Worker 名を
+ポジションとして使い回すので、同じ card を同じ名前が pull し直すと後任の assignment は
+先任のものとバイト単位で同一になる。加えて `cmd_update()` は status の書き換えを
+`with_lock()` の中で、assignment の削除を**ロックの外**で行っていた。ロック解放から
+削除までの間に同名 Worker が pending になった card を pull すると、内容一致という
+理由だけで**後任の assignment が消える**。assignment を失った Worker は dispatcher から
+idle に見えるので kill される。`cmd_done()` / `cmd_fail()` に至っては内容すら見ずに
+無条件で削除していた。
+
+**解決 (t021)。**
+
+1. **単一トランザクション** — assignment の公開・撤去はすべて card の書き換えと同じ
+   `with_lock()` の中で行う。`pull` の公開も同様。ロックの外に判定と書き込みが
+   分かれる隙間そのものを無くした。構造は `tests/test_plan_assignment_transaction.py`
+   が AST で固定している (ヘルパー以外がパスを組み立てない / 変更がロック外に出ない)。
+2. **実行アイデンティティ** — `queue/assignments/<agent>.identity` に
+   `{mission, task, worker, started_at}` を並べて置く。本体の 1 行フォーマットは
+   変えないので hooks / dispatcher / verifier-dispatcher の読み手は無改修
+   (いずれも名前で引くだけでディレクトリを列挙しない)。世代には `pull` が毎回
+   書き換える `started_at` を使い、同一秒内の差し戻し → 再 pull で衝突しないよう
+   小数秒まで刻む。
+3. **判定の集約** — 「公開中の assignment はこの実行のものか」の判定は
+   `classify_assignment()` 1 箇所だけにあり、撤去する唯一の入口 `retire_assignment()`
+   は判定が `mine` のときだけ消す。判定不能 (旧形式で世代が読めない・破損) は
+   `unverifiable` であって `mine` ではない。
+
+**`plan.sh retire` — 後始末の 1 本の API。**
+
+```
+plan.sh retire <task_id> --agent <name> --started-at <generation>
+               [--mission <slug>] [--outcome reset|needs-director] [--reason "<1 行>"]
+```
+
+「この実行 (mission, task, worker, 世代) を終了扱いにして後始末する」を 1 操作で行う。
+呼び出し側が status / worker / 世代を個別に組み立てる形だと、どれを渡すか・省くかの
+判断が呼び出し側ごとに分かれ、1 つ緩めた場所から同じ型の事故が再発する。
+
+- `--started-at` は**必須**。省略を許すと名前だけで束縛された後始末に戻る。世代を
+  読めなかった呼び出し側は retire を呼ばず Director に上げること。
+- 前提 (status が未終了 / worker 一致 / 世代一致 / assignment が自分のものか不在) が
+  1 つでも外れたら **1 バイトも書かずに exit 3** (`PRECONDITION_UNMET`)。0 (書いた)
+  とも 1 (plan.sh 側の異常) とも区別できるので、呼び出し側は保留に倒せる。
+- 前提を弱めて実行する経路は用意しない。
+
+watchdog 側の retirement (§4) が「終了させたあとの queue の後始末」で呼ぶのは
+この API である。`plan.sh update --reset` を直接叩く経路は、名前だけで束縛された
+後始末になるため使わない。
+
 
 ## 4. 中断耐性の要件
 
@@ -683,8 +738,8 @@ assert するのは「後任のプロセスが生きていること」「後任�
 - `scripts/lib_mux.py` — `pid()` (backend 抽象メソッド) :185
 - `scripts/benchmark-ctx.sh` — 直接 `mux_kill` :199 / :312 (N2)
 - `scripts/start.sh` — dispatcher / watchdog の起動 :771 / :780、F6是正コメント :778-779
-- `scripts/plan.sh` — assignment 書き込み :1514、削除 (done) :1794、削除 (fail) :1904、
-  削除 (--reset) :2966、インスタンス一致確認の先例 :2960-2984
+- `scripts/plan.sh` — `publish_assignment()` / `classify_assignment()` /
+  `retire_assignment()` / `cmd_retire()` (§3-5)
 - `knowledge/worker-shutdown-rules.md` — Rule 1-5 の確定仕様
 - `knowledge/worker-vanish-detection.md` — D4 の背景
 - `knowledge/dispatcher-restart-after-merge.md` — 常駐デーモンの反映手順

@@ -19,8 +19,8 @@ workers:
     last_active: 2026-08-25
   - name: Ren
     skills: [code, python]
-    task_count: 7
-    last_active: 2026-09-01
+    task_count: 19
+    last_active: 2026-09-14
   - name: Sora
     role: director
     skills: []
@@ -36,7 +36,7 @@ workers:
     last_active: 2026-08-25
   - name: Kai-codex
     skills: [codex-review]
-    task_count: 0
+    task_count: 1
     last_active: 2026-09-08
   - name: Mika
     skills: [code, typescript]
@@ -44,40 +44,40 @@ workers:
     last_active: 2026-05-12
   - name: Haruto
     skills: [bash, code]
-    task_count: 29
-    last_active: 2026-09-06
+    task_count: 46
+    last_active: 2026-09-12
   - name: Seo
     skills: [review]
-    task_count: 53
-    last_active: 2026-09-07
+    task_count: 73
+    last_active: 2026-09-14
   - name: Jiwon
     skills: [docs, research]
     task_count: 5
     last_active: 2026-09-02
   - name: Minjun
     skills: [docs]
-    task_count: 10
-    last_active: 2026-09-07
+    task_count: 12
+    last_active: 2026-09-09
   - name: Wei
     skills: [bash, code, docs]
-    task_count: 33
-    last_active: 2026-09-07
+    task_count: 39
+    last_active: 2026-09-09
   - name: Lin
     skills: [code, research, typescript]
     task_count: 4
     last_active: 2026-08-30
   - name: Mei
     skills: [code, docs]
-    task_count: 2
-    last_active: 2026-08-25
+    task_count: 5
+    last_active: 2026-09-12
   - name: Arjun
     skills: [qa]
-    task_count: 28
-    last_active: 2026-09-07
+    task_count: 39
+    last_active: 2026-09-13
   - name: Priya
     skills: [planning]
-    task_count: 19
-    last_active: 2026-09-07
+    task_count: 20
+    last_active: 2026-09-12
   - name: Anika
     skills: [research]
     task_count: 3
@@ -124,21 +124,29 @@ workers:
     last_active: 2026-09-04
   - name: Sofia
     skills: [bash, code, python]
-    task_count: 10
-    last_active: 2026-09-04
+    task_count: 27
+    last_active: 2026-09-12
   - name: Finn
     skills: [qa]
-    task_count: 6
-    last_active: 2026-09-06
+    task_count: 16
+    last_active: 2026-09-12
   - name: Ingrid
     skills: [bash, code]
-    task_count: 0
-    last_active: 2026-09-05
+    task_count: 3
+    last_active: 2026-09-12
   - name: Elias
     skills: [bash, code]
-    task_count: 1
-    last_active: 2026-09-05
+    task_count: 3
+    last_active: 2026-09-10
   - name: Mathis
     skills: [bash, code]
-    task_count: 0
-    last_active: 2026-09-05
+    task_count: 1
+    last_active: 2026-09-10
+  - name: Astrid
+    skills: [bash, code, docs, python]
+    task_count: 1
+    last_active: 2026-09-09
+  - name: Erik
+    skills: [code, docs, python]
+    task_count: 2
+    last_active: 2026-09-13

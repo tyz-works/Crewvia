@@ -40,7 +40,11 @@ QUEUE_DIR="${CREWVIA_QUEUE:-${REPO_ROOT}/queue}"
 REGISTRY_DIR="${REPO_ROOT}/registry"
 LOG_DIR="${REPO_ROOT}/logs/dispatcher"
 LOG_FILE="${LOG_DIR}/dispatcher-$(date +%Y%m%d).log"
-NOTIFY_CACHE="/tmp/dispatcher-notify-cache.json"
+# CREWVIA_NOTIFY_CACHE: isolated-QA escape hatch.  The default path is shared by
+# every dispatcher on the machine, so a test run would both read production
+# dedup keys (false PASS: a suppressed notification looks like "did not fire")
+# and write its own into them.  Tests point this at their own sandbox.
+NOTIFY_CACHE="${CREWVIA_NOTIFY_CACHE:-/tmp/dispatcher-notify-cache.json}"
 NOTIFY_TTL=300  # seconds before repeating the same notification (5 min)
 
 # Rule 5: state grace period in seconds (env > config > default 60).

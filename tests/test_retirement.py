@@ -823,6 +823,32 @@ def test_cleanup_survives_losing_the_request_marker(sandbox):
     assert not sandbox.assignment_file.exists()
 
 
+def test_request_lost_while_worker_still_alive_is_left_alone(sandbox):
+    """逆に、Worker がまだ生きているうちに request を失ったら手を出さない。
+
+    request が無いということは、次のステップを許可する identity の記録も
+    無いということ。殺す根拠が無いので discarded に倒す。
+    """
+    import lib_retirement
+
+    pane_pid = sandbox.spawn_worker_process()
+    sandbox.record_identity(WINDOW, pane_pid)
+    mux = FakeMux({WINDOW: pane_pid})
+    ex = make_executor(sandbox, mux, grace_period=3600)
+    ex.request(AGENT, WINDOW, "timeout", mission=SLUG, task_id=TASK_ID)
+    ex.process_all()  # → notified (猶予中なのでまだ生きている)
+
+    lib_retirement.unlink_quiet(lib_retirement.request_path(sandbox.registry, AGENT))
+    for _ in range(4):
+        ex.process_all()
+        if not ex.has_marker(AGENT):
+            break
+
+    assert _pid_alive(pane_pid), "根拠を失ったのに殺した"
+    assert sandbox.task_status() == "in_progress", "殺していないのに task を戻した"
+    assert any("discarded" in line for line in sandbox.logs), sandbox.logs
+
+
 def test_refuses_to_start_when_plan_sh_is_missing(sandbox):
     """後始末の道具が無いなら、そもそも殺し始めない (プランレビュー: fail closed)。
 

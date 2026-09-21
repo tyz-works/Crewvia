@@ -773,7 +773,22 @@ class RetirementExecutor:
         return "terminated"
 
     def _orphaned(self, agent: str, prog: dict) -> str:
-        """Progress with no request: the request was deleted mid-flight."""
+        """Progress with no request: the request was deleted mid-flight.
+
+        Which way this settles depends on whether the Worker is still there.
+        If the recorded pid is gone we already did the damage, so the queue
+        repair is still owed and dropping the marker would strand the task —
+        the progress file carries mission/task_id for exactly this case.  If
+        it is still running we have lost the identity record that authorises
+        further steps, so the only safe move left is to leave it alone.
+        """
+        if not process_alive(prog.get("pane_pid")):
+            self.log(
+                f"[retire] {agent}: request marker vanished, but the Worker is already "
+                f"gone — completing the cleanup we still owe"
+            )
+            self._write_progress(agent, prog, PHASE_TERMINATED, window_gone=True)
+            return "terminated"
         self.log(f"[retire] {agent}: request marker vanished mid-flight — settling as discarded")
         self._write_progress(agent, prog, PHASE_DISCARDED,
                              discard_reason="request marker vanished")

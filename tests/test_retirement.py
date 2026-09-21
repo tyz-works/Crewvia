@@ -793,6 +793,36 @@ def test_cleanup_failure_is_retried_until_it_succeeds(sandbox):
     assert not sandbox.assignment_file.exists()
 
 
+def test_cleanup_survives_losing_the_request_marker(sandbox):
+    """終端の後始末は request ファイルの生存に依存しない。
+
+    Worker を殺し終えた後に request を失うと、「どの task を戻すべきか」を
+    知る手段が無くなり、幽霊 task が誰にも気付かれないまま残る。
+    phase を書く時点で mission/task_id を progress 側にも写しておく。
+    """
+    import lib_retirement
+
+    pane_pid = sandbox.spawn_worker_process()
+    sandbox.record_identity(WINDOW, pane_pid)
+    mux = FakeMux({WINDOW: pane_pid})
+    ex = make_executor(sandbox, mux)
+    ex.request(AGENT, WINDOW, "timeout", mission=SLUG, task_id=TASK_ID)
+
+    # notified → sigterm_sent → terminated まで進めてから request を失う
+    for _ in range(3):
+        ex.process_all()
+    lib_retirement.unlink_quiet(lib_retirement.request_path(sandbox.registry, AGENT))
+
+    for _ in range(5):
+        ex.process_all()
+        if not ex.has_marker(AGENT):
+            break
+
+    assert not _pid_alive(pane_pid)
+    assert sandbox.task_status() == "pending", "request を失ったら後始末できなくなった"
+    assert not sandbox.assignment_file.exists()
+
+
 def test_refuses_to_start_when_plan_sh_is_missing(sandbox):
     """後始末の道具が無いなら、そもそも殺し始めない (プランレビュー: fail closed)。
 

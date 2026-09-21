@@ -649,7 +649,9 @@ class RetirementExecutor:
             # the queue-side cleanup is still owed, so go to the terminal
             # phase rather than dropping the marker.
             self.log(f"[retire] {agent}: window {target!r} already gone before first step")
-            self._write_progress(agent, None, PHASE_TERMINATED, window_gone=True)
+            self._write_progress(agent, None, PHASE_TERMINATED, window_gone=True,
+                                 mission=req.get("mission"), task_id=req.get("task_id"),
+                                 reason=req.get("reason"))
             return "terminated"
 
         # Pre-flight (plan review, fail closed): a retirement that owes a
@@ -677,9 +679,18 @@ class RetirementExecutor:
         pane_pid = current_spawn_identity(self.registry_dir, self.mux, target).get("pane_pid")
         # R1: the intent is durable before the act.  If the write fails we
         # have not sent anything, and next cycle starts over cleanly.
+        #
+        # mission/task_id are copied in rather than read back from the request
+        # at cleanup time: the terminal phase is where the queue gets
+        # repaired, and it must not depend on a second file still being there.
+        # Losing the request after the Worker is already dead would otherwise
+        # mean nobody ever learns which task to reset.
         if not self._write_progress(agent, None, PHASE_NOTIFIED,
                                     deadline=self.now() + self.grace_period,
-                                    pane_pid=pane_pid):
+                                    pane_pid=pane_pid,
+                                    mission=req.get("mission"),
+                                    task_id=req.get("task_id"),
+                                    reason=req.get("reason")):
             return "blocked"
         message = req.get("message") or SHUTDOWN_MESSAGE
         if not self.mux.send(target, message):
@@ -807,10 +818,11 @@ class RetirementExecutor:
                 f"[retire] {agent}: cleaned up {mission}/{task_id} "
                 f"(status→pending, assignment removed)"
             )
+            reason = (req or {}).get("reason") or prog.get("reason") or "unknown"
             self._report(
                 agent, prog,
                 f"watchdog が Worker {agent} を終了しました "
-                f"(理由: {(req or {}).get('reason', 'unknown')})。"
+                f"(理由: {reason})。"
                 f"task {task_id} (mission={mission}) は pending に戻し、"
                 f"assignment も削除済みです。復旧作業は不要です。",
             )

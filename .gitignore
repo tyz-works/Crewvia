@@ -40,6 +40,7 @@ registry/notifications/
 registry/approvals/
 registry/handoffs/
 registry/retirements/
+registry/daemons/
 registry/.workers.lock
 registry/dispatcher.log
 registry/dispatcher_all_done.flag

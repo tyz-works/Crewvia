@@ -760,15 +760,27 @@ PYEOF
     # ambient env 継承に頼ると「dispatcher にはあるのに watchdog には無い」
     # ような非対称が起こりうる (t016)。コマンド文字列へ直接埋め込めば、
     # herdr/tmux のどちらでも、どのタイミングでペインが作られても確実に効く。
-    _MUX_ENV_PREFIX=""
-    if [[ -n "${CREWVIA_MUX:-}" ]]; then
-      _MUX_ENV_PREFIX="export CREWVIA_MUX='${CREWVIA_MUX}'; "
+    # t005: 起動コマンドの単一の出どころは lib_daemon_watch.py spawn-cmd。
+    # 相互監視の respawn も同じ関数を通るので、「./crewvia で起動したデーモン」と
+    # 「相手デーモンに起こし直されたデーモン」が env や引数で食い違わない。
+    # 以前はここに文字列リテラルを持っていたが、2 箇所に同じ文字列がある状態は、
+    # まさに「どちらの backend と話すか」を決める変数だけが片方に無い、という形で
+    # ずれる (spawn_command() の docstring 参照)。
+    _DISPATCHER_CMD="$(python3 "${SCRIPT_DIR}/lib_daemon_watch.py" spawn-cmd dispatcher --repo-root "$REPO_ROOT")"
+    _WATCHDOG_CMD="$(python3 "${SCRIPT_DIR}/lib_daemon_watch.py" spawn-cmd watchdog --repo-root "$REPO_ROOT")"
+    # 空文字のまま mux_spawn すると「タブは出来たが何も動いていない」状態になる。
+    # それはこのファイルが一度戦った husk ペインと見分けがつかない壊れ方なので、
+    # 黙って進めず落とす。
+    if [[ -z "$_DISPATCHER_CMD" || -z "$_WATCHDOG_CMD" ]]; then
+      echo "[crewvia] ERROR: lib_daemon_watch.py spawn-cmd returned an empty command." >&2
+      echo "          dispatcher / watchdog を起動できません。python3 と scripts/lib_daemon_watch.py を確認してください。" >&2
+      exit 1
     fi
 
     # A name-only check would also match a window the mux restored empty, which
     # is exactly how the dispatcher silently went missing.  mux_spawn answers
     # the real question: it returns non-zero only when a live one is in there.
-    if mux_spawn "dispatcher" "cd '${REPO_ROOT}' && ${_MUX_ENV_PREFIX}bash '${SCRIPT_DIR}/dispatcher.sh'" "$REPO_ROOT"; then
+    if mux_spawn "dispatcher" "$_DISPATCHER_CMD" "$REPO_ROOT"; then
       echo "[crewvia] Dispatcher started in mux window: dispatcher"
     else
       echo "[crewvia] Dispatcher already running (dispatcher)"
@@ -777,7 +789,7 @@ PYEOF
     # Director: watchdog(v2)を mux 窓で起動（二重起動防止）
     # F6是正: tmuxモードでは従来watchdogが一度も起動していなかった。非tmuxブランチの
     # watchdog.sh(v1・DEPRECATED)ではなくwatchdog.py(v2)を起動する（v1は延命させない）。
-    if mux_spawn "watchdog" "cd '${REPO_ROOT}' && ${_MUX_ENV_PREFIX}python3 '${SCRIPT_DIR}/watchdog.py'" "$REPO_ROOT"; then
+    if mux_spawn "watchdog" "$_WATCHDOG_CMD" "$REPO_ROOT"; then
       echo "[crewvia] Watchdog(v2) started in mux window: watchdog"
     else
       echo "[crewvia] Watchdog already running (watchdog)"

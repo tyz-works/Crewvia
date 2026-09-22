@@ -1167,7 +1167,213 @@ Worker は**既に死んでいる**ので、届かなければ task が in_progr
 
 ---
 
-## 7. 参照
+## 7. 相互監視 — heartbeat / respawn / 自己申告 (t005, 2026-09-22)
+
+§1 で述べた「両者は互いの存在を一切知らない」を、ここで閉じる。
+外部 supervisor (pm2 等) は使わない (ユーザー決定 2026-09-21。node 依存を増やさず、
+設計原則の *mux 非依存 / Taskvia 非依存* と揃えるため)。残る手段は互いを見ることだけで、
+dispatcher と watchdog が 2 サイクルの輪をなす。どちらも特権を持たないので、
+「監視役が死んだら仕組み全体が止まる」という単一障害点ができない。
+
+実装は `scripts/lib_daemon_watch.py` (判定・respawn・報告) と
+`scripts/lib_daemon_watch.sh` (dispatcher の heartbeat 書き出し) の 2 本。
+
+### 7-1. 何が一番まずいのかを先に決める
+
+相互監視が救う障害は「デーモンが止まって誰も気付かない」であり、
+相互監視が新しく作りうる障害は「**生きているデーモンの隣にもう 1 つ起動する**」である。
+後者の方がはるかに重い: dispatcher が 2 つになると同じ task を 2 人の Worker に配り、
+watchdog が 2 つになると同じ retirement を 2 系統が進める (§5-2 の同名別インスタンス
+誤 kill が、今度はデーモン側で起きる)。
+
+したがって判定は常に **fail closed = 確証が無ければ respawn しない**。倒れる方向は
+「起こし損ねる」側であって「起こしすぎる」側ではない。§5-1 (居座り) と §5-2 (誤 kill)
+の選択と同じ向きである。
+
+### 7-2. 生存の書き手を、生きているプロセスに合わせる
+
+| デーモン | 実際に生き続けるプロセス | heartbeat の書き手 | 周期 |
+|---|---|---|---|
+| dispatcher | main loop を回す **bash** (python3 は 1 サイクルごとに使い捨て) | `lib_daemon_watch.sh` の `daemon_beat` (bash) | 5s |
+| watchdog | `watchdog.py` そのもの | `DaemonWatch.beat()` (python) | 30s |
+
+dispatcher の heartbeat を bash から書くのには 2 つ理由がある。
+
+1. **相手が probe すべき PID は bash の `$$` である。** python は毎サイクル別 PID に
+   なるので、記録しても次の cycle には存在しない。
+2. **dispatch サイクルの成否から独立させる必要がある。** python 側が毎回例外で落ちる
+   状態 (壊れた card、中途半端な deploy) では bash ループは元気に回り続けているのに
+   heartbeat だけが止まる。相手から見ると「生きているのに死んで見える」＝ respawn ＝
+   dispatcher が 2 つ、という 7-1 の最悪ケースそのものになる。そのため
+   `daemon_beat` は main loop の **先頭で無条件に** 呼び、`run_dispatch` と
+   `&&` で繋がない (回帰: `test_dispatcher_beats_independently_of_the_dispatch_cycle`)。
+
+watchdog 側の穴は `graceful_terminate()` である。ここは send → **60s 待機** →
+SIGTERM → **10s 待機** → SIGKILL の間、main loop を最大 70 秒ブロックする (§4-1)。
+1 cycle に 1 回しか書かない実装だと、**Worker を終了させるたびに watchdog 自身が
+死んで見える**。よって両方の待機ループの中でも `_beat()` を呼ぶ
+(回帰: `test_watchdog_beats_inside_the_blocking_terminate_wait`)。
+`watchdog_stale_seconds` の既定 240s も、この 70s を跨いでなお余裕が残る値として選んだ。
+
+置き場は `registry/daemons/` で、Worker 用の `registry/heartbeats/` とは分ける。
+後者は **エージェント名** をキーに D4 (vanished worker 検知) が走査するので、
+そこに `watchdog` というファイルを置くと「watchdog という名前の Worker」に見える。
+
+### 7-3. 死亡と判定する条件 — 証拠の強度で並べる
+
+以下を **すべて** 満たしたときだけ respawn する。1 つでも欠ければ保留 (hold)。
+
+| # | 条件 | 満たせない時の読み |
+|---|---|---|
+| 0 | 相互監視が有効 / 自分の checkout が本物 (`repo_identity_ok`) | `refused` |
+| 1 | 停止マーカー `<name>.paused` が無い | `paused` (§7-5) |
+| 2 | 直前の respawn から `respawn_grace_seconds` 経過 | `grace` |
+| 3 | heartbeat が stale、または最初から無い | `healthy` |
+| 4 | **プロセスが存在しない** | `hold` |
+| 5 | **mux のタブが無い** | `hold` |
+| 6 | flap しきい値未満 | `flapping` (§7-6) |
+
+**4 と 5 は両方必要**である。順序にも意味があり、4 を先に訊く。
+
+**4 — プロセス (主証拠).** 2 つの独立した probe を使い、どちらか一方でも「生きている」と
+答えたら respawn しない。
+
+- 記録 PID を **世代ごと** 照合する (`instance_alive()`)。PID は再利用されるので、
+  番号が存在することは同じデーモンである証拠にならない。`/proc/<pid>/stat` の
+  22 番目 (starttime) を `generation` として heartbeat に書き、両方一致したときだけ
+  「生きている」と読む。これは §5-2 の「名前は同じでも中身は別物」を PID の層で
+  繰り返さないためで、bash 側と python 側が同じ数え方をしていることは実プロセスに対して
+  検証してある (`test_bash_written_heartbeat_is_readable_by_python` + 隔離 smoke)。
+- `/proc` を絶対パスで走査する (`scan_daemon_pids()`)。needle は
+  `<repo_root>/scripts/dispatcher.sh` のような**絶対パス**で、`dispatcher.sh` という
+  名前ではない。名前で照合すると、隔離 QA 用の worktree で動かしたデーモンが本番の
+  デーモンに見えてしまう (逆も同じ)。走査そのものが失敗したら `None` を返し、
+  **`[]` (見たが居なかった) と区別する**。
+
+この probe を主証拠に置くのは、**カーネルが mux backend を介さずに答える**からである。
+バックエンドの不調から独立している唯一の信号がこれしかない。
+
+**5 — mux のタブ (従証拠).** `mux.list()` は tmux / herdr のどちらも失敗・タイムアウトを
+黙って `[]` に変換する (`TmuxBackend.list` は `returncode != 0` と 5s タイムアウト、
+`HerdrBackend.list` は workspace 解決失敗と 10s タイムアウト)。したがって
+**空のリストは権威を持たない** — 空でない時だけ「問い合わせは成功した」と言える。
+`_listing_authority_for_cycle()` (§6-3 (1)) と同じ判断を、ここでも同じ理由で採る。
+
+`available()` / `server_running()` による救済は **あえて入れていない**。どちらも
+タイムアウトや例外で False を返すので、1 つの障害が両方を倒し、2 つの失敗が互いを
+補強して「相手は死んだ」の権威になってしまう。それは §6-3 (1) で塞いだ欠陥を
+1 層下で再生産することである (memory: `fail-closed-guard-can-recreate-the-defect`)。
+
+タブが**在る**のにプロセスが無い場合 (herdr が再起動時に残す空ペイン = husk) も
+respawn しない。spawn がその状況でどう振る舞うかは backend 依存で、
+「起こしたつもりで何も起きていない」が成立しうるため、保留して人に上げる。
+
+### 7-4. 保留には必ず出口を付ける
+
+上の表の `hold` はどれも「次の cycle でもう一度見る」であり、一過性の原因
+(バックエンドが復帰する、詰まったデーモンが死ぬ) には正しく効く。効かないのは
+永久に解けない組み合わせで、そこで黙ると**無音の故障**になる。
+
+そこで `hold_report_after_seconds` (既定 1800) を超えた保留は Director に
+**1 度だけ** 報告する。自動で解消はしない — ここで採れる自動の解消手段は respawn しか
+なく、それが 7-1 の危険な向きだからである (memory: `fail-closed-discard-vs-hold`)。
+
+報告は**届くまで再試行する**。`mux.send()` の戻り値を見ないと「Director に伝えた」が
+偽のまま真に見え、それは障害が残す唯一の痕跡を消すことになる。未達の報告は
+`registry/daemons/<self>.reports.json` に積み、毎 cycle の先頭で再送する
+(§6-8 (2) と同じ形)。届いた報告は `delivered` 台帳に移り、二度と送られない。
+
+### 7-5. 意図的な停止 — maintenance マーカー
+
+運用で実際に打つ復旧手順は「kill してから spawn」である。この**隙間でデーモンは
+本当に死んでいる**ので、そこを見た相手が respawn するのは正しく、その 1 秒後に手で
+打った spawn が上に乗る = 二重起動になる。
+
+`registry/daemons/<name>.paused` がある間は respawn しない。順序が効くので、
+`restart()` は **pause → kill → spawn → resume** で実行する (kill を先にすると
+上記の隙間が開いたままになる。回帰: `test_restart_helper_pauses_before_killing`)。
+
+マーカーは `token` で **その restart 実行に束縛** する。名前だけで束縛すると、
+重なった 2 回の restart のうち先に終わった方の `resume` が、まだ作業中の方の保護を
+外してしまう — これも「名前は識別子ではない」の一例である。
+
+マーカーは**古くなっても自動では外さない**。「古い」は「作業が終わった」の証拠では
+なく、作業途中の相手を起こすのは二重起動だからである。代わりに
+`pause_report_after_seconds` を超えたら Director に 1 度だけ報告する。
+
+    # 手動の restart (推奨)
+    python3 scripts/lib_daemon_watch.py restart dispatcher
+
+    # 状態確認
+    python3 scripts/lib_daemon_watch.py status
+
+    # 手で pause/resume する場合 (token を控えること)
+    python3 scripts/lib_daemon_watch.py pause watchdog --reason "PR #NNN 反映"
+    python3 scripts/lib_daemon_watch.py resume watchdog --token <token>
+
+§5-3 の「両デーモンを同時に停止 → 両方 respawn」を手で行う場合は、**先に両方を
+pause してから** kill すること。片方だけ pause して kill すると、生きている側が
+死んだ側を起こす。
+
+### 7-6. flap ガード
+
+起動直後に落ちるデーモンを延々と起こし続けても復旧はしないし、ログだけが流れる。
+`flap_window_seconds` (既定 900) の中で `flap_threshold` (既定 3) 回に達したら
+自動 respawn をやめ、Director に**対応を求める**通知に格上げする (他の報告が
+「対応は不要です」で終わるのと対照的に、これは人を呼ぶ)。
+
+カウンタは名前ではなく**どのインスタンスを置き換えたか** (`replaced_generation`) を
+記録する。単なる回数は「同じ死体を 3 回起こした」(本物の flap) と「3 世代が健全に
+入れ替わった」を区別できない。窓はローリングで、ラッチではない — 1 時間前に荒れた
+デーモンが今日も起こせないのは行き過ぎである。
+
+### 7-7. 起動コマンドの単一の出どころ
+
+respawn のコマンドは `spawn_command()` が唯一の出どころで、`start.sh` も
+`lib_daemon_watch.py spawn-cmd <name>` を呼んでこれを使う
+(回帰: `test_respawn_command_matches_start_sh`)。
+
+同じ文字列を 2 箇所に置くと、**どちらの backend と話すかを決める変数だけが片方に無い**
+という形でずれる。`Mux.spawn()` の `env=` 引数は **両 backend とも無視する** ので、
+env はコマンド文字列に埋め込むしかなく (memory: `lib-mux-spawn-env-arg-ignored`)、
+herdr はさらにサーバー起動時の env を全ペインに継承するため、「./crewvia で起動した
+デーモン」と「相手に起こされたデーモン」が別の backend を向く事故が現実に起こりうる。
+
+### 7-8. しきい値 (`config/crewvia.yaml` の `daemons:`)
+
+| キー | 既定 | 意味 |
+|---|---|---|
+| `mutual_watch` | `true` | 相互監視そのものの ON/OFF |
+| `dispatcher_stale_seconds` | 60 | 5s 周期の 12 サイクル分 |
+| `watchdog_stale_seconds` | 240 | 30s 周期の 8 サイクル分、かつ 70s ブロックを跨げる値 |
+| `respawn_grace_seconds` | 120 | respawn 直後、まだ heartbeat を書いていない間は判定しない |
+| `flap_window_seconds` / `flap_threshold` | 900 / 3 | §7-6 |
+| `hold_report_after_seconds` | 1800 | §7-4 |
+| `pause_report_after_seconds` | 1800 | §7-5 |
+
+env での上書きは `CREWVIA_DAEMON_<KEY 大文字>` (例: `CREWVIA_DAEMON_MUTUAL_WATCH=0`)。
+
+**しきい値を詰めすぎないこと。** 1 回遅いサイクルが「死亡」に見えた瞬間、それは
+7-1 の二重起動である。stale 判定は respawn の入口にすぎず、そこから 4 と 5 の実在確認に
+進むのだから、余裕を取っても検知が遅れるだけで見落としにはならない。
+
+### 7-9. 回帰テストの形
+
+`tests/test_daemon_mutual_watch.py` (38 件)。観測の口 (`mux` / `/proc` 走査 / 時計 /
+自己同一性) をすべて注入可能にしてあるので、本番のデーモン・mux・registry を一切
+巻き込まずに判定表を全通りたどれる。タスク要件の 3 本柱は:
+
+- 片方を落としたら相手が起こす — `test_dead_peer_is_respawned`
+- 生きている相手は起こさない — `test_stuck_but_alive_peer_is_not_respawned` ほか
+- flap で止まる — `test_flap_guard_stops_respawning`
+
+加えて、合成 `/proc` では証明できない部分 (実プロセスの argv 配置、bash と python の
+starttime の数え方の一致) は、使い捨てディレクトリに sleep するだけの
+`scripts/dispatcher.sh` を置いて実プロセスを起動・kill する隔離 smoke で確認した。
+
+---
+
+## 8. 参照
 
 - `scripts/dispatcher.sh` — D1 :998、D2 :1210、D3 :1239、D4 :1351、D5 :819、
   `tmux_kill_window()` :523 (`.firstseen` unlink :561-566)、`_mux_created_at()` :570、
@@ -1185,4 +1391,10 @@ Worker は**既に死んでいる**ので、届かなければ task が in_progr
   `_report_fields()` / `_retry_pending_report()` (§6-8 (2))
 - `knowledge/worker-shutdown-rules.md` — Rule 1-5 の確定仕様
 - `knowledge/worker-vanish-detection.md` — D4 の背景
-- `knowledge/dispatcher-restart-after-merge.md` — 常駐デーモンの反映手順
+- `scripts/lib_daemon_watch.py` — 相互監視の判定・respawn・報告 (§7)。
+  `instance_alive()` / `scan_daemon_pids()` (§7-3)、`_list_windows()` (§7-3 の従証拠)、
+  `_hold()` (§7-4)、`pause()` / `resume()` / `restart()` (§7-5)、
+  `_flap_entries()` (§7-6)、`spawn_command()` (§7-7)
+- `scripts/lib_daemon_watch.sh` — dispatcher の heartbeat を bash から書く (§7-2)
+- `knowledge/dispatcher-restart-after-merge.md` — 常駐デーモンの反映手順。
+  **§7-5 の pause を挟む手順が追加された**ので、kill → spawn を素で打たないこと

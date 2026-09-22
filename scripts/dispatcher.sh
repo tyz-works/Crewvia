@@ -71,6 +71,13 @@ fi
 mkdir -p "$REGISTRY_DIR"
 mkdir -p "$LOG_DIR"
 
+# t005: 相互監視の bash 側。heartbeat を **bash から** 書くために source する。
+# この daemon の本体は「毎サイクル作り直される python」ではなく、このループを
+# 回している bash 自身なので、相手 (watchdog) が probe すべき PID もここの $$
+# である。詳細は scripts/lib_daemon_watch.sh の冒頭。
+# shellcheck source=lib_daemon_watch.sh
+source "${SCRIPT_DIR}/lib_daemon_watch.sh"
+
 log() {
   local msg
   msg="[dispatcher $(date -u '+%Y-%m-%dT%H:%M:%SZ')] $*"
@@ -1669,10 +1676,48 @@ def dispatch():
                     log(f"handoff detected but mux send failed: {slug}/{task_id} (will retry)")
 
 
+def run_daemon_watch():
+    """Is the watchdog still alive?  (t005)
+
+    Only the *peer* is judged here.  This daemon's own heartbeat is written by
+    the bash wrapper, deliberately: the wrapper is the process that endures,
+    and a python cycle that throws on every pass must not be able to make a
+    live dispatcher look dead to the watchdog.
+
+    Everything is caught — the mutual watch is a safety net, and a safety net
+    that can abort the dispatch cycle is a net that makes things worse.
+    """
+    try:
+        import lib_daemon_watch
+        watch = lib_daemon_watch.DaemonWatch(
+            registry_dir=REGISTRY_DIR,
+            repo_root=REPO_ROOT,
+            self_name=lib_daemon_watch.DAEMON_DISPATCHER,
+            mux=_mux,
+            config=lib_daemon_watch.load_config(),
+            log=log,
+        )
+        verdict = watch.watch_peer()
+        # 'healthy' fires every 5 seconds; logging it would bury the log.  The
+        # rest are all states a person may need to reconstruct afterwards.
+        if verdict.action not in (lib_daemon_watch.ACTION_HEALTHY,
+                                  lib_daemon_watch.ACTION_GRACE,
+                                  lib_daemon_watch.ACTION_DISABLED):
+            log(f"[daemon-watch] watchdog: {verdict.action} — {verdict.reason}")
+    except Exception as e:
+        log(f"[daemon-watch] cycle failed: {e!r}")
+
+
 # --- CYCLE ENTRY POINT ---
 # Everything below this marker runs a full dispatch cycle.  Tests that want to
 # exercise a single helper (tests/test_orphan_daemon_guard.py) exec() the code
 # above it and stop here, so keep the marker even if the calls change.
+#
+# t005: the mutual watch goes FIRST.  It is the watchdog's only observer, and
+# a failure further down this cycle (a corrupt card, a half-deployed change)
+# would otherwise take the observer down with it — at exactly the moment the
+# system is least healthy and most in need of it.
+run_daemon_watch()
 publish_agents()
 dispatch()
 # t002: both are queue/registry bookkeeping, not dispatch decisions, and both
@@ -1691,6 +1736,12 @@ while true; do
   # Recompute log file path on each cycle so midnight date-rollover creates a
   # new file automatically (e.g. dispatcher-20260905.log → dispatcher-20260906.log).
   LOG_FILE="${LOG_DIR}/dispatcher-$(date +%Y%m%d).log"
+  # t005: 生存表明は dispatch サイクルの成否から独立させる。`run_dispatch &&`
+  # のように繋いでしまうと、python 側が毎回例外で落ちる状態 (壊れた card、
+  # 中途半端な deploy) で heartbeat だけが止まり、この bash ループは元気なのに
+  # watchdog からは死んで見える → respawn → dispatcher が 2 つ、になる。
+  # そのため無条件・先頭で書く。
+  daemon_beat dispatcher "$REPO_ROOT" "$REGISTRY_DIR"
   run_dispatch || log "dispatch cycle error (exit $?)"
   sleep 5
 done

@@ -19,8 +19,8 @@ workers:
     last_active: 2026-08-25
   - name: Ren
     skills: [code, python]
-    task_count: 19
-    last_active: 2026-09-14
+    task_count: 126
+    last_active: 2026-09-22
   - name: Sora
     role: director
     skills: []
@@ -48,12 +48,12 @@ workers:
     last_active: 2026-09-12
   - name: Seo
     skills: [review]
-    task_count: 73
-    last_active: 2026-09-14
+    task_count: 76
+    last_active: 2026-09-22
   - name: Jiwon
     skills: [docs, research]
-    task_count: 5
-    last_active: 2026-09-02
+    task_count: 7
+    last_active: 2026-09-21
   - name: Minjun
     skills: [docs]
     task_count: 12
@@ -72,8 +72,8 @@ workers:
     last_active: 2026-09-12
   - name: Arjun
     skills: [qa]
-    task_count: 39
-    last_active: 2026-09-13
+    task_count: 44
+    last_active: 2026-09-22
   - name: Priya
     skills: [planning]
     task_count: 20

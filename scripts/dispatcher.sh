@@ -1385,6 +1385,40 @@ def dispatch():
                 log(f"[vanished_worker] {slug}/{task_id}: worker {worker_name} tab gone + heartbeat stale — notified director")
 
 
+    # needs_director detection: task escalated to needs_director → notify Director.
+    # t027: previously nothing watched this transition (grep for 'needs_director' in
+    # this file returned 0 hits) — a Codex NEEDS FIX or a Worker's `plan.sh
+    # needs-director` call left the queue silently draining to empty with no one
+    # waking the Director (measured: 10h28m full stop, 2026-09-21 19:53 UTC →
+    # 2026-09-22 06:22 UTC). Reuses all_tasks already loaded above — no extra scan.
+    # Re-sends every NOTIFY_TTL like the other notify_key's below (not a one-shot):
+    # should_notify() re-arms once the cache entry ages past NOTIFY_TTL, so an
+    # unresolved needs_director task keeps nagging instead of going silent forever.
+    for slug, meta in all_tasks:
+        if meta.get('status') != 'needs_director':
+            continue
+        task_id = meta.get('id', '?')
+        notify_key = f'needs_director_{slug}_{task_id}'
+        if not should_notify(notify_key):
+            continue
+        reason = (meta.get('needs_director_reason') or '').strip()
+        reason_line = reason.splitlines()[0][:200] if reason else '(理由未記載)'
+        task_file = MISSIONS_DIR / slug / 'tasks' / f'{task_id}.md'
+        msg = (
+            f'[needs_director] task {task_id} (mission={slug}) が needs_director です。'
+            f'理由: {reason_line}'
+            + ('…' if len(reason) > len(reason_line) else '')
+            + f' (全文: {task_file})。'
+            f'reason を読んで方針を決め、plan.sh update {task_id} --status in_progress --reset '
+            f'--mission {slug} で差し戻してください。'
+        )
+        if tmux_send(_director_name(), msg):
+            record_notify(notify_key)
+            log(f"[needs_director] {slug}/{task_id}: notified director (reason: {reason_line[:80]!r})")
+        else:
+            log(f"needs_director detected but mux send failed: {slug}/{task_id} (will retry)")
+
+
     # Handoff detection: failed tasks with handoff_path → notify Director
     for slug in active_missions:
         tasks_for_slug = list_tasks_for_mission(slug)

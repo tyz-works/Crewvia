@@ -274,6 +274,11 @@ idle 時の stderr 例（参考、Worker は内容を解釈しなくて良い）
 [plan.sh pull] no task available: no_skill_match — 3 pending task(s) found but none match skills ['ops']
 ```
 
+reason が `retirement_reserved` の場合、あなたの退役処理が進行中である（watchdog が
+`registry/retirements/<あなたの名前>.*` を置いている）。これも exit 2 なので対応は同じ
+（待って再試行 → やがて shutdown）で、**特別な操作は不要**。退役中の Worker に新しい
+task を渡すと、その task を実行中にシグナルが飛んで宙に浮くため、plan.sh の側で断っている。
+
 ### 環境変数を export して worktree に移動する
 
 ```bash

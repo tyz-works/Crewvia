@@ -110,10 +110,13 @@ decision and the act, and things happen in it.
     Worker that finishes the timed-out task and pulls the next one keeps its
     pid and its created_at.  `assignment_execution_verdict()` asks the
     assignment instead — the thing `plan.sh pull` republishes, with its
-    generation, inside the queue lock — and anything but a positive match is a
-    discard.  Upstream, dispatcher no longer hands a task to a Worker that has
-    a marker at all, so the situation mostly does not arise; this is the
-    backstop for the times it does.
+    generation, inside the queue lock — and **only a positive match lets the
+    retirement proceed**.  An assignment that says the Worker moved on is a
+    discard; a generation we cannot read at all is a hold, because a discard
+    there would be re-decided identically every cycle (`_unprovable()`,
+    t026).  Upstream, neither dispatcher nor `plan.sh pull` will hand a task
+    to a Worker that has a marker, so the situation mostly does not arise;
+    this is the backstop for the times it does.
   - **The request file is the race, so creating it is the decision.**  Two
     daemons write requests and both check `has_marker()` first.  A check apart
     from the write is not a decision, so the create is atomic
@@ -159,11 +162,15 @@ PHASE_SIGTERM_SENT = "sigterm_sent"
 PHASE_TERMINATED = "terminated"
 PHASE_DISCARDED = "discarded"
 PHASE_CLEANUP_FAILED = "cleanup_failed"
+#: Stopped because this retirement cannot be shown to be about the execution
+#: that is running now.  Nothing killed, nothing rewritten, marker kept — see
+#: `RetirementExecutor._unprovable()` for why this is a hold and not a discard.
+PHASE_UNPROVABLE = "unprovable"
 
 #: Phases where a Worker may still be alive and the machine owes it a step.
 IN_FLIGHT_PHASES = frozenset({PHASE_NOTIFIED, PHASE_SIGTERM_SENT, PHASE_TERMINATED})
 #: Phases where nothing further will happen on its own.
-SETTLED_PHASES = frozenset({PHASE_DISCARDED, PHASE_CLEANUP_FAILED})
+SETTLED_PHASES = frozenset({PHASE_DISCARDED, PHASE_CLEANUP_FAILED, PHASE_UNPROVABLE})
 
 #: Message dispatcher used to send itself before killing; now carried in the
 #: marker so the *executor* sends it exactly once.
@@ -512,6 +519,11 @@ def assignment_execution_verdict(queue_dir, agent: str, mission, task_id,
     it inside the queue lock together with the card, and publishes the
     generation beside it (`<agent>.identity`).  Read-only and deliberately
     small: this runs inside watchdog's cycle and must not take the queue lock.
+
+    **Only a positive match returns `EXEC_SAME`.**  Every way of failing to
+    read the generation — none recorded, no sidecar, a sidecar without one —
+    comes back `EXEC_UNREADABLE`, because the one thing left to compare is a
+    string that a reset + re-pull reproduces exactly (Codex 5 巡目 P1-1).
     """
     if not queue_dir or not agent or not task_id:
         return EXEC_UNREADABLE, "no assignment to compare against"
@@ -528,18 +540,21 @@ def assignment_execution_verdict(queue_dir, agent: str, mission, task_id,
         return EXEC_OTHER, (f"assignment names {published!r}, not {expected!r} "
                             f"— the Worker has moved on")
     if generation is None:
-        # Nothing was recorded to compare a generation against.  The card match
-        # above is all the evidence there is, and it already excludes the
-        # damaging case (a Worker executing a *different* task).
-        return EXEC_SAME, "no recorded generation to compare"
+        # Nothing was recorded to compare against, so nothing here can be
+        # matched.  The card match above is *not* the remaining evidence it
+        # looks like: a reset + re-pull of the same card by the same name
+        # republishes a byte-identical assignment, which is the one case the
+        # generation exists to separate (Codex 5 巡目 P1-1).
+        return EXEC_UNREADABLE, "no generation was recorded for this retirement"
 
     identity = read_json(base.with_name(base.name + ".identity"))
     current = (identity or {}).get("started_at")
     if identity is None or current is None:
         # `plan.sh pull` always writes the sidecar next to the assignment, so
-        # its absence is an old or hand-made state rather than the re-pull race
-        # — and the card match already rules out the dangerous direction.
-        return EXEC_SAME, "assignment identity sidecar unreadable"
+        # this is an old or hand-made state.  That makes it unusual, not
+        # proven: the assignment in front of us may still be a successor's.
+        return EXEC_UNREADABLE, (f"queue/assignments/{agent}.identity is missing "
+                                 f"or carries no started_at")
     if str(current).strip() != str(generation).strip():
         return EXEC_OTHER, (f"assignment generation {current!r} != recorded "
                             f"{generation!r} — same card, different execution")
@@ -748,6 +763,10 @@ GUARD_SKIP = "skip"
 #: identity).  The marker can never become valid again; settle it as discarded
 #: so it stops pointing at an innocent same-named successor.
 GUARD_DISCARD = "discard"
+#: We cannot tell whether the target is still the execution this retirement is
+#: about.  Unlike a discard, re-deciding would reach the same dead end every
+#: cycle, so the marker is held and a human is told once (`_unprovable()`).
+GUARD_UNPROVABLE = "unprovable"
 
 
 def _default_run_command(argv: list, env: dict) -> Tuple[int, str]:
@@ -1038,6 +1057,8 @@ class RetirementExecutor:
             return self._settle_terminated(agent, req, prog, keep_request=foreign)
         if phase == PHASE_DISCARDED:
             return self._settle_discarded(agent, prog, keep_request=foreign)
+        if phase == PHASE_UNPROVABLE:
+            return self._recheck_unprovable(agent, req, prog)
 
         # Unknown / corrupt phase.  Settle it as discarded rather than
         # guessing which destructive step it was in the middle of.
@@ -1156,9 +1177,9 @@ class RetirementExecutor:
         if req is None and prog is None:
             unlink_quiet(stall_path(self.registry_dir, agent))
             return False
-        # cleanup_failed has already told the Director, with a recipe; a second
+        # These two have already told the Director, with what to do; a second
         # message about the same marker would only add noise.
-        if (prog or {}).get("phase") == PHASE_CLEANUP_FAILED:
+        if (prog or {}).get("phase") in (PHASE_CLEANUP_FAILED, PHASE_UNPROVABLE):
             return False
         if stall_path(self.registry_dir, agent).exists():
             return False
@@ -1233,12 +1254,30 @@ class RetirementExecutor:
         successor that this guard never saw, and that pid would then be
         persisted and signalled without ever having been checked against the
         request (Codex P1-3).
+
+        The order of the checks is part of the guarantee.  The one call here
+        that can block — resolving the window's identity through the mux
+        backend — runs **first**, so that the assignment is the *last* thing
+        read before the caller acts on the answer.  Reading the assignment
+        first left a subprocess-long gap between "this Worker still holds that
+        execution" and the signal, and a Worker that called `plan.sh pull`
+        inside that gap was signalled while running a task this retirement
+        knows nothing about (Codex 5 巡目 P1-2).  What actually closes that
+        door is the retirement reservation `plan.sh pull` now honours — no
+        assignment can be published to a Worker with a marker, inside the same
+        queue lock that publishes it.  This ordering is what keeps the door
+        from standing open in the meantime; neither alone is the fix.
         """
         if not self.repo_identity_check():
             return GUARD_SKIP, (
                 f"self-identity check failed for repo_root={self.repo_root} "
                 f"(missing or no longer a git checkout — likely a removed worktree)"
             ), {}
+
+        current = current_spawn_identity(self.registry_dir, self.mux, target)
+        ok, why = identity_matches(req.get("spawn_identity"), current)
+        if not ok:
+            return GUARD_DISCARD, why, current
 
         # The premise of an idle retirement is "this Worker has no work".  It
         # was true when dispatcher wrote the marker; it is checked again here
@@ -1252,7 +1291,8 @@ class RetirementExecutor:
             try:
                 if (self.queue_dir / "assignments" / agent).exists():
                     return (GUARD_DISCARD,
-                            "Worker picked up a task after the request was written", {})
+                            "Worker picked up a task after the request was written",
+                            current)
             except OSError:
                 pass
 
@@ -1264,25 +1304,123 @@ class RetirementExecutor:
         # same created_at, so R7 passes and the escalation lands on live work,
         # stranding the new task nobody holds evidence for (Codex 4 巡目 P1-1).
         #
-        # Everything except a positive match is a discard, i.e. "kill nothing,
-        # rewrite nothing".  That has an exit: the marker goes away, and the
-        # timeout is re-decided from the card on a later cycle if the Worker
-        # really is stuck — unlike a hold, which would keep `has_marker()`
-        # raised and stop anybody asking again.
+        # Everything except a positive match stops here, and the two ways of
+        # stopping are not interchangeable:
+        #
+        #   - the assignment *says* the Worker moved on (another task, or
+        #     another generation of this one, or none at all) → discard.  The
+        #     marker goes away and the timeout is re-decided from the card on a
+        #     later cycle if the Worker really is stuck.
+        #   - we simply cannot read the generation → hold.  A discard here
+        #     would be re-requested and re-discarded every cycle, forever,
+        #     because the card says the same thing next time (`_unprovable()`).
         if req.get("task_id") and self.queue_dir:
             verdict, detail = assignment_execution_verdict(
                 self.queue_dir, agent, req.get("mission"), req.get("task_id"),
                 self._bound_generation(req, None))
+            if verdict == EXEC_UNREADABLE:
+                return GUARD_UNPROVABLE, (
+                    f"cannot prove the assignment still names the execution this "
+                    f"retirement is about ({detail})"), current
             if verdict != EXEC_SAME:
                 return GUARD_DISCARD, (
                     f"the assignment no longer names the execution this retirement "
-                    f"is about ({verdict}: {detail})"), {}
-
-        current = current_spawn_identity(self.registry_dir, self.mux, target)
-        ok, why = identity_matches(req.get("spawn_identity"), current)
-        if not ok:
-            return GUARD_DISCARD, why, current
+                    f"is about ({verdict}: {detail})"), current
         return GUARD_OK, "", current
+
+    def _unprovable(self, agent: str, req: Optional[dict], prog: Optional[dict],
+                    why: str, target: str) -> Optional[str]:
+        """The guard could not bind this retirement to a running execution.
+
+        Discarding is the usual answer to "the premise no longer holds", and
+        it is the right one when the assignment *says* the Worker moved on:
+        the marker goes away and the timeout gets re-decided from the card.
+        Here there is nothing to re-decide with.  The card will say exactly
+        the same thing next cycle, so a discard is re-requested and
+        re-discarded for as long as the Worker stays stuck — a silent
+        livelock, which is the ghost this module exists to remove, only
+        quieter.  So the marker is kept.
+
+        Keeping it is also what protects the Worker: `has_marker()` stays
+        raised, so watchdog stops re-firing the timeout, dispatcher stops
+        offering it work, and `plan.sh pull` refuses on the same file.  It is
+        quarantined rather than killed, and a human opens the quarantine by
+        deleting `registry/retirements/<agent>.*`.
+
+        Told once, and deliberately **without** the `--reset` recipe: a human
+        following it would roll back a task that may be under way right now
+        (`_settle_discarded()`).  What they are asked for is the one thing
+        only they can supply — looking at what the Worker is actually doing.
+
+        The message names the phase it stopped at, and says "from here on"
+        rather than "nothing": reached from `_step_sigterm()` a SIGTERM has
+        already gone out, and a report that claimed otherwise would send the
+        reader looking for the wrong thing.
+        """
+        previous = prog or {}
+        if previous.get("phase") == PHASE_UNPROVABLE:
+            return None   # already held and already reported
+        stopped_at = previous.get("phase") or "requested (no step taken yet)"
+        self.log(f"[retire] {agent}: HOLDING this retirement at phase={stopped_at} "
+                 f"— {why}. Nothing further killed, nothing reset; the marker stays "
+                 f"until a human clears registry/retirements/{agent}.*")
+        mission = (req or {}).get("mission") or previous.get("mission")
+        task_id = (req or {}).get("task_id") or previous.get("task_id")
+        task_line = (f"task {task_id} (mission={mission}) は in_progress のままです。"
+                     if task_id and mission else "")
+        notified = self._report(
+            agent, previous,
+            f"watchdog は Worker {agent} の退役を途中で止めました "
+            f"(phase={stopped_at})。この退役が「どの実行を終わらせるものだったか」"
+            f"を証明できないためです ({why})。証拠が無いまま進めると、同名の "
+            f"Worker が別の実行をしている場合にそれを巻き込むので、**ここから先は"
+            f"何も kill せず、queue も書き換えていません**。{task_line}\n"
+            f"確認してください: 窓 {target} の Worker がいま何を実行しているか / "
+            f"queue/assignments/{agent} と隣の .identity サイドカーが揃っているか。\n"
+            f"この marker がある間 {agent} は新しい task を pull できず、dispatcher "
+            f"からも割り当てられません。解除は registry/retirements/{agent}.* を"
+            f"削除してください。",
+        )
+        carried = _carried_from_request(req) if (prog is None and req) else {}
+        if not self._write_progress(agent, previous, PHASE_UNPROVABLE,
+                                    unprovable_reason=why,
+                                    director_notified=notified, **carried):
+            return "blocked"
+        return "unprovable"
+
+    def _recheck_unprovable(self, agent: str, req: Optional[dict],
+                            prog: dict) -> Optional[str]:
+        """A held retirement is released as soon as the assignment settles it.
+
+        The hold exists because nothing could be proved; it does not have to
+        outlive that.  If the assignment later says outright that this Worker
+        moved on — it is gone, or it names another task — the premise is
+        falsified without the generation entering into it, and the marker can
+        be dropped exactly as `_guard()` would have dropped it.  That is the
+        common recovery: the Worker was never stuck, it finished, and nobody
+        had to touch anything.
+
+        **Only those two answers release it.**  A generation that becomes
+        readable and matching would mean quietly resuming a retirement the
+        Director has already been told was stopped, and re-deciding that
+        behind their back is the churn the hold exists to prevent.
+
+        Read-only up to the one thing it writes — `discarded`, which kills
+        nothing and rewrites nothing.
+        """
+        mission = (req or {}).get("mission") or prog.get("mission")
+        task_id = (req or {}).get("task_id") or prog.get("task_id")
+        if not (task_id and self.queue_dir):
+            return None
+        verdict, detail = assignment_execution_verdict(
+            self.queue_dir, agent, mission, task_id,
+            self._bound_generation(req, prog))
+        if verdict not in (EXEC_OTHER, EXEC_ABSENT):
+            return None
+        why = f"held, then settled by the assignment ({verdict}: {detail})"
+        self.log(f"[retire] {agent}: releasing the held retirement — {why}")
+        self._write_progress(agent, prog, PHASE_DISCARDED, discard_reason=why)
+        return "discarded"
 
     @staticmethod
     def _verified_pid(req: dict, identity: dict) -> Optional[int]:
@@ -1365,6 +1503,8 @@ class RetirementExecutor:
         if verdict == GUARD_SKIP:
             self.log(f"[retire] {agent}: skipping this cycle — {why}")
             return "skipped"
+        if verdict == GUARD_UNPROVABLE:
+            return self._unprovable(agent, req, None, why, target)
         if verdict == GUARD_DISCARD:
             self.log(f"[retire] {agent}: NOT retiring — {why}")
             self._write_progress(agent, None, PHASE_DISCARDED, discard_reason=why)
@@ -1414,6 +1554,8 @@ class RetirementExecutor:
         if verdict == GUARD_SKIP:
             self.log(f"[retire] {agent}: REFUSING SIGTERM — {why}")
             return "skipped"
+        if verdict == GUARD_UNPROVABLE:
+            return self._unprovable(agent, req, prog, why, target)
         if verdict == GUARD_DISCARD:
             self.log(f"[retire] {agent}: NOT sending SIGTERM — {why}")
             self._write_progress(agent, prog, PHASE_DISCARDED, discard_reason=why)
@@ -1460,6 +1602,8 @@ class RetirementExecutor:
         if verdict == GUARD_SKIP:
             self.log(f"[retire] {agent}: REFUSING SIGKILL — {why}")
             return "skipped"
+        if verdict == GUARD_UNPROVABLE:
+            return self._unprovable(agent, req, prog, why, target)
         if verdict == GUARD_DISCARD:
             self.log(f"[retire] {agent}: NOT sending SIGKILL — {why}")
             self._write_progress(agent, prog, PHASE_DISCARDED, discard_reason=why)

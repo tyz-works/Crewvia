@@ -874,6 +874,11 @@ assignment かを問わなかったのが誤り**である。
 立ったままになり、誰も再要求できない Worker が残る。discard なら marker が
 消え、本当に止まっているなら次の cycle で card から timeout が再判定される。
 
+> **t026 で訂正。** 「読めない」をここに混ぜたのが 5 巡目 P1-1 だった。
+> 読めないケースは discard でも決着でもなく、次の cycle が同じ結論に辿り着く
+> だけの**無限ループ**になる。§6-7 (1) を参照 — 読めないときだけ hold + 報告
+> に分けた。
+
 **既に別 task を pull されていた場合、退役の側を取り消す**ことにした。新しい
 task を pending に戻す選択肢もあるが、それは「生きている Worker が作業中の
 card を、曖昧さを理由に巻き戻す」ことであり、このモジュールが 9 件かけて
@@ -964,6 +969,109 @@ subprocess timeout 自体も 120 → 30 秒 (`CLEANUP_COMMAND_TIMEOUT`) に下�
 RED であることは 7 本 + dispatcher 3 本を修正前の `scripts/` に対して流して
 確認した (全 fail → 修正後 53 passed)。
 
+## 6-7. 証拠が無いときの倒し方と、予約の置き場所 (t026, 2026-09-22)
+
+t012 (Codex) の 5 巡目、P1 2 件。どちらも §6-6 で入れた対策の**当てが甘かった
+場所**であり、新しい型ではない。
+
+| 指摘 | 何が甘かったか | 閉じ方 |
+|---|---|---|
+| P1-1 | 「世代を読めない」を EXEC_SAME (続行可) に倒していた | 積極的に一致したときだけ続行。読めないときは hold + 報告 (下 (1)) |
+| P1-2 | 退役予約が dispatcher の割り当て経路にしか無い | `plan.sh pull` のロックの中で予約を効かせる (下 (2)) |
+
+### (1) 「比べる相手が無い」は「一致した」ではない
+
+`assignment_execution_verdict()` は、記録側に世代が無い場合も `.identity`
+サイドカーを読めない場合も `EXEC_SAME` を返していた。理由づけは「assignment
+の本文が同じ card を指しているのだから」だったが、**その本文こそ、同じ card
+を取り直した後任のものとバイト単位で同一になる**。crewvia は Worker 名を
+ポジションとして使い回すので pane の pid も created_at も変わらない。つまり
+この fallback は、猶予期間中に reset → 再 pull が起きたときに**新しい実行への
+SIGTERM/SIGKILL を許可する**。しかも後始末は世代が違うことを理由にその実行の
+reset を拒むので、task は誰の管轄でもないまま in_progress で残る — §6-6 (1)
+が消したはずの幽霊 task が、証拠が無いときだけ復活していた。
+
+積極的に一致したときだけ `EXEC_SAME` を返すように直した。**倒す先は discard
+ではなく hold** で、ここが §6-6 (1) の書き方との違いである:
+
+- assignment が「Worker はもう別のことをしている」と**言っている** (別の
+  task / 別の世代 / 不在) → discard。前提が反証されたので決着してよく、
+  本当に止まっているなら次の cycle で card から再判定される。
+- 世代を**読めない** → hold (`PHASE_UNPROVABLE`)。discard にすると、次の
+  cycle も card は同じことを言うので再要求され、また読めずに discard される。
+  Worker は殺されも解放もされないまま、誰も気付かない無限ループになる。
+
+marker を残すこと自体が保護になっている: `has_marker()` が立っている間
+watchdog は timeout を再発火せず、dispatcher は割り当てず、下 (2) により本人も
+pull できない。つまり kill ではなく**隔離**である。報告に `--reset` の手順は
+**入れない** — 何も殺していない (あるいは SIGTERM までしか撃っていない) ので、
+それに従うと作業中の card を巻き戻させてしまう。
+
+hold の出口は 2 つある。**人間**が `registry/retirements/<agent>.*` を消すか、
+**assignment が言い切る**か。後者が `_recheck_unprovable()` で、assignment が
+不在になる / 別の task を指すようになったら — つまり「この Worker はもう別の
+ことをしている」が世代抜きで確定したら — discard に落として marker を消す。
+自力で完了しただけの健全な Worker を人間待ちで止めないための出口であり、
+「読めるようになって、しかも一致した」場合は**解かない** (止めたと報告済みの
+退役を黙って再開することになる)。
+
+### (2) 予約は assignment を公開する場所に置く
+
+§6-6 (1) の本命は dispatcher 側の除外だったが、dispatcher にできるのは
+**割り当てメッセージを送らないこと**だけである。Worker 自身が `plan.sh pull`
+を叩く経路も、退役が決まる前に既に届いていた指示も止まらない。実際
+`_guard()` は assignment を確認したあとに `current_spawn_identity()` を呼んで
+おり、これは mux の subprocess でブロックしうる。その隙に Worker が done →
+pull を通せば、pane の pid は変わらないので検証を通過し、**新しい task の実行
+中にシグナルが飛ぶ**。
+
+assignment を公開するのは `cmd_pull()` の 1 箇所だけで、しかも card の書き換え
+と同じキューロックの中である (t021)。予約を効かせられる直列化点はそこしか
+ない。`retirement_reservation()` が marker の**存在だけ**を stat で見て、
+立っていれば 1 バイトも書かずに `exit 2` (`retirement_reserved`) で返る。
+
+- 中身は読まない。全 Worker が叩く pull のロックの中なので、パースや列挙で
+  ロック保持時間を伸ばしてはいけない。
+- `exit 2` = 「タスクなし」に載せたのは、退役中の Worker に対しては**それが
+  本当のこと**だからである。Worker は既定の idle 動作 (待って再試行 → やがて
+  shutdown) に素直に落ちる。理由は stderr の `retirement_reserved` で残る。
+- registry の場所は `CREWVIA_REPO_ROOT` を優先する。worktree 側の plan.sh を
+  叩かれると `REPO_ROOT` は worktree を指し、本体の marker を見逃す
+  (memory: crewvia-worktree-repo-root-pitfall)。
+
+そのうえで `_guard()` の順序を入れ替え、**ブロックしうる mux 呼び出しを先頭に、
+assignment の確認を最後に**した。確認から着弾までの間に残るのはファイル読み
+数回だけになる。予約と順序は**どちらか一方では閉じない**: 予約は「新しい task
+を握らせない」ことを保証し、順序は予約が届かない経路 (既に届いていた指示、手で
+置かれた assignment、別 checkout の古い plan.sh) に対して窓を狭める。
+
+### 回帰テストの形
+
+- `test_red_missing_assignment_identity_sidecar_does_not_authorise_a_kill` /
+  `test_red_missing_recorded_generation_does_not_authorise_a_kill`
+  — 証拠の 2 通りの欠け方それぞれで、Worker が生きたまま card も assignment も
+  変わらないこと。
+- `test_unprovable_retirement_is_escalated_once_and_can_be_released` /
+  `test_unprovable_hold_releases_itself_when_the_worker_lets_go_of_the_card`
+  — 逆向きの担保。hold は黙って居座らせることではないので、報告が 1 通である
+  こと・`--reset` を勧めていないこと・**marker を消せば次の退役は普通に成立
+  すること**・**Worker が自分で assignment を手放したら人間を呼ばずに解ける
+  こと** (= 二度と終了できない Worker を作っていないこと) を押さえる。
+- `test_red_pull_is_refused_while_a_retirement_is_in_flight`
+  — 本物の plan.sh で。`exit 2` を返し、card を書き換えず、assignment を
+  公開しないこと。
+- `test_red_worker_that_pulls_inside_the_guard_is_not_signalled_on_the_new_task`
+  — 並行性。実時間では再現できない幅なので、guard が必ず通る `mux.pid()` を
+  割り込み点として固定し、そこで本物の `done` → `pull` を走らせる
+  (memory: microsecond-race-fix-needs-structural-test)。
+- `test_pull_is_allowed_again_once_the_retirement_marker_is_cleared`
+  — 逆向きの担保。これが無いと「常に断る」に倒しただけで緑になる。
+
+§6-6 の 3 本 (`..._during_the_grace_period_is_spared` 他) は、(2) の予約で
+**正面からは再現できなくなった**。backstop の試験としては残す必要があるので、
+`_reservation_lifted` で予約を一時的に外して同じ状態を作っている。予約が届か
+ない経路が現実にありうる以上、guard 単体の担保を消してはいけない。
+
 ---
 
 ## 7. 参照
@@ -977,7 +1085,8 @@ RED であることは 7 本 + dispatcher 3 本を修正前の `scripts/` に対
 - `scripts/benchmark-ctx.sh` — 直接 `mux_kill` :199 / :312 (N2)
 - `scripts/start.sh` — dispatcher / watchdog の起動 :771 / :780、F6是正コメント :778-779
 - `scripts/plan.sh` — `publish_assignment()` / `classify_assignment()` /
-  `retire_assignment()` / `cmd_retire()` (§3-5)
+  `retire_assignment()` / `cmd_retire()` (§3-5)、
+  `retirement_reservation()` + `cmd_pull()` 冒頭のゲート (§6-7 (2))
 - `knowledge/worker-shutdown-rules.md` — Rule 1-5 の確定仕様
 - `knowledge/worker-vanish-detection.md` — D4 の背景
 - `knowledge/dispatcher-restart-after-merge.md` — 常駐デーモンの反映手順

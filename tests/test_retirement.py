@@ -116,6 +116,23 @@ t024 — Codex 3 巡目の残り 2 件。どちらも「証拠が無いこと」
       あることを引数で固定する。サイトごとの個別ガードが復活すると落ちる。
   (対応表と設計は knowledge/daemon-authority.md §6-5)
 
+t026 — Codex 5 巡目 P1 2 件。t025 で入れた対策の当てが甘かった 2 箇所で、
+どちらも「証明できていないものを証明できたことにして進む」という同じ形:
+  test_red_missing_assignment_identity_sidecar_does_not_authorise_a_kill  (P1-1)
+  test_red_missing_recorded_generation_does_not_authorise_a_kill          (P1-1)
+  test_unprovable_retirement_is_escalated_once_and_can_be_released
+    ↑ 逆向きの担保: hold に倒す経路が増えたので、「二度と終了できない Worker」
+      を作っていないこと (報告 1 通 + marker を消せば次の退役は成立する)。
+  test_unprovable_hold_releases_itself_when_the_worker_lets_go_of_the_card
+    ↑ 同上。人間を呼ばずに済む曖昧さ (Worker が自分で assignment を手放した)
+      は自動で解けること。
+  test_red_pull_is_refused_while_a_retirement_is_in_flight                (P1-2)
+  test_red_worker_that_pulls_inside_the_guard_is_not_signalled_on_the_new_task
+                                                                          (P1-2)
+  test_pull_is_allowed_again_once_the_retirement_marker_is_cleared
+    ↑ 逆向きの担保: 「常に断る」に倒しただけでは緑にならないこと。
+  (設計は knowledge/daemon-authority.md §6-7)
+
 実行方法:
   python3 -m pytest tests/test_retirement.py -v
 """
@@ -1661,8 +1678,14 @@ def test_red_cleanup_without_a_recorded_generation_is_escalated_not_guessed(sand
     req = lib_retirement.read_json(lib_retirement.request_path(sandbox.registry, AGENT))
     assert "task_started_at" not in req, "世代が読めていたらこのテストは前提が違う"
 
-    ex.process_all()                      # → notified
-    os.kill(pane_pid, signal.SIGKILL)     # Worker は shutdown を受けて抜けた
+    # Worker は shutdown を待たずに自力で抜け、窓も消えた。
+    #
+    # t026 以降、世代を記録できていない retirement は `_guard()` を通れない
+    # (証明できないものを証明できたことにしないのが t026 の修正である) ので、
+    # この後始末に到達する道は「Worker が自分で終わっていた」経路だけになった。
+    # このテストの主題は**到達のしかた**ではなく、そこから先の「世代が無い
+    # まま前提を弱めて reset しないこと」なので、到達だけ書き換えている。
+    os.kill(pane_pid, signal.SIGKILL)
     _wait_gone(pane_pid)
     ex.process_all()                      # → terminated (後始末だけが残る)
 
@@ -1887,6 +1910,35 @@ def _status_of(sandbox, task_id: str) -> str:
     return "?"
 
 
+class _reservation_lifted:
+    """退役予約を一時的に外し、「退役中の Worker が task を握った」状態を作る。
+
+    t026 で `plan.sh pull` が退役予約を見るようになったので、この状態は正面から
+    (本物の pull で) は作れなくなった。それでも watchdog 側の guard は**最後の
+    防波堤**として残っていなければならない: 予約が届かない経路は実際にありうる
+    — 退役が決まる前に Worker へ届いていた指示、手で publish された assignment、
+    別 checkout の古い plan.sh。予約をいったん外して同じ状態を作り、guard 単体
+    でもその Worker に手を出さないことを確かめる。
+    """
+
+    def __init__(self, sandbox):
+        self.sandbox = sandbox
+        self.moved: list = []
+
+    def __enter__(self):
+        for path in (self.sandbox.registry / "retirements").glob(f"{AGENT}*"):
+            hidden = path.parent / (path.name + ".hidden")
+            path.rename(hidden)
+            self.moved.append((hidden, path))
+        assert self.moved, "退役 marker が無い — テストの前提が崩れている"
+        return self
+
+    def __exit__(self, *exc):
+        for hidden, path in self.moved:
+            hidden.rename(path)
+        return False
+
+
 # -- 1. 猶予期間中の pull ----------------------------------------------------
 
 def test_red_worker_that_pulled_another_task_during_the_grace_period_is_spared(sandbox):
@@ -1911,10 +1963,13 @@ def test_red_worker_that_pulled_another_task_during_the_grace_period_is_spared(s
     assert ex.process_all() == [(AGENT, "notified")]
 
     # 猶予期間中に Worker が生き返り、自分で片を付けて次を取る。
+    # (t026 以降、pull そのものは予約で断られる。ここで試しているのはその後ろの
+    #  guard なので、予約が届かなかった場合を `_reservation_lifted` で作る。)
     done = _plan(sandbox, "done", TASK_ID, "grace 中に自力で完了", "--mission", SLUG)
     assert done.returncode == 0, done.stderr
-    pull = _plan(sandbox, "pull", "--task", "t002", "--mission", SLUG,
-                 "--agent", AGENT, "--skills", "code")
+    with _reservation_lifted(sandbox):
+        pull = _plan(sandbox, "pull", "--task", "t002", "--mission", SLUG,
+                     "--agent", AGENT, "--skills", "code")
     assert pull.returncode == 0, pull.stderr
     assert _status_of(sandbox, "t002") == "in_progress"
 
@@ -1972,8 +2027,11 @@ def test_red_same_card_pulled_again_by_a_successor_is_a_different_execution(sand
     reset = _plan(sandbox, "update", TASK_ID, "--status", "pending", "--reset",
                   "--mission", SLUG)
     assert reset.returncode == 0, reset.stderr
-    pull = _plan(sandbox, "pull", "--task", TASK_ID, "--mission", SLUG,
-                 "--agent", AGENT, "--skills", "code")
+    # pull は t026 の予約で断られる。ここで試すのはその後ろの guard なので、
+    # 予約が届かなかった場合を作る (`_reservation_lifted` の docstring 参照)。
+    with _reservation_lifted(sandbox):
+        pull = _plan(sandbox, "pull", "--task", TASK_ID, "--mission", SLUG,
+                     "--agent", AGENT, "--skills", "code")
     assert pull.returncode == 0, pull.stderr
 
     ex.now = lambda: time.time() + 7200
@@ -2200,3 +2258,288 @@ def test_red_cleanup_does_not_block_the_cycle_on_the_queue_lock(sandbox):
 def read_json_file(sandbox, agent):
     import lib_retirement as lr
     return lr.read_json(lr.progress_path(sandbox.registry, agent)) or {}
+
+
+# ---------------------------------------------------------------------------
+# t026 — Codex 5 巡目 P1 2 件。どちらも「証明できていないものを証明できたことに
+# して破壊的な一手に進む」という、この module が 4 巡繰り返してきた形:
+#   1. 世代を突き合わせられないケースを EXEC_SAME (= 続行可) に倒していた (P1-1)
+#   2. guard の確認とシグナル送信の間に、Worker 自身が次の task を取れた (P1-2)
+# ---------------------------------------------------------------------------
+
+
+def _retirement_files(sandbox):
+    return sorted((sandbox.registry / "retirements").glob(f"{AGENT}*"))
+
+
+def _clear_marker(sandbox) -> None:
+    """人間が `registry/retirements/<agent>.*` を消す = 退役予約の解除。"""
+    for path in _retirement_files(sandbox):
+        path.unlink()
+
+
+def _drive(ex, cycles: int = 6) -> None:
+    for _ in range(cycles):
+        ex.process_all()
+
+
+# -- 1. 世代の証拠が無いときに続行してはならない -----------------------------
+
+def test_red_missing_assignment_identity_sidecar_does_not_authorise_a_kill(sandbox):
+    """サイドカーを読めない = 世代を突き合わせられない。続行の根拠にはならない。
+
+    RED (Codex 5 巡目 P1-1): `assignment_execution_verdict()` は
+    `<agent>.identity` が無い / 読めないときに `EXEC_SAME` を返していた。
+    「assignment の本文が同じ card を指しているのだから」という理由づけだが、
+    本文は**同じ card を取り直した後任のものとバイト単位で同一**になる。
+    crewvia は Worker 名をポジションとして使い回すので、pane の pid も
+    created_at も同じまま。つまりこの fallback は、猶予期間中に reset →
+    再 pull が起きたときに、**新しい実行に対する SIGTERM/SIGKILL を許可する**。
+    しかも後始末は世代が違うことを理由にその実行の reset を拒むので、task は
+    誰の管轄でもないまま in_progress で宙に浮く。
+    """
+    pane_pid = sandbox.spawn_worker_process()
+    sandbox.record_identity(WINDOW, pane_pid)
+    mux = FakeMux({WINDOW: pane_pid})
+
+    ex = make_executor(sandbox, mux)
+    assert ex.request(AGENT, WINDOW, "timeout", mission=SLUG, task_id=TASK_ID)
+
+    # 旧 plan.sh が公開した assignment、あるいは手で置かれた assignment。
+    sandbox.assignment_identity_file.unlink()
+
+    _drive(ex)
+
+    assert _pid_alive(pane_pid), (
+        f"世代を証明できないまま Worker を kill した (logs={sandbox.logs})")
+    assert sandbox.task_status() == "in_progress", "証拠が無いのに card を書き換えた"
+    assert sandbox.assignment_file.exists(), "証拠が無いのに assignment を消した"
+    assert ex.has_marker(AGENT), (
+        "marker を捨てると次の cycle が同じ判断をやり直すだけで、"
+        "退役が永久に成立しないまま誰も気付かない")
+
+
+def test_red_missing_recorded_generation_does_not_authorise_a_kill(sandbox):
+    """記録側に世代が無いときも同じ。「比べる相手が無い」は「一致した」ではない。
+
+    RED (Codex 5 巡目 P1-1 の同型): request の瞬間に card を読めないと
+    `task_started_at` は記録されない。その状態で `assignment_execution_verdict()`
+    は `EXEC_SAME` ("no recorded generation to compare") を返していたので、
+    guard は素通りし、Worker は殺される。証拠が無いまま殺しておいて後始末だけ
+    人間に渡す、という順番そのものが逆である。
+    """
+    import lib_retirement
+
+    pane_pid = sandbox.spawn_worker_process()
+    sandbox.record_identity(WINDOW, pane_pid)
+    mux = FakeMux({WINDOW: pane_pid})
+    ex = make_executor(sandbox, mux)
+
+    hidden = sandbox.task_file.parent / "hidden-during-request"
+    sandbox.task_file.rename(hidden)
+    assert ex.request(AGENT, WINDOW, "timeout", mission=SLUG, task_id=TASK_ID)
+    hidden.rename(sandbox.task_file)
+
+    req = lib_retirement.read_json(lib_retirement.request_path(sandbox.registry, AGENT))
+    assert "task_started_at" not in req, "世代が読めていたらこのテストは前提が違う"
+
+    _drive(ex)
+
+    assert _pid_alive(pane_pid), (
+        f"世代を記録できていないのに Worker を kill した (logs={sandbox.logs})")
+    assert sandbox.task_status() == "in_progress"
+    assert sandbox.assignment_file.exists()
+    assert ex.has_marker(AGENT)
+
+
+def test_unprovable_retirement_is_escalated_once_and_can_be_released(sandbox):
+    """逆向きの担保: 黙って居座る Worker を作らないこと。
+
+    discard に倒す経路を増やすと、「退役要求が永久に取り消され続けて Worker が
+    居座る」という別の穴が開く。倒す先は discard (= marker を捨てて次の cycle で
+    同じ判断をやり直す) ではなく **hold + Director への 1 度きりの報告** である
+    こと、そしてその保留に**人間が開けられる出口**があることを固定する。
+    """
+    pane_pid = sandbox.spawn_worker_process()
+    sandbox.record_identity(WINDOW, pane_pid)
+    mux = FakeMux({WINDOW: pane_pid})
+
+    ex = make_executor(sandbox, mux)
+    assert ex.request(AGENT, WINDOW, "timeout", mission=SLUG, task_id=TASK_ID)
+    sandbox.assignment_identity_file.unlink()
+
+    _drive(ex, 4)
+    make_executor(sandbox, mux).process_all()   # 再起動しても 2 通目は出ない
+
+    assert len(sandbox.notes) == 1, f"報告が 1 回に収まっていない: {sandbox.notes}"
+    note = sandbox.notes[0]
+    assert AGENT in note
+    assert "registry/retirements" in note, f"marker の片付け方が書かれていない: {note}"
+    assert "--reset" not in note, (
+        f"何も kill していないのに task の差し戻しを促している: {note}")
+
+    # 出口: 人間が marker を消せば、証拠のそろった次の退役はふつうに成立する。
+    _clear_marker(sandbox)
+    assert not ex.has_marker(AGENT)
+    sandbox.publish_assignment(sandbox.task_started_at())
+
+    ex2 = make_executor(sandbox, mux)
+    assert ex2.request(AGENT, WINDOW, "timeout", mission=SLUG, task_id=TASK_ID)
+    for _ in range(10):
+        ex2.process_all()
+        if not ex2.has_marker(AGENT):
+            break
+    assert not _pid_alive(pane_pid), (
+        f"証拠がそろっても二度と終了できない Worker になっている (logs={sandbox.logs})")
+    assert sandbox.task_status() == "pending"
+
+
+def test_unprovable_hold_releases_itself_when_the_worker_lets_go_of_the_card(sandbox):
+    """逆向きの担保その 2: 人間を呼ばずに済む曖昧さは、自分で片付けること。
+
+    hold は「証明できない」から待っているだけなので、assignment が「この Worker
+    はもう別のことをしている」と言い切った時点で前提は反証される。世代を読める
+    必要はない。ここを自動で解かないと、自力で完了しただけの健全な Worker が
+    人間の手作業を待って止まり続ける。
+    """
+    pane_pid = sandbox.spawn_worker_process()
+    sandbox.record_identity(WINDOW, pane_pid)
+    mux = FakeMux({WINDOW: pane_pid})
+
+    ex = make_executor(sandbox, mux)
+    assert ex.request(AGENT, WINDOW, "timeout", mission=SLUG, task_id=TASK_ID)
+    sandbox.assignment_identity_file.unlink()
+    _drive(ex, 3)
+    assert ex.has_marker(AGENT), "hold になっていない — テストの前提が崩れている"
+    assert len(sandbox.notes) == 1
+
+    # Worker は止まっていなかった。自分で片を付ける (= assignment を手放す)。
+    done = _plan(sandbox, "done", TASK_ID, "止まっていなかった", "--mission", SLUG)
+    assert done.returncode == 0, done.stderr
+
+    _drive(ex, 3)
+
+    assert not ex.has_marker(AGENT), (
+        f"曖昧さが解けても Worker が隔離されたまま (logs={sandbox.logs})")
+    assert _pid_alive(pane_pid), "解放のついでに kill した"
+    assert _status_of(sandbox, TASK_ID) == "done", "Worker 自身が書いた結末を巻き戻した"
+    assert len(sandbox.notes) == 1, f"解放を 2 通目の報告にした: {sandbox.notes}"
+
+
+# -- 2. 退役予約は plan.sh pull の側で効かせる -------------------------------
+
+def test_red_pull_is_refused_while_a_retirement_is_in_flight(sandbox):
+    """退役中の Worker は、自分で pull しても新しい task を受け取れない。
+
+    RED (Codex 5 巡目 P1-2): t025 で入れた dispatcher 側の除外は「割り当て
+    メッセージを送らない」だけで、**Worker 自身が `plan.sh pull` を叩く経路**も
+    既に届いている指示も止められない。assignment を公開するのは plan.sh の
+    キューロックの中なので、退役予約もそこで効かせるのが唯一の直列化点である。
+    """
+    pane_pid = sandbox.spawn_worker_process()
+    sandbox.record_identity(WINDOW, pane_pid)
+    mux = FakeMux({WINDOW: pane_pid})
+    _add_pending_task(sandbox, "t002")
+
+    ex = make_executor(sandbox, mux, grace_period=3600)
+    assert ex.request(AGENT, WINDOW, "timeout", mission=SLUG, task_id=TASK_ID)
+    assert ex.process_all() == [(AGENT, "notified")]
+
+    done = _plan(sandbox, "done", TASK_ID, "grace 中に自力で完了", "--mission", SLUG)
+    assert done.returncode == 0, done.stderr
+
+    pull = _plan(sandbox, "pull", "--mission", SLUG, "--agent", AGENT, "--skills", "code")
+    assert pull.returncode == 2, (
+        f"退役中の Worker に task を渡した: rc={pull.returncode}\n{pull.stdout}{pull.stderr}")
+    assert _status_of(sandbox, "t002") == "pending", "1 バイトも書かないはずが card を書き換えた"
+    assert not sandbox.assignment_file.exists(), "退役中の Worker の assignment を公開した"
+    assert "retire" in pull.stderr.lower(), (
+        f"断った理由が読み取れない (原因調査ができない): {pull.stderr}")
+
+
+class HookedMux(FakeMux):
+    """`pid()` — guard が必ず通る mux 呼び出し — に割り込み点を作る。
+
+    本番の `current_spawn_identity()` は mux backend の subprocess を叩くので、
+    ここは数十〜数百ミリ秒ブロックしうる。その間に Worker が `plan.sh done` →
+    `plan.sh pull` を通せる、というのが P1-2 の指摘である。実時間では再現でき
+    ない幅なので、**その呼び出しそのもの**を割り込み点として固定する
+    (memory: microsecond-race-fix-needs-structural-test)。
+    """
+
+    def __init__(self, windows: dict, hook):
+        super().__init__(windows)
+        self.hook = hook
+        self.armed = False
+        self.fired = 0
+
+    def pid(self, name):
+        if self.armed:
+            self.armed = False
+            self.fired += 1
+            self.hook()
+        return super().pid(name)
+
+
+def test_red_worker_that_pulls_inside_the_guard_is_not_signalled_on_the_new_task(sandbox):
+    """guard の途中で Worker が次の task を取っても、その実行にシグナルは飛ばない。
+
+    RED (Codex 5 巡目 P1-2): `_guard()` は assignment を先に読み、そのあとに
+    ブロックしうる `current_spawn_identity()` を呼んでいた。その隙に Worker が
+    自分で done → pull を通すと、pane の pid は変わらないので R7 は通り、
+    **新しい task を実行中の Worker に SIGTERM が飛ぶ**。その実行の後始末は
+    古い request の管轄外なので、新しい task は誰の管轄でもないまま宙に浮く。
+    """
+    outcome = {}
+
+    def worker_takes_the_next_task():
+        outcome["done"] = _plan(sandbox, "done", TASK_ID, "guard の最中に完了",
+                                "--mission", SLUG)
+        outcome["pull"] = _plan(sandbox, "pull", "--task", "t002", "--mission", SLUG,
+                                "--agent", AGENT, "--skills", "code")
+
+    pane_pid = sandbox.spawn_worker_process()
+    sandbox.record_identity(WINDOW, pane_pid)
+    mux = HookedMux({WINDOW: pane_pid}, worker_takes_the_next_task)
+    _add_pending_task(sandbox, "t002")
+
+    signals: list = []
+    ex = make_executor(sandbox, mux,
+                       kill_process=lambda pid, sig: (signals.append((pid, sig)), True)[1])
+    assert ex.request(AGENT, WINDOW, "timeout", mission=SLUG, task_id=TASK_ID)
+    assert ex.process_all() == [(AGENT, "notified")]
+
+    mux.armed = True          # 次の guard の途中で Worker が動く
+    ex.process_all()
+    assert mux.fired == 1, "割り込み点を通っていない — テストの前提が崩れている"
+
+    assert outcome["done"].returncode == 0, outcome["done"].stderr
+    assert outcome["pull"].returncode != 0, (
+        f"退役中の Worker が新しい task を取れた: {outcome['pull'].stdout}")
+    assert _status_of(sandbox, "t002") == "pending", "新しい task が宙に浮いた"
+    assert signals == [], (
+        f"もう手を離した Worker にシグナルを撃った: {signals} (logs={sandbox.logs})")
+
+
+def test_pull_is_allowed_again_once_the_retirement_marker_is_cleared(sandbox):
+    """逆向きの担保: 予約は退役のあいだだけ。marker が無ければ pull は通る。
+
+    これが無いと「常に断る」に倒しただけで上の 2 本が緑になる。
+    """
+    pane_pid = sandbox.spawn_worker_process()
+    sandbox.record_identity(WINDOW, pane_pid)
+    mux = FakeMux({WINDOW: pane_pid})
+    _add_pending_task(sandbox, "t002")
+
+    ex = make_executor(sandbox, mux, grace_period=3600)
+    assert ex.request(AGENT, WINDOW, "timeout", mission=SLUG, task_id=TASK_ID)
+    assert _plan(sandbox, "done", TASK_ID, "完了", "--mission", SLUG).returncode == 0
+    assert _plan(sandbox, "pull", "--task", "t002", "--mission", SLUG,
+                 "--agent", AGENT, "--skills", "code").returncode == 2
+
+    _clear_marker(sandbox)
+    ok = _plan(sandbox, "pull", "--task", "t002", "--mission", SLUG,
+               "--agent", AGENT, "--skills", "code")
+    assert ok.returncode == 0, f"予約解除後も pull できない: {ok.stderr}"
+    assert _status_of(sandbox, "t002") == "in_progress"
+    assert sandbox.assignment_file.exists()

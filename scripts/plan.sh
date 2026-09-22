@@ -1037,6 +1037,49 @@ def classify_assignment(agent, mission, task_id, generation):
     return ASSIGN_MINE
 
 
+# ---------------------------------------------------------------------------
+# 退役予約 — 退役中の Worker には assignment を公開しない
+# ---------------------------------------------------------------------------
+#
+# watchdog の退役は「shutdown を伝える → 猶予 → SIGTERM → SIGKILL」で、決定と
+# 実行の間に猶予期間ぶんの隙間がある。その隙間で Worker が自分で `plan.sh pull`
+# を叩くと、**別の task を実行中の Worker にシグナルが飛ぶ**。pane の pid も
+# created_at も変わらないので watchdog 側の identity チェックは通ってしまい、
+# しかもその実行の後始末は古い退役要求の管轄外なので、新しい task は誰の管轄
+# でもないまま in_progress で残る (Codex 5 巡目 P1-2)。
+#
+# dispatcher 側の除外 (t025) は「割り当てメッセージを送らない」だけで、Worker
+# 自身の pull も、既に届いている指示も止められない。assignment を公開するのは
+# ここ (キューロックの中) だけなので、予約を効かせる場所もここしかない。
+#
+# marker の中身は読まない。存在するかどうかだけを stat で見る — この判定は全
+# Worker が叩く pull のロックの中に入るので、パースや列挙でロック保持時間を
+# 伸ばしてはいけない。
+RETIREMENT_SUFFIXES = ('.json', '.progress.json')
+
+
+def retirement_reservation(agent):
+    """`agent` に退役予約が立っているなら、その marker のパス。無ければ None。
+
+    request (`<agent>.json`) と進行中 marker (`<agent>.progress.json`) の両方を
+    見る。request だけを見ると、request が先に消える後始末の途中や、人間が
+    request だけ消した状態で予約が外れてしまう。
+
+    registry の場所は CREWVIA_REPO_ROOT を優先する。Worker が worktree 側の
+    plan.sh を叩いた場合、REPO_ROOT (= スクリプトの位置) は worktree を指し、
+    本体の registry を見逃す (memory: crewvia-worktree-repo-root-pitfall)。
+    """
+    if not agent or agent_name_problem(agent):
+        return None
+    root = os.environ.get('CREWVIA_REPO_ROOT') or REPO_ROOT
+    base = os.path.join(root, 'registry', 'retirements')
+    for suffix in RETIREMENT_SUFFIXES:
+        path = os.path.join(base, agent + suffix)
+        if os.path.exists(path):
+            return path
+    return None
+
+
 def retire_assignment(agent, mission, task_id, generation):
     """assignment を撤去する唯一の入口。キューロック保持が前提。
 
@@ -1553,6 +1596,18 @@ def cmd_pull(args):
     diag = {'reason': None, 'detail': ''}
 
     def _do():
+        # ロックの中で最初に見る。退役予約が立っている Worker には、この pull が
+        # 1 バイトも書かずに引き返す — card を in_progress にしてから気付くと、
+        # まさにこの PR が潰した「割れたトランザクション」を自分で作ることになる。
+        reserved = retirement_reservation(agent)
+        if reserved:
+            diag['reason'] = 'retirement_reserved'
+            diag['detail'] = (
+                f'Worker {agent!r} は退役処理の対象です ({reserved})。'
+                f'退役が終わるか、marker を手で削除するまで新しい task は割り当てません'
+            )
+            return
+
         state = load_state()
         if opts.get('--mission'):
             slugs = [opts['--mission']]

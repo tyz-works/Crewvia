@@ -1409,7 +1409,7 @@ def dispatch():
             f'理由: {reason_line}'
             + ('…' if len(reason) > len(reason_line) else '')
             + f' (全文: {task_file})。'
-            f'reason を読んで方針を決め、plan.sh update {task_id} --status in_progress --reset '
+            f'reason を読んで方針を決め、plan.sh update {task_id} --status pending --reset '
             f'--mission {slug} で差し戻してください。'
         )
         if tmux_send(_director_name(), msg):

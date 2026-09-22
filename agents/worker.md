@@ -606,7 +606,7 @@ plan needs-director "$TASK_ID" "詰まった理由を具体的に記述" --missi
 
 - タスクは `needs_director` 状態になり、`done` 遷移はブロックされる
 - 後続タスクの `blocked_by` は解除されない（依存関係を保つ）
-- Director が `plan.sh update <task_id> --status in_progress --reset` で差し戻し、追加指示を出す
+- Director が `plan.sh update <task_id> --status pending --reset` で差し戻し、追加指示を出す（`--status in_progress --reset` は罠 — `--reset` 適用後に `--status` が上書きするため in_progress/worker=null のまま止まる）
 - `plan.sh needs-director` は「代替検証して done を無理やり呼ぶ」より **常に安い選択肢**であること
 - ⚠️ **reason は必ず 1 行に収めること**（frontmatter の `needs_director_reason` に直接書かれるため、改行を含めると task ファイルの frontmatter が壊れる）。長い説明が必要な場合でも、詰まった経緯の詳細は次の `plan.sh done` (または Director への直接連絡) で補うこと。`plan.sh done` の result にはこの 1 行制約は無い（上記「Result の記録方法」参照）
 

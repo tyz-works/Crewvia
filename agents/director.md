@@ -277,7 +277,8 @@ required_evidence:
 
 - Worker が `plan.sh needs-director <task_id> "<理由>"` を呼ぶと、タスクは `needs_director` 状態になる
 - `plan.sh status` で 🆘 アイコンとともに表示される
-- Director は reason を読んで対処方針を決定し、`plan.sh update <task_id> --status in_progress --reset` で差し戻す
+- Director は reason を読んで対処方針を決定し、`plan.sh update <task_id> --status pending --reset` で差し戻す
+  （`--status in_progress --reset` は罠 — `--reset` の適用後に `--status` が上書きするため、最終状態が `status=in_progress / worker=null` になり dispatch 不能・pull 拒否のまま静かに全停止する。`--status pending` にすること）
 - 後続タスクの `blocked_by` は **解除されない**（needs_director は TERMINAL_STATUSES に含まれない）
 
 ### ⚠️ Worker への指示で「task ファイルの直接編集」を促さないこと (t015)

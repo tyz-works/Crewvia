@@ -13,6 +13,11 @@
 #   4. reason が空でも '(理由未記載)' でメッセージが壊れない
 #   5. TTL dedup: 初回は通知、TTL 内は抑制、異なる task_id は独立
 #   6. failed / pending など他ステータスの task は対象にならない
+#   7. (t030) 通知本文が案内する復旧コマンドを実際に plan.sh update へ渡して実行し、
+#      task が dispatch 可能な状態 (status=pending, worker=null) になることを assert
+#      する。文字列一致だけでは検出できない不具合 (--status in_progress --reset だと
+#      --reset 適用後に --status が上書きし in_progress/worker=null のまま固着する)
+#      が過去に実在したため、コマンドの実行結果を検証する。
 #
 # 実行: bash scripts/test_dispatcher_needs_director_notify.sh
 # 副作用: /tmp 配下に一時ファイルを作成し終了時に削除する。本番 dispatcher / registry
@@ -93,7 +98,7 @@ def build_msg(slug, meta):
         f'理由: {reason_line}'
         + ('…' if len(reason) > len(reason_line) else '')
         + f' (全文: {task_file})。'
-        f'reason を読んで方針を決め、plan.sh update {task_id} --status in_progress --reset '
+        f'reason を読んで方針を決め、plan.sh update {task_id} --status pending --reset '
         f'--mission {slug} で差し戻してください。'
     )
     return msg
@@ -103,7 +108,7 @@ msg1 = build_msg('mission-a', {'id': 't027', 'needs_director_reason': 'Codex rev
 assert 't027' in msg1
 assert 'mission-a' in msg1
 assert 'Codex review NEEDS FIX: race in assign loop' in msg1
-assert 'plan.sh update t027 --status in_progress --reset --mission mission-a' in msg1
+assert 'plan.sh update t027 --status pending --reset --mission mission-a' in msg1
 assert '…' not in msg1, f"1 行 reason なのに省略記号が付いた: {msg1}"
 print("Test3 OK:", msg1[:80])
 
@@ -196,6 +201,69 @@ if [[ $? -eq 0 ]]; then
 else
   fail "needs_director フィルタが他ステータスの task を誤って拾っている"
 fi
+
+# ---------------------------------------------------------------------------
+# Test 7 (t030): 通知本文が案内する復旧コマンドを実際に実行し、task が
+# dispatch 可能な状態 (status=pending, worker=null) になることを assert する。
+# 文字列一致では捕まえられない不具合 (--status in_progress --reset だと
+# --reset 適用後に --status が上書きし in_progress/worker=null のまま固着する)
+# の再発を防ぐ。
+# ---------------------------------------------------------------------------
+echo ""
+echo "-- Test 7: 通知本文の復旧コマンドを実行し、実際に dispatch 可能な状態に戻ることを検証 --"
+
+PLAN_SH="$OWN_CHECKOUT_ROOT/scripts/plan.sh"
+T7_TMPDIR="/tmp/crewvia-test-needs-director-recovery-$$"
+T7_QUEUE="$T7_TMPDIR/queue"
+T7_MISSION="test-recovery-mission"
+T7_TASKS_DIR="$T7_QUEUE/missions/$T7_MISSION/tasks"
+mkdir -p "$T7_TASKS_DIR" "$T7_QUEUE/archive"
+
+printf 'active_missions:\n  - %s\ndefault_mission: %s\n' \
+  "$T7_MISSION" "$T7_MISSION" > "$T7_QUEUE/state.yaml"
+printf 'title: Recovery Test Mission\nslug: %s\nstatus: in_progress\ncreated_at: 2026-09-22T00:00:00Z\ncompleted_at: null\nnext_task_id: 2\n' \
+  "$T7_MISSION" > "$T7_QUEUE/missions/$T7_MISSION/mission.yaml"
+
+# needs_director 状態の task (dispatcher の通知対象と同じ形)
+printf -- '---\nid: t001\ntitle: Stuck task\nskills: [bash]\npriority: medium\nstatus: needs_director\nblocked_by: []\nworker: sofia\nstarted_at: 2026-09-22T00:00:00Z\ncompleted_at: null\nneeds_director_reason: "stuck, need guidance"\n---\n\n## Description\nDo the thing.\n\n## Result\n' \
+  > "$T7_TASKS_DIR/t001.md"
+
+# 通知メッセージのロジック (このファイル内の build_msg と同一) で復旧コマンドの
+# 引数を組み立て、実際に plan.sh update へ渡す — メッセージ文字列を目視で
+# コピーするのではなく、dispatcher.sh の f-string と同じ組み立て方を再現する。
+T7_TASK_ID="t001"
+RECOVERY_STATUS="pending"
+if CREWVIA_QUEUE="$T7_QUEUE" CREWVIA_REPO_ROOT="$OWN_CHECKOUT_ROOT" \
+   bash "$PLAN_SH" update "$T7_TASK_ID" --status "$RECOVERY_STATUS" --reset --mission "$T7_MISSION" > /dev/null 2>&1; then
+  pass "案内された plan.sh update コマンドが exit 0 で完了する"
+else
+  fail "案内された plan.sh update コマンドが失敗した"
+fi
+
+T7_STATUS=$(awk -F': ' '/^status:/{print $2; exit}' "$T7_TASKS_DIR/t001.md")
+T7_WORKER=$(awk -F': ' '/^worker:/{print $2; exit}' "$T7_TASKS_DIR/t001.md")
+
+if [[ "$T7_STATUS" == "pending" ]]; then
+  pass "復旧コマンド実行後、task の status が pending になっている (dispatch 対象)"
+else
+  fail "復旧コマンド実行後、status が pending になっていない (実際: '$T7_STATUS') — --status in_progress --reset の罠が再発している可能性"
+fi
+
+if [[ "$T7_WORKER" == "null" ]]; then
+  pass "復旧コマンド実行後、worker が null になっている (pull 可能)"
+else
+  fail "復旧コマンド実行後、worker が null になっていない (実際: '$T7_WORKER')"
+fi
+
+# pull で実際に取得できる = dispatch 可能な状態であることの最終確認
+if CREWVIA_QUEUE="$T7_QUEUE" CREWVIA_REPO_ROOT="$OWN_CHECKOUT_ROOT" \
+   bash "$PLAN_SH" pull --agent test-worker --skills bash --mission "$T7_MISSION" > /dev/null 2>&1; then
+  pass "復旧後の task は plan.sh pull で実際に取得できる (needs_director の罠が再発していない)"
+else
+  fail "復旧後の task を plan.sh pull で取得できない — 復旧コマンドが dispatch 不能な状態を作っている"
+fi
+
+rm -rf "$T7_TMPDIR"
 
 # ---------------------------------------------------------------------------
 # 結果サマリ

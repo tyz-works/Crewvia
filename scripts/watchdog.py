@@ -42,9 +42,32 @@ from typing import Literal, NamedTuple, Optional
 _SCRIPTS_DIR = Path(__file__).parent
 sys.path.insert(0, str(_SCRIPTS_DIR))
 from lib_mux import Mux, repo_identity_ok  # noqa: E402
+import lib_retirement  # noqa: E402
 _mux = Mux()
 
-__version__ = "2.0.0"
+__version__ = "2.1.0"
+
+# t002: which daemon is allowed to end a Worker process.
+#
+#   watchdog   (default) — dispatcher writes a retirement marker, watchdog
+#                          executes it and completes the queue-side cleanup.
+#   dispatcher (rollback) — the pre-t002 split: dispatcher kills idle Workers
+#                          itself, watchdog blocks inside graceful_terminate().
+#
+# One variable flips BOTH daemons because a partial rollback reproduces
+# exactly the failure the atomic migration exists to avoid: revert only
+# dispatcher and nobody closes a window (§5-1 居座り); revert only watchdog and
+# both of them kill independently, which on a name-reusing system lands on the
+# wrong Worker (§5-2). See knowledge/daemon-authority.md §5-3.
+KILL_AUTHORITY_WATCHDOG = "watchdog"
+KILL_AUTHORITY_DISPATCHER = "dispatcher"
+
+
+def kill_authority() -> str:
+    """Read per call, not at import: a daemon restart is the intended way to
+    apply this, and reading live keeps tests from needing to reload the module."""
+    value = (os.environ.get("CREWVIA_KILL_AUTHORITY") or "").strip().lower()
+    return KILL_AUTHORITY_DISPATCHER if value == KILL_AUTHORITY_DISPATCHER else KILL_AUTHORITY_WATCHDOG
 
 # ---------------------------------------------------------------------------
 # Worker profiles — defaults when task frontmatter has no timeout field
@@ -59,6 +82,11 @@ DEFAULT_PROFILE = "feature_impl"
 
 TERMINATE_GRACE_PERIOD = 60   # seconds to wait after sending graceful shutdown message
 KILL_DELAY = 10               # seconds after SIGTERM before SIGKILL
+
+#: What a Worker is told before a timeout terminate.  Carried in the retirement
+#: marker so the executor sends it exactly once, rather than each daemon
+#: sending its own copy (dispatcher's "タスクなし、shutdown" is the other one).
+TERMINATE_MESSAGE = "タイムアウトのため中断します。現在の状況を 1-2 行で記載して終了してください。"
 DEFAULT_CHECK_INTERVAL = 30   # main loop interval in seconds
 MASS_KILL_ALERT_BACKOFF_SECONDS = 300  # t020: min gap between mass-kill Taskvia alerts
 
@@ -614,8 +642,7 @@ def graceful_terminate(monitor: WorkerMonitor) -> None:
         _log(f"[kill] {monitor.agent_name}/{monitor.task_id}: window already gone")
         return
 
-    msg = "タイムアウトのため中断します。現在の状況を 1-2 行で記載して終了してください。"
-    ok = _mux.send(name, msg)
+    ok = _mux.send(name, TERMINATE_MESSAGE)
     if ok:
         _log(f"[terminate] {monitor.agent_name}/{monitor.task_id}: sent shutdown message, "
              f"waiting {TERMINATE_GRACE_PERIOD}s for graceful exit")
@@ -663,6 +690,66 @@ def graceful_terminate(monitor: WorkerMonitor) -> None:
             pass
     else:
         _log(f"[terminate] WARNING: could not get pane pid for {name!r}")
+
+
+# ---------------------------------------------------------------------------
+# Retirement execution (t002)
+# ---------------------------------------------------------------------------
+
+def _director_name() -> str:
+    """Live Director window, falling back to the conventional name.
+
+    Same resolution dispatcher uses.  Worth keeping identical: the fallback is
+    what makes the after-the-fact report land during the window right after a
+    Director restart, when the tab list has not settled yet.
+    """
+    names = _mux.list(suffix="-director")
+    return names[0] if names else "Sora-director"
+
+
+def _notify_director(message: str) -> bool:
+    return bool(_mux.send(_director_name(), message))
+
+
+def should_monitor(task_card: dict, retirement, authority: str) -> bool:
+    """False for a Worker whose retirement is already in flight.
+
+    Its task stays in_progress until the retirement finishes the queue-side
+    cleanup, so without this the monitor is rebuilt every cycle with
+    `started_at = now`, immediately re-decides "terminate", and re-announces
+    it — one termination produced a dozen identical Taskvia alerts (measured
+    in the e2e harness) and a log that read as if watchdog kept changing its
+    mind.  The marker is already the durable record of that decision.
+    """
+    if authority != KILL_AUTHORITY_WATCHDOG:
+        return True
+    worker = task_card.get("worker")
+    if not worker:
+        return True
+    return not retirement.has_marker(str(worker))
+
+
+def make_retirement_executor(repo_root: Path, *, queue_dir: Optional[Path] = None,
+                             mux=None, notify=None, log=None):
+    """Build the phase machine that ends Workers and repairs the queue.
+
+    Split out from run() so the machine can be driven a cycle at a time in
+    tests without a daemon, a mux backend or a live Worker.
+    """
+    repo_root = Path(repo_root)
+    backend = mux if mux is not None else _mux
+    return lib_retirement.RetirementExecutor(
+        registry_dir=repo_root / "registry",
+        repo_root=repo_root,
+        mux=backend,
+        repo_identity_check=lambda: repo_identity_ok(repo_root),
+        log=log or _log,
+        notify=notify if notify is not None else _notify_director,
+        plan_sh=repo_root / "scripts" / "plan.sh",
+        queue_dir=queue_dir or Path(os.environ.get("CREWVIA_QUEUE", str(repo_root / "queue"))),
+        grace_period=TERMINATE_GRACE_PERIOD,
+        kill_delay=KILL_DELAY,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -785,7 +872,7 @@ class VerdictLogger:
 
     def __init__(self, summary_every: int = VERDICT_SUMMARY_EVERY) -> None:
         self.summary_every = summary_every
-        self._state: dict[tuple[str, str], tuple[str, int]] = {}
+        self._state: dict[tuple[str, str], tuple[tuple[str, str], int]] = {}
 
     @staticmethod
     def _line(monitor: "WorkerMonitor", detail: CheckResult, repeats: int) -> str:
@@ -803,13 +890,20 @@ class VerdictLogger:
 
     def record(self, monitor: "WorkerMonitor", detail: CheckResult) -> None:
         key = (monitor.agent_name, monitor.task_id)
+        # t018 backlog (b): the *reason* is part of what changed, not just the
+        # verdict.  Keying on the verdict alone hides transitions within one
+        # verdict — warn/soft_idle → warn/hard_idle_but_executing says the
+        # Worker crossed the hard threshold and is only alive because a
+        # subprocess is running, and that used to wait up to
+        # VERDICT_SUMMARY_EVERY cycles (5 minutes) to appear.
+        signature = (detail.verdict, detail.reason)
         previous = self._state.get(key)
-        if previous is None or previous[0] != detail.verdict:
-            self._state[key] = (detail.verdict, 0)
+        if previous is None or previous[0] != signature:
+            self._state[key] = (signature, 0)
             _log(self._line(monitor, detail, repeats=0))
             return
         repeats = previous[1] + 1
-        self._state[key] = (detail.verdict, repeats)
+        self._state[key] = (signature, repeats)
         if self.summary_every > 0 and repeats % self.summary_every == 0:
             _log(self._line(monitor, detail, repeats=repeats))
 
@@ -936,11 +1030,29 @@ def run(repo_root: Path, interval: int) -> None:
     # parse because of a trailing inline comment) used to be invisible until
     # every live Worker started getting falsely reported as "window gone" —
     # this one line turns that into an immediate, obvious startup fact.
+    # t002: the phase machine that actually ends Workers.  Independent of
+    # `monitors` on purpose — the Workers dispatcher hands over hold neither an
+    # assignment nor an in_progress task, so they have no monitor to attach to
+    # (knowledge/daemon-authority.md §3-2).
+    authority = kill_authority()
+    retirement = make_retirement_executor(repo_root, queue_dir=queue_dir)
+
     _backend_name = type(_mux._backend).__name__
     _log(
         f"Starting Watchdog v2 (PID {os.getpid()}, interval={interval}s, "
-        f"repo={repo_root}, mux_backend={_backend_name})"
+        f"repo={repo_root}, mux_backend={_backend_name}, kill_authority={authority})"
     )
+    if authority == KILL_AUTHORITY_DISPATCHER:
+        _log(
+            "kill_authority=dispatcher (rollback mode): retirement markers are NOT "
+            "consumed and terminate blocks in graceful_terminate() as before t002. "
+            "dispatcher.sh must be running with the same setting, or idle Workers "
+            "are never closed."
+        )
+    else:
+        for _agent in retirement.recover():
+            taskvia_alert(taskvia_url, taskvia_token, _agent,
+                          f"watchdog restart: resuming interrupted retirement of {_agent}")
     if not _mux.available():
         _log(
             f"WARNING: mux backend ({_backend_name}) reports unavailable at startup. "
@@ -967,18 +1079,27 @@ def run(repo_root: Path, interval: int) -> None:
             # Remove monitors for tasks that are no longer in_progress
             for key in list(monitors.keys()):
                 if key not in active_keys:
+                    # t018 backlog (a): drop the verdict state too.  Left
+                    # behind it grows for the life of the daemon, and if the
+                    # same agent/task comes back (a --reset then re-pull) its
+                    # first verdict is silently swallowed as "unchanged" for
+                    # up to VERDICT_SUMMARY_EVERY cycles.
+                    verdict_logger.forget(monitors[key])
                     del monitors[key]
 
             # Add monitors for new in_progress tasks
             for slug, task_id, meta in active_tasks:
                 key = (slug, task_id)
-                if key not in monitors:
-                    monitors[key] = WorkerMonitor(
-                        task_id=task_id,
-                        task_card=meta,
-                        profiles=PROFILES,
-                        repo_root=repo_root,
-                    )
+                if key in monitors:
+                    continue
+                if not should_monitor(meta, retirement, authority):
+                    continue
+                monitors[key] = WorkerMonitor(
+                    task_id=task_id,
+                    task_card=meta,
+                    profiles=PROFILES,
+                    repo_root=repo_root,
+                )
 
             # Evaluate every monitor's status up front (side-effect free) before
             # acting on any of them. This lets us tell "every single monitored
@@ -1069,6 +1190,20 @@ def run(repo_root: Path, interval: int) -> None:
                     taskvia_alert(taskvia_url, taskvia_token, agent, msg)
 
                 elif status == "terminate":
+                    # Checked before anything is logged or sent.  The monitor is
+                    # rebuilt from the task card every cycle and the task stays
+                    # in_progress until the retirement finishes its cleanup, so
+                    # this branch is re-entered on every cycle of a termination
+                    # that is already under way.  Announcing it each time turned
+                    # one termination into a dozen identical Taskvia alerts
+                    # (measured: 12 in a single e2e run) and made the log read as
+                    # if watchdog kept re-deciding.
+                    if (authority == KILL_AUTHORITY_WATCHDOG
+                            and retirement.has_marker(agent)):
+                        verdict_logger.forget(monitor)
+                        del monitors[(slug, task_id)]
+                        continue
+
                     elapsed = time.time() - monitor.started_at
                     _log(
                         f"TERMINATE: {agent}/{task_id} (mission={slug}) "
@@ -1078,8 +1213,31 @@ def run(repo_root: Path, interval: int) -> None:
                         taskvia_url, taskvia_token, agent,
                         f"TERMINATE: {agent}/{task_id} タイムアウト (elapsed={elapsed:.0f}s)",
                     )
-                    graceful_terminate(monitor)
-                    del monitors[(slug, task_id)]
+                    if authority == KILL_AUTHORITY_DISPATCHER:
+                        graceful_terminate(monitor)
+                        verdict_logger.forget(monitor)
+                        del monitors[(slug, task_id)]
+                    else:
+                        window = monitor._mux_window_name() or f"{agent}-worker"
+                        requested = retirement.request(
+                            agent, window, "timeout",
+                            mission=slug, task_id=task_id,
+                            message=TERMINATE_MESSAGE,
+                        )
+                        if requested:
+                            # Keeping the monitor would re-fire terminate every
+                            # cycle; the marker is now the record of intent, and
+                            # it survives a restart in a way the monitor never did.
+                            verdict_logger.forget(monitor)
+                            del monitors[(slug, task_id)]
+                        else:
+                            # Fail closed (no spawn identity to prove who this
+                            # is).  Keep the monitor so the decision is retaken
+                            # next cycle instead of silently dropping it.
+                            _log(
+                                f"TERMINATE deferred: {agent}/{task_id} — could not "
+                                f"record a retirement request this cycle"
+                            )
 
                 elif status == "kill":
                     backend_name = type(_mux._backend).__name__
@@ -1091,7 +1249,18 @@ def run(repo_root: Path, interval: int) -> None:
                         taskvia_url, taskvia_token, agent,
                         f"KILL: {agent}/{task_id} mux window が消失 (backend={backend_name})",
                     )
+                    verdict_logger.forget(monitor)
                     del monitors[(slug, task_id)]
+
+            # t002: advance every in-flight retirement by at most one step.
+            # Deliberately outside the monitor loop and reached on every cycle,
+            # including cycles with no monitors at all — the idle Workers
+            # dispatcher hands over have no in_progress task to monitor.
+            # Skipped in a mass-kill cycle for the same reason the monitor
+            # cleanup is: a backend that cannot answer must not be read as
+            # "every window is gone", which here would reset live tasks.
+            if authority == KILL_AUTHORITY_WATCHDOG:
+                retirement.process_all()
 
         except Exception as e:
             _log(f"ERROR in dispatch cycle: {e}")

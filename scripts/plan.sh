@@ -24,9 +24,11 @@ set -euo pipefail
 #                            [--description <text>] [--reset]
 #   plan.sh retire <task_id> --agent <name> --started-at <generation>
 #                            [--mission <slug>] [--outcome reset|needs-director]
-#                            [--reason "<1 行>"]
+#                            [--reason "<1 行>"] [--no-wait]
 #                              実行アイデンティティで束縛した後始末。前提が外れたら
 #                              1 バイトも書かずに exit 3 (詳細は cmd_retire)
+#                              --no-wait: キューロックを待たずに諦め exit 4。
+#                              待てない常駐デーモン (watchdog) 用
 #   plan.sh status [--mission <slug>] [--all]
 #   plan.sh archive <slug>
 
@@ -839,7 +841,23 @@ def list_tasks(slug, base_dir=None):
 # Locking
 # ---------------------------------------------------------------------------
 
-def with_lock(callback):
+#: 「ロックを取れなかったので 1 バイトも書かなかった」を表す終了コード。
+#: 1 (plan.sh 側の異常) とも 3 (前提不成立 = もう何も owed でない) とも区別する。
+#: 呼び出し側 — 常駐デーモンの中で待てない経路 — は「次のサイクルで再試行」に
+#: 倒せる。3 と混ぜると「もう用は無い」と読まれて後始末の義務が捨てられる。
+LOCK_BUSY = 4
+
+
+def with_lock(callback, nonblocking=False):
+    """キューロックの下で callback を実行する。
+
+    nonblocking=True は「待てない呼び出し側」専用の取得方法である。
+    watchdog の retirement は監視ループの中から plan.sh を同期で呼ぶので、
+    ブロッキング取得だと**混んでいるキュー 1 つが全 Worker の監視を止める**
+    (marker 1 件につき subprocess timeout まで)。デーモンにとっては
+    「取れなければ次のサイクルで」の方が正しく、待つ価値のある仕事が無い。
+    取れなかった場合は exit LOCK_BUSY で返り、1 バイトも書かない。
+    """
     try:
         os.makedirs(QUEUE_DIR, exist_ok=True)
     except OSError as e:
@@ -852,7 +870,17 @@ def with_lock(callback):
             f"  hint: check write permission on {QUEUE_DIR}, or remove a stale lock file."
         )
     try:
-        fcntl.flock(lf, fcntl.LOCK_EX)
+        if nonblocking:
+            try:
+                fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                die(
+                    f"[plan.sh] queue lock {LOCK_FILE} is held by another process "
+                    f"— --no-wait なので待たずに諦めました (何も変更していません)",
+                    LOCK_BUSY,
+                )
+        else:
+            fcntl.flock(lf, fcntl.LOCK_EX)
         try:
             return callback()
         finally:
@@ -1007,6 +1035,49 @@ def classify_assignment(agent, mission, task_id, generation):
     if recorded is None or str(recorded) != str(generation):
         return ASSIGN_SUCCESSOR
     return ASSIGN_MINE
+
+
+# ---------------------------------------------------------------------------
+# 退役予約 — 退役中の Worker には assignment を公開しない
+# ---------------------------------------------------------------------------
+#
+# watchdog の退役は「shutdown を伝える → 猶予 → SIGTERM → SIGKILL」で、決定と
+# 実行の間に猶予期間ぶんの隙間がある。その隙間で Worker が自分で `plan.sh pull`
+# を叩くと、**別の task を実行中の Worker にシグナルが飛ぶ**。pane の pid も
+# created_at も変わらないので watchdog 側の identity チェックは通ってしまい、
+# しかもその実行の後始末は古い退役要求の管轄外なので、新しい task は誰の管轄
+# でもないまま in_progress で残る (Codex 5 巡目 P1-2)。
+#
+# dispatcher 側の除外 (t025) は「割り当てメッセージを送らない」だけで、Worker
+# 自身の pull も、既に届いている指示も止められない。assignment を公開するのは
+# ここ (キューロックの中) だけなので、予約を効かせる場所もここしかない。
+#
+# marker の中身は読まない。存在するかどうかだけを stat で見る — この判定は全
+# Worker が叩く pull のロックの中に入るので、パースや列挙でロック保持時間を
+# 伸ばしてはいけない。
+RETIREMENT_SUFFIXES = ('.json', '.progress.json')
+
+
+def retirement_reservation(agent):
+    """`agent` に退役予約が立っているなら、その marker のパス。無ければ None。
+
+    request (`<agent>.json`) と進行中 marker (`<agent>.progress.json`) の両方を
+    見る。request だけを見ると、request が先に消える後始末の途中や、人間が
+    request だけ消した状態で予約が外れてしまう。
+
+    registry の場所は CREWVIA_REPO_ROOT を優先する。Worker が worktree 側の
+    plan.sh を叩いた場合、REPO_ROOT (= スクリプトの位置) は worktree を指し、
+    本体の registry を見逃す (memory: crewvia-worktree-repo-root-pitfall)。
+    """
+    if not agent or agent_name_problem(agent):
+        return None
+    root = os.environ.get('CREWVIA_REPO_ROOT') or REPO_ROOT
+    base = os.path.join(root, 'registry', 'retirements')
+    for suffix in RETIREMENT_SUFFIXES:
+        path = os.path.join(base, agent + suffix)
+        if os.path.exists(path):
+            return path
+    return None
 
 
 def retire_assignment(agent, mission, task_id, generation):
@@ -1525,6 +1596,18 @@ def cmd_pull(args):
     diag = {'reason': None, 'detail': ''}
 
     def _do():
+        # ロックの中で最初に見る。退役予約が立っている Worker には、この pull が
+        # 1 バイトも書かずに引き返す — card を in_progress にしてから気付くと、
+        # まさにこの PR が潰した「割れたトランザクション」を自分で作ることになる。
+        reserved = retirement_reservation(agent)
+        if reserved:
+            diag['reason'] = 'retirement_reserved'
+            diag['detail'] = (
+                f'Worker {agent!r} は退役処理の対象です ({reserved})。'
+                f'退役が終わるか、marker を手で削除するまで新しい task は割り当てません'
+            )
+            return
+
         state = load_state()
         if opts.get('--mission'):
             slugs = [opts['--mission']]
@@ -3041,6 +3124,7 @@ def cmd_dashboard_data(args):
 # cmd_update — safe in-place task frontmatter editor
 # ---------------------------------------------------------------------------
 
+
 def cmd_update(args):
     """Update specific frontmatter fields of an existing task.
 
@@ -3056,6 +3140,17 @@ def cmd_update(args):
 
     --reset sets: status=pending, worker=null, started_at=null, completed_at=null
     Body (Description / Result sections) is never modified by this command.
+
+    前提の指定 (--expect-status / --expect-worker / --expect-started-at) は
+    ここには無い。デーモンが自動で走らせる後始末は `plan.sh retire` 1 本に
+    集約してあり、判定はその内側 — card の書き換えと同じロックの中 — で行う
+    (t024)。`update` に同じ前提指定を並べて置くと、「どれを渡すか / 渡さないか」
+    の判断が呼び出し側ごとに分かれ、1 つ緩めた場所から同じ型の事故が再発する。
+    3 巡のレビューで出た P1 9 件はすべてその形だった。
+
+    `update --reset` は**人間の手作業**用として残してある (Director が幽霊
+    task を片付ける経路)。ガードが無いのは弱さではなく、人間が card を見て
+    判断したうえで打つコマンドだからである。デーモンからは呼ばないこと。
     """
     opts, positional = parse_opts(args, {
         '--mission': 'value',
@@ -3196,14 +3291,22 @@ def cmd_update(args):
 # cmd_retire — 実行アイデンティティで束縛した単一のガード付きトランザクション
 # ---------------------------------------------------------------------------
 
-#: retire が終了扱いにできない (= 既に終わっている) card の状態。
-RETIRE_FINISHED_STATUSES = TERMINAL_STATUSES | {'failed', CORRUPT_TASK_STATUS}
+#: retire が終了扱いにできる唯一の状態。
+#:
+#: 「終わっている状態」を列挙して弾くのではなく、**まだ自分で結末を書いていない
+#: 実行**だけを通す形にしてある。列挙は必ず漏れる: needs_director /
+#: ready_for_verification / verification_failed はどれも Worker 自身が書いた
+#: 結末で、worker も started_at もそのまま残るため、列挙から漏れた瞬間に
+#: 「世代まで一致する reset」が成立して結末が消える。
+#: これは呼び出し側 (lib_retirement) が持っていた `--expect-status in_progress`
+#: を API の内側に取り込んだものでもある (t024)。
+RETIRE_RETIRABLE_STATUS = 'in_progress'
 
 
 def cmd_retire(args):
     """plan.sh retire <task_id> --agent <name> --started-at <generation>
                                 [--mission <slug>] [--outcome reset|needs-director]
-                                [--reason "<1 行>"]
+                                [--reason "<1 行>"] [--no-wait]
 
     「この実行 (mission, task, worker, 世代) を終了扱いにして後始末する」を
     1 つの操作として提供する。card の status 書き換えと assignment の撤去は
@@ -3229,6 +3332,16 @@ def cmd_retire(args):
     前提が 1 つでも外れた場合、また assignment の世代を証明できない場合は、
     1 バイトも書かずに exit 3 (PRECONDITION_UNMET) で返る。前提を弱めて
     実行する経路は用意しない — 呼び出し側は保留に倒し、Director に上げること。
+
+    終了させられるのは in_progress の実行だけ
+    -----------------------------------------
+    status が in_progress 以外の card は、その実行が**自分で結末を書いた**
+    ものである (done / failed はもちろん、needs_director /
+    ready_for_verification / verification_failed も同じ)。いずれも worker と
+    started_at はそのまま残るので、世代まで一致する reset が成立してしまう。
+    ここで通してしまうと、Director に上げたはずの card が pending に戻る。
+    以前は呼び出し側が `update --expect-status in_progress` として持っていた
+    ガードで、t024 でこの API の内側に取り込んだ。
     """
     opts, positional = parse_opts(args, {
         '--mission': 'value',
@@ -3236,6 +3349,7 @@ def cmd_retire(args):
         '--started-at': 'value',
         '--outcome': 'value',
         '--reason': 'value',
+        '--no-wait': 'bool',
     })
 
     if not positional:
@@ -3294,9 +3408,11 @@ def cmd_retire(args):
         suffix = " — 何も変更していません"
 
         cur_status = meta.get('status')
-        if cur_status in RETIRE_FINISHED_STATUSES:
-            die(f"{prefix}status が既に '{cur_status}' です"
-                f" (終了させるべき実行が残っていません){suffix}", PRECONDITION_UNMET)
+        if cur_status != RETIRE_RETIRABLE_STATUS:
+            die(f"{prefix}status が '{cur_status}' です"
+                f" (終了させられるのは '{RETIRE_RETIRABLE_STATUS}' の実行だけ —"
+                f" それ以外は実行自身が書いた結末なので、巻き戻しません){suffix}",
+                PRECONDITION_UNMET)
 
         cur_worker = meta.get('worker')
         if cur_worker != agent:
@@ -3342,7 +3458,7 @@ def cmd_retire(args):
         if verdict == ASSIGN_ABSENT:
             print(f"[plan.sh] assignment/{agent} は既にありませんでした")
 
-    with_lock(_do)
+    with_lock(_do, nonblocking=bool(opts.get('--no-wait')))
 
 
 # ---------------------------------------------------------------------------

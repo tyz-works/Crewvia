@@ -40,7 +40,11 @@ QUEUE_DIR="${CREWVIA_QUEUE:-${REPO_ROOT}/queue}"
 REGISTRY_DIR="${REPO_ROOT}/registry"
 LOG_DIR="${REPO_ROOT}/logs/dispatcher"
 LOG_FILE="${LOG_DIR}/dispatcher-$(date +%Y%m%d).log"
-NOTIFY_CACHE="/tmp/dispatcher-notify-cache.json"
+# CREWVIA_NOTIFY_CACHE: isolated-QA escape hatch.  The default path is shared by
+# every dispatcher on the machine, so a test run would both read production
+# dedup keys (false PASS: a suppressed notification looks like "did not fire")
+# and write its own into them.  Tests point this at their own sandbox.
+NOTIFY_CACHE="${CREWVIA_NOTIFY_CACHE:-/tmp/dispatcher-notify-cache.json}"
 NOTIFY_TTL=300  # seconds before repeating the same notification (5 min)
 
 # Rule 5: state grace period in seconds (env > config > default 60).
@@ -108,7 +112,26 @@ REPO_ROOT = REGISTRY_DIR.parent
 _SCRIPTS_DIR = REPO_ROOT / 'scripts'
 sys.path.insert(0, str(_SCRIPTS_DIR))
 from lib_mux import Mux, repo_identity_ok  # noqa: E402
+import lib_retirement  # noqa: E402
 _mux = Mux()
+
+# t002: who may end a Worker process.  'watchdog' (default) = this daemon only
+# writes retirement markers and watchdog executes them; 'dispatcher' = the
+# pre-t002 behaviour where this daemon kills windows itself.
+#
+# The same variable gates watchdog.py.  Flipping only one of the two is what
+# the atomic-migration rule forbids: dispatcher-only rollback means both
+# daemons kill independently and, because crewvia reuses Worker names, a
+# late-arriving kill lands on an innocent successor (§5-2); watchdog-only
+# rollback means nobody closes an idle window at all (§5-1).
+KILL_AUTHORITY = (os.environ.get('CREWVIA_KILL_AUTHORITY') or '').strip().lower()
+KILL_AUTHORITY = 'dispatcher' if KILL_AUTHORITY == 'dispatcher' else 'watchdog'
+
+#: How long a request marker may sit unconsumed before we say so.  Until t005
+#: (mutual watch) lands, watchdog is a single point of failure for closing
+#: Workers: if it is dead, markers pile up and idle Workers simply linger,
+#: which the notify dedup would otherwise keep almost invisible.
+RETIREMENT_STALE_SECONDS = 300
 
 MISSIONS_DIR   = QUEUE_DIR / 'missions'
 ARCHIVE_DIR    = QUEUE_DIR / 'archive'
@@ -523,6 +546,12 @@ def tmux_send(target, message):
 def tmux_kill_window(target):
     """Kill a mux window.
 
+    t002: only reachable under CREWVIA_KILL_AUTHORITY=dispatcher (the rollback
+    path).  In the default configuration this daemon does not kill Workers at
+    all — see retire_worker().  Kept, with its `.firstseen` unlink intact, so
+    that the rollback is a true return to the previous behaviour; the new
+    sweep in sweep_spawn_grace_markers() is idempotent with it.
+
     t015 (QA FAIL on PR#190): also unlinks the `.firstseen` spawn-grace
     marker (see _spawn_time_fallback) on a successful kill. crewvia reuses
     Worker names (Haruto / Seo / Arjun / ...), so on the tmux backend
@@ -540,8 +569,10 @@ def tmux_kill_window(target):
     not crash on a kill path).
 
     t003: re-checks repo_identity_ok() immediately before the actual kill —
-    the single choke point all three call sites (idle-worker shutdown,
-    blocked-stuck shutdown, vanished-worker cleanup) funnel through. The
+    the single choke point all kill call sites (idle-worker shutdown, no-task
+    shutdown, blocked-stuck shutdown) funnel through.  t002 N4: the old list
+    named "vanished-worker cleanup" here, which was never true — the vanished
+    Worker path only notifies the Director, it has never killed anything. The
     once-per-cycle check at module load time (see repo_identity_ok(REPO_ROOT)
     above) only proves this process's identity was valid when the cycle
     started; a long-running cycle can still straddle a worktree removal.
@@ -565,6 +596,123 @@ def tmux_kill_window(target):
             log(f"WARNING: failed to remove spawn-grace marker {firstseen}: {e}")
     else:
         log(f"WARNING: mux kill {target!r} failed")
+
+
+# Writer side only: this daemon calls request()/has_marker() and never
+# process_all().  Executing a marker is watchdog's job — that separation is the
+# whole point of t002, so the executor is deliberately not driven from here.
+_retirement = lib_retirement.RetirementExecutor(
+    registry_dir=REGISTRY_DIR,
+    repo_root=REPO_ROOT,
+    mux=_mux,
+    repo_identity_check=lambda: repo_identity_ok(REPO_ROOT),
+    log=lambda msg: log(msg),
+    queue_dir=QUEUE_DIR,
+)
+
+
+def retire_worker(agent_name, target, reason):
+    """Ask for `agent_name` to be retired.  Returns True if the ask was recorded.
+
+    This is where t002 moved the boundary.  All three "this Worker has no work
+    left" paths (idle shutdown, no-task shutdown, Rule 2 blocked-stuck) used to
+    end in `tmux_send(...)` + `tmux_kill_window(...)` right here.  The
+    judgement is still ours — it reads queue/, which only this daemon does —
+    but the killing is not: watchdog owns process lifetime, and it is the only
+    one of the two that can also finish the queue-side cleanup afterwards.
+
+    The shutdown message travels inside the marker so that exactly one daemon
+    sends it.  Sending it here and killing there would put the two ends of the
+    same action in different processes with no shared clock.
+    """
+    if KILL_AUTHORITY == 'dispatcher':
+        sent = tmux_send(target, lib_retirement.SHUTDOWN_MESSAGE)
+        time.sleep(1)  # allow the message to land before killing
+        tmux_kill_window(target)
+        # Callers gate record_notify() on this.  Reporting the send result (not
+        # an unconditional True) keeps the rollback path's dedup behaviour
+        # identical to pre-t002, where a failed send was retried next cycle.
+        return sent
+
+    if _retirement.has_marker(agent_name):
+        # Already asked.  Re-writing the request would restart watchdog's
+        # escalation from phase one every 5 seconds, so the Worker would be
+        # told to shut down forever and never actually be signalled.
+        return False
+    return _retirement.request(agent_name, target, reason)
+
+
+def sweep_spawn_grace_markers():
+    """Delete `.firstseen` markers whose window is gone (t002 F1).
+
+    `tmux_kill_window()` used to do this as a side effect of a successful
+    kill, and that was the only place it happened.  With the kill gone from
+    this daemon nobody would unlink them any more, and a stale marker is not
+    cosmetic: on the tmux backend (no created_at cache) the *next* Worker
+    spawned under the same reused name reads as already past SPAWN_GRACE, so
+    it gets zero grace and is shut down within one cycle — measured at 33
+    seconds from spawn when this regressed before (t015 / PR #190).
+
+    Keying on the window being absent rather than on a kill succeeding also
+    closes three holes that existed before t002: markers left behind when
+    watchdog terminated a Worker, when a window vanished on its own, and when
+    benchmark-ctx.sh killed one directly — none of those went through
+    tmux_kill_window(), so none of them ever cleaned up.
+
+    A backend that transiently lists nothing unlinks everything, which only
+    grants the next spawn its full grace again — the safe direction, the same
+    one watchdog's mass-kill guard leans.
+    """
+    try:
+        markers = list(STATE_JSON_DIR.glob('*.firstseen'))
+    except OSError:
+        return
+    if not markers:
+        return
+    live = set(_mux.list())
+    for marker in markers:
+        target = marker.name[:-len('.firstseen')]
+        if target in live:
+            continue
+        try:
+            marker.unlink(missing_ok=True)
+            log(f"[spawn_grace] swept stale marker for vanished window {target!r}")
+        except OSError as e:
+            log(f"WARNING: failed to sweep spawn-grace marker {marker}: {e}")
+
+
+def warn_on_unconsumed_retirements():
+    """Say so when retirement markers are not being executed (§5-3 N3).
+
+    Between t002 and t005 watchdog is the only thing that closes a Worker.  A
+    watchdog that is dead or misconfigured produces no error of its own — the
+    symptom is just idle Workers that never go away, and this daemon's notify
+    dedup means even the request is logged at most once per 5 minutes.  One
+    explicit line per stale marker turns "nothing visibly happening" into a
+    fact someone can act on, and names the rollback.
+    """
+    now = time.time()
+    for agent in lib_retirement.list_agents(REGISTRY_DIR):
+        prog = lib_retirement.read_json(lib_retirement.progress_path(REGISTRY_DIR, agent))
+        if prog is not None:
+            continue  # watchdog has picked it up
+        req = lib_retirement.read_json(lib_retirement.request_path(REGISTRY_DIR, agent))
+        if not req:
+            continue
+        age = now - float(req.get('requested_at') or now)
+        if age < RETIREMENT_STALE_SECONDS:
+            continue
+        notify_key = f'retire_stale_{agent}'
+        if should_notify(notify_key):
+            msg = (
+                f"Worker {agent} の retirement marker が {age:.0f}s 未処理です。"
+                f"watchdog が停止している可能性があります (watchdog タブを確認、"
+                f"必要なら kill + respawn)。暫定回避は両デーモンを "
+                f"CREWVIA_KILL_AUTHORITY=dispatcher で再起動。"
+            )
+            if tmux_send(_director_name(), msg):
+                record_notify(notify_key)
+            log(f"[retire] WARNING: {agent}: request unconsumed for {age:.0f}s — watchdog may be down")
 
 
 def _mux_created_at(window_target: str):
@@ -1023,7 +1171,10 @@ def spawn_kai_review(slug, meta):
 
 
 def shutdown_idle_workers():
-    """Send shutdown message and kill idle Worker windows."""
+    """Request retirement of idle Worker windows (D1).
+
+    t002: this decides, it no longer executes.  See retire_worker().
+    """
     windows = tmux_list_worker_windows()
     for window in windows:
         agent_name = window['agent_name']
@@ -1036,10 +1187,8 @@ def shutdown_idle_workers():
                 continue
             notify_key = f"shutdown_{agent_name}"
             if should_notify(notify_key):
-                if tmux_send(target, 'タスクなし、shutdown'):
+                if retire_worker(agent_name, target, 'all-done'):
                     record_notify(notify_key)
-                time.sleep(1)
-                tmux_kill_window(target)
 
 
 def dispatch():
@@ -1181,6 +1330,29 @@ def dispatch():
         # Runs for ALL workers (busy and idle) before the is_idle gate below.
         check_rule5(agent_name, target, assignment_file, task_statuses_by_mission)
 
+        # t025: a Worker whose retirement is already in flight is not a
+        # candidate for anything.  Before t002 the judgement and the kill were
+        # one second apart, so there was no window to assign into; now watchdog
+        # gives the Worker a grace period, and for the idle / no-task / Rule 2
+        # paths `queue/assignments/<agent>` stays absent for all of it.  This
+        # loop would happily read that as "idle" and send it the next task.
+        #
+        # What follows is not merely wasted work.  The Worker pulls, so the
+        # pane keeps the same pid and created_at, watchdog's identity guard
+        # passes, and the escalation lands on a Worker doing *new* work — whose
+        # task the cleanup, bound to the old execution, then leaves stranded
+        # in_progress (Codex 4 巡目 P1-1).  watchdog re-checks the assignment
+        # before it acts (`assignment_execution_verdict()`), but that is the
+        # last line of defence; not creating the situation is this one.
+        #
+        # Skipping the whole iteration also covers the no-task / blocked-stuck
+        # branches below, which would only call retire_worker() and be refused
+        # for the same marker.
+        if KILL_AUTHORITY != 'dispatcher' and _retirement.has_marker(agent_name):
+            log(f"[retire] {agent_name}: retirement in flight — not assigning "
+                f"any task this cycle")
+            continue
+
         if not is_idle:
             continue  # Worker is busy; do not interrupt
 
@@ -1259,10 +1431,8 @@ def dispatch():
                 else:
                     notify_key = f"shutdown_{agent_name}"
                     if should_notify(notify_key):
-                        if tmux_send(target, 'タスクなし、shutdown'):
+                        if retire_worker(agent_name, target, 'no-task'):
                             record_notify(notify_key)
-                        time.sleep(1)  # allow the message to land before killing
-                        tmux_kill_window(target)
             elif has_any and not has_in_progress:
                 # Rule 2: all matching tasks are blocked.  If the most recently
                 # modified matching task file is older than BLOCKED_STUCK_THRESHOLD,
@@ -1327,12 +1497,10 @@ def dispatch():
                                 log(
                                     f"[Rule 2] {agent_name}: all matching tasks blocked for "
                                     f"{stuck_secs:.0f}s ≥ {BLOCKED_STUCK_THRESHOLD}s "
-                                    f"— sending shutdown (blocked-stuck)"
+                                    f"— requesting retirement (blocked-stuck)"
                                 )
-                                if tmux_send(target, 'タスクなし、shutdown'):
+                                if retire_worker(agent_name, target, 'blocked-stuck'):
                                     record_notify(notify_key)
-                                time.sleep(1)
-                                tmux_kill_window(target)
 
     # Notify Sora about unblocked pending tasks that NO live worker can handle.
     # alive_workers uses OR condition: window seed + heartbeat-fresh union.
@@ -1501,8 +1669,18 @@ def dispatch():
                     log(f"handoff detected but mux send failed: {slug}/{task_id} (will retry)")
 
 
+# --- CYCLE ENTRY POINT ---
+# Everything below this marker runs a full dispatch cycle.  Tests that want to
+# exercise a single helper (tests/test_orphan_daemon_guard.py) exec() the code
+# above it and stop here, so keep the marker even if the calls change.
 publish_agents()
 dispatch()
+# t002: both are queue/registry bookkeeping, not dispatch decisions, and both
+# must run on every cycle — including the early-return cycles dispatch() takes
+# when there are no active missions.
+sweep_spawn_grace_markers()
+if KILL_AUTHORITY != 'dispatcher':
+    warn_on_unconsumed_retirements()
 PYEOF
 }
 

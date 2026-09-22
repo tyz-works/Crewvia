@@ -98,6 +98,41 @@ each other are not evidence.  So proof of an exit is a recorded pane_pid that
 corrupt one is no evidence at all, and reading it as a death was the third
 round's P1-1.
 
+## The world keeps moving (t025)
+
+The three rounds above are all about *who* is being ended and *what* counts as
+proof.  Both can be satisfied and the retirement still be wrong, because a
+retirement is no longer instantaneous: t002 put a grace period between the
+decision and the act, and things happen in it.
+
+  - **A Worker is not a process.**  A timeout retirement names one execution
+    of one card, and the pane cannot tell you which execution is running: a
+    Worker that finishes the timed-out task and pulls the next one keeps its
+    pid and its created_at.  `assignment_execution_verdict()` asks the
+    assignment instead — the thing `plan.sh pull` republishes, with its
+    generation, inside the queue lock — and anything but a positive match is a
+    discard.  Upstream, dispatcher no longer hands a task to a Worker that has
+    a marker at all, so the situation mostly does not arise; this is the
+    backstop for the times it does.
+  - **The request file is the race, so creating it is the decision.**  Two
+    daemons write requests and both check `has_marker()` first.  A check apart
+    from the write is not a decision, so the create is atomic
+    (`write_json_exclusive()`), and every request carries a `request_id` the
+    progress file copies.  A progress file and a request that disagree about
+    that id are two different retirements, and their evidence never mixes —
+    the progress finishes on its own (`_read_pair()`), the request waits its
+    turn.
+  - **Nothing in the cycle may wait on the queue lock.**  The cleanup runs
+    inside watchdog's monitoring loop, and plan.sh's lock is a blocking
+    exclusive flock: one busy queue used to suspend every Worker's monitoring
+    for the subprocess timeout, per marker, on every retry.  `plan.sh retire
+    --no-wait` gives up instead and exits `PLAN_LOCK_BUSY`, which is read as
+    "ask again next cycle" — not as a failure, which would burn an attempt and
+    wake a human for a lock that was about to be released.
+
+All three fail toward "kill nothing, rewrite nothing", and all three have the
+same exit as everything else here: `_check_stall()` tells the Director once.
+
 Every other reading waits.  Waiting has one exit, and it is not automatic:
 `_check_stall()` escalates a retirement that has not moved in
 `STALL_REPORT_AFTER` seconds to the Director, once, and changes nothing.  The
@@ -110,6 +145,7 @@ import json
 import os
 import signal
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Tuple
@@ -162,6 +198,20 @@ SIGKILL_REPORT_AFTER = 3
 #: `plan.sh update` exit status for "the precondition did not hold".  Distinct
 #: from 1 (plan.sh is broken → retry) so cleanup can tell the two apart.
 PLAN_PRECONDITION_UNMET = 3
+
+#: `plan.sh --no-wait` exit status for "the queue lock was held by somebody
+#: else, so nothing was written".  Kept distinct from 3 on purpose: 3 means
+#: "nothing is owed any more" and settles the marker, while this one means
+#: "ask again next cycle" and must not consume the cleanup obligation.
+PLAN_LOCK_BUSY = 4
+
+#: Ceiling on the cleanup subprocess.  The cleanup runs *inside* watchdog's
+#: monitoring cycle, so its worst case is the cycle's worst case (R2).  The
+#: lock wait — the one unbounded thing plan.sh used to do — is gone via
+#: `--no-wait`; this is the belt for everything else (a stalled interpreter, a
+#: filesystem that stops answering).  120s was worse than the 70s termination
+#: stall this module was written to remove.
+CLEANUP_COMMAND_TIMEOUT = 30
 
 #: How long a retirement may stay unsettled before the Director hears about it
 #: once.  Every fail-closed branch in this module ends in "wait and look again
@@ -251,6 +301,67 @@ def write_json_atomic(path, data: dict) -> bool:
         except OSError:
             pass
         return False
+
+
+#: `write_json_exclusive()` outcomes.
+WROTE_CREATED = "created"
+WROTE_EXISTS = "exists"
+WROTE_ERROR = "error"
+
+
+def write_json_exclusive(path, data: dict) -> str:
+    """Create `path` with `data`, **only if it does not exist yet**.
+
+    Returns one of `WROTE_CREATED` / `WROTE_EXISTS` / `WROTE_ERROR`.
+
+    The request file is the token two daemons contend for: dispatcher writes
+    one for an idle Worker, watchdog writes one for a timeout, and both decide
+    to by reading `has_marker()` first.  A check that is separate from the
+    write is not a decision — both can read "no marker" and then both write,
+    and the second `os.replace` silently discards the first retirement while
+    watchdog may already have built a progress file against it (Codex 4 巡目
+    P1-2).  Only the filesystem can settle that race, so the create *is* the
+    check.
+
+    Written to a temp file first and then hard-linked into place, rather than
+    `O_EXCL` + write: the loser of the race must not be able to observe a
+    zero-length or half-written request, because `read_json()` answers None
+    for a corrupt document and `_advance()` reads None as "no request" — which
+    is a *different* branch, not a retry.  `os.link` publishes a document that
+    is already complete, and fails with EEXIST if somebody got there first.
+    `O_EXCL` remains as the fallback for filesystems without hard links.
+    """
+    path = Path(path)
+    payload = json.dumps(data, ensure_ascii=False, sort_keys=True)
+    tmp = path.with_name(f".{path.name}.new.{os.getpid()}.{uuid.uuid4().hex[:8]}")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(payload, encoding="utf-8")
+    except OSError:
+        unlink_quiet(tmp)
+        return WROTE_ERROR
+    try:
+        try:
+            os.link(tmp, path)
+            return WROTE_CREATED
+        except FileExistsError:
+            return WROTE_EXISTS
+        except OSError:
+            pass  # no hard-link support — fall through
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        except FileExistsError:
+            return WROTE_EXISTS
+        except OSError:
+            return WROTE_ERROR
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(payload)
+            return WROTE_CREATED
+        except OSError:
+            return WROTE_ERROR
+    finally:
+        unlink_quiet(tmp)
 
 
 def read_json(path) -> Optional[dict]:
@@ -375,6 +486,66 @@ def read_task_started_at(queue_dir, mission: str, task_id: str):
     return None
 
 
+#: `assignment_execution_verdict()` answers.
+EXEC_SAME = "same"        # the assignment still names the execution we recorded
+EXEC_OTHER = "other"      # it names a different task, or a different generation
+EXEC_ABSENT = "absent"    # nothing is published — that execution has ended
+EXEC_UNREADABLE = "unreadable"  # the assignment is there but cannot be read
+
+
+def assignment_execution_verdict(queue_dir, agent: str, mission, task_id,
+                                 generation) -> Tuple[str, str]:
+    """Does `queue/assignments/<agent>` still name the execution we recorded?
+
+    Returns `(verdict, detail)`.
+
+    This is the second half of instance identity, and the half the pane cannot
+    supply.  `identity_matches()` answers "is this the same *process*", which
+    a Worker that finishes one task and pulls the next passes trivially — same
+    pane, same pid, same created_at.  A timeout retirement is not about a
+    process, though; it is about **one execution of one card**.  Between the
+    shutdown message and the escalation the Worker can finish that card and
+    take another, and killing it then both ends live work and strands the new
+    task, whose cleanup nobody is holding evidence for (Codex 4 巡目 P1-1).
+
+    The assignment is the right thing to ask because `plan.sh pull` publishes
+    it inside the queue lock together with the card, and publishes the
+    generation beside it (`<agent>.identity`).  Read-only and deliberately
+    small: this runs inside watchdog's cycle and must not take the queue lock.
+    """
+    if not queue_dir or not agent or not task_id:
+        return EXEC_UNREADABLE, "no assignment to compare against"
+    base = Path(queue_dir) / "assignments" / str(agent)
+    try:
+        published = base.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return EXEC_ABSENT, f"queue/assignments/{agent} does not exist"
+    except OSError as e:
+        return EXEC_UNREADABLE, f"queue/assignments/{agent} unreadable: {e}"
+
+    expected = f"{mission}:{task_id}"
+    if published != expected:
+        return EXEC_OTHER, (f"assignment names {published!r}, not {expected!r} "
+                            f"— the Worker has moved on")
+    if generation is None:
+        # Nothing was recorded to compare a generation against.  The card match
+        # above is all the evidence there is, and it already excludes the
+        # damaging case (a Worker executing a *different* task).
+        return EXEC_SAME, "no recorded generation to compare"
+
+    identity = read_json(base.with_name(base.name + ".identity"))
+    current = (identity or {}).get("started_at")
+    if identity is None or current is None:
+        # `plan.sh pull` always writes the sidecar next to the assignment, so
+        # its absence is an old or hand-made state rather than the re-pull race
+        # — and the card match already rules out the dangerous direction.
+        return EXEC_SAME, "assignment identity sidecar unreadable"
+    if str(current).strip() != str(generation).strip():
+        return EXEC_OTHER, (f"assignment generation {current!r} != recorded "
+                            f"{generation!r} — same card, different execution")
+    return EXEC_SAME, ""
+
+
 # ---------------------------------------------------------------------------
 # Spawn identity
 # ---------------------------------------------------------------------------
@@ -491,6 +662,12 @@ def build_request(agent: str, window_target: str, reason: str, identity: dict,
     is what stops a fabricated `null` from matching a genuinely unstarted card.
     """
     req = {
+        # A name for *this* retirement, minted here and carried by the progress
+        # file so the two can be told apart from a later one for the same
+        # agent.  Names are reused, agents are reused, and even mission/task
+        # can repeat; nothing else in the document is unique to one retirement
+        # (Codex 4 巡目 P1-2).
+        "request_id": uuid.uuid4().hex,
         "agent": agent,
         "window_target": window_target,
         "reason": reason,
@@ -517,6 +694,9 @@ def _carried_from_request(req: dict) -> dict:
     to stay distinguishable from a recorded `None`.
     """
     carried = {
+        # Carried first: it is what binds every later step to the request that
+        # authorised it, and the binding has to survive the request going away.
+        "request_id": req.get("request_id"),
         "mission": req.get("mission"),
         "task_id": req.get("task_id"),
         "reason": req.get("reason"),
@@ -539,6 +719,7 @@ def build_progress(previous: Optional[dict], phase: str, **fields) -> dict:
     doc["phase"] = phase
     doc["updated_at"] = time.time()
     for key, default in (
+        ("request_id", None),
         ("deadline", None),
         ("pane_pid", None),
         ("window_gone", False),
@@ -573,7 +754,8 @@ def _default_run_command(argv: list, env: dict) -> Tuple[int, str]:
     import subprocess
     try:
         proc = subprocess.run(
-            argv, env=env, capture_output=True, text=True, timeout=120,
+            argv, env=env, capture_output=True, text=True,
+            timeout=CLEANUP_COMMAND_TIMEOUT,
         )
     except Exception as e:  # noqa: BLE001 — a failed cleanup must never crash the daemon
         return 1, f"{type(e).__name__}: {e}"
@@ -677,15 +859,34 @@ class RetirementExecutor:
                 f"still be retired, but the queue cleanup will be handed to the "
                 f"Director instead of run automatically"
             )
+        if progress_path(self.registry_dir, agent).exists():
+            # A retirement is already under way and its request has been
+            # consumed or lost.  Writing a fresh request now would hand the
+            # phase machine a second document to read, and the two would
+            # disagree about which execution is being ended.
+            self.log(f"[retire] {agent}: a retirement is already in flight "
+                     f"— not writing a second request ({reason})")
+            return False
         req = build_request(agent, window_target, reason, identity,
                             mission=mission, task_id=task_id, message=message,
                             task_started_at=started_at)
-        if not write_json_atomic(request_path(self.registry_dir, agent), req):
+        # Create-if-absent, atomically: this *is* the `has_marker()` check for
+        # the two daemons that both write here.  A separate check followed by
+        # an unconditional replace let the loser overwrite the winner, and a
+        # progress file built against the first request would then be read
+        # alongside the second one's task and generation (Codex 4 巡目 P1-2).
+        outcome = write_json_exclusive(request_path(self.registry_dir, agent), req)
+        if outcome == WROTE_EXISTS:
+            self.log(f"[retire] {agent}: a retirement request already exists "
+                     f"— leaving it alone (not writing {reason!r})")
+            return False
+        if outcome != WROTE_CREATED:
             self.log(f"[retire] {agent}: failed to write retirement request")
             return False
         self.log(
             f"[retire] {agent}: requested ({reason}) window={window_target} "
-            f"mission={mission} task={task_id} pane_pid={identity.get('pane_pid')}"
+            f"mission={mission} task={task_id} pane_pid={identity.get('pane_pid')} "
+            f"request_id={req['request_id']}"
         )
         return True
 
@@ -778,9 +979,50 @@ class RetirementExecutor:
     # Phase machine
     # ------------------------------------------------------------------
 
-    def _advance(self, agent: str) -> Optional[str]:
+    @staticmethod
+    def _same_retirement(req: Optional[dict], prog: Optional[dict]) -> bool:
+        """Do this request and this progress file describe the same retirement?
+
+        Compared by `request_id` and nothing else.  A missing id on either side
+        is *not* a mismatch: markers written before ids existed are still
+        legitimate mid-flight retirements, and treating them as foreign would
+        orphan every one of them at upgrade time.
+        """
+        rid = (req or {}).get("request_id")
+        pid_ = (prog or {}).get("request_id")
+        if rid is None or pid_ is None:
+            return True
+        return str(rid) == str(pid_)
+
+    def _read_pair(self, agent: str) -> Tuple[Optional[dict], Optional[dict], bool]:
+        """`(request, progress, foreign)` — and evidence never crosses retirements.
+
+        When the request on disk is not the one this progress file was built
+        from, the request is handed back as `None`: every step then runs on the
+        progress file's own evidence (its pid, its task, its generation), which
+        is what `_orphaned()` already does correctly for "the request vanished
+        mid-flight".  Mixing the two instead — progress from one retirement,
+        mission/task/generation from another — is what lets a timeout's cleanup
+        obligation be dropped, or another retirement's evidence be applied to a
+        live execution (Codex 4 巡目 P1-2).
+
+        The foreign request is left on disk untouched.  It is somebody's live
+        ask; once this progress settles it gets its own turn through `_start()`.
+        """
         req = read_json(request_path(self.registry_dir, agent))
         prog = read_json(progress_path(self.registry_dir, agent))
+        if req is None or prog is None or self._same_retirement(req, prog):
+            return req, prog, False
+        self._log_waiting(
+            agent,
+            f"[retire] {agent}: the retirement request on disk "
+            f"(request_id={req.get('request_id')!r}) is not the one this progress "
+            f"file was built from ({prog.get('request_id')!r}) — finishing the "
+            f"progress marker on its own evidence and leaving the request alone")
+        return None, prog, True
+
+    def _advance(self, agent: str) -> Optional[str]:
+        req, prog, foreign = self._read_pair(agent)
 
         if prog is None:
             if req is None:
@@ -793,9 +1035,9 @@ class RetirementExecutor:
         if phase == PHASE_SIGTERM_SENT:
             return self._step_sigterm(agent, req, prog)
         if phase in (PHASE_TERMINATED, PHASE_CLEANUP_FAILED):
-            return self._settle_terminated(agent, req, prog)
+            return self._settle_terminated(agent, req, prog, keep_request=foreign)
         if phase == PHASE_DISCARDED:
-            return self._settle_discarded(agent, prog)
+            return self._settle_discarded(agent, prog, keep_request=foreign)
 
         # Unknown / corrupt phase.  Settle it as discarded rather than
         # guessing which destructive step it was in the middle of.
@@ -910,8 +1152,7 @@ class RetirementExecutor:
         Reported once, and durably so: a watchdog that restarts every few
         minutes must not turn one stuck marker into a stream of alerts.
         """
-        req = read_json(request_path(self.registry_dir, agent))
-        prog = read_json(progress_path(self.registry_dir, agent))
+        req, prog, _foreign = self._read_pair(agent)
         if req is None and prog is None:
             unlink_quiet(stall_path(self.registry_dir, agent))
             return False
@@ -1014,6 +1255,28 @@ class RetirementExecutor:
                             "Worker picked up a task after the request was written", {})
             except OSError:
                 pass
+
+        # The premise of a *timeout* retirement is "this Worker is stuck on
+        # this execution".  The exemption above is about the assignment merely
+        # existing, which is normal here — but *which* execution it names is
+        # not, and the pane cannot answer that question: a Worker that finishes
+        # the timed-out task and pulls the next one keeps the same pid and the
+        # same created_at, so R7 passes and the escalation lands on live work,
+        # stranding the new task nobody holds evidence for (Codex 4 巡目 P1-1).
+        #
+        # Everything except a positive match is a discard, i.e. "kill nothing,
+        # rewrite nothing".  That has an exit: the marker goes away, and the
+        # timeout is re-decided from the card on a later cycle if the Worker
+        # really is stuck — unlike a hold, which would keep `has_marker()`
+        # raised and stop anybody asking again.
+        if req.get("task_id") and self.queue_dir:
+            verdict, detail = assignment_execution_verdict(
+                self.queue_dir, agent, req.get("mission"), req.get("task_id"),
+                self._bound_generation(req, None))
+            if verdict != EXEC_SAME:
+                return GUARD_DISCARD, (
+                    f"the assignment no longer names the execution this retirement "
+                    f"is about ({verdict}: {detail})"), {}
 
         current = current_spawn_identity(self.registry_dir, self.mux, target)
         ok, why = identity_matches(req.get("spawn_identity"), current)
@@ -1388,7 +1651,8 @@ class RetirementExecutor:
 
     # -- terminal handling ---------------------------------------------
 
-    def _settle_terminated(self, agent: str, req: Optional[dict], prog: dict) -> Optional[str]:
+    def _settle_terminated(self, agent: str, req: Optional[dict], prog: dict,
+                           keep_request: bool = False) -> Optional[str]:
         """Finish the queue-side bookkeeping this daemon now owes (E1).
 
         The Worker is gone.  Historically this is where crewvia stopped:
@@ -1425,14 +1689,33 @@ class RetirementExecutor:
             if not self._plan_sh_usable():
                 return self._cleanup_failed(
                     agent, prog, f"plan.sh not usable at {self.plan_sh}", mission, task_id)
+            # --no-wait: this call happens inside watchdog's monitoring cycle,
+            # and plan.sh's lock is a *blocking* exclusive flock.  A busy queue
+            # used to suspend every Worker's monitoring for the subprocess
+            # timeout, once per marker and again on every retry — worse than
+            # the 70s termination stall this module was written to remove
+            # (Codex 4 巡目 P2).  Nothing is lost by giving up: the marker stays
+            # in flight and the next cycle asks again.
             argv = ["bash", str(self.plan_sh), "retire", task_id,
                     "--agent", agent, "--started-at", generation,
-                    "--mission", mission]
+                    "--mission", mission, "--no-wait"]
             env = dict(os.environ)
             if self.queue_dir:
                 env["CREWVIA_QUEUE"] = str(self.queue_dir)
             env["CREWVIA_REPO_ROOT"] = str(self.repo_root)
             rc, output = self.run_command(argv, env)
+            if rc == PLAN_LOCK_BUSY:
+                # Not a failure: nothing was written and the obligation still
+                # stands.  Deliberately *not* routed through _cleanup_failed(),
+                # which would burn an attempt, tell the Director, and move the
+                # phase to cleanup_failed — for a lock that is about to be
+                # released anyway.  `_check_stall()` is the exit if the queue
+                # never frees up.
+                self._log_waiting(
+                    agent,
+                    f"[retire] {agent}: queue lock busy — deferring the cleanup of "
+                    f"{mission}/{task_id} to a later cycle (nothing written)")
+                return None
             if rc == PLAN_PRECONDITION_UNMET:
                 # Nothing is owed and nothing is broken: the task is no longer
                 # the one this retirement was about.  Settle quietly rather
@@ -1468,8 +1751,11 @@ class RetirementExecutor:
 
         # Request first: a crash between the two unlinks leaves a settled
         # progress marker with no request, which _advance() treats as done
-        # instead of starting a second termination.
-        unlink_quiet(request_path(self.registry_dir, agent))
+        # instead of starting a second termination.  `keep_request` is the one
+        # exception: the request on disk belongs to a *different* retirement,
+        # so deleting it here would silently drop somebody else's ask.
+        if not keep_request:
+            unlink_quiet(request_path(self.registry_dir, agent))
         unlink_quiet(progress_path(self.registry_dir, agent))
         unlink_quiet(stall_path(self.registry_dir, agent))
         return "cleaned"
@@ -1501,7 +1787,7 @@ class RetirementExecutor:
                              mission=mission, task_id=task_id)
         return "cleanup_failed"
 
-    def _settle_discarded(self, agent: str, prog: dict) -> str:
+    def _settle_discarded(self, agent: str, prog: dict, keep_request: bool = False) -> str:
         """R7 said no.  Drop the marker without touching the queue.
 
         Nothing was killed, so there is no ghost task to repair — a healthy
@@ -1512,7 +1798,8 @@ class RetirementExecutor:
             f"[retire] {agent}: discarding marker "
             f"(reason: {prog.get('discard_reason')}) — Worker left alone"
         )
-        unlink_quiet(request_path(self.registry_dir, agent))
+        if not keep_request:   # see _settle_terminated()
+            unlink_quiet(request_path(self.registry_dir, agent))
         unlink_quiet(progress_path(self.registry_dir, agent))
         unlink_quiet(stall_path(self.registry_dir, agent))
         return "discarded_cleared"

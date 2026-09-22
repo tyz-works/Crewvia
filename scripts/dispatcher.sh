@@ -1303,6 +1303,29 @@ def dispatch():
         # Runs for ALL workers (busy and idle) before the is_idle gate below.
         check_rule5(agent_name, target, assignment_file)
 
+        # t025: a Worker whose retirement is already in flight is not a
+        # candidate for anything.  Before t002 the judgement and the kill were
+        # one second apart, so there was no window to assign into; now watchdog
+        # gives the Worker a grace period, and for the idle / no-task / Rule 2
+        # paths `queue/assignments/<agent>` stays absent for all of it.  This
+        # loop would happily read that as "idle" and send it the next task.
+        #
+        # What follows is not merely wasted work.  The Worker pulls, so the
+        # pane keeps the same pid and created_at, watchdog's identity guard
+        # passes, and the escalation lands on a Worker doing *new* work — whose
+        # task the cleanup, bound to the old execution, then leaves stranded
+        # in_progress (Codex 4 巡目 P1-1).  watchdog re-checks the assignment
+        # before it acts (`assignment_execution_verdict()`), but that is the
+        # last line of defence; not creating the situation is this one.
+        #
+        # Skipping the whole iteration also covers the no-task / blocked-stuck
+        # branches below, which would only call retire_worker() and be refused
+        # for the same marker.
+        if KILL_AUTHORITY != 'dispatcher' and _retirement.has_marker(agent_name):
+            log(f"[retire] {agent_name}: retirement in flight — not assigning "
+                f"any task this cycle")
+            continue
+
         if not is_idle:
             continue  # Worker is busy; do not interrupt
 

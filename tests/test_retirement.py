@@ -61,6 +61,23 @@ RED (修正前の実装では失敗する):
 既存ガードの回帰 (弱めていないこと):
   test_mass_kill_guard_conditions_unchanged
 
+t025 — Codex 4 巡目 P1 2 件 + P2 1 件 (退役処理と「割り当て・並行書き込み」の
+相互作用。identity も証拠の強度も通ったうえで、**猶予期間のあいだに外の世界が
+動く**ことで壊れる):
+  test_red_worker_that_pulled_another_task_during_the_grace_period_is_spared (P1-1)
+  test_red_worker_that_finished_its_task_during_the_grace_period_is_spared   (P1-1)
+  test_red_same_card_pulled_again_by_a_successor_is_a_different_execution    (P1-1)
+  test_red_concurrent_requests_do_not_overwrite_each_other                   (P1-2)
+  test_red_progress_is_bound_to_the_request_that_created_it                  (P1-2)
+  test_red_plan_sh_retire_can_refuse_to_wait_for_the_queue_lock              (P2)
+  test_red_cleanup_does_not_block_the_cycle_on_the_queue_lock                (P2)
+  test_timeout_retirement_on_the_same_execution_still_terminates
+    ↑ 逆向きの担保: 上の 3 本は全部「前提が外れたら殺さない」なので、これが
+      無いと「何も殺さない」に倒しただけで全部緑になる。
+  (dispatcher 側 — 退役中 Worker を割り当て対象から外す — は
+   tests/test_dispatcher_retirement_exclusion.py。dispatcher.sh の heredoc
+   python を exec() して本物の dispatch() を回している)
+
 t018 backlog の小修正:
   test_verdict_logger_forget_drops_state
   test_verdict_logger_logs_reason_change_within_same_verdict
@@ -1708,8 +1725,11 @@ def test_cleanup_is_bound_to_the_execution_by_a_single_plan_sh_call(sandbox):
     argv = calls[0]
     assert argv[2] == "retire", f"新 API を通っていない: {argv}"
     assert argv[3] == TASK_ID
-    assert argv[4:] == ["--agent", AGENT, "--started-at", started_at, "--mission", SLUG], (
+    assert argv[4:] == ["--agent", AGENT, "--started-at", started_at,
+                        "--mission", SLUG, "--no-wait"], (
         f"証拠以外のものを渡している: {argv}")
+    # --no-wait は「何を主張するか」ではなく「待てるかどうか」の指定なので、
+    # 前提を緩める種類のフラグではない (t025 / Codex 4 巡目 P2)。
     assert not any(a.startswith("--expect") for a in argv), (
         "サイト側のガードが二重に残っている — どちらが効いているか分からなくなる")
 
@@ -1818,3 +1838,365 @@ def test_verdict_logger_logs_reason_change_within_same_verdict(monkeypatch):
     logger.record(monitor, _detail("warn", "hard_idle_but_executing"))
     assert len(lines) == 2, lines
     assert "hard_idle_but_executing" in lines[-1]
+
+
+# ---------------------------------------------------------------------------
+# t025 — Codex 4 巡目。退役処理と「割り当て・並行書き込み」の相互作用。
+#
+# これまでの 9 件は「誰を殺すか」の束縛 (identity) と「何を証拠とするか」の
+# 強度だった。今回はそのどちらも通ったうえで、**退役処理が走っている最中に
+# 外の世界が動く**ことで壊れる 3 件。
+#
+#   1. 猶予期間中に Worker が次の task を pull できてしまう (P1)
+#   2. request の生成が原子的でない (P1)
+#   3. queue ロック待ちが watchdog の監視ループを止める (P2)
+# ---------------------------------------------------------------------------
+
+import multiprocessing  # noqa: E402  (t025 群でのみ使う)
+
+
+def _plan(sandbox, *args, timeout=60):
+    """sandbox の中で本物の plan.sh を回す。"""
+    env = dict(os.environ)
+    env["CREWVIA_QUEUE"] = str(sandbox.queue)
+    env["CREWVIA_REPO_ROOT"] = str(sandbox.root)
+    # 本番の Worker は必ずこれを持っている。無いと `plan.sh done` は
+    # assignment を撤去しないので、fixture が本番より弱い状態を試してしまう。
+    env["AGENT_NAME"] = AGENT
+    return subprocess.run(
+        ["bash", str(sandbox.scripts / "plan.sh"), *args],
+        env=env, capture_output=True, text=True, timeout=timeout,
+    )
+
+
+def _add_pending_task(sandbox, task_id: str) -> None:
+    """同じ mission にもう 1 枚 pending の card を置く。"""
+    (sandbox.queue / "missions" / SLUG / "tasks" / f"{task_id}.md").write_text(
+        f"---\nid: {task_id}\ntitle: next task\nskills: [code]\n"
+        f"priority: high\nstatus: pending\nblocked_by: []\ntarget_dir: null\n"
+        f"worker: null\nstarted_at: null\ncompleted_at: null\n"
+        f"---\n\n## Description\nnext\n\n## Result\n"
+    )
+
+
+def _status_of(sandbox, task_id: str) -> str:
+    path = sandbox.queue / "missions" / SLUG / "tasks" / f"{task_id}.md"
+    for line in path.read_text().splitlines():
+        if line.startswith("status:"):
+            return line.split(":", 1)[1].strip()
+    return "?"
+
+
+# -- 1. 猶予期間中の pull ----------------------------------------------------
+
+def test_red_worker_that_pulled_another_task_during_the_grace_period_is_spared(sandbox):
+    """猶予期間中に次の task を pull した Worker を殺してはならない。
+
+    timeout retirement は task_id を持つので `_guard()` の assignment
+    チェックを免除される。免除された結果、見ているのは pane identity だけ
+    になる — ところが pane の PID も created_at も**同じ Worker が次の task
+    を実行していても変わらない**。だから guard は素通りし、watchdog は
+    「別の task を実行中の生きた Worker」に SIGTERM を撃つ。しかも後始末は
+    元の task しか見ないので、新しい task は in_progress のまま宙に浮く。
+
+    再現は本物の plan.sh で行う: 猶予期間中に `done` → `pull` を実際に通す。
+    """
+    pane_pid = sandbox.spawn_worker_process()
+    sandbox.record_identity(WINDOW, pane_pid)
+    mux = FakeMux({WINDOW: pane_pid})
+    _add_pending_task(sandbox, "t002")
+
+    ex = make_executor(sandbox, mux, grace_period=3600)
+    assert ex.request(AGENT, WINDOW, "timeout", mission=SLUG, task_id=TASK_ID)
+    assert ex.process_all() == [(AGENT, "notified")]
+
+    # 猶予期間中に Worker が生き返り、自分で片を付けて次を取る。
+    done = _plan(sandbox, "done", TASK_ID, "grace 中に自力で完了", "--mission", SLUG)
+    assert done.returncode == 0, done.stderr
+    pull = _plan(sandbox, "pull", "--task", "t002", "--mission", SLUG,
+                 "--agent", AGENT, "--skills", "code")
+    assert pull.returncode == 0, pull.stderr
+    assert _status_of(sandbox, "t002") == "in_progress"
+
+    # 猶予期間が切れる。
+    ex.now = lambda: time.time() + 7200
+    for _ in range(5):
+        ex.process_all()
+        if not ex.has_marker(AGENT):
+            break
+
+    assert _pid_alive(pane_pid), "次の task を実行中の Worker を kill した"
+    assert _status_of(sandbox, "t002") == "in_progress", "新しい task が宙に浮いた"
+    assert sandbox.assignment_file.exists(), "新しい実行の assignment を消した"
+    assert _status_of(sandbox, TASK_ID) == "done", "Worker 自身が書いた結末を巻き戻した"
+
+
+def test_red_worker_that_finished_its_task_during_the_grace_period_is_spared(sandbox):
+    """assignment がもう無い = その実行は終わっている。殺す対象が無い。
+
+    上の一段手前。pull まで進んでいなくても、`plan.sh done` を通した時点で
+    退役要求の前提 (この Worker はこの task で止まっている) は偽になる。
+    """
+    pane_pid = sandbox.spawn_worker_process()
+    sandbox.record_identity(WINDOW, pane_pid)
+    mux = FakeMux({WINDOW: pane_pid})
+
+    ex = make_executor(sandbox, mux, grace_period=3600)
+    assert ex.request(AGENT, WINDOW, "timeout", mission=SLUG, task_id=TASK_ID)
+    ex.process_all()
+
+    done = _plan(sandbox, "done", TASK_ID, "grace 中に自力で完了", "--mission", SLUG)
+    assert done.returncode == 0, done.stderr
+
+    ex.now = lambda: time.time() + 7200
+    for _ in range(5):
+        ex.process_all()
+        if not ex.has_marker(AGENT):
+            break
+
+    assert _pid_alive(pane_pid), "もう手を離した task を理由に Worker を kill した"
+    assert _status_of(sandbox, TASK_ID) == "done", "Worker 自身が書いた結末を巻き戻した"
+
+
+def test_red_same_card_pulled_again_by_a_successor_is_a_different_execution(sandbox):
+    """同じ card でも世代が違えば別の実行。差し戻し → 再 pull を巻き込まない。"""
+    pane_pid = sandbox.spawn_worker_process()
+    sandbox.record_identity(WINDOW, pane_pid)
+    mux = FakeMux({WINDOW: pane_pid})
+
+    ex = make_executor(sandbox, mux, grace_period=3600)
+    assert ex.request(AGENT, WINDOW, "timeout", mission=SLUG, task_id=TASK_ID)
+    ex.process_all()
+
+    # 人間が差し戻し、同名 Worker が同じ card を取り直す (= 新しい世代)。
+    reset = _plan(sandbox, "update", TASK_ID, "--status", "pending", "--reset",
+                  "--mission", SLUG)
+    assert reset.returncode == 0, reset.stderr
+    pull = _plan(sandbox, "pull", "--task", TASK_ID, "--mission", SLUG,
+                 "--agent", AGENT, "--skills", "code")
+    assert pull.returncode == 0, pull.stderr
+
+    ex.now = lambda: time.time() + 7200
+    for _ in range(5):
+        ex.process_all()
+        if not ex.has_marker(AGENT):
+            break
+
+    assert _pid_alive(pane_pid), "同じ card の別の実行を巻き込んで kill した"
+    assert _status_of(sandbox, TASK_ID) == "in_progress", "後任の実行を pending に戻した"
+
+
+def test_timeout_retirement_on_the_same_execution_still_terminates(sandbox):
+    """逆方向の担保: 本当に同じ実行を握ったままの Worker は従来どおり終了する。
+
+    上の 3 本は全部「前提が外れたら殺さない」なので、これが無いと
+    「何も殺さない」に倒しただけでも全部緑になってしまう。
+    """
+    pane_pid = sandbox.spawn_worker_process()
+    sandbox.record_identity(WINDOW, pane_pid)
+    mux = FakeMux({WINDOW: pane_pid})
+
+    ex = make_executor(sandbox, mux)
+    assert ex.request(AGENT, WINDOW, "timeout", mission=SLUG, task_id=TASK_ID)
+    for _ in range(10):
+        ex.process_all()
+        if not ex.has_marker(AGENT):
+            break
+
+    assert not _pid_alive(pane_pid), "同じ実行を握ったままの Worker が終了しなかった"
+    assert sandbox.task_status() == "pending"
+
+
+# -- 2. request の原子性 -----------------------------------------------------
+
+def _request_in_child(root, agent, window, reason, queue, registry, out):
+    """別プロセスから request() を 1 回叩く。戻り値を out に積む。"""
+    import lib_retirement as lr
+
+    ex = lr.RetirementExecutor(
+        registry_dir=registry, repo_root=root,
+        mux=FakeMux({window: os.getpid()}),
+        repo_identity_check=lambda: True,
+        queue_dir=queue,
+    )
+    out.put((reason, bool(ex.request(agent, window, reason))))
+
+
+def test_red_concurrent_requests_do_not_overwrite_each_other(sandbox):
+    """2 つの書き手を実際に競わせる。勝つのは 1 本だけ。
+
+    `has_marker()` の確認と `request()` の書き込みが分かれており、
+    `request()` は無条件に os.replace する。dispatcher と watchdog が同時に
+    「marker 無し」を観測すると、後から書いた方が先の request を黙って
+    差し替える。
+    """
+    make_idle(sandbox)
+    sandbox.record_identity(WINDOW, os.getpid())
+
+    ctx = multiprocessing.get_context("fork")
+    out = ctx.Queue()
+    procs = [
+        ctx.Process(target=_request_in_child,
+                    args=(sandbox.root, AGENT, WINDOW, f"racer-{i}",
+                          sandbox.queue, sandbox.registry, out))
+        for i in range(8)
+    ]
+    for p in procs:
+        p.start()
+    for p in procs:
+        p.join(30)
+    results = [out.get() for _ in range(len(procs))]
+
+    winners = [reason for reason, ok in results if ok]
+    assert len(winners) == 1, f"複数の書き手が「書いた」と答えた: {winners}"
+
+    import lib_retirement as lr
+    req = lr.read_json(lr.request_path(sandbox.registry, AGENT))
+    assert req is not None, "request が 1 本も残っていない"
+    assert req["reason"] == winners[0], (
+        f"勝者 {winners[0]!r} の request が {req['reason']!r} に差し替えられている")
+
+
+def test_red_progress_is_bound_to_the_request_that_created_it(sandbox):
+    """差し替わった request の証拠を、前の retirement の progress に適用しない。
+
+    watchdog が最初の request で progress を作った後に request が差し替わる
+    と、progress は最初の request の PID と task 証拠を持つのに、後続ステップ
+    は差し替え側の mission/task/世代を読む。後始末の義務が捨てられるか、
+    **別の退役の証拠が適用される**。
+    """
+    import lib_retirement as lr
+
+    pane_pid = sandbox.spawn_worker_process()
+    sandbox.record_identity(WINDOW, pane_pid)
+    mux = FakeMux({WINDOW: pane_pid})
+
+    # t002 は **別の実行** — 同じ Worker 名が今まさに走らせている生きた task。
+    _add_pending_task(sandbox, "t002")
+    other = sandbox.queue / "missions" / SLUG / "tasks" / "t002.md"
+    other.write_text(other.read_text()
+                     .replace("status: pending", "status: in_progress")
+                     .replace("worker: null", f"worker: {AGENT}")
+                     .replace("started_at: null", 'started_at: "2099-01-01T00:00:00Z"'))
+
+    ex = make_executor(sandbox, mux, grace_period=3600)
+    assert ex.request(AGENT, WINDOW, "timeout", mission=SLUG, task_id=TASK_ID)
+    ex.process_all()  # → notified。progress は t001 の PID と世代を持つ。
+
+    # 旧コード相当の「無条件 os.replace」で request だけを別物に差し替える。
+    replacement = lr.build_request(
+        AGENT, WINDOW, "no-task",
+        {"pane_pid": pane_pid, "created_at": None},
+        mission=SLUG, task_id="t002", task_started_at="2099-01-01T00:00:00Z")
+    lr.write_json_atomic(lr.request_path(sandbox.registry, AGENT), replacement)
+    sandbox.publish_assignment("2099-01-01T00:00:00Z")  # t002 の assignment
+    sandbox.assignment_file.write_text(f"{SLUG}:t002\n")
+    sandbox.assignment_identity_file.write_text(json.dumps({
+        "mission": SLUG, "task": "t002", "worker": AGENT,
+        "started_at": "2099-01-01T00:00:00Z"}, ensure_ascii=False, sort_keys=True) + "\n")
+
+    ex.now = lambda: time.time() + 7200
+    for _ in range(6):
+        ex.process_all()
+        if not ex.has_marker(AGENT):
+            break
+
+    assert _status_of(sandbox, "t002") == "in_progress", (
+        "差し替えられた request の証拠で、別の実行 (t002) が巻き戻された")
+    assert sandbox.assignment_file.exists(), "別の実行の assignment を撤去した"
+    assert any("request" in line and "progress" in line for line in sandbox.logs), sandbox.logs
+
+
+# -- 3. queue ロック待ちで監視ループを止めない -------------------------------
+
+class _HeldLock:
+    """queue ロックを別プロセスで握りっぱなしにする。"""
+
+    def __init__(self, queue_dir):
+        self.queue_dir = Path(queue_dir)
+        self.proc = None
+
+    def __enter__(self):
+        script = (
+            "import fcntl,sys,time\n"
+            "f=open(sys.argv[1],'a+')\n"
+            "fcntl.flock(f, fcntl.LOCK_EX)\n"
+            "sys.stdout.write('locked\\n'); sys.stdout.flush()\n"
+            "time.sleep(600)\n"
+        )
+        self.queue_dir.mkdir(parents=True, exist_ok=True)
+        self.proc = subprocess.Popen(
+            [sys.executable, "-c", script, str(self.queue_dir / ".lock")],
+            stdout=subprocess.PIPE, text=True)
+        assert self.proc.stdout.readline().strip() == "locked"
+        return self
+
+    def __exit__(self, *exc):
+        self.proc.kill()
+        self.proc.wait(timeout=5)
+        return False
+
+
+def test_red_plan_sh_retire_can_refuse_to_wait_for_the_queue_lock(sandbox):
+    """plan.sh に「待たずに諦める」取得手段があること。"""
+    with _HeldLock(sandbox.queue):
+        started = time.monotonic()
+        res = _plan(sandbox, "retire", TASK_ID, "--agent", AGENT,
+                    "--started-at", "2026-09-21T00:00:00Z",
+                    "--mission", SLUG, "--no-wait", timeout=30)
+        elapsed = time.monotonic() - started
+
+    import lib_retirement as lr
+
+    assert elapsed < 15, f"ロックを待ってしまった ({elapsed:.1f}s)"
+    # 呼び出し側の定数で assert する — 片方だけ変えると
+    # 「ロック待ち」が「plan.sh の異常」や「もう用は無い」に化ける。
+    assert res.returncode == lr.PLAN_LOCK_BUSY, (
+        f"rc={res.returncode} — ロック取得失敗は 1 (異常) でも 3 (前提不成立) でもない"
+        f"専用の終了コードで返すこと\n{res.stdout}{res.stderr}")
+    assert lr.PLAN_LOCK_BUSY not in (0, 1, lr.PLAN_PRECONDITION_UNMET)
+    assert _status_of(sandbox, TASK_ID) == "in_progress", "1 バイトも書いてはならない"
+
+
+def test_red_cleanup_does_not_block_the_cycle_on_the_queue_lock(sandbox):
+    """queue が混んでいても 1 cycle は有界。
+
+    `_settle_terminated()` は `_default_run_command()` を同期呼び出ししており、
+    本物の plan.sh はブロッキングの排他 flock を使う。marker 1 件につき最大
+    120 秒 (subprocess timeout)、全 Worker の監視と退役処理が止まる。
+    """
+    pane_pid = sandbox.spawn_worker_process()
+    sandbox.record_identity(WINDOW, pane_pid)
+    mux = FakeMux({WINDOW: pane_pid})
+
+    ex = make_executor(sandbox, mux)
+    assert ex.request(AGENT, WINDOW, "timeout", mission=SLUG, task_id=TASK_ID)
+
+    with _HeldLock(sandbox.queue):
+        deadline = time.monotonic() + 60
+        settled = False
+        while time.monotonic() < deadline:
+            started = time.monotonic()
+            ex.process_all()
+            cycle = time.monotonic() - started
+            assert cycle < 20, f"1 cycle が {cycle:.0f}s 止まった (ロック待ち)"
+            if not ex.has_marker(AGENT):
+                settled = True
+                break
+        assert not settled, "ロックを取れていないのに後始末を完了扱いにした"
+        prog = read_json_file(sandbox, AGENT)
+        assert prog.get("phase") == "terminated", (
+            f"ロック待ちを後始末の失敗として扱っている: {prog.get('phase')}")
+
+    # ロックが空けば次の cycle で普通に完了する (保留に出口がある)。
+    for _ in range(10):
+        ex.process_all()
+        if not ex.has_marker(AGENT):
+            break
+    assert not ex.has_marker(AGENT), "ロックが空いても後始末が再開されない"
+    assert sandbox.task_status() == "pending"
+
+
+def read_json_file(sandbox, agent):
+    import lib_retirement as lr
+    return lr.read_json(lr.progress_path(sandbox.registry, agent)) or {}

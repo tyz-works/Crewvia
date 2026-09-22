@@ -24,9 +24,11 @@ set -euo pipefail
 #                            [--description <text>] [--reset]
 #   plan.sh retire <task_id> --agent <name> --started-at <generation>
 #                            [--mission <slug>] [--outcome reset|needs-director]
-#                            [--reason "<1 行>"]
+#                            [--reason "<1 行>"] [--no-wait]
 #                              実行アイデンティティで束縛した後始末。前提が外れたら
 #                              1 バイトも書かずに exit 3 (詳細は cmd_retire)
+#                              --no-wait: キューロックを待たずに諦め exit 4。
+#                              待てない常駐デーモン (watchdog) 用
 #   plan.sh status [--mission <slug>] [--all]
 #   plan.sh archive <slug>
 
@@ -839,7 +841,23 @@ def list_tasks(slug, base_dir=None):
 # Locking
 # ---------------------------------------------------------------------------
 
-def with_lock(callback):
+#: 「ロックを取れなかったので 1 バイトも書かなかった」を表す終了コード。
+#: 1 (plan.sh 側の異常) とも 3 (前提不成立 = もう何も owed でない) とも区別する。
+#: 呼び出し側 — 常駐デーモンの中で待てない経路 — は「次のサイクルで再試行」に
+#: 倒せる。3 と混ぜると「もう用は無い」と読まれて後始末の義務が捨てられる。
+LOCK_BUSY = 4
+
+
+def with_lock(callback, nonblocking=False):
+    """キューロックの下で callback を実行する。
+
+    nonblocking=True は「待てない呼び出し側」専用の取得方法である。
+    watchdog の retirement は監視ループの中から plan.sh を同期で呼ぶので、
+    ブロッキング取得だと**混んでいるキュー 1 つが全 Worker の監視を止める**
+    (marker 1 件につき subprocess timeout まで)。デーモンにとっては
+    「取れなければ次のサイクルで」の方が正しく、待つ価値のある仕事が無い。
+    取れなかった場合は exit LOCK_BUSY で返り、1 バイトも書かない。
+    """
     try:
         os.makedirs(QUEUE_DIR, exist_ok=True)
     except OSError as e:
@@ -852,7 +870,17 @@ def with_lock(callback):
             f"  hint: check write permission on {QUEUE_DIR}, or remove a stale lock file."
         )
     try:
-        fcntl.flock(lf, fcntl.LOCK_EX)
+        if nonblocking:
+            try:
+                fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                die(
+                    f"[plan.sh] queue lock {LOCK_FILE} is held by another process "
+                    f"— --no-wait なので待たずに諦めました (何も変更していません)",
+                    LOCK_BUSY,
+                )
+        else:
+            fcntl.flock(lf, fcntl.LOCK_EX)
         try:
             return callback()
         finally:
@@ -3223,7 +3251,7 @@ RETIRE_RETIRABLE_STATUS = 'in_progress'
 def cmd_retire(args):
     """plan.sh retire <task_id> --agent <name> --started-at <generation>
                                 [--mission <slug>] [--outcome reset|needs-director]
-                                [--reason "<1 行>"]
+                                [--reason "<1 行>"] [--no-wait]
 
     「この実行 (mission, task, worker, 世代) を終了扱いにして後始末する」を
     1 つの操作として提供する。card の status 書き換えと assignment の撤去は
@@ -3266,6 +3294,7 @@ def cmd_retire(args):
         '--started-at': 'value',
         '--outcome': 'value',
         '--reason': 'value',
+        '--no-wait': 'bool',
     })
 
     if not positional:
@@ -3374,7 +3403,7 @@ def cmd_retire(args):
         if verdict == ASSIGN_ABSENT:
             print(f"[plan.sh] assignment/{agent} は既にありませんでした")
 
-    with_lock(_do)
+    with_lock(_do, nonblocking=bool(opts.get('--no-wait')))
 
 
 # ---------------------------------------------------------------------------

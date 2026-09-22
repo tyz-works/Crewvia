@@ -829,6 +829,141 @@ RED であることは、同じテストファイルを修正前の `scripts/` �
 assignment 本体と `.identity` サイドカー、card の `started_at` を必ず書くので、
 本体だけ置いた fixture は本番より弱い状態を試していた。
 
+## 6-6. 猶予期間のあいだに世界が動く (t025, 2026-09-22)
+
+t012 (Codex) の 4 巡目。**これまでの 9 件とは型が違う。** 1〜3 巡目は
+「誰を終わらせるのか」の束縛 (identity) と「何を証拠とするか」の強度で、
+どちらも t021 / t024 で構造的に閉じた。4 巡目に出た 3 件はそのどちらも通る。
+壊れるのは、**退役が一瞬の出来事ではなくなった**からである — t002 が判定と
+着弾のあいだに猶予期間を入れ、その 60 秒のあいだに queue も他のデーモンも
+動き続ける。
+
+| 指摘 | 前提が崩れる経路 | 閉じ方 |
+|---|---|---|
+| P1-1 | 猶予期間中に Worker が次の task を pull する | 割り当てを止める (dispatcher) + assignment の世代で再照合 (下 (1)) |
+| P1-2 | 2 つのデーモンが同時に request を書く | create-if-absent の原子操作 + `request_id` 束縛 (下 (2)) |
+| P2  | plan.sh のブロッキング flock を cycle 内で待つ | `--no-wait` で諦めて次 cycle (下 (3)) |
+
+### (1) Worker はプロセスではなく「その実行」である (P1-1)
+
+`_guard()` は task_id を持つ request について assignment チェックを免除し、
+pane identity だけを見ていた。timeout retirement は「assignment を持っている
+Worker」が対象なので、存在することを理由に免除するのは正しい。**どの実行の
+assignment かを問わなかったのが誤り**である。
+
+猶予期間中に Worker が生き返って `plan.sh done` を通し、次の task を pull
+すると:
+
+- pane の PID も created_at も**変わらない**ので R7 は素通りする
+- watchdog は**新しい task を実行中の Worker に SIGTERM を撃つ**
+- 後始末は元の task しか見ないので、**新しい task は in_progress のまま
+  宙に浮く** — 誰も証拠を持っていない幽霊 task が 1 枚増える
+
+閉じ方は 2 段。**本命は dispatcher 側**で、`has_marker()` が立っている Worker
+を割り当て対象から外す (`dispatch()` のループ冒頭)。t002 以前は判定と kill が
+1 秒差だったので割り込む窓が無かった — 窓を作ったのは t002 自身である。
+
+**backstop は watchdog 側**の `assignment_execution_verdict()`。
+`queue/assignments/<agent>` の本体 (`<mission>:<task>`) と `.identity`
+サイドカーの `started_at` を、request に記録した実行と突き合わせる。
+`plan.sh pull` が queue ロックの中で card と一緒に公開するものなので、
+「いまこの Worker が握っている実行」の唯一の一次情報である。
+
+一致以外はすべて discard に倒す (絶対 / 別の task / 別の世代 / 読めない)。
+これは保留ではなく**決着**であることが重要で、保留にすると `has_marker()` が
+立ったままになり、誰も再要求できない Worker が残る。discard なら marker が
+消え、本当に止まっているなら次の cycle で card から timeout が再判定される。
+
+**既に別 task を pull されていた場合、退役の側を取り消す**ことにした。新しい
+task を pending に戻す選択肢もあるが、それは「生きている Worker が作業中の
+card を、曖昧さを理由に巻き戻す」ことであり、このモジュールが 9 件かけて
+やめたことそのものである。加えて退役要求の前提 (この Worker はこの task で
+止まっている) は、Worker が自分で `done` を書いた時点で**反証されている** —
+取り消すのに推測は要らない。
+
+### (2) request の生成そのものが競合である (P1-2)
+
+`has_marker()` の確認と `request()` の書き込みが分かれており、`request()` は
+無条件に `os.replace` していた。dispatcher と watchdog は**どちらも**書き手
+なので、両方が「marker 無し」を観測してから両方が書ける。後から書いた方が
+先の request を黙って差し替える。
+
+watchdog が最初の request に対して progress を作った後でも起きる。progress は
+最初の request の PID と task 証拠を持つのに、後続ステップは差し替わった
+request を読み、`_settle_terminated()` は差し替え側の mission/task/世代を
+優先する。結果は「timeout の後始末義務が捨てられる」か、より悪く
+**「別の退役の証拠が、いま動いている実行に適用される」**。
+
+- 生成は `write_json_exclusive()` — temp に完成品を書いてから `os.link` で
+  publish する。EEXIST なら負け。`O_EXCL` + 後から書き込みにしなかったのは、
+  負けた側が**空または書きかけの request を観測しうる**ため:
+  `read_json()` は壊れた文書に `None` を返し、`_advance()` はその `None` を
+  「request が無い」= 別の分岐として読む。リトライではない。
+- request には `request_id` (uuid) を持たせ、progress が複写する。両者の id が
+  食い違う組は**別の退役**であり、証拠を混ぜない (`_read_pair()`)。混ぜない
+  とは、progress を自分の証拠だけで完走させ (`_orphaned()` と同じ経路)、
+  request の方は**消さずに**置いておく — それは誰かの生きた依頼なので、
+  progress が片付いてから `_start()` で自分の番を取る。
+
+### (3) cycle の中で queue ロックを待たない (P2)
+
+`_settle_terminated()` は `plan.sh retire` を同期で呼ぶ。plan.sh の
+`with_lock()` は**ブロッキングの排他 flock** なので、queue が混んでいると
+marker 1 件につき subprocess timeout (旧 120 秒) まで**全 Worker の監視と
+退役処理が止まる**。リトライのたびに繰り返される。R2 が消したはずの 70 秒
+ストールより悪い。
+
+`plan.sh retire --no-wait` を足し、`with_lock(nonblocking=True)` が
+`LOCK_NB` で取れなければ **1 バイトも書かずに exit 4 (`LOCK_BUSY`)** で返る。
+呼び出し側はこれを「次の cycle で聞き直す」と読む。
+
+終了コードを 3 (`PRECONDITION_UNMET`) と分けたのが肝で、3 は「もう何も owed
+でない」を意味し marker を settle させる。ロック待ちを 3 と混ぜると、混んで
+いるだけの queue に対して**後始末の義務が捨てられる**。1 (plan.sh の異常) と
+も分ける — 1 は `_cleanup_failed()` に落ちて attempt を消費し Director を
+起こすので、じきに解放されるロックに対してそれをやるのは過剰である。
+
+保留の出口は他と同じ `_check_stall()`: 1800 秒動かなければ Director に 1 通。
+
+subprocess timeout 自体も 120 → 30 秒 (`CLEANUP_COMMAND_TIMEOUT`) に下げた。
+ロック待ちが無くなった以上、これは「インタプリタが固まった」等の残りの
+病態に対するベルトであり、120 秒は cycle の有界性としては大きすぎる。
+
+### 回帰テストの形
+
+並行性の 2 件は**実際に競わせる**。再現を仕込みで代用すると、直したのが
+競合なのか仕込みなのか区別できない。
+
+- `test_red_worker_that_pulled_another_task_during_the_grace_period_is_spared`
+  — 猶予期間中に**本物の plan.sh で** `done` → `pull` を通し、Worker が生きて
+  いること・新しい task が in_progress のままであること・その assignment が
+  残っていることを見る。
+- `test_red_worker_that_finished_its_task_during_the_grace_period_is_spared` /
+  `test_red_same_card_pulled_again_by_a_successor_is_a_different_execution`
+  — assignment が消えた場合と、同じ card の別世代を後任が握った場合。
+- `test_red_concurrent_requests_do_not_overwrite_each_other`
+  — 8 プロセスから同時に `request()` を叩き、「書いた」と答えるのが 1 本だけで、
+  ディスクに残るのがその 1 本であることを見る。
+- `test_red_progress_is_bound_to_the_request_that_created_it`
+  — progress を作った後に request を別物 (別 task・別世代) へ差し替え、
+  **その別の実行が巻き戻らない**ことを見る。
+- `test_red_plan_sh_retire_can_refuse_to_wait_for_the_queue_lock` /
+  `test_red_cleanup_does_not_block_the_cycle_on_the_queue_lock`
+  — 別プロセスでロックを握ったまま、plan.sh が即 exit 4 で返ること、
+  1 cycle が有界であること、ロックが空けば後始末が再開することを見る。
+- `test_timeout_retirement_on_the_same_execution_still_terminates`
+  — 逆向きの担保。上の 3 本は全部「前提が外れたら殺さない」なので、これが
+  無いと「何も殺さない」に倒しただけで全部緑になる。
+- `tests/test_dispatcher_retirement_exclusion.py`
+  — dispatcher 側。`dispatcher.sh` の heredoc に埋め込まれた**本物の python を
+  exec() して `dispatch()` を回す** (`tests/test_orphan_daemon_guard.py` と
+  同じ方式)。ロジックを複製したテストは dispatcher.sh を直したことを一切
+  証明しないため使わない。marker 有りで割り当てないこと、marker が片付けば
+  復帰すること、marker 無しなら従来どおり割り当てることを対で押さえる。
+
+RED であることは 7 本 + dispatcher 3 本を修正前の `scripts/` に対して流して
+確認した (全 fail → 修正後 53 passed)。
+
 ---
 
 ## 7. 参照

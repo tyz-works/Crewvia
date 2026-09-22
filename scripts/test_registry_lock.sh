@@ -86,6 +86,13 @@ root = pathlib.Path(sys.argv[1])
 exclude = {
     root / "scripts" / "lib_registry.py",
     root / "scripts" / "test_registry_lock.sh",
+    # pytest の tmp_path に使い捨ての registry を 1 度だけ組み立てるテスト。
+    # shell の `>` による初期化を対象外にしたのと同じ理由で対象外にする:
+    # 存在しないファイルを作る一回きりの書き込みで、並行書込の相手が
+    # 存在しない (repo の registry/workers.yaml には一切触れない)。
+    # 迂回を隠す余地を残さないよう、ファイル単位の明示列挙に留める
+    # — tests/ 全体を外すと本物の迂回がテストの下に隠れる。
+    root / "tests" / "test_dispatcher_retirement_exclusion.py",
 }
 proximity = 15
 found = []

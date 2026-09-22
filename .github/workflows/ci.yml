@@ -93,6 +93,23 @@ jobs:
       - name: scripts/test_registry_lock.sh
         run: bash scripts/test_registry_lock.sh
 
+  dispatcher-notify-test:
+    name: Dispatcher Notify Regression Tests (t027/t031, F3)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: git identity (harness runs `git init` in isolated fixtures)
+        run: |
+          git config --global user.email "ci@crewvia.local"
+          git config --global user.name "Crewvia CI"
+
+      - name: scripts/test_dispatcher_needs_director_notify.sh
+        run: bash scripts/test_dispatcher_needs_director_notify.sh
+
+      - name: scripts/test_dispatcher_notify.sh
+        run: bash scripts/test_dispatcher_notify.sh
+
   bats:
     name: Bats Unit Tests
     runs-on: ubuntu-latest

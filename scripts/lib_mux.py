@@ -202,6 +202,117 @@ class _Backend:
 
 
 # ---------------------------------------------------------------------------
+# Pane liveness — is anything actually running in there?
+# ---------------------------------------------------------------------------
+#
+# Both backends put a *shell* in the pane and type the command into it, so the
+# daemon (or the agent) is the shell's child.  When it dies the shell survives
+# and the pane keeps its label: a husk.  A pane's name therefore says nothing
+# about whether anything is running in it, and code that reads the name as
+# life will hold forever on the ordinary shape of a crash (t006 QA FAIL-1).
+#
+# herdr answers this with `pane process-info`.  tmux has no equivalent, so the
+# answer is read from /proc starting at the pane's shell pid — which is the
+# stronger source anyway, since the kernel answers without the backend.
+
+# Process names that can be a pane's *idle* shell.  A leading '-' (login shell,
+# e.g. "-bash") is stripped before the lookup.  The name alone is never enough:
+# `bash scripts/dispatcher.sh` also reports name "bash", so something else has
+# to separate an idle shell from a shell running a script — argv length for
+# herdr (_is_idle_shell_process), the absence of children for tmux
+# (_pane_shell_is_idle).
+_SHELL_PROCESS_NAMES = frozenset({
+    "bash", "sh", "zsh", "fish", "dash", "ksh", "tcsh", "csh",
+})
+
+
+def _proc_stat_tail(pid, proc_root: str = "/proc") -> Optional[List[str]]:
+    """`/proc/<pid>/stat` from field 3 on, or None when it cannot be read.
+
+    comm (field 2) is parenthesised and may itself contain spaces and ')', so
+    the split is after the LAST ')'.  Same parse as
+    lib_daemon_watch.process_generation() — kept here rather than imported to
+    avoid a cycle (lib_daemon_watch imports this module).
+    """
+    try:
+        stat = Path(proc_root, str(int(pid)), "stat").read_text(encoding="utf-8")
+    except (OSError, TypeError, ValueError):
+        return None
+    try:
+        return stat[stat.rindex(")") + 2:].split()
+    except ValueError:
+        return None
+
+
+def _process_comm(pid, proc_root: str = "/proc") -> Optional[str]:
+    """The process name between the parentheses of `/proc/<pid>/stat`."""
+    try:
+        stat = Path(proc_root, str(int(pid)), "stat").read_text(encoding="utf-8")
+    except (OSError, TypeError, ValueError):
+        return None
+    try:
+        return stat[stat.index("(") + 1:stat.rindex(")")]
+    except ValueError:
+        return None
+
+
+def _live_children(pid, proc_root: str = "/proc") -> Optional[List[int]]:
+    """Live, non-zombie children of `pid`; None when /proc cannot be listed.
+
+    `None` and `[]` are different answers and callers must keep them apart:
+    "could not look" is not "nothing there" — the distinction this repo has
+    now had to make at three separate layers.
+    """
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return None
+    try:
+        entries = list(Path(proc_root).iterdir())
+    except OSError:
+        return None
+    found: List[int] = []
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        tail = _proc_stat_tail(entry.name, proc_root)
+        if tail is None or len(tail) < 2:
+            continue          # exited between listing and read — not a child
+        if tail[0] == "Z":
+            continue          # a zombie has already stopped running
+        try:
+            if int(tail[1]) == pid:
+                found.append(int(entry.name))
+        except ValueError:
+            continue
+    return sorted(found)
+
+
+def _pane_shell_is_idle(pane_pid, proc_root: str = "/proc") -> bool:
+    """True only when `pane_pid` is provably a shell with nothing running under it.
+
+    Two things must hold, and either one alone would be wrong:
+
+      - the pid is a **shell**.  A pane whose root process is not a shell was
+        not left behind by a dead child; treating it as idle would relaunch on
+        top of whatever it is.
+      - it has **no live children**.  This is what separates a prompt from a
+        shell running work, and unlike the foreground-process-group test it
+        also counts a job that was backgrounded.
+
+    Every unreadable answer returns False (= busy).  The direction to fail in
+    is "do not start a second one" (knowledge/daemon-authority.md §7-1).
+    """
+    comm = _process_comm(pane_pid, proc_root)
+    if comm is None or comm.lstrip("-") not in _SHELL_PROCESS_NAMES:
+        return False
+    children = _live_children(pane_pid, proc_root)
+    if children is None:
+        return False
+    return not children
+
+
+# ---------------------------------------------------------------------------
 # TmuxBackend
 # ---------------------------------------------------------------------------
 
@@ -215,7 +326,9 @@ class TmuxBackend(_Backend):
     ----------------------------------
     spawn(name, cmd, cwd=None, env=None) -> bool
         Create a new window named `name` in the session and run `cmd`.
-        Returns True on success, False if the window already existed or on error.
+        Returns True on success, False on error or when a window of that name
+        already holds a live process.  A window holding only an idle shell (a
+        husk) is reused: `cmd` is typed into it and True is returned.
 
     send(name, text) -> bool
         Send `text` to the window as a 2-step: send-keys text, 0.1s sleep, send-keys Enter.
@@ -253,6 +366,23 @@ class TmuxBackend(_Backend):
     def _target(self, name: str) -> str:
         return f"{_session()}:{name}"
 
+    def _pane_has_live_process(self, name: str) -> bool:
+        """True if the window named `name` is running anything beyond its shell.
+
+        The tmux counterpart of HerdrBackend._pane_has_live_process, and the
+        reason spawn() can tell a husk from an occupied window on both
+        backends.  tmux offers no `process-info`, so the pane's shell pid
+        (`#{pane_pid}`) is the entry point and /proc answers the rest.
+
+        Fail-safe: a pid we cannot obtain answers True, so an unreadable
+        window is treated as occupied and never relaunched on top of.
+        """
+        pane_pid = self.pid(name)
+        if pane_pid is None:
+            self._warn(f"could not read pane pid for {name!r} — treating pane as busy")
+            return True
+        return not _pane_shell_is_idle(pane_pid)
+
     def available(self) -> bool:
         return shutil.which("tmux") is not None
 
@@ -280,7 +410,15 @@ class TmuxBackend(_Backend):
         Mirrors start.sh L468-481:
           - has-session → new-session (if session missing) → new-window
           - send-keys <cmd> + Enter
-        Returns False (without error) if window already exists.
+
+        Returns False (without error) when a window of this name already holds
+        a live process.  When the window exists but holds nothing but an idle
+        shell — the husk every ordinary crash leaves behind, since the daemon
+        is the pane shell's child — the command is typed into that window and
+        True is returned, which is what HerdrBackend.spawn already did.  The
+        two backends answering differently here is how "the peer is dead but
+        its tab is still listed" became un-actionable on tmux (t006 QA
+        FAIL-1).
         """
         session = _session()
         try:
@@ -304,8 +442,17 @@ class TmuxBackend(_Backend):
                     capture_output=True, text=True, timeout=5,
                 )
                 if existing.returncode == 0 and name in existing.stdout.splitlines():
-                    # Window already present → no-op, return False per spec
-                    return False
+                    if self._pane_has_live_process(name):
+                        return False  # live one in there → no-op, per spec
+                    # Husk: the shell outlived whatever it was running.
+                    # Relaunching in place keeps the window (and its position)
+                    # and is what lets a peer — or ./crewvia — actually revive
+                    # a daemon that merely crashed.
+                    self._warn(
+                        f"spawn {name!r}: window holds only an idle shell "
+                        "(crashed?) — relaunching in place"
+                    )
+                    return self.send(name, cmd)
                 r = subprocess.run(
                     ["tmux", "new-window", "-t", session, "-n", name],
                     capture_output=True, timeout=5,
@@ -475,15 +622,6 @@ _HERDR_CACHE_DIR_NAME = Path("registry") / "mux"
 
 # Verified herdr version.
 _HERDR_VERIFIED_VERSION = "0.9.0"
-
-# Process names that can be a pane's *idle* shell.  A leading '-' (login shell,
-# e.g. "-bash") is stripped before the lookup.  The name alone is not enough:
-# `bash scripts/dispatcher.sh` also reports name "bash", so the argv length is
-# what separates an idle shell from a shell running a script (see
-# _is_idle_shell_process).
-_SHELL_PROCESS_NAMES = frozenset({
-    "bash", "sh", "zsh", "fish", "dash", "ksh", "tcsh", "csh",
-})
 
 
 def _is_idle_shell_process(proc: dict) -> bool:

@@ -1230,12 +1230,11 @@ SIGTERM → **10s 待機** → SIGKILL の間、main loop を最大 70 秒ブロ
 | 2 | 直前の respawn から `respawn_grace_seconds` 経過 | `grace` |
 | 3 | heartbeat が stale、または最初から無い | `healthy` |
 | 4 | **プロセスが存在しない** | `hold` |
-| 5 | **mux のタブが無い** | `hold` |
-| 6 | flap しきい値未満 | `flapping` (§7-6) |
+| 5 | flap しきい値未満 | `flapping` (§7-6) |
 
-**4 と 5 は両方必要**である。順序にも意味があり、4 を先に訊く。
+**生死の証拠は 4 だけ**である。タブの有無は条件に入らない (理由は §7-3-1)。
 
-**4 — プロセス (主証拠).** 2 つの独立した probe を使い、どちらか一方でも「生きている」と
+**4 — プロセス (唯一の証拠).** 2 つの独立した probe を使い、どちらか一方でも「生きている」と
 答えたら respawn しない。
 
 - 記録 PID を **世代ごと** 照合する (`instance_alive()`)。PID は再利用されるので、
@@ -1253,20 +1252,57 @@ SIGTERM → **10s 待機** → SIGKILL の間、main loop を最大 70 秒ブロ
 この probe を主証拠に置くのは、**カーネルが mux backend を介さずに答える**からである。
 バックエンドの不調から独立している唯一の信号がこれしかない。
 
-**5 — mux のタブ (従証拠).** `mux.list()` は tmux / herdr のどちらも失敗・タイムアウトを
-黙って `[]` に変換する (`TmuxBackend.list` は `returncode != 0` と 5s タイムアウト、
-`HerdrBackend.list` は workspace 解決失敗と 10s タイムアウト)。したがって
-**空のリストは権威を持たない** — 空でない時だけ「問い合わせは成功した」と言える。
-`_listing_authority_for_cycle()` (§6-3 (1)) と同じ判断を、ここでも同じ理由で採る。
+### 7-3-1. タブの名前を生存の証拠に使わない (t035 / t006 QA FAIL-1 の差し戻し)
+
+当初は 4 に加えて「**権威ある窓一覧に名前が無い**」を必要条件にしていた
+(`mux.list()` は両 backend とも失敗を黙って `[]` に変換するので、空でない一覧だけを
+権威として扱う、という §6-3 (1) と同じ形)。**この条件が本番では永久に満たされない。**
+
+`start.sh` も `TmuxBackend.spawn` も `HerdrBackend.spawn` も、**pane にシェルを置いて
+そこへコマンドを流し込む**。だからデーモンは pane シェルの子であり、デーモンが落ちても
+シェルは生き残り、pane は label を保ったまま残る (= husk)。本番実測:
+
+    pid 1770898 = dispatcher → PPid 1769235 = /bin/bash → PPPid 1769218 = herdr server
+    pid  719042 = watchdog   → PPid  718789 = /bin/bash → PPPid 1769218 = herdr server
+
+`HerdrBackend.list()` は pane の label を**生死を見ずに**返す。つまり名前は常に在り、
+判定は必ず husk 分岐へ落ちる。t006 QA は隔離環境でこれを実測した: プロセスだけを
+kill した 4 分間、respawn は **0 回**、Director に届くのも既定 1800 秒後の
+「自動 respawn は安全側で止めています」= 人を呼ぶ 1 通だけだった。
+タブごと消した場合だけ設計どおり動く。
+
+husk を「herdr サーバー再起動時に残る稀な状態」と見積もっていたのが誤りで、
+**husk はあらゆるクラッシュの通常形**である。fail closed の向き自体は正しいが、
+この条件では相互監視の主目的 (片系が落ちたら起こし直す) が一度も発火しない。
+「起こしすぎない」ために「一度も起こさない」になっていた。
+
+**決定: 窓一覧を判定から外し、プロセス層を唯一の生死の証拠にする。**
+窓一覧は respawn の宛先を決めるためだけに使う。
+
+二重起動への最後の防壁は、名前の有無ではなく **その pane の中身の生死** に移した。
+`mux.spawn()` が既存 pane を見つけたとき:
+
+| backend | husk の判別 | husk だった場合 |
+|---|---|---|
+| herdr | `pane process-info` の foreground_processes が idle shell だけか (`_is_idle_shell_process`) | その pane で `pane run` して True |
+| tmux | pane シェルの pid (`#{pane_pid}`) から `/proc` を読み、**シェルであり、生きた子を持たない**か (`_pane_shell_is_idle`) | その窓へ send-keys して True |
+
+どちらも読めなければ「使用中」に倒す (= spawn は False)。名前より強い証拠であり、
+backend 間で強さが揃う。tmux 側は t035 で足した — それまでは tmux の spawn が
+「窓が在る」だけで無条件に False を返しており、husk を認めても tmux では何も
+起きなかった。
 
 `available()` / `server_running()` による救済は **あえて入れていない**。どちらも
 タイムアウトや例外で False を返すので、1 つの障害が両方を倒し、2 つの失敗が互いを
 補強して「相手は死んだ」の権威になってしまう。それは §6-3 (1) で塞いだ欠陥を
 1 層下で再生産することである (memory: `fail-closed-guard-can-recreate-the-defect`)。
 
-タブが**在る**のにプロセスが無い場合 (herdr が再起動時に残す空ペイン = husk) も
-respawn しない。spawn がその状況でどう振る舞うかは backend 依存で、
-「起こしたつもりで何も起きていない」が成立しうるため、保留して人に上げる。
+回帰は**実プロセスでしか置けない**。偽の mux は spawn 後に窓を消すか残すかを
+テスト側が決められるので、この欠陥をテスト自身が隠せる。
+`tests/test_daemon_husk_respawn.py` は実 tmux 窓で stub デーモンを起こし、
+**プロセスだけ** を SIGKILL して窓が残っていることを確認したうえで 1 cycle を回す。
+判定表側の双子は `test_a_husk_tab_does_not_veto_the_respawn` と
+`test_a_refused_spawn_holds_instead_of_claiming_a_respawn`。
 
 ### 7-4. 保留には必ず出口を付ける
 
@@ -1339,6 +1375,16 @@ env はコマンド文字列に埋め込むしかなく (memory: `lib-mux-spawn-
 herdr はさらにサーバー起動時の env を全ペインに継承するため、「./crewvia で起動した
 デーモン」と「相手に起こされたデーモン」が別の backend を向く事故が現実に起こりうる。
 
+運ぶのは `CREWVIA_MUX` だけでは足りない。**backend (どう話すか) と宛先 (どこと話すか)
+は別**で、`CREWVIA_TMUX_SESSION` / `CREWVIA_HERDR_WORKSPACE` が落ちると、起こされた
+デーモンは既定のセッション名にフォールバックし、`list()` が存在しないセッションを
+引いて空で返り、**相互監視が無言で恒久 hold に縮退する**。t006 QA が隔離環境で実際に
+踏んだ (`CREWVIA_MUX=tmux` だけが env に入り `tmux list-windows -t crewvia` が失敗)。
+本番は既定名なので露見しない = 既定以外を使い始めた瞬間に静かに壊れる形だった。
+`_SPAWN_ENV_VARS` に 3 つ並べ、値は必ず単一引用で囲って **データとして** 渡す
+(回帰: `test_spawn_command_carries_the_mux_destination_too` /
+`test_spawn_command_quotes_a_hostile_session_name`)。
+
 ### 7-8. しきい値 (`config/crewvia.yaml` の `daemons:`)
 
 | キー | 既定 | 意味 |
@@ -1354,12 +1400,12 @@ herdr はさらにサーバー起動時の env を全ペインに継承するた
 env での上書きは `CREWVIA_DAEMON_<KEY 大文字>` (例: `CREWVIA_DAEMON_MUTUAL_WATCH=0`)。
 
 **しきい値を詰めすぎないこと。** 1 回遅いサイクルが「死亡」に見えた瞬間、それは
-7-1 の二重起動である。stale 判定は respawn の入口にすぎず、そこから 4 と 5 の実在確認に
+7-1 の二重起動である。stale 判定は respawn の入口にすぎず、そこから 4 の実在確認に
 進むのだから、余裕を取っても検知が遅れるだけで見落としにはならない。
 
 ### 7-9. 回帰テストの形
 
-`tests/test_daemon_mutual_watch.py` (38 件)。観測の口 (`mux` / `/proc` 走査 / 時計 /
+`tests/test_daemon_mutual_watch.py`。観測の口 (`mux` / `/proc` 走査 / 時計 /
 自己同一性) をすべて注入可能にしてあるので、本番のデーモン・mux・registry を一切
 巻き込まずに判定表を全通りたどれる。タスク要件の 3 本柱は:
 

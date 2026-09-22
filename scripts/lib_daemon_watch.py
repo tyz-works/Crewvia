@@ -34,12 +34,22 @@ scripts/lib_daemon_watch.py — デーモンの相互監視 (t005)
 10s タイムアウトで、いずれも空リストを返す)。`available()` は tmux では PATH に
 バイナリがあるかしか見ず、`server_running()` もタイムアウト・例外で False を返す。
 これらの失敗を「相手が死んだ」の証拠に使うと、**バックエンドの一時的な不調が
-そのまま二重起動になる**。よって:
+そのまま二重起動になる**。よって死亡の証拠は **プロセスだけ** に置く。`/proc` は
+バックエンドを介さずカーネルが答えるので、mux の不調から独立している。
 
-  - 窓一覧は **空でない時だけ** 権威を持つ (`_listing_authority()`)。
-    空 = 「問い合わせに失敗した」と「本当に何も無い」の区別がつかない → 保留。
-  - 死亡の主証拠は **プロセス** に置く。`/proc` はバックエンドを介さず
-    カーネルが答えるので、mux の不調から独立している。
+**タブの名前は生存の証拠ではない (t035 / t006 QA FAIL-1)。** 両 backend とも pane に
+シェルを置いてそこへコマンドを流し込むので、デーモンは pane シェルの子である。
+デーモンが落ちてもシェルは生き残り、pane は label を保ったまま残る (= husk)。
+つまり**普通のクラッシュでは名前は必ず残る**。かつて「権威ある窓一覧に名前が無い」
+ことを死亡の必要条件にしていたが、それは実質「タブごと消えた時だけ起こす」であり、
+相互監視の目的 (片系が落ちたら起こし直す) が本番のプロセス構成で一度も発火しない、
+という無音の欠陥だった。
+
+窓一覧は**判定から外した** — この判定に `mux.list()` は登場しない。宛先の解決は
+`mux.spawn()` 側に任せ、二重起動に対する最後の防壁も名前の有無ではなく
+**その pane の中身の生死** に移した (herdr は `pane process-info`、tmux は pane
+シェルの pid から `/proc`)。名前より強い証拠であり、両 backend で同じ強さになる。
+`spawn()` が False を返す = 「生きたものが居るので断った」なので、そのまま保留する。
 
 **名前は同じでも中身は別物。** PID は再利用される。heartbeat に記録した PID が
 「存在する」だけでは同じデーモンである保証がないので、`/proc` の starttime を
@@ -61,13 +71,14 @@ scripts/lib_daemon_watch.py — デーモンの相互監視 (t005)
   3. heartbeat が stale (または最初から無い)
   4. **プロセスが存在しない** — 記録 PID が世代ごと不在 **かつ**
      `/proc` 走査が成功して 0 件。走査できなければ保留
-  5. **mux のタブが無い** — 権威ある (= 空でない) 窓一覧に名前が無い
-  6. flap しきい値に達していない
+  5. flap しきい値に達していない
 
-4 と 5 は両方必要である。タブ不在だけでは判定しない (バックエンドが黙って
-空を返すため)。プロセス不在だけでも判定しない — タブが残っているのに spawn
-すると、herdr が残した空ペイン (husk) の扱いが backend 依存になり、
-「起こしたつもりで何も起きていない」が起こりうる。その場合は保留して報告する。
+4 が唯一の生死の証拠である。走査が失敗したら (`None`) 保留 — 「見られなかった」は
+「居なかった」ではない。タブの有無は条件に入らない (上記「タブの名前は生存の証拠では
+ない」)。
+
+respawn したつもりで何も起きていない、を無くすために `mux.spawn()` の戻り値は必ず
+見る。False (= pane に生きたプロセスが居る / backend が断った) なら保留して報告する。
 
 CLI:
   python3 scripts/lib_daemon_watch.py spawn-cmd <dispatcher|watchdog>
@@ -260,15 +271,35 @@ def scan_daemon_pids(repo_root, name: str, *, proc_root="/proc",
 # Launch command — one source of truth, shared with start.sh
 # ---------------------------------------------------------------------------
 
-def spawn_command(name: str, repo_root, *, mux_mode: Optional[str] = None) -> str:
+#: Everything the launched daemon needs in order to talk to the *same* mux as
+#: its launcher.  CREWVIA_MUX alone decides the *backend* but not the
+#: *destination*: a daemon that inherits only the mode falls back to the
+#: default session / workspace name, and then every mux verb it performs lands
+#: somewhere nobody is looking — it would spawn its own peer into a session no
+#: one is attached to and report to a Director that isn't there.  The QA
+#: harness hit this for real (t006 QA FINDING-2); production is invisible to
+#: it only because production uses the default names.
+_SPAWN_ENV_VARS = ("CREWVIA_MUX", "CREWVIA_TMUX_SESSION", "CREWVIA_HERDR_WORKSPACE")
+
+
+def _sh_single_quote(value: str) -> str:
+    """`'...'` with embedded quotes escaped, so a session name cannot inject."""
+    return "'" + str(value).replace("'", "'\\''") + "'"
+
+
+def spawn_command(name: str, repo_root, *, env=None) -> str:
     """The exact command `start.sh` uses to launch `name`.
 
     `Mux.spawn()` takes an `env=` argument that **both backends ignore**, and
     herdr additionally replays its server's startup environment onto every new
     pane — so a daemon started by its peer would inherit whatever that server
     was born with rather than what the launcher meant.  The only thing that
-    reliably crosses the spawn boundary is the command text, so CREWVIA_MUX
-    travels inside it (start.sh's `_MUX_ENV_PREFIX`, same shape).
+    reliably crosses the spawn boundary is the command text, so the mux
+    variables travel inside it (start.sh's `_MUX_ENV_PREFIX`, same shape).
+
+    One `export` per variable, not one shared statement: the shape is asserted
+    on elsewhere, and a single joined statement changes when an unrelated
+    variable happens to be set in the caller's environment.
 
     start.sh calls this through the CLI instead of keeping its own copy: a
     literal in two places is how the launched and the respawned daemon come to
@@ -276,8 +307,10 @@ def spawn_command(name: str, repo_root, *, mux_mode: Optional[str] = None) -> st
     """
     repo_root = Path(repo_root)
     scripts = repo_root / "scripts"
-    mode = os.environ.get("CREWVIA_MUX", "") if mux_mode is None else mux_mode
-    prefix = f"export CREWVIA_MUX='{mode}'; " if mode else ""
+    env = os.environ if env is None else env
+    values = {var: str(env.get(var, "") or "") for var in _SPAWN_ENV_VARS}
+    prefix = "".join(f"export {var}={_sh_single_quote(value)}; "
+                     for var, value in values.items() if value)
     if name == DAEMON_DISPATCHER:
         body = f"bash '{scripts / 'dispatcher.sh'}'"
     elif name == DAEMON_WATCHDOG:
@@ -729,20 +762,12 @@ class DaemonWatch:
                 f"{peer} heartbeat is stale ({_fmt(down_seconds)}) but pid(s) "
                 f"{','.join(str(p) for p in live)} are still running it")
 
-        # --- evidence (a): the mux tab ------------------------------------
-        windows = self._list_windows()
-        if windows is None:
-            return self._hold(
-                state, now,
-                f"window list came back empty — both backends turn a failed "
-                f"query into [], so this cycle cannot tell an outage from "
-                f"{peer} being gone")
-        if peer in windows:
-            return self._hold(
-                state, now,
-                f"no {peer} process is running, but a tab named {peer!r} is still "
-                f"listed (a herdr husk?) — spawning into it is backend-dependent, "
-                f"so this needs ./crewvia or a hand")
+        # No window-list check stands between here and the spawn.  See the
+        # "the tab is not evidence" note in the module docstring: a pane's
+        # name outlives the process inside it, so requiring the name to be
+        # absent meant never respawning after an ordinary crash.  The pane's
+        # *contents* still guard the spawn — mux.spawn() refuses a pane that
+        # holds a live process — which is a stronger check than the name was.
 
         # --- flap guard -----------------------------------------------------
         entries = self._flap_entries()
@@ -792,29 +817,6 @@ class DaemonWatch:
         return Verdict(ACTION_RESPAWNED, f"respawned {peer}", down_seconds)
 
     # -- helpers -------------------------------------------------------------
-
-    def _list_windows(self) -> Optional[List[str]]:
-        """The window list, or None when it carries no authority.
-
-        A non-empty list proves the query worked.  An empty one proves
-        nothing: `TmuxBackend.list()` returns [] on a non-zero exit and on its
-        5s timeout, `HerdrBackend.list()` on a failed workspace lookup and on
-        its 10s `pane_list` timeout.  Reading that as "the peer is gone" makes
-        every backend hiccup a double start — the shape of
-        `_listing_authority_for_cycle()` in lib_retirement, same reasoning.
-
-        Deliberately no `available()` / `server_running()` rescue: both return
-        False on a timeout as readily as on a dead backend, so a single outage
-        would take out the probe too and the two failures would corroborate
-        each other into authority (memory:
-        fail-closed-guard-can-recreate-the-defect).
-        """
-        try:
-            windows = self.mux.list()
-        except Exception as exc:
-            self.log(f"[daemon-watch] window list failed: {exc!r}")
-            return None
-        return list(windows) if windows else None
 
     def _clear_hold(self, state: dict) -> None:
         if state.get("hold_since") is not None:

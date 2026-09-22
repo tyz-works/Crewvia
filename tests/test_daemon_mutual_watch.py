@@ -13,16 +13,23 @@ tests/test_daemon_mutual_watch.py
    2 つの dispatcher が割り当てる。
 3. **flap で止まる** — `test_flap_guard_stops_respawning`
 
-## 証拠の強度についての方針 (Director 追記 2026-09-22 / PR #205 の教訓)
+## 証拠の強度についての方針 (t035 で改訂 / 元は PR #205 の教訓)
 
-`mux.list()` は両 backend とも失敗を黙って `[]` に変換し、`available()` は
-tmux ではバイナリの有無しか見ない。よって「窓一覧に載っていない」は単体では
-死亡証明にならない。ここでのテストは次の 2 点を固定する:
+死亡の証拠は **プロセスだけ** (/proc 走査 + 記録 PID の世代照合) で、走査が失敗した
+cycle は hold する (`test_unreadable_proc_holds`)。
 
-- 観測できなかった cycle (`list()` が空) では **respawn しない** (hold)。
-  `test_unobservable_window_list_holds`
-- 死亡の主証拠は **プロセス** (/proc 走査 + 記録 PID の世代照合) であり、
-  走査が失敗した cycle も hold する。`test_unreadable_proc_holds`
+**窓一覧は証拠に入らない** (t006 QA FINDING-1)。両 backend とも pane にシェルを置いて
+そこへコマンドを流し込むので、デーモンはシェルの子であり、落ちても pane と label は
+残る (husk)。「名前が無いこと」を死亡の必要条件にすると、**普通のクラッシュでは
+一度も respawn しない**。よって:
+
+- husk タブは respawn を妨げない。`test_a_husk_tab_does_not_veto_the_respawn`
+- 二重起動に対する最後の防壁は `mux.spawn()` の戻り値 (= その pane の中身が生きて
+  いるか) に移した。`test_a_refused_spawn_holds_instead_of_claiming_a_respawn`
+
+実プロセス・実 tmux 窓で同じことを確かめるのは
+`tests/test_daemon_husk_respawn.py` — 偽の mux では husk を作れないので、
+判定表のテストだけでは FINDING-1 は二度と捕まらない。
 
 ## 同名別インスタンス (identity 束縛)
 
@@ -240,6 +247,43 @@ def test_spawn_command_embeds_env_in_the_command_string(repo, monkeypatch):
     assert "CREWVIA_MUX" not in dw.spawn_command("dispatcher", repo)
 
 
+def test_spawn_command_carries_the_mux_destination_too(repo):
+    """The backend alone is not enough — the daemon must reach the SAME session.
+
+    A respawned daemon that inherits only CREWVIA_MUX falls back to the
+    default session / workspace name.  Its `list()` then queries a session
+    that isn't there, comes back empty, and mutual watch degrades to a
+    permanent hold without saying a word (t006 QA FINDING-2, hit for real in
+    the isolated harness).  Production happens to use the default names, which
+    is exactly why this would have stayed invisible.
+    """
+    cmd = dw.spawn_command("watchdog", repo, env={
+        "CREWVIA_MUX": "tmux", "CREWVIA_TMUX_SESSION": "qa-t006-s1"})
+    assert "export CREWVIA_MUX='tmux';" in cmd
+    assert "export CREWVIA_TMUX_SESSION='qa-t006-s1';" in cmd
+
+    cmd = dw.spawn_command("watchdog", repo, env={
+        "CREWVIA_MUX": "herdr", "CREWVIA_HERDR_WORKSPACE": "crewvia-qa"})
+    assert "export CREWVIA_HERDR_WORKSPACE='crewvia-qa';" in cmd
+    assert "CREWVIA_TMUX_SESSION" not in cmd, "an unset variable was exported empty"
+
+
+def test_spawn_command_quotes_a_hostile_session_name(repo):
+    """A session name is data, not shell.  It is exported, never executed."""
+    hostile = "a'; echo PWNED; '"
+    cmd = dw.spawn_command("watchdog", repo, env={
+        "CREWVIA_MUX": "tmux", "CREWVIA_TMUX_SESSION": hostile})
+    # Everything up to the last "; " is the export prefix; the body follows.
+    exports = cmd[:cmd.rindex("; ") + 2]
+    out = subprocess.run(
+        ["bash", "-c", exports + 'printf %s "$CREWVIA_TMUX_SESSION"'],
+        capture_output=True, text=True, timeout=10)
+    assert out.returncode == 0, out.stderr
+    # Exact equality is the proof: had the quoting broken, `echo PWNED` would
+    # have run and printed its own line ahead of printf's output.
+    assert out.stdout == hostile, out
+
+
 # ---------------------------------------------------------------------------
 # 2. 生きている相手は起こさない (= 二重起動を絶対に起こさない)
 # ---------------------------------------------------------------------------
@@ -327,23 +371,52 @@ def test_instance_alive_compares_generation():
     assert dw.instance_alive(None, gen) is False
 
 
-def test_unobservable_window_list_holds(repo):
-    """An empty window list is an outage and a death at the same time.
+def test_a_husk_tab_does_not_veto_the_respawn(repo):
+    """A tab named after the peer is NOT evidence that the peer is alive.
 
-    Both backends turn a failed query into `[]`, so emptiness carries no
-    authority: without at least one window to prove the query worked, the
-    cycle holds instead of spawning into a backend it cannot see.
+    Both backends put a shell in the pane and type the command into it, so the
+    daemon is the shell's child and the pane outlives it with its label
+    intact.  That is the ordinary shape of a crash, not a rare one — requiring
+    the name to be absent meant the respawn fired only when someone had
+    already killed the tab by hand (t006 QA FINDING-1).
+
+    The real-process version of this is
+    tests/test_daemon_husk_respawn.py::test_real_husk_pane_does_not_block_respawn;
+    this one pins the decision table.
     """
     clock = Clock()
     watch, mux, clock = make_watch(
         repo, self_name="dispatcher", clock=clock,
-        mux=FakeMux(windows=[]))                 # nothing at all → unusable
+        mux=FakeMux(windows=["Sora-director", "watchdog"]))   # husk still listed
+    write_peer_heartbeat(repo, "watchdog", updated_at=clock() - 99999)
+
+    verdict = watch.watch_peer()
+
+    assert verdict.action == dw.ACTION_RESPAWNED, verdict.reason
+    assert [s["name"] for s in mux.spawned] == ["watchdog"]
+
+
+def test_a_refused_spawn_holds_instead_of_claiming_a_respawn(repo):
+    """`spawn()` returning False is the last line of defence, and it is honoured.
+
+    With the window name out of the decision, "is anything alive in that pane"
+    is answered by the backend at the moment of the spawn — herdr via `pane
+    process-info`, tmux via the pane shell's /proc entry.  False means it
+    refused (or failed), so nothing was started and nothing may be reported as
+    started.
+    """
+    clock = Clock()
+    watch, mux, clock = make_watch(
+        repo, self_name="dispatcher", clock=clock,
+        mux=FakeMux(windows=["Sora-director", "watchdog"], spawn_ok=False))
     write_peer_heartbeat(repo, "watchdog", updated_at=clock() - 99999)
 
     verdict = watch.watch_peer()
 
     assert verdict.action == dw.ACTION_HOLD, verdict.reason
-    assert mux.spawned == []
+    assert mux.sent == [], "a refused spawn was reported to the Director"
+    # No flap entry either: nothing was replaced, so nothing was spent.
+    assert not dw.respawn_log_path(repo / "registry", "watchdog").exists()
 
 
 def test_unreadable_proc_holds(repo):
@@ -774,10 +847,21 @@ def test_undelivered_report_is_retried_until_it_lands(repo):
 
 
 def test_report_is_not_repeated_once_delivered(repo):
+    """One respawn, one report — however many cycles run afterwards.
+
+    `scan` has to follow the spawn here.  A fake that keeps answering "nothing
+    is running" after its own spawn succeeded describes no real machine, and
+    before t035 this test passed only because the window check happened to
+    stop the second cycle: the FakeMux appended the name on spawn and the
+    watcher then held on the name.  With the name no longer standing in for
+    life (t006 QA FINDING-1), the honest fake is one where a successful spawn
+    makes the process visible to the next /proc scan.
+    """
     clock = Clock()
+    mux = FakeMux(windows=["Sora-director", "Ren-worker"])
     watch, mux, clock = make_watch(
-        repo, self_name="dispatcher", clock=clock,
-        mux=FakeMux(windows=["Sora-director", "Ren-worker"]))
+        repo, self_name="dispatcher", clock=clock, mux=mux,
+        scan=lambda repo_root, name: [4242] if mux.spawned else [])
     write_peer_heartbeat(repo, "watchdog", updated_at=clock() - 99999)
     watch.watch_peer()
 
@@ -785,6 +869,7 @@ def test_report_is_not_repeated_once_delivered(repo):
         clock.advance(30)
         watch.watch_peer()
 
+    assert len(mux.spawned) == 1, mux.spawned
     assert len(mux.sent) == 1, mux.sent
 
 

@@ -138,5 +138,14 @@ jobs:
       - name: Install dependencies
         run: pip install pytest pyyaml
 
+      # tests/test_daemon_husk_respawn.py はデーモンが死んでも pane が残る形
+      # (husk) を実 tmux 窓で再現する。偽 tmux では作れない状態なので、tmux が
+      # 無いと skip され、t006 QA FAIL-1 の回帰が CI で誰にも見えなくなる。
+      - name: Install tmux (required by the husk respawn regression)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y tmux
+          tmux -V
+
       - name: Run pytest
         run: python3 -m pytest tests/ -v

@@ -133,10 +133,28 @@ t026 — Codex 5 巡目 P1 2 件。t025 で入れた対策の当てが甘かっ�
     ↑ 逆向きの担保: 「常に断る」に倒しただけでは緑にならないこと。
   (設計は knowledge/daemon-authority.md §6-7)
 
+t033 — Codex 6 巡目 P1 / P2。どちらも t026 で入れた対策の「片側しか閉じて
+いない」箇所:
+  test_red_marker_is_not_created_while_a_pull_transaction_is_open        (P1)
+    ↑ pull は予約をキューロックの中で見るのに、marker の作成はロックの外
+      だった。予約チェックを通過した pull が走査で止まっている隙に marker が
+      立つと、その pull が公開する assignment は退役の管轄外になる。
+  test_request_is_only_delayed_by_a_live_pull_not_refused_forever
+    ↑ 逆向きの担保: 直列化は「待たせる」だけで、退役が二度と始まらない
+      Worker を作らないこと。
+  test_red_unprovable_hold_retries_its_report_until_the_director_hears_it (P2)
+    ↑ 通知 1 回の失敗で永久に隔離されないこと。
+  test_red_deferred_cleanup_retries_its_report_until_the_director_hears_it
+    ↑ 同型。世代が無くて後始末を保留した側にも同じ穴があった。
+  (設計は knowledge/daemon-authority.md §6-8)
+
 実行方法:
   python3 -m pytest tests/test_retirement.py -v
 """
 
+import contextlib
+import errno
+import fcntl
 import json
 import os
 import shutil
@@ -2543,3 +2561,272 @@ def test_pull_is_allowed_again_once_the_retirement_marker_is_cleared(sandbox):
     assert ok.returncode == 0, f"予約解除後も pull できない: {ok.stderr}"
     assert _status_of(sandbox, "t002") == "in_progress"
     assert sandbox.assignment_file.exists()
+
+
+# -- 3. marker の作成そのものを pull と直列化する (t033 / Codex 6 巡目 P1) ---
+
+def _queue_lock_is_held(sandbox) -> bool:
+    """キューロックが他のプロセスに握られているか。plan.sh と同じ flock を見る。"""
+    fh = open(sandbox.queue / ".lock", "a+")
+    try:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return True
+        fcntl.flock(fh, fcntl.LOCK_UN)
+        return False
+    finally:
+        fh.close()
+
+
+@contextlib.contextmanager
+def _pull_parked_inside_the_queue_lock(sandbox, *, skills="code"):
+    """本物の `plan.sh pull` を、キューロックを握ったまま card 走査の途中で止める。
+
+    止め方は名前付きパイプ。`list_tasks()` は `tNNN.md` を番号順に **全部
+    open して read** するので、`t000.md` を FIFO にしておくと pull はそこで
+    止まる。止まる位置は退役予約チェックの **後**、assignment 公開の **前** —
+    指摘された interleaving の (2) そのものである。
+
+    「止まった」ことは sleep で当て込まない。FIFO は読み手が現れるまで書き手側の
+    `O_WRONLY|O_NONBLOCK` open が ENXIO で失敗するので、**その open が成功した
+    こと**が「pull はキューロックの中で card を読みに来ている」の証明になる
+    (memory: microsecond-race-fix-needs-structural-test)。
+    """
+    fifo = sandbox.queue / "missions" / SLUG / "tasks" / "t000.md"
+    os.mkfifo(fifo)
+    env = dict(os.environ)
+    env["CREWVIA_QUEUE"] = str(sandbox.queue)
+    env["CREWVIA_REPO_ROOT"] = str(sandbox.root)
+    env["AGENT_NAME"] = AGENT
+    proc = subprocess.Popen(
+        ["bash", str(sandbox.scripts / "plan.sh"), "pull",
+         "--mission", SLUG, "--agent", AGENT, "--skills", skills],
+        env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    wfd = None
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        try:
+            wfd = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
+            break
+        except OSError as e:
+            if e.errno != errno.ENXIO:
+                raise
+            if proc.poll() is not None:
+                break
+            time.sleep(0.005)
+    if wfd is None:
+        out, err = proc.communicate(timeout=30)
+        raise AssertionError(
+            f"pull が card 走査まで来ていない (rc={proc.returncode}) — "
+            f"テストの前提が崩れている\n{out}{err}")
+    # 解放は必ず finally の中で。ここから先で何が失敗しても、キューロックを
+    # 握ったままの pull を残すとセッション全体が道連れになる。
+    try:
+        assert _queue_lock_is_held(sandbox), (
+            "pull が card を読みに来ているのにキューロックを握っていない — "
+            "トランザクションの張り方が変わっている")
+        yield proc
+    finally:
+        # FIFO に「pull 対象にならない card」を流し込む。pull はそのまま走査を
+        # 続け、本来の pending task を掴んでトランザクションを閉じる。
+        try:
+            os.write(wfd, (
+                "---\nid: t000\ntitle: parked\nskills: [code]\n"
+                "priority: low\nstatus: done\nblocked_by: []\ntarget_dir: null\n"
+                "worker: null\nstarted_at: null\ncompleted_at: null\n"
+                "---\n\n## Description\nparked\n\n## Result\n").encode())
+        finally:
+            os.close(wfd)
+        try:
+            proc.parked_output = proc.communicate(timeout=60)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.parked_output = proc.communicate()
+            raise
+
+
+def test_red_marker_is_not_created_while_a_pull_transaction_is_open(sandbox):
+    """pull のトランザクションが開いている間は、退役 marker を作らないこと。
+
+    RED (Codex 6 巡目 P1): t026 は `plan.sh pull` に退役予約を見させたが、見る
+    側だけをロックの中に入れた。**`RetirementExecutor.request()` は marker を
+    キューロックを取らずに作る**ので、次の並びがそのまま残っている:
+
+      1. pull が `retirement_reservation()` を通過する (marker はまだ無い)
+      2. pull が card 走査で止まる           ← ここで FIFO が pull を止める
+      3. marker が作られ、`_guard()` が「assignment 無し」を見て idle 退役と判断
+      4. shutdown が飛ぶ
+      5. pull が assignment を公開する → その実行は退役の管轄外で宙に浮く
+
+    guard の中で mux 参照を前倒ししても閉じない: 読む順番の問題ではなく、
+    **決定を書き込む瞬間が pull のトランザクションと直列化されていない**ことが
+    原因だからである。直列化点はキューロックしかない。
+    """
+    pane_pid = sandbox.spawn_worker_process()
+    sandbox.record_identity(WINDOW, pane_pid)
+    mux = FakeMux({WINDOW: pane_pid})
+    _add_pending_task(sandbox, "t002")
+    make_idle(sandbox)   # dispatcher が idle と判断する材料をそろえる
+
+    ex = make_executor(sandbox, mux)
+
+    with _pull_parked_inside_the_queue_lock(sandbox) as pull:
+        wrote = ex.request(AGENT, WINDOW, "idle")
+        actions = ex.process_all()
+
+        assert not wrote and not ex.has_marker(AGENT), (
+            f"pull のトランザクションが開いているのに退役 marker を作った "
+            f"(actions={actions}, logs={sandbox.logs})")
+        assert mux.sent == [], (
+            f"これから task を掴む Worker に shutdown を送った: {mux.sent}")
+
+    assert pull.returncode == 0, f"pull が完走していない: {pull.parked_output}"
+    # pull が「本当に危険な側の仕事をした」ことの確認。ここが空だと、marker を
+    # 作らなかったのは pull が何もしなかったからで、テストが穴を隠している。
+    assert _status_of(sandbox, "t002") == "in_progress"
+    assert sandbox.assignment_file.exists(), (
+        "pull が assignment を公開していない — テストの前提が崩れている")
+    assert not ex.has_marker(AGENT), (
+        f"task を握った Worker に退役 marker が残っている — この実行は誰の管轄でも"
+        f"ない (logs={sandbox.logs})")
+
+
+def test_request_is_only_delayed_by_a_live_pull_not_refused_forever(sandbox):
+    """逆向きの担保: 直列化は「待たせる」だけ。ロックが空けば marker は作れる。
+
+    これが無いと「キューロックを見たら常に諦める」に倒しただけで上が緑になり、
+    退役が二度と始まらない Worker — このミッションが潰してきた「黙って居座る」
+    側の穴 — ができる。
+    """
+    pane_pid = sandbox.spawn_worker_process()
+    sandbox.record_identity(WINDOW, pane_pid)
+    mux = FakeMux({WINDOW: pane_pid})
+    _add_pending_task(sandbox, "t002")
+    make_idle(sandbox)
+
+    ex = make_executor(sandbox, mux)
+    with _pull_parked_inside_the_queue_lock(sandbox):
+        assert not ex.request(AGENT, WINDOW, "idle")
+
+    assert ex.request(AGENT, WINDOW, "idle"), (
+        f"ロックが空いても退役を要求できない (logs={sandbox.logs})")
+    assert ex.has_marker(AGENT)
+
+
+# -- 4. 届かなかった報告は、届くまで再試行する (t033 / Codex 6 巡目 P2) ------
+
+def _flaky_notifier():
+    """「通知先が落ちている / 復旧した」を切り替えられる notify。"""
+    state = {"online": False}
+    delivered: list = []
+
+    def notify(message):
+        if not state["online"]:
+            return False
+        delivered.append(message)
+        return True
+
+    return state, delivered, notify
+
+
+def test_red_unprovable_hold_retries_its_report_until_the_director_hears_it(sandbox):
+    """通知が一時的に落ちただけで、Worker を永久に隔離しないこと。
+
+    RED (Codex 6 巡目 P2): `_unprovable()` は `_report()` が False を返しても
+    (= 通知が届かなくても) `PHASE_UNPROVABLE` を永続化する。以降のサイクルは
+    `_recheck_unprovable()` しか通らず report を再試行せず、`_check_stall()` は
+    この phase の報告を明示的に抑制する。結果、**一時的な通知失敗で Worker が
+    永久に隔離され、Director には復旧に必要な情報が届かない**。marker がある
+    あいだ pull も dispatcher の割り当ても止まるので、外からは何も起きない。
+    """
+    pane_pid = sandbox.spawn_worker_process()
+    sandbox.record_identity(WINDOW, pane_pid)
+    mux = FakeMux({WINDOW: pane_pid})
+    state, delivered, notify = _flaky_notifier()
+
+    ex = make_executor(sandbox, mux, notify=notify)
+    assert ex.request(AGENT, WINDOW, "timeout", mission=SLUG, task_id=TASK_ID)
+    sandbox.assignment_identity_file.unlink()   # 世代が読めない → hold
+
+    _drive(ex, 4)
+    prog = _progress_of(sandbox)
+    assert prog.get("phase") == "unprovable", (
+        f"hold になっていない — テストの前提が崩れている: {prog}")
+    assert delivered == [], "落ちている通知先に届いたことになっている"
+    assert not prog.get("director_notified")
+
+    state["online"] = True
+    _drive(ex, 3)
+
+    assert len(delivered) == 1, (
+        f"通知が復旧しても Director に届かない "
+        f"(delivered={delivered}, logs={sandbox.logs})")
+    note = delivered[0]
+    assert AGENT in note and "registry/retirements" in note, (
+        f"隔離の解き方が書かれていない: {note}")
+    assert "--reset" not in note, (
+        f"何も kill していないのに task の差し戻しを促している: {note}")
+
+    _drive(ex, 3)
+    assert len(delivered) == 1, f"届いたあとも送り続けている: {delivered}"
+
+    # 報告は報告でしかない。隔離も Worker も task もそのまま。
+    assert ex.has_marker(AGENT), "報告のついでに隔離を解いた"
+    assert _pid_alive(pane_pid), "報告のついでに kill した"
+    assert sandbox.task_status() == "in_progress"
+
+
+def test_red_deferred_cleanup_retries_its_report_until_the_director_hears_it(sandbox):
+    """同型: 世代が無くて後始末を保留した側も、届くまで再試行すること。
+
+    `_cleanup_deferred()` は `cleanup_deferred=True` を立てたあと二度と報告しない。
+    `_unprovable()` と同じく通知の成否を見ていないので、**Worker は既に殺されて
+    いるのに task が in_progress のまま誰にも知らされない** — この module が
+    消すために書かれた幽霊 task そのものになる。1 箇所だけ直すと同じ形が残る
+    (memory: crewvia-recurring-defect-patterns)。
+    """
+    pane_pid = sandbox.spawn_worker_process()
+    sandbox.record_identity(WINDOW, pane_pid)
+    mux = FakeMux({WINDOW: pane_pid})
+    state, delivered, notify = _flaky_notifier()
+
+    ex = make_executor(sandbox, mux, notify=notify)
+    hidden = sandbox.task_file.with_suffix(".hidden")
+    sandbox.task_file.rename(hidden)            # 世代を読めない状態で request
+    assert ex.request(AGENT, WINDOW, "timeout", mission=SLUG, task_id=TASK_ID)
+    hidden.rename(sandbox.task_file)
+
+    # Worker が自分で落ちる。pid が死んでいるので exit は「証明済み」となり、
+    # guard を通らずに terminated へ入る — 世代が無いまま後始末を迫られる、
+    # `_cleanup_deferred()` に実際に到達する唯一の並び。
+    os.kill(pane_pid, signal.SIGKILL)
+    for _ in range(200):
+        if not _pid_alive(pane_pid):
+            break
+        time.sleep(0.01)
+    assert not _pid_alive(pane_pid)
+
+    _drive(ex, 8)
+    prog = _progress_of(sandbox)
+    assert prog.get("cleanup_deferred"), (
+        f"後始末の保留になっていない — テストの前提が崩れている: {prog}")
+    assert delivered == []
+
+    state["online"] = True
+    _drive(ex, 3)
+    assert len(delivered) == 1, (
+        f"通知が復旧しても Director に届かない "
+        f"(delivered={delivered}, logs={sandbox.logs})")
+    assert "--reset" in delivered[0], (
+        f"kill 済みなのに task の戻し方が書かれていない: {delivered[0]}")
+
+    _drive(ex, 3)
+    assert len(delivered) == 1, f"届いたあとも送り続けている: {delivered}"
+
+
+def _progress_of(sandbox) -> dict:
+    import lib_retirement
+    return lib_retirement.read_json(
+        lib_retirement.progress_path(sandbox.registry, AGENT)) or {}

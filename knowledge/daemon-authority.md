@@ -1074,6 +1074,99 @@ assignment の確認を最後に**した。確認から着弾までの間に残�
 
 ---
 
+## 6-8. 予約を「読む側」だけロックに入れても閉じない (t033, 2026-09-22)
+
+Codex 6 巡目。§6-7 (2) で入れた予約と、§6-4 (2) 以来増え続けた「保留」の出口。
+2 件とも **対策を半分だけ適用していた** 箇所である。
+
+### (1) 予約の作成を pull のトランザクションと直列化する (P1)
+
+§6-7 (2) は `plan.sh pull` に marker を見させた。見る側はキューロックの中に
+入ったが、**書く側 — `RetirementExecutor.request()` — はロックを取らないまま
+だった**。判定と書き込みが別のクリティカルセクションにある以上、それは決定に
+なっていない:
+
+```
+pull:  retirement_reservation() を通過 (marker はまだ無い)
+pull:  … card 走査中 …
+here:  marker 作成 → _guard() は assignment を見ない → idle 退役と判断
+here:  shutdown 送信
+pull:  assignment を公開
+```
+
+公開された assignment はどの退役の管轄でもない。`_guard()` の中で mux 参照を
+前倒ししても (§6-7 (2) の後半) 閉じない: 読む順番の問題ではなく、**決定を
+書き込む瞬間が、その決定が覆すはずの決定と直列化されていない**ことが原因
+だからである。
+
+`queue_transaction()` — plan.sh と同じ `queue/.lock` を `LOCK_NB` で取る
+contextmanager — を追加し、marker の作成をその中に入れた。
+
+- **待たない。** 呼び手は両方デーモンで、dispatcher は割り当てサイクルを、
+  watchdog は監視サイクルを止められない (`plan.sh retire --no-wait` と同じ
+  理由 / §6-6 (3))。取れなければ「今サイクルは退役しない」で、倒れる先は
+  §5-1 (Worker が居残る) 側であって §5-2 (別の実行を殺す) 側ではない。
+- **ロックの中で subprocess を呼ばない。** `current_spawn_identity()` は mux
+  の subprocess なので**ロックの外**に残した。中でやるのはカードの読み取りと
+  小さな JSON の `os.replace` だけである。
+- **世代 (`started_at`) の読み取りはロックの中へ移した。** `cmd_pull()` は
+  `started_at` の書き換えと assignment の公開を 1 トランザクションで行うので、
+  外で読んだ世代は公開済みの後任のものと食い違いうる。
+- `queue_dir` が無い executor は marker を書かない。直列化する相手が分から
+  ないうえ、その executor は idle 前提の確認も後始末もできない (設定ミス)。
+
+`write_json_exclusive()` は残す。キューロックは plan.sh との直列化であって、
+**2 つのデーモン同士**は順番にロックを取れてしまうので、§6-6 (2) の
+create-if-absent は依然として必要である。
+
+### (2) 届かなかった報告は、届くまで再試行する (P2)
+
+`_unprovable()` は `_report()` が False を返しても (= 通知が届かなくても)
+`PHASE_UNPROVABLE` を永続化していた。以降のサイクルは `_recheck_unprovable()`
+しか通らず report を再試行せず、`_check_stall()` はこの phase の報告を明示的に
+抑制する。つまり **通知 1 回の失敗で「Director に伝えて保留」が「保留」だけに
+なる**。marker があるあいだ Worker は pull も割り当ても止まる (§6-7 (2)) ので、
+外からは何も起きず、復旧に必要な情報はどこにも届かない — この module が消す
+ために書かれた幽霊 task と同じ形で、デーモンが黙っている分だけ悪い。
+
+`_report_fields()` が報告の結果を progress のフィールドに畳み、**届かなかった
+message をそのまま `pending_report` に保存する**。`_retry_pending_report()` が
+毎サイクル再送し、**配信に成功してから** `director_notified` を立てて重複抑制を
+始める。message を作り直さず保存するのは、作成に使った入力 (request、guard の
+理由) が再送時には消えていることがあり、作り直すと決定時の文面から乖離する
+ためである。
+
+同じ形が `_cleanup_deferred()` にもあった (世代が無く後始末を保留する側。
+Worker は**既に死んでいる**ので、届かなければ task が in_progress のまま誰にも
+知られない)。片方だけ直すと同型が残るので、両方を `_report_fields()` /
+`_retry_pending_report()` に載せ替えた
+(memory: crewvia-recurring-defect-patterns)。
+
+`_check_stall()` がこの 2 phase を抑制し続けてよいのは、この再送があるから
+である — 抑制と再送はセットで読むこと。
+
+### 回帰テストの形
+
+- `test_red_marker_is_not_created_while_a_pull_transaction_is_open`
+  — 並行性を実際に作る。**名前付きパイプ**で本物の `plan.sh pull` を
+  「予約チェックの後・assignment 公開の前」で止める: `list_tasks()` は
+  `tNNN.md` を番号順に全部 open して read するので、`t000.md` を FIFO に
+  しておけばそこで止まる。止まったことは sleep で当て込まず、書き手側の
+  `O_WRONLY|O_NONBLOCK` open が ENXIO を返さなくなったことで確定する
+  (memory: microsecond-race-fix-needs-structural-test)。解放後に pull が
+  実際に assignment を公開していることまで assert する — ここが空だと
+  「pull が何もしなかったから marker も立たなかった」をテストが見逃す。
+- `test_request_is_only_delayed_by_a_live_pull_not_refused_forever`
+  — 逆向きの担保。これが無いと「ロックを見たら常に諦める」に倒しただけで
+  緑になり、退役が二度と始まらない Worker ができる。
+- `test_red_unprovable_hold_retries_its_report_until_the_director_hears_it` /
+  `test_red_deferred_cleanup_retries_its_report_until_the_director_hears_it`
+  — 通知先を落としたまま hold に入れ、復旧後に **1 通だけ** 届くこと、
+  届いたあとは送り続けないこと、報告のついでに kill も queue 書き換えも
+  していないことを押さえる。
+
+---
+
 ## 7. 参照
 
 - `scripts/dispatcher.sh` — D1 :998、D2 :1210、D3 :1239、D4 :1351、D5 :819、
@@ -1086,7 +1179,10 @@ assignment の確認を最後に**した。確認から着弾までの間に残�
 - `scripts/start.sh` — dispatcher / watchdog の起動 :771 / :780、F6是正コメント :778-779
 - `scripts/plan.sh` — `publish_assignment()` / `classify_assignment()` /
   `retire_assignment()` / `cmd_retire()` (§3-5)、
-  `retirement_reservation()` + `cmd_pull()` 冒頭のゲート (§6-7 (2))
+  `retirement_reservation()` + `cmd_pull()` 冒頭のゲート (§6-7 (2))、
+  `with_lock()` = `queue/.lock` (§6-8 (1) が marker 作成で共有する)
+- `scripts/lib_retirement.py` — `queue_transaction()` / `request()` (§6-8 (1))、
+  `_report_fields()` / `_retry_pending_report()` (§6-8 (2))
 - `knowledge/worker-shutdown-rules.md` — Rule 1-5 の確定仕様
 - `knowledge/worker-vanish-detection.md` — D4 の背景
 - `knowledge/dispatcher-restart-after-merge.md` — 常駐デーモンの反映手順

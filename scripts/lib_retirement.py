@@ -125,6 +125,17 @@ decision and the act, and things happen in it.
     that id are two different retirements, and their evidence never mixes —
     the progress finishes on its own (`_read_pair()`), the request waits its
     turn.
+
+    The same sentence decides *where* the create happens (t033).  `plan.sh
+    pull` reads this file — `retirement_reservation()` — to decide whether a
+    Worker may be given work, and it reads it inside the queue lock, together
+    with the assignment it publishes.  A decision written outside that lock is
+    not serialised with the decisions it is supposed to override: a pull that
+    has already passed the reservation check and is still scanning cards will
+    publish an assignment the marker knows nothing about, and the guard, asked
+    in between, sees an idle Worker and ends it.  So the create takes the
+    queue lock too (`queue_transaction()`), without waiting, and a busy queue
+    simply means "not this cycle".
   - **Nothing in the cycle may wait on the queue lock.**  The cleanup runs
     inside watchdog's monitoring loop, and plan.sh's lock is a blocking
     exclusive flock: one busy queue used to suspend every Worker's monitoring
@@ -144,6 +155,8 @@ ambiguity by rewriting the queue is how the last three defects in this module
 were built (memory: fail-closed-guard-can-recreate-the-defect).
 """
 
+import contextlib
+import fcntl
 import json
 import os
 import signal
@@ -220,6 +233,10 @@ PLAN_LOCK_BUSY = 4
 #: stall this module was written to remove.
 CLEANUP_COMMAND_TIMEOUT = 30
 
+#: plan.sh's queue lock, relative to the queue directory.  Writing a retirement
+#: request takes this same lock — see `queue_transaction()`.
+QUEUE_LOCK_NAME = ".lock"
+
 #: How long a retirement may stay unsettled before the Director hears about it
 #: once.  Every fail-closed branch in this module ends in "wait and look again
 #: next cycle", and some of those waits cannot resolve on their own: a request
@@ -281,6 +298,64 @@ def list_agents(registry_dir) -> list:
         elif p.name.endswith(_REQUEST_SUFFIX):
             agents.add(p.name[: -len(_REQUEST_SUFFIX)])
     return sorted(agents)
+
+
+# ---------------------------------------------------------------------------
+# The queue transaction
+# ---------------------------------------------------------------------------
+
+@contextlib.contextmanager
+def queue_transaction(queue_dir):
+    """plan.sh's queue lock, taken **without waiting**.  Yields `(held, why)`.
+
+    `plan.sh pull` publishes an assignment and checks
+    `retirement_reservation()` inside this lock, so this is the only place a
+    retirement request can be serialised against a pull.  Writing the request
+    outside it left the reservation check and the write in different critical
+    sections, which is not a decision at all:
+
+        pull: reservation check passes (no marker yet)
+        pull: … still scanning cards …
+        here: marker created; the guard sees no assignment → "idle" → shutdown
+        pull: publishes the assignment
+
+    and the task that pull just published belongs to no retirement.  Reading
+    the assignment later, or earlier, or twice does not close it — the write
+    has to happen where the reservation is read.
+
+    **Non-blocking on purpose.**  Both callers are daemons: dispatcher must
+    not stall its dispatch cycle behind a busy queue, and watchdog must not
+    stall its monitoring cycle, which is the whole reason `plan.sh retire`
+    grew `--no-wait` (see `PLAN_LOCK_BUSY`).  "Could not take it" is not a
+    failure here either — the Worker simply is not retired this cycle and the
+    caller asks again, which is the fail-closed direction (§5-1: a Worker
+    lingers) rather than the damaging one (§5-2: a kill lands on work).
+
+    **Nothing inside may call a subprocess.**  Everything this holds the lock
+    for is a local file read or an `os.replace` of a small document; a mux
+    query or a `plan.sh` invocation in here would suspend every Worker's
+    `plan.sh` call for its timeout.
+    """
+    path = Path(queue_dir) / QUEUE_LOCK_NAME
+    try:
+        os.makedirs(path.parent, exist_ok=True)
+        fh = open(path, "a+")
+    except OSError as e:
+        yield False, f"cannot open the queue lock {path}: {e}"
+        return
+    try:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            yield False, (f"the queue lock {path} is held by another process "
+                          f"(a plan.sh transaction is in flight)")
+            return
+        try:
+            yield True, ""
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+    finally:
+        fh.close()
 
 
 # ---------------------------------------------------------------------------
@@ -743,6 +818,7 @@ def build_progress(previous: Optional[dict], phase: str, **fields) -> dict:
         ("cleanup_attempts", 0),
         ("cleanup_deferred", False),
         ("director_notified", False),
+        ("pending_report", None),
         ("sigkill_attempts", 0),
         ("sigkill_report_sent", False),
     ):
@@ -850,7 +926,16 @@ class RetirementExecutor:
         guard above.  Refusing is the fail-closed direction: the Worker
         lingers (§5-1) instead of a later kill landing on the wrong instance
         (§5-2).
+
+        Also refuses while a `plan.sh` transaction is open.  The marker is what
+        `plan.sh pull` reads to decide whether this Worker may be given work,
+        so creating it *is* the decision, and a decision taken outside the lock
+        that publishes assignments is not serialised with them at all
+        (`queue_transaction()` has the interleaving).  Refusing costs a cycle;
+        the alternative costs an execution nobody owns.
         """
+        # Outside the lock on purpose: this goes to the mux backend, i.e. a
+        # subprocess, and nothing may hold the queue lock across one.
         identity = current_spawn_identity(self.registry_dir, self.mux, window_target)
         if identity.get("pane_pid") is None and identity.get("created_at") is None:
             self.log(
@@ -859,6 +944,43 @@ class RetirementExecutor:
                 f"Not writing a marker; will retry when identity is readable."
             )
             return False
+        if self.queue_dir is None:
+            # Without the queue there is no lock to serialise against, and a
+            # marker written anyway could land in the middle of somebody's
+            # pull.  The same executor could not check the idle premise
+            # (`_guard()` skips it) or clean up afterwards either, so this is
+            # a misconfiguration, not a mode.
+            self.log(
+                f"[retire] {agent}: refusing to request retirement — no queue_dir, so the "
+                f"marker cannot be serialised against plan.sh (would race with pull)"
+            )
+            return False
+
+        with queue_transaction(self.queue_dir) as (held, why):
+            if not held:
+                # Not a failure and nothing is owed: the Worker is simply not
+                # retired this cycle.  Rate-limited because dispatcher asks
+                # every few seconds and a busy queue would otherwise fill the
+                # log with one line per cycle per Worker.
+                self._log_waiting(
+                    agent,
+                    f"[retire] {agent}: not writing a retirement request this cycle "
+                    f"— {why}. Asking again next cycle ({reason})")
+                return False
+            return self._write_request(agent, window_target, reason, identity,
+                                       mission, task_id, message)
+
+    def _write_request(self, agent: str, window_target: str, reason: str,
+                       identity: dict, mission: Optional[str],
+                       task_id: Optional[str], message: str) -> bool:
+        """The request itself.  **Runs under the queue lock; no subprocesses.**
+
+        Reading the card here rather than before taking the lock is not
+        incidental: `plan.sh pull` rewrites `started_at` and publishes the
+        assignment in one transaction, so a generation read outside the lock
+        can name an execution that the assignment published a moment later has
+        already replaced.
+        """
         # Read here rather than taken from the caller: every caller would have
         # to remember, and the one that forgot would hand the cleanup to a
         # human for no reason (Codex P1-1).  One place decides.  This is also
@@ -889,11 +1011,11 @@ class RetirementExecutor:
         req = build_request(agent, window_target, reason, identity,
                             mission=mission, task_id=task_id, message=message,
                             task_started_at=started_at)
-        # Create-if-absent, atomically: this *is* the `has_marker()` check for
-        # the two daemons that both write here.  A separate check followed by
-        # an unconditional replace let the loser overwrite the winner, and a
-        # progress file built against the first request would then be read
-        # alongside the second one's task and generation (Codex 4 巡目 P1-2).
+        # Create-if-absent, atomically.  The queue lock serialises this against
+        # `plan.sh`; this keeps the *two daemons* from overwriting each other,
+        # which the lock does not help with — they can both hold it, one after
+        # the other, and a separate check followed by an unconditional replace
+        # let the loser overwrite the winner (Codex 4 巡目 P1-2).
         outcome = write_json_exclusive(request_path(self.registry_dir, agent), req)
         if outcome == WROTE_EXISTS:
             self.log(f"[retire] {agent}: a retirement request already exists "
@@ -1177,8 +1299,12 @@ class RetirementExecutor:
         if req is None and prog is None:
             unlink_quiet(stall_path(self.registry_dir, agent))
             return False
-        # These two have already told the Director, with what to do; a second
-        # message about the same marker would only add noise.
+        # These two own their own message to the Director, with what to do,
+        # and retry it every cycle until it is delivered
+        # (`_retry_pending_report()`); a stall report about the same marker
+        # would only add noise.  The suppression is safe *because* of that
+        # retry: before it, a phase whose report had failed was silenced here
+        # too, and the marker went quiet with the Worker still quarantined.
         if (prog or {}).get("phase") in (PHASE_CLEANUP_FAILED, PHASE_UNPROVABLE):
             return False
         if stall_path(self.registry_dir, agent).exists():
@@ -1368,7 +1494,7 @@ class RetirementExecutor:
         task_id = (req or {}).get("task_id") or previous.get("task_id")
         task_line = (f"task {task_id} (mission={mission}) は in_progress のままです。"
                      if task_id and mission else "")
-        notified = self._report(
+        reported = self._report_fields(
             agent, previous,
             f"watchdog は Worker {agent} の退役を途中で止めました "
             f"(phase={stopped_at})。この退役が「どの実行を終わらせるものだったか」"
@@ -1384,7 +1510,7 @@ class RetirementExecutor:
         carried = _carried_from_request(req) if (prog is None and req) else {}
         if not self._write_progress(agent, previous, PHASE_UNPROVABLE,
                                     unprovable_reason=why,
-                                    director_notified=notified, **carried):
+                                    **reported, **carried):
             return "blocked"
         return "unprovable"
 
@@ -1405,9 +1531,15 @@ class RetirementExecutor:
         Director has already been told was stopped, and re-deciding that
         behind their back is the churn the hold exists to prevent.
 
-        Read-only up to the one thing it writes — `discarded`, which kills
-        nothing and rewrites nothing.
+        Read-only up to the two things it writes — `discarded`, which kills
+        nothing and rewrites nothing, and the retry of a report that never got
+        out.  The retry comes first: "the Director has already been told" is
+        the premise the hold rests on, and while it is false this Worker is
+        quarantined with nobody able to act on it.
         """
+        delivered = self._retry_pending_report(agent, prog)
+        if delivered:
+            return delivered
         mission = (req or {}).get("mission") or prog.get("mission")
         task_id = (req or {}).get("task_id") or prog.get("task_id")
         if not (task_id and self.queue_dir):
@@ -1766,17 +1898,22 @@ class RetirementExecutor:
         once — with what to check, how to repair the task and how to clear the
         marker — and the marker is kept, because it is the only record that
         this task may still be a ghost.  Re-running the check every cycle
-        would only re-confirm the same answer, so later cycles say nothing.
+        would only re-confirm the same answer, so later cycles say nothing —
+        except to finish delivering the one message, which is the entire
+        value of this branch.  The Worker here is already dead, so a report
+        that never arrives leaves the task `in_progress` with nobody aware of
+        it: the same shape as the hold above, and the reason both go through
+        `_report_fields()` rather than each deciding for itself.
         """
         why = (f"{mission}/{task_id} の実行世代 (started_at) を記録できていないため、"
                f"自動の後始末は行いません")
         if prog.get("cleanup_deferred"):
-            return None
+            return self._retry_pending_report(agent, prog)
         self.log(
             f"[retire] {agent}: {why} — 世代を後から読み直しても、そこにあるのは"
             f"後任の世代なので埋め合わせにならない。Director に上げて保留する"
         )
-        notified = self._report(
+        reported = self._report_fields(
             agent, prog,
             f"watchdog が Worker {agent} を終了しましたが、その実行の世代 "
             f"(started_at) を記録できていませんでした。前提を弱めて自動で "
@@ -1789,7 +1926,7 @@ class RetirementExecutor:
         )
         self._write_progress(agent, prog, PHASE_CLEANUP_FAILED,
                              cleanup_error=why, cleanup_deferred=True,
-                             director_notified=notified,
+                             **reported,
                              mission=mission, task_id=task_id)
         return "cleanup_deferred"
 
@@ -1956,3 +2093,45 @@ class RetirementExecutor:
         except Exception as e:  # noqa: BLE001
             self.log(f"[retire] {agent}: director report failed: {type(e).__name__}: {e}")
             return False
+
+    def _report_fields(self, agent: str, prog: dict, message: str) -> dict:
+        """Report, and hand back the progress fields that record what happened.
+
+        The phases that report *once* — `unprovable`, `cleanup_deferred` —
+        used to persist `director_notified=<whatever _report returned>` and
+        then never look at it again.  A notifier that was down for one cycle
+        therefore turned "tell the Director, then hold" into "hold", silently:
+        the marker keeps the Worker quarantined (`has_marker()` stops pull and
+        dispatch) while the one message that explains why never arrives.  That
+        is the ghost this module exists to remove, with the daemons keeping
+        quiet about it.
+
+        So a report that did not get through is kept as an obligation.  The
+        message is stored verbatim rather than rebuilt later: the inputs it was
+        composed from (the request, the guard's reason) may be gone by the time
+        it is retried, and a reconstructed message would drift from the one the
+        decision was actually made on.  Dedup starts **after** delivery, which
+        is what `director_notified` is now allowed to mean.
+        """
+        ok = self._report(agent, prog, message)
+        return {"director_notified": ok, "pending_report": None if ok else message}
+
+    def _retry_pending_report(self, agent: str, prog: dict) -> Optional[str]:
+        """Deliver a report an earlier cycle could not get out.  Changes nothing else."""
+        if prog.get("director_notified"):
+            return None
+        message = prog.get("pending_report")
+        if not message:
+            return None
+        if not self._report(agent, prog, message):
+            self._log_waiting(
+                agent,
+                f"[retire] {agent}: still cannot reach the Director about this held "
+                f"retirement (phase={prog.get('phase')}) — retrying every cycle. "
+                f"The log line at the time of the decision is the fallback record.")
+            return None
+        self.log(f"[retire] {agent}: delivered the report that earlier cycles could not "
+                 f"send (phase={prog.get('phase')})")
+        self._write_progress(agent, prog, prog.get("phase"),
+                             director_notified=True, pending_report=None)
+        return "report_delivered"

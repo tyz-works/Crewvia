@@ -31,6 +31,7 @@ tests/test_daemon_husk_respawn.py
 """
 
 import os
+import pty
 import shutil
 import subprocess
 import sys
@@ -205,18 +206,47 @@ def reap():
             pass
 
 
-def test_tmux_pane_liveness_uses_real_processes(reap, monkeypatch):
-    """`_pane_has_live_process()` を実プロセス 3 種で確かめる。
+@pytest.fixture
+def pty_shell():
+    """本物の対話シェルを pty 上に起こす (終了はこの fixture が面倒を見る)。
+
+    `subprocess.Popen(..., stdin=<pty slave>)` では制御端末を取れない —
+    端末を **開いた** セッションリーダーだけが制御端末を得るので、fork 後に
+    setsid して自分で開く `pty.fork()` を使う。これをやらないと tpgid が
+    -1 のままになり、「プロンプトに居る対話シェル」ではなく「端末を持たない
+    シェル」を相手にテストしてしまう。
+    """
+    spawned = []
+
+    def _spawn():
+        pid, fd = pty.fork()
+        if pid == 0:                      # pragma: no cover - child never returns
+            os.execvp("bash", ["bash"])
+        spawned.append(pid)
+        _wait_for(lambda: Path(f"/proc/{pid}/stat").exists(), what="the pty shell")
+        time.sleep(0.5)                   # プロンプトを出し切るまで
+        return pid, fd
+
+    yield _spawn
+    for pid in spawned:
+        try:
+            os.kill(pid, 9)
+            os.waitpid(pid, 0)
+        except OSError:
+            pass
+
+
+def test_tmux_pane_liveness_uses_real_processes(reap, monkeypatch, pty_shell):
+    """`_pane_has_live_process()` を実プロセス数種で確かめる。
 
     tmux は herdr の `pane process-info` に当たる問い合わせを持たないので、
     pane シェルの pid から `/proc` を読む。読めなければ「使用中」に倒す。
     """
     backend = lib_mux.TmuxBackend()
 
-    # (a) プロンプトで待っているだけのシェル = husk
-    idle = subprocess.Popen(["bash", "-c", "read -r _"], stdin=subprocess.PIPE)
-    reap(idle)
-    monkeypatch.setattr(backend, "pid", lambda name: idle.pid)
+    # (a) プロンプトで待っているだけの対話シェル = husk
+    idle_pid, _idle_fd = pty_shell()
+    monkeypatch.setattr(backend, "pid", lambda name: idle_pid)
     assert backend._pane_has_live_process("dispatcher") is False
 
     # (b) 子プロセスを走らせているシェル = 使用中。
@@ -242,3 +272,95 @@ def test_tmux_pane_liveness_uses_real_processes(reap, monkeypatch):
 
 def _has_child(pid):
     return bool(lib_mux._live_children(pid))
+
+
+# ---------------------------------------------------------------------------
+# 3. 「子が無いシェル」 ≠ 「プロンプトに居るシェル」 (t036 / PR #209 P2)
+# ---------------------------------------------------------------------------
+#
+# comm と子プロセスだけを見ると、次のものが全部「idle」に見える:
+#
+#   - スクリプトを走らせているシェル (子を fork しない builtin だけの処理)
+#   - `bash -c '...'` で走っているシェル
+#   - パイプから読んでいる非対話シェル
+#
+# どれも実際には仕事をしていて、そこへ launch コマンドを送り込めば、コマンドは
+# 入力として食われるか、走っている処理と混ざる。spawn() はそれを成功として
+# 返していた。判定は「シェルであること」に加えて **どう起動されたか** と
+# **端末の前景に居るか** まで見る。
+
+def test_a_shell_running_a_script_is_not_idle(reap, tmp_path):
+    """`bash script.sh` は子を持たなくても仕事中。argv がそれを示している。"""
+    script = tmp_path / "busy.sh"
+    script.write_text("while :; do :; done\n", encoding="utf-8")
+    busy = subprocess.Popen(["bash", str(script)])
+    reap(busy)
+    time.sleep(0.3)
+    assert lib_mux._pane_shell_is_idle(busy.pid) is False
+
+
+def test_a_shell_running_a_builtin_loop_is_not_idle(reap):
+    """`bash -c` も同じ。子は一つも生まれない。"""
+    busy = subprocess.Popen(["bash", "-c", "while :; do :; done"])
+    reap(busy)
+    time.sleep(0.3)
+    assert lib_mux._pane_shell_is_idle(busy.pid) is False
+
+
+def test_a_non_interactive_shell_reading_a_pipe_is_not_idle(reap):
+    """端末を持たないシェルは pane のプロンプトではない。
+
+    `bash` を引数無しで起動しても、stdin がパイプなら中身を読んで実行して
+    いる最中でありうる。argv の長さだけでは見分けが付かない。
+    """
+    busy = subprocess.Popen(["bash"], stdin=subprocess.PIPE)
+    reap(busy)
+    time.sleep(0.3)
+    assert lib_mux._pane_shell_is_idle(busy.pid) is False
+
+
+def test_a_real_interactive_shell_at_its_prompt_is_idle(pty_shell):
+    """逆側の保証: 本物の husk は idle のままでないと respawn できなくなる。
+
+    t035 が足した生存性 (クラッシュで残ったシェルからも起こし直す) を、
+    厳しくした判定が潰していないことの確認。
+    """
+    pid, _fd = pty_shell()
+    assert lib_mux._pane_shell_is_idle(pid) is True
+
+
+def test_a_shell_with_a_background_job_is_not_idle(pty_shell):
+    """前景に戻っていても、裏で走っている仕事があれば使用中。"""
+    pid, fd = pty_shell()
+    os.write(fd, b"sleep 30 &\n")
+    _wait_for(lambda: _has_child(pid), what="the background job to start")
+    assert lib_mux._pane_shell_is_idle(pid) is False
+
+
+@requires_tmux
+def test_spawn_does_not_claim_success_when_the_pane_swallows_the_command(
+        stub_repo, tmux_session):
+    """入力待ちのペインに送り込んだコマンドは、起動ではなく **文字列** になる。
+
+    対話シェルが `read` で止まっている状態は、プロンプトに居るのと /proc 上で
+    区別が付かない (state も tpgid も argv も同じ)。区別が付かない以上、
+    spawn は「送った」ではなく「本当に何か走り出した」で答えなければならない。
+    さもないと相互監視は respawn を 1 回成功として記録し、grace と flap
+    カウンタを消費したうえで、実際には何も起きていない。
+    """
+    session = tmux_session
+    subprocess.run(["tmux", "new-session", "-d", "-s", session, "-n",
+                    dw.DAEMON_DISPATCHER], capture_output=True, timeout=10)
+    # ペインのシェルを入力待ちにする (人が read を打った状態と同じ)。
+    subprocess.run(["tmux", "send-keys", "-t", f"{session}:{dw.DAEMON_DISPATCHER}",
+                    "read -r _swallowed", "Enter"], capture_output=True, timeout=10)
+    time.sleep(1.0)
+
+    mux = lib_mux.Mux()
+    started = mux.spawn(dw.DAEMON_DISPATCHER,
+                        dw.spawn_command(dw.DAEMON_DISPATCHER, stub_repo),
+                        cwd=str(stub_repo))
+
+    assert _scan(stub_repo) == [], "the stub daemon started after all — bad fixture"
+    assert started is False, \
+        "spawn reported success although the pane swallowed the command as input"

@@ -103,6 +103,18 @@ daemons:
   # 黙って保留し続けるのは無音の故障なので、必ず出口を用意しておくための値。
   hold_report_after_seconds: 1800
 
+  # デーモン 1 つにつき 1 つのロック (registry/daemons/<name>.lock) で、
+  # 「相手を起こす判定〜spawn」と「手動 restart」を直列化します。マーカーを
+  # 先に書くだけでは閉じません — 相手が「マーカーは無い」と読んだ後に
+  # maintenance が始まれば、そのまま手動 spawn と並んで起動してしまうためです。
+  #
+  #   watch 側: 短く。取れなければ 1 サイクル保留するだけなので安全側であり、
+  #            ここで待たせると相互監視が自分のデーモンのサイクルを止める
+  #   maintenance 側: 長く。人が端末の前で待っている操作なので、進行中の
+  #            判定が終わるまで並ぶのが正しい
+  watch_lock_timeout_seconds: 2
+  maintenance_lock_timeout_seconds: 60
+
   # 停止マーカー (registry/daemons/<name>.paused) がこの秒数残っていたら
   # Director に 1 度だけ報告します。マーカーは自動で外しません — 「古い」は
   # 「作業が終わった」の証拠ではなく、作業途中の相手を起こすと二重起動になるため。

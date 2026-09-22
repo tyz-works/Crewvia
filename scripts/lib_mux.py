@@ -42,6 +42,7 @@ CLI usage (for bash callers):
   python3 lib_mux.py identity-ok <repo_root>    # exit 0 = repo_root still a valid git checkout
 """
 
+import errno
 import json
 import os
 import shutil
@@ -226,29 +227,65 @@ _SHELL_PROCESS_NAMES = frozenset({
 })
 
 
-def _proc_stat_tail(pid, proc_root: str = "/proc") -> Optional[List[str]]:
-    """`/proc/<pid>/stat` from field 3 on, or None when it cannot be read.
+#: Reading `/proc/<pid>/<file>`: the answer, and whether it is one at all.
+_PROC_OK, _PROC_GONE, _PROC_UNREADABLE = "ok", "gone", "unreadable"
+
+#: The only errnos that mean the process is not there.  Anything else — EACCES
+#: under `hidepid`, EIO, a path that is not what we expected — means we could
+#: not look, and "could not look" is not "nothing there".  lib_daemon_watch
+#: keeps its own copy of this constant: it imports this module, so this module
+#: cannot import it back.
+_PROC_GONE_ERRNOS = frozenset({errno.ENOENT, errno.ESRCH})
+
+
+def _read_proc(pid, filename: str, proc_root: str = "/proc"):
+    """`(status, text)` for `/proc/<pid>/<filename>`.
+
+    Callers branch on the status: `_PROC_GONE` is a real answer (the process
+    ended), `_PROC_UNREADABLE` is the absence of one.
+    """
+    try:
+        path = Path(proc_root, str(int(pid)), filename)
+    except (TypeError, ValueError):
+        return _PROC_UNREADABLE, ""
+    try:
+        return _PROC_OK, path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        if exc.errno in _PROC_GONE_ERRNOS:
+            return _PROC_GONE, ""
+        return _PROC_UNREADABLE, ""
+
+
+def _proc_stat_fields(pid, proc_root: str = "/proc"):
+    """`(status, fields)` where fields are `/proc/<pid>/stat` from field 3 on.
 
     comm (field 2) is parenthesised and may itself contain spaces and ')', so
     the split is after the LAST ')'.  Same parse as
     lib_daemon_watch.process_generation() — kept here rather than imported to
     avoid a cycle (lib_daemon_watch imports this module).
+
+    Indices into `fields`: 0 state, 1 ppid, 2 pgrp, 3 session, 4 tty_nr,
+    5 tpgid, … 19 starttime.
     """
+    status, stat = _read_proc(pid, "stat", proc_root)
+    if status != _PROC_OK:
+        return status, []
     try:
-        stat = Path(proc_root, str(int(pid)), "stat").read_text(encoding="utf-8")
-    except (OSError, TypeError, ValueError):
-        return None
-    try:
-        return stat[stat.rindex(")") + 2:].split()
+        return _PROC_OK, stat[stat.rindex(")") + 2:].split()
     except ValueError:
-        return None
+        return _PROC_UNREADABLE, []      # not a stat line we understand
+
+
+def _proc_stat_tail(pid, proc_root: str = "/proc") -> Optional[List[str]]:
+    """`_proc_stat_fields()` collapsed to the old Optional shape."""
+    status, fields = _proc_stat_fields(pid, proc_root)
+    return fields if status == _PROC_OK else None
 
 
 def _process_comm(pid, proc_root: str = "/proc") -> Optional[str]:
     """The process name between the parentheses of `/proc/<pid>/stat`."""
-    try:
-        stat = Path(proc_root, str(int(pid)), "stat").read_text(encoding="utf-8")
-    except (OSError, TypeError, ValueError):
+    status, stat = _read_proc(pid, "stat", proc_root)
+    if status != _PROC_OK:
         return None
     try:
         return stat[stat.index("(") + 1:stat.rindex(")")]
@@ -256,12 +293,25 @@ def _process_comm(pid, proc_root: str = "/proc") -> Optional[str]:
         return None
 
 
+def _process_argv(pid, proc_root: str = "/proc") -> Optional[List[str]]:
+    """`/proc/<pid>/cmdline` as a list, or None when it cannot be read."""
+    status, raw = _read_proc(pid, "cmdline", proc_root)
+    if status != _PROC_OK:
+        return None
+    return [arg for arg in raw.split("\0") if arg]
+
+
 def _live_children(pid, proc_root: str = "/proc") -> Optional[List[int]]:
-    """Live, non-zombie children of `pid`; None when /proc cannot be listed.
+    """Live, non-zombie children of `pid`; None when the walk was incomplete.
 
     `None` and `[]` are different answers and callers must keep them apart:
     "could not look" is not "nothing there" — the distinction this repo has
     now had to make at three separate layers.
+
+    The distinction is per entry.  An entry that vanished mid-walk was never a
+    live child, but one we could not *read* might be, and a list that quietly
+    omitted it would be read as "this pane is empty" by the one caller that
+    then launches something into it.
     """
     try:
         pid = int(pid)
@@ -275,37 +325,119 @@ def _live_children(pid, proc_root: str = "/proc") -> Optional[List[int]]:
     for entry in entries:
         if not entry.name.isdigit():
             continue
-        tail = _proc_stat_tail(entry.name, proc_root)
-        if tail is None or len(tail) < 2:
+        status, tail = _proc_stat_fields(entry.name, proc_root)
+        if status == _PROC_GONE:
             continue          # exited between listing and read — not a child
+        if status != _PROC_OK or len(tail) < 2:
+            return None       # could not read it — this walk proves nothing
         if tail[0] == "Z":
             continue          # a zombie has already stopped running
         try:
             if int(tail[1]) == pid:
                 found.append(int(entry.name))
         except ValueError:
-            continue
+            return None
     return sorted(found)
 
 
+#: How long spawn() waits for a reused pane to actually be running something.
+#: Only the husk path pays it, and only when the launch fails — a daemon that
+#: starts is seen on the first or second poll.  Overridable for slow machines
+#: (and for tests that deliberately let it expire) via
+#: CREWVIA_MUX_LAUNCH_VERIFY_SECONDS.
+_LAUNCH_VERIFY_SECONDS = 10.0
+_LAUNCH_VERIFY_POLL = 0.25
+
+
+def _launch_verify_seconds() -> float:
+    try:
+        value = float(os.environ.get("CREWVIA_MUX_LAUNCH_VERIFY_SECONDS", ""))
+    except ValueError:
+        return _LAUNCH_VERIFY_SECONDS
+    return value if value > 0 else _LAUNCH_VERIFY_SECONDS
+
+
+def _wait_until_launched(is_running, *, warn, name: str) -> bool:
+    """True once `is_running()` says yes; False if it never does.
+
+    Relaunching into an existing pane means *typing into a shell*, and a shell
+    accepts anything.  If it was in fact still busy — the one case /proc cannot
+    rule out, an interactive `read` — the launch command is swallowed as input
+    and nothing starts, while every caller above is told the daemon is back.
+    The peer would record a respawn, spend its grace period and a flap slot,
+    and watch the same corpse.  So the pane is asked afterwards, and the answer
+    to "did it start" is the pane's, not the send's.
+    """
+    limit = _launch_verify_seconds()
+    deadline = time.time() + limit
+    while True:
+        if is_running():
+            return True
+        if time.time() >= deadline:
+            warn(f"spawn {name!r}: nothing is running in the pane "
+                 f"{limit:.0f}s after the launch command — treating the spawn as "
+                 "failed (the pane may have taken it as input)")
+            return False
+        time.sleep(_LAUNCH_VERIFY_POLL)
+
+
 def _pane_shell_is_idle(pane_pid, proc_root: str = "/proc") -> bool:
-    """True only when `pane_pid` is provably a shell with nothing running under it.
+    """True only when `pane_pid` is provably an interactive shell at a prompt.
 
-    Two things must hold, and either one alone would be wrong:
+    Being a shell with no children is **not** that.  All of these are shells,
+    all of them have no children, and all of them are working:
 
-      - the pid is a **shell**.  A pane whose root process is not a shell was
-        not left behind by a dead child; treating it as idle would relaunch on
-        top of whatever it is.
-      - it has **no live children**.  This is what separates a prompt from a
-        shell running work, and unlike the foreground-process-group test it
-        also counts a job that was backgrounded.
+        bash script.sh          a script whose work is builtins only
+        bash -c 'while :; …'    same, one level shorter
+        bash < pipe             reading its input from somewhere that is not
+                                a terminal
+
+    Sending a launch command into any of them does not start a daemon: at best
+    it is ignored, at worst it is read as *data* by whatever is running.  So
+    idleness has to be shown, not assumed, and every check below is one of the
+    ways these differ from a pane sitting at its prompt:
+
+      1. the process is a **shell** (a pane rooted at something else was not
+         left behind by a dead child);
+      2. it was invoked as a **bare** shell — argv is just the shell itself,
+         which no `bash script.sh` and no `bash -c` can be;
+      3. it has a **controlling terminal**, and
+      4. **its own process group is that terminal's foreground** — together,
+         "this shell is the thing the pane is talking to";
+      5. it is **sleeping**, not running — a builtin loop burns CPU in R;
+      6. it has **no live children**, counted completely (backgrounded jobs
+         included).
 
     Every unreadable answer returns False (= busy).  The direction to fail in
     is "do not start a second one" (knowledge/daemon-authority.md §7-1).
+
+    What this still cannot see: a shell blocked in an interactive `read` looks
+    identical to one blocked at its prompt — same state, same argv, same
+    foreground group — because at that level it *is* the same thing.  That gap
+    is closed one layer up, by spawn() verifying that something actually
+    started rather than trusting that the command was accepted.
     """
+    status, fields = _proc_stat_fields(pane_pid, proc_root)
+    if status != _PROC_OK or len(fields) < 6:
+        return False
+
     comm = _process_comm(pane_pid, proc_root)
     if comm is None or comm.lstrip("-") not in _SHELL_PROCESS_NAMES:
         return False
+
+    argv = _process_argv(pane_pid, proc_root)
+    if argv is None or len(argv) != 1:
+        return False
+
+    if fields[0] != "S":              # R = busy, T/D = not answering a prompt
+        return False
+    try:
+        pgrp, tty_nr, tpgid = int(fields[2]), int(fields[4]), int(fields[5])
+    except ValueError:
+        return False
+    if tty_nr == 0 or tpgid <= 0 or tpgid != pgrp:
+        return False
+
     children = _live_children(pane_pid, proc_root)
     if children is None:
         return False
@@ -452,7 +584,11 @@ class TmuxBackend(_Backend):
                         f"spawn {name!r}: window holds only an idle shell "
                         "(crashed?) — relaunching in place"
                     )
-                    return self.send(name, cmd)
+                    if not self.send(name, cmd):
+                        return False
+                    return _wait_until_launched(
+                        lambda: self._pane_has_live_process(name),
+                        warn=self._warn, name=name)
                 r = subprocess.run(
                     ["tmux", "new-window", "-t", session, "-n", name],
                     capture_output=True, timeout=5,
@@ -1204,6 +1340,10 @@ class HerdrBackend(_Backend):
                 )
                 if _herdr_run("pane_run", [existing_pane_id, cmd], timeout=10) is None:
                     self._warn(f"spawn {name!r}: pane run failed on reused pane")
+                    return False
+                if not _wait_until_launched(
+                        lambda: self._pane_has_live_process(existing_pane_id),
+                        warn=self._warn, name=name):
                     return False
                 self._write_cache(name, pane.get("tab_id") or "", existing_pane_id)
                 return True

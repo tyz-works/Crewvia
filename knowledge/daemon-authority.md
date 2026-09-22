@@ -1304,6 +1304,49 @@ backend 間で強さが揃う。tmux 側は t035 で足した — それまで�
 判定表側の双子は `test_a_husk_tab_does_not_veto_the_respawn` と
 `test_a_refused_spawn_holds_instead_of_claiming_a_respawn`。
 
+#### 7-3-2. 「子が無いシェル」は「プロンプトに居るシェル」ではない (t036)
+
+t035 の husk 判別は **comm がシェルで、生きた子が居ない** の 2 つだけを見ていた。
+これは緩すぎる。次はどれもシェルで、どれも子を持たず、どれも仕事中である:
+
+    bash script.sh          builtin だけで完結するスクリプト
+    bash -c 'while :; …'    同じものの短い形
+    bash < pipe             端末ではない入力を読んでいる非対話シェル
+
+ここへ launch コマンドを送り込んでも デーモンは起動しない。最悪の場合、走っている
+処理が**それを入力として食う**。よって idle は「仮定する」ものではなく「示す」もの
+とし、`_pane_shell_is_idle()` は 6 点すべてを要求する: シェルであること / **引数
+無しで起動された** こと (`bash script.sh` も `bash -c` もここで落ちる) / 制御端末が
+あること / **自分のプロセスグループがその端末の前景** であること / state が S
+(builtin ループは R で回る) / 生きた子が 1 つも無いこと。
+
+それでも残る穴が 1 つある。**対話シェルが `read` で止まっている状態は、プロンプトで
+止まっている状態と /proc 上で完全に同一** である (state も argv も tpgid も同じ)。
+区別が付かない以上、判定層では閉じられない。閉じるのは 1 層上で、
+`spawn()` が husk へ相乗りしたときだけ**送った後に「本当に何か走り出したか」を
+pane に問い直す** (`_wait_until_launched`, 既定 10 秒)。走っていなければ spawn は
+False を返し、相互監視は respawn を記録せず hold する。これが無いと、コマンドを
+食われた 1 回が「成功した respawn」として grace と flap 枠を消費する。
+
+回帰は実プロセス:
+`tests/test_daemon_husk_respawn.py::test_a_shell_running_a_script_is_not_idle` ほか
+と、実 tmux で `read` 中のペインへ spawn する
+`test_spawn_does_not_claim_success_when_the_pane_swallows_the_command`。
+逆側 (本物の husk は idle のままで respawn できる) は
+`test_a_real_interactive_shell_at_its_prompt_is_idle` が固定している。
+
+#### 7-3-3. 読めなかった /proc エントリは「不在」ではない (t036)
+
+`scan_daemon_pids()` は `cmdline` の OSError をすべて「終了した」として skip して
+いた。権限エラーや読み取り失敗は不在の証明ではないのに、**不完全な走査が
+「何も走っていない」として respawn の条件を満たしてしまう**。`_live_children()` も
+同じ前提で、読めない stat があると「子が居ない」= 空いている pane と答えていた。
+
+分けるのは errno で、**ENOENT / ESRCH だけが「本当に居ない」**。走査中にプロセスが
+終わるのは日常なのでこれを不明扱いにすると respawn が二度と起きない (過剰修正)。
+それ以外は 1 件でも出たら走査全体を `None` (= 保留) にする。`hidepid` のマシンでは
+毎回 hold になるが、それが正しい倒れ方であり、出口は §7-4 の 30 分報告である。
+
 ### 7-4. 保留には必ず出口を付ける
 
 上の表の `hold` はどれも「次の cycle でもう一度見る」であり、一過性の原因
@@ -1326,8 +1369,18 @@ backend 間で強さが揃う。tmux 側は t035 で足した — それまで�
 打った spawn が上に乗る = 二重起動になる。
 
 `registry/daemons/<name>.paused` がある間は respawn しない。順序が効くので、
-`restart()` は **pause → kill → spawn → resume** で実行する (kill を先にすると
-上記の隙間が開いたままになる。回帰: `test_restart_helper_pauses_before_killing`)。
+`restart()` は **lock → pause → kill → spawn → resume** で実行する (kill を先に
+すると上記の隙間が開いたままになる。回帰:
+`test_restart_helper_locks_then_pauses_then_kills`)。先頭のロックが §7-10、
+その次の pause が**成功したときだけ**先へ進むのが次の段落である。
+
+**マーカーが disk に残っていなければ、破壊的ステップに進んではいけない (t036)。**
+`pause()` は `write_json_atomic()` の戻り値を見たうえで**読み直して token が
+一致すること**まで確かめ、駄目なら `None` を返す。書けなかったのに token を返すのは
+「保護がある」という嘘で、その嘘の直後に kill が走る。`restart()` は `None` を見たら
+**何も kill せずに** False を返し、CLI の `pause` も非ゼロで終わる (回帰:
+`test_restart_does_not_kill_when_the_pause_marker_cannot_be_persisted` /
+`test_pause_cli_exits_nonzero_when_the_marker_cannot_be_persisted`)。
 
 マーカーは `token` で **その restart 実行に束縛** する。名前だけで束縛すると、
 重なった 2 回の restart のうち先に終わった方の `resume` が、まだ作業中の方の保護を
@@ -1366,8 +1419,9 @@ pause してから** kill すること。片方だけ pause して kill する�
 ### 7-7. 起動コマンドの単一の出どころ
 
 respawn のコマンドは `spawn_command()` が唯一の出どころで、`start.sh` も
-`lib_daemon_watch.py spawn-cmd <name>` を呼んでこれを使う
-(回帰: `test_respawn_command_matches_start_sh`)。
+`lib_daemon_watch.py spawn <name>` (= ロックを取ってから `spawn_command()` で
+起動する経路) を呼んでこれを使う (回帰: `test_respawn_command_matches_start_sh` /
+`test_start_sh_launches_the_daemons_through_the_locked_path`)。
 
 同じ文字列を 2 箇所に置くと、**どちらの backend と話すかを決める変数だけが片方に無い**
 という形でずれる。`Mux.spawn()` の `env=` 引数は **両 backend とも無視する** ので、
@@ -1381,9 +1435,35 @@ herdr はさらにサーバー起動時の env を全ペインに継承するた
 引いて空で返り、**相互監視が無言で恒久 hold に縮退する**。t006 QA が隔離環境で実際に
 踏んだ (`CREWVIA_MUX=tmux` だけが env に入り `tmux list-windows -t crewvia` が失敗)。
 本番は既定名なので露見しない = 既定以外を使い始めた瞬間に静かに壊れる形だった。
-`_SPAWN_ENV_VARS` に 3 つ並べ、値は必ず単一引用で囲って **データとして** 渡す
+`_SPAWN_ENV_VARS` に並べ、値は必ず単一引用で囲って **データとして** 渡す
 (回帰: `test_spawn_command_carries_the_mux_destination_too` /
 `test_spawn_command_quotes_a_hostile_session_name`)。
+
+#### 何を引き継ぎ、何を引き継がないか (t036)
+
+mux の 3 変数だけでは足りない。起こし直されたデーモンが**別の設定で動く**なら、
+それは復旧ではなく「同じ名前の別のデーモン」を起動したことになる。運ぶのは
+**非機密の運用上書き** に限った allowlist:
+
+| 群 | 変数 | 落としたときに起きること |
+|---|---|---|
+| mux | `CREWVIA_MUX` / `CREWVIA_MUX_ENABLED` / `CREWVIA_TMUX_SESSION` / `CREWVIA_HERDR_WORKSPACE` / `CREWVIA_HERDR_SOCK` | 別の backend・別のセッションを向き、相互監視が無言で hold に縮退する |
+| 運用 | `CREWVIA_QUEUE` / `CREWVIA_KILL_AUTHORITY` / `CREWVIA_TASKVIA` / `CREWVIA_PROJECT` / `CREWVIA_NOTIFY_CACHE` / `CREWVIA_SPAWN_GRACE` / `CREWVIA_STATE_GRACE` / `CREWVIA_BENCH_MODE` | **別の queue を割り当て始める**。kill 権限が dispatcher と watchdog で食い違う (§5 が「どちらに倒しても必ず壊れる」と書いている状態)。隔離 QA のデーモンが本番の notify cache に戻る |
+| 相互監視 | `CREWVIA_DAEMON_*` (§7-8 の全キー) | 起こされた側だけ既定しきい値に戻り、緩めた側を stale と読んで起こし返す = 相互監視が自分で flap を作る |
+
+**運ばないもの** — `TASKVIA_TOKEN` / `NTFY_PASS` / `NTFY_USER` などの機密、
+`AGENT_NAME` / `TASK_ID` などの Worker 固有値、`HERDR_ENV` / `TMUX` などの mux 内部値。
+コマンド文字列は `ps` にもペインの履歴にも mux のログにも残るので、**機密を埋め込む
+のは漏洩**である。機密は今まで通りペインが作られる env 経由で渡り、無ければ
+Taskvia 同期が落ちるだけ (= 安全側) に縮退する。`os.environ` を丸ごと運ぶ「素朴な
+修正」は、この漏洩と、herdr server の古い env を引きずる既知の罠
+(memory: `herdr-server-stale-env-inheritance`) を同時に踏む。
+
+allowlist は**推移的**に効く: これらはデーモン自身の env に export されるので、
+そのデーモンが後で相手を起こすときにも同じ値が乗る。
+(回帰: `test_spawn_command_carries_the_operational_overrides` /
+`test_spawn_command_carries_the_mutual_watch_settings` /
+`test_spawn_command_does_not_carry_secrets`)
 
 ### 7-8. しきい値 (`config/crewvia.yaml` の `daemons:`)
 
@@ -1396,8 +1476,48 @@ herdr はさらにサーバー起動時の env を全ペインに継承するた
 | `flap_window_seconds` / `flap_threshold` | 900 / 3 | §7-6 |
 | `hold_report_after_seconds` | 1800 | §7-4 |
 | `pause_report_after_seconds` | 1800 | §7-5 |
+| `watch_lock_timeout_seconds` | 2 | §7-10。watch 側は短く — 取れなければ保留するだけ |
+| `maintenance_lock_timeout_seconds` | 60 | §7-10。人が待っている操作なので進行中の判定に並ぶ |
 
 env での上書きは `CREWVIA_DAEMON_<KEY 大文字>` (例: `CREWVIA_DAEMON_MUTUAL_WATCH=0`)。
+
+### 7-10. 決定を直列化する — マーカーだけでは閉じない (t036, 2026-09-23)
+
+§7-5 のマーカーは「意図的な停止」を**伝える**手段であって、判定と maintenance を
+**排他にする**手段ではなかった。実際の壊れ方:
+
+    watcher  : マーカーを読む → 無い
+    operator : マーカーを書く → peer を kill
+    watcher  : そのまま spawn            ← 手動 spawn と並んで 2 つ起動する
+
+読んだ瞬間と spawn する瞬間は別の瞬間で、その間に何でも起こる。両 backend の
+「既にあるか見てから作る」も 2 段階なので排他にはならない (spawn の拒否は最後の
+防壁であって相互排除ではない)。PR #205 が 6 巡かけて学んだ
+**「決定は、書き込む瞬間が直列化されていて初めて決定になる」** と同型である。
+
+したがって **デーモン 1 つにつき 1 つのロック** (`registry/daemons/<name>.lock`、
+`flock`) を置き、次の 3 つを同じロックで囲う:
+
+1. watch の判定全体 — マーカーの読み → 生死の判定 → spawn → 記録 (`DaemonWatch._decide`)
+2. maintenance — `pause` → kill → spawn → `resume` (`restart()`, `pause()`)
+3. 起動そのもの — `./crewvia` (`spawn_daemon()` / CLI `spawn`)
+
+3 を入れるのが肝心で、**起動主体は 3 つある**。2 つだけ囲っても、相手が respawn を
+決めた直後に人が `./crewvia` を叩けば同じ二重起動になる。
+
+マーカーファイルではなく `flock` なのは、**保持者が死ねばカーネルが外す**からである。
+クラッシュした restart が残したロックが居座ると相互監視が恒久的に止まり、それは
+まさにマーカーの stale 報告が拾おうとしている故障そのものになる。
+
+ロックが取れなかった側は**必ず何もしない**: watch は 1 サイクル hold (次の周期で
+また見る)、maintenance と launcher は非ゼロで終わる。ロックファイルすら作れない
+環境も同じ扱い — 直列化できないなら破壊的なことをする資格が無い。
+
+回帰: `tests/test_daemon_watch_hardening.py` の §1
+(`test_a_restart_in_progress_stops_the_watcher_from_spawning` /
+`test_the_decision_and_the_spawn_happen_under_one_lock` /
+`test_a_pause_cannot_slip_in_while_a_decision_is_in_flight` /
+`test_the_launcher_also_starts_daemons_under_the_lock`)。
 
 **しきい値を詰めすぎないこと。** 1 回遅いサイクルが「死亡」に見えた瞬間、それは
 7-1 の二重起動である。stale 判定は respawn の入口にすぎず、そこから 4 の実在確認に

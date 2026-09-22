@@ -648,7 +648,20 @@ case "${cmd1}" in
         exit 0
         ;;
       run)
-        # JSON response
+        # JSON response.
+        #
+        # A real `pane run` puts a process in the pane, so the next
+        # process-info reports it.  The fake has to model that: spawn() now
+        # verifies after relaunching into a husk, and a fake that kept
+        # answering "still an idle shell" would make every husk reuse look
+        # like a swallowed command (t036).
+        #
+        # FAKE_PANE_RUN_SWALLOWED=1 keeps the pane idle on purpose — that is
+        # the pane-ate-the-command case, and it must stay reachable.
+        if [[ "${FAKE_PANE_RUN_SWALLOWED:-0}" != "1" ]]; then
+          printf '%s' '[{"name":"claude","pid":4243,"argv":["claude"],"cmdline":"claude"}]' \
+            > "$FAKE_PANE_PROCS"
+        fi
         echo "{\"result\":{\"type\":\"ok\"}}"
         exit 0
         ;;
@@ -898,6 +911,28 @@ print('herdr backend selected OK')
     # Never relaunch when we cannot prove the pane is idle.
     ! herdr_log_contains "pane run"
     ! herdr_log_contains "tab create"
+}
+
+@test "herdr spawn: a husk that swallows the command is not a successful spawn" {
+    setup_fake_herdr
+    # The one case /proc (and process-info) cannot rule out: the pane's shell
+    # is blocked reading input, so `pane run` lands as *text* and nothing
+    # starts.  spawn() must answer with what the pane is running afterwards,
+    # not with whether the command was accepted — otherwise mutual watch
+    # records a respawn, burns its grace period and a flap slot, and the
+    # daemon is still dead.
+    echo "Omar-worker" > "$FAKE_PANE_LABEL"
+    echo '[{"name":"bash","pid":3827260,"argv":["/bin/bash"],"cmdline":"/bin/bash"}]' > "$FAKE_PANE_PROCS"
+    export FAKE_PANE_RUN_SWALLOWED=1
+    export CREWVIA_MUX_LAUNCH_VERIFY_SECONDS=1
+
+    run python3 "$LIB_MUX_PY" spawn "Omar-worker" "claude --revived"
+    [ "$status" -eq 1 ]
+
+    # It did try — the point is the answer, not the attempt.
+    herdr_log_contains "pane run ${FAKE_PANE_ID} claude --revived"
+
+    rm -f "${REPO_ROOT}/registry/mux/Omar-worker.json"
 }
 
 @test "herdr spawn: reusing a husk refreshes the pane id cache" {

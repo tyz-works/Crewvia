@@ -92,9 +92,13 @@ CLI:
 from __future__ import annotations
 
 import argparse
+import contextlib
+import errno
+import fcntl
 import json
 import os
 import sys
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -169,9 +173,139 @@ def reports_path(registry_dir, name: str) -> Path:
     return daemons_dir(registry_dir) / f"{name}.reports.json"
 
 
+def lock_path(registry_dir, name: str) -> Path:
+    """The file whose flock serialises every decision *about* `name`."""
+    return daemons_dir(registry_dir) / f"{name}.lock"
+
+
+# ---------------------------------------------------------------------------
+# Serialisation — one decision about a daemon at a time
+# ---------------------------------------------------------------------------
+#
+# The pause marker alone does not make maintenance and mutual watch exclusive.
+# Writing it before the kill only shortens the window; it does not close it:
+#
+#     watcher : reads the marker  → none
+#     operator: writes the marker → kills the peer
+#     watcher : spawns                       ← next to the operator's own spawn
+#
+# The watcher's read and its spawn are two separate instants, and anything can
+# happen in between.  Neither backend helps: both check for an existing window
+# and then create one as two steps, so "spawn refuses a live pane" is a last
+# line of defence, not mutual exclusion.  This is the same lesson PR #205 took
+# six rounds to learn — *a decision is only a decision if the moment it is
+# written down is serialised*.
+#
+# So the whole transaction (read the marker → judge → spawn → record) runs
+# under one lock per daemon, and maintenance takes the same lock.  flock is
+# used rather than a marker file because the kernel releases it when the
+# holder dies: a lock that outlives a crashed restart would silently disable
+# mutual watch, which is the failure mode the marker's stale-report exists to
+# catch in the first place.
+
+#: Watch runs every cycle and must not stall it; maintenance is a person
+#: waiting at a terminal and should queue behind whatever is in flight.
+WATCH_LOCK_TIMEOUT_SECONDS = 2.0
+MAINTENANCE_LOCK_TIMEOUT_SECONDS = 60.0
+
+_LOCK_POLL_SECONDS = 0.05
+
+#: flock is per *open file description*: a second `open()` of the same path in
+#: the same process conflicts with the first, so re-entrancy (restart → pause)
+#: has to be tracked here rather than left to the kernel.  Keyed by path, and
+#: re-entrant only for the thread that actually holds it — another thread must
+#: wait exactly as another process does, or the tests that drive both sides at
+#: once would pass while production still races.
+_LOCK_GUARD = threading.Lock()
+_LOCK_SLOTS: dict = {}
+
+
+def _lock_slot(path: str) -> dict:
+    with _LOCK_GUARD:
+        slot = _LOCK_SLOTS.get(path)
+        if slot is None:
+            slot = {"tlock": threading.Lock(), "owner": None, "depth": 0}
+            _LOCK_SLOTS[path] = slot
+        return slot
+
+
+@contextlib.contextmanager
+def daemon_lock(registry_dir, name: str, *,
+                timeout: float = MAINTENANCE_LOCK_TIMEOUT_SECONDS):
+    """Hold the per-daemon lock for the duration of the block.
+
+    Yields True when the lock is held and False when it could not be taken —
+    including when the lock file itself cannot be created.  Every caller must
+    branch on it, and every "no" is a reason *not* to act: the thing on the
+    other side of this lock is either a respawn or a maintenance restart, and
+    doing one while the other is in flight is the double start.
+    """
+    path = str(lock_path(registry_dir, name))
+    slot = _lock_slot(path)
+    me = threading.get_ident()
+
+    if slot["owner"] == me:                      # re-entrant, same thread
+        slot["depth"] += 1
+        try:
+            yield True
+        finally:
+            slot["depth"] -= 1
+        return
+
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    if not slot["tlock"].acquire(timeout=max(0.0, deadline - time.monotonic())):
+        yield False
+        return
+
+    fd = None
+    try:
+        try:
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o644)
+        except OSError:
+            # No lock file means no serialisation, and no serialisation means
+            # no permission to do anything destructive.
+            yield False
+            return
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    yield False
+                    return
+                time.sleep(_LOCK_POLL_SECONDS)
+        slot["owner"] = me
+        slot["depth"] = 1
+        try:
+            yield True
+        finally:
+            slot["owner"] = None
+            slot["depth"] = 0
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        slot["tlock"].release()
+
+
 # ---------------------------------------------------------------------------
 # Process identity — PID plus generation
 # ---------------------------------------------------------------------------
+
+#: The only read failures that mean "this process is not there".  Everything
+#: else (EACCES under hidepid, EIO, EPERM …) means "could not look", and the
+#: two must never collapse into one answer.  lib_mux keeps its own copy: it is
+#: imported *by* this module, so it cannot import back.
+_PROC_GONE_ERRNOS = frozenset({errno.ENOENT, errno.ESRCH})
+
 
 def process_generation(pid, *, proc_root: str = "/proc") -> Optional[str]:
     """`"<pid>:<starttime>"`, or None when it cannot be read.
@@ -235,6 +369,15 @@ def scan_daemon_pids(repo_root, name: str, *, proc_root="/proc",
 
     `None` means "could not look" and is not the same answer as `[]`.  Callers
     hold on None; only an empty list is evidence of absence.
+
+    That distinction is made **per entry**, not just for the directory as a
+    whole.  A process that vanished between the listing and the read really is
+    gone (ENOENT), but a permission error or any other read failure proves
+    nothing — and a scan that silently dropped such an entry would report
+    "nothing running" on an incomplete walk, which is the one answer that
+    authorises a respawn.  Under `hidepid` this makes the scan answer None
+    every time; holding forever (with the 30-minute report as the way out) is
+    the correct direction to fail in.
     """
     root = Path(proc_root)
     needle = str(Path(repo_root) / "scripts" / SCRIPT_OF[name])
@@ -253,8 +396,10 @@ def scan_daemon_pids(repo_root, name: str, *, proc_root="/proc",
             continue
         try:
             argv = (entry / "cmdline").read_bytes().split(b"\0")
-        except OSError:
-            continue  # exited between listing and read — genuinely not there
+        except OSError as exc:
+            if exc.errno in _PROC_GONE_ERRNOS:
+                continue      # exited between listing and read — really gone
+            return None       # could not read it — the walk is incomplete
         if not any(arg.decode("utf-8", "replace") == needle for arg in argv):
             continue
         try:
@@ -271,15 +416,72 @@ def scan_daemon_pids(repo_root, name: str, *, proc_root="/proc",
 # Launch command — one source of truth, shared with start.sh
 # ---------------------------------------------------------------------------
 
-#: Everything the launched daemon needs in order to talk to the *same* mux as
-#: its launcher.  CREWVIA_MUX alone decides the *backend* but not the
-#: *destination*: a daemon that inherits only the mode falls back to the
-#: default session / workspace name, and then every mux verb it performs lands
-#: somewhere nobody is looking — it would spawn its own peer into a session no
-#: one is attached to and report to a Director that isn't there.  The QA
-#: harness hit this for real (t006 QA FINDING-2); production is invisible to
-#: it only because production uses the default names.
-_SPAWN_ENV_VARS = ("CREWVIA_MUX", "CREWVIA_TMUX_SESSION", "CREWVIA_HERDR_WORKSPACE")
+#: Which mux, and — just as important — *which one of it*.  CREWVIA_MUX alone
+#: decides the backend but not the destination: a daemon that inherits only
+#: the mode falls back to the default session / workspace name, and then every
+#: mux verb it performs lands somewhere nobody is looking — it would spawn its
+#: own peer into a session no one is attached to and report to a Director that
+#: isn't there.  The QA harness hit this for real (t006 QA FINDING-2);
+#: production is invisible to it only because production uses the default
+#: names.
+_SPAWN_ENV_MUX = (
+    "CREWVIA_MUX",
+    "CREWVIA_MUX_ENABLED",
+    "CREWVIA_TMUX_SESSION",
+    "CREWVIA_HERDR_WORKSPACE",
+    "CREWVIA_HERDR_SOCK",
+)
+
+#: What the daemon *does*, and to whose files.  A respawn that drops these
+#: does not bring the daemon back — it starts a different daemon wearing the
+#: same name:
+#:
+#:   CREWVIA_QUEUE            it begins assigning out of another queue
+#:   CREWVIA_KILL_AUTHORITY   dispatcher and watchdog end up disagreeing about
+#:                            who may end a Worker, which dispatcher's own code
+#:                            calls out as guaranteed breakage in both
+#:                            directions (nobody closes a window, or two kills
+#:                            land on a reused name)
+#:   CREWVIA_TASKVIA          a "disabled" run starts talking to Taskvia again
+#:   CREWVIA_NOTIFY_CACHE     an isolated QA daemon rejoins production's shared
+#:                            notify cache — the exact shape that produced a
+#:                            false PASS before (memory:
+#:                            dispatcher-isolated-qa-harness)
+#:   CREWVIA_*_GRACE, BENCH   timing overrides a harness set on purpose
+_SPAWN_ENV_OPERATIONAL = (
+    "CREWVIA_QUEUE",
+    "CREWVIA_KILL_AUTHORITY",
+    "CREWVIA_TASKVIA",
+    "CREWVIA_PROJECT",
+    "CREWVIA_NOTIFY_CACHE",
+    "CREWVIA_SPAWN_GRACE",
+    "CREWVIA_STATE_GRACE",
+    "CREWVIA_BENCH_MODE",
+)
+
+#: The mutual watch's own settings.  Asymmetry here is self-inflicted flap:
+#: a checkout running with relaxed thresholds respawns its peer, the peer comes
+#: back with the shipped defaults, reads the relaxed side as stale, and starts
+#: it again.
+_SPAWN_ENV_WATCH = ("CREWVIA_DAEMON_MUTUAL_WATCH",) + tuple(
+    f"CREWVIA_DAEMON_{key.upper()}" for key in (
+        "dispatcher_stale_seconds", "watchdog_stale_seconds",
+        "flap_window_seconds", "flap_threshold", "respawn_grace_seconds",
+        "pause_report_after_seconds", "hold_report_after_seconds",
+        "watch_lock_timeout_seconds", "maintenance_lock_timeout_seconds",
+    ))
+
+#: An allowlist, and deliberately not `os.environ`.  Carrying everything would
+#: (a) print TASKVIA_TOKEN / NTFY_PASS into `ps`, the pane's scrollback and
+#: every mux log, and (b) drag along whatever the herdr server happened to be
+#: born with — the stale-env trap this repo already has a memory note about.
+#: Secrets keep travelling the way they do today, through the environment the
+#: pane is created in; a daemon that comes back without one degrades (no
+#: Taskvia sync) instead of leaking it.
+#:
+#: Transitive by construction: because these are exported into the daemon's
+#: own environment, the daemon it later respawns receives them in turn.
+_SPAWN_ENV_VARS = _SPAWN_ENV_MUX + _SPAWN_ENV_OPERATIONAL + _SPAWN_ENV_WATCH
 
 
 def _sh_single_quote(value: str) -> str:
@@ -343,6 +545,12 @@ class WatchConfig:
     respawn_grace_seconds: int = 120
     pause_report_after_seconds: int = 1800
     hold_report_after_seconds: int = 1800
+    #: How long each side waits for the per-daemon lock (see `daemon_lock`).
+    #: The watch side is short on purpose — a watcher that blocks on the lock
+    #: is a watcher that is not running its own daemon's cycle, and holding is
+    #: free: it looks again next cycle.
+    watch_lock_timeout_seconds: int = 2
+    maintenance_lock_timeout_seconds: int = 60
 
     def stale_seconds_for(self, name: str) -> int:
         return (self.dispatcher_stale_seconds if name == DAEMON_DISPATCHER
@@ -352,7 +560,8 @@ class WatchConfig:
 _CONFIG_KEYS = (
     "dispatcher_stale_seconds", "watchdog_stale_seconds", "flap_window_seconds",
     "flap_threshold", "respawn_grace_seconds", "pause_report_after_seconds",
-    "hold_report_after_seconds",
+    "hold_report_after_seconds", "watch_lock_timeout_seconds",
+    "maintenance_lock_timeout_seconds",
 )
 
 
@@ -406,7 +615,8 @@ def load_config(config_path=None, env=None) -> WatchConfig:
 # Maintenance marker
 # ---------------------------------------------------------------------------
 
-def pause(registry_dir, name: str, *, reason: str = "", now=None) -> str:
+def pause(registry_dir, name: str, *, reason: str = "", now=None,
+          timeout: Optional[float] = None) -> Optional[str]:
     """Suppress respawn of `name`; returns the token that can lift it.
 
     Needed because the documented restart recipe is "kill, then spawn": in the
@@ -418,17 +628,44 @@ def pause(registry_dir, name: str, *, reason: str = "", now=None) -> str:
     would otherwise have the first one's `resume` lift the second one's
     protection, which is the same "name is not identity" mistake the rest of
     this module is built around.
+
+    **Returns None when the marker did not reach the disk** — a full disk, a
+    read-only registry, a directory that isn't one.  A token handed back for a
+    marker nobody can read is a promise of protection that does not exist, and
+    the caller's very next step is destructive.  Callers must treat None as
+    "do not proceed" (`restart()` does).
+
+    Taken under the daemon's lock so that it cannot land in the middle of a
+    watcher's decision: the peer must either see this marker or still be
+    waiting for the lock when it looks.
     """
+    with daemon_lock(registry_dir, name,
+                     timeout=(MAINTENANCE_LOCK_TIMEOUT_SECONDS
+                              if timeout is None else timeout)) as locked:
+        if not locked:
+            return None
+        return _write_pause_marker(registry_dir, name, reason=reason, now=now)
+
+
+def _write_pause_marker(registry_dir, name: str, *, reason: str = "",
+                        now=None) -> Optional[str]:
+    """The marker write itself.  Assumes the daemon's lock is already held."""
     token = uuid.uuid4().hex
     path = pause_path(registry_dir, name)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    write_json_atomic(path, {
+    ok = write_json_atomic(path, {
         "daemon": name,
         "token": token,
         "reason": reason,
         "created_at": float(now if now is not None else time.time()),
         "by_pid": os.getpid(),
     })
+    if not ok:
+        return None
+    # Read it back.  write_json_atomic() reports on the write; this reports on
+    # what a *reader* will find, which is the thing actually being promised.
+    marker = read_json(path)
+    if not marker or marker.get("token") != token:
+        return None
     return token
 
 
@@ -708,6 +945,26 @@ class DaemonWatch:
             return Verdict(ACTION_REFUSED,
                            f"self-identity check failed for {self.repo_root}")
 
+        # Everything from here to the spawn is one transaction.  Reading the
+        # pause marker outside it would only prove the marker was absent at
+        # *that* instant — which is exactly the gap a maintenance restart
+        # slips into (see `daemon_lock`).
+        with daemon_lock(self.registry_dir, peer,
+                         timeout=self.config.watch_lock_timeout_seconds) as locked:
+            if not locked:
+                # Somebody else is mid-decision about this daemon.  Holding
+                # costs one cycle; guessing costs two daemons.
+                return self._hold(
+                    self._read_state(), now,
+                    f"another restart or respawn of {peer} is in flight "
+                    f"(could not take {lock_path(self.registry_dir, peer)} within "
+                    f"{self.config.watch_lock_timeout_seconds}s)")
+            return self._decide(now)
+
+    def _decide(self, now: float) -> Verdict:
+        """The judgment itself.  Runs with this peer's lock held."""
+        peer = self.peer_name
+
         marker = read_pause(self.registry_dir, peer)
         if marker is not None:
             self._maybe_report_stale_pause(marker, now)
@@ -876,8 +1133,30 @@ def _fmt(down_seconds: Optional[float]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Restart helper
+# Launch / restart helpers
 # ---------------------------------------------------------------------------
+
+def spawn_daemon(name: str, *, repo_root=None, mux=None,
+                 timeout: float = MAINTENANCE_LOCK_TIMEOUT_SECONDS,
+                 log: Callable[[str], None] = print) -> bool:
+    """Start `name`, under its lock, with the one launch command.
+
+    There are three things that start a daemon — `./crewvia`, the peer's
+    mutual watch, and a maintenance restart — and a lock that only two of them
+    take is not a lock.  Running `./crewvia` while a peer has just decided to
+    respawn produces exactly the double start everything else here is built to
+    prevent, so the launcher comes through this door too.
+    """
+    repo_root = Path(repo_root) if repo_root is not None else _SCRIPTS_DIR.parent
+    mux = mux if mux is not None else Mux()
+    registry_dir = repo_root / "registry"
+    with daemon_lock(registry_dir, name, timeout=timeout) as locked:
+        if not locked:
+            log(f"[daemon-watch] spawn {name}: another restart or respawn is "
+                f"already in flight — not starting a second one")
+            return False
+        return bool(mux.spawn(name, spawn_command(name, repo_root),
+                              cwd=str(repo_root)))
 
 def restart(name: str, *, repo_root=None, mux=None, reason: str = "manual restart",
             log: Callable[[str], None] = print) -> bool:
@@ -893,18 +1172,38 @@ def restart(name: str, *, repo_root=None, mux=None, reason: str = "manual restar
     mux = mux if mux is not None else Mux()
     registry_dir = repo_root / "registry"
 
-    token = pause(registry_dir, name, reason=reason)
-    try:
-        mux.kill(name)
-        ok = bool(mux.spawn(name, spawn_command(name, repo_root), cwd=str(repo_root)))
-        if not ok:
-            log(f"[daemon-watch] restart {name}: spawn reported no start")
-        return ok
-    finally:
-        # Even on failure: leaving the marker behind would silently disable
-        # mutual watch for this daemon, and the stale-pause report is a
-        # 30-minute detour compared with just not leaking it.
-        resume(registry_dir, name, token=token)
+    # The whole transaction, not just the marker: the peer's judgment and its
+    # spawn are one interval too, so overlapping them is what produced the
+    # double start.  Taking the lock here also means the marker written below
+    # cannot appear *after* a peer has already decided to respawn.
+    with daemon_lock(registry_dir, name,
+                     timeout=MAINTENANCE_LOCK_TIMEOUT_SECONDS) as locked:
+        if not locked:
+            log(f"[daemon-watch] restart {name}: another restart or respawn is "
+                f"already in flight (could not take {lock_path(registry_dir, name)})")
+            return False
+
+        token = _write_pause_marker(registry_dir, name, reason=reason)
+        if token is None:
+            # No marker, no protection.  Killing now would hand the peer a
+            # daemon that is genuinely dead and has nothing saying why.
+            log(f"[daemon-watch] restart {name}: refused — the pause marker "
+                f"could not be written ({pause_path(registry_dir, name)}). "
+                f"Nothing was killed.")
+            return False
+        try:
+            mux.kill(name)
+            # Re-entrant: we already hold this daemon's lock, and the launch
+            # command must come from the same place as every other start.
+            ok = spawn_daemon(name, repo_root=repo_root, mux=mux, log=log)
+            if not ok:
+                log(f"[daemon-watch] restart {name}: spawn reported no start")
+            return ok
+        finally:
+            # Even on failure: leaving the marker behind would silently disable
+            # mutual watch for this daemon, and the stale-pause report is a
+            # 30-minute detour compared with just not leaking it.
+            resume(registry_dir, name, token=token)
 
 
 # ---------------------------------------------------------------------------
@@ -931,6 +1230,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         return sp
 
     _sub("spawn-cmd", "print the launch command for a daemon")
+    _sub("spawn", "start a daemon under its lock (the launcher's path)")
 
     p = _sub("beat", "write a heartbeat for a daemon")
     p.add_argument("--pid", type=int, default=None)
@@ -955,6 +1255,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.cmd == "spawn-cmd":
         print(spawn_command(args.name, repo_root))
         return 0
+
+    if args.cmd == "spawn":
+        # Same exit-code contract as `lib_mux.py spawn`, which start.sh used
+        # before: 0 = started, 1 = did not (already live there, or refused).
+        return 0 if spawn_daemon(args.name, repo_root=repo_root,
+                                 log=lambda m: print(m, file=sys.stderr)) else 1
 
     if args.cmd == "beat":
         DaemonWatch(registry_dir=registry_dir, repo_root=repo_root,
@@ -1003,7 +1309,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0
 
     if args.cmd == "pause":
-        print(pause(registry_dir, args.name, reason=args.reason))
+        token = pause(registry_dir, args.name, reason=args.reason)
+        if token is None:
+            # Nothing on stdout: a caller that captures the token must not be
+            # handed an empty string it will then pass to `resume`.
+            print(f"refused: could not persist the pause marker for {args.name} "
+                  f"({pause_path(registry_dir, args.name)}). "
+                  f"Mutual watch is NOT suppressed — do not kill it yet.",
+                  file=sys.stderr)
+            return 1
+        print(token)
         return 0
 
     if args.cmd == "resume":
@@ -1014,7 +1329,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0 if ok else 1
 
     if args.cmd == "restart":
-        return 0 if restart(args.name, repo_root=repo_root) else 1
+        # Refusals explain themselves on stderr (see restart()); the exit code
+        # is what a script driving this will actually branch on.
+        return 0 if restart(args.name, repo_root=repo_root,
+                            log=lambda m: print(m, file=sys.stderr)) else 1
 
     return 2  # pragma: no cover - argparse rejects unknown commands
 

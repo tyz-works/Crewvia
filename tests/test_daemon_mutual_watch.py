@@ -229,9 +229,12 @@ def test_respawn_command_matches_start_sh(repo):
     """
     start_sh = (REPO_ROOT / "scripts" / "start.sh").read_text(encoding="utf-8")
     for name in ("dispatcher", "watchdog"):
+        # t036: the launcher went one step further and now calls `spawn`,
+        # which builds the command *and* takes the daemon's lock — three
+        # starting points, one command, one lock.
         assert re.search(
-            rf"lib_daemon_watch\.py['\"]? spawn-cmd {name}", start_sh
-        ), f"start.sh does not build the {name} command via lib_daemon_watch spawn-cmd"
+            rf"lib_daemon_watch\.py['\"]? spawn(-cmd)? {name}", start_sh
+        ), f"start.sh does not launch {name} via lib_daemon_watch"
 
 
 def test_spawn_command_embeds_env_in_the_command_string(repo, monkeypatch):
@@ -647,13 +650,20 @@ def test_stale_pause_marker_is_reported_once(repo):
     assert len(mux.sent) == 1, f"stale-pause report repeated: {mux.sent}"
 
 
-def test_restart_helper_pauses_before_killing(repo):
-    """Order matters: the marker has to exist *before* the process goes away,
-    or the peer sees a dead daemon during the gap and races the manual spawn.
+def test_restart_helper_locks_then_pauses_then_kills(repo):
+    """Order matters, and t036 added a step in front of it.
+
+    The marker has to exist *before* the process goes away, or the peer sees a
+    dead daemon during the gap and races the manual spawn.  But the marker
+    alone never closed that gap: the peer can already have read "no marker"
+    and be on its way to a spawn.  So the lock comes first, the marker second,
+    and only then may anything be killed.
     """
     source = (SCRIPTS / "lib_daemon_watch.py").read_text(encoding="utf-8")
-    body = source.split("def restart(", 1)[1].split("\ndef ", 1)[0]
-    assert body.index("pause(") < body.index("kill("), \
+    body = source.split("\ndef restart(", 1)[1].split("\ndef ", 1)[0]
+    assert body.index("daemon_lock(") < body.index("_write_pause_marker("), \
+        "restart() writes its marker outside the daemon lock"
+    assert body.index("_write_pause_marker(") < body.index("kill("), \
         "restart() kills before it pauses — that gap is a double start"
 
 

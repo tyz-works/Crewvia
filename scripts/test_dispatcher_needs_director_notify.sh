@@ -103,7 +103,61 @@ stub = (
     "    _SENT.append({'target': name, 'message': text})\n"
     "    return True\n"
     "_mux.send = _stub_send\n"
-    "_mux.list = lambda *a, **kw: []\n"
+    # t032 F5 test needs a live Director by default (matches production's
+    # common case) so Tests 1-7 keep exercising the notify-sent path; the
+    # dedicated director-absent test below (inject_mux_stub_ext) overrides this.
+    "_mux.list = lambda *a, suffix=None, **kw: (['Sora-director'] if suffix == '-director' else [])\n"
+    "import atexit as _atexit_capture\n"
+    f"_CAPTURE_FILE = {capture_file!r}\n"
+    "_atexit_capture.register(lambda: open(_CAPTURE_FILE, 'w').write(_json_capture.dumps(_SENT)))\n"
+)
+src = src.replace(marker, stub, 1)
+open(path, 'w').write(src)
+INJECT
+}
+
+# inject_mux_stub_ext <extracted.py> <capture.json> <worker_names_csv> <director_names_csv> <state_value>
+# Like inject_mux_stub, but lets a test control exactly which -worker / -director
+# windows are "live" and what _mux.state()/_mux.capture() report — needed to drive
+# check_rule5() (Rule 5), which inject_mux_stub's fixed empty '-worker' list never
+# reaches (windows = tmux_list_worker_windows() short-circuits to [] otherwise).
+inject_mux_stub_ext() {
+  python3 - "$1" "$2" "$3" "$4" "$5" <<'INJECT'
+import sys
+path, capture_file, worker_csv, director_csv, state_value = sys.argv[1:6]
+src = open(path).read()
+marker = "_mux = Mux()"
+if marker not in src:
+    print("ERROR: injection point '_mux = Mux()' not found in dispatcher.sh — harness needs updating", file=sys.stderr)
+    sys.exit(1)
+worker_names = [n for n in worker_csv.split(',') if n]
+director_names = [n for n in director_csv.split(',') if n]
+stub = (
+    marker + "\n"
+    "import json as _json_capture\n"
+    f"_WORKER_NAMES = {worker_names!r}\n"
+    f"_DIRECTOR_NAMES = {director_names!r}\n"
+    "_SENT = []\n"
+    # Match HerdrBackend.send() (production backend): send() to a name whose
+    # pane isn't live returns False (pane not found), it does not silently
+    # succeed. Rule5/needs_director's "if tmux_send(...): ... else: log(...)"
+    # fallback depends on this to detect a Director-absent send attempt.
+    "def _stub_send(name, text):\n"
+    "    if name not in _WORKER_NAMES and name not in _DIRECTOR_NAMES:\n"
+    "        return False\n"
+    "    _SENT.append({'target': name, 'message': text})\n"
+    "    return True\n"
+    "_mux.send = _stub_send\n"
+    "def _stub_list(*a, suffix=None, **kw):\n"
+    "    if suffix == '-worker':\n"
+    "        return list(_WORKER_NAMES)\n"
+    "    if suffix == '-director':\n"
+    "        return list(_DIRECTOR_NAMES)\n"
+    "    return []\n"
+    "_mux.list = _stub_list\n"
+    f"_STATE_VALUE = {state_value!r}\n"
+    "_mux.state = lambda *a, **kw: _STATE_VALUE\n"
+    "_mux.capture = lambda *a, **kw: ''\n"
     "import atexit as _atexit_capture\n"
     f"_CAPTURE_FILE = {capture_file!r}\n"
     "_atexit_capture.register(lambda: open(_CAPTURE_FILE, 'w').write(_json_capture.dumps(_SENT)))\n"
@@ -163,6 +217,55 @@ run_dispatcher_cycle() {
     PYTHONPATH="$OWN_CHECKOUT_ROOT/scripts" \
     python3 "$extracted" "$queue" "$registry" "$notify_cache" "300" "60" \
       "$TMPDIR_TEST/dispatcher-cycle.log" >> "$TMPDIR_TEST/dispatcher-cycle.log" 2>&1
+}
+
+# run_dispatcher_cycle_ext <queue> <registry> <notify_cache> <capture.json>
+#   <worker_names_csv> <director_names_csv> <mux_state_value> <state_grace_seconds>
+# Like run_dispatcher_cycle, but drives check_rule5() (Rule 5) too: lets the
+# caller control which -worker/-director windows are live and what
+# _mux.state() reports (Rule 5's A/B conditions), plus STATE_GRACE (arg 5 to
+# dispatcher.sh) so grace-period waits don't require real wall-clock time in tests.
+#
+# Prints the per-cycle LOG_FILE path on stdout (so the caller can grep it for
+# exact log-line-count assertions). Unlike run_dispatcher_cycle, the python
+# process's own LOG_FILE arg is NOT the same path the shell redirects its
+# stdout/stderr into — log() writes each line to both stderr AND LOG_FILE, so
+# reusing one path for both would double-count every line.
+run_dispatcher_cycle_ext() {
+  local queue="$1" registry="$2" notify_cache="$3" capture="$4"
+  local worker_csv="$5" director_csv="$6" state_value="$7" state_grace="$8"
+  CYCLE_SEQ=$((CYCLE_SEQ + 1))
+  local extracted="$TMPDIR_TEST/cycle_ext_${CYCLE_SEQ}.py"
+  local logfile="$TMPDIR_TEST/dispatcher-cycle-ext-${CYCLE_SEQ}.log"
+  extract_dispatcher_cycle "$extracted" || return 1
+  inject_mux_stub_ext "$extracted" "$capture" "$worker_csv" "$director_csv" "$state_value" || return 1
+  env -u TASKVIA_TOKEN CREWVIA_TASKVIA=disabled TASKVIA_URL= \
+    PYTHONPATH="$OWN_CHECKOUT_ROOT/scripts" \
+    python3 "$extracted" "$queue" "$registry" "$notify_cache" "300" "$state_grace" \
+      "$logfile" >> "$TMPDIR_TEST/dispatcher-cycle.log" 2>&1
+  echo "$logfile"
+}
+
+# captured_rule5_messages_for <capture.json> <task_id> — like captured_messages_for
+# but restricted to "[Rule 5]" messages (needs_director/vanished_worker messages also
+# contain "task <id> " and would otherwise collide in the t032 F4 tests below).
+captured_rule5_messages_for() {
+  python3 - "$1" "$2" <<'PYEOF'
+import sys, json
+capture_file, task_id = sys.argv[1], sys.argv[2]
+try:
+    text = open(capture_file).read().strip()
+    msgs = json.loads(text) if text else []
+except FileNotFoundError:
+    msgs = []
+# Rule 5's message shape is "(task <id>, mission=...)" — comma, not a space,
+# right after the id (unlike the needs_director block's "task <id> (mission=...)").
+needle = f"task {task_id},"
+for m in msgs:
+    text = m.get('message', '')
+    if text.startswith('[Rule 5]') and needle in text:
+        print(text)
+PYEOF
 }
 
 # captured_messages_for <capture.json> <task_id> — print each captured
@@ -464,6 +567,134 @@ if CREWVIA_QUEUE="$T7_QUEUE" CREWVIA_REPO_ROOT="$OWN_CHECKOUT_ROOT" \
   pass "復旧後の task は plan.sh pull で実際に取得できる (needs_director の罠が再発していない)"
 else
   fail "復旧後の task を plan.sh pull で取得できない — 復旧コマンドが dispatch 不能な状態を作っている"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 8 (t032 F4): needs_director task の assignment に対して Rule 5 の
+# idle-with-task (条件B) が発火しない (needs_director 通知と重複しない)。
+# 対照として同一設定 (state=idle, assignment 有り, grace=0) の in_progress task では
+# Rule 5 が発火することも確認し、「そもそも Rule 5 が発火しない harness」ではないことを
+# 保証する (t031 で踏んだ「壊れた実装のまま green」の再発防止)。
+# ---------------------------------------------------------------------------
+echo ""
+echo "-- Test 8 (F4): needs_director task は Rule 5 idle-with-task と重複通知しない --"
+
+T8_ROOT="$TMPDIR_TEST/fixture-8"
+T8_QUEUE="$T8_ROOT/queue"
+T8_REPO="$T8_ROOT/fakerepo"
+T8_SLUG="mission-8"
+setup_fixture_repo "$T8_REPO"
+cat > "$T8_REPO/registry/workers.yaml" <<'EOF'
+workers:
+  - name: wei
+    skills: [bash]
+    task_count: 0
+  - name: taro
+    skills: [bash]
+    task_count: 0
+EOF
+write_mission_fixture "$T8_QUEUE" "$T8_SLUG"
+T8_TASKS="$T8_QUEUE/missions/$T8_SLUG/tasks"
+mkdir -p "$T8_QUEUE/assignments"
+
+# t040: needs_director, worker=wei (escalated — cmd_needs_director leaves the
+# assignment file in place, this is exactly the F4 scenario).
+printf -- '---\nid: t040\ntitle: escalated\nskills: [bash]\npriority: high\nstatus: needs_director\nblocked_by: []\nworker: wei\nneeds_director_reason: "stuck f4"\n---\n\n## Description\nx\n' \
+  > "$T8_TASKS/t040.md"
+echo "$T8_SLUG:t040" > "$T8_QUEUE/assignments/wei"
+
+# t041: in_progress, worker=taro — positive control, same idle/assignment shape.
+printf -- '---\nid: t041\ntitle: still-working\nskills: [bash]\npriority: high\nstatus: in_progress\nblocked_by: []\nworker: taro\n---\n\n## Description\nx\n' \
+  > "$T8_TASKS/t041.md"
+echo "$T8_SLUG:t041" > "$T8_QUEUE/assignments/taro"
+
+T8_NOTIFY_CACHE="$TMPDIR_TEST/notify-8.json"
+T8_CAP1="$TMPDIR_TEST/capture-8-1.json"
+T8_CAP2="$TMPDIR_TEST/capture-8-2.json"
+
+# Cycle 1: both workers' Rule 5 state transitions are fresh — grace timer just
+# started for both, so neither notifies yet (matches check_rule5's existing
+# "condition changed → reset, don't notify" behaviour).
+run_dispatcher_cycle_ext "$T8_QUEUE" "$T8_REPO/registry" "$T8_NOTIFY_CACHE" "$T8_CAP1" \
+  "wei-worker,taro-worker" "Sora-director" "idle" "0" > /dev/null
+
+# Cycle 2: grace(0) elapsed for both — t041 (in_progress) should now fire Rule 5;
+# t040 (needs_director) must stay suppressed.
+run_dispatcher_cycle_ext "$T8_QUEUE" "$T8_REPO/registry" "$T8_NOTIFY_CACHE" "$T8_CAP2" \
+  "wei-worker,taro-worker" "Sora-director" "idle" "0" > /dev/null
+
+R5_T040=$(captured_rule5_messages_for "$T8_CAP2" t040)
+R5_T041=$(captured_rule5_messages_for "$T8_CAP2" t041)
+
+if [[ -z "$R5_T040" ]]; then
+  pass "needs_director task (t040) は Rule 5 idle-with-task を発火しない"
+else
+  fail "needs_director task (t040) なのに Rule 5 が発火した: $R5_T040"
+fi
+
+if [[ -n "$R5_T041" ]]; then
+  pass "同一条件の in_progress task (t041, 対照) では Rule 5 が正しく発火する (harness 自体は機能している)"
+else
+  fail "対照 task (t041) でも Rule 5 が発火しなかった — harness が Rule 5 を全く駆動できていない疑い"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 9 (t032 F5): Director 不在時、needs_director block は Rule 5 と同じ
+# director_live ガードで 1 行ログに留め、tmux_send を試行しない (ログ洪水防止)。
+# 復旧 (Director が戻る) 後は抑制されず通知される (notify_key を記録していないため)。
+# ---------------------------------------------------------------------------
+echo ""
+echo "-- Test 9 (F5): Director 不在時、needs_director 通知は director_live ガードで抑制される --"
+
+T9_ROOT="$TMPDIR_TEST/fixture-9"
+T9_QUEUE="$T9_ROOT/queue"
+T9_REPO="$T9_ROOT/fakerepo"
+T9_SLUG="mission-9"
+setup_fixture_repo "$T9_REPO"
+write_mission_fixture "$T9_QUEUE" "$T9_SLUG"
+T9_TASKS="$T9_QUEUE/missions/$T9_SLUG/tasks"
+printf -- '---\nid: t050\ntitle: stuck-no-director\nskills: [bash]\npriority: high\nstatus: needs_director\nblocked_by: []\nneeds_director_reason: "stuck f5"\n---\n\n## Description\nx\n' \
+  > "$T9_TASKS/t050.md"
+
+T9_NOTIFY_CACHE="$TMPDIR_TEST/notify-9.json"
+
+# Cycle 1: no Director window live at all.
+T9_CAP1="$TMPDIR_TEST/capture-9-1.json"
+T9_LOG1=$(run_dispatcher_cycle_ext "$T9_QUEUE" "$T9_REPO/registry" "$T9_NOTIFY_CACHE" "$T9_CAP1" \
+  "" "" "idle" "60")
+
+T9_MSG1=$(captured_messages_for "$T9_CAP1" t050)
+if [[ -z "$T9_MSG1" ]]; then
+  pass "Director 不在時、needs_director 通知は送信されない (tmux_send を試行しない)"
+else
+  fail "Director 不在なのに needs_director 通知が送信された: $T9_MSG1"
+fi
+
+T9_GUARD_LINES=$(grep -c "needs_director — Director 不在のため通知スキップ.*t050" "$T9_LOG1" || true)
+T9_DOUBLE_LOG_LINES=$(grep -c "needs_director detected but mux send failed.*t050" "$T9_LOG1" || true)
+
+if [[ "$T9_GUARD_LINES" -eq 1 ]]; then
+  pass "Director 不在ガードのログが 1 行だけ出る (Rule 5 と同じ体裁)"
+else
+  fail "Director 不在ガードのログ行数が期待と異なる (期待 1, 実際 $T9_GUARD_LINES)"
+fi
+
+if [[ "$T9_DOUBLE_LOG_LINES" -eq 0 ]]; then
+  pass "旧経路の 'mux send failed' ログ (2行目) は出ない — ログ洪水が解消されている"
+else
+  fail "旧経路の 'mux send failed' ログがまだ出ている ($T9_DOUBLE_LOG_LINES 行) — F5 未解消"
+fi
+
+# Cycle 2: Director comes back — notify_key was never recorded while suppressed,
+# so it should re-arm immediately (no NOTIFY_TTL wait needed for recovery).
+T9_CAP2="$TMPDIR_TEST/capture-9-2.json"
+run_dispatcher_cycle_ext "$T9_QUEUE" "$T9_REPO/registry" "$T9_NOTIFY_CACHE" "$T9_CAP2" \
+  "" "Sora-director" "idle" "60" > /dev/null
+T9_MSG2=$(captured_messages_for "$T9_CAP2" t050)
+if [[ -n "$T9_MSG2" ]]; then
+  pass "Director 復帰後は即座に needs_director 通知が送信される (抑制中に notify_key を記録していない)"
+else
+  fail "Director 復帰後も needs_director 通知が送信されない"
 fi
 
 # ---------------------------------------------------------------------------

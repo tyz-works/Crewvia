@@ -816,7 +816,7 @@ def _save_state_entry(name: str, state: str, since: float) -> None:
         log(f'WARNING: cannot write state entry for {name!r}: {e}')
 
 
-def check_rule5(name: str, target: str, assignment_file: Path) -> None:
+def check_rule5(name: str, target: str, assignment_file: Path, task_statuses_by_mission: dict) -> None:
     """Rule 5: detect blocked / idle-with-task and notify Director.
 
     A: state == "blocked"
@@ -826,6 +826,14 @@ def check_rule5(name: str, target: str, assignment_file: Path) -> None:
     Notifications are deduped via the standard NOTIFY_TTL cache.
 
     tmux mode (state == "unknown") → skip entirely (safe side).
+
+    t032 F4: cmd_needs_director leaves the assignment file in place (no
+    retire_assignment call), so once the escalating Worker goes idle,
+    condition B fires here too and Director gets both a
+    "[needs_director]" and a "[Rule 5] idle-with-task" notification for the
+    same root cause, forever (every NOTIFY_TTL). Fold into the
+    needs_director notification instead — same exclusivity idea as the
+    failed+handoff_path block, which only fires for status=='failed'.
     """
     # IMPORTANT: mux pane labels are '<name>-worker' (e.g. 'Omar-worker'), not
     # the bare agent name.  Use `target` (= window_target from
@@ -852,6 +860,25 @@ def check_rule5(name: str, target: str, assignment_file: Path) -> None:
     # Determine which condition applies.
     is_A = (st == 'blocked')
     is_B = (st in ('idle', 'done')) and assignment_file.exists()
+
+    # t032 F4: if the assignment points at a task that already escalated to
+    # needs_director, the needs_director block owns notifying Director for
+    # it — suppress Rule 5 entirely for this worker/task pair.
+    if is_A or is_B:
+        assigned_task_status = None
+        try:
+            raw = assignment_file.read_text().strip()
+            a_slug, _, a_task_id = raw.partition(':')
+            if not a_task_id:
+                a_task_id = a_slug
+                a_slug = None
+            if a_slug is not None:
+                assigned_task_status = task_statuses_by_mission.get(a_slug, {}).get(a_task_id)
+        except Exception:
+            assigned_task_status = None
+        if assigned_task_status == 'needs_director':
+            is_A = False
+            is_B = False
 
     if not is_A and not is_B:
         # idle/done without assignment → not B.  Reset state entry.
@@ -1152,7 +1179,7 @@ def dispatch():
 
         # Rule 5 (herdr only): check agent state for blocked / idle-with-task.
         # Runs for ALL workers (busy and idle) before the is_idle gate below.
-        check_rule5(agent_name, target, assignment_file)
+        check_rule5(agent_name, target, assignment_file, task_statuses_by_mission)
 
         if not is_idle:
             continue  # Worker is busy; do not interrupt
@@ -1394,12 +1421,24 @@ def dispatch():
     # Re-sends every NOTIFY_TTL like the other notify_key's below (not a one-shot):
     # should_notify() re-arms once the cache entry ages past NOTIFY_TTL, so an
     # unresolved needs_director task keeps nagging instead of going silent forever.
+    #
+    # t032 F5: _director_name() falls back to the literal 'Sora-director' when no
+    # Director window is live, so with no guard this block called tmux_send()
+    # unconditionally — 2 log lines (tmux_send's own WARNING + this block's own
+    # "mux send failed") every 5s per needs_director task, for as long as no
+    # Director is up. Match Rule 5's director_live guard: 1 log line, no send
+    # attempt, no notify_key recorded (so it re-checks, and re-notifies promptly,
+    # once a Director comes back).
+    director_live_for_needs_director = bool(_mux.list(suffix='-director'))
     for slug, meta in all_tasks:
         if meta.get('status') != 'needs_director':
             continue
         task_id = meta.get('id', '?')
         notify_key = f'needs_director_{slug}_{task_id}'
         if not should_notify(notify_key):
+            continue
+        if not director_live_for_needs_director:
+            log(f'WARNING: needs_director — Director 不在のため通知スキップ: {slug}/{task_id}')
             continue
         reason = (meta.get('needs_director_reason') or '').strip()
         reason_line = reason.splitlines()[0][:200] if reason else '(理由未記載)'

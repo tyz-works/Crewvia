@@ -19,9 +19,27 @@
 #      --reset 適用後に --status が上書きし in_progress/worker=null のまま固着する)
 #      が過去に実在したため、コマンドの実行結果を検証する。
 #
+# t031 (PR #207 Seo review 差し戻し): Test 3-6 は元々このファイル内で dispatcher.sh の
+# ロジック (build_msg / dedup / フィルタ) を再実装しており、dispatcher.sh 本体を一切
+# 駆動していなかった。Seo は隔離コピーで dispatcher.sh の実際の文字列を
+# `--status TOTAL-GARBAGE-NOT-A-STATUS` に差し替えても PASS=8/FAIL=0 のまま green に
+# なることを実証した (再実装した期待値が壊れた実装と同じ壊れ方をしていたため)。
+# また Test 7 も `RECOVERY_STATUS="pending"` をハードコードしており、dispatcher.sh の
+# 通知文からステータス値を読んでいなかった (dispatcher.sh を `--status in_progress
+# --reset` に戻しても PASS=12/FAIL=0 のまま通る)。
+#
+# 対応: dispatcher.sh の埋め込み Python サイクル本体 (`<<'PYEOF'` ... `PYEOF` の間 —
+# 実際の daemon ループが 5 秒毎に実行しているのと同じ `publish_agents()` +
+# `dispatch()`) を抽出し、tmux/herdr と通信する唯一の I/O 境界 (`_mux.send` /
+# `_mux.list`、`_mux = Mux()` の直後) だけをスタブして送信メッセージをキャプチャする
+# harness (run_dispatcher_cycle) に作り替えた。検知・dedup・メッセージ文言・復旧コマンド
+# の組み立てはすべて dispatcher.sh の無改造コードが担うので、そこに regression が入れば
+# キャプチャされるメッセージ自体が壊れ、以下の assertion が落ちる。
+#
 # 実行: bash scripts/test_dispatcher_needs_director_notify.sh
-# 副作用: /tmp 配下に一時ファイルを作成し終了時に削除する。本番 dispatcher / registry
-#         には一切触れない (isolated harness — knowledge/dispatcher-review.md 参照)。
+# 副作用: /tmp 配下に一時ファイル (queue fixture + git-init した空リポジトリ) を作成し
+#         終了時に削除する。本番 dispatcher / registry には一切触れない (isolated
+#         harness — knowledge/dispatcher-review.md 参照)。
 
 set -uo pipefail
 
@@ -41,6 +59,129 @@ cleanup() {
 trap cleanup EXIT
 
 echo "== test_dispatcher_needs_director_notify.sh (t027: needs_director → Director 通知) =="
+
+TMPDIR_TEST="/tmp/crewvia-test-needs-director-$$"
+mkdir -p "$TMPDIR_TEST"
+
+# ---------------------------------------------------------------------------
+# Harness: drive the REAL dispatcher.sh cycle (not a hand-copy of its logic)
+# ---------------------------------------------------------------------------
+
+# extract_dispatcher_cycle <out.py> — pull the python body out of dispatcher.sh's
+# `<<'PYEOF' ... PYEOF` heredoc (the code the bash while-loop at the bottom of
+# dispatcher.sh feeds to `python3 -` every 5s).
+extract_dispatcher_cycle() {
+  awk '
+    /<<.PYEOF.$/ { infile=1; next }
+    infile && /^PYEOF$/ { exit }
+    infile { print }
+  ' "$DISPATCHER_SH" > "$1"
+  if [[ ! -s "$1" ]]; then
+    echo "ERROR: failed to extract dispatcher.sh python body (heredoc markers not found — dispatcher.sh structure changed?)" >&2
+    return 1
+  fi
+}
+
+# inject_mux_stub <extracted.py> <capture.json> — replace the mux transport
+# (the only place the cycle talks to tmux/herdr) with an in-memory capture,
+# right after `_mux = Mux()`. Everything above that line — detection, dedup,
+# message text, recovery-command construction — stays dispatcher.sh's own code.
+inject_mux_stub() {
+  python3 - "$1" "$2" <<'INJECT'
+import sys
+path, capture_file = sys.argv[1], sys.argv[2]
+src = open(path).read()
+marker = "_mux = Mux()"
+if marker not in src:
+    print("ERROR: injection point '_mux = Mux()' not found in dispatcher.sh — harness needs updating", file=sys.stderr)
+    sys.exit(1)
+stub = (
+    marker + "\n"
+    "import json as _json_capture\n"
+    "_SENT = []\n"
+    "def _stub_send(name, text):\n"
+    "    _SENT.append({'target': name, 'message': text})\n"
+    "    return True\n"
+    "_mux.send = _stub_send\n"
+    "_mux.list = lambda *a, **kw: []\n"
+    "import atexit as _atexit_capture\n"
+    f"_CAPTURE_FILE = {capture_file!r}\n"
+    "_atexit_capture.register(lambda: open(_CAPTURE_FILE, 'w').write(_json_capture.dumps(_SENT)))\n"
+)
+src = src.replace(marker, stub, 1)
+open(path, 'w').write(src)
+INJECT
+}
+
+# setup_fixture_repo <root> — a `git init`'d empty repo to serve as REPO_ROOT.
+# dispatcher.sh refuses to run at all (repo_identity_ok() FATAL) unless its
+# REGISTRY_DIR's parent is a real git checkout (has a `.git` entry) — a bare
+# `git init` satisfies that check without needing real history/remote.
+setup_fixture_repo() {
+  local root="$1"
+  mkdir -p "$root/registry"
+  git init -q "$root" >/dev/null 2>&1
+  cat > "$root/registry/workers.yaml" <<'EOF'
+workers:
+  - name: sofia
+    skills: [bash]
+    task_count: 0
+EOF
+}
+
+# write_mission_fixture <queue_dir> <slug> — minimal active-mission scaffold.
+write_mission_fixture() {
+  local queue="$1" slug="$2"
+  mkdir -p "$queue/missions/$slug/tasks" "$queue/archive"
+  cat > "$queue/state.yaml" <<EOF
+active_missions:
+  - $slug
+default_mission: $slug
+EOF
+  cat > "$queue/missions/$slug/mission.yaml" <<EOF
+title: "Harness Test Mission"
+slug: $slug
+status: in_progress
+created_at: 2026-09-22T00:00:00Z
+completed_at: null
+next_task_id: 99
+EOF
+}
+
+# run_dispatcher_cycle <queue_dir> <registry_dir> <notify_cache> <capture.json>
+# Runs exactly one real dispatch cycle (publish_agents() + dispatch(), the
+# same pair the daemon's while-loop calls every 5s) against the given
+# isolated fixture, with mux I/O captured to <capture.json>.
+CYCLE_SEQ=0
+run_dispatcher_cycle() {
+  local queue="$1" registry="$2" notify_cache="$3" capture="$4"
+  CYCLE_SEQ=$((CYCLE_SEQ + 1))
+  local extracted="$TMPDIR_TEST/cycle_${CYCLE_SEQ}.py"
+  extract_dispatcher_cycle "$extracted" || return 1
+  inject_mux_stub "$extracted" "$capture" || return 1
+  env -u TASKVIA_TOKEN CREWVIA_TASKVIA=disabled TASKVIA_URL= \
+    PYTHONPATH="$OWN_CHECKOUT_ROOT/scripts" \
+    python3 "$extracted" "$queue" "$registry" "$notify_cache" "300" "60" \
+      "$TMPDIR_TEST/dispatcher-cycle.log" >> "$TMPDIR_TEST/dispatcher-cycle.log" 2>&1
+}
+
+# captured_messages_for <capture.json> <task_id> — print each captured
+# message whose text mentions "task <task_id> ", one per line (jq-free).
+captured_messages_for() {
+  python3 - "$1" "$2" <<'PYEOF'
+import sys, json
+capture_file, task_id = sys.argv[1], sys.argv[2]
+try:
+    text = open(capture_file).read().strip()
+    msgs = json.loads(text) if text else []
+except FileNotFoundError:
+    msgs = []
+needle = f"task {task_id} "
+for m in msgs:
+    if needle in m.get('message', ''):
+        print(m['message'])
+PYEOF
+}
 
 # ---------------------------------------------------------------------------
 # Test 1: dispatcher.sh に needs_director 検知 block が存在する
@@ -64,8 +205,6 @@ fi
 # ---------------------------------------------------------------------------
 echo ""
 echo "-- Test 2: all_tasks の再利用 (安価な判定) --"
-# needs_director block と handoff block の間の行だけを抜き出し、
-# 独自の list_tasks_for_mission() 呼び出しを増やしていないことを確認する。
 needs_director_block=$(awk '/# needs_director detection:/{f=1} f{print} /# Handoff detection:/{exit}' "$DISPATCHER_SH")
 if echo "$needs_director_block" | grep -q "for slug, meta in all_tasks:"; then
   pass "needs_director block は all_tasks をそのままイテレートしている"
@@ -79,169 +218,233 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Test 3-4: メッセージ構築ロジックの単体検証 (dispatcher.sh と同じロジックを再現)
+# Test 3/4/6: 実際の dispatcher cycle を1回走らせ、複数ステータス・複数 reason 形状の
+# task を同時に投入して「メッセージ構築」と「ステータスフィルタ」の両方を検証する。
+# (旧 Test3/4/6 は build_msg() の再実装だった — F2 対応)
 # ---------------------------------------------------------------------------
 echo ""
-echo "-- Test 3-4: メッセージ構築ロジック --"
-python3 <<'PYEOF'
-from pathlib import Path
+echo "-- Test 3/4/6: 実 dispatcher cycle によるメッセージ構築 + ステータスフィルタ --"
 
-MISSIONS_DIR = Path("/tmp/crewvia-test-needs-director-fake/missions")
+T346_ROOT="$TMPDIR_TEST/fixture-346"
+T346_QUEUE="$T346_ROOT/queue"
+T346_REPO="$T346_ROOT/fakerepo"
+T346_SLUG="mission-346"
+setup_fixture_repo "$T346_REPO"
+write_mission_fixture "$T346_QUEUE" "$T346_SLUG"
+T346_TASKS="$T346_QUEUE/missions/$T346_SLUG/tasks"
 
-def build_msg(slug, meta):
-    task_id = meta.get('id', '?')
-    reason = (meta.get('needs_director_reason') or '').strip()
-    reason_line = reason.splitlines()[0][:200] if reason else '(理由未記載)'
-    task_file = MISSIONS_DIR / slug / 'tasks' / f'{task_id}.md'
-    msg = (
-        f'[needs_director] task {task_id} (mission={slug}) が needs_director です。'
-        f'理由: {reason_line}'
-        + ('…' if len(reason) > len(reason_line) else '')
-        + f' (全文: {task_file})。'
-        f'reason を読んで方針を決め、plan.sh update {task_id} --status pending --reset '
-        f'--mission {slug} で差し戻してください。'
-    )
-    return msg
+# t010: 単一行 reason
+printf -- '---\nid: t010\ntitle: single-line\nskills: [bash]\npriority: high\nstatus: needs_director\nblocked_by: []\nneeds_director_reason: "Codex review NEEDS FIX: race in assign loop"\n---\n\n## Description\nx\n' \
+  > "$T346_TASKS/t010.md"
+# t011: reason が空
+printf -- '---\nid: t011\ntitle: empty-reason\nskills: [bash]\npriority: high\nstatus: needs_director\nblocked_by: []\nneeds_director_reason: ""\n---\n\n## Description\nx\n' \
+  > "$T346_TASKS/t011.md"
+# t012: 200 文字超の長い reason (単一行)。plan.sh の書き込み側 (_dump_scalar) は
+# 埋め込み改行を " / " に畳み込んで常に単一行で保存する (PR #181 — 生の改行を
+# frontmatter に書くと parse_yaml がクラッシュする)。そのため
+# needs_director_reason は実運用では絶対に複数物理行にならず、
+# dispatcher.sh の `reason.splitlines()[0]` は事実上 no-op — 実際に省略記号を
+# 発火させるのは後続の `[:200]` 文字数カットオフの方。HEAD_MARKER は先頭
+# (200文字カットオフ内)、TAIL_MARKER はカットオフを超えた位置に置く。
+T012_REASON="HEAD_MARKER-$(printf 'z%.0s' $(seq 1 210))-TAIL_MARKER"
+printf -- '---\nid: t012\ntitle: long-reason\nskills: [bash]\npriority: high\nstatus: needs_director\nblocked_by: []\nneeds_director_reason: "%s"\n---\n\n## Description\nx\n' \
+  "$T012_REASON" > "$T346_TASKS/t012.md"
+# t013/t014/t015/t016: needs_director 以外のステータス (フィルタの対照例)
+printf -- '---\nid: t013\ntitle: pending\nskills: [bash]\npriority: high\nstatus: pending\nblocked_by: []\n---\n\n## Description\nx\n' \
+  > "$T346_TASKS/t013.md"
+printf -- '---\nid: t014\ntitle: in-progress\nskills: [bash]\npriority: high\nstatus: in_progress\nblocked_by: []\n---\n\n## Description\nx\n' \
+  > "$T346_TASKS/t014.md"
+printf -- '---\nid: t015\ntitle: failed\nskills: [bash]\npriority: high\nstatus: failed\nblocked_by: []\n---\n\n## Description\nx\n' \
+  > "$T346_TASKS/t015.md"
+printf -- '---\nid: t016\ntitle: done\nskills: [bash]\npriority: high\nstatus: done\nblocked_by: []\n---\n\n## Description\nx\n' \
+  > "$T346_TASKS/t016.md"
 
-# Test 3: 単一行 reason
-msg1 = build_msg('mission-a', {'id': 't027', 'needs_director_reason': 'Codex review NEEDS FIX: race in assign loop'})
-assert 't027' in msg1
-assert 'mission-a' in msg1
-assert 'Codex review NEEDS FIX: race in assign loop' in msg1
-assert 'plan.sh update t027 --status pending --reset --mission mission-a' in msg1
-assert '…' not in msg1, f"1 行 reason なのに省略記号が付いた: {msg1}"
-print("Test3 OK:", msg1[:80])
+T346_NOTIFY_CACHE="$TMPDIR_TEST/notify-346.json"
+T346_CAPTURE="$TMPDIR_TEST/capture-346.json"
+run_dispatcher_cycle "$T346_QUEUE" "$T346_REPO/registry" "$T346_NOTIFY_CACHE" "$T346_CAPTURE"
 
-# Test 4: reason が空 / 複数行 → 1 行目のみ + 省略記号 + task_file 誘導
-msg2 = build_msg('mission-b', {'id': 't099', 'needs_director_reason': ''})
-assert '(理由未記載)' in msg2, f"空 reason で '(理由未記載)' が出ない: {msg2}"
-
-msg3 = build_msg('mission-c', {'id': 't100', 'needs_director_reason': '1行目のみ表示されるべき\n2行目は本文に埋もれる長い補足説明'})
-assert '1行目のみ表示されるべき' in msg3
-assert '2行目は本文に埋もれる長い補足説明' not in msg3, f"2 行目が漏れている: {msg3}"
-assert '…' in msg3, f"複数行 reason なのに省略記号が付かない: {msg3}"
-assert 'mission-c/tasks/t100.md' in msg3.replace('\\', '/'), f"全文パス誘導が無い: {msg3}"
-
-print("Test4 OK: 空/複数行 reason も安全に処理される")
-PYEOF
-if [[ $? -eq 0 ]]; then
-  pass "メッセージ構築: 単一行 reason は全文がそのまま入る"
-  pass "メッセージ構築: 空/複数行 reason でも 1 行目 + 省略記号 + 全文パス誘導になる"
+if [[ ! -s "$T346_CAPTURE" ]]; then
+  fail "dispatcher cycle がメッセージを1件もキャプチャしなかった (harness 自体が壊れている可能性)"
 else
-  fail "メッセージ構築ロジックの単体検証に失敗"
+  MSG_T010=$(captured_messages_for "$T346_CAPTURE" t010)
+  MSG_T011=$(captured_messages_for "$T346_CAPTURE" t011)
+  MSG_T012=$(captured_messages_for "$T346_CAPTURE" t012)
+
+  # Test 3: 単一行 reason はそのまま全文が入り、省略記号は付かない
+  if [[ "$MSG_T010" == *"$T346_SLUG"* && "$MSG_T010" == *"Codex review NEEDS FIX: race in assign loop"* \
+        && "$MSG_T010" == *"plan.sh update t010 --status pending --reset --mission $T346_SLUG"* ]]; then
+    pass "メッセージ構築: 単一行 reason は全文がそのまま入り、復旧コマンドも組み立てられる"
+  else
+    fail "メッセージ構築: 単一行 reason (t010) の内容が期待と異なる: $MSG_T010"
+  fi
+  if [[ "$MSG_T010" != *$'\xe2\x80\xa6'* ]]; then
+    pass "メッセージ構築: 単一行 reason (t010) に省略記号が付かない"
+  else
+    fail "メッセージ構築: 単一行 reason なのに省略記号が付いた: $MSG_T010"
+  fi
+
+  # Test 4: 空 reason は '(理由未記載)' になる
+  if [[ "$MSG_T011" == *"(理由未記載)"* ]]; then
+    pass "メッセージ構築: 空 reason は '(理由未記載)' になる"
+  else
+    fail "メッセージ構築: 空 reason (t011) で '(理由未記載)' が出ない: $MSG_T011"
+  fi
+
+  # Test 4: 200 文字超の長い reason は先頭 200 文字のみ + 省略記号 + 全文パス誘導
+  if [[ "$MSG_T012" == *"HEAD_MARKER"* && "$MSG_T012" != *"TAIL_MARKER"* \
+        && "$MSG_T012" == *"$T346_SLUG/tasks/t012.md"* && "$MSG_T012" == *$'\xe2\x80\xa6'* ]]; then
+    pass "メッセージ構築: 200 文字超の reason は先頭のみ + 省略記号 + 全文パス誘導になる"
+  else
+    fail "メッセージ構築: 長い reason (t012) の処理が期待と異なる: $MSG_T012"
+  fi
+
+  # Test 6: needs_director 以外のステータスは対象にならない
+  NON_TARGET_HIT=0
+  for other_id in t013 t014 t015 t016; do
+    hit=$(captured_messages_for "$T346_CAPTURE" "$other_id")
+    [[ -n "$hit" ]] && NON_TARGET_HIT=1
+  done
+  if [[ "$NON_TARGET_HIT" -eq 0 ]]; then
+    pass "needs_director 以外のステータス (pending/in_progress/failed/done) は通知対象にならない"
+  else
+    fail "needs_director フィルタが他ステータスの task を誤って拾っている"
+  fi
 fi
 
 # ---------------------------------------------------------------------------
-# Test 5: TTL dedup (should_notify/record_notify と同じロジック — 既存 Test 8 と同形)
+# Test 5: TTL dedup — 実 dispatcher cycle を複数回走らせて検証する
+# (旧 Test5 は should()/record() の再実装だった — F2 と同型のため合わせて修正)
 # ---------------------------------------------------------------------------
 echo ""
-echo "-- Test 5: TTL dedup (needs_director 専用 key) --"
-TMPDIR_TEST="/tmp/crewvia-test-needs-director-$$"
-mkdir -p "$TMPDIR_TEST"
-NOTIFY_CACHE_TEST="$TMPDIR_TEST/notify-test.json"
-python3 - "$NOTIFY_CACHE_TEST" "300" <<'PYEOF'
+echo "-- Test 5: TTL dedup (実 dispatcher cycle を複数回走らせる) --"
+
+T5_ROOT="$TMPDIR_TEST/fixture-5"
+T5_QUEUE="$T5_ROOT/queue"
+T5_REPO="$T5_ROOT/fakerepo"
+T5_SLUG="mission-5"
+setup_fixture_repo "$T5_REPO"
+write_mission_fixture "$T5_QUEUE" "$T5_SLUG"
+T5_TASKS="$T5_QUEUE/missions/$T5_SLUG/tasks"
+printf -- '---\nid: t020\ntitle: stuck-a\nskills: [bash]\npriority: high\nstatus: needs_director\nblocked_by: []\nneeds_director_reason: "stuck a"\n---\n\n## Description\nx\n' \
+  > "$T5_TASKS/t020.md"
+printf -- '---\nid: t021\ntitle: stuck-b\nskills: [bash]\npriority: high\nstatus: needs_director\nblocked_by: []\nneeds_director_reason: "stuck b"\n---\n\n## Description\nx\n' \
+  > "$T5_TASKS/t021.md"
+
+T5_NOTIFY_CACHE="$TMPDIR_TEST/notify-5.json"
+
+# Cycle 1: 初回 → 両方通知される (別 key は独立)
+T5_CAP1="$TMPDIR_TEST/capture-5-1.json"
+run_dispatcher_cycle "$T5_QUEUE" "$T5_REPO/registry" "$T5_NOTIFY_CACHE" "$T5_CAP1"
+C1_T020=$(captured_messages_for "$T5_CAP1" t020)
+C1_T021=$(captured_messages_for "$T5_CAP1" t021)
+if [[ -n "$C1_T020" && -n "$C1_T021" ]]; then
+  pass "TTL dedup: 初回サイクルで両方の needs_director task が通知される (別 key 独立)"
+else
+  fail "TTL dedup: 初回サイクルで通知が欠けている (t020 present=$([[ -n $C1_T020 ]] && echo y || echo n), t021 present=$([[ -n $C1_T021 ]] && echo y || echo n))"
+fi
+
+# Cycle 2: 同一 NOTIFY_CACHE で即再実行 → TTL 内なので両方抑制される
+T5_CAP2="$TMPDIR_TEST/capture-5-2.json"
+run_dispatcher_cycle "$T5_QUEUE" "$T5_REPO/registry" "$T5_NOTIFY_CACHE" "$T5_CAP2"
+C2_T020=$(captured_messages_for "$T5_CAP2" t020)
+if [[ -z "$C2_T020" ]]; then
+  pass "TTL dedup: TTL 内 (300s) の再サイクルでは同一 needs_director 通知が抑制される"
+else
+  fail "TTL dedup: TTL 内に同一通知が繰り返された: $C2_T020"
+fi
+
+# TTL 経過をシミュレート: notify_cache の t020 key を TTL+1 秒前に書き換える
+python3 - "$T5_NOTIFY_CACHE" "$T5_SLUG" <<'PYEOF'
 import sys, json, time
-from pathlib import Path
-
-NOTIFY_CACHE = Path(sys.argv[1])
-NOTIFY_TTL   = int(sys.argv[2])
-
-def load(): return json.loads(NOTIFY_CACHE.read_text()) if NOTIFY_CACHE.exists() else {}
-def save(c): NOTIFY_CACHE.write_text(json.dumps(c))
-def should(key): c = load(); return key not in c or time.time() - c[key] > NOTIFY_TTL
-def record(key): c = load(); c[key] = time.time(); save(c)
-
-key = "needs_director_mission-a_t027"
-
-# 初回は通知する
-assert should(key) == True, "初回通知が抑制されている"
-record(key)
-# 記録直後は TTL 内なので抑制される (永久ミュートではなく TTL 明けに再送されることは
-# TTL 判定式 (time.time()-cache[key] > NOTIFY_TTL) 自体が保証する — 他の通知と同じ仕組み)
-assert should(key) == False, "TTL 内に同一 needs_director 通知が繰り返される"
-
-# 別 task / 別 mission は独立して初回通知される
-assert should("needs_director_mission-a_t028") == True, "別 task_id の通知が誤って抑制されている"
-assert should("needs_director_mission-b_t027") == True, "別 mission の通知が誤って抑制されている"
-
-# TTL が過ぎたことにする (過去のタイムスタンプを直接書き込み、経過をシミュレート)
-c = load()
-c[key] = time.time() - (NOTIFY_TTL + 1)
-save(c)
-assert should(key) == True, "TTL 経過後も再送されない (永久ミュートになっている — 要件違反)"
-
-print("TTL dedup OK: 初回通知 / TTL内抑制 / 別key独立 / TTL経過後の再送 すべて成立")
+cache_file, slug = sys.argv[1], sys.argv[2]
+c = json.loads(open(cache_file).read())
+key = f"needs_director_{slug}_t020"
+assert key in c, f"expected key {key} not recorded after cycle 1: {list(c)}"
+c[key] = time.time() - 301
+open(cache_file, 'w').write(json.dumps(c))
 PYEOF
-if [[ $? -eq 0 ]]; then
-  pass "TTL dedup: 初回通知 OK、TTL 内 dedup OK、別 key 独立、TTL 経過後は再送される"
+
+# Cycle 3: TTL 経過後 → t020 は再送、t021 はまだ TTL 内なので抑制されたまま
+T5_CAP3="$TMPDIR_TEST/capture-5-3.json"
+run_dispatcher_cycle "$T5_QUEUE" "$T5_REPO/registry" "$T5_NOTIFY_CACHE" "$T5_CAP3"
+C3_T020=$(captured_messages_for "$T5_CAP3" t020)
+C3_T021=$(captured_messages_for "$T5_CAP3" t021)
+if [[ -n "$C3_T020" && -z "$C3_T021" ]]; then
+  pass "TTL dedup: TTL 経過後は再送され (t020)、TTL 内の別 task (t021) は抑制されたまま"
 else
-  fail "TTL dedup ロジックに問題あり (needs_director 用 key)"
+  fail "TTL dedup: TTL 経過後の再送に問題 (t020 present=$([[ -n $C3_T020 ]] && echo y || echo n), t021 present=$([[ -n $C3_T021 ]] && echo y || echo n))"
 fi
 
 # ---------------------------------------------------------------------------
-# Test 6: 対象外ステータス (failed / pending / in_progress) は needs_director フィルタを通らない
+# Test 7 (t030 / t031): 通知本文が案内する復旧コマンドを、実 dispatcher cycle の
+# キャプチャから動的に抽出して実行し、task が dispatch 可能な状態
+# (status=pending, worker=null) になることを assert する。
+#
+# t031 での修正: 旧版は RECOVERY_STATUS="pending" をハードコードしており、
+# dispatcher.sh のメッセージから読んでいなかった。今回はキャプチャした本物の
+# メッセージ文字列から `--status` 以降の全引数を正規表現で抜き出し、そのまま
+# plan.sh update に渡す — dispatcher.sh が案内するステータス値が変わればこの
+# テストも追随し、`--status in_progress --reset` の罠が戻れば pending
+# assertion で確実に FAIL する。
 # ---------------------------------------------------------------------------
 echo ""
-echo "-- Test 6: needs_director 以外のステータスはフィルタされる --"
-python3 <<'PYEOF'
-all_tasks = [
-    ('m', {'id': 't001', 'status': 'pending'}),
-    ('m', {'id': 't002', 'status': 'in_progress'}),
-    ('m', {'id': 't003', 'status': 'failed', 'handoff_path': '/tmp/x'}),
-    ('m', {'id': 't004', 'status': 'needs_director', 'needs_director_reason': 'stuck'}),
-    ('m', {'id': 't005', 'status': 'done'}),
-]
-
-targets = [meta['id'] for slug, meta in all_tasks if meta.get('status') == 'needs_director']
-assert targets == ['t004'], f"needs_director フィルタが他ステータスを拾っている: {targets}"
-print("Test6 OK: needs_director のみが対象になる")
-PYEOF
-if [[ $? -eq 0 ]]; then
-  pass "needs_director 以外のステータス (pending/in_progress/failed/done) は通知対象にならない"
-else
-  fail "needs_director フィルタが他ステータスの task を誤って拾っている"
-fi
-
-# ---------------------------------------------------------------------------
-# Test 7 (t030): 通知本文が案内する復旧コマンドを実際に実行し、task が
-# dispatch 可能な状態 (status=pending, worker=null) になることを assert する。
-# 文字列一致では捕まえられない不具合 (--status in_progress --reset だと
-# --reset 適用後に --status が上書きし in_progress/worker=null のまま固着する)
-# の再発を防ぐ。
-# ---------------------------------------------------------------------------
-echo ""
-echo "-- Test 7: 通知本文の復旧コマンドを実行し、実際に dispatch 可能な状態に戻ることを検証 --"
+echo "-- Test 7: 通知本文の復旧コマンドを動的抽出して実行し、実際に dispatch 可能な状態に戻ることを検証 --"
 
 PLAN_SH="$OWN_CHECKOUT_ROOT/scripts/plan.sh"
-T7_TMPDIR="/tmp/crewvia-test-needs-director-recovery-$$"
-T7_QUEUE="$T7_TMPDIR/queue"
-T7_MISSION="test-recovery-mission"
-T7_TASKS_DIR="$T7_QUEUE/missions/$T7_MISSION/tasks"
-mkdir -p "$T7_TASKS_DIR" "$T7_QUEUE/archive"
-
-printf 'active_missions:\n  - %s\ndefault_mission: %s\n' \
-  "$T7_MISSION" "$T7_MISSION" > "$T7_QUEUE/state.yaml"
-printf 'title: Recovery Test Mission\nslug: %s\nstatus: in_progress\ncreated_at: 2026-09-22T00:00:00Z\ncompleted_at: null\nnext_task_id: 2\n' \
-  "$T7_MISSION" > "$T7_QUEUE/missions/$T7_MISSION/mission.yaml"
-
-# needs_director 状態の task (dispatcher の通知対象と同じ形)
-printf -- '---\nid: t001\ntitle: Stuck task\nskills: [bash]\npriority: medium\nstatus: needs_director\nblocked_by: []\nworker: sofia\nstarted_at: 2026-09-22T00:00:00Z\ncompleted_at: null\nneeds_director_reason: "stuck, need guidance"\n---\n\n## Description\nDo the thing.\n\n## Result\n' \
-  > "$T7_TASKS_DIR/t001.md"
-
-# 通知メッセージのロジック (このファイル内の build_msg と同一) で復旧コマンドの
-# 引数を組み立て、実際に plan.sh update へ渡す — メッセージ文字列を目視で
-# コピーするのではなく、dispatcher.sh の f-string と同じ組み立て方を再現する。
+T7_ROOT="$TMPDIR_TEST/fixture-7"
+T7_QUEUE="$T7_ROOT/queue"
+T7_REPO="$T7_ROOT/fakerepo"
+T7_SLUG="mission-7"
+setup_fixture_repo "$T7_REPO"
+write_mission_fixture "$T7_QUEUE" "$T7_SLUG"
+T7_TASKS="$T7_QUEUE/missions/$T7_SLUG/tasks"
 T7_TASK_ID="t001"
-RECOVERY_STATUS="pending"
-if CREWVIA_QUEUE="$T7_QUEUE" CREWVIA_REPO_ROOT="$OWN_CHECKOUT_ROOT" \
-   bash "$PLAN_SH" update "$T7_TASK_ID" --status "$RECOVERY_STATUS" --reset --mission "$T7_MISSION" > /dev/null 2>&1; then
-  pass "案内された plan.sh update コマンドが exit 0 で完了する"
-else
-  fail "案内された plan.sh update コマンドが失敗した"
+printf -- '---\nid: %s\ntitle: Stuck task\nskills: [bash]\npriority: medium\nstatus: needs_director\nblocked_by: []\nworker: sofia\nstarted_at: 2026-09-22T00:00:00Z\ncompleted_at: null\nneeds_director_reason: "stuck, need guidance"\n---\n\n## Description\nDo the thing.\n\n## Result\n' \
+  "$T7_TASK_ID" > "$T7_TASKS/$T7_TASK_ID.md"
+
+T7_NOTIFY_CACHE="$TMPDIR_TEST/notify-7.json"
+T7_CAPTURE="$TMPDIR_TEST/capture-7.json"
+run_dispatcher_cycle "$T7_QUEUE" "$T7_REPO/registry" "$T7_NOTIFY_CACHE" "$T7_CAPTURE"
+
+T7_RECOVERY_ARGS=""
+if [[ -s "$T7_CAPTURE" ]]; then
+  T7_RECOVERY_ARGS=$(python3 - "$T7_CAPTURE" "$T7_TASK_ID" <<'PYEOF'
+import sys, json, re
+capture_file, task_id = sys.argv[1], sys.argv[2]
+msgs = json.loads(open(capture_file).read())
+target = next((m['message'] for m in msgs if f"task {task_id} " in m.get('message', '')), None)
+if not target:
+    sys.exit(1)
+m = re.search(r'plan\.sh update (.+?) で差し戻してください', target)
+if not m:
+    sys.exit(1)
+print(m.group(1))
+PYEOF
+)
 fi
 
-T7_STATUS=$(awk -F': ' '/^status:/{print $2; exit}' "$T7_TASKS_DIR/t001.md")
-T7_WORKER=$(awk -F': ' '/^worker:/{print $2; exit}' "$T7_TASKS_DIR/t001.md")
+if [[ -n "$T7_RECOVERY_ARGS" ]]; then
+  pass "dispatcher cycle が needs_director 通知を発火し、復旧コマンド引数を抽出できた: $T7_RECOVERY_ARGS"
+else
+  fail "dispatcher cycle から needs_director 通知の復旧コマンドを抽出できなかった"
+fi
+
+# T7_RECOVERY_ARGS は dispatcher.sh の実際のメッセージから抜き出した引数列
+# (例: "t001 --status pending --reset --mission mission-7") — ハードコードしない。
+if [[ -n "$T7_RECOVERY_ARGS" ]]; then
+  # shellcheck disable=SC2086
+  if CREWVIA_QUEUE="$T7_QUEUE" CREWVIA_REPO_ROOT="$OWN_CHECKOUT_ROOT" \
+     bash "$PLAN_SH" update $T7_RECOVERY_ARGS > /dev/null 2>&1; then
+    pass "案内された plan.sh update コマンド (動的抽出) が exit 0 で完了する"
+  else
+    fail "案内された plan.sh update コマンド (動的抽出) が失敗した: update $T7_RECOVERY_ARGS"
+  fi
+else
+  fail "復旧コマンドを抽出できなかったため plan.sh update を実行できない"
+fi
+
+T7_STATUS=$(awk -F': ' '/^status:/{print $2; exit}' "$T7_TASKS/$T7_TASK_ID.md" 2>/dev/null)
+T7_WORKER=$(awk -F': ' '/^worker:/{print $2; exit}' "$T7_TASKS/$T7_TASK_ID.md" 2>/dev/null)
 
 if [[ "$T7_STATUS" == "pending" ]]; then
   pass "復旧コマンド実行後、task の status が pending になっている (dispatch 対象)"
@@ -257,13 +460,11 @@ fi
 
 # pull で実際に取得できる = dispatch 可能な状態であることの最終確認
 if CREWVIA_QUEUE="$T7_QUEUE" CREWVIA_REPO_ROOT="$OWN_CHECKOUT_ROOT" \
-   bash "$PLAN_SH" pull --agent test-worker --skills bash --mission "$T7_MISSION" > /dev/null 2>&1; then
+   bash "$PLAN_SH" pull --agent test-worker --skills bash --mission "$T7_SLUG" > /dev/null 2>&1; then
   pass "復旧後の task は plan.sh pull で実際に取得できる (needs_director の罠が再発していない)"
 else
   fail "復旧後の task を plan.sh pull で取得できない — 復旧コマンドが dispatch 不能な状態を作っている"
 fi
-
-rm -rf "$T7_TMPDIR"
 
 # ---------------------------------------------------------------------------
 # 結果サマリ

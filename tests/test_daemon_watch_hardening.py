@@ -278,12 +278,32 @@ def test_spawn_daemon_uses_the_shared_launch_command(repo):
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
-def unwritable_repo(tmp_path):
+def blocked_marker_repo(tmp_path):
+    """マーカーの書き込みだけが失敗する checkout。
+
+    `registry/daemons/<name>.paused` の位置に **ディレクトリ** を置く。
+    `write_json_atomic()` は tmp への書き込みには成功し、`os.replace()` で
+    OSError になって False を返す — ディスク full や権限エラーと同じ経路。
+
+    **ロックは取れる** ように `registry/daemons` は正しいディレクトリのまま
+    にしてある。ここを壊すと「ロックが取れなかった」で先に止まってしまい、
+    確かめたい「書けなかったのに進む」を通らない (この取り違えで一度、
+    欠陥を戻しても緑のままのテストを書いた)。
+    """
+    root = tmp_path / "crewvia"
+    (root / "registry" / "daemons").mkdir(parents=True)
+    (root / "scripts").mkdir(parents=True)
+    (root / ".git").mkdir()
+    (root / "registry" / "daemons" / f"{dw.DAEMON_DISPATCHER}.paused").mkdir()
+    return root
+
+
+@pytest.fixture
+def unlockable_repo(tmp_path):
     """`registry/daemons` の位置に **ファイル** が居る checkout。
 
-    ディスク full や権限エラーを mock 無しで再現するための仕掛け。ここへの
-    mkdir も書き込みも OSError になるので、`write_json_atomic()` は False を
-    返す — 本番で起きる失敗と同じ経路をたどる。
+    ロックファイルすら作れない環境。直列化できないなら破壊的なことをする
+    資格が無い、という側の確認に使う。
     """
     root = tmp_path / "crewvia"
     (root / "registry").mkdir(parents=True)
@@ -293,27 +313,29 @@ def unwritable_repo(tmp_path):
     return root
 
 
-def test_pause_reports_failure_when_the_marker_cannot_be_persisted(unwritable_repo):
+def test_pause_reports_failure_when_the_marker_cannot_be_persisted(blocked_marker_repo):
     """書けなかったのに token を返すのは「保護がある」という嘘になる。"""
-    assert dw.pause(unwritable_repo / "registry", dw.DAEMON_DISPATCHER,
+    assert dw.pause(blocked_marker_repo / "registry", dw.DAEMON_DISPATCHER,
                     reason="maintenance") is None
 
 
-def test_restart_does_not_kill_when_the_pause_marker_cannot_be_persisted(unwritable_repo):
+def test_restart_does_not_kill_when_the_pause_marker_cannot_be_persisted(
+        blocked_marker_repo):
     """約束した保護が無いなら、kill も spawn もしない。
 
     マーカーが残らないまま kill すると、相手デーモンから見えるのはただの
     「死んだ dispatcher」なので、手動 spawn と並んで respawn される。
     """
     mux = RecordingMux(windows=[dw.DAEMON_DISPATCHER])
-    ok = dw.restart(dw.DAEMON_DISPATCHER, repo_root=unwritable_repo, mux=mux,
+    ok = dw.restart(dw.DAEMON_DISPATCHER, repo_root=blocked_marker_repo, mux=mux,
                     log=lambda m: None)
     assert ok is False
     assert mux.calls == [], \
         "restart killed the daemon although its pause marker was never persisted"
 
 
-def test_pause_cli_exits_nonzero_when_the_marker_cannot_be_persisted(unwritable_repo):
+def test_pause_cli_exits_nonzero_when_the_marker_cannot_be_persisted(
+        blocked_marker_repo):
     """CLI も黙って 0 を返さない — 人が見る唯一の合図なので。
 
     非ゼロなだけでは足りない: 例外が素通りしても非ゼロになる。断ったことが
@@ -321,7 +343,7 @@ def test_pause_cli_exits_nonzero_when_the_marker_cannot_be_persisted(unwritable_
     """
     out = subprocess.run(
         [sys.executable, str(SCRIPTS / "lib_daemon_watch.py"), "pause",
-         dw.DAEMON_DISPATCHER, "--repo-root", str(unwritable_repo)],
+         dw.DAEMON_DISPATCHER, "--repo-root", str(blocked_marker_repo)],
         capture_output=True, text=True, timeout=30)
     assert out.returncode != 0, out
     assert out.stdout.strip() == "", \
@@ -330,13 +352,23 @@ def test_pause_cli_exits_nonzero_when_the_marker_cannot_be_persisted(unwritable_
     assert dw.DAEMON_DISPATCHER in out.stderr, out.stderr
 
 
-def test_restart_cli_exits_nonzero_when_it_refuses(unwritable_repo):
+def test_restart_cli_exits_nonzero_when_it_refuses(blocked_marker_repo):
     out = subprocess.run(
         [sys.executable, str(SCRIPTS / "lib_daemon_watch.py"), "restart",
-         dw.DAEMON_DISPATCHER, "--repo-root", str(unwritable_repo)],
+         dw.DAEMON_DISPATCHER, "--repo-root", str(blocked_marker_repo)],
         capture_output=True, text=True, timeout=30)
     assert out.returncode != 0, out
     assert "Traceback" not in out.stderr, out.stderr
+
+
+def test_nothing_destructive_happens_when_the_lock_cannot_be_taken(unlockable_repo):
+    """ロックファイルも作れない環境では、pause も restart も断る。"""
+    assert dw.pause(unlockable_repo / "registry", dw.DAEMON_DISPATCHER,
+                    reason="maintenance", timeout=0.2) is None
+    mux = RecordingMux(windows=[dw.DAEMON_DISPATCHER])
+    assert dw.restart(dw.DAEMON_DISPATCHER, repo_root=unlockable_repo, mux=mux,
+                      log=lambda m: None) is False
+    assert mux.calls == []
 
 
 def test_a_persisted_marker_is_readable_before_the_kill(repo):

@@ -97,7 +97,14 @@ case "$cmd" in
     exit 0
     ;;
   display-message)
-    echo "12345"
+    # Substitute the format string, as tmux does.  A fake that answers one
+    # hard-coded format hides every change in what the caller asks for: the
+    # caller then reads "this pane has no pid", and the identity guard turns
+    # that into a refusal that does not exist in production.
+    fmt="${!#}"
+    fmt="${fmt//'#{window_id}'/@1}"
+    fmt="${fmt//'#{pane_pid}'/12345}"
+    echo "$fmt"
     exit 0
     ;;
   switch-client)
@@ -333,13 +340,15 @@ log_count() {
 # pid()
 # ---------------------------------------------------------------------------
 
-@test "pid: calls display-message with #{pane_pid} and returns integer" {
+@test "pid: asks for the window id and the pane pid together, returns the pid" {
     setup_fake_tmux
 
     run python3 "$LIB_MUX_PY" pid "Sora-director"
     [ "$status" -eq 0 ]
     [[ "$output" == "12345" ]]
-    log_contains "display-message -p -t crewvia:Sora-director #{pane_pid}"
+    # One query for both, so that the window a kill destroys is the window
+    # whose contents were inspected (t039 P1-4).
+    log_contains "display-message -p -t crewvia:Sora-director #{window_id} #{pane_pid}"
 }
 
 # ---------------------------------------------------------------------------

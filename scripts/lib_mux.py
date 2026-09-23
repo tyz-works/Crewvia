@@ -282,8 +282,32 @@ class _Backend:
 
     BACKEND_NAME = "base"
 
-    def _refuses_foreign_daemon(self, name: str) -> bool:
-        """True when `name`'s pane provably holds another checkout's daemon.
+    def _inspect_pane(self, name: str):
+        """`(handle, pane_pid)` for `name`, both from **one** query.
+
+        `handle` is the backend's own immutable identity for the thing a kill
+        would destroy (a tmux `@window_id`, a herdr `tab_id`) — not the caller
+        name, which is mutable and which another checkout can make point
+        somewhere else between the two calls.  `(None, None)` when the pane
+        could not be resolved; the allowlist turns that into a refusal.
+        """
+        raise NotImplementedError
+
+    def _refuses_foreign_daemon(self, name: str, pane_pid) -> bool:
+        """True unless `name`'s pane is provably this checkout's to destroy.
+
+        An allowlist (`_MAY_KILL_OWNERS`): `MINE` and a demonstrably empty
+        `NONE` pass, everything else — including everything unreadable —
+        refuses.  The inverse of what this did before, and the reason is that
+        the refusing side is recoverable (`restart --force`) while the
+        destructive side is not.
+
+        The availability argument for the old default does not reach here:
+        `DAEMON_PANE_NAMES` already excludes Worker panes, so a Worker whose
+        pane cannot be read is never asked about.
+
+        `pane_pid` is passed in rather than fetched, so that the pane this
+        judges is the same one the caller goes on to kill.
 
         Shared by both backends so the two cannot drift apart — the shape in
         which "the peer is dead but its tab is still listed" became
@@ -292,18 +316,15 @@ class _Backend:
         """
         if name not in DAEMON_PANE_NAMES:
             return False          # out of scope — see DAEMON_PANE_NAMES
-        pane_pid = self.pid(name)
-        if pane_pid is None:
-            return False
-        detail = foreign_daemon_in_pane(pane_pid)
-        if detail is None:
+        owner, detail = daemon_pane_owner(pane_pid)
+        if owner in _MAY_KILL_OWNERS:
             return False
         self._warn(
-            f"kill {name!r}: refused — the pane holds another checkout's "
-            f"crewvia daemon ({detail}). Nothing was killed. This guard reads "
-            f"the pane, not the environment, so a clean env does not lift it; "
-            f"use `lib_daemon_watch.py restart {name} --force` when you mean "
-            f"to take the pane over."
+            f"kill {name!r}: refused — the pane is not this checkout's to end "
+            f"({owner}: {detail}). Nothing was killed. This guard reads the "
+            f"pane, not the environment, so a clean env does not lift it; use "
+            f"`lib_daemon_watch.py restart {name} --force` when you mean to "
+            f"take the pane over."
         )
         return True
 
@@ -783,18 +804,45 @@ def _proc_cwd(pid, proc_root: str):
     return _PROC_OK, target
 
 
+def _resolved(path: str) -> str:
+    """`path` with its symlinks followed, as far as they can be.
+
+    `realpath()` rather than `normpath()`, because collapsing `..` *lexically*
+    changes which file a path names.  With `/ours/link` → `/foreign/subdir`,
+    `/ours/link/../scripts/watchdog.py` runs `/foreign/scripts/watchdog.py`,
+    but `normpath()` folds it to `/ours/scripts/watchdog.py` — i.e. it turns
+    another checkout's daemon into ours, which is the one answer that
+    authorises killing it.
+
+    Non-strict: a path whose tail no longer exists (a deleted worktree) still
+    comes back, resolved as far as the filesystem could take it.  That keeps
+    the identity a removed checkout still has, which is what the lexical
+    comparison was originally here for.
+
+    `ValueError` as well as `OSError`: a path out of `/proc` can carry bytes
+    that `realpath()` will not take, and this runs underneath `kill()`, which
+    owes its callers a return value rather than an exception.
+    """
+    try:
+        return os.path.realpath(path)
+    except (OSError, ValueError):
+        return os.path.normpath(path)
+
+
 def _same_script_file(a: str, b: str) -> bool:
     """Whether two paths name the same script.
 
-    Path equality first (it works when the file is already gone — a removed
-    worktree still has an identity), `samefile()` second so that a symlinked
-    or differently-spelled path to the *same* checkout is not read as another
-    one.
+    Both sides are resolved through their symlinks first, so that a symlinked
+    or differently-spelled path to the *same* file is not read as another one
+    — and, just as important, so that a path that only *looks* like ours after
+    a lexical collapse is not read as ours.  `samefile()` second, for the cases
+    resolution alone cannot settle (bind mounts, hard links).
     """
-    if os.path.normpath(a) == os.path.normpath(b):
+    ra, rb = _resolved(a), _resolved(b)
+    if ra == rb:
         return True
     try:
-        return os.path.samefile(a, b)
+        return os.path.samefile(ra, rb)
     except OSError:
         return False
 
@@ -856,26 +904,45 @@ def script_owner(pid, argv, script: str, mine: str, *, proc_root: str):
     resolved against the process's own working directory; before this, such a
     process matched nothing and the pane it was in was classified as empty —
     i.e. the ordinary way of starting a daemon put it outside the guard.
+
+    The path is resolved through its symlinks *before* it is recognised, so
+    that what a process runs is decided by the file it reaches and not by how
+    the path was spelled.  The two ways spelling used to win: a differently
+    named alias (`python3 /theirs/monitor`) answered "not this script", and a
+    `..` folded lexically across a symlink answered "ours".  Both land on the
+    destructive side, so neither is a judgment this may make on a name.
     """
     mentions = [a for a in argv if os.path.basename(a) == script]
     exec_arg = _executed_script_arg(argv)
 
-    if exec_arg is not None and os.path.basename(exec_arg) == script:
+    if exec_arg is not None:
         if os.path.isabs(exec_arg):
-            resolved = os.path.normpath(exec_arg)
+            resolved = _resolved(exec_arg)
         else:
             status, cwd = _proc_cwd(pid, proc_root)
             if status == _PROC_GONE:
                 return OWNER_NONE, ""      # exited; it is not in the pane
             if status != _PROC_OK:
-                return OWNER_UNKNOWN, (
-                    f"pid {pid} runs {exec_arg!r} but its working directory "
-                    f"could not be read, so which checkout it belongs to is "
-                    f"undecided")
-            resolved = os.path.normpath(os.path.join(cwd, exec_arg))
-        if _same_script_file(resolved, mine):
-            return OWNER_MINE, f"pid {pid} runs {resolved}"
-        return OWNER_FOREIGN, f"pid {pid} runs {resolved}, not {mine}"
+                if os.path.basename(exec_arg) == script:
+                    return OWNER_UNKNOWN, (
+                        f"pid {pid} runs {exec_arg!r} but its working directory "
+                        f"could not be read, so which checkout it belongs to is "
+                        f"undecided")
+                resolved = None            # some other program; see `mentions`
+            else:
+                resolved = _resolved(os.path.join(cwd, exec_arg))
+
+        # Recognition happens on the *resolved* path, never on the spelling in
+        # argv.  `python3 /theirs/monitor`, where `monitor` is a symlink to
+        # `/theirs/scripts/watchdog.py`, is a running daemon; matching the
+        # basename of argv first answered "not this script" and so classified
+        # its pane as genuinely empty — the husk verdict, which is what
+        # authorises destroying it.
+        if resolved is not None:
+            if _same_script_file(resolved, mine):
+                return OWNER_MINE, f"pid {pid} runs {resolved}"
+            if script in (os.path.basename(resolved), os.path.basename(exec_arg)):
+                return OWNER_FOREIGN, f"pid {pid} runs {resolved}, not {mine}"
 
     if mentions:
         # The name is in there, but not anywhere this can prove it is being
@@ -921,22 +988,41 @@ def pane_script_owner(pane_pid, script: str, mine: str, *,
     return OWNER_NONE, f"no {script} under pane pid {pane_pid}"
 
 
-def foreign_daemon_in_pane(pane_pid, *, repo_root=None,
-                           proc_root: Optional[str] = None) -> Optional[str]:
-    """Why `pane_pid` holds **another checkout's** crewvia daemon, or None.
+#: What may be destroyed.  An **allowlist**, and the same one the daemon layer
+#: keeps in `lib_daemon_watch._MAY_KILL_OWNERS` (a test binds the two together).
+#:
+#: The denylist version of this question — "is it provably somebody else's?" —
+#: is the shape four P1s came back through: every answer it had not thought of
+#: (an unreadable cmdline, a pane pid the backend would not give up, an
+#: unrecognised interpreter, an aliased path) fell on the destructive side.
+#: Listing what may be killed instead means the next unforeseen answer falls on
+#: the refusing side, where the cost is a `--force` rather than a production
+#: daemon (memory: approve-judgment-needs-allowlist-and-scope).
+_MAY_KILL_OWNERS = frozenset({OWNER_MINE, OWNER_NONE})
 
-    Positive proof only.  Everything unreadable answers None (= "no reason to
-    refuse"), because this is the backstop rather than the judgment: the pane
-    it is asked about is just as often a Worker's, and a Worker pane that
-    cannot be read still has to be closable.
+
+def daemon_pane_owner(pane_pid, *, repo_root=None,
+                      proc_root: Optional[str] = None):
+    """`(owner, detail)` — whose crewvia daemon, if any, `pane_pid` holds.
+
+    Three-valued across *every* daemon script, worst answer first: a pane with
+    another checkout's dispatcher and our watchdog is not ours to end, and a
+    pane we could not read is not a pane we know to be empty.
+
+    `UNKNOWN` is the answer that changed: it used to be folded into "no reason
+    to refuse" here, which is how a guard that reads the pane rather than the
+    environment still let a clean-env `kill("watchdog")` reach production.
     """
     root = Path(repo_root) if repo_root is not None else _own_repo_root()
+    verdicts: dict = {}
     for script in DAEMON_SCRIPTS:
         owner, detail = pane_script_owner(
             pane_pid, script, str(root / "scripts" / script), proc_root=proc_root)
-        if owner == OWNER_FOREIGN:
-            return detail
-    return None
+        verdicts.setdefault(owner, detail)
+    for owner in _OWNER_PRECEDENCE:
+        if owner in verdicts:
+            return owner, verdicts[owner]
+    return OWNER_NONE, f"no crewvia daemon under pane pid {pane_pid}"
 
 
 # ---------------------------------------------------------------------------
@@ -1203,9 +1289,26 @@ class TmuxBackend(_Backend):
         "nothing ever works again" (memory: fail-closed-discard-vs-hold).
         """
         self._guard("kill", name)
-        if not allow_foreign and self._refuses_foreign_daemon(name):
-            return False
         target = self._target(name)
+        if not allow_foreign and name in DAEMON_PANE_NAMES:
+            window_id, pane_pid = self._inspect_pane(name)
+            if self._refuses_foreign_daemon(name, pane_pid):
+                return False
+            if window_id is None:
+                # Unreachable while the allowlist holds (no pid means UNKNOWN
+                # means refused), and kept anyway: the invariant that matters
+                # is that nothing is destroyed except through the identity the
+                # inspection returned.
+                self._warn(
+                    f"kill {name!r}: refused — the window that was inspected "
+                    f"could not be identified. Nothing was killed.")
+                return False
+            # The window *id*, not the name: window names are mutable, and the
+            # /proc walk between the two takes real time.  If the inspected
+            # window is gone and another checkout has recreated one under the
+            # same name, `@id` no longer resolves and the kill fails — which
+            # is the answer we want, rather than closing a stranger.
+            target = window_id
         try:
             r = subprocess.run(
                 ["tmux", "kill-window", "-t", target],
@@ -1216,25 +1319,30 @@ class TmuxBackend(_Backend):
             self._warn(f"kill {name!r} failed: {e}")
             return False
 
-    def pid(self, name: str) -> Optional[int]:
-        """Return the shell PID of the pane (display-message #{pane_pid})."""
+    def _inspect_pane(self, name: str):
+        """`(window_id, pane_pid)` in one `display-message` — see _Backend."""
         self._guard("pid", name)
         target = self._target(name)
         try:
             r = subprocess.run(
-                ["tmux", "display-message", "-p", "-t", target, "#{pane_pid}"],
+                ["tmux", "display-message", "-p", "-t", target,
+                 "#{window_id} #{pane_pid}"],
                 capture_output=True, text=True, timeout=5,
             )
             if r.returncode != 0:
                 self._warn(f"display-message failed for {name!r}: {r.stderr}")
-                return None
-            raw = r.stdout.strip()
-            if not raw:
-                return None
-            return int(raw)
-        except (ValueError, Exception) as e:
+                return None, None
+            parts = r.stdout.strip().split()
+            if len(parts) != 2 or not parts[0].startswith("@"):
+                return None, None
+            return parts[0], int(parts[1])
+        except Exception as e:
             self._warn(f"pid {name!r} failed: {e}")
-            return None
+            return None, None
+
+    def pid(self, name: str) -> Optional[int]:
+        """Return the shell PID of the pane (display-message #{pane_pid})."""
+        return self._inspect_pane(name)[1]
 
     def attach(self, name: str) -> bool:
         """Attach to the session (called when already inside tmux).
@@ -2076,16 +2184,28 @@ class HerdrBackend(_Backend):
         `allow_foreign=True` lifts the identity backstop — see TmuxBackend.kill.
         """
         self._guard("kill", name)
-        if not allow_foreign and self._refuses_foreign_daemon(name):
-            return False
-        ids = self._resolve_ids(name)
-        if ids is None:
-            self._warn(f"kill {name!r}: pane not found")
-            return False
-        tab_id = ids.get("tab_id")
-        if not tab_id:
-            self._warn(f"kill {name!r}: tab_id not found in cache/live")
-            return False
+        if not allow_foreign and name in DAEMON_PANE_NAMES:
+            # The tab that was inspected is the tab that gets closed.  Calling
+            # `_resolve_ids()` again here would re-resolve *by label*, and a
+            # label is exactly what another checkout can attach to a different
+            # tab while the /proc walk runs.
+            tab_id, pane_pid = self._inspect_pane(name)
+            if self._refuses_foreign_daemon(name, pane_pid):
+                return False
+            if not tab_id:
+                self._warn(
+                    f"kill {name!r}: refused — the tab that was inspected "
+                    f"could not be identified. Nothing was killed.")
+                return False
+        else:
+            ids = self._resolve_ids(name)
+            if ids is None:
+                self._warn(f"kill {name!r}: pane not found")
+                return False
+            tab_id = ids.get("tab_id")
+            if not tab_id:
+                self._warn(f"kill {name!r}: tab_id not found in cache/live")
+                return False
 
         data = _herdr_run("tab_close", [tab_id], timeout=10)
         if data is None:
@@ -2094,25 +2214,33 @@ class HerdrBackend(_Backend):
         self._delete_cache(name)
         return True
 
-    def pid(self, name: str) -> Optional[int]:
-        """Return the shell PID of the named pane via pane process-info."""
+    def _inspect_pane(self, name: str):
+        """`(tab_id, pane_pid)` from one resolution — see _Backend."""
         self._guard("pid", name)
         ids = self._resolve_ids(name)
         if ids is None:
             self._warn(f"pid {name!r}: pane not found")
-            return None
-        pane_id = ids["pane_id"]
+            return None, None
+        pane_id = ids.get("pane_id")
+        tab_id = ids.get("tab_id")
+        if not pane_id:
+            self._warn(f"pid {name!r}: pane_id not found in cache/live")
+            return None, None
 
         data = _herdr_run("pane_process_info", [pane_id], timeout=10)
         if data is None:
             self._warn(f"pid {name!r}: pane process-info failed")
-            return None
+            return tab_id, None
         try:
             shell_pid = data["result"]["process_info"]["shell_pid"]
-            return int(shell_pid)
+            return tab_id, int(shell_pid)
         except (KeyError, TypeError, ValueError) as e:
             self._warn(f"pid {name!r}: could not parse shell_pid: {e}")
-            return None
+            return tab_id, None
+
+    def pid(self, name: str) -> Optional[int]:
+        """Return the shell PID of the named pane via pane process-info."""
+        return self._inspect_pane(name)[1]
 
     def attach(self, name: str) -> bool:
         """Attach / focus the named pane's tab (called when already inside herdr).

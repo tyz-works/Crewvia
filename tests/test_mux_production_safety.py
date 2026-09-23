@@ -63,14 +63,31 @@ class _RecordingSubprocess:
     def run(self, argv, **kwargs):
         self.calls.append(list(argv))
         text = kwargs.get("text", False)
-        empty = "" if text else b""
-        return subprocess.CompletedProcess(list(argv), 0, stdout=empty, stderr=empty)
+        out = ""
+        if "display-message" in argv:
+            # Substitute the format the way tmux does.  A stub that answers
+            # only the format string it was written against turns a change in
+            # the caller into a fake refusal — the identity guard would read
+            # "no pane pid" and refuse, and every test here would go red for a
+            # reason that does not exist in production
+            # (memory: crewvia-fake-cli-and-qa-fail-gaps).
+            out = (argv[-1].replace("#{window_id}", "@1")
+                           .replace("#{pane_pid}", str(os.getpid())) + "\n")
+        return subprocess.CompletedProcess(
+            list(argv), 0,
+            stdout=out if text else out.encode(),
+            stderr="" if text else b"")
 
     def __getattr__(self, item):
         return getattr(subprocess, item)
 
     def tmux_calls(self):
         return [c for c in self.calls if c and c[0] == "tmux"]
+
+    def addressed(self, verb):
+        """The `-t` targets of every `tmux <verb>` call."""
+        return [c[c.index("-t") + 1] for c in self.tmux_calls()
+                if verb in c and "-t" in c]
 
 
 @pytest.fixture
@@ -157,12 +174,18 @@ def test_under_isolation_the_pane_name_is_namespaced(recording_tmux):
     assert prefix, "conftest did not install a pane prefix"
 
     lib_mux.TmuxBackend().kill(dw.DAEMON_DISPATCHER)
-    targets = [c[-1] for c in recording_tmux.tmux_calls() if "kill-window" in c]
-    assert targets, recording_tmux.tmux_calls()
-    for target in targets:
+
+    # A daemon pane is now addressed by name once — to inspect it — and the
+    # kill carries the `@window_id` that inspection returned (t039 P1-4), so
+    # the namespace is asserted where the name is still used.
+    addressed = recording_tmux.addressed("display-message")
+    assert addressed, recording_tmux.tmux_calls()
+    for target in addressed:
         session, _, pane = target.partition(":")
         assert session != PRODUCTION_DESTINATION, target
         assert pane == f"{prefix}{dw.DAEMON_DISPATCHER}", target
+    assert recording_tmux.addressed("kill-window") == ["@1"], \
+        recording_tmux.tmux_calls()
 
 
 def test_list_hides_the_namespace_from_callers(monkeypatch):
@@ -197,8 +220,11 @@ def test_production_keeps_its_bare_names_and_no_guard(monkeypatch, recording_tmu
     monkeypatch.setenv("CREWVIA_TMUX_SESSION", PRODUCTION_DESTINATION)
 
     assert lib_mux.TmuxBackend().kill(dw.DAEMON_DISPATCHER) is True
-    targets = [c[-1] for c in recording_tmux.tmux_calls() if "kill-window" in c]
-    assert targets == [f"{PRODUCTION_DESTINATION}:{dw.DAEMON_DISPATCHER}"], targets
+    assert recording_tmux.addressed("display-message") == \
+        [f"{PRODUCTION_DESTINATION}:{dw.DAEMON_DISPATCHER}"], \
+        recording_tmux.tmux_calls()
+    assert recording_tmux.addressed("kill-window") == ["@1"], \
+        recording_tmux.tmux_calls()
 
 
 # ---------------------------------------------------------------------------
@@ -212,7 +238,15 @@ printf '%s\\n' "$*" >> "$TMUX_STUB_LOG"
 # なので repo identity ガードが「読めない」に落ちず、その子孫に dispatcher.sh は
 # 居ないので「誰も居ない (= husk)」と正しく判定される。init (pid 1) を返すと
 # **本番のデーモンが子孫に入ってしまい**、本番の稼働状況でテストが揺れる。
-if [ "$1" = "display-message" ]; then printf '%s\\n' "$PPID"; fi
+# tmux が返すのは「フォーマット文字列を置換したもの」なので、この偽物もそう振る舞う。
+# 聞かれた書式だけを決め打ちで返す偽物は、呼び手が書式を変えた瞬間に「ペインの pid が
+# 取れない」= 本番には存在しない拒否を作り出す (memory: crewvia-fake-cli-and-qa-fail-gaps)。
+if [ "$1" = "display-message" ]; then
+  fmt="${!#}"
+  fmt="${fmt//'#{window_id}'/@1}"
+  fmt="${fmt//'#{pane_pid}'/$PPID}"
+  printf '%s\\n' "$fmt"
+fi
 exit 0
 """
 

@@ -1612,16 +1612,41 @@ checkout のデーモンが動いていた = foreign)。そこで (b) を本線�
 
 | 層 | 形 | 曖昧なとき | 適用範囲 |
 |---|---|---|---|
-| `lib_mux.kill()` の backstop | **積極的な証明があるときだけ断る** | 通す | `DAEMON_PANE_NAMES` のペインだけ |
+| `lib_mux.kill()` の backstop | **allowlist** (`mine` / `none` のみ) | 断る | `DAEMON_PANE_NAMES` のペインだけ |
 | `pane_daemon_owner()` (デーモン層) | **allowlist** (`mine` / `none` のみ) | 断る | `restart()` の判定 |
 
-mux 層を allowlist にできないのは、そこが **Worker のペインも通る道**だから。
-Worker は任意のコマンドを走らせるので、「認識できたものだけ kill してよい」に
-すると watchdog が Worker を終了できなくなる。同じ理由で適用範囲をデーモンの
-ペイン名に絞ってある — crewvia の QA Worker は自分のペインで
-`bash scripts/dispatcher.sh` を走らせることが実際にあり、そこまで広げると
-その Worker が二度と retire できない。**守りたい unit を 1 つに絞る**
-(memory: approve-judgment-needs-allowlist-and-scope)。
+**2 つの層は同じ形にした (t039)。** ここには元々「mux 層を allowlist に
+できないのは、そこが Worker のペインも通る道だから」と書いてあり、曖昧なときは
+通す設計だった。Codex の 4 巡目がその理屈の誤りを指摘した — **適用範囲が既に
+`DAEMON_PANE_NAMES` に絞られている以上、Worker のペインはこの分岐に来ない**。
+Worker の可用性は、判定を緩めることではなく**スコープ**が守っている。
+
+緩めた代償として、`unknown` が kill の許可に変換されていた。そこを通れたものは:
+
+- `/proc` 走査中に読めない `cmdline` が 1 つでもある
+- バックエンドがペインの pid を答えない
+- `python3.12` のような表に無いインタプリタで起動された別 checkout の watchdog
+
+いずれも「判断できなかった」であって「空だった」ではない。きれいな env からの
+`mux.kill("watchdog")` が本番を閉じられる、という形で残っていた。
+
+適用範囲をデーモンのペイン名に絞ってあるのは今まで通り — crewvia の QA Worker は
+自分のペインで `bash scripts/dispatcher.sh` を走らせることが実際にあり、そこまで
+広げるとその Worker が二度と retire できない。**判定は allowlist、守る unit は
+1 つに絞る** (memory: approve-judgment-needs-allowlist-and-scope)。
+
+出口は `restart --force` (`kill(allow_foreign=True)`) の 1 本だけ。出口の無い
+fail closed は「判断できない」を「何も二度と動かない」に化けさせる
+(memory: fail-closed-discard-vs-hold)。
+
+**破壊は覗いた対象そのものに束縛する。** 所有権の判定が真偽値しか持ち帰らないと、
+kill は対象を名前から**引き直す**ことになる。tmux の window 名も herdr の
+ラベルも可変で、あいだに挟まる `/proc` の全走査には実時間がかかる。覗いたタブが
+消えて別 checkout が同じ名前で作り直せば、**一度も覗いていない後継**を閉じる。
+`_inspect_pane()` が「不変の id + そのときの pane pid」を 1 回の問い合わせで
+返し、kill はその id (tmux は `@window_id`、herdr は `tab_id`) を宛先にする。
+後継は別の id を持つので、届かずに失敗する — それが欲しい答え
+(PR #205 の `_verified_pid()` と同じ形)。
 
 **起動形態を同定する。** 修正前の `pane_daemon_owner()` は「`/scripts/<script>`
 で終わる引数」を探していた。つまり:
@@ -1637,6 +1662,23 @@ Worker は任意のコマンドを走らせるので、「認識できたもの�
 名前は出てくるのに実行位置を特定できない形 (`env FOO=1 bash scripts/…`) は
 `none` ではなく **`unknown`**。認識できない起動形態を「空のペイン」と書くと、
 知らない形が全部**破壊側**に落ちる。
+
+**スクリプトの同定は「字面」ではなく「届くファイル」で行う (t039)。** 同定を
+argv の綴りに任せると、同じ欠陥が 2 つの向きから戻ってくる:
+
+- **別名の symlink** — `python3 /theirs/monitor` (`monitor` は
+  `/theirs/scripts/watchdog.py` を指す)。basename で先に絞っていたので
+  `foreign` でも `unknown` でもなく **`none`** = 空のペイン。生きた他人の
+  デーモンが husk として潰せた
+- **`..` の字面での畳み込み** — `/ours/link` が `/theirs/subdir` を指すとき、
+  `/ours/link/../scripts/watchdog.py` が実際に動かすのは
+  `/theirs/scripts/watchdog.py`。`normpath()` はこれを
+  `/ours/scripts/watchdog.py` に畳むので **`mine`** = 自分のデーモン
+
+`normpath()` は symlink を知らないまま `..` を消すので、**パスが指すファイルが
+変わる**。`_resolved()` (= `realpath()`) で **symlink を解決してから**認識し、
+`_same_script_file()` も両辺を解決して比べる。字面の一致はスクリプト同一性の
+証明にならない。
 
 **respawn に隔離を引き継ぐ。** mux 経由で起動されるプロセスは呼び出し側ではなく
 **mux サーバーの env** を継承する (herdr は server 起動時の env を全ペインに

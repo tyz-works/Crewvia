@@ -122,18 +122,31 @@ def as_our_checkout(monkeypatch, our_checkout):
 # ---------------------------------------------------------------------------
 
 class _RecordingSubprocess:
-    """tmux を **実行せずに** argv を記録する差し替え。"""
+    """tmux を **実行せずに** argv を記録する差し替え。
 
-    def __init__(self, pane_pid=None):
+    `display-message` は `#{window_id} #{pane_pid}` の 2 つを 1 回で答える。
+    ペインを覗いた時点の window と、あとで閉じる window が同じものである
+    保証は「同じ 1 回の問い合わせで得た id」以外に無いので、テスト側の偽物も
+    その形にしておく (P1-4)。
+
+    `window_id_after` を渡すと、最初の `display-message` のあとに window_id が
+    すり替わる — 覗いたタブが消えて別チェックアウトが同じ名前で作り直した形。
+    """
+
+    def __init__(self, pane_pid=None, window_id="@1", window_id_after=None):
         self.calls = []
         self.pane_pid = pane_pid
+        self.window_id = window_id
+        self.window_id_after = window_id_after
 
     def run(self, argv, **kwargs):
         self.calls.append(list(argv))
         text = kwargs.get("text", False)
         out = ""
         if "display-message" in argv and self.pane_pid is not None:
-            out = f"{self.pane_pid}\n"
+            out = f"{self.window_id} {self.pane_pid}\n"
+            if self.window_id_after is not None:
+                self.window_id = self.window_id_after
         return subprocess.CompletedProcess(
             list(argv), 0,
             stdout=out if text else out.encode(),
@@ -144,6 +157,9 @@ class _RecordingSubprocess:
 
     def kill_calls(self):
         return [c for c in self.calls if "kill-window" in c]
+
+    def kill_targets(self):
+        return [c[c.index("-t") + 1] for c in self.kill_calls() if "-t" in c]
 
 
 @pytest.fixture
@@ -279,19 +295,49 @@ def test_a_worker_kill_does_not_pay_for_the_guard(
         f"the pane was inspected for a name the guard does not cover: {rec.calls}"
 
 
-def test_kill_does_not_refuse_when_the_pane_cannot_be_read(
+def test_kill_refuses_a_daemon_pane_that_cannot_be_read(
         monkeypatch, tmp_path, as_our_checkout, production_env):
-    """読めないときは断らない — ここは backstop であって判定ではない。
+    """デーモンのペインが読めないなら断る (t039 P1-1)。
 
-    mux 層を「判断できなければ断る」にすると、pid が取れないペイン
-    (Worker を含む) が永久に閉じられなくなる。曖昧さに対する fail closed は
-    デーモン層の `pane_daemon_owner()` が引き受ける。
+    これは **以前と逆の答え**。前は「読めない = 断る理由が無い」で kill を
+    通していたが、それは `UNKNOWN` を破壊の許可に変換していたということで、
+    Codex が 4 巡目に挙げた 4 件のうち 3 件がその形だった。
+
+    可用性の言い訳もここでは立たない: スコープは既に `DAEMON_PANE_NAMES` に
+    絞ってあるので、読めない Worker のペインは**この分岐に来ない**
+    (次のテストがそれを押さえる)。デーモンのペインを本当に取り返したいときの
+    出口は `--force` の方。
     """
     monkeypatch.setattr(lib_mux, "_PROC_ROOT", str(tmp_path / "nonexistent-proc"))
     rec = _RecordingSubprocess(pane_pid=None)   # display-message が答えない
     monkeypatch.setattr(lib_mux, "subprocess", rec)
 
-    assert lib_mux.TmuxBackend().kill("dispatcher") is True
+    # allowlist そのものを名指しで押さえる。`kill()` の結果だけを見ていると、
+    # P1-4 の「覗いた window に束縛する」方が先に断るので、**allowlist を
+    # 元に戻しても緑のまま**だった — 別の層が先に止めていて偶然緑、という形
+    # (memory: red-proof-catches-tests-green-for-the-wrong-reason)。
+    assert lib_mux.OWNER_UNKNOWN not in lib_mux._MAY_KILL_OWNERS
+    assert lib_mux.TmuxBackend()._refuses_foreign_daemon("dispatcher", None) is True
+
+    assert lib_mux.TmuxBackend().kill("dispatcher") is False
+    assert rec.kill_calls() == [], \
+        f"a daemon pane nobody could read was killed anyway: {rec.kill_calls()}"
+
+
+def test_a_worker_pane_that_cannot_be_read_is_still_killable(
+        monkeypatch, tmp_path, as_our_checkout, production_env):
+    """読めない Worker のペインは今まで通り閉じられる。
+
+    上のテストで足した拒否が、Worker の retire を道連れにしていないことの確認。
+    「判断できなければ断る」を全ペインに広げると、pid が取れないペインが永久に
+    残る — 安全側に倒したつもりで別の壊れ方を作る形
+    (memory: fail-closed-discard-vs-hold)。
+    """
+    monkeypatch.setattr(lib_mux, "_PROC_ROOT", str(tmp_path / "nonexistent-proc"))
+    rec = _RecordingSubprocess(pane_pid=None)
+    monkeypatch.setattr(lib_mux, "subprocess", rec)
+
+    assert lib_mux.TmuxBackend().kill("Ren-worker") is True
     assert rec.kill_calls()
 
 
@@ -673,3 +719,241 @@ def test_resume_still_lifts_a_marker_it_can_remove(registry):
     assert dw.resume(registry, dw.DAEMON_DISPATCHER, token=token) is True
     assert not dw.pause_path(registry, dw.DAEMON_DISPATCHER).exists()
     assert dw.read_pause_state(registry, dw.DAEMON_DISPATCHER)[0] == dw.PAUSE_ABSENT
+
+
+# ---------------------------------------------------------------------------
+# 6. 既定を「拒否」に反転する — mux 層の allowlist (t039 / Codex 4 巡目)
+#
+# 4 件の P1 は別々の穴に見えて 1 つの形をしている: **識別できなかったケースが
+# 破壊の許可に落ちる**。個別に塞ぐと次の「思いつかなかった起動形態」でまた開く
+# ので、関数の契約の方を反転させる —
+#
+#   破壊してよいのは MINE と、確実に空の NONE だけ。それ以外はすべて拒否。
+#
+# デーモン層の `_MAY_KILL_OWNERS` が既にその形なので、mux 層をそれに揃える。
+# ---------------------------------------------------------------------------
+
+def _foreign_watchdog(their_checkout):
+    """別チェックアウト側に watchdog.py を実在させる。"""
+    script = their_checkout / "scripts" / "watchdog.py"
+    script.write_text("#\n", encoding="utf-8")
+    return script
+
+
+def test_the_two_layers_agree_on_what_may_be_killed():
+    """kill してよい owner の表が、mux 層とデーモン層で一致していること。
+
+    片方だけ広いと、狭い方を通り抜けられなかった破壊が広い方から通る。
+    2 つある判定を 1 つに絞れない以上、せめて同じ答えを返すことを機械で縛る。
+    """
+    assert lib_mux._MAY_KILL_OWNERS == dw._MAY_KILL_OWNERS
+
+
+def test_kill_refuses_when_proc_cannot_be_walked_completely(
+        monkeypatch, tmp_path, as_our_checkout, production_env):
+    """/proc に 1 つでも読めない cmdline があれば断る (P1-1)。
+
+    `proc_table()` は元から「1 つでも読めなければ None」と正しく答えていた。
+    落ちていたのはその先 — backstop がその None を「断る理由が無い」に変換して
+    いた。ペインの中身を **一度も見られていない** のだから、そこから言える
+    ことは何も無い。
+    """
+    proc_root = _fake_proc(tmp_path, {
+        4100: (1, ["bash"], str(tmp_path)),
+        4200: (4100, ["python3", "scripts/watchdog.py"], str(tmp_path)),
+    })
+    unreadable = Path(proc_root) / "4200" / "cmdline"
+    unreadable.chmod(0o000)
+    if os.access(unreadable, os.R_OK):
+        pytest.skip("running as root — an unreadable cmdline cannot be staged")
+    monkeypatch.setattr(lib_mux, "_PROC_ROOT", proc_root)
+    rec = _RecordingSubprocess(pane_pid=4100)
+    monkeypatch.setattr(lib_mux, "subprocess", rec)
+
+    try:
+        assert lib_mux.TmuxBackend().kill("watchdog") is False
+        assert rec.kill_calls() == [], \
+            f"a pane nobody could read through was killed: {rec.kill_calls()}"
+    finally:
+        unreadable.chmod(0o644)
+
+
+def test_kill_refuses_a_daemon_under_an_unrecognised_interpreter(
+        monkeypatch, tmp_path, as_our_checkout, their_checkout, production_env):
+    """`python3.12 …/watchdog.py` — 表に無いインタプリタでも断る (P1-1)。
+
+    `_INTERPRETER_NAMES` は allowlist なので `python3.12` はそこに無く、
+    `script_owner()` は正しく `UNKNOWN` を返していた。にもかかわらず backstop が
+    それを許可に変換していたので、**別チェックアウトの watchdog** が入った
+    ペインを、きれいな env からの `mux.kill("watchdog")` が閉じられた。
+    """
+    _foreign_watchdog(their_checkout)
+    proc_root = _fake_proc(tmp_path, {
+        4100: (1, ["bash"], str(tmp_path)),
+        4200: (4100, ["python3.12", str(their_checkout / "scripts" / "watchdog.py")],
+               str(their_checkout)),
+    })
+    monkeypatch.setattr(lib_mux, "_PROC_ROOT", proc_root)
+    rec = _RecordingSubprocess(pane_pid=4100)
+    monkeypatch.setattr(lib_mux, "subprocess", rec)
+
+    assert lib_mux.TmuxBackend().kill("watchdog") is False
+    assert rec.kill_calls() == [], \
+        f"another checkout's watchdog was killed: {rec.kill_calls()}"
+
+
+def test_a_daemon_reached_through_a_renamed_symlink_is_not_a_husk(
+        monkeypatch, tmp_path, as_our_checkout, their_checkout, production_env):
+    """別名の symlink 越しに起動されたデーモンを「空のペイン」にしない (P1-2)。
+
+    `python3 /theirs/monitor` — `monitor` は `/theirs/scripts/watchdog.py` を
+    指す実在の symlink。argv の basename を**文字列として**先に見ていたため、
+    FOREIGN でも UNKNOWN でもなく **NONE**、つまり「本当に空のペイン」に
+    分類されていた。NONE は restart の allowlist が唯一通す答えなので、生きた
+    他人のデーモンが husk として潰せた。
+
+    実ファイル + 実 symlink で再現する。字面の一致ではなく、**実行しているファイル**
+    が何かを見ているかどうかが問われているので。
+    """
+    script = _foreign_watchdog(their_checkout)
+    alias = their_checkout / "monitor"
+    alias.symlink_to(script)
+    assert alias.resolve() == script.resolve()
+
+    proc_root = _fake_proc(tmp_path, {
+        4100: (1, ["bash"], str(tmp_path)),
+        4200: (4100, ["python3", str(alias)], str(their_checkout)),
+    })
+    monkeypatch.setattr(lib_mux, "_PROC_ROOT", proc_root)
+    rec = _RecordingSubprocess(pane_pid=4100)
+    monkeypatch.setattr(lib_mux, "subprocess", rec)
+
+    owner, detail = lib_mux.daemon_pane_owner(4100, proc_root=proc_root)
+    assert owner != lib_mux.OWNER_NONE, \
+        f"a live foreign daemon was classified as an empty pane: {detail}"
+    assert lib_mux.TmuxBackend().kill("watchdog") is False
+    assert rec.kill_calls() == [], \
+        f"a daemon behind an alias was killed: {rec.kill_calls()}"
+
+
+def test_a_parent_traversal_through_a_symlink_is_not_our_script(
+        monkeypatch, tmp_path, as_our_checkout, their_checkout, production_env):
+    """`..` を字面で畳むと、指すファイルが変わる (P1-3)。
+
+    `/ours/link` が `/theirs/subdir` を指すとき、
+    `/ours/link/../scripts/watchdog.py` が実際に動かすのは
+    `/theirs/scripts/watchdog.py`。ところが `normpath()` を先に呼ぶと
+    `/ours/scripts/watchdog.py` に畳まれて **MINE** — 自分のデーモンだから
+    kill してよい、と両方の identity ガードが答えていた。
+
+    これも実ファイル + 実 symlink で再現する。`normpath` と `realpath` の差は
+    ファイルシステムが実在しないと出ない。
+    """
+    script = _foreign_watchdog(their_checkout)
+    (their_checkout / "subdir").mkdir()
+    link = as_our_checkout / "link"
+    link.symlink_to(their_checkout / "subdir")
+
+    traversed = f"{link}/../scripts/watchdog.py"
+    assert os.path.realpath(traversed) == os.path.realpath(script), \
+        "the fixture does not actually traverse the symlink"
+    assert os.path.normpath(traversed) == str(as_our_checkout / "scripts" / "watchdog.py"), \
+        "the fixture does not exercise the lexical collapse this is about"
+
+    proc_root = _fake_proc(tmp_path, {
+        4100: (1, ["bash"], str(tmp_path)),
+        4200: (4100, ["python3", traversed], str(their_checkout)),
+    })
+    monkeypatch.setattr(lib_mux, "_PROC_ROOT", proc_root)
+    rec = _RecordingSubprocess(pane_pid=4100)
+    monkeypatch.setattr(lib_mux, "subprocess", rec)
+
+    owner, detail = lib_mux.daemon_pane_owner(4100, proc_root=proc_root)
+    assert owner == lib_mux.OWNER_FOREIGN, \
+        f"a path that runs another checkout's script was read as ours: {owner} {detail}"
+    assert lib_mux.TmuxBackend().kill("watchdog") is False
+    assert rec.kill_calls() == []
+
+
+def test_an_alias_to_our_own_script_is_still_ours(
+        monkeypatch, tmp_path, as_our_checkout, production_env):
+    """別名越しでも、指す先が自分のスクリプトなら今まで通り kill できる。
+
+    P1-2 / P1-3 の修正を「symlink が絡んだら全部断る」で済ませていないことの
+    確認。実行しているファイルを解決した結果が自分のものなら、それは自分のもの。
+    """
+    alias = as_our_checkout / "monitor"
+    alias.symlink_to(as_our_checkout / "scripts" / "watchdog.py")
+    proc_root = _fake_proc(tmp_path, {
+        4100: (1, ["bash"], str(tmp_path)),
+        4200: (4100, ["python3", str(alias)], str(as_our_checkout)),
+    })
+    monkeypatch.setattr(lib_mux, "_PROC_ROOT", proc_root)
+    rec = _RecordingSubprocess(pane_pid=4100)
+    monkeypatch.setattr(lib_mux, "subprocess", rec)
+
+    assert lib_mux.TmuxBackend().kill("watchdog") is True
+    assert rec.kill_calls(), "our own daemon behind an alias became un-killable"
+
+
+def test_tmux_kill_targets_the_window_it_inspected_not_the_name(
+        monkeypatch, tmp_path, as_our_checkout, production_env):
+    """覗いた window そのものを閉じる — 名前で引き直さない (P1-4)。
+
+    所有権の判定は真偽値しか持ち帰らず、kill は `<session>:<window 名>` を
+    **もう一度**解決していた。tmux の window 名は可変で、/proc の全走査には
+    実時間がかかる。その間に覗いたタブが消え、別チェックアウトが同じ名前で
+    作り直すと、**一度も覗いていない後継**を閉じることになる。チェックアウト
+    ローカルのデーモンロックは別チェックアウトを直列化しない。
+
+    ここでは display-message のあとに window_id をすり替えて、その入れ替わりを
+    作る。kill が不変の id (`@5`) を持ち込んでいれば、後継の `@9` には届かない。
+    """
+    proc_root = _fake_proc(tmp_path, {4100: (1, ["bash"], str(tmp_path))})
+    monkeypatch.setattr(lib_mux, "_PROC_ROOT", proc_root)
+    rec = _RecordingSubprocess(pane_pid=4100, window_id="@5", window_id_after="@9")
+    monkeypatch.setattr(lib_mux, "subprocess", rec)
+
+    assert lib_mux.TmuxBackend().kill("dispatcher") is True
+    assert rec.kill_targets() == ["@5"], (
+        "the kill was not bound to the window that was inspected: "
+        f"{rec.kill_targets()}")
+
+
+def test_herdr_kill_closes_the_tab_it_inspected(
+        monkeypatch, tmp_path, as_our_checkout, production_env):
+    """herdr 側も同じ — `pid()` が解決済みなのに `_resolve_ids()` を呼び直さない。
+
+    本番は herdr なので、実害の経路はこちら。ラベルで引き直すと、覗いたタブが
+    消えたあとに同じラベルで作られた別のタブを閉じる。
+    """
+    proc_root = _fake_proc(tmp_path, {4100: (1, ["bash"], str(tmp_path))})
+    monkeypatch.setattr(lib_mux, "_PROC_ROOT", proc_root)
+
+    calls = []
+    resolved = []
+
+    def fake_run(verb, args, timeout=10):
+        calls.append((verb, list(args)))
+        if verb == "pane_process_info":
+            return {"result": {"process_info": {"shell_pid": 4100,
+                                                "foreground_processes": []}}}
+        if verb == "tab_close":
+            return {"result": {"ok": True}}
+        return None
+
+    monkeypatch.setattr(lib_mux, "_herdr_run", fake_run)
+    backend = lib_mux.HerdrBackend()
+
+    def shifting_ids(name):
+        """2 回目からは別のタブが同じラベルを名乗っている。"""
+        resolved.append(name)
+        n = len(resolved)
+        return {"tab_id": f"w1:t{n}", "pane_id": f"w1:p{n}"}
+
+    monkeypatch.setattr(backend, "_resolve_ids", shifting_ids)
+
+    assert backend.kill("dispatcher") is True
+    closed = [args for verb, args in calls if verb == "tab_close"]
+    assert closed == [["w1:t1"]], \
+        f"the kill closed a tab it never inspected: {closed} (resolves: {resolved})"

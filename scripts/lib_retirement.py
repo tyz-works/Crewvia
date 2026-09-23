@@ -900,6 +900,12 @@ class RetirementExecutor:
         self._listing_authority: Optional[bool] = None
         self._unavailable_logged_at = 0.0
         self._waiting_logged_at: dict = {}
+        # (agent, request_id) of retirements whose report has already reached
+        # the Director this process's lifetime.  `_retry_pending_report()`
+        # checks this *before* re-sending, so a persistence failure after a
+        # successful delivery retries only the receipt write, never the
+        # notification (t034 / Codex 7巡目 P2-2).
+        self._delivered_reports: set = set()
 
     # ------------------------------------------------------------------
     # Requesting (called by dispatcher via CLI, and by watchdog for W2)
@@ -2116,22 +2122,87 @@ class RetirementExecutor:
         ok = self._report(agent, prog, message)
         return {"director_notified": ok, "pending_report": None if ok else message}
 
+    def _fallback_report(self, agent: str, prog: dict) -> str:
+        """Rebuild a notification from persisted evidence when no verbatim one survived.
+
+        `_report_fields()` started saving the exact message so a retry never
+        has to guess.  A marker written by an older watchdog has
+        `director_notified=False` with no `pending_report` at all — before
+        this fix, `_retry_pending_report()` gave up silently on that shape and
+        the Worker stayed quarantined forever, with `recover()` not migrating
+        the field and `_check_stall()` deliberately staying quiet about these
+        two phases (t034 / Codex 7巡目 P2-1). Everything the original message
+        was built from except the guard's exact prose is still on the progress
+        file, so this reconstructs an equivalent one instead of giving up.
+        """
+        phase = prog.get("phase") or "requested (no step taken yet)"
+        mission = prog.get("mission")
+        task_id = prog.get("task_id")
+        task_line = (f"task {task_id} (mission={mission}) は in_progress のままです。"
+                     if task_id and mission else
+                     "この Worker がどの task を持っていたかは記録から読み取れません。")
+        # `cleanup_deferred` means the Worker is already dead and the queue was
+        # deliberately left untouched (see `_cleanup_deferred()`) — the reader
+        # needs the manual reset recipe, not "go look at the window". A bare
+        # `PHASE_CLEANUP_FAILED` without the flag never reaches this path: its
+        # own retry (`_cleanup_failed()`) resends every cycle unconditionally.
+        if prog.get("cleanup_deferred"):
+            reason = prog.get("cleanup_error") or "実行世代 (started_at) を記録できていません"
+            recipe = (f"plan.sh update {task_id} --status pending --reset "
+                      f"--mission {mission} を手で実行してください。"
+                      if task_id and mission else "")
+            return (
+                f"watchdog が Worker {agent} を終了しましたが、後始末を保留して"
+                f"います ({reason})。この marker を書いた watchdog は元の通知本文を"
+                f"残さないバージョンだったため、永続化された証拠から再構成した"
+                f"通知です。**queue は何も書き換えていません**。{task_line}\n"
+                f"{recipe}"
+                f"そのうえで registry/retirements/{agent}.* を削除してください。"
+            )
+        reason = prog.get("unprovable_reason") or prog.get("discard_reason")
+        reason_line = f" 理由: {reason}。" if reason else ""
+        return (
+            f"watchdog は Worker {agent} の退役を phase={phase} で保留したまま"
+            f"止まっています。{reason_line}この marker を書いた watchdog は元の"
+            f"通知本文を残さないバージョンだったため、永続化された証拠から再構成"
+            f"した通知です。**この通知自体は何も kill せず queue も書き換えて"
+            f"いません**。{task_line}\n"
+            f"確認してください: 窓 {agent}-worker の Worker がいま何を実行しているか。\n"
+            f"解除は registry/retirements/{agent}.* を削除してください。"
+        )
+
     def _retry_pending_report(self, agent: str, prog: dict) -> Optional[str]:
-        """Deliver a report an earlier cycle could not get out.  Changes nothing else."""
+        """Deliver a report an earlier cycle could not get out.  Changes nothing else.
+
+        Delivery and persistence are retried independently: `identity` records
+        in memory, for this process's lifetime, that the message already
+        reached the Director, so a `_write_progress()` failure right after
+        (disk full, etc.) retries only the receipt write on later cycles —
+        never a second send of the same notification (t034 / Codex 7巡目
+        P2-2).
+        """
         if prog.get("director_notified"):
             return None
-        message = prog.get("pending_report")
-        if not message:
-            return None
-        if not self._report(agent, prog, message):
+        identity = (agent, prog.get("request_id"))
+        if identity not in self._delivered_reports:
+            message = prog.get("pending_report") or self._fallback_report(agent, prog)
+            if not self._report(agent, prog, message):
+                self._log_waiting(
+                    agent,
+                    f"[retire] {agent}: still cannot reach the Director about this held "
+                    f"retirement (phase={prog.get('phase')}) — retrying every cycle. "
+                    f"The log line at the time of the decision is the fallback record.")
+                return None
+            self.log(f"[retire] {agent}: delivered the report that earlier cycles could not "
+                     f"send (phase={prog.get('phase')})")
+            self._delivered_reports.add(identity)
+        if not self._write_progress(agent, prog, prog.get("phase"),
+                                    director_notified=True, pending_report=None):
             self._log_waiting(
                 agent,
-                f"[retire] {agent}: still cannot reach the Director about this held "
-                f"retirement (phase={prog.get('phase')}) — retrying every cycle. "
-                f"The log line at the time of the decision is the fallback record.")
+                f"[retire] {agent}: delivered the report but could not persist the "
+                f"receipt (phase={prog.get('phase')}) — will not resend, retrying "
+                f"only the write.")
             return None
-        self.log(f"[retire] {agent}: delivered the report that earlier cycles could not "
-                 f"send (phase={prog.get('phase')})")
-        self._write_progress(agent, prog, prog.get("phase"),
-                             director_notified=True, pending_report=None)
+        self._delivered_reports.discard(identity)
         return "report_delivered"

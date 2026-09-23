@@ -2826,6 +2826,160 @@ def test_red_deferred_cleanup_retries_its_report_until_the_director_hears_it(san
     assert len(delivered) == 1, f"届いたあとも送り続けている: {delivered}"
 
 
+# -- 5. 旧形式の marker と、届いたあとの永続化失敗 (t034 / Codex 7巡目 P2) ----
+
+def test_red_pre_upgrade_unprovable_marker_without_a_saved_message_still_gets_reported(sandbox):
+    """`pending_report` を持たない旧形式の marker も、フォールバックで報告すること。
+
+    RED (t034 / Codex 7巡目 P2-1): `_retry_pending_report()` は `pending_report`
+    が無ければ何もせず None を返す。この fix (`_report_fields()`) より前の
+    watchdog が書いた `unprovable` marker は `director_notified=False` だが
+    `pending_report` を持たない。`recover()` はこの形式を移行しないし、
+    `_check_stall()` はこの phase の報告を明示的に抑制するので、再起動後は
+    **どこからも拾われず、Director に一度も知らされないまま Worker が隔離され
+    続ける**。
+    """
+    pane_pid = sandbox.spawn_worker_process()
+    sandbox.record_identity(WINDOW, pane_pid)
+    mux = FakeMux({WINDOW: pane_pid})
+    state, delivered, notify = _flaky_notifier()
+
+    ex = make_executor(sandbox, mux, notify=notify)
+    assert ex.request(AGENT, WINDOW, "timeout", mission=SLUG, task_id=TASK_ID)
+    sandbox.assignment_identity_file.unlink()   # 世代が読めない → hold
+
+    _drive(ex, 4)
+    prog = _progress_of(sandbox)
+    assert prog.get("phase") == "unprovable", (
+        f"hold になっていない — テストの前提が崩れている: {prog}")
+    assert not prog.get("director_notified")
+
+    # 旧バージョンの watchdog が書いた marker を模す: pending_report が無い。
+    import lib_retirement
+    prog.pop("pending_report", None)
+    lib_retirement.write_json_atomic(
+        lib_retirement.progress_path(sandbox.registry, AGENT), prog)
+
+    state["online"] = True
+    _drive(ex, 3)
+
+    assert len(delivered) == 1, (
+        f"pending_report の無い旧形式 marker が report を再試行しない "
+        f"(delivered={delivered}, logs={sandbox.logs})")
+    note = delivered[0]
+    assert AGENT in note
+    assert "registry/retirements" in note, f"隔離の解き方が書かれていない: {note}"
+
+    _drive(ex, 3)
+    assert len(delivered) == 1, f"届いたあとも送り続けている: {delivered}"
+
+
+def test_red_pre_upgrade_cleanup_deferred_marker_without_a_saved_message_still_gets_reported(sandbox):
+    """同型: `cleanup_deferred` 側の旧形式 marker も同じ穴を持つ。
+
+    RED (t034 / Codex 7巡目 P2-1 の同型): `_cleanup_deferred()` も
+    `_retry_pending_report()` に頼っているので、`pending_report` の無い旧形式
+    marker はここでも黙って再試行されない。1 箇所だけ直すと同じ形が残る
+    (memory: crewvia-recurring-defect-patterns)。
+    """
+    pane_pid = sandbox.spawn_worker_process()
+    sandbox.record_identity(WINDOW, pane_pid)
+    mux = FakeMux({WINDOW: pane_pid})
+    state, delivered, notify = _flaky_notifier()
+
+    ex = make_executor(sandbox, mux, notify=notify)
+    hidden = sandbox.task_file.with_suffix(".hidden")
+    sandbox.task_file.rename(hidden)            # 世代を読めない状態で request
+    assert ex.request(AGENT, WINDOW, "timeout", mission=SLUG, task_id=TASK_ID)
+    hidden.rename(sandbox.task_file)
+
+    os.kill(pane_pid, signal.SIGKILL)
+    for _ in range(200):
+        if not _pid_alive(pane_pid):
+            break
+        time.sleep(0.01)
+    assert not _pid_alive(pane_pid)
+
+    _drive(ex, 8)
+    prog = _progress_of(sandbox)
+    assert prog.get("cleanup_deferred"), (
+        f"後始末の保留になっていない — テストの前提が崩れている: {prog}")
+    assert not prog.get("director_notified")
+
+    # 旧バージョンの watchdog が書いた marker を模す: pending_report が無い。
+    import lib_retirement
+    prog.pop("pending_report", None)
+    lib_retirement.write_json_atomic(
+        lib_retirement.progress_path(sandbox.registry, AGENT), prog)
+
+    state["online"] = True
+    _drive(ex, 3)
+
+    assert len(delivered) == 1, (
+        f"pending_report の無い旧形式 marker が report を再試行しない "
+        f"(delivered={delivered}, logs={sandbox.logs})")
+    assert "--reset" in delivered[0], (
+        f"kill 済みなのに task の戻し方が書かれていない: {delivered[0]}")
+
+    _drive(ex, 3)
+    assert len(delivered) == 1, f"届いたあとも送り続けている: {delivered}"
+
+
+def test_red_delivered_report_is_not_resent_when_persisting_the_receipt_fails(sandbox):
+    """届いた通知の受領証だけを再試行し、通知自体は再送しないこと。
+
+    RED (t034 / Codex 7巡目 P2-2): `_retry_pending_report()` は `_report()` が
+    成功したあと `_write_progress(..., director_notified=True, ...)` の戻り値を
+    見ていない。永続化がディスク満杯などで落ちると、次の cycle も
+    `director_notified=False` かつ `pending_report` が残ったままなので
+    **同じ通知をもう一度送る** — Codex はメモリ上の再現で 3 回の呼び出しから
+    3 通の配信を確認したと報告している。
+    """
+    pane_pid = sandbox.spawn_worker_process()
+    sandbox.record_identity(WINDOW, pane_pid)
+    mux = FakeMux({WINDOW: pane_pid})
+    state, delivered, notify = _flaky_notifier()
+
+    ex = make_executor(sandbox, mux, notify=notify)
+    assert ex.request(AGENT, WINDOW, "timeout", mission=SLUG, task_id=TASK_ID)
+    sandbox.assignment_identity_file.unlink()   # 世代が読めない → hold
+
+    _drive(ex, 4)
+    prog = _progress_of(sandbox)
+    assert prog.get("phase") == "unprovable", (
+        f"hold になっていない — テストの前提が崩れている: {prog}")
+    assert delivered == []
+
+    state["online"] = True
+
+    import lib_retirement
+    real_write = lib_retirement.write_json_atomic
+
+    def failing_write(path, data):
+        if str(path).endswith(".progress.json"):
+            return False
+        return real_write(path, data)
+
+    lib_retirement.write_json_atomic = failing_write
+    try:
+        ex.process_all()
+    finally:
+        lib_retirement.write_json_atomic = real_write
+
+    assert len(delivered) == 1, "通知そのものが届いていない — テストの前提が崩れている"
+    prog = _progress_of(sandbox)
+    assert not prog.get("director_notified"), (
+        "受領証の永続化が失敗しているのに director_notified が立っている — "
+        "テストの前提が崩れている")
+
+    _drive(ex, 3)
+
+    assert len(delivered) == 1, (
+        f"受領証の永続化が失敗しただけなのに通知を再送した: {delivered}")
+    prog = _progress_of(sandbox)
+    assert prog.get("director_notified"), "永続化が復旧しても受領証が書かれない"
+
+
 def _progress_of(sandbox) -> dict:
     import lib_retirement
     return lib_retirement.read_json(

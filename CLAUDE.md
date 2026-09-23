@@ -109,13 +109,22 @@
                         見ていない時間ができる
                         手動で書き出すなら `plan.sh task-graph`（`CREWVIA_QUEUE` が
                         `<root>/queue` でなければ拒否。書き先を明示すれば通る）。
-                        plugin は「空の tasks」と「依存の循環」でファイル全体を拒否するので、
-                        生成側で両方とも潰してある（t010）: task が 0 件のときは
+                        plugin は 4 つの理由で**ファイル全体**を拒否する（空の tasks /
+                        id が空・重複 / 解決できない depends_on / 依存の循環）。1 枚の
+                        カードの事情で全 mission の DAG が消えるので、**publish の直前に
+                        置いた唯一のゲート `enforce_task_graph_contract()` で 4 つとも
+                        潰す**（t013。別々の場所に書くと次の 1 件で片方だけ直して穴が開く）。
+                        潰し方はどれも隔離であって削除ではない: task が 0 件なら
                         `[表示する task なし]` の node を 1 件だけ置き（最後の mission を
                         archive した直後に必ず通る状態なので、画面が空にも古いままにも
-                        ならないようにするため）、循環は**その mission の中だけ**で
-                        後退辺を落として `[循環依存: <id>]` を title に残す（壊れた mission が
-                        他の mission の DAG を道連れにしないため）
+                        ならないようにするため）、循環は後退辺だけを落として
+                        `[循環依存: <id>]`、解決できない辺は `[依存不明: <id>]`、
+                        id の衝突は `[id重複: <id>]` を title に残す（t010 / t013）
+    ※ **task の識別子はファイル名**（`tNNN.md`）であって frontmatter の `id` 欄ではない。
+       `id` 欄がファイル名と食い違うカードは `[破損]` として保留され、pull も dispatch も
+       拾わない（`plan.sh status` に理由と直し方が出る）。突き合わせないと、tNNN.md を
+       コピーして id 行を直し忘れただけで DAG が全滅し、さらに `pull` の書き戻しが
+       **別のカードを上書きして消す**（t013）
     daemons/            dispatcher/watchdog 相互監視の heartbeat・pause マーカー・respawn 履歴
                         （.gitignore 対象）。hooks/post-tool-use.sh の同時死 backstop（t008）が
                         throttle マーカー（backstop-notify.throttle）を置く場所でもある

@@ -679,6 +679,82 @@ def test_nothing_else_neutralises_a_rejection_reason_on_its_own():
         )
 
 
+def _gate():
+    """plan.sh のゲートを、そのまま呼べる形で取り出す。
+
+    ゲートは「どこから来た node でも、通れば plugin が受け取れる」ことを保証する
+    位置に立っている。いまその保証に頼っている経路は list_tasks の手前で潰れて
+    いるので、**ゲート自身を直接呼ばないと、この保証を誰も見ていない状態になる**。
+    """
+    from test_task_graph import _plan_py_source
+
+    src = _plan_py_source()
+    # 末尾の dispatch 表から先は「サブコマンドを 1 つ実行する」本体なので、
+    # 定義だけを読み込む。ここより上に全部の関数定義がある。
+    cut = src.index("\ndispatch = {")
+    ns: dict = {"__name__": "plan_sh_defs"}
+    argv = sys.argv
+    sys.argv = ["plan.sh", str(REPO_ROOT / "queue"), "task-graph", str(REPO_ROOT)]
+    try:
+        exec(compile(src[:cut], "plan.sh", "exec"), ns)  # noqa: S102
+    finally:
+        sys.argv = argv
+    return ns[GATE]
+
+
+def test_the_gate_isolates_a_duplicate_id_whoever_produced_it():
+    """重複 id がゲートに届いたら、node を消さずに衝突を解くこと。"""
+    gate = _gate()
+    nodes = gate(
+        [
+            {"id": "m:t001", "title": "先に来たほう", "depends_on": [], "status": "ready"},
+            {"id": "m:t001", "title": "あとから来たほう", "depends_on": [], "status": "ready"},
+        ],
+        ["m"],
+    )
+    ids = [n["id"] for n in nodes]
+    assert len(nodes) == 2, f"node が消えている: {nodes}"
+    assert len(ids) == len(set(ids)), f"重複が残っている: {ids}"
+    assert ids[0] == "m:t001", "先に来たほうの id まで振り替えられている"
+
+    later = nodes[1]
+    assert "id重複" in later["title"], later["title"]
+    assert "あとから来たほう" in later["title"], later["title"]
+    assert later["status"] == "blocked", (
+        "どのカードなのか言えない node が ready / done に見えている"
+    )
+    assert _reject_reason({"title": "t", "tasks": nodes}) is None
+
+
+def test_the_gate_isolates_an_unusable_id_whoever_produced_it():
+    """id が空 / 文字列でない node も、消さずに隔離すること。"""
+    gate = _gate()
+    nodes = gate(
+        [
+            {"id": "", "title": "id が空", "depends_on": [], "status": "done"},
+            {"id": None, "title": "id が無い", "depends_on": [], "status": "ready"},
+        ],
+        ["m"],
+    )
+    assert len(nodes) == 2, f"node が消えている: {nodes}"
+    for node in nodes:
+        assert isinstance(node["id"], str) and node["id"], node
+        assert "id不正" in node["title"], node["title"]
+        assert node["status"] == "blocked", node
+    assert _reject_reason({"title": "t", "tasks": nodes}) is None
+
+
+def test_the_gate_leaves_a_healthy_graph_exactly_as_it_is():
+    """対照: 契約を満たしている入力に、ゲートが手を入れないこと。"""
+    gate = _gate()
+    original = [
+        {"id": "m:t001", "title": "one", "depends_on": [], "status": "done"},
+        {"id": "m:t002", "title": "two", "depends_on": ["m:t001"], "status": "ready"},
+    ]
+    nodes = gate(json.loads(json.dumps(original)), ["m"])
+    assert nodes == original, nodes
+
+
 def test_the_graph_builder_publishes_through_the_gate():
     """build_task_graph() がゲートを通ってから返すこと。"""
     import ast

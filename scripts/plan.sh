@@ -868,11 +868,12 @@ def list_tasks(slug, base_dir=None, quiet=False):
         # 識別子はファイル名。詳しい理由と「欄が無い」「欄が食い違う」を分ける
         # 理由は、この関数の docstring に書いてある。
         declared = meta.get('id')
-        if declared is not None and str(declared).strip() != task_id:
+        declared = '' if declared is None else str(declared).strip()
+        if declared and declared != task_id:
             if not quiet:
                 print(
                     f"[plan.sh warn] {path}: frontmatter id "
-                    f"{str(declared).strip()!r} does not match the filename "
+                    f"{declared!r} does not match the filename "
                     f"({task_id!r}).\n"
                     f"  hint: the filename is the task's identity. If this file "
                     f"was copied from another card, set `id: {task_id}`; if it "
@@ -882,8 +883,8 @@ def list_tasks(slug, base_dir=None, quiet=False):
                 )
             out.append(_isolated_task(
                 task_id,
-                f'id がファイル名と一致しない (frontmatter: {str(declared).strip()})',
-                f'frontmatter id {str(declared).strip()!r} != filename {task_id!r}',
+                f'id がファイル名と一致しない (frontmatter: {declared})',
+                f'frontmatter id {declared!r} != filename {task_id!r}',
             ))
             continue
         meta['id'] = task_id

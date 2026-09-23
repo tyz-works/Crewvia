@@ -2653,6 +2653,13 @@ def _herdr_close_tab_bound(tab_id: str, server) -> bool:
             "params": {"tab_id": tab_id},
         }).encode() + b"\n"
         try:
+            # The connect timeout is 3s, which is right for "is anybody there";
+            # closing a tab tears down a claude process and its children, and
+            # `_herdr_run("tab_close", ...)` allowed 10s for that.  Leaving the
+            # connect timeout in place here would turn a slow-but-fine close
+            # into a refusal, i.e. a daemon pane that cannot be replaced while
+            # the machine is busy.
+            sock.settimeout(10)
             sock.sendall(request)
             data = b""
             while b"\n" not in data:

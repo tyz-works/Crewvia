@@ -131,7 +131,10 @@ from lib_dep_rules import unmet_dependencies  # noqa: E402
 # サイクルが KeyError で落ちて全 mission の割り当てが止まる** 経路ができていた。
 # ここに frontmatter を直接読むコードを書き戻さないこと。
 # 再発防止は tests/test_task_card_identity.py。
-from lib_task_cards import CORRUPT_TASK_STATUS, list_task_cards, parse_frontmatter  # noqa: E402,F401
+from lib_task_cards import (  # noqa: E402,F401
+    CORRUPT_TASK_STATUS, list_task_cards, parse_frontmatter,
+    read_regular_text_or_none, read_task_card,
+)
 _mux = Mux()
 
 # t002: who may end a Worker process.  'watchdog' (default) = this daemon only
@@ -395,23 +398,47 @@ def parse_yaml(text):
 # State / workers / tasks loading
 # ---------------------------------------------------------------------------
 
+def read_queue_text(path, what):
+    """queue / registry のファイルを **種類を確かめてから** 読む。読めなければ None。
+
+    カードだけでなく `state.yaml` / `workers.yaml` / `mission.yaml` にも同じ
+    ガードを当てる (Codex 8 巡目 P2)。ここは常駐デーモンなので、上限の無い
+    `read_text()` が書き手のいない FIFO に当たると **サイクルごと座り込み、
+    全 mission の割り当てが止まる**。1 枚のカードで落ちないようにしてある
+    のと同じ理由で、1 つの壊れたファイルでも止まらないようにする。
+
+    倒す先は呼び出し側が決める。ここで返すのは「読めなかった」だけ
+    (memory: fail-direction-is-per-judgment)。
+    """
+    return read_regular_text_or_none(
+        path, warn=lambda msg: log(f"WARNING: {what}: {msg}"))
+
+
 def load_state():
     if not STATE_FILE.exists():
         return {}
-    return parse_yaml(STATE_FILE.read_text())
+    text = read_queue_text(STATE_FILE, 'state file')
+    if text is None:
+        # active mission ゼロ = 何も割り当てない。読めなかったことを
+        # 「割り当ててよい」の側に使わない。
+        return {}
+    return parse_yaml(text)
 
 
 def load_workers():
     """Return dict {name: {'skills': [...], ...}} from registry/workers.yaml."""
     if not WORKERS_FILE.exists():
         return {}
-    data = parse_yaml(WORKERS_FILE.read_text())
+    text = read_queue_text(WORKERS_FILE, 'workers file')
+    if text is None:
+        return {}          # Worker 0 人 = 何も割り当てない
+    data = parse_yaml(text)
     workers = {}
     # workers.yaml has a top-level 'workers' block list
     # parse_yaml returns it as a list of scalars which isn't right.
     # We need a proper block-list-of-mappings parser.
-    # Instead, parse manually.
-    text = WORKERS_FILE.read_text()
+    # Instead, parse manually (同じ text を使う — 2 回読むと、その間に置き換え
+    # られたファイルで data と workers が別の姿から作られる)。
     current = None
     for line in text.splitlines():
         stripped = line.strip()
@@ -854,7 +881,15 @@ def publish_agents():
                         mission_slug, task_id = assignment.split(':', 1)
                         task_file = MISSIONS_DIR / mission_slug / 'tasks' / f'{task_id}.md'
                         if task_file.exists():
-                            meta, _ = parse_frontmatter(task_file.read_text())
+                            # カードの読み取りは lib_task_cards を通すこと
+                            # (Codex 8 巡目 P2)。ここは列挙ではなく固定パスなので
+                            # t016 のガードから漏れていた —— `read_text()` には
+                            # 上限が無いので、割り当て済みカードが FIFO に
+                            # 置き換わると **この関数が返らない**。publish_agents()
+                            # は dispatch() より前に走るため、止まるのは全 mission の
+                            # 割り当てである。read_task_card() は例外を投げず、
+                            # 読めないカードは `[破損]` の title で返る。
+                            meta, _ = read_task_card(task_file, task_id)
                             task_title = meta.get('title')
                 except Exception:
                     pass
@@ -1206,7 +1241,14 @@ def dispatch():
         if not mfile.exists():
             all_done = False
             break
-        m = parse_yaml(mfile.read_text())
+        mtext = read_queue_text(mfile, 'mission file')
+        if mtext is None:
+            # 読めなかった mission を「完了した」に数えない。この判定の先には
+            # 全 idle Worker の shutdown があるので、観測の失敗はそこへ落として
+            # はいけない (memory: evidence-for-destructive-decisions)。
+            all_done = False
+            break
+        m = parse_yaml(mtext)
         if m.get('status') != 'done':
             all_done = False
             break

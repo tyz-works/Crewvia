@@ -67,6 +67,9 @@
     lib_retirement.py   retirement marker プロトコル（dispatcher が判定 → watchdog が実行）
                         権限境界の設計は knowledge/daemon-authority.md
                         判定の設計は knowledge/watchdog-idle-judgment.md
+                        沈黙の判定では **`ENOENT`（本当に無い）と、それ以外の `OSError`
+                        （観測できなかった）を分ける**（t017）。潰すと、`registry/` の権限事故
+                        1 回で健全な Worker が全員 `hard_idle` の terminate 対象になる
                         ログ: logs/watchdog/watchdog-YYYYMMDD.log（日次）
     lib_task_cards.py   **task カードを読むことの唯一の定義**（`list_task_cards()` /
                         `parse_frontmatter()` / `isolated_task()` / `CORRUPT_TASK_STATUS`）。
@@ -86,6 +89,19 @@
                         上限の無い `open()` を残すと、書き手のいない FIFO 1 枚で全 mission の
                         割り当てと生存監視が同時に止まる（t016）。設計と全数調査は
                         `knowledge/empty-vs-unobservable.md`
+                        **queue / registry のファイルを固定パスで開くコードも、必ずここを
+                        通すこと**（t017）。入口は 3 つで、判定の本体は 1 つ:
+                        `read_task_card()`（カード 1 枚。読めなければ `[破損]`、例外は出さない）/
+                        `read_regular_text()`（中身か例外）/
+                        `read_regular_text_or_none()`（中身か None + 警告 1 行。常駐デーモン用）。
+                        t016 のガードは `tasks/` を*列挙して*読む経路にしか入っておらず、
+                        `plan.sh` の `load_task`/`load_mission`、`dispatcher` の
+                        `publish_agents`/`load_state`/`load_workers`、`verifier-dispatcher` の
+                        `update_task_fields`、`taskvia-sync`、`watchdog` の `load_active_tasks`
+                        が素の `open()` のまま残っていた（Codex 8 巡目 P2）。
+                        表は `tests/test_queue_reads_go_through_the_guard.py` が構造で見張る。
+                        **例外は `plan.sh` の `load_state()` 1 つだけ**（意図的。
+                        `knowledge/empty-vs-unobservable.md` §4 の取引）
                         再発防止は tests/test_task_card_identity.py（両者が同じ queue から
                         同じ task 集合を導くことの直接 assert + コピー検出）と
                         tests/test_unobservable_is_not_empty.py（赤の実証は

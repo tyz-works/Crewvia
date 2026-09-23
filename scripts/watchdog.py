@@ -48,7 +48,9 @@ import lib_daemon_watch  # noqa: E402
 # task カードの読み取りは crewvia の中で 1 箇所しかない (Codex 5 巡目 P2)。
 # ここに frontmatter を直接読むコードを書き戻さないこと — plan.sh が `[破損]`
 # として保留するカードを、この監視だけが別の task の id で数える状態に戻る。
-from lib_task_cards import list_task_cards  # noqa: E402
+from lib_task_cards import (  # noqa: E402
+    NotARegularFile, list_task_cards, read_regular_text,
+)
 _mux = Mux()
 
 __version__ = "2.1.0"
@@ -395,6 +397,12 @@ class WorkerMonitor:
         #: ならない。
         self._notifications_observable: bool = True
 
+        #: 同じことを activity / heartbeat の `stat` についても覚えておく
+        #: (`_note_signal_observable`)。通知とは別の記憶にしてあるのは、
+        #: 片方が読めなくなったときに、もう片方の「読めるようになった」が
+        #: 状態変化を食い潰して行が出なくなるのを避けるため。
+        self._signals_observable: bool = True
+
     # ------------------------------------------------------------------
     # Signal detection helpers
     # ------------------------------------------------------------------
@@ -424,18 +432,68 @@ class WorkerMonitor:
         """
         return self.monitoring_since
 
-    def _mtimes_since_floor(self, paths) -> list[float]:
-        """mtimes of `paths` that exist and are not older than the floor."""
+    def _mtimes_since_floor(self, paths) -> tuple[list[float], bool]:
+        """floor 以降の mtime と、**観測に失敗したものがあったか**。
+
+        戻り値が 2 つあるのは、`stat` の失敗に 2 つの意味があるからである。
+
+        * `ENOENT` —— **本当に無い**。pull 直後の Worker に `<task>.activity` が
+          無いのは通常の状態で、そこを沈黙として数えられなくなると、ハングした
+          Worker が永久に検知されない。これまで通り候補から落とす。
+        * それ以外 (`EACCES` / `EIO` / `ENOTDIR` …) —— **観測できなかった**。
+          「シグナルが無い」ではない。
+
+        両方を `continue` に潰していたのが Codex 8 巡目 P1 で、潰した先が問題
+        だった: 候補が 1 つも残らないと `_last_activity_mtime()` は floor —— この
+        監視対象が始まった時刻 —— をそのまま返す。数時間前に pull された健全な
+        Worker が `idle = 数時間` と判定され、`hard_idle` で **terminate される**。
+        `registry/heartbeats/` は全 Worker 共通なので、1 回の権限事故で全員が
+        同時に対象になる。
+
+        t016 で `_notification_files()` に入れたのとまったく同じ型が、別の関数に
+        残っていたもの (memory: evidence-for-destructive-decisions)。区別する側を
+        `ENOENT` **だけ** の allowlist にしてあるのは、denylist が次の errno で
+        必ず穴を開けるため (memory: approve-judgment-needs-allowlist-and-scope)。
+
+        呼び出し側は 2 つ目の戻り値を **必ず** 見ること。倒す向きは判定ごとに
+        違うので、ここでは決めない (memory: fail-direction-is-per-judgment)。
+        """
         floor = self._signal_floor()
         found: list[float] = []
+        unobservable = False
         for p in paths:
             try:
                 mtime = p.stat().st_mtime
-            except OSError:
+            except FileNotFoundError:
+                continue                    # 本当に無い
+            except OSError as e:
+                unobservable = True         # 読めなかった — 「無い」ではない
+                self._note_signal_observable(
+                    False, f"{self.agent_name}: cannot stat {p}: {e} — "
+                           f"treating this as unobservable, not as silence "
+                           f"(terminate is suppressed until it can be read)")
                 continue
             if mtime >= floor:
                 found.append(mtime)
-        return found
+        if not unobservable:
+            self._note_signal_observable(True)
+        return found, unobservable
+
+    def _note_signal_observable(self, observable: bool, msg: str = "") -> None:
+        """activity / heartbeat を stat できるかが **変わったときだけ** 1 行出す。
+
+        `_note_notifications_observable()` と同じ理由で状態を覚えている ——
+        判定は 30 秒ごと、1 回の check で複数回ここを通るので、毎回書くと
+        Worker 1 人で毎分数行になる。
+        """
+        if observable == self._signals_observable:
+            return
+        self._signals_observable = observable
+        try:
+            _log(msg if msg else
+                 f"{self.agent_name}: signal files readable again")
+        except Exception:
+            pass
 
     def _activity_file(self) -> Path:
         return (
@@ -510,9 +568,13 @@ class WorkerMonitor:
         notifications = self._notification_files()
         if notifications is None:
             return time.time()
-        candidates = self._mtimes_since_floor(
+        candidates, unobservable = self._mtimes_since_floor(
             [self._activity_file(), self._heartbeat_file()] + notifications
         )
+        if unobservable:
+            # 列挙できても stat できなければ、やはり沈黙は主張できない。
+            # 倒した先の害は「terminate が 1 サイクル遅れる」だけである。
+            return time.time()
         return max(candidates + [self._signal_floor()])
 
     def _non_notification_mtime(self) -> Optional[float]:
@@ -526,8 +588,14 @@ class WorkerMonitor:
         残す — `_awaiting_human()` は「通知より後に実活動があったか」を訊いて
         いるので、floor に丸めると通知を常に解除済みに見せてしまう。
         """
-        candidates = self._mtimes_since_floor(
+        candidates, unobservable = self._mtimes_since_floor(
             [self._activity_file(), self._heartbeat_file()])
+        if unobservable and not candidates:
+            # 「実活動は無かった」と言い切れない。None は `_awaiting_human()` を
+            # True にする側 = terminate を抑制する側なので、ここでの安全な向き。
+            # 片方でも読めていればその値は本物なので、そちらを答えにする
+            # (読めた分だけで「通知より後に動いた」と言えるなら、それは事実)。
+            return None
         return max(candidates) if candidates else None
 
     def _newest_notification(self) -> tuple[Optional[float], Optional[str]]:
@@ -553,8 +621,15 @@ class WorkerMonitor:
         for f in notifications:
             try:
                 m = f.stat().st_mtime
-            except OSError:
+            except FileNotFoundError:
+                # 列挙と stat の間に消えた。通知は読まれたあと消されるので、
+                # これは競合ではなく通常の並び —— 本当に無い。
                 continue
+            except OSError:
+                # 列挙はできたのに stat できない (列挙後に権限が変わった等)。
+                # 「通知は無い」に潰すと抑制が外れて terminate 側に落ちるので、
+                # 一覧そのものを取れなかったときと同じ答えに揃える。
+                return time.time(), "(unobservable)"
             if m < floor:
                 continue
             if m > newest_mtime:
@@ -984,7 +1059,22 @@ def load_active_tasks(queue_dir: Path) -> list[tuple[str, str, dict]]:
     if not state_file.exists():
         return []
 
-    state = parse_yaml(state_file.read_text())
+    # 種類を確かめてから読む (Codex 8 巡目 P2)。上限の無い `read_text()` が
+    # 書き手のいない FIFO に当たると、**watchdog 全体が座り込む** —— どの
+    # Worker も監視されなくなる。読めなければ「監視対象なし」に倒す: 誰も
+    # 監視しない = 誰も kill しない、が、この判定の安全な向きである。
+    try:
+        state_text = read_regular_text(state_file)
+    except NotARegularFile as e:
+        _log(f"WARNING: {state_file} is not a regular file ({e}) — "
+             f"no Worker is monitored this cycle")
+        return []
+    except OSError as e:
+        _log(f"WARNING: failed to read {state_file}: {e} — "
+             f"no Worker is monitored this cycle")
+        return []
+
+    state = parse_yaml(state_text)
     active_missions = list(state.get("active_missions") or [])
 
     # カードの読み取りは scripts/lib_task_cards.py に 1 つだけ。識別子はファイル名

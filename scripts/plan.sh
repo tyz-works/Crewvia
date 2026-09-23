@@ -653,12 +653,56 @@ def task_path(slug, task_id):
 MISSION_KEY_ORDER = ['title', 'slug', 'status', 'created_at', 'completed_at', 'next_task_id', 'max_review_cycles', 'review']
 
 
+def try_read_queue_file(path):
+    """`(text, problem)` を返す。読めたら `problem` は None。
+
+    **例外にしないのは、表示系の呼び出し元があるから**である。mission を並べて
+    いる途中で 1 つ落ちると、健全な mission まで画面から消える (「1 枚の事故で
+    全体を止めない」は、この repo が t009 以来ずっと同じ向きに倒している)。
+
+    `read_queue_file()` は、これに `die()` を足しただけのもの。判定を 2 箇所に
+    書かないための分け方で、**種類を確かめる規則そのものは 1 つ**である。
+    """
+    try:
+        return _TASK_CARDS.read_regular_text(path), None
+    except _TASK_CARDS.NotARegularFile as e:
+        return None, (
+            f"{path} is not a regular file ({e})\n"
+            f"  hint: queue のファイルは通常ファイルだけです。"
+            f"`ls -l {path}` で種類を確かめ、置き違えたものなら削除してください。")
+    except OSError as e:
+        return None, f"failed to read {path}: {e}"
+
+
+def read_queue_file(path, what):
+    """queue のファイルを、**種類を確かめてから** 読む。読めなければ `die()`。
+
+    固定パスで開く読み取りにも `lib_task_cards` のガードを当てる (Codex 8 巡目
+    P2)。t016 で入れた判定は `tasks/` を *列挙して* 読む経路にしか無く、
+    ここ (`load_task` / `load_mission`) は素の `open()` のままだった。
+
+    列挙するかどうかは害の大きさを変えない。これらは `with_lock()` の内側で
+    呼ばれるので、書き手のいない FIFO 1 枚で **キューロックを握ったまま**
+    止まる —— 止まるのはその mission ではなく、`plan.sh` 全体である。
+
+    待ち時間に上限を付けるのではなく種類で弾くのは、待てば読めるものが 1 つも
+    無いから。queue のファイルは通常ファイルしかありえない。
+
+    ※ `load_state()` には **同じ判定を入れていない**。明示的な取引で、理由は
+      `knowledge/empty-vs-unobservable.md` §4 にある (そこが
+      `tests/test_retirement.py` の回帰テストを成立させている唯一の停止点)。
+    """
+    text, problem = try_read_queue_file(path)
+    if problem is not None:
+        die(f"{what}: {problem}")
+    return text
+
+
 def load_mission(slug):
     path = mission_yaml_path(slug)
     if not os.path.exists(path):
         die(f"mission '{slug}' not found at {path}")
-    with open(path) as f:
-        text = f.read()
+    text = read_queue_file(path, 'mission file')
     try:
         return parse_yaml(text, source=path)
     except ValueError as e:
@@ -674,8 +718,7 @@ def load_task(slug, task_id):
     path = task_path(slug, task_id)
     if not os.path.exists(path):
         die(f"task '{task_id}' not found in mission '{slug}'")
-    with open(path) as f:
-        text = f.read()
+    text = read_queue_file(path, 'task card')
     try:
         return parse_frontmatter(text, source=path)
     except ValueError as e:
@@ -2991,8 +3034,11 @@ def _print_mission_summary(slug, archived=False):
     if not os.path.exists(mission_path):
         print(f"  {slug} — (mission.yaml missing)")
         return
-    with open(mission_path) as f:
-        text = f.read()
+    text, problem = try_read_queue_file(mission_path)
+    if problem is not None:
+        # 1 つの mission を読めなかっただけで、残りを画面から消さない。
+        print(f"  {slug} — (mission.yaml unreadable: {problem})")
+        return
     try:
         mission = parse_yaml(text, source=mission_path)
     except ValueError as e:
@@ -3029,8 +3075,7 @@ def _print_mission_detail(slug):
     if not base:
         die(f"mission '{slug}' not found.")
     mission_path = os.path.join(base, 'mission.yaml')
-    with open(mission_path) as f:
-        text = f.read()
+    text = read_queue_file(mission_path, 'mission file')
     try:
         mission = parse_yaml(text, source=mission_path)
     except ValueError as e:
@@ -3831,11 +3876,15 @@ def cmd_resync(args):
 def _mission_data(slug, archived=False):
     base = os.path.join(ARCHIVE_DIR, slug) if archived else mission_dir(slug)
     mission_path = os.path.join(base, 'mission.yaml')
-    try:
-        with open(mission_path) as f:
-            mission = parse_yaml(f.read(), source=mission_path)
-    except (FileNotFoundError, ValueError):
+    text, problem = try_read_queue_file(mission_path)
+    if problem is not None:
+        # JSON 出力。1 つ読めなくても残りの mission は出す (表示系と同じ向き)。
         mission = {}
+    else:
+        try:
+            mission = parse_yaml(text, source=mission_path)
+        except ValueError:
+            mission = {}
 
     tasks_list = list_tasks(slug, base_dir=os.path.join(base, 'tasks'))
     done = sum(1 for (m, _) in tasks_list if m.get('status') == 'done')

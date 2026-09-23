@@ -391,6 +391,46 @@ def _read_regular_file(path):
         return f.read()
 
 
+#: 公開名。`_read_regular_file()` / `_NotARegularFile` は t016 からの内部名で、
+#: `tests/red_proof_unobservable.sh` が注入点として名指ししているので残してある。
+#:
+#: **queue / registry のファイルを固定パスで開くコードは、これを通すこと。**
+#: t016 のガードは `tasks/` を *列挙して* 読む経路にしか入っておらず、
+#: `plan.sh` の `load_task()` / `load_mission()` と `dispatcher.sh` の
+#: `publish_agents()` —— どれも固定パスで `open()` する —— がそのまま残って
+#: いた (Codex 8 巡目 P2)。列挙するかどうかは害の大きさを変えない: 書き手の
+#: いない FIFO 1 枚で、キューロックを握ったままの `plan.sh` と、`dispatch()`
+#: より前に走る `publish_agents()` が無期限に座り込む。
+NotARegularFile = _NotARegularFile
+read_regular_text = _read_regular_file
+
+
+def read_regular_text_or_none(path, warn=None):
+    """`read_regular_text()` の、**例外を出さない** 形。読めなければ None。
+
+    常駐デーモン (dispatcher / verifier-dispatcher / watchdog) と、mission を
+    並べて表示する側のための入口である。1 つのファイルを読めなかっただけで
+    サイクルや一覧全体を落とさない、という向きは `read_task_card()` と同じ。
+
+    **倒す先はここでは決めない。** 呼び出し側が None をどう読むかは判定ごとに
+    違う —— dispatcher の `load_state()` は「active mission ゼロ」(= 何も
+    割り当てない)、`all_done` の判定は「完了ではない」(= 誰も退役させない)。
+    どちらも「読めなかったことを、割り当て・破壊の許可に使わない」側である
+    (memory: fail-direction-is-per-judgment / evidence-for-destructive-decisions)。
+    """
+    try:
+        return read_regular_text(path)
+    except NotARegularFile as e:
+        _safe_warn(warn, f"{path} is not a regular file ({e})\n"
+                         f"  hint: queue / registry のファイルは通常ファイルだけです。"
+                         f"`ls -l {path}` で種類を確かめてください。\n"
+                         f"  treating it as unreadable for now.")
+    except OSError as e:
+        _safe_warn(warn, f"failed to read {path}: {e}\n"
+                         f"  treating it as unreadable for now.")
+    return None
+
+
 # ---------------------------------------------------------------------------
 # カード 1 枚を読む
 # ---------------------------------------------------------------------------

@@ -63,7 +63,9 @@ scripts_dir = sys.argv[5]
 # ここに frontmatter を直接読むコードを書き戻さないこと — Taskvia に出る姿と
 # `plan.sh status` に出る姿が、静かにズレる。
 sys.path.insert(0, scripts_dir)
-from lib_task_cards import list_task_cards  # noqa: E402
+from lib_task_cards import (  # noqa: E402
+    list_task_cards, read_regular_text_or_none,
+)
 
 state_file = os.path.join(queue_dir, 'state.yaml')
 missions_dir = os.path.join(queue_dir, 'missions')
@@ -210,20 +212,34 @@ def http_delete(url):
 
 # ---------- mission scanning ----------
 
+def _read_queue_text(path):
+    """queue のファイルを種類を確かめてから読む。読めなければ None (警告 1 行)。"""
+    return read_regular_text_or_none(
+        path,
+        warn=lambda msg: print(f"[taskvia-sync] WARNING: {msg}", file=sys.stderr))
+
+
+
 def scan_missions():
     """Yield (slug, mission_meta, task_meta) for every task in active missions."""
     if not os.path.exists(state_file):
         return
-    with open(state_file) as f:
-        state = parse_yaml(f.read())
+    # 固定パスの読み取りにも種類のガードを当てる (Codex 8 巡目 P2)。上限の無い
+    # `open()` は、書き手のいない FIFO 1 枚で同期全体を無期限に止める。
+    state_text = _read_queue_text(state_file)
+    if state_text is None:
+        return                      # active mission ゼロ = 何も同期しない
+    state = parse_yaml(state_text)
     active = state.get('active_missions') or []
     for slug in active:
         mdir = os.path.join(missions_dir, slug)
         myaml = os.path.join(mdir, 'mission.yaml')
         if not os.path.exists(myaml):
             continue
-        with open(myaml) as f:
-            mission_meta = parse_yaml(f.read())
+        mission_text = _read_queue_text(myaml)
+        if mission_text is None:
+            continue                # この mission だけ飛ばす (他は同期する)
+        mission_meta = parse_yaml(mission_text)
         # 読み取りは scripts/lib_task_cards.py に 1 つだけ (plan.sh / dispatcher.sh
         # と同じもの)。識別子はファイル名から来るので、`id` 行を直し忘れたコピーが
         # Taskvia 側で空 id / 別カードの上書きになることが構造上なくなる。

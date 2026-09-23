@@ -66,7 +66,9 @@ from lib_mux import Mux  # noqa: E402
 # task カードの読み取りは crewvia の中で 1 箇所しかない (Codex 5 巡目 P2)。
 # ここに frontmatter を直接読むコードを書き戻さないこと — plan.sh が受理する
 # カードとここが拾うカードが、静かにズレる。
-from lib_task_cards import list_task_cards  # noqa: E402
+from lib_task_cards import (  # noqa: E402
+    list_task_cards, read_regular_text, read_regular_text_or_none,
+)
 _mux = Mux()
 
 MISSIONS_DIR    = QUEUE_DIR / 'missions'
@@ -172,10 +174,24 @@ def parse_yaml(text):
 # State / workers / tasks loading
 # ---------------------------------------------------------------------------
 
+def _read_queue_text(path, what):
+    """queue / registry のファイルを種類を確かめてから読む。読めなければ None。
+
+    判定の本体は `lib_task_cards.read_regular_text_or_none()` に 1 つだけ
+    (Codex 8 巡目 P2)。常駐デーモンなので、上限の無い `read_text()` が書き手の
+    いない FIFO に当たると **検証の割り当てがサイクルごと止まる**。
+    """
+    return read_regular_text_or_none(
+        path, warn=lambda msg: log(f"WARNING: {what}: {msg}"))
+
+
 def load_state():
     if not STATE_FILE.exists():
         return {}
-    return parse_yaml(STATE_FILE.read_text())
+    text = _read_queue_text(STATE_FILE, 'state file')
+    if text is None:
+        return {}          # active mission ゼロ = 何も割り当てない
+    return parse_yaml(text)
 
 
 def load_workers():
@@ -183,7 +199,9 @@ def load_workers():
     if not WORKERS_FILE.exists():
         return {}
     workers = {}
-    text = WORKERS_FILE.read_text()
+    text = _read_queue_text(WORKERS_FILE, 'workers file')
+    if text is None:
+        return {}          # Worker 0 人 = 何も割り当てない
     current = None
     for line in text.splitlines():
         stripped = line.strip()
@@ -233,8 +251,17 @@ def _dump_scalar(s):
 
 
 def update_task_fields(task_path, updates):
-    """Atomically set specific frontmatter fields in a task .md file."""
-    text = task_path.read_text()
+    """Atomically set specific frontmatter fields in a task .md file.
+
+    **書き換える前に、カードが通常ファイルであることを確かめる** (Codex 8 巡目
+    P2)。ここは読んでから書き戻す経路なので、種類を見ないと 2 つ壊れる ——
+    書き手のいない FIFO なら読みで無期限に止まり、止まらなかったとしても
+    `os.replace()` が置き換えるのは *別の何か* である。
+
+    読めなければ例外を投げる。呼び出し側は 1 件ずつ `except Exception` で
+    受けてログに落とすので、倒れる先は「その task だけが割り当たらない」。
+    """
+    text = read_regular_text(task_path)
     lines = text.split('\n')
     in_fm = False
     result_lines = []

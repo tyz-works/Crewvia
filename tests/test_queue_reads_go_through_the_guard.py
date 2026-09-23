@@ -128,6 +128,11 @@ GUARDED_READS = [
 
     # --- watchdog.py ------------------------------------------------------
     ("watchdog.py", "load_active_tasks", {"read_regular_text"}),
+
+    # --- lib_registry.py --------------------------------------------------
+    # `with_lock()` の内側。素の open() だと **レジストリのロックを握ったまま**
+    # 止まり、Worker の起動も task_count の更新も進まなくなる。
+    ("lib_registry.py", "parse", {"read_regular_text"}),
 ]
 
 

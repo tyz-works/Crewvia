@@ -103,6 +103,30 @@ class _TmuxServers:
             raise AssertionError(f"tmux {args} failed: {r.stderr}")
         return r.stdout.strip()
 
+    def _live_socket(self):
+        """稼働中のサーバーのソケットパス。立っていなければ None。"""
+        r = subprocess.run(
+            ["tmux", "display-message", "-p", "#{socket_path}"],
+            capture_output=True, text=True, timeout=10)
+        return r.stdout.strip() if r.returncode == 0 else None
+
+    def _require_isolated(self):
+        """触ろうとしている相手が自分の一時ディレクトリの上に居ること。
+
+        `tmux kill-server` は宛先を取らないので、`TMUX_TMPDIR` が効いていなければ
+        利用者の**本物の**サーバーを落とす。2026-09-23 の事故はこの形だった
+        (`tests/conftest.py` 冒頭)。ここは `-S` を渡せない本番コードを相手に
+        しているぶん、テスト側で毎回確かめるしかない。
+        """
+        socket_path = self._live_socket()
+        if socket_path is None:
+            return None
+        if not socket_path.startswith(str(self.root)):
+            raise AssertionError(
+                f"tmux server is not isolated: socket {socket_path!r} is "
+                f"outside {self.root} — refusing to touch it")
+        return socket_path
+
     # -- 世代を立てる -------------------------------------------------------
     def start(self, first_window: str, *more_windows: str) -> dict:
         """新しいサーバーを起動し、`{window_name: window_id}` を返す。"""
@@ -110,6 +134,7 @@ class _TmuxServers:
         ids = {first_window: self._tmux(
             "new-session", "-d", "-s", session, "-n", first_window,
             "-P", "-F", "#{window_id}", "sleep 600")}
+        self._require_isolated()
         for name in more_windows:
             ids[name] = self._tmux(
                 "new-window", "-t", session, "-n", name,
@@ -117,6 +142,8 @@ class _TmuxServers:
         return ids
 
     def stop(self):
+        if self._require_isolated() is None:
+            return                      # 立っていない
         subprocess.run(["tmux", "kill-server"], capture_output=True,
                        timeout=10)
         # サーバーが本当に降りるまで待つ。降りきる前に次を起動すると 2 世代目が

@@ -20,6 +20,14 @@ import argparse
 import sys
 from pathlib import Path
 
+_SCRIPTS_DIR = Path(__file__).resolve().parent
+if str(_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS_DIR))
+
+from lib_task_cards import (  # noqa: E402
+    is_unreadable, read_regular_text_or_unreadable,
+)
+
 try:
     import yaml
 except ImportError:
@@ -42,31 +50,35 @@ def _parse_yaml_fallback(path: str) -> dict:
     result: dict = {}
     in_model_per_skill = False
 
-    with open(path, encoding="utf-8") as f:
-        for line in f:
-            stripped = line.rstrip()
-            if not stripped or stripped.lstrip().startswith("#"):
-                continue
-            indent = len(line) - len(line.lstrip())
+    # config も固定パスのガードを通す (t018)。置き違えた FIFO 1 枚で、
+    # Worker の起動がモデル解決の途中から先へ進まなくなる。
+    text = read_regular_text_or_unreadable(path)
+    if is_unreadable(text):
+        return result
+    for line in text.splitlines():
+        stripped = line.rstrip()
+        if not stripped or stripped.lstrip().startswith("#"):
+            continue
+        indent = len(line) - len(line.lstrip())
 
-            if indent == 0:
-                in_model_per_skill = False
-                if ":" in stripped:
-                    key, _, val = stripped.partition(":")
-                    key = key.strip()
-                    # インラインコメントを除去してから quotes を剥がす
-                    val = val.split("#")[0].strip().strip('"\'')
-                    if key == "worker_model" and val:
-                        result["worker_model"] = val
-                    elif key == "model_per_skill":
-                        result.setdefault("model_per_skill", {})
-                        in_model_per_skill = True
-            elif in_model_per_skill and indent >= 2 and ":" in stripped:
+        if indent == 0:
+            in_model_per_skill = False
+            if ":" in stripped:
                 key, _, val = stripped.partition(":")
                 key = key.strip()
-                val = val.strip().strip('"\'').split("#")[0].strip()  # strip inline comment
-                if key and val:
-                    result.setdefault("model_per_skill", {})[key] = val
+                # インラインコメントを除去してから quotes を剥がす
+                val = val.split("#")[0].strip().strip('"\'')
+                if key == "worker_model" and val:
+                    result["worker_model"] = val
+                elif key == "model_per_skill":
+                    result.setdefault("model_per_skill", {})
+                    in_model_per_skill = True
+        elif in_model_per_skill and indent >= 2 and ":" in stripped:
+            key, _, val = stripped.partition(":")
+            key = key.strip()
+            val = val.strip().strip('"\'').split("#")[0].strip()  # strip inline comment
+            if key and val:
+                result.setdefault("model_per_skill", {})[key] = val
 
     return result
 

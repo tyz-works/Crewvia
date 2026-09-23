@@ -55,6 +55,15 @@ import time
 from pathlib import Path
 from typing import List, Optional
 
+_SCRIPTS_DIR = Path(__file__).resolve().parent
+if str(_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS_DIR))
+
+# queue / registry / config を読むガードは crewvia に 1 つしかない (t017/t018)。
+from lib_task_cards import (  # noqa: E402
+    is_unreadable, read_regular_text_or_unreadable,
+)
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -229,7 +238,9 @@ def _config_mode(config_path: Optional[Path] = None) -> Optional[str]:
         script_dir = Path(__file__).parent
         config_path = script_dir.parent / "config" / "crewvia.yaml"
     try:
-        text = config_path.read_text(encoding="utf-8")
+        text = read_regular_text_or_unreadable(config_path)
+        if is_unreadable(text):
+            return None
         for line in text.splitlines():
             stripped = line.strip()
             if stripped.startswith("mode:") and not stripped.startswith("#"):
@@ -1429,9 +1440,14 @@ def write_pane_record(name: str, backend: str, handle: str, *,
 
 
 def read_pane_record(name: str, *, repo_root=None) -> Optional[dict]:
+    # registry/ の固定パス。素の `read_text()` は上限を持たないので、置き違えた
+    # FIFO 1 枚で spawn / kill の判定が返らなくなる (t018)。
+    text = read_regular_text_or_unreadable(
+        pane_record_path(name, repo_root=repo_root))
+    if is_unreadable(text):
+        return None
     try:
-        data = json.loads(
-            pane_record_path(name, repo_root=repo_root).read_text(encoding="utf-8"))
+        data = json.loads(text)
     except Exception:
         return None
     return data if isinstance(data, dict) else None

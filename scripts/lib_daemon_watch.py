@@ -131,6 +131,11 @@ from lib_retirement import (  # noqa: E402
     unlink_quiet,
     write_json_atomic,
 )
+from lib_task_cards import (  # noqa: E402
+    is_missing,
+    is_unreadable,
+    read_regular_text_or_unreadable,
+)
 
 try:
     import yaml  # type: ignore
@@ -683,9 +688,13 @@ def load_config(config_path=None, env=None) -> WatchConfig:
     block = {}
     if yaml is not None:
         try:
-            loaded = yaml.safe_load(Path(config_path).read_text(encoding="utf-8")) or {}
-            if isinstance(loaded, dict) and isinstance(loaded.get("daemons"), dict):
-                block = loaded["daemons"]
+            # config も固定パスのガードを通す (t018)。置き違えた FIFO 1 枚で
+            # 相互監視が無期限に座り込むのを避ける。読めなければ既定値のまま。
+            raw_cfg = read_regular_text_or_unreadable(config_path)
+            if not is_unreadable(raw_cfg):
+                loaded = yaml.safe_load(raw_cfg) or {}
+                if isinstance(loaded, dict) and isinstance(loaded.get("daemons"), dict):
+                    block = loaded["daemons"]
         except Exception:
             block = {}
 
@@ -870,11 +879,10 @@ def read_pause_state(registry_dir, name: str):
     them as "no marker" lifts a protection nobody lifted.
     """
     path = pause_path(registry_dir, name)
-    try:
-        text = path.read_text(encoding="utf-8")
-    except FileNotFoundError:
+    text = read_regular_text_or_unreadable(path)
+    if is_missing(text):
         return PAUSE_ABSENT, None
-    except OSError:
+    if is_unreadable(text):
         return PAUSE_UNREADABLE, None
     try:
         data = json.loads(text)

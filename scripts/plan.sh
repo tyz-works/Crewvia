@@ -653,7 +653,7 @@ def task_path(slug, task_id):
 MISSION_KEY_ORDER = ['title', 'slug', 'status', 'created_at', 'completed_at', 'next_task_id', 'max_review_cycles', 'review']
 
 
-def try_read_queue_file(path):
+def try_read_queue_file(path, newline=None):
     """`(text, problem)` を返す。読めたら `problem` は None。
 
     **例外にしないのは、表示系の呼び出し元があるから**である。mission を並べて
@@ -664,7 +664,7 @@ def try_read_queue_file(path):
     書かないための分け方で、**種類を確かめる規則そのものは 1 つ**である。
     """
     try:
-        return _TASK_CARDS.read_regular_text(path), None
+        return _TASK_CARDS.read_regular_text(path, newline=newline), None
     except _TASK_CARDS.NotARegularFile as e:
         return None, (
             f"{path} is not a regular file ({e})\n"
@@ -672,6 +672,21 @@ def try_read_queue_file(path):
             f"`ls -l {path}` で種類を確かめ、置き違えたものなら削除してください。")
     except OSError as e:
         return None, f"failed to read {path}: {e}"
+    except UnicodeError as e:
+        # `UnicodeDecodeError` は `OSError` ではなく `ValueError` の側にいるので
+        # 上の except では捕まらない。t015 で `read_task_card()` について直した
+        # のとまったく同じ漏れが、t017 で新しく作ったこちらに再現していた
+        # (Codex 9 巡目 P2) —— 1 つの読めない mission.yaml が、隔離されずに
+        # `status` の一覧そのものを中断させる。
+        return None, (
+            f"failed to decode {path}: {e}\n"
+            f"  hint: queue のファイルは UTF-8 です。`file {path}` で確かめ、"
+            f"必要なら `iconv -f <元の文字コード> -t utf-8` で書き直すこと。")
+    except Exception as e:      # noqa: BLE001 — backstop。
+        # 名前の分かっている失敗は上で個別に扱い (そのほうが直し方を書ける)、
+        # **残り全部をここで受ける**。「今回の 1 件を足す」形は、次に読み取り
+        # 経路へ新しい失敗が入った日に同じ止まり方をもう一度出す。
+        return None, f"unexpected failure while reading {path}: {type(e).__name__}: {e}"
 
 
 def read_queue_file(path, what):
@@ -956,11 +971,12 @@ def task_graph_assignment_holds(worker, slug, task_id):
     """
     if agent_name_problem(worker):
         return False
-    try:
-        with open(os.path.join(ASSIGNMENTS_DIR, worker)) as f:
-            return f.read().strip() == f'{slug}:{task_id}'
-    except OSError:
+    # 素の open() だと、置き違えた FIFO 1 枚で task-graph の生成が返らなく
+    # なる (t018)。読めないときは「出さない」に倒す —— 上の docstring の通り。
+    text, problem = try_read_queue_file(os.path.join(ASSIGNMENTS_DIR, worker))
+    if problem is not None:
         return False
+    return text.strip() == f'{slug}:{task_id}'
 
 
 def break_dependency_cycles(nodes):
@@ -1571,13 +1587,17 @@ def _task_graph_pending_outstanding(path, read_started):
     未来の時刻 (= 再起動をまたいで残った前の boot の残骸) は、要求として扱うと
     永久に True を返し続けるので、処理済みとして消す側に倒す。
     """
-    try:
-        with open(_task_graph_pending_path(path)) as f:
-            raw = f.read().split()
-    except FileNotFoundError:
+    # 「無い」= 要求なし。それ以外 (読めない) は要求が **あるかもしれない**
+    # 側に倒す —— 取りこぼすと誰も読み直さなくなるため。区別は `ENOENT` の
+    # 1 点だけで、`os.path.lexists()` は使わない (`EACCES` でも False になり、
+    # 「要求なし」= 取りこぼす側へ倒れる)。
+    text = _TASK_CARDS.read_regular_text_or_unreadable(
+        _task_graph_pending_path(path))
+    if _TASK_CARDS.is_missing(text):
         return False
-    except OSError:
+    if _TASK_CARDS.is_unreadable(text):
         return True
+    raw = text.split()
     try:
         marked = int(raw[1])
     except (IndexError, ValueError):
@@ -1751,10 +1771,12 @@ def assignment_identity_path(agent):
 
 def _read_assignment_identity(agent):
     """サイドカーを読む。読めない・形が違うときは None (= 世代不明)。"""
+    text, problem = try_read_queue_file(assignment_identity_path(agent))
+    if problem is not None:
+        return None
     try:
-        with open(assignment_identity_path(agent)) as f:
-            data = json.load(f)
-    except (OSError, ValueError):
+        data = json.loads(text)
+    except ValueError:
         return None
     return data if isinstance(data, dict) else None
 
@@ -1793,13 +1815,21 @@ def classify_assignment(agent, mission, task_id, generation):
         # 不正な名前の assignment は存在しえない。撤去側で die すると、card を
         # 書いたあとに落ちて片側だけ進むので、ここは「消さない」に倒す。
         return ASSIGN_UNVERIFIABLE
-    try:
-        with open(assignment_path(agent)) as f:
-            published = f.read().strip()
-    except FileNotFoundError:
+    # 「無い」= ASSIGN_ABSENT (撤去済み) と「読めない」= ASSIGN_UNVERIFIABLE
+    # (証明できないので消さない) は別の結論である。分けるのは `ENOENT` の
+    # 1 点だけで、それ以外の OSError・種類違い・デコード失敗はすべて
+    # 「証明できない」側 (knowledge/empty-vs-unobservable.md §5)。
+    #
+    # 区別を `os.path.lexists()` で取らないのは、あれが `EACCES` でも False に
+    # なるからである —— 親から実行権限が消えただけで「撤去済み」と読み、
+    # **証明できない assignment の削除を許可する**。判定は読み取りが返す
+    # `errno` に乗せる (memory: evidence-for-destructive-decisions)。
+    published = _TASK_CARDS.read_regular_text_or_unreadable(assignment_path(agent))
+    if _TASK_CARDS.is_missing(published):
         return ASSIGN_ABSENT
-    except OSError:
+    if _TASK_CARDS.is_unreadable(published):
         return ASSIGN_UNVERIFIABLE
+    published = published.strip()
 
     if published != f"{mission}:{task_id}":
         return ASSIGN_OTHER_TASK
@@ -1962,16 +1992,29 @@ def _taskvia_enabled():
     return bool(_TASKVIA_URL and _TASKVIA_TOKEN)
 
 
+def _load_taskvia_map(map_path):
+    """`queue/.taskvia-map.json` を、種類を確かめてから読む (t018)。
+
+    倒す先は `{}` でよい —— 中身は「crewvia の task id → Taskvia の id」の
+    キャッシュで、失われても次の同期が作り直す (冪等)。閉じているのは
+    「素の `open()` が FIFO で返らない」ほうであって、空との取り違えではない。
+    """
+    text, problem = try_read_queue_file(map_path)
+    if problem is not None:
+        return {}
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
 def _taskvia_map_update(slug, task_id, status='pending'):
     """Update .taskvia-map.json after a successful inline sync.
     Keeps taskvia-sync.sh from re-registering tasks already pushed inline.
     """
     map_path = os.path.join(QUEUE_DIR, '.taskvia-map.json')
-    try:
-        with open(map_path) as f:
-            task_map = json.load(f)
-    except (OSError, json.JSONDecodeError):
-        task_map = {}
+    task_map = _load_taskvia_map(map_path)
     map_key = f"{slug}:{task_id}"
     task_map[map_key] = {'registered': True, 'status': status}
     try:
@@ -1985,11 +2028,7 @@ def _taskvia_map_update(slug, task_id, status='pending'):
 def _taskvia_map_update_status(slug, task_id, status):
     """Update status of an existing .taskvia-map.json entry."""
     map_path = os.path.join(QUEUE_DIR, '.taskvia-map.json')
-    try:
-        with open(map_path) as f:
-            task_map = json.load(f)
-    except (OSError, json.JSONDecodeError):
-        task_map = {}
+    task_map = _load_taskvia_map(map_path)
     map_key = f"{slug}:{task_id}"
     if map_key in task_map:
         task_map[map_key]['status'] = status
@@ -2088,10 +2127,10 @@ def _load_workers_from_registry():
         return []
     workers = []
     current = None
-    try:
-        with open(registry_path) as f:
-            text = f.read()
-    except OSError:
+    # registry/workers.yaml も固定パスのガードを通す (Codex 9 巡目 P2)。
+    # 素の open() だと、置き違えた FIFO 1 枚で Worker 同期が返らなくなる。
+    text, problem = try_read_queue_file(registry_path)
+    if problem is not None:
         return []
     for line in text.splitlines():
         stripped = line.strip()
@@ -3289,10 +3328,8 @@ def upgrade_mode(current, proposed):
 
 def _apply_risk_flags(slug, plan_review_path):
     """Parse ## Risk Flags from plan_review.md and upgrade task verification.mode."""
-    try:
-        with open(plan_review_path) as f:
-            content = f.read()
-    except OSError:
+    content, problem = try_read_queue_file(plan_review_path)
+    if problem is not None:
         return
 
     # Find ## Risk Flags section
@@ -3616,12 +3653,12 @@ def cmd_review(args):
     # 旧形式の 1 行ファイル) なら、値が正しくても消費せず fail-closed。
     # 読めない / UTF-8 として解釈できない場合も、mission を reviewing のまま
     # 残さないよう rollback してから止める。
-    try:
-        with open(verdict_file, encoding='utf-8', newline='') as f:
-            verdict_raw = f.read()
-    except (OSError, UnicodeDecodeError) as e:
+    # 種類のガードも通す (t018)。`newline=''` は下の「2 行ちょうど」の検査が
+    # 改行変換を前提にしていないため必須なので、ガード側にそのまま渡す。
+    verdict_raw, problem = try_read_queue_file(verdict_file, newline='')
+    if problem is not None:
         _rollback_to_drafting("plan_review.verdict is unreadable", refund_cycle=True)
-        die(f"could not read {verdict_file} ({e}) — refusing to guess (fail-closed).")
+        die(f"could not read {verdict_file} ({problem}) — refusing to guess (fail-closed).")
     verdict_lines = verdict_raw.split('\n')
     if (
         len(verdict_lines) != 3

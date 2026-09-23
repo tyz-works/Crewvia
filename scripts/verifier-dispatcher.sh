@@ -67,7 +67,8 @@ from lib_mux import Mux  # noqa: E402
 # ここに frontmatter を直接読むコードを書き戻さないこと — plan.sh が受理する
 # カードとここが拾うカードが、静かにズレる。
 from lib_task_cards import (  # noqa: E402
-    list_task_cards, read_regular_text, read_regular_text_or_none,
+    is_missing, is_unreadable, list_task_cards, read_regular_text,
+    read_regular_text_or_unreadable,
 )
 _mux = Mux()
 
@@ -175,33 +176,34 @@ def parse_yaml(text):
 # ---------------------------------------------------------------------------
 
 def _read_queue_text(path, what):
-    """queue / registry のファイルを種類を確かめてから読む。読めなければ None。
+    """queue / registry のファイルを種類を確かめてから読む。
 
-    判定の本体は `lib_task_cards.read_regular_text_or_none()` に 1 つだけ
+    読めたら `str`、読めなければ `Unreadable` (t018)。判定の本体は
+    `lib_task_cards.read_regular_text_or_unreadable()` に 1 つだけ
     (Codex 8 巡目 P2)。常駐デーモンなので、上限の無い `read_text()` が書き手の
     いない FIFO に当たると **検証の割り当てがサイクルごと止まる**。
     """
-    return read_regular_text_or_none(
+    return read_regular_text_or_unreadable(
         path, warn=lambda msg: log(f"WARNING: {what}: {msg}"))
 
 
 def load_state():
-    if not STATE_FILE.exists():
-        return {}
     text = _read_queue_text(STATE_FILE, 'state file')
-    if text is None:
-        return {}          # active mission ゼロ = 何も割り当てない
+    if is_missing(text):
+        return {}          # 本当に無い = active mission ゼロ
+    if is_unreadable(text):
+        return text        # 観測できなかった —— 空として扱えない形で返す
     return parse_yaml(text)
 
 
 def load_workers():
     """Return dict {name: {'skills': [...], 'role': str}} from registry/workers.yaml."""
-    if not WORKERS_FILE.exists():
-        return {}
-    workers = {}
     text = _read_queue_text(WORKERS_FILE, 'workers file')
-    if text is None:
-        return {}          # Worker 0 人 = 何も割り当てない
+    if is_missing(text):
+        return {}          # 本当に無い = Worker 0 人
+    if is_unreadable(text):
+        return text        # 観測できなかった
+    workers = {}
     current = None
     for line in text.splitlines():
         stripped = line.strip()
@@ -374,6 +376,10 @@ def tmux_send(target, message):
 
 def dispatch():
     state = load_state()
+    if is_unreadable(state):
+        log(f"WARNING: state.yaml を観測できない ({state.reason}) — "
+            f"このサイクルは何も割り当てない")
+        return
     active_missions = list(state.get('active_missions') or [])
     if not active_missions:
         return
@@ -393,6 +399,10 @@ def dispatch():
 
     # Load workers with verify skill (exclude directors)
     all_workers = load_workers()
+    if is_unreadable(all_workers):
+        log(f"WARNING: workers.yaml を観測できない ({all_workers.reason}) — "
+            f"このサイクルは何も割り当てない")
+        return
     verify_workers = {
         name for name, info in all_workers.items()
         if 'verify' in (info.get('skills') or [])

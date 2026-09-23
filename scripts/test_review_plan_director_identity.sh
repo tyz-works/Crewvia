@@ -96,6 +96,10 @@ cp "$REAL_REPO/scripts/wait_for_plan_review.sh" "$SCRATCH_DIR/scripts/"
 # scripts/lib_model.py と config/crewvia.yaml を必須で読むようになった。
 mkdir -p "$SCRATCH_DIR/config"
 cp "$REAL_REPO/scripts/lib_model.py" "$SCRATCH_DIR/scripts/"
+# lib_mux.py / lib_model.py は queue・registry・config の読み取りを
+# scripts/lib_task_cards.py に通す (t018)。フォールバックを持たないので、
+# 単体でコピーする隔離環境では一緒に置くこと。
+cp "$REAL_REPO/scripts/lib_task_cards.py" "$SCRATCH_DIR/scripts/"
 cp "$REAL_REPO/config/crewvia.yaml" "$SCRATCH_DIR/config/"
 
 RESULT_DIR="$(mktemp -d /tmp/crewvia-test-review-plan-result-XXXXXX)"

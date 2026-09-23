@@ -56,6 +56,8 @@ _run_case() {
   # t001 (mission 20260909-dead-config-sweep): review-plan.sh はモデル解決に
   # scripts/lib_model.py と config/crewvia.yaml を必須で読むようになった。
   cp "${SCRIPT_DIR}/lib_model.py" "$TMPDIR_TEST/scripts/"
+  # lib_model.py は config の読み取りを lib_task_cards.py に通す (t018)。
+  cp "${SCRIPT_DIR}/lib_task_cards.py" "$TMPDIR_TEST/scripts/"
   cp "$(dirname "$SCRIPT_DIR")/config/crewvia.yaml" "$TMPDIR_TEST/config/"
   # t018 (mission 20260912-verdict-ci-launcher): review-plan.sh は lib_verdict.py の
   # 終了コード 10 (verdict 行の兆候なし) だけを「判定不能」とみなし、それ以外
@@ -124,6 +126,8 @@ cp "$REAL_REVIEW_PLAN" "$TMPDIR_TEST/scripts/review-plan.sh"
 # t001 (mission 20260909-dead-config-sweep): review-plan.sh はモデル解決に
 # scripts/lib_model.py と config/crewvia.yaml を必須で読むようになった。
 cp "${SCRIPT_DIR}/lib_model.py" "$TMPDIR_TEST/scripts/"
+# lib_model.py は config の読み取りを lib_task_cards.py に通す (t018)。
+cp "${SCRIPT_DIR}/lib_task_cards.py" "$TMPDIR_TEST/scripts/"
 cp "$(dirname "$SCRIPT_DIR")/config/crewvia.yaml" "$TMPDIR_TEST/config/"
 # t020 (mission 20260912-verdict-ci-launcher): Case 1-3 と同じ兆候なしスタブを置く。
 # schema 不在のフォールバック経路もプローズを 3 状態で分類するようになり、

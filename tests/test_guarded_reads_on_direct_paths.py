@@ -47,6 +47,8 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 SCRIPTS_DIR = REPO_ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
+import lib_task_cards  # noqa: E402
+
 from test_task_card_identity import load_dispatcher_namespace  # noqa: E402
 from test_unobservable_is_not_empty import MISSION, Sandbox  # noqa: E402
 
@@ -222,8 +224,12 @@ class _NullResponse:
 # いた。こちらはデーモンなので、止まるとサイクルごと止まる —— dispatcher なら
 # 全 mission の割り当て、watchdog なら **全 Worker の生存監視** である。
 #
-# 倒す先はどれも「何もしない」側にしてある: active mission ゼロ / Worker ゼロ /
+# 倒す先はどれも「何もしない」側にしてある: 割り当てない / 退役させない /
 # 監視対象ゼロ。読めなかったことを、割り当てや終了の許可に使わない。
+#
+# t018: `{}` で返すのはやめ、`Unreadable` を返す。「読めなかった」を「空」と
+# 同じ形で返していたことが、`dispatch()` の `if not active_missions:
+# shutdown_idle_workers()` に落ちる経路を作っていた (Codex 9 巡目 P1)。
 
 def test_dispatcher_load_state_does_not_block_on_a_fifo(tmp_path):
     root = tmp_path / "repo"
@@ -232,7 +238,8 @@ def test_dispatcher_load_state_does_not_block_on_a_fifo(tmp_path):
     _replace_with_fifo(root / "queue" / "state.yaml")
 
     with _deadline(10):
-        assert ns["load_state"]() == {}
+        state = ns["load_state"]()
+    assert lib_task_cards.is_unreadable(state), state
 
 
 def test_dispatcher_load_workers_does_not_block_on_a_fifo(tmp_path):
@@ -242,7 +249,8 @@ def test_dispatcher_load_workers_does_not_block_on_a_fifo(tmp_path):
     _replace_with_fifo(root / "registry" / "workers.yaml")
 
     with _deadline(10):
-        assert ns["load_workers"]() == {}
+        workers = ns["load_workers"]()
+    assert lib_task_cards.is_unreadable(workers), workers
 
 
 def test_dispatcher_still_reads_a_regular_state_and_workers_file(tmp_path):
@@ -417,7 +425,8 @@ def test_verifier_load_state_does_not_block_on_a_fifo(tmp_path):
     _replace_with_fifo(root / "queue" / "state.yaml")
 
     with _deadline(10):
-        assert ns["load_state"]() == {}
+        state = ns["load_state"]()
+    assert lib_task_cards.is_unreadable(state), state
 
 
 # ===========================================================================

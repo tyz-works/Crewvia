@@ -132,8 +132,8 @@ from lib_dep_rules import unmet_dependencies  # noqa: E402
 # ここに frontmatter を直接読むコードを書き戻さないこと。
 # 再発防止は tests/test_task_card_identity.py。
 from lib_task_cards import (  # noqa: E402,F401
-    CORRUPT_TASK_STATUS, list_task_cards, parse_frontmatter,
-    read_regular_text_or_none, read_task_card,
+    CORRUPT_TASK_STATUS, is_missing, is_unreadable, list_task_cards,
+    parse_frontmatter, read_regular_text_or_unreadable, read_task_card,
 )
 _mux = Mux()
 
@@ -399,8 +399,9 @@ def parse_yaml(text):
 # ---------------------------------------------------------------------------
 
 def read_queue_text(path, what):
-    """queue / registry のファイルを **種類を確かめてから** 読む。読めなければ None。
+    """queue / registry のファイルを **種類を確かめてから** 読む。
 
+    読めたら `str`、読めなければ `Unreadable` —— 空文字でも None でもない。
     カードだけでなく `state.yaml` / `workers.yaml` / `mission.yaml` にも同じ
     ガードを当てる (Codex 8 巡目 P2)。ここは常駐デーモンなので、上限の無い
     `read_text()` が書き手のいない FIFO に当たると **サイクルごと座り込み、
@@ -410,28 +411,59 @@ def read_queue_text(path, what):
     倒す先は呼び出し側が決める。ここで返すのは「読めなかった」だけ
     (memory: fail-direction-is-per-judgment)。
     """
-    return read_regular_text_or_none(
+    return read_regular_text_or_unreadable(
         path, warn=lambda msg: log(f"WARNING: {what}: {msg}"))
 
 
+def read_assignment(agent_name):
+    """`assignments/<agent>` を **種類を確かめてから** 読む。
+
+    読めたら `"<slug>:<task_id>"` (前後の空白は落とす)、無い = `Unreadable`
+    (`is_missing()` が True)、読めない = `Unreadable`。
+
+    このファイルは `assignment_file.exists()` で「busy かどうか」を判定する
+    経路と対になっているが、**中身を読むのは別の話**である。t017 のガードは
+    この直後のカード読み取りにしか入っておらず、assignment 本体は素の
+    `read_text()` のままだった (Codex 9 巡目 P2)。`registry/assignments/` は
+    Worker 名で引かれるだけの短いファイルで、書くのは plan.sh の
+    `_atomic_write` だけだが、置き違えた FIFO 1 枚で `publish_agents()` が
+    返らなくなり —— それは `dispatch()` の **前** に走るので —— 全 mission の
+    割り当てが止まる。
+    """
+    return read_queue_text(ASSIGNMENTS_DIR / agent_name, 'assignment file')
+
+
 def load_state():
-    if not STATE_FILE.exists():
-        return {}
+    """active mission の一覧。読めなければ `Unreadable` を **そのまま返す**。
+
+    t017 まではここで `{}` に潰していた。潰すと `dispatch()` の
+    `if not active_missions: shutdown_idle_workers()` に落ちて、**pending の
+    仕事が残っているのに idle Worker の退役が認可される** (Codex 9 巡目 P1)。
+    `Path.exists()` も同じ穴を持つ —— `EACCES` で stat できないときも False に
+    なるので、「無いことを観測した」と「観測できなかった」が同じ分岐に入る。
+    だから存在確認は `read_queue_text()` の `ENOENT` 1 本に寄せる。
+    """
     text = read_queue_text(STATE_FILE, 'state file')
-    if text is None:
-        # active mission ゼロ = 何も割り当てない。読めなかったことを
-        # 「割り当ててよい」の側に使わない。
-        return {}
+    if is_missing(text):
+        return {}          # 本当に無い = active mission ゼロ
+    if is_unreadable(text):
+        return text        # 観測できなかった —— 呼び出し側が「空」と読めない形
     return parse_yaml(text)
 
 
 def load_workers():
-    """Return dict {name: {'skills': [...], ...}} from registry/workers.yaml."""
-    if not WORKERS_FILE.exists():
-        return {}
+    """Return dict {name: {'skills': [...], ...}} from registry/workers.yaml.
+
+    `load_state()` と同じく、読めなかったときは `Unreadable` を返す。ここも
+    空に潰すと「Worker が 1 人もいない」と見分けが付かず、`publish_agents()` が
+    **全エージェントを Taskvia から DELETE する** (= 観測の失敗が撤去の根拠に
+    なる) 側へ倒れる。
+    """
     text = read_queue_text(WORKERS_FILE, 'workers file')
-    if text is None:
-        return {}          # Worker 0 人 = 何も割り当てない
+    if is_missing(text):
+        return {}          # 本当に無い = Worker 0 人
+    if is_unreadable(text):
+        return text
     data = parse_yaml(text)
     workers = {}
     # workers.yaml has a top-level 'workers' block list
@@ -748,7 +780,12 @@ def _mux_created_at(window_target: str):
     """
     p = STATE_JSON_DIR / f'{window_target}.json'
     try:
-        data = json.loads(p.read_text(encoding='utf-8'))
+        # registry/ の固定パスもガードを通す (t018)。tmux backend ではこの
+        # ファイルが存在しないのが普通なので、ENOENT は警告を出さない。
+        raw = read_queue_text(p, 'mux cache')
+        if is_unreadable(raw):
+            return None
+        data = json.loads(raw)
         ts = data.get('created_at')
         if not ts:
             return None
@@ -770,7 +807,9 @@ def _spawn_time_fallback(window_target: str) -> float:
     """
     p = STATE_JSON_DIR / f'{window_target}.firstseen'
     try:
-        return float(p.read_text().strip())
+        raw = read_queue_text(p, 'spawn-grace marker')
+        if not is_unreadable(raw):
+            return float(raw.strip())
     except Exception:
         pass
     now = time.time()
@@ -837,6 +876,13 @@ def publish_agents():
 
     now = time.time()
     workers = load_workers()
+    if is_unreadable(workers):
+        # 「誰がいるか」を観測できていない。ここで空として進むと、下の
+        # departure publish が **全員を DELETE する** —— 観測の失敗が撤去の
+        # 根拠になる形 (memory: evidence-for-destructive-decisions)。
+        log(f"WARNING: workers.yaml を観測できない ({workers.reason}) — "
+            f"このサイクルは Taskvia への publish を見送る")
+        return
 
     # Collect heartbeat mtimes for all agents
     heartbeats_dir = REGISTRY_DIR / 'heartbeats'
@@ -873,10 +919,10 @@ def publish_agents():
 
             task_id = None
             task_title = None
-            assignment_file = ASSIGNMENTS_DIR / name
-            if assignment_file.exists():
+            assignment = read_assignment(name)
+            if not is_unreadable(assignment):
                 try:
-                    assignment = assignment_file.read_text().strip()
+                    assignment = assignment.strip()
                     if ':' in assignment:
                         mission_slug, task_id = assignment.split(':', 1)
                         task_file = MISSIONS_DIR / mission_slug / 'tasks' / f'{task_id}.md'
@@ -979,7 +1025,13 @@ def _load_state_entry(name: str) -> dict:
     """Load state persistence entry.  Returns {} on missing / corrupt file."""
     p = _state_json_path(name)
     try:
-        return json.loads(p.read_text(encoding='utf-8'))
+        raw = read_queue_text(p, 'rule5 state entry')
+        if is_unreadable(raw):
+            # 倒す先はここだけ「空」でよい —— grace が最初からやり直しになる
+            # = **通知が遅れる**側で、破壊も割り当ても起こらない
+            # (knowledge/empty-vs-unobservable.md §2 の I)。
+            return {}
+        return json.loads(raw)
     except Exception:
         return {}
 
@@ -1045,16 +1097,17 @@ def check_rule5(name: str, target: str, assignment_file: Path, task_statuses_by_
     # it — suppress Rule 5 entirely for this worker/task pair.
     if is_A or is_B:
         assigned_task_status = None
-        try:
-            raw = assignment_file.read_text().strip()
-            a_slug, _, a_task_id = raw.partition(':')
-            if not a_task_id:
-                a_task_id = a_slug
-                a_slug = None
-            if a_slug is not None:
-                assigned_task_status = task_statuses_by_mission.get(a_slug, {}).get(a_task_id)
-        except Exception:
-            assigned_task_status = None
+        raw = read_assignment(name)
+        if not is_unreadable(raw):
+            try:
+                a_slug, _, a_task_id = raw.strip().partition(':')
+                if not a_task_id:
+                    a_task_id = a_slug
+                    a_slug = None
+                if a_slug is not None:
+                    assigned_task_status = task_statuses_by_mission.get(a_slug, {}).get(a_task_id)
+            except Exception:
+                assigned_task_status = None
         if assigned_task_status == 'needs_director':
             is_A = False
             is_B = False
@@ -1091,11 +1144,13 @@ def check_rule5(name: str, target: str, assignment_file: Path, task_statuses_by_
     task_id = '?'
     mission_slug = '?'
     try:
-        raw = assignment_file.read_text().strip()
-        if ':' in raw:
-            mission_slug, task_id = raw.split(':', 1)
-        else:
-            task_id = raw
+        raw = read_assignment(name)
+        if not is_unreadable(raw):
+            raw = raw.strip()
+            if ':' in raw:
+                mission_slug, task_id = raw.split(':', 1)
+            else:
+                task_id = raw
     except Exception:
         pass
 
@@ -1224,6 +1279,23 @@ def shutdown_idle_workers():
 
 def dispatch():
     state = load_state()
+    if is_unreadable(state):
+        # Codex 9 巡目 P1。`{}` に潰すと下の `if not active_missions` に落ちて
+        # **退役を認可する**。何が active なのか観測できていない以上、割り当ても
+        # 退役も結論できない —— このサイクルは丸ごと見送る。次の 5 秒後にもう
+        # 一度読む (state.yaml は `os.replace` でしか書かれないので、原因が
+        # 直れば自然に戻る)。
+        log(f"WARNING: state.yaml を観測できない ({state.reason}) — "
+            f"このサイクルは割り当ても退役も行わない")
+        return
+
+    workers = load_workers()
+    if is_unreadable(workers):
+        # 誰が idle なのかを決める材料が無い。同上、結論を出さない。
+        log(f"WARNING: workers.yaml を観測できない ({workers.reason}) — "
+            f"このサイクルは割り当ても退役も行わない")
+        return
+
     active_missions = list(state.get('active_missions') or [])
 
     # Bug1 fix: even with no active missions, shut down lingering idle Workers
@@ -1232,17 +1304,15 @@ def dispatch():
         set_all_done_state(False)
         return
 
-    workers = load_workers()
-
     # Check if all active missions are done (empty list = all done)
     all_done = True
     for slug in active_missions:
         mfile = MISSIONS_DIR / slug / 'mission.yaml'
-        if not mfile.exists():
-            all_done = False
-            break
+        # `exists()` での事前確認は置かない —— `EACCES` で stat できないときも
+        # False になるので、「無い」と「観測できない」が同じ分岐に入る。
+        # 欠損も `is_unreadable()` に含まれ、どちらも「完了ではない」に倒す。
         mtext = read_queue_text(mfile, 'mission file')
-        if mtext is None:
+        if is_unreadable(mtext):
             # 読めなかった mission を「完了した」に数えない。この判定の先には
             # 全 idle Worker の shutdown があるので、観測の失敗はそこへ落として
             # はいけない (memory: evidence-for-destructive-decisions)。
@@ -1684,12 +1754,12 @@ def dispatch():
                         log(f"WARNING: handoff_path is not absolute (task_158 regression?): "
                             f"{slug}/{task_id} handoff_path={handoff_path!r}")
                         hp = REGISTRY_DIR.parent / handoff_path
-                    if hp.exists():
-                        lines = hp.read_text().splitlines()[:10]
-                        handoff_summary = ' | '.join(lines)
+                    hp_text = read_queue_text(hp, 'handoff file')
+                    if not is_unreadable(hp_text):
+                        handoff_summary = ' | '.join(hp_text.splitlines()[:10])
                     else:
-                        log(f"WARNING: handoff file not found at resolved path: "
-                            f"{slug}/{task_id} resolved={hp}")
+                        log(f"WARNING: handoff file unreadable at resolved path: "
+                            f"{slug}/{task_id} resolved={hp} ({hp_text.reason})")
                 except Exception:
                     handoff_summary = '(読み取り失敗)'
                 msg = (

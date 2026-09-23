@@ -64,7 +64,7 @@ scripts_dir = sys.argv[5]
 # `plan.sh status` に出る姿が、静かにズレる。
 sys.path.insert(0, scripts_dir)
 from lib_task_cards import (  # noqa: E402
-    list_task_cards, read_regular_text_or_none,
+    is_unreadable, list_task_cards, read_regular_text_or_unreadable,
 )
 
 state_file = os.path.join(queue_dir, 'state.yaml')
@@ -127,10 +127,15 @@ def parse_yaml(text):
 # ---------- map I/O ----------
 
 def load_map(path):
+    # queue/.taskvia-map.json。素の open() だと FIFO 1 枚で同期全体が
+    # 無期限に止まる (t018)。欠損 = 初回同期なので `{}` でよい —— 倒す先は
+    # 「もう一度送る」= 冪等 (knowledge/empty-vs-unobservable.md §2 の K)。
+    text = _read_queue_text(path)
+    if is_unreadable(text):
+        return {}
     try:
-        with open(path) as f:
-            return json.load(f)
-    except (OSError, json.JSONDecodeError):
+        return json.loads(text)
+    except ValueError:
         return {}
 
 
@@ -213,8 +218,12 @@ def http_delete(url):
 # ---------- mission scanning ----------
 
 def _read_queue_text(path):
-    """queue のファイルを種類を確かめてから読む。読めなければ None (警告 1 行)。"""
-    return read_regular_text_or_none(
+    """queue のファイルを種類を確かめてから読む。
+
+    読めたら `str`、読めなければ `Unreadable` —— 空文字でも None でもない
+    (t018)。失敗を「空」と同じ形で返さないので、呼び出し側が取り違えられない。
+    """
+    return read_regular_text_or_unreadable(
         path,
         warn=lambda msg: print(f"[taskvia-sync] WARNING: {msg}", file=sys.stderr))
 
@@ -227,8 +236,8 @@ def scan_missions():
     # 固定パスの読み取りにも種類のガードを当てる (Codex 8 巡目 P2)。上限の無い
     # `open()` は、書き手のいない FIFO 1 枚で同期全体を無期限に止める。
     state_text = _read_queue_text(state_file)
-    if state_text is None:
-        return                      # active mission ゼロ = 何も同期しない
+    if is_unreadable(state_text):
+        return                      # 観測できなかった = 何も同期しない
     state = parse_yaml(state_text)
     active = state.get('active_missions') or []
     for slug in active:
@@ -237,7 +246,7 @@ def scan_missions():
         if not os.path.exists(myaml):
             continue
         mission_text = _read_queue_text(myaml)
-        if mission_text is None:
+        if is_unreadable(mission_text):
             continue                # この mission だけ飛ばす (他は同期する)
         mission_meta = parse_yaml(mission_text)
         # 読み取りは scripts/lib_task_cards.py に 1 つだけ (plan.sh / dispatcher.sh

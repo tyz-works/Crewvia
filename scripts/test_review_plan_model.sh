@@ -54,6 +54,8 @@ _setup_scratch() {
   mkdir -p "$dir/scripts" "$dir/config" "$dir/queue/missions/testmission"
   cp "$REAL_REPO/scripts/review-plan.sh" "$dir/scripts/"
   cp "$REAL_REPO/scripts/lib_model.py" "$dir/scripts/"
+  # lib_model.py は config の読み取りを lib_task_cards.py に通す (t018)。
+  cp "$REAL_REPO/scripts/lib_task_cards.py" "$dir/scripts/"
   # t018 (mission 20260912-verdict-ci-launcher): review-plan.sh は lib_verdict.py の
   # 終了コード 10 (verdict 行の兆候なし) だけを「判定不能」とみなし、それ以外
   # (スクリプト不在で python3 が返す 2 を含む) は書式違反として fail-closed に

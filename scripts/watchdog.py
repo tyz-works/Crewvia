@@ -49,7 +49,8 @@ import lib_daemon_watch  # noqa: E402
 # ここに frontmatter を直接読むコードを書き戻さないこと — plan.sh が `[破損]`
 # として保留するカードを、この監視だけが別の task の id で数える状態に戻る。
 from lib_task_cards import (  # noqa: E402
-    NotARegularFile, list_task_cards, read_regular_text,
+    NotARegularFile, is_unreadable, list_task_cards, read_regular_text,
+    read_regular_text_or_unreadable,
 )
 _mux = Mux()
 
@@ -637,11 +638,14 @@ class WorkerMonitor:
                 newest_file = f
         if newest_file is None:
             return None, None
-        try:
-            payload = json.loads(newest_file.read_text())
-            notif_type = payload.get("notification_type")
-        except Exception:
-            notif_type = "(unparseable)"
+        payload_text = read_regular_text_or_unreadable(newest_file)
+        if is_unreadable(payload_text):
+            notif_type = "(unreadable)"
+        else:
+            try:
+                notif_type = json.loads(payload_text).get("notification_type")
+            except Exception:
+                notif_type = "(unparseable)"
         return newest_mtime, notif_type
 
     def _observation_snapshot(self) -> dict:

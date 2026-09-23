@@ -1750,6 +1750,11 @@ setup_fake_crewvia_tree() {
     mkdir -p "${FAKE_TREE}/config" "${FAKE_TREE}/scripts"
     cp "${REPO_ROOT}/crewvia" "${FAKE_TREE}/crewvia"
     cp "${REPO_ROOT}/scripts/lib_mux.py" "${FAKE_TREE}/scripts/lib_mux.py"
+    # lib_mux.py は queue / registry / config の読み取りを
+    # scripts/lib_task_cards.py に通す (t018)。フォールバックを持たないので、
+    # 単体でコピーすると import で落ちる。
+    cp "${REPO_ROOT}/scripts/lib_task_cards.py" \
+       "${FAKE_TREE}/scripts/lib_task_cards.py"
     printf 'mode: herdr\ntaskvia: disabled\n' > "${FAKE_TREE}/config/crewvia.yaml"
 
     FAKE_TREE_DISPATCH="${FAKE_TREE}/dispatch.log"

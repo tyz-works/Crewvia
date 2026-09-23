@@ -90,6 +90,7 @@
 
 from __future__ import annotations
 
+import errno as _errno
 import os
 import re
 import stat
@@ -362,7 +363,7 @@ def _describe_file_type(mode):
     return f'mode {stat.S_IFMT(mode):#o}'
 
 
-def _read_regular_file(path):
+def _read_regular_file(path, newline=None):
     """通常ファイルなら中身を返す。それ以外なら `_NotARegularFile` で即座に断る。
 
     `O_NONBLOCK` を付けて開くのは、**種類を確かめる前に待たされないため**で
@@ -372,6 +373,10 @@ def _read_regular_file(path):
     判定は `fstat` —— 開いた **その fd** に対して行う。`os.stat(path)` で先に
     見てから開くと、見た対象と開いた対象が別物でありうる (memory:
     verify-and-destroy-must-share-one-connection と同じ形)。
+
+    `newline` は `open()` と同じ意味。既定 (`None`) は universal newlines で、
+    `''` を渡すと改行変換を行わない —— `plan.sh` の `plan_review.verdict` の
+    ように「2 行ちょうど」を検査する読み手だけが使う。
 
     通常ファイルだと分かったら `O_NONBLOCK` は落とす。通常ファイルの read に
     非ブロッキングの意味は無く、付けたままにすると将来この関数が他の種類を
@@ -383,7 +388,7 @@ def _read_regular_file(path):
         if not stat.S_ISREG(mode):
             raise _NotARegularFile(_describe_file_type(mode))
         os.set_blocking(fd, True)
-        f = os.fdopen(fd)
+        f = os.fdopen(fd, newline=newline)
     except BaseException:
         os.close(fd)
         raise
@@ -405,30 +410,140 @@ NotARegularFile = _NotARegularFile
 read_regular_text = _read_regular_file
 
 
-def read_regular_text_or_none(path, warn=None):
-    """`read_regular_text()` の、**例外を出さない** 形。読めなければ None。
+class Unreadable:
+    """**読めなかった**ことそのものを表す値。「空」ではない。
+
+    t018 まで、読み取りの失敗は `None` / `{}` / `[]` で返されていた。そこが
+    同じ型の欠陥を 8 回作った入口である —— 最後の 1 つ (Codex 9 巡目 P1) は
+    「state.yaml が読めない → `{}` → active mission ゼロ → **idle Worker を
+    退役させてよい**」で、直前の t017 がガードを足したことによって初めて
+    到達可能になった。個々の呼び出し側を見張る形では閉じない。**失敗を空と
+    同じ形で返さない**という、コードの形のほうを変える。
+
+    だからこの値は「空の入れ物」として振る舞わない。`bool()` / `len()` /
+    `in` / `[]` / 反復、そして `.get()` `.splitlines()` のような属性アクセスは
+    **すべて `TypeError`** になる。`if not state:` も
+    `state.get('active_missions')` も、書いた時点では気付けなくても
+    **実行した瞬間に落ちる** —— 黙って退役を認可する経路が、書けなくなる。
+
+    落ちること自体は安全側である。dispatcher の 1 サイクルは
+    `run_dispatch || log "dispatch cycle error"` の下にあり、heartbeat は
+    その外で無条件に書かれる (= respawn も起きない)。何も割り当てず何も
+    壊さずに 5 秒後へ進む。
+
+    正しい扱いは `is_unreadable()` / `is_missing()` で分岐すること。
+    `errno` は `OSError` 由来のときだけ入る —— `ENOENT` (本当に無い) と
+    それ以外 (権限・I/O・種類) を呼び出し側が分けられるようにするためで、
+    「まだ無いのが普通」は ENOENT の話でしかない
+    (`knowledge/empty-vs-unobservable.md` §5)。
+    """
+
+    __slots__ = ('path', 'reason', 'errno')
+
+    def __init__(self, path, reason, errno=None):
+        self.path = str(path)
+        self.reason = str(reason)
+        self.errno = errno
+
+    def __repr__(self):
+        return f'Unreadable({self.path!r}, {self.reason!r}, errno={self.errno!r})'
+
+    def _refuse(self, op):
+        raise TypeError(
+            f"{op} on Unreadable({self.path!r}): {self.reason}\n"
+            f"  「読めなかった」を「空」として扱うことはできません。"
+            f"is_unreadable() / is_missing() で分岐してください。")
+
+    # 「空の入れ物」として使われうる操作を、すべて拒否する。
+    def __bool__(self):
+        self._refuse('bool()')
+
+    def __len__(self):
+        self._refuse('len()')
+
+    def __iter__(self):
+        self._refuse('iter()')
+
+    def __contains__(self, item):
+        self._refuse('in')
+
+    def __getitem__(self, key):
+        self._refuse('[]')
+
+    def __getattr__(self, name):
+        # `__slots__` に無い属性 —— `.get()` `.splitlines()` `.strip()` など、
+        # dict / str のつもりで呼ばれたものがここに来る。
+        self._refuse(f'.{name}')
+
+
+def is_unreadable(value):
+    """`value` が「読めなかった」を表しているか。"""
+    return isinstance(value, Unreadable)
+
+
+def is_missing(value):
+    """`value` が **本当に無い** (ENOENT) を表しているか。
+
+    `Path.exists()` を分岐の材料にできないのは、`EACCES` で stat できない場合も
+    `False` に潰れるからである (`knowledge/empty-vs-unobservable.md` §2 の B と
+    同じ形)。「まだ無いのが普通」を許すときは、ここで **ENOENT だけ** を通す。
+    """
+    return isinstance(value, Unreadable) and value.errno == _errno.ENOENT
+
+
+def read_regular_text_or_unreadable(path, warn=None):
+    """`read_regular_text()` の、**例外を出さない** 形。読めなければ `Unreadable`。
 
     常駐デーモン (dispatcher / verifier-dispatcher / watchdog) と、mission を
     並べて表示する側のための入口である。1 つのファイルを読めなかっただけで
     サイクルや一覧全体を落とさない、という向きは `read_task_card()` と同じ。
 
-    **倒す先はここでは決めない。** 呼び出し側が None をどう読むかは判定ごとに
-    違う —— dispatcher の `load_state()` は「active mission ゼロ」(= 何も
-    割り当てない)、`all_done` の判定は「完了ではない」(= 誰も退役させない)。
-    どちらも「読めなかったことを、割り当て・破壊の許可に使わない」側である
+    **この関数は例外を投げない** (`KeyboardInterrupt` / `SystemExit` のような
+    `BaseException` は別 —— あれは握り潰してはいけない)。名前の分かっている
+    失敗には直し方まで書き、**残り全部を最後の `except Exception` が
+    受ける**。`read_task_card()` の backstop とまったく同じ形で、理由も同じ:
+    「今回の 1 件を足す」形は、次に読み取り経路へ新しい失敗が入った日に
+    もう一度同じ止まり方をする。実際、t015 で `read_task_card()` について
+    直した `UnicodeDecodeError` の漏れが、**t017 で新しく作ったこの wrapper に
+    そのまま再現していた** (Codex 9 巡目 P2)。
+
+    **倒す先はここでは決めない。** 呼び出し側が失敗をどう読むかは判定ごとに
+    違う —— dispatcher の `dispatch()` は「このサイクルは何もしない」、
+    `all_done` の判定は「完了ではない」(= 誰も退役させない)。どちらも
+    「読めなかったことを、割り当て・破壊の許可に使わない」側である
     (memory: fail-direction-is-per-judgment / evidence-for-destructive-decisions)。
     """
     try:
         return read_regular_text(path)
     except NotARegularFile as e:
-        _safe_warn(warn, f"{path} is not a regular file ({e})\n"
-                         f"  hint: queue / registry のファイルは通常ファイルだけです。"
-                         f"`ls -l {path}` で種類を確かめてください。\n"
-                         f"  treating it as unreadable for now.")
+        return _unreadable(
+            warn, path, f'not a regular file ({e})', None,
+            f"  hint: queue / registry のファイルは通常ファイルだけです。"
+            f"`ls -l {path}` で種類を確かめてください。")
+    except FileNotFoundError as e:
+        # 「まだ無い」は普通の状態 (起動直後の state.yaml / 未作成の marker)。
+        # 5 秒ごとに回る常駐デーモンからここへ来るので、警告は出さない ——
+        # 区別は戻り値の `errno` が持っており、警告はその写しにすぎない。
+        return Unreadable(path, f'not found ({e})', errno=e.errno)
     except OSError as e:
-        _safe_warn(warn, f"failed to read {path}: {e}\n"
-                         f"  treating it as unreadable for now.")
-    return None
+        return _unreadable(warn, path, f'read error ({e})', e.errno)
+    except UnicodeError as e:
+        # `UnicodeDecodeError` は `OSError` ではなく `ValueError` の側にいるので
+        # 上の except では捕まらない (Codex 6 巡目 P1 / 9 巡目 P2)。
+        return _unreadable(
+            warn, path, f'decode error, not UTF-8 ({e})', None,
+            f"  hint: `file {path}` でエンコーディングを確かめ、必要なら "
+            f"`iconv -f <元の文字コード> -t utf-8` で書き直すこと。")
+    except Exception as e:      # noqa: BLE001 — backstop。理由は docstring。
+        return _unreadable(
+            warn, path, f'unexpected read failure: {type(e).__name__}: {e}', None)
+
+
+def _unreadable(warn, path, reason, err_no, hint=''):
+    _safe_warn(warn, f"failed to read {path}: {reason}\n"
+                     + (hint + "\n" if hint else "")
+                     + f"  treating it as unreadable for now.")
+    return Unreadable(path, reason, errno=err_no)
 
 
 # ---------------------------------------------------------------------------

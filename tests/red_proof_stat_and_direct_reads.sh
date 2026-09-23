@@ -154,11 +154,11 @@ read -r -d '' INJECT_P2A <<'PY'
 import sys, pathlib
 p = pathlib.Path(sys.argv[1]); s = p.read_text()
 old = """    try:
-        return _TASK_CARDS.read_regular_text(path), None
+        return _TASK_CARDS.read_regular_text(path, newline=newline), None
     except _TASK_CARDS.NotARegularFile as e:"""
 assert old in s, "注入点が見つからない"
 s = s.replace(old, """    try:
-        with open(path) as f:
+        with open(path, newline=newline) as f:
             return f.read(), None
     except _TASK_CARDS.NotARegularFile as e:""")
 p.write_text(s)

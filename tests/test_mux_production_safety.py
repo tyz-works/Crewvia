@@ -29,6 +29,7 @@ Worker の割り当てが止まった。経緯と仕組みは `tests/conftest.py
 """
 
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -414,3 +415,82 @@ def test_restart_refuses_when_the_pane_owner_cannot_be_determined(
                       log=lambda m: None, proc_root=str(tmp_path / "no-such-proc"),
                       force=True) is True
     assert [c[0] for c in mux2.calls] == ["kill", "spawn"], mux2.calls
+
+
+# ---------------------------------------------------------------------------
+# 4. 全数点検を、書いた時点の事実ではなく契約にする
+# ---------------------------------------------------------------------------
+#
+# t037 で tests/ を全部見て「本番 mux に触れうるもの」を洗い出した。点検は
+# 点検した瞬間の事実でしかないので、同じ条件を機械に見張らせる。
+#
+# python 側は conftest + lib_mux のガードが構造で担保する。bats 側は python の
+# import 層を通らない (bash から scripts/*.sh を叩く) ので、**PATH に置いた
+# 偽の tmux / herdr** が唯一の隔離になる。その対応関係をここで固定する。
+
+#: mux の verb を直に名指しする痕跡。
+_MUX_VERBS = ("lib_mux", "mux_spawn", "mux_send", "mux_kill", "mux_capture",
+              "mux_list", "mux_pid")
+
+#: `VAR=".../start.sh"` のような、repo のスクリプトを指す変数の代入。
+_SCRIPT_ASSIGN = re.compile(
+    r"([A-Za-z_][A-Za-z0-9_]*)=[^\n]*(?:start\.sh|dispatcher\.sh|watchdog\.py)")
+
+#: その変数を実際に **実行している** 行 (grep しているだけの suite と分ける)。
+_SCRIPT_EXEC_VAR = re.compile(
+    r"(?:^|\s|\()(?:run\s+)?(?:bash|exec|python3|source)\s+[^\n]*?\$\{?(\w+)")
+
+#: パスを直書きして実行している行。
+_SCRIPT_EXEC_LITERAL = re.compile(
+    r"(?:^|\s|\()(?:run\s+)?(?:bash|exec|python3)\s+[^\n]*"
+    r"(?:start\.sh|dispatcher\.sh|watchdog\.py)")
+
+
+def _bats_can_reach_the_mux(code: str) -> bool:
+    if any(verb in code for verb in _MUX_VERBS):
+        return True
+    if _SCRIPT_EXEC_LITERAL.search(code):
+        return True
+    script_vars = set(_SCRIPT_ASSIGN.findall(code))
+    return any(v in script_vars for v in _SCRIPT_EXEC_VAR.findall(code))
+
+
+def _bats_installs_a_path_stub(code: str) -> bool:
+    return any(mark in code for mark in ('/tmux"', "/tmux'", '/herdr"', "/herdr'"))
+
+
+def test_every_bats_suite_that_can_reach_the_mux_installs_a_path_stub():
+    """bats から本番の tmux / herdr へ出ていく道が無いこと。
+
+    mux の verb を呼びうる suite — 直に呼ぶものも、`start.sh` / `dispatcher.sh` /
+    `watchdog.py` を実行するものも — は、PATH の先頭に偽の `tmux` / `herdr` を
+    置いていなければならない。bats は python の import 層を通らないので、
+    `lib_mux` のテスト隔離ガードは効かず、**PATH のスタブが唯一の防壁**になる。
+
+    「今日は start.sh が mux に届く前に exit するから安全」は理由にならない。
+    その exit が 1 行動けば、suite は本番の mux を掴む — pytest 側で
+    2026-09-23 に起きたのと同じ形が、ガードの無い bash 側に残る。
+
+    検出は文字列ベースで、実行とただの grep を分ける程度の粗さしかない。
+    厳密な解析ではなく、点検した事実を腐らせないための仕掛けとして置いている。
+    """
+    reaching, offenders = [], []
+    for suite in sorted((REPO_ROOT / "tests").glob("*.bats")):
+        # 実行される行だけを見る (コメントで verb 名に触れているだけの suite が
+        # 大半で、それを違反に数えると警告が意味を失う)。
+        code = "\n".join(ln for ln in suite.read_text(encoding="utf-8").splitlines()
+                         if not ln.lstrip().startswith("#"))
+        if not _bats_can_reach_the_mux(code):
+            continue
+        reaching.append(suite.name)
+        if not _bats_installs_a_path_stub(code):
+            offenders.append(suite.name)
+
+    assert offenders == [], (
+        "these bats suites can invoke a mux verb but install no fake tmux/herdr "
+        f"on PATH, so they can reach the production mux: {offenders}")
+    # 全部が reach=False に見えるなら、この検査は何も見ていない (memory:
+    # red-proof-catches-tests-green-for-the-wrong-reason)。
+    assert len(reaching) >= 5, (
+        f"only {reaching} were judged able to reach the mux — the detection "
+        "above has stopped matching and this test is passing vacuously")

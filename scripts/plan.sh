@@ -256,6 +256,7 @@ import shutil
 import hashlib
 import subprocess
 import shlex
+import time
 import urllib.request
 from datetime import datetime, timezone
 
@@ -1063,19 +1064,124 @@ def build_task_graph(state):
     return {'title': title, 'tasks': nodes}
 
 
-def refresh_task_graph():
-    """生成物を書き出す。tmp + os.replace で原子的に置き換える。
+#: publish の直列化ロックを待つ上限 (秒)。付加機能が本体を止めないための上限で
+#: あって、直列化の強さではない。flock はプロセスの死で必ず外れるので、ここに
+#: 引っかかるのは「publish の途中で生きたまま止まっている実行」がいるときだけ。
+TASK_GRAPH_LOCK_WAIT_SECONDS = 10.0
+TASK_GRAPH_LOCK_POLL_SECONDS = 0.02
 
-    複数の plan.sh が同時にここへ来ることはありうる (生成はキューロックの外)。
-    tmp は pid 別なので互いを壊さず、読み手が半端な JSON を見ることもない。
-    「先に queue を読んだ側が後に書く」並びになると一瞬だけ古い姿が残るが、
-    次に queue を書き換えたコマンドが上書きして解ける。ここでロックを増やして
-    まで直す価値のある種類のズレではない。
+#: pending を拾って読み直す上限。通常は 0 回、諦めた実行が 1 つあれば 1 回。
+#: 上限は「読み直しが終わらない」ことだけを防ぐ。
+TASK_GRAPH_MAX_ROUNDS = 3
+
+
+def _task_graph_lock_path(path):
+    """生成物ごとの直列化ロック。書き先が違う実行同士は競合しない。"""
+    return path + '.lock'
+
+
+def _task_graph_pending_path(path):
+    """「ロックを待ち切れず引き返した実行がいる」ことを表す印。"""
+    return path + '.pending'
+
+
+def acquire_task_graph_lock(path):
+    """publish を直列化するロックを取る。待ち切れなければ None。
+
+    **キューロックとは別物で、キューロックの内側からは決して取らない。**
+    生成がキューロックの外であることは構造テストで固定されているので、
+    2 つのロックの順序が逆転する経路は存在しない。
+
+    上限付きで待つのは、付加機能が本体の動作を変えないため。flock は
+    プロセスが死ねば必ず外れるので、死んだ実行が plan.sh 全体を止めることは
+    ないが、生きたまま止まっている実行に Worker が巻き込まれる道は塞ぐ。
+
+    None が意味するのは「待ち切れなかった」だけである。ロックファイルを
+    用意できない (書き先が壊れている等) は OSError のまま投げる — 生成の
+    失敗として 1 行報告される方の経路であって、混ぜると書き先が壊れている
+    ときに「publish が混んでいる」と読める嘘の診断が出る。
+    """
+    lock_path = _task_graph_lock_path(path)
+    os.makedirs(os.path.dirname(lock_path) or '.', exist_ok=True)
+    lf = open(lock_path, 'a+')
+    deadline = time.monotonic() + TASK_GRAPH_LOCK_WAIT_SECONDS
+    while True:
+        try:
+            fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return lf
+        except OSError:
+            pass
+        if time.monotonic() >= deadline:
+            lf.close()
+            return None
+        time.sleep(TASK_GRAPH_LOCK_POLL_SECONDS)
+
+
+def release_task_graph_lock(lf):
+    try:
+        fcntl.flock(lf, fcntl.LOCK_UN)
+    finally:
+        lf.close()
+
+
+def refresh_task_graph():
+    """生成物を書き出す。読み取りごと直列化し、tmp + os.replace で置き換える。
+
+    原子的な置換が防ぐのは「半端な JSON を読まれること」だけで、「先に queue を
+    読んだ実行が後に書く」入れ替わりは防がない。入れ替わると published な
+    グラフは古い姿に巻き戻る。そしてそれは一瞬では消えない: 巻き戻された変更が
+    *最後の queue 変更* だった場合、次に誰かが queue を触るまで誤った running が
+    居座る。「次のコマンドが直す」は、次のコマンドがある場合の話でしかない。
+
+    そこでロックを取ってから queue を読む。後から入った実行は必ず前の実行の
+    publish より後の queue を見るので、最後に書かれる姿は、その時点までに
+    commit された queue 変更をすべて含む。ロックはこの生成物専用で、
+    **キューロックの保持時間は 1 ミリ秒も伸びない**。
+
+    待ち切れなかった実行は 1 バイトも書かず、pending の印だけ置いて引き返す。
+    今 publish している側の読み取りは自分の変更より前かもしれないからで、
+    印を見たロック保持者が読み直して publish し直す。諦めた側の変更を黙って
+    落とさないための出口である。
     """
     path = task_graph_path()
-    graph = build_task_graph(load_state())
-    _atomic_write(path, json.dumps(graph, ensure_ascii=False, indent=2) + '\n')
+    lock = acquire_task_graph_lock(path)
+    if lock is None:
+        _mark_task_graph_pending(path)
+        return path
+    try:
+        for _ in range(TASK_GRAPH_MAX_ROUNDS):
+            # queue を読む *前* に消す。読んだあとに現れた印だけが「自分の
+            # スナップショットに入っていない変更がある」を意味する。
+            _clear_task_graph_pending(path)
+            graph = build_task_graph(load_state())
+            _atomic_write(path, json.dumps(graph, ensure_ascii=False, indent=2) + '\n')
+            if not os.path.exists(_task_graph_pending_path(path)):
+                break
+    finally:
+        release_task_graph_lock(lock)
     return path
+
+
+def _mark_task_graph_pending(path):
+    """読み直しを頼む印を置く。置けなくても呼び出し側は失敗させない。"""
+    try:
+        pending = _task_graph_pending_path(path)
+        os.makedirs(os.path.dirname(pending) or '.', exist_ok=True)
+        with open(pending, 'w') as f:
+            f.write(f"{os.getpid()}\n")
+    except OSError as e:
+        print(
+            f"[plan.sh warn] task-graph: publish を待ち切れず、読み直しの印も "
+            f"置けませんでした ({e}) — 次の queue 変更まで古い姿が残りえます",
+            file=sys.stderr,
+        )
+
+
+def _clear_task_graph_pending(path):
+    try:
+        os.unlink(_task_graph_pending_path(path))
+    except OSError:
+        pass
 
 
 def maybe_refresh_task_graph(subcommand):
@@ -3191,6 +3297,12 @@ def cmd_task_graph(args):
     herdr-task-graph 用の tasks.json を今すぐ書き出してパスを印字する。
     queue は変更しない。普段は queue を書き換えるサブコマンドが自動で呼ぶので、
     これを使うのは初回のブートストラップと、生成結果を目で見たいときだけ。
+
+    自動経路 (maybe_refresh_task_graph) と **同じ foreign-queue ガードを掛ける**。
+    手動だけ素通りさせると、`CREWVIA_QUEUE` を付け替えて走る隔離 QA が 1 回
+    叩くだけで、Director が見ているグラフがテスト用の queue の中身に化ける。
+    自動経路と違って黙って引き返さず失敗させるのは、こちらは人が「今すぐ
+    書き出せ」と言った実行だからで、何も起きないことの方が分かりにくい。
     """
     parse_opts(args, {})
     if not task_graph_enabled():
@@ -3199,6 +3311,15 @@ def cmd_task_graph(args):
             file=sys.stderr,
         )
         return
+    if not task_graph_queue_matches_root():
+        die(
+            f"[plan.sh] task-graph: CREWVIA_QUEUE ({QUEUE_DIR}) が "
+            f"{task_graph_repo_root()}/queue ではありません。"
+            f"このまま生成すると本体の生成物をこの queue の中身で上書きします。\n"
+            f"  hint: この queue のグラフを見たいなら書き先を明示してください "
+            f"(CREWVIA_TASK_GRAPH_FILE=<path> plan.sh task-graph)",
+            PRECONDITION_UNMET,
+        )
     print(refresh_task_graph())
 
 

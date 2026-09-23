@@ -85,7 +85,11 @@
     retirements/        Worker 終了要求と進捗（dispatcher→watchdog の引き渡し。.gitignore 対象）
     task-graph/         herdr-task-graph 用の `tasks.json`（.gitignore 対象）。queue を
                         書き換える plan.sh サブコマンドの後、キューロックの外で再生成される。
-                        手動で書き出すなら `plan.sh task-graph`
+                        再生成は `tasks.json.lock` で直列化される（古い読み取りが新しい姿を
+                        巻き戻さないため。キューロックの保持時間は伸びない）。待ち切れずに
+                        引き返した実行は `tasks.json.pending` を置き、ロック保持者が読み直す。
+                        手動で書き出すなら `plan.sh task-graph`（`CREWVIA_QUEUE` が
+                        `<root>/queue` でなければ拒否。書き先を明示すれば通る）
     daemons/            dispatcher/watchdog 相互監視の heartbeat・pause マーカー・respawn 履歴
                         （.gitignore 対象）。hooks/post-tool-use.sh の同時死 backstop（t008）が
                         throttle マーカー（backstop-notify.throttle）を置く場所でもある

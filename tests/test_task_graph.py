@@ -28,6 +28,7 @@ import pathlib
 import re
 import shutil
 import subprocess
+import sys
 import time
 
 import pytest
@@ -586,3 +587,167 @@ def test_generated_json_shape_matches_the_plugin_contract(sandbox):
     for node in graph["tasks"]:
         assert set(node) <= allowed_keys, f"未知のキー: {set(node) - allowed_keys}"
         assert node["status"] in allowed_status, node["status"]
+
+
+# ---------------------------------------------------------------------------
+# 4. 並行する publish — 古いスナップショットが新しい姿を巻き戻さないこと
+# ---------------------------------------------------------------------------
+#
+# 原子的な置換が防ぐのは「半端な JSON を読まれること」だけで、「読むのが先・
+# 書くのが後」の入れ替わりは防がない。そして巻き戻った表示は一瞬では消えない:
+# 巻き戻される側が *最後の queue 変更* だった場合、次に誰かが queue を触るまで
+# 誤った running が居座る。「次のコマンドが直す」は、次のコマンドがある場合の
+# 話でしかない。
+
+HARNESS = REPO_ROOT / "tests" / "task_graph_publisher_harness.py"
+
+#: 「新しい側が先に publish し終える」ための猶予。直列化されていれば、この間
+#: 新しい側はロック待ちのまま何も書かない (= 待ち切って先に進むのが正しい)。
+NEWER_PUBLISHER_GRACE = 3.0
+
+
+def _wait_for_file(path: pathlib.Path, timeout: float, what: str) -> None:
+    deadline = time.time() + timeout
+    while not path.exists():
+        assert time.time() < deadline, f"{what} が {timeout}s 以内に現れなかった"
+        time.sleep(0.01)
+
+
+def test_a_stale_snapshot_never_overwrites_a_newer_one(sandbox, tmp_path):
+    """queue を先に読んだ publish が、あとから来ても新しい姿を上書きしないこと。
+
+    harness 側 (古い読み取り) を publish の直前で止め、そのあいだに t001 を
+    done にして通常の `plan.sh task-graph` (新しい読み取り) を走らせる。
+    最後に harness を解放する — つまり **古い方が最後に書こうとする**。
+    直列化されていれば、古い方は新しい方より先に書き終えているか、新しい方が
+    そのあとで読み直すかのどちらかになり、最終形は done でなければならない。
+    """
+    sandbox.add_task("t001", "in_progress", [], worker="Ren")
+    assert sandbox.run("task-graph").returncode == 0
+    assert _by_id(sandbox.read_graph())[f"{MISSION}:t001"]["status"] == "running"
+
+    reached, go = tmp_path / "reached", tmp_path / "go"
+    plan = sandbox.root / "scripts" / "plan.sh"
+    stale = subprocess.Popen(
+        [sys.executable, str(HARNESS),
+         "--plan", str(plan), "--queue", str(sandbox.queue),
+         "--repo-root", str(sandbox.root),
+         "--reached", str(reached), "--go", str(go)],
+        env=sandbox.env(), stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, text=True,
+    )
+    newer = None
+    try:
+        # 古い側が queue を読み終え、publish の直前で止まった
+        _wait_for_file(reached, 10.0, "harness の到達印")
+
+        # 世界が進む: t001 が終わり、新しい読み取りが publish しに来る
+        sandbox.add_task("t001", "done", [])
+        newer = subprocess.Popen(
+            ["bash", str(plan), "task-graph"],
+            env=sandbox.env(), stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True,
+        )
+        try:
+            newer.wait(timeout=NEWER_PUBLISHER_GRACE)
+        except subprocess.TimeoutExpired:
+            pass  # 直列化されていれば、ここでロック待ちしているのが正しい
+    finally:
+        go.write_text("go")
+        out, err = stale.communicate(timeout=60)
+        assert stale.returncode == 0, f"harness が失敗した: {err or out}"
+        if newer is not None:
+            n_out, n_err = newer.communicate(timeout=60)
+            assert newer.returncode == 0, f"新しい側が失敗した: {n_err or n_out}"
+
+    status = _by_id(sandbox.read_graph())[f"{MISSION}:t001"]["status"]
+    assert status == "done", (
+        "古いスナップショットが新しい姿を上書きした "
+        f"(status={status!r}) — 次に queue を触る者が居なければ、この誤った "
+        "running は無期限に残る"
+    )
+
+
+def test_an_unwritable_destination_is_reported_as_a_failure_not_as_contention(sandbox):
+    """書き先が壊れているときの 1 行が、混雑ではなく失敗として出ること。
+
+    直列化のロックは生成物と同じディレクトリに作るので、書き先が壊れていると
+    「ロックを用意できない」が publish より先に起きる。これを「待ち切れなかった」
+    と同じ扱いに畳むと、operator が受け取る唯一の 1 行が嘘の診断になり、
+    存在しない混雑を追いかけることになる。
+    """
+    sandbox.add_task("t001", "pending", [])
+    blocker = sandbox.root / "blocker"
+    blocker.write_text("not a directory\n")
+    env = sandbox.env(CREWVIA_TASK_GRAPH_FILE=str(blocker / "tasks.json"))
+
+    r = sandbox.run("update", "t001", "--priority", "high", env=env)
+    assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
+    assert "生成に失敗しました" in r.stderr, (
+        f"書き先の失敗が失敗として出ていない: {r.stderr!r}"
+    )
+    assert "待ち切れ" not in r.stderr, (
+        f"書き先の失敗が publish の混雑として誤診されている: {r.stderr!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 5. 手動コマンドにも foreign-queue ガードが掛かること
+# ---------------------------------------------------------------------------
+
+def _foreign_queue(path: pathlib.Path, slug: str = "m-foreign") -> pathlib.Path:
+    """本体の registry とは無関係な、隔離テスト用の queue を 1 つ作る。"""
+    (path / "missions" / slug / "tasks").mkdir(parents=True)
+    (path / "archive").mkdir(parents=True)
+    (path / "missions" / slug / "mission.yaml").write_text(_mission_yaml(slug))
+    (path / "missions" / slug / "tasks" / "t001.md").write_text(
+        _task_md("t001", "pending", [])
+    )
+    (path / "state.yaml").write_text(
+        f"active_missions:\n  - {slug}\ndefault_mission: {slug}\n"
+    )
+    return path
+
+
+def test_manual_task_graph_refuses_a_foreign_queue(sandbox, tmp_path):
+    """`CREWVIA_QUEUE` だけ別に向けた手動実行が、本体の生成物を上書きしないこと。
+
+    自動経路 (maybe_refresh_task_graph) は既に守られているのに、手動の
+    `plan.sh task-graph` だけ素通りしていた。隔離 QA は本体の queue を汚さない
+    ために `CREWVIA_QUEUE` を付け替えて走るので、そこで 1 回叩かれるだけで
+    Director が見ているグラフがテスト用の queue に化ける。
+    """
+    sandbox.add_task("t001", "pending", [])
+    assert sandbox.run("task-graph").returncode == 0
+    before = sandbox.graph.read_bytes()
+
+    foreign = _foreign_queue(tmp_path / "foreign-queue")
+    r = sandbox.run("task-graph", env=sandbox.env(CREWVIA_QUEUE=str(foreign)))
+    assert r.returncode != 0, "隔離 queue からの手動生成が黙って通った"
+    assert sandbox.graph.read_bytes() == before, "隔離 queue が本体の生成物を上書きした"
+    assert "CREWVIA_TASK_GRAPH_FILE" in r.stderr, (
+        f"書き先の指定方法が案内されていない: {r.stderr!r}"
+    )
+
+
+def test_manual_task_graph_accepts_a_foreign_queue_with_an_explicit_destination(
+    sandbox, tmp_path
+):
+    """書き先を明示すれば、隔離 queue からの手動生成は通ること。
+
+    ガードが守るのは「本体の生成物」であって、隔離した実行そのものではない。
+    ここが塞がると、QA が自分の queue のグラフを目で見る手段が無くなる。
+    """
+    sandbox.add_task("t001", "pending", [])
+    assert sandbox.run("task-graph").returncode == 0
+    before = sandbox.graph.read_bytes()
+
+    foreign = _foreign_queue(tmp_path / "foreign-queue")
+    out = tmp_path / "explicit" / "tasks.json"
+    r = sandbox.run(
+        "task-graph",
+        env=sandbox.env(CREWVIA_QUEUE=str(foreign), CREWVIA_TASK_GRAPH_FILE=str(out)),
+    )
+    assert r.returncode == 0, r.stderr
+    assert "m-foreign:t001" in _by_id(json.loads(out.read_text()))
+    assert sandbox.graph.read_bytes() == before, "本体の生成物が巻き込まれた"

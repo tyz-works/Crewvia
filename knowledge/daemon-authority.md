@@ -1523,6 +1523,107 @@ env での上書きは `CREWVIA_DAEMON_<KEY 大文字>` (例: `CREWVIA_DAEMON_MU
 7-1 の二重起動である。stale 判定は respawn の入口にすぎず、そこから 4 の実在確認に
 進むのだから、余裕を取っても検知が遅れるだけで見落としにはならない。
 
+### 7-11. テストが本番の mux を掴む (t037, 2026-09-23 の本番障害)
+
+**約 4 時間半、本番の dispatcher が止まった。原因は t036 のテストである。**
+
+`restart` の CLI を実プロセスで検証する赤いテストが、本物の herdr・既定ワーク
+スペース `crewvia`・既定ペイン名 `dispatcher` を対象に走り、本番のペインを
+乗っ取った。ペインは pytest の一時ディレクトリを指すコマンドで置き換えられ、
+テスト終了後にそのディレクトリが消えて死亡。タブだけが残り (§7-3-1 の husk)、
+相互監視はまだ merge されていなかったので誰も気付かなかった。
+
+```
+cd /tmp/pytest-of-tkadmin/pytest-199/test_restart_cli_exits_nonzero0/crewvia \
+  && ... bash .../scripts/dispatcher.sh
+bash: /tmp/pytest-of-tkadmin/.../scripts/dispatcher.sh: No such file or directory
+```
+
+`--repo-root` は隔離されていた。隔離されていなかったのは**宛先**で、CLI は
+`Mux()` を周囲の環境変数から組み立てる。そして — ここが肝心だが —
+**赤いテストは定義上、欠陥のある破壊的経路を必ず通る**。「そのテストを直す」は
+対策にならない。隔離をテスト作者の記憶に預けてはいけない。
+
+防壁は 2 本立て、**別々の証拠**に立たせた。片方を破っても片方が残る
+(memory: fail-closed-guard-can-recreate-the-defect)。
+
+**(a) mux 層のテスト隔離** — テスト中かどうかを知っている側。
+
+| 変数 | 役割 |
+|---|---|
+| `CREWVIA_MUX_TEST_ISOLATION` | 「今はテスト中」の印。`tests/conftest.py` が `os.environ` に置くので **subprocess にも継承される** (事故で唯一欠けていたもの) |
+| `CREWVIA_MUX_PANE_PREFIX` | ペイン名の名前空間。**本番は空で完全な no-op**。テスト中は `spawn("dispatcher")` が `<prefix>dispatcher` に解決されるので、本番のペイン名そのものがテストから言えない |
+
+テスト中に、宛先が既定の `crewvia` のまま／接頭辞が空のまま、ペインを名指しする
+verb (`spawn` / `send` / `kill` / `pid` / `capture`) を呼ぶと
+`MuxTestIsolationError`。**実行前に**投げるので「何も起きなかった」まで保証する。
+CLI は traceback ではなく 1 行で断り exit 3。
+
+読み取り (`pid` / `capture`) も塞いでいるのは、それが破壊を**認可する**ステップ
+だからである (`restart()` はペインの pid を見て kill してよいかを決める)。規則は
+単純に「テストは本番のペインを**名指しできない**」。`list()` は名前を取らないので
+開けてあり、代わりに結果から名前空間を剥がす。
+
+**(b) repo identity ガード** — テストかどうかを知らない側。§7-1 の `repo_identity_ok()`
+が「自分に checkout があるか」を問うのに対し、`pane_daemon_owner()` は反対側、
+**そのペインで走っているのは誰のデーモンか**を `/proc` で問う。
+
+| 答え | 意味 | kill |
+|---|---|---|
+| `mine` | ペインの配下で `<repo_root>/scripts/<script>` が走っている | 通す |
+| `none` | それらしいものが居ない (husk / 新しいペイン) | 通す — §7-3-1 の復旧経路 |
+| `foreign` | **別チェックアウト**の同じスクリプトが走っている | 断る |
+| `unknown` | ペインの pid か `/proc` が読めない | 断る |
+
+`unknown` を通すと、このガードは「読めるときだけ効く」ものになる。本番が壊れるのは
+たいてい読めないときなので、それでは意味が無い。ただし fail-closed に出口を付ける
+(memory: fail-closed-discard-vs-hold): `restart --force` が操作者の逃げ道である。
+
+一台のマシンに crewvia の checkout が 2 つある (QA 用 worktree、2 つ目の WSL、
+herdr の古い env) のはこの repo の**普通の状態**なので、(b) は誰も何も宣言して
+いない本番同士の誤射にも効く。
+
+回帰: `tests/test_mux_production_safety.py`。事故の形そのもの
+(pytest → subprocess → CLI → 本番を指す env) を記録専用の tmux スタブで再現し、
+欠陥を戻すと `kill-window -t crewvia:dispatcher` が記録されて赤くなる。
+bats は python の import 層を通らずガードが効かないので、**PATH に置いた偽
+tmux / herdr** が唯一の隔離になる。その対応関係も
+`test_every_bats_suite_that_can_reach_the_mux_installs_a_path_stub` で固定した。
+
+### 7-12. 「わからない」を Yes/No に潰さない (t037, Codex 2 巡目)
+
+§7-3 で `/proc` 走査について書いた「見られなかったは居なかったではない」は、
+同じ形の欠陥がこの PR の中にあと 3 つあった。3 つとも**同じ述語に正反対の
+安全側を求めている**のが正体である。
+
+1. **`read_pause()`** — 不在・EISDIR・壊れた JSON を全部 `None` にしていた。
+   `_decide()` はそれを「停止マーカーは無い」と読み、**maintenance の真っ最中に
+   respawn** できた。`read_pause_state()` が `absent` / `active` / `unreadable`
+   を返し、`FileNotFoundError` だけが不在の証拠。読めなければ hold。
+
+2. **`_pane_has_live_process()`** — 読めなければ `True`。「ここに起こしていいか」
+   (占有判定) には正しいが、`_wait_until_launched()` の「起動したか」には正反対で、
+   コマンドが飲まれたうえにペイン照会も失敗すると **spawn が即座に成功を報告**し、
+   猶予と flap カウントを消費して検証していない復旧を宣言していた。
+   `PANE_IDLE` / `PANE_LIVE` / `PANE_UNKNOWN` の 3 値にし、占有判定は unknown を
+   busy に、起動確認は unknown を not-started に倒す。`_pane_shell_is_idle()` は
+   `state == PANE_IDLE` の wrapper なので、答えは 3 値化の前後で完全に一致する。
+
+3. **`resume()`** — ロックの外で「読む → token 照合 → unlink」をやっていた。
+   1 と 3 の間に別の maintenance がマーカーを差し替えると、**照合した token と
+   消したファイルが別物**になり、実行中の maintenance の保護が外れる。§7-10 の
+   ロックに入れた。取れなければ `False` — 直列化できないなら保護は外さない。
+
+おまけで **`spawn_command()` のクォート漏れ**。env の値だけクォートして
+`repo_root` とスクリプトパスを生で `'...'` に埋めていたので、`/home/o'brien/`
+の checkout でクォートが閉じ、**続くメタ文字がコマンドとして走る**。危険なのが
+「悪意ある入力」ではなく**ただの人名**だったのが教訓で、全ての補間を
+`_sh_single_quote()` に通した。
+
+回帰: `tests/test_daemon_watch_failclosed.py`。4 番の赤は
+`cd: .../obrien; touch PWNED; /crewvi...: No such file or directory` と出て、
+パスがクォートを破ったことがそのまま読める。
+
 ### 7-9. 回帰テストの形
 
 `tests/test_daemon_mutual_watch.py`。観測の口 (`mux` / `/proc` 走査 / 時計 /

@@ -58,6 +58,31 @@ tail -3 logs/dispatcher/dispatcher-$(date +%Y%m%d).log
 python3 scripts/lib_daemon_watch.py status
 ```
 
+### restart が「このペインは自分のものではない」と断ったとき (t037)
+
+```
+[daemon-watch] restart dispatcher: refused — the pane is not this checkout's
+to end (foreign: pid 12345 runs /other/crewvia/scripts/dispatcher.sh,
+not /path/to/crewvia/scripts/dispatcher.sh). Nothing was killed.
+Pass --force to override.
+```
+
+kill する前に、**そのペインで走っているのが自分の checkout のデーモンか**を
+`/proc` で確かめている (`daemon-authority.md` §7-11)。断られる理由は 2 つ:
+
+- `foreign` — 別 checkout の同じデーモンが入っている。**まず自分がどこに居るか
+  を疑うこと**。worktree から叩いていないか、herdr の古い env を引きずって
+  いないかを見る (`CREWVIA_HERDR_WORKSPACE` / `CREWVIA_TMUX_SESSION`)。本当に
+  そのペインを引き取りたいなら `--force`。
+- `unknown` — ペインの pid か `/proc` が読めない。再実行で直ることが多い。
+  直らなければ `--force`。
+
+```bash
+python3 scripts/lib_daemon_watch.py restart dispatcher --force
+```
+
+`--force` はこの確認だけを飛ばす。pause マーカーもロックも従来どおり効く。
+
 ### watchdog の restart 例
 
 ```bash

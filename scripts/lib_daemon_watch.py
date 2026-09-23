@@ -86,7 +86,11 @@ CLI:
   python3 scripts/lib_daemon_watch.py status
   python3 scripts/lib_daemon_watch.py pause <name> [--reason R]
   python3 scripts/lib_daemon_watch.py resume <name> [--token T] [--force]
-  python3 scripts/lib_daemon_watch.py restart <name>
+  python3 scripts/lib_daemon_watch.py restart <name> [--force]
+
+restart は kill の前に「そのペインで走っているのが自分の checkout のデーモンか」を
+/proc で確かめる (t037 / §7-11)。別 checkout のもの (foreign)・読めない (unknown)
+なら何もせず非ゼロで終わる。--force がその確認だけを飛ばす操作者の逃げ道。
 """
 
 from __future__ import annotations

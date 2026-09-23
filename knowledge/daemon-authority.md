@@ -1167,7 +1167,834 @@ Worker は**既に死んでいる**ので、届かなければ task が in_progr
 
 ---
 
-## 7. 参照
+## 7. 相互監視 — heartbeat / respawn / 自己申告 (t005, 2026-09-22)
+
+§1 で述べた「両者は互いの存在を一切知らない」を、ここで閉じる。
+外部 supervisor (pm2 等) は使わない (ユーザー決定 2026-09-21。node 依存を増やさず、
+設計原則の *mux 非依存 / Taskvia 非依存* と揃えるため)。残る手段は互いを見ることだけで、
+dispatcher と watchdog が 2 サイクルの輪をなす。どちらも特権を持たないので、
+「監視役が死んだら仕組み全体が止まる」という単一障害点ができない。
+
+実装は `scripts/lib_daemon_watch.py` (判定・respawn・報告) と
+`scripts/lib_daemon_watch.sh` (dispatcher の heartbeat 書き出し) の 2 本。
+
+### 7-1. 何が一番まずいのかを先に決める
+
+相互監視が救う障害は「デーモンが止まって誰も気付かない」であり、
+相互監視が新しく作りうる障害は「**生きているデーモンの隣にもう 1 つ起動する**」である。
+後者の方がはるかに重い: dispatcher が 2 つになると同じ task を 2 人の Worker に配り、
+watchdog が 2 つになると同じ retirement を 2 系統が進める (§5-2 の同名別インスタンス
+誤 kill が、今度はデーモン側で起きる)。
+
+したがって判定は常に **fail closed = 確証が無ければ respawn しない**。倒れる方向は
+「起こし損ねる」側であって「起こしすぎる」側ではない。§5-1 (居座り) と §5-2 (誤 kill)
+の選択と同じ向きである。
+
+### 7-2. 生存の書き手を、生きているプロセスに合わせる
+
+| デーモン | 実際に生き続けるプロセス | heartbeat の書き手 | 周期 |
+|---|---|---|---|
+| dispatcher | main loop を回す **bash** (python3 は 1 サイクルごとに使い捨て) | `lib_daemon_watch.sh` の `daemon_beat` (bash) | 5s |
+| watchdog | `watchdog.py` そのもの | `DaemonWatch.beat()` (python) | 30s |
+
+dispatcher の heartbeat を bash から書くのには 2 つ理由がある。
+
+1. **相手が probe すべき PID は bash の `$$` である。** python は毎サイクル別 PID に
+   なるので、記録しても次の cycle には存在しない。
+2. **dispatch サイクルの成否から独立させる必要がある。** python 側が毎回例外で落ちる
+   状態 (壊れた card、中途半端な deploy) では bash ループは元気に回り続けているのに
+   heartbeat だけが止まる。相手から見ると「生きているのに死んで見える」＝ respawn ＝
+   dispatcher が 2 つ、という 7-1 の最悪ケースそのものになる。そのため
+   `daemon_beat` は main loop の **先頭で無条件に** 呼び、`run_dispatch` と
+   `&&` で繋がない (回帰: `test_dispatcher_beats_independently_of_the_dispatch_cycle`)。
+
+watchdog 側の穴は `graceful_terminate()` である。ここは send → **60s 待機** →
+SIGTERM → **10s 待機** → SIGKILL の間、main loop を最大 70 秒ブロックする (§4-1)。
+1 cycle に 1 回しか書かない実装だと、**Worker を終了させるたびに watchdog 自身が
+死んで見える**。よって両方の待機ループの中でも `_beat()` を呼ぶ
+(回帰: `test_watchdog_beats_inside_the_blocking_terminate_wait`)。
+`watchdog_stale_seconds` の既定 240s も、この 70s を跨いでなお余裕が残る値として選んだ。
+
+置き場は `registry/daemons/` で、Worker 用の `registry/heartbeats/` とは分ける。
+後者は **エージェント名** をキーに D4 (vanished worker 検知) が走査するので、
+そこに `watchdog` というファイルを置くと「watchdog という名前の Worker」に見える。
+
+### 7-3. 死亡と判定する条件 — 証拠の強度で並べる
+
+以下を **すべて** 満たしたときだけ respawn する。1 つでも欠ければ保留 (hold)。
+
+| # | 条件 | 満たせない時の読み |
+|---|---|---|
+| 0 | 相互監視が有効 / 自分の checkout が本物 (`repo_identity_ok`) | `refused` |
+| 1 | 停止マーカー `<name>.paused` が無い | `paused` (§7-5) |
+| 2 | 直前の respawn から `respawn_grace_seconds` 経過 | `grace` |
+| 3 | heartbeat が stale、または最初から無い | `healthy` |
+| 4 | **プロセスが存在しない** | `hold` |
+| 5 | flap しきい値未満 | `flapping` (§7-6) |
+
+**生死の証拠は 4 だけ**である。タブの有無は条件に入らない (理由は §7-3-1)。
+
+**4 — プロセス (唯一の証拠).** 2 つの独立した probe を使い、どちらか一方でも「生きている」と
+答えたら respawn しない。
+
+- 記録 PID を **世代ごと** 照合する (`instance_alive()`)。PID は再利用されるので、
+  番号が存在することは同じデーモンである証拠にならない。`/proc/<pid>/stat` の
+  22 番目 (starttime) を `generation` として heartbeat に書き、両方一致したときだけ
+  「生きている」と読む。これは §5-2 の「名前は同じでも中身は別物」を PID の層で
+  繰り返さないためで、bash 側と python 側が同じ数え方をしていることは実プロセスに対して
+  検証してある (`test_bash_written_heartbeat_is_readable_by_python` + 隔離 smoke)。
+- `/proc` を絶対パスで走査する (`scan_daemon_pids()`)。needle は
+  `<repo_root>/scripts/dispatcher.sh` のような**絶対パス**で、`dispatcher.sh` という
+  名前ではない。名前で照合すると、隔離 QA 用の worktree で動かしたデーモンが本番の
+  デーモンに見えてしまう (逆も同じ)。走査そのものが失敗したら `None` を返し、
+  **`[]` (見たが居なかった) と区別する**。
+
+この probe を主証拠に置くのは、**カーネルが mux backend を介さずに答える**からである。
+バックエンドの不調から独立している唯一の信号がこれしかない。
+
+### 7-3-1. タブの名前を生存の証拠に使わない (t035 / t006 QA FAIL-1 の差し戻し)
+
+当初は 4 に加えて「**権威ある窓一覧に名前が無い**」を必要条件にしていた
+(`mux.list()` は両 backend とも失敗を黙って `[]` に変換するので、空でない一覧だけを
+権威として扱う、という §6-3 (1) と同じ形)。**この条件が本番では永久に満たされない。**
+
+`start.sh` も `TmuxBackend.spawn` も `HerdrBackend.spawn` も、**pane にシェルを置いて
+そこへコマンドを流し込む**。だからデーモンは pane シェルの子であり、デーモンが落ちても
+シェルは生き残り、pane は label を保ったまま残る (= husk)。本番実測:
+
+    pid 1770898 = dispatcher → PPid 1769235 = /bin/bash → PPPid 1769218 = herdr server
+    pid  719042 = watchdog   → PPid  718789 = /bin/bash → PPPid 1769218 = herdr server
+
+`HerdrBackend.list()` は pane の label を**生死を見ずに**返す。つまり名前は常に在り、
+判定は必ず husk 分岐へ落ちる。t006 QA は隔離環境でこれを実測した: プロセスだけを
+kill した 4 分間、respawn は **0 回**、Director に届くのも既定 1800 秒後の
+「自動 respawn は安全側で止めています」= 人を呼ぶ 1 通だけだった。
+タブごと消した場合だけ設計どおり動く。
+
+husk を「herdr サーバー再起動時に残る稀な状態」と見積もっていたのが誤りで、
+**husk はあらゆるクラッシュの通常形**である。fail closed の向き自体は正しいが、
+この条件では相互監視の主目的 (片系が落ちたら起こし直す) が一度も発火しない。
+「起こしすぎない」ために「一度も起こさない」になっていた。
+
+**決定: 窓一覧を判定から外し、プロセス層を唯一の生死の証拠にする。**
+窓一覧は respawn の宛先を決めるためだけに使う。
+
+二重起動への最後の防壁は、名前の有無ではなく **その pane の中身の生死** に移した。
+`mux.spawn()` が既存 pane を見つけたとき:
+
+| backend | husk の判別 | husk だった場合 |
+|---|---|---|
+| herdr | `pane process-info` の foreground_processes が idle shell だけか (`_is_idle_shell_process`) | その pane で `pane run` して True |
+| tmux | pane シェルの pid (`#{pane_pid}`) から `/proc` を読み、**シェルであり、生きた子を持たない**か (`_pane_shell_is_idle`) | その窓へ send-keys して True |
+
+どちらも読めなければ「使用中」に倒す (= spawn は False)。名前より強い証拠であり、
+backend 間で強さが揃う。tmux 側は t035 で足した — それまでは tmux の spawn が
+「窓が在る」だけで無条件に False を返しており、husk を認めても tmux では何も
+起きなかった。
+
+`available()` / `server_running()` による救済は **あえて入れていない**。どちらも
+タイムアウトや例外で False を返すので、1 つの障害が両方を倒し、2 つの失敗が互いを
+補強して「相手は死んだ」の権威になってしまう。それは §6-3 (1) で塞いだ欠陥を
+1 層下で再生産することである (memory: `fail-closed-guard-can-recreate-the-defect`)。
+
+回帰は**実プロセスでしか置けない**。偽の mux は spawn 後に窓を消すか残すかを
+テスト側が決められるので、この欠陥をテスト自身が隠せる。
+`tests/test_daemon_husk_respawn.py` は実 tmux 窓で stub デーモンを起こし、
+**プロセスだけ** を SIGKILL して窓が残っていることを確認したうえで 1 cycle を回す。
+判定表側の双子は `test_a_husk_tab_does_not_veto_the_respawn` と
+`test_a_refused_spawn_holds_instead_of_claiming_a_respawn`。
+
+#### 7-3-2. 「子が無いシェル」は「プロンプトに居るシェル」ではない (t036)
+
+t035 の husk 判別は **comm がシェルで、生きた子が居ない** の 2 つだけを見ていた。
+これは緩すぎる。次はどれもシェルで、どれも子を持たず、どれも仕事中である:
+
+    bash script.sh          builtin だけで完結するスクリプト
+    bash -c 'while :; …'    同じものの短い形
+    bash < pipe             端末ではない入力を読んでいる非対話シェル
+
+ここへ launch コマンドを送り込んでも デーモンは起動しない。最悪の場合、走っている
+処理が**それを入力として食う**。よって idle は「仮定する」ものではなく「示す」もの
+とし、`_pane_shell_is_idle()` は 6 点すべてを要求する: シェルであること / **引数
+無しで起動された** こと (`bash script.sh` も `bash -c` もここで落ちる) / 制御端末が
+あること / **自分のプロセスグループがその端末の前景** であること / state が S
+(builtin ループは R で回る) / 生きた子が 1 つも無いこと。
+
+それでも残る穴が 1 つある。**対話シェルが `read` で止まっている状態は、プロンプトで
+止まっている状態と /proc 上で完全に同一** である (state も argv も tpgid も同じ)。
+区別が付かない以上、判定層では閉じられない。閉じるのは 1 層上で、
+`spawn()` が husk へ相乗りしたときだけ**送った後に「本当に何か走り出したか」を
+pane に問い直す** (`_wait_until_launched`, 既定 10 秒)。走っていなければ spawn は
+False を返し、相互監視は respawn を記録せず hold する。これが無いと、コマンドを
+食われた 1 回が「成功した respawn」として grace と flap 枠を消費する。
+
+回帰は実プロセス:
+`tests/test_daemon_husk_respawn.py::test_a_shell_running_a_script_is_not_idle` ほか
+と、実 tmux で `read` 中のペインへ spawn する
+`test_spawn_does_not_claim_success_when_the_pane_swallows_the_command`。
+逆側 (本物の husk は idle のままで respawn できる) は
+`test_a_real_interactive_shell_at_its_prompt_is_idle` が固定している。
+
+#### 7-3-3. 読めなかった /proc エントリは「不在」ではない (t036)
+
+`scan_daemon_pids()` は `cmdline` の OSError をすべて「終了した」として skip して
+いた。権限エラーや読み取り失敗は不在の証明ではないのに、**不完全な走査が
+「何も走っていない」として respawn の条件を満たしてしまう**。`_live_children()` も
+同じ前提で、読めない stat があると「子が居ない」= 空いている pane と答えていた。
+
+分けるのは errno で、**ENOENT / ESRCH だけが「本当に居ない」**。走査中にプロセスが
+終わるのは日常なのでこれを不明扱いにすると respawn が二度と起きない (過剰修正)。
+それ以外は 1 件でも出たら走査全体を `None` (= 保留) にする。`hidepid` のマシンでは
+毎回 hold になるが、それが正しい倒れ方であり、出口は §7-4 の 30 分報告である。
+
+### 7-4. 保留には必ず出口を付ける
+
+上の表の `hold` はどれも「次の cycle でもう一度見る」であり、一過性の原因
+(バックエンドが復帰する、詰まったデーモンが死ぬ) には正しく効く。効かないのは
+永久に解けない組み合わせで、そこで黙ると**無音の故障**になる。
+
+そこで `hold_report_after_seconds` (既定 1800) を超えた保留は Director に
+**1 度だけ** 報告する。自動で解消はしない — ここで採れる自動の解消手段は respawn しか
+なく、それが 7-1 の危険な向きだからである (memory: `fail-closed-discard-vs-hold`)。
+
+報告は**届くまで再試行する**。`mux.send()` の戻り値を見ないと「Director に伝えた」が
+偽のまま真に見え、それは障害が残す唯一の痕跡を消すことになる。未達の報告は
+`registry/daemons/<self>.reports.json` に積み、毎 cycle の先頭で再送する
+(§6-8 (2) と同じ形)。届いた報告は `delivered` 台帳に移り、二度と送られない。
+
+### 7-5. 意図的な停止 — maintenance マーカー
+
+運用で実際に打つ復旧手順は「kill してから spawn」である。この**隙間でデーモンは
+本当に死んでいる**ので、そこを見た相手が respawn するのは正しく、その 1 秒後に手で
+打った spawn が上に乗る = 二重起動になる。
+
+`registry/daemons/<name>.paused` がある間は respawn しない。順序が効くので、
+`restart()` は **lock → pause → kill → spawn → resume** で実行する (kill を先に
+すると上記の隙間が開いたままになる。回帰:
+`test_restart_helper_locks_then_pauses_then_kills`)。先頭のロックが §7-10、
+その次の pause が**成功したときだけ**先へ進むのが次の段落である。
+
+**マーカーが disk に残っていなければ、破壊的ステップに進んではいけない (t036)。**
+`pause()` は `write_json_atomic()` の戻り値を見たうえで**読み直して token が
+一致すること**まで確かめ、駄目なら `None` を返す。書けなかったのに token を返すのは
+「保護がある」という嘘で、その嘘の直後に kill が走る。`restart()` は `None` を見たら
+**何も kill せずに** False を返し、CLI の `pause` も非ゼロで終わる (回帰:
+`test_restart_does_not_kill_when_the_pause_marker_cannot_be_persisted` /
+`test_pause_cli_exits_nonzero_when_the_marker_cannot_be_persisted`)。
+
+マーカーは `token` で **その restart 実行に束縛** する。名前だけで束縛すると、
+重なった 2 回の restart のうち先に終わった方の `resume` が、まだ作業中の方の保護を
+外してしまう — これも「名前は識別子ではない」の一例である。
+
+マーカーは**古くなっても自動では外さない**。「古い」は「作業が終わった」の証拠では
+なく、作業途中の相手を起こすのは二重起動だからである。代わりに
+`pause_report_after_seconds` を超えたら Director に 1 度だけ報告する。
+
+    # 手動の restart (推奨)
+    python3 scripts/lib_daemon_watch.py restart dispatcher
+
+    # 状態確認
+    python3 scripts/lib_daemon_watch.py status
+
+    # 手で pause/resume する場合 (token を控えること)
+    python3 scripts/lib_daemon_watch.py pause watchdog --reason "PR #NNN 反映"
+    python3 scripts/lib_daemon_watch.py resume watchdog --token <token>
+
+§5-3 の「両デーモンを同時に停止 → 両方 respawn」を手で行う場合は、**先に両方を
+pause してから** kill すること。片方だけ pause して kill すると、生きている側が
+死んだ側を起こす。
+
+### 7-6. flap ガード
+
+起動直後に落ちるデーモンを延々と起こし続けても復旧はしないし、ログだけが流れる。
+`flap_window_seconds` (既定 900) の中で `flap_threshold` (既定 3) 回に達したら
+自動 respawn をやめ、Director に**対応を求める**通知に格上げする (他の報告が
+「対応は不要です」で終わるのと対照的に、これは人を呼ぶ)。
+
+カウンタは名前ではなく**どのインスタンスを置き換えたか** (`replaced_generation`) を
+記録する。単なる回数は「同じ死体を 3 回起こした」(本物の flap) と「3 世代が健全に
+入れ替わった」を区別できない。窓はローリングで、ラッチではない — 1 時間前に荒れた
+デーモンが今日も起こせないのは行き過ぎである。
+
+### 7-7. 起動コマンドの単一の出どころ
+
+respawn のコマンドは `spawn_command()` が唯一の出どころで、`start.sh` も
+`lib_daemon_watch.py spawn <name>` (= ロックを取ってから `spawn_command()` で
+起動する経路) を呼んでこれを使う (回帰: `test_respawn_command_matches_start_sh` /
+`test_start_sh_launches_the_daemons_through_the_locked_path`)。
+
+同じ文字列を 2 箇所に置くと、**どちらの backend と話すかを決める変数だけが片方に無い**
+という形でずれる。`Mux.spawn()` の `env=` 引数は **両 backend とも無視する** ので、
+env はコマンド文字列に埋め込むしかなく (memory: `lib-mux-spawn-env-arg-ignored`)、
+herdr はさらにサーバー起動時の env を全ペインに継承するため、「./crewvia で起動した
+デーモン」と「相手に起こされたデーモン」が別の backend を向く事故が現実に起こりうる。
+
+運ぶのは `CREWVIA_MUX` だけでは足りない。**backend (どう話すか) と宛先 (どこと話すか)
+は別**で、`CREWVIA_TMUX_SESSION` / `CREWVIA_HERDR_WORKSPACE` が落ちると、起こされた
+デーモンは既定のセッション名にフォールバックし、`list()` が存在しないセッションを
+引いて空で返り、**相互監視が無言で恒久 hold に縮退する**。t006 QA が隔離環境で実際に
+踏んだ (`CREWVIA_MUX=tmux` だけが env に入り `tmux list-windows -t crewvia` が失敗)。
+本番は既定名なので露見しない = 既定以外を使い始めた瞬間に静かに壊れる形だった。
+`_SPAWN_ENV_VARS` に並べ、値は必ず単一引用で囲って **データとして** 渡す
+(回帰: `test_spawn_command_carries_the_mux_destination_too` /
+`test_spawn_command_quotes_a_hostile_session_name`)。
+
+#### 何を引き継ぎ、何を引き継がないか (t036)
+
+mux の 3 変数だけでは足りない。起こし直されたデーモンが**別の設定で動く**なら、
+それは復旧ではなく「同じ名前の別のデーモン」を起動したことになる。運ぶのは
+**非機密の運用上書き** に限った allowlist:
+
+| 群 | 変数 | 落としたときに起きること |
+|---|---|---|
+| mux | `CREWVIA_MUX` / `CREWVIA_MUX_ENABLED` / `CREWVIA_TMUX_SESSION` / `CREWVIA_HERDR_WORKSPACE` / `CREWVIA_HERDR_SOCK` | 別の backend・別のセッションを向き、相互監視が無言で hold に縮退する |
+| 運用 | `CREWVIA_QUEUE` / `CREWVIA_KILL_AUTHORITY` / `CREWVIA_TASKVIA` / `CREWVIA_PROJECT` / `CREWVIA_NOTIFY_CACHE` / `CREWVIA_SPAWN_GRACE` / `CREWVIA_STATE_GRACE` / `CREWVIA_BENCH_MODE` | **別の queue を割り当て始める**。kill 権限が dispatcher と watchdog で食い違う (§5 が「どちらに倒しても必ず壊れる」と書いている状態)。隔離 QA のデーモンが本番の notify cache に戻る |
+| 相互監視 | `CREWVIA_DAEMON_*` (§7-8 の全キー) | 起こされた側だけ既定しきい値に戻り、緩めた側を stale と読んで起こし返す = 相互監視が自分で flap を作る |
+
+**運ばないもの** — `TASKVIA_TOKEN` / `NTFY_PASS` / `NTFY_USER` などの機密、
+`AGENT_NAME` / `TASK_ID` などの Worker 固有値、`HERDR_ENV` / `TMUX` などの mux 内部値。
+コマンド文字列は `ps` にもペインの履歴にも mux のログにも残るので、**機密を埋め込む
+のは漏洩**である。機密は今まで通りペインが作られる env 経由で渡り、無ければ
+Taskvia 同期が落ちるだけ (= 安全側) に縮退する。`os.environ` を丸ごと運ぶ「素朴な
+修正」は、この漏洩と、herdr server の古い env を引きずる既知の罠
+(memory: `herdr-server-stale-env-inheritance`) を同時に踏む。
+
+allowlist は**推移的**に効く: これらはデーモン自身の env に export されるので、
+そのデーモンが後で相手を起こすときにも同じ値が乗る。
+(回帰: `test_spawn_command_carries_the_operational_overrides` /
+`test_spawn_command_carries_the_mutual_watch_settings` /
+`test_spawn_command_does_not_carry_secrets`)
+
+### 7-8. しきい値 (`config/crewvia.yaml` の `daemons:`)
+
+| キー | 既定 | 意味 |
+|---|---|---|
+| `mutual_watch` | `true` | 相互監視そのものの ON/OFF |
+| `dispatcher_stale_seconds` | 60 | 5s 周期の 12 サイクル分 |
+| `watchdog_stale_seconds` | 240 | 30s 周期の 8 サイクル分、かつ 70s ブロックを跨げる値 |
+| `respawn_grace_seconds` | 120 | respawn 直後、まだ heartbeat を書いていない間は判定しない |
+| `flap_window_seconds` / `flap_threshold` | 900 / 3 | §7-6 |
+| `hold_report_after_seconds` | 1800 | §7-4 |
+| `pause_report_after_seconds` | 1800 | §7-5 |
+| `watch_lock_timeout_seconds` | 2 | §7-10。watch 側は短く — 取れなければ保留するだけ |
+| `maintenance_lock_timeout_seconds` | 60 | §7-10。人が待っている操作なので進行中の判定に並ぶ |
+
+env での上書きは `CREWVIA_DAEMON_<KEY 大文字>` (例: `CREWVIA_DAEMON_MUTUAL_WATCH=0`)。
+
+### 7-10. 決定を直列化する — マーカーだけでは閉じない (t036, 2026-09-23)
+
+§7-5 のマーカーは「意図的な停止」を**伝える**手段であって、判定と maintenance を
+**排他にする**手段ではなかった。実際の壊れ方:
+
+    watcher  : マーカーを読む → 無い
+    operator : マーカーを書く → peer を kill
+    watcher  : そのまま spawn            ← 手動 spawn と並んで 2 つ起動する
+
+読んだ瞬間と spawn する瞬間は別の瞬間で、その間に何でも起こる。両 backend の
+「既にあるか見てから作る」も 2 段階なので排他にはならない (spawn の拒否は最後の
+防壁であって相互排除ではない)。PR #205 が 6 巡かけて学んだ
+**「決定は、書き込む瞬間が直列化されていて初めて決定になる」** と同型である。
+
+したがって **デーモン 1 つにつき 1 つのロック** (`registry/daemons/<name>.lock`、
+`flock`) を置き、次の 3 つを同じロックで囲う:
+
+1. watch の判定全体 — マーカーの読み → 生死の判定 → spawn → 記録 (`DaemonWatch._decide`)
+2. maintenance — `pause` → kill → spawn → `resume` (`restart()`, `pause()`)
+3. 起動そのもの — `./crewvia` (`spawn_daemon()` / CLI `spawn`)
+
+3 を入れるのが肝心で、**起動主体は 3 つある**。2 つだけ囲っても、相手が respawn を
+決めた直後に人が `./crewvia` を叩けば同じ二重起動になる。
+
+マーカーファイルではなく `flock` なのは、**保持者が死ねばカーネルが外す**からである。
+クラッシュした restart が残したロックが居座ると相互監視が恒久的に止まり、それは
+まさにマーカーの stale 報告が拾おうとしている故障そのものになる。
+
+ロックが取れなかった側は**必ず何もしない**: watch は 1 サイクル hold (次の周期で
+また見る)、maintenance と launcher は非ゼロで終わる。ロックファイルすら作れない
+環境も同じ扱い — 直列化できないなら破壊的なことをする資格が無い。
+
+回帰: `tests/test_daemon_watch_hardening.py` の §1
+(`test_a_restart_in_progress_stops_the_watcher_from_spawning` /
+`test_the_decision_and_the_spawn_happen_under_one_lock` /
+`test_a_pause_cannot_slip_in_while_a_decision_is_in_flight` /
+`test_the_launcher_also_starts_daemons_under_the_lock`)。
+
+**しきい値を詰めすぎないこと。** 1 回遅いサイクルが「死亡」に見えた瞬間、それは
+7-1 の二重起動である。stale 判定は respawn の入口にすぎず、そこから 4 の実在確認に
+進むのだから、余裕を取っても検知が遅れるだけで見落としにはならない。
+
+### 7-11. テストが本番の mux を掴む (t037, 2026-09-23 の本番障害)
+
+**約 4 時間半、本番の dispatcher が止まった。原因は t036 のテストである。**
+
+`restart` の CLI を実プロセスで検証する赤いテストが、本物の herdr・既定ワーク
+スペース `crewvia`・既定ペイン名 `dispatcher` を対象に走り、本番のペインを
+乗っ取った。ペインは pytest の一時ディレクトリを指すコマンドで置き換えられ、
+テスト終了後にそのディレクトリが消えて死亡。タブだけが残り (§7-3-1 の husk)、
+相互監視はまだ merge されていなかったので誰も気付かなかった。
+
+```
+cd /tmp/pytest-of-tkadmin/pytest-199/test_restart_cli_exits_nonzero0/crewvia \
+  && ... bash .../scripts/dispatcher.sh
+bash: /tmp/pytest-of-tkadmin/.../scripts/dispatcher.sh: No such file or directory
+```
+
+`--repo-root` は隔離されていた。隔離されていなかったのは**宛先**で、CLI は
+`Mux()` を周囲の環境変数から組み立てる。そして — ここが肝心だが —
+**赤いテストは定義上、欠陥のある破壊的経路を必ず通る**。「そのテストを直す」は
+対策にならない。隔離をテスト作者の記憶に預けてはいけない。
+
+防壁は 2 本立て、**別々の証拠**に立たせた。片方を破っても片方が残る
+(memory: fail-closed-guard-can-recreate-the-defect)。
+
+**(a) mux 層のテスト隔離** — テスト中かどうかを知っている側。
+
+| 変数 | 役割 |
+|---|---|
+| `CREWVIA_MUX_TEST_ISOLATION` | 「今はテスト中」の印。`tests/conftest.py` が `os.environ` に置くので **subprocess にも継承される** (事故で唯一欠けていたもの) |
+| `CREWVIA_MUX_PANE_PREFIX` | ペイン名の名前空間。**本番は空で完全な no-op**。テスト中は `spawn("dispatcher")` が `<prefix>dispatcher` に解決されるので、本番のペイン名そのものがテストから言えない |
+
+テスト中に、宛先が既定の `crewvia` のまま／接頭辞が空のまま、ペインを名指しする
+verb (`spawn` / `send` / `kill` / `pid` / `capture`) を呼ぶと
+`MuxTestIsolationError`。**実行前に**投げるので「何も起きなかった」まで保証する。
+CLI は traceback ではなく 1 行で断り exit 3。
+
+読み取り (`pid` / `capture`) も塞いでいるのは、それが破壊を**認可する**ステップ
+だからである (`restart()` はペインの pid を見て kill してよいかを決める)。規則は
+単純に「テストは本番のペインを**名指しできない**」。`list()` は名前を取らないので
+開けてあり、代わりに結果から名前空間を剥がす。
+
+**(b) repo identity ガード** — テストかどうかを知らない側。§7-1 の `repo_identity_ok()`
+が「自分に checkout があるか」を問うのに対し、`pane_daemon_owner()` は反対側、
+**そのペインで走っているのは誰のデーモンか**を `/proc` で問う。
+
+| 答え | 意味 | kill |
+|---|---|---|
+| `mine` | ペインの配下で `<repo_root>/scripts/<script>` が走っている | 通す |
+| `none` | それらしいものが居ない (husk / 新しいペイン) | 通す — §7-3-1 の復旧経路 |
+| `foreign` | **別チェックアウト**の同じスクリプトが走っている | 断る |
+| `unknown` | ペインの pid か `/proc` が読めない | 断る |
+
+`unknown` を通すと、このガードは「読めるときだけ効く」ものになる。本番が壊れるのは
+たいてい読めないときなので、それでは意味が無い。ただし fail-closed に出口を付ける
+(memory: fail-closed-discard-vs-hold): `restart --force` が操作者の逃げ道である。
+
+一台のマシンに crewvia の checkout が 2 つある (QA 用 worktree、2 つ目の WSL、
+herdr の古い env) のはこの repo の**普通の状態**なので、(b) は誰も何も宣言して
+いない本番同士の誤射にも効く。
+
+回帰: `tests/test_mux_production_safety.py`。事故の形そのもの
+(pytest → subprocess → CLI → 本番を指す env) を記録専用の tmux スタブで再現し、
+欠陥を戻すと `kill-window -t crewvia:dispatcher` が記録されて赤くなる。
+bats は python の import 層を通らずガードが効かないので、**PATH に置いた偽
+tmux / herdr** が唯一の隔離になる。その対応関係も
+`test_every_bats_suite_that_can_reach_the_mux_installs_a_path_stub` で固定した。
+
+### 7-11-1. 境界を「呼ぶ側の env」から「対象の identity」へ移す (t038, Codex 3 巡目)
+
+§7-11 (a) の隔離は **env に依存している**。Codex 3 巡目はそこを突いた:
+
+```
+env を消して TmuxBackend().kill("dispatcher") を呼ぶと
+tmux kill-window -t crewvia:dispatcher が発行された
+```
+
+`CREWVIA_MUX_TEST_ISOLATION` は**呼ぶ側の性質**なので、きれいな env で
+サブプロセスを起動すれば消える。そして `pane_daemon_owner()` は `restart()` の
+中にしか無く、**直接の mux 呼び出しは守っていなかった**。
+
+**本当の防壁は「対象が誰のものか」でなければならない。** 2026-09-23 の事故も、
+identity ガードが正しく働いていれば env に関係なく防げた (本番ペインでは別
+checkout のデーモンが動いていた = foreign)。そこで (b) を本線にし、(a) は
+「テストが本番のペイン名を**名乗れない**」ための利便性の層として残す。
+
+**2 つの層は形が違う。混ぜてはいけない。**
+
+| 層 | 形 | 曖昧なとき | 適用範囲 |
+|---|---|---|---|
+| `lib_mux.kill()` の backstop | **allowlist** (`mine` / `none` のみ) | 断る | `DAEMON_PANE_NAMES` のペインだけ |
+| `pane_daemon_owner()` (デーモン層) | **allowlist** (`mine` / `none` のみ) | 断る | `restart()` の判定 |
+
+**2 つの層は同じ形にした (t039)。** ここには元々「mux 層を allowlist に
+できないのは、そこが Worker のペインも通る道だから」と書いてあり、曖昧なときは
+通す設計だった。Codex の 4 巡目がその理屈の誤りを指摘した — **適用範囲が既に
+`DAEMON_PANE_NAMES` に絞られている以上、Worker のペインはこの分岐に来ない**。
+Worker の可用性は、判定を緩めることではなく**スコープ**が守っている。
+
+緩めた代償として、`unknown` が kill の許可に変換されていた。そこを通れたものは:
+
+- `/proc` 走査中に読めない `cmdline` が 1 つでもある
+- バックエンドがペインの pid を答えない
+- `python3.12` のような表に無いインタプリタで起動された別 checkout の watchdog
+
+いずれも「判断できなかった」であって「空だった」ではない。きれいな env からの
+`mux.kill("watchdog")` が本番を閉じられる、という形で残っていた。
+
+適用範囲をデーモンのペイン名に絞ってあるのは今まで通り — crewvia の QA Worker は
+自分のペインで `bash scripts/dispatcher.sh` を走らせることが実際にあり、そこまで
+広げるとその Worker が二度と retire できない。**判定は allowlist、守る unit は
+1 つに絞る** (memory: approve-judgment-needs-allowlist-and-scope)。
+
+出口は `restart --force` (`kill(allow_foreign=True)`) の 1 本だけ。出口の無い
+fail closed は「判断できない」を「何も二度と動かない」に化けさせる
+(memory: fail-closed-discard-vs-hold)。
+
+**破壊は覗いた対象そのものに束縛する。** 所有権の判定が真偽値しか持ち帰らないと、
+kill は対象を名前から**引き直す**ことになる。tmux の window 名も herdr の
+ラベルも可変で、あいだに挟まる `/proc` の全走査には実時間がかかる。覗いたタブが
+消えて別 checkout が同じ名前で作り直せば、**一度も覗いていない後継**を閉じる。
+`_inspect_pane()` が「不変の id + そのときの pane pid」を 1 回の問い合わせで
+返し、kill はその id (tmux は `@window_id`、herdr は `tab_id`) を宛先にする。
+後継は別の id を持つので、届かずに失敗する — それが欲しい答え
+(PR #205 の `_verified_pid()` と同じ形)。
+
+**起動形態を同定する。** 修正前の `pane_daemon_owner()` は「`/scripts/<script>`
+で終わる引数」を探していた。つまり:
+
+- `bash scripts/dispatcher.sh` (**人が実際に打つ形**) は何にも一致せず、その
+  ペインは `none` = **husk = 破壊してよい**と分類されていた
+- 逆に、引数のどこかに自分のパスがあれば即 `mine` — `tail -f …/dispatcher.sh`
+  でも kill を認可した
+
+`lib_mux.script_owner()` は代わりに **実行しているスクリプト**を argv から取り出し
+(`_executed_script_arg()`: argv[0] がインタプリタなら最初の非オプション引数、
+`-c` / `-m` の後ろはスクリプトではない)、プロセス自身の cwd に対して解決する。
+名前は出てくるのに実行位置を特定できない形 (`env FOO=1 bash scripts/…`) は
+`none` ではなく **`unknown`**。認識できない起動形態を「空のペイン」と書くと、
+知らない形が全部**破壊側**に落ちる。
+
+**スクリプトの同定は「字面」ではなく「届くファイル」で行う (t039)。** 同定を
+argv の綴りに任せると、同じ欠陥が 2 つの向きから戻ってくる:
+
+- **別名の symlink** — `python3 /theirs/monitor` (`monitor` は
+  `/theirs/scripts/watchdog.py` を指す)。basename で先に絞っていたので
+  `foreign` でも `unknown` でもなく **`none`** = 空のペイン。生きた他人の
+  デーモンが husk として潰せた
+- **`..` の字面での畳み込み** — `/ours/link` が `/theirs/subdir` を指すとき、
+  `/ours/link/../scripts/watchdog.py` が実際に動かすのは
+  `/theirs/scripts/watchdog.py`。`normpath()` はこれを
+  `/ours/scripts/watchdog.py` に畳むので **`mine`** = 自分のデーモン
+
+`normpath()` は symlink を知らないまま `..` を消すので、**パスが指すファイルが
+変わる**。`_resolved()` (= `realpath()`) で **symlink を解決してから**認識し、
+`_same_script_file()` も両辺を解決して比べる。字面の一致はスクリプト同一性の
+証明にならない。
+
+**respawn に隔離を引き継ぐ。** mux 経由で起動されるプロセスは呼び出し側ではなく
+**mux サーバーの env** を継承する (herdr は server 起動時の env を全ペインに
+複製する。memory: herdr-server-stale-env-inheritance)。したがって
+`CREWVIA_MUX_TEST_ISOLATION` / `CREWVIA_MUX_PANE_PREFIX` は `spawn_command()` の
+`export` 一覧に載せるしかない。載っていないと、名前空間付きのテストペインに
+起動されたデーモンが素のペイン名を名指しし、保護を両方とも失う。
+
+**消せなかったら成功と言わない。** `resume()` は `unlink_quiet()` を呼んで無条件に
+true を返していた。marker がディレクトリだったり親が書き込み不可だと、**保護が
+残ったまま「解除しました」と答える** — 相互監視は永久に hold し、出口は 30 分後の
+stale-pause 報告だけになる。`_remove_marker()` が削除の成否を確かめ、失敗なら
+診断付きで false を返す。`--force` の枝と普通の枝の両方に要る (片方だけ直すと
+同じ欠陥が残る)。
+
+回帰: `tests/test_pane_identity_guard.py`。欠陥を 9 通り戻して、それぞれ対応する
+テストが赤くなることを確認済み。
+
+> **赤の証明そのものが罠だった。** 同じファイルへの 2 つの注入が pristine と
+> **同じバイト数だけ**違い、しかも 1 秒以内に書かれると、`.pyc` のキーが
+> (mtime の**秒**, size) なので **1 つ目のバイトコードが再利用される**。
+> 2 つ目は「緑のまま」に見えるが、走っていたのは 1 つ目のコードだった。
+> 欠陥注入のハーネスでは `PYTHONDONTWRITEBYTECODE=1` と `__pycache__` の削除を
+> 必ず入れること (memory: red-proof-catches-tests-green-for-the-wrong-reason)。
+
+### 7-11-2. 破壊の根拠を「中の人の同定」から「自分が作った記録」に変える (t040, Codex 5 巡目)
+
+§7-11-1 で境界を「対象の identity」に移し、t039 で判定表を allowlist に反転した。
+それでも Codex 5 巡目の P1 は同じ場所から 3 件出た。
+
+| # | 形 | 出る答え |
+|---|---|---|
+| 1 | 相対パスの別名 (`./monitor`) で cwd が読めない | `NONE` |
+| 2 | `python3.12 /theirs/monitor` (未知のインタプリタ + 別名 symlink) | `NONE` |
+| 3 | 起動後に `/ours/link` が消え、`..` が字面で畳まれる | `MINE` |
+
+4 巡かけて表を反転しても同じ場所から出続けるなら、直すべきは表ではない。
+**`NONE` も `MINE` も破壊を許す結論**であり、そのどちらもが「外の世界についての
+推論」で出ている。分類器が知らない起動形態は今後も必ず現れる。
+
+そこで**土台を変えた**。
+
+> **破壊してよいのは「自分が作ったと記録に残っているペイン」だけ。**
+
+`registry/mux/<name>.json` は `spawn()` が pane を作った瞬間に書く。中身は
+バックエンド自身の不変 id (tmux `@window_id` / herdr `tab_id`)。これは**観測して
+推論する事実ではなく、自分が書いた事実**なので、symlink も相対パスも未知の
+インタプリタも関係ない。記録は「これを作ったのは私か」に答える — 破壊が本当に
+懸かっている問いはこれである。
+
+判定は `lib_mux.may_destroy_pane()` 1 箇所。積極的な証明が 2 つ、拒否が 1 つ:
+
+- **provenance** — 自分の spawn 記録がこのペインを名指ししている。強い方の証明。
+- **emptiness** — シェル以外に生きたプロセスが 1 つも無いことを確認できた。
+  provenance の *代わり* ではなく *並び*: herdr を再起動するとタブは復元されるが
+  id は新しくなり、記録は全部古くなる。この出口が無いと husk を二度と掃除できない
+  (memory: fail-closed-discard-vs-hold)。
+- **veto** — 別チェックアウトのデーモンを積極的に同定できたら、記録があっても断る。
+  記録は「ペインを作った」ことしか証明しない。
+
+**`MINE` は根拠から外した。** それが 3 の欠陥そのものだったから。
+
+分類器は backstop として残るが、失敗はすべて `UNKNOWN` に倒れる:
+
+- `NONE` を返してよいのは「シェル以外に生きたプロセスが無い」を確認できたときだけ。
+  「デーモンだと認識できるものが無かった」は別の答えで、これを `NONE` にしていた
+  から、分類器が取り逃がすたびにペインが「空」に化けていた。
+- `..` は、そこから登るディレクトリが実在するときにしか辿らない。実在しなければ
+  `UNDECIDED`。`..` を含まないパスは従来どおり解決するので、消えた worktree の
+  同定 (retirement が要る) は壊れない。
+- versioned interpreter (`python3.12`, `perl5.36`) を認識し、mention 走査は argv の
+  パスを**解決してから**照合する。
+
+付随して要ったもの:
+
+- **tmux も spawn 記録を書く。** 従来は herdr だけだったので、tmux モードでは
+  provenance が常に不在になり、新しい判定が常に拒否に倒れてしまう。
+- **herdr に訊けなかっただけでは記録を捨てない。** 一過性の失敗が永久の拒否に
+  化ける。「消えた」と**答えられた**ときだけ畳む。
+- **`restart()` は mux が断った kill を「済んだこと」にしない。** 握り潰すと、
+  生きているデーモンの上に spawn が乗る — この関数が防ぐはずの二重起動に、
+  反対側から到達する。
+- **`--force` は残すが黙って通らない。** 見えない出口は、安全判定を儀式に変える。
+
+既存の `registry/mux/*.json` は `tab_id` を持つので、`pane_record_status()` は
+`handle` が無ければ `tab_id` を読む。**merge 後も本番は自分を操作できる** —
+稼働中の herdr デーモンで実機確認済み (本番チェックアウトからは `match`/`mine` で
+破壊可、worktree からは `foreign` で拒否)。tmux モードで既に走っているデーモンには
+記録が無いので、一度だけ `--force` が要る。
+
+> 既定を拒否に反転する変更は、**本番が自分を操作できることを実機で確認する**まで
+> 終わりではない (memory: two-guard-layers-need-one-notion-of-self)。
+
+回帰: `tests/test_pane_provenance_guard.py`。欠陥を 8 通り戻して赤を確認済み。
+うち 1 件 (P1-1) は最初**緑のままだった** — ペイン単位で訊いていたため、同じ変更に
+含まれる別の修正が先に `UNKNOWN` を返して欠陥を隠していた。確かめたい層に直接
+当て直して赤にした (memory: red-proof-catches-tests-green-for-the-wrong-reason)。
+
+### 7-11-3. 記録が「自分のもの」であることまで証明する (t041, Codex 6 巡目)
+
+§7-11-2 で土台を「自分が作った記録」に移した。6 巡目の P1 4 件は、**その土台を
+否定していない** — 4 件とも「**その記録が本当に自分のものだと証明できていない**」
+という詰めである。記録という考え方は正しく、記録の*束縛*が足りていなかった。
+
+| # | 記録が自分のものだと言えない理由 | 倒れる方向 |
+|---|---|---|
+| 1 | ペインの root プロセスを無条件に「自分のシェル」とみなしていた | 空 → 破壊可 |
+| 2 | 記録の中に**どのチェックアウトが書いたか**が無い | 他人の記録 → 破壊可 |
+| 3 | 記録の中に**どの mux サーバーの何世代目か**が無い | 古い id → 破壊可 |
+| 4 | 記録する id を、作成後に**名前で引き直して**いた | 出自の偽造 |
+
+**1. 空だと宣言する前に、root が idle なシェルであることを確認する。**
+`_pane_recognition()` は `others` から `pane_pid` を無条件に引いていた。root を
+除いてよいのは root が本当にそのペインのシェルのときだけで、シェルが解決できない
+別名経由でデーモンを `exec` していれば **root こそが中の人**である。分類器がその
+argv を認識できなければ `others` は空、結論は「確実に空」— 記録が 1 つも無くても
+破壊が認可される。root がシェルかどうかは argv を認識できるかとは**別の事実**
+なので、別に、積極的に確かめる。`spawn()` が husk 判定に使うのと同じ述語
+(`_pane_shell_state`) を使うので、「再利用してよい husk」の定義が 2 つに割れない。
+
+**2. 記録を、書いたチェックアウトに束縛する。** ファイルを `_own_repo_root()` の
+下に置くのは**置き場所**の隔離であって**中身の出自**ではない。2 つの worktree が
+`registry/mux` を symlink で共有すれば置き場所の隔離はそもそも成立しないし、記録を
+コピーすれば付いて回る。`checkout` をファイルの中に書いて照合する。
+
+**3. 記録を mux サーバーのエンドポイントと世代に束縛する。** tmux の `@window_id`
+は**1 つのサーバーの生存期間内でしか一意でない**。記録は window の外部破壊もサーバー
+停止も越えて残り、新しいサーバーは同じ `@7` を別の window に配れる。別ソケットにも
+同じ id はある。tmux は `#{socket_path}` と `#{pid}` (サーバー pid = 世代)、herdr は
+API ソケットのパスと `SO_PEERCRED` が名指すサーバープロセスの `pid:starttime`。
+いずれもペインの pid と**同じ 1 回の問い合わせ**から取る。
+
+**4. window id は作成コマンドの出力から取る。** `new-window -P -F '#{window_id}'`
+/ `new-session -P -F '#{window_id}'`。作成と `send-keys` のあとに名前で引き直すと、
+その間に別チェックアウトが同名の window を作ったり rename したりでき、**他人の
+window を「自分が作った」と記録**してしまう。起動コマンドの送信先も、記録する id も、
+以後すべて**作成が返した id** を使い通す。id が取れなければ**名前に戻らず失敗する** —
+戻る先が、まさに閉じた穴だから。husk への再投入も同じで、`_inspect_pane_full()` が
+返した id をそのまま持ち回る。
+
+#### 可用性 — 永久に kill できない状態を黙って作らない
+
+出自もサーバーも持たない**旧形式の記録**は、この変更をまたいで稼働している
+デーモンが全部持っている。一律に拒否すれば、そのペインは二度と終われない。
+永久の拒否は安全な既定ではなく、別の障害である (memory: fail-closed-discard-vs-hold)。
+
+- 記録の置き場所が**共有されていない**とき (`registry/mux` が自分のルートの
+  直下に解決する) だけ、旧形式を受け入れる。置き場所がまだ弱い証拠として効く。
+  **必ず stderr に警告を出す。** 次の spawn で新形式に置き換わる。
+- 共有ストレージ (symlink 等) では拒否する。どちらが書いたか決めようがない。
+- `server` を持つ記録に対して現在のサーバーが不明なら拒否する。`--force` が出口。
+
+herdr サーバー再起動後の husk は、id が変わって記録が合わなくなるが、root が素の
+idle シェルなので「確実に空」の側で片付く — t035 の復活経路はそのまま。
+
+回帰: `tests/test_spawn_record_binding.py` (20 本)。4 件それぞれについて**欠陥を
+戻すと赤くなることを確認済み**。加えて実機 tmux 3.4 で spawn → 記録 → 世代改竄で
+拒否 → 出自改竄で拒否 → 正規の記録で kill → husk 再投入まで通してある (15/15)。
+
+> 偽の tmux が「聞かれた書式」ではなく「決め打ちの並び」を返していたせいで、
+> 赤いはずのテストが 1 本**緑のまま**だった。書式駆動に直して赤を取り直した
+> (memory: red-proof-catches-tests-green-for-the-wrong-reason)。
+
+### 7-12. 「わからない」を Yes/No に潰さない (t037, Codex 2 巡目)
+
+§7-3 で `/proc` 走査について書いた「見られなかったは居なかったではない」は、
+同じ形の欠陥がこの PR の中にあと 3 つあった。3 つとも**同じ述語に正反対の
+安全側を求めている**のが正体である。
+
+1. **`read_pause()`** — 不在・EISDIR・壊れた JSON を全部 `None` にしていた。
+   `_decide()` はそれを「停止マーカーは無い」と読み、**maintenance の真っ最中に
+   respawn** できた。`read_pause_state()` が `absent` / `active` / `unreadable`
+   を返し、`FileNotFoundError` だけが不在の証拠。読めなければ hold。
+
+2. **`_pane_has_live_process()`** — 読めなければ `True`。「ここに起こしていいか」
+   (占有判定) には正しいが、`_wait_until_launched()` の「起動したか」には正反対で、
+   コマンドが飲まれたうえにペイン照会も失敗すると **spawn が即座に成功を報告**し、
+   猶予と flap カウントを消費して検証していない復旧を宣言していた。
+   `PANE_IDLE` / `PANE_LIVE` / `PANE_UNKNOWN` の 3 値にし、占有判定は unknown を
+   busy に、起動確認は unknown を not-started に倒す。`_pane_shell_is_idle()` は
+   `state == PANE_IDLE` の wrapper なので、答えは 3 値化の前後で完全に一致する。
+
+3. **`resume()`** — ロックの外で「読む → token 照合 → unlink」をやっていた。
+   1 と 3 の間に別の maintenance がマーカーを差し替えると、**照合した token と
+   消したファイルが別物**になり、実行中の maintenance の保護が外れる。§7-10 の
+   ロックに入れた。取れなければ `False` — 直列化できないなら保護は外さない。
+
+おまけで **`spawn_command()` のクォート漏れ**。env の値だけクォートして
+`repo_root` とスクリプトパスを生で `'...'` に埋めていたので、`/home/o'brien/`
+の checkout でクォートが閉じ、**続くメタ文字がコマンドとして走る**。危険なのが
+「悪意ある入力」ではなく**ただの人名**だったのが教訓で、全ての補間を
+`_sh_single_quote()` に通した。
+
+回帰: `tests/test_daemon_watch_failclosed.py`。4 番の赤は
+`cd: .../obrien; touch PWNED; /crewvi...: No such file or directory` と出て、
+パスがクォートを破ったことがそのまま読める。
+
+### 7-9. 回帰テストの形
+
+`tests/test_daemon_mutual_watch.py`。観測の口 (`mux` / `/proc` 走査 / 時計 /
+自己同一性) をすべて注入可能にしてあるので、本番のデーモン・mux・registry を一切
+巻き込まずに判定表を全通りたどれる。タスク要件の 3 本柱は:
+
+- 片方を落としたら相手が起こす — `test_dead_peer_is_respawned`
+- 生きている相手は起こさない — `test_stuck_but_alive_peer_is_not_respawned` ほか
+- flap で止まる — `test_flap_guard_stops_respawning`
+
+加えて、合成 `/proc` では証明できない部分 (実プロセスの argv 配置、bash と python の
+starttime の数え方の一致) は、使い捨てディレクトリに sleep するだけの
+`scripts/dispatcher.sh` を置いて実プロセスを起動・kill する隔離 smoke で確認した。
+
+---
+
+### 7-13. 相互監視が機能しない瞬間の backstop — PostToolUse hook (t008, 2026-09-23)
+
+§7 の相互監視は「相手を見る」仕組みなので、**両方が同時に死ぬ**(herdr 再起動、OOM 等) ケースは
+原理的に救えない — 見る側も死んでいるから。これを補うのが Director 自身のセッションで動く
+PostToolUse hook (`hooks/post-tool-use.sh`) の役目である。
+
+**方針。** 相互監視の判定 (`DaemonWatch._decide()`) を再実装・再利用しない。hook は `.claude/settings.json`
+の `PostToolUse` matcher (`Bash|Write|Edit|MultiEdit`) の経路にあり、失敗やハングが全体に波及するため、
+判定は「heartbeat ファイルの mtime を見るだけ」に絞る (`instance_alive()` の /proc 照合や
+`scan_daemon_pids()` の走査はしない — それは respawn する側の相互監視の仕事であり、この hook は
+respawn しない・報告するだけ)。
+
+- しきい値は §7-8 の既定値 (60 / 240) をハードコードし、`lib_daemon_watch.py` と同じ env var 名
+  (`CREWVIA_DAEMON_DISPATCHER_STALE_SECONDS` / `CREWVIA_DAEMON_WATCHDOG_STALE_SECONDS`) でだけ
+  上書きを許す。`config/crewvia.yaml` の YAML 解析はこの hook の目的には重すぎるため行わない —
+  独立した簡易チェックであり、`lib_daemon_watch.py` の判定とバイト単位で一致する必要はない。
+- `registry/daemons/` ディレクトリが無い (= どちらのデーモンも一度も `beat()` していない) 場合は
+  判定に入らずスキップする。このディレクトリは `DaemonWatch.__post_init__` が最初の beat 時に
+  作るものなので、無いことは「デーモンが動いていない (standalone/inline 運用)」の証拠であり、
+  「両方死んでいる」の証拠ではない。ここをスキップしないと、mutual watch を使わない運用で常時
+  誤検知することになる。
+- **判定順 (t049)。** 安いものから順に並べ、状態を消費するもの (throttle) を最後にする:
+  1. `registry/daemons/` の存在確認 (最も安い。現在の本番では常にここで抜ける)
+  2. heartbeat の mtime 判定 (`stat` のみ。両方 stale でなければここで抜ける)
+  3. role の解決 (`registry/workers.yaml` を読む python3 サブプロセス。**両方 stale のときだけ**
+     走るので、通常運用 (両方健全) では 1 度も走らない)
+  4. throttle の判定と消費 (role が director と判明した呼び出しだけが行う。Worker は
+     一切消費しない)
+- 対象は role が director のセッションのみ。全 Worker のツール呼び出しにも同じ hook が刺さるが、
+  Worker には respawn も報告もできないので実際の通知は行わない。ただし role 自体の解決は、
+  **両方の heartbeat が stale と分かった呼び出しでは Worker であっても実行される** — 「誰が
+  呼んだか」は throttle より先に確定させる必要があるため。この分岐に入るのは mutual watch を
+  使っていて、かつ両デーモンが実際に stale な (= backstop が意味を持つ) 稀な状況に限られる。
+  **t008 原案 (2026-09-23) は role 解決を daemons/ の存在や throttle と無関係に毎ツール呼び出しで
+  走らせており、Director だけでなく全 Worker の全呼び出しが python3 起動コストを払っていた
+  (t047 で O-1 是正のため grep から python3 ヒアドキュメントに変わったのが引き金。実測
+  12ms→38ms、3.2倍。t009 2巡目 QA の F-3)。t048 で daemons/ の存在確認と throttle 判定を role 解決
+  より前に出したことで F-3 は閉じたが、その並べ替えは throttle マーカーの消費まで role 解決の
+  手前に動かしてしまい、新しい欠陥 (下記 F-4) を生んだ。t049 で throttle だけを role 解決の後段
+  (director のときだけ触る場所) に戻し、F-3 の是正 (daemons/ 不在なら python3 ゼロ) を保ったまま
+  F-4 を閉じた。**
+- throttle はマーカーファイル (`registry/daemons/backstop-notify.throttle`) の mtime で 60 秒に
+  1 回に抑える。マーカーの更新は「daemons/ あり かつ 両方 stale かつ director かつ 窓が開いている」を
+  全て通った後にしか起きない (t049。判定より先にマーカーを更新すると F-4 を再発させる)。
+  通知を出す呼び出しがマーカーを更新するので、同時に複数の PostToolUse が走っても
+  直後の呼び出しは早期リターンする (完全な排他ではないが、この hook にロックを持ち込むほどの
+  重さではない — 最悪でも throttle 窓の中で数回検知メッセージが重複するだけで、実害は無い)。
+  **このマーカーは全エージェント共有 (agent 別ではない) だが、role が director の呼び出ししか
+  触らない (t049)。** Worker のツール呼び出しは role 解決までは行うが、throttle の判定・消費には
+  一切踏み込まないので、Worker が並行して動いていても Director の通知窓を奪わない。
+
+  **t048 での事故 (F-4, t009 3巡目 QA, 修正済み)。** throttle 消費を role 解決の**前**に置いた
+  結果、マーカーが全エージェント共有のまま「最初にこの窓を触った呼び出し」が誰であるかに
+  関わらず消費されるようになり、Worker のツール呼び出し 1 回で Director の窓が丸ごと潰れていた。
+  実測では「次の窓まで遅れる」ではなく、Worker が先に呼ぶ限り**恒久的に**Director へ届かない
+  (連続 5 窓で到達 0/5)。backstop が意味を持つのは Worker が動いている並列モードだけなので、
+  この欠陥は実運用条件下で要件 1 (両デーモン停止時に Director に通知が届くこと) を満たさなかった。
+  複雑な per-agent throttle (`backstop-notify.<AGENT_NAME>.throttle`) を導入する案もあったが、
+  上記の判定順の並べ替え (throttle を director 専用の最終ゲートにする) だけで十分に閉じたため
+  採用しなかった。
+
+**Director への伝え方 — exit code 2 を使う。** Claude Code の PostToolUse hook は exit code 2 で
+終わると、ツールは既に実行済みのままブロックはせず、**stderr をそのまま呼び出し元 (Director) の
+文脈に見せる**。これはポーリングさせずに「Director が何か操作した拍子に勝手に届く」を実現する
+標準的な方法である。
+
+既存の crash guard (`trap '_crash_guard' EXIT`) は非ゼロ終了を全部 0 に握り潰す設計だったので、
+そのままでは意図した exit 2 も握り潰されてしまう。`_INTENTIONAL_EXIT_CODE` という変数を挟み、
+crash guard は「予期しないクラッシュ (`_INTENTIONAL_EXIT_CODE` と食い違う非ゼロ終了)」だけを
+警告付きで 0 に収束させ、`_INTENTIONAL_EXIT_CODE=2` をセットした意図的な経路はそのまま通す形に
+した。crash guard 自体の「失敗しても Worker/Director の動作を止めない」という不変条件は変えて
+いない — 意図的な exit 2 はツール実行を止めない (PostToolUse は事後フックなので、そもそもブロック
+する権限が無い)。
+
+**respawn はしない。** この hook が見つけたら唯一やることは「1 行出す」だけで、`mux.spawn()` は
+一切呼ばない。理由は 2 つ: (1) Claude Code の hook はタイムアウトに敏感で、mux の subprocess 呼び
+出しを混ぜると全ツール呼び出しの体感速度が悪化する、(2) respawn の判断 (flap ガード・pause
+マーカー確認・pane owner 確認) を省略した簡易実装で行うと、§7 が積み上げた fail-closed の設計を
+迂回する非公式な第二の respawn 経路になってしまう。Director が `status` で裏を取ってから
+`lib_daemon_watch.py restart` を手で打つ、という一段人間を挟む設計にした
+(`agents/director.md` §14「両デーモンの同時死 backstop」)。
+
+#### 回帰テストの形
+
+`tests/test_daemon_backstop_hook.py`。**本物の `hooks/post-tool-use.sh` を subprocess で実行**する
+— ロジックを Python で再実装したテストは hook を直したことを一切証明しないため使わない (§6-5 の
+教訓と同じ形)。両方 stale で exit 2 になること、片方だけでは発火しないこと、director 以外の
+role では発火しないこと、throttle が効くこと・窓が空けば再発火すること、`registry/daemons/` が
+無い (mutual watch 未使用) 環境で誤検知しないこと、しきい値が env var で上書きできることを
+それぞれ担保する。RED は、fix 前の `hooks/post-tool-use.sh` (git HEAD) に対して同じテストを
+流し、4 本が意図通り fail することで確認した。
+
+**t049 で追加した 4 本。** F-4 (Worker が窓を消費する) の回帰防止として、Worker が 1 回呼んだ
+直後に Director が呼んでも通知が届くこと、連続 3 窓すべてで Worker が先に呼んでも Director が
+毎回届くことを固定した。O-9 (t048 の並べ替えを守る回帰テストが無かった) の是正として、
+`registry/daemons/` 不在時と、両デーモンが健全 (fresh) な時に role 解決の python3 が
+1 回も起動しないことを、PATH に計数スタブを挿して固定した。4 本とも t048 (`d1bcead`) に対して
+3 本が意図通り fail する (`test_healthy_daemons_never_invoke_python3` は daemons/ 不在の分岐が
+t048 の時点で既に成立していたため元々 green) ことを確認済み。
+
+---
+
+## 8. 参照
 
 - `scripts/dispatcher.sh` — D1 :998、D2 :1210、D3 :1239、D4 :1351、D5 :819、
   `tmux_kill_window()` :523 (`.firstseen` unlink :561-566)、`_mux_created_at()` :570、
@@ -1185,4 +2012,12 @@ Worker は**既に死んでいる**ので、届かなければ task が in_progr
   `_report_fields()` / `_retry_pending_report()` (§6-8 (2))
 - `knowledge/worker-shutdown-rules.md` — Rule 1-5 の確定仕様
 - `knowledge/worker-vanish-detection.md` — D4 の背景
-- `knowledge/dispatcher-restart-after-merge.md` — 常駐デーモンの反映手順
+- `scripts/lib_daemon_watch.py` — 相互監視の判定・respawn・報告 (§7)。
+  `instance_alive()` / `scan_daemon_pids()` (§7-3)、`_list_windows()` (§7-3 の従証拠)、
+  `_hold()` (§7-4)、`pause()` / `resume()` / `restart()` (§7-5)、
+  `_flap_entries()` (§7-6)、`spawn_command()` (§7-7)
+- `scripts/lib_daemon_watch.sh` — dispatcher の heartbeat を bash から書く (§7-2)
+- `hooks/post-tool-use.sh` — 同時死の backstop (§7-13)。`_INTENTIONAL_EXIT_CODE` /
+  `daemon-backstop` セクション。`tests/test_daemon_backstop_hook.py` が回帰テスト
+- `knowledge/dispatcher-restart-after-merge.md` — 常駐デーモンの反映手順。
+  **§7-5 の pause を挟む手順が追加された**ので、kill → spawn を素で打たないこと

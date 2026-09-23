@@ -922,29 +922,41 @@ AGENT_NAME=$REVIEWER bash scripts/start.sh worker review
 
 restart しないと、稼働 tab は旧コードで動き続け、fix が反映されていないように見える（誤診断の原因）。
 
+**dispatcher / watchdog は `scripts/lib_mux.py kill` を直接使わないこと。** 両者は相互監視
+(`scripts/lib_daemon_watch.py`、`knowledge/daemon-authority.md` §7) をしており、素朴に kill する
+と、kill してから自分で新コードを spawn するまでの隙間をピア側が「死んだ」と誤認し、**旧コード
+のまま respawn してしまう**（手動 respawn と競合する二重起動）。restart は必ず `lib_daemon_watch.py
+restart` 経由で行う — pane の所有者確認・maintenance マーカーでの相互監視一時停止・kill 失敗時の
+安全な中断までを 1 コマンドに内包している。
+
 **restart が必要なプロセス**:
 
 | プロセス | 対象ファイル変更時 |
 |----------|-----------------|
-| `dispatcher` tab | `scripts/dispatcher.sh` / `scripts/lib_mux.py` |
-| `watchdog` tab | `scripts/watchdog.py` / `scripts/watchdog.sh` |
+| `dispatcher` tab | `scripts/dispatcher.sh` / `scripts/lib_mux.py` / `scripts/lib_daemon_watch.py` / `scripts/lib_retirement.py` |
+| `watchdog` tab | `scripts/watchdog.py` / `scripts/lib_daemon_watch.py` / `scripts/lib_retirement.py` |
 | Worker tab | `scripts/start.sh` |
 | `Sora-director` | `agents/director.md` / `hooks/*.sh` |
 
-**restart 手順（dispatcher の例）**:
+**restart 手順（maintenance マーカー経由。片方だけ変更した場合はその daemon だけでよい）**:
 
 ```bash
 # 1. fix を pull
 git fetch origin main && git pull --ff-only origin main
 
-# 2. kill → respawn
-python3 scripts/lib_mux.py kill dispatcher
-python3 scripts/lib_mux.py spawn dispatcher \
-  "cd '$PWD' && bash '$PWD/scripts/dispatcher.sh'" "$PWD"
+# 2. pause → kill → 新コードで spawn → resume を 1 コマンドで行う
+#    (相互監視と競合しない。dispatcher / watchdog を個別に指定)
+python3 scripts/lib_daemon_watch.py restart dispatcher
+python3 scripts/lib_daemon_watch.py restart watchdog
 
-# 3. 起動確認
+# 3. 起動確認（両デーモンの heartbeat / recorded_instance_alive をまとめて見る）
+python3 scripts/lib_daemon_watch.py status
 tail -3 logs/dispatcher/dispatcher-$(date +%Y%m%d).log
 ```
+
+`restart` が `refused` で終わった場合（pane の中身が自分の checkout のものと確認できない等）は理由が
+stderr に出る。原因を確認せず `--force` へ逃げないこと — 別 checkout の daemon を巻き込む事故
+(2026-09-23 の実例) の再発防止がその確認の目的。
 
 詳細は `knowledge/dispatcher-restart-after-merge.md` を参照。
 
@@ -1015,29 +1027,36 @@ registry/
     John
 ```
 
-watchdog はこのファイルの更新時刻を監視し、**10分以上（デフォルト）更新がない Worker** を停止とみなす。
+watchdog はこのファイルの更新時刻を監視し、**idle_threshold（既定 300s。task frontmatter の `timeout.idle` で上書き可）を超えて更新がない Worker** を停止候補とみなす。
 
-### 停止検知時の動作
+これは Worker 個別の生存監視であり、`registry/daemons/{dispatcher,watchdog}.heartbeat`（dispatcher と
+watchdog 自身が互いを監視する相互監視の heartbeat）とは**別の仕組み**。後者は §12 の
+`lib_daemon_watch.py` が扱う。
 
-停止が検知されると:
+### 停止検知時の動作（t002 以降: Worker を終了させ後始末まで完結させる唯一の実行者）
 
-1. **stderr に警告を出力する**:
-   ```
-   [watchdog] WARNING: Worker {AGENT_NAME} — no heartbeat for 10+ minutes
-   ```
+watchdog は idle / max threshold を超えた Worker を**自ら終了させ、queue の後始末（task を
+`pending` に戻し assignment を消す = `plan.sh retire`）まで自己完結させる**。Director は後始末を
+手で行う必要はない — 以前の版（stderr 警告のみ、Taskvia alert のみで実際には何もしない）は廃止済み。
 
-2. **Taskvia トークンが設定されていれば `/api/log` に alert として通知される**:
-   ```json
-   {
-     "type": "alert",
-     "content": "Worker {AGENT_NAME} stopped responding (no heartbeat for 10+ min)",
-     "agent": "watchdog"
-   }
-   ```
+1. shutdown メッセージを Worker へ送り、応答が無ければ SIGTERM → SIGKILL と段階的に進める
+   （各ステップの間に猶予があり、応答すれば止まる）
+2. Worker プロセスの終了を確認したら `plan.sh retire` で task を `pending` に戻し、assignment を
+   削除する（世代 = `started_at` で束縛されるので、猶予期間中に別 Worker がその task を pull し
+   直していた場合は後任を巻き込まない — 詳細 `knowledge/daemon-authority.md`）
+3. mux 経由で Director の pane に **1 行の事後報告**を直接送る（Taskvia を介さない）。ポーリング不要
+   — 何か操作した拍子に届く
 
-### 停止を検知した場合の対応フロー
+**Director がすることは基本的に「報告を読んで判断する」だけ**:
 
-**1. 当該 Worker のブランチを確認する**
+- 通常の終了報告（`terminated` / `respawned` 相当）→ 対応不要。task は既に `pending` に戻っており、
+  次の dispatcher cycle で誰かに再割り当てされる。partial commit の引き継ぎが要る場合だけ、以下の
+  ブランチ確認を行う
+- **判定不能 (`unprovable` / stall) の報告** → 自動処理を止めて保留している状態。報告文に従い、
+  `registry/retirements/<agent>.*` を人手で確認・削除するまで watchdog はそのまま待つ
+  （自動で `--reset` を打たないこと — 生きた Worker の作業を巻き戻す事故になる）
+
+**partial commit の引き継ぎが必要な場合のみ、ブランチを確認する**:
 
 ブランチ名は `task/<mission_slug>/<task_id>-<task_slug>` 形式。task_slug は plan.sh が自動生成するため、`git branch -a | grep <task_id>` で特定する:
 
@@ -1050,9 +1069,7 @@ git log --oneline origin/task/<mission_slug>/<task_id>-<task_slug>..HEAD
 git status
 ```
 
-partial commit（中途半端なコミット）がある場合は内容を確認し、引き継ぎ情報として次の Worker に渡すこと。
-
-**2. 必要であれば同スキルの新しい Worker を起動して引き継ぐ**
+partial commit（中途半端なコミット）がある場合は内容を確認し、引き継ぎ情報として次の Worker に渡すこと。task 自体は既に `pending` に戻っているので、通常は dispatcher が自動で次の同スキル Worker に配る。急ぎで手動起動したい場合のみ:
 
 ```bash
 NEW_WORKER=$(./scripts/assign-name.sh {skill1} {skill2})   # 位置引数
@@ -1060,13 +1077,31 @@ AGENT_NAME=$NEW_WORKER bash scripts/start.sh worker {skill1} {skill2}
 # plan.sh に引き継ぎメモを追記して Worker が参照できるようにする
 ```
 
-**3. heartbeat ファイルを削除してリセットする**
+heartbeat ファイルを手で `rm` する必要は無い — 後始末は watchdog が完結させる。
 
-```bash
-rm registry/heartbeats/{AGENT_NAME}
+### 両デーモンの同時死 backstop（t008）
+
+dispatcher と watchdog の相互監視は「相手を見る」仕組みなので、**両方が同時に死ぬ**ケース
+（herdr 再起動、OOM 等）はどちらも互いを起こせない。この場合だけ、Director 自身の PostToolUse
+hook（`hooks/post-tool-use.sh`）が `registry/daemons/{dispatcher,watchdog}.heartbeat` の mtime を
+見て検知し、ツール実行の拍子に stderr へ 1 行流し込む（60 秒に 1 回まで throttle 済み）。throttle
+マーカーは Director 自身の呼び出しだけが消費する（Worker のツール呼び出しでは一切更新されない、
+t049）ので、並列に動く Worker がいても Director の通知窓が奪われることはない:
+
+```
+[daemon-backstop] ⚠️ dispatcher と watchdog の heartbeat が両方 stale です (...)。
 ```
 
-これにより watchdog の警告が止まる。
+見えたら `python3 scripts/lib_daemon_watch.py status` で実際に両方死んでいるか確認し、本当に
+両方死んでいれば §12 と同じ手順で両方 `restart` する:
+
+```bash
+python3 scripts/lib_daemon_watch.py restart dispatcher
+python3 scripts/lib_daemon_watch.py restart watchdog
+```
+
+これは相互監視そのものではなく最後の保険なので、respawn の判断（flap ガード等）は行わない —
+必ず `status` で実際の生死を見てから手で判断すること。
 
 ---
 

@@ -66,6 +66,60 @@ mux:
   # 環境変数での上書き: CREWVIA_STATE_GRACE=<秒数>
   state_grace_seconds: 60
 
+# ===== デーモンの相互監視 (dispatcher / watchdog) =====
+# dispatcher と watchdog は互いの heartbeat を見張り、相手が死んでいたら
+# 起こし直して Director に事後報告します（外部 supervisor は使いません）。
+# 判定は常に fail closed — 確証が無いときは respawn せず保留します。
+# 実装: scripts/lib_daemon_watch.py / 設計: knowledge/daemon-authority.md §7
+daemons:
+  # 相互監視そのものの ON/OFF。切ると両デーモンは t005 以前と同じく
+  # 互いを知らないまま動きます（片方が死んでも誰も気付きません）。
+  # 環境変数での上書き: CREWVIA_DAEMON_MUTUAL_WATCH=0
+  mutual_watch: true
+
+  # heartbeat がこの秒数より古くなったら「stale」とみなし、**そこから**
+  # プロセスとタブの実在確認に進みます（stale だけでは死亡と判定しません）。
+  #
+  # サイクル周期に対して十分な余裕を取ること。ここを詰めすぎると、1 回遅い
+  # サイクルが「死亡」に見え、生きているデーモンの隣にもう 1 つ起動してしまう
+  # ＝同じ task が 2 人の Worker に渡る、という最悪の壊れ方になります。
+  #   dispatcher: 5 秒周期 → 12 サイクル分
+  #   watchdog  : 30 秒周期 → 8 サイクル分。加えて graceful_terminate() が
+  #               最大 70 秒メインループを止めるので、その分の余裕も要る
+  dispatcher_stale_seconds: 60
+  watchdog_stale_seconds: 240
+
+  # respawn 直後の猶予。起動したてのデーモンはまだ heartbeat を書いておらず、
+  # 「死んでいる」のと区別がつかないため、この秒数は判定しません。
+  respawn_grace_seconds: 120
+
+  # flap ガード: この時間窓の中で respawn がこの回数に達したら、自動 respawn を
+  # やめて Director に対応を求める通知に格上げします（起動直後に落ちるデーモンを
+  # 延々と起こし続けないため）。
+  flap_window_seconds: 900
+  flap_threshold: 3
+
+  # 保留 (hold) がこの秒数続いたら Director に 1 度だけ報告します。
+  # 黙って保留し続けるのは無音の故障なので、必ず出口を用意しておくための値。
+  hold_report_after_seconds: 1800
+
+  # デーモン 1 つにつき 1 つのロック (registry/daemons/<name>.lock) で、
+  # 「相手を起こす判定〜spawn」と「手動 restart」を直列化します。マーカーを
+  # 先に書くだけでは閉じません — 相手が「マーカーは無い」と読んだ後に
+  # maintenance が始まれば、そのまま手動 spawn と並んで起動してしまうためです。
+  #
+  #   watch 側: 短く。取れなければ 1 サイクル保留するだけなので安全側であり、
+  #            ここで待たせると相互監視が自分のデーモンのサイクルを止める
+  #   maintenance 側: 長く。人が端末の前で待っている操作なので、進行中の
+  #            判定が終わるまで並ぶのが正しい
+  watch_lock_timeout_seconds: 2
+  maintenance_lock_timeout_seconds: 60
+
+  # 停止マーカー (registry/daemons/<name>.paused) がこの秒数残っていたら
+  # Director に 1 度だけ報告します。マーカーは自動で外しません — 「古い」は
+  # 「作業が終わった」の証拠ではなく、作業途中の相手を起こすと二重起動になるため。
+  pause_report_after_seconds: 1800
+
 # ===== Taskvia 連携 =====
 # Taskvia 承認フローの使用モードを指定します。
 #

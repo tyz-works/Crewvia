@@ -41,7 +41,8 @@
     crewvia.yaml        システム設定（承認チャネル・WIP制限等）
   hooks/
     pre-tool-use.sh     PreToolUse hook（Taskvia承認）
-    post-tool-use.sh    PostToolUse hook（ログ投稿）
+    post-tool-use.sh    PostToolUse hook（ログ投稿）。role=director のときだけ、両デーモンの
+                        heartbeat 同時 stale を検知する backstop も持つ（t008、下記参照）
   agents/
     director.md         Directorのシステムプロンプト
     worker.md           Workerのシステムプロンプト
@@ -49,8 +50,18 @@
     start.sh            マルチエージェント起動スクリプト
     plan.sh             タスクプラン管理 CLI（per-task / multi-mission）
     dispatcher.sh       並列モードの常駐割り当てデーモン（idle Worker への自動 assign + codex-review spawn）
+                        **仕事の割り当ての判定者**（queue/ を読む唯一のデーモン）
     watchdog.py         Worker 生存監視デーモン（idle 判定・pane 消滅の検知と kill）
                         **Worker を終了させる唯一の実行者**（t002 以降）。後始末まで担う
+    lib_daemon_watch.py  dispatcher と watchdog の相互監視（heartbeat・respawn・自己申告・
+                        maintenance マーカー）。CLI: spawn / spawn-cmd / beat / watch / status /
+                        pause / resume / restart（pause→kill→spawn→resume を 1 コマンドで行う。
+                        `scripts/lib_mux.py kill`/`spawn` を素で叩かないこと。spawn-cmd は
+                        起動コマンド文字列だけを印字する — 両デーモン同時 restart 等で
+                        `lib_mux.py spawn` に手渡すときに使う）
+                        設計: knowledge/daemon-authority.md §7。両方が同時に死ぬケース
+                        （相互監視だけでは救えない）は hooks/post-tool-use.sh の backstop
+                        （§7-13）が Director に伝える
     lib_retirement.py   retirement marker プロトコル（dispatcher が判定 → watchdog が実行）
                         権限境界の設計は knowledge/daemon-authority.md
                         判定の設計は knowledge/watchdog-idle-judgment.md
@@ -70,6 +81,9 @@
     heartbeats/         watchdog 監視用
     mux/                mux バックエンドのタブ/ペイン ID キャッシュ（.gitignore 対象）
     retirements/        Worker 終了要求と進捗（dispatcher→watchdog の引き渡し。.gitignore 対象）
+    daemons/            dispatcher/watchdog 相互監視の heartbeat・pause マーカー・respawn 履歴
+                        （.gitignore 対象）。hooks/post-tool-use.sh の同時死 backstop（t008）が
+                        throttle マーカー（backstop-notify.throttle）を置く場所でもある
   CLAUDE.md             このファイル
   README.md             公開向けセットアップガイド
 ```
@@ -98,11 +112,17 @@
 | `CREWVIA_WORKER_PERMISSION_MODE` | Worker 起動時の `claude --permission-mode` 値。デフォルト: `auto`（対話プロンプトなし。実質的な承認ゲートは hooks/pre-tool-use.sh + Taskvia が別途担う）。空にすると CLI 既定（対話確認あり）にフォールバック |
 | `CREWVIA_DIRECTOR_PERMISSION_MODE` | Director 起動時の `claude --permission-mode` 値。デフォルト: 未設定（CLI 既定 = 対話確認あり）。Director は Taskvia 承認 hook を role 判定でスキップするため、対話確認が唯一の安全弁 |
 | `CREWVIA_KILL_AUTHORITY` | Worker を終了させる主体: `watchdog`（デフォルト）/ `dispatcher`（ロールバック）。**両デーモンで同じ値にし、同時に再起動すること** — 片方だけ戻すと「誰も窓を閉じない」か「二重 kill で同名の別 Worker を殺す」のどちらかが必ず起きる（`knowledge/daemon-authority.md` §5） |
+| `CREWVIA_DAEMON_MUTUAL_WATCH` | dispatcher/watchdog の相互監視の ON/OFF（`0` で無効）。`config/crewvia.yaml` の `daemons.mutual_watch`（既定 `true`）より優先。切ると片方が死んでも誰も respawn しない（`knowledge/daemon-authority.md` §7） |
+| `CREWVIA_DAEMON_DISPATCHER_STALE_SECONDS` / `CREWVIA_DAEMON_WATCHDOG_STALE_SECONDS` | 相互監視の stale 判定しきい値（既定 60 秒 / 240 秒）。`config/crewvia.yaml` の `daemons.dispatcher_stale_seconds` / `daemons.watchdog_stale_seconds` より優先。`hooks/post-tool-use.sh` の同時死 backstop（t008）も同じ変数名・同じ既定値を読む（`knowledge/daemon-authority.md` §7-13） |
+| `CREWVIA_DAEMON_FLAP_WINDOW_SECONDS` / `CREWVIA_DAEMON_FLAP_THRESHOLD` | flap ガード: この秒数の窓（既定 900）でこの回数（既定 3）respawn したら自動 respawn を止め Director に報告する。`config/crewvia.yaml` の `daemons.flap_window_seconds` / `daemons.flap_threshold` より優先 |
+| `CREWVIA_DAEMON_RESPAWN_GRACE_SECONDS` / `CREWVIA_DAEMON_PAUSE_REPORT_AFTER_SECONDS` / `CREWVIA_DAEMON_HOLD_REPORT_AFTER_SECONDS` / `CREWVIA_DAEMON_WATCH_LOCK_TIMEOUT_SECONDS` / `CREWVIA_DAEMON_MAINTENANCE_LOCK_TIMEOUT_SECONDS` | 相互監視の残りのしきい値（既定 120 / 1800 / 1800 / 2 / 60 秒）。`config/crewvia.yaml` の `daemons:` ブロック（コメント付き）より優先。詳細: `knowledge/daemon-authority.md` §7-8 |
 | `CREWVIA_MUX` | mux バックエンド選択: `tmux` / `herdr`。config `mode:` より優先 |
 | `CREWVIA_MUX_ENABLED` | 並列モード有効化: `1` で並列 ON（`CREWVIA_MUX` 未設定時の tmux fallback）/ `0` でインラインモード強制。`CREWVIA_MUX` が設定済みなら不要 |
 | `CREWVIA_TMUX_SESSION` | tmux backend が使うセッション名（デフォルト: `crewvia`） |
 | `CREWVIA_HERDR_WORKSPACE` | herdr backend が使うワークスペース名（デフォルト: `crewvia`） |
 | `CREWVIA_HERDR_SOCK` | **テスト専用**。lib_mux が ping する herdr API socket のパスを上書きする（デフォルト: `~/.config/herdr/herdr.sock`）。実 herdr はこの変数を読まないため、本番で設定すると ping 先と server の bind 先が食い違う |
+| `CREWVIA_MUX_TEST_ISOLATION` | **テスト専用**。テスト中であることの印。`tests/conftest.py` が `os.environ` に置くので subprocess にも継承される。これが立っている間、既定の宛先 (`crewvia`) や接頭辞なしのペイン名を名指しする mux verb は `MuxTestIsolationError` で拒否される (2026-09-23 の本番 dispatcher 乗っ取り事故の再発防止。`knowledge/daemon-authority.md` §7-11) |
+| `CREWVIA_MUX_PANE_PREFIX` | **テスト専用**。ペイン名の名前空間。**本番は空 (no-op)**。設定すると `spawn("dispatcher")` が `<prefix>dispatcher` に解決され、本番のペイン名そのものが到達不能になる |
 | `NTFY_URL` | ntfy サーバーの URL。`approval_channel.ntfy.url` より優先 |
 | `NTFY_TOPIC` | ntfy 通知トピック名。**必須** — 空のまま運用すると通知が silent skip される |
 | `NTFY_USER` | ntfy Basic 認証ユーザー名。`auth-default-access: deny-all` サーバーでは必須 |

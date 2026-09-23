@@ -36,13 +36,30 @@ cmd="${1:-}"
 case "$cmd" in
   has-session) exit 0 ;;
   list-sessions) echo "crewvia: 1 windows"; exit 0 ;;
-  new-session) exit 0 ;;
-  new-window) exit 0 ;;
+  # `-P -F '#{window_id}'`: since t041, spawn() takes the id of the window it
+  # created from the creation command rather than resolving it by name after
+  # the fact (Codex 6巡目 P1-4).  A fake that answers nothing here makes every
+  # spawn fail with "tmux would not say which window was created".
+  new-session|new-window)
+    for arg in "$@"; do
+      case "$arg" in '#{window_id}'*) echo "@1" ;; esac
+    done
+    exit 0 ;;
   list-windows) echo "watchdog"; exit 0 ;;
   send-keys) exit 0 ;;
   capture-pane) cat "$FAKE_TMUX_SCREEN"; exit 0 ;;
   kill-window) exit 0 ;;
-  display-message) echo "12345"; exit 0 ;;
+  display-message)
+    # Substitute the format the caller asked for, the way tmux does — a fake
+    # that answers one fixed string turns any change in the format into a
+    # refusal that does not exist in production.
+    fmt="${!#}"
+    fmt="${fmt//'#{window_id}'/@1}"
+    fmt="${fmt//'#{pane_pid}'/12345}"
+    fmt="${fmt//'#{pid}'/900}"
+    fmt="${fmt//'#{socket_path}'//tmp/tmux-fake/default}"
+    echo "$fmt"
+    exit 0 ;;
   *) exit 1 ;;
 esac
 FAKESCRIPT

@@ -64,7 +64,7 @@ tool 実行の子プロセスはそれよりずっと後に生える。
 ```
 1. now - started_at > max          → terminate      (絶対上限。従来どおり)
 2. mux 窓が無い                     → kill
-3. idle = now - 最新の activity/heartbeat/notification mtime   ← 常に評価する
+3. idle = now - max(floor 以降の activity/heartbeat/notification mtime, floor) ← 常に評価する
      idle <= idle_threshold        → alive
      idle <= idle_threshold * 2    → warn
      それ以上:
@@ -76,6 +76,48 @@ tool 実行の子プロセスはそれよりずっと後に生える。
 
 要点は **プロセス層を「生存の証明」から「terminate の抑制材料」に降格した**こと。
 idle 秒数だけが「働いていない」の根拠で、常に評価される。
+
+### floor — 誰の沈黙かを決める (t044)
+
+3 層のうち **2 層は agent 単位** である: `registry/heartbeats/<agent>` と
+`registry/notifications/<agent>/` は Worker 名で引かれ、task では引かれない。
+crewvia は同じスキルの Worker に同じ名前を継承させる設計なので、これらは
+**前の task の残骸として次の Worker を出迎える**。
+
+t044 以前はそれを今の task のシグナルとして読んでいた。pull した直後
+(`<task_id>.activity` がまだ無い) の Worker が、前日 18 時間前の heartbeat で
+`idle=64877s` と判定され、`elapsed=0s` で terminate された (2026-09-23 本番)。
+`started_at` は「候補が 1 つも無いとき」の fallback にしか使われておらず、
+その「1 つも無い」は起きなかった — 古い heartbeat が必ず 1 つあったからである。
+
+そこで **floor = この監視対象が始まった時刻** を導入し、floor より古いシグナルは
+候補から落とし、floor 自身を `max()` に入れる。floor は
+
+    min(task frontmatter の started_at,  WorkerMonitor の生成時刻)
+
+で、片方だけでは両方向に壊れる:
+
+- **生成時刻だけ** — watchdog を再起動するたびに監視オブジェクトが作り直され、
+  3 時間前にハングした Worker の idle 時計が 0 に戻る。再起動のたびに延命される。
+- **started_at だけ** — 時計ずれや書きかけの card で未来の値が入ると idle が
+  負になり、どれだけ沈黙しても alive のままになる。
+
+floor は notification の読み取りにも同じものを当てる。通知は 1 回しか鳴らず
+解除されないまま残るので、前の task の通知が `_awaiting_human()` を永久に True に
+すると、今の task のハングが terminate されなくなる — idle 側と向きが逆なだけで
+原因は同じである。判断がひとつなので実装も `_signal_floor()` ひとつに置く。
+
+**agent 単位と task 単位のシグナルを分けてはいない。** floor があれば「前の task の
+シグナル」は定義上 floor より古いので落ちる。分けても同じ結果になり、判定の入口が
+2 つに増えるぶん食い違う余地が生まれる。残る例外は「同じ Worker 名に in_progress の
+task が 2 つある」場合 (= 幽霊 task) で、そのとき生きている Worker の heartbeat が
+幽霊側の監視対象を生かしてしまう。これは floor ではなく幽霊 task 側の問題なので
+ここでは直さない。
+
+**spawn 直後の猶予は入れていない。** dispatcher には 90 秒の spawn grace があるが、
+watchdog 側では floor がその役を果たす — 起動直後の Worker は floor が「今」なので
+`idle_threshold * 2` ぶんの猶予を自動的に得る。固定秒の猶予を別に足すと「起動直後」
+の定義が 2 つになり、ずれたときにどちらが効いているのか分からなくなる。
 
 ### プロセス層の 3 値 (`classify_process_tree()`)
 

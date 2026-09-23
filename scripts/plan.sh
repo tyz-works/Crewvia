@@ -1261,6 +1261,19 @@ def build_task_graph(state):
 TASK_GRAPH_LOCK_WAIT_SECONDS = 10.0
 TASK_GRAPH_LOCK_POLL_SECONDS = 0.02
 
+#: 印を触るあいだだけ取る小さなロックを待つ上限 (秒)。本ロックと同じ理由で
+#: **必ず有限** にする。保持時間はファイル 1 つの読み書きと flock の解放だけ
+#: なので、ここに引っかかるのは「印の区間の中で生きたまま止まっている実行」が
+#: 居るときだけである。
+#:
+#: 秒数を本ロックより小さく取るのは、`retire --no-wait` が watchdog の監視
+#: ループから **同期で** 呼ばれるからである。watchdog は Worker の生死を見る
+#: 唯一の主体なので、その 30 秒の subprocess タイムアウトまで持っていかれると、
+#: その間 Worker を誰も見ていないことになる。最悪経路は「本ロック 10 秒 →
+#: 印のロック → (取れた本ロックで publish) → 印のロック」なので、上限の合計は
+#: 10 + 2 × 2 = 14 秒 + 走査 1 回分に収まる。
+TASK_GRAPH_PENDING_LOCK_WAIT_SECONDS = 2.0
+
 #: 読み直しを繰り返す上限。**通常運用では到達しない安全弁** であって、
 #: 受け渡しの仕組みではない。読み直しが 1 回増えるのは「この publish の読み
 #: 取りを *始めたあと* に新しい要求が置かれた」ときだけなので、ここに届くには
@@ -1286,7 +1299,7 @@ def _task_graph_pending_lock_path(path):
 
 
 @contextlib.contextmanager
-def task_graph_pending_lock(path):
+def task_graph_pending_lock(path, wait_seconds=None):
     """印の読み書きと、本ロックの解放とを、並べ替えさせないための小さなロック。
 
     守るのは印そのものではなく、印と本ロックの **順序** である。受け渡しが
@@ -1306,16 +1319,51 @@ def task_graph_pending_lock(path):
     保持時間はファイル 1 つの読み書きと flock の解放だけで、**キューロックには
     一切触れない**。要求者はこのロックを持ったまま本ロックを待たない (持った
     ままにすると、本ロックの保持者が確認に入れず互いに待つ) 。
+
+    待ちは有限
+    ----------
+    上の理屈は「このロックがすぐ空く」ことを前提にしているが、**前提が外れた
+    ときの倒し方を持たないと、前提そのものが凶器になる**。短いはずのロックを
+    期限なしで待つと、区間の中で生きたまま止まっている実行が 1 つ居るだけで、
+    以降の queue 変更コマンドが全て無期限に詰まる。可視化は付加機能なので、
+    倒す先は「グラフが少し古くなる」でなければならず、「plan.sh が待たされる」
+    であってはならない。
+
+    そこで取得は上限付きにし、**取れたかどうかを yield で返す**。取れなかった
+    ときにどう倒すかは呼び出し側が決めるが、どちらの呼び出し側も
+    **「印を消さない」に倒す** — 消してよいのは「無い」と確認できたときだけで、
+    確認できていない以上、消せば要求者の最後の変更がそのまま落ちる。残せば
+    次に queue を触った実行が拾うので、失われるのは即時性だけである。
+
+    受け渡しの不変条件は壊れない。区間に入れた者同士の順序は従来どおり flock が
+    決めており、上限を足しても「確認と解放が一区間に入る」ことは変わらない。
+    変わるのは「区間に入れなかった者が居りうる」ことだけで、入れなかった者は
+    印に一切触れないので、置かれた印が消えることも、消えた印が復活することも
+    ない。
     """
+    if wait_seconds is None:
+        wait_seconds = TASK_GRAPH_PENDING_LOCK_WAIT_SECONDS
     lock_path = _task_graph_pending_lock_path(path)
     os.makedirs(os.path.dirname(lock_path) or '.', exist_ok=True)
     lf = open(lock_path, 'a+')
+    acquired = False
     try:
-        fcntl.flock(lf, fcntl.LOCK_EX)
-        yield
+        deadline = time.monotonic() + wait_seconds
+        while True:
+            try:
+                fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+                break
+            except OSError:
+                pass
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(TASK_GRAPH_LOCK_POLL_SECONDS)
+        yield acquired
     finally:
         try:
-            fcntl.flock(lf, fcntl.LOCK_UN)
+            if acquired:
+                fcntl.flock(lf, fcntl.LOCK_UN)
         finally:
             lf.close()
 
@@ -1405,9 +1453,19 @@ def refresh_task_graph():
     if lock is None:
         # 1 バイトも書かず、要求だけを残す。置けたかどうかに関わらず (a) を
         # 試す — 取れたなら自分で publish するのが最も確実な出口である。
-        _mark_task_graph_pending(path)
+        marked = _mark_task_graph_pending(path)
         lock = acquire_task_graph_lock(path, wait_seconds=0.0)
         if lock is None:
+            if not marked:
+                # (a) も (b) も成立しない唯一の形。印を置けていないので保持者は
+                # 読み直さず、この実行の変更は次に queue を触った実行まで映ら
+                # ない。**待ち続けるより古いグラフを選ぶ** — 可視化のために
+                # plan.sh を止めないことが、この機能の唯一の約束である。
+                print(
+                    "[plan.sh warn] task-graph: publish を待ち切れず、読み直しの "
+                    "要求も置けませんでした — 次の queue 変更まで古い姿が残りえます",
+                    file=sys.stderr,
+                )
             return path  # (b) 保持者が居る。その保持者が必ず読み直す。
 
     released = False
@@ -1421,7 +1479,26 @@ def refresh_task_graph():
             read_started = time.monotonic_ns()
             graph = build_task_graph(load_state())
             _atomic_write(path, json.dumps(graph, ensure_ascii=False, indent=2) + '\n')
-            with task_graph_pending_lock(path):
+            with task_graph_pending_lock(path) as in_section:
+                if not in_section:
+                    # 区間に入れなかった。**印には一切触れずに** 本ロックだけ
+                    # 返す。ここで本ロックを握ったまま待ち続けると、止まるのは
+                    # この 1 コマンドではなく、以降の全ての queue 変更コマンド
+                    # になる (全員が本ロックの上限を払ったうえで同じ所に詰まる)。
+                    #
+                    # 消さないので要求は失われない。publish 自体はこの直前に
+                    # 済んでいるので、残るのは「この瞬間より後に置かれたかも
+                    # しれない要求の反映が、次の queue 変更まで遅れる」だけ。
+                    released = True
+                    release_task_graph_lock(lock)
+                    print(
+                        f"[plan.sh warn] task-graph: 読み直しの要求を確認できな "
+                        f"かったので手を引きました "
+                        f"({TASK_GRAPH_PENDING_LOCK_WAIT_SECONDS}s 待機) — "
+                        f"要求は残してあります (次の queue 変更で反映されます)",
+                        file=sys.stderr,
+                    )
+                    return path
                 if not _task_graph_pending_outstanding(path, read_started):
                     # 未処理の要求は無い。消してから、同じ区間の中で解放する。
                     _clear_task_graph_pending(path)
@@ -1447,24 +1524,32 @@ def refresh_task_graph():
 
 
 def _mark_task_graph_pending(path):
-    """読み直しを頼む要求を置く。置けなくても呼び出し側は失敗させない。
+    """読み直しを頼む要求を置く。**置けたら True。** 置けなくても失敗させない。
 
     時刻は **単調時計** で書く。realtime だと NTP の巻き戻しで「読み取りより
     前に置かれた」と誤読し、未処理の要求を消してしまう。単調時計は同じ機体の
     全プロセスで同じ基準を持つので、プロセスをまたいだ比較にそのまま使える。
+
+    区間に入れなかったときは **書かずに False を返す**。ロックの外から書くと、
+    保持者の「確認 → 消去」のあいだに置いた印がそのまま消され、置けたつもりで
+    要求が落ちる — 置かないより悪い。戻り値を見た呼び出し側が、(a) も成立
+    しなかったときに 1 行報告する。
     """
     try:
         pending = _task_graph_pending_path(path)
         os.makedirs(os.path.dirname(pending) or '.', exist_ok=True)
-        with task_graph_pending_lock(path):
+        with task_graph_pending_lock(path) as in_section:
+            if not in_section:
+                return False
             with open(pending, 'w') as f:
                 f.write(f"{os.getpid()} {time.monotonic_ns()}\n")
+            return True
     except OSError as e:
         print(
-            f"[plan.sh warn] task-graph: publish を待ち切れず、読み直しの要求も "
-            f"置けませんでした ({e}) — 次の queue 変更まで古い姿が残りえます",
+            f"[plan.sh warn] task-graph: 読み直しの要求を書けませんでした ({e})",
             file=sys.stderr,
         )
+        return False
 
 
 def _task_graph_pending_outstanding(path, read_started):

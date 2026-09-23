@@ -1061,3 +1061,198 @@ def test_manual_task_graph_accepts_a_foreign_queue_with_an_explicit_destination(
     assert r.returncode == 0, r.stderr
     assert "m-foreign:t001" in _by_id(json.loads(out.read_text()))
     assert sandbox.graph.read_bytes() == before, "本体の生成物が巻き込まれた"
+
+
+# ---------------------------------------------------------------------------
+# 印のロックを保持したまま止まっている実行が、plan.sh を止めないこと
+# ---------------------------------------------------------------------------
+#
+# 印のロック (`<生成物>.pending.lock`) は、保持時間がファイル 1 つの読み書きと
+# flock の解放だけの、非常に短いロックである。だからといって **期限なしで待つ**
+# と、保持したまま生きて止まっている実行が 1 つ居るだけで、以降の queue 変更
+# コマンドが全て無期限に待つ。可視化は付加機能なので、倒す先は「グラフが少し
+# 古くなる」でなければならず、「plan.sh が待たされる」であってはならない。
+#
+# とくに `retire --no-wait` は watchdog が **同期で** 叩く。watchdog は Worker の
+# 生死を見る唯一の主体なので、ここが止まると監視そのものが止まる。
+
+#: ロックを握ったまま止まっている実行を演じる。引数は「握るロックのパス …,
+#: 握り終えた印のパス」。**プロセスは生きたまま止まる** (死ぬと flock が外れて
+#: しまい、再現したい状況にならない)。
+_LOCK_STALLER_SRC = """
+import fcntl, pathlib, sys, time
+paths, ready = sys.argv[1:-1], pathlib.Path(sys.argv[-1])
+held = []
+for p in paths:
+    f = open(p, 'a+')
+    fcntl.flock(f, fcntl.LOCK_EX)
+    held.append(f)
+ready.write_text('held')
+time.sleep(600)
+"""
+
+#: 止まっている実行が居るときに plan.sh が返ってくるまでの上限 (テスト側の判定)。
+#: 本番の上限 (TASK_GRAPH_PENDING_LOCK_WAIT_SECONDS) より十分大きく取る —
+#: ここで見たいのは「有限で返る」であって、秒数の当てっこではない。
+PENDING_STALL_BUDGET = 25.0
+
+#: watchdog が `retire --no-wait` を叩くときの subprocess タイムアウト。
+#: plan.sh はこれより **内側** で返らなければ、監視を止めたことになる。
+WATCHDOG_RETIRE_TIMEOUT = 30.0
+
+
+def _stall_holding(tmp_path, *lock_paths, name="staller"):
+    """指定のロックを握ったまま止まるプロセスを起こし、握り終えるまで待つ。"""
+    ready = tmp_path / f"{name}.held"
+    for p in lock_paths:
+        pathlib.Path(p).parent.mkdir(parents=True, exist_ok=True)
+    proc = subprocess.Popen(
+        [sys.executable, "-c", _LOCK_STALLER_SRC, *map(str, lock_paths), str(ready)],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    try:
+        _wait_for_file(ready, 10.0, f"{name} がロックを握った印")
+    except BaseException:
+        proc.kill()
+        proc.wait(timeout=10)
+        raise
+    return proc
+
+
+def test_a_stalled_pending_lock_does_not_block_the_publisher(sandbox, tmp_path):
+    """印のロックを握ったまま止まっている実行が居ても、publish 側が返ること。
+
+    ここで止まるのは **本ロックを取れた側** である。印のロックを期限なしで待つと、
+    その実行は本ロックを握ったまま永久に止まる。つまり止まるのは 1 コマンドでは
+    なく、**以降の全ての queue 変更コマンド** である (全員が本ロックの 10 秒を
+    払ったうえで、同じ印のロックで無期限に詰まる)。
+
+    直っていれば、上限を過ぎた時点で publish 側は手を引いて返る。**そのとき
+    既にある要求の印を消さないこと** も併せて固定する: 消してよいのは「無い」と
+    確認できたときだけで、確認できていない以上、消せば要求者の最後の変更が
+    そのまま落ちる。残しておけば次に queue を触った実行が拾う。
+    """
+    sandbox.add_task("t001", "pending", [])
+    assert sandbox.run("task-graph").returncode == 0
+
+    pending = pathlib.Path(str(sandbox.graph) + ".pending")
+    pending_lock = pathlib.Path(str(sandbox.graph) + ".pending.lock")
+
+    # 先に置かれていた要求。手を引くときに巻き添えで消えてはいけない。
+    pending.write_text("999999 1\n")
+    before = pending.read_text()
+
+    staller = _stall_holding(tmp_path, pending_lock, name="pending-only")
+    try:
+        started = time.monotonic()
+        r = subprocess.run(
+            ["bash", str(sandbox.root / "scripts" / "plan.sh"),
+             "update", "t001", "--priority", "high"],
+            env=sandbox.env(), capture_output=True, text=True,
+            timeout=PENDING_STALL_BUDGET,
+        )
+        elapsed = time.monotonic() - started
+    except subprocess.TimeoutExpired:
+        pytest.fail(
+            f"印のロックを握ったまま止まっている実行が居るだけで、plan.sh が "
+            f"{PENDING_STALL_BUDGET}s 以内に返らなかった — 可視化のための "
+            f"任意機能が本体を止めている"
+        )
+    finally:
+        staller.kill()
+        staller.wait(timeout=10)
+
+    assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
+    assert elapsed < PENDING_STALL_BUDGET, elapsed
+    assert pending.exists(), (
+        "手を引くときに、確認できていない要求の印を消してしまっている — "
+        "要求者の最後の queue 変更がそのまま落ちる"
+    )
+    assert pending.read_text() == before, "印の中身が書き換わっている"
+    assert r.stderr.strip(), "手を引いたことが 1 行も報告されていない"
+
+
+def test_a_stalled_pending_lock_does_not_block_the_requester(sandbox, tmp_path):
+    """本ロックも印のロックも握られたまま止まっているとき、要求者が返ること。
+
+    要求者は本ロックを待ち切れずに引き返す側である。引き返す途中で要求の印を
+    置きに行き、そこで印のロックを **期限なしで** 待つ。Codex が指したのは
+    この経路で、本ロックの上限 (10 秒) を払い終えたあとに、上限の無い待ちが
+    続いてしまう。
+    """
+    sandbox.add_task("t001", "pending", [])
+    assert sandbox.run("task-graph").returncode == 0
+
+    staller = _stall_holding(
+        tmp_path,
+        str(sandbox.graph) + ".lock",
+        str(sandbox.graph) + ".pending.lock",
+        name="both",
+    )
+    requester = _publisher(sandbox, tmp_path, gate="none", name="requester",
+                           lock_wait=REQUESTER_LOCK_WAIT)
+    try:
+        try:
+            out, err = requester.communicate(timeout=PENDING_STALL_BUDGET)
+        except subprocess.TimeoutExpired:
+            requester.kill()
+            requester.communicate(timeout=10)
+            pytest.fail(
+                f"要求者が {PENDING_STALL_BUDGET}s 以内に返らなかった — "
+                f"印のロックの待ちに上限が無い"
+            )
+    finally:
+        staller.kill()
+        staller.wait(timeout=10)
+
+    assert requester.returncode == 0, f"要求者が失敗した: {err or out}"
+
+
+def test_retire_no_wait_returns_inside_the_watchdogs_timeout(sandbox, tmp_path):
+    """`retire --no-wait` が watchdog の 30 秒の内側で返ること (本番の定数で実測)。
+
+    watchdog は Worker の生死を見る唯一の主体で、この呼び出しを **同期で** 行う。
+    ここが subprocess タイムアウトまで持っていかれると、その間 **誰も Worker を
+    見ていない**。だからこのシナリオだけは待ち時間を harness で短くせず、本番の
+    上限 (本ロック + 印のロック) をそのまま払わせて測る。
+    """
+    sandbox.add_task("t001", "pending", [])
+    r = sandbox.run("pull", "--agent", "Ren", "--skills", "code")
+    assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
+    card = (sandbox.queue / "missions" / MISSION / "tasks" / "t001.md").read_text()
+    m = re.search(r"^started_at:\s*(\S+)\s*$", card, re.MULTILINE)
+    assert m, f"pull が started_at を書いていない: {card!r}"
+    generation = m.group(1).strip('"\'')
+
+    staller = _stall_holding(
+        tmp_path,
+        str(sandbox.graph) + ".lock",
+        str(sandbox.graph) + ".pending.lock",
+        name="retire",
+    )
+    try:
+        started = time.monotonic()
+        r = subprocess.run(
+            ["bash", str(sandbox.root / "scripts" / "plan.sh"),
+             "retire", "t001", "--agent", "Ren",
+             "--started-at", generation, "--no-wait"],
+            env=sandbox.env(), capture_output=True, text=True,
+            timeout=WATCHDOG_RETIRE_TIMEOUT,
+        )
+        elapsed = time.monotonic() - started
+    except subprocess.TimeoutExpired:
+        pytest.fail(
+            f"retire --no-wait が watchdog の {WATCHDOG_RETIRE_TIMEOUT}s の "
+            f"タイムアウトまで返らなかった — その間 Worker の生死を誰も見ていない"
+        )
+    finally:
+        staller.kill()
+        staller.wait(timeout=10)
+
+    assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
+    assert elapsed < WATCHDOG_RETIRE_TIMEOUT, elapsed
+    # 後始末そのものは、グラフの都合に一切引きずられずに成立していること。
+    card = (sandbox.queue / "missions" / MISSION / "tasks" / "t001.md").read_text()
+    assert re.search(r"^status:\s*pending\s*$", card, re.MULTILINE), card
+    print(f"[evidence] retire --no-wait elapsed={elapsed:.2f}s "
+          f"(watchdog timeout={WATCHDOG_RETIRE_TIMEOUT}s)")

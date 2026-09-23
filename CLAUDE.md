@@ -68,6 +68,13 @@
                         権限境界の設計は knowledge/daemon-authority.md
                         判定の設計は knowledge/watchdog-idle-judgment.md
                         ログ: logs/watchdog/watchdog-YYYYMMDD.log（日次）
+    lib_dep_rules.py    「依存が満たされた」の唯一の定義（`unmet_dependencies()` /
+                        `DEAD_DEP_STATUSES`）。**plan.sh pull・plan.sh task-graph・
+                        dispatcher.sh の 3 者がここだけを読む**。コピーを書き戻すと、
+                        ズレが出るのは QA FAIL の直後だけ（= 誰も疑わない瞬間）になる。
+                        フォールバックは持たない（読めなければ呼び出し側が落ちる）ので、
+                        plan.sh を単体でコピーする隔離テストでは一緒に置くこと。
+                        再発防止は tests/test_task_graph.py のコピー検出テスト
     kai-review.sh       Codex reviewer (Kai-codex) 起動ラッパー。詳細は `knowledge/codex-reviewer.md`
     taskvia-sync.sh     queue → Taskvia 同期
     lib_mux.py          mux 抽象化モジュール（TmuxBackend / HerdrBackend）
@@ -89,7 +96,14 @@
                         巻き戻さないため。キューロックの保持時間は伸びない）。待ち切れずに
                         引き返した実行は `tasks.json.pending` を置き、ロック保持者が読み直す。
                         手動で書き出すなら `plan.sh task-graph`（`CREWVIA_QUEUE` が
-                        `<root>/queue` でなければ拒否。書き先を明示すれば通る）
+                        `<root>/queue` でなければ拒否。書き先を明示すれば通る）。
+                        plugin は「空の tasks」と「依存の循環」でファイル全体を拒否するので、
+                        生成側で両方とも潰してある（t010）: task が 0 件のときは
+                        `[表示する task なし]` の node を 1 件だけ置き（最後の mission を
+                        archive した直後に必ず通る状態なので、画面が空にも古いままにも
+                        ならないようにするため）、循環は**その mission の中だけ**で
+                        後退辺を落として `[循環依存: <id>]` を title に残す（壊れた mission が
+                        他の mission の DAG を道連れにしないため）
     daemons/            dispatcher/watchdog 相互監視の heartbeat・pause マーカー・respawn 履歴
                         （.gitignore 対象）。hooks/post-tool-use.sh の同時死 backstop（t008）が
                         throttle マーカー（backstop-notify.throttle）を置く場所でもある

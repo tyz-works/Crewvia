@@ -318,6 +318,9 @@ def sandbox(tmp_path):
 
     (root / "scripts").mkdir(parents=True)
     shutil.copy2(REPO / "scripts" / "plan.sh", root / "scripts" / "plan.sh")
+    # plan.sh は依存規則 (lib_dep_rules.py) を自分の側の scripts/ から読む。
+    shutil.copy2(REPO / "scripts" / "lib_dep_rules.py",
+                 root / "scripts" / "lib_dep_rules.py")
 
     mission = root / "queue" / "missions" / SLUG
     (mission / "tasks").mkdir(parents=True)

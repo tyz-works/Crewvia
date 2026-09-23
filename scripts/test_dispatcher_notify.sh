@@ -117,7 +117,7 @@ EOF
 # ---------------------------------------------------------------------------
 run_python_check() {
   local notify_cache="$TMPDIR_TEST/notify-cache.json"
-  python3 - "$QUEUE" "$REGISTRY" "$notify_cache" "300" <<'PYEOF'
+  python3 - "$QUEUE" "$REGISTRY" "$notify_cache" "300" "$SCRIPT_DIR" <<'PYEOF'
 import sys
 import os
 import re
@@ -129,6 +129,11 @@ QUEUE_DIR      = Path(sys.argv[1])
 REGISTRY_DIR   = Path(sys.argv[2])
 NOTIFY_CACHE   = Path(sys.argv[3])
 NOTIFY_TTL     = int(sys.argv[4])
+# 依存判定の規則は本物 (scripts/lib_dep_rules.py) を読む。ここに
+# 「dispatcher.sh と同じロジック」を書き写すと、dispatcher が規則を
+# 変えてもこのテストだけは古い規則で緑のままになる。
+sys.path.insert(0, sys.argv[5])
+from lib_dep_rules import unmet_dependencies  # noqa: E402
 
 MISSIONS_DIR   = QUEUE_DIR / 'missions'
 STATE_FILE     = QUEUE_DIR / 'state.yaml'
@@ -224,8 +229,7 @@ unblocked_pending = []
 for meta, _ in tasks:
     if meta.get('status') != 'pending': continue
     bb = meta.get('blocked_by') or []
-    if any(dep not in done_ids and task_statuses.get(dep) not in ('failed', 'cancelled')
-           for dep in bb):
+    if unmet_dependencies(bb, done_ids, task_statuses):
         continue
     task_skills = set(meta.get('skills') or [])
     if not task_skills: continue

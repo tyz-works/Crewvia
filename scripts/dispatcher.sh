@@ -120,6 +120,11 @@ _SCRIPTS_DIR = REPO_ROOT / 'scripts'
 sys.path.insert(0, str(_SCRIPTS_DIR))
 from lib_mux import Mux, repo_identity_ok  # noqa: E402
 import lib_retirement  # noqa: E402
+# 「依存が満たされた」の定義は crewvia の中で 1 箇所しかない (t010 / QA t002 の
+# 指摘 F-2b)。ここに同じ規則のコピーを書き戻さないこと — plan.sh pull が割り当て
+# る task と dispatcher が投げる task がズレると、痛むのは QA FAIL の直後だけで、
+# その瞬間まで誰も気付かない。tests/test_task_graph.py がコピーの再発を見張る。
+from lib_dep_rules import unmet_dependencies  # noqa: E402
 _mux = Mux()
 
 # t002: who may end a Worker process.  'watchdog' (default) = this daemon only
@@ -1249,11 +1254,8 @@ def dispatch():
         done_ids = done_ids_by_mission.get(slug, set())
         task_statuses = task_statuses_by_mission.get(slug, {})
         bb = meta.get('blocked_by') or []
-        # failed/cancelled deps do not block: they indicate the dep will never
-        # complete, so downstream tasks should remain eligible for assignment.
-        unmet_deps = [dep for dep in bb
-                      if dep not in done_ids
-                      and task_statuses.get(dep) not in ('failed', 'cancelled')]
+        # 規則は lib_dep_rules に 1 つだけ (plan.sh pull / task-graph と共有)。
+        unmet_deps = unmet_dependencies(bb, done_ids, task_statuses)
         if unmet_deps:
             # Suppress repeated output of the same blocked state to avoid
             # flooding the scrollback (same line every 5s → 40-line buffer fills

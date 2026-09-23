@@ -76,11 +76,84 @@ def _call_name(node: ast.Call) -> str | None:
 # 1. 依存判定の規則は 1 箇所から来る
 # ---------------------------------------------------------------------------
 
-def test_unmet_dependency_rule_exists_as_one_helper(tree):
-    """READY / WAIT の判定が `unmet_dependencies()` に閉じていること。"""
-    assert "unmet_dependencies" in _functions(tree), (
-        "依存判定のヘルパー unmet_dependencies() が無い。"
-        "pull と task-graph が別々に規則を持つと、QA FAIL 直後にだけ嘘をつく DAG になる。"
+DEP_RULES_PY = REPO_ROOT / "scripts" / "lib_dep_rules.py"
+
+
+def _dep_rules():
+    """規則の本体モジュールを読み込む。"""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("lib_dep_rules", DEP_RULES_PY)
+    assert spec and spec.loader, f"{DEP_RULES_PY} を読めない"
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_unmet_dependency_rule_exists_as_one_helper():
+    """依存判定の本体が scripts/lib_dep_rules.py にあること。
+
+    規則を読む主体は 3 つある (plan.sh pull / plan.sh task-graph /
+    dispatcher.sh)。置き場が 1 つでなくなると、ズレは QA FAIL の直後だけ、
+    つまり誰も疑わない瞬間に現れる。
+    """
+    mod = _dep_rules()
+    assert callable(mod.unmet_dependencies)
+    assert mod.DEAD_DEP_STATUSES, "DEAD_DEP_STATUSES が空"
+
+
+def test_plan_sh_takes_the_rule_from_the_module_instead_of_defining_it(tree):
+    """plan.sh が規則を自前で定義し直していないこと。"""
+    assert "unmet_dependencies" not in _functions(tree), (
+        "plan.sh が unmet_dependencies() を自前で定義している。"
+        "規則は scripts/lib_dep_rules.py から取ること"
+    )
+    src = _plan_py_source()
+    assert "lib_dep_rules" in src, "plan.sh が lib_dep_rules を読んでいない"
+    assert "unmet_dependencies = " in src, (
+        "plan.sh の名前空間に unmet_dependencies が束縛されていない"
+    )
+
+
+#: 規則のコピーが残っていないかを見に行く範囲。
+_RULE_SCAN_GLOBS = ("scripts/*.sh", "scripts/*.py", "hooks/*.sh", "tests/*.py")
+
+
+def test_no_script_keeps_its_own_copy_of_the_rule():
+    """DEAD_DEP_STATUSES の中身を直書きした箇所が、本体以外に無いこと。
+
+    dispatcher.sh には PR #212 のあとも同じ規則の独自コピーが残っていた
+    (QA t002 の指摘 F-2b)。「今は一致している」は、片方だけ直せる形が残って
+    いるかぎり保証ではない。テスト側の写し (「dispatcher.sh と同じロジック」)
+    も同罪で、そちらは *本物を直しても緑のまま* になるぶん質が悪い。
+
+    探す文字列は本体の DEAD_DEP_STATUSES から組み立てる。このテスト自身に
+    リテラルを書かないので、規則の中身が変わっても探し先は自動で追従する。
+    """
+    needle = ", ".join(repr(s) for s in _dep_rules().DEAD_DEP_STATUSES)
+
+    offenders = []
+    for glob in _RULE_SCAN_GLOBS:
+        for path in sorted(REPO_ROOT.glob(glob)):
+            if path.resolve() == DEP_RULES_PY.resolve():
+                continue
+            if needle in path.read_text(errors="replace"):
+                offenders.append(str(path.relative_to(REPO_ROOT)))
+
+    assert not offenders, (
+        f"依存規則のコピーが残っている: {offenders} — "
+        f"scripts/lib_dep_rules.py の unmet_dependencies() を呼ぶこと"
+    )
+
+
+def test_dispatcher_uses_the_shared_rule():
+    """dispatcher.sh が規則を import して呼んでいること。"""
+    src = (REPO_ROOT / "scripts" / "dispatcher.sh").read_text()
+    assert "from lib_dep_rules import unmet_dependencies" in src, (
+        "dispatcher.sh が共有の依存規則を import していない"
+    )
+    assert "unmet_deps = unmet_dependencies(" in src, (
+        "dispatcher.sh が unmet_dependencies() を呼んでいない"
     )
 
 
@@ -203,6 +276,10 @@ STATUS_ROWS = [
     ("t012", "pending", [], "ready", None),          # 依存なし → 実行可能
     ("t013", "pending", ["t004"], "waiting", None),  # 依存が in_progress → 依存待ち
     ("t014", "pending", ["t006"], "ready", None),    # 依存が failed → crewvia は dispatch する
+    # `cancelled` は DEAD_DEP_STATUSES 側の終端。`blocked` に畳むと「依存先は
+    # blocked なのに下流は READY」という、依存規則と食い違う画面になる。
+    ("t015", "cancelled", [], "failed", "[中止]"),
+    ("t016", "pending", ["t015"], "ready", None),    # 依存が cancelled → dispatch する
 ]
 
 
@@ -246,7 +323,9 @@ def sandbox(tmp_path):
     root = tmp_path / "repo"
     (root / "scripts").mkdir(parents=True)
     shutil.copy2(PLAN_SH, root / "scripts" / "plan.sh")
-    for extra in ("lib_registry.py", "lint_plan.py"):
+    # lib_dep_rules.py は必須 (plan.sh が起動時に読む依存規則の本体)。
+    # 残りは、その subcommand を使うときだけ要る補助。
+    for extra in ("lib_dep_rules.py", "lib_registry.py", "lint_plan.py"):
         src = REPO_ROOT / "scripts" / extra
         if src.exists():
             shutil.copy2(src, root / "scripts" / extra)
@@ -542,6 +621,10 @@ def test_output_follows_crewvia_repo_root_not_script_location(sandbox, tmp_path)
     worktree = tmp_path / "wt"
     (worktree / "scripts").mkdir(parents=True)
     shutil.copy2(PLAN_SH, worktree / "scripts" / "plan.sh")
+    # 本物の worktree には scripts/ が丸ごと在る。plan.sh は依存規則を
+    # 自分の側の scripts/ から読むので、ここでも一緒に置く。
+    shutil.copy2(REPO_ROOT / "scripts" / "lib_dep_rules.py",
+                 worktree / "scripts" / "lib_dep_rules.py")
 
     sandbox.add_task("t001", "pending", [])
     assert sandbox.run("task-graph").returncode == 0

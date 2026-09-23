@@ -850,26 +850,36 @@ def list_tasks(slug, base_dir=None, quiet=False):
 # ---------------------------------------------------------------------------
 # Dependency readiness — 「依存が満たされた」の唯一の定義
 # ---------------------------------------------------------------------------
+#
+# 規則の本体は scripts/lib_dep_rules.py にある。pull / task-graph / dispatcher
+# の 3 者が同じ 1 つの定義を読むためで、経緯と「なぜフォールバックを置かない
+# のか」はそのファイルの docstring に書いてある。
+#
+# 読み込み元は REPO_ROOT (= 実行された plan.sh 自身の置き場) であって
+# CREWVIA_REPO_ROOT ではない。コードは、今走っている plan.sh と同じ checkout
+# から来なければならない — worktree の plan.sh が本体のコードを読むと、
+# worktree で直したはずの規則が効かない。
 
-#: 「この依存はもう完了しない」ことが確定している status。crewvia はこれらを
-#: 満たされた扱いにして下流を進める — QA が FAIL した直後に、その fix task まで
-#: 永久に止まってしまうのを避けるため。
-DEAD_DEP_STATUSES = ('failed', 'cancelled')
 
+def _load_dep_rules():
+    """scripts/lib_dep_rules.py を読む。失敗はそのまま外に出す。
 
-def unmet_dependencies(blocked_by, done_ids, task_statuses):
-    """`blocked_by` のうち、まだ満たされていない依存の一覧を返す。
-
-    この規則は crewvia の中で 1 箇所しか持たない。pull が「割り当ててよいか」を
-    決める規則と、task-graph が書き出す READY / WAIT は同じものでなければ
-    ならない。分裂した瞬間、QA FAIL の直後 —— 「次に何が動けるのか」を最も知り
-    たい瞬間 —— にだけ、実際は dispatch される task を DAG が WAIT と表示する。
-
-    存在しない task への依存 (dangling) は `task_statuses` に無いので unmet 側に
-    落ちる。crewvia の pull もそう扱う (永久に blocked) ので、ここでも同じ。
+    ここを try で包んで自前の規則に落ちると、「規則は 1 箇所」という性質が
+    壊れた環境でだけ静かに失われる。plan.sh が起動しないほうがまだよい。
     """
-    return [dep for dep in (blocked_by or [])
-            if dep not in done_ids and task_statuses.get(dep) not in DEAD_DEP_STATUSES]
+    import importlib.util, pathlib
+    path = pathlib.Path(REPO_ROOT) / 'scripts' / 'lib_dep_rules.py'
+    spec = importlib.util.spec_from_file_location('lib_dep_rules', path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f'依存規則のモジュールを読めません: {path}')
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+_DEP_RULES = _load_dep_rules()
+DEAD_DEP_STATUSES = _DEP_RULES.DEAD_DEP_STATUSES
+unmet_dependencies = _DEP_RULES.unmet_dependencies
 
 
 # ---------------------------------------------------------------------------
@@ -910,6 +920,13 @@ TASK_GRAPH_STATUS_MAP = {
     'verifying':              ('running', None),
     'failed':                 ('failed',  None),
     'verification_failed':    ('failed',  '[検証NG]'),
+    # `cancelled` は DEAD_DEP_STATUSES の側 —— 「もう完了しない」が確定した
+    # 終端で、`done` / `verified` / `skipped` (= TERMINAL_STATUSES) のような
+    # 「完了した」ではない。だから done ではなく failed に畳む: そうすれば
+    # 「依存先が終端 → 下流は READY」という見え方が failed とまったく同じに
+    # なり、依存規則と矛盾しない。done に畳むと、中止したものを完了したと
+    # 主張することになる。失敗ではないことは印で分ける ([skip] と同じやり方)。
+    'cancelled':              ('failed',  '[中止]'),
     # (c) blocked_reason 付きで明示的に止められている
     'blocked':                ('blocked', '[停止]'),
     # (b) 人間の判断待ち。(a) 依存待ち (= waiting) とは plugin の状態そのもので
@@ -924,6 +941,17 @@ TASK_GRAPH_STATUS_MAP = {
 #: 表に無い status。done にも ready にも倒さない — 「進んでよい」と読める側に
 #: 倒すと、知らない状態が黙って実行可能に見える。
 TASK_GRAPH_UNKNOWN = ('blocked', '[status不明]')
+
+#: ペインを持たない実行者に回る skill。`pane_match` は「この task が今どのペイン
+#: で動いているか」を plugin に教える欄なので、ペインが存在しない実行者に対して
+#: 名前を書くのは、当たらないだけでなく事実として誤りになる。
+#:
+#: `codex-review` は dispatcher が kai-review.sh を `nohup` + detached process
+#: group で起動する (dispatcher.sh CODEX_REVIEW_SKILLS)。mux のペインは作られ
+#: ないので、Kai-codex というペインはどこにも無い。QA t002 の指摘 F-1c は
+#: `Kai-codex-worker` と書かれていたことだが、正しい名前に直すのではなく欄ごと
+#: 出さないのが正解 —— 正しい名前に直しても、当たらないことは変わらない。
+PANELESS_SKILLS = {'codex-review'}
 
 
 def task_graph_enabled():
@@ -1000,6 +1028,107 @@ def _task_graph_worker(meta):
     return worker
 
 
+def break_dependency_cycles(nodes):
+    """循環を閉じている辺だけを落とし、落とした側の title に印を残す。
+
+    plugin の `load_config` は循環を見つけると `ValueError` を投げ、**ファイル
+    全体** を拒否する。つまり 1 つの mission の循環が、他の mission も含めた
+    全 DAG を表示不能にする。そして crewvia 側はいま循環を作れてしまう:
+    `plan.sh lint` は FAIL にするが `plan.sh update --blocked-by` は rc=0 で
+    通すので、普通の操作で可視化が全滅しうる。
+
+    採ったやり方は、list_tasks が破損 task を `[破損]` 疑似ステータスで隔離する
+    のと同じ —— **壊れているところだけを隔離して、残りは今までどおり見せる**。
+    task は 1 つも消さず、落とすのは循環を閉じている辺だけにする。
+
+    落とす辺は DFS の後退辺 (いま辿っている経路上の node に戻る辺) で決める。
+    後退辺だけが循環を閉じるので、これを外せば必ず非循環になり、外す数も最小で
+    済む。自己依存 (t001 → t001) も後退辺として同じ経路で落ちる。走査順は
+    `nodes` の順 (= list_tasks の順) に固定なので、同じ入力なら必ず同じ結果。
+
+    status は触らない。循環している task は実際に pull できない (依存が永久に
+    満たされない) ので、辺を落とす前に決まった `waiting` が事実のまま正しい。
+    落とした辺は `[循環依存: <id>]` として title に出す —— dangling を
+    `[依存不明: ...]` で見せるのと同じで、消した情報を黙って消さないため。
+    """
+    by_id = {n['id']: n for n in nodes}
+    WHITE, GREY, BLACK = 0, 1, 2
+    color = {node_id: WHITE for node_id in by_id}
+    cut = {}
+
+    for root in [n['id'] for n in nodes]:
+        if color[root] != WHITE:
+            continue
+        color[root] = GREY
+        stack = [(root, iter(list(by_id[root]['depends_on'])))]
+        while stack:
+            node_id, deps = stack[-1]
+            descended = False
+            for dep in deps:
+                if dep not in by_id:
+                    continue
+                if color[dep] == GREY:
+                    # 後退辺 — この辺が循環を閉じている。
+                    cut.setdefault(node_id, set()).add(dep)
+                elif color[dep] == WHITE:
+                    color[dep] = GREY
+                    stack.append((dep, iter(list(by_id[dep]['depends_on']))))
+                    descended = True
+                    break
+            if not descended:
+                color[node_id] = BLACK
+                stack.pop()
+
+    for node_id, dropped in cut.items():
+        node = by_id[node_id]
+        node['depends_on'] = [d for d in node['depends_on'] if d not in dropped]
+        node['title'] = (
+            '[循環依存: ' + ', '.join(sorted(dropped)) + '] ' + node['title']
+        )
+    return nodes
+
+
+#: task が 1 件も無いときに置くプレースホルダの id。`<slug>:<tNNN>` 形式の実 id
+#: とは別物にしてあるが、そもそも「他に node が 1 つも無い」ときにしか置かない
+#: ので、id が衝突することは構造上ありえない。
+TASK_GRAPH_EMPTY_ID = 'crewvia:no-active-tasks'
+
+
+def task_graph_placeholder(slugs):
+    """task が 0 件のときに置く、node 1 件だけのグラフの中身を返す。
+
+    plugin は `tasks` が空だと `ValueError: tasks must be a non-empty array` で
+    ファイル全体を拒否する。そして task 0 件は異常ではない —— **最後の mission
+    を archive した直後、つまりミッションとミッションの間の普通の状態** がまさに
+    それで、起動なら例外、稼働中なら `r` (reload) がエラー表示になる。通常運用で
+    必ず通る状態なので、ここで壊れるのは許容できない。
+
+    採れた道は 3 つあった。(1) ファイルを書かない、(2) 前回の内容を残す、
+    (3) プレースホルダを 1 件置く。
+
+    (1) と (2) は言い方が違うだけで、ディスク上の結果は同じ —— 画面には
+    *もう存在しない* mission の DAG が、現在の姿として出たままになる。グラフは
+    「今どうなっているか」を見るためのものなので、古い姿を現在として見せるのは、
+    何も見せないより悪い。しかも直前が最後の mission の完了直後なら、全部 done
+    の画面が次のミッションが始まるまで延々と残る。
+
+    採ったのは (3)。ファイルは常に妥当で、常に現在を映し、「今は何も無い」が
+    まさにそう読める形で出る。status は `blocked`: 実行可能に読める側 (`ready`)
+    にも、完了したと読める側 (`done`) にも倒さない —— TASK_GRAPH_UNKNOWN と
+    同じ理由で、偽の node が動かせる / 終わっていると見えるほうが害が大きい。
+    """
+    if not slugs:
+        reason = 'active mission がありません'
+    else:
+        reason = 'active mission に task がありません (' + ', '.join(slugs) + ')'
+    return {
+        'id': TASK_GRAPH_EMPTY_ID,
+        'title': '[表示する task なし] ' + reason,
+        'depends_on': [],
+        'status': 'blocked',
+    }
+
+
 def build_task_graph(state):
     """active mission 全部を plugin の入力形式に変換する。
 
@@ -1011,6 +1140,7 @@ def build_task_graph(state):
     for slug in slugs:
         if not os.path.isdir(mission_dir(slug)):
             continue
+        mission_nodes = []
         tasks = list_tasks(slug, quiet=True)
         done_ids = {m['id'] for (m, _) in tasks if m.get('status') in TERMINAL_STATUSES}
         task_statuses = {m['id']: m.get('status') for (m, _) in tasks}
@@ -1050,12 +1180,21 @@ def build_task_graph(state):
                 'status': status,
             }
             worker = _task_graph_worker(meta)
-            if worker and raw_status not in TERMINAL_STATUSES:
+            paneless = bool(set(meta.get('skills') or []) & PANELESS_SKILLS)
+            if worker and raw_status not in TERMINAL_STATUSES and not paneless:
                 # crewvia のペイン名は `<AGENT_NAME>-<ROLE>` (start.sh)。Worker は
                 # `<名前>-worker`。完了済み task の worker 欄は履歴であって、今
                 # そのペインが居る場所ではない (名前は使い回される) ので出さない。
                 node['pane_match'] = f'{worker}-worker'
-            nodes.append(node)
+            mission_nodes.append(node)
+
+        # 循環の切断は mission 単位で行う。depends_on は同じ slug で修飾されて
+        # いるので辺は mission をまたがず、「壊れた mission だけを隔離する」が
+        # この単位でそのまま成り立つ。
+        nodes.extend(break_dependency_cycles(mission_nodes))
+
+    if not nodes:
+        nodes = [task_graph_placeholder(slugs)]
 
     if len(slugs) == 1:
         title = f'crewvia / {slugs[0]}'

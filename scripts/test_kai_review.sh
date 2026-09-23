@@ -164,6 +164,8 @@ MAIN_WT_HEAD_BEFORE_ALL="$(git -C "$FIXTURE_REPO" rev-parse HEAD)"
 # 余計な worktree を作らないようにする。plan.sh 本体のロジックは本物のまま。
 mkdir -p "$FIXTURE_REPO/scripts"
 cp "$REAL_PLAN_SH" "$FIXTURE_REPO/scripts/plan.sh"
+# plan.sh は依存規則 (lib_dep_rules.py) を自分の側の scripts/ から読む。
+cp "$OWN_CHECKOUT_ROOT/scripts/lib_dep_rules.py" "$FIXTURE_REPO/scripts/lib_dep_rules.py"
 
 # t006: kai-review.sh は SCHEMA_FILE を ${CREWVIA_REPO_ROOT:-$REPO_ROOT}/config/... で
 # 解決する。run_kai() は CREWVIA_REPO_ROOT=$FIXTURE_REPO を渡すため、本物の schema

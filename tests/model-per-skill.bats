@@ -20,6 +20,34 @@ START_SH="${REPO_ROOT}/scripts/start.sh"
 REAL_CONFIG="${REPO_ROOT}/config/crewvia.yaml"
 
 # ---------------------------------------------------------------------------
+# 本番 mux への出口を塞ぐ (t037)
+# ---------------------------------------------------------------------------
+# CREWVIA_PRINT_MODEL=1 は start.sh の副作用のある処理より前で exit するので、
+# 今日のこの suite は mux に届かない。届かないことを **start.sh のどこで exit
+# するか** に預けているのが問題で、その行が動いた瞬間、この suite は本番の
+# herdr ワークスペースに Worker ペインを作り始める。2026-09-23 に pytest 側で
+# 起きたのと同じ形 (テストが本番の mux を掴む) なので、bash 側の唯一の隔離手段
+# である PATH のスタブをここでも置いておく。
+setup() {
+  MUX_STUB_DIR="$(mktemp -d)"
+  # 名前はリテラルで書く: 「この suite は tmux / herdr を潰している」を、
+  # tests/test_mux_production_safety.py の全数点検が読み取れるようにするため。
+  printf '#!/usr/bin/env bash\nexit 1\n' > "${MUX_STUB_DIR}/tmux"
+  printf '#!/usr/bin/env bash\nexit 1\n' > "${MUX_STUB_DIR}/herdr"
+  chmod +x "${MUX_STUB_DIR}/tmux" "${MUX_STUB_DIR}/herdr"
+  export PATH="${MUX_STUB_DIR}:${PATH}"
+}
+
+teardown() {
+  # start-sh-mux-gate.bats と同じ後始末 (find -delete + rmdir)。
+  if [[ -n "${MUX_STUB_DIR:-}" && -d "$MUX_STUB_DIR" ]]; then
+    find "$MUX_STUB_DIR" -mindepth 1 -delete 2>/dev/null || true
+    rmdir "$MUX_STUB_DIR" 2>/dev/null || true
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------------------
 # Test 1: env 明示指定が model_per_skill より優先される
 # ---------------------------------------------------------------------------
 @test "CREWVIA_WORKER_MODEL 明示指定は skill mapping を上書きする" {

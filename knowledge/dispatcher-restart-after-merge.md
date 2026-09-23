@@ -29,6 +29,15 @@ dispatcher tab を restart せずに再検証すると **OBS-1 バグが再現�
 
 ## restart 手順
 
+> **⚠️ 素の `lib_mux.py kill` → `spawn` は使わないこと (t005 以降)。**
+> dispatcher と watchdog は互いの生存を見張るようになった
+> (`knowledge/daemon-authority.md` §7)。kill と spawn の**隙間でデーモンは本当に
+> 死んでいる**ので、そこを見た相手が正しく respawn し、その直後に手で打った spawn が
+> 上に乗って**二重起動**になる。dispatcher が 2 つになると同じ task が 2 人の Worker に
+> 渡るので、これは restart で起こしうる一番重い事故である。
+>
+> 停止マーカーを挟む `restart` サブコマンドを使えば、この隙間は開かない。
+
 ### dispatcher の restart 例
 
 ```bash
@@ -36,28 +45,79 @@ dispatcher tab を restart せずに再検証すると **OBS-1 バグが再現�
 cd /path/to/crewvia
 git fetch origin main && git pull --ff-only origin main
 
-# 2. 稼働中の dispatcher tab を kill
-python3 scripts/lib_mux.py kill dispatcher
+# 2. restart (pause → kill → spawn → resume を 1 コマンドで)
+python3 scripts/lib_daemon_watch.py restart dispatcher
 
-# 3. dispatcher tab を respawn
-REPO="$PWD"
-python3 scripts/lib_mux.py spawn dispatcher \
-  "cd '${REPO}' && bash '${REPO}/scripts/dispatcher.sh'" \
-  "${REPO}"
-
-# 4. 起動確認 (ログの最終行が "Starting dispatcher (PID ...)" になっていること)
+# 3. 起動確認 (ログの最終行が "Starting dispatcher (PID ...)" になっていること)
 tail -3 logs/dispatcher/dispatcher-$(date +%Y%m%d).log
+
+# 4. 相互監視から見た状態確認
+#    双方が running=[<pid>] で、PAUSED が付いていないこと。
+#    running は heartbeat ではなく /proc の実走査なので、heartbeat がまだ
+#    書かれていない起動直後でも正しく答える。
+python3 scripts/lib_daemon_watch.py status
 ```
+
+### restart が「このペインは自分のものではない」と断ったとき (t037)
+
+```
+[daemon-watch] restart dispatcher: refused — the pane is not this checkout's
+to end (foreign: pid 12345 runs /other/crewvia/scripts/dispatcher.sh,
+not /path/to/crewvia/scripts/dispatcher.sh). Nothing was killed.
+Pass --force to override.
+```
+
+kill する前に、**そのペインで走っているのが自分の checkout のデーモンか**を
+`/proc` で確かめている (`daemon-authority.md` §7-11)。断られる理由は 2 つ:
+
+- `foreign` — 別 checkout の同じデーモンが入っている。**まず自分がどこに居るか
+  を疑うこと**。worktree から叩いていないか、herdr の古い env を引きずって
+  いないかを見る (`CREWVIA_HERDR_WORKSPACE` / `CREWVIA_TMUX_SESSION`)。本当に
+  そのペインを引き取りたいなら `--force`。
+- `unknown` — ペインの pid か `/proc` が読めない。再実行で直ることが多い。
+  直らなければ `--force`。
+
+```bash
+python3 scripts/lib_daemon_watch.py restart dispatcher --force
+```
+
+`--force` はこの確認だけを飛ばす。pause マーカーもロックも従来どおり効く。
 
 ### watchdog の restart 例
 
 ```bash
-python3 scripts/lib_mux.py kill watchdog
-REPO="$PWD"
-python3 scripts/lib_mux.py spawn watchdog \
-  "cd '${REPO}' && python3 '${REPO}/scripts/watchdog.py'" \
-  "${REPO}"
+python3 scripts/lib_daemon_watch.py restart watchdog
 ```
+
+### 両方を同時に restart する場合
+
+`CREWVIA_KILL_AUTHORITY` の切り替えなど、**両デーモンを同時に入れ替える**必要が
+あるとき (`daemon-authority.md` §5-3) は、**先に両方 pause してから** kill する。
+片方だけ pause して kill すると、生きている側が死んだ側を起こしてしまう。
+
+```bash
+TOK_D=$(python3 scripts/lib_daemon_watch.py pause dispatcher --reason "同時 restart")
+TOK_W=$(python3 scripts/lib_daemon_watch.py pause watchdog   --reason "同時 restart")
+
+python3 scripts/lib_mux.py kill dispatcher
+python3 scripts/lib_mux.py kill watchdog
+
+python3 scripts/lib_mux.py spawn dispatcher \
+  "$(python3 scripts/lib_daemon_watch.py spawn-cmd dispatcher)" "$PWD"
+python3 scripts/lib_mux.py spawn watchdog \
+  "$(python3 scripts/lib_daemon_watch.py spawn-cmd watchdog)" "$PWD"
+
+python3 scripts/lib_daemon_watch.py resume dispatcher --token "$TOK_D"
+python3 scripts/lib_daemon_watch.py resume watchdog   --token "$TOK_W"
+```
+
+起動コマンドを手で書かず `spawn-cmd` から取るのは、`Mux.spawn()` の `env=` 引数が
+**両 backend とも無視される**ため、`CREWVIA_MUX` をコマンド文字列に埋め込む必要が
+あるからである。手書きすると、起こし直したデーモンだけ別の backend を向く。
+
+> pause したまま resume を忘れると、そのデーモンは相互監視の対象外になる
+> (相手が死んでも誰も起こさない)。30 分でその旨が Director に 1 度通知されるが、
+> `status` に `PAUSED` が出ていないことを確認しておくとよい。
 
 ---
 
@@ -79,4 +139,6 @@ restart は **fix 効果検証の前提** であるため、mission 完了後の
 
 - MEMORY: `dispatcher-restart-after-merge` — この運用上の落とし穴の背景
 - `scripts/lib_mux.py` — kill / spawn の実装
+- `scripts/lib_daemon_watch.py` — `restart` / `pause` / `resume` / `status` / `spawn-cmd`
+- `knowledge/daemon-authority.md` §7 — 相互監視の設計 (なぜ pause を挟むのか)
 - `knowledge/ops.md` — その他の運用手順

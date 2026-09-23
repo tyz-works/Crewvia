@@ -43,9 +43,34 @@ _SCRIPTS_DIR = Path(__file__).parent
 sys.path.insert(0, str(_SCRIPTS_DIR))
 from lib_mux import Mux, repo_identity_ok  # noqa: E402
 import lib_retirement  # noqa: E402
+import lib_daemon_watch  # noqa: E402
 _mux = Mux()
 
 __version__ = "2.1.0"
+
+#: t005: this daemon's half of the mutual watch, built in run().  Module-level
+#: because `graceful_terminate()` — which blocks the main loop for up to 70s —
+#: has to keep the heartbeat going from deep inside its wait loops, and it is
+#: reached from places that have no watcher to pass down.
+_DAEMON_WATCH = None
+
+
+def _beat() -> None:
+    """Say "still alive", from anywhere, without ever raising.
+
+    Called from the main loop *and* from inside the blocking waits in
+    `graceful_terminate()`.  Those waits are the dangerous stretch: 60s of
+    grace plus 10s before SIGKILL is long enough to cross any sane staleness
+    threshold, so a watchdog that only beat once per cycle would be declared
+    dead every time it terminated a Worker — and respawned on top of itself,
+    with two watchdogs then racing the same retirement.
+    """
+    if _DAEMON_WATCH is None:
+        return
+    try:
+        _DAEMON_WATCH.beat()
+    except Exception as exc:
+        _log(f"[daemon-watch] heartbeat failed: {exc!r}")
 
 # t002: which daemon is allowed to end a Worker process.
 #
@@ -652,6 +677,7 @@ def graceful_terminate(monitor: WorkerMonitor) -> None:
     # Wait grace period, checking if Worker exits on its own
     for _ in range(TERMINATE_GRACE_PERIOD):
         time.sleep(1)
+        _beat()  # t005: the main loop is blocked here — keep proving we live
         if monitor._mux_window_name() is None:
             _log(f"[terminate] {monitor.agent_name}/{monitor.task_id}: Worker exited gracefully")
             return
@@ -674,7 +700,9 @@ def graceful_terminate(monitor: WorkerMonitor) -> None:
             os.kill(pane_pid, signal.SIGTERM)
         except ProcessLookupError:
             return
-        time.sleep(KILL_DELAY)
+        for _ in range(KILL_DELAY):
+            time.sleep(1)
+            _beat()  # t005: same reason as the grace loop above
         # Re-verify once more immediately before SIGKILL — same rationale,
         # smaller window (KILL_DELAY=10s).
         if not repo_identity_ok(monitor.repo_root):
@@ -709,6 +737,26 @@ def _director_name() -> str:
 
 def _notify_director(message: str) -> bool:
     return bool(_mux.send(_director_name(), message))
+
+
+def _watch_dispatcher() -> None:
+    """Is the dispatcher still alive?  (t005)
+
+    Caught wholesale on purpose: the mutual watch exists to make outages
+    louder, and one that can abort the monitoring cycle would instead make
+    them worse.
+    """
+    if _DAEMON_WATCH is None:
+        return
+    try:
+        verdict = _DAEMON_WATCH.watch_peer()
+    except Exception as exc:
+        _log(f"[daemon-watch] cycle failed: {exc!r}")
+        return
+    if verdict.action not in (lib_daemon_watch.ACTION_HEALTHY,
+                              lib_daemon_watch.ACTION_GRACE,
+                              lib_daemon_watch.ACTION_DISABLED):
+        _log(f"[daemon-watch] dispatcher: {verdict.action} — {verdict.reason}")
 
 
 def should_monitor(task_card: dict, retirement, authority: str) -> bool:
@@ -1037,6 +1085,21 @@ def run(repo_root: Path, interval: int) -> None:
     authority = kill_authority()
     retirement = make_retirement_executor(repo_root, queue_dir=queue_dir)
 
+    # t005: mutual watch.  Built before the first cycle and beaten immediately,
+    # so the very first thing this process does is stop looking dead — a gap
+    # here is a window in which dispatcher would respawn a watchdog that is
+    # in fact three lines into booting.
+    global _DAEMON_WATCH
+    _DAEMON_WATCH = lib_daemon_watch.DaemonWatch(
+        registry_dir=registry_dir,
+        repo_root=repo_root,
+        self_name=lib_daemon_watch.DAEMON_WATCHDOG,
+        mux=_mux,
+        config=lib_daemon_watch.load_config(),
+        log=_log,
+    )
+    _beat()
+
     _backend_name = type(_mux._backend).__name__
     _log(
         f"Starting Watchdog v2 (PID {os.getpid()}, interval={interval}s, "
@@ -1072,6 +1135,12 @@ def run(repo_root: Path, interval: int) -> None:
     while True:
         try:
             _assert_repo_identity_or_exit(repo_root)
+
+            # t005: both halves of the mutual watch, before anything that can
+            # fail on queue contents.  Beat first: this daemon's liveness must
+            # not depend on being able to parse a task card.
+            _beat()
+            _watch_dispatcher()
 
             active_tasks = load_active_tasks(queue_dir)
             active_keys = {(slug, tid) for slug, tid, _ in active_tasks}

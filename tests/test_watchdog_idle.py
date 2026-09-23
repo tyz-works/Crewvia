@@ -89,11 +89,23 @@ WINDOW = f"{AGENT}-worker"
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _make_monitor(tmp_path: Path, idle: int = 300, max_threshold: int = 3600):
-    """task frontmatter 相当の dict から WorkerMonitor を組み立てる。"""
+def _make_monitor(tmp_path: Path, idle: int = 300, max_threshold: int = 3600,
+                  pulled_seconds_ago: float = 86400):
+    """task frontmatter 相当の dict から WorkerMonitor を組み立てる。
+
+    `pulled_seconds_ago` は frontmatter の `started_at` になる。t044 以降、
+    **監視が始まる前のシグナルは idle の根拠にならない** ので、「N 秒前の
+    activity で判定される」テストは「その Worker が少なくとも N 秒前から
+    この task に就いている」という前提込みでないと成立しない (既定の 1 日は
+    このファイルのどのシグナル年齢よりも古いので、floor は無効になる)。
+
+    floor そのものの挙動は tests/test_watchdog_stale_signal_floor.py が持つ。
+    """
     card = {
         "worker": AGENT,
         "timeout": {"idle": idle, "max": max_threshold},
+        "started_at": time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - pulled_seconds_ago)),
     }
     return watchdog.WorkerMonitor(
         task_id=TASK_ID,

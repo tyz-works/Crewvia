@@ -783,8 +783,50 @@ def save_task(slug, task_id, meta, body):
     _atomic_write(task_path(slug, task_id), serialize_frontmatter(meta, body))
 
 
+def _isolated_task(task_id, title, reason):
+    """読めないカードを「見える形で隔離する」ときの、唯一の作り方。
+
+    `[破損]` 疑似ステータスは pending でも終端でもない。だから pull も dispatch
+    もこのカードを拾わず、同時に「mission が完了した」とも数えられない。依存して
+    いる下流は waiting のまま止まる —— これが正しい: 中身が信用できないカードを
+    「満たされた依存」として下流を動かしてはならない。
+    """
+    return {
+        'id': task_id,
+        'title': '[破損] ' + title,
+        'status': CORRUPT_TASK_STATUS,
+        'skills': [],
+        'blocked_by': [],
+        'parse_error': reason,
+    }, ''
+
+
 def list_tasks(slug, base_dir=None, quiet=False):
     """Return list of (meta, body) sorted by tNNN.
+
+    task の識別子は **ファイル名** から来る。frontmatter の `id` ではない。
+    `task_path()` が `<id>.md` を前提にしている以上ファイル名が本体で、`id` 欄は
+    同じことの言い直しでしかないが、誰も突き合わせていなかった (Codex 4 巡目)。
+
+    突き合わせないと 2 つ壊れる。
+
+    * `tNNN.md` をコピーして `id` 行を直し忘れると、同じ id の node が 2 つ並ぶ。
+      plugin はそれで **ファイル全体** を拒否するので、無関係な mission の DAG
+      まで消える (t010 の循環・空配列とまったく同じ巻き添えの型)。
+    * もっと悪いのは可視化の外側だ。`pull` は割り当てたカードを
+      `save_task(slug, meta['id'], ...)` で書き戻すので、`t002.md` が `id: t001`
+      を名乗っていると **t001.md が t002 の内容で上書きされる**。カードが 1 枚、
+      誰にも気付かれずに消える。
+
+    だから id はファイル名から取る (ファイルシステムが一意性を保証するので、
+    重複は構造上作れなくなる)。そのうえで `id` 欄の扱いは 2 つに分ける。
+
+    * **欄が無い / 空** — 矛盾ではない。ファイル名が答えを持っているので、
+      黙って落とさず普通のカードとして扱い、次の書き戻しで埋まる。
+    * **欄がファイル名と食い違う** — どちらが正しいか、ここでは決められない
+      (コピー元の id が残ったのか、ファイルが置き違えられたのか)。決められない
+      ものを勝手に決めると、名乗り替えを黙って追認することになる。だから
+      `[破損]` として **保留** する: 1 行直せば解けるし、それまで見えている。
 
     quiet=True は「同じ実行の中で 2 回目以降に読む」呼び出し用。破損した task に
     ついての hint 付き警告は 1 回出れば十分で、コマンド本体と task-graph の生成が
@@ -803,6 +845,7 @@ def list_tasks(slug, base_dir=None, quiet=False):
     out = []
     for _, fn in entries:
         path = os.path.join(tdir, fn)
+        task_id = fn[:-len('.md')]
         with open(path) as f:
             text = f.read()
         try:
@@ -820,18 +863,30 @@ def list_tasks(slug, base_dir=None, quiet=False):
                     f"  showing as [破損] task; other tasks are unaffected.",
                     file=sys.stderr,
                 )
-            task_id = fn[:-len('.md')]
-            meta = {
-                'id': task_id,
-                'title': '[破損] frontmatter parse error',
-                'status': CORRUPT_TASK_STATUS,
-                'skills': [],
-                'blocked_by': [],
-                'parse_error': str(e),
-            }
-            body = ''
-            out.append((meta, body))
+            out.append(_isolated_task(task_id, 'frontmatter parse error', str(e)))
             continue
+        # 識別子はファイル名。詳しい理由と「欄が無い」「欄が食い違う」を分ける
+        # 理由は、この関数の docstring に書いてある。
+        declared = meta.get('id')
+        if declared is not None and str(declared).strip() != task_id:
+            if not quiet:
+                print(
+                    f"[plan.sh warn] {path}: frontmatter id "
+                    f"{str(declared).strip()!r} does not match the filename "
+                    f"({task_id!r}).\n"
+                    f"  hint: the filename is the task's identity. If this file "
+                    f"was copied from another card, set `id: {task_id}`; if it "
+                    f"was misplaced, rename the file.\n"
+                    f"  holding it as a [破損] task; other tasks are unaffected.",
+                    file=sys.stderr,
+                )
+            out.append(_isolated_task(
+                task_id,
+                f'id がファイル名と一致しない (frontmatter: {str(declared).strip()})',
+                f'frontmatter id {str(declared).strip()!r} != filename {task_id!r}',
+            ))
+            continue
+        meta['id'] = task_id
         # Normalize defaults
         meta.setdefault('skills', [])
         meta.setdefault('blocked_by', [])
@@ -1097,6 +1152,11 @@ def break_dependency_cycles(nodes):
     満たされない) ので、辺を落とす前に決まった `waiting` が事実のまま正しい。
     落とした辺は `[循環依存: <id>]` として title に出す —— dangling を
     `[依存不明: ...]` で見せるのと同じで、消した情報を黙って消さないため。
+
+    全 mission の node をまとめて渡してよい。`depends_on` は同じ slug で修飾されて
+    いるので辺は mission をまたがず、どの mission の DFS も他の mission に入って
+    いけない。つまり 1 回の走査が mission ごとの走査そのものであり、「壊れた
+    mission だけを隔離する」はこの形でも変わらず成り立つ。
     """
     by_id = {n['id']: n for n in nodes}
     WHITE, GREY, BLACK = 0, 1, 2
@@ -1176,13 +1236,135 @@ def task_graph_placeholder(slugs):
     }
 
 
+#: id が使えなかった node に振り直す id の土台。実 id は `<slug>:<tNNN>` なので、
+#: この形と衝突することはない。
+TASK_GRAPH_UNUSABLE_ID = 'crewvia:id-unusable'
+
+
+def _free_task_graph_id(base, used):
+    """`used` に無い id を `base` から作る。"""
+    candidate = base
+    n = 1
+    while candidate in used:
+        n += 1
+        candidate = f'{base}#{n}'
+    return candidate
+
+
+def isolate_untrustworthy_ids(nodes):
+    """id を理由に plugin がファイル全体を捨てる 2 条件を、node を消さずに潰す。
+
+    plugin の `load_config` は id が空でも重複していても **ファイル全体** を
+    捨てる。1 枚のカードの事情で全 mission の DAG が消えるという、t010 の循環・
+    空配列とまったく同じ型の巻き添えである。
+
+    既知の発生源 (frontmatter の id の名乗り替え) は list_tasks が塞いだので、
+    ここはその後ろに立つ最後の関門である。**今はここより手前で潰れている** —
+    それでも置くのは、node を作る経路が増えたときに、増やした側が気付かないまま
+    ファイル全体を落とせてしまう形を残さないため。ゲートを通る限り publish 物が
+    契約を満たす、と言い切れることに意味がある。
+
+    潰し方は隔離であって削除ではない。node は消さず、id を衝突しない形に振り直し、
+    何が起きたかを title に残す。黙って落とすと、その task が DAG から消えた理由
+    が誰にも分からなくなる。status は `blocked` に倒す —— どのカードなのか言えない
+    node が `ready` (動ける) や `done` (終わった) に見えるほうが害が大きい。
+    """
+    used = {n.get('id') for n in nodes
+            if isinstance(n.get('id'), str) and n.get('id')}
+    seen = set()
+    for node in nodes:
+        node_id = node.get('id')
+        if not isinstance(node_id, str) or not node_id:
+            mark = '[id不正]'
+            node_id = _free_task_graph_id(TASK_GRAPH_UNUSABLE_ID, used)
+        elif node_id in seen:
+            mark = f'[id重複: {node_id}]'
+            node_id = _free_task_graph_id(node_id, used)
+        else:
+            seen.add(node_id)
+            continue
+        node['id'] = node_id
+        node['title'] = mark + ' ' + str(node.get('title') or '')
+        node['status'] = 'blocked'
+        used.add(node_id)
+        seen.add(node_id)
+    return nodes
+
+
+def drop_unresolvable_dependencies(nodes):
+    """publish する node のどれも指していない辺を落とし、印を title に残す。
+
+    plugin は解決できない `depends_on` でもファイル全体を捨てる。落とす理由は
+    それだけで、落とした事実は隠さない —— 黙って消すと、依存が最初から無かった
+    ように見える。status は触らない: 不明な依存は `unmet_dependencies()` の側で
+    すでに「満たされていない」と数えられており、waiting のままが事実である。
+
+    印に出す id は、同じ mission の中の依存なら `<slug>:` を外して見せる。
+    mission をまたぐ依存だけが修飾付きで出るので、どちらなのかが一目で分かる。
+    """
+    known = {n['id'] for n in nodes}
+    for node in nodes:
+        deps = node.get('depends_on') or []
+        missing = sorted({d for d in deps if d not in known})
+        if not missing:
+            continue
+        node['depends_on'] = [d for d in deps if d in known]
+        own = node['id'].rsplit(':', 1)[0] + ':'
+        shown = [d[len(own):] if d.startswith(own) else d for d in missing]
+        node['title'] = (
+            '[依存不明: ' + ', '.join(shown) + '] ' + str(node.get('title') or '')
+        )
+    return nodes
+
+
+def enforce_task_graph_contract(nodes, slugs):
+    """publish の直前に立つ唯一のゲート。
+
+    plugin の `load_config` は 4 つの理由で **ファイル全体** を捨てる —— 空の
+    tasks、id が空 / 重複、解決できない `depends_on`、依存の循環。どれも 1 つの
+    mission (ときに 1 枚のカード) の事情で起きるのに、巻き添えになるのは全
+    mission の DAG である。
+
+    **4 つの対処をここに集める理由**: t010 で 2 つ、Codex 4 巡目で 1 つと、理由は
+    増え続けている。潰し方が別々の場所に書かれていると、次の 1 件が来たときに
+    片方だけ直して穴が開く —— このミッションとその前のミッションで繰り返し起きた
+    型そのものである。「ここを通った node は plugin が受け取れる」とゲート 1 つで
+    言い切れる形にしておけば、次の 1 件もここに足すしかなくなる。
+
+    順番には意味がある。
+
+    1. **id** が先。以降の処理はどれも `{n['id']: n}` の形で node を引くので、
+       重複が残っていると片方が黙って消える。
+    2. **解決できない辺** を落としてから、
+    3. **循環** を切る。循環の判定は辺が全部解決している前提で書いてある。
+       切るのは後退辺だけなので、node は 1 つも減らない。
+    4. **空** は最後。1〜3 は node を減らさないので、空になりうるのは入力が
+       最初から空だったときだけである。
+    """
+    nodes = isolate_untrustworthy_ids(nodes)
+    nodes = drop_unresolvable_dependencies(nodes)
+    nodes = break_dependency_cycles(nodes)
+    if not nodes:
+        nodes = [task_graph_placeholder(slugs)]
+    return nodes
+
+
 def build_task_graph(state):
     """active mission 全部を plugin の入力形式に変換する。
+
+    ここは翻訳だけを行う。plugin が受け取れる形にする責任は
+    `enforce_task_graph_contract()` が 1 つで持つ。
 
     id は `<slug>:<tNNN>` に修飾する。mission をまたぐと t001 が衝突するため。
     `depends_on` も同じ修飾で解決する (blocked_by は mission 内の id)。
     """
-    slugs = [s for s in (state.get('active_missions') or []) if s]
+    # 同じ slug が 2 回並んでいても mission は 1 つ。state.yaml は復旧手順で手を
+    # 入れるファイルなので、2 行になること自体は起こる。落とさずに素通しすると
+    # **全 node が 2 つずつ** 出て、ファイルが丸ごと読めなくなる。
+    slugs = []
+    for s in (state.get('active_missions') or []):
+        if s and s not in slugs:
+            slugs.append(s)
     nodes = []
     for slug in slugs:
         if not os.path.isdir(mission_dir(slug)):
@@ -1207,23 +1389,18 @@ def build_task_graph(state):
             else:
                 status, marker = TASK_GRAPH_STATUS_MAP.get(raw_status, TASK_GRAPH_UNKNOWN)
 
-            markers = [marker] if marker else []
-            # 存在しない task への依存は depends_on に出さない (plugin 側で
-            # 解決できない参照になる) が、黙って消すと依存が無いように見える
-            # ので title に残す。status は unmet 側に落ちているので WAIT。
-            dangling = sorted({d for d in blocked_by if d not in task_statuses})
-            if dangling:
-                markers.append('[依存不明: ' + ', '.join(dangling) + ']')
             title = meta.get('title') or task_id
-            if markers:
-                title = ' '.join(markers) + ' ' + str(title)
+            if marker:
+                title = marker + ' ' + str(title)
 
             # depends_on は依存が無くても `[]` で必ず出す。省略が許されるかは
             # plugin の schema 次第だが、空リストはどちらの読み方でも通る。
+            # 存在しない task への依存をここで落とさないのは、それが plugin の
+            # 契約の話であって翻訳の話ではないから —— ゲートが落として印を残す。
             node = {
                 'id': f'{slug}:{task_id}',
                 'title': str(title),
-                'depends_on': [f'{slug}:{d}' for d in blocked_by if d in task_statuses],
+                'depends_on': [f'{slug}:{d}' for d in blocked_by],
                 'status': status,
             }
             worker = _task_graph_worker(meta)
@@ -1240,13 +1417,9 @@ def build_task_graph(state):
                 node['pane_match'] = f'{worker}-worker'
             mission_nodes.append(node)
 
-        # 循環の切断は mission 単位で行う。depends_on は同じ slug で修飾されて
-        # いるので辺は mission をまたがず、「壊れた mission だけを隔離する」が
-        # この単位でそのまま成り立つ。
-        nodes.extend(break_dependency_cycles(mission_nodes))
+        nodes.extend(mission_nodes)
 
-    if not nodes:
-        nodes = [task_graph_placeholder(slugs)]
+    nodes = enforce_task_graph_contract(nodes, slugs)
 
     if len(slugs) == 1:
         title = f'crewvia / {slugs[0]}'

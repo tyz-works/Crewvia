@@ -36,6 +36,7 @@ import pytest
 from test_task_graph import (  # noqa: F401  (sandbox は fixture として使う)
     MISSION,
     REPO_ROOT,
+    STATUS_ROWS,
     _by_id,
     sandbox,
 )
@@ -424,6 +425,267 @@ def test_every_status_the_linter_accepts_is_in_the_mapping_table():
     assert not missing, (
         f"lint が許すのに対応表に無い status: {sorted(missing)} — "
         f"[status不明] + blocked に落ちる"
+    )
+
+
+# ---------------------------------------------------------------------------
+# F-1d — id が信用できないカード (Codex 4 巡目)
+# ---------------------------------------------------------------------------
+#
+# plugin は id が空でも重複していても **ファイル全体** を捨てる。そして crewvia
+# 側の id は frontmatter に書かれた自己申告で、誰も検証していなかった。tNNN.md を
+# コピーして id 行を直し忘れる —— カードを作る一番ありふれたやり方 —— だけで、
+# 同じ id が 2 つ並んだ JSON が publish され、健全な他 mission の DAG まで消える。
+#
+# 害は可視化だけに留まらない。`plan.sh pull` は割り当てた card を
+# `save_task(slug, meta['id'], ...)` で書き戻すので、`t002.md` が `id: t001` を
+# 名乗っていると **t001.md が t002 の内容で上書きされる**。つまり id の食い違いは
+# 表示の問題ではなく、カードを 1 枚失う経路である。
+
+def _card_path(sandbox, task_id, mission=MISSION):
+    return sandbox.queue / "missions" / mission / "tasks" / f"{task_id}.md"
+
+
+def _copy_card(sandbox, src_id, dst_id, mission=MISSION, **replace):
+    """tNNN.md をコピーして id 行を直し忘れた、という一番ありふれた壊し方。
+
+    `replace` で本文の一部を差し替えられる (どちらのカードが書かれたかを
+    見分けるため)。
+    """
+    text = _card_path(sandbox, src_id, mission).read_text()
+    for old, new in replace.items():
+        text = text.replace(old, new)
+    _card_path(sandbox, dst_id, mission).write_text(text)
+
+
+def test_a_copied_card_does_not_make_the_whole_file_unreadable(sandbox):
+    """id を直し忘れたコピーがあっても、plugin がファイル全体を捨てないこと。
+
+    捨てられると、まったく無関係な mission の DAG まで見えなくなる。t010 の
+    循環 / 空配列とまったく同じ型の巻き添えである。
+    """
+    sandbox.add_task("t001", "pending", [])
+    sandbox.add_task("t003", "done", [])
+    _copy_card(sandbox, "t001", "t002")          # t002.md の中身は `id: t001`
+    sandbox.add_mission("m-healthy")
+    sandbox.add_task("t001", "pending", [], mission="m-healthy")
+
+    assert sandbox.run("task-graph").returncode == 0
+    graph = assert_plugin_accepts(sandbox)
+
+    ids = [t["id"] for t in graph["tasks"]]
+    assert len(ids) == len(set(ids)), f"id が重複したまま publish された: {ids}"
+    assert "m-healthy:t001" in ids, (
+        f"壊れていない mission が巻き添えで消えている: {ids}"
+    )
+    assert f"{MISSION}:t003" in ids, f"同じ mission の健全な card が消えている: {ids}"
+
+
+def test_the_copied_card_is_isolated_visibly_not_dropped(sandbox):
+    """隔離したカードが、隔離されたと分かる形で残ること。
+
+    黙って落とすと「なぜこの task が DAG から消えたのか」が誰にも分からない。
+    """
+    sandbox.add_task("t001", "pending", [])
+    _copy_card(sandbox, "t001", "t002")
+
+    assert sandbox.run("task-graph").returncode == 0
+    nodes = _by_id(assert_plugin_accepts(sandbox))
+
+    assert f"{MISSION}:t002" in nodes, (
+        f"id の食い違うカードが黙って消えている: {sorted(nodes)}"
+    )
+    title = nodes[f"{MISSION}:t002"]["title"]
+    assert "破損" in title, f"隔離の印が出ていない: {title!r}"
+    assert "id" in title.lower(), f"何が問題なのか読み取れない: {title!r}"
+
+
+def test_a_card_with_an_untrustworthy_id_is_never_ready_or_done(sandbox):
+    """隔離したカードが、実行可能にも完了済みにも見えないこと。
+
+    どちらに倒れても嘘になる: ready なら存在しない仕事が動けると読め、done なら
+    やっていない仕事が終わったと読める。
+    """
+    sandbox.add_task("t001", "done", [])
+    _copy_card(sandbox, "t001", "t002")          # done を名乗るコピー
+
+    assert sandbox.run("task-graph").returncode == 0
+    node = _by_id(assert_plugin_accepts(sandbox))[f"{MISSION}:t002"]
+    assert node["status"] not in ("ready", "done"), node
+
+
+def test_an_isolated_card_does_not_look_like_a_finished_dependency(sandbox):
+    """隔離したカードに依存する task が、動けると誤って表示されないこと。"""
+    sandbox.add_task("t001", "done", [])
+    _copy_card(sandbox, "t001", "t002")
+    sandbox.add_task("t003", "pending", ["t002"])
+
+    assert sandbox.run("task-graph").returncode == 0
+    nodes = _by_id(assert_plugin_accepts(sandbox))
+    assert nodes[f"{MISSION}:t003"]["status"] == "waiting", (
+        "隔離した card が『満たされた依存』に見えている"
+    )
+
+
+def test_pull_never_writes_one_card_over_another(sandbox):
+    """id の食い違いで、別のカードが上書きされないこと (害の本体)。
+
+    `pull` は `save_task(slug, meta['id'], ...)` で書き戻す。`t002.md` が
+    `id: t001` を名乗っていると、割り当ての瞬間に **t001.md が t002 の内容で
+    上書きされる** —— カードが 1 枚、誰にも気付かれずに消える。
+    """
+    sandbox.add_task("t001", "pending", [])
+    # priority を上げて、ソートで必ずコピー側が先に選ばれるようにする
+    # (優先度が同じだと安定ソートで t001.md が先になり、事故が再現しない)。
+    _copy_card(
+        sandbox, "t001", "t002",
+        **{"priority: medium": "priority: high", "title: task t001": "title: task t002"},
+    )
+    before = _card_path(sandbox, "t001").read_text()
+
+    r = sandbox.run("pull", "--agent", "Ren", "--skills", "code")
+    assert r.returncode == 0, r.stderr
+
+    after = _card_path(sandbox, "t001").read_text()
+    assert "task t002" not in after, (
+        "t001.md が t002.md の内容で上書きされた —— カードが 1 枚失われている\n"
+        f"before:\n{before}\nafter:\n{after}"
+    )
+    assert '"id": "t001"' in r.stdout, r.stdout
+    assert "task t002" not in r.stdout, (
+        f"id を名乗り替えたカードがそのまま割り当てられている: {r.stdout}"
+    )
+
+
+def test_a_mission_listed_twice_does_not_make_the_whole_file_unreadable(sandbox):
+    """state.yaml で同じ mission が 2 回並んでいても、plugin が読めること。
+
+    `active_missions` は手で編集される (Director の復旧手順に入っている)。
+    同じ slug が 2 行あると、すべての node が 2 回出力され、全部が重複 id に
+    なる —— カード 1 枚の事故ではなく、ファイルが丸ごと読めなくなる。
+    """
+    sandbox.add_task("t001", "pending", [])
+    sandbox.add_task("t002", "pending", ["t001"])
+    (sandbox.queue / "state.yaml").write_text(
+        f"active_missions:\n  - {MISSION}\n  - {MISSION}\ndefault_mission: {MISSION}\n"
+    )
+
+    assert sandbox.run("task-graph").returncode == 0
+    graph = assert_plugin_accepts(sandbox)
+    ids = sorted(t["id"] for t in graph["tasks"])
+    assert ids == [f"{MISSION}:t001", f"{MISSION}:t002"], (
+        f"同じ mission が 2 重に出ている: {ids}"
+    )
+
+
+def test_a_card_without_an_id_line_is_not_silently_dropped(sandbox):
+    """id 行そのものが無いカードが、DAG から黙って消えないこと。
+
+    ファイル名と食い違う id と違って、ここに矛盾は無い —— ファイル名が答えを
+    持っている。だから隔離ではなく、ファイル名の id で普通に扱う。ただし
+    「黙って消える」だけは許さない。
+    """
+    sandbox.add_task("t001", "pending", [])
+    path = _card_path(sandbox, "t001")
+    path.write_text(path.read_text().replace("id: t001\n", ""))
+
+    assert sandbox.run("task-graph").returncode == 0
+    nodes = _by_id(assert_plugin_accepts(sandbox))
+    assert f"{MISSION}:t001" in nodes, (
+        f"id 行の無い card が DAG から消えている: {sorted(nodes)}"
+    )
+    assert nodes[f"{MISSION}:t001"]["status"] == "ready"
+
+
+def test_healthy_cards_are_untouched_by_the_id_check(sandbox):
+    """対照: 普通のカードには印も付かず、状態も変わらないこと。"""
+    for row in STATUS_ROWS:
+        sandbox.add_task(row[0], row[1], row[2])
+    assert sandbox.run("task-graph").returncode == 0
+
+    nodes = _by_id(assert_plugin_accepts(sandbox))
+    for task_id, _status, _bb, expected, marker in STATUS_ROWS:
+        node = nodes[f"{MISSION}:{task_id}"]
+        assert node["status"] == expected, (task_id, node)
+        assert "破損" not in node["title"], (task_id, node["title"])
+        if marker:
+            assert marker in node["title"], (task_id, node["title"])
+
+
+# ---------------------------------------------------------------------------
+# 隔離はひとつの経路に集まっていること
+# ---------------------------------------------------------------------------
+#
+# plugin がファイル全体を捨てる理由は増えうる (t010 で 2 つ、ここで 1 つ)。
+# 潰し方がバラバラの場所に書かれていると、次の 1 件が来たときに片方だけ直して
+# 穴が開く。だから **publish の直前に 1 つのゲート** を置き、拒否理由の対処は
+# すべてそこを通す。
+
+GATE = "enforce_task_graph_contract"
+
+#: ゲートが潰している拒否理由と、その担当。plugin の `load_config` が投げる
+#: 理由がこれ以外に増えたら、ゲートに 1 行足すことになる。
+GATE_STEPS = {
+    "空の tasks": "task_graph_placeholder",
+    "id が空 / 重複": "isolate_untrustworthy_ids",
+    "依存の循環": "break_dependency_cycles",
+    "解決できない depends_on": "drop_unresolvable_dependencies",
+}
+
+
+def _plan_functions():
+    import ast
+
+    from test_task_graph import _functions, _plan_py_source
+
+    return _functions(ast.parse(_plan_py_source()))
+
+
+def test_every_rejection_reason_is_handled_inside_one_gate():
+    """拒否理由の対処が、ぜんぶ同じゲートの中から呼ばれていること。"""
+    import ast
+
+    funcs = _plan_functions()
+    assert GATE in funcs, f"{GATE}() が plan.sh に無い"
+    gate_src = ast.unparse(funcs[GATE])
+    for reason, helper in GATE_STEPS.items():
+        assert helper in gate_src, (
+            f"『{reason}』の対処 ({helper}) がゲートの外にある — "
+            f"次に同種の破綻が来たとき、片方だけ直して穴が開く"
+        )
+
+
+def test_nothing_else_neutralises_a_rejection_reason_on_its_own():
+    """各 helper が、ゲート以外から呼ばれていないこと。
+
+    ゲートを通らない経路が 1 本でも残っていると、「ここを通せば安全」が
+    成り立たなくなる。
+    """
+    import ast
+
+    from test_task_graph import _call_name
+
+    funcs = _plan_functions()
+    for helper in GATE_STEPS.values():
+        callers = set()
+        for name, fn in funcs.items():
+            if name in (GATE, helper):
+                continue
+            for node in ast.walk(fn):
+                if isinstance(node, ast.Call) and _call_name(node) == helper:
+                    callers.add(name)
+        assert not callers, (
+            f"{helper}() がゲートの外からも呼ばれている: {sorted(callers)}"
+        )
+
+
+def test_the_graph_builder_publishes_through_the_gate():
+    """build_task_graph() がゲートを通ってから返すこと。"""
+    import ast
+
+    funcs = _plan_functions()
+    assert GATE in ast.unparse(funcs["build_task_graph"]), (
+        f"build_task_graph() が {GATE}() を通らずに publish している"
     )
 
 

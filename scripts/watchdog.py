@@ -387,6 +387,14 @@ class WorkerMonitor:
             else self.started_at
         )
 
+        #: 通知ディレクトリを読めているか。**状態が変わったときだけ** 1 行出す
+        #: ための記憶で、判定そのものには使わない。`_notification_files()` は
+        #: 1 回の check で 2 回呼ばれ、check は 30 秒ごとに来るので、呼ばれる
+        #: たびに書くと 1 人の Worker で毎分 4 行になる。読めない状態が続いて
+        #: いる間も verdict 行は `VerdictLogger` が出し続けるので、見えなくは
+        #: ならない。
+        self._notifications_observable: bool = True
+
     # ------------------------------------------------------------------
     # Signal detection helpers
     # ------------------------------------------------------------------
@@ -438,12 +446,53 @@ class WorkerMonitor:
     def _heartbeat_file(self) -> Path:
         return self.repo_root / "registry" / "heartbeats" / self.agent_name
 
-    def _notification_files(self) -> list[Path]:
+    def _notification_files(self) -> Optional[list[Path]]:
+        """通知ファイルの一覧。**観測できなかったときは空ではない。**
+
+        `FileNotFoundError` だけが「通知は 1 通も無い」である。通知ディレクトリ
+        が無いのはほとんどの Worker の通常状態なので、そこは空で返さなければ
+        ならない。
+
+        それ以外の `OSError` (権限・I/O) は *観測の失敗* であって、「シグナルが
+        無い」ではない。両方を `[]` に潰すと、読めなかったことが
+
+          * `_last_activity_mtime()` の候補減 → idle が伸びる → terminate
+          * `_awaiting_human()` の「通知なし」 → 抑制が外れる  → terminate
+
+        の 2 経路でそのまま **破壊の側** に落ちる。だから `None` で「観測でき
+        なかった」を返し、読み手それぞれが自分の判定の安全な向きへ倒す
+        (memory: fail-direction-is-per-judgment)。
+        """
         notif_dir = self.repo_root / "registry" / "notifications" / self.agent_name
         try:
-            return [f for f in notif_dir.iterdir() if f.is_file()]
-        except OSError:
+            files = [f for f in notif_dir.iterdir() if f.is_file()]
+        except FileNotFoundError:
+            self._note_notifications_observable(True)
             return []
+        except OSError as e:
+            self._note_notifications_observable(
+                False, f"{self.agent_name}: cannot list {notif_dir}: {e} — "
+                       f"treating this as unobservable, not as silence "
+                       f"(terminate is suppressed until it can be read)")
+            return None
+        self._note_notifications_observable(True)
+        return files
+
+    def _note_notifications_observable(self, observable: bool, msg: str = "") -> None:
+        """観測できるかどうかが **変わったときだけ** 1 行残す。
+
+        警告が出せなくても判定は続ける。出せないことを理由に「観測できた」に
+        倒すと、いちばん忙しい日にだけ揃う組み合わせで穴が開く
+        (`lib_task_cards._safe_warn` と同じ理由)。
+        """
+        if observable == self._notifications_observable:
+            return
+        self._notifications_observable = observable
+        try:
+            _log(msg if msg else
+                 f"{self.agent_name}: notifications readable again")
+        except Exception:
+            pass
 
     def _last_activity_mtime(self) -> float:
         """Most recent signal across all layers, never earlier than the floor.
@@ -451,10 +500,18 @@ class WorkerMonitor:
         The floor is in the `max()` rather than being a fallback for "no files
         at all": a stale file is not evidence of silence, it is evidence about
         a different task (see `_signal_floor`).
+
+        通知の一覧を取れなかったときは `now` を返す。**沈黙を主張しない**のが
+        この判定の安全な向きで、見えていない通知が 1 通でもあれば idle は 0 に
+        なりうる以上、読めなかったときに「無かった」に倒すのは観測していない
+        ことを根拠に終了させることになる。倒した先の害は「terminate が 1
+        サイクル遅れる」だけで、次のサイクルで読めれば普通に判定される。
         """
+        notifications = self._notification_files()
+        if notifications is None:
+            return time.time()
         candidates = self._mtimes_since_floor(
-            [self._activity_file(), self._heartbeat_file()]
-            + self._notification_files()
+            [self._activity_file(), self._heartbeat_file()] + notifications
         )
         return max(candidates + [self._signal_floor()])
 
@@ -484,7 +541,16 @@ class WorkerMonitor:
         floor = self._signal_floor()
         newest_file = None
         newest_mtime = -1.0
-        for f in self._notification_files():
+        notifications = self._notification_files()
+        if notifications is None:
+            # 観測できなかった。`_awaiting_human()` はこの戻り値が None なら
+            # 「待ちではない」= terminate を抑制しない、に倒れる。それは
+            # 読めなかったことを終了の根拠にすることなので、代わりに
+            # 「いま通知が来ている」と読ませる —— 抑制する側が安全な向き。
+            # `_last_activity_mtime()` も同じサイクルで now を返すので、
+            # 判定は 2 層とも「このサイクルでは結論を出さない」で揃う。
+            return time.time(), "(unobservable)"
+        for f in notifications:
             try:
                 m = f.stat().st_mtime
             except OSError:

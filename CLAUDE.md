@@ -78,8 +78,18 @@
                         dispatch サイクルが KeyError で落ちる」が戻る（Codex 5 巡目 P2）。
                         フォールバックは持たない（読めなければ呼び出し側が落ちる）ので、
                         plan.sh を単体でコピーする隔離テストでは一緒に置くこと。
+                        **空リストは「カードが 1 枚も無い」の意味だけ**を持つ（走査に失敗
+                        したときは終端でないプレースホルダを 1 件返す）。同じ `[]` に潰すと
+                        `all(status in TERMINAL)` がそれに True を返し、**未完了の兄弟を
+                        残したまま mission 全体が done になる**（t016）。
+                        **カードは通常ファイルだけ**受理する（FIFO 等は待たずに `[破損]`）。
+                        上限の無い `open()` を残すと、書き手のいない FIFO 1 枚で全 mission の
+                        割り当てと生存監視が同時に止まる（t016）。設計と全数調査は
+                        `knowledge/empty-vs-unobservable.md`
                         再発防止は tests/test_task_card_identity.py（両者が同じ queue から
-                        同じ task 集合を導くことの直接 assert + コピー検出）
+                        同じ task 集合を導くことの直接 assert + コピー検出）と
+                        tests/test_unobservable_is_not_empty.py（赤の実証は
+                        tests/red_proof_unobservable.sh）
     lib_dep_rules.py    「依存が満たされた」の唯一の定義（`unmet_dependencies()` /
                         `DEAD_DEP_STATUSES`）。**plan.sh pull・plan.sh task-graph・
                         dispatcher.sh の 3 者がここだけを読む**。コピーを書き戻すと、

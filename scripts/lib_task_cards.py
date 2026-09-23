@@ -57,6 +57,29 @@
 突き抜けた (Codex 6 巡目 P1)。名前の分かっている失敗は個別に扱って直し方を
 警告に書き、**残り全部は `read_task_card()` の backstop が隔離に落とす**。
 
+## 「空」と「観測できなかった」を分ける
+
+`list_task_cards()` の **空リストは「カードが 1 枚も無い」の意味だけ**を持つ。
+走査そのものに失敗したときは `scan_failure_task()` の node を 1 件返す。
+
+同じ `[]` に潰していたのが Codex 7 巡目 P1 で、そこで出た形は
+`all(m['status'] in TERMINAL for tasks)` —— `cmd_done()` と
+`cmd_verify_result()` が持つ mission 完了の判定が **空リストに True を返す**、
+というものだった。tasks ディレクトリが「書き込み・実行は可、読み取り不可」だと
+既知のファイル名を直接開く更新系だけが生き残るので、1 枚を done にした瞬間に、
+未完了の兄弟を残したまま mission 全体が done になる。
+
+読み取り経路の全数調査と、直していない箇所の理由は
+`knowledge/empty-vs-unobservable.md` にある。
+
+## カードは通常ファイルだけ
+
+`read_task_card()` は `O_NONBLOCK` で開いて `fstat` で種類を確かめ、通常ファイル
+以外は **待たずに** `[破損]` として断る。待ち時間に上限を付けるのではなく種類で
+弾くのは、待てば読めるものが 1 つも無いからである。上限が無いままだと、書き手の
+いない FIFO 1 枚で、別 mission の健全なカードを 1 枚直しただけの実行と、この
+読み取りを使う常駐デーモン 3 者が同時に座り込む (Codex 7 巡目 P2)。
+
 ## フォールバックを持たない
 
 読み込めなければ呼び出し側はそのまま死ぬ。`lib_dep_rules.py` と同じ理由で、
@@ -69,6 +92,7 @@ from __future__ import annotations
 
 import os
 import re
+import stat
 
 #: 読めない / 信用できないカードに与える疑似ステータス。pending でも終端でもない。
 #: だから pull も dispatch もこのカードを拾わず、同時に「mission が完了した」とも
@@ -78,6 +102,11 @@ CORRUPT_TASK_STATUS = 'corrupted'
 #: task ファイルの名前。この正規表現に合うものだけが task であり、`tNNN` の
 #: 部分がその task の識別子になる。
 TASK_FILENAME_RE = re.compile(r't(\d+)\.md')
+
+#: 走査そのものが失敗したときに 1 件だけ返す疑似カードの id。
+#: 実在のカードの id は `TASK_FILENAME_RE` から来るので必ず `t<数字>` であり、
+#: この名前と衝突することはない (= 本物のカードを隠さない)。
+SCAN_FAILURE_TASK_ID = '!scan'
 
 
 # ---------------------------------------------------------------------------
@@ -261,6 +290,33 @@ def isolated_task(task_id, title, reason):
     }, ''
 
 
+def scan_failure_task(tasks_dir, what, detail):
+    """`tasks_dir` を走査できなかったことを、**1 件の終端でない node** で表す。
+
+    「観測できなかった」と「そこに何も無い」は違う。`[]` を返すと両者が同じ形に
+    なり、`all(status in TERMINAL for tasks)` —— `cmd_done()` と
+    `cmd_verify_result()` が持つ mission 完了の判定 —— が **空リストに対して
+    True になる**。tasks ディレクトリが「書き込み・実行は可、読み取り不可」だと、
+    既知のファイル名を直接開く更新系だけが生き残るので、**1 枚を done にした
+    瞬間に、未完了の兄弟を残したまま mission 全体が done になる** (Codex 7 巡目
+    P1)。集約前は listing の例外がこの経路を中断させていた。
+
+    だから 1 件返す。`CORRUPT_TASK_STATUS` は pending でも終端でもないので、
+
+    * 完了判定は **必ず False** になる (fail closed)
+    * pull も dispatch もこの node を拾わない
+    * `plan.sh status` と DAG に理由が出る (黙って止まらない)
+
+    の 3 つが同時に成立する。個々のカードを `[破損]` として保留するのとまったく
+    同じ形で、違うのは対象がディレクトリだという点だけである。
+    """
+    return isolated_task(
+        SCAN_FAILURE_TASK_ID,
+        f'{tasks_dir} を走査できない ({what})',
+        f'{what}: {detail}',
+    )
+
+
 def normalize_card(task_id, meta):
     """読めたカードの欄を揃える。識別子は **ファイル名から与えられる**。
 
@@ -279,6 +335,60 @@ def normalize_card(task_id, meta):
     if meta.get('blocked_by') is None:
         meta['blocked_by'] = []
     return meta
+
+
+# ---------------------------------------------------------------------------
+# 通常ファイルだけを、待たずに読む
+# ---------------------------------------------------------------------------
+
+class _NotARegularFile(Exception):
+    """開いた先が通常ファイルではなかった。`read_task_card()` が隔離に落とす。"""
+
+
+#: `stat` の種類ビット → 人が読める名前。理由の文面に使うだけ。
+_FILE_TYPES = (
+    (stat.S_ISFIFO, 'FIFO (named pipe)'),
+    (stat.S_ISDIR, 'directory'),
+    (stat.S_ISSOCK, 'socket'),
+    (stat.S_ISCHR, 'character device'),
+    (stat.S_ISBLK, 'block device'),
+)
+
+
+def _describe_file_type(mode):
+    for test, name in _FILE_TYPES:
+        if test(mode):
+            return name
+    return f'mode {stat.S_IFMT(mode):#o}'
+
+
+def _read_regular_file(path):
+    """通常ファイルなら中身を返す。それ以外なら `_NotARegularFile` で即座に断る。
+
+    `O_NONBLOCK` を付けて開くのは、**種類を確かめる前に待たされないため**で
+    ある。書き手のいない FIFO は `open()` の時点で止まるので、開いてから
+    `fstat` する形にしても、`O_NONBLOCK` が無ければ確かめる所まで到達できない。
+
+    判定は `fstat` —— 開いた **その fd** に対して行う。`os.stat(path)` で先に
+    見てから開くと、見た対象と開いた対象が別物でありうる (memory:
+    verify-and-destroy-must-share-one-connection と同じ形)。
+
+    通常ファイルだと分かったら `O_NONBLOCK` は落とす。通常ファイルの read に
+    非ブロッキングの意味は無く、付けたままにすると将来この関数が他の種類を
+    受理するようになったときに、短い read が黙って途中までの中身を返す。
+    """
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    try:
+        mode = os.fstat(fd).st_mode
+        if not stat.S_ISREG(mode):
+            raise _NotARegularFile(_describe_file_type(mode))
+        os.set_blocking(fd, True)
+        f = os.fdopen(fd)
+    except BaseException:
+        os.close(fd)
+        raise
+    with f:
+        return f.read()
 
 
 # ---------------------------------------------------------------------------
@@ -365,8 +475,31 @@ def _read_task_card(path, task_id, _warn):
     どちらのつもりなのか読めなくなる。
     """
     try:
-        with open(path) as f:
-            text = f.read()
+        text = _read_regular_file(path)
+    except _NotARegularFile as e:
+        # 通常ファイル以外は **待たずに拒否する** (Codex 7 巡目 P2)。
+        #
+        # `open()` には上限が無い。書き手のいない FIFO が `tNNN.md` として
+        # 置かれていると、そこを読みに来た実行は無期限に座り込む。止まるのは
+        # その mission ではない: 変更系の plan.sh は commit の後に全 active
+        # mission を同期で走査するので、**別 mission の健全なカードを 1 枚
+        # 直しただけの実行**が返らなくなる。`retire --no-wait` がこれを踏むと、
+        # 退役を commit した後に watchdog のタイムアウトを使い切る。同じ読み
+        # 取りを常駐デーモン 3 者も使うので、1 枚で全 mission の割り当てと
+        # Worker の生存監視が同時に止まりうる。
+        #
+        # 待ち時間に上限を付けるのではなく **種類で弾く** のは、待てば読める
+        # ものが 1 つも無いからである。カードは通常ファイルしかありえない。
+        # 条件を「FIFO なら拒否」と書かずに「通常ファイルだけ受理」と書いて
+        # あるのは、denylist を足し続ける形が次の種類で必ず穴を開けるため
+        # (memory: approve-judgment-needs-allowlist-and-scope)。
+        _warn(
+            f"{path} is not a regular file ({e})\n"
+            f"  hint: task カードは通常ファイルだけです。`ls -l {path}` で種類を "
+            f"確かめ、置き違えたものなら削除してください。\n"
+            f"  holding it as a [破損] task; other tasks are unaffected."
+        )
+        return isolated_task(task_id, 'not a regular file', str(e))
     except OSError as e:
         # 権限 / 消えた途中 / I/O。dispatcher は従来 per-file の try/except で
         # これを吸収していたので、共有に寄せる際にその耐性を落とさない。
@@ -426,17 +559,45 @@ def _read_task_card(path, task_id, _warn):
 def list_task_cards(tasks_dir, warn=None):
     """`tasks_dir` の全カードを `tNNN` 順に `[(meta, body), ...]` で返す。
 
-    ディレクトリが無ければ空リスト (mission が作られた直後・archive 済みなど、
-    普通に通る状態なので例外にはしない)。
+    **空リストが意味するのは「カードが 1 枚も無い」だけ**である。走査そのものに
+    失敗したときは `scan_failure_task()` の node を 1 件返す —— 理由はそちらの
+    docstring にある。
+
+    区別の付け方は `os.stat()` 1 回に寄せてある。`os.path.isdir()` は
+
+      * 本当に無い          (ENOENT)
+      * ディレクトリではない (ENOTDIR / 通常ファイル)
+      * stat できない        (EACCES: 親から実行権限が消えた等)
+
+    の 3 つを **同じ False** に潰すので、それを分岐の材料にするかぎり、1 番目と
+    残り 2 つを区別できない。
     """
-    if not os.path.isdir(tasks_dir):
+    try:
+        st = os.stat(tasks_dir)
+    except FileNotFoundError:
+        # ここだけが「本当に無い」。mission を作った直後・archive 済みは
+        # `tasks/` が無いのが正常な状態なので、空で返すのが正しい。終端でない
+        # node を置くと、その mission は二度と完了しなくなる。
         return []
+    except OSError as e:
+        _safe_warn(warn, f"failed to stat {tasks_dir}: {e}\n"
+                         f"  holding the mission as unscannable; "
+                         f"completion cannot be concluded from this.")
+        return [scan_failure_task(tasks_dir, 'stat error', str(e))]
+    if not stat.S_ISDIR(st.st_mode):
+        _safe_warn(warn, f"{tasks_dir} is not a directory\n"
+                         f"  holding the mission as unscannable; "
+                         f"completion cannot be concluded from this.")
+        return [scan_failure_task(tasks_dir, 'not a directory',
+                                  _describe_file_type(st.st_mode))]
     entries = []
     try:
         names = os.listdir(tasks_dir)
     except OSError as e:
-        _safe_warn(warn, f"failed to list {tasks_dir}: {e}")
-        return []
+        _safe_warn(warn, f"failed to list {tasks_dir}: {e}\n"
+                         f"  holding the mission as unscannable; "
+                         f"completion cannot be concluded from this.")
+        return [scan_failure_task(tasks_dir, 'listing error', str(e))]
     for fn in names:
         m = TASK_FILENAME_RE.fullmatch(fn)
         if not m:

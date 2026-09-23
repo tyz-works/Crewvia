@@ -777,7 +777,14 @@ def test_a_failing_warn_callback_does_not_abort_the_listing_either(queue):
     finally:
         queue.tasks.chmod(0o755)
 
-    assert cards == []
+    # 返ってくるのは「走査できなかった」を表す終端でない node 1 件。**空では
+    # ない** —— 空は「カードが 1 枚も無い」の意味で、完了判定 (`all(...)`) が
+    # それに対して True になるので、走査の失敗をそこに混ぜると mission 全体が
+    # done に化ける (Codex 7 巡目 P1、tests/test_unobservable_is_not_empty.py)。
+    # ここで見たいのは「警告が出せなくても走査が中断しない」ことだけなので、
+    # 例外が出ずに結果が返ることを確かめる。
+    (meta, _body), = cards
+    assert meta["status"] == lib_task_cards.CORRUPT_TASK_STATUS, meta
 
 
 def test_an_isolated_card_says_why_it_was_isolated(queue):

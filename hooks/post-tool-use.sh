@@ -106,20 +106,20 @@ fi
 # この hook の目的には重すぎるため、lib_daemon_watch.py と同じ env var
 # (CREWVIA_DAEMON_DISPATCHER_STALE_SECONDS 等) でだけ上書きを許す。
 #
-# throttle: 全ツール呼び出しのたびに判定すると使い物にならないため、
-# マーカーファイルの mtime で 60 秒に 1 回に抑える。判定結果に関わらず
-# マーカーを先に更新することで、同時に複数の PostToolUse が走っても
-# 直後の呼び出しは早期リターンする (二重通知の窓を狭める。完全な排他では
-# ないが、この hook にロックを持ち込むほどの重さではない)。
+# 判定順 (t049): 安いものから順に並べ、状態を消費するもの (throttle) を最後にする。
+#   1. registry/daemons/ の存在確認 (最も安い。現在の本番では常にここで抜ける)
+#   2. heartbeat の mtime 判定 (stat のみ。両方 stale でなければここで抜ける)
+#   3. role の解決 (python3。両方 stale のときだけ走るので、通常運用では
+#      1 度も走らない — F-3是正 (t048) はここで維持される)
+#   4. throttle の判定と消費 (role が director のときだけ。Worker は
+#      throttle マーカーに一切触れない — F-4是正 (t049))
 #
-# F-3是正 (t048): registry/daemons/ の存在確認と throttle 判定を role 解決
-# (python3 サブプロセス) より前に出す。role 解決は「この呼び出しで実際に
-# 判定へ進む」と分かってから初めて行うので、mutual watch を使っていない
-# 環境 (daemons/ が無い = 現在の本番) では python3 は 1 回も起動しない。
-# 使っている環境でも throttle 窓 (60秒) に 1 回だけになる。以前は role 解決が
-# daemons/ の有無や throttle と無関係に毎ツール呼び出しで走っており、
-# Director だけでなく全 Worker の全呼び出しが python3 起動コストを払っていた
-# (実測 12ms→38ms、3.2倍)。
+# t048 は throttle 消費を role 解決より前に置いたため、throttle マーカー
+# (registry/daemons/backstop-notify.throttle) が全エージェント共有のまま
+# Worker のツール呼び出し 1 回で消費されてしまい、Director への同時死通知が
+# 恒常的に沈黙する欠陥 (F-4) を生んだ。throttle を role 判定の後段 (director
+# だけが触る場所) に戻すことで、F-3 (daemons/ 不在なら python3 ゼロ) を
+# 保ったまま F-4 を閉じる。
 #
 # 検出したら「1 行だけ出力して exit 2」で終える。PostToolUse hook が exit 2
 # で終わると Claude Code は stderr を Claude (ここでは Director) にそのまま
@@ -129,30 +129,53 @@ _CURRENT_STEP="daemon-backstop"
 if [[ -n "${AGENT_NAME:-}" ]]; then
   _BS_REPO="${CREWVIA_REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
   _BS_DAEMONS_DIR="${_BS_REPO}/registry/daemons"
-  # daemons/ が無い = 両デーモンとも一度も mutual watch の heartbeat を
+  # 1. daemons/ が無い = 両デーモンとも一度も mutual watch の heartbeat を
   # 書いたことが無い (lib_daemon_watch.DaemonWatch が最初の beat() 時に
   # mkdir する)。standalone/inline 運用ではこの状態が正常なので、そのまま
   # 判定に入らずスキップする (常時 stale 誤検知を防ぐ)。role 解決すら行わない
   # ので、この分岐に入らない限り python3 は起動しない。
   if [[ -d "$_BS_DAEMONS_DIR" ]]; then
-    _BS_THROTTLE="${_BS_DAEMONS_DIR}/backstop-notify.throttle"
     _BS_NOW="$(date +%s)"
-    _BS_LAST=0
-    if [[ -f "$_BS_THROTTLE" ]]; then
+
+    # 2. heartbeat mtime 判定 (stat のみ。role 解決より前に行い、両方 stale
+    # でなければここで抜ける — 通常運用でも python3 は起動しない)。
+    _BS_DISPATCHER_STALE_S="${CREWVIA_DAEMON_DISPATCHER_STALE_SECONDS:-60}"
+    _BS_WATCHDOG_STALE_S="${CREWVIA_DAEMON_WATCHDOG_STALE_SECONDS:-240}"
+    # O-2是正: 不正な (非数値の) env値は lib_daemon_watch.py の load_config()
+    # と同じく「既定値を保って無視する」に揃える。以前はここで検証しておらず、
+    # `[[ ... -ge "$_BS_DISPATCHER_STALE_S" ]]` に非数値が渡ると bash が
+    # それを未束縛の変数参照として評価し `set -u` で hook 全体が異常終了
+    # していた (crash guard が exit 0 に握り潰すため、意図した通知も出ない
+    # まま黙って落ちる)。
+    [[ "$_BS_DISPATCHER_STALE_S" =~ ^[0-9]+$ ]] || _BS_DISPATCHER_STALE_S=60
+    [[ "$_BS_WATCHDOG_STALE_S" =~ ^[0-9]+$ ]] || _BS_WATCHDOG_STALE_S=240
+
+    _BS_D_AGE=-1
+    if [[ -f "${_BS_DAEMONS_DIR}/dispatcher.heartbeat" ]]; then
       # F-1是正: GNU 専用の `stat -c` は BSD/macOS に無く失敗する。
       # BSD の `stat -f %m` へフォールバックする (scripts/wait_for_plan_review.sh
-      # の _mtime_of と同じイディオム)。両方失敗した場合の既定値は「判定不能を
-      # 騒がしい側に倒さない」ため $_BS_NOW (= 今読んだばかり扱い) にする —
-      # heartbeat 側の -1 (無限に stale) とは逆方向: throttle は読めないだけで
-      # 誤発火させると要件 2 (毎ツール呼び出しの通知) と衝突する。
-      _BS_LAST="$(stat -c %Y "$_BS_THROTTLE" 2>/dev/null || stat -f %m "$_BS_THROTTLE" 2>/dev/null || echo "$_BS_NOW")"
+      # の _mtime_of と同じイディオム)。
+      _BS_D_MTIME="$(stat -c %Y "${_BS_DAEMONS_DIR}/dispatcher.heartbeat" 2>/dev/null || stat -f %m "${_BS_DAEMONS_DIR}/dispatcher.heartbeat" 2>/dev/null || echo "")"
+      [[ -n "$_BS_D_MTIME" ]] && _BS_D_AGE=$(( _BS_NOW - _BS_D_MTIME ))
     fi
-    _BS_ELAPSED=$(( _BS_NOW - _BS_LAST ))
+    _BS_W_AGE=-1
+    if [[ -f "${_BS_DAEMONS_DIR}/watchdog.heartbeat" ]]; then
+      _BS_W_MTIME="$(stat -c %Y "${_BS_DAEMONS_DIR}/watchdog.heartbeat" 2>/dev/null || stat -f %m "${_BS_DAEMONS_DIR}/watchdog.heartbeat" 2>/dev/null || echo "")"
+      [[ -n "$_BS_W_MTIME" ]] && _BS_W_AGE=$(( _BS_NOW - _BS_W_MTIME ))
+    fi
 
-    if [[ "$_BS_ELAPSED" -ge 60 ]]; then
-      # 判定前にスロットル窓を更新する (判定結果に関わらず)。
-      : > "$_BS_THROTTLE" 2>/dev/null || true
+    # -1 (ファイル無し/読めない) は「無限に stale」として扱う。
+    _BS_D_STALE=0
+    if [[ "$_BS_D_AGE" -lt 0 ]] || [[ "$_BS_D_AGE" -ge "$_BS_DISPATCHER_STALE_S" ]]; then
+      _BS_D_STALE=1
+    fi
+    _BS_W_STALE=0
+    if [[ "$_BS_W_AGE" -lt 0 ]] || [[ "$_BS_W_AGE" -ge "$_BS_WATCHDOG_STALE_S" ]]; then
+      _BS_W_STALE=1
+    fi
 
+    if [[ "$_BS_D_STALE" == "1" ]] && [[ "$_BS_W_STALE" == "1" ]]; then
+      # 3. role の解決 (python3)。両方 stale と分かってから初めて行う。
       _BS_WORKERS_YAML="${_BS_REPO}/registry/workers.yaml"
       _BS_IS_DIRECTOR=0
       if [[ -f "$_BS_WORKERS_YAML" ]]; then
@@ -194,40 +217,27 @@ PYEOF
         fi
       fi
 
+      # 4. throttle の判定と消費。role が director のときだけ触る — Worker は
+      # ここまで来ても (両方 stale の間は python3 は起動するが)
+      # throttle マーカーには一切触れないので、Director の窓を消費しない。
       if [[ "$_BS_IS_DIRECTOR" == "1" ]]; then
-        _BS_DISPATCHER_STALE_S="${CREWVIA_DAEMON_DISPATCHER_STALE_SECONDS:-60}"
-        _BS_WATCHDOG_STALE_S="${CREWVIA_DAEMON_WATCHDOG_STALE_SECONDS:-240}"
-        # O-2是正: 不正な (非数値の) env値は lib_daemon_watch.py の load_config()
-        # と同じく「既定値を保って無視する」に揃える。以前はここで検証しておらず、
-        # `[[ ... -ge "$_BS_DISPATCHER_STALE_S" ]]` に非数値が渡ると bash が
-        # それを未束縛の変数参照として評価し `set -u` で hook 全体が異常終了
-        # していた (crash guard が exit 0 に握り潰すため、意図した通知も出ない
-        # まま黙って落ちる)。
-        [[ "$_BS_DISPATCHER_STALE_S" =~ ^[0-9]+$ ]] || _BS_DISPATCHER_STALE_S=60
-        [[ "$_BS_WATCHDOG_STALE_S" =~ ^[0-9]+$ ]] || _BS_WATCHDOG_STALE_S=240
+        _BS_THROTTLE="${_BS_DAEMONS_DIR}/backstop-notify.throttle"
+        _BS_LAST=0
+        if [[ -f "$_BS_THROTTLE" ]]; then
+          # 両方失敗した場合の既定値は「判定不能を騒がしい側に倒さない」ため
+          # $_BS_NOW (= 今読んだばかり扱い) にする — heartbeat 側の -1
+          # (無限に stale) とは逆方向: throttle は読めないだけで誤発火させると
+          # 要件 2 (毎ツール呼び出しの通知) と衝突する。
+          _BS_LAST="$(stat -c %Y "$_BS_THROTTLE" 2>/dev/null || stat -f %m "$_BS_THROTTLE" 2>/dev/null || echo "$_BS_NOW")"
+        fi
+        _BS_ELAPSED=$(( _BS_NOW - _BS_LAST ))
 
-        _BS_D_AGE=-1
-        if [[ -f "${_BS_DAEMONS_DIR}/dispatcher.heartbeat" ]]; then
-          _BS_D_MTIME="$(stat -c %Y "${_BS_DAEMONS_DIR}/dispatcher.heartbeat" 2>/dev/null || stat -f %m "${_BS_DAEMONS_DIR}/dispatcher.heartbeat" 2>/dev/null || echo "")"
-          [[ -n "$_BS_D_MTIME" ]] && _BS_D_AGE=$(( _BS_NOW - _BS_D_MTIME ))
-        fi
-        _BS_W_AGE=-1
-        if [[ -f "${_BS_DAEMONS_DIR}/watchdog.heartbeat" ]]; then
-          _BS_W_MTIME="$(stat -c %Y "${_BS_DAEMONS_DIR}/watchdog.heartbeat" 2>/dev/null || stat -f %m "${_BS_DAEMONS_DIR}/watchdog.heartbeat" 2>/dev/null || echo "")"
-          [[ -n "$_BS_W_MTIME" ]] && _BS_W_AGE=$(( _BS_NOW - _BS_W_MTIME ))
-        fi
+        if [[ "$_BS_ELAPSED" -ge 60 ]]; then
+          # O-10是正: リダイレクト自体が失敗した場合のエラーメッセージは
+          # `2>/dev/null` の対象になっていないと漏れる。`{ ; } 2>/dev/null`
+          # で括り、コマンド全体の stderr を抑止する。
+          { : > "$_BS_THROTTLE"; } 2>/dev/null || true
 
-        # -1 (ファイル無し/読めない) は「無限に stale」として扱う。
-        _BS_D_STALE=0
-        if [[ "$_BS_D_AGE" -lt 0 ]] || [[ "$_BS_D_AGE" -ge "$_BS_DISPATCHER_STALE_S" ]]; then
-          _BS_D_STALE=1
-        fi
-        _BS_W_STALE=0
-        if [[ "$_BS_W_AGE" -lt 0 ]] || [[ "$_BS_W_AGE" -ge "$_BS_WATCHDOG_STALE_S" ]]; then
-          _BS_W_STALE=1
-        fi
-
-        if [[ "$_BS_D_STALE" == "1" ]] && [[ "$_BS_W_STALE" == "1" ]]; then
           _BS_D_DESC="${_BS_D_AGE}s前"
           [[ "$_BS_D_AGE" -lt 0 ]] && _BS_D_DESC="heartbeat無し"
           _BS_W_DESC="${_BS_W_AGE}s前"

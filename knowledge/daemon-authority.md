@@ -1912,28 +1912,44 @@ respawn しない・報告するだけ)。
   判定に入らずスキップする。このディレクトリは `DaemonWatch.__post_init__` が最初の beat 時に
   作るものなので、無いことは「デーモンが動いていない (standalone/inline 運用)」の証拠であり、
   「両方死んでいる」の証拠ではない。ここをスキップしないと、mutual watch を使わない運用で常時
-  誤検知することになる。**この存在確認と throttle 判定は role 解決 (次項) より前に行う** (t048是正、
-  下記参照)。
+  誤検知することになる。
+- **判定順 (t049)。** 安いものから順に並べ、状態を消費するもの (throttle) を最後にする:
+  1. `registry/daemons/` の存在確認 (最も安い。現在の本番では常にここで抜ける)
+  2. heartbeat の mtime 判定 (`stat` のみ。両方 stale でなければここで抜ける)
+  3. role の解決 (`registry/workers.yaml` を読む python3 サブプロセス。**両方 stale のときだけ**
+     走るので、通常運用 (両方健全) では 1 度も走らない)
+  4. throttle の判定と消費 (role が director と判明した呼び出しだけが行う。Worker は
+     一切消費しない)
 - 対象は role が director のセッションのみ。全 Worker のツール呼び出しにも同じ hook が刺さるが、
-  Worker には respawn も報告もできないので実際の stale 判定・通知は行わない。ただし role 自体の解決
-  (`registry/workers.yaml` を読む python3 サブプロセス) は、throttle 窓が開いている (= これから
-  判定する) 呼び出しでは Worker であっても実行される — 「誰が最初にこの窓を消費するか」が分かる前に
-  役割を判定する必要があるため。**t008 原案 (2026-09-23) は role 解決を daemons/ の存在や throttle
-  と無関係に毎ツール呼び出しで走らせており、Director だけでなく全 Worker の全呼び出しが python3
-  起動コストを払っていた (t047 で O-1 是正のため grep から python3 ヒアドキュメントに変わったのが
-  引き金。実測 12ms→38ms、3.2倍。t009 2巡目 QA の F-3)。t048 で daemons/ の存在確認と throttle 判定を
-  role 解決より前に出し、mutual watch 未使用環境 (daemons/ 不在 = 現在の本番) では python3 が
-  1 回も起動しないようにした。**
+  Worker には respawn も報告もできないので実際の通知は行わない。ただし role 自体の解決は、
+  **両方の heartbeat が stale と分かった呼び出しでは Worker であっても実行される** — 「誰が
+  呼んだか」は throttle より先に確定させる必要があるため。この分岐に入るのは mutual watch を
+  使っていて、かつ両デーモンが実際に stale な (= backstop が意味を持つ) 稀な状況に限られる。
+  **t008 原案 (2026-09-23) は role 解決を daemons/ の存在や throttle と無関係に毎ツール呼び出しで
+  走らせており、Director だけでなく全 Worker の全呼び出しが python3 起動コストを払っていた
+  (t047 で O-1 是正のため grep から python3 ヒアドキュメントに変わったのが引き金。実測
+  12ms→38ms、3.2倍。t009 2巡目 QA の F-3)。t048 で daemons/ の存在確認と throttle 判定を role 解決
+  より前に出したことで F-3 は閉じたが、その並べ替えは throttle マーカーの消費まで role 解決の
+  手前に動かしてしまい、新しい欠陥 (下記 F-4) を生んだ。t049 で throttle だけを role 解決の後段
+  (director のときだけ触る場所) に戻し、F-3 の是正 (daemons/ 不在なら python3 ゼロ) を保ったまま
+  F-4 を閉じた。**
 - throttle はマーカーファイル (`registry/daemons/backstop-notify.throttle`) の mtime で 60 秒に
   1 回に抑える。判定結果に関わらずマーカーを先に更新するので、同時に複数の PostToolUse が走っても
   直後の呼び出しは早期リターンする (完全な排他ではないが、この hook にロックを持ち込むほどの
   重さではない — 最悪でも throttle 窓の中で数回検知メッセージが重複するだけで、実害は無い)。
-  **このマーカーは全エージェント共有 (agent 別ではない)。** そのため理論上は、throttle 窓が開いた
-  瞬間にたまたま Worker のツール呼び出しが先に来ると、その回は role が worker と判定されて何もせず
-  窓だけを消費し、Director 自身の判定はさらに次の窓まで遅れる。既存の回帰テスト (下記) は単一
-  エージェントの連続呼び出ししか検証しておらず、この多エージェント競合は対象外。最後の砦としての
-  役割 (誤検知しても実害が無い・確実に検知できなくても他の経路で発見できる) を踏まえ、複雑な
-  per-agent throttle は導入しない設計判断とした。
+  **このマーカーは全エージェント共有 (agent 別ではない) だが、role が director の呼び出ししか
+  触らない (t049)。** Worker のツール呼び出しは role 解決までは行うが、throttle の判定・消費には
+  一切踏み込まないので、Worker が並行して動いていても Director の通知窓を奪わない。
+
+  **t048 での事故 (F-4, t009 3巡目 QA, 修正済み)。** throttle 消費を role 解決の**前**に置いた
+  結果、マーカーが全エージェント共有のまま「最初にこの窓を触った呼び出し」が誰であるかに
+  関わらず消費されるようになり、Worker のツール呼び出し 1 回で Director の窓が丸ごと潰れていた。
+  実測では「次の窓まで遅れる」ではなく、Worker が先に呼ぶ限り**恒久的に**Director へ届かない
+  (連続 5 窓で到達 0/5)。backstop が意味を持つのは Worker が動いている並列モードだけなので、
+  この欠陥は実運用条件下で要件 1 (両デーモン停止時に Director に通知が届くこと) を満たさなかった。
+  複雑な per-agent throttle (`backstop-notify.<AGENT_NAME>.throttle`) を導入する案もあったが、
+  上記の判定順の並べ替え (throttle を director 専用の最終ゲートにする) だけで十分に閉じたため
+  採用しなかった。
 
 **Director への伝え方 — exit code 2 を使う。** Claude Code の PostToolUse hook は exit code 2 で
 終わると、ツールは既に実行済みのままブロックはせず、**stderr をそのまま呼び出し元 (Director) の
@@ -1965,6 +1981,14 @@ role では発火しないこと、throttle が効くこと・窓が空けば再
 無い (mutual watch 未使用) 環境で誤検知しないこと、しきい値が env var で上書きできることを
 それぞれ担保する。RED は、fix 前の `hooks/post-tool-use.sh` (git HEAD) に対して同じテストを
 流し、4 本が意図通り fail することで確認した。
+
+**t049 で追加した 4 本。** F-4 (Worker が窓を消費する) の回帰防止として、Worker が 1 回呼んだ
+直後に Director が呼んでも通知が届くこと、連続 3 窓すべてで Worker が先に呼んでも Director が
+毎回届くことを固定した。O-9 (t048 の並べ替えを守る回帰テストが無かった) の是正として、
+`registry/daemons/` 不在時と、両デーモンが健全 (fresh) な時に role 解決の python3 が
+1 回も起動しないことを、PATH に計数スタブを挿して固定した。4 本とも t048 (`d1bcead`) に対して
+3 本が意図通り fail する (`test_healthy_daemons_never_invoke_python3` は daemons/ 不在の分岐が
+t048 の時点で既に成立していたため元々 green) ことを確認済み。
 
 ---
 

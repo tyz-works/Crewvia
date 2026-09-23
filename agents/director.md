@@ -1084,7 +1084,9 @@ heartbeat ファイルを手で `rm` する必要は無い — 後始末は watc
 dispatcher と watchdog の相互監視は「相手を見る」仕組みなので、**両方が同時に死ぬ**ケース
 （herdr 再起動、OOM 等）はどちらも互いを起こせない。この場合だけ、Director 自身の PostToolUse
 hook（`hooks/post-tool-use.sh`）が `registry/daemons/{dispatcher,watchdog}.heartbeat` の mtime を
-見て検知し、ツール実行の拍子に stderr へ 1 行流し込む（60 秒に 1 回まで throttle 済み）:
+見て検知し、ツール実行の拍子に stderr へ 1 行流し込む（60 秒に 1 回まで throttle 済み）。throttle
+マーカーは Director 自身の呼び出しだけが消費する（Worker のツール呼び出しでは一切更新されない、
+t049）ので、並列に動く Worker がいても Director の通知窓が奪われることはない:
 
 ```
 [daemon-backstop] ⚠️ dispatcher と watchdog の heartbeat が両方 stale です (...)。

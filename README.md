@@ -645,7 +645,10 @@ dispatcher と watchdog は `scripts/lib_daemon_watch.py` を通じて**相互�
 相互監視は「相手を見る」仕組みなので、**両方が同時に死ぬ**（herdr 再起動・OOM 等）ケースだけは
 互いに救えない。この場合だけ、Director セッションの PostToolUse hook（`hooks/post-tool-use.sh`）が
 両デーモンの heartbeat 同時 stale を検知し、Director の次のツール実行の拍子に 1 行警告する（60秒に
-1回まで throttle）。詳細設計は `knowledge/daemon-authority.md` を参照。
+1回まで throttle）。判定は安いものから順に行い（`registry/daemons/` の存在確認 → heartbeat の
+mtime → role 解決 → throttle）、throttle マーカーは role が director と判明した呼び出しだけが
+消費する。Worker のツール呼び出しはマーカーに一切触れないため、Worker が並行して動いていても
+Director の通知窓が奪われることはない（t049）。詳細設計は `knowledge/daemon-authority.md` を参照。
 
 ### Communication flow
 

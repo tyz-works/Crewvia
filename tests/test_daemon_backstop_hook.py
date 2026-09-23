@@ -180,6 +180,111 @@ def test_worker_role_never_triggers(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# F-4 (t009 3巡目 QA, t049 で修正): throttle マーカーは全エージェント共有の
+# ままなので、role 判定より前に消費すると Worker が 1 回呼んだだけで
+# Director の通知窓を食い潰してしまう。throttle は role が director と
+# 判明した後でだけ判定・消費すること — Worker は一切触れない。
+# t048 (旧 d1bcead) に対して RED、修正後は GREEN になることを QA (Arjun)
+# が確認済み (registry/handoffs/Arjun/t009_HANDOFF.md)。
+# ---------------------------------------------------------------------------
+
+def test_worker_call_must_not_consume_directors_throttle_window(tmp_path):
+    _make_registry(tmp_path)
+    _age(tmp_path, "dispatcher", 3600)
+    _age(tmp_path, "watchdog", 3600)
+
+    worker = _run_hook(tmp_path, agent="Wei")
+    assert worker.returncode == 0
+
+    director = _run_hook(tmp_path)
+    assert director.returncode == 2, (
+        "Worker が 1 回呼んだだけで Director への通知が抑止された (F-4 回帰)。"
+        f"stderr={director.stderr!r}"
+    )
+
+
+def test_worker_calls_do_not_starve_director_across_windows(tmp_path):
+    """連続する 3 つの throttle 窓それぞれで Worker が先に 1 回呼んでも、
+    Director はすべての窓で通知を受け取れること (0/5 窓 = 恒久的な飢餓、
+    という F-4 の症状の回帰防止)。"""
+    _make_registry(tmp_path)
+    throttle = tmp_path / "registry" / "daemons" / "backstop-notify.throttle"
+
+    hits = 0
+    windows = 3
+    for _ in range(windows):
+        _age(tmp_path, "dispatcher", 3600)
+        _age(tmp_path, "watchdog", 3600)
+        if throttle.exists():
+            old = time.time() - 61  # 前の窓を確実に閉じ、新しい窓を開ける
+            os.utime(throttle, (old, old))
+
+        worker = _run_hook(tmp_path, agent="Wei")
+        assert worker.returncode == 0
+
+        director = _run_hook(tmp_path)
+        if director.returncode == 2:
+            hits += 1
+
+    assert hits == windows, (
+        f"{windows} つの窓のうち Director に届いたのは {hits} 回だけだった "
+        "(Worker が先に窓を消費したための飢餓、F-4 回帰)"
+    )
+
+
+# ---------------------------------------------------------------------------
+# O-9 (t009 3巡目 QA, t049 で追加): t048 の判定順の並べ替えを回帰から守る
+# テストが無かった。daemons/ 不在 (= 現在の本番) や両デーモン健全時は
+# role 解決の python3 サブプロセスが 1 回も起動しないことを固定する。
+# ---------------------------------------------------------------------------
+
+def _write_counting_python3_stub(tmp_path: Path, counter_file: Path) -> Path:
+    """呼ばれるたびに counter_file に1行追記してから本物の python3 に
+    委譲するシム。呼び出し回数を「起動したか否か」で判定する。"""
+    real_python3 = which("python3")
+    bin_dir = tmp_path / "fakebin_py"
+    bin_dir.mkdir(exist_ok=True)
+    stub = bin_dir / "python3"
+    stub.write_text(
+        "#!/usr/bin/env bash\n"
+        f"echo called >> {counter_file}\n"
+        f"exec {real_python3} \"$@\"\n",
+        encoding="utf-8",
+    )
+    stub.chmod(0o755)
+    return bin_dir
+
+
+def test_no_daemons_dir_never_invokes_python3(tmp_path):
+    (tmp_path / "registry").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "registry" / "workers.yaml").write_text(WORKERS_YAML, encoding="utf-8")
+
+    counter = tmp_path / "python3.calls"
+    fakebin = _write_counting_python3_stub(tmp_path, counter)
+
+    result = _run_hook(tmp_path, extra_env={"PATH": f"{fakebin}:{os.environ['PATH']}"})
+    assert result.returncode == 0
+    assert not counter.exists(), (
+        "registry/daemons/ が無いのに role 解決の python3 が起動した (O-9 回帰)"
+    )
+
+
+def test_healthy_daemons_never_invoke_python3(tmp_path):
+    _make_registry(tmp_path)
+    _age(tmp_path, "dispatcher", 0)
+    _age(tmp_path, "watchdog", 0)
+
+    counter = tmp_path / "python3.calls"
+    fakebin = _write_counting_python3_stub(tmp_path, counter)
+
+    result = _run_hook(tmp_path, extra_env={"PATH": f"{fakebin}:{os.environ['PATH']}"})
+    assert result.returncode == 0
+    assert not counter.exists(), (
+        "両デーモン健全 (fresh) なのに role 解決の python3 が起動した (O-9 回帰)"
+    )
+
+
+# ---------------------------------------------------------------------------
 # registry/daemons/ が存在しない (mutual watch が一度も動いていない /
 # standalone・inline 運用) → 誤検知しない
 # ---------------------------------------------------------------------------

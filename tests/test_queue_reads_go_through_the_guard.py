@@ -187,6 +187,9 @@ GUARDED_READS = [
     ("lib_mux.py", "_config_mode", {"read_regular_text_or_unreadable"}),
     ("lib_model.py", "_parse_yaml_fallback",
      {"read_regular_text_or_unreadable"}),
+    # t019: PyYAML がある **通常の** 経路。t018 は fallback 側にだけガードを
+    # 足しており、本番で実際に走るほうが素の `p.open()` のまま残っていた。
+    ("lib_model.py", "resolve", {"read_regular_text_or_unreadable"}),
 ]
 
 
@@ -211,6 +214,36 @@ def test_the_read_goes_through_a_guard(script, function, guards):
 # 名指しされた 4 件の正体である。
 #
 # 対象モジュールの読み取りを AST で全部拾い、下の allowlist に無ければ落とす。
+#
+# ## 検出器が見えるもの / 見えないもの (t019)
+#
+# t018 の検出器は **裸の `open()` しか認識していなかった**。`Path.open()` /
+# `io.open()` / `os.open()` はどれも `ast.Attribute` なので素通りし、その穴に
+# `lib_model.resolve()` の `p.open(encoding="utf-8")` —— PyYAML がある本番の
+# 経路 —— が入っていた。FIFO を置くとモデル解決が無期限に止まるのに、この
+# テストは緑だった (Codex 10 巡目 P2-1)。**検出器の漏れは、構造テストを
+# 「守っているつもり」に変える。**
+#
+# 見える:
+#   * `open(...)` (裸)、`<何か>.open(...)` (`Path.open` / `io.open` /
+#     `os.open` を含む)、`.read_text()` / `.read_bytes()`
+#   * `lib_task_cards.py` に限り `.read()` (ガード本体を `open()` と対で数える)
+#   * 書き込みは除く: モード文字列に `w` / `a` / `x` を含むもの、および
+#     `os.open()` の書き込みフラグ (`O_WRONLY` 等)。`_is_write_open()` 参照
+#
+# 見えない (**ここを埋めるのは、これを読む人の仕事**):
+#   * `getattr(p, "open")()` のような間接呼び出し、`fn = p.open` の別名経由
+#   * `os.fdopen()` / `os.read()` を fd から直に使う形 (ガード本体だけが持つ)
+#   * `subprocess` 経由で `cat` 等に読ませる形
+#   * `AUDITED_MODULES` に載っていないモジュールそのもの (hooks/ は対象外)
+#   * `.sh` の中では `<<'PYEOF'` ブロック **1 つ目だけ** (`_python_source()`)
+#   * 受け手の名前だけでモード位置を決めているので、`os` / `io` / `codecs`
+#     という名前の **変数** に Path を入れて `.open()` すると読み違える
+#     (逆に `from pathlib import Path` した `Path(x).open("w")` は正しく
+#     書き込みと読む)
+#
+# 見えないものは **allowlist では止められない** ので、増やさないこと自体が
+# 規約になる。新しい読み方が要るときは、まずこの検出器を広げること。
 
 AUDITED_MODULES = [
     "plan.sh",
@@ -286,9 +319,35 @@ ALLOWED_DIRECT_READS = {
     # -- ガードの実装そのもの ----------------------------------------------
     ("lib_task_cards.py", "_read_regular_file", "f.read()"):
         "ガード本体。ここが唯一の `open()` で、O_NONBLOCK + fstat の判定を持つ",
+    # t019: 属性形式の open を検出するようにして、ガード本体の `os.open()` も
+    # 見えるようになった。`f.read()` と対で 1 組。
+    ("lib_task_cards.py", "_read_regular_file",
+     "os.open(path, os.O_RDONLY | os.O_NONBLOCK)"):
+        "ガード本体。`O_NONBLOCK` を付けて開くこと自体が判定の一部なので、"
+        "ここだけは自分自身を通せない",
 }
 
 _READ_ATTRS = ("read_text", "read_bytes")
+
+#: `os.open()` の書き込み側フラグ。`os.open()` はモードが文字列ではなく整数
+#: フラグなので、モード文字列とは別の見方をする。
+_OS_WRITE_FLAGS = frozenset({
+    "O_WRONLY", "O_RDWR", "O_APPEND", "O_CREAT", "O_EXCL", "O_TRUNC",
+})
+
+
+#: モジュール関数としての `open()` —— パスが第 1 引数で、モード/フラグが
+#: 第 2 引数に来る。`Path.open()` (モードが **第 1** 引数) と区別する。
+_MODULE_OPEN_RECEIVERS = frozenset({"os", "io", "codecs"})
+
+
+def _open_receiver(node: ast.Call):
+    """`<受け手>.open(...)` の受け手の名前。属性形式でなければ `None`。"""
+    func = node.func
+    if (isinstance(func, ast.Attribute) and func.attr == "open"
+            and isinstance(func.value, ast.Name)):
+        return func.value.id
+    return None
 
 
 def _is_write_open(node: ast.Call) -> bool:
@@ -296,8 +355,28 @@ def _is_write_open(node: ast.Call) -> bool:
 
     `'a+'` (ロック取得) もここで落ちる —— `flock` のために開くだけで、
     中身を読んでいないからである。
+
+    モードがどこにあるかは呼び方で違う (t019):
+
+    * 組み込みの `open(path, "a")`   → 第 2 引数
+    * `Path.open("a")`               → 第 1 引数 (パスはレシーバ側)
+    * `os.open(path, os.O_WRONLY|…)` → 第 2 引数だが **整数フラグ**
+
+    **「書き込みだ」と判定した読み取りは検出から外れる**ので、この判定は
+    狭いほうへ倒す —— 迷ったら読み取りとして報告し、allowlist に理由を
+    書かせる (memory: approve-judgment-needs-allowlist-and-scope)。
     """
-    modes = [a for a in node.args[1:2]]
+    receiver = _open_receiver(node)
+
+    if receiver == "os":
+        flags = {sub.attr for sub in ast.walk(node)
+                 if isinstance(sub, ast.Attribute)}
+        return bool(flags & _OS_WRITE_FLAGS)
+
+    if receiver is not None and receiver not in _MODULE_OPEN_RECEIVERS:
+        modes = list(node.args[:1])      # Path.open(mode, ...)
+    else:
+        modes = list(node.args[1:2])     # open(path, mode, ...)
     modes += [kw.value for kw in node.keywords if kw.arg == "mode"]
     for m in modes:
         if isinstance(m, ast.Constant) and isinstance(m.value, str):
@@ -324,6 +403,16 @@ def _direct_reads(script: str):
             continue
         func = node.func
         if isinstance(func, ast.Name) and func.id == "open":
+            if _is_write_open(node):
+                continue
+        elif isinstance(func, ast.Attribute) and func.attr == "open":
+            # t019 (Codex 10 巡目 P2-1): **属性形式の open も検出する**。
+            # ここを裸の `open()` だけにしていたせいで、`lib_model.resolve()`
+            # の `p.open(encoding="utf-8")` —— PyYAML がある通常経路 ——
+            # が最初から視界の外にいた。置き違えた FIFO 1 枚でモデル解決が
+            # 無期限に止まるのに、この構造テストは緑のままだった。
+            # **検出器に漏れがあると、構造テスト自体が「守っているつもり」
+            # になる。**
             if _is_write_open(node):
                 continue
         elif isinstance(func, ast.Attribute) and func.attr in _READ_ATTRS:

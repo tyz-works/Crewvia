@@ -129,8 +129,22 @@ def resolve(config_path: str, skills_str: str) -> str:
 
     try:
         if yaml is not None:
-            with p.open(encoding="utf-8") as f:
-                config = yaml.safe_load(f) or {}
+            # 通常 (PyYAML) 経路も固定パスのガードを通す (t019)。
+            # t018 でガードを足したのは fallback 側だけで、**PyYAML が入って
+            # いる本番の経路は素の `p.open()` のまま**だった。置き違えた
+            # FIFO 1 枚で、Worker 起動も plan review もモデル解決の途中から
+            # 先へ進まなくなる。属性形式の open だったため、
+            # tests/test_queue_reads_go_through_the_guard.py の機械検出から
+            # も見えていなかった (Codex 10 巡目 P2-1)。
+            text = read_regular_text_or_unreadable(str(p))
+            if is_unreadable(text):
+                print(
+                    f"[lib_model] WARNING: could not read config "
+                    f"{text.path}: {text.reason}",
+                    file=sys.stderr,
+                )
+                return ""
+            config = yaml.safe_load(text) or {}
         else:
             # PyYAML 未導入時は簡易 fallback パーサーを使う
             print(

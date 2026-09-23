@@ -140,8 +140,16 @@ _run_case() {
 
   local schema_mode="${CASE_SCHEMA_MODE:-}" spawn_mode="${CASE_SPAWN_MODE:-}" inj_expect="${CASE_INJECTION_EXPECT:-}"
 
+  # lib_task_cards.py は lib_model.py の **無条件 import** の相手 (t019)。
+  # 外部 PYTHONPATH の無い通常環境では、これが無いと review-plan.sh が
+  # `SELECTED_MODEL="$(python3 .../lib_model.py resolve …)"` で
+  # ModuleNotFoundError → set -e で死に、verdict binding を 1 つも検証しない
+  # まま SANITY ごと落ちる (Codex 10 巡目 P2-2)。他の隔離ツリー
+  # (test_review_plan_json_rescue.sh / _model.sh / _pane_leak.sh /
+  # _director_identity.sh / test_kai_review.sh / lib-mux.bats) と同じ扱い。
   local f
-  for f in lint_plan.py lib_verdict.py lib_model.py wait_for_plan_review.sh review-plan.sh; do
+  for f in lint_plan.py lib_verdict.py lib_model.py lib_task_cards.py \
+           wait_for_plan_review.sh review-plan.sh; do
     if ! cp "$src/scripts/$f" "$T/scripts/"; then
       fail "$label — setup: could not copy scripts/$f from $src"
       _cleanup_dir "$T"

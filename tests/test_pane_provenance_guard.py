@@ -377,16 +377,30 @@ def test_p1_1_an_unresolvable_relative_alias_is_undecided_not_empty(
     欠陥版は「`exec_arg` の basename が期待どおりのときだけ UNKNOWN」だった。
     `./monitor` のような**別名**は basename が一致しないので素通りし、
     ペイン全体が「空」= 壊してよい、と分類されていた。
+
+    判定は **`script_owner()` に直接**訊く。ペイン単位で訊くと、同じ変更に
+    含まれる別の修正 (「認識できない生きたプロセスが居るなら NONE ではない」)
+    が先に UNKNOWN を返してしまい、この欠陥を戻しても緑のままだった — 別の層が
+    先に止めていて偶然緑、という形
+    (memory: red-proof-catches-tests-green-for-the-wrong-reason)。
     """
-    proc_root = _fake_proc(tmp_path, {
-        4100: (1, ["bash"], str(tmp_path)),
-        4200: (4100, ["./monitor"], None),          # cwd が読めない
-    })
-    owner, detail = lib_mux.pane_script_owner(
-        4100, "watchdog.py", str(our_checkout / "scripts" / "watchdog.py"),
-        proc_root=proc_root)
+    argv = ["./monitor"]
+    proc_root = _fake_proc(tmp_path, {4200: (4100, argv, None)})  # cwd が読めない
+    mine = str(our_checkout / "scripts" / "watchdog.py")
+
+    owner, detail = lib_mux.script_owner(
+        4200, argv, "watchdog.py", mine, proc_root=proc_root)
     assert owner == lib_mux.OWNER_UNKNOWN, \
         f"解決できなかった相対パスが {owner} に倒れた: {detail}"
+
+    # 呼び出し側の契約としても押さえておく。
+    pane_proc_root = _fake_proc(tmp_path, {
+        4100: (1, ["bash"], str(tmp_path)),
+        4200: (4100, argv, None),
+    }, name="proc-pane")
+    owner, detail = lib_mux.pane_script_owner(
+        4100, "watchdog.py", mine, proc_root=pane_proc_root)
+    assert owner == lib_mux.OWNER_UNKNOWN, detail
 
 
 def test_p1_2_a_versioned_interpreter_still_resolves_its_script(

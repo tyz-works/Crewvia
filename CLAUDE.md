@@ -54,9 +54,11 @@
     watchdog.py         Worker 生存監視デーモン（idle 判定・pane 消滅の検知と kill）
                         **Worker を終了させる唯一の実行者**（t002 以降）。後始末まで担う
     lib_daemon_watch.py  dispatcher と watchdog の相互監視（heartbeat・respawn・自己申告・
-                        maintenance マーカー）。CLI: spawn / beat / watch / status / pause /
-                        resume / restart（pause→kill→spawn→resume を 1 コマンドで行う。
-                        `scripts/lib_mux.py kill`/`spawn` を素で叩かないこと）
+                        maintenance マーカー）。CLI: spawn / spawn-cmd / beat / watch / status /
+                        pause / resume / restart（pause→kill→spawn→resume を 1 コマンドで行う。
+                        `scripts/lib_mux.py kill`/`spawn` を素で叩かないこと。spawn-cmd は
+                        起動コマンド文字列だけを印字する — 両デーモン同時 restart 等で
+                        `lib_mux.py spawn` に手渡すときに使う）
                         設計: knowledge/daemon-authority.md §7。両方が同時に死ぬケース
                         （相互監視だけでは救えない）は hooks/post-tool-use.sh の backstop
                         （§7-13）が Director に伝える

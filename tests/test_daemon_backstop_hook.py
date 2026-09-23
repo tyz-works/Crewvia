@@ -23,6 +23,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from shutil import which
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 HOOK = REPO_ROOT / "hooks" / "post-tool-use.sh"
@@ -221,6 +222,127 @@ def test_stale_threshold_is_overridable_via_env(tmp_path):
         f"env var でしきい値を下げても検知しなかった。exit={overridden.returncode}, "
         f"stderr={overridden.stderr!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# F-1: `stat -c` は GNU 専用。BSD/macOS は `stat -f` しか無く、フォールバック
+# が無いと mtime が読めず heartbeat 側は「無限に stale」(誤発火)、throttle
+# 側は「常に窓経過」(抑制が効かない) の二重故障になる。
+# ---------------------------------------------------------------------------
+
+def _write_fake_bsd_stat(tmp_path: Path) -> Path:
+    """`-c` を拒否し `-f` だけを解釈する stat シム (実 BSD/macOS の再現)。
+    PATH の先頭に置いて `stat -c ... || stat -f ... || ...` の
+    フォールバック経路が実際に踏まれることを証明する。"""
+    real_stat = which("stat")
+    bin_dir = tmp_path / "fakebin"
+    bin_dir.mkdir(exist_ok=True)
+    stat_path = bin_dir / "stat"
+    stat_path.write_text(
+        "#!/usr/bin/env bash\n"
+        "if [ \"$1\" = \"-c\" ]; then\n"
+        "  echo 'stat: illegal option -- c' >&2\n"
+        "  exit 1\n"
+        "fi\n"
+        "if [ \"$1\" = \"-f\" ]; then\n"
+        "  shift; fmt=\"$1\"; shift\n"
+        "  if [ \"$fmt\" = \"%m\" ]; then\n"
+        f"    exec {real_stat} -c %Y \"$@\"\n"
+        "  fi\n"
+        "fi\n"
+        "exit 1\n",
+        encoding="utf-8",
+    )
+    stat_path.chmod(0o755)
+    return bin_dir
+
+
+def test_bsd_only_stat_does_not_false_positive_on_healthy_daemons(tmp_path):
+    """フォールバックが無いと、健全 (fresh) な heartbeat すら mtime が読めず
+    -1 (無限に stale) 扱いになり、BSD/macOS の Director に常に誤発火する。"""
+    _make_registry(tmp_path)
+    _age(tmp_path, "dispatcher", 0)
+    _age(tmp_path, "watchdog", 0)
+
+    fakebin = _write_fake_bsd_stat(tmp_path)
+    result = _run_hook(tmp_path, extra_env={"PATH": f"{fakebin}:{os.environ['PATH']}"})
+
+    assert result.returncode == 0, (
+        f"BSD 専用 stat 環境で健全な daemon を stale と誤検知した (F-1 回帰)。"
+        f"exit={result.returncode}, stderr={result.stderr!r}"
+    )
+    assert "daemon-backstop" not in result.stderr
+
+
+def test_bsd_only_stat_throttle_still_suppresses_second_call(tmp_path):
+    """throttle マーカーの mtime 読み取りも同じ `stat -c` 依存だった。
+    フォールバックが無いと mtime が常に読めず、窓が「常に経過済み」に
+    倒れて 2 回目以降も毎回発火してしまう (要件2 違反)。"""
+    _make_registry(tmp_path)
+    _age(tmp_path, "dispatcher", 3600)
+    _age(tmp_path, "watchdog", 3600)
+
+    fakebin = _write_fake_bsd_stat(tmp_path)
+    env = {"PATH": f"{fakebin}:{os.environ['PATH']}"}
+
+    first = _run_hook(tmp_path, extra_env=env)
+    assert first.returncode == 2
+
+    second = _run_hook(tmp_path, extra_env=env)
+    assert second.returncode == 0, (
+        f"BSD 専用 stat 環境で throttle が効かず 2 回目も発火した (F-1 回帰)。"
+        f"exit={second.returncode}, stderr={second.stderr!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# O-1: 位置依存の `grep -A3` は、director エントリの直前の Worker エントリが
+# `- name:` のみ (role/skills 欠落) だと次エントリの role: 行まで読んでしまう。
+# 現行 workers.yaml の Ren (Sora-director の直前) がまさにこの形。
+# ---------------------------------------------------------------------------
+
+def test_role_lookup_does_not_bleed_into_next_workers_yaml_entry(tmp_path):
+    (tmp_path / "registry" / "daemons").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "registry" / "workers.yaml").write_text(
+        "workers:\n"
+        "  - name: Ren\n"
+        "  - name: Sora-director\n"
+        "    role: director\n"
+        "    skills: []\n",
+        encoding="utf-8",
+    )
+    _age(tmp_path, "dispatcher", 3600)
+    _age(tmp_path, "watchdog", 3600)
+
+    result = _run_hook(tmp_path, agent="Ren")
+    assert result.returncode == 0, (
+        f"role フィールドを持たない Worker (Ren) が次エントリの director に "
+        f"誤判定された (O-1 回帰)。exit={result.returncode}, stderr={result.stderr!r}"
+    )
+    assert "daemon-backstop" not in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# O-2: 不正な (非数値の) しきい値 env は lib_daemon_watch.py の load_config()
+# と同じく「既定値を保って無視する」べき。以前は `[[ -ge ]]` が非数値を
+# 未束縛の変数参照として評価し、set -u で hook 全体が crash guard に握り
+# 潰されて、意図した通知が出ないまま exit 0 になっていた。
+# ---------------------------------------------------------------------------
+
+def test_invalid_env_threshold_falls_back_to_default_instead_of_aborting(tmp_path):
+    _make_registry(tmp_path)
+    _age(tmp_path, "dispatcher", 3600)
+    _age(tmp_path, "watchdog", 3600)
+
+    result = _run_hook(tmp_path, extra_env={
+        "CREWVIA_DAEMON_DISPATCHER_STALE_SECONDS": "not-a-number",
+    })
+    assert result.returncode == 2, (
+        f"不正な env しきい値で既定値へフォールバックせず握り潰された (O-2 回帰)。"
+        f"exit={result.returncode}, stderr={result.stderr!r}"
+    )
+    assert "crash guard" not in result.stderr
+    assert "daemon-backstop" in result.stderr
 
 
 if __name__ == "__main__":

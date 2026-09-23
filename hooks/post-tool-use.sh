@@ -121,8 +121,35 @@ if [[ -n "${AGENT_NAME:-}" ]]; then
   _BS_REPO="${CREWVIA_REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
   _BS_WORKERS_YAML="${_BS_REPO}/registry/workers.yaml"
   _BS_IS_DIRECTOR=0
-  if [[ -f "$_BS_WORKERS_YAML" ]] && grep -qA1 "name: ${AGENT_NAME}$" "$_BS_WORKERS_YAML" 2>/dev/null; then
-    _BS_ROLE="$(grep -A3 "name: ${AGENT_NAME}$" "$_BS_WORKERS_YAML" | grep 'role:' | awk '{print $2}' | head -1 || true)"
+  if [[ -f "$_BS_WORKERS_YAML" ]]; then
+    # O-1是正: 以前は grep -A3 の位置依存判定だったため、director エントリの
+    # 直前の Worker がフィールド 1 つだけ (role/skills 欠落等) だと次の
+    # `- name:` に届く前に role: 行を拾ってしまい、director と誤判定する
+    # 恐れがあった (workers.yaml では director の直前が `- name: Ren` の
+    # 1 行だけで、余裕が 1 行しかない)。下流の agents-heartbeat 送信で既に
+    # 使っている「`- name:` で次エントリを検知して break する」Python
+    # パーサに寄せる。
+    _BS_ROLE="$(python3 - "$AGENT_NAME" "$_BS_WORKERS_YAML" <<'PYEOF' 2>/dev/null || echo "worker"
+import re, sys
+from pathlib import Path
+agent_name, yaml_path = sys.argv[1], sys.argv[2]
+content = Path(yaml_path).read_text()
+in_target = False
+role = "worker"
+for line in content.splitlines():
+    if re.match(r'\s*- name: ' + re.escape(agent_name) + r'\s*$', line):
+        in_target = True
+        continue
+    if in_target:
+        if re.match(r'\s*- name:', line):
+            break
+        m = re.match(r'\s*role:\s*(.+)', line)
+        if m:
+            role = m.group(1).strip()
+            break
+print(role)
+PYEOF
+)"
     if [[ "$_BS_ROLE" == "director" ]]; then
       _BS_IS_DIRECTOR=1
     fi
@@ -139,7 +166,13 @@ if [[ -n "${AGENT_NAME:-}" ]]; then
       _BS_NOW="$(date +%s)"
       _BS_LAST=0
       if [[ -f "$_BS_THROTTLE" ]]; then
-        _BS_LAST="$(stat -c %Y "$_BS_THROTTLE" 2>/dev/null || echo 0)"
+        # F-1是正: GNU 専用の `stat -c` は BSD/macOS に無く失敗する。
+        # BSD の `stat -f %m` へフォールバックする (scripts/wait_for_plan_review.sh
+        # の _mtime_of と同じイディオム)。両方失敗した場合の既定値は「判定不能を
+        # 騒がしい側に倒さない」ため $_BS_NOW (= 今読んだばかり扱い) にする —
+        # heartbeat 側の -1 (無限に stale) とは逆方向: throttle は読めないだけで
+        # 誤発火させると要件 2 (毎ツール呼び出しの通知) と衝突する。
+        _BS_LAST="$(stat -c %Y "$_BS_THROTTLE" 2>/dev/null || stat -f %m "$_BS_THROTTLE" 2>/dev/null || echo "$_BS_NOW")"
       fi
       _BS_ELAPSED=$(( _BS_NOW - _BS_LAST ))
 
@@ -149,15 +182,23 @@ if [[ -n "${AGENT_NAME:-}" ]]; then
 
         _BS_DISPATCHER_STALE_S="${CREWVIA_DAEMON_DISPATCHER_STALE_SECONDS:-60}"
         _BS_WATCHDOG_STALE_S="${CREWVIA_DAEMON_WATCHDOG_STALE_SECONDS:-240}"
+        # O-2是正: 不正な (非数値の) env値は lib_daemon_watch.py の load_config()
+        # と同じく「既定値を保って無視する」に揃える。以前はここで検証しておらず、
+        # `[[ ... -ge "$_BS_DISPATCHER_STALE_S" ]]` に非数値が渡ると bash が
+        # それを未束縛の変数参照として評価し `set -u` で hook 全体が異常終了
+        # していた (crash guard が exit 0 に握り潰すため、意図した通知も出ない
+        # まま黙って落ちる)。
+        [[ "$_BS_DISPATCHER_STALE_S" =~ ^[0-9]+$ ]] || _BS_DISPATCHER_STALE_S=60
+        [[ "$_BS_WATCHDOG_STALE_S" =~ ^[0-9]+$ ]] || _BS_WATCHDOG_STALE_S=240
 
         _BS_D_AGE=-1
         if [[ -f "${_BS_DAEMONS_DIR}/dispatcher.heartbeat" ]]; then
-          _BS_D_MTIME="$(stat -c %Y "${_BS_DAEMONS_DIR}/dispatcher.heartbeat" 2>/dev/null || echo "")"
+          _BS_D_MTIME="$(stat -c %Y "${_BS_DAEMONS_DIR}/dispatcher.heartbeat" 2>/dev/null || stat -f %m "${_BS_DAEMONS_DIR}/dispatcher.heartbeat" 2>/dev/null || echo "")"
           [[ -n "$_BS_D_MTIME" ]] && _BS_D_AGE=$(( _BS_NOW - _BS_D_MTIME ))
         fi
         _BS_W_AGE=-1
         if [[ -f "${_BS_DAEMONS_DIR}/watchdog.heartbeat" ]]; then
-          _BS_W_MTIME="$(stat -c %Y "${_BS_DAEMONS_DIR}/watchdog.heartbeat" 2>/dev/null || echo "")"
+          _BS_W_MTIME="$(stat -c %Y "${_BS_DAEMONS_DIR}/watchdog.heartbeat" 2>/dev/null || stat -f %m "${_BS_DAEMONS_DIR}/watchdog.heartbeat" 2>/dev/null || echo "")"
           [[ -n "$_BS_W_MTIME" ]] && _BS_W_AGE=$(( _BS_NOW - _BS_W_MTIME ))
         fi
 

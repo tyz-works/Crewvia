@@ -20,10 +20,14 @@ dispatcher tab を restart せずに再検証すると **OBS-1 バグが再現�
 
 | プロセス | 再起動が必要なケース |
 |----------|-------------------|
-| `dispatcher` tab | `scripts/dispatcher.sh` / `scripts/lib_mux.py` の変更 |
-| `watchdog` tab | `scripts/watchdog.py` / `scripts/watchdog.sh` の変更 |
+| `dispatcher` tab | `scripts/dispatcher.sh` / `scripts/lib_mux.py` / `scripts/lib_daemon_watch.py` / `scripts/lib_retirement.py` の変更 |
+| `watchdog` tab | `scripts/watchdog.py` / `scripts/lib_daemon_watch.py` / `scripts/lib_retirement.py` の変更 |
 | Worker tab | `scripts/start.sh` の変更（スキル割り当て等） |
 | `Sora-director` | `agents/director.md` / `hooks/*.sh` の変更（プロンプト・hook 反映） |
+
+> `lib_daemon_watch.py` / `lib_retirement.py` は dispatcher・watchdog 双方が起動時に
+> import する共有モジュール。ここを直した PR は **両方** restart すること
+> (`agents/director.md` §12 と揃えてある)。
 
 ---
 

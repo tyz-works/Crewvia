@@ -125,6 +125,13 @@ import lib_retirement  # noqa: E402
 # る task と dispatcher が投げる task がズレると、痛むのは QA FAIL の直後だけで、
 # その瞬間まで誰も気付かない。tests/test_task_graph.py がコピーの再発を見張る。
 from lib_dep_rules import unmet_dependencies  # noqa: E402
+# task カードの読み取りも 1 箇所しかない (Codex 5 巡目 P2)。parser・「識別子は
+# ファイル名」・信用できないカードの隔離を plan.sh 側だけに入れた結果、同じ queue を
+# 2 つの別のコードが別の規則で読む状態になり、`id` 行の無いカードで **この
+# サイクルが KeyError で落ちて全 mission の割り当てが止まる** 経路ができていた。
+# ここに frontmatter を直接読むコードを書き戻さないこと。
+# 再発防止は tests/test_task_card_identity.py。
+from lib_task_cards import CORRUPT_TASK_STATUS, list_task_cards, parse_frontmatter  # noqa: E402,F401
 _mux = Mux()
 
 # t002: who may end a Worker process.  'watchdog' (default) = this daemon only
@@ -371,35 +378,18 @@ def parse_yaml(text):
 # ---------------------------------------------------------------------------
 # Frontmatter parser for task .md files
 # ---------------------------------------------------------------------------
-
-def parse_frontmatter(text):
-    """Return (meta dict, body string) from a task .md file."""
-    lines = text.splitlines()
-    if not lines or lines[0].strip() != '---':
-        return {}, text
-    end = -1
-    for idx in range(1, len(lines)):
-        if lines[idx].strip() == '---':
-            end = idx
-            break
-    if end < 0:
-        return {}, text
-    front = '\n'.join(lines[1:end])
-    body = '\n'.join(lines[end + 1:])
-    meta = parse_yaml(front)
-    meta.setdefault('skills', [])
-    meta.setdefault('blocked_by', [])
-    if meta.get('skills') is None:
-        meta['skills'] = []
-    elif isinstance(meta.get('skills'), str):
-        # Normalize scalar string to list: `skills: bash` → `skills: [bash]`
-        # Without this, set("bash") yields individual characters, breaking
-        # every skill-intersection check (DIRECTOR_ONLY_SKILLS, worker matching).
-        meta['skills'] = [meta['skills']]
-    if meta.get('blocked_by') is None:
-        meta['blocked_by'] = []
-    return meta, body
-
+#
+# `parse_frontmatter` は lib_task_cards から来る (import 部を参照)。ここに独自の
+# 実装を置いていたのが Codex 5 巡目 P2 の指摘で、上の `parse_yaml` との違いが
+# そのまま欠陥だった: 読めない行を黙って捨てるので、半分だけ読めた
+# `status: pending` がそのまま信じられ、**中身の分からないカードが dispatch
+# される**。plan.sh 側の parser は同じ行で例外を投げてカードを隔離していた。
+#
+# なお `parse_yaml` (この上) は **カード以外の YAML 専用** として残してある。
+# `state.yaml` / `workers.yaml` / `mission.yaml` は手で編集される経路があり、
+# 1 行の typo で常駐デーモンが毎サイクル死ぬと Worker の割り当てと生存監視が
+# まとめて止まる。カードのほうは list_task_cards() が例外を `[破損]` に変えて
+# 吸収するので、厳格な parser でも落ちない。
 
 # ---------------------------------------------------------------------------
 # State / workers / tasks loading
@@ -448,24 +438,18 @@ def load_workers():
 
 
 def list_tasks_for_mission(slug):
-    """Return list of (meta, body) sorted by task number."""
-    tdir = MISSIONS_DIR / slug / 'tasks'
-    if not tdir.exists():
-        return []
-    entries = []
-    for fn in tdir.iterdir():
-        m = re.fullmatch(r't(\d+)\.md', fn.name)
-        if m:
-            entries.append((int(m.group(1)), fn))
-    entries.sort()
-    out = []
-    for _, path in entries:
-        try:
-            meta, body = parse_frontmatter(path.read_text())
-            out.append((meta, body))
-        except Exception as e:
-            log(f"WARNING: failed to parse {path}: {e}")
-    return out
+    """Return list of (meta, body) sorted by task number.
+
+    読み取りの規則は `scripts/lib_task_cards.py` にある —— `plan.sh` の
+    `list_tasks()` が読むのと同じ 1 つのモジュールで、これが「pull が受理する
+    カードと、ここがスケジュールするカードが一致する」の中身である。
+
+    ここに自前の走査・parse を書き戻さないこと。読めないカードは例外ではなく
+    `[破損]` (`CORRUPT_TASK_STATUS`) のカードとして返ってくるので、1 枚の事故で
+    このサイクルが落ちることはない —— 倒れる先は常に「そのカードだけが動かない」。
+    """
+    return list_task_cards(MISSIONS_DIR / slug / 'tasks',
+                           warn=lambda msg: log(f"WARNING: {msg}"))
 
 
 def load_all_tasks(active_missions):

@@ -45,6 +45,10 @@ sys.path.insert(0, str(_SCRIPTS_DIR))
 from lib_mux import Mux, repo_identity_ok  # noqa: E402
 import lib_retirement  # noqa: E402
 import lib_daemon_watch  # noqa: E402
+# task カードの読み取りは crewvia の中で 1 箇所しかない (Codex 5 巡目 P2)。
+# ここに frontmatter を直接読むコードを書き戻さないこと — plan.sh が `[破損]`
+# として保留するカードを、この監視だけが別の task の id で数える状態に戻る。
+from lib_task_cards import list_task_cards  # noqa: E402
 _mux = Mux()
 
 __version__ = "2.1.0"
@@ -217,22 +221,6 @@ def parse_iso_epoch(value) -> Optional[float]:
         # a floor 9 hours in the future, i.e. idle that never grows.
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.timestamp()
-
-
-def parse_frontmatter(text: str) -> tuple[dict, str]:
-    lines = text.splitlines()
-    if not lines or lines[0].strip() != "---":
-        return {}, text
-    end = -1
-    for idx in range(1, len(lines)):
-        if lines[idx].strip() == "---":
-            end = idx
-            break
-    if end < 0:
-        return {}, text
-    meta = parse_yaml("\n".join(lines[1:end]))
-    body = "\n".join(lines[end + 1:])
-    return meta, body
 
 
 # ---------------------------------------------------------------------------
@@ -933,21 +921,17 @@ def load_active_tasks(queue_dir: Path) -> list[tuple[str, str, dict]]:
     state = parse_yaml(state_file.read_text())
     active_missions = list(state.get("active_missions") or [])
 
+    # カードの読み取りは scripts/lib_task_cards.py に 1 つだけ。識別子はファイル名
+    # から来るので、`id` 行を直し忘れたコピーが *別の task* として監視されることが
+    # 構造上なくなる (以前は `meta.get("id", fn.stem)` で、食い違う id 欄のほうが
+    # ファイル名に勝っていた)。信用できないカードは `in_progress` ではない疑似
+    # ステータスで返るので、この監視の対象にも自動的に入らない。
     results: list[tuple[str, str, dict]] = []
     missions_dir = queue_dir / "missions"
     for slug in active_missions:
-        tasks_dir = missions_dir / slug / "tasks"
-        if not tasks_dir.exists():
-            continue
-        for fn in tasks_dir.iterdir():
-            if not re.fullmatch(r"t\d+\.md", fn.name):
-                continue
-            try:
-                meta, _ = parse_frontmatter(fn.read_text())
-            except Exception:
-                continue
+        for meta, _ in list_task_cards(missions_dir / slug / "tasks"):
             if meta.get("status") == "in_progress":
-                results.append((slug, str(meta.get("id", fn.stem)), meta))
+                results.append((slug, str(meta["id"]), meta))
 
     return results
 

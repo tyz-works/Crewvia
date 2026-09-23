@@ -323,9 +323,11 @@ def sandbox(tmp_path):
     root = tmp_path / "repo"
     (root / "scripts").mkdir(parents=True)
     shutil.copy2(PLAN_SH, root / "scripts" / "plan.sh")
-    # lib_dep_rules.py は必須 (plan.sh が起動時に読む依存規則の本体)。
+    # lib_dep_rules.py / lib_task_cards.py は必須 (plan.sh が起動時に読む、
+    # 依存規則と task カード読み取りの本体。どちらもフォールバックを持たない)。
     # 残りは、その subcommand を使うときだけ要る補助。
-    for extra in ("lib_dep_rules.py", "lib_registry.py", "lint_plan.py"):
+    for extra in ("lib_dep_rules.py", "lib_task_cards.py",
+                  "lib_registry.py", "lint_plan.py"):
         src = REPO_ROOT / "scripts" / extra
         if src.exists():
             shutil.copy2(src, root / "scripts" / extra)
@@ -697,10 +699,10 @@ def test_output_follows_crewvia_repo_root_not_script_location(sandbox, tmp_path)
     worktree = tmp_path / "wt"
     (worktree / "scripts").mkdir(parents=True)
     shutil.copy2(PLAN_SH, worktree / "scripts" / "plan.sh")
-    # 本物の worktree には scripts/ が丸ごと在る。plan.sh は依存規則を
-    # 自分の側の scripts/ から読むので、ここでも一緒に置く。
-    shutil.copy2(REPO_ROOT / "scripts" / "lib_dep_rules.py",
-                 worktree / "scripts" / "lib_dep_rules.py")
+    # 本物の worktree には scripts/ が丸ごと在る。plan.sh は依存規則と task カードの
+    # 読み取りを自分の側の scripts/ から読むので、ここでも一緒に置く。
+    for _extra in ("lib_dep_rules.py", "lib_task_cards.py"):
+        shutil.copy2(REPO_ROOT / "scripts" / _extra, worktree / "scripts" / _extra)
 
     sandbox.add_task("t001", "pending", [])
     assert sandbox.run("task-graph").returncode == 0

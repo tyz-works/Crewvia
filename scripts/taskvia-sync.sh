@@ -46,7 +46,7 @@ fi
 MAP_FILE="${QUEUE_DIR}/.taskvia-map.json"
 AUTH_HEADER="Authorization: Bearer ${TASKVIA_TOKEN}"
 
-python3 - "$QUEUE_DIR" "$MAP_FILE" "$TASKVIA_URL" "$AUTH_HEADER" <<'PYEOF'
+python3 - "$QUEUE_DIR" "$MAP_FILE" "$TASKVIA_URL" "$AUTH_HEADER" "$SCRIPT_DIR" <<'PYEOF'
 import sys
 import os
 import re
@@ -57,6 +57,13 @@ queue_dir   = sys.argv[1]
 map_file    = sys.argv[2]
 taskvia_url = sys.argv[3]
 auth_header = sys.argv[4]
+scripts_dir = sys.argv[5]
+
+# task カードの読み取りは crewvia の中で 1 箇所しかない (Codex 5 巡目 P2)。
+# ここに frontmatter を直接読むコードを書き戻さないこと — Taskvia に出る姿と
+# `plan.sh status` に出る姿が、静かにズレる。
+sys.path.insert(0, scripts_dir)
+from lib_task_cards import list_task_cards  # noqa: E402
 
 state_file = os.path.join(queue_dir, 'state.yaml')
 missions_dir = os.path.join(queue_dir, 'missions')
@@ -113,20 +120,6 @@ def parse_yaml(text):
             result[key] = _scalar(val)
             i += 1
     return result
-
-
-def parse_frontmatter(text):
-    lines = text.splitlines()
-    if not lines or lines[0].strip() != '---':
-        return None
-    end = None
-    for i in range(1, len(lines)):
-        if lines[i].strip() == '---':
-            end = i
-            break
-    if end is None:
-        return None
-    return parse_yaml('\n'.join(lines[1:end]))
 
 
 # ---------- map I/O ----------
@@ -231,20 +224,12 @@ def scan_missions():
             continue
         with open(myaml) as f:
             mission_meta = parse_yaml(f.read())
-        tdir = os.path.join(mdir, 'tasks')
-        if not os.path.isdir(tdir):
-            continue
-        entries = []
-        for fn in os.listdir(tdir):
-            m = re.fullmatch(r't(\d+)\.md', fn)
-            if m:
-                entries.append((int(m.group(1)), fn))
-        entries.sort()
-        for _, fn in entries:
-            with open(os.path.join(tdir, fn)) as f:
-                meta = parse_frontmatter(f.read())
-            if meta is None:
-                continue
+        # 読み取りは scripts/lib_task_cards.py に 1 つだけ (plan.sh / dispatcher.sh
+        # と同じもの)。識別子はファイル名から来るので、`id` 行を直し忘れたコピーが
+        # Taskvia 側で空 id / 別カードの上書きになることが構造上なくなる。
+        # 信用できないカードも `[破損]` として出る —— 黙って消すと、ボードだけを
+        # 見ている人には「そんな task は無い」と読めてしまう。
+        for meta, _body in list_task_cards(os.path.join(mdir, 'tasks')):
             yield slug, mission_meta, meta
 
 

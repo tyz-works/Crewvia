@@ -68,6 +68,18 @@
                         権限境界の設計は knowledge/daemon-authority.md
                         判定の設計は knowledge/watchdog-idle-judgment.md
                         ログ: logs/watchdog/watchdog-YYYYMMDD.log（日次）
+    lib_task_cards.py   **task カードを読むことの唯一の定義**（`list_task_cards()` /
+                        `parse_frontmatter()` / `isolated_task()` / `CORRUPT_TASK_STATUS`）。
+                        **plan.sh・dispatcher.sh・watchdog.py・verifier-dispatcher.sh・
+                        taskvia-sync.sh の 5 者がここだけを読む**。識別子はファイル名、
+                        `id` 欄の食い違いは `[破損]` として保留、読めないカードも例外では
+                        なく `[破損]` で返す（1 枚の事故で常駐デーモンのサイクルを
+                        落とさないため）。コピーを書き戻すと「pull は受理するのに
+                        dispatch サイクルが KeyError で落ちる」が戻る（Codex 5 巡目 P2）。
+                        フォールバックは持たない（読めなければ呼び出し側が落ちる）ので、
+                        plan.sh を単体でコピーする隔離テストでは一緒に置くこと。
+                        再発防止は tests/test_task_card_identity.py（両者が同じ queue から
+                        同じ task 集合を導くことの直接 assert + コピー検出）
     lib_dep_rules.py    「依存が満たされた」の唯一の定義（`unmet_dependencies()` /
                         `DEAD_DEP_STATUSES`）。**plan.sh pull・plan.sh task-graph・
                         dispatcher.sh の 3 者がここだけを読む**。コピーを書き戻すと、
@@ -124,7 +136,13 @@
        `id` 欄がファイル名と食い違うカードは `[破損]` として保留され、pull も dispatch も
        拾わない（`plan.sh status` に理由と直し方が出る）。突き合わせないと、tNNN.md を
        コピーして id 行を直し忘れただけで DAG が全滅し、さらに `pull` の書き戻しが
-       **別のカードを上書きして消す**（t013）
+       **別のカードを上書きして消す**（t013）。
+       この規則は `scripts/lib_task_cards.py` に 1 つだけ置いてある（t014）。
+       **queue のカードを読むコードを新しく書くときは、必ずこのモジュールを呼ぶこと** —
+       t013 で plan.sh にだけ入れた結果、`id` 行の無いカードで dispatch サイクルが
+       `KeyError` で落ち、**全 mission の割り当てが止まる**経路ができていた（pull は
+       受理し `plan.sh status` にも ready と出るので、queue を見るかぎり何も壊れて
+       いないように見える）
     daemons/            dispatcher/watchdog 相互監視の heartbeat・pause マーカー・respawn 履歴
                         （.gitignore 対象）。hooks/post-tool-use.sh の同時死 backstop（t008）が
                         throttle マーカー（backstop-notify.throttle）を置く場所でもある

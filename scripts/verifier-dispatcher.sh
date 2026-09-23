@@ -63,6 +63,10 @@ NOTIFY_TTL     = int(sys.argv[4])
 _SCRIPTS_DIR = REGISTRY_DIR.parent / 'scripts'
 sys.path.insert(0, str(_SCRIPTS_DIR))
 from lib_mux import Mux  # noqa: E402
+# task カードの読み取りは crewvia の中で 1 箇所しかない (Codex 5 巡目 P2)。
+# ここに frontmatter を直接読むコードを書き戻さないこと — plan.sh が受理する
+# カードとここが拾うカードが、静かにズレる。
+from lib_task_cards import list_task_cards  # noqa: E402
 _mux = Mux()
 
 MISSIONS_DIR    = QUEUE_DIR / 'missions'
@@ -164,29 +168,6 @@ def parse_yaml(text):
     return result
 
 
-def parse_frontmatter(text):
-    lines = text.splitlines()
-    if not lines or lines[0].strip() != '---':
-        return {}, text
-    end = -1
-    for idx in range(1, len(lines)):
-        if lines[idx].strip() == '---':
-            end = idx
-            break
-    if end < 0:
-        return {}, text
-    front = '\n'.join(lines[1:end])
-    body = '\n'.join(lines[end + 1:])
-    meta = parse_yaml(front)
-    meta.setdefault('skills', [])
-    meta.setdefault('blocked_by', [])
-    if meta.get('skills') is None:
-        meta['skills'] = []
-    if meta.get('blocked_by') is None:
-        meta['blocked_by'] = []
-    return meta, body
-
-
 # ---------------------------------------------------------------------------
 # State / workers / tasks loading
 # ---------------------------------------------------------------------------
@@ -222,23 +203,15 @@ def load_workers():
 
 
 def list_tasks_for_mission(slug):
+    """Return list of (meta, body, path) sorted by task number.
+
+    読み取りの規則は scripts/lib_task_cards.py に 1 つだけ (plan.sh / dispatcher.sh
+    と同じもの)。読めないカードは例外ではなく `[破損]` のカードとして返るので、
+    1 枚の事故でこのループが止まることはない。
+    """
     tdir = MISSIONS_DIR / slug / 'tasks'
-    if not tdir.exists():
-        return []
-    entries = []
-    for fn in tdir.iterdir():
-        m = re.fullmatch(r't(\d+)\.md', fn.name)
-        if m:
-            entries.append((int(m.group(1)), fn))
-    entries.sort()
-    out = []
-    for _, path in entries:
-        try:
-            meta, body = parse_frontmatter(path.read_text())
-            out.append((meta, body, path))
-        except Exception as e:
-            log(f"WARNING: failed to parse {path}: {e}")
-    return out
+    cards = list_task_cards(tdir, warn=lambda msg: log(f"WARNING: {msg}"))
+    return [(meta, body, tdir / f"{meta['id']}.md") for meta, body in cards]
 
 
 # ---------------------------------------------------------------------------

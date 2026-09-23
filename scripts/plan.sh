@@ -271,16 +271,52 @@ MISSIONS_DIR = os.path.join(QUEUE_DIR, 'missions')
 ARCHIVE_DIR = os.path.join(QUEUE_DIR, 'archive')
 LOCK_FILE = os.path.join(QUEUE_DIR, '.lock')
 
+
+# ---------------------------------------------------------------------------
+# scripts/ の共有モジュール
+# ---------------------------------------------------------------------------
+#
+# 読み込み元は REPO_ROOT (= 実行された plan.sh 自身の置き場) であって
+# CREWVIA_REPO_ROOT ではない。コードは、今走っている plan.sh と同じ checkout
+# から来なければならない — worktree の plan.sh が本体のコードを読むと、
+# worktree で直したはずの規則が効かない。
+#
+# 失敗はそのまま外に出す。try で包んで自前の実装に落ちると、「規則は 1 箇所」
+# という性質が壊れた環境でだけ静かに失われる。plan.sh が起動しないほうがまだよい。
+
+def _load_scripts_module(name):
+    """`scripts/<name>.py` を読み込む。失敗はそのまま外に出す。"""
+    import importlib.util, pathlib
+    path = pathlib.Path(REPO_ROOT) / 'scripts' / f'{name}.py'
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f'共有モジュールを読めません: {path}')
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+# task カードの読み取り —— parser・識別子・隔離の規則は 1 箇所しかない。
+# dispatcher.sh も同じモジュールを読む: 同じ queue を 2 つの別のコードが別の
+# 規則で読んでいたのが Codex 5 巡目 P2 の指摘で、そのときズレは「pull は
+# 受理するのに dispatch サイクルが KeyError で落ちる」という形で出た。
+# 再発防止は tests/test_task_card_identity.py。
+_TASK_CARDS = _load_scripts_module('lib_task_cards')
+parse_yaml = _TASK_CARDS.parse_yaml
+parse_frontmatter = _TASK_CARDS.parse_frontmatter
+_scalar = _TASK_CARDS._scalar
+_split_inline_list = _TASK_CARDS._split_inline_list
+
 PRIORITY_ORDER = {'high': 0, 'medium': 1, 'low': 2}
 TERMINAL_STATUSES = {'done', 'verified', 'skipped'}
 
-# Pseudo-status for a task file that failed to parse (see list_tasks). Never
+# Pseudo-status for a task file that failed to parse (see lib_task_cards). Never
 # 'pending', so pull/dispatch skip it automatically; never in
 # TERMINAL_STATUSES, so a mission with a corrupted task is never mistaken for
 # complete. It exists purely so ONE malformed tNNN.md cannot take the rest of
 # the mission down with it (t009: a multi-line needs-director reason broke
 # frontmatter parsing and froze plan.sh status / dispatch entirely).
-CORRUPT_TASK_STATUS = 'corrupted'
+CORRUPT_TASK_STATUS = _TASK_CARDS.CORRUPT_TASK_STATUS
 
 STATUS_ICON = {
     'done': '✅',
@@ -323,113 +359,6 @@ def now_generation():
 # ---------------------------------------------------------------------------
 # Minimal YAML helpers (narrow subset, no external deps)
 # ---------------------------------------------------------------------------
-
-def parse_yaml(text, source='<yaml>'):
-    """Parse a narrow subset: scalar fields, inline lists, block lists.
-
-    Unrecognized lines raise instead of being silently dropped, so a hand-edit
-    typo (e.g. missing colon, mis-indented block list) cannot quietly produce a
-    half-loaded dict.
-    """
-    lines = text.splitlines()
-    result = {}
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        if not line.strip() or line.lstrip().startswith('#'):
-            i += 1
-            continue
-        m = re.match(r'^([\w-]+):\s*(.*)$', line)
-        if not m:
-            if line and line[0] in (' ', '\t'):
-                # Deeply nested / orphaned indented line (e.g. inside verification.commands)
-                # — skip silently to maintain backward compatibility with unknown block structures
-                i += 1
-                continue
-            raise ValueError(
-                f"{source}: malformed line {i + 1}: {line!r} "
-                f"(expected `key: value`, `key: [a, b]`, or `key:` followed by `  - item` lines)"
-            )
-        key = m.group(1)
-        val = m.group(2).rstrip()
-        if val == '':
-            # Possible block list (`- item`) or block mapping (`  key: val`)
-            i += 1
-            items = []
-            sub_dict = {}
-            while i < len(lines):
-                lst = re.match(r'^\s+-\s*(.*)$', lines[i])
-                if lst:
-                    items.append(_scalar(lst.group(1).strip()))
-                    i += 1
-                else:
-                    map_m = re.match(r'^  ([\w-]+):\s*(.*)$', lines[i])
-                    if map_m:
-                        sub_key = map_m.group(1)
-                        sub_val = _scalar(map_m.group(2).rstrip())
-                        sub_dict[sub_key] = sub_val
-                        i += 1
-                    else:
-                        break
-            if items:
-                result[key] = items
-            elif sub_dict:
-                result[key] = sub_dict
-            else:
-                result[key] = None
-        elif val.startswith('[') and val.endswith(']'):
-            inner = val[1:-1].strip()
-            if not inner:
-                result[key] = []
-            else:
-                result[key] = [_scalar(s.strip()) for s in _split_inline_list(inner)]
-            i += 1
-        else:
-            result[key] = _scalar(val)
-            i += 1
-    return result
-
-
-def _split_inline_list(s):
-    """Split inline list respecting quoted strings."""
-    out = []
-    cur = []
-    in_q = None
-    for ch in s:
-        if in_q:
-            cur.append(ch)
-            if ch == in_q:
-                in_q = None
-            continue
-        if ch in ('"', "'"):
-            in_q = ch
-            cur.append(ch)
-            continue
-        if ch == ',':
-            out.append(''.join(cur).strip())
-            cur = []
-            continue
-        cur.append(ch)
-    if cur:
-        out.append(''.join(cur).strip())
-    return [x for x in out if x]
-
-
-def _scalar(val):
-    if val == 'null' or val == '~':
-        return None
-    if val in ('true', 'True'):
-        return True
-    if val in ('false', 'False'):
-        return False
-    if len(val) >= 2 and val[0] == '"' and val[-1] == '"':
-        return val[1:-1].replace('\\"', '"').replace('\\\\', '\\')
-    if len(val) >= 2 and val[0] == "'" and val[-1] == "'":
-        return val[1:-1]
-    if re.fullmatch(r'-?\d+', val):
-        return int(val)
-    return val
-
 
 def dump_yaml(data, key_order=None):
     """Serialize a flat dict (with optional list values) to YAML."""
@@ -532,31 +461,6 @@ TASK_META_DEFAULTS = {
     'rework_count': 0,
     'max_rework': 3,
 }
-
-
-def parse_frontmatter(text, source='<task>'):
-    """Split a markdown file into (meta dict, body string)."""
-    lines = text.splitlines()
-    if not lines or lines[0].strip() != '---':
-        raise ValueError(
-            f"missing frontmatter delimiter — file must begin with a line "
-            f"containing only `---`"
-        )
-    end = None
-    for i in range(1, len(lines)):
-        if lines[i].strip() == '---':
-            end = i
-            break
-    if end is None:
-        raise ValueError(
-            f"unterminated frontmatter — frontmatter block must close with a "
-            f"line containing only `---` before the body"
-        )
-    meta_text = '\n'.join(lines[1:end])
-    body = '\n'.join(lines[end + 1:])
-    if body.startswith('\n'):
-        body = body[1:]
-    return parse_yaml(meta_text, source=f"{source} (frontmatter)"), body
 
 
 def serialize_frontmatter(meta, body):
@@ -783,125 +687,29 @@ def save_task(slug, task_id, meta, body):
     _atomic_write(task_path(slug, task_id), serialize_frontmatter(meta, body))
 
 
-def _isolated_task(task_id, title, reason):
-    """読めないカードを「見える形で隔離する」ときの、唯一の作り方。
-
-    `[破損]` 疑似ステータスは pending でも終端でもない。だから pull も dispatch
-    もこのカードを拾わず、同時に「mission が完了した」とも数えられない。依存して
-    いる下流は waiting のまま止まる —— これが正しい: 中身が信用できないカードを
-    「満たされた依存」として下流を動かしてはならない。
-    """
-    return {
-        'id': task_id,
-        'title': '[破損] ' + title,
-        'status': CORRUPT_TASK_STATUS,
-        'skills': [],
-        'blocked_by': [],
-        'parse_error': reason,
-    }, ''
-
-
 def list_tasks(slug, base_dir=None, quiet=False):
     """Return list of (meta, body) sorted by tNNN.
 
-    task の識別子は **ファイル名** から来る。frontmatter の `id` ではない。
-    `task_path()` が `<id>.md` を前提にしている以上ファイル名が本体で、`id` 欄は
-    同じことの言い直しでしかないが、誰も突き合わせていなかった (Codex 4 巡目)。
+    読み取りの規則そのものは `scripts/lib_task_cards.py` にある —— parser、
+    「識別子はファイル名であって frontmatter の `id` 欄ではない」、信用できない
+    カードを `[破損]` として保留する形の 3 点セットで、dispatcher.sh も同じ
+    モジュールを読む。ここはそれを mission の slug で呼ぶだけの薄い層である。
 
-    突き合わせないと 2 つ壊れる。
-
-    * `tNNN.md` をコピーして `id` 行を直し忘れると、同じ id の node が 2 つ並ぶ。
-      plugin はそれで **ファイル全体** を拒否するので、無関係な mission の DAG
-      まで消える (t010 の循環・空配列とまったく同じ巻き添えの型)。
-    * もっと悪いのは可視化の外側だ。`pull` は割り当てたカードを
-      `save_task(slug, meta['id'], ...)` で書き戻すので、`t002.md` が `id: t001`
-      を名乗っていると **t001.md が t002 の内容で上書きされる**。カードが 1 枚、
-      誰にも気付かれずに消える。
-
-    だから id はファイル名から取る (ファイルシステムが一意性を保証するので、
-    重複は構造上作れなくなる)。そのうえで `id` 欄の扱いは 2 つに分ける。
-
-    * **欄が無い / 空** — 矛盾ではない。ファイル名が答えを持っているので、
-      黙って落とさず普通のカードとして扱い、次の書き戻しで埋まる。
-    * **欄がファイル名と食い違う** — どちらが正しいか、ここでは決められない
-      (コピー元の id が残ったのか、ファイルが置き違えられたのか)。決められない
-      ものを勝手に決めると、名乗り替えを黙って追認することになる。だから
-      `[破損]` として **保留** する: 1 行直せば解けるし、それまで見えている。
+    別々のコードで同じ queue を読んでいたのが Codex 5 巡目 P2 の指摘で、そのとき
+    ズレは「`plan.sh` は受理して ready と表示するカードで、dispatch サイクルが
+    `KeyError` を出して全 mission の割り当てが止まる」という形で出た。
 
     quiet=True は「同じ実行の中で 2 回目以降に読む」呼び出し用。破損した task に
     ついての hint 付き警告は 1 回出れば十分で、コマンド本体と task-graph の生成が
     同じ警告を二重に出すと、読む側は 2 件壊れていると誤読する。
     """
     tdir = base_dir if base_dir else tasks_dir(slug)
-    if not os.path.exists(tdir):
-        return []
-    entries = []
-    for fn in os.listdir(tdir):
-        m = re.fullmatch(r't(\d+)\.md', fn)
-        if not m:
-            continue
-        entries.append((int(m.group(1)), fn))
-    entries.sort()
-    out = []
-    for _, fn in entries:
-        path = os.path.join(tdir, fn)
-        task_id = fn[:-len('.md')]
-        with open(path) as f:
-            text = f.read()
-        try:
-            meta, body = parse_frontmatter(text, source=path)
-        except ValueError as e:
-            # A single malformed task file must not blank out `plan.sh status`
-            # or freeze dispatch for the whole mission (t009). Surface it as a
-            # [破損] pseudo-task — visible, but never 'pending' or terminal —
-            # and keep going so every other task file is still usable.
-            if not quiet:
-                print(
-                    f"[plan.sh warn] failed to parse {path}: {e}\n"
-                    f"  hint: task files start with `---` / frontmatter / `---` / "
-                    f"`## Description` / `## Result` (see existing tNNN.md for the template).\n"
-                    f"  showing as [破損] task; other tasks are unaffected.",
-                    file=sys.stderr,
-                )
-            out.append(_isolated_task(task_id, 'frontmatter parse error', str(e)))
-            continue
-        # 識別子はファイル名。詳しい理由と「欄が無い」「欄が食い違う」を分ける
-        # 理由は、この関数の docstring に書いてある。
-        declared = meta.get('id')
-        declared = '' if declared is None else str(declared).strip()
-        if declared and declared != task_id:
-            if not quiet:
-                print(
-                    f"[plan.sh warn] {path}: frontmatter id "
-                    f"{declared!r} does not match the filename "
-                    f"({task_id!r}).\n"
-                    f"  hint: the filename is the task's identity. If this file "
-                    f"was copied from another card, set `id: {task_id}`; if it "
-                    f"was misplaced, rename the file.\n"
-                    f"  holding it as a [破損] task; other tasks are unaffected.",
-                    file=sys.stderr,
-                )
-            out.append(_isolated_task(
-                task_id,
-                f'id がファイル名と一致しない (frontmatter: {declared})',
-                f'frontmatter id {declared!r} != filename {task_id!r}',
-            ))
-            continue
-        meta['id'] = task_id
-        # Normalize defaults
-        meta.setdefault('skills', [])
-        meta.setdefault('blocked_by', [])
-        if meta.get('skills') is None:
-            meta['skills'] = []
-        elif isinstance(meta.get('skills'), str):
-            # Normalize scalar string to list: `skills: bash` → `skills: [bash]`
-            # Without this, set("bash") yields individual characters, breaking
-            # skill-intersection checks (worker matching, DIRECTOR_ONLY_SKILLS).
-            meta['skills'] = [meta['skills']]
-        if meta.get('blocked_by') is None:
-            meta['blocked_by'] = []
-        out.append((meta, body))
-    return out
+    return _TASK_CARDS.list_task_cards(tdir, warn=None if quiet else _warn_task_card)
+
+
+def _warn_task_card(msg):
+    """lib_task_cards からの 1 件の警告を plan.sh の顔で出す。"""
+    print(f"[plan.sh warn] {msg}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -912,29 +720,10 @@ def list_tasks(slug, base_dir=None, quiet=False):
 # の 3 者が同じ 1 つの定義を読むためで、経緯と「なぜフォールバックを置かない
 # のか」はそのファイルの docstring に書いてある。
 #
-# 読み込み元は REPO_ROOT (= 実行された plan.sh 自身の置き場) であって
-# CREWVIA_REPO_ROOT ではない。コードは、今走っている plan.sh と同じ checkout
-# から来なければならない — worktree の plan.sh が本体のコードを読むと、
-# worktree で直したはずの規則が効かない。
+# 読み込みは `_load_scripts_module()` 経由 (どこから読むか・なぜ try で包まない
+# かは、その定義の上のコメントにまとめてある)。
 
-
-def _load_dep_rules():
-    """scripts/lib_dep_rules.py を読む。失敗はそのまま外に出す。
-
-    ここを try で包んで自前の規則に落ちると、「規則は 1 箇所」という性質が
-    壊れた環境でだけ静かに失われる。plan.sh が起動しないほうがまだよい。
-    """
-    import importlib.util, pathlib
-    path = pathlib.Path(REPO_ROOT) / 'scripts' / 'lib_dep_rules.py'
-    spec = importlib.util.spec_from_file_location('lib_dep_rules', path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'依存規則のモジュールを読めません: {path}')
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
-
-
-_DEP_RULES = _load_dep_rules()
+_DEP_RULES = _load_scripts_module('lib_dep_rules')
 DEAD_DEP_STATUSES = _DEP_RULES.DEAD_DEP_STATUSES
 unmet_dependencies = _DEP_RULES.unmet_dependencies
 

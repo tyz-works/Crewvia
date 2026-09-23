@@ -754,6 +754,53 @@ herdr_log_count() {
     grep -cF -- "$1" "$FAKE_HERDR_LOG" || true
 }
 
+# start_fake_herdr_identity_socket: a real (temp-path) unix socket for the
+# server-identity path.  _herdr_server_identity() (used by
+# HerdrBackend._write_cache() to bind a spawn record to the server that
+# created it — t041/t043) does not go through the `herdr` CLI at all: it
+# connects to the herdr socket itself and reads the peer's pid off the kernel
+# via SO_PEERCRED.  The fake CLI above cannot fake that connection, and
+# without it there is nothing to name the connecting process, so
+# write_pane_record() fail-closes and writes nothing (by design — Codex 7巡目
+# P1-2). On a machine with no real herdr running (CI), that made every spawn
+# test that asserts on the cache file fail — not because production spawn()
+# is wrong, but because the fixture never gave server-identity resolution a
+# real socket + real process to resolve (PR #209 review B-1/F-2, t045).
+#
+# This starts a minimal listener — accept and close, no protocol needed since
+# _herdr_connect_identified() reads SO_PEERCRED without sending a byte — as
+# its own real process, so SO_PEERCRED names a pid with a readable
+# /proc/<pid>/stat, exactly like a real herdr server would.
+start_fake_herdr_identity_socket() {
+    FAKE_SRV_DIR="$(mktemp -d)"
+    FAKE_SRV_SOCK="${FAKE_SRV_DIR}/herdr.sock"
+    FAKE_SRV_PID="${FAKE_SRV_DIR}/server.pid"
+
+    cat > "${FAKE_SRV_DIR}/identityd.py" <<'IDENTITYD'
+import socket, sys
+
+sock_path = sys.argv[1]
+srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+srv.bind(sock_path)
+srv.listen(8)
+while True:
+    conn, _ = srv.accept()
+    conn.close()
+IDENTITYD
+
+    python3 "${FAKE_SRV_DIR}/identityd.py" "$FAKE_SRV_SOCK" &
+    echo $! > "$FAKE_SRV_PID"
+
+    # Wait for the socket file to exist before returning — spawn() runs
+    # immediately after this call and must not race the listener's bind().
+    for _ in $(seq 1 50); do
+        [[ -S "$FAKE_SRV_SOCK" ]] && break
+        sleep 0.1
+    done
+
+    export CREWVIA_HERDR_SOCK="$FAKE_SRV_SOCK"
+}
+
 # ---------------------------------------------------------------------------
 # available()
 # ---------------------------------------------------------------------------
@@ -962,6 +1009,7 @@ print('herdr backend selected OK')
 
 @test "herdr spawn: reusing a husk refreshes the pane id cache" {
     setup_fake_herdr
+    start_fake_herdr_identity_socket
     echo "Omar-worker" > "$FAKE_PANE_LABEL"
     echo '[{"name":"bash","pid":1,"argv":["/bin/bash"],"cmdline":"/bin/bash"}]' > "$FAKE_PANE_PROCS"
 
@@ -979,20 +1027,23 @@ print('herdr backend selected OK')
 
 @test "herdr spawn: cache file is written after successful spawn" {
     setup_fake_herdr
+    start_fake_herdr_identity_socket
     # Use a name not in the default pane list.
     echo "Existing-worker" > "$FAKE_PANE_LABEL"
 
     CACHE_DIR="${REPO_ROOT}/registry/mux"
     CACHE_FILE="${CACHE_DIR}/New-worker.json"
 
-    python3 "$LIB_MUX_PY" spawn "New-worker" "claude" 2>/dev/null || true
+    python3 "$LIB_MUX_PY" spawn "New-worker" "claude" 2>/dev/null
 
-    # Cache file should exist and contain pane_id.
-    if [[ -f "$CACHE_FILE" ]]; then
-        grep -q "pane_id" "$CACHE_FILE"
-        # Cleanup.
-        rm -f "$CACHE_FILE"
-    fi
+    # Cache file must exist and contain pane_id — unconditional now that
+    # server-identity resolution has a real socket to succeed against
+    # (t045 F-2: this used to be wrapped in `if [[ -f "$CACHE_FILE" ]]`,
+    # which passed silently even when the file was never written).
+    [ -f "$CACHE_FILE" ]
+    grep -q "pane_id" "$CACHE_FILE"
+
+    rm -f "$CACHE_FILE"
 }
 
 # ---------------------------------------------------------------------------

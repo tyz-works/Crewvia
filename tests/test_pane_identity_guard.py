@@ -229,6 +229,13 @@ def test_kill_still_ends_our_own_daemon(
 
     ガードが「常に断る」になっていないことの確認。これが無いと、安全側に
     倒したつもりで restart の道を塞いだことに気付けない。
+
+    t040 以降、破壊を許すのは **spawn 記録** であって「中の人が自分のものだと
+    分類できたこと」ではない (Codex 5 巡目 P1-3: その分類自体が字面一致で
+    出せてしまう)。なのでここでも、本番と同じように spawn 時の記録を置く。
+    記録が無い側が断られることは
+    `test_pane_provenance_guard.py::test_mine_alone_no_longer_authorises_destruction`
+    が押さえている。
     """
     proc_root = _fake_proc(tmp_path, {
         4100: (1, ["bash"], str(tmp_path)),
@@ -237,6 +244,7 @@ def test_kill_still_ends_our_own_daemon(
     monkeypatch.setattr(lib_mux, "_PROC_ROOT", proc_root)
     rec = _RecordingSubprocess(pane_pid=4100)
     monkeypatch.setattr(lib_mux, "subprocess", rec)
+    lib_mux.write_pane_record("dispatcher", "tmux", rec.window_id)
 
     assert lib_mux.TmuxBackend().kill("dispatcher") is True
     assert rec.kill_calls(), "our own daemon's pane was not killed"
@@ -312,12 +320,18 @@ def test_kill_refuses_a_daemon_pane_that_cannot_be_read(
     rec = _RecordingSubprocess(pane_pid=None)   # display-message が答えない
     monkeypatch.setattr(lib_mux, "subprocess", rec)
 
-    # allowlist そのものを名指しで押さえる。`kill()` の結果だけを見ていると、
-    # P1-4 の「覗いた window に束縛する」方が先に断るので、**allowlist を
-    # 元に戻しても緑のまま**だった — 別の層が先に止めていて偶然緑、という形
+    # 判定そのものを名指しで押さえる。`kill()` の結果だけを見ていると、
+    # P1-4 の「覗いた window に束縛する」方が先に断るので、**判定を元に戻しても
+    # 緑のまま**だった — 別の層が先に止めていて偶然緑、という形
     # (memory: red-proof-catches-tests-green-for-the-wrong-reason)。
-    assert lib_mux.OWNER_UNKNOWN not in lib_mux._MAY_KILL_OWNERS
-    assert lib_mux.TmuxBackend()._refuses_foreign_daemon("dispatcher", None) is True
+    #
+    # t040 以降、読めなかったペインは「破壊を許す 2 つの積極的な証明」の
+    # どちらも出せない: spawn 記録は無く、「空である」ことも確認できていない。
+    assert lib_mux.OWNER_UNKNOWN not in lib_mux._OWNERS_THAT_PROVE_EMPTY
+    allowed, why = lib_mux.may_destroy_pane("dispatcher", "tmux", None, None)
+    assert allowed is False, why
+    assert lib_mux.TmuxBackend()._refuses_foreign_daemon(
+        "dispatcher", None, None) is True
 
     assert lib_mux.TmuxBackend().kill("dispatcher") is False
     assert rec.kill_calls() == [], \
@@ -740,13 +754,44 @@ def _foreign_watchdog(their_checkout):
     return script
 
 
-def test_the_two_layers_agree_on_what_may_be_killed():
-    """kill してよい owner の表が、mux 層とデーモン層で一致していること。
+def test_both_backends_route_destruction_through_the_one_decision(monkeypatch):
+    """壊してよいかを決めるのは `may_destroy_pane()` 1 箇所だけであること。
 
-    片方だけ広いと、狭い方を通り抜けられなかった破壊が広い方から通る。
-    2 つある判定を 1 つに絞れない以上、せめて同じ答えを返すことを機械で縛る。
+    t040 で判定の土台が「中の人の同定」から「自分が作った記録」に変わり、
+    2 つあった表 (mux 層の allowlist とデーモン層の allowlist) は 1 つの関数に
+    畳まれた。畳んだつもりで片方のバックエンドに独自の判断が残っていると、
+    そのバックエンドだけ素通りする — `t006 QA FAIL-1` はまさにその形だった。
+
+    なので「表が一致していること」ではなく「**そこしか見ていないこと**」を
+    縛る: 判定関数を差し替えたら、両バックエンドの答えがそれに従う。
     """
-    assert lib_mux._MAY_KILL_OWNERS == dw._MAY_KILL_OWNERS
+    seen = []
+
+    def _refuse_everything(name, backend, handle, pane_pid, **kwargs):
+        seen.append(backend)
+        return False, "stubbed refusal"
+
+    monkeypatch.setattr(lib_mux, "may_destroy_pane", _refuse_everything)
+    for backend in (lib_mux.TmuxBackend(), lib_mux.HerdrBackend()):
+        assert backend._refuses_foreign_daemon("dispatcher", "@1", 1) is True
+    assert seen == ["tmux", "herdr"], seen
+
+    def _allow_everything(name, backend, handle, pane_pid, **kwargs):
+        return True, "stubbed permission"
+
+    monkeypatch.setattr(lib_mux, "may_destroy_pane", _allow_everything)
+    for backend in (lib_mux.TmuxBackend(), lib_mux.HerdrBackend()):
+        assert backend._refuses_foreign_daemon("dispatcher", "@1", 1) is False
+
+
+def test_the_daemon_layers_early_exit_never_outranks_the_mux_layer():
+    """デーモン層の事前チェックは、mux 層が拒否するものを許可しない。
+
+    `restart()` の事前チェックは pause marker を書く前に抜けるための早期脱出で、
+    壊すかどうかを決めるのは mux 層。早期脱出の方が広いと、marker を書いてから
+    mux に断られる — 落ちた先に marker が残り、相互監視が黙って止まる。
+    """
+    assert dw._MAY_KILL_OWNERS & lib_mux._OWNERS_THAT_VETO == frozenset()
 
 
 def test_kill_refuses_when_proc_cannot_be_walked_completely(
@@ -881,6 +926,10 @@ def test_an_alias_to_our_own_script_is_still_ours(
 
     P1-2 / P1-3 の修正を「symlink が絡んだら全部断る」で済ませていないことの
     確認。実行しているファイルを解決した結果が自分のものなら、それは自分のもの。
+
+    spawn 記録を置くのは t040 以降の本番と同じ形にするため — ここで確かめたい
+    のは「別名が拒否の理由にならない」ことなので、記録の有無で落ちてしまうと
+    確かめたい層に届かない。
     """
     alias = as_our_checkout / "monitor"
     alias.symlink_to(as_our_checkout / "scripts" / "watchdog.py")
@@ -891,6 +940,7 @@ def test_an_alias_to_our_own_script_is_still_ours(
     monkeypatch.setattr(lib_mux, "_PROC_ROOT", proc_root)
     rec = _RecordingSubprocess(pane_pid=4100)
     monkeypatch.setattr(lib_mux, "subprocess", rec)
+    lib_mux.write_pane_record("watchdog", "tmux", rec.window_id)
 
     assert lib_mux.TmuxBackend().kill("watchdog") is True
     assert rec.kill_calls(), "our own daemon behind an alias became un-killable"

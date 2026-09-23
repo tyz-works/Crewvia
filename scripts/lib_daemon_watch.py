@@ -1436,10 +1436,20 @@ def restart(name: str, *, repo_root=None, mux=None, reason: str = "manual restar
             # `force` has to reach the mux layer too.  Its identity backstop
             # reads the pane rather than the environment, so an exit that only
             # lifts the check *here* would look like an exit and not be one.
-            if force:
-                mux.kill(name, allow_foreign=True)
-            else:
-                mux.kill(name)
+            killed = (mux.kill(name, allow_foreign=True) if force
+                      else mux.kill(name))
+            if not killed:
+                # The mux layer holds the authoritative judgment — it compares
+                # this checkout's own spawn record against the pane it is
+                # about to destroy, which the advisory check above cannot do.
+                # Treating its refusal as "killed, carry on" would put the
+                # spawn on top of a daemon that is still running: the double
+                # start this function exists to prevent, arrived at from the
+                # other side.
+                log(f"[daemon-watch] restart {name}: the mux layer did not "
+                    f"destroy that pane, so nothing was started. Its warning "
+                    f"above says why; pass --force to take the pane over.")
+                return False
             # Re-entrant: we already hold this daemon's lock, and the launch
             # command must come from the same place as every other start.
             ok = spawn_daemon(name, repo_root=repo_root, mux=mux, log=log)

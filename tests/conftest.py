@@ -46,6 +46,7 @@ verb (spawn / send / kill / attach) を呼ばれたら `MuxTestIsolationError` �
 """
 
 import os
+import re
 import uuid
 
 import pytest
@@ -81,6 +82,47 @@ def production_destination(monkeypatch):
     monkeypatch.setenv("CREWVIA_HERDR_WORKSPACE", PRODUCTION_DESTINATION)
     monkeypatch.setenv("CREWVIA_MUX_PANE_PREFIX", "")
     return PRODUCTION_DESTINATION
+
+
+# ---------------------------------------------------------------------------
+# 束縛された破壊 (`tmux if-shell -F`) を偽 tmux で解く
+# ---------------------------------------------------------------------------
+#
+# t043 以降、保護されたペインの kill は
+#
+#     tmux -S <endpoint> if-shell -F '#{==:#{pid},<世代>}' \
+#          'kill-window -t @7' 'display-message -p -- <印>'
+#
+# という **1 回の呼び出し** になる。検証と破壊が同じサーバーで起きることが
+# 安全性の中身なので、偽 tmux も「条件が外れたら then 側は実行されない」を
+# 模さなければならない。条件を無視して then 側を実行する偽物にすると、束縛を
+# 外した欠陥版でも緑になる。
+#
+# 偽 tmux は 4 つのテストファイルに散っているので、条件の解き方はここに 1 つ
+# だけ置く。3 つの写しが少しずつずれる、というのがこのリポジトリが何度も踏んだ
+# 壊れ方である。
+
+def fake_tmux_if_shell(argv, answers):
+    """`(then_argv, stdout)` — tmux と同じ順で `if-shell` を解く。
+
+    `then_argv` が None なら条件が外れたので then 側は実行されない。
+    `answers` は書式トークン → 値 (`{"#{pid}": "900"}` 等)。
+    """
+    at = argv.index("-F")
+    condition = argv[at + 1]
+    for token, value in answers.items():
+        condition = condition.replace(token, str(value))
+    m = re.fullmatch(r"#\{==:([^,}]*),([^,}]*)\}", condition)
+    if m is None:
+        raise AssertionError(
+            f"fake tmux が評価できない条件式: {argv[at + 1]!r} → {condition!r}")
+    branches = argv[at + 2:]
+    if m.group(1) == m.group(2):
+        return ["tmux"] + branches[0].split(), ""
+    if len(branches) > 1:
+        # `display-message -p -- <印>` の最後の語が印。
+        return None, branches[1].split()[-1] + "\n"
+    return None, ""
 
 
 # ---------------------------------------------------------------------------

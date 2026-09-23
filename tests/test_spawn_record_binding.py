@@ -53,6 +53,8 @@ sys.path.insert(0, str(SCRIPTS))
 
 import lib_mux  # noqa: E402
 
+from conftest import fake_tmux_if_shell  # noqa: E402
+
 
 # ---------------------------------------------------------------------------
 # 偽 /proc — root プロセスの姿まで指定できる版
@@ -150,6 +152,7 @@ class _RecordingTmux:
     def __init__(self, pane_pid=None, window_id="@7", created_id=None,
                  server=SERVER, has_session=True, existing_windows=()):
         self.calls = []
+        self.issued = []
         self.pane_pid = pane_pid
         self.window_id = window_id
         self.created_id = created_id
@@ -157,14 +160,8 @@ class _RecordingTmux:
         self.has_session = has_session
         self.existing_windows = list(existing_windows)
 
-    def _expand(self, argv):
-        """要求された **書式そのもの** を展開して答える。
-
-        固定の並びを返すと、書式が変わったときに古いコードでも新しいコードでも
-        「たまたま」通ったり落ちたりする。ここが書式駆動でないと、赤の証明が
-        本物かどうか分からない (実際、最初の版はこれで 1 件が偽の緑になった)。
-        """
-        fmt = argv[-1] if argv else ""
+    def _expand_fmt(self, fmt):
+        """tmux の書式文字列を、このサーバーの答えで置き換える。"""
         endpoint, generation = self.server if self.server else ("", "")
         for token, value in (
                 ("#{window_id}", self.window_id),
@@ -175,13 +172,38 @@ class _RecordingTmux:
             fmt = fmt.replace(token, str(value))
         return fmt
 
-    def run(self, argv, **kwargs):
+    def _expand(self, argv):
+        """要求された **書式そのもの** を展開して答える。
+
+        固定の並びを返すと、書式が変わったときに古いコードでも新しいコードでも
+        「たまたま」通ったり落ちたりする。ここが書式駆動でないと、赤の証明が
+        本物かどうか分からない (実際、最初の版はこれで 1 件が偽の緑になった)。
+        """
+        return self._expand_fmt(argv[-1] if argv else "")
+
+    def _answers(self):
+        endpoint, generation = self.server if self.server else ("", "")
+        return {"#{window_id}": self.window_id, "#{pane_pid}": self.pane_pid,
+                "#{pid}": generation, "#{socket_path}": endpoint}
+
+    def run(self, argv, _branch=False, **kwargs):
         argv = list(argv)
         self.calls.append(argv)
+        # `issued` は **本番コードが自分で出した** 呼び出しだけ。if-shell の
+        # then 側は tmux の中で走るので `calls` にしか入らない。この 2 つを
+        # 混ぜると「素の kill-window を出していないか」を問えなくなる。
+        if not _branch:
+            self.issued.append(argv)
         text = kwargs.get("text", False)
         out = ""
         rc = 0
-        if "display-message" in argv:
+        if "if-shell" in argv:
+            # 条件の解き方は conftest に 1 つだけ。then 側は同じ run() に流して
+            # 記録させるので、kill_targets() はこの経路も数える。
+            then_argv, out = fake_tmux_if_shell(argv, self._answers())
+            if then_argv is not None:
+                self.run(then_argv, _branch=True, text=text)
+        elif "display-message" in argv:
             if self.pane_pid is None:
                 rc = 1
             else:

@@ -1644,6 +1644,40 @@ def may_destroy_pane(name: str, backend: str, handle, pane_pid, *,
 
 
 # ---------------------------------------------------------------------------
+# Binding a destructive command to the server that was inspected
+# ---------------------------------------------------------------------------
+#
+# Everything `may_destroy_pane()` establishes — the occupant is ours, our own
+# record names this very id — is established about *the server that answered
+# the inspection*.  The destruction used to be a second call, i.e. a second
+# client connection, i.e. possibly a second server: if the inspected server
+# exits and another starts on the same endpoint in between (`./crewvia`
+# restarting the mux does exactly that), the id is resolved again by the new
+# server, which hands out ids from scratch — and lands the command on a pane
+# whose occupant was never classified at all.  Both positive proofs are about
+# the old server, so the new server's occupant need not even be unreadable for
+# this to destroy it (Codex 8巡目).
+#
+# A further check on this side would not close that: it would only move the
+# window between the last check and the command.  So the check travels *with*
+# the command, in one exchange with one server:
+#
+#   tmux   — one invocation is one client connection, and one connection is
+#            served by one server process, so `if-shell -F` comparing `#{pid}`
+#            is evaluated by the same process that would run `kill-window`.
+#   herdr  — the request goes out on the very connection whose peer the kernel
+#            named over SO_PEERCRED.  The CLI would open its own.
+#
+# Neither needs a boot id or a process start time beyond the generation the
+# spawn record already carries.
+
+#: Printed by the else-branch of the bound tmux kill.  tmux exits 0 whichever
+#: branch `if-shell` takes, so the refusal has to be visible in the output of
+#: the same invocation rather than inferred from its status.
+_KILL_REFUSED_MARK = "crewvia-mux-kill-refused-server-changed"
+
+
+# ---------------------------------------------------------------------------
 # TmuxBackend
 # ---------------------------------------------------------------------------
 
@@ -1974,18 +2008,28 @@ class TmuxBackend(_Backend):
                     f"kill {name!r}: refused — the window that was inspected "
                     f"could not be identified. Nothing was killed.")
                 return False
+            if not server:
+                # The id is only meaningful inside one server's lifetime, so
+                # without a generation there is nothing to bind the kill to and
+                # no way to tell "the window we judged" from "whatever holds
+                # that id now".  Reachable only through the migration
+                # allowance for a legacy record, or through a tmux too old to
+                # expand `#{pid}`; `--force` is the exit either way, so this is
+                # not a pane that can never be ended.
+                self._warn(
+                    f"kill {name!r}: refused — tmux would not say which server "
+                    f"the inspected window is on, so the kill cannot be bound "
+                    f"to it, and an unbound kill would land on whatever holds "
+                    f"{window_id} on whichever server answers next. Nothing "
+                    f"was killed. Use `lib_daemon_watch.py restart {name} "
+                    f"--force` when you mean to take the pane over.")
+                return False
             # The window *id*, not the name: window names are mutable, and the
             # /proc walk between the two takes real time.  If the inspected
             # window is gone and another checkout has recreated one under the
             # same name, `@id` no longer resolves and the kill fails — which
             # is the answer we want, rather than closing a stranger.
-            target = window_id
-        try:
-            r = subprocess.run(
-                ["tmux", "kill-window", "-t", target],
-                capture_output=True, timeout=5,
-            )
-            if r.returncode != 0:
+            if not self._destroy_window_on(name, window_id, server):
                 return False
             # The pane this checkout made is gone, so the note saying it made
             # one has to go too.  Left behind, it would still be there the next
@@ -1993,9 +2037,80 @@ class TmuxBackend(_Backend):
             # likely to be another checkout's as ours.
             drop_pane_record(name)
             return True
+        try:
+            r = subprocess.run(
+                ["tmux", "kill-window", "-t", target],
+                capture_output=True, timeout=5,
+            )
+            if r.returncode != 0:
+                return False
+            drop_pane_record(name)
+            return True
         except Exception as e:
             self._warn(f"kill {name!r} failed: {e}")
             return False
+
+    def _destroy_window_on(self, name: str, window_id: str, server) -> bool:
+        """Kill `window_id`, and only on the server `server` names.
+
+        The comparison and the kill are one tmux invocation, so one client
+        connection, so one server process: whichever server evaluates
+        `#{pid}` is the one that goes on to run `kill-window`.  A server that
+        was replaced between the inspection and here fails the comparison and
+        the kill is never executed — see the note above this class for why a
+        second check on this side would not do.
+
+        `-S` pins the endpoint as well, so the invocation cannot be answered by
+        a server on a different socket that happens to share the generation.
+
+        The id and the generation go inside strings tmux parses as commands, so
+        both are required to be the shapes tmux actually produces (`@12`, a
+        server pid).  Anything else is a refusal rather than something spliced
+        into a command line: a stray `}` would merely make the comparison fail,
+        but a crafted one could make it hold.
+        """
+        try:
+            endpoint, generation = str(server[0] or ""), str(server[1] or "")
+        except (TypeError, IndexError, KeyError):
+            endpoint, generation = "", ""
+        if not endpoint or not re.fullmatch(r"\d+", generation):
+            self._warn(
+                f"kill {name!r}: refused — the inspected server was reported "
+                f"as {server!r}, which is not an (endpoint, generation) the "
+                f"kill can be bound to. Nothing was killed.")
+            return False
+        if not re.fullmatch(r"@\d+", str(window_id)):
+            self._warn(
+                f"kill {name!r}: refused — {window_id!r} is not a tmux window "
+                f"id, so it cannot be named in a bound kill. Nothing was "
+                f"killed.")
+            return False
+        try:
+            r = subprocess.run(
+                ["tmux", "-S", endpoint, "if-shell", "-F",
+                 "#{==:#{pid}," + generation + "}",
+                 f"kill-window -t {window_id}",
+                 f"display-message -p -- {_KILL_REFUSED_MARK}"],
+                capture_output=True, text=True, timeout=5,
+            )
+        except Exception as e:
+            self._warn(f"kill {name!r} failed: {e}")
+            return False
+        if r.returncode != 0:
+            self._warn(
+                f"kill {name!r}: tmux refused the bound kill of {window_id} "
+                f"on {endpoint} (generation {generation}): "
+                f"{(r.stderr or '').strip()}")
+            return False
+        if _KILL_REFUSED_MARK in (r.stdout or ""):
+            self._warn(
+                f"kill {name!r}: refused — the tmux server at {endpoint} is no "
+                f"longer generation {generation}, the one whose {window_id} "
+                f"was inspected. It has restarted since, so that id now names "
+                f"a window nobody has looked into. Nothing was killed; respawn "
+                f"the pane so its record names this server.")
+            return False
+        return True
 
     def _record_spawn(self, name: str, window_id: str) -> None:
         """Write down which window this checkout just created.
@@ -2437,6 +2552,40 @@ def _herdr_ping() -> bool:
         return False
 
 
+def _herdr_connect_identified():
+    """`(sock, endpoint, generation)` — an open connection and who answers *it*.
+
+    The socket comes back **still open**, and that is the point.  The identity
+    is a fact about this connection's peer, attested by the kernel over
+    `SO_PEERCRED`; a caller that closes it and reconnects — which is what
+    running the CLI amounts to — is talking to whatever is listening now, not
+    to the process it verified.  `_herdr_close_tab_bound()` therefore sends its
+    request on this very socket.
+
+    None when no identified peer could be reached; the socket is closed in that
+    case.
+    """
+    sock_path = str(_HERDR_SOCK_PATH)
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        s.settimeout(3)
+        s.connect(sock_path)
+        cred = s.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED,
+                            struct.calcsize("3i"))
+        pid, _uid, _gid = struct.unpack("3i", cred)
+    except Exception:
+        s.close()
+        return None
+    if pid <= 0:
+        s.close()
+        return None
+    status, fields = _proc_stat_fields(pid)
+    if status != _PROC_OK or len(fields) < 20:
+        s.close()
+        return None
+    return s, sock_path, f"{pid}:{fields[19]}"
+
+
 def _herdr_server_identity():
     """`(socket_path, "<pid>:<starttime>")` for the herdr server, or None.
 
@@ -2447,22 +2596,82 @@ def _herdr_server_identity():
     generation whatever the socket file did.  `starttime` is in there because
     a pid on its own can come round again.
     """
-    sock_path = str(_HERDR_SOCK_PATH)
+    identified = _herdr_connect_identified()
+    if identified is None:
+        return None
+    sock, endpoint, generation = identified
+    sock.close()
+    return endpoint, generation
+
+
+def _herdr_close_tab_bound(tab_id: str, server) -> bool:
+    """Close `tab_id`, and only on the server `server` names.
+
+    `herdr tab close` opens a connection of its own, so the verification and
+    the destruction would be two connections and could be answered by two
+    different servers — the tmux hole in herdr's clothing.  Here the peer of
+    one connection is named by the kernel, checked against the generation the
+    inspection produced, and the `tab.close` request goes out on **that**
+    connection: a server that has been replaced since is a different peer and
+    nothing is sent at all.
+
+    Deliberately the socket API rather than the CLI *only* on the guarded path.
+    If herdr ever changes the request, the blast radius is the daemon panes and
+    `--force` still closes them through the CLI, instead of every verb at once.
+    """
     try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
-            s.settimeout(3)
-            s.connect(sock_path)
-            cred = s.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED,
-                                struct.calcsize("3i"))
-            pid, _uid, _gid = struct.unpack("3i", cred)
-    except Exception:
-        return None
-    if pid <= 0:
-        return None
-    status, fields = _proc_stat_fields(pid)
-    if status != _PROC_OK or len(fields) < 20:
-        return None
-    return sock_path, f"{pid}:{fields[19]}"
+        endpoint, generation = str(server[0] or ""), str(server[1] or "")
+    except (TypeError, IndexError, KeyError):
+        endpoint, generation = "", ""
+    if not endpoint or not generation:
+        print(f"[mux:herdr] WARNING: refusing to close {tab_id!r}: the "
+              f"inspected server was reported as {server!r}, which is not an "
+              f"(endpoint, generation) the close can be bound to.",
+              file=sys.stderr)
+        return False
+    identified = _herdr_connect_identified()
+    if identified is None:
+        print(f"[mux:herdr] WARNING: refusing to close {tab_id!r}: no herdr "
+              f"server on the other end of {endpoint} would identify itself, "
+              f"so the close cannot be bound to the one that was inspected.",
+              file=sys.stderr)
+        return False
+    sock, live_endpoint, live_generation = identified
+    try:
+        if live_endpoint != endpoint or live_generation != generation:
+            print(f"[mux:herdr] WARNING: refusing to close {tab_id!r}: the "
+                  f"inspected server was {endpoint} (generation {generation}) "
+                  f"and this connection is answered by {live_endpoint} "
+                  f"(generation {live_generation}) — the server has restarted "
+                  f"since, so that tab id now names a tab nobody has looked "
+                  f"into. Nothing was closed; respawn the pane so its record "
+                  f"names this server.", file=sys.stderr)
+            return False
+        request = json.dumps({
+            "id": f"crewvia:tab.close:{tab_id}",
+            "method": "tab.close",
+            "params": {"tab_id": tab_id},
+        }).encode() + b"\n"
+        try:
+            sock.sendall(request)
+            data = b""
+            while b"\n" not in data:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+            response = json.loads(data.split(b"\n")[0].decode())
+        except Exception as exc:
+            print(f"[mux:herdr] WARNING: tab.close {tab_id!r} on the "
+                  f"inspected server failed: {exc}", file=sys.stderr)
+            return False
+        if not isinstance(response, dict) or "result" not in response:
+            print(f"[mux:herdr] WARNING: tab.close {tab_id!r} was refused by "
+                  f"the herdr server: {response!r}", file=sys.stderr)
+            return False
+        return True
+    finally:
+        sock.close()
 
 
 class HerdrBackend(_Backend):
@@ -2956,6 +3165,21 @@ class HerdrBackend(_Backend):
                     f"kill {name!r}: refused — the tab that was inspected "
                     f"could not be identified. Nothing was killed.")
                 return False
+            if not server:
+                # Same reasoning as TmuxBackend.kill(): a tab id means nothing
+                # without the generation that issued it, so there is nothing to
+                # bind the close to.  `--force` remains the exit.
+                self._warn(
+                    f"kill {name!r}: refused — the herdr server holding the "
+                    f"inspected tab could not be identified, so the close "
+                    f"cannot be bound to it. Nothing was killed. Use "
+                    f"`lib_daemon_watch.py restart {name} --force` when you "
+                    f"mean to take the pane over.")
+                return False
+            if not _herdr_close_tab_bound(tab_id, server):
+                return False
+            self._delete_cache(name)
+            return True
         else:
             ids = self._resolve_ids(name)
             if ids is None:

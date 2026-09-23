@@ -54,6 +54,8 @@ sys.path.insert(0, str(SCRIPTS))
 import lib_daemon_watch as dw  # noqa: E402
 import lib_mux  # noqa: E402
 
+from conftest import fake_tmux_if_shell  # noqa: E402
+
 
 # ---------------------------------------------------------------------------
 # 偽 /proc — cwd は本物のシンボリックリンクにする
@@ -142,13 +144,29 @@ class _RecordingTmux:
 
     def __init__(self, pane_pid=None, window_id="@7"):
         self.calls = []
+        self.issued = []
         self.pane_pid = pane_pid
         self.window_id = window_id
 
-    def run(self, argv, **kwargs):
+    def run(self, argv, _branch=False, **kwargs):
         self.calls.append(list(argv))
+        # `issued` は本番コードが自分で出した呼び出しだけ。`if-shell` の then 側は
+        # tmux の中で走るので `calls` にしか入らない。
+        if not _branch:
+            self.issued.append(list(argv))
         text = kwargs.get("text", False)
         out = ""
+        if "if-shell" in argv:
+            # 束縛された破壊 (t043)。条件が外れたら then 側は実行されない。
+            then_argv, out = fake_tmux_if_shell(argv, {
+                "#{window_id}": self.window_id, "#{pane_pid}": self.pane_pid,
+                "#{pid}": TMUX_SERVER[1], "#{socket_path}": TMUX_SERVER[0]})
+            if then_argv is not None:
+                self.run(then_argv, _branch=True, text=text)
+            return subprocess.CompletedProcess(
+                list(argv), 0,
+                stdout=out if text else out.encode(),
+                stderr="" if text else b"")
         # Expand whatever format was asked for, rather than a fixed pair of
         # fields: a stub that answers only the format string it was written
         # against turns a change in the caller into a fake refusal
@@ -632,11 +650,20 @@ def test_herdr_kill_is_bound_to_the_recorded_tab_id(
 
     def fake_run(cmd_key, extra_args, timeout=10):
         if cmd_key == "tab_close":
-            closed.append(extra_args[0])
+            closed.append(("cli", extra_args[0]))
             return {"result": {}}
         return {"result": {}}
 
+    def fake_close_bound(tab_id, server):
+        # t043 以降、保護された経路は CLI を通らず、名前を確かめた接続の上に
+        # 要求を流す。ここで差し替えるのは、このテストが「どのタブを名指しするか」
+        # だけを問うものであり、本物の herdr ソケットに届いてはいけないから。
+        assert server == HERDR_SERVER, server
+        closed.append(("bound", tab_id))
+        return True
+
     monkeypatch.setattr(lib_mux, "_herdr_run", fake_run)
+    monkeypatch.setattr(lib_mux, "_herdr_close_tab_bound", fake_close_bound)
     monkeypatch.setattr(lib_mux, "_herdr_server_identity", lambda: HERDR_SERVER)
     backend = lib_mux.HerdrBackend()
     monkeypatch.setattr(backend, "_inspect_pane", lambda name: ("tab-9", 4100))
@@ -649,7 +676,8 @@ def test_herdr_kill_is_bound_to_the_recorded_tab_id(
     lib_mux.write_pane_record("dispatcher", "herdr", "tab-9",
                               server=HERDR_SERVER)
     assert backend.kill("dispatcher") is True
-    assert closed == ["tab-9"]
+    assert closed == [("bound", "tab-9")], \
+        f"保護された経路が束縛を通らずに閉じた: {closed}"
 
 
 def test_a_transient_herdr_failure_does_not_destroy_the_record(

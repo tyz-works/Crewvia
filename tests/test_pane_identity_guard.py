@@ -50,7 +50,7 @@ sys.path.insert(0, str(SCRIPTS))
 import lib_daemon_watch as dw  # noqa: E402
 import lib_mux  # noqa: E402
 
-from conftest import PRODUCTION_DESTINATION  # noqa: E402
+from conftest import PRODUCTION_DESTINATION, fake_tmux_if_shell  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -157,6 +157,7 @@ class _RecordingSubprocess:
     def __init__(self, pane_pid=None, window_id="@1", window_id_after=None,
                  server=SERVER):
         self.calls = []
+        self.issued = []
         self.pane_pid = pane_pid
         self.window_id = window_id
         self.window_id_after = window_id_after
@@ -173,11 +174,25 @@ class _RecordingSubprocess:
             fmt = fmt.replace(token, str(value))
         return fmt
 
-    def run(self, argv, **kwargs):
+    def _answers(self):
+        endpoint, generation = self.server if self.server else ("", "")
+        return {"#{window_id}": self.window_id, "#{pane_pid}": self.pane_pid,
+                "#{pid}": generation, "#{socket_path}": endpoint}
+
+    def run(self, argv, _branch=False, **kwargs):
         self.calls.append(list(argv))
+        # `issued` は本番コードが自分で出した呼び出しだけ。`if-shell` の then 側は
+        # tmux の中で走るので `calls` にしか入らない。
+        if not _branch:
+            self.issued.append(list(argv))
         text = kwargs.get("text", False)
         out = ""
-        if "display-message" in argv and self.pane_pid is not None:
+        if "if-shell" in argv:
+            # 束縛された破壊 (t043)。条件が外れたら then 側は実行されない。
+            then_argv, out = fake_tmux_if_shell(argv, self._answers())
+            if then_argv is not None:
+                self.run(then_argv, _branch=True, text=text)
+        elif "display-message" in argv and self.pane_pid is not None:
             out = self._expand(argv[-1]) + "\n"
             if self.window_id_after is not None:
                 self.window_id = self.window_id_after
@@ -1018,6 +1033,7 @@ def test_herdr_kill_closes_the_tab_it_inspected(
 
     calls = []
     resolved = []
+    closed = []
 
     def fake_run(verb, args, timeout=10):
         calls.append((verb, list(args)))
@@ -1028,7 +1044,18 @@ def test_herdr_kill_closes_the_tab_it_inspected(
             return {"result": {"ok": True}}
         return None
 
+    def fake_close_bound(tab_id, server):
+        # Since t043 the guarded path does not go through the CLI at all: the
+        # request rides the connection whose peer was verified.  Stubbed here
+        # so this test cannot reach a real herdr socket while asking a question
+        # about *which* tab is addressed.
+        closed.append(tab_id)
+        return True
+
     monkeypatch.setattr(lib_mux, "_herdr_run", fake_run)
+    monkeypatch.setattr(lib_mux, "_herdr_close_tab_bound", fake_close_bound)
+    monkeypatch.setattr(lib_mux, "_herdr_server_identity",
+                        lambda: ("/tmp/herdr-test.sock", "900:1"))
     backend = lib_mux.HerdrBackend()
 
     def shifting_ids(name):
@@ -1040,6 +1067,7 @@ def test_herdr_kill_closes_the_tab_it_inspected(
     monkeypatch.setattr(backend, "_resolve_ids", shifting_ids)
 
     assert backend.kill("dispatcher") is True
-    closed = [args for verb, args in calls if verb == "tab_close"]
-    assert closed == [["w1:t1"]], \
+    assert closed == ["w1:t1"], \
         f"the kill closed a tab it never inspected: {closed} (resolves: {resolved})"
+    assert [args for verb, args in calls if verb == "tab_close"] == [], \
+        "the guarded path still went out through the herdr CLI"

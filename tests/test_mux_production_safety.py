@@ -47,7 +47,7 @@ sys.path.insert(0, str(SCRIPTS))
 import lib_daemon_watch as dw  # noqa: E402
 import lib_mux  # noqa: E402
 
-from conftest import PRODUCTION_DESTINATION  # noqa: E402
+from conftest import PRODUCTION_DESTINATION, fake_tmux_if_shell  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -63,6 +63,7 @@ class _RecordingSubprocess:
 
     def __init__(self, pane_pid=None):
         self.calls = []
+        self.issued = []
         # What `#{pane_pid}` answers.  It used to be hard-wired to the pytest
         # process, which is not a stand-in for a pane occupant: since t042 a
         # matching record only ends a pane whose occupant is *also* ours or
@@ -71,11 +72,22 @@ class _RecordingSubprocess:
         # *addressing* therefore point this at a pane they have modelled.
         self.pane_pid = os.getpid() if pane_pid is None else pane_pid
 
-    def run(self, argv, **kwargs):
+    def run(self, argv, _branch=False, **kwargs):
         self.calls.append(list(argv))
+        # `issued` は本番コードが自分で出した呼び出しだけ。`if-shell` の then 側は
+        # tmux の中で走るので `calls` にしか入らない。
+        if not _branch:
+            self.issued.append(list(argv))
         text = kwargs.get("text", False)
         out = ""
-        if "display-message" in argv or (
+        if "if-shell" in argv:
+            # 束縛された破壊 (t043)。条件が外れたら then 側は実行されない。
+            then_argv, out = fake_tmux_if_shell(argv, {
+                "#{window_id}": "@1", "#{pane_pid}": self.pane_pid,
+                "#{pid}": "900", "#{socket_path}": "/tmp/tmux-test/default"})
+            if then_argv is not None:
+                self.run(then_argv, _branch=True, text=text)
+        elif "display-message" in argv or (
                 ("new-window" in argv or "new-session" in argv)
                 and "-P" in argv and "-F" in argv):
             # Substitute the format the way tmux does.  A stub that answers

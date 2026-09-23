@@ -626,6 +626,27 @@ Director が直接 Worker にタスクを送る代わりに、Dispatcher がタ�
 | **Dispatcher** | 5秒ごとにタスク状況を確認し、idle Worker にタスクを割り当てる |
 | **Worker** | Dispatcher からの assign を受け取り、`plan.sh pull` で取得して実行 |
 
+### Dispatcher と Watchdog の責務境界・相互監視
+
+並列モードでは `scripts/dispatcher.sh`（5秒ポーリング）と `scripts/watchdog.py`（30秒ポーリング）
+の 2 つの常駐デーモンが動く。責務は明確に分かれている:
+
+| デーモン | 権限 | 判断材料 |
+|---|---|---|
+| **Dispatcher** | 仕事の割り当ての判定者 | `queue/`（task frontmatter・assignments・mission state） |
+| **Watchdog** | Worker を終了させる唯一の実行者。後始末（task を `pending` に戻す・assignment を消す）まで自己完結 | `registry/`（heartbeat・pane の生死） |
+
+両者は互いの存在を知らないまま並んで動いているだけでは、片方が死んでも誰も気付けない。そこで
+dispatcher と watchdog は `scripts/lib_daemon_watch.py` を通じて**相互に heartbeat を見張り**、
+相手が stale（既定: dispatcher 60秒 / watchdog 240秒）かつプロセスが実際に消えていることを確認できた
+場合にだけ respawn し、Director へ事後報告する（判定は常に fail-closed — 確証が無ければ respawn せず
+保留する）。しきい値・flap ガード等は `config/crewvia.yaml` の `daemons:` ブロックで調整できる。
+
+相互監視は「相手を見る」仕組みなので、**両方が同時に死ぬ**（herdr 再起動・OOM 等）ケースだけは
+互いに救えない。この場合だけ、Director セッションの PostToolUse hook（`hooks/post-tool-use.sh`）が
+両デーモンの heartbeat 同時 stale を検知し、Director の次のツール実行の拍子に 1 行警告する（60秒に
+1回まで throttle）。詳細設計は `knowledge/daemon-authority.md` を参照。
+
 ### Communication flow
 
 1. Director decomposes mission → registers tasks with `plan.sh add`
@@ -670,7 +691,9 @@ crewvia/
 │   └── autonomous-improvement.yaml  # Self-improvement scope settings
 ├── hooks/
 │   ├── pre-tool-use.sh            # PreToolUse hook — Taskvia approval gate
-│   └── post-tool-use.sh           # PostToolUse hook — knowledge log posting
+│   └── post-tool-use.sh           # PostToolUse hook — knowledge log posting +
+│                                   #   Director-only backstop for simultaneous
+│                                   #   dispatcher/watchdog death
 ├── agents/
 │   ├── director.md            # Director system prompt
 │   └── worker.md                  # Worker system prompt

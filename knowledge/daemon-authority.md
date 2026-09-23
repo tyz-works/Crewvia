@@ -1892,6 +1892,67 @@ starttime の数え方の一致) は、使い捨てディレクトリに sleep �
 
 ---
 
+### 7-13. 相互監視が機能しない瞬間の backstop — PostToolUse hook (t008, 2026-09-23)
+
+§7 の相互監視は「相手を見る」仕組みなので、**両方が同時に死ぬ**(herdr 再起動、OOM 等) ケースは
+原理的に救えない — 見る側も死んでいるから。これを補うのが Director 自身のセッションで動く
+PostToolUse hook (`hooks/post-tool-use.sh`) の役目である。
+
+**方針。** 相互監視の判定 (`DaemonWatch._decide()`) を再実装・再利用しない。hook は全ツール呼び出しの
+経路にあり、失敗やハングが全体に波及するため、判定は「heartbeat ファイルの mtime を見るだけ」に
+絞る (`instance_alive()` の /proc 照合や `scan_daemon_pids()` の走査はしない — それは respawn する
+側の相互監視の仕事であり、この hook は respawn しない・報告するだけ)。
+
+- しきい値は §7-8 の既定値 (60 / 240) をハードコードし、`lib_daemon_watch.py` と同じ env var 名
+  (`CREWVIA_DAEMON_DISPATCHER_STALE_SECONDS` / `CREWVIA_DAEMON_WATCHDOG_STALE_SECONDS`) でだけ
+  上書きを許す。`config/crewvia.yaml` の YAML 解析はこの hook の目的には重すぎるため行わない —
+  独立した簡易チェックであり、`lib_daemon_watch.py` の判定とバイト単位で一致する必要はない。
+- `registry/daemons/` ディレクトリが無い (= どちらのデーモンも一度も `beat()` していない) 場合は
+  判定に入らずスキップする。このディレクトリは `DaemonWatch.__post_init__` が最初の beat 時に
+  作るものなので、無いことは「デーモンが動いていない (standalone/inline 運用)」の証拠であり、
+  「両方死んでいる」の証拠ではない。ここをスキップしないと、mutual watch を使わない運用で常時
+  誤検知することになる。
+- 対象は role が director のセッションのみ。全 Worker のツール呼び出しにも同じ hook が刺さるが、
+  Worker には respawn も報告もできないので判定自体を行わない (ノイズと無駄な stat 呼び出しを
+  避ける)。
+- throttle はマーカーファイル (`registry/daemons/backstop-notify.throttle`) の mtime で 60 秒に
+  1 回に抑える。判定結果に関わらずマーカーを先に更新するので、同時に複数の PostToolUse が走っても
+  直後の呼び出しは早期リターンする (完全な排他ではないが、この hook にロックを持ち込むほどの
+  重さではない — 最悪でも throttle 窓の中で数回検知メッセージが重複するだけで、実害は無い)。
+
+**Director への伝え方 — exit code 2 を使う。** Claude Code の PostToolUse hook は exit code 2 で
+終わると、ツールは既に実行済みのままブロックはせず、**stderr をそのまま呼び出し元 (Director) の
+文脈に見せる**。これはポーリングさせずに「Director が何か操作した拍子に勝手に届く」を実現する
+標準的な方法である。
+
+既存の crash guard (`trap '_crash_guard' EXIT`) は非ゼロ終了を全部 0 に握り潰す設計だったので、
+そのままでは意図した exit 2 も握り潰されてしまう。`_INTENTIONAL_EXIT_CODE` という変数を挟み、
+crash guard は「予期しないクラッシュ (`_INTENTIONAL_EXIT_CODE` と食い違う非ゼロ終了)」だけを
+警告付きで 0 に収束させ、`_INTENTIONAL_EXIT_CODE=2` をセットした意図的な経路はそのまま通す形に
+した。crash guard 自体の「失敗しても Worker/Director の動作を止めない」という不変条件は変えて
+いない — 意図的な exit 2 はツール実行を止めない (PostToolUse は事後フックなので、そもそもブロック
+する権限が無い)。
+
+**respawn はしない。** この hook が見つけたら唯一やることは「1 行出す」だけで、`mux.spawn()` は
+一切呼ばない。理由は 2 つ: (1) Claude Code の hook はタイムアウトに敏感で、mux の subprocess 呼び
+出しを混ぜると全ツール呼び出しの体感速度が悪化する、(2) respawn の判断 (flap ガード・pause
+マーカー確認・pane owner 確認) を省略した簡易実装で行うと、§7 が積み上げた fail-closed の設計を
+迂回する非公式な第二の respawn 経路になってしまう。Director が `status` で裏を取ってから
+`lib_daemon_watch.py restart` を手で打つ、という一段人間を挟む設計にした
+(`agents/director.md` §14「両デーモンの同時死 backstop」)。
+
+#### 回帰テストの形
+
+`tests/test_daemon_backstop_hook.py`。**本物の `hooks/post-tool-use.sh` を subprocess で実行**する
+— ロジックを Python で再実装したテストは hook を直したことを一切証明しないため使わない (§6-5 の
+教訓と同じ形)。両方 stale で exit 2 になること、片方だけでは発火しないこと、director 以外の
+role では発火しないこと、throttle が効くこと・窓が空けば再発火すること、`registry/daemons/` が
+無い (mutual watch 未使用) 環境で誤検知しないこと、しきい値が env var で上書きできることを
+それぞれ担保する。RED は、fix 前の `hooks/post-tool-use.sh` (git HEAD) に対して同じテストを
+流し、4 本が意図通り fail することで確認した。
+
+---
+
 ## 8. 参照
 
 - `scripts/dispatcher.sh` — D1 :998、D2 :1210、D3 :1239、D4 :1351、D5 :819、
@@ -1915,5 +1976,7 @@ starttime の数え方の一致) は、使い捨てディレクトリに sleep �
   `_hold()` (§7-4)、`pause()` / `resume()` / `restart()` (§7-5)、
   `_flap_entries()` (§7-6)、`spawn_command()` (§7-7)
 - `scripts/lib_daemon_watch.sh` — dispatcher の heartbeat を bash から書く (§7-2)
+- `hooks/post-tool-use.sh` — 同時死の backstop (§7-13)。`_INTENTIONAL_EXIT_CODE` /
+  `daemon-backstop` セクション。`tests/test_daemon_backstop_hook.py` が回帰テスト
 - `knowledge/dispatcher-restart-after-merge.md` — 常駐デーモンの反映手順。
   **§7-5 の pause を挟む手順が追加された**ので、kill → spawn を素で打たないこと

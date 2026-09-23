@@ -19,13 +19,22 @@ set -euo pipefail
 # クラッシュガード: set -euo pipefail で予期せず exit した場合に exit 0 で収束させる。
 # PostToolUse はログ投稿のみで、失敗してもエージェント動作に影響しないため exit 0 が正しい。
 # trap の登録を set -euo pipefail の直後に置くことで、以降のどの行でクラッシュしても捕捉できる。
+#
+# _INTENTIONAL_EXIT_CODE: 既定は 0 (クラッシュガードの本来の収束先)。
+# t008 の同時死 backstop だけが意図的に 2 にセットする — PostToolUse hook が
+# exit 2 で終わると stderr が Claude (Director) に渡る、という Claude Code の
+# hook 仕様を使い、ポーリングさせずに文脈へ流し込む。exit code をそのまま
+# 使わずこの変数を経由するのは、「予期しないクラッシュ」と「意図的な signal」を
+# 区別するため — どちらも trap には非ゼロ exit として届き、素の $? だけでは
+# 見分けられない。
+_INTENTIONAL_EXIT_CODE=0
 _CURRENT_STEP="init"
 _crash_guard() {
   local _EXIT_CODE=$?
-  if [ "$_EXIT_CODE" -ne 0 ]; then
+  if [ "$_EXIT_CODE" -ne 0 ] && [ "$_EXIT_CODE" != "$_INTENTIONAL_EXIT_CODE" ]; then
     echo "[post-tool-use] ⚠️ crash guard: hook exited unexpectedly (exit=${_EXIT_CODE}, step=${_CURRENT_STEP})" >&2
   fi
-  exit 0
+  exit "$_INTENTIONAL_EXIT_CODE"
 }
 trap '_crash_guard' EXIT
 
@@ -76,6 +85,103 @@ if [[ -n "${AGENT_NAME:-}" ]]; then
   HEARTBEAT_DIR="${_HB_REPO}/registry/heartbeats"
   mkdir -p "$HEARTBEAT_DIR"
   date +%s > "${HEARTBEAT_DIR}/${AGENT_NAME}" 2>/dev/null || true
+fi
+
+# --- 同時死 backstop (t008) -------------------------------------------------
+# 背景: dispatcher と watchdog の相互監視 (scripts/lib_daemon_watch.py) は
+# 「相手を見る」仕組みなので、両方が同時に死ぬケース (herdr 再起動、OOM 等) は
+# どちらも互いを起こせない。このケースだけ Director 側のこの hook が拾う。
+#
+# 対象: role が director のセッションのみ (Worker では毎ツール呼び出しに
+# 発火してノイズになるうえ、Worker が自分で respawn/report できるわけでも
+# ないので意味が無い)。
+#
+# 判定は registry/daemons/{dispatcher,watchdog}.heartbeat の mtime だけを見る
+# 安価な処理 — ネットワーク I/O・mux 呼び出し・python サブプロセスは呼ばない
+# (lib_daemon_watch.py の watch_peer() のような "process が本当に生きているか"
+# の踏み込んだ検証はしない。あくまで最後の砦であり、誤検知しても Director が
+# scripts/lib_daemon_watch.py status で確認するだけなので副作用は無い)。
+# しきい値は config/crewvia.yaml の daemons.dispatcher_stale_seconds /
+# watchdog_stale_seconds の既定値 (60 / 240) をハードコードする — YAML 解析は
+# この hook の目的には重すぎるため、lib_daemon_watch.py と同じ env var
+# (CREWVIA_DAEMON_DISPATCHER_STALE_SECONDS 等) でだけ上書きを許す。
+#
+# throttle: 全ツール呼び出しのたびに判定すると使い物にならないため、
+# マーカーファイルの mtime で 60 秒に 1 回に抑える。判定結果に関わらず
+# マーカーを先に更新することで、同時に複数の PostToolUse が走っても
+# 直後の呼び出しは早期リターンする (二重通知の窓を狭める。完全な排他では
+# ないが、この hook にロックを持ち込むほどの重さではない)。
+#
+# 検出したら「1 行だけ出力して exit 2」で終える。PostToolUse hook が exit 2
+# で終わると Claude Code は stderr を Claude (ここでは Director) にそのまま
+# 見せる (ツールは既に実行済みなのでブロックはしない) — これが Director に
+# ポーリングさせず「何か操作した拍子に勝手に届く」形の実現方法。
+_CURRENT_STEP="daemon-backstop"
+if [[ -n "${AGENT_NAME:-}" ]]; then
+  _BS_REPO="${CREWVIA_REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+  _BS_WORKERS_YAML="${_BS_REPO}/registry/workers.yaml"
+  _BS_IS_DIRECTOR=0
+  if [[ -f "$_BS_WORKERS_YAML" ]] && grep -qA1 "name: ${AGENT_NAME}$" "$_BS_WORKERS_YAML" 2>/dev/null; then
+    _BS_ROLE="$(grep -A3 "name: ${AGENT_NAME}$" "$_BS_WORKERS_YAML" | grep 'role:' | awk '{print $2}' | head -1 || true)"
+    if [[ "$_BS_ROLE" == "director" ]]; then
+      _BS_IS_DIRECTOR=1
+    fi
+  fi
+
+  if [[ "$_BS_IS_DIRECTOR" == "1" ]]; then
+    _BS_DAEMONS_DIR="${_BS_REPO}/registry/daemons"
+    # daemons/ が無い = 両デーモンとも一度も mutual watch の heartbeat を
+    # 書いたことが無い (lib_daemon_watch.DaemonWatch が最初の beat() 時に
+    # mkdir する)。standalone/inline 運用ではこの状態が正常なので、そのまま
+    # 判定に入らずスキップする (常時 stale 誤検知を防ぐ)。
+    if [[ -d "$_BS_DAEMONS_DIR" ]]; then
+      _BS_THROTTLE="${_BS_DAEMONS_DIR}/backstop-notify.throttle"
+      _BS_NOW="$(date +%s)"
+      _BS_LAST=0
+      if [[ -f "$_BS_THROTTLE" ]]; then
+        _BS_LAST="$(stat -c %Y "$_BS_THROTTLE" 2>/dev/null || echo 0)"
+      fi
+      _BS_ELAPSED=$(( _BS_NOW - _BS_LAST ))
+
+      if [[ "$_BS_ELAPSED" -ge 60 ]]; then
+        # 判定前にスロットル窓を更新する (判定結果に関わらず)。
+        : > "$_BS_THROTTLE" 2>/dev/null || true
+
+        _BS_DISPATCHER_STALE_S="${CREWVIA_DAEMON_DISPATCHER_STALE_SECONDS:-60}"
+        _BS_WATCHDOG_STALE_S="${CREWVIA_DAEMON_WATCHDOG_STALE_SECONDS:-240}"
+
+        _BS_D_AGE=-1
+        if [[ -f "${_BS_DAEMONS_DIR}/dispatcher.heartbeat" ]]; then
+          _BS_D_MTIME="$(stat -c %Y "${_BS_DAEMONS_DIR}/dispatcher.heartbeat" 2>/dev/null || echo "")"
+          [[ -n "$_BS_D_MTIME" ]] && _BS_D_AGE=$(( _BS_NOW - _BS_D_MTIME ))
+        fi
+        _BS_W_AGE=-1
+        if [[ -f "${_BS_DAEMONS_DIR}/watchdog.heartbeat" ]]; then
+          _BS_W_MTIME="$(stat -c %Y "${_BS_DAEMONS_DIR}/watchdog.heartbeat" 2>/dev/null || echo "")"
+          [[ -n "$_BS_W_MTIME" ]] && _BS_W_AGE=$(( _BS_NOW - _BS_W_MTIME ))
+        fi
+
+        # -1 (ファイル無し/読めない) は「無限に stale」として扱う。
+        _BS_D_STALE=0
+        if [[ "$_BS_D_AGE" -lt 0 ]] || [[ "$_BS_D_AGE" -ge "$_BS_DISPATCHER_STALE_S" ]]; then
+          _BS_D_STALE=1
+        fi
+        _BS_W_STALE=0
+        if [[ "$_BS_W_AGE" -lt 0 ]] || [[ "$_BS_W_AGE" -ge "$_BS_WATCHDOG_STALE_S" ]]; then
+          _BS_W_STALE=1
+        fi
+
+        if [[ "$_BS_D_STALE" == "1" ]] && [[ "$_BS_W_STALE" == "1" ]]; then
+          _BS_D_DESC="${_BS_D_AGE}s前"
+          [[ "$_BS_D_AGE" -lt 0 ]] && _BS_D_DESC="heartbeat無し"
+          _BS_W_DESC="${_BS_W_AGE}s前"
+          [[ "$_BS_W_AGE" -lt 0 ]] && _BS_W_DESC="heartbeat無し"
+          echo "[daemon-backstop] ⚠️ dispatcher と watchdog の heartbeat が両方 stale です (dispatcher: ${_BS_D_DESC}, watchdog: ${_BS_W_DESC})。相互監視は片方が生きていないと相手を起こせません。scripts/lib_daemon_watch.py status で確認し、両方が本当に死んでいれば両方を respawn してください (片方だけの respawn は knowledge/daemon-authority.md §5 の事故を再現します)。" >&2
+          _INTENTIONAL_EXIT_CODE=2
+        fi
+      fi
+    fi
+  fi
 fi
 
 # Taskvia 無効モード: CREWVIA_TASKVIA=disabled または トークン未設定なら投稿スキップ

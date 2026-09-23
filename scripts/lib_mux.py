@@ -65,6 +65,124 @@ def _session() -> str:
     return os.environ.get("CREWVIA_TMUX_SESSION", _DEFAULT_SESSION)
 
 
+# ---------------------------------------------------------------------------
+# Test isolation — production is not reachable from a test run
+# ---------------------------------------------------------------------------
+#
+# On 2026-09-23 a test took production's dispatcher pane away for four and a
+# half hours.  The test ran the real CLI in a real subprocess to check that it
+# refused something; the CLI builds its `Mux()` **from the ambient
+# environment**, so while `--repo-root` pointed at a pytest tmpdir, the kill
+# and the spawn went to the default workspace `crewvia` and the default pane
+# name `dispatcher` — production.  The pane was replaced with a command
+# rooted in the tmpdir, and died when pytest deleted it.
+#
+# The lesson is not "fix that test".  A red test proves a defect by *running
+# the defective destructive path*; that is its job.  So isolation cannot be
+# left to the test author's memory.  Two environment variables are required
+# of every test run, and without them the destructive verbs refuse:
+#
+#   CREWVIA_MUX_TEST_ISOLATION   the marker; set by tests/conftest.py into
+#                                os.environ, so subprocesses inherit it (the
+#                                one thing the incident was missing)
+#   CREWVIA_MUX_PANE_PREFIX      a namespace for pane names.  Production
+#                                leaves it empty and this whole layer is then
+#                                the identity function; a test run sets it, so
+#                                `spawn("dispatcher")` lands on
+#                                `<prefix>dispatcher` and the production pane
+#                                name is not something a test can even say.
+#
+# plus a destination (tmux session / herdr workspace) that is not the default.
+#
+# Deliberately *not* the only defence: lib_daemon_watch also refuses to kill a
+# pane whose process belongs to another checkout, which holds in production
+# too, where no marker is set.  A single guard keyed on "are we testing" would
+# be exactly the fail-closed-in-one-place shape that reproduced this repo's
+# defects three times over.
+
+#: Raised instead of returning False: a test that aims at production must fail
+#: loudly, not degrade into a no-op it could mistake for a passing assertion.
+#: The `_Backend` "never raise" contract holds everywhere else — this is only
+#: reachable when CREWVIA_MUX_TEST_ISOLATION is set, i.e. never in production.
+class MuxTestIsolationError(RuntimeError):
+    pass
+
+
+#: Exit code the CLIs use for this refusal — distinct from the verbs' own
+#: 0/1/2 so a harness can tell "aimed at production" from "did not start".
+MUX_TEST_ISOLATION_EXIT = 3
+
+
+def _test_isolation_active() -> bool:
+    """True while a test run owns this process (or its parent's environment).
+
+    `PYTEST_CURRENT_TEST` is pytest's own per-test variable and is a backstop;
+    `CREWVIA_MUX_TEST_ISOLATION` is what conftest sets for the whole session,
+    which is what actually reaches a subprocess started between two tests.
+    """
+    return bool(os.environ.get("CREWVIA_MUX_TEST_ISOLATION")
+                or os.environ.get("PYTEST_CURRENT_TEST"))
+
+
+def _pane_prefix() -> str:
+    """The pane-name namespace.  Empty in production — this layer is a no-op."""
+    return os.environ.get("CREWVIA_MUX_PANE_PREFIX", "")
+
+
+def _pane_name(name: str) -> str:
+    """The backend-level name for the caller's `name`."""
+    return f"{_pane_prefix()}{name}"
+
+
+def _caller_name(pane_name: str) -> str:
+    """Inverse of `_pane_name()` — what `list()` hands back to callers.
+
+    The namespace is mux-internal.  Leaking it outwards would silently break
+    every caller that matches on a name it did not create: dispatcher's
+    `-worker` suffix scan, watchdog's per-agent heartbeat lookup.
+    """
+    prefix = _pane_prefix()
+    if prefix and pane_name.startswith(prefix):
+        return pane_name[len(prefix):]
+    return pane_name
+
+
+def _guard_test_isolation(backend: str, verb: str, name: str,
+                          destination: str) -> None:
+    """Refuse a verb that a test run aimed at a production pane.
+
+    Checked *before* anything is executed, so a refusal also means nothing
+    happened — which is the assertion the regression test actually makes.
+
+    Reads (`pid`, `capture`) are guarded as well as writes.  They are the step
+    that *authorises* the write — `restart()` asks for the pane's pid to decide
+    whether it may kill it — so leaving them open would mean a test could still
+    take production's measurements and then act on them.  The rule is simply
+    that a test cannot **name** a production pane.  `list()` names none and
+    stays open; its results are namespaced by `_caller_name()` instead.
+    """
+    if not _test_isolation_active():
+        return
+    problems = []
+    if destination == _DEFAULT_SESSION:
+        problems.append(
+            f"the destination is the production default {_DEFAULT_SESSION!r} "
+            f"(set CREWVIA_TMUX_SESSION / CREWVIA_HERDR_WORKSPACE to a name of "
+            f"this test's own)")
+    if not _pane_prefix():
+        problems.append(
+            "CREWVIA_MUX_PANE_PREFIX is empty, so this would claim the bare "
+            "pane name production uses")
+    if not problems:
+        return
+    raise MuxTestIsolationError(
+        f"[mux:{backend}] refusing {verb}({name!r}) under test isolation: "
+        + "; ".join(problems)
+        + ". Nothing was executed. See tests/conftest.py — a test run must not "
+          "be able to reach the production mux (2026-09-23 incident)."
+    )
+
+
 def repo_identity_ok(repo_root) -> bool:
     """Self-identity guard for long-running daemons (watchdog.py, dispatcher.sh).
 
@@ -495,8 +613,16 @@ class TmuxBackend(_Backend):
 
     BACKEND_NAME = "tmux"
 
+    def _guard(self, verb: str, name: str) -> None:
+        _guard_test_isolation(self.BACKEND_NAME, verb, name, _session())
+
     def _target(self, name: str) -> str:
-        return f"{_session()}:{name}"
+        """`<session>:<window>` for the caller's `name`.
+
+        The single place a caller-level name becomes a tmux window name, which
+        is why the test namespace is applied here rather than in each verb.
+        """
+        return f"{_session()}:{_pane_name(name)}"
 
     def _pane_has_live_process(self, name: str) -> bool:
         """True if the window named `name` is running anything beyond its shell.
@@ -552,7 +678,9 @@ class TmuxBackend(_Backend):
         its tab is still listed" became un-actionable on tmux (t006 QA
         FAIL-1).
         """
+        self._guard("spawn", name)
         session = _session()
+        window = _pane_name(name)
         try:
             # Check / create session
             has = subprocess.run(
@@ -561,7 +689,7 @@ class TmuxBackend(_Backend):
             )
             if has.returncode != 0:
                 r = subprocess.run(
-                    ["tmux", "new-session", "-d", "-s", session, "-n", name],
+                    ["tmux", "new-session", "-d", "-s", session, "-n", window],
                     capture_output=True, timeout=5,
                 )
                 if r.returncode != 0:
@@ -573,7 +701,7 @@ class TmuxBackend(_Backend):
                     ["tmux", "list-windows", "-t", session, "-F", "#{window_name}"],
                     capture_output=True, text=True, timeout=5,
                 )
-                if existing.returncode == 0 and name in existing.stdout.splitlines():
+                if existing.returncode == 0 and window in existing.stdout.splitlines():
                     if self._pane_has_live_process(name):
                         return False  # live one in there → no-op, per spec
                     # Husk: the shell outlived whatever it was running.
@@ -590,7 +718,7 @@ class TmuxBackend(_Backend):
                         lambda: self._pane_has_live_process(name),
                         warn=self._warn, name=name)
                 r = subprocess.run(
-                    ["tmux", "new-window", "-t", session, "-n", name],
+                    ["tmux", "new-window", "-t", session, "-n", window],
                     capture_output=True, timeout=5,
                 )
                 if r.returncode != 0:
@@ -624,6 +752,7 @@ class TmuxBackend(_Backend):
         ("ミッション開始…ミッション開始…"). Clearing first is a no-op when the
         line is already empty, so this is safe on a first attempt too.
         """
+        self._guard("send", name)
         target = self._target(name)
         try:
             subprocess.run(
@@ -646,6 +775,7 @@ class TmuxBackend(_Backend):
 
     def capture(self, name: str) -> str:
         """Return the current pane contents via capture-pane -p."""
+        self._guard("capture", name)
         target = self._target(name)
         try:
             r = subprocess.run(
@@ -670,7 +800,10 @@ class TmuxBackend(_Backend):
             )
             if r.returncode != 0:
                 return []
-            names = [line.strip() for line in r.stdout.splitlines() if line.strip()]
+            prefix = _pane_prefix()
+            names = [_caller_name(line.strip())
+                     for line in r.stdout.splitlines()
+                     if line.strip() and line.strip().startswith(prefix)]
             if suffix:
                 names = [n for n in names if n.endswith(suffix)]
             return names
@@ -680,6 +813,7 @@ class TmuxBackend(_Backend):
 
     def kill(self, name: str) -> bool:
         """Kill the named window."""
+        self._guard("kill", name)
         target = self._target(name)
         try:
             r = subprocess.run(
@@ -693,6 +827,7 @@ class TmuxBackend(_Backend):
 
     def pid(self, name: str) -> Optional[int]:
         """Return the shell PID of the pane (display-message #{pane_pid})."""
+        self._guard("pid", name)
         target = self._target(name)
         try:
             r = subprocess.run(
@@ -1092,7 +1227,13 @@ class HerdrBackend(_Backend):
         return self._cache_root
 
     def _cache_path(self, name: str) -> Path:
-        return self._cache_dir() / f"{name}.json"
+        # Namespaced too: a test run's pane ids must not be read back as
+        # production's (and vice versa) out of the same registry/mux/ file.
+        return self._cache_dir() / f"{_pane_name(name)}.json"
+
+    def _guard(self, verb: str, name: str) -> None:
+        _guard_test_isolation(self.BACKEND_NAME, verb, name,
+                              self._workspace_label())
 
     def _write_cache(self, name: str, tab_id: str, pane_id: str) -> None:
         try:
@@ -1146,7 +1287,7 @@ class HerdrBackend(_Backend):
             return None
         panes = data.get("result", {}).get("panes", [])
         for pane in panes:
-            if pane.get("label") == name:
+            if pane.get("label") == _pane_name(name):
                 return pane.get("pane_id")
         return None
 
@@ -1169,7 +1310,7 @@ class HerdrBackend(_Backend):
             return None
         panes = data.get("result", {}).get("panes", [])
         for pane in panes:
-            if pane.get("label") == name:
+            if pane.get("label") == _pane_name(name):
                 return {
                     "tab_id": pane.get("tab_id"),
                     "pane_id": pane.get("pane_id"),
@@ -1314,6 +1455,7 @@ class HerdrBackend(_Backend):
         an idle shell — the husk a herdr server restart leaves behind — the
         command is relaunched into that pane and True is returned.
         """
+        self._guard("spawn", name)
         ws_id = self._workspace_id()
         if ws_id is None:
             self._warn(f"spawn {name!r}: could not resolve workspace")
@@ -1324,7 +1466,7 @@ class HerdrBackend(_Backend):
         if existing is not None:
             panes = existing.get("result", {}).get("panes", [])
             for pane in panes:
-                if pane.get("label") != name:
+                if pane.get("label") != _pane_name(name):
                     continue
                 existing_pane_id = pane.get("pane_id") or ""
                 if not existing_pane_id or self._pane_has_live_process(existing_pane_id):
@@ -1349,7 +1491,7 @@ class HerdrBackend(_Backend):
                 return True
 
         # tab create.
-        tab_args = ["--workspace", ws_id, "--label", name, "--no-focus"]
+        tab_args = ["--workspace", ws_id, "--label", _pane_name(name), "--no-focus"]
         if cwd:
             tab_args += ["--cwd", cwd]
         tab_data = _herdr_run("tab_create", tab_args, timeout=10)
@@ -1367,7 +1509,7 @@ class HerdrBackend(_Backend):
             return False
 
         # pane rename (Phase 0: tab label does NOT propagate to pane label).
-        _herdr_run("pane_rename", [pane_id, name], timeout=5)
+        _herdr_run("pane_rename", [pane_id, _pane_name(name)], timeout=5)
 
         # pane run.
         run_data = _herdr_run("pane_run", [pane_id, cmd], timeout=10)
@@ -1411,6 +1553,7 @@ class HerdrBackend(_Backend):
         when the line is already empty, so this is safe on a first attempt
         too.
         """
+        self._guard("send", name)
         _SEND_PROMPT_TIMEOUT = 5.0   # seconds to wait for '❯'
         _SEND_PROMPT_INTERVAL = 0.5  # poll interval in seconds
 
@@ -1467,6 +1610,7 @@ class HerdrBackend(_Backend):
 
     def capture(self, name: str) -> str:
         """Return the current visible screen contents of the named pane."""
+        self._guard("capture", name)
         ids = self._resolve_ids(name)
         if ids is None:
             self._warn(f"capture {name!r}: pane not found")
@@ -1485,7 +1629,9 @@ class HerdrBackend(_Backend):
         if data is None:
             return []
         panes = data.get("result", {}).get("panes", [])
-        names = [p.get("label") for p in panes if p.get("label")]
+        prefix = _pane_prefix()
+        names = [_caller_name(p["label"]) for p in panes
+                 if p.get("label") and p["label"].startswith(prefix)]
         if suffix:
             names = [n for n in names if n.endswith(suffix)]
         return names
@@ -1496,6 +1642,7 @@ class HerdrBackend(_Backend):
         Phase 0: tab close terminates all child processes via SIGHUP within 2s.
         Cache is deleted on success.
         """
+        self._guard("kill", name)
         ids = self._resolve_ids(name)
         if ids is None:
             self._warn(f"kill {name!r}: pane not found")
@@ -1514,6 +1661,7 @@ class HerdrBackend(_Backend):
 
     def pid(self, name: str) -> Optional[int]:
         """Return the shell PID of the named pane via pane process-info."""
+        self._guard("pid", name)
         ids = self._resolve_ids(name)
         if ids is None:
             self._warn(f"pid {name!r}: pane not found")
@@ -1795,4 +1943,11 @@ def _cli_main(args: List[str]) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(_cli_main(sys.argv[1:]))
+    try:
+        sys.exit(_cli_main(sys.argv[1:]))
+    except MuxTestIsolationError as exc:
+        # One readable line, not a traceback: the refusal is the message, and
+        # every caller of this CLI reads stderr rather than a Python stack.
+        print(str(exc), file=sys.stderr)
+        sys.exit(MUX_TEST_ISOLATION_EXIT)
+

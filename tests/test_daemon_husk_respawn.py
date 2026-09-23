@@ -349,10 +349,15 @@ def test_spawn_does_not_claim_success_when_the_pane_swallows_the_command(
     カウンタを消費したうえで、実際には何も起きていない。
     """
     session = tmux_session
-    subprocess.run(["tmux", "new-session", "-d", "-s", session, "-n",
-                    dw.DAEMON_DISPATCHER], capture_output=True, timeout=10)
+    # tmux を直接叩くので、窓の名前は mux 層が解決したあとの名前で作る。テスト中は
+    # ペイン名に名前空間が付く (t037: 本番の `dispatcher` をテストから名指しできない)
+    # ので、素の `dispatcher` で作ると spawn が別の窓を新規に作ってしまい、
+    # 確かめたい「入力待ちのペインに送り込む」経路を通らない。
+    window = lib_mux._pane_name(dw.DAEMON_DISPATCHER)
+    subprocess.run(["tmux", "new-session", "-d", "-s", session, "-n", window],
+                   capture_output=True, timeout=10)
     # ペインのシェルを入力待ちにする (人が read を打った状態と同じ)。
-    subprocess.run(["tmux", "send-keys", "-t", f"{session}:{dw.DAEMON_DISPATCHER}",
+    subprocess.run(["tmux", "send-keys", "-t", f"{session}:{window}",
                     "read -r _swallowed", "Enter"], capture_output=True, timeout=10)
     time.sleep(1.0)
 

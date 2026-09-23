@@ -93,6 +93,22 @@ class FakeMux:
         self.sent.append({"name": name, "text": text})
         return True
 
+    def pid(self, name):
+        """The pane's shell pid — this test process.
+
+        `restart()` reads it to ask *whose daemon is in that pane* before
+        killing anything (t037).  Answering with our own pid models the
+        ordinary case the fake stands for: a pane that exists and holds
+        nothing belonging to the checkout under test, i.e. the husk a crash
+        leaves behind, which restart must still be able to replace.
+
+        Deliberately a **real** pid: the ownership check walks the real
+        /proc from here, so a made-up number would make every test that uses
+        this fake pass through the "could not read it" branch instead of the
+        one production takes.
+        """
+        return os.getpid()
+
 
 class DeadMux(FakeMux):
     """A mux whose send() always fails — used for the report-retry test."""

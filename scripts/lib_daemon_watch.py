@@ -109,7 +109,12 @@ _SCRIPTS_DIR = Path(__file__).resolve().parent
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
-from lib_mux import Mux, repo_identity_ok  # noqa: E402
+from lib_mux import (  # noqa: E402
+    MUX_TEST_ISOLATION_EXIT,
+    Mux,
+    MuxTestIsolationError,
+    repo_identity_ok,
+)
 from lib_retirement import (  # noqa: E402
     process_alive,
     read_json,
@@ -410,6 +415,136 @@ def scan_daemon_pids(repo_root, name: str, *, proc_root="/proc",
             pass
         found.append(pid)
     return sorted(found)
+
+
+# ---------------------------------------------------------------------------
+# Pane ownership — is the thing in that pane ours to end?
+# ---------------------------------------------------------------------------
+#
+# `repo_identity_ok()` asks whether *we* still have a checkout to act from.
+# This asks the other half, which is the half the 2026-09-23 incident needed:
+# whose daemon is in the pane we are about to kill?  A run rooted at a pytest
+# tmpdir killed and replaced the pane that was running
+# `/home/tkadmin/workspace/crewvia/scripts/dispatcher.sh`, and nothing in the
+# path from CLI to `mux.kill()` ever looked at what was in there.
+#
+# Deliberately independent of the test-isolation marker in lib_mux: that one
+# knows it is a test, this one does not care.  Two checkouts of crewvia on one
+# machine — a QA worktree, a second WSL, a stale herdr env — are the ordinary
+# case here, and the guard has to hold when nobody has declared anything.
+#
+# `lib_retirement._exit_evidence()` is the precedent: prove the thing you are
+# about to act on is the thing you meant, from the process layer, before you
+# act.
+
+#: Who is in the pane.  `UNKNOWN` is not `NONE` — the distinction this repo has
+#: now had to make at four separate layers.
+PANE_OWNER_MINE = "mine"
+PANE_OWNER_FOREIGN = "foreign"
+PANE_OWNER_NONE = "none"
+PANE_OWNER_UNKNOWN = "unknown"
+
+
+def _proc_table(proc_root: str = "/proc"):
+    """`{pid: (ppid, [argv…])}` for every process, or None if incomplete.
+
+    Per entry, exactly as `scan_daemon_pids()`: an entry that vanished mid-walk
+    was never in our pane, but one we could not *read* might be, and a table
+    that quietly dropped it would answer "nothing of ours in there" to the one
+    caller that then kills the pane.
+    """
+    try:
+        entries = list(Path(proc_root).iterdir())
+    except OSError:
+        return None
+    table = {}
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        try:
+            argv = [a.decode("utf-8", "replace")
+                    for a in (entry / "cmdline").read_bytes().split(b"\0") if a]
+            stat = (entry / "stat").read_text(encoding="utf-8")
+        except OSError as exc:
+            if exc.errno in _PROC_GONE_ERRNOS:
+                continue
+            return None
+        try:
+            tail = stat[stat.rindex(")") + 2:].split()
+            ppid = int(tail[1])
+        except (ValueError, IndexError):
+            return None
+        table[pid] = (ppid, argv)
+    return table
+
+
+def _descendants(table: dict, root_pid: int) -> set:
+    """`root_pid` and everything below it, per the ppid edges in `table`."""
+    children: dict = {}
+    for pid, (ppid, _) in table.items():
+        children.setdefault(ppid, []).append(pid)
+    seen = {root_pid}
+    stack = [root_pid]
+    while stack:
+        for child in children.get(stack.pop(), ()):
+            if child not in seen:
+                seen.add(child)
+                stack.append(child)
+    return seen
+
+
+def pane_daemon_owner(mux, name: str, repo_root, *, proc_root: str = "/proc"):
+    """`(owner, detail)` — whose `name` daemon, if any, runs in `name`'s pane.
+
+      MINE     a process under this pane runs `<repo_root>/scripts/<script>`
+      FOREIGN  it runs that script out of a **different** checkout
+      NONE     nothing recognisable is in there — a husk, or a fresh pane.
+               Restarting into it is the ordinary crash-recovery path and must
+               keep working (t035), so this is not a refusal.
+      UNKNOWN  the pane's pid or /proc could not be read.  Not the same answer
+               as NONE: production breaks precisely when things cannot be read,
+               and a guard that only holds while everything is readable is not
+               one.
+    """
+    try:
+        pane_pid = mux.pid(name)
+    except Exception as exc:                      # a backend may still throw
+        return PANE_OWNER_UNKNOWN, f"could not ask the backend for the pane pid: {exc!r}"
+    if pane_pid is None:
+        return PANE_OWNER_UNKNOWN, f"no pane pid for {name!r}"
+
+    table = _proc_table(proc_root)
+    if table is None:
+        return PANE_OWNER_UNKNOWN, f"{proc_root} could not be walked completely"
+    try:
+        pane_pid = int(pane_pid)
+    except (TypeError, ValueError):
+        return PANE_OWNER_UNKNOWN, f"unusable pane pid {pane_pid!r}"
+    if pane_pid not in table:
+        return PANE_OWNER_UNKNOWN, f"pane pid {pane_pid} is not in {proc_root}"
+
+    script = SCRIPT_OF[name]
+    mine = str(Path(repo_root) / "scripts" / script)
+    suffix = f"/scripts/{script}"
+    foreign = []
+    for pid in _descendants(table, pane_pid):
+        for arg in table[pid][1]:
+            if arg == mine:
+                return PANE_OWNER_MINE, f"pid {pid} runs {mine}"
+            if arg.endswith(suffix):
+                foreign.append((pid, arg))
+    if foreign:
+        pid, arg = foreign[0]
+        return PANE_OWNER_FOREIGN, f"pid {pid} runs {arg}, not {mine}"
+    return PANE_OWNER_NONE, f"no {script} under pane pid {pane_pid}"
+
+
+#: What may be killed.  An allowlist, because the denylist version of this
+#: question — "is it obviously someone else's?" — is the shape that let three
+#: earlier defects through: every answer it has not thought of falls on the
+#: destructive side (memory: approve-judgment-needs-allowlist-and-scope).
+_MAY_KILL_OWNERS = frozenset({PANE_OWNER_MINE, PANE_OWNER_NONE})
 
 
 # ---------------------------------------------------------------------------
@@ -1159,7 +1294,8 @@ def spawn_daemon(name: str, *, repo_root=None, mux=None,
                               cwd=str(repo_root)))
 
 def restart(name: str, *, repo_root=None, mux=None, reason: str = "manual restart",
-            log: Callable[[str], None] = print) -> bool:
+            log: Callable[[str], None] = print, force: bool = False,
+            proc_root: str = "/proc") -> bool:
     """Stop and start `name` without its peer racing us into a double start.
 
     Order is load-bearing: **pause first**, then kill.  The recipe people
@@ -1167,6 +1303,17 @@ def restart(name: str, *, repo_root=None, mux=None, reason: str = "manual restar
     dead — a peer watching at that moment is correct to respawn it, and the
     operator's own spawn a second later lands on top.  Pausing first closes
     the gap; resuming last reopens the watch only once the new one is up.
+
+    The pane is also checked before the kill: what is in it has to be *this*
+    checkout's daemon, or nothing recognisable at all.  Restarting a daemon
+    that belongs to another checkout is what a pytest run did to production on
+    2026-09-23, and `--repo-root` pointing somewhere harmless is no protection
+    at all — the mux destination comes from the environment, not from it.
+
+    `force=True` is the operator's way past an *unreadable* pane (or a foreign
+    one they mean to take over).  It exists so the refusal is a pause rather
+    than a dead end: a fail-closed guard with no exit is how "cannot judge"
+    turns into "nothing ever works again" (memory: fail-closed-discard-vs-hold).
     """
     repo_root = Path(repo_root) if repo_root is not None else _SCRIPTS_DIR.parent
     mux = mux if mux is not None else Mux()
@@ -1181,6 +1328,18 @@ def restart(name: str, *, repo_root=None, mux=None, reason: str = "manual restar
         if not locked:
             log(f"[daemon-watch] restart {name}: another restart or respawn is "
                 f"already in flight (could not take {lock_path(registry_dir, name)})")
+            return False
+
+        # Before the marker, not after: a refusal here must leave nothing
+        # behind, and a pause marker left on disk silently disables mutual
+        # watch until somebody notices the 30-minute stale-pause report.
+        owner, detail = (
+            (PANE_OWNER_MINE, "forced") if force
+            else pane_daemon_owner(mux, name, repo_root, proc_root=proc_root))
+        if owner not in _MAY_KILL_OWNERS:
+            log(f"[daemon-watch] restart {name}: refused — the pane is not "
+                f"this checkout's to end ({owner}: {detail}). Nothing was "
+                f"killed. Pass --force to override.")
             return False
 
         token = _write_pause_marker(registry_dir, name, reason=reason)
@@ -1246,7 +1405,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--token", default=None)
     p.add_argument("--force", action="store_true")
 
-    _sub("restart", "pause \u2192 kill \u2192 spawn \u2192 resume")
+    p = _sub("restart", "pause \u2192 kill \u2192 spawn \u2192 resume")
+    p.add_argument("--force", action="store_true",
+                   help="restart even when the pane's owner cannot be shown "
+                        "to be this checkout")
 
     args = parser.parse_args(argv)
     repo_root = Path(args.repo_root).resolve()
@@ -1331,11 +1493,18 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.cmd == "restart":
         # Refusals explain themselves on stderr (see restart()); the exit code
         # is what a script driving this will actually branch on.
-        return 0 if restart(args.name, repo_root=repo_root,
+        return 0 if restart(args.name, repo_root=repo_root, force=args.force,
                             log=lambda m: print(m, file=sys.stderr)) else 1
 
     return 2  # pragma: no cover - argparse rejects unknown commands
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except MuxTestIsolationError as exc:
+        # The 2026-09-23 shape: a test ran this CLI in a subprocess and the
+        # destination came from the ambient environment.  Refused before
+        # anything was executed; said in one line, not a traceback.
+        print(str(exc), file=sys.stderr)
+        sys.exit(MUX_TEST_ISOLATION_EXIT)

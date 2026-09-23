@@ -347,6 +347,10 @@ def test_a_paneless_runner_gets_no_pane_match(sandbox):
     ペインが存在しない実行者について名前を書くのは事実として誤り。
     """
     sandbox.add_task("t001", "in_progress", [], worker="Kai-codex")
+    # assignment は公開されている (kai-review.sh も plan.sh pull を通る)。
+    # 置かないと「assignment が無いから出ない」で緑になり、ペイン不在の規則
+    # そのものを何も見ていないテストになる。
+    sandbox.assign("Kai-codex", "t001")
     path = sandbox.queue / "missions" / MISSION / "tasks" / "t001.md"
     path.write_text(path.read_text().replace("skills: [code]", "skills: [codex-review]"))
     assert sandbox.run("task-graph").returncode == 0
@@ -360,6 +364,7 @@ def test_a_paneless_runner_gets_no_pane_match(sandbox):
 def test_a_normal_worker_still_gets_a_pane_match(sandbox):
     """対照: 普通の Worker には今までどおり付くこと。"""
     sandbox.add_task("t001", "in_progress", [], worker="Ren")
+    sandbox.assign("Ren", "t001")
     assert sandbox.run("task-graph").returncode == 0
     assert _by_id(sandbox.read_graph())[f"{MISSION}:t001"]["pane_match"] == "Ren-worker"
 

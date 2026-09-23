@@ -251,6 +251,7 @@ import sys
 import os
 import json
 import fcntl
+import contextlib
 import re
 import shutil
 import hashlib
@@ -953,6 +954,26 @@ TASK_GRAPH_UNKNOWN = ('blocked', '[status不明]')
 #: 出さないのが正解 —— 正しい名前に直しても、当たらないことは変わらない。
 PANELESS_SKILLS = {'codex-review'}
 
+#: pane_match を出してよい status (allowlist)。「この card にまだ Worker が
+#: 就いている」と plan.sh 自身が言える状態だけを並べる。
+#:
+#: 除外側を数える書き方 (`TERMINAL_STATUSES に無ければ出す`) では足りない。
+#: `cmd_fail` は **完了を記録しつつ `worker` 欄を残す** ので、`failed` の card は
+#: 終わったあとも Worker 名を持ち続ける。`cancelled` / `verification_failed` /
+#: `corrupted` も同じで、いずれも TERMINAL_STATUSES には入っていない。crewvia は
+#: Worker 名を使い回すので、それらに pane_match を出すと **無関係な task の
+#: ペイン** を指す。`pending` は `--reset` が worker を消すので通常は空だが、
+#: 残っていても「誰も就いていない」が正しい。
+#:
+#: 知らない status は出さない側に倒れる (allowlist なので既定が除外)。
+TASK_GRAPH_PANE_STATUSES = {
+    'in_progress',            # pull が assignment を公開した直後の状態
+    'verifying',              # 検証中 — card はまだ Worker のもの
+    'ready_for_verification', # 検証待ち — assignment は撤去されない
+    'needs_director',         # 判断待ち — assignment は撤去されない
+    'needs_human_review',     # 判断待ち — assignment は撤去されない
+}
+
 
 def task_graph_enabled():
     """停止スイッチ。`CREWVIA_TASK_GRAPH=0` で生成を完全に止める。
@@ -1026,6 +1047,32 @@ def _task_graph_worker(meta):
     if not worker or worker.lower() in ('null', 'none', '~'):
         return None
     return worker
+
+
+def task_graph_assignment_holds(worker, slug, task_id):
+    """`queue/assignments/<worker>` が、いまこの task を指しているか。
+
+    card の `worker` 欄は **履歴** で、crewvia は Worker 名を使い回す。だから
+    「いまどのペインに居るか」を card だけから決めると、名前の使い回しの分だけ
+    必ず誤る。`queue/assignments/<agent>` は crewvia が「存在 = busy / 不在 =
+    idle」を表すために持っている一行の事実なので、pane_match の根拠はそちらに
+    置く (status の allowlist との **AND**)。
+
+    撤去を伴う判定ではないので classify_assignment() の世代照合までは要らない。
+    ここで問うているのは「この名前の Worker が、いまこの card に就いているか」
+    だけで、後任か先任かで pane の宛先は変わらない。
+
+    読めない・無い・別の task を指している — どれも「分からない」ではなく
+    **出さない** に倒す。pane_match が無ければ plugin はペインを結び付けない
+    だけだが、間違った pane_match は無関係なペインを指す。
+    """
+    if agent_name_problem(worker):
+        return False
+    try:
+        with open(os.path.join(ASSIGNMENTS_DIR, worker)) as f:
+            return f.read().strip() == f'{slug}:{task_id}'
+    except OSError:
+        return False
 
 
 def break_dependency_cycles(nodes):
@@ -1181,10 +1228,15 @@ def build_task_graph(state):
             }
             worker = _task_graph_worker(meta)
             paneless = bool(set(meta.get('skills') or []) & PANELESS_SKILLS)
-            if worker and raw_status not in TERMINAL_STATUSES and not paneless:
+            if (worker and not paneless
+                    and raw_status in TASK_GRAPH_PANE_STATUSES
+                    and task_graph_assignment_holds(worker, slug, task_id)):
                 # crewvia のペイン名は `<AGENT_NAME>-<ROLE>` (start.sh)。Worker は
-                # `<名前>-worker`。完了済み task の worker 欄は履歴であって、今
-                # そのペインが居る場所ではない (名前は使い回される) ので出さない。
+                # `<名前>-worker`。終わった task の worker 欄は履歴であって、今
+                # そのペインが居る場所ではない (名前は使い回される)。だから
+                # 「card がまだ Worker のものだと言っている」(status) と
+                # 「公開中の assignment がこの task を指している」(事実) の
+                # **両方** が揃ったときにだけ出す。片方でも欠ければ出さない。
                 node['pane_match'] = f'{worker}-worker'
             mission_nodes.append(node)
 
@@ -1209,9 +1261,13 @@ def build_task_graph(state):
 TASK_GRAPH_LOCK_WAIT_SECONDS = 10.0
 TASK_GRAPH_LOCK_POLL_SECONDS = 0.02
 
-#: pending を拾って読み直す上限。通常は 0 回、諦めた実行が 1 つあれば 1 回。
-#: 上限は「読み直しが終わらない」ことだけを防ぐ。
-TASK_GRAPH_MAX_ROUNDS = 3
+#: 読み直しを繰り返す上限。**通常運用では到達しない安全弁** であって、
+#: 受け渡しの仕組みではない。読み直しが 1 回増えるのは「この publish の読み
+#: 取りを *始めたあと* に新しい要求が置かれた」ときだけなので、ここに届くには
+#: その並びが 32 回続く必要がある (= ロック待ちを諦めた実行が 32 回、毎回
+#: 読み取り窓の中に飛び込んでくる)。届いてしまった場合も要求は **消さずに**
+#: 残して手を引き、1 行報告する — 黙って落とす経路はどこにも作らない。
+TASK_GRAPH_MAX_ROUNDS = 32
 
 
 def _task_graph_lock_path(path):
@@ -1224,8 +1280,51 @@ def _task_graph_pending_path(path):
     return path + '.pending'
 
 
-def acquire_task_graph_lock(path):
+def _task_graph_pending_lock_path(path):
+    """印を触るあいだだけ取る小さなロック。"""
+    return path + '.pending.lock'
+
+
+@contextlib.contextmanager
+def task_graph_pending_lock(path):
+    """印の読み書きと、本ロックの解放とを、並べ替えさせないための小さなロック。
+
+    守るのは印そのものではなく、印と本ロックの **順序** である。受け渡しが
+    成立するかどうかは、次の 1 点だけに懸かっている:
+
+        「印が無いことを確認して本ロックを解放する」(保持者) と
+        「印を置く」(要求者) が、互いに割り込めないこと。
+
+    割り込めると、確認と解放のあいだに置かれた印を保持者が見ないまま手を引き、
+    要求者はもう誰も待っていないロックを諦めて帰る。その印は次に誰かが queue を
+    触るまで誰にも消費されず、**最後の queue 変更が無期限に見えないまま残る**。
+
+    そこで保持者は「確認 → 解放」をこのロックの中でまとめて行い、要求者は
+    「印を置く」をこのロックの中で行う。どちらが先にこのロックを取ったかで
+    順序が必ず決まるので、上の取りこぼしは構造として起きない。
+
+    保持時間はファイル 1 つの読み書きと flock の解放だけで、**キューロックには
+    一切触れない**。要求者はこのロックを持ったまま本ロックを待たない (持った
+    ままにすると、本ロックの保持者が確認に入れず互いに待つ) 。
+    """
+    lock_path = _task_graph_pending_lock_path(path)
+    os.makedirs(os.path.dirname(lock_path) or '.', exist_ok=True)
+    lf = open(lock_path, 'a+')
+    try:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(lf, fcntl.LOCK_UN)
+        finally:
+            lf.close()
+
+
+def acquire_task_graph_lock(path, wait_seconds=None):
     """publish を直列化するロックを取る。待ち切れなければ None。
+
+    `wait_seconds=0` は「1 回だけ試す」。要求を置いたあとに、いま保持者が
+    居るのかどうかを確かめるために使う (下の refresh_task_graph を参照)。
 
     **キューロックとは別物で、キューロックの内側からは決して取らない。**
     生成がキューロックの外であることは構造テストで固定されているので、
@@ -1240,10 +1339,12 @@ def acquire_task_graph_lock(path):
     失敗として 1 行報告される方の経路であって、混ぜると書き先が壊れている
     ときに「publish が混んでいる」と読める嘘の診断が出る。
     """
+    if wait_seconds is None:
+        wait_seconds = TASK_GRAPH_LOCK_WAIT_SECONDS
     lock_path = _task_graph_lock_path(path)
     os.makedirs(os.path.dirname(lock_path) or '.', exist_ok=True)
     lf = open(lock_path, 'a+')
-    deadline = time.monotonic() + TASK_GRAPH_LOCK_WAIT_SECONDS
+    deadline = time.monotonic() + wait_seconds
     while True:
         try:
             fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -1277,43 +1378,122 @@ def refresh_task_graph():
     commit された queue 変更をすべて含む。ロックはこの生成物専用で、
     **キューロックの保持時間は 1 ミリ秒も伸びない**。
 
-    待ち切れなかった実行は 1 バイトも書かず、pending の印だけ置いて引き返す。
-    今 publish している側の読み取りは自分の変更より前かもしれないからで、
-    印を見たロック保持者が読み直して publish し直す。諦めた側の変更を黙って
-    落とさないための出口である。
+    待ち切れなかった実行は 1 バイトも書かず、読み直しの要求だけを置いて引き返す。
+    今 publish している側の読み取りは自分の変更より前かもしれないからである。
+    その要求は **必ず誰かに拾われる**。受け渡しは次の 2 つの出口しかなく、
+    どちらか一方が必ず成立する:
+
+      (a) 要求を置いたあとに本ロックを取れた → **自分で publish する**。
+      (b) 取れなかった → そのとき本ロックを保持している実行が居る。その保持者の
+          最終確認は必ずこの要求より後に来る (task_graph_pending_lock の不変
+          条件) ので、**保持者が読み直す**。
+
+    (b) が言えるのは、保持者が「要求が無いことの確認」と「本ロックの解放」を
+    task_graph_pending_lock の中でまとめて行うからである。確認済みで解放前、
+    という中途半端な状態を外から観測できないので、要求を置いた時点でまだ本
+    ロックを持っている実行は、まだ確認していないことが確定する。
+
+    読み直しが要るかどうかは、**要求が置かれた時刻と、この publish が queue を
+    読み始めた時刻** の比較で決める。読み始めるより前に置かれた要求は、その
+    要求者の queue 変更 (要求より前に commit 済み) をこの publish が必ず含む
+    ので、消して終わってよい。だからラウンドが増えるのは「読み取り窓の中に
+    新しい要求が飛び込んだ」ときだけで、増えたラウンドは毎回、最新の queue を
+    publish するという必要な仕事をしている。
     """
     path = task_graph_path()
     lock = acquire_task_graph_lock(path)
     if lock is None:
+        # 1 バイトも書かず、要求だけを残す。置けたかどうかに関わらず (a) を
+        # 試す — 取れたなら自分で publish するのが最も確実な出口である。
         _mark_task_graph_pending(path)
-        return path
+        lock = acquire_task_graph_lock(path, wait_seconds=0.0)
+        if lock is None:
+            return path  # (b) 保持者が居る。その保持者が必ず読み直す。
+
+    released = False
+    rounds = 0
     try:
-        for _ in range(TASK_GRAPH_MAX_ROUNDS):
-            # queue を読む *前* に消す。読んだあとに現れた印だけが「自分の
-            # スナップショットに入っていない変更がある」を意味する。
-            _clear_task_graph_pending(path)
+        while True:
+            rounds += 1
+            # 読み取りを *始めた* 時刻。これより古い要求は、この publish に
+            # 含まれていることが言える (要求者は queue を書き終えてから
+            # ロックを待ち、諦めてから要求を置くため)。
+            read_started = time.monotonic_ns()
             graph = build_task_graph(load_state())
             _atomic_write(path, json.dumps(graph, ensure_ascii=False, indent=2) + '\n')
-            if not os.path.exists(_task_graph_pending_path(path)):
-                break
+            with task_graph_pending_lock(path):
+                if not _task_graph_pending_outstanding(path, read_started):
+                    # 未処理の要求は無い。消してから、同じ区間の中で解放する。
+                    _clear_task_graph_pending(path)
+                    released = True
+                    release_task_graph_lock(lock)
+                    return path
+                if rounds >= TASK_GRAPH_MAX_ROUNDS:
+                    # 病的な混み方。要求は **消さずに** 残して手を引く
+                    # (次に queue を触った実行が拾う) + 1 行報告する。
+                    released = True
+                    release_task_graph_lock(lock)
+                    print(
+                        f"[plan.sh warn] task-graph: 読み直しが "
+                        f"{TASK_GRAPH_MAX_ROUNDS} 回続いたので手を引きました "
+                        f"— 読み直しの要求は残してあります "
+                        f"(次の queue 変更で反映されます)",
+                        file=sys.stderr,
+                    )
+                    return path
     finally:
-        release_task_graph_lock(lock)
-    return path
+        if not released:
+            release_task_graph_lock(lock)
 
 
 def _mark_task_graph_pending(path):
-    """読み直しを頼む印を置く。置けなくても呼び出し側は失敗させない。"""
+    """読み直しを頼む要求を置く。置けなくても呼び出し側は失敗させない。
+
+    時刻は **単調時計** で書く。realtime だと NTP の巻き戻しで「読み取りより
+    前に置かれた」と誤読し、未処理の要求を消してしまう。単調時計は同じ機体の
+    全プロセスで同じ基準を持つので、プロセスをまたいだ比較にそのまま使える。
+    """
     try:
         pending = _task_graph_pending_path(path)
         os.makedirs(os.path.dirname(pending) or '.', exist_ok=True)
-        with open(pending, 'w') as f:
-            f.write(f"{os.getpid()}\n")
+        with task_graph_pending_lock(path):
+            with open(pending, 'w') as f:
+                f.write(f"{os.getpid()} {time.monotonic_ns()}\n")
     except OSError as e:
         print(
-            f"[plan.sh warn] task-graph: publish を待ち切れず、読み直しの印も "
+            f"[plan.sh warn] task-graph: publish を待ち切れず、読み直しの要求も "
             f"置けませんでした ({e}) — 次の queue 変更まで古い姿が残りえます",
             file=sys.stderr,
         )
+
+
+def _task_graph_pending_outstanding(path, read_started):
+    """まだ処理されていない読み直し要求があるか。**保持者が pending lock 内で呼ぶ。**
+
+    要求が無ければ False。要求の時刻が読み取り開始より後なら True (この
+    publish に入っていないかもしれない)。
+
+    読めない・形が違う要求は True に倒す — 余分な読み直しが 1 回増えるだけで、
+    失うものは何も無い。逆に「読めないから無かったことにする」と、要求者の
+    最後の変更が消える。
+
+    未来の時刻 (= 再起動をまたいで残った前の boot の残骸) は、要求として扱うと
+    永久に True を返し続けるので、処理済みとして消す側に倒す。
+    """
+    try:
+        with open(_task_graph_pending_path(path)) as f:
+            raw = f.read().split()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    try:
+        marked = int(raw[1])
+    except (IndexError, ValueError):
+        return True
+    if marked > time.monotonic_ns():
+        return False  # この boot のものではない残骸
+    return marked >= read_started
 
 
 def _clear_task_graph_pending(path):

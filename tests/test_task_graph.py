@@ -365,6 +365,18 @@ def sandbox(tmp_path):
             tdir.mkdir(parents=True, exist_ok=True)
             (tdir / f"{args[0]}.md").write_text(_task_md(*args, **kwargs))
 
+        def assign(self, worker, task_id, mission=MISSION):
+            """`plan.sh pull` が公開するのと同じ assignment を置く。
+
+            pane_match は card の `worker` 欄だけでは決まらない (名前は使い
+            回されるので、履歴の欄から「今どのペインに居るか」は言えない)。
+            「いま公開されている assignment がこの task を指している」が
+            もう一方の条件なので、fixture でも同じ事実を置く。
+            """
+            adir = queue / "assignments"
+            adir.mkdir(parents=True, exist_ok=True)
+            (adir / worker).write_text(f"{mission}:{task_id}\n")
+
         def add_mission(self, slug):
             (queue / "missions" / slug / "tasks").mkdir(parents=True, exist_ok=True)
             (queue / "missions" / slug / "mission.yaml").write_text(_mission_yaml(slug))
@@ -504,6 +516,7 @@ def test_pane_match_points_at_the_worker_pane(sandbox):
     sandbox.add_task("t001", "in_progress", [], worker="Ren")
     sandbox.add_task("t002", "done", [], worker="Ren")
     sandbox.add_task("t003", "pending", [], worker="null")
+    sandbox.assign("Ren", "t001")
     assert sandbox.run("task-graph").returncode == 0
     nodes = _by_id(sandbox.read_graph())
     assert nodes[f"{MISSION}:t001"]["pane_match"] == "Ren-worker"
@@ -511,6 +524,69 @@ def test_pane_match_points_at_the_worker_pane(sandbox):
     assert "pane_match" not in nodes[f"{MISSION}:t002"]
     # `worker: null` が文字列 "null" として入る既知の事故を拾わない
     assert "pane_match" not in nodes[f"{MISSION}:t003"]
+
+
+#: 「終わったのに worker 欄が残る」status。cmd_fail は completion を記録しつつ
+#: worker を残す (撤去するのは assignment だけ) ので、どれも TERMINAL_STATUSES
+#: には入らないまま Worker 名を持ち続ける。
+FINISHED_BUT_KEEPS_WORKER = ["failed", "cancelled", "verification_failed", "corrupted"]
+
+
+@pytest.mark.parametrize("status", FINISHED_BUT_KEEPS_WORKER)
+def test_a_finished_task_never_points_at_a_pane(sandbox, status):
+    """終了した task の worker 欄は、生きたペインの宛先ではない。
+
+    crewvia は Worker 名を使い回すので、Ren が次の task に移ったあと、この
+    node は **無関係な task のペイン** を指す。`plan.sh fail` が AGENT_NAME
+    無しで呼ばれると assignment すら残るので、status 側でも必ず弾く。
+    """
+    sandbox.add_task("t001", status, [], worker="Ren")
+    sandbox.assign("Ren", "t001")  # 撤去され損ねた assignment
+    assert sandbox.run("task-graph").returncode == 0
+    node = _by_id(sandbox.read_graph())[f"{MISSION}:t001"]
+    assert "pane_match" not in node, (
+        f"終了した task ({status}) に pane_match が付いている: "
+        f"{node.get('pane_match')!r}"
+    )
+
+
+def test_pane_match_follows_the_live_assignment_not_the_card(sandbox):
+    """名前の使い回し — assignment が別の task を指していれば出さない。
+
+    Ren は前の card (t001) の worker 欄に名前を残したまま、今は t002 に就いて
+    いる。card だけを根拠にすると、t001 の node が「今の Ren のペイン」を
+    指してしまう。
+    """
+    sandbox.add_task("t001", "needs_director", [], worker="Ren")
+    sandbox.add_task("t002", "in_progress", [], worker="Ren")
+    sandbox.assign("Ren", "t002")
+    assert sandbox.run("task-graph").returncode == 0
+    nodes = _by_id(sandbox.read_graph())
+    assert "pane_match" not in nodes[f"{MISSION}:t001"], (
+        "assignment が指していない task に pane_match が付いている: "
+        f"{nodes[f'{MISSION}:t001'].get('pane_match')!r}"
+    )
+    assert nodes[f"{MISSION}:t002"]["pane_match"] == "Ren-worker"
+
+
+def test_a_waiting_worker_still_points_at_its_pane(sandbox):
+    """判断待ち・検証待ちは「終わった」ではない — ペインはまだそこに居る。
+
+    needs_director は Director が **いちばんペインに飛びたい** 状態なので、
+    終了状態を弾くついでに巻き添えで消していないことを対照で見る。
+    """
+    for i, status in enumerate(
+        ["in_progress", "verifying", "ready_for_verification",
+         "needs_director", "needs_human_review"],
+        start=1,
+    ):
+        task_id = f"t00{i}"
+        sandbox.add_task(task_id, status, [], worker=f"W{i}")
+        sandbox.assign(f"W{i}", task_id)
+    assert sandbox.run("task-graph").returncode == 0
+    nodes = _by_id(sandbox.read_graph())
+    for i in range(1, 6):
+        assert nodes[f"{MISSION}:t00{i}"]["pane_match"] == f"W{i}-worker"
 
 
 # --- plan.sh への接続 --------------------------------------------------------
@@ -748,6 +824,157 @@ def test_a_stale_snapshot_never_overwrites_a_newer_one(sandbox, tmp_path):
         "古いスナップショットが新しい姿を上書きした "
         f"(status={status!r}) — 次に queue を触る者が居なければ、この誤った "
         "running は無期限に残る"
+    )
+
+
+#: 要求者が「ロックを待ち切れなかった」に入るまでの上限。本番は 10 秒だが、
+#: 待ち時間そのものは仕組みではないので harness 側で短くして演じさせる。
+REQUESTER_LOCK_WAIT = 0.05
+
+#: 要求者が要求を置く地点まで進むのを待つ時間。直っていれば要求者はここで
+#: pending lock を待って止まる (= 帰ってこない) ので、終了は待てない。
+REQUESTER_GRACE = 2.0
+
+
+def _publisher(sandbox, tmp_path, *, gate, name, lock_wait=None):
+    """harness を 1 つ起動する (本番の refresh_task_graph() をそのまま走らせる)。"""
+    argv = [
+        sys.executable, str(HARNESS),
+        "--plan", str(sandbox.root / "scripts" / "plan.sh"),
+        "--queue", str(sandbox.queue), "--repo-root", str(sandbox.root),
+        "--gate", gate,
+    ]
+    if gate != "none":
+        argv += ["--reached", str(tmp_path / f"{name}.reached"),
+                 "--go", str(tmp_path / f"{name}.go")]
+    if lock_wait is not None:
+        argv += ["--lock-wait", str(lock_wait)]
+    return subprocess.Popen(
+        argv, env=sandbox.env(), stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, text=True,
+    )
+
+
+def test_a_request_placed_at_the_moment_of_release_is_never_orphaned(sandbox, tmp_path):
+    """解放の *直前* に置かれた読み直しの要求が、誰にも拾われずに残らないこと。
+
+    取りこぼしはこの一瞬でしか起きない。保持者が「要求は無い」と確認したあと、
+    まだロックを解放しきらないうちに、待ち切れなかった側が要求を置く。保持者は
+    もう見に来ないし、要求者はもう待っていない。置かれた要求は次に誰かが queue
+    を触るまで誰にも消費されず、**最後の queue 変更 (t002) が無期限に見えない
+    まま残る** —— 「次のコマンドが直す」は、次のコマンドがある場合の話でしかない。
+
+    直っていれば出口は 2 つしかなく、どちらかが必ず成立する:
+      (a) 要求者が解放されたロックを取って自分で publish する
+      (b) 保持者が要求を見て読み直す
+    このシナリオが踏ませるのは (a) —— 保持者は確認と解放を一区間で終えるので、
+    要求者は「確認済みで解放前」に要求を置けず、必ず解放後に置いて自分で publish
+    することになる。
+    """
+    sandbox.add_task("t001", "pending", [])
+    assert sandbox.run("task-graph").returncode == 0
+    assert f"{MISSION}:t002" not in _by_id(sandbox.read_graph())
+
+    holder = _publisher(sandbox, tmp_path, gate="release", name="holder")
+    requester = None
+    try:
+        # 保持者は publish を終え、「要求は無い」と確認し、解放の直前で止まった
+        _wait_for_file(tmp_path / "holder.reached", 10.0, "保持者の解放直前の印")
+
+        # 世界が進む。**これが最後の queue 変更** — 誰も拾わなければ永久に映らない
+        sandbox.add_task("t002", "in_progress", [], worker="Ren")
+        sandbox.assign("Ren", "t002")
+
+        requester = _publisher(sandbox, tmp_path, gate="none", name="requester",
+                               lock_wait=REQUESTER_LOCK_WAIT)
+        try:
+            # 直っていれば要求者はここで止まる (要求を置く区間が保持者と排他)。
+            # 直っていなければ要求だけ置いて先に帰る — どちらでも次に進める。
+            requester.wait(timeout=REQUESTER_GRACE)
+        except subprocess.TimeoutExpired:
+            pass
+    finally:
+        (tmp_path / "holder.go").write_text("go")
+        h_out, h_err = holder.communicate(timeout=60)
+        assert holder.returncode == 0, f"保持者が失敗した: {h_err or h_out}"
+        if requester is not None:
+            r_out, r_err = requester.communicate(timeout=60)
+            assert requester.returncode == 0, f"要求者が失敗した: {r_err or r_out}"
+
+    nodes = _by_id(sandbox.read_graph())
+    assert f"{MISSION}:t002" in nodes, (
+        "解放の直前に置かれた読み直しの要求が誰にも拾われていない — "
+        f"最後の queue 変更 (t002) が publish されないまま残った: {sorted(nodes)}"
+    )
+    leftover = pathlib.Path(str(sandbox.graph) + ".pending")
+    assert not leftover.exists(), (
+        f"消費されないまま残った読み直しの要求がある: {leftover}"
+    )
+
+
+def test_the_holder_picks_up_a_request_placed_while_it_was_publishing(sandbox, tmp_path):
+    """publish の最中に置かれた要求は、保持者が読み直して消費すること (出口 b)。
+
+    要求者はロックを取れないまま帰るので、拾えるのは保持者しか居ない。保持者が
+    「自分の読み取りより後に置かれた要求」を読み直しの合図として扱えていないと、
+    ここで t002 が落ちる。
+    """
+    sandbox.add_task("t001", "pending", [])
+    assert sandbox.run("task-graph").returncode == 0
+
+    holder = _publisher(sandbox, tmp_path, gate="publish", name="holder")
+    requester = None
+    try:
+        # 保持者は queue を読み終え、生成物を書く直前で止まった
+        _wait_for_file(tmp_path / "holder.reached", 10.0, "保持者の publish 直前の印")
+
+        sandbox.add_task("t002", "in_progress", [], worker="Ren")
+        sandbox.assign("Ren", "t002")
+
+        requester = _publisher(sandbox, tmp_path, gate="none", name="requester",
+                               lock_wait=REQUESTER_LOCK_WAIT)
+        r_out, r_err = requester.communicate(timeout=60)
+        assert requester.returncode == 0, f"要求者が失敗した: {r_err or r_out}"
+        # 要求者は 1 バイトも書いていない (ロックを取れていないので)
+        assert f"{MISSION}:t002" not in _by_id(sandbox.read_graph())
+    finally:
+        (tmp_path / "holder.go").write_text("go")
+        h_out, h_err = holder.communicate(timeout=60)
+        assert holder.returncode == 0, f"保持者が失敗した: {h_err or h_out}"
+
+    nodes = _by_id(sandbox.read_graph())
+    assert f"{MISSION}:t002" in nodes, (
+        "publish 中に置かれた要求を保持者が読み直していない — "
+        f"要求者の変更 (t002) が落ちた: {sorted(nodes)}"
+    )
+    assert not pathlib.Path(str(sandbox.graph) + ".pending").exists()
+
+
+def test_the_release_is_decided_inside_the_pending_lock(tree):
+    """「要求が無いことの確認」と「本ロックの解放」が同じ区間にあること。
+
+    受け渡しが成立する根拠はこの入れ子だけである。解放が区間の外に出た瞬間、
+    「確認済みで解放前」という中途半端な状態が外から観測できるようになり、
+    そこに置かれた要求は誰にも拾われない。挙動テストはその一瞬を狙って開けて
+    いるが、構造としても固定しておく (順序が崩れても、狙う一瞬は残るため)。
+    """
+    funcs = _functions(tree)
+    assert "refresh_task_graph" in funcs
+    inside = []
+    for node in ast.walk(funcs["refresh_task_graph"]):
+        if not isinstance(node, ast.With):
+            continue
+        if not any(isinstance(i.context_expr, ast.Call)
+                   and _call_name(i.context_expr) == "task_graph_pending_lock"
+                   for i in node.items):
+            continue
+        inside += [
+            c for c in ast.walk(node)
+            if isinstance(c, ast.Call) and _call_name(c) == "release_task_graph_lock"
+        ]
+    assert inside, (
+        "release_task_graph_lock() が task_graph_pending_lock() の区間の中から "
+        "呼ばれていない — 確認と解放のあいだに置かれた要求を誰も拾えなくなる"
     )
 
 

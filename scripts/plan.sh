@@ -29,6 +29,9 @@ set -euo pipefail
 #                              1 バイトも書かずに exit 3 (詳細は cmd_retire)
 #                              --no-wait: キューロックを待たずに諦め exit 4。
 #                              待てない常駐デーモン (watchdog) 用
+#   plan.sh task-graph          herdr-task-graph 用の tasks.json を書き出す
+#                              （queue は変更しない。普段は queue を書き換える
+#                                サブコマンドが自動で呼ぶ）
 #   plan.sh status [--mission <slug>] [--all]
 #   plan.sh archive <slug>
 
@@ -37,7 +40,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 QUEUE_DIR="${CREWVIA_QUEUE:-${REPO_ROOT}/queue}"
 
 if [[ $# -eq 0 ]]; then
-  echo "Usage: plan.sh <init|add|pull|done|needs-director|fail|update|retire|ready-for-verification|verify-result|review|launch|lint|status|archive|dashboard|dashboard-data> [args...]" >&2
+  echo "Usage: plan.sh <init|add|pull|done|needs-director|fail|update|retire|ready-for-verification|verify-result|review|launch|task-graph|lint|status|archive|dashboard|dashboard-data> [args...]" >&2
   exit 1
 fi
 
@@ -778,8 +781,13 @@ def save_task(slug, task_id, meta, body):
     _atomic_write(task_path(slug, task_id), serialize_frontmatter(meta, body))
 
 
-def list_tasks(slug, base_dir=None):
-    """Return list of (meta, body) sorted by tNNN."""
+def list_tasks(slug, base_dir=None, quiet=False):
+    """Return list of (meta, body) sorted by tNNN.
+
+    quiet=True は「同じ実行の中で 2 回目以降に読む」呼び出し用。破損した task に
+    ついての hint 付き警告は 1 回出れば十分で、コマンド本体と task-graph の生成が
+    同じ警告を二重に出すと、読む側は 2 件壊れていると誤読する。
+    """
     tdir = base_dir if base_dir else tasks_dir(slug)
     if not os.path.exists(tdir):
         return []
@@ -802,13 +810,14 @@ def list_tasks(slug, base_dir=None):
             # or freeze dispatch for the whole mission (t009). Surface it as a
             # [破損] pseudo-task — visible, but never 'pending' or terminal —
             # and keep going so every other task file is still usable.
-            print(
-                f"[plan.sh warn] failed to parse {path}: {e}\n"
-                f"  hint: task files start with `---` / frontmatter / `---` / "
-                f"`## Description` / `## Result` (see existing tNNN.md for the template).\n"
-                f"  showing as [破損] task; other tasks are unaffected.",
-                file=sys.stderr,
-            )
+            if not quiet:
+                print(
+                    f"[plan.sh warn] failed to parse {path}: {e}\n"
+                    f"  hint: task files start with `---` / frontmatter / `---` / "
+                    f"`## Description` / `## Result` (see existing tNNN.md for the template).\n"
+                    f"  showing as [破損] task; other tasks are unaffected.",
+                    file=sys.stderr,
+                )
             task_id = fn[:-len('.md')]
             meta = {
                 'id': task_id,
@@ -835,6 +844,263 @@ def list_tasks(slug, base_dir=None):
             meta['blocked_by'] = []
         out.append((meta, body))
     return out
+
+
+# ---------------------------------------------------------------------------
+# Dependency readiness — 「依存が満たされた」の唯一の定義
+# ---------------------------------------------------------------------------
+
+#: 「この依存はもう完了しない」ことが確定している status。crewvia はこれらを
+#: 満たされた扱いにして下流を進める — QA が FAIL した直後に、その fix task まで
+#: 永久に止まってしまうのを避けるため。
+DEAD_DEP_STATUSES = ('failed', 'cancelled')
+
+
+def unmet_dependencies(blocked_by, done_ids, task_statuses):
+    """`blocked_by` のうち、まだ満たされていない依存の一覧を返す。
+
+    この規則は crewvia の中で 1 箇所しか持たない。pull が「割り当ててよいか」を
+    決める規則と、task-graph が書き出す READY / WAIT は同じものでなければ
+    ならない。分裂した瞬間、QA FAIL の直後 —— 「次に何が動けるのか」を最も知り
+    たい瞬間 —— にだけ、実際は dispatch される task を DAG が WAIT と表示する。
+
+    存在しない task への依存 (dangling) は `task_statuses` に無いので unmet 側に
+    落ちる。crewvia の pull もそう扱う (永久に blocked) ので、ここでも同じ。
+    """
+    return [dep for dep in (blocked_by or [])
+            if dep not in done_ids and task_statuses.get(dep) not in DEAD_DEP_STATUSES]
+
+
+# ---------------------------------------------------------------------------
+# herdr-task-graph 連携（任意の付加機能）
+# ---------------------------------------------------------------------------
+#
+# active mission の全 task を herdr plugin `herdr-task-graph` の入力形式で
+# 書き出す。crewvia はこの plugin が無くても完全に動く — 生成の失敗も、生成を
+# 止めたことも、plan.sh の終了コードや動作を一切変えてはいけない。
+#
+# 生成を呼ぶのは queue を書き換えるサブコマンドの **後** (キューロックの外)。
+# 常駐プロセスは増やさない。dispatcher のサイクルにも載せない — dispatcher が
+# 死んでいる間こそ「今どうなっているか」を見たいのに、そこに載せると更新が
+# 止まるため。
+
+#: queue を書き換えるサブコマンド = 生成を呼ぶ経路。正は冒頭の usage 行と
+#: 末尾の dispatch テーブル (tests/test_task_graph.py が突き合わせる)。
+QUEUE_MUTATING_SUBCOMMANDS = {
+    'init', 'add', 'pull', 'done', 'needs-director', 'fail', 'update', 'retire',
+    'ready-for-verification', 'verify-result', 'review', 'launch', 'archive',
+}
+
+#: queue を読むだけのサブコマンド = 生成を呼ばない経路。
+#: `task-graph` 自身もここ (queue は書き換えず、生成物だけを書く)。
+QUEUE_READONLY_SUBCOMMANDS = {
+    'lint', 'status', 'resync', 'dashboard-data', 'task-graph',
+}
+
+#: crewvia の status → (plugin の status, title に付ける印)。
+#: plugin 側は 6 状態 (done/running/blocked/ready/waiting/failed) しか持たない
+#: ので、同じ状態に畳まれるものは印で見分ける。`pending` だけは依存の状態で
+#: ready / waiting に分かれるため、ここではなく build_task_graph() が決める。
+TASK_GRAPH_STATUS_MAP = {
+    'done':                   ('done',    None),
+    'verified':               ('done',    None),
+    'skipped':                ('done',    '[skip]'),
+    'in_progress':            ('running', None),
+    'verifying':              ('running', None),
+    'failed':                 ('failed',  None),
+    'verification_failed':    ('failed',  '[検証NG]'),
+    # (c) blocked_reason 付きで明示的に止められている
+    'blocked':                ('blocked', '[停止]'),
+    # (b) 人間の判断待ち。(a) 依存待ち (= waiting) とは plugin の状態そのもので
+    #     分かれ、(c) とは印で分かれる。
+    'needs_director':         ('blocked', '[要判断]'),
+    'needs_human_review':     ('blocked', '[要判断]'),
+    'ready_for_verification': ('blocked', '[要判断]'),
+    # パース失敗。title は list_tasks が既に `[破損] ...` にしている。
+    CORRUPT_TASK_STATUS:      ('failed',  None),
+}
+
+#: 表に無い status。done にも ready にも倒さない — 「進んでよい」と読める側に
+#: 倒すと、知らない状態が黙って実行可能に見える。
+TASK_GRAPH_UNKNOWN = ('blocked', '[status不明]')
+
+
+def task_graph_enabled():
+    """停止スイッチ。`CREWVIA_TASK_GRAPH=0` で生成を完全に止める。
+
+    生成は plan.sh の queue 変更経路すべてに乗り、全 Worker と両デーモンが叩く。
+    「重い・壊れた」が分かったときに revert PR しか道が無い状態にしないための
+    退避路であって、plugin の有無とは別の話。
+    """
+    return os.environ.get('CREWVIA_TASK_GRAPH', '1').strip().lower() not in (
+        '0', 'false', 'off', 'no',
+    )
+
+
+def task_graph_repo_root():
+    """生成物を置くリポジトリ。`CREWVIA_REPO_ROOT` を優先する。
+
+    REPO_ROOT はスクリプトの位置 (`dirname $0/..`) で決まるので、Worker が
+    worktree 側の plan.sh を叩くと worktree の registry を指す。そこに書くと、
+    Director が開いているファイルは Worker の pull / done では一切更新されない
+    — このミッションの中心価値だけが、隔離テストには映らない形で失われる。
+    plan.sh は既に retirement_reservation() と cmd_done の bump-task-count で
+    同じ優先順を使っている。
+    """
+    return os.environ.get('CREWVIA_REPO_ROOT') or REPO_ROOT
+
+
+def task_graph_path():
+    """生成物のパス。`CREWVIA_TASK_GRAPH_FILE` で上書きできる。
+
+    既定は `<root>/registry/task-graph/tasks.json` — crewvia 側を正とし、plugin
+    には `HERDR_TASKS_FILE` でここを参照させる。plugin の config dir に直接書く
+    案は採らない: 書き先が plugin の内部レイアウトに依存し、plugin が無い環境や
+    別バージョンで壊れる。crewvia の中に置けば、plugin が無くても
+    `plan.sh task-graph` の出力として意味を持つ。
+    """
+    explicit = os.environ.get('CREWVIA_TASK_GRAPH_FILE', '').strip()
+    if explicit:
+        return os.path.abspath(os.path.expanduser(explicit))
+    return os.path.join(task_graph_repo_root(), 'registry', 'task-graph', 'tasks.json')
+
+
+def task_graph_queue_matches_root():
+    """今いじっている queue が、生成物を置くリポジトリの queue かどうか。
+
+    本番では start.sh が `CREWVIA_QUEUE=$CREWVIA_REPO_ROOT/queue` を必ず export
+    するので、この条件は常に成り立つ。成り立たないのは `CREWVIA_QUEUE` だけを
+    別の場所に向けた実行 (隔離テストなど) で、そのとき本体の registry を
+    上書きすると Director が開いているファイルにテスト用の queue が映る。
+    書き先を明示された場合 (`CREWVIA_TASK_GRAPH_FILE`) は呼び出し側の意図が
+    はっきりしているので、この判定は挟まない。
+    """
+    if os.environ.get('CREWVIA_TASK_GRAPH_FILE', '').strip():
+        return True
+    try:
+        expected = os.path.join(task_graph_repo_root(), 'queue')
+        return os.path.realpath(QUEUE_DIR) == os.path.realpath(expected)
+    except OSError:
+        return False
+
+
+def _task_graph_worker(meta):
+    """task の `worker` 欄を Worker 名として読む。無ければ None。
+
+    `plan.sh update --worker null` が `worker: "null"` (引用符付きの文字列) を
+    書く既知の事故があるので、文字列としての null も不在として扱う。
+    """
+    worker = meta.get('worker')
+    if not isinstance(worker, str):
+        return None
+    worker = worker.strip()
+    if not worker or worker.lower() in ('null', 'none', '~'):
+        return None
+    return worker
+
+
+def build_task_graph(state):
+    """active mission 全部を plugin の入力形式に変換する。
+
+    id は `<slug>:<tNNN>` に修飾する。mission をまたぐと t001 が衝突するため。
+    `depends_on` も同じ修飾で解決する (blocked_by は mission 内の id)。
+    """
+    slugs = [s for s in (state.get('active_missions') or []) if s]
+    nodes = []
+    for slug in slugs:
+        if not os.path.isdir(mission_dir(slug)):
+            continue
+        tasks = list_tasks(slug, quiet=True)
+        done_ids = {m['id'] for (m, _) in tasks if m.get('status') in TERMINAL_STATUSES}
+        task_statuses = {m['id']: m.get('status') for (m, _) in tasks}
+        for (meta, _body) in tasks:
+            task_id = meta.get('id')
+            if not task_id:
+                continue
+            raw_status = meta.get('status')
+            blocked_by = [d for d in (meta.get('blocked_by') or []) if d]
+            if raw_status == 'pending':
+                # crewvia 側で READY を導出して明示的に書く。plugin の導出に
+                # 委ねると、`failed` の依存を満たされた扱いにする crewvia の
+                # 規則が伝わらず、QA FAIL 直後だけ WAIT と表示される。
+                unmet = unmet_dependencies(blocked_by, done_ids, task_statuses)
+                status = 'waiting' if unmet else 'ready'
+                marker = None
+            else:
+                status, marker = TASK_GRAPH_STATUS_MAP.get(raw_status, TASK_GRAPH_UNKNOWN)
+
+            markers = [marker] if marker else []
+            # 存在しない task への依存は depends_on に出さない (plugin 側で
+            # 解決できない参照になる) が、黙って消すと依存が無いように見える
+            # ので title に残す。status は unmet 側に落ちているので WAIT。
+            dangling = sorted({d for d in blocked_by if d not in task_statuses})
+            if dangling:
+                markers.append('[依存不明: ' + ', '.join(dangling) + ']')
+            title = meta.get('title') or task_id
+            if markers:
+                title = ' '.join(markers) + ' ' + str(title)
+
+            # depends_on は依存が無くても `[]` で必ず出す。省略が許されるかは
+            # plugin の schema 次第だが、空リストはどちらの読み方でも通る。
+            node = {
+                'id': f'{slug}:{task_id}',
+                'title': str(title),
+                'depends_on': [f'{slug}:{d}' for d in blocked_by if d in task_statuses],
+                'status': status,
+            }
+            worker = _task_graph_worker(meta)
+            if worker and raw_status not in TERMINAL_STATUSES:
+                # crewvia のペイン名は `<AGENT_NAME>-<ROLE>` (start.sh)。Worker は
+                # `<名前>-worker`。完了済み task の worker 欄は履歴であって、今
+                # そのペインが居る場所ではない (名前は使い回される) ので出さない。
+                node['pane_match'] = f'{worker}-worker'
+            nodes.append(node)
+
+    if len(slugs) == 1:
+        title = f'crewvia / {slugs[0]}'
+    else:
+        title = f'crewvia / {len(slugs)} missions'
+    return {'title': title, 'tasks': nodes}
+
+
+def refresh_task_graph():
+    """生成物を書き出す。tmp + os.replace で原子的に置き換える。
+
+    複数の plan.sh が同時にここへ来ることはありうる (生成はキューロックの外)。
+    tmp は pid 別なので互いを壊さず、読み手が半端な JSON を見ることもない。
+    「先に queue を読んだ側が後に書く」並びになると一瞬だけ古い姿が残るが、
+    次に queue を書き換えたコマンドが上書きして解ける。ここでロックを増やして
+    まで直す価値のある種類のズレではない。
+    """
+    path = task_graph_path()
+    graph = build_task_graph(load_state())
+    _atomic_write(path, json.dumps(graph, ensure_ascii=False, indent=2) + '\n')
+    return path
+
+
+def maybe_refresh_task_graph(subcommand):
+    """queue を書き換えたあとに生成を 1 回だけ呼ぶ。失敗しても何も壊さない。
+
+    **キューロックの外から呼ぶこと。** ロック保持中に全 mission の走査を足すと、
+    その分だけ全 Worker の pull が待たされる。
+    """
+    if subcommand not in QUEUE_MUTATING_SUBCOMMANDS:
+        return
+    if not task_graph_enabled():
+        return  # 1 バイトも書かず、ログも出さない
+    if not task_graph_queue_matches_root():
+        print(
+            f"[plan.sh warn] task-graph: CREWVIA_QUEUE ({QUEUE_DIR}) が "
+            f"{task_graph_repo_root()}/queue ではないので生成しません "
+            f"(書き先を指定するなら CREWVIA_TASK_GRAPH_FILE)",
+            file=sys.stderr,
+        )
+        return
+    try:
+        refresh_task_graph()
+    except (Exception, SystemExit) as e:
+        # 黙って捨てない。ただし本体の終了コードには触らない。
+        print(f"[plan.sh warn] task-graph の生成に失敗しました: {e}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -1665,8 +1931,7 @@ def cmd_pull(args):
                     # failed/cancelled deps are excluded — they indicate the dep will
                     # never complete, so the downstream task should not be blocked.
                     bb = meta.get('blocked_by') or []
-                    unmet = [dep for dep in bb if dep not in done_ids
-                             and task_statuses.get(dep) not in ('failed', 'cancelled')]
+                    unmet = unmet_dependencies(bb, done_ids, task_statuses)
                     if unmet:
                         die(
                             f"task '{specific_task}' is blocked by unfinished dependencies: "
@@ -1709,8 +1974,7 @@ def cmd_pull(args):
                 bb = meta.get('blocked_by') or []
                 # failed/cancelled deps do not block: they indicate the dep will
                 # never complete, so the downstream task should remain eligible.
-                if any(dep not in done_ids and task_statuses.get(dep) not in ('failed', 'cancelled')
-                       for dep in bb):
+                if unmet_dependencies(bb, done_ids, task_statuses):
                     blocked_count += 1
                     continue
                 candidates.append((slug, meta, body))
@@ -2921,6 +3185,23 @@ def cmd_launch(args):
     with_lock(_do)
 
 
+def cmd_task_graph(args):
+    """Usage: plan.sh task-graph
+
+    herdr-task-graph 用の tasks.json を今すぐ書き出してパスを印字する。
+    queue は変更しない。普段は queue を書き換えるサブコマンドが自動で呼ぶので、
+    これを使うのは初回のブートストラップと、生成結果を目で見たいときだけ。
+    """
+    parse_opts(args, {})
+    if not task_graph_enabled():
+        print(
+            "[plan.sh] CREWVIA_TASK_GRAPH=0 のため生成しません",
+            file=sys.stderr,
+        )
+        return
+    print(refresh_task_graph())
+
+
 def cmd_lint(args):
     opts, positional = parse_opts(args, {'--strict': 'bool', '--mission': 'value'})
     slug = opts.get('--mission') or (positional[0] if positional else None)
@@ -3478,6 +3759,7 @@ dispatch = {
     'verify-result': cmd_verify_result,
     'review': cmd_review,
     'launch': cmd_launch,
+    'task-graph': cmd_task_graph,
     'lint': cmd_lint,
     'status': cmd_status,
     'archive': cmd_archive,
@@ -3490,5 +3772,28 @@ if SUBCOMMAND not in dispatch:
     print(f"Available: {', '.join(dispatch)}", file=sys.stderr)
     sys.exit(1)
 
-dispatch[SUBCOMMAND](ARGS)
+
+def _exit_code_of(exc):
+    """SystemExit が運ぶ終了コード。code は int / str / None のいずれでもありうる。"""
+    code = exc.code
+    if isinstance(code, int):
+        return code
+    return 0 if code is None else 1
+
+
+# 生成はここ — キューロックの外、コマンドが終わったあと。
+# 失敗した実行のあとでも呼ぶ: 途中まで書いて die() したケースがありうるので、
+# 「成功したときだけ」に絞ると DAG がその分だけ古いまま残る。
+# 例外は LOCK_BUSY (ロックを取れず 1 バイトも書かずに引き返した実行) で、
+# これは watchdog が監視ループの中から同期で叩く経路。何も書いていないと
+# 分かっている実行のあとに全 mission を走査し直すのは、キューが混んでいる
+# まさにその瞬間に足す純粋な無駄になる。
+try:
+    dispatch[SUBCOMMAND](ARGS)
+except SystemExit as _e:
+    if _exit_code_of(_e) != LOCK_BUSY:
+        maybe_refresh_task_graph(SUBCOMMAND)
+    raise
+else:
+    maybe_refresh_task_graph(SUBCOMMAND)
 PYEOF

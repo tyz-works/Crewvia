@@ -2599,6 +2599,11 @@ def _pull_parked_inside_the_queue_lock(sandbox, *, skills="code"):
     env["CREWVIA_QUEUE"] = str(sandbox.queue)
     env["CREWVIA_REPO_ROOT"] = str(sandbox.root)
     env["AGENT_NAME"] = AGENT
+    # FIFO の card は **1 回しか読めない**。plan.sh は queue を書き換えたあと、
+    # キューロックの外で task-graph を作り直す = card をもう一度読みに行くので、
+    # 有効なままだと 2 回目の open が書き手を待って永久に止まる。ここで見たいのは
+    # pull のトランザクションの張り方だけなので、付加機能は落としておく。
+    env["CREWVIA_TASK_GRAPH"] = "0"
     proc = subprocess.Popen(
         ["bash", str(sandbox.scripts / "plan.sh"), "pull",
          "--mission", SLUG, "--agent", AGENT, "--skills", skills],

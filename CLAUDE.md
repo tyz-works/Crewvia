@@ -48,7 +48,9 @@
     worker.md           Workerのシステムプロンプト
   scripts/
     start.sh            マルチエージェント起動スクリプト
-    plan.sh             タスクプラン管理 CLI（per-task / multi-mission）
+    plan.sh             タスクプラン管理 CLI（per-task / multi-mission）。queue を書き換える
+                        サブコマンドの後、キューロックの外で `registry/task-graph/tasks.json`
+                        を再生成する（herdr-task-graph 連携。`CREWVIA_TASK_GRAPH=0` で停止）
     dispatcher.sh       並列モードの常駐割り当てデーモン（idle Worker への自動 assign + codex-review spawn）
                         **仕事の割り当ての判定者**（queue/ を読む唯一のデーモン）
     watchdog.py         Worker 生存監視デーモン（idle 判定・pane 消滅の検知と kill）
@@ -81,6 +83,9 @@
     heartbeats/         watchdog 監視用
     mux/                mux バックエンドのタブ/ペイン ID キャッシュ（.gitignore 対象）
     retirements/        Worker 終了要求と進捗（dispatcher→watchdog の引き渡し。.gitignore 対象）
+    task-graph/         herdr-task-graph 用の `tasks.json`（.gitignore 対象）。queue を
+                        書き換える plan.sh サブコマンドの後、キューロックの外で再生成される。
+                        手動で書き出すなら `plan.sh task-graph`
     daemons/            dispatcher/watchdog 相互監視の heartbeat・pause マーカー・respawn 履歴
                         （.gitignore 対象）。hooks/post-tool-use.sh の同時死 backstop（t008）が
                         throttle マーカー（backstop-notify.throttle）を置く場所でもある
@@ -116,6 +121,8 @@
 | `CREWVIA_DAEMON_DISPATCHER_STALE_SECONDS` / `CREWVIA_DAEMON_WATCHDOG_STALE_SECONDS` | 相互監視の stale 判定しきい値（既定 60 秒 / 240 秒）。`config/crewvia.yaml` の `daemons.dispatcher_stale_seconds` / `daemons.watchdog_stale_seconds` より優先。`hooks/post-tool-use.sh` の同時死 backstop（t008）も同じ変数名・同じ既定値を読む（`knowledge/daemon-authority.md` §7-13） |
 | `CREWVIA_DAEMON_FLAP_WINDOW_SECONDS` / `CREWVIA_DAEMON_FLAP_THRESHOLD` | flap ガード: この秒数の窓（既定 900）でこの回数（既定 3）respawn したら自動 respawn を止め Director に報告する。`config/crewvia.yaml` の `daemons.flap_window_seconds` / `daemons.flap_threshold` より優先 |
 | `CREWVIA_DAEMON_RESPAWN_GRACE_SECONDS` / `CREWVIA_DAEMON_PAUSE_REPORT_AFTER_SECONDS` / `CREWVIA_DAEMON_HOLD_REPORT_AFTER_SECONDS` / `CREWVIA_DAEMON_WATCH_LOCK_TIMEOUT_SECONDS` / `CREWVIA_DAEMON_MAINTENANCE_LOCK_TIMEOUT_SECONDS` | 相互監視の残りのしきい値（既定 120 / 1800 / 1800 / 2 / 60 秒）。`config/crewvia.yaml` の `daemons:` ブロック（コメント付き）より優先。詳細: `knowledge/daemon-authority.md` §7-8 |
+| `CREWVIA_TASK_GRAPH` | herdr-task-graph 用 `tasks.json` の生成 ON/OFF。既定は有効、`0` で完全に無効（1 バイトも書かず、ログも出さない）。生成は queue を書き換える plan.sh サブコマンドすべてに乗るので、重い・壊れたときの退避路として残してある |
+| `CREWVIA_TASK_GRAPH_FILE` | 生成物の書き先。既定は `$CREWVIA_REPO_ROOT/registry/task-graph/tasks.json`（未設定時のみ plan.sh の位置基準にフォールバック）。plugin 側にはこのパスを `HERDR_TASKS_FILE` で参照させる |
 | `CREWVIA_MUX` | mux バックエンド選択: `tmux` / `herdr`。config `mode:` より優先 |
 | `CREWVIA_MUX_ENABLED` | 並列モード有効化: `1` で並列 ON（`CREWVIA_MUX` 未設定時の tmux fallback）/ `0` でインラインモード強制。`CREWVIA_MUX` が設定済みなら不要 |
 | `CREWVIA_TMUX_SESSION` | tmux backend が使うセッション名（デフォルト: `crewvia`） |

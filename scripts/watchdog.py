@@ -35,6 +35,7 @@ import sys
 import time
 import urllib.request
 import urllib.error
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal, NamedTuple, Optional
 
@@ -188,6 +189,34 @@ def parse_yaml(text: str) -> dict:
             result[key] = _scalar(val)
             i += 1
     return result
+
+
+def parse_iso_epoch(value) -> Optional[float]:
+    """Epoch seconds for a frontmatter timestamp, or None if it is not one.
+
+    plan.sh writes `started_at` with fractional seconds since t021
+    (`2026-09-23T07:05:49.455991Z`) and `completed_at` without
+    (`2026-09-23T07:52:17Z`), so both have to parse.  Anything else — absent,
+    null, empty, a leftover `"null"` string, a half-written value — is None,
+    and the caller decides what to do without one.
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text or text.lower() in ("null", "none", "~"):
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        # Everything crewvia writes carries `Z`.  A naive value would otherwise
+        # be read as local time, which on this repo's machines is 9 hours off —
+        # a floor 9 hours in the future, i.e. idle that never grows.
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp()
 
 
 def parse_frontmatter(text: str) -> tuple[dict, str]:
@@ -348,38 +377,98 @@ class WorkerMonitor:
         self.started_at: float = time.time()
         self.repo_root = repo_root
 
+        # t044: when *this* monitoring target began.  Signals older than this
+        # are not its silence — see `_signal_floor` and `_last_activity_mtime`.
+        #
+        # The earlier of "the Worker pulled the task" and "this monitor object
+        # was made", because each alone is wrong in one direction:
+        #
+        #   only the pull time  — a value from the future (clock skew, a
+        #     half-written card) would put the floor ahead of now, and idle
+        #     would never grow: a hung Worker becomes immortal.
+        #   only the object     — the object is remade every time the watchdog
+        #     restarts, so a Worker that hung three hours ago gets a fresh
+        #     idle clock on each restart and outlives every one of them.
+        #
+        # `min()` takes the pull time when it is sane and the object's own
+        # birth when it is not, which is also the answer when the card carries
+        # no usable timestamp at all.
+        pulled_at = parse_iso_epoch(task_card.get("started_at"))
+        self.monitoring_since: float = (
+            min(pulled_at, self.started_at) if pulled_at is not None
+            else self.started_at
+        )
+
     # ------------------------------------------------------------------
     # Signal detection helpers
     # ------------------------------------------------------------------
 
-    def _last_activity_mtime(self) -> float:
-        """Return mtime of most recent activity signal across all layers."""
-        candidates: list[float] = []
+    def _signal_floor(self) -> float:
+        """The oldest moment a signal can speak for this monitoring target.
 
-        # Tool layer: activity file
-        activity_file = (
+        Two of the three signal layers are **agent-scoped**:
+        `registry/heartbeats/<agent>` and `registry/notifications/<agent>/`
+        are keyed by Worker name, not by task, and crewvia reuses Worker names
+        by design (same skill → same name, inherited across tasks).  So both
+        outlive the task that wrote them, and a Worker starting a new task
+        finds its predecessor's files already sitting there.
+
+        Before t044 those files were read as if they were about the current
+        task.  A Worker that had just pulled — no `<task_id>.activity` yet —
+        was judged by a heartbeat written eighteen hours earlier under a
+        different task, and terminated at `elapsed=0s`.  `started_at` was
+        consulted only when there was no file at all, which is precisely the
+        case that did not happen.
+
+        Silence from before this target began is somebody else's silence.
+        That one sentence governs all three readers below, so it is computed
+        once here rather than restated in each — two readers with slightly
+        different notions of "mine" is how this repo has produced the same
+        defect twice already.
+        """
+        return self.monitoring_since
+
+    def _mtimes_since_floor(self, paths) -> list[float]:
+        """mtimes of `paths` that exist and are not older than the floor."""
+        floor = self._signal_floor()
+        found: list[float] = []
+        for p in paths:
+            try:
+                mtime = p.stat().st_mtime
+            except OSError:
+                continue
+            if mtime >= floor:
+                found.append(mtime)
+        return found
+
+    def _activity_file(self) -> Path:
+        return (
             self.repo_root / "registry" / "activity" / self.agent_name
             / f"{self.task_id}.activity"
         )
-        if activity_file.exists():
-            candidates.append(activity_file.stat().st_mtime)
 
-        # Thought layer: heartbeat file
-        hb_file = self.repo_root / "registry" / "heartbeats" / self.agent_name
-        if hb_file.exists():
-            candidates.append(hb_file.stat().st_mtime)
+    def _heartbeat_file(self) -> Path:
+        return self.repo_root / "registry" / "heartbeats" / self.agent_name
 
-        # Thought layer: notification files (most recent)
+    def _notification_files(self) -> list[Path]:
         notif_dir = self.repo_root / "registry" / "notifications" / self.agent_name
-        if notif_dir.exists():
-            for f in notif_dir.iterdir():
-                if f.is_file():
-                    try:
-                        candidates.append(f.stat().st_mtime)
-                    except OSError:
-                        pass
+        try:
+            return [f for f in notif_dir.iterdir() if f.is_file()]
+        except OSError:
+            return []
 
-        return max(candidates) if candidates else self.started_at
+    def _last_activity_mtime(self) -> float:
+        """Most recent signal across all layers, never earlier than the floor.
+
+        The floor is in the `max()` rather than being a fallback for "no files
+        at all": a stale file is not evidence of silence, it is evidence about
+        a different task (see `_signal_floor`).
+        """
+        candidates = self._mtimes_since_floor(
+            [self._activity_file(), self._heartbeat_file()]
+            + self._notification_files()
+        )
+        return max(candidates + [self._signal_floor()])
 
     def _non_notification_mtime(self) -> Optional[float]:
         """notification を除いた「実活動」の最新 mtime。
@@ -387,32 +476,32 @@ class WorkerMonitor:
         _last_activity_mtime() は notification 自体を候補に含むため、通知の
         解除判定 (_awaiting_human) には使えない — 通知が来ただけで「解除済み」に
         見えてしまう。そのための別計算。
+
+        t044: こちらも floor より古いシグナルは落とす。None ("実活動が無い") は
+        残す — `_awaiting_human()` は「通知より後に実活動があったか」を訊いて
+        いるので、floor に丸めると通知を常に解除済みに見せてしまう。
         """
-        candidates: list[float] = []
-        activity_file = (
-            self.repo_root / "registry" / "activity" / self.agent_name
-            / f"{self.task_id}.activity"
-        )
-        if activity_file.exists():
-            candidates.append(activity_file.stat().st_mtime)
-        hb_file = self.repo_root / "registry" / "heartbeats" / self.agent_name
-        if hb_file.exists():
-            candidates.append(hb_file.stat().st_mtime)
+        candidates = self._mtimes_since_floor(
+            [self._activity_file(), self._heartbeat_file()])
         return max(candidates) if candidates else None
 
     def _newest_notification(self) -> tuple[Optional[float], Optional[str]]:
-        """直近の notification の (mtime, notification_type)。無ければ (None, None)。"""
-        notif_dir = self.repo_root / "registry" / "notifications" / self.agent_name
-        if not notif_dir.exists():
-            return None, None
+        """直近の notification の (mtime, notification_type)。無ければ (None, None)。
+
+        t044: floor より古い通知は無かったものとして扱う。通知は 1 回しか鳴らず
+        その後は解除されないまま残るので、前の task で鳴った通知をそのまま読むと
+        `_awaiting_human()` が永久に True になり、**今の task でハングした
+        Worker が terminate されなくなる** — idle 側と逆向きの、同じ原因の欠陥。
+        """
+        floor = self._signal_floor()
         newest_file = None
         newest_mtime = -1.0
-        for f in notif_dir.iterdir():
-            if not f.is_file():
-                continue
+        for f in self._notification_files():
             try:
                 m = f.stat().st_mtime
             except OSError:
+                continue
+            if m < floor:
                 continue
             if m > newest_mtime:
                 newest_mtime = m

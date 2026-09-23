@@ -42,6 +42,21 @@
 割り当てと生存監視がまとめて止まる。カードは `list_task_cards()` が例外を
 `[破損]` に変えて吸収するので、厳格でも落ちない。
 
+## 例外を投げない
+
+`read_task_card()` / `list_task_cards()` は **例外を投げない**。読めなかったカードは
+`[破損]` のカードとして返る。呼び出し側 5 者のうち 3 つが常駐デーモン
+(dispatcher / verifier-dispatcher / watchdog) で、1 枚のカードでサイクルが落ちると
+止まるのは *その mission* ではなく **全 mission の割り当てと Worker の生存監視**
+だからである。
+
+ここは「捕まえる例外を数えて並べる」形にしていない。t014 で読み取りを集約した
+とき、集約先は `OSError` と `ValueError` しか見ておらず、**集約前に 3 デーモンが
+持っていたカード単位の `except Exception` より狭かった**。狭くなった差分が
+そのまま穴になり、不正な UTF-8 を含むカード 1 枚で `UnicodeDecodeError` が
+突き抜けた (Codex 6 巡目 P1)。名前の分かっている失敗は個別に扱って直し方を
+警告に書き、**残り全部は `read_task_card()` の backstop が隔離に落とす**。
+
 ## フォールバックを持たない
 
 読み込めなければ呼び出し側はそのまま死ぬ。`lib_dep_rules.py` と同じ理由で、
@@ -205,6 +220,26 @@ def parse_frontmatter(text, source='<task>'):
 # 隔離 —— 読めないカードを「見える形で保留する」唯一の作り方
 # ---------------------------------------------------------------------------
 
+def _safe_warn(warn, msg):
+    """警告を出す。出せなくても、そこで読み取りを止めない。
+
+    `warn` は呼び出し側から渡されたただの callable で、dispatcher なら
+    `log()` —— つまり **ログファイルへの書き込み**である。ディスクが埋まる /
+    ログの権限が変わるだけでそれは例外を投げる。そこで諦めないと、
+    「壊れたカードが 1 枚あって、かつログが書けない」という、いちばん忙しい日に
+    しか揃わない組み合わせで全 mission の割り当てが止まる。
+
+    黙っても隔離そのものは失われない —— `[破損]` のカードは *戻り値* であって、
+    警告はその写しにすぎないからである。
+    """
+    if warn is None:
+        return
+    try:
+        warn(msg)
+    except Exception:
+        pass
+
+
 def isolated_task(task_id, title, reason):
     """`[破損]` として保留されたカードを組み立てる。
 
@@ -281,13 +316,54 @@ def read_task_card(path, task_id, warn=None):
     1 枚のカードで dispatch サイクルが落ちると、止まるのはその mission ではなく
     全 mission の割り当てになる。倒れる先は常に「そのカードだけが動かない」。
 
+    **この関数は例外を投げない。** 保証しているのは「この失敗とこの失敗を捕まえ
+    た」ではなく「読み取り経路から例外が出てこない」ことのほう —— 理由は下の
+    backstop のコメントにある。
+
     `warn` は `callable(str)` か None。None なら黙る (同じ実行の中で 2 回目以降に
     読む呼び出し用 —— 同じ警告が二重に出ると、読む側は 2 件壊れていると誤読する)。
     """
     def _warn(msg):
-        if warn is not None:
-            warn(msg)
+        _safe_warn(warn, msg)
 
+    try:
+        return _read_task_card(path, task_id, _warn)
+    except Exception as e:
+        # ---- backstop (Codex 6 巡目 P1) -----------------------------------
+        #
+        # 集約前、このカードを読んでいた常駐デーモン 3 者 (dispatcher /
+        # verifier-dispatcher / watchdog) は **カード単位の `except Exception`**
+        # を持っていた。t014 で読み取りを 1 箇所に寄せたとき、集約先は
+        # `OSError` と `ValueError` しか見ていなかった —— 集約したこと自体は
+        # 正しかったが、**集約先が元のハンドラと同じ広さを持っているかを
+        # 確かめていなかった**。狭くなった差分がそのまま穴になり、不正な UTF-8 を
+        # 含むカード 1 枚で `UnicodeDecodeError` がここを突き抜けて、全 mission の
+        # 割り当てと Worker の生存監視が同時に止まった。
+        #
+        # だから「今回の 1 件 (UnicodeError) を足す」では閉じない。次に読み取り
+        # 経路へ新しい失敗が入った日に、同じ止まり方がもう一度出るからである。
+        # 上で名前の分かっている失敗は個別に扱い (そのほうが直し方を書ける)、
+        # **残り全部をここで隔離に落とす**。
+        #
+        # 広く捕まえても黙らない: 例外の型と文言が `[破損]` カードの理由として
+        # 残り、警告も出る。だから「読み取りのバグを握り潰す」方向には倒れない。
+        _warn(
+            f"unexpected failure while reading {path}: "
+            f"{type(e).__name__}: {e}\n"
+            f"  holding it as a [破損] task; other tasks are unaffected."
+        )
+        return isolated_task(
+            task_id, 'unexpected read error', f'{type(e).__name__}: {e}')
+
+
+def _read_task_card(path, task_id, _warn):
+    """`read_task_card()` の本体。名前の分かっている失敗をそれぞれ隔離する。
+
+    ここから漏れた例外は呼び出し元の backstop が受ける。関数を分けてあるのは、
+    「名前の分かっている失敗には直し方まで書く」と「名前の分からない失敗でも
+    止めない」が別の話だからで、1 つの try に混ぜると、後から足した except が
+    どちらのつもりなのか読めなくなる。
+    """
     try:
         with open(path) as f:
             text = f.read()
@@ -299,6 +375,17 @@ def read_task_card(path, task_id, warn=None):
             f"  holding it as a [破損] task; other tasks are unaffected."
         )
         return isolated_task(task_id, 'read error', str(e))
+    except UnicodeError as e:
+        # 途中で切れた書き込み・別エンコーディングの貼り付け・バイナリの
+        # 取り違えで普通に起きる。`UnicodeDecodeError` は `OSError` ではなく
+        # `ValueError` の側にいるので、上の except では捕まらない (Codex 6 巡目 P1)。
+        _warn(
+            f"failed to decode {path}: {e}\n"
+            f"  hint: task files must be UTF-8. `file {path}` でエンコーディングを "
+            f"確かめ、必要なら `iconv -f <元の文字コード> -t utf-8` で書き直すこと。\n"
+            f"  holding it as a [破損] task; other tasks are unaffected."
+        )
+        return isolated_task(task_id, 'decode error (not UTF-8)', str(e))
 
     try:
         meta, body = parse_frontmatter(text, source=str(path))
@@ -348,8 +435,7 @@ def list_task_cards(tasks_dir, warn=None):
     try:
         names = os.listdir(tasks_dir)
     except OSError as e:
-        if warn is not None:
-            warn(f"failed to list {tasks_dir}: {e}")
+        _safe_warn(warn, f"failed to list {tasks_dir}: {e}")
         return []
     for fn in names:
         m = TASK_FILENAME_RE.fullmatch(fn)

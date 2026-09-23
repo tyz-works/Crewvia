@@ -49,6 +49,7 @@ t013 で「task の識別子はファイル名であって frontmatter の `id` 
 
 from __future__ import annotations
 
+import os
 import pathlib
 import re
 import sys
@@ -131,6 +132,17 @@ class Queue:
     def write(self, task_id: str, text: str) -> pathlib.Path:
         path = self.tasks / f"{task_id}.md"
         path.write_text(text)
+        return path
+
+    def write_raw(self, task_id: str, data: bytes) -> pathlib.Path:
+        """バイト列をそのまま置く。UTF-8 として読めないカードを作るため。
+
+        `write_text()` では作れない —— 壊れたカードは *書き手が正しく書けなかった*
+        結果として生まれるもので (途中で切れた書き込み、別エンコーディングの
+        貼り付け、バイナリの取り違え)、テキストとして表現できるとはかぎらない。
+        """
+        path = self.tasks / f"{task_id}.md"
+        path.write_bytes(data)
         return path
 
     def add(self, task_id: str, **kwargs) -> pathlib.Path:
@@ -520,3 +532,267 @@ def test_no_script_builds_an_isolated_card_by_hand():
     assert not offenders, (
         f"疑似ステータスのリテラルが直書きされている: {offenders} — "
         f"lib_task_cards.CORRUPT_TASK_STATUS / isolated_task() を使うこと")
+
+
+# ---------------------------------------------------------------------------
+# 6. 読み取り経路の例外が、1 つ残らず隔離に落ちる (Codex 6 巡目 P1)
+# ---------------------------------------------------------------------------
+#
+# t014 で読み取りを 1 箇所に集約したこと自体は正しい。落としたのは **広さ** の
+# ほうだった。集約前、この読み取りを持っていた 5 者のハンドラはこうなっていた。
+#
+#   dispatcher.sh          try: parse_frontmatter(path.read_text()) except Exception
+#   verifier-dispatcher.sh 同上
+#   watchdog.py            同上 (except Exception: continue)
+#   plan.sh                read は素通し / parse だけ except ValueError
+#   taskvia-sync.sh        ハンドラ無し
+#
+# 集約先は `except OSError` + `except ValueError` だった。**常駐デーモン 3 者が
+# 持っていた `except Exception` より狭い**。狭くなった差分がそのまま穴になり、
+# 不正な UTF-8 を含むカード 1 枚で `UnicodeDecodeError` が `list_task_cards()` を
+# 突き抜け、**全 mission の割り当てと Worker の生存監視が同時に止まる**。
+#
+# だからここで押さえるのは「UnicodeError も捕まえた」ではない。**読み取り経路から
+# 例外が出てこない**ことそのもの ——「今回の 1 件を足した」で終わらせると、次に
+# 誰かが読み取り経路に新しい失敗を持ち込んだ日に、同じ止まり方がもう一度出る。
+
+UNDECODABLE_CARD = (
+    b"---\n"
+    b"id: t001\n"
+    b"title: \xff\xfe broken encoding\n"
+    b"status: pending\n"
+    b"skills: [code]\n"
+    b"blocked_by: []\n"
+    b"---\n"
+    b"\n## Description\n\nfixture\n"
+)
+
+
+def test_a_card_with_invalid_utf8_does_not_abort_the_dispatch_cycle(queue):
+    """0xff を含むカード 1 枚で、dispatch サイクル全体が落ちないこと (害の本体)。
+
+    落ちるのはその mission ではなく **全 mission の割り当て**である。しかも
+    `plan.sh status` には何も出ない (同じ例外で status も落ちる) ので、
+    「pull もできないし誰も割り当てられない、理由はどこにも出ていない」という
+    いちばん理由の見えない止まり方になる。
+    """
+    queue.write_raw("t001", UNDECODABLE_CARD)
+    queue.add("t002")
+    ns = load_dispatcher_namespace(queue.root)
+
+    all_tasks, done_ids, statuses = ns["load_all_tasks"]([MISSION])
+
+    assert statuses[MISSION].get("t002") == "pending", (
+        f"健全なカードが 1 枚の壊れたファイルに巻き添えにされた: {statuses}")
+    assert statuses[MISSION].get("t001") == "corrupted", (
+        f"読めなかったカードが隔離されていない: {statuses}")
+    assert done_ids[MISSION] == set(), (
+        f"中身の読めないカードが『完了した依存』に数えられている: {done_ids}")
+    assert sorted(meta["id"] for _slug, meta in all_tasks) == ["t001", "t002"]
+
+
+def test_a_card_with_invalid_utf8_does_not_abort_the_watchdog_cycle(queue):
+    """同じカードで、Worker の生存監視が止まらないこと。
+
+    dispatcher と watchdog は別のプロセスだが、読み取りは同じ 1 つの関数から
+    来る —— だから穴も同時に開く。割り当てが止まったうえに、走っている Worker
+    の監視まで同時に消えるのがこの欠陥のいちばん悪いところで、
+    `knowledge/daemon-authority.md` の相互監視もこれは救えない (どちらの
+    プロセスも生きたまま、毎サイクル同じ例外で何もせずに終わる)。
+    """
+    import watchdog
+
+    queue.write_raw("t001", UNDECODABLE_CARD)
+    queue.write("t002", _card("t002", status="in_progress"))
+
+    active = watchdog.load_active_tasks(queue.queue)
+
+    assert [task_id for _slug, task_id, _meta in active] == ["t002"], (
+        f"in_progress の Worker が監視対象から消えた: {active}")
+
+
+def test_pull_and_dispatch_agree_on_an_undecodable_card(queue):
+    """plan.sh と dispatcher が、読めないカードについても同じ結論を出すこと。
+
+    片方だけが落ちる形だと、`plan.sh status` で見えているものと実際に
+    割り当てられるものがズレる —— t014 で閉じたはずのズレが、読み取り失敗の
+    経路からもう一度開く。
+    """
+    queue.write_raw("t001", UNDECODABLE_CARD)
+    queue.add("t002")
+
+    dispatcher_ns = load_dispatcher_namespace(queue.root)
+    from_dispatcher = _cards(dispatcher_ns)
+
+    plan_ns = load_plan_namespace(PLAN_SH, str(queue.queue), str(REPO_ROOT))
+    from_plan = {meta.get("id"): meta.get("status")
+                 for meta, _ in plan_ns["list_tasks"](MISSION)}
+
+    assert from_dispatcher == from_plan, (
+        "読めないカードの扱いがズレている\n"
+        f"  plan.sh    : {from_plan}\n"
+        f"  dispatcher : {from_dispatcher}"
+    )
+    assert from_plan["t002"] == "pending", f"対照が崩れている: {from_plan}"
+
+
+# --- 読み取り経路の失敗を全部並べる -----------------------------------------
+#
+# ここに 1 行足すだけで、その壊れ方が隔離に落ちることが以後ずっと押さえられる。
+# 「隔離されない」ことが正しい欄 (id 欄の不在・空) も同じ表に置いてあるのは、
+# 全部を [破損] に倒して一致させた、という緑ではないことを同時に示すため。
+
+def _make_unreadable(queue):
+    path = queue.add("t001")
+    path.chmod(0o000)
+    if path.stat().st_mode & 0o400:          # root では chmod が効かない
+        pytest.skip("読み取り権限を落とせない環境 (root?)")
+
+
+def _make_directory(queue):
+    (queue.tasks / "t001.md").mkdir()
+
+
+READ_PATH_FAILURES = [
+    # (名前, カードの作り方, 期待する status)
+    ("OSError: 読み取り権限が無い",
+     _make_unreadable, "corrupted"),
+    ("OSError: ファイルではなくディレクトリ",
+     _make_directory, "corrupted"),
+    ("UnicodeError: UTF-8 として読めないバイト列",
+     lambda q: q.write_raw("t001", UNDECODABLE_CARD), "corrupted"),
+    ("UnicodeError: UTF-16 で書かれたカード",
+     lambda q: q.write_raw("t001", _card("t001").encode("utf-16")), "corrupted"),
+    ("ValueError: frontmatter が始まっていない",
+     lambda q: q.write("t001", "## Description\n\nfixture\n"), "corrupted"),
+    ("ValueError: frontmatter が閉じていない",
+     lambda q: q.write("t001", "---\nid: t001\nstatus: pending\n\n## Description\n"),
+     "corrupted"),
+    ("ValueError: 認識できない行がある",
+     lambda q: q.write("t001", "---\nid: t001\nbroken line\nstatus: pending\n---\n"),
+     "corrupted"),
+    ("id 欄がファイル名と食い違う",
+     lambda q: q.write("t001", _card("t001", declared_id="t002")), "corrupted"),
+    # --- ここから下は「隔離されない」ことが正しい (t013 の設計) ---
+    ("id 欄が無い — ファイル名が答えを持っているので普通のカード",
+     lambda q: q.write("t001", _card("t001", declared_id=None)), "pending"),
+    ("id 欄が空 — 「無い」と同じ",
+     lambda q: q.write("t001", "---\nid:\ntitle: t001\nstatus: pending\n"
+                               "skills: [code]\nblocked_by: []\n---\n"), "pending"),
+]
+
+
+@pytest.mark.parametrize(
+    "builder,expected",
+    [pytest.param(b, e, id=name) for name, b, e in READ_PATH_FAILURES],
+)
+def test_every_read_path_failure_lands_in_isolation(queue, builder, expected):
+    """読み取り経路で起こりうる失敗が、1 つ残らず隔離に落ちること。
+
+    そして **隣のカードは無傷である**こと。倒れる先は常に「そのカードだけが
+    動かない」でなければならない。
+    """
+    builder(queue)
+    queue.add("t002")
+    ns = load_dispatcher_namespace(queue.root)
+
+    cards = _cards(ns)
+
+    assert cards.get("t001") == expected, f"t001 の扱いが違う: {cards}"
+    assert cards.get("t002") == "pending", (
+        f"健全なカードが巻き添えになった: {cards}")
+
+
+def test_an_unexpected_exception_in_the_read_path_is_contained(queue, monkeypatch):
+    """**まだ知らない** 失敗でも、サイクルが落ちないこと。
+
+    集約前、常駐デーモン 3 者はカード単位の `except Exception` でこれを吸収して
+    いた。集約先がそれより狭いかぎり、「読み取り経路に新しい失敗が増えた日」は
+    そのまま「全 mission の割り当てが止まる日」になる —— 今回の P1 が
+    まさにそれで、`UnicodeDecodeError` は最初からあった失敗が見えただけだった。
+
+    だから押さえるのは特定の例外型ではなく、**例外が出てこないこと**そのもの。
+    """
+    import lib_task_cards
+
+    def exploding_parse(*_a, **_kw):
+        raise RuntimeError("まだ誰も想定していない読み取り失敗")
+
+    monkeypatch.setattr(lib_task_cards, "parse_frontmatter", exploding_parse)
+
+    queue.add("t001")
+    queue.add("t002")
+    ns = load_dispatcher_namespace(queue.root)
+
+    cards = _cards(ns)
+
+    assert cards == {"t001": "corrupted", "t002": "corrupted"}, (
+        f"想定外の例外が隔離に落ちていない: {cards}")
+
+
+def test_a_failing_warn_callback_does_not_abort_the_cycle():
+    """**警告を出せないこと**が、割り当てを止める理由にならないこと。
+
+    読み取り経路に残っていたもう 1 つの漏れ。`warn` は呼び出し側から渡される
+    ただの callable で、dispatcher なら `log()` —— つまり **ログファイルへの
+    書き込み**である。ディスクが埋まる / ログの権限が変わるだけでそれは
+    例外を投げるし、そのとき壊れたカードが 1 枚あれば、警告を出そうとした瞬間に
+    サイクルが落ちる。
+
+    「壊れたカードが 1 枚あって、かつログが書けない」という、いちばん忙しい日に
+    しか揃わない組み合わせで全 mission の割り当てが止まる形なので、`UnicodeError`
+    と同じ扱いにする —— 出せない警告は諦め、カードの隔離だけは必ず返す。
+    """
+    import lib_task_cards
+
+    def exploding_warn(_msg):
+        raise OSError(28, "No space left on device")
+
+    meta, _body = lib_task_cards.read_task_card(
+        "/nonexistent/queue/missions/m/tasks/t001.md", "t001", warn=exploding_warn)
+
+    assert meta["status"] == lib_task_cards.CORRUPT_TASK_STATUS, meta
+
+
+def test_a_failing_warn_callback_does_not_abort_the_listing_either(queue):
+    """同じことを、カードを 1 枚も開けなかった場合にも言えること。
+
+    `list_task_cards()` は `tasks/` そのものが読めないときにも警告を出す。
+    そこだけ素の `warn(...)` が残っていると、漏れは塞いだつもりで残る —— これが
+    「今回の 1 件を足す」で終わらせたときに必ず起きる形である。
+    """
+    import lib_task_cards
+
+    queue.add("t001")
+    queue.tasks.chmod(0o000)
+    if os.access(queue.tasks, os.R_OK):          # root では chmod が効かない
+        queue.tasks.chmod(0o755)
+        pytest.skip("読み取り権限を落とせない環境 (root?)")
+
+    def exploding_warn(_msg):
+        raise OSError(28, "No space left on device")
+
+    try:
+        cards = lib_task_cards.list_task_cards(queue.tasks, warn=exploding_warn)
+    finally:
+        queue.tasks.chmod(0o755)
+
+    assert cards == []
+
+
+def test_an_isolated_card_says_why_it_was_isolated(queue):
+    """隔離したカードに、何が起きたのかが残ること。
+
+    `[破損]` として保留するのは「黙って消えたカードは誰にも直せない」から
+    だった (t013)。理由が残っていなければ、保留にした意味がない。
+    """
+    queue.write_raw("t001", UNDECODABLE_CARD)
+    ns = load_dispatcher_namespace(queue.root)
+
+    meta, _body = ns["list_tasks_for_mission"](MISSION)[0]
+
+    assert "破損" in meta.get("title", ""), meta
+    reason = meta.get("parse_error") or ""
+    assert reason, f"隔離の理由が残っていない: {meta}"
+    assert "utf-8" in reason.lower() or "decode" in reason.lower(), (
+        f"何が起きたのか読み取れない理由: {reason!r}")

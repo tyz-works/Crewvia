@@ -97,7 +97,7 @@ fi
 # ないので意味が無い)。
 #
 # 判定は registry/daemons/{dispatcher,watchdog}.heartbeat の mtime だけを見る
-# 安価な処理 — ネットワーク I/O・mux 呼び出し・python サブプロセスは呼ばない
+# 安価な処理 — ネットワーク I/O・mux 呼び出しは呼ばない
 # (lib_daemon_watch.py の watch_peer() のような "process が本当に生きているか"
 # の踏み込んだ検証はしない。あくまで最後の砦であり、誤検知しても Director が
 # scripts/lib_daemon_watch.py status で確認するだけなので副作用は無い)。
@@ -112,6 +112,15 @@ fi
 # 直後の呼び出しは早期リターンする (二重通知の窓を狭める。完全な排他では
 # ないが、この hook にロックを持ち込むほどの重さではない)。
 #
+# F-3是正 (t048): registry/daemons/ の存在確認と throttle 判定を role 解決
+# (python3 サブプロセス) より前に出す。role 解決は「この呼び出しで実際に
+# 判定へ進む」と分かってから初めて行うので、mutual watch を使っていない
+# 環境 (daemons/ が無い = 現在の本番) では python3 は 1 回も起動しない。
+# 使っている環境でも throttle 窓 (60秒) に 1 回だけになる。以前は role 解決が
+# daemons/ の有無や throttle と無関係に毎ツール呼び出しで走っており、
+# Director だけでなく全 Worker の全呼び出しが python3 起動コストを払っていた
+# (実測 12ms→38ms、3.2倍)。
+#
 # 検出したら「1 行だけ出力して exit 2」で終える。PostToolUse hook が exit 2
 # で終わると Claude Code は stderr を Claude (ここでは Director) にそのまま
 # 見せる (ツールは既に実行済みなのでブロックはしない) — これが Director に
@@ -119,17 +128,42 @@ fi
 _CURRENT_STEP="daemon-backstop"
 if [[ -n "${AGENT_NAME:-}" ]]; then
   _BS_REPO="${CREWVIA_REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
-  _BS_WORKERS_YAML="${_BS_REPO}/registry/workers.yaml"
-  _BS_IS_DIRECTOR=0
-  if [[ -f "$_BS_WORKERS_YAML" ]]; then
-    # O-1是正: 以前は grep -A3 の位置依存判定だったため、director エントリの
-    # 直前の Worker がフィールド 1 つだけ (role/skills 欠落等) だと次の
-    # `- name:` に届く前に role: 行を拾ってしまい、director と誤判定する
-    # 恐れがあった (workers.yaml では director の直前が `- name: Ren` の
-    # 1 行だけで、余裕が 1 行しかない)。下流の agents-heartbeat 送信で既に
-    # 使っている「`- name:` で次エントリを検知して break する」Python
-    # パーサに寄せる。
-    _BS_ROLE="$(python3 - "$AGENT_NAME" "$_BS_WORKERS_YAML" <<'PYEOF' 2>/dev/null || echo "worker"
+  _BS_DAEMONS_DIR="${_BS_REPO}/registry/daemons"
+  # daemons/ が無い = 両デーモンとも一度も mutual watch の heartbeat を
+  # 書いたことが無い (lib_daemon_watch.DaemonWatch が最初の beat() 時に
+  # mkdir する)。standalone/inline 運用ではこの状態が正常なので、そのまま
+  # 判定に入らずスキップする (常時 stale 誤検知を防ぐ)。role 解決すら行わない
+  # ので、この分岐に入らない限り python3 は起動しない。
+  if [[ -d "$_BS_DAEMONS_DIR" ]]; then
+    _BS_THROTTLE="${_BS_DAEMONS_DIR}/backstop-notify.throttle"
+    _BS_NOW="$(date +%s)"
+    _BS_LAST=0
+    if [[ -f "$_BS_THROTTLE" ]]; then
+      # F-1是正: GNU 専用の `stat -c` は BSD/macOS に無く失敗する。
+      # BSD の `stat -f %m` へフォールバックする (scripts/wait_for_plan_review.sh
+      # の _mtime_of と同じイディオム)。両方失敗した場合の既定値は「判定不能を
+      # 騒がしい側に倒さない」ため $_BS_NOW (= 今読んだばかり扱い) にする —
+      # heartbeat 側の -1 (無限に stale) とは逆方向: throttle は読めないだけで
+      # 誤発火させると要件 2 (毎ツール呼び出しの通知) と衝突する。
+      _BS_LAST="$(stat -c %Y "$_BS_THROTTLE" 2>/dev/null || stat -f %m "$_BS_THROTTLE" 2>/dev/null || echo "$_BS_NOW")"
+    fi
+    _BS_ELAPSED=$(( _BS_NOW - _BS_LAST ))
+
+    if [[ "$_BS_ELAPSED" -ge 60 ]]; then
+      # 判定前にスロットル窓を更新する (判定結果に関わらず)。
+      : > "$_BS_THROTTLE" 2>/dev/null || true
+
+      _BS_WORKERS_YAML="${_BS_REPO}/registry/workers.yaml"
+      _BS_IS_DIRECTOR=0
+      if [[ -f "$_BS_WORKERS_YAML" ]]; then
+        # O-1是正: 以前は grep -A3 の位置依存判定だったため、director エントリの
+        # 直前の Worker がフィールド 1 つだけ (role/skills 欠落等) だと次の
+        # `- name:` に届く前に role: 行を拾ってしまい、director と誤判定する
+        # 恐れがあった (workers.yaml では director の直前が `- name: Ren` の
+        # 1 行だけで、余裕が 1 行しかない)。下流の agents-heartbeat 送信で既に
+        # 使っている「`- name:` で次エントリを検知して break する」Python
+        # パーサに寄せる。
+        _BS_ROLE="$(python3 - "$AGENT_NAME" "$_BS_WORKERS_YAML" <<'PYEOF' 2>/dev/null || echo "worker"
 import re, sys
 from pathlib import Path
 agent_name, yaml_path = sys.argv[1], sys.argv[2]
@@ -137,6 +171,11 @@ content = Path(yaml_path).read_text()
 in_target = False
 role = "worker"
 for line in content.splitlines():
+    # O-5是正: インラインコメント (`role: director  # ...`) を剥がしてから
+    # 判定する。剥がさないと role が "director  # ..." になり誤判定する
+    # (config/crewvia.yaml のインラインコメントで _config_mode() が壊れた
+    # PR #184 の事故と同根)。
+    line = line.split("#", 1)[0]
     if re.match(r'\s*- name: ' + re.escape(agent_name) + r'\s*$', line):
         in_target = True
         continue
@@ -150,36 +189,12 @@ for line in content.splitlines():
 print(role)
 PYEOF
 )"
-    if [[ "$_BS_ROLE" == "director" ]]; then
-      _BS_IS_DIRECTOR=1
-    fi
-  fi
-
-  if [[ "$_BS_IS_DIRECTOR" == "1" ]]; then
-    _BS_DAEMONS_DIR="${_BS_REPO}/registry/daemons"
-    # daemons/ が無い = 両デーモンとも一度も mutual watch の heartbeat を
-    # 書いたことが無い (lib_daemon_watch.DaemonWatch が最初の beat() 時に
-    # mkdir する)。standalone/inline 運用ではこの状態が正常なので、そのまま
-    # 判定に入らずスキップする (常時 stale 誤検知を防ぐ)。
-    if [[ -d "$_BS_DAEMONS_DIR" ]]; then
-      _BS_THROTTLE="${_BS_DAEMONS_DIR}/backstop-notify.throttle"
-      _BS_NOW="$(date +%s)"
-      _BS_LAST=0
-      if [[ -f "$_BS_THROTTLE" ]]; then
-        # F-1是正: GNU 専用の `stat -c` は BSD/macOS に無く失敗する。
-        # BSD の `stat -f %m` へフォールバックする (scripts/wait_for_plan_review.sh
-        # の _mtime_of と同じイディオム)。両方失敗した場合の既定値は「判定不能を
-        # 騒がしい側に倒さない」ため $_BS_NOW (= 今読んだばかり扱い) にする —
-        # heartbeat 側の -1 (無限に stale) とは逆方向: throttle は読めないだけで
-        # 誤発火させると要件 2 (毎ツール呼び出しの通知) と衝突する。
-        _BS_LAST="$(stat -c %Y "$_BS_THROTTLE" 2>/dev/null || stat -f %m "$_BS_THROTTLE" 2>/dev/null || echo "$_BS_NOW")"
+        if [[ "$_BS_ROLE" == "director" ]]; then
+          _BS_IS_DIRECTOR=1
+        fi
       fi
-      _BS_ELAPSED=$(( _BS_NOW - _BS_LAST ))
 
-      if [[ "$_BS_ELAPSED" -ge 60 ]]; then
-        # 判定前にスロットル窓を更新する (判定結果に関わらず)。
-        : > "$_BS_THROTTLE" 2>/dev/null || true
-
+      if [[ "$_BS_IS_DIRECTOR" == "1" ]]; then
         _BS_DISPATCHER_STALE_S="${CREWVIA_DAEMON_DISPATCHER_STALE_SECONDS:-60}"
         _BS_WATCHDOG_STALE_S="${CREWVIA_DAEMON_WATCHDOG_STALE_SECONDS:-240}"
         # O-2是正: 不正な (非数値の) env値は lib_daemon_watch.py の load_config()
@@ -281,6 +296,10 @@ in_target = False
 role = "worker"
 skills = []
 for line in content.splitlines():
+    # O-5是正: インラインコメントを剥がしてから判定する (上流の daemon-backstop
+    # 判定と同じ修正。config/crewvia.yaml のインラインコメントで _config_mode()
+    # が壊れた PR #184 の事故と同根)。
+    line = line.split("#", 1)[0]
     if re.match(r'\s*- name: ' + re.escape(agent_name) + r'\s*$', line):
         in_target = True
         continue

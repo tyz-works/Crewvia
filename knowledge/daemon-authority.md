@@ -1898,10 +1898,11 @@ starttime の数え方の一致) は、使い捨てディレクトリに sleep �
 原理的に救えない — 見る側も死んでいるから。これを補うのが Director 自身のセッションで動く
 PostToolUse hook (`hooks/post-tool-use.sh`) の役目である。
 
-**方針。** 相互監視の判定 (`DaemonWatch._decide()`) を再実装・再利用しない。hook は全ツール呼び出しの
-経路にあり、失敗やハングが全体に波及するため、判定は「heartbeat ファイルの mtime を見るだけ」に
-絞る (`instance_alive()` の /proc 照合や `scan_daemon_pids()` の走査はしない — それは respawn する
-側の相互監視の仕事であり、この hook は respawn しない・報告するだけ)。
+**方針。** 相互監視の判定 (`DaemonWatch._decide()`) を再実装・再利用しない。hook は `.claude/settings.json`
+の `PostToolUse` matcher (`Bash|Write|Edit|MultiEdit`) の経路にあり、失敗やハングが全体に波及するため、
+判定は「heartbeat ファイルの mtime を見るだけ」に絞る (`instance_alive()` の /proc 照合や
+`scan_daemon_pids()` の走査はしない — それは respawn する側の相互監視の仕事であり、この hook は
+respawn しない・報告するだけ)。
 
 - しきい値は §7-8 の既定値 (60 / 240) をハードコードし、`lib_daemon_watch.py` と同じ env var 名
   (`CREWVIA_DAEMON_DISPATCHER_STALE_SECONDS` / `CREWVIA_DAEMON_WATCHDOG_STALE_SECONDS`) でだけ
@@ -1911,14 +1912,28 @@ PostToolUse hook (`hooks/post-tool-use.sh`) の役目である。
   判定に入らずスキップする。このディレクトリは `DaemonWatch.__post_init__` が最初の beat 時に
   作るものなので、無いことは「デーモンが動いていない (standalone/inline 運用)」の証拠であり、
   「両方死んでいる」の証拠ではない。ここをスキップしないと、mutual watch を使わない運用で常時
-  誤検知することになる。
+  誤検知することになる。**この存在確認と throttle 判定は role 解決 (次項) より前に行う** (t048是正、
+  下記参照)。
 - 対象は role が director のセッションのみ。全 Worker のツール呼び出しにも同じ hook が刺さるが、
-  Worker には respawn も報告もできないので判定自体を行わない (ノイズと無駄な stat 呼び出しを
-  避ける)。
+  Worker には respawn も報告もできないので実際の stale 判定・通知は行わない。ただし role 自体の解決
+  (`registry/workers.yaml` を読む python3 サブプロセス) は、throttle 窓が開いている (= これから
+  判定する) 呼び出しでは Worker であっても実行される — 「誰が最初にこの窓を消費するか」が分かる前に
+  役割を判定する必要があるため。**t008 原案 (2026-09-23) は role 解決を daemons/ の存在や throttle
+  と無関係に毎ツール呼び出しで走らせており、Director だけでなく全 Worker の全呼び出しが python3
+  起動コストを払っていた (t047 で O-1 是正のため grep から python3 ヒアドキュメントに変わったのが
+  引き金。実測 12ms→38ms、3.2倍。t009 2巡目 QA の F-3)。t048 で daemons/ の存在確認と throttle 判定を
+  role 解決より前に出し、mutual watch 未使用環境 (daemons/ 不在 = 現在の本番) では python3 が
+  1 回も起動しないようにした。**
 - throttle はマーカーファイル (`registry/daemons/backstop-notify.throttle`) の mtime で 60 秒に
   1 回に抑える。判定結果に関わらずマーカーを先に更新するので、同時に複数の PostToolUse が走っても
   直後の呼び出しは早期リターンする (完全な排他ではないが、この hook にロックを持ち込むほどの
   重さではない — 最悪でも throttle 窓の中で数回検知メッセージが重複するだけで、実害は無い)。
+  **このマーカーは全エージェント共有 (agent 別ではない)。** そのため理論上は、throttle 窓が開いた
+  瞬間にたまたま Worker のツール呼び出しが先に来ると、その回は role が worker と判定されて何もせず
+  窓だけを消費し、Director 自身の判定はさらに次の窓まで遅れる。既存の回帰テスト (下記) は単一
+  エージェントの連続呼び出ししか検証しておらず、この多エージェント競合は対象外。最後の砦としての
+  役割 (誤検知しても実害が無い・確実に検知できなくても他の経路で発見できる) を踏まえ、複雑な
+  per-agent throttle は導入しない設計判断とした。
 
 **Director への伝え方 — exit code 2 を使う。** Claude Code の PostToolUse hook は exit code 2 で
 終わると、ツールは既に実行済みのままブロックはせず、**stderr をそのまま呼び出し元 (Director) の

@@ -93,6 +93,10 @@ exclude = {
     # 迂回を隠す余地を残さないよう、ファイル単位の明示列挙に留める
     # — tests/ 全体を外すと本物の迂回がテストの下に隠れる。
     root / "tests" / "test_dispatcher_retirement_exclusion.py",
+    # 同上 (t008 backstop テスト)。pytest の tmp_path 配下に合成 registry を
+    # 1 度だけ組み立てるだけで、repo の registry/workers.yaml には触れない
+    # (REPO_ROOT は hooks/post-tool-use.sh のパス解決にしか使っていない)。
+    root / "tests" / "test_daemon_backstop_hook.py",
 }
 proximity = 15
 found = []

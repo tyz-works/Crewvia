@@ -1892,6 +1892,108 @@ starttime の数え方の一致) は、使い捨てディレクトリに sleep �
 
 ---
 
+### 7-13. 相互監視が機能しない瞬間の backstop — PostToolUse hook (t008, 2026-09-23)
+
+§7 の相互監視は「相手を見る」仕組みなので、**両方が同時に死ぬ**(herdr 再起動、OOM 等) ケースは
+原理的に救えない — 見る側も死んでいるから。これを補うのが Director 自身のセッションで動く
+PostToolUse hook (`hooks/post-tool-use.sh`) の役目である。
+
+**方針。** 相互監視の判定 (`DaemonWatch._decide()`) を再実装・再利用しない。hook は `.claude/settings.json`
+の `PostToolUse` matcher (`Bash|Write|Edit|MultiEdit`) の経路にあり、失敗やハングが全体に波及するため、
+判定は「heartbeat ファイルの mtime を見るだけ」に絞る (`instance_alive()` の /proc 照合や
+`scan_daemon_pids()` の走査はしない — それは respawn する側の相互監視の仕事であり、この hook は
+respawn しない・報告するだけ)。
+
+- しきい値は §7-8 の既定値 (60 / 240) をハードコードし、`lib_daemon_watch.py` と同じ env var 名
+  (`CREWVIA_DAEMON_DISPATCHER_STALE_SECONDS` / `CREWVIA_DAEMON_WATCHDOG_STALE_SECONDS`) でだけ
+  上書きを許す。`config/crewvia.yaml` の YAML 解析はこの hook の目的には重すぎるため行わない —
+  独立した簡易チェックであり、`lib_daemon_watch.py` の判定とバイト単位で一致する必要はない。
+- `registry/daemons/` ディレクトリが無い (= どちらのデーモンも一度も `beat()` していない) 場合は
+  判定に入らずスキップする。このディレクトリは `DaemonWatch.__post_init__` が最初の beat 時に
+  作るものなので、無いことは「デーモンが動いていない (standalone/inline 運用)」の証拠であり、
+  「両方死んでいる」の証拠ではない。ここをスキップしないと、mutual watch を使わない運用で常時
+  誤検知することになる。
+- **判定順 (t049)。** 安いものから順に並べ、状態を消費するもの (throttle) を最後にする:
+  1. `registry/daemons/` の存在確認 (最も安い。現在の本番では常にここで抜ける)
+  2. heartbeat の mtime 判定 (`stat` のみ。両方 stale でなければここで抜ける)
+  3. role の解決 (`registry/workers.yaml` を読む python3 サブプロセス。**両方 stale のときだけ**
+     走るので、通常運用 (両方健全) では 1 度も走らない)
+  4. throttle の判定と消費 (role が director と判明した呼び出しだけが行う。Worker は
+     一切消費しない)
+- 対象は role が director のセッションのみ。全 Worker のツール呼び出しにも同じ hook が刺さるが、
+  Worker には respawn も報告もできないので実際の通知は行わない。ただし role 自体の解決は、
+  **両方の heartbeat が stale と分かった呼び出しでは Worker であっても実行される** — 「誰が
+  呼んだか」は throttle より先に確定させる必要があるため。この分岐に入るのは mutual watch を
+  使っていて、かつ両デーモンが実際に stale な (= backstop が意味を持つ) 稀な状況に限られる。
+  **t008 原案 (2026-09-23) は role 解決を daemons/ の存在や throttle と無関係に毎ツール呼び出しで
+  走らせており、Director だけでなく全 Worker の全呼び出しが python3 起動コストを払っていた
+  (t047 で O-1 是正のため grep から python3 ヒアドキュメントに変わったのが引き金。実測
+  12ms→38ms、3.2倍。t009 2巡目 QA の F-3)。t048 で daemons/ の存在確認と throttle 判定を role 解決
+  より前に出したことで F-3 は閉じたが、その並べ替えは throttle マーカーの消費まで role 解決の
+  手前に動かしてしまい、新しい欠陥 (下記 F-4) を生んだ。t049 で throttle だけを role 解決の後段
+  (director のときだけ触る場所) に戻し、F-3 の是正 (daemons/ 不在なら python3 ゼロ) を保ったまま
+  F-4 を閉じた。**
+- throttle はマーカーファイル (`registry/daemons/backstop-notify.throttle`) の mtime で 60 秒に
+  1 回に抑える。マーカーの更新は「daemons/ あり かつ 両方 stale かつ director かつ 窓が開いている」を
+  全て通った後にしか起きない (t049。判定より先にマーカーを更新すると F-4 を再発させる)。
+  通知を出す呼び出しがマーカーを更新するので、同時に複数の PostToolUse が走っても
+  直後の呼び出しは早期リターンする (完全な排他ではないが、この hook にロックを持ち込むほどの
+  重さではない — 最悪でも throttle 窓の中で数回検知メッセージが重複するだけで、実害は無い)。
+  **このマーカーは全エージェント共有 (agent 別ではない) だが、role が director の呼び出ししか
+  触らない (t049)。** Worker のツール呼び出しは role 解決までは行うが、throttle の判定・消費には
+  一切踏み込まないので、Worker が並行して動いていても Director の通知窓を奪わない。
+
+  **t048 での事故 (F-4, t009 3巡目 QA, 修正済み)。** throttle 消費を role 解決の**前**に置いた
+  結果、マーカーが全エージェント共有のまま「最初にこの窓を触った呼び出し」が誰であるかに
+  関わらず消費されるようになり、Worker のツール呼び出し 1 回で Director の窓が丸ごと潰れていた。
+  実測では「次の窓まで遅れる」ではなく、Worker が先に呼ぶ限り**恒久的に**Director へ届かない
+  (連続 5 窓で到達 0/5)。backstop が意味を持つのは Worker が動いている並列モードだけなので、
+  この欠陥は実運用条件下で要件 1 (両デーモン停止時に Director に通知が届くこと) を満たさなかった。
+  複雑な per-agent throttle (`backstop-notify.<AGENT_NAME>.throttle`) を導入する案もあったが、
+  上記の判定順の並べ替え (throttle を director 専用の最終ゲートにする) だけで十分に閉じたため
+  採用しなかった。
+
+**Director への伝え方 — exit code 2 を使う。** Claude Code の PostToolUse hook は exit code 2 で
+終わると、ツールは既に実行済みのままブロックはせず、**stderr をそのまま呼び出し元 (Director) の
+文脈に見せる**。これはポーリングさせずに「Director が何か操作した拍子に勝手に届く」を実現する
+標準的な方法である。
+
+既存の crash guard (`trap '_crash_guard' EXIT`) は非ゼロ終了を全部 0 に握り潰す設計だったので、
+そのままでは意図した exit 2 も握り潰されてしまう。`_INTENTIONAL_EXIT_CODE` という変数を挟み、
+crash guard は「予期しないクラッシュ (`_INTENTIONAL_EXIT_CODE` と食い違う非ゼロ終了)」だけを
+警告付きで 0 に収束させ、`_INTENTIONAL_EXIT_CODE=2` をセットした意図的な経路はそのまま通す形に
+した。crash guard 自体の「失敗しても Worker/Director の動作を止めない」という不変条件は変えて
+いない — 意図的な exit 2 はツール実行を止めない (PostToolUse は事後フックなので、そもそもブロック
+する権限が無い)。
+
+**respawn はしない。** この hook が見つけたら唯一やることは「1 行出す」だけで、`mux.spawn()` は
+一切呼ばない。理由は 2 つ: (1) Claude Code の hook はタイムアウトに敏感で、mux の subprocess 呼び
+出しを混ぜると全ツール呼び出しの体感速度が悪化する、(2) respawn の判断 (flap ガード・pause
+マーカー確認・pane owner 確認) を省略した簡易実装で行うと、§7 が積み上げた fail-closed の設計を
+迂回する非公式な第二の respawn 経路になってしまう。Director が `status` で裏を取ってから
+`lib_daemon_watch.py restart` を手で打つ、という一段人間を挟む設計にした
+(`agents/director.md` §14「両デーモンの同時死 backstop」)。
+
+#### 回帰テストの形
+
+`tests/test_daemon_backstop_hook.py`。**本物の `hooks/post-tool-use.sh` を subprocess で実行**する
+— ロジックを Python で再実装したテストは hook を直したことを一切証明しないため使わない (§6-5 の
+教訓と同じ形)。両方 stale で exit 2 になること、片方だけでは発火しないこと、director 以外の
+role では発火しないこと、throttle が効くこと・窓が空けば再発火すること、`registry/daemons/` が
+無い (mutual watch 未使用) 環境で誤検知しないこと、しきい値が env var で上書きできることを
+それぞれ担保する。RED は、fix 前の `hooks/post-tool-use.sh` (git HEAD) に対して同じテストを
+流し、4 本が意図通り fail することで確認した。
+
+**t049 で追加した 4 本。** F-4 (Worker が窓を消費する) の回帰防止として、Worker が 1 回呼んだ
+直後に Director が呼んでも通知が届くこと、連続 3 窓すべてで Worker が先に呼んでも Director が
+毎回届くことを固定した。O-9 (t048 の並べ替えを守る回帰テストが無かった) の是正として、
+`registry/daemons/` 不在時と、両デーモンが健全 (fresh) な時に role 解決の python3 が
+1 回も起動しないことを、PATH に計数スタブを挿して固定した。4 本とも t048 (`d1bcead`) に対して
+3 本が意図通り fail する (`test_healthy_daemons_never_invoke_python3` は daemons/ 不在の分岐が
+t048 の時点で既に成立していたため元々 green) ことを確認済み。
+
+---
+
 ## 8. 参照
 
 - `scripts/dispatcher.sh` — D1 :998、D2 :1210、D3 :1239、D4 :1351、D5 :819、
@@ -1915,5 +2017,7 @@ starttime の数え方の一致) は、使い捨てディレクトリに sleep �
   `_hold()` (§7-4)、`pause()` / `resume()` / `restart()` (§7-5)、
   `_flap_entries()` (§7-6)、`spawn_command()` (§7-7)
 - `scripts/lib_daemon_watch.sh` — dispatcher の heartbeat を bash から書く (§7-2)
+- `hooks/post-tool-use.sh` — 同時死の backstop (§7-13)。`_INTENTIONAL_EXIT_CODE` /
+  `daemon-backstop` セクション。`tests/test_daemon_backstop_hook.py` が回帰テスト
 - `knowledge/dispatcher-restart-after-merge.md` — 常駐デーモンの反映手順。
   **§7-5 の pause を挟む手順が追加された**ので、kill → spawn を素で打たないこと

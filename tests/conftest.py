@@ -81,3 +81,74 @@ def production_destination(monkeypatch):
     monkeypatch.setenv("CREWVIA_HERDR_WORKSPACE", PRODUCTION_DESTINATION)
     monkeypatch.setenv("CREWVIA_MUX_PANE_PREFIX", "")
     return PRODUCTION_DESTINATION
+
+
+# ---------------------------------------------------------------------------
+# 本物の「空のペイン」 — idle なシェルを pty の上に立てる
+# ---------------------------------------------------------------------------
+#
+# t041 (Codex 6 巡目 P1-1) で、ペインが空であることは**積極的に示す**ものになった:
+# root プロセスがシェルで、argv が 1 語で、端末を持ち、その端末の前景グループで、
+# 眠っていて、子が居ない。それ以前は「中の人を認識できなかった」だけで空と
+# 見なされていたので、テストは *python プロセス自身* を husk の代わりに使えていた。
+# python は idle なシェルではないので、もう代わりにならない。
+#
+# 代わりにここで本物を 1 つ用意する。fake が返す pid がこれになることで、
+# 「husk は今まで通り片付けられる」というテストが、**本物の husk** に対して
+# 行われるようになる。
+
+@pytest.fixture
+def idle_pane_shell(tmp_path):
+    """実在する idle なペインシェルの pid を返す。"""
+    import os
+    import pty
+    import signal
+    import sys
+    import time
+
+    sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent.parent / "scripts"))
+    import lib_mux
+
+    # 素の HOME。実機の ~/.bashrc は自前でプロセスを起こす (tmux auto-attach 等) ので、
+    # それを読むと「子の居ないシェル」ではなくなる。
+    home = tmp_path / "pane-home"
+    home.mkdir(exist_ok=True)
+
+    pid, fd = pty.fork()
+    if pid == 0:
+        try:
+            os.environ["HOME"] = str(home)
+            os.environ["PS1"] = "$ "
+            for leak in ("BASH_ENV", "ENV"):
+                os.environ.pop(leak, None)
+            os.execvp("bash", ["bash"])     # argv 1 語、tty 上で対話
+        except BaseException:
+            os._exit(127)
+
+    # idle で、かつ**少し後もまだ idle**であること。起動ファイルにまだ取りかかって
+    # いないシェルは、読み終えて待っているシェルと見分けがつかない。
+    deadline = time.time() + 10.0
+    stable = 0
+    while time.time() < deadline:
+        if lib_mux._pane_shell_state(pid) == lib_mux.PANE_IDLE:
+            stable += 1
+            if stable >= 3:
+                break
+        else:
+            stable = 0
+        time.sleep(0.1)
+    else:
+        os.kill(pid, signal.SIGKILL)
+        os.waitpid(pid, 0)
+        os.close(fd)
+        pytest.skip("could not bring up an idle shell on a pty")
+
+    try:
+        yield pid
+    finally:
+        try:
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+        except (ProcessLookupError, ChildProcessError):
+            pass
+        os.close(fd)

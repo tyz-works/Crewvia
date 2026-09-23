@@ -72,8 +72,17 @@ def _fake_proc(tmp_path, entries, *, name="proc"):
         d = proc / str(pid)
         d.mkdir(parents=True, exist_ok=True)
         (d / "cmdline").write_bytes(b"\0".join(a.encode() for a in argv) + b"\0")
+        # fields after the last ')': 0 state, 1 ppid, 2 pgrp, 3 session,
+        # 4 tty_nr, 5 tpgid.  These used to be all-zero, which modelled a
+        # process with **no controlling terminal** — i.e. not a pane shell at
+        # all.  Nothing read them until t041 made "the pane is empty" require
+        # the root to be a *positively identified* idle shell, and an
+        # under-specified root is exactly the blind spot Codex 6巡目 P1-1 came
+        # out of.  A pane shell owns its terminal's foreground group, so:
+        # pgrp = session = tpgid = pid, on a tty.
         (d / "stat").write_text(
-            f"{pid} (bash) S {ppid} 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1234",
+            f"{pid} (bash) S {ppid} {pid} {pid} 1234 {pid} "
+            + " ".join(["0"] * 14),
             encoding="utf-8")
         if cwd is not None:
             target = Path(cwd)

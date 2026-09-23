@@ -28,7 +28,11 @@ Worker の割り当てが止まった。経緯と仕組みは `tests/conftest.py
   python3 -m pytest tests/test_mux_production_safety.py -v
 """
 
+import json
 import os
+import time
+import signal
+import pty
 import re
 import subprocess
 import sys
@@ -64,15 +68,24 @@ class _RecordingSubprocess:
         self.calls.append(list(argv))
         text = kwargs.get("text", False)
         out = ""
-        if "display-message" in argv:
+        if "display-message" in argv or (
+                ("new-window" in argv or "new-session" in argv)
+                and "-P" in argv and "-F" in argv):
             # Substitute the format the way tmux does.  A stub that answers
             # only the format string it was written against turns a change in
             # the caller into a fake refusal — the identity guard would read
             # "no pane pid" and refuse, and every test here would go red for a
             # reason that does not exist in production
             # (memory: crewvia-fake-cli-and-qa-fail-gaps).
+            #
+            # `new-window -P -F` is answered for the same reason: since t041
+            # spawn() takes the window id from the command that *created* the
+            # window instead of looking it up by name afterwards.
             out = (argv[-1].replace("#{window_id}", "@1")
-                           .replace("#{pane_pid}", str(os.getpid())) + "\n")
+                           .replace("#{pane_pid}", str(os.getpid()))
+                           .replace("#{pid}", "900")
+                           .replace("#{socket_path}", "/tmp/tmux-test/default")
+                   + "\n")
         return subprocess.CompletedProcess(
             list(argv), 0,
             stdout=out if text else out.encode(),
@@ -164,7 +177,7 @@ def test_a_missing_pane_prefix_is_refused_even_on_an_isolated_destination(
     assert recording_tmux.tmux_calls() == []
 
 
-def test_under_isolation_the_pane_name_is_namespaced(recording_tmux):
+def test_under_isolation_the_pane_name_is_namespaced(recording_tmux, own_records):
     """conftest が効いている通常のテストでは、`dispatcher` は本番の `dispatcher`
     ではない別のペインに解決される。
 
@@ -172,6 +185,7 @@ def test_under_isolation_the_pane_name_is_namespaced(recording_tmux):
     """
     prefix = os.environ["CREWVIA_MUX_PANE_PREFIX"]
     assert prefix, "conftest did not install a pane prefix"
+    _record_this_pane(dw.DAEMON_DISPATCHER)
 
     lib_mux.TmuxBackend().kill(dw.DAEMON_DISPATCHER)
 
@@ -208,7 +222,8 @@ def test_list_hides_the_namespace_from_callers(monkeypatch):
     assert lib_mux.TmuxBackend().list(suffix="-worker") == ["Ren-worker"]
 
 
-def test_production_keeps_its_bare_names_and_no_guard(monkeypatch, recording_tmux):
+def test_production_keeps_its_bare_names_and_no_guard(monkeypatch, recording_tmux,
+                                                     own_records):
     """本番 (= 隔離マーカーが無い) では、この層は完全な no-op でなければならない。
 
     接頭辞が既定で空であること、ガードが本番を止めないこと。ここが崩れると
@@ -218,6 +233,7 @@ def test_production_keeps_its_bare_names_and_no_guard(monkeypatch, recording_tmu
                 "CREWVIA_MUX_PANE_PREFIX"):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("CREWVIA_TMUX_SESSION", PRODUCTION_DESTINATION)
+    _record_this_pane(dw.DAEMON_DISPATCHER)   # written under the bare name now
 
     assert lib_mux.TmuxBackend().kill(dw.DAEMON_DISPATCHER) is True
     assert recording_tmux.addressed("display-message") == \
@@ -241,14 +257,49 @@ printf '%s\\n' "$*" >> "$TMUX_STUB_LOG"
 # tmux が返すのは「フォーマット文字列を置換したもの」なので、この偽物もそう振る舞う。
 # 聞かれた書式だけを決め打ちで返す偽物は、呼び手が書式を変えた瞬間に「ペインの pid が
 # 取れない」= 本番には存在しない拒否を作り出す (memory: crewvia-fake-cli-and-qa-fail-gaps)。
-if [ "$1" = "display-message" ]; then
+if [ "$1" = "display-message" ] || [ "$1" = "new-window" ] \
+   || [ "$1" = "new-session" ]; then
   fmt="${!#}"
   fmt="${fmt//'#{window_id}'/@1}"
-  fmt="${fmt//'#{pane_pid}'/$PPID}"
+  fmt="${fmt//'#{pane_pid}'/${CREWVIA_STUB_PANE_PID:-$PPID}}"
+  fmt="${fmt//'#{pid}'/900}"
+  fmt="${fmt//'#{socket_path}'//tmp/tmux-test/default}"
   printf '%s\\n' "$fmt"
 fi
 exit 0
 """
+
+#: What the stub above claims to be, as `(endpoint, generation)`.  A spawn
+#: record has to agree with it or the kill is (correctly) refused.
+STUB_SERVER = ("/tmp/tmux-test/default", "900")
+
+
+# `idle_pane_shell` (a real interactive shell on a real pty) lives in
+# tests/conftest.py — the daemon-watch tests need the same thing, and two
+# copies of "what an empty pane actually looks like" is exactly the kind of
+# drift this module exists to stop.
+
+
+@pytest.fixture
+def own_records(tmp_path, monkeypatch):
+    """Point spawn records at a directory of this test's own.
+
+    The destruction gate needs *provenance* since t040: a pane is ours to end
+    because we recorded creating it.  The tests below are about the pane-name
+    namespace and about the guard being a no-op in production, not about the
+    verdict, so they write the record that makes the kill legitimate rather
+    than relying on the pane reading as empty — which it did only because the
+    pytest process happened to have no children (t041 P1-1 closed that: a
+    root process that is not an idle shell is no longer "nothing there").
+    """
+    root = tmp_path / "own"
+    (root / "registry" / "mux").mkdir(parents=True)
+    monkeypatch.setattr(lib_mux, "_own_repo_root", lambda: root)
+    return root
+
+
+def _record_this_pane(name, handle="@1", server=STUB_SERVER):
+    assert lib_mux.write_pane_record(name, "tmux", handle, server=server)
 
 
 @pytest.fixture
@@ -309,7 +360,8 @@ def test_the_incident_shape_is_refused_end_to_end(stub_tmux, healthy_repo):
     assert not dw.pause_path(healthy_repo / "registry", dw.DAEMON_DISPATCHER).exists()
 
 
-def test_the_isolated_shape_still_works_end_to_end(stub_tmux, healthy_repo):
+def test_the_isolated_shape_still_works_end_to_end(stub_tmux, healthy_repo,
+                                                   idle_pane_shell):
     """隔離された宛先なら、同じ CLI は今まで通り動く。
 
     ガードが「テストでは何もできない」になっていないことの確認。これが無いと、
@@ -322,11 +374,28 @@ def test_the_isolated_shape_still_works_end_to_end(stub_tmux, healthy_repo):
     env["CREWVIA_TMUX_SESSION"] = "crewvia-pytest-isolated"
     env["CREWVIA_MUX_PANE_PREFIX"] = "pytest-isolated-"
     env["CREWVIA_MUX_TEST_ISOLATION"] = "1"
+    env["CREWVIA_STUB_PANE_PID"] = str(idle_pane_shell)
 
-    out = subprocess.run(
-        [sys.executable, str(SCRIPTS / "lib_daemon_watch.py"), "restart",
-         dw.DAEMON_DISPATCHER, "--repo-root", str(healthy_repo)],
-        capture_output=True, text=True, timeout=60, env=env)
+    # The CLI runs in its own process, so `_own_repo_root()` is this checkout
+    # and no monkeypatch can move it.  The pane is only destroyable if this
+    # checkout recorded creating it (t040), so write that record where the
+    # subprocess will look — under the namespaced name, which is why it can
+    # never collide with a production record.
+    record = lib_mux.pane_record_dir() / f"{env['CREWVIA_MUX_PANE_PREFIX']}{dw.DAEMON_DISPATCHER}.json"
+    record.parent.mkdir(parents=True, exist_ok=True)
+    record.write_text(json.dumps({
+        "handle": "@1", "tab_id": "@1", "pane_id": "", "backend": "tmux",
+        "checkout": str(lib_mux._own_repo_root().resolve()),
+        "server": {"endpoint": STUB_SERVER[0], "generation": STUB_SERVER[1]},
+        "created_at": "2026-09-23T00:00:00Z",
+    }), encoding="utf-8")
+    try:
+        out = subprocess.run(
+            [sys.executable, str(SCRIPTS / "lib_daemon_watch.py"), "restart",
+             dw.DAEMON_DISPATCHER, "--repo-root", str(healthy_repo)],
+            capture_output=True, text=True, timeout=60, env=env)
+    finally:
+        record.unlink(missing_ok=True)
 
     log = stub_tmux["log"].read_text(encoding="utf-8")
     assert "kill-window" in log, (out.stdout, out.stderr, log)
@@ -368,9 +437,14 @@ def _fake_proc(tmp_path, entries):
         d = proc / str(pid)
         d.mkdir(parents=True, exist_ok=True)
         (d / "cmdline").write_bytes(b"\0".join(a.encode() for a in argv) + b"\0")
-        # /proc/<pid>/stat: pid (comm) state ppid ...
-        (d / "stat").write_text(f"{pid} (bash) S {ppid} 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1234",
-                                encoding="utf-8")
+        # /proc/<pid>/stat: pid (comm) state ppid pgrp session tty tpgid ...
+        # A pane shell owns its terminal's foreground group; the all-zero
+        # version modelled a process with no tty, which t041 now reads as
+        # "not demonstrably an idle shell" (Codex 6巡目 P1-1).
+        (d / "stat").write_text(
+            f"{pid} (bash) S {ppid} {pid} {pid} 1234 {pid} "
+            + " ".join(["0"] * 14),
+            encoding="utf-8")
     return str(proc)
 
 

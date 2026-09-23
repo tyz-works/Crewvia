@@ -71,11 +71,12 @@ class FakeMux:
     5s timeout; HerdrBackend.list returns [] when the workspace lookup fails).
     """
 
-    def __init__(self, windows=None, spawn_ok=True):
+    def __init__(self, windows=None, spawn_ok=True, pane_pid=None):
         self.windows = list(windows) if windows is not None else []
         self.spawn_ok = spawn_ok
         self.spawned = []
         self.sent = []
+        self.pane_pid = pane_pid
 
     def list(self, suffix=None):
         names = list(self.windows)
@@ -94,20 +95,24 @@ class FakeMux:
         return True
 
     def pid(self, name):
-        """The pane's shell pid — this test process.
+        """The pane's shell pid.
 
         `restart()` reads it to ask *whose daemon is in that pane* before
-        killing anything (t037).  Answering with our own pid models the
-        ordinary case the fake stands for: a pane that exists and holds
-        nothing belonging to the checkout under test, i.e. the husk a crash
-        leaves behind, which restart must still be able to replace.
+        killing anything (t037).  Deliberately a **real** pid: the ownership
+        check walks the real /proc from here, so a made-up number would make
+        every test that uses this fake pass through the "could not read it"
+        branch instead of the one production takes.
 
-        Deliberately a **real** pid: the ownership check walks the real
-        /proc from here, so a made-up number would make every test that uses
-        this fake pass through the "could not read it" branch instead of the
-        one production takes.
+        A test that needs the pane to read as the **husk a crash leaves
+        behind** must pass `pane_pid=` the `idle_pane_shell` fixture.  This
+        process is not a substitute for one: since t041 (Codex 6巡目 P1-1)
+        "nothing recognisable in there" is no longer "nothing in there", and
+        a pane rooted at python is `UNKNOWN` — which is the correct answer
+        for it, and the reason the old default silently stopped meaning
+        "husk".  It stays the default for the many tests that never reach the
+        destruction gate at all.
         """
-        return os.getpid()
+        return os.getpid() if self.pane_pid is None else self.pane_pid
 
 
 class DeadMux(FakeMux):
@@ -705,11 +710,11 @@ class RecordingMux(FakeMux):
         return super().spawn(name, cmd, cwd=cwd, env=env)
 
 
-def test_restart_holds_the_marker_across_kill_and_spawn(repo):
+def test_restart_holds_the_marker_across_kill_and_spawn(repo, idle_pane_shell):
     """Behavioural companion to the structural check: the marker must exist for
     the whole dangerous stretch, and must be gone afterwards."""
     registry = repo / "registry"
-    mux = RecordingMux(windows=["dispatcher"])
+    mux = RecordingMux(windows=["dispatcher"], pane_pid=idle_pane_shell)
     seen = []
     mux_kill, mux_spawn = mux.kill, mux.spawn
     mux.kill = lambda n: (seen.append(("kill", dw.pause_path(registry, n).exists())),

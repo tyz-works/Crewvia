@@ -48,6 +48,7 @@ import os
 import re
 import shutil
 import socket
+import struct
 import subprocess
 import sys
 import time
@@ -294,7 +295,36 @@ class _Backend:
         """
         raise NotImplementedError
 
-    def _refuses_foreign_daemon(self, name: str, handle, pane_pid) -> bool:
+    def server_identity(self):
+        """`(endpoint, generation)` for the mux server, or None.
+
+        `endpoint` distinguishes two servers running side by side (a tmux
+        socket path, herdr's API socket); `generation` distinguishes one
+        server's lifetime from the next one's at the same endpoint.  A pane
+        id is only meaningful inside one `(endpoint, generation)`, so a spawn
+        record that does not carry this is a claim about an id that the next
+        server is free to hand to somebody else (Codex 6巡目 P1-3).
+
+        None means "could not be established", which `pane_record_status()`
+        reads as a refusal rather than as a match — with `--force` as the way
+        past it.
+        """
+        return None
+
+    def _inspect_pane_full(self, name: str):
+        """`(handle, pane_pid, server)` — `_inspect_pane()` plus the server.
+
+        Overridden where the backend can answer all three from one query, so
+        that the pane judged and the pane destroyed are the same pane on the
+        same server.  The default asks separately, which is still correct:
+        a server that changed between the two answers cannot match the record
+        either way.
+        """
+        handle, pane_pid = self._inspect_pane(name)
+        return handle, pane_pid, self.server_identity()
+
+    def _refuses_foreign_daemon(self, name: str, handle, pane_pid,
+                                server=None) -> bool:
         """True unless `name`'s pane is provably this checkout's to destroy.
 
         Delegates the whole judgment to `may_destroy_pane()` — one decision
@@ -310,7 +340,7 @@ class _Backend:
         per-backend divergence.
         """
         allowed, reason = may_destroy_pane(
-            name, self.BACKEND_NAME, handle, pane_pid)
+            name, self.BACKEND_NAME, handle, pane_pid, server=server)
         if allowed:
             return False
         self._warn(
@@ -344,8 +374,9 @@ class _Backend:
         a second time, so the answer that governs is still the one `kill()`
         takes from its own inspection.
         """
-        handle, pane_pid = self._inspect_pane(name)
-        return may_destroy_pane(name, self.BACKEND_NAME, handle, pane_pid)
+        handle, pane_pid, server = self._inspect_pane_full(name)
+        return may_destroy_pane(name, self.BACKEND_NAME, handle, pane_pid,
+                                server=server)
 
     def _warn(self, msg: str) -> None:
         print(f"[mux:{self.BACKEND_NAME}] WARNING: {msg}", file=sys.stderr)
@@ -704,6 +735,10 @@ def _pane_shell_is_idle(pane_pid, proc_root: str = "/proc") -> bool:
 #
 # Neither layer replaces the env-based isolation; it stays as the convenience
 # layer that keeps a test from *naming* a production pane in the first place.
+
+#: "the caller did not supply this", kept apart from `None`, which is a real
+#: answer meaning "the pane has no readable pid".
+_UNSET = object()
 
 #: `/proc`, as a module-level name so tests can point the identity layer at a
 #: fixture without threading a parameter through every backend verb.  Never
@@ -1089,28 +1124,39 @@ def script_owner(pid, argv, script: str, mine: str, *, proc_root: str):
 
 
 def _pane_recognition(pane_pid, targets, *, proc_root: str):
-    """`(verdicts, others, problem)` from **one** walk of `pane_pid`.
+    """`(verdicts, others, problem, root_state)` from **one** walk of `pane_pid`.
 
     `targets` is `[(script, mine), …]`; `verdicts` maps each owner this walk
     recognised to the detail that justified it; `others` is the set of live
     pids under the pane apart from its own shell; `problem` is a detail string
-    when the walk could not be completed at all, and None otherwise.
+    when the walk could not be completed at all, and None otherwise;
+    `root_state` is what the pane's own root process turned out to be
+    (`PANE_IDLE` / `PANE_LIVE` / `PANE_UNKNOWN`).
 
     One walk rather than one per script, because the two questions a caller
     asks — "is *this* script in there?" and "is the pane empty?" — have to be
     answered about the same instant, and because folding a second script's
     "I did not recognise anything" into the first script's answer turns a pane
     running our own dispatcher into an undecided one.
+
+    `root_state` exists because `others` deliberately drops `pane_pid`, and
+    that subtraction used to be unconditional.  Dropping the root is only
+    right when the root really is the pane's idle shell; when the shell has
+    `exec`'d a daemon — through an alias `script_owner()` cannot resolve, say
+    — the root *is* the occupant, and subtracting it left `others` empty and
+    the pane classified as provably empty (Codex 6巡目 P1-1).  Whether the
+    root is a shell is a separate fact from whether argv is recognisable, and
+    it has to be established positively rather than assumed.
     """
     try:
         pane_pid = int(pane_pid)
     except (TypeError, ValueError):
-        return {}, set(), f"unusable pane pid {pane_pid!r}"
+        return {}, set(), f"unusable pane pid {pane_pid!r}", PANE_UNKNOWN
     table = proc_table(proc_root)
     if table is None:
-        return {}, set(), f"{proc_root} could not be walked completely"
+        return {}, set(), f"{proc_root} could not be walked completely", PANE_UNKNOWN
     if pane_pid not in table:
-        return {}, set(), f"pane pid {pane_pid} is not in {proc_root}"
+        return {}, set(), f"pane pid {pane_pid} is not in {proc_root}", PANE_UNKNOWN
 
     under = descendants(table, pane_pid)
     verdicts: dict = {}
@@ -1121,19 +1167,29 @@ def _pane_recognition(pane_pid, targets, *, proc_root: str):
                 proc_root=proc_root)
             if owner != OWNER_NONE:
                 verdicts.setdefault(owner, detail)
-    return verdicts, under - {pane_pid}, None
+    root_state = _pane_shell_state(pane_pid, proc_root)
+    return verdicts, under - {pane_pid}, None, root_state
 
 
-def _settle_pane(verdicts: dict, others: set, pane_pid, what: str):
+def _settle_pane(verdicts: dict, others: set, pane_pid, what: str,
+                 root_state: str = PANE_UNKNOWN):
     """The pane's verdict once the walk is done.
 
     `NONE` is a claim about the pane, not about how the scan went.  "Nothing
     in there was recognisable" and "there is nothing in there" are different
     answers, and only the second is a reason to destroy it — every P1 in this
     area has been the classifier failing to recognise something and the pane
-    being read as empty because of it.  So `NONE` now requires the positive
-    fact: nothing but the pane's own shell is running.  A husk is exactly
-    that, which is what keeps ordinary crash recovery working (t035).
+    being read as empty because of it.  So `NONE` requires two positive facts
+    together:
+
+      * nothing but the pane's root process is running, **and**
+      * that root process is demonstrably an **idle shell** — the same test
+        `spawn()` already applies before it relaunches into a pane, so the two
+        cannot disagree about what a reusable husk is.
+
+    A husk satisfies both, which is what keeps ordinary crash recovery working
+    (t035).  A pane whose root has `exec`'d something unrecognisable satisfies
+    only the first, and that gap is what authorised destroying it.
     """
     for owner in _OWNER_PRECEDENCE:
         if owner in verdicts:
@@ -1145,8 +1201,15 @@ def _settle_pane(verdicts: dict, others: set, pane_pid, what: str):
             f"its shell ({shown}{'…' if len(others) > 5 else ''}) and none of "
             f"them could be identified as {what}; not recognised is not "
             f"not there")
+    if root_state != PANE_IDLE:
+        return OWNER_UNKNOWN, (
+            f"nothing under pane pid {pane_pid} could be identified as {what}, "
+            f"and its root process is not a shell sitting at a prompt "
+            f"({root_state}) — so the root is itself running something, and "
+            f"what that is could not be established")
     return OWNER_NONE, (
-        f"nothing but the pane shell is running under pane pid {pane_pid}")
+        f"nothing but the pane's idle shell is running under pane pid "
+        f"{pane_pid}")
 
 
 def pane_script_owner(pane_pid, script: str, mine: str, *,
@@ -1159,11 +1222,11 @@ def pane_script_owner(pane_pid, script: str, mine: str, *,
     read, and a guard that only holds while everything is readable is not one.
     """
     proc_root = _PROC_ROOT if proc_root is None else proc_root
-    verdicts, others, problem = _pane_recognition(
+    verdicts, others, problem, root_state = _pane_recognition(
         pane_pid, [(script, mine)], proc_root=proc_root)
     if problem is not None:
         return OWNER_UNKNOWN, problem
-    return _settle_pane(verdicts, others, pane_pid, script)
+    return _settle_pane(verdicts, others, pane_pid, script, root_state)
 
 
 #: Classifier answers that forbid destruction outright, whatever else is known.
@@ -1193,13 +1256,14 @@ def daemon_pane_owner(pane_pid, *, repo_root=None,
     """
     root = Path(repo_root) if repo_root is not None else _own_repo_root()
     proc_root = _PROC_ROOT if proc_root is None else proc_root
-    verdicts, others, problem = _pane_recognition(
+    verdicts, others, problem, root_state = _pane_recognition(
         pane_pid,
         [(script, str(root / "scripts" / script)) for script in DAEMON_SCRIPTS],
         proc_root=proc_root)
     if problem is not None:
         return OWNER_UNKNOWN, problem
-    return _settle_pane(verdicts, others, pane_pid, "a crewvia daemon")
+    return _settle_pane(verdicts, others, pane_pid, "a crewvia daemon",
+                        root_state)
 
 
 # ---------------------------------------------------------------------------
@@ -1251,22 +1315,71 @@ def pane_record_path(name: str, *, repo_root=None) -> Path:
     return pane_record_dir(repo_root) / f"{_pane_name(name)}.json"
 
 
+def _record_checkout_identity(repo_root=None) -> str:
+    """The checkout a record belongs to, as it is written into the record.
+
+    The *content* of the record, not merely its location.  Anchoring the file
+    under `_own_repo_root()` isolates records only while every checkout has a
+    directory of its own; two worktrees sharing `registry/mux` through a
+    symlink — or a record simply copied from one tree to another — both read
+    the same file and, before this, both recognised it as their own (Codex
+    6巡目 P1-2).  A path written *into* the file survives both.
+    """
+    root = Path(repo_root) if repo_root is not None else _own_repo_root()
+    try:
+        return str(root.resolve())
+    except OSError:
+        return str(root)
+
+
+def _record_storage_is_shared(repo_root=None) -> bool:
+    """Whether this checkout's record directory can be reached by another one.
+
+    True when any component of `registry/mux` leaves the checkout — i.e. the
+    directory resolves somewhere other than directly beneath our own root.
+    That is exactly the condition under which "the file is under my root"
+    stops being evidence of who wrote it, and therefore the condition under
+    which a record with no recorded provenance has to be refused.
+
+    Unreadable answers count as shared: this is the input to a *migration*
+    allowance, so the direction to fail in is "do not extend the allowance".
+    """
+    root = Path(repo_root) if repo_root is not None else _own_repo_root()
+    directory = pane_record_dir(repo_root)
+    try:
+        return directory.resolve() != (root.resolve() / _PANE_RECORD_DIR_NAME)
+    except OSError:
+        return True
+
+
 def write_pane_record(name: str, backend: str, handle: str, *,
-                      pane_id: str = "", repo_root=None) -> bool:
-    """Note that *this* checkout created `name`'s pane, as `handle`."""
+                      pane_id: str = "", server=None, repo_root=None) -> bool:
+    """Note that *this* checkout created `name`'s pane, as `handle`.
+
+    `server` is `(endpoint, generation)` for the mux server the pane was
+    created on, or None when the backend could not establish one.  A pane id
+    is unique only within one server's lifetime, so without it the record is
+    a claim about an id that a later server can hand to somebody else.
+    """
     path = pane_record_path(name, repo_root=repo_root)
+    record = {
+        "handle": str(handle or ""),
+        # `tab_id` / `pane_id` are what HerdrBackend already resolved
+        # sends/captures through; `handle` is the one the guard reads, and
+        # for herdr they are the same string.
+        "tab_id": str(handle or ""),
+        "pane_id": str(pane_id or ""),
+        "backend": backend,
+        "checkout": _record_checkout_identity(repo_root),
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    if server is not None:
+        endpoint, generation = server
+        record["server"] = {"endpoint": str(endpoint),
+                            "generation": str(generation)}
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({
-            "handle": str(handle or ""),
-            # `tab_id` / `pane_id` are what HerdrBackend already resolved
-            # sends/captures through; `handle` is the one the guard reads, and
-            # for herdr they are the same string.
-            "tab_id": str(handle or ""),
-            "pane_id": str(pane_id or ""),
-            "backend": backend,
-            "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        }, indent=2), encoding="utf-8")
+        path.write_text(json.dumps(record, indent=2), encoding="utf-8")
         return True
     except Exception as exc:
         print(f"[mux] WARNING: could not record the spawn of {name!r} at "
@@ -1293,7 +1406,8 @@ def drop_pane_record(name: str, *, repo_root=None) -> None:
               f"{exc}", file=sys.stderr)
 
 
-def pane_record_status(name: str, backend: str, handle, *, repo_root=None):
+def pane_record_status(name: str, backend: str, handle, *, server=None,
+                       repo_root=None):
     """`(status, detail)` — does our own record name the pane we are holding?
 
     `handle` is the identifier the backend handed back from the *same* query
@@ -1301,12 +1415,21 @@ def pane_record_status(name: str, backend: str, handle, *, repo_root=None):
     with the thing that was created.  Names are not compared at all: a name is
     what another checkout can move onto a different pane between two calls,
     and doing exactly that is how the 4th round's P1-4 was demonstrated.
+
+    `server` is the mux server the caller is holding the pane on, as
+    `(endpoint, generation)`.  A pane id means nothing without it: a tmux
+    `@window_id` is unique only inside one server's lifetime, records outlive
+    both external window destruction and server shutdown, and a second socket
+    can hand out the very same id at the same moment (Codex 6巡目 P1-3).
+
+    Three things therefore have to line up, not one: the checkout that wrote
+    the record, the server it was written against, and the id itself.
     """
     record = read_pane_record(name, repo_root=repo_root)
+    path = pane_record_path(name, repo_root=repo_root)
     if record is None:
         return PANE_RECORD_ABSENT, (
-            f"this checkout has no spawn record at "
-            f"{pane_record_path(name, repo_root=repo_root)}")
+            f"this checkout has no spawn record at {path}")
     recorded = str(record.get("handle") or record.get("tab_id") or "")
     if not recorded:
         return PANE_RECORD_MISMATCH, "the spawn record names no pane id"
@@ -1314,6 +1437,64 @@ def pane_record_status(name: str, backend: str, handle, *, repo_root=None):
         return PANE_RECORD_MISMATCH, (
             f"the spawn record was written by the {record.get('backend')!r} "
             f"backend, and this is {backend!r}")
+
+    # --- whose record is it? ------------------------------------------------
+    mine = _record_checkout_identity(repo_root)
+    written_by = record.get("checkout")
+    if written_by:
+        if str(written_by) != mine:
+            return PANE_RECORD_MISMATCH, (
+                f"the spawn record at {path} was written by the checkout at "
+                f"{written_by!r}, and this is {mine!r} — it is not ours")
+    elif _record_storage_is_shared(repo_root):
+        return PANE_RECORD_MISMATCH, (
+            f"the spawn record at {path} records no checkout, and the record "
+            f"directory is shared with other checkouts, so there is nothing "
+            f"to show it was written here — re-spawn the pane, or use "
+            f"--force if you mean to take it over")
+    else:
+        # Migration, and the only place a record without provenance is taken
+        # at its word.  Every daemon running across this change has one, and
+        # refusing them all would mean the panes they name could never be
+        # ended again — a permanent refusal is not a safe default, it is a
+        # different outage (memory: fail-closed-discard-vs-hold).  Its
+        # location is still weak evidence here, because nothing else can
+        # reach this directory.  It is never silent.
+        print(f"[mux] WARNING: the spawn record at {path} is in the legacy "
+              f"format (no checkout, no mux server recorded). It is being "
+              f"accepted because this record directory is not shared, but "
+              f"that is weaker than a record written by this checkout. It "
+              f"will be replaced the next time this pane is spawned.",
+              file=sys.stderr)
+        return PANE_RECORD_MATCH, (
+            f"spawned by this checkout as {recorded} (legacy record, "
+            f"provenance taken from its unshared location)")
+
+    # --- on which server, and which generation of it? -----------------------
+    recorded_server = record.get("server")
+    if isinstance(recorded_server, dict):
+        if server is None:
+            return PANE_RECORD_MISMATCH, (
+                f"the spawn record names the mux server "
+                f"{recorded_server.get('endpoint')!r} (generation "
+                f"{recorded_server.get('generation')!r}), but the current "
+                f"server could not be identified, so the record cannot be "
+                f"shown to be about this pane")
+        endpoint, generation = str(server[0]), str(server[1])
+        if str(recorded_server.get("endpoint")) != endpoint:
+            return PANE_RECORD_MISMATCH, (
+                f"the spawn record was written against the mux server at "
+                f"{recorded_server.get('endpoint')!r}, and this is "
+                f"{endpoint!r} — the same pane id on a different server is a "
+                f"different pane")
+        if str(recorded_server.get("generation")) != generation:
+            return PANE_RECORD_MISMATCH, (
+                f"the spawn record was written against generation "
+                f"{recorded_server.get('generation')!r} of the mux server, "
+                f"and this is {generation!r} — the server has restarted since, "
+                f"so {recorded!r} is free to have been given to somebody else")
+
+    # --- and is it this pane? ----------------------------------------------
     if not handle:
         return PANE_RECORD_MISMATCH, (
             "the backend would not say which pane it inspected, so there is "
@@ -1326,7 +1507,8 @@ def pane_record_status(name: str, backend: str, handle, *, repo_root=None):
 
 
 def may_destroy_pane(name: str, backend: str, handle, pane_pid, *,
-                     repo_root=None, proc_root: Optional[str] = None):
+                     server=None, repo_root=None,
+                     proc_root: Optional[str] = None):
     """`(allowed, reason)` — the one place that decides a pane may be destroyed.
 
     Two positive proofs, either of which is enough, and one veto:
@@ -1357,7 +1539,7 @@ def may_destroy_pane(name: str, backend: str, handle, pane_pid, *,
                        f"({owner}: {owner_detail})")
 
     status, record_detail = pane_record_status(
-        name, backend, handle, repo_root=repo_root)
+        name, backend, handle, server=server, repo_root=repo_root)
     if status == PANE_RECORD_MATCH:
         return True, record_detail
     if owner in _OWNERS_THAT_PROVE_EMPTY:
@@ -1429,21 +1611,28 @@ class TmuxBackend(_Backend):
         """
         return f"{_session()}:{_pane_name(name)}"
 
-    def _pane_process_state(self, name: str) -> str:
+    def _pane_process_state(self, name: str, pane_pid=_UNSET) -> str:
         """`PANE_IDLE` / `PANE_LIVE` / `PANE_UNKNOWN` for the window `name`.
 
         The tmux counterpart of HerdrBackend._pane_process_state, and the
         reason spawn() can tell a husk from an occupied window on both
         backends.  tmux offers no `process-info`, so the pane's shell pid
         (`#{pane_pid}`) is the entry point and /proc answers the rest.
+
+        `pane_pid` may be supplied by a caller that has already inspected the
+        pane, and spawn() does supply it: looking the name up again here would
+        be a second resolution, and the window under a name can change between
+        two of them (Codex 6巡目 P1-4).  Omitting it keeps the old behaviour
+        of resolving the name, which is right for a one-shot question.
         """
-        pane_pid = self.pid(name)
+        if pane_pid is _UNSET:
+            pane_pid = self.pid(name)
         if pane_pid is None:
             self._warn(f"could not read pane pid for {name!r} — pane state unknown")
             return PANE_UNKNOWN
-        return _pane_shell_state(pane_pid)
+        return _pane_shell_state(pane_pid, _PROC_ROOT)
 
-    def _pane_has_live_process(self, name: str) -> bool:
+    def _pane_has_live_process(self, name: str, pane_pid=_UNSET) -> bool:
         """True unless the window is *demonstrably* an idle shell.
 
         The occupancy question, where unknown must read as busy: never
@@ -1451,7 +1640,7 @@ class TmuxBackend(_Backend):
         question needs the opposite default and therefore uses
         `_pane_process_state()` directly.
         """
-        return self._pane_process_state(name) != PANE_IDLE
+        return self._pane_process_state(name, pane_pid) != PANE_IDLE
 
     def available(self) -> bool:
         return shutil.which("tmux") is not None
@@ -1500,13 +1689,18 @@ class TmuxBackend(_Backend):
                 capture_output=True, timeout=5,
             )
             if has.returncode != 0:
+                # `-P -F` so the id comes from the creation itself.  Resolving
+                # it afterwards by name is what let another checkout's window
+                # be recorded as ours (Codex 6巡目 P1-4).
                 r = subprocess.run(
-                    ["tmux", "new-session", "-d", "-s", session, "-n", window],
-                    capture_output=True, timeout=5,
+                    ["tmux", "new-session", "-d", "-s", session, "-n", window,
+                     "-P", "-F", "#{window_id}"],
+                    capture_output=True, text=True, timeout=5,
                 )
                 if r.returncode != 0:
-                    self._warn(f"new-session failed for {session!r}: {r.stderr.decode()}")
+                    self._warn(f"new-session failed for {session!r}: {r.stderr}")
                     return False
+                window_id = r.stdout.strip()
             else:
                 # Session exists — check if window already exists
                 existing = subprocess.run(
@@ -1514,44 +1708,66 @@ class TmuxBackend(_Backend):
                     capture_output=True, text=True, timeout=5,
                 )
                 if existing.returncode == 0 and window in existing.stdout.splitlines():
-                    if self._pane_has_live_process(name):
-                        return False  # live one in there → no-op, per spec
+                    # One inspection, and everything below uses *its* answer.
+                    # Asking again by name would re-open the very window this
+                    # is deciding about to replacement in between.
+                    inspected_id, pane_pid, _ = self._inspect_pane_full(name)
+                    if self._pane_has_live_process(name, pane_pid):
+                        return False  # live one (or unreadable) → no-op, per spec
+                    if not inspected_id:
+                        self._warn(
+                            f"spawn {name!r}: the window under that name could "
+                            f"not be identified, so nothing was relaunched "
+                            f"into it.")
+                        return False
                     # Husk: the shell outlived whatever it was running.
                     # Relaunching in place keeps the window (and its position)
                     # and is what lets a peer — or ./crewvia — actually revive
                     # a daemon that merely crashed.
                     self._warn(
-                        f"spawn {name!r}: window holds only an idle shell "
-                        "(crashed?) — relaunching in place"
+                        f"spawn {name!r}: window {inspected_id} holds only an "
+                        "idle shell (crashed?) — relaunching in place"
                     )
-                    if not self.send(name, cmd):
+                    if not self._send_to_target(inspected_id, cmd, what=name):
                         return False
                     # Before the wait, not after: the window is ours from the
                     # moment we relaunch into it, and a daemon that takes a
                     # while to come up must not be a daemon we cannot later
                     # restart.
-                    self._record_spawn(name)
+                    self._record_spawn(name, inspected_id)
                     return _wait_until_launched(
-                        lambda: self._pane_process_state(name),
+                        lambda: self._pane_process_state(name, pane_pid),
                         warn=self._warn, name=name)
                 r = subprocess.run(
-                    ["tmux", "new-window", "-t", session, "-n", window],
-                    capture_output=True, timeout=5,
+                    ["tmux", "new-window", "-t", session, "-n", window,
+                     "-P", "-F", "#{window_id}"],
+                    capture_output=True, text=True, timeout=5,
                 )
                 if r.returncode != 0:
-                    self._warn(f"new-window failed for {name!r}: {r.stderr.decode()}")
+                    self._warn(f"new-window failed for {name!r}: {r.stderr}")
                     return False
+                window_id = r.stdout.strip()
 
-            target = self._target(name)
+            if not window_id.startswith("@"):
+                # Falling back to the name here would put back exactly the
+                # hole this closed, so there is no fallback: the window exists
+                # but this checkout cannot prove which one it is, and nothing
+                # is typed into a window we cannot name.
+                self._warn(
+                    f"spawn {name!r}: tmux did not report the id of the window "
+                    f"it created ({window_id!r}), so nothing was launched into "
+                    f"it and no spawn record was written.")
+                return False
+
             subprocess.run(
-                ["tmux", "send-keys", "-t", target, cmd],
+                ["tmux", "send-keys", "-t", window_id, cmd],
                 capture_output=True, timeout=5,
             )
             subprocess.run(
-                ["tmux", "send-keys", "-t", target, "Enter"],
+                ["tmux", "send-keys", "-t", window_id, "Enter"],
                 capture_output=True, timeout=5,
             )
-            self._record_spawn(name)
+            self._record_spawn(name, window_id)
             return True
         except Exception as e:
             self._warn(f"spawn {name!r} failed: {e}")
@@ -1571,7 +1787,18 @@ class TmuxBackend(_Backend):
         line is already empty, so this is safe on a first attempt too.
         """
         self._guard("send", name)
-        target = self._target(name)
+        return self._send_to_target(self._target(name), text, what=name)
+
+    def _send_to_target(self, target: str, text: str, *, what: str) -> bool:
+        """The send itself, against whatever `target` names.
+
+        Split out so `spawn()`'s husk path can type into the `@window_id` it
+        just inspected instead of going back to the name.  `send()` keeps
+        using the name, which is right for it: a caller that says "send to
+        dispatcher" means whatever is called that now.  `spawn()` means the
+        window it just looked at, and those are different questions whenever
+        another checkout is moving names around.
+        """
         try:
             subprocess.run(
                 ["tmux", "send-keys", "-t", target, "C-u"],
@@ -1588,7 +1815,7 @@ class TmuxBackend(_Backend):
             )
             return True
         except Exception as e:
-            self._warn(f"send to {name!r} failed: {e}")
+            self._warn(f"send to {what!r} failed: {e}")
             return False
 
     def capture(self, name: str) -> str:
@@ -1641,8 +1868,8 @@ class TmuxBackend(_Backend):
         if allow_foreign:
             self._warn_forced_bypass(name)
         if not allow_foreign and name in DAEMON_PANE_NAMES:
-            window_id, pane_pid = self._inspect_pane(name)
-            if self._refuses_foreign_daemon(name, window_id, pane_pid):
+            window_id, pane_pid, server = self._inspect_pane_full(name)
+            if self._refuses_foreign_daemon(name, window_id, pane_pid, server):
                 return False
             if window_id is None:
                 # Unreachable while the allowlist holds (no pid means UNKNOWN
@@ -1676,43 +1903,87 @@ class TmuxBackend(_Backend):
             self._warn(f"kill {name!r} failed: {e}")
             return False
 
-    def _record_spawn(self, name: str) -> None:
+    def _record_spawn(self, name: str, window_id: str) -> None:
         """Write down which window this checkout just created.
 
-        Only `spawn()` is in a position to know this: afterwards there is no
-        way to tell a window we made from one that merely carries the name.
-        `_inspect_pane()` rather than the name, because the record has to hold
-        the immutable `@window_id` that a later kill will compare against.
+        `window_id` is passed in rather than looked up, and that is the whole
+        point.  It used to be re-resolved *by name* after the window had been
+        created and the command sent — and in that interval another checkout
+        can create or rename a window of the same name, so what came back was
+        as likely to be theirs as ours.  Recording it forged exactly the
+        provenance this guard rests on, and a forged record authorises
+        destroying somebody else's window later (Codex 6巡目 P1-4).
+
+        The id therefore comes from the command that *created* the window
+        (`new-window -P -F '#{window_id}'`), or, on the husk path, from the
+        inspection that decided the window was reusable.  Both are answers
+        about the window we acted on; a name is not.
         """
-        handle, _ = self._inspect_pane(name)
-        if handle:
-            write_pane_record(name, self.BACKEND_NAME, handle)
-        else:
+        server = self.server_identity()
+        if not server:
             self._warn(
-                f"spawn {name!r}: tmux would not say which window was created, "
-                f"so no spawn record was written; a later kill of this pane "
-                f"will refuse until it is restarted or forced.")
+                f"spawn {name!r}: tmux would not say which server this is, so "
+                f"the spawn record cannot be bound to it; a later kill will "
+                f"refuse until this pane is respawned or forced.")
+        write_pane_record(name, self.BACKEND_NAME, window_id, server=server)
 
     def _inspect_pane(self, name: str):
         """`(window_id, pane_pid)` in one `display-message` — see _Backend."""
+        handle, pane_pid, _ = self._inspect_pane_full(name)
+        return handle, pane_pid
+
+    def _inspect_pane_full(self, name: str):
+        """`(window_id, pane_pid, server)` from **one** `display-message`.
+
+        All four values come out of the same query, so the window, the pid
+        and the server they belong to cannot drift apart between reads.
+        `#{pid}` is the tmux *server*'s pid — a fresh one per server lifetime,
+        which is exactly the generation a `@window_id` is unique within —
+        and `#{socket_path}` separates two servers running at once.
+        """
         self._guard("pid", name)
         target = self._target(name)
         try:
             r = subprocess.run(
                 ["tmux", "display-message", "-p", "-t", target,
-                 "#{window_id} #{pane_pid}"],
+                 "#{window_id} #{pane_pid} #{pid} #{socket_path}"],
                 capture_output=True, text=True, timeout=5,
             )
             if r.returncode != 0:
                 self._warn(f"display-message failed for {name!r}: {r.stderr}")
-                return None, None
+                return None, None, None
             parts = r.stdout.strip().split()
-            if len(parts) != 2 or not parts[0].startswith("@"):
-                return None, None
-            return parts[0], int(parts[1])
+            if len(parts) < 2 or not parts[0].startswith("@"):
+                return None, None, None
+            try:
+                pane_pid = int(parts[1])
+            except ValueError:
+                return None, None, None
+            # A tmux too old to know these formats prints them back verbatim
+            # rather than failing, so an unexpanded token is "no answer".
+            server = None
+            if len(parts) >= 4 and "#{" not in parts[2] + parts[3]:
+                server = (parts[3], parts[2])
+            return parts[0], pane_pid, server
         except Exception as e:
             self._warn(f"pid {name!r} failed: {e}")
-            return None, None
+            return None, None, None
+
+    def server_identity(self):
+        """`(socket_path, server_pid)` straight from the running server."""
+        try:
+            r = subprocess.run(
+                ["tmux", "display-message", "-p", "#{socket_path} #{pid}"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if r.returncode != 0:
+                return None
+            parts = r.stdout.strip().split()
+            if len(parts) != 2 or "#{" in parts[0] + parts[1]:
+                return None
+            return parts[0], parts[1]
+        except Exception:
+            return None
 
     def pid(self, name: str) -> Optional[int]:
         """Return the shell PID of the pane (display-message #{pane_pid})."""
@@ -2073,6 +2344,34 @@ def _herdr_ping() -> bool:
         return False
 
 
+def _herdr_server_identity():
+    """`(socket_path, "<pid>:<starttime>")` for the herdr server, or None.
+
+    The generation is taken from the server process itself, over
+    `SO_PEERCRED` on the connection we are about to use: the kernel names the
+    process on the other end, so a restarted server — which restores tabs with
+    fresh ids while every record still holds the old ones — is a different
+    generation whatever the socket file did.  `starttime` is in there because
+    a pid on its own can come round again.
+    """
+    sock_path = str(_HERDR_SOCK_PATH)
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(3)
+            s.connect(sock_path)
+            cred = s.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED,
+                                struct.calcsize("3i"))
+            pid, _uid, _gid = struct.unpack("3i", cred)
+    except Exception:
+        return None
+    if pid <= 0:
+        return None
+    status, fields = _proc_stat_fields(pid)
+    if status != _PROC_OK or len(fields) < 20:
+        return None
+    return sock_path, f"{pid}:{fields[19]}"
+
+
 class HerdrBackend(_Backend):
     """herdr terminal workspace manager backend (Phase 2).
 
@@ -2104,6 +2403,10 @@ class HerdrBackend(_Backend):
 
     BACKEND_NAME = "herdr"
 
+    def server_identity(self):
+        """`(endpoint, generation)` for the herdr server — see _Backend."""
+        return _herdr_server_identity()
+
     def _cache_path(self, name: str) -> Path:
         return pane_record_path(name)
 
@@ -2115,7 +2418,13 @@ class HerdrBackend(_Backend):
         # The resolution cache and the spawn record are the same file: both
         # say "this checkout put a pane here, and here is its id".  Writing
         # them separately would mean two answers to one question.
-        write_pane_record(name, self.BACKEND_NAME, tab_id, pane_id=pane_id)
+        #
+        # The server identity goes in with it: herdr restores a workspace's
+        # tabs across a restart with *fresh* ids, so a record that did not say
+        # which server it was written against would keep vouching for an id
+        # the new server is free to give to another tab.
+        write_pane_record(name, self.BACKEND_NAME, tab_id, pane_id=pane_id,
+                          server=self.server_identity())
 
     def _read_cache(self, name: str) -> Optional[dict]:
         return read_pane_record(name)
@@ -2546,8 +2855,8 @@ class HerdrBackend(_Backend):
             # `_resolve_ids()` again here would re-resolve *by label*, and a
             # label is exactly what another checkout can attach to a different
             # tab while the /proc walk runs.
-            tab_id, pane_pid = self._inspect_pane(name)
-            if self._refuses_foreign_daemon(name, tab_id, pane_pid):
+            tab_id, pane_pid, server = self._inspect_pane_full(name)
+            if self._refuses_foreign_daemon(name, tab_id, pane_pid, server):
                 return False
             if not tab_id:
                 self._warn(

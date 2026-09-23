@@ -189,10 +189,10 @@ def test_a_pause_cannot_slip_in_while_a_decision_is_in_flight(repo):
     assert outcome and outcome[0], "pause() failed once the lock was free"
 
 
-def test_restart_holds_the_lock_across_kill_and_spawn(repo):
+def test_restart_holds_the_lock_across_kill_and_spawn(repo, idle_pane_shell):
     """restart の kill → spawn は、外から割り込めない一区間であること。"""
     seen = []
-    mux = RecordingMux(windows=[dw.DAEMON_DISPATCHER])
+    mux = RecordingMux(windows=[dw.DAEMON_DISPATCHER], pane_pid=idle_pane_shell)
     lock = dw.lock_path(repo / "registry", dw.DAEMON_DISPATCHER)
     inner_kill, inner_spawn = mux.kill, mux.spawn
     mux.kill = lambda n: (seen.append(("kill", _foreign_lock_attempt(lock))),

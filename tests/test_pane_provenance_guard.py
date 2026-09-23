@@ -72,8 +72,17 @@ def _fake_proc(tmp_path, entries, *, name="proc"):
         d = proc / str(pid)
         d.mkdir(parents=True, exist_ok=True)
         (d / "cmdline").write_bytes(b"\0".join(a.encode() for a in argv) + b"\0")
+        # fields after the last ')': 0 state, 1 ppid, 2 pgrp, 3 session,
+        # 4 tty_nr, 5 tpgid.  These used to be all-zero, which modelled a
+        # process with **no controlling terminal** — i.e. not a pane shell at
+        # all.  Nothing read them until t041 made "the pane is empty" require
+        # the root to be a *positively identified* idle shell, and an
+        # under-specified root is exactly the blind spot Codex 6巡目 P1-1 came
+        # out of.  A pane shell owns its terminal's foreground group, so:
+        # pgrp = session = tpgid = pid, on a tty.
         (d / "stat").write_text(
-            f"{pid} (bash) S {ppid} 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1234",
+            f"{pid} (bash) S {ppid} {pid} {pid} 1234 {pid} "
+            + " ".join(["0"] * 14),
             encoding="utf-8")
         if cwd is not None:
             target = Path(cwd)
@@ -131,8 +140,21 @@ class _RecordingTmux:
         self.calls.append(list(argv))
         text = kwargs.get("text", False)
         out = ""
-        if "display-message" in argv and self.pane_pid is not None:
-            out = f"{self.window_id} {self.pane_pid}\n"
+        # Expand whatever format was asked for, rather than a fixed pair of
+        # fields: a stub that answers only the format string it was written
+        # against turns a change in the caller into a fake refusal
+        # (memory: crewvia-fake-cli-and-qa-fail-gaps).  `new-window -P -F` is
+        # answered too — since t041 spawn() takes the window id from the
+        # command that created the window rather than looking it up by name.
+        wants_format = "display-message" in argv or (
+            ("new-window" in argv or "new-session" in argv)
+            and "-P" in argv and "-F" in argv)
+        if wants_format and self.pane_pid is not None:
+            out = (argv[-1].replace("#{window_id}", str(self.window_id))
+                           .replace("#{pane_pid}", str(self.pane_pid))
+                           .replace("#{pid}", "900")
+                           .replace("#{socket_path}", "/tmp/tmux-test/default")
+                   + "\n")
         return subprocess.CompletedProcess(
             list(argv), 0,
             stdout=out if text else out.encode(),

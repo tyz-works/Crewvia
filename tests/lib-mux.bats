@@ -64,10 +64,18 @@ case "$cmd" in
     echo "crewvia: 3 windows"
     exit 0
     ;;
-  new-session)
-    exit 0
-    ;;
-  new-window)
+  new-session|new-window)
+    # `-P -F '#{window_id}'`: spawn() now takes the id of the window it
+    # created from the creation command itself, instead of looking it up by
+    # name afterwards — between those two steps another checkout can put a
+    # different window under the name (Codex 6巡目 P1-4).  A fake that stayed
+    # silent here would make every spawn look like "tmux would not say what
+    # it created", which is a refusal that does not exist in production.
+    for arg in "$@"; do
+      case "$arg" in
+        '#{window_id}'*) echo "@1" ;;
+      esac
+    done
     exit 0
     ;;
   list-windows)
@@ -104,6 +112,8 @@ case "$cmd" in
     fmt="${!#}"
     fmt="${fmt//'#{window_id}'/@1}"
     fmt="${fmt//'#{pane_pid}'/12345}"
+    fmt="${fmt//'#{pid}'/900}"
+    fmt="${fmt//'#{socket_path}'//tmp/tmux-fake/default}"
     echo "$fmt"
     exit 0
     ;;
@@ -186,8 +196,11 @@ log_count() {
     [ "$status" -eq 0 ]
 
     log_contains "new-session"
-    log_contains "send-keys -t crewvia:Omar-worker claude --some-flag"
-    log_contains "send-keys -t crewvia:Omar-worker Enter"
+    # The launch goes to the `@window_id` the creation reported, not to the
+    # name: a name is what another checkout can move onto a different window
+    # in between (Codex 6巡目 P1-4).
+    log_contains "send-keys -t @1 claude --some-flag"
+    log_contains "send-keys -t @1 Enter"
 }
 
 @test "spawn: new-window path — session exists, window is new" {
@@ -198,8 +211,8 @@ log_count() {
     [ "$status" -eq 0 ]
 
     log_contains "new-window"
-    log_contains "send-keys -t crewvia:New-worker claude"
-    log_contains "send-keys -t crewvia:New-worker Enter"
+    log_contains "send-keys -t @1 claude"
+    log_contains "send-keys -t @1 Enter"
 }
 
 @test "spawn: existing window returns exit 1 (no-op)" {
@@ -221,8 +234,11 @@ log_count() {
     run python3 "$LIB_MUX_PY" spawn "Test-worker" "claude"
     [ "$status" -eq 0 ]
 
-    log_contains "new-session -d -s mytest"
-    log_contains "send-keys -t mytest:Test-worker"
+    # The session override is visible where the window is *created*; the
+    # launch itself addresses the created `@window_id`, so the session name
+    # no longer appears in send-keys (Codex 6巡目 P1-4).
+    log_contains "new-session -d -s mytest -n Test-worker"
+    log_contains "send-keys -t @1"
 }
 
 # ---------------------------------------------------------------------------

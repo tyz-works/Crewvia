@@ -1590,6 +1590,78 @@ bats は python の import 層を通らずガードが効かないので、**PAT
 tmux / herdr** が唯一の隔離になる。その対応関係も
 `test_every_bats_suite_that_can_reach_the_mux_installs_a_path_stub` で固定した。
 
+### 7-11-1. 境界を「呼ぶ側の env」から「対象の identity」へ移す (t038, Codex 3 巡目)
+
+§7-11 (a) の隔離は **env に依存している**。Codex 3 巡目はそこを突いた:
+
+```
+env を消して TmuxBackend().kill("dispatcher") を呼ぶと
+tmux kill-window -t crewvia:dispatcher が発行された
+```
+
+`CREWVIA_MUX_TEST_ISOLATION` は**呼ぶ側の性質**なので、きれいな env で
+サブプロセスを起動すれば消える。そして `pane_daemon_owner()` は `restart()` の
+中にしか無く、**直接の mux 呼び出しは守っていなかった**。
+
+**本当の防壁は「対象が誰のものか」でなければならない。** 2026-09-23 の事故も、
+identity ガードが正しく働いていれば env に関係なく防げた (本番ペインでは別
+checkout のデーモンが動いていた = foreign)。そこで (b) を本線にし、(a) は
+「テストが本番のペイン名を**名乗れない**」ための利便性の層として残す。
+
+**2 つの層は形が違う。混ぜてはいけない。**
+
+| 層 | 形 | 曖昧なとき | 適用範囲 |
+|---|---|---|---|
+| `lib_mux.kill()` の backstop | **積極的な証明があるときだけ断る** | 通す | `DAEMON_PANE_NAMES` のペインだけ |
+| `pane_daemon_owner()` (デーモン層) | **allowlist** (`mine` / `none` のみ) | 断る | `restart()` の判定 |
+
+mux 層を allowlist にできないのは、そこが **Worker のペインも通る道**だから。
+Worker は任意のコマンドを走らせるので、「認識できたものだけ kill してよい」に
+すると watchdog が Worker を終了できなくなる。同じ理由で適用範囲をデーモンの
+ペイン名に絞ってある — crewvia の QA Worker は自分のペインで
+`bash scripts/dispatcher.sh` を走らせることが実際にあり、そこまで広げると
+その Worker が二度と retire できない。**守りたい unit を 1 つに絞る**
+(memory: approve-judgment-needs-allowlist-and-scope)。
+
+**起動形態を同定する。** 修正前の `pane_daemon_owner()` は「`/scripts/<script>`
+で終わる引数」を探していた。つまり:
+
+- `bash scripts/dispatcher.sh` (**人が実際に打つ形**) は何にも一致せず、その
+  ペインは `none` = **husk = 破壊してよい**と分類されていた
+- 逆に、引数のどこかに自分のパスがあれば即 `mine` — `tail -f …/dispatcher.sh`
+  でも kill を認可した
+
+`lib_mux.script_owner()` は代わりに **実行しているスクリプト**を argv から取り出し
+(`_executed_script_arg()`: argv[0] がインタプリタなら最初の非オプション引数、
+`-c` / `-m` の後ろはスクリプトではない)、プロセス自身の cwd に対して解決する。
+名前は出てくるのに実行位置を特定できない形 (`env FOO=1 bash scripts/…`) は
+`none` ではなく **`unknown`**。認識できない起動形態を「空のペイン」と書くと、
+知らない形が全部**破壊側**に落ちる。
+
+**respawn に隔離を引き継ぐ。** mux 経由で起動されるプロセスは呼び出し側ではなく
+**mux サーバーの env** を継承する (herdr は server 起動時の env を全ペインに
+複製する。memory: herdr-server-stale-env-inheritance)。したがって
+`CREWVIA_MUX_TEST_ISOLATION` / `CREWVIA_MUX_PANE_PREFIX` は `spawn_command()` の
+`export` 一覧に載せるしかない。載っていないと、名前空間付きのテストペインに
+起動されたデーモンが素のペイン名を名指しし、保護を両方とも失う。
+
+**消せなかったら成功と言わない。** `resume()` は `unlink_quiet()` を呼んで無条件に
+true を返していた。marker がディレクトリだったり親が書き込み不可だと、**保護が
+残ったまま「解除しました」と答える** — 相互監視は永久に hold し、出口は 30 分後の
+stale-pause 報告だけになる。`_remove_marker()` が削除の成否を確かめ、失敗なら
+診断付きで false を返す。`--force` の枝と普通の枝の両方に要る (片方だけ直すと
+同じ欠陥が残る)。
+
+回帰: `tests/test_pane_identity_guard.py`。欠陥を 9 通り戻して、それぞれ対応する
+テストが赤くなることを確認済み。
+
+> **赤の証明そのものが罠だった。** 同じファイルへの 2 つの注入が pristine と
+> **同じバイト数だけ**違い、しかも 1 秒以内に書かれると、`.pyc` のキーが
+> (mtime の**秒**, size) なので **1 つ目のバイトコードが再利用される**。
+> 2 つ目は「緑のまま」に見えるが、走っていたのは 1 つ目のコードだった。
+> 欠陥注入のハーネスでは `PYTHONDONTWRITEBYTECODE=1` と `__pycache__` の削除を
+> 必ず入れること (memory: red-proof-catches-tests-green-for-the-wrong-reason)。
+
 ### 7-12. 「わからない」を Yes/No に潰さない (t037, Codex 2 巡目)
 
 §7-3 で `/proc` 走査について書いた「見られなかったは居なかったではない」は、

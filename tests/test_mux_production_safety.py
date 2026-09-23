@@ -314,7 +314,10 @@ class _PaneMux:
     def pid(self, name):
         return self.pane_pid
 
-    def kill(self, name):
+    def kill(self, name, *, allow_foreign=False):
+        # Mirrors the real signature: `restart --force` now has to reach the
+        # mux layer's identity backstop too, so a double that refused the
+        # keyword would hide the one path the exit exists for.
         self.calls.append(("kill", name))
         return True
 

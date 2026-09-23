@@ -282,6 +282,31 @@ class _Backend:
 
     BACKEND_NAME = "base"
 
+    def _refuses_foreign_daemon(self, name: str) -> bool:
+        """True when `name`'s pane provably holds another checkout's daemon.
+
+        Shared by both backends so the two cannot drift apart — the shape in
+        which "the peer is dead but its tab is still listed" became
+        un-actionable on tmux only (t006 QA FAIL-1) started as exactly that
+        kind of per-backend divergence.
+        """
+        if name not in DAEMON_PANE_NAMES:
+            return False          # out of scope — see DAEMON_PANE_NAMES
+        pane_pid = self.pid(name)
+        if pane_pid is None:
+            return False
+        detail = foreign_daemon_in_pane(pane_pid)
+        if detail is None:
+            return False
+        self._warn(
+            f"kill {name!r}: refused — the pane holds another checkout's "
+            f"crewvia daemon ({detail}). Nothing was killed. This guard reads "
+            f"the pane, not the environment, so a clean env does not lift it; "
+            f"use `lib_daemon_watch.py restart {name} --force` when you mean "
+            f"to take the pane over."
+        )
+        return True
+
     def _warn(self, msg: str) -> None:
         print(f"[mux:{self.BACKEND_NAME}] WARNING: {msg}", file=sys.stderr)
 
@@ -298,7 +323,7 @@ class _Backend:
     def list(self, suffix: Optional[str] = None) -> List[str]:
         raise NotImplementedError
 
-    def kill(self, name: str) -> bool:
+    def kill(self, name: str, *, allow_foreign: bool = False) -> bool:
         raise NotImplementedError
 
     def pid(self, name: str) -> Optional[int]:
@@ -606,6 +631,315 @@ def _pane_shell_is_idle(pane_pid, proc_root: str = "/proc") -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Pane identity — whose checkout is running in there?
+# ---------------------------------------------------------------------------
+#
+# `_guard_test_isolation()` above is a guard on **the caller**: it asks whether
+# the process making the call is a test run.  That is a property of the
+# environment, and an environment is something a caller can simply not have —
+# start a subprocess with a clean `env` and the guard is gone, back to the
+# production defaults (Codex 3 巡目 P1-1, demonstrated against this very
+# module: `TmuxBackend().kill("dispatcher")` issued
+# `tmux kill-window -t crewvia:dispatcher`).
+#
+# So the real wall cannot be there.  It has to be a property of **the target**:
+# whose daemon is in the pane we are about to destroy?  That question is
+# answered from /proc, needs nobody to have declared anything, and holds
+# between two production checkouts exactly as it holds for a test run — which
+# is what the 2026-09-23 incident actually needed.
+#
+# Two layers, deliberately shaped differently and standing on separate
+# evidence (memory: fail-closed-guard-can-recreate-the-defect):
+#
+#   * here, at the mux layer: a **backstop** that refuses only what it can
+#     positively prove is another checkout's daemon.  It must stay a narrow
+#     denial, because every Worker pane also comes through `kill()` and a
+#     Worker runs arbitrary commands — an allowlist here would mean watchdog
+#     could never end a Worker again.
+#   * at the daemon layer (`lib_daemon_watch.pane_daemon_owner`): an
+#     **allowlist** — only `mine` and `none` may be killed, and everything it
+#     cannot judge is refused.  There the set of legitimate occupants is known,
+#     so the allowlist is the right shape (memory:
+#     approve-judgment-needs-allowlist-and-scope).
+#
+# Neither layer replaces the env-based isolation; it stays as the convenience
+# layer that keeps a test from *naming* a production pane in the first place.
+
+#: `/proc`, as a module-level name so tests can point the identity layer at a
+#: fixture without threading a parameter through every backend verb.  Never
+#: read from the environment: this guard exists precisely because the
+#: environment is what a caller can drop.
+_PROC_ROOT = "/proc"
+
+
+def _own_repo_root() -> Path:
+    """The checkout this module is running out of.
+
+    From `__file__`, not from `CREWVIA_REPO_ROOT` — the whole point is an
+    identity the caller cannot restate.  A worktree gets its own answer, which
+    is correct: a daemon started from a worktree owns that worktree's panes.
+    """
+    return Path(__file__).resolve().parent.parent
+
+
+#: The scripts whose presence in a pane binds it to a checkout.  Kept as a
+#: literal because `lib_daemon_watch` imports *this* module and so cannot be
+#: imported back; `tests/test_pane_identity_guard.py` asserts the two stay in
+#: step, because a daemon added to one and not the other would fall silently
+#: outside the guard.
+DAEMON_SCRIPTS = ("dispatcher.sh", "watchdog.py")
+
+#: The pane names this backstop applies to, and **only** these.
+#:
+#: Scope is the safety property here, not an optimisation.  Widening it to
+#: every pane would mean a Worker that happens to run `bash scripts/…` in its
+#: own pane — a QA Worker exercising the dispatcher, which this repo does —
+#: could never be retired again, because what it is running belongs to the
+#: worktree it was given rather than to watchdog's checkout.  The incident
+#: this guards is a *daemon pane* being taken over; keeping the judgment to
+#: one unit is what stopped the earlier versions of it from turning into a
+#: refusal nobody can clear (memory: approve-judgment-needs-allowlist-and-scope).
+DAEMON_PANE_NAMES = ("dispatcher", "watchdog")
+
+#: Whose daemon is in the pane.  `UNKNOWN` is not `NONE`: "there is nothing
+#: recognisable in there" authorises a relaunch, "we could not tell" must not.
+OWNER_MINE, OWNER_FOREIGN = "mine", "foreign"
+OWNER_NONE, OWNER_UNKNOWN = "none", "unknown"
+
+#: Most serious answer first.  A pane holding both somebody else's daemon and
+#: ours is not ours to end, so `FOREIGN` outranks `MINE` rather than the
+#: reverse — the first reading of the pane that forbids the kill wins.
+_OWNER_PRECEDENCE = (OWNER_FOREIGN, OWNER_UNKNOWN, OWNER_MINE, OWNER_NONE)
+
+#: argv[0] values after which the *script* is a later argument rather than
+#: argv[0] itself.  Anything not in here is taken to be the executable, so an
+#: unrecognised wrapper (`env FOO=1 bash …`) does not resolve to a script and
+#: falls into the ambiguous branch below rather than the empty one.
+_INTERPRETER_NAMES = frozenset({
+    "bash", "sh", "zsh", "fish", "dash", "ksh", "tcsh", "csh",
+    "python", "python3", "python2", "perl", "ruby",
+})
+
+#: Interpreter flags after which no script path follows — the next word is a
+#: program text (`-c`) or a module name (`-m`).  Treated as "there is no
+#: script here" rather than "the next word is one".
+_INTERPRETER_NO_SCRIPT_FLAGS = frozenset({"-c", "--command", "-m"})
+
+#: readlink() on a working directory that has been removed answers with this
+#: suffix appended.  The path still identifies the checkout it came from,
+#: which is the only thing asked of it here.
+_PROC_DELETED_SUFFIX = " (deleted)"
+
+
+def _executed_script_arg(argv) -> Optional[str]:
+    """The script `argv` is *running*, or None when we cannot point at one.
+
+    The distinction this function exists to make: `bash scripts/dispatcher.sh`
+    runs a script, `tail -f …/scripts/dispatcher.sh` mentions one.  Scanning
+    argv for anything that looks like the path answers `mine` to the second —
+    which, at the caller, reads as "ours to kill".
+    """
+    if not argv:
+        return None
+    head = os.path.basename(argv[0]).lstrip("-")
+    if head not in _INTERPRETER_NAMES:
+        return argv[0]
+    index = 1
+    while index < len(argv):
+        arg = argv[index]
+        if arg in _INTERPRETER_NO_SCRIPT_FLAGS:
+            return None
+        if arg.startswith("-") and arg != "-":
+            index += 1          # a flag; its value (if any) is handled below
+            continue
+        return arg
+    return None
+
+
+def _proc_cwd(pid, proc_root: str):
+    """`(status, path)` for `/proc/<pid>/cwd`.
+
+    Three-valued like `_read_proc()`: a process that has exited is a real
+    answer, a directory we may not read is the absence of one.
+    """
+    try:
+        link = Path(proc_root, str(int(pid)), "cwd")
+    except (TypeError, ValueError):
+        return _PROC_UNREADABLE, ""
+    try:
+        target = os.readlink(link)
+    except OSError as exc:
+        if exc.errno in _PROC_GONE_ERRNOS and not link.parent.exists():
+            # The whole `/proc/<pid>` is gone: the process exited between the
+            # table walk and this read, so it is not in the pane.  ENOENT on
+            # `cwd` while `/proc/<pid>` is still there is a different thing
+            # entirely — the process is alive and we could not look — and
+            # reading the two as one answer is how "could not look" becomes
+            # "nothing there" for the fourth time in this repo.
+            return _PROC_GONE, ""
+        return _PROC_UNREADABLE, ""
+    if target.endswith(_PROC_DELETED_SUFFIX):
+        target = target[:-len(_PROC_DELETED_SUFFIX)]
+    return _PROC_OK, target
+
+
+def _same_script_file(a: str, b: str) -> bool:
+    """Whether two paths name the same script.
+
+    Path equality first (it works when the file is already gone — a removed
+    worktree still has an identity), `samefile()` second so that a symlinked
+    or differently-spelled path to the *same* checkout is not read as another
+    one.
+    """
+    if os.path.normpath(a) == os.path.normpath(b):
+        return True
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return False
+
+
+def proc_table(proc_root: str = "/proc"):
+    """`{pid: (ppid, [argv…])}` for every process, or None if incomplete.
+
+    Per entry: a process that vanished mid-walk was never in our pane, but one
+    we could not *read* might be, and a table that quietly dropped it would
+    answer "nothing of ours in there" to the one caller that then kills the
+    pane.
+    """
+    try:
+        entries = list(Path(proc_root).iterdir())
+    except OSError:
+        return None
+    table = {}
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        try:
+            argv = [a.decode("utf-8", "replace")
+                    for a in (entry / "cmdline").read_bytes().split(b"\0") if a]
+            stat = (entry / "stat").read_text(encoding="utf-8")
+        except OSError as exc:
+            if exc.errno in _PROC_GONE_ERRNOS:
+                continue
+            return None
+        try:
+            tail = stat[stat.rindex(")") + 2:].split()
+            ppid = int(tail[1])
+        except (ValueError, IndexError):
+            return None
+        table[pid] = (ppid, argv)
+    return table
+
+
+def descendants(table: dict, root_pid: int) -> set:
+    """`root_pid` and everything below it, per the ppid edges in `table`."""
+    children: dict = {}
+    for pid, (ppid, _) in table.items():
+        children.setdefault(ppid, []).append(pid)
+    seen = {root_pid}
+    stack = [root_pid]
+    while stack:
+        for child in children.get(stack.pop(), ()):
+            if child not in seen:
+                seen.add(child)
+                stack.append(child)
+    return seen
+
+
+def script_owner(pid, argv, script: str, mine: str, *, proc_root: str):
+    """`(owner, detail)` — does `pid` run `script`, and out of whose checkout?
+
+    `mine` is the absolute path this checkout would run.  A **relative** launch
+    (`bash scripts/dispatcher.sh`, which is what people actually type) is
+    resolved against the process's own working directory; before this, such a
+    process matched nothing and the pane it was in was classified as empty —
+    i.e. the ordinary way of starting a daemon put it outside the guard.
+    """
+    mentions = [a for a in argv if os.path.basename(a) == script]
+    exec_arg = _executed_script_arg(argv)
+
+    if exec_arg is not None and os.path.basename(exec_arg) == script:
+        if os.path.isabs(exec_arg):
+            resolved = os.path.normpath(exec_arg)
+        else:
+            status, cwd = _proc_cwd(pid, proc_root)
+            if status == _PROC_GONE:
+                return OWNER_NONE, ""      # exited; it is not in the pane
+            if status != _PROC_OK:
+                return OWNER_UNKNOWN, (
+                    f"pid {pid} runs {exec_arg!r} but its working directory "
+                    f"could not be read, so which checkout it belongs to is "
+                    f"undecided")
+            resolved = os.path.normpath(os.path.join(cwd, exec_arg))
+        if _same_script_file(resolved, mine):
+            return OWNER_MINE, f"pid {pid} runs {resolved}"
+        return OWNER_FOREIGN, f"pid {pid} runs {resolved}, not {mine}"
+
+    if mentions:
+        # The name is in there, but not anywhere this can prove it is being
+        # executed — an unrecognised launch shape.  Answering NONE here is
+        # what let "a daemon started some way we did not think of" be read as
+        # an empty pane, and an empty pane is the one answer that authorises
+        # destroying it.
+        return OWNER_UNKNOWN, (
+            f"pid {pid} mentions {mentions[0]!r} in a launch shape this cannot "
+            f"identify ({' '.join(argv)!r})")
+    return OWNER_NONE, ""
+
+
+def pane_script_owner(pane_pid, script: str, mine: str, *,
+                      proc_root: Optional[str] = None):
+    """`(owner, detail)` for everything running under `pane_pid`.
+
+    `UNKNOWN` for anything that could not be read — the pane's pid, /proc, a
+    working directory.  Production breaks precisely when things cannot be read,
+    and a guard that only holds while everything is readable is not one.
+    """
+    proc_root = _PROC_ROOT if proc_root is None else proc_root
+    try:
+        pane_pid = int(pane_pid)
+    except (TypeError, ValueError):
+        return OWNER_UNKNOWN, f"unusable pane pid {pane_pid!r}"
+    table = proc_table(proc_root)
+    if table is None:
+        return OWNER_UNKNOWN, f"{proc_root} could not be walked completely"
+    if pane_pid not in table:
+        return OWNER_UNKNOWN, f"pane pid {pane_pid} is not in {proc_root}"
+
+    mine = os.path.normpath(str(mine))
+    verdicts: dict = {}
+    for pid in descendants(table, pane_pid):
+        owner, detail = script_owner(pid, table[pid][1], script, mine,
+                                     proc_root=proc_root)
+        if owner != OWNER_NONE:
+            verdicts.setdefault(owner, detail)
+    for owner in _OWNER_PRECEDENCE:
+        if owner in verdicts:
+            return owner, verdicts[owner]
+    return OWNER_NONE, f"no {script} under pane pid {pane_pid}"
+
+
+def foreign_daemon_in_pane(pane_pid, *, repo_root=None,
+                           proc_root: Optional[str] = None) -> Optional[str]:
+    """Why `pane_pid` holds **another checkout's** crewvia daemon, or None.
+
+    Positive proof only.  Everything unreadable answers None (= "no reason to
+    refuse"), because this is the backstop rather than the judgment: the pane
+    it is asked about is just as often a Worker's, and a Worker pane that
+    cannot be read still has to be closable.
+    """
+    root = Path(repo_root) if repo_root is not None else _own_repo_root()
+    for script in DAEMON_SCRIPTS:
+        owner, detail = pane_script_owner(
+            pane_pid, script, str(root / "scripts" / script), proc_root=proc_root)
+        if owner == OWNER_FOREIGN:
+            return detail
+    return None
+
+
+# ---------------------------------------------------------------------------
 # TmuxBackend
 # ---------------------------------------------------------------------------
 
@@ -861,9 +1195,16 @@ class TmuxBackend(_Backend):
             self._warn(f"list failed: {e}")
             return []
 
-    def kill(self, name: str) -> bool:
-        """Kill the named window."""
+    def kill(self, name: str, *, allow_foreign: bool = False) -> bool:
+        """Kill the named window.
+
+        `allow_foreign=True` is the operator's way past the identity backstop
+        (`restart --force`).  Without an exit, "cannot judge" turns into
+        "nothing ever works again" (memory: fail-closed-discard-vs-hold).
+        """
         self._guard("kill", name)
+        if not allow_foreign and self._refuses_foreign_daemon(name):
+            return False
         target = self._target(name)
         try:
             r = subprocess.run(
@@ -945,8 +1286,8 @@ _HERDR_CACHE_DIR_NAME = Path("registry") / "mux"
 _HERDR_VERIFIED_VERSION = "0.9.0"
 
 
-def _is_idle_shell_process(proc: dict) -> bool:
-    """True if `proc` is a shell sitting at its prompt rather than running work.
+def _idle_shell_entry_state(proc) -> str:
+    """`PANE_IDLE` / `PANE_LIVE` / `PANE_UNKNOWN` for one process-info entry.
 
     Verified against herdr 0.9.0 `pane process-info`:
       idle prompt      → {"name": "bash", "argv": ["/bin/bash"]}
@@ -955,16 +1296,32 @@ def _is_idle_shell_process(proc: dict) -> bool:
     So the name must be a shell *and* it must have been invoked with no
     arguments.  Matching on the name alone would read a live `bash
     scripts/dispatcher.sh` pane as idle and start a second dispatcher on top
-    of it.  Anything we cannot classify answers False (= treat as busy).
+    of it.
+
+    Three-valued rather than boolean, for the same reason `_pane_shell_state()`
+    is: an entry we cannot classify (`{}`, a name with no argv) is not evidence
+    of anything, and the two callers need it to fall in opposite directions.
+    The boolean version collapsed it into "not idle", which the pane-level
+    `all(...)` then turned into **PANE_LIVE** — so `_wait_until_launched()` read
+    an unreadable entry as a successful launch and reported a daemon back from
+    the dead (Codex 3 巡目 P2-4).
     """
     if not isinstance(proc, dict):
-        return False
-    if (proc.get("name") or "").lstrip("-") not in _SHELL_PROCESS_NAMES:
-        return False
+        return PANE_UNKNOWN
+    name = proc.get("name")
+    if not isinstance(name, str) or not name:
+        return PANE_UNKNOWN
+    if name.lstrip("-") not in _SHELL_PROCESS_NAMES:
+        return PANE_LIVE          # rooted at something that is not a shell
     argv = proc.get("argv")
     if not isinstance(argv, list) or not argv:
-        return False  # argv unavailable → cannot prove idle
-    return len(argv) == 1
+        return PANE_UNKNOWN       # argv unavailable → cannot prove either way
+    return PANE_IDLE if len(argv) == 1 else PANE_LIVE
+
+
+def _is_idle_shell_process(proc: dict) -> bool:
+    """True only when `proc` is *demonstrably* a shell at its prompt."""
+    return _idle_shell_entry_state(proc) == PANE_IDLE
 
 
 # Herdr CLI subcommand table — single place to update on CLI rename.
@@ -1399,7 +1756,26 @@ class HerdrBackend(_Backend):
                 "foreground_processes — pane state unknown"
             )
             return PANE_UNKNOWN
-        return PANE_IDLE if all(_is_idle_shell_process(p) for p in procs) else PANE_LIVE
+        # Per entry, and in this order.  One demonstrably running process makes
+        # the pane live whatever the rest are; only when nothing is live does
+        # an unclassifiable entry matter, and then it is `unknown`, never
+        # `live` — occupancy reads both as busy, but launch verification must
+        # tell "it started" from "we could not see".
+        #
+        # An *empty* list stays `idle`: herdr answers a failure with no
+        # `result` at all (caught above), so zero entries is a successful
+        # "nothing in this pane", which is exactly the husk a server restart
+        # leaves behind and which t035 requires spawn() to relaunch into.
+        states = [_idle_shell_entry_state(p) for p in procs]
+        if PANE_LIVE in states:
+            return PANE_LIVE
+        if PANE_UNKNOWN in states:
+            self._warn(
+                f"process-info for {pane_id!r} returned an entry that could not "
+                "be classified — pane state unknown"
+            )
+            return PANE_UNKNOWN
+        return PANE_IDLE
 
     def _pane_has_live_process(self, pane_id: str) -> bool:
         """True unless the pane is *demonstrably* an idle shell (see above)."""
@@ -1691,13 +2067,17 @@ class HerdrBackend(_Backend):
             names = [n for n in names if n.endswith(suffix)]
         return names
 
-    def kill(self, name: str) -> bool:
+    def kill(self, name: str, *, allow_foreign: bool = False) -> bool:
         """Close the tab for the named pane (terminates claude and children).
 
         Phase 0: tab close terminates all child processes via SIGHUP within 2s.
         Cache is deleted on success.
+
+        `allow_foreign=True` lifts the identity backstop — see TmuxBackend.kill.
         """
         self._guard("kill", name)
+        if not allow_foreign and self._refuses_foreign_daemon(name):
+            return False
         ids = self._resolve_ids(name)
         if ids is None:
             self._warn(f"kill {name!r}: pane not found")
@@ -1840,8 +2220,8 @@ class Mux:
     def list(self, suffix: Optional[str] = None) -> List[str]:
         return self._backend.list(suffix=suffix)
 
-    def kill(self, name: str) -> bool:
-        return self._backend.kill(name)
+    def kill(self, name: str, *, allow_foreign: bool = False) -> bool:
+        return self._backend.kill(name, allow_foreign=allow_foreign)
 
     def pid(self, name: str) -> Optional[int]:
         return self._backend.pid(name)
@@ -1939,10 +2319,12 @@ def _cli_main(args: List[str]) -> int:
         return 0
 
     elif verb == "kill":
+        force = "--force" in rest
+        rest = [a for a in rest if a != "--force"]
         if not rest:
-            print("Usage: lib_mux.py kill <name>", file=sys.stderr)
+            print("Usage: lib_mux.py kill <name> [--force]", file=sys.stderr)
             return 2
-        return 0 if m.kill(rest[0]) else 1
+        return 0 if m.kill(rest[0], allow_foreign=force) else 1
 
     elif verb == "pid":
         if not rest:

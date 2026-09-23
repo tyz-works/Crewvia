@@ -263,7 +263,11 @@ def test_spawn_command_embeds_env_in_the_command_string(repo, monkeypatch):
     assert "dispatcher.sh" in cmd
 
     monkeypatch.delenv("CREWVIA_MUX")
-    assert "CREWVIA_MUX" not in dw.spawn_command("dispatcher", repo)
+    # `export CREWVIA_MUX=`, not the bare prefix: CREWVIA_MUX_TEST_ISOLATION
+    # and CREWVIA_MUX_PANE_PREFIX are carried too now (they have to be — a
+    # daemon respawned inside a namespaced test pane would otherwise come back
+    # addressing the production pane names), and both start with this string.
+    assert "export CREWVIA_MUX=" not in dw.spawn_command("dispatcher", repo)
 
 
 def test_spawn_command_carries_the_mux_destination_too(repo):

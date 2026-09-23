@@ -117,6 +117,11 @@ from lib_mux import (  # noqa: E402
     MUX_TEST_ISOLATION_EXIT,
     Mux,
     MuxTestIsolationError,
+    OWNER_FOREIGN,
+    OWNER_MINE,
+    OWNER_NONE,
+    OWNER_UNKNOWN,
+    pane_script_owner,
     repo_identity_ok,
 )
 from lib_retirement import (  # noqa: E402
@@ -442,60 +447,13 @@ def scan_daemon_pids(repo_root, name: str, *, proc_root="/proc",
 # act.
 
 #: Who is in the pane.  `UNKNOWN` is not `NONE` — the distinction this repo has
-#: now had to make at four separate layers.
-PANE_OWNER_MINE = "mine"
-PANE_OWNER_FOREIGN = "foreign"
-PANE_OWNER_NONE = "none"
-PANE_OWNER_UNKNOWN = "unknown"
-
-
-def _proc_table(proc_root: str = "/proc"):
-    """`{pid: (ppid, [argv…])}` for every process, or None if incomplete.
-
-    Per entry, exactly as `scan_daemon_pids()`: an entry that vanished mid-walk
-    was never in our pane, but one we could not *read* might be, and a table
-    that quietly dropped it would answer "nothing of ours in there" to the one
-    caller that then kills the pane.
-    """
-    try:
-        entries = list(Path(proc_root).iterdir())
-    except OSError:
-        return None
-    table = {}
-    for entry in entries:
-        if not entry.name.isdigit():
-            continue
-        pid = int(entry.name)
-        try:
-            argv = [a.decode("utf-8", "replace")
-                    for a in (entry / "cmdline").read_bytes().split(b"\0") if a]
-            stat = (entry / "stat").read_text(encoding="utf-8")
-        except OSError as exc:
-            if exc.errno in _PROC_GONE_ERRNOS:
-                continue
-            return None
-        try:
-            tail = stat[stat.rindex(")") + 2:].split()
-            ppid = int(tail[1])
-        except (ValueError, IndexError):
-            return None
-        table[pid] = (ppid, argv)
-    return table
-
-
-def _descendants(table: dict, root_pid: int) -> set:
-    """`root_pid` and everything below it, per the ppid edges in `table`."""
-    children: dict = {}
-    for pid, (ppid, _) in table.items():
-        children.setdefault(ppid, []).append(pid)
-    seen = {root_pid}
-    stack = [root_pid]
-    while stack:
-        for child in children.get(stack.pop(), ()):
-            if child not in seen:
-                seen.add(child)
-                stack.append(child)
-    return seen
+#: now had to make at four separate layers.  The values are `lib_mux`'s: the
+#: walk itself lives there because `lib_mux.kill()` needs the same answer for
+#: its own backstop, and two copies of this judgment would drift.
+PANE_OWNER_MINE = OWNER_MINE
+PANE_OWNER_FOREIGN = OWNER_FOREIGN
+PANE_OWNER_NONE = OWNER_NONE
+PANE_OWNER_UNKNOWN = OWNER_UNKNOWN
 
 
 def pane_daemon_owner(mux, name: str, repo_root, *, proc_root: str = "/proc"):
@@ -506,10 +464,17 @@ def pane_daemon_owner(mux, name: str, repo_root, *, proc_root: str = "/proc"):
       NONE     nothing recognisable is in there — a husk, or a fresh pane.
                Restarting into it is the ordinary crash-recovery path and must
                keep working (t035), so this is not a refusal.
-      UNKNOWN  the pane's pid or /proc could not be read.  Not the same answer
-               as NONE: production breaks precisely when things cannot be read,
-               and a guard that only holds while everything is readable is not
-               one.
+      UNKNOWN  the pane's pid, /proc, a working directory, or the launch shape
+               could not be read.  Not the same answer as NONE: production
+               breaks precisely when things cannot be read, and a guard that
+               only holds while everything is readable is not one.
+
+    The identification is `lib_mux.pane_script_owner()`, which resolves the
+    script a process is actually *running* against that process's own working
+    directory.  The earlier version matched any argument ending in
+    `/scripts/<script>`, which meant a daemon started the way people actually
+    start one — `bash scripts/dispatcher.sh`, a relative path — matched
+    nothing and its pane was classified as empty, i.e. safe to destroy.
     """
     try:
         pane_pid = mux.pid(name)
@@ -518,30 +483,9 @@ def pane_daemon_owner(mux, name: str, repo_root, *, proc_root: str = "/proc"):
     if pane_pid is None:
         return PANE_OWNER_UNKNOWN, f"no pane pid for {name!r}"
 
-    table = _proc_table(proc_root)
-    if table is None:
-        return PANE_OWNER_UNKNOWN, f"{proc_root} could not be walked completely"
-    try:
-        pane_pid = int(pane_pid)
-    except (TypeError, ValueError):
-        return PANE_OWNER_UNKNOWN, f"unusable pane pid {pane_pid!r}"
-    if pane_pid not in table:
-        return PANE_OWNER_UNKNOWN, f"pane pid {pane_pid} is not in {proc_root}"
-
     script = SCRIPT_OF[name]
     mine = str(Path(repo_root) / "scripts" / script)
-    suffix = f"/scripts/{script}"
-    foreign = []
-    for pid in _descendants(table, pane_pid):
-        for arg in table[pid][1]:
-            if arg == mine:
-                return PANE_OWNER_MINE, f"pid {pid} runs {mine}"
-            if arg.endswith(suffix):
-                foreign.append((pid, arg))
-    if foreign:
-        pid, arg = foreign[0]
-        return PANE_OWNER_FOREIGN, f"pid {pid} runs {arg}, not {mine}"
-    return PANE_OWNER_NONE, f"no {script} under pane pid {pane_pid}"
+    return pane_script_owner(pane_pid, script, mine, proc_root=proc_root)
 
 
 #: What may be killed.  An allowlist, because the denylist version of this
@@ -563,7 +507,18 @@ _MAY_KILL_OWNERS = frozenset({PANE_OWNER_MINE, PANE_OWNER_NONE})
 #: isn't there.  The QA harness hit this for real (t006 QA FINDING-2);
 #: production is invisible to it only because production uses the default
 #: names.
+#:
+#: `CREWVIA_MUX_TEST_ISOLATION` / `CREWVIA_MUX_PANE_PREFIX` belong here for a
+#: reason that is easy to miss: a process started **through the mux** inherits
+#: the mux *server's* environment, not its caller's (herdr replays the env its
+#: server was born with onto every pane).  So a daemon respawned from inside a
+#: namespaced test pane would come back holding neither marker, address the
+#: bare production pane names, and — on herdr — be able to read the production
+#: checkout's cache entry for that bare name.  The command text is the only
+#: thing that crosses the spawn boundary, so both travel in it.
 _SPAWN_ENV_MUX = (
+    "CREWVIA_MUX_TEST_ISOLATION",
+    "CREWVIA_MUX_PANE_PREFIX",
     "CREWVIA_MUX",
     "CREWVIA_MUX_ENABLED",
     "CREWVIA_TMUX_SESSION",
@@ -813,9 +768,34 @@ def _write_pause_marker(registry_dir, name: str, *, reason: str = "",
     return token
 
 
+def _stderr(msg: str) -> None:
+    print(msg, file=sys.stderr)
+
+
+def _remove_marker(path) -> bool:
+    """True once `path` is gone.  Unlike `unlink_quiet()`, it reports.
+
+    `unlink_quiet()` swallows every OSError, which is right where the removal
+    is housekeeping and wrong where it *is* the promise being made.  A marker
+    that is a directory, or sits in a directory we may not write, survives the
+    unlink — and a caller that answered "lifted" to that leaves the protection
+    in place while telling everyone it is gone, which parks mutual watch on a
+    hold that only the 30-minute stale-pause report ever escapes.
+    """
+    path = Path(path)
+    try:
+        path.unlink()
+        return True
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return not path.exists()
+
+
 def resume(registry_dir, name: str, *, token: Optional[str] = None,
            force: bool = False,
-           timeout: float = MAINTENANCE_LOCK_TIMEOUT_SECONDS) -> bool:
+           timeout: float = MAINTENANCE_LOCK_TIMEOUT_SECONDS,
+           log: Callable[[str], None] = _stderr) -> bool:
     """Lift the marker.  False when it belongs to someone else.
 
     Under the daemon's lock, for the same reason `pause()` is: read, verify
@@ -832,6 +812,10 @@ def resume(registry_dir, name: str, *, token: Optional[str] = None,
     Returns False when the lock cannot be taken: no serialisation, no
     permission to remove a protection.  The marker stays, and the stale-pause
     report is the way out.
+
+    Returns False, too, when the marker could not actually be removed — see
+    `_remove_marker()`.  "Lifted" is a statement about the file on disk, and
+    the only honest way to make it is to look.
     """
     with daemon_lock(registry_dir, name, timeout=timeout) as locked:
         if not locked:
@@ -845,16 +829,26 @@ def resume(registry_dir, name: str, *, token: Optional[str] = None,
             # operator looking at a corrupt file and deciding it is rubbish.
             # Without it there is nothing to check the token against, so the
             # honest answer is "no".
-            if force:
-                unlink_quiet(path)
+            if not force:
+                return False
+            if _remove_marker(path):
                 return True
+            log(f"[daemon-watch] resume {name}: the pause marker at {path} "
+                f"could not be read *and* could not be removed (is it a "
+                f"directory, or is {path.parent} not writable?). The "
+                f"protection is still in place, so mutual watch will keep "
+                f"holding — remove it by hand.")
             return False
         if not force and token is None:
             return False
         if not force and marker.get("token") != token:
             return False
-        unlink_quiet(path)
-        return True
+        if _remove_marker(path):
+            return True
+        log(f"[daemon-watch] resume {name}: the pause marker at {path} could "
+            f"not be removed. The protection is still in place and mutual "
+            f"watch will keep holding — remove it by hand.")
+        return False
 
 
 #: `read_pause_state()` outcomes.  Three, not two: "there is no marker" and
@@ -1439,7 +1433,13 @@ def restart(name: str, *, repo_root=None, mux=None, reason: str = "manual restar
                 f"Nothing was killed.")
             return False
         try:
-            mux.kill(name)
+            # `force` has to reach the mux layer too.  Its identity backstop
+            # reads the pane rather than the environment, so an exit that only
+            # lifts the check *here* would look like an exit and not be one.
+            if force:
+                mux.kill(name, allow_foreign=True)
+            else:
+                mux.kill(name)
             # Re-entrant: we already hold this daemon's lock, and the launch
             # command must come from the same place as every other start.
             ok = spawn_daemon(name, repo_root=repo_root, mux=mux, log=log)
@@ -1450,7 +1450,7 @@ def restart(name: str, *, repo_root=None, mux=None, reason: str = "manual restar
             # Even on failure: leaving the marker behind would silently disable
             # mutual watch for this daemon, and the stale-pause report is a
             # 30-minute detour compared with just not leaking it.
-            resume(registry_dir, name, token=token)
+            resume(registry_dir, name, token=token, log=log)
 
 
 # ---------------------------------------------------------------------------

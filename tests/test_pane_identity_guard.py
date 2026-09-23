@@ -130,30 +130,55 @@ def as_our_checkout(monkeypatch, our_checkout):
 # 1. mux 層の backstop — env を一切見ない (P1-1)
 # ---------------------------------------------------------------------------
 
+#: この偽 tmux が名乗るサーバー — (エンドポイント, 世代)。spawn 記録は
+#: これに束縛されるので、記録を書くテストは同じ値を渡す。
+SERVER = ("/tmp/tmux-test/default", "900")
+
+
 class _RecordingSubprocess:
     """tmux を **実行せずに** argv を記録する差し替え。
 
-    `display-message` は `#{window_id} #{pane_pid}` の 2 つを 1 回で答える。
-    ペインを覗いた時点の window と、あとで閉じる window が同じものである
-    保証は「同じ 1 回の問い合わせで得た id」以外に無いので、テスト側の偽物も
-    その形にしておく (P1-4)。
+    `display-message` はペインの window / pid と、それが載っている **mux
+    サーバー** を 1 回で答える。ペインを覗いた時点の window と、あとで閉じる
+    window が同じものである保証は「同じ 1 回の問い合わせで得た id」以外に
+    無いので、テスト側の偽物もその形にしておく (P1-4)。
+
+    答えるのは **訊かれた書式そのもの**を展開したもので、固定の並びではない。
+    決め打ちで返す偽物は、呼び手が書式を変えた瞬間に「サーバーが分からない」
+    = 本番には存在しない拒否を作り出す
+    (memory: crewvia-fake-cli-and-qa-fail-gaps)。t041 で `#{pid}` と
+    `#{socket_path}` が加わり、t042 でその欠落が拒否になったので、ここが
+    書式駆動でないと全部が偽の赤になる。
 
     `window_id_after` を渡すと、最初の `display-message` のあとに window_id が
     すり替わる — 覗いたタブが消えて別チェックアウトが同じ名前で作り直した形。
     """
 
-    def __init__(self, pane_pid=None, window_id="@1", window_id_after=None):
+    def __init__(self, pane_pid=None, window_id="@1", window_id_after=None,
+                 server=SERVER):
         self.calls = []
         self.pane_pid = pane_pid
         self.window_id = window_id
         self.window_id_after = window_id_after
+        self.server = server
+
+    def _expand(self, fmt):
+        endpoint, generation = self.server if self.server else ("", "")
+        for token, value in (
+                ("#{window_id}", self.window_id),
+                ("#{pane_pid}", self.pane_pid),
+                ("#{pid}", generation),
+                ("#{socket_path}", endpoint),
+        ):
+            fmt = fmt.replace(token, str(value))
+        return fmt
 
     def run(self, argv, **kwargs):
         self.calls.append(list(argv))
         text = kwargs.get("text", False)
         out = ""
         if "display-message" in argv and self.pane_pid is not None:
-            out = f"{self.window_id} {self.pane_pid}\n"
+            out = self._expand(argv[-1]) + "\n"
             if self.window_id_after is not None:
                 self.window_id = self.window_id_after
         return subprocess.CompletedProcess(
@@ -253,7 +278,8 @@ def test_kill_still_ends_our_own_daemon(
     monkeypatch.setattr(lib_mux, "_PROC_ROOT", proc_root)
     rec = _RecordingSubprocess(pane_pid=4100)
     monkeypatch.setattr(lib_mux, "subprocess", rec)
-    lib_mux.write_pane_record("dispatcher", "tmux", rec.window_id)
+    lib_mux.write_pane_record("dispatcher", "tmux", rec.window_id,
+                              server=rec.server)
 
     assert lib_mux.TmuxBackend().kill("dispatcher") is True
     assert rec.kill_calls(), "our own daemon's pane was not killed"
@@ -949,7 +975,8 @@ def test_an_alias_to_our_own_script_is_still_ours(
     monkeypatch.setattr(lib_mux, "_PROC_ROOT", proc_root)
     rec = _RecordingSubprocess(pane_pid=4100)
     monkeypatch.setattr(lib_mux, "subprocess", rec)
-    lib_mux.write_pane_record("watchdog", "tmux", rec.window_id)
+    lib_mux.write_pane_record("watchdog", "tmux", rec.window_id,
+                              server=rec.server)
 
     assert lib_mux.TmuxBackend().kill("watchdog") is True
     assert rec.kill_calls(), "our own daemon behind an alias became un-killable"

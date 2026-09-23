@@ -125,6 +125,15 @@ def as_our_checkout(monkeypatch, our_checkout):
     return our_checkout
 
 
+#: 偽 tmux / 偽 herdr が名乗るサーバー — (エンドポイント, 世代)。
+#: t042 以降、spawn 記録は完全な server 束縛を持っていなければ照合で
+#: 拒否されるので (Codex 7 巡目 P1-2)、記録を書くテストは偽物が名乗るのと
+#: 同じ値を渡す。束縛が欠けた記録そのものの扱いは
+#: `test_destruction_and_condition.py` が受け持つ。
+TMUX_SERVER = ("/tmp/tmux-test/default", "900")
+HERDR_SERVER = ("/tmp/herdr-test.sock", "900:1")
+
+
 class _RecordingTmux:
     """tmux を実行せずに argv を記録する差し替え。
 
@@ -210,7 +219,8 @@ def test_our_own_spawn_record_authorises_destruction(
     rec = _RecordingTmux(pane_pid=4100, window_id="@7")
     monkeypatch.setattr(lib_mux, "subprocess", rec)
 
-    lib_mux.write_pane_record("dispatcher", "tmux", "@7")
+    lib_mux.write_pane_record("dispatcher", "tmux", "@7",
+                          server=TMUX_SERVER)
 
     assert lib_mux.TmuxBackend().kill("dispatcher") is True
     assert rec.kill_targets() == ["@7"], \
@@ -233,7 +243,8 @@ def test_a_record_for_another_tab_does_not_authorise_this_one(
     rec = _RecordingTmux(pane_pid=4100, window_id="@9")   # 今そこに在るのは @9
     monkeypatch.setattr(lib_mux, "subprocess", rec)
 
-    lib_mux.write_pane_record("dispatcher", "tmux", "@7")  # 記録は @7
+    lib_mux.write_pane_record("dispatcher", "tmux", "@7",
+                          server=TMUX_SERVER)  # 記録は @7
 
     assert lib_mux.TmuxBackend().kill("dispatcher") is False
     assert rec.kill_targets() == [], \
@@ -256,7 +267,8 @@ def test_a_record_written_by_the_other_backend_does_not_authorise(
     rec = _RecordingTmux(pane_pid=4100, window_id="@7")
     monkeypatch.setattr(lib_mux, "subprocess", rec)
 
-    lib_mux.write_pane_record("dispatcher", "herdr", "@7")
+    lib_mux.write_pane_record("dispatcher", "herdr", "@7",
+                          server=HERDR_SERVER)
 
     assert lib_mux.TmuxBackend().kill("dispatcher") is False
     assert rec.kill_targets() == []
@@ -298,7 +310,8 @@ def test_a_foreign_daemon_vetoes_even_our_own_record(
     rec = _RecordingTmux(pane_pid=4100, window_id="@7")
     monkeypatch.setattr(lib_mux, "subprocess", rec)
 
-    lib_mux.write_pane_record("dispatcher", "tmux", "@7")
+    lib_mux.write_pane_record("dispatcher", "tmux", "@7",
+                          server=TMUX_SERVER)
 
     assert lib_mux.TmuxBackend().kill("dispatcher") is False
     assert rec.kill_targets() == []
@@ -353,7 +366,8 @@ def test_a_successful_kill_drops_the_record(
     monkeypatch.setattr(lib_mux, "_PROC_ROOT", proc_root)
     rec = _RecordingTmux(pane_pid=4100, window_id="@7")
     monkeypatch.setattr(lib_mux, "subprocess", rec)
-    lib_mux.write_pane_record("dispatcher", "tmux", "@7")
+    lib_mux.write_pane_record("dispatcher", "tmux", "@7",
+                          server=TMUX_SERVER)
 
     assert lib_mux.TmuxBackend().kill("dispatcher") is True
     assert lib_mux.read_pane_record("dispatcher") is None
@@ -552,22 +566,27 @@ def test_an_empty_pane_is_still_none(tmp_path, our_checkout):
 # ===========================================================================
 
 def test_record_status_matrix(tmp_path, as_our_checkout):
-    """記録の照合が返す 3 値。"""
-    assert lib_mux.pane_record_status("dispatcher", "tmux", "@7")[0] \
-        == lib_mux.PANE_RECORD_ABSENT
+    """記録の照合が返す 3 値。
 
-    lib_mux.write_pane_record("dispatcher", "tmux", "@7")
-    assert lib_mux.pane_record_status("dispatcher", "tmux", "@7")[0] \
-        == lib_mux.PANE_RECORD_MATCH
-    assert lib_mux.pane_record_status("dispatcher", "tmux", "@9")[0] \
-        == lib_mux.PANE_RECORD_MISMATCH
-    assert lib_mux.pane_record_status("dispatcher", "herdr", "@7")[0] \
-        == lib_mux.PANE_RECORD_MISMATCH
+    どの呼びにも `server=` を渡す。記録がどのサーバーの id について書かれた
+    ものかは照合の一部であって、省略は「照合しない」ではなく「照合できない」
+    = 不一致だから (t042 / Codex 7 巡目 P1-2)。
+    """
+    def status(backend, handle, server=TMUX_SERVER):
+        return lib_mux.pane_record_status("dispatcher", backend, handle,
+                                          server=server)[0]
+
+    assert status("tmux", "@7") == lib_mux.PANE_RECORD_ABSENT
+
+    lib_mux.write_pane_record("dispatcher", "tmux", "@7", server=TMUX_SERVER)
+    assert status("tmux", "@7") == lib_mux.PANE_RECORD_MATCH
+    assert status("tmux", "@9") == lib_mux.PANE_RECORD_MISMATCH
+    assert status("herdr", "@7") == lib_mux.PANE_RECORD_MISMATCH
     # 覗いた側が id を答えられなかったのは、一致ではない。
-    assert lib_mux.pane_record_status("dispatcher", "tmux", None)[0] \
-        == lib_mux.PANE_RECORD_MISMATCH
-    assert lib_mux.pane_record_status("dispatcher", "tmux", "")[0] \
-        == lib_mux.PANE_RECORD_MISMATCH
+    assert status("tmux", None) == lib_mux.PANE_RECORD_MISMATCH
+    assert status("tmux", "") == lib_mux.PANE_RECORD_MISMATCH
+    # サーバーを名乗れなかったのも、一致ではない。
+    assert status("tmux", "@7", server=None) == lib_mux.PANE_RECORD_MISMATCH
 
 
 def test_a_record_lands_under_the_running_checkout(tmp_path, as_our_checkout,
@@ -576,7 +595,8 @@ def test_a_record_lands_under_the_running_checkout(tmp_path, as_our_checkout,
 
     別チェックアウトの記録を読んでしまうと、「自分が作った」証明にならない。
     """
-    lib_mux.write_pane_record("dispatcher", "tmux", "@7")
+    lib_mux.write_pane_record("dispatcher", "tmux", "@7",
+                          server=TMUX_SERVER)
     path = our_checkout / "registry" / "mux" / f"{lib_mux._pane_name('dispatcher')}.json"
     assert path.exists(), f"{path} が無い"
     assert json.loads(path.read_text(encoding="utf-8"))["handle"] == "@7"
@@ -589,7 +609,8 @@ def test_an_unparsable_record_is_not_a_match(tmp_path, as_our_checkout,
     d.mkdir(parents=True, exist_ok=True)
     (d / f"{lib_mux._pane_name('dispatcher')}.json").write_text("{ not json",
                                                                 encoding="utf-8")
-    assert lib_mux.pane_record_status("dispatcher", "tmux", "@7")[0] \
+    assert lib_mux.pane_record_status("dispatcher", "tmux", "@7",
+                                      server=TMUX_SERVER)[0] \
         != lib_mux.PANE_RECORD_MATCH
 
 
@@ -616,14 +637,17 @@ def test_herdr_kill_is_bound_to_the_recorded_tab_id(
         return {"result": {}}
 
     monkeypatch.setattr(lib_mux, "_herdr_run", fake_run)
+    monkeypatch.setattr(lib_mux, "_herdr_server_identity", lambda: HERDR_SERVER)
     backend = lib_mux.HerdrBackend()
     monkeypatch.setattr(backend, "_inspect_pane", lambda name: ("tab-9", 4100))
 
-    lib_mux.write_pane_record("dispatcher", "herdr", "tab-7")
+    lib_mux.write_pane_record("dispatcher", "herdr", "tab-7",
+                              server=HERDR_SERVER)
     assert backend.kill("dispatcher") is False
     assert closed == [], f"記録に無いタブが閉じられた: {closed}"
 
-    lib_mux.write_pane_record("dispatcher", "herdr", "tab-9")
+    lib_mux.write_pane_record("dispatcher", "herdr", "tab-9",
+                              server=HERDR_SERVER)
     assert backend.kill("dispatcher") is True
     assert closed == ["tab-9"]
 
@@ -635,10 +659,12 @@ def test_a_transient_herdr_failure_does_not_destroy_the_record(
     捨てると、次の kill は「記録が無い」= 拒否に倒れ、一過性の失敗が
     永久の拒否に化ける。「消えたと答えられた」ときだけ畳む。
     """
-    lib_mux.write_pane_record("dispatcher", "herdr", "tab-7", pane_id="pane-7")
+    lib_mux.write_pane_record("dispatcher", "herdr", "tab-7",
+                              pane_id="pane-7", server=HERDR_SERVER)
 
     monkeypatch.setattr(lib_mux, "_herdr_run",
                         lambda cmd_key, extra, timeout=10: None)
+    monkeypatch.setattr(lib_mux, "_herdr_server_identity", lambda: HERDR_SERVER)
     backend = lib_mux.HerdrBackend()
     backend._resolve_ids("dispatcher")
 

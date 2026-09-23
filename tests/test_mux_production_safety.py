@@ -61,8 +61,15 @@ class _RecordingSubprocess:
     使える。
     """
 
-    def __init__(self):
+    def __init__(self, pane_pid=None):
         self.calls = []
+        # What `#{pane_pid}` answers.  It used to be hard-wired to the pytest
+        # process, which is not a stand-in for a pane occupant: since t042 a
+        # matching record only ends a pane whose occupant is *also* ours or
+        # provably nothing, and a python process running pytest is neither
+        # (memory: empty-pane-fixture-needs-real-idle-shell).  Tests about
+        # *addressing* therefore point this at a pane they have modelled.
+        self.pane_pid = os.getpid() if pane_pid is None else pane_pid
 
     def run(self, argv, **kwargs):
         self.calls.append(list(argv))
@@ -82,7 +89,7 @@ class _RecordingSubprocess:
             # spawn() takes the window id from the command that *created* the
             # window instead of looking it up by name afterwards.
             out = (argv[-1].replace("#{window_id}", "@1")
-                           .replace("#{pane_pid}", str(os.getpid()))
+                           .replace("#{pane_pid}", str(self.pane_pid))
                            .replace("#{pid}", "900")
                            .replace("#{socket_path}", "/tmp/tmux-test/default")
                    + "\n")
@@ -177,7 +184,8 @@ def test_a_missing_pane_prefix_is_refused_even_on_an_isolated_destination(
     assert recording_tmux.tmux_calls() == []
 
 
-def test_under_isolation_the_pane_name_is_namespaced(recording_tmux, own_records):
+def test_under_isolation_the_pane_name_is_namespaced(recording_tmux, own_records,
+                                                     our_daemon_pane):
     """conftest が効いている通常のテストでは、`dispatcher` は本番の `dispatcher`
     ではない別のペインに解決される。
 
@@ -223,7 +231,8 @@ def test_list_hides_the_namespace_from_callers(monkeypatch):
 
 
 def test_production_keeps_its_bare_names_and_no_guard(monkeypatch, recording_tmux,
-                                                     own_records):
+                                                     own_records,
+                                                     our_daemon_pane):
     """本番 (= 隔離マーカーが無い) では、この層は完全な no-op でなければならない。
 
     接頭辞が既定で空であること、ガードが本番を止めないこと。ここが崩れると
@@ -300,6 +309,33 @@ def own_records(tmp_path, monkeypatch):
 
 def _record_this_pane(name, handle="@1", server=STUB_SERVER):
     assert lib_mux.write_pane_record(name, "tmux", handle, server=server)
+
+
+@pytest.fixture
+def our_daemon_pane(monkeypatch, tmp_path, own_records, recording_tmux):
+    """本番と同じ形のペインを 1 つ用意する — 中で自分のデーモンが動いている。
+
+    t042 で破壊の条件が「記録 AND 占有者」になったので、記録を書くだけでは
+    kill は通らない。中身が `UNKNOWN` なら止まるのが正しい振る舞いで、
+    pytest 自身の pid を pane の pid として渡していたこれまでの形は、
+    まさにその `UNKNOWN` に当たる。
+
+    ここで模すのは本番の姿そのもの: ペインのシェルの下で、**このチェックアウトの**
+    `dispatcher.sh` が走っている (= `MINE`)。宛先を確かめるテストが、
+    占有者の判定でこけないようにするための土台であって、占有者の判定そのものは
+    `test_destruction_and_condition.py` が受け持つ。
+    """
+    scripts = own_records / "scripts"
+    scripts.mkdir(parents=True, exist_ok=True)
+    (scripts / "dispatcher.sh").write_text("#!/bin/bash\n", encoding="utf-8")
+    (scripts / "watchdog.py").write_text("#\n", encoding="utf-8")
+    proc_root = _fake_proc(tmp_path, {
+        4100: (1, ["bash"]),
+        4200: (4100, ["bash", str(scripts / "dispatcher.sh")]),
+    })
+    monkeypatch.setattr(lib_mux, "_PROC_ROOT", proc_root)
+    recording_tmux.pane_pid = 4100
+    return own_records
 
 
 @pytest.fixture

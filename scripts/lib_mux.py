@@ -1241,6 +1241,23 @@ _OWNERS_THAT_VETO = frozenset({OWNER_FOREIGN})
 #: than about how well the scan went.
 _OWNERS_THAT_PROVE_EMPTY = frozenset({OWNER_NONE})
 
+#: Classifier answers that let a *matching record* go on to authorise
+#: destruction.  The record answers "did I make this pane?"; these answer "and
+#: is what is in it now still mine, or nothing at all?".
+#:
+#: `UNKNOWN` is deliberately not here, and that is the whole of the 7th round.
+#: Its five findings are five ways for a record to match when it should not —
+#: a generation captured a moment after the id it belongs to, a pane id reused
+#: by a server that restarted between validation and destruction, a tmux
+#: "generation" that is a pid and so can come round again.  Every one of them
+#: needs the pane's occupant to be unidentifiable to do any harm: if the
+#: occupant is positively foreign the veto stops it, and if it is ours or
+#: provably empty then destroying it is not the harm.  Making the record
+#: *and* the occupant both carry the decision is therefore worth more than
+#: making the record unforgeable, and costs no boot ids or process start
+#: times to say.
+_OWNERS_THAT_CONFIRM_A_RECORD = frozenset({OWNER_MINE, OWNER_NONE})
+
 
 def daemon_pane_owner(pane_pid, *, repo_root=None,
                       proc_root: Optional[str] = None):
@@ -1357,11 +1374,38 @@ def write_pane_record(name: str, backend: str, handle: str, *,
     """Note that *this* checkout created `name`'s pane, as `handle`.
 
     `server` is `(endpoint, generation)` for the mux server the pane was
-    created on, or None when the backend could not establish one.  A pane id
-    is unique only within one server's lifetime, so without it the record is
-    a claim about an id that a later server can hand to somebody else.
+    created on.  A pane id is unique only within one server's lifetime, so
+    without it the record is a claim about an id that a later server can hand
+    to somebody else — and `pane_record_status()` refuses such a record.
+
+    So when the backend could not establish a server, nothing is written and
+    False comes back.  Writing anyway was reachable through an ordinary spawn
+    and produced a record that matched on any endpoint and any generation
+    (Codex 7巡目 P1-2).  Any *previous* record for this name goes too: it was
+    written about a pane this spawn has just replaced, and leaving it behind
+    is the one way a stale record can go on naming a live pane.
     """
     path = pane_record_path(name, repo_root=repo_root)
+    endpoint, generation = ("", "")
+    if server is not None:
+        # Anything that is not a usable `(endpoint, generation)` is "could not
+        # be established", not a crash: this runs just after a pane was
+        # created, and raising here would lose the pane's launch as well as
+        # its record.
+        try:
+            endpoint, generation = str(server[0] or ""), str(server[1] or "")
+        except (TypeError, IndexError, KeyError):
+            endpoint, generation = ("", "")
+    if not endpoint or not generation:
+        print(f"[mux] WARNING: not recording the spawn of {name!r}: the mux "
+              f"server it was created on could not be identified, and a "
+              f"record that is not bound to one would match the same pane id "
+              f"on any other server or generation. Killing this pane later "
+              f"will refuse unless the pane is provably empty — use --force, "
+              f"or respawn it once the server can be identified.",
+              file=sys.stderr)
+        drop_pane_record(name, repo_root=repo_root)
+        return False
     record = {
         "handle": str(handle or ""),
         # `tab_id` / `pane_id` are what HerdrBackend already resolved
@@ -1372,11 +1416,8 @@ def write_pane_record(name: str, backend: str, handle: str, *,
         "backend": backend,
         "checkout": _record_checkout_identity(repo_root),
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "server": {"endpoint": endpoint, "generation": generation},
     }
-    if server is not None:
-        endpoint, generation = server
-        record["server"] = {"endpoint": str(endpoint),
-                            "generation": str(generation)}
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(record, indent=2), encoding="utf-8")
@@ -1404,6 +1445,46 @@ def drop_pane_record(name: str, *, repo_root=None) -> None:
     except Exception as exc:
         print(f"[mux] WARNING: could not drop the spawn record for {name!r}: "
               f"{exc}", file=sys.stderr)
+
+
+def _server_binding_problem(recorded_server, server, path):
+    """Why the record's mux server does not vouch for `server`, or None.
+
+    Split out because "the record names no server" and "the record names a
+    different server" used to be answered in two different ways: the second
+    refused, and the first *skipped the whole check* and fell through to a
+    match.  A record with no binding is not a record that binds to everything
+    (Codex 7巡目 P1-2); both answers are a refusal, and they are next to each
+    other here so a later reader cannot re-introduce the asymmetry.
+    """
+    if not isinstance(recorded_server, dict):
+        return (f"the spawn record at {path} names no mux server, so it does "
+                f"not say which server's pane id it is about — the same id on "
+                f"another server is another pane. Respawn the pane, or use "
+                f"--force if you mean to take it over")
+    recorded_endpoint = str(recorded_server.get("endpoint") or "")
+    recorded_generation = str(recorded_server.get("generation") or "")
+    if not recorded_endpoint or not recorded_generation:
+        return (f"the spawn record at {path} binds to an incomplete mux "
+                f"server (endpoint {recorded_endpoint!r}, generation "
+                f"{recorded_generation!r}), which is not enough to tell one "
+                f"server's pane id from another's")
+    if server is None:
+        return (f"the spawn record names the mux server {recorded_endpoint!r} "
+                f"(generation {recorded_generation!r}), but the current "
+                f"server could not be identified, so the record cannot be "
+                f"shown to be about this pane")
+    endpoint, generation = str(server[0]), str(server[1])
+    if recorded_endpoint != endpoint:
+        return (f"the spawn record was written against the mux server at "
+                f"{recorded_endpoint!r}, and this is {endpoint!r} — the same "
+                f"pane id on a different server is a different pane")
+    if recorded_generation != generation:
+        return (f"the spawn record was written against generation "
+                f"{recorded_generation!r} of the mux server, and this is "
+                f"{generation!r} — the server has restarted since, so the "
+                f"recorded id is free to have been given to somebody else")
+    return None
 
 
 def pane_record_status(name: str, backend: str, handle, *, server=None,
@@ -1441,6 +1522,7 @@ def pane_record_status(name: str, backend: str, handle, *, server=None,
     # --- whose record is it? ------------------------------------------------
     mine = _record_checkout_identity(repo_root)
     written_by = record.get("checkout")
+    legacy = False
     if written_by:
         if str(written_by) != mine:
             return PANE_RECORD_MISMATCH, (
@@ -1460,39 +1542,29 @@ def pane_record_status(name: str, backend: str, handle, *, server=None,
         # different outage (memory: fail-closed-discard-vs-hold).  Its
         # location is still weak evidence here, because nothing else can
         # reach this directory.  It is never silent.
+        #
+        # What it does *not* do any more is return.  It used to answer MATCH
+        # from here, before the pane the caller is holding had been compared
+        # with the one the record names — so a legacy record for `@7`
+        # authorised destroying `@99` (Codex 7巡目 P1-1).  The allowance is
+        # for how well the record's *provenance* is evidenced; it was never
+        # meant to be an allowance about *which pane* the record is for.
+        legacy = True
         print(f"[mux] WARNING: the spawn record at {path} is in the legacy "
               f"format (no checkout, no mux server recorded). It is being "
               f"accepted because this record directory is not shared, but "
               f"that is weaker than a record written by this checkout. It "
               f"will be replaced the next time this pane is spawned.",
               file=sys.stderr)
-        return PANE_RECORD_MATCH, (
-            f"spawned by this checkout as {recorded} (legacy record, "
-            f"provenance taken from its unshared location)")
 
     # --- on which server, and which generation of it? -----------------------
-    recorded_server = record.get("server")
-    if isinstance(recorded_server, dict):
-        if server is None:
-            return PANE_RECORD_MISMATCH, (
-                f"the spawn record names the mux server "
-                f"{recorded_server.get('endpoint')!r} (generation "
-                f"{recorded_server.get('generation')!r}), but the current "
-                f"server could not be identified, so the record cannot be "
-                f"shown to be about this pane")
-        endpoint, generation = str(server[0]), str(server[1])
-        if str(recorded_server.get("endpoint")) != endpoint:
-            return PANE_RECORD_MISMATCH, (
-                f"the spawn record was written against the mux server at "
-                f"{recorded_server.get('endpoint')!r}, and this is "
-                f"{endpoint!r} — the same pane id on a different server is a "
-                f"different pane")
-        if str(recorded_server.get("generation")) != generation:
-            return PANE_RECORD_MISMATCH, (
-                f"the spawn record was written against generation "
-                f"{recorded_server.get('generation')!r} of the mux server, "
-                f"and this is {generation!r} — the server has restarted since, "
-                f"so {recorded!r} is free to have been given to somebody else")
+    # Only of the new format: a legacy record has no server by definition, and
+    # requiring one of it would refuse every daemon now running (the very
+    # outage the migration allowance exists to avoid).
+    if not legacy:
+        problem = _server_binding_problem(record.get("server"), server, path)
+        if problem is not None:
+            return PANE_RECORD_MISMATCH, problem
 
     # --- and is it this pane? ----------------------------------------------
     if not handle:
@@ -1503,6 +1575,10 @@ def pane_record_status(name: str, backend: str, handle, *, server=None,
         return PANE_RECORD_MISMATCH, (
             f"the spawn record names {recorded!r}, but the pane under that "
             f"name is {str(handle)!r} — somebody else made this one")
+    if legacy:
+        return PANE_RECORD_MATCH, (
+            f"spawned by this checkout as {recorded} (legacy record, "
+            f"provenance taken from its unshared location)")
     return PANE_RECORD_MATCH, f"spawned by this checkout as {recorded}"
 
 
@@ -1511,20 +1587,30 @@ def may_destroy_pane(name: str, backend: str, handle, pane_pid, *,
                      proc_root: Optional[str] = None):
     """`(allowed, reason)` — the one place that decides a pane may be destroyed.
 
-    Two positive proofs, either of which is enough, and one veto:
+    Two positive proofs and one veto:
 
-      * **provenance** — our own spawn record names this exact pane.  The
-        strong one, because it is a fact we wrote rather than one we inferred.
-      * **emptiness** — the pane provably holds no live process at all.  Needed
-        as well as provenance, not instead of it: a herdr restart restores tabs
-        with fresh ids and leaves every record stale, and without this the
-        husks could never be cleared again (memory: fail-closed-discard-vs-hold).
+      * **provenance AND occupancy** — our own spawn record names this exact
+        pane, *and* what is in the pane right now is either our own daemon or
+        nothing.  Both halves, not either: the record is a fact we wrote, but
+        five rounds of review have now found as many ways for a record to be
+        stale, shared or reused, and each one of them needs an occupant we
+        cannot identify in order to reach anything destructive.  Requiring the
+        occupant as well costs one classifier answer we already compute and
+        closes all of them at once (Codex 7巡目 — see
+        `_OWNERS_THAT_CONFIRM_A_RECORD`).
+      * **emptiness** — the pane provably holds no live process at all.  This
+        one stands on its own, without a record, and has to: a herdr restart
+        restores tabs with fresh ids and leaves every record stale, and
+        without it the husks could never be cleared again (memory:
+        fail-closed-discard-vs-hold).  It is not a weakening — a pane with
+        nothing in it is a pane whose destruction takes nothing with it.
       * **veto** — a positively identified foreign daemon stops both. The
         record says we made the pane, not that what is in it now is ours.
 
-    Being *recognised as ours* is deliberately not on the list any more. That
-    was the old basis, and `MINE` is precisely what the 5th round produced out
-    of a `..` folded across a deleted symlink.
+    Being *recognised as ours* is still not a proof on its own. That was the
+    old basis, and `MINE` is precisely what the 5th round produced out of a
+    `..` folded across a deleted symlink; here it can only confirm a record,
+    never stand in for one.
 
     Panes outside `DAEMON_PANE_NAMES` never reach any of this — see that
     constant for why the scope is the safety property here.
@@ -1540,11 +1626,19 @@ def may_destroy_pane(name: str, backend: str, handle, pane_pid, *,
 
     status, record_detail = pane_record_status(
         name, backend, handle, server=server, repo_root=repo_root)
-    if status == PANE_RECORD_MATCH:
-        return True, record_detail
+    if status == PANE_RECORD_MATCH and owner in _OWNERS_THAT_CONFIRM_A_RECORD:
+        return True, (f"{record_detail}; what is in it: {owner} "
+                      f"({owner_detail})")
     if owner in _OWNERS_THAT_PROVE_EMPTY:
         return True, (f"{record_detail}, but the pane provably holds nothing: "
                       f"{owner_detail}")
+    if status == PANE_RECORD_MATCH:
+        return False, (
+            f"the spawn record matches ({record_detail}), but what is in the "
+            f"pane could not be identified: {owner} ({owner_detail}) — a "
+            f"record on its own no longer ends a pane, because a record can "
+            f"be stale or reused and this is the reading that would notice. "
+            f"Use --force if you mean to end it anyway")
     return False, (f"nothing proves this pane is ours to end — {record_detail}; "
                    f"what is in it: {owner} ({owner_detail})")
 
@@ -1923,8 +2017,7 @@ class TmuxBackend(_Backend):
         if not server:
             self._warn(
                 f"spawn {name!r}: tmux would not say which server this is, so "
-                f"the spawn record cannot be bound to it; a later kill will "
-                f"refuse until this pane is respawned or forced.")
+                f"this spawn goes unrecorded — see the warning below.")
         write_pane_record(name, self.BACKEND_NAME, window_id, server=server)
 
     def _inspect_pane(self, name: str):

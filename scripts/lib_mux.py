@@ -475,8 +475,8 @@ def _launch_verify_seconds() -> float:
     return value if value > 0 else _LAUNCH_VERIFY_SECONDS
 
 
-def _wait_until_launched(is_running, *, warn, name: str) -> bool:
-    """True once `is_running()` says yes; False if it never does.
+def _wait_until_launched(pane_state, *, warn, name: str) -> bool:
+    """True once `pane_state()` **observes** something running; False otherwise.
 
     Relaunching into an existing pane means *typing into a shell*, and a shell
     accepts anything.  If it was in fact still busy — the one case /proc cannot
@@ -485,18 +485,85 @@ def _wait_until_launched(is_running, *, warn, name: str) -> bool:
     The peer would record a respawn, spend its grace period and a flap slot,
     and watch the same corpse.  So the pane is asked afterwards, and the answer
     to "did it start" is the pane's, not the send's.
+
+    `pane_state()` must return the three-valued `PANE_*`, not a bool.  The
+    boolean version of this question was answered by `_pane_has_live_process()`,
+    which returns True for *anything it cannot read* — correct for "may I
+    launch in here", and exactly backwards for "did my launch work".  Fed that
+    predicate, this loop reported success the moment the backend stopped
+    answering: the command is swallowed, the pane query then fails, and the
+    spawn declares a recovery it never saw.  One predicate cannot fail safe in
+    two directions, so `PANE_UNKNOWN` is neither — it keeps the loop waiting
+    and, at the deadline, fails.
     """
     limit = _launch_verify_seconds()
     deadline = time.time() + limit
+    last = PANE_UNKNOWN
     while True:
-        if is_running():
+        last = pane_state()
+        if last == PANE_LIVE:
             return True
         if time.time() >= deadline:
-            warn(f"spawn {name!r}: nothing is running in the pane "
-                 f"{limit:.0f}s after the launch command — treating the spawn as "
-                 "failed (the pane may have taken it as input)")
+            if last == PANE_UNKNOWN:
+                warn(f"spawn {name!r}: the pane could not be read in the "
+                     f"{limit:.0f}s after the launch command — 'could not look' "
+                     "is not 'it started', so the spawn is treated as failed")
+            else:
+                warn(f"spawn {name!r}: nothing is running in the pane "
+                     f"{limit:.0f}s after the launch command — treating the spawn as "
+                     "failed (the pane may have taken it as input)")
             return False
         time.sleep(_LAUNCH_VERIFY_POLL)
+
+
+#: What is in a pane.  `UNKNOWN` is a third answer, not a shade of the other
+#: two: "may I launch here" must read it as busy, "did my launch work" must
+#: read it as no.  Collapsing it into either makes one of those wrong.
+PANE_IDLE, PANE_LIVE, PANE_UNKNOWN = "idle", "live", "unknown"
+
+
+def _pane_shell_state(pane_pid, proc_root: str = "/proc") -> str:
+    """`PANE_IDLE` / `PANE_LIVE` / `PANE_UNKNOWN` for a pane's shell pid.
+
+    The three-valued form of `_pane_shell_is_idle()` below, which is now a
+    wrapper over it and answers exactly what it always did (`is idle` ⇔
+    `state is PANE_IDLE`).  Every check that used to return "not idle" is split
+    here into the two reasons it could have: something is demonstrably running
+    (`LIVE`), or the check could not be made (`UNKNOWN`).
+    """
+    status, fields = _proc_stat_fields(pane_pid, proc_root)
+    if status != _PROC_OK or len(fields) < 6:
+        return PANE_UNKNOWN
+
+    comm = _process_comm(pane_pid, proc_root)
+    if comm is None:
+        return PANE_UNKNOWN
+    if comm.lstrip("-") not in _SHELL_PROCESS_NAMES:
+        return PANE_LIVE          # the pane is rooted at something that is not
+                                  # a shell — that something is running
+
+    argv = _process_argv(pane_pid, proc_root)
+    if argv is None:
+        return PANE_UNKNOWN
+    if len(argv) != 1:
+        return PANE_LIVE          # `bash script.sh`, `bash -c …`
+
+    if fields[0] != "S":
+        return PANE_LIVE          # R burns CPU; T/D is not sitting at a prompt
+
+    try:
+        pgrp, tty_nr, tpgid = int(fields[2]), int(fields[4]), int(fields[5])
+    except ValueError:
+        return PANE_UNKNOWN
+    if tty_nr == 0 or tpgid <= 0:
+        return PANE_UNKNOWN       # not a pane shell as we understand one
+    if tpgid != pgrp:
+        return PANE_LIVE          # the terminal's foreground is a child
+
+    children = _live_children(pane_pid, proc_root)
+    if children is None:
+        return PANE_UNKNOWN
+    return PANE_LIVE if children else PANE_IDLE
 
 
 def _pane_shell_is_idle(pane_pid, proc_root: str = "/proc") -> bool:
@@ -535,31 +602,7 @@ def _pane_shell_is_idle(pane_pid, proc_root: str = "/proc") -> bool:
     is closed one layer up, by spawn() verifying that something actually
     started rather than trusting that the command was accepted.
     """
-    status, fields = _proc_stat_fields(pane_pid, proc_root)
-    if status != _PROC_OK or len(fields) < 6:
-        return False
-
-    comm = _process_comm(pane_pid, proc_root)
-    if comm is None or comm.lstrip("-") not in _SHELL_PROCESS_NAMES:
-        return False
-
-    argv = _process_argv(pane_pid, proc_root)
-    if argv is None or len(argv) != 1:
-        return False
-
-    if fields[0] != "S":              # R = busy, T/D = not answering a prompt
-        return False
-    try:
-        pgrp, tty_nr, tpgid = int(fields[2]), int(fields[4]), int(fields[5])
-    except ValueError:
-        return False
-    if tty_nr == 0 or tpgid <= 0 or tpgid != pgrp:
-        return False
-
-    children = _live_children(pane_pid, proc_root)
-    if children is None:
-        return False
-    return not children
+    return _pane_shell_state(pane_pid, proc_root) == PANE_IDLE
 
 
 # ---------------------------------------------------------------------------
@@ -624,22 +667,29 @@ class TmuxBackend(_Backend):
         """
         return f"{_session()}:{_pane_name(name)}"
 
-    def _pane_has_live_process(self, name: str) -> bool:
-        """True if the window named `name` is running anything beyond its shell.
+    def _pane_process_state(self, name: str) -> str:
+        """`PANE_IDLE` / `PANE_LIVE` / `PANE_UNKNOWN` for the window `name`.
 
-        The tmux counterpart of HerdrBackend._pane_has_live_process, and the
+        The tmux counterpart of HerdrBackend._pane_process_state, and the
         reason spawn() can tell a husk from an occupied window on both
         backends.  tmux offers no `process-info`, so the pane's shell pid
         (`#{pane_pid}`) is the entry point and /proc answers the rest.
-
-        Fail-safe: a pid we cannot obtain answers True, so an unreadable
-        window is treated as occupied and never relaunched on top of.
         """
         pane_pid = self.pid(name)
         if pane_pid is None:
-            self._warn(f"could not read pane pid for {name!r} — treating pane as busy")
-            return True
-        return not _pane_shell_is_idle(pane_pid)
+            self._warn(f"could not read pane pid for {name!r} — pane state unknown")
+            return PANE_UNKNOWN
+        return _pane_shell_state(pane_pid)
+
+    def _pane_has_live_process(self, name: str) -> bool:
+        """True unless the window is *demonstrably* an idle shell.
+
+        The occupancy question, where unknown must read as busy: never
+        relaunch on top of a pane we cannot see into.  The launch-verification
+        question needs the opposite default and therefore uses
+        `_pane_process_state()` directly.
+        """
+        return self._pane_process_state(name) != PANE_IDLE
 
     def available(self) -> bool:
         return shutil.which("tmux") is not None
@@ -715,7 +765,7 @@ class TmuxBackend(_Backend):
                     if not self.send(name, cmd):
                         return False
                     return _wait_until_launched(
-                        lambda: self._pane_has_live_process(name),
+                        lambda: self._pane_process_state(name),
                         warn=self._warn, name=name)
                 r = subprocess.run(
                     ["tmux", "new-window", "-t", session, "-n", window],
@@ -1318,37 +1368,42 @@ class HerdrBackend(_Backend):
                 }
         return None
 
-    def _pane_has_live_process(self, pane_id: str) -> bool:
-        """True if `pane_id` runs anything beyond its idle shell.
+    def _pane_process_state(self, pane_id: str) -> str:
+        """`PANE_IDLE` / `PANE_LIVE` / `PANE_UNKNOWN` for `pane_id`.
 
         When the herdr server restarts it restores a workspace's tab layout but
         not the processes inside it, so panes keep their <Agent>-<role> label
         while holding nothing but a bare shell.  spawn() uses this to tell such
         a husk (safe to relaunch into) from a pane where an agent is still
-        running.
+        running — and, separately, to tell whether its own launch took.
 
-        Fail-safe: any error answers True, so a pane we cannot read is treated
-        as occupied and never relaunched on top of.
+        Every unreadable answer is `PANE_UNKNOWN`, which the two callers read
+        in opposite directions: occupancy treats it as busy, launch
+        verification as not-started.
         """
         data = _herdr_run("pane_process_info", [pane_id], timeout=10)
         if data is None:
-            self._warn(f"process-info failed for {pane_id!r} — treating pane as busy")
-            return True
+            self._warn(f"process-info failed for {pane_id!r} — pane state unknown")
+            return PANE_UNKNOWN
         try:
             procs = data["result"]["process_info"]["foreground_processes"]
         except (KeyError, TypeError):
             self._warn(
                 f"process-info for {pane_id!r} has no foreground_processes "
-                "— treating pane as busy"
+                "— pane state unknown"
             )
-            return True
+            return PANE_UNKNOWN
         if not isinstance(procs, list):
             self._warn(
                 f"process-info for {pane_id!r} returned a non-list "
-                "foreground_processes — treating pane as busy"
+                "foreground_processes — pane state unknown"
             )
-            return True
-        return not all(_is_idle_shell_process(proc) for proc in procs)
+            return PANE_UNKNOWN
+        return PANE_IDLE if all(_is_idle_shell_process(p) for p in procs) else PANE_LIVE
+
+    def _pane_has_live_process(self, pane_id: str) -> bool:
+        """True unless the pane is *demonstrably* an idle shell (see above)."""
+        return self._pane_process_state(pane_id) != PANE_IDLE
 
     # ------------------------------------------------------------------
     # Server / workspace helpers
@@ -1484,7 +1539,7 @@ class HerdrBackend(_Backend):
                     self._warn(f"spawn {name!r}: pane run failed on reused pane")
                     return False
                 if not _wait_until_launched(
-                        lambda: self._pane_has_live_process(existing_pane_id),
+                        lambda: self._pane_process_state(existing_pane_id),
                         warn=self._warn, name=name):
                     return False
                 self._write_cache(name, pane.get("tab_id") or "", existing_pane_id)

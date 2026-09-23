@@ -649,12 +649,17 @@ def spawn_command(name: str, repo_root, *, env=None) -> str:
     prefix = "".join(f"export {var}={_sh_single_quote(value)}; "
                      for var, value in values.items() if value)
     if name == DAEMON_DISPATCHER:
-        body = f"bash '{scripts / 'dispatcher.sh'}'"
+        body = f"bash {_sh_single_quote(scripts / 'dispatcher.sh')}"
     elif name == DAEMON_WATCHDOG:
-        body = f"python3 '{scripts / 'watchdog.py'}'"
+        body = f"python3 {_sh_single_quote(scripts / 'watchdog.py')}"
     else:
         raise ValueError(f"unknown daemon: {name!r}")
-    return f"cd '{repo_root}' && {prefix}{body}"
+    # The repo path is data too.  It was written bare inside `'...'`, which a
+    # checkout under `/home/o'brien/` closes — and everything after the
+    # apostrophe is then command, not path.  Quoting the env values but not
+    # the paths is the shape where the *unremarkable* input is the dangerous
+    # one, so every interpolation goes through the same function.
+    return f"cd {_sh_single_quote(repo_root)} && {prefix}{body}"
 
 
 # ---------------------------------------------------------------------------
@@ -805,22 +810,91 @@ def _write_pause_marker(registry_dir, name: str, *, reason: str = "",
 
 
 def resume(registry_dir, name: str, *, token: Optional[str] = None,
-           force: bool = False) -> bool:
-    """Lift the marker.  False when it belongs to someone else."""
+           force: bool = False,
+           timeout: float = MAINTENANCE_LOCK_TIMEOUT_SECONDS) -> bool:
+    """Lift the marker.  False when it belongs to someone else.
+
+    Under the daemon's lock, for the same reason `pause()` is: read, verify
+    and unlink are three instants, and between the first and the third another
+    maintenance run can replace the marker with its own.  Unlinking then
+    removes *that* run's protection — the checked token was never the token of
+    the file that got deleted — and the peer is free to respawn next to the
+    kill the second operator is about to do.  Classic read-modify-write; the
+    only reason it looks safe is that the write is a delete.
+
+    Re-entrant for `restart()`, which already holds this lock when its
+    `finally:` gets here.
+
+    Returns False when the lock cannot be taken: no serialisation, no
+    permission to remove a protection.  The marker stays, and the stale-pause
+    report is the way out.
+    """
+    with daemon_lock(registry_dir, name, timeout=timeout) as locked:
+        if not locked:
+            return False
+        path = pause_path(registry_dir, name)
+        state, marker = read_pause_state(registry_dir, name)
+        if state == PAUSE_ABSENT:
+            return True  # nothing to lift — idempotent
+        if state == PAUSE_UNREADABLE:
+            # `--force` is exactly the case for a marker nobody can parse: an
+            # operator looking at a corrupt file and deciding it is rubbish.
+            # Without it there is nothing to check the token against, so the
+            # honest answer is "no".
+            if force:
+                unlink_quiet(path)
+                return True
+            return False
+        if not force and token is None:
+            return False
+        if not force and marker.get("token") != token:
+            return False
+        unlink_quiet(path)
+        return True
+
+
+#: `read_pause_state()` outcomes.  Three, not two: "there is no marker" and
+#: "there may be a marker and we cannot read it" authorise opposite actions,
+#: and `read_json()` — which answers None to missing, unreadable and corrupt
+#: alike — cannot tell them apart.  The caller that matters here is `_decide()`,
+#: whose next step on "no marker" is a respawn.
+PAUSE_ABSENT = "absent"
+PAUSE_ACTIVE = "active"
+PAUSE_UNREADABLE = "unreadable"
+
+
+def read_pause_state(registry_dir, name: str):
+    """`(state, marker)` for `name`'s pause marker.
+
+    Only `FileNotFoundError` is evidence of absence.  A directory in the
+    marker's place, a permission error, a half-written file, a document that
+    is not an object — none of those say the maintenance is over, and reading
+    them as "no marker" lifts a protection nobody lifted.
+    """
     path = pause_path(registry_dir, name)
-    marker = read_json(path)
-    if marker is None:
-        return True  # nothing to lift — idempotent
-    if not force and token is not None and marker.get("token") != token:
-        return False
-    if not force and token is None:
-        return False
-    unlink_quiet(path)
-    return True
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return PAUSE_ABSENT, None
+    except OSError:
+        return PAUSE_UNREADABLE, None
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return PAUSE_UNREADABLE, None
+    if not isinstance(data, dict):
+        return PAUSE_UNREADABLE, None
+    return PAUSE_ACTIVE, data
 
 
 def read_pause(registry_dir, name: str) -> Optional[dict]:
-    return read_json(pause_path(registry_dir, name))
+    """The marker, or None when there is none *or* it cannot be read.
+
+    Kept for the callers that only display it (`status`).  Anything that acts
+    on the answer must use `read_pause_state()` — collapsing the two Nones is
+    the defect this pair exists to separate.
+    """
+    return read_pause_state(registry_dir, name)[1]
 
 
 # ---------------------------------------------------------------------------
@@ -1100,14 +1174,24 @@ class DaemonWatch:
         """The judgment itself.  Runs with this peer's lock held."""
         peer = self.peer_name
 
-        marker = read_pause(self.registry_dir, peer)
-        if marker is not None:
+        state = self._read_state()
+
+        pause_state, marker = read_pause_state(self.registry_dir, peer)
+        if pause_state == PAUSE_UNREADABLE:
+            # A marker is there — or might be — and we cannot say whose.  The
+            # only two things to do are "respawn" and "wait", and a respawn
+            # into somebody's half-done maintenance is the double start.
+            return self._hold(
+                state, now,
+                f"{peer} の停止マーカー ({pause_path(self.registry_dir, peer)}) が "
+                f"読めません。maintenance 中かどうか判断できないので respawn は "
+                f"しません")
+        if pause_state == PAUSE_ACTIVE:
             self._maybe_report_stale_pause(marker, now)
             return Verdict(ACTION_PAUSED,
                            f"{peer} is paused for maintenance "
                            f"({marker.get('reason') or 'no reason given'})")
 
-        state = self._read_state()
         if now < state["grace_until"]:
             since = state.get("last_respawn_at")
             ago = f"{now - float(since):.0f}s ago" if since else "just now"

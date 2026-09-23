@@ -2136,16 +2136,15 @@ class HerdrBackend(_Backend):
             data = _herdr_run("pane_get", [pane_id or ""], timeout=5)
             if data is not None and "result" in data:
                 return pane_id
-            if data is None:
-                # We could not *ask*.  Dropping the record here would let a
-                # timeout erase the only proof that this checkout made the
-                # pane — a transient failure turning into a permanent refusal.
-                # Falling back to a lookup *by label* would be worse still:
-                # the label is exactly what another checkout can point
-                # somewhere else.
-                return None
-            # herdr answered, and the answer is that the pane is gone.
-            self._delete_cache(name)
+            if data is not None:
+                # herdr answered, and the answer is that the pane is gone.
+                self._delete_cache(name)
+            # Otherwise we could not *ask*.  The record stays: dropping it on a
+            # timeout would let a transient failure erase the only proof that
+            # this checkout made the pane, and a missing record is a permanent
+            # refusal at `may_destroy_pane()`.  Re-resolving by label below is
+            # safe even so — the label finds *a* pane, and the destruction gate
+            # compares that pane's id against the record rather than its name.
 
         # Live lookup via pane list.
         ws_id = self._workspace_id()
@@ -2168,9 +2167,9 @@ class HerdrBackend(_Backend):
             data = _herdr_run("pane_get", [pane_id or ""], timeout=5)
             if data is not None and "result" in data:
                 return cached
-            if data is None:
-                return None          # could not ask — see _resolve_pane_id()
-            self._delete_cache(name)
+            if data is not None:
+                self._delete_cache(name)   # answered: the pane is gone
+            # could not ask → keep the record; see _resolve_pane_id()
 
         # Live lookup.
         ws_id = self._workspace_id()

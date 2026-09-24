@@ -381,16 +381,31 @@ Other markers in a title: `[依存不明: id]` (depends on a task that does not 
 
 - **The plugin does not reload by itself.** Press `r` in the Task Graph tab to re-read the
   file. Crewvia updates the file immediately, but the tab keeps showing what it read last
-  (measured: file updated, tab unchanged after 4 s, `r` brought it up to date). Only the
-  agent states shown by herdr are live.
+  (measured: file updated, tab unchanged after 4 s, `r` brought it up to date).
+- **With herdr 0.9.0, the plugin shows `[offline]` as soon as one agent exists, so there is
+  no live agent state.** Once a Worker is running, the header reads `TASK DAG [offline]` and
+  the bottom line `ERROR: [Errno 32] Broken pipe`. That is how it looks in normal operation,
+  not something you broke. Cause (measured against an isolated herdr 0.9.0): the plugin sends
+  `events.subscribe` on the same connection after `session.snapshot`, but the server closes a
+  connection after one request unless the first request is `events.subscribe`. With zero
+  agents the plugin never reaches the subscribe, which is why it looks fine on an empty
+  herdr (`[live]`). **This has to be fixed upstream in `tyz-works/herdr-task-graph`
+  (use separate connections for the snapshot and the subscription); Crewvia cannot fix it.**
+  What you get today is what Crewvia generates: the dependency graph and each task's status
+  (plus the `r` reload above). Crewvia writes an explicit `status` for every task, and the
+  plugin uses that in preference to anything it derives from an agent, so the task states you
+  see are Crewvia's regardless of `[offline]`.
 - **If the title is not `crewvia / N missions`, you are looking at the plugin's bundled
   example.** When the file is missing (for example a dangling symlink) the plugin does not
   complain; it falls back to a sample graph. Re-run `./scripts/plan.sh task-graph` and check
   the link.
 - **The worker ↔ task pane link does not work yet.** The generated `pane_match`
-  (`<Name>-worker`) is not something herdr 0.9.0 exposes to the plugin, so a task does not
-  light up its Worker's pane and Enter does not jump to it. Status, dependencies and the
-  ready/waiting split are unaffected. Tracked as a follow-up; see `knowledge/task-graph.md`.
+  (`<Name>-worker`) never matches: herdr 0.9.0 gives the plugin the agent's `pane_id`, not the
+  pane label that carries `<Name>-worker`. So a task shows no Worker and Enter does nothing.
+  Status, dependencies and the ready/waiting split are unaffected. Matching by `pane_id`
+  instead worked in an isolated herdr (agent name/status appeared in the task box and Enter
+  focused the pane, even while `[offline]`), but Crewvia does not generate `pane_id` yet.
+  Tracked as a follow-up; details and what is still unverified: `knowledge/task-graph.md` §4-4.
 - A queue with many finished tasks makes the graph crowded. Only active missions are drawn,
   so `plan.sh archive` a finished mission to clear it from the view.
 

@@ -102,9 +102,43 @@ plan.sh update t006 --status done   (生成物は即座に更新: done 48 / read
 'r' を送信                      pane: 1 running · 0 ready · 2 waiting · 48 done · 1 blocked   ← 反映
 ```
 
-**生きているのは herdr が持つエージェントの状態（`session.snapshot` の購読）だけ**で、
 タスクの DAG は最後に読んだ姿のまま。「crewvia は更新しているのに画面が変わらない」は
 故障ではなく仕様。`r` を押す。
+
+（この節の初版は「生きているのは herdr が持つエージェントの状態だけ」と書いていたが、
+**Worker が動いている環境では成り立たない**。次の §4-1b。）
+
+### 4-1b. herdr 0.9.0 では、エージェントが 1 つでも居ると plugin は `[offline]` になる
+
+**この環境（herdr 0.9.0 + plugin 0.1.1）では、エージェントが 1 つでも居ると plugin は
+offline になり、live なエージェント状態は来ない。** 実運用（Worker が動いている状態）では
+常に該当する。得られるのは crewvia が生成した依存関係と status の可視化だけ。
+
+見え方: ヘッダーが `TASK DAG [offline]`、最下部に `ERROR: [Errno 32] Broken pipe`。
+**故障ではない**（平常運用でこう見える）。
+
+原因（QA t006 が隔離ソケットを直接叩いて実証。`task_graph.py:_run_session` を読んで確認）:
+
+```
+snapshot 送信 -> 応答 -> 同じ接続で 2 つ目のリクエスト (events.subscribe) -> BrokenPipeError
+events.subscribe を最初のリクエストとして送る -> subscription_started (通る)
+```
+
+herdr 0.9.0 の server は、subscribe が最初のリクエストでない限り **1 接続 1 リクエスト**で閉じる。
+plugin は同一接続で `session.snapshot` → `events.subscribe` の順に送るので、`agents[]` が空で
+なければ必ず失敗する。**エージェント 0 件だと subscribe まで進まない**（購読対象が無いので
+`_run_session` が手前で返る）ため気付かない。A/B: 0 件 → `[live]` / 1 件 → `[offline]`。
+
+- **直す場所は upstream（`tyz-works/herdr-task-graph`）**: snapshot 用と subscribe 用で接続を分ける。
+  **crewvia 側では直せない**。upstream は t023 では変更していない（Director が別途判断）
+- README / CLAUDE.md の記述は、この実態に合わせてある
+- plugin は失敗のたびに約 0.75 秒待って snapshot からやり直すので、offline 表示のまま
+  `agents[]` は繰り返し読み込まれる（§4-4 の検証でも agents[] が箱に反映された）。ただし
+  agent の状態変化が箱に追従するかどうかは**確認していない**
+- crewvia の task には常に `status` が書かれ、plugin の `task_states` は `status` があれば
+  agent 由来の導出より優先する（コード読み。§4-4 の検証でも `agent` の無い task が `RUN` と出た）。
+  したがって **`[offline]` でも task の状態表示は crewvia の値そのもの**で、live の agent 状態が
+  無いことで失うのは「箱の中の agent 名・状態の表示」だけ
 
 ### 4-2. ファイルが見つからないと、エラーではなくサンプルが出る
 
@@ -124,13 +158,16 @@ t001 は `pending` の READY / WAIT を plugin の導出に**委ねず**、crewv
 よって「その瞬間の WAIT は信用しない」という但し書きは要らない。逆に、plugin の導出に
 戻す変更を入れるなら、この但し書きが必要になる。
 
-### 4-4. `pane_match` は live の herdr では当たらない（**未解決・要フォローアップ**）
+### 4-4. `pane_match` は live の herdr では当たらない（**未解決・要フォローアップ**。`pane_id` なら当たることを隔離環境で確認済み）
+
+**現状で起きること**: task の箱に Worker（agent）の表示が出ず、Enter を押しても何も起きない。
+§4-1b の offline とは独立した問題（offline でも、直っても、`pane_match` は当たらない）。
 
 生成物は `worker` が就いている task に `pane_match: "<Name>-worker"` を書く。
 plugin は `pane_match` を **`session.snapshot` の `agents[]` の
 `pane_id / name / title / display_agent / agent / terminal_title`** に対して部分一致で探す。
 
-実測（`herdr api snapshot` = plugin が購読するのと同じ snapshot）:
+実測（`herdr api snapshot` = plugin が読むのと同じ snapshot）:
 
 - 隔離 herdr で pane に label `Ren-worker` を付け、`claude` 名のプロセスを走らせた:
   `agents[]` の項目は `agent: "claude"`, `pane_id`, `cwd`, `agent_status` … で、
@@ -147,10 +184,40 @@ crewvia のペイン名 `<Name>-worker` は herdr の pane の **`label`** に�
 
 t001 が未確認としていた点（label か terminal title か）の答えは「どちらでもない」。
 
-**直す道筋（crewvia 側で完結できる可能性がある）**: plugin は `pane_id`（完全一致）も受ける。
+#### 検証済み: task に `pane_id` を書けば当たる（offline のままでも）
+
+隔離 herdr（別 HOME、`env -i` で起動した server。本番の `crewvia` workspace には触れていない）で、
+label `Ren-worker` の pane に `claude` 名のプロセスを走らせ、次の 2 task を持つ tasks.json を
+plugin に読ませた（2026-09-25、t023）:
+
+```
+{"id": "qa-f1:t001", "status": "running", "pane_match": "Ren-worker"}   ← label で照合
+{"id": "qa-f1:t002", "status": "running", "pane_id": "w1:p9"}           ← pane_id で照合
+```
+
+| 観測 | `pane_match: "Ren-worker"` | `pane_id: "w1:p9"` |
+|---|---|---|
+| 箱の agent 表示 | **無し** | `claude · idle` が出た |
+| Enter（選択して押す） | フォーカス不変（`w1:pA` のまま） | **`w1:p9`（Worker の pane）にフォーカスが移った** |
+
+この間ヘッダーは `[offline]`（`Broken pipe`）のまま。つまり **offline 中でも、snapshot 1 回分の
+`agents[]` は読み込まれ、`pane_id` の完全一致は効く**（§4-1b のとおり plugin は再接続のたびに
+snapshot を取り直す）。t006 QA が「未検証」としていた点は、これで確認できた。
+
+**確認できていないこと**（「できる」とは書かない）:
+
+- **crewvia の生成器が `pane_id` を書く実装はまだ無い**。上の検証は tasks.json を手で書いた。
+  今の crewvia の画面は「Worker 表示なし・Enter 不可」のまま
+- 実際の Claude Code の Worker pane での確認。検証は `claude` という名前のスタンドイン（`sleep`）で、
+  herdr が `agent: "claude"` と認識する経路は同じだが、実 Worker では見ていない
+- agent の状態変化（idle → working 等）が offline 中の箱に追従するか
+- pane id が herdr の再起動・復元を跨いで有効か（下記の注意点の前提）
+
+#### 直す道筋（crewvia 側で完結できる可能性がある。実装は別 task）
+
 crewvia は Worker 起動時に `registry/mux/<Name>-worker.json` へ `pane_id`
 （例 `wP:p80`）を記録している。生成器がここから `pane_id` を引いて書けば、upstream を
-触らずに紐付けられる。注意点:
+触らずに紐付けられる見込み（上の検証が根拠）。注意点:
 
 - pane id は herdr の再起動・復元で変わりうる。`server.generation` が現在の server と
   一致しない記録は使わない（古い記録は実在する。`Arjun-worker.json` は 2026-09-23 のもの）
@@ -158,8 +225,8 @@ crewvia は Worker 起動時に `registry/mux/<Name>-worker.json` へ `pane_id`
   と同様に取る
 - upstream の `label` 対応（plugin 側で `label` も検索する）でも直るが、別リポジトリの変更
 
-これは生成器の変更なので t005（ドキュメント）では実装していない。t005 の完了報告で
-Director に伝える（task 化は Director の判断）。
+これは生成器の変更なので、ドキュメントの task（t005 / t023）では実装していない。
+task 化は Director の判断。
 
 ### 4-5. 完了済み task が多いと画面が詰まる
 
@@ -198,7 +265,8 @@ plugin は全 task を並べる。完了済みが数十件あると箱が潰れ�
 | 画面が crewvia の内容でない（サンプルが出る） | タイトルが `crewvia / N missions` か。symlink の先が存在するか、主 checkout を指しているか |
 | ファイルが更新されない | `CREWVIA_TASK_GRAPH=0` になっていないか。`plan.sh task-graph` を手で実行して出力を見る。`plan.sh` の stderr に生成失敗の 1 行が出ていないか |
 | `plan.sh task-graph` が「queue が違う」と拒否する | `CREWVIA_QUEUE` が `<root>/queue` でない。書き先を明示するなら `CREWVIA_TASK_GRAPH_FILE` |
-| task に Worker 名が出ない | §4-4（現状は仕様上出ない） |
+| ヘッダーが `[offline]`、最下部に `ERROR: [Errno 32] Broken pipe` | Worker が動いている間は**平常**（§4-1b。herdr 0.9.0 の plugin の欠陥で、upstream 側の修正待ち）。crewvia の tasks.json 側を疑わない。task の状態表示は crewvia の値のまま |
+| task に Worker 名が出ない・Enter で pane に飛べない | §4-4（現状は仕様上出ない。生成器が `pane_id` を書いていない） |
 | plugin が読み込みに失敗する | plugin は空の `tasks` / id の空・重複 / 解決できない `depends_on` / 循環でファイル全体を拒否する。生成器は 4 つとも潰してあるので、出たらバグ（`enforce_task_graph_contract()` を見る） |
 
 ---
@@ -220,7 +288,7 @@ plugin は全 task を並べる。完了済みが数十件あると箱が潰れ�
 - 止めるときは **`herdr server stop` ではなく PID を指定して `kill`**（起動時に出した PID。
   `/proc/<pid>/environ` で `HOME` が隔離側であることを確認してから）。本番の PID
   （`ps` で PPID=1 の `herdr server` が複数出る）と取り違えない
-- plugin の照合を見るなら `herdr api snapshot`（plugin が購読するのと同じ）を読む。
+- plugin の照合を見るなら `herdr api snapshot`（plugin が読むのと同じ）を読む。
   画面を `herdr pane read <pane_id>` で取るのは補助
 - 後始末: このリポジトリのルールは `rm -rf` を禁じている。`/tmp/hgt` は残る（`/tmp` なので
   再起動で消える）

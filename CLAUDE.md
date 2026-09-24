@@ -47,7 +47,12 @@
 - 制約: plugin は **`r` キーでしか再読み込みしない**（crewvia が書き換えても自動反映されない。
   実測済み）。ファイルが見つからないと plugin は**エラーを出さず同梱のサンプルを表示する**
   （画面タイトルが `crewvia / N missions` でなければ crewvia のファイルを読めていない）。
-  **Worker とタスクのペイン紐付け（`pane_match`）は現状 live の herdr では当たらない**
+  **herdr 0.9.0 では、エージェントが 1 つでも居ると plugin は `[offline]`（`Broken pipe`）になり、
+  live なエージェント状態は来ない**（plugin が同一接続で snapshot の後に subscribe を送るのが原因。
+  upstream `tyz-works/herdr-task-graph` 側の修正が要り、crewvia では直せない）。得られるのは
+  crewvia が生成した依存関係と status の可視化のみ。**Worker とタスクのペイン紐付け
+  （`pane_match`）も当たらない**（`pane_id` で書けば当たることは隔離環境で確認済みだが、生成器は
+  まだ書かない）
 - 運用メモ・切り分け・実測: `knowledge/task-graph.md`
 
 ---

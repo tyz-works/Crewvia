@@ -63,6 +63,13 @@ NOTIFY_TTL     = int(sys.argv[4])
 _SCRIPTS_DIR = REGISTRY_DIR.parent / 'scripts'
 sys.path.insert(0, str(_SCRIPTS_DIR))
 from lib_mux import Mux  # noqa: E402
+# task カードの読み取りは crewvia の中で 1 箇所しかない (Codex 5 巡目 P2)。
+# ここに frontmatter を直接読むコードを書き戻さないこと — plan.sh が受理する
+# カードとここが拾うカードが、静かにズレる。
+from lib_task_cards import (  # noqa: E402
+    is_missing, is_unreadable, list_task_cards, read_regular_text,
+    read_regular_text_or_unreadable,
+)
 _mux = Mux()
 
 MISSIONS_DIR    = QUEUE_DIR / 'missions'
@@ -164,45 +171,39 @@ def parse_yaml(text):
     return result
 
 
-def parse_frontmatter(text):
-    lines = text.splitlines()
-    if not lines or lines[0].strip() != '---':
-        return {}, text
-    end = -1
-    for idx in range(1, len(lines)):
-        if lines[idx].strip() == '---':
-            end = idx
-            break
-    if end < 0:
-        return {}, text
-    front = '\n'.join(lines[1:end])
-    body = '\n'.join(lines[end + 1:])
-    meta = parse_yaml(front)
-    meta.setdefault('skills', [])
-    meta.setdefault('blocked_by', [])
-    if meta.get('skills') is None:
-        meta['skills'] = []
-    if meta.get('blocked_by') is None:
-        meta['blocked_by'] = []
-    return meta, body
-
-
 # ---------------------------------------------------------------------------
 # State / workers / tasks loading
 # ---------------------------------------------------------------------------
 
+def _read_queue_text(path, what):
+    """queue / registry のファイルを種類を確かめてから読む。
+
+    読めたら `str`、読めなければ `Unreadable` (t018)。判定の本体は
+    `lib_task_cards.read_regular_text_or_unreadable()` に 1 つだけ
+    (Codex 8 巡目 P2)。常駐デーモンなので、上限の無い `read_text()` が書き手の
+    いない FIFO に当たると **検証の割り当てがサイクルごと止まる**。
+    """
+    return read_regular_text_or_unreadable(
+        path, warn=lambda msg: log(f"WARNING: {what}: {msg}"))
+
+
 def load_state():
-    if not STATE_FILE.exists():
-        return {}
-    return parse_yaml(STATE_FILE.read_text())
+    text = _read_queue_text(STATE_FILE, 'state file')
+    if is_missing(text):
+        return {}          # 本当に無い = active mission ゼロ
+    if is_unreadable(text):
+        return text        # 観測できなかった —— 空として扱えない形で返す
+    return parse_yaml(text)
 
 
 def load_workers():
     """Return dict {name: {'skills': [...], 'role': str}} from registry/workers.yaml."""
-    if not WORKERS_FILE.exists():
-        return {}
+    text = _read_queue_text(WORKERS_FILE, 'workers file')
+    if is_missing(text):
+        return {}          # 本当に無い = Worker 0 人
+    if is_unreadable(text):
+        return text        # 観測できなかった
     workers = {}
-    text = WORKERS_FILE.read_text()
     current = None
     for line in text.splitlines():
         stripped = line.strip()
@@ -222,23 +223,15 @@ def load_workers():
 
 
 def list_tasks_for_mission(slug):
+    """Return list of (meta, body, path) sorted by task number.
+
+    読み取りの規則は scripts/lib_task_cards.py に 1 つだけ (plan.sh / dispatcher.sh
+    と同じもの)。読めないカードは例外ではなく `[破損]` のカードとして返るので、
+    1 枚の事故でこのループが止まることはない。
+    """
     tdir = MISSIONS_DIR / slug / 'tasks'
-    if not tdir.exists():
-        return []
-    entries = []
-    for fn in tdir.iterdir():
-        m = re.fullmatch(r't(\d+)\.md', fn.name)
-        if m:
-            entries.append((int(m.group(1)), fn))
-    entries.sort()
-    out = []
-    for _, path in entries:
-        try:
-            meta, body = parse_frontmatter(path.read_text())
-            out.append((meta, body, path))
-        except Exception as e:
-            log(f"WARNING: failed to parse {path}: {e}")
-    return out
+    cards = list_task_cards(tdir, warn=lambda msg: log(f"WARNING: {msg}"))
+    return [(meta, body, tdir / f"{meta['id']}.md") for meta, body in cards]
 
 
 # ---------------------------------------------------------------------------
@@ -260,8 +253,17 @@ def _dump_scalar(s):
 
 
 def update_task_fields(task_path, updates):
-    """Atomically set specific frontmatter fields in a task .md file."""
-    text = task_path.read_text()
+    """Atomically set specific frontmatter fields in a task .md file.
+
+    **書き換える前に、カードが通常ファイルであることを確かめる** (Codex 8 巡目
+    P2)。ここは読んでから書き戻す経路なので、種類を見ないと 2 つ壊れる ——
+    書き手のいない FIFO なら読みで無期限に止まり、止まらなかったとしても
+    `os.replace()` が置き換えるのは *別の何か* である。
+
+    読めなければ例外を投げる。呼び出し側は 1 件ずつ `except Exception` で
+    受けてログに落とすので、倒れる先は「その task だけが割り当たらない」。
+    """
+    text = read_regular_text(task_path)
     lines = text.split('\n')
     in_fm = False
     result_lines = []
@@ -374,6 +376,10 @@ def tmux_send(target, message):
 
 def dispatch():
     state = load_state()
+    if is_unreadable(state):
+        log(f"WARNING: state.yaml を観測できない ({state.reason}) — "
+            f"このサイクルは何も割り当てない")
+        return
     active_missions = list(state.get('active_missions') or [])
     if not active_missions:
         return
@@ -393,6 +399,10 @@ def dispatch():
 
     # Load workers with verify skill (exclude directors)
     all_workers = load_workers()
+    if is_unreadable(all_workers):
+        log(f"WARNING: workers.yaml を観測できない ({all_workers.reason}) — "
+            f"このサイクルは何も割り当てない")
+        return
     verify_workers = {
         name for name, info in all_workers.items()
         if 'verify' in (info.get('skills') or [])

@@ -160,11 +160,23 @@ import fcntl
 import json
 import os
 import signal
+import sys
 import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Tuple
+
+_SCRIPTS_DIR = Path(__file__).resolve().parent
+if str(_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS_DIR))
+
+# queue / registry を読むガードは crewvia に 1 つしかない (t017/t018)。
+# 素の `read_text()` は上限を持たないので、置き違えた FIFO 1 枚で退役処理
+# —— watchdog のサイクルの中 —— が無期限に座り込む。
+from lib_task_cards import (  # noqa: E402
+    is_missing, is_unreadable, read_regular_text_or_unreadable,
+)
 
 # ---------------------------------------------------------------------------
 # Phases
@@ -448,9 +460,12 @@ def write_json_exclusive(path, data: dict) -> str:
 
 def read_json(path) -> Optional[dict]:
     """Return the parsed document, or None if missing / unreadable / corrupt."""
+    text = read_regular_text_or_unreadable(path)
+    if is_unreadable(text):
+        return None
     try:
-        data = json.loads(Path(path).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        data = json.loads(text)
+    except ValueError:
         return None
     return data if isinstance(data, dict) else None
 
@@ -550,9 +565,11 @@ def read_task_started_at(queue_dir, mission: str, task_id: str):
     if not queue_dir or not mission or not task_id:
         return UNKNOWN_STARTED_AT
     path = Path(queue_dir) / "missions" / str(mission) / "tasks" / f"{task_id}.md"
-    try:
-        text = path.read_text(encoding="utf-8")
-    except OSError:
+    # カードも固定パスのガードを通す (Codex 9 巡目 P2)。ここは watchdog の
+    # サイクルの中で退役要求ごとに走るので、上限の無い `read_text()` が
+    # 書き手のいない FIFO に当たると **退役処理全体が返らない**。
+    text = read_regular_text_or_unreadable(path)
+    if is_unreadable(text):
         return UNKNOWN_STARTED_AT
     in_frontmatter = False
     for line in text.splitlines():
@@ -603,12 +620,12 @@ def assignment_execution_verdict(queue_dir, agent: str, mission, task_id,
     if not queue_dir or not agent or not task_id:
         return EXEC_UNREADABLE, "no assignment to compare against"
     base = Path(queue_dir) / "assignments" / str(agent)
-    try:
-        published = base.read_text(encoding="utf-8").strip()
-    except FileNotFoundError:
+    text = read_regular_text_or_unreadable(base)
+    if is_missing(text):
         return EXEC_ABSENT, f"queue/assignments/{agent} does not exist"
-    except OSError as e:
-        return EXEC_UNREADABLE, f"queue/assignments/{agent} unreadable: {e}"
+    if is_unreadable(text):
+        return EXEC_UNREADABLE, f"queue/assignments/{agent} unreadable: {text.reason}"
+    published = text.strip()
 
     expected = f"{mission}:{task_id}"
     if published != expected:
@@ -660,9 +677,12 @@ def created_at_from_cache(registry_dir, window_target: str) -> Optional[float]:
                 return dt.timestamp()
             except ValueError:
                 pass
+    raw = read_regular_text_or_unreadable(mux_dir / f"{window_target}.firstseen")
+    if is_unreadable(raw):
+        return None
     try:
-        return float((mux_dir / f"{window_target}.firstseen").read_text().strip())
-    except (OSError, ValueError):
+        return float(raw.strip())
+    except ValueError:
         return None
 
 

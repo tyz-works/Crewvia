@@ -97,6 +97,17 @@ exclude = {
     # 1 度だけ組み立てるだけで、repo の registry/workers.yaml には触れない
     # (REPO_ROOT は hooks/post-tool-use.sh のパス解決にしか使っていない)。
     root / "tests" / "test_daemon_backstop_hook.py",
+    # 同上 (t018 の guarded-read 構造テスト)。`_dispatcher_sandbox(root)` の
+    # root は全呼び出しで `tmp_path / "repo"` であり、書き込みは pytest の
+    # 使い捨てツリーに閉じる。このファイルの REPO_ROOT は
+    # `verifier-dispatcher.sh` の `.read_text()` にしか使っておらず、
+    # repo の registry/workers.yaml に書く経路は存在しない。
+    root / "tests" / "test_guarded_reads_on_direct_paths.py",
+    # 欠陥注入スクリプト。`p.write_text(s)` の p は `git archive HEAD` を
+    # mktemp -d に展開した使い捨てツリーの **Python ソースファイル** であって
+    # registry ではない。"workers.yaml" は注入するソース文字列と直前の見出し
+    # コメントに現れるだけで、近接ヒューリスティックがそれを拾っている。
+    root / "tests" / "red_proof_t018.sh",
 }
 proximity = 15
 found = []

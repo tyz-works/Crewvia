@@ -48,7 +48,9 @@
     worker.md           Workerのシステムプロンプト
   scripts/
     start.sh            マルチエージェント起動スクリプト
-    plan.sh             タスクプラン管理 CLI（per-task / multi-mission）
+    plan.sh             タスクプラン管理 CLI（per-task / multi-mission）。queue を書き換える
+                        サブコマンドの後、キューロックの外で `registry/task-graph/tasks.json`
+                        を再生成する（herdr-task-graph 連携。`CREWVIA_TASK_GRAPH=0` で停止）
     dispatcher.sh       並列モードの常駐割り当てデーモン（idle Worker への自動 assign + codex-review spawn）
                         **仕事の割り当ての判定者**（queue/ を読む唯一のデーモン）
     watchdog.py         Worker 生存監視デーモン（idle 判定・pane 消滅の検知と kill）
@@ -65,7 +67,61 @@
     lib_retirement.py   retirement marker プロトコル（dispatcher が判定 → watchdog が実行）
                         権限境界の設計は knowledge/daemon-authority.md
                         判定の設計は knowledge/watchdog-idle-judgment.md
+                        沈黙の判定では **`ENOENT`（本当に無い）と、それ以外の `OSError`
+                        （観測できなかった）を分ける**（t017）。潰すと、`registry/` の権限事故
+                        1 回で健全な Worker が全員 `hard_idle` の terminate 対象になる
                         ログ: logs/watchdog/watchdog-YYYYMMDD.log（日次）
+    lib_task_cards.py   **task カードを読むことの唯一の定義**（`list_task_cards()` /
+                        `parse_frontmatter()` / `isolated_task()` / `CORRUPT_TASK_STATUS`）。
+                        **plan.sh・dispatcher.sh・watchdog.py・verifier-dispatcher.sh・
+                        taskvia-sync.sh の 5 者がここだけを読む**。識別子はファイル名、
+                        `id` 欄の食い違いは `[破損]` として保留、読めないカードも例外では
+                        なく `[破損]` で返す（1 枚の事故で常駐デーモンのサイクルを
+                        落とさないため）。コピーを書き戻すと「pull は受理するのに
+                        dispatch サイクルが KeyError で落ちる」が戻る（Codex 5 巡目 P2）。
+                        フォールバックは持たない（読めなければ呼び出し側が落ちる）ので、
+                        plan.sh を単体でコピーする隔離テストでは一緒に置くこと。
+                        **空リストは「カードが 1 枚も無い」の意味だけ**を持つ（走査に失敗
+                        したときは終端でないプレースホルダを 1 件返す）。同じ `[]` に潰すと
+                        `all(status in TERMINAL)` がそれに True を返し、**未完了の兄弟を
+                        残したまま mission 全体が done になる**（t016）。
+                        **カードは通常ファイルだけ**受理する（FIFO 等は待たずに `[破損]`）。
+                        上限の無い `open()` を残すと、書き手のいない FIFO 1 枚で全 mission の
+                        割り当てと生存監視が同時に止まる（t016）。設計と全数調査は
+                        `knowledge/empty-vs-unobservable.md`
+                        **queue / registry / config のファイルを開くコードは、必ずここを
+                        通すこと**（t017/t018）。入口は 3 つで、判定の本体は 1 つ:
+                        `read_task_card()`（カード 1 枚。読めなければ `[破損]`、例外は出さない）/
+                        `read_regular_text()`（中身か例外）/
+                        `read_regular_text_or_unreadable()`（中身か `Unreadable` + 警告 1 行。
+                        常駐デーモン用。**例外を出さない** — `except Exception` の backstop 付き）。
+                        **読み取りの失敗を `None`/`{}`/`[]` で返さない**（t018）。`Unreadable` は
+                        空の入れ物として振る舞わず、`bool()`/`len()`/`in`/`[]`/反復/`.get()` が
+                        すべて `TypeError` になる。潰していたせいで、`dispatcher.load_state()` の
+                        `{}` が `dispatch()` の `if not active_missions: shutdown_idle_workers()`
+                        に落ち、**読めない state.yaml が idle Worker の退役を認可していた**
+                        （Codex 9 巡目 P1 — t017 でガードを足したことで初めて到達可能になった）。
+                        分岐は `is_unreadable()` / `is_missing()`（**ENOENT だけが「本当に無い」**。
+                        `Path.exists()` は `EACCES` も False に潰すので分岐の材料にしない）。
+                        表（`GUARDED_READS`）は「載せた関数」しか見ないので、t018 で向きを
+                        逆にした: `test_no_unguarded_read_remains` が対象モジュールの
+                        `open()`/`read_text()`/`read_bytes()` を **AST で機械的に全部拾い**、
+                        理由付き allowlist に無ければ落とす（新しい直接読み取りは必ず赤になる）。
+                        **例外は `plan.sh` の `load_state()` 1 つだけ**（意図的。
+                        `knowledge/empty-vs-unobservable.md` §4 の取引）。
+                        赤の実証は `tests/red_proof_t018.sh`、例外契約は
+                        `tests/test_read_wrapper_exception_contract.py`
+                        再発防止は tests/test_task_card_identity.py（両者が同じ queue から
+                        同じ task 集合を導くことの直接 assert + コピー検出）と
+                        tests/test_unobservable_is_not_empty.py（赤の実証は
+                        tests/red_proof_unobservable.sh）
+    lib_dep_rules.py    「依存が満たされた」の唯一の定義（`unmet_dependencies()` /
+                        `DEAD_DEP_STATUSES`）。**plan.sh pull・plan.sh task-graph・
+                        dispatcher.sh の 3 者がここだけを読む**。コピーを書き戻すと、
+                        ズレが出るのは QA FAIL の直後だけ（= 誰も疑わない瞬間）になる。
+                        フォールバックは持たない（読めなければ呼び出し側が落ちる）ので、
+                        plan.sh を単体でコピーする隔離テストでは一緒に置くこと。
+                        再発防止は tests/test_task_graph.py のコピー検出テスト
     kai-review.sh       Codex reviewer (Kai-codex) 起動ラッパー。詳細は `knowledge/codex-reviewer.md`
     taskvia-sync.sh     queue → Taskvia 同期
     lib_mux.py          mux 抽象化モジュール（TmuxBackend / HerdrBackend）
@@ -81,6 +137,47 @@
     heartbeats/         watchdog 監視用
     mux/                mux バックエンドのタブ/ペイン ID キャッシュ（.gitignore 対象）
     retirements/        Worker 終了要求と進捗（dispatcher→watchdog の引き渡し。.gitignore 対象）
+    task-graph/         herdr-task-graph 用の `tasks.json`（.gitignore 対象）。queue を
+                        書き換える plan.sh サブコマンドの後、キューロックの外で再生成される。
+                        再生成は `tasks.json.lock` で直列化される（古い読み取りが新しい姿を
+                        巻き戻さないため。キューロックの保持時間は伸びない）。待ち切れずに
+                        引き返した実行は `tasks.json.pending` に読み直しの要求を置く。その
+                        要求は必ず拾われる（t011）: 要求を置いたあと本ロックを 1 回取りに
+                        行き、取れれば自分で publish、取れなければ保持者が読み直す。
+                        「要求が無いことの確認」と「本ロックの解放」は
+                        `tasks.json.pending.lock` の一区間にまとめてあり、その隙間に置かれた
+                        要求を誰も拾わない、という取りこぼしが起きない。
+                        **両方のロックの待ちは有限**（本ロック 10 秒 / 印のロック 2 秒、t012）。
+                        区間に入れなかった実行は**印に一切触れずに**手を引き 1 行報告する
+                        （置かれた要求は消えないので、次の queue 変更が拾う）。可視化は
+                        付加機能なので、倒す先は「グラフが少し古くなる」であって
+                        「plan.sh が待たされる」ではない — とくに `retire --no-wait` は
+                        watchdog が同期で叩くため、ここが詰まると Worker の生死を誰も
+                        見ていない時間ができる
+                        手動で書き出すなら `plan.sh task-graph`（`CREWVIA_QUEUE` が
+                        `<root>/queue` でなければ拒否。書き先を明示すれば通る）。
+                        plugin は 4 つの理由で**ファイル全体**を拒否する（空の tasks /
+                        id が空・重複 / 解決できない depends_on / 依存の循環）。1 枚の
+                        カードの事情で全 mission の DAG が消えるので、**publish の直前に
+                        置いた唯一のゲート `enforce_task_graph_contract()` で 4 つとも
+                        潰す**（t013。別々の場所に書くと次の 1 件で片方だけ直して穴が開く）。
+                        潰し方はどれも隔離であって削除ではない: task が 0 件なら
+                        `[表示する task なし]` の node を 1 件だけ置き（最後の mission を
+                        archive した直後に必ず通る状態なので、画面が空にも古いままにも
+                        ならないようにするため）、循環は後退辺だけを落として
+                        `[循環依存: <id>]`、解決できない辺は `[依存不明: <id>]`、
+                        id の衝突は `[id重複: <id>]` を title に残す（t010 / t013）
+    ※ **task の識別子はファイル名**（`tNNN.md`）であって frontmatter の `id` 欄ではない。
+       `id` 欄がファイル名と食い違うカードは `[破損]` として保留され、pull も dispatch も
+       拾わない（`plan.sh status` に理由と直し方が出る）。突き合わせないと、tNNN.md を
+       コピーして id 行を直し忘れただけで DAG が全滅し、さらに `pull` の書き戻しが
+       **別のカードを上書きして消す**（t013）。
+       この規則は `scripts/lib_task_cards.py` に 1 つだけ置いてある（t014）。
+       **queue のカードを読むコードを新しく書くときは、必ずこのモジュールを呼ぶこと** —
+       t013 で plan.sh にだけ入れた結果、`id` 行の無いカードで dispatch サイクルが
+       `KeyError` で落ち、**全 mission の割り当てが止まる**経路ができていた（pull は
+       受理し `plan.sh status` にも ready と出るので、queue を見るかぎり何も壊れて
+       いないように見える）
     daemons/            dispatcher/watchdog 相互監視の heartbeat・pause マーカー・respawn 履歴
                         （.gitignore 対象）。hooks/post-tool-use.sh の同時死 backstop（t008）が
                         throttle マーカー（backstop-notify.throttle）を置く場所でもある
@@ -116,6 +213,8 @@
 | `CREWVIA_DAEMON_DISPATCHER_STALE_SECONDS` / `CREWVIA_DAEMON_WATCHDOG_STALE_SECONDS` | 相互監視の stale 判定しきい値（既定 60 秒 / 240 秒）。`config/crewvia.yaml` の `daemons.dispatcher_stale_seconds` / `daemons.watchdog_stale_seconds` より優先。`hooks/post-tool-use.sh` の同時死 backstop（t008）も同じ変数名・同じ既定値を読む（`knowledge/daemon-authority.md` §7-13） |
 | `CREWVIA_DAEMON_FLAP_WINDOW_SECONDS` / `CREWVIA_DAEMON_FLAP_THRESHOLD` | flap ガード: この秒数の窓（既定 900）でこの回数（既定 3）respawn したら自動 respawn を止め Director に報告する。`config/crewvia.yaml` の `daemons.flap_window_seconds` / `daemons.flap_threshold` より優先 |
 | `CREWVIA_DAEMON_RESPAWN_GRACE_SECONDS` / `CREWVIA_DAEMON_PAUSE_REPORT_AFTER_SECONDS` / `CREWVIA_DAEMON_HOLD_REPORT_AFTER_SECONDS` / `CREWVIA_DAEMON_WATCH_LOCK_TIMEOUT_SECONDS` / `CREWVIA_DAEMON_MAINTENANCE_LOCK_TIMEOUT_SECONDS` | 相互監視の残りのしきい値（既定 120 / 1800 / 1800 / 2 / 60 秒）。`config/crewvia.yaml` の `daemons:` ブロック（コメント付き）より優先。詳細: `knowledge/daemon-authority.md` §7-8 |
+| `CREWVIA_TASK_GRAPH` | herdr-task-graph 用 `tasks.json` の生成 ON/OFF。既定は有効、`0` で完全に無効（1 バイトも書かず、ログも出さない）。生成は queue を書き換える plan.sh サブコマンドすべてに乗るので、重い・壊れたときの退避路として残してある |
+| `CREWVIA_TASK_GRAPH_FILE` | 生成物の書き先。既定は `$CREWVIA_REPO_ROOT/registry/task-graph/tasks.json`（未設定時のみ plan.sh の位置基準にフォールバック）。plugin 側にはこのパスを `HERDR_TASKS_FILE` で参照させる |
 | `CREWVIA_MUX` | mux バックエンド選択: `tmux` / `herdr`。config `mode:` より優先 |
 | `CREWVIA_MUX_ENABLED` | 並列モード有効化: `1` で並列 ON（`CREWVIA_MUX` 未設定時の tmux fallback）/ `0` でインラインモード強制。`CREWVIA_MUX` が設定済みなら不要 |
 | `CREWVIA_TMUX_SESSION` | tmux backend が使うセッション名（デフォルト: `crewvia`） |

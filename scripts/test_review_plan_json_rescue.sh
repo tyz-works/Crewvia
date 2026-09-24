@@ -132,6 +132,8 @@ _run_case() {
   cp "$REAL_LIB_VERDICT" "$TMPDIR_TEST/scripts/lib_verdict.py"
   cp "$REAL_SCHEMA" "$TMPDIR_TEST/config/plan-review-verdict.schema.json"
   cp "$REAL_LIB_MODEL" "$TMPDIR_TEST/scripts/lib_model.py"
+  # lib_model.py は config の読み取りを lib_task_cards.py に通す (t018)。
+  cp "${SCRIPT_DIR}/lib_task_cards.py" "$TMPDIR_TEST/scripts/"
   cp "$REAL_CREWVIA_YAML" "$TMPDIR_TEST/config/crewvia.yaml"
 
   # スタブ lib_mux.sh: mux_available/mux_spawn は常に成功 (no-op)。mux_spawn は
@@ -258,6 +260,8 @@ _run_case_ex() {
     path_prefix="$TMPDIR_TEST/stubbin:"
   fi
   cp "$REAL_LIB_MODEL" "$TMPDIR_TEST/scripts/lib_model.py"
+  # lib_model.py は config の読み取りを lib_task_cards.py に通す (t018)。
+  cp "${SCRIPT_DIR}/lib_task_cards.py" "$TMPDIR_TEST/scripts/"
   cp "$REAL_CREWVIA_YAML" "$TMPDIR_TEST/config/crewvia.yaml"
 
   local review_output="$TMPDIR_TEST/queue/missions/testmission/plan_review.md"

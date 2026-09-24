@@ -41,6 +41,10 @@ registry/approvals/
 registry/handoffs/
 registry/retirements/
 registry/daemons/
+# herdr-task-graph 連携の生成物。plan.sh の pull / done / update のたびに
+# 書き換わるので、追跡下に置くと全 worktree と主 WT の git status が毎回汚れ、
+# 以後すべての PR に混入する（.crewvia-env で同型の事故あり）。
+registry/task-graph/
 registry/.workers.lock
 registry/dispatcher.log
 registry/dispatcher_all_done.flag

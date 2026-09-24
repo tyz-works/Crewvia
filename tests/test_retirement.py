@@ -318,6 +318,11 @@ def sandbox(tmp_path):
 
     (root / "scripts").mkdir(parents=True)
     shutil.copy2(REPO / "scripts" / "plan.sh", root / "scripts" / "plan.sh")
+    # plan.sh は依存規則 (lib_dep_rules.py) と task カードの読み取り
+    # (lib_task_cards.py) を自分の側の scripts/ から読む。どちらもフォールバックを
+    # 持たないので、置き忘れると plan.sh が起動しない。
+    for _extra in ("lib_dep_rules.py", "lib_task_cards.py"):
+        shutil.copy2(REPO / "scripts" / _extra, root / "scripts" / _extra)
 
     mission = root / "queue" / "missions" / SLUG
     (mission / "tasks").mkdir(parents=True)
@@ -2581,20 +2586,44 @@ def _queue_lock_is_held(sandbox) -> bool:
 
 @contextlib.contextmanager
 def _pull_parked_inside_the_queue_lock(sandbox, *, skills="code"):
-    """本物の `plan.sh pull` を、キューロックを握ったまま card 走査の途中で止める。
+    """本物の `plan.sh pull` を、キューロックを握ったまま止める。
 
-    止め方は名前付きパイプ。`list_tasks()` は `tNNN.md` を番号順に **全部
-    open して read** するので、`t000.md` を FIFO にしておくと pull はそこで
-    止まる。止まる位置は退役予約チェックの **後**、assignment 公開の **前** —
-    指摘された interleaving の (2) そのものである。
+    止め方は名前付きパイプ。止める位置は `_do()` の `state = load_state()` で、
+    退役予約チェックの **後**、assignment 公開の **前** —— 指摘された
+    interleaving の (2) そのものである。位置は経過時間ではなく `_do()` の中の
+    **文の順番**で決まるので、機体の速さに依存しない。
 
     「止まった」ことは sleep で当て込まない。FIFO は読み手が現れるまで書き手側の
     `O_WRONLY|O_NONBLOCK` open が ENXIO で失敗するので、**その open が成功した
-    こと**が「pull はキューロックの中で card を読みに来ている」の証明になる
+    こと**が「pull はキューロックの中に入っている」の証明になる
     (memory: microsecond-race-fix-needs-structural-test)。
+
+    ## なぜ card ではなく state.yaml で止めるのか
+
+    以前はここが `tasks/t000.md` の FIFO だった。`read_task_card()` が通常
+    ファイル以外を **待たずに拒否する**ようになった (Codex 7 巡目 P2) ので、
+    card では止まらなくなった —— それがこの修正の目的そのものである。カードは
+    通常ファイルしかありえないので、拒否は正しい。
+
+    `load_state()` に同じ判定を **入れていない**のは明示的な取引で、理由は
+    `knowledge/empty-vs-unobservable.md` §4 にある (両方塞ぐと、本物の
+    `plan.sh` を自分のキューロックの中で確実に止める手段が無くなり、この
+    テスト自体が成立しなくなる)。
+
+    そのとき一緒に落とせたのが `CREWVIA_TASK_GRAPH=0` である。以前は
+    「FIFO の card は 1 回しか読めないのに、plan.sh は commit 後にもう一度
+    走査する」ためにグラフ生成を切っていた —— **実装者がこのハングに既に
+    遭遇していて、テスト側で回避していた**。いまは生成を有効にしたまま通る。
     """
-    fifo = sandbox.queue / "missions" / SLUG / "tasks" / "t000.md"
-    os.mkfifo(fifo)
+    state_file = sandbox.queue / "state.yaml"
+    state_text = state_file.read_text()
+    # 解放時に差し戻す通常ファイルを先に用意しておく。`os.replace()` は原子的
+    # なので、state.yaml が一瞬でも存在しない瞬間を作らない。
+    regular = sandbox.queue / "state.yaml.regular"
+    regular.write_text(state_text)
+    state_file.unlink()
+    os.mkfifo(state_file)
+    fifo = state_file
     env = dict(os.environ)
     env["CREWVIA_QUEUE"] = str(sandbox.queue)
     env["CREWVIA_REPO_ROOT"] = str(sandbox.root)
@@ -2619,24 +2648,23 @@ def _pull_parked_inside_the_queue_lock(sandbox, *, skills="code"):
     if wfd is None:
         out, err = proc.communicate(timeout=30)
         raise AssertionError(
-            f"pull が card 走査まで来ていない (rc={proc.returncode}) — "
+            f"pull がキューロックの中まで来ていない (rc={proc.returncode}) — "
             f"テストの前提が崩れている\n{out}{err}")
     # 解放は必ず finally の中で。ここから先で何が失敗しても、キューロックを
     # 握ったままの pull を残すとセッション全体が道連れになる。
     try:
         assert _queue_lock_is_held(sandbox), (
-            "pull が card を読みに来ているのにキューロックを握っていない — "
+            "pull が state.yaml を読みに来ているのにキューロックを握っていない — "
             "トランザクションの張り方が変わっている")
         yield proc
     finally:
-        # FIFO に「pull 対象にならない card」を流し込む。pull はそのまま走査を
-        # 続け、本来の pending task を掴んでトランザクションを閉じる。
+        # 先に通常ファイルへ戻す。pull は **すでに開いた fd** を持っているので、
+        # パスを差し替えても pull の読み取りには影響しない。逆に、この差し替えを
+        # 書き込みより後にすると、commit 後のグラフ生成が同じパスを読みに来た
+        # ときに FIFO に当たりうる。順番がそのまま担保になっている。
+        os.replace(regular, state_file)
         try:
-            os.write(wfd, (
-                "---\nid: t000\ntitle: parked\nskills: [code]\n"
-                "priority: low\nstatus: done\nblocked_by: []\ntarget_dir: null\n"
-                "worker: null\nstarted_at: null\ncompleted_at: null\n"
-                "---\n\n## Description\nparked\n\n## Result\n").encode())
+            os.write(wfd, state_text.encode())
         finally:
             os.close(wfd)
         try:
@@ -2645,6 +2673,28 @@ def _pull_parked_inside_the_queue_lock(sandbox, *, skills="code"):
             proc.kill()
             proc.parked_output = proc.communicate()
             raise
+
+
+def test_a_parked_pull_still_refreshes_the_task_graph(sandbox):
+    """回避を外したことの実証 (Codex 7 巡目 P2)。
+
+    以前この harness は `CREWVIA_TASK_GRAPH=0` を立てていた —— FIFO の card を
+    commit 後の走査がもう一度読みに行って永久に止まるからで、**実装者はこの
+    ハングに既に遭遇していて、テスト側で回避していた**。回避を外すだけでは
+    「生成が別の理由で黙って何もしていない」形でも緑になるので、**生成物が
+    実際に書かれたこと**を見る。
+    """
+    _add_pending_task(sandbox, "t002")
+
+    with _pull_parked_inside_the_queue_lock(sandbox):
+        pass
+
+    graph = sandbox.root / "registry" / "task-graph" / "tasks.json"
+    assert graph.exists(), (
+        "キューロックの中で止められた pull が完走したのに tasks.json が無い — "
+        "グラフ生成が走っていない (回避を外した意味が無い)")
+    ids = {t["id"] for t in json.loads(graph.read_text())["tasks"]}
+    assert f"{SLUG}:t002" in ids, f"生成物に queue の内容が反映されていない: {ids}"
 
 
 def test_red_marker_is_not_created_while_a_pull_transaction_is_open(sandbox):

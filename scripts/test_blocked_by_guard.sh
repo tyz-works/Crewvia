@@ -9,8 +9,8 @@
 #   (1) plan.sh pull --task にも blocked_by ガードを追加 (defense-in-depth)。
 #       dispatcher.sh の TERMINAL_STATUSES に 'verified' を追加 (plan.sh と一致)。
 #   (2) BC-1 fix: failed/cancelled dep は blocking しない。
-#       unmet = [dep for dep in bb if dep not in done_ids
-#                and task_statuses.get(dep) not in ('failed', 'cancelled')]
+#       規則の本体は scripts/lib_dep_rules.py の unmet_dependencies()。
+#       plan.sh / dispatcher.sh / task-graph はそこだけを読む (t010)。
 #
 # このテストで検証:
 #   1. plan.sh pull --task: blocked 状態のタスクは exit 1 で拒否される

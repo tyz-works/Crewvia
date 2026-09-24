@@ -331,3 +331,71 @@ def test_a_started_at_in_the_future_does_not_make_idle_negative(tmp_path):
     detail = monitor.check_detail()
     assert detail.idle_seconds >= 0, f"idle が負: {detail.idle_seconds}"
     assert detail.verdict == "alive"
+
+
+# ===========================================================================
+# 観測できなかったことを、沈黙として数えない (Codex 7 巡目 P1 と同じ型)
+# ===========================================================================
+#
+# `_notification_files()` は `iterdir()` が失敗すると `[]` を返していた。空は
+# 「通知は 1 通も無い」の意味で、それは **通知ディレクトリが無い** という最も
+# 普通の状態と同じ形である。だから権限が落ちた / I/O が壊れたという *観測の
+# 失敗* が、そのまま「この Worker からのシグナルは無い」に化ける。
+#
+# 化けた先が問題で、この判断は 2 つとも **terminate の側** に倒れる。
+#
+#   * `_last_activity_mtime()` の候補が減る       → idle が伸びる  → terminate
+#   * `_awaiting_human()` が「通知なし」と読む    → 抑制が外れる   → terminate
+#
+# 「読めなかった」が破壊の許可に落ちる形そのものなので、
+# `list_task_cards()` の走査失敗と同じ扱いにする —— 読めなかったなら、沈黙を
+# 主張しない (memory: evidence-for-destructive-decisions / fail-direction-is-
+# per-judgment)。
+
+def _make_notifications_unreadable(tmp_path: Path) -> Path:
+    d = tmp_path / "registry" / "notifications" / AGENT
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "n1.json").write_text("{}")
+    d.chmod(0o000)
+    if os.access(d, os.R_OK):
+        d.chmod(0o755)
+        pytest.skip("読み取り権限を落とせない環境 (root?)")
+    return d
+
+
+def test_an_unreadable_notification_dir_is_not_counted_as_silence(tmp_path):
+    """通知ディレクトリを読めないだけで terminate しないこと。
+
+    RED: `except OSError: return []` に戻すと、候補が heartbeat だけになって
+    idle が 18 時間まで伸び、verdict が `terminate` になる。
+    """
+    monitor = _monitor(tmp_path, pulled_seconds_ago=18 * 3600)
+    _write_heartbeat(tmp_path, age_seconds=18 * 3600)
+    d = _make_notifications_unreadable(tmp_path)
+
+    try:
+        detail = monitor.check_detail()
+    finally:
+        d.chmod(0o755)
+
+    assert detail.verdict != "terminate", (
+        f"通知を観測できなかっただけで終了させた: "
+        f"{detail.verdict} / {detail.reason} / idle={detail.idle_seconds:.0f}s")
+
+
+def test_a_missing_notification_dir_is_still_genuinely_no_notifications(tmp_path):
+    """逆向きの担保 —— ディレクトリが無いのは「通知ゼロ」のまま。
+
+    これが無いと「読めなければ常に活動中」に倒しただけで上が緑になる。通知
+    ディレクトリが無いのは **ほとんどの Worker の通常状態** なので、そこで
+    沈黙を数えられなくなると、本当にハングした Worker が永久に検知されない。
+    """
+    monitor = _monitor(tmp_path, pulled_seconds_ago=18 * 3600)
+    _write_heartbeat(tmp_path, age_seconds=18 * 3600)
+    assert not (tmp_path / "registry" / "notifications" / AGENT).exists()
+
+    detail = monitor.check_detail()
+
+    assert detail.verdict == "terminate", (
+        f"通知が無いだけの、本当に沈黙している Worker を見逃した: "
+        f"{detail.verdict} / idle={detail.idle_seconds:.0f}s")

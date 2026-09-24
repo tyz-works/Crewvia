@@ -29,6 +29,9 @@ set -euo pipefail
 #                              1 バイトも書かずに exit 3 (詳細は cmd_retire)
 #                              --no-wait: キューロックを待たずに諦め exit 4。
 #                              待てない常駐デーモン (watchdog) 用
+#   plan.sh task-graph          herdr-task-graph 用の tasks.json を書き出す
+#                              （queue は変更しない。普段は queue を書き換える
+#                                サブコマンドが自動で呼ぶ）
 #   plan.sh status [--mission <slug>] [--all]
 #   plan.sh archive <slug>
 
@@ -37,7 +40,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 QUEUE_DIR="${CREWVIA_QUEUE:-${REPO_ROOT}/queue}"
 
 if [[ $# -eq 0 ]]; then
-  echo "Usage: plan.sh <init|add|pull|done|needs-director|fail|update|retire|ready-for-verification|verify-result|review|launch|lint|status|archive|dashboard|dashboard-data> [args...]" >&2
+  echo "Usage: plan.sh <init|add|pull|done|needs-director|fail|update|retire|ready-for-verification|verify-result|review|launch|task-graph|lint|status|archive|dashboard|dashboard-data> [args...]" >&2
   exit 1
 fi
 
@@ -248,11 +251,13 @@ import sys
 import os
 import json
 import fcntl
+import contextlib
 import re
 import shutil
 import hashlib
 import subprocess
 import shlex
+import time
 import urllib.request
 from datetime import datetime, timezone
 
@@ -266,16 +271,52 @@ MISSIONS_DIR = os.path.join(QUEUE_DIR, 'missions')
 ARCHIVE_DIR = os.path.join(QUEUE_DIR, 'archive')
 LOCK_FILE = os.path.join(QUEUE_DIR, '.lock')
 
+
+# ---------------------------------------------------------------------------
+# scripts/ の共有モジュール
+# ---------------------------------------------------------------------------
+#
+# 読み込み元は REPO_ROOT (= 実行された plan.sh 自身の置き場) であって
+# CREWVIA_REPO_ROOT ではない。コードは、今走っている plan.sh と同じ checkout
+# から来なければならない — worktree の plan.sh が本体のコードを読むと、
+# worktree で直したはずの規則が効かない。
+#
+# 失敗はそのまま外に出す。try で包んで自前の実装に落ちると、「規則は 1 箇所」
+# という性質が壊れた環境でだけ静かに失われる。plan.sh が起動しないほうがまだよい。
+
+def _load_scripts_module(name):
+    """`scripts/<name>.py` を読み込む。失敗はそのまま外に出す。"""
+    import importlib.util, pathlib
+    path = pathlib.Path(REPO_ROOT) / 'scripts' / f'{name}.py'
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f'共有モジュールを読めません: {path}')
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+# task カードの読み取り —— parser・識別子・隔離の規則は 1 箇所しかない。
+# dispatcher.sh も同じモジュールを読む: 同じ queue を 2 つの別のコードが別の
+# 規則で読んでいたのが Codex 5 巡目 P2 の指摘で、そのときズレは「pull は
+# 受理するのに dispatch サイクルが KeyError で落ちる」という形で出た。
+# 再発防止は tests/test_task_card_identity.py。
+_TASK_CARDS = _load_scripts_module('lib_task_cards')
+parse_yaml = _TASK_CARDS.parse_yaml
+parse_frontmatter = _TASK_CARDS.parse_frontmatter
+_scalar = _TASK_CARDS._scalar
+_split_inline_list = _TASK_CARDS._split_inline_list
+
 PRIORITY_ORDER = {'high': 0, 'medium': 1, 'low': 2}
 TERMINAL_STATUSES = {'done', 'verified', 'skipped'}
 
-# Pseudo-status for a task file that failed to parse (see list_tasks). Never
+# Pseudo-status for a task file that failed to parse (see lib_task_cards). Never
 # 'pending', so pull/dispatch skip it automatically; never in
 # TERMINAL_STATUSES, so a mission with a corrupted task is never mistaken for
 # complete. It exists purely so ONE malformed tNNN.md cannot take the rest of
 # the mission down with it (t009: a multi-line needs-director reason broke
 # frontmatter parsing and froze plan.sh status / dispatch entirely).
-CORRUPT_TASK_STATUS = 'corrupted'
+CORRUPT_TASK_STATUS = _TASK_CARDS.CORRUPT_TASK_STATUS
 
 STATUS_ICON = {
     'done': '✅',
@@ -318,113 +359,6 @@ def now_generation():
 # ---------------------------------------------------------------------------
 # Minimal YAML helpers (narrow subset, no external deps)
 # ---------------------------------------------------------------------------
-
-def parse_yaml(text, source='<yaml>'):
-    """Parse a narrow subset: scalar fields, inline lists, block lists.
-
-    Unrecognized lines raise instead of being silently dropped, so a hand-edit
-    typo (e.g. missing colon, mis-indented block list) cannot quietly produce a
-    half-loaded dict.
-    """
-    lines = text.splitlines()
-    result = {}
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        if not line.strip() or line.lstrip().startswith('#'):
-            i += 1
-            continue
-        m = re.match(r'^([\w-]+):\s*(.*)$', line)
-        if not m:
-            if line and line[0] in (' ', '\t'):
-                # Deeply nested / orphaned indented line (e.g. inside verification.commands)
-                # — skip silently to maintain backward compatibility with unknown block structures
-                i += 1
-                continue
-            raise ValueError(
-                f"{source}: malformed line {i + 1}: {line!r} "
-                f"(expected `key: value`, `key: [a, b]`, or `key:` followed by `  - item` lines)"
-            )
-        key = m.group(1)
-        val = m.group(2).rstrip()
-        if val == '':
-            # Possible block list (`- item`) or block mapping (`  key: val`)
-            i += 1
-            items = []
-            sub_dict = {}
-            while i < len(lines):
-                lst = re.match(r'^\s+-\s*(.*)$', lines[i])
-                if lst:
-                    items.append(_scalar(lst.group(1).strip()))
-                    i += 1
-                else:
-                    map_m = re.match(r'^  ([\w-]+):\s*(.*)$', lines[i])
-                    if map_m:
-                        sub_key = map_m.group(1)
-                        sub_val = _scalar(map_m.group(2).rstrip())
-                        sub_dict[sub_key] = sub_val
-                        i += 1
-                    else:
-                        break
-            if items:
-                result[key] = items
-            elif sub_dict:
-                result[key] = sub_dict
-            else:
-                result[key] = None
-        elif val.startswith('[') and val.endswith(']'):
-            inner = val[1:-1].strip()
-            if not inner:
-                result[key] = []
-            else:
-                result[key] = [_scalar(s.strip()) for s in _split_inline_list(inner)]
-            i += 1
-        else:
-            result[key] = _scalar(val)
-            i += 1
-    return result
-
-
-def _split_inline_list(s):
-    """Split inline list respecting quoted strings."""
-    out = []
-    cur = []
-    in_q = None
-    for ch in s:
-        if in_q:
-            cur.append(ch)
-            if ch == in_q:
-                in_q = None
-            continue
-        if ch in ('"', "'"):
-            in_q = ch
-            cur.append(ch)
-            continue
-        if ch == ',':
-            out.append(''.join(cur).strip())
-            cur = []
-            continue
-        cur.append(ch)
-    if cur:
-        out.append(''.join(cur).strip())
-    return [x for x in out if x]
-
-
-def _scalar(val):
-    if val == 'null' or val == '~':
-        return None
-    if val in ('true', 'True'):
-        return True
-    if val in ('false', 'False'):
-        return False
-    if len(val) >= 2 and val[0] == '"' and val[-1] == '"':
-        return val[1:-1].replace('\\"', '"').replace('\\\\', '\\')
-    if len(val) >= 2 and val[0] == "'" and val[-1] == "'":
-        return val[1:-1]
-    if re.fullmatch(r'-?\d+', val):
-        return int(val)
-    return val
-
 
 def dump_yaml(data, key_order=None):
     """Serialize a flat dict (with optional list values) to YAML."""
@@ -527,31 +461,6 @@ TASK_META_DEFAULTS = {
     'rework_count': 0,
     'max_rework': 3,
 }
-
-
-def parse_frontmatter(text, source='<task>'):
-    """Split a markdown file into (meta dict, body string)."""
-    lines = text.splitlines()
-    if not lines or lines[0].strip() != '---':
-        raise ValueError(
-            f"missing frontmatter delimiter — file must begin with a line "
-            f"containing only `---`"
-        )
-    end = None
-    for i in range(1, len(lines)):
-        if lines[i].strip() == '---':
-            end = i
-            break
-    if end is None:
-        raise ValueError(
-            f"unterminated frontmatter — frontmatter block must close with a "
-            f"line containing only `---` before the body"
-        )
-    meta_text = '\n'.join(lines[1:end])
-    body = '\n'.join(lines[end + 1:])
-    if body.startswith('\n'):
-        body = body[1:]
-    return parse_yaml(meta_text, source=f"{source} (frontmatter)"), body
 
 
 def serialize_frontmatter(meta, body):
@@ -744,12 +653,71 @@ def task_path(slug, task_id):
 MISSION_KEY_ORDER = ['title', 'slug', 'status', 'created_at', 'completed_at', 'next_task_id', 'max_review_cycles', 'review']
 
 
+def try_read_queue_file(path, newline=None):
+    """`(text, problem)` を返す。読めたら `problem` は None。
+
+    **例外にしないのは、表示系の呼び出し元があるから**である。mission を並べて
+    いる途中で 1 つ落ちると、健全な mission まで画面から消える (「1 枚の事故で
+    全体を止めない」は、この repo が t009 以来ずっと同じ向きに倒している)。
+
+    `read_queue_file()` は、これに `die()` を足しただけのもの。判定を 2 箇所に
+    書かないための分け方で、**種類を確かめる規則そのものは 1 つ**である。
+    """
+    try:
+        return _TASK_CARDS.read_regular_text(path, newline=newline), None
+    except _TASK_CARDS.NotARegularFile as e:
+        return None, (
+            f"{path} is not a regular file ({e})\n"
+            f"  hint: queue のファイルは通常ファイルだけです。"
+            f"`ls -l {path}` で種類を確かめ、置き違えたものなら削除してください。")
+    except OSError as e:
+        return None, f"failed to read {path}: {e}"
+    except UnicodeError as e:
+        # `UnicodeDecodeError` は `OSError` ではなく `ValueError` の側にいるので
+        # 上の except では捕まらない。t015 で `read_task_card()` について直した
+        # のとまったく同じ漏れが、t017 で新しく作ったこちらに再現していた
+        # (Codex 9 巡目 P2) —— 1 つの読めない mission.yaml が、隔離されずに
+        # `status` の一覧そのものを中断させる。
+        return None, (
+            f"failed to decode {path}: {e}\n"
+            f"  hint: queue のファイルは UTF-8 です。`file {path}` で確かめ、"
+            f"必要なら `iconv -f <元の文字コード> -t utf-8` で書き直すこと。")
+    except Exception as e:      # noqa: BLE001 — backstop。
+        # 名前の分かっている失敗は上で個別に扱い (そのほうが直し方を書ける)、
+        # **残り全部をここで受ける**。「今回の 1 件を足す」形は、次に読み取り
+        # 経路へ新しい失敗が入った日に同じ止まり方をもう一度出す。
+        return None, f"unexpected failure while reading {path}: {type(e).__name__}: {e}"
+
+
+def read_queue_file(path, what):
+    """queue のファイルを、**種類を確かめてから** 読む。読めなければ `die()`。
+
+    固定パスで開く読み取りにも `lib_task_cards` のガードを当てる (Codex 8 巡目
+    P2)。t016 で入れた判定は `tasks/` を *列挙して* 読む経路にしか無く、
+    ここ (`load_task` / `load_mission`) は素の `open()` のままだった。
+
+    列挙するかどうかは害の大きさを変えない。これらは `with_lock()` の内側で
+    呼ばれるので、書き手のいない FIFO 1 枚で **キューロックを握ったまま**
+    止まる —— 止まるのはその mission ではなく、`plan.sh` 全体である。
+
+    待ち時間に上限を付けるのではなく種類で弾くのは、待てば読めるものが 1 つも
+    無いから。queue のファイルは通常ファイルしかありえない。
+
+    ※ `load_state()` には **同じ判定を入れていない**。明示的な取引で、理由は
+      `knowledge/empty-vs-unobservable.md` §4 にある (そこが
+      `tests/test_retirement.py` の回帰テストを成立させている唯一の停止点)。
+    """
+    text, problem = try_read_queue_file(path)
+    if problem is not None:
+        die(f"{what}: {problem}")
+    return text
+
+
 def load_mission(slug):
     path = mission_yaml_path(slug)
     if not os.path.exists(path):
         die(f"mission '{slug}' not found at {path}")
-    with open(path) as f:
-        text = f.read()
+    text = read_queue_file(path, 'mission file')
     try:
         return parse_yaml(text, source=path)
     except ValueError as e:
@@ -765,8 +733,7 @@ def load_task(slug, task_id):
     path = task_path(slug, task_id)
     if not os.path.exists(path):
         die(f"task '{task_id}' not found in mission '{slug}'")
-    with open(path) as f:
-        text = f.read()
+    text = read_queue_file(path, 'task card')
     try:
         return parse_frontmatter(text, source=path)
     except ValueError as e:
@@ -778,63 +745,898 @@ def save_task(slug, task_id, meta, body):
     _atomic_write(task_path(slug, task_id), serialize_frontmatter(meta, body))
 
 
-def list_tasks(slug, base_dir=None):
-    """Return list of (meta, body) sorted by tNNN."""
+def list_tasks(slug, base_dir=None, quiet=False):
+    """Return list of (meta, body) sorted by tNNN.
+
+    読み取りの規則そのものは `scripts/lib_task_cards.py` にある —— parser、
+    「識別子はファイル名であって frontmatter の `id` 欄ではない」、信用できない
+    カードを `[破損]` として保留する形の 3 点セットで、dispatcher.sh も同じ
+    モジュールを読む。ここはそれを mission の slug で呼ぶだけの薄い層である。
+
+    別々のコードで同じ queue を読んでいたのが Codex 5 巡目 P2 の指摘で、そのとき
+    ズレは「`plan.sh` は受理して ready と表示するカードで、dispatch サイクルが
+    `KeyError` を出して全 mission の割り当てが止まる」という形で出た。
+
+    quiet=True は「同じ実行の中で 2 回目以降に読む」呼び出し用。破損した task に
+    ついての hint 付き警告は 1 回出れば十分で、コマンド本体と task-graph の生成が
+    同じ警告を二重に出すと、読む側は 2 件壊れていると誤読する。
+    """
     tdir = base_dir if base_dir else tasks_dir(slug)
-    if not os.path.exists(tdir):
-        return []
-    entries = []
-    for fn in os.listdir(tdir):
-        m = re.fullmatch(r't(\d+)\.md', fn)
-        if not m:
+    return _TASK_CARDS.list_task_cards(tdir, warn=None if quiet else _warn_task_card)
+
+
+def _warn_task_card(msg):
+    """lib_task_cards からの 1 件の警告を plan.sh の顔で出す。"""
+    print(f"[plan.sh warn] {msg}", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# Dependency readiness — 「依存が満たされた」の唯一の定義
+# ---------------------------------------------------------------------------
+#
+# 規則の本体は scripts/lib_dep_rules.py にある。pull / task-graph / dispatcher
+# の 3 者が同じ 1 つの定義を読むためで、経緯と「なぜフォールバックを置かない
+# のか」はそのファイルの docstring に書いてある。
+#
+# 読み込みは `_load_scripts_module()` 経由 (どこから読むか・なぜ try で包まない
+# かは、その定義の上のコメントにまとめてある)。
+
+_DEP_RULES = _load_scripts_module('lib_dep_rules')
+DEAD_DEP_STATUSES = _DEP_RULES.DEAD_DEP_STATUSES
+unmet_dependencies = _DEP_RULES.unmet_dependencies
+
+
+# ---------------------------------------------------------------------------
+# herdr-task-graph 連携（任意の付加機能）
+# ---------------------------------------------------------------------------
+#
+# active mission の全 task を herdr plugin `herdr-task-graph` の入力形式で
+# 書き出す。crewvia はこの plugin が無くても完全に動く — 生成の失敗も、生成を
+# 止めたことも、plan.sh の終了コードや動作を一切変えてはいけない。
+#
+# 生成を呼ぶのは queue を書き換えるサブコマンドの **後** (キューロックの外)。
+# 常駐プロセスは増やさない。dispatcher のサイクルにも載せない — dispatcher が
+# 死んでいる間こそ「今どうなっているか」を見たいのに、そこに載せると更新が
+# 止まるため。
+
+#: queue を書き換えるサブコマンド = 生成を呼ぶ経路。正は冒頭の usage 行と
+#: 末尾の dispatch テーブル (tests/test_task_graph.py が突き合わせる)。
+QUEUE_MUTATING_SUBCOMMANDS = {
+    'init', 'add', 'pull', 'done', 'needs-director', 'fail', 'update', 'retire',
+    'ready-for-verification', 'verify-result', 'review', 'launch', 'archive',
+}
+
+#: queue を読むだけのサブコマンド = 生成を呼ばない経路。
+#: `task-graph` 自身もここ (queue は書き換えず、生成物だけを書く)。
+QUEUE_READONLY_SUBCOMMANDS = {
+    'lint', 'status', 'resync', 'dashboard-data', 'task-graph',
+}
+
+#: crewvia の status → (plugin の status, title に付ける印)。
+#: plugin 側は 6 状態 (done/running/blocked/ready/waiting/failed) しか持たない
+#: ので、同じ状態に畳まれるものは印で見分ける。`pending` だけは依存の状態で
+#: ready / waiting に分かれるため、ここではなく build_task_graph() が決める。
+TASK_GRAPH_STATUS_MAP = {
+    'done':                   ('done',    None),
+    'verified':               ('done',    None),
+    'skipped':                ('done',    '[skip]'),
+    'in_progress':            ('running', None),
+    'verifying':              ('running', None),
+    'failed':                 ('failed',  None),
+    'verification_failed':    ('failed',  '[検証NG]'),
+    # `cancelled` は DEAD_DEP_STATUSES の側 —— 「もう完了しない」が確定した
+    # 終端で、`done` / `verified` / `skipped` (= TERMINAL_STATUSES) のような
+    # 「完了した」ではない。だから done ではなく failed に畳む: そうすれば
+    # 「依存先が終端 → 下流は READY」という見え方が failed とまったく同じに
+    # なり、依存規則と矛盾しない。done に畳むと、中止したものを完了したと
+    # 主張することになる。失敗ではないことは印で分ける ([skip] と同じやり方)。
+    'cancelled':              ('failed',  '[中止]'),
+    # (c) blocked_reason 付きで明示的に止められている
+    'blocked':                ('blocked', '[停止]'),
+    # (b) 人間の判断待ち。(a) 依存待ち (= waiting) とは plugin の状態そのもので
+    #     分かれ、(c) とは印で分かれる。
+    'needs_director':         ('blocked', '[要判断]'),
+    'needs_human_review':     ('blocked', '[要判断]'),
+    'ready_for_verification': ('blocked', '[要判断]'),
+    # パース失敗。title は list_tasks が既に `[破損] ...` にしている。
+    CORRUPT_TASK_STATUS:      ('failed',  None),
+}
+
+#: 表に無い status。done にも ready にも倒さない — 「進んでよい」と読める側に
+#: 倒すと、知らない状態が黙って実行可能に見える。
+TASK_GRAPH_UNKNOWN = ('blocked', '[status不明]')
+
+#: ペインを持たない実行者に回る skill。`pane_match` は「この task が今どのペイン
+#: で動いているか」を plugin に教える欄なので、ペインが存在しない実行者に対して
+#: 名前を書くのは、当たらないだけでなく事実として誤りになる。
+#:
+#: `codex-review` は dispatcher が kai-review.sh を `nohup` + detached process
+#: group で起動する (dispatcher.sh CODEX_REVIEW_SKILLS)。mux のペインは作られ
+#: ないので、Kai-codex というペインはどこにも無い。QA t002 の指摘 F-1c は
+#: `Kai-codex-worker` と書かれていたことだが、正しい名前に直すのではなく欄ごと
+#: 出さないのが正解 —— 正しい名前に直しても、当たらないことは変わらない。
+PANELESS_SKILLS = {'codex-review'}
+
+#: pane_match を出してよい status (allowlist)。「この card にまだ Worker が
+#: 就いている」と plan.sh 自身が言える状態だけを並べる。
+#:
+#: 除外側を数える書き方 (`TERMINAL_STATUSES に無ければ出す`) では足りない。
+#: `cmd_fail` は **完了を記録しつつ `worker` 欄を残す** ので、`failed` の card は
+#: 終わったあとも Worker 名を持ち続ける。`cancelled` / `verification_failed` /
+#: `corrupted` も同じで、いずれも TERMINAL_STATUSES には入っていない。crewvia は
+#: Worker 名を使い回すので、それらに pane_match を出すと **無関係な task の
+#: ペイン** を指す。`pending` は `--reset` が worker を消すので通常は空だが、
+#: 残っていても「誰も就いていない」が正しい。
+#:
+#: 知らない status は出さない側に倒れる (allowlist なので既定が除外)。
+TASK_GRAPH_PANE_STATUSES = {
+    'in_progress',            # pull が assignment を公開した直後の状態
+    'verifying',              # 検証中 — card はまだ Worker のもの
+    'ready_for_verification', # 検証待ち — assignment は撤去されない
+    'needs_director',         # 判断待ち — assignment は撤去されない
+    'needs_human_review',     # 判断待ち — assignment は撤去されない
+}
+
+
+def task_graph_enabled():
+    """停止スイッチ。`CREWVIA_TASK_GRAPH=0` で生成を完全に止める。
+
+    生成は plan.sh の queue 変更経路すべてに乗り、全 Worker と両デーモンが叩く。
+    「重い・壊れた」が分かったときに revert PR しか道が無い状態にしないための
+    退避路であって、plugin の有無とは別の話。
+    """
+    return os.environ.get('CREWVIA_TASK_GRAPH', '1').strip().lower() not in (
+        '0', 'false', 'off', 'no',
+    )
+
+
+def task_graph_repo_root():
+    """生成物を置くリポジトリ。`CREWVIA_REPO_ROOT` を優先する。
+
+    REPO_ROOT はスクリプトの位置 (`dirname $0/..`) で決まるので、Worker が
+    worktree 側の plan.sh を叩くと worktree の registry を指す。そこに書くと、
+    Director が開いているファイルは Worker の pull / done では一切更新されない
+    — このミッションの中心価値だけが、隔離テストには映らない形で失われる。
+    plan.sh は既に retirement_reservation() と cmd_done の bump-task-count で
+    同じ優先順を使っている。
+    """
+    return os.environ.get('CREWVIA_REPO_ROOT') or REPO_ROOT
+
+
+def task_graph_path():
+    """生成物のパス。`CREWVIA_TASK_GRAPH_FILE` で上書きできる。
+
+    既定は `<root>/registry/task-graph/tasks.json` — crewvia 側を正とし、plugin
+    には `HERDR_TASKS_FILE` でここを参照させる。plugin の config dir に直接書く
+    案は採らない: 書き先が plugin の内部レイアウトに依存し、plugin が無い環境や
+    別バージョンで壊れる。crewvia の中に置けば、plugin が無くても
+    `plan.sh task-graph` の出力として意味を持つ。
+    """
+    explicit = os.environ.get('CREWVIA_TASK_GRAPH_FILE', '').strip()
+    if explicit:
+        return os.path.abspath(os.path.expanduser(explicit))
+    return os.path.join(task_graph_repo_root(), 'registry', 'task-graph', 'tasks.json')
+
+
+def task_graph_queue_matches_root():
+    """今いじっている queue が、生成物を置くリポジトリの queue かどうか。
+
+    本番では start.sh が `CREWVIA_QUEUE=$CREWVIA_REPO_ROOT/queue` を必ず export
+    するので、この条件は常に成り立つ。成り立たないのは `CREWVIA_QUEUE` だけを
+    別の場所に向けた実行 (隔離テストなど) で、そのとき本体の registry を
+    上書きすると Director が開いているファイルにテスト用の queue が映る。
+    書き先を明示された場合 (`CREWVIA_TASK_GRAPH_FILE`) は呼び出し側の意図が
+    はっきりしているので、この判定は挟まない。
+    """
+    if os.environ.get('CREWVIA_TASK_GRAPH_FILE', '').strip():
+        return True
+    try:
+        expected = os.path.join(task_graph_repo_root(), 'queue')
+        return os.path.realpath(QUEUE_DIR) == os.path.realpath(expected)
+    except OSError:
+        return False
+
+
+def _task_graph_worker(meta):
+    """task の `worker` 欄を Worker 名として読む。無ければ None。
+
+    `plan.sh update --worker null` が `worker: "null"` (引用符付きの文字列) を
+    書く既知の事故があるので、文字列としての null も不在として扱う。
+    """
+    worker = meta.get('worker')
+    if not isinstance(worker, str):
+        return None
+    worker = worker.strip()
+    if not worker or worker.lower() in ('null', 'none', '~'):
+        return None
+    return worker
+
+
+def task_graph_assignment_holds(worker, slug, task_id):
+    """`queue/assignments/<worker>` が、いまこの task を指しているか。
+
+    card の `worker` 欄は **履歴** で、crewvia は Worker 名を使い回す。だから
+    「いまどのペインに居るか」を card だけから決めると、名前の使い回しの分だけ
+    必ず誤る。`queue/assignments/<agent>` は crewvia が「存在 = busy / 不在 =
+    idle」を表すために持っている一行の事実なので、pane_match の根拠はそちらに
+    置く (status の allowlist との **AND**)。
+
+    撤去を伴う判定ではないので classify_assignment() の世代照合までは要らない。
+    ここで問うているのは「この名前の Worker が、いまこの card に就いているか」
+    だけで、後任か先任かで pane の宛先は変わらない。
+
+    読めない・無い・別の task を指している — どれも「分からない」ではなく
+    **出さない** に倒す。pane_match が無ければ plugin はペインを結び付けない
+    だけだが、間違った pane_match は無関係なペインを指す。
+    """
+    if agent_name_problem(worker):
+        return False
+    # 素の open() だと、置き違えた FIFO 1 枚で task-graph の生成が返らなく
+    # なる (t018)。読めないときは「出さない」に倒す —— 上の docstring の通り。
+    text, problem = try_read_queue_file(os.path.join(ASSIGNMENTS_DIR, worker))
+    if problem is not None:
+        return False
+    return text.strip() == f'{slug}:{task_id}'
+
+
+def break_dependency_cycles(nodes):
+    """循環を閉じている辺だけを落とし、落とした側の title に印を残す。
+
+    plugin の `load_config` は循環を見つけると `ValueError` を投げ、**ファイル
+    全体** を拒否する。つまり 1 つの mission の循環が、他の mission も含めた
+    全 DAG を表示不能にする。そして crewvia 側はいま循環を作れてしまう:
+    `plan.sh lint` は FAIL にするが `plan.sh update --blocked-by` は rc=0 で
+    通すので、普通の操作で可視化が全滅しうる。
+
+    採ったやり方は、list_tasks が破損 task を `[破損]` 疑似ステータスで隔離する
+    のと同じ —— **壊れているところだけを隔離して、残りは今までどおり見せる**。
+    task は 1 つも消さず、落とすのは循環を閉じている辺だけにする。
+
+    落とす辺は DFS の後退辺 (いま辿っている経路上の node に戻る辺) で決める。
+    後退辺だけが循環を閉じるので、これを外せば必ず非循環になり、外す数も最小で
+    済む。自己依存 (t001 → t001) も後退辺として同じ経路で落ちる。走査順は
+    `nodes` の順 (= list_tasks の順) に固定なので、同じ入力なら必ず同じ結果。
+
+    status は触らない。循環している task は実際に pull できない (依存が永久に
+    満たされない) ので、辺を落とす前に決まった `waiting` が事実のまま正しい。
+    落とした辺は `[循環依存: <id>]` として title に出す —— dangling を
+    `[依存不明: ...]` で見せるのと同じで、消した情報を黙って消さないため。
+
+    全 mission の node をまとめて渡してよい。`depends_on` は同じ slug で修飾されて
+    いるので辺は mission をまたがず、どの mission の DFS も他の mission に入って
+    いけない。つまり 1 回の走査が mission ごとの走査そのものであり、「壊れた
+    mission だけを隔離する」はこの形でも変わらず成り立つ。
+    """
+    by_id = {n['id']: n for n in nodes}
+    WHITE, GREY, BLACK = 0, 1, 2
+    color = {node_id: WHITE for node_id in by_id}
+    cut = {}
+
+    for root in [n['id'] for n in nodes]:
+        if color[root] != WHITE:
             continue
-        entries.append((int(m.group(1)), fn))
-    entries.sort()
-    out = []
-    for _, fn in entries:
-        path = os.path.join(tdir, fn)
-        with open(path) as f:
-            text = f.read()
-        try:
-            meta, body = parse_frontmatter(text, source=path)
-        except ValueError as e:
-            # A single malformed task file must not blank out `plan.sh status`
-            # or freeze dispatch for the whole mission (t009). Surface it as a
-            # [破損] pseudo-task — visible, but never 'pending' or terminal —
-            # and keep going so every other task file is still usable.
-            print(
-                f"[plan.sh warn] failed to parse {path}: {e}\n"
-                f"  hint: task files start with `---` / frontmatter / `---` / "
-                f"`## Description` / `## Result` (see existing tNNN.md for the template).\n"
-                f"  showing as [破損] task; other tasks are unaffected.",
-                file=sys.stderr,
-            )
-            task_id = fn[:-len('.md')]
-            meta = {
-                'id': task_id,
-                'title': '[破損] frontmatter parse error',
-                'status': CORRUPT_TASK_STATUS,
-                'skills': [],
-                'blocked_by': [],
-                'parse_error': str(e),
+        color[root] = GREY
+        stack = [(root, iter(list(by_id[root]['depends_on'])))]
+        while stack:
+            node_id, deps = stack[-1]
+            descended = False
+            for dep in deps:
+                if dep not in by_id:
+                    continue
+                if color[dep] == GREY:
+                    # 後退辺 — この辺が循環を閉じている。
+                    cut.setdefault(node_id, set()).add(dep)
+                elif color[dep] == WHITE:
+                    color[dep] = GREY
+                    stack.append((dep, iter(list(by_id[dep]['depends_on']))))
+                    descended = True
+                    break
+            if not descended:
+                color[node_id] = BLACK
+                stack.pop()
+
+    for node_id, dropped in cut.items():
+        node = by_id[node_id]
+        node['depends_on'] = [d for d in node['depends_on'] if d not in dropped]
+        node['title'] = (
+            '[循環依存: ' + ', '.join(sorted(dropped)) + '] ' + node['title']
+        )
+    return nodes
+
+
+#: task が 1 件も無いときに置くプレースホルダの id。`<slug>:<tNNN>` 形式の実 id
+#: とは別物にしてあるが、そもそも「他に node が 1 つも無い」ときにしか置かない
+#: ので、id が衝突することは構造上ありえない。
+TASK_GRAPH_EMPTY_ID = 'crewvia:no-active-tasks'
+
+
+def task_graph_placeholder(slugs):
+    """task が 0 件のときに置く、node 1 件だけのグラフの中身を返す。
+
+    plugin は `tasks` が空だと `ValueError: tasks must be a non-empty array` で
+    ファイル全体を拒否する。そして task 0 件は異常ではない —— **最後の mission
+    を archive した直後、つまりミッションとミッションの間の普通の状態** がまさに
+    それで、起動なら例外、稼働中なら `r` (reload) がエラー表示になる。通常運用で
+    必ず通る状態なので、ここで壊れるのは許容できない。
+
+    採れた道は 3 つあった。(1) ファイルを書かない、(2) 前回の内容を残す、
+    (3) プレースホルダを 1 件置く。
+
+    (1) と (2) は言い方が違うだけで、ディスク上の結果は同じ —— 画面には
+    *もう存在しない* mission の DAG が、現在の姿として出たままになる。グラフは
+    「今どうなっているか」を見るためのものなので、古い姿を現在として見せるのは、
+    何も見せないより悪い。しかも直前が最後の mission の完了直後なら、全部 done
+    の画面が次のミッションが始まるまで延々と残る。
+
+    採ったのは (3)。ファイルは常に妥当で、常に現在を映し、「今は何も無い」が
+    まさにそう読める形で出る。status は `blocked`: 実行可能に読める側 (`ready`)
+    にも、完了したと読める側 (`done`) にも倒さない —— TASK_GRAPH_UNKNOWN と
+    同じ理由で、偽の node が動かせる / 終わっていると見えるほうが害が大きい。
+    """
+    if not slugs:
+        reason = 'active mission がありません'
+    else:
+        reason = 'active mission に task がありません (' + ', '.join(slugs) + ')'
+    return {
+        'id': TASK_GRAPH_EMPTY_ID,
+        'title': '[表示する task なし] ' + reason,
+        'depends_on': [],
+        'status': 'blocked',
+    }
+
+
+#: id が使えなかった node に振り直す id の土台。実 id は `<slug>:<tNNN>` なので、
+#: この形と衝突することはない。
+TASK_GRAPH_UNUSABLE_ID = 'crewvia:id-unusable'
+
+
+def _free_task_graph_id(base, used):
+    """`used` に無い id を `base` から作る。"""
+    candidate = base
+    n = 1
+    while candidate in used:
+        n += 1
+        candidate = f'{base}#{n}'
+    return candidate
+
+
+def isolate_untrustworthy_ids(nodes):
+    """id を理由に plugin がファイル全体を捨てる 2 条件を、node を消さずに潰す。
+
+    plugin の `load_config` は id が空でも重複していても **ファイル全体** を
+    捨てる。1 枚のカードの事情で全 mission の DAG が消えるという、t010 の循環・
+    空配列とまったく同じ型の巻き添えである。
+
+    既知の発生源 (frontmatter の id の名乗り替え) は list_tasks が塞いだので、
+    ここはその後ろに立つ最後の関門である。**今はここより手前で潰れている** —
+    それでも置くのは、node を作る経路が増えたときに、増やした側が気付かないまま
+    ファイル全体を落とせてしまう形を残さないため。ゲートを通る限り publish 物が
+    契約を満たす、と言い切れることに意味がある。
+
+    潰し方は隔離であって削除ではない。node は消さず、id を衝突しない形に振り直し、
+    何が起きたかを title に残す。黙って落とすと、その task が DAG から消えた理由
+    が誰にも分からなくなる。status は `blocked` に倒す —— どのカードなのか言えない
+    node が `ready` (動ける) や `done` (終わった) に見えるほうが害が大きい。
+    """
+    used = {n.get('id') for n in nodes
+            if isinstance(n.get('id'), str) and n.get('id')}
+    seen = set()
+    for node in nodes:
+        node_id = node.get('id')
+        if not isinstance(node_id, str) or not node_id:
+            mark = '[id不正]'
+            node_id = _free_task_graph_id(TASK_GRAPH_UNUSABLE_ID, used)
+        elif node_id in seen:
+            mark = f'[id重複: {node_id}]'
+            node_id = _free_task_graph_id(node_id, used)
+        else:
+            seen.add(node_id)
+            continue
+        node['id'] = node_id
+        node['title'] = mark + ' ' + str(node.get('title') or '')
+        node['status'] = 'blocked'
+        used.add(node_id)
+        seen.add(node_id)
+    return nodes
+
+
+def drop_unresolvable_dependencies(nodes):
+    """publish する node のどれも指していない辺を落とし、印を title に残す。
+
+    plugin は解決できない `depends_on` でもファイル全体を捨てる。落とす理由は
+    それだけで、落とした事実は隠さない —— 黙って消すと、依存が最初から無かった
+    ように見える。status は触らない: 不明な依存は `unmet_dependencies()` の側で
+    すでに「満たされていない」と数えられており、waiting のままが事実である。
+
+    印に出す id は、同じ mission の中の依存なら `<slug>:` を外して見せる。
+    mission をまたぐ依存だけが修飾付きで出るので、どちらなのかが一目で分かる。
+    """
+    known = {n['id'] for n in nodes}
+    for node in nodes:
+        deps = node.get('depends_on') or []
+        missing = sorted({d for d in deps if d not in known})
+        if not missing:
+            continue
+        node['depends_on'] = [d for d in deps if d in known]
+        own = node['id'].rsplit(':', 1)[0] + ':'
+        shown = [d[len(own):] if d.startswith(own) else d for d in missing]
+        node['title'] = (
+            '[依存不明: ' + ', '.join(shown) + '] ' + str(node.get('title') or '')
+        )
+    return nodes
+
+
+def enforce_task_graph_contract(nodes, slugs):
+    """publish の直前に立つ唯一のゲート。
+
+    plugin の `load_config` は 4 つの理由で **ファイル全体** を捨てる —— 空の
+    tasks、id が空 / 重複、解決できない `depends_on`、依存の循環。どれも 1 つの
+    mission (ときに 1 枚のカード) の事情で起きるのに、巻き添えになるのは全
+    mission の DAG である。
+
+    **4 つの対処をここに集める理由**: t010 で 2 つ、Codex 4 巡目で 1 つと、理由は
+    増え続けている。潰し方が別々の場所に書かれていると、次の 1 件が来たときに
+    片方だけ直して穴が開く —— このミッションとその前のミッションで繰り返し起きた
+    型そのものである。「ここを通った node は plugin が受け取れる」とゲート 1 つで
+    言い切れる形にしておけば、次の 1 件もここに足すしかなくなる。
+
+    順番には意味がある。
+
+    1. **id** が先。以降の処理はどれも `{n['id']: n}` の形で node を引くので、
+       重複が残っていると片方が黙って消える。
+    2. **解決できない辺** を落としてから、
+    3. **循環** を切る。循環の判定は辺が全部解決している前提で書いてある。
+       切るのは後退辺だけなので、node は 1 つも減らない。
+    4. **空** は最後。1〜3 は node を減らさないので、空になりうるのは入力が
+       最初から空だったときだけである。
+    """
+    nodes = isolate_untrustworthy_ids(nodes)
+    nodes = drop_unresolvable_dependencies(nodes)
+    nodes = break_dependency_cycles(nodes)
+    if not nodes:
+        nodes = [task_graph_placeholder(slugs)]
+    return nodes
+
+
+def build_task_graph(state):
+    """active mission 全部を plugin の入力形式に変換する。
+
+    ここは翻訳だけを行う。plugin が受け取れる形にする責任は
+    `enforce_task_graph_contract()` が 1 つで持つ。
+
+    id は `<slug>:<tNNN>` に修飾する。mission をまたぐと t001 が衝突するため。
+    `depends_on` も同じ修飾で解決する (blocked_by は mission 内の id)。
+    """
+    # 同じ slug が 2 回並んでいても mission は 1 つ。state.yaml は復旧手順で手を
+    # 入れるファイルなので、2 行になること自体は起こる。落とさずに素通しすると
+    # **全 node が 2 つずつ** 出て、ファイルが丸ごと読めなくなる。
+    slugs = []
+    for s in (state.get('active_missions') or []):
+        if s and s not in slugs:
+            slugs.append(s)
+    nodes = []
+    for slug in slugs:
+        if not os.path.isdir(mission_dir(slug)):
+            continue
+        mission_nodes = []
+        tasks = list_tasks(slug, quiet=True)
+        done_ids = {m['id'] for (m, _) in tasks if m.get('status') in TERMINAL_STATUSES}
+        task_statuses = {m['id']: m.get('status') for (m, _) in tasks}
+        for (meta, _body) in tasks:
+            task_id = meta.get('id')
+            if not task_id:
+                continue
+            raw_status = meta.get('status')
+            blocked_by = [d for d in (meta.get('blocked_by') or []) if d]
+            if raw_status == 'pending':
+                # crewvia 側で READY を導出して明示的に書く。plugin の導出に
+                # 委ねると、`failed` の依存を満たされた扱いにする crewvia の
+                # 規則が伝わらず、QA FAIL 直後だけ WAIT と表示される。
+                unmet = unmet_dependencies(blocked_by, done_ids, task_statuses)
+                status = 'waiting' if unmet else 'ready'
+                marker = None
+            else:
+                status, marker = TASK_GRAPH_STATUS_MAP.get(raw_status, TASK_GRAPH_UNKNOWN)
+
+            title = meta.get('title') or task_id
+            if marker:
+                title = marker + ' ' + str(title)
+
+            # depends_on は依存が無くても `[]` で必ず出す。省略が許されるかは
+            # plugin の schema 次第だが、空リストはどちらの読み方でも通る。
+            # 存在しない task への依存をここで落とさないのは、それが plugin の
+            # 契約の話であって翻訳の話ではないから —— ゲートが落として印を残す。
+            node = {
+                'id': f'{slug}:{task_id}',
+                'title': str(title),
+                'depends_on': [f'{slug}:{d}' for d in blocked_by],
+                'status': status,
             }
-            body = ''
-            out.append((meta, body))
-            continue
-        # Normalize defaults
-        meta.setdefault('skills', [])
-        meta.setdefault('blocked_by', [])
-        if meta.get('skills') is None:
-            meta['skills'] = []
-        elif isinstance(meta.get('skills'), str):
-            # Normalize scalar string to list: `skills: bash` → `skills: [bash]`
-            # Without this, set("bash") yields individual characters, breaking
-            # skill-intersection checks (worker matching, DIRECTOR_ONLY_SKILLS).
-            meta['skills'] = [meta['skills']]
-        if meta.get('blocked_by') is None:
-            meta['blocked_by'] = []
-        out.append((meta, body))
-    return out
+            worker = _task_graph_worker(meta)
+            paneless = bool(set(meta.get('skills') or []) & PANELESS_SKILLS)
+            if (worker and not paneless
+                    and raw_status in TASK_GRAPH_PANE_STATUSES
+                    and task_graph_assignment_holds(worker, slug, task_id)):
+                # crewvia のペイン名は `<AGENT_NAME>-<ROLE>` (start.sh)。Worker は
+                # `<名前>-worker`。終わった task の worker 欄は履歴であって、今
+                # そのペインが居る場所ではない (名前は使い回される)。だから
+                # 「card がまだ Worker のものだと言っている」(status) と
+                # 「公開中の assignment がこの task を指している」(事実) の
+                # **両方** が揃ったときにだけ出す。片方でも欠ければ出さない。
+                node['pane_match'] = f'{worker}-worker'
+            mission_nodes.append(node)
+
+        nodes.extend(mission_nodes)
+
+    nodes = enforce_task_graph_contract(nodes, slugs)
+
+    if len(slugs) == 1:
+        title = f'crewvia / {slugs[0]}'
+    else:
+        title = f'crewvia / {len(slugs)} missions'
+    return {'title': title, 'tasks': nodes}
+
+
+#: publish の直列化ロックを待つ上限 (秒)。付加機能が本体を止めないための上限で
+#: あって、直列化の強さではない。flock はプロセスの死で必ず外れるので、ここに
+#: 引っかかるのは「publish の途中で生きたまま止まっている実行」がいるときだけ。
+TASK_GRAPH_LOCK_WAIT_SECONDS = 10.0
+TASK_GRAPH_LOCK_POLL_SECONDS = 0.02
+
+#: 印を触るあいだだけ取る小さなロックを待つ上限 (秒)。本ロックと同じ理由で
+#: **必ず有限** にする。保持時間はファイル 1 つの読み書きと flock の解放だけ
+#: なので、ここに引っかかるのは「印の区間の中で生きたまま止まっている実行」が
+#: 居るときだけである。
+#:
+#: 秒数を本ロックより小さく取るのは、`retire --no-wait` が watchdog の監視
+#: ループから **同期で** 呼ばれるからである。watchdog は Worker の生死を見る
+#: 唯一の主体なので、その 30 秒の subprocess タイムアウトまで持っていかれると、
+#: その間 Worker を誰も見ていないことになる。最悪経路は「本ロック 10 秒 →
+#: 印のロック → (取れた本ロックで publish) → 印のロック」なので、上限の合計は
+#: 10 + 2 × 2 = 14 秒 + 走査 1 回分に収まる。
+TASK_GRAPH_PENDING_LOCK_WAIT_SECONDS = 2.0
+
+#: 読み直しを繰り返す上限。**通常運用では到達しない安全弁** であって、
+#: 受け渡しの仕組みではない。読み直しが 1 回増えるのは「この publish の読み
+#: 取りを *始めたあと* に新しい要求が置かれた」ときだけなので、ここに届くには
+#: その並びが 32 回続く必要がある (= ロック待ちを諦めた実行が 32 回、毎回
+#: 読み取り窓の中に飛び込んでくる)。届いてしまった場合も要求は **消さずに**
+#: 残して手を引き、1 行報告する — 黙って落とす経路はどこにも作らない。
+TASK_GRAPH_MAX_ROUNDS = 32
+
+
+def _task_graph_lock_path(path):
+    """生成物ごとの直列化ロック。書き先が違う実行同士は競合しない。"""
+    return path + '.lock'
+
+
+def _task_graph_pending_path(path):
+    """「ロックを待ち切れず引き返した実行がいる」ことを表す印。"""
+    return path + '.pending'
+
+
+def _task_graph_pending_lock_path(path):
+    """印を触るあいだだけ取る小さなロック。"""
+    return path + '.pending.lock'
+
+
+@contextlib.contextmanager
+def task_graph_pending_lock(path, wait_seconds=None):
+    """印の読み書きと、本ロックの解放とを、並べ替えさせないための小さなロック。
+
+    守るのは印そのものではなく、印と本ロックの **順序** である。受け渡しが
+    成立するかどうかは、次の 1 点だけに懸かっている:
+
+        「印が無いことを確認して本ロックを解放する」(保持者) と
+        「印を置く」(要求者) が、互いに割り込めないこと。
+
+    割り込めると、確認と解放のあいだに置かれた印を保持者が見ないまま手を引き、
+    要求者はもう誰も待っていないロックを諦めて帰る。その印は次に誰かが queue を
+    触るまで誰にも消費されず、**最後の queue 変更が無期限に見えないまま残る**。
+
+    そこで保持者は「確認 → 解放」をこのロックの中でまとめて行い、要求者は
+    「印を置く」をこのロックの中で行う。どちらが先にこのロックを取ったかで
+    順序が必ず決まるので、上の取りこぼしは構造として起きない。
+
+    保持時間はファイル 1 つの読み書きと flock の解放だけで、**キューロックには
+    一切触れない**。要求者はこのロックを持ったまま本ロックを待たない (持った
+    ままにすると、本ロックの保持者が確認に入れず互いに待つ) 。
+
+    待ちは有限
+    ----------
+    上の理屈は「このロックがすぐ空く」ことを前提にしているが、**前提が外れた
+    ときの倒し方を持たないと、前提そのものが凶器になる**。短いはずのロックを
+    期限なしで待つと、区間の中で生きたまま止まっている実行が 1 つ居るだけで、
+    以降の queue 変更コマンドが全て無期限に詰まる。可視化は付加機能なので、
+    倒す先は「グラフが少し古くなる」でなければならず、「plan.sh が待たされる」
+    であってはならない。
+
+    そこで取得は上限付きにし、**取れたかどうかを yield で返す**。取れなかった
+    ときにどう倒すかは呼び出し側が決めるが、どちらの呼び出し側も
+    **「印を消さない」に倒す** — 消してよいのは「無い」と確認できたときだけで、
+    確認できていない以上、消せば要求者の最後の変更がそのまま落ちる。残せば
+    次に queue を触った実行が拾うので、失われるのは即時性だけである。
+
+    受け渡しの不変条件は壊れない。区間に入れた者同士の順序は従来どおり flock が
+    決めており、上限を足しても「確認と解放が一区間に入る」ことは変わらない。
+    変わるのは「区間に入れなかった者が居りうる」ことだけで、入れなかった者は
+    印に一切触れないので、置かれた印が消えることも、消えた印が復活することも
+    ない。
+    """
+    if wait_seconds is None:
+        wait_seconds = TASK_GRAPH_PENDING_LOCK_WAIT_SECONDS
+    lock_path = _task_graph_pending_lock_path(path)
+    os.makedirs(os.path.dirname(lock_path) or '.', exist_ok=True)
+    lf = open(lock_path, 'a+')
+    acquired = False
+    try:
+        deadline = time.monotonic() + wait_seconds
+        while True:
+            try:
+                fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+                break
+            except OSError:
+                pass
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(TASK_GRAPH_LOCK_POLL_SECONDS)
+        yield acquired
+    finally:
+        try:
+            if acquired:
+                fcntl.flock(lf, fcntl.LOCK_UN)
+        finally:
+            lf.close()
+
+
+def acquire_task_graph_lock(path, wait_seconds=None):
+    """publish を直列化するロックを取る。待ち切れなければ None。
+
+    `wait_seconds=0` は「1 回だけ試す」。要求を置いたあとに、いま保持者が
+    居るのかどうかを確かめるために使う (下の refresh_task_graph を参照)。
+
+    **キューロックとは別物で、キューロックの内側からは決して取らない。**
+    生成がキューロックの外であることは構造テストで固定されているので、
+    2 つのロックの順序が逆転する経路は存在しない。
+
+    上限付きで待つのは、付加機能が本体の動作を変えないため。flock は
+    プロセスが死ねば必ず外れるので、死んだ実行が plan.sh 全体を止めることは
+    ないが、生きたまま止まっている実行に Worker が巻き込まれる道は塞ぐ。
+
+    None が意味するのは「待ち切れなかった」だけである。ロックファイルを
+    用意できない (書き先が壊れている等) は OSError のまま投げる — 生成の
+    失敗として 1 行報告される方の経路であって、混ぜると書き先が壊れている
+    ときに「publish が混んでいる」と読める嘘の診断が出る。
+    """
+    if wait_seconds is None:
+        wait_seconds = TASK_GRAPH_LOCK_WAIT_SECONDS
+    lock_path = _task_graph_lock_path(path)
+    os.makedirs(os.path.dirname(lock_path) or '.', exist_ok=True)
+    lf = open(lock_path, 'a+')
+    deadline = time.monotonic() + wait_seconds
+    while True:
+        try:
+            fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return lf
+        except OSError:
+            pass
+        if time.monotonic() >= deadline:
+            lf.close()
+            return None
+        time.sleep(TASK_GRAPH_LOCK_POLL_SECONDS)
+
+
+def release_task_graph_lock(lf):
+    try:
+        fcntl.flock(lf, fcntl.LOCK_UN)
+    finally:
+        lf.close()
+
+
+def refresh_task_graph():
+    """生成物を書き出す。読み取りごと直列化し、tmp + os.replace で置き換える。
+
+    原子的な置換が防ぐのは「半端な JSON を読まれること」だけで、「先に queue を
+    読んだ実行が後に書く」入れ替わりは防がない。入れ替わると published な
+    グラフは古い姿に巻き戻る。そしてそれは一瞬では消えない: 巻き戻された変更が
+    *最後の queue 変更* だった場合、次に誰かが queue を触るまで誤った running が
+    居座る。「次のコマンドが直す」は、次のコマンドがある場合の話でしかない。
+
+    そこでロックを取ってから queue を読む。後から入った実行は必ず前の実行の
+    publish より後の queue を見るので、最後に書かれる姿は、その時点までに
+    commit された queue 変更をすべて含む。ロックはこの生成物専用で、
+    **キューロックの保持時間は 1 ミリ秒も伸びない**。
+
+    待ち切れなかった実行は 1 バイトも書かず、読み直しの要求だけを置いて引き返す。
+    今 publish している側の読み取りは自分の変更より前かもしれないからである。
+    その要求は **必ず誰かに拾われる**。受け渡しは次の 2 つの出口しかなく、
+    どちらか一方が必ず成立する:
+
+      (a) 要求を置いたあとに本ロックを取れた → **自分で publish する**。
+      (b) 取れなかった → そのとき本ロックを保持している実行が居る。その保持者の
+          最終確認は必ずこの要求より後に来る (task_graph_pending_lock の不変
+          条件) ので、**保持者が読み直す**。
+
+    (b) が言えるのは、保持者が「要求が無いことの確認」と「本ロックの解放」を
+    task_graph_pending_lock の中でまとめて行うからである。確認済みで解放前、
+    という中途半端な状態を外から観測できないので、要求を置いた時点でまだ本
+    ロックを持っている実行は、まだ確認していないことが確定する。
+
+    読み直しが要るかどうかは、**要求が置かれた時刻と、この publish が queue を
+    読み始めた時刻** の比較で決める。読み始めるより前に置かれた要求は、その
+    要求者の queue 変更 (要求より前に commit 済み) をこの publish が必ず含む
+    ので、消して終わってよい。だからラウンドが増えるのは「読み取り窓の中に
+    新しい要求が飛び込んだ」ときだけで、増えたラウンドは毎回、最新の queue を
+    publish するという必要な仕事をしている。
+    """
+    path = task_graph_path()
+    lock = acquire_task_graph_lock(path)
+    if lock is None:
+        # 1 バイトも書かず、要求だけを残す。置けたかどうかに関わらず (a) を
+        # 試す — 取れたなら自分で publish するのが最も確実な出口である。
+        marked = _mark_task_graph_pending(path)
+        lock = acquire_task_graph_lock(path, wait_seconds=0.0)
+        if lock is None:
+            if not marked:
+                # (a) も (b) も成立しない唯一の形。印を置けていないので保持者は
+                # 読み直さず、この実行の変更は次に queue を触った実行まで映ら
+                # ない。**待ち続けるより古いグラフを選ぶ** — 可視化のために
+                # plan.sh を止めないことが、この機能の唯一の約束である。
+                print(
+                    "[plan.sh warn] task-graph: publish を待ち切れず、読み直しの "
+                    "要求も置けませんでした — 次の queue 変更まで古い姿が残りえます",
+                    file=sys.stderr,
+                )
+            return path  # (b) 保持者が居る。その保持者が必ず読み直す。
+
+    released = False
+    rounds = 0
+    try:
+        while True:
+            rounds += 1
+            # 読み取りを *始めた* 時刻。これより古い要求は、この publish に
+            # 含まれていることが言える (要求者は queue を書き終えてから
+            # ロックを待ち、諦めてから要求を置くため)。
+            read_started = time.monotonic_ns()
+            graph = build_task_graph(load_state())
+            _atomic_write(path, json.dumps(graph, ensure_ascii=False, indent=2) + '\n')
+            with task_graph_pending_lock(path) as in_section:
+                if not in_section:
+                    # 区間に入れなかった。**印には一切触れずに** 本ロックだけ
+                    # 返す。ここで本ロックを握ったまま待ち続けると、止まるのは
+                    # この 1 コマンドではなく、以降の全ての queue 変更コマンド
+                    # になる (全員が本ロックの上限を払ったうえで同じ所に詰まる)。
+                    #
+                    # 消さないので要求は失われない。publish 自体はこの直前に
+                    # 済んでいるので、残るのは「この瞬間より後に置かれたかも
+                    # しれない要求の反映が、次の queue 変更まで遅れる」だけ。
+                    released = True
+                    release_task_graph_lock(lock)
+                    print(
+                        f"[plan.sh warn] task-graph: 読み直しの要求を確認できな "
+                        f"かったので手を引きました "
+                        f"({TASK_GRAPH_PENDING_LOCK_WAIT_SECONDS}s 待機) — "
+                        f"要求は残してあります (次の queue 変更で反映されます)",
+                        file=sys.stderr,
+                    )
+                    return path
+                if not _task_graph_pending_outstanding(path, read_started):
+                    # 未処理の要求は無い。消してから、同じ区間の中で解放する。
+                    _clear_task_graph_pending(path)
+                    released = True
+                    release_task_graph_lock(lock)
+                    return path
+                if rounds >= TASK_GRAPH_MAX_ROUNDS:
+                    # 病的な混み方。要求は **消さずに** 残して手を引く
+                    # (次に queue を触った実行が拾う) + 1 行報告する。
+                    released = True
+                    release_task_graph_lock(lock)
+                    print(
+                        f"[plan.sh warn] task-graph: 読み直しが "
+                        f"{TASK_GRAPH_MAX_ROUNDS} 回続いたので手を引きました "
+                        f"— 読み直しの要求は残してあります "
+                        f"(次の queue 変更で反映されます)",
+                        file=sys.stderr,
+                    )
+                    return path
+    finally:
+        if not released:
+            release_task_graph_lock(lock)
+
+
+def _mark_task_graph_pending(path):
+    """読み直しを頼む要求を置く。**置けたら True。** 置けなくても失敗させない。
+
+    時刻は **単調時計** で書く。realtime だと NTP の巻き戻しで「読み取りより
+    前に置かれた」と誤読し、未処理の要求を消してしまう。単調時計は同じ機体の
+    全プロセスで同じ基準を持つので、プロセスをまたいだ比較にそのまま使える。
+
+    区間に入れなかったときは **書かずに False を返す**。ロックの外から書くと、
+    保持者の「確認 → 消去」のあいだに置いた印がそのまま消され、置けたつもりで
+    要求が落ちる — 置かないより悪い。戻り値を見た呼び出し側が、(a) も成立
+    しなかったときに 1 行報告する。
+    """
+    try:
+        pending = _task_graph_pending_path(path)
+        os.makedirs(os.path.dirname(pending) or '.', exist_ok=True)
+        with task_graph_pending_lock(path) as in_section:
+            if not in_section:
+                return False
+            with open(pending, 'w') as f:
+                f.write(f"{os.getpid()} {time.monotonic_ns()}\n")
+            return True
+    except OSError as e:
+        print(
+            f"[plan.sh warn] task-graph: 読み直しの要求を書けませんでした ({e})",
+            file=sys.stderr,
+        )
+        return False
+
+
+def _task_graph_pending_outstanding(path, read_started):
+    """まだ処理されていない読み直し要求があるか。**保持者が pending lock 内で呼ぶ。**
+
+    要求が無ければ False。要求の時刻が読み取り開始より後なら True (この
+    publish に入っていないかもしれない)。
+
+    読めない・形が違う要求は True に倒す — 余分な読み直しが 1 回増えるだけで、
+    失うものは何も無い。逆に「読めないから無かったことにする」と、要求者の
+    最後の変更が消える。
+
+    未来の時刻 (= 再起動をまたいで残った前の boot の残骸) は、要求として扱うと
+    永久に True を返し続けるので、処理済みとして消す側に倒す。
+    """
+    # 「無い」= 要求なし。それ以外 (読めない) は要求が **あるかもしれない**
+    # 側に倒す —— 取りこぼすと誰も読み直さなくなるため。区別は `ENOENT` の
+    # 1 点だけで、`os.path.lexists()` は使わない (`EACCES` でも False になり、
+    # 「要求なし」= 取りこぼす側へ倒れる)。
+    text = _TASK_CARDS.read_regular_text_or_unreadable(
+        _task_graph_pending_path(path))
+    if _TASK_CARDS.is_missing(text):
+        return False
+    if _TASK_CARDS.is_unreadable(text):
+        return True
+    raw = text.split()
+    try:
+        marked = int(raw[1])
+    except (IndexError, ValueError):
+        return True
+    if marked > time.monotonic_ns():
+        return False  # この boot のものではない残骸
+    return marked >= read_started
+
+
+def _clear_task_graph_pending(path):
+    try:
+        os.unlink(_task_graph_pending_path(path))
+    except OSError:
+        pass
+
+
+def maybe_refresh_task_graph(subcommand):
+    """queue を書き換えたあとに生成を 1 回だけ呼ぶ。失敗しても何も壊さない。
+
+    **キューロックの外から呼ぶこと。** ロック保持中に全 mission の走査を足すと、
+    その分だけ全 Worker の pull が待たされる。
+    """
+    if subcommand not in QUEUE_MUTATING_SUBCOMMANDS:
+        return
+    if not task_graph_enabled():
+        return  # 1 バイトも書かず、ログも出さない
+    if not task_graph_queue_matches_root():
+        print(
+            f"[plan.sh warn] task-graph: CREWVIA_QUEUE ({QUEUE_DIR}) が "
+            f"{task_graph_repo_root()}/queue ではないので生成しません "
+            f"(書き先を指定するなら CREWVIA_TASK_GRAPH_FILE)",
+            file=sys.stderr,
+        )
+        return
+    try:
+        refresh_task_graph()
+    except (Exception, SystemExit) as e:
+        # 黙って捨てない。ただし本体の終了コードには触らない。
+        print(f"[plan.sh warn] task-graph の生成に失敗しました: {e}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -969,10 +1771,12 @@ def assignment_identity_path(agent):
 
 def _read_assignment_identity(agent):
     """サイドカーを読む。読めない・形が違うときは None (= 世代不明)。"""
+    text, problem = try_read_queue_file(assignment_identity_path(agent))
+    if problem is not None:
+        return None
     try:
-        with open(assignment_identity_path(agent)) as f:
-            data = json.load(f)
-    except (OSError, ValueError):
+        data = json.loads(text)
+    except ValueError:
         return None
     return data if isinstance(data, dict) else None
 
@@ -1011,13 +1815,21 @@ def classify_assignment(agent, mission, task_id, generation):
         # 不正な名前の assignment は存在しえない。撤去側で die すると、card を
         # 書いたあとに落ちて片側だけ進むので、ここは「消さない」に倒す。
         return ASSIGN_UNVERIFIABLE
-    try:
-        with open(assignment_path(agent)) as f:
-            published = f.read().strip()
-    except FileNotFoundError:
+    # 「無い」= ASSIGN_ABSENT (撤去済み) と「読めない」= ASSIGN_UNVERIFIABLE
+    # (証明できないので消さない) は別の結論である。分けるのは `ENOENT` の
+    # 1 点だけで、それ以外の OSError・種類違い・デコード失敗はすべて
+    # 「証明できない」側 (knowledge/empty-vs-unobservable.md §5)。
+    #
+    # 区別を `os.path.lexists()` で取らないのは、あれが `EACCES` でも False に
+    # なるからである —— 親から実行権限が消えただけで「撤去済み」と読み、
+    # **証明できない assignment の削除を許可する**。判定は読み取りが返す
+    # `errno` に乗せる (memory: evidence-for-destructive-decisions)。
+    published = _TASK_CARDS.read_regular_text_or_unreadable(assignment_path(agent))
+    if _TASK_CARDS.is_missing(published):
         return ASSIGN_ABSENT
-    except OSError:
+    if _TASK_CARDS.is_unreadable(published):
         return ASSIGN_UNVERIFIABLE
+    published = published.strip()
 
     if published != f"{mission}:{task_id}":
         return ASSIGN_OTHER_TASK
@@ -1180,16 +1992,29 @@ def _taskvia_enabled():
     return bool(_TASKVIA_URL and _TASKVIA_TOKEN)
 
 
+def _load_taskvia_map(map_path):
+    """`queue/.taskvia-map.json` を、種類を確かめてから読む (t018)。
+
+    倒す先は `{}` でよい —— 中身は「crewvia の task id → Taskvia の id」の
+    キャッシュで、失われても次の同期が作り直す (冪等)。閉じているのは
+    「素の `open()` が FIFO で返らない」ほうであって、空との取り違えではない。
+    """
+    text, problem = try_read_queue_file(map_path)
+    if problem is not None:
+        return {}
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
 def _taskvia_map_update(slug, task_id, status='pending'):
     """Update .taskvia-map.json after a successful inline sync.
     Keeps taskvia-sync.sh from re-registering tasks already pushed inline.
     """
     map_path = os.path.join(QUEUE_DIR, '.taskvia-map.json')
-    try:
-        with open(map_path) as f:
-            task_map = json.load(f)
-    except (OSError, json.JSONDecodeError):
-        task_map = {}
+    task_map = _load_taskvia_map(map_path)
     map_key = f"{slug}:{task_id}"
     task_map[map_key] = {'registered': True, 'status': status}
     try:
@@ -1203,11 +2028,7 @@ def _taskvia_map_update(slug, task_id, status='pending'):
 def _taskvia_map_update_status(slug, task_id, status):
     """Update status of an existing .taskvia-map.json entry."""
     map_path = os.path.join(QUEUE_DIR, '.taskvia-map.json')
-    try:
-        with open(map_path) as f:
-            task_map = json.load(f)
-    except (OSError, json.JSONDecodeError):
-        task_map = {}
+    task_map = _load_taskvia_map(map_path)
     map_key = f"{slug}:{task_id}"
     if map_key in task_map:
         task_map[map_key]['status'] = status
@@ -1306,10 +2127,10 @@ def _load_workers_from_registry():
         return []
     workers = []
     current = None
-    try:
-        with open(registry_path) as f:
-            text = f.read()
-    except OSError:
+    # registry/workers.yaml も固定パスのガードを通す (Codex 9 巡目 P2)。
+    # 素の open() だと、置き違えた FIFO 1 枚で Worker 同期が返らなくなる。
+    text, problem = try_read_queue_file(registry_path)
+    if problem is not None:
         return []
     for line in text.splitlines():
         stripped = line.strip()
@@ -1665,8 +2486,7 @@ def cmd_pull(args):
                     # failed/cancelled deps are excluded — they indicate the dep will
                     # never complete, so the downstream task should not be blocked.
                     bb = meta.get('blocked_by') or []
-                    unmet = [dep for dep in bb if dep not in done_ids
-                             and task_statuses.get(dep) not in ('failed', 'cancelled')]
+                    unmet = unmet_dependencies(bb, done_ids, task_statuses)
                     if unmet:
                         die(
                             f"task '{specific_task}' is blocked by unfinished dependencies: "
@@ -1709,8 +2529,7 @@ def cmd_pull(args):
                 bb = meta.get('blocked_by') or []
                 # failed/cancelled deps do not block: they indicate the dep will
                 # never complete, so the downstream task should remain eligible.
-                if any(dep not in done_ids and task_statuses.get(dep) not in ('failed', 'cancelled')
-                       for dep in bb):
+                if unmet_dependencies(bb, done_ids, task_statuses):
                     blocked_count += 1
                     continue
                 candidates.append((slug, meta, body))
@@ -2254,8 +3073,11 @@ def _print_mission_summary(slug, archived=False):
     if not os.path.exists(mission_path):
         print(f"  {slug} — (mission.yaml missing)")
         return
-    with open(mission_path) as f:
-        text = f.read()
+    text, problem = try_read_queue_file(mission_path)
+    if problem is not None:
+        # 1 つの mission を読めなかっただけで、残りを画面から消さない。
+        print(f"  {slug} — (mission.yaml unreadable: {problem})")
+        return
     try:
         mission = parse_yaml(text, source=mission_path)
     except ValueError as e:
@@ -2292,8 +3114,7 @@ def _print_mission_detail(slug):
     if not base:
         die(f"mission '{slug}' not found.")
     mission_path = os.path.join(base, 'mission.yaml')
-    with open(mission_path) as f:
-        text = f.read()
+    text = read_queue_file(mission_path, 'mission file')
     try:
         mission = parse_yaml(text, source=mission_path)
     except ValueError as e:
@@ -2507,10 +3328,8 @@ def upgrade_mode(current, proposed):
 
 def _apply_risk_flags(slug, plan_review_path):
     """Parse ## Risk Flags from plan_review.md and upgrade task verification.mode."""
-    try:
-        with open(plan_review_path) as f:
-            content = f.read()
-    except OSError:
+    content, problem = try_read_queue_file(plan_review_path)
+    if problem is not None:
         return
 
     # Find ## Risk Flags section
@@ -2834,12 +3653,12 @@ def cmd_review(args):
     # 旧形式の 1 行ファイル) なら、値が正しくても消費せず fail-closed。
     # 読めない / UTF-8 として解釈できない場合も、mission を reviewing のまま
     # 残さないよう rollback してから止める。
-    try:
-        with open(verdict_file, encoding='utf-8', newline='') as f:
-            verdict_raw = f.read()
-    except (OSError, UnicodeDecodeError) as e:
+    # 種類のガードも通す (t018)。`newline=''` は下の「2 行ちょうど」の検査が
+    # 改行変換を前提にしていないため必須なので、ガード側にそのまま渡す。
+    verdict_raw, problem = try_read_queue_file(verdict_file, newline='')
+    if problem is not None:
         _rollback_to_drafting("plan_review.verdict is unreadable", refund_cycle=True)
-        die(f"could not read {verdict_file} ({e}) — refusing to guess (fail-closed).")
+        die(f"could not read {verdict_file} ({problem}) — refusing to guess (fail-closed).")
     verdict_lines = verdict_raw.split('\n')
     if (
         len(verdict_lines) != 3
@@ -2919,6 +3738,38 @@ def cmd_launch(args):
         print(f"Launched: '{slug}' is now in_progress — workers can pull tasks")
 
     with_lock(_do)
+
+
+def cmd_task_graph(args):
+    """Usage: plan.sh task-graph
+
+    herdr-task-graph 用の tasks.json を今すぐ書き出してパスを印字する。
+    queue は変更しない。普段は queue を書き換えるサブコマンドが自動で呼ぶので、
+    これを使うのは初回のブートストラップと、生成結果を目で見たいときだけ。
+
+    自動経路 (maybe_refresh_task_graph) と **同じ foreign-queue ガードを掛ける**。
+    手動だけ素通りさせると、`CREWVIA_QUEUE` を付け替えて走る隔離 QA が 1 回
+    叩くだけで、Director が見ているグラフがテスト用の queue の中身に化ける。
+    自動経路と違って黙って引き返さず失敗させるのは、こちらは人が「今すぐ
+    書き出せ」と言った実行だからで、何も起きないことの方が分かりにくい。
+    """
+    parse_opts(args, {})
+    if not task_graph_enabled():
+        print(
+            "[plan.sh] CREWVIA_TASK_GRAPH=0 のため生成しません",
+            file=sys.stderr,
+        )
+        return
+    if not task_graph_queue_matches_root():
+        die(
+            f"[plan.sh] task-graph: CREWVIA_QUEUE ({QUEUE_DIR}) が "
+            f"{task_graph_repo_root()}/queue ではありません。"
+            f"このまま生成すると本体の生成物をこの queue の中身で上書きします。\n"
+            f"  hint: この queue のグラフを見たいなら書き先を明示してください "
+            f"(CREWVIA_TASK_GRAPH_FILE=<path> plan.sh task-graph)",
+            PRECONDITION_UNMET,
+        )
+    print(refresh_task_graph())
 
 
 def cmd_lint(args):
@@ -3062,11 +3913,15 @@ def cmd_resync(args):
 def _mission_data(slug, archived=False):
     base = os.path.join(ARCHIVE_DIR, slug) if archived else mission_dir(slug)
     mission_path = os.path.join(base, 'mission.yaml')
-    try:
-        with open(mission_path) as f:
-            mission = parse_yaml(f.read(), source=mission_path)
-    except (FileNotFoundError, ValueError):
+    text, problem = try_read_queue_file(mission_path)
+    if problem is not None:
+        # JSON 出力。1 つ読めなくても残りの mission は出す (表示系と同じ向き)。
         mission = {}
+    else:
+        try:
+            mission = parse_yaml(text, source=mission_path)
+        except ValueError:
+            mission = {}
 
     tasks_list = list_tasks(slug, base_dir=os.path.join(base, 'tasks'))
     done = sum(1 for (m, _) in tasks_list if m.get('status') == 'done')
@@ -3478,6 +4333,7 @@ dispatch = {
     'verify-result': cmd_verify_result,
     'review': cmd_review,
     'launch': cmd_launch,
+    'task-graph': cmd_task_graph,
     'lint': cmd_lint,
     'status': cmd_status,
     'archive': cmd_archive,
@@ -3490,5 +4346,28 @@ if SUBCOMMAND not in dispatch:
     print(f"Available: {', '.join(dispatch)}", file=sys.stderr)
     sys.exit(1)
 
-dispatch[SUBCOMMAND](ARGS)
+
+def _exit_code_of(exc):
+    """SystemExit が運ぶ終了コード。code は int / str / None のいずれでもありうる。"""
+    code = exc.code
+    if isinstance(code, int):
+        return code
+    return 0 if code is None else 1
+
+
+# 生成はここ — キューロックの外、コマンドが終わったあと。
+# 失敗した実行のあとでも呼ぶ: 途中まで書いて die() したケースがありうるので、
+# 「成功したときだけ」に絞ると DAG がその分だけ古いまま残る。
+# 例外は LOCK_BUSY (ロックを取れず 1 バイトも書かずに引き返した実行) で、
+# これは watchdog が監視ループの中から同期で叩く経路。何も書いていないと
+# 分かっている実行のあとに全 mission を走査し直すのは、キューが混んでいる
+# まさにその瞬間に足す純粋な無駄になる。
+try:
+    dispatch[SUBCOMMAND](ARGS)
+except SystemExit as _e:
+    if _exit_code_of(_e) != LOCK_BUSY:
+        maybe_refresh_task_graph(SUBCOMMAND)
+    raise
+else:
+    maybe_refresh_task_graph(SUBCOMMAND)
 PYEOF

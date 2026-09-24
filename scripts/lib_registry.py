@@ -27,6 +27,9 @@ import re
 import sys
 from datetime import date
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from lib_task_cards import read_regular_text  # noqa: E402
+
 
 def _lock_path(path):
     """Dedicated lock file for a given registry path, sibling to the registry
@@ -82,10 +85,19 @@ def parse(path):
 
     Returns ('', [], {}) for a missing file.
     Returns (content, [], {}) if the file exists but has no 'workers:' key.
+
+    読むのは `lib_task_cards.read_regular_text()` —— 通常ファイルであることを
+    確かめてから読む、crewvia で 1 つだけの判定 —— を通す (Codex 8 巡目 P2)。
+    ここは `with_lock()` の内側で呼ばれるので、素の `open()` だと書き手のいない
+    FIFO 1 枚で **レジストリのロックを握ったまま** 止まる: Worker の起動
+    (`start.sh`) も `bump-task-count` も、そこから先へ進めなくなる。
+
+    ENOENT だけが「まだ無い」(初回起動の通常状態)。それ以外は投げる ——
+    呼び出し元は一度きりの CLI なので、黙って「Worker 0 人」に倒すより、
+    理由の分かるエラーで止まるほうが直しやすい。
     """
     try:
-        with open(path) as f:
-            content = f.read()
+        content = read_regular_text(path)
     except FileNotFoundError:
         return '', [], {}
 

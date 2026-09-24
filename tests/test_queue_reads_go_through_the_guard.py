@@ -55,6 +55,7 @@ and-condition-beats-unforgeable-evidence —— 閉じない指摘は閉じな�
 from __future__ import annotations
 
 import ast
+import os
 import pathlib
 import re
 
@@ -224,26 +225,56 @@ def test_the_read_goes_through_a_guard(script, function, guards):
 # テストは緑だった (Codex 10 巡目 P2-1)。**検出器の漏れは、構造テストを
 # 「守っているつもり」に変える。**
 #
+# **それでもまだ漏れていた** (Codex 11 巡目 P2, t020)。t019 の検出器は
+#
+#   * `os.open()` の flags を「`O_CREAT` / `O_APPEND` / `O_RDWR` が式のどこかに
+#     あれば書き込み」と読んでいた。この 3 つは書き込み専用を意味しない ——
+#     `os.open(path, os.O_RDONLY | os.O_CREAT)` は読めるし、既存の FIFO を
+#     指していれば無期限に止まる
+#   * 見慣れない名前のレシーバを **全部 `Path` だと仮定** していた。そのため
+#     `import io as fs; fs.open("queue/state.yaml")` の **ファイル名が
+#     モードとして解釈され**、その中の `a` が書き込み除外を発火させていた
+#   * 間接読み取り (`from io import open as read_file`) と subprocess 経由の
+#     読み取りを、コメントで認めたうえで **防止を規約に委ねていた**
+#
+# を持っていた。どれも「全部緑のまま未ガードの queue 読み取りを足せる」形
+# である。検出器の穴は、構造テスト全体を「守っているつもり」に戻す。
+#
 # 見える:
 #   * `open(...)` (裸)、`<何か>.open(...)` (`Path.open` / `io.open` /
 #     `os.open` を含む)、`.read_text()` / `.read_bytes()`
+#   * import の別名を解決したうえでの `os` / `io` / `codecs` / `builtins`
+#     (`import io as fs` の `fs.open()` も、`from io import open as X` の
+#     `X()` も) —— `_module_aliases()` / `_from_import_aliases()`
+#   * `getattr(p, "open")` のような文字列経由の間接呼び出しと、
+#     `fn = p.open` のように **呼ばずに取り置く** 属性
+#   * `os.fdopen()` / `os.read()`
 #   * `lib_task_cards.py` に限り `.read()` (ガード本体を `open()` と対で数える)
-#   * 書き込みは除く: モード文字列に `w` / `a` / `x` を含むもの、および
-#     `os.open()` の書き込みフラグ (`O_WRONLY` 等)。`_is_write_open()` 参照
+#   * `subprocess.run/Popen/check_output/…` と `os.system/popen` ——
+#     こちらは `ALLOWED_SUBPROCESS_CALLS` の表で別に見る
+#   * 書き込みは除く。ただし **証明できるときだけ**: モード文字列に
+#     `w` / `a` / `x` を含むもの、`os.open()` の **アクセスモード** が
+#     `O_WRONLY` だと式から読み取れるもの。レシーバの型が分からない
+#     `<x>.open("...")` は、第 1 引数が **モード文字列として通る形**
+#     (`_looks_like_mode()`) のときだけ `Path.open(mode)` と読む。
+#     `_is_write_open()` 参照
 #
-# 見えない (**ここを埋めるのは、これを読む人の仕事**):
-#   * `getattr(p, "open")()` のような間接呼び出し、`fn = p.open` の別名経由
-#   * `os.fdopen()` / `os.read()` を fd から直に使う形 (ガード本体だけが持つ)
-#   * `subprocess` 経由で `cat` 等に読ませる形
+# 原理的に閉じないもの (**規約ではなく、別の手段で担保すること**):
+#   * 動的に組んだ argv (`subprocess.run(cmd)`) ——
+#     `ALLOWED_SUBPROCESS_CALLS` は `cmd` という式のまま 1 行を持つので、
+#     その関数の中で argv の中身が `cat` に変わっても表は当たり続ける。
+#     **コードレビューの観点にすること** (knowledge/review.md)
+#   * `exec()` / `eval()` / C 拡張 / `ctypes` 経由の読み取り
+#   * 完全に動的な属性名 (`getattr(p, verb)()` の `verb` が変数)
 #   * `AUDITED_MODULES` に載っていないモジュールそのもの (hooks/ は対象外)
 #   * `.sh` の中では `<<'PYEOF'` ブロック **1 つ目だけ** (`_python_source()`)
-#   * 受け手の名前だけでモード位置を決めているので、`os` / `io` / `codecs`
-#     という名前の **変数** に Path を入れて `.open()` すると読み違える
-#     (逆に `from pathlib import Path` した `Path(x).open("w")` は正しく
-#     書き込みと読む)
+#   * `os` / `io` / `codecs` という名前の **変数** に Path を入れて
+#     `.open()` する形 (import の別名解決が優先される)
 #
-# 見えないものは **allowlist では止められない** ので、増やさないこと自体が
-# 規約になる。新しい読み方が要るときは、まずこの検出器を広げること。
+# 閉じない指摘は閉じないと明言する
+# (memory: and-condition-beats-unforgeable-evidence)。上の 5 件は
+# allowlist では止められないので、`knowledge/review.md` のレビュー観点に
+# 載せて人の目で見る —— 新しい読み方が要るときは、まずこの検出器を広げること。
 
 AUDITED_MODULES = [
     "plan.sh",
@@ -316,9 +347,23 @@ ALLOWED_DIRECT_READS = {
         "Codex 6 巡目 P1 の回帰テストを成立させる唯一の停止点として使っている。"
         "閉じるには harness の停止点を先に別の仕組みへ移すこと",
 
+    # -- ファイルの中身を読まない open --------------------------------------
+    # t020 (Codex 11 巡目 P2-1): `os.open()` の flags を具体的に解析するように
+    # したので、`O_RDWR` で開くロックファイルが見えるようになった。読める形で
+    # 開いてはいるが、**read は一度もしない**。
+    ("lib_daemon_watch.py", "daemon_lock",
+     "os.open(path, os.O_CREAT | os.O_RDWR, 0o644)"):
+        "flock 用のロックファイル。fd は fcntl.flock にしか渡さず、中身は "
+        "読まない。`O_RDWR` なので FIFO を置かれても open は返る (Linux)",
+
     # -- ガードの実装そのもの ----------------------------------------------
     ("lib_task_cards.py", "_read_regular_file", "f.read()"):
         "ガード本体。ここが唯一の `open()` で、O_NONBLOCK + fstat の判定を持つ",
+    # t020: `os.fdopen()` も検出するようにしたので、ガード本体の
+    # 「fd をテキスト stream にする」1 行が見えるようになった。
+    ("lib_task_cards.py", "_read_regular_file", "os.fdopen(fd, newline=newline)"):
+        "ガード本体。すでに fstat で通常ファイルだと確かめた fd を包むだけで、"
+        "ここで新しくパスを開いてはいない",
     # t019: 属性形式の open を検出するようにして、ガード本体の `os.open()` も
     # 見えるようになった。`f.read()` と対で 1 組。
     ("lib_task_cards.py", "_read_regular_file",
@@ -329,34 +374,183 @@ ALLOWED_DIRECT_READS = {
 
 _READ_ATTRS = ("read_text", "read_bytes")
 
-#: `os.open()` の書き込み側フラグ。`os.open()` はモードが文字列ではなく整数
-#: フラグなので、モード文字列とは別の見方をする。
-_OS_WRITE_FLAGS = frozenset({
-    "O_WRONLY", "O_RDWR", "O_APPEND", "O_CREAT", "O_EXCL", "O_TRUNC",
-})
+#: `open()` を作り出す名前。別名 import / `getattr` / 属性の取り置きを
+#: 追いかけるときの終点になる (t020)。
+_READER_ATTRS = frozenset({"open", "read_text", "read_bytes", "fdopen"})
 
+#: `os.open()` の **アクセスモード**。低 2bit の排他的な 3 値で、
+#: `O_CREAT` / `O_APPEND` / `O_EXCL` / `O_TRUNC` のような修飾フラグとは
+#: 別物である (t020 / Codex 11 巡目 P2-1)。
+_OS_ACCESS_WRITE_ONLY = "O_WRONLY"
+_OS_ACCESS_READABLE = frozenset({"O_RDONLY", "O_RDWR"})
 
 #: モジュール関数としての `open()` —— パスが第 1 引数で、モード/フラグが
 #: 第 2 引数に来る。`Path.open()` (モードが **第 1** 引数) と区別する。
-_MODULE_OPEN_RECEIVERS = frozenset({"os", "io", "codecs"})
+_MODULE_OPEN_RECEIVERS = frozenset({"os", "io", "codecs", "builtins"})
+
+#: `open()` のモード文字列に現れうる文字。**ファイル名と見分けるため**に
+#: 使う —— `"queue/state.yaml"` はここで落ちる (t020 / Codex 11 巡目 P2-2)。
+_MODE_CHARS = frozenset("rwxab+tU")
+
+#: 外部プロセスを起こす呼び出し。`cat` に読ませる形を機械で見張るための入口。
+_SUBPROCESS_FUNCS = frozenset({
+    ("subprocess", "run"), ("subprocess", "Popen"),
+    ("subprocess", "call"), ("subprocess", "check_call"),
+    ("subprocess", "check_output"), ("subprocess", "getoutput"),
+    ("subprocess", "getstatusoutput"),
+    ("os", "system"), ("os", "popen"),
+    ("os", "spawnv"), ("os", "spawnvp"), ("os", "spawnvpe"),
+})
 
 
-def _open_receiver(node: ast.Call):
-    """`<受け手>.open(...)` の受け手の名前。属性形式でなければ `None`。"""
-    func = node.func
-    if (isinstance(func, ast.Attribute) and func.attr == "open"
-            and isinstance(func.value, ast.Name)):
-        return func.value.id
+def _arg(node: ast.Call, index: int, keyword: str):
+    """位置引数 `index`、無ければキーワード `keyword` の値。どちらも無ければ `None`。"""
+    if len(node.args) > index:
+        return node.args[index]
+    for kw in node.keywords:
+        if kw.arg == keyword:
+            return kw.value
     return None
 
 
-def _is_write_open(node: ast.Call) -> bool:
+def _module_aliases(tree: ast.AST) -> dict[str, str]:
+    """`import io as fs` → `{"fs": "io"}`、`import os` → `{"os": "os"}`。
+
+    **別名を解決してからモード引数を選ぶ** ために要る (Codex 11 巡目 P2-2)。
+    これが無いと `fs.open("queue/state.yaml")` の第 1 引数がモードだと
+    読まれ、ファイル名の中の `a` が書き込み除外を発火させていた。
+    """
+    aliases: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for entry in node.names:
+                if entry.asname:
+                    aliases[entry.asname] = entry.name
+                else:
+                    root = entry.name.split(".")[0]
+                    aliases[root] = root
+    return aliases
+
+
+def _from_import_aliases(tree: ast.AST, modules, names) -> dict[str, str]:
+    """`from io import open as read_file` → `{"read_file": "io"}`。
+
+    裸の名前で呼ばれる「開く関数」を `open()` と同じ土俵に乗せる
+    (Codex 11 巡目 P2-3)。
+    """
+    out: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module in modules:
+            for entry in node.names:
+                if entry.name in names:
+                    out[entry.asname or entry.name] = node.module
+    return out
+
+
+def _looks_like_mode(value) -> bool:
+    """`open()` のモード文字列として通る形か。
+
+    レシーバの型が分からない `<x>.open("...")` で、第 1 引数がモードなのか
+    パスなのかを分けるのに使う。モード文字列は `"rwxab+tU"` の文字だけから
+    なる 4 文字以下の文字列で、`"queue/state.yaml"` はそのどちらの条件にも
+    当たらない。
+    """
+    return (isinstance(value, str) and 1 <= len(value) <= 4
+            and set(value) <= _MODE_CHARS)
+
+
+def _mode_is_write(node) -> bool:
+    """モード引数が、書き込みを **明示している** ときだけ True。"""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return any(c in node.value for c in "wax")
+    return False
+
+
+def _flag_names(node):
+    """`os.O_WRONLY | os.O_CREAT` から `{"O_WRONLY", "O_CREAT"}` を作る。
+
+    `os.O_*` / 裸の `O_*` / `|` / 整数リテラル以外が混ざったら `None` ——
+    **読み切れない式は「書き込みだ」と決めない**。
+    """
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
+        left = _flag_names(node.left)
+        right = _flag_names(node.right)
+        if left is None or right is None:
+            return None
+        return left | right
+    if isinstance(node, ast.Attribute) and node.attr.startswith("O_"):
+        return {node.attr}
+    if isinstance(node, ast.Name) and node.id.startswith("O_"):
+        return {node.id}
+    if isinstance(node, ast.Constant) and isinstance(node.value, int):
+        # 生の整数。`O_RDONLY` が 0 である以上、ここから書き込み専用は
+        # 証明できない。
+        return set()
+    return None
+
+
+def _os_open_is_write_only(node: ast.Call) -> bool:
+    """`os.open()` が **書き込み専用だと証明できる** ときだけ True。
+
+    t019 までは「`O_CREAT` / `O_APPEND` / `O_RDWR` のどれかが式のどこかに
+    現れたら捨てる」という見方をしていた。これらは書き込み専用を意味しない
+    —— アクセスモードは `O_RDONLY` / `O_WRONLY` / `O_RDWR` の排他的な 3 値
+    で、残りは修飾にすぎない。そのため
+    `os.read(os.open(path, os.O_RDONLY | os.O_CREAT), 100)` が検出から
+    外れていた。既存の FIFO を指していれば、この `open` は無期限に止まる
+    (Codex 11 巡目 P2-1)。
+
+    しかも旧実装は `ast.walk(node)` で **呼び出し全体** を見ていたので、
+    パス側の式に `O_` で終わる属性があるだけでも除外されえた。ここでは
+    flags 引数だけを見る。
+    """
+    flags = _arg(node, 1, "flags")
+    if flags is None:
+        return False
+    names = _flag_names(flags)
+    if names is None:
+        return False
+    if names & _OS_ACCESS_READABLE:
+        return False
+    return _OS_ACCESS_WRITE_ONLY in names
+
+
+def _open_kind(node: ast.Call, aliases, open_aliases) -> str:
+    """`open` の呼び方を 4 つに分ける。
+
+    * `"builtin"` —— 組み込みの `open(path, mode)` と同じ並び (`io.open` も)
+    * `"os"`      —— `os.open(path, flags)`。モードではなく整数フラグ
+    * `"module"`  —— `io` / `codecs` / `builtins` の `open(path, mode)`
+    * `"ambiguous"` —— レシーバの型が分からない。`Path.open(mode)` かも
+      しれないし、追えなかったモジュールの `open(path, mode)` かもしれない
+    """
+    func = node.func
+    if isinstance(func, ast.Name):
+        if func.id == "open":
+            return "builtin"
+        module = open_aliases.get(func.id)
+        if module == "os":
+            return "os"
+        if module is not None:
+            return "builtin"
+        return "ambiguous"
+    if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
+        module = aliases.get(func.value.id)
+        if module == "os":
+            return "os"
+        if module in _MODULE_OPEN_RECEIVERS:
+            return "module"
+        return "ambiguous"
+    return "ambiguous"
+
+
+def _is_write_open(node: ast.Call, aliases=None, open_aliases=None) -> bool:
     """`open(path, 'w')` のような書き込みは読み取り経路ではない。
 
     `'a+'` (ロック取得) もここで落ちる —— `flock` のために開くだけで、
     中身を読んでいないからである。
 
-    モードがどこにあるかは呼び方で違う (t019):
+    モードがどこにあるかは呼び方で違う:
 
     * 組み込みの `open(path, "a")`   → 第 2 引数
     * `Path.open("a")`               → 第 1 引数 (パスはレシーバ側)
@@ -365,45 +559,90 @@ def _is_write_open(node: ast.Call) -> bool:
     **「書き込みだ」と判定した読み取りは検出から外れる**ので、この判定は
     狭いほうへ倒す —— 迷ったら読み取りとして報告し、allowlist に理由を
     書かせる (memory: approve-judgment-needs-allowlist-and-scope)。
+
+    t020 で変えたのは 2 点:
+
+    1. `os.open()` は flags を **具体的に解析** し、書き込み専用だと
+       証明できるときだけ除外する (`_os_open_is_write_only`)
+    2. レシーバは import の別名を解決してから分類し、**型が分からない
+       レシーバは Path だと決めつけない**。第 1 引数がモード文字列として
+       通る形のときだけ `Path.open(mode)` と読む (`_looks_like_mode`)
     """
-    receiver = _open_receiver(node)
+    aliases = aliases or {}
+    open_aliases = open_aliases or {}
+    kind = _open_kind(node, aliases, open_aliases)
 
-    if receiver == "os":
-        flags = {sub.attr for sub in ast.walk(node)
-                 if isinstance(sub, ast.Attribute)}
-        return bool(flags & _OS_WRITE_FLAGS)
+    if kind == "os":
+        return _os_open_is_write_only(node)
 
-    if receiver is not None and receiver not in _MODULE_OPEN_RECEIVERS:
-        modes = list(node.args[:1])      # Path.open(mode, ...)
-    else:
-        modes = list(node.args[1:2])     # open(path, mode, ...)
-    modes += [kw.value for kw in node.keywords if kw.arg == "mode"]
-    for m in modes:
-        if isinstance(m, ast.Constant) and isinstance(m.value, str):
-            if any(c in m.value for c in "wax"):
-                return True
+    if kind in ("builtin", "module"):
+        return _mode_is_write(_arg(node, 1, "mode"))
+
+    # ambiguous —— `Path.open("w")` かもしれず、追えなかったモジュールの
+    # `open(path, "w")` かもしれない。**モードとして通る文字列** が見つかった
+    # ときだけ書き込みと読む。ファイル名は `_looks_like_mode()` で落ちるので、
+    # `fs.open("queue/state.yaml")` は読み取りとして残る。
+    first = _arg(node, 0, "mode")
+    if isinstance(first, ast.Constant) and _looks_like_mode(first.value):
+        return _mode_is_write(first)
+    second = _arg(node, 1, "mode")
+    if isinstance(second, ast.Constant) and _looks_like_mode(second.value):
+        return _mode_is_write(second)
     return False
 
 
-def _direct_reads(script: str):
-    """`(関数名, ソース断片)` を、そのモジュールの読み取り全部について返す。"""
-    source = _python_source(script)
-    tree = ast.parse(source, filename=script)
-
+def _owner_by_line(tree: ast.AST) -> dict[int, str]:
+    """行番号 → その行を含む関数名。"""
     owner: dict[int, str] = {}
     for node in ast.walk(tree):
         if isinstance(node, ast.FunctionDef):
             for sub in ast.walk(node):
                 if hasattr(sub, "lineno"):
                     owner.setdefault(sub.lineno, node.name)
+    return owner
+
+
+def _scan_reads(source: str, filename: str = "<synthetic>"):
+    """`(関数名, ソース断片)` を、そのソースの読み取り全部について返す。
+
+    `filename` は 2 つの役目を持つ: AST のエラー表示と、`lib_task_cards.py`
+    だけ `.read()` / `os.fdopen()` を `open()` と対で数える分岐。
+
+    **合成ソースでも呼べる形にしてある** —— 検出器そのものの回帰テスト
+    (`test_the_detector_sees_*`) が、本番コードを触らずに「この形を
+    見落としていないか」を確かめられるようにするため (t020)。
+    """
+    tree = ast.parse(source, filename=filename)
+    aliases = _module_aliases(tree)
+    open_aliases = _from_import_aliases(tree, _MODULE_OPEN_RECEIVERS,
+                                        {"open", "fdopen"})
+    owner = _owner_by_line(tree)
+    guard_body = filename == "lib_task_cards.py"
+    call_funcs = {id(n.func) for n in ast.walk(tree) if isinstance(n, ast.Call)}
 
     found = []
+
+    def _record(node):
+        segment = ast.get_source_segment(source, node) or "<unparsed>"
+        found.append((owner.get(node.lineno, "<module>"),
+                      " ".join(segment.split())))
+
     for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and id(node) not in call_funcs:
+            # `fn = p.open` のように **呼ばずに取り置く** 形 (t020)。
+            # ここを見ていないと、別名にしてから呼ぶだけで検出を抜けられる。
+            if node.attr in _READER_ATTRS or (guard_body and node.attr == "read"):
+                _record(node)
+            continue
         if not isinstance(node, ast.Call):
             continue
         func = node.func
-        if isinstance(func, ast.Name) and func.id == "open":
-            if _is_write_open(node):
+        if isinstance(func, ast.Name) and (func.id == "open"
+                                           or func.id in open_aliases):
+            # t020 (Codex 11 巡目 P2-3): `from io import open as read_file` の
+            # ように **別名で import された開く関数** も裸の `open()` と同じに
+            # 数える。
+            if _is_write_open(node, aliases, open_aliases):
                 continue
         elif isinstance(func, ast.Attribute) and func.attr == "open":
             # t019 (Codex 10 巡目 P2-1): **属性形式の open も検出する**。
@@ -413,20 +652,84 @@ def _direct_reads(script: str):
             # 無期限に止まるのに、この構造テストは緑のままだった。
             # **検出器に漏れがあると、構造テスト自体が「守っているつもり」
             # になる。**
-            if _is_write_open(node):
+            if _is_write_open(node, aliases, open_aliases):
                 continue
         elif isinstance(func, ast.Attribute) and func.attr in _READ_ATTRS:
             pass
+        elif isinstance(func, ast.Name) and func.id == "getattr":
+            # `getattr(p, "open")()` —— 文字列で名前を渡す間接呼び出し (t020)。
+            name = _arg(node, 1, "name")
+            if not (isinstance(name, ast.Constant)
+                    and name.value in _READER_ATTRS):
+                continue
+        elif (isinstance(func, ast.Attribute)
+                and isinstance(func.value, ast.Name)
+                and aliases.get(func.value.id) == "os"
+                and func.attr in ("fdopen", "read")):
+            # fd から直に読む形 (t020)。`os.fdopen()` はモードが第 2 引数
+            # なので、書き込みはここで落とす。読み取りはガード本体が持って
+            # いるぶんだけ allowlist に入る。
+            if func.attr == "fdopen" and _mode_is_write(_arg(node, 1, "mode")):
+                continue
         elif (isinstance(func, ast.Attribute) and func.attr == "read"
-                and script == "lib_task_cards.py"):
+                and guard_body):
             # ガード本体の `f.read()` だけは、`open()` と対で数える。
             pass
         else:
             continue
-        segment = ast.get_source_segment(source, node) or "<unparsed>"
-        segment = " ".join(segment.split())
-        found.append((owner.get(node.lineno, "<module>"), segment))
+        _record(node)
     return found
+
+
+def _direct_reads(script: str):
+    """`(関数名, ソース断片)` を、そのモジュールの読み取り全部について返す。"""
+    return _scan_reads(_python_source(script), script)
+
+
+def _program_of(node: ast.Call) -> str:
+    """外部プロセス呼び出しが起こすプログラム名。読み切れなければ式そのもの。"""
+    argv = _arg(node, 0, "args")
+    if isinstance(argv, (ast.List, ast.Tuple)) and argv.elts:
+        head = argv.elts[0]
+        if isinstance(head, ast.Constant) and isinstance(head.value, str):
+            return os.path.basename(head.value)
+        return ast.unparse(head)
+    if isinstance(argv, ast.Constant) and isinstance(argv.value, str):
+        parts = argv.value.split()
+        return os.path.basename(parts[0]) if parts else "<empty>"
+    if argv is None:
+        return "<none>"
+    return ast.unparse(argv)
+
+
+def _scan_subprocess(source: str, filename: str = "<synthetic>"):
+    """`(関数名, プログラム名)` を、そのソースの外部プロセス呼び出し全部について返す。"""
+    tree = ast.parse(source, filename=filename)
+    aliases = _module_aliases(tree)
+    bare = _from_import_aliases(tree, {"subprocess", "os"},
+                               {name for _, name in _SUBPROCESS_FUNCS})
+    owner = _owner_by_line(tree)
+
+    found = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
+            module = aliases.get(func.value.id, func.value.id)
+            if (module, func.attr) not in _SUBPROCESS_FUNCS:
+                continue
+        elif isinstance(func, ast.Name) and func.id in bare:
+            if (bare[func.id], func.id) not in _SUBPROCESS_FUNCS:
+                continue
+        else:
+            continue
+        found.append((owner.get(node.lineno, "<module>"), _program_of(node)))
+    return found
+
+
+def _subprocess_calls(script: str):
+    return _scan_subprocess(_python_source(script), script)
 
 
 @pytest.mark.parametrize("script", AUDITED_MODULES)
@@ -470,6 +773,214 @@ def test_the_allowlist_has_no_dead_entries():
         "ALLOWED_DIRECT_READS に、もう存在しない読み取りの行が残っている:\n"
         + "\n".join(f"  {s}:{f}(): {seg}" for s, f, seg in dead)
         + "\n  直したなら、その行は消すこと。")
+
+
+# ---------------------------------------------------------------------------
+# 外部プロセス経由の読み取り (t020 / Codex 11 巡目 P2-3)
+# ---------------------------------------------------------------------------
+#
+# `open()` を全部ガードに通しても、`subprocess.check_output(["cat", path])`
+# なら素通りできる。t019 のコメントはこの抜け道を **認めたうえで、防止を
+# 規約に委ねていた** —— つまり構造テストが全部緑のまま、未ガードの queue
+# 読み取りを足せる状態だった。
+#
+# 規約でなく表にする。対象モジュールの外部プロセス呼び出しを AST で全部拾い、
+# `(モジュール, 関数, プログラム名)` が下の表に無ければ落とす。`cat` を
+# 足した瞬間に赤くなるし、既存の行は「何を起こしていて、なぜファイルを
+# 読んでいないと言えるのか」を 1 行で持つ。
+#
+# プログラム名は argv の先頭。リテラルなら basename、式なら式そのもの。
+# **式のままの行 (`cmd` / `argv`) は、その関数の中身が変わっても同じ行に
+# 当たり続ける** —— そこは下の「原理的に閉じないもの」に書いてある。
+
+ALLOWED_SUBPROCESS_CALLS = {
+    # -- plan.sh -----------------------------------------------------------
+    ("plan.sh", "cmd_pull", "bash"):
+        "pull 後の worktree 作成スクリプト。queue のファイルは渡していない",
+    ("plan.sh", "cmd_review", "bash"):
+        "scripts/review-plan.sh を起こす。プラン本体は向こうが "
+        "lib_task_cards 経由で読む",
+    ("plan.sh", "cmd_done", "sys.executable"):
+        "lib_registry.py bump-task-count のサブコマンド。registry の読み書きは "
+        "向こうの with_lock() + read_regular_text() の中",
+
+    # -- dispatcher.sh -----------------------------------------------------
+    ("dispatcher.sh", "spawn_kai_review", "cmd"):
+        "kai-review.sh を起こすだけ。カードを読むのは向こうの plan.sh pull",
+
+    # -- lib_retirement.py -------------------------------------------------
+    ("lib_retirement.py", "_default_run_command", "argv"):
+        "退役の後始末コマンド (git worktree remove 等) を走らせる注入点。"
+        "argv は呼び出し側が組み、ファイルの中身は受け取らない",
+
+    # -- lib_mux.py: mux の制御コマンド -------------------------------------
+    # どれも tmux / herdr にペインを操作させるもので、ファイルを読ませていない。
+    ("lib_mux.py", "spawn", "tmux"): "ペインを作る",
+    ("lib_mux.py", "kill", "tmux"): "ペインを畳む",
+    ("lib_mux.py", "list", "tmux"): "ペイン一覧",
+    ("lib_mux.py", "capture", "tmux"): "ペインの画面を取る",
+    ("lib_mux.py", "attach", "tmux"): "セッションに繋ぐ",
+    ("lib_mux.py", "available", "_HERDR_CLI['version']"): "herdr の版を訊く",
+    ("lib_mux.py", "server_running", "tmux"): "サーバーの生死",
+    ("lib_mux.py", "server_identity", "tmux"): "サーバーの socket と pid",
+    ("lib_mux.py", "_send_to_target", "tmux"): "ペインにキーを送る",
+    ("lib_mux.py", "_inspect_pane_full", "tmux"): "ペインの属性を訊く",
+    ("lib_mux.py", "_destroy_window_on", "tmux"):
+        "if-shell で 1 つの接続に検証と破壊を流す "
+        "(memory: verify-and-destroy-must-share-one-connection)",
+    ("lib_mux.py", "_herdr_run", "cmd"):
+        "`_HERDR_CLI[key] + extra_args`。herdr CLI の固定語彙しか入らない",
+    ("lib_mux.py", "_herdr_run_raw", "cmd"): "同上 (JSON に包まない版)",
+    ("lib_mux.py", "_herdr_start_server", "_HERDR_CLI['server_start']"):
+        "herdr サーバーを起こす",
+}
+
+
+@pytest.mark.parametrize("script", AUDITED_MODULES)
+def test_no_unaudited_subprocess_remains(script):
+    """このモジュールに、表に無い外部プロセス呼び出しが残っていないこと。
+
+    RED の作り方 —— どれかのモジュールに
+    `subprocess.check_output(["cat", "queue/state.yaml"])` を足すと、
+    `cat` の行が表に無いのでここが落ちる。
+    """
+    unexpected = sorted(
+        {(fn, prog) for fn, prog in _subprocess_calls(script)
+         if (script, fn, prog) not in ALLOWED_SUBPROCESS_CALLS})
+    assert not unexpected, (
+        f"{script}: 表に無い外部プロセス呼び出しがある:\n"
+        + "\n".join(f"  {fn}(): {prog}" for fn, prog in unexpected)
+        + "\n\n  外部プロセスに queue / registry を読ませると、"
+          "ガードを丸ごと迂回できる。\n"
+          "  ファイルを読ませていないなら ALLOWED_SUBPROCESS_CALLS に "
+          "**理由付きで** 1 行足すこと。\n"
+          "  読ませる必要があるなら、読むのは python 側で "
+          "lib_task_cards を通すこと。")
+
+
+def test_the_subprocess_allowlist_has_no_dead_entries():
+    """外部プロセスの表にも、死んだ行を残さない。
+
+    死んだ行が残ると、その関数に別のプログラムが戻ってきたときに黙って
+    許可される —— `ALLOWED_DIRECT_READS` と同じ理由である。
+    """
+    live = {
+        (script, fn, prog)
+        for script in AUDITED_MODULES
+        for fn, prog in _subprocess_calls(script)
+    }
+    dead = sorted(k for k in ALLOWED_SUBPROCESS_CALLS if k not in live)
+    assert not dead, (
+        "ALLOWED_SUBPROCESS_CALLS に、もう存在しない呼び出しの行が残っている:\n"
+        + "\n".join(f"  {s}:{f}(): {p}" for s, f, p in dead)
+        + "\n  直したなら、その行は消すこと。")
+
+
+# ---------------------------------------------------------------------------
+# 検出器そのものの回帰 (t020)
+# ---------------------------------------------------------------------------
+#
+# 上の 2 つの表は「検出器が拾ったもの」しか見ない。**拾えていない形**は
+# どちらの表にも現れず、全部緑のままになる —— それが Codex 10 巡目 (属性
+# 形式の `open`) と 11 巡目 (os.open のフラグ / 別名 import / 間接読み取り)
+# で 2 度続けて起きたことだった。
+#
+# だから検出器を合成ソースに当てて、**見えるべき形が見えていること**と
+# **書き込みを読み取りと誤認しないこと**を対にして固定する。ここが緑でも
+# 本番が緑とは限らないが、ここが赤なら検出器に穴が開いている。
+
+#: `(名前, 拾ってほしい断片 または None, ソース)`。
+#:
+#: 断片を書くのは、**どの式が拾われたか** まで固定するためである。「何か 1 つ
+#: 拾えた」で通す形にすると、同じソースの別の式 (たとえば `os.read()`) が
+#: 拾われているだけで緑になり、直したはずの穴が閉じていなくても気付けない。
+_DETECTOR_READ_CASES = [
+    # --- Codex 11 巡目 P2-1: os.open のフラグ --------------------------
+    # `O_CREAT` / `O_APPEND` / `O_RDWR` は書き込み **専用** を意味しない。
+    ("os-rdonly-with-creat", "os.open(path, os.O_RDONLY | os.O_CREAT)",
+     "import os\nos.read(os.open(path, os.O_RDONLY | os.O_CREAT), 100)\n"),
+    ("os-rdwr-with-creat", "os.open(path, os.O_CREAT | os.O_RDWR, 0o644)",
+     "import os\nfd = os.open(path, os.O_CREAT | os.O_RDWR, 0o644)\n"),
+    ("os-append-without-access-mode", "os.open(path, os.O_APPEND | os.O_CREAT)",
+     "import os\nfd = os.open(path, os.O_APPEND | os.O_CREAT)\n"),
+    ("os-flags-from-a-variable", "os.open(path, flags)",
+     "import os\nfd = os.open(path, flags)\n"),
+    ("os-provably-write-only", None,
+     "import os\nfd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)\n"),
+    ("os-write-only-with-append", None,
+     "import os\nfd = os.open(path, os.O_WRONLY | os.O_APPEND)\n"),
+
+    # --- Codex 11 巡目 P2-2: 別名 import されたモジュール ---------------
+    # ファイル名の中の `a` をモードだと読むと、検出から外れる。
+    ("aliased-module-open-reads-a-filename", 'fs.open("queue/state.yaml")',
+     'import io as fs\nfs.open("queue/state.yaml").read()\n'),
+    ("aliased-module-open-writes", None,
+     'import io as fs\nfs.open("queue/state.yaml", "w")\n'),
+    ("unresolvable-receiver-with-a-filename", 'fs.open("queue/state.yaml")',
+     'fs.open("queue/state.yaml")\n'),
+    ("path-open-append-is-a-write", None,
+     "LOG_FILE.open('a')\n"),
+    ("path-open-read", 'p.open(encoding="utf-8")',
+     'p.open(encoding="utf-8")\n'),
+    ("path-call-open-write", None,
+     'from pathlib import Path\nPath(x).open("w")\n'),
+
+    # --- Codex 11 巡目 P2-3: 間接読み取り -------------------------------
+    ("from-import-open-alias", "read_file(path)",
+     "from io import open as read_file\nread_file(path).read()\n"),
+    ("getattr-open", 'getattr(p, "open")',
+     'getattr(p, "open")()\n'),
+    ("attribute-taken-aside", "p.open",
+     "fn = p.open\n"),
+    ("os-fdopen-read", "os.fdopen(fd, newline=None)",
+     "import os\nos.fdopen(fd, newline=None)\n"),
+    ("os-fdopen-write", None,
+     'import os\nos.fdopen(fd, "w", encoding="utf-8")\n'),
+]
+
+
+@pytest.mark.parametrize("name,expected,source", _DETECTOR_READ_CASES,
+                         ids=[c[0] for c in _DETECTOR_READ_CASES])
+def test_the_detector_sees_this_read(name, expected, source):
+    """この書き方を、検出器が拾う (拾わない) こと。"""
+    segments = [seg for _, seg in _scan_reads(source, "<synthetic>")]
+    if expected is not None:
+        assert expected in segments, (
+            f"{name}: 検出器がこの読み取りを見落としている:\n{source}\n"
+            f"  拾ってほしかった: {expected}\n"
+            f"  実際に拾ったもの: {segments}\n"
+            "  見落とした形は allowlist にも現れないので、"
+            "構造テストは緑のまま未ガードの読み取りを通す。")
+    else:
+        assert not segments, (
+            f"{name}: 書き込みを読み取りとして報告している:\n{source}\n"
+            f"  検出したもの: {segments}\n"
+            "  誤検出は allowlist を「書き込みの置き場」にしてしまい、"
+            "次に本物の読み取りが混ざっても気付けなくなる。")
+
+
+_DETECTOR_SUBPROCESS_CASES = [
+    ("subprocess-check-output-cat", "cat",
+     'import subprocess\nsubprocess.check_output(["cat", path])\n'),
+    ("aliased-subprocess-module", "cat",
+     'import subprocess as sp\nsp.run(["cat", path])\n'),
+    ("from-import-check-output", "cat",
+     'from subprocess import check_output\ncheck_output(["cat", path])\n'),
+    ("os-system-shell-string", "cat",
+     'import os\nos.system("cat queue/state.yaml")\n'),
+    ("absolute-path-program", "cat",
+     'import subprocess\nsubprocess.run(["/bin/cat", path])\n'),
+]
+
+
+@pytest.mark.parametrize("name,program,source", _DETECTOR_SUBPROCESS_CASES,
+                         ids=[c[0] for c in _DETECTOR_SUBPROCESS_CASES])
+def test_the_detector_sees_this_subprocess_read(name, program, source):
+    """外部プロセスに読ませる形を、プログラム名まで含めて拾えること。"""
+    found = _scan_subprocess(source, "<synthetic>")
+    assert [prog for _, prog in found] == [program], (
+        f"{name}: 外部プロセス経由の読み取りを取りこぼしている:\n{source}\n"
+        f"  拾ったもの: {found}")
 
 
 # ---------------------------------------------------------------------------

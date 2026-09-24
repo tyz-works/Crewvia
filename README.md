@@ -310,6 +310,92 @@ For a per-session override without editing the config:
 CREWVIA_MUX=herdr ./crewvia
 ```
 
+### Task graph view with herdr-task-graph (optional)
+
+[herdr-task-graph](https://github.com/tyz-works/herdr-task-graph) is a herdr plugin that
+draws the task dependency DAG, which tasks are running, and which are ready to run in
+parallel. Every time `plan.sh` changes the queue, Crewvia rewrites
+`registry/task-graph/tasks.json` (all active missions, ids qualified as `<mission>:<tNNN>`);
+the plugin only reads that file.
+
+**Nothing here is required.** Crewvia works exactly the same without the plugin, without
+herdr, and in tmux mode: generating the file never calls herdr, and if generation itself
+fails, `plan.sh` logs one line to stderr and keeps its own exit code. Set
+`CREWVIA_TASK_GRAPH=0` to turn generation off completely (nothing is written, nothing is
+logged).
+
+#### Setup (once)
+
+Run this from the **main checkout** of Crewvia, not from a worker worktree — the symlink
+must point at the file that Director and Workers actually update.
+
+```bash
+# 1. The plugin (or `herdr plugin link <path-to-a-local-clone>` for development)
+herdr plugin install tyz-works/herdr-task-graph
+
+# 2. Generate the file once so the link has something to point at
+./scripts/plan.sh task-graph
+
+# 3. Point the plugin's config dir at Crewvia's file
+CONFIG_DIR="$(herdr plugin config-dir io.github.tyz-works.task-graph)"
+mkdir -p "$CONFIG_DIR"
+ln -sfn "$PWD/registry/task-graph/tasks.json" "$CONFIG_DIR/tasks.json"
+```
+
+Crewvia owns the file; the symlink is the only thing in the plugin's config dir, so there is
+never a second copy to keep in sync. Generation replaces the file atomically, and the link
+follows it.
+
+Do **not** use `HERDR_TASKS_FILE`. It is read by the plugin, but plugin panes inherit the
+environment of the running herdr *server*, not of the shell that invokes the action, so an
+`export` in your shell never reaches the pane (verified against herdr 0.9.0). It only works if
+it was set when the herdr server started, and restarting the server closes every tab.
+
+#### Opening it
+
+Open it when you want to look; `./crewvia` does not open it for you (it is an optional
+extra, and Crewvia must not depend on herdr for it):
+
+```bash
+herdr plugin action invoke open-task-graph --plugin io.github.tyz-works.task-graph
+```
+
+Each invocation opens a new tab, so close the old one when you are done.
+
+#### Reading the view
+
+| Plugin state | Crewvia status |
+|---|---|
+| `READY` / `WAIT` | `pending` — `READY` when the dependencies are met by the same rule `plan.sh pull` uses (a `failed` dependency counts as met), otherwise `WAIT` |
+| `RUN` | `in_progress`, `verifying` |
+| `DONE` | `done`, `verified`, `skipped` (`[skip]`) |
+| `FAIL` | `failed`, `verification_failed` (`[検証NG]`), `cancelled` (`[中止]`), unreadable task file (`[破損]`) |
+| `BLOCK` | `blocked` (`[停止]`); waiting for a human: `needs_director`, `needs_human_review`, `ready_for_verification` (all `[要判断]`); unknown status (`[status不明]`) |
+
+`WAIT` means "waiting for a dependency", `BLOCK [要判断]` means "waiting for a person".
+Other markers in a title: `[依存不明: id]` (depends on a task that does not exist),
+`[循環依存: id]` (a dependency cycle was cut there so the rest of the graph still renders),
+`[id重複: id]`, and a single `[表示する task なし]` node when there are no tasks at all.
+
+#### Limitations
+
+- **The plugin does not reload by itself.** Press `r` in the Task Graph tab to re-read the
+  file. Crewvia updates the file immediately, but the tab keeps showing what it read last
+  (measured: file updated, tab unchanged after 4 s, `r` brought it up to date). Only the
+  agent states shown by herdr are live.
+- **If the title is not `crewvia / N missions`, you are looking at the plugin's bundled
+  example.** When the file is missing (for example a dangling symlink) the plugin does not
+  complain; it falls back to a sample graph. Re-run `./scripts/plan.sh task-graph` and check
+  the link.
+- **The worker ↔ task pane link does not work yet.** The generated `pane_match`
+  (`<Name>-worker`) is not something herdr 0.9.0 exposes to the plugin, so a task does not
+  light up its Worker's pane and Enter does not jump to it. Status, dependencies and the
+  ready/waiting split are unaffected. Tracked as a follow-up; see `knowledge/task-graph.md`.
+- A queue with many finished tasks makes the graph crowded. Only active missions are drawn,
+  so `plan.sh archive` a finished mission to clear it from the view.
+
+Operational notes and troubleshooting: `knowledge/task-graph.md`.
+
 ---
 
 ## Taskvia Integration

@@ -258,12 +258,53 @@ def test_the_read_goes_through_a_guard(script, function, guards):
 #     `<x>.open("...")` は、第 1 引数が **モード文字列として通る形**
 #     (`_looks_like_mode()`) のときだけ `Path.open(mode)` と読む。
 #     `_is_write_open()` 参照
+#   * `from os import ...` で入ってきた名前は **実体を解決してから**
+#     モード/フラグ引数を選ぶ。整数フラグを取るのは `os.open` だけで、
+#     `os.fdopen` はモード文字列を取る (t021 / Codex 12 巡目 指摘 6)
 #
-# 原理的に閉じないもの (**規約ではなく、別の手段で担保すること**):
-#   * 動的に組んだ argv (`subprocess.run(cmd)`) ——
-#     `ALLOWED_SUBPROCESS_CALLS` は `cmd` という式のまま 1 行を持つので、
-#     その関数の中で argv の中身が `cat` に変わっても表は当たり続ける。
-#     **コードレビューの観点にすること** (knowledge/review.md)
+# ---------------------------------------------------------------------------
+# 検出できない形 —— **実態より狭く書かないこと**
+# ---------------------------------------------------------------------------
+#
+# 以前ここには「動的に組み立てた argv だけが手動レビューを要する」と書いて
+# あった。**これは実態より狭い**。下の (B) はどれも静的に読める形であり、
+# (A-1) は argv が完全にリテラルでも素通りする。**守れない範囲を狭く書くと、
+# レビュアーはそこを見なくなる** —— 記述の甘さは検出漏れと同じだけ危ない。
+#
+# (A) 検出はするが、表が通してしまう:
+#   * A-1 `subprocess.run(["bash", "-c", "cat queue/state.yaml"])` ——
+#     program は `bash` として **拾えている**。しかし
+#     `ALLOWED_SUBPROCESS_CALLS` の鍵は `(script, 関数, program)` だけで、
+#     **引数を縛っていない**。だから `cmd_review` の既存の `bash` 許可に
+#     一致し、**完全にリテラルな shell 読み取りでも通る**。動的 argv
+#     (`subprocess.run(cmd)`) も同じ理由で通る —— 表は `cmd` という式のまま
+#     1 行を持つので、中身が `cat` に変わっても当たり続ける。
+#     → **argv の変更は、それ自体をレビュー対象にすること**
+#       (knowledge/review.md)
+#
+# (B) 静的には読めるのに、現実装が見ていない (t021 で Director 判断により
+#     backlog。**規約ではなく、別の手段で担保すること**):
+#   * B-1 別名 import された subprocess 関数 ——
+#     `from subprocess import check_output as capture; capture([...])`。
+#     `_scan_subprocess()` は **呼ばれている名前** で表を引く
+#   * B-2 変数に取り置いた subprocess 関数 ——
+#     `run = subprocess.check_output; run([...])`。取り置きの検出は
+#     open 系の属性 (`_READER_ATTRS`) だけを見ている
+#   * B-3 定数 `getattr` の subprocess 版 ——
+#     `getattr(subprocess, "check_output")([...])`。`getattr` の検出も
+#     `_READER_ATTRS` だけを見ている
+#   * B-4 **再束縛された `O_*` 定数** —— `O_WRONLY = 0` と置いてから
+#     `os.open(path, O_WRONLY)`。`_flag_names()` は裸の `O_*` を
+#     **出自を確かめずに信じる**ので、これは書き込み専用と判定されて
+#     検出から外れる。**倒れる方向が危険な唯一の項目** —— 他は「見えない」
+#     だけだが、これは読み取りを書き込みだと **積極的に誤判定** する
+#   * B-5 裸の名前を変数に取り置く形 —— `reader = open; reader(path).read()`。
+#     取り置きの検出は `ast.Attribute` だけで、`ast.Name` を見ていない
+#   * B-6 `from os import read as read_fd; read_fd(fd, 100)` ——
+#     `_READER_ATTRS` に `read` が無いため、import 経由の `os.read` は
+#     そもそも候補に入らない
+#
+# (C) 原理的に閉じないもの:
 #   * `exec()` / `eval()` / C 拡張 / `ctypes` 経由の読み取り
 #   * 完全に動的な属性名 (`getattr(p, verb)()` の `verb` が変数)
 #   * `AUDITED_MODULES` に載っていないモジュールそのもの (hooks/ は対象外)
@@ -271,8 +312,14 @@ def test_the_read_goes_through_a_guard(script, function, guards):
 #   * `os` / `io` / `codecs` という名前の **変数** に Path を入れて
 #     `.open()` する形 (import の別名解決が優先される)
 #
+# **この検出器は「うっかり直接読み取りを足す」ことを止める補助であって、
+# 敵対的なすり抜けを防ぐ境界ではない。** (B) はすべて「意図的に分かりにくく
+# 書いたコード」を要求する。そこを完璧にしても得られる安全は小さく、検出器の
+# 複雑さだけが増えるので、t021 で追いかけっこを打ち切った (Codex 12 巡目は
+# P1 ゼロ・3 巡連続)。
+#
 # 閉じない指摘は閉じないと明言する
-# (memory: and-condition-beats-unforgeable-evidence)。上の 5 件は
+# (memory: and-condition-beats-unforgeable-evidence)。(A) (B) (C) は
 # allowlist では止められないので、`knowledge/review.md` のレビュー観点に
 # 載せて人の目で見る —— 新しい読み方が要るときは、まずこの検出器を広げること。
 
@@ -432,18 +479,25 @@ def _module_aliases(tree: ast.AST) -> dict[str, str]:
     return aliases
 
 
-def _from_import_aliases(tree: ast.AST, modules, names) -> dict[str, str]:
-    """`from io import open as read_file` → `{"read_file": "io"}`。
+def _from_import_aliases(tree: ast.AST, modules, names) -> dict[str, tuple]:
+    """`from io import open as read_file` → `{"read_file": ("io", "open")}`。
 
     裸の名前で呼ばれる「開く関数」を `open()` と同じ土俵に乗せる
     (Codex 11 巡目 P2-3)。
+
+    **モジュール名だけでなく、import 元の関数名も持つ** (Codex 12 巡目
+    指摘 6)。`os` から来たことだけを覚えていると、モード引数の読み方が
+    決まらない —— `os.open()` は第 2 引数が **整数フラグ**、
+    `os.fdopen()` は **モード文字列** である。実体を区別しないと
+    `from os import fdopen; fdopen(fd, "w")` が「読み切れないフラグ」
+    として読み取り扱いになり、正当な書き込みが誤検出される。
     """
-    out: dict[str, str] = {}
+    out: dict[str, tuple] = {}
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom) and node.module in modules:
             for entry in node.names:
                 if entry.name in names:
-                    out[entry.asname or entry.name] = node.module
+                    out[entry.asname or entry.name] = (node.module, entry.name)
     return out
 
 
@@ -523,15 +577,24 @@ def _open_kind(node: ast.Call, aliases, open_aliases) -> str:
     * `"module"`  —— `io` / `codecs` / `builtins` の `open(path, mode)`
     * `"ambiguous"` —— レシーバの型が分からない。`Path.open(mode)` かも
       しれないし、追えなかったモジュールの `open(path, mode)` かもしれない
+
+    裸の名前は **import の実体を先に解決する** (Codex 12 巡目 指摘 6)。
+    `from os import open` を組み込みの `open` と読むと、第 2 引数の
+    `O_WRONLY` が「モード文字列ではない」として書き込み判定から落ち、
+    正当な書き込みが読み取りとして報告されていた。逆に `from os import
+    fdopen` を `os.open` と同じ整数フラグ扱いにすると、`fdopen(fd, "w")`
+    が読み切れないフラグとして誤検出される。**整数フラグを取るのは
+    `os.open` だけ**で、`os.fdopen` はモード文字列を取る。
     """
     func = node.func
     if isinstance(func, ast.Name):
-        if func.id == "open":
+        origin = open_aliases.get(func.id)
+        if origin is not None:
+            module, orig_name = origin
+            if module == "os" and orig_name == "open":
+                return "os"
             return "builtin"
-        module = open_aliases.get(func.id)
-        if module == "os":
-            return "os"
-        if module is not None:
+        if func.id == "open":
             return "builtin"
         return "ambiguous"
     if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
@@ -720,7 +783,14 @@ def _scan_subprocess(source: str, filename: str = "<synthetic>"):
             if (module, func.attr) not in _SUBPROCESS_FUNCS:
                 continue
         elif isinstance(func, ast.Name) and func.id in bare:
-            if (bare[func.id], func.id) not in _SUBPROCESS_FUNCS:
+            # `bare` は `(モジュール, import 元の関数名)` を持つが、ここで
+            # 見るのは **呼ばれている名前** のほうである。import 元の名前で
+            # 照合すると `from subprocess import check_output as capture`
+            # まで拾えるようになるが、別名 import の追跡は今回の範囲外
+            # (Director 判断で backlog)。振る舞いを変えないため、
+            # モジュールだけ取り出して従来どおり `func.id` と対で見る。
+            module, _orig_name = bare[func.id]
+            if (module, func.id) not in _SUBPROCESS_FUNCS:
                 continue
         else:
             continue
@@ -936,6 +1006,29 @@ _DETECTOR_READ_CASES = [
      "import os\nos.fdopen(fd, newline=None)\n"),
     ("os-fdopen-write", None,
      'import os\nos.fdopen(fd, "w", encoding="utf-8")\n'),
+
+    # --- Codex 12 巡目 指摘 6: import した関数の実体を解決する ----------
+    # `from os import ...` で入ってきた名前は、モジュール名だけでは
+    # モード引数の読み方が決まらない。`os.open()` は **整数フラグ**、
+    # `os.fdopen()` は **モード文字列** を第 2 引数に取る。実体を見ずに
+    # 「os から来た」で括ると、正当な書き込みが読み取りとして報告される。
+    #
+    # **誤検出は allowlist を「書き込みの置き場」に変えてしまう** ——
+    # 検出器が邪魔になると、人は理由を書かずに黙らせる方向へ流れ、
+    # そこに本物の読み取りが紛れても気付けなくなる。
+    ("from-import-os-fdopen-write", None,
+     'from os import fdopen\nfdopen(fd, "w")\n'),
+    ("from-import-os-open-write-only", None,
+     "from os import open, O_WRONLY\nopen(path, O_WRONLY)\n"),
+
+    # 実体を解決したあとも、**読み取りは読み取りとして残る**こと。
+    # 上の 2 件を黙らせるだけの直し方をすると、`from os import open` 経由の
+    # 読み取りがまとめて視界から消える —— 誤検出を消す修正が、本物の
+    # 見落としを作らないことを対で固定する。
+    ("from-import-os-fdopen-read", "fdopen(fd)",
+     "from os import fdopen\nfdopen(fd)\n"),
+    ("from-import-os-open-rdonly", "open(path, O_RDONLY)",
+     "from os import open, O_RDONLY\nopen(path, O_RDONLY)\n"),
 ]
 
 

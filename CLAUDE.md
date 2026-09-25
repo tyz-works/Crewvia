@@ -32,6 +32,32 @@
 
 ---
 
+## herdr-task-graph 連携（任意）
+
+- plugin: `tyz-works/herdr-task-graph`（herdr 上にタスク依存の DAG・実行中・並列実行可能を描く）
+- crewvia 側は `plan.sh` が queue を書き換えるたびに `registry/task-graph/tasks.json` を再生成する
+  だけ。**plugin が無くても・herdr でなくても・tmux モードでも何も起きず、エラーも出ない**
+  （生成は herdr に触れない）。停止スイッチ: `CREWVIA_TASK_GRAPH=0`（1 バイトも書かない）
+- **導入は crewvia の生成物を plugin の config dir に symlink する方式**。`HERDR_TASKS_FILE` は
+  使わない — plugin ペインは呼び出しシェルではなく **herdr server の env を継承する**ので
+  シェルの export は届かない（herdr 0.9.0 で実測）。手順は README「Task graph view」
+- **`./crewvia` は plugin を自動起動しない**（必要なときに `herdr plugin action invoke
+  open-task-graph --plugin io.github.tyz-works.task-graph`）。任意の付加機能に herdr 依存を
+  持ち込まないため。invoke のたびに新しいタブが開く
+- 制約: plugin は **`r` キーでしか再読み込みしない**（crewvia が書き換えても自動反映されない。
+  実測済み）。ファイルが見つからないと plugin は**エラーを出さず同梱のサンプルを表示する**
+  （画面タイトルが `crewvia / <slug>`（active mission が 1 件のとき）か `crewvia / N missions`
+  （0 件・2 件以上のとき）でなければ crewvia のファイルを読めていない）。
+  **herdr 0.9.0 では、エージェントが 1 つでも居ると plugin は `[offline]`（`Broken pipe`）になり、
+  live なエージェント状態は来ない**（plugin が同一接続で snapshot の後に subscribe を送るのが原因。
+  upstream `tyz-works/herdr-task-graph` 側の修正が要り、crewvia では直せない）。得られるのは
+  crewvia が生成した依存関係と status の可視化のみ。**Worker とタスクのペイン紐付け
+  （`pane_match`）も当たらない**（`pane_id` で書けば当たることは隔離環境で確認済みだが、生成器は
+  まだ書かない）
+- 運用メモ・切り分け・実測: `knowledge/task-graph.md`
+
+---
+
 ## ディレクトリ構成
 
 ```
@@ -214,7 +240,7 @@
 | `CREWVIA_DAEMON_FLAP_WINDOW_SECONDS` / `CREWVIA_DAEMON_FLAP_THRESHOLD` | flap ガード: この秒数の窓（既定 900）でこの回数（既定 3）respawn したら自動 respawn を止め Director に報告する。`config/crewvia.yaml` の `daemons.flap_window_seconds` / `daemons.flap_threshold` より優先 |
 | `CREWVIA_DAEMON_RESPAWN_GRACE_SECONDS` / `CREWVIA_DAEMON_PAUSE_REPORT_AFTER_SECONDS` / `CREWVIA_DAEMON_HOLD_REPORT_AFTER_SECONDS` / `CREWVIA_DAEMON_WATCH_LOCK_TIMEOUT_SECONDS` / `CREWVIA_DAEMON_MAINTENANCE_LOCK_TIMEOUT_SECONDS` | 相互監視の残りのしきい値（既定 120 / 1800 / 1800 / 2 / 60 秒）。`config/crewvia.yaml` の `daemons:` ブロック（コメント付き）より優先。詳細: `knowledge/daemon-authority.md` §7-8 |
 | `CREWVIA_TASK_GRAPH` | herdr-task-graph 用 `tasks.json` の生成 ON/OFF。既定は有効、`0` で完全に無効（1 バイトも書かず、ログも出さない）。生成は queue を書き換える plan.sh サブコマンドすべてに乗るので、重い・壊れたときの退避路として残してある |
-| `CREWVIA_TASK_GRAPH_FILE` | 生成物の書き先。既定は `$CREWVIA_REPO_ROOT/registry/task-graph/tasks.json`（未設定時のみ plan.sh の位置基準にフォールバック）。plugin 側にはこのパスを `HERDR_TASKS_FILE` で参照させる |
+| `CREWVIA_TASK_GRAPH_FILE` | 生成物の書き先。既定は `$CREWVIA_REPO_ROOT/registry/task-graph/tasks.json`（未設定時のみ plan.sh の位置基準にフォールバック）。plugin にはこのパスを **plugin の config dir への symlink** で参照させる（`HERDR_TASKS_FILE` は稼働中の herdr のペインに届かないので使わない。`knowledge/task-graph.md`） |
 | `CREWVIA_MUX` | mux バックエンド選択: `tmux` / `herdr`。config `mode:` より優先 |
 | `CREWVIA_MUX_ENABLED` | 並列モード有効化: `1` で並列 ON（`CREWVIA_MUX` 未設定時の tmux fallback）/ `0` でインラインモード強制。`CREWVIA_MUX` が設定済みなら不要 |
 | `CREWVIA_TMUX_SESSION` | tmux backend が使うセッション名（デフォルト: `crewvia`） |

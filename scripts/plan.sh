@@ -907,7 +907,8 @@ def task_graph_path():
     """生成物のパス。`CREWVIA_TASK_GRAPH_FILE` で上書きできる。
 
     既定は `<root>/registry/task-graph/tasks.json` — crewvia 側を正とし、plugin
-    には `HERDR_TASKS_FILE` でここを参照させる。plugin の config dir に直接書く
+    の config dir からここへ symlink させる (`HERDR_TASKS_FILE` は稼働中の
+    herdr のペインに届かない: knowledge/task-graph.md)。plugin の config dir に直接書く
     案は採らない: 書き先が plugin の内部レイアウトに依存し、plugin が無い環境や
     別バージョンで壊れる。crewvia の中に置けば、plugin が無くても
     `plan.sh task-graph` の出力として意味を持つ。

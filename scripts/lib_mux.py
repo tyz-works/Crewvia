@@ -46,7 +46,9 @@ CLI usage (for bash callers):
 """
 
 import calendar
+import contextlib
 import errno
+import fcntl
 import json
 import os
 import re
@@ -55,6 +57,7 @@ import socket
 import struct
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import List, Optional
@@ -1406,6 +1409,89 @@ def _record_storage_is_shared(repo_root=None) -> bool:
         return True
 
 
+#: The lock every writer of a record — and the sweep's compare-and-drop —
+#: takes.  A dot-file, so the `<name>.json` scan of the sweep never sees it;
+#: it lives *in* the record directory, so two checkouts sharing `registry/mux`
+#: through a symlink share the lock as well.
+_PANE_RECORD_LOCK_NAME = ".records.lock"
+
+#: How long a writer waits for the record lock.  What it is held for is a
+#: local file read plus one write/unlink — never a mux call (see
+#: `_pane_record_lock()`) — so waiting this long means something is wrong.
+PANE_RECORD_LOCK_TIMEOUT_SECONDS = 5.0
+
+_record_lock_held = threading.local()
+
+
+@contextlib.contextmanager
+def _pane_record_lock(repo_root=None, *, create: bool = False,
+                      timeout: Optional[float] = None):
+    """Serialise changes to `registry/mux/*.json`; yields whether it was taken.
+
+    Why it exists (Kai P1, PR #215): the sweep judged a record, re-read it to
+    be sure it was still the one it judged, and *then* unlinked it — three
+    steps a `spawn()` could land in the middle of, deleting the record of the
+    pane it had just made.  The record is the only authorisation
+    `may_destroy_pane()` has, so a sweep that can erase a live pane's record
+    is the very failure the record exists to prevent.  The comparison and the
+    unlink now happen in one stretch that `write_pane_record()` cannot
+    interleave with, because it takes the same lock.
+
+    **Nothing inside may call the mux or a subprocess.**  A writer waits on
+    this lock while it is held; ask the mux *before* taking it.
+
+    Re-entrant within a thread (`write_pane_record()` drops the previous
+    record while it holds the lock).  Not being able to take it is reported as
+    `False`, never raised: every caller has a safe direction to fall back to —
+    the sweep keeps the record, a writer reports "could not record".
+    `create` makes the directory (writers); without it a missing directory
+    means there is no record to race with, and the lock is not needed.
+    """
+    path = pane_record_dir(repo_root) / _PANE_RECORD_LOCK_NAME
+    held = getattr(_record_lock_held, "paths", None)
+    if held is None:
+        held = _record_lock_held.paths = set()
+    key = str(path)
+    if key in held:
+        yield True
+        return
+    try:
+        if create:
+            path.parent.mkdir(parents=True, exist_ok=True)
+        fh = open(path, "a+")
+    except FileNotFoundError:
+        yield True     # no directory: no record exists for anyone to rewrite
+        return
+    except OSError as exc:
+        print(f"[mux] WARNING: cannot open the record lock {path}: {exc}",
+              file=sys.stderr)
+        yield False
+        return
+    try:
+        deadline = time.monotonic() + (PANE_RECORD_LOCK_TIMEOUT_SECONDS
+                                       if timeout is None else timeout)
+        while True:
+            try:
+                fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    print(f"[mux] WARNING: the record lock {path} is still "
+                          f"held by another process; leaving the pane "
+                          f"records as they are", file=sys.stderr)
+                    yield False
+                    return
+                time.sleep(0.01)
+        held.add(key)
+        try:
+            yield True
+        finally:
+            held.discard(key)
+            fcntl.flock(fh, fcntl.LOCK_UN)
+    finally:
+        fh.close()
+
+
 def write_pane_record(name: str, backend: str, handle: str, *,
                       pane_id: str = "", server=None, repo_root=None) -> bool:
     """Note that *this* checkout created `name`'s pane, as `handle`.
@@ -1456,9 +1542,18 @@ def write_pane_record(name: str, backend: str, handle: str, *,
         "server": {"endpoint": endpoint, "generation": generation},
     }
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(record, indent=2), encoding="utf-8")
-        return True
+        # The lock covers the write so the sweep's compare-and-drop cannot
+        # land between "judged the old record" and "unlinked": either it sees
+        # this record (and keeps it), or it has already finished.
+        with _pane_record_lock(repo_root, create=True) as locked:
+            if not locked:
+                print(f"[mux] WARNING: could not record the spawn of "
+                      f"{name!r}: the record lock could not be taken",
+                      file=sys.stderr)
+                return False
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(record, indent=2), encoding="utf-8")
+            return True
     except Exception as exc:
         print(f"[mux] WARNING: could not record the spawn of {name!r} at "
               f"{path}: {exc}", file=sys.stderr)
@@ -1479,14 +1574,35 @@ def read_pane_record(name: str, *, repo_root=None) -> Optional[dict]:
     return data if isinstance(data, dict) else None
 
 
-def drop_pane_record(name: str, *, repo_root=None) -> None:
+def drop_pane_record(name: str, *, repo_root=None,
+                     expect: Optional[dict] = None) -> bool:
+    """Delete `name`'s record; True when it is gone by this call (or already).
+
+    **The only place a record file is unlinked** — `kill()`, the resolution
+    paths and the sweep all come here.
+
+    `expect` makes it conditional: the record is dropped only if the file on
+    disk *still equals* `expect`, judged inside the same lock a writer takes.
+    That is what lets the sweep decide on one record and end that record, not
+    whatever `spawn()` wrote since.  A record that is different, already gone,
+    or unreadable under a condition is kept and False comes back.
+    """
+    path = pane_record_path(name, repo_root=repo_root)
     try:
-        pane_record_path(name, repo_root=repo_root).unlink()
+        with _pane_record_lock(repo_root) as locked:
+            if not locked:
+                return False       # could not exclude a writer: keep it
+            if expect is not None and \
+                    read_pane_record(name, repo_root=repo_root) != expect:
+                return False
+            path.unlink()
+            return True
     except FileNotFoundError:
-        pass
+        return expect is None
     except Exception as exc:
         print(f"[mux] WARNING: could not drop the spawn record for {name!r}: "
               f"{exc}", file=sys.stderr)
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -1609,11 +1725,12 @@ def reap_stale_pane_records(backend: "_Backend", *, repo_root=None,
         if backend.record_existence(name, record) != PANE_GONE:
             continue
         # Judge and unlink the same record: a spawn that rewrote it while the
-        # mux was being asked has made a record about a different pane.
-        if read_pane_record(name, repo_root=repo_root) != record:
-            continue
-        drop_pane_record(name, repo_root=repo_root)
-        dropped.append(name)
+        # mux was being asked — or after, before the unlink — has made a
+        # record about a different pane.  The comparison and the unlink are
+        # one step under the writers' lock (`drop_pane_record(expect=)`), so
+        # no rewrite can land between them (Kai P1, PR #215).
+        if drop_pane_record(name, repo_root=repo_root, expect=record):
+            dropped.append(name)
     return dropped
 
 
@@ -2967,10 +3084,17 @@ class HerdrBackend(_Backend):
         is what let a herdr outage drop the record that proves this checkout
         made the pane.  Only `pane_not_found` is a definite absence.
 
-        A pane that exists but carries a different, non-empty label is gone as
-        far as the record is concerned: after a server restart an id can be
-        handed to another tab, and the record names ours.  An empty label is
-        not a mismatch — a tab is created before it is renamed.
+        A pane that exists but carries a different, non-empty label is
+        `PANE_UNOBSERVED`, **not** gone (QA F1, PR #215).  The id resolved, so
+        nothing says the pane is absent; what we cannot do is *identify* it as
+        the one the record names — someone may simply have renamed it
+        (`herdr pane rename`).  Calling that "gone" made the sweep drop the
+        record of a live pane, after which neither the record nor the name
+        could reach it: an orphan `kill()` could not close.  "An id that now
+        belongs to somebody else" is a server restart, and the sweep already
+        requires the record's server generation to match the live one, so the
+        label was never the check that mattered there.  An empty label is not
+        a mismatch either — a tab is created before it is renamed.
         """
         if not pane_id:
             return PANE_UNOBSERVED
@@ -2982,7 +3106,7 @@ class HerdrBackend(_Backend):
                 if isinstance(data.get("result"), dict) else None
             label = pane.get("label") if isinstance(pane, dict) else None
             if isinstance(label, str) and label and label != expected_label:
-                return PANE_GONE
+                return PANE_UNOBSERVED
             return PANE_EXISTS
         err = data.get("error")
         if isinstance(err, dict) and err.get("code") == "pane_not_found":

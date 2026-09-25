@@ -137,12 +137,31 @@ def test_record_of_a_live_pane_is_kept(checkout, herdr):
     assert _exists(checkout, "Ren-worker")
 
 
-def test_id_now_held_by_another_label_counts_as_gone(checkout, herdr):
-    """server 再起動で id が別のタブに振り直されると、記録が指す pane は「無い」。"""
+def test_a_live_pane_under_another_label_keeps_its_record(checkout, herdr):
+    """label が違っても、id が引けるなら pane は「無い」ではない (QA F1, PR #215)。
+
+    `herdr pane rename` された生存 pane は「観測できたが同定できない」。
+    ここを GONE と読むと、記録が消えて kill が `pane not found` で永久に届かず、
+    pane が孤児として残る。id の付け替わり (server 再起動) は sweep が server の
+    generation 一致を先に要求するので、label 判定は元々そこを担っていない。
+    """
     _write(checkout, "Ren-worker", pane_id="pA")
     herdr({"pA": _pane(_label("Someone-else"))})
+    assert HerdrBackend()._pane_existence("pA", _label("Ren-worker")) \
+        == PANE_UNOBSERVED
     assert lib_mux.reap_stale_pane_records(HerdrBackend(), repo_root=checkout,
-                                           now=FUTURE) == ["Ren-worker"]
+                                           now=FUTURE) == []
+    assert _exists(checkout, "Ren-worker")
+
+
+def test_a_renamed_live_pane_is_not_orphaned_by_resolution(checkout, herdr):
+    """解決経路 (`_resolve_pane_id`) も、label 不一致で記録を消さない。"""
+    _write(checkout, "Ren-worker", pane_id="pA")
+    herdr({"pA": _pane(_label("Someone-else"))})
+    b = HerdrBackend()
+    b._workspace_id = lambda: None      # label 引きは不可 → 記録の扱いだけを見る
+    assert b._resolve_pane_id("Ren-worker") is None
+    assert _exists(checkout, "Ren-worker")
 
 
 @pytest.mark.parametrize("answer", [
@@ -177,7 +196,7 @@ def test_existence_is_read_in_exactly_one_place():
     assert ask(SERVER_DOWN) == PANE_UNOBSERVED
     assert ask(None) == PANE_UNOBSERVED
     assert ask(_pane("L")) == PANE_EXISTS
-    assert ask(_pane("other")) == PANE_GONE
+    assert ask(_pane("other")) == PANE_UNOBSERVED   # 存在する = 「無い」ではない (F1)
     assert b._pane_existence("", "L") == PANE_UNOBSERVED   # 空 id は「無い」の証拠ではない
 
 
@@ -299,6 +318,95 @@ def test_a_record_rewritten_while_the_mux_was_asked_is_not_dropped(checkout, her
     assert lib_mux.read_pane_record("Ren-worker", repo_root=checkout)["pane_id"] == "pB"
 
 
+def test_a_record_rewritten_after_the_final_comparison_survives(checkout, herdr,
+                                                                monkeypatch):
+    """最終比較と unlink の**あいだ**に spawn が書き直しても、その記録は消えない。
+
+    Kai P1 (PR #215): 比較 (`read_pane_record`) と削除 (`unlink`) が書き手とロックを
+    共有していないと、比較の後で書かれた新しい記録を掃除が消す。記録は kill の唯一の
+    認可なので、生きた pane の認可を掃除自身が壊すことになる。
+
+    数マイクロ秒の窓なので実時間では再現しない。**比較が終わった直後**に、別スレッドで
+    spawn (`write_pane_record`) を走らせて窓を作る。ロックがあれば書き手は掃除が終わる
+    まで待たされ、あとで書く (記録が残る)。無ければ書き手はすぐ書き、掃除がそれを消す。
+    """
+    _write(checkout, "Ren-worker", pane_id="pA")
+    herdr({"pA": NOT_FOUND})
+    real_read = lib_mux.read_pane_record
+    reads = []
+    threads = []
+    results = []
+
+    def read_then_let_spawn_in(name, **kw):
+        result = real_read(name, **kw)
+        reads.append(name)
+        if len(reads) == 2:     # 1 回目 = 掃除の判定用の読み / 2 回目 = 最終比較
+            import threading
+            t = threading.Thread(target=lambda: results.append(
+                lib_mux.write_pane_record("Ren-worker", "herdr", "t2",
+                                          pane_id="pB", server=SERVER,
+                                          repo_root=checkout)))
+            threads.append(t)
+            t.start()
+            t.join(timeout=0.3)   # 書き手にすぐ書けるだけの時間を与える
+        return result
+    monkeypatch.setattr(lib_mux, "read_pane_record", read_then_let_spawn_in)
+
+    lib_mux.reap_stale_pane_records(HerdrBackend(), repo_root=checkout, now=FUTURE)
+    threads[0].join(timeout=10)
+    assert results == [True], "書き手が記録を書けなかった"
+    assert _exists(checkout, "Ren-worker"), \
+        "掃除が、比較の後に書かれた spawn の記録を消した (記録は kill の唯一の認可)"
+    assert real_read("Ren-worker", repo_root=checkout)["pane_id"] == "pB"
+
+
+def _hold_record_lock(root):
+    import fcntl
+    fh = open(lib_mux.pane_record_dir(root) / lib_mux._PANE_RECORD_LOCK_NAME, "a+")
+    fcntl.flock(fh, fcntl.LOCK_EX)
+    return fh
+
+
+def test_the_sweep_keeps_the_record_when_a_writer_holds_the_lock(checkout, herdr,
+                                                                 monkeypatch):
+    """ロックを取れない掃除は消さない (取れない = 書き手を排除できない)。"""
+    monkeypatch.setattr(lib_mux, "PANE_RECORD_LOCK_TIMEOUT_SECONDS", 0.1)
+    _write(checkout, "Ren-worker", pane_id="pA")
+    herdr({"pA": NOT_FOUND})
+    fh = _hold_record_lock(checkout)
+    try:
+        assert lib_mux.reap_stale_pane_records(HerdrBackend(), repo_root=checkout,
+                                               now=FUTURE) == []
+        assert _exists(checkout, "Ren-worker")
+    finally:
+        fh.close()
+    assert lib_mux.reap_stale_pane_records(HerdrBackend(), repo_root=checkout,
+                                           now=FUTURE) == ["Ren-worker"]
+
+
+def test_a_writer_waits_for_the_lock_and_reports_when_it_cannot_get_it(
+        checkout, monkeypatch):
+    """spawn の書き込みも同じロックに並ぶ。取れなければ「記録できなかった」と返す。"""
+    monkeypatch.setattr(lib_mux, "PANE_RECORD_LOCK_TIMEOUT_SECONDS", 0.1)
+    _write(checkout, "Ren-worker", pane_id="pA")
+    fh = _hold_record_lock(checkout)
+    try:
+        assert lib_mux.write_pane_record("Ren-worker", "herdr", "t2", pane_id="pB",
+                                         server=SERVER, repo_root=checkout) is False
+    finally:
+        fh.close()
+    assert lib_mux.read_pane_record("Ren-worker", repo_root=checkout)["pane_id"] == "pA"
+
+
+def test_the_record_lock_is_not_a_record(checkout, herdr):
+    """`.records.lock` は `<name>.json` の走査に入らない。"""
+    _write(checkout, "Ren-worker", pane_id="pA")
+    assert (lib_mux.pane_record_dir(checkout) / lib_mux._PANE_RECORD_LOCK_NAME).exists()
+    herdr({"pA": _pane(_label("Ren-worker"))})
+    assert lib_mux.reap_stale_pane_records(HerdrBackend(), repo_root=checkout,
+                                           now=FUTURE) == []
+
+
 def test_the_stop_switch_touches_nothing(checkout, herdr, monkeypatch):
     _write(checkout, "Ren-worker", pane_id="pA")
     fake = herdr({"pA": NOT_FOUND})
@@ -405,33 +513,192 @@ def test_watchdog_side_never_sweeps(daemon):
     assert "reap_stale" not in text and "reap-records" not in text
 
 
-def test_a_record_file_is_deleted_by_one_function_only():
-    """記録を unlink できるのは `drop_pane_record` だけ (掃除も kill もそこを通る)。"""
-    offenders = []
-    for fn_name, fn in FUNCS.items():
-        for n in ast.walk(fn):
-            if (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
-                    and n.func.attr in ("unlink", "remove", "rmdir")):
-                if fn_name != "drop_pane_record":
-                    offenders.append(f"{fn_name}:{n.lineno}")
-    assert not offenders, f"記録の削除が drop_pane_record 以外にある: {offenders}"
+# ---------------------------------------------------------------------------
+# 「記録を消せる者」は 1 人だけ (構造テスト)
+#
+# QA (t002) が欠陥を注入して測ったところ、旧版のこのテストは lib_mux.py 内の
+# リテラル `"pane_get"` と unlink/remove/rmdir にしか効かず、`dispatcher.sh` の
+# 埋め込み python に足した `os.unlink(registry/mux/*-worker.json)` (I5) や
+# `shutil.move` での削除 (I4) は緑のままだった。ここでは対象を「記録に触れうる
+# 全ファイル (埋め込み python を含む)」に広げ、削除系の呼び出しを allowlist 方式で
+# 全部拾う: **表に無い削除が 1 つでも増えたら落ちる。**
+#
+# 塞げないもの (AST の限界。allowlist の理由欄にも残す):
+#   * 変数・連結を経由した名前 — `op = "pane" + "_get"`、`getattr(os, "unl" + "ink")`
+#   * `subprocess.run(["rm", ...])` / `os.system(...)` のような外部コマンド
+#   * `open(path, "w")` での上書き (削除ではなく置換)
+# これらは静的には見つけられない。レビューで見るか、red proof で実害を測る。
+# ---------------------------------------------------------------------------
+
+#: どのファイルの、どの関数の、どの呼び出しなら記録の隣で削除してよいか。
+#: キーは (ファイル, 関数, 呼び出しのソース)。理由が書けない項目は足さないこと。
+ALLOWED_DELETIONS = {
+    ("lib_mux.py", "drop_pane_record", "path.unlink()"):
+        "**記録 (registry/mux/<name>.json) を消す唯一の場所**。kill・解決経路・掃除が"
+        "ここを通り、書き手と同じロックの内側で消す",
+    ("dispatcher.sh", "tmux_kill_window", "firstseen.unlink(missing_ok=True)"):
+        "`<name>.firstseen` (dispatcher 自身の spawn 猶予マーカー)。`<name>.json` ではない",
+    ("dispatcher.sh", "sweep_spawn_grace_markers", "marker.unlink(missing_ok=True)"):
+        "同上の `.firstseen` マーカーの掃除。glob は `*.firstseen` に限られる",
+    ("dispatcher.sh", "set_all_done_state", "ALL_DONE_STATE_FILE.unlink()"):
+        "all-done 通知の状態ファイル。registry/mux の外",
+    ("lib_retirement.py", "write_json_atomic", "tmp.unlink(missing_ok=True)"):
+        "temp + os.replace の失敗時に自分の temp を片付ける",
+    ("lib_retirement.py", "write_json_atomic", "os.replace(tmp, path)"):
+        "retirement の request/progress を書くときの atomic 置換 (registry/retirements/)",
+    ("lib_retirement.py", "unlink_quiet", "Path(path).unlink(missing_ok=True)"):
+        "retirement marker を消す helper。呼び出し側は下の表で個別に見る",
+    ("lib_daemon_watch.py", "_remove_marker", "path.unlink()"):
+        "daemons/ の pause・maintenance マーカー。registry/mux の外",
+    ("lib_daemon_watch.py", "resume", "_remove_marker(path)"):
+        "pause マーカー (daemons/) を解く。registry/mux の外",
+    ("lib_daemon_watch.py", "_write_reports", "unlink_quiet(path)"):
+        "相互監視の自己申告 ledger (`reports_path`, daemons/)。registry/mux の外",
+    ("lib_retirement.py", "_check_stall", "unlink_quiet(stall_path(self.registry_dir, agent))"):
+        "retirement の stall マーカー (registry/retirements/)",
+    ("lib_retirement.py", "_settle_discarded", "unlink_quiet(request_path(self.registry_dir, agent))"):
+        "retirement の request (registry/retirements/)",
+    ("lib_retirement.py", "_settle_discarded", "unlink_quiet(progress_path(self.registry_dir, agent))"):
+        "retirement の progress (registry/retirements/)",
+    ("lib_retirement.py", "_settle_discarded", "unlink_quiet(stall_path(self.registry_dir, agent))"):
+        "retirement の stall マーカー (registry/retirements/)",
+    ("lib_retirement.py", "_settle_terminated", "unlink_quiet(request_path(self.registry_dir, agent))"):
+        "retirement の request (registry/retirements/)",
+    ("lib_retirement.py", "_settle_terminated", "unlink_quiet(progress_path(self.registry_dir, agent))"):
+        "retirement の progress (registry/retirements/)",
+    ("lib_retirement.py", "_settle_terminated", "unlink_quiet(stall_path(self.registry_dir, agent))"):
+        "retirement の stall マーカー (registry/retirements/)",
+    ("lib_retirement.py", "write_json_exclusive", "unlink_quiet(tmp)"):
+        "排他書き込みの失敗時に自分の temp を片付ける",
+}
+
+#: 「ファイルを消す」意味の helper。中身は上の表で見るが、呼び出し側も数える。
+_DELETE_HELPERS = {"unlink_quiet", "_remove_marker"}
+
+DELETE_SCAN_FILES = ["lib_mux.py", "dispatcher.sh", "watchdog.py",
+                     "lib_retirement.py", "lib_daemon_watch.py"]
+
+_STRICT_DELETE_ATTRS = {"unlink", "rmdir", "rmtree", "removedirs"}
+_MODULE_ONLY_DELETE_ATTRS = {"remove", "rename", "replace", "move"}
+
+
+def _python_blocks(name):
+    """`.py` はそのまま、`.sh` は埋め込まれた python (`<<'PYEOF'`) を全部返す。"""
+    import re
+    text = (SCRIPTS / name).read_text(encoding="utf-8")
+    if name.endswith(".py"):
+        return [text]
+    blocks = re.findall(r"<<'PYEOF'\n(.*?)\nPYEOF", text, re.DOTALL)
+    assert blocks, f"{name}: 埋め込み python が見つからない (抽出の前提が変わった)"
+    return blocks
+
+
+def _is_deletion(call):
+    """ファイルを消す / 動かして「そこから無くする」呼び出しか。
+
+    `str.replace(a, b)` と `list.remove(x)` は名前が同じなので、モジュール
+    (`os` / `shutil`) 経由か、`Path.replace(target)` のように引数が 1 つのものだけを
+    削除と見なす (`str.replace` は必ず 2 引数以上)。
+    """
+    if isinstance(call.func, ast.Name):
+        return call.func.id in _DELETE_HELPERS
+    if not isinstance(call.func, ast.Attribute):
+        return False
+    attr, recv = call.func.attr, call.func.value
+    if attr in _STRICT_DELETE_ATTRS:
+        return True
+    if attr in _MODULE_ONLY_DELETE_ATTRS and isinstance(recv, ast.Name) \
+            and recv.id in ("os", "shutil"):
+        return True
+    return attr in ("replace", "rename") and len(call.args) == 1 and not call.keywords
+
+
+def _deletions_in(name):
+    """`[(関数, 呼び出しのソース)]` — 関数の外 (module 直下) も `<module>` として拾う。"""
+    found = []
+    for code in _python_blocks(name):
+        tree = ast.parse(code)
+        owner = {}
+        for fn in ast.walk(tree):
+            if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                for n in ast.walk(fn):
+                    owner[id(n)] = fn.name     # 内側の関数が後に上書きする
+        for n in ast.walk(tree):
+            if isinstance(n, ast.Call) and _is_deletion(n):
+                found.append((owner.get(id(n), "<module>"), ast.unparse(n)))
+    return found
+
+
+def test_deletions_next_to_the_records_are_all_accounted_for():
+    """ファイルを消す呼び出しは、理由付きの表に載っているものだけ。
+
+    載っていない削除が 1 つでも現れたら落ちる — lib_mux.py に限らず、
+    dispatcher.sh / watchdog.py の埋め込み python にも
+    `os.unlink(registry/mux/*-worker.json)` を足せない (QA F2 の I5)。
+    """
+    seen = {}
+    for name in DELETE_SCAN_FILES:
+        for fn, call in _deletions_in(name):
+            seen.setdefault((name, fn, call), 0)
+            seen[(name, fn, call)] += 1
+    unexplained = sorted(set(seen) - set(ALLOWED_DELETIONS))
+    assert not unexplained, (
+        "理由の書かれていない削除呼び出しがある。registry/mux/<name>.json は "
+        "`drop_pane_record` (書き手と同じロック) 以外で消してはいけない。"
+        f"消す対象が記録でないなら ALLOWED_DELETIONS に理由を書いて足すこと: {unexplained}")
+    stale = sorted(set(ALLOWED_DELETIONS) - set(seen))
+    assert not stale, f"表にあるが、もう存在しない項目 (表を直すこと): {stale}"
+
+
+def test_the_record_is_unlinked_by_exactly_one_call():
+    """lib_mux.py の削除は `drop_pane_record` の 1 か所だけ (`shutil.move` 等も含めて)。"""
+    in_lib_mux = [(fn, c) for fn, c in _deletions_in("lib_mux.py")]
+    assert in_lib_mux == [("drop_pane_record", "path.unlink()")], in_lib_mux
+
+
+def test_the_deletion_detector_sees_what_it_claims_to(tmp_path, monkeypatch):
+    """検出器自身の自己診断: I3 / I4 / I5 型の削除を実際に拾えること。"""
+    samples = {
+        "os.unlink(rec)": True,                     # I5
+        "os.remove(rec)": True,
+        "os.rename(rec, other)": True,
+        "os.replace(rec, other)": True,
+        "shutil.move(rec, other)": True,            # I4
+        "shutil.rmtree(d)": True,
+        "rec.unlink(missing_ok=True)": True,        # I3
+        "rec.rename(other)": True,
+        "rec.replace(other)": True,                 # Path.replace は 1 引数
+        "unlink_quiet(rec)": True,
+        "text.replace('a', 'b')": False,            # str.replace は 2 引数
+        "items.remove(x)": False,                   # list.remove
+        "os.path.join(a, b)": False,
+    }
+    for src, expected in samples.items():
+        call = ast.parse(src).body[0].value
+        assert _is_deletion(call) is expected, src
 
 
 def test_pane_get_answers_are_read_in_one_place():
     """`pane get` の答えを「消えた」と読んでよいのは `_pane_existence` だけ。
 
     `state()` は agent_status を読むだけで、消えたかどうかは判定しない。
+
+    見るのは呼び出しの形ではなく **文字列定数 `"pane_get"` の出現そのもの** (代入・
+    引数・辞書のどこでも)。ただし、`"pane" + "_get"` のような連結や外部から渡された
+    名前は静的に見えない — そこは塞げない (上のコメント参照)。
     """
     readers = set()
     for fn_name, fn in FUNCS.items():
         for n in ast.walk(fn):
-            if (isinstance(n, ast.Call) and getattr(n.func, "id", "") == "_herdr_run"
-                    and n.args and isinstance(n.args[0], ast.Constant)
-                    and n.args[0].value == "pane_get"):
+            if isinstance(n, ast.Constant) and n.value == "pane_get":
                 readers.add(fn_name)
     assert "_pane_existence" in readers
     assert readers <= {"_pane_existence", "state"}, \
         f"pane get を独自に読む関数が増えた: {sorted(readers)}"
+    for name in DELETE_SCAN_FILES[1:]:      # lib_mux 以外の記録に触れうるコード
+        for code in _python_blocks(name):
+            assert "pane_get" not in code, \
+                f"{name} が `pane get` を直に読んでいる — 「消えた」の判定は 1 か所に"
 
 
 # ---------------------------------------------------------------------------

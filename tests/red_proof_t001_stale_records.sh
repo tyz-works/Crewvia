@@ -85,13 +85,23 @@ run_case() {
 
     cp "$WORK/$target.orig" "$WORK/$target"
     find "$WORK" -name '*.pyc' -delete 2>/dev/null
+    [ -n "${BEFORE_FIXED:-}" ] && eval "$BEFORE_FIXED"
     if [ "$kind" = pytest ]; then run_pytest "$selector" > "$WORK/green.out" 2>&1
     else run_bats > "$WORK/green.out" 2>&1; fi
     rc2=$?
     echo "  [修正あり] rc=$rc2"
     tail -n 2 "$WORK/green.out" | sed 's/^/    /'
 
-    if [ "$rc" -ne 0 ] && [ "$rc2" -eq 0 ]; then
+    if [ "${EXPECT:-red}" = green ]; then
+        # 「塞げない」と明記した範囲: 欠陥を入れても赤にならないことを、そのまま記録する。
+        if [ "$rc" -eq 0 ] && [ "$rc2" -eq 0 ]; then
+            echo "  => 既知の限界: この型は検出できない (緑のまま)。テストの docstring と表の理由欄に明記済み"
+            PASS=$((PASS + 1))
+        else
+            echo "  => 想定外: 限界のはずが赤になった — 限界の記述を更新すること (rc=$rc / rc=$rc2)"
+            FAIL=$((FAIL + 1))
+        fi
+    elif [ "$rc" -ne 0 ] && [ "$rc2" -eq 0 ]; then
         echo "  => OK: 欠陥を戻すと赤、直すと緑"
         PASS=$((PASS + 1))
     else
@@ -158,14 +168,15 @@ run_case "欠陥 4: 別の server / 世代に対する記録も、いまの serv
 read -r -d '' INJ_OWN_UNLINK <<'PY'
 import sys, pathlib
 p = pathlib.Path(sys.argv[1]); s = p.read_text()
-old = """        drop_pane_record(name, repo_root=repo_root)
-        dropped.append(name)"""
+old = """        if drop_pane_record(name, repo_root=repo_root, expect=record):
+            dropped.append(name)"""
 assert old in s, "注入点が見つからない"
 p.write_text(s.replace(old, """        pane_record_path(name, repo_root=repo_root).unlink()
         dropped.append(name)"""))
 PY
 run_case "欠陥 5: 掃除が独自に unlink する (削除の入口が 2 つになる)" pytest \
-    "deleted_by_one_function" scripts/lib_mux.py "$INJ_OWN_UNLINK"
+    "deletions_next_to_the_records or unlinked_by_exactly_one" \
+    scripts/lib_mux.py "$INJ_OWN_UNLINK"
 
 # --- 欠陥 6: list() が掃除を兼ねる ---------------------------------------------
 # list() は watchdog も呼ぶ。registry/mux/ の書き手が増える。
@@ -223,6 +234,160 @@ p.write_text(s.replace(old, """sweep_spawn_grace_markers()
 PY
 run_case "欠陥 9: dispatcher の cycle が掃除を呼ばない" pytest \
     "dispatcher_cycle_calls_the_sweep" scripts/dispatcher.sh "$INJ_NO_DISPATCHER_CALL"
+
+# ============================================================================
+# PR #215 追加コミット (t022): Kai P1×2 / QA F1・F2
+# ============================================================================
+
+# --- 欠陥 10 (Kai P1-1): 比較と unlink が書き手とロックを共有しない -----------------
+# 元の欠陥そのもの: 掃除が「読んで比べる」を書き手のロックの外で行い、そのあと
+# 無条件に unlink する。比較の後に spawn が書いた記録を消す。
+read -r -d '' INJ_COMPARE_OUTSIDE_LOCK <<'PY'
+import sys, pathlib
+p = pathlib.Path(sys.argv[1]); s = p.read_text()
+old = """        if drop_pane_record(name, repo_root=repo_root, expect=record):
+            dropped.append(name)"""
+assert old in s, "注入点が見つからない"
+p.write_text(s.replace(old, """        if read_pane_record(name, repo_root=repo_root) != record:
+            continue
+        if drop_pane_record(name, repo_root=repo_root):
+            dropped.append(name)"""))
+PY
+run_case "欠陥 10a: 最終比較がロックの外 (比較の後に書かれた spawn の記録を消す)" pytest \
+    "rewritten_after_the_final_comparison" scripts/lib_mux.py "$INJ_COMPARE_OUTSIDE_LOCK"
+
+# 書き手 (write_pane_record / drop_pane_record) がロックに並ばない。
+read -r -d '' INJ_NO_FLOCK <<'PY'
+import sys, pathlib
+p = pathlib.Path(sys.argv[1]); s = p.read_text()
+old = """                fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break"""
+assert old in s, "注入点が見つからない"
+p.write_text(s.replace(old, """                break"""))
+PY
+run_case "欠陥 10b: ロックが実際には何も排除しない (flock を外す)" pytest \
+    "rewritten_after_the_final_comparison or holds_the_lock or waits_for_the_lock" \
+    scripts/lib_mux.py "$INJ_NO_FLOCK"
+
+# --- 欠陥 11 (QA F1): label 不一致を「pane が無い」と読む ---------------------------
+read -r -d '' INJ_LABEL_MISMATCH_IS_GONE <<'PY'
+import sys, pathlib
+p = pathlib.Path(sys.argv[1]); s = p.read_text()
+old = """            if isinstance(label, str) and label and label != expected_label:
+                return PANE_UNOBSERVED"""
+assert old in s, "注入点が見つからない"
+p.write_text(s.replace(old, """            if isinstance(label, str) and label and label != expected_label:
+                return PANE_GONE"""))
+PY
+run_case "欠陥 11: rename された生存 pane の記録を掃除する / 解決経路が消す" pytest \
+    "another_label or renamed_live_pane or existence_is_read" \
+    scripts/lib_mux.py "$INJ_LABEL_MISMATCH_IS_GONE"
+
+# --- 欠陥 12 (QA F2 / I5): dispatcher.sh の埋め込み python が記録を独自に消す ----------
+read -r -d '' INJ_I5_DISPATCHER_UNLINK <<'PY'
+import sys, pathlib
+p = pathlib.Path(sys.argv[1]); s = p.read_text()
+old = """            marker.unlink(missing_ok=True)
+            log(f"[spawn_grace] swept stale marker for vanished window {target!r}")"""
+assert old in s, "注入点が見つからない"
+p.write_text(s.replace(old, """            marker.unlink(missing_ok=True)
+            for _rec in STATE_JSON_DIR.glob('*-worker.json'):
+                os.unlink(_rec)
+            log(f"[spawn_grace] swept stale marker for vanished window {target!r}")"""))
+PY
+run_case "欠陥 12 (I5): dispatcher.sh の python が registry/mux/*-worker.json を os.unlink" pytest \
+    "deletions_next_to_the_records" scripts/dispatcher.sh "$INJ_I5_DISPATCHER_UNLINK"
+
+# --- 欠陥 13 (QA F2 / I4): shutil.move で記録を消す -----------------------------------
+read -r -d '' INJ_I4_SHUTIL_MOVE <<'PY'
+import sys, pathlib
+p = pathlib.Path(sys.argv[1]); s = p.read_text()
+old = """        if drop_pane_record(name, repo_root=repo_root, expect=record):
+            dropped.append(name)"""
+assert old in s, "注入点が見つからない"
+p.write_text(s.replace(old, """        shutil.move(str(pane_record_path(name, repo_root=repo_root)), os.devnull)
+        if drop_pane_record(name, repo_root=repo_root, expect=record):
+            dropped.append(name)"""))
+PY
+run_case "欠陥 13 (I4): lib_mux が shutil.move で記録を動かして消す" pytest \
+    "deletions_next_to_the_records or unlinked_by_exactly_one" \
+    scripts/lib_mux.py "$INJ_I4_SHUTIL_MOVE"
+
+# --- 欠陥 14 (QA F2 / I3): 別関数が os.unlink で記録を消す -----------------------------
+read -r -d '' INJ_I3_OTHER_FUNCTION <<'PY'
+import sys, pathlib
+p = pathlib.Path(sys.argv[1]); s = p.read_text()
+old = """def read_pane_record(name: str, *, repo_root=None) -> Optional[dict]:"""
+assert old in s, "注入点が見つからない"
+p.write_text(s.replace(old, """def _sneaky_drop(name, repo_root=None):
+    os.unlink(pane_record_path(name, repo_root=repo_root))
+
+
+""" + old))
+PY
+run_case "欠陥 14 (I3): 別の関数が os.unlink で記録を消す" pytest \
+    "deletions_next_to_the_records or unlinked_by_exactly_one" \
+    scripts/lib_mux.py "$INJ_I3_OTHER_FUNCTION"
+
+# --- 欠陥 15 (QA F2 / I1): 2 つ目のメソッドが pane_get を直に読む ----------------------
+read -r -d '' INJ_I1_SECOND_READER <<'PY'
+import sys, pathlib
+p = pathlib.Path(sys.argv[1]); s = p.read_text()
+old = """    def record_existence(self, name: str, record: dict) -> str:"""
+assert old in s, "注入点が見つからない"
+p.write_text(s.replace(old, """    def _second_reader(self, pane_id):
+        return _herdr_run("pane_get", [pane_id], timeout=5)
+
+""" + old))
+PY
+run_case "欠陥 15 (I1): 2 つ目のメソッドが pane get を直に読む" pytest \
+    "pane_get_answers_are_read" scripts/lib_mux.py "$INJ_I1_SECOND_READER"
+
+# --- 既知の限界 (I2): 連結した名前は静的に見えない ------------------------------------
+# AST では塞げない。緑のままであることを記録し、限界を隠さない
+# (memory: detector-exemption-needs-proof / 閉じない指摘は閉じないと明言する)。
+read -r -d '' INJ_I2_CONCATENATED <<'PY'
+import sys, pathlib
+p = pathlib.Path(sys.argv[1]); s = p.read_text()
+old = """    def record_existence(self, name: str, record: dict) -> str:"""
+assert old in s, "注入点が見つからない"
+p.write_text(s.replace(old, """    def _second_reader(self, pane_id):
+        op = "pane" + "_get"
+        return _herdr_run(op, [pane_id], timeout=5)
+
+""" + old))
+PY
+EXPECT=green run_case "既知の限界 (I2): op = \"pane\" + \"_get\" の連結は検出できない" pytest \
+    "pane_get_answers_are_read" scripts/lib_mux.py "$INJ_I2_CONCATENATED"
+
+# --- 欠陥 16 (Kai P1-2): bats が実 checkout で start.sh を走らせ、設定を消す -----------
+# 開発者の `.claude/settings.local.json` が「すでにある」状態を用意し、元の欠陥
+# (実 checkout で走らせ、teardown で無条件に rm) を戻す。**ここで消えるのは作業用の
+# コピーの中のファイルで、本番の worktree ではない。**
+mkdir -p "$WORK/.claude"
+echo '{"keep": "me"}' > "$WORK/.claude/settings.local.json"
+read -r -d '' INJ_BATS_REAL_CHECKOUT <<'PY'
+import sys, pathlib
+p = pathlib.Path(sys.argv[1]); s = p.read_text()
+old1 = '    REPO_ROOT="$SANDBOX"\n'
+old2 = "    # どのテストも、開発者の checkout を 1 バイトも変えていない。\n"
+assert old1 in s and old2 in s, "注入点が見つからない"
+s = s.replace(old1, '    REPO_ROOT="$REAL_ROOT"\n')
+s = s.replace(old2, '    rm -f "${REPO_ROOT}/.claude/settings.local.json"\n' + old2)
+p.write_text(s)
+PY
+BEFORE_FIXED='[ -e "$WORK/.claude/settings.local.json" ] \
+    && echo "  (欠陥版の実行で settings.local.json は変わった/消えた — これが Kai P1-2 の実害)" \
+    || echo "  (欠陥版の実行で、事前にあった settings.local.json は消えた — これが Kai P1-2 の実害)"; \
+    echo "{\"keep\": \"me\"}" > "$WORK/.claude/settings.local.json"' \
+run_case "欠陥 16: bats が実 checkout で走り、teardown が settings.local.json を無条件に消す" bats \
+    "" tests/start-sh-spawn-refusal.bats "$INJ_BATS_REAL_CHECKOUT"
+unset BEFORE_FIXED
+if [ "$(cat "$WORK/.claude/settings.local.json" 2>/dev/null)" = '{"keep": "me"}' ]; then
+    echo "  (修正版の実行後も、事前にあった settings.local.json は無傷で残っている)"
+else
+    echo "  NG: 修正版の実行が settings.local.json を変えた"; FAIL=$((FAIL + 1))
+fi
 
 echo
 echo "================================================================"

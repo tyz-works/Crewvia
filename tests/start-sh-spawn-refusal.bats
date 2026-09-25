@@ -11,12 +11,50 @@
 #
 # 実 lib_mux.py + 状態を持つ fake tmux。実 tmux / herdr には触れない。
 #
+# **start.sh は実 checkout では走らせない** (Kai P1, PR #215)。start.sh は自分の位置から
+# REPO_ROOT を決め、`.claude/settings.local.json` (開発者のローカル設定) を書き、
+# `registry/workers.yaml` と `registry/mux/` の記録を更新する。実 checkout で走らせ、
+# teardown で `settings.local.json` を無条件に消すと、ドキュメント通りの bats コマンドが
+# 開発者の設定を壊す。そこで作業ツリー (未コミットの変更を含む) を使い捨ての
+# checkout に複製し、そこの start.sh を走らせる。teardown が消すのはその複製だけ。
+#
 # Run: bats tests/start-sh-spawn-refusal.bats
 
-REPO_ROOT="$(cd "$(dirname "$BATS_TEST_FILENAME")/.." && pwd)"
-START_SH="${REPO_ROOT}/scripts/start.sh"
+REAL_ROOT="$(cd "$(dirname "$BATS_TEST_FILENAME")/.." && pwd)"
+
+# 開発者のファイルに触れていないことを見るための印 (中身は読まない)。
+_real_footprint() {
+    local f
+    for f in .claude/settings.local.json registry/workers.yaml; do
+        if [[ -e "${REAL_ROOT}/${f}" ]]; then
+            echo "${f} $(stat -c '%s %Y' "${REAL_ROOT}/${f}")"
+        else
+            echo "${f} absent"
+        fi
+    done
+    if [[ -d "${REAL_ROOT}/registry/mux" ]]; then
+        ls -A "${REAL_ROOT}/registry/mux" | sort
+    fi
+}
 
 setup() {
+    REAL_FOOTPRINT_BEFORE="$(_real_footprint)"
+
+    SANDBOX="$(mktemp -d)"
+    if git -C "$REAL_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        # 追跡ファイル + 未追跡 (ignore 除く)。ignore された物 (registry/mux 等) は持ち込まない。
+        ( cd "$REAL_ROOT" && git ls-files -z --cached --others --exclude-standard \
+            | tar --null --ignore-failed-read -T - -cf - 2>/dev/null ) \
+            | tar -xf - -C "$SANDBOX"
+    else
+        # git の木でない (アーカイブ展開・red proof の作業コピー): 木ごと複製する。
+        ( cd "$REAL_ROOT" && tar --exclude=./.git --exclude=./.claude/worktrees -cf - . ) \
+            | tar -xf - -C "$SANDBOX"
+    fi
+    REPO_ROOT="$SANDBOX"
+    START_SH="${REPO_ROOT}/scripts/start.sh"
+    [[ -f "$START_SH" ]]
+
     FAKE_DIR="$(mktemp -d)"
     FAKE_TMUX_LOG="${FAKE_DIR}/tmux_calls.log"
     FAKE_CLAUDE_LOG="${FAKE_DIR}/claude_calls.log"
@@ -90,7 +128,12 @@ teardown() {
         find "$FAKE_DIR" -mindepth 1 -delete 2>/dev/null || true
         rmdir "$FAKE_DIR" 2>/dev/null || true
     fi
-    rm -f "${REPO_ROOT}/.claude/settings.local.json"
+    # 消すのは setup が作った複製だけ。実 checkout のファイルは一切消さない。
+    if [[ -n "${SANDBOX:-}" && "$SANDBOX" != "$REAL_ROOT" && -d "$SANDBOX" ]]; then
+        find "$SANDBOX" -depth -delete 2>/dev/null || true
+    fi
+    # どのテストも、開発者の checkout を 1 バイトも変えていない。
+    [ "$(_real_footprint)" = "$REAL_FOOTPRINT_BEFORE" ]
 }
 
 @test "a live process in the pane is reported as already running" {
@@ -150,4 +193,19 @@ teardown() {
 
     [ "$status" -eq 0 ]
     [[ "$output" == *"Agent launched in mux window"* ]]
+}
+
+@test "start.sh writes into the disposable checkout, never the developer's" {
+    export FAKE_LIST_MODE=none
+
+    run bash "$START_SH" worker --name RefusalTest code
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Agent launched in mux window"* ]]
+    # spawn の記録と settings.local.json は複製の側にできている ...
+    [ -f "${SANDBOX}/registry/mux/RefusalTest-worker.json" ]
+    [ -f "${SANDBOX}/.claude/settings.local.json" ]
+    # ... 実 checkout は (teardown の footprint 比較でも) 何も変わっていない。
+    [ "$(_real_footprint)" = "$REAL_FOOTPRINT_BEFORE" ]
+    [ "$REPO_ROOT" != "$REAL_ROOT" ]
 }

@@ -2024,19 +2024,45 @@ server 再起動 (husk として復元) / retirement 相当の SIGKILL の 3 経
   記録を残す。消すと次の kill が恒久拒否になる (`knowledge/empty-vs-unobservable.md`)。
   従来の `_resolve_pane_id()` / `_resolve_ids()` は「error がある = 消えた」と読んでいて、
   **herdr の停止中に呼ばれただけで記録が消えた**。`HerdrBackend._pane_existence()` に集約して直した。
-- **名前ではなく、記録が指す id を問い合わせる。** id がいま別のラベルの pane のものなら
-  「消えた」(server 再起動で id が振り直された)。空のラベルは不一致と見ない
+- **名前ではなく、記録が指す id を問い合わせる。** id が引けて、ラベルが期待と違う pane は
+  **「消えた」ではなく「観測できたが同定できない」(`PANE_UNOBSERVED`) — 記録を残す**
+  (QA F1 / PR #215 の追加コミット)。初版は「別ラベル = 消えた」と読んでいたが、
+  `herdr pane rename` された生存 pane の記録を掃除が消し、記録も名前も pane に届かなくなって
+  kill が `pane not found` で永久に失敗し pane が孤児になった (QA が再現)。「id が別のものに
+  振り直された」のは server の再起動で、それは掃除が先に **server の generation 一致** を要求して
+  見ているので、ラベルは元々その役を担っていなかった。空のラベルも不一致と見ない
   (tab は作成後にラベルが付く)。tmux は `list-windows -a -F '#{pid} #{window_id}'` の 1 回の
   問い合わせで、id を発行した世代の一覧であることまで確かめる。
 - **迷ったら残す**: 自分の checkout の記録でない / server 束縛が無い / 別の endpoint・世代 /
-  120 秒より若い / 年齢が読めない / 判定と削除の間に書き直された。
+  120 秒より若い / 年齢が読めない / 判定と削除の間に書き直された / **ラベルが違う** /
+  **書き手を排除するロックが取れない**。
+- **比較と削除は書き手と同じロックの一区間** (Kai P1 / PR #215 の追加コミット)。初版は
+  「判定した記録を読み直して同じか確かめ、そのあと unlink」を 3 つの別操作で行っていて、
+  比較の後・unlink の前に `spawn()` が新しい記録を書くと、**掃除が生きた pane の記録 (=kill の
+  唯一の認可) を消せた**。120 秒の猶予は古い記録を見るだけで、差し替えを防がない。いまは
+  `registry/mux/.records.lock` (記録と同じディレクトリなので、symlink で `registry/mux` を共有する
+  checkout 同士でも共有される) を **`write_pane_record()` と `drop_pane_record()` が取り**、
+  掃除は `drop_pane_record(expect=<判定した記録>)` で「ロックの中で、ディスク上の記録が判定した
+  ものと同じときだけ」消す。ロックの中で mux を呼ばない (書き手を待たせるので、問い合わせは
+  ロックの前に済ませる)。取れなければ、掃除は消さず、書き手は「記録できなかった」と返す
+  (どちらも既存の安全側の分岐)。待ちは有限 (`PANE_RECORD_LOCK_TIMEOUT_SECONDS` = 5 秒)。
+  同じ先例は `registry/task-graph` の pending ロックと `retire_assignment` の card 書き換え。
 - **kill の認可とは別経路**: 掃除は `may_destroy_pane()` を呼ばず、逆も呼ばない。掃除が消せるのは
   「消えた pane の記録」だけで、他人の pane を殺す認可には化けない。
 - **書き手は増やさない**: `list()` には混ぜない (watchdog も `list()` を呼ぶ。§3 / F1)。
   呼ぶのは dispatcher (`sweep_stale_pane_records()`、`.firstseen` 掃除の隣) と `start.sh`
   (`mux_reap_records`、spawn の前) だけ。テストは watchdog 側のファイルに `reap_stale` が
   現れたら落ちる。
-- 記録の削除は `drop_pane_record()` 1 箇所 (テストが AST で数える)。
+- 記録の削除は `drop_pane_record()` 1 箇所。テストは AST で **削除系の呼び出し**
+  (`unlink` / `os.remove` / `os.rename` / `os.replace` / `shutil.move` / `shutil.rmtree` /
+  `Path.replace` 等と `unlink_quiet` 系の helper) を、`lib_mux.py` だけでなく
+  **`dispatcher.sh` / `watchdog.py` の埋め込み python、`lib_retirement.py` /
+  `lib_daemon_watch.py` まで**全部拾い、理由付きの表 (`ALLOWED_DELETIONS`) に無いものがあれば
+  落とす (QA F2)。初版は `lib_mux.py` 内の `unlink/remove/rmdir` と `"pane_get"` リテラルにしか
+  効かず、`dispatcher.sh` に足した `os.unlink(registry/mux/*-worker.json)` は全 942 件が緑だった。
+  **塞げないもの (AST の限界)**: 変数・連結を経由した名前 (`op = "pane" + "_get"`)、
+  `getattr(os, "unl" + "ink")`、外部コマンド (`rm`)、`open(path, "w")` での上書き。
+  red proof は連結の注入 (I2) が**緑のまま**であることをそのまま記録している。
 
 **`spawn` の終了コード**: 0 = 起動した / 1 = 起動しなかった / **10 = pane に live なプロセスが居る /
 11 = pane の中身が読めず busy 扱い**。`start.sh` が「already running」と言うのは 10 だけ
@@ -2044,20 +2070,44 @@ server 再起動 (husk として復元) / retirement 相当の SIGKILL の 3 経
 起動 (`lib_daemon_watch.py spawn`) は別経路で、ここでは変えていない。
 
 **ロールバック**: 停止スイッチは `CREWVIA_MUX_RECORD_SWEEP=0` (掃除が何も見ず何も消さない)。
-dispatcher は cycle ごとに新しい python なので、`dispatcher.sh` の env に足して再起動すれば効く。
-`start.sh` は env をそのまま読む。掃除が誤って記録を消したときの復旧は、その pane を respawn する
-(記録が書き直される) か、kill に `--force`。mux の停止中は掃除が何も消さないので、停止中に
-呼ばれること自体は安全。revert するなら `dispatcher.sh` の `sweep_stale_pane_records()` 呼び出しと
-`start.sh` の `mux_reap_records` を外せば掃除は止まる (テストは
-`tests/test_stale_pane_record_sweep.py` / `tests/start-sh-spawn-refusal.bats`)。
+**止まるのは掃除だけ**で、記録の書き手側のロック (`.records.lock`) は常に働く。掃除は
+「消す側」の 1 者 (dispatcher と `start.sh` が同じ関数を呼ぶ) で、片方だけ止めても、答えが割れるのは
+「どれだけ掃除されるか」であって「どの記録が正しいか」ではない — 共有規則 (`lib_dep_rules` 等) と
+違い、食い違っても危険な側には倒れない。dispatcher は cycle ごとに新しい python なので、
+`dispatcher.sh` の env に足して再起動すれば効く。`start.sh` は env をそのまま読む。
+掃除が誤って記録を消したときの復旧は、その pane を respawn する (記録が書き直される) か、kill に
+`--force`。mux の停止中は掃除が何も消さないので、停止中に呼ばれること自体は安全。
+revert するなら `dispatcher.sh` の `sweep_stale_pane_records()` 呼び出しと `start.sh` の
+`mux_reap_records` を外せば掃除は止まる。**ロックだけを戻したい場合**は `_pane_record_lock()` を
+外すのではなく PR ごと revert する (書き手と掃除のどちらか一方だけがロックを取る状態は、
+元の競合より悪い — 掃除だけが取れば書き手を止められず、書き手だけが取れば何も排除しない)。
+ロックが取れない環境 (記録のディレクトリに `.records.lock` を作れない) では、書き手は
+「記録できなかった」と警告して False を返し、掃除は何も消さない — 記録が書かれないと後の kill は
+`--force` が要るが、これは §7-11-2 の既存の安全側 (記録が無ければ壊さない) と同じ向き。
+ロックファイル自体は残っていても害は無い (flock はプロセス終了で解放される)。
 **merge 後、dispatcher の再起動が要る** (`knowledge/dispatcher-restart-after-merge.md`)。
 
 **残した穴**: 別世代の server に対する記録 (server が再起動した後の記録) は掃除しない。
 その id は別のものかもしれず、判定の根拠が無い。同名の pane が spawn されれば上書きされる。
 `<name>.state.json` / `.firstseen` は dispatcher 自身の別の印で、この掃除の対象外。
 
+**見送ったもの (QA F3 / P3)**: herdr の server 停止中に `pid` / `capture` 等が `pane not found` と
+表示する。記録は正しく残る (動作は正しい) が、利用者には「pane が無い」と「server に問い合わせ
+できなかった」が同じ文言に見える。直すには `_resolve_ids()` が「尋ねられなかった」を返り値で
+運び、6 か所の警告文 (send / capture / kill / pid / attach / state) を分ける必要がある。表示だけの
+変更に対して PR が大きく、レビュー機構の上限に近いため、別 PR に回した。
+
+**start.sh の bats は使い捨て checkout で走る** (Kai P1-2): `start.sh` は自分の位置から REPO_ROOT を
+決めて `.claude/settings.local.json` と `registry/` を書くので、実 checkout で走らせて teardown で
+無条件に消すと開発者の設定を壊す。setup が作業ツリー (未コミット変更を含む) を複製し、teardown が
+消すのはその複製だけ。teardown は実 checkout の `settings.local.json` / `workers.yaml` /
+`registry/mux` が変わっていないことも assert する。
+
 回帰テスト: `tests/test_stale_pane_record_sweep.py`、`tests/start-sh-spawn-refusal.bats`。
-欠陥を戻すと赤くなることは `tests/red_proof_t001_stale_records.sh` (9 種) で実証した。
+欠陥を戻すと赤くなることは `tests/red_proof_t001_stale_records.sh` (16 種 + 既知の限界 1) で実証した。
+「最終比較の後に spawn が書き直す」窓は実時間では再現できないので、比較の直後に別スレッドで
+`write_pane_record()` を走らせて窓を作る (ロックが無ければ書き手はすぐ書いて掃除に消され、
+あれば掃除が終わるまで待つ)。
 
 ---
 

@@ -784,3 +784,19 @@ def test_the_real_plugin_renders_a_graph_with_every_status(sandbox):
     assert_plugin_accepts(sandbox)
     r = run_plugin(sandbox.graph)
     assert "TASK GRAPH" in r.stdout, r.stdout[:400]
+
+
+def test_label_and_pane_id_do_not_make_an_older_plugin_reject_the_file(sandbox):
+    """`label` / `pane_id` を先に書いても、未対応の plugin (0.1.1) は壊れない。
+
+    plugin の `load_config` は未知の欄を拒否しない。写し (`_reject_reason`) と、
+    手元に plugin があれば本物の両方で確かめる。
+    """
+    sandbox.add_task("t001", "in_progress", [], worker="Ren")
+    sandbox.add_task("t002", "pending", ["t001"])
+    sandbox.assign("Ren", "t001")
+    sandbox.record_pane("Ren", "wP:p80")
+    assert sandbox.run("task-graph").returncode == 0
+    graph = assert_plugin_accepts(sandbox)
+    node = _by_id(graph)[f"{MISSION}:t001"]
+    assert node["label"] == "t001" and node["pane_id"] == "wP:p80"

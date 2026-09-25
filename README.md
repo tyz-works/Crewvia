@@ -401,13 +401,15 @@ Other markers in a title: `[依存不明: id]` (depends on a task that does not 
   example.** When the file is missing (for example a dangling symlink) the plugin does not
   complain; it falls back to a sample graph. Re-run `./scripts/plan.sh task-graph` and check
   the link.
-- **The worker ↔ task pane link does not work yet.** The generated `pane_match`
-  (`<Name>-worker`) never matches: herdr 0.9.0 gives the plugin the agent's `pane_id`, not the
-  pane label that carries `<Name>-worker`. So a task shows no Worker and Enter does nothing.
-  Status, dependencies and the ready/waiting split are unaffected. Matching by `pane_id`
-  instead worked in an isolated herdr (agent name/status appeared in the task box and Enter
-  focused the pane, even while `[offline]`), but Crewvia does not generate `pane_id` yet.
-  Tracked as a follow-up; details and what is still unverified: `knowledge/task-graph.md` §4-4.
+- **Worker ↔ task pane link.** The generated `pane_match` (`<Name>-worker`) never matches in
+  herdr 0.9.0: the plugin sees the agent's `pane_id`, not the pane label that carries
+  `<Name>-worker`. So for a task with a Worker on it, Crewvia also writes that Worker's `pane_id`,
+  taken from its spawn record (`registry/mux/<Name>-worker.json`), which the plugin does match.
+  This only reads the record and `/proc`; it never contacts herdr. The `pane_id` is left out
+  (and only `pane_match` remains) when the record is missing, unreadable, not from herdr, or
+  names a herdr server that is no longer running. Each node also carries a short `label`
+  (`tNNN`); plugins that do not know it ignore it. Details and what is still to be verified
+  against a live herdr: `knowledge/task-graph.md` §4-4.
 - A queue with many finished tasks makes the graph crowded. Only active missions are drawn,
   so `plan.sh archive` a finished mission to clear it from the view.
 

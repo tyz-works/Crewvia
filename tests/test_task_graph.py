@@ -28,7 +28,9 @@ import json
 import os
 import pathlib
 import re
+import fcntl
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -338,8 +340,11 @@ def sandbox(tmp_path):
     # lib_dep_rules.py / lib_task_cards.py は必須 (plan.sh が起動時に読む、
     # 依存規則と task カード読み取りの本体。どちらもフォールバックを持たない)。
     # 残りは、その subcommand を使うときだけ要る補助。
+    # lib_mux.py / lib_daemon_state.py は pane_id を解決するときだけ遅延で読まれる
+    # (`task_graph_pane_id`)。
     for extra in ("lib_dep_rules.py", "lib_task_cards.py",
-                  "lib_registry.py", "lint_plan.py"):
+                  "lib_registry.py", "lint_plan.py",
+                  "lib_mux.py", "lib_daemon_state.py"):
         src = REPO_ROOT / "scripts" / extra
         if src.exists():
             shutil.copy2(src, root / "scripts" / extra)
@@ -391,6 +396,28 @@ def sandbox(tmp_path):
             adir.mkdir(parents=True, exist_ok=True)
             (adir / worker).write_text(f"{mission}:{task_id}\n")
 
+        def record_pane(self, worker, pane_id="w1:p9", *, backend="herdr",
+                        generation=None, body=None):
+            """`start.sh` が Worker 起動時に書く spawn 記録を置く。
+
+            既定の `generation` は **生きているプロセス** (この pytest 自身) の
+            `<pid>:<starttime>` — herdr の server の世代が持つのと同じ形。
+            `body` を渡すと、その文字列をそのまま書く (壊れた記録の再現用)。
+            """
+            path = _mux().pane_record_path(f"{worker}-worker", repo_root=root)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if body is not None:
+                path.write_text(body)
+                return path
+            record = {
+                "handle": pane_id, "tab_id": pane_id, "pane_id": pane_id,
+                "backend": backend,
+                "server": {"endpoint": "/nonexistent/herdr.sock",
+                           "generation": generation or _live_generation()},
+            }
+            path.write_text(json.dumps(record))
+            return path
+
         def add_mission(self, slug):
             (queue / "missions" / slug / "tasks").mkdir(parents=True, exist_ok=True)
             (queue / "missions" / slug / "mission.yaml").write_text(_mission_yaml(slug))
@@ -416,6 +443,23 @@ def sandbox(tmp_path):
 
 def _by_id(graph):
     return {t["id"]: t for t in graph["tasks"]}
+
+
+def _mux():
+    """記録のパスを本番と同じ規則 (`CREWVIA_MUX_PANE_PREFIX` 込み) で引く。"""
+    sys.path.insert(0, str(REPO_ROOT / "scripts"))
+    import lib_mux
+    return lib_mux
+
+
+def _generation_of(pid: int) -> str:
+    """herdr の server の世代と同じ形: `<pid>:<starttime>`。"""
+    stat = pathlib.Path(f"/proc/{pid}/stat").read_text()
+    return f"{pid}:{stat[stat.rindex(')') + 2:].split()[19]}"
+
+
+def _live_generation() -> str:
+    return _generation_of(os.getpid())
 
 
 # --- 対応表 ---------------------------------------------------------------
@@ -612,6 +656,158 @@ def test_a_waiting_worker_still_points_at_its_pane(sandbox):
         assert nodes[f"{MISSION}:t00{i}"]["pane_match"] == f"W{i}-worker"
 
 
+# --- label (P-2) / pane_id (P-3) -----------------------------------------------
+
+def test_every_node_carries_a_short_label_and_keeps_its_qualified_id(sandbox):
+    """`label` は mission を落とした task id。`id` は一意性と依存解決のために残す。"""
+    sandbox.add_task("t001", "done", [])
+    sandbox.add_task("t002", "pending", ["t001"])
+    assert sandbox.run("task-graph").returncode == 0
+    nodes = _by_id(sandbox.read_graph())
+    assert set(nodes) == {f"{MISSION}:t001", f"{MISSION}:t002"}
+    assert nodes[f"{MISSION}:t001"]["label"] == "t001"
+    assert nodes[f"{MISSION}:t002"]["label"] == "t002"
+    assert nodes[f"{MISSION}:t002"]["depends_on"] == [f"{MISSION}:t001"]
+
+
+def test_pane_id_is_written_from_the_spawn_record(sandbox):
+    sandbox.add_task("t001", "in_progress", [], worker="Ren")
+    sandbox.assign("Ren", "t001")
+    sandbox.record_pane("Ren", "wP:p80")
+    r = sandbox.run("task-graph")
+    assert r.returncode == 0, r.stderr
+    node = _by_id(sandbox.read_graph())[f"{MISSION}:t001"]
+    assert node["pane_id"] == "wP:p80"
+    assert node["pane_match"] == "Ren-worker"   # 従来動作は残す
+
+
+def _dead_generation() -> str:
+    """終わって回収済みのプロセスの世代 — もう /proc に無い。"""
+    p = subprocess.Popen(["true"])
+    p.wait()
+    return _generation_of_dead(p.pid)
+
+
+def _generation_of_dead(pid: int) -> str:
+    return f"{pid}:123456789"
+
+
+#: (id, 記録の置き方, 理由)。どれも `pane_id` を書かず、`pane_match` は残る。
+UNUSABLE_RECORDS = [
+    ("no-record", lambda sb: None, "記録が無い"),
+    ("broken-json", lambda sb: sb.record_pane("Ren", body="{not json"), "壊れた JSON"),
+    ("empty-file", lambda sb: sb.record_pane("Ren", body=""), "書き込み途中の空ファイル"),
+    ("json-array", lambda sb: sb.record_pane("Ren", body="[1, 2]"), "object でない"),
+    ("tmux-backend", lambda sb: sb.record_pane("Ren", backend="tmux"), "herdr でない"),
+    ("empty-pane-id", lambda sb: sb.record_pane("Ren", ""), "pane_id が空"),
+    ("dead-server", lambda sb: sb.record_pane("Ren", generation=_dead_generation()),
+     "記録の server がもう居ない (再起動後の古い記録)"),
+    ("pid-reused",
+     lambda sb: sb.record_pane(
+         "Ren", generation=f"{os.getpid()}:{int(_live_generation().split(':')[1]) + 1}"),
+     "pid は生きているが starttime が違う (pid の使い回し)"),
+    ("malformed-generation", lambda sb: sb.record_pane("Ren", generation="abc"),
+     "世代の形が違う"),
+    ("pid-not-digits", lambda sb: sb.record_pane("Ren", generation="../1:2"),
+     "世代に pid でないものが入っている"),
+]
+
+
+@pytest.mark.parametrize("place", [u[1] for u in UNUSABLE_RECORDS],
+                         ids=[u[0] for u in UNUSABLE_RECORDS])
+def test_pane_id_is_omitted_when_the_record_cannot_be_trusted(sandbox, place):
+    sandbox.add_task("t001", "in_progress", [], worker="Ren")
+    sandbox.assign("Ren", "t001")
+    place(sandbox)
+    r = sandbox.run("task-graph")
+    assert r.returncode == 0, r.stderr
+    node = _by_id(sandbox.read_graph())[f"{MISSION}:t001"]
+    assert "pane_id" not in node, node
+    assert node["pane_match"] == "Ren-worker"       # 生成は落ちず、従来動作が残る
+
+
+def test_pane_id_needs_the_live_assignment_and_a_live_status(sandbox):
+    """pane_match と同じ AND: 記録があっても、就いていない Worker には書かない。"""
+    sandbox.record_pane("Ren", "wP:p80")
+    sandbox.record_pane("Old", "wP:p81")
+    # 名前の使い回し: assignment は別の task を指している
+    sandbox.add_task("t001", "needs_director", [], worker="Ren")
+    sandbox.add_task("t002", "in_progress", [], worker="Ren")
+    sandbox.assign("Ren", "t002")
+    # 終わった task の worker 欄 (履歴)
+    sandbox.add_task("t003", "failed", [], worker="Old")
+    sandbox.assign("Old", "t003")
+    assert sandbox.run("task-graph").returncode == 0
+    nodes = _by_id(sandbox.read_graph())
+    assert "pane_id" not in nodes[f"{MISSION}:t001"]
+    assert nodes[f"{MISSION}:t002"]["pane_id"] == "wP:p80"
+    assert "pane_id" not in nodes[f"{MISSION}:t003"]
+
+
+def test_pane_id_is_never_written_for_a_paneless_executor(sandbox):
+    """codex-review はペインを持たない。同名の記録が残っていても書かない。"""
+    task = sandbox.queue / "missions" / MISSION / "tasks" / "t001.md"
+    sandbox.add_task("t001", "in_progress", [], worker="Kai-codex")
+    task.write_text(task.read_text().replace("skills: [code]", "skills: [codex-review]"))
+    sandbox.assign("Kai-codex", "t001")
+    sandbox.record_pane("Kai-codex", "wP:p1")
+    assert sandbox.run("task-graph").returncode == 0
+    node = _by_id(sandbox.read_graph())[f"{MISSION}:t001"]
+    assert "pane_id" not in node and "pane_match" not in node
+
+
+def test_reading_the_record_takes_no_lock_and_never_touches_herdr(sandbox):
+    """生成は `.records.lock` を待たず、herdr の socket に接続もしない。
+
+    生成器は `retire --no-wait` (watchdog が同期で叩く) を含む全経路から呼ばれる。
+    ロックを待つと Worker の生死を誰も見ていない時間ができ、herdr に触れると
+    「plugin が無くても・herdr でなくても何も起きない」が崩れる。
+    """
+    sandbox.add_task("t001", "in_progress", [], worker="Ren")
+    sandbox.assign("Ren", "t001")
+    record = sandbox.record_pane("Ren", "wP:p80")
+
+    lock = record.parent / ".records.lock"
+    lock.touch()
+    sock_path = sandbox.root / "h.sock"
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(str(sock_path))
+    server.listen(4)
+    server.setblocking(False)
+    with open(lock, "w") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)          # 書き手 (spawn) が握っている状態
+        started = time.monotonic()
+        r = sandbox.run("task-graph", env=sandbox.env(CREWVIA_HERDR_SOCK=str(sock_path)))
+        elapsed = time.monotonic() - started
+    try:
+        server.accept()
+        connected = True
+    except BlockingIOError:
+        connected = False
+    finally:
+        server.close()
+
+    assert r.returncode == 0, r.stderr
+    assert elapsed < 5, f"記録のロックを待っている ({elapsed:.1f}s)"
+    assert not connected, "生成が herdr の socket に接続した"
+    node = _by_id(sandbox.read_graph())[f"{MISSION}:t001"]
+    assert node["pane_id"] == "wP:p80"
+
+
+def test_a_missing_lib_mux_costs_the_pane_id_and_nothing_else(sandbox):
+    """pane_id の解決が壊れても、図は描かれ、終了コードは変わらない。"""
+    sandbox.add_task("t001", "in_progress", [], worker="Ren")
+    sandbox.assign("Ren", "t001")
+    sandbox.record_pane("Ren", "wP:p80")
+    (sandbox.root / "scripts" / "lib_mux.py").unlink()
+    r = sandbox.run("task-graph")
+    assert r.returncode == 0, r.stderr
+    node = _by_id(sandbox.read_graph())[f"{MISSION}:t001"]
+    assert "pane_id" not in node and node["pane_match"] == "Ren-worker"
+    assert node["label"] == "t001"
+    assert "pane_id を解決できない" in r.stderr   # 黙って落とさない
+
+
 # --- plan.sh への接続 --------------------------------------------------------
 
 def _mtime(path: pathlib.Path):
@@ -764,7 +960,8 @@ def test_generated_json_shape_matches_the_plugin_contract(sandbox):
     graph = sandbox.read_graph()
     assert set(graph) == {"title", "tasks"}
     assert isinstance(graph["title"], str) and graph["title"]
-    allowed_keys = {"id", "title", "depends_on", "status", "pane_match"}
+    allowed_keys = {"id", "label", "title", "depends_on", "status", "pane_match",
+                    "pane_id"}
     allowed_status = {"done", "running", "blocked", "ready", "waiting", "failed"}
     for node in graph["tasks"]:
         assert set(node) <= allowed_keys, f"未知のキー: {set(node) - allowed_keys}"

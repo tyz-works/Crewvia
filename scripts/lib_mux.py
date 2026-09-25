@@ -1592,6 +1592,50 @@ def read_pane_record(name: str, *, repo_root=None) -> Optional[dict]:
     return None if is_unreadable(data) else data
 
 
+def recorded_herdr_pane_id(name: str, *, repo_root=None) -> Optional[str]:
+    """The herdr pane id `name`'s spawn record holds — only while it can be trusted.
+
+    **Reads the record and `/proc`; never talks to herdr.**  The task-graph
+    generator (plan.sh) runs on every queue mutation, including the
+    `retire --no-wait` the watchdog calls synchronously, so it may neither
+    open the herdr socket nor take `.records.lock`.  The writer
+    (`write_pane_record()`) truncates and rewrites in place, so a lock-free
+    read can see an empty or half-written file — `load_json_store()` turns
+    that into "unreadable", which is `None` here (no id is better than a
+    guessed one).
+
+    A pane id is meaningful only inside the server generation that issued it,
+    and herdr's generation is `<pid>:<starttime>` of the server process
+    (`_herdr_connect_identified()`).  That can be checked without herdr: the
+    record is used only if that very process is still alive.  A restarted
+    server has a different pid or starttime, and it restores tabs with fresh
+    ids, so the recorded one now points at nothing or at somebody else.
+
+    None for every case that is not a positive yes: no / unreadable record,
+    another backend, no pane id, a generation of another shape, a server
+    process that is gone (or a zombie, or cannot be read).
+    """
+    record = read_pane_record(name, repo_root=repo_root)
+    if not isinstance(record, dict) or record.get("backend") != "herdr":
+        return None
+    pane_id = record.get("pane_id")
+    if not isinstance(pane_id, str) or not pane_id.strip() or pane_id != pane_id.strip():
+        return None
+    server = record.get("server")
+    generation = server.get("generation") if isinstance(server, dict) else None
+    if not isinstance(generation, str):
+        return None
+    m = re.fullmatch(r"(\d+):(\d+)", generation)
+    if m is None:
+        return None
+    status, fields = _proc_stat_fields(int(m.group(1)))
+    if status != _PROC_OK or len(fields) < 20:
+        return None
+    if fields[0] in ("Z", "X") or fields[19] != m.group(2):
+        return None
+    return pane_id
+
+
 def drop_pane_record(name: str, *, repo_root=None,
                      expect: Optional[dict] = None) -> bool:
     """Delete `name`'s record; True when it is gone by this call (or already).

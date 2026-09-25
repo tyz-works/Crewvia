@@ -51,9 +51,13 @@
   **herdr 0.9.0 では、エージェントが 1 つでも居ると plugin は `[offline]`（`Broken pipe`）になり、
   live なエージェント状態は来ない**（plugin が同一接続で snapshot の後に subscribe を送るのが原因。
   upstream `tyz-works/herdr-task-graph` 側の修正が要り、crewvia では直せない）。得られるのは
-  crewvia が生成した依存関係と status の可視化のみ。**Worker とタスクのペイン紐付け
-  （`pane_match`）も当たらない**（`pane_id` で書けば当たることは隔離環境で確認済みだが、生成器は
-  まだ書かない）
+  crewvia が生成した依存関係と status の可視化のみ。**`pane_match` は live の herdr では
+  当たらない**ので、生成器は Worker が就いている task（`pane_match` と同じ AND）に spawn 記録の
+  `pane_id` も書く（`plan.sh` の `task_graph_pane_id()` → `lib_mux.recorded_herdr_pane_id()`）。
+  **記録と `/proc` を読むだけで herdr に触れず、`.records.lock` も取らない**。記録が無い・読めない・
+  herdr でない・記録の server が居ない（再起動後の古い記録）ときは書かず、`pane_match` だけが残る。
+  各 node には短い `label`（`tNNN`）も書く（`id` は `<slug>:tNNN` のまま。未対応の plugin は無視する）。
+  実 herdr での確認は QA / 結合確認（t008 / t011）待ち
 - 運用メモ・切り分け・実測: `knowledge/task-graph.md`
 
 ---
@@ -230,6 +234,8 @@
                         （queue 側の `lib_task_cards` と同じ作法。ストアごとの「使えないときの向き」の表は
                         `knowledge/notify-once.md` §3）
     lib_mux.py          mux 抽象化モジュール（TmuxBackend / HerdrBackend）
+                        `recorded_herdr_pane_id()`: spawn 記録の `pane_id` を、記録の server がまだ生きているとき
+                        だけ返す（記録と `/proc` のみ。herdr にもロックにも触れない。task-graph 生成器が使う）
                         **`registry/mux/<name>.json`（spawn 記録）は kill の認可の唯一の証拠**
                         （§7-11-2）で、Worker の retirement は pane の pid を直接 kill して `kill()` を
                         通らない → 記録だけが残る（失効記録。t001 / #7）。`reap_stale_pane_records()` が

@@ -164,7 +164,7 @@ t001 は `pending` の READY / WAIT を plugin の導出に**委ねず**、crewv
 は信用しない」という但し書きは要らない。逆に、plugin の導出に戻す変更を入れるなら、
 この但し書きが必要になる。設計と rollback は `knowledge/failed-dependency-hold.md`。
 
-### 4-4. `pane_match` は live の herdr では当たらない（**未解決・要フォローアップ**。`pane_id` なら当たることを隔離環境で確認済み）
+### 4-4. `pane_match` は live の herdr では当たらない（**crewvia 側は解決: 生成器が `pane_id` を書く**。t007）
 
 **現状で起きること**: task の箱に Worker（agent）の表示が出ず、Enter を押しても何も起きない。
 §4-1b の offline とは独立した問題（offline でも、直っても、`pane_match` は当たらない）。
@@ -212,14 +212,46 @@ snapshot を取り直す）。t006 QA が「未検証」としていた点は、
 
 **確認できていないこと**（「できる」とは書かない）:
 
-- **crewvia の生成器が `pane_id` を書く実装はまだ無い**。上の検証は tasks.json を手で書いた。
-  今の crewvia の画面は「Worker 表示なし・Enter 不可」のまま
+- **生成器が書いた `pane_id` を実 herdr の plugin が受けて Enter で飛べること**。上の検証は
+  tasks.json を手で書いた。生成器の実装は下の「実装（t007）」で入ったが、単体テストは生成物の
+  中身までしか見ていない。実 herdr での確認は QA（t008）と結合確認（t011）が行う
 - 実際の Claude Code の Worker pane での確認。検証は `claude` という名前のスタンドイン（`sleep`）で、
   herdr が `agent: "claude"` と認識する経路は同じだが、実 Worker では見ていない
 - agent の状態変化（idle → working 等）が offline 中の箱に追従するか
 - pane id が herdr の再起動・復元を跨いで有効か（下記の注意点の前提）
 
-#### 直す道筋（crewvia 側で完結できる可能性がある。実装は別 task）
+#### 実装（t007）
+
+生成器（`plan.sh` の `build_task_graph()`）は、`pane_match` を書く条件（status の allowlist と
+`queue/assignments/<worker>` の AND）が揃った node に、`pane_id` も書く。`pane_match` は残す。
+
+- 値は `registry/mux/<Worker>-worker.json` の `pane_id`。読むのは
+  `lib_mux.recorded_herdr_pane_id()` 1 つ（記録の読み取りは既存の `read_pane_record()` =
+  `load_json_store` の入口を通る）
+- 書かない条件（どれも `pane_match` だけが残り、生成は落ちない）: 記録が無い / 読めない・壊れた
+  JSON / object でない / `backend` が herdr でない / `pane_id` が空 / 世代の形が
+  `<pid>:<starttime>` でない / **記録の server プロセスがもう居ない**
+- **世代の検査は herdr に問い合わせずに行う**。herdr の世代は server プロセスの
+  `<pid>:<starttime>`（`_herdr_connect_identified()`）なので、その pid が `/proc` にあり
+  starttime が一致するかで「その pane id を発行した server がまだ生きているか」が言える。
+  `lib_mux` の既存の世代取得（`_herdr_server_identity()`）は socket に接続するので使わない
+  （生成は `retire --no-wait` から watchdog が同期で叩く経路にも乗る。herdr が固まっていると
+  その分 Worker を誰も見ない時間ができる。CLAUDE.md の設計「生成は herdr に触れない」も崩れる）。
+  外れた場合の害: 記録の server が生きている限り pane id は今の世代のものなので、外れが起きるのは
+  「記録の server が死んだあと」だけで、その場合は書かない（plugin 側で「一致なし」になる）
+- **`registry/mux/.records.lock` は取らない**。書き手（`write_pane_record()`）は `os.replace` では
+  なく `write_text()`（truncate してから書く）なので、ロック無しの読み取りは空・書きかけを見うる。
+  ただしそれは JSON として読めず `Unreadable` → 書かない、になるだけで、誤った `pane_id` にはならない
+  （書きかけの JSON object が有効な別の値に読めることはない）。次の queue 変更で再生成される
+- `label` は `tNNN`（mission slug を落とした task id）。`id` は `<slug>:tNNN` のまま。plugin 0.1.1 の
+  `load_config` は未知の欄を拒否しない（`tests/test_task_graph_plugin_contract.py` で本物に読ませて確認）
+- 複数 mission のとき `tNNN` だけでは同じ ID が並びうる（`t001` が mission ごとにある）。区別は
+  title と依存の線で付き、`id`（詳細表示）は slug 付きのまま。label に slug を足すと長くて読めなく
+  なる（P-2 の原因そのもの）ので足していない
+- **この変更単体の戻し方**: この PR を revert する（`label` / `pane_id` が消えて従来の生成物に戻る）。
+  `CREWVIA_TASK_GRAPH=0` は生成ごと止める退避路で別物
+
+#### 直す道筋（元の見立て）
 
 crewvia は Worker 起動時に `registry/mux/<Name>-worker.json` へ `pane_id`
 （例 `wP:p80`）を記録している。生成器がここから `pane_id` を引いて書けば、upstream を
@@ -255,6 +287,9 @@ plugin は全 task を並べる。完了済みが数十件あると箱が潰れ�
 | `BLOCK [要判断]` | **人間の判断待ち**: `needs_director` / `needs_human_review` / `ready_for_verification` |
 | `BLOCK [status不明]` | 対応表に無い status。done にも ready にも倒さず止めて見せる |
 
+各 node の `label`（`tNNN`）は短い表示名（plugin 側の対応は別 task。未対応の版は無視する）。Worker が就いている
+task の node には `pane_id` も入る（Enter でそのペインに飛ぶための宛先。§4-4）。
+
 依存待ち（`WAIT`）と人間待ち（`BLOCK [要判断]`）は plugin の状態そのものが違うので
 取り違えない。title の `[依存不明: id]` は存在しない task への依存、
 `[循環依存: id]` は循環を閉じている辺をそこで切ってある印（plugin は循環があるとファイル
@@ -272,7 +307,7 @@ plugin は全 task を並べる。完了済みが数十件あると箱が潰れ�
 | ファイルが更新されない | `CREWVIA_TASK_GRAPH=0` になっていないか。`plan.sh task-graph` を手で実行して出力を見る。`plan.sh` の stderr に生成失敗の 1 行が出ていないか |
 | `plan.sh task-graph` が「queue が違う」と拒否する | `CREWVIA_QUEUE` が `<root>/queue` でない。書き先を明示するなら `CREWVIA_TASK_GRAPH_FILE` |
 | ヘッダーが `[offline]`、最下部に `ERROR: [Errno 32] Broken pipe` | Worker が動いている間は**平常**（§4-1b。herdr 0.9.0 の plugin の欠陥で、upstream 側の修正待ち）。crewvia の tasks.json 側を疑わない。task の状態表示は crewvia の値のまま |
-| task に Worker 名が出ない・Enter で pane に飛べない | §4-4（現状は仕様上出ない。生成器が `pane_id` を書いていない） |
+| task に Worker 名が出ない・Enter で pane に飛べない | §4-4。生成物の該当 node に `pane_id` があるか（`jq` で確認）。無ければ `registry/mux/<Name>-worker.json` が無い・`backend` が herdr でない・記録の server（`server.generation` の pid）が居ない（herdr 再起動後の古い記録）のどれか。Worker を起動し直すと記録が書き直される |
 | plugin が読み込みに失敗する | plugin は空の `tasks` / id の空・重複 / 解決できない `depends_on` / 循環でファイル全体を拒否する。生成器は 4 つとも潰してあるので、出たらバグ（`enforce_task_graph_contract()` を見る） |
 
 ---

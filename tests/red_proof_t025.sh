@@ -43,6 +43,8 @@ if old not in s:
     sys.exit(f"注入点が無い: {old!r}")
 open(path, "w", encoding="utf-8").write(s.replace(old, new, count))
 PY
+    # 注入できなかったのに「緑のまま」を数えると偽の検出漏れになる。止める。
+    [ $? -eq 0 ] || { echo "FATAL: 注入に失敗した (本番コードの形が変わっている)"; exit 1; }
 }
 
 # 元の状態に戻す (git archive の内容へ)。
@@ -51,11 +53,12 @@ restore() {
     find "$WORK" -name '*.pyc' -delete 2>/dev/null
 }
 
-# expect_red <名前> <-k 式>   — 直前に注入した状態で、その -k が **失敗する** こと
+# expect_red <名前> <-k 式> [対象のテストファイル]
+#   — 直前に注入した状態で、その -k が **失敗する** こと
 expect_red() {
-    local name="$1" selector="$2" out rc
+    local name="$1" selector="$2" file="${3:-$TEST}" out rc
     out="$(cd "$WORK" && env -i PATH="$PATH" HOME="$HOME" PYTHONDONTWRITEBYTECODE=1 \
-        python3 -m pytest "$TEST" -q --tb=line -k "$selector" -p no:cacheprovider 2>&1)"
+        python3 -m pytest "$file" -q --tb=line -k "$selector" -p no:cacheprovider 2>&1)"
     rc=$?
     # 赤の理由 (--tb=line の 1 行) が読める長さだけ出す。RED_TAIL で増やせる。
     echo "$out" | tail -"${RED_TAIL:-40}"
@@ -149,6 +152,39 @@ replace scripts/plan.sh "        problem = _TASK_CARDS.released_deps_problem(met
                   f\"捨てて書き直します\", file=sys.stderr)
             meta['released_deps'] = []" "        pass" &&
 expect_red "P2-e" 'release_dep_is_still'
+
+# ---- QA t008 観点 5: dispatch() の呼び出し箇所 ------------------------------
+# 注入前の全スイートは、これらの注入に対して緑だった (QA の D1)。
+CYCLE=tests/test_dispatcher_cycle_honours_hold.py
+GATE_LINE="        verdict = dependency_gate(slug, meta, done_ids_by_mission, task_statuses_by_mission)
+        unmet_deps = verdict.unmet"
+
+section "D1 (QA): dispatch() の verdict を、dependency_gate を通さず旧規則の直書きに置き換える"
+restore
+replace scripts/dispatcher.sh "$GATE_LINE" "        verdict = __import__('types').SimpleNamespace(unmet=[d for d in (meta.get('blocked_by') or []) if d not in done_ids_by_mission.get(slug, set()) and task_statuses.get(d) not in ('failed', 'cancelled')], held=[])
+        unmet_deps = verdict.unmet" &&
+echo "-- (a) 挙動: 本物の dispatch() を 1 サイクル" &&
+expect_red "D1/(a)" 'real_dispatch_cycle_sends' "$CYCLE"
+echo "-- (b) 形" &&
+expect_red "D1/(b)" 'dispatch_calls_the_gate or dispatch_does_not' "$CYCLE"
+echo "-- 既存の test_dispatcher_agrees (dependency_gate を直接問う) は、この注入に対して緑のまま (= 穴だった)"
+out="$(cd "$WORK" && env -i PATH="$PATH" HOME="$HOME" PYTHONDONTWRITEBYTECODE=1 \
+    python3 -m pytest tests/test_failed_dependency_hold.py -q -k 'dispatcher' -p no:cacheprovider 2>&1)"
+echo "$out" | tail -2
+
+section "D2: verdict を gate の後で書き換える (held を消す)"
+restore
+replace scripts/dispatcher.sh "$GATE_LINE" "        verdict = dependency_gate(slug, meta, done_ids_by_mission, task_statuses_by_mission)
+        verdict = verdict._replace(unmet=[d for d in verdict.unmet if task_statuses.get(d) != 'failed'], held=[])
+        unmet_deps = verdict.unmet" &&
+expect_red "D2/(a)" 'real_dispatch_cycle_sends' "$CYCLE"
+expect_red "D2/(b)" 'does_not_overwrite_the_verdict' "$CYCLE"
+
+section "D3: verdict はそのまま、unmet_deps だけを後から絞る (形の検査 (b) は素通りする注入)"
+restore
+replace scripts/dispatcher.sh "$GATE_LINE" "        verdict = dependency_gate(slug, meta, done_ids_by_mission, task_statuses_by_mission)
+        unmet_deps = [d for d in verdict.unmet if d not in verdict.held]" &&
+expect_red "D3/(a) — (b) では見逃す、(a) だけが捕まえる" 'real_dispatch_cycle_sends' "$CYCLE"
 
 echo
 echo "================================================================"

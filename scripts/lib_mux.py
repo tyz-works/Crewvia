@@ -30,6 +30,8 @@ CLI usage (for bash callers):
   python3 lib_mux.py available            # exit 0 = available (starts herdr server if needed)
   python3 lib_mux.py server-running       # exit 0 = mux server already up (never starts it)
   python3 lib_mux.py spawn <name> <cmd> [<cwd>]
+                                          # exit 0 = launched, 1 = did not launch,
+                                          # 10 = pane occupied by a live process, 11 = occupant unreadable
   python3 lib_mux.py send  <name> <text>
   python3 lib_mux.py capture <name>       # prints raw screen text
   python3 lib_mux.py list [<suffix>]      # one name per line
@@ -40,8 +42,10 @@ CLI usage (for bash callers):
   python3 lib_mux.py state <name>         # prints agent state string
   python3 lib_mux.py verify-sent <name> <text>  # exit 0 = text left the input line (landed)
   python3 lib_mux.py identity-ok <repo_root>    # exit 0 = repo_root still a valid git checkout
+  python3 lib_mux.py reap-records         # drop spawn records whose pane is gone; prints the names dropped
 """
 
+import calendar
 import errno
 import json
 import os
@@ -392,6 +396,23 @@ class _Backend:
     def _warn(self, msg: str) -> None:
         print(f"[mux:{self.BACKEND_NAME}] WARNING: {msg}", file=sys.stderr)
 
+    #: Why the last `spawn()` that returned False declined to launch, when the
+    #: reason is "something is already in that pane" — `SPAWN_OCCUPIED` (a live
+    #: process was seen) or `SPAWN_UNREADABLE` (the pane could not be read, so
+    #: it is treated as busy).  None for every other failure (no server, tab
+    #: create failed, a relaunch that did not take), which is the point: the
+    #: caller must not say "already running" about those (t001).
+    last_spawn_refusal: Optional[str] = None
+
+    def record_existence(self, name: str, record: dict) -> str:
+        """`PANE_EXISTS` / `PANE_GONE` / `PANE_UNOBSERVED` for the pane
+        `record` names — asked by the *id in the record*, not by `name`.
+
+        Only a definite "no such pane" may be `PANE_GONE`.  See
+        `reap_stale_pane_records()`.
+        """
+        return PANE_UNOBSERVED
+
     def spawn(self, name: str, cmd: str, cwd: Optional[str] = None,
               env: Optional[dict] = None) -> bool:
         raise NotImplementedError
@@ -627,6 +648,11 @@ def _wait_until_launched(pane_state, *, warn, name: str) -> bool:
 #: two: "may I launch here" must read it as busy, "did my launch work" must
 #: read it as no.  Collapsing it into either makes one of those wrong.
 PANE_IDLE, PANE_LIVE, PANE_UNKNOWN = "idle", "live", "unknown"
+
+#: `_Backend.last_spawn_refusal` values, and the `lib_mux.py spawn` exit codes
+#: that carry them to shell callers (0 = launched, 1 = anything else).
+SPAWN_OCCUPIED, SPAWN_UNREADABLE = "occupied", "unreadable"
+SPAWN_EXIT_OCCUPIED, SPAWN_EXIT_UNREADABLE = 10, 11
 
 
 def _pane_shell_state(pane_pid, proc_root: str = "/proc") -> str:
@@ -1463,6 +1489,134 @@ def drop_pane_record(name: str, *, repo_root=None) -> None:
               f"{exc}", file=sys.stderr)
 
 
+# ---------------------------------------------------------------------------
+# Stale-record sweep (t001)
+#
+# A record says "this checkout made a pane, and here is its id".  Nothing else
+# ends that claim when the pane goes away *without* `kill()`: the watchdog's
+# retirement signals the pane's shell pid and the mux closes the pane by
+# itself, so the record outlives the pane it names (reproduced on an isolated
+# herdr: SIGKILL the shell, the pane is gone in <0.2s, the record stays).
+#
+# This is a *separate path from the kill authorisation* on purpose.  Whether
+# the record may be dropped is answered by asking the mux about the **id the
+# record names**, never by the name and never by a listing.  A record is only
+# dropped on an answer that says "that id does not exist" — a mux that cannot
+# be asked (server down, timeout, unparseable) leaves it alone, because the
+# record is the only proof `may_destroy_pane()` has, and dropping it turns the
+# next kill into a permanent refusal (knowledge/empty-vs-unobservable.md).
+# ---------------------------------------------------------------------------
+
+#: What the mux says about the id a record names.  `UNOBSERVED` is not a shade
+#: of `GONE`: only `GONE` may end a record.
+PANE_EXISTS, PANE_GONE, PANE_UNOBSERVED = "exists", "gone", "unobserved"
+
+#: A record younger than this is never swept.  `spawn()` creates the pane
+#: first and writes the record after, so a sweep that listed the mux in
+#: between would see a pane the record does not yet describe.
+STALE_RECORD_GRACE_SECONDS = 120
+
+
+def _record_belongs_here(record: dict, repo_root=None) -> bool:
+    """Whether this checkout wrote `record` — the same notion of "ours" as
+    `pane_record_status()`, asked as a yes/no.
+
+    A record from another checkout (or with no provenance in a directory other
+    checkouts can reach) is not ours to end, whatever the mux says about it.
+    """
+    written_by = record.get("checkout")
+    if written_by:
+        return str(written_by) == _record_checkout_identity(repo_root)
+    return not _record_storage_is_shared(repo_root)
+
+
+def _record_age_seconds(record: dict, now: float) -> Optional[float]:
+    # `write_pane_record()` writes `created_at` from `gmtime()`, so this reads
+    # it back as UTC (`timegm`), not as local time.
+    try:
+        created = calendar.timegm(time.strptime(str(record.get("created_at")),
+                                                "%Y-%m-%dT%H:%M:%SZ"))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return now - created
+
+
+def reap_stale_pane_records(backend: "_Backend", *, repo_root=None,
+                            now: Optional[float] = None) -> List[str]:
+    """Drop the records whose pane no longer exists; return the names dropped.
+
+    The single place that ends a record because its pane is gone (`kill()` ends
+    one because the pane was just destroyed; that is a different reason and a
+    different path).  Every doubt keeps the record:
+
+      * the record is not ours, has no server binding, or was written against
+        another server / generation — the id it names says nothing about the
+        server being asked now;
+      * the record is younger than `STALE_RECORD_GRACE_SECONDS`, or its age
+        cannot be read;
+      * the mux does not answer with a definite "no such pane".
+
+    `CREWVIA_MUX_RECORD_SWEEP=0` stops it (returns [] without touching the
+    mux or the directory) — the switch to reach for if a sweep ever drops a
+    record it should not have; a record dropped by mistake is recovered by
+    respawning the pane, or by `--force` on a kill.
+
+    Never raises.  Deliberately **not** called from `list()`: `list()` is also
+    the watchdog's, and `registry/mux/` has exactly one writer besides `spawn()`
+    (knowledge/daemon-authority.md §3, F1).
+    """
+    if os.environ.get("CREWVIA_MUX_RECORD_SWEEP") == "0":
+        return []
+    directory = pane_record_dir(repo_root)
+    try:
+        entries = sorted(os.listdir(directory))
+    except FileNotFoundError:
+        return []
+    except OSError as exc:
+        print(f"[mux] WARNING: could not list {directory} to sweep stale pane "
+              f"records: {exc}", file=sys.stderr)
+        return []
+    now = time.time() if now is None else now
+    prefix = _pane_prefix()
+    server = None
+    dropped: List[str] = []
+    for fname in entries:
+        # `<name>.json` only: `.state.json` / `.firstseen` are the
+        # dispatcher's own markers with their own sweeps.
+        if not fname.endswith(".json") or fname.endswith(".state.json"):
+            continue
+        stem = fname[:-len(".json")]
+        if not stem.startswith(prefix):
+            continue
+        name = _caller_name(stem)
+        record = read_pane_record(name, repo_root=repo_root)
+        if record is None or record.get("backend") != backend.BACKEND_NAME:
+            continue
+        if not _record_belongs_here(record, repo_root):
+            continue
+        age = _record_age_seconds(record, now)
+        if age is None or age < STALE_RECORD_GRACE_SECONDS:
+            continue
+        recorded = record.get("server")
+        if not isinstance(recorded, dict):
+            continue
+        if server is None:
+            server = backend.server_identity() or False
+        if not server or (
+                str(recorded.get("endpoint") or "") != str(server[0])
+                or str(recorded.get("generation") or "") != str(server[1])):
+            continue
+        if backend.record_existence(name, record) != PANE_GONE:
+            continue
+        # Judge and unlink the same record: a spawn that rewrote it while the
+        # mux was being asked has made a record about a different pane.
+        if read_pane_record(name, repo_root=repo_root) != record:
+            continue
+        drop_pane_record(name, repo_root=repo_root)
+        dropped.append(name)
+    return dropped
+
+
 def _server_binding_problem(recorded_server, server, path):
     """Why the record's mux server does not vouch for `server`, or None.
 
@@ -1824,6 +1978,7 @@ class TmuxBackend(_Backend):
         FAIL-1).
         """
         self._guard("spawn", name)
+        self.last_spawn_refusal = None
         session = _session()
         window = _pane_name(name)
         try:
@@ -1856,8 +2011,14 @@ class TmuxBackend(_Backend):
                     # Asking again by name would re-open the very window this
                     # is deciding about to replacement in between.
                     inspected_id, pane_pid, _ = self._inspect_pane_full(name)
-                    if self._pane_has_live_process(name, pane_pid):
-                        return False  # live one (or unreadable) → no-op, per spec
+                    occupant = self._pane_process_state(name, pane_pid)
+                    if occupant != PANE_IDLE:
+                        # live one (or unreadable) → no-op, per spec.  Which of
+                        # the two is what the caller gets to say about it.
+                        self.last_spawn_refusal = (
+                            SPAWN_OCCUPIED if occupant == PANE_LIVE
+                            else SPAWN_UNREADABLE)
+                        return False
                     if not inspected_id:
                         self._warn(
                             f"spawn {name!r}: the window under that name could "
@@ -2150,6 +2311,42 @@ class TmuxBackend(_Backend):
                 f"spawn {name!r}: tmux would not say which server this is, so "
                 f"this spawn goes unrecorded — see the warning below.")
         write_pane_record(name, self.BACKEND_NAME, window_id, server=server)
+
+    def record_existence(self, name: str, record: dict) -> str:
+        """Does the window id the record names exist on *the server it names*?
+
+        One `list-windows -a` answers both halves: each line carries the
+        server's pid next to the window id, so "this id is absent" is only
+        ever concluded from a listing produced by the generation that issued
+        the id.  A different generation (or a listing that could not be read)
+        is `PANE_UNOBSERVED` — the recorded id means nothing there.
+        """
+        recorded = record.get("server")
+        generation = str((recorded or {}).get("generation") or "") \
+            if isinstance(recorded, dict) else ""
+        handle = str(record.get("handle") or record.get("tab_id") or "")
+        if not re.fullmatch(r"@\d+", handle) or not generation:
+            return PANE_UNOBSERVED
+        try:
+            r = subprocess.run(
+                ["tmux", "list-windows", "-a", "-F", "#{pid} #{window_id}"],
+                capture_output=True, text=True, timeout=5,
+            )
+        except Exception:
+            return PANE_UNOBSERVED
+        if r.returncode != 0:
+            return PANE_UNOBSERVED
+        seen = set()
+        for line in r.stdout.splitlines():
+            parts = line.split()
+            if len(parts) != 2 or "#{" in line:
+                return PANE_UNOBSERVED
+            if parts[0] != generation:
+                return PANE_UNOBSERVED
+            seen.add(parts[1])
+        if not seen:
+            return PANE_UNOBSERVED
+        return PANE_EXISTS if handle in seen else PANE_GONE
 
     def _inspect_pane(self, name: str):
         """`(window_id, pane_pid)` in one `display-message` — see _Backend."""
@@ -2757,6 +2954,45 @@ class HerdrBackend(_Backend):
     def _delete_cache(self, name: str) -> None:
         drop_pane_record(name)
 
+    def _pane_existence(self, pane_id, expected_label: str) -> str:
+        """`PANE_EXISTS` / `PANE_GONE` / `PANE_UNOBSERVED` for `pane_id`.
+
+        **The one place a `pane get` answer is read as "this pane is gone".**
+        Everything that ends a record because its pane vanished — the
+        resolution paths and the sweep — goes through here.
+
+        herdr puts *every* failure in an `{"error": ...}` body, so "there is an
+        error" is not "the pane is gone": a server that is down answers
+        `server_not_running` in exactly that shape.  Reading any error as gone
+        is what let a herdr outage drop the record that proves this checkout
+        made the pane.  Only `pane_not_found` is a definite absence.
+
+        A pane that exists but carries a different, non-empty label is gone as
+        far as the record is concerned: after a server restart an id can be
+        handed to another tab, and the record names ours.  An empty label is
+        not a mismatch — a tab is created before it is renamed.
+        """
+        if not pane_id:
+            return PANE_UNOBSERVED
+        data = _herdr_run("pane_get", [pane_id], timeout=5)
+        if not isinstance(data, dict):
+            return PANE_UNOBSERVED
+        if "result" in data:
+            pane = (data.get("result") or {}).get("pane") \
+                if isinstance(data.get("result"), dict) else None
+            label = pane.get("label") if isinstance(pane, dict) else None
+            if isinstance(label, str) and label and label != expected_label:
+                return PANE_GONE
+            return PANE_EXISTS
+        err = data.get("error")
+        if isinstance(err, dict) and err.get("code") == "pane_not_found":
+            return PANE_GONE
+        return PANE_UNOBSERVED
+
+    def record_existence(self, name: str, record: dict) -> str:
+        return self._pane_existence(str(record.get("pane_id") or ""),
+                                    _pane_name(name))
+
     def _resolve_pane_id(self, name: str) -> Optional[str]:
         """Resolve pane_id for `name` — cache first, then live pane list.
 
@@ -2767,10 +3003,10 @@ class HerdrBackend(_Backend):
         if cached:
             pane_id = cached.get("pane_id")
             # Verify cache is still live.
-            data = _herdr_run("pane_get", [pane_id or ""], timeout=5)
-            if data is not None and "result" in data:
+            seen = self._pane_existence(pane_id, _pane_name(name))
+            if seen == PANE_EXISTS:
                 return pane_id
-            if data is not None:
+            if seen == PANE_GONE:
                 # herdr answered, and the answer is that the pane is gone.
                 self._delete_cache(name)
             # Otherwise we could not *ask*.  The record stays: dropping it on a
@@ -2798,10 +3034,10 @@ class HerdrBackend(_Backend):
         cached = self._read_cache(name)
         if cached:
             pane_id = cached.get("pane_id")
-            data = _herdr_run("pane_get", [pane_id or ""], timeout=5)
-            if data is not None and "result" in data:
+            seen = self._pane_existence(pane_id, _pane_name(name))
+            if seen == PANE_EXISTS:
                 return cached
-            if data is not None:
+            if seen == PANE_GONE:
                 self._delete_cache(name)   # answered: the pane is gone
             # could not ask → keep the record; see _resolve_pane_id()
 
@@ -2984,6 +3220,7 @@ class HerdrBackend(_Backend):
         command is relaunched into that pane and True is returned.
         """
         self._guard("spawn", name)
+        self.last_spawn_refusal = None
         ws_id = self._workspace_id()
         if ws_id is None:
             self._warn(f"spawn {name!r}: could not resolve workspace")
@@ -2997,8 +3234,16 @@ class HerdrBackend(_Backend):
                 if pane.get("label") != _pane_name(name):
                     continue
                 existing_pane_id = pane.get("pane_id") or ""
-                if not existing_pane_id or self._pane_has_live_process(existing_pane_id):
-                    return False  # Live agent in there → no-op
+                if not existing_pane_id:
+                    self.last_spawn_refusal = SPAWN_UNREADABLE
+                    return False
+                occupant = self._pane_process_state(existing_pane_id)
+                if occupant != PANE_IDLE:
+                    # Live agent in there (or one we cannot see past) → no-op.
+                    self.last_spawn_refusal = (
+                        SPAWN_OCCUPIED if occupant == PANE_LIVE
+                        else SPAWN_UNREADABLE)
+                    return False
                 # Husk pane: herdr restored the label but not the process.
                 # Relaunching in place keeps the tab (and its position) and is
                 # what makes ./crewvia recover on its own after a server
@@ -3338,6 +3583,24 @@ class Mux:
     def available(self) -> bool:
         return self._backend.available()
 
+    @property
+    def last_spawn_refusal(self) -> Optional[str]:
+        """Why the last `spawn()` declined because the pane was occupied, or
+        None — see `_Backend.last_spawn_refusal`."""
+        return self._backend.last_spawn_refusal
+
+    def reap_stale_records(self) -> List[str]:
+        """Drop spawn records whose pane is gone; the names dropped.
+
+        See `reap_stale_pane_records()`.  Not part of `list()`.
+        """
+        try:
+            return reap_stale_pane_records(self._backend)
+        except Exception as e:
+            print(f"[mux] WARNING: sweeping stale pane records failed: {e}",
+                  file=sys.stderr)
+            return []
+
     def server_running(self) -> bool:
         return self._backend.server_running()
 
@@ -3428,7 +3691,19 @@ def _cli_main(args: List[str]) -> int:
             return 2
         name, cmd = rest[0], rest[1]
         cwd = rest[2] if len(rest) >= 3 else None
-        return 0 if m.spawn(name, cmd, cwd=cwd) else 1
+        if m.spawn(name, cmd, cwd=cwd):
+            return 0
+        # 0 = launched, 1 = did not launch, 10/11 = did not launch *because the
+        # pane is occupied* (a live process / one that could not be read).  A
+        # caller that wants to say "already running" needs the second kind
+        # only: a name in `list` after a failed spawn is also what a relaunch
+        # that did not take looks like (t001).
+        refusal = m.last_spawn_refusal
+        if refusal == SPAWN_OCCUPIED:
+            return SPAWN_EXIT_OCCUPIED
+        if refusal == SPAWN_UNREADABLE:
+            return SPAWN_EXIT_UNREADABLE
+        return 1
 
     elif verb == "send":
         if len(rest) < 2:
@@ -3501,6 +3776,11 @@ def _cli_main(args: List[str]) -> int:
             return 2
         name, text = rest[0], " ".join(rest[1:])
         return 0 if m.verify_sent(name, text) else 1
+
+    elif verb == "reap-records":
+        for n in m.reap_stale_records():
+            print(n)
+        return 0
 
     elif verb == "identity-ok":
         if not rest:

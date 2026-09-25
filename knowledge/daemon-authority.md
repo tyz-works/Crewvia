@@ -1992,6 +1992,73 @@ role では発火しないこと、throttle が効くこと・窓が空けば再
 3 本が意図通り fail する (`test_healthy_daemons_never_invoke_python3` は daemons/ 不在の分岐が
 t048 の時点で既に成立していたため元々 green) ことを確認済み。
 
+### 7-14. pane が消えても記録が残る — 失効記録の掃除 (t001, 2026-09-25)
+
+`registry/mux/<name>.json` は「この checkout が pane を作った、その id」の記録で、§7-11-2 以降は
+**kill の認可の唯一の証拠**である。書くのは `spawn()`、消すのは `kill()` だけだった。だから
+`kill()` を通らずに pane が消えると、記録だけが残る。
+
+**発生源 (実測)**: Worker の retirement は pane の shell pid に SIGTERM → SIGKILL を送るだけで
+`mux.kill()` を通らない (`lib_retirement.py` `_step_sigterm` / `_step_sigkill`)。mux は 0.2 秒以内に
+pane を自分で閉じるが、記録を消す者がいない。隔離 herdr で `spawn` → shell pid を `kill -9` して
+再現した (pane は消え、記録は残る)。着手前に本番で見つかった 5 件の失効記録
+(Ren / Haruto / Wei / Seo / Arjun) は、いずれも retire 済みの Worker だった。
+
+**症状 (a)「already running と言われるのにペインが無い」の真因は特定できていない。**
+記録が原因ではないことは確かめた — `spawn()` も `list()` も記録を読まない (herdr は
+`pane list` をラベルで、tmux は `list-windows` を名前で引く)。失効記録を置いたまま
+`spawn` すると新しい pane が作られ、記録は上書きされる。隔離 herdr で、正常な close /
+server 再起動 (husk として復元) / retirement 相当の SIGKILL の 3 経路を試したが、どれでも
+拒否は再現しなかった。本番の `logs/{dispatcher,watchdog,kai-spawn}` と `registry/daemons/` にも
+該当のイベントは無い (`start.sh` の「already running」は端末に出るだけでログに残らない)。
+**実際に再現できたのは別の誤報**である: 空の pane への再起動が定着しなかった
+(`_wait_until_launched` が偽) とき `spawn` は False を返し、名前は `list` に出続けるので、
+`start.sh` は「already running」と言っていた。これは (a) の一因になりうるが、7 回の発生が
+これだったとは確認できていない。
+
+**掃除の契約** (`lib_mux.reap_stale_pane_records()` — 判定はここ 1 箇所):
+
+- **消してよいのは、mux が「その id は無い」と明確に答えたときだけ。** herdr は失敗を全部
+  `{"error": ...}` で返し、server 不達も `server_not_running` としてその形で来る。
+  `pane_not_found` 以外 (不達・timeout・未知のエラー・空応答) は「観測できなかった」で、
+  記録を残す。消すと次の kill が恒久拒否になる (`knowledge/empty-vs-unobservable.md`)。
+  従来の `_resolve_pane_id()` / `_resolve_ids()` は「error がある = 消えた」と読んでいて、
+  **herdr の停止中に呼ばれただけで記録が消えた**。`HerdrBackend._pane_existence()` に集約して直した。
+- **名前ではなく、記録が指す id を問い合わせる。** id がいま別のラベルの pane のものなら
+  「消えた」(server 再起動で id が振り直された)。空のラベルは不一致と見ない
+  (tab は作成後にラベルが付く)。tmux は `list-windows -a -F '#{pid} #{window_id}'` の 1 回の
+  問い合わせで、id を発行した世代の一覧であることまで確かめる。
+- **迷ったら残す**: 自分の checkout の記録でない / server 束縛が無い / 別の endpoint・世代 /
+  120 秒より若い / 年齢が読めない / 判定と削除の間に書き直された。
+- **kill の認可とは別経路**: 掃除は `may_destroy_pane()` を呼ばず、逆も呼ばない。掃除が消せるのは
+  「消えた pane の記録」だけで、他人の pane を殺す認可には化けない。
+- **書き手は増やさない**: `list()` には混ぜない (watchdog も `list()` を呼ぶ。§3 / F1)。
+  呼ぶのは dispatcher (`sweep_stale_pane_records()`、`.firstseen` 掃除の隣) と `start.sh`
+  (`mux_reap_records`、spawn の前) だけ。テストは watchdog 側のファイルに `reap_stale` が
+  現れたら落ちる。
+- 記録の削除は `drop_pane_record()` 1 箇所 (テストが AST で数える)。
+
+**`spawn` の終了コード**: 0 = 起動した / 1 = 起動しなかった / **10 = pane に live なプロセスが居る /
+11 = pane の中身が読めず busy 扱い**。`start.sh` が「already running」と言うのは 10 だけ
+(11 は「読めなかった」、1 は「起動が定着しなかった」または純粋な失敗)。dispatcher / watchdog の
+起動 (`lib_daemon_watch.py spawn`) は別経路で、ここでは変えていない。
+
+**ロールバック**: 停止スイッチは `CREWVIA_MUX_RECORD_SWEEP=0` (掃除が何も見ず何も消さない)。
+dispatcher は cycle ごとに新しい python なので、`dispatcher.sh` の env に足して再起動すれば効く。
+`start.sh` は env をそのまま読む。掃除が誤って記録を消したときの復旧は、その pane を respawn する
+(記録が書き直される) か、kill に `--force`。mux の停止中は掃除が何も消さないので、停止中に
+呼ばれること自体は安全。revert するなら `dispatcher.sh` の `sweep_stale_pane_records()` 呼び出しと
+`start.sh` の `mux_reap_records` を外せば掃除は止まる (テストは
+`tests/test_stale_pane_record_sweep.py` / `tests/start-sh-spawn-refusal.bats`)。
+**merge 後、dispatcher の再起動が要る** (`knowledge/dispatcher-restart-after-merge.md`)。
+
+**残した穴**: 別世代の server に対する記録 (server が再起動した後の記録) は掃除しない。
+その id は別のものかもしれず、判定の根拠が無い。同名の pane が spawn されれば上書きされる。
+`<name>.state.json` / `.firstseen` は dispatcher 自身の別の印で、この掃除の対象外。
+
+回帰テスト: `tests/test_stale_pane_record_sweep.py`、`tests/start-sh-spawn-refusal.bats`。
+欠陥を戻すと赤くなることは `tests/red_proof_t001_stale_records.sh` (9 種) で実証した。
+
 ---
 
 ## 8. 参照
@@ -2019,5 +2086,7 @@ t048 の時点で既に成立していたため元々 green) ことを確認済�
 - `scripts/lib_daemon_watch.sh` — dispatcher の heartbeat を bash から書く (§7-2)
 - `hooks/post-tool-use.sh` — 同時死の backstop (§7-13)。`_INTENTIONAL_EXIT_CODE` /
   `daemon-backstop` セクション。`tests/test_daemon_backstop_hook.py` が回帰テスト
+- `scripts/lib_mux.py` — `reap_stale_pane_records()` / `HerdrBackend._pane_existence()` /
+  `TmuxBackend.record_existence()` (§7-14)、`spawn` の終了コード 10 / 11
 - `knowledge/dispatcher-restart-after-merge.md` — 常駐デーモンの反映手順。
   **§7-5 の pause を挟む手順が追加された**ので、kill → spawn を素で打たないこと

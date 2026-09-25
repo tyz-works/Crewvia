@@ -46,7 +46,8 @@
   持ち込まないため。invoke のたびに新しいタブが開く
 - 制約: plugin は **`r` キーでしか再読み込みしない**（crewvia が書き換えても自動反映されない。
   実測済み）。ファイルが見つからないと plugin は**エラーを出さず同梱のサンプルを表示する**
-  （画面タイトルが `crewvia / N missions` でなければ crewvia のファイルを読めていない）。
+  （画面タイトルが `crewvia / <slug>`（active mission が 1 件のとき）か `crewvia / N missions`
+  （0 件・2 件以上のとき）でなければ crewvia のファイルを読めていない）。
   **herdr 0.9.0 では、エージェントが 1 つでも居ると plugin は `[offline]`（`Broken pipe`）になり、
   live なエージェント状態は来ない**（plugin が同一接続で snapshot の後に subscribe を送るのが原因。
   upstream `tyz-works/herdr-task-graph` 側の修正が要り、crewvia では直せない）。得られるのは

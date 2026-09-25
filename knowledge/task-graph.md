@@ -146,8 +146,11 @@ plugin は同一接続で `session.snapshot` → `events.subscribe` の順に送
 （"Product delivery"）を置いている。symlink の先が無い（生成前・パス違い・主 checkout でなく
 worktree を指した）と、**エラーなしでサンプルが描かれる**。
 
-→ **画面のタイトルが `crewvia / N missions` であることを毎回の確認点にする。**
-そうでなければ crewvia のファイルは読めていない。
+→ **画面のタイトルが `crewvia / <slug>`（active mission が 1 件のとき）または
+`crewvia / N missions`（0 件・2 件以上のとき）であることを毎回の確認点にする。**
+どちらでもなければ crewvia のファイルは読めていない。crewvia は 1 mission だけの状態が
+普通なので、`N missions` だけを確認点にすると日常的に誤判定する（実装は `scripts/plan.sh` の
+`len(slugs) == 1` 分岐）。
 
 ### 4-3. 「QA FAIL 後の WAIT 表示は信用しない」は不要（crewvia 側で READY を導出している）
 
@@ -262,7 +265,7 @@ plugin は全 task を並べる。完了済みが数十件あると箱が潰れ�
 | 症状 | まず見るところ |
 |---|---|
 | 画面が古い | `r` を押したか。ファイル側は `ls -l registry/task-graph/tasks.json` の mtime で確認 |
-| 画面が crewvia の内容でない（サンプルが出る） | タイトルが `crewvia / N missions` か。symlink の先が存在するか、主 checkout を指しているか |
+| 画面が crewvia の内容でない（サンプルが出る） | タイトルが `crewvia / <slug>`（1 mission）か `crewvia / N missions`（0・2 件以上）か。symlink の先が存在するか、主 checkout を指しているか |
 | ファイルが更新されない | `CREWVIA_TASK_GRAPH=0` になっていないか。`plan.sh task-graph` を手で実行して出力を見る。`plan.sh` の stderr に生成失敗の 1 行が出ていないか |
 | `plan.sh task-graph` が「queue が違う」と拒否する | `CREWVIA_QUEUE` が `<root>/queue` でない。書き先を明示するなら `CREWVIA_TASK_GRAPH_FILE` |
 | ヘッダーが `[offline]`、最下部に `ERROR: [Errno 32] Broken pipe` | Worker が動いている間は**平常**（§4-1b。herdr 0.9.0 の plugin の欠陥で、upstream 側の修正待ち）。crewvia の tasks.json 側を疑わない。task の状態表示は crewvia の値のまま |

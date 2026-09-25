@@ -395,7 +395,8 @@ Other markers in a title: `[依存不明: id]` (depends on a task that does not 
   (plus the `r` reload above). Crewvia writes an explicit `status` for every task, and the
   plugin uses that in preference to anything it derives from an agent, so the task states you
   see are Crewvia's regardless of `[offline]`.
-- **If the title is not `crewvia / N missions`, you are looking at the plugin's bundled
+- **If the title is neither `crewvia / <slug>` (exactly one active mission) nor
+  `crewvia / N missions` (zero, or two or more), you are looking at the plugin's bundled
   example.** When the file is missing (for example a dangling symlink) the plugin does not
   complain; it falls back to a sample graph. Re-run `./scripts/plan.sh task-graph` and check
   the link.

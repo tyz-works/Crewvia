@@ -357,7 +357,8 @@
 | `CREWVIA_HERDR_WORKSPACE` | herdr backend が使うワークスペース名（デフォルト: `crewvia`） |
 | `CREWVIA_HERDR_SOCK` | **テスト専用**。lib_mux が ping する herdr API socket のパスを上書きする（デフォルト: `~/.config/herdr/herdr.sock`）。実 herdr はこの変数を読まないため、本番で設定すると ping 先と server の bind 先が食い違う |
 | `CREWVIA_MUX_RECORD_SWEEP` | 失効した mux spawn 記録（`registry/mux/*.json`）の掃除の停止スイッチ。`0` で掃除が何も見ず何も消さない（既定は有効）。**止まるのは掃除だけ**で、記録の書き込みロックは常に働く。dispatcher は cycle ごとに新しい python なので dispatcher の env に足して再起動すれば効く。`start.sh` は env をそのまま読む。掃除は消す側の 1 者なので食い違っても危険な側には倒れない（規則を共有する `lib_dep_rules` 等に env スイッチを付けない理由と逆）。`knowledge/daemon-authority.md` §7-14 |
-| `CREWVIA_MUX_TEST_ISOLATION` | **テスト専用**。テスト中であることの印。`tests/conftest.py` が `os.environ` に置くので subprocess にも継承される。これが立っている間、既定の宛先 (`crewvia`) や接頭辞なしのペイン名を名指しする mux verb は `MuxTestIsolationError` で拒否される (2026-09-23 の本番 dispatcher 乗っ取り事故の再発防止。`knowledge/daemon-authority.md` §7-11) |
+| `CREWVIA_MUX_TEST_ISOLATION` | **テスト専用**。テスト中であることの印。`tests/conftest.py` が `os.environ` に置くので subprocess にも継承される。これが立っている間、既定の宛先 (`crewvia`) や接頭辞なしのペイン名を名指しする mux verb は `MuxTestIsolationError` で拒否される (2026-09-23 の本番 dispatcher 乗っ取り事故の再発防止。`knowledge/daemon-authority.md` §7-11)。**セッションが作った宛先 (`crewvia-pytest-<pid>-<hex>`) は pytest の終了時に片付けられる**（`tests/pytest_workspace_sweep.py`。以前は herdr に空の workspace が 1 回ごとに溜まっていた） |
+| `CREWVIA_PYTEST_WORKSPACE_SWEEP` | **テスト専用**。pytest 終了時の**残骸掃除**の停止スイッチ。`0` のときだけ、死んだ pid の `crewvia-pytest-<pid>-<hex>` を何も見ず何も消さない（既定は有効）。**止まるのは残骸掃除だけ**で、セッション自身の宛先の後始末は止まらない（自分の label だけを消すので危険が無く、止めると元の漏れに戻る）。消すのは「形が合う・pid が `ESRCH`・live な pane が無い」の AND を満たす宛先だけ。pytest を起動するシェルの env に足すだけで効く（デーモンの再起動は不要）。`knowledge/daemon-authority.md` §7-15 |
 | `CREWVIA_MUX_PANE_PREFIX` | **テスト専用**。ペイン名の名前空間。**本番は空 (no-op)**。設定すると `spawn("dispatcher")` が `<prefix>dispatcher` に解決され、本番のペイン名そのものが到達不能になる |
 | `NTFY_URL` | ntfy サーバーの URL。`approval_channel.ntfy.url` より優先 |
 | `NTFY_TOPIC` | ntfy 通知トピック名。**必須** — 空のまま運用すると通知が silent skip される |

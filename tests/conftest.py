@@ -70,6 +70,23 @@ def pytest_configure(config):
     os.environ["CREWVIA_MUX_PANE_PREFIX"] = TEST_PANE_PREFIX
 
 
+def pytest_unconfigure(config):
+    """終わるときに、このセッションが作った宛先 (と、死んだ pytest の残骸) を片付ける。
+
+    上の隔離は「本番 `crewvia` を撃たない」ための宛先を毎回作るが、herdr は初回
+    アクセスで workspace を自動作成し、以前は誰も閉じなかった (backlog #15: 50 個
+    溜まった)。後始末は `tests/pytest_workspace_sweep.py` にある。何があっても
+    テストの結果は変えない (例外を出さない)。**隔離の仕組みには触れない。**
+
+    `pytest_sessionfinish` ではなくここなのは、collection エラーや中断でも走るため。
+    残骸掃除を「開始時」でなく「終了時」にしたのは、開始時だと `--collect-only` や
+    `--help` でも本番 herdr を触りにいくうえ、掃除のぶんだけ最初のテストが遅れるから。
+    SIGKILL された回の残骸は、次に正常終了した回が拾う。
+    """
+    import pytest_workspace_sweep
+    pytest_workspace_sweep.run_cleanup(TEST_DESTINATION, PRODUCTION_DESTINATION)
+
+
 @pytest.fixture
 def production_destination(monkeypatch):
     """Put the environment back the way the 2026-09-23 incident found it.

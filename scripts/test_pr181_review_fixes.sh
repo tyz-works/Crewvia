@@ -158,7 +158,7 @@ echo "--- Test 3: same flow but ending in 'fail' instead of 'done' ---"
 run_plan_rc needs-director t002 "$LONG_REASON" --mission "$MISSION_SLUG"
 run_plan_rc update t002 --reset --mission "$MISSION_SLUG"
 run_plan_rc update t002 --status in_progress --worker sofia --mission "$MISSION_SLUG"
-run_plan_rc fail t002 "registry/handoffs/sofia/t002_HANDOFF.md" --mission "$MISSION_SLUG"
+run_plan_rc fail t002 "registry/handoffs/sofia/t002_HANDOFF.md" --head "$(git rev-parse HEAD)" --mission "$MISSION_SLUG"
 if grep -q '## Needs-Director 詳細' "$TASKS_DIR/t002.md" \
    && grep -q 'Conclusion: needs Director review' "$TASKS_DIR/t002.md" \
    && grep -q 'FAILED' "$TASKS_DIR/t002.md"; then

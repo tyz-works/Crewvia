@@ -351,8 +351,10 @@ Dispatcher から `タスクなし、shutdown` を受信したら **即座に** 
 
 Watchdog がタイムアウトを通知した場合（「タイムアウトのため中断します」）、**30 秒以内** に以下を完了させること:
 
-1. HANDOFF.md を作成（最低限: 進捗 / 残作業 / 注意点の 3 点）
-2. `plan.sh fail <task_id>` を実行
+1. HANDOFF.md を作成（最低限: 進捗 / 残作業 / 注意点の 3 点 + **検証・作業した head**（`git rev-parse HEAD` の出力））
+2. `plan.sh fail <task_id> "$HANDOFF_PATH" --head "$(git rev-parse HEAD)"` を実行
+   （`--head` は必須。handoff にその head が書かれていないと拒否される — 古い handoff の再提出を防ぐため。
+   git 管理外で head が無いときだけ `--no-head "<理由 1 行>"`。記録に残り Director に見える）
 
 > **優先順位**: 「完璧な HANDOFF.md」より「30 秒以内の終了」を優先する。
 > Watchdog は 60 秒で SIGTERM → 70 秒で SIGKILL を実行する。
@@ -725,8 +727,12 @@ mkdir -p "$(dirname "$HANDOFF_PATH")"
 **Step 4**: plan.sh fail を実行:
 
 ```bash
-plan fail "$TASK_ID" "$HANDOFF_PATH" --mission "$TASK_MISSION"
+plan fail "$TASK_ID" "$HANDOFF_PATH" --head "$(git rev-parse HEAD)" --mission "$TASK_MISSION"
 ```
+
+`--head`（検証対象の commit SHA）は**必須**。HANDOFF.md に同じ head を書いておくこと（Step 3 の
+`## ブランチ` の隣に `## head` を書く）。別の head 時点の古い handoff を再提出すると拒否される。
+検証対象が git 管理外で head を出せないときだけ `--no-head "<理由 1 行>"`（免除は card に残る）。
 
 **Step 5**: Director に報告:
 
@@ -748,6 +754,9 @@ handoff_path: $HANDOFF_PATH
 
 ## ブランチ
 {branch_name}
+
+## head
+{git rev-parse HEAD の出力 — plan.sh fail --head に渡すものと同じ}
 
 ## 進捗サマリー
 [ここに何をどこまでやったかを記述]

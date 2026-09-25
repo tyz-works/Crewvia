@@ -870,6 +870,10 @@ ALLOWED_SUBPROCESS_CALLS = {
     ("plan.sh", "cmd_review", "bash"):
         "scripts/review-plan.sh を起こす。プラン本体は向こうが "
         "lib_task_cards 経由で読む",
+    ("plan.sh", "_resolve_head_commit", "git"):
+        "`git rev-parse` で --head の SHA が実在する commit かを確かめるだけ (t004)。"
+        "queue / registry のファイルは渡していない。handoff の中身は "
+        "_handoff_names_head() が lib_task_cards 経由で読む",
     ("plan.sh", "cmd_done", "sys.executable"):
         "lib_registry.py bump-task-count のサブコマンド。registry の読み書きは "
         "向こうの with_lock() + read_regular_text() の中",

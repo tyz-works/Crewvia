@@ -804,8 +804,18 @@ def test_a_hung_herdr_is_cut_by_the_timeout_and_never_changes_the_exit_code(
     即死するスタブでも通っていた)。だから**timeout を実際に通ったこと**を別に示す:
     スタブは眠る前に自分の pid と時刻を残し、pytest がそれから CLI_TIMEOUT 以上待って
     (= 即死していない) 60 秒より前に終わり (= 眠り切っていない)、スタブが殺されている。
+
+    下限の計測: subprocess.run の timeout は**子の起動前**から数え始めるが、スタブの
+    時刻は python が立ち上がって書いた**後**なので、スタブ基準だけで `timeout <= waited`
+    と言うと、正しく timeout を通っても起動が遅い回に timeout をわずかに下回る (実測 1.98 秒)。
+    だから下限は 2 本に分ける: (1) subprocess を起動する**前**から測る (起動遅延に
+    影響されない。timeout を通ったなら必ず超える)、(2) スタブ基準は起動の余裕
+    STARTUP_TOLERANCE を引いて見る (起動後すぐ死ぬスタブを、セッション全体の所要時間で
+    誤魔化して緑にしないため。0 にはしない)。
     """
     timeout = 2
+    startup_tolerance = 1.0
+    launched = time.time()
     r, _, _ = _session(
         tmp_path, {}, {}, {}, test_body=body, cli_timeout=timeout,
         herdr_stub=HUNG_HERDR.format(python=sys.executable))
@@ -818,8 +828,12 @@ def test_a_hung_herdr_is_cut_by_the_timeout_and_never_changes_the_exit_code(
     assert len(log) == 1, f"偽 herdr が 1 回だけ呼ばれて眠り始めたはず: {log}"
     pid, started = log[0].split(" ", 1)
     waited = finished - float(started)
-    assert timeout <= waited < 60, \
-        f"timeout ({timeout}s) を通ったなら待ちは {timeout}s 以上 60s 未満: {waited:.1f}s"
+    assert timeout <= finished - launched, \
+        f"timeout ({timeout}s) を通ったなら起動前からの待ちは {timeout}s 以上: " \
+        f"{finished - launched:.2f}s"
+    assert timeout - startup_tolerance <= waited < 60, \
+        f"スタブが起動してからの待ちは {timeout - startup_tolerance}s 以上 60s 未満のはず: " \
+        f"{waited:.2f}s (眠り始めてすぐ死んでいる / 眠り切っている)"
     assert sweep.pid_state(int(pid)) == sweep.PID_DEAD, \
         "timeout で偽 herdr が殺されているはず"
     assert "宛先の一覧を読めなかった" in r.stderr, "timeout は警告 1 行になる"

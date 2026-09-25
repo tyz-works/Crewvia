@@ -15,6 +15,12 @@
 #   M5  読めない拒否記録を 'none' に倒す        → 「壊れた記録は spawn を保留」が赤
 #   M6  台帳に書けない/壊れているときに黙る     → 「使えない台帳を声に出す」が赤
 #   M7  kai-review.sh が拒否記録を書かない      → scripts/test_kai_review.sh が赤
+#   --- t021 (PR #214 の Kai 指摘 P2 x2 + QA t011 の P3) ---
+#   M8  拒否記録の値を検証しない                → 「不正な値の記録は保留・サイクルを落とさない」が赤
+#   M9  離脱時にスロットルを捨てない            → 「離脱→再入 (キャッシュを消さない)」が赤
+#   M10 fingerprint が変わってもスロットルを残す → 「A → B → A」が赤
+#   M11 Director 生存確認を先に無条件で呼ぶ      → 「idle サイクルで mux を叩かない」が赤
+#   M12 Director 生存確認をサイクル内で使い回さない → 「サイクル内 1 回」が赤
 #
 # 隔離: 本番の worktree には触らない (使い捨てのコピーの中だけで変異させる)。
 # $PYTHONDONTWRITEBYTECODE=1: 欠陥注入は .pyc を通して古い姿を拾わせない
@@ -136,6 +142,48 @@ else
   bad "M7 → 拒否記録テストが赤にならなかった"
   echo "$kout" | tail -5
 fi
+
+echo "== M8: 拒否記録の値を検証しない (欄が在れば受理)"
+fresh_copy
+mutate scripts/lib_review_refusal.py "    problem = _invalid_reason(data, mission, task)" "    problem = None" || bad "M8 注入失敗"
+out="$(run_pytest)"
+expect_red M8 "$out" "test_invalid_refusal_values_hold_the_spawn_and_do_not_crash_the_cycle"
+expect_red M8 "$out" "test_refusal_load_rejects_invalid_field_values"
+expect_red M8 "$out" "test_a_refusal_record_for_another_task_is_not_accepted_as_this_ones"
+
+echo "== M9: 状態を離れても、その key のスロットルを捨てない"
+fresh_copy
+mutate scripts/dispatcher.sh "    for k in stale:
+        forget_notify(f'{k}#')" "    pass" || bad "M9 注入失敗"
+out="$(run_pytest)"
+expect_red M9 "$out" "test_needs_director_left_and_re_entered_with_same_reason_is_told_again"
+expect_red M9 "$out" "test_handoff_left_and_re_entered_is_told_again"
+
+echo "== M10: fingerprint が変わっても旧 fingerprint のスロットルを残す"
+fresh_copy
+mutate scripts/dispatcher.sh "        forget_notify(f'{key}#', keep=throttle_key)" "        pass" || bad "M10 注入失敗"
+out="$(run_pytest)"
+expect_red M10 "$out" "test_needs_director_reason_A_then_B_then_A_is_told_each_time"
+expect_red M10 "$out" "test_handoff_path_A_then_B_then_A_is_told_each_time"
+
+echo "== M11: Director 生存確認をサイクルの先頭で無条件に呼ぶ (遅延評価をやめる)"
+fresh_copy
+mutate scripts/dispatcher.sh "    _director_live_memo.clear()
+    state = load_state()" "    _director_live_memo.clear()
+    director_live_for_state_notices()
+    state = load_state()" || bad "M11 注入失敗"
+out="$(run_pytest)"
+expect_red M11 "$out" "test_an_idle_cycle_does_not_ask_the_mux_whether_a_director_is_live"
+expect_red M11 "$out" "test_a_cycle_with_only_already_told_states_does_not_ask_the_mux"
+
+echo "== M12: Director 生存確認をサイクル内で使い回さない"
+fresh_copy
+mutate scripts/dispatcher.sh "    if not _director_live_memo:
+        _director_live_memo.append" "    if True:
+        _director_live_memo[:] = []
+        _director_live_memo.append" || bad "M12 注入失敗"
+out="$(run_pytest)"
+expect_red M12 "$out" "test_liveness_is_looked_up_once_per_cycle_however_many_notices"
 
 echo
 echo "== 結果: OK=$PASS BAD=$FAIL"

@@ -566,6 +566,20 @@ def record_notify(key):
         log(f"WARNING: cannot write notify cache: {e}")
 
 
+def forget_notify(prefix, keep=None):
+    """`prefix` で始まるスロットルを捨てる (`keep` だけは残す)。捨てる = 「送れる」側。"""
+    cache = load_notify_cache()
+    gone = [k for k in cache if k.startswith(prefix) and k != keep]
+    if not gone:
+        return
+    for k in gone:
+        del cache[k]
+    try:
+        NOTIFY_CACHE.write_text(json.dumps(cache))
+    except OSError as e:
+        log(f"WARNING: cannot write notify cache: {e}")
+
+
 # ---------------------------------------------------------------------------
 # State-notice ledger (t010 / #10)
 # ---------------------------------------------------------------------------
@@ -646,11 +660,20 @@ def already_told(told, key, fp):
     return isinstance(entry, dict) and entry.get('fp') == fp
 
 
-def record_told(key, fp, kind, slug, task_id):
-    """送れた通知を台帳に書く。台帳が壊れていたら作り直す (自己修復)。"""
+def record_told(key, fp, kind, slug, task_id, throttle_key=None):
+    """送れた通知を台帳に書く。台帳が壊れていたら作り直す (自己修復)。
+
+    同じ key の fingerprint が変わった (A → B) ときは、以前の fingerprint のスロットル
+    (`<key>#<旧fp>`) を捨てる (`throttle_key` = 今送った分は残す)。捨てないと、
+    A → B → A で 3 回目の A が 1 回目の A の `<key>#<fp_A>` に NOTIFY_TTL のあいだ
+    遮られ、**新しい事象の通知が遅れる** (t021 / Kai P2)。
+    """
     told = load_told()
     if is_unreadable(told):
         told = {}
+    prev = told.get(key)
+    if isinstance(prev, dict) and prev.get('fp') != fp:
+        forget_notify(f'{key}#', keep=throttle_key)
     told[key] = {'fp': fp, 'kind': kind, 'slug': slug, 'task': task_id}
     return save_told(told)
 
@@ -672,6 +695,16 @@ def prune_told(live_keys, observed_slugs):
     for k in stale:
         del told[k]
     save_told(told)
+    # 台帳の記録だけでなくスロットル (`<key>#<fp>`) も捨てる。状態を離れて同じ理由で
+    # 戻ったのは新しい事象で、fingerprint は前回と同じ。スロットルが残っていると
+    # 台帳が「伝えていない」と言っても NOTIFY_TTL のあいだ遮られる (t021 / Kai P2)。
+    #
+    # 選んだ理由 (状態の「回」をスロットル key に入れる案を採らなかった): 回の識別子は
+    # 台帳に持たせるしかなく、台帳が使えないとき (= 再送側に倒したいとき) に key が
+    # 定まらず、連射防止のスロットルが働かなくなる。離脱時に捨てるなら、台帳が使える
+    # ときだけ (離脱を観測できたときだけ) 捨てるので、倒す向きが変わらない。
+    for k in stale:
+        forget_notify(f'{k}#')
 
 
 def observed_missions(all_tasks, active_missions):
@@ -681,11 +714,14 @@ def observed_missions(all_tasks, active_missions):
     return {slug for slug in active_missions if slug not in broken}
 
 
-def notify_state_once(key, fp, kind, slug, task_id, build_msg, *, needs_director_live=True):
+def notify_state_once(key, fp, kind, slug, task_id, build_msg, *, director_live=lambda: True):
     """状態ベースの通知を、状態が変わるまで 1 回だけ送る。
 
     順序 (安い判定を先に): 台帳が「伝えた」→ 何もしない / スロットル → 何もしない /
     Director 不在 → 記録せず見送る (戻ったらすぐ送る) / 送る。
+    `director_live` は **呼び出せる値** (遅延評価)。mux への問い合わせは、台帳とスロットルを
+    通り抜けて実際に送ろうとする通知があるときにだけ行う — 通知対象が 1 件も無い
+    サイクル (= ほとんどのサイクル) で 5 秒ごとに `mux list` を叩かないため (t021 / QA t011 の P3)。
     スロットルの key に fingerprint を含めるのは 2 つの理由: (1) 状態が変わったら
     残っているスロットルに遮られず届く、(2) 台帳に書けなくても直後のサイクルで
     同じ通知が飛ばない。
@@ -696,12 +732,12 @@ def notify_state_once(key, fp, kind, slug, task_id, build_msg, *, needs_director
     throttle_key = f'{key}#{fp}'
     if not should_notify(throttle_key):
         return False
-    if not needs_director_live:
+    if not director_live():
         log(f'WARNING: {kind} — Director 不在のため通知スキップ: {slug}/{task_id}')
         return False
     if tmux_send(_director_name(), build_msg()):
         record_notify(throttle_key)
-        record_told(key, fp, kind, slug, task_id)
+        record_told(key, fp, kind, slug, task_id, throttle_key=throttle_key)
         return True
     log(f"{kind} detected but mux send failed: {slug}/{task_id} (will retry)")
     return False
@@ -1418,6 +1454,8 @@ def review_refusal_for(slug, meta):
         rec = lib_review_refusal.load(REGISTRY_DIR, slug, task_id)
     except ValueError as e:      # ファイル名に使えない slug / id
         return 'unreadable', Unreadable(REGISTRY_DIR, str(e))
+    except Exception as e:       # backstop: 想定外でも dispatch サイクルを落とさず「保留」に倒す
+        return 'unreadable', Unreadable(REGISTRY_DIR, f'unexpected {type(e).__name__}: {e}')
     if is_missing(rec):
         return 'none', None
     if is_unreadable(rec):
@@ -1478,7 +1516,7 @@ def handle_codex_review(slug, meta, live_state_keys):
                     f"切り替えてください。"
                 )
         notify_state_once(key, fp, 'review-refused', slug, task_id, build_msg,
-                          needs_director_live=director_live_for_state_notices())
+                          director_live=director_live_for_state_notices)
         return
     spawn_key = f'kai_spawn_{slug}_{task_id}'
     if should_notify(spawn_key):
@@ -1486,8 +1524,20 @@ def handle_codex_review(slug, meta, live_state_keys):
             record_notify(spawn_key)
 
 
+_director_live_memo = []     # dispatch() が毎サイクルの先頭で空にする
+
+
 def director_live_for_state_notices():
-    return bool(_mux.list(suffix='-director'))
+    """Director の窓が生きているか。**サイクル内で最初に必要になったときに 1 回だけ**問い合わせる。
+
+    以前は needs_director / handoff のループの前で無条件に呼んでいたので、通知対象が
+    無いサイクルでも mux への問い合わせが 5 秒ごとに増えていた。呼び出し側は
+    `notify_state_once(director_live=director_live_for_state_notices)` と **関数のまま**
+    渡す。1 サイクルの中で結果を使い回すのは、通知のたびに問い合わせを増やさないため。
+    """
+    if not _director_live_memo:
+        _director_live_memo.append(bool(_mux.list(suffix='-director')))
+    return _director_live_memo[0]
 
 
 def shutdown_idle_workers():
@@ -1512,6 +1562,7 @@ def shutdown_idle_workers():
 
 
 def dispatch():
+    _director_live_memo.clear()
     state = load_state()
     if is_unreadable(state):
         # Codex 9 巡目 P1。`{}` に潰すと下の `if not active_missions` に落ちて
@@ -1940,7 +1991,6 @@ def dispatch():
     # Director is up. Match Rule 5's director_live guard: 1 log line, no send
     # attempt, no notify recorded (so it re-checks, and re-notifies promptly,
     # once a Director comes back).
-    director_live_for_needs_director = director_live_for_state_notices()
     for slug, meta in all_tasks:
         if meta.get('status') != 'needs_director':
             continue
@@ -1967,7 +2017,7 @@ def dispatch():
                 + note
             )
         if notify_state_once(notify_key, fp, 'needs_director', slug, task_id, build_msg,
-                             needs_director_live=director_live_for_needs_director):
+                             director_live=director_live_for_state_notices):
             log(f"[needs_director] {slug}/{task_id}: notified director (reason: {reason_line[:80]!r})")
 
 
@@ -1975,7 +2025,6 @@ def dispatch():
     # t010 (#10): needs_director と同じく、状態が変わるまで 1 回だけ (台帳)。
     # 入力は status + handoff_path。以前は failed かつ handoff_path がある間ずっと
     # TTL ごとに再送された。
-    director_live_for_handoff = director_live_for_state_notices()
     for slug in active_missions:
         tasks_for_slug = list_tasks_for_mission(slug)
         for meta, _ in tasks_for_slug:
@@ -2015,7 +2064,7 @@ def dispatch():
                     f"plan.sh add で継続タスクを追加してください。"
                 )
             if notify_state_once(notify_key, fp, 'handoff', slug, task_id, build_msg,
-                                 needs_director_live=director_live_for_handoff):
+                                 director_live=director_live_for_state_notices):
                 log(f"handoff detected: {slug}/{task_id} -> notified director")
 
     # t010: 状態を離れた task の「伝えた」記録を捨てる (Director が pending に戻し、

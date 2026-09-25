@@ -25,6 +25,12 @@
 (`Unreadable` を返す。空の入れ物としては振る舞わない — `lib_task_cards.Unreadable`)。
 読めないことを「拒否されていない」に倒すと、壊れた記録 1 枚でループが戻る。
 
+「壊れている」には、JSON として読めない・必須欄が無いに加えて、**欄の値が使えない**
+ことも含む (t021): `pr` が正の整数でない / `diff_bytes`・`max_bytes` が 0 以上の
+整数でない (null・文字列・bool は不可) / 記録が名乗る `mission`・`task` が置き場所と
+食い違う。欄が「在る」だけで受理すると、`diff_bytes: null` が `describe()` を落として
+**dispatch サイクル全体を止め**、不正な `pr` が拒否チェックを迂回する。
+
 ## Director が意図して再試行する経路
 
 - PR を分割した / 差分を縮めた → 別の PR 番号を task に設定する
@@ -101,7 +107,9 @@ def load(registry_dir, mission, task, warn=None):
 
     - `dict`: 拒否の記録がある
     - `Unreadable` で `is_missing()`: 記録が無い (= 拒否されていない)
-    - それ以外の `Unreadable`: 読めない / 壊れている (= 拒否されていないと証明できない)
+    - それ以外の `Unreadable`: 読めない / 壊れている / 値が使えない
+      (= 拒否されていないと証明できない)。`dict` を返したときは、欄の値が検証済みで
+      `describe()` / `refused_for_pr()` が例外を出さない
     """
     path = refusal_path(registry_dir, mission, task)
     text = read_regular_text_or_unreadable(path, warn=warn)
@@ -113,10 +121,50 @@ def load(registry_dir, mission, task, warn=None):
         return Unreadable(path, f'malformed JSON ({e})')
     if not isinstance(data, dict):
         return Unreadable(path, f'expected a JSON object, got {type(data).__name__}')
+    problem = _invalid_reason(data, mission, task)
+    if problem:
+        return Unreadable(path, problem)
+    return data
+
+
+def _is_count(v):
+    """バイト数として使える値か: 0 以上の整数 (bool は数ではない)。"""
+    return isinstance(v, int) and not isinstance(v, bool) and v >= 0
+
+
+def _is_pr_number(v):
+    """PR 番号として使える値か: 正の整数、またはその十進表記の文字列。"""
+    if isinstance(v, bool):
+        return False
+    if isinstance(v, int):
+        return v > 0
+    return isinstance(v, str) and v.strip().isascii() and v.strip().isdigit() and int(v) > 0
+
+
+def _invalid_reason(data, mission, task):
+    """記録の中身が使えない理由 (使えれば None)。
+
+    フィールドが「在る」だけでは足りない (t021 / Kai P2)。値を検証せずに受理すると:
+      - `diff_bytes: null` → `describe()` が TypeError → **dispatch サイクル全体が落ちる**
+        (後続タスクと通知が全 mission で止まる。1 枚の壊れた記録が常駐デーモンを止める型)
+      - `pr` が不正 → `refused_for_pr()` が偽になり拒否チェックを**迂回**する
+        (#11 の「spawn → 拒否 → needs_director → pending → spawn」ループが戻る)
+      - 別の task の記録を置き場所にコピーした → 別物を自分の拒否として受理する
+    どれも「拒否されていないと証明できない」= 呼び出し側は spawn を保留する。
+    """
     missing = [k for k in REQUIRED_FIELDS if k not in data]
     if missing:
-        return Unreadable(path, f'missing fields: {", ".join(missing)}')
-    return data
+        return f'missing fields: {", ".join(missing)}'
+    # 記録の自己申告が置き場所 (ファイル名) と一致すること。
+    for what, want in (('mission', mission), ('task', task)):
+        if not isinstance(data[what], str) or data[what] != str(want):
+            return f'record names {what} {data[what]!r}, expected {str(want)!r}'
+    if not _is_pr_number(data['pr']):
+        return f'invalid pr: {data["pr"]!r}'
+    for k in ('diff_bytes', 'max_bytes'):
+        if not _is_count(data[k]):
+            return f'invalid {k}: {data[k]!r}'
+    return None
 
 
 def clear(registry_dir, mission, task):

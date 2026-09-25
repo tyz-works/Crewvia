@@ -39,10 +39,26 @@ dispatcher が kai-review.sh を spawn → 拒否 → needs_director (通知が�
   (観測の失敗を「状態を離れた」の証拠にしない)。
 - スロットルの key に fingerprint を含める (`<key>#<fp>`)。状態が変わったら残りのスロットルに
   遮られず届く。台帳に書けなくても、直後のサイクルで同じ通知が飛ばない。
+- **台帳の記録を捨てるとき、対応するスロットルも捨てる** (t021 / Kai P2)。fingerprint を含めた
+  `<key>#<fp>` は「同じ状態」を同じ key にするので、離脱→同じ理由で再入 (fp が同じ) や
+  A → B → A (3 回目の A が 1 回目の A と同じ fp) では、台帳が「伝えていない」と言っても残った
+  スロットルが `NOTIFY_TTL` のあいだ新しい事象の通知を遮っていた。捨てる場所は 2 つ:
+  (a) `prune_told` — 状態を離れたとき `<key>#*` を全部捨てる、(b) `record_told` — 同じ key の
+  fp が変わったとき (A → B) `<key>#<旧fp>` を捨てる (今送った分は残す)。
+  - 「状態の回」をスロットル key に入れる案は採らなかった: 回の識別子を持てるのは台帳だけで、
+    台帳が使えないとき (= 再送側に倒したいとき) に key が定まらず、連射防止が効かなくなる。
+    捨てる案は、離脱を**観測できたとき**にしか捨てないので、倒す向きが変わらない。
+  - 残る穴 (許容): 台帳が読めない/書けない間は離脱を観測できないので、離脱→再入の通知は
+    最大 `NOTIFY_TTL` 遅れる (その間も `WARNING: notified-state` は出ている)。欠落ではなく遅延。
 - 送れなかった通知 (mux send 失敗・Director 不在) は **記録しない** — 戻ったらすぐ送る。
 - 順序 (安い判定を先に): 台帳 → スロットル → Director 不在ガード → 送信。共有スロットルを
   役割ゲートより前に出さない (別の役割の通知が飢えた実例がある。
   memory: shared-throttle-before-role-gate-starves)。
+- **Director 生存確認 (`mux list`) は遅延評価**: `notify_state_once(director_live=<関数>)` と
+  関数のまま渡し、台帳とスロットルを通り抜けて実際に送ろうとしたときにだけ呼ぶ。サイクル内の
+  結果は使い回す。以前はループの前で無条件に呼んでいたので、通知対象が無い idle サイクルでも
+  mux への問い合わせが増えていた (QA t011 実測: main 2 回 → PR 3 回/サイクル)。
+  今は通知対象が無い / 伝え済みのサイクルでは 0 回。
 
 ### 置き場が「無い」と「使えない」を分ける
 
@@ -66,6 +82,14 @@ dispatcher が kai-review.sh を spawn → 拒否 → needs_director (通知が�
   needs_director 通知にも同じ 1 文が付く。
 - **記録が読めない / 壊れている → spawn を保留** (「拒否されていない」に倒さない。壊れた記録 1 枚で
   ループが戻る)。記録が **無い** (ENOENT) だけが「拒否されていない」。
+- **「壊れている」は欄の値まで見る** (t021 / Kai P2)。`load()` は欄が在るだけでは受理せず、
+  `pr` = 正の整数 (または十進表記の文字列) / `diff_bytes`・`max_bytes` = 0 以上の整数
+  (null・文字列・bool は不可) / 記録の `mission`・`task` = 置き場所 (ファイル名) と一致、を
+  満たさなければ `Unreadable` を返す。検証しないと 2 通りに壊れる: `diff_bytes: null` は
+  `describe()` を TypeError で落とし、**通知の組み立てが dispatch サイクル全体を中断して
+  後続タスクと通知が全 mission で止まる**。`pr` が不正だと `refused_for_pr()` が偽になり、
+  拒否チェックを迂回して再 spawn ループが戻る。dispatcher 側の `review_refusal_for()` にも
+  想定外の例外を「保留」に倒す backstop がある。
 
 #### Director が意図して再試行する経路
 
@@ -97,6 +121,9 @@ env var の停止スイッチは足していない — 常駐デーモンの分�
 1. **通知が届かない (台帳が「伝えた」と言っているが Director は見ていない)**:
    `registry/daemons/notified-state.json` を消す (ファイル 1 枚)。次のサイクルで、いま成り立っている
    状態が全部 1 回だけ再通知される。dispatcher の再起動は不要 (毎サイクル読み直す)。
+   **直近 `NOTIFY_TTL` (5 分) 以内に送った通知は、スロットル (`/tmp/dispatcher-notify-cache.json`、
+   `<key>#<fp>`) が残っているので最大 5 分待つ**。すぐ送り直したいなら、その `<key>#…` の
+   エントリ (またはキャッシュファイルごと) も消す。
 2. **codex-review が拒否済みのまま動かない**:
    `python3 scripts/lib_review_refusal.py clear --mission <slug> --task <id>`。全部消すなら
    `registry/daemons/review-refusals/` 内の `*.json` を消す (ディレクトリごとは消さない)。
@@ -109,7 +136,13 @@ env var の停止スイッチは足していない — 常駐デーモンの分�
 
 - `python3 -m pytest tests/test_dispatcher_notify_once.py -q` — 本物の `dispatcher.sh` の埋め込み python を
   `exec()` して `dispatch()` を回す (複製ではない)。「TTL が過ぎた」は /tmp のスロットルを消して表す。
+  **ただし離脱→再入・A → B → A のテストはスロットルを消さない** (t021)。以前の再入テストは離脱・
+  再入のサイクルで `ttl_expired=True` (キャッシュ削除) を使っていて、離脱時にスロットルが生き残る穴を
+  隠したまま緑だった (キャッシュ削除を外すと赤になる)。TTL が過ぎた状況を表す `ttl_expired=True` は
+  「TTL 後も 1 回だけ」を確かめるテストにだけ使う。
 - `bash scripts/test_kai_review.sh` — サイズ超過で拒否記録が書かれる / `--dry-run` は書かない。
-- `bash tests/red_proof_t010.sh` — 欠陥を 1 つずつ注入し、見張るテストが赤になることを確かめる。
+- `bash tests/red_proof_t010.sh` — 欠陥を 1 つずつ注入し、見張るテストが赤になることを確かめる
+  (M1〜M7 = t010 本体、M8〜M12 = t021: 拒否記録の値の検証・離脱時/fp 変更時のスロットル破棄・
+  生存確認の遅延評価と使い回し)。
 - `scripts/test_dispatcher_needs_director_notify.sh` の「TTL dedup」節は、旧仕様
   (「TTL 経過後は再送される」) を固定していたので、新仕様 (再送されない / 入力が変われば再通知) に書き換えた。

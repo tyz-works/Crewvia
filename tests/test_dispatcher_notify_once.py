@@ -197,13 +197,32 @@ def test_needs_director_is_told_again_when_the_reason_changes(h):
 
 
 def test_needs_director_left_and_re_entered_with_same_reason_is_told_again(h):
-    """Director が pending に戻し、同じ理由でまた落ちた = 新しい事象。黙ってはいけない。"""
+    """Director が pending に戻し、同じ理由でまた落ちた = 新しい事象。黙ってはいけない。
+
+    **スロットルキャッシュを消さない** (t021 / Kai P2)。以前のこのテストは離脱・再入の
+    サイクルで `ttl_expired=True` (= キャッシュ削除) を使っており、離脱時に台帳の記録は
+    捨てるのに `<key>#<fp>` のスロットルが NOTIFY_TTL 生き残る穴を隠して緑になっていた。
+    """
     h.card("t001", "needs_director", needs_director_reason="same reason")
     assert len(about(h.cycle(), "t001")) == 1
     h.card("t001", "pending")
-    h.cycle(ttl_expired=True)           # 状態を離れたことを、通知側が観測する
+    h.cycle()                           # 状態を離れたことを、通知側が観測する
     h.card("t001", "needs_director", needs_director_reason="same reason")
-    assert len(about(h.cycle(ttl_expired=True), "t001")) == 1
+    assert h.notify_cache.exists()      # スロットルは生きている (削除して緑にしていない)
+    assert len(about(h.cycle(), "t001")) == 1
+
+
+def test_needs_director_reason_A_then_B_then_A_is_told_each_time(h):
+    """A → B → A: 3 回目の A は 1 回目の A と同じ fingerprint だが、新しい事象。"""
+    h.card("t001", "needs_director", needs_director_reason="A")
+    assert len(about(h.cycle(), "t001")) == 1
+    h.card("t001", "needs_director", needs_director_reason="B")
+    assert len(about(h.cycle(), "t001")) == 1
+    h.card("t001", "needs_director", needs_director_reason="A")
+    assert h.notify_cache.exists()
+    msgs = about(h.cycle(), "t001")
+    assert len(msgs) == 1 and "理由: A" in msgs[0]
+    assert about(h.cycle(), "t001") == []       # 同じ状態が続くあいだは黙る
 
 
 def test_handoff_is_told_once_even_after_the_throttle_expires(h):
@@ -224,9 +243,27 @@ def test_handoff_left_and_re_entered_is_told_again(h):
     h.card("t002", "failed", handoff_path="/tmp/handoff-a.md")
     assert len(about(h.cycle(), "t002")) == 1
     h.card("t002", "pending")
-    h.cycle(ttl_expired=True)
+    h.cycle()                           # スロットルキャッシュは消さない (上のテストと同じ理由)
     h.card("t002", "failed", handoff_path="/tmp/handoff-a.md")
-    assert len(about(h.cycle(ttl_expired=True), "t002")) == 1
+    assert h.notify_cache.exists()
+    assert len(about(h.cycle(), "t002")) == 1
+
+
+def test_handoff_path_A_then_B_then_A_is_told_each_time(h):
+    h.card("t002", "failed", handoff_path="/tmp/handoff-a.md")
+    assert len(about(h.cycle(), "t002")) == 1
+    h.card("t002", "failed", handoff_path="/tmp/handoff-b.md")
+    assert len(about(h.cycle(), "t002")) == 1
+    h.card("t002", "failed", handoff_path="/tmp/handoff-a.md")
+    assert len(about(h.cycle(), "t002")) == 1
+    assert about(h.cycle(), "t002") == []
+
+
+def test_throttle_still_holds_while_the_state_is_unchanged(h):
+    """離脱時にスロットルを消す修正が、同じ状態の連射を許してはいけない (台帳が書けないとき)。"""
+    (h.registry / "daemons").write_text("file")     # 台帳が使えない = スロットルだけが頼り
+    h.card("t001", "needs_director", needs_director_reason="x")
+    assert sum(len(about(h.cycle(), "t001")) for _ in range(5)) == 1
 
 
 def test_other_tasks_are_independent(h):
@@ -253,6 +290,44 @@ def test_no_director_is_not_recorded_as_told(h):
     assert h.cycle() == []
     FakeMux.directors = ["Sora-director"]
     assert len(about(h.cycle(), "t001")) == 1
+
+
+# -- 安いスキップを高い判定より前に (t021 / QA t011 の P3) -------------------------
+
+def count_director_lookups(h, monkeypatch):
+    """`mux list -director` の呼び出し回数を数える口 (送信先の解決 `_director_name()` も含む)。"""
+    calls = []
+    orig = FakeMux.list
+
+    def counting(self, *a, suffix=None, **kw):
+        if suffix == "-director":
+            calls.append(1)
+        return orig(self, *a, suffix=suffix, **kw)
+    monkeypatch.setattr(FakeMux, "list", counting)
+    return calls
+
+
+def test_an_idle_cycle_does_not_ask_the_mux_whether_a_director_is_live(h, monkeypatch):
+    """通知対象が 1 件も無いサイクルで mux を叩かない (5 秒ごとに回るので、積もる)。"""
+    calls = count_director_lookups(h, monkeypatch)
+    h.cycle()
+    assert calls == []
+
+
+def test_a_cycle_with_only_already_told_states_does_not_ask_the_mux(h, monkeypatch):
+    h.card("t001", "needs_director", needs_director_reason="x")
+    h.card("t002", "failed", handoff_path="/tmp/handoff-t002.md")
+    h.cycle()                                   # ここで 1 回だけ伝える
+    calls = count_director_lookups(h, monkeypatch)
+    assert h.cycle() == [] and calls == []      # 台帳が「伝えた」と言っている間は問い合わせない
+
+
+def test_liveness_is_looked_up_once_per_cycle_however_many_notices(h, monkeypatch):
+    h.card("t001", "needs_director", needs_director_reason="x")
+    h.card("t002", "failed", handoff_path="/tmp/handoff-t002.md")
+    calls = count_director_lookups(h, monkeypatch)
+    assert len(h.cycle()) == 2
+    assert len(calls) == 1 + 2      # 生存確認 1 回 + 送信先の解決 (送るたびに 1 回)
 
 
 # -- 記録の置き場: 「無い」と「使えない」を分ける ---------------------------------
@@ -384,6 +459,69 @@ def test_unreadable_refusal_holds_the_spawn(h):
     assert len(msgs) == 1 and "読めない" in msgs[0]
 
 
+def write_refusal(h, task_id="t010", **overrides):
+    """`record()` を通さずに記録を書く (壊れた/不正な値の記録を作るため)。"""
+    body = {"mission": SLUG, "task": task_id, "pr": "214", "diff_bytes": 412345,
+            "max_bytes": 307200, "refused_at": "2026-09-25T00:00:00Z"}
+    body.update(overrides)
+    p = lib_review_refusal.refusal_path(h.registry, SLUG, task_id)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(body))
+
+
+# t021 (Kai P2): フィールドが「在る」だけで受理していた。値が不正な記録は、
+#   - diff_bytes:null → describe() が TypeError → **dispatch サイクル全体が落ちる**
+#     (後続タスクと通知が全 mission で止まる)
+#   - pr が不正 → 拒否チェックを**迂回**して再 spawn ループが戻る
+# のどちらかになる。読めない記録は「拒否されていないと証明できない」= spawn を保留。
+INVALID_REFUSAL_VALUES = [
+    {"diff_bytes": None},
+    {"max_bytes": None},
+    {"diff_bytes": "412345"},          # 文字列 (型が違う)
+    {"diff_bytes": True},              # bool は int の亜種だが数ではない
+    {"diff_bytes": -1},
+    {"max_bytes": -5},
+    {"diff_bytes": 1.5},
+    {"pr": None},
+    {"pr": ""},
+    {"pr": "abc"},
+    {"pr": "0"},
+    {"pr": -3},
+    {"pr": 214.5},
+    {"pr": ["214"]},
+]
+
+
+@pytest.mark.parametrize("bad", INVALID_REFUSAL_VALUES, ids=lambda d: repr(d))
+def test_invalid_refusal_values_hold_the_spawn_and_do_not_crash_the_cycle(h, bad):
+    review_card(h)
+    review_card(h, task_id="t012", pr="216")          # 後続のタスクも処理されなければならない
+    write_refusal(h, **bad)
+    msgs = h.cycle()                                  # 例外を出さない
+    assert not any("--pr" in c and "214" in c for c in h.spawned)       # 保留 (「拒否されていない」に倒さない)
+    assert len(about(msgs, "t010")) == 1 and "読めない" in about(msgs, "t010")[0]
+    assert any("216" in c for c in h.spawned)         # 後続の task は止まらない
+
+
+@pytest.mark.parametrize("bad", [{"mission": "some-other-mission"}, {"task": "t999"},
+                                 {"mission": None}, {"task": 10}],
+                         ids=lambda d: repr(d))
+def test_a_refusal_record_for_another_task_is_not_accepted_as_this_ones(h, bad):
+    """ファイルのコピー/取り違え。記録の自己申告 (mission/task) が置き場所と食い違えば別物。"""
+    review_card(h)
+    write_refusal(h, **bad)
+    msgs = h.cycle()
+    assert h.spawned == []
+    assert len(about(msgs, "t010")) == 1 and "読めない" in about(msgs, "t010")[0]
+
+
+def test_integer_pr_in_a_refusal_record_is_valid(h):
+    review_card(h)
+    write_refusal(h, pr=214)
+    msgs = about(h.cycle(), "t010")
+    assert h.spawned == [] and len(msgs) == 1 and "手動" in msgs[0]
+
+
 def test_refusal_does_not_touch_other_review_tasks(h):
     review_card(h, task_id="t010")
     review_card(h, task_id="t012", pr="216")
@@ -418,6 +556,40 @@ def test_refusal_malformed_is_unreadable_but_not_missing(tmp_path, body):
     p.write_text(body)
     rec = lib_review_refusal.load(tmp_path, "m", "t1")
     assert is_unreadable(rec) and not is_missing(rec)
+
+
+@pytest.mark.parametrize("bad", INVALID_REFUSAL_VALUES, ids=lambda d: repr(d))
+def test_refusal_load_rejects_invalid_field_values(tmp_path, bad):
+    from lib_task_cards import is_missing, is_unreadable
+    body = {"mission": "m", "task": "t1", "pr": "9", "diff_bytes": 500, "max_bytes": 300}
+    body.update(bad)
+    p = lib_review_refusal.refusal_path(tmp_path, "m", "t1")
+    p.parent.mkdir(parents=True)
+    p.write_text(json.dumps(body))
+    rec = lib_review_refusal.load(tmp_path, "m", "t1")
+    assert is_unreadable(rec) and not is_missing(rec)
+
+
+def test_refusal_load_rejects_a_record_that_names_another_task(tmp_path):
+    from lib_task_cards import is_missing, is_unreadable
+    lib_review_refusal.record(tmp_path, "m", "t1", "9", 500, 300)
+    src = lib_review_refusal.refusal_path(tmp_path, "m", "t1")
+    dst = lib_review_refusal.refusal_path(tmp_path, "m", "t2")
+    dst.write_text(src.read_text())               # t1 の記録を t2 の置き場所にコピー
+    rec = lib_review_refusal.load(tmp_path, "m", "t2")
+    assert is_unreadable(rec) and not is_missing(rec)
+
+
+def test_refusal_load_accepts_valid_int_and_str_pr(tmp_path):
+    for pr in (9, "9"):
+        p = lib_review_refusal.refusal_path(tmp_path, "m", "t1")
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps({"mission": "m", "task": "t1", "pr": pr,
+                                 "diff_bytes": 500, "max_bytes": 300}))
+        rec = lib_review_refusal.load(tmp_path, "m", "t1")
+        assert isinstance(rec, dict)
+        assert lib_review_refusal.refused_for_pr(rec, 9)
+        assert lib_review_refusal.describe(rec)      # 例外を出さない
 
 
 @pytest.mark.parametrize("bad", ["", "a/b", ".."])

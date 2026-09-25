@@ -580,7 +580,7 @@ def test_herdr_kill_routes_through_the_bound_close(
     monkeypatch.setattr(
         backend, "_inspect_pane_full",
         lambda name: ("wP:t7W", 4100, a_identity))
-    monkeypatch.setattr(backend, "_delete_cache", lambda name: None)
+    monkeypatch.setattr(backend, "_forget_record", lambda name, judged: None)
 
     def replace_the_server():
         herdr_servers.stop()
@@ -606,7 +606,7 @@ def test_herdr_kill_closes_the_tab_on_the_inspected_server(
         backend, "_inspect_pane_full",
         lambda name: ("wP:t7W", 4100, identity))
     deleted = []
-    monkeypatch.setattr(backend, "_delete_cache", lambda name: deleted.append(name))
+    monkeypatch.setattr(backend, "_forget_record", lambda name, judged: deleted.append(name))
 
     _owner_is_ours(monkeypatch)
 

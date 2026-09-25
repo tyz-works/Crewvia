@@ -108,6 +108,11 @@ exclude = {
     # registry ではない。"workers.yaml" は注入するソース文字列と直前の見出し
     # コメントに現れるだけで、近接ヒューリスティックがそれを拾っている。
     root / "tests" / "red_proof_t018.sh",
+    # t010 の通知テスト。`Harness.__init__` が pytest の `tmp_path / "repo"` に
+    # 使い捨ての registry を 1 度だけ組み立てる (dispatcher は REGISTRY_DIR 直下の
+    # workers.yaml を読むので、その名前で置く必要がある)。書き込みは tmp_path に
+    # 閉じ、repo の registry/workers.yaml に書く経路は存在しない。
+    root / "tests" / "test_dispatcher_notify_once.py",
 }
 proximity = 15
 found = []

@@ -177,6 +177,8 @@ if str(_SCRIPTS_DIR) not in sys.path:
 from lib_task_cards import (  # noqa: E402
     is_missing, is_unreadable, read_regular_text_or_unreadable,
 )
+# JSON の状態ストアを読む入口も 1 つ (t026)。ここで `json.loads` を書き足さない。
+from lib_daemon_state import load_json_store  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Phases
@@ -460,14 +462,11 @@ def write_json_exclusive(path, data: dict) -> str:
 
 def read_json(path) -> Optional[dict]:
     """Return the parsed document, or None if missing / unreadable / corrupt."""
-    text = read_regular_text_or_unreadable(path)
-    if is_unreadable(text):
-        return None
-    try:
-        data = json.loads(text)
-    except ValueError:
-        return None
-    return data if isinstance(data, dict) else None
+    # 「None = 無い / 読めない / 壊れている」を潰した形は従来のまま (この関数の契約)。
+    # 区別が要る呼び出し側は `load_json_store()` を直接使う (`read_pause_state()` 参照)。
+    # 読み取り・JSON・「object であること」は入口の 1 つ (t026)。
+    data = load_json_store(path)
+    return None if is_unreadable(data) else data
 
 
 def unlink_quiet(path) -> None:

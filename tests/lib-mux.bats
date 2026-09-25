@@ -215,12 +215,14 @@ log_count() {
     log_contains "send-keys -t @1 Enter"
 }
 
-@test "spawn: existing window returns exit 1 (no-op)" {
+@test "spawn: existing window is a no-op (exit 11: occupant unreadable, so busy)" {
     setup_fake_tmux
-    # Omar-worker is already in the default window list.
+    # Omar-worker is already in the default window list.  The fake's pane pid is
+    # not a real process, so what is in the window cannot be read: busy (11),
+    # not "launch it anyway" (0) and not a plain failure (1) — t001.
 
     run python3 "$LIB_MUX_PY" spawn "Omar-worker" "claude"
-    [ "$status" -eq 1 ]
+    [ "$status" -eq 11 ]
 
     # Must NOT call new-window for an existing name.
     ! log_contains "new-window"
@@ -883,7 +885,7 @@ print('herdr backend selected OK')
     # foreground process is a live `claude`.
 
     run python3 "$LIB_MUX_PY" spawn "Omar-worker" "claude"
-    [ "$status" -eq 1 ]
+    [ "$status" -eq 10 ]   # t001: a live process → 10 (occupied)
 
     # Neither a new tab nor a relaunch may happen on top of a live agent.
     ! herdr_log_contains "tab create"
@@ -946,7 +948,7 @@ print('herdr backend selected OK')
     echo '[{"name":"bash","pid":3854037,"argv":["bash","/repo/scripts/dispatcher.sh"],"cmdline":"bash /repo/scripts/dispatcher.sh"}]' > "$FAKE_PANE_PROCS"
 
     run python3 "$LIB_MUX_PY" spawn "dispatcher" "bash /repo/scripts/dispatcher.sh"
-    [ "$status" -eq 1 ]
+    [ "$status" -eq 10 ]   # t001: a live process → 10 (occupied)
 
     ! herdr_log_contains "pane run"
     ! herdr_log_contains "tab create"
@@ -958,7 +960,7 @@ print('herdr backend selected OK')
     echo '[{"name":"bash","pid":1,"cmdline":"/bin/bash"}]' > "$FAKE_PANE_PROCS"
 
     run python3 "$LIB_MUX_PY" spawn "Omar-worker" "claude"
-    [ "$status" -eq 1 ]
+    [ "$status" -eq 11 ]   # t001: cannot classify → 11 (unreadable, still busy)
     ! herdr_log_contains "pane run"
 }
 
@@ -968,7 +970,7 @@ print('herdr backend selected OK')
     echo '[{"name":"bash","pid":1,"argv":["/bin/bash"],"cmdline":"/bin/bash"},{"name":"claude","pid":2,"argv":["claude"],"cmdline":"claude"}]' > "$FAKE_PANE_PROCS"
 
     run python3 "$LIB_MUX_PY" spawn "Omar-worker" "claude"
-    [ "$status" -eq 1 ]
+    [ "$status" -eq 10 ]   # t001: a live child → 10 (occupied)
     ! herdr_log_contains "pane run"
 }
 
@@ -978,7 +980,7 @@ print('herdr backend selected OK')
     export FAKE_PROCESS_INFO_FAIL=1
 
     run python3 "$LIB_MUX_PY" spawn "Omar-worker" "claude"
-    [ "$status" -eq 1 ]
+    [ "$status" -eq 11 ]   # t001: unreadable → 11 (still busy, nothing relaunched)
 
     # Never relaunch when we cannot prove the pane is idle.
     ! herdr_log_contains "pane run"
@@ -1338,9 +1340,13 @@ STALE_FAKE
     run python3 "$LIB_MUX_PY" send "Omar-worker" "hello"
     [ "$status" -eq 0 ]
 
-    # pane get must have been called with STALE_ID (cache verification).
-    herdr_log_contains "pane get STALE_ID"
-    # Then pane list for re-resolution.
+    # The record above names no mux server (legacy format), so nothing can say
+    # which server's ids it is about: it is not asked about at all — a
+    # `pane get` over a fresh CLI connection could be answered by a different
+    # server (Kai 2巡目 P2-2).  A record that does name one is asked on a
+    # connection verified to be that generation (tests/test_renamed_pane_and_bound_existence.py).
+    [ "$(herdr_log_count "pane get STALE_ID")" -eq 0 ]
+    # So the pane is found by label: pane list for re-resolution.
     herdr_log_contains "pane list"
     # Finally pane run with the resolved id.
     herdr_log_contains "pane run w1:p1"
@@ -1755,6 +1761,10 @@ setup_fake_crewvia_tree() {
     # 単体でコピーすると import で落ちる。
     cp "${REPO_ROOT}/scripts/lib_task_cards.py" \
        "${FAKE_TREE}/scripts/lib_task_cards.py"
+    # lib_mux.py は JSON の状態ストア (pane 記録) の読み取りを
+    # scripts/lib_daemon_state.py に通す (t026)。同じくフォールバックは持たない。
+    cp "${REPO_ROOT}/scripts/lib_daemon_state.py" \
+       "${FAKE_TREE}/scripts/lib_daemon_state.py"
     printf 'mode: herdr\ntaskvia: disabled\n' > "${FAKE_TREE}/config/crewvia.yaml"
 
     FAKE_TREE_DISPATCH="${FAKE_TREE}/dispatch.log"

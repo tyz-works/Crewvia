@@ -133,7 +133,7 @@ NOTIFY_TTL     = int(sys.argv[4])
 # 「dispatcher.sh と同じロジック」を書き写すと、dispatcher が規則を
 # 変えてもこのテストだけは古い規則で緑のままになる。
 sys.path.insert(0, sys.argv[5])
-from lib_dep_rules import unmet_dependencies  # noqa: E402
+from lib_dep_rules import card_dependencies  # noqa: E402
 # カードの読み取りも本物から取る。ここに dispatcher.sh の写しを置くと、
 # 本番を直してもこのテストは緑のままになる (いちばん質の悪い緑)。
 from lib_task_cards import list_task_cards  # noqa: E402
@@ -211,8 +211,9 @@ task_statuses = {m['id']: m.get('status') for m, _ in tasks}
 unblocked_pending = []
 for meta, _ in tasks:
     if meta.get('status') != 'pending': continue
-    bb = meta.get('blocked_by') or []
-    if unmet_dependencies(bb, done_ids, task_statuses):
+    # card を丸ごと渡す (dispatcher / plan.sh と同じ入口)。blocked_by だけを渡すと
+    # released_deps (Director の解除) を見落とし、本物の規則を直しても緑のままになる。
+    if card_dependencies(meta, done_ids, task_statuses).unmet:
         continue
     task_skills = set(meta.get('skills') or [])
     if not task_skills: continue

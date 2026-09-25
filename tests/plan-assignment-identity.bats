@@ -205,7 +205,7 @@ assert d['started_at'] == '''$started''', d
   run plan pull --agent Ren --skills bash --task t002 --mission "$TEST_MISSION"
   [ "$status" -eq 0 ]
 
-  run plan_as Ren fail t001 --mission "$TEST_MISSION"
+  run plan_as Ren fail t001 --head "$(git rev-parse HEAD)" --mission "$TEST_MISSION"
   [ "$status" -eq 0 ]
 
   [ -f "$ASSIGN_DIR/Ren" ]

@@ -63,6 +63,8 @@ NOTIFY_TTL     = int(sys.argv[4])
 _SCRIPTS_DIR = REGISTRY_DIR.parent / 'scripts'
 sys.path.insert(0, str(_SCRIPTS_DIR))
 from lib_mux import Mux  # noqa: E402
+# デーモン側 JSON 状態ストアを読む入口は 1 つ (t026)。ここで `json.loads` を書き足さない。
+from lib_daemon_state import load_json_store, notify_cache_problem  # noqa: E402
 # task カードの読み取りは crewvia の中で 1 箇所しかない (Codex 5 巡目 P2)。
 # ここに frontmatter を直接読むコードを書き戻さないこと — plan.sh が受理する
 # カードとここが拾うカードが、静かにズレる。
@@ -318,12 +320,10 @@ def update_task_fields(task_path, updates):
 # ---------------------------------------------------------------------------
 
 def load_notify_cache():
-    if not NOTIFY_CACHE.exists():
-        return {}
-    try:
-        return json.loads(NOTIFY_CACHE.read_text())
-    except Exception:
-        return {}
+    # dispatcher.sh と同じ。読み取りと形の検証は入口 1 つ (t026)。使えないときは `{}`
+    # = スロットルを失う = もう一度送る側 (冪等)。
+    cache = load_json_store(NOTIFY_CACHE, check=notify_cache_problem)
+    return {} if is_unreadable(cache) else cache
 
 
 def should_notify(key):

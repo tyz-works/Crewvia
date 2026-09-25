@@ -343,3 +343,24 @@ assert する)。閉じたらそのテストが赤で知らせるので、その
 - [ ] `tests/test_queue_reads_go_through_the_guard.py` の表に 1 行足したか
       (足し忘れても `test_no_unguarded_read_remains` が落とすが、
       落ちた理由が 1 行で分かるほうがよい)
+
+## 7. mux への問い合わせ: 「エラー本文がある」は「無い」ではない (t001, 2026-09-25)
+
+ファイルの `ENOENT` と同じ区別が、mux への問い合わせにもある。herdr は失敗をすべて
+`{"error": {"code": ...}}` の本文で返す (終了コードは 1)。**pane が無いとき (`pane_not_found`) も、
+server が動いていないとき (`server_not_running`) も同じ形**で来る。
+
+`HerdrBackend._resolve_pane_id()` / `_resolve_ids()` は「本文が返った = herdr が答えた = pane は
+無い」と読み、記録 (`registry/mux/<name>.json`) を消していた。timeout (本文なし) は残すよう
+書いてあったので「観測できなかったら残す」は意図されていたが、**server 不達が「答え」の形で
+来る**ことを見落としていた。herdr の停止中に send / capture / pid が 1 回呼ばれるだけで、
+その pane を作った証拠が消え、次の kill が恒久拒否になる。
+
+- 「無い」と読んでよいのは `error.code == "pane_not_found"` だけ (`HerdrBackend._pane_existence()`。
+  `pane get` の答えを読む場所はここ 1 箇所。テストが AST で数える)
+- それ以外 (`server_not_running`・未知のコード・本文なし・空の本文) は「観測できなかった」で、
+  記録を残す
+- 空の id を尋ねるのも観測ではない (`pane get ""` は `pane_not_found` を返す)。尋ねずに保留する
+
+失効記録の掃除 (`lib_mux.reap_stale_pane_records()`) も同じ判定を通る。設計と契約は
+`knowledge/daemon-authority.md` §7-14。

@@ -17,6 +17,9 @@
 #     → notify crewvia:Sora-director
 #
 # Notification dedup: same key is suppressed for NOTIFY_TTL seconds.
+# State-based notices (needs_director / failed+handoff / codex-review refused) are sent
+# ONCE per state, not per NOTIFY_TTL: see the ledger (registry/daemons/notified-state.json)
+# and knowledge/notify-once.md (t010).
 # Standalone-safe: exits 0 silently when tmux is not available.
 #
 # IMPORTANT — Daemon restart after code changes:
@@ -132,8 +135,19 @@ from lib_dep_rules import card_dependencies  # noqa: E402
 # ここに frontmatter を直接読むコードを書き戻さないこと。
 # 再発防止は tests/test_task_card_identity.py。
 from lib_task_cards import (  # noqa: E402,F401
-    CORRUPT_TASK_STATUS, is_missing, is_unreadable, list_task_cards,
+    CORRUPT_TASK_STATUS, Unreadable, is_missing, is_unreadable, list_task_cards,
     parse_frontmatter, read_regular_text_or_unreadable, read_task_card,
+)
+# codex-review が「差分が大きすぎる」で拒否した事実の記録 (t010 / #11)。書き手は
+# kai-review.sh、読み手はここ。定義はこのモジュールに 1 つだけ。
+import lib_review_refusal  # noqa: E402
+# デーモン側 JSON 状態ストア (「伝えた」台帳・拒否の記録) を読む入口は 1 つ (t026)。
+# ここで `json.loads(text)` を書き足さないこと — 外側しか検証しない読み方が、同じ根の
+# 欠陥を PR #214 で 3 回出した。再発防止は
+# tests/test_daemon_state_reads_go_through_the_entry.py (この埋め込み python も走査する)。
+from lib_daemon_state import (  # noqa: E402
+    load_json_store, notify_cache_problem, rule5_state_problem, told_entry_problem,
+    told_ledger_problem,
 )
 _mux = Mux()
 
@@ -551,12 +565,16 @@ def dependency_gate(slug, meta, done_ids_by_mission, task_statuses_by_mission):
 # ---------------------------------------------------------------------------
 
 def load_notify_cache():
-    if not NOTIFY_CACHE.exists():
-        return {}
-    try:
-        return json.loads(NOTIFY_CACHE.read_text())
-    except Exception:
-        return {}
+    """通知スロットル `{key: 最後に送った epoch 秒}`。
+
+    読み取りと形の検証は入口 (`load_json_store`) の 1 つ (t026)。使えないとき
+    (無い / 壊れている / 値が数でない・NaN・遠い未来) は `{}` = スロットルを失う =
+    **もう一度送る** 側に倒す (冪等。次の `record_notify()` が正しい形で書き直す)。
+    値を検証せずに信じると、`cache[key]` が `TypeError` でサイクルを落とすか、NaN・未来時刻で
+    その key の通知を永久に遮る。
+    """
+    cache = load_json_store(NOTIFY_CACHE, check=notify_cache_problem)
+    return {} if is_unreadable(cache) else cache
 
 
 def should_notify(key):
@@ -573,6 +591,187 @@ def record_notify(key):
         NOTIFY_CACHE.write_text(json.dumps(cache))
     except OSError as e:
         log(f"WARNING: cannot write notify cache: {e}")
+
+
+def forget_notify(prefix, keep=None):
+    """`prefix` で始まるスロットルを捨てる (`keep` だけは残す)。捨てる = 「送れる」側。"""
+    cache = load_notify_cache()
+    gone = [k for k in cache if k.startswith(prefix) and k != keep]
+    if not gone:
+        return
+    for k in gone:
+        del cache[k]
+    try:
+        NOTIFY_CACHE.write_text(json.dumps(cache))
+    except OSError as e:
+        log(f"WARNING: cannot write notify cache: {e}")
+
+
+# ---------------------------------------------------------------------------
+# State-notice ledger (t010 / #10)
+# ---------------------------------------------------------------------------
+#
+# `should_notify()` は NOTIFY_TTL のスロットルであって **受領確認ではない**。
+# needs_director / failed+handoff_path のような *状態ベース* の通知は、状態が続く
+# かぎり TTL ごとに永久に再送された (2026-09-25、同一内容が数十通届いてユーザーが
+# デーモンを手で止めた)。スロットルを長くしても直らない — 永久に再送されること
+# が問題であって、間隔が問題ではない。
+#
+# そこで「この状態については既に伝えた」を、スロットルとは別に registry に持つ。
+# 通知内容を決める入力 (status / reason / handoff_path / 拒否の記録) を畳んだ
+# fingerprint が変わったときだけ再通知する。状態を離れた (task が pending に戻った
+# 等) ら記録を捨てる — 同じ理由でもう一度落ちたのは新しい事象だから。
+#
+# 置き場が「まだ無い」(ENOENT) は初回で普通。**置き場が使えない** (壊れている・
+# 書けない) は普通ではない: 「通知すべきものが無い」ではなく起動失敗として log に
+# 出し、スロットルだけの旧挙動 (再送側) に倒す。黙って通知を止める側には倒さない
+# — 10 時間の全停止 (t027) を作ったのは「通知が来ない」の方である。
+TOLD_FILE = REGISTRY_DIR / 'daemons' / 'notified-state.json'
+
+
+def _told_trouble(msg):
+    """台帳が使えないことを log に出す。5 秒ごとに回るので TTL に 1 回だけ。"""
+    if should_notify('told_ledger_trouble'):
+        log(f"WARNING: notified-state: {msg} — 同じ状態の通知が "
+            f"NOTIFY_TTL={NOTIFY_TTL}s ごとに再送されます (スロットルだけに戻っています)")
+        record_notify('told_ledger_trouble')
+
+
+def load_told():
+    """`{notify_key: {'fp', 'kind', 'slug', 'task'}}`、または `Unreadable`。
+
+    読み取り・JSON・**各エントリの形** の検証は `load_json_store()` (1 つの入口)。
+    ENOENT (まだ無い) は `{}`。それ以外の失敗は `Unreadable` のまま返し、
+    呼び出し側が「使えない」として扱う (空とは別)。**壊れたエントリが 1 つでもあれば
+    台帳全体が `Unreadable`** (t026 / Kai 3 巡目 P2): 外側だけ検証して内側を信じると、
+    `{"bad": {"slug": []}}` で `prune_told()` が毎サイクル `TypeError` になり、
+    prune もサイクルの残りも止まって、状態を離れて戻った task が永久に沈黙する。
+    `Unreadable` のときの向きは **再送側** (`already_told` は False、`prune_told` は何もしない、
+    `record_told` は作り直す)。
+    """
+    told = load_json_store(TOLD_FILE, check=told_ledger_problem)
+    if is_missing(told):
+        return {}
+    if is_unreadable(told):
+        _told_trouble(f"{TOLD_FILE} を使えない ({told.reason})")
+    return told
+
+
+def save_told(told):
+    try:
+        TOLD_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = TOLD_FILE.with_name(f'.{TOLD_FILE.name}.{os.getpid()}.tmp')
+        tmp.write_text(json.dumps(told, ensure_ascii=False, sort_keys=True))
+        os.replace(tmp, TOLD_FILE)
+        return True
+    except OSError as e:
+        _told_trouble(f"{TOLD_FILE} に書けない ({e})")
+        return False
+
+
+def fingerprint(*parts):
+    """通知内容を決める入力の畳み込み。入力が変われば変わる、それだけが要件。"""
+    import hashlib
+    blob = json.dumps(parts, ensure_ascii=False, sort_keys=True, default=str)
+    return hashlib.sha256(blob.encode('utf-8')).hexdigest()[:16]
+
+
+def already_told(told, key, fp):
+    """`told` は `load_told()` の結果。使えない台帳は「伝えていない」(再送側)。"""
+    if is_unreadable(told):
+        return False
+    entry = told.get(key)
+    return isinstance(entry, dict) and entry.get('fp') == fp
+
+
+def record_told(key, fp, kind, slug, task_id, throttle_key=None):
+    """送れた通知を台帳に書く。台帳が壊れていたら作り直す (自己修復)。
+
+    同じ key の fingerprint が変わった (A → B) ときは、以前の fingerprint のスロットル
+    (`<key>#<旧fp>`) を捨てる (`throttle_key` = 今送った分は残す)。捨てないと、
+    A → B → A で 3 回目の A が 1 回目の A の `<key>#<fp_A>` に NOTIFY_TTL のあいだ
+    遮られ、**新しい事象の通知が遅れる** (t021 / Kai P2)。
+    """
+    told = load_told()
+    if is_unreadable(told):
+        told = {}
+    prev = told.get(key)
+    if isinstance(prev, dict) and prev.get('fp') != fp:
+        forget_notify(f'{key}#', keep=throttle_key)
+    entry = {'fp': fp, 'kind': kind, 'slug': slug, 'task': str(task_id)}
+    # 書くものは、読み手が受け付ける形と同じでなければならない (t026)。読み手だけが
+    # 厳しいと、書いたばかりの台帳を自分が「壊れている」と読み、永久に再送側へ倒れる。
+    problem = told_entry_problem(key, entry)
+    if problem:
+        _told_trouble(f"台帳に書けない形のエントリ ({problem})")
+        return False
+    told[key] = entry
+    return save_told(told)
+
+
+def prune_told(live_keys, observed_slugs):
+    """状態を離れた task の記録を捨てる。
+
+    観測できた mission (`observed_slugs`) の task だけが対象。観測できなかった
+    (破損カード・走査失敗) ものは「離れた」の証拠にならないので触らない。
+    """
+    told = load_told()
+    if is_unreadable(told):
+        return
+    stale = [k for k, e in told.items()
+             if isinstance(e, dict) and e.get('slug') in observed_slugs
+             and k not in live_keys]
+    if not stale:
+        return
+    for k in stale:
+        del told[k]
+    save_told(told)
+    # 台帳の記録だけでなくスロットル (`<key>#<fp>`) も捨てる。状態を離れて同じ理由で
+    # 戻ったのは新しい事象で、fingerprint は前回と同じ。スロットルが残っていると
+    # 台帳が「伝えていない」と言っても NOTIFY_TTL のあいだ遮られる (t021 / Kai P2)。
+    #
+    # 選んだ理由 (状態の「回」をスロットル key に入れる案を採らなかった): 回の識別子は
+    # 台帳に持たせるしかなく、台帳が使えないとき (= 再送側に倒したいとき) に key が
+    # 定まらず、連射防止のスロットルが働かなくなる。離脱時に捨てるなら、台帳が使える
+    # ときだけ (離脱を観測できたときだけ) 捨てるので、倒す向きが変わらない。
+    for k in stale:
+        forget_notify(f'{k}#')
+
+
+def observed_missions(all_tasks, active_missions):
+    """破損カードを 1 枚も含まない active mission (= 全 task を観測できた)。"""
+    broken = {slug for slug, meta in all_tasks
+              if meta.get('status') == CORRUPT_TASK_STATUS}
+    return {slug for slug in active_missions if slug not in broken}
+
+
+def notify_state_once(key, fp, kind, slug, task_id, build_msg, *, director_live=lambda: True):
+    """状態ベースの通知を、状態が変わるまで 1 回だけ送る。
+
+    順序 (安い判定を先に): 台帳が「伝えた」→ 何もしない / スロットル → 何もしない /
+    Director 不在 → 記録せず見送る (戻ったらすぐ送る) / 送る。
+    `director_live` は **呼び出せる値** (遅延評価)。mux への問い合わせは、台帳とスロットルを
+    通り抜けて実際に送ろうとする通知があるときにだけ行う — 通知対象が 1 件も無い
+    サイクル (= ほとんどのサイクル) で 5 秒ごとに `mux list` を叩かないため (t021 / QA t011 の P3)。
+    スロットルの key に fingerprint を含めるのは 2 つの理由: (1) 状態が変わったら
+    残っているスロットルに遮られず届く、(2) 台帳に書けなくても直後のサイクルで
+    同じ通知が飛ばない。
+    """
+    told = load_told()
+    if already_told(told, key, fp):
+        return False
+    throttle_key = f'{key}#{fp}'
+    if not should_notify(throttle_key):
+        return False
+    if not director_live():
+        log(f'WARNING: {kind} — Director 不在のため通知スキップ: {slug}/{task_id}')
+        return False
+    if tmux_send(_director_name(), build_msg()):
+        record_notify(throttle_key)
+        record_told(key, fp, kind, slug, task_id, throttle_key=throttle_key)
+        return True
+    log(f"{kind} detected but mux send failed: {slug}/{task_id} (will retry)")
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -751,6 +950,33 @@ def sweep_spawn_grace_markers():
             log(f"WARNING: failed to sweep spawn-grace marker {marker}: {e}")
 
 
+def sweep_stale_pane_records():
+    """Drop `registry/mux/<name>.json` records whose pane no longer exists (t001).
+
+    A Worker's pane closes without `kill()` — watchdog's retirement signals the
+    shell pid and the mux closes the pane itself — so the record naming it
+    outlives it.  This is the same shape as `sweep_spawn_grace_markers()` and
+    lives beside it for the same reason: this daemon owns `registry/mux/`, and
+    the sweep is keyed on the pane being *gone*, not on any one kill path
+    succeeding.
+
+    The decision is `lib_mux.reap_stale_pane_records()` and nothing here
+    repeats it.  It asks the mux about the id each record names, and drops a
+    record only on a definite "no such pane"; a mux that cannot be asked
+    (down, timing out) leaves every record where it is, because the record is
+    the proof `may_destroy_pane()` needs.  It never raises, and a failure here
+    is a log line, never a failed cycle.
+
+    Rollback: a mux outage is already safe (records are kept).  To stop the
+    sweep, restart this daemon with `CREWVIA_MUX_RECORD_SWEEP=0`.
+    """
+    try:
+        for name in _mux.reap_stale_records():
+            log(f"[mux-record] swept stale spawn record for vanished pane {name!r}")
+    except Exception as e:
+        log(f"WARNING: stale spawn-record sweep failed: {e!r}")
+
+
 def warn_on_unconsumed_retirements():
     """Say so when retirement markers are not being executed (§5-3 N3).
 
@@ -797,10 +1023,11 @@ def _mux_created_at(window_target: str):
     try:
         # registry/ の固定パスもガードを通す (t018)。tmux backend ではこの
         # ファイルが存在しないのが普通なので、ENOENT は警告を出さない。
-        raw = read_queue_text(p, 'mux cache')
-        if is_unreadable(raw):
+        # 読み取りと JSON は入口の 1 つ (t026)。
+        data = load_json_store(
+            p, warn=lambda msg: log(f"WARNING: mux cache: {msg}"))
+        if is_unreadable(data):
             return None
-        data = json.loads(raw)
         ts = data.get('created_at')
         if not ts:
             return None
@@ -1038,17 +1265,17 @@ def _state_json_path(name: str) -> Path:
 
 def _load_state_entry(name: str) -> dict:
     """Load state persistence entry.  Returns {} on missing / corrupt file."""
-    p = _state_json_path(name)
-    try:
-        raw = read_queue_text(p, 'rule5 state entry')
-        if is_unreadable(raw):
-            # 倒す先はここだけ「空」でよい —— grace が最初からやり直しになる
-            # = **通知が遅れる**側で、破壊も割り当ても起こらない
-            # (knowledge/empty-vs-unobservable.md §2 の I)。
-            return {}
-        return json.loads(raw)
-    except Exception:
+    # 読み取りと形の検証は入口 (`load_json_store`) の 1 つ (t026)。`since` が文字列だと
+    # `now - since` が TypeError、list だと `.get` が AttributeError で、Rule 5 のサイクルが落ちる。
+    entry = load_json_store(
+        _state_json_path(name), check=rule5_state_problem,
+        warn=lambda msg: log(f"WARNING: rule5 state entry: {msg}"))
+    if is_unreadable(entry):
+        # 倒す先はここだけ「空」でよい —— grace が最初からやり直しになる
+        # = **通知が遅れる**側で、破壊も割り当ても起こらない
+        # (knowledge/empty-vs-unobservable.md §2 の I)。
         return {}
+    return entry
 
 
 def _save_state_entry(name: str, state: str, since: float) -> None:
@@ -1271,6 +1498,107 @@ def spawn_kai_review(slug, meta):
         return False
 
 
+def review_refusal_for(slug, meta):
+    """このcodex-review task に、差分サイズ超過の拒否記録が効いているか (t010 / #11)。
+
+    -> ('none', None)          記録が無い / 別の PR 番号 (= 出し直した) → 通常どおり spawn
+       ('refused', rec)        拒否済み → 再 spawn しない
+       ('unreadable', Unreadable)  記録が読めない・壊れている → **保留** (spawn しない)
+
+    読めない記録を「拒否されていない」に倒さない: 壊れた記録 1 枚で
+    「spawn → 拒否 → needs_director → pending → spawn」のループが戻るため。
+    """
+    task_id = meta.get('id', '?')
+    try:
+        rec = lib_review_refusal.load(REGISTRY_DIR, slug, task_id)
+    except ValueError as e:      # ファイル名に使えない slug / id
+        return 'unreadable', Unreadable(REGISTRY_DIR, str(e))
+    except Exception as e:       # backstop: 想定外でも dispatch サイクルを落とさず「保留」に倒す
+        return 'unreadable', Unreadable(REGISTRY_DIR, f'unexpected {type(e).__name__}: {e}')
+    if is_missing(rec):
+        return 'none', None
+    if is_unreadable(rec):
+        return 'unreadable', rec
+    if not lib_review_refusal.refused_for_pr(rec, meta.get('pr_number')):
+        return 'none', None
+    return 'refused', rec
+
+
+def _refusal_clear_hint(slug, task_id):
+    return (f"python3 {REPO_ROOT / 'scripts' / 'lib_review_refusal.py'} clear "
+            f"--mission {slug} --task {task_id}")
+
+
+def refusal_note(slug, meta):
+    """needs_director 通知に添える 1 文 (拒否済みのときだけ)。無ければ ''。"""
+    if not (set(meta.get('skills') or []) & CODEX_REVIEW_SKILLS):
+        return '', None
+    state, rec = review_refusal_for(slug, meta)
+    if state != 'refused':
+        return '', None
+    task_id = meta.get('id', '?')
+    note = (f" ※ codex-review は差分サイズ超過で拒否済み: "
+            f"{lib_review_refusal.describe(rec)}。手動差分レビューに切り替えてください "
+            f"(dispatcher はこの task を再 spawn しません。codex-review を意図して再試行するなら "
+            f"{_refusal_clear_hint(slug, task_id)} 、PR を分割したなら "
+            f"plan.sh update {task_id} --pr-number <新PR> --mission {slug})。")
+    return note, (rec['pr'], rec['diff_bytes'], rec['max_bytes'])
+
+
+def handle_codex_review(slug, meta, live_state_keys):
+    """unblocked-pending な codex-review task: 拒否済みなら知らせて止め、そうでなければ spawn。"""
+    task_id = meta['id']
+    state, rec = review_refusal_for(slug, meta)
+    if state != 'none':
+        key = f'review_refused_{slug}_{task_id}'
+        live_state_keys.add(key)
+        if state == 'refused':
+            fp = fingerprint('review_refused', rec['pr'], rec['diff_bytes'], rec['max_bytes'])
+            def build_msg():
+                return (
+                    f"[review-refused] task {task_id} (mission={slug}): codex-review は拒否済みです "
+                    f"({lib_review_refusal.describe(rec)})。差分が大きいと codex は途中を切り詰め、"
+                    f"空の結果を信用できないため、dispatcher は再 spawn しません。"
+                    f"手動差分レビューに切り替え、結果を plan.sh done {task_id} --mission {slug} "
+                    f"で報告してください。codex-review を意図して再試行するなら "
+                    f"{_refusal_clear_hint(slug, task_id)} 、PR を分割したなら "
+                    f"plan.sh update {task_id} --pr-number <新PR> --mission {slug}。"
+                )
+        else:
+            fp = fingerprint('review_refused', 'unreadable', rec.reason)
+            def build_msg():
+                return (
+                    f"[review-refused] task {task_id} (mission={slug}): codex-review の拒否記録が"
+                    f"読めない/壊れているため spawn を保留しています ({rec.reason})。"
+                    f"記録を確認し、意図して再試行するなら "
+                    f"{_refusal_clear_hint(slug, task_id)} 、そうでなければ手動差分レビューに"
+                    f"切り替えてください。"
+                )
+        notify_state_once(key, fp, 'review-refused', slug, task_id, build_msg,
+                          director_live=director_live_for_state_notices)
+        return
+    spawn_key = f'kai_spawn_{slug}_{task_id}'
+    if should_notify(spawn_key):
+        if spawn_kai_review(slug, meta):
+            record_notify(spawn_key)
+
+
+_director_live_memo = []     # dispatch() が毎サイクルの先頭で空にする
+
+
+def director_live_for_state_notices():
+    """Director の窓が生きているか。**サイクル内で最初に必要になったときに 1 回だけ**問い合わせる。
+
+    以前は needs_director / handoff のループの前で無条件に呼んでいたので、通知対象が
+    無いサイクルでも mux への問い合わせが 5 秒ごとに増えていた。呼び出し側は
+    `notify_state_once(director_live=director_live_for_state_notices)` と **関数のまま**
+    渡す。1 サイクルの中で結果を使い回すのは、通知のたびに問い合わせを増やさないため。
+    """
+    if not _director_live_memo:
+        _director_live_memo.append(bool(_mux.list(suffix='-director')))
+    return _director_live_memo[0]
+
+
 def shutdown_idle_workers():
     """Request retirement of idle Worker windows (D1).
 
@@ -1293,6 +1621,7 @@ def shutdown_idle_workers():
 
 
 def dispatch():
+    _director_live_memo.clear()
     state = load_state()
     if is_unreadable(state):
         # Codex 9 巡目 P1。`{}` に潰すと下の `if not active_missions` に落ちて
@@ -1356,6 +1685,9 @@ def dispatch():
 
     # Load all tasks
     all_tasks, done_ids_by_mission, task_statuses_by_mission = load_all_tasks(active_missions)
+    # t010: 状態ベースの通知 (needs_director / handoff / review-refused) が今なお
+    # 成り立っている key。サイクルの最後に、成り立たなくなった記録を捨てるのに使う。
+    live_state_keys = set()
 
     # Unblocked pending tasks (eligible for assignment), sorted by priority
     unblocked_pending = []
@@ -1645,10 +1977,7 @@ def dispatch():
         # no-op when Kai-codex is already in flight (assignment file exists)
         # or when pr_number is missing (warning logged, Director escalates).
         if task_skills & CODEX_REVIEW_SKILLS:
-            spawn_key = f'kai_spawn_{slug}_{task_id}'
-            if should_notify(spawn_key):
-                if spawn_kai_review(slug, meta):
-                    record_notify(spawn_key)
+            handle_codex_review(slug, meta, live_state_keys)
             continue
         # can_handle: True if any alive worker (window exists OR heartbeat recent) has skills ⊇ task_skills
         can_handle = any(
@@ -1711,87 +2040,109 @@ def dispatch():
     # needs-director` call left the queue silently draining to empty with no one
     # waking the Director (measured: 10h28m full stop, 2026-09-21 19:53 UTC →
     # 2026-09-22 06:22 UTC). Reuses all_tasks already loaded above — no extra scan.
-    # Re-sends every NOTIFY_TTL like the other notify_key's below (not a one-shot):
-    # should_notify() re-arms once the cache entry ages past NOTIFY_TTL, so an
-    # unresolved needs_director task keeps nagging instead of going silent forever.
+    #
+    # t010 (#10): 状態ベースの通知は **状態が変わるまで 1 回だけ**。以前は
+    # should_notify() (= NOTIFY_TTL のスロットル) だけで、対処済みの task でも 5 分ごと
+    # に永久に再送されていた (2026-09-25 に数十通)。今は notify_state_once() が
+    # 「この状態は既に伝えた」台帳 (registry/daemons/notified-state.json) を持ち、
+    # status + reason (+ 拒否記録) が変わったときだけ再通知する。Director が
+    # pending に戻して再び落ちた場合は、状態を離れた時点で台帳から捨てるので届く。
     #
     # t032 F5: _director_name() falls back to the literal 'Sora-director' when no
     # Director window is live, so with no guard this block called tmux_send()
     # unconditionally — 2 log lines (tmux_send's own WARNING + this block's own
     # "mux send failed") every 5s per needs_director task, for as long as no
     # Director is up. Match Rule 5's director_live guard: 1 log line, no send
-    # attempt, no notify_key recorded (so it re-checks, and re-notifies promptly,
+    # attempt, no notify recorded (so it re-checks, and re-notifies promptly,
     # once a Director comes back).
-    director_live_for_needs_director = bool(_mux.list(suffix='-director'))
     for slug, meta in all_tasks:
         if meta.get('status') != 'needs_director':
             continue
         task_id = meta.get('id', '?')
         notify_key = f'needs_director_{slug}_{task_id}'
-        if not should_notify(notify_key):
-            continue
-        if not director_live_for_needs_director:
-            log(f'WARNING: needs_director — Director 不在のため通知スキップ: {slug}/{task_id}')
-            continue
+        live_state_keys.add(notify_key)
         reason = (meta.get('needs_director_reason') or '').strip()
         reason_line = reason.splitlines()[0][:200] if reason else '(理由未記載)'
         task_file = MISSIONS_DIR / slug / 'tasks' / f'{task_id}.md'
-        msg = (
-            f'[needs_director] task {task_id} (mission={slug}) が needs_director です。'
-            f'理由: {reason_line}'
-            + ('…' if len(reason) > len(reason_line) else '')
-            + f' (全文: {task_file})。'
-            f'reason を読んで方針を決め、plan.sh update {task_id} --status pending --reset '
-            f'--mission {slug} で差し戻してください。'
-        )
-        if tmux_send(_director_name(), msg):
-            record_notify(notify_key)
+        # codex-review が差分サイズ超過で拒否した task には、手動差分レビューへの
+        # 切り替えと超過バイト数・PR 番号を添える (t010 / #11)。
+        note, note_inputs = refusal_note(slug, meta)
+        fp = fingerprint('needs_director', reason, note_inputs)
+
+        def build_msg(slug=slug, task_id=task_id, reason=reason, reason_line=reason_line,
+                      task_file=task_file, note=note):
+            return (
+                f'[needs_director] task {task_id} (mission={slug}) が needs_director です。'
+                f'理由: {reason_line}'
+                + ('…' if len(reason) > len(reason_line) else '')
+                + f' (全文: {task_file})。'
+                f'reason を読んで方針を決め、plan.sh update {task_id} --status pending --reset '
+                f'--mission {slug} で差し戻してください。'
+                + note
+            )
+        if notify_state_once(notify_key, fp, 'needs_director', slug, task_id, build_msg,
+                             director_live=director_live_for_state_notices):
             log(f"[needs_director] {slug}/{task_id}: notified director (reason: {reason_line[:80]!r})")
-        else:
-            log(f"needs_director detected but mux send failed: {slug}/{task_id} (will retry)")
 
 
     # Handoff detection: failed tasks with handoff_path → notify Director
-    for slug in active_missions:
-        tasks_for_slug = list_tasks_for_mission(slug)
-        for meta, _ in tasks_for_slug:
-            if meta.get('status') != 'failed':
-                continue
-            handoff_path = meta.get('handoff_path')
-            if not handoff_path:
-                continue
-            task_id = meta.get('id', '?')
-            notify_key = f"handoff_{slug}_{task_id}"
-            if should_notify(notify_key):
-                handoff_summary = ''
-                try:
-                    hp = Path(handoff_path)
-                    if not hp.is_absolute():
-                        # task_158: writer(worker.md)は crewvia_handoff_path 経由で常に絶対パスを
-                        # 書くはずなので、ここに来るのは規約からの逸脱(回帰)。cwd(worktree)基準の
-                        # 相対パスは main repo 側から見て別ファイルを指し handoff_summary が空に
-                        # なる既知の壊れ方(task_158)なので、黙って空文字にせず明示的に警告する。
-                        log(f"WARNING: handoff_path is not absolute (task_158 regression?): "
-                            f"{slug}/{task_id} handoff_path={handoff_path!r}")
-                        hp = REGISTRY_DIR.parent / handoff_path
-                    hp_text = read_queue_text(hp, 'handoff file')
-                    if not is_unreadable(hp_text):
-                        handoff_summary = ' | '.join(hp_text.splitlines()[:10])
-                    else:
-                        log(f"WARNING: handoff file unreadable at resolved path: "
-                            f"{slug}/{task_id} resolved={hp} ({hp_text.reason})")
-                except Exception:
-                    handoff_summary = '(読み取り失敗)'
-                msg = (
-                    f"タスク {task_id} (mission={slug}) が failed になりました。"
-                    f"handoff_path: {handoff_path} — {handoff_summary[:200]}。"
-                    f"plan.sh add で継続タスクを追加してください。"
-                )
-                if tmux_send(_director_name(), msg):
-                    record_notify(notify_key)
-                    log(f"handoff detected: {slug}/{task_id} -> notified director")
+    # t010 (#10): needs_director と同じく、状態が変わるまで 1 回だけ (台帳)。
+    # 入力は status + handoff_path。以前は failed かつ handoff_path がある間ずっと
+    # TTL ごとに再送された。
+    # t023 (Kai 2 巡目 P2): **ここは all_tasks を使う** (ミッションを走査し直さない)。
+    # 末尾の prune_told() は「observed_missions(all_tasks) で観測できた mission の、live に
+    # 無い key を捨てる」ので、live key を集める側も同じスナップショットでなければならない。
+    # 別の走査で live key を集めると、1 回目の走査 (all_tasks) は成功・2 回目が破損カード /
+    # 走査失敗のとき、handoff key が 1 件も集まらないのに mission は「観測できた」扱いになり、
+    # 台帳とスロットルを捨てる。読み取りが回復すると同じ failed task が再通知され、
+    # 断続的な失敗のたびに通知洪水が戻る (「観測できなかった」を「もう無い」と読む型)。
+    # 採らなかった案 (b) 「2 回目の失敗を pruning のガードに足す」: 走査を 2 回するせいで
+    # 起きる欠陥を、2 回目の結果を見張る別のガードで塞ぐことになる。ガードは持ち場が増える
+    # ぶん漏れる (t018)。スナップショットを 1 つにすれば、判断の材料が 1 つなので食い違えない
+    # (needs_director / vanished 検知はすでに all_tasks を使っている)。走査も 1 回減る。
+    for slug, meta in all_tasks:
+        if meta.get('status') != 'failed':
+            continue
+        handoff_path = meta.get('handoff_path')
+        if not handoff_path:
+            continue
+        task_id = meta.get('id', '?')
+        notify_key = f"handoff_{slug}_{task_id}"
+        live_state_keys.add(notify_key)
+        fp = fingerprint('failed', handoff_path)
+
+        def build_msg(slug=slug, task_id=task_id, handoff_path=handoff_path):
+            handoff_summary = ''
+            try:
+                hp = Path(handoff_path)
+                if not hp.is_absolute():
+                    # task_158: writer(worker.md)は crewvia_handoff_path 経由で常に絶対パスを
+                    # 書くはずなので、ここに来るのは規約からの逸脱(回帰)。cwd(worktree)基準の
+                    # 相対パスは main repo 側から見て別ファイルを指し handoff_summary が空に
+                    # なる既知の壊れ方(task_158)なので、黙って空文字にせず明示的に警告する。
+                    log(f"WARNING: handoff_path is not absolute (task_158 regression?): "
+                        f"{slug}/{task_id} handoff_path={handoff_path!r}")
+                    hp = REGISTRY_DIR.parent / handoff_path
+                hp_text = read_queue_text(hp, 'handoff file')
+                if not is_unreadable(hp_text):
+                    handoff_summary = ' | '.join(hp_text.splitlines()[:10])
                 else:
-                    log(f"handoff detected but mux send failed: {slug}/{task_id} (will retry)")
+                    log(f"WARNING: handoff file unreadable at resolved path: "
+                        f"{slug}/{task_id} resolved={hp} ({hp_text.reason})")
+            except Exception:
+                handoff_summary = '(読み取り失敗)'
+            return (
+                f"タスク {task_id} (mission={slug}) が failed になりました。"
+                f"handoff_path: {handoff_path} — {handoff_summary[:200]}。"
+                f"plan.sh add で継続タスクを追加してください。"
+            )
+        if notify_state_once(notify_key, fp, 'handoff', slug, task_id, build_msg,
+                             director_live=director_live_for_state_notices):
+            log(f"handoff detected: {slug}/{task_id} -> notified director")
+
+    # t010: 状態を離れた task の「伝えた」記録を捨てる (Director が pending に戻し、
+    # 同じ理由でまた落ちたのは新しい事象なので、届かなければならない)。
+    prune_told(live_state_keys, observed_missions(all_tasks, active_missions))
 
 
 def run_daemon_watch():
@@ -1842,6 +2193,7 @@ dispatch()
 # must run on every cycle — including the early-return cycles dispatch() takes
 # when there are no active missions.
 sweep_spawn_grace_markers()
+sweep_stale_pane_records()
 if KILL_AUTHORITY != 'dispatcher':
     warn_on_unconsumed_retirements()
 PYEOF

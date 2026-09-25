@@ -141,9 +141,17 @@ GUARDED_READS = [
     # t018: assignment / registry/mux の固定パスもガード経由へ。
     ("dispatcher.sh", "read_assignment", {"read_queue_text"}),
     ("dispatcher.sh", "check_rule5", {"read_assignment"}),
-    ("dispatcher.sh", "_mux_created_at", {"read_queue_text"}),
+    ("dispatcher.sh", "_mux_created_at", {"load_json_store"}),
     ("dispatcher.sh", "_spawn_time_fallback", {"read_queue_text"}),
-    ("dispatcher.sh", "_load_state_entry", {"read_queue_text"}),
+    # t026: JSON の状態ストアは入口 (`lib_daemon_state.load_json_store`) 経由。入口の中で
+    # ガード (`read_regular_text_or_unreadable`) を通ることは下の lib_daemon_state 行が見る。
+    ("dispatcher.sh", "_load_state_entry", {"load_json_store"}),
+    ("dispatcher.sh", "load_notify_cache", {"load_json_store"}),
+    # t010: 「伝えた」台帳。壊れた/読めない台帳を空として扱わない (ENOENT だけが「まだ無い」)。
+    ("dispatcher.sh", "load_told", {"load_json_store"}),
+    ("lib_review_refusal.py", "load", {"load_json_store"}),
+    ("lib_daemon_state.py", "load_json_store", {"read_regular_text_or_unreadable"}),
+    ("verifier-dispatcher.sh", "load_notify_cache", {"load_json_store"}),
 
     # --- verifier-dispatcher.sh ------------------------------------------
     ("verifier-dispatcher.sh", "_read_queue_text",
@@ -170,7 +178,7 @@ GUARDED_READS = [
     # --- lib_retirement.py (t018) ----------------------------------------
     # watchdog のサイクルの中で退役要求ごとに走る。止まると退役処理全体が
     # 返らない。
-    ("lib_retirement.py", "read_json", {"read_regular_text_or_unreadable"}),
+    ("lib_retirement.py", "read_json", {"load_json_store"}),
     ("lib_retirement.py", "read_task_started_at",
      {"read_regular_text_or_unreadable"}),
     ("lib_retirement.py", "assignment_execution_verdict",
@@ -180,11 +188,10 @@ GUARDED_READS = [
 
     # --- lib_daemon_watch.py (t018) --------------------------------------
     ("lib_daemon_watch.py", "load_config", {"read_regular_text_or_unreadable"}),
-    ("lib_daemon_watch.py", "read_pause_state",
-     {"read_regular_text_or_unreadable"}),
+    ("lib_daemon_watch.py", "read_pause_state", {"load_json_store"}),
 
     # --- lib_mux.py / lib_model.py (t018) --------------------------------
-    ("lib_mux.py", "read_pane_record", {"read_regular_text_or_unreadable"}),
+    ("lib_mux.py", "read_pane_record", {"load_json_store"}),
     ("lib_mux.py", "_config_mode", {"read_regular_text_or_unreadable"}),
     ("lib_model.py", "_parse_yaml_fallback",
      {"read_regular_text_or_unreadable"}),
@@ -337,6 +344,9 @@ AUDITED_MODULES = [
     "lib_model.py",
     "lib_verdict.py",
     "lib_dep_rules.py",
+    # t026: デーモン側 JSON 状態ストアの入口と、その読み手。
+    "lib_daemon_state.py",
+    "lib_review_refusal.py",
 ]
 
 #: (モジュール, 関数, ソースの断片) → なぜガードを通さなくてよいか。
@@ -374,10 +384,6 @@ ALLOWED_DIRECT_READS = {
      "BENCH_STRATEGY_CONF.read_text()"):
         "/tmp のベンチ用スイッチ。queue でも registry でもなく、"
         "落ちる先はベンチの分岐だけ",
-    ("dispatcher.sh", "load_notify_cache", "NOTIFY_CACHE.read_text()"):
-        "/tmp の通知重複キャッシュ。失っても倒れる先は「もう一度送る」(冪等)",
-    ("verifier-dispatcher.sh", "load_notify_cache", "NOTIFY_CACHE.read_text()"):
-        "同上",
 
     # -- 呼び出し側から渡される任意のパス ----------------------------------
     ("lib_verdict.py", "main", 'open(path, encoding="utf-8", newline="")'):
@@ -895,6 +901,9 @@ ALLOWED_SUBPROCESS_CALLS = {
     ("lib_mux.py", "server_identity", "tmux"): "サーバーの socket と pid",
     ("lib_mux.py", "_send_to_target", "tmux"): "ペインにキーを送る",
     ("lib_mux.py", "_inspect_pane_full", "tmux"): "ペインの属性を訊く",
+    ("lib_mux.py", "record_existence", "tmux"):
+        "記録が指す window id の実在を訊く (t001。tmux に `list-windows -a` を"
+        "投げるだけで、queue / registry のファイルは読ませない)",
     ("lib_mux.py", "_destroy_window_on", "tmux"):
         "if-shell で 1 つの接続に検証と破壊を流す "
         "(memory: verify-and-destroy-must-share-one-connection)",

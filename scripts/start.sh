@@ -665,21 +665,41 @@ PYEOF
   # 使えるようにするため、ペイン側の $PATH に対して明示的に prepend する。
   LAUNCH_CMD="$ENV_EXPORTS; export PATH='${REPO_ROOT}/scripts/bin:'\"\$PATH\"; unset CLAUDE_CODE_CHILD_SESSION; cd '$WORK_DIR'; claude${MODEL_CLI_ARG}${SETTINGS_CLI_ARG}${PERMISSION_MODE_CLI_ARG}"
 
+  # Drop spawn records whose pane is gone (a retired Worker's pane closes without
+  # `kill()`, so its record outlives it).  Housekeeping only: the answer never
+  # changes whether the spawn below is attempted, so a failure here is not one.
+  mux_reap_records >/dev/null 2>&1 || true
+
   # Spawn agent window (mux_spawn handles has-session/new-session/new-window internally).
   # mux_spawn only refuses when the window still holds a live agent; a window
   # left behind empty by a mux restart is relaunched in place and succeeds.
-  if ! mux_spawn "$WINDOW_NAME" "$LAUNCH_CMD" "$WORK_DIR"; then
-    # Check if the window already exists (safe no-op) vs a real error.
-    if mux_list | grep -qx "$WINDOW_NAME"; then
-      echo "[crewvia] $WINDOW_NAME is already running — not launching a second one"
-      # An existing Director is what the user wanted to reach, so attach to it
-      # instead of exiting silently.
-      if [[ "${ROLE}" == "director" ]]; then
-        echo "[crewvia] Attaching to $WINDOW_NAME ..."
-        mux_attach "$WINDOW_NAME"
-      fi
-    else
-      echo "[crewvia] ERROR: Failed to spawn mux window: $WINDOW_NAME" >&2
+  #
+  # The exit code says *why* it did not launch (t001): 10 = a live process is in
+  # the pane, 11 = the pane could not be read (treated as busy).  Only those may
+  # be reported as "already running".  Every other failure — including a
+  # relaunch into an empty pane that did not take, after which the name is still
+  # in `mux_list` — used to fall into the same message.
+  SPAWN_RC=0
+  mux_spawn "$WINDOW_NAME" "$LAUNCH_CMD" "$WORK_DIR" || SPAWN_RC=$?
+  if [[ $SPAWN_RC -ne 0 ]]; then
+    case $SPAWN_RC in
+      10) echo "[crewvia] $WINDOW_NAME is already running — not launching a second one" ;;
+      11) echo "[crewvia] $WINDOW_NAME exists but its pane could not be read — not launching a second one." >&2
+          echo "          確認: mux_capture $WINDOW_NAME (中身が空の shell なら mux_kill $WINDOW_NAME してから再実行)" >&2 ;;
+      *)
+        if mux_list | grep -qx "$WINDOW_NAME"; then
+          echo "[crewvia] ERROR: $WINDOW_NAME is listed but the launch did not take (spawn failed — see the warnings above)." >&2
+          echo "          'already running' ではありません。確認: mux_capture $WINDOW_NAME / 直すなら mux_kill $WINDOW_NAME してから再実行" >&2
+        else
+          echo "[crewvia] ERROR: Failed to spawn mux window: $WINDOW_NAME" >&2
+        fi
+        ;;
+    esac
+    # An existing Director is what the user wanted to reach, so attach to it
+    # instead of exiting silently.
+    if [[ "${ROLE}" == "director" && ( $SPAWN_RC -eq 10 || $SPAWN_RC -eq 11 ) ]]; then
+      echo "[crewvia] Attaching to $WINDOW_NAME ..."
+      mux_attach "$WINDOW_NAME"
     fi
     exit 0
   fi

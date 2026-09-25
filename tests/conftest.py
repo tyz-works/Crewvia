@@ -79,9 +79,9 @@ def pytest_unconfigure(config):
     テストの結果は変えない (例外を出さない)。**隔離の仕組みには触れない。**
 
     `pytest_sessionfinish` ではなくここなのは、collection エラーや中断でも走るため。
-    残骸掃除を「開始時」でなく「終了時」にしたのは、開始時だと `--collect-only` や
-    `--help` でも本番 herdr を触りにいくうえ、掃除のぶんだけ最初のテストが遅れるから。
-    SIGKILL された回の残骸は、次に正常終了した回が拾う。
+    残骸掃除を「開始時」でなく「終了時」にしたのは、開始時に置くと掃除のぶんだけ
+    最初のテストが遅れるから。**このフックは `--collect-only` や `--help` でも走る**
+    (一覧の取得だけで、書き込みは無い)。SIGKILL された回の残骸は、次に正常終了した回が拾う。
     """
     import pytest_workspace_sweep
     pytest_workspace_sweep.run_cleanup(TEST_DESTINATION, PRODUCTION_DESTINATION)

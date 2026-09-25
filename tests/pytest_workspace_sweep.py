@@ -36,8 +36,14 @@ herdr は初回アクセスで workspace を自動作成するが、**conftest �
 ## 後始末の失敗でテスト結果を変えない
 
 herdr / tmux が居ない・timeout・CLI エラーはすべて警告 1 行で握りつぶす
-(`run_cleanup()` は例外を出さない)。CLI 呼び出しには有限の timeout と、全体の
-時間予算 (`BUDGET_SECONDS`) がある。
+(`run_cleanup()` は例外を出さない)。CLI 呼び出しには有限の timeout (`CLI_TIMEOUT_SECONDS`) と、
+後始末**全体**で 1 つの時間予算 (`BUDGET_SECONDS`) がある。
+
+予算は `Deadline` 1 つで、`run_cleanup` が作って backend の subprocess 呼び出しまで渡す
+(backend ごとに作り直さない — herdr と tmux で合わせて `BUDGET_SECONDS`)。各呼び出しの
+timeout は `min(CLI_TIMEOUT_SECONDS, 残り時間)` で、残りが尽きたら**呼ばずに**「観測できなかった」
+に倒す (閉じずに打ち切る。記録は無いので次回が拾う)。宛先の境目でだけ確かめると、1 つの宛先の
+中の呼び出し (pane ごとの process-info・最後の close) が予算を超えて走る。
 
 ## 構成
 
@@ -74,6 +80,24 @@ PID_DEAD, PID_ALIVE = "dead", "alive"
 
 def _warn(message):
     sys.stderr.write(f"[pytest-workspace-sweep] {message}\n")
+
+
+class Deadline:
+    """後始末全体で 1 つの締切。時計は差し替えられる (テストは実時間に頼らない)。"""
+
+    def __init__(self, budget=BUDGET_SECONDS, clock=time.monotonic):
+        self._clock = clock
+        self._end = clock() + budget
+
+    def remaining(self):
+        return self._end - self._clock()
+
+    def expired(self):
+        return self.remaining() <= 0
+
+    def timeout(self):
+        """CLI 1 回に許す秒数。1 回の上限と残り時間の小さいほう。"""
+        return min(CLI_TIMEOUT_SECONDS, self.remaining())
 
 
 # ---------------------------------------------------------------------------
@@ -154,22 +178,33 @@ def plan_cleanup(names, own_label, production, sweep_enabled,
 
 
 # ---------------------------------------------------------------------------
-# 実行層 — herdr / tmux。どちらも同じ 3 つの口を持つ:
-#   entries() -> [(name, handle)] | None   (None = 一覧を観測できなかった)
-#   is_empty(handle) -> bool               (True は「空だと示せた」だけ)
-#   close(handle) -> bool
+# 実行層 — herdr / tmux。どちらも同じ 3 つの口を持つ。**どれも `deadline` を受け取る**
+# (subprocess の timeout を残り時間で頭打ちにするため):
+#   entries(deadline) -> [(name, handle)] | None   (None = 一覧を観測できなかった)
+#   is_empty(handle, deadline) -> bool             (True は「空だと示せた」だけ)
+#   close(handle, deadline) -> bool
+# `run(argv, timeout)` は `(rc, stdout, stderr)` を返す (timeout 超過は例外)。
 # ---------------------------------------------------------------------------
 
-def _exec(run, argv):
-    """`run(argv)` の `(rc, stdout, stderr)`。例外 (不在・timeout) は rc=None に潰す。
+def _exec(run, argv, deadline):
+    """`run(argv, timeout)` の `(rc, stdout, stderr)`。例外 (不在・timeout) は rc=None に潰す。
 
     1 回の呼び出しの失敗が、ほかの宛先の後始末を止めないようにするため。
     rc=None は「観測できなかった」で、呼び出し側はどれも閉じない側に倒す。
+    締切が尽きていたら**呼ばずに**rc=None を返す。timeout は残り時間で頭打ち。
     """
+    timeout = deadline.timeout()
+    if timeout <= 0:
+        return None, "", "時間予算切れ"
     try:
-        return run(argv)
+        return run(argv, timeout)
     except Exception as e:  # noqa: BLE001
         return None, "", f"{type(e).__name__}: {e}"
+
+
+def _subprocess_run(argv, timeout):
+    r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+    return r.returncode, r.stdout, r.stderr
 
 
 def _default_pane_state(shell_pid):
@@ -191,18 +226,12 @@ class HerdrBackend:
     """herdr の workspace。宛先の名前は workspace の label、handle は workspace_id。"""
 
     def __init__(self, run=None, pane_state=None):
-        self._run = run or self._subprocess_run
+        self._run = run or _subprocess_run
         self._pane_state = pane_state or _default_pane_state
 
-    @staticmethod
-    def _subprocess_run(argv):
-        r = subprocess.run(argv, capture_output=True, text=True,
-                           timeout=CLI_TIMEOUT_SECONDS)
-        return r.returncode, r.stdout, r.stderr
-
-    def _json(self, argv):
+    def _json(self, argv, deadline):
         import json
-        rc, out, _ = _exec(self._run, ["herdr"] + argv)
+        rc, out, _ = _exec(self._run, ["herdr"] + argv, deadline)
         if rc != 0:
             return None
         try:
@@ -214,8 +243,8 @@ class HerdrBackend:
         result = data.get("result")
         return result if isinstance(result, dict) else None
 
-    def entries(self):
-        result = self._json(["workspace", "list"])
+    def entries(self, deadline):
+        result = self._json(["workspace", "list"], deadline)
         workspaces = result.get("workspaces") if result else None
         if not isinstance(workspaces, list):
             return None
@@ -228,13 +257,15 @@ class HerdrBackend:
                 out.append((ws.get("label"), wid))
         return out
 
-    def is_empty(self, workspace_id):
+    def is_empty(self, workspace_id, deadline):
         """全 pane が idle なシェルだと示せたときだけ True。
 
         pane 一覧が読めない / pane が 0 個 / process-info が読めない /
         idle でない (live・判定不能) pane が 1 つでもある → False。
+        締切が尽きると次の process-info が読めなくなるので、pane が何個あっても
+        予算の中で False になる。
         """
-        result = self._json(["pane", "list", "--workspace", workspace_id])
+        result = self._json(["pane", "list", "--workspace", workspace_id], deadline)
         panes = result.get("panes") if result else None
         if not isinstance(panes, list) or not panes:
             return False
@@ -242,7 +273,7 @@ class HerdrBackend:
             pane_id = pane.get("pane_id") if isinstance(pane, dict) else None
             if not isinstance(pane_id, str) or not pane_id:
                 return False
-            info = self._json(["pane", "process-info", "--pane", pane_id])
+            info = self._json(["pane", "process-info", "--pane", pane_id], deadline)
             info = info.get("process_info") if info else None
             shell_pid = info.get("shell_pid") if isinstance(info, dict) else None
             if not isinstance(shell_pid, int) or isinstance(shell_pid, bool) \
@@ -252,35 +283,31 @@ class HerdrBackend:
                 return False
         return True
 
-    def close(self, workspace_id):
-        return self._json(["workspace", "close", workspace_id]) is not None
+    def close(self, workspace_id, deadline):
+        return self._json(["workspace", "close", workspace_id], deadline) is not None
 
 
 class TmuxBackend:
     """tmux の session。宛先の名前は session 名、handle も session 名。"""
 
     def __init__(self, run=None, pane_state=None):
-        self._run = run or self._subprocess_run
+        self._run = run or _subprocess_run
         self._pane_state = pane_state or _default_pane_state
 
-    @staticmethod
-    def _subprocess_run(argv):
-        r = subprocess.run(argv, capture_output=True, text=True,
-                           timeout=CLI_TIMEOUT_SECONDS)
-        return r.returncode, r.stdout, r.stderr
-
-    def entries(self):
+    def entries(self, deadline):
         rc, out, err = _exec(self._run,
-                             ["tmux", "list-sessions", "-F", "#{session_name}"])
+                             ["tmux", "list-sessions", "-F", "#{session_name}"],
+                             deadline)
         if rc != 0:
             # server が居ないのは異常ではない (閉じるものが無い)。それ以外の失敗は
             # 観測できなかった。
             return [] if "no server running" in err else None
         return [(name, name) for name in out.splitlines() if name]
 
-    def is_empty(self, session):
+    def is_empty(self, session, deadline):
         rc, out, _ = _exec(self._run, ["tmux", "list-panes", "-s", "-t",
-                                       f"={session}", "-F", "#{pane_pid}"])
+                                       f"={session}", "-F", "#{pane_pid}"],
+                           deadline)
         if rc != 0:
             return False
         pids = out.split()
@@ -293,9 +320,10 @@ class TmuxBackend:
                 return False
         return True
 
-    def close(self, session):
+    def close(self, session, deadline):
         # `=` は完全一致 (前方一致で別のセッションを撃たない)。
-        rc, _, _ = _exec(self._run, ["tmux", "kill-session", "-t", f"={session}"])
+        rc, _, _ = _exec(self._run, ["tmux", "kill-session", "-t", f"={session}"],
+                         deadline)
         return rc == 0
 
 
@@ -305,15 +333,18 @@ class TmuxBackend:
 
 def cleanup(backend, own_label, production, sweep_enabled,
             pid_alive=pid_state, warn=_warn, clock=time.monotonic,
-            budget=BUDGET_SECONDS):
+            budget=BUDGET_SECONDS, deadline=None):
     """1 つの backend に対して自分の後始末と残骸掃除を行う。閉じた名前の列を返す。
 
     例外は出さない。観測できなかったことは警告 1 行にして先へ進む。
+    `deadline` は後始末全体で 1 つの締切 (複数の backend で共有する)。省略したときだけ
+    この呼び出しの分を `clock` / `budget` で作る。
     """
     closed = []
-    deadline = clock() + budget
+    if deadline is None:
+        deadline = Deadline(budget, clock)
     try:
-        entries = backend.entries()
+        entries = backend.entries(deadline)
         if entries is None:
             warn("宛先の一覧を読めなかったので何も閉じない")
             return closed
@@ -331,7 +362,7 @@ def cleanup(backend, own_label, production, sweep_enabled,
         #    (自分が作った名前で、中身も自分のテストが作ったものだけ)。
         for name in dict.fromkeys(own):
             for handle in by_name[name]:
-                if backend.close(handle):
+                if backend.close(handle, deadline):
                     closed.append(name)
                 else:
                     warn(f"{name!r} を閉じられなかった")
@@ -339,13 +370,17 @@ def cleanup(backend, own_label, production, sweep_enabled,
         # 2. 残骸。形 + pid の死 + 空、の AND。
         for name in dict.fromkeys(leftovers):
             for handle in by_name[name]:
-                if clock() > deadline:
+                if deadline.expired():
                     warn("時間予算を使い切ったので残りの残骸は次回に回す")
                     return closed
-                if not backend.is_empty(handle):
+                if not backend.is_empty(handle, deadline):
                     warn(f"{name!r} は空だと確認できなかったので残す")
                     continue
-                if backend.close(handle):
+                if deadline.expired():
+                    # 空だと示せた後でも、締切を越えて close を走らせない。
+                    warn(f"{name!r} は時間予算が尽きたので閉じずに次回に回す")
+                    return closed
+                if backend.close(handle, deadline):
                     closed.append(name)
                 else:
                     warn(f"{name!r} を閉じられなかった")
@@ -374,12 +409,18 @@ def default_backends():
     return backends
 
 
-def run_cleanup(own_label, production, environ=None, backends=None):
-    """conftest の `pytest_unconfigure` から呼ぶ。何があっても例外を出さない。"""
+def run_cleanup(own_label, production, environ=None, backends=None,
+                clock=time.monotonic, budget=BUDGET_SECONDS):
+    """conftest の `pytest_unconfigure` から呼ぶ。何があっても例外を出さない。
+
+    時間予算は**ここで 1 つだけ**作り、全 backend で共有する (backend ごとに作ると
+    herdr と tmux で 2 倍になる)。
+    """
     env = os.environ if environ is None else environ
     try:
         sweep_enabled = env.get(SWEEP_SWITCH) != "0"
+        deadline = Deadline(budget, clock)
         for backend in (default_backends() if backends is None else backends):
-            cleanup(backend, own_label, production, sweep_enabled)
+            cleanup(backend, own_label, production, sweep_enabled, deadline=deadline)
     except Exception as e:  # noqa: BLE001
         _warn(f"後始末を中断した: {type(e).__name__}: {e}")

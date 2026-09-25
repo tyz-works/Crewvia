@@ -17,9 +17,22 @@
 #   case J   — 「idle でない pane」を idle と読む                       → 赤
 #   case K   — pid 0 の label を残骸として扱う (os.kill(0,0) は常に成功) → 赤
 #   case L   — tmux の kill-session が完全一致 (`=`) でない             → 赤
+#   case M   — 残り時間で頭打ちにせず subprocess を走らせる (締切が届かない) → 赤
+#   case N   — backend ごとに時間予算が戻る (herdr と tmux で 2 倍)      → 赤
+#   case O   — 実 subprocess に timeout を渡さない                      → 赤
 #
-# 隔離: 使い捨ての複製で欠陥を注入する。本番の worktree のファイルには触らない。
-#       複製の pytest は CREWVIA_HERDR_SOCK を存在しないパスにして本番 herdr に話しかけない。
+# 隔離 (2 重):
+#   1. 使い捨ての複製で欠陥を注入する。本番の worktree のファイルには触らない。
+#   2. **欠陥を注入したコードの終了フック (pytest_unconfigure) が、本物の tmux / herdr に
+#      届かない状態で走らせる。** 複製の pytest は終了時に後始末を走らせるので、case E / G の
+#      ように「空か」「pid は死んでいるか」の確認を外した版は、届けば本物の tmux server の
+#      `crewvia-pytest-*` (別 worktree で同時に走っている pytest のもの) を kill しうる。
+#        - PATH の先頭に tmux / herdr のスタブ (呼び出しを記録して失敗を返す) を置く
+#        - TMUX_TMPDIR を空の隔離ディレクトリに向け、TMUX を外す (スタブを迂回しても
+#          本物の server には届かない)
+#        - CREWVIA_HERDR_SOCK を存在しないパスにする (sweep は socket が無ければ herdr を呼ばない)
+#      そのうえで**実行の前後で本物の `tmux ls` が同じ**であること、スタブに kill-session が
+#      届いていないこと、本物でなくスタブに届いたこと (隔離が効いていた証拠) を assert する。
 # PYTHONDONTWRITEBYTECODE=1 で __pycache__ を作らない (古い .pyc が注入を隠さないように)。
 set -uo pipefail
 
@@ -27,11 +40,43 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/red-proof-t001-pytest-ws.XXXXXX")"
 trap 'mv "$WORK" "$WORK.done" 2>/dev/null' EXIT
 
-export PYTHONDONTWRITEBYTECODE=1
-export CREWVIA_HERDR_SOCK="$WORK/no-such-herdr.sock"
 PASS=0; FAIL=0
 ok() { echo "  PASS: $1"; PASS=$((PASS + 1)); }
 ng() { echo "  FAIL: $1"; FAIL=$((FAIL + 1)); }
+
+# --- 本物の tmux の観測 (隔離を入れる前の環境で。これは読み取りだけ) -------------------
+ORIG_PATH="$PATH"; ORIG_TMUX="${TMUX-}"; ORIG_TMUX_TMPDIR="${TMUX_TMPDIR-}"
+REAL_TMUX="$(command -v tmux || true)"
+real_tmux_snapshot() {
+    [ -n "$REAL_TMUX" ] || { echo "(tmux が無い)"; return 0; }
+    ( PATH="$ORIG_PATH"
+      if [ -n "$ORIG_TMUX" ]; then export TMUX="$ORIG_TMUX"; else unset TMUX; fi
+      if [ -n "$ORIG_TMUX_TMPDIR" ]; then export TMUX_TMPDIR="$ORIG_TMUX_TMPDIR"
+      else unset TMUX_TMPDIR; fi
+      "$REAL_TMUX" list-sessions -F '#{session_name}:#{session_created}' 2>&1 )
+}
+TMUX_BEFORE="$(real_tmux_snapshot)"
+
+# --- 隔離: 以降に走らせるものはすべてスタブにしか届かない --------------------------------
+STUBS="$WORK/stubs"; mkdir -p "$STUBS" "$WORK/tmux-tmp"
+export STUB_LOG="$WORK/stub-calls.log"; : > "$STUB_LOG"
+for tool in tmux herdr; do
+    # 呼び出しを記録して「server が居ない」と答える。何も作らず何も消さない。
+    printf '#!/bin/sh\necho "%s $*" >> "$STUB_LOG"\necho "no server running (red-proof stub)" >&2\nexit 1\n' \
+        "$tool" > "$STUBS/$tool"
+    chmod +x "$STUBS/$tool"
+done
+export PATH="$STUBS:$PATH"
+export TMUX_TMPDIR="$WORK/tmux-tmp"; unset TMUX
+export PYTHONDONTWRITEBYTECODE=1
+export CREWVIA_HERDR_SOCK="$WORK/no-such-herdr.sock"
+
+echo "== isolation: 注入版の終了フックは本物の tmux / herdr に届かない"
+if [ "$(command -v tmux)" = "$STUBS/tmux" ] && [ "$(command -v herdr)" = "$STUBS/herdr" ]; then
+    ok "PATH 先頭の tmux / herdr はスタブ"
+else
+    echo "FATAL: スタブが PATH の先頭に無い。本物に届きうるので中止する"; exit 2
+fi
 
 # case ごとに別のディレクトリ (前の注入を消すために rm しない)
 N=0
@@ -116,7 +161,7 @@ expect_red "own を前方一致で拾う"
 echo "== case E: 「live な pane が無い」の AND を外す"
 fresh_copy
 inject $SWEEP \
-'                if not backend.is_empty(handle):' \
+'                if not backend.is_empty(handle, deadline):' \
 '                if False:'
 expect_red "is_empty を見ない"
 
@@ -170,6 +215,54 @@ inject $SWEEP \
 '"kill-session", "-t", f"={session}"' \
 '"kill-session", "-t", session'
 expect_red "= を付けない"
+
+echo "== case M: 残り時間で頭打ちにせず subprocess を走らせる"
+fresh_copy
+inject $SWEEP \
+'        return run(argv, timeout)' \
+'        return run(argv, CLI_TIMEOUT_SECONDS)'
+expect_red "締切が subprocess の timeout に届かない (pane 10 個 × 4 秒が上限を超える)"
+
+echo "== case N: backend ごとに時間予算が戻る"
+fresh_copy
+inject $SWEEP \
+'            cleanup(backend, own_label, production, sweep_enabled, deadline=deadline)' \
+'            cleanup(backend, own_label, production, sweep_enabled,
+                    clock=clock, budget=budget)'
+expect_red "run_cleanup が共有の締切を渡さない"
+
+echo "== case O: 実 subprocess に timeout を渡さない"
+fresh_copy
+inject $SWEEP \
+'    r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)' \
+'    r = subprocess.run(argv, capture_output=True, text=True,
+                       timeout=CLI_TIMEOUT_SECONDS)'
+expect_red "_subprocess_run が残り時間を捨てる"
+
+echo "== isolation: 実行後 (本物の tmux は変わらず、スタブにだけ届いた)"
+TMUX_AFTER="$(real_tmux_snapshot)"
+echo "  本物の tmux (前): $(echo "$TMUX_BEFORE" | tr '\n' ' ')"
+echo "  本物の tmux (後): $(echo "$TMUX_AFTER" | tr '\n' ' ')"
+if [ "$TMUX_BEFORE" = "$TMUX_AFTER" ]; then
+    ok "本物の tmux のセッション一覧は前後で同じ"
+else
+    ng "本物の tmux のセッション一覧が変わった"
+fi
+if grep -q '^tmux list-sessions' "$STUB_LOG"; then
+    ok "各ケースの終了フックはスタブの tmux に届いた ($(grep -c '^tmux ' "$STUB_LOG") 回。隔離が効いていた証拠)"
+else
+    ng "スタブの tmux に 1 回も届いていない (隔離が効いているか確かめられない)"
+fi
+if grep -q -e 'kill-session' -e 'kill-server' "$STUB_LOG"; then
+    ng "スタブに kill が届いた: $(grep -e kill "$STUB_LOG" | head -3)"
+else
+    ok "kill-session / kill-server はどこにも届いていない"
+fi
+if grep -q '^herdr ' "$STUB_LOG"; then
+    ng "herdr に話しかけた: $(grep '^herdr ' "$STUB_LOG" | head -3)"
+else
+    ok "herdr には話しかけていない (socket が無いので CLI を呼ばない)"
+fi
 
 echo
 echo "== 結果: PASS=$PASS FAIL=$FAIL"

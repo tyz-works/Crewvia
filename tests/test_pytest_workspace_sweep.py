@@ -17,6 +17,7 @@ import stat
 import subprocess
 import sys
 import textwrap
+import time
 from pathlib import Path
 
 import pytest
@@ -51,17 +52,17 @@ class FakeBackend:
         self.closed = []
         self.empty_asked = []
 
-    def entries(self):
+    def entries(self, deadline):
         if not self.entries_ok:
             return None
         return [(n, h) for h, n in self.workspaces.items()]
 
-    def is_empty(self, handle):
+    def is_empty(self, handle, deadline):
         name = self.workspaces[handle]
         self.empty_asked.append(name)
         return self.empty.get(name, True)
 
-    def close(self, handle):
+    def close(self, handle, deadline):
         self.closed.append(self.workspaces[handle])
         return self.close_ok
 
@@ -260,7 +261,7 @@ class FakeHerdr:
         self.fail = set(fail)                   # 失敗させる verb
         self.calls = []
 
-    def __call__(self, argv):
+    def __call__(self, argv, timeout=None):
         self.calls.append(argv)
         verb = " ".join(argv[1:3])
         if verb in self.fail:
@@ -358,12 +359,12 @@ def test_herdr_close_uses_the_workspace_id_not_the_label():
 
 
 @pytest.mark.parametrize("failing", [
-    lambda argv: (_ for _ in ()).throw(FileNotFoundError("herdr")),
-    lambda argv: (_ for _ in ()).throw(subprocess.TimeoutExpired(argv, 5)),
-    lambda argv: (1, "", "boom"),
-    lambda argv: (0, "not json", ""),
-    lambda argv: (0, json.dumps({"error": {"code": "x"}}), ""),
-    lambda argv: (0, json.dumps({"result": {"workspaces": "no"}}), ""),
+    lambda argv, t: (_ for _ in ()).throw(FileNotFoundError("herdr")),
+    lambda argv, t: (_ for _ in ()).throw(subprocess.TimeoutExpired(argv, 5)),
+    lambda argv, t: (1, "", "boom"),
+    lambda argv, t: (0, "not json", ""),
+    lambda argv, t: (0, json.dumps({"error": {"code": "x"}}), ""),
+    lambda argv, t: (0, json.dumps({"result": {"workspaces": "no"}}), ""),
 ])
 def test_herdr_absent_timeout_or_error_never_raises(failing):
     closed, _ = run(sweep.HerdrBackend(run=failing))
@@ -395,7 +396,7 @@ class FakeTmux:
         self.server = server
         self.calls = []
 
-    def __call__(self, argv):
+    def __call__(self, argv, timeout=None):
         self.calls.append(argv)
         if not self.server:
             return 1, "", "no server running on /tmp/tmux-1000/default"
@@ -458,7 +459,7 @@ def test_run_cleanup_honours_the_kill_switch_env_only_for_the_leftovers():
 
 def test_cleanup_itself_never_raises_even_if_a_backend_explodes():
     class Exploding:
-        def entries(self):
+        def entries(self, deadline):
             raise RuntimeError("boom")
 
     warnings = []
@@ -469,7 +470,7 @@ def test_cleanup_itself_never_raises_even_if_a_backend_explodes():
 
 def test_run_cleanup_never_raises_even_if_a_backend_explodes():
     class Exploding:
-        def entries(self):
+        def entries(self, deadline):
             raise RuntimeError("boom")
 
     sweep.run_cleanup(OWN, PRODUCTION_DESTINATION, backends=[Exploding()])
@@ -504,6 +505,133 @@ def test_cli_timeout_is_finite_and_a_hung_herdr_does_not_hang_the_session(
     closed, warnings = run(sweep.HerdrBackend())
     assert closed == [] and warnings
     assert 0 < sweep.CLI_TIMEOUT_SECONDS <= 10
+
+
+# ---------------------------------------------------------------------------
+# 全体の時間上限 — 締切は 1 つで、backend の subprocess 呼び出しまで届く
+#
+# 時計を差し替えるので実時間は使わない。偽の herdr は「応答に latency 秒かかる」と
+# 時計を進めるだけで、timeout がそれより短ければ本物の subprocess.run と同じく
+# timeout ぶんだけ進めて TimeoutExpired を出す。
+# ---------------------------------------------------------------------------
+
+class FakeClock:
+    def __init__(self):
+        self.now = 0.0
+
+    def __call__(self):
+        return self.now
+
+
+class SlowHerdr(FakeHerdr):
+    def __init__(self, clock, latency, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.clock = clock
+        self.latency = latency
+        self.timeouts = []
+
+    def __call__(self, argv, timeout=None):
+        self.timeouts.append(timeout)
+        assert timeout is not None, "timeout の無い subprocess は締切を越えて走りうる"
+        if timeout < self.latency:
+            self.clock.now += max(timeout, 0)
+            raise subprocess.TimeoutExpired(argv, timeout)
+        self.clock.now += self.latency
+        return super().__call__(argv, timeout)
+
+
+def _ten_pane_leftover(clock, latency=4):
+    """pid が本当に死んでいる残骸 workspace 1 つ (pane 10 個)。"""
+    label = f"crewvia-pytest-{_dead_pid()}-aaaaaaaa"
+    panes = [f"wD:p{i}" for i in range(10)]
+    fake = SlowHerdr(clock, latency, {"wD": label}, panes={"wD": panes},
+                     process={p: 900 + i for i, p in enumerate(panes)})
+    return fake, label
+
+
+def test_ten_panes_at_four_seconds_each_stay_within_the_overall_budget():
+    """pane 10 個 × 応答 4 秒でも、後始末全体が上限 (30 秒) を超えない。
+
+    以前は宛先の境目でしか締切を見ず、process-info を 10 回 (40 秒) 走らせたうえ
+    close まで走って 52 秒かかった。
+    """
+    clock = FakeClock()
+    fake, label = _ten_pane_leftover(clock)
+    backend = sweep.HerdrBackend(run=fake, pane_state=lambda pid: "idle")
+    sweep.run_cleanup(OWN, PRODUCTION_DESTINATION, environ={}, backends=[backend],
+                      clock=clock, budget=30)
+    assert clock.now <= 30, f"{clock.now} 秒かかった"
+    assert fake.verbs("workspace close") == [], "空だと示し切れなかったので閉じない"
+    assert fake.workspaces == {"wD": label}
+
+
+def test_the_budget_is_shared_across_backends_not_restarted_per_backend():
+    """herdr が予算を使い切ったら、tmux は始めない (herdr と tmux で合わせて 30 秒)。"""
+    clock = FakeClock()
+    herdr, _ = _ten_pane_leftover(clock)
+    tmux = FakeTmux({OWN})
+    sweep.run_cleanup(
+        OWN, PRODUCTION_DESTINATION, environ={}, clock=clock, budget=30,
+        backends=[sweep.HerdrBackend(run=herdr, pane_state=lambda pid: "idle"),
+                  sweep.TmuxBackend(run=tmux)])
+    assert clock.now <= 30
+    assert tmux.calls == [], "予算が尽きているのに tmux を呼んだ (backend ごとに予算が戻っている)"
+
+
+def test_each_subprocess_timeout_is_capped_by_the_remaining_time():
+    clock = FakeClock()
+    fake, _ = _ten_pane_leftover(clock)
+    backend = sweep.HerdrBackend(run=fake, pane_state=lambda pid: "idle")
+    warnings = []
+    sweep.cleanup(backend, OWN, PRODUCTION_DESTINATION, True, warn=warnings.append,
+                  clock=clock, budget=7)
+    # 1 回目 (一覧) は上限の 5 秒。4 秒かかって残り 3 秒 → 2 回目は 3 秒で頭打ち。
+    assert fake.timeouts == [5, 3]
+    assert clock.now == 7
+
+
+def test_close_is_not_run_after_the_budget_is_spent():
+    """空だと示せても、そこで予算が尽きたなら close は走らせない。"""
+    clock = FakeClock()
+    label = f"crewvia-pytest-{_dead_pid()}-aaaaaaaa"
+    fake = SlowHerdr(clock, 4, {"wD": label}, panes={"wD": ["wD:p1"]},
+                     process={"wD:p1": 900})
+    backend = sweep.HerdrBackend(run=fake, pane_state=lambda pid: "idle")
+    warnings = []
+    closed = sweep.cleanup(backend, OWN, PRODUCTION_DESTINATION, True,
+                           warn=warnings.append, clock=clock, budget=12)
+    # 一覧 4 + pane list 4 + process-info 4 = 12。ここで尽きる。
+    assert closed == [] and fake.verbs("workspace close") == []
+    assert fake.workspaces == {"wD": label}
+    assert clock.now <= 12 and any("時間予算" in w for w in warnings)
+
+
+def test_no_subprocess_is_started_once_the_budget_is_spent():
+    clock = FakeClock()
+    deadline = sweep.Deadline(10, clock)
+    clock.now = 10
+    started = []
+    rc, _, _ = sweep._exec(lambda argv, timeout: started.append(argv),
+                           ["herdr", "x"], deadline)
+    assert rc is None and started == []
+
+
+def test_the_remaining_budget_reaches_the_real_subprocess(monkeypatch, tmp_path):
+    """`_subprocess_run` に timeout が渡っている (応答しない herdr を予算で切る)。
+
+    1 回の上限 (5 秒) より短い予算を与え、上限まで待たずに戻ることを見る。
+    """
+    stub = tmp_path / "herdr"
+    stub.write_text("#!/bin/sh\nexec sleep 30\n")
+    stub.chmod(stub.stat().st_mode | stat.S_IXUSR)
+    monkeypatch.setenv("PATH", f"{tmp_path}:{os.environ['PATH']}")
+    assert sweep.CLI_TIMEOUT_SECONDS >= 5
+    started = time.monotonic()
+    warnings = []
+    closed = sweep.cleanup(sweep.HerdrBackend(), OWN, PRODUCTION_DESTINATION, True,
+                           warn=warnings.append, budget=0.5)
+    assert closed == [] and warnings
+    assert time.monotonic() - started < 3
 
 
 # ---------------------------------------------------------------------------

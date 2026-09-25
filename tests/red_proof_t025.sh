@@ -55,9 +55,10 @@ restore() {
 expect_red() {
     local name="$1" selector="$2" out rc
     out="$(cd "$WORK" && env -i PATH="$PATH" HOME="$HOME" PYTHONDONTWRITEBYTECODE=1 \
-        python3 -m pytest "$TEST" -q -k "$selector" -p no:cacheprovider 2>&1)"
+        python3 -m pytest "$TEST" -q --tb=line -k "$selector" -p no:cacheprovider 2>&1)"
     rc=$?
-    echo "$out" | tail -8
+    # 赤の理由 (--tb=line の 1 行) が読める長さだけ出す。RED_TAIL で増やせる。
+    echo "$out" | tail -"${RED_TAIL:-40}"
     if [ "$rc" -ne 0 ]; then
         echo "  => RED (期待どおり: 欠陥を戻すと落ちる) — $name"
         PASS=$((PASS + 1))

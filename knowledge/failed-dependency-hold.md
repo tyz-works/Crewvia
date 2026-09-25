@@ -98,6 +98,18 @@ worker.md / 過去の task 記述の「着手したらまず QA の status を�
   needs_director / blocked / dangling / failed / 解除済み / 事前解除 / 複数依存の組み合わせ) ×
   5 者 (自動 pull / `pull --task` / task-graph / status / dispatcher) の突き合わせを直接
   assert する。どれか 1 者が別の答えを出すと赤になる。
+- **dispatcher は呼び出し側まで実挙動で固定する** (QA t008 観点 5 / t025):
+  `dependency_gate()` を直接問うだけでは、`dispatch()` の呼び出し箇所で旧規則を直書きされても
+  全スイートが緑のままだった (D1)。`tests/test_dispatcher_cycle_honours_hold.py` が本物の
+  `dispatch()` を、mux だけフェイク・idle Worker 1 人で 1 サイクル回し、同じ依存パターンで
+  「kickoff が飛んだか」を assert する (挙動 = 本筋)。併せて AST で、`dispatch()` が
+  `dependency_gate` を呼ぶこと・規則の名前を直接触らないこと・`verdict` を上書きしないことを
+  固定する (形。これだけでは verdict を触らない迂回 — D3 — を見逃すので挙動が要る)。
+  欠陥注入 (D1-D3) は `tests/red_proof_t025.sh`。
+- 見送り (P3): `scripts/taskvia-sync.sh` の `taskvia_status()` は独自の blocked 判定
+  (done のみ満たされた扱い) を持ち、保留 / 解除を判別できない。表示だけの差で dispatch・pull
+  には効かず、より保守的な側 (blocked と出す) に倒れる。TASKVIA_TOKEN が無い環境では同期自体が
+  skip される。直すなら `lib_dep_rules.card_dependencies()` を読む別 task で。
 
 `taskvia-sync.sh` の blocked 判定は元から done しか満たされた扱いにしない (より保守的)
 ので、保留とは矛盾しない。

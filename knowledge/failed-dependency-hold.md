@@ -47,12 +47,38 @@ worker.md / 過去の task 記述の「着手したらまず QA の status を�
 保留にすると、Director が気付かなければ task は誰にも拾われない。だから出口を 3 つ置いた:
 
 - **見える**: `plan.sh status` (要約にも詳細にも) が `🛑 tNNN ... HELD: 依存 tXXX が failed —
-  Director の判断待ち。進めるなら plan.sh release-dep tNNN` を出す。詳細を開かないと
-  見えない場所には置かない。DAG (`task-graph`) は `[保留: tXXX が failed]` の印で blocked
-  にする。dispatcher のログは `[held]` で出口のコマンドまで書く。
-  自動選択の pull が空振りしたときの診断にも同じ文面が付く。
-- **解除できる**: `plan.sh release-dep <task_id> [--dep <csv>]`。card に `released_deps`
-  を記録し、`blocked_by` は消さない (DAG に依存の履歴が残る)。
+  Director の判断待ち。進めるなら plan.sh release-dep tNNN --mission <slug>` を出す。詳細を
+  開かないと見えない場所には置かない。DAG (`task-graph`) は `[保留: tXXX が failed]` の印で
+  blocked にする (印は理由だけで、コマンドは持たない)。dispatcher のログは `[held]` で出口の
+  コマンドまで書く。自動選択の pull が空振りしたときの診断と、`pull --task` の拒否にも同じ
+  文面が付く。
+- **案内のコマンドは `--mission` 付き**: task ID は mission ごとの自動採番なので、別 mission
+  に同じ `tNNN` が普通にある。`--mission` の無い `release-dep` / `update` は default_mission の
+  task に当たり、**案内どおり打つと別の task が解除される / skip され、意図した task は保留の
+  まま**になる (PR #217 Kai P1)。`held_dependency_hint(task_id, held, slug)` の `slug` は既定値の
+  無い必須引数で、案内を出す 4 経路 (status 要約 / status 詳細 / pull 診断 / pull --task) は
+  全部これを通る。**保留を見つけた人が打つ手順は必ずこの形**:
+  ```
+  plan.sh release-dep <task_id> --mission <slug>                  # 進めてよい
+  plan.sh update <task_id> --mission <slug> --status skipped      # 中止
+  ```
+  (`plan.sh done` が `--mission` を要るのと同じ理由。)
+- **解除できる**: `plan.sh release-dep <task_id> [--dep <csv>] [--mission <slug>]`。card に
+  `released_deps` を記録し、`blocked_by` は消さない (DAG に依存の履歴が残る)。
+- **`released_deps` は task ID (`tNNN`) の list だけ受理する** (PR #217 Kai P2)。欄が無い /
+  `null` / `[]` は「解除なし」。`true` / `123` / `t001` (list でない) / mapping /
+  要素が ID の形でない list は、card ごと `[破損]` に隔離する (`lib_task_cards.py` の
+  `released_deps_problem()` が判定の本体)。黙って解釈すると 2 方向に壊れる: `set(True)` の
+  `TypeError` で **1 枚の card が dispatch と status を落とす** / mapping `t001: false` が
+  `set()` でキーだけになり **failed の依存を誤って解除する**。
+  - **隔離は出口を塞がない**: `plan.sh status` に `💥 tNNN [破損] — released_deps ...` と直し方が
+    出る。`plan.sh release-dep <id> --mission <slug>` は不正な値を捨てて `[tXXX]` の list に
+    書き直す (解除の**記録**を捨てるだけで、保留を外す方向には働かない)。`update --blocked-by`
+    も同様に不正な値を捨てる。手で `released_deps: [t001]` に直してもよい。
+  - 2 枚目の網: `lib_dep_rules.card_dependencies()` は list-of-str 以外を **解除なし (= 保留のまま)**
+    として扱う。読み取りの隔離を通らない生の card (release-dep が読むもの) が来ても、落ちず、
+    誤って解除もしない。判定の本体は 1 つ (`released_deps_problem`)、2 枚目は型だけを見る
+    (`lib_dep_rules` は他を import しない)。
 - **打ち間違いが解除に見えない**: `blocked_by` に無い依存の名指し、pending でない task、
   保留が無い task への引数なし実行は、どれも 1 バイトも書かずに拒否する。
 
@@ -78,10 +104,17 @@ worker.md / 過去の task 記述の「着手したらまず QA の status を�
 
 ## merge 後に必要な作業 (restart)
 
-**`lib_dep_rules.py` は dispatcher が起動時に import するので、merge 後に dispatcher の
-restart が必要** (restart は Director が行う。`lib_daemon_watch.py restart dispatcher`)。
-watchdog はこのモジュールを読まない (`grep lib_dep_rules scripts/watchdog.py` は 0 件) ので
-この変更のための restart は要らないが、既存の運用どおり両方を一度に restart しても害は無い。
+**`lib_dep_rules.py` / `lib_task_cards.py` は dispatcher が起動時に import するので、merge 後に
+dispatcher の restart が必要** (restart は Director が行う。`lib_daemon_watch.py restart dispatcher`)。
+
+watchdog は **`lib_dep_rules.py` は読まない** (`grep lib_dep_rules scripts/watchdog.py` は 0 件) が、
+**`lib_task_cards.py` は読む** (`from lib_task_cards import ...` で `list_task_cards()` を使う)。
+`released_deps` の検証 (P2) は `lib_task_cards.py` にあるので、restart するまで watchdog の目には
+不正な `released_deps` の card も `pending` のまま見える。watchdog は依存を判定せず
+task の status しか使わないので、**誤動作はしない (= restart は必須ではない)** が、
+`plan.sh status` と watchdog の見え方を揃えるなら両方を一度に restart する
+(既存の運用どおり、害は無い)。`verifier-dispatcher.sh` / `taskvia-sync.sh` も
+`lib_task_cards` を読むので、常駐させているなら同じ扱い。
 
 restart するまでの間は、走っている dispatcher が **古い規則** (failed を満たされた扱い) で
 task を Worker に投げる。その kickoff は新しい `plan.sh pull --task` (defense-in-depth の

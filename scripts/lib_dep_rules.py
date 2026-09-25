@@ -101,7 +101,16 @@ def card_dependencies(meta, done_ids, task_statuses):
     Director が解除したのに誰も進めない、という見えにくい壊れ方になる。
     """
     blocked_by = [d for d in (meta.get('blocked_by') or []) if d]
-    released = meta.get('released_deps') or ()
+    released = meta.get('released_deps')
+    if not (isinstance(released, (list, tuple))
+            and all(isinstance(d, str) for d in released)):
+        # 2 枚目の網。読み取り側 (`lib_task_cards.released_deps_problem`) が形の違う
+        # card を `[破損]` に隔離するので、ふつうここには list しか来ない。来なかった
+        # ときに `set(True)` の TypeError や、mapping のキーを解除と読む事故になら
+        # ないよう、**解除なし (= 保留のまま)** に倒す。解除は保留を外す権限なので、
+        # 判断不能は外さない側が安全。判定の本体はあちら (このモジュールは他を
+        # import しないので、ここは型だけを見る)。
+        released = ()
     return DependencyVerdict(
         unmet_dependencies(blocked_by, done_ids, task_statuses, released),
         held_dependencies(blocked_by, done_ids, task_statuses, released),

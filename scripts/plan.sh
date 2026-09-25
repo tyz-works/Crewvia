@@ -792,17 +792,24 @@ unmet_dependencies = _DEP_RULES.unmet_dependencies
 card_dependencies = _DEP_RULES.card_dependencies
 
 
-def held_dependency_hint(task_id, held):
+def held_dependency_hint(task_id, held, slug):
     """保留 (failed の依存) を見た人が、次に何を打てばよいか分かる 1 行。
 
-    保留が「永久保留」という別の outage にならないための出口の案内。status /
-    pull の診断 / task-graph が同じ文面を使う (別々に書くと、解除コマンドの
+    保留が「永久保留」という別の outage にならないための出口の案内。status
+    (要約 / 詳細) と pull の診断が同じ文面を使う (別々に書くと、解除コマンドの
     綴りが片方だけ古くなる)。
+
+    **`slug` は必須 (既定値なし)**。task ID は mission ごとの自動採番なので別 mission
+    に同じ `tNNN` が普通にあり、`--mission` の無いコマンドは default_mission の
+    task を解除する / skip する。出した文面をそのまま打つと別の task が解除され、
+    意図した task は保留のまま —— 出口の案内が罠になる (Codex PR #217 P1)。
+    呼び忘れを黙って許す既定値を置かず、渡し忘れた経路は呼んだ瞬間に落ちる。
     """
     return (
         f"HELD: 依存 {', '.join(held)} が failed — Director の判断待ち。"
-        f"進めるなら `plan.sh release-dep {task_id}` (fix が要るなら task を足す / "
-        f"中止なら `plan.sh update {task_id} --status skipped`)"
+        f"進めるなら `plan.sh release-dep {task_id} --mission {slug}` "
+        f"(fix が要るなら task を足す / "
+        f"中止なら `plan.sh update {task_id} --mission {slug} --status skipped`)"
     )
 
 
@@ -2479,7 +2486,8 @@ def cmd_pull(args):
         pending_count = 0
         skill_mismatch = 0
         blocked_count = 0
-        held_tasks = []   # [(task_id, [failed dep ids])] — Director の判断待ち
+        held_tasks = []   # [(slug, task_id, [failed dep ids])] — Director の判断待ち。
+                          # slug を持つのは、別 mission に同じ tNNN があるため (解除の案内に要る)
         target_mismatch = 0
         missing_dirs = []
 
@@ -2522,7 +2530,7 @@ def cmd_pull(args):
                     unmet = verdict.unmet
                     if verdict.held:
                         die(
-                            f"task '{specific_task}' is held: {held_dependency_hint(specific_task, verdict.held)}"
+                            f"task '{specific_task}' is held: {held_dependency_hint(specific_task, verdict.held, slug)}"
                             f" — cannot pull until the Director decides "
                             f"(blocked by unfinished dependencies: {unmet})"
                         )
@@ -2571,7 +2579,7 @@ def cmd_pull(args):
                 if verdict.unmet:
                     blocked_count += 1
                     if verdict.held:
-                        held_tasks.append((meta.get('id'), verdict.held))
+                        held_tasks.append((slug, meta.get('id'), verdict.held))
                     continue
                 candidates.append((slug, meta, body))
 
@@ -2606,7 +2614,7 @@ def cmd_pull(args):
                 diag['detail'] = f'{blocked_count} pending task(s) blocked by unmet dependencies'
                 if held_tasks:
                     diag['detail'] += ' — ' + '; '.join(
-                        held_dependency_hint(t, h) for t, h in held_tasks)
+                        f"[{s}/{t}] " + held_dependency_hint(t, h, s) for s, t, h in held_tasks)
             else:
                 diag['reason'] = 'no_eligible_task'
                 diag['detail'] = (
@@ -2615,7 +2623,7 @@ def cmd_pull(args):
                 )
                 if held_tasks:
                     diag['detail'] += ' — ' + '; '.join(
-                        held_dependency_hint(t, h) for t, h in held_tasks)
+                        f"[{s}/{t}] " + held_dependency_hint(t, h, s) for s, t, h in held_tasks)
             return
 
         # Priority-first sort: high-priority tasks across all active missions
@@ -3166,7 +3174,7 @@ def _print_mission_summary(slug, archived=False):
     for (m, deps) in held:
         # 既定の status (要約) にも出す。保留は誰も自動では解かないので、
         # 詳細を開かないと見えない場所に置くと「永久保留」になる。
-        print(f"    🛑 {m['id']} {m['title']} — {held_dependency_hint(m['id'], deps)}")
+        print(f"    🛑 {m['id']} {m['title']} — {held_dependency_hint(m['id'], deps, slug)}")
 
 
 def _print_mission_detail(slug):
@@ -3234,7 +3242,7 @@ def _print_mission_detail(slug):
             verdict = card_dependencies(m, done_ids, task_statuses)
             if verdict.held:
                 suffix = f"(HELD: {', '.join(verdict.held)} が failed — Director の判断待ち)"
-                held_lines.append(held_dependency_hint(tid, verdict.held))
+                held_lines.append(held_dependency_hint(tid, verdict.held, slug))
             elif verdict.unmet:
                 suffix = f"(blocked: {', '.join(verdict.unmet)})"
             else:
@@ -4154,7 +4162,13 @@ def cmd_update(args):
             changed.append(f"blocked_by={new_blocked}")
             # 外れた依存の解除が残ると、同じ id を後で付け直したときに
             # 「解除した覚えのない依存」が最初から解除済みになる。
-            kept = [d for d in (meta.get('released_deps') or []) if d in new_blocked]
+            # 形の違う released_deps (読み取りが隔離する card) は、ここで捨てる。
+            # 反復すると `TypeError` / mapping のキーを解除と読む — この直後に
+            # blocked_by を組み直す操作なので、捨てても解除が増える方向には働かない。
+            old_released = meta.get('released_deps')
+            if _TASK_CARDS.released_deps_problem(old_released):
+                old_released = []
+            kept = [d for d in (old_released or []) if d in new_blocked]
             if kept:
                 meta['released_deps'] = kept
             elif 'released_deps' in meta:
@@ -4264,7 +4278,18 @@ def cmd_release_dep(args):
             die(f"task '{task_id}' is {st}, not pending — release-dep applies only to a "
                 f"pending task held by a failed dependency")
 
-        blocked_by = [d for d in (meta.get('blocked_by') or []) if d]
+        # `load_task()` は生の card を返すので、形の違う `released_deps` (読み取りが
+        # `[破損]` に隔離する card) はここで初めて見える。Director が「解除する」と
+        # 言っている場面なので、隔離のまま断らず、不正な値は捨てて書き直す —— さもないと
+        # 隔離が保留の出口 (この command) を塞ぐ。捨てるのは解除の**記録**で、保留を
+        # 外す方向には働かない (捨てた分は、下で名指し / 既定で選び直される)。
+        problem = _TASK_CARDS.released_deps_problem(meta.get('released_deps'))
+        if problem:
+            print(f"[plan.sh warn] {slug}/{task_id}: {problem} — 不正な released_deps は"
+                  f"捨てて書き直します", file=sys.stderr)
+            meta['released_deps'] = []
+
+        blocked_by =[d for d in (meta.get('blocked_by') or []) if d]
         tasks = list_tasks(slug, quiet=True)
         done_ids = {m['id'] for (m, _) in tasks if m.get('status') in TERMINAL_STATUSES}
         task_statuses = {m['id']: m.get('status') for (m, _) in tasks}

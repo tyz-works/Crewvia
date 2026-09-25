@@ -104,6 +104,9 @@ CORRUPT_TASK_STATUS = 'corrupted'
 #: 部分がその task の識別子になる。
 TASK_FILENAME_RE = re.compile(r't(\d+)\.md')
 
+#: task の識別子の形。`released_deps` の要素はこの形の文字列だけを受理する。
+TASK_ID_RE = re.compile(r't\d+')
+
 #: 走査そのものが失敗したときに 1 件だけ返す疑似カードの id。
 #: 実在のカードの id は `TASK_FILENAME_RE` から来るので必ず `t<数字>` であり、
 #: この名前と衝突することはない (= 本物のカードを隠さない)。
@@ -316,6 +319,37 @@ def scan_failure_task(tasks_dir, what, detail):
         f'{tasks_dir} を走査できない ({what})',
         f'{what}: {detail}',
     )
+
+
+def released_deps_problem(value):
+    """card の `released_deps` が受理できない形なら、その理由を返す (受理なら `None`)。
+
+    受理するのは **task ID (`tNNN`) の list だけ**。欄が無い / `null` も「解除なし」
+    として受理する。それ以外は理由付きで断る —— 黙って解釈すると、両方向に壊れる
+    (Codex PR #217 P2):
+
+    * `released_deps: true` / `123` は、消費側の `set(...)` が `TypeError` を出し、
+      **1 枚の card で dispatch と status が落ちる** (全 mission の割り当てが止まる)。
+    * mapping (`t001: false`) は `set()` がキーだけを拾い、**「解除しない」と書いた
+      依存を解除済みにする** —— t007 が塞いだ「failed の依存を持つ task が進む」穴が
+      この card だけ開く。
+
+    `str` を受理しないのは、`released_deps: t001` を list と取り違えた typo を
+    `set("t001")` (= 1 文字ずつ) にしないため。**この関数が判定の本体**で、
+    `_read_task_card()` (読み取りの隔離) と `plan.sh release-dep` (書き込み前の確認)
+    が同じものを呼ぶ。
+    """
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        return (f"released_deps は task ID の list でなければならない "
+                f"(実際: {type(value).__name__} {value!r})")
+    bad = [v for v in value
+           if not (isinstance(v, str) and TASK_ID_RE.fullmatch(v))]
+    if bad:
+        return (f"released_deps の要素は task ID (tNNN) でなければならない "
+                f"(不正: {bad!r})")
+    return None
 
 
 def normalize_card(task_id, meta):
@@ -707,6 +741,20 @@ def _read_task_card(path, task_id, _warn):
             f'id がファイル名と一致しない (frontmatter: {declared})',
             f'frontmatter id {declared!r} != filename {task_id!r}',
         )
+
+    problem = released_deps_problem(meta.get('released_deps'))
+    if problem:
+        # 「解除」は保留を外す権限そのもの。形が違う card は、読み違えて解除にも
+        # 例外にもしない (上の `released_deps_problem` を参照)。隔離は削除では
+        # ないので、Director は 1 コマンドか 1 行で直せる — 保留の出口は塞がない。
+        _warn(
+            f"{path}: {problem}\n"
+            f"  hint: `released_deps: [t001]` の形に直すか、行ごと消す。解除したいなら "
+            f"`plan.sh release-dep {task_id} --mission <slug>` が不正な値を捨てて "
+            f"書き直す。\n"
+            f"  holding it as a [破損] task; other tasks are unaffected."
+        )
+        return isolated_task(task_id, 'released_deps が不正', problem)
 
     return normalize_card(task_id, meta), body
 

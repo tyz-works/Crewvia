@@ -14,6 +14,10 @@
 #   case H   — 退避先が衝突したら黙って上書きする (Kai P2)           → 赤
 #   case I   — 変数経由の自動 fail 呼び出しを注入 (QA F1)            → 赤
 #            (旧ガード = リテラル `plan.sh fail` の正規表現は、同じ注入で緑のまま)
+#   case J   — handoff なしの fail が card の古い handoff_path を残す (t028) → 赤
+#   case K   — update --status で開き直しても証拠が残る (--reset だけ掃除) (t028) → 赤
+#   case L   — cmd_fail が handoff_path を自前で足す構造に戻る (t028)  → 赤 (構造テスト)
+#   case M   — 掃除が広すぎて failed のまま failed でも検証済み証拠を消す (t028) → 赤
 #
 # 隔離: 使い捨ての複製で欠陥を注入する。本番の worktree の plan.sh には触らない。
 # PYTHONDONTWRITEBYTECODE=1 で __pycache__ を作らない (古い .pyc が注入を隠さないように)。
@@ -134,6 +138,32 @@ old = re.compile(r"""(?x)(?: plan(?:\.sh)?["']? \s+ fail\b | ["']plan(?:\.sh)?["
 sys.exit(0 if not old.search(open(sys.argv[1]).read()) else 1)
 PY
 then ok "case I: 旧ガードの正規表現は同じ注入を検出できない (= F1 の再現)"; else ng "case I: 旧正規表現でも検出できてしまう (注入が F1 を再現していない)"; fi
+
+echo "== case J: handoff なしの fail が、開き直しで card に残った古い handoff_path を残す (t028)"
+fresh_copy
+inject "    return None, {'fail_head': full, 'fail_head_waiver': None,
+                  'handoff_path': recorded_handoff}" "    return None, {'fail_head': full, 'fail_head_waiver': None}"
+expect_red "case J" "test_fail_without_a_handoff_clears_one_the_card_inherited"
+
+echo "== case K: update --status で開き直しても証拠が残る (--reset だけ掃除する t004 の形)"
+fresh_copy
+inject "            not status or (status == 'failed' and old_status == 'failed'))" "            True)"
+expect_red "case K" "test_every_status_change_away_from_failed_clears_the_evidence"
+expect_red "case K (再現手順)" "test_a_reopened_card_cannot_carry_the_old_handoff_into_the_next_fail"
+
+echo "== case L: cmd_fail が handoff_path を渡されたときだけ自前で足す"
+fresh_copy
+inject "        recorded_handoff = fields.get('handoff_path')
+        meta['status'] = 'failed'" "        recorded_handoff = fields.get('handoff_path')
+        if recorded_handoff:
+            meta['handoff_path'] = recorded_handoff
+        meta['status'] = 'failed'"
+expect_red "case L" "test_the_fail_gate_is_where_the_handoff_path_of_a_failed_card_is_decided"
+
+echo "== case M: 掃除が広すぎる (failed のまま failed でも検証済み証拠を消す)"
+fresh_copy
+inject "            not status or (status == 'failed' and old_status == 'failed'))" "            not status)"
+expect_red "case M" "test_evidence_survives_updates_that_do_not_end_the_failure"
 
 echo
 echo "Results: $PASS passed, $FAIL failed"

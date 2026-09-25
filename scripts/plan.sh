@@ -2821,10 +2821,21 @@ def _validate_fail_evidence(meta, report):
     証拠を出せない報告者 (検証対象が git 管理外など) のために `--no-head "<理由>"` がある。
     Director が `required_evidence: []` を置くのと同じく、**外から見える形**
     (card の fail_head_waiver 欄 + Result + stderr 警告) でだけ免除できる。
+
+    **戻りの dict は「card に書く欄の全体」で、`handoff_path` を必ず含む** (t028)。
+    検証を通った handoff は正規化した絶対パス、渡されなかったなら `None` — `None` の欄は
+    呼び出し側が card から**消す**。「渡さなければ card に触れない」と読める形にすると、
+    `update --status in_progress` で開き直した card に残っていた**古い** handoff_path が、
+    head を検証されないまま FAIL の記録に混ざり、dispatcher がそれを読んで Director に
+    通知する (Result は `handoff: none` なのに)。card に残る handoff_path を「この報告で
+    検証したもの」だけにする、という不変条件を、この関数の戻り値 1 か所に置いてある。
     """
     head = report.get('head')
     no_head = report.get('no_head')
     handoff_path = report.get('handoff_path')
+    # card に残す値。検証に使ったのと同一のパス (_handoff_names_head は abspath して読む)。
+    # 相対パスはここより前で拒否済みなので、正規化するだけでよい。
+    recorded_handoff = os.path.normpath(handoff_path) if handoff_path else None
     usage = ("  plan.sh fail <task_id> [<handoff_path>] --head <sha>\n"
              "  (検証対象が git 管理外: --no-head \"<理由 1 行>\")")
     if head is not None and no_head is not None:
@@ -2848,7 +2859,8 @@ def _validate_fail_evidence(meta, report):
         reason = ' '.join(str(no_head).split())
         if not reason:
             return "[plan.sh] --no-head には理由 (空でない 1 行) が必要です", {}
-        return None, {'fail_head': None, 'fail_head_waiver': reason}
+        return None, {'fail_head': None, 'fail_head_waiver': reason,
+                      'handoff_path': recorded_handoff}
 
     full, why = _resolve_head_commit(head)
     if full is None:
@@ -2859,7 +2871,8 @@ def _validate_fail_evidence(meta, report):
             return f"[plan.sh] {note}\n{usage}", {}
         if note:
             print(f"[plan.sh warn] {note}", file=sys.stderr)
-    return None, {'fail_head': full, 'fail_head_waiver': None}
+    return None, {'fail_head': full, 'fail_head_waiver': None,
+                  'handoff_path': recorded_handoff}
 
 
 def _gate_terminal_report(kind, meta, report):
@@ -3158,13 +3171,16 @@ def cmd_fail(args):
         if err:
             die(err)
 
-        # 検証したのと同一のパスを card に書く (_handoff_names_head は abspath して読む)。
-        # ここに来た時点で絶対パスであることはゲートが保証している。
-        recorded_handoff = os.path.normpath(handoff_path) if handoff_path else None
+        # card に書く証拠の欄は fields が全部持っている。None は「この報告には無い」の意味で、
+        # card から**消す** (t028)。handoff_path も同じ: 渡されなかったのに card の古い値を
+        # 残すと、開き直し (`update --status in_progress` 等) で持ち越された別 head 時点の
+        # handoff が検証されないまま failed の card に載り、dispatcher が読んで通知する。
+        # 消す側 (ここ) を選んだのは、開き直す経路 (update --reset / --status / 手書き / 旧版の
+        # card) の全部を塞ぐより、failed に至る唯一の入口で塞ぐ方が漏れないため。
+        # 開き直す側の掃除は cmd_update が別に行う (card を failed 以外の間も綺麗に保つ)。
+        recorded_handoff = fields.get('handoff_path')
         meta['status'] = 'failed'
         meta['completed_at'] = now_iso()
-        if recorded_handoff:
-            meta['handoff_path'] = recorded_handoff
         for key, val in fields.items():
             if val is None:
                 meta.pop(key, None)     # 前回の FAIL の証拠を持ち越さない
@@ -4237,6 +4253,9 @@ def cmd_update(args):
                                [--reset]
 
     --reset sets: status=pending, worker=null, started_at=null, completed_at=null
+    --reset と、status を動かす更新 (failed からの --status 等) は前回の FAIL の証拠
+    (handoff_path / fail_head / fail_head_waiver) を card から消し、古い handoff ファイルを
+    退避する (t028。knowledge/fail-evidence.md)。
     Body (Description / Result sections) is never modified by this command.
 
     前提の指定 (--expect-status / --expect-worker / --expect-started-at) は
@@ -4287,7 +4306,7 @@ def cmd_update(args):
     # Holder for reset worker info (populated inside _do, used after with_lock)
     # [0] = old worker name, [1] = slug (for assignment content verification)
     reset_worker_holder = [None, None]
-    stale_handoff_holder = [None]  # --reset が消した handoff_path (ファイル退避用)
+    stale_handoff_holder = [None]  # 証拠を消した card の handoff_path (ファイル退避用)
 
     def _do():
         state = load_state()
@@ -4298,6 +4317,7 @@ def cmd_update(args):
             die(f"mission '{slug}' not found.")
 
         meta, body = load_task(slug, task_id)
+        old_status = meta.get('status')
 
         changed = []
 
@@ -4310,14 +4330,6 @@ def cmd_update(args):
             meta['started_at'] = None
             meta['completed_at'] = None
             changed.append('reset(status=pending,worker=null,started_at=null,completed_at=null)')
-            # 前回の FAIL の証拠 (handoff / head) を持ち越さない。古い handoff が
-            # 同じ固定パスに残ると、やり直しの FAIL としてそのまま再提出できて
-            # しまう (backlog #8 の誘因)。ファイルの退避は card の保存後に行う。
-            stale_handoff_holder[0] = meta.get('handoff_path')
-            for stale_key in ('handoff_path', 'fail_head', 'fail_head_waiver'):
-                if stale_key in meta:
-                    del meta[stale_key]
-                    changed.append(f'{stale_key}=cleared')
 
         if opts.get('--skills') is not None:
             new_skills = [s.strip() for s in opts['--skills'].split(',') if s.strip()]
@@ -4342,6 +4354,24 @@ def cmd_update(args):
         if status:
             meta['status'] = status
             changed.append(f"status={status}")
+
+        # 前回の FAIL の証拠 (handoff / head) を持ち越さない。古い handoff が同じ固定パスに
+        # 残ると、やり直しの FAIL としてそのまま再提出できてしまう (backlog #8 の誘因)。
+        # **--reset だけでなく status を動かす経路すべて** (t028): `--status in_progress` /
+        # `--status pending` で開き直しても card に証拠が残ると、次の `fail` が handoff を
+        # 渡さないとき古い値が failed の card に載り、dispatcher が読んで通知していた。
+        # 証拠が生き残るのは「failed のまま failed」(同じ FAIL の再記録) だけ — 逆に
+        # 「failed 以外 → failed」は FAIL の報告 (`plan.sh fail`) を経ていないので、card に
+        # 載っている証拠は今回の FAIL のものではない。status を触らない更新 (priority 等) は
+        # 証拠に関与しない。ファイルの退避は card の保存後に行う (退避であって削除ではない)。
+        keeps_evidence = not opts.get('--reset') and (
+            not status or (status == 'failed' and old_status == 'failed'))
+        if not keeps_evidence:
+            stale_handoff_holder[0] = meta.get('handoff_path')
+            for stale_key in ('handoff_path', 'fail_head', 'fail_head_waiver'):
+                if stale_key in meta:
+                    del meta[stale_key]
+                    changed.append(f'{stale_key}=cleared')
 
         if opts.get('--description') is not None:
             # Replace Description section while preserving Result section

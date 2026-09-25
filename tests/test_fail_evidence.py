@@ -612,3 +612,222 @@ def test_set_aside_never_overwrites_an_earlier_report(sb):
     stale = list(sb.handoffs.glob("t001_HANDOFF.md.stale-*"))
     assert len(stale) == 4, [p.name for p in stale]
     assert any(sb.old_head in p.read_text() for p in stale), "今回の handoff が退避されていない"
+
+
+# ---------------------------------------------------------------------------
+# Kai P2 2 巡目 (PR #216 / t028): 開き直しで引き継がれた handoff_path を断つ
+#
+# t004 は `update --reset` だけ handoff を掃除した。`update --status in_progress` で
+# 開き直すと card に古い handoff_path が残り、次の `fail --head <新 SHA>` (handoff なし) が
+# それに触れないまま failed にする → dispatcher が古いファイルを読んで Director に通知する。
+# Result には `handoff: none` と書かれているのに。#8 の元の事故 (別 head 時点の handoff の
+# 再提出) が別の入口から開いたままだった。
+# ---------------------------------------------------------------------------
+
+# `plan.sh update --status` が受け付ける failed 以外の status の全部 (cmd_update の
+# valid_statuses から failed を除いたもの)。どれで開き直し / 動かしても証拠は残らない。
+_NON_FAILED_STATUSES = sorted({
+    "pending", "in_progress", "done", "blocked", "skipped", "verified",
+    "ready_for_verification", "verifying", "verification_failed", "needs_human_review",
+})
+
+# 開き直す経路。(名前, update に渡す引数)。`--reset` だけを見て終わりにしない。
+_REOPEN_ROUTES = [
+    ("update --status in_progress", ("--status", "in_progress")),
+    ("update --status pending", ("--status", "pending")),
+    ("update --reset", ("--reset",)),
+    ("update --reset --status in_progress", ("--reset", "--status", "in_progress")),
+]
+
+
+def _dispatcher_notifies_with(sb, task_id="t001"):
+    """dispatcher.sh の「Handoff detection」が、この card について読むことになる handoff_path。
+
+    dispatcher は `status == 'failed'` かつ `meta.get('handoff_path')` の card を、その
+    ファイルを読んで Director に通知する。読み取りは dispatcher と同じ
+    `lib_task_cards.list_task_cards` を通す (card を読む側の視点)。通知しないなら None。
+    """
+    import sys
+    scripts = str(REPO_ROOT / "scripts")
+    if scripts not in sys.path:
+        sys.path.insert(0, scripts)
+    import lib_task_cards
+    for meta, _body in lib_task_cards.list_task_cards(sb.tasks):
+        if meta.get("id") == task_id and meta.get("status") == "failed":
+            return meta.get("handoff_path") or None
+    return None
+
+
+def test_the_dispatcher_view_helper_mirrors_the_real_notify_condition():
+    """`_dispatcher_notifies_with` は dispatcher.sh の条件の写し。写しがずれたら落とす。"""
+    src = (REPO_ROOT / "scripts" / "dispatcher.sh").read_text()
+    m = re.search(r"# Handoff detection:.*?handoff_path = meta\.get\('handoff_path'\)", src, re.DOTALL)
+    assert m, "dispatcher.sh の handoff 通知の条件が変わった。_dispatcher_notifies_with を見直すこと"
+    assert "meta.get('status') != 'failed'" in m.group(0)
+
+
+def _result_section(card: str) -> str:
+    return card.split("## Result", 1)[1]
+
+
+def _assert_result_matches_card(card: str, expect_handoff):
+    """Result の `handoff: <x>` と card の handoff_path が食い違わないこと (受入条件 2)。"""
+    result = _result_section(card)
+    m = re.search(r"handoff: (\S+)", result)
+    assert m, f"Result に handoff の記述が無い: {result!r}"
+    if expect_handoff is None:
+        assert m.group(1) == "none", result
+        assert "handoff_path" not in card, "Result は handoff: none なのに card に handoff_path が残っている"
+    else:
+        assert m.group(1) == str(expect_handoff), result
+        assert f"handoff_path: {expect_handoff}\n" in card
+
+
+@pytest.mark.parametrize("route", _REOPEN_ROUTES, ids=[r[0] for r in _REOPEN_ROUTES])
+def test_a_reopened_card_cannot_carry_the_old_handoff_into_the_next_fail(sb, route):
+    """再現手順そのもの: FAIL(古い head の handoff 付き) → 開き直す → handoff なしで fail。
+
+    どの入口から開き直しても、dispatcher が読む handoff_path は空でなければならない。
+    """
+    _name, update_args = route
+    old = sb.handoff(f"# HANDOFF\n\nhead: {sb.old_head}\n")
+    sb.add(status="failed", extra=f"handoff_path: {old}\nfail_head: {sb.old_head}\n")
+    assert _dispatcher_notifies_with(sb) == str(old), "前提: 開き直す前は古い handoff が見える"
+
+    r = sb.run("update", "t001", *update_args, "--mission", MISSION)
+    assert r.returncode == 0, r.stderr
+    reopened = sb.card()
+    assert "handoff_path" not in reopened, "開き直した card に古い handoff_path が残っている"
+    assert "fail_head" not in reopened
+
+    # 開き直した card が in_progress でなければ (reset → pending)、Worker が拾い直した状態にする
+    (sb.tasks / "t001.md").write_text(reopened.replace("status: pending", "status: in_progress"))
+    r = sb.run("fail", "t001", "--head", sb.new_head, "--mission", MISSION)
+    assert r.returncode == 0, r.stderr
+    card = sb.card()
+    _assert_result_matches_card(card, None)
+    assert _dispatcher_notifies_with(sb) is None, "dispatcher が古い handoff を読んで通知する"
+
+
+def test_fail_without_a_handoff_clears_one_the_card_inherited(sb):
+    """sink 側の単独確認: 開き直しの経路がどうであれ (旧版が書いた card / 手書き)、
+    card に古い handoff_path が載ったまま in_progress になっていても、handoff なしの
+    fail は failed の card にそれを載せない。update 側の掃除に頼らない。"""
+    old = sb.handoff(f"head: {sb.old_head}\n")
+    sb.add(status="in_progress", extra=f"handoff_path: {old}\nfail_head: {sb.old_head}\n")
+    assert _dispatcher_notifies_with(sb) is None    # failed ではないので読まれない (前提)
+    r = sb.run("fail", "t001", "--head", sb.new_head, "--mission", MISSION)
+    assert r.returncode == 0, r.stderr
+    card = sb.card()
+    _assert_result_matches_card(card, None)
+    assert f"fail_head: {sb.new_head}\n" in card
+    assert _dispatcher_notifies_with(sb) is None
+
+
+def test_no_head_fail_without_a_handoff_also_clears_the_inherited_one(sb):
+    old = sb.handoff(f"head: {sb.old_head}\n")
+    sb.add(status="in_progress", extra=f"handoff_path: {old}\n")
+    r = sb.run("fail", "t001", "--no-head", "git 管理外", "--mission", MISSION)
+    assert r.returncode == 0, r.stderr
+    _assert_result_matches_card(sb.card(), None)
+    assert _dispatcher_notifies_with(sb) is None
+
+
+def test_a_handoff_supplied_to_fail_replaces_the_inherited_one_and_is_validated(sb):
+    """渡された handoff は従来どおり検証され、card には渡された方だけが載る。"""
+    old = sb.handoff(f"head: {sb.old_head}\n")
+    sb.add(status="in_progress", extra=f"handoff_path: {old}\n")
+    # 古い handoff を渡せば (別 head なので) 弾かれる — 継承を断っても検証は緩まない
+    r = sb.run("fail", "t001", str(old), "--head", sb.new_head, "--mission", MISSION)
+    assert r.returncode != 0
+    assert "触れていません" in r.stderr
+    fresh = sb.handoff(f"head: {sb.new_head}\n")
+    r = sb.run("fail", "t001", str(fresh), "--head", sb.new_head, "--mission", MISSION)
+    assert r.returncode == 0, r.stderr
+    card = sb.card()
+    _assert_result_matches_card(card, fresh)
+    assert _dispatcher_notifies_with(sb) == str(fresh)
+
+
+def test_clearing_the_handoff_never_turns_a_legitimate_fail_into_an_outage(sb):
+    """原則: FAIL が報告できなくなる別の outage を作らない (受入条件 9)。
+
+    handoff を消す規則が、正当な FAIL を拒否する経路になっていないこと:
+    (a) 古い handoff が card に残っていても、head だけの FAIL は通る
+    (b) 開き直したあとの fresh な handoff 付き FAIL は通る
+    (c) 宣言済みゲート付き task でも同じ
+    (d) 継承された handoff のファイルが消えていても / 読めなくても、handoff を渡さない FAIL は通る
+    """
+    old = sb.handoff(f"head: {sb.old_head}\n")
+    gated = ("qa_checkpoints:\n  - {id: c1, required: true}\n"
+             "required_evidence: [\"screenshot\"]\n")
+    sb.add("t001", status="in_progress", extra=f"handoff_path: {old}\n{gated}")
+    old.unlink()                                                    # (d) ファイルが無い
+    r = sb.run("fail", "t001", "--head", sb.new_head, "--mission", MISSION)   # (a)(c)(d)
+    assert r.returncode == 0, r.stderr
+    assert "handoff_path" not in sb.card()
+
+    sb.add("t002", status="failed", extra=f"handoff_path: {sb.handoffs / 't002_HANDOFF.md'}\n")
+    r = sb.run("update", "t002", "--status", "in_progress", "--mission", MISSION)
+    assert r.returncode == 0, r.stderr
+    sb.handoffs.mkdir(parents=True, exist_ok=True)
+    fresh = sb.handoffs / "t002_HANDOFF.md"
+    fresh.write_text(f"head: {sb.new_head}\n")
+    r = sb.run("fail", "t002", str(fresh), "--head", sb.new_head, "--mission", MISSION)   # (b)
+    assert r.returncode == 0, r.stderr
+    assert f"handoff_path: {fresh}\n" in (sb.tasks / "t002.md").read_text()
+
+
+@pytest.mark.parametrize("status", _NON_FAILED_STATUSES)
+def test_every_status_change_away_from_failed_clears_the_evidence(sb, status):
+    """`update --status <X>` は failed から動かせる全部の status で証拠を持ち越さない。"""
+    old = sb.handoff(f"head: {sb.old_head}\n")
+    sb.add(status="failed", extra=(f"handoff_path: {old}\nfail_head: {sb.old_head}\n"
+                                   'fail_head_waiver: "x"\n'))
+    r = sb.run("update", "t001", "--status", status, "--mission", MISSION)
+    assert r.returncode == 0, r.stderr
+    card = sb.card()
+    for key in ("handoff_path", "fail_head", "fail_head_waiver"):
+        assert key not in card, f"{status}: {key} が残っている"
+    assert not old.exists() and len(list(sb.handoffs.glob("t001_HANDOFF.md.stale-*"))) == 1, \
+        "古い handoff が同じ固定パスに残っている (退避されていない)"
+
+
+def test_marking_a_non_failed_card_failed_by_hand_does_not_adopt_stale_evidence(sb):
+    """`update --status failed` は FAIL の報告 (gate) を経ない。in_progress の card に載っている
+    handoff は今回の FAIL のものではないので、failed にした途端に dispatcher へ出てはいけない。"""
+    old = sb.handoff(f"head: {sb.old_head}\n")
+    sb.add(status="in_progress", extra=f"handoff_path: {old}\nfail_head: {sb.old_head}\n")
+    r = sb.run("update", "t001", "--status", "failed", "--mission", MISSION)
+    assert r.returncode == 0, r.stderr
+    assert "handoff_path" not in sb.card()
+    assert _dispatcher_notifies_with(sb) is None
+
+
+def test_evidence_survives_updates_that_do_not_end_the_failure(sb):
+    """掃除は「FAIL が終わる更新」だけ。同じ FAIL の再記録 / status に触れない更新では、
+    検証済みの証拠を消さない (消すと Director が見る handoff が消える)。"""
+    fresh = sb.handoff(f"head: {sb.new_head}\n")
+    sb.add(status="in_progress")
+    assert sb.run("fail", "t001", str(fresh), "--head", sb.new_head, "--mission", MISSION).returncode == 0
+    for args in (("--priority", "high"), ("--status", "failed"), ("--pr-number", "216")):
+        r = sb.run("update", "t001", *args, "--mission", MISSION)
+        assert r.returncode == 0, r.stderr
+        card = sb.card()
+        assert f"handoff_path: {fresh}\n" in card, f"{args}: 検証済みの handoff が消えた"
+        assert f"fail_head: {sb.new_head}\n" in card
+        assert fresh.exists()
+    assert _dispatcher_notifies_with(sb) == str(fresh)
+
+
+def test_the_fail_gate_is_where_the_handoff_path_of_a_failed_card_is_decided(tree):
+    """構造: `handoff_path` を card に書く欄は gate の戻り値 (fields) に 1 本化されている。
+    cmd_fail が `meta['handoff_path'] = ...` を自前で足す形 (= 渡されないとき card に触れない形)
+    に戻ったら赤くなる。"""
+    fns = _functions(tree)
+    for node in ast.walk(fns["cmd_fail"]):
+        if (isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name)
+                and node.value.id == "meta" and isinstance(node.ctx, ast.Store)
+                and isinstance(node.slice, ast.Constant) and node.slice.value == "handoff_path"):
+            pytest.fail("cmd_fail が meta['handoff_path'] を直接書いている — "
+                        "渡されないときに古い値が残る形に戻っている")

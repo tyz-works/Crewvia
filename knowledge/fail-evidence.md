@@ -87,6 +87,43 @@ shell はコメントでない行に単独の語 `fail` があれば落とす（
   （衝突したら `-1`, `-2`, ...）、その確保済みの名前へ置換する。「存在しなければ改名」の check-then-act にしない。
 `retire` は in_progress からしか動かず、handoff_path を持ち得ないので対象外。
 
+### 開き直しで引き継がれた handoff_path を断つ（t028 / Kai 2 巡目 P2）
+
+`--reset` だけを掃除すると、**`update --status in_progress` で開き直す経路がそれを迂回する**。card に古い
+`handoff_path` が残ったまま次の `fail --head <新 SHA>`（handoff なし）が通り、Result は `handoff: none` なのに
+failed の card に古い handoff_path が載る → dispatcher（`status == failed` かつ `handoff_path` のある card を
+読んで Director に通知する）が、head を検証されていない古いファイルを読む。#8 の元の事故が別の入口で開いていた。
+
+塞ぎ方は **2 か所**（どちらか片方では漏れる）:
+
+1. **入口（`plan.sh fail`）**: `_validate_fail_evidence()` の戻り値 `fields` が card に書く欄の全体で、
+   `handoff_path` を必ず含む（検証した絶対パス、渡されなければ `None`）。`None` は card から**消す**。
+   card の値は「この報告で検証したもの」だけになる。`cmd_fail` が `meta['handoff_path']` を自前で足す形に
+   戻ると、渡されないとき card に触れない形になる（構造テストが赤くする）。
+2. **開き直す側（`plan.sh update`）**: FAIL が終わる更新は証拠（`handoff_path` / `fail_head` /
+   `fail_head_waiver`）を消し、ファイルを退避する。消さないのは「status に触れない更新」と
+   「failed のまま failed（同じ FAIL の再記録）」だけ。**failed 以外 → failed の手動更新も消す側**
+   （`fail` の gate を経ていないので、card の証拠は今回の FAIL のものではない）。
+
+入口側を主にした理由: 開き直す経路（`--reset` / `--status` / 手書き / 旧版が書いた card）を全部塞ぐより、
+failed に至る唯一の入口で塞ぐ方が漏れない。update 側は failed 以外の間も card を綺麗に保つ多層目。
+
+洗い出した card の status を戻す / 動かす経路（どれから来ても古い handoff は残らない）:
+
+| 経路 | 掃除 |
+|---|---|
+| `update --reset` | 消す + 退避 |
+| `update --reset --status <X>` | 消す + 退避 |
+| `update --status in_progress` / `pending` / 他の failed 以外の全 status | 消す + 退避 |
+| `update --status failed`（failed 以外から） | 消す + 退避（未検証の証拠を採用しない） |
+| `update --status failed`（failed から。再記録） | 残す（検証済み） |
+| `update --priority` 等（status に触れない） | 残す |
+| card の手書き / 旧版の card | `fail` の入口が消す（update を経ないので入口側が必要な理由） |
+
+**outage を作らない**: 消す規則は FAIL の受理条件を一切変えない。継承された handoff のファイルが無い / 読めない /
+ゲート宣言付き task でも、handoff を渡さない `fail --head` は通る。渡された handoff は従来どおり検証される
+（`test_clearing_the_handoff_never_turns_a_legitimate_fail_into_an_outage`）。
+
 ## ロールバック
 
 停止スイッチは**設けていない**（証拠要求を env で切れると、それが「静かに検証しない」経路になる）。

@@ -200,6 +200,14 @@ allowlist に無ければ落とす。新しい経路を足したら必ず赤に�
 - `lib_retirement.read_json` / `lib_mux.read_pane_record` / pause marker は **外側が object であること** までしか
   検証しない (契約は従来のまま)。内側の欄の型は呼び出し側が検証している (heartbeat の `updated_at`/`pid` など)。
 
+**#215 (registry/mux の記録を消す経路の走査) との相互衝突 (t031)**: 2 つの構造ガードが、互いの新しいコードを
+拾う形があった。どちらも実欠陥ではなく、**個別の呼び出しを理由付きで allowlist に足して閉じた** (走査の範囲・判定は緩めていない)。
+- #215 の `ALLOWED_DELETIONS` (`tests/test_stale_pane_record_sweep.py`) は、`dispatcher.sh:save_told` の
+  `os.replace(tmp, TOLD_FILE)` を拾う。これは本台帳の原子的な書き込みで、registry/mux の記録ではない。
+- 本節の `ALLOWED_JSON_PARSES` は、#215 が足した `lib_mux.py:_herdr_pane_get_bound` の `json.loads` を拾う。
+  herdr の `pane.get` 応答 (E) であって、デーモン側状態ストアではない (既存の `_herdr_close_tab_bound` と同区分)。
+- キーは (ファイル, 関数, 呼び出しのソース) なので、同じ形を**別の関数**に足せば依然として赤になる (欠陥注入で確認済み)。
+
 **検出器が見えないもの** (実態より狭く書かない): `exec()`/`eval()`、`json` を変数に入れて渡す形、JSON 以外の
 パーサ (`yaml.safe_load` / `pickle`)、走査対象外のモジュール (`hooks/` 等)。「うっかり足す」ことを止める補助で、
 敵対的なすり抜けを防ぐ境界ではない。

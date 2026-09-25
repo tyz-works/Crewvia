@@ -177,6 +177,9 @@ ALLOWED_JSON_PARSES: dict[tuple[str, str, str], str] = {
         _EXTERNAL_RESPONSE + "同上 (エラー本文が stderr の JSON で来る版)",
     ("lib_mux.py", "_herdr_close_tab_bound", "json.loads(data.split(b\"\\n\")[0].decode())"):
         _EXTERNAL_RESPONSE + "herdr socket の応答。壊れていれば「閉じられなかった」と読む",
+    ("lib_mux.py", "_herdr_pane_get_bound", "json.loads(data.split(b\"\\n\")[0].decode())"):
+        _EXTERNAL_RESPONSE + "herdr socket の `pane.get` 応答 (束縛済み接続)。デーモン側状態ストア "
+        "(registry/daemons) のファイルではない。壊れていれば None = 「観測できなかった」と読む",
     # -- (E) Taskvia の HTTP 応答 --------------------------------------------
     ("plan.sh", "_taskvia_request", "json.loads(resp.read().decode())"):
         _EXTERNAL_RESPONSE + "Taskvia の HTTP 応答。同期は best-effort (Taskvia 非依存)",

@@ -2176,6 +2176,92 @@ capture / pid / send / `kill --force` の到達、sweep 中の server 再起動�
 `write_pane_record()` を走らせて窓を作る (ロックが無ければ書き手はすぐ書いて掃除に消され、
 あれば掃除が終わるまで待つ)。
 
+### 7-15. pytest が作った宛先を終わるときに片付ける (mission 20260925-pytest-workspace-leak / t001 / backlog #15)
+
+§7-11 の隔離は、pytest セッションごとに `crewvia-pytest-<pid>-<8 桁 hex>` という宛先を作って
+`CREWVIA_HERDR_WORKSPACE` / `CREWVIA_TMUX_SESSION` をそこへ向ける。**この隔離は正しい**。
+足りなかったのは後始末だけで、herdr は初回アクセスで workspace を自動作成するのに、conftest が
+終了時に閉じなかった。pytest を 1 回まわすたびに空の workspace が本番 herdr に 1 つ残り、
+2026-09-25 には 50 個になって `herdr pane list` が 50KB を超えた。
+
+**実測 (修正前 = origin/main、label 集合の差分)**: 漏れのあるテスト 1 本でも、`tests/` 全体
+(1648 件) でも、実行後に自分の `crewvia-pytest-<pid>-<hex>` が **1 個** 残る (pane は idle な素の
+シェル 1 つ)。**tmux は漏れない**: 同じ全体実行の前後で `tmux ls` に差が無く、tmux の実行層
+(`new-session`) を呼ぶ経路は `lib_mux.TmuxBackend` だけで、テストの偽 tmux はそこへ届かない。
+ただし判定ロジックは共有し、実行層だけ差し替える形で tmux 用の後始末も入れてある (将来漏れたときのため)。
+
+**直し方** (`tests/pytest_workspace_sweep.py`、conftest の `pytest_unconfigure` から 1 回呼ぶ):
+
+| 対象 | 何を閉じるか | 根拠 |
+|---|---|---|
+| 自分の宛先 | label が **完全一致** する workspace / session だけ | 自分が作った名前。中身も自分のテストが作ったもの。空かどうかは問わない |
+| 残骸 | `crewvia-pytest-<pid>-<hex>` の形 **かつ** pid が死んでいる **かつ** 中に live な pane が 1 つも無い | 3 つの AND。どれか 1 つでも欠ければ残す |
+
+`pytest_sessionfinish` でなく `pytest_unconfigure` なのは、collection エラーや中断でも走るため。
+残骸掃除を**開始時でなく終了時**に置いたのは、開始時に置くと最初のテストが掃除のぶん遅れるため。
+**このフックは `--collect-only` / `--help` でも走る** (QA が subprocess を記録して確認: herdr への
+一覧の取得 2 回だけで書き込みは無い。自分の宛先は作られていないので閉じるものも無い)。
+SIGKILL された回 (watchdog の timeout 等) は終了フックが走らないので、次に正常終了した回が拾う。
+
+**倒す向き** (`knowledge/empty-vs-unobservable.md` の作法): 破壊の根拠は「観測できたこと」だけ。
+label の形も pid の生死も対象そのものの観測ではなく分類なので、単独では閉じる根拠にしない。
+
+- **pid**: `ESRCH` だけが「死んでいる」。`EPERM` (別ユーザーの生きたプロセス)・その他の `OSError`・
+  `OverflowError` は「生きている」= 残す。pid 0 は `os.kill(0, 0)` が自分のプロセスグループへの
+  シグナルで常に成功するので、形の段階で対象外にする。**別 worktree で同時に走っている pytest の
+  workspace は pid が生きているので残る** (空かどうかを尋ねる前に対象外)。
+- **live な pane が無い**: herdr は `pane list --workspace` + 各 pane の `process-info` の `shell_pid` を
+  `lib_mux._pane_shell_state()` (idle な素のシェルだと**示せた**ときだけ `idle`) に通す。tmux は
+  `list-panes -s` の `pane_pid` を同じ関数に通す。pane 一覧が読めない・pane が 0 個と答えた・
+  process-info が読めない・idle でない (live / 判定不能) pane が 1 つでもある → 閉じない。
+- **label**: 完全一致だけ。前方一致・部分一致で閉じない。閉じる前にガード (`guard_refusal`) が、
+  `crewvia-pytest-` で始まらない / 本番の宛先 (`crewvia`) と等しい label を拒否して警告 1 行を出す。
+  tmux の `kill-session` は `-t =<名前>` (完全一致。`=` が無いと前方一致で別のセッションを撃つ)。
+- **失敗はテスト結果に影響しない**: herdr が居ない (`herdr` が PATH に無い / socket が無い — socket は
+  `CREWVIA_HERDR_SOCK` か既定の `~/.config/herdr/herdr.sock`。server を起こさないよう CLI を呼ばない)・timeout・
+  CLI エラー・読めない答えは、警告 1 行で握りつぶして先へ進む。`run_cleanup()` は例外を出さない。
+  tmux の「no server running」は正常な状態なので警告も出さない。
+- **時間上限は 1 つの締切 (`Deadline`) で、backend の subprocess 呼び出しまで届く**: 後始末**全体**で
+  30 秒 (`BUDGET_SECONDS`)、CLI 1 回は 5 秒 (`CLI_TIMEOUT_SECONDS`)。`run_cleanup` が締切を 1 つだけ作り、
+  全 backend で共有する (backend ごとに作ると herdr と tmux で 60 秒になる)。各 subprocess の timeout は
+  `min(5 秒, 残り時間)` で、**残りが尽きたら呼ばずに「観測できなかった」に倒す**ので、閉じずに打ち切る
+  (記録は無いので次回が拾う)。以前は宛先の境目でしか締切を見ておらず、`HerdrBackend.is_empty` が
+  pane ごとの `process-info` を (それぞれ最大 5 秒で) 何回でも走らせたうえ、その後の `close` も締切を
+  見なかった: pane 10 個 × 応答 4 秒の偽 herdr が、30 秒の予算に対して **52 秒**かかった (Codex 指摘)。
+  直したあとは同じ構成が 30 秒に収まり、workspace は閉じない (空だと示し切れていない)。
+  空だと示せた直後に尽きたときも `close` は走らせない。**herdr の残骸掃除で予算を使い切ると tmux は
+  何も始めない** (tmux は漏れないことを実測済みで、次に正常終了した回が拾う)。
+  テストは時計を差し替えた偽 herdr で構成する (実時間に頼らない)。
+
+**暴走時の止め方: `CREWVIA_PYTEST_WORKSPACE_SWEEP=0`** — 残骸掃除は何も見ず何も消さない。
+**自分の宛先の後始末は止まらない** (自分の label だけを消すので危険が無く、止めると元の漏れに戻る)。
+`CREWVIA_MUX_RECORD_SWEEP=0` (§7-14) と同じ考え方で、消す側が 1 者なので食い違っても危険な側には
+倒れない。値は `0` のときだけ効く (`false` や空では止まらない)。掃除は pytest が終わるときに走るので、
+止めたいシェルの env に足して pytest を起動し直すだけで効く (常駐デーモンの再起動は要らない)。
+完全に外したければ conftest の `pytest_unconfigure` を revert する。
+
+**残した穴**: SIGKILL された回の残骸は、次に**正常終了した** pytest まで残る (数が増え続けることは
+ない — 次の 1 回で全部消える)。pid が再利用されて別のプロセスが同じ番号を持っていると、その残骸は
+「生きている」として残る (安全側。手で `herdr workspace close` する)。
+
+回帰テスト: `tests/test_pytest_workspace_sweep.py` (偽の herdr / tmux。本物の pytest セッションを
+偽 herdr を PATH に置いて走らせる入口から出口までのテストを含む)。欠陥を戻すと赤くなることは
+`tests/red_proof_t001_pytest_workspace.sh` (15 種: 12 種 + 締切が subprocess に届かない / backend ごとに
+予算が戻る / 実 subprocess に timeout を渡さない) で実証した。実機の label 集合差分は PR 本文と
+Result にある。
+
+**赤の実証自身も本物の tmux / herdr に触れない** (Codex 指摘): 欠陥を注入した版の
+`pytest_unconfigure` は、複製の pytest が終わるたびに**その版の後始末**を走らせる。`is_empty` の
+確認や pid の生死の確認を外した版 (case E / G) が本物の tmux server (このマシンには `main` が居る)
+に届けば、別 worktree で同時に走っている pytest の `crewvia-pytest-*` を kill しうる。
+そこでスクリプトは、外側の変異実行にも (内側の統合テストが元々そうしていたのと同じく)
+PATH の先頭に tmux / herdr のスタブ (呼び出しを記録して失敗を返す) を置き、`TMUX_TMPDIR` を空の
+ディレクトリに向けて `TMUX` を外し、`CREWVIA_HERDR_SOCK` を存在しないパスにする。そのうえで
+**実行の前後で本物の `tmux list-sessions` が同じ**こと・スタブに tmux が届いたこと (隔離が効いていた
+証拠) ・kill-session / kill-server / herdr がどこにも届いていないことを assert する。スタブが
+PATH の先頭に無ければ、注入版を走らせる前に中止する。**赤の実証を書き足すときは、注入した版が走る
+場所が本番から届かないことを先に確かめる**こと。
+
 ---
 
 ## 8. 参照
@@ -2205,5 +2291,7 @@ capture / pid / send / `kill --force` の到達、sweep 中の server 再起動�
   `daemon-backstop` セクション。`tests/test_daemon_backstop_hook.py` が回帰テスト
 - `scripts/lib_mux.py` — `reap_stale_pane_records()` / `HerdrBackend._pane_existence()` /
   `TmuxBackend.record_existence()` (§7-14)、`spawn` の終了コード 10 / 11
+- `tests/pytest_workspace_sweep.py` + `tests/conftest.py` の `pytest_unconfigure` — pytest が作った
+  宛先の後始末 (§7-15)。`CREWVIA_PYTEST_WORKSPACE_SWEEP=0` で残骸掃除だけが止まる
 - `knowledge/dispatcher-restart-after-merge.md` — 常駐デーモンの反映手順。
   **§7-5 の pause を挟む手順が追加された**ので、kill → spawn を素で打たないこと

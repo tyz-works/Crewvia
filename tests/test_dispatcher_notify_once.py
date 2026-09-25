@@ -274,6 +274,103 @@ def test_other_tasks_are_independent(h):
     assert about(msgs, "t001") == [] and len(about(msgs, "t003")) == 1
 
 
+# -- 観測できなかったときは、台帳もスロットルも捨てない (t023 / Kai 2 巡目 P2) -----------
+#
+# 「空 (もう無い)」と「観測不能 (見られなかった)」を同じに扱う型。prune_told() は
+# 「観測できた mission の、live に無い key」を捨てる。live key を別の走査で集めていると、
+# 走査 (all_tasks) は成功・その後の走査が失敗したとき、key が 1 件も集まらないのに
+# mission は「観測できた」扱いになり、台帳とスロットルを捨てる。回復すると再通知される。
+
+def handoff_throttle_keys(h, task_id):
+    cache = json.loads(h.notify_cache.read_text()) if h.notify_cache.exists() else {}
+    return [k for k in cache if k.startswith(f"handoff_{SLUG}_{task_id}#")]
+
+
+def told_keys(h):
+    return list(json.loads(h.told_file.read_text())) if h.told_file.exists() else []
+
+
+def make_later_scans_fail(monkeypatch):
+    """`list_task_cards` を「サイクルの 1 回目の走査だけ成功・2 回目以降は走査失敗」にする。
+
+    dispatch() が mission を何回走査しても、1 サイクル内では最初の 1 回しか本物を返さない。
+    走査を 1 つのスナップショットにまとめていれば、失敗する 2 回目は存在しない。
+    """
+    import lib_task_cards
+    real = lib_task_cards.list_task_cards
+    state = {"calls": 0}
+
+    def flaky(tasks_dir, warn=None):
+        state["calls"] += 1
+        if state["calls"] == 1:
+            return real(tasks_dir, warn=warn)
+        return [lib_task_cards.scan_failure_task(tasks_dir, "listing error", "injected")]
+
+    monkeypatch.setattr(lib_task_cards, "list_task_cards", flaky)
+    return state
+
+
+def test_handoff_ledger_and_throttle_survive_a_corrupt_card(h):
+    """failed+handoff のカード自体が壊れて読めない = 観測不能。「もう failed でない」ではない。"""
+    h.card("t002", "failed", handoff_path="/tmp/handoff-t002.md")
+    assert len(about(h.cycle(), "t002")) == 1
+    assert told_keys(h) == [f"handoff_{SLUG}_t002"]
+    assert handoff_throttle_keys(h, "t002")
+
+    h.card("t999", "failed", handoff_path="/tmp/handoff-t002.md")
+    (h.tasks / "t999.md").replace(h.tasks / "t002.md")      # id がファイル名と食い違う = [破損]
+    assert about(h.cycle(), "t002") == []
+    assert told_keys(h) == [f"handoff_{SLUG}_t002"]         # 台帳は捨てない
+    assert handoff_throttle_keys(h, "t002")                 # スロットルも捨てない
+
+    h.card("t002", "failed", handoff_path="/tmp/handoff-t002.md")              # 読み取りが回復
+    assert about(h.cycle(), "t002") == []                   # スロットルだけで黙っている
+    assert about(h.cycle(ttl_expired=True), "t002") == []   # 台帳が黙らせている: 再通知されない
+
+
+def test_handoff_ledger_and_throttle_survive_a_scan_failure(h):
+    """mission の tasks/ を走査できない (非終端のプレースホルダが返る) = 観測不能。"""
+    h.card("t002", "failed", handoff_path="/tmp/handoff-t002.md")
+    assert len(about(h.cycle(), "t002")) == 1
+
+    backup = h.tasks.with_name("tasks.bak")
+    h.tasks.rename(backup)
+    h.tasks.write_text("not a directory")                   # 走査失敗 (ENOTDIR)
+    try:
+        assert h.cycle() == []
+        assert told_keys(h) == [f"handoff_{SLUG}_t002"]
+        assert handoff_throttle_keys(h, "t002")
+    finally:
+        h.tasks.unlink()
+        backup.rename(h.tasks)
+    assert about(h.cycle(ttl_expired=True), "t002") == []   # 回復後に再通知されない
+
+
+def test_handoff_detection_and_pruning_share_one_snapshot(h, monkeypatch):
+    """Kai 2 巡目 P2 そのもの: 1 回目の走査は成功・2 回目は失敗するとき、台帳を捨てない。
+
+    走査が 1 回なら 2 回目は存在せず、handoff 検知と pruning は同じ結果を見る。
+    """
+    h.card("t002", "failed", handoff_path="/tmp/handoff-t002.md")
+    assert len(about(h.cycle(), "t002")) == 1
+
+    calls = make_later_scans_fail(monkeypatch)
+    assert about(h.cycle(), "t002") == []
+    assert told_keys(h) == [f"handoff_{SLUG}_t002"]
+    assert handoff_throttle_keys(h, "t002")
+    assert calls["calls"] == 1, "mission は 1 サイクルに 1 回だけ走査する (スナップショットは 1 つ)"
+
+
+def test_a_task_that_really_left_the_state_is_still_pruned(h):
+    """観測できたうえで failed でなくなったものは、これまでどおり捨てる (捨てすぎの逆側)。"""
+    h.card("t002", "failed", handoff_path="/tmp/handoff-t002.md")
+    assert len(about(h.cycle(), "t002")) == 1
+    h.card("t002", "pending")
+    h.cycle()
+    assert told_keys(h) == []
+    assert handoff_throttle_keys(h, "t002") == []
+
+
 # -- 送れなかった通知は「伝えた」に数えない ------------------------------------
 
 def test_a_failed_send_is_not_recorded_as_told(h):

@@ -2025,47 +2025,56 @@ def dispatch():
     # t010 (#10): needs_director と同じく、状態が変わるまで 1 回だけ (台帳)。
     # 入力は status + handoff_path。以前は failed かつ handoff_path がある間ずっと
     # TTL ごとに再送された。
-    for slug in active_missions:
-        tasks_for_slug = list_tasks_for_mission(slug)
-        for meta, _ in tasks_for_slug:
-            if meta.get('status') != 'failed':
-                continue
-            handoff_path = meta.get('handoff_path')
-            if not handoff_path:
-                continue
-            task_id = meta.get('id', '?')
-            notify_key = f"handoff_{slug}_{task_id}"
-            live_state_keys.add(notify_key)
-            fp = fingerprint('failed', handoff_path)
+    # t023 (Kai 2 巡目 P2): **ここは all_tasks を使う** (ミッションを走査し直さない)。
+    # 末尾の prune_told() は「observed_missions(all_tasks) で観測できた mission の、live に
+    # 無い key を捨てる」ので、live key を集める側も同じスナップショットでなければならない。
+    # 別の走査で live key を集めると、1 回目の走査 (all_tasks) は成功・2 回目が破損カード /
+    # 走査失敗のとき、handoff key が 1 件も集まらないのに mission は「観測できた」扱いになり、
+    # 台帳とスロットルを捨てる。読み取りが回復すると同じ failed task が再通知され、
+    # 断続的な失敗のたびに通知洪水が戻る (「観測できなかった」を「もう無い」と読む型)。
+    # 採らなかった案 (b) 「2 回目の失敗を pruning のガードに足す」: 走査を 2 回するせいで
+    # 起きる欠陥を、2 回目の結果を見張る別のガードで塞ぐことになる。ガードは持ち場が増える
+    # ぶん漏れる (t018)。スナップショットを 1 つにすれば、判断の材料が 1 つなので食い違えない
+    # (needs_director / vanished 検知はすでに all_tasks を使っている)。走査も 1 回減る。
+    for slug, meta in all_tasks:
+        if meta.get('status') != 'failed':
+            continue
+        handoff_path = meta.get('handoff_path')
+        if not handoff_path:
+            continue
+        task_id = meta.get('id', '?')
+        notify_key = f"handoff_{slug}_{task_id}"
+        live_state_keys.add(notify_key)
+        fp = fingerprint('failed', handoff_path)
 
-            def build_msg(slug=slug, task_id=task_id, handoff_path=handoff_path):
-                handoff_summary = ''
-                try:
-                    hp = Path(handoff_path)
-                    if not hp.is_absolute():
-                        # task_158: writer(worker.md)は crewvia_handoff_path 経由で常に絶対パスを
-                        # 書くはずなので、ここに来るのは規約からの逸脱(回帰)。cwd(worktree)基準の
-                        # 相対パスは main repo 側から見て別ファイルを指し handoff_summary が空に
-                        # なる既知の壊れ方(task_158)なので、黙って空文字にせず明示的に警告する。
-                        log(f"WARNING: handoff_path is not absolute (task_158 regression?): "
-                            f"{slug}/{task_id} handoff_path={handoff_path!r}")
-                        hp = REGISTRY_DIR.parent / handoff_path
-                    hp_text = read_queue_text(hp, 'handoff file')
-                    if not is_unreadable(hp_text):
-                        handoff_summary = ' | '.join(hp_text.splitlines()[:10])
-                    else:
-                        log(f"WARNING: handoff file unreadable at resolved path: "
-                            f"{slug}/{task_id} resolved={hp} ({hp_text.reason})")
-                except Exception:
-                    handoff_summary = '(読み取り失敗)'
-                return (
-                    f"タスク {task_id} (mission={slug}) が failed になりました。"
-                    f"handoff_path: {handoff_path} — {handoff_summary[:200]}。"
-                    f"plan.sh add で継続タスクを追加してください。"
-                )
-            if notify_state_once(notify_key, fp, 'handoff', slug, task_id, build_msg,
-                                 director_live=director_live_for_state_notices):
-                log(f"handoff detected: {slug}/{task_id} -> notified director")
+        def build_msg(slug=slug, task_id=task_id, handoff_path=handoff_path):
+            handoff_summary = ''
+            try:
+                hp = Path(handoff_path)
+                if not hp.is_absolute():
+                    # task_158: writer(worker.md)は crewvia_handoff_path 経由で常に絶対パスを
+                    # 書くはずなので、ここに来るのは規約からの逸脱(回帰)。cwd(worktree)基準の
+                    # 相対パスは main repo 側から見て別ファイルを指し handoff_summary が空に
+                    # なる既知の壊れ方(task_158)なので、黙って空文字にせず明示的に警告する。
+                    log(f"WARNING: handoff_path is not absolute (task_158 regression?): "
+                        f"{slug}/{task_id} handoff_path={handoff_path!r}")
+                    hp = REGISTRY_DIR.parent / handoff_path
+                hp_text = read_queue_text(hp, 'handoff file')
+                if not is_unreadable(hp_text):
+                    handoff_summary = ' | '.join(hp_text.splitlines()[:10])
+                else:
+                    log(f"WARNING: handoff file unreadable at resolved path: "
+                        f"{slug}/{task_id} resolved={hp} ({hp_text.reason})")
+            except Exception:
+                handoff_summary = '(読み取り失敗)'
+            return (
+                f"タスク {task_id} (mission={slug}) が failed になりました。"
+                f"handoff_path: {handoff_path} — {handoff_summary[:200]}。"
+                f"plan.sh add で継続タスクを追加してください。"
+            )
+        if notify_state_once(notify_key, fp, 'handoff', slug, task_id, build_msg,
+                             director_live=director_live_for_state_notices):
+            log(f"handoff detected: {slug}/{task_id} -> notified director")
 
     # t010: 状態を離れた task の「伝えた」記録を捨てる (Director が pending に戻し、
     # 同じ理由でまた落ちたのは新しい事象なので、届かなければならない)。

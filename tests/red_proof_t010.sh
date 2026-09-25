@@ -21,6 +21,9 @@
 #   M10 fingerprint が変わってもスロットルを残す → 「A → B → A」が赤
 #   M11 Director 生存確認を先に無条件で呼ぶ      → 「idle サイクルで mux を叩かない」が赤
 #   M12 Director 生存確認をサイクル内で使い回さない → 「サイクル内 1 回」が赤
+#   --- t023 (PR #214 の Kai 2 巡目 P2: 観測できなかったときは台帳とスロットルを捨てない) ---
+#   M13 handoff 検知が mission を走査し直す     → 「検知と pruning は 1 つのスナップショット」が赤
+#   M14 prune_told が観測の可否を見ない          → 「破損カード / 走査失敗で台帳とスロットルが残る」が赤
 #
 # 隔離: 本番の worktree には触らない (使い捨てのコピーの中だけで変異させる)。
 # $PYTHONDONTWRITEBYTECODE=1: 欠陥注入は .pyc を通して古い姿を拾わせない
@@ -184,6 +187,25 @@ mutate scripts/dispatcher.sh "    if not _director_live_memo:
         _director_live_memo.append" || bad "M12 注入失敗"
 out="$(run_pytest)"
 expect_red M12 "$out" "test_liveness_is_looked_up_once_per_cycle_however_many_notices"
+
+echo "== M13: handoff 検知が all_tasks ではなく mission を走査し直す (t021 が作った欠陥)"
+fresh_copy
+mutate scripts/dispatcher.sh "    for slug, meta in all_tasks:
+        if meta.get('status') != 'failed':
+            continue
+        handoff_path = meta.get('handoff_path')" "    for slug, meta in [(_s, _m) for _s in active_missions for _m, _ in list_tasks_for_mission(_s)]:
+        if meta.get('status') != 'failed':
+            continue
+        handoff_path = meta.get('handoff_path')" || bad "M13 注入失敗"
+out="$(run_pytest)"
+expect_red M13 "$out" "test_handoff_detection_and_pruning_share_one_snapshot"
+
+echo "== M14: prune_told が「観測できた mission」で絞らない (観測不能を「離れた」と読む)"
+fresh_copy
+mutate scripts/dispatcher.sh "    prune_told(live_state_keys, observed_missions(all_tasks, active_missions))" "    prune_told(live_state_keys, set(active_missions))" || bad "M14 注入失敗"
+out="$(run_pytest)"
+expect_red M14 "$out" "test_handoff_ledger_and_throttle_survive_a_corrupt_card"
+expect_red M14 "$out" "test_handoff_ledger_and_throttle_survive_a_scan_failure"
 
 echo
 echo "== 結果: OK=$PASS BAD=$FAIL"

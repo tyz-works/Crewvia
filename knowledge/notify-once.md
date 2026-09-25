@@ -70,6 +70,36 @@ dispatcher が kai-review.sh を spawn → 拒否 → needs_director (通知が�
 倒す先が「再送」なのは、通知の欠落 (t027 の 10 時間全停止) のほうが再送より高くつくため。
 `Unreadable` を空の入れ物として扱わない (`lib_task_cards.py` の規則)。
 
+### 観測できなかったときは、台帳もスロットルも捨てない (t023 / Kai 2 巡目 P2)
+
+離脱時の掃除 `prune_told()` は「観測できた mission の、いま成り立っていない key」を捨てる。
+**「観測できた」の判定と「いま成り立っている key」の収集は、同じ 1 つのスナップショット
+(`all_tasks`) から作らなければならない。**
+
+t021 は `prune_told` を足したが、handoff 検知だけが `list_tasks_for_mission()` で mission を
+**もう一度走査**していた。1 回目 (`all_tasks`) が成功・2 回目が破損カード / 走査失敗のとき、
+handoff key が 1 件も集まらないのに mission は「観測できた」扱いになり、台帳とスロットルが
+捨てられる。読み取りが回復すると、変わっていない failed task が再通知される。断続的な失敗が
+繰り返されると、この PR が潰したはずの通知洪水が戻る。「空 (もう無い)」と「観測不能 (見られなかった)」
+を同じものとして扱う、crewvia で繰り返し出ている型そのもの
+(`knowledge/empty-vs-unobservable.md`、`lib_task_cards.list_task_cards()` は走査失敗で
+`[]` ではなく非終端のプレースホルダを返す)。
+
+| | 直し方 | 採否 |
+|---|---|---|
+| (a) | handoff 検知でも `all_tasks` を使う。判断の材料を 1 つにする | **採用** |
+| (b) | 2 回目の走査の失敗も pruning のガードに含める | 不採用 |
+
+(a) を採った理由: 欠陥の根は「同じサイクルで同じ mission を 2 回読み、2 つの結果から 1 つの判断をする」
+ことにある。(b) はそれを残したまま、2 回目の結果を見張る別のガードを足すことになり、ガードが持つ
+場所が増えるぶん漏れる (t018 で表の「載せた関数しか見ない」を機械的な走査に置き換えたのと同じ理由)。
+(a) なら食い違う 2 つの結果がそもそも存在せず、走査も 1 回減る (needs_director / vanished 検知は
+すでに `all_tasks` を使っている)。どちらでも「観測できなかったときは捨てない」に倒れる。捨てる側に
+倒すと元の洪水が戻る。
+
+これから足す状態ベースの通知も同じ規則に従う: **live key は `all_tasks` から集める。mission を
+自分で走査し直さない。**
+
 ### 2. codex-review の拒否記録 (`registry/daemons/review-refusals/<mission>__<task>.json`)
 
 `scripts/lib_review_refusal.py` が唯一の定義 (書き手: `kai-review.sh`、読み手: dispatcher)。
@@ -143,6 +173,7 @@ env var の停止スイッチは足していない — 常駐デーモンの分�
 - `bash scripts/test_kai_review.sh` — サイズ超過で拒否記録が書かれる / `--dry-run` は書かない。
 - `bash tests/red_proof_t010.sh` — 欠陥を 1 つずつ注入し、見張るテストが赤になることを確かめる
   (M1〜M7 = t010 本体、M8〜M12 = t021: 拒否記録の値の検証・離脱時/fp 変更時のスロットル破棄・
-  生存確認の遅延評価と使い回し)。
+  生存確認の遅延評価と使い回し
+  M13〜M14 = t023: handoff 検知が mission を走査し直す / prune が観測の可否を見ない)。
 - `scripts/test_dispatcher_needs_director_notify.sh` の「TTL dedup」節は、旧仕様
   (「TTL 経過後は再送される」) を固定していたので、新仕様 (再送されない / 入力が変われば再通知) に書き換えた。

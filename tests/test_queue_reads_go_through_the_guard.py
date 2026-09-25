@@ -901,6 +901,9 @@ ALLOWED_SUBPROCESS_CALLS = {
     ("lib_mux.py", "server_identity", "tmux"): "サーバーの socket と pid",
     ("lib_mux.py", "_send_to_target", "tmux"): "ペインにキーを送る",
     ("lib_mux.py", "_inspect_pane_full", "tmux"): "ペインの属性を訊く",
+    ("lib_mux.py", "record_existence", "tmux"):
+        "記録が指す window id の実在を訊く (t001。tmux に `list-windows -a` を"
+        "投げるだけで、queue / registry のファイルは読ませない)",
     ("lib_mux.py", "_destroy_window_on", "tmux"):
         "if-shell で 1 つの接続に検証と破壊を流す "
         "(memory: verify-and-destroy-must-share-one-connection)",

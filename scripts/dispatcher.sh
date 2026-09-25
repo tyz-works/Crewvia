@@ -935,6 +935,33 @@ def sweep_spawn_grace_markers():
             log(f"WARNING: failed to sweep spawn-grace marker {marker}: {e}")
 
 
+def sweep_stale_pane_records():
+    """Drop `registry/mux/<name>.json` records whose pane no longer exists (t001).
+
+    A Worker's pane closes without `kill()` — watchdog's retirement signals the
+    shell pid and the mux closes the pane itself — so the record naming it
+    outlives it.  This is the same shape as `sweep_spawn_grace_markers()` and
+    lives beside it for the same reason: this daemon owns `registry/mux/`, and
+    the sweep is keyed on the pane being *gone*, not on any one kill path
+    succeeding.
+
+    The decision is `lib_mux.reap_stale_pane_records()` and nothing here
+    repeats it.  It asks the mux about the id each record names, and drops a
+    record only on a definite "no such pane"; a mux that cannot be asked
+    (down, timing out) leaves every record where it is, because the record is
+    the proof `may_destroy_pane()` needs.  It never raises, and a failure here
+    is a log line, never a failed cycle.
+
+    Rollback: a mux outage is already safe (records are kept).  To stop the
+    sweep, restart this daemon with `CREWVIA_MUX_RECORD_SWEEP=0`.
+    """
+    try:
+        for name in _mux.reap_stale_records():
+            log(f"[mux-record] swept stale spawn record for vanished pane {name!r}")
+    except Exception as e:
+        log(f"WARNING: stale spawn-record sweep failed: {e!r}")
+
+
 def warn_on_unconsumed_retirements():
     """Say so when retirement markers are not being executed (§5-3 N3).
 
@@ -2146,6 +2173,7 @@ dispatch()
 # must run on every cycle — including the early-return cycles dispatch() takes
 # when there are no active missions.
 sweep_spawn_grace_markers()
+sweep_stale_pane_records()
 if KILL_AUTHORITY != 'dispatcher':
     warn_on_unconsumed_retirements()
 PYEOF

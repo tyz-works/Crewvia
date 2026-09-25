@@ -2119,6 +2119,10 @@ server 再起動 (husk として復元) / retirement 相当の SIGKILL の 3 経
   **塞げないもの (AST の限界)**: 変数・連結を経由した名前 (`op = "pane" + "_get"`)、
   `getattr(os, "unl" + "ink")`、外部コマンド (`rm`)、`open(path, "w")` での上書き。
   red proof は連結の注入 (I2) が**緑のまま**であることをそのまま記録している。
+- 別 PR の走査と互いの新コードを拾い合うことがある (t031): `dispatcher.sh:save_told` の
+  `os.replace(tmp, TOLD_FILE)` (notified-state 台帳の原子的書き込み) は `ALLOWED_DELETIONS` に
+  理由付きで 1 行足して閉じた。逆向きの `lib_mux.py:_herdr_pane_get_bound` の `json.loads` は
+  `knowledge/notify-once.md` §3 の `ALLOWED_JSON_PARSES` 側 (E 区分)。走査の範囲は緩めていない。
 
 **`spawn` の終了コード**: 0 = 起動した / 1 = 起動しなかった / **10 = pane に live なプロセスが居る /
 11 = pane の中身が読めず busy 扱い**。`start.sh` が「already running」と言うのは 10 だけ

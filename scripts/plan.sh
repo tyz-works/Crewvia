@@ -33,6 +33,9 @@ set -euo pipefail
 #                              （queue は変更しない。普段は queue を書き換える
 #                                サブコマンドが自動で呼ぶ）
 #   plan.sh status [--mission <slug>] [--all]
+#   plan.sh resolve-mission <task_id> [--mission <slug>]
+#                              task が属する mission の slug を 1 行出す (読み取り専用。
+#                              --mission 省略時の探索順は pull と同じ)
 #   plan.sh archive <slug>
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -40,7 +43,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 QUEUE_DIR="${CREWVIA_QUEUE:-${REPO_ROOT}/queue}"
 
 if [[ $# -eq 0 ]]; then
-  echo "Usage: plan.sh <init|add|pull|done|needs-director|fail|update|retire|ready-for-verification|verify-result|review|launch|task-graph|lint|status|archive|dashboard|dashboard-data> [args...]" >&2
+  echo "Usage: plan.sh <init|add|pull|done|needs-director|fail|update|retire|ready-for-verification|verify-result|review|launch|task-graph|lint|status|archive|dashboard|dashboard-data|resolve-mission> [args...]" >&2
   exit 1
 fi
 
@@ -809,7 +812,7 @@ QUEUE_MUTATING_SUBCOMMANDS = {
 #: queue を読むだけのサブコマンド = 生成を呼ばない経路。
 #: `task-graph` 自身もここ (queue は書き換えず、生成物だけを書く)。
 QUEUE_READONLY_SUBCOMMANDS = {
-    'lint', 'status', 'resync', 'dashboard-data', 'task-graph',
+    'lint', 'status', 'resync', 'dashboard-data', 'task-graph', 'resolve-mission',
 }
 
 #: crewvia の status → (plugin の status, title に付ける印)。
@@ -2390,6 +2393,48 @@ def cmd_add(args):
         _print_sync_summary(ok)
 
 
+def mission_search_order(explicit, state):
+    """`--mission` を省略したときに、どの mission をどの順で探すか。
+
+    `--mission` があればそれだけ。無ければ active mission を **default_mission 優先** で。
+    `pull` と `resolve-mission` の **唯一の定義** (t026): kai-review.sh が拒否記録を書く先の
+    mission と、`plan.sh pull --task` が実際に task を取る mission が食い違うと、記録は
+    別 mission の名前で書かれ、dispatcher は見つけられずに #11 の再 spawn ループが戻る。
+    別々に解決しない。
+    """
+    if explicit:
+        return [explicit]
+    slugs = list(state.get('active_missions') or [])
+    default = state.get('default_mission')
+    if default and default in slugs:
+        slugs.remove(default)
+        slugs.insert(0, default)
+    return slugs
+
+
+def cmd_resolve_mission(args):
+    """plan.sh resolve-mission <task_id> [--mission <slug>]
+
+    その task が属する mission の slug を **1 行だけ** stdout に出す (読み取り専用)。
+    `--mission` を省略したときの規則は `pull` と同じ (`mission_search_order()`):
+    default_mission 優先で active mission を探し、最初に task を持つものを採る。
+    kai-review.sh が「実効 mission」を pull の **前に** 1 度だけ解決して保持するのに使う (t026)。
+    見つからなければ exit 1 (stdout には何も出さない)。
+    """
+    opts, positional = parse_opts(args, {'--mission': 'value'})
+    if len(positional) != 1:
+        die("resolve-mission requires exactly one <task_id>\\n"
+            "Usage: plan.sh resolve-mission <task_id> [--mission <slug>]")
+    task_id = positional[0]
+    state = load_state()
+    slugs = mission_search_order(opts.get('--mission'), state)
+    for slug in slugs:
+        if os.path.exists(task_path(slug, task_id)):
+            print(slug)
+            return
+    die(f"task '{task_id}' not found in mission(s): {slugs}")
+
+
 def cmd_pull(args):
     opts, _ = parse_opts(args, {
         '--mission': 'value',
@@ -2431,14 +2476,7 @@ def cmd_pull(args):
             return
 
         state = load_state()
-        if opts.get('--mission'):
-            slugs = [opts['--mission']]
-        else:
-            slugs = list(state.get('active_missions') or [])
-            default = state.get('default_mission')
-            if default and default in slugs:
-                slugs.remove(default)
-                slugs.insert(0, default)
+        slugs = mission_search_order(opts.get('--mission'), state)
 
         if not slugs:
             diag['reason'] = 'no_active_missions'
@@ -4340,6 +4378,7 @@ dispatch = {
     'archive': cmd_archive,
     'resync': cmd_resync,
     'dashboard-data': cmd_dashboard_data,
+    'resolve-mission': cmd_resolve_mission,
 }
 
 if SUBCOMMAND not in dispatch:

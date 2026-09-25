@@ -1761,6 +1761,10 @@ setup_fake_crewvia_tree() {
     # 単体でコピーすると import で落ちる。
     cp "${REPO_ROOT}/scripts/lib_task_cards.py" \
        "${FAKE_TREE}/scripts/lib_task_cards.py"
+    # lib_mux.py は JSON の状態ストア (pane 記録) の読み取りを
+    # scripts/lib_daemon_state.py に通す (t026)。同じくフォールバックは持たない。
+    cp "${REPO_ROOT}/scripts/lib_daemon_state.py" \
+       "${FAKE_TREE}/scripts/lib_daemon_state.py"
     printf 'mode: herdr\ntaskvia: disabled\n' > "${FAKE_TREE}/config/crewvia.yaml"
 
     FAKE_TREE_DISPATCH="${FAKE_TREE}/dispatch.log"

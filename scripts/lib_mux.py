@@ -70,6 +70,8 @@ if str(_SCRIPTS_DIR) not in sys.path:
 from lib_task_cards import (  # noqa: E402
     is_unreadable, read_regular_text_or_unreadable,
 )
+# JSON の状態ストアを読む入口も 1 つ (t026)。
+from lib_daemon_state import load_json_store  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -1585,15 +1587,9 @@ def write_pane_record(name: str, backend: str, handle: str, *,
 def read_pane_record(name: str, *, repo_root=None) -> Optional[dict]:
     # registry/ の固定パス。素の `read_text()` は上限を持たないので、置き違えた
     # FIFO 1 枚で spawn / kill の判定が返らなくなる (t018)。
-    text = read_regular_text_or_unreadable(
-        pane_record_path(name, repo_root=repo_root))
-    if is_unreadable(text):
-        return None
-    try:
-        data = json.loads(text)
-    except Exception:
-        return None
-    return data if isinstance(data, dict) else None
+    # 読み取り・JSON・「object であること」は入口の 1 つ (t026)。None に潰す契約は従来のまま。
+    data = load_json_store(pane_record_path(name, repo_root=repo_root))
+    return None if is_unreadable(data) else data
 
 
 def drop_pane_record(name: str, *, repo_root=None,

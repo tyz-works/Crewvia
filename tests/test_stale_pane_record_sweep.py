@@ -582,6 +582,9 @@ ALLOWED_DELETIONS = {
         "同上の `.firstseen` マーカーの掃除。glob は `*.firstseen` に限られる",
     ("dispatcher.sh", "set_all_done_state", "ALL_DONE_STATE_FILE.unlink()"):
         "all-done 通知の状態ファイル。registry/mux の外",
+    ("dispatcher.sh", "save_told", "os.replace(tmp, TOLD_FILE)"):
+        "notified-state 台帳 (`registry/daemons/notified-state.json`) の temp + os.replace による"
+        "原子的な書き込み。置換先は `TOLD_FILE` の 1 つに固定で、registry/mux の記録ではない",
     ("lib_retirement.py", "write_json_atomic", "tmp.unlink(missing_ok=True)"):
         "temp + os.replace の失敗時に自分の temp を片付ける",
     ("lib_retirement.py", "write_json_atomic", "os.replace(tmp, path)"):

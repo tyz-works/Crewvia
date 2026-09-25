@@ -100,6 +100,8 @@ cp "$REAL_REPO/scripts/lib_model.py" "$SCRATCH_DIR/scripts/"
 # scripts/lib_task_cards.py に通す (t018)。フォールバックを持たないので、
 # 単体でコピーする隔離環境では一緒に置くこと。
 cp "$REAL_REPO/scripts/lib_task_cards.py" "$SCRATCH_DIR/scripts/"
+# lib_mux.py は JSON の状態ストアの読み取りを scripts/lib_daemon_state.py に通す (t026)。
+cp "$REAL_REPO/scripts/lib_daemon_state.py" "$SCRATCH_DIR/scripts/"
 cp "$REAL_REPO/config/crewvia.yaml" "$SCRATCH_DIR/config/"
 
 RESULT_DIR="$(mktemp -d /tmp/crewvia-test-review-plan-result-XXXXXX)"

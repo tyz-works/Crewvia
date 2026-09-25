@@ -18,7 +18,7 @@ set -euo pipefail
 #                          [--priority high|medium|low] [--description <text>]
 #   plan.sh pull [--mission <slug>] --skills <csv> [--agent <name>]
 #   plan.sh done <task_id> "<result>" [--mission <slug>]
-#   plan.sh fail <task_id> [<handoff_path>] [--mission <slug>]
+#   plan.sh fail <task_id> [<handoff_path>] (--head <sha> | --no-head <理由>) [--mission <slug>]
 #   plan.sh update <task_id> [--mission <slug>] [--skills <csv>] [--blocked-by <csv>]
 #                            [--priority high|medium|low] [--worker <name>] [--status <status>]
 #                            [--description <text>] [--reset]
@@ -457,7 +457,7 @@ def _dump_inline(val):
 TASK_META_KEY_ORDER = [
     'id', 'title', 'skills', 'priority', 'status',
     'blocked_by', 'released_deps', 'timeout', 'target_dir', 'worker', 'started_at', 'completed_at',
-    'handoff_path', 'pr_number',
+    'handoff_path', 'fail_head', 'fail_head_waiver', 'pr_number',
     'acceptance_criteria', 'verification', 'rework_count', 'max_rework',
     'qa_checkpoints', 'required_evidence', 'needs_director_reason',
 ]
@@ -2826,6 +2826,200 @@ def _validate_required_evidence(result_text, required):
     return missing
 
 
+def _git_head_probe_dirs():
+    """head を解決してよい repo の候補 (呼び出し元の cwd が先頭)。
+
+    Worker の worktree / TARGET_DIR の別 repo / crewvia 本体。worktree は主 repo と
+    object DB を共有するので、どれかで解決できれば「実在する commit」と言える。
+    """
+    dirs = []
+    for d in (os.getcwd(), os.environ.get('TARGET_DIR', '').strip(),
+              os.environ.get('CREWVIA_REPO_ROOT', '').strip(), REPO_ROOT):
+        if d and os.path.isdir(d) and d not in dirs:
+            dirs.append(d)
+    return dirs
+
+
+def _resolve_head_commit(head):
+    """head (SHA / 略称) を実在する commit の完全な SHA に解決する。
+
+    戻り値: (full_sha, None) か (None, 理由)。**解決できなかった理由を必ず返す** —
+    「git が無い / repo でない」を「検証しない」に倒さないため。
+    """
+    if not re.fullmatch(r'[0-9a-fA-F]{7,64}', head or ''):
+        return None, (f"--head '{head}' は commit SHA の形 (16 進 7〜64 桁) ではありません"
+                      " (`git rev-parse HEAD` の出力を渡してください)")
+    in_repo = False
+    for d in _git_head_probe_dirs():
+        try:
+            inside = subprocess.run(
+                ['git', '-C', d, 'rev-parse', '--is-inside-work-tree'],
+                capture_output=True, text=True, timeout=10)
+            if inside.returncode != 0:
+                continue
+            in_repo = True
+            found = subprocess.run(
+                ['git', '-C', d, 'rev-parse', '--verify', '--quiet', f'{head}^{{commit}}'],
+                capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        full = found.stdout.strip()
+        if found.returncode == 0 and re.fullmatch(r'[0-9a-f]{40,64}', full):
+            return full, None
+    if in_repo:
+        return None, (f"--head '{head}' は、この repo に存在する commit ではありません"
+                      " (打ち間違い / 別 repo の SHA / 曖昧な略称)")
+    return None, ("git repo の中で実行されていないため --head を確かめられません"
+                  " (検証対象が git 管理外なら --no-head \"<理由>\" で明示すること)")
+
+
+def _handoff_names_head(handoff_path, full_sha):
+    """handoff が **この head** について書かれていることの確認。(ok, 説明)
+
+    古い handoff (別 head 時点) の再提出を弾く。handoff 内に、完全な SHA の先頭と
+    一致する 16 進の語 (7 桁以上) が 1 つでもあれば通す。history として複数の SHA を
+    並べた handoff も通るので、これは「別 head 専用の handoff をそのまま出す」を
+    止めるための確認であって、内容の真正性の証明ではない。
+
+    ファイルが無い (ENOENT) ときは通す: 無いものは「古い再提出」になり得ず、
+    dispatcher 側も読めなければ警告する (ok=True, 説明=警告文)。
+    読めない (ENOENT 以外) ときは **通さない** — 観測できなかったことを
+    「結び付いている」の根拠にしない。
+    """
+    path = os.path.abspath(handoff_path)
+    text = _TASK_CARDS.read_regular_text_or_unreadable(path)
+    if _TASK_CARDS.is_missing(text):
+        return True, (f"handoff ファイルがまだ存在しません: {path}"
+                      " (Director への通知が中身なしになります)")
+    if _TASK_CARDS.is_unreadable(text):
+        return False, f"handoff を読めないため、この head に結び付いているか確かめられません: {path}"
+    for token in re.findall(r'[0-9a-fA-F]{7,64}', text):
+        if full_sha.startswith(token.lower()):
+            return True, None
+    return False, (f"handoff ({path}) が、報告する head {full_sha[:12]} に触れていません。"
+                   " 別の head 時点の古い handoff を再提出していませんか?"
+                   " handoff に検証した head (`git rev-parse HEAD`) を書き足すか、"
+                   "今の作業で書き直してください")
+
+
+def _validate_fail_evidence(meta, report):
+    """FAIL の証拠を検証する。(エラー文 or None, card に書く欄の dict) を返す。
+
+    **done の検証 (`_validate_qa_gate` / `_validate_required_evidence`) は流用しない。**
+    それらは「PASS の証拠が揃っていること」を要求する。FAIL の理由が「PASS の証拠が
+    出せない」ことであるのは普通で、流用すると required な checkpoint が
+    `failed` / `not_run` の FAIL — つまり最も正当な FAIL — が報告できなくなる
+    (別の outage)。qa_checkpoints / required_evidence を宣言した task でも、
+    FAIL に課す証拠は宣言の有無で変えない: **検証対象の head (commit SHA)** と、
+    handoff を付けるならその head に結び付いていること。
+
+    証拠を出せない報告者 (検証対象が git 管理外など) のために `--no-head "<理由>"` がある。
+    Director が `required_evidence: []` を置くのと同じく、**外から見える形**
+    (card の fail_head_waiver 欄 + Result + stderr 警告) でだけ免除できる。
+
+    **戻りの dict は「card に書く欄の全体」で、`handoff_path` を必ず含む** (t028)。
+    検証を通った handoff は正規化した絶対パス、渡されなかったなら `None` — `None` の欄は
+    呼び出し側が card から**消す**。「渡さなければ card に触れない」と読める形にすると、
+    `update --status in_progress` で開き直した card に残っていた**古い** handoff_path が、
+    head を検証されないまま FAIL の記録に混ざり、dispatcher がそれを読んで Director に
+    通知する (Result は `handoff: none` なのに)。card に残る handoff_path を「この報告で
+    検証したもの」だけにする、という不変条件を、この関数の戻り値 1 か所に置いてある。
+    """
+    head = report.get('head')
+    no_head = report.get('no_head')
+    handoff_path = report.get('handoff_path')
+    # card に残す値。検証に使ったのと同一のパス (_handoff_names_head は abspath して読む)。
+    # 相対パスはここより前で拒否済みなので、正規化するだけでよい。
+    recorded_handoff = os.path.normpath(handoff_path) if handoff_path else None
+    usage = ("  plan.sh fail <task_id> [<handoff_path>] --head <sha>\n"
+             "  (検証対象が git 管理外: --no-head \"<理由 1 行>\")")
+    if head is not None and no_head is not None:
+        return "[plan.sh] --head と --no-head は同時に指定できません", {}
+    if head is None and no_head is None:
+        return ("[plan.sh] fail には検証対象の head (commit SHA) が必要です。\n"
+                "古い handoff / 別の head の検証結果を FAIL として再提出できないようにするためです。\n"
+                f"{usage}\n"
+                "  例: plan.sh fail t001 --head \"$(git rev-parse HEAD)\""), {}
+    if handoff_path and not os.path.isabs(handoff_path):
+        # dispatcher.sh は相対パスを **registry の親 (main repo)** 基準で読む。ここ (Worker の
+        # cwd = worktree) 基準で検証すると、別のファイルを検証して通す / 無いファイルを通す
+        # 一方で、dispatcher は main repo の古い handoff を読む — 新設した stale-handoff 確認の
+        # 迂回になる。基準を揃えるより、相対パスを受け付けない (--no-head でも同じ)。
+        return (f"[plan.sh] handoff_path は絶対パスで渡してください (相対パス: {handoff_path})。\n"
+                "dispatcher は相対パスを worktree ではなく main repo 基準で読むため、"
+                "検証したファイルと通知に使われるファイルが食い違います。\n"
+                "  HANDOFF_PATH=\"$(crewvia_handoff_path \"$AGENT_NAME\" \"$TASK_ID\")\"  # scripts/git-helpers.sh"
+                f"\n{usage}"), {}
+    if no_head is not None:
+        reason = ' '.join(str(no_head).split())
+        if not reason:
+            return "[plan.sh] --no-head には理由 (空でない 1 行) が必要です", {}
+        return None, {'fail_head': None, 'fail_head_waiver': reason,
+                      'handoff_path': recorded_handoff}
+
+    full, why = _resolve_head_commit(head)
+    if full is None:
+        return f"[plan.sh] {why}\n{usage}", {}
+    if handoff_path:
+        ok, note = _handoff_names_head(handoff_path, full)
+        if not ok:
+            return f"[plan.sh] {note}\n{usage}", {}
+        if note:
+            print(f"[plan.sh warn] {note}", file=sys.stderr)
+    return None, {'fail_head': full, 'fail_head_waiver': None,
+                  'handoff_path': recorded_handoff}
+
+
+def _gate_terminal_report(kind, meta, report):
+    """Worker の結末報告 (done / fail) を検証する **唯一の入口**。
+
+    「done は守るが fail は守らない」形の再発を、入口を 1 つにして防ぐ
+    (backlog #8。qa_checkpoints / required_evidence は done だけを守っていた)。
+    `meta['status']` を done / failed に書くコマンドは必ずここを通ること —
+    `tests/test_fail_evidence.py` が AST で確かめる。
+
+    kind='done': QA Gate → required_evidence (従来どおり。report['result'])
+    kind='fail': `_validate_fail_evidence` (別の規則。理由はそこのコメント)
+
+    戻り値: (エラー文 or None, card に書く欄の dict)。呼び出し側が die する。
+    """
+    if kind == 'done':
+        result = report['result']
+        task_id = report['task_id']
+        # qa_checkpoints が frontmatter にある → ## QA Gate セクション必須
+        # qa_checkpoints がない → 後方互換（スキップ）
+        has_qa_checkpoints = bool(meta.get('qa_checkpoints'))  # None / [] は False
+        qa_fails = _validate_qa_gate(result, has_qa_checkpoints)
+        if qa_fails:
+            reasons = '\n'.join(qa_fails)
+            return (
+                f"[plan.sh] QA gate FAIL — 以下のチェックポイントが not_run / failed または欠落しています:\n"
+                f"{reasons}\n\n"
+                f"plan.sh done をブロックします。\n"
+                f"対処方法:\n"
+                f"  1. チェックポイントを完遂して再度 plan.sh done を呼ぶ\n"
+                f"  2. 完遂できない場合は以下で差し戻す:\n"
+                f"     plan.sh needs-director {task_id} \"<理由>\""
+            ), {}
+        req_ev = meta.get('required_evidence')
+        if isinstance(req_ev, list) and req_ev:
+            ev_missing = _validate_required_evidence(result, req_ev)
+            if ev_missing:
+                missing_str = '\n'.join(ev_missing)
+                return (
+                    f"[plan.sh] required_evidence が result に見つかりません:\n"
+                    f"{missing_str}\n\n"
+                    f"plan.sh done をブロックします。\n"
+                    f"証拠を result に含めてから再度実行するか、\n"
+                    f"証拠が存在しない場合は以下で差し戻してください:\n"
+                    f"  plan.sh needs-director {task_id} \"<理由>\""
+                ), {}
+        return None, {}
+    if kind == 'fail':
+        return _validate_fail_evidence(meta, report)
+    raise ValueError(f"unknown terminal report kind: {kind!r}")
+
+
 # ---------------------------------------------------------------------------
 # needs-director command
 # ---------------------------------------------------------------------------
@@ -2933,38 +3127,11 @@ def cmd_done(args):
                 f" 差し戻してから再度 plan.sh done を呼んでください。"
             )
 
-        # ── QA Gate 検証 ──────────────────────────────────────────────────────
-        # qa_checkpoints が frontmatter にある → ## QA Gate セクション必須
-        # qa_checkpoints がない → 後方互換（スキップ）
-        qa_cp = meta.get('qa_checkpoints')
-        has_qa_checkpoints = bool(qa_cp)  # None / [] はいずれも False
-        qa_fails = _validate_qa_gate(result, has_qa_checkpoints)
-        if qa_fails:
-            reasons = '\n'.join(qa_fails)
-            die(
-                f"[plan.sh] QA gate FAIL — 以下のチェックポイントが not_run / failed または欠落しています:\n"
-                f"{reasons}\n\n"
-                f"plan.sh done をブロックします。\n"
-                f"対処方法:\n"
-                f"  1. チェックポイントを完遂して再度 plan.sh done を呼ぶ\n"
-                f"  2. 完遂できない場合は以下で差し戻す:\n"
-                f"     plan.sh needs-director {task_id} \"<理由>\""
-            )
-
-        # ── required_evidence 検証 ──────────────────────────────────────────
-        req_ev = meta.get('required_evidence')
-        if isinstance(req_ev, list) and req_ev:
-            ev_missing = _validate_required_evidence(result, req_ev)
-            if ev_missing:
-                missing_str = '\n'.join(ev_missing)
-                die(
-                    f"[plan.sh] required_evidence が result に見つかりません:\n"
-                    f"{missing_str}\n\n"
-                    f"plan.sh done をブロックします。\n"
-                    f"証拠を result に含めてから再度実行するか、\n"
-                    f"証拠が存在しない場合は以下で差し戻してください:\n"
-                    f"  plan.sh needs-director {task_id} \"<理由>\""
-                )
+        # ── QA Gate / required_evidence 検証 (fail と共通の入口) ──────────────
+        err, _fields = _gate_terminal_report(
+            'done', meta, {'result': result, 'task_id': task_id})
+        if err:
+            die(err)
 
         meta['status'] = 'done'
         meta['completed_at'] = now_iso()
@@ -3054,7 +3221,14 @@ def cmd_done(args):
 
 
 def cmd_fail(args):
-    opts, positional = parse_opts(args, {'--mission': 'value'})
+    """plan.sh fail <task_id> [<handoff_path>] (--head <sha> | --no-head <理由>) [--mission <slug>]
+
+    検証対象の head (commit SHA) を必須にする。証拠の要求と設計判断は
+    `_gate_terminal_report` / `_validate_fail_evidence` を参照 (done と同じ入口を通る)。
+    """
+    opts, positional = parse_opts(args, {
+        '--mission': 'value', '--head': 'value', '--no-head': 'value',
+    })
     if not positional:
         die("fail requires <task_id>")
     task_id = positional[0]
@@ -3083,17 +3257,49 @@ def cmd_fail(args):
         if cur_status in ('done', 'verified', 'failed', 'skipped'):
             die(f"task '{task_id}' is already {cur_status}.")
 
+        # ── 証拠の検証 (done と共通の入口。card は 1 バイトも書く前) ─────────────
+        err, fields = _gate_terminal_report('fail', meta, {
+            'head': opts.get('--head'),
+            'no_head': opts.get('--no-head'),
+            'handoff_path': handoff_path,
+        })
+        if err:
+            die(err)
+
+        # card に書く証拠の欄は fields が全部持っている。None は「この報告には無い」の意味で、
+        # card から**消す** (t028)。handoff_path も同じ: 渡されなかったのに card の古い値を
+        # 残すと、開き直し (`update --status in_progress` 等) で持ち越された別 head 時点の
+        # handoff が検証されないまま failed の card に載り、dispatcher が読んで通知する。
+        # 消す側 (ここ) を選んだのは、開き直す経路 (update --reset / --status / 手書き / 旧版の
+        # card) の全部を塞ぐより、failed に至る唯一の入口で塞ぐ方が漏れないため。
+        # 開き直す側の掃除は cmd_update が別に行う (card を failed 以外の間も綺麗に保つ)。
+        recorded_handoff = fields.get('handoff_path')
         meta['status'] = 'failed'
         meta['completed_at'] = now_iso()
-        if handoff_path:
-            meta['handoff_path'] = handoff_path
+        for key, val in fields.items():
+            if val is None:
+                meta.pop(key, None)     # 前回の FAIL の証拠を持ち越さない
+            else:
+                meta[key] = val
+        if fields.get('fail_head'):
+            evidence = f"head: {fields['fail_head']}"
+        else:
+            evidence = f"head: none (--no-head: {fields['fail_head_waiver']})"
         trailing = extract_trailing_body_section(body)
         desc, _ = parse_task_body(body)
         new_body = append_trailing_body_section(
-            build_task_body(desc, f"FAILED — handoff: {handoff_path or 'none'}"), trailing
+            build_task_body(
+                desc, f"FAILED — {evidence} — handoff: {recorded_handoff or 'none'}"),
+            trailing
         )
         save_task(slug, task_id, meta, new_body)
         print(f"Failed: {slug}/{task_id}")
+        if fields.get('fail_head_waiver'):
+            print(
+                f"[plan.sh warn] --no-head で head なしの FAIL を記録しました"
+                f" (理由: {fields['fail_head_waiver']}) — Director は検証対象を確認してください",
+                file=sys.stderr,
+            )
 
         # done と同じく、撤去は card の書き換えと同じトランザクションの中で。
         agent_name = os.environ.get('AGENT_NAME', '')
@@ -3110,7 +3316,7 @@ def cmd_fail(args):
         rework = meta.get('rework_count') or 0
         max_rework = meta.get('max_rework') or 3
         if rework >= max_rework:
-            knowledge_info[0] = (task_id, slug, rework, max_rework, handoff_path)
+            knowledge_info[0] = (task_id, slug, rework, max_rework, recorded_handoff)
 
     with_lock(_do)
 
@@ -4099,6 +4305,58 @@ def cmd_dashboard_data(args):
     print(json.dumps({'missions': missions, 'archived': archived}, ensure_ascii=False, indent=2))
 
 
+def _set_aside_stale_handoff(handoff_path):
+    """`update --reset` で古い handoff ファイルを同じパスから退避する (削除はしない)。
+
+    handoff は `registry/handoffs/<agent>/<task>_HANDOFF.md` の固定パスに書かれるので、
+    差し戻した task を同名 Worker がやり直すと、前回のファイルがそのまま残って
+    再提出できる。`<path>.stale-<UTC>` に改名して、情報は残しつつ「今回の handoff」
+    とは別物にする。card の handoff_path は Worker が書いた値なので、
+    **registry/handoffs の下にあるものしか動かさない** (任意のパスを改名しない)。
+    退避に失敗しても reset は止めない (人間が card を見て打つコマンドなので、
+    警告して手で片付けてもらう)。
+    """
+    repo_root = os.environ.get('CREWVIA_REPO_ROOT', REPO_ROOT)
+    root = os.path.join(repo_root, 'registry', 'handoffs')
+    try:
+        real_root = os.path.realpath(root)
+        # 相対パスは dispatcher.sh と同じ基準 (registry の親 = repo root) で解く。cwd 基準だと
+        # dispatcher が読むのと別のファイルを退避してしまい、古い handoff がそのまま残る。
+        # (`plan.sh fail` は相対パスを受け付けないので、ここに来るのは古い card / 手書きの値)
+        real = os.path.realpath(os.path.join(repo_root, handoff_path))
+        if os.path.commonpath([real_root, real]) != real_root:
+            print(f"[plan.sh] handoff は {root} の外にあるため動かしません: {handoff_path}",
+                  file=sys.stderr)
+            return
+        if not os.path.isfile(real):
+            return
+        stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+        target = _reserve_unique_path(f"{real}.stale-{stamp}")
+        os.replace(real, target)    # 置換されるのは、自分が O_EXCL で確保した空ファイルだけ
+        print(f"[plan.sh] 古い handoff を退避しました: {target}")
+    except (OSError, ValueError) as e:
+        print(f"[plan.sh warn] 古い handoff を退避できませんでした ({handoff_path}): {e}"
+              " — 手で片付けてください (同じパスの再提出を防ぐため)", file=sys.stderr)
+
+
+def _reserve_unique_path(base):
+    """`base` (衝突したら `base-1`, `base-2`, ...) を O_EXCL で作り、その名前を返す。
+
+    `os.rename` / `os.replace` は既存の宛先を **黙って置換する**。秒精度のタイムスタンプ
+    だけを名前にすると、同じ秒の 2 回目の退避が 1 回目の証拠を消す。「存在しなければ改名」は
+    check-then-act で同じ穴が残るので、名前の確保そのものを原子的な O_EXCL にする。
+    """
+    for n in range(1000):
+        candidate = base if n == 0 else f"{base}-{n}"
+        try:
+            fd = os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            continue
+        os.close(fd)
+        return candidate
+    raise OSError(f"退避先の名前を確保できませんでした: {base}")
+
+
 # ---------------------------------------------------------------------------
 # cmd_update — safe in-place task frontmatter editor
 # ---------------------------------------------------------------------------
@@ -4118,6 +4376,9 @@ def cmd_update(args):
                                [--reset]
 
     --reset sets: status=pending, worker=null, started_at=null, completed_at=null
+    --reset と、status を動かす更新 (failed からの --status 等) は前回の FAIL の証拠
+    (handoff_path / fail_head / fail_head_waiver) を card から消し、古い handoff ファイルを
+    退避する (t028。knowledge/fail-evidence.md)。
     Body (Description / Result sections) is never modified by this command.
 
     前提の指定 (--expect-status / --expect-worker / --expect-started-at) は
@@ -4168,6 +4429,7 @@ def cmd_update(args):
     # Holder for reset worker info (populated inside _do, used after with_lock)
     # [0] = old worker name, [1] = slug (for assignment content verification)
     reset_worker_holder = [None, None]
+    stale_handoff_holder = [None]  # 証拠を消した card の handoff_path (ファイル退避用)
 
     def _do():
         state = load_state()
@@ -4178,6 +4440,7 @@ def cmd_update(args):
             die(f"mission '{slug}' not found.")
 
         meta, body = load_task(slug, task_id)
+        old_status = meta.get('status')
 
         changed = []
 
@@ -4228,6 +4491,24 @@ def cmd_update(args):
             meta['status'] = status
             changed.append(f"status={status}")
 
+        # 前回の FAIL の証拠 (handoff / head) を持ち越さない。古い handoff が同じ固定パスに
+        # 残ると、やり直しの FAIL としてそのまま再提出できてしまう (backlog #8 の誘因)。
+        # **--reset だけでなく status を動かす経路すべて** (t028): `--status in_progress` /
+        # `--status pending` で開き直しても card に証拠が残ると、次の `fail` が handoff を
+        # 渡さないとき古い値が failed の card に載り、dispatcher が読んで通知していた。
+        # 証拠が生き残るのは「failed のまま failed」(同じ FAIL の再記録) だけ — 逆に
+        # 「failed 以外 → failed」は FAIL の報告 (`plan.sh fail`) を経ていないので、card に
+        # 載っている証拠は今回の FAIL のものではない。status を触らない更新 (priority 等) は
+        # 証拠に関与しない。ファイルの退避は card の保存後に行う (退避であって削除ではない)。
+        keeps_evidence = not opts.get('--reset') and (
+            not status or (status == 'failed' and old_status == 'failed'))
+        if not keeps_evidence:
+            stale_handoff_holder[0] = meta.get('handoff_path')
+            for stale_key in ('handoff_path', 'fail_head', 'fail_head_waiver'):
+                if stale_key in meta:
+                    del meta[stale_key]
+                    changed.append(f'{stale_key}=cleared')
+
         if opts.get('--description') is not None:
             # Replace Description section while preserving Result section
             _, result_text = parse_task_body(body)
@@ -4263,6 +4544,9 @@ def cmd_update(args):
         # pull すると、後任の assignment が「内容が一致する」という理由だけで
         # 消えていた (Codex P1)。card の書き換えと同じトランザクションに入れた
         # ことで、その隙間そのものが無くなっている。
+        if stale_handoff_holder[0]:
+            _set_aside_stale_handoff(stale_handoff_holder[0])
+
         old_worker = reset_worker_holder[0]
         reset_slug = reset_worker_holder[1]
         if opts.get('--reset') and old_worker and reset_slug:

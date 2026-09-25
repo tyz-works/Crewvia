@@ -57,9 +57,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from lib_task_cards import (  # noqa: E402
-    Unreadable, is_missing, is_unreadable, read_regular_text_or_unreadable,
-)
+from lib_daemon_state import load_json_store  # noqa: E402
+from lib_task_cards import is_missing, is_unreadable  # noqa: E402
 
 #: 記録に必須の欄。欠けていたら「壊れている」であって「拒否されていない」ではない。
 REQUIRED_FIELDS = ('mission', 'task', 'pr', 'diff_bytes', 'max_bytes')
@@ -112,19 +111,9 @@ def load(registry_dir, mission, task, warn=None):
       `describe()` / `refused_for_pr()` が例外を出さない
     """
     path = refusal_path(registry_dir, mission, task)
-    text = read_regular_text_or_unreadable(path, warn=warn)
-    if is_unreadable(text):
-        return text
-    try:
-        data = json.loads(text)
-    except ValueError as e:
-        return Unreadable(path, f'malformed JSON ({e})')
-    if not isinstance(data, dict):
-        return Unreadable(path, f'expected a JSON object, got {type(data).__name__}')
-    problem = _invalid_reason(data, mission, task)
-    if problem:
-        return Unreadable(path, problem)
-    return data
+    # 読み取り・JSON・形の検証は 1 つの入口 (lib_daemon_state) に集約してある (t026)。
+    return load_json_store(path, check=lambda d: _invalid_reason(d, mission, task),
+                           warn=warn)
 
 
 def _is_count(v):

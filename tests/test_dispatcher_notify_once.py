@@ -155,6 +155,7 @@ class Harness:
             "300", "60", str(self.log)])
         ns = {"__name__": "dispatcher_under_test"}
         exec(compile(src, "dispatcher.sh (embedded, test)", "exec"), ns)
+        self.ns = ns    # 直近のサイクルの名前空間 (関数を直接呼ぶテスト用)
         ns["dispatch"]()
         return [m["message"] for m in FakeMux.sent]
 

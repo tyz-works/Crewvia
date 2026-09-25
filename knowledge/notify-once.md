@@ -133,11 +133,94 @@ handoff key が 1 件も集まらないのに mission は「観測できた」�
 **同じ PR の head が更新されただけでは自動では解除されない** (dispatcher は PR の head を見ない)。
 差分を縮めて push したなら `clear` する。
 
+#### `--mission` を省略した `kai-review.sh` (t026 / Kai 3 巡目 P2 の 2 件目)
+
+`--mission` は省略できる正当な呼び出し (plan.sh が解決する) だが、拒否記録の名前 `<mission>__<task>.json` には
+mission が要る。以前は `MISSION_SLUG` が空だと記録が **書かれず**、pending に戻された task を dispatcher が
+もう一度 spawn した (#11 のループが戻る)。今は、**pull の前に** `plan.sh resolve-mission <task>` で
+実効 mission を 1 度だけ解決して保持し、以降の `pull` / `needs-director` / `done` と拒否記録の全部に同じ値を渡す。
+
+- `resolve-mission` は読み取り専用で、探索順は `pull` と **同じ定義** (`mission_search_order()`:
+  `--mission` があればそれだけ、無ければ default_mission 優先で active mission を走査し最初に task を持つもの)。
+  別々に解決すると食い違う (`tests/test_daemon_state_reads_go_through_the_entry.py` が、`pull` と
+  `resolve-mission` の両方が同じ関数を通ることを構造で見張る)。
+- `--mission` を明示した呼び出しは従来どおり (解決を挟まない)。
+- mission を解決できない (task がどこにも無い) 非 dry-run は、`could not resolve the mission … pass --mission`
+  で exit 1 (何も書かない)。`--dry-run` は警告だけで続ける (plan.sh の状態に依存しない smoke test のまま)。
+
+### 3. デーモン側 JSON 状態ストアを読む入口は 1 つ (t026 / Kai 3 巡目 P2 の 1 件目)
+
+**同じ根の欠陥が PR #214 で 3 回出た**: 読めた JSON の **中身の形を確かめずに使う**。
+
+1. t019 1 巡目: 拒否記録が欄の存在しか見ず、`diff_bytes: null` で `describe()` が TypeError → dispatch サイクル全体が落ちる
+2. t019 3 巡目: 台帳が **外側** (JSON object か) しか見ず、`{"bad": {"slug": []}}` で `prune_told()` が
+   毎サイクル TypeError → prune もサイクルの残りも止まり、状態を離れて戻った task が **永久に黙る**
+3. t015 (#217): `released_deps` が未検証で `true` / `123` なら TypeError
+
+1 件ずつ site patch を当てても 4 回目は「まだ書かれていないストア」に出る。`lib_task_cards` が queue の
+カードについて既にそうしているのと同じ作法で、読み取りの **入口を 1 つ** にした。
+
+**入口**: `scripts/lib_daemon_state.py` の `load_json_store(path, check=<形の検証>, warn=<警告>, expect=dict)`。
+戻り値は「検証済みの値」または `Unreadable` (`bool()` / `len()` / `in` / `[]` / 反復 / `.get()` がすべて
+`TypeError`。空の入れ物として振る舞わない)。ENOENT だけが「まだ無い」(`is_missing()`)。読めない・JSON として
+壊れている (`RecursionError` 等も)・形が使えない・`check` が例外を出す、はすべて `Unreadable`。
+**壊れたエントリが 1 つでもあれば、ストア全体が `Unreadable`**。この関数は例外を出さない。
+
+| ストア | 検証 (`lib_daemon_state`) | 使えないときの向き (判定ごとに決めてある) |
+|---|---|---|
+| `registry/daemons/notified-state.json` (台帳) | `told_ledger_problem`: キーは空でない文字列、エントリは object、`fp`/`kind`/`slug`/`task` は空でない文字列 | **再送側**: `already_told` は False、`prune_told` は何もしない、次に送れたとき `record_told` が作り直す (自己修復)。WARNING を TTL に 1 回 (`notified-state`) |
+| `registry/daemons/review-refusals/*.json` | `lib_review_refusal._invalid_reason` (t021) | **spawn を保留** (拒否されていないと証明できない) |
+| `/tmp/dispatcher-notify-cache.json` (dispatcher / verifier-dispatcher) | `notify_cache_problem`: 値は有限の数で、負でなく、未来 24 時間以内 | `{}` = スロットルを失う = **もう一度送る** (冪等)。NaN・遠い未来を通すとその key の通知を **永久に遮る** ので落とす |
+| `registry/mux/<name>.state.json` (Rule 5) | `rule5_state_problem`: `state` は文字列、`since` は有限の数 | `{}` = grace が最初からやり直し = **通知が遅れる側** (破壊も割り当ても起きない) |
+| `registry/daemons/<peer>.watch.json` | `watch_state_problem`: `grace_until`/`last_respawn_at`/`hold_since` は有限の数か null | 既定値 (grace なし・hold の起点は取り直し) = ファイルが無いときと同じ |
+| `registry/daemons/<peer>.respawns.json` | 外側が object で `entries` が list。**エントリごと** に、object でない / `at` が有限の数でないものを捨てる (この記録は 1 件壊れても残りで flap を数える設計) | 壊れた 1 件だけ捨てる。ログ全体が使えなければ履歴なし (従来どおり) |
+| pause marker / reports / `lib_retirement.read_json` / pane record | 入口経由 (外側が object であることのみ。`None` に潰す契約は従来のまま) | 従来のまま。区別が要る呼び出し側は `read_pause_state()` のように入口を直接使う |
+
+**書き手と読み手は同じ形**: `record_told` は書く直前に同じ `told_entry_problem` を通し、通らなければ書かずに
+`notified-state` の WARNING を出す。読み手だけが厳しいと、書いたばかりの台帳を自分が「壊れている」と読み、
+永久に再送側へ倒れる。
+
+**構造で閉じている**: `tests/test_daemon_state_reads_go_through_the_entry.py` が、対象モジュール
+(`AUDITED_MODULES` + `lib_*.py` 全部。`.sh` は **`dispatcher.sh` の埋め込み python を含め全ブロック**) の
+`json.load` / `json.loads` / `json.JSONDecoder` を AST で全部拾い、入口の中にあるもの以外は理由付き
+allowlist に無ければ落とす。新しい経路を足したら必ず赤になる (表で示すだけにしていない)。あわせて
+「この読み手はこの入口を、この検証器付きで通っている」(`ENTRY_READERS` / `VALIDATED_STORES`) を表で見張る。
+
+**allowlist の中身** (`ALLOWED_JSON_PARSES`。理由を書けないものは載せていない):
+(E) 外から来る応答 (herdr socket / CLI、Taskvia の HTTP、Claude Code の notification payload = 観測専用) と、
+(Q) queue 側 (`registry/daemons/` の外) の sidecar — `plan.sh` の `_read_assignment_identity` /
+`_load_taskvia_map`、`taskvia-sync.sh` の `load_map`。
+
+**入口を通していない読み取り (backlog。allowlist に明示して凍結してある)**:
+- (Q) は `plan.sh` が単体コピーの隔離テストで使われており、新しい lib への依存を足すと fixture がまとめて壊れる
+  (memory: shared-module-breaks-single-script-fixtures) ので移していない。
+- **既知の穴**: `taskvia-sync.sh` の `load_map()` は **外側の型も未検証** (`.taskvia-map.json` が list だと呼び出し側の
+  `.get` が落ちうる)。`plan.sh` 側 (`_load_taskvia_map`) と同じ 1 行 (`isinstance(data, dict)`) で閉じるが、
+  registry/daemons の外なので t026 では触っていない。
+- `lib_retirement.read_json` / `lib_mux.read_pane_record` / pause marker は **外側が object であること** までしか
+  検証しない (契約は従来のまま)。内側の欄の型は呼び出し側が検証している (heartbeat の `updated_at`/`pid` など)。
+
+**検出器が見えないもの** (実態より狭く書かない): `exec()`/`eval()`、`json` を変数に入れて渡す形、JSON 以外の
+パーサ (`yaml.safe_load` / `pickle`)、走査対象外のモジュール (`hooks/` 等)。「うっかり足す」ことを止める補助で、
+敵対的なすり抜けを防ぐ境界ではない。
+
+**WARNING を見たとき (`notified-state` / `rule5 state entry` / `unusable JSON store`)**:
+1. 中身を見る: `python3 -m json.tool registry/daemons/notified-state.json`
+2. 直せるなら壊れたエントリを直す。**消してよい** (どのストアも「無い」= 既定値 / 再送側)。台帳を消すと、いま成り立って
+   いる状態が全部 1 回だけ再通知される (通知が欠けることはない)。スロットル (`/tmp`) を消すと、直近 5 分に送った通知も
+   もう一度届く。Rule 5 / watch の状態は消すと grace がやり直しになるだけ。
+3. 壊れた原因 (手編集・部分書き込み・別バージョンの書き手) の見当を付けておく。書き手は原子的に書く (tmp + rename)
+   ので、通常は壊れない。
+
 ## merge 後に必要なこと
 
 - **`scripts/dispatcher.sh` を変更したので、merge 後に dispatcher restart が必要** (Director が行う)。
   restart するまで旧コードが動き続ける (`knowledge/dispatcher-restart-after-merge.md`)。
   `python3 scripts/lib_daemon_watch.py restart dispatcher` を使う (`lib_mux.py kill`/`spawn` を素で叩かない)。
+- **t026 で `lib_mux.py` / `lib_retirement.py` / `lib_daemon_watch.py` / `verifier-dispatcher.sh` も入口経由に変えた**
+  (新規: `lib_daemon_state.py`)。**watchdog も restart が必要** (これらを import する常駐 python) —
+  `python3 scripts/lib_daemon_watch.py restart watchdog`。verifier-dispatcher を常駐させている環境では、それも
+  restart する。restart までは旧コードが動くだけで、新旧の混在で壊れる書式変更はない (ストアの形は変えていない)。
 - restart 直後、いま needs_director / failed+handoff の task があれば、台帳が空なので **1 回だけ**
   再通知される。その後は黙る。
 - `scripts/kai-review.sh` の変更 (拒否記録の書き込み) は、dispatcher が常に main 版を起動するので
@@ -174,6 +257,9 @@ env var の停止スイッチは足していない — 常駐デーモンの分�
 - `bash tests/red_proof_t010.sh` — 欠陥を 1 つずつ注入し、見張るテストが赤になることを確かめる
   (M1〜M7 = t010 本体、M8〜M12 = t021: 拒否記録の値の検証・離脱時/fp 変更時のスロットル破棄・
   生存確認の遅延評価と使い回し
-  M13〜M14 = t023: handoff 検知が mission を走査し直す / prune が観測の可否を見ない)。
+  M13〜M14 = t023: handoff 検知が mission を走査し直す / prune が観測の可否を見ない
+  M15〜M30 = t026: 台帳/スロットル/Rule 5/watch 状態の形の検証・入口・構造テストの検出力・kai-review の mission 解決)。
+- `python3 -m pytest tests/test_daemon_state_reads_go_through_the_entry.py tests/test_daemon_state_fail_direction.py -q`
+  — 入口を通さない `json.loads` が増えたら落ちる構造テストと、壊れたストアでの「落ちない・WARNING・再送側・自己修復」。
 - `scripts/test_dispatcher_needs_director_notify.sh` の「TTL dedup」節は、旧仕様
   (「TTL 経過後は再送される」) を固定していたので、新仕様 (再送されない / 入力が変われば再通知) に書き換えた。

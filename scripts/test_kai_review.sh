@@ -1335,6 +1335,91 @@ else
   fail "--dry-run が拒否記録を書いた、または想定外の終了: rc=$rc record=$([[ -e "$REFUSAL_FILE_215" ]] && echo yes || echo no)"
 fi
 
+echo ""
+echo "--- t026 (PR #214 Kai 3 巡目 P2): --mission を省略しても拒否記録は実効 mission に書かれる ---"
+# `--mission` は省略できる正当な呼び出し。省略のまま MISSION_SLUG が空だと記録が書かれず、
+# pending に戻された task を dispatcher がもう一度 spawn する (#11 のループ)。
+# **実際の pull を通す** (--skip-pull にしない): 実効 mission は plan.sh が pull で選ぶものと
+# 一致しなければならない。
+OTHER_SLUG="other-mission"
+OTHER_TASKS_DIR="$QUEUE/missions/$OTHER_SLUG/tasks"
+REFUSALS_DIR="$FIXTURE_REPO/registry/daemons/review-refusals"
+mkdir -p "$OTHER_TASKS_DIR"
+printf 'title: Other Mission\nslug: %s\nstatus: in_progress\ncreated_at: 2026-09-08T00:00:00Z\ncompleted_at: null\nnext_task_id: 900\n' \
+  "$OTHER_SLUG" > "$QUEUE/missions/$OTHER_SLUG/mission.yaml"
+
+write_task_in() {   # <tasks_dir> <id> <title>
+  printf -- '---\nid: %s\ntitle: "%s"\nskills: [codex-review]\npriority: medium\nstatus: pending\nblocked_by: []\ntarget_dir: null\nworker: null\nstarted_at: null\ncompleted_at: null\npr_number: 5\n---\n\n## Description\n%s\n\n## Result\n' \
+    "$2" "$3" "$3" > "$1/$2.md"
+}
+status_in() {       # <tasks_dir> <id>
+  grep -m1 '^status:' "$1/$2.md" | awk '{print $2}'
+}
+refusal_mission_of() {   # <task>: 拒否記録が書かれた mission (無ければ空)
+  local f
+  for f in "$REFUSALS_DIR"/*__"$1".json; do
+    [[ -e "$f" ]] && basename "$f" | sed "s/__$1\.json\$//"
+  done
+}
+run_plan() { CREWVIA_REPO_ROOT="$FIXTURE_REPO" CREWVIA_QUEUE="$QUEUE" bash "$FIXTURE_REPO/scripts/plan.sh" "$@"; }
+
+# (a) 単一 mission (= default): --mission 省略でも pull → 拒否 → 記録が書かれる
+write_task t216 "t026 omitted --mission, single mission"
+out=$(FAKE_GH_HEAD_BRANCH="feature-branch" FAKE_CODEX_FIXTURE="$FIXTURES_DIR/json_empty.txt" FAKE_CODEX_LOG="$TMPDIR_TEST/t216_codex.log" \
+  run_kai --pr 5 --task t216 2>&1) && rc=0 || rc=$?
+if [[ $rc -eq 1 && "$(task_status t216)" == "needs_director" && "$(refusal_mission_of t216)" == "$MISSION_SLUG" ]]; then
+  pass "--mission 省略 (単一 mission): 拒否記録が default_mission ($MISSION_SLUG) に書かれる"
+else
+  fail "REGRESSION (t026): omitted --mission must still record the refusal under the effective mission — rc=$rc status=$(task_status t216) record_mission='$(refusal_mission_of t216)' out=$out"
+fi
+
+# (b) 2 つの active mission。task は default でない mission にだけ在る
+printf 'active_missions:\n  - %s\n  - %s\ndefault_mission: %s\n' "$MISSION_SLUG" "$OTHER_SLUG" "$MISSION_SLUG" > "$QUEUE/state.yaml"
+write_task_in "$OTHER_TASKS_DIR" t217 "t026 omitted --mission, task only in a non-default mission"
+out=$(FAKE_GH_HEAD_BRANCH="feature-branch" FAKE_CODEX_FIXTURE="$FIXTURES_DIR/json_empty.txt" FAKE_CODEX_LOG="$TMPDIR_TEST/t217_codex.log" \
+  run_kai --pr 5 --task t217 2>&1) && rc=0 || rc=$?
+if [[ $rc -eq 1 && "$(status_in "$OTHER_TASKS_DIR" t217)" == "needs_director" \
+      && "$(refusal_mission_of t217)" == "$OTHER_SLUG" ]]; then
+  pass "--mission 省略 (task は default でない mission): 記録が task の属する mission ($OTHER_SLUG) に書かれる"
+else
+  fail "REGRESSION (t026): record must follow the mission that holds the task — rc=$rc status=$(status_in "$OTHER_TASKS_DIR" t217) record_mission='$(refusal_mission_of t217)' out=$out"
+fi
+
+# (c) 同じ task id が両方の mission に在る: plan.sh pull が選ぶ mission (default 優先) と一致する
+write_task t218 "t026 same id in the default mission"
+write_task_in "$OTHER_TASKS_DIR" t218 "t026 same id in the other mission"
+resolved="$(run_plan resolve-mission t218)"
+out=$(FAKE_GH_HEAD_BRANCH="feature-branch" FAKE_CODEX_FIXTURE="$FIXTURES_DIR/json_empty.txt" FAKE_CODEX_LOG="$TMPDIR_TEST/t218_codex.log" \
+  run_kai --pr 5 --task t218 2>&1) && rc=0 || rc=$?
+if [[ "$resolved" == "$MISSION_SLUG" && $rc -eq 1 \
+      && "$(task_status t218)" == "needs_director" && "$(status_in "$OTHER_TASKS_DIR" t218)" == "pending" \
+      && "$(refusal_mission_of t218)" == "$MISSION_SLUG" ]]; then
+  pass "同じ task id が両方に在る: resolve-mission = pull が実際に選んだ mission = default_mission ($MISSION_SLUG)、記録もそこ"
+else
+  fail "REGRESSION (t026): resolve-mission / pull / record disagree — resolved='$resolved' default=$MISSION_SLUG default_status=$(task_status t218) other_status=$(status_in "$OTHER_TASKS_DIR" t218) record_mission='$(refusal_mission_of t218)' rc=$rc out=$out"
+fi
+
+# (d) --mission 明示は従来どおり (解決を挟まない)
+write_task_in "$OTHER_TASKS_DIR" t219 "t026 explicit --mission is used as is"
+out=$(FAKE_GH_HEAD_BRANCH="feature-branch" FAKE_CODEX_FIXTURE="$FIXTURES_DIR/json_empty.txt" FAKE_CODEX_LOG="$TMPDIR_TEST/t219_codex.log" \
+  run_kai --pr 5 --task t219 --mission "$OTHER_SLUG" 2>&1) && rc=0 || rc=$?
+if [[ $rc -eq 1 && "$(refusal_mission_of t219)" == "$OTHER_SLUG" ]]; then
+  pass "--mission 明示: その mission に記録される (従来どおり)"
+else
+  fail "explicit --mission regressed: rc=$rc record_mission='$(refusal_mission_of t219)' out=$out"
+fi
+
+# (e) task がどの mission にも無い: 非 dry-run は pull を試みずに exit 1 (何も書かない)
+out=$(run_kai --pr 5 --task t999 2>&1) && rc=0 || rc=$?
+if [[ $rc -eq 1 && -z "$(refusal_mission_of t999)" ]] && echo "$out" | grep -q "could not resolve the mission"; then
+  pass "task が見つからない: mission を解決できないと明示して exit 1 (記録も書かない)"
+else
+  fail "unresolvable task should stop with a clear error — rc=$rc out=$out"
+fi
+
+# 後続に影響しないよう state を戻す
+printf 'active_missions:\n  - %s\ndefault_mission: %s\n' "$MISSION_SLUG" "$MISSION_SLUG" > "$QUEUE/state.yaml"
+
 # ---------------------------------------------------------------------------
 echo ""
 echo "================================"

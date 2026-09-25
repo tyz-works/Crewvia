@@ -131,6 +131,11 @@ from lib_retirement import (  # noqa: E402
     unlink_quiet,
     write_json_atomic,
 )
+from lib_daemon_state import (  # noqa: E402
+    is_finite_number,
+    load_json_store,
+    watch_state_problem,
+)
 from lib_task_cards import (  # noqa: E402
     is_missing,
     is_unreadable,
@@ -878,17 +883,11 @@ def read_pause_state(registry_dir, name: str):
     is not an object — none of those say the maintenance is over, and reading
     them as "no marker" lifts a protection nobody lifted.
     """
-    path = pause_path(registry_dir, name)
-    text = read_regular_text_or_unreadable(path)
-    if is_missing(text):
+    # 読み取り・JSON・「object であること」は入口 (`load_json_store`) の 1 つ (t026)。
+    data = load_json_store(pause_path(registry_dir, name))
+    if is_missing(data):
         return PAUSE_ABSENT, None
-    if is_unreadable(text):
-        return PAUSE_UNREADABLE, None
-    try:
-        data = json.loads(text)
-    except ValueError:
-        return PAUSE_UNREADABLE, None
-    if not isinstance(data, dict):
+    if is_unreadable(data):
         return PAUSE_UNREADABLE, None
     return PAUSE_ACTIVE, data
 
@@ -1071,7 +1070,9 @@ class DaemonWatch:
         self._write_reports(state)
 
     def _read_reports(self) -> dict:
-        data = read_json(reports_path(self.registry_dir, self.self_name)) or {}
+        data = load_json_store(reports_path(self.registry_dir, self.self_name))
+        if is_unreadable(data):
+            data = {}
         pending = data.get("pending")
         delivered = data.get("delivered")
         return {
@@ -1094,7 +1095,13 @@ class DaemonWatch:
     # -- state ---------------------------------------------------------------
 
     def _read_state(self) -> dict:
-        data = read_json(watch_state_path(self.registry_dir, self.peer_name)) or {}
+        # 欄の型は入口で検証する (t026)。`float("x")` / `float({})` が watch のサイクルを
+        # 落とさない。使えないときは「まだ何も覚えていない」= ファイルが無いときと同じ既定値
+        # (grace なし・hold の起点は取り直し)。倒す向きは従来のまま。
+        data = load_json_store(watch_state_path(self.registry_dir, self.peer_name),
+                               check=watch_state_problem)
+        if is_unreadable(data):
+            data = {}
         return {
             "grace_until": float(data.get("grace_until") or 0.0),
             "last_respawn_at": data.get("last_respawn_at"),
@@ -1107,18 +1114,22 @@ class DaemonWatch:
     # -- 5. flap guard -------------------------------------------------------
 
     def _flap_entries(self) -> List[dict]:
-        data = read_json(respawn_log_path(self.registry_dir, self.peer_name)) or {}
+        data = load_json_store(respawn_log_path(self.registry_dir, self.peer_name))
+        if is_unreadable(data):
+            data = {}
         entries = data.get("entries")
         if not isinstance(entries, list):
             return []
         cutoff = float(self.now()) - self.config.flap_window_seconds
         kept = []
         for entry in entries:
-            try:
-                if float(entry.get("at")) >= cutoff:
-                    kept.append(entry)
-            except (TypeError, ValueError):
+            # この記録は **エントリごとに** 使えないものを捨てる設計 (1 件壊れても
+            # 残りの履歴で flap を数える)。エントリが object でない場合 (t026) を
+            # 落とし漏れていて、`entry.get` が AttributeError でサイクルを落としていた。
+            if not isinstance(entry, dict) or not is_finite_number(entry.get("at")):
                 continue
+            if float(entry["at"]) >= cutoff:
+                kept.append(entry)
         return kept
 
     def _record_respawn(self, entries: List[dict], replaced_generation) -> None:

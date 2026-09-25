@@ -141,6 +141,14 @@ from lib_task_cards import (  # noqa: E402,F401
 # codex-review が「差分が大きすぎる」で拒否した事実の記録 (t010 / #11)。書き手は
 # kai-review.sh、読み手はここ。定義はこのモジュールに 1 つだけ。
 import lib_review_refusal  # noqa: E402
+# デーモン側 JSON 状態ストア (「伝えた」台帳・拒否の記録) を読む入口は 1 つ (t026)。
+# ここで `json.loads(text)` を書き足さないこと — 外側しか検証しない読み方が、同じ根の
+# 欠陥を PR #214 で 3 回出した。再発防止は
+# tests/test_daemon_state_reads_go_through_the_entry.py (この埋め込み python も走査する)。
+from lib_daemon_state import (  # noqa: E402
+    load_json_store, notify_cache_problem, rule5_state_problem, told_entry_problem,
+    told_ledger_problem,
+)
 _mux = Mux()
 
 # t002: who may end a Worker process.  'watchdog' (default) = this daemon only
@@ -542,12 +550,16 @@ def load_all_tasks(active_missions):
 # ---------------------------------------------------------------------------
 
 def load_notify_cache():
-    if not NOTIFY_CACHE.exists():
-        return {}
-    try:
-        return json.loads(NOTIFY_CACHE.read_text())
-    except Exception:
-        return {}
+    """通知スロットル `{key: 最後に送った epoch 秒}`。
+
+    読み取りと形の検証は入口 (`load_json_store`) の 1 つ (t026)。使えないとき
+    (無い / 壊れている / 値が数でない・NaN・遠い未来) は `{}` = スロットルを失う =
+    **もう一度送る** 側に倒す (冪等。次の `record_notify()` が正しい形で書き直す)。
+    値を検証せずに信じると、`cache[key]` が `TypeError` でサイクルを落とすか、NaN・未来時刻で
+    その key の通知を永久に遮る。
+    """
+    cache = load_json_store(NOTIFY_CACHE, check=notify_cache_problem)
+    return {} if is_unreadable(cache) else cache
 
 
 def should_notify(key):
@@ -613,24 +625,21 @@ def _told_trouble(msg):
 def load_told():
     """`{notify_key: {'fp', 'kind', 'slug', 'task'}}`、または `Unreadable`。
 
+    読み取り・JSON・**各エントリの形** の検証は `load_json_store()` (1 つの入口)。
     ENOENT (まだ無い) は `{}`。それ以外の失敗は `Unreadable` のまま返し、
-    呼び出し側が「使えない」として扱う (空とは別)。
+    呼び出し側が「使えない」として扱う (空とは別)。**壊れたエントリが 1 つでもあれば
+    台帳全体が `Unreadable`** (t026 / Kai 3 巡目 P2): 外側だけ検証して内側を信じると、
+    `{"bad": {"slug": []}}` で `prune_told()` が毎サイクル `TypeError` になり、
+    prune もサイクルの残りも止まって、状態を離れて戻った task が永久に沈黙する。
+    `Unreadable` のときの向きは **再送側** (`already_told` は False、`prune_told` は何もしない、
+    `record_told` は作り直す)。
     """
-    text = read_regular_text_or_unreadable(TOLD_FILE)
-    if is_missing(text):
+    told = load_json_store(TOLD_FILE, check=told_ledger_problem)
+    if is_missing(told):
         return {}
-    if is_unreadable(text):
-        _told_trouble(f"{TOLD_FILE} を読めない ({text.reason})")
-        return text
-    try:
-        data = json.loads(text)
-    except ValueError as e:
-        _told_trouble(f"{TOLD_FILE} が壊れている (malformed JSON: {e})")
-        return Unreadable(TOLD_FILE, f'malformed JSON ({e})')
-    if not isinstance(data, dict):
-        _told_trouble(f"{TOLD_FILE} が壊れている (JSON object でない)")
-        return Unreadable(TOLD_FILE, 'not a JSON object')
-    return data
+    if is_unreadable(told):
+        _told_trouble(f"{TOLD_FILE} を使えない ({told.reason})")
+    return told
 
 
 def save_told(told):
@@ -674,7 +683,14 @@ def record_told(key, fp, kind, slug, task_id, throttle_key=None):
     prev = told.get(key)
     if isinstance(prev, dict) and prev.get('fp') != fp:
         forget_notify(f'{key}#', keep=throttle_key)
-    told[key] = {'fp': fp, 'kind': kind, 'slug': slug, 'task': task_id}
+    entry = {'fp': fp, 'kind': kind, 'slug': slug, 'task': str(task_id)}
+    # 書くものは、読み手が受け付ける形と同じでなければならない (t026)。読み手だけが
+    # 厳しいと、書いたばかりの台帳を自分が「壊れている」と読み、永久に再送側へ倒れる。
+    problem = told_entry_problem(key, entry)
+    if problem:
+        _told_trouble(f"台帳に書けない形のエントリ ({problem})")
+        return False
+    told[key] = entry
     return save_told(told)
 
 
@@ -965,10 +981,11 @@ def _mux_created_at(window_target: str):
     try:
         # registry/ の固定パスもガードを通す (t018)。tmux backend ではこの
         # ファイルが存在しないのが普通なので、ENOENT は警告を出さない。
-        raw = read_queue_text(p, 'mux cache')
-        if is_unreadable(raw):
+        # 読み取りと JSON は入口の 1 つ (t026)。
+        data = load_json_store(
+            p, warn=lambda msg: log(f"WARNING: mux cache: {msg}"))
+        if is_unreadable(data):
             return None
-        data = json.loads(raw)
         ts = data.get('created_at')
         if not ts:
             return None
@@ -1206,17 +1223,17 @@ def _state_json_path(name: str) -> Path:
 
 def _load_state_entry(name: str) -> dict:
     """Load state persistence entry.  Returns {} on missing / corrupt file."""
-    p = _state_json_path(name)
-    try:
-        raw = read_queue_text(p, 'rule5 state entry')
-        if is_unreadable(raw):
-            # 倒す先はここだけ「空」でよい —— grace が最初からやり直しになる
-            # = **通知が遅れる**側で、破壊も割り当ても起こらない
-            # (knowledge/empty-vs-unobservable.md §2 の I)。
-            return {}
-        return json.loads(raw)
-    except Exception:
+    # 読み取りと形の検証は入口 (`load_json_store`) の 1 つ (t026)。`since` が文字列だと
+    # `now - since` が TypeError、list だと `.get` が AttributeError で、Rule 5 のサイクルが落ちる。
+    entry = load_json_store(
+        _state_json_path(name), check=rule5_state_problem,
+        warn=lambda msg: log(f"WARNING: rule5 state entry: {msg}"))
+    if is_unreadable(entry):
+        # 倒す先はここだけ「空」でよい —— grace が最初からやり直しになる
+        # = **通知が遅れる**側で、破壊も割り当ても起こらない
+        # (knowledge/empty-vs-unobservable.md §2 の I)。
         return {}
+    return entry
 
 
 def _save_state_entry(name: str, state: str, since: float) -> None:

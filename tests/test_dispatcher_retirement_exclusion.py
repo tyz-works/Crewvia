@@ -131,6 +131,11 @@ def _load_dispatcher(root: Path, mux: FakeMux) -> dict:
     fake_lib_mux = types.ModuleType("lib_mux")
     fake_lib_mux.Mux = lambda: mux
     fake_lib_mux.repo_identity_ok = lib_mux.repo_identity_ok
+    # 差し替える前の module を覚えておき、finally で **元に戻す**。`del` だけだと本物の
+    # lib_mux が sys.modules から消え、後続のテストの `import lib_mux` が別の module を
+    # 新しく読み込む (test_dispatcher_notify_once.py が `lib_mux.Mux` を patch した object と
+    # 食い違い、本物の mux に触れに行く)。
+    previous_lib_mux = sys.modules.get("lib_mux")
     sys.modules["lib_mux"] = fake_lib_mux
 
     argv = [
@@ -150,7 +155,10 @@ def _load_dispatcher(root: Path, mux: FakeMux) -> dict:
         return ns
     finally:
         sys.argv = old_argv
-        del sys.modules["lib_mux"]
+        if previous_lib_mux is None:
+            sys.modules.pop("lib_mux", None)
+        else:
+            sys.modules["lib_mux"] = previous_lib_mux
 
 
 def _write_retirement_request(root: Path, mux: FakeMux) -> None:

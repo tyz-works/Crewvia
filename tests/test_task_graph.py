@@ -3,10 +3,11 @@
 このファイルが守りたいのは 3 つある。
 
 1. **「依存が満たされた」の定義が 1 箇所しか無いこと。**
-   crewvia の pull は `failed` / `cancelled` の依存を *満たされた扱い* にする。
-   DAG 側がこの規則を自前で持つと、QA が FAIL した直後 —— 「次に何が動ける
-   のか」を最も知りたい瞬間 —— にだけ、実際は dispatch される task を WAIT と
-   表示する。規則は `unmet_dependencies()` ただ 1 つから来なければならない。
+   crewvia の pull は `cancelled` の依存を *満たされた扱い* にし、`failed` の依存は
+   Director が `release-dep` するまで *保留* にする (t007)。DAG 側がこの規則を
+   自前で持つと、QA が FAIL した直後 —— 「次に何が動けるのか」を最も知りたい
+   瞬間 —— にだけ、pull が拒否する task を READY と表示する (あるいはその逆)。
+   規則は `lib_dep_rules.card_dependencies()` ただ 1 つから来なければならない。
 
 2. **生成がキューロックの内側に入らないこと。**
    plan.sh は全 Worker と両デーモンが叩く中枢である。ロック保持中に全 mission
@@ -22,6 +23,7 @@
 from __future__ import annotations
 
 import ast
+import itertools
 import json
 import os
 import pathlib
@@ -130,30 +132,38 @@ def test_no_script_keeps_its_own_copy_of_the_rule():
     探す文字列は本体の DEAD_DEP_STATUSES から組み立てる。このテスト自身に
     リテラルを書かないので、規則の中身が変わっても探し先は自動で追従する。
     """
-    needle = ", ".join(repr(s) for s in _dep_rules().DEAD_DEP_STATUSES)
+    mod = _dep_rules()
+    dead = tuple(mod.DEAD_DEP_STATUSES) + tuple(mod.HELD_DEP_STATUSES)
+    # 「終わらないと確定した status を並べたタプル」は、順序を入れ替えても同じコピー。
+    needles = {", ".join(repr(s) for s in order)
+               for order in itertools.permutations(dead)}
 
     offenders = []
     for glob in _RULE_SCAN_GLOBS:
         for path in sorted(REPO_ROOT.glob(glob)):
             if path.resolve() == DEP_RULES_PY.resolve():
                 continue
-            if needle in path.read_text(errors="replace"):
+            text = path.read_text(errors="replace")
+            if any(needle in text for needle in needles if "," in needle):
                 offenders.append(str(path.relative_to(REPO_ROOT)))
 
     assert not offenders, (
         f"依存規則のコピーが残っている: {offenders} — "
-        f"scripts/lib_dep_rules.py の unmet_dependencies() を呼ぶこと"
+        f"scripts/lib_dep_rules.py の card_dependencies() を呼ぶこと"
     )
 
 
 def test_dispatcher_uses_the_shared_rule():
     """dispatcher.sh が規則を import して呼んでいること。"""
     src = (REPO_ROOT / "scripts" / "dispatcher.sh").read_text()
-    assert "from lib_dep_rules import unmet_dependencies" in src, (
+    assert "from lib_dep_rules import card_dependencies" in src, (
         "dispatcher.sh が共有の依存規則を import していない"
     )
-    assert "unmet_deps = unmet_dependencies(" in src, (
-        "dispatcher.sh が unmet_dependencies() を呼んでいない"
+    assert "return card_dependencies(" in src, (
+        "dispatcher.sh の dependency_gate() が card_dependencies() を呼んでいない"
+    )
+    assert "dependency_gate(slug, meta," in src, (
+        "dispatch() が dependency_gate() を通していない"
     )
 
 
@@ -169,9 +179,9 @@ def test_pull_does_not_reimplement_the_dependency_rule(tree):
     assert "done_ids" in src, "前提が変わっている (cmd_pull が done_ids を使っていない)"
     assert "not in done_ids" not in src, (
         "cmd_pull が依存判定を自前で持っている。"
-        "unmet_dependencies() を呼ぶ形に寄せること"
+        "card_dependencies() を呼ぶ形に寄せること"
     )
-    assert "unmet_dependencies" in src, "cmd_pull が unmet_dependencies() を使っていない"
+    assert "card_dependencies" in src, "cmd_pull が card_dependencies() を使っていない"
 
 
 def test_task_graph_uses_the_same_helper(tree):
@@ -179,8 +189,8 @@ def test_task_graph_uses_the_same_helper(tree):
     funcs = _functions(tree)
     assert "build_task_graph" in funcs, "build_task_graph() が無い"
     src = ast.unparse(funcs["build_task_graph"])
-    assert "unmet_dependencies" in src, (
-        "build_task_graph() が unmet_dependencies() を使っていない。"
+    assert "card_dependencies" in src, (
+        "build_task_graph() が card_dependencies() を使っていない。"
         "READY の導出を自前で書くと pull と分裂する"
     )
 
@@ -275,9 +285,11 @@ STATUS_ROWS = [
     ("t011", "ready_for_verification", [], "blocked", "[要判断]"),
     ("t012", "pending", [], "ready", None),          # 依存なし → 実行可能
     ("t013", "pending", ["t004"], "waiting", None),  # 依存が in_progress → 依存待ち
-    ("t014", "pending", ["t006"], "ready", None),    # 依存が failed → crewvia は dispatch する
-    # `cancelled` は DEAD_DEP_STATUSES 側の終端。`blocked` に畳むと「依存先は
-    # blocked なのに下流は READY」という、依存規則と食い違う画面になる。
+    # 依存が failed → Director の判断待ち。pull / dispatch は拒否するので READY と
+    # 出してはいけない。plugin に「判断待ち」は無いので blocked に畳んで印で見分ける。
+    ("t014", "pending", ["t006"], "blocked", "[保留"),
+    # `cancelled` は DEAD_DEP_STATUSES 側の終端 (Director 自身の判断)。`blocked` に
+    # 畳むと「依存先は blocked なのに下流は READY」という、依存規則と食い違う画面になる。
     ("t015", "cancelled", [], "failed", "[中止]"),
     ("t016", "pending", ["t015"], "ready", None),    # 依存が cancelled → dispatch する
 ]
@@ -448,22 +460,31 @@ def test_human_wait_is_distinguishable_from_dependency_wait_and_blocked(sandbox)
     assert explicit_block["status"] == "blocked"
 
 
-def test_failed_dependency_does_not_make_downstream_look_blocked(sandbox):
-    """QA FAIL 直後、crewvia が実際に dispatch する task は READY に見えること。
+def test_failed_dependency_shows_downstream_as_held_not_ready(sandbox):
+    """QA FAIL 直後、pull が拒否する task は READY に見えないこと (t007)。
 
-    ここが赤いままだと、このミッションのゴール「並列実行可能なタスクが見える」が
-    まさにそれを見たい瞬間にだけ逆を表示する。
+    以前は failed の依存を「満たされた」扱いにして READY と出し、実際に review task
+    が自動で進んだ。表示 (この DAG) と pull の可否が同じ規則から来ること。
+    詳細な突き合わせは tests/test_failed_dependency_hold.py。
     """
     sandbox.add_task("t001", "failed", [])
     sandbox.add_task("t002", "pending", ["t001"])
     assert sandbox.run("task-graph").returncode == 0
-    nodes = _by_id(sandbox.read_graph())
-    assert nodes[f"{MISSION}:t002"]["status"] == "ready"
+    node = _by_id(sandbox.read_graph())[f"{MISSION}:t002"]
+    assert node["status"] == "blocked"
+    assert "[保留: t001 が failed]" in node["title"]
 
-    # 同じ規則で pull が実際に割り当てることを突き合わせる (対照)
+    # 同じ規則で pull が実際に拒否することを突き合わせる (対照)
     r = sandbox.run("pull", "--agent", "Ren", "--skills", "code")
-    assert r.returncode == 0, r.stderr
-    assert '"id": "t002"' in r.stdout
+    assert '"id": "t002"' not in r.stdout, (r.stdout, r.stderr)
+    assert "release-dep" in (r.stdout + r.stderr)
+
+    # Director が解除したら、DAG も pull も同時に進める側へ変わる
+    assert sandbox.run("release-dep", "t002").returncode == 0
+    node = _by_id(sandbox.read_graph())[f"{MISSION}:t002"]
+    assert node["status"] == "ready"
+    r = sandbox.run("pull", "--agent", "Ren", "--skills", "code")
+    assert r.returncode == 0 and '"id": "t002"' in r.stdout
 
 
 def test_corrupted_task_is_surfaced_and_does_not_abort_generation(sandbox):

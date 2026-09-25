@@ -104,6 +104,9 @@ CORRUPT_TASK_STATUS = 'corrupted'
 #: 部分がその task の識別子になる。
 TASK_FILENAME_RE = re.compile(r't(\d+)\.md')
 
+#: task の識別子の形。`released_deps` の要素はこの形の文字列だけを受理する。
+TASK_ID_RE = re.compile(r't\d+')
+
 #: 走査そのものが失敗したときに 1 件だけ返す疑似カードの id。
 #: 実在のカードの id は `TASK_FILENAME_RE` から来るので必ず `t<数字>` であり、
 #: この名前と衝突することはない (= 本物のカードを隠さない)。
@@ -316,6 +319,75 @@ def scan_failure_task(tasks_dir, what, detail):
         f'{tasks_dir} を走査できない ({what})',
         f'{what}: {detail}',
     )
+
+
+def released_deps_problem(value):
+    """card の `released_deps` が受理できない形なら、その理由を返す (受理なら `None`)。
+
+    受理するのは **task ID (`tNNN`) の list だけ**。欄が無い / `null` も「解除なし」
+    として受理する。それ以外は理由付きで断る —— 黙って解釈すると、両方向に壊れる
+    (Codex PR #217 P2):
+
+    * `released_deps: true` / `123` は、消費側の `set(...)` が `TypeError` を出し、
+      **1 枚の card で dispatch と status が落ちる** (全 mission の割り当てが止まる)。
+    * mapping (`t001: false`) は `set()` がキーだけを拾い、**「解除しない」と書いた
+      依存を解除済みにする** —— t007 が塞いだ「failed の依存を持つ task が進む」穴が
+      この card だけ開く。
+
+    `str` を受理しないのは、`released_deps: t001` を list と取り違えた typo を
+    `set("t001")` (= 1 文字ずつ) にしないため。**この関数が判定の本体**で、
+    `_read_task_card()` (読み取りの隔離) と `plan.sh release-dep` (書き込み前の確認)
+    が同じものを呼ぶ。
+    """
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        return (f"released_deps は task ID の list でなければならない "
+                f"(実際: {type(value).__name__} {value!r})")
+    bad = [v for v in value
+           if not (isinstance(v, str) and TASK_ID_RE.fullmatch(v))]
+    if bad:
+        return (f"released_deps の要素は task ID (tNNN) でなければならない "
+                f"(不正: {bad!r})")
+    return None
+
+
+def blocked_deps_problem(value):
+    """card の `blocked_by` が受理できない形なら、その理由を返す (受理なら `None`)。
+
+    受理するのは **空でない文字列の list** と、欄が無い / `null` / `[]` (= 依存なし)
+    だけ。それ以外は理由付きで断る。**依存の宣言は「これが済むまで進めるな」という
+    制約**なので、読み違えて落とすと制約そのものが消える (Codex PR #217 2 巡目 P2):
+
+    * `blocked_by: [null]` / `[false]` / `[0]` / `[""]` を「値の無い要素」として捨てると、
+      **依存を宣言した card が「依存なし」になり、pull も dispatch も開始する**。
+      t025 で足した truthiness フィルタ (`if d`) がこれをやっていた。#9 が潰そうとした
+      「依存が満たされていないのに下流が進む」事故を逆向きから作り直す回帰で、しかも
+      修正前 (`null` が unmet に落ちていた) より悪い。
+    * `blocked_by: false` / `0` / `""` を `or []` で「無い」に潰すのも同じ穴。
+    * mapping / 素の文字列 (`blocked_by: t001` = 反復すると 1 文字ずつ) / `true` / `123`
+      は、消費側の反復が `TypeError` を出す、または意味のない依存名を作る。
+
+    この関数が判定の本体で、`_read_task_card()` (読み取りの隔離) と
+    `plan.sh release-dep` (書き込み前の確認) が同じものを呼ぶ。`lib_dep_rules` は
+    このモジュールを import しない (フォールバック無しの単独モジュール) ので、あちらの
+    2 枚目の網は別に「落とさず unmet に残す」形で持つ。
+
+    **形だけを見る**: 存在しない task ID (dangling) は受理する。dangling は
+    `task_statuses` に無いので unmet に落ちて永久に待つ —— それは既に fail closed で、
+    `plan.sh status` に依存名が出るので直せる。ここで `tNNN` の形まで縛ると、
+    「別の id 体系を使う mission」の card を、黙って待たせるのではなく隔離してしまう。
+    """
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        return (f"blocked_by は task ID の list でなければならない "
+                f"(実際: {type(value).__name__} {value!r})")
+    bad = [v for v in value if not (isinstance(v, str) and v.strip())]
+    if bad:
+        return (f"blocked_by の要素は空でない task ID の文字列でなければならない "
+                f"(不正: {bad!r})")
+    return None
 
 
 def normalize_card(task_id, meta):
@@ -707,6 +779,33 @@ def _read_task_card(path, task_id, _warn):
             f'id がファイル名と一致しない (frontmatter: {declared})',
             f'frontmatter id {declared!r} != filename {task_id!r}',
         )
+
+    problem = blocked_deps_problem(meta.get('blocked_by'))
+    if problem:
+        # 依存の宣言を読み違えて落とすと、その card は「依存なし」として進む。
+        # 形の違う card は落とさず、直し方付きで隔離する。隔離は削除ではなく、
+        # `plan.sh update <id> --blocked-by <ids>` (raw の card を書き直す) が出口。
+        _warn(
+            f"{path}: {problem}\n"
+            f"  hint: `blocked_by: [t001, t002]` の形に直す (依存が無いなら `[]`)。"
+            f"`plan.sh update {task_id} --mission <slug> --blocked-by t001,t002` でも直せる。\n"
+            f"  holding it as a [破損] task; other tasks are unaffected."
+        )
+        return isolated_task(task_id, 'blocked_by が不正', problem)
+
+    problem = released_deps_problem(meta.get('released_deps'))
+    if problem:
+        # 「解除」は保留を外す権限そのもの。形が違う card は、読み違えて解除にも
+        # 例外にもしない (上の `released_deps_problem` を参照)。隔離は削除では
+        # ないので、Director は 1 コマンドか 1 行で直せる — 保留の出口は塞がない。
+        _warn(
+            f"{path}: {problem}\n"
+            f"  hint: `released_deps: [t001]` の形に直すか、行ごと消す。解除したいなら "
+            f"`plan.sh release-dep {task_id} --mission <slug>` が不正な値を捨てて "
+            f"書き直す。\n"
+            f"  holding it as a [破損] task; other tasks are unaffected."
+        )
+        return isolated_task(task_id, 'released_deps が不正', problem)
 
     return normalize_card(task_id, meta), body
 

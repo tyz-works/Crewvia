@@ -20,24 +20,127 @@ dispatcher.sh には同じ規則の独自コピーが残っていた (QA t002 �
 そのまま死ぬ。ここで「読めなかったら自前の規則で続行」に倒すと、規則が 1 つで
 あるという性質そのものが、最も気付きにくい形 (壊れた環境でだけコピーが動く)
 で失われる。
+
+## failed の依存は「満たされた」ではなく「保留」(t007 / backlog #9)
+
+以前の規則は `failed` / `cancelled` の依存を *満たされた* 扱いにしていた
+(QA が FAIL した直後に、その fix task まで永久に止まらないように)。だがその規則は
+fix task (進めてよい) と review / merge task (進めてはいけない) を区別できず、
+QA FAIL の直後に review task が自動で unblock され、merge 寸前まで進んだ。
+
+いまは:
+
+* `failed` の依存 = **保留 (held)**。unmet に数え、誰も自動では進めない。
+  Director が `plan.sh release-dep` で解除したとき (card の `released_deps`) だけ
+  満たされる。保留は `plan.sh status` に理由と解除コマンド付きで出る。
+* `cancelled` の依存 = 従来どおり満たされた扱い。Director 自身が下した判断なので、
+  保留にすると自分の判断で下流が止まる。
+
+選択肢の比較 (hard/soft 区別 vs 明示保留) は knowledge/failed-dependency-hold.md。
 """
 
 from __future__ import annotations
 
-#: 「この依存はもう完了しない」ことが確定している status。crewvia はこれらを
-#: 満たされた扱いにして下流を進める — QA が FAIL した直後に、その fix task まで
-#: 永久に止まってしまうのを避けるため。
+from collections import namedtuple
+
+#: 「この依存はもう完了しない」ことが確定しており、**Director 自身の判断で**そうなった
+#: status。満たされた扱いにして下流を進める。
 #:
 #: 完了した status (`done` / `verified` / `skipped` = plan.sh の
 #: TERMINAL_STATUSES) はここに入れない。あちらは done_ids として渡ってくる。
-DEAD_DEP_STATUSES = ('failed', 'cancelled')
+DEAD_DEP_STATUSES = ('cancelled',)
+
+#: 「もう完了しない」が確定しているが、**誰の判断も経ていない** status。保留にして
+#: Director の解除 (`released_deps`) を待つ。ここに `failed` 以外を足すときは、
+#: それが本当に Director の判断待ちなのかを先に決めること。
+HELD_DEP_STATUSES = ('failed',)
+
+#: `unmet` = 満たされていない依存すべて (保留を含む)。`held` = そのうち、Director の
+#: 解除待ちのもの。`held` は必ず `unmet` の部分集合。
+DependencyVerdict = namedtuple('DependencyVerdict', ['unmet', 'held'])
 
 
-def unmet_dependencies(blocked_by, done_ids, task_statuses):
+def unmet_dependencies(blocked_by, done_ids, task_statuses, released=()):
     """`blocked_by` のうち、まだ満たされていない依存の一覧を返す。
+
+    `released` は Director が明示的に解除した依存 (card の `released_deps`)。効くのは
+    その依存が **いま `failed` のときだけ** —— まだ走っている依存を解除しても待つ。
+    「事前に解除しておく」(failed になったら待たない) はできるが、今の依存を飛ばす
+    ことはできない。
 
     存在しない task への依存 (dangling) は `task_statuses` に無いので unmet 側に
     落ちる。crewvia の pull もそう扱う (永久に blocked) ので、ここでも同じ。
+    解除しても dangling は満たされない (status が無いので `failed` ではない)。
     """
-    return [dep for dep in (blocked_by or [])
-            if dep not in done_ids and task_statuses.get(dep) not in DEAD_DEP_STATUSES]
+    released = set(released or ())
+    unmet = []
+    for dep in declared_dependencies(blocked_by):
+        if dep in done_ids:
+            continue
+        status = task_statuses.get(dep)
+        if status in DEAD_DEP_STATUSES:
+            continue
+        if status in HELD_DEP_STATUSES and dep in released:
+            continue
+        unmet.append(dep)
+    return unmet
+
+
+def held_dependencies(blocked_by, done_ids, task_statuses, released=()):
+    """`unmet_dependencies()` のうち、Director の解除待ち (保留) のもの。"""
+    return [dep for dep in unmet_dependencies(blocked_by, done_ids, task_statuses, released)
+            if task_statuses.get(dep) in HELD_DEP_STATUSES]
+
+
+def declared_dependencies(value):
+    """card の `blocked_by` を、**1 つも落とさずに** 依存名の list にする。
+
+    依存の宣言は「これが済むまで進めるな」という制約なので、読めない要素を捨てると
+    制約が消える (Codex PR #217 2 巡目 P2: `blocked_by: [null]` を `if d` で捨てた結果、
+    pull も dispatch も開始した)。だから **形の違うものは、捨てずに unmet に残す**:
+
+    * 欄が無い / `null` / `[]` だけが「依存なし」。
+    * list の要素が空でない文字列でなければ、その要素を `<不正な依存: 値>` という
+      名前の依存にする。`task_statuses` に無いので必ず unmet (= 永久に待つ) になり、
+      `plan.sh status` にその名前が出る。`[null]` が 0 件になることは無い。
+    * list でない値 (mapping / 素の文字列 / bool / int) は、値まるごとを 1 件の
+      `<不正な blocked_by: 値>` にする。反復して `TypeError` を出したり、文字列を
+      1 文字ずつに割ったりしない。
+
+    読み取り側 (`lib_task_cards.blocked_deps_problem`) が形の違う card を `[破損]` に
+    隔離するので、ふつうここには list of str しか来ない。これは 2 枚目の網で、
+    raw の card を渡す経路 (`plan.sh release-dep` など) と、隔離をすり抜ける将来の
+    経路のためにある。判定の本体はあちら (このモジュールは他を import しないので、
+    ここは型だけを見る)。
+    """
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        return [f'<不正な blocked_by: {value!r}>']
+    return [d if isinstance(d, str) and d.strip() else f'<不正な依存: {d!r}>'
+            for d in value]
+
+
+def card_dependencies(meta, done_ids, task_statuses):
+    """card (frontmatter の dict) から `DependencyVerdict` を作る。
+
+    pull / task-graph / dispatcher は **これだけ**を呼ぶ。`blocked_by` と
+    `released_deps` を呼び出し側が別々に取り出す形だと、片方 (released_deps) を
+    渡し忘れる経路ができる —— 渡し忘れは「常に保留」に倒れるので事故にはならないが、
+    Director が解除したのに誰も進めない、という見えにくい壊れ方になる。
+    """
+    blocked_by = meta.get('blocked_by')
+    released = meta.get('released_deps')
+    if not (isinstance(released, (list, tuple))
+            and all(isinstance(d, str) for d in released)):
+        # 2 枚目の網。読み取り側 (`lib_task_cards.released_deps_problem`) が形の違う
+        # card を `[破損]` に隔離するので、ふつうここには list しか来ない。来なかった
+        # ときに `set(True)` の TypeError や、mapping のキーを解除と読む事故になら
+        # ないよう、**解除なし (= 保留のまま)** に倒す。解除は保留を外す権限なので、
+        # 判断不能は外さない側が安全。判定の本体はあちら (このモジュールは他を
+        # import しないので、ここは型だけを見る)。
+        released = ()
+    return DependencyVerdict(
+        unmet_dependencies(blocked_by, done_ids, task_statuses, released),
+        held_dependencies(blocked_by, done_ids, task_statuses, released),
+    )

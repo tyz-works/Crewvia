@@ -155,11 +155,14 @@ worktree を指した）と、**エラーなしでサンプルが描かれる**�
 ### 4-3. 「QA FAIL 後の WAIT 表示は信用しない」は不要（crewvia 側で READY を導出している）
 
 t001 は `pending` の READY / WAIT を plugin の導出に**委ねず**、crewvia 側で
-`unmet_dependencies()`（`plan.sh pull` と dispatcher が使うのと同じ 1 つの規則）を使って
-明示的に `ready` / `waiting` を書く。`failed` / `cancelled` の依存を満たされた扱いにする
-規則が画面にも反映されるので、**QA FAIL の直後でも、dispatch される task は READY と出る**。
-よって「その瞬間の WAIT は信用しない」という但し書きは要らない。逆に、plugin の導出に
-戻す変更を入れるなら、この但し書きが必要になる。
+`card_dependencies()`（`plan.sh pull` と dispatcher が使うのと同じ 1 つの規則）を使って
+明示的に `ready` / `waiting` を書く。規則は t007 で変わった: `cancelled` の依存は満たされた
+扱い、**`failed` の依存は保留（Director が `plan.sh release-dep` するまで pull も dispatch も
+拒否）**。保留の task は `blocked` + `[保留: tXXX が failed]` の印で描かれる（`waiting` に
+すると「依存が終われば勝手に進む」と読めてしまう）。画面と pull の可否は同じ規則から来るので、
+**QA FAIL の直後でも、READY と出ている task は実際に pull できる**。よって「その瞬間の WAIT
+は信用しない」という但し書きは要らない。逆に、plugin の導出に戻す変更を入れるなら、
+この但し書きが必要になる。設計と rollback は `knowledge/failed-dependency-hold.md`。
 
 ### 4-4. `pane_match` は live の herdr では当たらない（**未解決・要フォローアップ**。`pane_id` なら当たることを隔離環境で確認済み）
 

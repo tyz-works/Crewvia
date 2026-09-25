@@ -8,9 +8,14 @@
 # 修正:
 #   (1) plan.sh pull --task にも blocked_by ガードを追加 (defense-in-depth)。
 #       dispatcher.sh の TERMINAL_STATUSES に 'verified' を追加 (plan.sh と一致)。
-#   (2) BC-1 fix: failed/cancelled dep は blocking しない。
-#       規則の本体は scripts/lib_dep_rules.py の unmet_dependencies()。
-#       plan.sh / dispatcher.sh / task-graph はそこだけを読む (t010)。
+#   (2) BC-1 fix (t010): 規則の本体は scripts/lib_dep_rules.py に 1 つだけ。
+#       plan.sh / dispatcher.sh / task-graph はそこだけを読む。
+#   (3) t007 (backlog #9): BC-1 の「failed dep は blocking しない」は撤回。
+#       failed dep を満たされた扱いにすると、QA FAIL 直後に review/merge task が
+#       自動で unblock され merge 寸前まで進んだ。いまは failed dep = 保留 (HELD):
+#       Director が `plan.sh release-dep` するまで pull / dispatch は拒否する。
+#       cancelled は Director 自身の判断なので従来どおり blocking しない。
+#       (網羅的な突き合わせは tests/test_failed_dependency_hold.py)
 #
 # このテストで検証:
 #   1. plan.sh pull --task: blocked 状態のタスクは exit 1 で拒否される
@@ -20,7 +25,8 @@
 #   5. dispatcher.sh: TERMINAL_STATUSES に 'verified' が含まれる
 #   6. エラーメッセージに未完了依存タスク名が含まれる
 #   7. 再現テスト: pending dep で blocked task を --task で pull → 拒否
-#   BC-1: dep=failed → pull 可 (failed は blocking しない)
+#   BC-1: dep=failed → pull 不可 (保留。理由と release-dep の案内が出る)
+#   BC-1b: release-dep 後 → pull 可
 #   BC-2: dep=cancelled → pull 可 (cancelled は blocking しない)
 #
 # 実行: bash scripts/test_blocked_by_guard.sh
@@ -104,12 +110,17 @@ write_task t005 "Task blocked by verified dep" pending "t006"
 printf -- '---\nid: t006\ntitle: Verified dep\nskills: [bash]\npriority: medium\nstatus: verified\nblocked_by: []\nworker: null\nstarted_at: null\ncompleted_at: 2026-08-25T02:00:00Z\n---\n\n## Description\nAlready verified.\n\n## Result\nVerified.\n' \
   > "$TASKS_DIR/t006.md"
 
-# t007: pending, blocked by t008 (failed) → should be pull-able (BC-1)
+# t007: pending, blocked by t008 (failed) → HELD until the Director releases it (BC-1)
 write_task t007 "Task blocked by failed dep" pending "t008"
 
 # t008: failed dep
 printf -- '---\nid: t008\ntitle: Failed dep\nskills: [bash]\npriority: medium\nstatus: failed\nblocked_by: []\nworker: null\nstarted_at: null\ncompleted_at: null\n---\n\n## Description\nFailed task.\n\n## Result\n' \
   > "$TASKS_DIR/t008.md"
+
+# t009: pending, blocked by t010 (cancelled) → pull-able (BC-2)
+write_task t009 "Task blocked by cancelled dep" pending "t010"
+printf -- '---\nid: t010\ntitle: Cancelled dep\nskills: [bash]\npriority: medium\nstatus: cancelled\nblocked_by: []\nworker: null\nstarted_at: null\ncompleted_at: null\n---\n\n## Description\nCancelled task.\n\n## Result\n' \
+  > "$TASKS_DIR/t010.md"
 
 # Helper: run plan.sh with test QUEUE (stdout only; discard stderr warnings)
 run_plan_stdout() {
@@ -197,25 +208,42 @@ else
 fi
 
 echo ""
-echo "--- BC-1: dep=failed → pull --task succeeds (failed does not block) ---"
-out_bc1=$(run_plan_stdout pull --task t007 --mission "$MISSION_SLUG" --skills bash) && rc_bc1=0 || rc_bc1=$?
-if [[ "$rc_bc1" -eq 0 ]] && echo "$out_bc1" | python3 -c "import sys,json; d=json.load(sys.stdin); exit(0 if d.get('id')=='t007' else 1)" 2>/dev/null; then
-  pass "BC-1: dep=failed → --task pull succeeds (t007 pulled)"
+echo "--- BC-1: dep=failed → pull --task is refused (held) ---"
+out_bc1=$(run_plan_all pull --task t007 --mission "$MISSION_SLUG" --skills bash)
+if echo "$out_bc1" | grep -q "HELD" && echo "$out_bc1" | grep -q "release-dep t007" \
+   && ! echo "$out_bc1" | grep -q '"id": "t007"'; then
+  pass "BC-1: dep=failed → --task pull refused with HELD + release-dep hint"
 else
-  fail "BC-1: dep=failed should NOT block pull — rc=$rc_bc1 out=$out_bc1"
+  fail "BC-1: dep=failed must be HELD (refused, with reason) — out=$out_bc1"
 fi
 
-# Reset t007 to pending
-reset_task t007 "Task blocked by failed dep" "t008"
-
 echo ""
-echo "--- BC-1 normal pull: dep=failed → task appears in normal pull ---"
+echo "--- BC-1 normal pull: dep=failed task is NOT auto-selected ---"
 out_bc1n=$(run_plan_stdout pull --skills bash --mission "$MISSION_SLUG") && rc_bc1n=0 || rc_bc1n=$?
 picked_bc1n=$(echo "$out_bc1n" | python3 -c "import sys,json; print(json.load(sys.stdin).get('id','?'))" 2>/dev/null || echo "?")
-if [[ "$rc_bc1n" -eq 0 ]] && [[ "$picked_bc1n" != "?" ]]; then
-  pass "BC-1 normal pull: dep=failed task is eligible for normal pull (picked=$picked_bc1n)"
+if [[ "$picked_bc1n" != "t007" ]]; then
+  pass "BC-1 normal pull: held t007 was not selected (picked=$picked_bc1n)"
 else
-  fail "BC-1 normal pull: dep=failed task should be eligible — rc=$rc_bc1n picked=$picked_bc1n"
+  fail "BC-1 normal pull: held t007 must not be selected — rc=$rc_bc1n out=$out_bc1n"
+fi
+
+echo ""
+echo "--- BC-1b: release-dep → pull --task succeeds ---"
+run_plan_all release-dep t007 --mission "$MISSION_SLUG" > /dev/null
+out_bc1b=$(run_plan_stdout pull --task t007 --mission "$MISSION_SLUG" --skills bash) && rc_bc1b=0 || rc_bc1b=$?
+if [[ "$rc_bc1b" -eq 0 ]] && echo "$out_bc1b" | python3 -c "import sys,json; d=json.load(sys.stdin); exit(0 if d.get('id')=='t007' else 1)" 2>/dev/null; then
+  pass "BC-1b: released failed dep → t007 pulled"
+else
+  fail "BC-1b: release-dep should let t007 through — rc=$rc_bc1b out=$out_bc1b"
+fi
+
+echo ""
+echo "--- BC-2: dep=cancelled → pull --task succeeds (Director's own decision) ---"
+out_bc2=$(run_plan_stdout pull --task t009 --mission "$MISSION_SLUG" --skills bash) && rc_bc2=0 || rc_bc2=$?
+if [[ "$rc_bc2" -eq 0 ]] && echo "$out_bc2" | python3 -c "import sys,json; d=json.load(sys.stdin); exit(0 if d.get('id')=='t009' else 1)" 2>/dev/null; then
+  pass "BC-2: dep=cancelled → t009 pulled"
+else
+  fail "BC-2: cancelled dep should NOT block — rc=$rc_bc2 out=$out_bc2"
 fi
 
 echo ""

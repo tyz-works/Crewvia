@@ -127,7 +127,7 @@ import lib_retirement  # noqa: E402
 # 指摘 F-2b)。ここに同じ規則のコピーを書き戻さないこと — plan.sh pull が割り当て
 # る task と dispatcher が投げる task がズレると、痛むのは QA FAIL の直後だけで、
 # その瞬間まで誰も気付かない。tests/test_task_graph.py がコピーの再発を見張る。
-from lib_dep_rules import unmet_dependencies  # noqa: E402
+from lib_dep_rules import card_dependencies  # noqa: E402
 # task カードの読み取りも 1 箇所しかない (Codex 5 巡目 P2)。parser・「識別子は
 # ファイル名」・信用できないカードの隔離を plan.sh 側だけに入れた結果、同じ queue を
 # 2 つの別のコードが別の規則で読む状態になり、`id` 行の無いカードで **この
@@ -543,6 +543,21 @@ def load_all_tasks(active_missions):
         for meta, _ in tasks:
             all_tasks.append((slug, meta))
     return all_tasks, done_ids_by_mission, task_statuses_by_mission
+
+
+def dependency_gate(slug, meta, done_ids_by_mission, task_statuses_by_mission):
+    """この pending task の依存判定 (`DependencyVerdict`: unmet / held)。
+
+    規則は lib_dep_rules に 1 つだけ (plan.sh pull / task-graph と共有)。dispatch()
+    はここを通す —— テストが「dispatcher はこの card を投げるのか」を本物のコードで
+    直接問えるように、判定を dispatch() の外に出してある (tests/test_failed_dependency_hold.py)。
+    failed の依存は held (Director が release-dep するまで投げない、t007)。
+    """
+    return card_dependencies(
+        meta,
+        done_ids_by_mission.get(slug, set()),
+        task_statuses_by_mission.get(slug, {}),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1679,11 +1694,9 @@ def dispatch():
     for slug, meta in all_tasks:
         if meta.get('status') != 'pending':
             continue
-        done_ids = done_ids_by_mission.get(slug, set())
         task_statuses = task_statuses_by_mission.get(slug, {})
-        bb = meta.get('blocked_by') or []
-        # 規則は lib_dep_rules に 1 つだけ (plan.sh pull / task-graph と共有)。
-        unmet_deps = unmet_dependencies(bb, done_ids, task_statuses)
+        verdict = dependency_gate(slug, meta, done_ids_by_mission, task_statuses_by_mission)
+        unmet_deps = verdict.unmet
         if unmet_deps:
             # Suppress repeated output of the same blocked state to avoid
             # flooding the scrollback (same line every 5s → 40-line buffer fills
@@ -1692,8 +1705,15 @@ def dispatch():
             # (default 300s) as a heartbeat so the state remains visible.
             _bkey = f"blocked_log_{slug}_{meta.get('id')}"
             if should_notify(_bkey):
-                log(f"[blocked] task {meta.get('id')} (mission={slug}) — unmet deps: "
-                    f"{unmet_deps} (statuses: {[task_statuses.get(d) for d in unmet_deps]})")
+                if verdict.held:
+                    # failed の依存は誰も自動では解かない。ログにも出口を残す
+                    # (plan.sh status にも同じ文面が出る)。
+                    log(f"[held] task {meta.get('id')} (mission={slug}) — failed deps "
+                        f"{verdict.held}: Director の判断待ち。"
+                        f"`plan.sh release-dep {meta.get('id')} --mission {slug}` で解除")
+                else:
+                    log(f"[blocked] task {meta.get('id')} (mission={slug}) — unmet deps: "
+                        f"{unmet_deps} (statuses: {[task_statuses.get(d) for d in unmet_deps]})")
                 record_notify(_bkey)
             continue
         task_skills = set(meta.get('skills') or [])

@@ -1262,6 +1262,11 @@ cat {handoff_path}
 ```
 
 > **注意**: `--blocked-by` は設定しない（failed タスクは blocking を解除しないため）
+>
+> failed の依存を持つ既存 task は **HELD（保留）** になり、pull / dispatch は拒否する。`plan.sh status` の
+> 🛑 行に理由と解除コマンドが出る。失敗の中身を見て、進めてよい (fix task 等) なら
+> `plan.sh release-dep <task_id>`、進めてはいけない (QA FAIL 後の review / merge 等) ならそのまま
+> 保留にして task を足す / `plan.sh update <task_id> --status skipped`。設計は `knowledge/failed-dependency-hold.md`
 
 **3.** 適切なスキルの Worker を起動（既存 Worker が idle なら再利用）:
 

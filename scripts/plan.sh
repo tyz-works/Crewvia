@@ -1231,6 +1231,36 @@ def enforce_task_graph_contract(nodes, slugs):
     return nodes
 
 
+_LIB_MUX = None
+
+
+def task_graph_pane_id(worker):
+    """Worker のペインの `pane_id`。確かに言えるときだけ返し、他は None。
+
+    根拠は `registry/mux/<Worker>-worker.json` (start.sh が Worker 起動時に
+    書く spawn 記録)。**herdr には触れない** — 記録と /proc を読むだけで、
+    `lib_mux.recorded_herdr_pane_id()` が「記録の server がまだ生きているか」
+    (= その pane id が今の server の世代のものか) まで見る。ロックも取らない
+    (`.records.lock` を待つと、`retire --no-wait` 経由で watchdog が同期で
+    待たされる)。書き手は in-place の書き込みなので半端な読み取りはあるが、
+    JSON として読めなければ None になるだけ。
+
+    None のとき呼び出し側は `pane_id` を書かず、従来の `pane_match` だけが残る。
+    **どんな失敗でも生成全体を落とさない** — ペインへ飛べることは付加機能で、
+    図が描けることのほうが上。
+    """
+    global _LIB_MUX
+    try:
+        if _LIB_MUX is None:
+            _LIB_MUX = _load_scripts_module('lib_mux')
+        return _LIB_MUX.recorded_herdr_pane_id(
+            f'{worker}-worker', repo_root=task_graph_repo_root())
+    except Exception as e:      # noqa: BLE001 — 上の docstring の通り。
+        print(f'[plan.sh] task-graph: {worker} の pane_id を解決できない '
+              f'({type(e).__name__}: {e}) — pane_match だけを書く', file=sys.stderr)
+        return None
+
+
 def build_task_graph(state):
     """active mission 全部を plugin の入力形式に変換する。
 
@@ -1291,6 +1321,11 @@ def build_task_graph(state):
             # 契約の話であって翻訳の話ではないから —— ゲートが落として印を残す。
             node = {
                 'id': f'{slug}:{task_id}',
+                # 画面に出す短い名前。plugin が `label` に対応していれば `id`
+                # (`<slug>:tNNN`、長くて読めない) の代わりに使う。対応していない
+                # 版は未知の欄として無視する。`id` は mission をまたぐ一意性と
+                # 依存解決のためにそのまま残す。
+                'label': str(task_id),
                 'title': str(title),
                 'depends_on': [f'{slug}:{d}' for d in blocked_by],
                 'status': status,
@@ -1307,6 +1342,12 @@ def build_task_graph(state):
                 # 「公開中の assignment がこの task を指している」(事実) の
                 # **両方** が揃ったときにだけ出す。片方でも欠ければ出さない。
                 node['pane_match'] = f'{worker}-worker'
+                # pane_match は live の herdr の snapshot には当たらない
+                # (knowledge/task-graph.md §4-4) ので、spawn 記録の pane_id も
+                # 書く。記録が無い・古い・読めないときは書かない (pane_match のまま)。
+                pane_id = task_graph_pane_id(worker)
+                if pane_id:
+                    node['pane_id'] = pane_id
             mission_nodes.append(node)
 
         nodes.extend(mission_nodes)

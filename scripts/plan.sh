@@ -22,6 +22,10 @@ set -euo pipefail
 #   plan.sh update <task_id> [--mission <slug>] [--skills <csv>] [--blocked-by <csv>]
 #                            [--priority high|medium|low] [--worker <name>] [--status <status>]
 #                            [--description <text>] [--reset]
+#   plan.sh release-dep <task_id> [--dep <csv>] [--mission <slug>]
+#                              failed の依存で保留されている task を、Director が明示的に
+#                              進めてよいと決める (省略時は今 failed の依存すべて)。
+#                              依存の辺は消えず、card に released_deps として残る
 #   plan.sh retire <task_id> --agent <name> --started-at <generation>
 #                            [--mission <slug>] [--outcome reset|needs-director]
 #                            [--reason "<1 行>"] [--no-wait]
@@ -40,7 +44,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 QUEUE_DIR="${CREWVIA_QUEUE:-${REPO_ROOT}/queue}"
 
 if [[ $# -eq 0 ]]; then
-  echo "Usage: plan.sh <init|add|pull|done|needs-director|fail|update|retire|ready-for-verification|verify-result|review|launch|task-graph|lint|status|archive|dashboard|dashboard-data> [args...]" >&2
+  echo "Usage: plan.sh <init|add|pull|done|needs-director|fail|update|release-dep|retire|ready-for-verification|verify-result|review|launch|task-graph|lint|status|archive|dashboard|dashboard-data> [args...]" >&2
   exit 1
 fi
 
@@ -449,7 +453,7 @@ def _dump_inline(val):
 
 TASK_META_KEY_ORDER = [
     'id', 'title', 'skills', 'priority', 'status',
-    'blocked_by', 'timeout', 'target_dir', 'worker', 'started_at', 'completed_at',
+    'blocked_by', 'released_deps', 'timeout', 'target_dir', 'worker', 'started_at', 'completed_at',
     'handoff_path', 'pr_number',
     'acceptance_criteria', 'verification', 'rework_count', 'max_rework',
     'qa_checkpoints', 'required_evidence', 'needs_director_reason',
@@ -783,7 +787,23 @@ def _warn_task_card(msg):
 
 _DEP_RULES = _load_scripts_module('lib_dep_rules')
 DEAD_DEP_STATUSES = _DEP_RULES.DEAD_DEP_STATUSES
+HELD_DEP_STATUSES = _DEP_RULES.HELD_DEP_STATUSES
 unmet_dependencies = _DEP_RULES.unmet_dependencies
+card_dependencies = _DEP_RULES.card_dependencies
+
+
+def held_dependency_hint(task_id, held):
+    """保留 (failed の依存) を見た人が、次に何を打てばよいか分かる 1 行。
+
+    保留が「永久保留」という別の outage にならないための出口の案内。status /
+    pull の診断 / task-graph が同じ文面を使う (別々に書くと、解除コマンドの
+    綴りが片方だけ古くなる)。
+    """
+    return (
+        f"HELD: 依存 {', '.join(held)} が failed — Director の判断待ち。"
+        f"進めるなら `plan.sh release-dep {task_id}` (fix が要るなら task を足す / "
+        f"中止なら `plan.sh update {task_id} --status skipped`)"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -802,7 +822,8 @@ unmet_dependencies = _DEP_RULES.unmet_dependencies
 #: queue を書き換えるサブコマンド = 生成を呼ぶ経路。正は冒頭の usage 行と
 #: 末尾の dispatch テーブル (tests/test_task_graph.py が突き合わせる)。
 QUEUE_MUTATING_SUBCOMMANDS = {
-    'init', 'add', 'pull', 'done', 'needs-director', 'fail', 'update', 'retire',
+    'init', 'add', 'pull', 'done', 'needs-director', 'fail', 'update', 'release-dep',
+    'retire',
     'ready-for-verification', 'verify-result', 'review', 'launch', 'archive',
 }
 
@@ -1233,9 +1254,17 @@ def build_task_graph(state):
                 # crewvia 側で READY を導出して明示的に書く。plugin の導出に
                 # 委ねると、`failed` の依存を満たされた扱いにする crewvia の
                 # 規則が伝わらず、QA FAIL 直後だけ WAIT と表示される。
-                unmet = unmet_dependencies(blocked_by, done_ids, task_statuses)
-                status = 'waiting' if unmet else 'ready'
-                marker = None
+                verdict = card_dependencies(meta, done_ids, task_statuses)
+                if verdict.held:
+                    # failed の依存は Director の判断待ち。plugin の 6 状態には
+                    # 「判断待ち」が無いので blocked に畳み、印で理由を残す
+                    # (needs_director と同じやり方)。waiting のままだと
+                    # 「依存が終われば勝手に進む」と読めてしまう。
+                    status = 'blocked'
+                    marker = f"[保留: {', '.join(verdict.held)} が failed]"
+                else:
+                    status = 'waiting' if verdict.unmet else 'ready'
+                    marker = None
             else:
                 status, marker = TASK_GRAPH_STATUS_MAP.get(raw_status, TASK_GRAPH_UNKNOWN)
 
@@ -2450,6 +2479,7 @@ def cmd_pull(args):
         pending_count = 0
         skill_mismatch = 0
         blocked_count = 0
+        held_tasks = []   # [(task_id, [failed dep ids])] — Director の判断待ち
         target_mismatch = 0
         missing_dirs = []
 
@@ -2484,10 +2514,18 @@ def cmd_pull(args):
                     # even when --task bypasses skill/target filters.  This prevents
                     # a blocked task from being executed when the dispatcher sends a
                     # stale kickoff message (e.g. blocked_by race, parse glitch).
-                    # failed/cancelled deps are excluded — they indicate the dep will
-                    # never complete, so the downstream task should not be blocked.
-                    bb = meta.get('blocked_by') or []
-                    unmet = unmet_dependencies(bb, done_ids, task_statuses)
+                    # cancelled deps are excluded (Director's own decision).  A
+                    # *failed* dep is HELD until the Director releases it
+                    # (plan.sh release-dep): treating it as satisfied let a review
+                    # task run right after its QA failed (t007 / backlog #9).
+                    verdict = card_dependencies(meta, done_ids, task_statuses)
+                    unmet = verdict.unmet
+                    if verdict.held:
+                        die(
+                            f"task '{specific_task}' is held: {held_dependency_hint(specific_task, verdict.held)}"
+                            f" — cannot pull until the Director decides "
+                            f"(blocked by unfinished dependencies: {unmet})"
+                        )
                     if unmet:
                         die(
                             f"task '{specific_task}' is blocked by unfinished dependencies: "
@@ -2527,11 +2565,13 @@ def cmd_pull(args):
                     if task_td != effective_target:
                         target_mismatch += 1
                         continue
-                bb = meta.get('blocked_by') or []
-                # failed/cancelled deps do not block: they indicate the dep will
-                # never complete, so the downstream task should remain eligible.
-                if unmet_dependencies(bb, done_ids, task_statuses):
+                # cancelled deps do not block (Director's own decision).  failed
+                # deps HOLD the task until the Director releases them.
+                verdict = card_dependencies(meta, done_ids, task_statuses)
+                if verdict.unmet:
                     blocked_count += 1
+                    if verdict.held:
+                        held_tasks.append((meta.get('id'), verdict.held))
                     continue
                 candidates.append((slug, meta, body))
 
@@ -2564,12 +2604,18 @@ def cmd_pull(args):
             elif blocked_count and not skill_mismatch and not target_mismatch:
                 diag['reason'] = 'all_blocked'
                 diag['detail'] = f'{blocked_count} pending task(s) blocked by unmet dependencies'
+                if held_tasks:
+                    diag['detail'] += ' — ' + '; '.join(
+                        held_dependency_hint(t, h) for t, h in held_tasks)
             else:
                 diag['reason'] = 'no_eligible_task'
                 diag['detail'] = (
                     f'{pending_count} pending; {skill_mismatch} skill-mismatch; '
                     f'{target_mismatch} target-mismatch; {blocked_count} blocked'
                 )
+                if held_tasks:
+                    diag['detail'] += ' — ' + '; '.join(
+                        held_dependency_hint(t, h) for t, h in held_tasks)
             return
 
         # Priority-first sort: high-priority tasks across all active missions
@@ -3090,6 +3136,15 @@ def _print_mission_summary(slug, archived=False):
     in_prog = [(m, b) for (m, b) in tasks if m.get('status') == 'in_progress']
     needs_dir = [(m, b) for (m, b) in tasks if m.get('status') == 'needs_director']
     corrupted = [(m, b) for (m, b) in tasks if m.get('status') == CORRUPT_TASK_STATUS]
+    done_ids = {m['id'] for (m, _) in tasks if m.get('status') in TERMINAL_STATUSES}
+    task_statuses = {m['id']: m.get('status') for (m, _) in tasks}
+    held = []
+    for (m, _) in tasks:
+        if m.get('status') != 'pending':
+            continue
+        verdict = card_dependencies(m, done_ids, task_statuses)
+        if verdict.held:
+            held.append((m, verdict.held))
 
     title = mission.get('title', '(unnamed)')
     status = mission.get('status', 'in_progress')
@@ -3108,6 +3163,10 @@ def _print_mission_summary(slug, archived=False):
         err = m.get('parse_error', '')
         err_str = f" — {err}" if err else ''
         print(f"    💥 {m['id']} [破損]{err_str}")
+    for (m, deps) in held:
+        # 既定の status (要約) にも出す。保留は誰も自動では解かないので、
+        # 詳細を開かないと見えない場所に置くと「永久保留」になる。
+        print(f"    🛑 {m['id']} {m['title']} — {held_dependency_hint(m['id'], deps)}")
 
 
 def _print_mission_detail(slug):
@@ -3128,6 +3187,8 @@ def _print_mission_detail(slug):
     print()
 
     done_ids = {m['id'] for (m, _) in tasks if m.get('status') in TERMINAL_STATUSES}
+    task_statuses = {m['id']: m.get('status') for (m, _) in tasks}
+    held_lines = []
     for (m, _) in tasks:
         st = m.get('status', 'pending')
         icon = STATUS_ICON.get(st, '❓')
@@ -3168,8 +3229,16 @@ def _print_mission_detail(slug):
             err_str = f" — {err}" if err else ''
             suffix = f"(破損 — 手動修復が必要){err_str}"
         elif bb:
-            unmet = [d for d in bb if d not in done_ids]
-            suffix = f"(blocked: {', '.join(unmet)})" if unmet else "(pending)"
+            # 表示も pull / dispatcher と同じ規則から (別に数えると、進める
+            # task が blocked と出る / 保留が waiting に見える、という食い違いになる)。
+            verdict = card_dependencies(m, done_ids, task_statuses)
+            if verdict.held:
+                suffix = f"(HELD: {', '.join(verdict.held)} が failed — Director の判断待ち)"
+                held_lines.append(held_dependency_hint(tid, verdict.held))
+            elif verdict.unmet:
+                suffix = f"(blocked: {', '.join(verdict.unmet)})"
+            else:
+                suffix = "(pending)"
         else:
             suffix = "(pending)"
         timeout_suffix = ''
@@ -3188,6 +3257,11 @@ def _print_mission_detail(slug):
     done_count = sum(1 for (m, _) in tasks if m.get('status') == 'done')
     print()
     print(f"Progress: {done_count}/{total} done")
+    if held_lines:
+        print()
+        print("Held (failed の依存 — 自動では進まない):")
+        for line in held_lines:
+            print(f"  {line}")
 
 
 def cmd_ready_for_verification(args):
@@ -4078,6 +4152,13 @@ def cmd_update(args):
             new_blocked = [s.strip() for s in raw.split(',') if s.strip()] if raw else []
             meta['blocked_by'] = new_blocked
             changed.append(f"blocked_by={new_blocked}")
+            # 外れた依存の解除が残ると、同じ id を後で付け直したときに
+            # 「解除した覚えのない依存」が最初から解除済みになる。
+            kept = [d for d in (meta.get('released_deps') or []) if d in new_blocked]
+            if kept:
+                meta['released_deps'] = kept
+            elif 'released_deps' in meta:
+                del meta['released_deps']
 
         if priority:
             meta['priority'] = priority
@@ -4139,6 +4220,82 @@ def cmd_update(args):
                     f" — 削除しませんでした ({old_worker} は別の作業に就いている可能性があります)",
                     file=sys.stderr,
                 )
+
+    with_lock(_do)
+
+
+def cmd_release_dep(args):
+    """Director が「failed の依存を持つこの task を進めてよい」と明示的に決める。
+
+    Usage:
+      plan.sh release-dep <task_id> [--dep <csv>] [--mission <slug>]
+
+    failed の依存を持つ task は保留 (HELD) になり、pull / dispatch は拒否する
+    (t007 / backlog #9)。これはその出口: 対象の依存を card の `released_deps` に
+    記録する。`blocked_by` は消さない — DAG に「この task はあの依存に由来する」
+    という履歴が残り、release した事実も card から読める。
+
+    --dep を省略すると、**今 failed で解除されていない依存すべて**が対象。--dep で
+    名指しした依存は、その task の `blocked_by` に無ければ拒否する (打ち間違いが
+    解除に見えてしまうため)。まだ failed でない依存を名指しすると「もし failed に
+    なっても待たない」という事前解除になる (今の依存は待ったまま)。
+
+    対象は pending の task だけ。走り出した task の依存を解除しても意味が無く、
+    黙って card を書き換えると Worker の実行中に前提が変わる。
+    """
+    opts, positional = parse_opts(args, {'--mission': 'value', '--dep': 'value'})
+    if not positional:
+        die("release-dep requires a task_id (e.g. t005)")
+    task_id = positional[0]
+    if not re.fullmatch(r't\d+', task_id):
+        die(f"invalid task_id '{task_id}': expected format tNNN (e.g. t001, t012)")
+
+    def _do():
+        state = load_state()
+        slug = opts.get('--mission') or state.get('default_mission')
+        if not slug:
+            die("no active mission. Pass --mission <slug> or set a default mission.")
+        if not os.path.exists(mission_dir(slug)):
+            die(f"mission '{slug}' not found.")
+
+        meta, body = load_task(slug, task_id)
+        st = meta.get('status')
+        if st != 'pending':
+            die(f"task '{task_id}' is {st}, not pending — release-dep applies only to a "
+                f"pending task held by a failed dependency")
+
+        blocked_by = [d for d in (meta.get('blocked_by') or []) if d]
+        tasks = list_tasks(slug, quiet=True)
+        done_ids = {m['id'] for (m, _) in tasks if m.get('status') in TERMINAL_STATUSES}
+        task_statuses = {m['id']: m.get('status') for (m, _) in tasks}
+
+        if opts.get('--dep') is not None:
+            wanted = [d.strip() for d in opts['--dep'].split(',') if d.strip()]
+            if not wanted:
+                die("--dep is empty. Name the dependency to release (e.g. --dep t003).")
+            stray = [d for d in wanted if d not in blocked_by]
+            if stray:
+                die(f"task '{task_id}' does not depend on {stray} "
+                    f"(blocked_by: {blocked_by}) — nothing released")
+        else:
+            wanted = card_dependencies(meta, done_ids, task_statuses).held
+            if not wanted:
+                die(f"task '{task_id}' has no held dependency — nothing to release "
+                    f"(blocked_by: {blocked_by}). "
+                    f"HELD は failed の依存があるときだけ。plan.sh status で確認")
+
+        released = list(meta.get('released_deps') or [])
+        added = [d for d in wanted if d not in released]
+        meta['released_deps'] = released + added
+        save_task(slug, task_id, meta, body)
+        after = card_dependencies(meta, done_ids, task_statuses)
+        if added:
+            print(f"Released: {slug}/{task_id} — {', '.join(added)} "
+                  f"(released_deps={meta['released_deps']})")
+        else:
+            print(f"Released: {slug}/{task_id} — already released ({', '.join(wanted)})")
+        if after.unmet:
+            print(f"  まだ待つ依存: {after.unmet}")
 
     with_lock(_do)
 
@@ -4329,6 +4486,7 @@ dispatch = {
     'needs-director': cmd_needs_director,
     'fail': cmd_fail,
     'update': cmd_update,
+    'release-dep': cmd_release_dep,
     'retire': cmd_retire,
     'ready-for-verification': cmd_ready_for_verification,
     'verify-result': cmd_verify_result,

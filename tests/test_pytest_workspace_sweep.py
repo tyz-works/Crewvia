@@ -672,13 +672,22 @@ HERDR_STUB = textwrap.dedent('''\
 
 
 def _session(tmp_path, workspaces, panes, process, extra_env=None,
-             test_body="def test_ok():\n    pass\n", herdr_stub=True):
+             test_body="def test_ok():\n    pass\n", herdr_stub=True,
+             cli_timeout=None):
     # herdr_stub: True = 状態を持つ偽 herdr / False = 無し / str = その内容のスクリプト
+    # cli_timeout: コピーした sweep の CLI_TIMEOUT_SECONDS だけを短くする (本物は 5 秒)。
     """conftest と sweep をコピーした小さな tests/ を、偽 herdr を PATH に置いて走らせる。"""
     proj = tmp_path / "proj"
     proj.mkdir()
     for name in ("conftest.py", "pytest_workspace_sweep.py"):
         (proj / name).write_text((TESTS_DIR / name).read_text())
+    if cli_timeout is not None:
+        copied = proj / "pytest_workspace_sweep.py"
+        text = copied.read_text()
+        short = text.replace(f"CLI_TIMEOUT_SECONDS = {sweep.CLI_TIMEOUT_SECONDS}\n",
+                             f"CLI_TIMEOUT_SECONDS = {cli_timeout}\n", 1)
+        assert short != text, "CLI_TIMEOUT_SECONDS の定義が見つからず短縮できない"
+        copied.write_text(short)
     (tmp_path / "scripts").symlink_to(TESTS_DIR.parent / "scripts")   # lib_mux の置き場
     (proj / "test_inner.py").write_text(test_body)
 
@@ -767,13 +776,53 @@ def test_the_kill_switch_stops_the_sweep_in_a_real_session_but_not_the_own_clean
 @pytest.mark.parametrize("herdr_script", [
     "#!/bin/sh\nexit 1\n",                       # CLI エラー
     "#!/bin/sh\necho 'not json'\nexit 0\n",     # 読めない答え
-    "#!/bin/sh\nexec sleep 60\n",                # 応答しない (timeout)
 ])
 def test_cleanup_failure_never_changes_the_exit_code(
         tmp_path, body, expected_rc, herdr_script, monkeypatch):
     """herdr が壊れていても、pytest の終了コードはテスト結果のまま。"""
     r, _, _ = _session(tmp_path, {}, {}, {}, test_body=body, herdr_stub=herdr_script)
     assert r.returncode == expected_rc, r.stdout + r.stderr
+
+
+HUNG_HERDR = """#!{python}
+import os, sys, time
+with open(os.path.join(os.environ["STUB_ROOT"], "hung.log"), "a") as f:
+    f.write("%d %r\\n" % (os.getpid(), time.time()))
+time.sleep(60)
+"""
+
+
+@pytest.mark.parametrize("body,expected_rc", [
+    ("def test_ok():\n    pass\n", 0),
+    ("def test_bad():\n    assert False\n", 1),
+])
+def test_a_hung_herdr_is_cut_by_the_timeout_and_never_changes_the_exit_code(
+        tmp_path, body, expected_rc):
+    """応答しない herdr は timeout で切られ、pytest の終了コードはテスト結果のまま。
+
+    「exit code が変わらない」だけでは CLI エラーでも緑になる (PATH に sleep が無くて
+    即死するスタブでも通っていた)。だから**timeout を実際に通ったこと**を別に示す:
+    スタブは眠る前に自分の pid と時刻を残し、pytest がそれから CLI_TIMEOUT 以上待って
+    (= 即死していない) 60 秒より前に終わり (= 眠り切っていない)、スタブが殺されている。
+    """
+    timeout = 2
+    r, _, _ = _session(
+        tmp_path, {}, {}, {}, test_body=body, cli_timeout=timeout,
+        herdr_stub=HUNG_HERDR.format(python=sys.executable))
+    finished = time.time()
+    assert r.returncode == expected_rc, r.stdout + r.stderr
+
+    log_file = tmp_path / "stub" / "hung.log"
+    assert log_file.exists(), "偽 herdr が眠り始めた記録が無い (起動できずに即死している)"
+    log = log_file.read_text().splitlines()
+    assert len(log) == 1, f"偽 herdr が 1 回だけ呼ばれて眠り始めたはず: {log}"
+    pid, started = log[0].split(" ", 1)
+    waited = finished - float(started)
+    assert timeout <= waited < 60, \
+        f"timeout ({timeout}s) を通ったなら待ちは {timeout}s 以上 60s 未満: {waited:.1f}s"
+    assert sweep.pid_state(int(pid)) == sweep.PID_DEAD, \
+        "timeout で偽 herdr が殺されているはず"
+    assert "宛先の一覧を読めなかった" in r.stderr, "timeout は警告 1 行になる"
 
 
 def test_no_herdr_at_all_does_not_change_the_exit_code(tmp_path):

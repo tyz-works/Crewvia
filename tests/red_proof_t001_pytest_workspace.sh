@@ -20,6 +20,9 @@
 #   case M   — 残り時間で頭打ちにせず subprocess を走らせる (締切が届かない) → 赤
 #   case N   — backend ごとに時間予算が戻る (herdr と tmux で 2 倍)      → 赤
 #   case O   — 実 subprocess に timeout を渡さない                      → 赤
+#   case P   — timeout の統合テストのスタブが PATH に無い sleep を呼ぶ    → 赤
+#              (`exec sleep 60` が not found で即死し、CLI エラーと同じ形で緑になっていた。
+#               「timeout を通った」assert (待ち時間・スタブの pid) で赤になる)
 #
 # 隔離 (2 重):
 #   1. 使い捨ての複製で欠陥を注入する。本番の worktree のファイルには触らない。
@@ -238,6 +241,13 @@ inject $SWEEP \
 '    r = subprocess.run(argv, capture_output=True, text=True,
                        timeout=CLI_TIMEOUT_SECONDS)'
 expect_red "_subprocess_run が残り時間を捨てる"
+
+echo "== case P: timeout のスタブが PATH に無い sleep を呼ぶ (即死して timeout を通らない)"
+fresh_copy
+inject tests/test_pytest_workspace_sweep.py \
+'herdr_stub=HUNG_HERDR.format(python=sys.executable))' \
+'herdr_stub="#!/bin/sh\nexec sleep 60\n")'
+expect_red "スタブが即死しても exit code だけでは緑 → timeout を通った assert で赤"
 
 echo "== isolation: 実行後 (本物の tmux は変わらず、スタブにだけ届いた)"
 TMUX_AFTER="$(real_tmux_snapshot)"

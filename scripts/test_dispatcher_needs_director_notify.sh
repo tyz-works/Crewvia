@@ -11,7 +11,8 @@
 #      ミッション単位の再スキャンを増やしていない
 #   3. メッセージ構築ロジック (reason 1 行目 + 全文パス + reset コマンド) の単体検証
 #   4. reason が空でも '(理由未記載)' でメッセージが壊れない
-#   5. TTL dedup: 初回は通知、TTL 内は抑制、異なる task_id は独立
+#   5. dedup: 初回は通知、TTL 内は抑制、異なる task_id は独立。t010 以降は TTL が過ぎても
+#      状態 (status + reason) が同じなら再送せず、reason が変わったときだけ再通知する
 #   6. failed / pending など他ステータスの task は対象にならない
 #   7. (t030) 通知本文が案内する復旧コマンドを実際に plan.sh update へ渡して実行し、
 #      task が dispatch 可能な状態 (status=pending, worker=null) になることを assert
@@ -456,26 +457,44 @@ else
   fail "TTL dedup: TTL 内に同一通知が繰り返された: $C2_T020"
 fi
 
-# TTL 経過をシミュレート: notify_cache の t020 key を TTL+1 秒前に書き換える
+# TTL 経過をシミュレート: notify_cache の throttle 記録をすべて TTL+1 秒前に書き換える
+# (t010 / #10: throttle key は "<notify_key>#<fingerprint>"。前方一致で拾う)
 python3 - "$T5_NOTIFY_CACHE" "$T5_SLUG" <<'PYEOF'
 import sys, json, time
 cache_file, slug = sys.argv[1], sys.argv[2]
 c = json.loads(open(cache_file).read())
 key = f"needs_director_{slug}_t020"
-assert key in c, f"expected key {key} not recorded after cycle 1: {list(c)}"
-c[key] = time.time() - 301
+assert any(k.startswith(key) for k in c), f"expected a key starting with {key} after cycle 1: {list(c)}"
+for k in list(c):
+    c[k] = time.time() - 301
 open(cache_file, 'w').write(json.dumps(c))
 PYEOF
 
-# Cycle 3: TTL 経過後 → t020 は再送、t021 はまだ TTL 内なので抑制されたまま
+# Cycle 3 (t010 / #10): TTL が過ぎても、状態が変わっていなければ再送しない。
+# 旧仕様 (t027) は「TTL 経過後は再送される」だったが、それが対処済みの task の通知を
+# 5 分ごとに永久に送り続け、ユーザーがデーモンを手で止める事故になった。
 T5_CAP3="$TMPDIR_TEST/capture-5-3.json"
 run_dispatcher_cycle "$T5_QUEUE" "$T5_REPO/registry" "$T5_NOTIFY_CACHE" "$T5_CAP3"
 C3_T020=$(captured_messages_for "$T5_CAP3" t020)
 C3_T021=$(captured_messages_for "$T5_CAP3" t021)
-if [[ -n "$C3_T020" && -z "$C3_T021" ]]; then
-  pass "TTL dedup: TTL 経過後は再送され (t020)、TTL 内の別 task (t021) は抑制されたまま"
+if [[ -z "$C3_T020" && -z "$C3_T021" ]]; then
+  pass "TTL dedup (t010): TTL 経過後も、状態が同じなら再送されない (両 task)"
 else
-  fail "TTL dedup: TTL 経過後の再送に問題 (t020 present=$([[ -n $C3_T020 ]] && echo y || echo n), t021 present=$([[ -n $C3_T021 ]] && echo y || echo n))"
+  fail "TTL dedup (t010): TTL 経過後に同じ状態の通知が再送された (t020 present=$([[ -n $C3_T020 ]] && echo y || echo n), t021 present=$([[ -n $C3_T021 ]] && echo y || echo n))"
+fi
+
+# Cycle 4: t020 の reason (= 通知内容を決める入力) が変わったら、スロットルが
+# 残っていても再通知される。t021 は変わっていないので黙っている。
+printf -- '---\nid: t020\ntitle: stuck-a\nskills: [bash]\npriority: high\nstatus: needs_director\nblocked_by: []\nneeds_director_reason: "stuck a, now for a different reason"\n---\n\n## Description\nx\n' \
+  > "$T5_TASKS/t020.md"
+T5_CAP4="$TMPDIR_TEST/capture-5-4.json"
+run_dispatcher_cycle "$T5_QUEUE" "$T5_REPO/registry" "$T5_NOTIFY_CACHE" "$T5_CAP4"
+C4_T020=$(captured_messages_for "$T5_CAP4" t020)
+C4_T021=$(captured_messages_for "$T5_CAP4" t021)
+if [[ "$C4_T020" == *"now for a different reason"* && -z "$C4_T021" ]]; then
+  pass "TTL dedup (t010): reason が変わった task (t020) だけが再通知され、変わらない task (t021) は黙っている"
+else
+  fail "TTL dedup (t010): 入力が変わったときの再通知に問題 (t020='$C4_T020' t021 present=$([[ -n $C4_T021 ]] && echo y || echo n))"
 fi
 
 # ---------------------------------------------------------------------------

@@ -1298,6 +1298,43 @@ else
   fail "REGRESSION (t010): multibyte diff whose byte count exceeds MAX_DIFF_BYTES (while char count does not) should fail closed WITHOUT invoking codex — rc=$rc log_exists=$([[ -s "$LOG_213" ]] && echo yes || echo no) out=$out"
 fi
 
+echo ""
+echo "--- t010 (#11): サイズ超過の拒否は記録に残る (dispatcher が再 spawn しないための材料) ---"
+# 実行系 (--skip-pull で in_progress の task に対し needs-director まで通す)。
+# 記録は fixture repo の registry/ に書かれる (CREWVIA_REPO_ROOT=$FIXTURE_REPO)。
+REFUSAL_FILE="$FIXTURE_REPO/registry/daemons/review-refusals/${MISSION_SLUG}__t214.json"
+write_task_in_progress t214 "t010 oversized diff leaves a refusal record"
+LOG_214="$TMPDIR_TEST/t214_codex.log"
+out=$(FAKE_GH_HEAD_BRANCH="feature-branch" FAKE_CODEX_FIXTURE="$FIXTURES_DIR/json_empty.txt" FAKE_CODEX_LOG="$LOG_214" \
+  run_kai --pr 5 --task t214 --mission "$MISSION_SLUG" --skip-pull 2>&1) && rc=0 || rc=$?
+if [[ $rc -eq 1 && ! -s "$LOG_214" && "$(task_status t214)" == "needs_director" && -f "$REFUSAL_FILE" ]] \
+   && python3 - "$REFUSAL_FILE" <<'PYEOF'
+import json, sys
+r = json.load(open(sys.argv[1]))
+assert r["pr"] == "5" and r["task"] == "t214", r
+assert r["max_bytes"] == 307200 and r["diff_bytes"] > r["max_bytes"], r
+PYEOF
+then
+  pass "サイズ超過で拒否 → needs_director + 拒否記録 (PR 番号・実バイト数・上限) が書かれる"
+else
+  fail "REGRESSION (t010/#11): oversized diff must leave a refusal record — rc=$rc status=$(task_status t214) record=$([[ -f "$REFUSAL_FILE" ]] && echo yes || echo no) out=$out"
+fi
+if echo "$out" | grep -q "手動差分レビュー"; then
+  pass "needs-director の reason に「手動差分レビュー」への切り替えが含まれる"
+else
+  fail "needs-director reason に手動差分レビューへの案内が無い: $out"
+fi
+
+write_task t215 "t010 dry-run writes no refusal record"
+REFUSAL_FILE_215="$FIXTURE_REPO/registry/daemons/review-refusals/${MISSION_SLUG}__t215.json"
+out=$(FAKE_GH_HEAD_BRANCH="feature-branch" FAKE_CODEX_FIXTURE="$FIXTURES_DIR/json_empty.txt" FAKE_CODEX_LOG="$TMPDIR_TEST/t215_codex.log" \
+  run_kai --pr 5 --task t215 --mission "$MISSION_SLUG" --dry-run 2>&1) && rc=0 || rc=$?
+if [[ $rc -eq 1 && ! -e "$REFUSAL_FILE_215" ]]; then
+  pass "--dry-run は拒否記録を書かない (実 task / registry を変えない約束)"
+else
+  fail "--dry-run が拒否記録を書いた、または想定外の終了: rc=$rc record=$([[ -e "$REFUSAL_FILE_215" ]] && echo yes || echo no)"
+fi
+
 # ---------------------------------------------------------------------------
 echo ""
 echo "================================"

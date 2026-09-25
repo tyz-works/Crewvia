@@ -144,6 +144,9 @@ GUARDED_READS = [
     ("dispatcher.sh", "_mux_created_at", {"read_queue_text"}),
     ("dispatcher.sh", "_spawn_time_fallback", {"read_queue_text"}),
     ("dispatcher.sh", "_load_state_entry", {"read_queue_text"}),
+    # t010: 「伝えた」台帳。壊れた/読めない台帳を空として扱わない (ENOENT だけが「まだ無い」)。
+    ("dispatcher.sh", "load_told", {"read_regular_text_or_unreadable"}),
+    ("lib_review_refusal.py", "load", {"read_regular_text_or_unreadable"}),
 
     # --- verifier-dispatcher.sh ------------------------------------------
     ("verifier-dispatcher.sh", "_read_queue_text",

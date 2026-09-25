@@ -284,6 +284,12 @@ needs-director に倒す:
 negative test として確認している (診断できない diff は codex の応答内容を一切信用しない
 という設計を、fixture レベルでも裏付ける)。
 
+**サイズ超過の拒否は記録に残す (t010 / #11)**: 拒否した task が pending に戻されても dispatcher が
+再 spawn → 再拒否 → needs_director 再送のループに入らないよう、`kai-review.sh` は
+`registry/daemons/review-refusals/<mission>__<task>.json` に PR 番号・実バイト数・上限を書く。dispatcher は
+記録がある間 spawn せず、Director に「手動差分レビューに切り替えよ」を 1 回だけ伝える。
+意図して再試行する経路と戻し方は `knowledge/notify-once.md`。
+
 ### F-B (Seo 指摘): JSON が複数ドキュメント (JSONL) の場合の fail-open
 
 `--output-schema` 移行で JSON 経路が本番の主経路になったことで、Seo が隔離ハーネスで

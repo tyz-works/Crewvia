@@ -311,7 +311,24 @@ fi
 DIFF_BYTES=$(printf '%s' "$DIFF_CONTENT" | wc -c)
 MAX_DIFF_BYTES=$((300 * 1024))  # 300KB
 if [[ $DIFF_BYTES -gt $MAX_DIFF_BYTES ]]; then
-  fail_needs_director "NEEDS FIX: diff is ${DIFF_BYTES} bytes (> ${MAX_DIFF_BYTES}) — too large to trust against silent context truncation (fail-closed, t006 acceptance criterion i)"
+  # t010 (#11): 拒否した「事実」を記録する。同じ PR は何度やっても同じ大きさなので、
+  # 記録が無いと dispatcher が pending に戻された task をまた spawn し、また拒否し、
+  # needs_director を再送し続ける (spawn → 拒否 → needs_director → pending → spawn)。
+  # dispatcher はこの記録がある間は spawn せず、Director に手動差分レビューへの
+  # 切り替えを 1 回だけ伝える。**needs-director より先に書く** — task が
+  # needs_director に見えた時点で記録が既にある、という順序が要る。
+  # 書けなくても拒否自体は止めない (fail-closed のまま)。ループの抑止は台帳
+  # (dispatcher 側の「伝えた」記録) が別に担うので、通知の洪水にはならない。
+  # --dry-run は plan.sh への書き込みを一切しない約束なので、こちらも書かない。
+  if [[ $DRY_RUN -eq 0 && -n "$MISSION_SLUG" ]]; then
+    if ! python3 "${SCRIPT_DIR}/lib_review_refusal.py" record \
+         --registry "${CREWVIA_REPO_ROOT:-$REPO_ROOT}/registry" \
+         --mission "$MISSION_SLUG" --task "$TASK_ID" --pr "$PR_NUM" \
+         --diff-bytes "$DIFF_BYTES" --max-bytes "$MAX_DIFF_BYTES" >/dev/null; then
+      _warn "could not record the size refusal for ${MISSION_SLUG}/${TASK_ID} — dispatcher may respawn this review after a reset"
+    fi
+  fi
+  fail_needs_director "NEEDS FIX: diff is ${DIFF_BYTES} bytes (> ${MAX_DIFF_BYTES}) — too large to trust against silent context truncation (fail-closed, t006 acceptance criterion i). PR#${PR_NUM}: 手動差分レビューに切り替えてください"
 fi
 _info "Diff size: ${DIFF_BYTES} bytes"
 

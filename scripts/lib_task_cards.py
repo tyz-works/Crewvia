@@ -352,6 +352,44 @@ def released_deps_problem(value):
     return None
 
 
+def blocked_deps_problem(value):
+    """card の `blocked_by` が受理できない形なら、その理由を返す (受理なら `None`)。
+
+    受理するのは **空でない文字列の list** と、欄が無い / `null` / `[]` (= 依存なし)
+    だけ。それ以外は理由付きで断る。**依存の宣言は「これが済むまで進めるな」という
+    制約**なので、読み違えて落とすと制約そのものが消える (Codex PR #217 2 巡目 P2):
+
+    * `blocked_by: [null]` / `[false]` / `[0]` / `[""]` を「値の無い要素」として捨てると、
+      **依存を宣言した card が「依存なし」になり、pull も dispatch も開始する**。
+      t025 で足した truthiness フィルタ (`if d`) がこれをやっていた。#9 が潰そうとした
+      「依存が満たされていないのに下流が進む」事故を逆向きから作り直す回帰で、しかも
+      修正前 (`null` が unmet に落ちていた) より悪い。
+    * `blocked_by: false` / `0` / `""` を `or []` で「無い」に潰すのも同じ穴。
+    * mapping / 素の文字列 (`blocked_by: t001` = 反復すると 1 文字ずつ) / `true` / `123`
+      は、消費側の反復が `TypeError` を出す、または意味のない依存名を作る。
+
+    この関数が判定の本体で、`_read_task_card()` (読み取りの隔離) と
+    `plan.sh release-dep` (書き込み前の確認) が同じものを呼ぶ。`lib_dep_rules` は
+    このモジュールを import しない (フォールバック無しの単独モジュール) ので、あちらの
+    2 枚目の網は別に「落とさず unmet に残す」形で持つ。
+
+    **形だけを見る**: 存在しない task ID (dangling) は受理する。dangling は
+    `task_statuses` に無いので unmet に落ちて永久に待つ —— それは既に fail closed で、
+    `plan.sh status` に依存名が出るので直せる。ここで `tNNN` の形まで縛ると、
+    「別の id 体系を使う mission」の card を、黙って待たせるのではなく隔離してしまう。
+    """
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        return (f"blocked_by は task ID の list でなければならない "
+                f"(実際: {type(value).__name__} {value!r})")
+    bad = [v for v in value if not (isinstance(v, str) and v.strip())]
+    if bad:
+        return (f"blocked_by の要素は空でない task ID の文字列でなければならない "
+                f"(不正: {bad!r})")
+    return None
+
+
 def normalize_card(task_id, meta):
     """読めたカードの欄を揃える。識別子は **ファイル名から与えられる**。
 
@@ -741,6 +779,19 @@ def _read_task_card(path, task_id, _warn):
             f'id がファイル名と一致しない (frontmatter: {declared})',
             f'frontmatter id {declared!r} != filename {task_id!r}',
         )
+
+    problem = blocked_deps_problem(meta.get('blocked_by'))
+    if problem:
+        # 依存の宣言を読み違えて落とすと、その card は「依存なし」として進む。
+        # 形の違う card は落とさず、直し方付きで隔離する。隔離は削除ではなく、
+        # `plan.sh update <id> --blocked-by <ids>` (raw の card を書き直す) が出口。
+        _warn(
+            f"{path}: {problem}\n"
+            f"  hint: `blocked_by: [t001, t002]` の形に直す (依存が無いなら `[]`)。"
+            f"`plan.sh update {task_id} --mission <slug> --blocked-by t001,t002` でも直せる。\n"
+            f"  holding it as a [破損] task; other tasks are unaffected."
+        )
+        return isolated_task(task_id, 'blocked_by が不正', problem)
 
     problem = released_deps_problem(meta.get('released_deps'))
     if problem:

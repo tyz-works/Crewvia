@@ -79,6 +79,33 @@ worker.md / 過去の task 記述の「着手したらまず QA の status を�
     として扱う。読み取りの隔離を通らない生の card (release-dep が読むもの) が来ても、落ちず、
     誤って解除もしない。判定の本体は 1 つ (`released_deps_problem`)、2 枚目は型だけを見る
     (`lib_dep_rules` は他を import しない)。
+- **`blocked_by` は「空でない文字列の list」だけ受理し、falsy な要素を絶対に落とさない**
+  (PR #217 Kai 2 巡目 P2 — t025 の修正が作った fail-open 回帰)。受理するのは欄が無い /
+  `null` / `[]` (= 依存なし) と `[t001, t002]`。`[null]` / `[false]` / `[0]` / `[""]` / `["   "]` /
+  `[123]` / `[true]` / mapping / 素の文字列 / bool / int は、card ごと `[破損]` に隔離する
+  (`lib_task_cards.py` の `blocked_deps_problem()` が判定の本体)。
+  **なぜ落としてはいけないか**: 依存の宣言は「これが済むまで進めるな」という**制約**で、読み違えて
+  落とすと制約が消える。t025 が `released_deps` を検証したときに入れた `if d` (truthiness) フィルタが
+  `blocked_by: [null]` を「依存なし」にし、pull も dispatch も開始した。#9 が潰そうとした事故
+  (依存が満たされていないのに下流が進む) を逆向きから作り直し、修正前 (`null` が unmet) より悪かった。
+  `blocked_by: false` / `0` の `or []` も同じ穴 (「無い」に潰す)。
+  - **隔離を選んだ理由** (「falsy を unmet で保持」だけにしない): 保持だけだと、`[null]` の card は
+    `plan.sh status` に依存名 `None` の待ちとして出て、原因が読めない。隔離なら `[破損]` と理由・
+    直し方が出る。**2 枚目の網も持つ** (下)。
+  - **隔離は出口を塞がない**: `plan.sh update <id> --mission <slug> --blocked-by t001,t002`
+    (`--blocked-by ""` で依存なし) は raw の card を書き直すので、隔離された card にも効く。
+    `release-dep` は、何の依存を解除するのか読めない card では**断る** (`released_deps` と違い、
+    不正な値を捨てて書き直さない — `blocked_by` は宣言そのもので、捨てると制約が消える)。
+  - **2 枚目の網**: `lib_dep_rules.declared_dependencies()` は、要素を**1 つも落とさず**、空でない
+    文字列でないものを `<不正な依存: 値>` という依存名にして unmet に残す。list でない値は丸ごと
+    `<不正な blocked_by: 値>` 1 件にする。反復で `TypeError` も、文字列の 1 文字ずつ分割も起きない。
+    `card_dependencies()` / `unmet_dependencies()` / task-graph / release-dep がこれを通る。
+  - **形だけを見る**: 存在しない task ID (dangling) は受理する (unmet で永久に待つ = 既に fail closed)。
+    `tNNN` の形まで縛ると、別の id 体系の card を黙って待たせず隔離してしまう。
+  - 検証: `tests/test_malformed_blocked_by.py` が 17 種の不正値 × 5 者 (自動 pull / `pull --task` /
+    task-graph / status / 実 dispatcher 1 サイクル) で「開始されない」ことと、健全な形の対照
+    (進める / 待つ) を固定する。消費側に `if d` 型のフィルタが戻らないことは構造テスト
+    (`test_no_consumer_drops_falsy_dependencies`) が固定する。欠陥注入は `tests/red_proof_t025.sh` の P3。
 - **打ち間違いが解除に見えない**: `blocked_by` に無い依存の名指し、pending でない task、
   保留が無い task への引数なし実行は、どれも 1 バイトも書かずに拒否する。
 
@@ -121,8 +148,8 @@ dispatcher の restart が必要** (restart は Director が行う。`lib_daemon
 
 watchdog は **`lib_dep_rules.py` は読まない** (`grep lib_dep_rules scripts/watchdog.py` は 0 件) が、
 **`lib_task_cards.py` は読む** (`from lib_task_cards import ...` で `list_task_cards()` を使う)。
-`released_deps` の検証 (P2) は `lib_task_cards.py` にあるので、restart するまで watchdog の目には
-不正な `released_deps` の card も `pending` のまま見える。watchdog は依存を判定せず
+`released_deps` / `blocked_by` の検証 (P2) は `lib_task_cards.py` にあるので、restart するまで
+watchdog の目には不正な `released_deps` / `blocked_by` の card も `pending` のまま見える。watchdog は依存を判定せず
 task の status しか使わないので、**誤動作はしない (= restart は必須ではない)** が、
 `plan.sh status` と watchdog の見え方を揃えるなら両方を一度に restart する
 (既存の運用どおり、害は無い)。`verifier-dispatcher.sh` / `taskvia-sync.sh` も

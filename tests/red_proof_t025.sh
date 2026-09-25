@@ -186,6 +186,64 @@ replace scripts/dispatcher.sh "$GATE_LINE" "        verdict = dependency_gate(sl
         unmet_deps = [d for d in verdict.unmet if d not in verdict.held]" &&
 expect_red "D3/(a) — (b) では見逃す、(a) だけが捕まえる" 'real_dispatch_cycle_sends' "$CYCLE"
 
+# ---- P3 (2 巡目 P2, t029): falsy な blocked_by を落とさない -------------------
+# 欠陥 = t025 が入れた truthiness フィルタ (`if d`) が `blocked_by: [null]` を「依存なし」にする。
+# 修正は 2 層 (読み取りの隔離 / declared_dependencies の 2 枚目の網) なので、層ごとに外す。
+MAL=tests/test_malformed_blocked_by.py
+OLD_FILTER="    if value is None:
+        return []
+    if not isinstance(value, list):
+        return [f'<不正な blocked_by: {value!r}>']
+    return [d if isinstance(d, str) and d.strip() else f'<不正な依存: {d!r}>'
+            for d in value]"
+READER_CHECK="    problem = blocked_deps_problem(meta.get('blocked_by'))
+    if problem:"
+
+section "P3-a: 元の欠陥そのもの (両層を外し、truthiness フィルタに戻す) — 5 者すべてが開始してしまう"
+restore
+replace scripts/lib_dep_rules.py "$OLD_FILTER" "    return [d for d in (value or []) if d]" &&
+replace scripts/lib_task_cards.py "$READER_CHECK" "    problem = None
+    if problem:" &&
+expect_red "P3-a" 'never or second_net or reader_quarantines' "$MAL"
+
+section "P3-b: 2 枚目の網だけ、元の truthiness フィルタに戻す (読み取りの隔離は残る)"
+restore
+replace scripts/lib_dep_rules.py "$OLD_FILTER" "    return [d for d in (value or []) if d]" &&
+expect_red "P3-b" 'second_net or does_not_shrink' "$MAL"
+echo "-- 5 者のテストは、隔離が生きているのでこの注入に対して緑のまま (= 多層防御。2 枚目の網は上のテストが守る)"
+
+section "P3-c: 読み取りの隔離だけ外す (2 枚目の網は残る)"
+restore
+replace scripts/lib_task_cards.py "$READER_CHECK" "    problem = None
+    if problem:" &&
+expect_red "P3-c" 'reader_quarantines or task_graph_never or status_shows or update_blocked_by' "$MAL"
+
+section "P3-d: 検証を「要素の検査だけ外す」形に緩める (list の中の null / 0 / 空文字を通す)"
+restore
+replace scripts/lib_task_cards.py '    if bad:
+        return (f"blocked_by の要素は' '    if False:
+        return (f"blocked_by の要素は' &&
+expect_red "P3-d" 'reader_quarantines' "$MAL"
+
+section "P3-e: 検証を「list でない値」だけ外す (bool / int / mapping / 素の文字列を通す)"
+restore
+replace scripts/lib_task_cards.py '    if not isinstance(value, list):
+        return (f"blocked_by は task ID' '    if not isinstance(value, (list, str, dict, bool, int)):
+        return (f"blocked_by は task ID' &&
+expect_red "P3-e" 'reader_quarantines' "$MAL"
+
+section "P3-f: release-dep が、読み違えた card を断らずに解除する"
+restore
+replace scripts/plan.sh "bb_problem = _TASK_CARDS.blocked_deps_problem(meta.get('blocked_by'))" "bb_problem = None" &&
+expect_red "P3-f" 'release_dep_refuses' "$MAL"
+
+section "P3-g: task-graph の依存の読み取りに truthiness フィルタを戻す (隔離が生きていると挙動では見えない — 構造テストだけが捕まえる)"
+restore
+replace scripts/plan.sh "            blocked_by = declared_dependencies(meta.get('blocked_by'))
+            if raw_status == 'pending':" "            blocked_by = [d for d in (meta.get('blocked_by') or []) if d]
+            if raw_status == 'pending':" &&
+expect_red "P3-g" 'no_consumer_drops' "$MAL"
+
 echo
 echo "================================================================"
 echo "== 結果: 期待どおり赤 ${PASS} 件 / 緑のまま (検出漏れ) ${FAIL} 件"

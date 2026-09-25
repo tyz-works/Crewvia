@@ -53,6 +53,15 @@ def _run_one_cycle(tmp_path, deps, blocked_by, released):
     """`Sandbox` に card を置き、idle Worker 1 人 + フェイク mux で本物の dispatch() を 1 回回す。"""
     sb = Sandbox(tmp_path)
     _build(sb, deps, blocked_by, released)
+    return run_dispatch_cycle(sb)
+
+
+def run_dispatch_cycle(sb):
+    """card を置き終えた `Sandbox` で、本物の dispatch() を 1 回回す (`(mux, log)` を返す)。
+
+    card の置き方が `_build()` に収まらないテスト (`blocked_by` の生の YAML を渡すなど、
+    `tests/test_malformed_blocked_by.py`) が、同じハーネスを共有するために切り出してある。
+    """
     root = sb.root
     (root / "queue" / "assignments").mkdir(exist_ok=True)
     (root / "registry" / "retirements").mkdir(parents=True, exist_ok=True)

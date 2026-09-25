@@ -790,6 +790,7 @@ DEAD_DEP_STATUSES = _DEP_RULES.DEAD_DEP_STATUSES
 HELD_DEP_STATUSES = _DEP_RULES.HELD_DEP_STATUSES
 unmet_dependencies = _DEP_RULES.unmet_dependencies
 card_dependencies = _DEP_RULES.card_dependencies
+declared_dependencies = _DEP_RULES.declared_dependencies
 
 
 def held_dependency_hint(task_id, held, slug):
@@ -1256,7 +1257,9 @@ def build_task_graph(state):
             if not task_id:
                 continue
             raw_status = meta.get('status')
-            blocked_by = [d for d in (meta.get('blocked_by') or []) if d]
+            # 1 つも落とさない (`if d` で falsy を捨てると `[null]` が「依存なし」になる)。
+            # 形の違う card は読み取りが隔離済みで、ここは 2 枚目の網。
+            blocked_by = declared_dependencies(meta.get('blocked_by'))
             if raw_status == 'pending':
                 # crewvia 側で READY を導出して明示的に書く。plugin の導出に
                 # 委ねると、`failed` の依存を満たされた扱いにする crewvia の
@@ -4289,7 +4292,17 @@ def cmd_release_dep(args):
                   f"捨てて書き直します", file=sys.stderr)
             meta['released_deps'] = []
 
-        blocked_by =[d for d in (meta.get('blocked_by') or []) if d]
+        # `load_task()` は生の card なので、形の違う `blocked_by` (読み取りが `[破損]` に
+        # 隔離する card) もここでは見える。解除は保留を外す権限なので、何の依存を解除
+        # するのか読めない card では断る (`released_deps` と違い、捨てて書き直しはしない:
+        # `blocked_by` は依存の**宣言そのもの**で、捨てると制約が消える)。出口は
+        # `plan.sh update <id> --blocked-by ...`。
+        bb_problem = _TASK_CARDS.blocked_deps_problem(meta.get('blocked_by'))
+        if bb_problem:
+            die(f"task '{task_id}': {bb_problem}. 先に "
+                f"`plan.sh update {task_id} --mission {slug} --blocked-by <ids>` で"
+                f"直すこと — release-dep は依存の宣言を読み違えたまま解除しない")
+        blocked_by = declared_dependencies(meta.get('blocked_by'))
         tasks = list_tasks(slug, quiet=True)
         done_ids = {m['id'] for (m, _) in tasks if m.get('status') in TERMINAL_STATUSES}
         task_statuses = {m['id']: m.get('status') for (m, _) in tasks}

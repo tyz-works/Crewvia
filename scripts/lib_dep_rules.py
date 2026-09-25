@@ -74,7 +74,7 @@ def unmet_dependencies(blocked_by, done_ids, task_statuses, released=()):
     """
     released = set(released or ())
     unmet = []
-    for dep in (blocked_by or []):
+    for dep in declared_dependencies(blocked_by):
         if dep in done_ids:
             continue
         status = task_statuses.get(dep)
@@ -92,6 +92,35 @@ def held_dependencies(blocked_by, done_ids, task_statuses, released=()):
             if task_statuses.get(dep) in HELD_DEP_STATUSES]
 
 
+def declared_dependencies(value):
+    """card の `blocked_by` を、**1 つも落とさずに** 依存名の list にする。
+
+    依存の宣言は「これが済むまで進めるな」という制約なので、読めない要素を捨てると
+    制約が消える (Codex PR #217 2 巡目 P2: `blocked_by: [null]` を `if d` で捨てた結果、
+    pull も dispatch も開始した)。だから **形の違うものは、捨てずに unmet に残す**:
+
+    * 欄が無い / `null` / `[]` だけが「依存なし」。
+    * list の要素が空でない文字列でなければ、その要素を `<不正な依存: 値>` という
+      名前の依存にする。`task_statuses` に無いので必ず unmet (= 永久に待つ) になり、
+      `plan.sh status` にその名前が出る。`[null]` が 0 件になることは無い。
+    * list でない値 (mapping / 素の文字列 / bool / int) は、値まるごとを 1 件の
+      `<不正な blocked_by: 値>` にする。反復して `TypeError` を出したり、文字列を
+      1 文字ずつに割ったりしない。
+
+    読み取り側 (`lib_task_cards.blocked_deps_problem`) が形の違う card を `[破損]` に
+    隔離するので、ふつうここには list of str しか来ない。これは 2 枚目の網で、
+    raw の card を渡す経路 (`plan.sh release-dep` など) と、隔離をすり抜ける将来の
+    経路のためにある。判定の本体はあちら (このモジュールは他を import しないので、
+    ここは型だけを見る)。
+    """
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        return [f'<不正な blocked_by: {value!r}>']
+    return [d if isinstance(d, str) and d.strip() else f'<不正な依存: {d!r}>'
+            for d in value]
+
+
 def card_dependencies(meta, done_ids, task_statuses):
     """card (frontmatter の dict) から `DependencyVerdict` を作る。
 
@@ -100,7 +129,7 @@ def card_dependencies(meta, done_ids, task_statuses):
     渡し忘れる経路ができる —— 渡し忘れは「常に保留」に倒れるので事故にはならないが、
     Director が解除したのに誰も進めない、という見えにくい壊れ方になる。
     """
-    blocked_by = [d for d in (meta.get('blocked_by') or []) if d]
+    blocked_by = meta.get('blocked_by')
     released = meta.get('released_deps')
     if not (isinstance(released, (list, tuple))
             and all(isinstance(d, str) for d in released)):

@@ -92,7 +92,7 @@ class FakeHerdr:
         self.asked = []
         self.live = live
 
-    def __call__(self, pane_id, server):
+    def __call__(self, pane_id, server, timeout=None):
         if tuple(server) != tuple(self.live):
             return None
         self.asked.append(pane_id)
@@ -223,7 +223,7 @@ def test_existence_is_read_in_exactly_one_place(monkeypatch):
 
     def ask(answer, record=None):
         monkeypatch.setattr(lib_mux, "_herdr_pane_get_bound",
-                            lambda pane_id, server: answer)
+                            lambda pane_id, server, timeout=None: answer)
         return b._pane_existence(record if record is not None else _rec("p1"), "L")
     assert ask(NOT_FOUND) == PANE_GONE
     assert ask(SERVER_DOWN) == PANE_UNOBSERVED

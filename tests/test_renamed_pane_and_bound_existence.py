@@ -288,7 +288,7 @@ def test_the_sweep_takes_the_identity_per_record_not_once(checkout, monkeypatch)
         def server_identity(self):
             taken.append(1)
             return ("/s", "g1")
-        def record_existence(self, name, record):
+        def record_existence(self, name, record, timeout=None):
             return PANE_GONE
 
     dropped = lib_mux.reap_stale_pane_records(Counting(), repo_root=checkout,

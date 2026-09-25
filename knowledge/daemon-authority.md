@@ -2066,6 +2066,43 @@ server 再起動 (husk として復元) / retirement 相当の SIGKILL の 3 経
   ロックの前に済ませる)。取れなければ、掃除は消さず、書き手は「記録できなかった」と返す
   (どちらも既存の安全側の分岐)。待ちは有限 (`PANE_RECORD_LOCK_TIMEOUT_SECONDS` = 5 秒)。
   同じ先例は `registry/task-graph` の pending ロックと `retire_assignment` の card 書き換え。
+- **記録を消す判断は、すべて「判定した記録」を渡して消す** (Kai 3巡目 P2-1)。ロックは unlink を
+  直列化するだけで、**古い判断を新しくはできない**。上の掃除は `expect=` にしたが、解決経路
+  (`_resolve_ids`) が素の `_delete_cache(name)` のまま残っていて、「無い」の答えが返る途中で
+  spawn が書いた置き換えの記録を消せた (1 巡目 P1 と同じ構造の 2 か所目)。いまは観測に基づく
+  削除がすべて `_forget_record(name, judged)` (= `drop_pane_record(name, expect=judged)`) を通る。
+  全経路の棚卸し (`drop_pane_record` の呼び出し元。構造テストが表で固定する):
+
+  | 経路 | 消す理由 | 形 |
+  |---|---|---|
+  | `reap_stale_pane_records` | mux が「その id は無い」と答えた | `expect=` (判定した記録) |
+  | `_resolve_ids` | 解決の途中で「無い」と答えが返った | `_forget_record(name, cached)` |
+  | `TmuxBackend.kill` (2 か所) / `HerdrBackend.kill` (2 か所) | pane を壊した | `_forget_record(name, judged)`。kill の判断時点の記録 |
+  | `write_pane_record` (サーバー特定不能の spawn) | 直前の記録は、この spawn が置き換えた pane のもの | **無条件のまま**。古い観測に基づく判断ではなく、spawn 自身がこの名前の持ち主になった事実による |
+
+  `judged` が無い (判断時点で記録が無かった) なら何も消さない — その後にあるのは、判断のあとに書かれた
+  別の spawn の記録である。`_delete_cache` は廃止した (名前だけで消す入口を残さない)。無条件に消せる
+  呼び出しが 1 か所を越えて増えたら、構造テスト (`test_every_path_that_drops_a_record_goes_through_expect`)
+  が落ちる。
+- **掃除には時間予算がある** (Kai 3巡目 P2-2)。sweep は dispatcher の cycle の中で同期に走り
+  (相互監視は 60 秒の heartbeat で見る)、`start.sh` は spawn の前にその完了を待つ。初版は
+  eligible な記録を 1 件ずつ、1 件 5 秒の timeout で全部問い合わせ、全体の上限が無かった。
+  **接続は受けるが返事をしない herdr** だと 5 秒 x 記録数を毎 cycle 待ち (記録は残るので毎 cycle
+  繰り返す)、本番の 13 件で 65 秒 — **掃除のせいで相互監視が dispatcher を「死んだ」と判断して
+  respawn し、Worker の起動も遅れる**。付加機能の失敗が、倒してはいけない側 (dispatch) に倒れて
+  いた。倒す先は「失効記録が数秒長く残る」でなければならない (`registry/task-graph` の publish が
+  待ちを有限にして、待てなければ手を引くのと同じ判断)。両方入れた:
+  - **全体の予算** `STALE_SWEEP_BUDGET_SECONDS` (5 秒)。使い切ったら以降は何も問い合わせない。
+    1 件ごとの問い合わせも「残り」に切り詰める (`min(STALE_SWEEP_QUERY_TIMEOUT_SECONDS, 残り)`)。
+  - **`PANE_UNANSWERED` で打ち切る**。問い合わせたが答えが返らなかった (herdr は `no_answer`、
+    tmux は `TimeoutExpired`) 記録が 1 件でも出たら、その周は止める。残りも同じ理由で同じだけ待つので、
+    予算だけでは「答えは返すが遅い server」しか止められない一方、応答しない server では 1 件目で
+    止めるほうが安い (2 秒 1 回)。予算だけだと、応答しない server で毎 cycle 予算いっぱい使う。
+  記録はどちらでも残り (`UNANSWERED` は UNOBSERVED の一種)、次の周が続きを拾う。上限は
+  「予算 + `server_identity()` 1 回」(問い合わせの前の絞り込みで、自前の allowance 引数を持たない。
+  herdr は接続 3 秒、tmux は 5 秒)。**`start.sh` の `mux_reap_records` も dispatcher も同じ
+  `Mux.reap_stale_records()` -> `reap_stale_pane_records()` なので、同じ上限に従う** (入口の
+  wiring もテストで固定)。
 - **kill の認可とは別経路**: 掃除は `may_destroy_pane()` を呼ばず、逆も呼ばない。掃除が消せるのは
   「消えた pane の記録」だけで、他人の pane を殺す認可には化けない。
 - **書き手は増やさない**: `list()` には混ぜない (watchdog も `list()` を呼ぶ。§3 / F1)。
@@ -2123,7 +2160,11 @@ revert するなら `dispatcher.sh` の `sweep_stale_pane_records()` 呼び出�
 `registry/mux` が変わっていないことも assert する。
 
 回帰テスト: `tests/test_stale_pane_record_sweep.py`、`tests/start-sh-spawn-refusal.bats`。
-欠陥を戻すと赤くなることは `tests/red_proof_t001_stale_records.sh` (26 種 + 既知の限界 1) で実証した。
+欠陥を戻すと赤くなることは `tests/red_proof_t001_stale_records.sh` (35 種 + 既知の限界 1) で実証した。
+3 巡目 (t030) の分は `tests/test_sweep_budget_and_conditional_drop.py`: 「無い」と答えが返る途中の置き換え
+(解決経路・両 backend の kill)、記録を消す全経路の構造テスト、応答しない / 遅い server に対する
+sweep の上限 (偽の clock で時間を進める。実時間に頼らない。dispatcher の埋め込み関数と
+`Mux.reap_stale_records()` を実コードのまま動かす)、本物の unix socket の「応答しない server」。
 2 巡目の分は `tests/test_renamed_pane_and_bound_existence.py` (実プロセスの 2 世代 + 実 unix socket。
 世代の違いは SO_PEERCRED が答える本物) と、隔離 herdr での実機確認 (rename 後の
 capture / pid / send / `kill --force` の到達、sweep 中の server 再起動で記録が残ること)。

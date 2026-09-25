@@ -119,6 +119,8 @@ p = pathlib.Path(sys.argv[1]); s = p.read_text()
 old = """        err = data.get("error")
         if isinstance(err, dict) and err.get("code") == "pane_not_found":
             return PANE_GONE
+        if isinstance(err, dict) and err.get("code") == "no_answer":
+            return PANE_UNANSWERED
         return PANE_UNOBSERVED"""
 assert old in s, "注入点が見つからない"
 p.write_text(s.replace(old, """        return PANE_GONE"""))
@@ -143,7 +145,7 @@ run_case "欠陥 2: 若い記録 / 年齢が読めない記録も掃除する" p
 read -r -d '' INJ_NO_ASK <<'PY'
 import sys, pathlib
 p = pathlib.Path(sys.argv[1]); s = p.read_text()
-old = """        if backend.record_existence(name, record) != PANE_GONE:
+old = """        if seen != PANE_GONE:
             continue"""
 assert old in s, "注入点が見つからない"
 p.write_text(s.replace(old, "        pass"))
@@ -334,7 +336,9 @@ run_case "欠陥 14 (I3): 別の関数が os.unlink で記録を消す" pytest \
 read -r -d '' INJ_I1_SECOND_READER <<'PY'
 import sys, pathlib
 p = pathlib.Path(sys.argv[1]); s = p.read_text()
-old = """    def record_existence(self, name: str, record: dict) -> str:"""
+old = """    def record_existence(self, name: str, record: dict,
+                         timeout: Optional[float] = None) -> str:
+        return self._pane_existence("""
 assert old in s, "注入点が見つからない"
 p.write_text(s.replace(old, """    def _second_reader(self, pane_id):
         return _herdr_run("pane_get", [pane_id], timeout=5)
@@ -350,7 +354,9 @@ run_case "欠陥 15 (I1): 2 つ目のメソッドが pane get を直に読む" p
 read -r -d '' INJ_I2_CONCATENATED <<'PY'
 import sys, pathlib
 p = pathlib.Path(sys.argv[1]); s = p.read_text()
-old = """    def record_existence(self, name: str, record: dict) -> str:"""
+old = """    def record_existence(self, name: str, record: dict,
+                         timeout: Optional[float] = None) -> str:
+        return self._pane_existence("""
 assert old in s, "注入点が見つからない"
 p.write_text(s.replace(old, """    def _second_reader(self, pane_id):
         op = "pane" + "_get"
@@ -417,13 +423,13 @@ import sys, pathlib
 p = pathlib.Path(sys.argv[1]); s = p.read_text()
 old1 = """        server = backend.server_identity()
         if not server or ("""
-old2 = """    dropped: List[str] = []
+old2 = """                                 if budget is None else budget)
     for fname in entries:"""
 assert old1 in s and old2 in s, "注入点が見つからない"
 s = s.replace(old1, """        if server is None:
             server = backend.server_identity() or False
         if not server or (""")
-s = s.replace(old2, """    dropped: List[str] = []
+s = s.replace(old2, """                                 if budget is None else budget)
     server = None
     for fname in entries:""")
 p.write_text(s)
@@ -436,7 +442,8 @@ read -r -d '' INJ_UNBOUND_CLI <<'PY'
 import sys, pathlib
 p = pathlib.Path(sys.argv[1]); s = p.read_text()
 old = """        data = _herdr_pane_get_bound(
-            pane_id, (recorded.get("endpoint"), recorded.get("generation")))"""
+            pane_id, (recorded.get("endpoint"), recorded.get("generation")),
+            timeout=timeout)"""
 assert old in s, "注入点が見つからない"
 p.write_text(s.replace(old, """        data = _herdr_run("pane_get", [pane_id], timeout=5)"""))
 PY
@@ -513,6 +520,136 @@ p.write_text(s.replace(old, """    if False:"""))
 PY
 TEST_FILES="$NEW_TESTS" run_case "欠陥 22: kill の認可が、記録と別の pane (handle 食い違い) を受け入れる" pytest \
     "handle_mismatch" scripts/lib_mux.py "$INJ_GATE_IGNORES_HANDLE"
+
+# ============================================================================
+# PR #215 3 巡目 (t030, 最終): Kai-codex の P2 2 件
+#   欠陥 23 = 判定した記録ではなく「いまの記録」を消す (P2-1)
+#   欠陥 24 = 掃除に時間の上限が無い (P2-2)
+# 対象テストは tests/test_sweep_budget_and_conditional_drop.py。
+# ============================================================================
+T30_TESTS="tests/test_sweep_budget_and_conditional_drop.py"
+
+# --- 欠陥 23a (Kai P2-1): 解決経路が素の drop で消す (= 3 巡目の指摘そのもの) -------------
+read -r -d '' INJ_RESOLVE_UNCONDITIONAL <<'PY'
+import sys, pathlib
+p = pathlib.Path(sys.argv[1]); s = p.read_text()
+old = """                self._forget_record(name, cached)"""
+assert old in s, "注入点が見つからない"
+p.write_text(s.replace(old, """                drop_pane_record(name)"""))
+PY
+TEST_FILES="$T30_TESTS" run_case "欠陥 23a: 解決経路が、判定した記録ではなく いまの記録 を消す (置き換えを消す)" pytest \
+    "replacement_written_while_it_was_asking or every_path_that_drops or use_forget_record" \
+    scripts/lib_mux.py "$INJ_RESOLVE_UNCONDITIONAL"
+
+# --- 欠陥 23b: herdr の kill が、閉じたあとに素の drop で消す ---------------------------
+read -r -d '' INJ_HERDR_KILL_UNCONDITIONAL <<'PY'
+import sys, pathlib
+p = pathlib.Path(sys.argv[1]); s = p.read_text()
+old = """        data = _herdr_run("tab_close", [tab_id], timeout=10)
+        if data is None:
+            return False
+
+        self._forget_record(name, judged)"""
+assert old in s, "注入点が見つからない"
+p.write_text(s.replace(old, """        data = _herdr_run("tab_close", [tab_id], timeout=10)
+        if data is None:
+            return False
+
+        drop_pane_record(name)"""))
+PY
+TEST_FILES="$T30_TESTS" run_case "欠陥 23b: herdr の kill が、閉じたあと素の drop で新しい pane の記録を消す" pytest \
+    "herdr_kill_does_not_drop or every_path_that_drops or use_forget_record" \
+    scripts/lib_mux.py "$INJ_HERDR_KILL_UNCONDITIONAL"
+
+# --- 欠陥 23c: tmux の kill が、殺したあと素の drop で消す -----------------------------
+read -r -d '' INJ_TMUX_KILL_UNCONDITIONAL <<'PY'
+import sys, pathlib
+p = pathlib.Path(sys.argv[1]); s = p.read_text()
+old = """            if r.returncode != 0:
+                return False
+            self._forget_record(name, judged)"""
+assert old in s, "注入点が見つからない"
+p.write_text(s.replace(old, """            if r.returncode != 0:
+                return False
+            drop_pane_record(name)"""))
+PY
+TEST_FILES="$T30_TESTS" run_case "欠陥 23c: tmux の kill が、殺したあと素の drop で新しい window の記録を消す" pytest \
+    "tmux_kill_does_not_drop or every_path_that_drops or use_forget_record" \
+    scripts/lib_mux.py "$INJ_TMUX_KILL_UNCONDITIONAL"
+
+# --- 欠陥 23d: 入口 (_forget_record) が判定した記録を無視する -------------------------------
+read -r -d '' INJ_FORGET_IGNORES_JUDGED <<'PY'
+import sys, pathlib
+p = pathlib.Path(sys.argv[1]); s = p.read_text()
+old = """        if judged is not None:
+            drop_pane_record(name, expect=judged)"""
+assert old in s, "注入点が見つからない"
+p.write_text(s.replace(old, """        if judged is not None:
+            drop_pane_record(name)"""))
+PY
+TEST_FILES="$T30_TESTS" run_case "欠陥 23d: _forget_record が expect= を渡さない (全経路が無条件になる)" pytest \
+    "replacement_written or every_path_that_drops" \
+    scripts/lib_mux.py "$INJ_FORGET_IGNORES_JUDGED"
+
+# --- 欠陥 24a (Kai P2-2): 時間予算が無い ---------------------------------------------------
+read -r -d '' INJ_NO_BUDGET <<'PY'
+import sys, pathlib
+p = pathlib.Path(sys.argv[1]); s = p.read_text()
+old = """    deadline = _sweep_clock() + (STALE_SWEEP_BUDGET_SECONDS
+                                 if budget is None else budget)"""
+assert old in s, "注入点が見つからない"
+p.write_text(s.replace(old, """    deadline = float("inf")"""))
+PY
+TEST_FILES="$T30_TESTS" run_case "欠陥 24a: sweep に全体の時間予算が無い (遅い server で 13 件ぶん待つ)" pytest \
+    "slow_server or several_cycles or inside_the_budget or same_bounded_sweep or budget_stops" \
+    scripts/lib_mux.py "$INJ_NO_BUDGET"
+
+# --- 欠陥 24b (Kai P2-2): 「答えなかった」で打ち切らない -----------------------------------
+read -r -d '' INJ_NO_STOP_ON_SILENCE <<'PY'
+import sys, pathlib
+p = pathlib.Path(sys.argv[1]); s = p.read_text()
+old = """        if seen == PANE_UNANSWERED:"""
+assert old in s, "注入点が見つからない"
+p.write_text(s.replace(old, """        if False:"""))
+PY
+TEST_FILES="$T30_TESTS" run_case "欠陥 24b: 応答しない server でも次の記録を問い合わせ続ける" pytest \
+    "never_answers or stops_answering" \
+    scripts/lib_mux.py "$INJ_NO_STOP_ON_SILENCE"
+
+# --- 欠陥 24c (Kai P2-2): 問い合わせを「残り」に切り詰めない --------------------------------
+read -r -d '' INJ_NO_CLAMP <<'PY'
+import sys, pathlib
+p = pathlib.Path(sys.argv[1]); s = p.read_text()
+old = """            timeout=min(STALE_SWEEP_QUERY_TIMEOUT_SECONDS, remaining))"""
+assert old in s, "注入点が見つからない"
+p.write_text(s.replace(old, """            timeout=STALE_SWEEP_QUERY_TIMEOUT_SECONDS)"""))
+PY
+TEST_FILES="$T30_TESTS" run_case "欠陥 24c: 最後の問い合わせが、残りを越えて待つ" pytest \
+    "slow_server" scripts/lib_mux.py "$INJ_NO_CLAMP"
+
+# --- 欠陥 24d (Kai P2-2): dispatcher / start.sh の入口 (Mux) だけ予算を外す ---------------
+# 掃除本体は予算を持っていても、入口が無効化すれば dispatcher と start.sh は待たされる。
+read -r -d '' INJ_FACADE_NO_BUDGET <<'PY'
+import sys, pathlib
+p = pathlib.Path(sys.argv[1]); s = p.read_text()
+old = """            return reap_stale_pane_records(self._backend)"""
+assert old in s, "注入点が見つからない"
+p.write_text(s.replace(old, """            return reap_stale_pane_records(self._backend, budget=float("inf"))"""))
+PY
+TEST_FILES="$T30_TESTS" run_case "欠陥 24d: dispatcher / start.sh の入口 (Mux) が予算を無効にする" pytest \
+    "dispatcher_cycle_stays_inside or start_sh_waits" \
+    scripts/lib_mux.py "$INJ_FACADE_NO_BUDGET"
+
+# --- 欠陥 24e (Kai P2-2): 本物の socket で、応答しない server を timeout なしで待つ ------------
+read -r -d '' INJ_NO_SOCKET_TIMEOUT <<'PY'
+import sys, pathlib
+p = pathlib.Path(sys.argv[1]); s = p.read_text()
+old = """            sock.settimeout(5 if timeout is None else max(timeout, 0.001))"""
+assert old in s, "注入点が見つからない"
+p.write_text(s.replace(old, """            sock.settimeout(5)"""))
+PY
+TEST_FILES="$T30_TESTS" run_case "欠陥 24e: 束縛付き問い合わせが、渡された timeout を無視する (実 socket)" pytest \
+    "real_silent_server" scripts/lib_mux.py "$INJ_NO_SOCKET_TIMEOUT"
 
 echo
 echo "================================================================"

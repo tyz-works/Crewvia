@@ -370,6 +370,25 @@ class _Backend:
         )
         return True
 
+    def _forget_record(self, name: str, judged: Optional[dict]) -> None:
+        """End `name`'s record **if it is still the one that was judged**.
+
+        Every path that ends a record because of something it observed — the
+        pane it names was destroyed (`kill()`), or was answered "gone"
+        (`_resolve_ids()`) — comes through here, and so does the sweep through
+        the same `drop_pane_record(expect=)`.  The observation was made about
+        `judged`; a `spawn()` that has written a replacement since made a
+        record about a different, live pane, and an unconditional drop would
+        erase the authorisation for it.  The writers' lock serialises the
+        unlink, but it cannot make a stale decision fresh (Kai 3巡目 P2-1 —
+        the second place the 1巡目 P1 was found).
+
+        `judged is None` means there was no record to end: whatever is on disk
+        now was written after the judgement and is not ours to drop.
+        """
+        if judged is not None:
+            drop_pane_record(name, expect=judged)
+
     def _warn_forced_bypass(self, name: str) -> None:
         """Say out loud that the guard was skipped.
 
@@ -407,12 +426,15 @@ class _Backend:
     #: caller must not say "already running" about those (t001).
     last_spawn_refusal: Optional[str] = None
 
-    def record_existence(self, name: str, record: dict) -> str:
+    def record_existence(self, name: str, record: dict,
+                         timeout: Optional[float] = None) -> str:
         """`PANE_EXISTS` / `PANE_GONE` / `PANE_UNOBSERVED` for the pane
         `record` names — asked by the *id in the record*, not by `name`.
 
-        Only a definite "no such pane" may be `PANE_GONE`.  See
-        `reap_stale_pane_records()`.
+        Only a definite "no such pane" may be `PANE_GONE`.  `timeout` is the
+        most this one question may take (the sweep passes what is left of its
+        budget); a mux that used all of it without answering is
+        `PANE_UNANSWERED`.  See `reap_stale_pane_records()`.
         """
         return PANE_UNOBSERVED
 
@@ -1635,10 +1657,43 @@ def drop_pane_record(name: str, *, repo_root=None,
 PANE_EXISTS, PANE_GONE, PANE_UNOBSERVED = "exists", "gone", "unobserved"
 PANE_RENAMED = "renamed"
 
+#: `UNOBSERVED` in the particular way that costs time: the mux was asked and
+#: **did not answer within the allowance** (a server that accepts a connection
+#: and then says nothing).  Every caller reads it as `UNOBSERVED` — the record
+#: stays — but the sweep also stops on it, because the next record would wait
+#: just as long for the same reason (Kai 3巡目 P2-2).
+PANE_UNANSWERED = "unanswered"
+
 #: A record younger than this is never swept.  `spawn()` creates the pane
 #: first and writes the record after, so a sweep that listed the mux in
 #: between would see a pane the record does not yet describe.
 STALE_RECORD_GRACE_SECONDS = 120
+
+#: The whole sweep gets this long, and no longer.  The sweep is housekeeping
+#: that runs **inside the dispatcher's cycle** (which the mutual watch times
+#: against a 60 s heartbeat) and **in front of every `start.sh` launch**, and it
+#: asks the mux about each eligible record in turn.  Without a bound, a server
+#: that accepts connections but stops answering costs (per-query timeout x
+#: number of records) per cycle — 13 records at 5 s is 65 s, past the
+#: heartbeat, so the *sweep* would get the dispatcher respawned and delay every
+#: launch (Kai 3巡目 P2-2).  What is dropped when the budget runs out is
+#: nothing: the records stay and the next cycle picks the rest up.  The failure
+#: direction is "a stale record lives a few seconds longer", not "dispatch
+#: waits" — the same call `registry/task-graph`'s publish makes.
+#:
+#: The bound is the budget plus at most one `server_identity()` call (its own
+#: connect timeout is 3 s for herdr, 5 s for tmux), which is a filter in front
+#: of each query and has no allowance parameter; the queries themselves are
+#: clamped to what is left.
+STALE_SWEEP_BUDGET_SECONDS = 5.0
+
+#: One question to the mux.  A local socket answers in milliseconds, so this is
+#: generous; it is also the most a hung server can cost before the sweep stops.
+STALE_SWEEP_QUERY_TIMEOUT_SECONDS = 2.0
+
+#: The sweep's clock.  A module attribute (not a bare `time.monotonic()`) so a
+#: test can advance time deterministically instead of sleeping.
+_sweep_clock = time.monotonic
 
 
 def _record_belongs_here(record: dict, repo_root=None) -> bool:
@@ -1666,7 +1721,8 @@ def _record_age_seconds(record: dict, now: float) -> Optional[float]:
 
 
 def reap_stale_pane_records(backend: "_Backend", *, repo_root=None,
-                            now: Optional[float] = None) -> List[str]:
+                            now: Optional[float] = None,
+                            budget: Optional[float] = None) -> List[str]:
     """Drop the records whose pane no longer exists; return the names dropped.
 
     The single place that ends a record because its pane is gone (`kill()` ends
@@ -1707,6 +1763,8 @@ def reap_stale_pane_records(backend: "_Backend", *, repo_root=None,
     now = time.time() if now is None else now
     prefix = _pane_prefix()
     dropped: List[str] = []
+    deadline = _sweep_clock() + (STALE_SWEEP_BUDGET_SECONDS
+                                 if budget is None else budget)
     for fname in entries:
         # `<name>.json` only: `.state.json` / `.firstseen` are the
         # dispatcher's own markers with their own sweeps.
@@ -1735,12 +1793,37 @@ def reap_stale_pane_records(backend: "_Backend", *, repo_root=None,
         # connection that carries its question, which is what makes a "gone"
         # trustworthy; a filter that passed and a server that then changed
         # ends up as `PANE_UNOBSERVED`, i.e. the record stays.
+        #
+        # **Time budget** (Kai 3巡目 P2-2): nothing below the cheap local
+        # filters starts once the budget is spent, and each question to the mux
+        # gets at most what is left.  A mux that accepts a connection and then
+        # does not answer (`PANE_UNANSWERED`) also ends the sweep, since every
+        # remaining record would wait for the same reason.  Records are kept in
+        # both cases; the next cycle continues.
+        if deadline - _sweep_clock() <= 0:
+            print(f"[mux] WARNING: the stale-record sweep ran out of its "
+                  f"{STALE_SWEEP_BUDGET_SECONDS if budget is None else budget:g}s "
+                  f"budget at {name!r}; the remaining records are left for the "
+                  f"next cycle", file=sys.stderr)
+            break
         server = backend.server_identity()
         if not server or (
                 str(recorded.get("endpoint") or "") != str(server[0])
                 or str(recorded.get("generation") or "") != str(server[1])):
             continue
-        if backend.record_existence(name, record) != PANE_GONE:
+        remaining = deadline - _sweep_clock()
+        if remaining <= 0:
+            break        # the filter used the last of it; nothing is asked
+        seen = backend.record_existence(
+            name, record,
+            timeout=min(STALE_SWEEP_QUERY_TIMEOUT_SECONDS, remaining))
+        if seen == PANE_UNANSWERED:
+            print(f"[mux] WARNING: the mux did not answer about {name!r} "
+                  f"within {min(STALE_SWEEP_QUERY_TIMEOUT_SECONDS, remaining):g}s"
+                  f"; stopping the stale-record sweep for this cycle (records "
+                  f"are kept)", file=sys.stderr)
+            break
+        if seen != PANE_GONE:
             continue
         # Judge and unlink the same record: a spawn that rewrote it while the
         # mux was being asked — or after, before the unlink — has made a
@@ -2305,6 +2388,9 @@ class TmuxBackend(_Backend):
         """
         self._guard("kill", name)
         target = self._target(name)
+        # The record as it was when this kill was decided; the drop after the
+        # destruction is conditional on it (see `_forget_record()`).
+        judged = read_pane_record(name)
         if allow_foreign:
             self._warn_forced_bypass(name)
         if not allow_foreign and name in DAEMON_PANE_NAMES:
@@ -2347,7 +2433,7 @@ class TmuxBackend(_Backend):
             # one has to go too.  Left behind, it would still be there the next
             # time a window appears under this name — and that window is as
             # likely to be another checkout's as ours.
-            drop_pane_record(name)
+            self._forget_record(name, judged)
             return True
         try:
             r = subprocess.run(
@@ -2356,7 +2442,7 @@ class TmuxBackend(_Backend):
             )
             if r.returncode != 0:
                 return False
-            drop_pane_record(name)
+            self._forget_record(name, judged)
             return True
         except Exception as e:
             self._warn(f"kill {name!r} failed: {e}")
@@ -2447,7 +2533,8 @@ class TmuxBackend(_Backend):
                 f"this spawn goes unrecorded — see the warning below.")
         write_pane_record(name, self.BACKEND_NAME, window_id, server=server)
 
-    def record_existence(self, name: str, record: dict) -> str:
+    def record_existence(self, name: str, record: dict,
+                         timeout: Optional[float] = None) -> str:
         """Does the window id the record names exist on *the server it names*?
 
         One `list-windows -a` answers both halves: each line carries the
@@ -2465,8 +2552,11 @@ class TmuxBackend(_Backend):
         try:
             r = subprocess.run(
                 ["tmux", "list-windows", "-a", "-F", "#{pid} #{window_id}"],
-                capture_output=True, text=True, timeout=5,
+                capture_output=True, text=True,
+                timeout=5 if timeout is None else timeout,
             )
+        except subprocess.TimeoutExpired:
+            return PANE_UNANSWERED       # a tmux that hangs: the sweep stops
         except Exception:
             return PANE_UNOBSERVED
         if r.returncode != 0:
@@ -3029,7 +3119,8 @@ def _herdr_close_tab_bound(tab_id: str, server) -> bool:
         sock.close()
 
 
-def _herdr_pane_get_bound(pane_id: str, server) -> Optional[dict]:
+def _herdr_pane_get_bound(pane_id: str, server,
+                          timeout: Optional[float] = None) -> Optional[dict]:
     """`pane get <pane_id>`, answered by the server `server` names — or None.
 
     The sweep used to ask `server_identity()` once, close that connection, and
@@ -3051,6 +3142,13 @@ def _herdr_pane_get_bound(pane_id: str, server) -> Optional[dict]:
     itself, a request that fails or an answer that is not a JSON object.  An
     `{"error": ...}` body is returned as-is — deciding what it means is
     `HerdrBackend._pane_existence()`'s job, in one place.
+
+    `timeout` (default 5 s) is the most the answer may take.  A server that
+    took the request and then said nothing — the connection was verified, the
+    peer is right, it just does not reply — is reported as the synthetic
+    `{"error": {"code": "no_answer"}}`, which `_pane_existence()` reads as
+    `PANE_UNANSWERED`: not an absence, and a reason for the sweep to stop
+    rather than wait the same time for every other record.
     """
     try:
         endpoint, generation = str(server[0] or ""), str(server[1] or "")
@@ -3078,7 +3176,7 @@ def _herdr_pane_get_bound(pane_id: str, server) -> Optional[dict]:
             "params": {"pane_id": pane_id},
         }).encode() + b"\n"
         try:
-            sock.settimeout(5)
+            sock.settimeout(5 if timeout is None else max(timeout, 0.001))
             sock.sendall(request)
             data = b""
             while b"\n" not in data:
@@ -3087,6 +3185,9 @@ def _herdr_pane_get_bound(pane_id: str, server) -> Optional[dict]:
                     break
                 data += chunk
             response = json.loads(data.split(b"\n")[0].decode())
+        except socket.timeout:
+            return {"error": {"code": "no_answer",
+                              "message": "the server did not answer in time"}}
         except Exception:
             return None
         return response if isinstance(response, dict) else None
@@ -3151,10 +3252,8 @@ class HerdrBackend(_Backend):
     def _read_cache(self, name: str) -> Optional[dict]:
         return read_pane_record(name)
 
-    def _delete_cache(self, name: str) -> None:
-        drop_pane_record(name)
-
-    def _pane_existence(self, record: dict, expected_label: str) -> str:
+    def _pane_existence(self, record: dict, expected_label: str,
+                        timeout: Optional[float] = None) -> str:
         """`PANE_EXISTS` / `PANE_RENAMED` / `PANE_GONE` / `PANE_UNOBSERVED`
         for the pane `record` names.
 
@@ -3191,7 +3290,8 @@ class HerdrBackend(_Backend):
             return PANE_UNOBSERVED
         pane_id = str(record.get("pane_id") or "")
         data = _herdr_pane_get_bound(
-            pane_id, (recorded.get("endpoint"), recorded.get("generation")))
+            pane_id, (recorded.get("endpoint"), recorded.get("generation")),
+            timeout=timeout)
         if not isinstance(data, dict):
             return PANE_UNOBSERVED
         if "result" in data:
@@ -3210,10 +3310,13 @@ class HerdrBackend(_Backend):
         err = data.get("error")
         if isinstance(err, dict) and err.get("code") == "pane_not_found":
             return PANE_GONE
+        if isinstance(err, dict) and err.get("code") == "no_answer":
+            return PANE_UNANSWERED
         return PANE_UNOBSERVED
 
-    def record_existence(self, name: str, record: dict) -> str:
-        return self._pane_existence(record, _pane_name(name))
+    def record_existence(self, name: str, record: dict,
+                         timeout: Optional[float] = None) -> str:
+        return self._pane_existence(record, _pane_name(name), timeout)
 
     def _resolve_pane_id(self, name: str) -> Optional[str]:
         """Resolve pane_id for `name` — see `_resolve_ids()`."""
@@ -3268,7 +3371,10 @@ class HerdrBackend(_Backend):
             if seen == PANE_EXISTS:
                 return cached
             if seen == PANE_GONE:
-                self._delete_cache(name)   # answered: the pane is gone
+                # Answered: the pane is gone.  The answer is about `cached`,
+                # so it ends `cached` — not a replacement that `spawn()` wrote
+                # while the question was in flight (Kai 3巡目 P2-1).
+                self._forget_record(name, cached)
             elif seen == PANE_RENAMED:
                 renamed = cached
         return self._label_lookup(name) or renamed
@@ -3633,6 +3739,9 @@ class HerdrBackend(_Backend):
         `allow_foreign=True` lifts the identity backstop — see TmuxBackend.kill.
         """
         self._guard("kill", name)
+        # The record as it was when this kill was decided; the drop after the
+        # destruction is conditional on it (see `_forget_record()`).
+        judged = read_pane_record(name)
         if allow_foreign:
             self._warn_forced_bypass(name)
         if not allow_foreign and name in DAEMON_PANE_NAMES:
@@ -3661,7 +3770,7 @@ class HerdrBackend(_Backend):
                 return False
             if not _herdr_close_tab_bound(tab_id, server):
                 return False
-            self._delete_cache(name)
+            self._forget_record(name, judged)
             return True
         else:
             ids = self._resolve_ids(name)
@@ -3677,7 +3786,7 @@ class HerdrBackend(_Backend):
         if data is None:
             return False
 
-        self._delete_cache(name)
+        self._forget_record(name, judged)
         return True
 
     def _inspect_pane(self, name: str):

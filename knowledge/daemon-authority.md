@@ -2024,18 +2024,37 @@ server 再起動 (husk として復元) / retirement 相当の SIGKILL の 3 経
   記録を残す。消すと次の kill が恒久拒否になる (`knowledge/empty-vs-unobservable.md`)。
   従来の `_resolve_pane_id()` / `_resolve_ids()` は「error がある = 消えた」と読んでいて、
   **herdr の停止中に呼ばれただけで記録が消えた**。`HerdrBackend._pane_existence()` に集約して直した。
-- **名前ではなく、記録が指す id を問い合わせる。** id が引けて、ラベルが期待と違う pane は
-  **「消えた」ではなく「観測できたが同定できない」(`PANE_UNOBSERVED`) — 記録を残す**
-  (QA F1 / PR #215 の追加コミット)。初版は「別ラベル = 消えた」と読んでいたが、
-  `herdr pane rename` された生存 pane の記録を掃除が消し、記録も名前も pane に届かなくなって
-  kill が `pane not found` で永久に失敗し pane が孤児になった (QA が再現)。「id が別のものに
-  振り直された」のは server の再起動で、それは掃除が先に **server の generation 一致** を要求して
-  見ているので、ラベルは元々その役を担っていなかった。空のラベルも不一致と見ない
-  (tab は作成後にラベルが付く)。tmux は `list-windows -a -F '#{pid} #{window_id}'` の 1 回の
-  問い合わせで、id を発行した世代の一覧であることまで確かめる。
+- **名前ではなく、記録が指す id を、記録の server の世代に束ねて問い合わせる。**
+  - **束縛 (Kai 2巡目 P2-2)**: herdr の `pane.get` は、`SO_PEERCRED` で相手の世代を確かめた
+    **その接続の上に** 流す (`_herdr_pane_get_bound()`。`_herdr_close_tab_bound()` と同じ形)。
+    初版は `server_identity()` を sweep で 1 回取って接続を閉じ、`herdr pane get` (CLI) が
+    別の接続を張っていた。**検証と問い合わせが別の呼び出しなら、別の server でありうる**
+    (§7-11-1、memory `verify-and-destroy-must-share-one-connection`) — herdr が sweep の途中で
+    再起動すると、後継 server は旧 id すべてに `pane_not_found` を返し、契約に反して記録が消えた。
+    いまは記録の endpoint + generation と違う世代には**何も尋ねず** (`None` = 観測できず)、
+    記録は残る。識別子は **記録ごとに取り直す** (全記録で使い回すキャッシュは窓を広げるだけ)。
+    「無い」の判定は `_pane_existence()` 1 か所、束縛付きの `pane.get` を送るのは
+    `_herdr_pane_get_bound()` 1 か所 (構造テストが数える)。
+  - **rename (QA F1 → Kai 2巡目 P2-1)**: id が引けて、ラベルが期待と違う pane は「消えた」
+    ではない。**同じ server の世代・同じ pane id・記録が持つ tab id が一致すれば `PANE_RENAMED`**
+    (場所で同定する。名前ではない)、tab が違う / 記録に無いなら `PANE_UNOBSERVED`。
+    どちらも記録を残す。初版 (t022) は UNOBSERVED にして記録を残したが、解決経路
+    (`_resolve_ids`) は UNOBSERVED を「label で引き直す」と読み、**rename された pane は label では
+    もう見つからない**ので capture / send / pid / `kill --force` のどれも届かず、孤児化は
+    解決していなかった (記録を残すだけでは足りない)。
+  - **解決の順序**: ① 記録 (server が「その label で居る」と答えたとき) → ② label (live の
+    `pane list`) → ③ 記録 (`PANE_RENAMED` のとき)。**③ は label で何も見つからないときだけ**。
+    label が別の pane を指すなら、従来どおりその pane が答えで、kill の認可は id を記録と突き合わせて
+    **handle の食い違いを拒否する**。名前 → pane の意味は変えない。
+  - **kill の認可は緩めていない**: 記録の id で pane に届くようになっても、別 checkout の記録 /
+    別世代 / handle 食い違いは `pane_record_status()` が拒否する。別世代の記録は、そもそも束縛付きの
+    問い合わせが尋ねないので解決にも使われない。空のラベルは不一致と見ない (tab は作成後に
+    ラベルが付く)。
+  - tmux は `list-windows -a -F '#{pid} #{window_id}'` の 1 回の問い合わせで、id を発行した世代の
+    一覧であることまで確かめる (問い合わせ自身が世代を運ぶので、別の接続の問題が無い)。
 - **迷ったら残す**: 自分の checkout の記録でない / server 束縛が無い / 別の endpoint・世代 /
   120 秒より若い / 年齢が読めない / 判定と削除の間に書き直された / **ラベルが違う** /
-  **書き手を排除するロックが取れない**。
+  **問い合わせの接続が、記録の世代でなかった** / **書き手を排除するロックが取れない**。
 - **比較と削除は書き手と同じロックの一区間** (Kai P1 / PR #215 の追加コミット)。初版は
   「判定した記録を読み直して同じか確かめ、そのあと unlink」を 3 つの別操作で行っていて、
   比較の後・unlink の前に `spawn()` が新しい記録を書くと、**掃除が生きた pane の記録 (=kill の
@@ -2104,7 +2123,10 @@ revert するなら `dispatcher.sh` の `sweep_stale_pane_records()` 呼び出�
 `registry/mux` が変わっていないことも assert する。
 
 回帰テスト: `tests/test_stale_pane_record_sweep.py`、`tests/start-sh-spawn-refusal.bats`。
-欠陥を戻すと赤くなることは `tests/red_proof_t001_stale_records.sh` (16 種 + 既知の限界 1) で実証した。
+欠陥を戻すと赤くなることは `tests/red_proof_t001_stale_records.sh` (26 種 + 既知の限界 1) で実証した。
+2 巡目の分は `tests/test_renamed_pane_and_bound_existence.py` (実プロセスの 2 世代 + 実 unix socket。
+世代の違いは SO_PEERCRED が答える本物) と、隔離 herdr での実機確認 (rename 後の
+capture / pid / send / `kill --force` の到達、sweep 中の server 再起動で記録が残ること)。
 「最終比較の後に spawn が書き直す」窓は実時間では再現できないので、比較の直後に別スレッドで
 `write_pane_record()` を走らせて窓を作る (ロックが無ければ書き手はすぐ書いて掃除に消され、
 あれば掃除が終わるまで待つ)。

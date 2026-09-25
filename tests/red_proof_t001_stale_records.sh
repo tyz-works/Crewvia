@@ -46,7 +46,7 @@ run_pytest() {   # <selector>
         GIT_CONFIG_GLOBAL="${GIT_CONFIG_GLOBAL:-$HOME/.gitconfig}" \
         PYTHONPATH="$USER_SITE" PYTHONDONTWRITEBYTECODE=1 \
         timeout 300 python3 -m pytest -p no:cacheprovider -q \
-        tests/test_stale_pane_record_sweep.py -k "$1" )
+        ${TEST_FILES:-tests/test_stale_pane_record_sweep.py} -k "$1" )
 }
 run_bats() {
     ( cd "$WORK" && env -i HOME="$WORK/home" PATH="$PATH" TERM=xterm \
@@ -273,11 +273,12 @@ run_case "欠陥 10b: ロックが実際には何も排除しない (flock を�
 read -r -d '' INJ_LABEL_MISMATCH_IS_GONE <<'PY'
 import sys, pathlib
 p = pathlib.Path(sys.argv[1]); s = p.read_text()
-old = """            if isinstance(label, str) and label and label != expected_label:
-                return PANE_UNOBSERVED"""
+old = """            recorded_tab = str(record.get("tab_id") or "")
+            if recorded_tab and str(pane.get("tab_id") or "") == recorded_tab:
+                return PANE_RENAMED
+            return PANE_UNOBSERVED"""
 assert old in s, "注入点が見つからない"
-p.write_text(s.replace(old, """            if isinstance(label, str) and label and label != expected_label:
-                return PANE_GONE"""))
+p.write_text(s.replace(old, """            return PANE_GONE"""))
 PY
 run_case "欠陥 11: rename された生存 pane の記録を掃除する / 解決経路が消す" pytest \
     "another_label or renamed_live_pane or existence_is_read" \
@@ -388,6 +389,130 @@ if [ "$(cat "$WORK/.claude/settings.local.json" 2>/dev/null)" = '{"keep": "me"}'
 else
     echo "  NG: 修正版の実行が settings.local.json を変えた"; FAIL=$((FAIL + 1))
 fi
+
+# ============================================================================
+# PR #215 2 巡目 (t027): Kai-codex の P2 2 件
+#   欠陥 17 = 存在確認を記録の世代に束ねない (P2-2) / 欠陥 18 = 記録経由の解決が無い (P2-1)
+# 対象テストは tests/test_renamed_pane_and_bound_existence.py (+ 一部は sweep 側)。
+# ============================================================================
+NEW_TESTS="tests/test_renamed_pane_and_bound_existence.py tests/test_stale_pane_record_sweep.py"
+
+# --- 欠陥 17a (Kai P2-2): 問い合わせを流す接続の世代を、記録の世代と突き合わせない ------
+# 検証と問い合わせが別の呼び出し (= 別の server) でありうる、という元の穴。
+read -r -d '' INJ_NO_GENERATION_CHECK <<'PY'
+import sys, pathlib
+p = pathlib.Path(sys.argv[1]); s = p.read_text()
+old = """        if live_endpoint != endpoint or live_generation != generation:
+            print(f"[mux:herdr] WARNING: not asking whether pane {pane_id!r} \""""
+assert old in s, "注入点が見つからない"
+p.write_text(s.replace(old, """        if False:
+            print(f"[mux:herdr] WARNING: not asking whether pane {pane_id!r} \""""))
+PY
+TEST_FILES="$NEW_TESTS" run_case "欠陥 17a: 問い合わせの接続の世代を記録と突き合わせない (再起動後の「無い」で記録が消える)" pytest \
+    "replaced_server or restart_during_the_sweep" scripts/lib_mux.py "$INJ_NO_GENERATION_CHECK"
+
+# --- 欠陥 17b (Kai P2-2): 識別子を sweep 全体で 1 回だけ取って使い回す ------------------
+read -r -d '' INJ_IDENTITY_CACHED <<'PY'
+import sys, pathlib
+p = pathlib.Path(sys.argv[1]); s = p.read_text()
+old1 = """        server = backend.server_identity()
+        if not server or ("""
+old2 = """    dropped: List[str] = []
+    for fname in entries:"""
+assert old1 in s and old2 in s, "注入点が見つからない"
+s = s.replace(old1, """        if server is None:
+            server = backend.server_identity() or False
+        if not server or (""")
+s = s.replace(old2, """    dropped: List[str] = []
+    server = None
+    for fname in entries:""")
+p.write_text(s)
+PY
+TEST_FILES="$NEW_TESTS" run_case "欠陥 17b: 識別子を全記録で使い回す (窓を広げる)" pytest \
+    "identity_per_record" scripts/lib_mux.py "$INJ_IDENTITY_CACHED"
+
+# --- 欠陥 17c (Kai P2-2): 存在確認が束縛のない CLI (`herdr pane get`) に戻る ---------------
+read -r -d '' INJ_UNBOUND_CLI <<'PY'
+import sys, pathlib
+p = pathlib.Path(sys.argv[1]); s = p.read_text()
+old = """        data = _herdr_pane_get_bound(
+            pane_id, (recorded.get("endpoint"), recorded.get("generation")))"""
+assert old in s, "注入点が見つからない"
+p.write_text(s.replace(old, """        data = _herdr_run("pane_get", [pane_id], timeout=5)"""))
+PY
+run_case "欠陥 17c: 存在確認が、束縛の無い CLI 接続に戻る (構造テスト)" pytest \
+    "pane_get_answers_are_read" scripts/lib_mux.py "$INJ_UNBOUND_CLI"
+
+# --- 欠陥 18a (Kai P2-1): 記録経由の解決が無い (= t022 の状態) --------------------------
+# 記録は残るが、label で見つからない rename 済み pane に誰も届かない。
+read -r -d '' INJ_NO_RECORD_RESOLUTION <<'PY'
+import sys, pathlib
+p = pathlib.Path(sys.argv[1]); s = p.read_text()
+old = """        return self._label_lookup(name) or renamed"""
+assert old in s, "注入点が見つからない"
+p.write_text(s.replace(old, """        return self._label_lookup(name)"""))
+PY
+TEST_FILES="$NEW_TESTS" run_case "欠陥 18a: rename された pane を記録の id で解決しない (capture/send/pid/kill/--force が届かない)" pytest \
+    "reaches or orphaned_by_resolution" scripts/lib_mux.py "$INJ_NO_RECORD_RESOLUTION"
+
+# --- 欠陥 18b (Kai P2-1): rename を「同定できない」に戻す (t022 の PANE_UNOBSERVED) ---------
+read -r -d '' INJ_RENAMED_UNOBSERVED <<'PY'
+import sys, pathlib
+p = pathlib.Path(sys.argv[1]); s = p.read_text()
+old = """            if recorded_tab and str(pane.get("tab_id") or "") == recorded_tab:
+                return PANE_RENAMED"""
+assert old in s, "注入点が見つからない"
+p.write_text(s.replace(old, """            if False:
+                return PANE_RENAMED"""))
+PY
+TEST_FILES="$NEW_TESTS" run_case "欠陥 18b: rename された pane を同定しない (t022 の UNOBSERVED のまま)" pytest \
+    "reaches or renamed or another_label" scripts/lib_mux.py "$INJ_RENAMED_UNOBSERVED"
+
+# --- 欠陥 19 (認可を緩める 1): 記録が label より優先される --------------------------------
+# label が別の pane を指しているのに記録の pane を返すと、名前 → pane の意味が変わる。
+read -r -d '' INJ_RECORD_BEATS_LABEL <<'PY'
+import sys, pathlib
+p = pathlib.Path(sys.argv[1]); s = p.read_text()
+old = """        return self._label_lookup(name) or renamed"""
+assert old in s, "注入点が見つからない"
+p.write_text(s.replace(old, """        return renamed or self._label_lookup(name)"""))
+PY
+TEST_FILES="$NEW_TESTS" run_case "欠陥 19: 記録が label より優先される (別の pane を指す label を無視する)" pytest \
+    "label_that_finds_a_pane or handle_mismatch" scripts/lib_mux.py "$INJ_RECORD_BEATS_LABEL"
+
+# --- 欠陥 20 (認可を緩める 2): tab を確かめずに「同じ pane」とみなす ------------------------
+read -r -d '' INJ_NO_TAB_CHECK <<'PY'
+import sys, pathlib
+p = pathlib.Path(sys.argv[1]); s = p.read_text()
+old = """            if recorded_tab and str(pane.get("tab_id") or "") == recorded_tab:"""
+assert old in s, "注入点が見つからない"
+p.write_text(s.replace(old, """            if True:"""))
+PY
+run_case "欠陥 20: tab を確かめずに label 違いの pane を同じ pane とみなす" pytest \
+    "another_label or exactly_one_place" scripts/lib_mux.py "$INJ_NO_TAB_CHECK"
+
+# --- 欠陥 21 / 22 (認可のゲートそのもの): 「再確認テスト」が空振りでないことの実証 ---------
+# 記録経由で pane に届くようになっても、kill の認可 (`pane_record_status`) が別 checkout の
+# 記録・handle 食い違いを拒否し続けること。ゲートを緩めて、再確認テストが赤になるかを見る。
+read -r -d '' INJ_GATE_IGNORES_CHECKOUT <<'PY'
+import sys, pathlib
+p = pathlib.Path(sys.argv[1]); s = p.read_text()
+old = """        if str(written_by) != mine:"""
+assert old in s, "注入点が見つからない"
+p.write_text(s.replace(old, """        if False:"""))
+PY
+TEST_FILES="$NEW_TESTS" run_case "欠陥 21: kill の認可が、他の checkout が書いた記録を受け入れる" pytest \
+    "another_checkouts_record" scripts/lib_mux.py "$INJ_GATE_IGNORES_CHECKOUT"
+
+read -r -d '' INJ_GATE_IGNORES_HANDLE <<'PY'
+import sys, pathlib
+p = pathlib.Path(sys.argv[1]); s = p.read_text()
+old = """    if str(handle) != recorded:"""
+assert old in s, "注入点が見つからない"
+p.write_text(s.replace(old, """    if False:"""))
+PY
+TEST_FILES="$NEW_TESTS" run_case "欠陥 22: kill の認可が、記録と別の pane (handle 食い違い) を受け入れる" pytest \
+    "handle_mismatch" scripts/lib_mux.py "$INJ_GATE_IGNORES_HANDLE"
 
 echo
 echo "================================================================"

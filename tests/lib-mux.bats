@@ -1340,9 +1340,13 @@ STALE_FAKE
     run python3 "$LIB_MUX_PY" send "Omar-worker" "hello"
     [ "$status" -eq 0 ]
 
-    # pane get must have been called with STALE_ID (cache verification).
-    herdr_log_contains "pane get STALE_ID"
-    # Then pane list for re-resolution.
+    # The record above names no mux server (legacy format), so nothing can say
+    # which server's ids it is about: it is not asked about at all — a
+    # `pane get` over a fresh CLI connection could be answered by a different
+    # server (Kai 2巡目 P2-2).  A record that does name one is asked on a
+    # connection verified to be that generation (tests/test_renamed_pane_and_bound_existence.py).
+    [ "$(herdr_log_count "pane get STALE_ID")" -eq 0 ]
+    # So the pane is found by label: pane list for re-resolution.
     herdr_log_contains "pane list"
     # Finally pane run with the resolved id.
     herdr_log_contains "pane run w1:p1"

@@ -1625,7 +1625,15 @@ def drop_pane_record(name: str, *, repo_root=None,
 
 #: What the mux says about the id a record names.  `UNOBSERVED` is not a shade
 #: of `GONE`: only `GONE` may end a record.
+#:
+#: `RENAMED` is `EXISTS` with a caveat: the server the record names answered
+#: that the id is alive **and in the tab the record names**, under a label that
+#: is not the one we gave it (`herdr pane rename`).  It is identified — by
+#: (server generation, tab id, pane id), not by name — so a caller that cannot
+#: find the pane by label may reach it through the record (QA F1 / Kai 2巡目
+#: P2-1).  For the sweep it is a reason to keep, like every non-`GONE` answer.
 PANE_EXISTS, PANE_GONE, PANE_UNOBSERVED = "exists", "gone", "unobserved"
+PANE_RENAMED = "renamed"
 
 #: A record younger than this is never swept.  `spawn()` creates the pane
 #: first and writes the record after, so a sweep that listed the mux in
@@ -1670,7 +1678,11 @@ def reap_stale_pane_records(backend: "_Backend", *, repo_root=None,
         server being asked now;
       * the record is younger than `STALE_RECORD_GRACE_SECONDS`, or its age
         cannot be read;
-      * the mux does not answer with a definite "no such pane".
+      * the mux does not answer with a definite "no such pane" — and for
+        herdr that answer only counts when it came from **the server the
+        record names, on a connection verified to be that generation**
+        (`record_existence()`).  A herdr that restarted mid-sweep answers
+        `pane_not_found` for every old id; that is not an absence.
 
     `CREWVIA_MUX_RECORD_SWEEP=0` stops it (returns [] without touching the
     mux or the directory) — the switch to reach for if a sweep ever drops a
@@ -1694,7 +1706,6 @@ def reap_stale_pane_records(backend: "_Backend", *, repo_root=None,
         return []
     now = time.time() if now is None else now
     prefix = _pane_prefix()
-    server = None
     dropped: List[str] = []
     for fname in entries:
         # `<name>.json` only: `.state.json` / `.firstseen` are the
@@ -1716,8 +1727,15 @@ def reap_stale_pane_records(backend: "_Backend", *, repo_root=None,
         recorded = record.get("server")
         if not isinstance(recorded, dict):
             continue
-        if server is None:
-            server = backend.server_identity() or False
+        # Per record, **not cached across the sweep**: an identity taken once
+        # and reused for every record widens the window in which the server
+        # can be replaced between "it is the recorded generation" and the
+        # question about the id (Kai 2巡目 P2-2).  This is only a pre-filter —
+        # `record_existence()` verifies the generation again on the very
+        # connection that carries its question, which is what makes a "gone"
+        # trustworthy; a filter that passed and a server that then changed
+        # ends up as `PANE_UNOBSERVED`, i.e. the record stays.
+        server = backend.server_identity()
         if not server or (
                 str(recorded.get("endpoint") or "") != str(server[0])
                 or str(recorded.get("generation") or "") != str(server[1])):
@@ -3011,6 +3029,71 @@ def _herdr_close_tab_bound(tab_id: str, server) -> bool:
         sock.close()
 
 
+def _herdr_pane_get_bound(pane_id: str, server) -> Optional[dict]:
+    """`pane get <pane_id>`, answered by the server `server` names — or None.
+
+    The sweep used to ask `server_identity()` once, close that connection, and
+    then let `herdr pane get` open one of its own per record.  Those are
+    different servers if herdr restarts in between, and a *replacement* server
+    answers `pane_not_found` for every id of the old one — which read as "the
+    pane is gone" and ended records the contract says to keep (Kai 2巡目 P2-2).
+    Verifying first and asking second is the same hole the destruction path
+    closed (`_herdr_close_tab_bound`): a check that travels in a different
+    call from the thing it justifies can be answered by a different server.
+
+    So the peer is named by the kernel (`SO_PEERCRED`) on the connection that
+    carries the request, compared with the (endpoint, generation) the *record*
+    was written against, and the `pane.get` goes out on **that** connection.
+    A server that has been replaced is a different peer and nothing is asked:
+    the answer is None, which every caller reads as "could not observe".
+
+    None also for: no server answering, a server that will not identify
+    itself, a request that fails or an answer that is not a JSON object.  An
+    `{"error": ...}` body is returned as-is — deciding what it means is
+    `HerdrBackend._pane_existence()`'s job, in one place.
+    """
+    try:
+        endpoint, generation = str(server[0] or ""), str(server[1] or "")
+    except (TypeError, IndexError, KeyError):
+        return None
+    if not pane_id or not endpoint or not generation:
+        return None
+    identified = _herdr_connect_identified()
+    if identified is None:
+        return None
+    sock, live_endpoint, live_generation = identified
+    try:
+        if live_endpoint != endpoint or live_generation != generation:
+            print(f"[mux:herdr] WARNING: not asking whether pane {pane_id!r} "
+                  f"exists: the record names {endpoint} (generation "
+                  f"{generation}) and this connection is answered by "
+                  f"{live_endpoint} (generation {live_generation}) — the "
+                  f"server has restarted since, so its answer would be about "
+                  f"a different server's ids and cannot end this record.",
+                  file=sys.stderr)
+            return None
+        request = json.dumps({
+            "id": f"crewvia:pane.get:{pane_id}",
+            "method": "pane.get",
+            "params": {"pane_id": pane_id},
+        }).encode() + b"\n"
+        try:
+            sock.settimeout(5)
+            sock.sendall(request)
+            data = b""
+            while b"\n" not in data:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+            response = json.loads(data.split(b"\n")[0].decode())
+        except Exception:
+            return None
+        return response if isinstance(response, dict) else None
+    finally:
+        sock.close()
+
+
 class HerdrBackend(_Backend):
     """herdr terminal workspace manager backend (Phase 2).
 
@@ -3071,12 +3154,21 @@ class HerdrBackend(_Backend):
     def _delete_cache(self, name: str) -> None:
         drop_pane_record(name)
 
-    def _pane_existence(self, pane_id, expected_label: str) -> str:
-        """`PANE_EXISTS` / `PANE_GONE` / `PANE_UNOBSERVED` for `pane_id`.
+    def _pane_existence(self, record: dict, expected_label: str) -> str:
+        """`PANE_EXISTS` / `PANE_RENAMED` / `PANE_GONE` / `PANE_UNOBSERVED`
+        for the pane `record` names.
 
         **The one place a `pane get` answer is read as "this pane is gone".**
         Everything that ends a record because its pane vanished — the
         resolution paths and the sweep — goes through here.
+
+        **The question is asked of the server the record names, on a
+        connection that server was verified to be answering** (see
+        `_herdr_pane_get_bound()`).  A record without a usable server binding,
+        or a server that is not that generation any more, is
+        `PANE_UNOBSERVED`: the id means nothing to any other server, so its
+        "not found" cannot end the record.  This is what makes an absence
+        answer safe to act on (Kai 2巡目 P2-2).
 
         herdr puts *every* failure in an `{"error": ...}` body, so "there is an
         error" is not "the pane is gone": a server that is down answers
@@ -3084,88 +3176,52 @@ class HerdrBackend(_Backend):
         is what let a herdr outage drop the record that proves this checkout
         made the pane.  Only `pane_not_found` is a definite absence.
 
-        A pane that exists but carries a different, non-empty label is
-        `PANE_UNOBSERVED`, **not** gone (QA F1, PR #215).  The id resolved, so
-        nothing says the pane is absent; what we cannot do is *identify* it as
-        the one the record names — someone may simply have renamed it
-        (`herdr pane rename`).  Calling that "gone" made the sweep drop the
-        record of a live pane, after which neither the record nor the name
-        could reach it: an orphan `kill()` could not close.  "An id that now
-        belongs to somebody else" is a server restart, and the sweep already
-        requires the record's server generation to match the live one, so the
-        label was never the check that mattered there.  An empty label is not
-        a mismatch either — a tab is created before it is renamed.
+        A pane that exists but carries a different, non-empty label is **not
+        gone** (QA F1, PR #215): someone may have renamed it (`herdr pane
+        rename`), and calling that "gone" dropped the record of a live pane.
+        Whether it is *ours* is decided by where it is, not what it is called:
+        the same server generation, the same pane id **and the tab the record
+        names** make it `PANE_RENAMED` — reachable through the record.  When
+        the tab is not the recorded one (or the record has none) nothing
+        identifies it, and it is `PANE_UNOBSERVED`.  An empty label is not a
+        mismatch — a tab is created before it is renamed.
         """
-        if not pane_id:
+        recorded = record.get("server") if isinstance(record, dict) else None
+        if not isinstance(recorded, dict):
             return PANE_UNOBSERVED
-        data = _herdr_run("pane_get", [pane_id], timeout=5)
+        pane_id = str(record.get("pane_id") or "")
+        data = _herdr_pane_get_bound(
+            pane_id, (recorded.get("endpoint"), recorded.get("generation")))
         if not isinstance(data, dict):
             return PANE_UNOBSERVED
         if "result" in data:
-            pane = (data.get("result") or {}).get("pane") \
-                if isinstance(data.get("result"), dict) else None
-            label = pane.get("label") if isinstance(pane, dict) else None
-            if isinstance(label, str) and label and label != expected_label:
+            result = data.get("result")
+            pane = result.get("pane") if isinstance(result, dict) else None
+            if not isinstance(pane, dict):
                 return PANE_UNOBSERVED
-            return PANE_EXISTS
+            label = pane.get("label")
+            if not (isinstance(label, str) and label
+                    and label != expected_label):
+                return PANE_EXISTS
+            recorded_tab = str(record.get("tab_id") or "")
+            if recorded_tab and str(pane.get("tab_id") or "") == recorded_tab:
+                return PANE_RENAMED
+            return PANE_UNOBSERVED
         err = data.get("error")
         if isinstance(err, dict) and err.get("code") == "pane_not_found":
             return PANE_GONE
         return PANE_UNOBSERVED
 
     def record_existence(self, name: str, record: dict) -> str:
-        return self._pane_existence(str(record.get("pane_id") or ""),
-                                    _pane_name(name))
+        return self._pane_existence(record, _pane_name(name))
 
     def _resolve_pane_id(self, name: str) -> Optional[str]:
-        """Resolve pane_id for `name` — cache first, then live pane list.
+        """Resolve pane_id for `name` — see `_resolve_ids()`."""
+        ids = self._resolve_ids(name)
+        return ids.get("pane_id") if ids else None
 
-        If cache exists but herdr says the pane is gone, drops cache and
-        re-resolves via pane list.  Returns None if not found.
-        """
-        cached = self._read_cache(name)
-        if cached:
-            pane_id = cached.get("pane_id")
-            # Verify cache is still live.
-            seen = self._pane_existence(pane_id, _pane_name(name))
-            if seen == PANE_EXISTS:
-                return pane_id
-            if seen == PANE_GONE:
-                # herdr answered, and the answer is that the pane is gone.
-                self._delete_cache(name)
-            # Otherwise we could not *ask*.  The record stays: dropping it on a
-            # timeout would let a transient failure erase the only proof that
-            # this checkout made the pane, and a missing record is a permanent
-            # refusal at `may_destroy_pane()`.  Re-resolving by label below is
-            # safe even so — the label finds *a* pane, and the destruction gate
-            # compares that pane's id against the record rather than its name.
-
-        # Live lookup via pane list.
-        ws_id = self._workspace_id()
-        if ws_id is None:
-            return None
-        data = _herdr_run("pane_list", ["--workspace", ws_id], timeout=10)
-        if data is None:
-            return None
-        panes = data.get("result", {}).get("panes", [])
-        for pane in panes:
-            if pane.get("label") == _pane_name(name):
-                return pane.get("pane_id")
-        return None
-
-    def _resolve_ids(self, name: str) -> Optional[dict]:
-        """Return {tab_id, pane_id} for `name` using cache → live fallback."""
-        cached = self._read_cache(name)
-        if cached:
-            pane_id = cached.get("pane_id")
-            seen = self._pane_existence(pane_id, _pane_name(name))
-            if seen == PANE_EXISTS:
-                return cached
-            if seen == PANE_GONE:
-                self._delete_cache(name)   # answered: the pane is gone
-            # could not ask → keep the record; see _resolve_pane_id()
-
-        # Live lookup.
+    def _label_lookup(self, name: str) -> Optional[dict]:
+        """`{tab_id, pane_id, backend}` of the pane labelled `name`, or None."""
         ws_id = self._workspace_id()
         if ws_id is None:
             return None
@@ -3181,6 +3237,41 @@ class HerdrBackend(_Backend):
                     "backend": "herdr",
                 }
         return None
+
+    def _resolve_ids(self, name: str) -> Optional[dict]:
+        """Return {tab_id, pane_id} for `name`: record → label → record again.
+
+        1. The record, when the server it names says the pane is there under
+           the label we gave it.
+        2. The label — a live `pane list`.  A label held by a *different* pane
+           is answered as that pane; the destruction gate compares its id with
+           the record rather than trusting the name, so this stays refusable.
+        3. The record, when the server it names says the pane is alive **in the
+           tab the record names but under another label** (`PANE_RENAMED`).
+           Only reached when the label finds nothing: a renamed pane is exactly
+           the case the label cannot find, and without this step capture /
+           send / pid — and `kill --force` — could not reach a pane whose
+           record we had (correctly) kept.  Keeping the record alone did not
+           fix the orphan (Kai 2巡目 P2-1).  The record is used because of
+           where the pane is (server generation + tab + pane id, all checked
+           by `_pane_existence()`), never because of what it is called.
+
+        A record whose pane is gone is dropped; one that could not be asked
+        about stays (dropping it on a timeout would erase the only proof that
+        this checkout made the pane, and a missing record is a permanent
+        refusal at `may_destroy_pane()`).
+        """
+        cached = self._read_cache(name)
+        renamed = None
+        if cached:
+            seen = self._pane_existence(cached, _pane_name(name))
+            if seen == PANE_EXISTS:
+                return cached
+            if seen == PANE_GONE:
+                self._delete_cache(name)   # answered: the pane is gone
+            elif seen == PANE_RENAMED:
+                renamed = cached
+        return self._label_lookup(name) or renamed
 
     def _pane_process_state(self, pane_id: str) -> str:
         """`PANE_IDLE` / `PANE_LIVE` / `PANE_UNKNOWN` for `pane_id`.

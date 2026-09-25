@@ -50,7 +50,8 @@ sys.path.insert(0, str(SCRIPTS))
 
 import lib_mux  # noqa: E402
 from lib_mux import (  # noqa: E402
-    PANE_EXISTS, PANE_GONE, PANE_UNOBSERVED, HerdrBackend, TmuxBackend,
+    PANE_EXISTS, PANE_GONE, PANE_RENAMED, PANE_UNOBSERVED, HerdrBackend,
+    TmuxBackend,
 )
 
 SERVER = ("/tmp/fake-herdr.sock", "gen-1")
@@ -80,22 +81,34 @@ def _exists(root, name):
 
 
 class FakeHerdr:
-    """`_herdr_run` の代わり。`pane_get` の答えを name → 応答 で差し替える。"""
+    """`_herdr_pane_get_bound` の代わり。pane_id → 応答 で差し替える。
 
-    def __init__(self, answers):
+    本物と同じく **束縛を守る**: 問い合わせに渡された server が、いま答えている
+    server (`live`) と違うなら、何も尋ねずに None を返す。
+    """
+
+    def __init__(self, answers, live=SERVER):
         self.answers = answers     # pane_id -> dict | None | callable
         self.asked = []
+        self.live = live
 
-    def __call__(self, cmd_key, extra_args, timeout=10):
-        assert cmd_key == "pane_get", f"unexpected herdr call {cmd_key}"
-        pane_id = extra_args[0]
+    def __call__(self, pane_id, server):
+        if tuple(server) != tuple(self.live):
+            return None
         self.asked.append(pane_id)
         ans = self.answers[pane_id]
         return ans() if callable(ans) else ans
 
 
-def _pane(label):
-    return {"result": {"pane": {"label": label, "pane_id": "x"}}}
+def _pane(label, tab="t1"):
+    """`_write()` の記録 (tab_id = "t1") と同じ tab にいる pane の答え。"""
+    return {"result": {"pane": {"label": label, "pane_id": "x", "tab_id": tab}}}
+
+
+def _rec(pane_id="p1", tab="t1", server=SERVER):
+    """`_pane_existence()` に渡す記録 (ディスクの記録と同じ形)。"""
+    return {"pane_id": pane_id, "tab_id": tab, "handle": tab,
+            "server": {"endpoint": server[0], "generation": server[1]}}
 
 
 NOT_FOUND = {"error": {"code": "pane_not_found", "message": "pane p1 not found"}}
@@ -104,10 +117,10 @@ SERVER_DOWN = {"error": {"code": "server_not_running", "message": "no herdr serv
 
 @pytest.fixture
 def herdr(monkeypatch):
-    def install(answers):
-        fake = FakeHerdr(answers)
-        monkeypatch.setattr(lib_mux, "_herdr_run", fake)
-        monkeypatch.setattr(lib_mux, "_herdr_server_identity", lambda: SERVER)
+    def install(answers, live=SERVER):
+        fake = FakeHerdr(answers, live)
+        monkeypatch.setattr(lib_mux, "_herdr_pane_get_bound", fake)
+        monkeypatch.setattr(lib_mux, "_herdr_server_identity", lambda: live)
         return fake
     return install
 
@@ -140,14 +153,19 @@ def test_record_of_a_live_pane_is_kept(checkout, herdr):
 def test_a_live_pane_under_another_label_keeps_its_record(checkout, herdr):
     """label が違っても、id が引けるなら pane は「無い」ではない (QA F1, PR #215)。
 
-    `herdr pane rename` された生存 pane は「観測できたが同定できない」。
-    ここを GONE と読むと、記録が消えて kill が `pane not found` で永久に届かず、
-    pane が孤児として残る。id の付け替わり (server 再起動) は sweep が server の
-    generation 一致を先に要求するので、label 判定は元々そこを担っていない。
+    `herdr pane rename` された生存 pane の記録を GONE と読むと、記録が消えて kill が
+    `pane not found` で永久に届かず、pane が孤児として残る。
+    同じ tab にいる (server の世代・pane id・tab id が記録と一致) なら RENAMED、
+    tab が違う / 記録に tab が無いなら同定できないので UNOBSERVED。どちらも残す。
     """
     _write(checkout, "Ren-worker", pane_id="pA")
     herdr({"pA": _pane(_label("Someone-else"))})
-    assert HerdrBackend()._pane_existence("pA", _label("Ren-worker")) \
+    b = HerdrBackend()
+    assert b._pane_existence(_rec("pA"), _label("Ren-worker")) == PANE_RENAMED
+    other_tab = _pane(_label("Someone-else"), tab="t99")
+    herdr({"pA": other_tab})
+    assert b._pane_existence(_rec("pA"), _label("Ren-worker")) == PANE_UNOBSERVED
+    assert b._pane_existence(_rec("pA", tab=""), _label("Ren-worker")) \
         == PANE_UNOBSERVED
     assert lib_mux.reap_stale_pane_records(HerdrBackend(), repo_root=checkout,
                                            now=FUTURE) == []
@@ -155,13 +173,30 @@ def test_a_live_pane_under_another_label_keeps_its_record(checkout, herdr):
 
 
 def test_a_renamed_live_pane_is_not_orphaned_by_resolution(checkout, herdr):
-    """解決経路 (`_resolve_pane_id`) も、label 不一致で記録を消さない。"""
+    """解決経路も、label 不一致で記録を消さず、記録の id で pane に届く (Kai 2巡目 P2-1)。"""
     _write(checkout, "Ren-worker", pane_id="pA")
     herdr({"pA": _pane(_label("Someone-else"))})
     b = HerdrBackend()
-    b._workspace_id = lambda: None      # label 引きは不可 → 記録の扱いだけを見る
-    assert b._resolve_pane_id("Ren-worker") is None
+    b._label_lookup = lambda name: None      # rename 後は label では見つからない
+    assert b._resolve_pane_id("Ren-worker") == "pA"
+    ids = b._resolve_ids("Ren-worker")
+    assert ids["pane_id"] == "pA" and ids["tab_id"] == "t1"
     assert _exists(checkout, "Ren-worker")
+
+
+def test_a_label_that_finds_a_pane_still_wins_over_a_renamed_record(checkout,
+                                                                    herdr):
+    """名前 → pane の意味は変えない: label が別の pane を指すなら、その pane を返す。
+
+    記録経由は「label で見つからないとき」だけ。kill の認可 (`may_destroy_pane`) は
+    その pane の id を記録と突き合わせて食い違いを拒否する。
+    """
+    _write(checkout, "Ren-worker", pane_id="pA")
+    herdr({"pA": _pane(_label("Someone-else"))})
+    b = HerdrBackend()
+    holder = {"tab_id": "t2", "pane_id": "pB", "backend": "herdr"}
+    b._label_lookup = lambda name: holder
+    assert b._resolve_ids("Ren-worker") == holder
 
 
 @pytest.mark.parametrize("answer", [
@@ -182,22 +217,27 @@ def test_an_answer_that_is_not_a_definite_absence_keeps_the_record(
     assert _exists(checkout, "Ren-worker")
 
 
-def test_existence_is_read_in_exactly_one_place():
+def test_existence_is_read_in_exactly_one_place(monkeypatch):
     """判定の本体は `_pane_existence` だけ。各ケースを直に突く。"""
     b = HerdrBackend()
-    def ask(answer, monkeypatch_target=lib_mux):
-        orig = lib_mux._herdr_run
-        lib_mux._herdr_run = lambda *a, **k: answer
-        try:
-            return b._pane_existence("p1", "L")
-        finally:
-            lib_mux._herdr_run = orig
+
+    def ask(answer, record=None):
+        monkeypatch.setattr(lib_mux, "_herdr_pane_get_bound",
+                            lambda pane_id, server: answer)
+        return b._pane_existence(record if record is not None else _rec("p1"), "L")
     assert ask(NOT_FOUND) == PANE_GONE
     assert ask(SERVER_DOWN) == PANE_UNOBSERVED
     assert ask(None) == PANE_UNOBSERVED
     assert ask(_pane("L")) == PANE_EXISTS
-    assert ask(_pane("other")) == PANE_UNOBSERVED   # 存在する = 「無い」ではない (F1)
-    assert b._pane_existence("", "L") == PANE_UNOBSERVED   # 空 id は「無い」の証拠ではない
+    assert ask(_pane("")) == PANE_EXISTS                 # 空 label は不一致ではない
+    assert ask(_pane("other")) == PANE_RENAMED           # 同じ tab で label だけ違う (F1)
+    assert ask(_pane("other", tab="t9")) == PANE_UNOBSERVED   # 別の tab は同定できない
+    assert ask({"result": {}}) == PANE_UNOBSERVED
+    assert b._pane_existence(_rec(""), "L") == PANE_UNOBSERVED   # 空 id は「無い」の証拠ではない
+    # 束縛の無い記録は、問い合わせる前に UNOBSERVED (差し替えた問い合わせは NOT_FOUND を
+    # 返すので、尋ねていれば GONE になる — UNOBSERVED は「尋ねなかった」ことの証拠)
+    no_server = dict(_rec("p1")); no_server.pop("server")
+    assert ask(NOT_FOUND, no_server) == PANE_UNOBSERVED
 
 
 # ---------------------------------------------------------------------------
@@ -210,7 +250,7 @@ def test_resolution_keeps_the_record_while_the_server_is_down(checkout, herdr,
     _write(checkout, "Ren-worker", pane_id="pA")
     herdr({"pA": SERVER_DOWN})
     b = HerdrBackend()
-    monkeypatch.setattr(b, "_workspace_id", lambda: None)   # live lookup も届かない
+    monkeypatch.setattr(b, "_label_lookup", lambda name: None)   # live lookup も届かない
     assert b._resolve_pane_id("Ren-worker") is None
     assert b._resolve_ids("Ren-worker") is None
     assert _exists(checkout, "Ren-worker"), \
@@ -222,7 +262,7 @@ def test_resolution_still_self_heals_on_a_definite_absence(checkout, herdr,
     _write(checkout, "Ren-worker", pane_id="pA")
     herdr({"pA": NOT_FOUND})
     b = HerdrBackend()
-    monkeypatch.setattr(b, "_workspace_id", lambda: None)
+    monkeypatch.setattr(b, "_label_lookup", lambda name: None)
     assert b._resolve_pane_id("Ren-worker") is None
     assert not _exists(checkout, "Ren-worker")
 
@@ -687,17 +727,35 @@ def test_pane_get_answers_are_read_in_one_place():
     引数・辞書のどこでも)。ただし、`"pane" + "_get"` のような連結や外部から渡された
     名前は静的に見えない — そこは塞げない (上のコメント参照)。
     """
-    readers = set()
-    for fn_name, fn in FUNCS.items():
+    # 「存在」の問い合わせは 2 つの綴りで書ける: CLI 表のキー `"pane_get"` と、束縛された
+    # 接続に流すソケット API の method `"pane.get"`。どちらの定数も数える。
+    spellings = ("pane_get", "pane.get")
+    readers = {s: set() for s in spellings}
+    # `FUNCS` は関数名をキーにした dict で、同名のメソッド (各 backend の `state` など)
+    # が上書きし合う。ここでは全部の関数を見る。
+    every_function = [n for n in ast.walk(LIB_MUX_TREE)
+                      if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+    for fn in every_function:
         for n in ast.walk(fn):
-            if isinstance(n, ast.Constant) and n.value == "pane_get":
-                readers.add(fn_name)
-    assert "_pane_existence" in readers
-    assert readers <= {"_pane_existence", "state"}, \
-        f"pane get を独自に読む関数が増えた: {sorted(readers)}"
+            if isinstance(n, ast.Constant) and n.value in readers:
+                readers[n.value].add(fn.name)
+    # CLI 経由 (束縛なし) の `pane get` は `state()` の agent_status 読みだけ。
+    # 「消えた」の判定に使う `_pane_existence` はもう CLI を通らない (Kai 2巡目 P2-2)。
+    assert readers["pane_get"] == {"state"}, \
+        f"束縛なしの pane get を読む関数が変わった: {sorted(readers['pane_get'])}"
+    # 束縛された `pane.get` を送るのは 1 関数だけ。
+    assert readers["pane.get"] == {"_herdr_pane_get_bound"}, \
+        f"pane.get を独自に送る関数が増えた: {sorted(readers['pane.get'])}"
+    # その関数を呼んでよいのは `_pane_existence` だけ (答えの読み方が 1 か所になる)。
+    callers = {fn.name for fn in every_function
+               for n in ast.walk(fn)
+               if isinstance(n, ast.Name) and n.id == "_herdr_pane_get_bound"
+               and fn.name != "_herdr_pane_get_bound"}
+    assert callers == {"_pane_existence"}, \
+        f"束縛付きの存在問い合わせを、別の関数が読んでいる: {sorted(callers)}"
     for name in DELETE_SCAN_FILES[1:]:      # lib_mux 以外の記録に触れうるコード
         for code in _python_blocks(name):
-            assert "pane_get" not in code, \
+            assert "pane_get" not in code and "pane.get" not in code, \
                 f"{name} が `pane get` を直に読んでいる — 「消えた」の判定は 1 か所に"
 
 

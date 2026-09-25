@@ -181,6 +181,60 @@ def _automated_sources() -> list[pathlib.Path]:
     )
 
 
+#: plan.sh を参照しているファイル。呼び出しの **形** (変数経由か) には依存しない。
+_MENTIONS_PLAN = re.compile(r"plan[._]sh|PLAN_SH|\bplan\b", re.IGNORECASE)
+#: shell: コメントでない行に、単独の語 `fail` (`"$PLAN_SH" fail ...` / `"${PLAN[@]}" 'fail'`)
+_BARE_FAIL_WORD = re.compile(r"""(?:^|[\s"'=(])fail(?=[\s"')]|$)""")
+
+
+def _fail_literal_hits(src: pathlib.Path) -> list[int]:
+    """plan.sh を参照するファイルの中の、サブコマンド位置にありうる `fail` の行番号。
+
+    `_FAIL_CALL` (リテラル `plan.sh fail`) だけでは、デーモンの実際の呼び出し形
+    (`["bash", str(self.plan_sh), "retire", ...]` — plan.sh は変数、サブコマンドは別要素)
+    を検出できない (t005 QA の F1: 注入 M9a/M9b が緑のまま)。ここでは **変数名に依存せず**
+    「plan.sh を参照するファイルに、リスト / タプルの要素・呼び出しの位置引数として単独の
+    `"fail"` がある」(python) / 「コメントでない行に単独の語 `fail` がある」(shell) を拾う。
+
+    検出できない形は knowledge/fail-evidence.md の「ガードが検出できない形」に明記してある
+    (サブコマンド名を連結・変数・設定から組み立てる形。`"fa" + "il"` / `verb=fail; plan.sh $verb`)。
+    """
+    text = src.read_text(errors="replace")
+    if not _MENTIONS_PLAN.search(text):
+        return []
+    hits: set[int] = set()
+    if src.suffix == ".py":
+        try:
+            module = ast.parse(text)
+        except SyntaxError:
+            module = None
+        if module is not None:
+            for node in ast.walk(module):
+                elts = (
+                    node.elts if isinstance(node, (ast.List, ast.Tuple))
+                    else node.args if isinstance(node, ast.Call)
+                    else []
+                )
+                for e in elts:
+                    if isinstance(e, ast.Constant) and e.value == "fail":
+                        hits.add(e.lineno)
+            return sorted(hits)
+    for i, line in enumerate(text.splitlines(), 1):
+        if line.lstrip().startswith("#"):
+            continue
+        if _BARE_FAIL_WORD.search(line):
+            hits.add(i)
+    return sorted(hits)
+
+
+def _automated_fail_callers() -> set[str]:
+    found = set()
+    for src in _automated_sources():
+        if _FAIL_CALL.search(src.read_text(errors="replace")) or _fail_literal_hits(src):
+            found.add(str(src.relative_to(REPO_ROOT)))
+    return found
+
+
 def test_no_automated_caller_invokes_fail_without_a_decision():
     """daemon / hook / script から `plan.sh fail` を呼ぶ経路が増えたら赤くなる。
 
@@ -188,16 +242,42 @@ def test_no_automated_caller_invokes_fail_without_a_decision():
     `plan.sh retire` を、kai-review.sh は `done` / `needs-director` を呼ぶ。
     `fail` を呼ぶのは **エージェント** (worker.md の graceful handoff) だけで、
     どれも head を渡せる。自動経路は 0 件。
+
+    呼び出しの形は問わない: リテラル (`plan.sh fail`) も、変数経由
+    (`["bash", str(self.plan_sh), "fail", ...]` / `"$PLAN_SH" fail ...`) も拾う。
     """
-    found = set()
-    for src in _automated_sources():
-        if _FAIL_CALL.search(src.read_text(errors="replace")):
-            found.add(str(src.relative_to(REPO_ROOT)))
+    found = _automated_fail_callers()
     assert found == AUTOMATED_FAIL_CALLERS, (
         f"`plan.sh fail` を呼ぶ自動経路が増えた/減った: {sorted(found)}。"
         " head を渡せるか、渡せないなら --no-head を外から見える形で使うかを"
         " 決めてから AUTOMATED_FAIL_CALLERS に足すこと"
     )
+
+
+@pytest.mark.parametrize("name,src", [
+    ("python: 変数経由の argv (lib_retirement.py の実際の形)",
+     'plan_sh = self.plan_sh\nargv = ["bash", str(self.plan_sh), "fail", task_id]\n'),
+    ("python: subprocess の位置引数",
+     'import subprocess\nsubprocess.run(["bash", PLAN_SH, "fail", tid])\n'),
+    ("shell: 変数経由", '"$PLAN_SH" fail "$TASK_ID" --head "$h"\n'),
+    ("shell: 配列展開", '"${PLAN_CMD[@]}" fail "$TASK_ID"\n'),
+])
+def test_the_guard_detects_the_forms_the_daemons_actually_use(tmp_path, name, src):
+    """ガード自身の検出力: 変数経由の呼び出し形を注入して拾えること (QA F1)。"""
+    f = tmp_path / ("x.py" if name.startswith("python") else "x.sh")
+    f.write_text(f"# plan.sh を呼ぶ\n{src}")
+    assert _fail_literal_hits(f), f"検出できない形: {name}"
+
+
+@pytest.mark.parametrize("src", [
+    "# plan.sh fail は呼ばない\n\"$PLAN_SH\" retire \"$TASK\"\n",
+    'x = {"status": "fail"}  # plan.sh とは無関係の verdict\n',
+    "r = 'pass' if ok else 'fail'  # plan.sh\n",
+])
+def test_the_guard_does_not_flag_unrelated_fail_words(tmp_path, src):
+    f = tmp_path / "x.py"
+    f.write_text(src)
+    assert not _fail_literal_hits(f)
 
 
 def test_documented_fail_invocations_carry_the_head():
@@ -459,3 +539,76 @@ def test_reset_never_moves_a_file_outside_the_handoff_directory(sb, tmp_path):
     assert r.returncode == 0, r.stderr
     assert outside.read_text() == "keep me"
     assert "handoff_path" not in sb.card()
+
+
+# ---------------------------------------------------------------------------
+# Kai P2 (PR #216): handoff パスの基準 / 退避先の衝突
+# ---------------------------------------------------------------------------
+
+
+def test_a_relative_handoff_path_is_rejected(sb):
+    """Worker の cwd (worktree) 基準の検証と dispatcher (main repo 基準) の読み取りが
+    食い違う。stale-handoff の確認を迂回できてしまうので、相対パスは受け付けない。"""
+    sb.add()
+    before = sb.card()
+    # cwd (work) に、head に触れている「別の」handoff を置く。cwd 基準で検証すると通ってしまう。
+    (sb.work / "registry" / "handoffs" / "Ren").mkdir(parents=True)
+    decoy = sb.work / "registry" / "handoffs" / "Ren" / "t001_HANDOFF.md"
+    decoy.write_text(f"head: {sb.new_head}\n")
+    rel = "registry/handoffs/Ren/t001_HANDOFF.md"
+    for extra in (["--head", sb.new_head], ["--no-head", "git 管理外"]):
+        r = sb.run("fail", "t001", rel, *extra, "--mission", MISSION)
+        assert r.returncode != 0, r.stdout
+        assert "絶対パス" in r.stderr
+        assert sb.card() == before
+
+
+def test_an_absolute_handoff_path_is_persisted_as_validated(sb):
+    sb.add()
+    fresh = sb.handoff(f"head: {sb.new_head}\n")
+    dotted = str(fresh.parent / ".." / "Ren" / fresh.name)   # 正規化されるべき形
+    r = sb.run("fail", "t001", dotted, "--head", sb.new_head, "--mission", MISSION)
+    assert r.returncode == 0, r.stderr
+    assert f"handoff_path: {fresh}\n" in sb.card()
+
+
+def test_reset_resolves_a_relative_handoff_path_like_the_dispatcher(sb):
+    """reset は card の値を動かす。相対値は dispatcher と同じ基準 (repo root) で解く。
+    cwd 基準だと、cwd 側の無関係なファイルを退避し、本物の古い handoff が残る。"""
+    real = sb.handoff(f"head: {sb.old_head}\n")
+    decoy_dir = sb.work / "registry" / "handoffs" / "Ren"
+    decoy_dir.mkdir(parents=True)
+    decoy = decoy_dir / "t001_HANDOFF.md"
+    decoy.write_text("decoy in cwd")
+    sb.add(status="failed", extra="handoff_path: registry/handoffs/Ren/t001_HANDOFF.md\n")
+    r = sb.run("update", "t001", "--reset", "--mission", MISSION)
+    assert r.returncode == 0, r.stderr
+    assert not real.exists(), "repo root 側の本物の古い handoff が残っている"
+    assert decoy.read_text() == "decoy in cwd", "cwd 側の無関係なファイルを動かした"
+    assert len(list(sb.handoffs.glob("t001_HANDOFF.md.stale-*"))) == 1
+
+
+def test_set_aside_never_overwrites_an_earlier_report(sb):
+    """同じ秒内の 2 回目の退避が 1 回目の証拠を消さない (os.rename は宛先を置換する)。
+
+    時計を止められないので、いま/次の秒の退避先名を先に埋めておく: 実行の秒は必ずどちらか。
+    """
+    from datetime import datetime, timedelta, timezone
+    sb.handoffs.mkdir(parents=True, exist_ok=True)
+    now = datetime.now(timezone.utc)
+    earlier = {}
+    for k in range(3):
+        stamp = (now + timedelta(seconds=k)).strftime("%Y%m%dT%H%M%SZ")
+        f = sb.handoffs / f"t001_HANDOFF.md.stale-{stamp}"
+        f.write_text(f"earlier evidence {k}")
+        earlier[f] = f"earlier evidence {k}"
+    cur = sb.handoff(f"head: {sb.old_head}\n")
+    sb.add(status="failed", extra=f"handoff_path: {cur}\n")
+    r = sb.run("update", "t001", "--reset", "--mission", MISSION)
+    assert r.returncode == 0, r.stderr
+    for f, text in earlier.items():
+        assert f.read_text() == text, f"先の退避が上書きされた: {f.name}"
+    assert not cur.exists()
+    stale = list(sb.handoffs.glob("t001_HANDOFF.md.stale-*"))
+    assert len(stale) == 4, [p.name for p in stale]
+    assert any(sb.old_head in p.read_text() for p in stale), "今回の handoff が退避されていない"

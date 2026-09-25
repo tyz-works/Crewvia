@@ -9,6 +9,11 @@
 #   case C   — FAIL の規則が PASS の検証 (QA Gate) を流用する    → 赤 (FAIL 不能 outage の形)
 #   case D   — handoff と head の結び付きを外す (古い再提出)     → 赤
 #   case E   — update --reset が前回の証拠を持ち越す              → 赤
+#   case F   — 相対 handoff パスを受け付ける (Kai P2: 基準の食い違い) → 赤
+#   case G   — reset が相対パスを cwd 基準で解く (dispatcher と不一致) → 赤
+#   case H   — 退避先が衝突したら黙って上書きする (Kai P2)           → 赤
+#   case I   — 変数経由の自動 fail 呼び出しを注入 (QA F1)            → 赤
+#            (旧ガード = リテラル `plan.sh fail` の正規表現は、同じ注入で緑のまま)
 #
 # 隔離: 使い捨ての複製で欠陥を注入する。本番の worktree の plan.sh には触らない。
 # PYTHONDONTWRITEBYTECODE=1 で __pycache__ を作らない (古い .pyc が注入を隠さないように)。
@@ -32,6 +37,18 @@ fresh_copy() {
 # inject <old> <new> — 複製した plan.sh の old を new に置換 (1 か所だけ。無ければ FATAL)
 inject() {
     OLD="$1" NEW="$2" python3 - "$WORK/tree/scripts/plan.sh" <<'PY' || { echo "FATAL: 注入点が見つからない"; exit 2; }
+import os, sys, pathlib
+p = pathlib.Path(sys.argv[1]); s = p.read_text()
+old, new = os.environ["OLD"], os.environ["NEW"]
+if s.count(old) != 1:
+    sys.exit(1)
+p.write_text(s.replace(old, new))
+PY
+}
+
+# inject_in <相対パス> <old> <new> — plan.sh 以外の複製ファイルへの注入
+inject_in() {
+    OLD="$2" NEW="$3" python3 - "$WORK/tree/$1" <<'PY' || { echo "FATAL: 注入点が見つからない ($1)"; exit 2; }
 import os, sys, pathlib
 p = pathlib.Path(sys.argv[1]); s = p.read_text()
 old, new = os.environ["OLD"], os.environ["NEW"]
@@ -90,6 +107,33 @@ echo "== case E: reset が前回の証拠を持ち越す"
 fresh_copy
 inject "            for stale_key in ('handoff_path', 'fail_head', 'fail_head_waiver'):" "            for stale_key in ():"
 expect_red "case E" "test_reset_clears_the_previous_failure_evidence"
+
+echo "== case F: 相対 handoff パスを受け付ける"
+fresh_copy
+inject "    if handoff_path and not os.path.isabs(handoff_path):" "    if False:"
+expect_red "case F" "test_a_relative_handoff_path_is_rejected"
+
+echo "== case G: reset が相対パスを cwd 基準で解く"
+fresh_copy
+inject "real = os.path.realpath(os.path.join(repo_root, handoff_path))" "real = os.path.realpath(handoff_path)"
+expect_red "case G" "test_reset_resolves_a_relative_handoff_path_like_the_dispatcher"
+
+echo "== case H: 退避先の衝突を検出せず上書きする"
+fresh_copy
+inject "target = _reserve_unique_path(f\"{real}.stale-{stamp}\")" "target = f\"{real}.stale-{stamp}\""
+expect_red "case H" "test_set_aside_never_overwrites_an_earlier_report"
+
+echo "== case I: 変数経由の自動 fail 呼び出し (lib_retirement.py の実際の argv 形)"
+fresh_copy
+inject_in scripts/lib_retirement.py 'argv = ["bash", str(self.plan_sh), "retire", task_id,' 'argv = ["bash", str(self.plan_sh), "fail", task_id,'
+expect_red "case I" "test_no_automated_caller_invokes_fail_without_a_decision"
+# 旧ガード (リテラル正規表現) が同じ注入を見逃すことの確認 = この case が F1 の再現になっている証拠
+if python3 - "$WORK/tree/scripts/lib_retirement.py" <<'PY'
+import re, sys
+old = re.compile(r"""(?x)(?: plan(?:\.sh)?["']? \s+ fail\b | ["']plan(?:\.sh)?["'] \s*,\s* ["']fail["'] | \bcmd_fail\b )""")
+sys.exit(0 if not old.search(open(sys.argv[1]).read()) else 1)
+PY
+then ok "case I: 旧ガードの正規表現は同じ注入を検出できない (= F1 の再現)"; else ng "case I: 旧正規表現でも検出できてしまう (注入が F1 を再現していない)"; fi
 
 echo
 echo "Results: $PASS passed, $FAIL failed"

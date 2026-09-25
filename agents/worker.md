@@ -355,6 +355,8 @@ Watchdog がタイムアウトを通知した場合（「タイムアウトの�
 2. `plan.sh fail <task_id> "$HANDOFF_PATH" --head "$(git rev-parse HEAD)"` を実行
    （`--head` は必須。handoff にその head が書かれていないと拒否される — 古い handoff の再提出を防ぐため。
    git 管理外で head が無いときだけ `--no-head "<理由 1 行>"`。記録に残り Director に見える）
+   `$HANDOFF_PATH` は **絶対パス**（`crewvia_handoff_path "$AGENT_NAME" "$TASK_ID"`、§7 Step 2）。
+   相対パスは `plan.sh fail` が拒否する — dispatcher は main repo 基準で読むので、worktree 基準の検証と食い違う
 
 > **優先順位**: 「完璧な HANDOFF.md」より「30 秒以内の終了」を優先する。
 > Watchdog は 60 秒で SIGTERM → 70 秒で SIGKILL を実行する。
@@ -733,6 +735,7 @@ plan fail "$TASK_ID" "$HANDOFF_PATH" --head "$(git rev-parse HEAD)" --mission "$
 `--head`（検証対象の commit SHA）は**必須**。HANDOFF.md に同じ head を書いておくこと（Step 3 の
 `## ブランチ` の隣に `## head` を書く）。別の head 時点の古い handoff を再提出すると拒否される。
 検証対象が git 管理外で head を出せないときだけ `--no-head "<理由 1 行>"`（免除は card に残る）。
+`$HANDOFF_PATH` は Step 2 の絶対パスのまま渡すこと。相対パスは `plan.sh fail` が拒否する（`--no-head` のときも）。
 
 **Step 5**: Director に報告:
 

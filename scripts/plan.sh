@@ -2834,6 +2834,16 @@ def _validate_fail_evidence(meta, report):
                 "古い handoff / 別の head の検証結果を FAIL として再提出できないようにするためです。\n"
                 f"{usage}\n"
                 "  例: plan.sh fail t001 --head \"$(git rev-parse HEAD)\""), {}
+    if handoff_path and not os.path.isabs(handoff_path):
+        # dispatcher.sh は相対パスを **registry の親 (main repo)** 基準で読む。ここ (Worker の
+        # cwd = worktree) 基準で検証すると、別のファイルを検証して通す / 無いファイルを通す
+        # 一方で、dispatcher は main repo の古い handoff を読む — 新設した stale-handoff 確認の
+        # 迂回になる。基準を揃えるより、相対パスを受け付けない (--no-head でも同じ)。
+        return (f"[plan.sh] handoff_path は絶対パスで渡してください (相対パス: {handoff_path})。\n"
+                "dispatcher は相対パスを worktree ではなく main repo 基準で読むため、"
+                "検証したファイルと通知に使われるファイルが食い違います。\n"
+                "  HANDOFF_PATH=\"$(crewvia_handoff_path \"$AGENT_NAME\" \"$TASK_ID\")\"  # scripts/git-helpers.sh"
+                f"\n{usage}"), {}
     if no_head is not None:
         reason = ' '.join(str(no_head).split())
         if not reason:
@@ -3148,10 +3158,13 @@ def cmd_fail(args):
         if err:
             die(err)
 
+        # 検証したのと同一のパスを card に書く (_handoff_names_head は abspath して読む)。
+        # ここに来た時点で絶対パスであることはゲートが保証している。
+        recorded_handoff = os.path.normpath(handoff_path) if handoff_path else None
         meta['status'] = 'failed'
         meta['completed_at'] = now_iso()
-        if handoff_path:
-            meta['handoff_path'] = handoff_path
+        if recorded_handoff:
+            meta['handoff_path'] = recorded_handoff
         for key, val in fields.items():
             if val is None:
                 meta.pop(key, None)     # 前回の FAIL の証拠を持ち越さない
@@ -3165,7 +3178,7 @@ def cmd_fail(args):
         desc, _ = parse_task_body(body)
         new_body = append_trailing_body_section(
             build_task_body(
-                desc, f"FAILED — {evidence} — handoff: {handoff_path or 'none'}"),
+                desc, f"FAILED — {evidence} — handoff: {recorded_handoff or 'none'}"),
             trailing
         )
         save_task(slug, task_id, meta, new_body)
@@ -3192,7 +3205,7 @@ def cmd_fail(args):
         rework = meta.get('rework_count') or 0
         max_rework = meta.get('max_rework') or 3
         if rework >= max_rework:
-            knowledge_info[0] = (task_id, slug, rework, max_rework, handoff_path)
+            knowledge_info[0] = (task_id, slug, rework, max_rework, recorded_handoff)
 
     with_lock(_do)
 
@@ -4164,10 +4177,14 @@ def _set_aside_stale_handoff(handoff_path):
     退避に失敗しても reset は止めない (人間が card を見て打つコマンドなので、
     警告して手で片付けてもらう)。
     """
-    root = os.path.join(os.environ.get('CREWVIA_REPO_ROOT', REPO_ROOT), 'registry', 'handoffs')
+    repo_root = os.environ.get('CREWVIA_REPO_ROOT', REPO_ROOT)
+    root = os.path.join(repo_root, 'registry', 'handoffs')
     try:
         real_root = os.path.realpath(root)
-        real = os.path.realpath(handoff_path)
+        # 相対パスは dispatcher.sh と同じ基準 (registry の親 = repo root) で解く。cwd 基準だと
+        # dispatcher が読むのと別のファイルを退避してしまい、古い handoff がそのまま残る。
+        # (`plan.sh fail` は相対パスを受け付けないので、ここに来るのは古い card / 手書きの値)
+        real = os.path.realpath(os.path.join(repo_root, handoff_path))
         if os.path.commonpath([real_root, real]) != real_root:
             print(f"[plan.sh] handoff は {root} の外にあるため動かしません: {handoff_path}",
                   file=sys.stderr)
@@ -4175,12 +4192,30 @@ def _set_aside_stale_handoff(handoff_path):
         if not os.path.isfile(real):
             return
         stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
-        target = f"{real}.stale-{stamp}"
-        os.rename(real, target)
+        target = _reserve_unique_path(f"{real}.stale-{stamp}")
+        os.replace(real, target)    # 置換されるのは、自分が O_EXCL で確保した空ファイルだけ
         print(f"[plan.sh] 古い handoff を退避しました: {target}")
     except (OSError, ValueError) as e:
         print(f"[plan.sh warn] 古い handoff を退避できませんでした ({handoff_path}): {e}"
               " — 手で片付けてください (同じパスの再提出を防ぐため)", file=sys.stderr)
+
+
+def _reserve_unique_path(base):
+    """`base` (衝突したら `base-1`, `base-2`, ...) を O_EXCL で作り、その名前を返す。
+
+    `os.rename` / `os.replace` は既存の宛先を **黙って置換する**。秒精度のタイムスタンプ
+    だけを名前にすると、同じ秒の 2 回目の退避が 1 回目の証拠を消す。「存在しなければ改名」は
+    check-then-act で同じ穴が残るので、名前の確保そのものを原子的な O_EXCL にする。
+    """
+    for n in range(1000):
+        candidate = base if n == 0 else f"{base}-{n}"
+        try:
+            fd = os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            continue
+        os.close(fd)
+        return candidate
+    raise OSError(f"退避先の名前を確保できませんでした: {base}")
 
 
 # ---------------------------------------------------------------------------

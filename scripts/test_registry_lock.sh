@@ -103,6 +103,11 @@ exclude = {
     # `verifier-dispatcher.sh` の `.read_text()` にしか使っておらず、
     # repo の registry/workers.yaml に書く経路は存在しない。
     root / "tests" / "test_guarded_reads_on_direct_paths.py",
+    # 同上 (t025 の実 dispatch() 1 サイクルのテスト)。`_run_one_cycle()` の root は
+    # `Sandbox(tmp_path)` が作る `tmp_path / "repo"` で、idle Worker 1 人ぶんの
+    # workers.yaml を 1 度だけ書く。書き込みは pytest の使い捨てツリーに閉じ、
+    # repo の registry/workers.yaml に書く経路は存在しない。
+    root / "tests" / "test_dispatcher_cycle_honours_hold.py",
     # 欠陥注入スクリプト。`p.write_text(s)` の p は `git archive HEAD` を
     # mktemp -d に展開した使い捨てツリーの **Python ソースファイル** であって
     # registry ではない。"workers.yaml" は注入するソース文字列と直前の見出し

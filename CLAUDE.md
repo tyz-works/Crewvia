@@ -77,8 +77,46 @@
     plan.sh             タスクプラン管理 CLI（per-task / multi-mission）。queue を書き換える
                         サブコマンドの後、キューロックの外で `registry/task-graph/tasks.json`
                         を再生成する（herdr-task-graph 連携。`CREWVIA_TASK_GRAPH=0` で停止）
+                        **`plan.sh fail` は `--head <sha>`（実在する commit）が必須**（t004）。
+                        `plan.sh done` だけが証拠ゲートを持っていて、FAIL の報告が外にあったので、
+                        QA Worker が前回の handoff（別 head 時点のもの。パスは agent 名 + task id で
+                        固定）を 36 秒で再提出できた。免除は `--no-head "<理由>"` で、card の
+                        `fail_head_waiver` に残る（静かに検証を飛ばす経路にしない）。`handoff_path` は
+                        **絶対パスのみ**（dispatcher は main repo 基準・`plan.sh` は Worker の cwd 基準で
+                        読むので、相対だと検証したファイルと通知に使うファイルが別物になる）。
+                        done と fail は `_gate_terminal_report()` を通る（入口は 1 つ）が、**FAIL の検証で
+                        PASS の証拠要求は流用しない**（required の checkpoint が `failed` の FAIL —
+                        最も正当な FAIL — が報告できなくなる）。停止スイッチは無い。`update` で
+                        FAIL を開き直すと `handoff_path` / `fail_head*` を消して古い handoff を
+                        `.stale-<UTC>` に退避する（削除しない）。設計: `knowledge/fail-evidence.md`
+                        **`release-dep <id> --mission <slug>`**: failed の依存で保留（HELD）された
+                        task を Director が明示的に進める唯一の出口（t007。下の `lib_dep_rules.py`）。
+                        **保留を案内するコマンドは必ず `--mission` 付き**（task ID は mission ごとの
+                        採番で、付けないと別 mission の同 ID に当たる。`held_dependency_hint()` の
+                        `slug` は必須引数）。`resolve-mission <id>` は `pull` と同じ探索順
+                        （`mission_search_order()`）で実効 mission を返す読み取り専用コマンド
     dispatcher.sh       並列モードの常駐割り当てデーモン（idle Worker への自動 assign + codex-review spawn）
                         **仕事の割り当ての判定者**（queue/ を読む唯一のデーモン）
+                        **状態ベースの通知（needs_director / failed+handoff / review 拒否）は、状態が
+                        変わるまで 1 回だけ**（t010 / backlog #10）。`NOTIFY_TTL`(300 秒）は
+                        スロットルであって受領確認ではないので、状態が続くかぎり TTL ごとに永久に
+                        再送され、2026-09-25 に数十通届いてユーザーがデーモンを手で止めた。
+                        `registry/daemons/notified-state.json`（「伝えた」台帳。fingerprint = 通知内容を
+                        決める入力）を `notify_state_once()` が見る。**台帳が読めない・壊れているときは
+                        再送側に倒す**（欠落は再送より高くつく）。live key は `all_tasks` の 1 つの
+                        スナップショットから集め、mission を自分で走査し直さない（観測できなかった回に
+                        台帳を捨てると洪水が戻る）。停止スイッチは無い（rollback は台帳を消す /
+                        PR revert + dispatcher restart）。設計: `knowledge/notify-once.md`
+                        **codex-review の差分 300KB 超の拒否は記録して再 spawn しない**（#11）:
+                        `kai-review.sh` が `needs-director` に倒す前に `registry/daemons/review-refusals/
+                        <mission>__<task>.json` を書き（`lib_review_refusal.py` が唯一の定義）、
+                        dispatcher は記録がある間 spawn しない。同じ PR は何度やっても同じ大きさなので、
+                        再 spawn は必ず同じ結論に戻り、「spawn → 拒否 → pending → spawn」のループになっていた。
+                        記録が**読めない・欄の値が不正なら保留**（拒否されていない、に倒さない）。
+                        Director が再試行するには `plan.sh update <id> --pr-number <新PR>` か
+                        `lib_review_refusal.py clear`。
+                        **失効した mux spawn 記録の掃除**（`sweep_stale_pane_records()`。下の
+                        `lib_mux.py`）も毎サイクルここから呼ぶ
     watchdog.py         Worker 生存監視デーモン（idle 判定・pane 消滅の検知と kill）
                         **Worker を終了させる唯一の実行者**（t002 以降）。後始末まで担う
     lib_daemon_watch.py  dispatcher と watchdog の相互監視（heartbeat・respawn・自己申告・
@@ -137,20 +175,84 @@
                         `knowledge/empty-vs-unobservable.md` §4 の取引）。
                         赤の実証は `tests/red_proof_t018.sh`、例外契約は
                         `tests/test_read_wrapper_exception_contract.py`
+                        **依存欄の検証もここ**（t007）: `blocked_deps_problem()` は `blocked_by` を
+                        「欄なし / null / [] / 空でない文字列の list」だけ受理し、`released_deps_problem()`
+                        は task ID の list だけ受理する。それ以外は card ごと `[破損]`。
+                        **依存の宣言は「これが済むまで進めるな」という制約なので、読み違えて落とすと制約が
+                        消える** — 検証の `if d`（truthiness）フィルタが `blocked_by: [null]` を「依存なし」に
+                        して pull も dispatch も開始した（#9 が潰す事故を逆向きに作り直した）。**要素を 1 つも
+                        落とさない**（`lib_dep_rules.declared_dependencies()` が 2 枚目の網: 不正な要素は
+                        `<不正な依存: 値>` という unmet に残す）。`released_deps` が壊れているときは
+                        「解除なし = 保留のまま」に倒す（誤って failed の依存を解除しない）。
+                        設計: `knowledge/failed-dependency-hold.md`
                         再発防止は tests/test_task_card_identity.py（両者が同じ queue から
                         同じ task 集合を導くことの直接 assert + コピー検出）と
                         tests/test_unobservable_is_not_empty.py（赤の実証は
                         tests/red_proof_unobservable.sh）
-    lib_dep_rules.py    「依存が満たされた」の唯一の定義（`unmet_dependencies()` /
-                        `DEAD_DEP_STATUSES`）。**plan.sh pull・plan.sh task-graph・
-                        dispatcher.sh の 3 者がここだけを読む**。コピーを書き戻すと、
+    lib_dep_rules.py    「依存が満たされた」の唯一の定義（`card_dependencies(meta, ...)` →
+                        `DependencyVerdict(unmet, held)`。`HELD_DEP_STATUSES` / `DEAD_DEP_STATUSES`）。
+                        **plan.sh pull（自動・`--task`）・plan.sh task-graph・plan.sh status・
+                        dispatcher.sh がここだけを読む**。コピーを書き戻すと、
                         ズレが出るのは QA FAIL の直後だけ（= 誰も疑わない瞬間）になる。
                         フォールバックは持たない（読めなければ呼び出し側が落ちる）ので、
                         plan.sh を単体でコピーする隔離テストでは一緒に置くこと。
                         再発防止は tests/test_task_graph.py のコピー検出テスト
+                        **`failed` の依存は「満たされた」ではなく「保留（HELD）」**（t007 / backlog #9）。
+                        以前は `failed` を dead 扱い（= 満たされた）にしていて、QA が FAIL した直後に
+                        その QA に `blocked_by` した review / merge task が自動で unblock され、merge
+                        寸前まで進んだ。fix task（進めてよい）と review / merge task（進めてはいけない）を
+                        **規則は区別できない**ので、辺ごとの hard/soft を plan 時点で選ばせる案は採らず
+                        （failed の理由を見る前には決められない・選び忘れが事故側に倒れる）、
+                        Director が failed の後に `plan.sh release-dep` で解除する形にした。
+                        `blocked_by` は消さず `released_deps` に記録する。`cancelled` は Director 自身の
+                        判断なので従来どおり満たされた扱い。`plan.sh status` が `🛑 HELD` と解除コマンド
+                        を出し、task-graph は `[保留: <id> が failed]`、dispatcher は `[held]` をログに出す
+                        （保留が「永久保留」という別の outage にならないための出口）。
+                        **停止スイッチは無い**（長寿命の dispatcher と呼ばれるたびに読み直す plan.sh で
+                        答えが割れ、消そうとした食い違いをスイッチが作る）。
+                        設計と比較: `knowledge/failed-dependency-hold.md`
     kai-review.sh       Codex reviewer (Kai-codex) 起動ラッパー。詳細は `knowledge/codex-reviewer.md`
+                        差分が 300KB 超なら拒否記録を書いてから `needs-director`（上の dispatcher.sh）。
+                        `--mission` を省略した呼び出しは、**pull の前に** `plan.sh resolve-mission` で
+                        実効 mission を 1 度だけ解決して全部に使う（記録名に mission が要るので、
+                        空だと記録が書かれず再 spawn ループが戻る）
     taskvia-sync.sh     queue → Taskvia 同期
+    lib_review_refusal.py  codex-review の拒否記録の唯一の定義（書き手 kai-review.sh・読み手
+                        dispatcher。CLI: `record` / `show` / `clear`）。`load()` は欄の値まで検証し、
+                        不正なら `Unreadable`（`diff_bytes: null` が通知の組み立てを落として全 mission の
+                        dispatch が止まる、を防ぐ）
+    lib_daemon_state.py  **デーモン側 JSON 状態ストアを読む入口**（`load_json_store(path, check=...)`）。
+                        戻りは検証済みの値か `Unreadable`。ENOENT だけが「まだ無い」。壊れたエントリが
+                        1 つでもあればストア全体が `Unreadable`（例外は出さない）。同じ欠陥（読めた JSON の
+                        中身の形を確かめずに使う）が PR #214 で 3 回出たので、1 件ずつの site patch をやめて
+                        入口を 1 つにした。`tests/test_daemon_state_reads_go_through_the_entry.py` が
+                        `json.load(s)` を AST で全部拾い、入口の外は理由付き allowlist に無ければ落とす
+                        （queue 側の `lib_task_cards` と同じ作法。ストアごとの「使えないときの向き」の表は
+                        `knowledge/notify-once.md` §3）
     lib_mux.py          mux 抽象化モジュール（TmuxBackend / HerdrBackend）
+                        **`registry/mux/<name>.json`（spawn 記録）は kill の認可の唯一の証拠**
+                        （§7-11-2）で、Worker の retirement は pane の pid を直接 kill して `kill()` を
+                        通らない → 記録だけが残る（失効記録。t001 / #7）。`reap_stale_pane_records()` が
+                        掃除する（dispatcher `sweep_stale_pane_records()` と `start.sh` の
+                        `mux_reap_records`）。**消してよいのは mux が「その id は無い」と明確に答えた
+                        ときだけ**（herdr は失敗を全部 `{"error"}` で返し、server 不達も同じ形。
+                        `error.code == "pane_not_found"` 以外は「観測できなかった」で残す。旧
+                        `_resolve_ids()` は error があれば消えたと読み、**herdr 停止中に呼ばれるだけで
+                        記録が消えて次の kill が恒久拒否**になった）。問い合わせは名前ではなく記録の id を、
+                        **記録の server の世代と同じ接続の上で**流す（`_herdr_pane_get_bound()`。検証と
+                        破壊が別の接続なら別の server でありうる）。label が違う pane は消えたのではなく
+                        `PANE_RENAMED`（同じ世代・id・tab なら記録から届く）。記録を書く `write_pane_record()` と
+                        消す `drop_pane_record(expect=<判定した記録>)` は `registry/mux/.records.lock` の
+                        同じ区間で直列化され（掃除が生きた pane の記録を消せた窓を塞ぐ）、記録を消す判断は
+                        すべて「判定した記録」を渡して消す。掃除には時間予算がある（`STALE_SWEEP_BUDGET_SECONDS`。
+                        応答しない herdr で 65 秒待つと相互監視が dispatcher を死んだと見て respawn する）。
+                        `spawn` の終了コード: 0 起動 / 1 起動せず / **10 live プロセスが居る / 11 pane が読めず
+                        busy 扱い**（`start.sh` が「already running」と言うのは 10 だけ）。
+                        症状「already running と言うのにペインが無い」の**真因は特定できていない**
+                        （記録は原因ではないと確認済み。再現できたのは起動が定着しなかった別の誤報のみ）。
+                        停止スイッチ: `CREWVIA_MUX_RECORD_SWEEP=0`（掃除だけが止まる。記録のロックは残る）。
+                        設計と全経路の棚卸し: `knowledge/daemon-authority.md` §7-14、
+                        `knowledge/empty-vs-unobservable.md` §7
     lib_mux.sh          bash 向け薄いラッパー（mux_spawn / mux_send 等）
   queue/                プラン置き場（plan.sh が管理）
     state.yaml          active mission slug + default_mission
@@ -161,7 +263,10 @@
   registry/
     workers.yaml        Worker のスキル・経験値
     heartbeats/         watchdog 監視用
-    mux/                mux バックエンドのタブ/ペイン ID キャッシュ（.gitignore 対象）
+    mux/                mux バックエンドのタブ/ペイン ID キャッシュ（.gitignore 対象）。`<name>.json` は
+                        kill の認可の証拠で、失効したものは `lib_mux.reap_stale_pane_records()` が掃除する。
+                        `.records.lock` が書き手（spawn）と消す側（kill・掃除）を直列化する（消してよいのは
+                        mux が「無い」と答えたときだけ。詳細は上の `lib_mux.py`）
     retirements/        Worker 終了要求と進捗（dispatcher→watchdog の引き渡し。.gitignore 対象）
     task-graph/         herdr-task-graph 用の `tasks.json`（.gitignore 対象）。queue を
                         書き換える plan.sh サブコマンドの後、キューロックの外で再生成される。
@@ -206,7 +311,12 @@
        いないように見える）
     daemons/            dispatcher/watchdog 相互監視の heartbeat・pause マーカー・respawn 履歴
                         （.gitignore 対象）。hooks/post-tool-use.sh の同時死 backstop（t008）が
-                        throttle マーカー（backstop-notify.throttle）を置く場所でもある
+                        throttle マーカー（backstop-notify.throttle）を置く場所でもある。
+                        `notified-state.json`（状態ベース通知の「伝えた」台帳）と
+                        `review-refusals/<mission>__<task>.json`（codex-review の差分サイズ拒否記録）も
+                        ここ。どちらも**消してよい**（無い = 再通知 / 拒否されていない）ので、通知が届かない・
+                        review が動かないときの手当ては、該当ファイルを消す（dispatcher の再起動は不要。
+                        `knowledge/notify-once.md`「戻し方」）
   CLAUDE.md             このファイル
   README.md             公開向けセットアップガイド
 ```
@@ -246,6 +356,7 @@
 | `CREWVIA_TMUX_SESSION` | tmux backend が使うセッション名（デフォルト: `crewvia`） |
 | `CREWVIA_HERDR_WORKSPACE` | herdr backend が使うワークスペース名（デフォルト: `crewvia`） |
 | `CREWVIA_HERDR_SOCK` | **テスト専用**。lib_mux が ping する herdr API socket のパスを上書きする（デフォルト: `~/.config/herdr/herdr.sock`）。実 herdr はこの変数を読まないため、本番で設定すると ping 先と server の bind 先が食い違う |
+| `CREWVIA_MUX_RECORD_SWEEP` | 失効した mux spawn 記録（`registry/mux/*.json`）の掃除の停止スイッチ。`0` で掃除が何も見ず何も消さない（既定は有効）。**止まるのは掃除だけ**で、記録の書き込みロックは常に働く。dispatcher は cycle ごとに新しい python なので dispatcher の env に足して再起動すれば効く。`start.sh` は env をそのまま読む。掃除は消す側の 1 者なので食い違っても危険な側には倒れない（規則を共有する `lib_dep_rules` 等に env スイッチを付けない理由と逆）。`knowledge/daemon-authority.md` §7-14 |
 | `CREWVIA_MUX_TEST_ISOLATION` | **テスト専用**。テスト中であることの印。`tests/conftest.py` が `os.environ` に置くので subprocess にも継承される。これが立っている間、既定の宛先 (`crewvia`) や接頭辞なしのペイン名を名指しする mux verb は `MuxTestIsolationError` で拒否される (2026-09-23 の本番 dispatcher 乗っ取り事故の再発防止。`knowledge/daemon-authority.md` §7-11) |
 | `CREWVIA_MUX_PANE_PREFIX` | **テスト専用**。ペイン名の名前空間。**本番は空 (no-op)**。設定すると `spawn("dispatcher")` が `<prefix>dispatcher` に解決され、本番のペイン名そのものが到達不能になる |
 | `NTFY_URL` | ntfy サーバーの URL。`approval_channel.ntfy.url` より優先 |

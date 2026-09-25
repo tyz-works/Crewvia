@@ -96,6 +96,7 @@ Crewvia uses the following environment variables. Add them to your shell profile
 | `APPROVAL_TOKEN_TTL_SECONDS` | Optional | One-time token TTL in seconds (default: `900`) |
 | `CREWVIA_VERIFICATION_UI` | Optional | Set in **Taskvia's** Vercel env (not crewvia). `disabled` hides all verification UI and redirects `/verification-queue` to `/` |
 | `CREWVIA_MUX` | Optional | Mux backend override: `tmux` or `herdr`. Overrides `mode:` in `config/crewvia.yaml` |
+| `CREWVIA_MUX_RECORD_SWEEP` | Optional | Set `0` to stop the cleanup of stale mux spawn records (`registry/mux/*.json`, left behind when a pane vanished without going through `kill`). Enabled by default; only the cleanup stops, nothing else. See `knowledge/daemon-authority.md` §7-14 |
 | `CREWVIA_WORKER_PERMISSION_MODE` | Optional | `claude --permission-mode` value for Worker sessions (default: `auto`). Set empty to fall back to the CLI's own default/manual mode |
 | `CREWVIA_DIRECTOR_PERMISSION_MODE` | Optional | `claude --permission-mode` value for the Director session (default: unset — CLI's own default/manual mode, since the Director bypasses the Taskvia approval hook entirely and relies on this as its only gate) |
 
@@ -366,7 +367,7 @@ Each invocation opens a new tab, so close the old one when you are done.
 
 | Plugin state | Crewvia status |
 |---|---|
-| `READY` / `WAIT` | `pending` — `READY` when the dependencies are met by the same rule `plan.sh pull` uses (a `failed` dependency counts as met), otherwise `WAIT` |
+| `READY` / `WAIT` | `pending` — `READY` when the dependencies are met by the same rule `plan.sh pull` uses, otherwise `WAIT`. A `failed` dependency does **not** count as met: the task waits (`[保留: <id> が failed]`) until a Director runs `plan.sh release-dep` (see [Failed dependencies hold their dependents](#failed-dependencies-hold-their-dependents)) |
 | `RUN` | `in_progress`, `verifying` |
 | `DONE` | `done`, `verified`, `skipped` (`[skip]`) |
 | `FAIL` | `failed`, `verification_failed` (`[検証NG]`), `cancelled` (`[中止]`), unreadable task file (`[破損]`) |
@@ -639,7 +640,7 @@ the Americas, Africa, and Slavic regions — 50 names by default.
 | `database` | DB operations, queries |
 | `cloud` | Cloud platforms (AWS, OCI, GCP) |
 | `docs` | Documentation writing |
-| `codex-review` | Automated PR review via Codex CLI (Kai-codex). No Worker needed — the Dispatcher spawns `scripts/kai-review.sh` directly when a task with this skill and a `--pr-number` is unblocked. Requires the `codex` CLI (see [Prerequisites](#prerequisites)). See `knowledge/codex-reviewer.md` |
+| `codex-review` | Automated PR review via Codex CLI (Kai-codex). No Worker needed — the Dispatcher spawns `scripts/kai-review.sh` directly when a task with this skill and a `--pr-number` is unblocked. Requires the `codex` CLI (see [Prerequisites](#prerequisites)). See `knowledge/codex-reviewer.md`. A diff over 300KB is refused (fail-closed) and the refusal is recorded, so the Dispatcher does not respawn the review — switch to a manual diff review, or split the PR and `plan.sh update <id> --pr-number <new PR>` |
 
 ---
 
@@ -763,6 +764,33 @@ Director の通知窓が奪われることはない（t049）。詳細設計は 
 7. Worker reports completion via `plan.sh done`, then waits for next Dispatcher assign
 8. Dispatcher notifies Director when a new Worker skill is needed or all missions are complete
 9. Director responds to Dispatcher notifications (spawns Workers / archives mission)
+
+State-based notifications (a task in `needs_director`, a `failed` task with a handoff, a refused
+`codex-review`) are sent **once per state**, not repeated on a timer: the Dispatcher keeps a
+ledger in `registry/daemons/notified-state.json` and notifies again only when the situation
+changes. If a notification never reached you, delete that file and the current states are
+re-sent once (see `knowledge/notify-once.md`).
+
+### Failed dependencies hold their dependents
+
+When a task fails (typically a QA task), the tasks that list it in `blocked_by` are **held**,
+not started: `plan.sh pull` and the Dispatcher both refuse them, `plan.sh status` shows
+`🛑 tNNN … HELD` with the command to release it, and the task graph marks it `[保留: <id> が failed]`.
+A Director decides after reading why it failed:
+
+```bash
+plan.sh release-dep <task_id> --mission <slug>                  # safe to proceed (e.g. a fix task)
+plan.sh update <task_id> --mission <slug> --status skipped      # abandon it
+```
+
+`--mission` matters: task IDs are numbered per mission, so without it the command applies to the
+default mission's task with the same ID. `cancelled` dependencies still count as met.
+See `knowledge/failed-dependency-hold.md`.
+
+`plan.sh fail` also requires evidence: `--head <sha>` (a real commit; or `--no-head "<reason>"`,
+which is recorded on the card) and, if a handoff is passed, an absolute path whose content
+mentions that head — so a stale handoff from an earlier round cannot be resubmitted
+(see `knowledge/fail-evidence.md`).
 
 ### Kanban card structure
 

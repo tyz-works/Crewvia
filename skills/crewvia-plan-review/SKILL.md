@@ -208,7 +208,8 @@ Priya がプラン設計時に **Claude (Seo) のみ / Seo + Kai-codex の 2 人
 - title: "PR#XXX Codex review (Kai)"
   skills: [codex-review]
   blocked_by: [<実装 task の ID>]
-  pr_number: XXX          # ★ 必須。dispatcher が --pr で渡す
+  # pr_number は書かない: 実装 task の `plan.sh done <id> --pr <N>` が自動で入れる（未設定のものだけ）。
+  # dispatcher は pr_number が入るまで spawn しない（既に PR がある task のときだけ手で書く）
   description: |
     Codex CLI による adversarial review。Seo と独立に判定する。
 ```
@@ -216,7 +217,7 @@ Priya がプラン設計時に **Claude (Seo) のみ / Seo + Kai-codex の 2 人
 `plan.sh add` の呼び出し例:
 ```bash
 plan.sh add "PR#42 review (Seo)"      --skills review        --blocked-by t003
-plan.sh add "PR#42 Codex review (Kai)" --skills codex-review  --blocked-by t003 --pr-number 42
+plan.sh add "Codex review (Kai)"      --skills codex-review  --blocked-by t003
 ```
 
 | 突合結果 | Director の対応 |
@@ -227,7 +228,7 @@ plan.sh add "PR#42 Codex review (Kai)" --skills codex-review  --blocked-by t003 
 
 ### Phase 2 の Priya への注意
 
-- **codex-review skill task には `--pr-number` を必ず指定する**。指定なしだと dispatcher は spawn せず warning を出す
+- **codex-review skill task は、PR を作る実装 task を `blocked_by` に持たせる**。`pr_number` はその実装 task が `plan.sh done --pr <N>` で閉じたときに自動で入る。PR 番号を見込みで書かない。`pr_number` が無いまま開いた task は dispatcher が spawn せず warning を出す（Director に見える停止）。PR 番号待ちの止まり方を明示したいときは `status: blocked` + `blocked_reason`（drafting でも lint を通る）
 - Kai-codex は registry に登録済みなので `plan.sh done` で task_count が自動 bump される
 - Kai-codex のカードは Taskvia カンバンに表示される（plan.sh pull 経由で in_progress → done が sync される）
 - タイムアウト時は Director が `rm queue/assignments/Kai-codex` + `plan.sh update <task> --reset` で復旧する

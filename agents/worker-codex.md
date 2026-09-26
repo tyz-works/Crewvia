@@ -32,14 +32,16 @@ Phase 2 で登録した **Codex Kai** の worker 名は **`Kai-codex`** に決�
 
 ## Phase 2 スコープ (現行)
 
-Phase 2 では **Kai-codex を dispatcher が自動 spawn する**。Priya は `skills: [codex-review]` + `pr_number: N` の task を積むだけで、Director の手動介入なしで review が走る。
+Phase 2 では **Kai-codex を dispatcher が自動 spawn する**。Priya は `skills: [codex-review]` の task を実装 task に `blocked_by` で積むだけで、Director の手動介入なしで review が走る（`pr_number` は実装 task の `plan.sh done <id> --pr <N>` が自動で書く）。
 
 **運用フロー (Phase 2)**:
 
-1. Priya が計画時に codex-review task を積む:
+1. Priya が計画時に codex-review task を積む（PR 番号はまだ無い — 実装 task が PR を作る）:
    ```bash
-   plan.sh add "PR#42 Codex review" --skills codex-review --blocked-by t003 --pr-number 42
+   plan.sh add "Codex review" --skills codex-review --blocked-by t003
    ```
+   実装 task t003 が `plan.sh done t003 --pr 42 --mission <slug> "PR #42 ..."` で閉じると、この task に `pr_number: 42` が入り
+   （未設定のときだけ）、`blocked` なら `pending` に戻る。既に PR がある task を積むときだけ `--pr-number 42` で最初から入れる
 2. Dispatcher が 5s poll で検知 → `nohup kai-review.sh --pr 42 --task tXXX --mission <slug> --agent Kai-codex` を background spawn
 3. kai-review.sh が `plan.sh pull` で task を in_progress にし、Taskvia PATCH を発火
 4. codex exec (--output-schema, t006 以降) が完了したら `plan.sh done` または `plan.sh needs-director` で状態遷移 + Taskvia sync + registry の task_count 自動 bump

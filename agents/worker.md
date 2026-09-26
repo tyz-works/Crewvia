@@ -279,6 +279,10 @@ reason が `retirement_reserved` の場合、あなたの退役処理が進行�
 （待って再試行 → やがて shutdown）で、**特別な操作は不要**。退役中の Worker に新しい
 task を渡すと、その task を実行中にシグナルが飛んで宙に浮くため、plan.sh の側で断っている。
 
+前任の退役が kill まで済んで**後始末だけが残っている**とき（同名の Worker を起動し直した直後）は、`plan.sh pull` が
+「前任の後始末待ちです。最大 60 秒待って取り直します」と出して待ち、後始末が終わったら 1 回で取る。
+この待ちは plan.sh の内側なので、Worker が自分で再試行・sleep する必要は無い。
+
 ### 環境変数を export して worktree に移動する
 
 ```bash
@@ -301,9 +305,11 @@ fi
 
 worktree に移動した後、以降のすべての Bash コマンドは worktree を cwd として実行される（Claude Code は Bash ツール呼び出し間で cwd を保持する）。
 
-### task JSON の target_dir を確認する
+### task JSON の target_dir と cwd を確認する
 
-pull した task JSON には `target_dir` フィールドが含まれる。Director が Worker を起動する時点で `TARGET_DIR` env var も既にセット済みのはずだが、念のため task JSON と env var を突き合わせて確認する:
+pull した task JSON には `target_dir` フィールドが含まれる。**Worker の `TARGET_DIR` と task の `target_dir` の照合は plan.sh が行う**
+（`pull` が別の target の task を取らない。`pull --task` は exit 3 で断り、何も書かない）ので、カードの冒頭に「`echo $TARGET_DIR` が
+空でなければ差し戻せ」のような自己確認を書いても、Worker がそれをする必要も無い。残る確認は **cwd が正しい場所か**:
 
 ```bash
 TASK_TARGET_DIR=$(echo "$TASK_JSON" | jq -r .target_dir)
@@ -601,6 +607,18 @@ Worker はここで手動 bump を呼ばないこと（二重 bump 防止）。
 ```bash
 plan done "$TASK_ID" "実行した内容と結果の要約" --mission "$TASK_MISSION"
 ```
+
+**成果物が PR の task は `--pr <N>` を付け、Result の 1 行目に `PR #<N>` も書く**:
+
+```bash
+plan done "$TASK_ID" "PR #123 ..." --mission "$TASK_MISSION" --pr 123
+```
+
+`--pr` は、この task を `blocked_by` に持つ `codex-review` / `review` の task に `pr_number` を書き、
+`blocked` の codex-review を `pending` に戻す（Director が手で入れる必要は無い）。**明示フラグだけ**
+（Result の本文から番号は推測されない）。伝える先が無ければ 1 行そう表示されるだけで、エラーではない。
+オプションは `plan done` の位置引数（task id と Result）の**後ろ**に置いてよいが、`--pr` の綴りを間違えると
+`unknown option` で拒否される（何も書かれない — Result を打ち直す）。
 
 > **移行予告**: 将来的に `plan.sh done` は `plan.sh ready-for-verification <task_id>` に移行予定。
 > Verifier 機能（M-QA-4）が導入されるまでは `done` を使い続けてよい。

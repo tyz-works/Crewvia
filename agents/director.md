@@ -364,7 +364,7 @@ Worker に指示を出す際は:
 | `planning` | プランレビュー（タスク分解・依存関係・スキル割り当ての妥当性検証）。Bash(plan.sh status/pull), git log/diff は可。Edit/Write は deny |
 | `plan_review` | plan_review.md への verdict 出力専用（Write 可 / Edit・Bash 全面 deny）。planning とは権限が異なる。crewvia-plan-review skill 参照 |
 | `verify` | 実機検証・smoke test |
-| `codex-review` | Codex CLI (Kai-codex) による自動 review 専用。plan task には積むだけで良く、Dispatcher が `kai-review.sh` を自動 spawn する（Director が Worker を起動する必要はない）。`--pr-number` 必須。詳細は `knowledge/codex-reviewer.md` |
+| `codex-review` | Codex CLI (Kai-codex) による自動 review 専用。plan task には積むだけで良く、Dispatcher が `kai-review.sh` を自動 spawn する（Director が Worker を起動する必要はない）。`pr_number` が無い task は spawn されない（warning のみ）が、**PR がまだ無い段階では手で入れない** — 実装 task を `blocked_by` に持たせ、実装 task を `plan.sh done <id> --pr <N>` で閉じると `pr_number` が自動で入る（下記「`codex-review` skill task の積み方」）。詳細は `knowledge/codex-reviewer.md` |
 
 ### skill 別デフォルトモデル
 
@@ -559,8 +559,17 @@ Worker に crewvia 以外のプロジェクト (例: `~/workspace/taskvia`) を�
      SIGKILL 等で削除が実行されなかった場合は次回起動時に孤立ファイルを自動削除。
      手動リカバリ: `bash scripts/cleanup-target-dir.sh <TARGET_DIR> [AGENT_NAME]`
 
-4. **Worker がどの target project に割り当てられているかを把握しておく**
-   同じ Worker 名 (例: Hana) でも、起動時の `TARGET_DIR` が異なれば触るプロジェクトが変わる。Director は「今起動中の Hana はどの TARGET_DIR で動いているか」を混同しないように記憶しておく。
+4. **Worker の TARGET_DIR は記録されている — 覚えておく必要は無い**
+   同じ Worker 名 (例: Hana) でも、起動時の `TARGET_DIR` が異なれば触るプロジェクトが変わる。`start.sh` は起動が成功したとき
+   `registry/workers/<Name>/target_dir.json` に TARGET_DIR（crewvia 本体なら `null`）を記録し、dispatcher と
+   `plan.sh pull --task` がそれで task の `target_dir` を照合する。**別の TARGET_DIR の Worker には割り当てられず、
+   手で `pull --task` しても exit 3 で断られる**（何も書かれない）。確認は
+   `python3 scripts/lib_worker_target.py show registry <Name>`。
+   合う Worker が居ないときの Director 通知には、**そのまま貼れる起動コマンド**が付く
+   （skill に合う Worker が別の TARGET_DIR で居るときは `assign-name.sh --fresh` 付き）。
+   起動済みの Worker は記録を持たない（次の再起動まで `target_dir: null` の Worker として扱われる）ので、
+   TARGET_DIR 付きで動いている Worker に target_dir 付きの task が回らないときは
+   `lib_worker_target.py record registry <Name> <target_dir>` で書き直す。
 
 起動モードによる挙動の違い:
 
@@ -979,7 +988,12 @@ Dispatcher は常に **main 版の `scripts/kai-review.sh`**（$CREWVIA_REPO_ROO
 
 ### `codex-review` skill task の積み方（通常パス）
 
-`review`（Seo）とは別に、`--skills codex-review --pr-number <N>` で task を積むだけでよい。
+`review`（Seo）とは別に、`--skills codex-review --blocked-by <実装 task>` で task を積むだけでよい。
+**PR 番号は手で入れない**: 実装 task を `plan.sh done <id> --pr <N> --mission <slug> "<Result>"` で閉じると、
+その task を `blocked_by` に持つ `codex-review` / `review` の task に `pr_number` が書かれ（未設定のものだけ。
+Result の本文から推測はしない）、`blocked` の codex-review は `pending` に戻る。PR 番号待ちで止めておきたい
+task は drafting のうちから `status: blocked` + `blocked_reason` で積める（lint が受理する）。
+既に PR が存在する場合だけ `--pr-number <N>` で最初から入れる。`--pr` は Result 1 行目の `PR #<N>` と一緒に付ける。
 Worker 起動は不要 — Dispatcher が `kai-review.sh` を自動 spawn し、`plan.sh pull` → `codex exec --output-schema`
 → `plan.sh done`/`needs-director` まで完走する。重要 mission では Seo（Claude）と Kai-codex（Codex）の
 **2 人体制**での verdict 突合も検討すること。詳細は `knowledge/codex-reviewer.md` を参照。
@@ -1048,8 +1062,11 @@ watchdog は idle / max threshold を超えた Worker を**自ら終了させ、
 2. Worker プロセスの終了を確認したら `plan.sh retire` で task を `pending` に戻し、assignment を
    削除する（世代 = `started_at` で束縛されるので、猶予期間中に別 Worker がその task を pull し
    直していた場合は後任を巻き込まない — 詳細 `knowledge/daemon-authority.md`）
-3. mux 経由で Director の pane に **1 行の事後報告**を直接送る（Taskvia を介さない）。ポーリング不要
-   — 何か操作した拍子に届く
+3. mux 経由で Director の pane に **事後報告**を直接送る（Taskvia を介さない）。ポーリング不要
+   — 何か操作した拍子に届く。**timeout 終了は `[timeout]` の 1 通**で、task id・mission・どちらの上限か
+   （idle×2 / max）・経過秒・**`plan.sh update <id> --status pending --reset` が要るか**（後始末が成功していれば
+   「不要」）まで書いてある。同じ退役では 2 通目は出ない（台帳 `timeout_<mission>_<task>`）。同じ task が同じ上限に
+   また当たるなら task の frontmatter の `timeout`（idle / max）を見直す
 
 **Director がすることは基本的に「報告を読んで判断する」だけ**:
 
@@ -1379,7 +1396,11 @@ herdr モードでのみ動作。Worker の `agent_status` を毎ポーリング
 **Director の対応** (`[Rule 5]` 通知受信時):
 1. 通知に含まれる「画面末尾」で状況を判断する
 2. テキストで質問待ち → `python3 scripts/lib_mux.py send {name}-worker "<回答>"`
-3. 承認ダイアログ (`Enter to confirm · Esc to cancel`) → ユーザーへエスカレーション
+3. 承認ダイアログ (`Enter to confirm · Esc to cancel`) → ユーザーへエスカレーション。
+   **選択ダイアログ**（信頼確認など、カーソルで選ぶもの）は `send` で数字を打っても選べない（Enter が先頭項目を
+   選ぶ）。`capture` でカーソルの位置を見てから `python3 scripts/lib_mux.py keys {name}-worker down enter`
+   のように**名前付きキー**（`up` / `down` / `left` / `right` / `enter` / `escape` / `tab`）を送る。
+   `keys` は宛先名の本番拒否が `CREWVIA_MUX_TEST_ISOLATION=1` のときだけ働くので、宛先は必ず自分の Worker にすること
 4. 回復不能な停止 → `python3 scripts/lib_mux.py kill {name}-worker` + `plan.sh retire`（下記）
 
 **kill した Worker の後始末は `plan.sh retire` を使う**:

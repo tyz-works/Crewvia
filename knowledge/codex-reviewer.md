@@ -42,15 +42,15 @@
 ### Phase 2: Priya が plan に codex-review task を積むだけ（常用パス）
 
 ```bash
-plan.sh add "PR#<N> Codex review (Kai)" \
+plan.sh add "Codex review (Kai)" \
   --skills codex-review \
   --blocked-by t<impl_task_id> \
-  --pr-number <N> \
   --priority medium
+# pr_number は実装 task の `plan.sh done <impl_task_id> --pr <N>` が入れる。既存の PR を見る task だけ --pr-number <N> を付ける
 ```
 
 - `--skills codex-review` — 専用 skill 名。Dispatcher がこの skill を検知して `kai-review.sh` を自動 spawn する
-- `--pr-number <N>` — frontmatter に PR 番号を刻む。Dispatcher が spawn 時に `--pr` として渡す。**必須**（無いと spawn せず warning）
+- `--pr-number <N>` — frontmatter に PR 番号を刻む。Dispatcher が spawn 時に `--pr` として渡す。**spawn には `pr_number` が必要**（無いと spawn せず warning）だが、PR がまだ無い段階では手で入れない — 実装 task の `plan.sh done <id> --pr <N>` が、その task を `blocked_by` に持つ codex-review / review の task に自動で書く（未設定のものだけ。t009 / #24）
 - `--blocked-by` — 実装 task の完了後に review を走らせる典型パターン
 
 Dispatcher spawn 後のフロー: `kai-review.sh` が `plan.sh pull` → `codex exec review` → `plan.sh done` を実行。Director の手動介入は不要。

@@ -81,7 +81,11 @@
 /
   config/
     worker-names.yaml   名前プール・カスタマイズ設定
-    crewvia.yaml        システム設定（承認チャネル・WIP制限等）
+    crewvia.yaml        システム設定（承認チャネル・WIP制限等）。`model_per_skill` は
+                        **docs / qa / verify = `claude-sonnet-5`**（Haiku は `--permission-mode auto` を
+                        無視して承認ダイアログで止まる。t028 / #16）。起動のたびの
+                        `CREWVIA_WORKER_MODEL` 上書きは不要（env は従来どおり最優先で残る）。
+                        `tests/test_model_per_skill.py::TestRealConfig` が実 config を固定する
   hooks/
     pre-tool-use.sh     PreToolUse hook（Taskvia承認）
     post-tool-use.sh    PostToolUse hook（ログ投稿）。role=director のときだけ、両デーモンの
@@ -91,6 +95,16 @@
     worker.md           Workerのシステムプロンプト
   scripts/
     start.sh            マルチエージェント起動スクリプト
+                        **Worker 起動時に 2 つを機械で残す**（どちらも「起動が成功した後」）:
+                        (1) 渡された skills を registry の当該 Worker に**和集合で**足す
+                        （`lib_registry.py add-skills`。足すだけで消さない・何も足さなければ書き直さない・
+                        registry に居ない名前は作らない。t017 / #14。以前は registry の skills が古いと
+                        「起動要求」と「仕事なし退役」が打ち消し合い、Director が registry を手で直していた）
+                        (2) `TARGET_DIR` を `registry/workers/<Name>/target_dir.json` に記録
+                        （`lib_worker_target.py`。下記。断られた起動では書かない）。
+                        `Mux.spawn()` の `env=` 引数は廃止（渡すと TypeError。env は起動コマンドに
+                        `export` として埋める）。設計: `knowledge/daemon-authority.md` §7-17、
+                        `knowledge/assignment-routing.md` §1
     plan.sh             タスクプラン管理 CLI（per-task / multi-mission）。queue を書き換える
                         サブコマンドの後、キューロックの外で `registry/task-graph/tasks.json`
                         を再生成する（herdr-task-graph 連携。`CREWVIA_TASK_GRAPH=0` で停止）
@@ -112,6 +126,36 @@
                         採番で、付けないと別 mission の同 ID に当たる。`held_dependency_hint()` の
                         `slug` は必須引数）。`resolve-mission <id>` は `pull` と同じ探索順
                         （`mission_search_order()`）で実効 mission を返す読み取り専用コマンド
+                        **引数は厳格**（t005 / #23。`parse_opts`）: 未知の option は usage を出して
+                        exit 2 で何も書かない（以前は捨てるか positional に混ぜ、`init --help` が
+                        「--help」mission を作り、`done --agent X "..."` の Result が `--agent` になった）。
+                        `--` 以降は全部 positional。`-h` / `--help` は全サブコマンドで usage + exit 0 で
+                        **1 バイトも書かない**。**`pull` だけ使い方の誤りが exit 1**（pull の exit 2 は
+                        「タスクなし」で、Worker は 2 を無限に再試行する）。`--mission` 省略で task id が
+                        複数 mission に当たるときは `resolve_ambiguous_mission()`（`CREWVIA_MISSION_SLUG` の
+                        mission に**自分が実行中**のときだけそれを使い、他は候補と打つべきコマンドを出して拒否）。
+                        `pull` は `--skills` → env `SKILLS` → registry の順で、どれも無ければ拒否
+                        （`dashboard` は `parse_opts` を通らない bash 側の TUI なので、同じ規則
+                        （`--help` は何も書かない・未知の option は拒否）を bash 側の分岐が持つ）。
+                        設計: `knowledge/plan-sh-strict-args.md`
+                        **`pull --task` は task の `target_dir` を Worker の実効 target
+                        （`--target-dir` > `TARGET_DIR`）と照合し、自分が別の task を持っていれば拒否する**
+                        （どちらも何も書かずに exit 3 = `PRECONDITION_UNMET`。`agent_busy_elsewhere()`。
+                        **孤児の assignment・`needs_director` の card だけ**では拒否しない —
+                        Kai-codex の codex-review が恒久に取れなくなる #13 の再発になる）。
+                        `done <id> --pr <N>` は、その task を `blocked_by` に持つ `codex-review` /
+                        `review` の task に `pr_number` を書き（**未設定のものだけ**。Result から推測しない）、
+                        `blocked` の codex-review は `pending` に戻す（`propagate_pr_number()`）。
+                        `lint_plan.py` は drafting でも `status: blocked`（`blocked_reason` 必須）を受理する
+                        ので、PR 番号待ちの task は承認前から止めて積める。
+                        **`pull` は Director（registry の `role: director`）を拒否する**（`ROLE` env では
+                        判定しない — dispatcher が spawn する `kai-review.sh` が継承しうる）。
+                        `needs-director` は呼んだ Worker の `queue/assignments/<name>` を外す
+                        （`retire_assignment()`。`done` / `fail` と同じ。#13）。退役 marker が「前任の
+                        後始末待ち」（phase=terminated・記録された pane_pid が `ESRCH`）のときだけ、
+                        `pull` は最大 60 秒待ってロックを取り直し 1 回で取る（`predecessor_cleanup_pending()`。
+                        それ以外の `retirement_reserved` は従来どおり即拒否。t021 / PR6）。
+                        設計: `knowledge/assignment-routing.md` §3-5、`knowledge/daemon-authority.md` §7-16 / §7-18
     dispatcher.sh       並列モードの常駐割り当てデーモン（idle Worker への自動 assign + codex-review spawn）
                         **仕事の割り当ての判定者**（queue/ を読む唯一のデーモン）
                         **状態ベースの通知（needs_director / failed+handoff / review 拒否）は、状態が
@@ -134,8 +178,32 @@
                         `lib_review_refusal.py clear`。
                         **失効した mux spawn 記録の掃除**（`sweep_stale_pane_records()`。下の
                         `lib_mux.py`）も毎サイクルここから呼ぶ
+                        **割り当ては skill だけでなく TARGET_DIR でも照合する**（t009 / #21。
+                        `worker_may_take_task()` → `lib_worker_target.worker_may_take()`。task の
+                        target_dir が非 null で Worker の記録が**無い・読めない**ときは割り当てない
+                        （保留）が、null の task は記録が無くても従来どおり — 起動済みの Worker が
+                        dispatcher の再起動で全員止まらないため）。**担当できる Worker が居ないとき**の
+                        Director 通知には、**そのまま貼れる起動コマンド**（`AGENT_NAME=$(assign-name.sh ...)
+                        [TARGET_DIR=..] ... start.sh worker <skills>`）と、既存 Worker が担当できない理由が付く。
+                        **送信済み・pull 待ちの Worker には別の task を送らない**（#22。通知スロットルの
+                        TTL の内。以前は 6 秒後に別 task を送り assignment が上書きされた）。
+                        **Rule 2（no-task / blocked-stuck の退役）の「仕事を持っている」は card で数える**
+                        （`worker_holds_work()`。needs_director / blocked / verifying 等の card を持つ Worker は
+                        退役させない。`needs-director` が assignment を外すようになったので、assignment では
+                        数えられない。#13）。skill は合うが TARGET_DIR が合わない task しか残っていない Worker も
+                        退役させない。**codex-review の同時 1 実行は `queue/assignments/Kai-codex` の
+                        有無ではなく、指す task で判定**（`codex_review_slot_busy()`。終わった task・
+                        needs_director を指す孤児は塞がない。読めない・形が違う・task が見つからないは塞ぐ側）。
+                        設計: `knowledge/assignment-routing.md` §2、`knowledge/daemon-authority.md` §7-16
     watchdog.py         Worker 生存監視デーモン（idle 判定・pane 消滅の検知と kill）
                         **Worker を終了させる唯一の実行者**（t002 以降）。後始末まで担う
+                        **timeout 終了は Director に `[timeout]` の 1 通で伝える**（t021 / PR6）: どちらの
+                        上限か（idle×2 / max）・経過・`plan.sh update <id> --status pending --reset` の要否
+                        （後始末が成功していれば「不要」）。notify-once 台帳に `timeout_<mission>_<task>` を
+                        退役ごとの fingerprint で置くので、settle の再実行で 2 通目は出ない。送れなかった通知は
+                        watchdog がメモリ上で最大 1800 秒再送する。台帳の書き手は dispatcher と watchdog の 2 人で、
+                        書き換えはすべて `told_lock()`（`lib_daemon_state.py`）の中。`kind=timeout` は 24 時間
+                        prune されない。設計: `knowledge/daemon-authority.md` §7-18
     lib_daemon_watch.py  dispatcher と watchdog の相互監視（heartbeat・respawn・自己申告・
                         maintenance マーカー）。CLI: spawn / spawn-cmd / beat / watch / status /
                         pause / resume / restart（pause→kill→spawn→resume を 1 コマンドで行う。
@@ -272,6 +340,29 @@
                         停止スイッチ: `CREWVIA_MUX_RECORD_SWEEP=0`（掃除だけが止まる。記録のロックは残る）。
                         設計と全経路の棚卸し: `knowledge/daemon-authority.md` §7-14、
                         `knowledge/empty-vs-unobservable.md` §7
+                        **`keys <name> <key>...`**（t028 / #16）: 選択ダイアログ（信頼確認・権限メニュー）を
+                        カーソル移動で答える verb。`send` は**テキスト**を打つので、`"2"` を送ってもカーソルは
+                        動かず、続く Enter は**先頭項目**を選ぶ。`keys` は**名前付きキーだけ**
+                        （`up` / `down` / `left` / `right` / `enter` / `escape`(`esc`) / `tab`。大小無視）を
+                        受け、未知の名前は何も送らずに全体を拒否する（tmux は未知の語をそのまま打つため）。
+                        1 回の `send-keys` で送る。使う前に `capture` でカーソルの位置を見ること。
+                        **本番宛先名（`Sora-director` 等）の拒否は `CREWVIA_MUX_TEST_ISOLATION=1` のときだけ働く**
+                        （`_guard_test_isolation`。t025 の実測: 環境変数なしなら本番の Director に実際にキーが届く）
+                        ので、試すときは必ず自分が起動した Worker の pane に向けること
+    lib_worker_target.py  Worker が起動された `TARGET_DIR` の記録の唯一の定義（t009 / #21。書き手 `start.sh`・
+                        読み手 dispatcher）。`registry/workers/<Name>/target_dir.json`
+                        `{"agent","target_dir": <絶対パス|null>,"written_at"}`（`.gitignore` 対象）。
+                        **`null` は「crewvia 本体で起動した」という事実**で「記録が無い」とは別。
+                        `registry/mux/<Name>-worker.json`（kill の認可の証拠）には相乗りしない。
+                        `worker_may_take()` が判定表の唯一の定義、読みは `lib_daemon_state.load_json_store`
+                        （壊れていれば `Unreadable`）、`sweep_stale_records()` は窓も新しい heartbeat も無く
+                        300 秒以上古い記録だけ消す。停止スイッチは無い（dispatcher と `plan.sh pull --task` の
+                        答えが割れる）。CLI: `record <registry_dir> <agent> [<target_dir>]` / `show`。
+                        記録が嘘・無いときは `record` で書き直す（dispatcher は毎サイクル読み直す）。
+                        設計: `knowledge/assignment-routing.md`
+    lib_registry.py     `registry/workers.yaml` を書く入口（`registry/.workers.lock` の中で parse → 変更 → write）。
+                        CLI に `add-skills PATH NAME SKILL...`（`start.sh` が使う。和集合・flow list に書き戻せない
+                        tag は警告して飛ばす）。t017 / PR5a
     lib_mux.sh          bash 向け薄いラッパー（mux_spawn / mux_send 等）
   queue/                プラン置き場（plan.sh が管理）
     state.yaml          active mission slug + default_mission
@@ -280,7 +371,9 @@
       tasks/tNNN.md     frontmatter + Description / Result
     archive/            完了 mission の退避先
   registry/
-    workers.yaml        Worker のスキル・経験値
+    workers.yaml        Worker のスキル・経験値（`start.sh` が起動のたびに skills を和集合で追従させる）
+    workers/<Name>/target_dir.json  起動時の `TARGET_DIR` の記録（`lib_worker_target.py`。.gitignore 対象。
+                        消してよい — 無い = 「target_dir 付きの task は割り当てない」側に倒れるだけ）
     heartbeats/         watchdog 監視用
     mux/                mux バックエンドのタブ/ペイン ID キャッシュ（.gitignore 対象）。`<name>.json` は
                         kill の認可の証拠で、失効したものは `lib_mux.reap_stale_pane_records()` が掃除する。
@@ -360,7 +453,7 @@
 | `CREWVIA_PROJECT` | Taskvia に送るプロジェクト識別子。デフォルト: `crewvia` |
 | `CREWVIA_APPROVAL_CHANNEL` | 承認通知チャネル: `taskvia` / `ntfy` / `both`（config `approval_channel.mode` より優先） |
 | `CREWVIA_DIRECTOR_MODEL` | Director が使用するモデル。`config/crewvia.yaml` の `director_model` より優先。空の場合は claude CLI のデフォルト |
-| `CREWVIA_WORKER_MODEL` | Worker が使用するモデルを強制指定。`config/crewvia.yaml` の `model_per_skill` による skill 別自動選択より優先（最優先）。空にするか未設定の場合は skill に応じて自動選択される |
+| `CREWVIA_WORKER_MODEL` | Worker が使用するモデルを強制指定。`config/crewvia.yaml` の `model_per_skill` による skill 別自動選択より優先（最優先）。空にするか未設定の場合は skill に応じて自動選択される。**docs / qa / verify は config で Sonnet なので、Haiku 回避のために起動のたびに設定する必要は無い**（t028）。1 回だけ別モデルを使わせたいとき用 |
 | `CREWVIA_WORKER_PERMISSION_MODE` | Worker 起動時の `claude --permission-mode` 値。デフォルト: `auto`（対話プロンプトなし。実質的な承認ゲートは hooks/pre-tool-use.sh + Taskvia が別途担う）。空にすると CLI 既定（対話確認あり）にフォールバック |
 | `CREWVIA_DIRECTOR_PERMISSION_MODE` | Director 起動時の `claude --permission-mode` 値。デフォルト: 未設定（CLI 既定 = 対話確認あり）。Director は Taskvia 承認 hook を role 判定でスキップするため、対話確認が唯一の安全弁 |
 | `CREWVIA_KILL_AUTHORITY` | Worker を終了させる主体: `watchdog`（デフォルト）/ `dispatcher`（ロールバック）。**両デーモンで同じ値にし、同時に再起動すること** — 片方だけ戻すと「誰も窓を閉じない」か「二重 kill で同名の別 Worker を殺す」のどちらかが必ず起きる（`knowledge/daemon-authority.md` §5） |

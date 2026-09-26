@@ -16,8 +16,8 @@
 #      _read_approval_yaml() にも同じ欠陥があったため合わせて修正した。
 #   2. scripts/start.sh: dispatcher/watchdog を mux window に spawn する際、
 #      CREWVIA_MUX をコマンド文字列自体に明示的に埋め込む (mux_spawn は
-#      呼び出し側プロセスの env を新しいペインへ自動伝播しない — env= 引数は
-#      両 backend とも未実装。herdr は特にサーバー起動時の env スナップショット
+#      呼び出し側プロセスの env を新しいペインへ自動伝播しない — spawn() は
+#      env 引数を持たない (t017)。herdr は特にサーバー起動時の env スナップショット
 #      を全ペインへ継承するため、ambient env 継承に頼ると非対称が起こりうる)。
 #   3. scripts/watchdog.py: ログ文言 'tmux window gone' のハードコードを
 #      backend 名入りの文言に修正し、起動時にどの backend を使っているかを

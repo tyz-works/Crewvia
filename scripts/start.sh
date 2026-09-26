@@ -507,6 +507,12 @@ registry/workers.yaml でこの名前のエントリを確認し、過去の tas
   # Update last_active for this worker in registry
   REGISTRY_YAML="${REPO_ROOT}/registry/workers.yaml"
   if [[ -f "$REGISTRY_YAML" ]]; then
+    # 起動時に渡された skills を registry の skills に和集合で足す（消さない）。
+    # dispatcher は task の skills を registry と突き合わせるので、registry が
+    # 古いと「起動要求 ⇄ 仕事なし退役」が互いを打ち消す（backlog #14）。
+    if [[ ${#SKILLS_ARR[@]} -gt 0 ]]; then
+      python3 "${SCRIPT_DIR}/lib_registry.py" add-skills "$REGISTRY_YAML" "$AGENT_NAME" "${SKILLS_ARR[@]}"
+    fi
     python3 "${SCRIPT_DIR}/lib_registry.py" set-last-active "$REGISTRY_YAML" "$AGENT_NAME"
   fi
 
@@ -660,8 +666,8 @@ PYEOF
   # Director/Worker の claude プロセスへ汚染が伝播しないよう、起動直前に必ず除去する。
   #
   # export PATH: mux (tmux/herdr) が spawn する新しいペインは、この start.sh
-  # プロセスが export した PATH を継承しない（spawn() の env= 引数はどちらの
-  # backend でも未実装 — 上の ENV_EXPORTS と同じ理由）。scripts/bin/plan を
+  # プロセスが export した PATH を継承しない（spawn() は env 引数を持たない —
+  # 上の ENV_EXPORTS と同じ理由）。scripts/bin/plan を
   # 使えるようにするため、ペイン側の $PATH に対して明示的に prepend する。
   LAUNCH_CMD="$ENV_EXPORTS; export PATH='${REPO_ROOT}/scripts/bin:'\"\$PATH\"; unset CLAUDE_CODE_CHILD_SESSION; cd '$WORK_DIR'; claude${MODEL_CLI_ARG}${SETTINGS_CLI_ARG}${PERMISSION_MODE_CLI_ARG}"
 
@@ -775,7 +781,7 @@ PYEOF
     # CREWVIA_MUX を spawn するコマンド文字列自体に明示的に埋め込む。
     # mux_spawn (→ lib_mux.py spawn → 各 backend の pane_run/send-keys) はどの
     # backend でも呼び出し側プロセスの env を新しいペインへ自動伝播しない
-    # (spawn() は env= 引数を受け取るが両 backend とも未実装)。herdr は特に
+    # (spawn() は env 引数を持たない。渡すと TypeError — t017)。herdr は特に
     # サーバー起動時の env スナップショットを全ペインへ継承するため、
     # ambient env 継承に頼ると「dispatcher にはあるのに watchdog には無い」
     # ような非対称が起こりうる (t016)。コマンド文字列へ直接埋め込めば、

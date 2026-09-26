@@ -2063,6 +2063,95 @@ def retirement_reservation(agent):
     return None
 
 
+# 前世代の後始末待ち (t021)
+# ---------------------------------------------------------------------------
+#
+# Worker 名は使い回される (名前はポジション)。前任の退役が終わる前に後任が起動
+# すると、後任の最初の pull は前任の marker に当たって必ず 1 回空振りする —
+# marker の pane_pid は前任のもので、後任のものではないのに、予約は名前だけで
+# 効くからである (2026-09-23: watchdog が後始末を終えたのは後任の起動 5 秒後)。
+#
+# 拒否の既定は変えない。**「前任の pane が既に死んでいて、後始末だけが残って
+# いる」ことを証明できたときだけ**、その後始末が終わるのを待って取り直す。
+# 待つのは pull の判定を通ったあと (ロックの外) で、marker が消えたらロックを
+# 取り直して判定を最初からやり直す — 待った結果を「通ってよい」の証拠に使わ
+# ない。判断できない (読めない・phase が違う・pid が読めない・pid が生きている)
+# ときは従来どおり拒否する。**待つことの誤りは 60 秒の遅れで済む** (待っても
+# marker が消えなければ結局拒否する) ので、判定はこの向きに倒してよい。
+#
+# 60 秒の根拠: 後始末をするのは watchdog で、周期は 30 秒
+# (watchdog.py DEFAULT_CHECK_INTERVAL)。terminated の marker は次の周期で settle
+# されるので、最悪でも 1 周期 + plan.sh retire 1 回。その 2 周期ぶん。
+# 上限を持つのは、後始末が進まない (cleanup_failed 等) marker のために pull を
+# 永久に待たせないため。
+PREDECESSOR_CLEANUP_WAIT_SECONDS = 60
+PREDECESSOR_CLEANUP_POLL_SECONDS = 1.0
+
+
+def _recorded_pid(value):
+    """marker が記録した pid。使える値でなければ None (= 何の証拠にもならない)。"""
+    if isinstance(value, bool):
+        return None
+    try:
+        pid = int(value)
+    except (TypeError, ValueError):
+        return None
+    return pid if pid > 0 else None
+
+
+def _pid_is_gone(pid):
+    """`ESRCH` (そういう process は無い) と**証明できる**ときだけ True。
+
+    `EPERM` は「居るが signal を送れない」= 生きている。それ以外の失敗も
+    「観測できなかった」で、死んだ証拠にしない。
+    """
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
+def predecessor_cleanup_pending(agent):
+    """`agent` の退役 marker が「死んだ前世代の後始末待ち」と証明できるなら True。
+
+    条件は 3 つの AND: progress の phase が `terminated` (kill は済み、queue の
+    後始末だけが残っている) / 記録された pane_pid が読める / その pid が死んで
+    いる (`ESRCH`)。progress に pid が無いときは request の `spawn_identity` の
+    pid を見る (watchdog の `_exit_evidence()` と同じ順序)。どれかが欠ければ
+    False — 拒否の既定に戻る。
+
+    marker の中身を読むので、**キューロックの中では呼ばない** (`retirement_reservation()`
+    の注記)。読み取りは registry を開くコードの入口 (`lib_task_cards`) を通す。
+    """
+    if not agent or agent_name_problem(agent):
+        return False
+    root = os.environ.get('CREWVIA_REPO_ROOT') or REPO_ROOT
+    base = os.path.join(root, 'registry', 'retirements')
+
+    def _load(suffix):
+        text = _TASK_CARDS.read_regular_text_or_unreadable(os.path.join(base, agent + suffix))
+        if _TASK_CARDS.is_missing(text) or _TASK_CARDS.is_unreadable(text):
+            return None
+        try:
+            doc = json.loads(text)
+        except ValueError:
+            return None
+        return doc if isinstance(doc, dict) else None
+
+    prog = _load('.progress.json')
+    if prog is None or prog.get('phase') != 'terminated':
+        return False
+    pid = _recorded_pid(prog.get('pane_pid'))
+    if pid is None:
+        req = _load('.json') or {}
+        identity = req.get('spawn_identity')
+        pid = _recorded_pid(identity.get('pane_pid')) if isinstance(identity, dict) else None
+    return pid is not None and _pid_is_gone(pid)
+
+
 def retire_assignment(agent, mission, task_id, generation):
     """assignment を撤去する唯一の入口。キューロック保持が前提。
 
@@ -3139,7 +3228,33 @@ def cmd_pull(args):
             'target_dir': meta.get('target_dir'),  # None for crewvia-local tasks
         }
 
-    with_lock(_do)
+    # 退役予約で断られたとき、それが「死んだ前任の後始末待ち」と証明できれば、
+    # 後始末が終わるのを待って**判定からやり直す** (t021)。待つのはロックの外:
+    # 抱えたまま待つと、dispatcher・全 Worker の plan.sh・watchdog が同期で叩く
+    # `retire --no-wait` が止まる。marker の中身を読む `predecessor_cleanup_pending()`
+    # も同じ理由でロックの外。上限は PREDECESSOR_CLEANUP_WAIT_SECONDS。
+    wait_deadline = time.monotonic() + PREDECESSOR_CLEANUP_WAIT_SECONDS
+    waited = False
+    while True:
+        with_lock(_do)
+        if chosen_holder[0] is not None or diag['reason'] != 'retirement_reserved':
+            break
+        if time.monotonic() >= wait_deadline or not predecessor_cleanup_pending(agent):
+            if waited:
+                diag['detail'] += (
+                    f' (前任の後始末を {PREDECESSOR_CLEANUP_WAIT_SECONDS} 秒待ちましたが'
+                    f'終わりませんでした)')
+            break
+        if not waited:
+            waited = True
+            print(
+                f"[plan.sh pull] {agent} の前任の退役は kill まで済んでいて、後始末待ちです。"
+                f"最大 {PREDECESSOR_CLEANUP_WAIT_SECONDS} 秒待って取り直します。",
+                file=sys.stderr,
+            )
+        time.sleep(PREDECESSOR_CLEANUP_POLL_SECONDS)
+        diag['reason'] = None
+        diag['detail'] = ''
 
     if chosen_holder[0] is None:
         # exit 2 = "no task available" (idle / sleep & retry)

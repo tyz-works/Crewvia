@@ -178,7 +178,7 @@ from lib_task_cards import (  # noqa: E402
     is_missing, is_unreadable, read_regular_text_or_unreadable,
 )
 # JSON の状態ストアを読む入口も 1 つ (t026)。ここで `json.loads` を書き足さない。
-from lib_daemon_state import load_json_store  # noqa: E402
+from lib_daemon_state import TOLD_TIMEOUT_KIND, load_json_store  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Phases
@@ -755,7 +755,8 @@ def identity_matches(recorded: Optional[dict], current: Optional[dict]) -> Tuple
 def build_request(agent: str, window_target: str, reason: str, identity: dict,
                   mission: Optional[str] = None, task_id: Optional[str] = None,
                   message: str = SHUTDOWN_MESSAGE,
-                  task_started_at=UNKNOWN_STARTED_AT) -> dict:
+                  task_started_at=UNKNOWN_STARTED_AT,
+                  detail: Optional[dict] = None) -> dict:
     """A dispatcher-side retirement request.
 
     `mission` / `task_id` are None for the idle / no-task / blocked-stuck
@@ -788,6 +789,11 @@ def build_request(agent: str, window_target: str, reason: str, identity: dict,
     }
     if task_started_at is not UNKNOWN_STARTED_AT:
         req["task_started_at"] = task_started_at
+    if detail:
+        # What the requester knew when it decided (t021): for a timeout, which
+        # limit and how long.  The after-the-fact report is written by a later
+        # cycle, possibly after a daemon restart, so it cannot ask the monitor.
+        req["detail"] = dict(detail)
     return req
 
 
@@ -812,6 +818,8 @@ def _carried_from_request(req: dict) -> dict:
     }
     if "task_started_at" in req:
         carried["task_started_at"] = req["task_started_at"]
+    if req.get("detail"):
+        carried["detail"] = req["detail"]
     return carried
 
 
@@ -901,7 +909,8 @@ class RetirementExecutor:
     def __init__(self, registry_dir, repo_root, mux, repo_identity_check, *,
                  log=None, notify=None, plan_sh=None, queue_dir=None,
                  grace_period: int = 60, kill_delay: int = 10,
-                 run_command=None, kill_process=None, now=None) -> None:
+                 run_command=None, kill_process=None, now=None,
+                 notify_once=None) -> None:
         self.registry_dir = Path(registry_dir)
         self.repo_root = Path(repo_root)
         self.mux = mux
@@ -925,6 +934,15 @@ class RetirementExecutor:
         # successful delivery retries only the receipt write, never the
         # notification (t034 / Codex 7巡目 P2-2).
         self._delivered_reports: set = set()
+        # `notify_once(key, fp, kind, slug, task, message) -> bool` (t021): "the
+        # Director has this notice" — sent now, or already recorded in the
+        # notify-once ledger.  None = no ledger wired (tests, old callers); the
+        # plain `notify` is used and there is no once-only guarantee.
+        self.notify_once = notify_once
+        # Notices `notify_once` could not deliver: {(key, fp): (mission, task,
+        # message, first_attempt_at)}.  In memory on purpose — see
+        # `_retry_owed_notices()`.
+        self._owed_notices: dict = {}
 
     # ------------------------------------------------------------------
     # Requesting (called by dispatcher via CLI, and by watchdog for W2)
@@ -942,7 +960,8 @@ class RetirementExecutor:
 
     def request(self, agent: str, window_target: str, reason: str,
                 mission: Optional[str] = None, task_id: Optional[str] = None,
-                message: str = SHUTDOWN_MESSAGE) -> bool:
+                message: str = SHUTDOWN_MESSAGE,
+                detail: Optional[dict] = None) -> bool:
         """Write a retirement request.  False = not written (and not owed).
 
         Refuses when the current window has no usable identity at all, because
@@ -993,11 +1012,12 @@ class RetirementExecutor:
                     f"— {why}. Asking again next cycle ({reason})")
                 return False
             return self._write_request(agent, window_target, reason, identity,
-                                       mission, task_id, message)
+                                       mission, task_id, message, detail)
 
     def _write_request(self, agent: str, window_target: str, reason: str,
                        identity: dict, mission: Optional[str],
-                       task_id: Optional[str], message: str) -> bool:
+                       task_id: Optional[str], message: str,
+                       detail: Optional[dict] = None) -> bool:
         """The request itself.  **Runs under the queue lock; no subprocesses.**
 
         Reading the card here rather than before taking the lock is not
@@ -1035,7 +1055,7 @@ class RetirementExecutor:
             return False
         req = build_request(agent, window_target, reason, identity,
                             mission=mission, task_id=task_id, message=message,
-                            task_started_at=started_at)
+                            task_started_at=started_at, detail=detail)
         # Create-if-absent, atomically.  The queue lock serialises this against
         # `plan.sh`; this keeps the *two daemons* from overwriting each other,
         # which the lock does not help with — they can both hold it, one after
@@ -1102,6 +1122,10 @@ class RetirementExecutor:
         Bounded by design (R2): no step blocks, so the caller's cycle time
         does not grow with the number of Workers being retired.
         """
+        # Before the early returns below: a notice is owed *because* its marker
+        # has already settled and gone, so "no markers" is exactly when it is due.
+        self._retry_owed_notices()
+
         agents = list_agents(self.registry_dir)
         if not agents:
             return []
@@ -2029,12 +2053,14 @@ class RetirementExecutor:
                 detail = output.strip()[:300] or "task no longer matches the retirement"
                 self.log(f"[retire] {agent}: no queue cleanup owed for {mission}/{task_id} "
                          f"— {detail}")
-                self._report(
-                    agent, prog,
+                message = (
                     f"watchdog が Worker {agent} を終了しましたが、task {task_id} "
                     f"(mission={mission}) は既に別の状態になっていたため queue は"
-                    f"変更していません ({detail})。確認だけお願いします。",
+                    f"変更していません ({detail})。確認だけお願いします。"
                 )
+                if not self._report_timeout_once(agent, req, prog, mission, task_id,
+                                                 generation, "other_state", detail):
+                    self._report(agent, prog, message)
             elif rc != 0:
                 return self._cleanup_failed(
                     agent, prog, f"plan.sh retire exited {rc}: {output.strip()[:400]}",
@@ -2045,13 +2071,15 @@ class RetirementExecutor:
                     f"(status→pending, assignment removed)"
                 )
                 reason = (req or {}).get("reason") or prog.get("reason") or "unknown"
-                self._report(
-                    agent, prog,
-                    f"watchdog が Worker {agent} を終了しました "
-                    f"(理由: {reason})。"
-                    f"task {task_id} (mission={mission}) は pending に戻し、"
-                    f"assignment も削除済みです。復旧作業は不要です。",
-                )
+                if not self._report_timeout_once(agent, req, prog, mission, task_id,
+                                                 generation, "reset", ""):
+                    self._report(
+                        agent, prog,
+                        f"watchdog が Worker {agent} を終了しました "
+                        f"(理由: {reason})。"
+                        f"task {task_id} (mission={mission}) は pending に戻し、"
+                        f"assignment も削除済みです。復旧作業は不要です。",
+                    )
         else:
             self.log(f"[retire] {agent}: retired, no task to clean up")
 
@@ -2109,6 +2137,108 @@ class RetirementExecutor:
         unlink_quiet(progress_path(self.registry_dir, agent))
         unlink_quiet(stall_path(self.registry_dir, agent))
         return "discarded_cleared"
+
+    # -- timeout notice (t021) ------------------------------------------
+
+    #: How long an undeliverable timeout notice is retried.  The usual cause is
+    #: the Director's window being absent for a restart (minutes); past this the
+    #: log line and the Taskvia alert are the record.
+    OWED_NOTICE_GIVE_UP_SECONDS = 1800
+
+    def _report_timeout_once(self, agent: str, req: Optional[dict], prog: dict,
+                             mission: str, task_id: str, generation: str,
+                             outcome: str, why: str) -> bool:
+        """Tell the Director about a *timeout* retirement, once.  False = not handled here.
+
+        Returns False (so the caller sends its plain report) for any other
+        reason, or when no notify-once ledger is wired.  True means the notice
+        was taken over: delivered, already recorded, or queued for retry.
+
+        One message per retirement, carrying what the Director needs to act:
+        which limit, how long, and whether `plan.sh update --reset` is needed.
+        `key` is per task and `fp` per retirement (`request_id`): a second
+        timeout of the same task is a new event and must get through, and a
+        repeat of the same one (a settle re-run after a crash between the send
+        and the marker removal) must not.  `outcome` is `reset` (plan.sh put the
+        task back to pending) or `other_state` (plan.sh found nothing to reset).
+        """
+        reason = (req or {}).get("reason") or prog.get("reason")
+        if reason != "timeout" or self.notify_once is None:
+            return False
+        detail = (req or {}).get("detail") or prog.get("detail") or {}
+        fp = str((req or {}).get("request_id") or prog.get("request_id") or f"gen:{generation}")
+        key = f"timeout_{mission}_{task_id}"
+        message = self._timeout_message(agent, mission, task_id, detail, outcome, why)
+        self._deliver_notice(key, fp, mission, task_id, message)
+        return True
+
+    @staticmethod
+    def _timeout_message(agent: str, mission: str, task_id: str, detail: dict,
+                         outcome: str, why: str) -> str:
+        kind = detail.get("kind")
+        try:
+            limit = f"{float(detail['limit_seconds']):.0f}"
+            observed = f"{float(detail['observed_seconds']):.0f}"
+        except (KeyError, TypeError, ValueError):
+            limit = observed = "?"
+        if kind == "max":
+            what = f"実行時間の上限 (max={limit}s) を超過 (経過 {observed}s)"
+        elif kind == "idle":
+            what = f"無活動が上限 (idle×2={limit}s) を超過 (無活動 {observed}s)"
+        else:
+            what = "timeout (種別を記録できていません)"
+        if outcome == "reset":
+            need = (f"task は pending に戻し、assignment も削除済みです。"
+                    f"`plan.sh update {task_id} --status pending --reset` は**不要**です。")
+        else:
+            need = (f"task は既に別の状態になっていたため queue は変更していません ({why})。"
+                    f"`--reset` は**不要**です (別の実行が進んでいれば巻き戻してしまいます)。")
+        return (
+            f"[timeout] watchdog が Worker {agent} を timeout で終了しました: "
+            f"task {task_id} (mission={mission}) — {what}。{need}"
+            f"同じ task がまた同じ上限に当たる場合は、task の frontmatter の "
+            f"timeout (idle / max) を見直してください。"
+        )
+
+    def _deliver_notice(self, key: str, fp: str, mission: str, task_id: str,
+                        message: str) -> bool:
+        """`notify_once` を呼ぶ。届かなければ、届くまで毎サイクル再送する対象にする。"""
+        try:
+            ok = bool(self.notify_once(key, fp, TOLD_TIMEOUT_KIND, mission, task_id, message))
+        except Exception as e:  # noqa: BLE001 — a notifier bug must not stop the machine
+            self.log(f"[retire] {key}: timeout notice failed: {type(e).__name__}: {e}")
+            ok = False
+        if ok:
+            self._owed_notices.pop((key, fp), None)
+            return True
+        first = self._owed_notices.get((key, fp), (mission, task_id, message, self.now()))[3]
+        self._owed_notices[(key, fp)] = (mission, task_id, message, first)
+        self._log_waiting(
+            key,
+            f"[retire] {key}: could not reach the Director with the timeout notice — "
+            f"retrying every cycle for {self.OWED_NOTICE_GIVE_UP_SECONDS}s "
+            f"(the log line at the time of the decision and the Taskvia alert are the record)")
+        return False
+
+    def _retry_owed_notices(self) -> None:
+        """Deliver timeout notices an earlier cycle could not.
+
+        In memory only.  A watchdog restart drops the queue, which is acceptable
+        for a *notice*: what the Director needs to act on is already in the log
+        line and the Taskvia alert, and the queue itself was repaired by the
+        cleanup that came first.  Persisting it would need a file that outlives
+        the marker, i.e. one more thing every reader of `registry/retirements/`
+        has to know about.
+        """
+        for (key, fp), (mission, task_id, message, first) in list(self._owed_notices.items()):
+            if self.now() - first > self.OWED_NOTICE_GIVE_UP_SECONDS:
+                del self._owed_notices[(key, fp)]
+                self.log(f"[retire] {key}: giving up on the timeout notice after "
+                         f"{self.OWED_NOTICE_GIVE_UP_SECONDS}s — the Director was never reached")
+                continue
+            if self._deliver_notice(key, fp, mission, task_id, message):
+                self.log(f"[retire] {key}: delivered the timeout notice that earlier "
+                         f"cycles could not send")
 
     def _report(self, agent: str, prog: dict, message: str) -> bool:
         if self.notify is None:

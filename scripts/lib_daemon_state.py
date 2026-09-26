@@ -44,8 +44,11 @@ PR #214 で、**同じ根の欠陥が 3 回** 出た:
 無ければ落とす。`dispatcher.sh` の埋め込み python も対象。表で示すだけにしない。
 """
 
+import contextlib
+import fcntl
 import json
 import math
+import os
 import sys
 import time
 from pathlib import Path
@@ -53,7 +56,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from lib_task_cards import (  # noqa: E402
-    Unreadable, is_unreadable, read_regular_text_or_unreadable,
+    Unreadable, is_missing, is_unreadable, read_regular_text_or_unreadable,
 )
 
 
@@ -136,6 +139,136 @@ def told_ledger_problem(data):
         if problem:
             return problem
     return None
+
+
+# ---------------------------------------------------------------------------
+# 「伝えた」台帳の書き込み (t021)
+# ---------------------------------------------------------------------------
+#
+# 台帳 (`registry/daemons/notified-state.json`) の書き手は **2 人** になった:
+# dispatcher (needs_director / handoff / review 拒否) と watchdog (timeout 終了の
+# 通知)。read-modify-write は全体で 1 つのクリティカルセクションでなければならず、
+# 原子的な置換 (temp + os.replace) だけでは「A が読む → B が書く → A が書く」で B の
+# エントリが消える。消えたのが dispatcher のエントリなら、対処済みの状態の通知が
+# 再送される (2026-09-25 に数十通届いた洪水の型)。
+#
+# そこで台帳の書き換えは **すべて `told_lock()` の中** で行う。読むだけの側は
+# ロックを取らない (置換は原子的なので、途中の姿は見えない)。
+
+#: ロックを待つ上限。dispatcher は 5 秒周期、watchdog は 30 秒周期で、どちらも
+#: 「取れなければ次のサイクルで」に倒せるので、長く待つ理由が無い。
+TOLD_LOCK_WAIT_SECONDS = 2.0
+
+#: watchdog が書く timeout 通知のエントリの kind。**この kind のエントリは、書かれて
+#: から `TOLD_TIMEOUT_TTL_SECONDS` のあいだは dispatcher の prune の対象外**である
+#: (状態ベースの通知と違い、「状態を離れた」ことを dispatcher は観測できない — task は
+#: 後始末で pending に戻っているので live key に現れない)。TTL を過ぎたものは
+#: dispatcher の prune が掃除する。
+TOLD_TIMEOUT_KIND = 'timeout'
+TOLD_TIMEOUT_TTL_SECONDS = 24 * 3600
+
+
+@contextlib.contextmanager
+def told_lock(path, wait=TOLD_LOCK_WAIT_SECONDS):
+    """台帳の read-modify-write を直列化する排他ロック。取れたかどうかを yield する。
+
+    `with told_lock(TOLD_FILE) as held:` — **`held` が False のとき本体は走るが、台帳に
+    書いてはいけない** (書けなかった扱いにして呼び出し側の「取れなければ次のサイクル」
+    に倒す)。ロックのファイルは `<path>.lock`。中身は読まない (fd は `flock` にしか
+    渡さない) ので書き込み専用で開く。`O_NONBLOCK` は、そこに FIFO を置かれても
+    open が返るようにするため。開けなければ (置き場が使えない) 取れなかった扱い。
+    """
+    lock_path = f'{path}.lock'
+    fd = None
+    held = False
+    try:
+        try:
+            os.makedirs(os.path.dirname(lock_path) or '.', exist_ok=True)
+            fd = os.open(lock_path, os.O_CREAT | os.O_WRONLY | os.O_NONBLOCK, 0o644)
+        except OSError:
+            fd = None
+        if fd is not None:
+            deadline = time.monotonic() + wait
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    held = True
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        break
+                    time.sleep(0.05)
+        yield held
+    finally:
+        if fd is not None:
+            if held:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+            os.close(fd)
+
+
+def told_matches(told, key, fp):
+    """`told` (= `load_json_store(..., check=told_ledger_problem)` の結果) が、この key を
+    この fingerprint で「伝えた」としているか。使えない台帳は「伝えていない」(再送側)。"""
+    if is_unreadable(told):
+        return False
+    entry = told.get(key)
+    return isinstance(entry, dict) and entry.get('fp') == fp
+
+
+def told_is_fresh_timeout(entry, now=None):
+    """dispatcher の prune が触ってはいけない timeout 通知のエントリか (TTL 内)。"""
+    if not isinstance(entry, dict) or entry.get('kind') != TOLD_TIMEOUT_KIND:
+        return False
+    at = entry.get('at')
+    if not is_finite_number(at):
+        return False
+    now = time.time() if now is None else now
+    return 0 <= now - at < TOLD_TIMEOUT_TTL_SECONDS
+
+
+def write_told_atomic(path, told):
+    """台帳を temp + os.replace で書く。書けなければ False (例外は出さない)。
+
+    **`told_lock()` の中で呼ぶこと。**
+    """
+    path = Path(path)
+    tmp = path.with_name(f'.{path.name}.{os.getpid()}.tmp')
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(json.dumps(told, ensure_ascii=False, sort_keys=True))
+        os.replace(tmp, path)
+        return True
+    except OSError:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False
+
+
+def told_record(path, key, entry, warn=None):
+    """台帳に 1 エントリ足す (ロックの下で read-modify-write)。書けたら True。
+
+    エントリは `told_entry_problem()` を通してから書く (読み手と同じ形)。台帳が壊れて
+    いれば作り直す (自己修復 — dispatcher の `record_told()` と同じ向き)。ロックが
+    取れなければ False。
+    """
+    problem = told_entry_problem(key, entry)
+    if problem:
+        _safe_warn(warn, f'notified-state: 台帳に書けない形のエントリ ({problem})')
+        return False
+    with told_lock(path) as held:
+        if not held:
+            _safe_warn(warn, f'notified-state: {path} のロックを取れなかった')
+            return False
+        told = load_json_store(path, check=told_ledger_problem, warn=warn)
+        if is_missing(told) or is_unreadable(told):
+            told = {}
+        told[key] = entry
+        return write_told_atomic(path, told)
 
 
 # ---------------------------------------------------------------------------

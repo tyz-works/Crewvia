@@ -200,6 +200,11 @@ ALLOWED_JSON_PARSES: dict[tuple[str, str, str], str] = {
         _QUEUE_SIDE + "queue/assignments の実行アイデンティティ sidecar。外側 (dict か) は強制済みで、"
         "読めない・形が違うは None = 世代不明 (関数の docstring の契約)。"
         "内側の欄の型は呼び出し側任せ — backlog",
+    ("plan.sh", "predecessor_cleanup_pending", "json.loads(text)"):
+        _QUEUE_SIDE + "registry/retirements の marker (t021)。読むのは「前任の後始末待ちと証明できるか」の"
+        "判定だけで、外側 (dict か) は強制済み・内側は phase の一致と `_recorded_pid()` の検証を通る。"
+        "**証明できない形はすべて False = 待たずに従来どおり拒否** (壊れた marker が拒否を緩めない向き)。"
+        "入口へ移すなら lib_daemon_state を plan.sh の依存に足すことになり、単体コピーの fixture が壊れる",
     ("plan.sh", "_load_taskvia_map", "json.loads(text)"):
         _QUEUE_SIDE + "queue/.taskvia-map.json (Taskvia id のキャッシュ)。外側は強制済みで、"
         "壊れていれば {} = もう一度送る (冪等)",

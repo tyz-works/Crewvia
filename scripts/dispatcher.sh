@@ -149,7 +149,7 @@ import lib_review_refusal  # noqa: E402
 # tests/test_daemon_state_reads_go_through_the_entry.py (この埋め込み python も走査する)。
 from lib_daemon_state import (  # noqa: E402
     load_json_store, notify_cache_problem, rule5_state_problem, told_entry_problem,
-    told_ledger_problem,
+    told_is_fresh_timeout, told_ledger_problem, told_lock,
 )
 # Worker が起動された TARGET_DIR の記録と、「この Worker にこの task を回してよいか」の
 # 判定 (t009 / #21)。定義はこのモジュールに 1 つだけ (`plan.sh pull` の target 照合と
@@ -856,12 +856,6 @@ def record_told(key, fp, kind, slug, task_id, throttle_key=None):
     A → B → A で 3 回目の A が 1 回目の A の `<key>#<fp_A>` に NOTIFY_TTL のあいだ
     遮られ、**新しい事象の通知が遅れる** (t021 / Kai P2)。
     """
-    told = load_told()
-    if is_unreadable(told):
-        told = {}
-    prev = told.get(key)
-    if isinstance(prev, dict) and prev.get('fp') != fp:
-        forget_notify(f'{key}#', keep=throttle_key)
     entry = {'fp': fp, 'kind': kind, 'slug': slug, 'task': str(task_id)}
     # 書くものは、読み手が受け付ける形と同じでなければならない (t026)。読み手だけが
     # 厳しいと、書いたばかりの台帳を自分が「壊れている」と読み、永久に再送側へ倒れる。
@@ -869,8 +863,21 @@ def record_told(key, fp, kind, slug, task_id, throttle_key=None):
     if problem:
         _told_trouble(f"台帳に書けない形のエントリ ({problem})")
         return False
-    told[key] = entry
-    return save_told(told)
+    # 台帳の書き手は watchdog (timeout 通知) と 2 人 (t021)。read-modify-write の全体を
+    # `told_lock()` の下に置く — 原子的な置換だけでは、相手が今書いたエントリを、
+    # 古い読み取りの書き戻しで消しうる。取れなければ「書けなかった」= 再送側 (次サイクル)。
+    with told_lock(TOLD_FILE) as held:
+        if not held:
+            _told_trouble(f"{TOLD_FILE} のロックを取れない")
+            return False
+        told = load_told()
+        if is_unreadable(told):
+            told = {}
+        prev = told.get(key)
+        if isinstance(prev, dict) and prev.get('fp') != fp:
+            forget_notify(f'{key}#', keep=throttle_key)
+        told[key] = entry
+        return save_told(told)
 
 
 def prune_told(live_keys, observed_slugs):
@@ -879,17 +886,22 @@ def prune_told(live_keys, observed_slugs):
     観測できた mission (`observed_slugs`) の task だけが対象。観測できなかった
     (破損カード・走査失敗) ものは「離れた」の証拠にならないので触らない。
     """
-    told = load_told()
-    if is_unreadable(told):
-        return
-    stale = [k for k, e in told.items()
-             if isinstance(e, dict) and e.get('slug') in observed_slugs
-             and k not in live_keys]
-    if not stale:
-        return
-    for k in stale:
-        del told[k]
-    save_told(told)
+    # watchdog の timeout 通知 (kind=timeout) は TTL のあいだ対象外 — その task は後始末で
+    # pending に戻っていて、live key に現れないのが普通 (`told_is_fresh_timeout()`)。
+    with told_lock(TOLD_FILE) as held:
+        if not held:
+            return      # 次のサイクルでやり直す。prune は遅れてよい (欠落ではなく遅延)
+        told = load_told()
+        if is_unreadable(told):
+            return
+        stale = [k for k, e in told.items()
+                 if isinstance(e, dict) and e.get('slug') in observed_slugs
+                 and k not in live_keys and not told_is_fresh_timeout(e)]
+        if not stale:
+            return
+        for k in stale:
+            del told[k]
+        save_told(told)
     # 台帳の記録だけでなくスロットル (`<key>#<fp>`) も捨てる。状態を離れて同じ理由で
     # 戻ったのは新しい事象で、fingerprint は前回と同じ。スロットルが残っていると
     # 台帳が「伝えていない」と言っても NOTIFY_TTL のあいだ遮られる (t021 / Kai P2)。

@@ -45,6 +45,10 @@ sys.path.insert(0, str(_SCRIPTS_DIR))
 from lib_mux import Mux, repo_identity_ok  # noqa: E402
 import lib_retirement  # noqa: E402
 import lib_daemon_watch  # noqa: E402
+# 「伝えた」台帳 (dispatcher と共有) の読み書き。timeout 終了の通知を 1 回だけにする (t021)。
+from lib_daemon_state import (  # noqa: E402
+    load_json_store, told_ledger_problem, told_matches, told_record,
+)
 # task カードの読み取りは crewvia の中で 1 箇所しかない (Codex 5 巡目 P2)。
 # ここに frontmatter を直接読むコードを書き戻さないこと — plan.sh が `[破損]`
 # として保留するカードを、この監視だけが別の task の id で数える状態に戻る。
@@ -961,6 +965,37 @@ def _notify_director(message: str) -> bool:
     return bool(_mux.send(_director_name(), message))
 
 
+def make_notify_once(repo_root: Path, *, send=None, log=None, now=None):
+    """Director への通知を、台帳 (`registry/daemons/notified-state.json`) で 1 回だけにする。
+
+    戻り値の `notify_once(key, fp, kind, slug, task, message)` は「Director はこの通知を
+    持っている」= 今送れた、または台帳に既に記録がある、のとき True。送れなかったときは
+    **台帳に書かない** (戻ったらすぐ送る。呼び出し側が再送する)。台帳が使えないとき
+    (壊れている) は「伝えていない」= 再送側に倒す — dispatcher と同じ向き。
+
+    台帳は dispatcher と共有する (書き手は 2 人)。書き込みは `told_record()` が
+    `told_lock()` の下で行う。送れたのに台帳に書けなかったときは、送った事実を優先して
+    True を返す (再送すると Director に同じ通知が 2 通届く。書けなかったことは log に残す)。
+    """
+    told_path = Path(repo_root) / "registry" / "daemons" / "notified-state.json"
+    send = send or _notify_director
+    log = log or _log
+    clock = now or time.time
+
+    def notify_once(key, fp, kind, slug, task, message) -> bool:
+        told = load_json_store(told_path, check=told_ledger_problem)
+        if told_matches(told, key, fp):
+            return True
+        if not send(message):
+            return False
+        entry = {"fp": fp, "kind": kind, "slug": slug, "task": str(task), "at": clock()}
+        if not told_record(told_path, key, entry, warn=log):
+            log(f"[notify-once] sent {key} but could not record it in {told_path}")
+        return True
+
+    return notify_once
+
+
 def _watch_dispatcher() -> None:
     """Is the dispatcher still alive?  (t005)
 
@@ -979,6 +1014,20 @@ def _watch_dispatcher() -> None:
                               lib_daemon_watch.ACTION_GRACE,
                               lib_daemon_watch.ACTION_DISABLED):
         _log(f"[daemon-watch] dispatcher: {verdict.action} — {verdict.reason}")
+
+
+def timeout_detail(monitor: "WorkerMonitor", detail: "CheckResult", elapsed: float) -> dict:
+    """Which limit ended this Worker, for the Director's after-the-fact notice (t021).
+
+    `max_exceeded` is the absolute ceiling (`elapsed` > `max_threshold`); `hard_idle`
+    is `idle_seconds` > 2 × `idle_threshold` (see `check_detail()`).  Carried in the
+    retirement request, because the notice is written by a later cycle.
+    """
+    if detail.reason == "max_exceeded":
+        return {"kind": "max", "observed_seconds": round(elapsed),
+                "limit_seconds": monitor.max_threshold}
+    return {"kind": "idle", "observed_seconds": round(detail.idle_seconds),
+            "limit_seconds": monitor.idle_threshold * 2}
 
 
 def should_monitor(task_card: dict, retirement, authority: str) -> bool:
@@ -1000,7 +1049,7 @@ def should_monitor(task_card: dict, retirement, authority: str) -> bool:
 
 
 def make_retirement_executor(repo_root: Path, *, queue_dir: Optional[Path] = None,
-                             mux=None, notify=None, log=None):
+                             mux=None, notify=None, log=None, notify_once=None):
     """Build the phase machine that ends Workers and repairs the queue.
 
     Split out from run() so the machine can be driven a cycle at a time in
@@ -1015,6 +1064,8 @@ def make_retirement_executor(repo_root: Path, *, queue_dir: Optional[Path] = Non
         repo_identity_check=lambda: repo_identity_ok(repo_root),
         log=log or _log,
         notify=notify if notify is not None else _notify_director,
+        notify_once=(notify_once if notify_once is not None
+                     else make_notify_once(repo_root, send=notify)),
         plan_sh=repo_root / "scripts" / "plan.sh",
         queue_dir=queue_dir or Path(os.environ.get("CREWVIA_QUEUE", str(repo_root / "queue"))),
         grace_period=TERMINATE_GRACE_PERIOD,
@@ -1525,6 +1576,7 @@ def run(repo_root: Path, interval: int) -> None:
                             agent, window, "timeout",
                             mission=slug, task_id=task_id,
                             message=TERMINATE_MESSAGE,
+                            detail=timeout_detail(monitor, detail, elapsed),
                         )
                         if requested:
                             # Keeping the monitor would re-fire terminate every

@@ -21,10 +21,12 @@ set -euo pipefail
 #                              --skills 省略時は環境変数 SKILLS → registry の Worker の skills の順。
 #                              どれも無ければ拒否 (skill の絞り込みを丸ごと無効にしない)。
 #                              Director (registry の role: director) は pull できない
-#   plan.sh done <task_id> "<result>" [--mission <slug>] [--pr <N>]
+#   plan.sh done <task_id> "<result>" [--mission <slug>] (--pr <N> | --no-pr "<理由>")
 #                              --pr <N>: この task の PR 番号。この task を blocked_by に持つ
 #                              codex-review / review の task に pr_number を書く (未設定のものだけ)。
 #                              codex-review が blocked なら pending に戻す。Result からは推測しない
+#                              この task を待つ codex-review (pr_number 未設定) があるのに --pr が無いと拒否
+#                              (exit 2、何も書かない)。PR を作らない task は --no-pr "<理由>" (card に残る)
 #   plan.sh fail <task_id> [<handoff_path>] (--head <sha> | --no-head <理由>) [--mission <slug>]
 #   plan.sh update <task_id> [--mission <slug>] [--skills <csv>] [--blocked-by <csv>]
 #                            [--priority high|medium|low] [--worker <name>] [--status <status>]
@@ -513,7 +515,7 @@ def _dump_inline(val):
 TASK_META_KEY_ORDER = [
     'id', 'title', 'skills', 'priority', 'status',
     'blocked_by', 'released_deps', 'timeout', 'target_dir', 'worker', 'started_at', 'completed_at',
-    'handoff_path', 'fail_head', 'fail_head_waiver', 'pr_number',
+    'handoff_path', 'fail_head', 'fail_head_waiver', 'pr_number', 'no_pr_waiver',
     'acceptance_criteria', 'verification', 'rework_count', 'max_rework',
     'qa_checkpoints', 'required_evidence', 'needs_director_reason',
 ]
@@ -2500,7 +2502,8 @@ USAGE = {
             '                     [--pr-number <N>]'),
     'pull': ('plan.sh pull [--mission <slug>] [--skills <csv>] [--agent <name>]\n'
              '                    [--target-dir <path>] [--task <task_id>]'),
-    'done': 'plan.sh done <task_id> "<result>" [--mission <slug>] [--pr <N>]',
+    'done': ('plan.sh done <task_id> "<result>" [--mission <slug>] [--pr <N>]\n'
+             '                    [--no-pr "<理由>"]   (--pr / --no-pr は codex-review が待っているときだけ必須)'),
     'needs-director': 'plan.sh needs-director <task_id> "<理由>" [--mission <slug>]',
     'fail': ('plan.sh fail <task_id> [<handoff_path>] (--head <sha> | --no-head "<理由>")\n'
              '                     [--mission <slug>]'),
@@ -3663,6 +3666,9 @@ def cmd_needs_director(args):
 #: kai-review.sh に PR 番号を渡すために必須、`review` は Worker が読むカードに書く。
 PR_PROPAGATION_SKILLS = ('codex-review', 'review')
 
+#: もう PR 番号を待っていない status (`codex_reviews_awaiting_pr` が数えない)。
+PR_NOT_AWAITED_STATUSES = {'done', 'verified', 'failed', 'skipped', 'cancelled', 'verification_failed'}
+
 
 def propagate_pr_number(slug, task_id, pr_number):
     """`task_id` を blocked_by に持つ codex-review / review の task に `pr_number` を書く。
@@ -3700,8 +3706,33 @@ def propagate_pr_number(slug, task_id, pr_number):
     return touched
 
 
+def codex_reviews_awaiting_pr(slug, task_id):
+    """`task_id` を **直接** blocked_by に持ち、PR 番号が要るのに未設定の codex-review task。
+
+    `propagate_pr_number` の伝え先のうち codex-review だけ (review の task は番号が無くても
+    Worker が PR を探せるので、止めるほどの事故にならない)。終わった task (done / failed /
+    skipped / cancelled ...) は番号を待っていない。`[破損]` の card は読み違えないので数えない
+    (拒否の根拠にできるのは、読めた card だけ)。キューロックの中で呼ぶこと。
+    戻り値: 該当 task の id のリスト。
+    """
+    waiting = []
+    for meta, _body in list_tasks(slug):
+        status = meta.get('status')
+        if status == CORRUPT_TASK_STATUS or status in PR_NOT_AWAITED_STATUSES:
+            continue
+        deps = meta.get('blocked_by')
+        if not isinstance(deps, list) or task_id not in deps:
+            continue
+        if 'codex-review' not in set(meta.get('skills') or []):
+            continue
+        if meta.get('pr_number') not in (None, ''):
+            continue
+        waiting.append(meta['id'])
+    return waiting
+
+
 def cmd_done(args):
-    opts, positional = parse_opts(args, {'--mission': 'value', '--pr': 'value'})
+    opts, positional = parse_opts(args, {'--mission': 'value', '--pr': 'value', '--no-pr': 'value'})
     if len(positional) < 2:
         die("done requires <task_id> and <result>")
     task_id = positional[0]
@@ -3715,6 +3746,13 @@ def cmd_done(args):
             die("--pr must be a positive integer")
         if pr_number <= 0:
             die("--pr must be a positive integer")
+    no_pr_reason = None
+    if opts.get('--no-pr') is not None:
+        if pr_number is not None:
+            _usage_exit("--pr と --no-pr は同時に指定できません")
+        no_pr_reason = ' '.join(str(opts['--no-pr']).split())
+        if not no_pr_reason:
+            _usage_exit('--no-pr には理由 (空でない 1 行) が必要です')
     sync_holder = [None]  # (slug, task_id, result)
     worker_holder = [None]  # worker name for registry bump (None = _do未実行, '' = worker未設定)
 
@@ -3763,6 +3801,23 @@ def cmd_done(args):
                 f" 差し戻してから再度 plan.sh done を呼んでください。"
             )
 
+        # ── PR 番号の付け忘れ (t036) ──────────────────────────────────────
+        # この task を待つ codex-review に PR 番号が渡らないと、その task は pending のまま
+        # 誰にも知らされず、Codex を通らずに merge されうる。--pr も --no-pr も無いなら、
+        # 何も書かずに断る (fail の --head / --no-head と同じ作法)。
+        if pr_number is None and no_pr_reason is None:
+            awaiting = codex_reviews_awaiting_pr(slug, task_id)
+            if awaiting:
+                die(
+                    f"[plan.sh] {task_id} を blocked_by に持つ codex-review task ({', '.join(awaiting)}) が"
+                    f" PR 番号を待っています。--pr が無いと番号が伝わらず、codex-review が走らないまま"
+                    f" merge されえます。何も書いていません。\n"
+                    f"  PR を作った: plan.sh done {task_id} \"<result>\" --pr <N> --mission {slug}\n"
+                    f"  PR を作らない task: plan.sh done {task_id} \"<result>\" "
+                    f"--no-pr \"<理由 1 行>\" --mission {slug}",
+                    USAGE_EXIT,
+                )
+
         # ── QA Gate / required_evidence 検証 (fail と共通の入口) ──────────────
         err, _fields = _gate_terminal_report(
             'done', meta, {'result': result, 'task_id': task_id})
@@ -3770,6 +3825,8 @@ def cmd_done(args):
             die(err)
 
         meta['status'] = 'done'
+        if no_pr_reason is not None:
+            meta['no_pr_waiver'] = no_pr_reason
         meta['completed_at'] = now_iso()
         trailing = extract_trailing_body_section(body)
         desc, _ = parse_task_body(body)
@@ -3781,6 +3838,9 @@ def cmd_done(args):
         # PR 番号を、この task を待っている codex-review / review の card に伝える (#24)。
         # done と同じトランザクションで行う: done だけ済んで番号が伝わっていない瞬間に
         # dispatcher が「pr_number が無い」と警告して止まるのを避ける。
+        if no_pr_reason is not None:
+            print(f"[plan.sh warn] --no-pr で PR 番号なしの done を記録しました (理由: {no_pr_reason})"
+                  f" — card の no_pr_waiver に残しました", file=sys.stderr)
         if pr_number is not None:
             propagated = propagate_pr_number(slug, task_id, pr_number)
             if not propagated:

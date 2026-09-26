@@ -479,9 +479,11 @@ class TestDonePr:
         assert _status(sb, "t003") == "blocked", "番号を上書きしないなら status も動かさない"
 
     def test_without_the_flag_nothing_is_propagated_or_guessed_from_the_result(self, sb):
+        # t036: --pr を付けないなら --no-pr が要る。免除しても Result の「PR #231」からは推測しない。
         self._mission(sb)
-        r = sb.run("done", "t001", "PR #231 を作りました。head abc", "--mission", MISSION)
-        assert r.returncode == 0
+        r = sb.run("done", "t001", "PR #231 を作りました。head abc", "--no-pr", "免除の確認",
+                   "--mission", MISSION)
+        assert r.returncode == 0, (r.stdout, r.stderr)
         assert _pr_line(sb, "t003") is None and _status(sb, "t003") == "blocked"
 
     def test_task_itself_is_done_and_the_result_is_kept(self, sb):
@@ -513,6 +515,100 @@ class TestDonePr:
     def test_usage_documents_the_flag(self, sb):
         r = sb.run("done", "--help")
         assert r.returncode == 0 and "--pr <N>" in r.stdout
+
+
+class TestDoneRequiresPr:
+    """t036: 待っている codex-review があるのに --pr が無い done は、何も書かずに断る。
+
+    PR3 で「plan 時に --pr-number を書く」手作業を `done --pr` の自動伝播に置き換えたので、
+    --pr の付け忘れは「codex-review が pending のまま誰にも知らされず、Codex を通らずに
+    merge される」事故になる。
+    """
+
+    def _waiting(self, sb, *, status="blocked", extra=()):
+        sb.card("t001", status="in_progress", worker="Ren")
+        sb.card("t003", skills="[codex-review]", blocked_by="[t001]", status=status,
+                extra=list(extra))
+
+    def test_missing_pr_is_refused_with_exit_2_and_writes_nothing(self, sb):
+        self._waiting(sb)
+        before = sb.snapshot()
+        r = sb.run("done", "t001", "finished", "--mission", MISSION)
+        assert r.returncode == 2, (r.stdout, r.stderr)
+        assert sb.snapshot() == before, "拒否は何も書かない (task は in_progress のまま)"
+        assert _status(sb, "t001") == "in_progress"
+
+    def test_the_refusal_names_the_waiting_task_and_the_command_to_type(self, sb):
+        self._waiting(sb)
+        r = sb.run("done", "t001", "finished", "--mission", MISSION)
+        assert "t003" in r.stderr
+        assert "--pr <N>" in r.stderr and '--no-pr "' in r.stderr
+        assert f"--mission {MISSION}" in r.stderr
+
+    def test_pending_codex_review_is_refused_too(self, sb):
+        self._waiting(sb, status="pending")
+        assert sb.run("done", "t001", "finished", "--mission", MISSION).returncode == 2
+
+    def test_with_pr_it_passes_and_propagates(self, sb):
+        self._waiting(sb)
+        r = sb.run("done", "t001", "finished", "--pr", "231", "--mission", MISSION)
+        assert r.returncode == 0, (r.stdout, r.stderr)
+        assert _pr_line(sb, "t003") == "pr_number: 231" and _status(sb, "t003") == "pending"
+
+    def test_no_pr_waives_it_and_leaves_the_reason_on_the_card_and_stderr(self, sb):
+        self._waiting(sb)
+        r = sb.run("done", "t001", "finished", "--no-pr", "PR を作らない調査 task",
+                   "--mission", MISSION)
+        assert r.returncode == 0, (r.stdout, r.stderr)
+        assert "no_pr_waiver: PR を作らない調査 task" in sb.text("t001")
+        assert "PR を作らない調査 task" in r.stderr, "静かに飛ばさない"
+        assert _status(sb, "t001") == "done"
+        assert _pr_line(sb, "t003") is None and _status(sb, "t003") == "blocked", "免除は伝播しない"
+
+    @pytest.mark.parametrize("reason", ["", "   "])
+    def test_no_pr_needs_a_reason(self, sb, reason):
+        self._waiting(sb)
+        before = sb.snapshot()
+        r = sb.run("done", "t001", "finished", "--no-pr", reason, "--mission", MISSION)
+        assert r.returncode == 2 and sb.snapshot() == before
+
+    def test_pr_and_no_pr_together_are_refused(self, sb):
+        self._waiting(sb)
+        before = sb.snapshot()
+        r = sb.run("done", "t001", "finished", "--pr", "1", "--no-pr", "x", "--mission", MISSION)
+        assert r.returncode == 2 and sb.snapshot() == before
+
+    def test_a_task_nobody_waits_on_needs_neither_flag(self, sb):
+        sb.card("t001", status="in_progress", worker="Ren")
+        sb.card("t002", skills="[qa]", blocked_by="[t001]")
+        sb.card("t004", skills="[review]", blocked_by="[t001]")
+        r = sb.run("done", "t001", "finished", "--mission", MISSION)
+        assert r.returncode == 0, (r.stdout, r.stderr)
+        assert "no_pr_waiver" not in sb.text("t001")
+
+    def test_an_indirect_dependent_does_not_count(self, sb):
+        sb.card("t001", status="in_progress", worker="Ren")
+        sb.card("t002", skills="[qa]", blocked_by="[t001]")
+        sb.card("t003", skills="[codex-review]", blocked_by="[t002]", status="blocked")
+        assert sb.run("done", "t001", "finished", "--mission", MISSION).returncode == 0
+
+    def test_a_codex_review_that_already_has_its_number_does_not_count(self, sb):
+        self._waiting(sb, extra=["pr_number: 100"])
+        assert sb.run("done", "t001", "finished", "--mission", MISSION).returncode == 0
+
+    @pytest.mark.parametrize("status", ["done", "failed", "skipped", "cancelled"])
+    def test_a_codex_review_that_is_already_over_does_not_count(self, sb, status):
+        self._waiting(sb, status=status)
+        assert sb.run("done", "t001", "finished", "--mission", MISSION).returncode == 0
+
+    def test_a_corrupt_card_is_not_a_reason_to_refuse(self, sb):
+        sb.card("t001", status="in_progress", worker="Ren")
+        (sb.tasks / "t007.md").write_text("not a card at all")
+        assert sb.run("done", "t001", "finished", "--mission", MISSION).returncode == 0
+
+    def test_usage_documents_no_pr(self, sb):
+        r = sb.run("done", "--help")
+        assert r.returncode == 0 and "--no-pr" in r.stdout
 
 
 # ---------------------------------------------------------------------------

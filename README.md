@@ -872,6 +872,9 @@ Assignments are checked by machine, not by the Worker's self-check (see `knowled
 - `plan.sh done <id> "<result>" --pr <N>` writes `pr_number` onto the `codex-review` / `review` tasks that
   are blocked by `<id>` and un-blocks a `blocked` `codex-review` task. `--pr` is explicit only; the result
   text is never parsed. A drafted plan may mark a task `status: blocked` if it has a `blocked_reason`.
+  If a `codex-review` task is waiting on `<id>` for its PR number, `done` without `--pr` is refused (exit 2,
+  nothing written); a task that does not produce a PR closes with `--no-pr "<reason>"` (recorded on the card).
+  The Dispatcher also tells the Director once about a ready `codex-review` task that has no `pr_number`.
 
 State-based notifications (a task in `needs_director`, a `failed` task with a handoff, a refused
 `codex-review`) are sent **once per state**, not repeated on a timer: the Dispatcher keeps a

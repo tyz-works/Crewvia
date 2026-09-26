@@ -6,7 +6,25 @@ crewvia の queue を herdr plugin `tyz-works/herdr-task-graph`
 利用者向けの手順は README「Task graph view with herdr-task-graph」。ここには
 **実測で分かったこと**と、そこから決めた方針の根拠を残す。
 
-検証環境: herdr 0.9.0（protocol 22）、plugin 0.1.1（commit 8801fde）、2026-09-25。
+検証環境: herdr 0.9.0（protocol 22）。§1〜§4 の実測は plugin 0.1.1（commit 8801fde、2026-09-25）。
+**結合確認（t011、2026-09-26）は crewvia `f9353fa` + plugin 0.3.0（`d2b8195`）**で、結果は §0 と §8。
+
+---
+
+## 0. plugin の版ごとの違い（t011 の実測で確定）
+
+必要な最低 version は **0.3.0**（label / group の表示と箱の折り返しは 0.3.0 から）。
+
+| 症状（0.1.1） | 直った版 | 0.3.0 での実測（隔離 herdr、3 mission / 62 task、Worker 相当 pane 2 つ） |
+|---|---|---|
+| `r` でしか再読み込みしない（§4-1） | 0.2.0 | `r` なしで `plan.sh update` から **0.4〜0.6 秒**（0.58 / 0.36 / 0.35 / 0.36 秒。`plan.sh` 自体の 0.15 秒を含む） |
+| エージェントが居ると `[offline]`・`Broken pipe`（§4-1b） | 0.2.0（snapshot と subscribe を別接続に） | ヘッダー `[live]`・ERROR 行なし。箱に `claude · idle` |
+| 設定が読めないと黙ってサンプルに落ちる（§4-2） | 0.2.0（設定済みで読めないときだけ） | dangling symlink で `ERROR: cannot read …/tasks.json` を出し、最後の内容を保つ。symlink を戻すと 2 秒で回復。`--once` は exit 1 |
+| 箱が重なる・入りきらない行が消える（§4-5） | 0.3.0 | 幅 80/120/200 で j を 62 回押すと全 62 task に届く（選択 box が画面外のフレーム 0）。重なりの署名（`[DO|`・`+--+--+`）0 件、陽性対照（0.1.1 の画面）では検出 |
+| 箱に `tNNN`・タイトルが出ない（P-2） | 0.3.0（`label` / `group`） | 全幅で `[STATE] tNNN · <mission 末尾>` + タイトル + agent の 3 段 |
+
+**0.3.0 でも残る**（§8 の観察）: config dir に entry が**無い**とサンプル（§4-2）/ agent 名は `claude`
+（Worker 名は出ない）/ 幅 200 でタイトルが短い / `open-task-graph` がタブを増やす（§9）。
 
 ---
 
@@ -71,7 +89,7 @@ crewvia の設計原則「mux 非依存」を崩さないため。plugin が無�
 
 manifest の action の説明は "Open or focus" だが、**実測では invoke のたびに新しいタブが開く**
 （既存の Task Graph タブがあっても重複を避けない）。自動化に組み込むと開くたびにタブが増える。
-見終わったらタブを閉じる。
+見終わったらタブを閉じる。0.3.0 でも同じ（t011 で確認）。今回は扱わない（§9）。
 
 ---
 
@@ -90,9 +108,9 @@ manifest の action の説明は "Open or focus" だが、**実測では invoke 
 
 ## 4. 制約（実測）
 
-### 4-1. plugin は `r` キーでしか再読み込みしない
+### 4-1. plugin は `r` キーでしか再読み込みしない（**0.1.1 のみ**。0.2.0 以降は自動。§0）
 
-`task_graph.py` が `load_config` を呼ぶのは**起動時と `r` キーの 2 箇所だけ**（ファイル監視なし）。
+以下は 0.1.1 の実測。`task_graph.py` が `load_config` を呼ぶのは**起動時と `r` キーの 2 箇所だけ**（ファイル監視なし）。
 隔離 herdr で確認:
 
 ```
@@ -103,12 +121,15 @@ plan.sh update t006 --status done   (生成物は即座に更新: done 48 / read
 ```
 
 タスクの DAG は最後に読んだ姿のまま。「crewvia は更新しているのに画面が変わらない」は
-故障ではなく仕様。`r` を押す。
+故障ではなく 0.1.1 の仕様。`r` を押す（0.2.0 以降はファイルの mtime・inode・size を見て自動で
+読み直す。symlink は追うので `os.replace` による置換も検知する。t011 の実測は §0）。
 
 （この節の初版は「生きているのは herdr が持つエージェントの状態だけ」と書いていたが、
 **Worker が動いている環境では成り立たない**。次の §4-1b。）
 
-### 4-1b. herdr 0.9.0 では、エージェントが 1 つでも居ると plugin は `[offline]` になる
+### 4-1b. herdr 0.9.0 では、エージェントが 1 つでも居ると plugin は `[offline]` になる（**0.1.1 のみ。0.2.0 で解消**。§0）
+
+以下は 0.1.1 の実測と原因。0.3.0 では `[live]` になることを t011 が確認した（§8）。
 
 **この環境（herdr 0.9.0 + plugin 0.1.1）では、エージェントが 1 つでも居ると plugin は
 offline になり、live なエージェント状態は来ない。** 実運用（Worker が動いている状態）では
@@ -130,7 +151,8 @@ plugin は同一接続で `session.snapshot` → `events.subscribe` の順に送
 `_run_session` が手前で返る）ため気付かない。A/B: 0 件 → `[live]` / 1 件 → `[offline]`。
 
 - **直す場所は upstream（`tyz-works/herdr-task-graph`）**: snapshot 用と subscribe 用で接続を分ける。
-  **crewvia 側では直せない**。upstream は t023 では変更していない（Director が別途判断）
+  **crewvia 側では直せない**。→ upstream 0.2.0 がこの形で直した（本番の plugin を 0.3.0 に
+  入れ替える手順は README「Upgrading the plugin」と §8）
 - README / CLAUDE.md の記述は、この実態に合わせてある
 - plugin は失敗のたびに約 0.75 秒待って snapshot からやり直すので、offline 表示のまま
   `agents[]` は繰り返し読み込まれる（§4-4 の検証でも agents[] が箱に反映された）。ただし
@@ -140,11 +162,17 @@ plugin は同一接続で `session.snapshot` → `events.subscribe` の順に送
   したがって **`[offline]` でも task の状態表示は crewvia の値そのもの**で、live の agent 状態が
   無いことで失うのは「箱の中の agent 名・状態の表示」だけ
 
-### 4-2. ファイルが見つからないと、エラーではなくサンプルが出る
+### 4-2. ファイルが見つからないと、エラーではなくサンプルが出る（0.2.0 以降は「entry が無いとき」だけ）
 
-`find_config` は候補を順に `is_file()` で試し、最後の候補に**同梱のサンプル `tasks.json`**
+0.1.1 の挙動。`find_config` は候補を順に `is_file()` で試し、最後の候補に**同梱のサンプル `tasks.json`**
 （"Product delivery"）を置いている。symlink の先が無い（生成前・パス違い・主 checkout でなく
 worktree を指した）と、**エラーなしでサンプルが描かれる**。
+
+**0.2.0 以降**: config dir に `tasks.json` の entry があれば（**dangling symlink を含む**。
+`is_symlink() or exists()`）その読み取りを試み、読めなければサンプルでなく **ERROR を出して最後に
+読めた内容を保つ**（t011 で実測）。サンプルが出るのは「entry が config dir に**無い**」ときだけ
+（何も設定されていない）。つまり symlink を作り忘れた・別の config dir に作った、はまだ黙って
+サンプルに落ちる。だから確認点は今も要る:
 
 → **画面のタイトルが `crewvia / <slug>`（active mission が 1 件のとき）または
 `crewvia / N missions`（0 件・2 件以上のとき）であることを毎回の確認点にする。**
@@ -212,12 +240,14 @@ snapshot を取り直す）。t006 QA が「未検証」としていた点は、
 
 **確認できていないこと**（「できる」とは書かない）:
 
-- **生成器が書いた `pane_id` を実 herdr の plugin が受けて Enter で飛べること**。上の検証は
-  tasks.json を手で書いた。生成器の実装は下の「実装（t007）」で入ったが、単体テストは生成物の
-  中身までしか見ていない。実 herdr での確認は QA（t008）と結合確認（t011）が行う
-- 実際の Claude Code の Worker pane での確認。検証は `claude` という名前のスタンドイン（`sleep`）で、
+- ~~生成器が書いた `pane_id` を実 herdr の plugin が受けて Enter で飛べること~~ → **t011 が確認済み**
+  （plugin 0.3.0 + crewvia `f9353fa`。生成物の node の `pane_id` が t011 = `w1:p2`、t012 = `w1:p3`
+  で、live ペインで選択して Enter → `focused_pane_id` が `w1:p5`（plugin）→ `w1:p2` / `w1:p3` に
+  移った。`registry/mux/<Name>-worker.json` の `pane_id` と一致）
+- 実際の Claude Code の Worker pane での確認（t011 も `claude` 名の `sleep` のスタンドイン）。検証は `claude` という名前のスタンドイン（`sleep`）で、
   herdr が `agent: "claude"` と認識する経路は同じだが、実 Worker では見ていない
-- agent の状態変化（idle → working 等）が offline 中の箱に追従するか
+- agent の状態変化（idle → working 等）が箱に追従するか（t011 は `claude · idle` の表示までで、
+  状態の遷移は見ていない）
 - pane id が herdr の再起動・復元を跨いで有効か（下記の注意点の前提）
 
 #### 実装（t007）
@@ -269,10 +299,11 @@ crewvia は Worker 起動時に `registry/mux/<Name>-worker.json` へ `pane_id`
 これは生成器の変更なので、ドキュメントの task（t005 / t023）では実装していない。
 task 化は Director の判断。
 
-### 4-5. 完了済み task が多いと画面が詰まる
+### 4-5. 完了済み task が多いと画面が詰まる（0.1.1。0.3.0 で折り返し・スクロールに）
 
-plugin は全 task を並べる。完了済みが数十件あると箱が潰れて ID が読めない
-（本番 queue の複製 53 task で確認）。描くのは **active な mission だけ**なので、
+0.1.1 は全 task を 1 行に並べる。完了済みが数十件あると箱が潰れて ID が読めない
+（本番 queue の複製 53 task で確認）。**0.3.0 は幅を超える段を折り返し、縦にスクロールする**ので
+62 task でも全件に j/k が届く（§0）が、多いほどスクロールは長くなる。描くのは **active な mission だけ**なので、
 終わった mission は `plan.sh archive <slug>` で退避すれば画面から消える。
 
 ---
@@ -305,11 +336,12 @@ task の node には `pane_id` も入る（Enter でそのペインに飛ぶた�
 
 | 症状 | まず見るところ |
 |---|---|
-| 画面が古い | `r` を押したか。ファイル側は `ls -l registry/task-graph/tasks.json` の mtime で確認 |
-| 画面が crewvia の内容でない（サンプルが出る） | タイトルが `crewvia / <slug>`（1 mission）か `crewvia / N missions`（0・2 件以上）か。symlink の先が存在するか、主 checkout を指しているか |
+| 画面が古い | plugin の版（`herdr plugin list`）。0.1.1 なら `r` を押す（自動再読み込みは 0.2.0 以降）。0.3.0 で古いままなら開いている**タブが古いコード**のことがある（入れ替え前に開いたタブは古いまま動く。閉じて開き直す）。ファイル側は `ls -l registry/task-graph/tasks.json` の mtime で確認 |
+| 画面が crewvia の内容でない（サンプルが出る） | 0.2.0 以降は config dir に entry が**無い**ときだけ。タイトルが `crewvia / <slug>`（1 mission）か `crewvia / N missions`（0・2 件以上）か。symlink の先が存在するか、主 checkout を指しているか |
 | ファイルが更新されない | `CREWVIA_TASK_GRAPH=0` になっていないか。`plan.sh task-graph` を手で実行して出力を見る。`plan.sh` の stderr に生成失敗の 1 行が出ていないか |
 | `plan.sh task-graph` が「queue が違う」と拒否する | `CREWVIA_QUEUE` が `<root>/queue` でない。書き先を明示するなら `CREWVIA_TASK_GRAPH_FILE` |
-| ヘッダーが `[offline]`、最下部に `ERROR: [Errno 32] Broken pipe` | Worker が動いている間は**平常**（§4-1b。herdr 0.9.0 の plugin の欠陥で、upstream 側の修正待ち）。crewvia の tasks.json 側を疑わない。task の状態表示は crewvia の値のまま |
+| ヘッダーが `[offline]`、最下部に `ERROR: [Errno 32] Broken pipe` | plugin が **0.1.1**（§4-1b。0.2.0 で直っている。入れ替えは README「Upgrading the plugin」）。crewvia の tasks.json 側を疑わない。task の状態表示は crewvia の値のまま。0.3.0 でこれが出たら別件 |
+| 最下部に `ERROR: cannot read …/tasks.json` | 0.2.0 以降の正常な報告。config dir の symlink の先が無い（`plan.sh task-graph` を 1 回走らせる）・主 checkout でなく worktree を指している。最後に読めた内容は画面に残る。ファイルが戻れば自動で回復する |
 | task に Worker 名が出ない・Enter で pane に飛べない | §4-4。生成物の該当 node に `pane_id` があるか（`jq` で確認）。無ければ `registry/mux/<Name>-worker.json` が無い・`backend` が herdr でない・記録の server（`server.generation` の pid）が居ない（herdr 再起動後の古い記録）のどれか。Worker を起動し直すと記録が書き直される |
 | plugin が読み込みに失敗する | plugin は空の `tasks` / id の空・重複 / 解決できない `depends_on` / 循環でファイル全体を拒否する。生成器は 4 つとも潰してあるので、出たらバグ（`enforce_task_graph_contract()` を見る） |
 
@@ -336,3 +368,68 @@ task の node には `pane_id` も入る（Enter でそのペインに飛ぶた�
   画面を `herdr pane read <pane_id>` で取るのは補助
 - 後始末: このリポジトリのルールは `rm -rf` を禁じている。`/tmp/hgt` は残る（`/tmp` なので
   再起動で消える）
+
+---
+
+## 8. 結合確認（t011）の実測記録と、本番 plugin の入れ替え・戻し
+
+2026-09-26、隔離 herdr（HOME=`/tmp/hgt11`、server PID 3517176 の `HERDR_SOCKET_PATH` なし、socket
+`/tmp/hgt11/.config/herdr/herdr.sock`）と隔離 queue/registry（`/tmp/cv11`）。検証対象 head:
+crewvia `f9353fa83b09a2c8b9359e761d01ca200df5324c`、plugin `d2b819553980cb7875b962e3e6a9e2faba768e80`
+（0.3.0）。対照は plugin 0.1.1（本番が今リンクしている `/tmp/herdr-task-graph`）。3 mission / 62 task
+（`queue/archive` から複製した 2 本 + 進行中の 1 本）、Worker 相当 pane 2 つ（`claude` 名の `sleep`）。
+本番の workspace label 集合・plugin 一覧・config dir の symlink 先・デーモン pid（dispatcher /
+watchdog / herdr server）は前後で不変。
+
+| 項目 | 実測 |
+|---|---|
+| 接続 | 0.1.1: `[offline]` + `ERROR: [Errno 32] Broken pipe`（箱も重なる）/ 0.3.0: `[live]`・ERROR なし |
+| 反映 | `r` なしで 0.58 / 0.36 / 0.35 / 0.36 秒（pane を 0.2 秒間隔で読んで測定。`plan.sh` の 0.14〜0.15 秒を含む）。**引用は「1 秒未満」** |
+| 幅 80 / 120 / 200 | 全 62 task に届く・選択 box が画面外のフレーム 0・重なり署名 0（陽性対照で検出器が効くことを確認）。幅 120 は live ペインでも同じ |
+| 箱 | 3 段（`[STATE] tNNN · <group 末尾>` / タイトル / meta）。タイトルは約 34 桁で切れる。幅 200 は右に AGENTS パネル（約 30 桁）が付いて箱が 29 桁に縮み、上端で connector の断片が欠けて見える箇所がある（読めなくはない） |
+| Enter | `pane_id` で `focused_pane_id` が動く（§4-4） |
+| 読めないとき | dangling symlink → `ERROR: cannot read …` を出して内容を保持 / 2 秒で回復。`--once --socket <存在しないパス>` は exit 1・サンプルなし |
+
+### 観察（PASS を妨げない）
+
+- **O-1 agent 名は `claude`。** 箱と AGENTS パネルに Worker 名（`Arjun-worker`）は出ない。plugin が pane の
+  label を読まないため（upstream の変更）。Enter は `pane_id` で正しく飛ぶので機能は成立
+- **O-2 幅 200 は箱が狭い**（AGENTS パネルの分。見た目のみ）
+- **O-3 ヘッダーの状態語は `[live]`**（`[connected]` ではない）。確認点は「`[offline]` でない・ERROR 行が無い」
+- **O-4 本番が今リンクしている 0.1.1 の実体は `/tmp/herdr-task-graph`**（`/tmp` の複製で、再起動で消える）。
+  戻し方が通るのは残っている間だけ。**入れ替えの前に消えない場所へ複製する**（例
+  `cp -r /tmp/herdr-task-graph ~/htg-0.1.1`）
+- **O-5 入れ替えても、開いたままの古い plugin ペインは古いコードで動き続ける。** 入れ替え前に閉じ、
+  後で開き直す
+
+### 入れ替え（隔離で実行した記録。手順の本体は README「Upgrading the plugin」）
+
+`herdr plugin pane close` → `unlink` → `link ~/workspace/herdr-task-graph` → `action invoke
+open-task-graph`。link の応答の version が 0.3.0、画面タイトルが `crewvia / 3 missions`・`[live]`・
+ERROR なし。**`unlink` / `link` しても config dir の `tasks.json` symlink は残る**（`ls -l` で同じ先）ので
+作り直しは要らず、入れ替えで crewvia のファイルが読めなくなることは無い。所要は数秒。
+事前に `git -C ~/workspace/herdr-task-graph rev-parse HEAD origin/main` で意図した commit か確かめる。
+
+### 戻し方（隔離で実行済み）
+
+同じく pane を閉じて `unlink` → `link <0.1.1 の clone>` → `invoke`。link 応答の version が 0.1.1 になり、
+画面は入れ替え前と同じ（`[offline]` + `Broken pipe` + 箱の重なり）に戻った。タイトルは
+`crewvia / 3 missions` のまま、config dir の symlink は変わらない。**戻し先の clone が消えていると link が
+失敗する**（O-4）。
+
+**本番の入れ替えそのものは t011・t012 では実行していない**（本番 herdr の変更。Director がユーザーの
+了承を得て行う: t014）。
+
+---
+
+## 9. 今回扱わないこと（次のミッションの種）
+
+- **`open-task-graph` は invoke のたびに新しいタブを開く。** manifest の説明は "Open or focus" だが、
+  既存の Task Graph タブがあっても重複を避けない（0.1.1 で実測し、0.3.0 でも変わらない）。開くたびに
+  タブが増えるので、自動化（`./crewvia` からの自動起動・hook・cron）には載せていない。直すなら
+  upstream（既存タブへフォーカスを移す）か、crewvia 側で開く前に `herdr api snapshot` の label
+  `Task Graph` を見て既にあればフォーカスするラッパー。どちらも今回は着手しない
+- **箱に Worker 名を出す**（O-1）: plugin が pane の label を読む必要があり、upstream の変更
+- **幅 200 の AGENTS パネルによる箱の縮み**（O-2）: 見た目のみ。upstream
+- **agent の状態遷移（idle → working）が箱に追従するか**: t011 は `claude · idle` の表示までで
+  遷移は見ていない（§4-4）

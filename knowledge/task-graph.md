@@ -246,8 +246,11 @@ snapshot を取り直す）。t006 QA が「未検証」としていた点は、
 - `label` は `tNNN`（mission slug を落とした task id）。`id` は `<slug>:tNNN` のまま。plugin 0.1.1 の
   `load_config` は未知の欄を拒否しない（`tests/test_task_graph_plugin_contract.py` で本物に読ませて確認）
 - 複数 mission のとき `tNNN` だけでは同じ ID が並びうる（`t001` が mission ごとにある）。区別は
-  title と依存の線で付き、`id`（詳細表示）は slug 付きのまま。label に slug を足すと長くて読めなく
-  なる（P-2 の原因そのもの）ので足していない
+  **`group`（mission slug。t016）** が担う。plugin 0.3.0 は箱の 1 行目右端に slug の末尾を出す。
+  label に slug を足すと長くて読めなくなる（P-2 の原因そのもの）ので、label とは別の欄にした。
+  `group` は 0.1.1 / 0.2.0 が未知の欄として無視する（実物で確認）。**0.3.0 は `group` が文字列で
+  ないとファイル全体を拒否する**が、slug は常に文字列。`[表示する task なし]` の placeholder は
+  mission に属さないので `group` を書かない
 - **この変更単体の戻し方**: この PR を revert する（`label` / `pane_id` が消えて従来の生成物に戻る）。
   `CREWVIA_TASK_GRAPH=0` は生成ごと止める退避路で別物
 
@@ -287,7 +290,7 @@ plugin は全 task を並べる。完了済みが数十件あると箱が潰れ�
 | `BLOCK [要判断]` | **人間の判断待ち**: `needs_director` / `needs_human_review` / `ready_for_verification` |
 | `BLOCK [status不明]` | 対応表に無い status。done にも ready にも倒さず止めて見せる |
 
-各 node の `label`（`tNNN`）は短い表示名（plugin 側の対応は別 task。未対応の版は無視する）。Worker が就いている
+各 node の `label`（`tNNN`）は短い表示名、`group`（mission slug）は複数 mission を並べたときの区別（どちらも未対応の版は無視する）。Worker が就いている
 task の node には `pane_id` も入る（Enter でそのペインに飛ぶための宛先。§4-4）。
 
 依存待ち（`WAIT`）と人間待ち（`BLOCK [要判断]`）は plugin の状態そのものが違うので

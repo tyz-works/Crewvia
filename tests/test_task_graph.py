@@ -670,6 +670,27 @@ def test_every_node_carries_a_short_label_and_keeps_its_qualified_id(sandbox):
     assert nodes[f"{MISSION}:t002"]["depends_on"] == [f"{MISSION}:t001"]
 
 
+def test_every_node_carries_its_mission_slug_as_group(sandbox):
+    """複数 mission を並べると `label` (`tNNN`) は重複する。`group` が区別を担う。"""
+    sandbox.add_task("t001", "done", [])
+    sandbox.add_mission("m-beta")
+    sandbox.add_task("t001", "pending", [], mission="m-beta")
+    assert sandbox.run("task-graph").returncode == 0
+    nodes = _by_id(sandbox.read_graph())
+    assert nodes[f"{MISSION}:t001"]["group"] == MISSION
+    assert nodes["m-beta:t001"]["group"] == "m-beta"
+    # 対照: 同じ label でも group で区別できる (これが無いと画面で見分けがつかない)
+    assert nodes[f"{MISSION}:t001"]["label"] == nodes["m-beta:t001"]["label"] == "t001"
+
+
+def test_the_placeholder_has_no_group_because_it_belongs_to_no_mission(sandbox):
+    """task 0 件の placeholder は mission に属さないので `group` を持たない。"""
+    assert sandbox.run("task-graph").returncode == 0
+    (node,) = sandbox.read_graph()["tasks"]
+    assert "表示する task なし" in node["title"]
+    assert "group" not in node
+
+
 def test_pane_id_is_written_from_the_spawn_record(sandbox):
     sandbox.add_task("t001", "in_progress", [], worker="Ren")
     sandbox.assign("Ren", "t001")
@@ -960,8 +981,8 @@ def test_generated_json_shape_matches_the_plugin_contract(sandbox):
     graph = sandbox.read_graph()
     assert set(graph) == {"title", "tasks"}
     assert isinstance(graph["title"], str) and graph["title"]
-    allowed_keys = {"id", "label", "title", "depends_on", "status", "pane_match",
-                    "pane_id"}
+    allowed_keys = {"id", "label", "group", "title", "depends_on", "status",
+                    "pane_match", "pane_id"}
     allowed_status = {"done", "running", "blocked", "ready", "waiting", "failed"}
     for node in graph["tasks"]:
         assert set(node) <= allowed_keys, f"未知のキー: {set(node) - allowed_keys}"

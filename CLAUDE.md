@@ -56,7 +56,7 @@
   `pane_id` も書く（`plan.sh` の `task_graph_pane_id()` → `lib_mux.recorded_herdr_pane_id()`）。
   **記録と `/proc` を読むだけで herdr に触れず、`.records.lock` も取らない**。記録が無い・読めない・
   herdr でない・記録の server が居ない（再起動後の古い記録）ときは書かず、`pane_match` だけが残る。
-  各 node には短い `label`（`tNNN`）も書く（`id` は `<slug>:tNNN` のまま。未対応の plugin は無視する）。
+  各 node には短い `label`（`tNNN`）と `group`（mission slug。複数 mission で同じ `tNNN` を区別する）も書く（`id` は `<slug>:tNNN` のまま。未対応の plugin は無視する）。
   実 herdr での確認は QA / 結合確認（t008 / t011）待ち
 - 運用メモ・切り分け・実測: `knowledge/task-graph.md`
 

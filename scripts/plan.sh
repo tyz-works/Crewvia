@@ -1326,6 +1326,12 @@ def build_task_graph(state):
                 # 版は未知の欄として無視する。`id` は mission をまたぐ一意性と
                 # 依存解決のためにそのまま残す。
                 'label': str(task_id),
+                # 複数 mission を並べると `label` (`tNNN`) は mission ごとの採番で
+                # 重複する。plugin が `group` に対応していれば箱の右端に mission
+                # slug の末尾が出て区別できる。対応していない版は未知の欄として
+                # 無視する。slug は str なので、plugin の「group は文字列」の検証
+                # (満たさないとファイル全体を拒否する) を破らない。
+                'group': str(slug),
                 'title': str(title),
                 'depends_on': [f'{slug}:{d}' for d in blocked_by],
                 'status': status,

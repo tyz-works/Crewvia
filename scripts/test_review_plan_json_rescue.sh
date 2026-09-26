@@ -75,13 +75,15 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REAL_REPO="$(cd "$SCRIPT_DIR/.." && pwd)"
+# shellcheck source=../tests/fixture_tree.sh
+source "$REAL_REPO/tests/fixture_tree.sh"
 REAL_REVIEW_PLAN="${SCRIPT_DIR}/review-plan.sh"
-REAL_LIB_VERDICT="${SCRIPT_DIR}/lib_verdict.py"
+REAL_LIB_VERDICT="${SCRIPT_DIR}/lib_verdict.py"   # 隔離ツリーには置かず、判定の期待値を直接計算するのに使う
 REAL_SCHEMA="${SCRIPT_DIR}/../config/plan-review-verdict.schema.json"
 # t001 (mission 20260909-dead-config-sweep): review-plan.sh はモデル解決に
 # scripts/lib_model.py と config/crewvia.yaml を必須で読むようになった
 # (scripts/test_review_plan_director_identity.sh と同じ理由)。
-REAL_LIB_MODEL="${SCRIPT_DIR}/lib_model.py"
 REAL_CREWVIA_YAML="${SCRIPT_DIR}/../config/crewvia.yaml"
 
 # review-plan.sh の構造化出力待ちループの poll 間隔・上限を、テスト実行を
@@ -126,14 +128,12 @@ _run_case() {
   mkdir -p "$TMPDIR_TEST/scripts" "$TMPDIR_TEST/config" "$TMPDIR_TEST/queue/missions/testmission"
 
   cp "$REAL_REVIEW_PLAN" "$TMPDIR_TEST/scripts/review-plan.sh"
-  # t018: 以前はここで lib_verdict.py をコピーしておらず、python3 がスクリプト
-  # 不在で返す rc=2 が「判定不能 = 救済可」として扱われていた。本物の
-  # lib_verdict.py を置く (plan_review.md が無いので「兆候なし」になる)。
-  cp "$REAL_LIB_VERDICT" "$TMPDIR_TEST/scripts/lib_verdict.py"
+  # lib_* はまとめて写す (tests/fixture_tree.sh)。t018: lib_verdict.py が無いと python3 が
+  # スクリプト不在で返す rc=2 が「判定不能 = 救済可」として扱われていたので、本物を置く
+  # (plan_review.md が無いので「兆候なし」になる)。lib_model.py は config の読み取りを
+  # lib_task_cards.py に通す。
+  copy_scripts_libs "$REAL_REPO" "$TMPDIR_TEST"
   cp "$REAL_SCHEMA" "$TMPDIR_TEST/config/plan-review-verdict.schema.json"
-  cp "$REAL_LIB_MODEL" "$TMPDIR_TEST/scripts/lib_model.py"
-  # lib_model.py は config の読み取りを lib_task_cards.py に通す (t018)。
-  cp "${SCRIPT_DIR}/lib_task_cards.py" "$TMPDIR_TEST/scripts/"
   cp "$REAL_CREWVIA_YAML" "$TMPDIR_TEST/config/crewvia.yaml"
 
   # スタブ lib_mux.sh: mux_available/mux_spawn は常に成功 (no-op)。mux_spawn は
@@ -243,10 +243,10 @@ _run_case_ex() {
   mkdir -p "$TMPDIR_TEST/scripts" "$TMPDIR_TEST/config" "$TMPDIR_TEST/queue/missions/testmission" "$TMPDIR_TEST/stubbin"
 
   cp "$REAL_REVIEW_PLAN" "$TMPDIR_TEST/scripts/review-plan.sh"
+  # lib_* はまとめて写し (tests/fixture_tree.sh)、lib_verdict.py だけ必要ならスタブで上書きする。
+  copy_scripts_libs "$REAL_REPO" "$TMPDIR_TEST"
   if [[ -n "$lib_stub" ]]; then
     printf '%s\n' "$lib_stub" > "$TMPDIR_TEST/scripts/lib_verdict.py"
-  else
-    cp "$REAL_LIB_VERDICT" "$TMPDIR_TEST/scripts/lib_verdict.py"
   fi
   case "$schema_mode" in
     missing) ;;
@@ -259,9 +259,6 @@ _run_case_ex() {
     chmod +x "$TMPDIR_TEST/stubbin/jq"
     path_prefix="$TMPDIR_TEST/stubbin:"
   fi
-  cp "$REAL_LIB_MODEL" "$TMPDIR_TEST/scripts/lib_model.py"
-  # lib_model.py は config の読み取りを lib_task_cards.py に通す (t018)。
-  cp "${SCRIPT_DIR}/lib_task_cards.py" "$TMPDIR_TEST/scripts/"
   cp "$REAL_CREWVIA_YAML" "$TMPDIR_TEST/config/crewvia.yaml"
 
   local review_output="$TMPDIR_TEST/queue/missions/testmission/plan_review.md"

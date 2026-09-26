@@ -162,13 +162,13 @@ MAIN_WT_HEAD_BEFORE_ALL="$(git -C "$FIXTURE_REPO" rev-parse HEAD)"
 # 自動作成するか」を判断する。本物の plan.sh をこの fixture repo にコピーし、
 # git-helpers.sh は置かない → pull がこのテストの外側 (本物の crewvia repo) に
 # 余計な worktree を作らないようにする。plan.sh 本体のロジックは本物のまま。
-mkdir -p "$FIXTURE_REPO/scripts"
-cp "$REAL_PLAN_SH" "$FIXTURE_REPO/scripts/plan.sh"
-# plan.sh は依存規則 (lib_dep_rules.py) と task カードの読み取り
-# (lib_task_cards.py) を自分の側の scripts/ から読む。どちらもフォールバックを
-# 持たないので、置き忘れると plan.sh が起動しない。
-cp "$OWN_CHECKOUT_ROOT/scripts/lib_dep_rules.py" "$FIXTURE_REPO/scripts/lib_dep_rules.py"
-cp "$OWN_CHECKOUT_ROOT/scripts/lib_task_cards.py" "$FIXTURE_REPO/scripts/lib_task_cards.py"
+#
+# plan.sh は lib_dep_rules / lib_task_cards ... を自分の側の scripts/ から読む
+# (フォールバックなし)。plan.sh と lib_* は共通 helper でまとめて写す
+# (tests/fixture_tree.sh。git-helpers.sh は写さない)。
+# shellcheck source=../tests/fixture_tree.sh
+source "$OWN_CHECKOUT_ROOT/tests/fixture_tree.sh"
+copy_plan_tree "$OWN_CHECKOUT_ROOT" "$FIXTURE_REPO" || { echo "FAIL: copy_plan_tree" >&2; exit 1; }
 
 # t006: kai-review.sh は SCHEMA_FILE を ${CREWVIA_REPO_ROOT:-$REPO_ROOT}/config/... で
 # 解決する。run_kai() は CREWVIA_REPO_ROOT=$FIXTURE_REPO を渡すため、本物の schema

@@ -21,6 +21,8 @@
 
 REPO_ROOT="$(cd "$(dirname "$BATS_TEST_FILENAME")/.." && pwd)"
 LIB_MUX_PY="${REPO_ROOT}/scripts/lib_mux.py"
+# scripts/ の隔離コピーを作る共通 helper (copy_scripts_libs / copy_plan_tree)
+source "${REPO_ROOT}/tests/fixture_tree.sh"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -1755,16 +1757,10 @@ setup_fake_crewvia_tree() {
     FAKE_TREE="$(mktemp -d)"
     mkdir -p "${FAKE_TREE}/config" "${FAKE_TREE}/scripts"
     cp "${REPO_ROOT}/crewvia" "${FAKE_TREE}/crewvia"
-    cp "${REPO_ROOT}/scripts/lib_mux.py" "${FAKE_TREE}/scripts/lib_mux.py"
-    # lib_mux.py は queue / registry / config の読み取りを
-    # scripts/lib_task_cards.py に通す (t018)。フォールバックを持たないので、
-    # 単体でコピーすると import で落ちる。
-    cp "${REPO_ROOT}/scripts/lib_task_cards.py" \
-       "${FAKE_TREE}/scripts/lib_task_cards.py"
-    # lib_mux.py は JSON の状態ストア (pane 記録) の読み取りを
-    # scripts/lib_daemon_state.py に通す (t026)。同じくフォールバックは持たない。
-    cp "${REPO_ROOT}/scripts/lib_daemon_state.py" \
-       "${FAKE_TREE}/scripts/lib_daemon_state.py"
+    # lib_mux.py は lib_task_cards.py / lib_daemon_state.py ... に読み取りを通し、
+    # フォールバックを持たない (単体でコピーすると import で落ちる)。lib はまとめて写す
+    # (tests/fixture_tree.sh。lib を足すたびにここを直す運用が CI でだけ赤くなった)。
+    copy_scripts_libs "${REPO_ROOT}" "${FAKE_TREE}"
     printf 'mode: herdr\ntaskvia: disabled\n' > "${FAKE_TREE}/config/crewvia.yaml"
 
     FAKE_TREE_DISPATCH="${FAKE_TREE}/dispatch.log"

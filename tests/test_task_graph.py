@@ -37,6 +37,8 @@ import time
 
 import pytest
 
+from fixture_tree import copy_plan_tree
+
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 PLAN_SH = REPO_ROOT / "scripts" / "plan.sh"
 
@@ -335,19 +337,9 @@ def _mission_yaml(slug: str, next_id: int = 99) -> str:
 def sandbox(tmp_path):
     """CREWVIA_REPO_ROOT / CREWVIA_QUEUE の両方を隔離した実行環境。"""
     root = tmp_path / "repo"
-    (root / "scripts").mkdir(parents=True)
-    shutil.copy2(PLAN_SH, root / "scripts" / "plan.sh")
-    # lib_dep_rules.py / lib_task_cards.py は必須 (plan.sh が起動時に読む、
-    # 依存規則と task カード読み取りの本体。どちらもフォールバックを持たない)。
-    # 残りは、その subcommand を使うときだけ要る補助。
-    # lib_mux.py / lib_daemon_state.py は pane_id を解決するときだけ遅延で読まれる
-    # (`task_graph_pane_id`)。
-    for extra in ("lib_dep_rules.py", "lib_task_cards.py",
-                  "lib_registry.py", "lint_plan.py",
-                  "lib_mux.py", "lib_daemon_state.py"):
-        src = REPO_ROOT / "scripts" / extra
-        if src.exists():
-            shutil.copy2(src, root / "scripts" / extra)
+    # plan.sh と scripts/lib_* をまとめて写す (lib_dep_rules / lib_task_cards は起動時に
+    # 読まれる必須、lib_mux / lib_daemon_state は pane_id の解決で遅延に読まれる)。
+    copy_plan_tree(root)
 
     queue = root / "queue"
     (queue / "missions" / MISSION / "tasks").mkdir(parents=True)
@@ -984,12 +976,9 @@ def test_output_follows_crewvia_repo_root_not_script_location(sandbox, tmp_path)
     ファイルは Worker の pull / done では一切更新されない。
     """
     worktree = tmp_path / "wt"
-    (worktree / "scripts").mkdir(parents=True)
-    shutil.copy2(PLAN_SH, worktree / "scripts" / "plan.sh")
-    # 本物の worktree には scripts/ が丸ごと在る。plan.sh は依存規則と task カードの
-    # 読み取りを自分の側の scripts/ から読むので、ここでも一緒に置く。
-    for _extra in ("lib_dep_rules.py", "lib_task_cards.py"):
-        shutil.copy2(REPO_ROOT / "scripts" / _extra, worktree / "scripts" / _extra)
+    # 本物の worktree には scripts/ が丸ごと在る。plan.sh は lib を自分の側の scripts/
+    # から読むので、ここでも lib ごと写す。
+    copy_plan_tree(worktree)
 
     sandbox.add_task("t001", "pending", [])
     assert sandbox.run("task-graph").returncode == 0

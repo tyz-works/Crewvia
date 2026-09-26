@@ -134,9 +134,15 @@ exclude = {
     # (dispatcher は REGISTRY_DIR 直下のその名前を読む)。書き込みは pytest の使い捨てツリーに閉じ、
     # repo の registry/workers.yaml に書く経路は存在しない。
     root / "tests" / "test_assignment_routing.py",
+    # t013 (registry の隔離テスト)。`World` が pytest の `tmp_path` に「本番の代役」の registry を
+    # 1 度だけ組み立て、その registry が **変わらないこと**を確かめるテスト。書き込みは使い捨て
+    # ツリーに閉じ、repo の registry/workers.yaml に書く経路は存在しない。
+    # (この除外は、worktree 内で検査が有効になって初めて見つかった — 修正前は素通りしていた。)
+    root / "tests" / "test_registry_isolation.py",
 }
 proximity = 15
 found = []
+scanned = 0
 
 for path in root.rglob("*"):
     if not path.is_file():
@@ -145,10 +151,17 @@ for path in root.rglob("*"):
         continue
     if path in exclude:
         continue
-    if ".git" in path.parts:
+    # 除外判定は **root からの相対パス**で行う。絶対パスの parts を見ると、root 自身が
+    # worktree (`<repo>/.claude/worktrees/<mission>/<task>/`) のとき全ファイルが
+    # `.claude` + `worktrees` に当たって検査対象が 0 件になり、この静的検査は
+    # worktree の中では必ず PASS した (t013)。除外したいのは root の下に入れ子になった
+    # 別の worktree だけ。
+    rel_parts = path.relative_to(root).parts
+    if ".git" in rel_parts:
         continue
-    if ".claude" in path.parts and "worktrees" in path.parts:
+    if ".claude" in rel_parts and "worktrees" in rel_parts:
         continue
+    scanned += 1
     try:
         lines = path.read_text().splitlines()
     except Exception:
@@ -164,8 +177,21 @@ for path in root.rglob("*"):
 
 for f in found:
     print(f)
+# 最終行: 実際に検査したファイル数 (0 件で「見つからなかった」を PASS にしないため)
+print(f"#scanned={scanned}")
 PYEOF
 )"
+
+SCANNED_COUNT="$(printf '%s\n' "$BYPASS_OUT" | sed -n 's/^#scanned=//p' | tail -n 1)"
+BYPASS_OUT="$(printf '%s\n' "$BYPASS_OUT" | grep -v '^#scanned=' || true)"
+
+# 検査対象が 0 件なら、除外判定が全部を外している (worktree の中で絶対パスを見ていたときの
+# 欠陥)。「迂回が見つからなかった」ではなく「何も見ていない」なので FAIL にする。
+if [[ -z "$SCANNED_COUNT" || "$SCANNED_COUNT" -lt 50 ]]; then
+  fail "static check inspected only '${SCANNED_COUNT:-?}' files under $OWN_CHECKOUT_ROOT (expected >= 50) — the exclusion rule is skipping the tree"
+else
+  pass "static check inspected $SCANNED_COUNT files under $OWN_CHECKOUT_ROOT (not vacuous)"
+fi
 
 if [[ -n "$BYPASS_OUT" ]]; then
   while IFS= read -r line; do

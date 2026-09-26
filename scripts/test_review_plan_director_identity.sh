@@ -46,6 +46,8 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REAL_REPO="$(cd "$SCRIPT_DIR/.." && pwd)"
+# shellcheck source=../tests/fixture_tree.sh
+source "$REAL_REPO/tests/fixture_tree.sh"
 
 PASS_COUNT=0
 FAIL_COUNT=0
@@ -89,19 +91,12 @@ mkdir -p "$SCRATCH_DIR/queue/missions/test-mission"
 # review-plan.sh 本体・依存スクリプトは実ファイルをそのままコピーする
 # (ロジックを書き換えずにテストするため)。
 cp "$REAL_REPO/scripts/review-plan.sh" "$SCRATCH_DIR/scripts/"
-cp "$REAL_REPO/scripts/lib_mux.sh" "$SCRATCH_DIR/scripts/"
-cp "$REAL_REPO/scripts/lib_mux.py" "$SCRATCH_DIR/scripts/"
 cp "$REAL_REPO/scripts/wait_for_plan_review.sh" "$SCRATCH_DIR/scripts/"
-# t001 (mission 20260909-dead-config-sweep): review-plan.sh はモデル解決に
-# scripts/lib_model.py と config/crewvia.yaml を必須で読むようになった。
+# review-plan.sh はモデル解決に scripts/lib_model.py と config/crewvia.yaml を必須で読み、
+# lib_mux.{sh,py} / lib_model.py は lib_task_cards.py / lib_daemon_state.py ... に読み取りを
+# 通す (フォールバックなし)。lib_* はまとめて写す (tests/fixture_tree.sh)。
 mkdir -p "$SCRATCH_DIR/config"
-cp "$REAL_REPO/scripts/lib_model.py" "$SCRATCH_DIR/scripts/"
-# lib_mux.py / lib_model.py は queue・registry・config の読み取りを
-# scripts/lib_task_cards.py に通す (t018)。フォールバックを持たないので、
-# 単体でコピーする隔離環境では一緒に置くこと。
-cp "$REAL_REPO/scripts/lib_task_cards.py" "$SCRATCH_DIR/scripts/"
-# lib_mux.py は JSON の状態ストアの読み取りを scripts/lib_daemon_state.py に通す (t026)。
-cp "$REAL_REPO/scripts/lib_daemon_state.py" "$SCRATCH_DIR/scripts/"
+copy_scripts_libs "$REAL_REPO" "$SCRATCH_DIR"
 cp "$REAL_REPO/config/crewvia.yaml" "$SCRATCH_DIR/config/"
 
 RESULT_DIR="$(mktemp -d /tmp/crewvia-test-review-plan-result-XXXXXX)"

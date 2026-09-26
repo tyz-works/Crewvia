@@ -69,6 +69,8 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OWN_CHECKOUT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# shellcheck source=../tests/fixture_tree.sh
+source "$OWN_CHECKOUT_ROOT/tests/fixture_tree.sh"
 GIT_REPO="${BINDING_E2E_GIT_REPO:-$OWN_CHECKOUT_ROOT}"
 CASE_FILTER="${BINDING_E2E_CASE_FILTER:-}"
 
@@ -147,9 +149,14 @@ _run_case() {
   # まま SANITY ごと落ちる (Codex 10 巡目 P2-2)。他の隔離ツリー
   # (test_review_plan_json_rescue.sh / _model.sh / _pane_leak.sh /
   # _director_identity.sh / test_kai_review.sh / lib-mux.bats) と同じ扱い。
+  # lib_* は名前でなく **まとめて** 写す (tests/fixture_tree.sh)。
+  if ! copy_scripts_libs "$src" "$T"; then
+    fail "$label — setup: could not copy scripts/lib_* from $src"
+    _cleanup_dir "$T"
+    return 0
+  fi
   local f
-  for f in lint_plan.py lib_verdict.py lib_model.py lib_task_cards.py \
-           wait_for_plan_review.sh review-plan.sh; do
+  for f in lint_plan.py wait_for_plan_review.sh review-plan.sh; do
     if ! cp "$src/scripts/$f" "$T/scripts/"; then
       fail "$label — setup: could not copy scripts/$f from $src"
       _cleanup_dir "$T"
@@ -515,7 +522,7 @@ if _selected "Decision1"; then
   mkdir -p "$T_BIND/scripts" "$T_BIND/config"
   export CREWVIA_QUEUE="$T_BIND/queue"
   cp "$OWN_CHECKOUT_ROOT/scripts/lint_plan.py" "$T_BIND/scripts/"
-  cp "$OWN_CHECKOUT_ROOT/scripts/lib_verdict.py" "$T_BIND/scripts/"
+  copy_scripts_libs "$OWN_CHECKOUT_ROOT" "$T_BIND"    # lib_verdict.py ほか (tests/fixture_tree.sh)
   cp -r "$OWN_CHECKOUT_ROOT/config/." "$T_BIND/config/"
   "$OWN_CHECKOUT_ROOT/scripts/plan.sh" init "Test Mission" --mission testmission >/dev/null 2>&1
   cat > "$T_BIND/scripts/review-plan.sh" << EOF

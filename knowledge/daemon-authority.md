@@ -1424,7 +1424,8 @@ respawn のコマンドは `spawn_command()` が唯一の出どころで、`star
 `test_start_sh_launches_the_daemons_through_the_locked_path`)。
 
 同じ文字列を 2 箇所に置くと、**どちらの backend と話すかを決める変数だけが片方に無い**
-という形でずれる。`Mux.spawn()` の `env=` 引数は **両 backend とも無視する** ので、
+という形でずれる。`Mux.spawn()` の `env=` 引数は **両 backend とも無視していた**
+(t017 で引数ごと廃止。渡すと TypeError。§7-16) ので、
 env はコマンド文字列に埋め込むしかなく (memory: `lib-mux-spawn-env-arg-ignored`)、
 herdr はさらにサーバー起動時の env を全ペインに継承するため、「./crewvia で起動した
 デーモン」と「相手に起こされたデーモン」が別の backend を向く事故が現実に起こりうる。
@@ -2261,6 +2262,50 @@ PATH の先頭に tmux / herdr のスタブ (呼び出しを記録して失敗�
 証拠) ・kill-session / kill-server / herdr がどこにも届いていないことを assert する。スタブが
 PATH の先頭に無ければ、注入版を走らせる前に中止する。**赤の実証を書き足すときは、注入した版が走る
 場所が本番から届かないことを先に確かめる**こと。
+
+### 7-16. 起動で registry の skills を追従させる / `spawn(env=)` を廃止する (t017 / PR5a, backlog #14, 2026-09-26)
+
+**症状**: `start.sh worker code python bash` で Haruto / Ren などを起動しても、registry の
+`skills` が古いと dispatcher は task を割り当てない (突き合わせの相手は registry であって、
+起動時の引数ではない)。dispatcher は Director に「要求スキルの Worker を起動してください」を
+送り続け、同時にその Worker を「仕事なし」と見て退役を要求する — **起動要求と退役要求が互いを
+打ち消す**。4 人で発生し、そのたびに Director が registry を手で直していた。
+
+**直し方**: `start.sh` が Worker 起動時に、渡された skills を registry の当該 Worker に
+**和集合で**足す (`lib_registry.py add-skills PATH NAME SKILL...` / `add_skills()`)。
+- 足すだけで消さない。registry には過去の担当で得た skill も入っており、1 つの task 用の
+  起動で他を忘れさせない。既存の順序を保ち、新しいものを末尾に足す。
+- 何も足さない起動 (通常の場合) はファイルを書き直さない。
+- registry に居ない名前・registry が無い場合は何もしない (`set-last-active` と同じ。
+  勝手に Worker を作らない — 登録は `assign-name.sh` の仕事)。
+- 他の書き手と同じロック (`registry/.workers.lock`) の中で parse → 変更 → write を通す。
+- YAML の flow list に書き戻せない tag (`,` `]` `#` や空白を含む) は、stderr に警告を出して
+  **飛ばす** (黙って捨てない・書いて registry を壊さない)。
+
+**`spawn(env=)` の廃止**: `Mux.spawn()` / 両 backend の `spawn()` は `env` 引数を受け取り、
+どちらも使わずに捨てていた。渡した呼び出し元は env の付いた pane を得たつもりで、実際は
+付いていない — しかもエラーにならない。**引数ごと無くした** (渡せば、`None` でも TypeError)。
+env が要るなら `export FOO=...; cmd` を cmd に埋める (`spawn_command()` / `start.sh` の
+`ENV_EXPORTS`。§7-7)。呼び出し元の全数は 0 件だった (`Mux.spawn` の呼び出しは
+`lib_daemon_watch.py` と `lib_mux.py` の CLI のみで、どちらも `env` を渡していない)。
+テスト側の fake が `env=None` を受け取って本物より寛容だと、退行が本番でだけ露見するので、
+fake の `spawn` からも `env` を外した。
+
+**回帰**: `tests/test_registry_skills_and_spawn_env.py` (和集合の両側 / 何も足さなければ書き直さない /
+ロックの内側 / CLI / 4 つの `spawn` の署名 / TypeError / リポジトリ全 `.py` の AST 全数走査 —
+`spawn(env=...)`・4 番目の位置引数・`def spawn(..., env)` — と、走査器自身の陽性対照)、
+`tests/start-sh-registry-skills.bats` (実 start.sh を使い捨て checkout で走らせ、registry が
+足される / 減らない / 他の Worker に触れない)。修正前の `start.sh` / `lib_registry.py` /
+`lib_mux.py` に戻した複製では pytest 38 件中 36 件・bats 5 件中 2 件が赤になる (残りは「消さない」
+「skills 無し起動」を固定する対照)。
+
+**戻し方**: 失敗すると起動が壊れる種類の変更なので手順を残す。PR を revert → 主 checkout を
+`git merge --ff-only origin/main` → `python3 scripts/lib_daemon_watch.py restart dispatcher` /
+`restart watchdog` (`lib_mux.py kill` / `spawn` を素で叩かない。§7-5)。`start.sh` は起動のたびに
+読み直されるので、デーモンの再起動が要るのは `lib_mux.py` を戻したときだけ。共有規則なので
+env の停止スイッチは付けない (dispatcher と `start.sh` で答えが割れる。memory:
+`no-env-killswitch-for-shared-rule`)。registry に足された skill は revert しても残る
+(害は無く、消すなら `registry/workers.yaml` を手で直す)。
 
 ---
 

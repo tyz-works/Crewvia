@@ -115,9 +115,9 @@ python3 scripts/lib_daemon_watch.py resume dispatcher --token "$TOK_D"
 python3 scripts/lib_daemon_watch.py resume watchdog   --token "$TOK_W"
 ```
 
-起動コマンドを手で書かず `spawn-cmd` から取るのは、`Mux.spawn()` の `env=` 引数が
-**両 backend とも無視される**ため、`CREWVIA_MUX` をコマンド文字列に埋め込む必要が
-あるからである。手書きすると、起こし直したデーモンだけ別の backend を向く。
+起動コマンドを手で書かず `spawn-cmd` から取るのは、`Mux.spawn()` が env を運べない
+(`env=` 引数は両 backend とも無視されていたため t017 で廃止した。渡すと TypeError) ので、
+`CREWVIA_MUX` をコマンド文字列に埋め込む必要があるからである。手書きすると、起こし直したデーモンだけ別の backend を向く。
 
 > pause したまま resume を忘れると、そのデーモンは相互監視の対象外になる
 > (相手が死んでも誰も起こさない)。30 分でその旨が Director に 1 度通知されるが、

@@ -17,6 +17,12 @@ CLI commands:
   set-last-active PATH NAME [YYYY-MM-DD]
       Update last_active for NAME. No-op if name not in registry.
 
+  add-skills PATH NAME SKILL [SKILL...]
+      Union SKILL(s) into NAME's skills (existing skills are never removed,
+      order kept, new ones appended). No-op if name not in registry. start.sh
+      calls this at Worker launch so the registry follows the skills the Worker
+      was started with (t017 / backlog #14).
+
   bump-task-count PATH NAME [YYYY-MM-DD]
       Increment task_count and update last_active for NAME (Worker Step4).
       No-op if name not in registry.
@@ -219,6 +225,53 @@ def set_last_active(path, name, day=None):
     with_lock(path, _do)
 
 
+#: A skill tag is written into a YAML flow list (`skills: [a, b]`) that `parse()`
+#: reads back with a regex, so it must not contain `,` `]` `#` or whitespace.
+#: The tags in use (`code`, `codex-review`, ...) all fit this shape.
+_SKILL_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.-]*$')
+
+
+def add_skills(path, name, skills):
+    """Union `skills` into NAME's skills. Returns the list of skills that were
+    newly added ([] when nothing changed or NAME is not in the registry).
+
+    Why this exists: dispatcher matches a task's `skills` against the registry,
+    not against what the Worker was launched with. A Worker started with more
+    skills than its registry entry was therefore never assigned anything, while
+    the dispatcher kept asking the Director to start it and retiring it as
+    idle at the same time (backlog #14, seen on 4 Workers).
+
+    Union, never replace: the registry also holds skills earned earlier, and a
+    Worker launched for one task must not forget the others. A tag that cannot
+    be written back safely is skipped with a warning on stderr, not silently.
+    Same lock + whole parse-modify-write cycle as the other writers.
+    """
+    added = []
+
+    def _do():
+        header, order, by_name = parse(path)
+        if name not in by_name:
+            return
+        current = list(by_name[name].get('skills', []))
+        for raw in skills:
+            skill = (raw or '').strip()
+            if not skill:
+                continue
+            if not _SKILL_RE.match(skill):
+                print(f"[lib_registry] WARNING: skill {skill!r} is not a valid tag "
+                      f"— not added to {name}", file=sys.stderr)
+                continue
+            if skill not in current:
+                current.append(skill)
+                added.append(skill)
+        if not added:
+            return
+        by_name[name]['skills'] = current
+        write(path, header, order, by_name)
+    with_lock(path, _do)
+    return added
+
+
 def bump_task_count(path, name, day=None):
     """Increment task_count and update last_active for NAME (Worker Step4).
     Returns True if bumped, False (no-op) if name is not in the registry.
@@ -261,6 +314,13 @@ def _main(argv):
             return 2
         day = argv[4] if len(argv) > 4 else None
         set_last_active(argv[2], argv[3], day)
+        return 0
+    if cmd == 'add-skills':
+        if len(argv) < 5:
+            print("usage: add-skills PATH NAME SKILL [SKILL...]", file=sys.stderr)
+            return 2
+        added = add_skills(argv[2], argv[3], argv[4:])
+        print('added: ' + ','.join(added) if added else 'no-op')
         return 0
     if cmd == 'bump-task-count':
         if len(argv) < 4:

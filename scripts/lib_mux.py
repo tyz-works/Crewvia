@@ -440,8 +440,13 @@ class _Backend:
         """
         return PANE_UNOBSERVED
 
-    def spawn(self, name: str, cmd: str, cwd: Optional[str] = None,
-              env: Optional[dict] = None) -> bool:
+    def spawn(self, name: str, cmd: str, cwd: Optional[str] = None) -> bool:
+        # No `env` parameter, on purpose (t017 / backlog #14).  It used to be
+        # accepted and then dropped by both backends, so a caller that passed
+        # one got a pane WITHOUT it and no error.  Anything the new pane needs
+        # has to travel inside `cmd` (`export FOO=...; cmd`) — see
+        # lib_daemon_watch.spawn_command() and start.sh's ENV_EXPORTS.  Passing
+        # `env=` now raises TypeError.
         raise NotImplementedError
 
     def send(self, name: str, text: str) -> bool:
@@ -2117,7 +2122,7 @@ class TmuxBackend(_Backend):
 
     Verb signatures and return values
     ----------------------------------
-    spawn(name, cmd, cwd=None, env=None) -> bool
+    spawn(name, cmd, cwd=None) -> bool
         Create a new window named `name` in the session and run `cmd`.
         Returns True on success, False on error or when a window of that name
         already holds a live process.  A window holding only an idle shell (a
@@ -2218,8 +2223,7 @@ class TmuxBackend(_Backend):
         except Exception:
             return False
 
-    def spawn(self, name: str, cmd: str, cwd: Optional[str] = None,
-              env: Optional[dict] = None) -> bool:
+    def spawn(self, name: str, cmd: str, cwd: Optional[str] = None) -> bool:
         """Create a tmux window named `name` and run `cmd`.
 
         Mirrors start.sh L468-481:
@@ -3564,8 +3568,7 @@ class HerdrBackend(_Backend):
         """
         return _herdr_ping()
 
-    def spawn(self, name: str, cmd: str, cwd: Optional[str] = None,
-              env: Optional[dict] = None) -> bool:
+    def spawn(self, name: str, cmd: str, cwd: Optional[str] = None) -> bool:
         """Create a herdr tab named `name` and run `cmd`.
 
         Steps:
@@ -3968,9 +3971,8 @@ class Mux:
     def server_running(self) -> bool:
         return self._backend.server_running()
 
-    def spawn(self, name: str, cmd: str, cwd: Optional[str] = None,
-              env: Optional[dict] = None) -> bool:
-        return self._backend.spawn(name, cmd, cwd=cwd, env=env)
+    def spawn(self, name: str, cmd: str, cwd: Optional[str] = None) -> bool:
+        return self._backend.spawn(name, cmd, cwd=cwd)
 
     def send(self, name: str, text: str) -> bool:
         return self._backend.send(name, text)

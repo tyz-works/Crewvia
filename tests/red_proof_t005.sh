@@ -16,6 +16,10 @@
 #   case J   — skills が無いとき絞り込みなしで進む (元の欠陥)              → 赤
 #   case K   — pull --task の複数 mission を拒否しない                     → 赤
 #   case L   — positional の最大数の宣言を 1 つ落とす                      → 赤
+#   case M   — dashboard: queue の骨組みを引数の検証より前に作る (t035)     → 赤
+#   case N   — dashboard: -h / --help を usage にしない                    → 赤
+#   case O   — dashboard: 未知の option を受理する                         → 赤
+#   case P   — bash 側に新しいサブコマンドを足し、usage 行に載せない        → 赤 (列挙の構造テスト)
 #
 # 隔離: 使い捨ての複製で欠陥を注入する。本番の worktree の plan.sh には触らない。
 # PYTHONDONTWRITEBYTECODE=1 で __pycache__ を作らない (古い .pyc が注入を隠さないように)。
@@ -152,6 +156,42 @@ echo "== case L: positional の最大数の宣言を 1 つ落とす"
 fresh_copy
 inject "'status': (0, 0), " ""
 expect_red "case L" "test_too_many_positionals_are_rejected_not_silently_dropped\[status\]"
+
+# --- dashboard (t035 / t006 QA の FAIL): python の dispatch を通らない bash 側の分岐 -------------
+
+echo "== case M: dashboard が骨組みを検証より前に作る (元の欠陥)"
+fresh_copy
+inject "if [[ \"\$SUBCOMMAND\" == \"dashboard\" ]]; then
+  _dashboard_usage_exit() {" "if [[ \"\$SUBCOMMAND\" == \"dashboard\" ]]; then
+  mkdir -p \"\$QUEUE_DIR\" \"\$QUEUE_DIR/missions\" \"\$QUEUE_DIR/archive\"
+  _dashboard_usage_exit() {"
+expect_red "case M" "test_help_prints_usage_and_writes_nothing_on_a_fresh_directory.*dashboard"
+
+echo "== case N: dashboard が -h / --help を usage にしない"
+fresh_copy
+inject "      -h|--help) echo \"Usage: plan.sh dashboard [--all]\"; exit 0 ;;
+" ""
+expect_red "case N" "test_help_prints_usage_and_writes_nothing_on_a_fresh_directory.*dashboard"
+
+echo "== case O: dashboard が未知の option を受理する"
+fresh_copy
+inject "      --all) ;;
+      *)
+        if [[ \"\$_dashboard_arg\" =~" "      --all) ;;
+      *) ;;
+      __unreachable__)
+        if [[ \"\$_dashboard_arg\" =~"
+expect_red "case O" "test_unknown_option_is_rejected_and_nothing_is_written.*dashboard"
+
+echo "== case P: bash 側に新しいサブコマンドを足して usage 行に載せない"
+fresh_copy
+inject "# ─── dashboard TUI (fzf + gum) ───────────────────────────────────────────────" "if [[ \"\$SUBCOMMAND\" == \"frobnicate\" ]]; then
+  mkdir -p \"\$QUEUE_DIR/frobnicate\"
+  exit 0
+fi
+
+# ─── dashboard TUI (fzf + gum) ───────────────────────────────────────────────"
+expect_red "case P" "test_the_tested_subcommands_are_exactly_dispatch_plus_bash_side_branches"
 
 echo
 echo "PASS=$PASS FAIL=$FAIL"

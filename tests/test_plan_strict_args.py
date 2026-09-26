@@ -133,7 +133,7 @@ def _ok(r):
 
 
 def _dispatch_names():
-    """plan.sh 末尾の dispatch テーブルのキー (= サブコマンド全部)。"""
+    """plan.sh 末尾の dispatch テーブルのキー (= python 側で処理するサブコマンド)。"""
     text = PLAN_SH.read_text()
     block = re.search(r"^dispatch = \{(.*?)^\}", text, re.M | re.S).group(1)
     names = re.findall(r"^\s*'([a-z-]+)':", block, re.M)
@@ -141,7 +141,30 @@ def _dispatch_names():
     return names
 
 
-SUBCOMMANDS = _dispatch_names()
+def _bash_side_names():
+    """python の dispatch より前に bash が自分で分岐するサブコマンド (`"$SUBCOMMAND" == "x"`)。
+
+    dispatch テーブルだけを列挙していた頃は、bash 側で完結する `dashboard` が全部の規則の
+    外に出ていた (t006 QA の FAIL)。bash の部分 (python の heredoc より前) の分岐を拾う。
+    """
+    bash_part = PLAN_SH.read_text().split('python3 - "$QUEUE_DIR"', 1)[0]
+    names = set(re.findall(r'"\$SUBCOMMAND" == "([a-z][a-z-]*)"', bash_part))
+    return names - {"help"}
+
+
+def _usage_line_names():
+    """`plan.sh` を引数なしで呼んだときの usage 行に載っているサブコマンド全部。"""
+    m = re.search(r'Usage: plan\.sh <([a-z|-]+)>', PLAN_SH.read_text())
+    assert m, "引数なしの usage 行が見つからない"
+    return m.group(1).split("|")
+
+
+DISPATCH_NAMES = _dispatch_names()
+#: 規則 (--help / 未知の option / positional の数 / 何も書かない) を掛ける対象は **全サブコマンド**
+#: = python の dispatch + bash 側で完結する分岐。usage 行を正にすると、載せ忘れた分だけ
+#: カバレッジが黙って落ちる (実際に `resync` が usage 行に無かった) ので、実装側から導く。
+#: usage 行との突き合わせは下の構造テスト。
+SUBCOMMANDS = DISPATCH_NAMES + sorted(_bash_side_names() - set(DISPATCH_NAMES))
 
 
 def two_missions(sb, *, worker="Ren", first_status="in_progress"):
@@ -550,8 +573,21 @@ def test_every_subcommand_has_a_usage_and_an_arity_entry():
     usage = set(re.findall(r"^    '([a-z-]+)': ", re.search(r"^USAGE = \{(.*?)^\}", text, re.M | re.S).group(1), re.M))
     arity = set(re.findall(r"'([a-z-]+)': \(\d, \d\)",
                            re.search(r"^POSITIONAL_ARITY = \{(.*?)^\}", text, re.M | re.S).group(1)))
-    assert usage == set(SUBCOMMANDS), usage ^ set(SUBCOMMANDS)
-    assert arity == set(SUBCOMMANDS), arity ^ set(SUBCOMMANDS)
+    assert usage == set(DISPATCH_NAMES), usage ^ set(DISPATCH_NAMES)
+    assert arity == set(DISPATCH_NAMES), arity ^ set(DISPATCH_NAMES)
+
+
+def test_the_tested_subcommands_are_exactly_dispatch_plus_bash_side_branches():
+    """列挙から漏れたサブコマンドが「規則の外」になる (dashboard がそうだった) のを機械で防ぐ。
+
+    - 検出器が bash 側の分岐を 1 つも拾えなくなったら赤 (陽性対照: dashboard を拾えること)
+    - dispatch / bash 側の分岐に足したのに、引数なしの usage 行に載せ忘れても赤
+      (利用者が見つけられないサブコマンド。`resync` が実際に載っていなかった)
+    """
+    assert "dashboard" in _bash_side_names(), "検出器が bash 側の分岐を 1 つも拾えていない (陽性対照)"
+    usage_line = _usage_line_names()
+    assert len(usage_line) == len(set(usage_line)), "usage 行に重複がある"
+    assert set(usage_line) == set(SUBCOMMANDS), set(usage_line) ^ set(SUBCOMMANDS)
 
 
 def test_header_usage_documents_the_strict_rules():

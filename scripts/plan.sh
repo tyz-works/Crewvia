@@ -45,6 +45,7 @@ set -euo pipefail
 #                              task が属する mission の slug を 1 行出す (読み取り専用。
 #                              --mission 省略時の探索順は pull と同じ)
 #   plan.sh archive <slug>
+#   plan.sh dashboard [--all]   fzf/gum の TUI (bash 側で完結。引数の規則は他と同じ)
 #
 # 引数は厳格: 未知の option (`-x` / `--xxx`) と余った positional は usage を出して exit 2
 # (`pull` だけ exit 1 — pull の 2 は「タスクなし」)。`--` 以降は positional。
@@ -58,7 +59,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 QUEUE_DIR="${CREWVIA_QUEUE:-${REPO_ROOT}/queue}"
 
 if [[ $# -eq 0 ]]; then
-  echo "Usage: plan.sh <init|add|pull|done|needs-director|fail|update|release-dep|retire|ready-for-verification|verify-result|review|launch|task-graph|lint|status|archive|dashboard|dashboard-data|resolve-mission> [args...]" >&2
+  echo "Usage: plan.sh <init|add|pull|done|needs-director|fail|update|release-dep|retire|ready-for-verification|verify-result|review|launch|task-graph|lint|status|archive|resync|dashboard|dashboard-data|resolve-mission> [args...]" >&2
   exit 1
 fi
 
@@ -73,7 +74,38 @@ if [[ "$SUBCOMMAND" == "-h" || "$SUBCOMMAND" == "--help" || "$SUBCOMMAND" == "he
   exit 0
 fi
 
+# `dashboard` は python の dispatch を通らず bash 側で完結する (fzf/gum の TUI) ので、parse_opts と
+# 同じ規則をここで掛ける: `-h` / `--help` は usage を出して exit 0、未知の option と positional は
+# exit 2。**どちらの場合も queue の骨組みは作らない** (mkdir は検証を通ったあと)。
+# 検証を bash 側の分岐に持たなかった頃は、`dashboard --help` が queue/ を作って TUI を起動し、
+# `dashboard --bogus` が受理された (t006 QA の FAIL)。
 if [[ "$SUBCOMMAND" == "dashboard" ]]; then
+  _dashboard_usage_exit() {
+    echo "plan.sh dashboard: $1" >&2
+    echo "Usage: plan.sh dashboard [--all]" >&2
+    exit 2
+  }
+  _dashboard_option_like='^--?[A-Za-z][A-Za-z0-9_-]*(=.*)?$'
+  _dashboard_after_dd=0
+  for _dashboard_arg in "$@"; do
+    if [[ "$_dashboard_after_dd" -eq 1 ]]; then
+      _dashboard_usage_exit "expected 0 positional argument(s), got '$_dashboard_arg'"
+    fi
+    case "$_dashboard_arg" in
+      --) _dashboard_after_dd=1 ;;
+      -h|--help) echo "Usage: plan.sh dashboard [--all]"; exit 0 ;;
+      --all) ;;
+      *)
+        if [[ "$_dashboard_arg" =~ $_dashboard_option_like ]]; then
+          _dashboard_usage_exit "unknown option '$_dashboard_arg'"
+        fi
+        _dashboard_usage_exit "expected 0 positional argument(s), got '$_dashboard_arg'"
+        ;;
+    esac
+  done
+  unset -f _dashboard_usage_exit
+  unset _dashboard_option_like _dashboard_arg _dashboard_after_dd
+  # 検証を通ったあとにだけ骨組みを作る
   mkdir -p "$QUEUE_DIR" "$QUEUE_DIR/missions" "$QUEUE_DIR/archive"
 fi
 

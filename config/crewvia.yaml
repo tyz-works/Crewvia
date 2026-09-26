@@ -20,7 +20,7 @@ wip_limit: 8
 # 利用可能な ID (2026-09 時点で claude CLI 2.1.263 に受理確認済み):
 #   claude-opus-5              ← 最高性能。計画・調整・レビュー向き
 #   claude-sonnet-5            ← バランス型。実装・汎用作業向き (worker_model のデフォルト)
-#   claude-haiku-4-5-20251001  ← 高速・低コスト。軽タスク向き
+#   claude-haiku-4-5-20251001  ← 高速・低コスト。ただし permission-mode auto を無視するので Worker には使わない
 #
 # 環境変数での上書き:
 #   CREWVIA_DIRECTOR_MODEL=claude-opus-5
@@ -40,9 +40,11 @@ model_per_skill:
   plan_review: claude-opus-5
   review:      claude-opus-5
   research:    claude-opus-5
-  docs:        claude-haiku-4-5-20251001
-  qa:          claude-haiku-4-5-20251001
-  verify:      claude-haiku-4-5-20251001
+  # docs / qa / verify を Haiku にしない: Haiku は --permission-mode auto を無視して承認
+  # ダイアログで止まる (t028 / backlog #16)。以前は起動のたびに CREWVIA_WORKER_MODEL で上書きしていた。
+  docs:        claude-sonnet-5
+  qa:          claude-sonnet-5
+  verify:      claude-sonnet-5
   # 未定義の skill (bash / code / typescript / python / database / cloud / ops)
   # は worker_model にフォールバックする
 

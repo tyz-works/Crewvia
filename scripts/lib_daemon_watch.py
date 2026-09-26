@@ -596,8 +596,8 @@ def _sh_single_quote(value: str) -> str:
 def spawn_command(name: str, repo_root, *, env=None) -> str:
     """The exact command `start.sh` uses to launch `name`.
 
-    `Mux.spawn()` takes an `env=` argument that **both backends ignore**, and
-    herdr additionally replays its server's startup environment onto every new
+    `Mux.spawn()` has no `env` argument (it used to accept one and drop it in
+    both backends — t017), and herdr additionally replays its server's startup environment onto every new
     pane — so a daemon started by its peer would inherit whatever that server
     was born with rather than what the launcher meant.  The only thing that
     reliably crosses the spawn boundary is the command text, so the mux

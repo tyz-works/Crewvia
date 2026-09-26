@@ -108,6 +108,12 @@ exclude = {
     # workers.yaml を 1 度だけ書く。書き込みは pytest の使い捨てツリーに閉じ、
     # repo の registry/workers.yaml に書く経路は存在しない。
     root / "tests" / "test_dispatcher_cycle_honours_hold.py",
+    # 同上 (t017 の add-skills テスト)。`registry` fixture は `tmp_path / "registry" /
+    # "workers.yaml"` に固定の内容を 1 度だけ書き、書き込みは pytest の使い捨て
+    # ツリーに閉じる (repo の registry/workers.yaml には一切触れない)。add_skills
+    # 自身は lib_registry.py の with_lock を通る (test_the_whole_cycle_runs_under_
+    # the_registry_lock がそれを固定する)。
+    root / "tests" / "test_registry_skills_and_spawn_env.py",
     # 欠陥注入スクリプト。`p.write_text(s)` の p は `git archive HEAD` を
     # mktemp -d に展開した使い捨てツリーの **Python ソースファイル** であって
     # registry ではない。"workers.yaml" は注入するソース文字列と直前の見出し

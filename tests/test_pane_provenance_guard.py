@@ -722,7 +722,7 @@ def test_restart_cannot_destroy_what_the_mux_layer_refuses(
         def kill(self, name, allow_foreign=False):
             return False                       # identity ガードが断った
 
-        def spawn(self, name, cmd, cwd=None, env=None):
+        def spawn(self, name, cmd, cwd=None):
             self.spawned.append(name)
             return True
 

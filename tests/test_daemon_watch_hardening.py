@@ -138,9 +138,9 @@ def test_the_decision_and_the_spawn_happen_under_one_lock(repo):
     held = []
 
     class ProbingMux(FakeMux):
-        def spawn(self, name, cmd, cwd=None, env=None):
+        def spawn(self, name, cmd, cwd=None):
             held.append(_foreign_lock_attempt(dw.lock_path(repo / "registry", name)))
-            return super().spawn(name, cmd, cwd=cwd, env=env)
+            return super().spawn(name, cmd, cwd=cwd)
 
     watch, mux, _ = _dead_peer_watch(repo, mux=ProbingMux(windows=["Sora-director"]))
     verdict = watch.watch_peer()
@@ -161,10 +161,10 @@ def test_a_pause_cannot_slip_in_while_a_decision_is_in_flight(repo):
     let_spawn_finish = threading.Event()
 
     class SlowMux(FakeMux):
-        def spawn(self, name, cmd, cwd=None, env=None):
+        def spawn(self, name, cmd, cwd=None):
             reached_spawn.set()
             let_spawn_finish.wait(10)
-            return super().spawn(name, cmd, cwd=cwd, env=env)
+            return super().spawn(name, cmd, cwd=cwd)
 
     watch, mux, _ = _dead_peer_watch(repo, mux=SlowMux(windows=["Sora-director"]))
     watcher = threading.Thread(target=watch.watch_peer, daemon=True)
@@ -197,9 +197,9 @@ def test_restart_holds_the_lock_across_kill_and_spawn(repo, idle_pane_shell):
     inner_kill, inner_spawn = mux.kill, mux.spawn
     mux.kill = lambda n: (seen.append(("kill", _foreign_lock_attempt(lock))),
                           inner_kill(n))[1]
-    mux.spawn = lambda n, c, cwd=None, env=None: (
+    mux.spawn = lambda n, c, cwd=None: (
         seen.append(("spawn", _foreign_lock_attempt(lock))),
-        inner_spawn(n, c, cwd=cwd, env=env))[1]
+        inner_spawn(n, c, cwd=cwd))[1]
 
     assert dw.restart(dw.DAEMON_DISPATCHER, repo_root=repo, mux=mux,
                       log=lambda m: None) is True

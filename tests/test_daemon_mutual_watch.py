@@ -84,7 +84,7 @@ class FakeMux:
             names = [n for n in names if n.endswith(suffix)]
         return names
 
-    def spawn(self, name, cmd, cwd=None, env=None):
+    def spawn(self, name, cmd, cwd=None):
         self.spawned.append({"name": name, "cmd": cmd, "cwd": cwd})
         if self.spawn_ok:
             self.windows.append(name)
@@ -259,7 +259,7 @@ def test_respawn_command_matches_start_sh(repo):
 
 
 def test_spawn_command_embeds_env_in_the_command_string(repo, monkeypatch):
-    """spawn()'s `env=` argument is ignored by BOTH backends, so CREWVIA_MUX
+    """spawn() has no `env` argument (t017), so CREWVIA_MUX
     has to travel inside the command text (same as start.sh's _MUX_ENV_PREFIX)."""
     monkeypatch.setenv("CREWVIA_MUX", "herdr")
     cmd = dw.spawn_command("dispatcher", repo)
@@ -705,9 +705,9 @@ class RecordingMux(FakeMux):
             self.windows.remove(name)
         return True
 
-    def spawn(self, name, cmd, cwd=None, env=None):
+    def spawn(self, name, cmd, cwd=None):
         self.calls.append(("spawn", name))
-        return super().spawn(name, cmd, cwd=cwd, env=env)
+        return super().spawn(name, cmd, cwd=cwd)
 
 
 def test_restart_holds_the_marker_across_kill_and_spawn(repo, idle_pane_shell):
@@ -719,9 +719,9 @@ def test_restart_holds_the_marker_across_kill_and_spawn(repo, idle_pane_shell):
     mux_kill, mux_spawn = mux.kill, mux.spawn
     mux.kill = lambda n: (seen.append(("kill", dw.pause_path(registry, n).exists())),
                           mux_kill(n))[1]
-    mux.spawn = lambda n, c, cwd=None, env=None: (
+    mux.spawn = lambda n, c, cwd=None: (
         seen.append(("spawn", dw.pause_path(registry, n).exists())),
-        mux_spawn(n, c, cwd=cwd, env=env))[1]
+        mux_spawn(n, c, cwd=cwd))[1]
 
     assert dw.restart("dispatcher", repo_root=repo, mux=mux, log=lambda m: None) is True
 

@@ -473,7 +473,7 @@ class _PaneMux:
         self.calls.append(("kill", name))
         return True
 
-    def spawn(self, name, cmd, cwd=None, env=None):
+    def spawn(self, name, cmd, cwd=None):
         self.calls.append(("spawn", name))
         return True
 

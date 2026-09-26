@@ -11,6 +11,8 @@
 #   mux_spawn <name> <cmd> [<cwd>]  → exit 0 launched, 1 did not launch,
 #                                 10 pane occupied by a live process, 11 occupant unreadable
 #   mux_send  <name> <text>
+#   mux_keys  <name> <key>...   → press named keys (Up Down Left Right Enter Escape Tab) for a
+#                                 selection dialog; exit 2 on an unknown key (nothing sent)
 #   mux_verify_sent <name> <text> → exit 0 if <text> left the input line (landed), 1 if still stuck
 #   mux_capture <name>          → prints screen contents
 #   mux_list [<suffix>]         → one name per line
@@ -36,6 +38,10 @@ mux_spawn() {
 
 mux_send() {
     python3 "$_LIB_MUX_PY" send "$@"
+}
+
+mux_keys() {
+    python3 "$_LIB_MUX_PY" keys "$@"
 }
 
 mux_verify_sent() {

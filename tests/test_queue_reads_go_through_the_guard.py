@@ -904,6 +904,9 @@ ALLOWED_SUBPROCESS_CALLS = {
     ("lib_mux.py", "server_running", "tmux"): "サーバーの生死",
     ("lib_mux.py", "server_identity", "tmux"): "サーバーの socket と pid",
     ("lib_mux.py", "_send_to_target", "tmux"): "ペインにキーを送る",
+    ("lib_mux.py", "keys", "tmux"):
+        "`tmux send-keys` に名前付きキー (translate_keys の語彙だけ) を渡す "
+        "(t028)。ファイルは渡さない",
     ("lib_mux.py", "_inspect_pane_full", "tmux"): "ペインの属性を訊く",
     ("lib_mux.py", "record_existence", "tmux"):
         "記録が指す window id の実在を訊く (t001。tmux に `list-windows -a` を"

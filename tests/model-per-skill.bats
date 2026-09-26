@@ -11,7 +11,7 @@
 #
 # Coverage:
 #   1. env 明示指定 (CREWVIA_WORKER_MODEL) が model_per_skill より優先
-#   2. env 無しで model_per_skill が効く (planning→opus / docs→haiku / code→sonnet)
+#   2. env 無しで model_per_skill が効く (planning→opus / docs,qa,verify→sonnet / code→sonnet)
 #   3. director role では model_per_skill が適用されない (CREWVIA_DIRECTOR_MODEL のみ)
 #   4. config 欠損時に WORKER_MODEL_FROM_CONFIG フォールバック → 空文字を返す
 
@@ -51,7 +51,7 @@ teardown() {
 # Test 1: env 明示指定が model_per_skill より優先される
 # ---------------------------------------------------------------------------
 @test "CREWVIA_WORKER_MODEL 明示指定は skill mapping を上書きする" {
-  # docs skill は haiku のはずだが、env で opus を指定すれば opus が返る
+  # docs skill は sonnet のはずだが、env で opus を指定すれば opus が返る
   result=$(CREWVIA_WORKER_MODEL="claude-opus-5" CREWVIA_PRINT_MODEL=1 \
            bash "$START_SH" worker docs 2>/dev/null)
   [ "$result" = "claude-opus-5" ]
@@ -72,9 +72,20 @@ teardown() {
   [ "$result" = "claude-opus-5" ]
 }
 
-@test "env 無し: docs → claude-haiku-4-5-20251001" {
+# docs / qa / verify は Sonnet (t028): Haiku は permission-mode auto を無視して承認ダイアログで止まる。
+@test "env 無し: docs → claude-sonnet-5" {
   result=$(CREWVIA_PRINT_MODEL=1 bash "$START_SH" worker docs 2>/dev/null)
-  [ "$result" = "claude-haiku-4-5-20251001" ]
+  [ "$result" = "claude-sonnet-5" ]
+}
+
+@test "env 無し: qa → claude-sonnet-5" {
+  result=$(CREWVIA_PRINT_MODEL=1 bash "$START_SH" worker qa 2>/dev/null)
+  [ "$result" = "claude-sonnet-5" ]
+}
+
+@test "env 無し: verify → claude-sonnet-5" {
+  result=$(CREWVIA_PRINT_MODEL=1 bash "$START_SH" worker verify 2>/dev/null)
+  [ "$result" = "claude-sonnet-5" ]
 }
 
 @test "env 無し: code → claude-sonnet-5 (worker_model フォールバック)" {
@@ -82,9 +93,9 @@ teardown() {
   [ "$result" = "claude-sonnet-5" ]
 }
 
-@test "env 無し: docs qa → claude-haiku (複数 skill、同ランクは haiku)" {
+@test "env 無し: docs qa → claude-sonnet-5 (複数 skill でも Haiku に落ちない)" {
   result=$(CREWVIA_PRINT_MODEL=1 bash "$START_SH" worker docs qa 2>/dev/null)
-  [ "$result" = "claude-haiku-4-5-20251001" ]
+  [ "$result" = "claude-sonnet-5" ]
 }
 
 @test "env 無し: planning code → claude-opus-5 (最高ランク選択)" {

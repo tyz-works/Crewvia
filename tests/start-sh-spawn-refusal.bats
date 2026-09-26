@@ -149,6 +149,23 @@ teardown() {
     [[ "$output" != *"Agent launched"* ]]
 }
 
+@test "a refused launch does not overwrite the live Worker's TARGET_DIR record (t009)" {
+    # 既に生きている Worker が居る名前への start.sh は、起動していない。そこで別の TARGET_DIR の
+    # 記録を書くと、生きている Worker の記録が嘘になり、dispatcher が誤った task を回す。
+    python3 "${REPO_ROOT}/scripts/lib_worker_target.py" record "${REPO_ROOT}/registry" RefusalTest /srv/live-target >/dev/null
+    sleep 30 >/dev/null 2>&1 3>&- &
+    LIVE_PID=$!
+    export FAKE_PANE_PID="$LIVE_PID"
+    export FAKE_LIST_MODE=present
+    unset TARGET_DIR
+
+    run bash "$START_SH" worker --name RefusalTest code
+
+    [[ "$output" == *"is already running"* ]]
+    run python3 "${REPO_ROOT}/scripts/lib_worker_target.py" show "${REPO_ROOT}/registry" RefusalTest
+    [[ "$output" == *'"target_dir": "/srv/live-target"'* ]]
+}
+
 @test "a pane that cannot be read is not reported as running" {
     export FAKE_PANE_PID=999999     # no such process: the pane cannot be read
     export FAKE_LIST_MODE=present

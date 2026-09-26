@@ -129,6 +129,11 @@ exclude = {
     # REGISTRY_DIR 直下のその名前を読む)。書き込みは pytest の使い捨てツリーに閉じ、
     # repo の registry/workers.yaml に書く経路は存在しない。
     root / "tests" / "test_needs_director_releases_assignment.py",
+    # t009 (割り当ての機械照合) の実 dispatch() 1 サイクルのテスト。`repo` fixture が `tmp_path /
+    # "repo"` の使い捨てツリーに、idle Worker 1 人と Director のぶんの workers.yaml を 1 度だけ書く
+    # (dispatcher は REGISTRY_DIR 直下のその名前を読む)。書き込みは pytest の使い捨てツリーに閉じ、
+    # repo の registry/workers.yaml に書く経路は存在しない。
+    root / "tests" / "test_assignment_routing.py",
 }
 proximity = 15
 found = []

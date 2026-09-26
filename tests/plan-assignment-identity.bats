@@ -95,14 +95,18 @@ Task $id.
 MD
 }
 
+# TARGET_DIR は task の target_dir (add_task が埋める TEST_TARGET) と同じにする。
+# `pull --task` は Worker の実効 target と card の target_dir を照合して、合わなければ exit 3 で
+# 拒否する (t009 / #21)。ここの task は worktree 作成を抑止するためだけに target_dir を持つので、
+# Worker もその target で起動された体にする (照合の拒否そのものは tests/test_assignment_routing.py)。
 plan() {
-  CREWVIA_QUEUE="$TEST_QUEUE" TASKVIA_URL= TASKVIA_TOKEN= TARGET_DIR= \
+  CREWVIA_QUEUE="$TEST_QUEUE" TASKVIA_URL= TASKVIA_TOKEN= TARGET_DIR="$TEST_TARGET" \
     bash "$PLAN_SH" "$@" 2>&1
 }
 
 plan_as() {
   local agent="$1"; shift
-  CREWVIA_QUEUE="$TEST_QUEUE" TASKVIA_URL= TASKVIA_TOKEN= TARGET_DIR= \
+  CREWVIA_QUEUE="$TEST_QUEUE" TASKVIA_URL= TASKVIA_TOKEN= TARGET_DIR="$TEST_TARGET" \
     AGENT_NAME="$agent" bash "$PLAN_SH" "$@" 2>&1
 }
 
@@ -177,13 +181,15 @@ assert d['started_at'] == '''$started''', d
 
 @test "done does not remove an assignment that points at another task" {
   setup_queue "ai-done-foreign"
-  add_task t001 in_progress Ren '"2026-01-01T00:00:00Z"'
   add_task t002
 
   # Ren は既に t002 に移っている (t001 の card だけが取り残されている)。
+  # 取り残された card は pull の **後** に置く: 先に置くと、別の task を持っている Worker の
+  # pull として拒否される (t009 / #22 — その拒否は tests/test_assignment_routing.py)。
   run plan pull --agent Ren --skills bash --task t002 --mission "$TEST_MISSION"
   [ "$status" -eq 0 ]
   [ "$(cat "$ASSIGN_DIR/Ren")" = "$TEST_MISSION:t002" ]
+  add_task t001 in_progress Ren '"2026-01-01T00:00:00Z"'
 
   run plan_as Ren done t001 "result" --mission "$TEST_MISSION"
   [ "$status" -eq 0 ]
@@ -199,11 +205,12 @@ assert d['started_at'] == '''$started''', d
 
 @test "fail does not remove an assignment that points at another task" {
   setup_queue "ai-fail-foreign"
-  add_task t001 in_progress Ren '"2026-01-01T00:00:00Z"'
   add_task t002
 
+  # 取り残された card は pull の後に置く (上のテストと同じ理由)。
   run plan pull --agent Ren --skills bash --task t002 --mission "$TEST_MISSION"
   [ "$status" -eq 0 ]
+  add_task t001 in_progress Ren '"2026-01-01T00:00:00Z"'
 
   run plan_as Ren fail t001 --head "$(git rev-parse HEAD)" --mission "$TEST_MISSION"
   [ "$status" -eq 0 ]

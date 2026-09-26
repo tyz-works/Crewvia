@@ -21,7 +21,10 @@ set -euo pipefail
 #                              --skills 省略時は環境変数 SKILLS → registry の Worker の skills の順。
 #                              どれも無ければ拒否 (skill の絞り込みを丸ごと無効にしない)。
 #                              Director (registry の role: director) は pull できない
-#   plan.sh done <task_id> "<result>" [--mission <slug>]
+#   plan.sh done <task_id> "<result>" [--mission <slug>] [--pr <N>]
+#                              --pr <N>: この task の PR 番号。この task を blocked_by に持つ
+#                              codex-review / review の task に pr_number を書く (未設定のものだけ)。
+#                              codex-review が blocked なら pending に戻す。Result からは推測しない
 #   plan.sh fail <task_id> [<handoff_path>] (--head <sha> | --no-head <理由>) [--mission <slug>]
 #   plan.sh update <task_id> [--mission <slug>] [--skills <csv>] [--blocked-by <csv>]
 #                            [--priority high|medium|low] [--worker <name>] [--status <status>]
@@ -2395,7 +2398,7 @@ USAGE = {
             '                     [--pr-number <N>]'),
     'pull': ('plan.sh pull [--mission <slug>] [--skills <csv>] [--agent <name>]\n'
              '                    [--target-dir <path>] [--task <task_id>]'),
-    'done': 'plan.sh done <task_id> "<result>" [--mission <slug>]',
+    'done': 'plan.sh done <task_id> "<result>" [--mission <slug>] [--pr <N>]',
     'needs-director': 'plan.sh needs-director <task_id> "<理由>" [--mission <slug>]',
     'fail': ('plan.sh fail <task_id> [<handoff_path>] (--head <sha> | --no-head "<理由>")\n'
              '                     [--mission <slug>]'),
@@ -2779,6 +2782,55 @@ def resolve_ambiguous_mission(command, task_id, matches):
     die("\n".join(lines))
 
 
+def agent_busy_elsewhere(agent, mission, task_id, slugs):
+    """`agent` が、`mission/task_id` とは **別の** task を持っているなら、その説明 (1 行)。無ければ None。
+
+    `pull --task` の二重割り当て拒否 (t009 / #22) の判定。2 つの証拠のどちらか一方でも
+    別の task を指していれば「持っている」:
+
+      * card: worker が `agent` で status が `in_progress` の card。
+      * assignment: `queue/assignments/<agent>` が別の task を指していて、**その task が手放されて
+        いない** (in_progress / needs_director / verifying ... 。完了・failed・cancelled・pending・
+        card が見つからない、は手放し済みの孤児)。
+
+    needs_director / needs_human_review の card だけでは「持っている」にしない: Kai-codex
+    (使い捨ての reviewer) は needs-director 後も名前が card に残り、それを持っていることにすると
+    以後の codex-review が恒久的に取れなくなる (#13 の再発)。dispatcher が判断待ちの Worker に
+    task を送らないのは dispatcher 側 (`worker_waits_on_director`) の話。
+    孤児の assignment は次の `publish_assignment` が上書きする (codex_review_slot_busy と同じ扱い)。
+
+    assignment が **読めない** ときは、別の task を指していないと証明できないので「持っている」に
+    数える (上書きが、まさに防ぎたい事故の再現になる)。キューロックの中で呼ぶこと。
+    """
+    for slug in slugs:
+        if not os.path.exists(mission_dir(slug)):
+            continue
+        for meta, _body in list_tasks(slug):
+            if (meta.get('worker') == agent and meta.get('status') == 'in_progress'
+                    and not (slug == mission and meta.get('id') == task_id)):
+                return f"card {slug}/{meta.get('id')} が in_progress です"
+
+    verdict = classify_assignment(agent, mission, task_id, None)
+    if verdict == ASSIGN_UNVERIFIABLE:
+        return describe_assignment_verdict(agent, verdict)
+    if verdict != ASSIGN_OTHER_TASK:
+        return None
+    published = _TASK_CARDS.read_regular_text_or_unreadable(assignment_path(agent))
+    if _TASK_CARDS.is_unreadable(published):
+        return describe_assignment_verdict(agent, ASSIGN_UNVERIFIABLE)
+    other_mission, _, other_task = published.strip().partition(':')
+    if not other_mission or not other_task or not os.path.exists(mission_dir(other_mission)):
+        return None   # 形が違う / mission が無い: 指す先が無い孤児
+    released = TERMINAL_STATUSES | set(DEAD_DEP_STATUSES) | set(HELD_DEP_STATUSES) | {'pending'}
+    for meta, _body in list_tasks(other_mission):
+        if meta.get('id') == other_task:
+            status = meta.get('status')
+            if status in released or status == CORRUPT_TASK_STATUS:
+                return None
+            return f"assignment/{agent} が task {other_mission}/{other_task} (status={status}) を指しています"
+    return None
+
+
 def cmd_resolve_mission(args):
     """plan.sh resolve-mission <task_id> [--mission <slug>]
 
@@ -2910,6 +2962,40 @@ def cmd_pull(args):
                         )
                     if st != 'pending':
                         die(f"task '{specific_task}' has unexpected status: {st}")
+                    # 割り当てを機械で照合する (t009 / #21 #22)。ここより前の検査が
+                    # 「同じ task を既に持っている」(= 割り当てメッセージの二重着弾や、同名の
+                    # 後任の取り直し) を扱う。ここから先は **別の** task の話で、
+                    # 1 バイトも書かずに exit 3 (PRECONDITION_UNMET) で返る。
+                    #
+                    # (1) target_dir: skill の絞り込みは dispatcher が済ませているので迂回
+                    #     するが、target は Worker の実効 target (--target-dir > TARGET_DIR) と
+                    #     照合する。別 repo 用の Worker が crewvia 本体の task を取ると、
+                    #     差し戻しても同じ Worker に再割り当てされた。自動 pull の絞り込みと
+                    #     同じ比較 (下の Regular auto-selection flow)。
+                    task_td = meta.get('target_dir') or None
+                    if task_td != effective_target:
+                        die(
+                            f"task '{specific_task}' の target_dir は {task_td or '(crewvia 本体)'} ですが、"
+                            f"この Worker の TARGET_DIR は {effective_target or '(crewvia 本体)'} です。"
+                            f"取りません (何も書いていません)。"
+                            f"Director は target_dir に合う Worker を起動して割り当ててください。",
+                            PRECONDITION_UNMET,
+                        )
+                    # (2) 二重割り当て: 自分が別の task を持っている Worker は取らない。
+                    #     assignment を上書きすると、先に持っていた task の assignment が消え、
+                    #     dispatcher からは idle に見える。in_progress の card と assignment の
+                    #     どちらか一方でも別の task を指していれば拒否する (孤児の assignment・
+                    #     判断待ちだけの card は対象外、読めない assignment は拒否 —
+                    #     agent_busy_elsewhere() が唯一の定義)。
+                    if agent:
+                        busy = agent_busy_elsewhere(agent, slug, specific_task, slugs)
+                        if busy:
+                            die(
+                                f"{agent} は既に別の task を持っています: {busy}。"
+                                f"task '{specific_task}' は取りません (何も書いていません)。"
+                                f"先の task を done / needs-director で手放してから取り直してください。",
+                                PRECONDITION_UNMET,
+                            )
                     # Defense-in-depth: reject pull if any dependency is not yet done,
                     # even when --task bypasses skill/target filters.  This prevents
                     # a blocked task from being executed when the dispatcher sends a
@@ -3445,12 +3531,62 @@ def cmd_needs_director(args):
     with_lock(_do)
 
 
+#: `plan.sh done --pr` が PR 番号を伝える先の skill (t009 / #24)。`codex-review` は dispatcher が
+#: kai-review.sh に PR 番号を渡すために必須、`review` は Worker が読むカードに書く。
+PR_PROPAGATION_SKILLS = ('codex-review', 'review')
+
+
+def propagate_pr_number(slug, task_id, pr_number):
+    """`task_id` を blocked_by に持つ codex-review / review の task に `pr_number` を書く。
+
+    伝える先の条件は 3 つの AND: この task を `blocked_by` に持つ・skills に codex-review か
+    review を含む・`pr_number` が **未設定** (Director が手で入れた値を上書きしない)。
+    codex-review の task が `blocked` (PR 番号待ち) なら `pending` に戻す — 戻さないと、番号が
+    入ったのに誰も dispatch しない。`blocked_reason` は消す (理由が済んだので)。review の task は
+    番号だけで、status は触らない (止まっている理由が PR 番号とは限らないため)。
+
+    Result の本文から番号を推測することはしない (明示フラグだけ)。キューロックの中で呼ぶこと。
+    `[破損]` の card は書き戻すと壊れた中身を正規化してしまうので触らない。
+    戻り値: `[(task_id, 'pr_number' | 'pr_number+unblocked')]`。
+    """
+    touched = []
+    for meta, body in list_tasks(slug):
+        if meta.get('status') == CORRUPT_TASK_STATUS:
+            continue
+        deps = meta.get('blocked_by')
+        if not isinstance(deps, list) or task_id not in deps:
+            continue
+        skills = set(meta.get('skills') or [])
+        if not skills & set(PR_PROPAGATION_SKILLS):
+            continue
+        if meta.get('pr_number') not in (None, ''):
+            continue
+        meta['pr_number'] = pr_number
+        how = 'pr_number'
+        if 'codex-review' in skills and meta.get('status') == 'blocked':
+            meta['status'] = 'pending'
+            meta.pop('blocked_reason', None)
+            how = 'pr_number+unblocked'
+        save_task(slug, meta['id'], meta, body)
+        touched.append((meta['id'], how))
+    return touched
+
+
 def cmd_done(args):
-    opts, positional = parse_opts(args, {'--mission': 'value'})
+    opts, positional = parse_opts(args, {'--mission': 'value', '--pr': 'value'})
     if len(positional) < 2:
         die("done requires <task_id> and <result>")
     task_id = positional[0]
     result = positional[1]
+    # --pr は、何かを書き始める前に検証する。
+    pr_number = None
+    if opts.get('--pr') is not None:
+        try:
+            pr_number = int(opts['--pr'])
+        except ValueError:
+            die("--pr must be a positive integer")
+        if pr_number <= 0:
+            die("--pr must be a positive integer")
     sync_holder = [None]  # (slug, task_id, result)
     worker_holder = [None]  # worker name for registry bump (None = _do未実行, '' = worker未設定)
 
@@ -3513,6 +3649,18 @@ def cmd_done(args):
         save_task(slug, task_id, meta, new_body)
         worker_holder[0] = meta.get('worker') or ''  # capture worker for post-lock bump
         sync_holder[0] = (slug, task_id, result)
+
+        # PR 番号を、この task を待っている codex-review / review の card に伝える (#24)。
+        # done と同じトランザクションで行う: done だけ済んで番号が伝わっていない瞬間に
+        # dispatcher が「pr_number が無い」と警告して止まるのを避ける。
+        if pr_number is not None:
+            propagated = propagate_pr_number(slug, task_id, pr_number)
+            if not propagated:
+                print(f"[plan.sh] --pr {pr_number}: {task_id} を blocked_by に持つ、pr_number 未設定の "
+                      f"codex-review / review task はありません (何も伝えていません)")
+            for dep_id, how in propagated:
+                print(f"[plan.sh] PR #{pr_number} → {slug}/{dep_id} "
+                      f"({'pr_number を設定し blocked を pending に戻した' if how.endswith('unblocked') else 'pr_number を設定'})")
 
         # assignment の撤去は card の書き換えと同じトランザクションで行う。
         # generation=None なのは、この経路が「いま card が示している実行」を

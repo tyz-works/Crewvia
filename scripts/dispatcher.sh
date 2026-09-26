@@ -99,6 +99,7 @@ import sys
 import os
 import re
 import json
+import shlex
 import time
 import subprocess
 import urllib.request
@@ -150,6 +151,10 @@ from lib_daemon_state import (  # noqa: E402
     load_json_store, notify_cache_problem, rule5_state_problem, told_entry_problem,
     told_ledger_problem,
 )
+# Worker が起動された TARGET_DIR の記録と、「この Worker にこの task を回してよいか」の
+# 判定 (t009 / #21)。定義はこのモジュールに 1 つだけ (`plan.sh pull` の target 照合と
+# 同じ正規形)。ここに Worker と task の target_dir の比較を書き戻さないこと。
+import lib_worker_target as _worker_target  # noqa: E402
 _mux = Mux()
 
 # t002: who may end a Worker process.  'watchdog' (default) = this daemon only
@@ -623,6 +628,85 @@ def codex_review_slot_busy(task_statuses_by_mission):
             f"(status={status}) を指す孤児 — spawn を塞がない")
         return False
     return True
+
+
+_target_record_memo = {}      # dispatch() が毎サイクルの先頭で空にする
+
+
+def worker_target_record(agent_name):
+    """`registry/workers/<agent>/target_dir.json` (検証済みの dict か `Unreadable`)。
+
+    1 サイクルに 1 度だけ読む。読めない (壊れている) は毎サイクル警告すると 5 秒ごとに
+    ログを埋めるので、通知スロットルに 1 回だけ出す。
+    """
+    if agent_name not in _target_record_memo:
+        def _warn(msg, agent_name=agent_name):
+            key = f"target_record_trouble_{agent_name}"
+            if should_notify(key):
+                log(f"WARNING: {agent_name}: {msg}")
+                record_notify(key)
+        _target_record_memo[agent_name] = _worker_target.load_record(
+            REGISTRY_DIR, agent_name, warn=_warn)
+    return _target_record_memo[agent_name]
+
+
+def worker_may_take_task(agent_name, meta):
+    """この Worker に task (`meta`) を割り当ててよいか — `(可否, 理由)`。判定は lib 1 つ。"""
+    return _worker_target.worker_may_take(
+        worker_target_record(agent_name), meta.get('target_dir'))
+
+
+def worker_outstanding_assignment(agent_name, all_tasks):
+    """割り当てメッセージを送ったが、まだ pull されていない task `(slug, task_id)` を返す (無ければ None)。
+
+    #22: dispatcher は Worker に task A を送った 6 秒後に、別の task B (優先度が高い・
+    unblock された) を同じ Worker に送り、Worker が両方を pull して `queue/assignments/<worker>` が
+    上書きされた。送った時点では assignment ファイルはまだ無いので `is_idle` は真のままで、
+    「送った」という事実は通知スロットル (`assign_<agent>_<slug>_<task>`) にしか残っていない。
+    A がまだ pending で、その送信が TTL の内にあるあいだ、その Worker は「割り当て済み」として扱う。
+    TTL を過ぎても pull されなければ (Worker が受け取っていない) この保護は外れ、A の再送に戻る
+    (従来と同じ)。`plan.sh pull --task` 側の拒否 (別 task を持つ Worker) が最後の網。
+    """
+    cache = load_notify_cache()
+    now = time.time()
+    for slug, meta in all_tasks:
+        if meta.get('status') != 'pending':
+            continue
+        sent_at = cache.get(f"assign_{agent_name}_{slug}_{meta.get('id')}")
+        if sent_at is not None and now - sent_at <= NOTIFY_TTL:
+            return slug, meta.get('id')
+    return None
+
+
+def worker_start_command(task_skills, target_dir, *, fresh):
+    """Director がそのまま貼れる Worker 起動コマンド (`director.md` の起動手順と同じ形)。
+
+    `fresh`: 同じ skill の Worker が (別の TARGET_DIR で) 生きているとき。registry-first の
+    名前引きは同じ名前を返し、`start.sh` は「既に居る」で断るので、新しい名前を取らせる。
+    名前は貼った時点で `assign-name.sh` が決める (dispatcher が registry を書き換えない)。
+    """
+    skills = ' '.join(shlex.quote(s) for s in sorted(task_skills))
+    backend = os.environ.get('CREWVIA_MUX') or 'herdr'
+    target = f"TARGET_DIR={shlex.quote(str(target_dir))} " if target_dir else ''
+    return (
+        f"cd {shlex.quote(str(REPO_ROOT))} && "
+        f"AGENT_NAME=$(bash scripts/assign-name.sh {skills}{' --fresh' if fresh else ''}) "
+        f"{target}CREWVIA_MUX_ENABLED=1 CREWVIA_MUX={shlex.quote(backend)} "
+        f"bash scripts/start.sh worker {skills}"
+    )
+
+
+def sweep_stale_target_records(alive_workers):
+    """生きていない Worker の古い target_dir 記録を片付ける (t009)。判定は lib 1 つ、例外は出さない。
+
+    `alive_workers` は窓が有る **または** heartbeat が新しい Worker (`_alive_workers`)。窓の一覧だけを
+    根拠にすると、mux が 1 人分だけ一時的に落とした回に、生きている Worker の記録を消しうる。
+    """
+    try:
+        for name in _worker_target.sweep_stale_records(REGISTRY_DIR, set(alive_workers)):
+            log(f"[target-record] swept stale TARGET_DIR record for retired Worker {name!r}")
+    except Exception as e:
+        log(f"WARNING: stale TARGET_DIR record sweep failed: {e!r}")
 
 
 def dependency_gate(slug, meta, done_ids_by_mission, task_statuses_by_mission):
@@ -1710,6 +1794,7 @@ def shutdown_idle_workers():
 
 def dispatch():
     _director_live_memo.clear()
+    _target_record_memo.clear()
     state = load_state()
     if is_unreadable(state):
         # Codex 9 巡目 P1。`{}` に潰すと下の `if not active_missions` に落ちて
@@ -1850,6 +1935,8 @@ def dispatch():
                 except OSError:
                     pass
 
+    sweep_stale_target_records(_alive_workers)
+
     # Track which tasks were assigned this cycle to avoid double-dispatch.
     # Keyed as (slug, task_id) tuples so that missions reusing the same
     # task IDs (e.g. t001 in both mission-a and mission-b) do not block
@@ -1924,6 +2011,18 @@ def dispatch():
             log(f"[bench] {agent_name} is restarting (Strategy C) — skipping assignment")
             continue
 
+        # #22: 割り当てメッセージを送ったばかりで、まだ pull されていない task がある
+        # Worker には、別の task を重ねて送らない (assignment ファイルはまだ無いので
+        # is_idle は真のまま)。理由と TTL は worker_outstanding_assignment() を参照。
+        outstanding = worker_outstanding_assignment(agent_name, all_tasks)
+        if outstanding:
+            _okey = f"outstanding_log_{agent_name}_{outstanding[0]}_{outstanding[1]}"
+            if should_notify(_okey):
+                log(f"[assign] {agent_name}: task {outstanding[1]} (mission={outstanding[0]}) "
+                    f"を送信済みで pull 待ち — 別の task は送らない")
+                record_notify(_okey)
+            continue
+
         # Find best unblocked pending task with skill match
         best = None
         for slug, meta in unblocked_pending:
@@ -1942,6 +2041,17 @@ def dispatch():
             if task_skills & CODEX_REVIEW_SKILLS:
                 continue
             if task_skills.issubset(worker_skills):
+                # #21: Worker が起動された TARGET_DIR と task の target_dir が合わない
+                # task は回さない (別 repo 用の Worker に crewvia 本体の task が回り、
+                # 差し戻しても同じ Worker に再割り当てされた)。記録が読めない Worker には
+                # target_dir 付きの task を回さない (保留)。判定は lib_worker_target 1 つ。
+                may_take, why_not = worker_may_take_task(agent_name, meta)
+                if not may_take:
+                    _tkey = f"target_skip_{agent_name}_{slug}_{meta['id']}"
+                    if should_notify(_tkey):
+                        log(f"[target] {agent_name}: task {meta['id']} (mission={slug}) を割り当てない — {why_not}")
+                        record_notify(_tkey)
+                    continue
                 best = (slug, meta)
                 break
 
@@ -1979,7 +2089,20 @@ def dispatch():
             # read as "no work" and be retired (memory:
             # assignment-removal-triggers-rule2-kill).
             has_in_progress = worker_holds_work(agent_name, all_tasks)
-            if not has_any and not has_in_progress:
+            # #21: skill は合うが TARGET_DIR が合わない task しか残っていない Worker。
+            # それは「全部 blocked」でも「仕事なし」でもない — Rule 2 (blocked-stuck) で
+            # 退役させると、記録を持たない (PR3 より前に起動した) TARGET_DIR 付き Worker が、
+            # 自分の task を待っているだけで殺される。Director に起動要求 (下の no_worker) が
+            # 行くので、ここは何もしない。
+            takeable_pending = [(sl, m) for sl, m in matching_pending
+                                if worker_may_take_task(agent_name, m)[0]]
+            if has_any and not takeable_pending and not has_in_progress:
+                _skey = f"target_only_{agent_name}"
+                if should_notify(_skey):
+                    log(f"[target] {agent_name}: 残っている task は TARGET_DIR が合わないものだけ — "
+                        f"退役させず待機 (Director に起動要求済み)")
+                    record_notify(_skey)
+            elif not has_any and not has_in_progress:
                 if in_spawn_grace(target):
                     log(f"[spawn_grace] {agent_name}: within {SPAWN_GRACE_SECONDS}s spawn grace — skip shutdown")
                 else:
@@ -2078,11 +2201,13 @@ def dispatch():
             handle_codex_review(slug, meta, live_state_keys, task_statuses_by_mission)
             continue
         # can_handle: True if any alive worker (window exists OR heartbeat recent) has skills ⊇ task_skills
-        can_handle = any(
-            task_skills.issubset(set((workers.get(name) or {}).get('skills') or []))
-            for name in _alive_workers
+        # #21: skill に加えて TARGET_DIR の記録も合う Worker だけが「担当できる」。
+        skill_ok = [
+            name for name in _alive_workers
             if (workers.get(name) or {}).get('role', 'worker') == 'worker'
-        )
+            and task_skills.issubset(set((workers.get(name) or {}).get('skills') or []))
+        ]
+        can_handle = any(worker_may_take_task(name, meta)[0] for name in skill_ok)
         if not can_handle:
             # Include slug to avoid collision when missions reuse t001, t002, etc.
             notify_key = f"no_worker_{slug}_{task_id}"
@@ -2090,6 +2215,13 @@ def dispatch():
                 msg = (
                     f"要求スキル {sorted(task_skills)} の Worker を起動してください "
                     f"(task {task_id}, mission={slug})"
+                )
+                if skill_ok:
+                    # skill は合う Worker が居るのに担当できない = TARGET_DIR が合わない。
+                    msg += f" — 既存の Worker は担当できません: {worker_may_take_task(skill_ok[0], meta)[1]}"
+                msg += (
+                    f"。起動コマンド: "
+                    + worker_start_command(task_skills, meta.get('target_dir'), fresh=bool(skill_ok))
                 )
                 if tmux_send(_director_name(), msg):
                     record_notify(notify_key)

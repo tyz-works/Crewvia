@@ -347,6 +347,8 @@ AUDITED_MODULES = [
     # t026: デーモン側 JSON 状態ストアの入口と、その読み手。
     "lib_daemon_state.py",
     "lib_review_refusal.py",
+    # t009: Worker の TARGET_DIR の記録。読み取りは lib_daemon_state.load_json_store の入口 1 つ。
+    "lib_worker_target.py",
 ]
 
 #: (モジュール, 関数, ソースの断片) → なぜガードを通さなくてよいか。

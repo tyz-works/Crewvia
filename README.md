@@ -735,7 +735,7 @@ the Americas, Africa, and Slavic regions — 50 names by default.
 | `database` | DB operations, queries |
 | `cloud` | Cloud platforms (AWS, OCI, GCP) |
 | `docs` | Documentation writing |
-| `codex-review` | Automated PR review via Codex CLI (Kai-codex). No Worker needed — the Dispatcher spawns `scripts/kai-review.sh` directly when a task with this skill and a `--pr-number` is unblocked. Requires the `codex` CLI (see [Prerequisites](#prerequisites)). See `knowledge/codex-reviewer.md`. A diff over 300KB is refused (fail-closed) and the refusal is recorded, so the Dispatcher does not respawn the review — switch to a manual diff review, or split the PR and `plan.sh update <id> --pr-number <new PR>` |
+| `codex-review` | Automated PR review via Codex CLI (Kai-codex). No Worker needed — the Dispatcher spawns `scripts/kai-review.sh` directly when a task with this skill and a `--pr-number` is unblocked (`plan.sh done <id> "<result>" --pr <N>` on the PR-producing task sets it for you). Requires the `codex` CLI (see [Prerequisites](#prerequisites)). See `knowledge/codex-reviewer.md`. A diff over 300KB is refused (fail-closed) and the refusal is recorded, so the Dispatcher does not respawn the review — switch to a manual diff review, or split the PR and `plan.sh update <id> --pr-number <new PR>` |
 
 ---
 
@@ -859,6 +859,19 @@ Director の通知窓が奪われることはない（t049）。詳細設計は 
 7. Worker reports completion via `plan.sh done`, then waits for next Dispatcher assign
 8. Dispatcher notifies Director when a new Worker skill is needed or all missions are complete
 9. Director responds to Dispatcher notifications (spawns Workers / archives mission)
+
+Assignments are checked by machine, not by the Worker's self-check (see `knowledge/assignment-routing.md`):
+
+- `start.sh` records each Worker's `TARGET_DIR` (or `null`) in `registry/workers/<Name>/target_dir.json`.
+  The Dispatcher only hands a `target_dir` task to a Worker whose recorded `TARGET_DIR` matches, and never
+  hands a crewvia-local task to a Worker started in another repo. When no Worker can take a task, the
+  request to the Director carries a ready-to-paste `start.sh` command.
+- The Dispatcher does not send a second task to a Worker whose first task was sent but not yet pulled.
+- `plan.sh pull --task` refuses (exit 3, writes nothing) a task whose `target_dir` does not match the
+  Worker's `TARGET_DIR`, and a Worker that already holds a different task (in progress or assigned).
+- `plan.sh done <id> "<result>" --pr <N>` writes `pr_number` onto the `codex-review` / `review` tasks that
+  are blocked by `<id>` and un-blocks a `blocked` `codex-review` task. `--pr` is explicit only; the result
+  text is never parsed. A drafted plan may mark a task `status: blocked` if it has a `blocked_reason`.
 
 State-based notifications (a task in `needs_director`, a `failed` task with a handoff, a refused
 `codex-review`) are sent **once per state**, not repeated on a timer: the Dispatcher keeps a

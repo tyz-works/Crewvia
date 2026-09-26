@@ -107,6 +107,9 @@ VALID_PRIORITIES = {'high', 'medium', 'low'}
 VALID_STATUSES = {
     'pending', 'in_progress', 'done', 'verified', 'failed', 'skipped',
     'ready_for_verification', 'verifying', 'verification_failed', 'needs_human_review',
+    # t009 / #24: drafting の段階から止めておける (Director 専用 / PR 番号待ちの task)。
+    # `blocked_reason` が必須 (check_frontmatter)。理由の無い停止は、あとで誰も解けない。
+    'blocked',
 }
 REQUIRED_FIELDS = ['id', 'title', 'skills', 'status', 'priority']
 
@@ -142,6 +145,15 @@ def check_frontmatter(tasks: list[dict]) -> list[tuple[str, str, str]]:
         status = meta.get('status')
         if status is not None and status not in VALID_STATUSES:
             results.append(('FAIL', 'frontmatter', f"{prefix}: unknown status '{status}' (valid: {sorted(VALID_STATUSES)})"))
+
+        # `blocked` は明示的な停止で、理由 (blocked_reason) が要る。理由が無いと、
+        # 何を待っているのか (PR 番号か・Director の判断か) が誰にも分からず、解くのも
+        # `plan.sh done --pr` のような機械の解除に任せられない。
+        if status == 'blocked':
+            reason = meta.get('blocked_reason')
+            if not isinstance(reason, str) or not reason.strip():
+                results.append(('FAIL', 'frontmatter',
+                                f"{prefix}: status 'blocked' requires a non-empty 'blocked_reason'"))
 
         if not results or all(level != 'FAIL' for level, *_ in results):
             pass  # OK entries added by caller

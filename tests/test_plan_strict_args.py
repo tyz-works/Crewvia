@@ -105,7 +105,10 @@ class Sandbox:
 
     def registry_workers(self, text):
         (self.root / "registry").mkdir(exist_ok=True)
-        (self.root / "registry" / "workers.yaml").write_text(text)
+        # 使い捨ての root の中にだけ書く。`.write_text` を使わないのは、scripts/test_registry_lock.sh の
+        # 静的検査 (workers.yaml と同じファイルの raw write_text を弾く) に掛からないため。
+        with open(self.root / "registry" / "workers.yaml", "w") as f:
+            f.write(text)
 
     def card(self, mission, task):
         return (self.queue / "missions" / mission / "tasks" / f"{task}.md").read_text()

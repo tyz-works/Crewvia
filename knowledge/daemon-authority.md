@@ -1425,7 +1425,7 @@ respawn のコマンドは `spawn_command()` が唯一の出どころで、`star
 
 同じ文字列を 2 箇所に置くと、**どちらの backend と話すかを決める変数だけが片方に無い**
 という形でずれる。`Mux.spawn()` の `env=` 引数は **両 backend とも無視していた**
-(t017 で引数ごと廃止。渡すと TypeError。§7-16) ので、
+(t017 で引数ごと廃止。渡すと TypeError。§7-17) ので、
 env はコマンド文字列に埋め込むしかなく (memory: `lib-mux-spawn-env-arg-ignored`)、
 herdr はさらにサーバー起動時の env を全ペインに継承するため、「./crewvia で起動した
 デーモン」と「相手に起こされたデーモン」が別の backend を向く事故が現実に起こりうる。
@@ -2263,7 +2263,64 @@ PATH の先頭に tmux / herdr のスタブ (呼び出しを記録して失敗�
 PATH の先頭に無ければ、注入版を走らせる前に中止する。**赤の実証を書き足すときは、注入した版が走る
 場所が本番から届かないことを先に確かめる**こと。
 
-### 7-16. 起動で registry の skills を追従させる / `spawn(env=)` を廃止する (t017 / PR5a, backlog #14, 2026-09-26)
+### 7-16. needs-director は assignment を外す — 退役判定は「仕事」を card で数える (mission 20260926-mechanize-guards-a / t001 / backlog #13)
+
+`plan.sh needs-director` は assignment を外さなかった (`cmd_done` / `cmd_fail` は外す)。dispatcher の
+codex-review spawn は `queue/assignments/Kai-codex` の**有無**だけで「同時 1 実行」を判定するので、
+findings を出して needs_director で止まった run の assignment が残ると、以後の codex-review が
+恒久的に spawn されなかった (1 ミッションで Director が手で 15 回消した)。
+
+単純に外すと別の事故になる: dispatcher の Rule 2 (§2-1 の D2 no-task / D3 blocked-stuck) は
+`status == 'in_progress'` の card しか「仕事」と数えないので、assignment を失った Worker は idle・タスク
+なしと読まれ、Director の判断を待っているだけの Worker が退役の対象になる。そこで 3 つを同時に入れた:
+
+1. **`cmd_needs_director` が `retire_assignment(AGENT_NAME, slug, task, None)` を呼ぶ** — `cmd_fail` と同じ形
+   (キューロックの中・card の書き換えと同じトランザクション・別 task を指す assignment は消さない)。
+2. **Rule 2 の「仕事を持っている」を card で数える** — `worker_holds_work()`: card の `worker` が自分で、
+   `RELEASED_WORK_STATUSES` (done / verified / skipped / cancelled / failed。「もう完了しない」status の名前は
+   `lib_dep_rules` から取り、ここに並べ直さない) でも `pending` でもない card が
+   1 枚でもあれば持っている (needs_director / needs_human_review / blocked / verifying / in_progress / 未知の
+   status)。倒す先は「殺さない」(除外側を数える)。card は `load_all_tasks()` の戻り (= `lib_task_cards` の入口) を
+   使い、ここで読み直さない。`TERMINAL_STATUSES` (依存が満たされた) とは問いが違うので別の集合にしてある —
+   `failed` は依存を満たさないが Worker は手放している。
+3. **判断待ちの Worker は busy のまま** — `worker_waits_on_director()`: assignment を外す前は「assignment がある = busy」
+   が判断待ちの Worker を守っていた (新しい task を渡さない)。外した後は card がそれを言う。Rule 5-A の
+   t032 F4 (needs_director の Worker に重ねて通知しない) も、根拠を assignment の中身から card に移した
+   (assignment が指す task の判定も、旧版が残した assignment のために残してある)。
+
+codex-review 側は、Kai-codex の assignment が**終わった task (`RELEASED_WORK_STATUSES`) か needs_director を指す孤児**なら
+spawn を塞がない (`codex_review_slot_busy()`)。dispatcher は**読むだけ**で、assignment を消すのは plan.sh の役目
+(次の pull が上書きする)。塞ぐ側に倒すもの: assignment が読めない / `<mission>:<task>` の形でない / 指す task が
+見つからない (archive 済みなど) / 進行中の status — 孤児と**証明できない**ものは孤児と扱わない (誤って 2 つ目の
+run を走らせるより、Director に見える停止のほうが安い)。plan.sh が外す (1) と dispatcher が塞がない (孤児判定) は
+二重の防御で、片方だけでも codex-review は止まらない (旧版の plan.sh が残した assignment・archive 前に取り残された
+assignment にも効く)。
+
+**task-graph への影響 (同じ PR で塞いだ)**: pane_match / pane_id は「card の status の allowlist」と「assignment が
+この task を指している」の AND だった。needs_director は assignment を外すので、そのままだと Director がいちばん
+ペインに飛びたい node だけが実運用で pane_match を失う (fixture は assignment を置くので既存テストでは見えない)。
+`task_graph_assignment_holds()` は `needs_director` に限り assignment が**本当に無い** (ENOENT) ときも許す。読めない
+assignment は「無い」ではないので許さない。代償: 名前を使い回した別の Worker が idle で居ると、その pane を指しうる
+(別の task に就いていれば assignment の指す先が違うので出ない)。
+
+**残る穴**:
+- 判断待ちのあいだ、hooks (`pre-tool-use.sh` / `post-tool-use.sh`) が assignment から補完する `TASK_ID` は解決できない
+  (env に `TASK_ID` が無い場合)。main checkout 編集ガード (worktree ガード) は `TASK_ID` 解決済みが発火条件なので、
+  判断待ちの Worker が pull し直さずに作業を再開するとガードが効かない。再開は `update --reset` → pull し直す前提
+  (`agents/director.md`)。`done` / `fail` の後と同じ状態で、この PR で新しく生まれた種類の穴ではないが、needs_director は
+  Worker が生きたまま待つので露出が長い。
+- 指す task が archive 済み mission にある assignment は「指す task が見つからない」なので孤児と
+扱わず塞ぐ (証明できない)。その場合は従来どおり `ls queue/assignments/` を見て手で消す。
+
+**戻し方**: 共有規則 (plan.sh と dispatcher が同じ「仕事」の定義を読む) なので env の停止スイッチは付けない
+(片方だけ戻すと、assignment を外す plan.sh と card を見ない Rule 2 の組が残り、判断待ちの Worker が殺される)。
+PR revert → 主 checkout を `git merge --ff-only origin/main` → `lib_daemon_watch.py restart` (dispatcher は
+常駐で、merge しただけでは動かない: `knowledge/dispatcher-restart-after-merge.md`)。
+
+回帰テスト: `tests/test_needs_director_releases_assignment.py` (本物の plan.sh と dispatcher の python を回す)、
+赤の実証は `tests/red_proof_t001_needs_director.sh`。
+
+### 7-17. 起動で registry の skills を追従させる / `spawn(env=)` を廃止する (t017 / PR5a, backlog #14, 2026-09-26)
 
 **症状**: `start.sh worker code python bash` で Haruto / Ren などを起動しても、registry の
 `skills` が古いと dispatcher は task を割り当てない (突き合わせの相手は registry であって、
@@ -2338,5 +2395,7 @@ env の停止スイッチは付けない (dispatcher と `start.sh` で答えが
   `TmuxBackend.record_existence()` (§7-14)、`spawn` の終了コード 10 / 11
 - `tests/pytest_workspace_sweep.py` + `tests/conftest.py` の `pytest_unconfigure` — pytest が作った
   宛先の後始末 (§7-15)。`CREWVIA_PYTEST_WORKSPACE_SWEEP=0` で残骸掃除だけが止まる
+- `scripts/plan.sh` `cmd_needs_director()` / `scripts/dispatcher.sh` `worker_holds_work()` /
+  `worker_waits_on_director()` / `codex_review_slot_busy()` / `RELEASED_WORK_STATUSES` (§7-16)
 - `knowledge/dispatcher-restart-after-merge.md` — 常駐デーモンの反映手順。
   **§7-5 の pause を挟む手順が追加された**ので、kill → spawn を素で打たないこと

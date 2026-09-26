@@ -905,7 +905,7 @@ TASK_GRAPH_PANE_STATUSES = {
     'in_progress',            # pull が assignment を公開した直後の状態
     'verifying',              # 検証中 — card はまだ Worker のもの
     'ready_for_verification', # 検証待ち — assignment は撤去されない
-    'needs_director',         # 判断待ち — assignment は撤去されない
+    'needs_director',         # 判断待ち — assignment は撤去されるが card の worker は残る (t001)
     'needs_human_review',     # 判断待ち — assignment は撤去されない
 }
 
@@ -920,6 +920,10 @@ def task_graph_enabled():
     return os.environ.get('CREWVIA_TASK_GRAPH', '1').strip().lower() not in (
         '0', 'false', 'off', 'no',
     )
+
+#: assignment が無くても pane_match を出してよい status (`task_graph_assignment_holds`)。
+#: `plan.sh needs-director` が assignment を外すので、判断待ちはここに入る。
+TASK_GRAPH_PANE_WITHOUT_ASSIGNMENT = {'needs_director'}
 
 
 def task_graph_repo_root():
@@ -985,7 +989,7 @@ def _task_graph_worker(meta):
     return worker
 
 
-def task_graph_assignment_holds(worker, slug, task_id):
+def task_graph_assignment_holds(worker, slug, task_id, status=None):
     """`queue/assignments/<worker>` が、いまこの task を指しているか。
 
     card の `worker` 欄は **履歴** で、crewvia は Worker 名を使い回す。だから
@@ -1001,15 +1005,36 @@ def task_graph_assignment_holds(worker, slug, task_id):
     読めない・無い・別の task を指している — どれも「分からない」ではなく
     **出さない** に倒す。pane_match が無ければ plugin はペインを結び付けない
     だけだが、間違った pane_match は無関係なペインを指す。
+
+    唯一の例外 (t001 / backlog #13): `needs_director` の card は、assignment が
+    **本当に無い** (ENOENT) ときも出す。`plan.sh needs-director` が assignment を
+    外すので、判断待ちの Worker は常に「無い」— これを弾くと、Director がいちばん
+    ペインに飛びたい node だけが実運用で pane_match を失う。代償は、名前を使い回した
+    別の Worker が idle で居るとき、その pane を指しうること (別の task に就いて
+    いれば assignment が指す先が違うので出ない)。読めない assignment は「無い」では
+    ないので、この例外にも入らない。
     """
     if agent_name_problem(worker):
         return False
+    path = os.path.join(ASSIGNMENTS_DIR, worker)
     # 素の open() だと、置き違えた FIFO 1 枚で task-graph の生成が返らなく
     # なる (t018)。読めないときは「出さない」に倒す —— 上の docstring の通り。
-    text, problem = try_read_queue_file(os.path.join(ASSIGNMENTS_DIR, worker))
+    text, problem = try_read_queue_file(path)
     if problem is not None:
-        return False
+        return status in TASK_GRAPH_PANE_WITHOUT_ASSIGNMENT and _is_enoent(path)
     return text.strip() == f'{slug}:{task_id}'
+
+
+def _is_enoent(path):
+    """`path` が本当に無いか。`EACCES` など観測できなかった場合は False
+    (`exists()` は両者を潰すので使わない)。"""
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return False
 
 
 def break_dependency_cycles(nodes):
@@ -1340,7 +1365,7 @@ def build_task_graph(state):
             paneless = bool(set(meta.get('skills') or []) & PANELESS_SKILLS)
             if (worker and not paneless
                     and raw_status in TASK_GRAPH_PANE_STATUSES
-                    and task_graph_assignment_holds(worker, slug, task_id)):
+                    and task_graph_assignment_holds(worker, slug, task_id, raw_status)):
                 # crewvia のペイン名は `<AGENT_NAME>-<ROLE>` (start.sh)。Worker は
                 # `<名前>-worker`。終わった task の worker 欄は履歴であって、今
                 # そのペインが居る場所ではない (名前は使い回される)。だから
@@ -3078,6 +3103,8 @@ def cmd_needs_director(args):
     Director の介入を求める。
     - TERMINAL_STATUSES に含まれないため、後続 blocked_by は解除されない
     - Dispatcher は pending 以外の非終端ステータスと同じく割り当て対象外
+    - AGENT_NAME の assignment (この task を指すもの) を撤去する (done / fail と同じ)。
+      card の `worker` は残るので、dispatcher は判断待ちの Worker を「仕事あり」と読む
     """
     opts, positional = parse_opts(args, {'--mission': 'value'})
     if len(positional) < 2:
@@ -3112,6 +3139,23 @@ def cmd_needs_director(args):
         if full_text is not None:
             body = body.rstrip() + '\n\n## Needs-Director 詳細\n' + full_text.strip() + '\n'
         save_task(slug, task_id, meta, body)
+
+        # done / fail と同じく、撤去は card の書き換えと同じトランザクションの中で
+        # (generation=None の理由も cmd_done を参照)。撤去しないと、codex-review の
+        # Kai-codex のように「同時 1 実行」を assignment の有無で判定する側が、終わった
+        # run の assignment に恒久的に塞がれる (backlog #13)。判断待ちの Worker が
+        # 「仕事なし」と読まれて退役されないことは dispatcher 側が card で見る
+        # (`worker_holds_work()`) — assignment を外す前提はそちらに置いてある。
+        agent_name = os.environ.get('AGENT_NAME', '')
+        if agent_name:
+            verdict = retire_assignment(agent_name, slug, task_id, None)
+            if verdict not in (ASSIGN_MINE, ASSIGN_ABSENT):
+                print(
+                    f"[plan.sh warn] {describe_assignment_verdict(agent_name, verdict)}"
+                    f" — 削除しませんでした ({agent_name} は別の作業に就いている可能性があります)",
+                    file=sys.stderr,
+                )
+
         print(f"[plan.sh] Task {task_id} → needs_director")
         print(f"[plan.sh] Reason: {summary}")
         if full_text is not None:

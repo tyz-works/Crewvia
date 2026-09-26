@@ -280,6 +280,10 @@ required_evidence:
 - Director は reason を読んで対処方針を決定し、`plan.sh update <task_id> --status pending --reset` で差し戻す
   （`--status in_progress --reset` は罠 — `--reset` の適用後に `--status` が上書きするため、最終状態が `status=in_progress / worker=null` になり dispatch 不能・pull 拒否のまま静かに全停止する。`--status pending` にすること）
 - 後続タスクの `blocked_by` は **解除されない**（needs_director は TERMINAL_STATUSES に含まれない）
+- `plan.sh needs-director` は呼んだ Worker の `queue/assignments/<name>` を撤去する（`done` / `fail` と同じ）。
+  **手で `rm queue/assignments/Kai-codex` する必要は無い** — 以前は残って以後の codex-review を止めていた。
+  判断待ちの Worker は card の `worker` で「仕事あり」と読まれるので、dispatcher に退役されず、新しい task も
+  渡されない（`knowledge/daemon-authority.md` §7-16）
 
 ### ⚠️ Worker への指示で「task ファイルの直接編集」を促さないこと (t015)
 
@@ -369,7 +373,7 @@ Worker 起動時のモデルは `config/crewvia.yaml` の `model_per_skill` で�
 | skill | デフォルトモデル | 理由 |
 |---|---|---|
 | `planning` / `plan_review` / `review` / `research` | `claude-opus-5` | 深い推論で誤判断を減らす |
-| `docs` / `qa` / `verify` | `claude-haiku-4-5-20251001` | 軽タスク・コスト削減 |
+| `docs` / `qa` / `verify` | `claude-sonnet-5` | Haiku は permission-mode auto を無視して承認ダイアログで止まる |
 | `code` / `bash` / `python` / `typescript` / `database` / `cloud` / `ops` | `claude-sonnet-5` | worker_model フォールバック (model_per_skill に定義なし) |
 
 複数 skill が指定された場合は最も要求の高いモデル (`opus > sonnet > haiku`) が選ばれる。詳細は `knowledge/model-per-skill.md` を参照。

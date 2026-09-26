@@ -203,6 +203,52 @@ def _guard_test_isolation(backend: str, verb: str, name: str,
     )
 
 
+# ---------------------------------------------------------------------------
+# keys — named key presses for selection dialogs (t028 / backlog #16)
+# ---------------------------------------------------------------------------
+#
+# `send` types *text*.  A selection dialog (a trust prompt, a permission menu)
+# is answered by moving the cursor, not by typing: sending "2" leaves the cursor
+# where it was and the Enter that follows picks the *first* entry.  `keys` is the
+# verb for that, and it accepts **named keys only** — never text — so the digit
+# cannot come back as a key the caller believes it pressed.
+#
+# The vocabulary is the caller's (case-insensitive) and is translated per
+# backend.  A name that is not here is refused as a whole, before anything is
+# sent: tmux would type an unknown word literally, and a half-delivered key
+# sequence in front of a dialog is worse than none.
+
+#: caller's key name (lower-case) -> (tmux name, herdr name)
+_KEY_NAMES = {
+    "up":     ("Up",     "up"),
+    "down":   ("Down",   "down"),
+    "left":   ("Left",   "left"),
+    "right":  ("Right",  "right"),
+    "enter":  ("Enter",  "enter"),
+    "escape": ("Escape", "esc"),
+    "esc":    ("Escape", "esc"),
+    "tab":    ("Tab",    "tab"),
+}
+
+
+def translate_keys(keys, backend: str):
+    """`(translated, unknown)` for the caller's key names.
+
+    `translated` is the backend's own spelling of every key, in order, or an
+    empty list when anything is wrong: `unknown` names each key that is not in
+    the vocabulary (an empty `keys` is reported as `["<none>"]`).  Callers act
+    only when `unknown` is empty — there is no partial result to misuse.
+    """
+    keys = list(keys)
+    if not keys:
+        return [], ["<none>"]
+    column = 0 if backend == "tmux" else 1
+    unknown = [k for k in keys if str(k).lower() not in _KEY_NAMES]
+    if unknown:
+        return [], unknown
+    return [_KEY_NAMES[str(k).lower()][column] for k in keys], []
+
+
 def repo_identity_ok(repo_root) -> bool:
     """Self-identity guard for long-running daemons (watchdog.py, dispatcher.sh).
 
@@ -450,6 +496,17 @@ class _Backend:
         raise NotImplementedError
 
     def send(self, name: str, text: str) -> bool:
+        raise NotImplementedError
+
+    def keys(self, name: str, keys: List[str]) -> bool:
+        """Press named keys (`Up`, `Down`, `Enter`, ...) in the named pane.
+
+        For selection dialogs, where `send()`'s text + Enter picks the wrong
+        entry.  Named keys only (`translate_keys()`): an unknown name sends
+        nothing and returns False.  Does not clear the input line and does not
+        add an Enter — pressing a key nobody asked for in front of a dialog is
+        the failure this verb exists to avoid.
+        """
         raise NotImplementedError
 
     def capture(self, name: str) -> str:
@@ -2385,6 +2442,30 @@ class TmuxBackend(_Backend):
             self._warn(f"send to {what!r} failed: {e}")
             return False
 
+    def keys(self, name: str, keys: List[str]) -> bool:
+        """Press named keys in the named window — one `send-keys` call.
+
+        One call, not one per key: the keys arrive as a sequence, and a failure
+        part-way cannot leave a dialog half-navigated by this verb's own doing.
+        """
+        self._guard("keys", name)
+        translated, unknown = translate_keys(keys, self.BACKEND_NAME)
+        if unknown:
+            self._warn(f"keys {name!r}: refusing unknown key name(s) {unknown!r}")
+            return False
+        try:
+            r = subprocess.run(
+                ["tmux", "send-keys", "-t", self._target(name), *translated],
+                capture_output=True, text=True, timeout=5,
+            )
+            if r.returncode != 0:
+                self._warn(f"keys {name!r} failed: {r.stderr.strip()}")
+                return False
+            return True
+        except Exception as e:
+            self._warn(f"keys {name!r} failed: {e}")
+            return False
+
     def capture(self, name: str) -> str:
         """Return the current pane contents via capture-pane -p."""
         self._guard("capture", name)
@@ -3732,6 +3813,29 @@ class HerdrBackend(_Backend):
 
         return True
 
+    def keys(self, name: str, keys: List[str]) -> bool:
+        """Press named keys in the named pane — one `pane send-keys` call.
+
+        No wait for the `❯` prompt (that is `send()`'s business: a selection
+        dialog has no prompt) and no capture-based Enter insurance.
+        herdr answers a refusal as `{"error": ...}` on a non-error exit, so
+        an `error` in the reply is a failure here, not a delivery.
+        """
+        self._guard("keys", name)
+        translated, unknown = translate_keys(keys, self.BACKEND_NAME)
+        if unknown:
+            self._warn(f"keys {name!r}: refusing unknown key name(s) {unknown!r}")
+            return False
+        ids = self._resolve_ids(name)
+        if ids is None:
+            self._warn(f"keys {name!r}: pane not found")
+            return False
+        data = _herdr_run("pane_send_keys", [ids["pane_id"]] + translated, timeout=5)
+        if data is None or "error" in data:
+            self._warn(f"keys {name!r}: pane send-keys failed")
+            return False
+        return True
+
     def _capture_by_pane_id(self, pane_id: str) -> str:
         """Internal: capture screen by pane_id directly (no name lookup).
 
@@ -3977,6 +4081,9 @@ class Mux:
     def send(self, name: str, text: str) -> bool:
         return self._backend.send(name, text)
 
+    def keys(self, name: str, keys: List[str]) -> bool:
+        return self._backend.keys(name, keys)
+
     def capture(self, name: str) -> str:
         return self._backend.capture(name)
 
@@ -4077,6 +4184,21 @@ def _cli_main(args: List[str]) -> int:
             return 2
         name, text = rest[0], " ".join(rest[1:])
         return 0 if m.send(name, text) else 1
+
+    elif verb == "keys":
+        if len(rest) < 2:
+            print("Usage: lib_mux.py keys <name> <key>...  "
+                  f"(keys: {' '.join(sorted(_KEY_NAMES))})", file=sys.stderr)
+            return 2
+        # Validated before the backend is asked for anything, so a typo is a
+        # usage error (2), not a delivery failure (1) — and nothing is sent.
+        _, unknown = translate_keys(rest[1:], "tmux")
+        if unknown:
+            print(f"lib_mux.py keys: unknown key name(s) {unknown!r} — nothing was "
+                  f"sent (keys: {' '.join(sorted(_KEY_NAMES))}). Use `send` for text.",
+                  file=sys.stderr)
+            return 2
+        return 0 if m.keys(rest[0], rest[1:]) else 1
 
     elif verb == "capture":
         if not rest:

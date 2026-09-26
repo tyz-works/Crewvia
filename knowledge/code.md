@@ -24,7 +24,7 @@ Worker が `$CREWVIA_REPO_ROOT/scripts/plan.sh ...` を毎回タイプする運�
 を作り、`scripts/start.sh` で PATH に追加することで、そもそも絶対パスを書く理由を無くした。
 ポイント: mux (tmux/herdr) が spawn する新しいペインは起動元プロセスの env/PATH を継承しない
 (`spawn()` は env を運べない。`env=` 引数は両 backend が黙って捨てていたので t017 で廃止した —
-[[lib-mux-spawn-env-arg-ignored]] / `knowledge/daemon-authority.md` §7-16 参照)。
+[[lib-mux-spawn-env-arg-ignored]] / `knowledge/daemon-authority.md` §7-17 参照)。
 そのため PATH 拡張は (1) 現在プロセスの `export PATH=...`(inline モード用)と (2) mux が実行する
 LAUNCH_CMD 文字列内に埋め込む `export PATH=...`(mux モード用)の **両方** が必要。片方だけだと
 モードによって効いたり効かなかったりする。

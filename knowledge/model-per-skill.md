@@ -13,9 +13,9 @@
 | `plan_review` | `claude-opus-5` | プランレビューは深い推論が必要 |
 | `review` | `claude-opus-5` | コードレビュー品質を最大化する |
 | `research` | `claude-opus-5` | 情報収集・要約の精度が結果に直結する |
-| `docs` | `claude-haiku-4-5-20251001` | 記述・整形タスクは軽量モデルで十分。コスト削減 |
-| `qa` | `claude-haiku-4-5-20251001` | 動作検証は手順が明確。軽量化で thinking loop hang も回避 |
-| `verify` | `claude-haiku-4-5-20251001` | smoke test・実機検証は同上 |
+| `docs` | `claude-sonnet-5` | Haiku は `--permission-mode auto` を無視して承認ダイアログで止まる (t028 / backlog #16) |
+| `qa` | `claude-sonnet-5` | 同上 |
+| `verify` | `claude-sonnet-5` | 同上 |
 | `code` | `claude-sonnet-5` (worker_model) | 実装の精度とコストのバランス |
 | `bash` | `claude-sonnet-5` (worker_model) | 同上 |
 | `python` | `claude-sonnet-5` (worker_model) | 同上 |
@@ -35,8 +35,8 @@
 
 ```
 planning,code  → planning=opus(3), code→sonnet(2)  → claude-opus-5
-docs,qa        → docs=haiku(1),   qa=haiku(1)       → claude-haiku-4-5-20251001
-qa,bash        → qa=haiku(1),     bash→sonnet(2)    → claude-sonnet-5
+docs,qa        → docs=sonnet(2),  qa=sonnet(2)      → claude-sonnet-5
+qa,bash        → qa=sonnet(2),    bash→sonnet(2)    → claude-sonnet-5
 code,python    → 両方 worker_model=sonnet(2)        → claude-sonnet-5
 ```
 
@@ -63,7 +63,7 @@ Director がこの env var を設定してから Worker を起動することで
 ```yaml
 # config/crewvia.yaml
 model_per_skill:
-  docs: claude-sonnet-5  # haiku → sonnet に変更
+  docs: claude-haiku-4-5-20251001  # sonnet → haiku に変更 (承認ダイアログで止まる。下の「t028」参照)
 ```
 
 ---
@@ -100,11 +100,40 @@ WORKER_MODEL_EXPLICIT=0
 
 ```bash
 CREWVIA_PRINT_MODEL=1 bash scripts/start.sh worker docs qa
-# → claude-haiku-4-5-20251001 を stdout に出力して exit 0
+# → claude-sonnet-5 を stdout に出力して exit 0
 ```
 
 モデル解決結果を確認するだけで claude は起動しない。`AGENT_NAME` 割り当てや registry 書き込みなど
 副作用のある処理より前に exit するため、何度実行しても副作用ゼロ。
+
+---
+
+## t028: docs / qa / verify を Sonnet に + 選択ダイアログ用のキー送信 verb (backlog #16)
+
+Director が Worker を起動するたびに手で直していたものを機械にした 2 点。
+
+1. **docs / qa / verify を `claude-sonnet-5` に**。Haiku は `--permission-mode auto` を無視して
+   承認ダイアログで止まり、毎回 `CREWVIA_WORKER_MODEL` で上書きしていた。`config/crewvia.yaml` の
+   `model_per_skill` を直したので、上書きは要らない（env での上書きは従来どおり最優先で残る）。
+   `tests/test_model_per_skill.py::TestRealConfig` が実 config の 3 skill が Haiku でないことを固定する。
+2. **`lib_mux.py keys <name> <key>...`（bash: `mux_keys`）**。選択ダイアログ用。Director が
+   `send` で数字を送ると、Enter が先頭の項目を選んでしまう事故があった（memory
+   `worker-dialog-numeric-key-does-not-select`）。`keys` は**名前付きキーだけ**を受ける
+   （`Up Down Left Right Enter Escape Tab`、大文字小文字は区別しない。`Esc` も可）。
+   任意の文字列は受けない — 文字列は `send` の仕事で、`keys` に混ぜると数字が再び
+   「押したつもりのキー」になる。1 つでも未知のキーがあれば**何も送らず** exit 2。
+   `send` と違い C-u（入力行の消去）も Enter の補完もしない: ダイアログの上で
+   勝手に Enter を押さないのが目的。tmux は `send-keys`（キー名はそのまま）、herdr は
+   `pane send-keys`（`escape` → `esc`、他は小文字。`herdr pane send-keys --help` が `esc` を正とする）。`_guard("keys", name)` を通るので、
+   本番の宛先 / 接頭辞なしの名前を名指しするテストは `MuxTestIsolationError`。
+
+**戻し方**: 該当 PR を revert → 主 checkout で `git merge --ff-only origin/main` →
+`python3 scripts/lib_daemon_watch.py restart dispatcher` / `restart watchdog`（`lib_mux.py` は
+dispatcher と watchdog が import しているので、新しい verb が入った版を掴んだ常駐プロセスは
+restart するまで入れ替わらない）。以後の Worker 起動の実効モデルが元（docs / qa / verify = Haiku）に
+戻る。env の停止スイッチは付けていない（`model_per_skill` は config そのものが切り替え手段で、
+`keys` は新しい verb を足しただけで既存の verb の挙動を変えない）。一時的に Haiku に戻したい
+だけなら、`CREWVIA_WORKER_MODEL=claude-haiku-4-5-20251001` で 1 回の起動だけ上書きできる。
 
 ---
 

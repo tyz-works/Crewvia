@@ -149,6 +149,7 @@ _MUTATIONS = [
     ("kill", lambda b, name: b.kill(name)),
     ("spawn", lambda b, name: b.spawn(name, "echo hi", cwd="/tmp")),
     ("send", lambda b, name: b.send(name, "hello")),
+    ("keys", lambda b, name: b.keys(name, ["Down", "Enter"])),   # t028
 ]
 
 

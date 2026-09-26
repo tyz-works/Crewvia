@@ -249,7 +249,7 @@ The mapping is defined in `config/crewvia.yaml` under `model_per_skill`:
 | Skill | Default model | Rationale |
 |---|---|---|
 | `planning`, `plan_review`, `review`, `research` | `claude-opus-5` | Deep reasoning reduces errors |
-| `docs`, `qa`, `verify` | `claude-haiku-4-5-20251001` | Lightweight tasks, cost savings |
+| `docs`, `qa`, `verify` | `claude-sonnet-5` | Haiku ignores `--permission-mode auto` and stalls on approval dialogs |
 | `code`, `bash`, `python`, `typescript`, `database`, `cloud`, `ops` | `claude-sonnet-5` | worker_model fallback (not in model_per_skill) |
 
 When multiple skills are specified, the strongest model wins (`opus > sonnet > haiku`).

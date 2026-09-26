@@ -656,6 +656,55 @@ def test_a_waiting_worker_still_points_at_its_pane(sandbox):
         assert nodes[f"{MISSION}:t00{i}"]["pane_match"] == f"W{i}-worker"
 
 
+def test_a_worker_parked_on_needs_director_points_at_its_pane_without_an_assignment(sandbox):
+    """`plan.sh needs-director` は assignment を外す (t001 / backlog #13)。
+
+    それでも判断待ちの node は Director が **いちばんペインに飛びたい** 状態のまま。
+    「assignment が指している」を要求し続けると、実運用 (assignment が無い) では
+    この node だけ pane_match が出ない —— 上のテストは fixture が assignment を
+    置いているので、この回帰を見逃す。
+    """
+    sandbox.add_task("t001", "needs_director", [], worker="Ren")
+    sandbox.record_pane("Ren", "wP:p80")
+    assert sandbox.run("task-graph").returncode == 0
+    node = _by_id(sandbox.read_graph())[f"{MISSION}:t001"]
+    assert node["pane_match"] == "Ren-worker"
+    assert node["pane_id"] == "wP:p80"
+
+
+@pytest.mark.parametrize(
+    "status", ["in_progress", "verifying", "ready_for_verification", "needs_human_review"])
+def test_no_assignment_is_not_enough_for_the_other_pane_statuses(sandbox, status):
+    """assignment の不在を許すのは needs_director だけ。ほかの status は従来どおり
+    「公開中の assignment がこの task を指している」を要求する (名前の使い回しの防御)。"""
+    sandbox.add_task("t001", status, [], worker="Ren")
+    assert sandbox.run("task-graph").returncode == 0
+    assert "pane_match" not in _by_id(sandbox.read_graph())[f"{MISSION}:t001"]
+
+
+def test_an_unreadable_assignment_does_not_count_as_absent_for_needs_director(sandbox):
+    """「無い」(ENOENT) と「読めない」は別。読めない assignment は、判断待ちでも出さない側に倒す。"""
+    sandbox.add_task("t001", "needs_director", [], worker="Ren")
+    (sandbox.queue / "assignments" / "Ren").mkdir(parents=True)     # 通常ファイルでない
+    assert sandbox.run("task-graph").returncode == 0
+    assert "pane_match" not in _by_id(sandbox.read_graph())[f"{MISSION}:t001"]
+
+
+def test_needs_director_through_the_real_plan_sh_keeps_the_pane_link(sandbox):
+    """実 plan.sh の `needs-director` を通した後でも、node が Worker のペインを指す。"""
+    sandbox.add_task("t001", "in_progress", [], worker="Ren")
+    sandbox.assign("Ren", "t001")
+    sandbox.record_pane("Ren", "wP:p81")
+    r = sandbox.run("needs-director", "t001", "NEEDS FIX: fixture", "--mission", MISSION,
+                    env=sandbox.env(AGENT_NAME="Ren"))
+    assert r.returncode == 0, r.stderr
+    assert not (sandbox.queue / "assignments" / "Ren").exists(), "前提: assignment は外れている"
+    assert sandbox.run("task-graph").returncode == 0
+    node = _by_id(sandbox.read_graph())[f"{MISSION}:t001"]
+    assert node["pane_match"] == "Ren-worker"
+    assert node["pane_id"] == "wP:p81"
+
+
 # --- label (P-2) / pane_id (P-3) -----------------------------------------------
 
 def test_every_node_carries_a_short_label_and_keeps_its_qualified_id(sandbox):

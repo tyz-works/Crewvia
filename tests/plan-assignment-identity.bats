@@ -424,13 +424,17 @@ assert d['started_at'] == '''$started''', d
   [ "$status" -eq 0 ]
   [ "$(card_field t001 status)" = "needs_director" ]
 
+  # needs-director は assignment を外す (t001 / backlog #13)。retire が拒否されたあとも、
+  # 外れたままであること (retire が拒否の途中で assignment を作り直したり触ったりしない)。
+  [ ! -e "$ASSIGN_DIR/Ren" ]
+
   # worker も started_at も needs-director では変わらないので、世代まで一致する。
   run plan retire t001 --agent Ren --started-at "$gen" --mission "$TEST_MISSION"
   [ "$status" -eq "$PRECONDITION_UNMET" ]
 
   [ "$(card_field t001 status)" = "needs_director" ]
   [ "$(card_field t001 worker)" = "Ren" ]
-  [ -f "$ASSIGN_DIR/Ren" ]
+  [ ! -e "$ASSIGN_DIR/Ren" ]
 
   cleanup_queue
 }

@@ -887,6 +887,19 @@ which is recorded on the card) and, if a handoff is passed, an absolute path who
 mentions that head — so a stale handoff from an earlier round cannot be resubmitted
 (see `knowledge/fail-evidence.md`).
 
+### `plan.sh` arguments are strict
+
+An unknown option (`--agent` on `done`, a typo) or a surplus positional argument is refused with the
+usage and exit 2 (`pull` exits 1 — its exit 2 means "no task available"); nothing is written.
+`-h` / `--help` prints the usage for every subcommand and writes nothing to `queue/` or `registry/`.
+Everything after `--` is positional (for a title that begins with an option-looking word).
+
+Without `--mission`, `done` / `fail` / `needs-director` / `update` refuse a task id that exists in
+several missions and print the command to type for each — unless `CREWVIA_MISSION_SLUG` names a
+mission where *you* (`AGENT_NAME`) are the worker of that task and it is `in_progress`. `pull` takes
+its skills from `--skills`, then `$SKILLS`, then the registry (and refuses if there are none), and a
+registry `role: director` cannot pull. See `knowledge/plan-sh-strict-args.md`.
+
 ### Kanban card structure
 
 ```json

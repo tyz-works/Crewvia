@@ -16,7 +16,11 @@ set -euo pipefail
 #   plan.sh init "<title>" [--mission <slug>] [--force]
 #   plan.sh add  "<title>" [--mission <slug>] --skills <csv> [--blocked-by <csv>]
 #                          [--priority high|medium|low] [--description <text>]
-#   plan.sh pull [--mission <slug>] --skills <csv> [--agent <name>]
+#   plan.sh pull [--mission <slug>] [--skills <csv>] [--agent <name>] [--target-dir <path>]
+#                [--task <task_id>]
+#                              --skills 省略時は環境変数 SKILLS → registry の Worker の skills の順。
+#                              どれも無ければ拒否 (skill の絞り込みを丸ごと無効にしない)。
+#                              Director (registry の role: director) は pull できない
 #   plan.sh done <task_id> "<result>" [--mission <slug>]
 #   plan.sh fail <task_id> [<handoff_path>] (--head <sha> | --no-head <理由>) [--mission <slug>]
 #   plan.sh update <task_id> [--mission <slug>] [--skills <csv>] [--blocked-by <csv>]
@@ -41,6 +45,13 @@ set -euo pipefail
 #                              task が属する mission の slug を 1 行出す (読み取り専用。
 #                              --mission 省略時の探索順は pull と同じ)
 #   plan.sh archive <slug>
+#
+# 引数は厳格: 未知の option (`-x` / `--xxx`) と余った positional は usage を出して exit 2
+# (`pull` だけ exit 1 — pull の 2 は「タスクなし」)。`--` 以降は positional。
+# `-h` / `--help` は usage を出して exit 0 で、queue にも registry にも何も書かない。
+# done / fail / needs-director / update で --mission を省略して task id が複数 mission に
+# 当たるとき、CREWVIA_MISSION_SLUG の mission に自分 (AGENT_NAME) が in_progress で担当している
+# 場合に限ってそれを使う (stderr に 1 行出す)。それ以外は拒否して候補とコマンドを示す。
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -54,7 +65,17 @@ fi
 SUBCOMMAND="$1"
 shift
 
-mkdir -p "$QUEUE_DIR" "$QUEUE_DIR/missions" "$QUEUE_DIR/archive"
+# `plan.sh -h` / `--help`: 何も書かずに usage を出す。サブコマンドの位置に `--help` を置いたとき
+# 「--help という名前の subcommand」として扱わず (init --help が「--help」mission を作った事故)、
+# queue の骨組みも作らない (骨組みは引数を検証し終えた python 側 `_ensure_queue_dirs()` が作る)。
+if [[ "$SUBCOMMAND" == "-h" || "$SUBCOMMAND" == "--help" || "$SUBCOMMAND" == "help" ]]; then
+  sed -n '/^# Usage:/,/^$/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  exit 0
+fi
+
+if [[ "$SUBCOMMAND" == "dashboard" ]]; then
+  mkdir -p "$QUEUE_DIR" "$QUEUE_DIR/missions" "$QUEUE_DIR/archive"
+fi
 
 # ─── dashboard TUI (fzf + gum) ───────────────────────────────────────────────
 
@@ -2272,6 +2293,40 @@ def _load_workers_from_registry():
     return workers
 
 
+def registered_worker(agent):
+    """registry/workers.yaml の `agent` の項目 (無ければ None)。
+
+    読めない registry を黙って「登録なし」にしない: 警告を出す (Director の判定が効かない
+    ことを、pull した本人が見えるように)。判定自体は通す — registry の事故で全 Worker の
+    pull を止めない。
+    """
+    if not agent:
+        return None
+    workers = _load_workers_from_registry()
+    registry_path = os.path.join(os.path.dirname(QUEUE_DIR), 'registry', 'workers.yaml')
+    if not workers and os.path.exists(registry_path):
+        print(f"[plan.sh pull] WARNING: {registry_path} を読めない (または空) ため、"
+              f"{agent!r} の role / skills を registry から確かめられませんでした",
+              file=sys.stderr)
+    for w in workers:
+        if w.get('name') == agent:
+            return w
+    return None
+
+
+def pull_skills(cli_value, registered):
+    """pull が使う Worker の skills: `--skills` → 環境変数 `SKILLS` → registry の順。
+
+    空集合 (どれも無い) は「絞り込みなし」ではなく、呼び出し側が拒否する。
+    """
+    for source in (cli_value, os.environ.get('SKILLS'),
+                   ','.join((registered or {}).get('skills') or [])):
+        skills = {s.strip() for s in (source or '').split(',') if s.strip()}
+        if skills:
+            return skills
+    return set()
+
+
 def taskvia_sync_workers():
     """Sync all workers from registry/workers.yaml to Taskvia."""
     workers = _load_workers_from_registry()
@@ -2298,26 +2353,145 @@ def taskvia_sync_workers():
 # Argument parsing helper
 # ---------------------------------------------------------------------------
 
+#: サブコマンドごとの usage。`-h` / `--help` と、引数の誤りの両方がこれを出す。
+#: 冒頭コメントの Usage と同じ内容 (tests/test_plan_strict_args.py が突き合わせる)。
+USAGE = {
+    'init': 'plan.sh init "<title>" [--mission <slug>] [--force]',
+    'add': ('plan.sh add "<title>" [--mission <slug>] --skills <csv> [--blocked-by <csv>]\n'
+            '                     [--priority high|medium|low] [--description <text>]\n'
+            '                     [--target-dir <path>] [--idle-timeout <s>] [--max-timeout <s>]\n'
+            '                     [--pr-number <N>]'),
+    'pull': ('plan.sh pull [--mission <slug>] [--skills <csv>] [--agent <name>]\n'
+             '                    [--target-dir <path>] [--task <task_id>]'),
+    'done': 'plan.sh done <task_id> "<result>" [--mission <slug>]',
+    'needs-director': 'plan.sh needs-director <task_id> "<理由>" [--mission <slug>]',
+    'fail': ('plan.sh fail <task_id> [<handoff_path>] (--head <sha> | --no-head "<理由>")\n'
+             '                     [--mission <slug>]'),
+    'update': ('plan.sh update <task_id> [--mission <slug>] [--skills <csv>] [--blocked-by <csv>]\n'
+               '                       [--priority high|medium|low] [--worker <name>] [--status <status>]\n'
+               '                       [--description <text>] [--reset] [--pr-number <N>]'),
+    'release-dep': 'plan.sh release-dep <task_id> [--dep <csv>] [--mission <slug>]',
+    'retire': ('plan.sh retire <task_id> --agent <name> --started-at <generation>\n'
+               '                       [--mission <slug>] [--outcome reset|needs-director]\n'
+               '                       [--reason "<1 行>"] [--no-wait]'),
+    'ready-for-verification': 'plan.sh ready-for-verification <task_id> [--mission <slug>]',
+    'verify-result': ('plan.sh verify-result <task_id> <pass|fail|needs_human_review>\n'
+                      '                            [--mission <slug>] [--notes "<text>"]'),
+    'review': 'plan.sh review <mission_slug>',
+    'launch': 'plan.sh launch <mission_slug>',
+    'task-graph': 'plan.sh task-graph',
+    'lint': 'plan.sh lint [<mission_slug> | --mission <slug>] [--strict]',
+    'status': 'plan.sh status [--mission <slug>] [--all]',
+    'archive': 'plan.sh archive <slug>',
+    'resync': 'plan.sh resync (<slug> | --all)',
+    'dashboard-data': 'plan.sh dashboard-data [--all]',
+    'resolve-mission': 'plan.sh resolve-mission <task_id> [--mission <slug>]',
+}
+
+#: サブコマンドごとに受け付ける positional の数 (最小, 最大)。余剰は黙って捨てず拒否する
+#: (`done t007 --agent X "結果"` で Result が `--agent` になった事故 / add の title に
+#: 引数が紛れた事故 — どちらも余った・取り違えた positional を黙って受けたのが根)。
+#: dispatch テーブルと同じキーを持つこと (tests/test_plan_strict_args.py が突き合わせる)。
+POSITIONAL_ARITY = {
+    'init': (1, 1), 'add': (1, 1), 'pull': (0, 0), 'done': (2, 2),
+    'needs-director': (2, 2), 'fail': (1, 2), 'update': (1, 1), 'release-dep': (1, 1),
+    'retire': (1, 1), 'ready-for-verification': (1, 1), 'verify-result': (2, 2),
+    'review': (1, 1), 'launch': (1, 1), 'task-graph': (0, 0), 'lint': (0, 1),
+    'status': (0, 0), 'archive': (1, 1), 'resync': (0, 1), 'dashboard-data': (0, 0),
+    'resolve-mission': (1, 1),
+}
+
+#: 使い方の誤りの終了コード。`pull` だけは 1 — `pull` の 2 は「タスクなし (idle)」で、
+#: Worker は 2 を受けると 30 秒待って再試行する (agents/worker.md)。引数の誤りを 2 で返すと
+#: 「壊れた呼び出し」が「ただのアイドル」として無限に再試行される。1 = 実エラー
+#: (不正引数を含む、と worker.md が明記している)。
+USAGE_EXIT = 2
+PULL_USAGE_EXIT = 1
+
+
+class UsageExit(SystemExit):
+    """`-h` / 使い方の誤りによる終了。**何も書かずに**終わったことの印。
+
+    末尾の dispatch は SystemExit のあとで task-graph を再生成する (途中まで書いて die() した
+    実行の後でも DAG を最新にするため)。`--help` はそこで registry/ に 1 バイトも書いては
+    ならないので、この型だけは再生成を飛ばす。
+    """
+
+
+#: `-x` / `--xxx` の形の語 (`--x=y` を含む)。**空白を含む語は option ではない** — Result や
+#: title が `- 修正した` や `-3 件` のように `-` で始まるだけで拒否されないように。
+_OPTION_LIKE = re.compile(r'^--?[A-Za-z][A-Za-z0-9_-]*(=.*)?$')
+
+
+def _usage_text():
+    return 'Usage: ' + USAGE.get(SUBCOMMAND, f'plan.sh {SUBCOMMAND} [args...]')
+
+
+def _usage_exit(message):
+    """使い方の誤り: メッセージと usage を stderr に出して終わる。何も書いていない。"""
+    code = PULL_USAGE_EXIT if SUBCOMMAND == 'pull' else USAGE_EXIT
+    print(f"plan.sh {SUBCOMMAND}: {message}", file=sys.stderr)
+    print(_usage_text(), file=sys.stderr)
+    raise UsageExit(code)
+
+
+def _ensure_queue_dirs():
+    """queue の骨組み。引数を検証し終えたあとにだけ作る (`--help` は何も作らない)。"""
+    os.makedirs(os.path.join(QUEUE_DIR, 'missions'), exist_ok=True)
+    os.makedirs(os.path.join(QUEUE_DIR, 'archive'), exist_ok=True)
+
+
 def parse_opts(args, spec):
-    """spec: dict of {flag: 'value' or 'bool'}. Returns (opts dict, positional list)."""
+    """spec: dict of {flag: 'value' or 'bool'}. Returns (opts dict, positional list).
+
+    厳格: 未知の option (`-` で始まる option らしい語) は拒否する。`--` 以降は全部 positional
+    (`-` で始まる title / Result の逃げ道)。`-h` / `--help` は usage を出して exit 0 —
+    どちらも queue / registry に 1 バイトも書かない。positional の数は
+    POSITIONAL_ARITY で宣言し、過不足は拒否する。
+    """
     opts = {}
     positional = []
     i = 0
     while i < len(args):
         a = args[i]
+        if a == '--':
+            positional.extend(args[i + 1:])
+            break
+        if a in ('-h', '--help'):
+            print(_usage_text())
+            raise UsageExit(0)
         if a in spec:
             kind = spec[a]
             if kind == 'value':
                 if i + 1 >= len(args):
-                    die(f"option {a} requires a value")
-                opts[a] = args[i + 1]
+                    _usage_exit(f"option {a} requires a value")
+                value = args[i + 1]
+                if value in spec or _OPTION_LIKE.match(value):
+                    # `--mission --skills x` — 値を打ち忘れて次の option を値に食った
+                    # (空白を含む値 `--not-an-option text` は option の形ではないので通る)
+                    _usage_exit(f"option {a} requires a value (got the option {value})")
+                opts[a] = value
                 i += 2
             else:
                 opts[a] = True
                 i += 1
+        elif _OPTION_LIKE.match(a):
+            hint = ""
+            if '=' in a and a.split('=', 1)[0] in spec:
+                hint = f" (`{a.split('=', 1)[0]} <値>` と空白で区切ること)"
+            _usage_exit(
+                f"unknown option {a!r}{hint}\n"
+                f"  `-` で始まる値を positional として渡すなら `--` の後ろに置くこと")
         else:
             positional.append(a)
             i += 1
+    low, high = POSITIONAL_ARITY.get(SUBCOMMAND, (0, len(positional)))
+    if not low <= len(positional) <= high:
+        want = f"{low}" if low == high else f"{low}〜{high}"
+        _usage_exit(
+            f"expected {want} positional argument(s), got {len(positional)}: {positional}\n"
+            f"  空白を含む値 (title / result / reason) は 1 つの引数として引用符で囲むこと")
+    _ensure_queue_dirs()
     return opts, positional
 
 
@@ -2523,6 +2697,56 @@ def mission_search_order(explicit, state):
     return slugs
 
 
+#: task id が複数 mission に当たったときに、環境変数で mission を決めてよい status。
+#: Worker が今その task を実行している (または検証中の) 間だけ。
+_ENV_MISSION_STATUSES = ('in_progress', 'verifying')
+
+
+def _env_mission_for_task(task_id, matches):
+    """`CREWVIA_MISSION_SLUG` が指す mission を、**自分の担当** と確かめられたときだけ返す。
+
+    env だけを信じると、別の mission を担当していたときの残りの env (worktree の
+    `.crewvia-env` を source したままのシェル) が、無関係な mission の同じ tNNN に届く。
+    だから 3 つ全部を要求する: (1) その mission が候補に居る (2) card の worker が
+    `AGENT_NAME` と一致 (3) card の status が in_progress / verifying。
+    読めない card は「確かめられなかった」なので使わない (= 拒否の側に倒す)。
+    """
+    env_slug = os.environ.get('CREWVIA_MISSION_SLUG', '').strip()
+    agent = os.environ.get('AGENT_NAME', '').strip()
+    if not env_slug or not agent or env_slug not in matches:
+        return None
+    try:
+        meta, _ = load_task(env_slug, task_id)
+    except (Exception, SystemExit):
+        return None
+    if meta.get('worker') != agent or meta.get('status') not in _ENV_MISSION_STATUSES:
+        return None
+    return env_slug
+
+
+def resolve_ambiguous_mission(command, task_id, matches):
+    """`--mission` 省略で task id が複数 mission に当たったときの **唯一の解決**。
+
+    done / fail / needs-director / update / ready-for-verification / verify-result が使う。
+    task id は mission ごとの採番なので、Worker が取り違えて別 mission の同じ tNNN を
+    書き換える事故を、拒否 (候補と打つべきコマンドを添えて) で潰す。ただし自分の担当と
+    確かめられる mission が env にあるときだけ、それを使う (使ったことを stderr に 1 行)。
+    """
+    slug = _env_mission_for_task(task_id, matches)
+    if slug:
+        print(
+            f"[plan.sh {command}] --mission 省略: CREWVIA_MISSION_SLUG={slug} を使います "
+            f"({task_id} の worker={os.environ.get('AGENT_NAME')} が AGENT_NAME と一致し実行中)",
+            file=sys.stderr,
+        )
+        return slug
+    lines = [f"task '{task_id}' exists in multiple missions: {matches}. Use --mission."]
+    lines.append("  どの mission か決められません。打つコマンド (引数は元のまま、--mission を足す):")
+    for s in matches:
+        lines.append(f"    plan.sh {command} {task_id} --mission {s} ...")
+    die("\n".join(lines))
+
+
 def cmd_resolve_mission(args):
     """plan.sh resolve-mission <task_id> [--mission <slug>]
 
@@ -2554,9 +2778,24 @@ def cmd_pull(args):
         '--target-dir': 'value',
         '--task': 'value',   # specific task ID (dispatcher-assigned; bypasses skill/target/blocked filters)
     })
-    requested_skills = {s.strip() for s in opts.get('--skills', '').split(',') if s.strip()}
     agent = opts.get('--agent') or os.environ.get('AGENT_NAME', '')
     specific_task = opts.get('--task')
+    if agent:
+        require_valid_agent_name(agent)
+
+    # Director は pull しない。判定は registry 上の role で — **`ROLE` 環境変数は見ない**:
+    # dispatcher が spawn する kai-review.sh は Director の env を継承しうるので、env で
+    # 判定すると Kai-codex が Director として拒否される (memory: crewvia-director-pull-pitfall)。
+    registered = registered_worker(agent)
+    if registered and registered.get('role', '').strip('"\' ').lower() == 'director':
+        die(f"{agent!r} は registry/workers.yaml で role: director です。Director は task を pull しません "
+            f"(Worker に割り当てる側)。`plan.sh status` で状態を見るか、Worker として起動し直してください。")
+
+    requested_skills = pull_skills(opts.get('--skills'), registered)
+    if not requested_skills:
+        die("pull requires the worker's skills: pass --skills <csv>, set the SKILLS environment "
+            "variable, or register the agent's skills in registry/workers.yaml. "
+            "(skills を空にすると skill の絞り込みが丸ごと無効になるので、黙って進めません)")
 
     # Determine effective target_dir for filtering:
     # --target-dir flag > TARGET_DIR env var > None (crewvia-local)
@@ -2566,9 +2805,6 @@ def cmd_pull(args):
     else:
         env_td = os.environ.get('TARGET_DIR', '').strip()
         effective_target = os.path.abspath(env_td) if env_td else None
-
-    if agent:
-        require_valid_agent_name(agent)
 
     chosen_holder = [None]
     diag = {'reason': None, 'detail': ''}
@@ -2593,6 +2829,17 @@ def cmd_pull(args):
             diag['reason'] = 'no_active_missions'
             diag['detail'] = 'state.yaml lists no active missions'
             return
+
+        if specific_task and not opts.get('--mission'):
+            # --task は「この task を取れ」なので、どの mission か曖昧なまま最初に当たった
+            # mission で進めない (別 mission の同じ tNNN を in_progress にしてしまう)。
+            holders = [s for s in slugs if os.path.exists(task_path(s, specific_task))]
+            if len(holders) > 1:
+                die(
+                    f"task '{specific_task}' exists in multiple missions: {holders}. "
+                    f"--mission が無いので決められません。打つコマンド:\n"
+                    + "\n".join(f"    plan.sh pull --task {specific_task} --mission {s}" for s in holders)
+                )
 
         # Diagnostic counters per slug
         scanned = 0
@@ -3122,8 +3369,9 @@ def cmd_needs_director(args):
             if not matches:
                 die(f"task '{task_id}' not found in any active mission.")
             if len(matches) > 1:
-                die(f"task '{task_id}' exists in multiple missions: {matches}. Use --mission.")
-            slug = matches[0]
+                slug = resolve_ambiguous_mission('needs-director', task_id, matches)
+            else:
+                slug = matches[0]
 
         if not os.path.exists(task_path(slug, task_id)):
             die(f"task '{task_id}' not found in mission '{slug}'.")
@@ -3200,8 +3448,9 @@ def cmd_done(args):
                     )
                 die(f"task '{task_id}' not found in any active mission.")
             if len(matches) > 1:
-                die(f"task '{task_id}' exists in multiple missions: {matches}. Use --mission.")
-            slug = matches[0]
+                slug = resolve_ambiguous_mission('done', task_id, matches)
+            else:
+                slug = matches[0]
 
         if not os.path.exists(task_path(slug, task_id)):
             die(f"task '{task_id}' not found in mission '{slug}'.")
@@ -3337,8 +3586,9 @@ def cmd_fail(args):
             if not matches:
                 die(f"task '{task_id}' not found in any active mission.")
             if len(matches) > 1:
-                die(f"task '{task_id}' exists in multiple missions: {matches}. Use --mission.")
-            slug = matches[0]
+                slug = resolve_ambiguous_mission('fail', task_id, matches)
+            else:
+                slug = matches[0]
 
         if not os.path.exists(task_path(slug, task_id)):
             die(f"task '{task_id}' not found in mission '{slug}'.")
@@ -3627,8 +3877,9 @@ def cmd_ready_for_verification(args):
             if not matches:
                 die(f"task '{task_id}' not found in any active mission.")
             if len(matches) > 1:
-                die(f"task '{task_id}' exists in multiple missions: {matches}. Use --mission.")
-            slug = matches[0]
+                slug = resolve_ambiguous_mission('ready-for-verification', task_id, matches)
+            else:
+                slug = matches[0]
 
         if not os.path.exists(task_path(slug, task_id)):
             die(f"task '{task_id}' not found in mission '{slug}'.")
@@ -3679,8 +3930,9 @@ def cmd_verify_result(args):
             if not matches:
                 die(f"task '{task_id}' not found in any active mission.")
             if len(matches) > 1:
-                die(f"task '{task_id}' exists in multiple missions: {matches}. Use --mission.")
-            slug = matches[0]
+                slug = resolve_ambiguous_mission('verify-result', task_id, matches)
+            else:
+                slug = matches[0]
 
         if not os.path.exists(task_path(slug, task_id)):
             die(f"task '{task_id}' not found in mission '{slug}'.")
@@ -4524,7 +4776,17 @@ def cmd_update(args):
 
     def _do():
         state = load_state()
-        slug = opts.get('--mission') or state.get('default_mission')
+        slug = opts.get('--mission')
+        if not slug:
+            # --mission 省略: 従来は default_mission に黙って当てていた。task id が複数の
+            # active mission に在ると、Director / Worker が意図しない mission の同じ tNNN を
+            # 書き換える。複数に当たるときは done / fail と同じ規則で決める (曖昧なら拒否)。
+            matches = [s for s in (state.get('active_missions') or [])
+                       if os.path.exists(task_path(s, task_id))]
+            if len(matches) > 1:
+                slug = resolve_ambiguous_mission('update', task_id, matches)
+            else:
+                slug = state.get('default_mission')
         if not slug:
             die("no active mission. Pass --mission <slug> or set a default mission.")
         if not os.path.exists(mission_dir(slug)):
@@ -4976,7 +5238,8 @@ def _exit_code_of(exc):
 try:
     dispatch[SUBCOMMAND](ARGS)
 except SystemExit as _e:
-    if _exit_code_of(_e) != LOCK_BUSY:
+    # UsageExit (`--help` / 引数の誤り) は何も書いていない: 再生成もしない
+    if _exit_code_of(_e) != LOCK_BUSY and not isinstance(_e, UsageExit):
         maybe_refresh_task_graph(SUBCOMMAND)
     raise
 else:

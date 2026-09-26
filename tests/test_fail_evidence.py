@@ -38,6 +38,8 @@ import subprocess
 
 import pytest
 
+from fixture_tree import copy_plan_tree
+
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 PLAN_SH = REPO_ROOT / "scripts" / "plan.sh"
 
@@ -337,12 +339,7 @@ def _task_md(task_id: str, status: str, *, extra: str = "", worker: str = "Ren")
 @pytest.fixture
 def sb(tmp_path):
     root = tmp_path / "repo"
-    (root / "scripts").mkdir(parents=True)
-    shutil.copy2(PLAN_SH, root / "scripts" / "plan.sh")
-    for extra in ("lib_dep_rules.py", "lib_task_cards.py", "lib_registry.py", "lint_plan.py"):
-        src = REPO_ROOT / "scripts" / extra
-        if src.exists():
-            shutil.copy2(src, root / "scripts" / extra)
+    copy_plan_tree(root)
 
     queue = root / "queue"
     tasks = queue / "missions" / MISSION / "tasks"

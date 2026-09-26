@@ -51,6 +51,7 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
 import lib_dep_rules  # noqa: E402
+from fixture_tree import copy_plan_tree  # noqa: E402
 
 MISSION = "m-hold"
 
@@ -165,15 +166,9 @@ class Sandbox:
 
     def __init__(self, tmp_path):
         self.root = tmp_path / "repo"
-        (self.root / "scripts").mkdir(parents=True)
-        (self.root / ".git").mkdir()
+        (self.root / ".git").mkdir(parents=True)
         (self.root / "registry" / "mux").mkdir(parents=True)
-        shutil.copy2(PLAN_SH, self.root / "scripts" / "plan.sh")
-        for extra in ("lib_dep_rules.py", "lib_task_cards.py",
-                      "lib_registry.py", "lint_plan.py"):
-            src = SCRIPTS_DIR / extra
-            if src.exists():
-                shutil.copy2(src, self.root / "scripts" / extra)
+        copy_plan_tree(self.root)
         self.queue = self.root / "queue"
         self.tasks = self.queue / "missions" / MISSION / "tasks"
         self.tasks.mkdir(parents=True)

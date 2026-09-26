@@ -39,6 +39,8 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REAL_REPO="$(cd "$SCRIPT_DIR/.." && pwd)"
+# shellcheck source=../tests/fixture_tree.sh
+source "$REAL_REPO/tests/fixture_tree.sh"
 
 PASS_COUNT=0
 FAIL_COUNT=0
@@ -53,9 +55,9 @@ _setup_scratch() {
   local dir="$1"
   mkdir -p "$dir/scripts" "$dir/config" "$dir/queue/missions/testmission"
   cp "$REAL_REPO/scripts/review-plan.sh" "$dir/scripts/"
-  cp "$REAL_REPO/scripts/lib_model.py" "$dir/scripts/"
-  # lib_model.py は config の読み取りを lib_task_cards.py に通す (t018)。
-  cp "$REAL_REPO/scripts/lib_task_cards.py" "$dir/scripts/"
+  # lib_model.py は lib_task_cards.py ... に読み取りを通す。lib_* はまとめて写す
+  # (tests/fixture_tree.sh)。下の lib_verdict.py のスタブはこの後で置くので上書きされる。
+  copy_scripts_libs "$REAL_REPO" "$dir"
   # t018 (mission 20260912-verdict-ci-launcher): review-plan.sh は lib_verdict.py の
   # 終了コード 10 (verdict 行の兆候なし) だけを「判定不能」とみなし、それ以外
   # (スクリプト不在で python3 が返す 2 を含む) は書式違反として fail-closed に

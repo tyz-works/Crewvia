@@ -170,6 +170,7 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "scripts"))
 
 import watchdog  # noqa: E402
+from fixture_tree import copy_plan_tree  # noqa: E402
 
 AGENT = "Retiree"
 WINDOW = f"{AGENT}-worker"
@@ -316,13 +317,9 @@ def sandbox(tmp_path):
     sb = Sandbox(root)
     sb._procs = []
 
-    (root / "scripts").mkdir(parents=True)
-    shutil.copy2(REPO / "scripts" / "plan.sh", root / "scripts" / "plan.sh")
-    # plan.sh は依存規則 (lib_dep_rules.py) と task カードの読み取り
-    # (lib_task_cards.py) を自分の側の scripts/ から読む。どちらもフォールバックを
-    # 持たないので、置き忘れると plan.sh が起動しない。
-    for _extra in ("lib_dep_rules.py", "lib_task_cards.py"):
-        shutil.copy2(REPO / "scripts" / _extra, root / "scripts" / _extra)
+    # plan.sh は lib_dep_rules / lib_task_cards ... を自分の側の scripts/ から読む
+    # (フォールバックなし)。lib はまとめて写す。
+    copy_plan_tree(root)
 
     mission = root / "queue" / "missions" / SLUG
     (mission / "tasks").mkdir(parents=True)

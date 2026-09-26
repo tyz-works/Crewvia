@@ -2048,14 +2048,14 @@ def retirement_reservation(agent):
     見る。request だけを見ると、request が先に消える後始末の途中や、人間が
     request だけ消した状態で予約が外れてしまう。
 
-    registry の場所は CREWVIA_REPO_ROOT を優先する。Worker が worktree 側の
-    plan.sh を叩いた場合、REPO_ROOT (= スクリプトの位置) は worktree を指し、
-    本体の registry を見逃す (memory: crewvia-worktree-repo-root-pitfall)。
+    registry の場所は `registry_dir()` (= queue の隣)。Worker が worktree 側の
+    plan.sh を叩いても CREWVIA_QUEUE は本体の queue を指すので、本体の registry を
+    見る (memory: crewvia-worktree-repo-root-pitfall)。plan.sh の位置 (REPO_ROOT) の
+    registry を見ると、queue だけを付け替えた隔離実行が本番の marker で pull を拒否される。
     """
     if not agent or agent_name_problem(agent):
         return None
-    root = os.environ.get('CREWVIA_REPO_ROOT') or REPO_ROOT
-    base = os.path.join(root, 'registry', 'retirements')
+    base = os.path.join(registry_dir(), 'retirements')
     for suffix in RETIREMENT_SUFFIXES:
         path = os.path.join(base, agent + suffix)
         if os.path.exists(path):
@@ -2128,8 +2128,7 @@ def predecessor_cleanup_pending(agent):
     """
     if not agent or agent_name_problem(agent):
         return False
-    root = os.environ.get('CREWVIA_REPO_ROOT') or REPO_ROOT
-    base = os.path.join(root, 'registry', 'retirements')
+    base = os.path.join(registry_dir(), 'retirements')
 
     def _load(suffix):
         text = _TASK_CARDS.read_regular_text_or_unreadable(os.path.join(base, agent + suffix))
@@ -2380,9 +2379,23 @@ def taskvia_sync_archive(slug):
     return resp is not None
 
 
+def registry_dir():
+    """`registry/` の場所の唯一の定義 — **queue の隣** (`dirname(QUEUE_DIR)/registry`)。
+
+    読み取り (`_load_workers_from_registry` / `registered_worker`) と書き込み
+    (`done` の task_count 加算) の両方がここを呼ぶ。以前は読みが queue の隣、書きが
+    `CREWVIA_REPO_ROOT` (無ければ plan.sh の位置) の registry で、`CREWVIA_QUEUE` だけを
+    一時ディレクトリに向けたテストが **本番の task_count を加算した** (Ren が 7→402)。
+    本番では start.sh が `CREWVIA_QUEUE=$CREWVIA_REPO_ROOT/queue` を必ず export するので
+    両者は一致し、Worker が worktree から `done` しても queue は本番を指す = 本番の
+    registry に書かれる (これは正しい)。queue を付け替えた実行は registry も一緒に付け替わる。
+    """
+    return os.path.join(os.path.dirname(os.path.abspath(QUEUE_DIR)), 'registry')
+
+
 def _load_workers_from_registry():
     """Parse registry/workers.yaml and return list of worker dicts."""
-    registry_path = os.path.join(os.path.dirname(QUEUE_DIR), 'registry', 'workers.yaml')
+    registry_path = os.path.join(registry_dir(), 'workers.yaml')
     if not os.path.exists(registry_path):
         return []
     workers = []
@@ -2427,7 +2440,7 @@ def registered_worker(agent):
     if not agent:
         return None
     workers = _load_workers_from_registry()
-    registry_path = os.path.join(os.path.dirname(QUEUE_DIR), 'registry', 'workers.yaml')
+    registry_path = os.path.join(registry_dir(), 'workers.yaml')
     if not workers and os.path.exists(registry_path):
         print(f"[plan.sh pull] WARNING: {registry_path} を読めない (または空) ため、"
               f"{agent!r} の role / skills を registry から確かめられませんでした",
@@ -3822,11 +3835,12 @@ def cmd_done(args):
     # Auto-bump task_count in worker registry (Worker Step4 automation)
     # worker_holder[0] is None if _do didn't run, '' if no worker field, else worker name
     if worker_holder[0]:
-        # Use CREWVIA_REPO_ROOT when available so that Workers calling plan.sh done
-        # from a worktree still update the main repo's registry (not the worktree's).
-        _actual_root = os.environ.get('CREWVIA_REPO_ROOT', REPO_ROOT)
-        _registry = os.path.join(_actual_root, 'registry', 'workers.yaml')
-        _lib = os.path.join(_actual_root, 'scripts', 'lib_registry.py')
+        # registry は読み取りと同じ場所 (queue の隣。`registry_dir()`)。Worker が worktree から
+        # `done` しても CREWVIA_QUEUE は本番 queue を指すので、本番の registry に書かれる。
+        # CREWVIA_QUEUE だけを付け替えた隔離実行が本番の registry を書かないのもこれ。
+        # lib は書き込み先ではなくコードなので、この plan.sh 自身の checkout のものを使う。
+        _registry = os.path.join(registry_dir(), 'workers.yaml')
+        _lib = os.path.join(REPO_ROOT, 'scripts', 'lib_registry.py')
         try:
             _result = subprocess.run(
                 [sys.executable, _lib, 'bump-task-count', _registry, worker_holder[0]],
@@ -4954,8 +4968,10 @@ def _set_aside_stale_handoff(handoff_path):
     退避に失敗しても reset は止めない (人間が card を見て打つコマンドなので、
     警告して手で片付けてもらう)。
     """
-    repo_root = os.environ.get('CREWVIA_REPO_ROOT', REPO_ROOT)
-    root = os.path.join(repo_root, 'registry', 'handoffs')
+    # registry の場所は `registry_dir()` (queue の隣)。位置 (REPO_ROOT) や CREWVIA_REPO_ROOT の
+    # registry を見ると、queue だけを付け替えた隔離実行が別の registry の handoff を改名する。
+    repo_root = os.path.dirname(registry_dir())
+    root = os.path.join(registry_dir(), 'handoffs')
     try:
         real_root = os.path.realpath(root)
         # 相対パスは dispatcher.sh と同じ基準 (registry の親 = repo root) で解く。cwd 基準だと

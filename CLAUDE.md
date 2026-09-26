@@ -44,20 +44,33 @@
 - **`./crewvia` は plugin を自動起動しない**（必要なときに `herdr plugin action invoke
   open-task-graph --plugin io.github.tyz-works.task-graph`）。任意の付加機能に herdr 依存を
   持ち込まないため。invoke のたびに新しいタブが開く
-- 制約: plugin は **`r` キーでしか再読み込みしない**（crewvia が書き換えても自動反映されない。
-  実測済み）。ファイルが見つからないと plugin は**エラーを出さず同梱のサンプルを表示する**
-  （画面タイトルが `crewvia / <slug>`（active mission が 1 件のとき）か `crewvia / N missions`
-  （0 件・2 件以上のとき）でなければ crewvia のファイルを読めていない）。
-  **herdr 0.9.0 では、エージェントが 1 つでも居ると plugin は `[offline]`（`Broken pipe`）になり、
-  live なエージェント状態は来ない**（plugin が同一接続で snapshot の後に subscribe を送るのが原因。
-  upstream `tyz-works/herdr-task-graph` 側の修正が要り、crewvia では直せない）。得られるのは
-  crewvia が生成した依存関係と status の可視化のみ。**`pane_match` は live の herdr では
-  当たらない**ので、生成器は Worker が就いている task（`pane_match` と同じ AND）に spawn 記録の
-  `pane_id` も書く（`plan.sh` の `task_graph_pane_id()` → `lib_mux.recorded_herdr_pane_id()`）。
+- **必要な plugin は 0.3.0 以上**（0.1.1 では下の制約がそのまま出る。t011 の結合確認は crewvia
+  `f9353fa` + plugin `d2b8195`（0.3.0）の隔離 herdr で行った）:
+  - 0.2.0: エージェントが居ても `[live]`（snapshot と subscribe を別接続に）/ tasks.json の
+    **自動再読み込み**（mtime・inode・size。`plan.sh update` から **0.4〜0.6 秒**で反映。`r` は不要）/
+    config dir に `tasks.json` の entry（**dangling symlink を含む**）があって読めないときは
+    サンプルでなく**エラーを出し、最後に読めた内容を保つ**
+  - 0.3.0: 横に溢れる段は折り返し・縦スクロール（62 task 全件に j/k が届く。幅 80/120/200 で箱が
+    重ならない）・`label` / `group` の表示（`tNNN` とタイトルが読める）
+  - **0.1.1 の挙動**（本番が t011 の時点でリンクしていた版）: `r` でしか再読み込みしない・エージェントが
+    1 つでも居ると `[offline]`（`Broken pipe`）・箱が重なる。入れ替え・戻し手順は README
+    「Upgrading the plugin」。**入れ替えは本番 herdr の変更なので Director がユーザーの了承を得て行う**
+- 0.3.0 でも残る制約: ファイルが**見つからない**（config dir に entry が無い）とエラーを出さず
+  同梱のサンプルを表示する（画面タイトルが `crewvia / <slug>`（active mission が 1 件のとき）か
+  `crewvia / N missions`（0 件・2 件以上のとき）でなければ crewvia のファイルを読めていない）。
+  箱と AGENTS パネルのエージェント名は `claude` で、Worker 名（`Arjun-worker`）は出ない
+  （plugin が pane の label を読まない。upstream の変更）。幅 200 は AGENTS パネルの分だけ箱が
+  狭くタイトルが短い（見た目のみ）。ヘッダーの状態語は `[connected]` でなく `[live]`
+- **`pane_match` は live の herdr では当たらない**（plugin は `label` を見ない）ので、生成器は Worker が
+  就いている task（`pane_match` と同じ AND）に spawn 記録の `pane_id` も書く
+  （`plan.sh` の `task_graph_pane_id()` → `lib_mux.recorded_herdr_pane_id()`）。
   **記録と `/proc` を読むだけで herdr に触れず、`.records.lock` も取らない**。記録が無い・読めない・
   herdr でない・記録の server が居ない（再起動後の古い記録）ときは書かず、`pane_match` だけが残る。
   各 node には短い `label`（`tNNN`）と `group`（mission slug。複数 mission で同じ `tNNN` を区別する）も書く（`id` は `<slug>:tNNN` のまま。未対応の plugin は無視する）。
-  実 herdr での確認は QA / 結合確認（t008 / t011）待ち
+  **t011 が実 herdr で確認済み**: Enter で Worker の pane にフォーカスが移る（`focused_pane_id` を
+  snapshot で前後比較）
+- 今回扱っていない: `open-task-graph` は invoke のたびに新しいタブを開く（次のミッションの種。
+  `knowledge/task-graph.md` §9）
 - 運用メモ・切り分け・実測: `knowledge/task-graph.md`
 
 ---

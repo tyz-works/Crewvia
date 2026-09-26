@@ -408,7 +408,8 @@ Other markers in a title: `[依存不明: id]` (depends on a task that does not 
   This only reads the record and `/proc`; it never contacts herdr. The `pane_id` is left out
   (and only `pane_match` remains) when the record is missing, unreadable, not from herdr, or
   names a herdr server that is no longer running. Each node also carries a short `label`
-  (`tNNN`); plugins that do not know it ignore it. Details and what is still to be verified
+  (`tNNN`) and a `group` (the mission slug, which tells apart the same `tNNN` of different
+  missions); plugins that do not know them ignore them. Details and what is still to be verified
   against a live herdr: `knowledge/task-graph.md` §4-4.
 - A queue with many finished tasks makes the graph crowded. Only active missions are drawn,
   so `plan.sh archive` a finished mission to clear it from the view.

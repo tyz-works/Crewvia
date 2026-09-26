@@ -49,6 +49,15 @@ PLUGIN = pathlib.Path(
     os.environ.get("CREWVIA_TASK_GRAPH_PLUGIN", "/tmp/herdr-task-graph/task_graph.py")
 )
 
+#: 古い版の plugin (0.1.1 / 0.2.0) の checkout の場所 (`os.pathsep` 区切り)。
+#: 本番の `/tmp/herdr-task-graph` は動いている資産なので使わない — 手元の clone から
+#: `git worktree add <scratchpad>/... <sha>` した別の木を指す。
+OLD_PLUGINS = [
+    pathlib.Path(p) / "task_graph.py"
+    for p in os.environ.get("CREWVIA_TASK_GRAPH_OLD_PLUGINS", "").split(os.pathsep)
+    if p
+]
+
 requires_plugin = pytest.mark.skipif(
     not PLUGIN.exists(),
     reason=(
@@ -58,13 +67,13 @@ requires_plugin = pytest.mark.skipif(
 )
 
 
-def run_plugin(config: pathlib.Path) -> subprocess.CompletedProcess:
+def run_plugin(config: pathlib.Path, plugin: pathlib.Path = None) -> subprocess.CompletedProcess:
     """本物の plugin に読ませて 1 フレーム描かせる。
 
     `--demo` は socket を探しにいかないので、本番の herdr に触れる経路が無い。
     """
     return subprocess.run(
-        [sys.executable, str(PLUGIN), "--config", str(config),
+        [sys.executable, str(plugin or PLUGIN), "--config", str(config),
          "--demo", "--once", "--width", "150", "--height", "30"],
         capture_output=True, text=True, timeout=60,
     )
@@ -90,6 +99,9 @@ def _reject_reason(graph: dict) -> str | None:
         ids.add(task_id)
         if not isinstance(task.get("depends_on", []), list):
             return f"depends_on must be an array: {task_id}"
+        for key in ("label", "group"):     # 0.3.0 から。古い版は見ない
+            if key in task and not isinstance(task[key], str):
+                return f"{key} must be a string: {task_id}"
 
     for task in tasks:
         for dep in task.get("depends_on", []):
@@ -800,3 +812,52 @@ def test_label_and_pane_id_do_not_make_an_older_plugin_reject_the_file(sandbox):
     graph = assert_plugin_accepts(sandbox)
     node = _by_id(graph)[f"{MISSION}:t001"]
     assert node["label"] == "t001" and node["pane_id"] == "wP:p80"
+
+
+def test_group_does_not_make_an_older_plugin_reject_the_file(sandbox):
+    """`group` を書いても、未対応の plugin (0.1.1 / 0.2.0) は壊れない。
+
+    写し (`_reject_reason`) で常に確かめ、古い版の実物が手元にあれば
+    (`CREWVIA_TASK_GRAPH_OLD_PLUGINS`) それにも読ませる。
+    """
+    sandbox.add_task("t001", "in_progress", [], worker="Ren")
+    sandbox.add_task("t002", "pending", ["t001"])
+    sandbox.add_mission("m-beta")
+    sandbox.add_task("t001", "pending", [], mission="m-beta")
+    assert sandbox.run("task-graph").returncode == 0
+    graph = assert_plugin_accepts(sandbox)
+    nodes = _by_id(graph)
+    assert nodes[f"{MISSION}:t001"]["group"] == MISSION
+    assert nodes["m-beta:t001"]["group"] == "m-beta"
+
+    for old_plugin in OLD_PLUGINS:
+        assert old_plugin.exists(), f"CREWVIA_TASK_GRAPH_OLD_PLUGINS の {old_plugin} が無い"
+        r = run_plugin(sandbox.graph, old_plugin)
+        assert r.returncode == 0, (
+            f"{old_plugin.parent.name} が group 付きのファイルを拒否した: {r.stderr.strip()[:400]}"
+        )
+        assert "Traceback" not in r.stderr, r.stderr[:400]
+
+
+def test_the_mirror_rejects_a_non_string_group():
+    """対照: 写しが `group` の型を見ていること (見ないと上のテストは空振りになる)。"""
+    node = {"id": "m:t001", "title": "t", "depends_on": [], "status": "ready"}
+    assert _reject_reason({"tasks": [dict(node, group="m")]}) is None
+    assert "group must be a string" in _reject_reason({"tasks": [dict(node, group=1)]})
+
+
+@requires_plugin
+def test_the_real_plugin_shows_the_mission_slug_of_each_task(sandbox):
+    """本物の plugin (0.3.0 以上) の画面に、同じ tNNN の mission が区別して出ること。"""
+    import re
+
+    sandbox.add_task("t001", "pending", [])
+    sandbox.add_mission("m-beta")
+    sandbox.add_task("t001", "pending", [], mission="m-beta")
+    assert sandbox.run("task-graph").returncode == 0
+    assert_plugin_accepts(sandbox)
+    out = run_plugin(sandbox.graph).stdout
+    if "group" not in PLUGIN.read_text():
+        pytest.skip(f"{PLUGIN} は group 未対応の版")
+    assert re.search(r"t001.*m-beta", out), out[:1200]
+    assert re.search(r"t001.*" + re.escape(MISSION[-12:]), out), out[:1200]

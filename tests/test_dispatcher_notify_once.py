@@ -629,6 +629,72 @@ def test_refusal_does_not_touch_other_review_tasks(h):
 
 
 # ---------------------------------------------------------------------------
+# t036: pr_number の無い codex-review が ready なら、Director に 1 回だけ知らせる
+# ---------------------------------------------------------------------------
+#
+# 実装 Worker が `plan.sh done --pr` を付け忘れると、codex-review は pending のまま
+# spawn できない。以前は log() だけで、Director には何も届かなかった。
+
+def no_pr_card(h, task_id="t010", status="pending", **fields):
+    h.card(task_id, status, skills="[codex-review]", **fields)     # pr_number 欄なし
+
+
+def test_ready_codex_review_without_pr_number_is_told_to_the_director_once(h):
+    no_pr_card(h)
+    msgs = about(h.cycle(), "t010")
+    assert len(msgs) == 1
+    m = msgs[0]
+    assert "pr_number" in m and SLUG in m
+    assert f"plan.sh update t010 --pr-number <N> --status pending --mission {SLUG}" in m
+    assert h.spawned == [], "番号が無いので spawn はしない"
+    for _ in range(3):
+        assert about(h.cycle(ttl_expired=True), "t010") == []
+
+
+def test_no_pr_notice_is_not_sent_for_a_blocked_codex_review(h):
+    """blocked は Director が意図して止めている。通知しない。"""
+    no_pr_card(h, status="blocked", blocked_reason="PR 番号待ち")
+    assert about(h.cycle(), "t010") == []
+    assert about(h.cycle(ttl_expired=True), "t010") == []
+
+
+def test_no_pr_notice_is_not_sent_when_pr_number_is_set(h):
+    review_card(h)
+    assert about(h.cycle(), "t010") == []
+    assert len(h.spawned) == 1
+
+
+def test_no_pr_notice_is_sent_for_an_empty_pr_number_too(h):
+    review_card(h, pr=None)                     # pr_number: null
+    assert len(about(h.cycle(), "t010")) == 1
+
+
+def test_no_pr_notice_is_told_again_when_the_state_is_left_and_re_entered(h):
+    no_pr_card(h)
+    assert len(about(h.cycle(), "t010")) == 1
+    review_card(h)                              # Director が番号を入れた = 状態を離れる
+    h.cycle()
+    no_pr_card(h)                               # 番号を消してまた ready (新しい事象)
+    assert h.notify_cache.exists()
+    assert len(about(h.cycle(), "t010")) == 1
+
+
+def test_no_pr_notice_waits_for_a_live_director_without_recording(h):
+    no_pr_card(h)
+    FakeMux.directors = []
+    assert h.cycle() == []
+    FakeMux.directors = ["Sora-director"]
+    assert len(about(h.cycle(), "t010")) == 1   # 戻ったらすぐ届く (記録していない)
+
+
+def test_no_pr_notice_is_per_task(h):
+    no_pr_card(h, task_id="t010")
+    no_pr_card(h, task_id="t011")
+    msgs = h.cycle()
+    assert len(about(msgs, "t010")) == 1 and len(about(msgs, "t011")) == 1
+
+
+# ---------------------------------------------------------------------------
 # lib_review_refusal (record / load / clear)
 # ---------------------------------------------------------------------------
 

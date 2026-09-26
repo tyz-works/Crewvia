@@ -88,6 +88,29 @@ Worker として扱われる** (= その間、TARGET_DIR 付きで起動済み�
 (t017 で実際に起きた)。それまでは `plan.sh done <id> "<Result>"` で閉じ、Result 1 行目の `PR #<N>` で
 Director が codex-review を開く。
 
+#### `--pr` の付け忘れを機械で断る (t036 / t027 P2-1)
+
+自動伝播にしたことで、**実装 Worker が `--pr` を付け忘れると codex-review が pending のまま誰にも
+知らされず、Codex を通らずに merge されうる**ようになった (手作業のころは Director が plan 時に番号を
+書く段で気づけた)。2 段で塞ぐ:
+
+1. **`plan.sh done <id>` が拒否する (exit 2、何も書かない)**: その task を **直接** `blocked_by` に持ち、
+   skills に `codex-review` を含み、`pr_number` が未設定で、まだ終わっていない task があるのに `--pr` も
+   `--no-pr` も無いとき。メッセージに待っている task と打つべきコマンドを出す。数える対象は
+   `codex_reviews_awaiting_pr()` の 1 か所 (`review` の task は数えない — 番号が無くても Worker が PR を探せる。
+   `[破損]` の card も数えない — 読めた card だけを拒否の根拠にする)。
+2. **PR を作らない task は `--no-pr "<理由 1 行>"`**: 理由は card の `no_pr_waiver` 欄と stderr に残る
+   (`fail --no-head` と同じ作法。静かに飛ばす経路にしない)。理由が空・`--pr` との併用は使い方の誤り
+   (exit 2)。免除しても番号は伝播しない。
+
+それでも番号が入らなかった codex-review (Director が手で開いた・`--no-pr` で閉じた等) のために、
+**dispatcher が `pr_number` の無い ready (依存が満たされて pending) な codex-review を Director に 1 回だけ
+知らせる** (`[review-no-pr]`。`notify_state_once()` の kind `no-pr-number`、key `review_no_pr_<mission>_<task>`)。
+案内は `plan.sh update <id> --pr-number <N> --status pending --mission <slug>`。番号が入れば状態を離れ、
+台帳から捨てられる。`blocked` のままの codex-review は Director が意図して止めているので通知しない。
+以前は `spawn_kai_review()` の `log()` だけで、呼び出し側が `handle_codex_review()` の後に無条件 continue
+するため no_worker の通知にも届かなかった。
+
 ### 5. lint — drafting の `blocked`
 
 `lint_plan.py` の `VALID_STATUSES` に `blocked` を追加。**`blocked_reason` (空でない文字列) が必須** —
@@ -104,6 +127,11 @@ env の停止スイッチを付けると、長寿命の dispatcher と呼ばれ�
 害は無い。`start.sh` は revert 後は記録を書かない (既存の記録は古くなるが誰も引かない)。
 revert すると #21 (別 repo の Worker に task が回る) と #22 (送信済みの Worker に二重送信) が戻る点に注意。
 
+**t036 (`--pr` の付け忘れ防止) だけを戻すなら**: PR を revert → 主 checkout を
+`git merge --ff-only origin/main` → `python3 scripts/lib_daemon_watch.py restart` (dispatcher の通知だけが
+再起動を要する。`plan.sh` は呼ばれるたびに読み直すので ff だけで戻る)。revert すると `done` は `--pr` 無しでも
+通り (`--no-pr` は未知の option として拒否される)、pr_number の無い codex-review はまた log だけになる。
+軽い手当て: `[review-no-pr]` が届く task は `plan.sh update <id> --pr-number <N> --status pending` で解消する。
 それより軽い手当て (再起動不要):
 
 - **target_dir 付きの task が回らない (記録が無い / 壊れている)**: `python3 scripts/lib_worker_target.py record
@@ -117,4 +145,5 @@ revert すると #21 (別 repo の Worker に task が回る) と #22 (送信済
   `done --pr`・lint・**本物の `dispatch()` を 1 サイクル回す** (mux だけフェイク)。
 - `bats tests/start-sh-target-dir-record.bats tests/start-sh-spawn-refusal.bats` — start.sh が記録を書く・
   断られた起動では書かない (使い捨ての checkout の複製で走る)。
-- 赤の実証: `tests/red_proof_t009.sh`。
+- 赤の実証: `tests/red_proof_t009.sh`、`--pr` の付け忘れ防止は `tests/red_proof_t036.sh` (done の拒否・`--no-pr`・
+  dispatcher の通知の 10 ケース。`TestDoneRequiresPr` と `test_dispatcher_notify_once.py` を使う)。

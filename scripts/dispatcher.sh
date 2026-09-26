@@ -1761,6 +1761,28 @@ def handle_codex_review(slug, meta, live_state_keys, task_statuses_by_mission):
         notify_state_once(key, fp, 'review-refused', slug, task_id, build_msg,
                           director_live=director_live_for_state_notices)
         return
+    if not meta.get('pr_number'):
+        # t036: PR 番号の無い codex-review は spawn できない。以前は log() だけで、しかも
+        # 呼び出し側が handle_codex_review() の後に無条件 continue するので no_worker の
+        # Director 通知にも届かず、pending のまま誰にも知らされなかった (実装 Worker が
+        # `plan.sh done --pr` を付け忘れると、Codex を通らずに merge されうる)。
+        # 状態ベースなので 1 回だけ (番号が入れば状態を離れ、台帳から捨てられる)。
+        # ここに来るのは依存が満たされて pending の task だけ — blocked のまま止めている
+        # task は Director が意図して止めているので通知しない。
+        key = f'review_no_pr_{slug}_{task_id}'
+        live_state_keys.add(key)
+        fp = fingerprint('review_no_pr')
+        def build_msg():
+            return (
+                f"[review-no-pr] task {task_id} (mission={slug}): codex-review が ready なのに "
+                f"pr_number がありません。kai-review.sh を起動できず、このままでは Codex を通らずに "
+                f"merge されえます。実装 Worker が plan.sh done --pr を付け忘れた可能性があります。"
+                f"PR 番号を入れて再開してください: "
+                f"plan.sh update {task_id} --pr-number <N> --status pending --mission {slug}"
+            )
+        notify_state_once(key, fp, 'no-pr-number', slug, task_id, build_msg,
+                          director_live=director_live_for_state_notices)
+        return
     spawn_key = f'kai_spawn_{slug}_{task_id}'
     if should_notify(spawn_key):
         if spawn_kai_review(slug, meta, task_statuses_by_mission):

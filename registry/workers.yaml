@@ -18,14 +18,14 @@ workers:
     task_count: 5
     last_active: 2026-08-25
   - name: Ren
-    skills: [code, python]
-    task_count: 7
-    last_active: 2026-09-01
+    skills: [code, python, bash]
+    task_count: 70
+    last_active: 2026-09-27
   - name: Sora
     role: director
     skills: []
-    task_count: 4
-    last_active: 2026-09-01
+    task_count: 5
+    last_active: 2026-09-26
   - name: Yuki
     skills: [research, typescript]
     task_count: 2
@@ -36,47 +36,47 @@ workers:
     last_active: 2026-08-25
   - name: Kai-codex
     skills: [codex-review]
-    task_count: 0
-    last_active: 2026-09-08
+    task_count: 9
+    last_active: 2026-09-26
   - name: Mika
     skills: [code, typescript]
     task_count: 13
     last_active: 2026-05-12
   - name: Haruto
-    skills: [bash, code]
-    task_count: 29
-    last_active: 2026-09-06
+    skills: [bash, code, python]
+    task_count: 60
+    last_active: 2026-09-26
   - name: Seo
     skills: [review]
-    task_count: 53
-    last_active: 2026-09-07
+    task_count: 102
+    last_active: 2026-09-26
   - name: Jiwon
     skills: [docs, research]
-    task_count: 5
+    task_count: 7
     last_active: 2026-09-02
   - name: Minjun
     skills: [docs]
-    task_count: 10
-    last_active: 2026-09-07
+    task_count: 13
+    last_active: 2026-09-25
   - name: Wei
-    skills: [bash, code, docs]
-    task_count: 33
-    last_active: 2026-09-07
+    skills: [bash, code, docs, python]
+    task_count: 52
+    last_active: 2026-09-26
   - name: Lin
     skills: [code, research, typescript]
     task_count: 4
     last_active: 2026-08-30
   - name: Mei
     skills: [code, docs]
-    task_count: 2
+    task_count: 5
     last_active: 2026-08-25
   - name: Arjun
-    skills: [qa]
-    task_count: 28
-    last_active: 2026-09-07
+    skills: [qa, python, bash]
+    task_count: 58
+    last_active: 2026-09-27
   - name: Priya
     skills: [planning]
-    task_count: 19
+    task_count: 20
     last_active: 2026-09-07
   - name: Anika
     skills: [research]
@@ -124,21 +124,37 @@ workers:
     last_active: 2026-09-04
   - name: Sofia
     skills: [bash, code, python]
-    task_count: 10
-    last_active: 2026-09-04
+    task_count: 30
+    last_active: 2026-09-26
   - name: Finn
     skills: [qa]
-    task_count: 6
+    task_count: 16
     last_active: 2026-09-06
   - name: Ingrid
     skills: [bash, code]
-    task_count: 0
+    task_count: 3
     last_active: 2026-09-05
   - name: Elias
     skills: [bash, code]
-    task_count: 1
+    task_count: 3
     last_active: 2026-09-05
   - name: Mathis
     skills: [bash, code]
-    task_count: 0
+    task_count: 1
     last_active: 2026-09-05
+  - name: Astrid
+    skills: [bash, code, python]
+    task_count: 1
+    last_active: 2026-09-25
+  - name: Erik
+    skills: [bash, python, qa]
+    task_count: 8
+    last_active: 2026-09-26
+  - name: Chiara
+    skills: [bash, qa]
+    task_count: 1
+    last_active: 2026-09-25
+  - name: Mateo
+    skills: [bash, docs]
+    task_count: 0
+    last_active: 2026-09-27

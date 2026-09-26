@@ -146,6 +146,10 @@
                         `done <id> --pr <N>` は、その task を `blocked_by` に持つ `codex-review` /
                         `review` の task に `pr_number` を書き（**未設定のものだけ**。Result から推測しない）、
                         `blocked` の codex-review は `pending` に戻す（`propagate_pr_number()`）。
+                        **`done` は `--pr` の付け忘れを拒否する**（t036 / PR7）: その task を `blocked_by` に
+                        持つ未終了の codex-review に `pr_number` が無いのに `--pr` が無ければ exit 2・何も書かない
+                        （`codex_reviews_awaiting_pr()`）。PR を作らない task は `--no-pr "<理由>"`（card の
+                        `no_pr_waiver` + stderr に残る。`--pr` との併用・空の理由は拒否）。
                         `lint_plan.py` は drafting でも `status: blocked`（`blocked_reason` 必須）を受理する
                         ので、PR 番号待ちの task は承認前から止めて積める。
                         **`pull` は Director（registry の `role: director`）を拒否する**（`ROLE` env では
@@ -176,6 +180,9 @@
                         記録が**読めない・欄の値が不正なら保留**（拒否されていない、に倒さない）。
                         Director が再試行するには `plan.sh update <id> --pr-number <新PR>` か
                         `lib_review_refusal.py clear`。
+                        **`pr_number` の無い ready な codex-review は spawn せず Director に 1 回だけ通知する**
+                        （t036 / PR7。`notify_state_once()` の kind `no-pr-number`、メッセージ `[review-no-pr]`。
+                        以前は log だけで pending のまま誰にも知られなかった。`blocked` の task は通知しない）
                         **失効した mux spawn 記録の掃除**（`sweep_stale_pane_records()`。下の
                         `lib_mux.py`）も毎サイクルここから呼ぶ
                         **割り当ては skill だけでなく TARGET_DIR でも照合する**（t009 / #21。

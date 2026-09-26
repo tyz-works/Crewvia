@@ -364,7 +364,7 @@ Worker に指示を出す際は:
 | `planning` | プランレビュー（タスク分解・依存関係・スキル割り当ての妥当性検証）。Bash(plan.sh status/pull), git log/diff は可。Edit/Write は deny |
 | `plan_review` | plan_review.md への verdict 出力専用（Write 可 / Edit・Bash 全面 deny）。planning とは権限が異なる。crewvia-plan-review skill 参照 |
 | `verify` | 実機検証・smoke test |
-| `codex-review` | Codex CLI (Kai-codex) による自動 review 専用。plan task には積むだけで良く、Dispatcher が `kai-review.sh` を自動 spawn する（Director が Worker を起動する必要はない）。`pr_number` が無い task は spawn されない（warning のみ）が、**PR がまだ無い段階では手で入れない** — 実装 task を `blocked_by` に持たせ、実装 task を `plan.sh done <id> --pr <N>` で閉じると `pr_number` が自動で入る（下記「`codex-review` skill task の積み方」）。詳細は `knowledge/codex-reviewer.md` |
+| `codex-review` | Codex CLI (Kai-codex) による自動 review 専用。plan task には積むだけで良く、Dispatcher が `kai-review.sh` を自動 spawn する（Director が Worker を起動する必要はない）。`pr_number` が無いまま ready になった task は spawn されず、Director に `[review-no-pr]` が 1 回だけ届くが、**PR がまだ無い段階では手で入れない** — 実装 task を `blocked_by` に持たせ、実装 task を `plan.sh done <id> --pr <N>` で閉じると `pr_number` が自動で入る（下記「`codex-review` skill task の積み方」）。詳細は `knowledge/codex-reviewer.md` |
 
 ### skill 別デフォルトモデル
 
@@ -564,12 +564,13 @@ Worker に crewvia 以外のプロジェクト (例: `~/workspace/taskvia`) を�
    `registry/workers/<Name>/target_dir.json` に TARGET_DIR（crewvia 本体なら `null`）を記録し、dispatcher と
    `plan.sh pull --task` がそれで task の `target_dir` を照合する。**別の TARGET_DIR の Worker には割り当てられず、
    手で `pull --task` しても exit 3 で断られる**（何も書かれない）。確認は
-   `python3 scripts/lib_worker_target.py show registry <Name>`。
+   `python3 scripts/lib_worker_target.py show "$CREWVIA_REPO_ROOT/registry" <Name>`。
    合う Worker が居ないときの Director 通知には、**そのまま貼れる起動コマンド**が付く
    （skill に合う Worker が別の TARGET_DIR で居るときは `assign-name.sh --fresh` 付き）。
    起動済みの Worker は記録を持たない（次の再起動まで `target_dir: null` の Worker として扱われる）ので、
    TARGET_DIR 付きで動いている Worker に target_dir 付きの task が回らないときは
-   `lib_worker_target.py record registry <Name> <target_dir>` で書き直す。
+   `lib_worker_target.py record "$CREWVIA_REPO_ROOT/registry" <Name> <target_dir>` で書き直す
+   （相対の `registry` は worktree から実行すると別の registry に書き、dispatcher は読まないので無言で効かない）。
 
 起動モードによる挙動の違い:
 
@@ -994,6 +995,11 @@ Dispatcher は常に **main 版の `scripts/kai-review.sh`**（$CREWVIA_REPO_ROO
 Result の本文から推測はしない）、`blocked` の codex-review は `pending` に戻る。PR 番号待ちで止めておきたい
 task は drafting のうちから `status: blocked` + `blocked_reason` で積める（lint が受理する）。
 既に PR が存在する場合だけ `--pr-number <N>` で最初から入れる。`--pr` は Result 1 行目の `PR #<N>` と一緒に付ける。
+**`--pr` の付け忘れは仕組みで止まる**（t036）: その task を `blocked_by` に持つ未終了の codex-review に `pr_number` が
+無いのに `--pr` が無いと `done` は拒否する（exit 2・何も書かない）。PR を作らない task は
+`--no-pr "<理由 1 行>"` で免除される（card の `no_pr_waiver` に残る。`--pr` との併用・空の理由は拒否）。
+すり抜けて `pr_number` の無い codex-review が ready になった場合は、dispatcher が Director に
+`[review-no-pr]` を **1 回だけ**通知する（`plan.sh update <id> --pr-number <N> --status pending --mission <slug>` で再開）。
 Worker 起動は不要 — Dispatcher が `kai-review.sh` を自動 spawn し、`plan.sh pull` → `codex exec --output-schema`
 → `plan.sh done`/`needs-director` まで完走する。重要 mission では Seo（Claude）と Kai-codex（Codex）の
 **2 人体制**での verdict 突合も検討すること。詳細は `knowledge/codex-reviewer.md` を参照。

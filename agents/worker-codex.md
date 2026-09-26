@@ -49,7 +49,7 @@ Phase 2 では **Kai-codex を dispatcher が自動 spawn する**。Priya は `
 **Dispatcher の安全策**:
 
 - `queue/assignments/Kai-codex` が存在する間は 2 重 spawn しない
-- `pr_number` が frontmatter に無い codex-review task は spawn せず warning log を出して skip する（Director escalation）
+- `pr_number` が frontmatter に無い codex-review task は spawn しない。依存が満たされて ready なのに無いときは、Director に `[review-no-pr]` を 1 回だけ通知する（`blocked` のものは通知しない）。実装 task 側も、`plan.sh done` が `--pr` の付け忘れを拒否する（PR を作らないなら `--no-pr "<理由>"`）
 - codex-review skill は `DIRECTOR_ONLY_SKILLS` と同型で「no worker 起動要求」通知を抑制する
 - 通常の Worker への assign ループでも codex-review skill を defense-in-depth で skip する
 
@@ -70,12 +70,14 @@ Priya が計画時に codex-review task を積めば、Dispatcher が自動で `
 
 ```bash
 # Priya の plan-review skill から発行される typical な add コマンド
-plan.sh add "PR#<N> Codex review (Kai)" \
+# （PR 番号はまだ無いので --pr-number は付けない。実装 task の `plan.sh done --pr <N>` が入れる）
+plan.sh add "Codex review (Kai)" \
   --skills codex-review \
   --blocked-by t<impl_task> \
-  --pr-number <N> \
   --priority medium
 ```
+
+既に PR がある task を積むときだけ `--pr-number <N>` を付けて最初から入れる（上の「運用フロー (Phase 2)」と同じ）。
 
 Dispatcher の spawn ログは `logs/kai-spawn/<slug>-<task_id>-<epoch>.log` に残る。
 

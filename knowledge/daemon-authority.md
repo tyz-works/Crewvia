@@ -2364,6 +2364,105 @@ env の停止スイッチは付けない (dispatcher と `start.sh` で答えが
 `no-env-killswitch-for-shared-rule`)。registry に足された skill は revert しても残る
 (害は無く、消すなら `registry/workers.yaml` を手で直す)。
 
+### 7-18. 前任の後始末を待って取り直す / timeout 終了を Director に 1 回だけ伝える (t021 / PR6, 2026-09-26)
+
+2 つの穴は別の症状だが、どちらも「退役 marker が Worker 名で引かれ、その後始末が別の周期で
+進む」ことから来ている。
+
+#### (1) 後任の最初の pull が必ず 1 回空振りする
+
+**症状** (2026-09-23): 新しい Ren が起動直後に `plan.sh pull` すると
+`retirement_reserved` で拒否された。marker の `pane_pid` は**既に死んでいる前任のもの**で、
+phase は `terminated`。watchdog の後始末は後任の起動の 5 秒後に終わり、次の pull は通った。予約は
+名前だけで効くので (§6-7 (2))、前任の後始末待ちの間に後任が起動すれば必ず 1 回空振りする。
+
+**直し方**: 拒否の既定は変えない。**次の 3 つを証明できたときだけ**、後始末が終わるのを待つ
+(`plan.sh` の `predecessor_cleanup_pending()`):
+
+1. progress の phase が `terminated` (kill は済み、queue の後始末だけが残っている)
+2. 記録された pane_pid が読める (progress に無ければ request の `spawn_identity.pane_pid`。
+   watchdog の `_exit_evidence()` と同じ順序)
+3. その pid が死んでいる (`ESRCH`。`EPERM` や他の失敗は「観測できなかった」で、死んだ証拠にしない)
+
+どれかが欠ければ従来どおり即拒否する (退役対象に task を渡さない)。**待つことの誤りは 60 秒の
+遅れで済む** — 待っても marker が消えなければ結局拒否に戻るので、判定はこの向きに倒してよい。
+
+- **待つのはキューロックの外**。`cmd_pull()` は `with_lock(_do)` を呼び、`retirement_reserved` で返って
+  きたら (ロックを放してから) marker を読んで待ち、消えたら**ロックを取り直して `_do` を最初から
+  やり直す**。ロックを持ったまま待つと、dispatcher・全 Worker の plan.sh・watchdog が同期で叩く
+  `retire --no-wait` (LOCK_BUSY = 4) が止まる。marker の中身を読むのもロックの外
+  (`retirement_reservation()` の「ロック保持時間を伸ばさない」規則を守る)。
+- **60 秒の根拠**: 後始末をする watchdog の周期は 30 秒 (`DEFAULT_CHECK_INTERVAL`)。terminated の
+  marker は次の周期で settle されるので、最悪でも 1 周期 + `plan.sh retire` 1 回。その 2 周期ぶん。
+  2026-09-23 の実測は 25 秒未満。上限を持つのは、後始末が進まない marker (`cleanup_failed` 等) で
+  pull を永久に待たせないため。定数 (`PREDECESSOR_CLEANUP_WAIT_SECONDS`) の隣にも同じ根拠を書いた。
+- 判定は `lib_retirement` を import せず plan.sh の中に持つ (plan.sh を単体でコピーする隔離
+  fixture が、新しい lib import で CI でだけ落ちる — memory: new-lib-import-breaks-single-copy-fixtures-again)。
+  marker の読み取りは registry を開くコードの入口 (`lib_task_cards.read_regular_text_or_unreadable`)
+  を通す。
+
+#### (2) watchdog の timeout 終了が Director に届かない / 何度も届く
+
+**症状** (2026-09-13、Ren / Erik): watchdog が 1 時間の上限で Worker を終了させたのに、痕跡は
+watchdog tab のログにしか残らず、Director は原因不明として調べ直した (memory:
+`watchdog-max-threshold-kills-long-tasks`)。その後 t002 で settle 後に「終了しました (理由: timeout)」
+の 1 通が出るようになったが、(a) どの上限か・どれだけ超えたか・`--reset` が要るか、が無い
+(b) 送れなくても再送されない (Director の窓が無い数分間が丸ごと欠落する) (c) 台帳が無いので、
+settle の再実行 (送信のあと・marker を消す前にデーモンが落ちた) で 2 通目が出うる。
+
+**直し方**:
+
+- `retirement.request(..., detail=...)`: watchdog が判定の根拠 (`kind` = `max` / `idle`、
+  `observed_seconds`、`limit_seconds`) を request に載せる (`timeout_detail()`)。通知を書くのは後の
+  周期 (デーモンの再起動を跨ぎうる) なので、monitor に聞き直せない。`detail` は progress にも引き継ぐ。
+- settle のとき (`_settle_terminated`)、reason が `timeout` なら `_report_timeout_once()` が、
+  **notify-once 台帳 (`registry/daemons/notified-state.json`)** に乗せて 1 通だけ送る。文面は
+  task id・mission・どちらの上限か・経過・**`plan.sh update <id> --status pending --reset` の要否**
+  (後始末が成功したなら「不要」、既に別の状態なら「不要 — 別の実行を巻き戻す恐れ」)。
+  後始末が失敗・保留した経路は従来どおりそれぞれの報告 (手で reset する手順つき) が出る。
+- key は task ごと (`timeout_<mission>_<task>`)、**fingerprint は退役ごと** (`request_id`)。同じ task が
+  別の実行でもう一度 timeout したら新しい事象として届き、同じ退役の再 settle は届かない。
+- 送れなかった (Director 不在・mux 失敗) ときは**台帳に書かず**、executor が**メモリ上で**毎サイクル
+  再送する (`process_all()` の先頭 — marker が全部消えたあとが、まさに再送の出番だから)。上限
+  1800 秒で諦めて log に残す。メモリだけにしたのは、marker より長生きするファイルを 1 つ増やす
+  と、`registry/retirements/` を読む全員がそれを知らなければならなくなるため。watchdog の再起動で
+  再送は落ちるが、判断に要る事実は log と Taskvia の alert (**残してある**) にあり、queue は
+  先に修復されている。
+- Taskvia の `TERMINATE:` alert は従来どおり (判定の直後)。
+
+**台帳の書き手が 2 人になった**: dispatcher と watchdog。原子的な置換 (temp + `os.replace`) だけでは
+「A が読む → B が書く → A が書く」で B のエントリが消え、消えたのが dispatcher のエントリなら対処済み
+の通知が再送される (2026-09-25 の洪水の型)。そこで台帳の**書き換えはすべて** `told_lock()`
+(`<台帳>.lock` への `flock`。`lib_daemon_state.py`) の中で行う — dispatcher の `record_told()` /
+`prune_told()` も同じ。取れなければ「書けなかった」(再送側 / 次のサイクル) に倒れる。読むだけの側は
+ロックしない (置換は原子的)。
+
+**dispatcher の prune との取り決め**: 状態ベースの通知 (needs_director 等) は「状態を離れたら捨てる」
+だが、timeout 通知の task は後始末で pending に戻っていて live key に現れない。そのまま prune する
+と即座に消える。`kind=timeout` のエントリは**書かれてから 24 時間 (`TOLD_TIMEOUT_TTL_SECONDS`) は
+prune の対象外**、TTL を過ぎたら dispatcher の prune が掃除する (台帳が育ち続けない)。
+
+**採らなかった案**: (a) dispatcher に通知させる (watchdog は判定の根拠を書くだけ)。台帳の書き手が
+1 人のままで済み、再送も dispatcher の既存の仕組みに乗るが、settle 時の従来の 1 通と二重になる/
+それを止めるには executor の報告を timeout だけ抑止することになり、dispatcher が止まっている間は
+何も届かない。(b) 送れなかった通知をファイル (sidecar) に残す。上記の理由で不採用。
+
+**回帰**: `tests/test_retirement_wait_and_timeout_notice.py` (本物の plan.sh / 本物の
+`make_notify_once` + executor / 本物の dispatcher の python)。赤の実証は
+`tests/red_proof_t021_pr6.sh` (欠陥 14 種を 1 つずつ注入し、見張るテストが赤になる)。
+
+**戻し方**: 失敗すると全 mission の割り当て・生存監視が止まる種類の変更 (`plan.sh pull` は全 Worker が
+叩き、台帳は dispatcher が毎サイクル書く) なので手順を残す。**PR を revert → 主 checkout を
+`git merge --ff-only origin/main` → `python3 scripts/lib_daemon_watch.py restart dispatcher` /
+`restart watchdog`** (`lib_mux.py kill` / `spawn` を素で叩かない。§7-5)。plan.sh は呼ばれるたびに
+読み直されるので (1) は revert だけで戻る。デーモンの再起動が要るのは (2) — `lib_retirement.py` /
+`lib_daemon_state.py` / `watchdog.py` / `dispatcher.sh`。共有規則なので env の停止スイッチは付けない
+(dispatcher と plan.sh で答えが割れる。memory: `no-env-killswitch-for-shared-rule`)。revert 後に残る
+ものは害が無い: 台帳の `kind=timeout` エントリは旧コードからは読まれるだけで (形は他のエントリと
+同じ)、`<台帳>.lock` は空のファイル、request / progress の `detail` 欄は旧コードが無視する。
+台帳の通知が届かない・重複するときの手当ては `knowledge/notify-once.md`「戻し方」と同じ
+(台帳ファイルを消す。dispatcher の再起動は不要)。
+
 ---
 
 ## 8. 参照
@@ -2397,5 +2496,9 @@ env の停止スイッチは付けない (dispatcher と `start.sh` で答えが
   宛先の後始末 (§7-15)。`CREWVIA_PYTEST_WORKSPACE_SWEEP=0` で残骸掃除だけが止まる
 - `scripts/plan.sh` `cmd_needs_director()` / `scripts/dispatcher.sh` `worker_holds_work()` /
   `worker_waits_on_director()` / `codex_review_slot_busy()` / `RELEASED_WORK_STATUSES` (§7-16)
+- `scripts/plan.sh` `predecessor_cleanup_pending()` / `cmd_pull()` の待機ループ、
+  `scripts/lib_retirement.py` `_report_timeout_once()` / `_retry_owed_notices()`、
+  `scripts/watchdog.py` `make_notify_once()` / `timeout_detail()`、
+  `scripts/lib_daemon_state.py` `told_lock()` / `told_record()` (§7-18)
 - `knowledge/dispatcher-restart-after-merge.md` — 常駐デーモンの反映手順。
   **§7-5 の pause を挟む手順が追加された**ので、kill → spawn を素で打たないこと

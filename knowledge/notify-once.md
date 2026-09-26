@@ -194,6 +194,9 @@ allowlist に無ければ落とす。新しい経路を足したら必ず赤に�
 **入口を通していない読み取り (backlog。allowlist に明示して凍結してある)**:
 - (Q) は `plan.sh` が単体コピーの隔離テストで使われており、新しい lib への依存を足すと fixture がまとめて壊れる
   (memory: shared-module-breaks-single-script-fixtures) ので移していない。
+- (t021) `plan.sh` の `predecessor_cleanup_pending()` は registry/retirements の marker を `json.loads` で読む
+  (allowlist の (Q))。判定は「前任の後始末待ちと証明できるか」だけで、証明できない形はすべて False (= 待たずに
+  従来どおり拒否) に倒れるので、壊れた marker が拒否を緩めることはない。入口へ移すのは (Q) 全体と一緒に。
 - **既知の穴**: `taskvia-sync.sh` の `load_map()` は **外側の型も未検証** (`.taskvia-map.json` が list だと呼び出し側の
   `.get` が落ちうる)。`plan.sh` 側 (`_load_taskvia_map`) と同じ 1 行 (`isinstance(data, dict)`) で閉じるが、
   registry/daemons の外なので t026 では触っていない。
@@ -233,6 +236,20 @@ allowlist に無ければ落とす。新しい経路を足したら必ず赤に�
   再通知される。その後は黙る。
 - `scripts/kai-review.sh` の変更 (拒否記録の書き込み) は、dispatcher が常に main 版を起動するので
   **merge されるまで dogfood できない** (鶏と卵)。この PR の diff のレビュー自体は成立する。
+
+## watchdog の timeout 終了通知も同じ台帳に乗る (t021 / PR6)
+
+台帳の書き手は dispatcher だけではなくなった。watchdog が timeout (idle / max) で Worker を終了させた
+あとの Director 宛の通知 (`kind=timeout`、key は `timeout_<mission>_<task>`、fingerprint は退役の
+`request_id`) を、`watchdog.make_notify_once()` がこの台帳に乗せて 1 通だけ送る。設計と根拠は
+`knowledge/daemon-authority.md` §7-18。この台帳を読み書きするときの約束:
+
+- **書き換えはすべて `lib_daemon_state.told_lock()` の中で**。dispatcher の `record_told()` /
+  `prune_told()` も同じ。取れなければ「書けなかった」に倒れる (通知は次のサイクルで再試行 / prune は遅れる)。
+- `kind=timeout` のエントリは、書かれてから 24 時間 (`TOLD_TIMEOUT_TTL_SECONDS`) は dispatcher の prune の
+  対象外 (その task は pending に戻っていて live key に現れないため)。TTL 後に dispatcher が掃除する。
+  **エントリに `at` (書いた epoch 秒) を持つ**のはこのため。他の kind は `at` を持たない。
+- 送れなかった通知は台帳に書かない (再送側)。台帳が使えないときも再送側 — 上の表と同じ向き。
 
 ## 本番で問題が出たときの戻し方 (停止スイッチは設けていない)
 

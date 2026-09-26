@@ -128,6 +128,7 @@ import lib_retirement  # noqa: E402
 # る task と dispatcher が投げる task がズレると、痛むのは QA FAIL の直後だけで、
 # その瞬間まで誰も気付かない。tests/test_task_graph.py がコピーの再発を見張る。
 from lib_dep_rules import card_dependencies  # noqa: E402
+from lib_dep_rules import DEAD_DEP_STATUSES, HELD_DEP_STATUSES  # noqa: E402
 # task カードの読み取りも 1 箇所しかない (Codex 5 巡目 P2)。parser・「識別子は
 # ファイル名」・信用できないカードの隔離を plan.sh 側だけに入れた結果、同じ queue を
 # 2 つの別のコードが別の規則で読む状態になり、`id` 行の無いカードで **この
@@ -180,6 +181,17 @@ ALL_DONE_STATE_FILE = REGISTRY_DIR / 'dispatcher_all_done.flag'
 
 PRIORITY_ORDER  = {'high': 0, 'medium': 1, 'low': 2}
 TERMINAL_STATUSES = {'done', 'verified', 'skipped'}
+
+# 「Worker がその card をもう手放している」status。TERMINAL_STATUSES (= 依存が
+# 満たされた) とは問いが違う: `failed` は依存を満たさない (HELD) が、Worker は
+# 手放している。`cancelled` も同じ。Worker の生死・Kai-codex の孤児判定はこちらを
+# 使う (t001 / backlog #13)。
+# 「もう完了しない」status の名前は lib_dep_rules が持っている (ここに並べ直すと、
+# tests/test_failed_dependency_hold.py が規則のコピーとして落とす)。完了した status
+# (TERMINAL_STATUSES) にそれを足したものが「手放した」の全部。
+RELEASED_WORK_STATUSES = (
+    TERMINAL_STATUSES | set(DEAD_DEP_STATUSES) | set(HELD_DEP_STATUSES)
+)
 
 # Skills that mark a task as Director-only (handled directly by the Director,
 # not dispatchable to any Worker).  Tasks with these skills are excluded from
@@ -543,6 +555,74 @@ def load_all_tasks(active_missions):
         for meta, _ in tasks:
             all_tasks.append((slug, meta))
     return all_tasks, done_ids_by_mission, task_statuses_by_mission
+
+
+def worker_holds_work(agent_name, all_tasks):
+    """card の `worker` が `agent_name` で、手放されていない card が 1 枚でもあるか。
+
+    「手放されていない」= `RELEASED_WORK_STATUSES` でも `pending` でもない。in_progress
+    だけでなく needs_director / needs_human_review / blocked / verifying / ... を含む。
+    pending を外すのは、`--reset` が worker を消すので pending に名前が残るのは取り残しで、
+    Worker を生かす理由にならないため。
+
+    以前の Rule 2 は `status == 'in_progress'` だけを見ていた。`plan.sh needs-director` が
+    assignment を外すようになった (t001) ので、そのままでは判断待ちの Worker が
+    「仕事なし」と読まれて退役の対象になる。倒す先は「殺さない」: 知らない status も
+    保持に数える (allowlist ではなく除外側を数える)。
+
+    `all_tasks` は `load_all_tasks()` の戻り (= `lib_task_cards` の入口を通った card)。
+    ここで card を読み直さない。
+    """
+    return any(
+        meta.get('worker') == agent_name
+        and meta.get('status') not in RELEASED_WORK_STATUSES
+        and meta.get('status') != 'pending'
+        for _, meta in all_tasks
+    )
+
+
+def worker_waits_on_director(agent_name, all_tasks):
+    """`agent_name` が needs_director の card を持っている (= Director の判断待ち) か。
+
+    `needs-director` は assignment を外すので、assignment の有無だけでは「まだこの
+    Worker は仕事を持っている」が読めなくなった。外す前は assignment が残っていたので
+    busy 扱いになっていた —— その扱いをここで保つ (新しい task を割り当てない・Rule 5 を
+    重ねて鳴らさない)。
+    """
+    return any(
+        meta.get('worker') == agent_name and meta.get('status') == 'needs_director'
+        for _, meta in all_tasks
+    )
+
+
+def codex_review_slot_busy(task_statuses_by_mission):
+    """`queue/assignments/Kai-codex` が、いま走っているかもしれない run を指しているか。
+
+    「同時 1 実行」の根拠は assignment の**有無**だった。`plan.sh needs-director` が撤去
+    しない版 (t001 より前) や archive 前の取り残しでは、走っていない run の assignment が
+    残り、以後の codex-review が恒久的に spawn されなかった (backlog #13)。
+
+    指す task が手放し済み (`RELEASED_WORK_STATUSES`) か needs_director なら孤児で、塞がない
+    (**読むだけ**。assignment を消すのは plan.sh の役目 —— 次の pull が上書きする)。
+
+    塞ぐ側に倒すもの: assignment が読めない / `<mission>:<task>` の形でない / 指す task が
+    見つからない (archive 済みなど) / 進行中の status。証明できない孤児は孤児と扱わない
+    (誤って 2 つ目の run を走らせるより、Director に見える停止のほうが安い)。
+    """
+    raw = read_assignment(CODEX_REVIEW_AGENT)
+    if is_missing(raw):
+        return False
+    if is_unreadable(raw):
+        return True
+    slug, _, task_id = raw.strip().partition(':')
+    if not slug or not task_id:
+        return True
+    status = task_statuses_by_mission.get(slug, {}).get(task_id)
+    if status in RELEASED_WORK_STATUSES or status == 'needs_director':
+        log(f"[codex-review] {CODEX_REVIEW_AGENT} の assignment は終わった task {slug}:{task_id} "
+            f"(status={status}) を指す孤児 — spawn を塞がない")
+        return False
+    return True
 
 
 def dependency_gate(slug, meta, done_ids_by_mission, task_statuses_by_mission):
@@ -1289,7 +1369,8 @@ def _save_state_entry(name: str, state: str, since: float) -> None:
         log(f'WARNING: cannot write state entry for {name!r}: {e}')
 
 
-def check_rule5(name: str, target: str, assignment_file: Path, task_statuses_by_mission: dict) -> None:
+def check_rule5(name: str, target: str, assignment_file: Path, task_statuses_by_mission: dict,
+                waits_on_director: bool = False) -> None:
     """Rule 5: detect blocked / idle-with-task and notify Director.
 
     A: state == "blocked"
@@ -1300,13 +1381,18 @@ def check_rule5(name: str, target: str, assignment_file: Path, task_statuses_by_
 
     tmux mode (state == "unknown") → skip entirely (safe side).
 
-    t032 F4: cmd_needs_director leaves the assignment file in place (no
-    retire_assignment call), so once the escalating Worker goes idle,
-    condition B fires here too and Director gets both a
-    "[needs_director]" and a "[Rule 5] idle-with-task" notification for the
-    same root cause, forever (every NOTIFY_TTL). Fold into the
-    needs_director notification instead — same exclusivity idea as the
+    t032 F4: once the escalating Worker goes idle after `plan.sh needs-director`,
+    Rule 5 must not send a second notification ("[Rule 5] idle-with-task" /
+    "blocked") for the same root cause, forever (every NOTIFY_TTL) — the
+    needs_director notification owns it.  Same exclusivity idea as the
     failed+handoff_path block, which only fires for status=='failed'.
+
+    t001 (#13): `plan.sh needs-director` now retires the assignment, so the
+    assignment file no longer says "this Worker is parked on a needs_director
+    task".  Condition B needs the file and stops firing by itself; condition A
+    (pane blocked) used to be suppressed only through the assignment, so the
+    caller now passes `waits_on_director` (the Worker's own card says so).
+    The assignment-based check stays for assignments left by an older plan.sh.
     """
     # IMPORTANT: mux pane labels are '<name>-worker' (e.g. 'Omar-worker'), not
     # the bare agent name.  Use `target` (= window_target from
@@ -1350,7 +1436,7 @@ def check_rule5(name: str, target: str, assignment_file: Path, task_statuses_by_
                     assigned_task_status = task_statuses_by_mission.get(a_slug, {}).get(a_task_id)
             except Exception:
                 assigned_task_status = None
-        if assigned_task_status == 'needs_director':
+        if assigned_task_status == 'needs_director' or waits_on_director:
             is_A = False
             is_B = False
 
@@ -1425,7 +1511,7 @@ def check_rule5(name: str, target: str, assignment_file: Path, task_statuses_by_
         record_notify(notify_key)
 
 
-def spawn_kai_review(slug, meta):
+def spawn_kai_review(slug, meta, task_statuses_by_mission):
     """Background-spawn kai-review.sh for a codex-review task.
 
     Preconditions:
@@ -1435,8 +1521,10 @@ def spawn_kai_review(slug, meta):
 
     Behavior:
       - Extracts pr_number from frontmatter; if absent, logs warning and returns.
-      - Refuses to spawn while queue/assignments/Kai-codex exists (another run
-        of the same agent is already in flight — either this task or another).
+      - Refuses to spawn while queue/assignments/Kai-codex points at a run that
+        may still be in flight (`codex_review_slot_busy()`).  An assignment left
+        behind by a run that already finished / escalated is an orphan and does
+        not block (t001 / backlog #13).
       - Launches nohup kai-review.sh in a detached process group so the 5s
         poll loop does not block waiting for the codex CLI to finish.
       - stdout/stderr go to logs/kai-spawn/<slug>-<task_id>-<epoch>.log so
@@ -1457,7 +1545,7 @@ def spawn_kai_review(slug, meta):
             record_notify(_key)
         return False
     # Only one Kai-codex run at a time.
-    if (ASSIGNMENTS_DIR / CODEX_REVIEW_AGENT).exists():
+    if codex_review_slot_busy(task_statuses_by_mission):
         return False
     if not KAI_REVIEW_SH.exists():
         log(f"ERROR: kai-review.sh not found at {KAI_REVIEW_SH} — cannot spawn Codex review")
@@ -1545,7 +1633,7 @@ def refusal_note(slug, meta):
     return note, (rec['pr'], rec['diff_bytes'], rec['max_bytes'])
 
 
-def handle_codex_review(slug, meta, live_state_keys):
+def handle_codex_review(slug, meta, live_state_keys, task_statuses_by_mission):
     """unblocked-pending な codex-review task: 拒否済みなら知らせて止め、そうでなければ spawn。"""
     task_id = meta['id']
     state, rec = review_refusal_for(slug, meta)
@@ -1579,7 +1667,7 @@ def handle_codex_review(slug, meta, live_state_keys):
         return
     spawn_key = f'kai_spawn_{slug}_{task_id}'
     if should_notify(spawn_key):
-        if spawn_kai_review(slug, meta):
+        if spawn_kai_review(slug, meta, task_statuses_by_mission):
             record_notify(spawn_key)
 
 
@@ -1779,13 +1867,22 @@ def dispatch():
 
         worker_skills = set(worker_info.get('skills') or [])
 
-        # Idle = no assignment file
+        # Idle = no assignment file, and not waiting on the Director.
+        #
+        # t001 (#13): `plan.sh needs-director` now retires the assignment (so a
+        # finished Kai-codex run no longer blocks every later codex-review).  A
+        # Worker parked on a needs_director card is still not idle — before the
+        # change its assignment file said so; now its card does.  Reading it as
+        # idle would hand it a new task while the Director is deciding what to
+        # do with the old one.
         assignment_file = ASSIGNMENTS_DIR / agent_name
-        is_idle = not assignment_file.exists()
+        waits_on_director = worker_waits_on_director(agent_name, all_tasks)
+        is_idle = not assignment_file.exists() and not waits_on_director
 
         # Rule 5 (herdr only): check agent state for blocked / idle-with-task.
         # Runs for ALL workers (busy and idle) before the is_idle gate below.
-        check_rule5(agent_name, target, assignment_file, task_statuses_by_mission)
+        check_rule5(agent_name, target, assignment_file, task_statuses_by_mission,
+                    waits_on_director=waits_on_director)
 
         # t025: a Worker whose retirement is already in flight is not a
         # candidate for anything.  Before t002 the judgement and the kill were
@@ -1872,16 +1969,16 @@ def dispatch():
                 if bool(task_s := set(meta.get('skills') or [])) and task_s.issubset(worker_skills)
             ]
             has_any = bool(matching_pending)
-            # Defense-in-depth: also keep the worker alive if it owns an
-            # in_progress task.  plan.sh pull writes the assignment file before
-            # the Taskvia sync, but there is still a narrow window between
-            # save_task (task→in_progress) and the assignment file write where
-            # the dispatcher could see is_idle=True + no pending tasks.
-            has_in_progress = any(
-                meta.get('worker') == agent_name
-                for _, meta in all_tasks
-                if meta.get('status') == 'in_progress'
-            )
+            # Also keep the worker alive if it still holds a card — in_progress,
+            # needs_director, needs_human_review, blocked, verifying, ... (t001:
+            # anything the Worker has not released; see worker_holds_work()).
+            # Originally this only looked at in_progress, as defense in depth for
+            # the window between plan.sh pull's save_task (task→in_progress) and
+            # the assignment write.  needs-director now removes the assignment
+            # too, so a Worker awaiting the Director's decision would otherwise
+            # read as "no work" and be retired (memory:
+            # assignment-removal-triggers-rule2-kill).
+            has_in_progress = worker_holds_work(agent_name, all_tasks)
             if not has_any and not has_in_progress:
                 if in_spawn_grace(target):
                     log(f"[spawn_grace] {agent_name}: within {SPAWN_GRACE_SECONDS}s spawn grace — skip shutdown")
@@ -1974,10 +2071,11 @@ def dispatch():
             continue
         # Codex-review path (Phase 2): background-spawn kai-review.sh instead
         # of asking the Director to start a Worker.  spawn_kai_review is a
-        # no-op when Kai-codex is already in flight (assignment file exists)
+        # no-op when Kai-codex may still be in flight (assignment points at a
+        # live run — an orphan assignment does not count)
         # or when pr_number is missing (warning logged, Director escalates).
         if task_skills & CODEX_REVIEW_SKILLS:
-            handle_codex_review(slug, meta, live_state_keys)
+            handle_codex_review(slug, meta, live_state_keys, task_statuses_by_mission)
             continue
         # can_handle: True if any alive worker (window exists OR heartbeat recent) has skills ⊇ task_skills
         can_handle = any(

@@ -280,6 +280,10 @@ required_evidence:
 - Director は reason を読んで対処方針を決定し、`plan.sh update <task_id> --status pending --reset` で差し戻す
   （`--status in_progress --reset` は罠 — `--reset` の適用後に `--status` が上書きするため、最終状態が `status=in_progress / worker=null` になり dispatch 不能・pull 拒否のまま静かに全停止する。`--status pending` にすること）
 - 後続タスクの `blocked_by` は **解除されない**（needs_director は TERMINAL_STATUSES に含まれない）
+- `plan.sh needs-director` は呼んだ Worker の `queue/assignments/<name>` を撤去する（`done` / `fail` と同じ）。
+  **手で `rm queue/assignments/Kai-codex` する必要は無い** — 以前は残って以後の codex-review を止めていた。
+  判断待ちの Worker は card の `worker` で「仕事あり」と読まれるので、dispatcher に退役されず、新しい task も
+  渡されない（`knowledge/daemon-authority.md` §7-16）
 
 ### ⚠️ Worker への指示で「task ファイルの直接編集」を促さないこと (t015)
 

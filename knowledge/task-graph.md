@@ -254,6 +254,8 @@ snapshot を取り直す）。t006 QA が「未検証」としていた点は、
 
 生成器（`plan.sh` の `build_task_graph()`）は、`pane_match` を書く条件（status の allowlist と
 `queue/assignments/<worker>` の AND）が揃った node に、`pane_id` も書く。`pane_match` は残す。
+（`needs_director` だけは assignment が**無くても**よい: `plan.sh needs-director` が assignment を外すため。
+読めない assignment は許さない。`knowledge/daemon-authority.md` §7-16）
 
 - 値は `registry/mux/<Worker>-worker.json` の `pane_id`。読むのは
   `lib_mux.recorded_herdr_pane_id()` 1 つ（記録の読み取りは既存の `read_pane_record()` =

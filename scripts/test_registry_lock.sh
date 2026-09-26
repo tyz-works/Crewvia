@@ -118,6 +118,11 @@ exclude = {
     # workers.yaml を読むので、その名前で置く必要がある)。書き込みは tmp_path に
     # 閉じ、repo の registry/workers.yaml に書く経路は存在しない。
     root / "tests" / "test_dispatcher_notify_once.py",
+    # t001 (#13) の needs-director / Rule 2 のテスト。end-to-end 1 本が `Sandbox(tmp_path)` の
+    # `tmp_path / "repo"` に idle Worker 用の workers.yaml を 1 度だけ書く (dispatcher は
+    # REGISTRY_DIR 直下のその名前を読む)。書き込みは pytest の使い捨てツリーに閉じ、
+    # repo の registry/workers.yaml に書く経路は存在しない。
+    root / "tests" / "test_needs_director_releases_assignment.py",
 }
 proximity = 15
 found = []

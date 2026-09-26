@@ -7,7 +7,7 @@ skill → モデル ID の解決ヘルパー。
 
 使い方:
   python3 scripts/lib_model.py resolve --config config/crewvia.yaml --skills "docs,qa"
-  → claude-haiku-4-5-20251001
+  → claude-sonnet-5  (t028 以降。docs / qa / verify は Sonnet)
 
 終了コード:
   常に 0。呼び出し元の Worker 起動を絶対に止めない。

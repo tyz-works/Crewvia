@@ -28,7 +28,10 @@ import lib_model  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
-# フィクスチャ: 標準 config (実際の crewvia.yaml と同等の内容)
+# フィクスチャ: ランク付け・タイブレークの論理を検証するための config。
+# 実 crewvia.yaml とは違う: t028 以降、実 config の docs / qa / verify は sonnet で、
+# haiku を含む組み合わせ (opus > sonnet > haiku) はこの fixture でしか検証できない。
+# 実 config の値は TestRealConfig が別に固定する。
 # ---------------------------------------------------------------------------
 STANDARD_CONFIG = textwrap.dedent("""\
     worker_model: claude-sonnet-5
@@ -182,8 +185,24 @@ class TestRealConfig:
     def test_planning_returns_opus(self):
         assert lib_model.resolve(str(REAL_CONFIG), "planning") == "claude-opus-5"
 
-    def test_docs_returns_haiku(self):
-        assert lib_model.resolve(str(REAL_CONFIG), "docs") == "claude-haiku-4-5-20251001"
+    @pytest.mark.parametrize("skill", ["docs", "qa", "verify"])
+    def test_docs_qa_verify_are_sonnet_not_haiku(self, skill):
+        # t028 / backlog #16: Haiku は --permission-mode auto を無視して承認ダイアログで
+        # 止まる。以前は起動のたびに CREWVIA_WORKER_MODEL で上書きしていた。
+        # 「Haiku でない」ではなく「Sonnet である」を固定する: 未定義に戻って
+        # worker_model にフォールバックしても、この 3 skill が意図して選ばれた
+        # 値でなくなるので検出したい。
+        assert lib_model.resolve(str(REAL_CONFIG), skill) == "claude-sonnet-5"
+        assert "haiku" not in lib_model.resolve(str(REAL_CONFIG), skill)
+
+    def test_no_skill_in_model_per_skill_is_haiku(self):
+        # 3 skill の列挙だけでは、4 つ目の skill を Haiku で足す退行を見逃す。
+        # PyYAML の有無に依存しない (env -i の pytest には入っていないことがある)。
+        cfg = lib_model._parse_yaml_fallback(str(REAL_CONFIG))
+        per_skill = cfg["model_per_skill"]
+        assert len(per_skill) >= 7, f"parsed too little of model_per_skill: {per_skill}"
+        haiku = {k: v for k, v in per_skill.items() if "haiku" in str(v).lower()}
+        assert haiku == {}, f"Haiku ignores permission-mode auto and stalls on dialogs: {haiku}"
 
     def test_code_falls_back_to_worker_model(self):
         # code は model_per_skill 未定義 → worker_model を返す
@@ -194,9 +213,9 @@ class TestRealConfig:
         # 最高ランク選択: planning=opus, code=worker_model → opus
         assert lib_model.resolve(str(REAL_CONFIG), "planning,code") == "claude-opus-5"
 
-    def test_docs_and_qa_returns_haiku(self):
-        # 同ランク: docs=haiku, qa=haiku → haiku
-        assert lib_model.resolve(str(REAL_CONFIG), "docs,qa") == "claude-haiku-4-5-20251001"
+    def test_docs_and_qa_returns_sonnet(self):
+        # 同ランク: docs=sonnet, qa=sonnet → sonnet
+        assert lib_model.resolve(str(REAL_CONFIG), "docs,qa") == "claude-sonnet-5"
 
 
 class TestTiebreakWithFixture:
@@ -275,7 +294,7 @@ class TestParseYamlFallback:
         assert "worker_model" in result
         assert "model_per_skill" in result
         assert result["model_per_skill"].get("planning") == "claude-opus-5"
-        assert result["model_per_skill"].get("docs") == "claude-haiku-4-5-20251001"
+        assert result["model_per_skill"].get("docs") == "claude-sonnet-5"  # t028
 
 
 # ---------------------------------------------------------------------------

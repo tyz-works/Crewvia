@@ -34,6 +34,8 @@ Thumbs.db
 .crewvia-env
 queue/
 registry/mux/
+# Worker が起動された TARGET_DIR の記録 (t009)。実行時の状態で、コミットしない
+registry/workers/
 registry/heartbeats/
 registry/activity/
 registry/notifications/

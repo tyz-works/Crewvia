@@ -711,6 +711,21 @@ PYEOF
   fi
   echo "[crewvia] Agent launched in mux window: $WINDOW_NAME"
 
+  # Worker の TARGET_DIR を記録する (t009 / #21)。dispatcher が「別 repo 用の Worker に
+  # crewvia 本体の task を回す」のを止める根拠になる。**起動が成功した後にだけ**書く —
+  # 上の 10/11 (既に生きた Worker が居る) で終わった呼び出しが、生きている Worker の記録を
+  # 別の TARGET_DIR で上書きしてはいけない。書き先は spawn 記録 (registry/mux/) とは別
+  # (kill の認可の証拠に相乗りしない。lib_worker_target.py の冒頭)。
+  # 書けなくても起動は止めない: 記録が無い Worker は「target_dir 付きの task を受けない」
+  # 側に倒れるだけで、crewvia 本体の task は従来どおり受ける。
+  if [[ "${ROLE}" == "worker" ]]; then
+    _RECORDED_TARGET=""
+    [[ "$WORK_DIR" != "$REPO_ROOT" ]] && _RECORDED_TARGET="$WORK_DIR"
+    python3 "${SCRIPT_DIR}/lib_worker_target.py" record "${REPO_ROOT}/registry" "$AGENT_NAME" \
+      "$_RECORDED_TARGET" >/dev/null \
+      || echo "[crewvia] WARNING: $AGENT_NAME の TARGET_DIR を記録できませんでした — target_dir 付きの task は割り当てられません" >&2
+  fi
+
   # Claude Code の入力プロンプト（❯）が表示されるまで待ってから kickoff メッセージを送る。
   # 固定 sleep だと環境依存でタイミングがずれるため、プロンプト検出でポーリングする。
   # (spec §4.2-D: capture で ❯ を確認してから send する規約)

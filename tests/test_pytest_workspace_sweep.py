@@ -445,16 +445,20 @@ def test_tmux_no_server_is_a_quiet_no_op():
 # ---------------------------------------------------------------------------
 
 def test_run_cleanup_honours_the_kill_switch_env_only_for_the_leftovers():
-    b = FakeBackend([OWN, DEAD])
+    # `run_cleanup` は pid_alive を差し替えられず本物の os.kill(pid, 0) を通る。
+    # 固定の偽 pid (111) は GitHub runner 上で実在して残骸と見なされず落ちた (t042)
+    # ので、回収済みの子の pid を使う。
+    dead = f"crewvia-pytest-{_dead_pid()}-aaaaaaaa"
+    b = FakeBackend([OWN, dead])
     sweep.run_cleanup(OWN, PRODUCTION_DESTINATION, environ={sweep.SWEEP_SWITCH: "0"},
                       backends=[b])
     assert b.closed == [OWN]
 
     for value in (None, "1", "", "false"):       # `0` 以外では止まらない
-        b = FakeBackend([OWN, DEAD])
+        b = FakeBackend([OWN, dead])
         env = {} if value is None else {sweep.SWEEP_SWITCH: value}
         sweep.run_cleanup(OWN, PRODUCTION_DESTINATION, environ=env, backends=[b])
-        assert sorted(b.closed) == sorted([OWN, DEAD]), value
+        assert sorted(b.closed) == sorted([OWN, dead]), value
 
 
 def test_cleanup_itself_never_raises_even_if_a_backend_explodes():

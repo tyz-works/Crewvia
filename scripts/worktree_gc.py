@@ -238,14 +238,23 @@ def _git_env() -> dict:
 
 
 def run_git(cwd, *args) -> tuple[Optional[int], str, str]:
-    """`(returncode, stdout, stderr)`。起動できない・時間切れは returncode=None (= 判定不能)。"""
+    """`(returncode, stdout, stderr)`。起動できない・時間切れは returncode=None (= 判定不能)。
+
+    stdout/stderr はバイト列で受け取り、UTF-8 + surrogateescape で**手動**デコードする (t086 /
+    PR#239 5巡目 P2)。`subprocess.run(text=True)` (`encoding=` / `errors=` 付きも同様) は
+    `io.TextIOWrapper` 経由になり、デコードとは別に universal newlines 変換もかかる ——
+    `git worktree list --porcelain -z` は NUL 区切りの生バイト列 (パスは一切クォートされない) を
+    返すので、登録パスに含まれる本物の CR・CRLF がデコードの過程で LF に化ける (元のバイト列を
+    `bytes.decode()` で直接デコードすれば、改行変換は起きない)。
+    """
     try:
-        proc = subprocess.run(['git', '-C', str(cwd), *args], capture_output=True, text=True,
-                              env=_git_env(), timeout=GIT_TIMEOUT_SECONDS,
-                              encoding='utf-8', errors='surrogateescape')
+        proc = subprocess.run(['git', '-C', str(cwd), *args], capture_output=True,
+                              env=_git_env(), timeout=GIT_TIMEOUT_SECONDS)
     except (OSError, subprocess.SubprocessError) as e:
         return None, '', f'{type(e).__name__}: {e}'
-    return proc.returncode, proc.stdout, proc.stderr
+    stdout = proc.stdout.decode('utf-8', errors='surrogateescape')
+    stderr = proc.stderr.decode('utf-8', errors='surrogateescape')
+    return proc.returncode, stdout, stderr
 
 
 @dataclass
@@ -439,20 +448,27 @@ def scan_process_cwds() -> tuple[list, str]:
 
 
 def _scan_with_lsof() -> tuple[list, str]:
+    # t086 / PR#239 5巡目 P2: run_git() と同族。lsof は cwd パスを一切クォートしないので、
+    # `text=True` だとパスに含まれる本物の CR・CRLF が universal newlines 変換で LF に化ける。
+    # バイト列で受け取り、UTF-8 + surrogateescape で手動デコードする (改行変換なし)。
     try:
-        proc = subprocess.run(['lsof', '-a', '-d', 'cwd', '-Fpn'], capture_output=True, text=True,
+        proc = subprocess.run(['lsof', '-a', '-d', 'cwd', '-Fpn'], capture_output=True,
                               timeout=60)
     except (OSError, subprocess.SubprocessError) as e:
         return [], f'/proc も lsof も使えない ({type(e).__name__}: {e})'
+    stdout = proc.stdout.decode('utf-8', errors='surrogateescape')
+    stderr = proc.stderr.decode('utf-8', errors='surrogateescape')
     # lsof は一部のプロセスの検査に失敗しても部分的な stdout を出しつつ非 0 を返すことがある。
     # 出力があっても不完全なスキャンでしかない = 「使われていない証拠」にならないので、成功 (rc=0) だけを完全とみなす。
     if proc.returncode != 0:
-        return [], f'lsof が不完全 (rc={proc.returncode}): {(proc.stderr or "").strip()[:200]}'
+        return [], f'lsof が不完全 (rc={proc.returncode}): {stderr.strip()[:200]}'
     # 出力が空なら「見えなかった」であって「無い」ではない。
-    if not proc.stdout.strip():
+    if not stdout.strip():
         return [], f'lsof の出力が空 (rc={proc.returncode})'
     found, pid = [], None
-    for line in proc.stdout.splitlines():
+    # str.splitlines() は \r 単体も行区切りとみなす (lsof 自身の record 区切りは \n だけ)。
+    # パスに埋め込まれた本物の CR を余分な行境界に変えないよう、\n だけで区切る。
+    for line in stdout.split('\n'):
         if line.startswith('p') and line[1:].isdigit():
             pid = int(line[1:])
         elif line.startswith('n') and pid is not None:

@@ -459,8 +459,10 @@ class TestProcessScan:
 
     def test_an_empty_lsof_output_is_a_failure_not_an_empty_table(self, tmp_path, monkeypatch):
         monkeypatch.setattr(gc, "PROC_ROOT", tmp_path / "no-such-proc")
+        # t086: _scan_with_lsof() はもう text=True を付けないので、本物の subprocess.run と同じく
+        # stdout/stderr は bytes で返す偽物にする。
         monkeypatch.setattr(gc.subprocess, "run",
-                            lambda *a, **kw: subprocess.CompletedProcess(a, 1, stdout="", stderr=""))
+                            lambda *a, **kw: subprocess.CompletedProcess(a, 1, stdout=b"", stderr=b""))
         found, problem = gc.scan_process_cwds()
         assert found == [] and problem
 
@@ -470,12 +472,27 @@ class TestProcessScan:
         monkeypatch.setattr(gc, "PROC_ROOT", tmp_path / "no-such-proc")
         target = tmp_path / "wt"
         target.mkdir()
-        stdout = f"p123\nn{target}\n"
+        stdout = f"p123\nn{target}\n".encode()
         monkeypatch.setattr(gc.subprocess, "run",
                             lambda *a, **kw: subprocess.CompletedProcess(
-                                a, 1, stdout=stdout, stderr="lsof: WARNING: can't stat() fuse.gvfsd-fuse\n"))
+                                a, 1, stdout=stdout, stderr=b"lsof: WARNING: can't stat() fuse.gvfsd-fuse\n"))
         found, problem = gc.scan_process_cwds()
         assert found == [] and problem, "非 0 の lsof は、出力があっても不完全なスキャンとして拒否すること"
+
+    def test_lsof_output_with_a_literal_cr_in_the_cwd_path_is_preserved(self, tmp_path, monkeypatch):
+        """t086 (Codex 5巡目 P2) の赤の実証: lsof はパスを一切クォートしないので、cwd に本物の CR
+        を含むプロセスがあっても universal newlines 変換で LF に化けてはいけない。旧実装
+        (`text=True`) は化けた上に `str.splitlines()` が化けた LF で行を余分に割り、パスが
+        途中で切り詰められる。"""
+        monkeypatch.setattr(gc, "PROC_ROOT", tmp_path / "no-such-proc")
+        target = tmp_path / "wt\rwith-cr"
+        target.mkdir()
+        stdout = f"p123\nn{target}\n".encode()
+        monkeypatch.setattr(gc.subprocess, "run",
+                            lambda *a, **kw: subprocess.CompletedProcess(a, 0, stdout=stdout, stderr=b""))
+        found, problem = gc.scan_process_cwds()
+        assert problem == ""
+        assert found == [(123, os.path.realpath(target))], "cwd パスの CR がそのまま残ること (LF に化けない)"
 
 
 # ---------------------------------------------------------------------------
@@ -679,6 +696,45 @@ class TestGitEnvIsolation:
         monkeypatch.setenv("GIT_WORK_TREE", str(decoy))
         v = fx.verdict(wt)
         assert (v.action, v.reason) == (gc.KEEP, gc.R_DIRTY), v
+
+
+class TestRunGitPreservesRawBytes:
+    """`run_git()` (t086 / PR#239 5巡目 P2): `git worktree list --porcelain -z` はパスを一切
+    クォートしない生バイト列を返す。旧実装 (`subprocess.run(text=True, encoding='utf-8',
+    errors='surrogateescape')`) は `io.TextIOWrapper` の universal newlines 変換により、
+    stdout の**本物の** CR・CRLF を LF に変換してしまう (デコードとは別の変換で、encoding= の
+    指定だけでは止められない)。"""
+
+    def test_worktree_list_porcelain_z_keeps_a_literal_cr_intact(self, fx):
+        name = "line1\rline2"
+        wt = fx.repo / ".claude" / "worktrees" / SLUG / name
+        wt.parent.mkdir(parents=True, exist_ok=True)
+        git(fx.repo, "worktree", "add", "-q", "--detach", str(wt), "origin/main")
+        rc, out, err = gc.run_git(fx.repo, "worktree", "list", "--porcelain", "-z")
+        assert rc == 0, err
+        assert f"worktree {wt}\0" in out, "生の CR がそのまま stdout に残ること (LF に化けない)"
+
+    def test_worktree_list_porcelain_z_keeps_an_embedded_crlf_intact(self, fx):
+        name = "line1\r\nline2\r\n"
+        wt = fx.repo / ".claude" / "worktrees" / SLUG / name
+        wt.parent.mkdir(parents=True, exist_ok=True)
+        git(fx.repo, "worktree", "add", "-q", "--detach", str(wt), "origin/main")
+        rc, out, err = gc.run_git(fx.repo, "worktree", "list", "--porcelain", "-z")
+        assert rc == 0, err
+        assert f"worktree {wt}\0" in out, "CRLF が LF 1 バイトに畳まれずそのまま残ること"
+
+    def test_worktree_list_porcelain_z_keeps_non_utf8_bytes_intact(self, fx):
+        """回帰ガード: `run_git()` は本タスク以前から `errors='surrogateescape'` で非 UTF-8 の
+        バイトを扱えており、この経路 (デコードそのもの) は t086 (universal newlines を止めた
+        変更) の前後で壊れていない。CR/CRLF とは独立した経路だが、同じ `run_git()` の出力を
+        経由するので合わせて固定する。"""
+        name = os.fsdecode(b"line1-\xff\xfe-line2")
+        wt = fx.repo / ".claude" / "worktrees" / SLUG / name
+        wt.parent.mkdir(parents=True, exist_ok=True)
+        git(fx.repo, "worktree", "add", "-q", "--detach", str(wt), "origin/main")
+        rc, out, err = gc.run_git(fx.repo, "worktree", "list", "--porcelain", "-z")
+        assert rc == 0, err
+        assert f"worktree {wt}\0" in out, "非 UTF-8 のバイトが surrogateescape 往復でそのまま残ること"
 
 
 class TestParseWorktreeList:
@@ -1112,6 +1168,59 @@ class TestRestoreAndListQuarantine:
         そもそも reason に書いた値を正しく読み戻せない。"""
         name_with_newlines = "line1\nline2\n"
         wt = fx.repo / ".claude" / "worktrees" / SLUG / name_with_newlines
+        wt.parent.mkdir(parents=True, exist_ok=True)
+        git(fx.repo, "worktree", "add", "-q", "--detach", str(wt), "origin/main")
+        r = fx.cli("--apply")
+        assert r.returncode == 0, (r.stdout, r.stderr)
+        assert not wt.exists()
+
+        entries = fx.quarantine_entries()
+        assert len(entries) == 1
+        _quarantined_wt, _ts, listed_original = entries[0]
+        assert listed_original == str(wt), "隔離先の一覧が返す元のパスがバイト単位で一致すること"
+
+        data = json.loads(fx.cli("--list-quarantine", "--json").stdout)
+        assert data[0]["original_path"] == str(wt)
+
+        r = fx.cli("--restore", str(wt))
+        assert r.returncode == 0, (r.stdout, r.stderr)
+        assert wt.is_dir()
+        assert fx.quarantine_entries() == []
+
+    def test_quarantine_round_trips_a_path_with_a_literal_cr_byte_for_byte(self, fx):
+        """t086 (Codex 5巡目 P2) の赤の実証: `git worktree list --porcelain -z` はパスを一切
+        クォートしない生バイト列を返すので、名前に本物の CR (改行 LF を 1 つも伴わない単独の CR)
+        を含む worktree でも、隔離 → 一覧 → 復旧の往復がバイト単位で一致すること。旧実装
+        (`subprocess.run(text=True, encoding='utf-8', errors='surrogateescape')`) は
+        `io.TextIOWrapper` の universal newlines 変換により、単独の CR も含めて LF に変換して
+        しまう (CRLF だけでなく裸の CR も変換対象)。"""
+        name_with_cr = "line1\rline2"
+        wt = fx.repo / ".claude" / "worktrees" / SLUG / name_with_cr
+        wt.parent.mkdir(parents=True, exist_ok=True)
+        git(fx.repo, "worktree", "add", "-q", "--detach", str(wt), "origin/main")
+        r = fx.cli("--apply")
+        assert r.returncode == 0, (r.stdout, r.stderr)
+        assert not wt.exists()
+
+        entries = fx.quarantine_entries()
+        assert len(entries) == 1
+        _quarantined_wt, _ts, listed_original = entries[0]
+        assert listed_original == str(wt), "隔離先の一覧が返す元のパスがバイト単位で一致すること"
+
+        data = json.loads(fx.cli("--list-quarantine", "--json").stdout)
+        assert data[0]["original_path"] == str(wt)
+
+        r = fx.cli("--restore", str(wt))
+        assert r.returncode == 0, (r.stdout, r.stderr)
+        assert wt.is_dir()
+        assert fx.quarantine_entries() == []
+
+    def test_quarantine_round_trips_a_path_with_an_embedded_crlf_byte_for_byte(self, fx):
+        """t086 (Codex 5巡目 P2) の赤の実証: 名前に本物の CRLF (2 バイト) を含む場合、旧実装の
+        universal newlines 変換は CRLF を LF 1 バイトに畳んでしまう (バイト数そのものが変わる)。
+        畳まれた文字列では元のディレクトリと一致しなくなる。"""
+        name_with_crlf = "line1\r\nline2\r\n"
+        wt = fx.repo / ".claude" / "worktrees" / SLUG / name_with_crlf
         wt.parent.mkdir(parents=True, exist_ok=True)
         git(fx.repo, "worktree", "add", "-q", "--detach", str(wt), "origin/main")
         r = fx.cli("--apply")

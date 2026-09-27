@@ -47,6 +47,13 @@
 #   II 元の絶対パスの復元 (--list-quarantine の original_path) が最初の改行で             → 赤 (t080 P2-2)
 #      切り詰められる (埋め込み・末尾の改行を含むパスの往復が壊れる)
 #
+# t086 (B9 fix 5巡目: Codex review の findings) で追加:
+#   JJ run_git() が text=True に戻り、worktree パスの単独の CR が LF に化ける              → 赤 (t086 P2)
+#   KK run_git() が text=True に戻り、worktree パスの CRLF が LF 1 バイトに畳まれる         → 赤 (t086 P2)
+#   LL _scan_with_lsof() が text=True に戻り、cwd パスの CR が LF に化ける                 → 赤 (t086 P2)
+#   MM _scan_with_lsof() のバイト安全なデコードは残るが split('\n') が splitlines() に      → 赤 (t086 P2)
+#      戻り、cwd パスに埋め込まれた単独の CR が余分な行境界として扱われる
+#
 # 隔離: 使い捨ての複製で欠陥を注入する。本番の worktree のファイルには触らない。
 # テストは一時ディレクトリの git repo (origin = bare) と隔離した queue / registry だけで動き、
 # 本番の主 checkout・queue・registry・mux には届かない (--repo / --queue を必ず明示している)。
@@ -247,9 +254,9 @@ expect_red "case X" "test_apply_never_invokes_git_worktree_prune"
 echo "== case Y: lsof が非 0 でも部分出力を完全なスキャンとみなす (PR#239 F3)"
 fresh_copy
 inject $S "    if proc.returncode != 0:
-        return [], f'lsof が不完全 (rc={proc.returncode}): {(proc.stderr or \"\").strip()[:200]}'" \
+        return [], f'lsof が不完全 (rc={proc.returncode}): {stderr.strip()[:200]}'" \
            "    if False:
-        return [], f'lsof が不完全 (rc={proc.returncode}): {(proc.stderr or \"\").strip()[:200]}'"
+        return [], f'lsof が不完全 (rc={proc.returncode}): {stderr.strip()[:200]}'"
 expect_red "case Y" "test_a_nonzero_lsof_exit_with_partial_output_is_a_failure_not_a_partial_success"
 
 echo "== case Z: GIT_DIR/GIT_WORK_TREE 等を継承する (PR#239 2巡目 P1)"
@@ -348,6 +355,67 @@ fresh_copy
 inject $S "        out.append((wt, timestamp, _quarantine_original_path(managed_root, rel)))" \
            "        out.append((wt, timestamp, _quarantine_original_path(managed_root, rel).split(chr(10))[0]))"
 expect_red "case II" "test_quarantine_round_trips_a_path_with_embedded_and_trailing_newlines_byte_for_byte"
+
+echo "== case JJ: run_git() が text=True に戻り、単独の CR が LF に化ける (t086 P2)"
+fresh_copy
+inject $S "    try:
+        proc = subprocess.run(['git', '-C', str(cwd), *args], capture_output=True,
+                              env=_git_env(), timeout=GIT_TIMEOUT_SECONDS)
+    except (OSError, subprocess.SubprocessError) as e:
+        return None, '', f'{type(e).__name__}: {e}'
+    stdout = proc.stdout.decode('utf-8', errors='surrogateescape')
+    stderr = proc.stderr.decode('utf-8', errors='surrogateescape')
+    return proc.returncode, stdout, stderr" \
+           "    try:
+        proc = subprocess.run(['git', '-C', str(cwd), *args], capture_output=True, text=True,
+                              env=_git_env(), timeout=GIT_TIMEOUT_SECONDS,
+                              encoding='utf-8', errors='surrogateescape')
+    except (OSError, subprocess.SubprocessError) as e:
+        return None, '', f'{type(e).__name__}: {e}'
+    return proc.returncode, proc.stdout, proc.stderr"
+expect_red "case JJ" "test_worktree_list_porcelain_z_keeps_a_literal_cr_intact"
+
+echo "== case KK: run_git() が text=True に戻り、CRLF が LF 1 バイトに畳まれる (t086 P2)"
+fresh_copy
+inject $S "    try:
+        proc = subprocess.run(['git', '-C', str(cwd), *args], capture_output=True,
+                              env=_git_env(), timeout=GIT_TIMEOUT_SECONDS)
+    except (OSError, subprocess.SubprocessError) as e:
+        return None, '', f'{type(e).__name__}: {e}'
+    stdout = proc.stdout.decode('utf-8', errors='surrogateescape')
+    stderr = proc.stderr.decode('utf-8', errors='surrogateescape')
+    return proc.returncode, stdout, stderr" \
+           "    try:
+        proc = subprocess.run(['git', '-C', str(cwd), *args], capture_output=True, text=True,
+                              env=_git_env(), timeout=GIT_TIMEOUT_SECONDS,
+                              encoding='utf-8', errors='surrogateescape')
+    except (OSError, subprocess.SubprocessError) as e:
+        return None, '', f'{type(e).__name__}: {e}'
+    return proc.returncode, proc.stdout, proc.stderr"
+expect_red "case KK" "test_worktree_list_porcelain_z_keeps_an_embedded_crlf_intact"
+
+echo "== case LL: _scan_with_lsof() が text=True に戻り、cwd パスの CR が LF に化ける (t086 P2)"
+fresh_copy
+inject $S "    try:
+        proc = subprocess.run(['lsof', '-a', '-d', 'cwd', '-Fpn'], capture_output=True,
+                              timeout=60)
+    except (OSError, subprocess.SubprocessError) as e:
+        return [], f'/proc も lsof も使えない ({type(e).__name__}: {e})'
+    stdout = proc.stdout.decode('utf-8', errors='surrogateescape')
+    stderr = proc.stderr.decode('utf-8', errors='surrogateescape')" \
+           "    try:
+        proc = subprocess.run(['lsof', '-a', '-d', 'cwd', '-Fpn'], capture_output=True, text=True,
+                              timeout=60)
+    except (OSError, subprocess.SubprocessError) as e:
+        return [], f'/proc も lsof も使えない ({type(e).__name__}: {e})'
+    stdout = proc.stdout
+    stderr = proc.stderr"
+expect_red "case LL" "test_lsof_output_with_a_literal_cr_in_the_cwd_path_is_preserved"
+
+echo "== case MM: _scan_with_lsof() の split('\\n') が splitlines() に戻り、CR が余分な行境界になる (t086 P2)"
+fresh_copy
+inject $S "    for line in stdout.split('\n'):" "    for line in stdout.splitlines():"
+expect_red "case MM" "test_lsof_output_with_a_literal_cr_in_the_cwd_path_is_preserved"
 
 echo
 echo "PASS=$PASS FAIL=$FAIL"

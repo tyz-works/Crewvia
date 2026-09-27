@@ -197,3 +197,72 @@ root 所有のプロセスは EPERM で残った。キープアライブが消�
   kill_budget が pid 再利用で誤った年齢を見て判定を誤っても、その誤判定が実際の kill 対象を変える
   ことはない (判定と破壊が同じ pid 番号を再確認しているわけではなく、破壊は束縛済みの pidfd に
   固定されているため)。よって kill_budget 側の追加修正は不要と判断。
+
+### PR#240 6巡目 codex review (2026-09-28, t093) — 4 モジュール横断の所有・待ち・握り潰しの監査
+
+5巡目 (t083) が入れた「1 プロセス分の処理を丸ごと境界に閉じ込める」(`_scan_one`) という構造は、
+**境界の外側で「観測できなかった」に変換する前に、境界の内側で確保した資源を閉じる**ところまでは
+保証していなかった。6巡目はその抜けを直したうえで、`tests/leaked_descendants.py` /
+`tests/kill_budget.py` / `tests/proc_group.py` / `tests/conftest.py` の 4 ファイルについて、
+「所有」「待ち」「握り潰し」の 3 つの規則を横断で棚卸しした。
+
+#### findings (2 件)
+
+1. **[P2-1] `_scan_one` の pidfd 所有権**: `_open_pidfd_verified` が束縛に成功した**後**
+   (cmdline / wchan の読み取り、`Survivor` の構築) で例外が起きると、外側の
+   `except Exception: return None, True` がそれを「観測できなかった」に変えるだけで、
+   束縛済みの pidfd を閉じ忘れていた。所有権は `Survivor` を返す 1 つの正常出口でしか
+   渡らないので、pidfd 取得から `Survivor` 構築までを内側の `try/finally` で囲み、
+   所有権が確定する前に例外が起きたら finally で閉じてから外側の境界へ再送出する形にした。
+2. **[P2-2] `run_in_own_group` の後始末の待ち**: `communicate(timeout=)` がタイムアウトした後、
+   `kill_group()` を送ってから**上限なしの `communicate()`** を呼んでいた。`kill_group` は
+   `PermissionError` を含む終了エラーを黙って握り潰すので、シグナルが実際に届いたかはここでは
+   分からない —— 届かなかった、または `set -m` (job control) で process group を抜けた子孫が
+   pipe (stdout/stderr) を握ったまま残っていると、後始末の `communicate()` は EOF を無期限に
+   待ち、呼び出し元の `TimeoutExpired` すら上がらない (leak guard まで制御が返らない)。
+   `except BaseException:` 側の `proc.wait()` も対になる同じ形。どちらも
+   `CLEANUP_GRACE_SECONDS` (5.0s) を上限に置き、上限に達したら元の例外の代わりに
+   `ProcGroupCleanupError` を送出して報告するようにした。
+
+#### 所有の規則 (境界の中で取得する資源) — 4 モジュール横断
+
+| モジュール | 資源 | 正常出口 | 例外出口 | early return | 保証の形 |
+|---|---|---|---|---|---|
+| `leaked_descendants.py` `_scan_one` | pidfd (`_open_pidfd_verified`) | `Survivor` へ所有権を渡す (1 箇所) | **(6巡目まで漏れていた)** 内側 `try/finally` で close してから再送出 | pidfd 取得**前**の return は pidfd 自体が無いので該当なし | 構造的 (`try/finally`) |
+| `leaked_descendants.py` `kill_all`/`settle` | `Survivor.pidfd` (走査で束縛済み) | `_close_survivor_pidfds` で必ず閉じる (`kill_all` の全 return 経路、`settle` の再走査前) | 同左 (`_close_survivor_pidfds` 自体は例外を出さない設計) | `fatal` 早期 return でも `_close_survivor_pidfds` を経由 | 構造的 (全 return 直前に一括 close) |
+| `kill_budget.py` | なし (`/proc` の読み取りは `read_bytes()` で自動close) | — | — | — | 該当資源なし |
+| `proc_group.py` `run_in_own_group` | `Popen` (子プロセス・stdout/stderr pipe) | `communicate()`/`wait()` が reap、`kill_group` で残党も掃除 | **(6巡目で追加)** `except subprocess.TimeoutExpired` / `except BaseException` の両方で `kill_group` → 上限つき `communicate`/`wait`。上限に達したら `ProcGroupCleanupError` (プロセス自体は道連れにできず、残存リスクとして下記に記録) | なし (Popen 起動後は必ずどちらかの except かフォールスルーを通る) | 部分的 (通常経路は構造的。上限超過後の完全な reap は保証できない — 下記「残る穴」) |
+| `conftest.py` `idle_pane_shell` | `pty.fork()` の子 pid + master fd | `finally` で `kill` → `waitpid` → `close(fd)` (yield を挟んだ `try/finally`) | 同左 (`finally` は例外時も実行される) | デッドライン超過時も同じ `kill`/`waitpid`/`close` を実行してから `pytest.skip` | 構造的 (`try/finally`) |
+
+#### 待ちの規則 (待つ箇所を全部列挙・上限の有無・上限到達時の扱い)
+
+| モジュール・箇所 | 上限 | 上限到達時 |
+|---|---|---|
+| `leaked_descendants.py` `kill_all` の死亡確認ループ | あり (`GRACE_SECONDS`=1.5s) | **(6巡目まで欠落)** 死亡未確認のまま `killed` に含めて黙って返していた → `still_alive` フィールドを追加し `KillReport.describe()` で報告するようにした |
+| `leaked_descendants.py` `settle` の再走査ループ | あり (`GRACE_SECONDS`) | 到達時点の `Scan` (survivors/unobservable) をそのまま返す。呼び出し元 (`LeakGuard`) が `pytest.fail` / `warnings.warn` で必ず報告するので、ここでの黙殺はない (既存、変更なし) |
+| `proc_group.py run_in_own_group` の最初の `communicate(timeout=timeout)` | あり (呼び出し元指定) | `TimeoutExpired` をそのまま伝播 (既存、変更なし) |
+| `proc_group.py run_in_own_group` のタイムアウト後の後始末 `communicate()` | **(6巡目まで無し)** → `CLEANUP_GRACE_SECONDS`=5.0s | **(6巡目まで無限に待っていた)** → `ProcGroupCleanupError` を送出して伝播 |
+| `proc_group.py run_in_own_group` の `BaseException` 後の後始末 `wait()` | **(6巡目まで無し)** → `CLEANUP_GRACE_SECONDS`=5.0s | 同上 |
+| `conftest.py idle_pane_shell` の idle 安定待ちループ | あり (10.0s) | `else` 節で子を kill・waitpid・fd close してから `pytest.skip` (既存、変更なし) |
+| `conftest.py idle_pane_shell` の `finally` 内 `os.waitpid(pid, 0)` | **無し** (`waitpid` に timeout 引数は無い) | 対象は直前に自分で `SIGKILL` した pty の子であり、D state 等の例外を除けば実務上すぐ返る。この境界 (5〜6巡目の「例外の境界」) より前から存在するパターンで、`os.waitpid` を timeout 付きで書き直すには別の仕組み (`WNOHANG` ポーリング) が要り、この task の対象 4 モジュールのうち唯一 pty を扱う特殊な fixture であることも踏まえ、今回は直さず残存ギャップとして記録する |
+
+#### 握り潰しの規則 (`except …: pass` / `contextlib.suppress` を全部列挙・報告に出るか)
+
+| モジュール・箇所 | 握り潰す例外 | 報告に出るか |
+|---|---|---|
+| `leaked_descendants.py` `_close_survivor_pidfds` | `Exception` (`os.close` 失敗) | 出ない。POSIX 上 `close()` はエラーでも fd 自体は解放される規約のため実害が薄く、他の全箇所 (`_signal_one` 等) と同じ「後始末は失敗しても他件を止めない」という既存方針に合わせた既知の意図的な黙殺 |
+| `leaked_descendants.py` `_signal_one` (`ProcessLookupError`) | `ProcessLookupError` のみ | 出ないが「シグナル不要 (既に死亡)」という成功と等価な意味しか持たないので実害なし (既存) |
+| `kill_budget.py` `protected()` | `OSError` (`os.getsid(0)` / `os.getpgrp()`) | 出ない。読めなければ `keep` に追加されないだけで、真に致命的な保護 (自分・祖先・`pid<=1`) は別途 `ancestors(me)` で確保されている。`tests/CLAUDE.md` の「このファイルは変異させない」対象そのものであり、6巡目では手を入れず記録に留める |
+| `proc_group.py` `kill_group` | `Exception` (`os.killpg` — `PermissionError` 含む) | **出ない (これが P2-2 の根本原因)**。ただし kill_group 自体の戻り値を「成功したか」に変えるのではなく、呼び出し元 (`run_in_own_group`) 側で「後始末が上限内に終わったか」を見て `ProcGroupCleanupError` に変換する形にした — kill_group は他の 3 箇所 (`test_watchdog_idle.py` / `test_retirement.py` / 自身の別呼び出し) からも「例外を出さないこと」を前提に使われており、戻り値の意味を変える改修はそれらの呼び出し規約を壊すため見送った |
+| `proc_group.py` `kill_tree` (per-victim ループ) | `Exception` (`os.kill`) | 出ないが、対象は常に呼び出し元が直前に自分で作った子孫で、失敗しても他の victim の kill は続く (5巡目で確立した既存方針)。システム全体を走査する `leaked_descendants.scan()` とは信頼モデルが違うため 6巡目でも処置なし |
+| `conftest.py` `idle_pane_shell` の `finally` | `(ProcessLookupError, ChildProcessError)` | 出ないが、対象は自分が `pty.fork()` した子で、既に死んでいる/回収済みという想定内の状態のみを握り潰す (既存) |
+
+#### 残る穴 (処置なし、理由あり)
+
+- `run_in_own_group` が `ProcGroupCleanupError` を送出した後、`Popen` オブジェクト自体は
+  呼び出し元に返らない (例外を送出するため)。escaped した子孫がその後も生き続ける可能性はある
+  が、これは「殺せなかった」ことを**黙って隠さず例外で報告する**という 6巡目の主眼そのもの
+  であり、実際の子孫の掃除は `tests/leaked_descendants.py` の構造ガード (session finish の
+  再走査) が最後の網として引き継ぐ (このガード自身は同 uid 全体を見るので、pgid を抜けた
+  子孫であっても basetemp/marker で拾える)。
+- `conftest.py idle_pane_shell` の `os.waitpid(pid, 0)` に上限を付けなかった件は上表のとおり。

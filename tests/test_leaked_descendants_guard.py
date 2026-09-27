@@ -28,6 +28,7 @@ import pytest
 
 import kill_budget
 import leaked_descendants
+import proc_group
 from proc_group import descendants, kill_group, kill_tree, run_in_own_group
 
 TESTS_DIR = pathlib.Path(__file__).resolve().parent
@@ -618,6 +619,75 @@ def test_scan_one_boundary_return_contract_does_not_flip_to_permission_to_kill(m
     assert unobservable is True
 
 
+# --- 1e. pidfd の所有権 (6巡目 P2-1) -----------------------------------------------------
+
+@pytest.mark.skipif(not leaked_descendants.pidfd_supported(), reason="このカーネルは pidfd_open が使えない")
+def test_pidfd_is_closed_when_an_exception_happens_after_it_is_bound(monkeypatch, basetemp):
+    """`_open_pidfd_verified` が成功した**後** (wchan/cmdline の読み取りや `Survivor` の構築) で
+    例外が起きても、束縛済みの pidfd を閉じ忘れない (6巡目 P2-1)。
+
+    `_belongs` は cmdline を先に読むので、注入する例外の的は `_belongs` が触らない `wchan` に絞る
+    —— そうしないと pidfd を束縛する**前** (`_belongs` の中) で落ちてしまい、束縛済みの pidfd が
+    そもそも存在しない場面を検査することになる。
+    """
+    real_read_bytes = leaked_descendants._read_bytes
+
+    def _boom_on_wchan(path):
+        if str(path).endswith("/wchan"):
+            raise RuntimeError("injected: failure after the pidfd was already bound")
+        return real_read_bytes(path)
+
+    monkeypatch.setattr(leaked_descendants, "_read_bytes", _boom_on_wchan)
+
+    before = leaked_descendants.snapshot()
+    pid = _spawn_orphan()
+    try:
+        assert _wait_observable(pid), "孤児の environ が読めるようにならない (前提が崩れた)"
+        fds_before = len(os.listdir("/proc/self/fd"))
+        result = leaked_descendants.scan(before, _marker(), basetemp)
+        fds_after = len(os.listdir("/proc/self/fd"))
+
+        assert pid not in {s.pid for s in result.survivors}, \
+            "wchan の読み取りで例外を注入したのに生き残りに入った (境界が許可に倒れた)"
+        assert result.unobservable >= 1, "境界を通った例外が unobservable に数えられていない"
+        assert fds_after <= fds_before, (
+            f"pidfd を閉じ忘れて漏れた ({fds_before} → {fds_after} 個の開いている fd)")
+    finally:
+        os.kill(pid, signal.SIGKILL)
+    assert _wait_dead(pid)
+
+
+@pytest.mark.skipif(not leaked_descendants.pidfd_supported(), reason="このカーネルは pidfd_open が使えない")
+def test_kill_all_reports_a_pid_that_does_not_die_within_the_grace_period(basetemp):
+    """シグナル送信自体は成功として扱われても (`kill=` の差し替えで本物のシグナルは送らない)、
+    `GRACE_SECONDS` の上限まで待って死亡を確認できなければ、`killed` に紛れ込ませたまま黙って
+    返さず `still_alive` で報告する (6巡目、待ちの規則の横展開: 上限はあったが到達時に報告して
+    いなかった)。
+
+    pidfd が使えない環境では `kill_all` は束縛できなかった survivor を最初から `refused` に
+    回し `killed` へは入れない (族A: 観測失敗を許可に倒さない、が正しく効いている) ので、
+    この test の前提 (`killed` に入ってから still_alive で足止めされる) 自体が成立しない。
+    """
+    before = leaked_descendants.snapshot()
+    pid = _spawn_orphan()
+    try:
+        assert _wait_observable(pid), "孤児の environ が読めるようにならない (前提が崩れた)"
+        result = leaked_descendants.scan(before, _marker(), basetemp)
+        survivors = [s for s in result.survivors if s.pid == pid]
+        assert survivors, "対象の孤児を scan が見つけられていない (前提が崩れた)"
+
+        report = leaked_descendants.kill_all(survivors, kill=lambda s, sig: None)
+
+        assert pid in report.killed, "シグナル送信自体は成功として扱われるはず (killed に入る)"
+        assert pid in report.still_alive, (
+            f"本物のシグナルを送っていないので死んでいないはずが still_alive に出ていない: "
+            f"{report.still_alive}")
+        assert str(pid) in report.describe(), f"失敗メッセージに出ていない: {report.describe()!r}"
+    finally:
+        os.kill(pid, signal.SIGKILL)
+    assert _wait_dead(pid)
+
+
 # --- 2. 本物の欠陥を内側の pytest で ---------------------------------------------------------
 
 _INNER_CONFTEST = """\
@@ -729,6 +799,123 @@ def test_run_in_own_group_sweeps_a_child_left_after_bash_exits(tmp_path):
     assert done.returncode == 0
     child = int(marker_file.read_text().strip())
     assert _wait_dead(child), "bash が終わったあとに孫が残った"
+
+
+# --- 3b. kill_group 後の後始末に上限がない (6巡目 P2-2) ---------------------------------------
+#
+# `kill_group` は終了エラーを黙って握り潰す。届かなければ、(a) process group を抜けた子孫が
+# pipe を握ったまま残るか、(b) 対象そのものが生き続けるかのどちらかで、後始末の
+# `communicate()` / `wait()` に上限が無いと無期限に待つ。ここでは欠陥版が実際にブロックしうる
+# ので、経過時間の比較ではなく `signal.alarm` で本物のブロックを打ち切って区別する
+# (`test_unobservable_is_not_empty.py` の `_deadline` と同じ作法)。
+
+
+class _AlarmTimeout(Exception):
+    """`_hard_deadline` が本物のブロックを打ち切ったときに投げる。"""
+
+
+def _hard_deadline(seconds: float):
+    """`signal.alarm` でブロックを打ち切る。欠陥版 (上限なし) は実際に無期限へ入りうるので、
+    経過時間では「遅いだけ」と区別できない —— ブロックしたらここで例外にする。"""
+    def _fire(_signum, _frame):
+        raise _AlarmTimeout(f"{seconds}s 以内に返らなかった (ハングしている)")
+
+    class _Ctx:
+        def __enter__(self):
+            self.prev = signal.signal(signal.SIGALRM, _fire)
+            signal.alarm(int(seconds) + 1)
+
+        def __exit__(self, *exc):
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, self.prev)
+            return False
+
+    return _Ctx()
+
+
+def test_run_in_own_group_reports_when_a_descendant_outside_the_group_holds_the_pipe(tmp_path):
+    """P2-2 (1/2): `kill_group` (`os.killpg`) は自分のグループしか殺せない。`set -m`
+    (job control) で孫を別グループへ逃がすと、孫が stdout の pipe を握ったまま生き残る —— bash
+    自身は殺せても、書き手が残っている限り後始末の `communicate()` は EOF を待ち続ける。上限を
+    超えたら `ProcGroupCleanupError` で報告されること (欠陥版では `_hard_deadline` が代わりに
+    打ち切って赤にする)。"""
+    marker_file = tmp_path / "escaped_child_pid"
+    # bash 自身は最初のタイムアウトの標的。set -m で孫 (sleep) を別グループへ逃がすが、
+    # リダイレクトしない (孫は bash の stdout パイプをそのまま継承する)。
+    cmd = ["bash", "-c", f"set -m; sleep 60 & echo $! > {marker_file}; wait"]
+    try:
+        with pytest.raises((proc_group.ProcGroupCleanupError, _AlarmTimeout)) as excinfo:
+            with _hard_deadline(1.0 + proc_group.CLEANUP_GRACE_SECONDS + 5.0):
+                proc_group.run_in_own_group(cmd, timeout=1.0)
+        assert not isinstance(excinfo.value, _AlarmTimeout), (
+            "上限時間内に ProcGroupCleanupError で報告されず、外側のハード打ち切りに頼った "
+            "(= 欠陥が直っていない)")
+    finally:
+        deadline = time.monotonic() + 3
+        while not marker_file.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        if marker_file.exists():
+            try:
+                os.kill(int(marker_file.read_text().strip()), signal.SIGKILL)
+            except (ValueError, ProcessLookupError):
+                pass
+
+
+def test_run_in_own_group_reports_when_kill_group_swallows_a_permission_error(monkeypatch, tmp_path):
+    """P2-2 (2/2): `kill_group` が `PermissionError` (資格情報の変化・セキュリティ制約) を握り
+    潰すと、シグナルは実際には届かず子は生き続ける。上限が無ければ後始末の `communicate()` は
+    孫が開いたままの pipe の EOF を無期限に待つ。"""
+    marker_file = tmp_path / "bash_pid"
+
+    def _denied_killpg(pgid, sig):
+        raise PermissionError("injected: killpg denied (simulating a credential/security restriction)")
+
+    monkeypatch.setattr(os, "killpg", _denied_killpg)
+
+    cmd = ["bash", "-c", f"echo $$ > {marker_file}; sleep 60"]
+    try:
+        with pytest.raises((proc_group.ProcGroupCleanupError, _AlarmTimeout)) as excinfo:
+            with _hard_deadline(1.0 + proc_group.CLEANUP_GRACE_SECONDS + 5.0):
+                proc_group.run_in_own_group(cmd, timeout=1.0)
+        assert not isinstance(excinfo.value, _AlarmTimeout), (
+            "kill_group が PermissionError を握り潰したのに、上限時間内に報告されなかった "
+            "(= 欠陥が直っていない)")
+    finally:
+        deadline = time.monotonic() + 3
+        while not marker_file.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        if marker_file.exists():
+            try:
+                os.kill(int(marker_file.read_text().strip()), signal.SIGKILL)
+            except (ValueError, ProcessLookupError):
+                pass
+
+
+def test_run_in_own_group_reports_when_the_wait_after_an_unexpected_exception_does_not_return(
+        monkeypatch):
+    """P2-2 の対になるもう一方の分岐 (`except BaseException:`): `communicate()` 自体が
+    (`TimeoutExpired` 以外の) 予期しない例外を出した場合も、`kill_group` の後の `wait()` に
+    上限がある。実プロセスの pipe 芸に頼らず `Popen` を差し替えて決定的に再現する (この分岐は
+    タイムアウト以外の場面でしか起きないので、実プロセスで安全に再現するのが難しい)。"""
+
+    class _StuckPopen:
+        pid = 999999
+
+        def __init__(self, *a, **k):
+            pass
+
+        def communicate(self, timeout=None):
+            raise RuntimeError("injected: unexpected failure during communicate")
+
+        def wait(self, timeout=None):
+            # kill_group を送っても子が終わらない体 (D state 等) を模す。
+            raise subprocess.TimeoutExpired(cmd="stuck", timeout=timeout)
+
+    monkeypatch.setattr(subprocess, "Popen", _StuckPopen)
+    monkeypatch.setattr(proc_group, "kill_group", lambda proc: None)
+
+    with pytest.raises(proc_group.ProcGroupCleanupError):
+        proc_group.run_in_own_group(["true"], timeout=5)
 
 
 def _spawn_shell_with_background_job(tmp_path, name):

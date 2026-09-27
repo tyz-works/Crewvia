@@ -99,12 +99,35 @@ def kill_tree(pid: int) -> None:
             pass
 
 
+#: `kill_group` の後の後始末 (communicate/wait) に許す上限秒数 (6巡目 P2-2)。
+CLEANUP_GRACE_SECONDS = 5.0
+
+
+class ProcGroupCleanupError(RuntimeError):
+    """`kill_group` の後の後始末 (`communicate()` / `wait()`) が上限時間内に終わらなかった。
+
+    `kill_group` は終了エラー (`PermissionError` 等) を握り潰すので、シグナルが届かなかった
+    ことは戻り値からは分からない。届かなかった場合、止まった子孫が pipe (stdout/stderr) を
+    開いたまま残るか、`os.killpg` の対象グループを抜けた子孫がまだ生きているかのどちらかで、
+    上限なしの `communicate()` / `wait()` は無期限に待つ (6巡目 P2-2)。ここで上限を切って
+    例外にすることで、「後始末に失敗した」という事実そのものを呼び出し元 (延いては leak guard)
+    に伝播する —— 黙って進まない。
+    """
+
+
 def run_in_own_group(cmd, *, timeout, env=None, cwd=None, text=True, capture_output=True):
     """`subprocess.run(..., timeout=)` と同じ形で、タイムアウト時にグループごと kill する。
 
     タイムアウトしたら `subprocess.TimeoutExpired` を **そのまま** 上げる (呼び出し側の
     「返らなかったら赤」の判定を変えない)。終わったあとも、正常終了・異常終了を問わずグループを
     掃除する (bash が先に終わって python だけ残る形も止める)。
+
+    `kill_group` の後の後始末 (パイプが閉じるのを待つ `communicate()` / 子の終了を待つ `wait()`)
+    には `CLEANUP_GRACE_SECONDS` の上限を置く (6巡目 P2-2)。`kill_group` は
+    `PermissionError` を含む終了エラーを黙って握り潰すので、シグナルが実際に届いたかは
+    ここでは分からない —— 届かなかった、または process group を抜けた子孫が pipe を保持したまま
+    残っていると、上限なしの待ちは無期限に止まり、呼び出し元の `TimeoutExpired` すら上がらない
+    (leak guard まで制御が返らない)。上限に達したら `ProcGroupCleanupError` を送出して報告する。
     """
     kwargs = {"env": env, "cwd": cwd, "text": text, "start_new_session": True}
     if capture_output:
@@ -115,12 +138,24 @@ def run_in_own_group(cmd, *, timeout, env=None, cwd=None, text=True, capture_out
         stdout, stderr = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired as exc:
         kill_group(proc)
-        # 読み手がいなくなったパイプは空になるので、ここで待っても返る。
-        exc.stdout, exc.stderr = proc.communicate()
+        # 読み手がいなくなったパイプは通常ここで返るが、kill_group が終了に失敗した相手や
+        # group を抜けた子孫が pipe を握ったままだと返らない —— 上限を切って報告する。
+        try:
+            exc.stdout, exc.stderr = proc.communicate(timeout=CLEANUP_GRACE_SECONDS)
+        except subprocess.TimeoutExpired as cleanup_exc:
+            raise ProcGroupCleanupError(
+                f"run_in_own_group: {cmd!r} がタイムアウトし kill_group を送ったが、"
+                f"{CLEANUP_GRACE_SECONDS}s 待っても後始末 (pipe を握った子孫の可能性) が"
+                f"終わらなかった") from cleanup_exc
         raise
     except BaseException:
         kill_group(proc)
-        proc.wait()
+        try:
+            proc.wait(timeout=CLEANUP_GRACE_SECONDS)
+        except subprocess.TimeoutExpired as cleanup_exc:
+            raise ProcGroupCleanupError(
+                f"run_in_own_group: {cmd!r} の後始末中に例外が起き kill_group を送ったが、"
+                f"{CLEANUP_GRACE_SECONDS}s 待っても子の終了を確認できなかった") from cleanup_exc
         raise
     kill_group(proc)
     return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)

@@ -376,6 +376,19 @@ def _scan_one(pid: int, marker: bytes, base: bytes, boot_now: float, hz: int,
     ゾンビ・別ユーザー・走査中に消えた (stat が読めなくなった) は**想定内**の「この pid は対象では
     ない」であり、観測に失敗したわけではないので `unobservable` には数えない (最内の try/except で
     個別に扱う。外側の `except Exception` はここに書いていない**未知の**失敗のための最後の網)。
+
+    ## pidfd の所有権 (6巡目 P2-1)
+
+    `_open_pidfd_verified` が束縛に成功すると、その fd の所有者はこの関数になる。正常出口は
+    `Survivor` を作ってそこへ所有権を渡す 1 つだけ —— それ以降は `kill_all` / `settle` /
+    `_close_survivor_pidfds` が最終的に閉じる。所有権を渡す**前** (cmdline / wchan の読み取り、
+    `Survivor` の構築そのもの) で例外が起きると、外側の `except Exception` がそれを「観測できな
+    かった」に変えて pid を 1 つ進めるが、それだけでは **fd を閉じ忘れる** —— 束縛済みの pidfd は
+    ローカル変数のまま参照が失われ、GC 頼みになる (確実な即時解放ではない。settle の繰り返しで
+    fd を使い切りうる)。「観測できなかった」への変換は境界の**外側**で起きるが、fd の後始末は
+    それより**内側** (所有権が確定する前) で閉じる必要があるので、pidfd 取得から `Survivor` 構築
+    までを内側の `try/finally` で囲み、`Survivor` を返す前に例外が起きたら finally で閉じてから
+    再送出する (境界の外側の `except Exception` がそれを拾って unobservable に変える)。
     """
     try:
         stat = _read_stat(pid)
@@ -395,27 +408,53 @@ def _scan_one(pid: int, marker: bytes, base: bytes, boot_now: float, hz: int,
         # 観測した瞬間に破壊用の pidfd を束縛する (finding 3)。ここより後で pid が
         # 再利用されても、kill_all は必ずこの fd 経由で送るので誤った相手には届かない。
         pidfd = _open_pidfd_verified(pid, start)
-        cmd = _read_bytes(_PROC / str(pid) / "cmdline") or b""
-        wchan = (_read_bytes(_PROC / str(pid) / "wchan") or b"").decode(errors="replace")
-        survivor = Survivor(
-            pid, ppid, state, max(0.0, boot_now - start / hz), wchan,
-            cmd.replace(b"\0", b" ").decode(errors="replace").strip(), why, pidfd=pidfd)
+        try:
+            cmd = _read_bytes(_PROC / str(pid) / "cmdline") or b""
+            wchan = (_read_bytes(_PROC / str(pid) / "wchan") or b"").decode(errors="replace")
+            survivor = Survivor(
+                pid, ppid, state, max(0.0, boot_now - start / hz), wchan,
+                cmd.replace(b"\0", b" ").decode(errors="replace").strip(), why, pidfd=pidfd)
+        except Exception:
+            # 所有権は Survivor へまだ渡っていない —— ここで閉じないと束縛した fd が
+            # 参照を失ったまま漏れる (6巡目 P2-1)。外側の except Exception へ再送出して
+            # 「観測できなかった」の扱いへ合流させる (境界の意味は変えない)。
+            if pidfd is not None:
+                try:
+                    os.close(pidfd)
+                except OSError:
+                    pass
+            raise
         return survivor, False
     except Exception:
         return None, True
 
 
 class KillReport:
-    """`kill_all` の結果。`refused` は関門が断った件、`fatal` は 1 件も殺さなかった理由。"""
+    """`kill_all` の結果。`refused` は関門が断った件、`fatal` は 1 件も殺さなかった理由。
 
-    def __init__(self, killed: list[int], refused: list, fatal: str | None):
+    `still_alive` (6巡目、待ちの規則の横展開): シグナルは送れた (`killed` に入る) が、
+    `GRACE_SECONDS` の上限まで待っても死んだことを確認できなかった pid。この上限つきの
+    待ちループ自体は 2 巡目から存在するが、上限に達したあと `killed` に残したまま黙って
+    返しており (「殺した」と「殺せたはず」を区別しない)、呼び出し元が死亡を確認しないまま
+    次のテストへ進みうる (待ちの規則: 上限に達したら黙って進まず報告する、に対する欠落)。
+    ここに残る場合の典型は D state (割り込み不可能な sleep) で、SIGKILL 自体は配送されても
+    実際に終了するまで待たされる。
+    """
+
+    def __init__(self, killed: list[int], refused: list, fatal: str | None,
+                 still_alive: list[int] | None = None):
         self.killed, self.refused, self.fatal = killed, refused, fatal
+        self.still_alive = list(still_alive) if still_alive else []
 
     def describe(self) -> str:
         lines = []
         if self.fatal:
             lines.append(f"  !! kill を全件見送った (ガードの判定が壊れている疑い): {self.fatal}")
         lines += [f"  - kill しなかった {r.describe()}" for r in self.refused]
+        if self.still_alive:
+            lines.append(
+                f"  !! シグナルは送ったが {GRACE_SECONDS}s 待っても死亡を確認できなかった: "
+                f"{self.still_alive} (D state 等の疑い。次のテストへそのまま残るおそれがある)")
         return "\n".join(lines)
 
 
@@ -488,13 +527,17 @@ def kill_all(survivors: list[Survivor], kill=None) -> KillReport:
             refused.append(kill_budget.Refusal(
                 pid, f"シグナルを送れなかった ({type(exc).__name__}: {exc}) — 他の survivor の処理は続ける"))
     deadline = time.monotonic() + GRACE_SECONDS
+    alive: list[int] = list(attempted)
     while time.monotonic() < deadline:
         alive = [pid for pid in attempted if (_read_stat(pid) or ("Z",))[0] not in ("Z", "X")]
         if not alive:
             break
         time.sleep(_POLL_SECONDS)
     _close_survivor_pidfds(survivors)
-    return KillReport(attempted, refused, None)
+    # 上限 (GRACE_SECONDS) に達しても死亡を確認できなかった pid は、黙って「殺した」に
+    # 含めたままにしない —— still_alive で呼び出し元 (format_failure 経由の失敗メッセージ)
+    # に報告する (6巡目、待ちの規則の横展開)。
+    return KillReport(attempted, refused, None, still_alive=alive)
 
 
 def settle(exclude: set[int], marker_value: str, basetemp: str) -> Scan:

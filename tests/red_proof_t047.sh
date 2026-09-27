@@ -529,6 +529,76 @@ inject tests/leaked_descendants.py \
         return None, True"
 expect_red "case M" "test_scan_one_boundary_catches_an_arbitrary_exception_from_belongs"
 
+echo "== case N: _scan_one が pidfd 束縛後の例外で fd を閉じ忘れる (6巡目 P2-1、この task の主眼)"
+fresh_copy
+inject tests/leaked_descendants.py \
+'        pidfd = _open_pidfd_verified(pid, start)
+        try:
+            cmd = _read_bytes(_PROC / str(pid) / "cmdline") or b""
+            wchan = (_read_bytes(_PROC / str(pid) / "wchan") or b"").decode(errors="replace")
+            survivor = Survivor(
+                pid, ppid, state, max(0.0, boot_now - start / hz), wchan,
+                cmd.replace(b"\0", b" ").decode(errors="replace").strip(), why, pidfd=pidfd)
+        except Exception:
+            # 所有権は Survivor へまだ渡っていない —— ここで閉じないと束縛した fd が
+            # 参照を失ったまま漏れる (6巡目 P2-1)。外側の except Exception へ再送出して
+            # 「観測できなかった」の扱いへ合流させる (境界の意味は変えない)。
+            if pidfd is not None:
+                try:
+                    os.close(pidfd)
+                except OSError:
+                    pass
+            raise
+        return survivor, False' \
+'        pidfd = _open_pidfd_verified(pid, start)
+        cmd = _read_bytes(_PROC / str(pid) / "cmdline") or b""
+        wchan = (_read_bytes(_PROC / str(pid) / "wchan") or b"").decode(errors="replace")
+        survivor = Survivor(
+            pid, ppid, state, max(0.0, boot_now - start / hz), wchan,
+            cmd.replace(b"\0", b" ").decode(errors="replace").strip(), why, pidfd=pidfd)
+        return survivor, False'
+expect_red "case N" "test_pidfd_is_closed_when_an_exception_happens_after_it_is_bound"
+
+echo "== case O: kill_all が GRACE_SECONDS を超えても死亡未確認の pid を still_alive で報告しない (6巡目、待ちの規則の横展開)"
+fresh_copy
+inject tests/leaked_descendants.py \
+'    _close_survivor_pidfds(survivors)
+    # 上限 (GRACE_SECONDS) に達しても死亡を確認できなかった pid は、黙って「殺した」に
+    # 含めたままにしない —— still_alive で呼び出し元 (format_failure 経由の失敗メッセージ)
+    # に報告する (6巡目、待ちの規則の横展開)。
+    return KillReport(attempted, refused, None, still_alive=alive)' \
+'    _close_survivor_pidfds(survivors)
+    return KillReport(attempted, refused, None)'
+expect_red "case O" "test_kill_all_reports_a_pid_that_does_not_die_within_the_grace_period"
+
+echo "== case P: run_in_own_group が kill_group 後の communicate() を上限なしで待つと、脱走した子孫の pipe で無期限に止まる (6巡目 P2-2 そのもの)"
+fresh_copy
+inject tests/proc_group.py \
+'        try:
+            exc.stdout, exc.stderr = proc.communicate(timeout=CLEANUP_GRACE_SECONDS)
+        except subprocess.TimeoutExpired as cleanup_exc:
+            raise ProcGroupCleanupError(
+                f"run_in_own_group: {cmd!r} がタイムアウトし kill_group を送ったが、"
+                f"{CLEANUP_GRACE_SECONDS}s 待っても後始末 (pipe を握った子孫の可能性) が"
+                f"終わらなかった") from cleanup_exc' \
+'        exc.stdout, exc.stderr = proc.communicate()'
+# このケースは欠陥版だと実際にハングしうる (テスト自身の signal.alarm が打ち切って赤にする)。
+# run_py 自体は待つだけなので、通常の expect_red と同じ形で安全に使える
+# (テストの中の alarm が pytest プロセスを止めずに例外へ変える)。
+expect_red "case P" "test_run_in_own_group_reports_when_a_descendant_outside_the_group_holds_the_pipe"
+
+echo "== case Q: run_in_own_group が kill_group 後の wait() を上限なしで待つ (6巡目 P2-2、except BaseException 側の対になる分岐)"
+fresh_copy
+inject tests/proc_group.py \
+'        try:
+            proc.wait(timeout=CLEANUP_GRACE_SECONDS)
+        except subprocess.TimeoutExpired as cleanup_exc:
+            raise ProcGroupCleanupError(
+                f"run_in_own_group: {cmd!r} の後始末中に例外が起き kill_group を送ったが、"
+                f"{CLEANUP_GRACE_SECONDS}s 待っても子の終了を確認できなかった") from cleanup_exc' \
+'        proc.wait()'
+expect_red "case Q" "test_run_in_own_group_reports_when_the_wait_after_an_unexpected_exception_does_not_return"
+
 echo
 echo "PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ]

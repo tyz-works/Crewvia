@@ -16,12 +16,17 @@ set -euo pipefail
 #   plan.sh init "<title>" [--mission <slug>] [--force]
 #   plan.sh add  "<title>" [--mission <slug>] --skills <csv> [--blocked-by <csv>]
 #                          [--priority high|medium|low] [--description <text>]
+#                          [--deliverable pr|file|none]
+#                              --deliverable: この task の成果物の宣言。pr = PR を作る / file = ファイルを作る /
+#                              none = 作らない。lint は宣言と config/skill-permissions.yaml の
+#                              can_produce_deliverable を突き合わせ、done は pr の task に --pr か --no-pr を求める
 #   plan.sh pull [--mission <slug>] [--skills <csv>] [--agent <name>] [--target-dir <path>]
 #                [--task <task_id>]
 #                              --skills 省略時は環境変数 SKILLS → registry の Worker の skills の順。
 #                              どれも無ければ拒否 (skill の絞り込みを丸ごと無効にしない)。
 #                              Director (registry の role: director) は pull できない
 #   plan.sh done <task_id> "<result>" [--mission <slug>] (--pr <N> | --no-pr "<理由>")
+#                              deliverable: pr の task は --pr か --no-pr が必須 (無いと拒否。exit 2・何も書かない)
 #                              --pr <N>: この task の PR 番号。この task を blocked_by に持つ
 #                              codex-review / review の task に pr_number を書く (未設定のものだけ)。
 #                              codex-review が blocked なら pending に戻す。Result からは推測しない
@@ -30,7 +35,7 @@ set -euo pipefail
 #   plan.sh fail <task_id> [<handoff_path>] (--head <sha> | --no-head <理由>) [--mission <slug>]
 #   plan.sh update <task_id> [--mission <slug>] [--skills <csv>] [--blocked-by <csv>]
 #                            [--priority high|medium|low] [--worker <name>] [--status <status>]
-#                            [--description <text>] [--reset]
+#                            [--description <text>] [--reset] [--deliverable pr|file|none]
 #   plan.sh release-dep <task_id> [--dep <csv>] [--mission <slug>]
 #                              failed の依存で保留されている task を、Director が明示的に
 #                              進めてよいと決める (省略時は今 failed の依存すべて)。
@@ -515,7 +520,7 @@ def _dump_inline(val):
 TASK_META_KEY_ORDER = [
     'id', 'title', 'skills', 'priority', 'status',
     'blocked_by', 'released_deps', 'timeout', 'target_dir', 'worker', 'started_at', 'completed_at',
-    'handoff_path', 'fail_head', 'fail_head_waiver', 'pr_number', 'no_pr_waiver',
+    'handoff_path', 'fail_head', 'fail_head_waiver', 'pr_number', 'no_pr_waiver', 'deliverable',
     'acceptance_criteria', 'verification', 'rework_count', 'max_rework',
     'qa_checkpoints', 'required_evidence', 'needs_director_reason',
 ]
@@ -715,7 +720,11 @@ def task_path(slug, task_id):
     return os.path.join(tasks_dir(slug), f"{task_id}.md")
 
 
-MISSION_KEY_ORDER = ['title', 'slug', 'status', 'created_at', 'completed_at', 'next_task_id', 'max_review_cycles', 'review']
+MISSION_KEY_ORDER = ['title', 'slug', 'status', 'created_at', 'completed_at', 'next_task_id', 'max_review_cycles',
+                     'deliverable_required', 'review']
+
+#: task の成果物の宣言 (`--deliverable`)。lint_plan.py の VALID_DELIVERABLES と同じ集合。
+DELIVERABLE_VALUES = ('pr', 'file', 'none')
 
 
 def try_read_queue_file(path, newline=None):
@@ -2499,17 +2508,18 @@ USAGE = {
     'add': ('plan.sh add "<title>" [--mission <slug>] --skills <csv> [--blocked-by <csv>]\n'
             '                     [--priority high|medium|low] [--description <text>]\n'
             '                     [--target-dir <path>] [--idle-timeout <s>] [--max-timeout <s>]\n'
-            '                     [--pr-number <N>]'),
+            '                     [--pr-number <N>] [--deliverable pr|file|none]'),
     'pull': ('plan.sh pull [--mission <slug>] [--skills <csv>] [--agent <name>]\n'
              '                    [--target-dir <path>] [--task <task_id>]'),
     'done': ('plan.sh done <task_id> "<result>" [--mission <slug>] [--pr <N>]\n'
-             '                    [--no-pr "<理由>"]   (--pr / --no-pr は codex-review が待っているときだけ必須)'),
+             '                    [--no-pr "<理由>"]   (--pr / --no-pr は codex-review が待っているとき・deliverable: pr の task で必須)'),
     'needs-director': 'plan.sh needs-director <task_id> "<理由>" [--mission <slug>]',
     'fail': ('plan.sh fail <task_id> [<handoff_path>] (--head <sha> | --no-head "<理由>")\n'
              '                     [--mission <slug>]'),
     'update': ('plan.sh update <task_id> [--mission <slug>] [--skills <csv>] [--blocked-by <csv>]\n'
                '                       [--priority high|medium|low] [--worker <name>] [--status <status>]\n'
-               '                       [--description <text>] [--reset] [--pr-number <N>]'),
+               '                       [--description <text>] [--reset] [--pr-number <N>]\n'
+               '                       [--deliverable pr|file|none]'),
     'release-dep': 'plan.sh release-dep <task_id> [--dep <csv>] [--mission <slug>]',
     'retire': ('plan.sh retire <task_id> --agent <name> --started-at <generation>\n'
                '                       [--mission <slug>] [--outcome reset|needs-director]\n'
@@ -2686,6 +2696,9 @@ def cmd_init(args):
             'completed_at': None,
             'next_task_id': 1,
             'max_review_cycles': 3,
+            # この印のある (= この機能より後に init された) mission だけ、lint が全 task に
+            # deliverable の宣言を求める。印の無い既存 mission は求められない (t013)。
+            'deliverable_required': True,
             'review': {
                 'last_verdict': None,
                 'cycle_count': 0,
@@ -2713,6 +2726,19 @@ def cmd_init(args):
         taskvia_sync_workers()
 
 
+def _parse_deliverable_opt(opts):
+    """`--deliverable` の値を検証して返す (無ければ None)。不正値は exit 2 で、何も書かない。
+
+    add / update が、queue に触れる前に呼ぶ (PR2 の厳格引数の規則)。
+    """
+    if opts.get('--deliverable') is None:
+        return None
+    value = opts['--deliverable'].strip()
+    if value not in DELIVERABLE_VALUES:
+        _usage_exit(f"--deliverable は {'|'.join(DELIVERABLE_VALUES)} のどれか (got {opts['--deliverable']!r})")
+    return value
+
+
 def cmd_add(args):
     opts, positional = parse_opts(args, {
         '--mission': 'value',
@@ -2724,9 +2750,11 @@ def cmd_add(args):
         '--idle-timeout': 'value',
         '--max-timeout': 'value',
         '--pr-number': 'value',
+        '--deliverable': 'value',
     })
     if not positional:
         die("add requires a task title")
+    deliverable = _parse_deliverable_opt(opts)
     title = positional[0]
     sync_holder = [None]  # (slug, task_id, title, skills, priority, blocked_by)
 
@@ -2803,6 +2831,8 @@ def cmd_add(args):
             meta['timeout'] = timeout
         if pr_number is not None:
             meta['pr_number'] = pr_number
+        if deliverable is not None:
+            meta['deliverable'] = deliverable
         body = build_task_body(description, '')
         save_task(slug, task_id, meta, body)
         sync_holder[0] = (slug, task_id, title, skills, priority, blocked_by)
@@ -3806,6 +3836,22 @@ def cmd_done(args):
         # 誰にも知らされず、Codex を通らずに merge されうる。--pr も --no-pr も無いなら、
         # 何も書かずに断る (fail の --head / --no-head と同じ作法)。
         if pr_number is None and no_pr_reason is None:
+            # task 自身の宣言 (t013 / #31): `deliverable: pr` は PR を作る task なので、番号を待つ
+            # codex-review が居なくても --pr が要る。宣言が読めない値 (手で書き換えた card) のときは
+            # PR を作る task かどうか決められないので、同じく拒否する (「読めない」を「宣言なし」にしない)。
+            declared = meta.get('deliverable')
+            if declared == 'pr' or (declared is not None and declared not in DELIVERABLE_VALUES):
+                what = ("この task は deliverable: pr (PR を作る task) です" if declared == 'pr' else
+                        f"card の deliverable が読めない値です ({declared!r}。valid: {'|'.join(DELIVERABLE_VALUES)})")
+                die(
+                    f"[plan.sh] {task_id}: {what}。--pr が無いと PR 番号が記録されず、後続の codex-review が"
+                    f" 走らないまま merge されえます。何も書いていません。\n"
+                    f"  PR を作った: plan.sh done {task_id} \"<result>\" --pr <N> --mission {slug}\n"
+                    f"  PR を作らなかった: plan.sh done {task_id} \"<result>\" "
+                    f"--no-pr \"<理由 1 行>\" --mission {slug}   (理由は card の no_pr_waiver に残る)\n"
+                    f"  宣言が違う: plan.sh update {task_id} --deliverable {'|'.join(DELIVERABLE_VALUES)} --mission {slug}",
+                    USAGE_EXIT,
+                )
             awaiting = codex_reviews_awaiting_pr(slug, task_id)
             if awaiting:
                 die(
@@ -5116,10 +5162,12 @@ def cmd_update(args):
         '--description': 'value',
         '--reset': 'bool',
         '--pr-number': 'value',
+        '--deliverable': 'value',
     })
 
     if not positional:
         die("update requires a task_id (e.g. t005)")
+    deliverable = _parse_deliverable_opt(opts)
     task_id = positional[0]
 
     # Validate task_id format
@@ -5254,6 +5302,10 @@ def cmd_update(args):
                     die("--pr-number must be a positive integer (or 'null' to clear)")
                 meta['pr_number'] = n
                 changed.append(f"pr_number={n}")
+
+        if deliverable is not None:
+            meta['deliverable'] = deliverable
+            changed.append(f"deliverable={deliverable}")
 
         if not changed:
             print(f"update {slug}/{task_id}: nothing to do (no fields specified)", file=sys.stderr)

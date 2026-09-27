@@ -9,6 +9,12 @@
 #   - Bash コマンド:    "Bash(npm *)", "Bash(git *)"
 #   - ワイルドカード:   fnmatch 準拠 (* は任意文字列)
 #
+# can_produce_deliverable: (省略可) false のスキルだけでは、PR やファイルという成果物を
+#   作れない (Write / Edit を持たない・実行が hook の外にある)。`plan.sh lint` が
+#   task の `deliverable: pr|file` と突き合わせる **唯一の情報源** (lint_plan.py に
+#   スキル名は書かない)。欄が無い = 作れる。skills が全部 false の task に成果物を
+#   宣言すると lint が FAIL する。値は true / false のどちらかだけ (他は lint が FAIL)。
+#
 # SAFE_TOOLS (Read, Grep, Glob, WebSearch 等) は hook で既にスキップされるため
 # ここに記載不要。
 #
@@ -103,6 +109,7 @@ skills:
     deny: []
 
   research:
+    can_produce_deliverable: false
     allow: []
     deny:
       - "Edit"
@@ -111,6 +118,7 @@ skills:
       - "Bash(git push *)"
 
   review:
+    can_produce_deliverable: false
     allow:
       - "Bash(gh pr *)"
       - "Bash(gh api *)"
@@ -143,6 +151,7 @@ skills:
   # 参考として review skill 相当の意図 (read-only な gh/git 操作 + レビュー
   # レポート) をコメントで残す。
   codex-review:
+    can_produce_deliverable: false
     allow: []
     deny: []
 
@@ -203,6 +212,7 @@ skills:
       - "Bash(gh pr merge*)"
 
   verify:
+    can_produce_deliverable: false
     allow:
       - "Read(**)"
       - "Grep(**)"
@@ -227,6 +237,7 @@ skills:
       - "Bash(mv*)"
 
   planning:
+    can_produce_deliverable: false
     allow:
       - "Bash(*/plan.sh status*)"
       - "Bash(*/plan.sh pull*)"
@@ -242,6 +253,7 @@ skills:
       - "Bash(git push*)"
 
   plan_review:
+    can_produce_deliverable: false
     allow:
       - "Read(**)"
       - "Grep(**)"

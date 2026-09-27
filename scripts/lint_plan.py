@@ -352,6 +352,149 @@ def check_timeout_validity(tasks: list[dict], timeout_profiles_path: str) -> lis
 
 
 # ---------------------------------------------------------------------------
+# Module 5: Deliverable declaration check (t013 / backlog #31)
+# ---------------------------------------------------------------------------
+#
+# 「PR を作る task に Write 禁止の skill を付けた」を、スキル名からの推測ではなく task の
+# **宣言** (`deliverable: pr|file|none`) と、config/skill-permissions.yaml の
+# `can_produce_deliverable` 欄の突き合わせで落とす。このファイルにスキル名は書かない
+# (判定の情報源は config の 1 箇所だけ。スキルを足したら config の欄を足す)。
+
+VALID_DELIVERABLES = ('pr', 'file', 'none')
+
+#: 成果物 (PR / file) を宣言した task にだけ、skills との突き合わせが効く。
+DELIVERABLES_THAT_NEED_A_WRITER = ('pr', 'file')
+
+_CAPABILITY_LINE = re.compile(r'^    can_produce_deliverable:\s*([^#\s]*)\s*(?:#.*)?$')
+
+
+def _load_deliverable_capabilities(skill_permissions_path: str) -> tuple[dict, Optional[str]]:
+    """`{skill: True | False | <不正な値の文字列>}` と、読めなかった理由 (読めたら None)。
+
+    欄の無いスキルは辞書に載せない (= 呼び出し側は「作れる」と読む)。値は `true` / `false` の
+    どちらかだけを受け入れ、それ以外は **文字列のまま** 返す (truthiness で False に潰さない —
+    `flase` と書き間違えたスキルを「作れる」にも「作れない」にも黙って倒さないため)。
+    """
+    try:
+        with open(skill_permissions_path, encoding='utf-8') as f:
+            content = f.read()
+    except (OSError, UnicodeDecodeError) as e:
+        return {}, f"{skill_permissions_path}: {type(e).__name__}: {e}"
+    caps: dict = {}
+    in_skills = False
+    current: Optional[str] = None
+    for line in content.splitlines():
+        if re.match(r'^skills:\s*$', line):
+            in_skills = True
+            continue
+        if not in_skills:
+            continue
+        m = re.match(r'^  ([a-zA-Z_][a-zA-Z0-9_-]*):\s*$', line)
+        if m:
+            current = m.group(1)
+            continue
+        if line and not line.startswith(' ') and not line.startswith('#'):
+            in_skills = False
+            current = None
+            continue
+        cm = _CAPABILITY_LINE.match(line)
+        if cm and current is not None:
+            raw = cm.group(1)
+            caps[current] = {'true': True, 'false': False}.get(raw, raw)
+    return caps, None
+
+
+def _mission_requires_deliverable(slug: str, queue_dir: str) -> tuple[bool, Optional[str]]:
+    """mission.yaml の `deliverable_required` を読む。`(必須か, 読めなかった理由)`。
+
+    印が無い (キーが無い・mission.yaml 自体が無い = ENOENT だけ) mission は「必須でない」。
+    それ以外の読み取り失敗・`true` / `false` 以外の値は、必須かどうか決められないので理由を返す
+    (呼び出し側が FAIL にする — 「読めない」を「印が無い」に潰さない)。
+    """
+    path = os.path.join(queue_dir, 'missions', slug, 'mission.yaml')
+    try:
+        with open(path, encoding='utf-8') as f:
+            text = f.read()
+    except FileNotFoundError:
+        return False, None
+    except (OSError, UnicodeDecodeError) as e:
+        return False, f"{path}: {type(e).__name__}: {e}"
+    value = _parse_minimal_yaml(text).get('deliverable_required')
+    if value is None or value is False:
+        return False, None
+    if value is True:
+        return True, None
+    return False, f"{path}: deliverable_required は true / false のどちらかだけ (got {value!r})"
+
+
+def check_deliverable(tasks: list[dict], skill_permissions_path: str,
+                      required: bool = False,
+                      required_problem: Optional[str] = None) -> list[tuple[str, str, str]]:
+    """`deliverable` 宣言の検査。Returns list of (level, category, message).
+
+    * 値は pr / file / none のどれか (印の有無にかかわらず、書かれていれば検査する)。
+    * `required` (この mission が deliverable 必須の印を持つ) なら、全 task が宣言を持つ。
+    * `pr` / `file` を宣言した task の skills が **すべて** `can_produce_deliverable: false`
+      なら FAIL (印の有無にかかわらず効く)。欄の無い・config に載っていないスキルは
+      「作れる」側 (未知のスキルは別に skill 検査が WARN する)。
+    """
+    results: list[tuple[str, str, str]] = []
+    caps: Optional[dict] = None
+    caps_problem: Optional[str] = None
+
+    def capabilities() -> tuple[dict, Optional[str]]:
+        nonlocal caps, caps_problem
+        if caps is None:
+            caps, caps_problem = _load_deliverable_capabilities(skill_permissions_path)
+        return caps, caps_problem
+
+    if required_problem is not None and any(m.get('deliverable') is None for m in tasks):
+        results.append(('FAIL', 'deliverable',
+                        f"mission: deliverable が必須かどうか決められません — {required_problem}"))
+
+    for meta in tasks:
+        tid = meta.get('id', '<unknown>')
+        prefix = f"task/{tid}"
+        declared = meta.get('deliverable')
+
+        if declared is None:
+            if required:
+                results.append(('FAIL', 'deliverable',
+                                f"{prefix}: 'deliverable' が未宣言です (この mission は必須) — "
+                                f"plan.sh update {tid} --deliverable {'|'.join(VALID_DELIVERABLES)}"))
+            continue
+
+        if declared not in VALID_DELIVERABLES:
+            results.append(('FAIL', 'deliverable',
+                            f"{prefix}: unknown deliverable {declared!r} (valid: {list(VALID_DELIVERABLES)})"))
+            continue
+
+        if declared not in DELIVERABLES_THAT_NEED_A_WRITER:
+            continue
+
+        skills = meta.get('skills')
+        if not isinstance(skills, list) or not skills:
+            continue  # skills の型・欠落は frontmatter 検査の担当
+        table, problem = capabilities()
+        if problem is not None:
+            results.append(('FAIL', 'deliverable',
+                            f"{prefix}: deliverable '{declared}' を skills と突き合わせられません — {problem}"))
+            continue
+        bad = sorted({s for s in skills if s in table and table[s] not in (True, False)})
+        if bad:
+            results.append(('FAIL', 'deliverable',
+                            f"{prefix}: skill {bad} の can_produce_deliverable が true / false ではありません "
+                            f"({skill_permissions_path})"))
+            continue
+        if all(table.get(s) is False for s in skills):
+            results.append(('FAIL', 'deliverable',
+                            f"{prefix}: deliverable '{declared}' を宣言していますが、skills {skills} は"
+                            f" すべて can_produce_deliverable: false で、成果物を作れません "
+                            f"(成果物を作れる skill を足すか、deliverable を none にする)"))
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Task loader
 # ---------------------------------------------------------------------------
 
@@ -402,6 +545,11 @@ def lint_mission(slug: str, queue_dir: str, config_dir: str, strict: bool = Fals
     all_results += check_dependency_graph(valid_tasks)
     all_results += check_skill_alignment(valid_tasks, skill_perm_path)
     all_results += check_timeout_validity(valid_tasks, timeout_path)
+    # mission.yaml は、宣言の無い task があるときだけ読む (印が要るのはそのときだけ)。
+    required, required_problem = (
+        _mission_requires_deliverable(slug, queue_dir)
+        if any(m.get('deliverable') is None for m in valid_tasks) else (False, None))
+    all_results += check_deliverable(valid_tasks, skill_perm_path, required, required_problem)
 
     # Print results
     has_fail = False

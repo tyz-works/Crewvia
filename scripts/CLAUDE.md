@@ -76,9 +76,17 @@ lib ごとの**破ってはいけない契約**の要約。理由・経緯・全
   precheck (start.sh 自身の cwd 基準) と WORK_DIR へ `cd` してから起動する claude とで基準が変わり、
   「同じ文字列」でも「同じ解決済みの対象」にならない。t070 P2）。解決できない値はそのまま precheck に
   委ねる（存在しない dir は lib_trust.py が untrusted として止める。安全側）。
-- LAUNCH_CMD へ値を埋め込むときは必ず `_shq`（`printf '%q'`）を通す。自前の `'$var'` 埋め込みは、
+- LAUNCH_CMD へ値を埋め込むときは必ず `_shq` を通す。自前の `'$var'` 埋め込みは、
   AGENT_NAME・TARGET_DIR・WORK_DIR のような外部由来の値に `'` が含まれるだけで壊れ、`'; cmd; #` の
   ような値ならペインでコマンドが追加実行される（t070 P1 シェルインジェクション）。ENV_EXPORTS・
   `--model` / `--settings` / `--permission-mode` の CLI 引数・`cd`・advisory メッセージまで、
   埋め込み箇所は全部 `_shq` を通す（族 D）。文字列の形を見るテストは評価時の挙動を保証しない —
   `tests/start-sh-trust-precheck.bats` は実際に LAUNCH_CMD をスタブ claude で評価するテストを持つ。
+  `_shq` は bash 組み込みの `printf '%q'` を使わない（t089 / PR#237 4巡目 P2-2）: LAUNCH_CMD を
+  実際に評価するのは pane の**設定済みシェル**であり、それが bash である保証はない。`%q` は改行や
+  非 ASCII を `$'...'`（ANSI-C quoting、bash 専用）で出力するが、dash はそれを構文エラーにする。
+  代わりに、値をシングルクォートで囲み中の `'` を `'\''` に置き換える POSIX 互換の方式にした —
+  bash / dash / ash / ksh / zsh のどれでも同じ意味になる（常にクォート付きになる点が旧実装との
+  観測できる違い — `--permission-mode auto` は `--permission-mode 'auto'` になる）。
+  また LAUNCH_CMD 内の `cd $(_shq "$WORK_DIR")` は `claude...` の前を `;` ではなく `&&` でつなぐ
+  （族 A）: `cd` が失敗しても `;` は後続を実行してしまい、**別のディレクトリで Claude が起動する**。

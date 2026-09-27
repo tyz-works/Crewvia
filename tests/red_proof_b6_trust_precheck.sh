@@ -17,8 +17,8 @@
 #   C  lib_trust: `is True` を truthiness にする ("true" 文字列で信頼済み)    → 赤 (pytest)
 #   D  lib_trust: 祖先を辿らない                                          → 赤 (pytest + bats)
 #   E  lib_trust: 論理パスの候補を落とす (物理パスへ畳む)                    → 赤 (pytest)
-#   R  lib_trust: 折り返した文言の判定を外す (空白を畳まない)                → 赤 (pytest)
-#   S  lib_trust: 単独の "No, exit" もダイアログに数える                    → 赤 (pytest)
+#   R  lib_trust: 大文字小文字を畳まない (.lower() を外す)                  → 赤 (pytest)
+#   S  lib_trust: 選択肢の文言を見ずカーソル+数字だけで数える (t089 で塞いだ緩さに戻す) → 赤 (pytest)
 #
 # t051 (B6 fix: PR#237 の Codex findings) で追加:
 #   T  start.sh: CLAUDE_CONFIG_DIR を spawn 先に伝播しない (P1)              → 赤 (bats)
@@ -34,8 +34,15 @@
 #   REL  start.sh: CLAUDE_CONFIG_DIR / HOME の絶対パス解決を外す (P2)                        → 赤 (bats)
 #
 # t078 (B6 fix 3巡目: 族B — 文言の部分一致だけでは同定にならない) で追加:
-#   SUBM lib_trust: ダイアログの操作構造 (選択肢のカーソル行 / Enter to confirm) を見ずに、
-#        文言が一致した時点で即 True にする (部分一致に戻す)                                  → 赤 (pytest)
+#   SUBM lib_trust: 構造を一切見ず、文言 (部分一致) が画面のどこかにあれば即 True にする
+#        (t078 が塞いだ「文言だけ」の状態そのものに戻す)                                       → 赤 (pytest)
+#
+# t089 (B6 fix 4巡目: PR#237 Codex 4巡目 P2×2) で追加:
+#   S2   lib_trust: t078 の「文言と構造を画面のどこからでも独立に拾う」実装に戻す
+#        (t089 が実際に見つけた食い違いそのもの — パスの文言 + 無関係な権限確認メニュー)          → 赤 (pytest)
+#   SHQ  start.sh: _shq を printf '%q' (bash 専用) に戻す                                       → 赤 (bats)
+#   CDF  start.sh: LAUNCH_CMD の `cd ... && claude` を `cd ...; claude` に戻す
+#        (cd が失敗しても claude がそのまま起動してしまう)                                        → 赤 (bats)
 #
 # 注意 (defense in depth): 最後の網は 3 か所 (待機中 / 送信前 / 送信後) にあり、**1 か所だけ**を外しても、
 # 別の 1 か所が同じ画面を捕まえるので、多くのテストは緑のまま。だから G / H は「その 1 か所にだけ
@@ -76,6 +83,21 @@ inject() {
 import os, sys, pathlib
 p = pathlib.Path(sys.argv[1]); s = p.read_text()
 old, new = os.environ["OLD"], os.environ["NEW"]
+if s.count(old) != 1:
+    print(f"count={s.count(old)}", file=sys.stderr)
+    sys.exit(1)
+p.write_text(s.replace(old, new))
+PY
+}
+
+# inject_span <file> <old_content_file> <new_content_file> — old/new をファイル経由で渡す版
+# (バッククォート・$ を多く含む大きなブロックを引用符地獄なしで置換するため)。
+inject_span() {
+    FILE="$1" OLDFILE="$2" NEWFILE="$3" python3 - "$TREE/$1" <<'PY' || { echo "FATAL: 注入点が見つからない ($1)"; exit 2; }
+import os, sys, pathlib
+p = pathlib.Path(sys.argv[1]); s = p.read_text()
+old = pathlib.Path(os.environ["OLDFILE"]).read_text()
+new = pathlib.Path(os.environ["NEWFILE"]).read_text()
 if s.count(old) != 1:
     print(f"count={s.count(old)}", file=sys.stderr)
     sys.exit(1)
@@ -216,31 +238,67 @@ fresh_copy
 inject scripts/lib_trust.py '    for p in (logical, physical):' '    for p in (physical,):'
 expect_red_py "case E" "test_a_symlinked_dir_is_trusted_by_its_logical_path"
 
-echo "== case R: 折り返した文言の判定を外す (空白を畳まない)"
+echo "== case R: 大文字小文字を畳まない (.lower() を外す)"
+# t089 で `_MENU_CURSOR_RE` を撤去し `_TRUST_ACCEPT_OPTION_RE` (\s* ベース) にしたことで、
+# 折り返し (空白の畳み込み) 自体はこの正規表現がすでに吸収する (\s* は改行も畳む) ため、
+# 「join/split を外す」だけではもう赤にならない。まだ意味があるのは大文字小文字の畳み込み
+# (regex は re.IGNORECASE を持たない) — これを外すと大文字混じりの陽性 fixture が緑のまま拾えなくなる。
 fresh_copy
-inject scripts/lib_trust.py "    flat = ' '.join(str(screen).lower().split())" "    flat = str(screen).lower()"
+inject scripts/lib_trust.py "    flat = ' '.join(str(screen).lower().split())" "    flat = ' '.join(str(screen).split())"
 expect_red_py "case R" "test_the_trust_dialog_is_recognised"
 
-echo "== case S: 単独の No, exit もダイアログに数える"
+echo "== case S: 選択肢の文言を見ずカーソル+数字だけで数える (t089 で塞いだ緩さに戻す)"
 fresh_copy
-inject scripts/lib_trust.py "    if not phrase_hit:
-        return False
-    return bool(_MENU_CURSOR_RE.search(flat)) or 'enter to confirm' in flat" \
-                              "    if not phrase_hit:
-        return False
-    return True"
+inject scripts/lib_trust.py \
+"_TRUST_ACCEPT_OPTION_RE = re.compile(
+    r'[❯›>]\s*1[.)]\s*yes,?\s*(?:i\s*)?(?:trust\s*this\s*folder|proceed)\b'
+)" \
+"_TRUST_ACCEPT_OPTION_RE = re.compile(r'[❯›>]\s*\d+[.)]')"
 expect_red_py "case S" "test_ordinary_screens_are_not_mistaken_for_the_dialog"
 
-echo "== case SUBM: 文言の部分一致だけで同定する (族B、t078) — 選択肢の構造を見ない"
+echo "== case SUBM: 構造を一切見ず、文言の部分一致だけで同定する (t078 が塞いだ状態そのもの)"
 fresh_copy
-inject scripts/lib_trust.py "    phrase_hit = any(p in flat for p in _DIALOG_PHRASES) or 'no, exit' in flat
+cat > "$WORK/subm_old.txt" <<'BLOCK'
+def screen_shows_trust_dialog(screen):
+    flat = ' '.join(str(screen).lower().split())
+    if _TRUST_ACCEPT_OPTION_RE.search(flat):
+        return True
+    return 'no, exit' in flat and 'enter to confirm' in flat
+BLOCK
+cat > "$WORK/subm_new.txt" <<'BLOCK'
+def screen_shows_trust_dialog(screen):
+    flat = ' '.join(str(screen).lower().split())
+    phrases = ('quick safety check', 'yes, i trust this folder',
+               'do you trust the files in this folder',
+               'is this a project you created or one you trust')
+    return any(p in flat for p in phrases) or 'no, exit' in flat
+BLOCK
+inject_span scripts/lib_trust.py "$WORK/subm_old.txt" "$WORK/subm_new.txt"
+expect_red_py "case SUBM" "test_ordinary_screens_are_not_mistaken_for_the_dialog"
+
+echo "== case S2: t078 の『文言と構造を画面のどこからでも独立に拾う』実装に戻す (t089 の本題)"
+fresh_copy
+cat > "$WORK/s2_old.txt" <<'BLOCK'
+def screen_shows_trust_dialog(screen):
+    flat = ' '.join(str(screen).lower().split())
+    if _TRUST_ACCEPT_OPTION_RE.search(flat):
+        return True
+    return 'no, exit' in flat and 'enter to confirm' in flat
+BLOCK
+cat > "$WORK/s2_new.txt" <<'BLOCK'
+def screen_shows_trust_dialog(screen):
+    import re as _re
+    flat = ' '.join(str(screen).lower().split())
+    phrases = ('quick safety check', 'yes, i trust this folder',
+               'do you trust the files in this folder',
+               'is this a project you created or one you trust')
+    phrase_hit = any(p in flat for p in phrases) or 'no, exit' in flat
     if not phrase_hit:
         return False
-    return bool(_MENU_CURSOR_RE.search(flat)) or 'enter to confirm' in flat" \
-                              "    if any(p in flat for p in _DIALOG_PHRASES):
-        return True
-    return 'no, exit' in flat and 'enter to confirm' in flat"
-expect_red_py "case SUBM" "test_ordinary_screens_are_not_mistaken_for_the_dialog"
+    return bool(_re.search(r'[❯›>]\s*\d+[.)]', flat)) or 'enter to confirm' in flat
+BLOCK
+inject_span scripts/lib_trust.py "$WORK/s2_old.txt" "$WORK/s2_new.txt"
+expect_red_py "case S2" "test_ordinary_screens_are_not_mistaken_for_the_dialog"
 
 echo "== case T: CLAUDE_CONFIG_DIR を spawn 先に伝播しない (t051 P1)"
 fresh_copy
@@ -285,7 +343,7 @@ expect_red_bats "case V2" "HOME used by the precheck (when CLAUDE_CONFIG_DIR is 
 
 echo "== case INJ: LAUNCH_CMD の cd を生の '\$WORK_DIR' 埋め込みに戻す (t070 P1 シェルインジェクション)"
 fresh_copy
-inject scripts/start.sh 'cd $(_shq "$WORK_DIR"); claude' "cd '\$WORK_DIR'; claude"
+inject scripts/start.sh 'cd $(_shq "$WORK_DIR") && claude' "cd '\$WORK_DIR'; claude"
 expect_red_bats "case INJ" \
     "LAUNCH_CMD survives a TARGET_DIR containing a quote and a shell-injection payload"
 
@@ -304,6 +362,29 @@ inject scripts/start.sh '    _RESOLVED_HOME="$(cd "${HOME}" 2>/dev/null && pwd)"
 expect_red_bats "case REL" \
     "a relative CLAUDE_CONFIG_DIR resolves to the same absolute dir the spawned claude will read" \
     "a relative HOME (no CLAUDE_CONFIG_DIR) resolves to the same absolute dir too"
+
+echo "== case SHQ: _shq を printf '%q' (bash 専用) に戻す (t089 P2-2)"
+fresh_copy
+cat > "$WORK/shq_new.txt" <<'BLOCK'
+  _shq() {
+    local s=$1
+    printf "'%s'" "${s//\'/\'\\\'\'}"
+  }
+BLOCK
+cat > "$WORK/shq_old.txt" <<'BLOCK'
+  _shq() {
+    printf '%q' "$1"
+  }
+BLOCK
+inject_span scripts/start.sh "$WORK/shq_new.txt" "$WORK/shq_old.txt"
+expect_red_bats "case SHQ" \
+    "_shq quotes a value with a newline, non-ASCII, and a quote the same way for bash and dash"
+
+echo "== case CDF: LAUNCH_CMD の cd ... && claude を cd ...; claude に戻す (t089 P2-2)"
+fresh_copy
+inject scripts/start.sh 'cd $(_shq "$WORK_DIR") && claude' 'cd $(_shq "$WORK_DIR"); claude'
+expect_red_bats "case CDF" \
+    "a cd failure in LAUNCH_CMD stops before claude runs"
 
 echo
 echo "PASS=$PASS FAIL=$FAIL"

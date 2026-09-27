@@ -414,13 +414,31 @@ fake tmux で start.sh を mux モードで走らせるテストは `tests/trust
 - **P1 (シェルインジェクション)**: t051 が追加した `CLAUDE_CONFIG_DIR='${CLAUDE_CONFIG_DIR}'` / `HOME='${HOME}'`
   を含め、LAUNCH_CMD 全体が生の `'$var'` 埋め込みで組み立てられていた。値に `'` が入るだけで壊れ、
   `'; cmd; #` のような値ならペインが LAUNCH_CMD を評価したときに追加のコマンドが実行される
-  (AGENT_NAME・TARGET_DIR・WORK_DIR は外部由来で入力しうる)。`_shq()`（`printf '%q'`。自前でクォートを
+  (AGENT_NAME・TARGET_DIR・WORK_DIR は外部由来で入力しうる)。`_shq()`（自前でクォートを
   組み立てない）を導入し、ENV_EXPORTS の全変数・`--model` / `--settings` / `--permission-mode` の
   CLI 引数・`cd`・advisory メッセージ（`_abort_on_trust_dialog` 等）まで、埋め込み箇所を**全部**
   これに通した（族 D の掃除）。**文字列の形を見るだけのテストは評価時の挙動を保証しない**
   (Codex 指摘) ので、`tests/start-sh-trust-precheck.bats` は fake tmux に送られた LAUNCH_CMD の
   実テキストを取り出し、claude の代わりに引数と cwd を書き出すスタブを使って**隔離した bash で
   実際に評価する**テストを持つ。
+
+**t089 (B6 fix 4巡目: PR#237 Codex 4巡目 P2×2) で直した 2 件**:
+- **P2-1 (trust ダイアログ検出の族B再発)**: t078 は「文言」と「ダイアログの操作構造」を要求したが、
+  画面の**どこからでも独立に**拾っていたため、無関係なパスの文言 (`/tmp/quick safety check` 等) と、
+  無関係な別の権限確認メニューが同じ画面に乗ると誤検出した。`screen_shows_trust_dialog()` は
+  「カーソルが選択肢 1 を指し、その選択肢自身が `Yes, I trust this folder` / `Yes, proceed` である」
+  ことを 1 つの正規表現 (`_TRUST_ACCEPT_OPTION_RE`) でまとめて要求するように直した — 文言と選択肢を
+  独立に探すのではなく、最初から「同じダイアログの枠の中にある」ことを保証する形にした。
+- **P2-2 (`_shq` が bash 専用)**: `_shq()` は `printf '%q'` (bash 組み込み) を使っていたが、
+  LAUNCH_CMD を実際に評価するのは pane の**設定済みシェル**であり、それが bash である保証は無い。
+  `%q` は改行・非 ASCII を `$'...'` (ANSI-C quoting、bash 専用) で出力するが、dash はそれを構文
+  エラーにする。シングルクォート方式 (`'...'`、中の `'` は `'\''`) に変えた — bash / dash のどちらでも
+  同じ意味になる (常にクォート付きになる点が観測できる違い)。あわせて LAUNCH_CMD の
+  `cd $(_shq "$WORK_DIR")` と `claude...` の間を `;` から `&&` にした (族 A): `cd` が失敗しても
+  `;` は後続を実行してしまい、**別のディレクトリで Claude が起動する**。
+  `tests/start-sh-trust-precheck.bats` は `_shq` を start.sh のソースから直接取り出し bash と dash の
+  両方で評価するテストと、`cd` の行き先を送信後に消してから評価し claude が起動しないことを確かめる
+  テストを持つ。
 - **P2 (相対パスの CLAUDE_CONFIG_DIR / HOME)**: precheck は start.sh 自身の cwd を基準に相対パスを
   開くが、LAUNCH_CMD は WORK_DIR に `cd` してから claude を起動する。相対な `CLAUDE_CONFIG_DIR` /
   `HOME` を「同じ文字列」のまま渡しても、cd の前後で基準が変わり「同じ解決済みの対象」にはならない

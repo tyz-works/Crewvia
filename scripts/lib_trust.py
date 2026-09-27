@@ -220,35 +220,42 @@ def refusal_message(verdict, directory):
 #
 # 文言は claude 2.1.283 のバンドルで確認したもの (`Quick safety check: Is this a project you
 # created or one you trust?` / `Yes, I trust this folder` / `No, exit`) と、それ以前の版の
-# `Do you trust the files in this folder?`。画面は折り返されるので、空白を畳んでから見る。
+# `Do you trust the files in this folder?` / `Yes, proceed`。画面は折り返されるので、
+# 空白を畳んでから見る。
 #
 # **文言の部分一致だけでは同定にならない (族B、PR#239 の `basetemp in cmdline` と同型。t078)**。
 # 信頼済みディレクトリのパス名 (`/tmp/quick safety check` 等)・task の出力がその語を引用した場合・
 # ファイル名やブランチ名がステータス行に出た場合、いずれも画面に文言だけが乗り、start.sh はこれを
 # 検出すると kickoff を送らず pane を kill する — 正常な起動が破壊される側の誤検出。
-# → 文言に加えて、**ダイアログの操作構造** (カーソル `❯` が数字付きの選択肢を指している行、または
-# 決定の操作案内 `Enter to confirm`) が画面のどこかに伴うことを要求する。`mux_capture` は pane の
-# 画面全体を返す (スクロール中の一部ではない) ので、実際に描画されているダイアログ (自己完結した
-# 小さい UI ブロック) では、文言と操作構造が同じ capture に必ず両方乗る。
+#
+# t078 は「文言」と「ダイアログの操作構造 (カーソルが数字付きの選択肢を指す行 / Enter to confirm)」
+# の**両方**を要求したが、この 2 つを画面のどこからでも**独立に**拾っていたため、まだ不十分だった
+# (t089 / PR#237 4巡目 P2-1、直接確認済み): `Working directory: /tmp/quick safety check` のような
+# パスの文言 (どこか) と、画面の別の場所に出ている**普通の権限確認メニュー** (Bash 実行等の
+# 「Do you want to proceed? ❯ 1. Yes / 2. No, and tell Claude what to do differently /
+# Enter to confirm」— これ自体は生成されている trust ダイアログではない) の構造が、互いに無関係
+# なのに組み合わさって True になった。
+#
+# → 文言と選択肢を**まとまりとして一緒に**照合する: 「カーソルが選択肢 1 を指し、その選択肢自身の
+# 文言が "Yes, I trust this folder" / "Yes, proceed" である」1 つの正規表現にする
+# (`_TRUST_ACCEPT_OPTION_RE`)。これは実物の trust ダイアログでなければ画面に現れない組み合わせで、
+# 「同じダイアログの枠の中にある」ことを、無関係な 2 箇所を独立に探すのではなく**最初から 1 つの
+# 照合として保証する**。カーソル行が capture から切れて選択肢 1 が見えない場合の網として、
+# "No, exit" (trust ダイアログの拒否選択肢に固有 — 他の確認メニューは "No, and tell Claude ..." の
+# ような文言になる) が決定の操作案内 (`Enter to confirm`) と揃った場合だけ数える。
 
-_DIALOG_PHRASES = (
-    'quick safety check',
-    'yes, i trust this folder',
-    'do you trust the files in this folder',
-    'is this a project you created or one you trust',
+#: カーソル (`❯`/`›`/`>`) が選択肢 1 を指し、その選択肢自身が信頼を受け入れる文言であること
+#: (`Yes, I trust this folder` / `Yes, proceed`) を、1 つの正規表現でまとめて要求する。
+_TRUST_ACCEPT_OPTION_RE = re.compile(
+    r'[❯›>]\s*1[.)]\s*yes,?\s*(?:i\s*)?(?:trust\s*this\s*folder|proceed)\b'
 )
-
-#: カーソル (`❯`/`›`/`>`) が数字付きの選択肢を指している行。パスやファイル名の中の文言には
-#: この構造は伴わない。
-_MENU_CURSOR_RE = re.compile(r'[❯›>]\s*\d+[.)]')
 
 
 def screen_shows_trust_dialog(screen):
     flat = ' '.join(str(screen).lower().split())
-    phrase_hit = any(p in flat for p in _DIALOG_PHRASES) or 'no, exit' in flat
-    if not phrase_hit:
-        return False
-    return bool(_MENU_CURSOR_RE.search(flat)) or 'enter to confirm' in flat
+    if _TRUST_ACCEPT_OPTION_RE.search(flat):
+        return True
+    return 'no, exit' in flat and 'enter to confirm' in flat
 
 
 def main(argv):

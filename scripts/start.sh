@@ -680,9 +680,19 @@ if [[ "${_EFFECTIVE_MUX_ENABLED:-0}" == "1" ]]; then
   # LAUNCH_CMD は mux が新しいペインのシェルへ「入力して Enter」する文字列であり、後で
   # そのシェルが評価する。自前でクォート ('$var' 等) を組み立てると、値に ' が含まれる
   # だけで起動が壊れ、`/tmp/x'; printf INJECTED; #` のような値ならペインの評価時に
-  # 追加のコマンドが実行される (Codex 2巡目 P1)。bash 組み込みの printf '%q' に任せる。
+  # 追加のコマンドが実行される (Codex 2巡目 P1)。
+  #
+  # bash 組み込みの printf '%q' には頼らない (t089 / PR#237 4巡目 P2-2): TmuxBackend.spawn は
+  # LAUNCH_CMD を pane の**設定済みシェル**に打ち込むだけで、そのシェルが bash である保証は無い。
+  # `%q` は改行・非 ASCII (C ロケール下) を含む値を `$'...'` (ANSI-C quoting、bash 専用の構文) で
+  # 出力するが、dash 等の POSIX シェルは `$'...'` を知らず、`$` と後続の文字列を全く別の意味に
+  # 解釈する (直接確認済み — 設定のパスが壊れ、`cd` が失敗する)。代わりに、値をシングルクォート
+  # `'...'` で囲み、値の中の `'` だけを `'\''` に置き換える POSIX 互換のクォートにする —
+  # シングルクォートの中は改行・非 ASCII を含むどんな bytes もそのまま保存され、bash / dash / ash /
+  # ksh / zsh のどのシェルでも同じ意味になる (`$'...'` のような特殊構文を一切使わない)。
   _shq() {
-    printf '%q' "$1"
+    local s=$1
+    printf "'%s'" "${s//\'/\'\\\'\'}"
   }
 
   # --- 最後の網: pane に claude の trust ダイアログが出ていないか (t021 / backlog #28) ---
@@ -848,7 +858,14 @@ PYEOF
   # プロセスが export した PATH を継承しない（spawn() は env 引数を持たない —
   # 上の ENV_EXPORTS と同じ理由）。scripts/bin/plan を
   # 使えるようにするため、ペイン側の $PATH に対して明示的に prepend する。
-  LAUNCH_CMD="$ENV_EXPORTS; export PATH=$(_shq "${REPO_ROOT}/scripts/bin:")\"\$PATH\"; unset CLAUDE_CODE_CHILD_SESSION; ${_TRUST_UNSET_STALE_CONFIG_DIR}cd $(_shq "$WORK_DIR"); claude${MODEL_CLI_ARG}${SETTINGS_CLI_ARG}${PERMISSION_MODE_CLI_ARG}"
+  #
+  # `cd ... && claude...` (t089 / PR#237 4巡目 P2-2): `cd` とそれ以前の文 (export / unset) を
+  # `;` で単純に連ねると、`cd` が失敗しても (`_shq` の値が壊れた・dir が存在しない等) 後続の
+  # `claude` がそのまま実行され、**別のディレクトリ (pane がそれまで居た cwd) で Claude が
+  # 起動する**（直接確認済み）。ここだけ `&&` にし、`cd` の失敗を後続に伝播させる。
+  # それより前の export / unset は代入・変数削除であり、失敗しても後続の意味が変わらない
+  # (族A の棚卸し: LAUNCH_CMD 内で「前のコマンドの失敗を握り潰すと危険」なのはこの 1 箇所だけ)。
+  LAUNCH_CMD="$ENV_EXPORTS; export PATH=$(_shq "${REPO_ROOT}/scripts/bin:")\"\$PATH\"; unset CLAUDE_CODE_CHILD_SESSION; ${_TRUST_UNSET_STALE_CONFIG_DIR}cd $(_shq "$WORK_DIR") && claude${MODEL_CLI_ARG}${SETTINGS_CLI_ARG}${PERMISSION_MODE_CLI_ARG}"
 
   # Drop spawn records whose pane is gone (a retired Worker's pane closes without
   # `kill()`, so its record outlives it).  Housekeeping only: the answer never

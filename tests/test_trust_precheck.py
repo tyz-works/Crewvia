@@ -390,6 +390,21 @@ def test_the_trust_dialog_is_recognised(screen):
     # (3) ダイアログの文言を含むファイル名・ブランチ名がステータス行に出ている
     "On branch feat/quick safety check\nnothing to commit, working tree clean\n❯ ",
     "modified: docs/quick safety check.md\n❯ ",
+    # --- 族B (続き, t089 / PR#237 4巡目 P2-1): 文言と選択肢の構造を「画面のどこかに独立に」
+    # 拾うだけでは、無関係な 2 箇所の組み合わせでも一致してしまう (t078 はここまでしか塞がなかった)。
+    # パスの文言 (Working directory: .../quick safety check) と、trust ダイアログとは無関係な
+    # 普通の権限確認メニュー (Bash 実行の確認。選択肢自身の文言は "Yes" / "No, and tell Claude ..."
+    # であり、trust ダイアログの選択肢 "Yes, I trust this folder" / "No, exit" ではない) が
+    # 同じ画面に乗ると、旧実装 (文言 = 部分一致 / 構造 = カーソル+数字 or confirm、を独立に判定) は
+    # 誤って True を返す (直接確認済み)。文言と選択肢は「同じダイアログの枠」になければならない。
+    "[crewvia] Working directory: /tmp/quick safety check\n\n"
+    "Bash command\nnpm test\n\n"
+    "Do you want to proceed?\n❯ 1. Yes\n  2. No, and tell Claude what to do differently\n\n"
+    "Enter to confirm · Esc to cancel",
+    # 同じ族: フレーズが「No, exit」ではなく他の phrase (quick safety check) 由来でも同様に誤検出しない。
+    "user@host:/tmp/quick safety check$ claude\n\n"
+    "Do you want to proceed?\n❯ 1. Yes\n  2. No, and tell Claude what to do differently\n\n"
+    "Enter to confirm · Esc to cancel",
 ])
 def test_ordinary_screens_are_not_mistaken_for_the_dialog(screen):
     assert not lib_trust.screen_shows_trust_dialog(screen)

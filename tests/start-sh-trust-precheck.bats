@@ -322,9 +322,10 @@ _kickoffs()   { grep -cF -- "ミッション開始" "$FAKE_TMUX_LOG" || true; }
 
     [ "$status" -eq 0 ]
     _launched
-    # t070 P1: _shq (printf %q) は特殊文字を含まない値をクォート無しでそのまま返すので、
-    # ここでは生の '$VAR' 埋め込みではなく _shq を通した後の形 (この値では無クォート) を見る。
-    grep -qF "CLAUDE_CONFIG_DIR=${CFG}" "$FAKE_TMUX_LOG"
+    # t089 P2-2: _shq は printf '%q' (bash 専用、特殊文字を含まない値はクォート無しで返す) をやめ、
+    # 常にシングルクォートで囲む POSIX 互換の方式にした (dash 等でも同じ意味になるようにするため)。
+    # ここでは _shq を通した後の形 (常にクォート付き) を見る。
+    grep -qF "CLAUDE_CONFIG_DIR='${CFG}'" "$FAKE_TMUX_LOG"
 }
 
 @test "without CLAUDE_CONFIG_DIR, the launch command clears any stale value the pane's server env might hold (t051 P1)" {
@@ -350,7 +351,7 @@ _kickoffs()   { grep -cF -- "ミッション開始" "$FAKE_TMUX_LOG" || true; }
 
     [ "$status" -eq 0 ]
     _launched
-    grep -qF "HOME=${FAKE_HOME}" "$FAKE_TMUX_LOG"
+    grep -qF "HOME='${FAKE_HOME}'" "$FAKE_TMUX_LOG"
     find "$FAKE_HOME" -depth -delete 2>/dev/null || true
 }
 
@@ -530,9 +531,10 @@ STUB
     [ "$status" -eq 0 ]
     _launched
     # 伝播された CLAUDE_CONFIG_DIR が REL_BASE/.config という絶対パスになっている
-    # (相対のまま ".config" が伝播されていたら、この grep は失敗する)。
-    grep -qF "CLAUDE_CONFIG_DIR=${REL_BASE}/.config" "$FAKE_TMUX_LOG"
-    ! grep -q "CLAUDE_CONFIG_DIR=.config " "$FAKE_TMUX_LOG"
+    # (相対のまま ".config" が伝播されていたら、この grep は失敗する)。t089 P2-2 で _shq が
+    # 常にシングルクォートを付けるようになったので、ここでもクォート付きの形を見る。
+    grep -qF "CLAUDE_CONFIG_DIR='${REL_BASE}/.config'" "$FAKE_TMUX_LOG"
+    ! grep -q "CLAUDE_CONFIG_DIR='.config'" "$FAKE_TMUX_LOG"
 
     find "$REL_BASE" -depth -delete 2>/dev/null || true
 }
@@ -548,8 +550,76 @@ STUB
 
     [ "$status" -eq 0 ]
     _launched
-    grep -qF "HOME=${REL_HOME_PARENT}/home" "$FAKE_TMUX_LOG"
-    ! grep -q ' HOME=home ' "$FAKE_TMUX_LOG"
+    grep -qF "HOME='${REL_HOME_PARENT}/home'" "$FAKE_TMUX_LOG"
+    ! grep -q " HOME='home' " "$FAKE_TMUX_LOG"
 
     find "$REL_HOME_PARENT" -depth -delete 2>/dev/null || true
+}
+
+# ---------------------------------------------------------------------------
+# 4. LAUNCH_CMD の POSIX 互換性 (t089 / B6 4巡目 — PR#237 Codex 4巡目 P2-2): `_shq` は
+#    bash 組み込みの printf '%q' を使わず、pane の実際のシェル (bash とは限らない) でも同じ意味に
+#    なるシングルクォート方式でなければならない。文字列の形を見るだけでは評価時の挙動を保証しない
+#    ので、ここでも fake tmux に送られた LAUNCH_CMD の実テキストを取り出し、bash **と** dash の
+#    両方で実際に評価する。
+# ---------------------------------------------------------------------------
+
+@test "_shq quotes a value with a newline, non-ASCII, and a quote the same way for bash and dash (t089 P2-2)" {
+    # `_launch_cmd_text` (fake tmux の send-keys 行を grep する既存 helper) は改行を含む値では
+    # 使えない — fake tmux は `echo "$*" >> log` するだけなので、送られた文字列自身に改行があると
+    # ログの行構造そのものが壊れ、`grep -m1 '^send-keys ...'` が値の途中で切れる (別の直交した
+    # 制約: fake tmux の観測方法の限界であり、_shq の正しさとは別の話)。ここでは start.sh の
+    # ソースから実物の `_shq` の定義だけを取り出し (再実装しない)、直接評価する。
+    #
+    # `_shq` 自身は start.sh (常に bash で起動される) の中で実行されるので、この関数の**中身**は
+    # bash 専用の構文で構わない — 保証すべきは「**出力**」(LAUNCH_CMD に埋め込まれる引用済み文字列)
+    # が、それを最終的に評価する pane 側のシェル (bash とは限らない) でも同じ意味になること。
+    SHQ_SRC="$(sed -n '/^  _shq() {/,/^  }/p' "$START_SH")"
+    [ -n "$SHQ_SRC" ]
+
+    # 改行 + 非 ASCII (café) + シングルクォートを含む値。bash の printf '%q' はこの手の値を
+    # $'...' (ANSI-C quoting、bash 専用の構文) で出力するが、dash はそれを構文エラーにする
+    # (直接確認済み)。シングルクォート方式ならどちらのシェルでも同じバイト列に戻る。
+    WEIRD_VALUE="$(printf "caf\xc3\xa9'\ndir")"
+
+    # _shq を計算するのは実際の start.sh と同じく bash 側 (1 回だけ)。その出力を LAUNCH_CMD の
+    # 断片として、bash と dash の両方に「入力して評価させる」— pane の実際の挙動の再現。
+    QUOTED="$(bash -c "${SHQ_SRC}"$'\n''_shq "$1"' -- "$WEIRD_VALUE")"
+    [ -n "$QUOTED" ]
+
+    for SHELL_BIN in bash dash; do
+        ROUNDTRIPPED="$("$SHELL_BIN" -c "printf %s ${QUOTED}")"
+        [ "$ROUNDTRIPPED" = "$WEIRD_VALUE" ]
+    done
+}
+
+@test "a cd failure in LAUNCH_CMD stops before claude runs, under both bash and dash (t089 P2-2)" {
+    trust_fixture_setup /
+    TARGET_DIR="$TARGET" run bash "$START_SH" worker --name Ren code
+    [ "$status" -eq 0 ]
+    _launched
+
+    LAUNCH_CMD_TEXT="$(_launch_cmd_text)"
+    [ -n "$LAUNCH_CMD_TEXT" ]
+
+    # WORK_DIR (= $TARGET) を、LAUNCH_CMD を送った後で消す — 評価時に cd が実際に失敗する
+    # (`_shq` の値そのものは壊れていない。純粋に「行き先が無くなった」場合の挙動を確かめる)。
+    find "$TARGET" -depth -delete 2>/dev/null || true
+
+    EVAL_DIR="$(mktemp -d)"
+    cat > "${EVAL_DIR}/claude" <<'STUB'
+#!/bin/sh
+touch "$CLAUDE_RAN_MARKER"
+STUB
+    chmod +x "${EVAL_DIR}/claude"
+
+    for SHELL_BIN in bash dash; do
+        CLAUDE_RAN_MARKER="${EVAL_DIR}/ran_${SHELL_BIN}"
+        rm -f "$CLAUDE_RAN_MARKER"
+        ( env -i PATH="${EVAL_DIR}:${PATH}" HOME="$HOME" CLAUDE_RAN_MARKER="$CLAUDE_RAN_MARKER" \
+            "$SHELL_BIN" -c "$LAUNCH_CMD_TEXT" ) || true
+        [ ! -f "$CLAUDE_RAN_MARKER" ]   # cd が失敗したら claude は (どこであれ) 起動してはいけない
+    done
+
+    find "$EVAL_DIR" -depth -delete 2>/dev/null || true
 }

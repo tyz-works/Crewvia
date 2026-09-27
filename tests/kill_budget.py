@@ -117,6 +117,11 @@ def partition(pids, me: int | None = None, environ=None):
 
     `starttime` は boot からの tick なので単調で比較できる。**同じ tick は許す** —
     テストと同じ tick に生まれた子孫は本物なので、`<` (厳密に古い) だけを断る。
+
+    年齢を **検証できない** ときは fail-open (allowed に入れる) しない —— 検証できない状態と
+    「若いと確認できた」状態を区別する。対象の stat が読めない候補、および自分自身の開始時刻
+    が読めない場合 (このときは年齢を判定できる候補が 1 つも無いので、全候補を拒否する) は
+    どちらも拒否する。
     """
     me = os.getpid() if me is None else me
     mine = _ppid_and_start(me)
@@ -129,8 +134,14 @@ def partition(pids, me: int | None = None, environ=None):
         if pid <= 1 or pid in keep:
             refused.append(Refusal(pid, "自分・祖先・セッション/グループリーダー — 殺すと自分が死ぬ"))
             continue
+        if my_start is None:
+            refused.append(Refusal(pid, "自分の開始時刻が読めない — 年齢を検証できないため拒否"))
+            continue
         got = _ppid_and_start(pid)
-        if got is not None and my_start is not None and got[1] < my_start:
+        if got is None:
+            refused.append(Refusal(pid, "対象の stat が読めない — 年齢を検証できないため拒否"))
+            continue
+        if got[1] < my_start:
             refused.append(Refusal(pid, "このテストセッションより古い — テストの子孫ではありえない"))
             continue
         allowed.append(pid)

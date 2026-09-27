@@ -131,6 +131,28 @@ def _uptime() -> float:
         return 0.0
 
 
+def _dir_in_cmdline(haystack: bytes, dirpath: bytes) -> bool:
+    """`dirpath` が `haystack` にパスの境界として現れるか (部分文字列の暴走一致を防ぐ)。
+
+    素の `in` は `/tmp/pytest-1` が `/tmp/pytest-10/test.py` にも前方一致してしまい、
+    別の pytest セッションの若いプロセスを子孫と誤認しうる (誤認は kill に直結する)。
+    `cmdline` は NUL 区切りの引数の連結なので、引数の途中に埋め込まれた形
+    (`--basetemp=<dir>/x` 等) も拾えるよう、引数ごとの厳密一致ではなく、一致の直後が
+    `/` / NUL / 終端であることを要求する境界付き部分文字列一致にする。
+    """
+    if not dirpath:
+        return False
+    start = 0
+    while True:
+        idx = haystack.find(dirpath, start)
+        if idx < 0:
+            return False
+        end = idx + len(dirpath)
+        if end == len(haystack) or haystack[end:end + 1] in (b"\0", b"/"):
+            return True
+        start = idx + 1
+
+
 def _belongs(pid: int, marker: bytes, basetemp: bytes):
     """(所属する理由 | None, 観測できたか)。同 uid の pid の environ が読めなければ観測できていない。
 
@@ -149,7 +171,7 @@ def _belongs(pid: int, marker: bytes, basetemp: bytes):
         if marker in environ.split(b"\0"):
             return "env-marker", True
     cmdline = _read_bytes(base / "cmdline")
-    if cmdline is not None and basetemp and basetemp in cmdline:
+    if cmdline is not None and basetemp and _dir_in_cmdline(cmdline, basetemp):
         return "cmdline-in-basetemp", True
     try:
         cwd = os.readlink(base / "cwd").encode()
@@ -239,10 +261,14 @@ def settle(exclude: set[int], marker_value: str, basetemp: str) -> Scan:
     """増えたプロセスが自然に終わるのを `GRACE_SECONDS` まで待ってから、残ったものを返す。
 
     テストの後片付けで殺されたばかりのプロセスが、まだ終わり切っていないだけの場合を残りに数えない。
+    `unobservable` (environ が読めない同 uid のプロセス) がある間も再試行する —— exec 直後の
+    空 environ (2.7%、1ms 未満で解消) のような一過性の観測失敗を、1 回読めなかっただけで
+    「クリーンな結果」に潰さないため。survivors が 0 でも unobservable が残ったままなら、
+    それは「無い」ではなく「確認できなかった」であり、呼び出し側が別に報告する。
     """
     deadline = time.monotonic() + GRACE_SECONDS
     result = scan(exclude, marker_value, basetemp)
-    while result.survivors and time.monotonic() < deadline:
+    while (result.survivors or result.unobservable) and time.monotonic() < deadline:
         time.sleep(_POLL_SECONDS)
         result = scan(exclude, marker_value, basetemp)
     return result
@@ -270,6 +296,15 @@ class LeakGuard:
         self.basetemp = ""
         self.checked_tests = 0          # 実際に走査したテストの数 (0 件で PASS にしない)
         self.leaks: list[str] = []
+        #: survivors は 0 だが unobservable が残ったまま (無いとは言えない) だったテストの数。
+        #: 落とす根拠にはしない (誤検出の可能性がある観測失敗で赤にしない) が、黙って消さない。
+        self.unobservable_only = 0
+
+    def _report_unobservable_only(self, where: str, count: int) -> None:
+        warnings.warn(
+            f"{where}: 子孫プロセスとは確認できなかったが、環境が読めず観測できなかった同 uid の"
+            f"プロセスが {count} 個残っている (『無い』とは言えない。数には入れていない)",
+            pytest.PytestWarning)
 
     @pytest.fixture(autouse=True)
     def _crewvia_no_leaked_descendants(self, request, tmp_path_factory):
@@ -285,25 +320,38 @@ class LeakGuard:
             message = format_failure(request.node.nodeid, result, report)
             self.leaks.append(message)
             pytest.fail(message, pytrace=False)
+        elif result.unobservable:
+            self.unobservable_only += 1
+            self._report_unobservable_only(request.node.nodeid, result.unobservable)
 
     def pytest_terminal_summary(self, terminalreporter):
         """検査した件数を毎回出す（0 件で PASS にしない）。"""
         terminalreporter.write_line(
             f"[leaked-descendants] 検査したテスト: {self.checked_tests} 件 / "
-            f"残された子孫を検出したテスト: {len(self.leaks)} 件")
+            f"残された子孫を検出したテスト: {len(self.leaks)} 件 / "
+            f"観測できず不確かなまま終えたテスト: {self.unobservable_only} 件")
 
     @pytest.hookimpl(trylast=True)
     def pytest_sessionfinish(self, session, exitstatus):
-        """module / session スコープの fixture が残したもののための最後の網。"""
+        """module / session スコープの fixture が残したもののための最後の網。
+
+        fixture の `_crewvia_no_leaked_descendants` と同じ扱い (`settle` で再試行し、
+        survivors が無くても unobservable が残れば報告する) をここにも入れる。
+        """
         if not available():
             return
-        result = scan(set(), self.marker_value, self.basetemp)
+        result = settle(set(), self.marker_value, self.basetemp)
         if result.survivors:
             report = kill_all(result.survivors)
             message = format_failure("session finish", result, report)
             self.leaks.append(message)
             print("\n" + message)
             session.exitstatus = int(pytest.ExitCode.TESTS_FAILED)
+        elif result.unobservable:
+            self.unobservable_only += 1
+            print(f"\n[leaked-descendants] session finish: 子孫プロセスとは確認できなかったが、"
+                  f"環境が読めず観測できなかった同 uid のプロセスが {result.unobservable} 個残っている "
+                  f"(『無い』とは言えない。数には入れていない)")
 
 
 def install(config) -> LeakGuard | None:

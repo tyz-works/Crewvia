@@ -166,6 +166,78 @@ def test_an_empty_environ_is_not_counted_as_observed(monkeypatch):
         "空の environ を「観測できた」にすると、exec 中の印つき子孫を黙って見逃す")
 
 
+def test_cmdline_match_requires_a_path_boundary_not_a_bare_prefix():
+    """`/tmp/pytest-1` は `/tmp/pytest-10/test.py` の前方一致であって同じディレクトリではない。
+
+    素の部分文字列一致 (`basetemp in cmdline`) だと、別の pytest セッションの basetemp
+    (`pytest-10`) 配下で動く若いプロセスを、自分の basetemp (`pytest-1`) 配下の子孫と
+    誤認し、殺す対象に入れてしまう。
+    """
+    basetemp = b"/tmp/pytest-1"
+    colliding = b"/usr/bin/python3\0/tmp/pytest-10/test.py\0"
+    assert not leaked_descendants._dir_in_cmdline(colliding, basetemp), (
+        "接頭辞が一致するだけの別ディレクトリ (pytest-10) を basetemp (pytest-1) 配下と誤認した")
+
+    real_subpath = b"/usr/bin/python3\0/tmp/pytest-1/test.py\0"
+    assert leaked_descendants._dir_in_cmdline(real_subpath, basetemp), (
+        "本物の basetemp 配下の引数を検出できていない")
+
+    exact_arg = b"/tmp/pytest-1"
+    assert leaked_descendants._dir_in_cmdline(exact_arg, basetemp), (
+        "引数がディレクトリそのものと完全一致する形 (境界が終端) を拒否している"
+    )
+
+
+def test_settle_retries_while_unobservable_remains(monkeypatch):
+    """survivors が 0 でも unobservable が残っている間は再試行する。
+
+    exec 直後の空 environ のような一過性の観測失敗を、1 回読めなかっただけで
+    「クリーンな結果 (unobservable=1 のまま)」として確定させない。
+    """
+    calls: list[int] = []
+
+    def fake_scan(exclude, marker_value, basetemp):
+        calls.append(1)
+        result = leaked_descendants.Scan()
+        result.unobservable = 0 if len(calls) > 1 else 1
+        return result
+
+    monkeypatch.setattr(leaked_descendants, "scan", fake_scan)
+    monkeypatch.setattr(leaked_descendants, "GRACE_SECONDS", 1.0)
+    monkeypatch.setattr(leaked_descendants, "_POLL_SECONDS", 0.01)
+    result = leaked_descendants.settle(set(), "marker", "/tmp")
+    assert len(calls) >= 2, "unobservable が残っているのに再試行しなかった (1 回で確定させた)"
+    assert result.unobservable == 0
+
+
+class _FakeSession:
+    def __init__(self):
+        self.exitstatus = 0
+
+
+def test_sessionfinish_reports_but_does_not_fail_on_unobservable_only(monkeypatch, capsys):
+    """survivors が 0 で unobservable だけが残った session finish は、report はするが落とさない。
+
+    `scan`/`settle` のどちらを呼ぶ実装でも同じ偽の結果を返すよう両方差し替える —— 呼び出し方の
+    詳細に依らず「survivors が無くても unobservable を報告する」という振る舞いだけを固定する。
+    """
+    def fake_result(exclude, marker_value, basetemp):
+        result = leaked_descendants.Scan()
+        result.unobservable = 2
+        return result
+
+    monkeypatch.setattr(leaked_descendants, "settle", fake_result)
+    monkeypatch.setattr(leaked_descendants, "scan", fake_result)
+
+    guard_obj = leaked_descendants.LeakGuard("marker-that-matches-nothing")
+    session = _FakeSession()
+    guard_obj.pytest_sessionfinish(session, 0)
+
+    assert guard_obj.unobservable_only == 1, "unobservable だけの session finish を報告していない"
+    assert session.exitstatus == 0, "確認できない観測失敗だけを理由に session を失敗にした"
+    assert "観測でき" in capsys.readouterr().out, "unobservable の報告が標準出力に出ていない"
+
+
 def test_scan_ignores_processes_that_were_there_before(basetemp):
     pid = _spawn_orphan()
     try:

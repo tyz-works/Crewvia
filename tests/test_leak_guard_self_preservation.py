@@ -10,6 +10,7 @@ WSL ごと落ちた。判定を壊す変異は今後も書かれる。この 1 �
 from __future__ import annotations
 
 import os
+import pathlib
 import subprocess
 import sys
 import time
@@ -26,12 +27,8 @@ pytestmark = pytest.mark.skipif(
 #: 却下された 1 個のせいで「上限内」に落ちてしまう。余裕を持たせて環境に依存させない。
 _OVER_CAP = kill_budget.DEFAULT_MAX_KILLS * 2 + 1
 
-#: 実在しにくい高い pid 帯 (実在しても年齢で却下されるだけで、上限判定は上の余裕で守られる)。
+#: 実在しにくい高い pid 帯 (stat が読めない候補を作るのに使う)。
 _SYNTHETIC_BASE = 4_000_001
-
-
-def _synthetic_pids(count=_OVER_CAP):
-    return list(range(_SYNTHETIC_BASE, _SYNTHETIC_BASE + count))
 
 
 def _broken_belongs(pid, marker, basetemp):
@@ -41,6 +38,17 @@ def _broken_belongs(pid, marker, basetemp):
 
 def _sleeper():
     return subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+
+
+def _sleepers(count):
+    return [_sleeper() for _ in range(count)]
+
+
+def _reap(children):
+    for c in children:
+        c.kill()
+    for c in children:
+        c.wait()
 
 
 def test_broken_predicate_refuses_the_dangerous_targets(monkeypatch):
@@ -115,18 +123,65 @@ def test_a_real_young_descendant_is_still_killed(monkeypatch):
 
 
 def test_budget_cap_refuses_everything():
-    """上限を超えたら「本当に漏れた」ではなく判定の事故を疑い、1 件も殺さない。"""
-    many = _synthetic_pids()
-    allowed, refused, fatal = kill_budget.partition(many)
-    assert fatal is not None and "上限" in fatal, "上限を超えたのに見送っていない"
-    assert allowed == [], "上限超過でも kill 対象が残った"
-    assert len(refused) == len(many), "見送った件は全部 refused に出す"
+    """上限を超えたら「本当に漏れた」ではなく判定の事故を疑い、1 件も殺さない。
+
+    候補は実在して stat が読める (= 素通りすれば allowed に入りうる) 若いプロセスでなければ
+    ならない。stat が読めない候補は fail-closed の対象になり、上限判定に届く前に個別の理由で
+    refused になってしまうため (fail-open fix: `partition` は読めない候補を allowed にしない)、
+    合成 (実在しない) pid では上限判定そのものを検証できない。
+    """
+    children = _sleepers(_OVER_CAP)
+    try:
+        allowed, refused, fatal = kill_budget.partition([c.pid for c in children])
+        assert fatal is not None and "上限" in fatal, "上限を超えたのに見送っていない"
+        assert allowed == [], "上限超過でも kill 対象が残った"
+        assert len(refused) == len(children), "見送った件は全部 refused に出す"
+    finally:
+        _reap(children)
 
 
 def test_budget_var_can_raise_the_cap_but_garbage_falls_back():
-    """上限は環境変数で上げられる。読めない値で上限が消えてはいけない。"""
-    many = _synthetic_pids()
-    _, _, fatal_raised = kill_budget.partition(many, environ={kill_budget.BUDGET_VAR: "1000"})
-    assert fatal_raised is None, "上限を上げたのに見送られた"
-    _, _, fatal_garbage = kill_budget.partition(many, environ={kill_budget.BUDGET_VAR: "yes-please"})
-    assert fatal_garbage is not None, "壊れた環境変数で上限が消えてはいけない"
+    """上限は環境変数で上げられる。読めない値で上限が消えてはいけない。
+
+    (上と同じ理由で、上限判定を検証する候補は実在する若いプロセスでなければならない。)
+    """
+    children = _sleepers(_OVER_CAP)
+    try:
+        pids = [c.pid for c in children]
+        _, _, fatal_raised = kill_budget.partition(pids, environ={kill_budget.BUDGET_VAR: "1000"})
+        assert fatal_raised is None, "上限を上げたのに見送られた"
+        _, _, fatal_garbage = kill_budget.partition(pids, environ={kill_budget.BUDGET_VAR: "yes-please"})
+        assert fatal_garbage is not None, "壊れた環境変数で上限が消えてはいけない"
+    finally:
+        _reap(children)
+
+
+def test_a_candidate_whose_stat_cannot_be_read_is_refused_not_allowed():
+    """kill_budget fail-open fix: 対象の stat が読めない (= 存在しない / 消えた) candidate を allowed に入れない。
+
+    旧実装は `got is not None and ...` の条件が False になるだけで候補が `allowed` に落ち、
+    上限判定でしか止まらなかった (合成 pid が上限を超えたときだけ偶然守られていた)。
+    """
+    bogus = _SYNTHETIC_BASE - 1
+    assert not pathlib.Path(f"/proc/{bogus}").exists(), "前提: この pid は実在しない"
+    allowed, refused, fatal = kill_budget.partition([bogus])
+    assert allowed == [], "stat が読めない候補が allowed に入った"
+    assert fatal is None
+    assert len(refused) == 1 and "読めない" in refused[0].reason, refused
+
+
+def test_all_candidates_are_refused_when_the_sessions_own_start_time_is_unreadable():
+    """kill_budget fail-open fix: 自分の開始時刻が読めなければ、候補がどれだけ若くて実在しても年齢を検証できない。
+
+    検証できないことを「制限なし」に倒さず、全候補を拒否する。
+    """
+    child = _sleeper()
+    try:
+        bogus_me = _SYNTHETIC_BASE - 2
+        assert not pathlib.Path(f"/proc/{bogus_me}").exists(), "前提: この pid は実在しない"
+        allowed, refused, fatal = kill_budget.partition([child.pid], me=bogus_me)
+        assert allowed == [], "自分の開始時刻が読めないのに候補が allowed に入った"
+        assert refused and all("開始時刻" in r.reason for r in refused), refused
+    finally:
+        child.kill()
+        child.wait()

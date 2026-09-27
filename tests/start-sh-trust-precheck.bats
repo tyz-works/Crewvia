@@ -103,9 +103,14 @@ case "$cmd" in
   capture-pane)
     # FAKE_DIALOG_AFTER=N: N 回目までの capture は普通の入力行、それ以降は trust ダイアログ
     # (0 なら最初から)。unset なら常に普通の入力行。
+    # FAKE_CAPTURE_EMPTY_AFTER=N: N 回目以降は出力なし (空) を返す — capture の失敗／画面が
+    # 本当に空、のどちらも区別できない状態を模す (t051 P2)。両方は同時に使わない。
     if [[ -n "${FAKE_DIALOG_AFTER:-}" ]]; then
       n=$(cat "$FAKE_CAPTURES"); echo $((n + 1)) > "$FAKE_CAPTURES"
       if [[ $n -ge $FAKE_DIALOG_AFTER ]]; then cat "$FAKE_DIALOG"; exit 0; fi
+    elif [[ -n "${FAKE_CAPTURE_EMPTY_AFTER:-}" ]]; then
+      n=$(cat "$FAKE_CAPTURES"); echo $((n + 1)) > "$FAKE_CAPTURES"
+      if [[ $n -ge $FAKE_CAPTURE_EMPTY_AFTER ]]; then exit 0; fi
     fi
     echo "❯ "; exit 0 ;;
   display-message)
@@ -133,7 +138,7 @@ FAKESCRIPT
     export PATH="${FAKE_DIR}:${PATH}"
     export CREWVIA_TASKVIA=disabled
     export CREWVIA_MUX=tmux
-    unset CREWVIA_MUX_ENABLED CREWVIA_BENCH_MODE CREWVIA_TMUX_SESSION AGENT_NAME TARGET_DIR FAKE_DIALOG_AFTER
+    unset CREWVIA_MUX_ENABLED CREWVIA_BENCH_MODE CREWVIA_TMUX_SESSION AGENT_NAME TARGET_DIR FAKE_DIALOG_AFTER FAKE_CAPTURE_EMPTY_AFTER
 }
 
 teardown() {
@@ -307,6 +312,34 @@ _kickoffs()   { grep -cF -- "ミッション開始" "$FAKE_TMUX_LOG" || true; }
 }
 
 # ---------------------------------------------------------------------------
+# 1b. precheck が読んだ設定と、spawn 先が読む設定が一致すること (t051 P1)
+# ---------------------------------------------------------------------------
+
+@test "CLAUDE_CONFIG_DIR read by the precheck is forwarded to the spawned claude (t051 P1)" {
+    trust_fixture_setup "$TARGET"
+    CFG="$CLAUDE_CONFIG_DIR"
+    TARGET_DIR="$TARGET" run bash "$START_SH" worker --name Ren code
+
+    [ "$status" -eq 0 ]
+    _launched
+    grep -qF "CLAUDE_CONFIG_DIR='${CFG}'" "$FAKE_TMUX_LOG"
+}
+
+@test "without CLAUDE_CONFIG_DIR, the launch command clears any stale value the pane's server env might hold (t051 P1)" {
+    unset CLAUDE_CONFIG_DIR
+    FAKE_HOME="$(mktemp -d)"
+    printf '{"projects": {"%s": {"hasTrustDialogAccepted": true}}}' "$TARGET" > "${FAKE_HOME}/.claude.json"
+    PYTHONUSERBASE="${PYTHONUSERBASE:-$HOME/.local}" HOME="$FAKE_HOME" TARGET_DIR="$TARGET" \
+        run bash "$START_SH" worker --name Ren code
+
+    [ "$status" -eq 0 ]
+    _launched
+    grep -q 'unset CLAUDE_CONFIG_DIR' "$FAKE_TMUX_LOG"
+    ! grep -q "CLAUDE_CONFIG_DIR='" "$FAKE_TMUX_LOG"
+    find "$FAKE_HOME" -depth -delete 2>/dev/null || true
+}
+
+# ---------------------------------------------------------------------------
 # 2. 最後の網: 事前検査をすり抜けてダイアログが出てしまった場合
 # ---------------------------------------------------------------------------
 
@@ -362,6 +395,35 @@ _kickoffs()   { grep -cF -- "ミッション開始" "$FAKE_TMUX_LOG" || true; }
     [ "$status" -eq 0 ]
     [[ "$output" == *"Kickoff message sent to Ren-worker (verified)"* ]]
     [ "$(_kickoffs)" -eq 1 ]
+    ! grep -q '^kill-window' "$FAKE_TMUX_LOG"
+    [ ! -e "$REFUSALS" ]
+}
+
+@test "last net: a screen that cannot be captured is never treated as 'no dialog' — refused before send (t051 P2)" {
+    trust_fixture_setup
+    # capture-pane が (delivery 失敗か画面が本当に空かの区別なく) 空を返し続ける状況を模す。
+    FAKE_CAPTURE_EMPTY_AFTER=2 TARGET_DIR="$TARGET" run bash "$START_SH" worker --name Ren code
+
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"確認できません"* ]]
+    [[ "$output" != *"(verified)"* ]]
+    [[ "$output" != *"Kickoff message sent"* ]]
+    [ "$(_kickoffs)" -eq 0 ]
+    grep -q '^kill-window' "$FAKE_TMUX_LOG"
+    grep -q ' REFUSED kind=trust-dialog-unobservable role=worker agent=Ren ' "$REFUSALS"
+}
+
+@test "bench mode is not gated by the last-net trust dialog check in the prompt-wait loop either (t051 P2x2)" {
+    trust_fixture_setup
+    # プロンプト待ちループが最初から trust ダイアログの画面を見る状況 (precheck 自体は bench mode
+    # なので既に対象外)。この網も bench mode を対象外にしないと、bench controller が処理する前に
+    # start.sh がこの pane を kill して exit 1 してしまう。
+    FAKE_DIALOG_AFTER=0 CREWVIA_BENCH_MODE=1 TARGET_DIR="$TARGET" run bash "$START_SH" worker --name Ren code
+
+    [ "$status" -eq 0 ]
+    _launched
+    [[ "$output" == *"BENCH_MODE: skipping auto-kickoff"* ]]
+    [[ "$output" != *"trust ダイアログで止まっています"* ]]
     ! grep -q '^kill-window' "$FAKE_TMUX_LOG"
     [ ! -e "$REFUSALS" ]
 }

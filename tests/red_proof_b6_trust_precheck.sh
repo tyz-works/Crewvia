@@ -20,6 +20,13 @@
 #   R  lib_trust: 折り返した文言の判定を外す (空白を畳まない)                → 赤 (pytest)
 #   S  lib_trust: 単独の "No, exit" もダイアログに数える                    → 赤 (pytest)
 #
+# t051 (B6 fix: PR#237 の Codex findings) で追加:
+#   T  start.sh: CLAUDE_CONFIG_DIR を spawn 先に伝播しない (P1)              → 赤 (bats)
+#   U  start.sh: 未設定時に spawn 先の古い値を unset しない (P1)             → 赤 (bats)
+#   W  start.sh: 空画面を「ダイアログなし」に倒す (P2)                       → 赤 (bats)
+#   X  start.sh: 送信直前/直後の網を緩い版に戻す (観測不能でも Enter を送る) (P2) → 赤 (bats)
+#   Y  start.sh: プロンプト待ちループの網に bench mode の除外を付けない (P2x2) → 赤 (bats)
+#
 # 注意 (defense in depth): 最後の網は 3 か所 (待機中 / 送信前 / 送信後) にあり、**1 か所だけ**を外しても、
 # 別の 1 か所が同じ画面を捕まえるので、多くのテストは緑のまま。だから G / H は「その 1 か所にだけ
 # 反応するテスト」(送信前の窓・送信後の verified) が赤になることを名指しで確かめ、I は 2 か所を同時に
@@ -142,22 +149,26 @@ expect_red_bats "case J" "the refusal is written to the log file"
 
 echo "== case K: 最後の網が窓を片付けない"
 fresh_copy
-inject scripts/start.sh '    mux_kill "$WINDOW_NAME" >/dev/null 2>&1 \' '    true \'
+# t051 で _abort_on_unobservable_dialog にも同じ mux_kill 行が増えたので、直前の _log_refusal 行込みで
+# _abort_on_trust_dialog 側だけを名指しする (unobservable 側は _log_refusal trust-dialog-unobservable)。
+inject scripts/start.sh '    _log_refusal trust-dialog "$msg"
+    mux_kill "$WINDOW_NAME" >/dev/null 2>&1 \' '    _log_refusal trust-dialog "$msg"
+    true \'
 expect_red_bats "case K" "last net: a trust dialog on the pane stops the launch"
 
 echo "== case G: 送信後の検査を外す (dialog のまま verified と言い切る)"
 fresh_copy
-inject scripts/start.sh '    _trust_dialog_check "kickoff 送信後"' '    true'
+inject scripts/start.sh '    _require_no_trust_dialog "kickoff 送信後"' '    true'
 expect_red_bats "case G" "last net: a dialog still on screen after the send"
 
 echo "== case H: 送信前の検査を外す"
 fresh_copy
-inject scripts/start.sh '      _trust_dialog_check "kickoff 送信前 (${_kickoff_attempt}/3)"' '      true'
+inject scripts/start.sh '      _require_no_trust_dialog "kickoff 送信前 (${_kickoff_attempt}/3)"' '      true'
 expect_red_bats "case H" "last net: a dialog that shows up after the prompt was seen"
 
 echo "== case I: 待機中と送信前の検査を外す (送信後の網しか残らない → kickoff が送られてしまう)"
 fresh_copy
-inject scripts/start.sh '      _trust_dialog_check "kickoff 送信前 (${_kickoff_attempt}/3)"' '      true'
+inject scripts/start.sh '      _require_no_trust_dialog "kickoff 送信前 (${_kickoff_attempt}/3)"' '      true'
 inject scripts/start.sh '    _trust_dialog_check "❯ の待機中"' '    true'
 expect_red_bats "case I" \
     "last net: a trust dialog on the pane stops the launch" \
@@ -204,6 +215,42 @@ echo "== case S: 単独の No, exit もダイアログに数える"
 fresh_copy
 inject scripts/lib_trust.py "    return 'no, exit' in flat and 'enter to confirm' in flat" "    return 'no, exit' in flat"
 expect_red_py "case S" "test_ordinary_screens_are_not_mistaken_for_the_dialog"
+
+echo "== case T: CLAUDE_CONFIG_DIR を spawn 先に伝播しない (t051 P1)"
+fresh_copy
+inject scripts/start.sh "    ENV_EXPORTS+=\" CLAUDE_CONFIG_DIR='\${CLAUDE_CONFIG_DIR}'\"" "    true"
+expect_red_bats "case T" "CLAUDE_CONFIG_DIR read by the precheck is forwarded to the spawned claude"
+
+echo "== case U: 未設定時に spawn 先の古い値を unset しない (t051 P1)"
+fresh_copy
+inject scripts/start.sh '    _TRUST_UNSET_STALE_CONFIG_DIR="unset CLAUDE_CONFIG_DIR; "' '    _TRUST_UNSET_STALE_CONFIG_DIR=""'
+expect_red_bats "case U" "without CLAUDE_CONFIG_DIR, the launch command clears any stale value"
+
+echo "== case W: 空画面を『ダイアログなし』に倒す (t051 P2)"
+fresh_copy
+inject scripts/start.sh '    if [[ -z "$screen" ]]; then
+      return 2
+    fi
+    printf' '    printf'
+expect_red_bats "case W" "last net: a screen that cannot be captured is never treated"
+
+echo "== case X: 送信直前/直後の網を緩い版に戻す (t051 P2)"
+fresh_copy
+inject scripts/start.sh '      _require_no_trust_dialog "kickoff 送信前 (${_kickoff_attempt}/3)"' '      _trust_dialog_check "kickoff 送信前 (${_kickoff_attempt}/3)"'
+inject scripts/start.sh '    _require_no_trust_dialog "kickoff 送信後"' '    _trust_dialog_check "kickoff 送信後"'
+expect_red_bats "case X" "last net: a screen that cannot be captured is never treated"
+
+echo "== case Y: プロンプト待ちループの網に bench mode の除外を付けない (t051 P2x2)"
+fresh_copy
+inject scripts/start.sh '    [[ "${CREWVIA_BENCH_MODE:-0}" == "1" ]] && return 0
+    local rc=0
+    _trust_dialog_shown || rc=$?
+    case $rc in
+      0) _abort_on_trust_dialog "$1" ;;' '    local rc=0
+    _trust_dialog_shown || rc=$?
+    case $rc in
+      0) _abort_on_trust_dialog "$1" ;;'
+expect_red_bats "case Y" "bench mode is not gated by the last-net trust dialog check"
 
 echo
 echo "PASS=$PASS FAIL=$FAIL"

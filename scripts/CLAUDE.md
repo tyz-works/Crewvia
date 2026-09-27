@@ -66,3 +66,9 @@ lib ごとの**破ってはいけない契約**の要約。理由・経緯・全
   拒否は端末と `logs/start-sh/refusals.log` の両方に出す（`_log_refusal`）。副作用より前に置く。
 - kickoff 前後の最後の網（`lib_trust.py dialog`）が、`❯`（ダイアログの選択カーソルでもある）を入力行と誤認する穴を塞ぐ。
   ダイアログの文言の定義は `lib_trust.py` の 1 箇所。戻し方は `knowledge/file-map.md`「lib_trust.py」。
+- `CLAUDE_CONFIG_DIR` は precheck (ambient env) と spawn 先 (`ENV_EXPORTS`) で必ず同じ値にする。設定されて
+  いれば伝播し、未設定なら spawn 先で明示的に `unset`（mux server 側に残る古い値を消す。t051 P1）。
+- `capture()` は「読めなかった」と「画面が本当に空」を区別できず同じ `""` を返す。空画面を「ダイアログ
+  なし」に倒さない — kickoff 送信直前・送信後は `_require_no_trust_dialog`（画面の検査が成功するまで
+  有限回再試行、それでも駄目なら拒否）を使う。プロンプト待ちループ側の `_trust_dialog_check` は緩い網
+  （観測できない間は上位のポーリングに委ねる）で、`CREWVIA_BENCH_MODE=1` はここも対象外にする（t051 P2 / P2x2）。

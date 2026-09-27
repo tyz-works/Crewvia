@@ -391,6 +391,25 @@ claude の trust ダイアログを `start.sh` が踏まないための検査（
 fake tmux で start.sh を mux モードで走らせるテストは `tests/trust_fixture.sh` で信頼を宣言する
 （しないと CI（`~/.claude.json` が無い）でだけ落ちる）
 
+**t051 (B6 fix / PR#237 の Codex findings) で直した 3 件**:
+- **P1 (設定の不伝播)**: precheck は `start.sh` プロセスの ambient `CLAUDE_CONFIG_DIR` を読むが、
+  spawn 先のペインは mux server が保持し続ける起動時点の env（`herdr-server-stale-env-inheritance`）
+  を引き継ぐため、precheck が見た設定と実際に起動する claude が読む設定が食い違いうる。`CLAUDE_CONFIG_DIR`
+  が設定されていれば `ENV_EXPORTS` に含めて spawn 先へも伝え、未設定なら spawn 先の起動コマンドで
+  明示的に `unset CLAUDE_CONFIG_DIR`（server 側に残っているかもしれない古い値を消す）。
+- **P2 (読めない画面を「無い」に倒す)**: `capture()` は「pane を読めなかった」ときも「画面が本当に空」
+  なときも同じ `""` を返し区別できない（`Mux.verify_sent` の docstring と同じ理由）。空を「ダイアログ
+  なし」に倒すと、まさに読めなかった側で kickoff の Enter を送ってしまう（この網が本来防ぐはずだった
+  失敗そのもの）。空画面は「観測できない」として扱い、kickoff 送信直前・送信後の網
+  （`_require_no_trust_dialog`）は画面の検査が成功する（rc=0 か rc=1）まで有限回 (3 回) 再試行し、
+  それでも駄目なら拒否する。プロンプト待ちループ側の緩い網（`_trust_dialog_check`）は観測できない間
+  中止せず、上位の 30 回ポーリングに判定を委ねる（起動直後の「まだ何も描画していない」正常系まで
+  拾わないため）。
+- **P2x2 (bench mode の除外漏れ)**: プロンプト待ちループの `_trust_dialog_check` は precheck と同じ
+  `CREWVIA_BENCH_MODE` 除外条件を持たず、bench mode の未信頼 pane まで kill していた。関数の先頭に
+  `[[ "${CREWVIA_BENCH_MODE:-0}" == "1" ]] && return 0` を追加（kickoff 送信直前/後は元から
+  `if BENCH_MODE != 1` ブロックの内側なので対象外だった）。
+
 **戻し方**（誤判定すると Worker / Director の起動が止まる種類の変更。**env の停止スイッチは付けない**:
 trust は利用者の判断で、迂回口を作ると「信頼していない dir で起動して即死」に戻る）:
 (1) 個別に通す — 止められた dir は、表示されたコマンド（`! cd <dir> && claude` で Yes を選ぶか、`jq`

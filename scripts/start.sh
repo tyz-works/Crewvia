@@ -660,10 +660,18 @@ if [[ "${_EFFECTIVE_MUX_ENABLED:-0}" == "1" ]]; then
   # claude が終了していた。それでも「Kickoff message sent (verified)」と言っていた (症状の本体は
   # 失敗が不可視だったこと)。画面にダイアログの文言があれば、kickoff を送らず失敗として止める。
   # 文言の定義は lib_trust.py の 1 箇所。
-  _trust_dialog_shown() {   # 0 = 出ている / 1 = 出ていない / 2 = 検出器が壊れた
+  _trust_dialog_shown() {   # 0 = 出ている / 1 = 出ていないと確認できた / 2 = 観測できなかった (t051 P2)
+    # capture() は「pane を読めなかった」ときも「画面が本当に空」なときも同じ "" を返し、ここでは
+    # 区別できない (lib_mux.py Mux.verify_sent の docstring と同じ理由)。空を「ダイアログなし」に
+    # 倒すと、まさに読めなかった側で危険側へ倒れる (元の finding: capture 失敗が握り潰され、空画面が
+    # detector exit 1 = ダイアログなし、になっていた)。読めたと確認できるまで「無い」とは言わない。
     local screen rc=0
     screen="$(mux_capture "$WINDOW_NAME" 2>/dev/null)" || true
+    if [[ -z "$screen" ]]; then
+      return 2
+    fi
     printf '%s' "$screen" | python3 "${SCRIPT_DIR}/lib_trust.py" dialog || rc=$?
+    [[ $rc -ge 2 ]] && return 2
     return "$rc"
   }
   _abort_on_trust_dialog() {   # $1 = いつ見つけたか
@@ -677,17 +685,51 @@ if [[ "${_EFFECTIVE_MUX_ENABLED:-0}" == "1" ]]; then
       || echo "[crewvia] WARNING: $WINDOW_NAME を片付けられませんでした。手動で: mux_kill $WINDOW_NAME" >&2
     exit 1
   }
-  _trust_dialog_check() {   # $1 = いつ見たか。ダイアログが出ていれば起動を止める
+  _abort_on_unobservable_dialog() {   # $1 = いつ確認しようとしたか (t051 P2)
+    local msg="[crewvia] ERROR: $WINDOW_NAME の画面を検査できないため、trust ダイアログの有無を確認できません (${1})。
+          kickoff は送信していません。読めない状態を「ダイアログなし」とは扱いません (capture の失敗と
+          画面が本当に空の場合を区別できないため、区別できないときは危険側 = 止める側に倒します)。
+          この窓は片付けます。mux_capture ${WINDOW_NAME} で状況を確認し、dir を信頼してから起動し直してください:
+            ! cd '${WORK_DIR}' && claude      # \"Yes, I trust this folder\" を選び、/exit"
+    echo "$msg" >&2
+    _log_refusal trust-dialog-unobservable "$msg"
+    mux_kill "$WINDOW_NAME" >/dev/null 2>&1 \
+      || echo "[crewvia] WARNING: $WINDOW_NAME を片付けられませんでした。手動で: mux_kill $WINDOW_NAME" >&2
+    exit 1
+  }
+  _trust_dialog_check() {   # $1 = いつ見たか。プロンプト待ちループ専用 (`for _i in seq 1 30`) の緩い網。
+    # bench mode は自動 kickoff をしない (precheck と同じ除外条件) ので対象外にする (t051 P2x2)。
+    # 観測できない間 (rc=2) は中止しない — 上位のポーリングと、送信直前/直後の厳格な網 (下記
+    # _require_no_trust_dialog) に判定を委ねる。ここで焦って止めると、pane がまだ何も描画していない
+    # だけの正常な起動シーケンスまで拾ってしまう。
+    [[ "${CREWVIA_BENCH_MODE:-0}" == "1" ]] && return 0
     local rc=0
     _trust_dialog_shown || rc=$?
     case $rc in
       0) _abort_on_trust_dialog "$1" ;;
       1) ;;
       *) if [[ -z "${_TRUST_DETECTOR_WARNED:-}" ]]; then
-           echo "[crewvia] WARNING: trust ダイアログの検出器が異常終了しました (exit ${rc}) — この最後の網は効いていません" >&2
+           echo "[crewvia] WARNING: $WINDOW_NAME の画面をまだ検査できません (${1}) — ポーリングを続けます" >&2
            _TRUST_DETECTOR_WARNED=1
          fi ;;
     esac
+  }
+  _require_no_trust_dialog() {   # $1 = いつ。kickoff の送信直前・送信後専用の厳格な網 (t051 P2)。
+    # 画面の検査が成功した (= ダイアログの有無を確認できた) ことを要求する。有限回 (3回) 再試行し、
+    # それでも観測できなければ拒否する — 「読めない」を「無い」に倒して kickoff の Enter を送ってしまう
+    # (この網が本来防ぐはずだった失敗そのもの) のを避けるため。bench mode は自動 kickoff をしないので
+    # このガード自体が呼ばれない (呼び出し元が BENCH_MODE 時はブロックごとスキップする)。
+    local when="$1" attempt rc
+    for attempt in 1 2 3; do
+      rc=0
+      _trust_dialog_shown || rc=$?
+      case $rc in
+        0) _abort_on_trust_dialog "$when" ;;
+        1) return 0 ;;
+      esac
+      sleep 1
+    done
+    _abort_on_unobservable_dialog "$when"
   }
 
   # CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1: CLAUDE_CODE_CHILD_SESSION マーカーが存在しても
@@ -697,6 +739,20 @@ if [[ "${_EFFECTIVE_MUX_ENABLED:-0}" == "1" ]]; then
   # かつ公式 env var で transcript 保存を明示的に保証する (b)方式を採用。
   ENV_EXPORTS="export AGENT_NAME='$AGENT_NAME' TASKVIA_URL='$TASKVIA_URL' TASKVIA_TOKEN='${TASKVIA_TOKEN:-}' CREWVIA_TASKVIA='${CREWVIA_TASKVIA:-enabled}' ROLE='$ROLE' SKILLS='${SKILLS:-}' CREWVIA_REPO='$CREWVIA_REPO' CREWVIA_REPO_ROOT='$CREWVIA_REPO_ROOT' CREWVIA_QUEUE='$CREWVIA_QUEUE' CREWVIA_APPROVAL_CHANNEL='${CREWVIA_APPROVAL_CHANNEL:-taskvia}' NTFY_URL='${NTFY_URL:-}' NTFY_TOPIC='${NTFY_TOPIC:-}' NTFY_USER='${NTFY_USER:-}' NTFY_PASS='${NTFY_PASS:-}' APPROVAL_TOKEN_TTL_SECONDS='${APPROVAL_TOKEN_TTL_SECONDS:-900}' CREWVIA_MUX='${CREWVIA_MUX:-}' CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1"
   [[ "${ROLE}" == "worker" ]] && [[ "$WORK_DIR" != "$REPO_ROOT" ]] && ENV_EXPORTS+=" TARGET_DIR='$WORK_DIR'"
+
+  # --- CLAUDE_CONFIG_DIR: precheck が読んだ設定と、実際に起動する claude が読む設定を同一にする (t051 P1) ---
+  # 上の trust precheck (lib_trust.py check) は start.sh プロセスの ambient CLAUDE_CONFIG_DIR を読むが、
+  # ここまでの ENV_EXPORTS には含めていなかった。spawn 先のペインは mux server が保持し続ける起動時点の
+  # env (herdr-server-stale-env-inheritance) をそのまま引き継ぐため、precheck が見た設定と spawn 先が
+  # 読む設定が食い違いうる (信頼済みの設定が precheck を通ったのに別設定で起動して trust ダイアログに
+  # 当たる／その逆)。precheck と spawn 先を同じ値に揃え、未設定なら server 側に残っているかもしれない
+  # 古い値も明示的に消す (export 一覧に含めないだけでは、既に export 済みの値は消えない)。
+  if [[ -n "${CLAUDE_CONFIG_DIR:-}" ]]; then
+    ENV_EXPORTS+=" CLAUDE_CONFIG_DIR='${CLAUDE_CONFIG_DIR}'"
+    _TRUST_UNSET_STALE_CONFIG_DIR=""
+  else
+    _TRUST_UNSET_STALE_CONFIG_DIR="unset CLAUDE_CONFIG_DIR; "
+  fi
 
   # --model flag (空なら省略)
   MODEL_CLI_ARG=""
@@ -748,7 +804,7 @@ PYEOF
   # プロセスが export した PATH を継承しない（spawn() は env 引数を持たない —
   # 上の ENV_EXPORTS と同じ理由）。scripts/bin/plan を
   # 使えるようにするため、ペイン側の $PATH に対して明示的に prepend する。
-  LAUNCH_CMD="$ENV_EXPORTS; export PATH='${REPO_ROOT}/scripts/bin:'\"\$PATH\"; unset CLAUDE_CODE_CHILD_SESSION; cd '$WORK_DIR'; claude${MODEL_CLI_ARG}${SETTINGS_CLI_ARG}${PERMISSION_MODE_CLI_ARG}"
+  LAUNCH_CMD="$ENV_EXPORTS; export PATH='${REPO_ROOT}/scripts/bin:'\"\$PATH\"; unset CLAUDE_CODE_CHILD_SESSION; ${_TRUST_UNSET_STALE_CONFIG_DIR}cd '$WORK_DIR'; claude${MODEL_CLI_ARG}${SETTINGS_CLI_ARG}${PERMISSION_MODE_CLI_ARG}"
 
   # Drop spawn records whose pane is gone (a retired Worker's pane closes without
   # `kill()`, so its record outlives it).  Housekeeping only: the answer never
@@ -849,8 +905,9 @@ PYEOF
     # なっていた。stdout だけを捨て、warning はターミナル/ログに残す。
     _KICKOFF_LANDED=0
     for _kickoff_attempt in 1 2 3; do
-      # 送る直前にもう一度: `❯` を見つけた後にダイアログが出た場合の窓 (t021)。
-      _trust_dialog_check "kickoff 送信前 (${_kickoff_attempt}/3)"
+      # 送る直前にもう一度: `❯` を見つけた後にダイアログが出た場合の窓 (t021)。送信直前は
+      # 厳格な網 (_require_no_trust_dialog) を使う — 観測できないまま Enter を送らない (t051 P2)。
+      _require_no_trust_dialog "kickoff 送信前 (${_kickoff_attempt}/3)"
       mux_send "$WINDOW_NAME" "$KICKOFF_MSG" >/dev/null || true
       sleep 1.5
       if mux_verify_sent "$WINDOW_NAME" "$KICKOFF_MSG"; then
@@ -861,8 +918,9 @@ PYEOF
       sleep 2
     done
 
-    # 着弾検証が通っても、画面がダイアログのままなら「verified」と言わない (t021)。
-    _trust_dialog_check "kickoff 送信後"
+    # 着弾検証が通っても、画面がダイアログのままなら「verified」と言わない (t021)。ここも厳格な網
+    # (_require_no_trust_dialog) — 観測できないまま「verified」を名乗らない (t051 P2)。
+    _require_no_trust_dialog "kickoff 送信後"
 
     if [[ "$_KICKOFF_LANDED" -eq 1 ]]; then
       echo "[crewvia] Kickoff message sent to $WINDOW_NAME (verified)"

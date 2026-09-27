@@ -26,6 +26,7 @@
 #   W  start.sh: 空画面を「ダイアログなし」に倒す (P2)                       → 赤 (bats)
 #   X  start.sh: 送信直前/直後の網を緩い版に戻す (観測不能でも Enter を送る) (P2) → 赤 (bats)
 #   Y  start.sh: プロンプト待ちループの網に bench mode の除外を付けない (P2x2) → 赤 (bats)
+#   V2 start.sh: HOME を spawn 先に伝播しない (Director 指示の族 B 掃除で発見)     → 赤 (bats)
 #
 # 注意 (defense in depth): 最後の網は 3 か所 (待機中 / 送信前 / 送信後) にあり、**1 か所だけ**を外しても、
 # 別の 1 か所が同じ画面を捕まえるので、多くのテストは緑のまま。だから G / H は「その 1 か所にだけ
@@ -251,6 +252,11 @@ inject scripts/start.sh '    [[ "${CREWVIA_BENCH_MODE:-0}" == "1" ]] && return 0
     case $rc in
       0) _abort_on_trust_dialog "$1" ;;'
 expect_red_bats "case Y" "bench mode is not gated by the last-net trust dialog check"
+
+echo "== case V2: HOME を spawn 先に伝播しない (族 B 掃除で発見)"
+fresh_copy
+inject scripts/start.sh "  ENV_EXPORTS+=\" HOME='\${HOME}'\"" "  true"
+expect_red_bats "case V2" "HOME used by the precheck (when CLAUDE_CONFIG_DIR is unset) is forwarded too"
 
 echo
 echo "PASS=$PASS FAIL=$FAIL"

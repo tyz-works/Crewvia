@@ -754,6 +754,13 @@ if [[ "${_EFFECTIVE_MUX_ENABLED:-0}" == "1" ]]; then
     _TRUST_UNSET_STALE_CONFIG_DIR="unset CLAUDE_CONFIG_DIR; "
   fi
 
+  # --- HOME: 同じ理由 (t051 family B sweep) ---
+  # CLAUDE_CONFIG_DIR が未設定のとき、precheck (lib_trust.py) は `$HOME/.claude.json` を見る。
+  # HOME も CLAUDE_CONFIG_DIR と同じく ENV_EXPORTS に含めていなかったので、理論上は同じ
+  # 不伝播 (herdr-server-stale-env-inheritance) が起こりうる。`set -euo pipefail` の下で
+  # ここまで実行できている時点で HOME は必ず設定済みなので、unset 分岐は要らない。
+  ENV_EXPORTS+=" HOME='${HOME}'"
+
   # --model flag (空なら省略)
   MODEL_CLI_ARG=""
   if [[ -n "$SELECTED_MODEL" ]]; then

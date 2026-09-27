@@ -339,6 +339,19 @@ _kickoffs()   { grep -cF -- "ミッション開始" "$FAKE_TMUX_LOG" || true; }
     find "$FAKE_HOME" -depth -delete 2>/dev/null || true
 }
 
+@test "HOME used by the precheck (when CLAUDE_CONFIG_DIR is unset) is forwarded too — same family as P1" {
+    unset CLAUDE_CONFIG_DIR
+    FAKE_HOME="$(mktemp -d)"
+    printf '{"projects": {"%s": {"hasTrustDialogAccepted": true}}}' "$TARGET" > "${FAKE_HOME}/.claude.json"
+    PYTHONUSERBASE="${PYTHONUSERBASE:-$HOME/.local}" HOME="$FAKE_HOME" TARGET_DIR="$TARGET" \
+        run bash "$START_SH" worker --name Ren code
+
+    [ "$status" -eq 0 ]
+    _launched
+    grep -qF "HOME='${FAKE_HOME}'" "$FAKE_TMUX_LOG"
+    find "$FAKE_HOME" -depth -delete 2>/dev/null || true
+}
+
 # ---------------------------------------------------------------------------
 # 2. 最後の網: 事前検査をすり抜けてダイアログが出てしまった場合
 # ---------------------------------------------------------------------------

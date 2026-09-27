@@ -47,6 +47,7 @@ sys.path.insert(0, str(SCRIPTS))
 
 import lib_daemon_watch as dw  # noqa: E402
 import lib_mux  # noqa: E402
+from proc_group import kill_tree  # noqa: E402
 
 requires_tmux = pytest.mark.skipif(
     shutil.which("tmux") is None,
@@ -200,7 +201,7 @@ def reap():
     yield procs.append
     for p in procs:
         try:
-            p.kill()
+            kill_tree(p.pid)         # p だけ kill すると、bash の下の sleep が孤児で残る (t029)
             p.wait(timeout=5)
         except Exception:
             pass
@@ -230,7 +231,8 @@ def pty_shell():
     yield _spawn
     for pid in spawned:
         try:
-            os.kill(pid, 9)
+            # 対話シェルの裏の仕事 (`sleep 30 &`) は別のプロセスグループなので、木ごと殺す (t029)
+            kill_tree(pid)
             os.waitpid(pid, 0)
         except OSError:
             pass

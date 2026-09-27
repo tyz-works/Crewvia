@@ -51,6 +51,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
 import lib_task_cards  # noqa: E402
 from fixture_tree import copy_plan_tree  # noqa: E402
+from proc_group import run_in_own_group  # noqa: E402
 
 MISSION = "m-fixture"
 OTHER_MISSION = "m-other"
@@ -144,10 +145,12 @@ class Sandbox:
         return env
 
     def run(self, *args, env=None, timeout=60):
-        return subprocess.run(
+        # タイムアウトで殺すのは bash だけでは足りない: plan.sh の下の `python3 -` は FIFO の
+        # open() で永久に待つので、孤児で残る (t029)。グループごと殺す。
+        return run_in_own_group(
             ["bash", str(self.root / "scripts" / "plan.sh"), *args],
             env=env if env is not None else self.env(),
-            capture_output=True, text=True, timeout=timeout,
+            timeout=timeout,
         )
 
 

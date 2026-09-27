@@ -38,6 +38,18 @@ root の `CLAUDE.md` から移した、テスト専用の規則。設計と経�
 - 静的検査（`scripts/test_registry_lock.sh` 等）は worktree では除外判定が全件に当たり必ず PASS する。
   検査件数を出し、fixture の lib は helper 経由にする。
 
+## 子プロセスを残さない（`tests/leaked_descendants.py` / `tests/proc_group.py`）
+
+- plan.sh のような **bash の下で更に子を起こすもの** を `subprocess.run(timeout=)` / `Popen.kill()` で止めると、
+  殺されるのは bash だけで、下の `python3 -` は孤児になる（FIFO のテストでは `wait_for_partner` で永久に待つ）。
+  タイムアウトや後始末が要る実行は `proc_group.run_in_own_group()`（`Popen` なら `start_new_session=True` +
+  `kill_group()`）で、**木ごと**殺す。
+- 構造ガード: 各テストの後に、そのテストの間に増えて生きている **このセッションの子孫** があれば kill して、
+  そのテストを ERROR にする（`conftest.py` が `install()`）。「このセッションの子孫」は環境の印
+  `CREWVIA_PYTEST_SESSION` か cmdline / cwd が basetemp を指すこと。本番の plan.sh・デーモン・別セッションの
+  pytest は数えない・殺さない。ガードが赤くなったら、ガードではなくそのテストの後片付けを直す。
+- 設計・実測・戻し方: `knowledge/test-leaked-descendants.md`。
+
 ## red proof の作法
 
 - 修正のテストは、**欠陥を戻して赤くなること**を実証する（`tests/red_proof_*.sh`）。期待値をテスト内に

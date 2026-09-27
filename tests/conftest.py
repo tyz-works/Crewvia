@@ -69,6 +69,11 @@ def pytest_configure(config):
     os.environ["CREWVIA_HERDR_WORKSPACE"] = TEST_DESTINATION
     os.environ["CREWVIA_MUX_PANE_PREFIX"] = TEST_PANE_PREFIX
 
+    # テストが起こした子孫プロセスを、テストの終わりまでに残させない (t029 / backlog #32)。
+    # 印を os.environ に置くので、mux の隔離と同じくここ (collection の前) で入れる。
+    import leaked_descendants
+    leaked_descendants.install(config)
+
 
 def pytest_unconfigure(config):
     """終わるときに、このセッションが作った宛先 (と、死んだ pytest の残骸) を片付ける。

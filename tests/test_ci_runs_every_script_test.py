@@ -10,10 +10,11 @@ CI は `scripts/ci-run-script-tests.sh` で glob して全部走らせる。走�
 `scripts/ci-script-tests-excluded.txt` の `<path> | <理由>` だけ。このテストは次を機械で保証する。
 
 1. 全 `scripts/test_*.sh` が、実行 (RUN) か除外 (SKIP) のどちらかに **ちょうど 1 回** 入る（漏れも二重も無い）
-2. 除外ファイルの各行は、実在するファイルと **2 種類だけの理由** を持つ（理由の無い行・存在しない行・重複は赤）
+2. 除外ファイルの各行は、実在するファイルと **決められた理由** を持つ（理由の無い行・存在しない行・重複は赤）
 3. CI の workflow が runner を呼び、`scripts/test_*.sh` を **名指しで** 走らせる step が無い（名指しの一覧が戻らない）
 4. runner 自身の振る舞い: 1 本落ちても残りを止めない / 0 本走らせて PASS にしない / 壊れた除外ファイルで落ちる /
-   新しく足したテストは何もしなくても走る
+   新しく足したテストは何もしなくても走る / コメント判定は行を trim した後だけを見る (t043 P3-1) /
+   path の許容文字は pytest の正規表現と揃える (t043 P3-2)
 
 検査した件数は毎回出す（`-s` か失敗メッセージ）。0 件で PASS しない（memory:
 registry-dir-single-definition-and-vacuous-static-guards）。
@@ -34,10 +35,22 @@ RUNNER = SCRIPTS / "ci-run-script-tests.sh"
 ALLOWLIST = SCRIPTS / "ci-script-tests-excluded.txt"
 WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yml"
 
-#: 除外の理由は 2 種類だけ（Director 決定）。理由を足したいときはこの表を直す＝レビューに載る。
+#: 除外の理由は Director 決定の固定表。理由を足したいときはこの表を直す＝レビューに載る。
+#: t043 で 3 番目を追加: live の herdr/tmux 以外にも、live の Taskvia dev server /
+#: Upstash Redis / ntfy の実クレデンシャルが要る恒久的な除外がある (test_phase_c.sh /
+#: test_phase_e.sh)。CI にそれらの secret を持ち込む計画は無いので「未調査」ではなく
+#: 恒久の理由として書き直す。
 REASON_LIVE_MUX = "live の herdr / tmux が要る（恒久）"
+REASON_LIVE_EXTERNAL_SERVICES = "live の Taskvia dev server / Upstash Redis / ntfy の実クレデンシャルが要る（恒久）"
 REASON_UNINVESTIGATED = "未調査 (t043)"
-ALLOWED_REASONS = {REASON_LIVE_MUX, REASON_UNINVESTIGATED}
+ALLOWED_REASONS = {REASON_LIVE_MUX, REASON_LIVE_EXTERNAL_SERVICES, REASON_UNINVESTIGATED}
+
+#: allowlist の path とワークフロー内の「名指し」検出、両方が対象ファイル名として認める
+#: 字クラス。3 箇所 (runner の bash 正規表現・ここの 2 つの python 正規表現) がこれまで
+#: 食い違っていた (t043 P3-2, Director 指摘)。runner 側 (scripts/ci-run-script-tests.sh)
+#: はこの文字列と同じ字クラスを直接埋め込んでおり (bash から python の定数は import
+#: できないため)、変えるときは両方を直すこと。
+TEST_FILENAME_PATTERN = r"scripts/test_[A-Za-z0-9_]+\.sh"
 
 
 def _glob_tests() -> list[str]:
@@ -99,7 +112,7 @@ def test_allowlist_lines_have_a_real_file_and_one_of_two_reasons():
     bad: list[str] = []
     seen: set[str] = set()
     for no, path, reason in entries:
-        if not re.fullmatch(r"scripts/test_[A-Za-z0-9_]+\.sh", path):
+        if not re.fullmatch(TEST_FILENAME_PATTERN, path):
             bad.append(f"{no}: scripts/test_*.sh ではない: {path}")
         elif not (REPO_ROOT / path).is_file():
             bad.append(f"{no}: 存在しないファイル: {path}")
@@ -109,6 +122,21 @@ def test_allowlist_lines_have_a_real_file_and_one_of_two_reasons():
             bad.append(f"{no}: 重複: {path}")
         seen.add(path)
     assert not bad, "除外ファイルに不正な行がある:\n  " + "\n  ".join(bad)
+
+
+def test_no_uninvestigated_reason_remains():
+    """t043 の受入条件: allowlist に『未調査 (t043)』が 1 行も残っていないこと。
+
+    ALLOWED_REASONS には REASON_UNINVESTIGATED を残す (将来別 task が新しく CI に入れて
+    落ちたテストを一時的に置く先として)。ただしそのテキストは task id 付き
+    (`未調査 (t043)`) で t043 専用なので、この task が終わった時点では 0 件でなければ
+    ならない。将来同種の一時退避が要るなら、別 task id の新しい理由文字列を
+    ALLOWED_REASONS に追加すること（この定数を書き換えて再利用しない）。
+    """
+    entries, _ = _parse_allowlist(ALLOWLIST.read_text(encoding="utf-8"))
+    uninvestigated = [path for _, path, reason in entries if reason == REASON_UNINVESTIGATED]
+    print(f"\n[ci-runs-every-script-test] 検査した除外行: {len(entries)} 行中 未調査(t043): {len(uninvestigated)} 行")
+    assert not uninvestigated, f"『未調査 (t043)』が残っている: {uninvestigated}"
 
 
 def test_runner_skips_exactly_the_allowlisted_files():
@@ -136,7 +164,7 @@ def test_workflow_runs_the_runner_and_names_no_script_test():
 
     calls = [job for job, cmd in runs if "scripts/ci-run-script-tests.sh" in cmd]
     assert calls, "workflow が scripts/ci-run-script-tests.sh を呼んでいない（glob の実行が CI に載っていない）"
-    named = [(job, m.group(0)) for job, cmd in runs for m in re.finditer(r"scripts/test_\w+\.sh", cmd)]
+    named = [(job, m.group(0)) for job, cmd in runs for m in re.finditer(TEST_FILENAME_PATTERN, cmd)]
     assert not named, (
         "workflow が scripts/test_*.sh を名指しで走らせている。名指しの一覧に戻ると、足したテストが"
         f"黙って CI の外に残る。runner (glob) に任せ、走らせたくないものは除外ファイルへ: {named}")
@@ -208,15 +236,41 @@ def test_runner_does_not_pass_when_nothing_ran(tree):
     (["scripts/test_gone.sh | 未調査 (t043)"], "存在しないファイル"),
     (["scripts/test_a.sh | 未調査 (t043)", "scripts/test_a.sh | 未調査 (t043)"], "重複"),
     (["scripts/other.sh | 未調査 (t043)"], "scripts/test_*.sh ではない"),
-], ids=["no-reason", "empty-reason", "missing-file", "duplicate", "not-a-test"])
+    # t043 P3-2: path の許容文字を pytest の TEST_FILENAME_PATTERN と揃える。
+    # 以前の runner は glob `scripts/test_*.sh` で '-' も受理しており、ここは
+    # 素通り (pytest 側だけが赤くなる食い違い) だった。
+    (["scripts/test_foo-bar.sh | 未調査 (t043)"], "scripts/test_*.sh ではない"),
+], ids=["no-reason", "empty-reason", "missing-file", "duplicate", "not-a-test", "hyphenated-name"])
 def test_runner_rejects_a_malformed_allowlist(tree, lines, needle):
     tree.test("test_a.sh")
     (tree.root / "scripts" / "other.sh").write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+    (tree.root / "scripts" / "test_foo-bar.sh").write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
     tree.allowlist(*lines)
     proc = _run_runner(tree.runner)
     assert proc.returncode == 2, f"壊れた除外ファイルで落ちない: rc={proc.returncode}\n{proc.stdout}{proc.stderr}"
     assert needle in proc.stderr
     assert "ran test_a.sh" not in proc.stdout, "除外ファイルが壊れているのにテストを走らせた"
+
+
+def test_runner_comment_check_only_matches_a_truly_leading_hash(tree):
+    """t043 P3-1: 先頭が空白1個+行のどこかに # があるだけの正当な行を、runner がコメントとして
+    黙って無視してはいけない（trim してから先頭 # だけを見る。pytest の parser と同じ規則）。
+
+    以前の runner の判定 `[[:space:]]*"#"*` は「先頭が空白 1 個、かつ行のどこかに #」に
+    マッチしてしまい、`  scripts/test_a.sh | 未調査 (t043) 用の備考 #123` のような、
+    先頭に 1 個の空白があり理由の中に # を含む正当な行を丸ごとコメット扱いして
+    黙って除外リストから漏らしていた（SKIP に載らない = pytest 側の
+    test_runner_skips_exactly_the_allowlisted_files が検出する）。
+    """
+    tree.test("test_a.sh")
+    tree.test("test_b.sh")  # --list は「走らせた 0 本」を空振りとして拒否するので、除外対象以外を 1 本置く
+    tree.allowlist(" scripts/test_a.sh | 未調査 (t043) 用の備考 #123")
+    proc = _run_runner(tree.runner, "--list")
+    assert proc.returncode == 0, f"--list が落ちた: {proc.stdout}{proc.stderr}"
+    skipped = [ln.split(" ", 1)[1] for ln in proc.stdout.splitlines() if ln.startswith("SKIP ")]
+    assert skipped == ["scripts/test_a.sh"], (
+        "先頭に空白 1 個 + 理由の中に # がある正当な行を、runner がコメットとして"
+        f"読み飛ばした（除外として認識されない）: {proc.stdout}")
 
 
 def test_runner_refuses_to_run_without_an_allowlist_file(tree):

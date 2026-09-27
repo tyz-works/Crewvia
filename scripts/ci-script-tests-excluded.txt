@@ -3,12 +3,15 @@
 #
 # 形式: <path> | <理由>      （# で始まる行と空行は無視。理由の無い行・存在しないファイル・重複は CI が落ちる）
 #
-# 理由は次の 2 種類だけ（tests/test_ci_runs_every_script_test.py が強制する）:
-#   live の herdr / tmux が要る（恒久）   CI に無い実物の herdr / tmux が要り、偽物では代えられない
-#   未調査 (t043)                          新しく CI に入れたら落ちた。原因の棚卸しと修正は t043。直ったらこの行を消す
+# 理由は次の 3 種類だけ（tests/test_ci_runs_every_script_test.py の ALLOWED_REASONS が強制する）:
+#   live の herdr / tmux が要る（恒久）                                    CI に無い実物の herdr / tmux が要り、偽物では代えられない
+#   live の Taskvia dev server / Upstash Redis / ntfy の実クレデンシャルが要る（恒久）   CI に持ち込まない外部サービスの実 secret が要る
+#   未調査 (t043)                                                          新しく CI に入れたら落ちた。原因の棚卸しと修正は t043。直ったらこの行を消す
 #
 # 除外は「走らせない」の宣言であって「直った」ではない。行を足すときは理由を確かめる。
 
-scripts/test_phase_c.sh | 未調査 (t043)
-scripts/test_phase_e.sh | 未調査 (t043)
-scripts/test_watchdog_config_mode.sh | 未調査 (t043)
+# t043: NTFY_TOPIC/NTFY_PASS/UPSTASH_REDIS_REST_URL/UPSTASH_REDIS_REST_TOKEN が無いと
+# 即 exit 1 する（Taskvia .env.local 前提）。CI にこれらの secret を持ち込む計画は無い。
+scripts/test_phase_c.sh | live の Taskvia dev server / Upstash Redis / ntfy の実クレデンシャルが要る（恒久）
+# t043: UPSTASH_REDIS_REST_URL/UPSTASH_REDIS_REST_TOKEN が無いと即 exit 1 する（同上）。
+scripts/test_phase_e.sh | live の Taskvia dev server / Upstash Redis / ntfy の実クレデンシャルが要る（恒久）

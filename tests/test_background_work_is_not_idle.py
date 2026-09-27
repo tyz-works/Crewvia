@@ -17,20 +17,28 @@ tests/test_background_work_is_not_idle.py — 裏の shell / monitor は「止�
 watchdog はプロセス層 (t016) が既に hard idle を terminate にしない — ここではそれを
 **実プロセス木で** 通しで確かめ、上限 (max) が裏の子があっても効くことを固定する。
 
-## t065 (Codex review 2巡目, PR#238 P2): 判定根拠を時刻からプロセスの同定に移す
+## t074 (Codex review 3巡目 P1): 判定根拠を「何であるか (comm)」から「誰が起動したか」に移す
 
-t016 (`grace_seconds`) → t049 (`min_start_epoch`) はどちらも「いつ生えたか」という
-時刻を代理指標にしていたため、`plan.sh pull` の後で初めて起動する MCP サーバー
-(遅延起動の Playwright ブラウザ等) を本物の job と区別できず、job が全部終わった
-後も Rule 5 を永久に抑制し続ける偽陰性が残った。`lib_pane_process.classify_process_tree()`
-はもう時刻を見ない — comm (実行ファイル名) でシェル (job) と既知インフラを区別する。
-このファイルのテストもそれに合わせてある: `PROCESS_WORK_START_GRACE` は無くなった。
+t016 (`grace_seconds`) → t049 (`min_start_epoch`) → t065 (comm の同定) の 3 巡とも、
+「いつ生えたか」「何という名前か」という**代理指標**を使っていたため、それぞれ違う形で
+穴が残った (詳細は `scripts/lib_pane_process.py` docstring)。3巡目の穴は、本番の
+`npm exec @playwright/mcp` が npm の `process.title` 書き換えと `sh -c "..."` を挟む経路
+のせいで、comm ベースの許可リストでは MCP を job と誤読する (偽陰性)、というものだった。
+`lib_pane_process.classify_process_tree()` はもう comm も時刻も見ない —
+**祖先 (自分自身を含む) の cmdline に Bash tool / Monitor の shell snapshot wrapper
+(`/shell-snapshots/snapshot-` を `source` する形) が現れるか**で区別する。
 
-## 方法
+## 方法 (t074: symlink で名前を作る fixture は使わない — Codex がそれで素通りしたと指摘)
 
-* プロセス木は本物 (`sh` の親子)。MCP / ブラウザ相当は `_fake_binary()` で
-  `/bin/sh` を `node` / `chrome` 等の名前の symlink 越しに起動し、comm (実行体名)
-  だけを模擬する (実バイナリの中身は問わない — 分類は comm しか見ない)。
+* プロセス木は本物。MCP 相当は `_mcp_like_cmd()` で **本物の bash の `exec -a`** を使い、
+  実バイナリ (`/bin/sleep`) を実際に fork/exec しつつ argv[0]/cmdline だけを本番の
+  npm 実測値 (`npm exec @playwright/mcp@latest` 等) に書き換える (npm の
+  `process.title` 書き換えの実物相当。symlink で comm を偽装するのとは違い、
+  cmdline そのものが本物の観測対象になる — 分類は cmdline しか見ない)。
+* 裏の job 相当は `_job_wrapper_cmd()` で、Bash tool / Monitor が実際に生成する
+  wrapper の形 (`bash -c "source <shell-snapshot> ... && eval '<command>'"`) を
+  実測どおりそのまま再現する (2026-09-27 実測: 本ファイル群の実行時に自分の
+  `run_in_background` / Monitor で確認した実物の cmdline)。
 * dispatcher は **本物の** dispatcher.sh の埋め込み python を `exec()` して `check_rule5()` を呼ぶ
   (`tests/test_dispatcher_notify_once.py` の Harness)。差し替えるのは mux (状態と pane pid) だけ。
 * watchdog は本物の `WorkerMonitor.check_detail()`。差し替えるのは mux の pane pid 解決だけで、
@@ -45,6 +53,7 @@ fail の向き (memory: fail-direction-is-per-judgment) はテスト名に出す
 
 import json
 import os
+import shlex
 import signal
 import subprocess
 import sys
@@ -122,46 +131,77 @@ def _kill_pane_tree(proc: subprocess.Popen) -> None:
     proc.wait()
 
 
-def _fake_binary(directory, name: str, real: str = "/bin/sh") -> str:
-    """`real` への symlink を `name` という名前で作り、そのパスを返す。
+def _mcp_like_cmd(title: str, seconds: int = 300) -> str:
+    """本物の bash の `exec -a` で argv[0]/cmdline だけを書き換えて、実バイナリ
+    (`/bin/sleep`) を実際に fork/exec する (t074: symlink で名前を作る fixture は
+    使わない — Codex が「本物の起動経路を通っていない」と指摘している)。
 
-    /proc/<pid>/stat の comm (実行体名) は execve に渡したパス自身の
-    ベース名になる (実行ファイルの実体の名前ではない — 本ファイル内で実測
-    済み: `/bin/sleep` への symlink `chrome_test_marker` を実行すると
-    comm は `chrome_test_mar` [15 文字打ち切り] になる)。これを使って
-    node / chrome 等の永続インフラの comm を、実バイナリを入れずに模擬する。
-    `real="/bin/sh"` を使えば、模擬した名前のままシェルとして機能する
-    (comm は symlink 名のまま、中身は sh なので `-c` でさらに子を生やせる) —
-    「MCP サーバー (node) が後からブラウザ (chrome) を起動する」形を作れる。
+    npm は自分の `process.title` を書き換えるので、本番の MCP サーバーの
+    cmdline は `npm exec @playwright/mcp@latest ...` のような形になる
+    (`scripts/lib_pane_process.py` docstring の実測表)。`exec -a` はこれと
+    同じ効果 (argv[0]/cmdline の書き換え) を、実際の fork/exec を経て起こす —
+    comm を偽装する symlink と違い、cmdline そのものが本物の観測対象になる。
+    重要なのは、この cmdline のどこにも Bash tool / Monitor の wrapper marker
+    (`/shell-snapshots/snapshot-`) が **絶対に現れない**こと (分類はそれしか
+    見ない)。
     """
-    p = Path(directory) / name
-    if not p.exists():
-        p.symlink_to(real)
-    return str(p)
+    inner = f'exec -a {shlex.quote(title)} /bin/sleep {seconds}'
+    return f'bash -c {shlex.quote(inner)}'
+
+
+def _write_wrapper_snapshot(directory) -> Path:
+    """Bash tool / Monitor が起動のたびに書き出す shell snapshot ファイルの
+    使い捨てフィクスチャ (中身は無害な no-op)。パスに `/shell-snapshots/snapshot-`
+    を含めることが重要 — 分類はパスの中身でなく、cmdline に現れるこの部分
+    文字列だけを見る。
+    """
+    snap_dir = Path(directory) / ".claude" / "shell-snapshots"
+    snap_dir.mkdir(parents=True, exist_ok=True)
+    snap = snap_dir / "snapshot-test-fixture.sh"
+    if not snap.exists():
+        snap.write_text(": # no-op fixture snapshot\n")
+    return snap
+
+
+def _job_wrapper_cmd(snapshot_path: Path, inner: str) -> str:
+    """Bash tool (前景 / `run_in_background`) と Monitor が実際に生成する
+    wrapper の形そのもの (2026-09-27 t074 実測: 自分の `run_in_background` /
+    Monitor 呼び出しで `/proc/<pid>/cmdline` を直接読んで確認した):
+
+        /bin/bash -c source <shell-snapshot> ... && eval '<command>' ...
+
+    実測では他に `export CODEX_COMPANION_*` 等が挟まるが、分類が見るのは
+    `source` の後に続く `/shell-snapshots/snapshot-` という部分文字列だけなので、
+    ここでは本質だけを再現する。
+    """
+    script = f"source {shlex.quote(str(snapshot_path))} 2>/dev/null || true && eval {shlex.quote(inner)}"
+    return f"bash -c {shlex.quote(script)}"
 
 
 @pytest.fixture(scope="module")
 def panes(tmp_path_factory):
     """{"busy": pid, "quiet": pid} — どちらも本番のペインと同じ形の木。
 
-    busy   root sh ─ node(t=0, MCP 相当) ─ sh(t=0, 裏の job)
-    quiet  root sh ─ node(t=0, MCP 相当)                       … 裏の job 無し
+    busy   root sh ─ MCP相当 (node風 cmdline, t=0) ─ Bash tool wrapper (裏の job)
+    quiet  root sh ─ MCP相当 (node風 cmdline, t=0)                       … 裏の job 無し
 
-    MCP 相当は `_fake_binary()` で comm を `node` にする (t065: 分類は comm を
-    見るので、真の MCP サーバーでなくても「同定される既知インフラ」であれば
-    形が揃う)。**quiet にシェルを一切含めないこと** — シェル (comm) が見つかった
-    時点で job と判定するので、中身が空でも `sh -c "..."` のような wrapper を
+    MCP 相当は `_mcp_like_cmd()` で cmdline だけを本番実測の npm 表記に似せる
+    (`exec -a`。symlink は使わない)。**quiet に Bash tool wrapper 形を一切
+    含めないこと** — wrapper marker (`/shell-snapshots/snapshot-`) を持つ
+    cmdline が見つかった時点で job と判定するので、中身が空でもこの形を
     quiet 側に置くと、それだけで誤って job 側に倒れてしまう。
     各木は `start_new_session=True` で自分専用の process group を持つ
     (setsid)。teardown は `_kill_pane_tree()` で group ごと落とす (P3)。
     """
-    fake_bin_dir = tmp_path_factory.mktemp("fake-bin-panes")
-    node_bin = _fake_binary(fake_bin_dir, "node", real="/bin/sleep")
+    fake_dir = tmp_path_factory.mktemp("fake-panes")
+    snapshot = _write_wrapper_snapshot(fake_dir)
+    mcp_cmd = _mcp_like_cmd("npm exec @playwright/mcp@latest")
+    job_cmd = _job_wrapper_cmd(snapshot, "sleep 300")
     busy = subprocess.Popen(
-        ["sh", "-c", f'{node_bin} 300 & sh -c "sleep 300 & wait" & wait'],
+        ["sh", "-c", f'{mcp_cmd} & {job_cmd} & wait'],
         start_new_session=True)
     quiet = subprocess.Popen(
-        ["sh", "-c", f'{node_bin} 300 & wait'],
+        ["sh", "-c", f'{mcp_cmd} & wait'],
         start_new_session=True)
     time.sleep(3.5)  # 遅れて生える子が出そろうまで
     try:
@@ -266,6 +306,14 @@ class Rule5:
         return json.loads(
             (self.h.registry / "mux" / f"{AGENT}.state.json").read_text())
 
+    def job_since_path(self):
+        return self.h.registry / "mux" / f"{AGENT}.job-since.json"
+
+    def seed_job_since(self, seconds_ago):
+        """job が `seconds_ago` 秒前から連続して見え続けている、という状態を作る
+        (t074 追補: BACKGROUND_JOB_MAX_SECONDS の安全弁テスト用)。"""
+        self.ns["_save_job_since"](AGENT, time.time() - seconds_ago)
+
     def run(self):
         FakeMux.sent = []
         self.ns["check_rule5"](AGENT, TARGET, self.assignment, {})
@@ -303,6 +351,66 @@ def test_a_background_job_restarts_the_grace_and_clears_the_dedup_key(r5, panes)
     assert r5.entry()["state"] == "working"
     assert time.time() - r5.entry()["since"] < 30          # 測り直された
     assert f"idle_with_task_{AGENT}" not in r5.ns["load_notify_cache"]()
+
+
+# ---------------------------------------------------------------------------
+# t074 追補 (Director 実例, 2026-09-27 23:15〜23:45): Ren の
+# `while pgrep -f "<script>" > /dev/null; do sleep 15; done` は Bash tool の
+# ラッパーの子孫なので「起動元」判定では job と分かるが、`pgrep -f` が
+# ループ自身の cmdline に自己一致して赤の実証が終わった後も永遠に回り続けた。
+# 「job だから黙る」に上限 (BACKGROUND_JOB_MAX_SECONDS) を足し、黙る方向には
+# 倒さない安全弁を固定する。memory `pgrep-self-match-wait-loop-hangs-worker`。
+# ---------------------------------------------------------------------------
+
+def test_a_job_younger_than_the_ceiling_still_suppresses_rule5(r5, panes):
+    """上限に達していない裏の job は、従来どおり黙る (回帰させない)。"""
+    PaneMux.pane_state, PaneMux.pane_pid = "idle", panes["busy"]
+    r5.seed_job_since(r5.ns["BACKGROUND_JOB_MAX_SECONDS"] - 60)
+    r5.age_state()
+    assert r5.run() == []
+
+
+def test_a_job_older_than_the_ceiling_no_longer_suppresses_rule5(r5, panes):
+    """赤の実証: 裏の job (本物のシェル、`executing`) が生きたままでも、
+    連続して見え続けている時間が上限を超えたら通常の idle-with-task 判定に
+    進む (黙り続けない)。Ren の pgrep 自己一致ループのように、Bash tool の
+    ラッパーの子孫のまま何十分も進んでいない job を想定。
+    """
+    PaneMux.pane_state, PaneMux.pane_pid = "idle", panes["busy"]
+    r5.seed_job_since(r5.ns["BACKGROUND_JOB_MAX_SECONDS"] + 60)
+    r5.age_state()
+    msgs = r5.run()
+    assert len(msgs) == 1 and "idle-with-task" in msgs[0]
+
+
+def test_the_ceiling_timer_is_independent_of_the_grace_timer(r5, panes):
+    """job_since (連続 job 検出の起点) は grace の `since` (現在の条件が
+    始まった時刻。job があるあいだ毎サイクル書き直される) とは別物であること
+    を固定する — 同じフィールドを 2 つの意味で使うと、どちらかが壊れる。
+    grace を何度測り直しても (`run()` を複数回呼んでも)、job_since は
+    最初に job を見た時刻のまま変わらない。
+    """
+    PaneMux.pane_state, PaneMux.pane_pid = "idle", panes["busy"]
+    r5.age_state()
+    assert r5.run() == []
+    first_job_since = json.loads(r5.job_since_path().read_text())["job_since"]
+    time.sleep(1.1)
+    assert r5.run() == []                                    # grace ('since') は測り直る
+    assert r5.entry()["state"] == "working"
+    assert time.time() - r5.entry()["since"] < 5              # grace は測り直された
+    second_job_since = json.loads(r5.job_since_path().read_text())["job_since"]
+    assert second_job_since == first_job_since                 # job_since は変わらない
+
+
+def test_job_since_clears_when_the_job_ends(r5, panes):
+    """job が終われば job_since も消える — 次に別の job が生えたら新しく計り直す。"""
+    PaneMux.pane_state, PaneMux.pane_pid = "idle", panes["busy"]
+    r5.age_state()
+    assert r5.run() == []
+    assert r5.job_since_path().exists()
+    PaneMux.pane_pid = panes["quiet"]                          # job が終わった
+    r5.run()
+    assert not r5.job_since_path().exists()
 
 
 def test_grace_counts_from_the_end_of_the_job(r5, panes):
@@ -362,128 +470,81 @@ def test_a_vanished_pane_process_falls_to_the_notifying_side(r5):
 
 
 # ---------------------------------------------------------------------------
-# P2 2巡目 (Codex review, PR#238): 判定根拠を時刻からプロセスの同定に移す
+# t074 (Codex review 3巡目 P1): 判定根拠を「何であるか (comm)」から
+# 「誰が起動したか (起動元)」に移す。symlink で名前を作る fixture は使わない。
 # ---------------------------------------------------------------------------
 
-def test_a_job_that_starts_at_the_same_instant_as_mcp_is_still_caught(tmp_path):
-    """偽陽性側の赤の実証: 裏 job が MCP と**同時に** (しきい値の前後を問わず)
-    始まっても、シェルとして同定されればその場で job と分かる。t049 までの
-    時刻ベースの判定は「着手直後 (しきい値の枠内)」に始まった job を区別
-    できなかったが、同定ベースなら「いつ生えたか」自体を見ないのでこの区別が
-    そもそも要らないことを固定する。
+def _nested_infra_cmd(titles: list, seconds: int = 300) -> str:
+    """本番の MCP 起動経路 (`npm exec ...` → `sh -c "playwright-mcp"` → ...) を、
+    実際の fork 境界を挟んだ複数の実プロセスで再現する
+    (`titles[0]` が末端・`titles[-1]` が根に近い側)。
+
+    `exec -a` は現在のプロセスを**置き換えるだけで fork しない**ため、
+    `bash -c 'exec -a T1 bash -c "…exec -a T2…"'` のように単純に入れ子にすると
+    1 プロセスに畳み込まれてしまう (本ファイルで実測して踏んだ)。ここでは
+    各段のあいだに `&` (バックグラウンド化 = 必ず fork) を挟むことで、
+    本番と同じく**複数の別 PID が親子関係を持つ**木を作る。
     """
-    node_bin = _fake_binary(tmp_path, "node", real="/bin/sleep")
-    root = subprocess.Popen(
-        ["sh", "-c", f'{node_bin} 300 & sh -c "sleep 300 & wait" & wait'],
-        start_new_session=True)
-    try:
-        time.sleep(0.05)  # MCP (node) と job (sh) がほぼ同時に生えた直後
-        assert lib_pane_process.classify_process_tree(root.pid) == "executing"
-    finally:
-        _kill_pane_tree(root)
+    result = f"exec -a {shlex.quote(titles[0])} /bin/sleep {seconds}"
+    for title in titles[1:]:
+        inner = f"bash -c {shlex.quote(result)} & wait"
+        result = f"exec -a {shlex.quote(title)} bash -c {shlex.quote(inner)}"
+    return f"bash -c {shlex.quote(result)}"
 
 
-def test_a_late_starting_mcp_browser_does_not_suppress_rule_5_forever(tmp_path):
-    """偽陰性側の赤の実証 (今回の主眼): `plan.sh pull` の後で初めて起動する MCP
-    サーバー / ブラウザ (遅延起動の Playwright ブラウザ等) は、時刻ベースの
-    判定 (t049 の `min_start_epoch`) だと「assignment より後に生えた」という
-    理由だけで無条件に executing 扱いになり、**job が全部終わった後も Rule 5
-    を永久に抑制し続けた** (偽陰性 — Director が気付けない)。
-
-    同定ベースでは、遅れて生えた MCP/ブラウザだけが残る木は job (シェル) を
-    一切含まないので idle_process と判定され、Rule 5 が正しく機能することを
-    固定する。木は「MCP (node) が起動し、しばらくしてブラウザ (chrome) だけを
-    起動する。job (シェル) は無い」形 — job がとっくに終わった Worker を模す。
-
-    遅延は shell の `sleep N;` では作らない — `sleep` は外部コマンドなので
-    フォークされ、そのプロセス自身が (シェルでも既知インフラでもない)
-    同定不能な子として一瞬混ざり込み、テストの意図と無関係に "executing" に
-    倒れてしまう (このテスト自身が実測して踏んだ)。ここでは builtin の `read`
-    で FIFO から 1 行読むまで node は止まり、書き込まれたら node が chrome を
-    **新しい子プロセスとして** fork する (`exec` で同じ pid に入れ替えると
-    chrome の /proc starttime が node の fork 時刻のままになり、「assignment
-    より後に生えた」を再現できなくなる — この違いも実測して踏んだ)。
+def test_the_real_production_tree_shape_is_not_a_job(tmp_path):
+    """偽陰性側の赤の実証 (主眼): 本番実測 (`scripts/lib_pane_process.py`
+    docstring の表) と同じ 2 段の入れ子 (`npm exec @playwright/mcp@latest` →
+    `sh -c "playwright-mcp"`、実 fork 境界つき) を job (Bash tool wrapper) 無しで
+    再現する。旧 comm ベースの許可リストなら、この形の内側にある `sh -c` の
+    comm がシェル一致で job と誤読していた (t074 P1: 本番で実際に踏んだ偽陰性)。
+    起動元ベースでは、cmdline のどこにも wrapper marker が無いので
+    idle_process と判定されることを固定する。
     """
-    fifo_path = tmp_path / "signal"
-    os.mkfifo(fifo_path)
-    node_bin = _fake_binary(tmp_path, "node", real="/bin/sh")
-    chrome_bin = _fake_binary(tmp_path, "chrome", real="/bin/sleep")
-    root = subprocess.Popen(
-        ["sh", "-c", f'{node_bin} -c "read x < {fifo_path}; {chrome_bin} 300 & wait" & wait'],
-        start_new_session=True)
+    cmd = _nested_infra_cmd(["sh -c playwright-mcp", "npm exec @playwright/mcp@latest"])
+    root = subprocess.Popen(["sh", "-c", f"{cmd} & wait"], start_new_session=True)
     try:
-        time.sleep(0.3)  # node (MCP 相当) だけが立った状態。ブラウザはまだ
-        assert lib_pane_process.classify_process_tree(root.pid) == "idle_process"
-
-        with open(fifo_path, "w") as f:
-            f.write("go\n")  # 遅延起動のブラウザを今始める合図
-        time.sleep(0.3)  # chrome (遅延起動のブラウザ相当) が生えた後
+        time.sleep(0.5)
         assert lib_pane_process.classify_process_tree(root.pid) == "idle_process"
     finally:
         _kill_pane_tree(root)
 
 
-def test_a_late_starting_mcp_browser_lets_rule_5_notify_via_check_rule5(
-    tmp_path, monkeypatch
-):
-    """上と同じ木を、本物の `check_rule5()` 経由で確かめる — 受入条件の
-    「MCP の永続プロセスだけを持ち、job は全部終わった Worker に Rule 5 が
-    発火すること」そのもの。**ブラウザは assignment file を書いた後で初めて
-    起動する** (finding が明示的に要求する「plan.sh pull の後で初めて起動する
-    Playwright ブラウザ」の経路そのもの) — 旧実装 (t049 の `min_start_epoch`:
-    「assignment より後に生えた子孫は無条件 executing」) だと、このブラウザは
-    job が無くても永久に executing と誤読され、Rule 5 が黙り続けた (偽陰性)。
-    同定ベースでは「いつ生えたか」を見ないので、assignment の前後に関わらず
-    ブラウザは infra のまま — 通知が正しく発火することを固定する。
+def test_an_unidentified_persistent_process_is_not_treated_as_a_job(tmp_path):
+    """族C監査の向きの訂正 (t074 P1): t065 は「同定できない永続プロセスは job
+    (executing) に倒す」と決めていたが、そのコメントは「1 回余計に通知する方が
+    安い」と書きながら、実際には `executing` は**通知/terminate を抑制する側**
+    (`worker_has_background_work` / `_process_signal` 参照) なので、コメントと
+    挙動が逆だった (Codex 3巡目 P1)。
+
+    起動元ベースの設計はこの「同定できないものをどちらに倒すか」という
+    許可リスト方式の問い自体を無くした — マーカーを持たない (=起動元が
+    Bash tool / Monitor でない) ものは、名前を知っているかどうかに関わらず
+    常に job ではない。ここでは「完全に未知の実行体名」でも同じ結果になる
+    ことを固定する (旧テストは逆の結果 [executing] を期待していた)。
     """
-    fifo_path = tmp_path / "signal"
-    os.mkfifo(fifo_path)
-    node_bin = _fake_binary(tmp_path, "node", real="/bin/sh")
-    chrome_bin = _fake_binary(tmp_path, "chrome", real="/bin/sleep")
+    unknown_cmd = f"exec -a {shlex.quote('totally-unknown-binary')} /bin/sleep 300"
     root = subprocess.Popen(
-        ["sh", "-c", f'{node_bin} -c "read x < {fifo_path}; {chrome_bin} 300 & wait" & wait'],
-        start_new_session=True)
-    try:
-        time.sleep(0.3)  # node だけが立った状態。ブラウザはまだ
-
-        h = Harness(tmp_path / "repo", monkeypatch)
-        monkeypatch.setattr(lib_mux, "Mux", PaneMux)
-        PaneMux.pane_state, PaneMux.pane_pid, PaneMux.pid_raises = "idle", root.pid, None
-        h.cycle()
-        assignment = h.ns["ASSIGNMENTS_DIR"] / AGENT
-        assignment.parent.mkdir(parents=True, exist_ok=True)
-        assignment.write_text(f"{SLUG}:t001\n")  # ここが「plan.sh pull」の時刻
-        h.ns["_save_state_entry"](AGENT, "idle-with-task", time.time() - 600)  # grace 経過済み
-
-        # assignment を書いた**後**で初めてブラウザ (chrome) を起動する —
-        # 遅延起動の Playwright ブラウザの経路そのもの
-        with open(fifo_path, "w") as f:
-            f.write("go\n")
-        time.sleep(0.3)  # chrome が生えるまで
-
-        FakeMux.sent = []
-        h.ns["check_rule5"](AGENT, TARGET, assignment, {})
-        msgs = [m["message"] for m in FakeMux.sent]
-        assert len(msgs) == 1 and "idle-with-task" in msgs[0]
-    finally:
-        _kill_pane_tree(root)
-
-
-def test_an_unidentified_persistent_process_is_treated_as_a_job_not_infra(tmp_path):
-    """族C監査 (t065): 既知インフラの一覧に無い永続プロセスをどう倒すか。
-    未知の物を infra 側に倒す (= 黙り続ける) と、新種の MCP サーバー / 未対応の
-    ブラウザが現れるたびに同じ偽陰性が起こりうる。同定できないものは job 側
-    (executing) に倒し、偽陽性 (1 回余計に通知する) の方を選ぶことを固定する。
-    """
-    unknown_bin = _fake_binary(tmp_path, "totally-unknown-binary", real="/bin/sleep")
-    root = subprocess.Popen(
-        ["sh", "-c", f'{unknown_bin} 300 & wait'],
+        ["sh", "-c", f'bash -c {shlex.quote(unknown_cmd)} & wait'],
         start_new_session=True)
     try:
         time.sleep(0.3)
-        assert lib_pane_process.classify_process_tree(root.pid) == "executing"
+        assert lib_pane_process.classify_process_tree(root.pid) == "idle_process"
     finally:
         _kill_pane_tree(root)
+
+
+def test_a_changed_wrapper_marker_fails_toward_more_notifications_not_silence(
+    monkeypatch, panes
+):
+    """Bash tool の内部実装が変わって wrapper marker が変わった (= 定数が古く
+    なった) 想定の欠陥注入。本物の job (`panes["busy"]`) がマーカー不一致で
+    「job ではない」に見えるようになる — その結果は Rule 5 / watchdog を
+    **もっと通知・terminate させる方向**であって、黙らせる方向ではないことを
+    固定する (受入条件: 「誤検知が増える方向に壊れ、黙る方向には壊れない」)。
+    """
+    monkeypatch.setattr(lib_pane_process, "BASH_TOOL_WRAPPER_MARKER", "/no-such-marker/")
+    assert lib_pane_process.classify_process_tree(panes["busy"]) == "idle_process"
 
 
 # ---------------------------------------------------------------------------

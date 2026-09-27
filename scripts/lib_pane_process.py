@@ -8,35 +8,75 @@ watchdog.py にあった `classify_process_tree()` を、dispatcher.sh の Rule 
 自分の判定の fail の向きで決める (knowledge/watchdog-idle-judgment.md)。
 読むのは /proc だけで、queue / registry / config は開かない。
 
-## t065 (Codex review 2巡目, PR#238 P2): 判定根拠を「いつ生えたか」から「何であるか」に移す
+## t074 (B1 設計変更 / Codex review 3巡目 P1): 判定根拠を「何であるか (comm)」から
+## 「誰が起動したか (起動元)」に移す
 
-t016 の元の分類は `grace_seconds` (セッション起動からの経過時間) で MCP サーバーの
-起動ノイズと本物の job を区別していた。t049 はこれを「assignment file の mtime
-より後か」に差し替えたが、**どちらも時刻を代理指標にしている**点は変わらず、穴が
-向きを変えて残った: `plan.sh pull` の後で初めて起動する MCP サーバー (遅延起動の
-Playwright ブラウザ等) は、時刻基準では「assignment より後」に見え、**すべての
-ツール呼び出しと裏 job が終わった後も Rule 5 を永久に抑制し続ける** (偽陰性 —
-本当に止まっている Worker に誰も気付けない。t049 の偽陽性より高くつく、
-memory `fail-direction-is-per-judgment`)。
+t065 (2巡目) は判定根拠を時刻から comm (実行ファイル名) に移したが、**3巡目でも
+穴が向きを変えて残った**:
 
-判定根拠を「そのプロセスが何であるか」(comm = 実行ファイル名) に置き換えた:
+  | 巡 | 代理指標                                   | 破れ方                                   |
+  |----|--------------------------------------------|-------------------------------------------|
+  | 1  | セッション起動から 60 秒以内の子孫は無視     | 起動直後に投げた長い job が永久 idle (偽陽性) |
+  | 2  | assignment 以降に生えた子孫は job            | 遅延起動の MCP が永久 job (偽陰性)          |
+  | 3  | comm の完全一致の許可リストで永続インフラを除外 | 本番の `npm exec @playwright/mcp` は npm が |
+  |    |                                              | process.title を書き換え comm が           |
+  |    |                                              | `npm exec @playw` (15 文字打ち切り)、       |
+  |    |                                              | しかも `sh -c "playwright-mcp"` を挟む →    |
+  |    |                                              | シェル一致で job 扱い (偽陰性: MCP が動いて  |
+  |    |                                              | いる間 Rule 5 が永久に黙る)                 |
 
-  - シェル (`bash` / `sh` / `dash` / `zsh` / `ksh` / `ash`) が見つかった時点で
-    それは job である。Bash tool の実行 (`run_in_background` の裏 job も
-    Monitor も) は必ずこの形で生える (t016 実測)。シェルの子孫もすべて job
-    (シェルが起動した実体の一部だから)。
-  - シェルでなく、既知の「永続インフラ」名 (`claude` = セッション本体、
-    `node`/`npm`/`npx` = MCP サーバーの起動経路、`chrome`/`chromium`/
-    `chrome-headless-shell`/`google-chrome` = Playwright / Chrome DevTools MCP
-    が起動するブラウザ) に一致する、かつ祖先に job が居ない場合だけ infra。
-  - **それ以外 (同定できない) は job 側に倒す。** 未知の永続プロセスを infra
-    と誤認して黙り続けるより、正体不明のものを job 扱いして 1 回余計に通知する
-    方が安い (族C: memory `a-new-guard-creates-a-new-state` — 除外リストを
-    作ること自体が「リストに載っていない未知のものをどう倒すか」という新しい
-    状態を生む。ここでは常に job 側に倒すことでその状態を無害化する)。
+**comm (実行ファイル名) は本質的に代理指標**である — 「シェルという名前かどうか」も
+「知っているインフラの名前かどうか」も、そのプロセスが**何をするために起動されたか**
+とは無関係 (npm は自分の process.title を書き換えるし、MCP サーバーの起動経路は
+`sh -c "..."` を挟む)。t074 (2026-09-27 本番実測, Director + Worker) で比較した:
 
-時刻 (`grace_seconds` / `min_start_epoch`) はもう判定に使わない — 同定という
-別の根拠に完全に置き換えた (t049 の `min_start_epoch` 機構は撤去)。
+  | プロセス                     | comm             | Bash tool のラッパー
+  |                               |                  | (`.claude/shell-snapshots/snapshot-` を
+  |                               |                  | cmdline に持つ祖先) があるか |
+  |-------------------------------|------------------|--------------------------------------|
+  | Playwright MCP                | `npm exec @playw`| **無い**                              |
+  | chrome-devtools MCP           | `npm exec chrome`/`sh` | **無い**                        |
+  | Playwright の node 本体       | `MainThread`     | **無い**                              |
+  | Bash tool (`run_in_background`)| `sleep` 等       | **有る** (直接の親が `bash -c source |
+  |                               |                  | .../shell-snapshots/snapshot-....sh  |
+  |                               |                  | && eval '...'`)                      |
+  | Monitor                       | `bash`           | **有る** (Monitor 自身が `bash -c    |
+  |                               |                  | source .../shell-snapshots/snapshot-  |
+  |                               |                  | ....sh && eval '<command>'`)         |
+
+**comm では見分けられない**(MCP 側にも `sh` や `bash` が出るので、シェル comm =
+job という旧ルールでは MCP を job と誤読する)。**起動元では綺麗に分かれる**:
+Bash tool (前景・`run_in_background` の裏 job いずれも) と Monitor は、必ず
+Claude Code 自身が書き出す shell snapshot ファイル (`~/.claude/shell-snapshots/
+snapshot-<timestamp>-<hash>.sh`) を `source` する `bash -c "source <path> ... &&
+eval '<command>' ..."` という形で生える。MCP サーバー (`npm exec ...`) は
+`claude` プロセスの直接の子として起動し、この形を経由しない。
+
+新しい判定基準: **祖先 (自分自身を含む) のどれかの cmdline に、この shell snapshot
+を `source` する形が含まれるか**。含まれれば job (その子孫もすべて job — シェルが
+起動した実体の一部)。含まれなければ job ではない (infra)。
+
+**分からないとき (祖先の cmdline が読めない等) は「job ではない」側に倒す**
+(通知する側 / 殺さない側は呼び出し側の判定だが、ここでの「わからない」は
+「その 1 ノードが job のマーカーを持つと確認できなかった」というだけなので、
+そのノードだけを job から除外して走査は続ける — 呼び出し側に `unknown` を
+返すのは `/proc` の列挙自体が失敗した場合だけ [族A、下記])。
+
+族C (t065 で作った「同定できないものは job 側に倒す」という許可リスト方式の
+考え方) は**この設計では成立しない**: 許可リストが要らなくなった (「既知の
+インフラ名を全部知っている」という前提そのものを捨てた) ので、「未知の名前を
+job/infra のどちらに倒すか」という問い自体が無くなった。さらに、旧実装の
+「同定できない場合は job 側に倒す」という**コメント**は「1 回余計に通知する
+方が安い」と書かれていたが、実際には classify=`executing` は **通知/terminate
+を抑制する側**(dispatcher の `worker_has_background_work` / watchdog の
+`_process_signal` 参照) なので、**コメントと挙動が逆だった** (Codex 3巡目 P1)。
+新しい設計はデフォルトを「job ではない」にすることで、この向きの取り違えごと
+無くす — 「わからない/知らない」はすべて「job ではない」(= 通知・terminate を
+許す側) に統一される。
+
+時刻 (`grace_seconds` / `min_start_epoch`) はもう判定に使わない (t065 で撤去済み)。
+comm による同定 (`_SHELL_COMMS` / `_KNOWN_INFRASTRUCTURE_COMMS`) も撤去した —
+残すと「起動元」と「名前」の 2 つの判定基準が食い違いうる。
 """
 from collections import deque
 from pathlib import Path
@@ -45,28 +85,23 @@ from typing import Literal, Optional
 ProcessSignal = Literal[
     "no_window",     # mux 窓が無い
     "not_probed",    # プロセス層を見るまでもなく判定が決まった (絶対上限など)
-    "unknown",       # 窓はあるが pane pid が引けない、または途中の pid が
+    "unknown",       # 窓はあるが pane pid が引けない、またはプロセス木の列挙自体が
                      # 「消滅」以外の理由で読めない → terminate を抑制する
     "no_process",    # 子プロセスが 1 つも無い
-    "idle_process",  # 永続インフラ (セッション本体・MCP サーバー・その子孫) だけ
-    "executing",     # シェル (Bash tool の実行) か、同定できない子孫が居る = job 中
+    "idle_process",  # Bash tool / Monitor のラッパー経由でないプロセス
+                     # (セッション本体・MCP サーバー・その子孫) だけ
+    "executing",     # Bash tool (前景・run_in_background いずれも) か Monitor が
+                     # 起動した子孫が居る = job 中
 ]
 
-# Bash tool の実行 (前景・run_in_background の裏 job・Monitor いずれも) は必ず
-# シェル経由で生える (t016 実測: "/bin/bash -c source ...")。シェルが見つかった
-# 時点で job — これより後の判定 (既知インフラ一覧) より優先する。
-_SHELL_COMMS = frozenset({"bash", "sh", "dash", "zsh", "ksh", "ash"})
-
-# 既知の「永続インフラ」の comm (/proc/<pid>/stat の実行体名。15 文字で切り詰め)。
-# **ここに載っていない永続プロセスは infra に含めない** — 同定できない場合は
-# job 側 (executing) に倒す (族C監査、モジュール docstring 参照)。
-_KNOWN_INFRASTRUCTURE_COMMS = frozenset({
-    "claude",                # セッション本体
-    "node", "npm", "npx",    # MCP サーバーの起動経路 (npm exec / npx 経由で node が実行体になることが多い)
-    "chrome", "chromium",    # Playwright / Chrome DevTools MCP が起動するブラウザ
-    "chrome-headless",       # "chrome-headless-shell" (21 文字) は 15 文字で切り詰まる
-    "google-chrome",
-})
+# Claude Code が Bash tool / Monitor の実行のたびに書き出す shell snapshot を
+# `source` する wrapper の cmdline に必ず含まれる部分文字列 (t074 実測:
+# `/bin/bash -c source /home/<user>/.claude/shell-snapshots/snapshot-<ts>-<hash>.sh
+# ... && eval '<command>' ...`)。$HOME に依存しないよう、パスの末尾側だけを見る。
+# Claude Code の内部実装なので、変わったときに気付けるよう 1 箇所の定数に閉じ込める
+# (変わると「マーカーが見つからない」→ 全部 job ではない判定に倒れる = 誤検知が
+# **増える**方向に壊れる。黙る方向には壊れない。下記 classify_process_tree 参照)。
+BASH_TOOL_WRAPPER_MARKER = "/shell-snapshots/snapshot-"
 
 
 def _proc_stat(pid: int) -> Optional[tuple[int, int, str]]:
@@ -87,6 +122,11 @@ def _proc_stat(pid: int) -> Optional[tuple[int, int, str]]:
     最後の ')' で括り出す (例: "1234 (sh -c (x)) S 1 ..." )。
     切った残りの先頭が field 3 なので、field N は rest[N - 3] になる:
       ppid = field 4 = rest[1] / starttime = field 22 = rest[19]
+
+    starttime は t074 時点で分類には使わない (t065 で時刻ベースの判定を撤去
+    済み) が、デバッグ・将来の監査のために引き続き読む (タプルの形を変えると
+    `_direct_children()` 等のテスト helper が壊れる)。comm も同様 (分類には
+    使わないが、ログ・デバッグ表示に使える)。
     """
     try:
         raw = Path(f"/proc/{pid}/stat").read_text()
@@ -106,40 +146,70 @@ def _proc_stat(pid: int) -> Optional[tuple[int, int, str]]:
         return None
 
 
+def _proc_cmdline(pid: int) -> Optional[str]:
+    """/proc/<pid>/cmdline を 1 つの文字列にして返す (NUL 区切りの引数を空白で連結)。
+
+    comm (`/proc/<pid>/stat` の実行体名) は 15 文字で打ち切られ、かつ npm 等が
+    `process.title` を書き換えると execve 時の実行体名とも一致しなくなる
+    (モジュール docstring の実測)。cmdline は打ち切られず、Bash tool /
+    Monitor が生成する `source .../shell-snapshots/snapshot-....sh` という
+    文字列をそのまま含むので、判定はこちらを読む。
+
+    読めない場合 (消滅・権限問題いずれも) は None を返し、呼び出し側 (t074:
+    分からないときは「job ではない」側に倒す。モジュール docstring 参照) に
+    「このノードにはマーカーが見つからなかった」ものとして扱わせる。これは
+    `_proc_stat` (消滅以外は re-raise してツリー構築全体を "unknown" にする)
+    とは意図的に違う流儀: cmdline の読み取り失敗はツリー構造 (親子関係) を
+    壊さない (親子関係は `_proc_stat` の ppid だけで決まる) ので、1 ノードの
+    判定だけを「job ではない」に倒して走査を続けられる。
+    """
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except (FileNotFoundError, ProcessLookupError, OSError):
+        return None
+    return raw.replace(b"\x00", b" ").decode("utf-8", errors="replace")
+
+
 def classify_process_tree(root_pid: int) -> ProcessSignal:
     """mux ペインのプロセス木を 3 値に分類する。
 
-    本番のペインは常にこの形をしている (2026-09-21 実測, Ren-worker):
+    本番のペインは常にこの形をしている (2026-09-21 実測, Ren-worker。
+    t074 で「MCP はどれも Bash tool のラッパーを経由しない」ことを再実測):
 
         /bin/bash                      ← root_pid (pane_pid)
           claude --model ...           ← セッション。Worker が生きている限り常駐
             npm exec @playwright/mcp   ← MCP サーバー。claude の 1-2 秒後に起動
             npm exec chrome-devtools   ← 同上
-            /bin/bash -c source ...    ← Bash tool の実行中だけ現れる
+            /bin/bash -c source \
+              .../shell-snapshots/snapshot-....sh && eval '...'
+                                        ← Bash tool (前景 / run_in_background) か
+                                          Monitor の実行中だけ現れる
 
     旧実装 (t016) の `pgrep -P <pane_pid>` は常に claude 1 件を返すため「子
     プロセスが居る = 作業中」が恒真になり、idle 判定に一度も到達しなかった。
-    続く実装 (t016 → t049) は「いつ生えたか」(session_start からの経過時間 /
-    assignment file の mtime との比較) で区別していたが、時刻はしょせん代理
-    指標であり、どちらの向きにも穴が残った (モジュール docstring 参照)。
+    続く実装 (t016 → t049 → t065) は「いつ生えたか」(時刻) → 「何であるか」
+    (comm) の順に判定基準を移したが、どちらも代理指標であり穴が向きを変えて
+    残った (モジュール docstring 参照)。
 
-    ここでは **そのプロセスが何であるか** (comm) で区別する:
+    ここでは **誰が起動したか** (祖先の cmdline に Bash tool / Monitor の
+    shell snapshot wrapper が現れるか) で区別する:
 
-      "executing"    … シェル (Bash tool の実行) か、同定できない子孫が居る
-                       = job が走っている (と見なす)
-      "idle_process" … セッション本体・MCP サーバー・その子孫 (既知インフラ)
+      "executing"    … 自分自身か祖先の cmdline に `BASH_TOOL_WRAPPER_MARKER`
+                       を含むノードが居る = job が走っている
+      "idle_process" … それ以外 (セッション本体・MCP サーバー・その子孫)
                        だけ。木が有ること自体は「働いている」の証拠にならない
       "no_process"   … 子が 1 つも無い (claude が落ちた / 素のシェル)
-      "unknown"      … 途中の pid が「消滅」以外の理由で読めず、同定できない
+      "unknown"      … `/proc` の列挙自体 (`_proc_stat`) が「消滅」以外の
+                       理由で読めず、木そのものが組み立てられない
                        (t049 族A監査。terminate 側の抑制材料としては効くが、
                        Rule 5 は「観測できない → 通知する」に倒す)
 
-    親の分類 (job / infra) は子に伝播する: シェルの子孫はすべて job (シェルが
-    起動した実体の一部)。既知インフラの子孫はシェルに当たるまで infra
-    (Playwright MCP が起動するブラウザ等)。ルート直下 (親の分類が無い) で
-    既知インフラでもシェルでもない場合は job 側に倒す (族C: 未知の永続
-    プロセスを infra と誤認して黙り続けるより、job 扱いして 1 回余計に
-    通知する方が安い)。
+    親の分類 (job / not-job) は子に伝播する: job と分類されたノードの子孫は
+    すべて job (そのシェルが起動した実体の一部だから)。ルート直下 (親の分類が
+    無い) でマーカーを持たない場合は not-job (t065 の「同定できないものは
+    job 側に倒す」族C の許可リスト方式はここでは撤去 — 許可リストという
+    概念自体が要らなくなった。モジュール docstring 参照)。cmdline が読めない
+    ノードもマーカー無しと同じ扱い (not-job) にする — `_proc_cmdline` 参照。
     """
     try:
         root_stat = _proc_stat(root_pid)
@@ -189,17 +259,12 @@ def classify_process_tree(root_pid: int) -> ProcessSignal:
         if pid in seen:
             continue
         seen.add(pid)
-        comm = procs[pid][2]
-        if comm in _SHELL_COMMS:
-            origin = "job"
-        elif parent_origin == "job":
-            origin = "job"
-        elif comm in _KNOWN_INFRASTRUCTURE_COMMS:
-            origin = "infra"
+        if parent_origin == "job":
+            origin = "job"  # job の子孫はシェルの cmdline を見るまでもなく job
         else:
-            # 同定できない (シェルでも既知インフラでもない、親も infra) —
-            # job 側に倒す (族C: モジュール docstring 参照)。
-            origin = "job"
+            cmdline = _proc_cmdline(pid)
+            has_marker = cmdline is not None and BASH_TOOL_WRAPPER_MARKER in cmdline
+            origin = "job" if has_marker else "infra"
         if origin == "job":
             return "executing"
         for child in children.get(pid, []):

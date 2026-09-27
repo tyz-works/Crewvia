@@ -16,15 +16,20 @@
 #   J  dispatcher に /proc を読む分類のコピーが生える                              → 赤
 #   L  テスト: pane tree の teardown が group ごとでなく root だけになる (t049 P3)   → 赤
 #   M  分類: 読めない pid を静かに「子孫なし」へ倒す (族A監査)                    → 赤
-#   O  分類 (t065 P2 2巡目): シェルを job と同定しない                            → 赤
-#   P  分類 (t065 族C監査): 同定できない永続プロセスを infra 側に倒してしまう      → 赤
+#   O  分類 (t074 P1): wrapper marker 定数が壊れる (Bash tool の内部実装変更想定)  → 赤
+#   P  分類 (t074 族C監査の向き訂正): 同定できないものを job 側に倒し直す          → 赤
+#   Q  dispatcher (t074 追補): BACKGROUND_JOB_MAX_SECONDS の安全弁を外す           → 赤
+#   R  dispatcher (t074 追補): job_since が grace の since と混同される            → 赤
 #
 # t049 の時刻ベースの判定 (grace_seconds の枠内で始まった裏 job を assignment mtime
-# で拾う仕組み。旧 case K/N) は t065 でプロセスの同定に置き換えられ、丸ごと撤去した
-# (Codex review 2巡目: 時刻を代理指標にする限り、plan.sh pull の後で初めて起動する
-# MCP サーバー / ブラウザを本物の job と区別できず、偽陰性 [本当に止まっているのに
-# 気付けない] が残るため)。この赤の実証は消えたコードを再現できないので K/N は削除、
-# 代わりに O/P で同定ベースの欠陥を実証する。
+# で拾う仕組み。旧 case K/N) は t065 でプロセスの同定 (comm) に置き換えられ、丸ごと
+# 撤去した。t074 (Codex review 3巡目) はその comm ベースの同定も「誰が起動したか」
+# (Bash tool / Monitor のラッパーの子孫か) へ丸ごと置き換えた — 本番の
+# `npm exec @playwright/mcp` が npm の process.title 書き換えと `sh -c "..."` を
+# 挟む経路のせいで、comm ベースの許可リストでは MCP を job と誤読する (偽陰性) ため。
+# この赤の実証は消えたコードを再現できないので旧 O/P (comm ベース) は新しい定義に
+# 合わせて書き換えた。Q/R は Director が本番で踏んだ実例 (Ren の pgrep 自己一致
+# ループが起動元判定でも job のまま黙り続ける) への追補。
 #
 # 隔離: 使い捨ての複製で欠陥を注入する。本番の worktree のファイルには触らない。
 # pytest は FakeMux / 隔離した queue・registry と本物の sh の親子木で動き、
@@ -87,8 +92,8 @@ else ng "baseline が緑でない"; echo "$out" | tail -8; fi
 
 echo "== case A: 裏の job があっても idle-with-task を通知する"
 fresh_copy
-inject scripts/dispatcher.sh "    if st in ('idle', 'done') and assignment_file.exists() and worker_has_background_work(target):" \
-                             "    if False:"
+inject scripts/dispatcher.sh "    has_job = st in ('idle', 'done') and assignment_file.exists() and worker_has_background_work(target)" \
+                             "    has_job = False"
 expect_red "case A" "test_a_live_background_job_is_not_idle_with_task" "${B1_TESTS[@]}"
 
 echo "== case B: 裏の job が無い pane も「裏の job あり」と読む"
@@ -115,17 +120,17 @@ expect_red "case D" "test_unobservable_pane_pid_falls_to_the_notifying_side" "${
 
 echo "== case E: blocked も裏の job があれば黙らせる"
 fresh_copy
-inject scripts/dispatcher.sh "    if st in ('idle', 'done') and assignment_file.exists() and worker_has_background_work(target):" \
-                             "    if st in ('idle', 'done', 'blocked') and assignment_file.exists() and worker_has_background_work(target):"
+inject scripts/dispatcher.sh "    has_job = st in ('idle', 'done') and assignment_file.exists() and worker_has_background_work(target)" \
+                             "    has_job = st in ('idle', 'done', 'blocked') and assignment_file.exists() and worker_has_background_work(target)"
 expect_red "case E" "test_blocked_is_still_notified_with_a_background_job" "${B1_TESTS[@]}"
 
 echo "== case F: 裏の job 中に grace を測り直さない"
 fresh_copy
 # 'working' への読み替えをやめ、裏の job があるあいだは単に return する (state entry を触らない)
-inject scripts/dispatcher.sh "worker_has_background_work(target):
-        st = 'working'" \
-                             "worker_has_background_work(target):
-        return"
+inject scripts/dispatcher.sh "        if now - job_since <= BACKGROUND_JOB_MAX_SECONDS:
+            st = 'working'" \
+                             "        if now - job_since <= BACKGROUND_JOB_MAX_SECONDS:
+            return"
 expect_red "case F" "test_a_background_job_restarts_the_grace_and_clears_the_dedup_key" "${B1_TESTS[@]}"
 
 echo "== case G: 分類が裏の job を executing と読まない"
@@ -185,22 +190,37 @@ inject scripts/lib_pane_process.py '        try:
             procs[int(entry.name)] = st'
 expect_red "case M" "test_an_unreadable_intermediate_pid_falls_to_unknown_not_idle" "${B1_TESTS[@]}"
 
-echo "== case O (t065 P2 2巡目): 既知インフラの comm 一覧から node が抜け、MCP を job と誤読する"
+echo "== case O (t074 P1): wrapper marker 定数が壊れる (Bash tool の内部実装が変わった想定)"
 fresh_copy
-inject scripts/lib_pane_process.py '    "claude",                # セッション本体
-    "node", "npm", "npx",    # MCP サーバーの起動経路 (npm exec / npx 経由で node が実行体になることが多い)' \
-                             '    "claude",                # セッション本体
-    "npm", "npx",    # MCP サーバーの起動経路 (npm exec / npx 経由で node が実行体になることが多い)'
-expect_red "case O" "test_a_late_starting_mcp_browser_does_not_suppress_rule_5_forever" "${B1_TESTS[@]}"
+inject scripts/lib_pane_process.py 'BASH_TOOL_WRAPPER_MARKER = "/shell-snapshots/snapshot-"' \
+                                    'BASH_TOOL_WRAPPER_MARKER = "/no-such-marker/"'
+expect_red "case O" "test_the_fixture_trees_classify_as_intended" "${B1_TESTS[@]}"
 
-echo "== case P (t065 族C監査): 同定できない永続プロセスを infra 側に倒してしまう"
+echo "== case P (t074 族C監査の向き訂正): 同定できないものを job 側に倒し直してしまう"
 fresh_copy
-inject scripts/lib_pane_process.py '        else:
-            # 同定できない (シェルでも既知インフラでもない、親も infra) —
-            # job 側に倒す (族C: モジュール docstring 参照)。
-            origin = "job"' '        else:
-            origin = "infra"'
-expect_red "case P" "test_an_unidentified_persistent_process_is_treated_as_a_job_not_infra" "${B1_TESTS[@]}"
+inject scripts/lib_pane_process.py '            cmdline = _proc_cmdline(pid)
+            has_marker = cmdline is not None and BASH_TOOL_WRAPPER_MARKER in cmdline
+            origin = "job" if has_marker else "infra"' \
+                                    '            cmdline = _proc_cmdline(pid)
+            has_marker = cmdline is not None and BASH_TOOL_WRAPPER_MARKER in cmdline
+            origin = "job"'
+expect_red "case P" "test_an_unidentified_persistent_process_is_not_treated_as_a_job" "${B1_TESTS[@]}"
+
+echo "== case Q (t074 追補): BACKGROUND_JOB_MAX_SECONDS の安全弁を外す (黙り続ける方に戻る)"
+fresh_copy
+inject scripts/dispatcher.sh "        if now - job_since <= BACKGROUND_JOB_MAX_SECONDS:
+            st = 'working'" "        st = 'working'"
+expect_red "case Q" "test_a_job_older_than_the_ceiling_no_longer_suppresses_rule5" "${B1_TESTS[@]}"
+
+echo "== case R (t074 追補): job_since が grace の since と混同され、job 中に測り直ってしまう"
+fresh_copy
+inject scripts/dispatcher.sh "        job_since = _load_job_since(name)
+        if job_since is None:
+            job_since = now
+            _save_job_since(name, job_since)" \
+                             "        job_since = now
+        _save_job_since(name, job_since)"
+expect_red "case R" "test_the_ceiling_timer_is_independent_of_the_grace_timer" "${B1_TESTS[@]}"
 
 echo
 echo "Results: PASS=$PASS FAIL=$FAIL"

@@ -68,6 +68,7 @@ RED (修正前の実装では失敗する = 欠陥の再現):
 
 import json
 import os
+import shlex
 import subprocess
 import sys
 import time
@@ -399,19 +400,42 @@ def test_startup_children_are_not_executing(tmp_path):
         root.wait()
 
 
-def test_a_shell_child_is_executing():
-    """シェル (= Bash tool の実行) が同定されたら executing。
+def test_a_plain_shell_without_the_wrapper_marker_is_not_executing():
+    """t074 (Codex review 3巡目 P1): comm がシェルというだけでは executing に
+    ならない。本番の MCP 起動経路 (`npm exec ...` が `sh -c "..."` を挟む) と
+    comm では区別できないため、判定根拠は「誰が起動したか」(Bash tool /
+    Monitor の shell snapshot wrapper の子孫か) に変わった。
 
         root sh
-          ├ sleep 300                  … MCP サーバー相当 (未同定 → job 側扱いになるので
-          │                               このテストの主眼ではない。sh の方を見る)
-          └ sh                         … Bash tool の実行そのもの (comm = "sh")
+          ├ sleep 300      … MCP サーバー相当
+          └ sh -c "..."    … 中身は sh だが Bash tool のラッパーではない
 
-    t065: 「いつ生えたか」は問わない。comm がシェルであることが根拠。
+    どちらも wrapper marker を持たないので idle_process (t065 まではここが
+    "executing" だった — 逆の結果を固定していた)。
     """
     root = subprocess.Popen(
         ["sh", "-c", 'sleep 300 & sh -c "sleep 300 & wait" & wait']
     )
+    try:
+        time.sleep(0.5)
+        assert watchdog.classify_process_tree(root.pid) == "idle_process"
+    finally:
+        root.kill()
+        root.wait()
+
+
+def test_a_bash_tool_wrapper_child_is_executing(tmp_path):
+    """t074: Bash tool / Monitor の実際の起動形 (`bash -c "source <shell-snapshot>
+    ... && eval '<command>'"`) の子孫は executing。2026-09-27 実測 (自分の
+    `run_in_background` / Monitor 呼び出しの `/proc/<pid>/cmdline` を確認)。
+    """
+    snap_dir = tmp_path / ".claude" / "shell-snapshots"
+    snap_dir.mkdir(parents=True)
+    snapshot = snap_dir / "snapshot-test-fixture.sh"
+    snapshot.write_text(": # no-op fixture snapshot\n")
+    script = f"source {shlex.quote(str(snapshot))} 2>/dev/null || true && eval {shlex.quote('sleep 300')}"
+    wrapper = f"bash -c {shlex.quote(script)}"
+    root = subprocess.Popen(["sh", "-c", f"{wrapper} & wait"])
     try:
         time.sleep(0.5)
         assert watchdog.classify_process_tree(root.pid) == "executing"
@@ -420,17 +444,17 @@ def test_a_shell_child_is_executing():
         root.wait()
 
 
-def test_an_unidentified_child_is_also_executing():
-    """同定できない子 (シェルでも既知インフラでもない) も executing 側に倒す。
-
-    t065 族C監査: 未知の永続プロセスを infra 側に倒す (= 黙り続ける) と、
-    新種の MCP サーバーが現れるたびに偽陰性が起こりうる。同定できないものは
-    job 側 (executing) に倒すことを、watchdog 経由でも固定する。
+def test_an_unidentified_child_without_the_wrapper_marker_is_not_executing():
+    """t074 族C監査の向き訂正: 同定できない子 (シェルでも既知インフラでもない)
+    は job ではない。t065 は「同定できないものは job 側に倒す」と決めていたが、
+    そのコメント (「1 回余計に通知する方が安い」) は実際の挙動 (`executing` は
+    通知/terminate を**抑制する**側) と逆だった (Codex 3巡目 P1)。起動元ベースの
+    設計は許可リストという概念自体を無くしたので、この逆転は自然に直る。
     """
     root = subprocess.Popen(["sh", "-c", "sleep 30 & wait"])
     try:
         time.sleep(0.3)
-        assert watchdog.classify_process_tree(root.pid) == "executing"
+        assert watchdog.classify_process_tree(root.pid) == "idle_process"
     finally:
         root.kill()
         root.wait()

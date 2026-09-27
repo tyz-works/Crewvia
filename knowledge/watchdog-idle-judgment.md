@@ -301,3 +301,71 @@ Rule 5 の通知も遅れる。
 - `tests/watchdog-idle-e2e.sh` は手動・CI 外で、対照実験が origin/main の watchdog を読むため
   もう本来の意味を持たない (先に古くなっていた)。lib 移設に合わせて `PROCESS_WORK_START_GRACE` の
   書換先だけ追従させた。
+
+## 8. 判定根拠を「何であるか (comm)」から「誰が起動したか」に移す (t074, 2026-09-27)
+
+§7 の comm ベースの判定 (t065) は、**3巡目の Codex review で穴が向きを変えて残った**:
+本番の `npm exec @playwright/mcp` は npm が `process.title` を書き換え、かつ `sh -c "playwright-mcp"`
+を挟むため、comm が `npm exec @playw` (15 文字打ち切り) や `sh` になり、`_SHELL_COMMS` /
+`_KNOWN_INFRASTRUCTURE_COMMS` の許可リストでは job と誤読される (偽陰性: MCP が生きている間
+Rule 5 が永久に黙る)。「同定できないものは job 側に倒す」(族C) というコメントも、実際には
+`executing` が通知/terminate を**抑制する**側なので、書いてある向きと逆だった。
+
+### 実測 (2026-09-27, 本番プロセス比較)
+
+| プロセス | comm | Bash tool のラッパー (`.claude/shell-snapshots/snapshot-` を cmdline に持つ祖先) があるか |
+|---|---|---|
+| Playwright MCP (`npm exec @playwright/mcp`) | `npm exec @playw` | **無い** |
+| chrome-devtools MCP | `npm exec chrome` / `sh` | **無い** |
+| Playwright の node 本体 | `MainThread` | **無い** |
+| Bash tool (前景 / `run_in_background`) | 様々 | **有る** (直接の親が `bash -c source .../shell-snapshots/snapshot-....sh && eval '...'`) |
+| Monitor | `bash` | **有る** (Monitor 自身がその形で生える) |
+
+comm では見分けられない (MCP 側にも `sh` / `bash` が出る) が、起動元では綺麗に分かれる。
+
+### 変更
+
+- `classify_process_tree()` の判定基準を「祖先 (自分自身を含む) の cmdline に Bash tool /
+  Monitor の shell snapshot wrapper が現れるか」に一本化。`_SHELL_COMMS` /
+  `_KNOWN_INFRASTRUCTURE_COMMS` (comm の許可リスト) は撤去。マーカーを持たないものは
+  (名前を知っているかどうかに関わらず) 常に job ではない — 族Cの「許可リストに無い名前を
+  どちらに倒すか」という問い自体が無くなった。
+- `/proc/<pid>/cmdline` を読む `_proc_cmdline()` を追加 (`_proc_stat` の comm は 15 文字で
+  打ち切られ判定に使えない)。cmdline が読めない 1 ノードは「job ではない」に倒して走査を
+  続ける (`_proc_stat` の「消滅以外は re-raise して `unknown` に倒す」= ツリー構築失敗とは
+  別の話。1 ノードの分類失敗はツリー構造を壊さない)。
+- テストの fixture は symlink で comm を偽装する方式 (`_fake_binary`) をやめ、本物の bash の
+  `exec -a` で argv[0]/cmdline を書き換える方式にした (Bash tool wrapper 形は実際の shell
+  snapshot ファイルを `source` する形をそのまま再現)。
+
+### Rule 5 の「裏の job だから黙る」に上限を足す (t074 追補, Director 実例 2026-09-27 23:15〜23:45)
+
+Ren の `while pgrep -f "<script>" > /dev/null; do sleep 15; done` は、Claude Code が
+コマンド全体を `bash -c '… eval …'` に包むため **`pgrep -f` がループ自身の cmdline に
+自己一致**し、赤の実証が終わった後も終わらず 15 分以上回った。このループは Bash tool の
+ラッパーの子孫なので、起動元判定では (正しく) job と分かる — が、job の**中身が進んでいるか**
+は起動元だけでは分からない。「末端が `sleep`/`pgrep`/`tail -f` なら job でない」という案は
+採らなかった: 正当な CI 待ちループ (`while ...; do sleep 20; done` で `gh pr checks` を呼ぶ
+パターン。本番で常用) も末端は同じ `sleep` になり、これを「job でない」にすると正当な長時間
+待ちを常に誤検知する ([[time-as-proxy-flips-false-positive-to-false-negative]] と同じ罠)。
+
+代わりに、watchdog の絶対上限 (`max_threshold`) と同じ考え方 (「プロセス層はこの上限だけは
+抑制しない」) を dispatcher の Rule 5 にも 1 つ足した: `BACKGROUND_JOB_MAX_SECONDS`
+(既定 1800 秒 = 30 分。`CREWVIA_RULE5_BACKGROUND_JOB_MAX_SECONDS` で上書き)。job が
+**連続して見え続けている時間** (`registry/mux/<name>.job-since.json`。grace の `since` とは
+別のタイマー — grace は job があるあいだ毎サイクル測り直されるので流用できない) がこれを
+超えたら、たとえ本物の job が生きていても通常の idle-with-task 判定に進む。デフォルトは
+本番で観測されている正当な長時間実行 (pytest 一式が約 25 分。`tests/CLAUDE.md`) より長く、
+watchdog の絶対上限 (既定 3600 秒) より短い。「本当に進んでいるか」を判定しようとはしない
+(その代理指標はまた別の穴を生む) — 上限は「黙る方向には倒さない安全弁」であって「進捗検知」
+ではない。memory `pgrep-self-match-wait-loop-hangs-worker`。
+
+### 検証 (t074)
+
+- `tests/test_background_work_is_not_idle.py` — 本物の起動経路 (`exec -a` による cmdline
+  書き換え、実際の shell snapshot ファイルを `source` する wrapper) で偽陽性・偽陰性・watchdog
+  の 3 方向 + BACKGROUND_JOB_MAX_SECONDS の受入条件 (上限前後・grace との独立性・job 終了時の
+  クリア) を固定。`tests/test_watchdog_idle.py` の comm ベース時代のテスト 2 本も同じ方式に
+  書き換えた。
+- `tests/red_proof_b1_background_work.sh` — case O/P を新しい定義に合わせて書き換え、
+  BACKGROUND_JOB_MAX_SECONDS 用の case Q/R を追加。全 18 件が赤になることを確認。

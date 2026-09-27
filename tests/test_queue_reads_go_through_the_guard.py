@@ -362,6 +362,8 @@ ALLOWED_DIRECT_READS = {
     # -- crewvia のファイルではない: /proc ---------------------------------
     ("lib_pane_process.py", "_proc_stat", 'Path(f"/proc/{pid}/stat").read_text()'):
         "/proc は procfs。FIFO にも通常ファイルにも置き換えられない",
+    ("lib_pane_process.py", "_proc_cmdline", 'Path(f"/proc/{pid}/cmdline").read_bytes()'):
+        "同上 (t074: 判定根拠を comm から cmdline に移した)",
     ("lib_retirement.py", "process_alive",
      'Path(f"/proc/{pid}/stat").read_text()'):
         "同上",

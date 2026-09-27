@@ -941,23 +941,47 @@ class TestQuarantinedEntriesAreNotReprocessed:
         assert "quarantined 0" in r.stdout
         assert fx.quarantine_entries() == before
 
-    def test_a_path_under_quarantine_without_the_lock_reason_is_not_treated_as_ours(self, fx):
-        """パスが `.quarantine/` 配下「だけ」では十分でない (族B — 対象の同定は 2 つの一致で確かめる)。
-        reason 無しで手動 lock されただけの何かは、通常の R_LOCKED として扱われる (=quarantine
-        扱いにして黙って見落とさない)。"""
+    def test_a_path_under_quarantine_without_the_lock_reason_is_kept_as_unverified(self, fx):
+        """パスが `.quarantine/` 配下「だけ」では R_QUARANTINED (確定) にはしない (族B — 対象の
+        同定は 2 つの一致で確かめる: 構造上の場所 + lock の reason の timestamp)。だが t080 P2-1
+        より前は、この場合に通常の分類 (mission slug 等) へ進んでしまい、状態次第で REMOVE にすら
+        なりえた。今は構造上の場所だけで R_QUARANTINE_UNVERIFIED に倒し、正体が確認できない
+        エントリを自動で動かさない（reason 無しで手動 lock されただけの何かも、move が成功した
+        だけで lock に失敗した本物の隔離エントリも、同じ理由で保護される）。"""
         wt = fx.repo / ".claude" / "worktrees" / ".quarantine" / "20260101-000000" / SLUG / "manual"
         wt.parent.mkdir(parents=True)
         git(fx.repo, "worktree", "add", "-q", "-b", "manual-branch", str(wt), "origin/main")
         git(fx.repo, "worktree", "lock", str(wt))                  # reason 無し
-        assert fx.verdict(wt).reason == gc.R_LOCKED, "族B: パスだけでは quarantine 扱いにしない"
+        v = fx.verdict(wt)
+        assert (v.action, v.reason) == (gc.KEEP, gc.R_QUARANTINE_UNVERIFIED)
 
     def test_our_lock_reason_outside_the_quarantine_dir_is_not_treated_as_ours(self, fx):
         """reason がこのツールの印と一致「だけ」でも、パスが `.quarantine/` の外なら quarantine
         扱いにしない (通常の判定に進ませる — ここでは push 済みなので REMOVE になる)。"""
         wt = _pushed_worktree(fx, "t001")
-        reason = gc._quarantine_reason("20260101-000000", str(wt))
+        reason = gc._quarantine_reason("20260101-000000")
         git(fx.repo, "worktree", "lock", "--reason", reason, str(wt))
         assert fx.verdict(wt).reason == gc.R_LOCKED, "族B: reason だけでは quarantine 扱いにしない"
+
+    def test_a_move_that_succeeded_but_a_lock_that_failed_is_never_reswept(self, fx):
+        """t080 P2-1 の赤の実証: move は成功したが lock が失敗した場合を、実際に lock を呼ばずに
+        再現する。次の classify() が R_QUARANTINE_UNVERIFIED で keep し、次の --apply でも
+        再び動かされない (二重隔離が起きない) ことを確かめる。欠陥版 (このガードを外したもの) では
+        `.quarantine` 自体が mission slug として解釈され、clean・push 済みの条件を満たして
+        REMOVE になる。"""
+        wt = _pushed_worktree(fx, "gone")
+        managed_root = str(fx.repo / ".claude" / "worktrees")
+        timestamp = "20260101-000000-000000"
+        dest = pathlib.Path(gc._quarantine_destination(managed_root, timestamp, str(wt)))
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        git(fx.repo, "worktree", "move", str(wt), str(dest))
+        # lock は意図的に呼ばない (lock 失敗を模擬)。
+        v = fx.verdict(dest)
+        assert (v.action, v.reason) == (gc.KEEP, gc.R_QUARANTINE_UNVERIFIED)
+        r = fx.cli("--apply")
+        assert r.returncode == 0, r.stderr
+        assert "quarantined 0" in r.stdout, r.stdout
+        assert dest.is_dir(), "再度動かされて別の場所へ移っていないこと"
 
 
 # ---------------------------------------------------------------------------
@@ -1045,6 +1069,67 @@ class TestRestoreAndListQuarantine:
         assert r.returncode == 2
         r = fx.cli("--restore", "x", "--apply")
         assert r.returncode == 2
+
+    def test_list_quarantine_sees_an_entry_even_when_the_lock_failed(self, fx):
+        """t080 P2-1 の赤の実証: move だけ成功し lock を呼んでいない (=lock 失敗を模擬した) entry も
+        `--list-quarantine` に出る。旧実装は lock の reason を頼りに元のパスを取り出していたので、
+        lock が無ければこの entry は一覧から漏れていた。"""
+        wt = _pushed_worktree(fx, "gone")
+        managed_root = str(fx.repo / ".claude" / "worktrees")
+        timestamp = "20260101-000000-000000"
+        dest = pathlib.Path(gc._quarantine_destination(managed_root, timestamp, str(wt)))
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        git(fx.repo, "worktree", "move", str(wt), str(dest))
+        data = json.loads(fx.cli("--list-quarantine", "--json").stdout)
+        assert len(data) == 1
+        assert data[0]["original_path"] == str(wt)
+        assert data[0]["path"] == str(dest)
+
+    def test_restore_works_even_when_the_lock_failed(self, fx):
+        """t080 P2-1 の赤の実証: 同じ「move だけ成功・lock 無し」の entry を `--restore` で
+        完全に元へ戻せる (unlock を呼ばずに直接 move で戻す)。"""
+        wt = _pushed_worktree(fx, "gone")
+        fx.commit(wt, "extra.txt")
+        fx.push(wt)
+        managed_root = str(fx.repo / ".claude" / "worktrees")
+        timestamp = "20260101-000000-000000"
+        dest = pathlib.Path(gc._quarantine_destination(managed_root, timestamp, str(wt)))
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        git(fx.repo, "worktree", "move", str(wt), str(dest))
+        assert not wt.exists()
+        r = fx.cli("--restore", str(wt))
+        assert r.returncode == 0, (r.stdout, r.stderr)
+        assert wt.is_dir()
+        assert (wt / "extra.txt").is_file()
+        assert fx.quarantine_entries() == []
+
+    def test_quarantine_round_trips_a_path_with_embedded_and_trailing_newlines_byte_for_byte(self, fx):
+        """t080 P2-2 の赤の実証: 元の絶対パスの最後の構成要素に埋め込みの改行と末尾の改行を両方含む
+        場合でも、隔離 → 一覧 → 復旧の往復がバイト単位で一致すること。旧実装 (reason に
+        `orig=<path>` を埋め込み、DOTALL 無しの正規表現で取り出す) は、埋め込みの改行で
+        マッチ自体に失敗し (`_parse_quarantine_reason` が None を返す)、さらに `git worktree
+        lock` 自身が reason ファイルの末尾の改行を読み出し時に落とすため、末尾の改行があると
+        そもそも reason に書いた値を正しく読み戻せない。"""
+        name_with_newlines = "line1\nline2\n"
+        wt = fx.repo / ".claude" / "worktrees" / SLUG / name_with_newlines
+        wt.parent.mkdir(parents=True, exist_ok=True)
+        git(fx.repo, "worktree", "add", "-q", "--detach", str(wt), "origin/main")
+        r = fx.cli("--apply")
+        assert r.returncode == 0, (r.stdout, r.stderr)
+        assert not wt.exists()
+
+        entries = fx.quarantine_entries()
+        assert len(entries) == 1
+        _quarantined_wt, _ts, listed_original = entries[0]
+        assert listed_original == str(wt), "隔離先の一覧が返す元のパスがバイト単位で一致すること"
+
+        data = json.loads(fx.cli("--list-quarantine", "--json").stdout)
+        assert data[0]["original_path"] == str(wt)
+
+        r = fx.cli("--restore", str(wt))
+        assert r.returncode == 0, (r.stdout, r.stderr)
+        assert wt.is_dir()
+        assert fx.quarantine_entries() == []
 
 
 class TestOutput:

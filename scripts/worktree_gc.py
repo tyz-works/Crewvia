@@ -54,11 +54,16 @@ assume-unchanged を自動で付けるので、設定 1 つで大量に目隠し
 
 - **`git worktree remove` は呼ばない。** 代わりに `git worktree move <candidate> <隔離先>` で
   `.claude/worktrees/.quarantine/<timestamp>/<元の相対パス>` へ移し、直後に
-  `git worktree lock --reason "quarantined by worktree_gc <timestamp> orig=<元の絶対パス>"` を付ける。
+  `git worktree lock --reason "quarantined by worktree_gc <timestamp>"` を付ける。**元の絶対パスは
+  reason に埋め込まない**（t080 P2-2: 埋め込みの改行を含むパスで正規表現のパースが壊れ、末尾の改行は
+  `git worktree lock` 自身が黙って落とすことを実機で確認した）。元のパスは、隔離先のディレクトリ階層
+  （`<managed_root>` から `.quarantine/<timestamp>/` を除いた残り = 元の相対パス）から機械的に
+  復元する — ディレクトリ名はどんなバイト列（埋め込み・末尾の改行を含む）も失わずに保持できる。
   `git worktree move` は登録・ブランチ・未コミットの変更をすべて保ったまま移動し、`lock` された
-  worktree は `git worktree prune` でも消えない。**`git branch -d` / `-D` も呼ばない** — 隔離では
-  branch に触れる理由が無い (branch は移動した worktree にそのまま残る)。`rm -rf` は使わない。
-  remote branch は触らない。
+  worktree は `git worktree prune` でも消えない。`--list-quarantine` / `--restore` は lock の成否を
+  見ない（move さえ済んでいれば、lock が失敗していても機能する。t080 P2-1）。**`git branch -d` / `-D`
+  も呼ばない** — 隔離では branch に触れる理由が無い (branch は移動した worktree にそのまま残る)。
+  `rm -rf` は使わない。remote branch は触らない。
 - **repository-wide の `git worktree prune` は呼ばない。** (t057 で削除済み。隔離は個別の対象だけを
   `git worktree move` で動かすので、この制約は変わらず有効)
 - 隔離先が既に存在する場合は **`git worktree move` を呼ばずに失敗として報告する** — 空ディレクトリで
@@ -79,8 +84,13 @@ assume-unchanged を自動で付けるので、設定 1 つで大量に目隠し
   ブランチは「push 済みと確かめられない」= keep になる。それが保留の向き)。
 - プロセスの cwd は Linux の `/proc`、無ければ `lsof` で見る。どちらも使えなければ全部 keep。
 - **戻せない操作はこのツールには無い。** `--apply` がやるのは `git worktree move` + `git worktree lock`
-  だけで、どちらも `--restore` で完全に戻せる (unlock + move back)。実際に消す操作 (`git worktree remove`
-  や `rm -rf`) はこのツールの外、人間の判断で行う。
+  だけで、`move` さえ成功していれば `lock` が失敗していても `--restore` で完全に戻せる
+  (t080 P2-1: 復旧できるかどうかを lock の成否に依存させていない)。実際に消す操作
+  (`git worktree remove` や `rm -rf`) はこのツールの外、人間の判断で行う。
+- **`git worktree move` 自体の原子性はこのツールの外側の前提。** move がファイルシステム上の移動と
+  git 内部の登録更新の両方を行う操作である以上、その 2 つが中途半端に食い違う状態
+  (例: ファイルは移動したが登録が古いパスを指す) は git 自身の実装に委ねている。そうなった場合の
+  検出・復旧はこのツールの対象外（`git worktree list` の結果と実ディレクトリを人間が突き合わせること）。
 
 ## 停止スイッチは無い
 
@@ -137,6 +147,12 @@ R_CONFIG_CHECK_FAILED = 'config-check-failed'
 R_HEAD_UNRESOLVED = 'head-unverifiable'
 R_UNPUSHED = 'unpushed-commits'
 R_QUARANTINED = 'already-quarantined'
+#: `.quarantine/` 配下にはあるが、lock が無い・timestamp が一致しないなど「このツールが隔離した
+#: と確認しきれない」もの (t080 P2-1: move は成功したが lock が失敗した場合がここに落ちる)。
+#: 通常の分類 (mission slug 等) に進ませない — `.quarantine` 自体を mission slug として
+#: 再判定すると、次の --apply がこのエントリを再び動かし、隔離先のパスを「元の場所」として
+#: 記録してしまう (族C: ガード自身が失敗した状態の未処理)。
+R_QUARANTINE_UNVERIFIED = 'quarantine-dir-unverified'
 
 GIT_TIMEOUT_SECONDS = 120
 
@@ -146,20 +162,52 @@ PROC_ROOT = Path('/proc')
 #: 隔離領域の名前 (`<managed_root>/.quarantine/<timestamp>/<元の相対パス>`)。
 QUARANTINE_DIRNAME = '.quarantine'
 
-#: `git worktree lock --reason` に埋め込む印。`--restore` はこれを手がかりに元のパスへ戻す。
-#: タイムスタンプ・元のパスのどちらにも空白を含みうるので、`orig=` は行の最後に置き、そこから先を
-#: まるごと元のパスとして読む (`re.match` の `(.*)$` — パスの途中にどんな文字があっても崩れない)。
-_QUARANTINE_REASON_RE = re.compile(r'^quarantined by worktree_gc (\S+) orig=(.*)$')
+#: `git worktree lock --reason` に埋め込む印。timestamp だけを持つ (t080 P2-2)。
+#:
+#: 旧実装は元の絶対パスも `orig=<path>` として reason 文字列に埋め込み、`re.match` の `(.*)$`
+#: (DOTALL 無し) で取り出していた。しかし (a) 元のパスに埋め込みの改行が入ると `.` が `\n` を
+#: 跨げず正規表現が丸ごとマッチしなくなり、(b) 末尾の改行は `git worktree lock` 自身が
+#: (`.git/worktrees/<name>/locked` から読み出す `git worktree list` の時点で) 黙って落とす
+#: ことを実機で確認した (改行を含まないファイル内容として読むため)。DOTALL を付けても (b) は
+#: 直らない — git 側が既に落としているので、reason に何を書いても手遅り。
+#:
+#: そこで元の絶対パスは reason に**持たせない**。`_quarantine_path_parts()` が隔離先の
+#: ディレクトリ階層 (`<managed_root>/.quarantine/<timestamp>/<rel>`) から機械的に導く。
+#: ディレクトリ名は (`git worktree list --porcelain -z` の worktree パス欄がそうであるように)
+#: NUL 区切りの実体であり、埋め込み・末尾の改行を含むどんなバイト列でも失わずに保持できる。
+_QUARANTINE_REASON_RE = re.compile(r'^quarantined by worktree_gc (\S+)$')
 
 
-def _quarantine_reason(timestamp: str, original_abs_path: str) -> str:
-    return f'quarantined by worktree_gc {timestamp} orig={original_abs_path}'
+def _quarantine_reason(timestamp: str) -> str:
+    return f'quarantined by worktree_gc {timestamp}'
 
 
-def _parse_quarantine_reason(reason: str) -> Optional[tuple[str, str]]:
-    """`(timestamp, 元の絶対パス)`。このツールが付けた印でなければ None。"""
+def _parse_quarantine_reason(reason: str) -> Optional[str]:
+    """timestamp。このツールが付けた印でなければ None。"""
     m = _QUARANTINE_REASON_RE.match(reason)
-    return (m.group(1), m.group(2)) if m else None
+    return m.group(1) if m else None
+
+
+def _quarantine_path_parts(wt_real: str, managed_root: str) -> Optional[tuple[str, str]]:
+    """`<managed_root>/.quarantine/<timestamp>/<rel...>` の分解。`(timestamp, rel)`。
+
+    2 階層に満たない (timestamp か rel のどちらかが空になる) なら None。lock の状態は見ない
+    (`--list-quarantine` / `--restore` は lock が失敗していても機能する必要がある。t080 P2-1)。
+    """
+    qroot = quarantine_root_of(managed_root)
+    if not _within(wt_real, qroot):
+        return None
+    rel_all = os.path.relpath(wt_real, qroot)
+    if rel_all in ('', '.'):
+        return None
+    parts = rel_all.split(os.sep, 1)
+    if len(parts) != 2 or not parts[0] or not parts[1]:
+        return None
+    return parts[0], parts[1]
+
+
+def _quarantine_original_path(managed_root: str, rel: str) -> str:
+    return os.path.join(managed_root, rel)
 
 
 # ---------------------------------------------------------------------------
@@ -457,17 +505,23 @@ def quarantine_root_of(managed_root: str) -> str:
 
 
 def _is_our_quarantine_entry(wt: Worktree, wt_real: str, managed_root: str) -> bool:
-    """すでにこのツールが隔離した worktree か。
+    """すでにこのツールが隔離し、lock まで完全に確認できた worktree か (= R_QUARANTINED)。
 
-    **根拠は 2 つの一致 (族B: 対象の同定)** — パスが `.quarantine/` 配下「だけ」でも、lock の reason が
-    このツールの印「だけ」でも判定しない。片方だけずれている (パスは隔離領域だが reason が無い/別物、
-    または reason はこのツールの印だが `.quarantine/` の外) のは、通常の運用では起きない組み合わせで
-    あり、そのまま「隔離済みで安全」と信用せず通常の分類に進ませる (何かを黙って見落とすより、
-    もう一度普通に判定させる方が安全な向き)。
+    **根拠は 2 つの一致 (族B: 対象の同定)** — 構造上の場所 (`.quarantine/<timestamp>/<rel>` の
+    形) と、lock の reason に埋め込まれた timestamp が**その場所の timestamp と一致する**こと。
+    片方だけでは確定しない (通常の運用では起きない組み合わせ、または t080 P2-1 のように lock 自体が
+    失敗した場合がここに落ちる)。**元のパスの一致はここでは見ない** — 元のパスは reason ではなく
+    ディレクトリ階層から導くので (`_quarantine_path_parts`)、この関数の役目は「lock まで含めて
+    完全に確認できたか」だけである。確認できない場合も `classify()` 側の別条件
+    (`_quarantine_path_parts` が非 None) が拾い、通常の分類には進ませない (R_QUARANTINE_UNVERIFIED)。
     """
-    under_quarantine = _within(wt_real, quarantine_root_of(managed_root))
-    marked = bool(wt.locked and wt.locked_reason and _parse_quarantine_reason(wt.locked_reason))
-    return under_quarantine and marked
+    parts = _quarantine_path_parts(wt_real, managed_root)
+    if parts is None:
+        return False
+    ts_from_path, _rel = parts
+    if not wt.locked or not wt.locked_reason:
+        return False
+    return _parse_quarantine_reason(wt.locked_reason) == ts_from_path
 
 
 def classify(wt: Worktree, ctx: Context, is_main: bool = False) -> Verdict:
@@ -485,6 +539,17 @@ def classify(wt: Worktree, ctx: Context, is_main: bool = False) -> Verdict:
         return keep(R_MAIN)
     if _is_our_quarantine_entry(wt, wt_real, ctx.managed_root):
         return keep(R_QUARANTINED, '`--restore` で元に戻すか、`--list-quarantine` で一覧を見る')
+    if _within(wt_real, quarantine_root_of(ctx.managed_root)):
+        # `.quarantine/` 配下ではあるが lock が無い・timestamp が一致しない (t080 P2-1:
+        # move は成功したが lock が失敗した場合がここに落ちる。手動で置かれた何かの可能性もある)。
+        # **正体の分からないエントリは自動で動かさない** — ここで keep せずに下の mission slug
+        # 判定へ進ませると、`.quarantine` 自体が mission slug として解釈され、通常の条件を
+        # 満たせば REMOVE になり、次の --apply が隔離先のパスを「元の場所」として再度動かす
+        # (隔離先を隔離する二重隔離)。`--list-quarantine` は lock の成否に関わらずこのエントリを
+        # 見せる (`_quarantine_path_parts` はディレクトリ階層だけで判定する)。
+        return keep(R_QUARANTINE_UNVERIFIED,
+                    'lock が無いか timestamp が一致しない。`--list-quarantine` で確認するか、'
+                    '手動で `git worktree lock` すること')
     slug = mission_slug_of(wt_real, ctx.managed_root)
     if slug is None:
         return keep(R_OUTSIDE, f'{ctx.managed_root}/<mission>/<name> の外')
@@ -634,12 +699,19 @@ def apply_quarantine(repo: str, queue: str, verdicts: list[Verdict]) -> list[dic
             results.append({'path': v.path, 'status': 'failed',
                             'detail': f'git worktree move: {(err or "実行できない").strip()[:300]}'})
             continue
-        reason = _quarantine_reason(timestamp, wt_real)
+        reason = _quarantine_reason(timestamp)
         rc, _out, err = run_git(repo, 'worktree', 'lock', '--reason', reason, dest)
         if rc != 0:
+            # lock は失敗したが move は済んでいる。`classify()` は `.quarantine/` 配下という
+            # 構造だけで次の --apply に巻き込まれないようにする (R_QUARANTINE_UNVERIFIED)。
+            # `--restore` も lock の成否を見ずディレクトリ階層から元のパスを導くので機能する
+            # (t080 P2-1)。ここでの failed は「lock という 1 ステップが未完了」の報告であり、
+            # データは隔離領域に残っていて消えていない。
             results.append({'path': v.path, 'status': 'failed',
-                            'detail': (f'{dest} へ移動したが lock に失敗した (手で `git worktree lock` '
-                                       f'すること): {(err or "実行できない").strip()[:300]}')})
+                            'detail': (f'{dest} へ移動したが lock に失敗した (次の --apply には '
+                                       f'巻き込まれない。`--restore {dest}` で戻すか、手で '
+                                       f'`git worktree lock` すること): '
+                                       f'{(err or "実行できない").strip()[:300]}')})
             continue
         results.append({'path': v.path, 'status': 'quarantined', 'detail': dest})
     return results
@@ -650,7 +722,12 @@ def apply_quarantine(repo: str, queue: str, verdicts: list[Verdict]) -> list[dic
 # ---------------------------------------------------------------------------
 
 def find_quarantine_entries(repo: str) -> tuple[Optional[list[tuple[Worktree, str, str]]], str]:
-    """`([(worktree, 隔離日時, 元の絶対パス), ...], 問題)`。`list_worktrees` が失敗したら `(None, 理由)`。"""
+    """`([(worktree, 隔離日時, 元の絶対パス), ...], 問題)`。`list_worktrees` が失敗したら `(None, 理由)`。
+
+    lock の成否は見ない (t080 P2-1) — 隔離先のディレクトリ階層 (`_quarantine_path_parts`) だけで
+    判定・復元するので、`git worktree move` が成功してさえいれば `--list-quarantine` / `--restore`
+    は機能する。lock は prune からの保護であって、復旧できるかどうかの条件ではない。
+    """
     worktrees, problem = list_worktrees(repo)
     if worktrees is None:
         return None, problem
@@ -658,10 +735,11 @@ def find_quarantine_entries(repo: str) -> tuple[Optional[list[tuple[Worktree, st
     out = []
     for wt in worktrees:
         wt_real = os.path.realpath(wt.path)
-        if not _is_our_quarantine_entry(wt, wt_real, managed_root):
+        parts = _quarantine_path_parts(wt_real, managed_root)
+        if parts is None:
             continue
-        parsed = _parse_quarantine_reason(wt.locked_reason)
-        out.append((wt, parsed[0], parsed[1]))
+        timestamp, rel = parts
+        out.append((wt, timestamp, _quarantine_original_path(managed_root, rel)))
     return out, ''
 
 
@@ -716,17 +794,23 @@ def cmd_restore(repo: str, given_path: str, as_json: bool) -> int:
     except OSError as e:
         print(f'{orig} の親ディレクトリを作れません (隔離先は変更していません): {e}', file=sys.stderr)
         return 1
-    rc, _out, err = run_git(repo, 'worktree', 'unlock', wt.path)
-    if rc != 0:
-        print(f'{wt.path} の unlock に失敗しました (何も動かしていません): '
-              f'{(err or "実行できない").strip()[:300]}', file=sys.stderr)
-        return 1
+    # 隔離時に lock が失敗していた場合、この entry はそもそも locked ではない (t080 P2-1)。
+    # `git worktree unlock` は locked でない worktree には非 0 を返すので、その場合は
+    # unlock 自体をスキップする (呼んで無意味な失敗を報告しない)。
+    if wt.locked:
+        rc, _out, err = run_git(repo, 'worktree', 'unlock', wt.path)
+        if rc != 0:
+            print(f'{wt.path} の unlock に失敗しました (何も動かしていません): '
+                  f'{(err or "実行できない").strip()[:300]}', file=sys.stderr)
+            return 1
     rc, _out, err = run_git(repo, 'worktree', 'move', wt.path, orig)
     if rc != 0:
-        # unlock は済んだが move できなかった。保護を失った状態で放置しないよう再ロックを試みる
-        # (ベストエフォート — 失敗してもその旨を報告するだけで、これ以上は何もしない)。
-        relock_rc, _o, relock_err = run_git(repo, 'worktree', 'lock', '--reason', wt.locked_reason, wt.path)
-        relock_note = '' if relock_rc == 0 else f' (再ロックにも失敗: {(relock_err or "").strip()[:200]})'
+        relock_note = ''
+        if wt.locked:
+            # unlock は済んだが move できなかった。保護を失った状態で放置しないよう再ロックを試みる
+            # (ベストエフォート — 失敗してもその旨を報告するだけで、これ以上は何もしない)。
+            relock_rc, _o, relock_err = run_git(repo, 'worktree', 'lock', '--reason', wt.locked_reason, wt.path)
+            relock_note = '' if relock_rc == 0 else f' (再ロックにも失敗: {(relock_err or "").strip()[:200]})'
         print(f'{wt.path} を {orig} へ move できませんでした{relock_note}: '
               f'{(err or "実行できない").strip()[:300]}', file=sys.stderr)
         return 1

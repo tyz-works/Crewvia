@@ -39,6 +39,14 @@
 #   EE git worktree move の失敗を削除にフォールバックする                          → 赤 (t071 / PR#239 3巡目)
 #   FF 隔離先が既に存在してもそのまま move を呼ぶ (上書きの危険)                    → 赤 (t071 / PR#239 3巡目)
 #
+# t080 (B9 fix 4巡目: Codex review の findings) で追加:
+#   GG move は成功したが lock が失敗したエントリを通常の分類 (mission slug 等) に            → 赤 (t080 P2-1)
+#      進ませ、.quarantine 自体を mission slug として再判定できてしまう
+#   HH --list-quarantine / --restore を lock の成否 (reason の一致) に依存させる          → 赤 (t080 P2-1)
+#      (move だけ成功した entry が一覧・復旧から見えなくなる)
+#   II 元の絶対パスの復元 (--list-quarantine の original_path) が最初の改行で             → 赤 (t080 P2-2)
+#      切り詰められる (埋め込み・末尾の改行を含むパスの往復が壊れる)
+#
 # 隔離: 使い捨ての複製で欠陥を注入する。本番の worktree のファイルには触らない。
 # テストは一時ディレクトリの git repo (origin = bare) と隔離した queue / registry だけで動き、
 # 本番の主 checkout・queue・registry・mux には届かない (--repo / --queue を必ず明示している)。
@@ -145,7 +153,9 @@ expect_red "case H" "test_a_scan_that_failed_keeps_every_worktree"
 
 echo "== case I: locked でも remove にする"
 fresh_copy
-inject $S "    if wt.locked:" "    if False:"
+inject $S "    if wt.locked:
+        return keep(R_LOCKED)" "    if False:
+        return keep(R_LOCKED)"
 expect_red "case I" "test_a_locked_worktree_is_kept"
 
 echo "== case J: 主 checkout を管理対象として扱う"
@@ -297,6 +307,47 @@ echo "== case FF: 隔離先が既に存在してもそのまま move を呼ぶ (
 fresh_copy
 inject $S "        if os.path.exists(dest):" "        if False:"
 expect_red "case FF" "test_an_existing_quarantine_destination_refuses_the_move_instead_of_calling_it"
+
+echo "== case GG: move は成功したが lock が失敗したエントリを通常の分類へ進ませる (t080 P2-1)"
+fresh_copy
+inject $S "    if _within(wt_real, quarantine_root_of(ctx.managed_root)):
+        # \`.quarantine/\` 配下ではあるが lock が無い・timestamp が一致しない (t080 P2-1:
+        # move は成功したが lock が失敗した場合がここに落ちる。手動で置かれた何かの可能性もある)。
+        # **正体の分からないエントリは自動で動かさない** — ここで keep せずに下の mission slug
+        # 判定へ進ませると、\`.quarantine\` 自体が mission slug として解釈され、通常の条件を
+        # 満たせば REMOVE になり、次の --apply が隔離先のパスを「元の場所」として再度動かす
+        # (隔離先を隔離する二重隔離)。\`--list-quarantine\` は lock の成否に関わらずこのエントリを
+        # 見せる (\`_quarantine_path_parts\` はディレクトリ階層だけで判定する)。
+        return keep(R_QUARANTINE_UNVERIFIED,
+                    'lock が無いか timestamp が一致しない。\`--list-quarantine\` で確認するか、'
+                    '手動で \`git worktree lock\` すること')" \
+           "    if False:
+        return keep(R_QUARANTINE_UNVERIFIED, '')"
+expect_red "case GG" "test_a_move_that_succeeded_but_a_lock_that_failed_is_never_reswept"
+
+echo "== case HH: --list-quarantine / --restore を lock の成否に依存させる (t080 P2-1)"
+fresh_copy
+inject $S "    for wt in worktrees:
+        wt_real = os.path.realpath(wt.path)
+        parts = _quarantine_path_parts(wt_real, managed_root)
+        if parts is None:
+            continue
+        timestamp, rel = parts
+        out.append((wt, timestamp, _quarantine_original_path(managed_root, rel)))" \
+           "    for wt in worktrees:
+        wt_real = os.path.realpath(wt.path)
+        if not _is_our_quarantine_entry(wt, wt_real, managed_root):
+            continue
+        parts = _quarantine_path_parts(wt_real, managed_root)
+        timestamp, rel = parts
+        out.append((wt, timestamp, _quarantine_original_path(managed_root, rel)))"
+expect_red "case HH" "test_list_quarantine_sees_an_entry_even_when_the_lock_failed"
+
+echo "== case II: 元のパスの復元が最初の改行で切り詰められる (t080 P2-2)"
+fresh_copy
+inject $S "        out.append((wt, timestamp, _quarantine_original_path(managed_root, rel)))" \
+           "        out.append((wt, timestamp, _quarantine_original_path(managed_root, rel).split(chr(10))[0]))"
+expect_red "case II" "test_quarantine_round_trips_a_path_with_embedded_and_trailing_newlines_byte_for_byte"
 
 echo
 echo "PASS=$PASS FAIL=$FAIL"

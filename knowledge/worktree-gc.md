@@ -102,9 +102,15 @@ memory `fail-closed-discard-vs-hold` / `evidence-for-destructive-decisions` の�
 
 - **`git worktree remove` は呼ばない。** remove と判定したものは `git worktree move <candidate> <隔離先>`
   で `.claude/worktrees/.quarantine/<timestamp>/<元の相対パス>` へ移し、直後に
-  `git worktree lock --reason "quarantined by worktree_gc <timestamp> orig=<元の絶対パス>"` を付ける。
-  `move` は登録・ブランチ・未コミットの変更をすべて保ったまま移動し、`lock` された worktree は
-  `git worktree prune` でも消えない。
+  `git worktree lock --reason "quarantined by worktree_gc <timestamp>"` を付ける。**元の絶対パスは
+  reason に埋め込まない**（t080 P2-2 — 埋め込みの改行を含むパスは DOTALL 無しの正規表現でマッチ自体に
+  失敗し、末尾の改行は `git worktree lock` 自身が読み出し時に黙って落とすことを実機で確認した。reason
+  に何を書いても手遅れ）。元のパスは、隔離先のディレクトリ階層（`.quarantine/<timestamp>/` を除いた
+  残り = 元の相対パス）から `_quarantine_path_parts()` が機械的に復元する — ディレクトリ名はどんな
+  バイト列（埋め込み・末尾の改行を含む）も失わずに保持できる。`move` は登録・ブランチ・未コミットの
+  変更をすべて保ったまま移動し、`lock` された worktree は `git worktree prune` でも消えない。
+  `--list-quarantine` / `--restore` は lock の成否を見ない — move さえ済んでいれば機能する
+  （t080 P2-1: move は成功したが lock が失敗した entry も、一覧・復旧の対象になる）。
 - `timestamp` は秒精度ではなく `%Y%m%d-%H%M%S-%f` (マイクロ秒まで)。同じ元パスを 2 回に分けて隔離する
   2 回の `--apply` が同じ秒に収まると、秒精度では隔離先が文字列として一致し 2 回目が「隔離先が既に存在
   する」で失敗する (`second-precision-timestamp-is-not-a-generation` と同型。世代として突き合わせる値は
@@ -132,10 +138,19 @@ memory `fail-closed-discard-vs-hold` / `evidence-for-destructive-decisions` の�
 
 ## 隔離領域そのものの扱い
 
-- worktree_gc 自身の走査対象から `.quarantine/` を外す。根拠は「パスが `.quarantine/` 配下」**だけでなく**
-  「lock の reason が worktree_gc の印 (`quarantined by worktree_gc <timestamp> orig=<path>`) である」でも
-  確かめる (`_is_our_quarantine_entry()`。族B: 対象の同定 — 片方だけずれている組み合わせは通常の運用では
-  起きないので、そのまま「隔離済みで安全」と信用せず通常の分類に進ませる)。
+- **`classify()` での「安全に keep」の判定**（`.quarantine/` 配下は次の `--apply` に巻き込まない）は、
+  パスが `.quarantine/` 配下であること**だけ**で足りる（`R_QUARANTINE_UNVERIFIED`。t080 P2-1）。
+  ここで lock の確認までは要求しない — move が成功してさえいれば（lock が失敗していても）安全側の
+  keep に倒す。「正体の分からないエントリを自動で動かさない」ためのガードなので、`.quarantine/` 配下に
+  何があろうと（手動で置かれた何かでも）そのまま通常の分類（mission slug 等）へ進ませない。
+- **「lock まで含めて完全に確認できた」("--restore で戻すか --list-quarantine で" の案内を出す
+  `R_QUARANTINED`)** は、構造上の場所 (`.quarantine/<timestamp>/<rel>`) **と** lock の reason に
+  埋め込まれた timestamp が**その場所の timestamp と一致する**ことの 2 つの一致で確かめる
+  (`_is_our_quarantine_entry()`。族B: 対象の同定)。`R_QUARANTINED` と `R_QUARANTINE_UNVERIFIED` は
+  どちらも KEEP なので、`--apply` の安全性そのものはどちらでも変わらない — 違いは人間への案内
+  （lock されていて `--restore` にすぐ進めるか、確認が要るか）だけ。
+- **`--list-quarantine` / `--restore` は lock を見ない**（`_quarantine_path_parts()` がディレクトリ
+  階層だけで判定・復元する。t080 P2-1）。move だけ成功した (lock 失敗) entry も一覧・復旧できる。
 - `.claude/worktrees/` は `.gitignore` 済みなので、その下の `.quarantine/` も追跡対象にならない。
 
 ## 隔離の運用 (一覧・復旧・最終削除)
@@ -161,9 +176,12 @@ memory `fail-closed-discard-vs-hold` / `evidence-for-destructive-decisions` の�
   これを「変更なし」と読むかは Director の判断 (この道具は読まない。ファイル名で例外を作ると、本物の変更を
   消す穴になりうる)。
 - **戻せない操作はこのツールには無い** (PR#239 3巡目、t071 以降)。`--apply` がやるのは `git worktree move`
-  + `git worktree lock` だけで、どちらも `--restore` で完全に戻せる (unlock + move back。ファイル・登録・
-  branch のすべてが戻る)。実際に消す操作 (`git worktree remove` や `rm -rf`) はこのツールの外、人間の
-  判断で行う。
+  + `git worktree lock` だけで、`move` さえ成功していれば `lock` が失敗していても `--restore` で完全に
+  戻せる (t080 P2-1: unlock はロック済みのときだけ呼ぶ。move back はファイル・登録・branch のすべてを
+  戻す)。実際に消す操作 (`git worktree remove` や `rm -rf`) はこのツールの外、人間の判断で行う。
+- **`git worktree move` 自体の原子性はこのツールの外側の前提。** move がファイルシステム上の移動と
+  git 内部の登録更新の両方を行う操作である以上、その 2 つが中途半端に食い違う状態はこのツールの検出・
+  復旧の対象外 (git 自身の実装に委ねている)。
 
 ## 戻し方
 
@@ -176,8 +194,9 @@ env の停止スイッチも付けていない。PR を revert すれば道具�
 - `python3 -m pytest tests/test_worktree_gc.py -q` — 一時 git repo (origin = bare) と隔離した queue / registry で、
   各条件の keep / remove・観測できない場合の保留・隔離しても keep が残る・再判定・`--restore` の往復・
   `-D` / `--force` / `worktree remove` / `branch` を一切呼ばない、を確かめる。
-- 赤の実証: `bash tests/red_proof_t033.sh` (baseline + 31 ケース。W/X/Y は PR#239 1巡目の Codex findings 3 件
+- 赤の実証: `bash tests/red_proof_t033.sh` (baseline + 34 ケース。W/X/Y は PR#239 1巡目の Codex findings 3 件
   (t057)、Z/AA は PR#239 2巡目の findings 2 件 (t064: GIT_DIR 系の継承・`/proc` stat の EACCES 扱い)、
   BB〜FF は PR#239 3巡目の findings (t071: index フラグ / `core.ignoreStat` の検出漏れ・隔離設計への回帰
-  ３パターン)。P (branch を `-D` で消す) は t071 で退役 — 隔離設計になり branch を消す経路自体が
-  無くなったため)。
+  ３パターン)、GG〜II は PR#239 4巡目の findings (t080: move 成功・lock 失敗が再隔離される / 一覧・復旧が
+  lock に依存する / 元のパス復元が改行で切り詰められる)。P (branch を `-D` で消す) は t071 で退役 —
+  隔離設計になり branch を消す経路自体が無くなったため)。

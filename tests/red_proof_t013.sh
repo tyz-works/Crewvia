@@ -23,6 +23,11 @@
 #   N  lint: check_deliverable() が per-task の null を「宣言なし」と読む            → 赤 (t084 P2)
 #      (has_declaration を見ず、旧来の `declared is None` に戻す)
 #
+# t095 (Codex 8巡目 P2) で追加:
+#   OO done: 成果物を作った task 自身の card に pr_number を残さない                → 赤 (t095 P2-1)
+#   PP done: 既存の pr_number と違う番号を黙って上書きする (食い違いを拒否しない)     → 赤 (t095 P2-1)
+#   QQ lint: check_permission() 呼び出しの例外を捕まえず lint 全体を落とす            → 赤 (t095 P2-2)
+#
 # 隔離: 使い捨ての複製で欠陥を注入する。本番の worktree のファイルには触らない。
 # pytest は隔離した queue・registry (Sandbox) で動き、本物の herdr / tmux / 本番 queue には届かない。
 # PYTHONDONTWRITEBYTECODE=1 で __pycache__ を作らない (古い .pyc が注入を隠さないように)。
@@ -79,7 +84,7 @@ run_py() {  # run_py <pytest の引数...>
     ( cd "$TREE" && env -i PATH="$PATH" HOME="$WORK" PYTHONUSERBASE="${PYTHONUSERBASE:-$HOME/.local}" \
         PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -q -p no:cacheprovider "$@" 2>&1 )
 }
-TESTS=(tests/test_task_deliverable.py)
+TESTS=(tests/test_task_deliverable.py tests/test_assignment_routing.py)
 
 expect_red() {  # expect_red <case名> <赤になるはずのテスト名の断片>
     local name="$1" frag="$2"
@@ -217,6 +222,66 @@ echo "== case N: lint の check_deliverable() が per-task の null を「宣言
 fresh_copy
 inject scripts/lint_plan.py "        if not has_declaration:" "        if declared is None:"
 expect_red "case N" "test_an_explicit_null_is_rejected_as_unreadable_not_treated_as_undeclared"
+
+echo "== case OO: done が成果物を作った task 自身の card に pr_number を残さない (t095 P2-1)"
+fresh_copy
+inject scripts/plan.sh "        if pr_number is not None:
+            # 成果物を作った task 自身の card にも番号を残す (B4 の本題。t095 / PR#236 8巡目
+            # P2-1)。旧実装は propagate_pr_number() で後続の codex-review/review にだけ書き、
+            # 成果物を作った側の card には PR への参照が一切残らなかった。食い違いの拒否は
+            # 上の「自分自身の card に既にある pr_number との食い違い」で済んでいるので、
+            # ここは単純に書くだけでよい。
+            meta['pr_number'] = pr_number" \
+       "        if pr_number is not None:
+            pass  # t095 red proof: self-card pr_number write removed"
+expect_red "case OO" "test_the_producing_task_itself_keeps_its_own_pr_number"
+
+echo "== case PP: done が既存の pr_number と違う番号を黙って上書きする (t095 P2-1)"
+fresh_copy
+inject scripts/plan.sh "            if existing_pr not in (None, '') and existing_pr != pr_number:" \
+       "            if False:"
+expect_red "case PP" "test_a_conflicting_pr_number_on_the_task_itself_is_refused"
+
+echo "== case QQ: lint が check_permission() の評価時の例外を捕まえず lint 全体を落とす (t095 P2-2)"
+fresh_copy
+sed -n '/^def _skills_can_produce/,/^    return True, None$/p' \
+    "$TREE/scripts/lint_plan.py" > "$WORK/qq_current.txt"
+if [ ! -s "$WORK/qq_current.txt" ]; then
+    echo "FATAL: 置換対象の現行実装ブロックが見つからない (マーカーがずれた?)"; exit 2
+fi
+cat > "$WORK/qq_reverted.txt" <<'BLOCK'
+def _skills_can_produce(config: dict, skills: list[str], declared: str) -> tuple[bool, Optional[str]]:
+    """hook (`check_permission()`) の答えだけで、この skills の組み合わせが実際に
+    `declared` を作れるかを判定する。作れないなら理由 (人が読めるメッセージ) を添えて返す。
+
+    「1 つでも can_produce_deliverable: true な skill があれば作れる」という宣言の集計は
+    しない — `check_permission()` は deny の和を allow より先に適用するので、宣言の単純な
+    集計とは答えがズレうる (このモジュール冒頭のコメント参照)。
+    """
+    mod = _hook_skill_perms()
+    skills_csv = ','.join(skills)
+
+    write_results = [mod.check_permission(config, skills_csv, sig) for sig in _WRITE_TOOL_SIGS]
+    if all(r['decision'] == 'deny' for r in write_results):
+        sources = {r['source'] for r in write_results}
+        who = _denying_skills(sources)
+        fix = f"skill {who} を外す" if who else "拒否している skill を外す"
+        return False, (f"Write/Edit/MultiEdit が全て拒否されています ({'; '.join(sorted(sources))})。"
+                        f" {fix}こと (deny は allow より先に適用されるため、成果物を作れる skill を"
+                        f" 足しても解決しない)")
+
+    if declared == 'pr':
+        push = mod.check_permission(config, skills_csv, _PUSH_TOOL_SIG)
+        if push['decision'] == 'deny':
+            who = _denying_skills({push['source']})
+            fix = f"skill {who} を外す" if who else "拒否している skill を外す"
+            return False, f"git push が拒否されています ({push['source']})。{fix}こと"
+
+    return True, None
+BLOCK
+inject_span scripts/lint_plan.py "$WORK/qq_current.txt" "$WORK/qq_reverted.txt"
+expect_red "case QQ (null deny)" "test_a_null_deny_list_fails_only_that_task_and_does_not_crash_lint"
+expect_red "case QQ (empty config)" "test_an_empty_permissions_file_fails_only_that_task_and_does_not_crash_lint"
 
 echo
 echo "PASS=$PASS FAIL=$FAIL"

@@ -366,6 +366,44 @@ class TestCheckDeliverable:
         fails = _fails(lint_plan.check_deliverable([_t()], perms, required_problem="boom"))
         assert len(fails) == 1 and "boom" in fails[0], fails
 
+    def test_a_null_deny_list_fails_only_that_task_and_does_not_crash_lint(self, tmp_path):
+        """t095 (Codex 8巡目 P2-2): `skills: {code: {deny: null}}` は正当な YAML (config の
+        構造検証・`can_produce_deliverable` の値検証のどちらも通る) だが、`deny: null` は
+        `check_permission()` 内部の `for pattern in deny_patterns` で
+        `TypeError: 'NoneType' object is not iterable` を出す。t088 の例外処理は
+        `_load_hook_permission_config()` の config **読み込み** しか覆っておらず、この
+        評価時の例外は捕まらず lint_plan.py 全体を落としていた —— 他の (正常な) task も
+        一切検査されなくなる。捕まえて「その task の FAIL」にし、他の task の検査は続くこと。
+        """
+        perms = str(tmp_path / "skill-permissions.yaml")
+        pathlib.Path(perms).write_text(
+            "skills:\n"
+            "  code:\n"
+            "    allow: [Edit, Write, MultiEdit]\n"
+            "    deny: null\n"
+            "  docs:\n"
+            "    allow: [Edit, Write, MultiEdit]\n"
+            "    deny: []\n"
+        )
+        tasks = [_t("pr", ["code"], "t001"), _t("pr", ["docs"], "t002")]
+        results = lint_plan.check_deliverable(tasks, perms)  # 例外を出さないこと自体が実証
+        fails = _fails(results)
+        assert len(fails) == 1
+        assert "t001" in fails[0] and "評価できません" in fails[0] and "TypeError" in fails[0], fails[0]
+        assert not any("t002" in f for f in fails), "code の deny:null が docs の判定を巻き込まないこと"
+
+    def test_an_empty_permissions_file_fails_only_that_task_and_does_not_crash_lint(self, tmp_path):
+        """t095: `skill-permissions.yaml` が完全に空 (`yaml.safe_load()` は None を返す) だと、
+        `load_config()` 自体は例外を出さず config=None を返す (t088 の try/except は config の
+        **読み込み失敗** しか捕まえない)。`check_permission(None, ...)` は
+        `None.get("_global", {})` で `AttributeError` を出す。同じく捕まえて FAIL にすること。
+        """
+        perms = str(tmp_path / "skill-permissions.yaml")
+        pathlib.Path(perms).write_text("")
+        fails = _fails(lint_plan.check_deliverable([_t("pr", ["code"])], perms))
+        assert len(fails) == 1
+        assert "評価できません" in fails[0] and "AttributeError" in fails[0], fails[0]
+
 
 # ---------------------------------------------------------------------------
 # 3a2. lint の判定が check_permission() の答えと全件一致することの実証

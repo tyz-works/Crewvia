@@ -3831,6 +3831,23 @@ def cmd_done(args):
                 f" 差し戻してから再度 plan.sh done を呼んでください。"
             )
 
+        # ── 自分自身の card に既にある pr_number との食い違い (t095 / PR#236 8巡目 P2-1) ──
+        # 成果物を作った task 自身の card にも pr_number を残す (下の done 処理の中)。既に
+        # (`update --pr-number` 等で) 別の番号が入っている状態で違う番号が --pr で渡されたら、
+        # 黙って上書きしない —— どちらが正しいか自動では決められず、間違った番号で上書きすると
+        # 元の値が失われて後から気付けない。propagate_pr_number() が後続の card を
+        # 「Director が手で入れた値を上書きしない」のと同じ判断 (族A: 読めない/決められない値を
+        # 都合よく書き換えない)。同じ番号の再指定は冪等に許す。
+        if pr_number is not None:
+            existing_pr = meta.get('pr_number')
+            if existing_pr not in (None, '') and existing_pr != pr_number:
+                die(
+                    f"[plan.sh] {task_id}: card には既に pr_number={existing_pr!r} が設定されています。"
+                    f" --pr {pr_number} では上書きしません (書き間違いの可能性があるため)。"
+                    f" 正しい番号か確認するか、plan.sh update {task_id} --pr-number {pr_number}"
+                    f" --mission {slug} で明示的に書き換えてから done してください。"
+                )
+
         # ── PR 番号の付け忘れ (t036) ──────────────────────────────────────
         # この task を待つ codex-review に PR 番号が渡らないと、その task は pending のまま
         # 誰にも知らされず、Codex を通らずに merge されうる。--pr も --no-pr も無いなら、
@@ -3880,6 +3897,13 @@ def cmd_done(args):
             die(err)
 
         meta['status'] = 'done'
+        if pr_number is not None:
+            # 成果物を作った task 自身の card にも番号を残す (B4 の本題。t095 / PR#236 8巡目
+            # P2-1)。旧実装は propagate_pr_number() で後続の codex-review/review にだけ書き、
+            # 成果物を作った側の card には PR への参照が一切残らなかった。食い違いの拒否は
+            # 上の「自分自身の card に既にある pr_number との食い違い」で済んでいるので、
+            # ここは単純に書くだけでよい。
+            meta['pr_number'] = pr_number
         if no_pr_reason is not None:
             meta['no_pr_waiver'] = no_pr_reason
         meta['completed_at'] = now_iso()

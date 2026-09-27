@@ -595,7 +595,21 @@ def _skills_can_produce(config: dict, skills: list[str], declared: str) -> tuple
     mod = _hook_skill_perms()
     skills_csv = ','.join(skills)
 
-    write_results = [mod.check_permission(config, skills_csv, sig) for sig in _WRITE_TOOL_SIGS]
+    # t095 (Codex 8巡目 P2-2): check_permission() は config の構造 (`_global` / `skills.<name>`
+    # がマッピングであること、`deny` / `allow` がリストであること等) を検証しない。7巡目
+    # (t088) の例外処理は config の**読み込み** (_load_hook_permission_config の
+    # mod.load_config() 呼び出し) しか覆っておらず、`skills: {code: {deny: null}}` のような
+    # 正当な YAML (load_config() 自体は例外を出さない) が check_permission() の中で
+    # `for pattern in None` の TypeError を、空の config (`yaml.safe_load('')` は None を
+    # 返す。load_config() も例外を出さない) が `None.get(...)` の AttributeError を出す。
+    # ここを捕まえずに伝播させると lint_plan.py 全体が落ち、他の task も一切検査されない。
+    # 「読めない/計算できない」を「作れる」に倒さない (族A) ため、捕まえた例外は
+    # False (作れない = その task の FAIL) にする — 他の task の検査は続く。
+    try:
+        write_results = [mod.check_permission(config, skills_csv, sig) for sig in _WRITE_TOOL_SIGS]
+    except Exception as e:  # noqa: BLE001 — hooks/lib_skill_perms.py 自体が壊れた config でも lint を落とさない
+        return False, (f"hooks/lib_skill_perms.py の check_permission() で評価できません "
+                        f"({type(e).__name__}: {e})。config/skill-permissions.yaml の構造を確認すること")
     if all(r['decision'] == 'deny' for r in write_results):
         sources = {r['source'] for r in write_results}
         who = _denying_skills(sources)
@@ -605,7 +619,11 @@ def _skills_can_produce(config: dict, skills: list[str], declared: str) -> tuple
                         f" 足しても解決しない)")
 
     if declared == 'pr':
-        push = mod.check_permission(config, skills_csv, _PUSH_TOOL_SIG)
+        try:
+            push = mod.check_permission(config, skills_csv, _PUSH_TOOL_SIG)
+        except Exception as e:  # noqa: BLE001 — 同上
+            return False, (f"hooks/lib_skill_perms.py の check_permission() で評価できません "
+                            f"({type(e).__name__}: {e})。config/skill-permissions.yaml の構造を確認すること")
         if push['decision'] == 'deny':
             who = _denying_skills({push['source']})
             fix = f"skill {who} を外す" if who else "拒否している skill を外す"

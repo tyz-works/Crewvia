@@ -242,8 +242,26 @@ class TestCheckDeliverable:
         fails = _fails(lint_plan.check_deliverable([_t()], perms, required=True))
         assert len(fails) == 1 and "未宣言" in fails[0] and "update t001 --deliverable" in fails[0], fails
 
-    def test_an_explicit_null_counts_as_undeclared(self, perms):
-        assert _fails(lint_plan.check_deliverable([_t(None)], perms, required=True))
+    @pytest.mark.parametrize("required", [True, False])
+    def test_an_explicit_null_is_rejected_as_unreadable_not_treated_as_undeclared(self, perms, required):
+        """t084 (Codex 6巡目 P2 と同族): 'deliverable' キーが**ある**が値が明示的に null なのは
+        「未宣言」(キーが無い) とは別の状態 —— 誰かがこの欄を触ったのに空にした可能性が高い。
+        required の有無に関わらず「unknown deliverable」で拒否する ('未宣言' のメッセージにはしない)。
+        """
+        fails = _fails(lint_plan.check_deliverable([_t(None)], perms, required=required))
+        assert len(fails) == 1
+        assert "unknown deliverable" in fails[0] and "未宣言" not in fails[0], fails[0]
+
+    def test_a_null_only_mission_does_not_need_to_know_if_required(self, perms):
+        """t084: 'deliverable' が null の task しかないなら、required が決められなくても
+        (required_problem が渡されても)「必須かどうか決められません」という無関係な追加
+        メッセージは出ない —— null の task 自身が required に関わらず無条件で FAIL するため
+        (required を実際に使うのは「キーが無い」task だけ)。"""
+        fails = _fails(lint_plan.check_deliverable([_t(None)], perms, required=False,
+                                                    required_problem="mission.yaml が読めない"))
+        assert len(fails) == 1
+        assert "unknown deliverable" in fails[0]
+        assert not any("決められません" in f for f in fails)
 
     def test_declared_tasks_pass_in_a_required_mission(self, perms):
         tasks = [_t("pr", ["code"], "t001"), _t("none", ["research"], "t002"), _t("file", ["docs"], "t003")]
@@ -690,6 +708,23 @@ class TestDoneHonoursTheDeclaration:
 
     @pytest.mark.parametrize("bad", ["PR", "pull", "maybe"])
     def test_an_unreadable_declaration_is_refused_not_read_as_undeclared(self, sb, bad):
+        sb.card("t001", status="in_progress", worker="Ren", extra=[f"deliverable: {bad}"])
+        before = sb.snapshot()
+        r = _done(sb, "t001")
+        assert r.returncode == 2, (r.stdout, r.stderr)
+        assert "読めない値" in r.stderr and sb.snapshot() == before
+        # 出口: 宣言を直す、または --no-pr
+        assert sb.run("update", "t001", "--mission", MISSION, "--deliverable", "none").returncode == 0
+        assert _done(sb, "t001").returncode == 0
+
+    @pytest.mark.parametrize("bad", ["null", "~", ""])
+    def test_an_explicit_null_declaration_is_refused_not_read_as_undeclared(self, sb, bad):
+        """t084 (Codex 6巡目 P2): `meta.get('deliverable')` は「キーが無い」と「キーはあるが
+        値が明示的に null」を同じ None に潰し、後者を『何も宣言していない』(=素通り) として
+        扱っていた。'deliverable: null' / 'deliverable: ~' / 'deliverable:' (値なし) はどれも
+        YAML 上 None になるが、キー自体は書かれている —— 誰かがこの欄を触ったのに空にした
+        可能性が高く、読めない値として拒否すること (`test_a_card_without_the_field_behaves_as_before`
+        の「キーが最初から無い」場合とは区別する)。"""
         sb.card("t001", status="in_progress", worker="Ren", extra=[f"deliverable: {bad}"])
         before = sb.snapshot()
         r = _done(sb, "t001")

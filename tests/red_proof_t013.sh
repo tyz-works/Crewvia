@@ -17,6 +17,12 @@
 #   K  add / update: 不正な --deliverable を受け付ける                              → 赤
 #   L  config: codex-review の can_produce_deliverable: false を外す                → 赤
 #
+# t084 (Codex 6巡目 P2) で追加:
+#   M  done: 'deliverable' キーはあるが値が null の task を「宣言なし」と読む         → 赤 (t084 P2)
+#      (has_declaration を見ず、旧来の `declared is not None` に戻す)
+#   N  lint: check_deliverable() が per-task の null を「宣言なし」と読む            → 赤 (t084 P2)
+#      (has_declaration を見ず、旧来の `declared is None` に戻す)
+#
 # 隔離: 使い捨ての複製で欠陥を注入する。本番の worktree のファイルには触らない。
 # pytest は隔離した queue・registry (Sandbox) で動き、本物の herdr / tmux / 本番 queue には届かない。
 # PYTHONDONTWRITEBYTECODE=1 で __pycache__ を作らない (古い .pyc が注入を隠さないように)。
@@ -75,12 +81,12 @@ else ng "baseline が緑でない"; echo "$out" | tail -8; fi
 
 echo "== case A: deliverable: pr でも --pr / --no-pr を求めない"
 fresh_copy
-inject scripts/plan.sh "            if declared == 'pr' or (declared is not None and declared not in DELIVERABLE_VALUES):" "            if False:"
+inject scripts/plan.sh "            if has_declaration and (declared == 'pr' or declared not in DELIVERABLE_VALUES):" "            if False:"
 expect_red "case A" "test_pr_without_a_flag_is_refused_with_exit_2_and_writes_nothing"
 
 echo "== case B: 読めない宣言の値を「宣言なし」と読む"
 fresh_copy
-inject scripts/plan.sh "            if declared == 'pr' or (declared is not None and declared not in DELIVERABLE_VALUES):" "            if declared == 'pr':"
+inject scripts/plan.sh "            if has_declaration and (declared == 'pr' or declared not in DELIVERABLE_VALUES):" "            if has_declaration and declared == 'pr':"
 expect_red "case B" "test_an_unreadable_declaration_is_refused_not_read_as_undeclared"
 
 echo "== case C: pr|file の task を skills と突き合わせない"
@@ -147,6 +153,21 @@ inject config/skill-permissions.yaml "  codex-review:
 " "  codex-review:
 "
 expect_red "case L" "test_the_six_non_producers_declare_false"
+
+echo "== case M: done が 'deliverable' キーはあるが値が null の task を「宣言なし」と読む (t084 P2)"
+fresh_copy
+inject scripts/plan.sh "            has_declaration = 'deliverable' in meta
+            declared = meta.get('deliverable')
+            if has_declaration and (declared == 'pr' or declared not in DELIVERABLE_VALUES):" \
+       "            has_declaration = 'deliverable' in meta
+            declared = meta.get('deliverable')
+            if declared == 'pr' or (declared is not None and declared not in DELIVERABLE_VALUES):"
+expect_red "case M" "test_an_explicit_null_declaration_is_refused_not_read_as_undeclared"
+
+echo "== case N: lint の check_deliverable() が per-task の null を「宣言なし」と読む (t084 P2)"
+fresh_copy
+inject scripts/lint_plan.py "        if not has_declaration:" "        if declared is None:"
+expect_red "case N" "test_an_explicit_null_is_rejected_as_unreadable_not_treated_as_undeclared"
 
 echo
 echo "PASS=$PASS FAIL=$FAIL"

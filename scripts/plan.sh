@@ -3839,8 +3839,17 @@ def cmd_done(args):
             # task 自身の宣言 (t013 / #31): `deliverable: pr` は PR を作る task なので、番号を待つ
             # codex-review が居なくても --pr が要る。宣言が読めない値 (手で書き換えた card) のときは
             # PR を作る task かどうか決められないので、同じく拒否する (「読めない」を「宣言なし」にしない)。
+            #
+            # t084 (Codex 6巡目 P2): `meta.get('deliverable')` は「キーが無い」と「キーはあるが値が
+            # 明示的に null」を同じ None に潰す。**キーが無い** (この機能より前に書かれた card) のは
+            # 「宣言なし」の正当な既定 (下の awaiting チェックにそのまま委ねる)。だが **キーがあって
+            # 値が null** (`deliverable:` とだけ書いて値を書き忘れた・編集事故) は「宣言なし」に
+            # 黙って倒さない —— まさにこの分岐が防ごうとしていた「読めない値」そのものであり、
+            # `in` 演算子でキーの有無を別に確かめてから値を読む (5 巡目 t081 / lint_plan.py
+            # `_mission_requires_deliverable` と同じ型の欠陥)。
+            has_declaration = 'deliverable' in meta
             declared = meta.get('deliverable')
-            if declared == 'pr' or (declared is not None and declared not in DELIVERABLE_VALUES):
+            if has_declaration and (declared == 'pr' or declared not in DELIVERABLE_VALUES):
                 what = ("この task は deliverable: pr (PR を作る task) です" if declared == 'pr' else
                         f"card の deliverable が読めない値です ({declared!r}。valid: {'|'.join(DELIVERABLE_VALUES)})")
                 die(

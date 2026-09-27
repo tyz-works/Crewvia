@@ -510,16 +510,26 @@ def check_deliverable(tasks: list[dict], skill_permissions_path: str,
             caps, caps_problem = _load_deliverable_capabilities(skill_permissions_path)
         return caps, caps_problem
 
-    if required_problem is not None and any(m.get('deliverable') is None for m in tasks):
+    # required の値が要るのは「キーが無い (未宣言)」task だけ —— 「キーはあるが値が null」の
+    # task は required に関わらず下のループが無条件で FAIL する (unknown deliverable) ので、
+    # ここで `.get() is None` のまま広く数えると、null だけの mission でも「必須かどうか
+    # 決められません」という無関係な追加メッセージが出る (t084)。
+    if required_problem is not None and any('deliverable' not in m for m in tasks):
         results.append(('FAIL', 'deliverable',
                         f"mission: deliverable が必須かどうか決められません — {required_problem}"))
 
     for meta in tasks:
         tid = meta.get('id', '<unknown>')
         prefix = f"task/{tid}"
+        # t084 (Codex 6巡目 P2 と同族): `meta.get('deliverable')` は「キーが無い」と「キーは
+        # あるが値が明示的に null」を同じ None に潰す。**キーが無い** (この機能より前に書かれた
+        # task) は「未宣言」の正当な既定 (required でなければ何も言わない)。だが **キーがあって
+        # 値が null** は誰かがこの欄を触ったのに空にした可能性が高く、「未宣言」に潰さず
+        # 下の「unknown deliverable」で拒否する (`_mission_requires_deliverable` / t081 と同じ型)。
+        has_declaration = 'deliverable' in meta
         declared = meta.get('deliverable')
 
-        if declared is None:
+        if not has_declaration:
             if required:
                 results.append(('FAIL', 'deliverable',
                                 f"{prefix}: 'deliverable' が未宣言です (この mission は必須) — "
@@ -614,10 +624,13 @@ def lint_mission(slug: str, queue_dir: str, config_dir: str, strict: bool = Fals
     all_results += check_dependency_graph(valid_tasks)
     all_results += check_skill_alignment(valid_tasks, skill_perm_path)
     all_results += check_timeout_validity(valid_tasks, timeout_path)
-    # mission.yaml は、宣言の無い task があるときだけ読む (印が要るのはそのときだけ)。
+    # mission.yaml は、宣言の無い (キーが無い) task があるときだけ読む (required が要るのは
+    # そのときだけ —— 「キーはあるが値が null」の task は required に関わらず check_deliverable()
+    # が無条件で FAIL するので、ここで required を知る必要が無い。t084: `.get() is None` のまま
+    # 広く数えると、null だけの mission でも不要に mission.yaml を読みに行く)。
     required, required_problem = (
         _mission_requires_deliverable(slug, queue_dir)
-        if any(m.get('deliverable') is None for m in valid_tasks) else (False, None))
+        if any('deliverable' not in m for m in valid_tasks) else (False, None))
     all_results += check_deliverable(valid_tasks, skill_perm_path, required, required_problem)
 
     # Print results

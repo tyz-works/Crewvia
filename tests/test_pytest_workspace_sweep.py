@@ -683,8 +683,9 @@ def _session(tmp_path, workspaces, panes, process, extra_env=None,
     """conftest と sweep をコピーした小さな tests/ を、偽 herdr を PATH に置いて走らせる。"""
     proj = tmp_path / "proj"
     proj.mkdir()
-    # conftest.py は leaked_descendants を import する (t029) ので、それも一緒に写す。
-    for name in ("conftest.py", "pytest_workspace_sweep.py", "leaked_descendants.py"):
+    # conftest.py は leaked_descendants を、それは kill_budget を import する (t029) ので一緒に写す。
+    for name in ("conftest.py", "pytest_workspace_sweep.py", "leaked_descendants.py",
+                 "kill_budget.py"):
         (proj / name).write_text((TESTS_DIR / name).read_text())
     if cli_timeout is not None:
         copied = proj / "pytest_workspace_sweep.py"

@@ -49,6 +49,8 @@ import warnings
 
 import pytest
 
+import kill_budget
+
 MARKER_VAR = "CREWVIA_PYTEST_SESSION"
 
 #: kill したあと死ぬのを待つ / 増えたプロセスが自然に終わるのを待つ上限 (秒)。
@@ -188,19 +190,42 @@ def scan(exclude: set[int], marker_value: str, basetemp: str) -> Scan:
     return result
 
 
-def kill_all(survivors: list[Survivor]) -> None:
-    """判定済みの生き残りだけを SIGKILL する。死ぬ (ゾンビ含む) のを `GRACE_SECONDS` まで待つ。"""
-    for s in survivors:
+class KillReport:
+    """`kill_all` の結果。`refused` は関門が断った件、`fatal` は 1 件も殺さなかった理由。"""
+
+    def __init__(self, killed: list[int], refused: list, fatal: str | None):
+        self.killed, self.refused, self.fatal = killed, refused, fatal
+
+    def describe(self) -> str:
+        lines = []
+        if self.fatal:
+            lines.append(f"  !! kill を全件見送った (ガードの判定が壊れている疑い): {self.fatal}")
+        lines += [f"  - kill しなかった {r.describe()}" for r in self.refused]
+        return "\n".join(lines)
+
+
+def kill_all(survivors: list[Survivor], kill=os.kill) -> KillReport:
+    """生き残りのうち `kill_budget` が許した pid だけを SIGKILL する。
+
+    判定 (`_belongs` / `scan`) を壊す変異が入っても、自分・祖先・自分より古いプロセスは
+    ここで落とせない。件数が上限を超えたら 1 件も殺さない (2026-09-27 の自爆の再発防止)。
+    `kill` は差し替え口 — 変異テストとこのガード自身のテストは本物のシグナルを送らない。
+    """
+    allowed, refused, fatal = kill_budget.partition([s.pid for s in survivors])
+    if fatal is not None:
+        return KillReport([], refused, fatal)
+    for pid in allowed:
         try:
-            os.kill(s.pid, signal.SIGKILL)
+            kill(pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
     deadline = time.monotonic() + GRACE_SECONDS
     while time.monotonic() < deadline:
-        alive = [s for s in survivors if (_read_stat(s.pid) or ("Z",))[0] not in ("Z", "X")]
+        alive = [pid for pid in allowed if (_read_stat(pid) or ("Z",))[0] not in ("Z", "X")]
         if not alive:
-            return
+            break
         time.sleep(_POLL_SECONDS)
+    return KillReport(allowed, refused, None)
 
 
 def settle(exclude: set[int], marker_value: str, basetemp: str) -> Scan:
@@ -216,11 +241,15 @@ def settle(exclude: set[int], marker_value: str, basetemp: str) -> Scan:
     return result
 
 
-def format_failure(where: str, result: Scan) -> str:
+def format_failure(where: str, result: Scan, report: "KillReport | None" = None) -> str:
     lines = [f"{where}: このセッションのテストが子孫プロセスを {len(result.survivors)} 個残した (kill 済み)。",
              "  テストの後片付け漏れ。plan.sh のような bash の下の子孫は `subprocess.run(timeout=)` では "
              "bash しか殺されない —— `tests/proc_group.py` の `run_in_own_group()` / `kill_group()` を使う。"]
     lines += [f"  - {s.describe()}" for s in result.survivors]
+    if report is not None:
+        detail = report.describe()
+        if detail:
+            lines.append(detail)
     if result.unobservable:
         lines.append(f"  (環境が読めず観測できなかった同 uid のプロセス: {result.unobservable} 個。数には入れていない)")
     return "\n".join(lines)
@@ -245,8 +274,8 @@ class LeakGuard:
         result = settle(before, self.marker_value, self.basetemp)
         self.checked_tests += 1
         if result.survivors:
-            message = format_failure(request.node.nodeid, result)
-            kill_all(result.survivors)
+            report = kill_all(result.survivors)
+            message = format_failure(request.node.nodeid, result, report)
             self.leaks.append(message)
             pytest.fail(message, pytrace=False)
 
@@ -263,8 +292,8 @@ class LeakGuard:
             return
         result = scan(set(), self.marker_value, self.basetemp)
         if result.survivors:
-            message = format_failure("session finish", result)
-            kill_all(result.survivors)
+            report = kill_all(result.survivors)
+            message = format_failure("session finish", result, report)
             self.leaks.append(message)
             print("\n" + message)
             session.exitstatus = int(pytest.ExitCode.TESTS_FAILED)

@@ -49,6 +49,17 @@ root の `CLAUDE.md` から移した、テスト専用の規則。設計と経�
   `CREWVIA_PYTEST_SESSION` か cmdline / cwd が basetemp を指すこと。本番の plan.sh・デーモン・別セッションの
   pytest は数えない・殺さない。ガードが赤くなったら、ガードではなくそのテストの後片付けを直す。
 - 設計・実測・戻し方: `knowledge/test-leaked-descendants.md`。
+- **kill の関門は `tests/kill_budget.py`（判定とは別ファイル）**。自分・祖先・セッション/グループリーダー・
+  **自分より古いプロセス**（テストの子孫が、テスト自身より先に生まれていることはない）は殺さない。許可が
+  上限（既定 16、`CREWVIA_LEAK_KILL_BUDGET`）を超えたら **1 件も殺さない** — 「本当に N 個漏れた」ではなく
+  判定が壊れている方を疑う。**このファイルは変異させない**（安全弁を壊す変異は意味を失わせる）。
+- ガードの kill は `kill_all(survivors, kill=os.kill)` の差し替え口を通す。ガード自身のテストと変異テストは
+  **本物のシグナルを送らない**（`tests/test_leak_guard_self_preservation.py`）。
+- **判定を壊す変異テストは PID 名前空間の中だけで走らせる**:
+  `unshare -Urpf --mount-proc python3 -m pytest …`。名前空間の外の pid は `/proc` に見えず `os.kill` も
+  ESRCH になるので、判定がどう壊れても外へ届かない。2026-09-27、`_belongs` の頭に `return "any", True` を
+  注入した変異（G1）を素の環境で走らせ、`systemd --user` / tmux / WSL キープアライブ / n8n（uid 1000）を
+  SIGKILL して WSL ごと落とした。
 
 ## red proof の作法
 

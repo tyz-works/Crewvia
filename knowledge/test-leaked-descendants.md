@@ -80,3 +80,49 @@ pytest 自身は数えない。環境が読めない同 uid のプロセスは�
   登録されず、印も置かれない。`tests/proc_group.py` と直したテストは残してよい（後片付けが木ごとになるだけ）。
 - 誤検出の 1 件だけを許したいときは、ガードを外さず、そのテストが残しているものを片付ける
   （`kill_group()`）。残るのが正当なら、`leaked_descendants.py` の判定に理由付きの除外を足す（説明できない除外は足さない）。
+
+## 自爆させない — kill の関門（2026-09-27 の事故）
+
+ガードは `scan()` で `/proc` を全部見て、`_belongs()` が「自分の子孫か」を答え、`kill_all()` が
+その全部を SIGKILL する。**ブレーキが `_belongs()` の 1 箇所しかなかった。**
+
+2026-09-27 14:04、このガードの変異テスト（`_belongs` の頭に `return "any", True` を注入した
+`G1-count-everything-new`）を素の環境で走らせた。判定が全部「子孫」と答え、`pytest_sessionfinish` の
+`scan(set(), ...)`（`exclude` が空）が同 uid の全プロセスを拾い、`kill_all()` が全部殺した:
+`systemd --user`（`user@1000.service`）、tmux、変異テストを走らせていた Claude Code 自身、
+**"start WSL" キープアライブの `sleep infinity`**、そして **n8n コンテナの main process**
+（`n8nio/n8n` は `node` = uid 1000 で動き、userns-remap が無いのでホストの tkadmin と同一 uid）。
+root 所有のプロセスは EPERM で残った。キープアライブが消えたので WSL はクライアント無しと判断し、
+14:04:18 に `poweroff.target`、14:05:22 に VM の NIC 撤去 — WSL ごと落ちて amun がオフラインになった。
+
+### 関門（`tests/kill_budget.py`）
+
+判定と**別ファイル**に置く。判定を壊す変異が安全弁まで一緒に無効化しないため。判定が何と答えても
+次に当たる pid は殺さない:
+
+- `pid <= 1`
+- 自分（`os.getpid()`）と**その祖先すべて**
+- 自分のセッションリーダー / プロセスグループリーダー
+- **自分より古いプロセス** — `starttime`（boot からの tick）で比較。同じ tick は許す（同 tick に生まれた
+  子孫は本物）。これが今回の 4 つを単独で全部止める（どれも pytest より 11 日古い）。
+- 許可が上限（既定 16 / `CREWVIA_LEAK_KILL_BUDGET`）を超えたら **1 件も殺さない**。壊れた環境変数は
+  既定に倒す（上限が消えないように）。
+
+`kill_all(survivors, kill=os.kill)` に差し替え口を足した（`pytest_workspace_sweep.pid_state` と同じ作法）。
+`KillReport` が「殺した / 断った / 全件見送った理由」を返し、失敗メッセージに出る。
+
+### 残る穴と、それを閉じる層
+
+年齢ルールは「古いものを守る」ので、**若くて無関係なプロセス**は、判定が壊れていて件数が上限以内なら
+まだ殺され得る。完全に閉じるのは OS の境界だけ:
+
+    unshare -Urpf --mount-proc python3 -m pytest …
+
+名前空間の中からは外の pid が `/proc` に見えず `os.kill` も ESRCH。**判定を壊す変異テストはここでしか
+走らせない**（`tests/CLAUDE.md`）。非特権で動くことは WSL2 で確認済み。
+
+### 回帰テスト
+
+`tests/test_leak_guard_self_preservation.py` が、あの日の G1 と同じ状態（`_belongs` を潰す）を作って
+「断るべき pid に kill が飛ばない」「祖先・自分は何があっても殺されない」「自分より古いものは断る」
+「上限超過なら 1 件も殺さない」「それでも若い子孫はちゃんと殺す」を固定する。本物のシグナルは送らない。

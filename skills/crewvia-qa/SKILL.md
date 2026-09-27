@@ -1,6 +1,6 @@
 ---
 name: crewvia-qa
-description: Use when executing a QA task in the crewvia workflow — verifying that an implementation works correctly before merge. Invoke when assigned a task with skills containing "qa", when asked to test/verify a PR or implementation, or when checking that code meets requirements. Works for any project type: web apps, CLI tools, scripts, libraries, APIs, infrastructure code, etc.
+description: "Use when executing a QA task in the crewvia workflow — verifying that an implementation works correctly before merge. Invoke when assigned a task with skills containing \"qa\", when asked to test/verify a PR or implementation, or when checking that code meets requirements. Works for any project type: web apps, CLI tools, scripts, libraries, APIs, infrastructure code, etc."
 ---
 
 # Crewvia QA スキル

@@ -60,6 +60,7 @@ claude は **信頼されていない cwd** で起動すると trust ダイア�
 """
 
 import os
+import re
 import shlex
 import sys
 import unicodedata
@@ -220,7 +221,15 @@ def refusal_message(verdict, directory):
 # 文言は claude 2.1.283 のバンドルで確認したもの (`Quick safety check: Is this a project you
 # created or one you trust?` / `Yes, I trust this folder` / `No, exit`) と、それ以前の版の
 # `Do you trust the files in this folder?`。画面は折り返されるので、空白を畳んでから見る。
-# 単独の `No, exit` は他の画面にも出うるので、決定の操作案内 (`Enter to confirm`) と揃ったときだけ数える。
+#
+# **文言の部分一致だけでは同定にならない (族B、PR#239 の `basetemp in cmdline` と同型。t078)**。
+# 信頼済みディレクトリのパス名 (`/tmp/quick safety check` 等)・task の出力がその語を引用した場合・
+# ファイル名やブランチ名がステータス行に出た場合、いずれも画面に文言だけが乗り、start.sh はこれを
+# 検出すると kickoff を送らず pane を kill する — 正常な起動が破壊される側の誤検出。
+# → 文言に加えて、**ダイアログの操作構造** (カーソル `❯` が数字付きの選択肢を指している行、または
+# 決定の操作案内 `Enter to confirm`) が画面のどこかに伴うことを要求する。`mux_capture` は pane の
+# 画面全体を返す (スクロール中の一部ではない) ので、実際に描画されているダイアログ (自己完結した
+# 小さい UI ブロック) では、文言と操作構造が同じ capture に必ず両方乗る。
 
 _DIALOG_PHRASES = (
     'quick safety check',
@@ -229,12 +238,17 @@ _DIALOG_PHRASES = (
     'is this a project you created or one you trust',
 )
 
+#: カーソル (`❯`/`›`/`>`) が数字付きの選択肢を指している行。パスやファイル名の中の文言には
+#: この構造は伴わない。
+_MENU_CURSOR_RE = re.compile(r'[❯›>]\s*\d+[.)]')
+
 
 def screen_shows_trust_dialog(screen):
     flat = ' '.join(str(screen).lower().split())
-    if any(p in flat for p in _DIALOG_PHRASES):
-        return True
-    return 'no, exit' in flat and 'enter to confirm' in flat
+    phrase_hit = any(p in flat for p in _DIALOG_PHRASES) or 'no, exit' in flat
+    if not phrase_hit:
+        return False
+    return bool(_MENU_CURSOR_RE.search(flat)) or 'enter to confirm' in flat
 
 
 def main(argv):

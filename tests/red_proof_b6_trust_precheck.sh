@@ -33,6 +33,10 @@
 #   INJ2 start.sh: ENV_EXPORTS の AGENT_NAME を生の '$AGENT_NAME' 埋め込みに戻す (P1 / 族D)  → 赤 (bats)
 #   REL  start.sh: CLAUDE_CONFIG_DIR / HOME の絶対パス解決を外す (P2)                        → 赤 (bats)
 #
+# t078 (B6 fix 3巡目: 族B — 文言の部分一致だけでは同定にならない) で追加:
+#   SUBM lib_trust: ダイアログの操作構造 (選択肢のカーソル行 / Enter to confirm) を見ずに、
+#        文言が一致した時点で即 True にする (部分一致に戻す)                                  → 赤 (pytest)
+#
 # 注意 (defense in depth): 最後の網は 3 か所 (待機中 / 送信前 / 送信後) にあり、**1 か所だけ**を外しても、
 # 別の 1 か所が同じ画面を捕まえるので、多くのテストは緑のまま。だから G / H は「その 1 か所にだけ
 # 反応するテスト」(送信前の窓・送信後の verified) が赤になることを名指しで確かめ、I は 2 か所を同時に
@@ -219,8 +223,24 @@ expect_red_py "case R" "test_the_trust_dialog_is_recognised"
 
 echo "== case S: 単独の No, exit もダイアログに数える"
 fresh_copy
-inject scripts/lib_trust.py "    return 'no, exit' in flat and 'enter to confirm' in flat" "    return 'no, exit' in flat"
+inject scripts/lib_trust.py "    if not phrase_hit:
+        return False
+    return bool(_MENU_CURSOR_RE.search(flat)) or 'enter to confirm' in flat" \
+                              "    if not phrase_hit:
+        return False
+    return True"
 expect_red_py "case S" "test_ordinary_screens_are_not_mistaken_for_the_dialog"
+
+echo "== case SUBM: 文言の部分一致だけで同定する (族B、t078) — 選択肢の構造を見ない"
+fresh_copy
+inject scripts/lib_trust.py "    phrase_hit = any(p in flat for p in _DIALOG_PHRASES) or 'no, exit' in flat
+    if not phrase_hit:
+        return False
+    return bool(_MENU_CURSOR_RE.search(flat)) or 'enter to confirm' in flat" \
+                              "    if any(p in flat for p in _DIALOG_PHRASES):
+        return True
+    return 'no, exit' in flat and 'enter to confirm' in flat"
+expect_red_py "case SUBM" "test_ordinary_screens_are_not_mistaken_for_the_dialog"
 
 echo "== case T: CLAUDE_CONFIG_DIR を spawn 先に伝播しない (t051 P1)"
 fresh_copy

@@ -357,11 +357,12 @@ DIALOG_OLDER = """\
 @pytest.mark.parametrize("screen", [
     DIALOG_2_1_283,
     DIALOG_OLDER,
-    # 折り返しで文言が行をまたいでも見つける
-    "Quick safety check: Is this a project you\n  created or one you trust?",
+    # 折り返しで文言が行をまたいでも見つける (実物と同じく、選択肢の構造も画面に乗っている)
+    "Quick safety check: Is this a project you\n  created or one you trust?"
+    "\n\n ❯ 1. Yes, I trust this folder\n   2. No, exit\n\n Enter to confirm · Esc to cancel",
     "❯ 1. Yes, I\n    trust this folder",
     # 大文字小文字・余分な空白
-    "QUICK   SAFETY\nCHECK",
+    "QUICK   SAFETY\nCHECK\n\n ❯ 1. Yes, I trust this folder\n   2. No, exit\n\n Enter to confirm · Esc to cancel",
     # 単独の "No, exit" は決定の操作案内と揃ったときだけ数える
     "  2. No, exit\n\n Enter to confirm · Esc to cancel",
 ])
@@ -380,6 +381,15 @@ def test_the_trust_dialog_is_recognised(screen):
     "Enter to confirm",
     # ダイアログ以外の選択ダイアログ (permission プロンプト)
     "Do you want to proceed?\n ❯ 1. Yes\n   2. No, and tell Claude what to do differently",
+    # --- 族B: 文言の部分一致だけでは同定にならない (t078) ---
+    # (1) 信頼済みディレクトリのパスに文言を含む
+    "user@host:/tmp/quick safety check$ claude\n╭──────╮\n│ ❯    │\n╰──────╯",
+    "[crewvia] WORK_DIR=/tmp/quick safety check\n╭──────╮\n│ ❯    │\n╰──────╯",
+    # (2) 送信後の画面に、task の出力として文言が引用されている
+    "❯ echo 'Quick safety check: looks fine to me'\nQuick safety check: looks fine to me\n❯ ",
+    # (3) ダイアログの文言を含むファイル名・ブランチ名がステータス行に出ている
+    "On branch feat/quick safety check\nnothing to commit, working tree clean\n❯ ",
+    "modified: docs/quick safety check.md\n❯ ",
 ])
 def test_ordinary_screens_are_not_mistaken_for_the_dialog(screen):
     assert not lib_trust.screen_shows_trust_dialog(screen)
@@ -395,6 +405,8 @@ def test_cli_dialog_survives_bytes_that_are_not_utf8():
     r = run_cli("dialog", stdin=None)
     assert r.returncode in (0, 1)
     raw = subprocess.run([sys.executable, str(SCRIPTS / "lib_trust.py"), "dialog"],
-                         input=b"\xff\xfe Quick safety check", capture_output=True,
+                         input=b"\xff\xfe Quick safety check\n \xe2\x9d\xaf 1. Yes, I trust this folder"
+                               b"\n   2. No, exit",
+                         capture_output=True,
                          env={"PATH": os.environ["PATH"], "PYTHONDONTWRITEBYTECODE": "1"})
     assert raw.returncode == 0

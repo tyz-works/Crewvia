@@ -140,3 +140,60 @@ root 所有のプロセスは EPERM で残った。キープアライブが消�
 待たないと、印を数えるテストは 2.7% で落ち (2026-09-27 の flaky。両ファイル丸ごとで 22 回中 2 回、
 当該 1 本だけなら 0/24 で再現しなかった)、**数えないことを確かめるテストは同じ確率で理由なく緑**
 になっていた (0 件で PASS にしない / `tests/CLAUDE.md`)。
+
+### PR#240 2 巡目 codex review (2026-09-27, t067)
+
+1. **`red_proof_t047.sh` の安全性の説明が誤っていた**。スクリプトは「注入点を直接少数の候補で呼ぶ
+   だけだから `scan()` の全走査 + 本物の kill は通らない」と書いていたが、`run_py` が呼ぶのは
+   フルの `python3 -m pytest tests/test_leaked_descendants_guard.py …` で、`conftest.py` の
+   `pytest_configure` がこのセッション全体に (欠陥入りの木の) `LeakGuard` を登録する。つまり
+   個々のテストの後 / session finish のたびに autouse fixture が本物の `scan()` + `kill_all()`
+   を回す —— 前提が成立していなかった。直しは「ホストで走らせない」ではなく「`run_py` の呼び出し
+   全部 (baseline も含む) を PID 名前空間の中に閉じ込める」。`unshare --user --map-root-user --pid
+   --fork --mount-proc` を使い、作れなければホストにフォールバックせず拒否 (exit 3, fail closed)。
+   スクリプト内で「本物に届いていない」ことを PID1 がラッパー自身であること・見えるプロセス数が
+   小さいこと・ホストの pid へ `kill -0` が届かないこと、の 3 点で確認してから初めてケースを走らせる
+   (PID 名前空間はカーネルの階層構造そのもので子から親を見せないので、最後の確認は原理的に必ず通る
+   ―― 「unshare が本当に隔離できたか」の smoke test)。
+2. **`_dir_in_cmdline` は一致の「後ろ」の境界しか見ていなかった** (`_belongs` の 1 巡目 fix は
+   この境界チェックを追加した箇所そのもの)。`/backup/tmp/pytest-1/job.py` (前に別ディレクトリが
+   付いているだけ) や `/tmp/pytest-1/../pytest-2/job.py` (`..` で実体が隣に逃げる) は、後ろの境界は
+   満たすので誤って一致した。引数を NUL 区切りで 1 単位ずつ取り出し (`--rootdir=<path>` のような
+   `=` 付きは値側も見る)、`os.path.normpath` で正規化してから完全一致 / 区切り付き前方一致を見る
+   方式に直した (`os.path.commonpath` 相当)。相手プロセスの cmdline に現れた文字列は `realpath`
+   しない (制御できないファイルシステムへの stat を pid ごとに発生させ、走査が固まりうるため) —
+   これは意図した残存ギャップとして残す。一方 `basetemp` 自身 (呼び出し元が知っている自分のディレクトリ)
+   は `scan()` が 1 回だけ `realpath` する。`/proc/<pid>/cwd` はカーネルが常に正規化済みパスを返す
+   ので、`TMPDIR` がシンボリックリンク越しの環境でも cwd 側の判定と文字面が食い違わなくなる
+   (族B: 観測対象と比較対象の同一性がずれる、の一種)。
+3. **`kill_all` は pid 番号で `os.kill` していた**。`scan()` で見つけてから `kill_all` で実際に
+   殺すまでの間 (settle の再試行・`GRACE_SECONDS` の待ち) に pid が再利用されると、`partition()`
+   は新しい無関係なプロセスの年齢だけを見て判定するので、生まれ変わった別プロセスを殺しうる。
+   `scan()` が候補を見つけた**その場**で `os.pidfd_open` して pidfd を束縛し、直後に starttime を
+   読み直して一致を確認 (`_open_pidfd_verified`) してから `Survivor.pidfd` に載せる。実際の破壊
+   (`_default_kill`) は `signal.pidfd_send_signal(survivor.pidfd, sig)` **限定** —— pidfd はその
+   場で束縛した瞬間のプロセスインスタンスにしか届かないので、pid 番号がその後どれだけ再利用されても
+   無関係な相手を殺せない (memory: verify-and-destroy-must-share-one-connection)。pidfd を束縛
+   できなかった survivor は pid 番号へフォールバックせず kill しない (族A: 観測失敗を許可に倒さない)。
+   `pidfd_open` 自体が使えないカーネルでは「検出はするが殺せない」に劣化するので `install()` が
+   警告する (族C: ガードの安全弁が単独障害点で無効化されたことを黙って隠さない)。
+
+**族ごとの掃除で見た他ファイル (処置なし、理由あり)**:
+
+- `tests/proc_group.py` の `kill_group` (`os.killpg(proc.pid, …)`) / `kill_tree`
+  (`descendants()` → `os.kill` を pid 番号で) にも「観測 (pid を確定) してから作用するまでの間に
+  pid が再利用されうる」という同じ形の族B はある。ただし対象は常に**呼び出し元が直前に自分で
+  spawn した直接の子/子孫**で、システム全体を走査する `leaked_descendants.scan()` (2026-09-27 に
+  `systemd --user` / tmux / n8n を巻き込んだ張本人) とは信頼モデルが違う。プロセスグループには
+  pidfd 相当の束縛手段が無く (pidfd は個別 pid 用)、同じ強度の修正は構造的にできない。窓は「同じ
+  関数呼び出しの中の数命令」で、成功パスは `communicate()` の reap 直後 (pid 解放から次の行までの
+  マイクロ秒未満)、タイムアウトパスは対象がまだ生きていることが確定している (だから reuse 自体が
+  起きない)。costs (複雑化) が bounded な残存リスクに見合わないと判断し、直さず記録に留める。
+- `tests/conftest.py` の `idle_pane_shell` fixture の `os.kill(pid, SIGKILL)` も同型 (`pty.fork()`
+  した直接の子を finally で殺す) で、同じ理由により処置なし。
+- `tests/kill_budget.py` の `partition()` 自身は `_ppid_and_start(pid)` で毎回 pid 番号から年齢を
+  読み直すので、`scan()` の pidfd 束縛と時点がずれうる。ただし kill_budget の役目は「殺していいか
+  の判定」だけで、実際の破壊は必ず `kill_all` が `survivor.pidfd` 経由で送る (上記 3.) ため、
+  kill_budget が pid 再利用で誤った年齢を見て判定を誤っても、その誤判定が実際の kill 対象を変える
+  ことはない (判定と破壊が同じ pid 番号を再確認しているわけではなく、破壊は束縛済みの pidfd に
+  固定されているため)。よって kill_budget 側の追加修正は不要と判断。

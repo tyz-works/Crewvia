@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import pathlib
+import signal
 import subprocess
 import sys
 import time
@@ -20,8 +21,10 @@ import pytest
 import kill_budget
 import leaked_descendants as guard
 
-pytestmark = pytest.mark.skipif(
-    not guard.available(), reason="/proc が無い環境では関門も走査も動かない")
+pytestmark = [
+    pytest.mark.skipif(not guard.available(), reason="/proc が無い環境では関門も走査も動かない"),
+    pytest.mark.skipif(not guard.pidfd_supported(), reason="このカーネルは pidfd_open が使えない"),
+]
 
 #: 上限を確実に超えるための合成 pid の個数。上限ぴったり + 1 だと、たまたま実在して年齢で
 #: 却下された 1 個のせいで「上限内」に落ちてしまう。余裕を持たせて環境に依存させない。
@@ -66,7 +69,7 @@ def test_broken_predicate_refuses_the_dangerous_targets(monkeypatch):
     assert refused, "断るべき対象が候補に無いと、守れたことの証明にならない"
 
     killed: list[int] = []
-    guard.kill_all(result.survivors, kill=lambda pid, sig: killed.append(pid))
+    guard.kill_all(result.survivors, kill=lambda survivor, sig: killed.append(survivor.pid))
 
     dangerous = {r.pid for r in refused}
     assert not (set(killed) & dangerous), f"断ったはずの pid を殺しに行った: {sorted(set(killed) & dangerous)}"
@@ -103,9 +106,14 @@ def test_a_real_young_descendant_is_still_killed(monkeypatch):
     本物のシグナルを送らないので子は死なず、`kill_all` の待ちループが `GRACE_SECONDS` を
     空回りする。その間この子を生かしたままにすると、後続のテストに無駄なプロセスの揺らぎを
     持ち込むので、待ちを短くする。
+
+    finding 3 以降、`kill_all` は survivor に束縛済みの pidfd 経由でしか殺さないので、
+    ここで手組みする `Survivor` にも本物の pidfd (`os.pidfd_open`) を持たせる —— 無いと
+    「pidfd を束縛できなかった」扱いで kill 経路にすら乗らず、このテストの前提が崩れる。
     """
     monkeypatch.setattr(guard, "GRACE_SECONDS", 0.1)
     child = _sleeper()
+    pidfd = os.pidfd_open(child.pid)
     try:
         allowed, refused, fatal = kill_budget.partition([child.pid])
         assert fatal is None
@@ -113,10 +121,11 @@ def test_a_real_young_descendant_is_still_killed(monkeypatch):
 
         killed: list[int] = []
         report = guard.kill_all(
-            [guard.Survivor(child.pid, os.getpid(), "S", 0.0, "", "sleep 30", "test")],
-            kill=lambda pid, sig: killed.append(pid))
+            [guard.Survivor(child.pid, os.getpid(), "S", 0.0, "", "sleep 30", "test", pidfd=pidfd)],
+            kill=lambda survivor, sig: killed.append(survivor.pid))
         assert killed == [child.pid]
         assert report.fatal is None
+        assert report.refused == [], f"pidfd を持つ若い子孫が断られた: {[r.describe() for r in report.refused]}"
     finally:
         child.kill()
         child.wait()
@@ -185,3 +194,98 @@ def test_all_candidates_are_refused_when_the_sessions_own_start_time_is_unreadab
     finally:
         child.kill()
         child.wait()
+
+
+# --- finding 3: pidfd による同一性束縛 (2 巡目 codex review) ---------------------------------
+
+
+def test_open_pidfd_verified_returns_a_working_fd_when_starttime_matches():
+    """本物の starttime を渡せば束縛できる (前提が壊れていないことの確認)。"""
+    stat = guard._read_stat(os.getpid())
+    assert stat is not None, "前提: 自分の stat が読めない"
+    fd = guard._open_pidfd_verified(os.getpid(), expected_start=stat[2])
+    assert fd is not None
+    os.close(fd)
+
+
+def test_open_pidfd_verified_rejects_a_recycled_pid(monkeypatch):
+    """`pidfd_open` の直後に starttime がずれていたら (pid 再利用) 束縛を拒否する。
+
+    実時間で本物のレース (pidfd_open してから再読みするまでの数マイクロ秒に本当に pid が
+    再利用される) を再現するのは非決定的 (memory: microsecond-race-fix-needs-structural-test)。
+    ここでは `_read_stat` の返り値を差し替え、「pidfd_open は成功したが直後の再読みでは
+    別プロセスの starttime が見える」を構造的に模す。
+    """
+    real_pid = os.getpid()
+
+    def fake_stat(pid):
+        assert pid == real_pid
+        return ("S", 1, 999999)   # 呼び出し元が期待する starttime とは別の値
+
+    monkeypatch.setattr(guard, "_read_stat", fake_stat)
+    fd = guard._open_pidfd_verified(real_pid, expected_start=1)
+    assert fd is None, "starttime が食い違った (再利用された) のに pidfd を束縛した"
+
+
+def test_open_pidfd_verified_refuses_when_pidfd_open_itself_fails(monkeypatch):
+    """`pidfd_open` が失敗する (プロセス消滅等) ケースは None —— 例外を外に漏らさない。"""
+    def fake_pidfd_open(pid):
+        raise ProcessLookupError("gone")
+
+    monkeypatch.setattr(os, "pidfd_open", fake_pidfd_open)
+    assert guard._open_pidfd_verified(4_100_003, expected_start=0) is None
+
+
+def test_default_kill_sends_only_through_the_pidfd_never_by_bare_pid(monkeypatch):
+    """本物の破壊経路 (`_default_kill`) は `signal.pidfd_send_signal` だけを使う。
+
+    `os.kill` (pid 番号での送信) を呼んだらこのテストが失敗するようにして、フォールバック
+    経路が復活していないことを構造的に固定する (finding 3)。
+    """
+    calls: list[tuple[int, int]] = []
+    monkeypatch.setattr(signal, "pidfd_send_signal", lambda fd, sig, *a, **k: calls.append((fd, sig)))
+
+    def _forbidden(*a, **k):
+        raise AssertionError("os.kill を pid 番号で直接呼んではいけない (finding 3 のフォールバック復活)")
+
+    monkeypatch.setattr(os, "kill", _forbidden)
+    survivor = guard.Survivor(4_100_004, os.getpid(), "S", 0.0, "", "x", "test", pidfd=77)
+    guard._default_kill(survivor, signal.SIGKILL)
+    assert calls == [(77, signal.SIGKILL)]
+
+
+def test_default_kill_refuses_a_survivor_without_a_bound_pidfd():
+    """防御的な最終防波堤: `pidfd is None` の survivor が `_default_kill` に来ても送らない。"""
+    survivor = guard.Survivor(4_100_005, os.getpid(), "S", 0.0, "", "x", "test", pidfd=None)
+    with pytest.raises(ProcessLookupError):
+        guard._default_kill(survivor, signal.SIGKILL)
+
+
+def test_kill_all_refuses_a_survivor_without_a_verified_pidfd(monkeypatch):
+    """`kill_all` は pidfd を束縛できなかった survivor に、pid 番号でのフォールバックをしない。
+
+    kill_budget の年齢/予算判定は通っても (`allowed` に入っても)、pidfd が無ければ kill 経路
+    に乗せない —— 観測時に同一性を束縛できなかった対象は「殺せる」に倒さない (finding 3)。
+    """
+    monkeypatch.setattr(guard, "GRACE_SECONDS", 0.1)
+    child = _sleeper()
+    try:
+        killed: list[int] = []
+        survivor = guard.Survivor(child.pid, os.getpid(), "S", 0.0, "", "sleep 30", "test", pidfd=None)
+        report = guard.kill_all([survivor], kill=lambda s, sig: killed.append(s.pid))
+        assert killed == [], "pidfd が無いのに kill 経路を通した"
+        assert report.killed == [], "pidfd が無い survivor が killed に入った"
+        assert any("pidfd" in r.reason for r in report.refused), report.refused
+    finally:
+        child.kill()
+        child.wait()
+
+
+def test_kill_all_closes_the_pidfds_it_was_given():
+    """成功・拒否のどちらでも、渡された pidfd は `kill_all` の後に必ず閉じられる (fd リーク防止)。"""
+    fd = os.pidfd_open(os.getpid())   # 束縛はするが kill_budget が自分自身を必ず断る (protected)
+    survivor = guard.Survivor(os.getpid(), os.getppid(), "S", 0.0, "", "self", "test", pidfd=fd)
+    guard.kill_all([survivor], kill=lambda s, sig: None)
+    assert survivor.pidfd is None, "kill_all の後も pidfd が開いたままになっている"
+    with pytest.raises(OSError):
+        os.close(fd)   # 既に閉じられているはず (二重 close は EBADF)

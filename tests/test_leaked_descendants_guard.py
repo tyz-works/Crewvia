@@ -225,6 +225,82 @@ def test_cmdline_match_requires_a_path_boundary_not_a_bare_prefix():
     )
 
 
+def test_cmdline_match_rejects_a_prefix_directory_sharing_only_a_suffix():
+    """`/backup/tmp/pytest-1` は `/tmp/pytest-1` と末尾が同じだけの別ディレクトリ。
+
+    旧実装は一致の**後ろ**の境界しか見ておらず、前の境界を見ていなかった (2 巡目 codex
+    finding 2、直接呼び出しで再現済み)。前の境界も見ないと、こういう別ディレクトリ配下の
+    プロセスを basetemp 配下と誤認して kill 対象に入れてしまう。
+    """
+    basetemp = b"/tmp/pytest-1"
+    haystack = b"/usr/bin/python3\0/backup/tmp/pytest-1/job.py\0"
+    assert not leaked_descendants._dir_in_cmdline(haystack, basetemp), (
+        "接頭ディレクトリが違うだけの別パスを basetemp 配下と誤認した")
+
+
+def test_cmdline_match_normalizes_dot_dot_before_comparing():
+    """`/tmp/pytest-1/../pytest-2/job.py` は文字面に basetemp を含むが実体は隣の pytest-2 配下。"""
+    basetemp = b"/tmp/pytest-1"
+    haystack = b"/usr/bin/python3\0/tmp/pytest-1/../pytest-2/job.py\0"
+    assert not leaked_descendants._dir_in_cmdline(haystack, basetemp), (
+        "`..` を正規化せずに部分文字列一致させ、隣の別ディレクトリを basetemp 配下と誤認した")
+
+
+def test_cmdline_match_still_finds_a_real_subpath_that_only_resolves_after_dot_dot_collapses():
+    """逆方向: 文字面には basetemp が現れなくても、正規化すれば本物の basetemp 配下なら検出する。
+
+    見逃す向きの誤りも同じ根っこ (正規化しない部分文字列一致) から起こる —— このガードは
+    「見逃さない」側に倒す設計 (`empty-vs-unobservable.md`) なので、こちらも直す。
+    """
+    basetemp = b"/tmp/pytest-1"
+    haystack = b"/usr/bin/python3\0/tmp/pytest-2/../pytest-1/job.py\0"
+    assert leaked_descendants._dir_in_cmdline(haystack, basetemp), (
+        "正規化すれば本物の basetemp 配下になる引数を検出できていない")
+
+
+def test_cmdline_match_ignores_a_trailing_slash_on_either_side():
+    assert leaked_descendants._dir_in_cmdline(b"/tmp/pytest-1/\0", b"/tmp/pytest-1"), (
+        "引数側の末尾スラッシュを理由に検出を落とした")
+    assert leaked_descendants._dir_in_cmdline(b"/tmp/pytest-1\0", b"/tmp/pytest-1/"), (
+        "basetemp 側の末尾スラッシュを理由に検出を落とした")
+
+
+def test_cmdline_match_finds_the_value_of_an_equals_form_argument():
+    """`--rootdir=<basetemp>/...` のような `=` 付き引数の値側も検出できること。"""
+    basetemp = b"/tmp/pytest-1"
+    assert leaked_descendants._dir_in_cmdline(b"pytest\0--rootdir=/tmp/pytest-1/sub\0", basetemp), (
+        "`=` 付き引数の値側にある basetemp 配下のパスを検出できていない")
+    assert not leaked_descendants._dir_in_cmdline(b"pytest\0--rootdir=/tmp/pytest-10/sub\0", basetemp), (
+        "`=` 付き引数でも別ディレクトリ (pytest-10) を basetemp (pytest-1) 配下と誤認した")
+
+
+def test_scan_matches_a_descendant_via_a_symlinked_basetemp(tmp_path):
+    """basetemp 自体がシンボリックリンク経由で渡されても、実体化して検出できること。
+
+    `/proc/<pid>/cwd` はカーネルが常に正規化済み (シンボリックリンク解決済み) のパスを
+    返す。`tmp_path_factory` の basetemp がシンボリックリンク越しの表記のまま比較されると、
+    正規化済みの cwd と文字面で食い違い、黙って見逃す (族B: 観測対象と比較対象の同一性が
+    ずれる)。`scan()` は basetemp を 1 回だけ `os.path.realpath` してこれを吸収する。
+    """
+    real_dir = tmp_path / "real-basetemp"
+    real_dir.mkdir()
+    link_dir = tmp_path / "link-basetemp"
+    link_dir.symlink_to(real_dir)
+
+    before = leaked_descendants.snapshot()
+    pid = _spawn_orphan(env={"PATH": "/usr/bin:/bin"}, cwd=str(real_dir))
+    try:
+        assert _wait_observable(pid), "前提が崩れた"
+        result = leaked_descendants.scan(before, _marker(), str(link_dir))
+        found = {s.pid: s for s in result.survivors}
+        assert pid in found, (
+            "basetemp がシンボリックリンク経由でも、実体化して cwd と一致させられていない "
+            f"(観測できなかった同 uid のプロセス: {result.unobservable} 個)")
+    finally:
+        os.kill(pid, signal.SIGKILL)
+    assert _wait_dead(pid)
+
+
 def test_settle_retries_while_unobservable_remains(monkeypatch):
     """survivors が 0 でも unobservable が残っている間は再試行する。
 
@@ -273,6 +349,28 @@ def test_sessionfinish_reports_but_does_not_fail_on_unobservable_only(monkeypatc
     assert guard_obj.unobservable_only == 1, "unobservable だけの session finish を報告していない"
     assert session.exitstatus == 0, "確認できない観測失敗だけを理由に session を失敗にした"
     assert "観測でき" in capsys.readouterr().out, "unobservable の報告が標準出力に出ていない"
+
+
+@pytest.mark.skipif(not leaked_descendants.pidfd_supported(), reason="このカーネルは pidfd_open が使えない")
+def test_scan_binds_a_working_pidfd_for_each_real_survivor(basetemp):
+    """scan() が返す survivor は、観測した瞬間に束縛した pidfd 経由で本物に届く (finding 3)。"""
+    before = leaked_descendants.snapshot()
+    pid = _spawn_orphan()
+    try:
+        assert _wait_observable(pid), "孤児の environ が読めるようにならない (前提が崩れた)"
+        result = leaked_descendants.scan(before, _marker(), basetemp)
+        found = {s.pid: s for s in result.survivors}
+        assert pid in found, f"印を継承した孤児を数えていない: {list(found)}"
+        survivor = found[pid]
+        assert survivor.pidfd is not None, "本物の子孫なのに pidfd を束縛できなかった"
+        signal.pidfd_send_signal(survivor.pidfd, signal.SIGKILL)
+        os.close(survivor.pidfd)
+    finally:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    assert _wait_dead(pid)
 
 
 def test_scan_ignores_processes_that_were_there_before(basetemp):

@@ -65,11 +65,18 @@ def available() -> bool:
 
 
 class Survivor:
-    """生き残りの 1 件 (kill する前に読んだ観測)。"""
+    """生き残りの 1 件 (kill する前に読んだ観測)。
 
-    def __init__(self, pid: int, ppid: int, state: str, age_s: float, wchan: str, cmdline: str, via: str):
+    `pidfd` は観測した瞬間 (`scan`) に束縛・同一性確認した破壊用ハンドル (§ `_open_pidfd_verified`)。
+    束縛できなかった (取れない / 直後の再確認で starttime が食い違った = pid 再利用の疑い) 場合は
+    `None` —— `kill_all` はこれを見て pid 番号へのフォールバックはせず、kill しない。
+    """
+
+    def __init__(self, pid: int, ppid: int, state: str, age_s: float, wchan: str, cmdline: str, via: str,
+                 pidfd: int | None = None):
         self.pid, self.ppid, self.state, self.age_s = pid, ppid, state, age_s
         self.wchan, self.cmdline, self.via = wchan, cmdline, via
+        self.pidfd = pidfd
 
     def describe(self) -> str:
         return (f"pid={self.pid} ppid={self.ppid} state={self.state} age={self.age_s:.0f}s "
@@ -124,6 +131,55 @@ def snapshot() -> set[int]:
     return pids()
 
 
+def pidfd_supported() -> bool:
+    """`os.pidfd_open` が**このカーネルで実際に動くか** (関数として存在するだけでは分からない)。
+
+    Python は Linux 以外でも `os.pidfd_open` を定義しうるし、対応カーネル (5.3+) でなければ
+    `OSError` (ENOSYS 等) になる。動かない環境で `install()` が黙っていると、「検出はするが
+    kill フォールバックを廃止したので実際には殺せない」という族C の劣化状態に誰も気づけない。
+    """
+    try:
+        fd = os.pidfd_open(os.getpid())
+    except OSError:
+        return False
+    os.close(fd)
+    return True
+
+
+def _open_pidfd_verified(pid: int, expected_start: int) -> int | None:
+    """観測した瞬間に pidfd を取り、直後に starttime を読み直して同一プロセスであることを確かめる。
+
+    `pidfd_open` はカーネルがその瞬間に `pid` を持つプロセスへ fd を束縛する動作なので、
+    一度取れれば以降その pid 番号がどれだけ再利用されても、この fd は**取った瞬間のプロセス
+    インスタンス**にしか届かない (memory: verify-and-destroy-must-share-one-connection)。
+    残る隙は「scan が stat を読んでからここに来るまで」と「pidfd_open してから直後の
+    再読みまで」の 2 箇所だけで、後者はここで閉じる: 直後の starttime が渡された
+    `expected_start` と食い違えば、その pid は既に再利用されているので束縛を捨てて
+    `None` を返す (kill_all はこれを「束縛できなかった」として扱い、pid 番号への
+    フォールバックはしない —— 観測失敗を許可に倒さない)。
+    """
+    try:
+        fd = os.pidfd_open(pid)
+    except OSError:
+        return None
+    recheck = _read_stat(pid)
+    if recheck is None or recheck[2] != expected_start:
+        os.close(fd)
+        return None
+    return fd
+
+
+def _close_survivor_pidfds(survivors: list["Survivor"]) -> None:
+    """束縛した pidfd を全部閉じる (fd リークを避ける。破壊の成否は問わない)。"""
+    for s in survivors:
+        if s.pidfd is not None:
+            try:
+                os.close(s.pidfd)
+            except OSError:
+                pass
+            s.pidfd = None
+
+
 def _uptime() -> float:
     try:
         return float((_PROC / "uptime").read_text().split()[0])
@@ -132,25 +188,45 @@ def _uptime() -> float:
 
 
 def _dir_in_cmdline(haystack: bytes, dirpath: bytes) -> bool:
-    """`dirpath` が `haystack` にパスの境界として現れるか (部分文字列の暴走一致を防ぐ)。
+    """`dirpath` を、`haystack` (NUL 区切りの cmdline) の**引数ごとに正規化した所有**として持つか。
 
-    素の `in` は `/tmp/pytest-1` が `/tmp/pytest-10/test.py` にも前方一致してしまい、
-    別の pytest セッションの若いプロセスを子孫と誤認しうる (誤認は kill に直結する)。
-    `cmdline` は NUL 区切りの引数の連結なので、引数の途中に埋め込まれた形
-    (`--basetemp=<dir>/x` 等) も拾えるよう、引数ごとの厳密一致ではなく、一致の直後が
-    `/` / NUL / 終端であることを要求する境界付き部分文字列一致にする。
+    旧実装は一致の「後ろ」の境界 (直後が `/` / NUL / 終端) しか見ておらず、2 つの誤認を通した
+    (2 巡目 codex review finding 2、直接呼び出しで再現済み):
+
+    - **前の境界を見ない**: `/backup/tmp/pytest-1/job.py` は `/tmp/pytest-1` を含むが、
+      実際に所有しているのは `/backup/tmp/pytest-1` という別ディレクトリ (末尾がたまたま
+      一致するだけ)。
+    - **`..` を正規化しない**: `/tmp/pytest-1/../pytest-2/job.py` は文字面に basetemp を
+      含むが実体は隣の pytest-2 配下 (逆に `/tmp/pytest-2/../pytest-1/x` は文字面には
+      含まないが実体は basetemp 配下 —— 見逃す向きの誤りも起こりうる)。
+
+    引数を **1 単位** として扱い (`--rootdir=<path>` のような `=` 付き引数は値側も見る)、
+    `os.path.normpath` で構文的に正規化してから「等しい」か「区切り付きで前方一致する」かを
+    見る (`os.path.commonpath` 相当。末尾スラッシュの有無もこれで吸収する)。
+
+    シンボリックリンクは解決しない —— 相手プロセスの cmdline に現れた任意の文字列を
+    `realpath` すると、こちらが制御できないファイルシステム (遅い network mount 等) への
+    stat を pid ごとに発生させることになり、走査そのものが固まりうる (残る既知のギャップ。
+    Result 参照)。`basetemp` 側のシンボリックリンクは呼び出し元 (`scan`) が一度だけ
+    `os.path.realpath` して吸収する。
     """
     if not dirpath:
         return False
-    start = 0
-    while True:
-        idx = haystack.find(dirpath, start)
-        if idx < 0:
-            return False
-        end = idx + len(dirpath)
-        if end == len(haystack) or haystack[end:end + 1] in (b"\0", b"/"):
-            return True
-        start = idx + 1
+    dirpath = os.path.normpath(dirpath)
+    for arg in haystack.split(b"\0"):
+        if not arg:
+            continue
+        candidates = [arg]
+        eq = arg.find(b"=")
+        if eq >= 0 and arg[eq + 1:eq + 2] == b"/":
+            candidates.append(arg[eq + 1:])
+        for candidate in candidates:
+            if not candidate.startswith(b"/"):
+                continue
+            normalized = os.path.normpath(candidate)
+            if normalized == dirpath or normalized.startswith(dirpath + b"/"):
+                return True
+    return False
 
 
 def _belongs(pid: int, marker: bytes, basetemp: bytes):
@@ -197,10 +273,19 @@ def _belongs(pid: int, marker: bytes, basetemp: bytes):
 
 
 def scan(exclude: set[int], marker_value: str, basetemp: str) -> Scan:
-    """`exclude` に無い、生きていて、このセッションの子孫と判定できるプロセスを集める。"""
+    """`exclude` に無い、生きていて、このセッションの子孫と判定できるプロセスを集める。
+
+    `basetemp` は一度だけ `os.path.realpath` する。`/proc/<pid>/cwd` はカーネルが常に
+    シンボリックリンクを解決した正準パスを返すので、呼び出し元から渡された `basetemp`
+    自体が (`TMPDIR` の設定等で) シンボリックリンク経由の表記だと、正規化しないまま
+    比較すると cwd 側と文字面が食い違って黙って見逃す (族B: 観測対象と比較対象の
+    同一性がずれる)。`basetemp` は自分の既知のディレクトリなので、ここで 1 回
+    realpath するのは安全 (候補側の cmdline パスは解決しない — 上の `_dir_in_cmdline`
+    参照)。
+    """
     result = Scan()
     marker = f"{MARKER_VAR}={marker_value}".encode()
-    base = basetemp.encode()
+    base = os.path.realpath(basetemp).encode() if basetemp else basetemp.encode()
     me, uid = os.getpid(), os.getuid()
     boot_now = _uptime()
     hz = os.sysconf("SC_CLK_TCK")
@@ -225,11 +310,14 @@ def scan(exclude: set[int], marker_value: str, basetemp: str) -> Scan:
             if not observed:
                 result.unobservable += 1
             continue
+        # 観測した瞬間に破壊用の pidfd を束縛する (finding 3)。ここより後で pid が
+        # 再利用されても、kill_all は必ずこの fd 経由で送るので誤った相手には届かない。
+        pidfd = _open_pidfd_verified(pid, start)
         cmd = _read_bytes(_PROC / str(pid) / "cmdline") or b""
         wchan = (_read_bytes(_PROC / str(pid) / "wchan") or b"").decode(errors="replace")
         result.survivors.append(Survivor(
             pid, ppid, state, max(0.0, boot_now - start / hz), wchan,
-            cmd.replace(b"\0", b" ").decode(errors="replace").strip(), why))
+            cmd.replace(b"\0", b" ").decode(errors="replace").strip(), why, pidfd=pidfd))
     return result
 
 
@@ -247,28 +335,57 @@ class KillReport:
         return "\n".join(lines)
 
 
-def kill_all(survivors: list[Survivor], kill=os.kill) -> KillReport:
-    """生き残りのうち `kill_budget` が許した pid だけを SIGKILL する。
+def _default_kill(survivor: "Survivor", sig: int) -> None:
+    """本物の破壊経路。`survivor.pidfd` **限定**で送る —— pid 番号では送らない (finding 3)。
+
+    `pidfd is None` (束縛できなかった / 直後の再確認で弾かれた) 呼び出しは、この関数を
+    呼ぶ前に `kill_all` 側で refused に回すので、ここに来る時点で必ず束縛済みのはず。
+    それでも呼ばれた場合に備えて防御的に拒否する (観測失敗を許可に倒さない、をここでも)。
+    """
+    if survivor.pidfd is None:
+        raise ProcessLookupError("no verified pidfd bound — refusing to signal by bare pid")
+    signal.pidfd_send_signal(survivor.pidfd, sig)
+
+
+def kill_all(survivors: list[Survivor], kill=None) -> KillReport:
+    """生き残りのうち `kill_budget` が許し、かつ pidfd を束縛できた pid だけを SIGKILL する。
 
     判定 (`_belongs` / `scan`) を壊す変異が入っても、自分・祖先・自分より古いプロセスは
     ここで落とせない。件数が上限を超えたら 1 件も殺さない (2026-09-27 の自爆の再発防止)。
-    `kill` は差し替え口 — 変異テストとこのガード自身のテストは本物のシグナルを送らない。
+    観測時 (`scan`) に pidfd で同一性を束縛できなかった survivor は、pid 番号への
+    フォールバックをせず kill しない (finding 3: 観測から破壊までの間に pid が再利用
+    されても、無関係な新しいプロセスを殺さない)。
+    `kill` は差し替え口 (既定は `_default_kill`) — 変異テストとこのガード自身のテストは
+    本物のシグナルを送らない。
     """
-    allowed, refused, fatal = kill_budget.partition([s.pid for s in survivors])
+    if kill is None:
+        kill = _default_kill
+    by_pid = {s.pid: s for s in survivors}
+    budget_allowed, refused, fatal = kill_budget.partition([s.pid for s in survivors])
     if fatal is not None:
+        _close_survivor_pidfds(survivors)
         return KillReport([], refused, fatal)
-    for pid in allowed:
+
+    attempted: list[int] = []
+    for pid in budget_allowed:
+        survivor = by_pid[pid]
+        if survivor.pidfd is None:
+            refused.append(kill_budget.Refusal(
+                pid, "観測時に pidfd で同一性を束縛できなかった (pid 再利用の疑い) — kill しない"))
+            continue
+        attempted.append(pid)
         try:
-            kill(pid, signal.SIGKILL)
+            kill(survivor, signal.SIGKILL)
         except ProcessLookupError:
             pass
     deadline = time.monotonic() + GRACE_SECONDS
     while time.monotonic() < deadline:
-        alive = [pid for pid in allowed if (_read_stat(pid) or ("Z",))[0] not in ("Z", "X")]
+        alive = [pid for pid in attempted if (_read_stat(pid) or ("Z",))[0] not in ("Z", "X")]
         if not alive:
             break
         time.sleep(_POLL_SECONDS)
-    return KillReport(allowed, refused, None)
+    _close_survivor_pidfds(survivors)
+    return KillReport(attempted, refused, None)
 
 
 def settle(exclude: set[int], marker_value: str, basetemp: str) -> Scan:
@@ -284,6 +401,7 @@ def settle(exclude: set[int], marker_value: str, basetemp: str) -> Scan:
     result = scan(exclude, marker_value, basetemp)
     while (result.survivors or result.unobservable) and time.monotonic() < deadline:
         time.sleep(_POLL_SECONDS)
+        _close_survivor_pidfds(result.survivors)   # 破棄する走査の分。fd リークを避ける
         result = scan(exclude, marker_value, basetemp)
     return result
 
@@ -375,6 +493,12 @@ def install(config) -> LeakGuard | None:
             "tests/leaked_descendants.py: /proc が無いので、テストが残した子孫プロセスの検査は動かない "
             "(黙って通さないためにこの警告を出す)", pytest.PytestWarning)
         return None
+    if not pidfd_supported():
+        warnings.warn(
+            "tests/leaked_descendants.py: このカーネルは pidfd_open が使えない。残った子孫プロセスの"
+            "検出 (テストを ERROR にする) は動くが、kill は観測時に束縛した pidfd 限定でしか行わない"
+            "設計 (finding 3) のため、実際には殺せない (検出だけになる。黙って劣化させないための警告)",
+            pytest.PytestWarning)
     marker_value = f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
     os.environ[MARKER_VAR] = marker_value
     guard = LeakGuard(marker_value)

@@ -53,8 +53,13 @@ root の `CLAUDE.md` から移した、テスト専用の規則。設計と経�
   **自分より古いプロセス**（テストの子孫が、テスト自身より先に生まれていることはない）は殺さない。許可が
   上限（既定 16、`CREWVIA_LEAK_KILL_BUDGET`）を超えたら **1 件も殺さない** — 「本当に N 個漏れた」ではなく
   判定が壊れている方を疑う。**このファイルは変異させない**（安全弁を壊す変異は意味を失わせる）。
-- ガードの kill は `kill_all(survivors, kill=os.kill)` の差し替え口を通す。ガード自身のテストと変異テストは
-  **本物のシグナルを送らない**（`tests/test_leak_guard_self_preservation.py`）。
+- ガードの kill は `kill_all(survivors, kill=_default_kill)` の差し替え口を通す。ガード自身のテストと
+  変異テストは **本物のシグナルを送らない**（`tests/test_leak_guard_self_preservation.py`）。
+  `_default_kill` は `signal.pidfd_send_signal` で **観測時 (`scan()`) に束縛した pidfd 限定**に送る
+  （pid 番号では送らない）— `scan()` が候補を見つけた瞬間に `os.pidfd_open` して starttime を
+  再確認し、以降その pid 番号が再利用されても束縛した fd は元のプロセスにしか届かない
+  （2 巡目 codex review finding 3 / memory: verify-and-destroy-must-share-one-connection）。
+  pidfd を束縛できなかった survivor は pid 番号へフォールバックせず kill しない。
 - **判定を壊す変異テストは PID 名前空間の中だけで走らせる**:
   `unshare -Urpf --mount-proc python3 -m pytest …`。名前空間の外の pid は `/proc` に見えず `os.kill` も
   ESRCH になるので、判定がどう壊れても外へ届かない。2026-09-27、`_belongs` の頭に `return "any", True` を

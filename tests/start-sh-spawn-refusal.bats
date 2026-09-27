@@ -21,6 +21,7 @@
 # Run: bats tests/start-sh-spawn-refusal.bats
 
 REAL_ROOT="$(cd "$(dirname "$BATS_TEST_FILENAME")/.." && pwd)"
+source "$(dirname "$BATS_TEST_FILENAME")/trust_fixture.sh"   # t021: start.sh の trust 事前検査を通す偽の設定
 
 # 開発者のファイルに触れていないことを見るための印 (中身は読まない)。
 _real_footprint() {
@@ -38,6 +39,7 @@ _real_footprint() {
 }
 
 setup() {
+    trust_fixture_setup
     REAL_FOOTPRINT_BEFORE="$(_real_footprint)"
 
     SANDBOX="$(mktemp -d)"
@@ -123,6 +125,7 @@ FAKESCRIPT
 }
 
 teardown() {
+    trust_fixture_teardown
     [[ -n "${LIVE_PID:-}" ]] && kill "$LIVE_PID" 2>/dev/null || true
     if [[ -n "${FAKE_DIR:-}" && -d "$FAKE_DIR" ]]; then
         find "$FAKE_DIR" -mindepth 1 -delete 2>/dev/null || true

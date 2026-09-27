@@ -411,6 +411,50 @@ if [[ "${ROLE}" == "worker" ]] && [[ -n "${TARGET_DIR:-}" ]]; then
   export TARGET_DIR="$WORK_DIR"  # Worker 側にも canonicalized pathを渡す
 fi
 
+# --- 並列モードか (実効値の解決) ---
+# 下の mux 分岐と trust の事前検査の 2 箇所がこの値を見る (経緯は「Launch with or without mux」の
+# コメント: t002 設計判断 (A))。CREWVIA_MUX_ENABLED が明示されていれば最優先、未設定のときだけ
+# CREWVIA_MUX の有無にフォールバックする。
+_EFFECTIVE_MUX_ENABLED="${CREWVIA_MUX_ENABLED:-}"
+if [[ -z "$_EFFECTIVE_MUX_ENABLED" ]] && [[ -n "${CREWVIA_MUX:-}" ]]; then
+  _EFFECTIVE_MUX_ENABLED=1
+fi
+
+# --- 起動の拒否は端末だけでなくログにも残す (t021 / backlog #18) ---
+# start.sh の拒否は端末にしか出ず、dispatcher が pane で起動した場合は誰も見ないまま消えていた。
+# 書き先は logs/start-sh/refusals.log (logs/ は gitignore 済み。dispatcher の logs/dispatcher/ と同じ流儀)。
+# ログを書けなくても拒否は取り消さない (警告だけ出す)。
+_log_refusal() {
+  local kind="$1" msg="$2" dir="${REPO_ROOT}/logs/start-sh" line
+  line="$(date '+%Y-%m-%dT%H:%M:%S%z') REFUSED kind=${kind} role=${ROLE} agent=${AGENT_NAME:-?} dir=${WORK_DIR} | $(printf '%s' "$msg" | tr '\n' ' ' | tr -s ' ')"
+  { mkdir -p "$dir" && printf '%s\n' "$line" >> "${dir}/refusals.log"; } 2>/dev/null \
+    || echo "[crewvia] WARNING: 拒否をログに書けませんでした: ${dir}/refusals.log" >&2
+}
+
+# --- claude の trust ダイアログを踏む前に止める (t021 / backlog #28) ---
+# 信頼されていない cwd で claude を起動すると "Do you trust this folder?" が出る。既定の選択は
+# "No, exit" で、下の kickoff の Enter がそれを選んで claude が終了し、残りの文字列が pane の
+# シェルに落ちる。だから起動する**前**に ~/.claude.json を読んで止める。判定・倒す向き・
+# 祖先の継承・パス正規化は lib_trust.py の冒頭に理由つきで書いてある (読めない = 信頼済みとは
+# 扱わない = 止める。~/.claude.json は書き換えない)。
+# 対象は kickoff を自動で送る経路 (mux モード) だけ: インラインモード (exec claude) は利用者が
+# その端末でダイアログを見て答えられる。BENCH_MODE は自動 kickoff をしない。
+# 副作用 (crewvia-worker-*.json / settings.local.json / registry の last_active) より前に置くので、
+# 拒否した起動は target dir に何も残さない。
+if [[ "${_EFFECTIVE_MUX_ENABLED:-0}" == "1" ]] && [[ "${CREWVIA_BENCH_MODE:-0}" != "1" ]]; then
+  _TRUST_RC=0
+  _TRUST_MSG="$(python3 "${SCRIPT_DIR}/lib_trust.py" check "$WORK_DIR")" || _TRUST_RC=$?
+  if [[ $_TRUST_RC -ne 0 ]]; then
+    if [[ $_TRUST_RC -ne 10 && $_TRUST_RC -ne 11 ]]; then
+      # 検査自体が壊れた (python 不在・例外)。「信頼済み」には倒さない。
+      _TRUST_MSG="[crewvia] ERROR: trust の検査が異常終了したので (exit ${_TRUST_RC})、$WORK_DIR を信頼済みとは扱わず起動しません。${_TRUST_MSG:+ 出力: ${_TRUST_MSG}}"
+    fi
+    echo "$_TRUST_MSG" >&2
+    _log_refusal trust "$_TRUST_MSG"
+    exit 1
+  fi
+fi
+
 # --- TARGET_DIR モード: crewvia 専用 settings ファイルに絶対パス hook を書き込む ---
 # Worker が TARGET_DIR で起動すると ${CLAUDE_PROJECT_DIR} が TARGET_DIR を指し、
 # crewvia hooks（pre-tool-use.sh / post-tool-use.sh）が見つからず hook error が
@@ -600,16 +644,51 @@ fi
 #     実効値を解決すれば二重ゲートの実害（ROLE=worker で無効）は解消できる。
 # よって (A): CREWVIA_MUX_ENABLED が明示されていれば最優先でそれを尊重し
 # (0 での強制インラインも含む)、未設定時のみ CREWVIA_MUX の有無にフォールバックする。
-_EFFECTIVE_MUX_ENABLED="${CREWVIA_MUX_ENABLED:-}"
-if [[ -z "$_EFFECTIVE_MUX_ENABLED" ]] && [[ -n "${CREWVIA_MUX:-}" ]]; then
-  _EFFECTIVE_MUX_ENABLED=1
-fi
+# (_EFFECTIVE_MUX_ENABLED は WORK_DIR の決定の直後で解決済み。trust の事前検査 (t021) が同じ値を
+#  要るため、ここにあった解決をそこへ移した。答えを出すのは 1 箇所のまま。)
 if [[ "${_EFFECTIVE_MUX_ENABLED:-0}" == "1" ]]; then
   # Load mux abstraction layer (backend selected via CREWVIA_MUX or config/crewvia.yaml).
   # shellcheck source=lib_mux.sh
   source "${SCRIPT_DIR}/lib_mux.sh"
 
   WINDOW_NAME="${AGENT_NAME}-${ROLE}"
+
+  # --- 最後の網: pane に claude の trust ダイアログが出ていないか (t021 / backlog #28) ---
+  # 上の事前検査 (lib_trust.py check) をすり抜けた場合 (git worktree・未知の継承規則・claude の版差)
+  # の備え。下の「❯ が出るまで待つ」は入力行の目印を見るので、trust ダイアログの選択カーソル
+  # (`❯ 1. Yes, I trust this folder`) にも反応し、kickoff の Enter が既定の "No, exit" を選んで
+  # claude が終了していた。それでも「Kickoff message sent (verified)」と言っていた (症状の本体は
+  # 失敗が不可視だったこと)。画面にダイアログの文言があれば、kickoff を送らず失敗として止める。
+  # 文言の定義は lib_trust.py の 1 箇所。
+  _trust_dialog_shown() {   # 0 = 出ている / 1 = 出ていない / 2 = 検出器が壊れた
+    local screen rc=0
+    screen="$(mux_capture "$WINDOW_NAME" 2>/dev/null)" || true
+    printf '%s' "$screen" | python3 "${SCRIPT_DIR}/lib_trust.py" dialog || rc=$?
+    return "$rc"
+  }
+  _abort_on_trust_dialog() {   # $1 = いつ見つけたか
+    local msg="[crewvia] ERROR: $WINDOW_NAME は claude の trust ダイアログで止まっています (${1})。kickoff は着弾していません。
+          ダイアログは既定が \"No, exit\" なので Enter を送りません。この窓は片付けます (ダイアログに
+          dispatcher の割り当て + Enter が届くのを防ぐため)。dir を信頼してから起動し直してください:
+            ! cd '${WORK_DIR}' && claude      # \"Yes, I trust this folder\" を選び、/exit"
+    echo "$msg" >&2
+    _log_refusal trust-dialog "$msg"
+    mux_kill "$WINDOW_NAME" >/dev/null 2>&1 \
+      || echo "[crewvia] WARNING: $WINDOW_NAME を片付けられませんでした。手動で: mux_kill $WINDOW_NAME" >&2
+    exit 1
+  }
+  _trust_dialog_check() {   # $1 = いつ見たか。ダイアログが出ていれば起動を止める
+    local rc=0
+    _trust_dialog_shown || rc=$?
+    case $rc in
+      0) _abort_on_trust_dialog "$1" ;;
+      1) ;;
+      *) if [[ -z "${_TRUST_DETECTOR_WARNED:-}" ]]; then
+           echo "[crewvia] WARNING: trust ダイアログの検出器が異常終了しました (exit ${rc}) — この最後の網は効いていません" >&2
+           _TRUST_DETECTOR_WARNED=1
+         fi ;;
+    esac
+  }
 
   # CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1: CLAUDE_CODE_CHILD_SESSION マーカーが存在しても
   # transcript 保存を強制する公式の env var（Claude Code 2.x 以降）。unset と組み合わせる二重防御。
@@ -731,6 +810,8 @@ PYEOF
   # (spec §4.2-D: capture で ❯ を確認してから send する規約)
   PROMPT_READY=0
   for _i in $(seq 1 30); do
+    # `❯` はダイアログの選択カーソルでもあるので、先にダイアログかどうかを見る (t021)。
+    _trust_dialog_check "❯ の待機中"
     if mux_capture "$WINDOW_NAME" 2>/dev/null | grep -q '❯'; then
       PROMPT_READY=1
       break
@@ -768,6 +849,8 @@ PYEOF
     # なっていた。stdout だけを捨て、warning はターミナル/ログに残す。
     _KICKOFF_LANDED=0
     for _kickoff_attempt in 1 2 3; do
+      # 送る直前にもう一度: `❯` を見つけた後にダイアログが出た場合の窓 (t021)。
+      _trust_dialog_check "kickoff 送信前 (${_kickoff_attempt}/3)"
       mux_send "$WINDOW_NAME" "$KICKOFF_MSG" >/dev/null || true
       sleep 1.5
       if mux_verify_sent "$WINDOW_NAME" "$KICKOFF_MSG"; then
@@ -777,6 +860,9 @@ PYEOF
       echo "[crewvia] WARNING: kickoff message not confirmed in $WINDOW_NAME (attempt ${_kickoff_attempt}/3)" >&2
       sleep 2
     done
+
+    # 着弾検証が通っても、画面がダイアログのままなら「verified」と言わない (t021)。
+    _trust_dialog_check "kickoff 送信後"
 
     if [[ "$_KICKOFF_LANDED" -eq 1 ]]; then
       echo "[crewvia] Kickoff message sent to $WINDOW_NAME (verified)"

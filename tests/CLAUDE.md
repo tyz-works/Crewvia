@@ -25,6 +25,13 @@ root の `CLAUDE.md` から移した、テスト専用の規則。設計と経�
 - registry は queue の隣に置く（`registry_dir()` 1 箇所）。実 registry を書くテストは作らない
   （`knowledge/test-isolation.md`）。
 
+## start.sh を mux モードで走らせるテスト
+
+- start.sh は claude を起動する前に `~/.claude.json` で cwd の trust を検査する（t021）。fake tmux で走らせるテストは
+  `tests/trust_fixture.sh`（`trust_fixture_setup` / `trust_fixture_teardown`）で信頼を宣言する。開発機は
+  `~/.claude.json` が crewvia を信頼しているので通ってしまい、**CI でだけ落ちる**。`CLAUDE_CONFIG_DIR` を
+  使い捨ての dir に向ける方式で、本物の `~/.claude.json` は読まない・書かない（HOME は変えない）。
+
 ## 構造ガード（AST）
 
 - queue / registry / config を開く**直接読み取り**は、`tests/test_queue_reads_go_through_the_guard.py`（`test_no_unguarded_read_remains`）が対象モジュールの

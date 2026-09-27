@@ -55,6 +55,17 @@ registry に居ない名前は作らない。t017 / #14。以前は registry の
 `Mux.spawn()` の `env=` 引数は廃止（渡すと TypeError。env は起動コマンドに
 `export` として埋める）。設計: `knowledge/daemon-authority.md` §7-17、
 `knowledge/assignment-routing.md` §1
+**mux モードでは claude を起動する前に cwd の trust を検査して止める**（t021 / #28。
+`lib_trust.py check`。下記）。信頼されていない cwd では claude の trust ダイアログ
+（既定 `No, exit`）を kickoff の Enter が選んで Worker が即死し、残りの文字列がシェルに落ちた。
+拒否は非 0 で終わり、端末と `logs/start-sh/refusals.log`（1 拒否 1 行。`logs/` は gitignore 済み。
+#18: 以前の start.sh の拒否は端末にしか出なかった）の両方に残る。副作用
+（`crewvia-worker-*.json` / `settings.local.json` / registry の更新）より前なので、拒否した起動は
+何も残さない。kickoff 後の最後の網は `❯` の待機中・送信前・送信後にダイアログの文言を見て、
+出ていれば kickoff を送らず（送った後なら `verified` と言わず）窓を片付けて非 0 で止まる
+（`❯` はダイアログの選択カーソルでもあり、旧実装はそれを Claude の入力行と誤認して
+`Kickoff message sent (verified)` と言っていた）。インラインモード（`exec claude`）と
+`CREWVIA_BENCH_MODE=1` は対象外
 
 ### `plan.sh`
 
@@ -356,6 +367,39 @@ Worker が起動された `TARGET_DIR` の記録の唯一の定義（t009 / #21�
 答えが割れる）。CLI: `record <registry_dir> <agent> [<target_dir>]` / `show`。
 記録が嘘・無いときは `record` で書き直す（dispatcher は毎サイクル読み直す）。
 設計: `knowledge/assignment-routing.md`
+
+### `lib_trust.py`
+
+claude の trust ダイアログを `start.sh` が踏まないための検査（t021 / #28）。CLI:
+`check <dir>`（信頼済みなら無出力で 0 / 未信頼 10 / 確認不能 11。10 と 11 は端末向けの説明を stdout に出す）と
+`dialog`（stdin の pane capture にダイアログの文言があれば 0 / 無ければ 1 / 読めなければ 2）。
+判定は `~/.claude.json`（`CLAUDE_CONFIG_DIR` があればその下）の
+`projects["<絶対パス>"].hasTrustDialogAccepted`。**cwd 自身と `/` までの祖先のどれかが `true`**
+なら信頼済み（実測: 信頼済みの祖先の配下ではダイアログが出ない）。パスは論理（`cd && pwd`）と
+物理（`realpath`）、それぞれ NFC の形の全部を候補にし、キー側も `normpath` で畳む（正規化は一致を
+見つけやすくするためだけに使う）。`true` は `is True`（`"true"`・`1`・`null` は信頼済みにならない）。
+**倒す向き**: 読めない・JSON でない・形が違う（`projects` が object でない・cwd に関わる記録が bool でない）
+は **確認不能 = 止める**（「読めない」を「信頼済み」に潰さない。進めた場合の被害は Worker の即死と
+シェルへの文字列漏れ、止めた場合の被害は利用者が 1 行直すこと）。ファイルが**無い**（ENOENT）のは
+「何も信頼していない」が事実なので未信頼。**`~/.claude.json` は書き換えない**（trust は利用者の
+判断。止めるときは `! cd <dir> && claude`（Yes を選んで `/exit`）と `jq` の 1 行を出す）。
+読みは `lib_daemon_state.load_json_store`（通常ファイルか・JSON か・object か）。
+最後の網の文言（`Quick safety check` / `Yes, I trust this folder` / 旧版の
+`Do you trust the files in this folder` / 決定の案内と揃った `No, exit`）は claude 2.1.283 の
+バンドルで確認したもので、この 1 箇所にだけある。テスト: `tests/test_trust_precheck.py`（判定の表）・
+`tests/start-sh-trust-precheck.bats`（start.sh 経由）・`tests/red_proof_b6_trust_precheck.sh`。
+fake tmux で start.sh を mux モードで走らせるテストは `tests/trust_fixture.sh` で信頼を宣言する
+（しないと CI（`~/.claude.json` が無い）でだけ落ちる）
+
+**戻し方**（誤判定すると Worker / Director の起動が止まる種類の変更。**env の停止スイッチは付けない**:
+trust は利用者の判断で、迂回口を作ると「信頼していない dir で起動して即死」に戻る）:
+(1) 個別に通す — 止められた dir は、表示されたコマンド（`! cd <dir> && claude` で Yes を選ぶか、`jq`
+の 1 行）で信頼を記録すれば通る。claude 自身が出さない dir（git worktree など未知の継承規則）で
+誤って止められた場合も、記録しておけば害は無い（claude が自分で書く値と同じ）。
+(2) 全体を戻す — 該当 PR を revert → 主 checkout を `git merge --ff-only origin/main`。
+`start.sh` は起動のたびに読まれる（dispatcher が pane で起動するときも毎回新しい bash）ので、
+デーモンの再起動（`lib_daemon_watch.py restart`）は要らない。既に走っている Worker には影響しない。
+拒否の記録は `logs/start-sh/refusals.log`（消してよい）
 
 ### `lib_registry.py`
 

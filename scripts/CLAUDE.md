@@ -58,3 +58,11 @@ lib ごとの**破ってはいけない契約**の要約。理由・経緯・全
 - `done` は `--pr <N>` か `--no-pr "<理由>"` のどちらかが要る場合がある（後続の codex-review に pr_number が無いとき）。
 - 引数は厳格（未知の option は exit 2 で何も書かない）。`pull` だけ使い方の誤りが exit 1（exit 2 は「タスクなし」）。
 - queue を書き換えるサブコマンドの後、`registry/task-graph/tasks.json` を再生成する（`CREWVIA_TASK_GRAPH=0` で停止）。
+
+## 起動（`start.sh` / `lib_trust.py`）
+
+- mux モードの start.sh は、claude を起動する**前**に `lib_trust.py check <cwd>` で trust を検査する。未信頼（10）・確認不能（11）・
+  検査自体の異常終了は**すべて止める**（exit 1。「読めない」を「信頼済み」にしない）。`~/.claude.json` は書き換えない。
+  拒否は端末と `logs/start-sh/refusals.log` の両方に出す（`_log_refusal`）。副作用より前に置く。
+- kickoff 前後の最後の網（`lib_trust.py dialog`）が、`❯`（ダイアログの選択カーソルでもある）を入力行と誤認する穴を塞ぐ。
+  ダイアログの文言の定義は `lib_trust.py` の 1 箇所。戻し方は `knowledge/file-map.md`「lib_trust.py」。

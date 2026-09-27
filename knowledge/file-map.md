@@ -355,8 +355,11 @@ dispatcher の Rule 5 が共有する。分類するだけで判定しない —
 snapshot-`) が現れるか」（本番の `npm exec ...` が process.title 書き換え + `sh -c "..."` を
 挟むため comm では MCP を job と誤読していた）。dispatcher の Rule 5 には
 `BACKGROUND_JOB_MAX_SECONDS`（既定 30分）の上限も追加— 起動元だけでは job の中身が進んで
-いるかは分からない（Ren の `pgrep -f` 自己一致ループの実例）。設計・実測・戻し方:
-`knowledge/watchdog-idle-judgment.md` §7-8
+いるかは分からない（Ren の `pgrep -f` 自己一致ループの実例）。**t082**: cmdline が
+「消滅」以外の理由で読めないノードは（マーカー無しに潰さず）`unknown` に倒す（本物の job が
+idle_process に化けて watchdog が誤 terminate しうる P1）。`BACKGROUND_JOB_MAX_SECONDS` の
+タイマーも「無い」と「読めない/書けない」を区別する（P2）。設計・実測・戻し方:
+`knowledge/watchdog-idle-judgment.md` §7-9
 
 ### `lib_worker_target.py`
 

@@ -127,9 +127,9 @@ expect_red "case E" "test_blocked_is_still_notified_with_a_background_job" "${B1
 echo "== case F: 裏の job 中に grace を測り直さない"
 fresh_copy
 # 'working' への読み替えをやめ、裏の job があるあいだは単に return する (state entry を触らない)
-inject scripts/dispatcher.sh "        if now - job_since <= BACKGROUND_JOB_MAX_SECONDS:
+inject scripts/dispatcher.sh "        if reliable and (now - job_since <= BACKGROUND_JOB_MAX_SECONDS):
             st = 'working'" \
-                             "        if now - job_since <= BACKGROUND_JOB_MAX_SECONDS:
+                             "        if reliable and (now - job_since <= BACKGROUND_JOB_MAX_SECONDS):
             return"
 expect_red "case F" "test_a_background_job_restarts_the_grace_and_clears_the_dedup_key" "${B1_TESTS[@]}"
 
@@ -198,29 +198,73 @@ expect_red "case O" "test_the_fixture_trees_classify_as_intended" "${B1_TESTS[@]
 
 echo "== case P (t074 族C監査の向き訂正): 同定できないものを job 側に倒し直してしまう"
 fresh_copy
-inject scripts/lib_pane_process.py '            cmdline = _proc_cmdline(pid)
-            has_marker = cmdline is not None and BASH_TOOL_WRAPPER_MARKER in cmdline
+inject scripts/lib_pane_process.py '            has_marker = cmdline is not None and BASH_TOOL_WRAPPER_MARKER in cmdline
             origin = "job" if has_marker else "infra"' \
-                                    '            cmdline = _proc_cmdline(pid)
-            has_marker = cmdline is not None and BASH_TOOL_WRAPPER_MARKER in cmdline
+                                    '            has_marker = cmdline is not None and BASH_TOOL_WRAPPER_MARKER in cmdline
             origin = "job"'
 expect_red "case P" "test_an_unidentified_persistent_process_is_not_treated_as_a_job" "${B1_TESTS[@]}"
 
 echo "== case Q (t074 追補): BACKGROUND_JOB_MAX_SECONDS の安全弁を外す (黙り続ける方に戻る)"
 fresh_copy
-inject scripts/dispatcher.sh "        if now - job_since <= BACKGROUND_JOB_MAX_SECONDS:
+inject scripts/dispatcher.sh "        if reliable and (now - job_since <= BACKGROUND_JOB_MAX_SECONDS):
             st = 'working'" "        st = 'working'"
 expect_red "case Q" "test_a_job_older_than_the_ceiling_no_longer_suppresses_rule5" "${B1_TESTS[@]}"
 
 echo "== case R (t074 追補): job_since が grace の since と混同され、job 中に測り直ってしまう"
 fresh_copy
-inject scripts/dispatcher.sh "        job_since = _load_job_since(name)
+inject scripts/dispatcher.sh "        job_since, reliable = _load_job_since(name)
         if job_since is None:
             job_since = now
-            _save_job_since(name, job_since)" \
-                             "        job_since = now
+            # t082 P2: 保存に失敗したら、今回計った job_since は次のサイクルで
+            # 読み直せない (= 保てていない)。reliable を落とし、上限判定を
+            # 信用しない側に倒す (握り潰して「保存できた」ふりをしない)。
+            reliable = _save_job_since(name, job_since) and reliable" \
+                             "        job_since, reliable = now, True
         _save_job_since(name, job_since)"
 expect_red "case R" "test_the_ceiling_timer_is_independent_of_the_grace_timer" "${B1_TESTS[@]}"
+
+echo "== case S (t082 P1): cmdline が読めないノードを『インフラ』に潰す (job が idle_process に化ける)"
+fresh_copy
+inject scripts/lib_pane_process.py "            try:
+                cmdline = _proc_cmdline(pid)
+            except OSError:
+                # t082 P1: 消滅以外の理由で読めない (EACCES 等)。「マーカーが
+                # 無い」(= job ではない) に潰すと、読めないノードが Bash tool
+                # のラッパー自身だったときに本物の job が idle_process に化け、
+                # watchdog が hard-idle で terminate してしまう。木全体を
+                # \`unknown\` に倒す (_proc_stat の列挙失敗と同じ扱い)。
+                return \"unknown\"
+            has_marker = cmdline is not None and BASH_TOOL_WRAPPER_MARKER in cmdline" \
+                             "            cmdline = _proc_cmdline(pid)
+            has_marker = cmdline is not None and BASH_TOOL_WRAPPER_MARKER in cmdline"
+expect_red "case S" "test_an_unreadable_wrapper_is_unknown_not_infra" "${B1_TESTS[@]}"
+
+echo "== case T (t082 P2): job_since の『無い』と『読めない』を同じに潰す"
+fresh_copy
+inject scripts/dispatcher.sh "    if is_missing(entry):
+        return None, True
+    if is_unreadable(entry):
+        return None, False
+    value = entry.get('job_since')
+    if is_finite_number(value):
+        return value, True
+    return None, False  # スキーマ検証済みのはずだが、念のため信用しない側に倒す" \
+                         "    if is_unreadable(entry):
+        return None, True
+    value = entry.get('job_since')
+    return (value, True) if is_finite_number(value) else (None, True)"
+expect_red "case T" "test_an_unreadable_job_since_file_does_not_suppress_forever" "${B1_TESTS[@]}"
+
+echo "== case U (t082 P2): job_since の書き込み失敗を握り潰す (保存できたふりをする)"
+fresh_copy
+inject scripts/dispatcher.sh "    except Exception as e:
+        log(f'WARNING: cannot write job_since entry for {name!r}: {e}')
+        return False
+    return True" \
+                             "    except Exception as e:
+        log(f'WARNING: cannot write job_since entry for {name!r}: {e}')
+    return True"
+expect_red "case U" "test_a_job_since_write_failure_does_not_suppress_forever" "${B1_TESTS[@]}"
 
 echo
 echo "Results: PASS=$PASS FAIL=$FAIL"

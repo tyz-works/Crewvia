@@ -1510,38 +1510,66 @@ def _job_since_path(name: str) -> Path:
     return STATE_JSON_DIR / f'{name}.job-since.json'
 
 
-def _load_job_since(name: str) -> Optional[float]:
+def _load_job_since(name: str) -> tuple[Optional[float], bool]:
     """t074 追補: 「裏の job が連続して見え続けている」開始時刻。`_load_state_entry`
     の `since` (現在の条件 A/B の grace 計測。job があるあいだ毎サイクル
     `time.time()` へ書き直される — `test_grace_counts_from_the_end_of_the_job`)
     とは別物なので別ファイルに持つ (同じフィールドを 2 つの意味で使うと
-    どちらかの意味が壊れる)。壊れている/読めないときは None (= 初めて見た
-    ものとして扱う — 黙る方向にも通知する方向にも決め打ちしない。次のサイクルで
-    改めて計り直すだけ)。"""
+    どちらかの意味が壊れる)。
+
+    戻り値は `(job_since, reliable)`。**「無い」と「読めない」を区別する**
+    (t082 P2, Codex review 4巡目): ファイルがまだ無い (`is_missing`) のは
+    「この job を初めて見た」という正常な状態で、`reliable=True` /
+    `job_since=None` (呼び出し側が `now` で新規に計る)。ファイルは**あるのに
+    壊れている/形が合わない**のは異常な状態で、`reliable=False` を返す —
+    これを None と同じに潰して「初めて見た」扱いにすると、`job_since` を
+    保てない環境 (registry/mux が壊れている等) では**毎サイクル `now` を
+    新規タイマーとして採用し続け、`BACKGROUND_JOB_MAX_SECONDS` が永久に
+    切れない** (安全弁そのものが黙る側に壊れる)。呼び出し側は `reliable`
+    が False なら上限判定を信用せず、通常の idle-with-task 判定に流すこと
+    (「タイマーを確実に保てないときは通知を許す」)。
+    """
     entry = load_json_store(
         _job_since_path(name), check=job_since_state_problem,
         warn=lambda msg: log(f"WARNING: rule5 job_since entry: {msg}"))
+    if is_missing(entry):
+        return None, True
     if is_unreadable(entry):
-        return None
+        return None, False
     value = entry.get('job_since')
-    return value if is_finite_number(value) else None
+    if is_finite_number(value):
+        return value, True
+    return None, False  # スキーマ検証済みのはずだが、念のため信用しない側に倒す
 
 
-def _save_job_since(name: str, job_since: Optional[float]) -> None:
+def _save_job_since(name: str, job_since: Optional[float]) -> bool:
     """job_since を書く。None は「job が消えた/条件から外れた」— ファイルごと消す
-    (次に job が現れたときまた新しく計り直す)。"""
+    (次に job が現れたときまた新しく計り直す)。
+
+    戻り値は書き込みが**成功したか** (t082 P2)。呼び出し側は、新規タイマーの
+    保存に失敗したら (今回計った `job_since` が次のサイクルで読み直せない)
+    その事実を信用せず、上限判定を通常の idle-with-task 判定に譲ること
+    (書き込み失敗を握り潰して「保存できた」ふりをすると `_load_job_since` の
+    修正が意味を持たなくなる — 毎サイクル保存に失敗し続け、毎サイクル
+    「初めて見た」と読み直して `now` を採用し、結局上限が切れない)。
+    """
     path = _job_since_path(name)
     if job_since is None:
         try:
             path.unlink()
         except FileNotFoundError:
             pass
-        return
+        except OSError as e:
+            log(f'WARNING: cannot clear job_since entry for {name!r}: {e}')
+            return False
+        return True
     try:
         STATE_JSON_DIR.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps({'job_since': job_since}), encoding='utf-8')
     except Exception as e:
         log(f'WARNING: cannot write job_since entry for {name!r}: {e}')
+        return False
+    return True
 
 
 def worker_has_background_work(target: str) -> bool:
@@ -1624,15 +1652,19 @@ def check_rule5(name: str, target: str, assignment_file: Path, task_statuses_by_
         # Ren の pgrep 自己一致ループのように、ラッパーの子孫だが何十分も
         # 進んでいない job を Rule 5 が永久に黙らせないため)。
         now = time.time()
-        job_since = _load_job_since(name)
+        job_since, reliable = _load_job_since(name)
         if job_since is None:
             job_since = now
-            _save_job_since(name, job_since)
-        if now - job_since <= BACKGROUND_JOB_MAX_SECONDS:
+            # t082 P2: 保存に失敗したら、今回計った job_since は次のサイクルで
+            # 読み直せない (= 保てていない)。reliable を落とし、上限判定を
+            # 信用しない側に倒す (握り潰して「保存できた」ふりをしない)。
+            reliable = _save_job_since(name, job_since) and reliable
+        if reliable and (now - job_since <= BACKGROUND_JOB_MAX_SECONDS):
             st = 'working'
-        # else: 上限超え — st は 'idle'/'done' のまま通常の判定に流す。
-        # job_since はクリアしない (同じ長時間 job が続く限り、次サイクルも
-        # 同じ経過時間を計り続け、通常の grace/NOTIFY_TTL の判定に任せる)。
+        # else: 上限超え、またはタイマーを確実に保てない — st は 'idle'/'done'
+        # のまま通常の判定に流す (黙る方向には倒さない)。job_since はクリア
+        # しない (同じ長時間 job が続く限り、次サイクルも同じ経過時間を計り
+        # 続け、通常の grace/NOTIFY_TTL の判定に任せる)。
     else:
         # job が消えた/条件から外れた → 連続計測をリセットする
         _save_job_since(name, None)

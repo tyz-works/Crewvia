@@ -57,8 +57,12 @@ lib ごとの**破ってはいけない契約**の要約。理由・経緯・全
   **観測できないときは通知する側**、watchdog は殺さない側（判定ごとに向きが違う）。
   job が連続して見え続けている時間が `BACKGROUND_JOB_MAX_SECONDS`（既定 30分）を超えたら
   通知を再開する（起動元だけでは job の中身が進んでいるかは分からない — Ren の `pgrep -f`
-  自己一致ループの実例）。それでも黙り続ける裏で止まった job は watchdog の max が拾う
-  （`knowledge/watchdog-idle-judgment.md` §7-8）。
+  自己一致ループの実例）。それでも黙り続ける裏で止まった job は watchdog の max が拾う。
+  この上限タイマー (`<name>.job-since.json`) は「無い」(正常) と「読めない/書けない」
+  (異常) を区別し、後者は上限判定を信用せず通常判定に流す（t082。握り潰すと安全弁自体が
+  黙る側に壊れる）。cmdline が読めないノードも「消滅」以外は `unknown` に倒す（t082 P1。
+  「マーカー無し」に潰すと本物の job が見えなくなり watchdog が誤って terminate しうる）。
+  （`knowledge/watchdog-idle-judgment.md` §7-9）。
 - 台帳・拒否記録は**消してよい**（無い = 再通知 / 拒否されていない）。通知が届かない・review が動かないときの
   手当てはそのファイルを消すこと（dispatcher の再起動は不要。`knowledge/notify-once.md`「戻し方」）。
 

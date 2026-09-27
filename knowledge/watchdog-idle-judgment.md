@@ -369,3 +369,81 @@ watchdog の絶対上限 (既定 3600 秒) より短い。「本当に進んで�
   書き換えた。
 - `tests/red_proof_b1_background_work.sh` — case O/P を新しい定義に合わせて書き換え、
   BACKGROUND_JOB_MAX_SECONDS 用の case Q/R を追加。全 18 件が赤になることを確認。
+
+## 9. t074 の族の掃除が漏らした 2 か所 + e2e の追従 (t082, Codex review 4巡目)
+
+t074 は `_proc_stat` (族A) を確認したが、隣の `_proc_cmdline` と dispatcher 側の新設
+タイマー (`_load_job_since` / `_save_job_since`) には同じ監査が及んでいなかった。
+
+### [P1] `_proc_cmdline` の読み取り失敗を「マーカー無し」に潰していた
+
+当初の実装は `_proc_cmdline` の `OSError` を（消滅かどうかに関わらず）全部 `None` にし、
+呼び出し側はそれを「マーカーが無い = job ではない」として扱っていた。読めないノードが
+**Bash tool のラッパー自身**だと、本物の job のマーカーが誰にも見えなくなり、木全体が
+`idle_process` に化ける — watchdog はそれを見て hard-idle による terminate を許して
+しまう (「観測できないなら kill しない」という要件に反する)。
+
+`_proc_stat` と同じ基準に揃えた: 消滅 (`FileNotFoundError`/`ProcessLookupError`) だけを
+「マーカー無し」と同じ扱いにし、それ以外は `classify_process_tree` 全体を `unknown` に
+倒す (族A と同じ形の欠陥が、時刻から起動元への作り直しの後も違う関数で再発した — memory
+`evidence-for-destructive-decisions` と同根)。
+
+### [P2] `_load_job_since` / `_save_job_since` の「無い」と「読めない」の混同
+
+`_load_job_since` は「まだファイルが無い」(is_missing, 正常) と「ファイルはあるが壊れて
+いる/形が合わない」(is_unreadable, 異常) を同じ `None` に潰していた。`_save_job_since`
+も書き込み失敗を握り潰し、呼び出し側は「保存できた」ものとして扱っていた。
+
+registry/mux が壊れている等でこのタイマーを**確実に保てない**環境では、毎サイクル
+「初めて見た」と読み直して `now` を新規タイマーに採用し続け、**`BACKGROUND_JOB_MAX_SECONDS`
+が永久に切れない** — t074 で足した安全弁そのものが、黙る側に壊れる欠陥を持ったまま
+マージされていた (P1 で見せたパターンと同根: 「読めない/保てない」を「正常な初期状態」に
+潰さない)。
+
+`_load_job_since` は `(job_since, reliable)` を返すよう変更し、`_save_job_since` は
+書き込み成否を bool で返す。呼び出し側は `reliable` が False (読めない、または保存に
+失敗した) なら上限判定を信用せず、通常の idle-with-task 判定に流す (「タイマーを
+確実に保てないときは通知を許す」)。
+
+### 族ごとの掃除 (t082 で追加した/確認した読み書き失敗点、全経路)
+
+| 箇所 | 読み書き | 失敗の潰し先 | 影響する判定 | 向き |
+|---|---|---|---|---|
+| `lib_pane_process._proc_stat` | `/proc/<pid>/stat` 読み | 消滅→無し、それ以外→`unknown` (既存, t049) | Rule5 (通知)・watchdog (kill) | 両方とも安全側 (Rule5=通知, watchdog=殺さない) |
+| `lib_pane_process._proc_cmdline` | `/proc/<pid>/cmdline` 読み | 消滅→マーカー無し、それ以外→`unknown` (t082 で修正) | 同上 | 同上 (修正前は「マーカー無し」に潰し、watchdog 側が危険な方向に壊れていた) |
+| `/proc` 列挙 (`Path("/proc").iterdir()`) | 列挙 | 失敗→`unknown` (既存) | 同上 | 安全側 |
+| dispatcher `_load_job_since` | `<name>.job-since.json` 読み | 無い→新規 (reliable=True)、壊れている→信用しない (reliable=False, t082 で区別) | Rule5 の BACKGROUND_JOB_MAX_SECONDS | 安全側 (信用しない→通常判定へ) |
+| dispatcher `_save_job_since` | 同上 書き | 失敗→呼び出し側に bool で伝える (t082 で修正) | 同上 | 修正前は握り潰し (黙る方向に壊れていた)、修正後は安全側 |
+| dispatcher `_load_state_entry` | `<name>.state.json` 読み | 無い/壊れている、どちらも `{}` (既存, t021) | Rule5 の grace 計測 | **意図的に区別しない** — grace が最初からやり直しになる = 通知が「遅れる」側 (`knowledge/empty-vs-unobservable.md` §2 の I)。書き込みが恒久的に失敗し続けると grace が永久に満了しない同型の穴が理論上あるが、その環境では registry/mux 全体 (mux spawn 記録・retirement marker 等) が書けなくなっており、Rule5 単体より広い障害として別経路で顕在化する。**このタスクの findings に無いので変更していない** — 変更するなら別 task |
+| dispatcher `worker_has_background_work` | `_mux.pid` / `classify_process_tree` 呼び出し | 例外→`False` (既存, t074) | Rule5 | 安全側 (通知する) |
+| watchdog `_process_signal` | `_mux.pid` | `None`→`"no_window"` (既存) | watchdog | 安全側 (殺さない) |
+| watchdog `_last_activity_mtime` / `_notification_files` | activity/notification/heartbeat の `stat` | ENOENT のみ「無い」、それ以外は unobservable (既存, t016 族A) | watchdog | 安全側 |
+
+族B (パスの相対/絶対解決の食い違い) はこのタスクの対象に無い (t070 固有の話)。
+族C (許可リストで未知のものをどちらに倒すか) は t074 で許可リスト自体を撤去して解消済み
+— t082 で新たな族C 相当の分岐は増えていない。
+
+### 検証 (t082)
+
+- P1: `test_an_unreadable_wrapper_is_unknown_not_infra` (classify レベル) +
+  `test_watchdog_does_not_terminate_when_the_wrapper_cmdline_is_unreadable` (watchdog
+  受入条件そのもの)。
+- P2: `test_an_unreadable_job_since_file_does_not_suppress_forever` (壊れたファイル) +
+  `test_a_job_since_write_failure_does_not_suppress_forever` (書き込み失敗。
+  `registry/mux` を一時的に read-only にして実際に書き込みを失敗させる)。
+- P2-3: `tests/watchdog-idle-e2e.sh` を最後まで走らせて緑にした。t016 (この e2e が
+  書かれた時点) 以降に増えた依存 (`lib_retirement` / `lib_daemon_watch` /
+  `lib_daemon_state` / `lib_task_cards`。t002 のリタイアマーカー方式) をコピーし忘れて
+  いて `ModuleNotFoundError` で即落ちていた。さらに t044 の「floor」機構 (`monitoring_since
+  = min(pulled_at, self.started_at)`) に `started_at` が無いと `self.started_at` (ほぼ
+  「今」) が使われ、あらかじめ古くした activity ファイルが effectively 無視される
+  ため、fixture の task card に `started_at` を足した。終了経路も t002 で
+  retirement marker 方式 (要 plan.sh / mission.yaml) に変わっていたため、
+  `CREWVIA_KILL_AUTHORITY=dispatcher` (rollback モード = t002 以前と同じ直接 kill) で
+  この e2e が検証したいプロセス層の判定だけを隔離して見られるようにした。シナリオ4
+  (対照) は「plain な idle 木ですら terminate しない origin/main」を見せていたが、
+  それは main が t016 の修正を既に持つので現在は成立しない (対照として空振り) — 「B1 が
+  無いと実行中の Worker も terminate してしまう」という、この PR が実際に守っている
+  実害に置き換えた。
+- `tests/red_proof_b1_background_work.sh` に case S (P1) / T・U (P2) を追加。全 21 件
+  (baseline 含む) PASS。

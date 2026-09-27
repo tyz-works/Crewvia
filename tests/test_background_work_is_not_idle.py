@@ -265,6 +265,63 @@ def test_an_unreadable_intermediate_pid_falls_to_unknown_not_idle(monkeypatch):
         _kill_pane_tree(root)
 
 
+def test_an_unreadable_wrapper_is_unknown_not_infra(panes, monkeypatch):
+    """t082 (Codex review 4巡目 P1): 赤の実証。ラッパー自身の cmdline が
+    「消滅」以外の理由 (EACCES 等) で読めないとき、それを「マーカーが無い」
+    (= job ではない = infra) に潰す実装は、**走っている本物の job を
+    idle_process に誤分類する** — watchdog の check_detail() はそれを見て
+    hard-idle による terminate を許してしまう (「観測に失敗したら kill しない」
+    という要件に反する)。`_proc_stat` (族A監査) と同じ基準で、木全体を
+    `unknown` に倒すことを固定する。
+    """
+    real_proc_cmdline = lib_pane_process._proc_cmdline
+
+    # busy fixture の直下 (root の子) のうち、wrapper marker を持つ方が job の
+    # ラッパー自身 (もう一方は MCP 相当で marker を持たない)。
+    direct = _direct_children(panes["busy"])
+    wrapper_pid = next(
+        pid for pid in direct
+        if (real_proc_cmdline(pid) or "") and
+        lib_pane_process.BASH_TOOL_WRAPPER_MARKER in real_proc_cmdline(pid))
+
+    def flaky_proc_cmdline(pid):
+        if pid == wrapper_pid:
+            raise PermissionError(13, "Permission denied (test injection)")
+        return real_proc_cmdline(pid)
+
+    monkeypatch.setattr(lib_pane_process, "_proc_cmdline", flaky_proc_cmdline)
+
+    assert lib_pane_process.classify_process_tree(panes["busy"]) == "unknown"
+
+
+def test_watchdog_does_not_terminate_when_the_wrapper_cmdline_is_unreadable(
+    tmp_path, monkeypatch, panes
+):
+    """t082 P1 受入条件そのもの: ラッパーの cmdline が読めない状態でも、
+    その下に本物の job を持つ Worker は watchdog に kill されない
+    (`unknown` は殺さない側に倒れる — 既存の fail-direction と同じ)。
+    """
+    real_proc_cmdline = lib_pane_process._proc_cmdline
+    direct = _direct_children(panes["busy"])
+    wrapper_pid = next(
+        pid for pid in direct
+        if (real_proc_cmdline(pid) or "") and
+        lib_pane_process.BASH_TOOL_WRAPPER_MARKER in real_proc_cmdline(pid))
+
+    def flaky_proc_cmdline(pid):
+        if pid == wrapper_pid:
+            raise PermissionError(13, "Permission denied (test injection)")
+        return real_proc_cmdline(pid)
+
+    monkeypatch.setattr(lib_pane_process, "_proc_cmdline", flaky_proc_cmdline)
+    monkeypatch.setattr(watchdog, "_mux", _WatchdogFakeMux(WINDOW, panes["busy"]))
+    monitor = _make_monitor(tmp_path, idle=300)
+    _write_activity(tmp_path, age_seconds=3000)
+    detail = monitor.check_detail()
+    assert detail.process_signal == "unknown"
+    assert detail.verdict != "terminate"
+
+
 # ---------------------------------------------------------------------------
 # dispatcher Rule 5
 # ---------------------------------------------------------------------------
@@ -411,6 +468,43 @@ def test_job_since_clears_when_the_job_ends(r5, panes):
     PaneMux.pane_pid = panes["quiet"]                          # job が終わった
     r5.run()
     assert not r5.job_since_path().exists()
+
+
+def test_an_unreadable_job_since_file_does_not_suppress_forever(r5, panes):
+    """t082 (Codex review 4巡目 P2): 赤の実証。job_since ファイルが**存在するが
+    壊れている** (JSON として不正) とき、それを「無い」(=初めて見た) に潰すと
+    毎サイクル `now` を新規タイマーとして採用し続け、`BACKGROUND_JOB_MAX_SECONDS`
+    が永久に切れない (安全弁そのものが黙る側に壊れる)。「無い」と「読めない」を
+    区別し、読めないときは上限判定を信用せず通常の idle-with-task 判定に
+    流すことを固定する。
+    """
+    PaneMux.pane_state, PaneMux.pane_pid = "idle", panes["busy"]
+    r5.job_since_path().parent.mkdir(parents=True, exist_ok=True)
+    r5.job_since_path().write_text("{not valid json")
+    r5.age_state()
+    msgs = r5.run()
+    assert len(msgs) == 1 and "idle-with-task" in msgs[0]
+
+
+def test_a_job_since_write_failure_does_not_suppress_forever(r5, panes):
+    """t082 (Codex review 4巡目 P2): 赤の実証。job_since を初めて書こうとして
+    失敗する (registry/mux が書き込めない) と、それを握り潰して「保存できた」
+    ふりをする実装は、次のサイクルでもファイルが無いまま `now` を新規タイマー
+    として採用し続け、上限が永久に切れない。書き込みの失敗を呼び出し側に
+    伝え、上限判定を信用しない (通常の idle-with-task 判定に流す) ことを固定する。
+    """
+    PaneMux.pane_state, PaneMux.pane_pid = "idle", panes["busy"]
+    mux_dir = r5.job_since_path().parent
+    mux_dir.mkdir(parents=True, exist_ok=True)
+    assert not r5.job_since_path().exists()  # 前提: まだ無い (「初めて見た」経路)
+    r5.age_state()  # grace の state entry はディレクトリが書ける間に先に書く
+    old_mode = mux_dir.stat().st_mode
+    os.chmod(mux_dir, 0o500)  # r-x: 既存ファイルは読めるが新規作成はできない
+    try:
+        msgs = r5.run()
+        assert len(msgs) == 1 and "idle-with-task" in msgs[0]
+    finally:
+        os.chmod(mux_dir, old_mode)
 
 
 def test_grace_counts_from_the_end_of_the_job(r5, panes):

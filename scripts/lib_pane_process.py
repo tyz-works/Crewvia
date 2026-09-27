@@ -56,23 +56,25 @@ eval '<command>' ..."` という形で生える。MCP サーバー (`npm exec ..
 を `source` する形が含まれるか**。含まれれば job (その子孫もすべて job — シェルが
 起動した実体の一部)。含まれなければ job ではない (infra)。
 
-**分からないとき (祖先の cmdline が読めない等) は「job ではない」側に倒す**
-(通知する側 / 殺さない側は呼び出し側の判定だが、ここでの「わからない」は
-「その 1 ノードが job のマーカーを持つと確認できなかった」というだけなので、
-そのノードだけを job から除外して走査は続ける — 呼び出し側に `unknown` を
-返すのは `/proc` の列挙自体が失敗した場合だけ [族A、下記])。
+**マーカーを持たない (=知らない名前・同定できないプロセス) は「job ではない」
+側に倒す** — これは「観測に失敗した (読めない)」とは別の話。族C (t065 で
+作った「同定できないものは job 側に倒す」という許可リスト方式の考え方) は
+**この設計では成立しない**: 許可リストが要らなくなった (「既知のインフラ名を
+全部知っている」という前提そのものを捨てた) ので、「未知の名前を job/infra の
+どちらに倒すか」という問い自体が無くなった。さらに、旧実装の「同定できない
+場合は job 側に倒す」という**コメント**は「1 回余計に通知する方が安い」と
+書かれていたが、実際には classify=`executing` は **通知/terminate を抑制する
+側**(dispatcher の `worker_has_background_work` / watchdog の `_process_signal`
+参照) なので、**コメントと挙動が逆だった** (Codex 3巡目 P1)。
 
-族C (t065 で作った「同定できないものは job 側に倒す」という許可リスト方式の
-考え方) は**この設計では成立しない**: 許可リストが要らなくなった (「既知の
-インフラ名を全部知っている」という前提そのものを捨てた) ので、「未知の名前を
-job/infra のどちらに倒すか」という問い自体が無くなった。さらに、旧実装の
-「同定できない場合は job 側に倒す」という**コメント**は「1 回余計に通知する
-方が安い」と書かれていたが、実際には classify=`executing` は **通知/terminate
-を抑制する側**(dispatcher の `worker_has_background_work` / watchdog の
-`_process_signal` 参照) なので、**コメントと挙動が逆だった** (Codex 3巡目 P1)。
-新しい設計はデフォルトを「job ではない」にすることで、この向きの取り違えごと
-無くす — 「わからない/知らない」はすべて「job ではない」(= 通知・terminate を
-許す側) に統一される。
+**「観測に失敗した (cmdline が消滅以外の理由で読めない)」は別の話で、`unknown`
+に倒す** (t082 P1)。当初はここも「job ではない」に潰していたが、読めない
+ノードが Bash tool のラッパー自身だと、走っている本物の job のマーカーが
+誰にも見つからず `idle_process` に化ける — watchdog はそれを見て hard-idle
+による terminate を許してしまう (「観測できないなら kill しない」という
+要件に反する)。`_proc_stat` (プロセス木の列挙) と同じ基準で、「消滅」
+(ENOENT/ESRCH) だけを「マーカー無し」と同じ扱いにし、それ以外の読み取り
+失敗は木全体を `unknown` に倒す。
 
 時刻 (`grace_seconds` / `min_start_epoch`) はもう判定に使わない (t065 で撤去済み)。
 comm による同定 (`_SHELL_COMMS` / `_KNOWN_INFRASTRUCTURE_COMMS`) も撤去した —
@@ -85,8 +87,9 @@ from typing import Literal, Optional
 ProcessSignal = Literal[
     "no_window",     # mux 窓が無い
     "not_probed",    # プロセス層を見るまでもなく判定が決まった (絶対上限など)
-    "unknown",       # 窓はあるが pane pid が引けない、またはプロセス木の列挙自体が
-                     # 「消滅」以外の理由で読めない → terminate を抑制する
+    "unknown",       # 窓はあるが pane pid が引けない、プロセス木の列挙、または
+                     # 判定中のノードの cmdline が「消滅」以外の理由で読めない
+                     # → terminate を抑制する
     "no_process",    # 子プロセスが 1 つも無い
     "idle_process",  # Bash tool / Monitor のラッパー経由でないプロセス
                      # (セッション本体・MCP サーバー・その子孫) だけ
@@ -155,17 +158,25 @@ def _proc_cmdline(pid: int) -> Optional[str]:
     Monitor が生成する `source .../shell-snapshots/snapshot-....sh` という
     文字列をそのまま含むので、判定はこちらを読む。
 
-    読めない場合 (消滅・権限問題いずれも) は None を返し、呼び出し側 (t074:
-    分からないときは「job ではない」側に倒す。モジュール docstring 参照) に
-    「このノードにはマーカーが見つからなかった」ものとして扱わせる。これは
-    `_proc_stat` (消滅以外は re-raise してツリー構築全体を "unknown" にする)
-    とは意図的に違う流儀: cmdline の読み取り失敗はツリー構造 (親子関係) を
-    壊さない (親子関係は `_proc_stat` の ppid だけで決まる) ので、1 ノードの
-    判定だけを「job ではない」に倒して走査を続けられる。
+    消滅 (`FileNotFoundError` / `ProcessLookupError` = ENOENT/ESRCH) だけを
+    None として扱う — `_proc_stat` と同じ契約 (この pid はもう居ない、という
+    確定した事実)。それ以外の `OSError` (EACCES 等) は re-raise し、呼び出し側
+    (`classify_process_tree`) で `unknown` に倒す。
+
+    t082 (Codex review 4巡目 P1): 当初はここで全 `OSError` を握り潰して None
+    (=「job ではない」) にしていた。読めないノードが Bash tool のラッパー
+    自身だと、走っている job のマーカーが誰にも見つからず**本物の job が
+    `idle_process` に化ける**——watchdog の `check_detail()` はそれを見て
+    hard-idle による terminate を許してしまう (「観測に失敗したら kill しない」
+    という要件に反する。t074 のカードで Director が名指ししていた向き:
+    「kill してよい根拠を『分からない』から作らないこと」)。cmdline の読み取り
+    失敗はツリー構造 (親子関係。`_proc_stat` の ppid だけで決まる) を壊さない
+    が、**判定の根拠を握り潰してよいわけではない** — 「消滅」と「消滅以外」を
+    _proc_stat と同じ基準で分ける。
     """
     try:
         raw = Path(f"/proc/{pid}/cmdline").read_bytes()
-    except (FileNotFoundError, ProcessLookupError, OSError):
+    except (FileNotFoundError, ProcessLookupError):
         return None
     return raw.replace(b"\x00", b" ").decode("utf-8", errors="replace")
 
@@ -199,10 +210,12 @@ def classify_process_tree(root_pid: int) -> ProcessSignal:
       "idle_process" … それ以外 (セッション本体・MCP サーバー・その子孫)
                        だけ。木が有ること自体は「働いている」の証拠にならない
       "no_process"   … 子が 1 つも無い (claude が落ちた / 素のシェル)
-      "unknown"      … `/proc` の列挙自体 (`_proc_stat`) が「消滅」以外の
-                       理由で読めず、木そのものが組み立てられない
-                       (t049 族A監査。terminate 側の抑制材料としては効くが、
-                       Rule 5 は「観測できない → 通知する」に倒す)
+      "unknown"      … `/proc` の列挙自体 (`_proc_stat`) か、判定中の 1 ノードの
+                       cmdline (`_proc_cmdline`) のどちらかが「消滅」以外の
+                       理由で読めず、木そのものが組み立てられない、または
+                       job かどうかを確定できない (t049 族A監査 / t082 P1。
+                       terminate 側の抑制材料としては効くが、Rule 5 は
+                       「観測できない → 通知する」に倒す)
 
     親の分類 (job / not-job) は子に伝播する: job と分類されたノードの子孫は
     すべて job (そのシェルが起動した実体の一部だから)。ルート直下 (親の分類が
@@ -262,7 +275,15 @@ def classify_process_tree(root_pid: int) -> ProcessSignal:
         if parent_origin == "job":
             origin = "job"  # job の子孫はシェルの cmdline を見るまでもなく job
         else:
-            cmdline = _proc_cmdline(pid)
+            try:
+                cmdline = _proc_cmdline(pid)
+            except OSError:
+                # t082 P1: 消滅以外の理由で読めない (EACCES 等)。「マーカーが
+                # 無い」(= job ではない) に潰すと、読めないノードが Bash tool
+                # のラッパー自身だったときに本物の job が idle_process に化け、
+                # watchdog が hard-idle で terminate してしまう。木全体を
+                # `unknown` に倒す (_proc_stat の列挙失敗と同じ扱い)。
+                return "unknown"
             has_marker = cmdline is not None and BASH_TOOL_WRAPPER_MARKER in cmdline
             origin = "job" if has_marker else "infra"
         if origin == "job":

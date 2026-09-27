@@ -408,11 +408,16 @@ for name in (ldw.DAEMON_DISPATCHER, ldw.DAEMON_WATCHDOG):
     print(f"{'PASS' if ok else 'FAIL'}\t{name}\t{cmd}")
 PYEOF
 )
+PY26_EXIT=$?
 echo "$PY26" | while IFS=$'\t' read -r result rest; do
   echo "  [$result] $rest"
 done
-if echo "$PY26" | grep -q "^FAIL"; then
-  fail "lib_daemon_watch.spawn_command() should embed CREWVIA_MUX for both dispatcher and watchdog — see cases above"
+# 代入コマンドの終了コードも検査する (Test 1-8 / 14-22 / 23-25 と同じ理由:
+# import か spawn_command() が未処理の例外を出すと途中まで/一切 PASS 行を
+# 出さないまま非ゼロ終了する。出力に "FAIL" が無いことだけを見ると、
+# 例外による早期終了 (=両ケースを検証できていない) が PASS に潰れる)
+if [[ "$PY26_EXIT" -ne 0 ]] || echo "$PY26" | grep -q "^FAIL"; then
+  fail "lib_daemon_watch.spawn_command() should embed CREWVIA_MUX for both dispatcher and watchdog (exit=$PY26_EXIT) — see cases above"
 else
   pass "spawn_command() embeds CREWVIA_MUX explicitly for both dispatcher and watchdog (shared function, t043 test fix)"
 fi

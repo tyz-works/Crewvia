@@ -117,9 +117,11 @@ expect_red "case H" "test_a_malformed_capability_is_a_fail_not_silently_true_or_
 
 echo "== case I: mission.yaml が読めないのを「印なし」に潰す"
 fresh_copy
-inject scripts/lint_plan.py "        return False, f\"{path}: {type(e).__name__}: {e}\"
-    value = " "        return False, None
-    value = "
+inject scripts/lint_plan.py "    if problem is not None:
+        return False, problem
+    value = data.get('deliverable_required')" "    if problem is not None:
+        return False, None
+    value = data.get('deliverable_required')"
 expect_red "case I" "test_an_unreadable_mission_yaml_is_a_problem_not_a_no"
 
 echo "== case J: init が mission.yaml に印を書かない"

@@ -101,7 +101,11 @@ expect_red "case B" "test_an_empty_skills_list_fails_because_no_skill_can_produc
 
 echo "== case C: 本物の YAML パーサを丸ごと旧来の手書き行パーサへ戻す (t059 / PR#236 2巡目)"
 fresh_copy
-sed -n '/^#: `can_produce_deliverable` は厳密に/,/^    return caps, None$/p' \
+# t072 で _load_yaml_document() / _StrictBoolLoader が _load_known_skills() /
+# _load_timeout_profiles() / _mission_requires_deliverable() の共有インフラになったため、
+# 置換の範囲は _load_deliverable_capabilities() 関数**だけ**に絞る (共有インフラごと消すと
+# 他の呼び出し元が NameError になり、この case とは無関係な箇所まで壊れる)。
+sed -n '/^def _load_deliverable_capabilities/,/^    return caps, None$/p' \
     "$TREE/scripts/lint_plan.py" > "$WORK/new_block.txt"
 if [ ! -s "$WORK/new_block.txt" ]; then
     echo "FATAL: 置換対象の新実装ブロックが見つからない (マーカーがずれた?)"; exit 2

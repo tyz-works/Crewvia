@@ -290,6 +290,19 @@ class TestCheckDeliverable:
         fails = _fails(lint_plan.check_deliverable([_t("pr", ["research"])], perms))
         assert len(fails) == 1 and "true / false ではありません" in fails[0], fails
 
+    @pytest.mark.parametrize("raw", ["!!bool no", "!!bool yes", "!!bool True", "!!bool on"])
+    def test_an_explicit_bool_tag_is_a_fail_not_silently_true_or_false(self, tmp_path, raw):
+        """4 巡目 (t076) の finding: `!!bool` の明示タグは resolver を経由しないので、
+        resolver だけの厳密化はすり抜ける (欠陥版はこれらをそのまま True/False に丸め込み、
+        `!!bool yes` は PR を作れない skill を「作れる」に通してしまう)。コンストラクタ自体を
+        厳密化すると `yaml.YAMLError` になり、config 全体が「読めない」扱いになる
+        (per-skill の `true / false ではありません` とは別のメッセージ形 — ドキュメント単位の
+        構文エラーなので config 全体が読めなくなる、という違いを反映している)。
+        """
+        perms = _perms(tmp_path, f"  research:\n    can_produce_deliverable: {raw}\n    allow: []\n    deny: []\n")
+        fails = _fails(lint_plan.check_deliverable([_t("pr", ["research"])], perms))
+        assert len(fails) == 1 and "突き合わせられません" in fails[0], fails
+
     def test_a_mission_required_problem_fails_only_if_a_task_needs_the_answer(self, perms):
         assert lint_plan.check_deliverable([_t("pr")], perms, required_problem="boom") == []
         fails = _fails(lint_plan.check_deliverable([_t()], perms, required_problem="boom"))
@@ -489,6 +502,16 @@ class TestMissionMark:
         required, problem = lint_plan._mission_requires_deliverable(
             "m", self._write(tmp_path, '"deliverable_required": true\n'))
         assert (required, problem) == (True, None)
+
+    @pytest.mark.parametrize("value", ["!!bool no", "!!bool yes", "!!bool True", "!!bool on"])
+    def test_an_explicit_bool_tag_does_not_bypass_strict_validation(self, tmp_path, value):
+        """4 巡目 (t076) の finding: 暗黙 resolver の絞り込みは `!!bool` で明示タグ付けされた
+        値には効かない (resolver を経由しないため)。コンストラクタ自体も厳密化していないと、
+        `deliverable_required: !!bool no` が黙って (False, None) になる (欠陥版はこの assert
+        で拾われる — 特に `!!bool yes` は誤って必須ミッションを作ってしまう)。"""
+        required, problem = lint_plan._mission_requires_deliverable(
+            "m", self._write(tmp_path, f"deliverable_required: {value}\n"))
+        assert required is False and problem and "true / false" in problem
 
 
 # ---------------------------------------------------------------------------

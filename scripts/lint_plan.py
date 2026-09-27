@@ -312,10 +312,19 @@ DELIVERABLES_THAT_NEED_A_WRITER = ('pr', 'file')
 #: 「はっきりしない綴り」を黙って true/false のどちらかに倒す挙動であり、この 2 つの欄が守りたい
 #: 性質 (曖昧な値は「不正」として拒否し、既定の安全側 (「作れる」/「必須でない」) へは絶対に
 #: 倒さない) と衝突する。resolver を差し替えて対象を狭める (引用符付きの値は元々 resolver の
-#: 対象外 — 常に文字列なので影響しない)。`yaml.SafeLoader` のサブクラスで、コンストラクタは何も
-#: 足さない (`!!python/object` 等の任意型構築は不可能なまま) — 下の
-#: `yaml.load(..., Loader=_StrictBoolLoader)` は `yaml.safe_load` と同じ安全性で、resolver だけを
-#: 差し替えている。
+#: 対象外 — 常に文字列なので影響しない)。
+#:
+#: **4 巡目 (t076) の finding**: resolver は「タグの無い値をどのタグと見なすか」だけを決め、
+#: `!!bool no` のように **タグを明示した値には効かない** — 明示タグは resolver を経由せず、
+#: PyYAML 既定の緩い bool コンストラクタ (`yes`/`no`/`on`/`off`/大文字小文字混在まで真偽値に
+#: 丸める) にそのまま渡る。`can_produce_deliverable: !!bool yes` が PR を作れない skill を
+#: 「作れる」に通してしまうことを読み取り専用の probe で確認済み。resolver に加えて
+#: **`tag:yaml.org,2002:bool` のコンストラクタ自体も** 厳密化する (`true`/`false` の 2 語しか
+#: 受け付けず、それ以外は `yaml.YAMLError` を送出する) — 暗黙・明示のどちらの経路で
+#: `bool` タグに辿り着いても同じ既定になる。`yaml.SafeLoader` のサブクラスで、`bool` 以外の
+#: コンストラクタは何も足さない (`!!python/object` 等の任意型構築は不可能なまま) — 下の
+#: `yaml.load(..., Loader=_StrictBoolLoader)` は `yaml.safe_load` と同じ安全性で、
+#: `bool` の resolver とコンストラクタだけを差し替えている。
 if yaml is not None:
     class _StrictBoolLoader(yaml.SafeLoader):
         pass
@@ -326,6 +335,27 @@ if yaml is not None:
     }
     _StrictBoolLoader.add_implicit_resolver(
         'tag:yaml.org,2002:bool', re.compile(r'^(?:true|false)$'), list('tf'))
+
+    def _construct_strict_bool(loader: 'yaml.SafeLoader', node: 'yaml.Node') -> bool:
+        """`tag:yaml.org,2002:bool` の構築を `true` / `false` の 2 語だけに絞る。
+
+        暗黙 resolver の絞り込み (上) は、タグの無い値にしか効かない。`!!bool no` のように
+        タグを明示した値は resolver を経由せず直接この constructor に来るため、resolver だけ
+        差し替えても `!!bool` 経由の抜け道が残る (t076 finding)。既定の
+        `SafeConstructor.bool_values` (`yes`/`no`/`on`/`off`/大文字小文字混在) を使わず、
+        ここで `true`/`false` 以外を明示的に拒否する。
+        """
+        value = loader.construct_scalar(node)
+        if value == 'true':
+            return True
+        if value == 'false':
+            return False
+        raise yaml.constructor.ConstructorError(
+            None, None,
+            f"bool は true / false のどちらかだけ (got {value!r})",
+            node.start_mark)
+
+    _StrictBoolLoader.add_constructor('tag:yaml.org,2002:bool', _construct_strict_bool)
 
 
 def _load_yaml_document(path: str, *, missing_is_ok: bool = True) -> tuple[dict, Optional[str]]:

@@ -6,12 +6,21 @@ Worker は task ごとに `.claude/worktrees/<mission_slug>/<task>-<slug>` を�
 手で消すと「今使っている Worker の worktree」「push していないコミットのある worktree」を巻き込みうるので、
 **理由付きで keep / remove を出す**道具にした。
 
+**`--apply` は削除ではなく隔離する (t071 / PR#239 3巡目)。** Codex review で 3 巡連続、「削除してよいかの
+判定が何かを見落とす → 唯一のコピーごと消える」P1 が出た (ignored ファイル・`GIT_DIR` 継承・
+`assume-unchanged`/`skip-worktree` の index フラグ)。見落とし方を列挙して塞ぐやり方は 4 巡目がありうる
+ので、**判定が見落としても復旧できる**ように設計を変えた: `remove` と判定したものは `git worktree remove`
+で消す代わりに `git worktree move` + `git worktree lock` で `.quarantine/` へ移す。**実際に消す操作は
+このツールには無い** — 最終的な削除は人間が手で行う (このツールの外)。
+
 ```
-python3 scripts/worktree_gc.py                # dry-run (既定。何も消さない)
-python3 scripts/worktree_gc.py --quiet        # 集計だけ (remove / keep の件数と keep の理由別件数)
-python3 scripts/worktree_gc.py --json         # 機械可読 (1 行 1 worktree の action / reason / detail)
-python3 scripts/worktree_gc.py --fetch        # 判定の前に git fetch --prune origin
-python3 scripts/worktree_gc.py --apply        # remove と判定したものだけを消す
+python3 scripts/worktree_gc.py                       # dry-run (既定。何も変えない)
+python3 scripts/worktree_gc.py --quiet               # 集計だけ (remove / keep の件数と keep の理由別件数)
+python3 scripts/worktree_gc.py --json                # 機械可読 (1 行 1 worktree の action / reason / detail)
+python3 scripts/worktree_gc.py --fetch                # 判定の前に git fetch --prune origin
+python3 scripts/worktree_gc.py --apply                # remove と判定したものを隔離する (削除しない)
+python3 scripts/worktree_gc.py --list-quarantine      # 隔離済みの一覧 (隔離日時・元の場所)
+python3 scripts/worktree_gc.py --restore <path>       # 隔離を元に戻す (隔離先・元のパスのどちらでもよい)
 ```
 
 `--repo` (既定: カレント。どの worktree からでも主 checkout を辿る) / `--queue` (既定: `$CREWVIA_QUEUE`、無ければ
@@ -30,7 +39,9 @@ python3 scripts/worktree_gc.py --apply        # remove と判定したものだ�
 | 7 | どのプロセスの cwd も worktree の中に無い (Worker の claude・pane のシェル・この実行自身) | `in-use-process` |
 | 8 | 未コミット・untracked の変更が無い (`git status --porcelain --untracked-files=all` が空) | `dirty` |
 | 9 | ignore されている内容も無い (`git status --ignored=matching` が空)。「ignore されている = 捨ててよい」は成り立たない — `.env` 等の secrets・ローカル状態を ignore しているこの repo では `git worktree remove` は `--force` 無しでも ignored ファイルの削除を許すため (PR#239 F1、2026-09-27) | `ignored-files-present` |
-| 10 | HEAD から辿れるコミットがすべて `origin/*` にある (merge 済み、または remote branch に push 済み) | `unpushed-commits` |
+| 10 | `assume-unchanged` / `skip-worktree` の index フラグが付いた tracked ファイルが無い (`git ls-files -v` が空)。どちらのフラグも付いたファイルへの編集は `git status` に**一切出ない** — 空の status は「変わっていない」を示さない (PR#239 3巡目、t071) | `index-flags-present` |
+| 11 | `core.ignoreStat` が有効でない。有効だと、以後の checkout 等で触れたファイルへ自動で assume-unchanged が付き、上の 10 の観測が今後の編集を拾えなくなる (PR#239 3巡目、t071) | `core-ignorestat-enabled` |
+| 12 | HEAD から辿れるコミットがすべて `origin/*` にある (merge 済み、または remote branch に push 済み) | `unpushed-commits` |
 
 判定の順序は安いものから (構造 → mission → 使用中 → git の中身)。最初に当たった keep の理由が出る。
 `--json` の `summary.keep_by_reason` が理由別件数。
@@ -84,28 +95,58 @@ memory `fail-closed-discard-vs-hold` / `evidence-for-destructive-decisions` の�
 これらが残っていると、`git -C candidate status` が実際には **candidate ではなく env の指す別リポジトリ**
 を検査してしまい (git hook の中・別ツールのラッパー経由・`git -C` を多用するセッションなど混入経路は
 複数考えられる)、未コミットの変更があっても「クリーン」に見え、他の条件さえ揃えば remove されうる
-(`--fetch` の `git fetch --prune origin` や `apply_removals` の再判定ステップも同じ `_git_env()` を
+(`--fetch` の `git fetch --prune origin` や `apply_quarantine` の再判定ステップも同じ `_git_env()` を
 通るため影響範囲は同じ)。
 
-## `--apply` の安全策
+## `--apply` の安全策 (隔離。削除しない — PR#239 3巡目、t071)
 
-- `git worktree remove` — **`--force` を使わない** (git が dirty / locked を自分でも断る)。
-- ローカルブランチは `git branch -d` — **`-D` を使わない**。git が merge 済みと認めないなら残す
-  (`branch: kept <name> (...)` と出る。失敗ではない)。detached の worktree はブランチに触れない。
-  worktree を消せなかったときもブランチに触れない。
-- `rm -rf` / `shutil.rmtree` / `unlink` は使わない。remote branch は触らない。
-- **repository-wide の `git worktree prune` は呼ばない** (PR#239 F2、2026-09-27 で削除)。元の実装は
-  `--apply` のたびに全 verdict が keep でも `state.yaml` が読めなくても無条件に走らせており、管理対象
-  ディレクトリの外にある worktree (一度も verdict を出していない対象) のメタデータまで消しうった。
-  移動中・一時的に見えないだけの detached worktree では、未 push のコミットを守る HEAD・reflog が消え、
-  git の紐付けが壊れる。個別に判定した対象は `git worktree remove` (自分が消した登録だけを消す) で消し、
-  それ以外 (`prunable` = ディレクトリが無い判定を含む) は触らない。
-- **消す直前に、その worktree の判定をもう一度やり直す** (dry-run と `--apply` の間に Worker が起動した・変更が
-  入った・mission が active になった、を拾う)。remove でなくなっていれば `skipped`。
+- **`git worktree remove` は呼ばない。** remove と判定したものは `git worktree move <candidate> <隔離先>`
+  で `.claude/worktrees/.quarantine/<timestamp>/<元の相対パス>` へ移し、直後に
+  `git worktree lock --reason "quarantined by worktree_gc <timestamp> orig=<元の絶対パス>"` を付ける。
+  `move` は登録・ブランチ・未コミットの変更をすべて保ったまま移動し、`lock` された worktree は
+  `git worktree prune` でも消えない。
+- `timestamp` は秒精度ではなく `%Y%m%d-%H%M%S-%f` (マイクロ秒まで)。同じ元パスを 2 回に分けて隔離する
+  2 回の `--apply` が同じ秒に収まると、秒精度では隔離先が文字列として一致し 2 回目が「隔離先が既に存在
+  する」で失敗する (`second-precision-timestamp-is-not-a-generation` と同型。世代として突き合わせる値は
+  衝突してはいけない)。
+- **`git branch -d` / `-D` も呼ばない** — 隔離では branch に触れる理由が無い (branch は移動した worktree
+  にそのまま残る)。`rm -rf` / `shutil.rmtree` / `unlink` は使わない。remote branch は触らない。
+- 隔離先が既に存在する場合は **`git worktree move` を呼ばずに失敗として報告する**。空ディレクトリで
+  あっても `git worktree move` は「その中へ移す」(`mv` と同じ挙動) なので、既存の何かを上書きすることは
+  ないが、意図しない場所への配置になりうる (`git worktree move` 自身は「成功」を返すので、これを見落とすと
+  誤配置に気付けない)。
+- `git worktree move` が失敗する場合 (submodule を含む worktree 等) は、**削除にフォールバックせず keep**
+  にする (族A — 安全な操作の失敗を、より危険な操作へのフォールバックの合図にしない)。
+- **repository-wide の `git worktree prune` は呼ばない** (PR#239 F2、2026-09-27 で削除。隔離設計でも
+  この制約は変わらず有効)。元の実装は `--apply` のたびに全 verdict が keep でも `state.yaml` が読めなくても
+  無条件に走らせており、管理対象ディレクトリの外にある worktree (一度も verdict を出していない対象) の
+  メタデータまで消しうった。
+- **隔離する直前に、その worktree の判定をもう一度やり直す** (dry-run と `--apply` の間に Worker が起動した・
+  変更が入った・mission が active になった、を拾う)。remove でなくなっていれば `skipped`。
 - 1 件の失敗で止めない。失敗は報告して次へ進み、終了コード 1。
+- **実際の削除はこのツールの外。** 隔離された worktree を最終的に消すかどうかは人間が判断する。
 - これらは `tests/test_worktree_gc.py::TestNoForcefulOperations` が **AST で固定**している
   (`run_git(...)` の literal 引数から verb / flag を洗い出し、`--force` / `-f` / `-D` / `--hard` 等が
-  1 つでも増えたら赤。ファイルを直接消す呼び出しも赤。`("worktree", "prune")` の呼び出しも赤にする)。
+  1 つでも増えたら赤。ファイルを直接消す呼び出しも赤。`worktree remove` / `worktree prune` / `branch` の
+  呼び出しが 1 つでもあれば赤 — 隔離設計では削除する verb 自体が存在しない）。
+
+## 隔離領域そのものの扱い
+
+- worktree_gc 自身の走査対象から `.quarantine/` を外す。根拠は「パスが `.quarantine/` 配下」**だけでなく**
+  「lock の reason が worktree_gc の印 (`quarantined by worktree_gc <timestamp> orig=<path>`) である」でも
+  確かめる (`_is_our_quarantine_entry()`。族B: 対象の同定 — 片方だけずれている組み合わせは通常の運用では
+  起きないので、そのまま「隔離済みで安全」と信用せず通常の分類に進ませる)。
+- `.claude/worktrees/` は `.gitignore` 済みなので、その下の `.quarantine/` も追跡対象にならない。
+
+## 隔離の運用 (一覧・復旧・最終削除)
+
+- `--list-quarantine` (`--json` 可): 隔離済みの worktree を隔離日時・元の場所つきで一覧する。
+- `--restore <path>`: 隔離を元に戻す (unlock + move back)。`<path>` は隔離先・隔離される前の元のパスの
+  どちらでもよい。**元の場所に既に何かあれば上書きせず拒否する** (`git worktree move` は既存ディレクトリを
+  「その中へ移す」ので、素通しすると誤配置になる)。同じ元パスが複数回隔離されて一意に決まらないときは
+  隔離先のパスを直接指定するよう求める (`--list-quarantine` で一覧してから指定する)。
+- **最終的な削除はこのツールの外、人間が手で行う** (`git worktree remove` / `rm -rf` 等。隔離した worktree
+  を眺めて安全だと確認したあとで)。このツール自身は削除する経路を持たない。
 
 ## 限界 (知っておくこと)
 
@@ -119,18 +160,24 @@ memory `fail-closed-discard-vs-hold` / `evidence-for-destructive-decisions` の�
   そのうち約 140 は `.crewvia-env` (`.gitignore` 登録前に作られた worktree では追跡または untracked) だけの差。
   これを「変更なし」と読むかは Director の判断 (この道具は読まない。ファイル名で例外を作ると、本物の変更を
   消す穴になりうる)。
-- 戻せない操作は `git worktree remove` と `git branch -d` だけ。コミットが origin にあれば
-  `git worktree add <path> origin/<branch>` / `git checkout -b <branch> origin/<branch>` で作り直せる。
+- **戻せない操作はこのツールには無い** (PR#239 3巡目、t071 以降)。`--apply` がやるのは `git worktree move`
+  + `git worktree lock` だけで、どちらも `--restore` で完全に戻せる (unlock + move back。ファイル・登録・
+  branch のすべてが戻る)。実際に消す操作 (`git worktree remove` や `rm -rf`) はこのツールの外、人間の
+  判断で行う。
 
 ## 戻し方
 
 この道具は **`--apply` を付けない限り何も変えない**。共有規則ではなく (dispatcher / plan.sh は読まない)、
 env の停止スイッチも付けていない。PR を revert すれば道具が無くなるだけで、稼働中のものへの影響は無い
-(デーモンの再起動も要らない)。`--apply` で消した worktree を戻したいときは上の「限界」の最後の項。
+(デーモンの再起動も要らない)。`--apply` で隔離した worktree を戻したいときは `--restore` (上の「隔離の運用」)。
 
 ## 検証
 
 - `python3 -m pytest tests/test_worktree_gc.py -q` — 一時 git repo (origin = bare) と隔離した queue / registry で、
-  各条件の keep / remove・観測できない場合の保留・`--apply` しても keep が残る・再判定・`-D` / `--force` を使わない。
-- 赤の実証: `bash tests/red_proof_t033.sh` (27 ケース。W/X/Y は PR#239 1巡目の Codex findings 3 件 (t057)、
-  Z/AA は PR#239 2巡目の findings 2 件 (t064: GIT_DIR 系の継承・`/proc` stat の EACCES 扱い))。
+  各条件の keep / remove・観測できない場合の保留・隔離しても keep が残る・再判定・`--restore` の往復・
+  `-D` / `--force` / `worktree remove` / `branch` を一切呼ばない、を確かめる。
+- 赤の実証: `bash tests/red_proof_t033.sh` (baseline + 31 ケース。W/X/Y は PR#239 1巡目の Codex findings 3 件
+  (t057)、Z/AA は PR#239 2巡目の findings 2 件 (t064: GIT_DIR 系の継承・`/proc` stat の EACCES 扱い)、
+  BB〜FF は PR#239 3巡目の findings (t071: index フラグ / `core.ignoreStat` の検出漏れ・隔離設計への回帰
+  ３パターン)。P (branch を `-D` で消す) は t071 で退役 — 隔離設計になり branch を消す経路自体が
+  無くなったため)。

@@ -61,6 +61,9 @@ lib ごとの**破ってはいけない契約**の要約。理由・経緯・全
 
 ## worktree_gc.py
 
-- 既定は dry-run。`--apply` は `git worktree remove`（`--force` 無し）と `git branch -d`（`-D` 無し）だけ。`rm -rf` 系は使わない
-  （`tests/test_worktree_gc.py::TestNoForcefulOperations` が AST で固定）。remove は全条件を満たしたものだけで、
-  読めない・git が失敗・プロセス表を取れない、は keep（`knowledge/worktree-gc.md`）。消す直前に判定をやり直す。
+- 既定は dry-run。`--apply` は remove と判定したものを **削除せず隔離する**（`git worktree move` +
+  `git worktree lock`。`git worktree remove` / `git branch -d` / `rm -rf` はどれも呼ばない — 実際の削除は
+  このツールの外、人間が手で行う。`tests/test_worktree_gc.py::TestNoForcefulOperations` が AST で固定）。
+  隔離は `--restore` で完全に戻せる。remove 判定は全条件を満たしたものだけで、読めない・git が失敗・
+  プロセス表を取れない・index フラグ（assume-unchanged/skip-worktree）が付いている、は keep
+  （`knowledge/worktree-gc.md`）。隔離する直前に判定をやり直す。

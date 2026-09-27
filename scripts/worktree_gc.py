@@ -6,9 +6,25 @@
 「push していないコミットのある worktree」を巻き込みうるので、**理由付きで keep / remove を出す**
 仕組みにする。
 
-    python3 scripts/worktree_gc.py                 # dry-run (既定。何も消さない・何も書かない)
-    python3 scripts/worktree_gc.py --apply         # remove と判定したものだけを消す
+    python3 scripts/worktree_gc.py                 # dry-run (既定。何も変えない・何も書かない)
+    python3 scripts/worktree_gc.py --apply         # remove と判定したものだけを隔離する (削除しない)
     python3 scripts/worktree_gc.py --json          # 機械可読
+    python3 scripts/worktree_gc.py --list-quarantine   # 隔離済みの一覧
+    python3 scripts/worktree_gc.py --restore <隔離先 or 元のパス>   # 隔離を元に戻す
+
+## `--apply` は削除ではなく隔離する (t071 / PR#239 3巡目)
+
+Codex review で 3 巡連続、「削除してよいかの判定が何かを見落とす → 唯一のコピーごと消える」P1 が出た
+(t057: ignored ファイル、t064: `GIT_DIR` 継承、t071: `assume-unchanged`/`skip-worktree` の index フラグ)。
+見落とし方を列挙して塞ぐやり方は 4 巡目がありうる (`core.ignoreStat=true` は新しいエントリに
+assume-unchanged を自動で付けるので、設定 1 つで大量に目隠しされる、等)。**判定が見落としても
+復旧できるようにする**ため、`--apply` は remove と判定したものを `git worktree remove` で消す代わりに、
+`git worktree move` で `.claude/worktrees/.quarantine/<YYYYMMDD-HHMMSS>/<元の相対パス>` へ移し、
+`git worktree lock` を付ける。**`git worktree remove` / `git branch -d` / `git worktree prune` は
+一切呼ばない。実際の削除はこのツールの外、人間が手で行う。** 元に戻すには `--restore`。
+
+判定 (`classify()`) の条件そのものは変えていない — 隔離は復旧できるが、clean でないものを隔離候補に
+しないことは引き続き重要 (隔離に気付かず作業を失ったと思わせないため)。
 
 ## remove にしてよいのは、次を **すべて** 満たすものだけ
 
@@ -21,7 +37,12 @@
 5. ignore されている内容も無い (`git status --ignored=matching` が空)。「ignore されている = 捨ててよい」
    は成り立たない (`.env` 等の secrets・ローカル状態を ignore しているこの repo では、`git worktree remove`
    は `--force` 無しでも ignored ファイルの削除を許すため)。捨ててよいと明示的に確立できていない限り keep
-6. HEAD から辿れるコミットがすべて `origin/*` にある (merge 済み、または remote branch に push 済み)
+6. `assume-unchanged` / `skip-worktree` の index フラグが付いた tracked ファイルが無い (`git ls-files -v`
+   が空)。どちらのフラグも付いたファイルへの編集は `git status` に **一切出ない** — 空の status は
+   「tracked ファイルが変わっていない」を示さない。1 つでもあれば keep (t071 / PR#239 3巡目)
+7. `core.ignoreStat` が有効でない。有効だと、以後の checkout 等で触れたファイルへ自動で
+   assume-unchanged が付き、6 の観測が今後の編集を拾えなくなる (t071 / PR#239 3巡目)
+8. HEAD から辿れるコミットがすべて `origin/*` にある (merge 済み、または remote branch に push 済み)
 
 ## 判定できないものは keep (破棄ではなく保留)
 
@@ -31,17 +52,25 @@
 
 ## `--apply` の安全策
 
-- `git worktree remove` (**`--force` を使わない**。git が dirty / locked を自分でも断る)。
-  ローカルブランチは `git branch -d` (**`-D` を使わない**。merge 済みと git が認めないなら残す)。
-  `rm -rf` は使わない。remote branch は触らない。
-- **repository-wide の `git worktree prune` は呼ばない。** `git worktree remove` は自分が消した対象の
-  登録だけを消すので、他の worktree には触れない。`prune` は管理対象ディレクトリの外にある worktree
-  (一度も verdict を出していない = 検証していない) のメタデータまで対象にしてしまい、移動中・一時的に
-  見えないだけの detached worktree の HEAD・reflog を消しうる。破壊の根拠は分類ではなく観測 (対象の同定)
-  に乗せる — 個別に verdict を出した対象だけを `git worktree remove` で消す
-- 消す直前に、その worktree の判定を **もう一度** やり直し、remove でなくなっていたら消さない
+- **`git worktree remove` は呼ばない。** 代わりに `git worktree move <candidate> <隔離先>` で
+  `.claude/worktrees/.quarantine/<timestamp>/<元の相対パス>` へ移し、直後に
+  `git worktree lock --reason "quarantined by worktree_gc <timestamp> orig=<元の絶対パス>"` を付ける。
+  `git worktree move` は登録・ブランチ・未コミットの変更をすべて保ったまま移動し、`lock` された
+  worktree は `git worktree prune` でも消えない。**`git branch -d` / `-D` も呼ばない** — 隔離では
+  branch に触れる理由が無い (branch は移動した worktree にそのまま残る)。`rm -rf` は使わない。
+  remote branch は触らない。
+- **repository-wide の `git worktree prune` は呼ばない。** (t057 で削除済み。隔離は個別の対象だけを
+  `git worktree move` で動かすので、この制約は変わらず有効)
+- 隔離先が既に存在する場合は **`git worktree move` を呼ばずに失敗として報告する** — 空ディレクトリで
+  あっても `git worktree move` は「その中へ移す」(Unix の `mv` と同じ挙動) ので、既存の何かの上に
+  上書きすることはないが、意図しない場所への配置になりうる (族A: `git worktree move` 自身は成功
+  ("成功" というエラー無し)を返すため、これを見落とすと誤配置が起きたことに気付けない)。
+- `git worktree move` が失敗する場合 (submodule を含む worktree 等) は、**削除にフォールバックせず
+  keep** にする (族A — 安全な操作の失敗を、より危険な操作へのフォールバックの合図にしない)。
+- 隔離する直前に、その worktree の判定を **もう一度** やり直し、remove でなくなっていたら隔離しない
   (dry-run から --apply までに Worker が起動した・変更が入った、を拾う)。
 - 1 件の失敗で止めない (失敗は報告して次へ。終了コード 1)。
+- **実際の削除はこのツールの外。** 隔離された worktree を最終的に消すかどうかは人間が判断する。
 
 ## 限界 (知っておくこと)
 
@@ -49,8 +78,9 @@
   `git fetch --prune origin` してから判定する (merge 後に remote branch が消えていれば、squash merge の
   ブランチは「push 済みと確かめられない」= keep になる。それが保留の向き)。
 - プロセスの cwd は Linux の `/proc`、無ければ `lsof` で見る。どちらも使えなければ全部 keep。
-- 戻せない操作は `git worktree remove` と `git branch -d` だけ。どちらも、コミットが origin にあれば
-  `git worktree add` / `git checkout -b <branch> origin/<branch>` で作り直せる。
+- **戻せない操作はこのツールには無い。** `--apply` がやるのは `git worktree move` + `git worktree lock`
+  だけで、どちらも `--restore` で完全に戻せる (unlock + move back)。実際に消す操作 (`git worktree remove`
+  や `rm -rf`) はこのツールの外、人間の判断で行う。
 
 ## 停止スイッチは無い
 
@@ -64,10 +94,12 @@ import argparse
 import errno
 import json
 import os
+import re
 import subprocess
 import sys
 from collections import Counter
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -98,13 +130,36 @@ R_IN_USE_PROCESS = 'in-use-process'
 R_STATUS_FAILED = 'git-status-failed'
 R_DIRTY = 'dirty'
 R_IGNORED = 'ignored-files-present'
+R_INDEX_FLAGS = 'index-flags-present'
+R_LS_FILES_FAILED = 'ls-files-failed'
+R_IGNORE_STAT = 'core-ignorestat-enabled'
+R_CONFIG_CHECK_FAILED = 'config-check-failed'
 R_HEAD_UNRESOLVED = 'head-unverifiable'
 R_UNPUSHED = 'unpushed-commits'
+R_QUARANTINED = 'already-quarantined'
 
 GIT_TIMEOUT_SECONDS = 120
 
 #: プロセス表の場所 (テストが偽の /proc に向ける)。
 PROC_ROOT = Path('/proc')
+
+#: 隔離領域の名前 (`<managed_root>/.quarantine/<timestamp>/<元の相対パス>`)。
+QUARANTINE_DIRNAME = '.quarantine'
+
+#: `git worktree lock --reason` に埋め込む印。`--restore` はこれを手がかりに元のパスへ戻す。
+#: タイムスタンプ・元のパスのどちらにも空白を含みうるので、`orig=` は行の最後に置き、そこから先を
+#: まるごと元のパスとして読む (`re.match` の `(.*)$` — パスの途中にどんな文字があっても崩れない)。
+_QUARANTINE_REASON_RE = re.compile(r'^quarantined by worktree_gc (\S+) orig=(.*)$')
+
+
+def _quarantine_reason(timestamp: str, original_abs_path: str) -> str:
+    return f'quarantined by worktree_gc {timestamp} orig={original_abs_path}'
+
+
+def _parse_quarantine_reason(reason: str) -> Optional[tuple[str, str]]:
+    """`(timestamp, 元の絶対パス)`。このツールが付けた印でなければ None。"""
+    m = _QUARANTINE_REASON_RE.match(reason)
+    return (m.group(1), m.group(2)) if m else None
 
 
 # ---------------------------------------------------------------------------
@@ -153,6 +208,7 @@ class Worktree:
     detached: bool = False
     bare: bool = False
     locked: bool = False
+    locked_reason: Optional[str] = None   # `locked` の値部分。reason 無しの lock は '' のまま
     prunable: bool = False
 
 
@@ -183,6 +239,7 @@ def parse_worktree_list(raw: str) -> list[Worktree]:
             cur.bare = True
         elif key == 'locked':
             cur.locked = True
+            cur.locked_reason = value
         elif key == 'prunable':
             cur.prunable = True
     if cur is not None:
@@ -395,6 +452,24 @@ def mission_slug_of(wt_real: str, managed_root: str) -> Optional[str]:
     return parts[0]
 
 
+def quarantine_root_of(managed_root: str) -> str:
+    return os.path.join(managed_root, QUARANTINE_DIRNAME)
+
+
+def _is_our_quarantine_entry(wt: Worktree, wt_real: str, managed_root: str) -> bool:
+    """すでにこのツールが隔離した worktree か。
+
+    **根拠は 2 つの一致 (族B: 対象の同定)** — パスが `.quarantine/` 配下「だけ」でも、lock の reason が
+    このツールの印「だけ」でも判定しない。片方だけずれている (パスは隔離領域だが reason が無い/別物、
+    または reason はこのツールの印だが `.quarantine/` の外) のは、通常の運用では起きない組み合わせで
+    あり、そのまま「隔離済みで安全」と信用せず通常の分類に進ませる (何かを黙って見落とすより、
+    もう一度普通に判定させる方が安全な向き)。
+    """
+    under_quarantine = _within(wt_real, quarantine_root_of(managed_root))
+    marked = bool(wt.locked and wt.locked_reason and _parse_quarantine_reason(wt.locked_reason))
+    return under_quarantine and marked
+
+
 def classify(wt: Worktree, ctx: Context, is_main: bool = False) -> Verdict:
     """1 つの worktree を分類する。最初に当たった keep の理由を返し、全部通れば remove。
 
@@ -408,6 +483,8 @@ def classify(wt: Worktree, ctx: Context, is_main: bool = False) -> Verdict:
     wt_real = os.path.realpath(wt.path)
     if is_main or wt_real == ctx.repo or wt.bare:
         return keep(R_MAIN)
+    if _is_our_quarantine_entry(wt, wt_real, ctx.managed_root):
+        return keep(R_QUARANTINED, '`--restore` で元に戻すか、`--list-quarantine` で一覧を見る')
     slug = mission_slug_of(wt_real, ctx.managed_root)
     if slug is None:
         return keep(R_OUTSIDE, f'{ctx.managed_root}/<mission>/<name> の外')
@@ -444,6 +521,26 @@ def classify(wt: Worktree, ctx: Context, is_main: bool = False) -> Verdict:
             return keep(R_IN_USE_PROCESS, f'pid {pid} の cwd = {cwd}')
 
     # --- git の中身 ---
+    # `core.ignoreStat=true` は以後の checkout 等で触れたファイルへ自動で assume-unchanged を付ける。
+    # 効いていれば、この時点で 1 件もフラグが無くても今後の編集が git status から見えなくなりうる
+    # ので keep にする (t071 / PR#239 3巡目)。`git config` は system/global/local/worktree の実効値を
+    # 見る (`--local` を付けない) — このツールが実際に信頼する git 呼び出しが読む値と一致させるため。
+    rc, out, err = run_git(wt.path, 'config', '--bool', 'core.ignoreStat')
+    if rc == 0:
+        if out.strip() == 'true':
+            return keep(R_IGNORE_STAT, 'core.ignoreStat=true (今後の編集が status から見えなくなりうる)')
+    elif rc != 1:                                  # rc=1 は「未設定」(既定 false) — 失敗ではない
+        return keep(R_CONFIG_CHECK_FAILED, (err or 'git を実行できない').strip()[:200])
+
+    # assume-unchanged (小文字) / skip-worktree ('S') が付いた tracked ファイルへの編集は
+    # `git status` に一切出ない。空の status は「変わっていない」を示さない (t071 / PR#239 3巡目)。
+    rc, out, err = run_git(wt.path, 'ls-files', '-v')
+    if rc != 0:
+        return keep(R_LS_FILES_FAILED, (err or 'git を実行できない').strip()[:200])
+    flagged = [line for line in out.splitlines() if line and (line[0].islower() or line[0] == 'S')]
+    if flagged:
+        return keep(R_INDEX_FLAGS, f'{len(flagged)} 件 (先頭: {flagged[0]})')
+
     rc, out, err = run_git(wt.path, 'status', '--porcelain=v1', '--untracked-files=all', '--ignored=matching')
     if rc != 0:
         return keep(R_STATUS_FAILED, (err or 'git を実行できない').strip()[:200])
@@ -480,15 +577,28 @@ def classify_all(repo: str, queue: str) -> tuple[list[Verdict], Optional[str]]:
 
 
 # ---------------------------------------------------------------------------
-# --apply
+# --apply (隔離。削除しない)
 # ---------------------------------------------------------------------------
 
-def apply_removals(repo: str, queue: str, verdicts: list[Verdict]) -> list[dict]:
-    """remove と判定したものを 1 件ずつ、**判定をやり直してから** 消す。結果のリストを返す。
+def _quarantine_destination(managed_root: str, timestamp: str, wt_real: str) -> str:
+    rel = os.path.relpath(wt_real, managed_root)
+    return os.path.join(quarantine_root_of(managed_root), timestamp, rel)
 
-    `--force` / `-D` / `rm -rf` は使わない。worktree の除去が失敗したらブランチには触れない。
+
+def apply_quarantine(repo: str, queue: str, verdicts: list[Verdict]) -> list[dict]:
+    """remove と判定したものを 1 件ずつ、**判定をやり直してから** 隔離する (削除しない)。
+
+    `git worktree move` + `git worktree lock` だけを使う。`git worktree remove` / `git branch -d` /
+    `rm -rf` は呼ばない — branch は移動した worktree にそのまま残る。隔離先が既に存在する・
+    `git worktree move` 自体が失敗する、はどちらも削除にフォールバックせず `failed` にする (族A)。
+    1 回の `--apply` で隔離したものは全部同じタイムスタンプの下に入る。
     """
     results = []
+    managed_root = os.path.join(os.path.realpath(repo), '.claude', 'worktrees')
+    # 秒精度だと、同じ元パスを 2 回に分けて隔離する 2 回の `--apply` が同じ秒に収まった瞬間、隔離先が
+    # 文字列として一致し、2 回目が「隔離先が既に存在する」で failed になる (quarantine が世代として
+    # 突き合わせる値である以上、衝突してはいけない。crewvia の `now_generation()` と同じ理由)。
+    timestamp = datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S-%f')
     for v in verdicts:
         if v.action != REMOVE:
             continue
@@ -505,22 +615,126 @@ def apply_removals(repo: str, queue: str, verdicts: list[Verdict]) -> list[dict]
             results.append({'path': v.path, 'status': 'skipped',
                             'detail': f'再判定で keep になった ({again.reason}: {again.detail})'})
             continue
-        rc, _out, err = run_git(repo, 'worktree', 'remove', v.path)
+        wt_real = os.path.realpath(current.path)
+        dest = _quarantine_destination(managed_root, timestamp, wt_real)
+        if os.path.exists(dest):
+            # `git worktree move` は既存のディレクトリ (空でも) を「その中へ移す」— 上書きはしないが
+            # 意図しない場所への配置になる。ここで先に拒否し、move 自体を呼ばない (族A)。
+            results.append({'path': v.path, 'status': 'failed',
+                            'detail': f'隔離先が既に存在するので隔離しない: {dest}'})
+            continue
+        try:
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+        except OSError as e:
+            results.append({'path': v.path, 'status': 'failed', 'detail': f'隔離先を作れない: {e}'})
+            continue
+        rc, _out, err = run_git(repo, 'worktree', 'move', current.path, dest)
+        if rc != 0:
+            # submodule を含む worktree 等で move が失敗しうる。削除にフォールバックせず keep (族A)。
+            results.append({'path': v.path, 'status': 'failed',
+                            'detail': f'git worktree move: {(err or "実行できない").strip()[:300]}'})
+            continue
+        reason = _quarantine_reason(timestamp, wt_real)
+        rc, _out, err = run_git(repo, 'worktree', 'lock', '--reason', reason, dest)
         if rc != 0:
             results.append({'path': v.path, 'status': 'failed',
-                            'detail': f'git worktree remove: {(err or "実行できない").strip()[:300]}'})
+                            'detail': (f'{dest} へ移動したが lock に失敗した (手で `git worktree lock` '
+                                       f'すること): {(err or "実行できない").strip()[:300]}')})
             continue
-        entry = {'path': v.path, 'status': 'removed', 'detail': '', 'branch': None}
-        branch = current.branch
-        if branch and branch.startswith('refs/heads/'):
-            name = branch[len('refs/heads/'):]
-            rc, _out, err = run_git(repo, 'branch', '-d', name)
-            if rc == 0:
-                entry['branch'] = f'deleted {name}'
-            else:
-                entry['branch'] = f'kept {name} ({(err or "実行できない").strip()[:200]})'
-        results.append(entry)
+        results.append({'path': v.path, 'status': 'quarantined', 'detail': dest})
     return results
+
+
+# ---------------------------------------------------------------------------
+# --restore / --list-quarantine
+# ---------------------------------------------------------------------------
+
+def find_quarantine_entries(repo: str) -> tuple[Optional[list[tuple[Worktree, str, str]]], str]:
+    """`([(worktree, 隔離日時, 元の絶対パス), ...], 問題)`。`list_worktrees` が失敗したら `(None, 理由)`。"""
+    worktrees, problem = list_worktrees(repo)
+    if worktrees is None:
+        return None, problem
+    managed_root = os.path.join(os.path.realpath(repo), '.claude', 'worktrees')
+    out = []
+    for wt in worktrees:
+        wt_real = os.path.realpath(wt.path)
+        if not _is_our_quarantine_entry(wt, wt_real, managed_root):
+            continue
+        parsed = _parse_quarantine_reason(wt.locked_reason)
+        out.append((wt, parsed[0], parsed[1]))
+    return out, ''
+
+
+def cmd_list_quarantine(repo: str, as_json: bool) -> int:
+    entries, problem = find_quarantine_entries(repo)
+    if entries is None:
+        print(f'worktree 一覧を取れませんでした: {problem}', file=sys.stderr)
+        return 1
+    if as_json:
+        print(json.dumps([{'path': wt.path, 'quarantined_at': ts, 'original_path': orig}
+                          for wt, ts, orig in entries], ensure_ascii=False, indent=2))
+        return 0
+    if not entries:
+        print('隔離されている worktree はありません')
+        return 0
+    for wt, ts, orig in entries:
+        print(f'{wt.path}\n  隔離日時: {ts}\n  元の場所: {orig}')
+    return 0
+
+
+def cmd_restore(repo: str, given_path: str, as_json: bool) -> int:
+    """隔離を元に戻す。引数は隔離先のパス、または隔離される前の元のパスのどちらでもよい。
+
+    元の場所に既に何かあれば **上書きせず拒否する** (`git worktree move` は既存ディレクトリを
+    「その中へ移す」ので、素通しすると誤配置になる)。
+    """
+    entries, problem = find_quarantine_entries(repo)
+    if entries is None:
+        print(f'worktree 一覧を取れませんでした: {problem}', file=sys.stderr)
+        return 1
+    given_real = os.path.realpath(given_path)
+    by_quarantine_path = [e for e in entries if os.path.realpath(e[0].path) == given_real]
+    by_original_path = [e for e in entries if os.path.realpath(e[2]) == given_real]
+    candidates = by_quarantine_path or by_original_path
+    if not candidates:
+        print(f'{given_path}: 隔離エントリが見つかりません '
+              f'(隔離先のパス、または隔離される前の元のパスを指定すること。--list-quarantine で一覧)',
+              file=sys.stderr)
+        return 1
+    if len(candidates) > 1:
+        print(f'{given_path}: 複数の隔離エントリが該当します。隔離先のパスを直接指定すること:', file=sys.stderr)
+        for wt, ts, _orig in candidates:
+            print(f'  {wt.path} (隔離日時: {ts})', file=sys.stderr)
+        return 1
+    wt, _ts, orig = candidates[0]
+    if os.path.exists(orig):
+        print(f'{orig}: 既に何かある。上書きしないので中止する (隔離先 {wt.path} は変更していません)',
+              file=sys.stderr)
+        return 1
+    try:
+        os.makedirs(os.path.dirname(orig), exist_ok=True)
+    except OSError as e:
+        print(f'{orig} の親ディレクトリを作れません (隔離先は変更していません): {e}', file=sys.stderr)
+        return 1
+    rc, _out, err = run_git(repo, 'worktree', 'unlock', wt.path)
+    if rc != 0:
+        print(f'{wt.path} の unlock に失敗しました (何も動かしていません): '
+              f'{(err or "実行できない").strip()[:300]}', file=sys.stderr)
+        return 1
+    rc, _out, err = run_git(repo, 'worktree', 'move', wt.path, orig)
+    if rc != 0:
+        # unlock は済んだが move できなかった。保護を失った状態で放置しないよう再ロックを試みる
+        # (ベストエフォート — 失敗してもその旨を報告するだけで、これ以上は何もしない)。
+        relock_rc, _o, relock_err = run_git(repo, 'worktree', 'lock', '--reason', wt.locked_reason, wt.path)
+        relock_note = '' if relock_rc == 0 else f' (再ロックにも失敗: {(relock_err or "").strip()[:200]})'
+        print(f'{wt.path} を {orig} へ move できませんでした{relock_note}: '
+              f'{(err or "実行できない").strip()[:300]}', file=sys.stderr)
+        return 1
+    if as_json:
+        print(json.dumps({'restored': wt.path, 'to': orig}, ensure_ascii=False, indent=2))
+    else:
+        print(f'{wt.path} を {orig} へ復元しました')
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -547,22 +761,27 @@ def format_text(verdicts: list[Verdict], applied: Optional[list[dict]], quiet: b
     for reason, n in s['keep_by_reason'].items():
         lines.append(f'  keep {reason}: {n}')
     if applied is None:
-        lines.append('dry-run (何も消していません)。消すには --apply')
+        lines.append('dry-run (何も変えていません)。remove と判定したものを隔離するには --apply')
     else:
         counts = Counter(r['status'] for r in applied)
-        lines.append(f"apply: removed {counts.get('removed', 0)} / skipped {counts.get('skipped', 0)}"
+        lines.append(f"apply: quarantined {counts.get('quarantined', 0)} / skipped {counts.get('skipped', 0)}"
                      f" / failed {counts.get('failed', 0)}")
         for r in applied:
-            if r['status'] != 'removed':
+            if r['status'] == 'quarantined':
+                lines.append(f"  quarantined: {r['path']} -> {r['detail']}")
+            else:
                 lines.append(f"  {r['status']}: {r['path']} — {r['detail']}")
-            elif r.get('branch'):
-                lines.append(f"  branch: {r['branch']}  ({r['path']})")
     return '\n'.join(lines)
 
 
 def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(description='古い Worker worktree を安全に片付ける (既定は dry-run)')
-    ap.add_argument('--apply', action='store_true', help='remove と判定したものを実際に消す')
+    ap = argparse.ArgumentParser(
+        description='古い Worker worktree を安全に片付ける (既定は dry-run。--apply は削除ではなく隔離)')
+    mode = ap.add_mutually_exclusive_group()
+    mode.add_argument('--apply', action='store_true', help='remove と判定したものを隔離する (削除しない)')
+    mode.add_argument('--restore', metavar='PATH', default=None,
+                      help='隔離を元に戻す。PATH は隔離先・隔離される前の元のパスのどちらでもよい')
+    mode.add_argument('--list-quarantine', action='store_true', help='隔離済みの worktree の一覧を出す')
     ap.add_argument('--repo', default='.', help='主 checkout (または任意の worktree) のパス。既定: カレント')
     ap.add_argument('--queue', default=None,
                     help='queue ディレクトリ。既定: $CREWVIA_QUEUE、無ければ <主 checkout>/queue')
@@ -576,6 +795,12 @@ def main(argv=None) -> int:
         print(f'worktree 一覧を取れませんでした: {problem or "空"}', file=sys.stderr)
         return 1
     repo = worktrees[0].path            # 先頭は常に主 checkout
+
+    if args.list_quarantine:
+        return cmd_list_quarantine(repo, args.json)
+    if args.restore is not None:
+        return cmd_restore(repo, args.restore, args.json)
+
     queue = args.queue or os.environ.get('CREWVIA_QUEUE') or os.path.join(repo, 'queue')
 
     if args.fetch:
@@ -590,7 +815,7 @@ def main(argv=None) -> int:
         print(f'worktree 一覧を取れませんでした: {problem}', file=sys.stderr)
         return 1
 
-    applied = apply_removals(repo, queue, verdicts) if args.apply else None
+    applied = apply_quarantine(repo, queue, verdicts) if args.apply else None
 
     if args.json:
         print(json.dumps({'summary': summarize(verdicts), 'applied': applied,

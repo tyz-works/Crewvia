@@ -18,9 +18,11 @@
 #   L  queue/missions に残っている (archive されていない) mission も remove にする   → 赤
 #   M  mission ディレクトリを観測できなくても「無い」と読む                          → 赤
 #   N  --apply が消す直前の再判定をしない                                            → 赤
-#   O  worktree の除去に --force を付ける                                            → 赤
-#   P  ブランチを -D で消す                                                          → 赤
-#   Q  dry-run でも消す                                                              → 赤
+#   O  worktree の隔離 (move) に --force を付ける                                    → 赤
+#   P  (退役: t071 で --apply が削除ではなく隔離になり、branch を消さなくなったので
+#      「-D で消す」という対象自体が無くなった。branch に一切触れないことは
+#      test_quarantine_never_calls_worktree_remove_or_branch_delete が守る)
+#   Q  dry-run でも隔離する                                                          → 赤
 #   R  cwd を読めないプロセスを、証明なしに無害と読む                                → 赤
 #   S  同じ uid のプロセスの cwd を読めなくても、取れたことにする                    → 赤
 #   T  git status の失敗を clean と読む                                              → 赤
@@ -31,6 +33,11 @@
 #   Y  lsof が非 0 でも部分出力を完全なスキャンとみなす                              → 赤 (t057 / PR#239 F3)
 #   Z  GIT_DIR/GIT_WORK_TREE 等を継承し、-C の指定を上書きさせる                     → 赤 (t064 / PR#239 2巡目 P1)
 #   AA stat の EACCES 等 ENOENT/ESRCH 以外の OSError も「消えた」に潰す              → 赤 (t064 / PR#239 2巡目 P2)
+#   BB assume-unchanged / skip-worktree の index フラグ検出を外す                    → 赤 (t071 / PR#239 3巡目)
+#   CC core.ignoreStat=true の検出を外す                                            → 赤 (t071 / PR#239 3巡目)
+#   DD --apply が git worktree remove を呼ぶ (隔離ではなく削除に戻す)               → 赤 (t071 / PR#239 3巡目)
+#   EE git worktree move の失敗を削除にフォールバックする                          → 赤 (t071 / PR#239 3巡目)
+#   FF 隔離先が既に存在してもそのまま move を呼ぶ (上書きの危険)                    → 赤 (t071 / PR#239 3巡目)
 #
 # 隔離: 使い捨ての複製で欠陥を注入する。本番の worktree のファイルには触らない。
 # テストは一時ディレクトリの git repo (origin = bare) と隔離した queue / registry だけで動き、
@@ -166,21 +173,20 @@ expect_red "case M" "test_an_unobservable_mission_dir_is_kept_not_read_as_absent
 echo "== case N: --apply が消す直前の再判定をしない"
 fresh_copy
 inject $S "        if again.action != REMOVE:" "        if False:"
-expect_red "case N" "test_state_that_changed_since_the_dry_run_is_rejudged_before_removing"
+expect_red "case N" "test_state_that_changed_since_the_dry_run_is_rejudged_before_quarantining"
 
-echo "== case O: worktree の除去に --force を付ける"
+echo "== case O: worktree の隔離 (move) に --force を付ける"
 fresh_copy
-inject $S "run_git(repo, 'worktree', 'remove', v.path)" "run_git(repo, 'worktree', 'remove', '--force', v.path)"
+inject $S "run_git(repo, 'worktree', 'move', current.path, dest)" \
+           "run_git(repo, 'worktree', 'move', '--force', current.path, dest)"
 expect_red "case O" "test_git_is_only_called_with_the_allowed_verbs_and_flags"
 
-echo "== case P: ブランチを -D で消す"
-fresh_copy
-inject $S "run_git(repo, 'branch', '-d', name)" "run_git(repo, 'branch', '-D', name)"
-expect_red "case P" "test_the_branch_is_deleted_with_d_only_when_git_agrees"
+# case P は t071 で退役 (上のヘッダコメント参照)。
 
-echo "== case Q: dry-run でも消す"
+echo "== case Q: dry-run でも隔離する"
 fresh_copy
-inject $S "    applied = apply_removals(repo, queue, verdicts) if args.apply else None" "    applied = apply_removals(repo, queue, verdicts) if True else None"
+inject $S "    applied = apply_quarantine(repo, queue, verdicts) if args.apply else None" \
+           "    applied = apply_quarantine(repo, queue, verdicts) if True else None"
 expect_red "case Q" "test_dry_run_changes_nothing"
 
 echo "== case R: cwd を読めないプロセスを証明なしに無害と読む"
@@ -222,8 +228,8 @@ expect_red "case W" "test_an_ignored_file_keeps_it_even_though_git_status_is_cle
 
 echo "== case X: --apply のたびに repository-wide prune を復活させる (PR#239 F2)"
 fresh_copy
-inject $S "    applied = apply_removals(repo, queue, verdicts) if args.apply else None" \
-           "    applied = apply_removals(repo, queue, verdicts) if args.apply else None
+inject $S "    applied = apply_quarantine(repo, queue, verdicts) if args.apply else None" \
+           "    applied = apply_quarantine(repo, queue, verdicts) if args.apply else None
     if applied is not None:
         run_git(repo, 'worktree', 'prune')"
 expect_red "case X" "test_apply_never_invokes_git_worktree_prune"
@@ -256,6 +262,41 @@ inject $S "            except OSError as stat_e:
            "            except OSError:
                 continue                  # stat もできない = 消えた"
 expect_red "case AA" "test_a_readonly_probe_where_stat_also_fails_with_eacces_fails_the_scan"
+
+echo "== case BB: assume-unchanged / skip-worktree の index フラグ検出を外す (t071)"
+fresh_copy
+inject $S "    if flagged:
+        return keep(R_INDEX_FLAGS, f'{len(flagged)} 件 (先頭: {flagged[0]})')" \
+           "    if False:
+        return keep(R_INDEX_FLAGS, f'{len(flagged)} 件 (先頭: {flagged[0]})')"
+expect_red "case BB" "test_an_assume_unchanged_file_keeps_it_even_though_status_is_clean"
+
+echo "== case CC: core.ignoreStat=true の検出を外す (t071)"
+fresh_copy
+inject $S "        if out.strip() == 'true':" "        if False:"
+expect_red "case CC" "test_core_ignore_stat_true_keeps_it_even_with_no_flags_yet"
+
+echo "== case DD: --apply が git worktree remove を呼ぶ (隔離ではなく削除に戻す。t071)"
+fresh_copy
+inject $S "        rc, _out, err = run_git(repo, 'worktree', 'move', current.path, dest)" \
+           "        rc, _out, err = run_git(repo, 'worktree', 'remove', current.path)"
+expect_red "case DD" "test_quarantine_never_calls_worktree_remove_or_branch_delete"
+
+echo "== case EE: git worktree move の失敗を削除にフォールバックする (t071)"
+fresh_copy
+inject $S "            results.append({'path': v.path, 'status': 'failed',
+                            'detail': f'git worktree move: {(err or \"実行できない\").strip()[:300]}'})
+            continue" \
+           "            results.append({'path': v.path, 'status': 'failed',
+                            'detail': f'git worktree move: {(err or \"実行できない\").strip()[:300]}'})
+            run_git(repo, 'worktree', 'remove', current.path)
+            continue"
+expect_red "case EE" "test_a_worktree_move_failure_is_kept_not_deleted"
+
+echo "== case FF: 隔離先が既に存在してもそのまま move を呼ぶ (t071)"
+fresh_copy
+inject $S "        if os.path.exists(dest):" "        if False:"
+expect_red "case FF" "test_an_existing_quarantine_destination_refuses_the_move_instead_of_calling_it"
 
 echo
 echo "PASS=$PASS FAIL=$FAIL"

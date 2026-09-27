@@ -8,8 +8,10 @@
 
 1. remove にしてよいのは **全条件を満たすものだけ** — 条件ごとに、その 1 つだけを欠いた worktree が keep になる
 2. **判定できない** (読めない・git が失敗・プロセス表を取れない) はすべて keep (保留)
-3. dry-run は何も変えない・`--apply` しても keep のものは残る・消す直前に再判定する
+3. dry-run は何も変えない・`--apply` しても keep のものは残る・隔離する直前に再判定する
 4. `--force` / `-D` / `rm -rf` (`shutil.rmtree` 等) を使わない (AST で構造的に固定)
+5. `--apply` は `git worktree remove` を **呼ばない** — `git worktree move` + `git worktree lock` で
+   隔離するだけ (t071 / PR#239 3巡目)。`--restore` で完全に戻せる
 
     python3 -m pytest tests/test_worktree_gc.py -v
 """
@@ -106,6 +108,11 @@ class Fixture:
     def push(self, wt):
         branch = git(wt, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
         git(wt, "push", "-q", "origin", branch)
+
+    def quarantine_entries(self):
+        entries, problem = gc.find_quarantine_entries(str(self.repo))
+        assert problem == "", problem
+        return entries
 
     # --- 判定 ---
     def verdicts(self, monkeypatch=None):
@@ -534,6 +541,62 @@ class TestGitContent:
         (wt / "new.txt").write_text("x\n")
         assert fx.verdict(wt).reason == gc.R_DIRTY
 
+    def test_an_assume_unchanged_file_keeps_it_even_though_status_is_clean(self, fx):
+        """`git update-index --assume-unchanged` を付けた tracked ファイルへの編集は `git status` に
+        一切出ない (t071 / PR#239 3巡目、Codex の要求)。中身は読まず「フラグが付いている」ことだけを扱う。"""
+        wt = _pushed_worktree(fx)
+        git(wt, "update-index", "--assume-unchanged", "work.txt")
+        (wt / "work.txt").write_text("edited but invisible to status\n")
+        assert git(wt, "status", "--porcelain=v1").stdout == ""     # 前提: status は本当に空
+        v = fx.verdict(wt)
+        assert (v.action, v.reason) == (gc.KEEP, gc.R_INDEX_FLAGS) and "work.txt" in v.detail
+
+    def test_a_skip_worktree_file_keeps_it_even_though_status_is_clean(self, fx):
+        wt = _pushed_worktree(fx)
+        git(wt, "update-index", "--skip-worktree", "work.txt")
+        (wt / "work.txt").write_text("edited but invisible to status\n")
+        assert git(wt, "status", "--porcelain=v1").stdout == ""
+        v = fx.verdict(wt)
+        assert (v.action, v.reason) == (gc.KEEP, gc.R_INDEX_FLAGS) and "work.txt" in v.detail
+
+    def test_ls_files_failing_is_a_hold_not_a_pass(self, fx, monkeypatch):
+        wt = _pushed_worktree(fx)
+        real = gc.run_git
+
+        def failing(cwd, *args):
+            if args and args[0] == "ls-files":
+                return None, "", "OSError: boom"
+            return real(cwd, *args)
+        monkeypatch.setattr(gc, "run_git", failing)
+        v = fx.verdict(wt)
+        assert (v.action, v.reason) == (gc.KEEP, gc.R_LS_FILES_FAILED)
+
+    def test_core_ignore_stat_true_keeps_it_even_with_no_flags_yet(self, fx):
+        """`core.ignoreStat=true` は以後の checkout 等が触れたファイルへ自動で assume-unchanged を
+        付ける。今この瞬間に 1 件もフラグが無くても、今後の編集が見えなくなりうるので keep にする。"""
+        wt = _pushed_worktree(fx)
+        git(wt, "config", "core.ignoreStat", "true")
+        v = fx.verdict(wt)
+        assert (v.action, v.reason) == (gc.KEEP, gc.R_IGNORE_STAT)
+
+    def test_core_ignore_stat_false_or_unset_does_not_keep_it(self, fx):
+        wt = _pushed_worktree(fx)
+        assert fx.verdict(wt).action == gc.REMOVE                 # 未設定
+        git(wt, "config", "core.ignoreStat", "false")
+        assert fx.verdict(wt).action == gc.REMOVE                 # 明示的に false
+
+    def test_a_failing_ignore_stat_config_check_is_a_hold_not_a_pass(self, fx, monkeypatch):
+        wt = _pushed_worktree(fx)
+        real = gc.run_git
+
+        def failing(cwd, *args):
+            if args[:2] == ("config", "--bool"):
+                return 128, "", "fatal: bad config"
+            return real(cwd, *args)
+        monkeypatch.setattr(gc, "run_git", failing)
+        v = fx.verdict(wt)
+        assert (v.action, v.reason) == (gc.KEEP, gc.R_CONFIG_CHECK_FAILED)
+
     def test_a_commit_that_is_not_on_origin_keeps_it(self, fx):
         wt = _pushed_worktree(fx)
         fx.commit(wt, "second.txt")              # push していない
@@ -628,6 +691,8 @@ class TestParseWorktreeList:
         assert [w.path for w in got] == ["/r/main", "/r/with space/wt", "/r/gone", "/r/bare"]
         assert got[0].branch == "refs/heads/main" and not got[0].locked
         assert got[1].detached and got[1].locked and got[1].branch is None
+        assert got[1].locked_reason == "because reasons"
+        assert got[0].locked_reason is None
         assert got[2].prunable and got[3].bare
 
     def test_an_empty_list_is_empty(self):
@@ -642,6 +707,15 @@ def _branches(fx):
     return set(git(fx.repo, "for-each-ref", "--format=%(refname:short)", "refs/heads").stdout.split())
 
 
+def _worktree_paths(porcelain_listing):
+    """`git worktree list --porcelain` の `worktree <path>` 行だけを集める。
+
+    `locked <reason>` 行には隔離前の元の絶対パスが `orig=...` として埋め込まれるので、listing 全体への
+    単純な部分文字列検索では「登録されているか」を確かめられない (元のパスが quarantine エントリの
+    reason 内に文字列として現れるだけで in を誤検出する)。"""
+    return {line[len("worktree "):] for line in porcelain_listing.splitlines() if line.startswith("worktree ")}
+
+
 class TestApply:
     def test_dry_run_changes_nothing(self, fx):
         _pushed_worktree(fx, "t001")
@@ -652,7 +726,8 @@ class TestApply:
         assert (git(fx.repo, "worktree", "list", "--porcelain").stdout, _branches(fx)) == before
         assert (fx.repo / ".claude" / "worktrees" / SLUG / "t001").is_dir()
 
-    def test_apply_removes_the_removable_and_leaves_every_keep(self, fx):
+    def test_apply_quarantines_the_removable_and_leaves_every_keep_untouched(self, fx):
+        """`--apply` は消さず `.quarantine/<timestamp>/<元の相対パス>` へ move + lock する。"""
         gone = _pushed_worktree(fx, "gone")
         dirty = _pushed_worktree(fx, "dirty")
         (dirty / "x").write_text("x\n")
@@ -664,50 +739,74 @@ class TestApply:
         git(fx.repo, "worktree", "lock", str(locked))
         r = fx.cli("--apply")
         assert r.returncode == 0, (r.stdout, r.stderr)
-        assert not gone.exists()
+        assert not gone.exists()                                   # 元の場所には何も残らない
         for keep in (dirty, unpushed, active, locked, fx.repo):
             assert keep.is_dir(), keep
         listed = git(fx.repo, "worktree", "list", "--porcelain").stdout
-        assert str(gone) not in listed and all(str(k) in listed for k in (dirty, unpushed, active, locked))
+        paths = _worktree_paths(listed)
+        assert str(gone) not in paths and all(str(k) in paths for k in (dirty, unpushed, active, locked))
         assert (dirty / "x").read_text() == "x\n"                 # 未コミットの中身も無事
+        entries = fx.quarantine_entries()
+        assert len(entries) == 1
+        wt, _ts, orig = entries[0]
+        assert orig == str(gone) and wt.locked
+        assert (pathlib.Path(wt.path) / "work.txt").is_file(), "隔離後もファイルは無事"
+        assert f"task/{SLUG}/gone" in _branches(fx), "隔離では branch に触れない (削除しない)"
 
-    def test_the_branch_is_deleted_with_d_only_when_git_agrees(self, fx):
+    def test_quarantine_never_calls_worktree_remove_or_branch_delete(self, fx, monkeypatch):
+        _pushed_worktree(fx, "t001")
+        calls = []
+        real = gc.run_git
+
+        def spy(cwd, *args):
+            calls.append(args)
+            return real(cwd, *args)
+        monkeypatch.setattr(gc, "run_git", spy)
+        rc = gc.main(["--repo", str(fx.repo), "--queue", str(fx.queue), "--apply"])
+        assert rc == 0
+        assert ("worktree", "remove") not in calls
+        assert ("branch", "-d") not in calls and ("branch", "-D") not in calls
+        assert any(c[:2] == ("worktree", "move") for c in calls)
+        assert any(c[:3] == ("worktree", "lock", "--reason") for c in calls)
+
+    def test_a_merged_and_an_unmerged_branch_both_survive_quarantine(self, fx):
+        """削除しないので、`-d` が通る/通らないの区別自体が無くなる — どちらも branch はそのまま残る。"""
         merged = fx.add("merged")                                  # origin/main と同じ = merge 済み
         pushed_only = _pushed_worktree(fx, "pushed-only")          # push 済みだが main に未 merge
         r = fx.cli("--apply")
         assert r.returncode == 0, (r.stdout, r.stderr)
-        assert not merged.exists() and not pushed_only.exists()
+        assert not merged.exists() and not pushed_only.exists()   # 元の場所からは消える (隔離済み)
         branches = _branches(fx)
-        assert f"task/{SLUG}/merged" not in branches               # -d が通る
-        assert f"task/{SLUG}/pushed-only" in branches, "git が merge 済みと認めない branch は -D で消さない"
-        assert "kept task/" in r.stdout and "deleted task/" in r.stdout
+        assert f"task/{SLUG}/merged" in branches and f"task/{SLUG}/pushed-only" in branches
+        assert len(fx.quarantine_entries()) == 2
 
-    def test_a_detached_worktree_is_removed_without_touching_any_branch(self, fx):
+    def test_a_detached_worktree_is_quarantined_without_touching_any_branch(self, fx):
         wt = fx.add("t001", branch=False)
         before = _branches(fx)
         assert fx.cli("--apply").returncode == 0
         assert not wt.exists() and _branches(fx) == before
+        assert len(fx.quarantine_entries()) == 1
 
     def test_remote_branches_are_never_touched(self, fx):
         wt = _pushed_worktree(fx)
         fx.cli("--apply")
         assert f"task/{SLUG}/t001" in git(fx.origin, "for-each-ref", "--format=%(refname:short)", "refs/heads").stdout
 
-    def test_state_that_changed_since_the_dry_run_is_rejudged_before_removing(self, fx):
-        """dry-run と --apply の間に Worker が戻ってきた・変更が入った → 消さない。"""
+    def test_state_that_changed_since_the_dry_run_is_rejudged_before_quarantining(self, fx):
+        """dry-run と --apply の間に Worker が戻ってきた・変更が入った → 隔離しない。"""
         wt = _pushed_worktree(fx)
         verdicts, _ = gc.classify_all(str(fx.repo), str(fx.queue))
         assert next(v for v in verdicts if v.path == str(wt)).action == gc.REMOVE
         (wt / "late.txt").write_text("late work\n")
-        results = gc.apply_removals(str(fx.repo), str(fx.queue), verdicts)
+        results = gc.apply_quarantine(str(fx.repo), str(fx.queue), verdicts)
         assert [r["status"] for r in results] == ["skipped"] and "dirty" in results[0]["detail"]
         assert (wt / "late.txt").read_text() == "late work\n"
 
-    def test_a_mission_that_became_active_since_the_dry_run_is_not_removed(self, fx):
+    def test_a_mission_that_became_active_since_the_dry_run_is_not_quarantined(self, fx):
         wt = _pushed_worktree(fx)
         verdicts, _ = gc.classify_all(str(fx.repo), str(fx.queue))
         fx.set_active([SLUG])
-        results = gc.apply_removals(str(fx.repo), str(fx.queue), verdicts)
+        results = gc.apply_quarantine(str(fx.repo), str(fx.queue), verdicts)
         assert results[0]["status"] == "skipped" and gc.R_MISSION_ACTIVE in results[0]["detail"]
         assert wt.is_dir()
 
@@ -716,15 +815,56 @@ class TestApply:
         real = gc.run_git
 
         def failing(cwd, *args):
-            if args[:2] == ("worktree", "remove") and args[2].endswith("/a"):
+            if args[:2] == ("worktree", "move") and args[2].endswith("/a"):
                 return 1, "", "fatal: refusing"
             return real(cwd, *args)
         monkeypatch.setattr(gc, "run_git", failing)
         rc = gc.main(["--repo", str(fx.repo), "--queue", str(fx.queue), "--apply"])
         out = capsys.readouterr().out
-        assert rc == 1 and "failed 1" in out and "removed 1" in out
+        assert rc == 1 and "failed 1" in out and "quarantined 1" in out
         assert first.is_dir() and not second.exists()
-        assert f"task/{SLUG}/a" in _branches(fx), "worktree を消せなかった branch には触れない"
+        assert f"task/{SLUG}/a" in _branches(fx), "隔離できなかった worktree の branch には触れない"
+
+    def test_a_worktree_move_failure_is_kept_not_deleted(self, fx, monkeypatch):
+        """`git worktree move` が失敗する (submodule 等) → keep 相当にする。削除にフォールバックしない (族A)。"""
+        wt = _pushed_worktree(fx)
+        real = gc.run_git
+
+        def failing(cwd, *args):
+            if args[:2] == ("worktree", "move"):
+                return 1, "", "fatal: refusing to move (submodule?)"
+            return real(cwd, *args)
+        monkeypatch.setattr(gc, "run_git", failing)
+        rc = gc.main(["--repo", str(fx.repo), "--queue", str(fx.queue), "--apply"])
+        assert rc == 1
+        assert wt.is_dir(), "move が失敗しても元の worktree はそのまま残る"
+        assert fx.quarantine_entries() == []
+
+    def test_an_existing_quarantine_destination_refuses_the_move_instead_of_calling_it(self, fx, monkeypatch):
+        """隔離先が既に存在する場合、`git worktree move` を呼ばずに拒否する
+        (`git worktree move` は既存ディレクトリの中へ移すだけで失敗しないため、見落とすと誤配置になる)。
+
+        `os.path.exists` を広く (".quarantine" を含むパス全部) モックすると `os.makedirs(exist_ok=True)`
+        の内部の exists チェックまで壊れ、別の失敗経路 (親ディレクトリを作れない) で偶然 assert が通ってしまう
+        (red proof で確認済み — defect を戻しても赤にならなかった)。`_quarantine_destination` を固定パスに
+        差し替え、そのパスを実際に (空ディレクトリとして) 作っておく方が、意図した分岐だけを通す。"""
+        wt = _pushed_worktree(fx)
+        fixed_dest = fx.repo / ".claude" / "worktrees" / ".quarantine" / "fixed" / SLUG / "t001"
+        fixed_dest.mkdir(parents=True)                             # 隔離先を実際に埋めておく
+        monkeypatch.setattr(gc, "_quarantine_destination", lambda *a, **k: str(fixed_dest))
+
+        real_run_git = gc.run_git
+        calls = []
+
+        def spy(cwd, *args):
+            calls.append(args)
+            return real_run_git(cwd, *args)
+        monkeypatch.setattr(gc, "run_git", spy)
+
+        rc = gc.main(["--repo", str(fx.repo), "--queue", str(fx.queue), "--apply"])
+        assert rc == 1
+        assert wt.is_dir()
+        assert ("worktree", "move") not in calls, "隔離先が存在するときは move 自体を呼ばない"
 
     def test_a_prunable_worktree_inside_the_managed_dir_is_left_registered_after_apply(self, fx):
         """`prunable` (ディレクトリが無い) は keep 止まり (R_PRUNABLE)。--apply は repository-wide の
@@ -777,6 +917,134 @@ class TestApply:
         r = fx.cli("--apply")
         assert r.returncode == 0 and wt.is_dir()
         assert "state-unreadable" in r.stdout
+
+
+# ---------------------------------------------------------------------------
+# 5. 隔離済みエントリの再分類 (族B: 対象の同定)
+# ---------------------------------------------------------------------------
+
+class TestQuarantinedEntriesAreNotReprocessed:
+    def test_an_already_quarantined_entry_is_kept_with_its_own_reason(self, fx):
+        wt = _pushed_worktree(fx, "gone")
+        fx.cli("--apply")
+        entries = fx.quarantine_entries()
+        assert len(entries) == 1
+        v = fx.verdict(pathlib.Path(entries[0][0].path))
+        assert (v.action, v.reason) == (gc.KEEP, gc.R_QUARANTINED)
+
+    def test_a_second_apply_does_not_move_an_already_quarantined_entry_again(self, fx):
+        _pushed_worktree(fx, "gone")
+        fx.cli("--apply")
+        before = fx.quarantine_entries()
+        r = fx.cli("--apply")
+        assert r.returncode == 0, r.stderr
+        assert "quarantined 0" in r.stdout
+        assert fx.quarantine_entries() == before
+
+    def test_a_path_under_quarantine_without_the_lock_reason_is_not_treated_as_ours(self, fx):
+        """パスが `.quarantine/` 配下「だけ」では十分でない (族B — 対象の同定は 2 つの一致で確かめる)。
+        reason 無しで手動 lock されただけの何かは、通常の R_LOCKED として扱われる (=quarantine
+        扱いにして黙って見落とさない)。"""
+        wt = fx.repo / ".claude" / "worktrees" / ".quarantine" / "20260101-000000" / SLUG / "manual"
+        wt.parent.mkdir(parents=True)
+        git(fx.repo, "worktree", "add", "-q", "-b", "manual-branch", str(wt), "origin/main")
+        git(fx.repo, "worktree", "lock", str(wt))                  # reason 無し
+        assert fx.verdict(wt).reason == gc.R_LOCKED, "族B: パスだけでは quarantine 扱いにしない"
+
+    def test_our_lock_reason_outside_the_quarantine_dir_is_not_treated_as_ours(self, fx):
+        """reason がこのツールの印と一致「だけ」でも、パスが `.quarantine/` の外なら quarantine
+        扱いにしない (通常の判定に進ませる — ここでは push 済みなので REMOVE になる)。"""
+        wt = _pushed_worktree(fx, "t001")
+        reason = gc._quarantine_reason("20260101-000000", str(wt))
+        git(fx.repo, "worktree", "lock", "--reason", reason, str(wt))
+        assert fx.verdict(wt).reason == gc.R_LOCKED, "族B: reason だけでは quarantine 扱いにしない"
+
+
+# ---------------------------------------------------------------------------
+# 6. --restore / --list-quarantine
+# ---------------------------------------------------------------------------
+
+class TestRestoreAndListQuarantine:
+    def test_restore_by_the_original_path_fully_reverses_the_quarantine(self, fx):
+        wt = _pushed_worktree(fx, "gone")
+        fx.commit(wt, "extra.txt")
+        fx.push(wt)                                                # push しないと unpushed で keep になる
+        fx.cli("--apply")
+        assert not wt.exists()
+        r = fx.cli("--restore", str(wt))
+        assert r.returncode == 0, (r.stdout, r.stderr)
+        assert wt.is_dir()
+        assert (wt / "extra.txt").is_file()
+        assert git(wt, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip() == f"task/{SLUG}/gone"
+        assert fx.quarantine_entries() == []
+        listed = git(fx.repo, "worktree", "list", "--porcelain").stdout
+        assert str(wt) in listed and ".quarantine" not in listed
+
+    def test_restore_by_the_quarantine_path_also_works(self, fx):
+        wt = _pushed_worktree(fx, "gone")
+        fx.cli("--apply")
+        quarantine_path = fx.quarantine_entries()[0][0].path
+        r = fx.cli("--restore", quarantine_path)
+        assert r.returncode == 0, (r.stdout, r.stderr)
+        assert wt.is_dir()
+
+    def test_restore_refuses_when_the_original_location_is_occupied(self, fx):
+        """元の場所に既に何かある場合は上書きせず拒否する (`git worktree move` は既存ディレクトリの
+        中へ移すだけで失敗しないため、素通しすると誤配置になる)。"""
+        wt = _pushed_worktree(fx, "gone")
+        fx.cli("--apply")
+        assert not wt.exists()
+        wt.mkdir(parents=True)
+        (wt / "someone-elses-file").write_text("don't touch me\n")
+        r = fx.cli("--restore", str(wt))
+        assert r.returncode == 1
+        assert "既に何かある" in r.stderr
+        assert (wt / "someone-elses-file").read_text() == "don't touch me\n"
+        assert len(fx.quarantine_entries()) == 1, "拒否したら隔離側も変更しない"
+
+    def test_restore_of_an_unknown_path_fails_clearly(self, fx):
+        r = fx.cli("--restore", str(fx.repo / "no-such-thing"))
+        assert r.returncode == 1
+        assert "見つかりません" in r.stderr
+
+    def test_ambiguous_restore_by_original_path_asks_for_the_quarantine_path(self, fx):
+        """同じ元パスが 2 回隔離された場合 (2 回に分けて --apply した場合等)、元のパスだけでは
+        一意に決まらないので、隔離先を直接指定するよう求める。"""
+        wt = _pushed_worktree(fx, "gone")
+        fx.cli("--apply")
+        # 2 回目の隔離: 同じ元パスにもう一度 worktree を作り、再度隔離する。
+        # `task/{SLUG}/gone` は 1 回目の隔離先にまだ残っている (隔離は branch を削除しない) ので、
+        # 同名では `git worktree add -b` が失敗する。別の branch 名で同じパスに作る。
+        wt.parent.mkdir(parents=True, exist_ok=True)
+        git(fx.repo, "worktree", "add", "-q", "-b", f"task/{SLUG}/gone-2", str(wt), "origin/main")
+        wt2 = wt
+        fx.commit(wt2)
+        fx.push(wt2)
+        fx.cli("--apply")
+        assert len(fx.quarantine_entries()) == 2
+        r = fx.cli("--restore", str(wt))
+        assert r.returncode == 1
+        assert "複数の隔離エントリ" in r.stderr
+
+    def test_list_quarantine_is_empty_before_any_apply(self, fx):
+        _pushed_worktree(fx, "t001")
+        r = fx.cli("--list-quarantine")
+        assert r.returncode == 0
+        assert "ありません" in r.stdout
+
+    def test_list_quarantine_json_shape(self, fx):
+        wt = _pushed_worktree(fx, "gone")
+        fx.cli("--apply")
+        data = json.loads(fx.cli("--list-quarantine", "--json").stdout)
+        assert len(data) == 1
+        assert data[0]["original_path"] == str(wt)
+        assert data[0]["path"] == fx.quarantine_entries()[0][0].path
+
+    def test_apply_and_restore_and_list_quarantine_are_mutually_exclusive(self, fx):
+        r = fx.cli("--apply", "--list-quarantine")
+        assert r.returncode == 2
+        r = fx.cli("--restore", "x", "--apply")
+        assert r.returncode == 2
 
 
 class TestOutput:
@@ -834,24 +1102,26 @@ class TestNoForcefulOperations:
                 if consts:
                     verbs.add(consts[0])
                     flags.update(c for c in consts[1:] if c.startswith("-"))
-        assert verbs == {"worktree", "status", "rev-list", "branch", "fetch"}, verbs
+        # t071 (PR#239 3巡目): --apply は削除ではなく隔離になったので `branch` / `worktree remove` は
+        # 消え、代わりに `config` (core.ignoreStat 検査) / `ls-files` (index フラグ検査) が増えた。
+        assert verbs == {"worktree", "status", "rev-list", "fetch", "config", "ls-files"}, verbs
         assert flags <= {"--porcelain", "-z", "--porcelain=v1", "--untracked-files=all", "--ignored=matching",
-                         "--max-count=1", "--not", "--remotes=origin", "--prune", "-d"}, flags
-        for banned in ("--force", "-f", "-D", "--delete", "--hard", "-B"):
+                         "--max-count=1", "--not", "--remotes=origin", "--prune", "--bool", "-v", "--reason"}, flags
+        for banned in ("--force", "-f", "-D", "-d", "--delete", "--hard", "-B"):
             assert banned not in flags
 
-    def test_the_only_deleting_verbs_are_worktree_remove_and_branch_d(self):
+    def test_no_deleting_git_verb_is_called_at_all(self):
+        """隔離設計 (t071) では削除操作そのものが無い — `worktree remove` / `branch -d` / `-D` / `prune`。"""
         calls = []
         for node in ast.walk(self._tree()):
             if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "run_git":
                 consts = tuple(a.value for a in node.args[1:] if isinstance(a, ast.Constant))
                 calls.append(consts)
-        assert ("worktree", "remove") in {c[:2] for c in calls}
-        assert ("branch", "-d") in {c[:2] for c in calls}
-        assert ("worktree", "prune") not in {c[:2] for c in calls}, \
+        sub_verbs = {c[:2] for c in calls}
+        assert ("worktree", "remove") not in sub_verbs
+        assert ("worktree", "prune") not in sub_verbs, \
             "repository-wide の `git worktree prune` は呼ばない (検証していない他の worktree まで消しうる)"
+        assert not any(c[:1] == ("branch",) for c in calls), "隔離では branch に触れない (削除しない)"
         for c in calls:
             if c[:1] == ("worktree",):
-                assert c[1] in {"list", "remove"}, c
-            if c[:1] == ("branch",):
-                assert c[1] == "-d", c
+                assert c[1] in {"list", "move", "lock", "unlock"}, c

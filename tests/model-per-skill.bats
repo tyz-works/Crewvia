@@ -11,7 +11,7 @@
 #
 # Coverage:
 #   1. env 明示指定 (CREWVIA_WORKER_MODEL) が model_per_skill より優先
-#   2. env 無しで model_per_skill が効く (planning→opus / docs→haiku / code→sonnet)
+#   2. env 無しで model_per_skill が効く (planning→opus / docs,qa,verify→sonnet / code→sonnet)
 #   3. director role では model_per_skill が適用されない (CREWVIA_DIRECTOR_MODEL のみ)
 #   4. config 欠損時に WORKER_MODEL_FROM_CONFIG フォールバック → 空文字を返す
 
@@ -20,10 +20,38 @@ START_SH="${REPO_ROOT}/scripts/start.sh"
 REAL_CONFIG="${REPO_ROOT}/config/crewvia.yaml"
 
 # ---------------------------------------------------------------------------
+# 本番 mux への出口を塞ぐ (t037)
+# ---------------------------------------------------------------------------
+# CREWVIA_PRINT_MODEL=1 は start.sh の副作用のある処理より前で exit するので、
+# 今日のこの suite は mux に届かない。届かないことを **start.sh のどこで exit
+# するか** に預けているのが問題で、その行が動いた瞬間、この suite は本番の
+# herdr ワークスペースに Worker ペインを作り始める。2026-09-23 に pytest 側で
+# 起きたのと同じ形 (テストが本番の mux を掴む) なので、bash 側の唯一の隔離手段
+# である PATH のスタブをここでも置いておく。
+setup() {
+  MUX_STUB_DIR="$(mktemp -d)"
+  # 名前はリテラルで書く: 「この suite は tmux / herdr を潰している」を、
+  # tests/test_mux_production_safety.py の全数点検が読み取れるようにするため。
+  printf '#!/usr/bin/env bash\nexit 1\n' > "${MUX_STUB_DIR}/tmux"
+  printf '#!/usr/bin/env bash\nexit 1\n' > "${MUX_STUB_DIR}/herdr"
+  chmod +x "${MUX_STUB_DIR}/tmux" "${MUX_STUB_DIR}/herdr"
+  export PATH="${MUX_STUB_DIR}:${PATH}"
+}
+
+teardown() {
+  # start-sh-mux-gate.bats と同じ後始末 (find -delete + rmdir)。
+  if [[ -n "${MUX_STUB_DIR:-}" && -d "$MUX_STUB_DIR" ]]; then
+    find "$MUX_STUB_DIR" -mindepth 1 -delete 2>/dev/null || true
+    rmdir "$MUX_STUB_DIR" 2>/dev/null || true
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------------------
 # Test 1: env 明示指定が model_per_skill より優先される
 # ---------------------------------------------------------------------------
 @test "CREWVIA_WORKER_MODEL 明示指定は skill mapping を上書きする" {
-  # docs skill は haiku のはずだが、env で opus を指定すれば opus が返る
+  # docs skill は sonnet のはずだが、env で opus を指定すれば opus が返る
   result=$(CREWVIA_WORKER_MODEL="claude-opus-5" CREWVIA_PRINT_MODEL=1 \
            bash "$START_SH" worker docs 2>/dev/null)
   [ "$result" = "claude-opus-5" ]
@@ -44,9 +72,20 @@ REAL_CONFIG="${REPO_ROOT}/config/crewvia.yaml"
   [ "$result" = "claude-opus-5" ]
 }
 
-@test "env 無し: docs → claude-haiku-4-5-20251001" {
+# docs / qa / verify は Sonnet (t028): Haiku は permission-mode auto を無視して承認ダイアログで止まる。
+@test "env 無し: docs → claude-sonnet-5" {
   result=$(CREWVIA_PRINT_MODEL=1 bash "$START_SH" worker docs 2>/dev/null)
-  [ "$result" = "claude-haiku-4-5-20251001" ]
+  [ "$result" = "claude-sonnet-5" ]
+}
+
+@test "env 無し: qa → claude-sonnet-5" {
+  result=$(CREWVIA_PRINT_MODEL=1 bash "$START_SH" worker qa 2>/dev/null)
+  [ "$result" = "claude-sonnet-5" ]
+}
+
+@test "env 無し: verify → claude-sonnet-5" {
+  result=$(CREWVIA_PRINT_MODEL=1 bash "$START_SH" worker verify 2>/dev/null)
+  [ "$result" = "claude-sonnet-5" ]
 }
 
 @test "env 無し: code → claude-sonnet-5 (worker_model フォールバック)" {
@@ -54,9 +93,9 @@ REAL_CONFIG="${REPO_ROOT}/config/crewvia.yaml"
   [ "$result" = "claude-sonnet-5" ]
 }
 
-@test "env 無し: docs qa → claude-haiku (複数 skill、同ランクは haiku)" {
+@test "env 無し: docs qa → claude-sonnet-5 (複数 skill でも Haiku に落ちない)" {
   result=$(CREWVIA_PRINT_MODEL=1 bash "$START_SH" worker docs qa 2>/dev/null)
-  [ "$result" = "claude-haiku-4-5-20251001" ]
+  [ "$result" = "claude-sonnet-5" ]
 }
 
 @test "env 無し: planning code → claude-opus-5 (最高ランク選択)" {

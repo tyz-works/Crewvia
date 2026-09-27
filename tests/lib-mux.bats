@@ -21,6 +21,8 @@
 
 REPO_ROOT="$(cd "$(dirname "$BATS_TEST_FILENAME")/.." && pwd)"
 LIB_MUX_PY="${REPO_ROOT}/scripts/lib_mux.py"
+# scripts/ の隔離コピーを作る共通 helper (copy_scripts_libs / copy_plan_tree)
+source "${REPO_ROOT}/tests/fixture_tree.sh"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -64,10 +66,18 @@ case "$cmd" in
     echo "crewvia: 3 windows"
     exit 0
     ;;
-  new-session)
-    exit 0
-    ;;
-  new-window)
+  new-session|new-window)
+    # `-P -F '#{window_id}'`: spawn() now takes the id of the window it
+    # created from the creation command itself, instead of looking it up by
+    # name afterwards — between those two steps another checkout can put a
+    # different window under the name (Codex 6巡目 P1-4).  A fake that stayed
+    # silent here would make every spawn look like "tmux would not say what
+    # it created", which is a refusal that does not exist in production.
+    for arg in "$@"; do
+      case "$arg" in
+        '#{window_id}'*) echo "@1" ;;
+      esac
+    done
     exit 0
     ;;
   list-windows)
@@ -97,7 +107,16 @@ case "$cmd" in
     exit 0
     ;;
   display-message)
-    echo "12345"
+    # Substitute the format string, as tmux does.  A fake that answers one
+    # hard-coded format hides every change in what the caller asks for: the
+    # caller then reads "this pane has no pid", and the identity guard turns
+    # that into a refusal that does not exist in production.
+    fmt="${!#}"
+    fmt="${fmt//'#{window_id}'/@1}"
+    fmt="${fmt//'#{pane_pid}'/12345}"
+    fmt="${fmt//'#{pid}'/900}"
+    fmt="${fmt//'#{socket_path}'//tmp/tmux-fake/default}"
+    echo "$fmt"
     exit 0
     ;;
   switch-client)
@@ -179,8 +198,11 @@ log_count() {
     [ "$status" -eq 0 ]
 
     log_contains "new-session"
-    log_contains "send-keys -t crewvia:Omar-worker claude --some-flag"
-    log_contains "send-keys -t crewvia:Omar-worker Enter"
+    # The launch goes to the `@window_id` the creation reported, not to the
+    # name: a name is what another checkout can move onto a different window
+    # in between (Codex 6巡目 P1-4).
+    log_contains "send-keys -t @1 claude --some-flag"
+    log_contains "send-keys -t @1 Enter"
 }
 
 @test "spawn: new-window path — session exists, window is new" {
@@ -191,16 +213,18 @@ log_count() {
     [ "$status" -eq 0 ]
 
     log_contains "new-window"
-    log_contains "send-keys -t crewvia:New-worker claude"
-    log_contains "send-keys -t crewvia:New-worker Enter"
+    log_contains "send-keys -t @1 claude"
+    log_contains "send-keys -t @1 Enter"
 }
 
-@test "spawn: existing window returns exit 1 (no-op)" {
+@test "spawn: existing window is a no-op (exit 11: occupant unreadable, so busy)" {
     setup_fake_tmux
-    # Omar-worker is already in the default window list.
+    # Omar-worker is already in the default window list.  The fake's pane pid is
+    # not a real process, so what is in the window cannot be read: busy (11),
+    # not "launch it anyway" (0) and not a plain failure (1) — t001.
 
     run python3 "$LIB_MUX_PY" spawn "Omar-worker" "claude"
-    [ "$status" -eq 1 ]
+    [ "$status" -eq 11 ]
 
     # Must NOT call new-window for an existing name.
     ! log_contains "new-window"
@@ -214,8 +238,11 @@ log_count() {
     run python3 "$LIB_MUX_PY" spawn "Test-worker" "claude"
     [ "$status" -eq 0 ]
 
-    log_contains "new-session -d -s mytest"
-    log_contains "send-keys -t mytest:Test-worker"
+    # The session override is visible where the window is *created*; the
+    # launch itself addresses the created `@window_id`, so the session name
+    # no longer appears in send-keys (Codex 6巡目 P1-4).
+    log_contains "new-session -d -s mytest -n Test-worker"
+    log_contains "send-keys -t @1"
 }
 
 # ---------------------------------------------------------------------------
@@ -333,13 +360,15 @@ log_count() {
 # pid()
 # ---------------------------------------------------------------------------
 
-@test "pid: calls display-message with #{pane_pid} and returns integer" {
+@test "pid: asks for the window id and the pane pid together, returns the pid" {
     setup_fake_tmux
 
     run python3 "$LIB_MUX_PY" pid "Sora-director"
     [ "$status" -eq 0 ]
     [[ "$output" == "12345" ]]
-    log_contains "display-message -p -t crewvia:Sora-director #{pane_pid}"
+    # One query for both, so that the window a kill destroys is the window
+    # whose contents were inspected (t039 P1-4).
+    log_contains "display-message -p -t crewvia:Sora-director #{window_id} #{pane_pid}"
 }
 
 # ---------------------------------------------------------------------------
@@ -648,7 +677,20 @@ case "${cmd1}" in
         exit 0
         ;;
       run)
-        # JSON response
+        # JSON response.
+        #
+        # A real `pane run` puts a process in the pane, so the next
+        # process-info reports it.  The fake has to model that: spawn() now
+        # verifies after relaunching into a husk, and a fake that kept
+        # answering "still an idle shell" would make every husk reuse look
+        # like a swallowed command (t036).
+        #
+        # FAKE_PANE_RUN_SWALLOWED=1 keeps the pane idle on purpose — that is
+        # the pane-ate-the-command case, and it must stay reachable.
+        if [[ "${FAKE_PANE_RUN_SWALLOWED:-0}" != "1" ]]; then
+          printf '%s' '[{"name":"claude","pid":4243,"argv":["claude"],"cmdline":"claude"}]' \
+            > "$FAKE_PANE_PROCS"
+        fi
         echo "{\"result\":{\"type\":\"ok\"}}"
         exit 0
         ;;
@@ -714,6 +756,53 @@ herdr_log_contains() {
 # herdr_log_count: count log lines matching a fixed string.
 herdr_log_count() {
     grep -cF -- "$1" "$FAKE_HERDR_LOG" || true
+}
+
+# start_fake_herdr_identity_socket: a real (temp-path) unix socket for the
+# server-identity path.  _herdr_server_identity() (used by
+# HerdrBackend._write_cache() to bind a spawn record to the server that
+# created it — t041/t043) does not go through the `herdr` CLI at all: it
+# connects to the herdr socket itself and reads the peer's pid off the kernel
+# via SO_PEERCRED.  The fake CLI above cannot fake that connection, and
+# without it there is nothing to name the connecting process, so
+# write_pane_record() fail-closes and writes nothing (by design — Codex 7巡目
+# P1-2). On a machine with no real herdr running (CI), that made every spawn
+# test that asserts on the cache file fail — not because production spawn()
+# is wrong, but because the fixture never gave server-identity resolution a
+# real socket + real process to resolve (PR #209 review B-1/F-2, t045).
+#
+# This starts a minimal listener — accept and close, no protocol needed since
+# _herdr_connect_identified() reads SO_PEERCRED without sending a byte — as
+# its own real process, so SO_PEERCRED names a pid with a readable
+# /proc/<pid>/stat, exactly like a real herdr server would.
+start_fake_herdr_identity_socket() {
+    FAKE_SRV_DIR="$(mktemp -d)"
+    FAKE_SRV_SOCK="${FAKE_SRV_DIR}/herdr.sock"
+    FAKE_SRV_PID="${FAKE_SRV_DIR}/server.pid"
+
+    cat > "${FAKE_SRV_DIR}/identityd.py" <<'IDENTITYD'
+import socket, sys
+
+sock_path = sys.argv[1]
+srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+srv.bind(sock_path)
+srv.listen(8)
+while True:
+    conn, _ = srv.accept()
+    conn.close()
+IDENTITYD
+
+    python3 "${FAKE_SRV_DIR}/identityd.py" "$FAKE_SRV_SOCK" &
+    echo $! > "$FAKE_SRV_PID"
+
+    # Wait for the socket file to exist before returning — spawn() runs
+    # immediately after this call and must not race the listener's bind().
+    for _ in $(seq 1 50); do
+        [[ -S "$FAKE_SRV_SOCK" ]] && break
+        sleep 0.1
+    done
+
+    export CREWVIA_HERDR_SOCK="$FAKE_SRV_SOCK"
 }
 
 # ---------------------------------------------------------------------------
@@ -798,7 +887,7 @@ print('herdr backend selected OK')
     # foreground process is a live `claude`.
 
     run python3 "$LIB_MUX_PY" spawn "Omar-worker" "claude"
-    [ "$status" -eq 1 ]
+    [ "$status" -eq 10 ]   # t001: a live process → 10 (occupied)
 
     # Neither a new tab nor a relaunch may happen on top of a live agent.
     ! herdr_log_contains "tab create"
@@ -861,7 +950,7 @@ print('herdr backend selected OK')
     echo '[{"name":"bash","pid":3854037,"argv":["bash","/repo/scripts/dispatcher.sh"],"cmdline":"bash /repo/scripts/dispatcher.sh"}]' > "$FAKE_PANE_PROCS"
 
     run python3 "$LIB_MUX_PY" spawn "dispatcher" "bash /repo/scripts/dispatcher.sh"
-    [ "$status" -eq 1 ]
+    [ "$status" -eq 10 ]   # t001: a live process → 10 (occupied)
 
     ! herdr_log_contains "pane run"
     ! herdr_log_contains "tab create"
@@ -873,7 +962,7 @@ print('herdr backend selected OK')
     echo '[{"name":"bash","pid":1,"cmdline":"/bin/bash"}]' > "$FAKE_PANE_PROCS"
 
     run python3 "$LIB_MUX_PY" spawn "Omar-worker" "claude"
-    [ "$status" -eq 1 ]
+    [ "$status" -eq 11 ]   # t001: cannot classify → 11 (unreadable, still busy)
     ! herdr_log_contains "pane run"
 }
 
@@ -883,7 +972,7 @@ print('herdr backend selected OK')
     echo '[{"name":"bash","pid":1,"argv":["/bin/bash"],"cmdline":"/bin/bash"},{"name":"claude","pid":2,"argv":["claude"],"cmdline":"claude"}]' > "$FAKE_PANE_PROCS"
 
     run python3 "$LIB_MUX_PY" spawn "Omar-worker" "claude"
-    [ "$status" -eq 1 ]
+    [ "$status" -eq 10 ]   # t001: a live child → 10 (occupied)
     ! herdr_log_contains "pane run"
 }
 
@@ -893,15 +982,38 @@ print('herdr backend selected OK')
     export FAKE_PROCESS_INFO_FAIL=1
 
     run python3 "$LIB_MUX_PY" spawn "Omar-worker" "claude"
-    [ "$status" -eq 1 ]
+    [ "$status" -eq 11 ]   # t001: unreadable → 11 (still busy, nothing relaunched)
 
     # Never relaunch when we cannot prove the pane is idle.
     ! herdr_log_contains "pane run"
     ! herdr_log_contains "tab create"
 }
 
+@test "herdr spawn: a husk that swallows the command is not a successful spawn" {
+    setup_fake_herdr
+    # The one case /proc (and process-info) cannot rule out: the pane's shell
+    # is blocked reading input, so `pane run` lands as *text* and nothing
+    # starts.  spawn() must answer with what the pane is running afterwards,
+    # not with whether the command was accepted — otherwise mutual watch
+    # records a respawn, burns its grace period and a flap slot, and the
+    # daemon is still dead.
+    echo "Omar-worker" > "$FAKE_PANE_LABEL"
+    echo '[{"name":"bash","pid":3827260,"argv":["/bin/bash"],"cmdline":"/bin/bash"}]' > "$FAKE_PANE_PROCS"
+    export FAKE_PANE_RUN_SWALLOWED=1
+    export CREWVIA_MUX_LAUNCH_VERIFY_SECONDS=1
+
+    run python3 "$LIB_MUX_PY" spawn "Omar-worker" "claude --revived"
+    [ "$status" -eq 1 ]
+
+    # It did try — the point is the answer, not the attempt.
+    herdr_log_contains "pane run ${FAKE_PANE_ID} claude --revived"
+
+    rm -f "${REPO_ROOT}/registry/mux/Omar-worker.json"
+}
+
 @test "herdr spawn: reusing a husk refreshes the pane id cache" {
     setup_fake_herdr
+    start_fake_herdr_identity_socket
     echo "Omar-worker" > "$FAKE_PANE_LABEL"
     echo '[{"name":"bash","pid":1,"argv":["/bin/bash"],"cmdline":"/bin/bash"}]' > "$FAKE_PANE_PROCS"
 
@@ -919,20 +1031,23 @@ print('herdr backend selected OK')
 
 @test "herdr spawn: cache file is written after successful spawn" {
     setup_fake_herdr
+    start_fake_herdr_identity_socket
     # Use a name not in the default pane list.
     echo "Existing-worker" > "$FAKE_PANE_LABEL"
 
     CACHE_DIR="${REPO_ROOT}/registry/mux"
     CACHE_FILE="${CACHE_DIR}/New-worker.json"
 
-    python3 "$LIB_MUX_PY" spawn "New-worker" "claude" 2>/dev/null || true
+    python3 "$LIB_MUX_PY" spawn "New-worker" "claude" 2>/dev/null
 
-    # Cache file should exist and contain pane_id.
-    if [[ -f "$CACHE_FILE" ]]; then
-        grep -q "pane_id" "$CACHE_FILE"
-        # Cleanup.
-        rm -f "$CACHE_FILE"
-    fi
+    # Cache file must exist and contain pane_id — unconditional now that
+    # server-identity resolution has a real socket to succeed against
+    # (t045 F-2: this used to be wrapped in `if [[ -f "$CACHE_FILE" ]]`,
+    # which passed silently even when the file was never written).
+    [ -f "$CACHE_FILE" ]
+    grep -q "pane_id" "$CACHE_FILE"
+
+    rm -f "$CACHE_FILE"
 }
 
 # ---------------------------------------------------------------------------
@@ -1227,9 +1342,13 @@ STALE_FAKE
     run python3 "$LIB_MUX_PY" send "Omar-worker" "hello"
     [ "$status" -eq 0 ]
 
-    # pane get must have been called with STALE_ID (cache verification).
-    herdr_log_contains "pane get STALE_ID"
-    # Then pane list for re-resolution.
+    # The record above names no mux server (legacy format), so nothing can say
+    # which server's ids it is about: it is not asked about at all — a
+    # `pane get` over a fresh CLI connection could be answered by a different
+    # server (Kai 2巡目 P2-2).  A record that does name one is asked on a
+    # connection verified to be that generation (tests/test_renamed_pane_and_bound_existence.py).
+    [ "$(herdr_log_count "pane get STALE_ID")" -eq 0 ]
+    # So the pane is found by label: pane list for re-resolution.
     herdr_log_contains "pane list"
     # Finally pane run with the resolved id.
     herdr_log_contains "pane run w1:p1"
@@ -1638,7 +1757,10 @@ setup_fake_crewvia_tree() {
     FAKE_TREE="$(mktemp -d)"
     mkdir -p "${FAKE_TREE}/config" "${FAKE_TREE}/scripts"
     cp "${REPO_ROOT}/crewvia" "${FAKE_TREE}/crewvia"
-    cp "${REPO_ROOT}/scripts/lib_mux.py" "${FAKE_TREE}/scripts/lib_mux.py"
+    # lib_mux.py は lib_task_cards.py / lib_daemon_state.py ... に読み取りを通し、
+    # フォールバックを持たない (単体でコピーすると import で落ちる)。lib はまとめて写す
+    # (tests/fixture_tree.sh。lib を足すたびにここを直す運用が CI でだけ赤くなった)。
+    copy_scripts_libs "${REPO_ROOT}" "${FAKE_TREE}"
     printf 'mode: herdr\ntaskvia: disabled\n' > "${FAKE_TREE}/config/crewvia.yaml"
 
     FAKE_TREE_DISPATCH="${FAKE_TREE}/dispatch.log"

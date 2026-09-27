@@ -206,6 +206,8 @@ Director の対応 (参照: `agents/director.md §17`):
 
 Worker の義務的動作:
   目標: 30 秒以内に HANDOFF.md 作成 + plan.sh fail 完了
+  （`plan.sh fail` は `--head "$(git rev-parse HEAD)"` が必須。HANDOFF.md にも同じ head を書く。
+   `knowledge/fail-evidence.md`）
   「完璧な HANDOFF.md」より「30 秒以内に終了」を優先
   最低限 progress/remaining/注意点の 3 点のみ記載して完了させる
 

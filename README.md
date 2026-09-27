@@ -96,6 +96,7 @@ Crewvia uses the following environment variables. Add them to your shell profile
 | `APPROVAL_TOKEN_TTL_SECONDS` | Optional | One-time token TTL in seconds (default: `900`) |
 | `CREWVIA_VERIFICATION_UI` | Optional | Set in **Taskvia's** Vercel env (not crewvia). `disabled` hides all verification UI and redirects `/verification-queue` to `/` |
 | `CREWVIA_MUX` | Optional | Mux backend override: `tmux` or `herdr`. Overrides `mode:` in `config/crewvia.yaml` |
+| `CREWVIA_MUX_RECORD_SWEEP` | Optional | Set `0` to stop the cleanup of stale mux spawn records (`registry/mux/*.json`, left behind when a pane vanished without going through `kill`). Enabled by default; only the cleanup stops, nothing else. See `knowledge/daemon-authority.md` §7-14 |
 | `CREWVIA_WORKER_PERMISSION_MODE` | Optional | `claude --permission-mode` value for Worker sessions (default: `auto`). Set empty to fall back to the CLI's own default/manual mode |
 | `CREWVIA_DIRECTOR_PERMISSION_MODE` | Optional | `claude --permission-mode` value for the Director session (default: unset — CLI's own default/manual mode, since the Director bypasses the Taskvia approval hook entirely and relies on this as its only gate) |
 
@@ -248,7 +249,7 @@ The mapping is defined in `config/crewvia.yaml` under `model_per_skill`:
 | Skill | Default model | Rationale |
 |---|---|---|
 | `planning`, `plan_review`, `review`, `research` | `claude-opus-5` | Deep reasoning reduces errors |
-| `docs`, `qa`, `verify` | `claude-haiku-4-5-20251001` | Lightweight tasks, cost savings |
+| `docs`, `qa`, `verify` | `claude-sonnet-5` | Haiku ignores `--permission-mode auto` and stalls on approval dialogs |
 | `code`, `bash`, `python`, `typescript`, `database`, `cloud`, `ops` | `claude-sonnet-5` | worker_model fallback (not in model_per_skill) |
 
 When multiple skills are specified, the strongest model wins (`opus > sonnet > haiku`).
@@ -309,6 +310,203 @@ For a per-session override without editing the config:
 ```bash
 CREWVIA_MUX=herdr ./crewvia
 ```
+
+### Task graph view with herdr-task-graph (optional)
+
+[herdr-task-graph](https://github.com/tyz-works/herdr-task-graph) is a herdr plugin that
+draws the task dependency DAG, which tasks are running, and which are ready to run in
+parallel. Every time `plan.sh` changes the queue, Crewvia rewrites
+`registry/task-graph/tasks.json` (all active missions, ids qualified as `<mission>:<tNNN>`);
+the plugin only reads that file. **Use plugin 0.3.0 or later** (0.2.0 fixed `[offline]` and
+made it reload by itself; 0.3.0 fixed overlapping boxes and shows the task label and mission).
+Older versions still work, with the limits described under
+[Limitations](#limitations) and how to move off them under
+[Upgrading the plugin](#upgrading-the-plugin).
+
+**Nothing here is required.** Crewvia works exactly the same without the plugin, without
+herdr, and in tmux mode: generating the file never calls herdr, and if generation itself
+fails, `plan.sh` logs one line to stderr and keeps its own exit code. Set
+`CREWVIA_TASK_GRAPH=0` to turn generation off completely (nothing is written, nothing is
+logged).
+
+#### Setup (once)
+
+Run this from the **main checkout** of Crewvia, not from a worker worktree — the symlink
+must point at the file that Director and Workers actually update.
+
+```bash
+# 1. The plugin (or `herdr plugin link <path-to-a-local-clone>` for development)
+herdr plugin install tyz-works/herdr-task-graph
+#    then check the reported version is 0.3.0 or later (see "Upgrading the plugin" if not)
+
+# 2. Generate the file once so the link has something to point at
+./scripts/plan.sh task-graph
+
+# 3. Point the plugin's config dir at Crewvia's file
+CONFIG_DIR="$(herdr plugin config-dir io.github.tyz-works.task-graph)"
+mkdir -p "$CONFIG_DIR"
+ln -sfn "$PWD/registry/task-graph/tasks.json" "$CONFIG_DIR/tasks.json"
+```
+
+Crewvia owns the file; the symlink is the only thing in the plugin's config dir, so there is
+never a second copy to keep in sync. Generation replaces the file atomically, and the link
+follows it.
+
+Do **not** use `HERDR_TASKS_FILE`. It is read by the plugin, but plugin panes inherit the
+environment of the running herdr *server*, not of the shell that invokes the action, so an
+`export` in your shell never reaches the pane (verified against herdr 0.9.0). It only works if
+it was set when the herdr server started, and restarting the server closes every tab.
+
+#### Opening it
+
+Open it when you want to look; `./crewvia` does not open it for you (it is an optional
+extra, and Crewvia must not depend on herdr for it):
+
+```bash
+herdr plugin action invoke open-task-graph --plugin io.github.tyz-works.task-graph
+```
+
+Each invocation opens a new tab, so close the old one when you are done.
+
+#### Reading the view
+
+| Plugin state | Crewvia status |
+|---|---|
+| `READY` / `WAIT` | `pending` — `READY` when the dependencies are met by the same rule `plan.sh pull` uses, otherwise `WAIT`. A `failed` dependency does **not** count as met: the task waits (`[保留: <id> が failed]`) until a Director runs `plan.sh release-dep` (see [Failed dependencies hold their dependents](#failed-dependencies-hold-their-dependents)) |
+| `RUN` | `in_progress`, `verifying` |
+| `DONE` | `done`, `verified`, `skipped` (`[skip]`) |
+| `FAIL` | `failed`, `verification_failed` (`[検証NG]`), `cancelled` (`[中止]`), unreadable task file (`[破損]`) |
+| `BLOCK` | `blocked` (`[停止]`); waiting for a human: `needs_director`, `needs_human_review`, `ready_for_verification` (all `[要判断]`); unknown status (`[status不明]`) |
+
+`WAIT` means "waiting for a dependency", `BLOCK [要判断]` means "waiting for a person".
+Other markers in a title: `[依存不明: id]` (depends on a task that does not exist),
+`[循環依存: id]` (a dependency cycle was cut there so the rest of the graph still renders),
+`[id重複: id]`, and a single `[表示する task なし]` node when there are no tasks at all.
+
+#### Limitations
+
+Measured in an isolated herdr 0.9.0 with Crewvia `f9353fa` and plugin `d2b8195` (0.3.0),
+three missions / 62 tasks and two agent panes. Details and the raw numbers:
+`knowledge/task-graph.md`.
+
+**With plugin 0.3.0 or later**
+
+- **The header reads `[live]`, not `[connected]`.** That is the plugin's word for "connected to
+  the herdr socket, not `[offline]`". It stays `[live]` while Workers are running, and the
+  boxes show the agent's state (`claude · idle`).
+- **It reloads by itself.** The plugin watches `tasks.json` (mtime, inode, size; the symlink is
+  followed). After `plan.sh update`, the footer counts changed in **0.4 to 0.6 seconds**
+  (four runs: 0.58 / 0.36 / 0.35 / 0.36 s, including the ~0.15 s `plan.sh` itself) without
+  pressing `r`. `r` still reloads on demand.
+- **Boxes do not overlap and every task is reachable.** A level wider than the pane wraps into
+  rows, and the graph scrolls (`↑ N more` / `↓ N more`). At widths 80, 120 and 200, `j` pressed
+  62 times visits all 62 tasks with the selection always on screen. A box shows
+  `[STATE] tNNN · <mission tail>`, the title, then the agent. At width 200 an AGENTS panel takes
+  the right side, so boxes are narrower and the title is shorter (cosmetic).
+- **Enter on a task with a Worker focuses that Worker's pane** (see "Worker ↔ task pane link"
+  below; checked by comparing `focused_pane_id` before and after).
+- **An unreadable file is an error, not the sample.** If `tasks.json` exists in the plugin's
+  config dir (a dangling symlink counts) but cannot be read, the bottom line shows
+  `ERROR: cannot read …/tasks.json` and the last good graph stays on screen; it recovers on its
+  own once the file is back (2 s in the test).
+- **The agent name shown is `claude`, not the Worker's name** (`Arjun-worker`): the plugin does
+  not read the pane label. Enter still lands on the right pane. Showing the name needs a change
+  in the plugin.
+- **The title check still matters.** If the config dir has **no** `tasks.json` entry at all, the
+  plugin has nothing configured and shows its bundled example graph without any error. So if the
+  title is neither `crewvia / <slug>` (exactly one active mission) nor `crewvia / N missions`
+  (zero, or two or more), you are looking at that example: re-run `./scripts/plan.sh task-graph`
+  and check the link.
+- **`open-task-graph` opens a new tab on every invocation** (its manifest says "Open or focus",
+  but it does not avoid duplicates). Close the old tab; automating the invocation would pile up
+  tabs. Not addressed yet.
+
+**With plugin 0.1.1 (what you get if you have not upgraded)**
+
+- **It does not reload by itself.** Press `r` to re-read the file. Crewvia updates the file
+  immediately, but the tab keeps showing what it read last (measured: file updated, tab
+  unchanged after 4 s, `r` brought it up to date).
+- **With herdr 0.9.0, it shows `[offline]` as soon as one agent exists.** Once a Worker is
+  running, the header reads `TASK DAG [offline]` and the bottom line
+  `ERROR: [Errno 32] Broken pipe`, and there is no live agent state. Cause: the plugin sent
+  `events.subscribe` on the same connection after `session.snapshot`, but the server closes a
+  connection after one request unless the first request is `events.subscribe`. Fixed in
+  plugin 0.2.0 (separate connections).
+- **Boxes overlap** when a level has many tasks (a box is cut like `[DO|`), and rows that do
+  not fit are dropped. Fixed in plugin 0.3.0.
+- **A missing or unreadable file silently shows the bundled example.** Fixed in plugin 0.2.0
+  for a configured-but-unreadable file (see the title check above).
+- Task states you see are Crewvia's in every version: Crewvia writes an explicit `status` for
+  every task, and the plugin prefers it to anything it derives from an agent, so `[offline]`
+  only costs you the agent name and state inside a box.
+
+**Regardless of the plugin version**
+
+- **Worker ↔ task pane link.** The generated `pane_match` (`<Name>-worker`) never matches in
+  herdr 0.9.0: the plugin sees the agent's `pane_id`, not the pane label that carries
+  `<Name>-worker`. So for a task with a Worker on it, Crewvia also writes that Worker's `pane_id`,
+  taken from its spawn record (`registry/mux/<Name>-worker.json`), which the plugin does match.
+  This only reads the record and `/proc`; it never contacts herdr. The `pane_id` is left out
+  (and only `pane_match` remains) when the record is missing, unreadable, not from herdr, or
+  names a herdr server that is no longer running. Each node also carries a short `label`
+  (`tNNN`) and a `group` (the mission slug, which tells apart the same `tNNN` of different
+  missions); plugins that do not know them ignore them, and 0.3.0 shows them. Details:
+  `knowledge/task-graph.md` §4-4.
+- Only active missions are drawn, so `plan.sh archive` a finished mission to clear it from the
+  view.
+
+#### Upgrading the plugin
+
+Do this only when you decide to change the plugin the running herdr uses; it changes your
+herdr, so it is not something a Worker does. The commands below were rehearsed end to end in an
+isolated herdr (there, `herdr` was pointed at the isolated server; you run it as is).
+
+The plugin you are replacing is a `link` to a local clone. Note its path first — it is your way
+back — and if it is under `/tmp`, copy it somewhere that survives a reboot before you switch:
+
+```bash
+ID=io.github.tyz-works.task-graph
+herdr plugin list          # note the current [local:<path>] — this is the rollback target
+```
+
+```bash
+# 0. Make sure the new clone is at the commit you intend (0.3.0 or later)
+NEW=~/workspace/herdr-task-graph
+git -C "$NEW" fetch origin && git -C "$NEW" rev-parse HEAD origin/main
+
+# 1. Close the open Task Graph tab: an already-open pane keeps running the old code
+PANE=$(herdr api snapshot | python3 -c 'import sys,json; s=json.load(sys.stdin)["result"]["snapshot"]; print([p["pane_id"] for p in s["panes"] if p.get("label")=="Task Graph"][0])')
+herdr plugin pane close "$PANE"      # skip if no Task Graph tab is open
+
+# 2. Swap the link
+herdr plugin unlink $ID
+herdr plugin link "$NEW"             # the reply shows the new version, e.g. 0.3.0
+
+# 3. Open it again (each call opens a new tab)
+herdr plugin action invoke open-task-graph --plugin $ID
+```
+
+Check: `herdr plugin list` shows `[local:<NEW>]` and the link reply said the new version. The
+tab title is `crewvia / <slug>` (or `crewvia / N missions`), the header reads `[live]`, there is
+no `ERROR:` line, and the bottom line shows the `j/k … Enter … r … q` keys. You do **not** have
+to recreate the config-dir symlink: `unlink` / `link` leave `tasks.json` there (checked with
+`ls -l`), so the swap cannot make the plugin lose Crewvia's file. It takes a few seconds.
+
+**Rolling back** (rehearsed too): link the old clone again.
+
+```bash
+PANE=$(herdr api snapshot | python3 -c 'import sys,json; s=json.load(sys.stdin)["result"]["snapshot"]; print([p["pane_id"] for p in s["panes"] if p.get("label")=="Task Graph"][0])')
+herdr plugin pane close "$PANE"
+herdr plugin unlink $ID
+herdr plugin link <the path you noted from `herdr plugin list`>   # e.g. the 0.1.1 clone
+herdr plugin action invoke open-task-graph --plugin $ID
+```
+
+The link reply shows the old version and the tab goes back to how the old version looked
+(0.1.1: `[offline]`, `Broken pipe`, overlapping boxes, with Workers running). If the old clone
+lived under `/tmp` and was deleted by a reboot, the link fails — which is why you copy it first.
+
+Operational notes and troubleshooting: `knowledge/task-graph.md`.
 
 ---
 
@@ -537,7 +735,7 @@ the Americas, Africa, and Slavic regions — 50 names by default.
 | `database` | DB operations, queries |
 | `cloud` | Cloud platforms (AWS, OCI, GCP) |
 | `docs` | Documentation writing |
-| `codex-review` | Automated PR review via Codex CLI (Kai-codex). No Worker needed — the Dispatcher spawns `scripts/kai-review.sh` directly when a task with this skill and a `--pr-number` is unblocked. Requires the `codex` CLI (see [Prerequisites](#prerequisites)). See `knowledge/codex-reviewer.md` |
+| `codex-review` | Automated PR review via Codex CLI (Kai-codex). No Worker needed — the Dispatcher spawns `scripts/kai-review.sh` directly when a task with this skill and a `--pr-number` is unblocked (`plan.sh done <id> "<result>" --pr <N>` on the PR-producing task sets it for you). Requires the `codex` CLI (see [Prerequisites](#prerequisites)). See `knowledge/codex-reviewer.md`. A diff over 300KB is refused (fail-closed) and the refusal is recorded, so the Dispatcher does not respawn the review — switch to a manual diff review, or split the PR and `plan.sh update <id> --pr-number <new PR>` |
 
 ---
 
@@ -626,6 +824,30 @@ Director が直接 Worker にタスクを送る代わりに、Dispatcher がタ�
 | **Dispatcher** | 5秒ごとにタスク状況を確認し、idle Worker にタスクを割り当てる |
 | **Worker** | Dispatcher からの assign を受け取り、`plan.sh pull` で取得して実行 |
 
+### Dispatcher と Watchdog の責務境界・相互監視
+
+並列モードでは `scripts/dispatcher.sh`（5秒ポーリング）と `scripts/watchdog.py`（30秒ポーリング）
+の 2 つの常駐デーモンが動く。責務は明確に分かれている:
+
+| デーモン | 権限 | 判断材料 |
+|---|---|---|
+| **Dispatcher** | 仕事の割り当ての判定者 | `queue/`（task frontmatter・assignments・mission state） |
+| **Watchdog** | Worker を終了させる唯一の実行者。後始末（task を `pending` に戻す・assignment を消す）まで自己完結 | `registry/`（heartbeat・pane の生死） |
+
+両者は互いの存在を知らないまま並んで動いているだけでは、片方が死んでも誰も気付けない。そこで
+dispatcher と watchdog は `scripts/lib_daemon_watch.py` を通じて**相互に heartbeat を見張り**、
+相手が stale（既定: dispatcher 60秒 / watchdog 240秒）かつプロセスが実際に消えていることを確認できた
+場合にだけ respawn し、Director へ事後報告する（判定は常に fail-closed — 確証が無ければ respawn せず
+保留する）。しきい値・flap ガード等は `config/crewvia.yaml` の `daemons:` ブロックで調整できる。
+
+相互監視は「相手を見る」仕組みなので、**両方が同時に死ぬ**（herdr 再起動・OOM 等）ケースだけは
+互いに救えない。この場合だけ、Director セッションの PostToolUse hook（`hooks/post-tool-use.sh`）が
+両デーモンの heartbeat 同時 stale を検知し、Director の次のツール実行の拍子に 1 行警告する（60秒に
+1回まで throttle）。判定は安いものから順に行い（`registry/daemons/` の存在確認 → heartbeat の
+mtime → role 解決 → throttle）、throttle マーカーは role が director と判明した呼び出しだけが
+消費する。Worker のツール呼び出しはマーカーに一切触れないため、Worker が並行して動いていても
+Director の通知窓が奪われることはない（t049）。詳細設計は `knowledge/daemon-authority.md` を参照。
+
 ### Communication flow
 
 1. Director decomposes mission → registers tasks with `plan.sh add`
@@ -637,6 +859,62 @@ Director が直接 Worker にタスクを送る代わりに、Dispatcher がタ�
 7. Worker reports completion via `plan.sh done`, then waits for next Dispatcher assign
 8. Dispatcher notifies Director when a new Worker skill is needed or all missions are complete
 9. Director responds to Dispatcher notifications (spawns Workers / archives mission)
+
+Assignments are checked by machine, not by the Worker's self-check (see `knowledge/assignment-routing.md`):
+
+- `start.sh` records each Worker's `TARGET_DIR` (or `null`) in `registry/workers/<Name>/target_dir.json`.
+  The Dispatcher only hands a `target_dir` task to a Worker whose recorded `TARGET_DIR` matches, and never
+  hands a crewvia-local task to a Worker started in another repo. When no Worker can take a task, the
+  request to the Director carries a ready-to-paste `start.sh` command.
+- The Dispatcher does not send a second task to a Worker whose first task was sent but not yet pulled.
+- `plan.sh pull --task` refuses (exit 3, writes nothing) a task whose `target_dir` does not match the
+  Worker's `TARGET_DIR`, and a Worker that already holds a different task (in progress or assigned).
+- `plan.sh done <id> "<result>" --pr <N>` writes `pr_number` onto the `codex-review` / `review` tasks that
+  are blocked by `<id>` and un-blocks a `blocked` `codex-review` task. `--pr` is explicit only; the result
+  text is never parsed. A drafted plan may mark a task `status: blocked` if it has a `blocked_reason`.
+  If a `codex-review` task is waiting on `<id>` for its PR number, `done` without `--pr` is refused (exit 2,
+  nothing written); a task that does not produce a PR closes with `--no-pr "<reason>"` (recorded on the card).
+  The Dispatcher also tells the Director once about a ready `codex-review` task that has no `pr_number`.
+
+State-based notifications (a task in `needs_director`, a `failed` task with a handoff, a refused
+`codex-review`) are sent **once per state**, not repeated on a timer: the Dispatcher keeps a
+ledger in `registry/daemons/notified-state.json` and notifies again only when the situation
+changes. If a notification never reached you, delete that file and the current states are
+re-sent once (see `knowledge/notify-once.md`).
+
+### Failed dependencies hold their dependents
+
+When a task fails (typically a QA task), the tasks that list it in `blocked_by` are **held**,
+not started: `plan.sh pull` and the Dispatcher both refuse them, `plan.sh status` shows
+`🛑 tNNN … HELD` with the command to release it, and the task graph marks it `[保留: <id> が failed]`.
+A Director decides after reading why it failed:
+
+```bash
+plan.sh release-dep <task_id> --mission <slug>                  # safe to proceed (e.g. a fix task)
+plan.sh update <task_id> --mission <slug> --status skipped      # abandon it
+```
+
+`--mission` matters: task IDs are numbered per mission, so without it the command applies to the
+default mission's task with the same ID. `cancelled` dependencies still count as met.
+See `knowledge/failed-dependency-hold.md`.
+
+`plan.sh fail` also requires evidence: `--head <sha>` (a real commit; or `--no-head "<reason>"`,
+which is recorded on the card) and, if a handoff is passed, an absolute path whose content
+mentions that head — so a stale handoff from an earlier round cannot be resubmitted
+(see `knowledge/fail-evidence.md`).
+
+### `plan.sh` arguments are strict
+
+An unknown option (`--agent` on `done`, a typo) or a surplus positional argument is refused with the
+usage and exit 2 (`pull` exits 1 — its exit 2 means "no task available"); nothing is written.
+`-h` / `--help` prints the usage for every subcommand and writes nothing to `queue/` or `registry/`.
+Everything after `--` is positional (for a title that begins with an option-looking word).
+
+Without `--mission`, `done` / `fail` / `needs-director` / `update` refuse a task id that exists in
+several missions and print the command to type for each — unless `CREWVIA_MISSION_SLUG` names a
+mission where *you* (`AGENT_NAME`) are the worker of that task and it is `in_progress`. `pull` takes
+its skills from `--skills`, then `$SKILLS`, then the registry (and refuses if there are none), and a
+registry `role: director` cannot pull. See `knowledge/plan-sh-strict-args.md`.
 
 ### Kanban card structure
 
@@ -670,7 +948,9 @@ crewvia/
 │   └── autonomous-improvement.yaml  # Self-improvement scope settings
 ├── hooks/
 │   ├── pre-tool-use.sh            # PreToolUse hook — Taskvia approval gate
-│   └── post-tool-use.sh           # PostToolUse hook — knowledge log posting
+│   └── post-tool-use.sh           # PostToolUse hook — knowledge log posting +
+│                                   #   Director-only backstop for simultaneous
+│                                   #   dispatcher/watchdog death
 ├── agents/
 │   ├── director.md            # Director system prompt
 │   └── worker.md                  # Worker system prompt

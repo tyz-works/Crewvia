@@ -96,7 +96,7 @@ Worker 起動時に使用するモデルは以下の優先順位で決まる:
 | skill | デフォルトモデル |
 |---|---|
 | `planning` / `plan_review` / `review` / `research` | `claude-opus-5` (深い推論が必要) |
-| `docs` / `qa` / `verify` | `claude-haiku-4-5-20251001` (軽タスク・コスト削減) |
+| `docs` / `qa` / `verify` | `claude-sonnet-5` (Haiku は permission-mode auto を無視して承認ダイアログで止まるため) |
 | `code` / `bash` / `python` / `typescript` / `database` / `cloud` / `ops` | `claude-sonnet-5` (worker_model フォールバック — model_per_skill に定義なし) |
 
 > ℹ️ 詳細な設計判断は `knowledge/model-per-skill.md` を参照。カスタマイズは `config/crewvia.yaml` の `model_per_skill` を編集すること。
@@ -274,6 +274,15 @@ idle 時の stderr 例（参考、Worker は内容を解釈しなくて良い）
 [plan.sh pull] no task available: no_skill_match — 3 pending task(s) found but none match skills ['ops']
 ```
 
+reason が `retirement_reserved` の場合、あなたの退役処理が進行中である（watchdog が
+`registry/retirements/<あなたの名前>.*` を置いている）。これも exit 2 なので対応は同じ
+（待って再試行 → やがて shutdown）で、**特別な操作は不要**。退役中の Worker に新しい
+task を渡すと、その task を実行中にシグナルが飛んで宙に浮くため、plan.sh の側で断っている。
+
+前任の退役が kill まで済んで**後始末だけが残っている**とき（同名の Worker を起動し直した直後）は、`plan.sh pull` が
+「前任の後始末待ちです。最大 60 秒待って取り直します」と出して待ち、後始末が終わったら 1 回で取る。
+この待ちは plan.sh の内側なので、Worker が自分で再試行・sleep する必要は無い。
+
 ### 環境変数を export して worktree に移動する
 
 ```bash
@@ -296,9 +305,11 @@ fi
 
 worktree に移動した後、以降のすべての Bash コマンドは worktree を cwd として実行される（Claude Code は Bash ツール呼び出し間で cwd を保持する）。
 
-### task JSON の target_dir を確認する
+### task JSON の target_dir と cwd を確認する
 
-pull した task JSON には `target_dir` フィールドが含まれる。Director が Worker を起動する時点で `TARGET_DIR` env var も既にセット済みのはずだが、念のため task JSON と env var を突き合わせて確認する:
+pull した task JSON には `target_dir` フィールドが含まれる。**Worker の `TARGET_DIR` と task の `target_dir` の照合は plan.sh が行う**
+（`pull` が別の target の task を取らない。`pull --task` は exit 3 で断り、何も書かない）ので、カードの冒頭に「`echo $TARGET_DIR` が
+空でなければ差し戻せ」のような自己確認を書いても、Worker がそれをする必要も無い。残る確認は **cwd が正しい場所か**:
 
 ```bash
 TASK_TARGET_DIR=$(echo "$TASK_JSON" | jq -r .target_dir)
@@ -346,8 +357,12 @@ Dispatcher から `タスクなし、shutdown` を受信したら **即座に** 
 
 Watchdog がタイムアウトを通知した場合（「タイムアウトのため中断します」）、**30 秒以内** に以下を完了させること:
 
-1. HANDOFF.md を作成（最低限: 進捗 / 残作業 / 注意点の 3 点）
-2. `plan.sh fail <task_id>` を実行
+1. HANDOFF.md を作成（最低限: 進捗 / 残作業 / 注意点の 3 点 + **検証・作業した head**（`git rev-parse HEAD` の出力））
+2. `plan.sh fail <task_id> "$HANDOFF_PATH" --head "$(git rev-parse HEAD)"` を実行
+   （`--head` は必須。handoff にその head が書かれていないと拒否される — 古い handoff の再提出を防ぐため。
+   git 管理外で head が無いときだけ `--no-head "<理由 1 行>"`。記録に残り Director に見える）
+   `$HANDOFF_PATH` は **絶対パス**（`crewvia_handoff_path "$AGENT_NAME" "$TASK_ID"`、§7 Step 2）。
+   相対パスは `plan.sh fail` が拒否する — dispatcher は main repo 基準で読むので、worktree 基準の検証と食い違う
 
 > **優先順位**: 「完璧な HANDOFF.md」より「30 秒以内の終了」を優先する。
 > Watchdog は 60 秒で SIGTERM → 70 秒で SIGKILL を実行する。
@@ -593,6 +608,18 @@ Worker はここで手動 bump を呼ばないこと（二重 bump 防止）。
 plan done "$TASK_ID" "実行した内容と結果の要約" --mission "$TASK_MISSION"
 ```
 
+**成果物が PR の task は `--pr <N>` を付け、Result の 1 行目に `PR #<N>` も書く**:
+
+```bash
+plan done "$TASK_ID" "PR #123 ..." --mission "$TASK_MISSION" --pr 123
+```
+
+`--pr` は、この task を `blocked_by` に持つ `codex-review` / `review` の task に `pr_number` を書き、
+`blocked` の codex-review を `pending` に戻す（Director が手で入れる必要は無い）。**明示フラグだけ**
+（Result の本文から番号は推測されない）。伝える先が無ければ 1 行そう表示されるだけで、エラーではない。
+オプションは `plan done` の位置引数（task id と Result）の**後ろ**に置いてよいが、`--pr` の綴りを間違えると
+`unknown option` で拒否される（何も書かれない — Result を打ち直す）。
+
 > **移行予告**: 将来的に `plan.sh done` は `plan.sh ready-for-verification <task_id>` に移行予定。
 > Verifier 機能（M-QA-4）が導入されるまでは `done` を使い続けてよい。
 
@@ -606,7 +633,7 @@ plan needs-director "$TASK_ID" "詰まった理由を具体的に記述" --missi
 
 - タスクは `needs_director` 状態になり、`done` 遷移はブロックされる
 - 後続タスクの `blocked_by` は解除されない（依存関係を保つ）
-- Director が `plan.sh update <task_id> --status in_progress --reset` で差し戻し、追加指示を出す
+- Director が `plan.sh update <task_id> --status pending --reset` で差し戻し、追加指示を出す（`--status in_progress --reset` は罠 — `--reset` 適用後に `--status` が上書きするため in_progress/worker=null のまま止まる）
 - `plan.sh needs-director` は「代替検証して done を無理やり呼ぶ」より **常に安い選択肢**であること
 - ⚠️ **reason は必ず 1 行に収めること**（frontmatter の `needs_director_reason` に直接書かれるため、改行を含めると task ファイルの frontmatter が壊れる）。長い説明が必要な場合でも、詰まった経緯の詳細は次の `plan.sh done` (または Director への直接連絡) で補うこと。`plan.sh done` の result にはこの 1 行制約は無い（上記「Result の記録方法」参照）
 
@@ -720,8 +747,13 @@ mkdir -p "$(dirname "$HANDOFF_PATH")"
 **Step 4**: plan.sh fail を実行:
 
 ```bash
-plan fail "$TASK_ID" "$HANDOFF_PATH" --mission "$TASK_MISSION"
+plan fail "$TASK_ID" "$HANDOFF_PATH" --head "$(git rev-parse HEAD)" --mission "$TASK_MISSION"
 ```
+
+`--head`（検証対象の commit SHA）は**必須**。HANDOFF.md に同じ head を書いておくこと（Step 3 の
+`## ブランチ` の隣に `## head` を書く）。別の head 時点の古い handoff を再提出すると拒否される。
+検証対象が git 管理外で head を出せないときだけ `--no-head "<理由 1 行>"`（免除は card に残る）。
+`$HANDOFF_PATH` は Step 2 の絶対パスのまま渡すこと。相対パスは `plan.sh fail` が拒否する（`--no-head` のときも）。
 
 **Step 5**: Director に報告:
 
@@ -743,6 +775,9 @@ handoff_path: $HANDOFF_PATH
 
 ## ブランチ
 {branch_name}
+
+## head
+{git rev-parse HEAD の出力 — plan.sh fail --head に渡すものと同じ}
 
 ## 進捗サマリー
 [ここに何をどこまでやったかを記述]

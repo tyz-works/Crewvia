@@ -63,3 +63,27 @@ Taskvia 承認をスキップして「native permission にフォールバック
 使える(`chmod` という文字列を Bash コマンド冒頭に含めないため危険コマンド判定に掛からない)。
 また `git add <file> && git update-index --chmod=+x <file>` で git のインデックス上のモード
 (100755)だけ先に確定させる手もある(コミット後のチェックアウトでは実ファイルにも反映される)。
+
+## 2026-09-22 Haruto発見: dispatcher.sh の埋め込み python を抽出して「本物を駆動する」回帰テスト harness
+
+dispatcher.sh は daemon ループ全体が単一の `python3 - <<'PYEOF' ... PYEOF` heredoc として
+埋め込まれている (bash の `while true; do python3 - ... <<'PYEOF' ... PYEOF; sleep 5; done`)。
+回帰テストがこのロジックを test 内で再実装すると、dispatcher.sh 本体が壊れても検出できない
+(t031/PR#207 Seo review F2 — `--status TOTAL-GARBAGE-NOT-A-STATUS` に差し替えても green のまま)。
+
+対策: `awk '/<<.PYEOF.$/{f=1;next} f && /^PYEOF$/{exit} f'` で埋め込み python 本体を
+そのまま抽出し、tmux/herdr と通信する唯一の I/O 境界 (`_mux.send`/`_mux.list`、
+`_mux = Mux()` の直後) だけをテキスト置換でスタブしてメッセージをキャプチャする。
+REPO_ROOT には `repo_identity_ok()` ガード (`root.is_dir() and (root/'.git').exists()`) が
+あるため、REGISTRY_DIR の親ディレクトリを `git init` だけした空リポジトリにする必要がある
+(history/remote は不要)。`from lib_mux import Mux` は `sys.path.insert(0, REPO_ROOT/'scripts')`
+で解決されるため、このフェイク REPO_ROOT には scripts/ が存在せず import が失敗する —
+`PYTHONPATH=<本物の scripts dir>` を渡すことで import 自体は本物の lib_mux を使いつつ、
+REGISTRY_DIR/QUEUE_DIR だけ完全に隔離できる。
+
+なお `needs_director_reason` 等のフロントマター値は `plan.sh` 書き込み側 (`_dump_scalar`)
+が埋め込み改行を常に " / " に畳み込む (PR #181) ため、on-disk の値が実際に複数物理行に
+なることは構造的にありえない。「複数行 reason → 1 行目 + 省略記号」というテストを書くなら
+実際に発火する経路 (200 文字超の単一行 reason の `[:200]` カットオフ) を使うこと —
+literal `\n` を frontmatter に埋め込んでも parser (`_scalar`) は `\n` を unescape しないため
+何も起きない。

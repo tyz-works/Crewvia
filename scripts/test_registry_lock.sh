@@ -86,9 +86,63 @@ root = pathlib.Path(sys.argv[1])
 exclude = {
     root / "scripts" / "lib_registry.py",
     root / "scripts" / "test_registry_lock.sh",
+    # pytest の tmp_path に使い捨ての registry を 1 度だけ組み立てるテスト。
+    # shell の `>` による初期化を対象外にしたのと同じ理由で対象外にする:
+    # 存在しないファイルを作る一回きりの書き込みで、並行書込の相手が
+    # 存在しない (repo の registry/workers.yaml には一切触れない)。
+    # 迂回を隠す余地を残さないよう、ファイル単位の明示列挙に留める
+    # — tests/ 全体を外すと本物の迂回がテストの下に隠れる。
+    root / "tests" / "test_dispatcher_retirement_exclusion.py",
+    # 同上 (t008 backstop テスト)。pytest の tmp_path 配下に合成 registry を
+    # 1 度だけ組み立てるだけで、repo の registry/workers.yaml には触れない
+    # (REPO_ROOT は hooks/post-tool-use.sh のパス解決にしか使っていない)。
+    root / "tests" / "test_daemon_backstop_hook.py",
+    # 同上 (t018 の guarded-read 構造テスト)。`_dispatcher_sandbox(root)` の
+    # root は全呼び出しで `tmp_path / "repo"` であり、書き込みは pytest の
+    # 使い捨てツリーに閉じる。このファイルの REPO_ROOT は
+    # `verifier-dispatcher.sh` の `.read_text()` にしか使っておらず、
+    # repo の registry/workers.yaml に書く経路は存在しない。
+    root / "tests" / "test_guarded_reads_on_direct_paths.py",
+    # 同上 (t025 の実 dispatch() 1 サイクルのテスト)。`_run_one_cycle()` の root は
+    # `Sandbox(tmp_path)` が作る `tmp_path / "repo"` で、idle Worker 1 人ぶんの
+    # workers.yaml を 1 度だけ書く。書き込みは pytest の使い捨てツリーに閉じ、
+    # repo の registry/workers.yaml に書く経路は存在しない。
+    root / "tests" / "test_dispatcher_cycle_honours_hold.py",
+    # 同上 (t017 の add-skills テスト)。`registry` fixture は `tmp_path / "registry" /
+    # "workers.yaml"` に固定の内容を 1 度だけ書き、書き込みは pytest の使い捨て
+    # ツリーに閉じる (repo の registry/workers.yaml には一切触れない)。add_skills
+    # 自身は lib_registry.py の with_lock を通る (test_the_whole_cycle_runs_under_
+    # the_registry_lock がそれを固定する)。
+    root / "tests" / "test_registry_skills_and_spawn_env.py",
+    # 欠陥注入スクリプト。`p.write_text(s)` の p は `git archive HEAD` を
+    # mktemp -d に展開した使い捨てツリーの **Python ソースファイル** であって
+    # registry ではない。"workers.yaml" は注入するソース文字列と直前の見出し
+    # コメントに現れるだけで、近接ヒューリスティックがそれを拾っている。
+    root / "tests" / "red_proof_t018.sh",
+    # t010 の通知テスト。`Harness.__init__` が pytest の `tmp_path / "repo"` に
+    # 使い捨ての registry を 1 度だけ組み立てる (dispatcher は REGISTRY_DIR 直下の
+    # workers.yaml を読むので、その名前で置く必要がある)。書き込みは tmp_path に
+    # 閉じ、repo の registry/workers.yaml に書く経路は存在しない。
+    root / "tests" / "test_dispatcher_notify_once.py",
+    # t001 (#13) の needs-director / Rule 2 のテスト。end-to-end 1 本が `Sandbox(tmp_path)` の
+    # `tmp_path / "repo"` に idle Worker 用の workers.yaml を 1 度だけ書く (dispatcher は
+    # REGISTRY_DIR 直下のその名前を読む)。書き込みは pytest の使い捨てツリーに閉じ、
+    # repo の registry/workers.yaml に書く経路は存在しない。
+    root / "tests" / "test_needs_director_releases_assignment.py",
+    # t009 (割り当ての機械照合) の実 dispatch() 1 サイクルのテスト。`repo` fixture が `tmp_path /
+    # "repo"` の使い捨てツリーに、idle Worker 1 人と Director のぶんの workers.yaml を 1 度だけ書く
+    # (dispatcher は REGISTRY_DIR 直下のその名前を読む)。書き込みは pytest の使い捨てツリーに閉じ、
+    # repo の registry/workers.yaml に書く経路は存在しない。
+    root / "tests" / "test_assignment_routing.py",
+    # t013 (registry の隔離テスト)。`World` が pytest の `tmp_path` に「本番の代役」の registry を
+    # 1 度だけ組み立て、その registry が **変わらないこと**を確かめるテスト。書き込みは使い捨て
+    # ツリーに閉じ、repo の registry/workers.yaml に書く経路は存在しない。
+    # (この除外は、worktree 内で検査が有効になって初めて見つかった — 修正前は素通りしていた。)
+    root / "tests" / "test_registry_isolation.py",
 }
 proximity = 15
 found = []
+scanned = 0
 
 for path in root.rglob("*"):
     if not path.is_file():
@@ -97,10 +151,17 @@ for path in root.rglob("*"):
         continue
     if path in exclude:
         continue
-    if ".git" in path.parts:
+    # 除外判定は **root からの相対パス**で行う。絶対パスの parts を見ると、root 自身が
+    # worktree (`<repo>/.claude/worktrees/<mission>/<task>/`) のとき全ファイルが
+    # `.claude` + `worktrees` に当たって検査対象が 0 件になり、この静的検査は
+    # worktree の中では必ず PASS した (t013)。除外したいのは root の下に入れ子になった
+    # 別の worktree だけ。
+    rel_parts = path.relative_to(root).parts
+    if ".git" in rel_parts:
         continue
-    if ".claude" in path.parts and "worktrees" in path.parts:
+    if ".claude" in rel_parts and "worktrees" in rel_parts:
         continue
+    scanned += 1
     try:
         lines = path.read_text().splitlines()
     except Exception:
@@ -116,8 +177,21 @@ for path in root.rglob("*"):
 
 for f in found:
     print(f)
+# 最終行: 実際に検査したファイル数 (0 件で「見つからなかった」を PASS にしないため)
+print(f"#scanned={scanned}")
 PYEOF
 )"
+
+SCANNED_COUNT="$(printf '%s\n' "$BYPASS_OUT" | sed -n 's/^#scanned=//p' | tail -n 1)"
+BYPASS_OUT="$(printf '%s\n' "$BYPASS_OUT" | grep -v '^#scanned=' || true)"
+
+# 検査対象が 0 件なら、除外判定が全部を外している (worktree の中で絶対パスを見ていたときの
+# 欠陥)。「迂回が見つからなかった」ではなく「何も見ていない」なので FAIL にする。
+if [[ -z "$SCANNED_COUNT" || "$SCANNED_COUNT" -lt 50 ]]; then
+  fail "static check inspected only '${SCANNED_COUNT:-?}' files under $OWN_CHECKOUT_ROOT (expected >= 50) — the exclusion rule is skipping the tree"
+else
+  pass "static check inspected $SCANNED_COUNT files under $OWN_CHECKOUT_ROOT (not vacuous)"
+fi
 
 if [[ -n "$BYPASS_OUT" ]]; then
   while IFS= read -r line; do

@@ -124,6 +124,29 @@ if [[ ! -f "$PLAN_SH" ]]; then
   exit 1
 fi
 
+# --- 実効 mission の解決 (t026 / PR #214 Kai 3 巡目 P2) ---
+# `--mission` は省略できる (plan.sh が解決する) が、この後の処理には mission 名が要る:
+# サイズ超過の拒否記録は `<mission>__<task>.json` として書かれ、dispatcher は同じ名前で探す。
+# 省略のまま `MISSION_SLUG` が空だと記録が書かれず、task が pending に戻されたとき
+# dispatcher が同じ拒否済みレビューをもう一度 spawn する (#11 のループ)。
+# **pull の前に 1 度だけ解決して保持し**、以降の plan.sh 呼び出し (pull / needs-director /
+# done) と拒否記録のすべてに同じ値を渡す。解決は plan.sh 自身に聞く (`resolve-mission`):
+# 探索順 (default_mission 優先) は `pull` と同じ定義を共有しており、ここで別々に
+# 解決して食い違う形にしない。--mission が明示されていれば、そのまま使う (従来どおり)。
+if [[ -z "$MISSION_SLUG" ]]; then
+  if RESOLVED_MISSION="$("$PLAN_SH" resolve-mission "$TASK_ID" 2>/dev/null)" \
+     && [[ -n "$RESOLVED_MISSION" ]]; then
+    MISSION_SLUG="$RESOLVED_MISSION"
+    _info "Resolved mission for ${TASK_ID}: ${MISSION_SLUG}"
+  elif [[ $DRY_RUN -eq 1 ]]; then
+    # dry-run は plan.sh の状態に依存しない smoke test のまま。書き込みは元々しない。
+    _warn "could not resolve the mission of ${TASK_ID} (dry-run continues without it)"
+  else
+    _error "could not resolve the mission of task ${TASK_ID} — pass --mission <slug>"
+    exit 1
+  fi
+fi
+
 # --- failure path 共通ヘルパー (F4, PR#180) ---
 # 全ての needs-director 呼び出しをここに統一し、--mission 漏れを防ぐ。
 # call_needs_director: needs-director を呼ぶだけ（exit しない）。findings 判定後の
@@ -311,7 +334,24 @@ fi
 DIFF_BYTES=$(printf '%s' "$DIFF_CONTENT" | wc -c)
 MAX_DIFF_BYTES=$((300 * 1024))  # 300KB
 if [[ $DIFF_BYTES -gt $MAX_DIFF_BYTES ]]; then
-  fail_needs_director "NEEDS FIX: diff is ${DIFF_BYTES} bytes (> ${MAX_DIFF_BYTES}) — too large to trust against silent context truncation (fail-closed, t006 acceptance criterion i)"
+  # t010 (#11): 拒否した「事実」を記録する。同じ PR は何度やっても同じ大きさなので、
+  # 記録が無いと dispatcher が pending に戻された task をまた spawn し、また拒否し、
+  # needs_director を再送し続ける (spawn → 拒否 → needs_director → pending → spawn)。
+  # dispatcher はこの記録がある間は spawn せず、Director に手動差分レビューへの
+  # 切り替えを 1 回だけ伝える。**needs-director より先に書く** — task が
+  # needs_director に見えた時点で記録が既にある、という順序が要る。
+  # 書けなくても拒否自体は止めない (fail-closed のまま)。ループの抑止は台帳
+  # (dispatcher 側の「伝えた」記録) が別に担うので、通知の洪水にはならない。
+  # --dry-run は plan.sh への書き込みを一切しない約束なので、こちらも書かない。
+  if [[ $DRY_RUN -eq 0 && -n "$MISSION_SLUG" ]]; then
+    if ! python3 "${SCRIPT_DIR}/lib_review_refusal.py" record \
+         --registry "${CREWVIA_REPO_ROOT:-$REPO_ROOT}/registry" \
+         --mission "$MISSION_SLUG" --task "$TASK_ID" --pr "$PR_NUM" \
+         --diff-bytes "$DIFF_BYTES" --max-bytes "$MAX_DIFF_BYTES" >/dev/null; then
+      _warn "could not record the size refusal for ${MISSION_SLUG}/${TASK_ID} — dispatcher may respawn this review after a reset"
+    fi
+  fi
+  fail_needs_director "NEEDS FIX: diff is ${DIFF_BYTES} bytes (> ${MAX_DIFF_BYTES}) — too large to trust against silent context truncation (fail-closed, t006 acceptance criterion i). PR#${PR_NUM}: 手動差分レビューに切り替えてください"
 fi
 _info "Diff size: ${DIFF_BYTES} bytes"
 

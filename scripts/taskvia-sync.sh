@@ -46,7 +46,7 @@ fi
 MAP_FILE="${QUEUE_DIR}/.taskvia-map.json"
 AUTH_HEADER="Authorization: Bearer ${TASKVIA_TOKEN}"
 
-python3 - "$QUEUE_DIR" "$MAP_FILE" "$TASKVIA_URL" "$AUTH_HEADER" <<'PYEOF'
+python3 - "$QUEUE_DIR" "$MAP_FILE" "$TASKVIA_URL" "$AUTH_HEADER" "$SCRIPT_DIR" <<'PYEOF'
 import sys
 import os
 import re
@@ -57,6 +57,15 @@ queue_dir   = sys.argv[1]
 map_file    = sys.argv[2]
 taskvia_url = sys.argv[3]
 auth_header = sys.argv[4]
+scripts_dir = sys.argv[5]
+
+# task カードの読み取りは crewvia の中で 1 箇所しかない (Codex 5 巡目 P2)。
+# ここに frontmatter を直接読むコードを書き戻さないこと — Taskvia に出る姿と
+# `plan.sh status` に出る姿が、静かにズレる。
+sys.path.insert(0, scripts_dir)
+from lib_task_cards import (  # noqa: E402
+    is_unreadable, list_task_cards, read_regular_text_or_unreadable,
+)
 
 state_file = os.path.join(queue_dir, 'state.yaml')
 missions_dir = os.path.join(queue_dir, 'missions')
@@ -115,27 +124,18 @@ def parse_yaml(text):
     return result
 
 
-def parse_frontmatter(text):
-    lines = text.splitlines()
-    if not lines or lines[0].strip() != '---':
-        return None
-    end = None
-    for i in range(1, len(lines)):
-        if lines[i].strip() == '---':
-            end = i
-            break
-    if end is None:
-        return None
-    return parse_yaml('\n'.join(lines[1:end]))
-
-
 # ---------- map I/O ----------
 
 def load_map(path):
+    # queue/.taskvia-map.json。素の open() だと FIFO 1 枚で同期全体が
+    # 無期限に止まる (t018)。欠損 = 初回同期なので `{}` でよい —— 倒す先は
+    # 「もう一度送る」= 冪等 (knowledge/empty-vs-unobservable.md §2 の K)。
+    text = _read_queue_text(path)
+    if is_unreadable(text):
+        return {}
     try:
-        with open(path) as f:
-            return json.load(f)
-    except (OSError, json.JSONDecodeError):
+        return json.loads(text)
+    except ValueError:
         return {}
 
 
@@ -217,34 +217,44 @@ def http_delete(url):
 
 # ---------- mission scanning ----------
 
+def _read_queue_text(path):
+    """queue のファイルを種類を確かめてから読む。
+
+    読めたら `str`、読めなければ `Unreadable` —— 空文字でも None でもない
+    (t018)。失敗を「空」と同じ形で返さないので、呼び出し側が取り違えられない。
+    """
+    return read_regular_text_or_unreadable(
+        path,
+        warn=lambda msg: print(f"[taskvia-sync] WARNING: {msg}", file=sys.stderr))
+
+
+
 def scan_missions():
     """Yield (slug, mission_meta, task_meta) for every task in active missions."""
     if not os.path.exists(state_file):
         return
-    with open(state_file) as f:
-        state = parse_yaml(f.read())
+    # 固定パスの読み取りにも種類のガードを当てる (Codex 8 巡目 P2)。上限の無い
+    # `open()` は、書き手のいない FIFO 1 枚で同期全体を無期限に止める。
+    state_text = _read_queue_text(state_file)
+    if is_unreadable(state_text):
+        return                      # 観測できなかった = 何も同期しない
+    state = parse_yaml(state_text)
     active = state.get('active_missions') or []
     for slug in active:
         mdir = os.path.join(missions_dir, slug)
         myaml = os.path.join(mdir, 'mission.yaml')
         if not os.path.exists(myaml):
             continue
-        with open(myaml) as f:
-            mission_meta = parse_yaml(f.read())
-        tdir = os.path.join(mdir, 'tasks')
-        if not os.path.isdir(tdir):
-            continue
-        entries = []
-        for fn in os.listdir(tdir):
-            m = re.fullmatch(r't(\d+)\.md', fn)
-            if m:
-                entries.append((int(m.group(1)), fn))
-        entries.sort()
-        for _, fn in entries:
-            with open(os.path.join(tdir, fn)) as f:
-                meta = parse_frontmatter(f.read())
-            if meta is None:
-                continue
+        mission_text = _read_queue_text(myaml)
+        if is_unreadable(mission_text):
+            continue                # この mission だけ飛ばす (他は同期する)
+        mission_meta = parse_yaml(mission_text)
+        # 読み取りは scripts/lib_task_cards.py に 1 つだけ (plan.sh / dispatcher.sh
+        # と同じもの)。識別子はファイル名から来るので、`id` 行を直し忘れたコピーが
+        # Taskvia 側で空 id / 別カードの上書きになることが構造上なくなる。
+        # 信用できないカードも `[破損]` として出る —— 黙って消すと、ボードだけを
+        # 見ている人には「そんな task は無い」と読めてしまう。
+        for meta, _body in list_task_cards(os.path.join(mdir, 'tasks')):
             yield slug, mission_meta, meta
 
 

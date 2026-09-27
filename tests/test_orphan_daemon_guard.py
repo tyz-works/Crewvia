@@ -327,8 +327,12 @@ def _load_dispatcher_namespace(repo_root: Path) -> dict:
     m = re.search(r"<<'PYEOF'\n(.*)\nPYEOF", text, re.S)
     assert m, "could not locate the python heredoc in dispatcher.sh — has the marker changed?"
     src = m.group(1)
-    src, n = re.subn(r"\npublish_agents\(\)\ndispatch\(\)\s*$", "", src)
-    assert n == 1, "could not strip the trailing publish_agents()/dispatch() call — dispatcher.sh structure changed?"
+    # t002: cut at the explicit marker rather than at a literal call sequence.
+    # The cycle gained two more calls (sweep_spawn_grace_markers /
+    # warn_on_unconsumed_retirements) and matching the exact tail meant this
+    # loader broke the moment the entry point grew.
+    src, n = re.subn(r"\n# --- CYCLE ENTRY POINT ---\n.*$", "", src, flags=re.S)
+    assert n == 1, "could not strip the cycle entry point — dispatcher.sh structure changed?"
 
     fake_lib_mux = types.ModuleType("lib_mux")
     fake_lib_mux.Mux = FakeDispatcherMux

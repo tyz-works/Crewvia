@@ -4,7 +4,8 @@
 # Regression tests for plan.sh pull blocked_by enforcement.
 # Covers both --task (dispatcher→Worker path) and auto-selection path.
 #
-# Related: PR #108 (failed/cancelled dep regression), dispatcher-blocked-by-analysis.md
+# Related: PR #108 (failed/cancelled dep regression), dispatcher-blocked-by-analysis.md,
+#          t007 / backlog #9 (failed dep is HELD until the Director release-dep's it)
 #
 # Run: npx bats tests/dispatcher-blocked-by.bats
 #      (requires Node.js / npx; bats 1.13+ recommended)
@@ -164,12 +165,28 @@ cleanup_queue() {
   [ "$status" -eq 0 ]
 }
 
-@test "--task: blocked_by failed dep → pull succeeds (PR #108 regression)" {
-  # failed dep should NOT block (dep will never complete; downstream should proceed)
+@test "--task: blocked_by failed dep → pull refused as HELD (t007, was PR #108)" {
+  # PR #108 let a failed dep through so a fix task would not stall forever.  That let a
+  # review task run right after its QA FAILed (backlog #9).  A failed dep is now HELD:
+  # refused until the Director releases it, with the way out spelled in the message.
   setup_queue "bbt-failed-dep"
   add_task t001 failed ""
   add_task t002 pending "t001"
 
+  run plan_pull_task t002
+  cleanup_queue
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"HELD"* ]]
+  [[ "$output" == *"release-dep t002"* ]]
+}
+
+@test "--task: failed dep + release-dep → pull succeeds (Director's explicit release)" {
+  setup_queue "bbt-failed-dep-released"
+  add_task t001 failed ""
+  add_task t002 pending "t001"
+
+  CREWVIA_QUEUE="$TEST_QUEUE" bash "$PLAN_SH" release-dep t002 --mission "$TEST_MISSION"
   run plan_pull_task t002
   cleanup_queue
 
@@ -198,8 +215,8 @@ cleanup_queue() {
   [[ "$output" == *"blocked"* ]]
 }
 
-@test "--task: all deps done, one was failed → pull succeeds" {
-  # t002 blocked_by [t001, t003]; t001=done, t003=failed → both are "terminal" → unblocked
+@test "--task: one dep done, one dep failed → pull refused as HELD" {
+  # t002 blocked_by [t001, t003]; t001=done, t003=failed → t003 is held (t007)
   setup_queue "bbt-mixed-deps-done"
   add_task t001 done ""
   add_task t003 failed ""
@@ -208,7 +225,9 @@ cleanup_queue() {
   run plan_pull_task t002
   cleanup_queue
 
-  [ "$status" -eq 0 ]
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"HELD"* ]]
+  [[ "$output" == *"t003"* ]]
 }
 
 @test "--task: one dep done, one dep pending → pull rejected" {

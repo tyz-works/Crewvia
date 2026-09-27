@@ -91,6 +91,11 @@ if any(dep not in done_ids
 
 ## 4. PR #108 との整合性確認
 
+> **更新 (t007 / backlog #9)**: 以下は PR #108 時点の記録。**`failed` の依存を満たされた扱いにする
+> 規則は撤回された** — QA FAIL 直後に review task が自動で進む事故の原因だったため。いまは
+> `failed` は保留 (`plan.sh release-dep` で Director が解除するまで進まない)、`cancelled` だけが
+> 満たされた扱い。`knowledge/failed-dependency-hold.md` を参照。以下のコード片は現行ではない。
+
 **PR #108** (fix: pull ガードが failed/cancelled dep を誤って blocking 扱いする regression):
 
 修正前:

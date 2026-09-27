@@ -39,6 +39,8 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OWN_CHECKOUT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# shellcheck source=../tests/fixture_tree.sh
+source "$OWN_CHECKOUT_ROOT/tests/fixture_tree.sh"
 PLAN_SH="$OWN_CHECKOUT_ROOT/scripts/plan.sh"
 
 PASS_COUNT=0
@@ -63,7 +65,7 @@ _run_variant() {
   export CREWVIA_QUEUE="$T/queue"
   unset TASKVIA_URL TASKVIA_TOKEN 2>/dev/null || true
   cp "$OWN_CHECKOUT_ROOT/scripts/lint_plan.py" "$T/scripts/"
-  cp "$OWN_CHECKOUT_ROOT/scripts/lib_verdict.py" "$T/scripts/"
+  copy_scripts_libs "$OWN_CHECKOUT_ROOT" "$T"    # lib_verdict.py ほか (tests/fixture_tree.sh)
   cp -r "$OWN_CHECKOUT_ROOT/config/." "$T/config/"
   "$PLAN_SH" init "Test Mission" --mission testmission >/dev/null 2>&1
 

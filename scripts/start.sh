@@ -507,6 +507,12 @@ registry/workers.yaml でこの名前のエントリを確認し、過去の tas
   # Update last_active for this worker in registry
   REGISTRY_YAML="${REPO_ROOT}/registry/workers.yaml"
   if [[ -f "$REGISTRY_YAML" ]]; then
+    # 起動時に渡された skills を registry の skills に和集合で足す（消さない）。
+    # dispatcher は task の skills を registry と突き合わせるので、registry が
+    # 古いと「起動要求 ⇄ 仕事なし退役」が互いを打ち消す（backlog #14）。
+    if [[ ${#SKILLS_ARR[@]} -gt 0 ]]; then
+      python3 "${SCRIPT_DIR}/lib_registry.py" add-skills "$REGISTRY_YAML" "$AGENT_NAME" "${SKILLS_ARR[@]}"
+    fi
     python3 "${SCRIPT_DIR}/lib_registry.py" set-last-active "$REGISTRY_YAML" "$AGENT_NAME"
   fi
 
@@ -660,30 +666,65 @@ PYEOF
   # Director/Worker の claude プロセスへ汚染が伝播しないよう、起動直前に必ず除去する。
   #
   # export PATH: mux (tmux/herdr) が spawn する新しいペインは、この start.sh
-  # プロセスが export した PATH を継承しない（spawn() の env= 引数はどちらの
-  # backend でも未実装 — 上の ENV_EXPORTS と同じ理由）。scripts/bin/plan を
+  # プロセスが export した PATH を継承しない（spawn() は env 引数を持たない —
+  # 上の ENV_EXPORTS と同じ理由）。scripts/bin/plan を
   # 使えるようにするため、ペイン側の $PATH に対して明示的に prepend する。
   LAUNCH_CMD="$ENV_EXPORTS; export PATH='${REPO_ROOT}/scripts/bin:'\"\$PATH\"; unset CLAUDE_CODE_CHILD_SESSION; cd '$WORK_DIR'; claude${MODEL_CLI_ARG}${SETTINGS_CLI_ARG}${PERMISSION_MODE_CLI_ARG}"
+
+  # Drop spawn records whose pane is gone (a retired Worker's pane closes without
+  # `kill()`, so its record outlives it).  Housekeeping only: the answer never
+  # changes whether the spawn below is attempted, so a failure here is not one.
+  mux_reap_records >/dev/null 2>&1 || true
 
   # Spawn agent window (mux_spawn handles has-session/new-session/new-window internally).
   # mux_spawn only refuses when the window still holds a live agent; a window
   # left behind empty by a mux restart is relaunched in place and succeeds.
-  if ! mux_spawn "$WINDOW_NAME" "$LAUNCH_CMD" "$WORK_DIR"; then
-    # Check if the window already exists (safe no-op) vs a real error.
-    if mux_list | grep -qx "$WINDOW_NAME"; then
-      echo "[crewvia] $WINDOW_NAME is already running — not launching a second one"
-      # An existing Director is what the user wanted to reach, so attach to it
-      # instead of exiting silently.
-      if [[ "${ROLE}" == "director" ]]; then
-        echo "[crewvia] Attaching to $WINDOW_NAME ..."
-        mux_attach "$WINDOW_NAME"
-      fi
-    else
-      echo "[crewvia] ERROR: Failed to spawn mux window: $WINDOW_NAME" >&2
+  #
+  # The exit code says *why* it did not launch (t001): 10 = a live process is in
+  # the pane, 11 = the pane could not be read (treated as busy).  Only those may
+  # be reported as "already running".  Every other failure — including a
+  # relaunch into an empty pane that did not take, after which the name is still
+  # in `mux_list` — used to fall into the same message.
+  SPAWN_RC=0
+  mux_spawn "$WINDOW_NAME" "$LAUNCH_CMD" "$WORK_DIR" || SPAWN_RC=$?
+  if [[ $SPAWN_RC -ne 0 ]]; then
+    case $SPAWN_RC in
+      10) echo "[crewvia] $WINDOW_NAME is already running — not launching a second one" ;;
+      11) echo "[crewvia] $WINDOW_NAME exists but its pane could not be read — not launching a second one." >&2
+          echo "          確認: mux_capture $WINDOW_NAME (中身が空の shell なら mux_kill $WINDOW_NAME してから再実行)" >&2 ;;
+      *)
+        if mux_list | grep -qx "$WINDOW_NAME"; then
+          echo "[crewvia] ERROR: $WINDOW_NAME is listed but the launch did not take (spawn failed — see the warnings above)." >&2
+          echo "          'already running' ではありません。確認: mux_capture $WINDOW_NAME / 直すなら mux_kill $WINDOW_NAME してから再実行" >&2
+        else
+          echo "[crewvia] ERROR: Failed to spawn mux window: $WINDOW_NAME" >&2
+        fi
+        ;;
+    esac
+    # An existing Director is what the user wanted to reach, so attach to it
+    # instead of exiting silently.
+    if [[ "${ROLE}" == "director" && ( $SPAWN_RC -eq 10 || $SPAWN_RC -eq 11 ) ]]; then
+      echo "[crewvia] Attaching to $WINDOW_NAME ..."
+      mux_attach "$WINDOW_NAME"
     fi
     exit 0
   fi
   echo "[crewvia] Agent launched in mux window: $WINDOW_NAME"
+
+  # Worker の TARGET_DIR を記録する (t009 / #21)。dispatcher が「別 repo 用の Worker に
+  # crewvia 本体の task を回す」のを止める根拠になる。**起動が成功した後にだけ**書く —
+  # 上の 10/11 (既に生きた Worker が居る) で終わった呼び出しが、生きている Worker の記録を
+  # 別の TARGET_DIR で上書きしてはいけない。書き先は spawn 記録 (registry/mux/) とは別
+  # (kill の認可の証拠に相乗りしない。lib_worker_target.py の冒頭)。
+  # 書けなくても起動は止めない: 記録が無い Worker は「target_dir 付きの task を受けない」
+  # 側に倒れるだけで、crewvia 本体の task は従来どおり受ける。
+  if [[ "${ROLE}" == "worker" ]]; then
+    _RECORDED_TARGET=""
+    [[ "$WORK_DIR" != "$REPO_ROOT" ]] && _RECORDED_TARGET="$WORK_DIR"
+    python3 "${SCRIPT_DIR}/lib_worker_target.py" record "${REPO_ROOT}/registry" "$AGENT_NAME" \
+      "$_RECORDED_TARGET" >/dev/null \
+      || echo "[crewvia] WARNING: $AGENT_NAME の TARGET_DIR を記録できませんでした — target_dir 付きの task は割り当てられません" >&2
+  fi
 
   # Claude Code の入力プロンプト（❯）が表示されるまで待ってから kickoff メッセージを送る。
   # 固定 sleep だと環境依存でタイミングがずれるため、プロンプト検出でポーリングする。
@@ -755,20 +796,29 @@ PYEOF
     # CREWVIA_MUX を spawn するコマンド文字列自体に明示的に埋め込む。
     # mux_spawn (→ lib_mux.py spawn → 各 backend の pane_run/send-keys) はどの
     # backend でも呼び出し側プロセスの env を新しいペインへ自動伝播しない
-    # (spawn() は env= 引数を受け取るが両 backend とも未実装)。herdr は特に
+    # (spawn() は env 引数を持たない。渡すと TypeError — t017)。herdr は特に
     # サーバー起動時の env スナップショットを全ペインへ継承するため、
     # ambient env 継承に頼ると「dispatcher にはあるのに watchdog には無い」
     # ような非対称が起こりうる (t016)。コマンド文字列へ直接埋め込めば、
     # herdr/tmux のどちらでも、どのタイミングでペインが作られても確実に効く。
-    _MUX_ENV_PREFIX=""
-    if [[ -n "${CREWVIA_MUX:-}" ]]; then
-      _MUX_ENV_PREFIX="export CREWVIA_MUX='${CREWVIA_MUX}'; "
-    fi
-
-    # A name-only check would also match a window the mux restored empty, which
-    # is exactly how the dispatcher silently went missing.  mux_spawn answers
-    # the real question: it returns non-zero only when a live one is in there.
-    if mux_spawn "dispatcher" "cd '${REPO_ROOT}' && ${_MUX_ENV_PREFIX}bash '${SCRIPT_DIR}/dispatcher.sh'" "$REPO_ROOT"; then
+    # t005: 起動コマンドの単一の出どころは lib_daemon_watch.py。相互監視の
+    # respawn も同じ関数を通るので、「./crewvia で起動したデーモン」と
+    # 「相手デーモンに起こし直されたデーモン」が env や引数で食い違わない。
+    # 以前はここに文字列リテラルを持っていたが、2 箇所に同じ文字列がある状態は、
+    # まさに「どちらの backend と話すか」を決める変数だけが片方に無い、という形で
+    # ずれる (spawn_command() の docstring 参照)。
+    #
+    # t036: 起動は `spawn` サブコマンド経由。デーモンを起動する主体は
+    # ./crewvia・相手デーモンの respawn・手動 restart の 3 つあり、そのうち
+    # 2 つだけをロックで囲っても二重起動は閉じない。`spawn` はそのデーモンの
+    # ロックを取ってから起動するので、相手が respawn を決めた直後にここを
+    # 叩いても、片方が必ず待つ。
+    #
+    # 終了コードは以前の mux_spawn と同じ: 0 = 起動した / 非 0 = 起動しなかった
+    # (生きたものが既に居る、またはロックが取れなかった)。理由は stderr に出る。
+    # 名前だけの確認では mux が空で復元した窓も「起動済み」に見えてしまい、
+    # dispatcher が黙って居なくなる — 中身の生死で答えるのはこの先の spawn()。
+    if python3 "${SCRIPT_DIR}/lib_daemon_watch.py" spawn dispatcher --repo-root "$REPO_ROOT"; then
       echo "[crewvia] Dispatcher started in mux window: dispatcher"
     else
       echo "[crewvia] Dispatcher already running (dispatcher)"
@@ -777,7 +827,7 @@ PYEOF
     # Director: watchdog(v2)を mux 窓で起動（二重起動防止）
     # F6是正: tmuxモードでは従来watchdogが一度も起動していなかった。非tmuxブランチの
     # watchdog.sh(v1・DEPRECATED)ではなくwatchdog.py(v2)を起動する（v1は延命させない）。
-    if mux_spawn "watchdog" "cd '${REPO_ROOT}' && ${_MUX_ENV_PREFIX}python3 '${SCRIPT_DIR}/watchdog.py'" "$REPO_ROOT"; then
+    if python3 "${SCRIPT_DIR}/lib_daemon_watch.py" spawn watchdog --repo-root "$REPO_ROOT"; then
       echo "[crewvia] Watchdog(v2) started in mux window: watchdog"
     else
       echo "[crewvia] Watchdog already running (watchdog)"

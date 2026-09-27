@@ -8,12 +8,16 @@
 #   mux_available               → exit 0 if backend available (herdr: starts server if down)
 #   mux_server_running          → exit 0 if the mux server is already up (never starts it;
 #                                 tmux: `tmux list-sessions`, herdr: socket ping)
-#   mux_spawn <name> <cmd> [<cwd>]
+#   mux_spawn <name> <cmd> [<cwd>]  → exit 0 launched, 1 did not launch,
+#                                 10 pane occupied by a live process, 11 occupant unreadable
 #   mux_send  <name> <text>
+#   mux_keys  <name> <key>...   → press named keys (Up Down Left Right Enter Escape Tab) for a
+#                                 selection dialog; exit 2 on an unknown key (nothing sent)
 #   mux_verify_sent <name> <text> → exit 0 if <text> left the input line (landed), 1 if still stuck
 #   mux_capture <name>          → prints screen contents
 #   mux_list [<suffix>]         → one name per line
 #   mux_kill <name>
+#   mux_reap_records            → drop spawn records whose pane is gone (prints names dropped)
 #   mux_pid  <name>             → prints PID integer
 #   mux_attach <name>           → exec into the mux if outside; tab/switch if already inside
 
@@ -36,6 +40,10 @@ mux_send() {
     python3 "$_LIB_MUX_PY" send "$@"
 }
 
+mux_keys() {
+    python3 "$_LIB_MUX_PY" keys "$@"
+}
+
 mux_verify_sent() {
     python3 "$_LIB_MUX_PY" verify-sent "$@"
 }
@@ -50,6 +58,10 @@ mux_list() {
 
 mux_kill() {
     python3 "$_LIB_MUX_PY" kill "$@"
+}
+
+mux_reap_records() {
+    python3 "$_LIB_MUX_PY" reap-records
 }
 
 mux_pid() {

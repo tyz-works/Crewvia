@@ -60,6 +60,35 @@ Director の pane が本当に稼働中だった場合、`start.sh` は黙って
 
 ---
 
+## tmux でも同じ判定をする (t035)
+
+husk は herdr サーバー再起動に限った話ではない。**プロセスだけが死ぬ普通のクラッシュ**
+でも同じものが残る — `start.sh` も両 backend の `spawn` も pane にシェルを置いて
+そこへコマンドを流し込むので、エージェント / デーモンはシェルの子であり、死んでも
+シェルと label は残るからである。頻度は「稀」ではなく「毎回」。
+
+そのため tmux 側にも同じ判定を足した。`pane process-info` に当たる問い合わせが
+無いので、`#{pane_pid}` (pane シェルの pid) を入口に `/proc` を読む:
+
+| pane シェルの pid から見えるもの | 判定 | spawn の挙動 |
+|---|---|---|
+| comm がシェル **かつ** 生きた子プロセスが 0 | husk | **その窓へ send-keys し直して True** |
+| 子プロセスが 1 つでも居る | 稼働中 | False |
+| comm がシェルでない | 稼働中 | False |
+| pid が取れない / `/proc` が読めない | **稼働中とみなす** | False (fail-safe) |
+
+herdr が argv の長さで「プロンプト」と「スクリプト実行中」を分けるのに対し、tmux は
+**子の有無**で分ける。`bash scripts/dispatcher.sh` は pane シェルの子なので確実に
+捕まり、バックグラウンドに回った仕事も数えられる。
+
+これが無かった間、相互監視 (`knowledge/daemon-authority.md` §7) は tmux では
+respawn の手段を持たなかった。「タブが在る = 生きている」を捨てても、spawn 側が
+無条件に False を返すので何も起こせない。実装は
+`TmuxBackend._pane_has_live_process()` / `_pane_shell_is_idle()`、回帰は
+`tests/test_daemon_husk_respawn.py` (実 tmux 窓・実プロセス)。
+
+---
+
 ## 手動での診断
 
 自動復帰が効かない・様子がおかしい時の確認手順。
@@ -93,7 +122,9 @@ done
 
 ## 関連
 
-- `scripts/lib_mux.py` — `_is_idle_shell_process()` / `HerdrBackend._pane_has_live_process()` / `spawn()`
+- `scripts/lib_mux.py` — `_is_idle_shell_process()` / `HerdrBackend._pane_has_live_process()` /
+  `_pane_shell_is_idle()` / `TmuxBackend._pane_has_live_process()` / 両 `spawn()`
+- `knowledge/daemon-authority.md` §7-3-1 — husk を respawn 可能と認めた判断と、その理由
 - `scripts/start.sh` — Director spawn 失敗時の attach、dispatcher / watchdog ガード
 - `tests/lib-mux.bats` — "stale husk panes (herdr server restart)" セクション
 - `knowledge/dispatcher-restart-after-merge.md` — fix を merge しても稼働中 tab は旧コードのままな件

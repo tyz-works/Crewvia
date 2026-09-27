@@ -127,8 +127,12 @@ Dispatcher が Worker にタスクを割り当て・進行管理する（自動�
   ↓
 Dispatcher から通知を受け取る:
   「要求スキル [...] の Worker を起動してください」→ §16 参照
-  「全ミッション完了」→ plan.sh archive <slug> で退避 → ユーザーへ報告
+  「全ミッション完了」→ plan.sh archive <slug> で退避 → ログ保存（下記）→ ユーザーへ報告
 ```
+
+**mission 完了時のログ保存**: `plan.sh archive <slug>` の**後**に `./scripts/log_to_obsidian.sh --mission <slug>` を実行し、
+`~/obsidian/research/mission_log/YYYY-MM-DD_<slug>.md` ができたことを確認してからユーザーへ報告する
+（作られていなければ報告に「ログ未保存」と書く）。
 
 複数 mission を並走させる場合は、各 mission に対してこのフローを独立に回す。Workers は **active 全 mission を priority 優先で横断的に pull する**（同一優先度のタイブレークは default mission 優先 → 末尾は task id 順）。つまり緊急 mission の `high` タスクは、default mission の `medium` タスクよりも先に消化される。同一優先度の中では default mission に積んだ順から消化されるので、ルーティン作業とアドホックを `default` / `非default` に分けると整理しやすい。
 
@@ -277,8 +281,13 @@ required_evidence:
 
 - Worker が `plan.sh needs-director <task_id> "<理由>"` を呼ぶと、タスクは `needs_director` 状態になる
 - `plan.sh status` で 🆘 アイコンとともに表示される
-- Director は reason を読んで対処方針を決定し、`plan.sh update <task_id> --status in_progress --reset` で差し戻す
+- Director は reason を読んで対処方針を決定し、`plan.sh update <task_id> --status pending --reset` で差し戻す
+  （`--status in_progress --reset` は罠 — `--reset` の適用後に `--status` が上書きするため、最終状態が `status=in_progress / worker=null` になり dispatch 不能・pull 拒否のまま静かに全停止する。`--status pending` にすること）
 - 後続タスクの `blocked_by` は **解除されない**（needs_director は TERMINAL_STATUSES に含まれない）
+- `plan.sh needs-director` は呼んだ Worker の `queue/assignments/<name>` を撤去する（`done` / `fail` と同じ）。
+  **手で `rm queue/assignments/Kai-codex` する必要は無い** — 以前は残って以後の codex-review を止めていた。
+  判断待ちの Worker は card の `worker` で「仕事あり」と読まれるので、dispatcher に退役されず、新しい task も
+  渡されない（`knowledge/daemon-authority.md` §7-16）
 
 ### ⚠️ Worker への指示で「task ファイルの直接編集」を促さないこと (t015)
 
@@ -359,7 +368,7 @@ Worker に指示を出す際は:
 | `planning` | プランレビュー（タスク分解・依存関係・スキル割り当ての妥当性検証）。Bash(plan.sh status/pull), git log/diff は可。Edit/Write は deny |
 | `plan_review` | plan_review.md への verdict 出力専用（Write 可 / Edit・Bash 全面 deny）。planning とは権限が異なる。crewvia-plan-review skill 参照 |
 | `verify` | 実機検証・smoke test |
-| `codex-review` | Codex CLI (Kai-codex) による自動 review 専用。plan task には積むだけで良く、Dispatcher が `kai-review.sh` を自動 spawn する（Director が Worker を起動する必要はない）。`--pr-number` 必須。詳細は `knowledge/codex-reviewer.md` |
+| `codex-review` | Codex CLI (Kai-codex) による自動 review 専用。plan task には積むだけで良く、Dispatcher が `kai-review.sh` を自動 spawn する（Director が Worker を起動する必要はない）。`pr_number` が無いまま ready になった task は spawn されず、Director に `[review-no-pr]` が 1 回だけ届くが、**PR がまだ無い段階では手で入れない** — 実装 task を `blocked_by` に持たせ、実装 task を `plan.sh done <id> --pr <N>` で閉じると `pr_number` が自動で入る（下記「`codex-review` skill task の積み方」）。詳細は `knowledge/codex-reviewer.md` |
 
 ### skill 別デフォルトモデル
 
@@ -368,7 +377,7 @@ Worker 起動時のモデルは `config/crewvia.yaml` の `model_per_skill` で�
 | skill | デフォルトモデル | 理由 |
 |---|---|---|
 | `planning` / `plan_review` / `review` / `research` | `claude-opus-5` | 深い推論で誤判断を減らす |
-| `docs` / `qa` / `verify` | `claude-haiku-4-5-20251001` | 軽タスク・コスト削減 |
+| `docs` / `qa` / `verify` | `claude-sonnet-5` | Haiku は permission-mode auto を無視して承認ダイアログで止まる |
 | `code` / `bash` / `python` / `typescript` / `database` / `cloud` / `ops` | `claude-sonnet-5` | worker_model フォールバック (model_per_skill に定義なし) |
 
 複数 skill が指定された場合は最も要求の高いモデル (`opus > sonnet > haiku`) が選ばれる。詳細は `knowledge/model-per-skill.md` を参照。
@@ -554,8 +563,18 @@ Worker に crewvia 以外のプロジェクト (例: `~/workspace/taskvia`) を�
      SIGKILL 等で削除が実行されなかった場合は次回起動時に孤立ファイルを自動削除。
      手動リカバリ: `bash scripts/cleanup-target-dir.sh <TARGET_DIR> [AGENT_NAME]`
 
-4. **Worker がどの target project に割り当てられているかを把握しておく**
-   同じ Worker 名 (例: Hana) でも、起動時の `TARGET_DIR` が異なれば触るプロジェクトが変わる。Director は「今起動中の Hana はどの TARGET_DIR で動いているか」を混同しないように記憶しておく。
+4. **Worker の TARGET_DIR は記録されている — 覚えておく必要は無い**
+   同じ Worker 名 (例: Hana) でも、起動時の `TARGET_DIR` が異なれば触るプロジェクトが変わる。`start.sh` は起動が成功したとき
+   `registry/workers/<Name>/target_dir.json` に TARGET_DIR（crewvia 本体なら `null`）を記録し、dispatcher と
+   `plan.sh pull --task` がそれで task の `target_dir` を照合する。**別の TARGET_DIR の Worker には割り当てられず、
+   手で `pull --task` しても exit 3 で断られる**（何も書かれない）。確認は
+   `python3 scripts/lib_worker_target.py show "$CREWVIA_REPO_ROOT/registry" <Name>`。
+   合う Worker が居ないときの Director 通知には、**そのまま貼れる起動コマンド**が付く
+   （skill に合う Worker が別の TARGET_DIR で居るときは `assign-name.sh --fresh` 付き）。
+   起動済みの Worker は記録を持たない（次の再起動まで `target_dir: null` の Worker として扱われる）ので、
+   TARGET_DIR 付きで動いている Worker に target_dir 付きの task が回らないときは
+   `lib_worker_target.py record "$CREWVIA_REPO_ROOT/registry" <Name> <target_dir>` で書き直す
+   （相対の `registry` は worktree から実行すると別の registry に書き、dispatcher は読まないので無言で効かない）。
 
 起動モードによる挙動の違い:
 
@@ -921,29 +940,41 @@ AGENT_NAME=$REVIEWER bash scripts/start.sh worker review
 
 restart しないと、稼働 tab は旧コードで動き続け、fix が反映されていないように見える（誤診断の原因）。
 
+**dispatcher / watchdog は `scripts/lib_mux.py kill` を直接使わないこと。** 両者は相互監視
+(`scripts/lib_daemon_watch.py`、`knowledge/daemon-authority.md` §7) をしており、素朴に kill する
+と、kill してから自分で新コードを spawn するまでの隙間をピア側が「死んだ」と誤認し、**旧コード
+のまま respawn してしまう**（手動 respawn と競合する二重起動）。restart は必ず `lib_daemon_watch.py
+restart` 経由で行う — pane の所有者確認・maintenance マーカーでの相互監視一時停止・kill 失敗時の
+安全な中断までを 1 コマンドに内包している。
+
 **restart が必要なプロセス**:
 
 | プロセス | 対象ファイル変更時 |
 |----------|-----------------|
-| `dispatcher` tab | `scripts/dispatcher.sh` / `scripts/lib_mux.py` |
-| `watchdog` tab | `scripts/watchdog.py` / `scripts/watchdog.sh` |
+| `dispatcher` tab | `scripts/dispatcher.sh` / `scripts/lib_mux.py` / `scripts/lib_daemon_watch.py` / `scripts/lib_retirement.py` |
+| `watchdog` tab | `scripts/watchdog.py` / `scripts/lib_daemon_watch.py` / `scripts/lib_retirement.py` |
 | Worker tab | `scripts/start.sh` |
 | `Sora-director` | `agents/director.md` / `hooks/*.sh` |
 
-**restart 手順（dispatcher の例）**:
+**restart 手順（maintenance マーカー経由。片方だけ変更した場合はその daemon だけでよい）**:
 
 ```bash
 # 1. fix を pull
 git fetch origin main && git pull --ff-only origin main
 
-# 2. kill → respawn
-python3 scripts/lib_mux.py kill dispatcher
-python3 scripts/lib_mux.py spawn dispatcher \
-  "cd '$PWD' && bash '$PWD/scripts/dispatcher.sh'" "$PWD"
+# 2. pause → kill → 新コードで spawn → resume を 1 コマンドで行う
+#    (相互監視と競合しない。dispatcher / watchdog を個別に指定)
+python3 scripts/lib_daemon_watch.py restart dispatcher
+python3 scripts/lib_daemon_watch.py restart watchdog
 
-# 3. 起動確認
+# 3. 起動確認（両デーモンの heartbeat / recorded_instance_alive をまとめて見る）
+python3 scripts/lib_daemon_watch.py status
 tail -3 logs/dispatcher/dispatcher-$(date +%Y%m%d).log
 ```
+
+`restart` が `refused` で終わった場合（pane の中身が自分の checkout のものと確認できない等）は理由が
+stderr に出る。原因を確認せず `--force` へ逃げないこと — 別 checkout の daemon を巻き込む事故
+(2026-09-23 の実例) の再発防止がその確認の目的。
 
 詳細は `knowledge/dispatcher-restart-after-merge.md` を参照。
 
@@ -962,7 +993,17 @@ Dispatcher は常に **main 版の `scripts/kai-review.sh`**（$CREWVIA_REPO_ROO
 
 ### `codex-review` skill task の積み方（通常パス）
 
-`review`（Seo）とは別に、`--skills codex-review --pr-number <N>` で task を積むだけでよい。
+`review`（Seo）とは別に、`--skills codex-review --blocked-by <実装 task>` で task を積むだけでよい。
+**PR 番号は手で入れない**: 実装 task を `plan.sh done <id> --pr <N> --mission <slug> "<Result>"` で閉じると、
+その task を `blocked_by` に持つ `codex-review` / `review` の task に `pr_number` が書かれ（未設定のものだけ。
+Result の本文から推測はしない）、`blocked` の codex-review は `pending` に戻る。PR 番号待ちで止めておきたい
+task は drafting のうちから `status: blocked` + `blocked_reason` で積める（lint が受理する）。
+既に PR が存在する場合だけ `--pr-number <N>` で最初から入れる。`--pr` は Result 1 行目の `PR #<N>` と一緒に付ける。
+**`--pr` の付け忘れは仕組みで止まる**（t036）: その task を `blocked_by` に持つ未終了の codex-review に `pr_number` が
+無いのに `--pr` が無いと `done` は拒否する（exit 2・何も書かない）。PR を作らない task は
+`--no-pr "<理由 1 行>"` で免除される（card の `no_pr_waiver` に残る。`--pr` との併用・空の理由は拒否）。
+すり抜けて `pr_number` の無い codex-review が ready になった場合は、dispatcher が Director に
+`[review-no-pr]` を **1 回だけ**通知する（`plan.sh update <id> --pr-number <N> --status pending --mission <slug>` で再開）。
 Worker 起動は不要 — Dispatcher が `kai-review.sh` を自動 spawn し、`plan.sh pull` → `codex exec --output-schema`
 → `plan.sh done`/`needs-director` まで完走する。重要 mission では Seo（Claude）と Kai-codex（Codex）の
 **2 人体制**での verdict 突合も検討すること。詳細は `knowledge/codex-reviewer.md` を参照。
@@ -1014,29 +1055,39 @@ registry/
     John
 ```
 
-watchdog はこのファイルの更新時刻を監視し、**10分以上（デフォルト）更新がない Worker** を停止とみなす。
+watchdog はこのファイルの更新時刻を監視し、**idle_threshold（既定 300s。task frontmatter の `timeout.idle` で上書き可）を超えて更新がない Worker** を停止候補とみなす。
 
-### 停止検知時の動作
+これは Worker 個別の生存監視であり、`registry/daemons/{dispatcher,watchdog}.heartbeat`（dispatcher と
+watchdog 自身が互いを監視する相互監視の heartbeat）とは**別の仕組み**。後者は §12 の
+`lib_daemon_watch.py` が扱う。
 
-停止が検知されると:
+### 停止検知時の動作（t002 以降: Worker を終了させ後始末まで完結させる唯一の実行者）
 
-1. **stderr に警告を出力する**:
-   ```
-   [watchdog] WARNING: Worker {AGENT_NAME} — no heartbeat for 10+ minutes
-   ```
+watchdog は idle / max threshold を超えた Worker を**自ら終了させ、queue の後始末（task を
+`pending` に戻し assignment を消す = `plan.sh retire`）まで自己完結させる**。Director は後始末を
+手で行う必要はない — 以前の版（stderr 警告のみ、Taskvia alert のみで実際には何もしない）は廃止済み。
 
-2. **Taskvia トークンが設定されていれば `/api/log` に alert として通知される**:
-   ```json
-   {
-     "type": "alert",
-     "content": "Worker {AGENT_NAME} stopped responding (no heartbeat for 10+ min)",
-     "agent": "watchdog"
-   }
-   ```
+1. shutdown メッセージを Worker へ送り、応答が無ければ SIGTERM → SIGKILL と段階的に進める
+   （各ステップの間に猶予があり、応答すれば止まる）
+2. Worker プロセスの終了を確認したら `plan.sh retire` で task を `pending` に戻し、assignment を
+   削除する（世代 = `started_at` で束縛されるので、猶予期間中に別 Worker がその task を pull し
+   直していた場合は後任を巻き込まない — 詳細 `knowledge/daemon-authority.md`）
+3. mux 経由で Director の pane に **事後報告**を直接送る（Taskvia を介さない）。ポーリング不要
+   — 何か操作した拍子に届く。**timeout 終了は `[timeout]` の 1 通**で、task id・mission・どちらの上限か
+   （idle×2 / max）・経過秒・**`plan.sh update <id> --status pending --reset` が要るか**（後始末が成功していれば
+   「不要」）まで書いてある。同じ退役では 2 通目は出ない（台帳 `timeout_<mission>_<task>`）。同じ task が同じ上限に
+   また当たるなら task の frontmatter の `timeout`（idle / max）を見直す
 
-### 停止を検知した場合の対応フロー
+**Director がすることは基本的に「報告を読んで判断する」だけ**:
 
-**1. 当該 Worker のブランチを確認する**
+- 通常の終了報告（`terminated` / `respawned` 相当）→ 対応不要。task は既に `pending` に戻っており、
+  次の dispatcher cycle で誰かに再割り当てされる。partial commit の引き継ぎが要る場合だけ、以下の
+  ブランチ確認を行う
+- **判定不能 (`unprovable` / stall) の報告** → 自動処理を止めて保留している状態。報告文に従い、
+  `registry/retirements/<agent>.*` を人手で確認・削除するまで watchdog はそのまま待つ
+  （自動で `--reset` を打たないこと — 生きた Worker の作業を巻き戻す事故になる）
+
+**partial commit の引き継ぎが必要な場合のみ、ブランチを確認する**:
 
 ブランチ名は `task/<mission_slug>/<task_id>-<task_slug>` 形式。task_slug は plan.sh が自動生成するため、`git branch -a | grep <task_id>` で特定する:
 
@@ -1049,9 +1100,7 @@ git log --oneline origin/task/<mission_slug>/<task_id>-<task_slug>..HEAD
 git status
 ```
 
-partial commit（中途半端なコミット）がある場合は内容を確認し、引き継ぎ情報として次の Worker に渡すこと。
-
-**2. 必要であれば同スキルの新しい Worker を起動して引き継ぐ**
+partial commit（中途半端なコミット）がある場合は内容を確認し、引き継ぎ情報として次の Worker に渡すこと。task 自体は既に `pending` に戻っているので、通常は dispatcher が自動で次の同スキル Worker に配る。急ぎで手動起動したい場合のみ:
 
 ```bash
 NEW_WORKER=$(./scripts/assign-name.sh {skill1} {skill2})   # 位置引数
@@ -1059,13 +1108,31 @@ AGENT_NAME=$NEW_WORKER bash scripts/start.sh worker {skill1} {skill2}
 # plan.sh に引き継ぎメモを追記して Worker が参照できるようにする
 ```
 
-**3. heartbeat ファイルを削除してリセットする**
+heartbeat ファイルを手で `rm` する必要は無い — 後始末は watchdog が完結させる。
 
-```bash
-rm registry/heartbeats/{AGENT_NAME}
+### 両デーモンの同時死 backstop（t008）
+
+dispatcher と watchdog の相互監視は「相手を見る」仕組みなので、**両方が同時に死ぬ**ケース
+（herdr 再起動、OOM 等）はどちらも互いを起こせない。この場合だけ、Director 自身の PostToolUse
+hook（`hooks/post-tool-use.sh`）が `registry/daemons/{dispatcher,watchdog}.heartbeat` の mtime を
+見て検知し、ツール実行の拍子に stderr へ 1 行流し込む（60 秒に 1 回まで throttle 済み）。throttle
+マーカーは Director 自身の呼び出しだけが消費する（Worker のツール呼び出しでは一切更新されない、
+t049）ので、並列に動く Worker がいても Director の通知窓が奪われることはない:
+
+```
+[daemon-backstop] ⚠️ dispatcher と watchdog の heartbeat が両方 stale です (...)。
 ```
 
-これにより watchdog の警告が止まる。
+見えたら `python3 scripts/lib_daemon_watch.py status` で実際に両方死んでいるか確認し、本当に
+両方死んでいれば §12 と同じ手順で両方 `restart` する:
+
+```bash
+python3 scripts/lib_daemon_watch.py restart dispatcher
+python3 scripts/lib_daemon_watch.py restart watchdog
+```
+
+これは相互監視そのものではなく最後の保険なので、respawn の判断（flap ガード等）は行わない —
+必ず `status` で実際の生死を見てから手で判断すること。
 
 ---
 
@@ -1202,7 +1269,7 @@ Dispatcher からの通知を受け取った時だけ対応すればよい。
 | `要求スキル [...] の Worker を起動してください (task {id}, mission={slug})` | 該当スキルを持つ Worker が存在しない | 必要スキルで `bash scripts/start.sh worker <skill>` を実行 |
 | `全ミッション完了` | 全 active mission が done 状態になった | `plan.sh archive <slug>` で退避 → ユーザーへ完了報告 |
 | `タスク {id} (mission={slug}) が failed になりました。handoff_path: {path} — ...。plan.sh add で継続タスクを追加してください。` | Worker が graceful handoff でタスクを中断した | 以下の Handoff 再計画フローを実行 |
-| `[Rule 5] Worker {name} が blocked / idle-with-task です (task {id}, mission={slug}, {n}秒継続)。画面末尾: ...` | herdr モードで Worker が承認待ち・質問待ち・停止状態 | 画面末尾を読み (1) 質問なら `python3 scripts/lib_mux.py send {name}-worker "<回答>"` (2) 承認ダイアログならユーザーへエスカレーション (3) 回復不能なら kill + `plan.sh update --reset` |
+| `[Rule 5] Worker {name} が blocked / idle-with-task です (task {id}, mission={slug}, {n}秒継続)。画面末尾: ...` | herdr モードで Worker が承認待ち・質問待ち・停止状態 | 画面末尾を読み (1) 質問なら `python3 scripts/lib_mux.py send {name}-worker "<回答>"` (2) 承認ダイアログならユーザーへエスカレーション (3) 回復不能なら kill + `plan.sh retire {id} --agent {name} --mission {slug} --started-at <card の started_at>` |
 
 ### Handoff 再計画フロー
 
@@ -1226,6 +1293,11 @@ cat {handoff_path}
 ```
 
 > **注意**: `--blocked-by` は設定しない（failed タスクは blocking を解除しないため）
+>
+> failed の依存を持つ既存 task は **HELD（保留）** になり、pull / dispatch は拒否する。`plan.sh status` の
+> 🛑 行に理由と解除コマンドが出る。失敗の中身を見て、進めてよい (fix task 等) なら
+> `plan.sh release-dep <task_id>`、進めてはいけない (QA FAIL 後の review / merge 等) ならそのまま
+> 保留にして task を足す / `plan.sh update <task_id> --status skipped`。設計は `knowledge/failed-dependency-hold.md`
 
 **3.** 適切なスキルの Worker を起動（既存 Worker が idle なら再利用）:
 
@@ -1334,8 +1406,27 @@ herdr モードでのみ動作。Worker の `agent_status` を毎ポーリング
 **Director の対応** (`[Rule 5]` 通知受信時):
 1. 通知に含まれる「画面末尾」で状況を判断する
 2. テキストで質問待ち → `python3 scripts/lib_mux.py send {name}-worker "<回答>"`
-3. 承認ダイアログ (`Enter to confirm · Esc to cancel`) → ユーザーへエスカレーション
-4. 回復不能な停止 → `python3 scripts/lib_mux.py kill {name}-worker` + `plan.sh update --reset`
+3. 承認ダイアログ (`Enter to confirm · Esc to cancel`) → ユーザーへエスカレーション。
+   **選択ダイアログ**（信頼確認など、カーソルで選ぶもの）は `send` で数字を打っても選べない（Enter が先頭項目を
+   選ぶ）。`capture` でカーソルの位置を見てから `python3 scripts/lib_mux.py keys {name}-worker down enter`
+   のように**名前付きキー**（`up` / `down` / `left` / `right` / `enter` / `escape` / `tab`）を送る。
+   `keys` は宛先名の本番拒否が `CREWVIA_MUX_TEST_ISOLATION=1` のときだけ働くので、宛先は必ず自分の Worker にすること
+4. 回復不能な停止 → `python3 scripts/lib_mux.py kill {name}-worker` + `plan.sh retire`（下記）
+
+**kill した Worker の後始末は `plan.sh retire` を使う**:
+
+```bash
+# card の started_at (= 実行世代) を確認してから渡す
+./scripts/plan.sh retire {task_id} --agent {name} --mission {slug} \
+  --started-at "$(sed -n 's/^started_at: *//p' queue/missions/{slug}/tasks/{task_id}.md | tr -d '"')"
+```
+
+card の status 差し戻しと `queue/assignments/{name}` の撤去が 1 つのトランザクションで
+行われる。前提（status が未終了 / worker 一致 / 世代一致）が外れていた場合は **exit 3 で
+何も変更しない** — その間に Worker が自分で `plan.sh done` を通していたか、差し戻し済みの
+card を同名の後任が pull し直していたかのどちらかなので、`plan.sh status` で確かめること。
+`update --reset` + 手動 `rm queue/assignments/<name>` は、世代を見ないぶん後任の
+assignment を巻き込む（= 稼働中の Worker を dispatcher に idle と誤認させて殺す）。
 
 **注意事項**:
 - **自動対処はしない** — 通知を見て Director が判断する（誤判定リスクを避けるため）

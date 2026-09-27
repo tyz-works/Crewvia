@@ -42,15 +42,15 @@
 ### Phase 2: Priya が plan に codex-review task を積むだけ（常用パス）
 
 ```bash
-plan.sh add "PR#<N> Codex review (Kai)" \
+plan.sh add "Codex review (Kai)" \
   --skills codex-review \
   --blocked-by t<impl_task_id> \
-  --pr-number <N> \
   --priority medium
+# pr_number は実装 task の `plan.sh done <impl_task_id> --pr <N>` が入れる。既存の PR を見る task だけ --pr-number <N> を付ける
 ```
 
 - `--skills codex-review` — 専用 skill 名。Dispatcher がこの skill を検知して `kai-review.sh` を自動 spawn する
-- `--pr-number <N>` — frontmatter に PR 番号を刻む。Dispatcher が spawn 時に `--pr` として渡す。**必須**（無いと spawn せず warning）
+- `--pr-number <N>` — frontmatter に PR 番号を刻む。Dispatcher が spawn 時に `--pr` として渡す。**spawn には `pr_number` が必要**（無いと spawn せず warning）だが、PR がまだ無い段階では手で入れない — 実装 task の `plan.sh done <id> --pr <N>` が、その task を `blocked_by` に持つ codex-review / review の task に自動で書く（未設定のものだけ。t009 / #24）
 - `--blocked-by` — 実装 task の完了後に review を走らせる典型パターン
 
 Dispatcher spawn 後のフロー: `kai-review.sh` が `plan.sh pull` → `codex exec review` → `plan.sh done` を実行。Director の手動介入は不要。
@@ -283,6 +283,12 @@ needs-director に倒す:
 「codex 側に空配列を返す fixture を用意していても、codex が実際には一度も呼ばれないこと」を
 negative test として確認している (診断できない diff は codex の応答内容を一切信用しない
 という設計を、fixture レベルでも裏付ける)。
+
+**サイズ超過の拒否は記録に残す (t010 / #11)**: 拒否した task が pending に戻されても dispatcher が
+再 spawn → 再拒否 → needs_director 再送のループに入らないよう、`kai-review.sh` は
+`registry/daemons/review-refusals/<mission>__<task>.json` に PR 番号・実バイト数・上限を書く。dispatcher は
+記録がある間 spawn せず、Director に「手動差分レビューに切り替えよ」を 1 回だけ伝える。
+意図して再試行する経路と戻し方は `knowledge/notify-once.md`。
 
 ### F-B (Seo 指摘): JSON が複数ドキュメント (JSONL) の場合の fail-open
 

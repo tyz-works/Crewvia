@@ -182,12 +182,28 @@ cleanup_queue() {
   [[ "$output" == *"t002"* ]]
 }
 
-@test "blocked task becomes pullable when dep is failed (PR #108 regression)" {
-  # failed dep should not block (Rule 2 must not fire for failed deps)
+@test "task held by a failed dep is NOT pullable, and the idle diagnostic says why (t007)" {
+  # PR #108 made a failed dep count as satisfied; that let a review task run right after
+  # its QA failed (backlog #9).  A failed dep is now HELD until the Director releases it.
+  # The Worker sees exit 2 (idle) — and the diagnostic names the way out, so the hold
+  # cannot silently become a permanent outage.
   setup_queue "dep-failed"
   add_task t001 failed bash
   add_task t002 pending bash "t001"
 
+  run plan_pull_auto bash
+  cleanup_queue
+
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"release-dep t002"* ]]
+}
+
+@test "task held by a failed dep becomes pullable after release-dep (t007)" {
+  setup_queue "dep-failed-released"
+  add_task t001 failed bash
+  add_task t002 pending bash "t001"
+
+  CREWVIA_QUEUE="$TEST_QUEUE" bash "$PLAN_SH" release-dep t002 --mission "$TEST_MISSION"
   run plan_pull_auto bash
   cleanup_queue
 

@@ -62,7 +62,7 @@ herdr のモデル: background **server** が PTY を保持し、`workspace` > `
 
 ```
 class Mux:                      # backend 選択: CREWVIA_MUX env > config/crewvia.yaml mode: > 自動 (tmux があれば tmux)
-  spawn(name, cmd, cwd, env)    # 名前付き端末を作り cmd を実行。既存名なら何もせず False
+  spawn(name, cmd, cwd)         # 名前付き端末を作り cmd を実行。既存名なら何もせず False（env 引数は無い: 必要な環境変数は cmd に export で埋める。t017）
   send(name, text)              # text + Enter (tmux: 2-step send-keys / herdr: pane run)
   capture(name) -> str          # 現在画面 (tmux: capture-pane -p / herdr: pane read --source visible)
   list(suffix=None) -> [name]   # 生存端末名 (tmux: list-windows / herdr: tab list の label)

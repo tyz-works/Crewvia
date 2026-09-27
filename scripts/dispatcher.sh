@@ -17,6 +17,9 @@
 #     → notify crewvia:Sora-director
 #
 # Notification dedup: same key is suppressed for NOTIFY_TTL seconds.
+# State-based notices (needs_director / failed+handoff / codex-review refused) are sent
+# ONCE per state, not per NOTIFY_TTL: see the ledger (registry/daemons/notified-state.json)
+# and knowledge/notify-once.md (t010).
 # Standalone-safe: exits 0 silently when tmux is not available.
 #
 # IMPORTANT — Daemon restart after code changes:
@@ -40,7 +43,11 @@ QUEUE_DIR="${CREWVIA_QUEUE:-${REPO_ROOT}/queue}"
 REGISTRY_DIR="${REPO_ROOT}/registry"
 LOG_DIR="${REPO_ROOT}/logs/dispatcher"
 LOG_FILE="${LOG_DIR}/dispatcher-$(date +%Y%m%d).log"
-NOTIFY_CACHE="/tmp/dispatcher-notify-cache.json"
+# CREWVIA_NOTIFY_CACHE: isolated-QA escape hatch.  The default path is shared by
+# every dispatcher on the machine, so a test run would both read production
+# dedup keys (false PASS: a suppressed notification looks like "did not fire")
+# and write its own into them.  Tests point this at their own sandbox.
+NOTIFY_CACHE="${CREWVIA_NOTIFY_CACHE:-/tmp/dispatcher-notify-cache.json}"
 NOTIFY_TTL=300  # seconds before repeating the same notification (5 min)
 
 # Rule 5: state grace period in seconds (env > config > default 60).
@@ -67,6 +74,13 @@ fi
 mkdir -p "$REGISTRY_DIR"
 mkdir -p "$LOG_DIR"
 
+# t005: 相互監視の bash 側。heartbeat を **bash から** 書くために source する。
+# この daemon の本体は「毎サイクル作り直される python」ではなく、このループを
+# 回している bash 自身なので、相手 (watchdog) が probe すべき PID もここの $$
+# である。詳細は scripts/lib_daemon_watch.sh の冒頭。
+# shellcheck source=lib_daemon_watch.sh
+source "${SCRIPT_DIR}/lib_daemon_watch.sh"
+
 log() {
   local msg
   msg="[dispatcher $(date -u '+%Y-%m-%dT%H:%M:%SZ')] $*"
@@ -85,6 +99,7 @@ import sys
 import os
 import re
 import json
+import shlex
 import time
 import subprocess
 import urllib.request
@@ -108,7 +123,57 @@ REPO_ROOT = REGISTRY_DIR.parent
 _SCRIPTS_DIR = REPO_ROOT / 'scripts'
 sys.path.insert(0, str(_SCRIPTS_DIR))
 from lib_mux import Mux, repo_identity_ok  # noqa: E402
+import lib_retirement  # noqa: E402
+# 「依存が満たされた」の定義は crewvia の中で 1 箇所しかない (t010 / QA t002 の
+# 指摘 F-2b)。ここに同じ規則のコピーを書き戻さないこと — plan.sh pull が割り当て
+# る task と dispatcher が投げる task がズレると、痛むのは QA FAIL の直後だけで、
+# その瞬間まで誰も気付かない。tests/test_task_graph.py がコピーの再発を見張る。
+from lib_dep_rules import card_dependencies  # noqa: E402
+from lib_dep_rules import DEAD_DEP_STATUSES, HELD_DEP_STATUSES  # noqa: E402
+# task カードの読み取りも 1 箇所しかない (Codex 5 巡目 P2)。parser・「識別子は
+# ファイル名」・信用できないカードの隔離を plan.sh 側だけに入れた結果、同じ queue を
+# 2 つの別のコードが別の規則で読む状態になり、`id` 行の無いカードで **この
+# サイクルが KeyError で落ちて全 mission の割り当てが止まる** 経路ができていた。
+# ここに frontmatter を直接読むコードを書き戻さないこと。
+# 再発防止は tests/test_task_card_identity.py。
+from lib_task_cards import (  # noqa: E402,F401
+    CORRUPT_TASK_STATUS, Unreadable, is_missing, is_unreadable, list_task_cards,
+    parse_frontmatter, read_regular_text_or_unreadable, read_task_card,
+)
+# codex-review が「差分が大きすぎる」で拒否した事実の記録 (t010 / #11)。書き手は
+# kai-review.sh、読み手はここ。定義はこのモジュールに 1 つだけ。
+import lib_review_refusal  # noqa: E402
+# デーモン側 JSON 状態ストア (「伝えた」台帳・拒否の記録) を読む入口は 1 つ (t026)。
+# ここで `json.loads(text)` を書き足さないこと — 外側しか検証しない読み方が、同じ根の
+# 欠陥を PR #214 で 3 回出した。再発防止は
+# tests/test_daemon_state_reads_go_through_the_entry.py (この埋め込み python も走査する)。
+from lib_daemon_state import (  # noqa: E402
+    load_json_store, notify_cache_problem, rule5_state_problem, told_entry_problem,
+    told_is_fresh_timeout, told_ledger_problem, told_lock,
+)
+# Worker が起動された TARGET_DIR の記録と、「この Worker にこの task を回してよいか」の
+# 判定 (t009 / #21)。定義はこのモジュールに 1 つだけ (`plan.sh pull` の target 照合と
+# 同じ正規形)。ここに Worker と task の target_dir の比較を書き戻さないこと。
+import lib_worker_target as _worker_target  # noqa: E402
 _mux = Mux()
+
+# t002: who may end a Worker process.  'watchdog' (default) = this daemon only
+# writes retirement markers and watchdog executes them; 'dispatcher' = the
+# pre-t002 behaviour where this daemon kills windows itself.
+#
+# The same variable gates watchdog.py.  Flipping only one of the two is what
+# the atomic-migration rule forbids: dispatcher-only rollback means both
+# daemons kill independently and, because crewvia reuses Worker names, a
+# late-arriving kill lands on an innocent successor (§5-2); watchdog-only
+# rollback means nobody closes an idle window at all (§5-1).
+KILL_AUTHORITY = (os.environ.get('CREWVIA_KILL_AUTHORITY') or '').strip().lower()
+KILL_AUTHORITY = 'dispatcher' if KILL_AUTHORITY == 'dispatcher' else 'watchdog'
+
+#: How long a request marker may sit unconsumed before we say so.  Until t005
+#: (mutual watch) lands, watchdog is a single point of failure for closing
+#: Workers: if it is dead, markers pile up and idle Workers simply linger,
+#: which the notify dedup would otherwise keep almost invisible.
+RETIREMENT_STALE_SECONDS = 300
 
 MISSIONS_DIR   = QUEUE_DIR / 'missions'
 ARCHIVE_DIR    = QUEUE_DIR / 'archive'
@@ -121,6 +186,17 @@ ALL_DONE_STATE_FILE = REGISTRY_DIR / 'dispatcher_all_done.flag'
 
 PRIORITY_ORDER  = {'high': 0, 'medium': 1, 'low': 2}
 TERMINAL_STATUSES = {'done', 'verified', 'skipped'}
+
+# 「Worker がその card をもう手放している」status。TERMINAL_STATUSES (= 依存が
+# 満たされた) とは問いが違う: `failed` は依存を満たさない (HELD) が、Worker は
+# 手放している。`cancelled` も同じ。Worker の生死・Kai-codex の孤児判定はこちらを
+# 使う (t001 / backlog #13)。
+# 「もう完了しない」status の名前は lib_dep_rules が持っている (ここに並べ直すと、
+# tests/test_failed_dependency_hold.py が規則のコピーとして落とす)。完了した status
+# (TERMINAL_STATUSES) にそれを足したものが「手放した」の全部。
+RELEASED_WORK_STATUSES = (
+    TERMINAL_STATUSES | set(DEAD_DEP_STATUSES) | set(HELD_DEP_STATUSES)
+)
 
 # Skills that mark a task as Director-only (handled directly by the Director,
 # not dispatchable to any Worker).  Tasks with these skills are excluded from
@@ -336,57 +412,96 @@ def parse_yaml(text):
 # ---------------------------------------------------------------------------
 # Frontmatter parser for task .md files
 # ---------------------------------------------------------------------------
-
-def parse_frontmatter(text):
-    """Return (meta dict, body string) from a task .md file."""
-    lines = text.splitlines()
-    if not lines or lines[0].strip() != '---':
-        return {}, text
-    end = -1
-    for idx in range(1, len(lines)):
-        if lines[idx].strip() == '---':
-            end = idx
-            break
-    if end < 0:
-        return {}, text
-    front = '\n'.join(lines[1:end])
-    body = '\n'.join(lines[end + 1:])
-    meta = parse_yaml(front)
-    meta.setdefault('skills', [])
-    meta.setdefault('blocked_by', [])
-    if meta.get('skills') is None:
-        meta['skills'] = []
-    elif isinstance(meta.get('skills'), str):
-        # Normalize scalar string to list: `skills: bash` → `skills: [bash]`
-        # Without this, set("bash") yields individual characters, breaking
-        # every skill-intersection check (DIRECTOR_ONLY_SKILLS, worker matching).
-        meta['skills'] = [meta['skills']]
-    if meta.get('blocked_by') is None:
-        meta['blocked_by'] = []
-    return meta, body
-
+#
+# `parse_frontmatter` は lib_task_cards から来る (import 部を参照)。ここに独自の
+# 実装を置いていたのが Codex 5 巡目 P2 の指摘で、上の `parse_yaml` との違いが
+# そのまま欠陥だった: 読めない行を黙って捨てるので、半分だけ読めた
+# `status: pending` がそのまま信じられ、**中身の分からないカードが dispatch
+# される**。plan.sh 側の parser は同じ行で例外を投げてカードを隔離していた。
+#
+# なお `parse_yaml` (この上) は **カード以外の YAML 専用** として残してある。
+# `state.yaml` / `workers.yaml` / `mission.yaml` は手で編集される経路があり、
+# 1 行の typo で常駐デーモンが毎サイクル死ぬと Worker の割り当てと生存監視が
+# まとめて止まる。カードのほうは list_task_cards() が例外を `[破損]` に変えて
+# 吸収するので、厳格な parser でも落ちない。
 
 # ---------------------------------------------------------------------------
 # State / workers / tasks loading
 # ---------------------------------------------------------------------------
 
+def read_queue_text(path, what):
+    """queue / registry のファイルを **種類を確かめてから** 読む。
+
+    読めたら `str`、読めなければ `Unreadable` —— 空文字でも None でもない。
+    カードだけでなく `state.yaml` / `workers.yaml` / `mission.yaml` にも同じ
+    ガードを当てる (Codex 8 巡目 P2)。ここは常駐デーモンなので、上限の無い
+    `read_text()` が書き手のいない FIFO に当たると **サイクルごと座り込み、
+    全 mission の割り当てが止まる**。1 枚のカードで落ちないようにしてある
+    のと同じ理由で、1 つの壊れたファイルでも止まらないようにする。
+
+    倒す先は呼び出し側が決める。ここで返すのは「読めなかった」だけ
+    (memory: fail-direction-is-per-judgment)。
+    """
+    return read_regular_text_or_unreadable(
+        path, warn=lambda msg: log(f"WARNING: {what}: {msg}"))
+
+
+def read_assignment(agent_name):
+    """`assignments/<agent>` を **種類を確かめてから** 読む。
+
+    読めたら `"<slug>:<task_id>"` (前後の空白は落とす)、無い = `Unreadable`
+    (`is_missing()` が True)、読めない = `Unreadable`。
+
+    このファイルは `assignment_file.exists()` で「busy かどうか」を判定する
+    経路と対になっているが、**中身を読むのは別の話**である。t017 のガードは
+    この直後のカード読み取りにしか入っておらず、assignment 本体は素の
+    `read_text()` のままだった (Codex 9 巡目 P2)。`registry/assignments/` は
+    Worker 名で引かれるだけの短いファイルで、書くのは plan.sh の
+    `_atomic_write` だけだが、置き違えた FIFO 1 枚で `publish_agents()` が
+    返らなくなり —— それは `dispatch()` の **前** に走るので —— 全 mission の
+    割り当てが止まる。
+    """
+    return read_queue_text(ASSIGNMENTS_DIR / agent_name, 'assignment file')
+
+
 def load_state():
-    if not STATE_FILE.exists():
-        return {}
-    return parse_yaml(STATE_FILE.read_text())
+    """active mission の一覧。読めなければ `Unreadable` を **そのまま返す**。
+
+    t017 まではここで `{}` に潰していた。潰すと `dispatch()` の
+    `if not active_missions: shutdown_idle_workers()` に落ちて、**pending の
+    仕事が残っているのに idle Worker の退役が認可される** (Codex 9 巡目 P1)。
+    `Path.exists()` も同じ穴を持つ —— `EACCES` で stat できないときも False に
+    なるので、「無いことを観測した」と「観測できなかった」が同じ分岐に入る。
+    だから存在確認は `read_queue_text()` の `ENOENT` 1 本に寄せる。
+    """
+    text = read_queue_text(STATE_FILE, 'state file')
+    if is_missing(text):
+        return {}          # 本当に無い = active mission ゼロ
+    if is_unreadable(text):
+        return text        # 観測できなかった —— 呼び出し側が「空」と読めない形
+    return parse_yaml(text)
 
 
 def load_workers():
-    """Return dict {name: {'skills': [...], ...}} from registry/workers.yaml."""
-    if not WORKERS_FILE.exists():
-        return {}
-    data = parse_yaml(WORKERS_FILE.read_text())
+    """Return dict {name: {'skills': [...], ...}} from registry/workers.yaml.
+
+    `load_state()` と同じく、読めなかったときは `Unreadable` を返す。ここも
+    空に潰すと「Worker が 1 人もいない」と見分けが付かず、`publish_agents()` が
+    **全エージェントを Taskvia から DELETE する** (= 観測の失敗が撤去の根拠に
+    なる) 側へ倒れる。
+    """
+    text = read_queue_text(WORKERS_FILE, 'workers file')
+    if is_missing(text):
+        return {}          # 本当に無い = Worker 0 人
+    if is_unreadable(text):
+        return text
+    data = parse_yaml(text)
     workers = {}
     # workers.yaml has a top-level 'workers' block list
     # parse_yaml returns it as a list of scalars which isn't right.
     # We need a proper block-list-of-mappings parser.
-    # Instead, parse manually.
-    text = WORKERS_FILE.read_text()
+    # Instead, parse manually (同じ text を使う — 2 回読むと、その間に置き換え
+    # られたファイルで data と workers が別の姿から作られる)。
     current = None
     for line in text.splitlines():
         stripped = line.strip()
@@ -413,24 +528,18 @@ def load_workers():
 
 
 def list_tasks_for_mission(slug):
-    """Return list of (meta, body) sorted by task number."""
-    tdir = MISSIONS_DIR / slug / 'tasks'
-    if not tdir.exists():
-        return []
-    entries = []
-    for fn in tdir.iterdir():
-        m = re.fullmatch(r't(\d+)\.md', fn.name)
-        if m:
-            entries.append((int(m.group(1)), fn))
-    entries.sort()
-    out = []
-    for _, path in entries:
-        try:
-            meta, body = parse_frontmatter(path.read_text())
-            out.append((meta, body))
-        except Exception as e:
-            log(f"WARNING: failed to parse {path}: {e}")
-    return out
+    """Return list of (meta, body) sorted by task number.
+
+    読み取りの規則は `scripts/lib_task_cards.py` にある —— `plan.sh` の
+    `list_tasks()` が読むのと同じ 1 つのモジュールで、これが「pull が受理する
+    カードと、ここがスケジュールするカードが一致する」の中身である。
+
+    ここに自前の走査・parse を書き戻さないこと。読めないカードは例外ではなく
+    `[破損]` (`CORRUPT_TASK_STATUS`) のカードとして返ってくるので、1 枚の事故で
+    このサイクルが落ちることはない —— 倒れる先は常に「そのカードだけが動かない」。
+    """
+    return list_task_cards(MISSIONS_DIR / slug / 'tasks',
+                           warn=lambda msg: log(f"WARNING: {msg}"))
 
 
 def load_all_tasks(active_missions):
@@ -453,17 +562,183 @@ def load_all_tasks(active_missions):
     return all_tasks, done_ids_by_mission, task_statuses_by_mission
 
 
+def worker_holds_work(agent_name, all_tasks):
+    """card の `worker` が `agent_name` で、手放されていない card が 1 枚でもあるか。
+
+    「手放されていない」= `RELEASED_WORK_STATUSES` でも `pending` でもない。in_progress
+    だけでなく needs_director / needs_human_review / blocked / verifying / ... を含む。
+    pending を外すのは、`--reset` が worker を消すので pending に名前が残るのは取り残しで、
+    Worker を生かす理由にならないため。
+
+    以前の Rule 2 は `status == 'in_progress'` だけを見ていた。`plan.sh needs-director` が
+    assignment を外すようになった (t001) ので、そのままでは判断待ちの Worker が
+    「仕事なし」と読まれて退役の対象になる。倒す先は「殺さない」: 知らない status も
+    保持に数える (allowlist ではなく除外側を数える)。
+
+    `all_tasks` は `load_all_tasks()` の戻り (= `lib_task_cards` の入口を通った card)。
+    ここで card を読み直さない。
+    """
+    return any(
+        meta.get('worker') == agent_name
+        and meta.get('status') not in RELEASED_WORK_STATUSES
+        and meta.get('status') != 'pending'
+        for _, meta in all_tasks
+    )
+
+
+def worker_waits_on_director(agent_name, all_tasks):
+    """`agent_name` が needs_director の card を持っている (= Director の判断待ち) か。
+
+    `needs-director` は assignment を外すので、assignment の有無だけでは「まだこの
+    Worker は仕事を持っている」が読めなくなった。外す前は assignment が残っていたので
+    busy 扱いになっていた —— その扱いをここで保つ (新しい task を割り当てない・Rule 5 を
+    重ねて鳴らさない)。
+    """
+    return any(
+        meta.get('worker') == agent_name and meta.get('status') == 'needs_director'
+        for _, meta in all_tasks
+    )
+
+
+def codex_review_slot_busy(task_statuses_by_mission):
+    """`queue/assignments/Kai-codex` が、いま走っているかもしれない run を指しているか。
+
+    「同時 1 実行」の根拠は assignment の**有無**だった。`plan.sh needs-director` が撤去
+    しない版 (t001 より前) や archive 前の取り残しでは、走っていない run の assignment が
+    残り、以後の codex-review が恒久的に spawn されなかった (backlog #13)。
+
+    指す task が手放し済み (`RELEASED_WORK_STATUSES`) か needs_director なら孤児で、塞がない
+    (**読むだけ**。assignment を消すのは plan.sh の役目 —— 次の pull が上書きする)。
+
+    塞ぐ側に倒すもの: assignment が読めない / `<mission>:<task>` の形でない / 指す task が
+    見つからない (archive 済みなど) / 進行中の status。証明できない孤児は孤児と扱わない
+    (誤って 2 つ目の run を走らせるより、Director に見える停止のほうが安い)。
+    """
+    raw = read_assignment(CODEX_REVIEW_AGENT)
+    if is_missing(raw):
+        return False
+    if is_unreadable(raw):
+        return True
+    slug, _, task_id = raw.strip().partition(':')
+    if not slug or not task_id:
+        return True
+    status = task_statuses_by_mission.get(slug, {}).get(task_id)
+    if status in RELEASED_WORK_STATUSES or status == 'needs_director':
+        log(f"[codex-review] {CODEX_REVIEW_AGENT} の assignment は終わった task {slug}:{task_id} "
+            f"(status={status}) を指す孤児 — spawn を塞がない")
+        return False
+    return True
+
+
+_target_record_memo = {}      # dispatch() が毎サイクルの先頭で空にする
+
+
+def worker_target_record(agent_name):
+    """`registry/workers/<agent>/target_dir.json` (検証済みの dict か `Unreadable`)。
+
+    1 サイクルに 1 度だけ読む。読めない (壊れている) は毎サイクル警告すると 5 秒ごとに
+    ログを埋めるので、通知スロットルに 1 回だけ出す。
+    """
+    if agent_name not in _target_record_memo:
+        def _warn(msg, agent_name=agent_name):
+            key = f"target_record_trouble_{agent_name}"
+            if should_notify(key):
+                log(f"WARNING: {agent_name}: {msg}")
+                record_notify(key)
+        _target_record_memo[agent_name] = _worker_target.load_record(
+            REGISTRY_DIR, agent_name, warn=_warn)
+    return _target_record_memo[agent_name]
+
+
+def worker_may_take_task(agent_name, meta):
+    """この Worker に task (`meta`) を割り当ててよいか — `(可否, 理由)`。判定は lib 1 つ。"""
+    return _worker_target.worker_may_take(
+        worker_target_record(agent_name), meta.get('target_dir'))
+
+
+def worker_outstanding_assignment(agent_name, all_tasks):
+    """割り当てメッセージを送ったが、まだ pull されていない task `(slug, task_id)` を返す (無ければ None)。
+
+    #22: dispatcher は Worker に task A を送った 6 秒後に、別の task B (優先度が高い・
+    unblock された) を同じ Worker に送り、Worker が両方を pull して `queue/assignments/<worker>` が
+    上書きされた。送った時点では assignment ファイルはまだ無いので `is_idle` は真のままで、
+    「送った」という事実は通知スロットル (`assign_<agent>_<slug>_<task>`) にしか残っていない。
+    A がまだ pending で、その送信が TTL の内にあるあいだ、その Worker は「割り当て済み」として扱う。
+    TTL を過ぎても pull されなければ (Worker が受け取っていない) この保護は外れ、A の再送に戻る
+    (従来と同じ)。`plan.sh pull --task` 側の拒否 (別 task を持つ Worker) が最後の網。
+    """
+    cache = load_notify_cache()
+    now = time.time()
+    for slug, meta in all_tasks:
+        if meta.get('status') != 'pending':
+            continue
+        sent_at = cache.get(f"assign_{agent_name}_{slug}_{meta.get('id')}")
+        if sent_at is not None and now - sent_at <= NOTIFY_TTL:
+            return slug, meta.get('id')
+    return None
+
+
+def worker_start_command(task_skills, target_dir, *, fresh):
+    """Director がそのまま貼れる Worker 起動コマンド (`director.md` の起動手順と同じ形)。
+
+    `fresh`: 同じ skill の Worker が (別の TARGET_DIR で) 生きているとき。registry-first の
+    名前引きは同じ名前を返し、`start.sh` は「既に居る」で断るので、新しい名前を取らせる。
+    名前は貼った時点で `assign-name.sh` が決める (dispatcher が registry を書き換えない)。
+    """
+    skills = ' '.join(shlex.quote(s) for s in sorted(task_skills))
+    backend = os.environ.get('CREWVIA_MUX') or 'herdr'
+    target = f"TARGET_DIR={shlex.quote(str(target_dir))} " if target_dir else ''
+    return (
+        f"cd {shlex.quote(str(REPO_ROOT))} && "
+        f"AGENT_NAME=$(bash scripts/assign-name.sh {skills}{' --fresh' if fresh else ''}) "
+        f"{target}CREWVIA_MUX_ENABLED=1 CREWVIA_MUX={shlex.quote(backend)} "
+        f"bash scripts/start.sh worker {skills}"
+    )
+
+
+def sweep_stale_target_records(alive_workers):
+    """生きていない Worker の古い target_dir 記録を片付ける (t009)。判定は lib 1 つ、例外は出さない。
+
+    `alive_workers` は窓が有る **または** heartbeat が新しい Worker (`_alive_workers`)。窓の一覧だけを
+    根拠にすると、mux が 1 人分だけ一時的に落とした回に、生きている Worker の記録を消しうる。
+    """
+    try:
+        for name in _worker_target.sweep_stale_records(REGISTRY_DIR, set(alive_workers)):
+            log(f"[target-record] swept stale TARGET_DIR record for retired Worker {name!r}")
+    except Exception as e:
+        log(f"WARNING: stale TARGET_DIR record sweep failed: {e!r}")
+
+
+def dependency_gate(slug, meta, done_ids_by_mission, task_statuses_by_mission):
+    """この pending task の依存判定 (`DependencyVerdict`: unmet / held)。
+
+    規則は lib_dep_rules に 1 つだけ (plan.sh pull / task-graph と共有)。dispatch()
+    はここを通す —— テストが「dispatcher はこの card を投げるのか」を本物のコードで
+    直接問えるように、判定を dispatch() の外に出してある (tests/test_failed_dependency_hold.py)。
+    failed の依存は held (Director が release-dep するまで投げない、t007)。
+    """
+    return card_dependencies(
+        meta,
+        done_ids_by_mission.get(slug, set()),
+        task_statuses_by_mission.get(slug, {}),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Notification dedup cache
 # ---------------------------------------------------------------------------
 
 def load_notify_cache():
-    if not NOTIFY_CACHE.exists():
-        return {}
-    try:
-        return json.loads(NOTIFY_CACHE.read_text())
-    except Exception:
-        return {}
+    """通知スロットル `{key: 最後に送った epoch 秒}`。
+
+    読み取りと形の検証は入口 (`load_json_store`) の 1 つ (t026)。使えないとき
+    (無い / 壊れている / 値が数でない・NaN・遠い未来) は `{}` = スロットルを失う =
+    **もう一度送る** 側に倒す (冪等。次の `record_notify()` が正しい形で書き直す)。
+    値を検証せずに信じると、`cache[key]` が `TypeError` でサイクルを落とすか、NaN・未来時刻で
+    その key の通知を永久に遮る。
+    """
+    cache = load_json_store(NOTIFY_CACHE, check=notify_cache_problem)
+    return {} if is_unreadable(cache) else cache
 
 
 def should_notify(key):
@@ -480,6 +755,199 @@ def record_notify(key):
         NOTIFY_CACHE.write_text(json.dumps(cache))
     except OSError as e:
         log(f"WARNING: cannot write notify cache: {e}")
+
+
+def forget_notify(prefix, keep=None):
+    """`prefix` で始まるスロットルを捨てる (`keep` だけは残す)。捨てる = 「送れる」側。"""
+    cache = load_notify_cache()
+    gone = [k for k in cache if k.startswith(prefix) and k != keep]
+    if not gone:
+        return
+    for k in gone:
+        del cache[k]
+    try:
+        NOTIFY_CACHE.write_text(json.dumps(cache))
+    except OSError as e:
+        log(f"WARNING: cannot write notify cache: {e}")
+
+
+# ---------------------------------------------------------------------------
+# State-notice ledger (t010 / #10)
+# ---------------------------------------------------------------------------
+#
+# `should_notify()` は NOTIFY_TTL のスロットルであって **受領確認ではない**。
+# needs_director / failed+handoff_path のような *状態ベース* の通知は、状態が続く
+# かぎり TTL ごとに永久に再送された (2026-09-25、同一内容が数十通届いてユーザーが
+# デーモンを手で止めた)。スロットルを長くしても直らない — 永久に再送されること
+# が問題であって、間隔が問題ではない。
+#
+# そこで「この状態については既に伝えた」を、スロットルとは別に registry に持つ。
+# 通知内容を決める入力 (status / reason / handoff_path / 拒否の記録) を畳んだ
+# fingerprint が変わったときだけ再通知する。状態を離れた (task が pending に戻った
+# 等) ら記録を捨てる — 同じ理由でもう一度落ちたのは新しい事象だから。
+#
+# 置き場が「まだ無い」(ENOENT) は初回で普通。**置き場が使えない** (壊れている・
+# 書けない) は普通ではない: 「通知すべきものが無い」ではなく起動失敗として log に
+# 出し、スロットルだけの旧挙動 (再送側) に倒す。黙って通知を止める側には倒さない
+# — 10 時間の全停止 (t027) を作ったのは「通知が来ない」の方である。
+TOLD_FILE = REGISTRY_DIR / 'daemons' / 'notified-state.json'
+
+
+def _told_trouble(msg):
+    """台帳が使えないことを log に出す。5 秒ごとに回るので TTL に 1 回だけ。"""
+    if should_notify('told_ledger_trouble'):
+        log(f"WARNING: notified-state: {msg} — 同じ状態の通知が "
+            f"NOTIFY_TTL={NOTIFY_TTL}s ごとに再送されます (スロットルだけに戻っています)")
+        record_notify('told_ledger_trouble')
+
+
+def load_told():
+    """`{notify_key: {'fp', 'kind', 'slug', 'task'}}`、または `Unreadable`。
+
+    読み取り・JSON・**各エントリの形** の検証は `load_json_store()` (1 つの入口)。
+    ENOENT (まだ無い) は `{}`。それ以外の失敗は `Unreadable` のまま返し、
+    呼び出し側が「使えない」として扱う (空とは別)。**壊れたエントリが 1 つでもあれば
+    台帳全体が `Unreadable`** (t026 / Kai 3 巡目 P2): 外側だけ検証して内側を信じると、
+    `{"bad": {"slug": []}}` で `prune_told()` が毎サイクル `TypeError` になり、
+    prune もサイクルの残りも止まって、状態を離れて戻った task が永久に沈黙する。
+    `Unreadable` のときの向きは **再送側** (`already_told` は False、`prune_told` は何もしない、
+    `record_told` は作り直す)。
+    """
+    told = load_json_store(TOLD_FILE, check=told_ledger_problem)
+    if is_missing(told):
+        return {}
+    if is_unreadable(told):
+        _told_trouble(f"{TOLD_FILE} を使えない ({told.reason})")
+    return told
+
+
+def save_told(told):
+    try:
+        TOLD_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = TOLD_FILE.with_name(f'.{TOLD_FILE.name}.{os.getpid()}.tmp')
+        tmp.write_text(json.dumps(told, ensure_ascii=False, sort_keys=True))
+        os.replace(tmp, TOLD_FILE)
+        return True
+    except OSError as e:
+        _told_trouble(f"{TOLD_FILE} に書けない ({e})")
+        return False
+
+
+def fingerprint(*parts):
+    """通知内容を決める入力の畳み込み。入力が変われば変わる、それだけが要件。"""
+    import hashlib
+    blob = json.dumps(parts, ensure_ascii=False, sort_keys=True, default=str)
+    return hashlib.sha256(blob.encode('utf-8')).hexdigest()[:16]
+
+
+def already_told(told, key, fp):
+    """`told` は `load_told()` の結果。使えない台帳は「伝えていない」(再送側)。"""
+    if is_unreadable(told):
+        return False
+    entry = told.get(key)
+    return isinstance(entry, dict) and entry.get('fp') == fp
+
+
+def record_told(key, fp, kind, slug, task_id, throttle_key=None):
+    """送れた通知を台帳に書く。台帳が壊れていたら作り直す (自己修復)。
+
+    同じ key の fingerprint が変わった (A → B) ときは、以前の fingerprint のスロットル
+    (`<key>#<旧fp>`) を捨てる (`throttle_key` = 今送った分は残す)。捨てないと、
+    A → B → A で 3 回目の A が 1 回目の A の `<key>#<fp_A>` に NOTIFY_TTL のあいだ
+    遮られ、**新しい事象の通知が遅れる** (t021 / Kai P2)。
+    """
+    entry = {'fp': fp, 'kind': kind, 'slug': slug, 'task': str(task_id)}
+    # 書くものは、読み手が受け付ける形と同じでなければならない (t026)。読み手だけが
+    # 厳しいと、書いたばかりの台帳を自分が「壊れている」と読み、永久に再送側へ倒れる。
+    problem = told_entry_problem(key, entry)
+    if problem:
+        _told_trouble(f"台帳に書けない形のエントリ ({problem})")
+        return False
+    # 台帳の書き手は watchdog (timeout 通知) と 2 人 (t021)。read-modify-write の全体を
+    # `told_lock()` の下に置く — 原子的な置換だけでは、相手が今書いたエントリを、
+    # 古い読み取りの書き戻しで消しうる。取れなければ「書けなかった」= 再送側 (次サイクル)。
+    with told_lock(TOLD_FILE) as held:
+        if not held:
+            _told_trouble(f"{TOLD_FILE} のロックを取れない")
+            return False
+        told = load_told()
+        if is_unreadable(told):
+            told = {}
+        prev = told.get(key)
+        if isinstance(prev, dict) and prev.get('fp') != fp:
+            forget_notify(f'{key}#', keep=throttle_key)
+        told[key] = entry
+        return save_told(told)
+
+
+def prune_told(live_keys, observed_slugs):
+    """状態を離れた task の記録を捨てる。
+
+    観測できた mission (`observed_slugs`) の task だけが対象。観測できなかった
+    (破損カード・走査失敗) ものは「離れた」の証拠にならないので触らない。
+    """
+    # watchdog の timeout 通知 (kind=timeout) は TTL のあいだ対象外 — その task は後始末で
+    # pending に戻っていて、live key に現れないのが普通 (`told_is_fresh_timeout()`)。
+    with told_lock(TOLD_FILE) as held:
+        if not held:
+            return      # 次のサイクルでやり直す。prune は遅れてよい (欠落ではなく遅延)
+        told = load_told()
+        if is_unreadable(told):
+            return
+        stale = [k for k, e in told.items()
+                 if isinstance(e, dict) and e.get('slug') in observed_slugs
+                 and k not in live_keys and not told_is_fresh_timeout(e)]
+        if not stale:
+            return
+        for k in stale:
+            del told[k]
+        save_told(told)
+    # 台帳の記録だけでなくスロットル (`<key>#<fp>`) も捨てる。状態を離れて同じ理由で
+    # 戻ったのは新しい事象で、fingerprint は前回と同じ。スロットルが残っていると
+    # 台帳が「伝えていない」と言っても NOTIFY_TTL のあいだ遮られる (t021 / Kai P2)。
+    #
+    # 選んだ理由 (状態の「回」をスロットル key に入れる案を採らなかった): 回の識別子は
+    # 台帳に持たせるしかなく、台帳が使えないとき (= 再送側に倒したいとき) に key が
+    # 定まらず、連射防止のスロットルが働かなくなる。離脱時に捨てるなら、台帳が使える
+    # ときだけ (離脱を観測できたときだけ) 捨てるので、倒す向きが変わらない。
+    for k in stale:
+        forget_notify(f'{k}#')
+
+
+def observed_missions(all_tasks, active_missions):
+    """破損カードを 1 枚も含まない active mission (= 全 task を観測できた)。"""
+    broken = {slug for slug, meta in all_tasks
+              if meta.get('status') == CORRUPT_TASK_STATUS}
+    return {slug for slug in active_missions if slug not in broken}
+
+
+def notify_state_once(key, fp, kind, slug, task_id, build_msg, *, director_live=lambda: True):
+    """状態ベースの通知を、状態が変わるまで 1 回だけ送る。
+
+    順序 (安い判定を先に): 台帳が「伝えた」→ 何もしない / スロットル → 何もしない /
+    Director 不在 → 記録せず見送る (戻ったらすぐ送る) / 送る。
+    `director_live` は **呼び出せる値** (遅延評価)。mux への問い合わせは、台帳とスロットルを
+    通り抜けて実際に送ろうとする通知があるときにだけ行う — 通知対象が 1 件も無い
+    サイクル (= ほとんどのサイクル) で 5 秒ごとに `mux list` を叩かないため (t021 / QA t011 の P3)。
+    スロットルの key に fingerprint を含めるのは 2 つの理由: (1) 状態が変わったら
+    残っているスロットルに遮られず届く、(2) 台帳に書けなくても直後のサイクルで
+    同じ通知が飛ばない。
+    """
+    told = load_told()
+    if already_told(told, key, fp):
+        return False
+    throttle_key = f'{key}#{fp}'
+    if not should_notify(throttle_key):
+        return False
+    if not director_live():
+        log(f'WARNING: {kind} — Director 不在のため通知スキップ: {slug}/{task_id}')
+        return False
+    if tmux_send(_director_name(), build_msg()):
+        record_notify(throttle_key)
+        record_told(key, fp, kind, slug, task_id, throttle_key=throttle_key)
+        return True
+    log(f"{kind} detected but mux send failed: {slug}/{task_id} (will retry)")
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -523,6 +991,12 @@ def tmux_send(target, message):
 def tmux_kill_window(target):
     """Kill a mux window.
 
+    t002: only reachable under CREWVIA_KILL_AUTHORITY=dispatcher (the rollback
+    path).  In the default configuration this daemon does not kill Workers at
+    all — see retire_worker().  Kept, with its `.firstseen` unlink intact, so
+    that the rollback is a true return to the previous behaviour; the new
+    sweep in sweep_spawn_grace_markers() is idempotent with it.
+
     t015 (QA FAIL on PR#190): also unlinks the `.firstseen` spawn-grace
     marker (see _spawn_time_fallback) on a successful kill. crewvia reuses
     Worker names (Haruto / Seo / Arjun / ...), so on the tmux backend
@@ -540,8 +1014,10 @@ def tmux_kill_window(target):
     not crash on a kill path).
 
     t003: re-checks repo_identity_ok() immediately before the actual kill —
-    the single choke point all three call sites (idle-worker shutdown,
-    blocked-stuck shutdown, vanished-worker cleanup) funnel through. The
+    the single choke point all kill call sites (idle-worker shutdown, no-task
+    shutdown, blocked-stuck shutdown) funnel through.  t002 N4: the old list
+    named "vanished-worker cleanup" here, which was never true — the vanished
+    Worker path only notifies the Director, it has never killed anything. The
     once-per-cycle check at module load time (see repo_identity_ok(REPO_ROOT)
     above) only proves this process's identity was valid when the cycle
     started; a long-running cycle can still straddle a worktree removal.
@@ -567,6 +1043,150 @@ def tmux_kill_window(target):
         log(f"WARNING: mux kill {target!r} failed")
 
 
+# Writer side only: this daemon calls request()/has_marker() and never
+# process_all().  Executing a marker is watchdog's job — that separation is the
+# whole point of t002, so the executor is deliberately not driven from here.
+_retirement = lib_retirement.RetirementExecutor(
+    registry_dir=REGISTRY_DIR,
+    repo_root=REPO_ROOT,
+    mux=_mux,
+    repo_identity_check=lambda: repo_identity_ok(REPO_ROOT),
+    log=lambda msg: log(msg),
+    queue_dir=QUEUE_DIR,
+)
+
+
+def retire_worker(agent_name, target, reason):
+    """Ask for `agent_name` to be retired.  Returns True if the ask was recorded.
+
+    This is where t002 moved the boundary.  All three "this Worker has no work
+    left" paths (idle shutdown, no-task shutdown, Rule 2 blocked-stuck) used to
+    end in `tmux_send(...)` + `tmux_kill_window(...)` right here.  The
+    judgement is still ours — it reads queue/, which only this daemon does —
+    but the killing is not: watchdog owns process lifetime, and it is the only
+    one of the two that can also finish the queue-side cleanup afterwards.
+
+    The shutdown message travels inside the marker so that exactly one daemon
+    sends it.  Sending it here and killing there would put the two ends of the
+    same action in different processes with no shared clock.
+    """
+    if KILL_AUTHORITY == 'dispatcher':
+        sent = tmux_send(target, lib_retirement.SHUTDOWN_MESSAGE)
+        time.sleep(1)  # allow the message to land before killing
+        tmux_kill_window(target)
+        # Callers gate record_notify() on this.  Reporting the send result (not
+        # an unconditional True) keeps the rollback path's dedup behaviour
+        # identical to pre-t002, where a failed send was retried next cycle.
+        return sent
+
+    if _retirement.has_marker(agent_name):
+        # Already asked.  Re-writing the request would restart watchdog's
+        # escalation from phase one every 5 seconds, so the Worker would be
+        # told to shut down forever and never actually be signalled.
+        return False
+    return _retirement.request(agent_name, target, reason)
+
+
+def sweep_spawn_grace_markers():
+    """Delete `.firstseen` markers whose window is gone (t002 F1).
+
+    `tmux_kill_window()` used to do this as a side effect of a successful
+    kill, and that was the only place it happened.  With the kill gone from
+    this daemon nobody would unlink them any more, and a stale marker is not
+    cosmetic: on the tmux backend (no created_at cache) the *next* Worker
+    spawned under the same reused name reads as already past SPAWN_GRACE, so
+    it gets zero grace and is shut down within one cycle — measured at 33
+    seconds from spawn when this regressed before (t015 / PR #190).
+
+    Keying on the window being absent rather than on a kill succeeding also
+    closes three holes that existed before t002: markers left behind when
+    watchdog terminated a Worker, when a window vanished on its own, and when
+    benchmark-ctx.sh killed one directly — none of those went through
+    tmux_kill_window(), so none of them ever cleaned up.
+
+    A backend that transiently lists nothing unlinks everything, which only
+    grants the next spawn its full grace again — the safe direction, the same
+    one watchdog's mass-kill guard leans.
+    """
+    try:
+        markers = list(STATE_JSON_DIR.glob('*.firstseen'))
+    except OSError:
+        return
+    if not markers:
+        return
+    live = set(_mux.list())
+    for marker in markers:
+        target = marker.name[:-len('.firstseen')]
+        if target in live:
+            continue
+        try:
+            marker.unlink(missing_ok=True)
+            log(f"[spawn_grace] swept stale marker for vanished window {target!r}")
+        except OSError as e:
+            log(f"WARNING: failed to sweep spawn-grace marker {marker}: {e}")
+
+
+def sweep_stale_pane_records():
+    """Drop `registry/mux/<name>.json` records whose pane no longer exists (t001).
+
+    A Worker's pane closes without `kill()` — watchdog's retirement signals the
+    shell pid and the mux closes the pane itself — so the record naming it
+    outlives it.  This is the same shape as `sweep_spawn_grace_markers()` and
+    lives beside it for the same reason: this daemon owns `registry/mux/`, and
+    the sweep is keyed on the pane being *gone*, not on any one kill path
+    succeeding.
+
+    The decision is `lib_mux.reap_stale_pane_records()` and nothing here
+    repeats it.  It asks the mux about the id each record names, and drops a
+    record only on a definite "no such pane"; a mux that cannot be asked
+    (down, timing out) leaves every record where it is, because the record is
+    the proof `may_destroy_pane()` needs.  It never raises, and a failure here
+    is a log line, never a failed cycle.
+
+    Rollback: a mux outage is already safe (records are kept).  To stop the
+    sweep, restart this daemon with `CREWVIA_MUX_RECORD_SWEEP=0`.
+    """
+    try:
+        for name in _mux.reap_stale_records():
+            log(f"[mux-record] swept stale spawn record for vanished pane {name!r}")
+    except Exception as e:
+        log(f"WARNING: stale spawn-record sweep failed: {e!r}")
+
+
+def warn_on_unconsumed_retirements():
+    """Say so when retirement markers are not being executed (§5-3 N3).
+
+    Between t002 and t005 watchdog is the only thing that closes a Worker.  A
+    watchdog that is dead or misconfigured produces no error of its own — the
+    symptom is just idle Workers that never go away, and this daemon's notify
+    dedup means even the request is logged at most once per 5 minutes.  One
+    explicit line per stale marker turns "nothing visibly happening" into a
+    fact someone can act on, and names the rollback.
+    """
+    now = time.time()
+    for agent in lib_retirement.list_agents(REGISTRY_DIR):
+        prog = lib_retirement.read_json(lib_retirement.progress_path(REGISTRY_DIR, agent))
+        if prog is not None:
+            continue  # watchdog has picked it up
+        req = lib_retirement.read_json(lib_retirement.request_path(REGISTRY_DIR, agent))
+        if not req:
+            continue
+        age = now - float(req.get('requested_at') or now)
+        if age < RETIREMENT_STALE_SECONDS:
+            continue
+        notify_key = f'retire_stale_{agent}'
+        if should_notify(notify_key):
+            msg = (
+                f"Worker {agent} の retirement marker が {age:.0f}s 未処理です。"
+                f"watchdog が停止している可能性があります (watchdog タブを確認、"
+                f"必要なら kill + respawn)。暫定回避は両デーモンを "
+                f"CREWVIA_KILL_AUTHORITY=dispatcher で再起動。"
+            )
+            if tmux_send(_director_name(), msg):
+                record_notify(notify_key)
+            log(f"[retire] WARNING: {agent}: request unconsumed for {age:.0f}s — watchdog may be down")
+
+
 def _mux_created_at(window_target: str):
     """Return the spawn epoch (float) for `window_target` from the Herdr
     cache (registry/mux/<window_target>.json, written by lib_mux.py
@@ -577,7 +1197,13 @@ def _mux_created_at(window_target: str):
     """
     p = STATE_JSON_DIR / f'{window_target}.json'
     try:
-        data = json.loads(p.read_text(encoding='utf-8'))
+        # registry/ の固定パスもガードを通す (t018)。tmux backend ではこの
+        # ファイルが存在しないのが普通なので、ENOENT は警告を出さない。
+        # 読み取りと JSON は入口の 1 つ (t026)。
+        data = load_json_store(
+            p, warn=lambda msg: log(f"WARNING: mux cache: {msg}"))
+        if is_unreadable(data):
+            return None
         ts = data.get('created_at')
         if not ts:
             return None
@@ -599,7 +1225,9 @@ def _spawn_time_fallback(window_target: str) -> float:
     """
     p = STATE_JSON_DIR / f'{window_target}.firstseen'
     try:
-        return float(p.read_text().strip())
+        raw = read_queue_text(p, 'spawn-grace marker')
+        if not is_unreadable(raw):
+            return float(raw.strip())
     except Exception:
         pass
     now = time.time()
@@ -666,6 +1294,13 @@ def publish_agents():
 
     now = time.time()
     workers = load_workers()
+    if is_unreadable(workers):
+        # 「誰がいるか」を観測できていない。ここで空として進むと、下の
+        # departure publish が **全員を DELETE する** —— 観測の失敗が撤去の
+        # 根拠になる形 (memory: evidence-for-destructive-decisions)。
+        log(f"WARNING: workers.yaml を観測できない ({workers.reason}) — "
+            f"このサイクルは Taskvia への publish を見送る")
+        return
 
     # Collect heartbeat mtimes for all agents
     heartbeats_dir = REGISTRY_DIR / 'heartbeats'
@@ -702,15 +1337,23 @@ def publish_agents():
 
             task_id = None
             task_title = None
-            assignment_file = ASSIGNMENTS_DIR / name
-            if assignment_file.exists():
+            assignment = read_assignment(name)
+            if not is_unreadable(assignment):
                 try:
-                    assignment = assignment_file.read_text().strip()
+                    assignment = assignment.strip()
                     if ':' in assignment:
                         mission_slug, task_id = assignment.split(':', 1)
                         task_file = MISSIONS_DIR / mission_slug / 'tasks' / f'{task_id}.md'
                         if task_file.exists():
-                            meta, _ = parse_frontmatter(task_file.read_text())
+                            # カードの読み取りは lib_task_cards を通すこと
+                            # (Codex 8 巡目 P2)。ここは列挙ではなく固定パスなので
+                            # t016 のガードから漏れていた —— `read_text()` には
+                            # 上限が無いので、割り当て済みカードが FIFO に
+                            # 置き換わると **この関数が返らない**。publish_agents()
+                            # は dispatch() より前に走るため、止まるのは全 mission の
+                            # 割り当てである。read_task_card() は例外を投げず、
+                            # 読めないカードは `[破損]` の title で返る。
+                            meta, _ = read_task_card(task_file, task_id)
                             task_title = meta.get('title')
                 except Exception:
                     pass
@@ -798,11 +1441,17 @@ def _state_json_path(name: str) -> Path:
 
 def _load_state_entry(name: str) -> dict:
     """Load state persistence entry.  Returns {} on missing / corrupt file."""
-    p = _state_json_path(name)
-    try:
-        return json.loads(p.read_text(encoding='utf-8'))
-    except Exception:
+    # 読み取りと形の検証は入口 (`load_json_store`) の 1 つ (t026)。`since` が文字列だと
+    # `now - since` が TypeError、list だと `.get` が AttributeError で、Rule 5 のサイクルが落ちる。
+    entry = load_json_store(
+        _state_json_path(name), check=rule5_state_problem,
+        warn=lambda msg: log(f"WARNING: rule5 state entry: {msg}"))
+    if is_unreadable(entry):
+        # 倒す先はここだけ「空」でよい —— grace が最初からやり直しになる
+        # = **通知が遅れる**側で、破壊も割り当ても起こらない
+        # (knowledge/empty-vs-unobservable.md §2 の I)。
         return {}
+    return entry
 
 
 def _save_state_entry(name: str, state: str, since: float) -> None:
@@ -816,7 +1465,8 @@ def _save_state_entry(name: str, state: str, since: float) -> None:
         log(f'WARNING: cannot write state entry for {name!r}: {e}')
 
 
-def check_rule5(name: str, target: str, assignment_file: Path) -> None:
+def check_rule5(name: str, target: str, assignment_file: Path, task_statuses_by_mission: dict,
+                waits_on_director: bool = False) -> None:
     """Rule 5: detect blocked / idle-with-task and notify Director.
 
     A: state == "blocked"
@@ -826,6 +1476,19 @@ def check_rule5(name: str, target: str, assignment_file: Path) -> None:
     Notifications are deduped via the standard NOTIFY_TTL cache.
 
     tmux mode (state == "unknown") → skip entirely (safe side).
+
+    t032 F4: once the escalating Worker goes idle after `plan.sh needs-director`,
+    Rule 5 must not send a second notification ("[Rule 5] idle-with-task" /
+    "blocked") for the same root cause, forever (every NOTIFY_TTL) — the
+    needs_director notification owns it.  Same exclusivity idea as the
+    failed+handoff_path block, which only fires for status=='failed'.
+
+    t001 (#13): `plan.sh needs-director` now retires the assignment, so the
+    assignment file no longer says "this Worker is parked on a needs_director
+    task".  Condition B needs the file and stops firing by itself; condition A
+    (pane blocked) used to be suppressed only through the assignment, so the
+    caller now passes `waits_on_director` (the Worker's own card says so).
+    The assignment-based check stays for assignments left by an older plan.sh.
     """
     # IMPORTANT: mux pane labels are '<name>-worker' (e.g. 'Omar-worker'), not
     # the bare agent name.  Use `target` (= window_target from
@@ -852,6 +1515,26 @@ def check_rule5(name: str, target: str, assignment_file: Path) -> None:
     # Determine which condition applies.
     is_A = (st == 'blocked')
     is_B = (st in ('idle', 'done')) and assignment_file.exists()
+
+    # t032 F4: if the assignment points at a task that already escalated to
+    # needs_director, the needs_director block owns notifying Director for
+    # it — suppress Rule 5 entirely for this worker/task pair.
+    if is_A or is_B:
+        assigned_task_status = None
+        raw = read_assignment(name)
+        if not is_unreadable(raw):
+            try:
+                a_slug, _, a_task_id = raw.strip().partition(':')
+                if not a_task_id:
+                    a_task_id = a_slug
+                    a_slug = None
+                if a_slug is not None:
+                    assigned_task_status = task_statuses_by_mission.get(a_slug, {}).get(a_task_id)
+            except Exception:
+                assigned_task_status = None
+        if assigned_task_status == 'needs_director' or waits_on_director:
+            is_A = False
+            is_B = False
 
     if not is_A and not is_B:
         # idle/done without assignment → not B.  Reset state entry.
@@ -885,11 +1568,13 @@ def check_rule5(name: str, target: str, assignment_file: Path) -> None:
     task_id = '?'
     mission_slug = '?'
     try:
-        raw = assignment_file.read_text().strip()
-        if ':' in raw:
-            mission_slug, task_id = raw.split(':', 1)
-        else:
-            task_id = raw
+        raw = read_assignment(name)
+        if not is_unreadable(raw):
+            raw = raw.strip()
+            if ':' in raw:
+                mission_slug, task_id = raw.split(':', 1)
+            else:
+                task_id = raw
     except Exception:
         pass
 
@@ -922,7 +1607,7 @@ def check_rule5(name: str, target: str, assignment_file: Path) -> None:
         record_notify(notify_key)
 
 
-def spawn_kai_review(slug, meta):
+def spawn_kai_review(slug, meta, task_statuses_by_mission):
     """Background-spawn kai-review.sh for a codex-review task.
 
     Preconditions:
@@ -932,8 +1617,10 @@ def spawn_kai_review(slug, meta):
 
     Behavior:
       - Extracts pr_number from frontmatter; if absent, logs warning and returns.
-      - Refuses to spawn while queue/assignments/Kai-codex exists (another run
-        of the same agent is already in flight — either this task or another).
+      - Refuses to spawn while queue/assignments/Kai-codex points at a run that
+        may still be in flight (`codex_review_slot_busy()`).  An assignment left
+        behind by a run that already finished / escalated is an orphan and does
+        not block (t001 / backlog #13).
       - Launches nohup kai-review.sh in a detached process group so the 5s
         poll loop does not block waiting for the codex CLI to finish.
       - stdout/stderr go to logs/kai-spawn/<slug>-<task_id>-<epoch>.log so
@@ -954,7 +1641,7 @@ def spawn_kai_review(slug, meta):
             record_notify(_key)
         return False
     # Only one Kai-codex run at a time.
-    if (ASSIGNMENTS_DIR / CODEX_REVIEW_AGENT).exists():
+    if codex_review_slot_busy(task_statuses_by_mission):
         return False
     if not KAI_REVIEW_SH.exists():
         log(f"ERROR: kai-review.sh not found at {KAI_REVIEW_SH} — cannot spawn Codex review")
@@ -995,8 +1682,134 @@ def spawn_kai_review(slug, meta):
         return False
 
 
+def review_refusal_for(slug, meta):
+    """このcodex-review task に、差分サイズ超過の拒否記録が効いているか (t010 / #11)。
+
+    -> ('none', None)          記録が無い / 別の PR 番号 (= 出し直した) → 通常どおり spawn
+       ('refused', rec)        拒否済み → 再 spawn しない
+       ('unreadable', Unreadable)  記録が読めない・壊れている → **保留** (spawn しない)
+
+    読めない記録を「拒否されていない」に倒さない: 壊れた記録 1 枚で
+    「spawn → 拒否 → needs_director → pending → spawn」のループが戻るため。
+    """
+    task_id = meta.get('id', '?')
+    try:
+        rec = lib_review_refusal.load(REGISTRY_DIR, slug, task_id)
+    except ValueError as e:      # ファイル名に使えない slug / id
+        return 'unreadable', Unreadable(REGISTRY_DIR, str(e))
+    except Exception as e:       # backstop: 想定外でも dispatch サイクルを落とさず「保留」に倒す
+        return 'unreadable', Unreadable(REGISTRY_DIR, f'unexpected {type(e).__name__}: {e}')
+    if is_missing(rec):
+        return 'none', None
+    if is_unreadable(rec):
+        return 'unreadable', rec
+    if not lib_review_refusal.refused_for_pr(rec, meta.get('pr_number')):
+        return 'none', None
+    return 'refused', rec
+
+
+def _refusal_clear_hint(slug, task_id):
+    return (f"python3 {REPO_ROOT / 'scripts' / 'lib_review_refusal.py'} clear "
+            f"--mission {slug} --task {task_id}")
+
+
+def refusal_note(slug, meta):
+    """needs_director 通知に添える 1 文 (拒否済みのときだけ)。無ければ ''。"""
+    if not (set(meta.get('skills') or []) & CODEX_REVIEW_SKILLS):
+        return '', None
+    state, rec = review_refusal_for(slug, meta)
+    if state != 'refused':
+        return '', None
+    task_id = meta.get('id', '?')
+    note = (f" ※ codex-review は差分サイズ超過で拒否済み: "
+            f"{lib_review_refusal.describe(rec)}。手動差分レビューに切り替えてください "
+            f"(dispatcher はこの task を再 spawn しません。codex-review を意図して再試行するなら "
+            f"{_refusal_clear_hint(slug, task_id)} 、PR を分割したなら "
+            f"plan.sh update {task_id} --pr-number <新PR> --mission {slug})。")
+    return note, (rec['pr'], rec['diff_bytes'], rec['max_bytes'])
+
+
+def handle_codex_review(slug, meta, live_state_keys, task_statuses_by_mission):
+    """unblocked-pending な codex-review task: 拒否済みなら知らせて止め、そうでなければ spawn。"""
+    task_id = meta['id']
+    state, rec = review_refusal_for(slug, meta)
+    if state != 'none':
+        key = f'review_refused_{slug}_{task_id}'
+        live_state_keys.add(key)
+        if state == 'refused':
+            fp = fingerprint('review_refused', rec['pr'], rec['diff_bytes'], rec['max_bytes'])
+            def build_msg():
+                return (
+                    f"[review-refused] task {task_id} (mission={slug}): codex-review は拒否済みです "
+                    f"({lib_review_refusal.describe(rec)})。差分が大きいと codex は途中を切り詰め、"
+                    f"空の結果を信用できないため、dispatcher は再 spawn しません。"
+                    f"手動差分レビューに切り替え、結果を plan.sh done {task_id} --mission {slug} "
+                    f"で報告してください。codex-review を意図して再試行するなら "
+                    f"{_refusal_clear_hint(slug, task_id)} 、PR を分割したなら "
+                    f"plan.sh update {task_id} --pr-number <新PR> --mission {slug}。"
+                )
+        else:
+            fp = fingerprint('review_refused', 'unreadable', rec.reason)
+            def build_msg():
+                return (
+                    f"[review-refused] task {task_id} (mission={slug}): codex-review の拒否記録が"
+                    f"読めない/壊れているため spawn を保留しています ({rec.reason})。"
+                    f"記録を確認し、意図して再試行するなら "
+                    f"{_refusal_clear_hint(slug, task_id)} 、そうでなければ手動差分レビューに"
+                    f"切り替えてください。"
+                )
+        notify_state_once(key, fp, 'review-refused', slug, task_id, build_msg,
+                          director_live=director_live_for_state_notices)
+        return
+    if not meta.get('pr_number'):
+        # t036: PR 番号の無い codex-review は spawn できない。以前は log() だけで、しかも
+        # 呼び出し側が handle_codex_review() の後に無条件 continue するので no_worker の
+        # Director 通知にも届かず、pending のまま誰にも知らされなかった (実装 Worker が
+        # `plan.sh done --pr` を付け忘れると、Codex を通らずに merge されうる)。
+        # 状態ベースなので 1 回だけ (番号が入れば状態を離れ、台帳から捨てられる)。
+        # ここに来るのは依存が満たされて pending の task だけ — blocked のまま止めている
+        # task は Director が意図して止めているので通知しない。
+        key = f'review_no_pr_{slug}_{task_id}'
+        live_state_keys.add(key)
+        fp = fingerprint('review_no_pr')
+        def build_msg():
+            return (
+                f"[review-no-pr] task {task_id} (mission={slug}): codex-review が ready なのに "
+                f"pr_number がありません。kai-review.sh を起動できず、このままでは Codex を通らずに "
+                f"merge されえます。実装 Worker が plan.sh done --pr を付け忘れた可能性があります。"
+                f"PR 番号を入れて再開してください: "
+                f"plan.sh update {task_id} --pr-number <N> --status pending --mission {slug}"
+            )
+        notify_state_once(key, fp, 'no-pr-number', slug, task_id, build_msg,
+                          director_live=director_live_for_state_notices)
+        return
+    spawn_key = f'kai_spawn_{slug}_{task_id}'
+    if should_notify(spawn_key):
+        if spawn_kai_review(slug, meta, task_statuses_by_mission):
+            record_notify(spawn_key)
+
+
+_director_live_memo = []     # dispatch() が毎サイクルの先頭で空にする
+
+
+def director_live_for_state_notices():
+    """Director の窓が生きているか。**サイクル内で最初に必要になったときに 1 回だけ**問い合わせる。
+
+    以前は needs_director / handoff のループの前で無条件に呼んでいたので、通知対象が
+    無いサイクルでも mux への問い合わせが 5 秒ごとに増えていた。呼び出し側は
+    `notify_state_once(director_live=director_live_for_state_notices)` と **関数のまま**
+    渡す。1 サイクルの中で結果を使い回すのは、通知のたびに問い合わせを増やさないため。
+    """
+    if not _director_live_memo:
+        _director_live_memo.append(bool(_mux.list(suffix='-director')))
+    return _director_live_memo[0]
+
+
 def shutdown_idle_workers():
-    """Send shutdown message and kill idle Worker windows."""
+    """Request retirement of idle Worker windows (D1).
+
+    t002: this decides, it no longer executes.  See retire_worker().
+    """
     windows = tmux_list_worker_windows()
     for window in windows:
         agent_name = window['agent_name']
@@ -1009,14 +1822,31 @@ def shutdown_idle_workers():
                 continue
             notify_key = f"shutdown_{agent_name}"
             if should_notify(notify_key):
-                if tmux_send(target, 'タスクなし、shutdown'):
+                if retire_worker(agent_name, target, 'all-done'):
                     record_notify(notify_key)
-                time.sleep(1)
-                tmux_kill_window(target)
 
 
 def dispatch():
+    _director_live_memo.clear()
+    _target_record_memo.clear()
     state = load_state()
+    if is_unreadable(state):
+        # Codex 9 巡目 P1。`{}` に潰すと下の `if not active_missions` に落ちて
+        # **退役を認可する**。何が active なのか観測できていない以上、割り当ても
+        # 退役も結論できない —— このサイクルは丸ごと見送る。次の 5 秒後にもう
+        # 一度読む (state.yaml は `os.replace` でしか書かれないので、原因が
+        # 直れば自然に戻る)。
+        log(f"WARNING: state.yaml を観測できない ({state.reason}) — "
+            f"このサイクルは割り当ても退役も行わない")
+        return
+
+    workers = load_workers()
+    if is_unreadable(workers):
+        # 誰が idle なのかを決める材料が無い。同上、結論を出さない。
+        log(f"WARNING: workers.yaml を観測できない ({workers.reason}) — "
+            f"このサイクルは割り当ても退役も行わない")
+        return
+
     active_missions = list(state.get('active_missions') or [])
 
     # Bug1 fix: even with no active missions, shut down lingering idle Workers
@@ -1025,16 +1855,21 @@ def dispatch():
         set_all_done_state(False)
         return
 
-    workers = load_workers()
-
     # Check if all active missions are done (empty list = all done)
     all_done = True
     for slug in active_missions:
         mfile = MISSIONS_DIR / slug / 'mission.yaml'
-        if not mfile.exists():
+        # `exists()` での事前確認は置かない —— `EACCES` で stat できないときも
+        # False になるので、「無い」と「観測できない」が同じ分岐に入る。
+        # 欠損も `is_unreadable()` に含まれ、どちらも「完了ではない」に倒す。
+        mtext = read_queue_text(mfile, 'mission file')
+        if is_unreadable(mtext):
+            # 読めなかった mission を「完了した」に数えない。この判定の先には
+            # 全 idle Worker の shutdown があるので、観測の失敗はそこへ落として
+            # はいけない (memory: evidence-for-destructive-decisions)。
             all_done = False
             break
-        m = parse_yaml(mfile.read_text())
+        m = parse_yaml(mtext)
         if m.get('status') != 'done':
             all_done = False
             break
@@ -1057,20 +1892,18 @@ def dispatch():
 
     # Load all tasks
     all_tasks, done_ids_by_mission, task_statuses_by_mission = load_all_tasks(active_missions)
+    # t010: 状態ベースの通知 (needs_director / handoff / review-refused) が今なお
+    # 成り立っている key。サイクルの最後に、成り立たなくなった記録を捨てるのに使う。
+    live_state_keys = set()
 
     # Unblocked pending tasks (eligible for assignment), sorted by priority
     unblocked_pending = []
     for slug, meta in all_tasks:
         if meta.get('status') != 'pending':
             continue
-        done_ids = done_ids_by_mission.get(slug, set())
         task_statuses = task_statuses_by_mission.get(slug, {})
-        bb = meta.get('blocked_by') or []
-        # failed/cancelled deps do not block: they indicate the dep will never
-        # complete, so downstream tasks should remain eligible for assignment.
-        unmet_deps = [dep for dep in bb
-                      if dep not in done_ids
-                      and task_statuses.get(dep) not in ('failed', 'cancelled')]
+        verdict = dependency_gate(slug, meta, done_ids_by_mission, task_statuses_by_mission)
+        unmet_deps = verdict.unmet
         if unmet_deps:
             # Suppress repeated output of the same blocked state to avoid
             # flooding the scrollback (same line every 5s → 40-line buffer fills
@@ -1079,8 +1912,15 @@ def dispatch():
             # (default 300s) as a heartbeat so the state remains visible.
             _bkey = f"blocked_log_{slug}_{meta.get('id')}"
             if should_notify(_bkey):
-                log(f"[blocked] task {meta.get('id')} (mission={slug}) — unmet deps: "
-                    f"{unmet_deps} (statuses: {[task_statuses.get(d) for d in unmet_deps]})")
+                if verdict.held:
+                    # failed の依存は誰も自動では解かない。ログにも出口を残す
+                    # (plan.sh status にも同じ文面が出る)。
+                    log(f"[held] task {meta.get('id')} (mission={slug}) — failed deps "
+                        f"{verdict.held}: Director の判断待ち。"
+                        f"`plan.sh release-dep {meta.get('id')} --mission {slug}` で解除")
+                else:
+                    log(f"[blocked] task {meta.get('id')} (mission={slug}) — unmet deps: "
+                        f"{unmet_deps} (statuses: {[task_statuses.get(d) for d in unmet_deps]})")
                 record_notify(_bkey)
             continue
         task_skills = set(meta.get('skills') or [])
@@ -1129,6 +1969,8 @@ def dispatch():
                 except OSError:
                     pass
 
+    sweep_stale_target_records(_alive_workers)
+
     # Track which tasks were assigned this cycle to avoid double-dispatch.
     # Keyed as (slug, task_id) tuples so that missions reusing the same
     # task IDs (e.g. t001 in both mission-a and mission-b) do not block
@@ -1146,13 +1988,45 @@ def dispatch():
 
         worker_skills = set(worker_info.get('skills') or [])
 
-        # Idle = no assignment file
+        # Idle = no assignment file, and not waiting on the Director.
+        #
+        # t001 (#13): `plan.sh needs-director` now retires the assignment (so a
+        # finished Kai-codex run no longer blocks every later codex-review).  A
+        # Worker parked on a needs_director card is still not idle — before the
+        # change its assignment file said so; now its card does.  Reading it as
+        # idle would hand it a new task while the Director is deciding what to
+        # do with the old one.
         assignment_file = ASSIGNMENTS_DIR / agent_name
-        is_idle = not assignment_file.exists()
+        waits_on_director = worker_waits_on_director(agent_name, all_tasks)
+        is_idle = not assignment_file.exists() and not waits_on_director
 
         # Rule 5 (herdr only): check agent state for blocked / idle-with-task.
         # Runs for ALL workers (busy and idle) before the is_idle gate below.
-        check_rule5(agent_name, target, assignment_file)
+        check_rule5(agent_name, target, assignment_file, task_statuses_by_mission,
+                    waits_on_director=waits_on_director)
+
+        # t025: a Worker whose retirement is already in flight is not a
+        # candidate for anything.  Before t002 the judgement and the kill were
+        # one second apart, so there was no window to assign into; now watchdog
+        # gives the Worker a grace period, and for the idle / no-task / Rule 2
+        # paths `queue/assignments/<agent>` stays absent for all of it.  This
+        # loop would happily read that as "idle" and send it the next task.
+        #
+        # What follows is not merely wasted work.  The Worker pulls, so the
+        # pane keeps the same pid and created_at, watchdog's identity guard
+        # passes, and the escalation lands on a Worker doing *new* work — whose
+        # task the cleanup, bound to the old execution, then leaves stranded
+        # in_progress (Codex 4 巡目 P1-1).  watchdog re-checks the assignment
+        # before it acts (`assignment_execution_verdict()`), but that is the
+        # last line of defence; not creating the situation is this one.
+        #
+        # Skipping the whole iteration also covers the no-task / blocked-stuck
+        # branches below, which would only call retire_worker() and be refused
+        # for the same marker.
+        if KILL_AUTHORITY != 'dispatcher' and _retirement.has_marker(agent_name):
+            log(f"[retire] {agent_name}: retirement in flight — not assigning "
+                f"any task this cycle")
+            continue
 
         if not is_idle:
             continue  # Worker is busy; do not interrupt
@@ -1169,6 +2043,18 @@ def dispatch():
         # before tmux kill-window and removed after the new window is ready.
         if bench_worker_restarting(agent_name):
             log(f"[bench] {agent_name} is restarting (Strategy C) — skipping assignment")
+            continue
+
+        # #22: 割り当てメッセージを送ったばかりで、まだ pull されていない task がある
+        # Worker には、別の task を重ねて送らない (assignment ファイルはまだ無いので
+        # is_idle は真のまま)。理由と TTL は worker_outstanding_assignment() を参照。
+        outstanding = worker_outstanding_assignment(agent_name, all_tasks)
+        if outstanding:
+            _okey = f"outstanding_log_{agent_name}_{outstanding[0]}_{outstanding[1]}"
+            if should_notify(_okey):
+                log(f"[assign] {agent_name}: task {outstanding[1]} (mission={outstanding[0]}) "
+                    f"を送信済みで pull 待ち — 別の task は送らない")
+                record_notify(_okey)
             continue
 
         # Find best unblocked pending task with skill match
@@ -1189,6 +2075,17 @@ def dispatch():
             if task_skills & CODEX_REVIEW_SKILLS:
                 continue
             if task_skills.issubset(worker_skills):
+                # #21: Worker が起動された TARGET_DIR と task の target_dir が合わない
+                # task は回さない (別 repo 用の Worker に crewvia 本体の task が回り、
+                # 差し戻しても同じ Worker に再割り当てされた)。記録が読めない Worker には
+                # target_dir 付きの task を回さない (保留)。判定は lib_worker_target 1 つ。
+                may_take, why_not = worker_may_take_task(agent_name, meta)
+                if not may_take:
+                    _tkey = f"target_skip_{agent_name}_{slug}_{meta['id']}"
+                    if should_notify(_tkey):
+                        log(f"[target] {agent_name}: task {meta['id']} (mission={slug}) を割り当てない — {why_not}")
+                        record_notify(_tkey)
+                    continue
                 best = (slug, meta)
                 break
 
@@ -1216,26 +2113,37 @@ def dispatch():
                 if bool(task_s := set(meta.get('skills') or [])) and task_s.issubset(worker_skills)
             ]
             has_any = bool(matching_pending)
-            # Defense-in-depth: also keep the worker alive if it owns an
-            # in_progress task.  plan.sh pull writes the assignment file before
-            # the Taskvia sync, but there is still a narrow window between
-            # save_task (task→in_progress) and the assignment file write where
-            # the dispatcher could see is_idle=True + no pending tasks.
-            has_in_progress = any(
-                meta.get('worker') == agent_name
-                for _, meta in all_tasks
-                if meta.get('status') == 'in_progress'
-            )
-            if not has_any and not has_in_progress:
+            # Also keep the worker alive if it still holds a card — in_progress,
+            # needs_director, needs_human_review, blocked, verifying, ... (t001:
+            # anything the Worker has not released; see worker_holds_work()).
+            # Originally this only looked at in_progress, as defense in depth for
+            # the window between plan.sh pull's save_task (task→in_progress) and
+            # the assignment write.  needs-director now removes the assignment
+            # too, so a Worker awaiting the Director's decision would otherwise
+            # read as "no work" and be retired (memory:
+            # assignment-removal-triggers-rule2-kill).
+            has_in_progress = worker_holds_work(agent_name, all_tasks)
+            # #21: skill は合うが TARGET_DIR が合わない task しか残っていない Worker。
+            # それは「全部 blocked」でも「仕事なし」でもない — Rule 2 (blocked-stuck) で
+            # 退役させると、記録を持たない (PR3 より前に起動した) TARGET_DIR 付き Worker が、
+            # 自分の task を待っているだけで殺される。Director に起動要求 (下の no_worker) が
+            # 行くので、ここは何もしない。
+            takeable_pending = [(sl, m) for sl, m in matching_pending
+                                if worker_may_take_task(agent_name, m)[0]]
+            if has_any and not takeable_pending and not has_in_progress:
+                _skey = f"target_only_{agent_name}"
+                if should_notify(_skey):
+                    log(f"[target] {agent_name}: 残っている task は TARGET_DIR が合わないものだけ — "
+                        f"退役させず待機 (Director に起動要求済み)")
+                    record_notify(_skey)
+            elif not has_any and not has_in_progress:
                 if in_spawn_grace(target):
                     log(f"[spawn_grace] {agent_name}: within {SPAWN_GRACE_SECONDS}s spawn grace — skip shutdown")
                 else:
                     notify_key = f"shutdown_{agent_name}"
                     if should_notify(notify_key):
-                        if tmux_send(target, 'タスクなし、shutdown'):
+                        if retire_worker(agent_name, target, 'no-task'):
                             record_notify(notify_key)
-                        time.sleep(1)  # allow the message to land before killing
-                        tmux_kill_window(target)
             elif has_any and not has_in_progress:
                 # Rule 2: all matching tasks are blocked.  If the most recently
                 # modified matching task file is older than BLOCKED_STUCK_THRESHOLD,
@@ -1300,12 +2208,10 @@ def dispatch():
                                 log(
                                     f"[Rule 2] {agent_name}: all matching tasks blocked for "
                                     f"{stuck_secs:.0f}s ≥ {BLOCKED_STUCK_THRESHOLD}s "
-                                    f"— sending shutdown (blocked-stuck)"
+                                    f"— requesting retirement (blocked-stuck)"
                                 )
-                                if tmux_send(target, 'タスクなし、shutdown'):
+                                if retire_worker(agent_name, target, 'blocked-stuck'):
                                     record_notify(notify_key)
-                                time.sleep(1)
-                                tmux_kill_window(target)
 
     # Notify Sora about unblocked pending tasks that NO live worker can handle.
     # alive_workers uses OR condition: window seed + heartbeat-fresh union.
@@ -1322,20 +2228,20 @@ def dispatch():
             continue
         # Codex-review path (Phase 2): background-spawn kai-review.sh instead
         # of asking the Director to start a Worker.  spawn_kai_review is a
-        # no-op when Kai-codex is already in flight (assignment file exists)
+        # no-op when Kai-codex may still be in flight (assignment points at a
+        # live run — an orphan assignment does not count)
         # or when pr_number is missing (warning logged, Director escalates).
         if task_skills & CODEX_REVIEW_SKILLS:
-            spawn_key = f'kai_spawn_{slug}_{task_id}'
-            if should_notify(spawn_key):
-                if spawn_kai_review(slug, meta):
-                    record_notify(spawn_key)
+            handle_codex_review(slug, meta, live_state_keys, task_statuses_by_mission)
             continue
         # can_handle: True if any alive worker (window exists OR heartbeat recent) has skills ⊇ task_skills
-        can_handle = any(
-            task_skills.issubset(set((workers.get(name) or {}).get('skills') or []))
-            for name in _alive_workers
+        # #21: skill に加えて TARGET_DIR の記録も合う Worker だけが「担当できる」。
+        skill_ok = [
+            name for name in _alive_workers
             if (workers.get(name) or {}).get('role', 'worker') == 'worker'
-        )
+            and task_skills.issubset(set((workers.get(name) or {}).get('skills') or []))
+        ]
+        can_handle = any(worker_may_take_task(name, meta)[0] for name in skill_ok)
         if not can_handle:
             # Include slug to avoid collision when missions reuse t001, t002, etc.
             notify_key = f"no_worker_{slug}_{task_id}"
@@ -1343,6 +2249,13 @@ def dispatch():
                 msg = (
                     f"要求スキル {sorted(task_skills)} の Worker を起動してください "
                     f"(task {task_id}, mission={slug})"
+                )
+                if skill_ok:
+                    # skill は合う Worker が居るのに担当できない = TARGET_DIR が合わない。
+                    msg += f" — 既存の Worker は担当できません: {worker_may_take_task(skill_ok[0], meta)[1]}"
+                msg += (
+                    f"。起動コマンド: "
+                    + worker_start_command(task_skills, meta.get('target_dir'), fresh=bool(skill_ok))
                 )
                 if tmux_send(_director_name(), msg):
                     record_notify(notify_key)
@@ -1385,51 +2298,168 @@ def dispatch():
                 log(f"[vanished_worker] {slug}/{task_id}: worker {worker_name} tab gone + heartbeat stale — notified director")
 
 
+    # needs_director detection: task escalated to needs_director → notify Director.
+    # t027: previously nothing watched this transition (grep for 'needs_director' in
+    # this file returned 0 hits) — a Codex NEEDS FIX or a Worker's `plan.sh
+    # needs-director` call left the queue silently draining to empty with no one
+    # waking the Director (measured: 10h28m full stop, 2026-09-21 19:53 UTC →
+    # 2026-09-22 06:22 UTC). Reuses all_tasks already loaded above — no extra scan.
+    #
+    # t010 (#10): 状態ベースの通知は **状態が変わるまで 1 回だけ**。以前は
+    # should_notify() (= NOTIFY_TTL のスロットル) だけで、対処済みの task でも 5 分ごと
+    # に永久に再送されていた (2026-09-25 に数十通)。今は notify_state_once() が
+    # 「この状態は既に伝えた」台帳 (registry/daemons/notified-state.json) を持ち、
+    # status + reason (+ 拒否記録) が変わったときだけ再通知する。Director が
+    # pending に戻して再び落ちた場合は、状態を離れた時点で台帳から捨てるので届く。
+    #
+    # t032 F5: _director_name() falls back to the literal 'Sora-director' when no
+    # Director window is live, so with no guard this block called tmux_send()
+    # unconditionally — 2 log lines (tmux_send's own WARNING + this block's own
+    # "mux send failed") every 5s per needs_director task, for as long as no
+    # Director is up. Match Rule 5's director_live guard: 1 log line, no send
+    # attempt, no notify recorded (so it re-checks, and re-notifies promptly,
+    # once a Director comes back).
+    for slug, meta in all_tasks:
+        if meta.get('status') != 'needs_director':
+            continue
+        task_id = meta.get('id', '?')
+        notify_key = f'needs_director_{slug}_{task_id}'
+        live_state_keys.add(notify_key)
+        reason = (meta.get('needs_director_reason') or '').strip()
+        reason_line = reason.splitlines()[0][:200] if reason else '(理由未記載)'
+        task_file = MISSIONS_DIR / slug / 'tasks' / f'{task_id}.md'
+        # codex-review が差分サイズ超過で拒否した task には、手動差分レビューへの
+        # 切り替えと超過バイト数・PR 番号を添える (t010 / #11)。
+        note, note_inputs = refusal_note(slug, meta)
+        fp = fingerprint('needs_director', reason, note_inputs)
+
+        def build_msg(slug=slug, task_id=task_id, reason=reason, reason_line=reason_line,
+                      task_file=task_file, note=note):
+            return (
+                f'[needs_director] task {task_id} (mission={slug}) が needs_director です。'
+                f'理由: {reason_line}'
+                + ('…' if len(reason) > len(reason_line) else '')
+                + f' (全文: {task_file})。'
+                f'reason を読んで方針を決め、plan.sh update {task_id} --status pending --reset '
+                f'--mission {slug} で差し戻してください。'
+                + note
+            )
+        if notify_state_once(notify_key, fp, 'needs_director', slug, task_id, build_msg,
+                             director_live=director_live_for_state_notices):
+            log(f"[needs_director] {slug}/{task_id}: notified director (reason: {reason_line[:80]!r})")
+
+
     # Handoff detection: failed tasks with handoff_path → notify Director
-    for slug in active_missions:
-        tasks_for_slug = list_tasks_for_mission(slug)
-        for meta, _ in tasks_for_slug:
-            if meta.get('status') != 'failed':
-                continue
-            handoff_path = meta.get('handoff_path')
-            if not handoff_path:
-                continue
-            task_id = meta.get('id', '?')
-            notify_key = f"handoff_{slug}_{task_id}"
-            if should_notify(notify_key):
-                handoff_summary = ''
-                try:
-                    hp = Path(handoff_path)
-                    if not hp.is_absolute():
-                        # task_158: writer(worker.md)は crewvia_handoff_path 経由で常に絶対パスを
-                        # 書くはずなので、ここに来るのは規約からの逸脱(回帰)。cwd(worktree)基準の
-                        # 相対パスは main repo 側から見て別ファイルを指し handoff_summary が空に
-                        # なる既知の壊れ方(task_158)なので、黙って空文字にせず明示的に警告する。
-                        log(f"WARNING: handoff_path is not absolute (task_158 regression?): "
-                            f"{slug}/{task_id} handoff_path={handoff_path!r}")
-                        hp = REGISTRY_DIR.parent / handoff_path
-                    if hp.exists():
-                        lines = hp.read_text().splitlines()[:10]
-                        handoff_summary = ' | '.join(lines)
-                    else:
-                        log(f"WARNING: handoff file not found at resolved path: "
-                            f"{slug}/{task_id} resolved={hp}")
-                except Exception:
-                    handoff_summary = '(読み取り失敗)'
-                msg = (
-                    f"タスク {task_id} (mission={slug}) が failed になりました。"
-                    f"handoff_path: {handoff_path} — {handoff_summary[:200]}。"
-                    f"plan.sh add で継続タスクを追加してください。"
-                )
-                if tmux_send(_director_name(), msg):
-                    record_notify(notify_key)
-                    log(f"handoff detected: {slug}/{task_id} -> notified director")
+    # t010 (#10): needs_director と同じく、状態が変わるまで 1 回だけ (台帳)。
+    # 入力は status + handoff_path。以前は failed かつ handoff_path がある間ずっと
+    # TTL ごとに再送された。
+    # t023 (Kai 2 巡目 P2): **ここは all_tasks を使う** (ミッションを走査し直さない)。
+    # 末尾の prune_told() は「observed_missions(all_tasks) で観測できた mission の、live に
+    # 無い key を捨てる」ので、live key を集める側も同じスナップショットでなければならない。
+    # 別の走査で live key を集めると、1 回目の走査 (all_tasks) は成功・2 回目が破損カード /
+    # 走査失敗のとき、handoff key が 1 件も集まらないのに mission は「観測できた」扱いになり、
+    # 台帳とスロットルを捨てる。読み取りが回復すると同じ failed task が再通知され、
+    # 断続的な失敗のたびに通知洪水が戻る (「観測できなかった」を「もう無い」と読む型)。
+    # 採らなかった案 (b) 「2 回目の失敗を pruning のガードに足す」: 走査を 2 回するせいで
+    # 起きる欠陥を、2 回目の結果を見張る別のガードで塞ぐことになる。ガードは持ち場が増える
+    # ぶん漏れる (t018)。スナップショットを 1 つにすれば、判断の材料が 1 つなので食い違えない
+    # (needs_director / vanished 検知はすでに all_tasks を使っている)。走査も 1 回減る。
+    for slug, meta in all_tasks:
+        if meta.get('status') != 'failed':
+            continue
+        handoff_path = meta.get('handoff_path')
+        if not handoff_path:
+            continue
+        task_id = meta.get('id', '?')
+        notify_key = f"handoff_{slug}_{task_id}"
+        live_state_keys.add(notify_key)
+        fp = fingerprint('failed', handoff_path)
+
+        def build_msg(slug=slug, task_id=task_id, handoff_path=handoff_path):
+            handoff_summary = ''
+            try:
+                hp = Path(handoff_path)
+                if not hp.is_absolute():
+                    # task_158: writer(worker.md)は crewvia_handoff_path 経由で常に絶対パスを
+                    # 書くはずなので、ここに来るのは規約からの逸脱(回帰)。cwd(worktree)基準の
+                    # 相対パスは main repo 側から見て別ファイルを指し handoff_summary が空に
+                    # なる既知の壊れ方(task_158)なので、黙って空文字にせず明示的に警告する。
+                    log(f"WARNING: handoff_path is not absolute (task_158 regression?): "
+                        f"{slug}/{task_id} handoff_path={handoff_path!r}")
+                    hp = REGISTRY_DIR.parent / handoff_path
+                hp_text = read_queue_text(hp, 'handoff file')
+                if not is_unreadable(hp_text):
+                    handoff_summary = ' | '.join(hp_text.splitlines()[:10])
                 else:
-                    log(f"handoff detected but mux send failed: {slug}/{task_id} (will retry)")
+                    log(f"WARNING: handoff file unreadable at resolved path: "
+                        f"{slug}/{task_id} resolved={hp} ({hp_text.reason})")
+            except Exception:
+                handoff_summary = '(読み取り失敗)'
+            return (
+                f"タスク {task_id} (mission={slug}) が failed になりました。"
+                f"handoff_path: {handoff_path} — {handoff_summary[:200]}。"
+                f"plan.sh add で継続タスクを追加してください。"
+            )
+        if notify_state_once(notify_key, fp, 'handoff', slug, task_id, build_msg,
+                             director_live=director_live_for_state_notices):
+            log(f"handoff detected: {slug}/{task_id} -> notified director")
+
+    # t010: 状態を離れた task の「伝えた」記録を捨てる (Director が pending に戻し、
+    # 同じ理由でまた落ちたのは新しい事象なので、届かなければならない)。
+    prune_told(live_state_keys, observed_missions(all_tasks, active_missions))
 
 
+def run_daemon_watch():
+    """Is the watchdog still alive?  (t005)
+
+    Only the *peer* is judged here.  This daemon's own heartbeat is written by
+    the bash wrapper, deliberately: the wrapper is the process that endures,
+    and a python cycle that throws on every pass must not be able to make a
+    live dispatcher look dead to the watchdog.
+
+    Everything is caught — the mutual watch is a safety net, and a safety net
+    that can abort the dispatch cycle is a net that makes things worse.
+    """
+    try:
+        import lib_daemon_watch
+        watch = lib_daemon_watch.DaemonWatch(
+            registry_dir=REGISTRY_DIR,
+            repo_root=REPO_ROOT,
+            self_name=lib_daemon_watch.DAEMON_DISPATCHER,
+            mux=_mux,
+            config=lib_daemon_watch.load_config(),
+            log=log,
+        )
+        verdict = watch.watch_peer()
+        # 'healthy' fires every 5 seconds; logging it would bury the log.  The
+        # rest are all states a person may need to reconstruct afterwards.
+        if verdict.action not in (lib_daemon_watch.ACTION_HEALTHY,
+                                  lib_daemon_watch.ACTION_GRACE,
+                                  lib_daemon_watch.ACTION_DISABLED):
+            log(f"[daemon-watch] watchdog: {verdict.action} — {verdict.reason}")
+    except Exception as e:
+        log(f"[daemon-watch] cycle failed: {e!r}")
+
+
+# --- CYCLE ENTRY POINT ---
+# Everything below this marker runs a full dispatch cycle.  Tests that want to
+# exercise a single helper (tests/test_orphan_daemon_guard.py) exec() the code
+# above it and stop here, so keep the marker even if the calls change.
+#
+# t005: the mutual watch goes FIRST.  It is the watchdog's only observer, and
+# a failure further down this cycle (a corrupt card, a half-deployed change)
+# would otherwise take the observer down with it — at exactly the moment the
+# system is least healthy and most in need of it.
+run_daemon_watch()
 publish_agents()
 dispatch()
+# t002: both are queue/registry bookkeeping, not dispatch decisions, and both
+# must run on every cycle — including the early-return cycles dispatch() takes
+# when there are no active missions.
+sweep_spawn_grace_markers()
+sweep_stale_pane_records()
+if KILL_AUTHORITY != 'dispatcher':
+    warn_on_unconsumed_retirements()
 PYEOF
 }
 
@@ -1440,6 +2470,12 @@ while true; do
   # Recompute log file path on each cycle so midnight date-rollover creates a
   # new file automatically (e.g. dispatcher-20260905.log → dispatcher-20260906.log).
   LOG_FILE="${LOG_DIR}/dispatcher-$(date +%Y%m%d).log"
+  # t005: 生存表明は dispatch サイクルの成否から独立させる。`run_dispatch &&`
+  # のように繋いでしまうと、python 側が毎回例外で落ちる状態 (壊れた card、
+  # 中途半端な deploy) で heartbeat だけが止まり、この bash ループは元気なのに
+  # watchdog からは死んで見える → respawn → dispatcher が 2 つ、になる。
+  # そのため無条件・先頭で書く。
+  daemon_beat dispatcher "$REPO_ROOT" "$REGISTRY_DIR"
   run_dispatch || log "dispatch cycle error (exit $?)"
   sleep 5
 done

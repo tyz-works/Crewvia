@@ -117,7 +117,7 @@ EOF
 # ---------------------------------------------------------------------------
 run_python_check() {
   local notify_cache="$TMPDIR_TEST/notify-cache.json"
-  python3 - "$QUEUE" "$REGISTRY" "$notify_cache" "300" <<'PYEOF'
+  python3 - "$QUEUE" "$REGISTRY" "$notify_cache" "300" "$SCRIPT_DIR" <<'PYEOF'
 import sys
 import os
 import re
@@ -129,6 +129,14 @@ QUEUE_DIR      = Path(sys.argv[1])
 REGISTRY_DIR   = Path(sys.argv[2])
 NOTIFY_CACHE   = Path(sys.argv[3])
 NOTIFY_TTL     = int(sys.argv[4])
+# 依存判定の規則は本物 (scripts/lib_dep_rules.py) を読む。ここに
+# 「dispatcher.sh と同じロジック」を書き写すと、dispatcher が規則を
+# 変えてもこのテストだけは古い規則で緑のままになる。
+sys.path.insert(0, sys.argv[5])
+from lib_dep_rules import card_dependencies  # noqa: E402
+# カードの読み取りも本物から取る。ここに dispatcher.sh の写しを置くと、
+# 本番を直してもこのテストは緑のままになる (いちばん質の悪い緑)。
+from lib_task_cards import list_task_cards  # noqa: E402
 
 MISSIONS_DIR   = QUEUE_DIR / 'missions'
 STATE_FILE     = QUEUE_DIR / 'state.yaml'
@@ -187,28 +195,8 @@ def parse_yaml(text):
             result[key] = _scalar(val); i += 1
     return result
 
-def parse_frontmatter(text):
-    lines = text.splitlines()
-    if not lines or lines[0].strip() != '---': return {}, text
-    end = -1
-    for idx in range(1, len(lines)):
-        if lines[idx].strip() == '---': end = idx; break
-    if end < 0: return {}, text
-    meta = parse_yaml('\n'.join(lines[1:end]))
-    meta.setdefault('skills', []); meta.setdefault('blocked_by', [])
-    if meta.get('skills') is None: meta['skills'] = []
-    if meta.get('blocked_by') is None: meta['blocked_by'] = []
-    return meta, '\n'.join(lines[end+1:])
-
 def list_tasks(slug):
-    tdir = MISSIONS_DIR / slug / 'tasks'
-    if not tdir.exists(): return []
-    entries = sorted(
-        [(int(m.group(1)), fn)
-         for fn in tdir.iterdir()
-         if (m := re.fullmatch(r't(\d+)\.md', fn.name))]
-    )
-    return [parse_frontmatter(p.read_text()) for _, p in entries]
+    return list_task_cards(MISSIONS_DIR / slug / 'tasks')
 
 # Load tasks
 state = parse_yaml(STATE_FILE.read_text())
@@ -223,9 +211,9 @@ task_statuses = {m['id']: m.get('status') for m, _ in tasks}
 unblocked_pending = []
 for meta, _ in tasks:
     if meta.get('status') != 'pending': continue
-    bb = meta.get('blocked_by') or []
-    if any(dep not in done_ids and task_statuses.get(dep) not in ('failed', 'cancelled')
-           for dep in bb):
+    # card を丸ごと渡す (dispatcher / plan.sh と同じ入口)。blocked_by だけを渡すと
+    # released_deps (Director の解除) を見落とし、本物の規則を直しても緑のままになる。
+    if card_dependencies(meta, done_ids, task_statuses).unmet:
         continue
     task_skills = set(meta.get('skills') or [])
     if not task_skills: continue
@@ -249,10 +237,16 @@ PYEOF
 # ---------------------------------------------------------------------------
 echo ""
 echo "-- Test 1: NOTIFY_CACHE は PID 非依存パス --"
-if grep -q 'NOTIFY_CACHE="/tmp/dispatcher-notify-cache\.json"' "$DISPATCHER_SH"; then
-  pass "NOTIFY_CACHE に PID (\$\$) が含まれない"
+# t002: CREWVIA_NOTIFY_CACHE による上書きを足したので、行の完全一致では
+# なく「既定値に PID が入らないこと」で判定する。元の欠陥は
+# /tmp/dispatcher-notify-cache-$$.json で dedup が再起動ごとにリセットされ、
+# 同じ通知が何度も飛んでいたこと。上書きは隔離 QA 用 (本番の共有キャッシュを
+# 読むと「抑止された通知」が「発火しなかった」に見えて偽 PASS になる)。
+notify_cache_line=$(grep -E '^NOTIFY_CACHE=' "$DISPATCHER_SH" | head -1)
+if [[ "$notify_cache_line" == *'dispatcher-notify-cache.json'* && "$notify_cache_line" != *'$$'* ]]; then
+  pass "NOTIFY_CACHE の既定値に PID (\$\$) が含まれない"
 else
-  fail "NOTIFY_CACHE がまだ PID 固有パス (\$\$.json) のまま"
+  fail "NOTIFY_CACHE がまだ PID 固有パス (\$\$.json) のまま: ${notify_cache_line}"
 fi
 
 # ---------------------------------------------------------------------------

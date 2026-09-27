@@ -4,14 +4,21 @@ scripts/watchdog.py — Crewvia Worker Watchdog v2
 
 Monitors active Workers via three signal layers:
   - Tool layer   : registry/activity/<agent>/<task_id>.activity
-  - Thought layer: registry/notifications/<agent>/ (Notification hook, M1)
-  - Process layer: tmux pane_pid → pgrep -P child processes
+  - Thought layer: registry/heartbeats/<agent>, registry/notifications/<agent>/
+  - Process layer: mux pane_pid → /proc プロセス木の分類
 
 Multi-level judgment per WorkerMonitor:
   alive     → no action
   warn      → POST /api/log type=alert (soft idle threshold)
   terminate → graceful shutdown (hard idle threshold or absolute max)
   kill      → cleanup only (tmux session already gone)
+
+判定材料の組み合わせ方 (t016):
+  idle 秒数 (Tool + Thought 層の最新 mtime) が唯一の「働いていない」の根拠で、
+  **常に評価される**。プロセス層は terminate を *抑制する方向にだけ* 効く。
+  子プロセスの存在は「生存」の証拠にはならない — claude 本体も MCP サーバーも
+  ハング中・入力待ち・承認待ちのあいだ生き続けるからである。詳細は
+  knowledge/daemon-authority.md と classify_process_tree() の docstring 参照。
 
 Usage:
   python3 scripts/watchdog.py [--interval <s>] [--repo-root <path>]
@@ -24,21 +31,80 @@ import json
 import os
 import re
 import signal
-import subprocess
 import sys
 import time
 import urllib.request
 import urllib.error
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal, Optional
+from typing import Literal, NamedTuple, Optional
 
 # Import lib_mux — assumes watchdog.py lives in scripts/ alongside lib_mux.py
 _SCRIPTS_DIR = Path(__file__).parent
 sys.path.insert(0, str(_SCRIPTS_DIR))
 from lib_mux import Mux, repo_identity_ok  # noqa: E402
+import lib_retirement  # noqa: E402
+import lib_daemon_watch  # noqa: E402
+# 「伝えた」台帳 (dispatcher と共有) の読み書き。timeout 終了の通知を 1 回だけにする (t021)。
+from lib_daemon_state import (  # noqa: E402
+    load_json_store, told_ledger_problem, told_matches, told_record,
+)
+# task カードの読み取りは crewvia の中で 1 箇所しかない (Codex 5 巡目 P2)。
+# ここに frontmatter を直接読むコードを書き戻さないこと — plan.sh が `[破損]`
+# として保留するカードを、この監視だけが別の task の id で数える状態に戻る。
+from lib_task_cards import (  # noqa: E402
+    NotARegularFile, is_unreadable, list_task_cards, read_regular_text,
+    read_regular_text_or_unreadable,
+)
 _mux = Mux()
 
-__version__ = "2.0.0"
+__version__ = "2.1.0"
+
+#: t005: this daemon's half of the mutual watch, built in run().  Module-level
+#: because `graceful_terminate()` — which blocks the main loop for up to 70s —
+#: has to keep the heartbeat going from deep inside its wait loops, and it is
+#: reached from places that have no watcher to pass down.
+_DAEMON_WATCH = None
+
+
+def _beat() -> None:
+    """Say "still alive", from anywhere, without ever raising.
+
+    Called from the main loop *and* from inside the blocking waits in
+    `graceful_terminate()`.  Those waits are the dangerous stretch: 60s of
+    grace plus 10s before SIGKILL is long enough to cross any sane staleness
+    threshold, so a watchdog that only beat once per cycle would be declared
+    dead every time it terminated a Worker — and respawned on top of itself,
+    with two watchdogs then racing the same retirement.
+    """
+    if _DAEMON_WATCH is None:
+        return
+    try:
+        _DAEMON_WATCH.beat()
+    except Exception as exc:
+        _log(f"[daemon-watch] heartbeat failed: {exc!r}")
+
+# t002: which daemon is allowed to end a Worker process.
+#
+#   watchdog   (default) — dispatcher writes a retirement marker, watchdog
+#                          executes it and completes the queue-side cleanup.
+#   dispatcher (rollback) — the pre-t002 split: dispatcher kills idle Workers
+#                          itself, watchdog blocks inside graceful_terminate().
+#
+# One variable flips BOTH daemons because a partial rollback reproduces
+# exactly the failure the atomic migration exists to avoid: revert only
+# dispatcher and nobody closes a window (§5-1 居座り); revert only watchdog and
+# both of them kill independently, which on a name-reusing system lands on the
+# wrong Worker (§5-2). See knowledge/daemon-authority.md §5-3.
+KILL_AUTHORITY_WATCHDOG = "watchdog"
+KILL_AUTHORITY_DISPATCHER = "dispatcher"
+
+
+def kill_authority() -> str:
+    """Read per call, not at import: a daemon restart is the intended way to
+    apply this, and reading live keeps tests from needing to reload the module."""
+    value = (os.environ.get("CREWVIA_KILL_AUTHORITY") or "").strip().lower()
+    return KILL_AUTHORITY_DISPATCHER if value == KILL_AUTHORITY_DISPATCHER else KILL_AUTHORITY_WATCHDOG
 
 # ---------------------------------------------------------------------------
 # Worker profiles — defaults when task frontmatter has no timeout field
@@ -53,8 +119,26 @@ DEFAULT_PROFILE = "feature_impl"
 
 TERMINATE_GRACE_PERIOD = 60   # seconds to wait after sending graceful shutdown message
 KILL_DELAY = 10               # seconds after SIGTERM before SIGKILL
+
+#: What a Worker is told before a timeout terminate.  Carried in the retirement
+#: marker so the executor sends it exactly once, rather than each daemon
+#: sending its own copy (dispatcher's "タスクなし、shutdown" is the other one).
+TERMINATE_MESSAGE = "タイムアウトのため中断します。現在の状況を 1-2 行で記載して終了してください。"
 DEFAULT_CHECK_INTERVAL = 30   # main loop interval in seconds
 MASS_KILL_ALERT_BACKOFF_SECONDS = 300  # t020: min gap between mass-kill Taskvia alerts
+
+# t016: プロセス層の分類しきい値。ペインのセッション (claude) 起動からこれ以上
+# 遅れて始まった子孫が居れば「Bash tool が実行中」とみなす。
+#
+# 下限の根拠: MCP サーバーは claude 起動の 1-2 秒後に立ち上がる (本番実測
+# 2026-09-21: claude et=119s に対し MCP 2 本が et=117s)。これを「実行中」と
+# 誤読すると idle 判定が永久に抑止され、今回直した欠陥がそのまま再発する。
+# 60 秒は実測値の 30 倍で、MCP の起動が多少遅れても誤読しない余裕がある。
+# 上限側は緩くて構わない — 誤読の向きが「殺さない」だからである。
+PROCESS_WORK_START_GRACE = 60
+
+# 同じ判定が続く間、何 cycle ごとに要約を 1 行残すか (30s * 10 = 5 分)。
+VERDICT_SUMMARY_EVERY = 10
 
 
 # ---------------------------------------------------------------------------
@@ -118,20 +202,154 @@ def parse_yaml(text: str) -> dict:
     return result
 
 
-def parse_frontmatter(text: str) -> tuple[dict, str]:
-    lines = text.splitlines()
-    if not lines or lines[0].strip() != "---":
-        return {}, text
-    end = -1
-    for idx in range(1, len(lines)):
-        if lines[idx].strip() == "---":
-            end = idx
-            break
-    if end < 0:
-        return {}, text
-    meta = parse_yaml("\n".join(lines[1:end]))
-    body = "\n".join(lines[end + 1:])
-    return meta, body
+def parse_iso_epoch(value) -> Optional[float]:
+    """Epoch seconds for a frontmatter timestamp, or None if it is not one.
+
+    plan.sh writes `started_at` with fractional seconds since t021
+    (`2026-09-23T07:05:49.455991Z`) and `completed_at` without
+    (`2026-09-23T07:52:17Z`), so both have to parse.  Anything else — absent,
+    null, empty, a leftover `"null"` string, a half-written value — is None,
+    and the caller decides what to do without one.
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text or text.lower() in ("null", "none", "~"):
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        # Everything crewvia writes carries `Z`.  A naive value would otherwise
+        # be read as local time, which on this repo's machines is 9 hours off —
+        # a floor 9 hours in the future, i.e. idle that never grows.
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp()
+
+
+# ---------------------------------------------------------------------------
+# Process layer (t016)
+# ---------------------------------------------------------------------------
+
+ProcessSignal = Literal[
+    "no_window",     # mux 窓が無い
+    "not_probed",    # プロセス層を見るまでもなく判定が決まった (絶対上限など)
+    "unknown",       # 窓はあるが pane pid が引けない → terminate を抑制する
+    "no_process",    # 子プロセスが 1 つも無い
+    "idle_process",  # claude と MCP サーバーだけ = 木が有るだけ
+    "executing",     # セッション起動より十分後に始まった子孫が居る = tool 実行中
+]
+
+
+def _proc_stat(pid: int) -> Optional[tuple[int, int]]:
+    """/proc/<pid>/stat から (ppid, starttime_ticks) を返す。読めなければ None。
+
+    comm (field 2) は括弧で囲まれ、空白や ')' を含みうるので最後の ')' で
+    切ってから split する (例: "1234 (sh -c (x)) S 1 ..." )。
+    切った残りの先頭が field 3 なので、field N は rest[N - 3] になる:
+      ppid = field 4 = rest[1] / starttime = field 22 = rest[19]
+    """
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text()
+    except (OSError, ValueError):
+        return None
+    close = raw.rfind(")")
+    if close < 0:
+        return None
+    rest = raw[close + 1:].split()
+    if len(rest) < 20:
+        return None
+    try:
+        return int(rest[1]), int(rest[19])
+    except ValueError:
+        return None
+
+
+def classify_process_tree(
+    root_pid: int, grace_seconds: int = PROCESS_WORK_START_GRACE
+) -> ProcessSignal:
+    """mux ペインのプロセス木を 3 値に分類する。
+
+    本番のペインは常にこの形をしている (2026-09-21 実測, Ren-worker):
+
+        /bin/bash                      ← root_pid (pane_pid)
+          claude --model ...           ← セッション。Worker が生きている限り常駐
+            npm exec @playwright/mcp   ← MCP サーバー。claude の 1-2 秒後に起動
+            npm exec chrome-devtools   ← 同上
+            /bin/bash -c source ...    ← Bash tool の実行中だけ現れる
+
+    旧実装の `pgrep -P <pane_pid>` は常に claude 1 件を返すため「子プロセスが
+    居る = 作業中」が恒真になり、idle 判定に一度も到達しなかった。ここでは
+    **いつ生えたか** で区別する:
+
+      "executing"    … セッション起動から grace_seconds より後に始まった子孫が
+                       居る = Bash tool が今まさに走っている。長時間のビルド /
+                       学習 / CI 待ちで activity が stale になる正当なケース
+      "idle_process" … claude と MCP サーバーだけ。木が有ること自体は
+                       「働いている」の証拠にならない
+      "no_process"   … 子が 1 つも無い (claude が落ちた / 素のシェル)
+
+    基準時刻は **最も古い直下の子 (= claude) の起動時刻** にする。root 自身では
+    なく子を基準にするのは、ペインの bash が Worker より先に (crewvia 起動時に)
+    生まれていることがあり、それを基準にすると claude の起動自体が "executing"
+    に見えてしまうからである。深さは問わないので、ペイン直下に後から生えた
+    プロセスも拾える。
+
+    起動時刻は /proc の starttime (boot からの tick) 同士で比較する。壁時計に
+    依存しないので、NTP 補正やサスペンドの影響を受けない。
+    """
+    if _proc_stat(root_pid) is None:
+        return "no_process"
+
+    procs: dict[int, tuple[int, int]] = {}
+    try:
+        proc_entries = list(Path("/proc").iterdir())
+    except OSError:
+        return "unknown"
+    for entry in proc_entries:
+        if not entry.name.isdigit():
+            continue
+        st = _proc_stat(int(entry.name))
+        if st is not None:
+            procs[int(entry.name)] = st
+
+    children: dict[int, list[int]] = {}
+    for pid, (ppid, _) in procs.items():
+        children.setdefault(ppid, []).append(pid)
+
+    direct = children.get(root_pid, [])
+    if not direct:
+        return "no_process"
+
+    ticks_per_sec = os.sysconf("SC_CLK_TCK") or 100
+    threshold_ticks = grace_seconds * ticks_per_sec
+    session_start = min(procs[pid][1] for pid in direct)
+
+    # root 配下を幅優先で走査 (root 自身は含めない)
+    stack = list(direct)
+    seen: set[int] = set()
+    while stack:
+        pid = stack.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        if procs[pid][1] - session_start > threshold_ticks:
+            return "executing"
+        stack.extend(children.get(pid, []))
+
+    return "idle_process"
+
+
+class CheckResult(NamedTuple):
+    """check() の判定と、その根拠。ログ・観測ログはこれをそのまま書く。"""
+    verdict: Literal["alive", "warn", "terminate", "kill"]
+    reason: str
+    idle_seconds: float
+    process_signal: ProcessSignal
+    awaiting_human: bool
 
 
 # ---------------------------------------------------------------------------
@@ -154,38 +372,285 @@ class WorkerMonitor:
         self.started_at: float = time.time()
         self.repo_root = repo_root
 
+        # t044: when *this* monitoring target began.  Signals older than this
+        # are not its silence — see `_signal_floor` and `_last_activity_mtime`.
+        #
+        # The earlier of "the Worker pulled the task" and "this monitor object
+        # was made", because each alone is wrong in one direction:
+        #
+        #   only the pull time  — a value from the future (clock skew, a
+        #     half-written card) would put the floor ahead of now, and idle
+        #     would never grow: a hung Worker becomes immortal.
+        #   only the object     — the object is remade every time the watchdog
+        #     restarts, so a Worker that hung three hours ago gets a fresh
+        #     idle clock on each restart and outlives every one of them.
+        #
+        # `min()` takes the pull time when it is sane and the object's own
+        # birth when it is not, which is also the answer when the card carries
+        # no usable timestamp at all.
+        pulled_at = parse_iso_epoch(task_card.get("started_at"))
+        self.monitoring_since: float = (
+            min(pulled_at, self.started_at) if pulled_at is not None
+            else self.started_at
+        )
+
+        #: 通知ディレクトリを読めているか。**状態が変わったときだけ** 1 行出す
+        #: ための記憶で、判定そのものには使わない。`_notification_files()` は
+        #: 1 回の check で 2 回呼ばれ、check は 30 秒ごとに来るので、呼ばれる
+        #: たびに書くと 1 人の Worker で毎分 4 行になる。読めない状態が続いて
+        #: いる間も verdict 行は `VerdictLogger` が出し続けるので、見えなくは
+        #: ならない。
+        self._notifications_observable: bool = True
+
+        #: 同じことを activity / heartbeat の `stat` についても覚えておく
+        #: (`_note_signal_observable`)。通知とは別の記憶にしてあるのは、
+        #: 片方が読めなくなったときに、もう片方の「読めるようになった」が
+        #: 状態変化を食い潰して行が出なくなるのを避けるため。
+        self._signals_observable: bool = True
+
     # ------------------------------------------------------------------
     # Signal detection helpers
     # ------------------------------------------------------------------
 
-    def _last_activity_mtime(self) -> float:
-        """Return mtime of most recent activity signal across all layers."""
-        candidates: list[float] = []
+    def _signal_floor(self) -> float:
+        """The oldest moment a signal can speak for this monitoring target.
 
-        # Tool layer: activity file
-        activity_file = (
+        Two of the three signal layers are **agent-scoped**:
+        `registry/heartbeats/<agent>` and `registry/notifications/<agent>/`
+        are keyed by Worker name, not by task, and crewvia reuses Worker names
+        by design (same skill → same name, inherited across tasks).  So both
+        outlive the task that wrote them, and a Worker starting a new task
+        finds its predecessor's files already sitting there.
+
+        Before t044 those files were read as if they were about the current
+        task.  A Worker that had just pulled — no `<task_id>.activity` yet —
+        was judged by a heartbeat written eighteen hours earlier under a
+        different task, and terminated at `elapsed=0s`.  `started_at` was
+        consulted only when there was no file at all, which is precisely the
+        case that did not happen.
+
+        Silence from before this target began is somebody else's silence.
+        That one sentence governs all three readers below, so it is computed
+        once here rather than restated in each — two readers with slightly
+        different notions of "mine" is how this repo has produced the same
+        defect twice already.
+        """
+        return self.monitoring_since
+
+    def _mtimes_since_floor(self, paths) -> tuple[list[float], bool]:
+        """floor 以降の mtime と、**観測に失敗したものがあったか**。
+
+        戻り値が 2 つあるのは、`stat` の失敗に 2 つの意味があるからである。
+
+        * `ENOENT` —— **本当に無い**。pull 直後の Worker に `<task>.activity` が
+          無いのは通常の状態で、そこを沈黙として数えられなくなると、ハングした
+          Worker が永久に検知されない。これまで通り候補から落とす。
+        * それ以外 (`EACCES` / `EIO` / `ENOTDIR` …) —— **観測できなかった**。
+          「シグナルが無い」ではない。
+
+        両方を `continue` に潰していたのが Codex 8 巡目 P1 で、潰した先が問題
+        だった: 候補が 1 つも残らないと `_last_activity_mtime()` は floor —— この
+        監視対象が始まった時刻 —— をそのまま返す。数時間前に pull された健全な
+        Worker が `idle = 数時間` と判定され、`hard_idle` で **terminate される**。
+        `registry/heartbeats/` は全 Worker 共通なので、1 回の権限事故で全員が
+        同時に対象になる。
+
+        t016 で `_notification_files()` に入れたのとまったく同じ型が、別の関数に
+        残っていたもの (memory: evidence-for-destructive-decisions)。区別する側を
+        `ENOENT` **だけ** の allowlist にしてあるのは、denylist が次の errno で
+        必ず穴を開けるため (memory: approve-judgment-needs-allowlist-and-scope)。
+
+        呼び出し側は 2 つ目の戻り値を **必ず** 見ること。倒す向きは判定ごとに
+        違うので、ここでは決めない (memory: fail-direction-is-per-judgment)。
+        """
+        floor = self._signal_floor()
+        found: list[float] = []
+        unobservable = False
+        for p in paths:
+            try:
+                mtime = p.stat().st_mtime
+            except FileNotFoundError:
+                continue                    # 本当に無い
+            except OSError as e:
+                unobservable = True         # 読めなかった — 「無い」ではない
+                self._note_signal_observable(
+                    False, f"{self.agent_name}: cannot stat {p}: {e} — "
+                           f"treating this as unobservable, not as silence "
+                           f"(terminate is suppressed until it can be read)")
+                continue
+            if mtime >= floor:
+                found.append(mtime)
+        if not unobservable:
+            self._note_signal_observable(True)
+        return found, unobservable
+
+    def _note_signal_observable(self, observable: bool, msg: str = "") -> None:
+        """activity / heartbeat を stat できるかが **変わったときだけ** 1 行出す。
+
+        `_note_notifications_observable()` と同じ理由で状態を覚えている ——
+        判定は 30 秒ごと、1 回の check で複数回ここを通るので、毎回書くと
+        Worker 1 人で毎分数行になる。
+        """
+        if observable == self._signals_observable:
+            return
+        self._signals_observable = observable
+        try:
+            _log(msg if msg else
+                 f"{self.agent_name}: signal files readable again")
+        except Exception:
+            pass
+
+    def _activity_file(self) -> Path:
+        return (
             self.repo_root / "registry" / "activity" / self.agent_name
             / f"{self.task_id}.activity"
         )
-        if activity_file.exists():
-            candidates.append(activity_file.stat().st_mtime)
 
-        # Thought layer: heartbeat file
-        hb_file = self.repo_root / "registry" / "heartbeats" / self.agent_name
-        if hb_file.exists():
-            candidates.append(hb_file.stat().st_mtime)
+    def _heartbeat_file(self) -> Path:
+        return self.repo_root / "registry" / "heartbeats" / self.agent_name
 
-        # Thought layer: notification files (most recent)
+    def _notification_files(self) -> Optional[list[Path]]:
+        """通知ファイルの一覧。**観測できなかったときは空ではない。**
+
+        `FileNotFoundError` だけが「通知は 1 通も無い」である。通知ディレクトリ
+        が無いのはほとんどの Worker の通常状態なので、そこは空で返さなければ
+        ならない。
+
+        それ以外の `OSError` (権限・I/O) は *観測の失敗* であって、「シグナルが
+        無い」ではない。両方を `[]` に潰すと、読めなかったことが
+
+          * `_last_activity_mtime()` の候補減 → idle が伸びる → terminate
+          * `_awaiting_human()` の「通知なし」 → 抑制が外れる  → terminate
+
+        の 2 経路でそのまま **破壊の側** に落ちる。だから `None` で「観測でき
+        なかった」を返し、読み手それぞれが自分の判定の安全な向きへ倒す
+        (memory: fail-direction-is-per-judgment)。
+        """
         notif_dir = self.repo_root / "registry" / "notifications" / self.agent_name
-        if notif_dir.exists():
-            for f in notif_dir.iterdir():
-                if f.is_file():
-                    try:
-                        candidates.append(f.stat().st_mtime)
-                    except OSError:
-                        pass
+        try:
+            files = [f for f in notif_dir.iterdir() if f.is_file()]
+        except FileNotFoundError:
+            self._note_notifications_observable(True)
+            return []
+        except OSError as e:
+            self._note_notifications_observable(
+                False, f"{self.agent_name}: cannot list {notif_dir}: {e} — "
+                       f"treating this as unobservable, not as silence "
+                       f"(terminate is suppressed until it can be read)")
+            return None
+        self._note_notifications_observable(True)
+        return files
 
-        return max(candidates) if candidates else self.started_at
+    def _note_notifications_observable(self, observable: bool, msg: str = "") -> None:
+        """観測できるかどうかが **変わったときだけ** 1 行残す。
+
+        警告が出せなくても判定は続ける。出せないことを理由に「観測できた」に
+        倒すと、いちばん忙しい日にだけ揃う組み合わせで穴が開く
+        (`lib_task_cards._safe_warn` と同じ理由)。
+        """
+        if observable == self._notifications_observable:
+            return
+        self._notifications_observable = observable
+        try:
+            _log(msg if msg else
+                 f"{self.agent_name}: notifications readable again")
+        except Exception:
+            pass
+
+    def _last_activity_mtime(self) -> float:
+        """Most recent signal across all layers, never earlier than the floor.
+
+        The floor is in the `max()` rather than being a fallback for "no files
+        at all": a stale file is not evidence of silence, it is evidence about
+        a different task (see `_signal_floor`).
+
+        通知の一覧を取れなかったときは `now` を返す。**沈黙を主張しない**のが
+        この判定の安全な向きで、見えていない通知が 1 通でもあれば idle は 0 に
+        なりうる以上、読めなかったときに「無かった」に倒すのは観測していない
+        ことを根拠に終了させることになる。倒した先の害は「terminate が 1
+        サイクル遅れる」だけで、次のサイクルで読めれば普通に判定される。
+        """
+        notifications = self._notification_files()
+        if notifications is None:
+            return time.time()
+        candidates, unobservable = self._mtimes_since_floor(
+            [self._activity_file(), self._heartbeat_file()] + notifications
+        )
+        if unobservable:
+            # 列挙できても stat できなければ、やはり沈黙は主張できない。
+            # 倒した先の害は「terminate が 1 サイクル遅れる」だけである。
+            return time.time()
+        return max(candidates + [self._signal_floor()])
+
+    def _non_notification_mtime(self) -> Optional[float]:
+        """notification を除いた「実活動」の最新 mtime。
+
+        _last_activity_mtime() は notification 自体を候補に含むため、通知の
+        解除判定 (_awaiting_human) には使えない — 通知が来ただけで「解除済み」に
+        見えてしまう。そのための別計算。
+
+        t044: こちらも floor より古いシグナルは落とす。None ("実活動が無い") は
+        残す — `_awaiting_human()` は「通知より後に実活動があったか」を訊いて
+        いるので、floor に丸めると通知を常に解除済みに見せてしまう。
+        """
+        candidates, unobservable = self._mtimes_since_floor(
+            [self._activity_file(), self._heartbeat_file()])
+        if unobservable and not candidates:
+            # 「実活動は無かった」と言い切れない。None は `_awaiting_human()` を
+            # True にする側 = terminate を抑制する側なので、ここでの安全な向き。
+            # 片方でも読めていればその値は本物なので、そちらを答えにする
+            # (読めた分だけで「通知より後に動いた」と言えるなら、それは事実)。
+            return None
+        return max(candidates) if candidates else None
+
+    def _newest_notification(self) -> tuple[Optional[float], Optional[str]]:
+        """直近の notification の (mtime, notification_type)。無ければ (None, None)。
+
+        t044: floor より古い通知は無かったものとして扱う。通知は 1 回しか鳴らず
+        その後は解除されないまま残るので、前の task で鳴った通知をそのまま読むと
+        `_awaiting_human()` が永久に True になり、**今の task でハングした
+        Worker が terminate されなくなる** — idle 側と逆向きの、同じ原因の欠陥。
+        """
+        floor = self._signal_floor()
+        newest_file = None
+        newest_mtime = -1.0
+        notifications = self._notification_files()
+        if notifications is None:
+            # 観測できなかった。`_awaiting_human()` はこの戻り値が None なら
+            # 「待ちではない」= terminate を抑制しない、に倒れる。それは
+            # 読めなかったことを終了の根拠にすることなので、代わりに
+            # 「いま通知が来ている」と読ませる —— 抑制する側が安全な向き。
+            # `_last_activity_mtime()` も同じサイクルで now を返すので、
+            # 判定は 2 層とも「このサイクルでは結論を出さない」で揃う。
+            return time.time(), "(unobservable)"
+        for f in notifications:
+            try:
+                m = f.stat().st_mtime
+            except FileNotFoundError:
+                # 列挙と stat の間に消えた。通知は読まれたあと消されるので、
+                # これは競合ではなく通常の並び —— 本当に無い。
+                continue
+            except OSError:
+                # 列挙はできたのに stat できない (列挙後に権限が変わった等)。
+                # 「通知は無い」に潰すと抑制が外れて terminate 側に落ちるので、
+                # 一覧そのものを取れなかったときと同じ答えに揃える。
+                return time.time(), "(unobservable)"
+            if m < floor:
+                continue
+            if m > newest_mtime:
+                newest_mtime = m
+                newest_file = f
+        if newest_file is None:
+            return None, None
+        payload_text = read_regular_text_or_unreadable(newest_file)
+        if is_unreadable(payload_text):
+            notif_type = "(unreadable)"
+        else:
+            try:
+                notif_type = json.loads(payload_text).get("notification_type")
+            except Exception:
+                notif_type = "(unparseable)"
+        return newest_mtime, notif_type
 
     def _observation_snapshot(self) -> dict:
         """★task_162 案C(観測専用). check() の判定には一切使わない — 呼び出し元は
@@ -197,48 +662,8 @@ class WorkerMonitor:
         記録する。「無音」と「人間待ちで無音」を区別するための情報(Picard指示)。
         """
         now = time.time()
-
-        activity_file = (
-            self.repo_root / "registry" / "activity" / self.agent_name
-            / f"{self.task_id}.activity"
-        )
-        activity_mtime = activity_file.stat().st_mtime if activity_file.exists() else None
-
-        hb_file = self.repo_root / "registry" / "heartbeats" / self.agent_name
-        heartbeat_mtime = hb_file.stat().st_mtime if hb_file.exists() else None
-
-        # notification を除いた「実活動」の最新mtime(通知の解除判定に使う。
-        # _last_activity_mtime() は notification 自体を候補に含めるため、
-        # ここでは意図的に別計算にしている — 通知が来ただけで「解除済み」と
-        # 誤認しないようにするため)
-        non_notification_candidates = [
-            m for m in (activity_mtime, heartbeat_mtime) if m is not None
-        ]
-        non_notification_mtime = max(non_notification_candidates) if non_notification_candidates else None
-
-        last_notif_type: Optional[str] = None
-        last_notif_mtime: Optional[float] = None
-        notif_dir = self.repo_root / "registry" / "notifications" / self.agent_name
-        if notif_dir.exists():
-            newest_file = None
-            newest_mtime = -1.0
-            for f in notif_dir.iterdir():
-                if not f.is_file():
-                    continue
-                try:
-                    m = f.stat().st_mtime
-                except OSError:
-                    continue
-                if m > newest_mtime:
-                    newest_mtime = m
-                    newest_file = f
-            if newest_file is not None:
-                last_notif_mtime = newest_mtime
-                try:
-                    payload = json.loads(newest_file.read_text())
-                    last_notif_type = payload.get("notification_type")
-                except Exception:
-                    last_notif_type = "(unparseable)"
+        non_notification_mtime = self._non_notification_mtime()
+        last_notif_mtime, last_notif_type = self._newest_notification()
 
         cleared_since_notification: Optional[bool] = None
         if last_notif_mtime is not None:
@@ -274,58 +699,103 @@ class WorkerMonitor:
     def _tmux_window_target(self) -> Optional[str]:
         return self._mux_window_name()
 
-    def _has_child_processes(self) -> bool:
-        """Return True if the mux pane has live child processes (Claude is active)."""
+    def _process_signal(self) -> ProcessSignal:
+        """プロセス層のシグナル。**生死の判定ではない** — classify_process_tree() 参照。"""
         name = self._mux_window_name()
         if not name:
-            return False
+            return "no_window"
         pane_pid = _mux.pid(name)
         if pane_pid is None:
+            # 窓はあるのに pane pid が引けない = mux backend の不調。実行中か
+            # ハング中かを見分ける材料が無いので "unknown" とし、terminate を
+            # 抑制する側に倒す (fail closed)。_is_mass_kill() と同じ向き。
+            return "unknown"
+        return classify_process_tree(pane_pid)
+
+    def _awaiting_human(self) -> bool:
+        """直近の Notification が未解除か = 人間の入力/承認待ちで無音か。
+
+        Notification hook は承認待ち・入力待ちで発火するが **1 回しか鳴らない**。
+        その後は activity も heartbeat も止まるため、無音の理由が「ハング」でも
+        「人間待ち」でも idle_seconds は同じように伸びる。両者を区別できるのは
+        「最後の通知より後に実活動があったか」だけである。
+
+        通知より後に activity / heartbeat が動いていれば解除済み = 待ちではない。
+        解除済みの古い通知が永久に terminate を抑止しないよう、比較は必ず
+        **通知を除いた** 実活動の mtime と行う (_last_activity_mtime() は通知
+        自体を候補に含むので、これに使うと常に「解除済み」に見えてしまう)。
+        """
+        notif_mtime, _ = self._newest_notification()
+        if notif_mtime is None:
             return False
-        try:
-            r = subprocess.run(["pgrep", "-P", str(pane_pid)], capture_output=True, timeout=5)
-            return r.returncode == 0
-        except Exception:
-            return False
+        real_mtime = self._non_notification_mtime()
+        return real_mtime is None or real_mtime <= notif_mtime
 
     # ------------------------------------------------------------------
     # Core check
     # ------------------------------------------------------------------
 
     def check(self) -> Literal["alive", "warn", "terminate", "kill"]:
+        """check_detail() の判定だけを返す薄いラッパー (既存呼び出し互換)。"""
+        return self.check_detail().verdict
+
+    def check_detail(self) -> CheckResult:
         """
         Evaluate Worker health across all signal layers.
 
-        Returns:
+        Returns (verdict, reason, idle_seconds, process_signal, awaiting_human):
           "alive"     — Worker is healthy, no action needed
           "warn"      — Soft idle threshold exceeded; send alert to Taskvia
           "terminate" — Hard idle threshold or absolute max exceeded; graceful shutdown
-          "kill"      — tmux session gone; cleanup only
+          "kill"      — mux window gone; cleanup only
+
+        t016: 旧実装はここで「子プロセスが居れば alive」と即返していたため、
+        以下の idle 判定に一度も到達しなかった。idle は常に評価し、プロセス層と
+        「人間待ち」は **terminate を warn に落とす方向にだけ** 効かせる。
+        判断が付かないケース (process_signal == "unknown") も殺さない側に倒す。
         """
         now = time.time()
-
-        # 1. 絶対上限チェック
-        if now - self.started_at > self.max_threshold:
-            return "terminate"
-
-        # 2. tmux session 生存チェック
-        target = self._tmux_window_target()
-        if target is None:
-            return "kill"
-
-        # 3. 子プロセス生存チェック (pgrep -P <pane_pid>)
-        if self._has_child_processes():
-            return "alive"
-
-        # 4. activity / heartbeat / notification の mtime チェック
         idle_seconds = now - self._last_activity_mtime()
 
-        if idle_seconds > self.idle_threshold * 2:
-            return "terminate"
-        if idle_seconds > self.idle_threshold:
-            return "warn"
+        # 1. 絶対上限チェック
+        #    idle とは独立した天井。プロセス層では抑制しない — 長時間 task は
+        #    task frontmatter の timeout.max で明示的に引き上げる運用のままにする
+        #    (knowledge/daemon-authority.md §4-3 で started_at の起点見直しは
+        #    backlog 送りと決まっている)。
+        if now - self.started_at > self.max_threshold:
+            return CheckResult("terminate", "max_exceeded", idle_seconds, "not_probed", False)
 
-        return "alive"
+        # 2. mux 窓の生存チェック
+        if self._tmux_window_target() is None:
+            return CheckResult("kill", "window_gone", idle_seconds, "no_window", False)
+
+        # 3. idle 判定 (常に評価する)
+        process_signal = self._process_signal()
+        awaiting_human = self._awaiting_human()
+
+        if idle_seconds > self.idle_threshold * 2:
+            # プロセス層が terminate を抑制するケース。理由をログで区別できるよう
+            # 別々の reason にする ("実行中だから見送った" と "見えないから見送った"
+            # は運用上まったく別の話なので、まとめると原因調査ができない)。
+            suppressed_by_process = {
+                "executing": "hard_idle_but_executing",
+                "unknown": "hard_idle_but_process_unknown",
+            }.get(process_signal)
+            if suppressed_by_process:
+                return CheckResult(
+                    "warn", suppressed_by_process, idle_seconds, process_signal, awaiting_human,
+                )
+            if awaiting_human:
+                return CheckResult(
+                    "warn", "hard_idle_but_awaiting_human",
+                    idle_seconds, process_signal, awaiting_human,
+                )
+            return CheckResult("terminate", "hard_idle", idle_seconds, process_signal, awaiting_human)
+
+        if idle_seconds > self.idle_threshold:
+            return CheckResult("warn", "soft_idle", idle_seconds, process_signal, awaiting_human)
+
+        return CheckResult("alive", "active", idle_seconds, process_signal, awaiting_human)
 
 
 # ---------------------------------------------------------------------------
@@ -423,8 +893,7 @@ def graceful_terminate(monitor: WorkerMonitor) -> None:
         _log(f"[kill] {monitor.agent_name}/{monitor.task_id}: window already gone")
         return
 
-    msg = "タイムアウトのため中断します。現在の状況を 1-2 行で記載して終了してください。"
-    ok = _mux.send(name, msg)
+    ok = _mux.send(name, TERMINATE_MESSAGE)
     if ok:
         _log(f"[terminate] {monitor.agent_name}/{monitor.task_id}: sent shutdown message, "
              f"waiting {TERMINATE_GRACE_PERIOD}s for graceful exit")
@@ -434,6 +903,7 @@ def graceful_terminate(monitor: WorkerMonitor) -> None:
     # Wait grace period, checking if Worker exits on its own
     for _ in range(TERMINATE_GRACE_PERIOD):
         time.sleep(1)
+        _beat()  # t005: the main loop is blocked here — keep proving we live
         if monitor._mux_window_name() is None:
             _log(f"[terminate] {monitor.agent_name}/{monitor.task_id}: Worker exited gracefully")
             return
@@ -456,7 +926,9 @@ def graceful_terminate(monitor: WorkerMonitor) -> None:
             os.kill(pane_pid, signal.SIGTERM)
         except ProcessLookupError:
             return
-        time.sleep(KILL_DELAY)
+        for _ in range(KILL_DELAY):
+            time.sleep(1)
+            _beat()  # t005: same reason as the grace loop above
         # Re-verify once more immediately before SIGKILL — same rationale,
         # smaller window (KILL_DELAY=10s).
         if not repo_identity_ok(monitor.repo_root):
@@ -472,6 +944,133 @@ def graceful_terminate(monitor: WorkerMonitor) -> None:
             pass
     else:
         _log(f"[terminate] WARNING: could not get pane pid for {name!r}")
+
+
+# ---------------------------------------------------------------------------
+# Retirement execution (t002)
+# ---------------------------------------------------------------------------
+
+def _director_name() -> str:
+    """Live Director window, falling back to the conventional name.
+
+    Same resolution dispatcher uses.  Worth keeping identical: the fallback is
+    what makes the after-the-fact report land during the window right after a
+    Director restart, when the tab list has not settled yet.
+    """
+    names = _mux.list(suffix="-director")
+    return names[0] if names else "Sora-director"
+
+
+def _notify_director(message: str) -> bool:
+    return bool(_mux.send(_director_name(), message))
+
+
+def make_notify_once(repo_root: Path, *, send=None, log=None, now=None):
+    """Director への通知を、台帳 (`registry/daemons/notified-state.json`) で 1 回だけにする。
+
+    戻り値の `notify_once(key, fp, kind, slug, task, message)` は「Director はこの通知を
+    持っている」= 今送れた、または台帳に既に記録がある、のとき True。送れなかったときは
+    **台帳に書かない** (戻ったらすぐ送る。呼び出し側が再送する)。台帳が使えないとき
+    (壊れている) は「伝えていない」= 再送側に倒す — dispatcher と同じ向き。
+
+    台帳は dispatcher と共有する (書き手は 2 人)。書き込みは `told_record()` が
+    `told_lock()` の下で行う。送れたのに台帳に書けなかったときは、送った事実を優先して
+    True を返す (再送すると Director に同じ通知が 2 通届く。書けなかったことは log に残す)。
+    """
+    told_path = Path(repo_root) / "registry" / "daemons" / "notified-state.json"
+    send = send or _notify_director
+    log = log or _log
+    clock = now or time.time
+
+    def notify_once(key, fp, kind, slug, task, message) -> bool:
+        told = load_json_store(told_path, check=told_ledger_problem)
+        if told_matches(told, key, fp):
+            return True
+        if not send(message):
+            return False
+        entry = {"fp": fp, "kind": kind, "slug": slug, "task": str(task), "at": clock()}
+        if not told_record(told_path, key, entry, warn=log):
+            log(f"[notify-once] sent {key} but could not record it in {told_path}")
+        return True
+
+    return notify_once
+
+
+def _watch_dispatcher() -> None:
+    """Is the dispatcher still alive?  (t005)
+
+    Caught wholesale on purpose: the mutual watch exists to make outages
+    louder, and one that can abort the monitoring cycle would instead make
+    them worse.
+    """
+    if _DAEMON_WATCH is None:
+        return
+    try:
+        verdict = _DAEMON_WATCH.watch_peer()
+    except Exception as exc:
+        _log(f"[daemon-watch] cycle failed: {exc!r}")
+        return
+    if verdict.action not in (lib_daemon_watch.ACTION_HEALTHY,
+                              lib_daemon_watch.ACTION_GRACE,
+                              lib_daemon_watch.ACTION_DISABLED):
+        _log(f"[daemon-watch] dispatcher: {verdict.action} — {verdict.reason}")
+
+
+def timeout_detail(monitor: "WorkerMonitor", detail: "CheckResult", elapsed: float) -> dict:
+    """Which limit ended this Worker, for the Director's after-the-fact notice (t021).
+
+    `max_exceeded` is the absolute ceiling (`elapsed` > `max_threshold`); `hard_idle`
+    is `idle_seconds` > 2 × `idle_threshold` (see `check_detail()`).  Carried in the
+    retirement request, because the notice is written by a later cycle.
+    """
+    if detail.reason == "max_exceeded":
+        return {"kind": "max", "observed_seconds": round(elapsed),
+                "limit_seconds": monitor.max_threshold}
+    return {"kind": "idle", "observed_seconds": round(detail.idle_seconds),
+            "limit_seconds": monitor.idle_threshold * 2}
+
+
+def should_monitor(task_card: dict, retirement, authority: str) -> bool:
+    """False for a Worker whose retirement is already in flight.
+
+    Its task stays in_progress until the retirement finishes the queue-side
+    cleanup, so without this the monitor is rebuilt every cycle with
+    `started_at = now`, immediately re-decides "terminate", and re-announces
+    it — one termination produced a dozen identical Taskvia alerts (measured
+    in the e2e harness) and a log that read as if watchdog kept changing its
+    mind.  The marker is already the durable record of that decision.
+    """
+    if authority != KILL_AUTHORITY_WATCHDOG:
+        return True
+    worker = task_card.get("worker")
+    if not worker:
+        return True
+    return not retirement.has_marker(str(worker))
+
+
+def make_retirement_executor(repo_root: Path, *, queue_dir: Optional[Path] = None,
+                             mux=None, notify=None, log=None, notify_once=None):
+    """Build the phase machine that ends Workers and repairs the queue.
+
+    Split out from run() so the machine can be driven a cycle at a time in
+    tests without a daemon, a mux backend or a live Worker.
+    """
+    repo_root = Path(repo_root)
+    backend = mux if mux is not None else _mux
+    return lib_retirement.RetirementExecutor(
+        registry_dir=repo_root / "registry",
+        repo_root=repo_root,
+        mux=backend,
+        repo_identity_check=lambda: repo_identity_ok(repo_root),
+        log=log or _log,
+        notify=notify if notify is not None else _notify_director,
+        notify_once=(notify_once if notify_once is not None
+                     else make_notify_once(repo_root, send=notify)),
+        plan_sh=repo_root / "scripts" / "plan.sh",
+        queue_dir=queue_dir or Path(os.environ.get("CREWVIA_QUEUE", str(repo_root / "queue"))),
+        grace_period=TERMINATE_GRACE_PERIOD,
+        kill_delay=KILL_DELAY,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -515,24 +1114,35 @@ def load_active_tasks(queue_dir: Path) -> list[tuple[str, str, dict]]:
     if not state_file.exists():
         return []
 
-    state = parse_yaml(state_file.read_text())
+    # 種類を確かめてから読む (Codex 8 巡目 P2)。上限の無い `read_text()` が
+    # 書き手のいない FIFO に当たると、**watchdog 全体が座り込む** —— どの
+    # Worker も監視されなくなる。読めなければ「監視対象なし」に倒す: 誰も
+    # 監視しない = 誰も kill しない、が、この判定の安全な向きである。
+    try:
+        state_text = read_regular_text(state_file)
+    except NotARegularFile as e:
+        _log(f"WARNING: {state_file} is not a regular file ({e}) — "
+             f"no Worker is monitored this cycle")
+        return []
+    except OSError as e:
+        _log(f"WARNING: failed to read {state_file}: {e} — "
+             f"no Worker is monitored this cycle")
+        return []
+
+    state = parse_yaml(state_text)
     active_missions = list(state.get("active_missions") or [])
 
+    # カードの読み取りは scripts/lib_task_cards.py に 1 つだけ。識別子はファイル名
+    # から来るので、`id` 行を直し忘れたコピーが *別の task* として監視されることが
+    # 構造上なくなる (以前は `meta.get("id", fn.stem)` で、食い違う id 欄のほうが
+    # ファイル名に勝っていた)。信用できないカードは `in_progress` ではない疑似
+    # ステータスで返るので、この監視の対象にも自動的に入らない。
     results: list[tuple[str, str, dict]] = []
     missions_dir = queue_dir / "missions"
     for slug in active_missions:
-        tasks_dir = missions_dir / slug / "tasks"
-        if not tasks_dir.exists():
-            continue
-        for fn in tasks_dir.iterdir():
-            if not re.fullmatch(r"t\d+\.md", fn.name):
-                continue
-            try:
-                meta, _ = parse_frontmatter(fn.read_text())
-            except Exception:
-                continue
+        for meta, _ in list_task_cards(missions_dir / slug / "tasks"):
             if meta.get("status") == "in_progress":
-                results.append((slug, str(meta.get("id", fn.stem)), meta))
+                results.append((slug, str(meta["id"]), meta))
 
     return results
 
@@ -541,23 +1151,134 @@ def load_active_tasks(queue_dir: Path) -> list[tuple[str, str, dict]]:
 # Logging
 # ---------------------------------------------------------------------------
 
+# _LOG_FILE は「固定ファイルへの明示的な上書き」。テストが monkeypatch で使う。
+# 本番は _LOG_DIR を設定し、日付ごとにローテートする (dispatcher.sh と同じ規約)。
 _LOG_FILE: Optional[Path] = None
+_LOG_DIR: Optional[Path] = None
 _OBSERVATION_LOG_FILE: Optional[Path] = None
+
+
+def _current_log_file() -> Optional[Path]:
+    """今このタイミングで書くべきログファイル。
+
+    _LOG_DIR 側は呼ばれるたびに日付を評価するので、常駐したまま日付を跨いでも
+    自動で次の日のファイルに切り替わる (旧実装は run() で 1 度だけパスを決めて
+    いたため、単一ファイルが無限に伸び続けていた)。
+    """
+    if _LOG_FILE is not None:
+        return _LOG_FILE
+    if _LOG_DIR is None:
+        return None
+    return _LOG_DIR / f"watchdog-{time.strftime('%Y%m%d')}.log"
 
 
 def _log(msg: str) -> None:
     ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     line = f"[watchdog {ts}] {msg}"
     print(line, file=sys.stderr)
-    if _LOG_FILE:
+    path = _current_log_file()
+    if path:
         try:
-            with _LOG_FILE.open("a") as f:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a") as f:
                 f.write(line + "\n")
         except OSError:
             pass
 
 
-def _log_observation(monitor: "WorkerMonitor", check_result: str) -> None:
+class VerdictLogger:
+    """判定結果を watchdog のログに残す (t016)。
+
+    旧実装は warn / terminate / kill のときしか _log() を呼ばなかった。
+    check() が「子プロセスが居れば alive」で即返していたため非 alive の判定が
+    一度も起きず、結果として **30 秒ごとの判定が 1 行も残らなかった**
+    (registry/watchdog.log は 2026-09-18 の起動行以降が空)。判定が記録されない
+    限り QA も本番運用も「watchdog が何をどう判断したか」を検証できない。
+
+    ただし全 Worker 分を毎 cycle 書くとログが肥大するので:
+      - 判定が **変わった** 瞬間は必ず 1 行
+      - 同じ判定が続く間は summary_every cycle ごとに 1 行 ("still ...")
+    とする。これで「静かな時間も watchdog は生きていて alive と判定し続けて
+    いた」ことが後から確認でき、かつ行数は有界に保たれる。
+    """
+
+    def __init__(self, summary_every: int = VERDICT_SUMMARY_EVERY) -> None:
+        self.summary_every = summary_every
+        self._state: dict[tuple[str, str], tuple[tuple[str, str], int]] = {}
+
+    @staticmethod
+    def _line(monitor: "WorkerMonitor", detail: CheckResult, repeats: int) -> str:
+        head = (
+            f"still {detail.verdict} ({repeats} cycles)"
+            if repeats
+            else detail.verdict
+        )
+        return (
+            f"[verdict] {monitor.agent_name}/{monitor.task_id} {head} "
+            f"idle={detail.idle_seconds:.0f}s idle_threshold={monitor.idle_threshold} "
+            f"max_threshold={monitor.max_threshold} process={detail.process_signal} "
+            f"awaiting_human={str(detail.awaiting_human).lower()} reason={detail.reason}"
+        )
+
+    def record(self, monitor: "WorkerMonitor", detail: CheckResult) -> None:
+        key = (monitor.agent_name, monitor.task_id)
+        # t018 backlog (b): the *reason* is part of what changed, not just the
+        # verdict.  Keying on the verdict alone hides transitions within one
+        # verdict — warn/soft_idle → warn/hard_idle_but_executing says the
+        # Worker crossed the hard threshold and is only alive because a
+        # subprocess is running, and that used to wait up to
+        # VERDICT_SUMMARY_EVERY cycles (5 minutes) to appear.
+        signature = (detail.verdict, detail.reason)
+        previous = self._state.get(key)
+        if previous is None or previous[0] != signature:
+            self._state[key] = (signature, 0)
+            _log(self._line(monitor, detail, repeats=0))
+            return
+        repeats = previous[1] + 1
+        self._state[key] = (signature, repeats)
+        if self.summary_every > 0 and repeats % self.summary_every == 0:
+            _log(self._line(monitor, detail, repeats=repeats))
+
+    def forget(self, monitor: "WorkerMonitor") -> None:
+        """監視対象から外れた Worker の状態を捨てる (同名で再起動したら初回扱い)。"""
+        self._state.pop((monitor.agent_name, monitor.task_id), None)
+
+
+_LEGACY_POINTER_MARK = "[moved]"
+
+
+def _leave_legacy_log_pointer(legacy: Path) -> None:
+    """旧ログパスに「引っ越し先」を 1 行だけ残す。
+
+    `registry/dispatcher.log` は dispatcher が `logs/dispatcher/` の日付別
+    ファイルへ移行した後も残り続け、2026-09-21 には「2026-09-05 以降更新されて
+    いない = ログ経路が壊れている」と誤読される原因になった (実際には新しい
+    パスに正常に出ていた)。watchdog で同じ引っ越しをする以上、同じ誤読を
+    仕込まないための一行。
+
+    既にマーカーが書かれていれば何もしない (再起動のたびに伸ばさない)。
+    """
+    try:
+        if not legacy.exists():
+            return
+        tail = legacy.read_text(errors="replace").rstrip().rsplit("\n", 1)[-1]
+        if _LEGACY_POINTER_MARK in tail:
+            return
+        ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        with legacy.open("a") as f:
+            f.write(
+                f"[watchdog {ts}] {_LEGACY_POINTER_MARK} このファイルはもう使われない。"
+                f"以降のログは logs/watchdog/watchdog-YYYYMMDD.log を見ること。\n"
+            )
+    except OSError:
+        pass
+
+
+def _log_observation(
+    monitor: "WorkerMonitor",
+    check_result: str,
+    detail: Optional[CheckResult] = None,
+) -> None:
     """★task_162 案C(観測専用). idle秒数・通知状況を registry/watchdog-observations.jsonl
     へ追記するだけの関数。check() の戻り値・判定条件には一切関与しない
     (check_result は記録のためだけに受け取る — この関数の失敗や有無で check() の
@@ -567,6 +1288,13 @@ def _log_observation(monitor: "WorkerMonitor", check_result: str) -> None:
     try:
         snapshot = monitor._observation_snapshot()
         snapshot["check_result"] = check_result
+        if detail is not None:
+            # t016: 判定の根拠も残す。check_result だけだと「なぜ terminate
+            # しなかったのか」(executing / awaiting_human による抑制) が
+            # 後から追えない。
+            snapshot["reason"] = detail.reason
+            snapshot["process_signal"] = detail.process_signal
+            snapshot["awaiting_human"] = detail.awaiting_human
         with _OBSERVATION_LOG_FILE.open("a") as f:
             f.write(json.dumps(snapshot) + "\n")
     except Exception:
@@ -605,11 +1333,12 @@ def _assert_repo_identity_or_exit(repo_root: Path) -> None:
 
 
 def run(repo_root: Path, interval: int) -> None:
-    global _LOG_FILE, _OBSERVATION_LOG_FILE
+    global _LOG_DIR, _OBSERVATION_LOG_FILE
     registry_dir = repo_root / "registry"
     registry_dir.mkdir(exist_ok=True)
-    _LOG_FILE = registry_dir / "watchdog.log"
+    _LOG_DIR = repo_root / "logs" / "watchdog"
     _OBSERVATION_LOG_FILE = registry_dir / "watchdog-observations.jsonl"
+    _leave_legacy_log_pointer(registry_dir / "watchdog.log")
 
     taskvia_url = os.environ.get("TASKVIA_URL", "https://taskvia.vercel.app")
     taskvia_token = os.environ.get("TASKVIA_TOKEN", "")
@@ -623,16 +1352,54 @@ def run(repo_root: Path, interval: int) -> None:
     # every single cycle forever.
     last_mass_kill_alert_at = 0.0
 
+    # t016: 判定結果を watchdog のログに残す。旧実装は非 alive のときしか
+    # ログを書かず、その非 alive が一度も起きなかったため判定が 1 行も残って
+    # いなかった。
+    verdict_logger = VerdictLogger()
+
     # t016: log which mux backend got selected at startup. A silent
     # misconfiguration here (e.g. config/crewvia.yaml `mode:` failing to
     # parse because of a trailing inline comment) used to be invisible until
     # every live Worker started getting falsely reported as "window gone" —
     # this one line turns that into an immediate, obvious startup fact.
+    # t002: the phase machine that actually ends Workers.  Independent of
+    # `monitors` on purpose — the Workers dispatcher hands over hold neither an
+    # assignment nor an in_progress task, so they have no monitor to attach to
+    # (knowledge/daemon-authority.md §3-2).
+    authority = kill_authority()
+    retirement = make_retirement_executor(repo_root, queue_dir=queue_dir)
+
+    # t005: mutual watch.  Built before the first cycle and beaten immediately,
+    # so the very first thing this process does is stop looking dead — a gap
+    # here is a window in which dispatcher would respawn a watchdog that is
+    # in fact three lines into booting.
+    global _DAEMON_WATCH
+    _DAEMON_WATCH = lib_daemon_watch.DaemonWatch(
+        registry_dir=registry_dir,
+        repo_root=repo_root,
+        self_name=lib_daemon_watch.DAEMON_WATCHDOG,
+        mux=_mux,
+        config=lib_daemon_watch.load_config(),
+        log=_log,
+    )
+    _beat()
+
     _backend_name = type(_mux._backend).__name__
     _log(
         f"Starting Watchdog v2 (PID {os.getpid()}, interval={interval}s, "
-        f"repo={repo_root}, mux_backend={_backend_name})"
+        f"repo={repo_root}, mux_backend={_backend_name}, kill_authority={authority})"
     )
+    if authority == KILL_AUTHORITY_DISPATCHER:
+        _log(
+            "kill_authority=dispatcher (rollback mode): retirement markers are NOT "
+            "consumed and terminate blocks in graceful_terminate() as before t002. "
+            "dispatcher.sh must be running with the same setting, or idle Workers "
+            "are never closed."
+        )
+    else:
+        for _agent in retirement.recover():
+            taskvia_alert(taskvia_url, taskvia_token, _agent,
+                          f"watchdog restart: resuming interrupted retirement of {_agent}")
     if not _mux.available():
         _log(
             f"WARNING: mux backend ({_backend_name}) reports unavailable at startup. "
@@ -653,32 +1420,50 @@ def run(repo_root: Path, interval: int) -> None:
         try:
             _assert_repo_identity_or_exit(repo_root)
 
+            # t005: both halves of the mutual watch, before anything that can
+            # fail on queue contents.  Beat first: this daemon's liveness must
+            # not depend on being able to parse a task card.
+            _beat()
+            _watch_dispatcher()
+
             active_tasks = load_active_tasks(queue_dir)
             active_keys = {(slug, tid) for slug, tid, _ in active_tasks}
 
             # Remove monitors for tasks that are no longer in_progress
             for key in list(monitors.keys()):
                 if key not in active_keys:
+                    # t018 backlog (a): drop the verdict state too.  Left
+                    # behind it grows for the life of the daemon, and if the
+                    # same agent/task comes back (a --reset then re-pull) its
+                    # first verdict is silently swallowed as "unchanged" for
+                    # up to VERDICT_SUMMARY_EVERY cycles.
+                    verdict_logger.forget(monitors[key])
                     del monitors[key]
 
             # Add monitors for new in_progress tasks
             for slug, task_id, meta in active_tasks:
                 key = (slug, task_id)
-                if key not in monitors:
-                    monitors[key] = WorkerMonitor(
-                        task_id=task_id,
-                        task_card=meta,
-                        profiles=PROFILES,
-                        repo_root=repo_root,
-                    )
+                if key in monitors:
+                    continue
+                if not should_monitor(meta, retirement, authority):
+                    continue
+                monitors[key] = WorkerMonitor(
+                    task_id=task_id,
+                    task_card=meta,
+                    profiles=PROFILES,
+                    repo_root=repo_root,
+                )
 
             # Evaluate every monitor's status up front (side-effect free) before
             # acting on any of them. This lets us tell "every single monitored
             # Worker's window looks gone in the same cycle" apart from an
             # isolated, real window closure — see the mass-kill guard below
             # (t016).
+            details: dict[tuple[str, str], CheckResult] = {
+                key: monitor.check_detail() for key, monitor in monitors.items()
+            }
             results: dict[tuple[str, str], "Literal['alive', 'warn', 'terminate', 'kill']"] = {
-                key: monitor.check() for key, monitor in monitors.items()
+                key: detail.verdict for key, detail in details.items()
             }
 
             # Cheap pre-check (no extra backend calls) before paying for the
@@ -726,19 +1511,24 @@ def run(repo_root: Path, interval: int) -> None:
                             f"{now_ts - last_mass_kill_alert_at:.0f}s since last)"
                         )
                     for key, monitor in monitors.items():
-                        _log_observation(monitor, results[key])
+                        verdict_logger.record(monitor, details[key])
+                        _log_observation(monitor, results[key], details[key])
                     time.sleep(interval)
                     continue
 
             # Check each monitor
             for (slug, task_id), monitor in list(monitors.items()):
+                detail = details[(slug, task_id)]
                 status = results[(slug, task_id)]
                 agent = monitor.agent_name
+
+                # t016: 判定そのものをログに残す (変化時 + 一定間隔の要約)。
+                verdict_logger.record(monitor, detail)
 
                 # ★task_162 案C(観測専用): check() の戻り値・分岐には一切影響しない
                 # 独立した記録経路。この呼び出しを削除しても以下の判定ロジックは
                 # 完全に同一に動作する。
-                _log_observation(monitor, status)
+                _log_observation(monitor, status, detail)
 
                 if status == "alive":
                     pass  # healthy — no action
@@ -753,6 +1543,20 @@ def run(repo_root: Path, interval: int) -> None:
                     taskvia_alert(taskvia_url, taskvia_token, agent, msg)
 
                 elif status == "terminate":
+                    # Checked before anything is logged or sent.  The monitor is
+                    # rebuilt from the task card every cycle and the task stays
+                    # in_progress until the retirement finishes its cleanup, so
+                    # this branch is re-entered on every cycle of a termination
+                    # that is already under way.  Announcing it each time turned
+                    # one termination into a dozen identical Taskvia alerts
+                    # (measured: 12 in a single e2e run) and made the log read as
+                    # if watchdog kept re-deciding.
+                    if (authority == KILL_AUTHORITY_WATCHDOG
+                            and retirement.has_marker(agent)):
+                        verdict_logger.forget(monitor)
+                        del monitors[(slug, task_id)]
+                        continue
+
                     elapsed = time.time() - monitor.started_at
                     _log(
                         f"TERMINATE: {agent}/{task_id} (mission={slug}) "
@@ -762,8 +1566,32 @@ def run(repo_root: Path, interval: int) -> None:
                         taskvia_url, taskvia_token, agent,
                         f"TERMINATE: {agent}/{task_id} タイムアウト (elapsed={elapsed:.0f}s)",
                     )
-                    graceful_terminate(monitor)
-                    del monitors[(slug, task_id)]
+                    if authority == KILL_AUTHORITY_DISPATCHER:
+                        graceful_terminate(monitor)
+                        verdict_logger.forget(monitor)
+                        del monitors[(slug, task_id)]
+                    else:
+                        window = monitor._mux_window_name() or f"{agent}-worker"
+                        requested = retirement.request(
+                            agent, window, "timeout",
+                            mission=slug, task_id=task_id,
+                            message=TERMINATE_MESSAGE,
+                            detail=timeout_detail(monitor, detail, elapsed),
+                        )
+                        if requested:
+                            # Keeping the monitor would re-fire terminate every
+                            # cycle; the marker is now the record of intent, and
+                            # it survives a restart in a way the monitor never did.
+                            verdict_logger.forget(monitor)
+                            del monitors[(slug, task_id)]
+                        else:
+                            # Fail closed (no spawn identity to prove who this
+                            # is).  Keep the monitor so the decision is retaken
+                            # next cycle instead of silently dropping it.
+                            _log(
+                                f"TERMINATE deferred: {agent}/{task_id} — could not "
+                                f"record a retirement request this cycle"
+                            )
 
                 elif status == "kill":
                     backend_name = type(_mux._backend).__name__
@@ -775,7 +1603,18 @@ def run(repo_root: Path, interval: int) -> None:
                         taskvia_url, taskvia_token, agent,
                         f"KILL: {agent}/{task_id} mux window が消失 (backend={backend_name})",
                     )
+                    verdict_logger.forget(monitor)
                     del monitors[(slug, task_id)]
+
+            # t002: advance every in-flight retirement by at most one step.
+            # Deliberately outside the monitor loop and reached on every cycle,
+            # including cycles with no monitors at all — the idle Workers
+            # dispatcher hands over have no in_progress task to monitor.
+            # Skipped in a mass-kill cycle for the same reason the monitor
+            # cleanup is: a backend that cannot answer must not be read as
+            # "every window is gone", which here would reset live tasks.
+            if authority == KILL_AUTHORITY_WATCHDOG:
+                retirement.process_all()
 
         except Exception as e:
             _log(f"ERROR in dispatch cycle: {e}")

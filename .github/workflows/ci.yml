@@ -68,30 +68,31 @@ jobs:
           sys.exit(1 if failed else 0)
           EOF
 
-  handoff-path-test:
-    name: Handoff Path Regression Test (task_158)
+  # scripts/test_*.sh を glob で全部走らせる。名指しの一覧は持たない（足したテストが黙って CI の外に
+  # 残らないように）。走らせないものは scripts/ci-script-tests-excluded.txt の「理由付き」行だけ。
+  # 1 本ずつ走らせて結果を出し、1 本落ちても残りは止めない。knowledge/ci-script-tests.md
+  script-tests:
+    name: scripts/test_*.sh (all, minus the reasoned allowlist)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 0   # test_handoff_path.sh が git worktree add をする
 
-      - name: git identity (required for git worktree add in CI)
+      - name: git identity (harness runs `git init` / `git worktree add` in isolated fixtures)
         run: |
-          git config user.email "ci@crewvia.local"
-          git config user.name "Crewvia CI"
+          git config --global user.email "ci@crewvia.local"
+          git config --global user.name "Crewvia CI"
 
-      - name: scripts/test_handoff_path.sh
-        run: bash scripts/test_handoff_path.sh
+      # test_retirement_authority.sh は実 tmux に窓を立てる（偽 tmux では作れない状態を検査する）。
+      - name: Install tmux
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y tmux
+          tmux -V
 
-  registry-lock-test:
-    name: Registry Lock Regression Test (task_161)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: scripts/test_registry_lock.sh
-        run: bash scripts/test_registry_lock.sh
+      - name: scripts/ci-run-script-tests.sh
+        run: bash scripts/ci-run-script-tests.sh
 
   bats:
     name: Bats Unit Tests
@@ -120,6 +121,15 @@ jobs:
 
       - name: Install dependencies
         run: pip install pytest pyyaml
+
+      # tests/test_daemon_husk_respawn.py はデーモンが死んでも pane が残る形
+      # (husk) を実 tmux 窓で再現する。偽 tmux では作れない状態なので、tmux が
+      # 無いと skip され、t006 QA FAIL-1 の回帰が CI で誰にも見えなくなる。
+      - name: Install tmux (required by the husk respawn regression)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y tmux
+          tmux -V
 
       - name: Run pytest
         run: python3 -m pytest tests/ -v

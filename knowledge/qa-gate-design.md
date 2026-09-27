@@ -256,7 +256,7 @@ def cmd_needs_director(args):
 **Director の対処フロー:**
 1. `plan.sh status` で `needs_director` タスクを発見
 2. reason を読んで対処方針を決定
-3. 手順を補足した上で `plan.sh update <task_id> --status in_progress --reset` で差し戻し
+3. 手順を補足した上で `plan.sh update <task_id> --status pending --reset` で差し戻し（`--status in_progress --reset` は罠 — `--reset` 適用後に `--status` が上書きし in_progress/worker=null のまま止まる。t030 参照）
 4. Worker に `lib_mux send` で追加指示
 
 ### STATUS_ICON への追加

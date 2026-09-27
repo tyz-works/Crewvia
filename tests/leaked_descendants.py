@@ -132,10 +132,17 @@ def _uptime() -> float:
 
 
 def _belongs(pid: int, marker: bytes, basetemp: bytes):
-    """(所属する理由 | None, 観測できたか)。同 uid の pid の environ が読めなければ観測できていない。"""
+    """(所属する理由 | None, 観測できたか)。同 uid の pid の environ が読めなければ観測できていない。
+
+    **0 バイトで読めたのも観測の失敗** (`knowledge/empty-vs-unobservable.md` の O)。exec の
+    最中のプロセスは environ が空で読める —— 孤児を起こした直後の 1 読みで 300 回中 8 回
+    (2.7%)、印が現れるまでは 1ms 未満だった。これを「読めた・印が無い」に潰すと、印を継承した
+    子孫が survivors にも unobservable にも入らず **黙って消える**。残骸を見逃さないのが
+    仕事のガードとしては倒す向きが逆なので、空は「観測できなかった」に倒す。
+    """
     base = _PROC / str(pid)
     environ = _read_bytes(base / "environ")
-    if environ is None:
+    if not environ:
         observed = False
     else:
         observed = True

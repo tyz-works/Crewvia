@@ -56,6 +56,25 @@ def _marker() -> str:
     return os.environ[leaked_descendants.MARKER_VAR]
 
 
+def _wait_observable(pid: int, seconds: float = 5.0) -> bool:
+    """`/proc/<pid>/environ` が **空でなく** 読めるようになるまで待つ。
+
+    exec の最中は environ が 0 バイトで読める (実測 2.7%、1ms 未満で解消)。その隙に走査すると
+    印を持つ子孫を観測できず、判定そのものを見たいテストが揺れる (2026-09-27 の flaky)。
+    ガード側は空を「観測できなかった」に倒すので黙って消えることはもう無いが、**判定を見る
+    テストは観測できる状態になってから走査する**。
+    """
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        try:
+            if pathlib.Path(f"/proc/{pid}/environ").read_bytes():
+                return True
+        except OSError:
+            pass
+        time.sleep(0.005)
+    return False
+
+
 def _spawn_orphan(env=None, cwd=None) -> int:
     """`sh -c 'sleep 60 & wait'` の親を殺して、sleep を孤児にする。孤児の pid を返す。"""
     proc = subprocess.Popen(
@@ -80,9 +99,12 @@ def test_scan_counts_an_orphan_that_carries_the_session_marker(basetemp):
     before = leaked_descendants.snapshot()
     pid = _spawn_orphan()
     try:
+        assert _wait_observable(pid), "孤児の environ が読めるようにならない (前提が崩れた)"
         result = leaked_descendants.scan(before, _marker(), basetemp)
         found = {s.pid: s for s in result.survivors}
-        assert pid in found, f"印を継承した孤児を数えていない: {list(found)}"
+        assert pid in found, (
+            f"印を継承した孤児を数えていない: {list(found)} "
+            f"(観測できなかった同 uid のプロセス: {result.unobservable} 個)")
         assert found[pid].via == "env-marker"
         assert found[pid].ppid == 1 or found[pid].ppid != os.getpid()
     finally:
@@ -95,6 +117,9 @@ def test_scan_does_not_count_a_process_with_neither_marker_nor_basetemp(basetemp
     before = leaked_descendants.snapshot()
     pid = _spawn_orphan(env={"PATH": "/usr/bin:/bin"}, cwd="/")
     try:
+        # 観測できない隙に走査すると「数えなかった」が **観測できなかっただけ** になり、
+        # このテストが理由なく緑になる (0 件で PASS にしない / tests/CLAUDE.md)。
+        assert _wait_observable(pid), "他人役の environ が読めるようにならない (前提が崩れた)"
         result = leaked_descendants.scan(before, _marker(), basetemp)
         assert pid not in {s.pid for s in result.survivors}, (
             "印も basetemp も持たない (= このセッションの子孫と言えない) プロセスを数えた。"
@@ -112,13 +137,33 @@ def test_scan_counts_a_descendant_that_dropped_its_env_but_lives_in_basetemp(bas
     before = leaked_descendants.snapshot()
     pid = _spawn_orphan(env={"PATH": "/usr/bin:/bin"}, cwd=str(tmp_path))
     try:
+        assert _wait_observable(pid), "子孫の environ が読めるようにならない (前提が崩れた)"
         result = leaked_descendants.scan(before, _marker(), basetemp)
         found = {s.pid: s for s in result.survivors}
-        assert pid in found, "env を捨てた子孫を basetemp で捕まえられない"
+        assert pid in found, (
+            f"env を捨てた子孫を basetemp で捕まえられない "
+            f"(観測できなかった同 uid のプロセス: {result.unobservable} 個)")
         assert found[pid].via == "cwd-in-basetemp"
     finally:
         os.kill(pid, signal.SIGKILL)
     assert _wait_dead(pid)
+
+
+def test_an_empty_environ_is_not_counted_as_observed(monkeypatch):
+    """environ が 0 バイトで読めるのは **観測の失敗** (`knowledge/empty-vs-unobservable.md` の O)。
+
+    「読めた・印が無い」に潰すと、exec の最中の子孫が survivors にも unobservable にも入らず
+    黙って消える。実測では孤児を起こした直後の 1 読みで 300 回中 8 回 (2.7%) が空だった。
+    実物のレースは時刻依存なので、ここは読み取りを差し替えて判定そのものを固定する。
+    """
+    monkeypatch.setattr(
+        leaked_descendants, "_read_bytes",
+        lambda path: b"" if path.name == "environ" else None)
+    why, observed = leaked_descendants._belongs(
+        os.getpid(), f"{leaked_descendants.MARKER_VAR}=no-such-session".encode(), b"/nonexistent")
+    assert why is None
+    assert observed is False, (
+        "空の environ を「観測できた」にすると、exec 中の印つき子孫を黙って見逃す")
 
 
 def test_scan_ignores_processes_that_were_there_before(basetemp):

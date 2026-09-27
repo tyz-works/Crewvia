@@ -57,7 +57,8 @@ lib ごとの**破ってはいけない契約**の要約。理由・経緯・全
 - `fail` は `--head <sha>`（実在する commit）必須、免除は `--no-head "<理由>"`。`handoff_path` は**絶対パスのみ**。
 - `done` は `--pr <N>` か `--no-pr "<理由>"` のどちらかが要る場合がある（後続の codex-review に pr_number が無いとき）。
 - task の成果物は `deliverable: pr|file|none`（`add` / `update --deliverable`）。`done` は `deliverable: pr` に `--pr` / `--no-pr` を求める。
-  lint は `config/skill-permissions.yaml` の `can_produce_deliverable` **だけ**で突き合わせる（`lint_plan.py` にスキル名を書かない）。
+  lint は `hooks/lib_skill_perms.py` の `check_permission()` を task の skills で直接呼び、Write/Edit/(`pr` なら) `git push` が
+  実際に拒否されないかで突き合わせる（`lint_plan.py` にスキル名を書かない。`can_produce_deliverable` は宣言のみで判定には使わない — t088）。
   必須化は `init` が mission.yaml に書く `deliverable_required: true` の mission だけ（`knowledge/assignment-routing.md` §6）。
 - 引数は厳格（未知の option は exit 2 で何も書かない）。`pull` だけ使い方の誤りが exit 1（exit 2 は「タスクなし」）。
 - queue を書き換えるサブコマンドの後、`registry/task-graph/tasks.json` を再生成する（`CREWVIA_TASK_GRAPH=0` で停止）。

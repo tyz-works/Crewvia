@@ -44,6 +44,27 @@ def _load_scripts_module(name: str):
     return mod
 
 
+def _load_hooks_module(name: str):
+    """Load `hooks/<name>.py` by path — same pattern as `_load_scripts_module()`
+    above, but for the sibling `hooks/` directory.
+
+    `check_deliverable()` calls into `hooks/lib_skill_perms.py`'s `check_permission()`
+    directly (t088 / PR#236 7巡目 P2) rather than re-implementing its allow/deny
+    union rules here, so this loader is only exercised lazily by the tasks that
+    actually need it (see `_hook_skill_perms()`) — a sandbox that never declares
+    `deliverable: pr|file` never needs `hooks/` to exist next to its copy of
+    `scripts/`.
+    """
+    import importlib.util
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    repo_root = os.path.dirname(script_dir)
+    path = os.path.join(repo_root, 'hooks', f'{name}.py')
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 # task カード (queue/missions/<slug>/tasks/tNNN.md) の読み取りは、識別子・
 # parser・隔離の規則を持つ唯一の入口 (CLAUDE.md 不変条件 #1)。plan.sh /
 # dispatcher.sh と同じものを読む — lint だけが別の緩い parser で読んでいると、
@@ -489,6 +510,110 @@ def _mission_requires_deliverable(slug: str, queue_dir: str) -> tuple[bool, Opti
     return False, f"{path}: deliverable_required は true / false のどちらかだけ (got {value!r})"
 
 
+# ---------------------------------------------------------------------------
+# 実際に書ける/push できるかの判定 — hook (`hooks/lib_skill_perms.py`) に委譲する
+# (t088 / PR#236 7巡目 P2)
+# ---------------------------------------------------------------------------
+#
+# finding: `[research, code]` のように `can_produce_deliverable: false` な skill と
+# `true` な skill を混ぜた task は、旧実装 (「1 つでも true な skill があれば作れる」の
+# 集計) では lint を通ってしまう。だが `hooks/lib_skill_perms.py` の `check_permission()`
+# は **全 skill の deny の和を allow より先に** 適用するので、Write / Edit は
+# research の deny によって拒否されたまま — 「lint は通るのに実際には作れない」食い違いが
+# 生まれる (族B: 検査した対象と作用する対象が違う)。
+#
+# 直し方は、この判定を lint 側に**書き写さない**こと。hook が使っているのと同じ
+# `check_permission()` をここでも呼び、その task の skills で実際に Write / Edit /
+# (`pr` なら) `git push` が拒否されていないかを確かめる。2 つの実装が別々に「同じはずの
+# 規則」を持つのをやめれば、この 2 つが食い違うことは構造的に無くなる。
+
+#: 「成果物を書ける」ことの代表 signature。hook (`pre-tool-use.sh`) は非 Bash ツールに
+#: bare な tool 名を signature として渡す (`research` / `review` / `plan_review` の
+#: allow/deny コメント参照)。3 つのうちどれか 1 つでも拒否されていなければ「書ける」。
+_WRITE_TOOL_SIGS: tuple[str, ...] = ('Write', 'Edit', 'MultiEdit')
+
+#: `deliverable: pr` は書くだけでなく push もできないと作れない。ブランチ名は
+#: `_global.deny` の "push to main/master" / "force push" パターンに **当たらない**
+#: 適当な feature branch 名にする (main/master・force 自体は別の理由で常に拒否されるべき
+#: 操作であり、この判定が確かめたい「skill の deny/allow」とは別の話)。
+_PUSH_TOOL_SIG = 'Bash(git push origin task-branch)'
+
+#: `hooks/lib_skill_perms.py` はキャッシュ付きの重い読み込みではないが、モジュール自体は
+#: 遅延読み込みする — `deliverable: pr|file` を 1 件も宣言しない mission (大半のテスト
+#: 用 sandbox を含む) は `hooks/` の存在を必要としない。
+_hook_skill_perms_module = None
+
+
+def _hook_skill_perms():
+    global _hook_skill_perms_module
+    if _hook_skill_perms_module is None:
+        _hook_skill_perms_module = _load_hooks_module('lib_skill_perms')
+    return _hook_skill_perms_module
+
+
+def _load_hook_permission_config(skill_permissions_path: str) -> tuple[Optional[dict], Optional[str]]:
+    """`skill-permissions.yaml` を hook と同じ読み方 (`lib_skill_perms.load_config()`) で読む。
+
+    読めるかどうかの一次判定 (存在確認・通常ファイルか) は他の config 読み取りと同じ
+    `lib_task_cards` の入口を通す (CLAUDE.md 不変条件 #1)。実際の YAML 解析
+    (PyYAML / PyYAML が無いときのフォールバック) は `lib_skill_perms.load_config()` に
+    完全に委譲する — allow/deny の構造をここでもう一度書かない。
+    """
+    text = lib_task_cards.read_regular_text_or_unreadable(skill_permissions_path)
+    if lib_task_cards.is_unreadable(text):
+        return None, f"{skill_permissions_path}: {text.reason}"
+    try:
+        mod = _hook_skill_perms()
+        config = mod.load_config(skill_permissions_path)
+    except Exception as e:  # noqa: BLE001 — hook 自体が壊れた入力でも lint を落とさない
+        return None, f"{skill_permissions_path}: hooks/lib_skill_perms.py で読めません ({type(e).__name__}: {e})"
+    return config, None
+
+
+_DENY_SOURCE_RE = re.compile(r'^skill:([^:]+):deny:')
+
+
+def _denying_skills(sources: set[str]) -> list[str]:
+    """`check_permission()` の `source` (`"skill:<skill>:deny:<pattern>"`) から
+    拒否した skill 名だけを取り出す (メッセージで「どれを外せばいいか」を言うため)。"""
+    found = set()
+    for src in sources:
+        m = _DENY_SOURCE_RE.match(src)
+        if m:
+            found.add(m.group(1))
+    return sorted(found)
+
+
+def _skills_can_produce(config: dict, skills: list[str], declared: str) -> tuple[bool, Optional[str]]:
+    """hook (`check_permission()`) の答えだけで、この skills の組み合わせが実際に
+    `declared` を作れるかを判定する。作れないなら理由 (人が読めるメッセージ) を添えて返す。
+
+    「1 つでも can_produce_deliverable: true な skill があれば作れる」という宣言の集計は
+    しない — `check_permission()` は deny の和を allow より先に適用するので、宣言の単純な
+    集計とは答えがズレうる (このモジュール冒頭のコメント参照)。
+    """
+    mod = _hook_skill_perms()
+    skills_csv = ','.join(skills)
+
+    write_results = [mod.check_permission(config, skills_csv, sig) for sig in _WRITE_TOOL_SIGS]
+    if all(r['decision'] == 'deny' for r in write_results):
+        sources = {r['source'] for r in write_results}
+        who = _denying_skills(sources)
+        fix = f"skill {who} を外す" if who else "拒否している skill を外す"
+        return False, (f"Write/Edit/MultiEdit が全て拒否されています ({'; '.join(sorted(sources))})。"
+                        f" {fix}こと (deny は allow より先に適用されるため、成果物を作れる skill を"
+                        f" 足しても解決しない)")
+
+    if declared == 'pr':
+        push = mod.check_permission(config, skills_csv, _PUSH_TOOL_SIG)
+        if push['decision'] == 'deny':
+            who = _denying_skills({push['source']})
+            fix = f"skill {who} を外す" if who else "拒否している skill を外す"
+            return False, f"git push が拒否されています ({push['source']})。{fix}こと"
+
+    return True, None
+
+
 def check_deliverable(tasks: list[dict], skill_permissions_path: str,
                       required: bool = False,
                       required_problem: Optional[str] = None) -> list[tuple[str, str, str]]:
@@ -496,19 +621,31 @@ def check_deliverable(tasks: list[dict], skill_permissions_path: str,
 
     * 値は pr / file / none のどれか (印の有無にかかわらず、書かれていれば検査する)。
     * `required` (この mission が deliverable 必須の印を持つ) なら、全 task が宣言を持つ。
-    * `pr` / `file` を宣言した task の skills が **すべて** `can_produce_deliverable: false`
-      なら FAIL (印の有無にかかわらず効く)。欄の無い・config に載っていないスキルは
-      「作れる」側 (未知のスキルは別に skill 検査が WARN する)。
+    * `pr` / `file` を宣言した task の `can_produce_deliverable` の値がそもそも壊れて
+      いないか (true/false 以外) を先に確かめたうえで、実際に Write/Edit/(pr なら) push が
+      hook (`check_permission()`) に拒否されていないかで FAIL を決める (t088 / PR#236
+      7巡目 P2 — 「宣言のどれか 1 つが true なら作れる」という集計はしない。deny は allow
+      より先に適用されるため、宣言の単純な集計と実際の権限がズレる)。
     """
     results: list[tuple[str, str, str]] = []
     caps: Optional[dict] = None
     caps_problem: Optional[str] = None
+    hook_cfg: Optional[dict] = None
+    hook_cfg_problem: Optional[str] = None
+    hook_cfg_loaded = False
 
     def capabilities() -> tuple[dict, Optional[str]]:
         nonlocal caps, caps_problem
         if caps is None:
             caps, caps_problem = _load_deliverable_capabilities(skill_permissions_path)
         return caps, caps_problem
+
+    def hook_config() -> tuple[Optional[dict], Optional[str]]:
+        nonlocal hook_cfg, hook_cfg_problem, hook_cfg_loaded
+        if not hook_cfg_loaded:
+            hook_cfg, hook_cfg_problem = _load_hook_permission_config(skill_permissions_path)
+            hook_cfg_loaded = True
+        return hook_cfg, hook_cfg_problem
 
     # required の値が要るのは「キーが無い (未宣言)」task だけ —— 「キーはあるが値が null」の
     # task は required に関わらず下のループが無条件で FAIL する (unknown deliverable) ので、
@@ -564,11 +701,18 @@ def check_deliverable(tasks: list[dict], skill_permissions_path: str,
                             f"{prefix}: skill {bad} の can_produce_deliverable が true / false ではありません "
                             f"({skill_permissions_path})"))
             continue
-        if all(table.get(s) is False for s in skills):
+
+        config, hook_problem = hook_config()
+        if hook_problem is not None:
+            results.append(('FAIL', 'deliverable',
+                            f"{prefix}: deliverable '{declared}' を skills と突き合わせられません — {hook_problem}"))
+            continue
+
+        can_produce, reason = _skills_can_produce(config, skills, declared)
+        if not can_produce:
             results.append(('FAIL', 'deliverable',
                             f"{prefix}: deliverable '{declared}' を宣言していますが、skills {skills} は"
-                            f" すべて can_produce_deliverable: false で、成果物を作れません "
-                            f"(成果物を作れる skill を足すか、deliverable を none にする)"))
+                            f" 実際には成果物を作れません — {reason}"))
     return results
 
 

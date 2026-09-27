@@ -124,20 +124,29 @@ Director が codex-review を開く。
 - **宣言**: card の frontmatter `deliverable: pr | file | none`（pr = PR を作る / file = ファイルを作る /
   none = 作らない）。`plan.sh add --deliverable <値>` / `plan.sh update <id> --deliverable <値>` で書く。
   不正値は exit 2 で何も書かない（`_parse_deliverable_opt()` が queue に触れる前に検証）。
-- **判定の情報源は 1 か所**: `config/skill-permissions.yaml` の各 skill の `can_produce_deliverable`。
-  `false` を持つのは `codex-review` / `review` / `research` / `planning` / `plan_review` / `verify`（欄が無い skill は
-  「作れる」）。`lint_plan.py` はこの欄だけを読み、**スキル名を書かない**（`test_lint_plan_carries_no_skill_name_literal`
-  が固定）。skill を足したら config の欄を足す。値は `true` / `false` のどちらかだけ（それ以外は lint が FAIL —
-  truthiness で潰さない）。hook（`hooks/lib_skill_perms.py`）は欄を許可規則として読まない。
+- **判定の情報源**: 実際に Write / Edit / (`pr` なら) `git push` が拒否されないかは、hook
+  (`hooks/lib_skill_perms.py`) の `check_permission()` を task の skills 全部で直接呼んで決める
+  (t088 / PR#236 7巡目 P2)。`config/skill-permissions.yaml` の各 skill の `can_produce_deliverable`
+  (`false` を持つのは `codex-review` / `review` / `research` / `planning` / `plan_review` / `verify`。
+  欄が無い skill は「宣言なし」) は **判定には使わない** — Write/MultiEdit の真偽値だけを検証する
+  ドキュメント用の宣言 (値は `true` / `false` のどちらかだけ。それ以外は lint が FAIL — truthiness で
+  潰さない)。以前は「skills の 1 つでも `can_produce_deliverable: true` なら作れる」という宣言の
+  集計だったが、`check_permission()` は skill の deny の和を allow より先に適用するため、
+  `[research, code]` のように false な skill と true な skill を混ぜた組み合わせで宣言の集計と
+  実際の権限がズレていた（宣言は「作れる」なのに hook は拒否する）。`lint_plan.py` は
+  `check_permission()` を直接呼ぶだけで、**スキル名もその規則も書かない**
+  (`test_lint_plan_carries_no_skill_name_literal` が固定)。
 - **lint（`check_deliverable()`）**:
-  - `pr` / `file` を宣言した task の skills が**すべて** `can_produce_deliverable: false` → FAIL。
-    **mission の印の有無にかかわらず**、宣言のある task には効く。skills の 1 つでも作れれば通る。
+  - `pr` / `file` を宣言した task の skills を union した `check_permission()` が Write / Edit /
+    MultiEdit を全部拒否する → FAIL。`pr` はさらに `git push` も拒否されていないかを確認する。
+    **mission の印の有無にかかわらず**、宣言のある task には効く。
   - 宣言の**必須化**は、この機能より後に `plan.sh init` された mission だけ。`init` が mission.yaml に
     `deliverable_required: true` を書く。**印の無い既存 mission は、drafting / reviewing に戻っても deliverable の
     欠落で FAIL しない**（宣言が無い = 何も検査しない）。宣言が書かれていれば値と skills の突き合わせは効く。
-  - config が読めない・`can_produce_deliverable` が不正・`deliverable_required` が `true` / `false` 以外・
-    mission.yaml が ENOENT 以外で読めない、は**「決められない」ので FAIL**（「無い」に潰さない。ENOENT だけが
-    「印なし」）。config と mission.yaml は、それが要る task があるときだけ読む。
+  - `can_produce_deliverable` が不正・`hooks/lib_skill_perms.py` の config が読めない・
+    `deliverable_required` が `true` / `false` 以外・mission.yaml が ENOENT 以外で読めない、は
+    **「決められない」ので FAIL**（「無い」に潰さない。ENOENT だけが「印なし」）。config と
+    mission.yaml は、それが要る task があるときだけ読む。
 - **done**: `deliverable: pr` の task は `--pr <N>` か `--no-pr "<理由>"` が必須（無ければ exit 2・何も書かない。
   理由は `no_pr_waiver` に残る — t036 と同じ作法）。card の `deliverable` が読めない値なら、PR を作る task かどうか
   決められないので同じく拒否する（出口は `update --deliverable` か `--no-pr`）。`deliverable` の無い既存 card は従来どおり

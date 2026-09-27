@@ -6,8 +6,8 @@
 #   baseline — いまの木では tests/test_task_deliverable.py が緑
 #   A  done: deliverable: pr でも --pr / --no-pr を求めない                         → 赤
 #   B  done: 読めない宣言の値を「宣言なし」と読む                                   → 赤
-#   C  lint: pr|file の task を skills と突き合わせない                             → 赤
-#   D  lint: skills の「どれか 1 つ」が作れない (all でなく any) で FAIL にする     → 赤
+#   C  lint: pr|file の task を実際の権限 (check_permission) で判定しない (常に通す) → 赤
+#   D  lint: check_permission() への委譲をやめ、宣言の集計 (旧実装、t088 で撤去) に戻す → 赤
 #   E  lint: 印のある mission でも宣言の無い task を通す                            → 赤
 #   F  lint: 印が無くても宣言を必須にする (既存 mission を止める)                   → 赤
 #   G  lint: config が読めなくても pr|file を通す                                   → 赤
@@ -59,6 +59,21 @@ p.write_text(s.replace(old, new))
 PY
 }
 
+# inject_span <file> <old_content_file> <new_content_file> — old/new をファイル経由で渡す版
+# (バッククォート・$ を多く含む大きなブロックを引用符地獄なしで置換するため。red_proof_t055.sh と同じ)。
+inject_span() {
+    FILE="$1" OLDFILE="$2" NEWFILE="$3" python3 - "$TREE/$1" <<'PY' || { echo "FATAL: 注入点が見つからない ($1)"; exit 2; }
+import os, sys, pathlib
+p = pathlib.Path(sys.argv[1]); s = p.read_text()
+old = pathlib.Path(os.environ["OLDFILE"]).read_text()
+new = pathlib.Path(os.environ["NEWFILE"]).read_text()
+if s.count(old) != 1:
+    print(f"count={s.count(old)}", file=sys.stderr)
+    sys.exit(1)
+p.write_text(s.replace(old, new))
+PY
+}
+
 # 呼び出し元の AGENT_NAME / SKILLS / CREWVIA_* を引き継がない (テストは自前の env を組む)
 run_py() {  # run_py <pytest の引数...>
     ( cd "$TREE" && env -i PATH="$PATH" HOME="$WORK" PYTHONUSERBASE="${PYTHONUSERBASE:-$HOME/.local}" \
@@ -89,15 +104,43 @@ fresh_copy
 inject scripts/plan.sh "            if has_declaration and (declared == 'pr' or declared not in DELIVERABLE_VALUES):" "            if has_declaration and declared == 'pr':"
 expect_red "case B" "test_an_unreadable_declaration_is_refused_not_read_as_undeclared"
 
-echo "== case C: pr|file の task を skills と突き合わせない"
+echo "== case C: pr|file の task を実際の権限 (check_permission) で判定しない (常に通す)"
 fresh_copy
-inject scripts/lint_plan.py "        if all(table.get(s) is False for s in skills):" "        if False:"
+inject scripts/lint_plan.py "        can_produce, reason = _skills_can_produce(config, skills, declared)
+        if not can_produce:" "        can_produce, reason = _skills_can_produce(config, skills, declared)
+        if False:"
 expect_red "case C" "test_a_deliverable_with_only_non_producing_skills_fails"
 
-echo "== case D: skills のどれか 1 つが作れないだけで FAIL (any)"
+echo "== case D: check_permission() への委譲をやめ、宣言の集計 (旧実装、t088 で撤去) に戻す"
+# t088 (PR#236 7巡目 P2) の本題: 「1 つでも can_produce_deliverable: true な skill が
+# あれば作れる」という旧実装 (all(table.get(s) is False for s in skills)) は、hook が
+# skill の deny の和を allow より先に union で適用することを見ていない。[research, code]
+# のような組み合わせで、宣言の集計と実際の権限がズレる (このケースを戻すと、それを検出する
+# ために書いた test_a_denying_skill_mixed_in_still_fails / test_a_mixed_skill_list_with_a_denying_skill_fails
+# が緑に戻ってしまう = 赤になるはず)。
 fresh_copy
-inject scripts/lint_plan.py "        if all(table.get(s) is False for s in skills):" "        if any(table.get(s) is False for s in skills):"
-expect_red "case D" "test_one_producing_skill_is_enough"
+cat > "$WORK/d_new.txt" <<'BLOCK'
+        config, hook_problem = hook_config()
+        if hook_problem is not None:
+            results.append(('FAIL', 'deliverable',
+                            f"{prefix}: deliverable '{declared}' を skills と突き合わせられません — {hook_problem}"))
+            continue
+
+        can_produce, reason = _skills_can_produce(config, skills, declared)
+        if not can_produce:
+            results.append(('FAIL', 'deliverable',
+                            f"{prefix}: deliverable '{declared}' を宣言していますが、skills {skills} は"
+                            f" 実際には成果物を作れません — {reason}"))
+BLOCK
+cat > "$WORK/d_old.txt" <<'BLOCK'
+        if all(table.get(s) is False for s in skills):
+            results.append(('FAIL', 'deliverable',
+                            f"{prefix}: deliverable '{declared}' を宣言していますが、skills {skills} は"
+                            f" すべて can_produce_deliverable: false で、成果物を作れません "
+                            f"(成果物を作れる skill を足すか、deliverable を none にする)"))
+BLOCK
+inject_span scripts/lint_plan.py "$WORK/d_new.txt" "$WORK/d_old.txt"
+expect_red "case D" "test_a_denying_skill_mixed_in_still_fails"
 
 echo "== case E: 印のある mission でも宣言の無い task を通す"
 fresh_copy
@@ -110,8 +153,14 @@ inject scripts/lint_plan.py "            if required:" "            if True:"
 expect_red "case F" "test_an_old_mission_without_the_mark_is_not_stopped"
 
 echo "== case G: config が読めなくても pr|file を通す"
+# t088 (PR#236 7巡目 P2) で check_deliverable() に guard が 2 つになった (capabilities() の
+# problem と hook_config() の hook_problem — どちらも同じ skill_permissions_path を読む)。
+# 「config が無い」テストは元は前者だけで拾えたが、今は後者が独立に同じ FAIL を出すため、
+# 前者だけを外しても赤にならない (これは退行ではなく、多重防御が効いている証拠)。
+# この case は両方を外して初めて「config が読めなくても通ってしまう」を再現する。
 fresh_copy
 inject scripts/lint_plan.py "        if problem is not None:" "        if False:"
+inject scripts/lint_plan.py "        if hook_problem is not None:" "        if False:"
 expect_red "case G" "test_an_unreadable_config_is_a_fail_not_a_pass"
 
 echo "== case H: 不正な can_produce_deliverable を False に倒す"

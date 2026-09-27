@@ -39,11 +39,21 @@ NON_PRODUCERS = ("codex-review", "review", "research", "planning", "plan_review"
 
 
 class DeliverableSandbox(Sandbox):
-    """`Sandbox` + 実 config の隔離コピー (lint は `<repo_root>/config` を読む)。"""
+    """`Sandbox` + 実 config の隔離コピー (lint は `<repo_root>/config` を読む)。
+
+    t088 (PR#236 7巡目 P2) 以降、`check_deliverable()` は `hooks/lib_skill_perms.py` の
+    `check_permission()` を直接呼ぶので、`<repo_root>/hooks/lib_skill_perms.py` も要る
+    (`tests/fixture_tree.py` の glob は `scripts/lib_*` だけを対象にしており、`hooks/` の
+    1 ファイルはその対象外 — `scripts/test_main_repo_git_guard.sh` が `hooks/lib_main_repo_git_guard.py`
+    を単体コピーしているのと同じ扱い。`tests/test_fixture_tree_is_the_only_copier.py` の
+    ALLOWED に理由を書いてある)。
+    """
 
     def __init__(self, tmp_path):
         super().__init__(tmp_path)
         shutil.copytree(CONFIG_DIR, self.root / "config")
+        (self.root / "hooks").mkdir(parents=True, exist_ok=True)
+        shutil.copy2(REPO / "hooks" / "lib_skill_perms.py", self.root / "hooks" / "lib_skill_perms.py")
 
     def mark_required(self):
         path = self.queue / "missions" / MISSION / "mission.yaml"
@@ -190,11 +200,28 @@ def _perms(tmp_path, body):
     return str(path)
 
 
+# t088 (PR#236 7巡目 P2): allow/deny を空のままにしていた旧 PERMS は、判定が
+# `can_produce_deliverable` の宣言だけを見ていた頃の名残 — hook (`check_permission()`) に
+# 判定を委譲するようになった今、空の allow/deny では何も deny されず、research/review の
+# 「作れない」を実際に再現できない。実 config (`config/skill-permissions.yaml`) の
+# research / review / code / docs の allow/deny を縮めて写す (deny が allow より先に効く
+# ことを確かめるテストが意味を持つように)。
 PERMS = (
-    "  code:\n    allow: []\n    deny: []\n"
-    "  docs:\n    can_produce_deliverable: true\n    allow: []\n    deny: []\n"
-    "  research:\n    can_produce_deliverable: false\n    allow: []\n    deny: []\n"
-    "  review:\n    can_produce_deliverable: false   # 読むだけ\n    allow: []\n    deny: []\n"
+    "  code:\n"
+    "    allow: [Edit, Write, MultiEdit, \"Bash(git *)\"]\n"
+    "    deny: []\n"
+    "  docs:\n"
+    "    can_produce_deliverable: true\n"
+    "    allow: [Edit, Write, MultiEdit, \"Bash(git *)\"]\n"
+    "    deny: []\n"
+    "  research:\n"
+    "    can_produce_deliverable: false\n"
+    "    allow: []\n"
+    "    deny: [Edit, Write, MultiEdit, \"Bash(git push *)\"]\n"
+    "  review:\n"
+    "    can_produce_deliverable: false   # 読むだけ\n"
+    "    allow: []\n"
+    "    deny: [Edit, Write, MultiEdit]\n"
 )
 
 
@@ -218,12 +245,25 @@ class TestCheckDeliverable:
     @pytest.mark.parametrize("skills", [["research"], ["review"], ["research", "review"]])
     def test_a_deliverable_with_only_non_producing_skills_fails(self, perms, declared, skills):
         fails = _fails(lint_plan.check_deliverable([_t(declared, skills)], perms))
-        assert len(fails) == 1 and "t001" in fails[0] and "can_produce_deliverable" in fails[0], fails
+        assert len(fails) == 1 and "t001" in fails[0] and "拒否されています" in fails[0], fails
 
     @pytest.mark.parametrize("declared", ["pr", "file"])
-    @pytest.mark.parametrize("skills", [["code"], ["docs"], ["research", "code"], ["review", "docs"]])
-    def test_one_producing_skill_is_enough(self, perms, declared, skills):
+    @pytest.mark.parametrize("skills", [["code"], ["docs"]])
+    def test_a_lone_producing_skill_is_enough(self, perms, declared, skills):
         assert lint_plan.check_deliverable([_t(declared, skills)], perms) == []
+
+    @pytest.mark.parametrize("declared", ["pr", "file"])
+    @pytest.mark.parametrize("skills", [["research", "code"], ["review", "docs"]])
+    def test_a_denying_skill_mixed_in_still_fails(self, perms, declared, skills):
+        """t088 (PR#236 7巡目 P2): 「1 つでも can_produce_deliverable: true な skill が
+        あれば作れる」という宣言の集計 (旧実装) は、hook (`check_permission()`) が
+        skill の deny の和を allow より先に union で適用することを見ていなかった。
+        research / review の deny が code / docs の allow より勝つので、Write/Edit は
+        実際には拒否されたまま —— 旧実装はこの組み合わせを誤って通していた
+        (このテストを欠陥版に戻すと緑になる。tests/red_proof_t013.sh case D 参照)。
+        """
+        fails = _fails(lint_plan.check_deliverable([_t(declared, skills)], perms))
+        assert len(fails) == 1 and "t001" in fails[0] and "拒否されています" in fails[0], fails
 
     def test_none_needs_no_writer(self, perms):
         assert lint_plan.check_deliverable([_t("none", ["research"])], perms) == []
@@ -325,6 +365,75 @@ class TestCheckDeliverable:
         assert lint_plan.check_deliverable([_t("pr")], perms, required_problem="boom") == []
         fails = _fails(lint_plan.check_deliverable([_t()], perms, required_problem="boom"))
         assert len(fails) == 1 and "boom" in fails[0], fails
+
+
+# ---------------------------------------------------------------------------
+# 3a2. lint の判定が check_permission() の答えと全件一致することの実証
+# (t088 / PR#236 7巡目 P2 の受入条件「一致の実証」)
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(scope="module")
+def hook_module():
+    sys.path.insert(0, str(REPO / "hooks"))
+    import lib_skill_perms
+    return lib_skill_perms
+
+
+@pytest.fixture(scope="module")
+def hook_config(hook_module):
+    return hook_module.load_config(str(CONFIG_DIR / "skill-permissions.yaml"))
+
+
+@pytest.fixture(scope="module")
+def all_skills(hook_config):
+    skills = sorted(hook_config["skills"])
+    assert skills, "config/skill-permissions.yaml に skill が無い"
+    return skills
+
+
+class TestLintMatchesHookPermissionExhaustively:
+    """`config/skill-permissions.yaml` の全 skill から 1〜2 個の組み合わせを網羅的に生成し、
+    `check_deliverable()` (lint) の可否判定が、`hooks/lib_skill_perms.py` の
+    `check_permission()` をこのテストが**独立に**同じ signature (`lint_plan._WRITE_TOOL_SIGS` /
+    `lint_plan._PUSH_TOOL_SIG`) で直接呼んだ答えと、常に一致することを確かめる。
+
+    これは「lint が check_permission() の答えだけで決まっている (宣言の別集計を混ぜていない)」
+    ことの実証であって、hook の allow/deny 規則自体をここで書き写しているわけではない —
+    どちらの側も `check_permission()` を **呼ぶ** だけ (このテストが自分で fnmatch や
+    deny-before-allow の判定をすると、テスト自身が回帰の留め金にならない — 期待値をテスト内に
+    再実装しない、という規約に反する)。
+    """
+
+    def _hook_says_can_produce(self, hook_module, hook_config, skills, declared):
+        skills_csv = ",".join(skills)
+        write_ok = any(
+            hook_module.check_permission(hook_config, skills_csv, sig)["decision"] != "deny"
+            for sig in lint_plan._WRITE_TOOL_SIGS
+        )
+        if not write_ok:
+            return False
+        if declared == "pr":
+            push = hook_module.check_permission(hook_config, skills_csv, lint_plan._PUSH_TOOL_SIG)
+            if push["decision"] == "deny":
+                return False
+        return True
+
+    @pytest.mark.parametrize("declared", ["pr", "file"])
+    def test_every_1_or_2_skill_combination_matches_check_permission(
+        self, hook_module, hook_config, all_skills, declared,
+    ):
+        import itertools
+        combos = list(itertools.combinations(all_skills, 1)) + list(itertools.combinations(all_skills, 2))
+        skill_permissions_path = str(CONFIG_DIR / "skill-permissions.yaml")
+        mismatches = []
+        for skills in combos:
+            task = _t(declared, list(skills))
+            fails = _fails(lint_plan.check_deliverable([task], skill_permissions_path))
+            lint_can_produce = not fails
+            hook_can_produce = self._hook_says_can_produce(hook_module, hook_config, list(skills), declared)
+            if lint_can_produce != hook_can_produce:
+                mismatches.append((skills, declared, "lint=%s hook=%s" % (lint_can_produce, hook_can_produce)))
+        assert not mismatches, mismatches
 
 
 # ---------------------------------------------------------------------------
@@ -622,11 +731,18 @@ class TestLintThroughThePlanShEntry:
                 sb.mark_required()
             r = sb.lint()
             assert r.returncode == 1, (marked, r.stdout, r.stderr)
-            assert "can_produce_deliverable: false" in r.stdout
+            assert "拒否されています" in r.stdout and "research" in r.stdout
 
-    def test_a_mixed_skill_list_passes(self, sb):
+    def test_a_mixed_skill_list_with_a_denying_skill_fails(self, sb):
+        """t088 (PR#236 7巡目 P2): `research` の deny が `code` の allow より先に効くため、
+        [research, code] は実際には Write/Edit を作れない —— 以前の実装 (宣言の
+        `can_produce_deliverable` の集計で「1 つでも true なら作れる」) はこれを見逃し、
+        lint を誤って通していた (このテストを欠陥版に戻すと緑になる)。
+        """
         sb.card("t001", skills="[research, code]", extra=["deliverable: pr"])
-        assert sb.lint().returncode == 0
+        r = sb.lint()
+        assert r.returncode == 1, (r.stdout, r.stderr)
+        assert "拒否されています" in r.stdout
 
     def test_the_review_pre_step_uses_the_same_rule(self, sb):
         """`plan.sh review` は lint を前段に走らせる (FAIL は revise 扱い)。同じ関数を通ることを確かめる。"""

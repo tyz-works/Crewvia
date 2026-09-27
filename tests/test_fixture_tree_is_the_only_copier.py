@@ -57,6 +57,9 @@ ALLOWED: dict[str, str] = {
         "CI に載っていない手動の e2e",
     "scripts/test_main_repo_git_guard.sh":
         "`hooks/lib_main_repo_git_guard.py` (hooks/ の 1 ファイル) を写す。scripts/lib_* ではない",
+    "tests/test_task_deliverable.py":
+        "`hooks/lib_skill_perms.py` (hooks/ の 1 ファイル) を写す。scripts/lib_* ではない — "
+        "`check_deliverable()` が check_permission() を直接呼ぶための入口 (t088)",
 }
 
 

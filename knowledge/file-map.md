@@ -343,6 +343,16 @@ busy 扱い**（`start.sh` が「already running」と言うのは 10 だけ）�
 （`_guard_test_isolation`。t025 の実測: 環境変数なしなら本番の Director に実際にキーが届く）
 ので、試すときは必ず自分が起動した Worker の pane に向けること
 
+### `lib_pane_process.py`
+
+mux ペインのプロセス木の分類（`classify_process_tree()` → `executing` / `idle_process` /
+`no_process`）の唯一の定義（B1 / #27。watchdog.py から移設）。読むのは `/proc` だけ。
+**「ペインの裏で何かが走っているか」の答えはここ 1 つ**で、watchdog の idle 判定と
+dispatcher の Rule 5 が共有する。分類するだけで判定しない — 「殺してよいか」「通知してよいか」は
+呼び出し側が自分の fail の向きで決める。裏の shell・Monitor も前景のツールも `executing`
+（claude の直下に後から `bash -c` が生える）。設計・実測・戻し方:
+`knowledge/watchdog-idle-judgment.md` §7
+
 ### `lib_worker_target.py`
 
 Worker が起動された `TARGET_DIR` の記録の唯一の定義（t009 / #21。書き手 `start.sh`・

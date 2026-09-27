@@ -49,6 +49,10 @@ lib ごとの**破ってはいけない契約**の要約。理由・経緯・全
 - codex-review の差分 300KB 超の拒否は `registry/daemons/review-refusals/<mission>__<task>.json` に記録し
   （`lib_review_refusal.py` が唯一の定義）、dispatcher は記録がある間 spawn しない。記録が読めない・
   欄の値が不正なら保留。
+- Rule 5 (idle-with-task) は、`run_in_background` の shell / Monitor が生きている Worker には送らない。
+  「ペインの裏で何かが走っているか」は `lib_pane_process.classify_process_tree()` の 1 か所
+  （watchdog の idle 判定と共有）。**観測できないときは通知する側**、watchdog は殺さない側
+  （判定ごとに向きが違う）。裏で止まった job は watchdog の max が拾う（`knowledge/watchdog-idle-judgment.md` §7）。
 - 台帳・拒否記録は**消してよい**（無い = 再通知 / 拒否されていない）。通知が届かない・review が動かないときの
   手当てはそのファイルを消すこと（dispatcher の再起動は不要。`knowledge/notify-once.md`「戻し方」）。
 

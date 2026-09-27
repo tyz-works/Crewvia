@@ -62,8 +62,12 @@ cp "$SRC_DIR/scripts/watchdog.py" "$ROOT/scripts/watchdog.py"
 sed -i \
   -e 's/^TERMINATE_GRACE_PERIOD = .*/TERMINATE_GRACE_PERIOD = 2/' \
   -e 's/^KILL_DELAY = .*/KILL_DELAY = 1/' \
-  -e 's/^PROCESS_WORK_START_GRACE = .*/PROCESS_WORK_START_GRACE = 1/' \
   "$ROOT/scripts/watchdog.py"
+
+# B1 (#27): プロセス層の分類は lib_pane_process.py に移った (PROCESS_WORK_START_GRACE もそこ)。
+cp "$SRC_DIR/scripts/lib_pane_process.py" "$ROOT/scripts/lib_pane_process.py"
+sed -i -e 's/^PROCESS_WORK_START_GRACE = .*/PROCESS_WORK_START_GRACE = 1/' \
+  "$ROOT/scripts/lib_pane_process.py"
 
 # 偽 lib_mux — 本番 backend には触れない
 cat_fake_mux() {

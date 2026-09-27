@@ -155,6 +155,9 @@ from lib_daemon_state import (  # noqa: E402
 # 判定 (t009 / #21)。定義はこのモジュールに 1 つだけ (`plan.sh pull` の target 照合と
 # 同じ正規形)。ここに Worker と task の target_dir の比較を書き戻さないこと。
 import lib_worker_target as _worker_target  # noqa: E402
+# 「ペインの裏で何かが走っているか」の定義 (watchdog の idle 判定と共有、B1 / #27)。
+# ここで /proc を読む分類を書き足さないこと — 2 か所に置くと答えが割れる。
+from lib_pane_process import classify_process_tree  # noqa: E402
 _mux = Mux()
 
 # t002: who may end a Worker process.  'watchdog' (default) = this daemon only
@@ -1465,12 +1468,42 @@ def _save_state_entry(name: str, state: str, since: float) -> None:
         log(f'WARNING: cannot write state entry for {name!r}: {e}')
 
 
+def worker_has_background_work(target: str) -> bool:
+    """True iff this Worker's pane has a tool / background job running under claude.
+
+    B1 (#27): `run_in_background` の shell と Monitor は、生きている間 herdr の
+    agent_status を `idle` / `done` にする (2026-09-27 実測: 裏の `sleep` が生きている
+    50 秒間ずっと `done`、画面末尾は `1 shell` / `1 monitor`)。ツール呼び出しが止まる
+    ので当然だが、Worker は待っているだけで停止していない。同じ瞬間、claude の直下には
+    `bash -c ...` が生えていて、watchdog の idle 判定 (`classify_process_tree`) は
+    `executing` と読む。**同じ定義を共有する** — 別の判定を dispatcher に置かない。
+
+    倒す向き (この判定は**通知**を止める側): 観測できない (`unknown` / pane pid が
+    引けない / 例外) ときは False = 従来どおり通知する。誤って True にすると詰まった
+    Worker の通知が黙るが、False の誤りは Director に 1 通余計に届くだけ。watchdog は
+    逆向き (`unknown` は殺さない) — 殺す側の誤りの方が高くつくから、判定ごとに向きが違う。
+    """
+    try:
+        pane_pid = _mux.pid(target)
+        if pane_pid is None:
+            return False
+        return classify_process_tree(pane_pid) == 'executing'
+    except Exception as e:  # 観測失敗 → 通知する側に倒す。黙って True にしない
+        log(f'WARNING: Rule 5 — cannot classify pane process tree for {target!r}: {e!r}')
+        return False
+
+
 def check_rule5(name: str, target: str, assignment_file: Path, task_statuses_by_mission: dict,
                 waits_on_director: bool = False) -> None:
     """Rule 5: detect blocked / idle-with-task and notify Director.
 
     A: state == "blocked"
     B: state in {"idle", "done"} AND assignment_file exists
+       AND no tool / background job (run_in_background shell, Monitor) is running in
+       the pane — such a Worker is waiting, not stopped (B1 / #27).  It is treated as
+       'working': dedup keys cleared, grace timer restarted, so once the job ends the
+       grace period counts from then.  A job that never ends is bounded by
+       watchdog's absolute max, not by this rule.
 
     State is persisted to registry/mux/<name>.state.json for grace tracking.
     Notifications are deduped via the standard NOTIFY_TTL cache.
@@ -1495,6 +1528,12 @@ def check_rule5(name: str, target: str, assignment_file: Path, task_statuses_by_
     # tmux_list_worker_windows) so the label lookup succeeds.  Using `name`
     # always returns 'unknown' (pane not found) and silently disables Rule 5.
     st = _mux.state(target)
+
+    # B1 (#27): idle/done with a live background job is 'working' for Rule 5.
+    # Only condition B (assignment exists) is affected — 'blocked' still notifies.
+    # The /proc scan runs only for the idle-with-assignment case.
+    if st in ('idle', 'done') and assignment_file.exists() and worker_has_background_work(target):
+        st = 'working'
 
     # unknown / working → no action.  tmux always returns unknown → skip.
     if st in ('unknown', 'working'):

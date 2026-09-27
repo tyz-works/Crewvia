@@ -235,3 +235,69 @@ dispatcher はとっくに `logs/dispatcher/` の日次ファイルへ移行し�
 kill + respawn する。今回の変更は watchdog.py 単独で閉じており dispatcher 側の
 変更を伴わないため、`knowledge/daemon-authority.md` §5-3 が求める
 「両デーモン同時 respawn」には該当しない (kill 権限の移譲は t002)。
+
+## 7. 裏の shell / monitor は「止まっている」ではない (B1 / #27, 2026-09-27)
+
+長いテストを `run_in_background` / Monitor で待つ Worker は、待っているあいだツールを呼ばない。
+dispatcher の Rule 5 は herdr の agent_status だけを見ていたので、これを止まっていると読んで
+`[Rule 5] idle-with-task` を約 2 分おきに Director へ送り続けた (mission 20260926-mechanize-guards-a
+では Director が手でツールを 1 回使わせて回避した)。
+
+### 実測 (自分の pane。読み取りのみ)
+
+| 状況 | herdr `agent_status` | 画面末尾 | claude の直下 | `classify_process_tree(pane_pid)` |
+|---|---|---|---|---|
+| `run_in_background` の `sleep` が生存 | **`idle`** | `1 shell` | `bash -c ... eval 'sleep 300'` | **`executing`** (50 秒間ずっと) |
+| Monitor が生存 (出力なしで 120 秒) | **`done`** | `1 monitor` | `bash -c ...` | `executing` |
+| どちらも終了 | `working` に戻る (次のツールで) | — | MCP の `npm exec` だけ | `idle_process` |
+
+- agent_status は `idle` / `done` — **どちらも Rule 5 の条件 B (`st in (idle, done)` + assignment) に当たる**。
+- 根拠に選んだのはプロセス木。画面末尾の `N shell(s)` / `N monitor(s)` は claude の表示文言で、
+  版で変わりうる。プロセス木は watchdog が t016 から使っている信号と同じで、shell と Monitor の
+  両方が同じ形 (claude の直下に後から生える `bash -c`) で見える。
+- 前景のツール実行と裏の job は木の形が同じ (どちらも `bash -c`)。区別する必要は無い —
+  どちらも「Worker は待っているだけで止まっていない」。
+
+### 変更
+
+- `classify_process_tree()` を `scripts/lib_pane_process.py` に移した (watchdog.py にあったものを
+  そのまま。分類の定義は 1 か所)。watchdog.py は import して使う。挙動は変えていない。
+- dispatcher の Rule 5 (`check_rule5()`): 条件 B (idle/done + assignment) のとき、
+  `worker_has_background_work()` が真なら **`working` 扱い** (通知済みの印を外し、state entry の
+  grace を測り直す)。job が終わったあとの grace は終わった時点から数える。`blocked` (承認・質問待ち)
+  は裏の job があっても通知する (待っているのは人間)。/proc の走査は条件 B のときだけ。
+- watchdog は**変更なし**: プロセス層 (§3) が既に hard idle を `warn / hard_idle_but_executing` に
+  落とす。実プロセス木を通した回帰テストと、上限 (max) が裏の job があっても効くテストを足した。
+
+### fail の向き — 判定ごとに違う (memory: fail-direction-is-per-judgment)
+
+| 判定 | 観測できない (`unknown` / pane pid が引けない / 例外 / `no_process`) | 理由 |
+|---|---|---|
+| Rule 5 の「裏の job あり」 | **通知する** (= 従来どおり) | 黙る誤りは詰まった Worker を隠す。通知する誤りは Director に 1 通余計に届くだけ。例外は WARNING を残す |
+| watchdog の hard idle | **殺さない** (`hard_idle_but_process_unknown` → warn) | 殺す誤りは取り返せない (§3) |
+
+### 上限 — 裏で永久に止まった job
+
+Rule 5 は裏の job がある限り黙るので、job が終わらない Worker を通知では拾えない。
+拾うのは watchdog の絶対上限 (`max`) — **裏の job があっても効く** (`check_detail()` の 1 番目。
+プロセス層では抑制しない)。frontmatter の `timeout.max` を大きくした task は、その分だけ
+Rule 5 の通知も遅れる。
+
+### 戻し方
+
+デーモンの挙動を変える (dispatcher の Rule 5 と、watchdog の import 元)。共有規則なので env の
+停止スイッチは付けていない。戻すときは **PR を revert → 主 checkout を
+`git merge --ff-only origin/main` → `python3 scripts/lib_daemon_watch.py restart dispatcher` と
+`... restart watchdog`** (merge しただけでは動いている daemon は古いコードのまま。
+`knowledge/dispatcher-restart-after-merge.md`)。戻すと Rule 5 は再び agent_status だけを見る
+(裏の job 待ちの Worker に idle-with-task が届く)。watchdog の挙動は戻しても変わらない。
+
+### 検証
+
+- `tests/test_background_work_is_not_idle.py` — 実プロセス木 (本物の sh の親子) + 本物の
+  dispatcher.sh 埋め込み python の `check_rule5()` + 本物の `WorkerMonitor.check_detail()`。
+  差し替えるのは mux (状態と pane pid) だけ。
+- `tests/red_proof_b1_background_work.sh` — 欠陥を 10 通り注入して全部赤になることを確かめる。
+- `tests/watchdog-idle-e2e.sh` は手動・CI 外で、対照実験が origin/main の watchdog を読むため
+  もう本来の意味を持たない (先に古くなっていた)。lib 移設に合わせて `PROCESS_WORK_START_GRACE` の
+  書換先だけ追従させた。

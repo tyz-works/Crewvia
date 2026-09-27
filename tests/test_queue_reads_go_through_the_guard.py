@@ -349,6 +349,8 @@ AUDITED_MODULES = [
     "lib_review_refusal.py",
     # t009: Worker の TARGET_DIR の記録。読み取りは lib_daemon_state.load_json_store の入口 1 つ。
     "lib_worker_target.py",
+    # B1 (#27): ペインのプロセス木の分類。watchdog.py から移した。読むのは /proc だけ。
+    "lib_pane_process.py",
 ]
 
 #: (モジュール, 関数, ソースの断片) → なぜガードを通さなくてよいか。
@@ -358,7 +360,7 @@ AUDITED_MODULES = [
 #: 判断することになる。
 ALLOWED_DIRECT_READS = {
     # -- crewvia のファイルではない: /proc ---------------------------------
-    ("watchdog.py", "_proc_stat", 'Path(f"/proc/{pid}/stat").read_text()'):
+    ("lib_pane_process.py", "_proc_stat", 'Path(f"/proc/{pid}/stat").read_text()'):
         "/proc は procfs。FIFO にも通常ファイルにも置き換えられない",
     ("lib_retirement.py", "process_alive",
      'Path(f"/proc/{pid}/stat").read_text()'):

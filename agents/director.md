@@ -127,8 +127,12 @@ Dispatcher が Worker にタスクを割り当て・進行管理する（自動�
   ↓
 Dispatcher から通知を受け取る:
   「要求スキル [...] の Worker を起動してください」→ §16 参照
-  「全ミッション完了」→ plan.sh archive <slug> で退避 → ユーザーへ報告
+  「全ミッション完了」→ plan.sh archive <slug> で退避 → ログ保存（下記）→ ユーザーへ報告
 ```
+
+**mission 完了時のログ保存**: `plan.sh archive <slug>` の**後**に `./scripts/log_to_obsidian.sh --mission <slug>` を実行し、
+`~/obsidian/research/mission_log/YYYY-MM-DD_<slug>.md` ができたことを確認してからユーザーへ報告する
+（作られていなければ報告に「ログ未保存」と書く）。
 
 複数 mission を並走させる場合は、各 mission に対してこのフローを独立に回す。Workers は **active 全 mission を priority 優先で横断的に pull する**（同一優先度のタイブレークは default mission 優先 → 末尾は task id 順）。つまり緊急 mission の `high` タスクは、default mission の `medium` タスクよりも先に消化される。同一優先度の中では default mission に積んだ順から消化されるので、ルーティン作業とアドホックを `default` / `非default` に分けると整理しやすい。
 

@@ -132,12 +132,21 @@ def snapshot() -> set[int]:
 
 
 def pidfd_supported() -> bool:
-    """`os.pidfd_open` が**このカーネルで実際に動くか** (関数として存在するだけでは分からない)。
+    """`os.pidfd_open` と `signal.pidfd_send_signal` が**このカーネルで実際に動くか**
+    (関数として存在するだけでは分からない。そもそも属性として存在しない環境もある)。
+
+    `hasattr` を先に見ないと、この関数自体が `pytest.mark.skipif` の引数として
+    **収集の段階で**評価されるモジュール (`test_leaked_descendants_guard.py` /
+    `test_leak_guard_self_preservation.py`) で `AttributeError` を投げ、`/proc` が
+    無い場合の skip マークが効く前に収集そのものを落とす (3巡目 codex review finding 1)。
+    属性が無ければ `except OSError` は捕まえない。
 
     Python は Linux 以外でも `os.pidfd_open` を定義しうるし、対応カーネル (5.3+) でなければ
     `OSError` (ENOSYS 等) になる。動かない環境で `install()` が黙っていると、「検出はするが
     kill フォールバックを廃止したので実際には殺せない」という族C の劣化状態に誰も気づけない。
     """
+    if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
+        return False
     try:
         fd = os.pidfd_open(os.getpid())
     except OSError:
@@ -157,7 +166,14 @@ def _open_pidfd_verified(pid: int, expected_start: int) -> int | None:
     `expected_start` と食い違えば、その pid は既に再利用されているので束縛を捨てて
     `None` を返す (kill_all はこれを「束縛できなかった」として扱い、pid 番号への
     フォールバックはしない —— 観測失敗を許可に倒さない)。
+
+    `os.pidfd_open` が属性として無い環境 (macOS 等) では `except OSError` は
+    `AttributeError` を捕まえない。ここは `scan()` から**無条件に**呼ばれる
+    (pidfd_supported() のチェックを経由しない) ので、属性が無ければ「束縛できなかった」
+    と同じ `None` を返して fail closed のまま抜ける (族A: 使えない → kill しない、を維持)。
     """
+    if not hasattr(os, "pidfd_open"):
+        return None
     try:
         fd = os.pidfd_open(pid)
     except OSError:

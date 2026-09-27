@@ -289,3 +289,41 @@ def test_kill_all_closes_the_pidfds_it_was_given():
     assert survivor.pidfd is None, "kill_all の後も pidfd が開いたままになっている"
     with pytest.raises(OSError):
         os.close(fd)   # 既に閉じられているはず (二重 close は EBADF)
+
+
+# --- finding 1 (3巡目 codex review): pidfd API が属性として無い環境 -----------------------
+#
+# `os.pidfd_open` / `signal.pidfd_send_signal` は Linux 5.3+ / Python 3.9+ でしか属性として
+# 存在しない。以下は monkeypatch で「属性そのものが無い」を直接模し、**本物のシグナルは
+# 送らない**まま fail closed (None / False を返すだけで例外を漏らさない) を固定する。
+# 「収集の段階で pytest.mark.skipif が評価されて落ちる」方の回帰は
+# `tests/red_proof_t047.sh` の case G (PID 名前空間の中で `os.pidfd_open` を実際に
+# 属性として消してから pytest を起動する) が担う —— この 2 本はその補完で、通常の
+# pytest 実行に混ざって毎回走る安い回帰。
+
+
+def test_pidfd_supported_returns_false_without_raising_when_os_pidfd_open_is_absent(monkeypatch):
+    """`os.pidfd_open` が属性として無くても `pidfd_supported()` は `False` を返すだけで済む。"""
+    monkeypatch.delattr(os, "pidfd_open", raising=False)
+    assert guard.pidfd_supported() is False
+
+
+def test_pidfd_supported_returns_false_without_raising_when_signal_pidfd_send_signal_is_absent(monkeypatch):
+    """`signal.pidfd_send_signal` が属性として無くても `pidfd_supported()` は `False` を返すだけで済む。
+
+    `os.pidfd_open` だけあっても、送る手段 (`signal.pidfd_send_signal`) が無ければ実際には
+    殺せない —— 「使えない」の判定は両方の属性を要求する。
+    """
+    monkeypatch.delattr(signal, "pidfd_send_signal", raising=False)
+    assert guard.pidfd_supported() is False
+
+
+def test_open_pidfd_verified_returns_none_without_raising_when_os_pidfd_open_is_absent(monkeypatch):
+    """`_open_pidfd_verified` は `pidfd_supported()` を経由せず `scan()` から無条件に呼ばれる。
+
+    `os.pidfd_open` が属性として無い環境でここが `AttributeError` を漏らすと `scan()` ごと
+    落ちる (`except OSError` は `AttributeError` を捕まえない)。属性が無ければ「束縛できな
+    かった」と同じ `None` を返し、fail closed のまま抜けることを固定する (族A)。
+    """
+    monkeypatch.delattr(os, "pidfd_open", raising=False)
+    assert guard._open_pidfd_verified(os.getpid(), expected_start=0) is None

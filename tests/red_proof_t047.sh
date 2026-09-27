@@ -98,15 +98,49 @@ run_py() {  # run_py <pytest の引数...> — PID 名前空間の中で走ら�
             # このセッションの env はそのまま使う (名前空間の中の /proc の実プロセスを見る必要が
             # あるため env -i にはしない —— 名前空間の外はどのみち見えない)。
             #
-            # pytest を名前空間の PID1 に**しない** (`sh -c '…; :'` で必ず fork させ、sh を
-            # PID1 のまま残す)。対象テストのうち `test_ancestors_and_self_are_refused` /
+            # pytest を名前空間の PID1 に**しない** (`sh -c '… ; ec=$?; exit "$ec"'` で必ず
+            # fork させ、sh を PID1 のまま残す)。対象テストのうち `test_ancestors_and_self_are_refused` /
             # `test_broken_predicate_refuses_the_dangerous_targets` は「pytest に祖先が
             # 1 つ以上見える」ことを前提にしており (PID1 には祖先が無い)、素の
             # `"${NS_CMD[@]}" python3 -m pytest …` だと pytest 自身が PID1 になって
-            # 両方とも前提が崩れて red proof 自体が赤くなる (「; :」の直後の command が
+            # 両方とも前提が崩れて red proof 自体が赤くなる (pytest の直後に別コマンドが
             # あるので shell の tail-call 最適化で sh が python3 に化けることもない)。
+            #
+            # ただし `ec=$?; exit "$ec"` で pytest の**実際の**終了コードを sh -c 自身の
+            # 終了コードとして持ち帰る (3巡目 codex review finding 2)。旧実装は `; :` で
+            # 終えており、`:` は常に 0 を返すので run_py の呼び出し元は「N passed, 1 error」
+            # のような、`N failed` の行が出ず passed 件数だけが並ぶ teardown/sessionfinish
+            # の非 0 終了コードを検知できなかった (exit-code-through-a-pipe-is-not-the-suite-s
+            # と同じ型)。
+    ( cd "$TREE" && PYTHONDONTWRITEBYTECODE=1 "${NS_CMD[@]}" \
+        sh -c 'python3 -m pytest -q -p no:cacheprovider "$@"; ec=$?; exit "$ec"' sh "$@" 2>&1 )
+}
+
+run_py_swallowing_exit_code() {  # case H 専用の比較対象。finding 2 の欠陥そのもの (旧実装) を
+                                  # そのまま再現するだけの関数 —— 本番の run_py はこの形に戻さない。
     ( cd "$TREE" && PYTHONDONTWRITEBYTECODE=1 "${NS_CMD[@]}" \
         sh -c 'python3 -m pytest -q -p no:cacheprovider "$@"; :' sh "$@" 2>&1 )
+}
+
+# case G 専用のランナー。`del os.pidfd_open` を pytest がテストモジュールを import するより
+# **前**に行うことで、「属性として存在しない環境」を Linux 上でも直接模す (実 OS 差し替えは
+# 不要 —— os モジュールはプロセス内シングルトンなので、この 1 プロセスの中では以降
+# `hasattr(os, "pidfd_open")` も `os.pidfd_open(...)` も無い環境と同じに振る舞う)。
+NO_PIDFD_RUNNER="$WORK/run_without_pidfd_open.py"
+cat > "$NO_PIDFD_RUNNER" <<'PY'
+import os, sys
+if hasattr(os, "pidfd_open"):
+    del os.pidfd_open
+import pytest
+sys.exit(pytest.main(sys.argv[1:]))
+PY
+
+run_py_without_pidfd_open() {  # case G: os.pidfd_open が属性として無い環境を模して起動する (finding 1)。
+                                # `${@:2}` は bash 専用のスライス構文で、ここで起動する `sh`
+                                # (dash) には無く `Bad substitution` になる。`shift` で POSIX に。
+    ( cd "$TREE" && PYTHONDONTWRITEBYTECODE=1 "${NS_CMD[@]}" \
+        sh -c 'runner="$1"; shift; python3 "$runner" -q -p no:cacheprovider "$@"; ec=$?; exit "$ec"' \
+        sh "$NO_PIDFD_RUNNER" "$@" 2>&1 )
 }
 TESTS=(tests/test_leaked_descendants_guard.py tests/test_leak_guard_self_preservation.py)
 
@@ -119,9 +153,14 @@ expect_red() {  # expect_red <case名> <赤になるはずのテスト名の断�
 
 fresh_copy
 echo "== baseline"
-out="$(run_py "${TESTS[@]}")"
-if echo "$out" | grep -q " passed" && ! echo "$out" | grep -qE "[0-9]+ failed"; then ok "baseline は緑"
-else ng "baseline が緑でない"; echo "$out" | tail -20; fi
+out="$(run_py "${TESTS[@]}")"; rc=$?
+# 終了コード 0 を必須にする (finding 2)。`N passed, 1 error` のように passed 件数だけが
+# 出て `N failed` の行が無いまま非 0 で終わるケースを、文字列一致だけでは緑と誤認する。
+if [ "$rc" -eq 0 ] && echo "$out" | grep -q " passed" && ! echo "$out" | grep -qE "[0-9]+ failed"; then
+  ok "baseline は緑 (exit=$rc)"
+else
+  ng "baseline が緑でない (exit=$rc)"; echo "$out" | tail -20
+fi
 
 echo "== case A1: cmdline の一致が前の境界を見ない (別ディレクトリの接頭辞誤認に戻す)"
 fresh_copy
@@ -265,6 +304,73 @@ inject tests/leaked_descendants.py \
 "    signal.pidfd_send_signal(survivor.pidfd, sig)" \
 "    os.kill(survivor.pid, sig)"
 expect_red "case F" "test_default_kill_sends_only_through_the_pidfd_never_by_bare_pid"
+
+echo "== case G (fix): os.pidfd_open が属性として無い環境でも収集は落ちず skip になる (3巡目 finding 1)"
+fresh_copy
+out="$(run_py_without_pidfd_open "${TESTS[@]}")"; rc=$?
+# 「このカーネルは pidfd_open が使えない」の警告文自体が "ERROR" という語を含む (install() が
+# 意図して出す想定内の文言) ので、粗い `grep -qi error` はこの警告に誤爆する。pytest の
+# サマリ行が実際に出す `N error(s)` の形だけを見る。
+if [ "$rc" -eq 0 ] && echo "$out" | grep -qE "[0-9]+ skipped" && ! echo "$out" | grep -qE "[0-9]+ error"; then
+  ok "case G (fix) → os.pidfd_open 不在でも skip として緑 (exit=$rc)"
+else
+  ng "case G (fix) → os.pidfd_open 不在で壊れた (exit=$rc)"; echo "$out" | tail -20
+fi
+
+echo "== case G (defect): hasattr 保護を外すと os.pidfd_open 不在で収集失敗になる"
+fresh_copy
+inject tests/leaked_descendants.py \
+"    if not hasattr(os, \"pidfd_open\") or not hasattr(signal, \"pidfd_send_signal\"):
+        return False
+    try:
+        fd = os.pidfd_open(os.getpid())" \
+"    try:
+        fd = os.pidfd_open(os.getpid())"
+out="$(run_py_without_pidfd_open "${TESTS[@]}")"; rc=$?
+if [ "$rc" -ne 0 ] && echo "$out" | grep -qi "AttributeError"; then
+  ok "case G (defect) → 赤 (AttributeError で収集失敗, exit=$rc)"
+else
+  ng "case G (defect) → 赤にならなかった (exit=$rc)"; echo "$out" | tail -20
+fi
+
+echo "== case H: run_py が pytest の終了コードを捨てると N passed, 1 error を green 扱いしてしまう (3巡目 finding 2)"
+fresh_copy
+LEAK_TEST_REL="tests/red_proof_case_h_leak.py"
+cat > "$TREE/$LEAK_TEST_REL" <<'PY'
+"""case H 専用の使い捨てテスト。red_proof_t047.sh 以外からは呼ばれない。
+
+テスト本体は何もせず合格するが、autouse の LeakGuard フィクスチャが後片付けで見つけた
+子孫プロセスに対して teardown で `pytest.fail` するため、この 1 本は「FAILED」ではなく
+「ERROR」として集計される (`leaked_descendants.LeakGuard._crewvia_no_leaked_descendants` 参照)。
+`N passed, 1 error` (`N failed` の行が無い) を確実に再現する。
+"""
+import subprocess
+
+
+def test_intentionally_leaks_a_child_for_red_proof_case_h():
+    subprocess.Popen(["sleep", "30"])
+PY
+
+out_fixed="$(run_py "$LEAK_TEST_REL")"; rc_fixed=$?
+if echo "$out_fixed" | grep -q " passed" && echo "$out_fixed" | grep -qE "[0-9]+ error" \
+   && ! echo "$out_fixed" | grep -qE "[0-9]+ failed"; then
+  ok "case H → N passed, 1 error の場面を再現できた"
+else
+  ng "case H → N passed, 1 error を再現できなかった (前提が崩れた)"; echo "$out_fixed" | tail -20
+fi
+if [ "$rc_fixed" -ne 0 ]; then
+  ok "case H (現行 run_py) → 非0 exit=$rc_fixed で検知できた"
+else
+  ng "case H (現行 run_py) → exit=0 のまま検知できなかった"; echo "$out_fixed" | tail -20
+fi
+
+out_old="$(run_py_swallowing_exit_code "$LEAK_TEST_REL")"; rc_old=$?
+if [ "$rc_old" -eq 0 ]; then
+  ok "case H (旧実装 run_py '; :') → 欠陥を再現: 同じ場面でも exit=0 のまま green に見える"
+else
+  ng "case H (旧実装 run_py '; :') → 欠陥が再現しなかった (前提が崩れた: \$? が本当に捨てられているか要確認)"
+  echo "$out_old" | tail -20
+fi
 
 echo
 echo "PASS=$PASS FAIL=$FAIL"

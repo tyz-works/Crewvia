@@ -424,9 +424,24 @@ class TestMissionMark:
 
     def test_an_unreadable_mission_yaml_is_a_problem_not_a_no(self, tmp_path):
         d = tmp_path / "missions" / "m"
-        (d / "mission.yaml").mkdir(parents=True)          # 通常ファイルでない (IsADirectoryError)
+        (d / "mission.yaml").mkdir(parents=True)          # 通常ファイルでない (ディレクトリ)
         required, problem = lint_plan._mission_requires_deliverable("m", str(tmp_path))
-        assert required is False and problem and "IsADirectoryError" in problem
+        assert required is False and problem and "not a regular file" in problem
+
+    def test_yaml_1_1_style_no_is_a_problem_not_a_silent_false(self, tmp_path):
+        """3 巡目 (t072) の finding 1: `no` を黙って false として受け入れない (欠陥版は
+        (False, None) を返し、この assert が拾う)。"""
+        required, problem = lint_plan._mission_requires_deliverable(
+            "m", self._write(tmp_path, "deliverable_required: no\n"))
+        assert required is False and problem and "true / false" in problem
+
+    def test_a_quoted_key_is_not_silently_ignored(self, tmp_path):
+        """3 巡目 (t072) の finding 2: 引用符付きキーは通常のキーと同じに読める
+        (欠陥版は手書きの `^([\\w-]+):` 正規表現がクォートを弾き、キー自体が丸ごと
+        無視されて (False, None) になる)。"""
+        required, problem = lint_plan._mission_requires_deliverable(
+            "m", self._write(tmp_path, '"deliverable_required": true\n'))
+        assert (required, problem) == (True, None)
 
 
 # ---------------------------------------------------------------------------

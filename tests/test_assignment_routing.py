@@ -652,7 +652,7 @@ class TestLintBlocked:
                                             extra=['blocked_reason: "PR 番号待ち"']))
         import lint_plan
         text = (mdir / "t001.md").read_text()
-        meta, _body = lint_plan._parse_frontmatter(text)
+        meta, _body = lint_plan.lib_task_cards.parse_frontmatter(text)
         assert lint_plan.check_frontmatter([meta]) == []
 
 

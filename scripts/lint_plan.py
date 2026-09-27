@@ -23,85 +23,33 @@ except ImportError:
     yaml = None
 
 
-# ---------------------------------------------------------------------------
-# YAML helpers (minimal — mirrors plan.sh's parse_yaml subset)
-# ---------------------------------------------------------------------------
+def _load_scripts_module(name: str):
+    """Load `scripts/<name>.py` by path, same pattern as plan.sh's own
+    `_load_scripts_module()`.
 
-def _parse_minimal_yaml(text: str) -> dict:
-    """Parse a very narrow YAML subset (scalars, inline lists, block lists/maps)."""
-    lines = text.splitlines()
-    result: dict = {}
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        if not line.strip() or line.lstrip().startswith('#'):
-            i += 1
-            continue
-        m = re.match(r'^([\w-]+):\s*(.*)$', line)
-        if not m:
-            i += 1
-            continue
-        key = m.group(1)
-        val = m.group(2).rstrip()
-        if val == '':
-            i += 1
-            items: list = []
-            sub: dict = {}
-            while i < len(lines):
-                lm = re.match(r'^\s+-\s*(.*)$', lines[i])
-                if lm:
-                    items.append(_scalar(lm.group(1).strip()))
-                    i += 1
-                else:
-                    mm = re.match(r'^  ([\w-]+):\s*(.*)$', lines[i])
-                    if mm:
-                        sub[mm.group(1)] = _scalar(mm.group(2).rstrip())
-                        i += 1
-                    else:
-                        break
-            result[key] = items if items else (sub if sub else None)
-        elif val.startswith('[') and val.endswith(']'):
-            inner = val[1:-1].strip()
-            result[key] = [_scalar(s.strip()) for s in inner.split(',')] if inner else []
-            i += 1
-        else:
-            result[key] = _scalar(val)
-            i += 1
-    return result
+    lint_plan.py is loaded three different ways (plan.sh's `_load_lint_module()`
+    via `importlib.util.spec_from_file_location` from a `python3 -` stdin
+    interpreter whose `sys.path` does *not* include `scripts/`; its own
+    `if __name__ == '__main__':` entry point when run directly; and tests via
+    `sys.path.insert(0, SCRIPTS_DIR); import lint_plan`). Resolving relative to
+    `__file__` works in all three, unlike a plain `import lib_task_cards` that
+    would only work in the last case.
+    """
+    import importlib.util
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    path = os.path.join(script_dir, f'{name}.py')
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
-def _scalar(s: str):
-    if s in ('null', '~', ''):
-        return None
-    if s in ('true', 'yes'):
-        return True
-    if s in ('false', 'no'):
-        return False
-    try:
-        return int(s)
-    except ValueError:
-        pass
-    try:
-        return float(s)
-    except ValueError:
-        pass
-    return s.strip('"\'')
-
-
-def _parse_frontmatter(text: str) -> tuple[dict, str]:
-    lines = text.splitlines()
-    if not lines or lines[0].strip() != '---':
-        raise ValueError("missing frontmatter delimiter")
-    end = None
-    for i in range(1, len(lines)):
-        if lines[i].strip() == '---':
-            end = i
-            break
-    if end is None:
-        raise ValueError("unterminated frontmatter")
-    meta_text = '\n'.join(lines[1:end])
-    body = '\n'.join(lines[end + 1:])
-    return _parse_minimal_yaml(meta_text), body
+# task カード (queue/missions/<slug>/tasks/tNNN.md) の読み取りは、識別子・
+# parser・隔離の規則を持つ唯一の入口 (CLAUDE.md 不変条件 #1)。plan.sh /
+# dispatcher.sh と同じものを読む — lint だけが別の緩い parser で読んでいると、
+# 「lint は OK と言うのに plan.sh は [破損] として保留する」食い違いが起きる
+# (t072 / PR#236 3巡目)。
+lib_task_cards = _load_scripts_module('lib_task_cards')
 
 
 # ---------------------------------------------------------------------------
@@ -223,26 +171,22 @@ def check_dependency_graph(tasks: list[dict]) -> list[tuple[str, str, str]]:
 # ---------------------------------------------------------------------------
 
 def _load_known_skills(skill_permissions_path: str) -> set[str]:
-    """Extract skill names from the 'skills:' section of skill-permissions.yaml."""
-    if not os.path.exists(skill_permissions_path):
+    """`skills:` セクション直下の skill 名の集合。読めない・空・形が不正なら空集合
+    (呼び出し側の `check_skill_alignment` が WARN にする — 「未知の skill 0 件」に
+    見えても実害は無い、という判定なので FAIL にはしない)。
+
+    旧実装は「2 マス下げの `name:` 行」を正規表現で拾う手書きパーサで、
+    コメント付きヘッダ (`skills: # permissions`) で `in_skills` に入れず全滅する
+    族Aの欠陥を t059 の改善提案として残していた (`_load_deliverable_capabilities`
+    と同じ族)。構造的な YAML 読み込みに寄せて解消する。
+    """
+    data, problem = _load_yaml_document(skill_permissions_path)
+    if problem is not None:
         return set()
-    with open(skill_permissions_path) as f:
-        content = f.read()
-    # Find the 'skills:' block and collect top-level keys (2-space indented)
-    in_skills = False
-    known: set[str] = set()
-    for line in content.splitlines():
-        if re.match(r'^skills:\s*$', line):
-            in_skills = True
-            continue
-        if in_skills:
-            # top-level key under skills: block (2-space indent)
-            m = re.match(r'^  ([a-zA-Z_][a-zA-Z0-9_-]*):\s*$', line)
-            if m:
-                known.add(m.group(1))
-            elif line and not line.startswith(' ') and not line.startswith('#'):
-                in_skills = False  # left the skills block
-    return known
+    skills = data.get('skills')
+    if not isinstance(skills, dict):
+        return set()
+    return {name for name in skills if isinstance(name, str)}
 
 
 def check_skill_alignment(tasks: list[dict], skill_permissions_path: str) -> list[tuple[str, str, str]]:
@@ -271,39 +215,28 @@ def check_skill_alignment(tasks: list[dict], skill_permissions_path: str) -> lis
 # ---------------------------------------------------------------------------
 
 def _load_timeout_profiles(timeout_profiles_path: str) -> dict:
-    """Load profiles from timeout-profiles.yaml."""
-    if not os.path.exists(timeout_profiles_path):
+    """`profiles:` セクションの `{name: {idle: int, max: int}}`。読めない・空・
+    形が不正なら空 dict (呼び出し側の `check_timeout_validity` が WARN にする)。
+
+    旧実装は 2 段の手書き状態機械 (2 マス下げでプロファイル名、4 マス下げで
+    `idle`/`max` の数字だけを正規表現で拾う) で、コメント付きヘッダやフロー
+    スタイルを同じ理由で見落としうる族Aの欠陥だった。構造的な読み込みに寄せる。
+    """
+    data, problem = _load_yaml_document(timeout_profiles_path)
+    if problem is not None:
         return {}
-    with open(timeout_profiles_path) as f:
-        content = f.read()
-    # Find 'profiles:' block
-    profiles: dict = {}
-    in_profiles = False
-    current_profile: Optional[str] = None
-    current_data: dict = {}
-    for line in content.splitlines():
-        if re.match(r'^profiles:\s*$', line):
-            in_profiles = True
+    profiles = data.get('profiles')
+    if not isinstance(profiles, dict):
+        return {}
+    result: dict = {}
+    for name, entry in profiles.items():
+        if not isinstance(name, str) or not isinstance(entry, dict):
             continue
-        if not in_profiles:
-            continue
-        # profile name (2-space indent)
-        pm = re.match(r'^  ([a-zA-Z_][a-zA-Z0-9_-]*):\s*$', line)
-        if pm:
-            if current_profile:
-                profiles[current_profile] = current_data
-            current_profile = pm.group(1)
-            current_data = {}
-            continue
-        # profile field (4-space indent)
-        fm = re.match(r'^    (idle|max):\s*(\d+)', line)
-        if fm and current_profile:
-            current_data[fm.group(1)] = int(fm.group(2))
-        elif line and not line.startswith(' ') and not line.startswith('#'):
-            break
-    if current_profile:
-        profiles[current_profile] = current_data
-    return profiles
+        result[name] = {
+            k: v for k, v in entry.items()
+            if k in ('idle', 'max') and isinstance(v, int) and not isinstance(v, bool)
+        }
+    return result
 
 
 def check_timeout_validity(tasks: list[dict], timeout_profiles_path: str) -> list[tuple[str, str, str]]:
@@ -370,17 +303,19 @@ VALID_DELIVERABLES = ('pr', 'file', 'none')
 #: 成果物 (PR / file) を宣言した task にだけ、skills との突き合わせが効く。
 DELIVERABLES_THAT_NEED_A_WRITER = ('pr', 'file')
 
-#: `can_produce_deliverable` は厳密に小文字の `true` / `false` だけを真偽値として認める
-#: (1 巡目 t055 の後も、2 巡目 (t057→t059) でコメント付きヘッダが `current` を前の skill の
-#: まま残す形で同じ族が再発した — この欄をこれ以上正規表現の手当てで直さない。以後は本物の
-#: YAML パーサ (PyYAML) で読む)。既定の YAML 1.1 bool resolver は `yes` / `no` / `on` / `off` /
-#: `True` / `FALSE` 等も暗黙に真偽値へ丸め込むが、それは「はっきりしない綴り」を黙って
-#: true/false のどちらかに倒す挙動であり、この欄が守りたい性質 (曖昧な値は「不正」として
-#: 拒否し、既定の「作れる」側へは絶対に倒さない) と衝突する。resolver を差し替えて対象を
-#: 狭める (引用符付きの値は元々 resolver の対象外 — 常に文字列なので影響しない)。
-#: `yaml.SafeLoader` のサブクラスで、コンストラクタは何も足さない (`!!python/object` 等の
-#: 任意型構築は不可能なまま) — 下の `yaml.load(..., Loader=_StrictBoolLoader)` は
-#: `yaml.safe_load` と同じ安全性で、resolver だけを差し替えている。
+#: `can_produce_deliverable` / `deliverable_required` は厳密に小文字の `true` / `false` だけを
+#: 真偽値として認める (1 巡目 t055 の後も、2 巡目 (t057→t059) でコメント付きヘッダが `current` を
+#: 前の skill のまま残す形で同じ族が再発し、3 巡目 (t072) では `deliverable_required: no` が
+#: 黙って `false` になる形で mission.yaml 側にも同じ族が出た — この欄をこれ以上正規表現の手当てで
+#: 直さない。以後は本物の YAML パーサ (PyYAML) で読む)。既定の YAML 1.1 bool resolver は
+#: `yes` / `no` / `on` / `off` / `True` / `FALSE` 等も暗黙に真偽値へ丸め込むが、それは
+#: 「はっきりしない綴り」を黙って true/false のどちらかに倒す挙動であり、この 2 つの欄が守りたい
+#: 性質 (曖昧な値は「不正」として拒否し、既定の安全側 (「作れる」/「必須でない」) へは絶対に
+#: 倒さない) と衝突する。resolver を差し替えて対象を狭める (引用符付きの値は元々 resolver の
+#: 対象外 — 常に文字列なので影響しない)。`yaml.SafeLoader` のサブクラスで、コンストラクタは何も
+#: 足さない (`!!python/object` 等の任意型構築は不可能なまま) — 下の
+#: `yaml.load(..., Loader=_StrictBoolLoader)` は `yaml.safe_load` と同じ安全性で、resolver だけを
+#: 差し替えている。
 if yaml is not None:
     class _StrictBoolLoader(yaml.SafeLoader):
         pass
@@ -393,6 +328,50 @@ if yaml is not None:
         'tag:yaml.org,2002:bool', re.compile(r'^(?:true|false)$'), list('tf'))
 
 
+def _load_yaml_document(path: str, *, missing_is_ok: bool = True) -> tuple[dict, Optional[str]]:
+    """queue / config の YAML ファイル 1 つを、構造的に (本物の YAML パーサで) 読む。
+
+    `(data, problem)`。ファイルの**オープン**は `lib_task_cards.read_regular_text_or_unreadable()`
+    を通す (CLAUDE.md 不変条件 #1 — 種類の確認・ENOENT とそれ以外の区別を、この 1 箇所とだけ共有する)。
+    それ以外の読み取り失敗・YAML 構文エラー・トップレベルがマッピングでない場合は
+    `({}, <理由>)` を返し、呼び出し側に「決められない」として扱わせる
+    (「読めない」を「無い」「空」に潰さない)。空ファイル (`yaml.load` が `None` を返す) は
+    「中身が無い」として `({}, None)`。
+
+    `missing_is_ok` (既定 True): 本当に無い (ENOENT) を「印が無い」として `({}, None)` に
+    するかどうか。呼び出し側で意味が違う —— `mission.yaml` の `deliverable_required` や
+    プロファイル集の各セクションのように、**印自体が無いのが普通の状態**なら既定のままでよい。
+    `config/skill-permissions.yaml` の `can_produce_deliverable` のように、**ファイルは常に
+    存在すべき前提**で、無いことを黙って安全側の既定 (「作れる」) に倒したくない呼び出し側は
+    `missing_is_ok=False` を渡す (`_load_deliverable_capabilities` 参照)。
+
+    構造は本物の YAML パーサ (`_StrictBoolLoader` — PyYAML の SafeLoader で bool resolver だけ
+    厳密化したもの) で読む。**PyYAML が無い環境では読めない扱いにする** (この用途専用の簡易
+    フォールバックは書かない — 簡易パーサを書くたびにコメント・引用符・フロースタイルのどれかを
+    見落として同じ族の欠陥を作ってきたため。`pip install pyyaml` は CI にも既定で入っている)。
+    """
+    text = lib_task_cards.read_regular_text_or_unreadable(path)
+    if lib_task_cards.is_unreadable(text):
+        if missing_is_ok and lib_task_cards.is_missing(text):
+            return {}, None
+        return {}, f"{path}: {text.reason}"
+
+    if yaml is None:
+        return {}, (f"{path}: PyYAML が無いため読めません "
+                     f"(この用途専用の簡易パーサは意図的に持たない — pip install pyyaml)")
+
+    try:
+        data = yaml.load(text, Loader=_StrictBoolLoader)
+    except yaml.YAMLError as e:
+        return {}, f"{path}: YAML を解釈できません ({e})"
+
+    if data is None:
+        return {}, None                      # 空ファイル = 中身なし
+    if not isinstance(data, dict):
+        return {}, f"{path}: トップレベルがマッピングではありません ({type(data).__name__})"
+    return data, None
+
+
 def _load_deliverable_capabilities(skill_permissions_path: str) -> tuple[dict, Optional[str]]:
     """`{skill: True | False | <不正な値の文字列>}` と、読めなかった理由 (読めたら None)。
 
@@ -402,31 +381,16 @@ def _load_deliverable_capabilities(skill_permissions_path: str) -> tuple[dict, O
     空白を含む値 (文字列・リスト表記など) や空値も、欄自体は「ある」ものとして拾い、
     不正な値の文字列として返す (欄の有無と値の妥当性を別に扱う)。
 
-    構造 (`skills:` セクション・各 skill・その下の欄) は本物の YAML パーサで読む。**PyYAML が
-    無い環境では読めない扱いにする** (この欄専用の簡易フォールバックは書かない — 簡易パーサを
-    書くたびにコメント・引用符・フロースタイルのどれかを見落として同じ族の欠陥を作ってきたため。
-    `pip install pyyaml` は CI にも既定で入っている)。パーサが構造を理解できなかった (トップ
-    レベルがマッピングでない・`skills` がマッピングでない・ある skill の値がマッピングでない)
-    場合も、その skill だけを飛ばさず **読み込み全体を「読めない」として拒否する** (「宣言が
-    無い」と「読めない」は別の状態 — 既定の「作れる」に静かに倒さない)。
+    構造 (`skills:` セクション・各 skill・その下の欄) はパーサが理解できなかった (`skills` が
+    マッピングでない・ある skill の値がマッピングでない) 場合も、その skill だけを飛ばさず
+    **読み込み全体を「読めない」として拒否する** (「宣言が無い」と「読めない」は別の状態 —
+    既定の「作れる」に静かに倒さない)。ファイル自体が無い場合も同様に問題として返す
+    (`missing_is_ok=False`) — この config は常に存在すべき前提で、無いことを「全 skill が
+    作れる」に静かに倒さない。
     """
-    try:
-        with open(skill_permissions_path, encoding='utf-8') as f:
-            content = f.read()
-    except (OSError, UnicodeDecodeError) as e:
-        return {}, f"{skill_permissions_path}: {type(e).__name__}: {e}"
-
-    if yaml is None:
-        return {}, (f"{skill_permissions_path}: PyYAML が無いため読めません "
-                     f"(この欄専用の簡易パーサは意図的に持たない — pip install pyyaml)")
-
-    try:
-        data = yaml.load(content, Loader=_StrictBoolLoader)
-    except yaml.YAMLError as e:
-        return {}, f"{skill_permissions_path}: YAML を解釈できません ({e})"
-
-    if not isinstance(data, dict):
-        return {}, f"{skill_permissions_path}: トップレベルがマッピングではありません ({type(data).__name__})"
+    data, problem = _load_yaml_document(skill_permissions_path, missing_is_ok=False)
+    if problem is not None:
+        return {}, problem
     skills = data.get('skills')
     if skills is None:
         return {}, None                      # `skills:` セクション自体が無い = 宣言 0 件
@@ -454,16 +418,19 @@ def _mission_requires_deliverable(slug: str, queue_dir: str) -> tuple[bool, Opti
     印が無い (キーが無い・mission.yaml 自体が無い = ENOENT だけ) mission は「必須でない」。
     それ以外の読み取り失敗・`true` / `false` 以外の値は、必須かどうか決められないので理由を返す
     (呼び出し側が FAIL にする — 「読めない」を「印が無い」に潰さない)。
+
+    3 巡目 (t072) の finding 2 件を、手書きパーサではなく `_load_yaml_document()` (本物の
+    YAML パーサ) に寄せることで解消する: `deliverable_required: no` は (YAML 1.1 の bool
+    ではなく) 文字列 `'no'` のまま読め、下の `value is True` / `is False` の同一性判定に
+    引っかからず「true / false のどちらかだけ」の FAIL になる (黙って False にしない)。
+    引用符付きのキー `"deliverable_required": true` も、本物のパーサはキーの引用符を
+    構文として扱うので、通常のキーと同じに読める (丸ごと無視しない)。
     """
     path = os.path.join(queue_dir, 'missions', slug, 'mission.yaml')
-    try:
-        with open(path, encoding='utf-8') as f:
-            text = f.read()
-    except FileNotFoundError:
-        return False, None
-    except (OSError, UnicodeDecodeError) as e:
-        return False, f"{path}: {type(e).__name__}: {e}"
-    value = _parse_minimal_yaml(text).get('deliverable_required')
+    data, problem = _load_yaml_document(path)
+    if problem is not None:
+        return False, problem
+    value = data.get('deliverable_required')
     if value is None or value is False:
         return False, None
     if value is True:
@@ -549,23 +516,20 @@ def check_deliverable(tasks: list[dict], skill_permissions_path: str,
 # ---------------------------------------------------------------------------
 
 def _load_tasks_from_mission(slug: str, queue_dir: str) -> list[dict]:
-    mission_dir = os.path.join(queue_dir, 'missions', slug)
-    tasks_dir = os.path.join(mission_dir, 'tasks')
-    if not os.path.isdir(tasks_dir):
-        return []
-    metas = []
-    for fname in sorted(os.listdir(tasks_dir)):
-        if not fname.endswith('.md'):
-            continue
-        path = os.path.join(tasks_dir, fname)
-        with open(path) as f:
-            text = f.read()
-        try:
-            meta, _ = _parse_frontmatter(text)
-            metas.append(meta)
-        except ValueError as e:
-            metas.append({'id': fname, '_parse_error': str(e)})
-    return metas
+    """`lib_task_cards.list_task_cards()` を通す (CLAUDE.md 不変条件 #1)。
+
+    旧実装は `os.listdir` + 素の `open()` + 自前の frontmatter パーサで、
+    plan.sh / dispatcher.sh が読むのと**別の parser**でカードを読んでいた
+    (t072 / PR#236 3巡目)。食い違うと「lint は OK と言うのに plan.sh は
+    [破損] として保留する」(またはその逆) が起きうる。加えて、旧実装は
+    `os.listdir` 自体が失敗した場合の処理が無く未捕捉の例外で落ちていた
+    (`list_task_cards()` は `scan_failure_task()` の保留ノードを返す)。
+
+    読めなかったカードは `status: lib_task_cards.CORRUPT_TASK_STATUS` の
+    擬似カードとして返る (`lint_mission()` が FAIL に変換する)。
+    """
+    tasks_dir = os.path.join(queue_dir, 'missions', slug, 'tasks')
+    return [meta for meta, _body in lib_task_cards.list_task_cards(tasks_dir)]
 
 
 # ---------------------------------------------------------------------------
@@ -584,12 +548,16 @@ def lint_mission(slug: str, queue_dir: str, config_dir: str, strict: bool = Fals
 
     all_results: list[tuple[str, str, str]] = []
 
-    # Parse errors first
+    # Parse errors first (lib_task_cards.list_task_cards() holds unreadable
+    # cards as a CORRUPT_TASK_STATUS pseudo-task rather than raising — see
+    # _load_tasks_from_mission()).
     for meta in tasks:
-        if '_parse_error' in meta:
-            all_results.append(('FAIL', 'frontmatter', f"task/{meta['id']}: parse error — {meta['_parse_error']}"))
+        if meta.get('status') == lib_task_cards.CORRUPT_TASK_STATUS:
+            all_results.append(('FAIL', 'frontmatter',
+                                f"task/{meta.get('id', '<unknown>')}: "
+                                f"{meta.get('parse_error', lib_task_cards.CORRUPT_TASK_STATUS)}"))
 
-    valid_tasks = [m for m in tasks if '_parse_error' not in m]
+    valid_tasks = [m for m in tasks if m.get('status') != lib_task_cards.CORRUPT_TASK_STATUS]
 
     all_results += check_frontmatter(valid_tasks)
     all_results += check_dependency_graph(valid_tasks)

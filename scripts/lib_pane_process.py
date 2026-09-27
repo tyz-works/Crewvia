@@ -79,6 +79,96 @@ eval '<command>' ..."` という形で生える。MCP サーバー (`npm exec ..
 時刻 (`grace_seconds` / `min_start_epoch`) はもう判定に使わない (t065 で撤去済み)。
 comm による同定 (`_SHELL_COMMS` / `_KNOWN_INFRASTRUCTURE_COMMS`) も撤去した —
 残すと「起動元」と「名前」の 2 つの判定基準が食い違いうる。
+
+## t091 (B1 5巡目 P1): `exec` が cmdline の印を消す — environ を第二の証拠にする
+
+t074 の「起動元」判定は cmdline の `BASH_TOOL_WRAPPER_MARKER` **だけ**を見ていたが、
+Bash tool の中で `exec sleep 30` のように `exec` を使うと、その pid の cmdline は
+`sleep 30` に置き換わり (execve が argv を丸ごと差し替えるため)、ラッパーの印が
+その pid 自身の cmdline からは失われる (実測、`bash -c 'exec sleep 30'` の
+`/proc/<pid>/cmdline` は `sleep 30`)。この pid はもう祖先の cmdline も持たない
+(execve は同じ pid のまま置き換わるだけで、親子関係も cmdline の履歴も残さない)。
+結果、この job は `idle_process` に化け、watchdog の hard-idle が terminate を許してしまう
+(本物の job を kill してよいことにする、という向きの誤り)。
+
+**exec は cmdline を消すが、environ は消さない** — execve は呼び出し元が明示的に
+新しい envp を渡さない限り、既存の環境変数をそのまま引き継ぐ (実測:
+`bash -c 'exec env | grep CLAUDE'` は元の shell と同じ `CLAUDE_CODE_CHILD_SESSION=1`
+`CLAUDE_CODE_EXECPATH=...` を含む)。Director が本番で実測した表 (2026-09-28 04:35):
+
+| 環境変数 | MCP (`npm exec @playw` 等) | Bash tool の job (`exec` 後も) |
+|---|---|---|
+| `CLAUDECODE` | あり | あり |
+| `CLAUDE_CODE_CHILD_SESSION` | **なし** | **あり** |
+| `CLAUDE_CODE_EXECPATH` | **なし** | **あり** |
+
+（`/proc/<pid>/environ` は同一 uid の非祖先プロセスでも読める — 本番 pane で実測済み。
+Yama `ptrace_scope=1` の下でも `PTRACE_MODE_READ_FSCREDS` はこの読み取りを許す。
+watchdog / dispatcher は pane の祖先ではないので、この読み取り可否が本設計の前提になる）。
+
+**3 値に分ける** (per-node の起源判定。`_origin_of()`):
+
+  - **job**: 自分の cmdline に wrapper marker がある、**または** 自分の environ に
+    `CLAUDE_CODE_CHILD_SESSION` **または** `CLAUDE_CODE_EXECPATH` がある
+  - **infra**: 上記が無く、`CLAUDECODE` はある (Claude が起動したが Bash tool /
+    Monitor 経由ではないもの — MCP サーバー・claude 本体)
+  - **unknown**: `CLAUDECODE` すら無い (`env -i` で消された、または Claude Code と
+    無関係なプロセス)、または `environ` が「消滅」以外の理由で読めない
+
+**job の env シグナルを 2 つ (`CHILD_SESSION` / `EXECPATH`) にした理由**: どちらも
+Claude Code の内部実装の変数名なので、将来どちらかの名前が変わっても、もう一方が
+残っていれば job 判定は壊れない (単一の定数に依存する設計は、その定数が壊れた
+瞬間に「本物の exec 済み job が infra に化けて kill されうる」という、この task が
+直そうとしている欠陥そのものを再導入してしまう — 受入条件(4)参照)。両方同時に
+壊れる (= job の env シグナルが両方消える) 場合だけ、job は cmdline marker 頼みに
+戻る (t074 までの状態と同じ露出)。これは残存リスクとして明記する。
+
+**不明の扱いは判定ごとに非対称** (`classify_process_tree` 自体は判定しない —
+呼び出し側の fail-direction は `watchdog-idle-judgment.md` 参照):
+  - 木の中に **job が 1 つでもあれば** (`job` が見つかった時点で) 即 `executing`
+    (既存動作を維持)
+  - job が無く、`unknown` origin のノードが 1 つでもあれば木全体を `unknown` に倒す
+    (Rule 5 は「job ではない」= 通知する側、watchdog は `unknown` を殺さない側。
+    どちらも「安全側」で、`idle_process` (確実に job が無い) と区別する)
+  - job も unknown も無ければ (全ノードが確実に infra) `idle_process`
+
+`environ` の読み取り失敗 (「消滅」以外の `OSError`) は `_proc_cmdline` と同じ基準で
+即座に木全体を `unknown` に倒す (t082 の cmdline 読み取り失敗と同じ理由 — 読めない
+ノードが本物の job の証拠を持っていた可能性を握り潰さない)。
+
+**この設計で観測不能な既知の限界**: `setsid` ユーティリティおよび `( cmd & )` の
+二重 fork は、いずれも中間の親プロセスをすぐ終了させることで対象を pane の
+祖先チェーンから完全に切り離し (init/subreaper の子になる)、**root_pid からの
+`ppid` ベースの木構造走査そのものが対象を見失う**。cmdline・environ のどちらを
+見ても解決できない (実測: `setsid sleep N` / `( sleep N & )` の実プロセスは
+どちらも数百 ms 後に `ppid=1` になり、pane の子孫から消える)。この場合の安全弁は
+既存の watchdog 絶対上限 (`max_threshold`) だけであり、この task (exec によるマーカー
+消失) とは別の残存リスクとして明記する。`disown` (シェル組み込み、実行中プロセスの
+親子関係・cmdline・environ には無関係) は判定に影響しない。
+
+## 族ごとの掃除: job の証拠が消える経路の一覧 (2026-09-28 実測)
+
+Bash tool のラッパー配下で job の証拠 (cmdline marker / environ) がどう変わるかを
+経路ごとに実測した (`bash -c '<経路> sleep N &'` 等、`/proc/<pid>/{cmdline,environ}`
+を直接読んで確認。手順は t091 の Result に貼る)。「見える」は root_pid の子孫として
+残る (= `classify_process_tree` の走査が到達できる) ことを指す:
+
+| 経路 | cmdline の marker | environ の job シグナル | pane の子孫として見えるか | この lib の判定 | Rule 5 | watchdog |
+|---|---|---|---|---|---|---|
+| `cmd` (何もしない) | 残る | 残る | 見える | job | 黙る | kill しない |
+| `exec cmd` | **消える** | 残る (execve は envp を継承) | 見える | **job (environ で救う)** | 黙る | kill しない |
+| `exec env -i cmd` | 消える | **消える** (`CLAUDECODE` も無い) | 見える | **unknown** | 通知する | kill しない (warn) |
+| `nohup cmd &` | 消える (`nohup` 自身が exec する) | 残る | 見える | job (environ で救う) | 黙る | kill しない |
+| `exec -a <name> cmd` / Node の `process.title` 書き換え | 書き換わる (marker 消える) | 残る (argv の表示だけが変わり environ は別領域) | 見える | job (environ で救う) | 黙る | kill しない |
+| `disown` (シェル組み込み、bookkeeping のみ) | 変化なし | 変化なし | 見える (親が生きている限り) | 変化なし | 変化なし | 変化なし |
+| `setsid cmd` (setsid ユーティリティ) | 消える (setsid 自身が内部で exec) | 残る | **見えない** (setsid は内部で二重 fork し、grandparent が即終了するため init/subreaper の子になる — 実測: 数百 ms で `ppid=1`) | (到達不能 — この木にそもそも現れない) | 見えないので通常判定 (job 無しと同じ扱い) | 見えないので通常判定 (`max_threshold` だけが安全弁) |
+| `( cmd & )` (サブシェルの二重 fork) | 消える (孫の cmdline は `cmd` 自身) | 残る | **見えない** (同上の理由で init/subreaper の子になる) | (到達不能) | 同上 | 同上 |
+
+**「見えない」2 経路 (`setsid` / 二重 fork) は、cmdline・environ のどちらを見ても
+直せない構造的な限界**: プロセスが pane の `ppid` チェーンそのものから外れる
+(init や subreaper の子になる) ため、root_pid を起点にした木構造の走査が対象に
+到達しない。安全弁は既存の watchdog 絶対上限 (`max_threshold`) のみで、この task
+(exec によるマーカー消失) の対象外の残存リスクとして明記する。
 """
 from collections import deque
 from pathlib import Path
@@ -88,7 +178,9 @@ ProcessSignal = Literal[
     "no_window",     # mux 窓が無い
     "not_probed",    # プロセス層を見るまでもなく判定が決まった (絶対上限など)
     "unknown",       # 窓はあるが pane pid が引けない、プロセス木の列挙、または
-                     # 判定中のノードの cmdline が「消滅」以外の理由で読めない
+                     # 判定中のノードの cmdline / environ が「消滅」以外の
+                     # 理由で読めない、または job も infra の確証も持たない
+                     # ノードがあった (t091: CLAUDECODE すら無い)
                      # → terminate を抑制する
     "no_process",    # 子プロセスが 1 つも無い
     "idle_process",  # Bash tool / Monitor のラッパー経由でないプロセス
@@ -105,6 +197,19 @@ ProcessSignal = Literal[
 # (変わると「マーカーが見つからない」→ 全部 job ではない判定に倒れる = 誤検知が
 # **増える**方向に壊れる。黙る方向には壊れない。下記 classify_process_tree 参照)。
 BASH_TOOL_WRAPPER_MARKER = "/shell-snapshots/snapshot-"
+
+# t091: cmdline のマーカーが `exec` で消えても environ は残る (モジュール
+# docstring 実測)。job であることを示す environ のキーを 2 つ持つ (どちらか
+# 1 つでもあれば job) — 単一の定数にすると、その名前が将来変わった瞬間に
+# 「exec 済みの本物の job が infra に化けて kill されうる」という、この
+# task が直す欠陥そのものを再導入してしまう (受入条件(4))。
+JOB_ENVIRON_MARKERS = ("CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_EXECPATH")
+
+# Claude Code (本体・MCP サーバーいずれも) が起動した子孫であることを示す
+# environ のキー。これが無ければ「Claude Code とは無関係、または env が
+# 丸ごと消された (`env -i` 等)」= unknown に倒す (job/infra どちらの確証も
+# 無いノードを安易に infra 側に倒さない)。
+INFRA_ENVIRON_MARKER = "CLAUDECODE"
 
 
 def _proc_stat(pid: int) -> Optional[tuple[int, int, str]]:
@@ -181,6 +286,69 @@ def _proc_cmdline(pid: int) -> Optional[str]:
     return raw.replace(b"\x00", b" ").decode("utf-8", errors="replace")
 
 
+def _proc_environ(pid: int) -> Optional[dict[str, str]]:
+    """/proc/<pid>/environ を `{key: value}` にして返す (t091)。
+
+    NUL 区切りの `KEY=VALUE` エントリを分割する。`=` を含まない壊れたエントリは
+    無視する (キーだけ拾えても判定には使わない)。空 (`env -i` で起動した
+    プロセス) は `{}` — これは「消滅」でも「読めない」でもなく、正当な結果
+    (`INFRA_ENVIRON_MARKER` すら無い = unknown 側に倒す)。
+
+    消滅 (`FileNotFoundError` / `ProcessLookupError` = ENOENT/ESRCH) だけを
+    None として扱う契約は `_proc_stat` / `_proc_cmdline` と同じ。それ以外の
+    `OSError` (EACCES 等) は re-raise し、呼び出し側で `unknown` に倒す —
+    /proc/<pid>/environ は同一 uid の非祖先プロセスでも読める (本番実測、
+    モジュール docstring 参照) ので、実運用で EACCES が起きるとすれば
+    hidepid マウント等の環境要因であり、「読めない」を「無い」に潰して
+    良い理由にはならない (_proc_cmdline と同じ判断)。
+    """
+    try:
+        raw = Path(f"/proc/{pid}/environ").read_bytes()
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+    result: dict[str, str] = {}
+    for entry in raw.split(b"\x00"):
+        if not entry:
+            continue
+        key, sep, value = entry.partition(b"=")
+        if not sep:
+            continue
+        result[key.decode("utf-8", errors="replace")] = value.decode(
+            "utf-8", errors="replace")
+    return result
+
+
+def _origin_of(pid: int) -> Literal["job", "infra", "unknown"]:
+    """1 ノードの起源を判定する (t091)。cmdline → environ の順に見る。
+
+    cmdline に wrapper marker があれば environ を読むまでもなく job (既存の
+    t074 判定をそのまま維持)。無ければ environ を見る — job / infra どちらの
+    根拠も無ければ unknown (安易に infra に倒さない。モジュール docstring
+    「3 値に分ける」参照)。
+
+    cmdline / environ の読み取りが「消滅」以外の理由で失敗した場合は
+    `OSError` を re-raise する (呼び出し側 `classify_process_tree` が木全体を
+    `unknown` に倒す — `_proc_cmdline` と同じ契約)。
+
+    どちらかが「消滅」(None) なら、この pid は BFS 対象の列挙から生きて
+    見えていたのに読む時点で居なくなった、というだけの無害なレースなので
+    infra (=判定に寄与しない) として扱う (t082 以前からの既存の扱いを維持)。
+    """
+    cmdline = _proc_cmdline(pid)
+    if cmdline is None:
+        return "infra"
+    if BASH_TOOL_WRAPPER_MARKER in cmdline:
+        return "job"
+    environ = _proc_environ(pid)
+    if environ is None:
+        return "infra"
+    if any(marker in environ for marker in JOB_ENVIRON_MARKERS):
+        return "job"
+    if INFRA_ENVIRON_MARKER in environ:
+        return "infra"
+    return "unknown"
+
+
 def classify_process_tree(root_pid: int) -> ProcessSignal:
     """mux ペインのプロセス木を 3 値に分類する。
 
@@ -203,26 +371,33 @@ def classify_process_tree(root_pid: int) -> ProcessSignal:
     残った (モジュール docstring 参照)。
 
     ここでは **誰が起動したか** (祖先の cmdline に Bash tool / Monitor の
-    shell snapshot wrapper が現れるか) で区別する:
+    shell snapshot wrapper が現れるか、**または** 祖先の environ に t091 の
+    job シグナルがあるか) で区別する:
 
-      "executing"    … 自分自身か祖先の cmdline に `BASH_TOOL_WRAPPER_MARKER`
-                       を含むノードが居る = job が走っている
-      "idle_process" … それ以外 (セッション本体・MCP サーバー・その子孫)
-                       だけ。木が有ること自体は「働いている」の証拠にならない
+      "executing"    … 自分自身か祖先が `_origin_of()` で job と判定された
+                       (cmdline の wrapper marker、または environ の
+                       `JOB_ENVIRON_MARKERS`) = job が走っている
+      "idle_process" … job が 1 つも無く、かつ全ノードが確証を持って infra
+                       (`INFRA_ENVIRON_MARKER` あり) と判定できた。木が有る
+                       こと自体は「働いている」の証拠にならない
       "no_process"   … 子が 1 つも無い (claude が落ちた / 素のシェル)
       "unknown"      … `/proc` の列挙自体 (`_proc_stat`) か、判定中の 1 ノードの
-                       cmdline (`_proc_cmdline`) のどちらかが「消滅」以外の
-                       理由で読めず、木そのものが組み立てられない、または
-                       job かどうかを確定できない (t049 族A監査 / t082 P1。
+                       cmdline / environ (`_proc_cmdline` / `_proc_environ`)
+                       のどちらかが「消滅」以外の理由で読めず木そのものが
+                       組み立てられない (即座に unknown。t049 族A監査 / t082 P1)、
+                       **または** job も infra の確証も無いノードが 1 つでも
+                       あった (t091: `CLAUDECODE` すら無い = Claude Code と
+                       無関係か env が消された。この場合は BFS を中断せず
+                       他のノードも見る — job が他所で見つかればそちらが勝つ)。
                        terminate 側の抑制材料としては効くが、Rule 5 は
-                       「観測できない → 通知する」に倒す)
+                       「観測できない → 通知する」に倒す
 
-    親の分類 (job / not-job) は子に伝播する: job と分類されたノードの子孫は
-    すべて job (そのシェルが起動した実体の一部だから)。ルート直下 (親の分類が
-    無い) でマーカーを持たない場合は not-job (t065 の「同定できないものは
-    job 側に倒す」族C の許可リスト方式はここでは撤去 — 許可リストという
-    概念自体が要らなくなった。モジュール docstring 参照)。cmdline が読めない
-    ノードもマーカー無しと同じ扱い (not-job) にする — `_proc_cmdline` 参照。
+    親の分類が job なら子は cmdline/environ を見るまでもなく job (そのシェルが
+    起動した実体の一部だから)。job はどこで見つかっても即座に確定するので
+    "executing" は即 return する。infra / unknown の親は子に伝播しない —
+    各ノードは `_origin_of()` で独立に判定される (t065 の「同定できないものは
+    job 側に倒す」族C の許可リスト方式はここでは撤去したまま — 許可リストという
+    概念自体が要らない。モジュール docstring 参照)。
     """
     try:
         root_stat = _proc_stat(root_pid)
@@ -267,28 +442,34 @@ def classify_process_tree(root_pid: int) -> ProcessSignal:
     queue: deque[tuple[int, Optional[str]]] = deque(
         (pid, None) for pid in direct)
     seen: set[int] = set()
+    saw_unknown = False
     while queue:
         pid, parent_origin = queue.popleft()
         if pid in seen:
             continue
         seen.add(pid)
         if parent_origin == "job":
-            origin = "job"  # job の子孫はシェルの cmdline を見るまでもなく job
+            origin = "job"  # job の子孫は cmdline/environ を見るまでもなく job
         else:
             try:
-                cmdline = _proc_cmdline(pid)
+                origin = _origin_of(pid)
             except OSError:
-                # t082 P1: 消滅以外の理由で読めない (EACCES 等)。「マーカーが
-                # 無い」(= job ではない) に潰すと、読めないノードが Bash tool
-                # のラッパー自身だったときに本物の job が idle_process に化け、
-                # watchdog が hard-idle で terminate してしまう。木全体を
-                # `unknown` に倒す (_proc_stat の列挙失敗と同じ扱い)。
+                # t082 P1 / t091: cmdline か environ のどちらかが消滅以外の
+                # 理由で読めない (EACCES 等)。「マーカーが無い」(= job では
+                # ない) に潰すと、読めないノードが Bash tool のラッパー自身
+                # だったときに本物の job が idle_process に化け、watchdog が
+                # hard-idle で terminate してしまう。木全体を `unknown` に
+                # 倒す (_proc_stat の列挙失敗と同じ扱い)。
                 return "unknown"
-            has_marker = cmdline is not None and BASH_TOOL_WRAPPER_MARKER in cmdline
-            origin = "job" if has_marker else "infra"
         if origin == "job":
-            return "executing"
+            return "executing"  # job はどこで見つかっても即座に確定する
+        if origin == "unknown":
+            # t091: CLAUDECODE すら無い = job/infra どちらの確証も無い。
+            # ここで即 return しない — 他のノードに本物の job があれば
+            # そちらを優先する (job が最優先の signal であることは変わらない)。
+            # job が他に無ければ、最後に unknown として返す。
+            saw_unknown = True
         for child in children.get(pid, []):
             queue.append((child, origin))
 
-    return "idle_process"
+    return "unknown" if saw_unknown else "idle_process"

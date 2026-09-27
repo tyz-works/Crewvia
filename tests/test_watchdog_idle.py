@@ -74,6 +74,26 @@ import sys
 import time
 from pathlib import Path
 
+
+def _infra_env() -> dict:
+    """t091: 明示的に `CLAUDECODE=1` だけを持つ environ (`CLAUDE_CODE_CHILD_SESSION`
+    / `CLAUDE_CODE_EXECPATH` は持たない) — 「確証のある infra」(MCP サーバー相当)
+    を再現する。
+
+    pytest をこの Claude Code の Bash tool から (= Worker として) 走らせると、
+    その Bash tool 自身の呼び出しが `CLAUDE_CODE_CHILD_SESSION=1` を持つため
+    (2026-09-28 実測)、明示しないと fixture のプロセスがこれを継承して job に
+    誤判定される (`classify_process_tree` は environ も見るようになった)。
+    """
+    return {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "CLAUDECODE": "1"}
+
+
+def _foreign_env() -> dict:
+    """t091: `CLAUDECODE` すら持たない environ — Claude Code と無関係な
+    プロセスを再現する (`unknown` 側のテスト用)。
+    """
+    return {"PATH": os.environ.get("PATH", "/usr/bin:/bin")}
+
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
@@ -199,7 +219,8 @@ def worker_pane(tmp_path):
     node_bin = tmp_path / "node"
     node_bin.symlink_to("/bin/sleep")
     root = subprocess.Popen(
-        ["sh", "-c", f'{claude_bin} -c "{node_bin} 300 & {node_bin} 300 & wait" & wait']
+        ["sh", "-c", f'{claude_bin} -c "{node_bin} 300 & {node_bin} 300 & wait" & wait'],
+        env=_infra_env(),  # t091: 確証のある infra として固定する (下の docstring 参照)
     )
     time.sleep(0.5)  # 木が出そろうまで
     try:
@@ -391,7 +412,7 @@ def test_startup_children_are_not_executing(tmp_path):
     """
     node_bin = tmp_path / "node"
     node_bin.symlink_to("/bin/sleep")
-    root = subprocess.Popen(["sh", "-c", f"{node_bin} 30 & wait"])
+    root = subprocess.Popen(["sh", "-c", f"{node_bin} 30 & wait"], env=_infra_env())
     try:
         time.sleep(0.3)
         assert watchdog.classify_process_tree(root.pid) == "idle_process"
@@ -414,7 +435,8 @@ def test_a_plain_shell_without_the_wrapper_marker_is_not_executing():
     "executing" だった — 逆の結果を固定していた)。
     """
     root = subprocess.Popen(
-        ["sh", "-c", 'sleep 300 & sh -c "sleep 300 & wait" & wait']
+        ["sh", "-c", 'sleep 300 & sh -c "sleep 300 & wait" & wait'],
+        env=_infra_env(),
     )
     try:
         time.sleep(0.5)
@@ -450,11 +472,18 @@ def test_an_unidentified_child_without_the_wrapper_marker_is_not_executing():
     そのコメント (「1 回余計に通知する方が安い」) は実際の挙動 (`executing` は
     通知/terminate を**抑制する**側) と逆だった (Codex 3巡目 P1)。起動元ベースの
     設計は許可リストという概念自体を無くしたので、この逆転は自然に直る。
+
+    t091 補記: この子は `CLAUDECODE` すら持たない (`_foreign_env()`。Claude Code
+    と無関係なプロセスの再現) — job ではないことに変わりはないが、もはや
+    「確証を持った infra」でもないので `idle_process` ではなく `unknown` になる
+    (job/infra どちらの確証も無いノードを安易に infra に倒さない、という t091 の
+    3 値化そのもの)。job ではない、という結論は変わらない (依然 executing では
+    ない) ことがこのテストの主眼であることに変わりはない。
     """
-    root = subprocess.Popen(["sh", "-c", "sleep 30 & wait"])
+    root = subprocess.Popen(["sh", "-c", "sleep 30 & wait"], env=_foreign_env())
     try:
         time.sleep(0.3)
-        assert watchdog.classify_process_tree(root.pid) == "idle_process"
+        assert watchdog.classify_process_tree(root.pid) == "unknown"
     finally:
         root.kill()
         root.wait()

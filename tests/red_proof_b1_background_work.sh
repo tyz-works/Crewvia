@@ -16,8 +16,8 @@
 #   J  dispatcher に /proc を読む分類のコピーが生える                              → 赤
 #   L  テスト: pane tree の teardown が group ごとでなく root だけになる (t049 P3)   → 赤
 #   M  分類: 読めない pid を静かに「子孫なし」へ倒す (族A監査)                    → 赤
-#   O  分類 (t074 P1): wrapper marker 定数が壊れる (Bash tool の内部実装変更想定)  → 赤
-#   P  分類 (t074 族C監査の向き訂正): 同定できないものを job 側に倒し直す          → 赤
+#   O  分類 (t091 P1 本体): environ フォールバックを丸ごと外す                     → 赤
+#   P  分類 (t074 族C監査の向き訂正 / t091): CLAUDECODE すら無いものを job 側に倒す → 赤
 #   Q  dispatcher (t074 追補): BACKGROUND_JOB_MAX_SECONDS の安全弁を外す           → 赤
 #   R  dispatcher (t074 追補): job_since が grace の since と混同される            → 赤
 #
@@ -27,9 +27,17 @@
 # (Bash tool / Monitor のラッパーの子孫か) へ丸ごと置き換えた — 本番の
 # `npm exec @playwright/mcp` が npm の process.title 書き換えと `sh -c "..."` を
 # 挟む経路のせいで、comm ベースの許可リストでは MCP を job と誤読する (偽陰性) ため。
-# この赤の実証は消えたコードを再現できないので旧 O/P (comm ベース) は新しい定義に
-# 合わせて書き換えた。Q/R は Director が本番で踏んだ実例 (Ren の pgrep 自己一致
-# ループが起動元判定でも job のまま黙り続ける) への追補。
+# Q/R は Director が本番で踏んだ実例 (Ren の pgrep 自己一致ループが起動元判定でも
+# job のまま黙り続ける) への追補。
+#
+# t091 (B1 5巡目 P1): Bash tool 内で `exec` を使うと cmdline のマーカーが消える
+# (execve が argv を丸ごと差し替える) ので、cmdline だけを見ていた判定 (t074) は
+# 本物の job を idle_process に誤分類する。environ (`exec` は envp を継承する) を
+# 第二の証拠に足した — これに伴い旧 case O (wrapper marker 定数破損) は
+# 「environ フォールバックが救うので、この単独欠陥ではもう赤にならない」という
+# **改善の実証**に変わった (`tests/test_background_work_is_not_idle.py` の
+# `test_a_changed_wrapper_marker_no_longer_loses_the_job_thanks_to_environ` 参照)。
+# ここでの O/P は t091 の環境変数フォールバック自体を狙った赤の実証に更新した。
 #
 # 隔離: 使い捨ての複製で欠陥を注入する。本番の worktree のファイルには触らない。
 # pytest は FakeMux / 隔離した queue・registry と本物の sh の親子木で動き、
@@ -136,8 +144,8 @@ expect_red "case F" "test_a_background_job_restarts_the_grace_and_clears_the_ded
 echo "== case G: 分類が裏の job を executing と読まない"
 fresh_copy
 inject scripts/lib_pane_process.py '        if origin == "job":
-            return "executing"' '        if origin == "job":
-            pass'
+            return "executing"  # job はどこで見つかっても即座に確定する' '        if origin == "job":
+            pass  # job はどこで見つかっても即座に確定する'
 expect_red "case G (dispatcher)" "test_a_live_background_job_is_not_idle_with_task" "${B1_TESTS[@]}"
 expect_red "case G (watchdog)"   "test_watchdog_does_not_terminate_a_worker_with_a_live_background_job" "${B1_TESTS[@]}"
 
@@ -190,19 +198,32 @@ inject scripts/lib_pane_process.py '        try:
             procs[int(entry.name)] = st'
 expect_red "case M" "test_an_unreadable_intermediate_pid_falls_to_unknown_not_idle" "${B1_TESTS[@]}"
 
-echo "== case O (t074 P1): wrapper marker 定数が壊れる (Bash tool の内部実装が変わった想定)"
+echo "== case O (t091 P1 本体): environ フォールバックを丸ごと外す (exec で cmdline のマーカーが消える P1 の再現)"
 fresh_copy
-inject scripts/lib_pane_process.py 'BASH_TOOL_WRAPPER_MARKER = "/shell-snapshots/snapshot-"' \
-                                    'BASH_TOOL_WRAPPER_MARKER = "/no-such-marker/"'
-expect_red "case O" "test_the_fixture_trees_classify_as_intended" "${B1_TESTS[@]}"
+inject scripts/lib_pane_process.py '    if BASH_TOOL_WRAPPER_MARKER in cmdline:
+        return "job"
+    environ = _proc_environ(pid)
+    if environ is None:
+        return "infra"
+    if any(marker in environ for marker in JOB_ENVIRON_MARKERS):
+        return "job"
+    if INFRA_ENVIRON_MARKER in environ:
+        return "infra"
+    return "unknown"' \
+                                    '    if BASH_TOOL_WRAPPER_MARKER in cmdline:
+        return "job"
+    return "infra"'
+expect_red "case O" "test_exec_erasing_the_cmdline_marker_is_still_a_job" "${B1_TESTS[@]}"
 
-echo "== case P (t074 族C監査の向き訂正): 同定できないものを job 側に倒し直してしまう"
+echo "== case P (t074 族C監査の向き訂正 / t091): CLAUDECODE すら無いものを job 側に倒し直してしまう"
 fresh_copy
-inject scripts/lib_pane_process.py '            has_marker = cmdline is not None and BASH_TOOL_WRAPPER_MARKER in cmdline
-            origin = "job" if has_marker else "infra"' \
-                                    '            has_marker = cmdline is not None and BASH_TOOL_WRAPPER_MARKER in cmdline
-            origin = "job"'
-expect_red "case P" "test_an_unidentified_persistent_process_is_not_treated_as_a_job" "${B1_TESTS[@]}"
+inject scripts/lib_pane_process.py '    if INFRA_ENVIRON_MARKER in environ:
+        return "infra"
+    return "unknown"' \
+                                    '    if INFRA_ENVIRON_MARKER in environ:
+        return "infra"
+    return "job"'
+expect_red "case P" "test_a_process_with_no_claudecode_evidence_at_all_is_unknown_not_idle" "${B1_TESTS[@]}"
 
 echo "== case Q (t074 追補): BACKGROUND_JOB_MAX_SECONDS の安全弁を外す (黙り続ける方に戻る)"
 fresh_copy
@@ -223,20 +244,17 @@ inject scripts/dispatcher.sh "        job_since, reliable = _load_job_since(name
         _save_job_since(name, job_since)"
 expect_red "case R" "test_the_ceiling_timer_is_independent_of_the_grace_timer" "${B1_TESTS[@]}"
 
-echo "== case S (t082 P1): cmdline が読めないノードを『インフラ』に潰す (job が idle_process に化ける)"
+echo "== case S (t082 P1 / t091): cmdline が読めないノードを『インフラ』に潰す (job が idle_process に化ける)"
 fresh_copy
-inject scripts/lib_pane_process.py "            try:
-                cmdline = _proc_cmdline(pid)
-            except OSError:
-                # t082 P1: 消滅以外の理由で読めない (EACCES 等)。「マーカーが
-                # 無い」(= job ではない) に潰すと、読めないノードが Bash tool
-                # のラッパー自身だったときに本物の job が idle_process に化け、
-                # watchdog が hard-idle で terminate してしまう。木全体を
-                # \`unknown\` に倒す (_proc_stat の列挙失敗と同じ扱い)。
-                return \"unknown\"
-            has_marker = cmdline is not None and BASH_TOOL_WRAPPER_MARKER in cmdline" \
-                             "            cmdline = _proc_cmdline(pid)
-            has_marker = cmdline is not None and BASH_TOOL_WRAPPER_MARKER in cmdline"
+inject scripts/lib_pane_process.py '    cmdline = _proc_cmdline(pid)
+    if cmdline is None:
+        return "infra"' \
+                             '    try:
+        cmdline = _proc_cmdline(pid)
+    except OSError:
+        return "infra"
+    if cmdline is None:
+        return "infra"'
 expect_red "case S" "test_an_unreadable_wrapper_is_unknown_not_infra" "${B1_TESTS[@]}"
 
 echo "== case T (t082 P2): job_since の『無い』と『読めない』を同じに潰す"

@@ -268,20 +268,27 @@ spawn_pane() {
   local node_bin="$FAKE_BIN_DIR/node"
   local runner="$ROOT/spawn_pane_runner.sh"
   rm -f "$pidfile"
+  # t091: environ を明示的に curate する。この e2e 自体が Claude Code の
+  # Bash tool から (= Worker として) 走らせられると、その Bash tool 自身が
+  # CLAUDE_CODE_CHILD_SESSION=1 を持つ (2026-09-28 実測) ため、明示しないと
+  # "idle" 側の木までこれを継承して job に誤判定される
+  # (classify_process_tree は environ も見るようになった — job の証拠が
+  # `exec` で cmdline から消えても environ で拾うため)。
   # 入れ子の引用符地獄を避けるため、起動スクリプトを一時ファイルに書く。
   if [[ "$kind" == "executing" ]]; then
     cat > "$runner" <<EOF
 #!/bin/sh
 echo \$\$ > "$pidfile"
-"$node_bin" 300 &
-bash -c "source '$SNAPSHOT_FILE' 2>/dev/null || true && eval 'sleep 300'" &
+env -i PATH="\$PATH" CLAUDECODE=1 "$node_bin" 300 &
+env -i PATH="\$PATH" CLAUDECODE=1 CLAUDE_CODE_CHILD_SESSION=1 CLAUDE_CODE_EXECPATH=/fake \
+  bash -c "source '$SNAPSHOT_FILE' 2>/dev/null || true && eval 'sleep 300'" &
 wait
 EOF
   else
     cat > "$runner" <<EOF
 #!/bin/sh
 echo \$\$ > "$pidfile"
-"$claude_bin" -c "'$node_bin' 300 & '$node_bin' 300 & wait" &
+env -i PATH="\$PATH" CLAUDECODE=1 "$claude_bin" -c "'$node_bin' 300 & '$node_bin' 300 & wait" &
 wait
 EOF
   fi

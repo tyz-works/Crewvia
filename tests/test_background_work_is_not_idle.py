@@ -48,6 +48,19 @@ fail の向き (memory: fail-direction-is-per-judgment) はテスト名に出す
   * Rule 5 (通知を止める判定): 観測できない → **通知する**側
   * watchdog (殺す判定):        観測できない → **殺さない**側 (既存: test_watchdog_idle.py)
 
+## t091 (B1 5巡目 P1追補): `exec` が cmdline の印を消す
+
+`exec sleep 30` のように Bash tool の中で `exec` を使うと、その pid の cmdline は
+`sleep 30` に置き換わり (execve が argv を丸ごと差し替える)、上の `_job_wrapper_cmd()`
+が作る `source <snapshot> && eval ...` という cmdline の印が失われる。だが environ は
+execve で明示的に envp を渡さない限り引き継がれる (`_env_prefix()` で明示的に curate した
+`CLAUDE_CODE_CHILD_SESSION` / `CLAUDE_CODE_EXECPATH` はそのまま残る) — これを第二の証拠
+として使う (`lib_pane_process.JOB_ENVIRON_MARKERS`)。全 fixture の environ は
+`_env_prefix()` で明示的に決める — pytest をどの環境 (CI / Claude Code の Bash tool から
+の Worker) で走らせても結果が変わらないようにするため (Bash tool 自身の呼び出しは
+`CLAUDE_CODE_CHILD_SESSION=1` を持つので、明示的に curate しないと fixture がこれを
+継承してしまう)。
+
 実行: python3 -m pytest tests/test_background_work_is_not_idle.py -v
 """
 
@@ -131,7 +144,26 @@ def _kill_pane_tree(proc: subprocess.Popen) -> None:
     proc.wait()
 
 
-def _mcp_like_cmd(title: str, seconds: int = 300) -> str:
+def _env_prefix(extra: dict) -> str:
+    """`env -i PATH=... KEY=VALUE ...` — 後続コマンドの environ を丸ごと
+    差し替える shell 断片 (t091)。
+
+    fixture のプロセス木は pytest を起動した process から environ を継承する。
+    このテストを Claude Code の Bash tool から (= Worker として) 走らせると、
+    その Bash tool 自身の呼び出しがすでに `CLAUDE_CODE_CHILD_SESSION=1` を
+    持つ (実測: 本 task の着手時に自分の Bash tool の env で確認した) ため、
+    fixture の全ノードがこれを**継承**してしまい、"quiet" (job 無し) の
+    はずのノードまで job に誤判定される。各ノードの environ は必ずここで
+    明示的に決め、周囲の実行環境 (pytest を CI で走らせるか、Worker の
+    Bash tool から走らせるか) に結果が依存しないようにする。
+    """
+    parts = ["env", "-i", f"PATH={shlex.quote(os.environ.get('PATH', '/usr/bin:/bin'))}"]
+    for key, value in extra.items():
+        parts.append(f"{key}={shlex.quote(value)}")
+    return " ".join(parts)
+
+
+def _mcp_like_cmd(title: str, seconds: int = 300, *, claudecode: bool = True) -> str:
     """本物の bash の `exec -a` で argv[0]/cmdline だけを書き換えて、実バイナリ
     (`/bin/sleep`) を実際に fork/exec する (t074: symlink で名前を作る fixture は
     使わない — Codex が「本物の起動経路を通っていない」と指摘している)。
@@ -144,9 +176,17 @@ def _mcp_like_cmd(title: str, seconds: int = 300) -> str:
     重要なのは、この cmdline のどこにも Bash tool / Monitor の wrapper marker
     (`/shell-snapshots/snapshot-`) が **絶対に現れない**こと (分類はそれしか
     見ない)。
+
+    t091: environ は `_env_prefix()` で明示的に決める。`claudecode=True`
+    (既定) は本番実測どおり `CLAUDECODE=1` だけを持つ (`CLAUDE_CODE_CHILD_SESSION`
+    / `CLAUDE_CODE_EXECPATH` は持たない) — Claude が起動したが Bash tool /
+    Monitor 経由ではないもの (MCP サーバー) を再現する。`claudecode=False` は
+    `CLAUDECODE` すら持たない、Claude Code と無関係なプロセスを再現する
+    (t091 の新しい "unknown" 経路のテスト用)。
     """
     inner = f'exec -a {shlex.quote(title)} /bin/sleep {seconds}'
-    return f'bash -c {shlex.quote(inner)}'
+    env = {"CLAUDECODE": "1"} if claudecode else {}
+    return f'{_env_prefix(env)} bash -c {shlex.quote(inner)}'
 
 
 def _write_wrapper_snapshot(directory) -> Path:
@@ -163,7 +203,7 @@ def _write_wrapper_snapshot(directory) -> Path:
     return snap
 
 
-def _job_wrapper_cmd(snapshot_path: Path, inner: str) -> str:
+def _job_wrapper_cmd(snapshot_path: Path, inner: str, *, with_marker: bool = True) -> str:
     """Bash tool (前景 / `run_in_background`) と Monitor が実際に生成する
     wrapper の形そのもの (2026-09-27 t074 実測: 自分の `run_in_background` /
     Monitor 呼び出しで `/proc/<pid>/cmdline` を直接読んで確認した):
@@ -173,9 +213,27 @@ def _job_wrapper_cmd(snapshot_path: Path, inner: str) -> str:
     実測では他に `export CODEX_COMPANION_*` 等が挟まるが、分類が見るのは
     `source` の後に続く `/shell-snapshots/snapshot-` という部分文字列だけなので、
     ここでは本質だけを再現する。
+
+    t091: environ も `_env_prefix()` で明示的に `CLAUDECODE` / `CLAUDE_CODE_CHILD_SESSION`
+    / `CLAUDE_CODE_EXECPATH` を持たせる (Director 実測表どおり、本物の Bash tool
+    job は 3 つとも持つ)。`with_marker=False` は cmdline の wrapper marker を
+    含めない `exec` 後の状態を再現する — environ だけが job の証拠になる
+    (この task の本題)。
     """
-    script = f"source {shlex.quote(str(snapshot_path))} 2>/dev/null || true && eval {shlex.quote(inner)}"
-    return f"bash -c {shlex.quote(script)}"
+    if with_marker:
+        script = (
+            f"source {shlex.quote(str(snapshot_path))} 2>/dev/null || true "
+            f"&& eval {shlex.quote(inner)}")
+    else:
+        # exec で cmdline のマーカーが失われた後の状態そのもの: この pid の
+        # cmdline はもう `source .../shell-snapshots/...` を含まない。
+        script = f"exec {inner}"
+    env = {
+        "CLAUDECODE": "1",
+        "CLAUDE_CODE_CHILD_SESSION": "1",
+        "CLAUDE_CODE_EXECPATH": "/fake/claude/execpath",
+    }
+    return f"{_env_prefix(env)} bash -c {shlex.quote(script)}"
 
 
 @pytest.fixture(scope="module")
@@ -568,7 +626,7 @@ def test_a_vanished_pane_process_falls_to_the_notifying_side(r5):
 # 「誰が起動したか (起動元)」に移す。symlink で名前を作る fixture は使わない。
 # ---------------------------------------------------------------------------
 
-def _nested_infra_cmd(titles: list, seconds: int = 300) -> str:
+def _nested_infra_cmd(titles: list, seconds: int = 300, *, claudecode: bool = True) -> str:
     """本番の MCP 起動経路 (`npm exec ...` → `sh -c "playwright-mcp"` → ...) を、
     実際の fork 境界を挟んだ複数の実プロセスで再現する
     (`titles[0]` が末端・`titles[-1]` が根に近い側)。
@@ -578,12 +636,19 @@ def _nested_infra_cmd(titles: list, seconds: int = 300) -> str:
     1 プロセスに畳み込まれてしまう (本ファイルで実測して踏んだ)。ここでは
     各段のあいだに `&` (バックグラウンド化 = 必ず fork) を挟むことで、
     本番と同じく**複数の別 PID が親子関係を持つ**木を作る。
+
+    t091: environ は一番外側だけ `_env_prefix()` で明示的に決める — 内側の
+    `exec -a` / 入れ子 `bash -c` はどれも自分では environ を変更しないので、
+    最外側の起点だけ curate すれば木全体に伝わる (execve は明示的な envp を
+    渡さない限り継承する)。`claudecode=False` は `CLAUDECODE` すら無い、
+    Claude Code と無関係な木を再現する。
     """
     result = f"exec -a {shlex.quote(titles[0])} /bin/sleep {seconds}"
     for title in titles[1:]:
         inner = f"bash -c {shlex.quote(result)} & wait"
         result = f"exec -a {shlex.quote(title)} bash -c {shlex.quote(inner)}"
-    return f"bash -c {shlex.quote(result)}"
+    env = {"CLAUDECODE": "1"} if claudecode else {}
+    return f"{_env_prefix(env)} bash -c {shlex.quote(result)}"
 
 
 def test_the_real_production_tree_shape_is_not_a_job(tmp_path):
@@ -592,8 +657,9 @@ def test_the_real_production_tree_shape_is_not_a_job(tmp_path):
     `sh -c "playwright-mcp"`、実 fork 境界つき) を job (Bash tool wrapper) 無しで
     再現する。旧 comm ベースの許可リストなら、この形の内側にある `sh -c` の
     comm がシェル一致で job と誤読していた (t074 P1: 本番で実際に踏んだ偽陰性)。
-    起動元ベースでは、cmdline のどこにも wrapper marker が無いので
-    idle_process と判定されることを固定する。
+    起動元ベースでは、cmdline のどこにも wrapper marker が無く、environ も
+    本番実測どおり `CLAUDECODE` だけ (t091) なので、idle_process と判定される
+    ことを固定する。
     """
     cmd = _nested_infra_cmd(["sh -c playwright-mcp", "npm exec @playwright/mcp@latest"])
     root = subprocess.Popen(["sh", "-c", f"{cmd} & wait"], start_new_session=True)
@@ -616,10 +682,18 @@ def test_an_unidentified_persistent_process_is_not_treated_as_a_job(tmp_path):
     Bash tool / Monitor でない) ものは、名前を知っているかどうかに関わらず
     常に job ではない。ここでは「完全に未知の実行体名」でも同じ結果になる
     ことを固定する (旧テストは逆の結果 [executing] を期待していた)。
+
+    t091: environ は明示的に `CLAUDECODE=1` だけを持たせる (= Claude が起動した
+    が名前は未知、というシナリオ。名前が判定に効かないことを固定するのが
+    このテストの主眼であって、environ を空にすると別の主張 [unknown 側の
+    テスト] になってしまう — それは
+    `test_a_process_with_no_claudecode_evidence_at_all_is_unknown_not_idle`
+    が別に持つ)。
     """
     unknown_cmd = f"exec -a {shlex.quote('totally-unknown-binary')} /bin/sleep 300"
+    env_prefix = _env_prefix({"CLAUDECODE": "1"})
     root = subprocess.Popen(
-        ["sh", "-c", f'bash -c {shlex.quote(unknown_cmd)} & wait'],
+        ["sh", "-c", f'{env_prefix} bash -c {shlex.quote(unknown_cmd)} & wait'],
         start_new_session=True)
     try:
         time.sleep(0.3)
@@ -628,17 +702,202 @@ def test_an_unidentified_persistent_process_is_not_treated_as_a_job(tmp_path):
         _kill_pane_tree(root)
 
 
-def test_a_changed_wrapper_marker_fails_toward_more_notifications_not_silence(
+def test_a_process_with_no_claudecode_evidence_at_all_is_unknown_not_idle(tmp_path):
+    """t091 受入条件 (3) の cmdline 側の対照: `CLAUDECODE` すら無い (Claude Code
+    と無関係、または `env -i` で丸ごと消された) プロセスは、旧設計なら
+    「マーカーが無い」= infra/idle_process に倒れていたが、それは「本当に
+    infra だと確認できた」わけではない。job/infra どちらの確証も無いので
+    unknown に倒すことを固定する (Rule 5 は unknown も「job ではない」として
+    通知するので退行しない — 下の `test_the_same_pane_without_a_background_job_is_still_notified`
+    系と対照)。
+    """
+    unknown_cmd = f"exec -a {shlex.quote('totally-unknown-binary')} /bin/sleep 300"
+    env_prefix = _env_prefix({})  # CLAUDECODE も含め何も持たない
+    root = subprocess.Popen(
+        ["sh", "-c", f'{env_prefix} bash -c {shlex.quote(unknown_cmd)} & wait'],
+        start_new_session=True)
+    try:
+        time.sleep(0.3)
+        assert lib_pane_process.classify_process_tree(root.pid) == "unknown"
+    finally:
+        _kill_pane_tree(root)
+
+
+def test_a_changed_wrapper_marker_no_longer_loses_the_job_thanks_to_environ(
     monkeypatch, panes
 ):
     """Bash tool の内部実装が変わって wrapper marker が変わった (= 定数が古く
-    なった) 想定の欠陥注入。本物の job (`panes["busy"]`) がマーカー不一致で
-    「job ではない」に見えるようになる — その結果は Rule 5 / watchdog を
-    **もっと通知・terminate させる方向**であって、黙らせる方向ではないことを
-    固定する (受入条件: 「誤検知が増える方向に壊れ、黙る方向には壊れない」)。
+    なった) 想定の欠陥注入。t074 時点では、本物の job (`panes["busy"]`) が
+    マーカー不一致で「job ではない」に見えるようになっていた
+    (誤検知が増える方向に壊れ、黙る方向には壊れない、という設計だった)。
+
+    t091: cmdline マーカーが壊れても、environ の `JOB_ENVIRON_MARKERS`
+    (`panes["busy"]` の job ノードは本物の Bash tool job と同じく
+    `CLAUDE_CODE_CHILD_SESSION` / `CLAUDE_CODE_EXECPATH` を持つ) が第二の
+    証拠として残るので、**この特定の欠陥注入では job を見失わない** ことを
+    固定する — t091 が実際に直した P1 (`exec` で cmdline のマーカーが消える)
+    そのものに対する防御力の向上を示す。cmdline と environ の**両方**が
+    同時に壊れる (=job の証拠が全部消える) ケースは
+    `test_breaking_all_job_signals_falls_back_to_the_documented_residual_risk`
+    が別に持つ (残存リスクとして明記)。
     """
     monkeypatch.setattr(lib_pane_process, "BASH_TOOL_WRAPPER_MARKER", "/no-such-marker/")
+    assert lib_pane_process.classify_process_tree(panes["busy"]) == "executing"
+
+
+def test_breaking_one_job_env_marker_is_still_caught_by_the_other(panes, monkeypatch):
+    """受入条件 (4) 相当: job の environ シグナルを 2 つ (`CLAUDE_CODE_CHILD_SESSION`
+    / `CLAUDE_CODE_EXECPATH`) にしたのは、将来どちらか一方の名前が変わっても
+    (Claude Code の内部実装が変わる想定)、もう一方が残っていれば job 判定が
+    壊れないようにするため。`panes["busy"]` の job ノードは実際に両方持つ
+    (`_job_wrapper_cmd` 実測)。cmdline マーカーと環境変数の片方 (CHILD_SESSION)
+    が同時に壊れても、EXECPATH が残っていれば依然 job と判定されることを固定する。
+    """
+    monkeypatch.setattr(lib_pane_process, "BASH_TOOL_WRAPPER_MARKER", "/no-such-marker/")
+    monkeypatch.setattr(
+        lib_pane_process, "JOB_ENVIRON_MARKERS",
+        ("CLAUDE_CODE_CHILD_SESSION_RENAMED_BY_FUTURE_CLAUDE_CODE",
+         "CLAUDE_CODE_EXECPATH"))
+    assert lib_pane_process.classify_process_tree(panes["busy"]) == "executing"
+
+
+def test_breaking_all_job_signals_falls_back_to_the_documented_residual_risk(
+    panes, monkeypatch
+):
+    """既知の残存リスク (モジュール docstring に明記): cmdline マーカーと
+    job の environ シグナル**両方**が同時に壊れた場合 (= 将来 Claude Code が
+    `CLAUDE_CODE_CHILD_SESSION` と `CLAUDE_CODE_EXECPATH` を同時に改名する、
+    という考えにくい複合ドリフト)、job ノードは `CLAUDECODE` だけが残る —
+    これは infra ノードも同じく持つので、job と infra が区別できなくなり
+    infra 側に倒れる。**この複合欠陥だけは誤検知が増える方向 (idle_process) に
+    壊れ、watchdog の kill が増える方向に倒れうる** — 単独の定数破損では
+    起きない (`test_breaking_one_job_env_marker_is_still_caught_by_the_other`
+    参照) ことをここで対比させ、残存リスクの範囲を実測で固定する。
+    """
+    monkeypatch.setattr(lib_pane_process, "BASH_TOOL_WRAPPER_MARKER", "/no-such-marker/")
+    monkeypatch.setattr(lib_pane_process, "JOB_ENVIRON_MARKERS", ())
     assert lib_pane_process.classify_process_tree(panes["busy"]) == "idle_process"
+
+
+def test_breaking_the_infra_marker_fails_toward_unknown_not_idle(panes, monkeypatch):
+    """受入条件 (4) の対照: `INFRA_ENVIRON_MARKER` (`CLAUDECODE`) の名前が変わると、
+    本物の infra ノード (`panes["quiet"]`) はもう infra と確証できなくなり
+    unknown に倒れる — job は無いままなので Rule 5 の通知判断は変わらないが
+    (unknown も infra も「job ではない」= 通知する)、watchdog は unknown を
+    殺さない側に倒すので、**kill は増えず、より安全な方向に壊れる**
+    (誤検知が増える側 = 通知寄りに壊れ、kill が増える側には倒れない)。
+    """
+    monkeypatch.setattr(lib_pane_process, "INFRA_ENVIRON_MARKER", "CLAUDECODE_RENAMED")
+    assert lib_pane_process.classify_process_tree(panes["quiet"]) == "unknown"
+
+
+# ---------------------------------------------------------------------------
+# t091 受入条件 (1)(3): `exec` で cmdline のマーカーが消えた後の本物のプロセス
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(scope="module")
+def execd_panes(tmp_path_factory):
+    """{"job_execd": pid, "job_wiped": pid} — どちらも `exec` の**後**の実プロセス
+    (cmdline はすでに `sleep 300` に置き換わっている。ラッパーの印は無い)。
+
+    job_execd: environ は `_job_wrapper_cmd(..., with_marker=False)` どおり
+               `CLAUDECODE` / `CLAUDE_CODE_CHILD_SESSION` / `CLAUDE_CODE_EXECPATH`
+               を持つ (`exec` は envp を明示しない限り継承するので、本物の
+               Bash tool job が `exec` した直後と同じ状態)。
+    job_wiped: `exec env -i sleep 300` 相当 — cmdline も environ も両方消える
+               (受入条件 (3) の「不明」)。
+    """
+    fake_dir = tmp_path_factory.mktemp("execd-fake-panes")
+    snapshot = _write_wrapper_snapshot(fake_dir)
+    execd_cmd = _job_wrapper_cmd(snapshot, "/bin/sleep 300", with_marker=False)
+    wiped_cmd = f'{_env_prefix({})} bash -c {shlex.quote("exec /bin/sleep 300")}'
+    job_execd = subprocess.Popen(["sh", "-c", f'{execd_cmd} & wait'], start_new_session=True)
+    job_wiped = subprocess.Popen(["sh", "-c", f'{wiped_cmd} & wait'], start_new_session=True)
+    time.sleep(0.5)
+    try:
+        yield {"job_execd": job_execd.pid, "job_wiped": job_wiped.pid}
+    finally:
+        for p in (job_execd, job_wiped):
+            _kill_pane_tree(p)
+
+
+def test_the_execd_panes_classify_as_intended(execd_panes):
+    """前提: `exec` 後もラッパーの cmdline marker は無いことを確認する
+    (無ければこの先の assert は何の証明にもならない)。"""
+    execd_cmdline = lib_pane_process._proc_cmdline(
+        next(iter(_direct_children(execd_panes["job_execd"]))))
+    assert lib_pane_process.BASH_TOOL_WRAPPER_MARKER not in (execd_cmdline or "")
+
+
+def test_exec_erasing_the_cmdline_marker_is_still_a_job(execd_panes):
+    """受入条件 (1) そのもの: `exec sleep 30` 相当 (cmdline のマーカーは無いが
+    environ は残る) は `executing` と判定される — cmdline だけを見ていた
+    t074 時点の実装ならここは `idle_process` になっていた。"""
+    assert lib_pane_process.classify_process_tree(execd_panes["job_execd"]) == "executing"
+
+
+def test_removing_the_environ_fallback_makes_the_execd_job_look_idle(
+    execd_panes, monkeypatch
+):
+    """赤の実証: environ フォールバックを外した (t074 までの) 欠陥版に戻すと、
+    `exec` 済みの本物の job が `idle_process` に化けることを固定する
+    (受入条件 (1) の「欠陥版で落ちる」)。"""
+    monkeypatch.setattr(lib_pane_process, "JOB_ENVIRON_MARKERS", ())
+    assert lib_pane_process.classify_process_tree(execd_panes["job_execd"]) == "idle_process"
+
+
+def test_watchdog_does_not_terminate_an_exec_erased_job(tmp_path, monkeypatch, execd_panes):
+    """受入条件 (1): `exec` 済みの job を watchdog が terminate しないこと
+    (実際の `WorkerMonitor.check_detail()` を通す)。"""
+    monkeypatch.setattr(watchdog, "_mux", _WatchdogFakeMux(WINDOW, execd_panes["job_execd"]))
+    monitor = _make_monitor(tmp_path, idle=300)
+    _write_activity(tmp_path, age_seconds=3000)
+    detail = monitor.check_detail()
+    assert (detail.verdict, detail.process_signal) == ("warn", "executing")
+
+
+def test_watchdog_would_terminate_the_exec_erased_job_without_the_environ_fallback(
+    tmp_path, monkeypatch, execd_panes
+):
+    """同じ赤の実証を watchdog の実際の判定を通して確かめる: environ フォールバック
+    を外すと、`exec` 済みの job が hard-idle で terminate されてしまう。"""
+    monkeypatch.setattr(lib_pane_process, "JOB_ENVIRON_MARKERS", ())
+    monkeypatch.setattr(watchdog, "_mux", _WatchdogFakeMux(WINDOW, execd_panes["job_execd"]))
+    monitor = _make_monitor(tmp_path, idle=300)
+    _write_activity(tmp_path, age_seconds=3000)
+    detail = monitor.check_detail()
+    assert (detail.verdict, detail.reason) == ("terminate", "hard_idle")
+
+
+def test_watchdog_does_not_terminate_a_fully_wiped_exec_job_either(
+    tmp_path, monkeypatch, execd_panes
+):
+    """受入条件 (3): `exec env -i sleep 30` (cmdline も environ も消える) は
+    `unknown` になり、watchdog はやはり terminate しない (warn)。"""
+    monkeypatch.setattr(watchdog, "_mux", _WatchdogFakeMux(WINDOW, execd_panes["job_wiped"]))
+    monitor = _make_monitor(tmp_path, idle=300)
+    _write_activity(tmp_path, age_seconds=3000)
+    detail = monitor.check_detail()
+    assert (detail.verdict, detail.reason, detail.process_signal) == (
+        "warn", "hard_idle_but_process_unknown", "unknown")
+
+
+def test_rule5_stays_silent_for_an_exec_erased_job(r5, execd_panes):
+    """受入条件 (1) の Rule 5 側: `exec` 済みの job がある間は
+    idle-with-task を通知しない (job のまま黙る)。"""
+    PaneMux.pane_state, PaneMux.pane_pid = "idle", execd_panes["job_execd"]
+    r5.age_state()
+    assert r5.run() == []
+
+
+def test_rule5_notifies_for_a_fully_wiped_exec_job(r5, execd_panes):
+    """受入条件 (3) の Rule 5 側: cmdline も environ も消えた exec 済みプロセス
+    (`unknown`) は「job だと確証できない」ので、Rule 5 は通常どおり通知する
+    (unknown を「job だから黙る」に倒さない — 誤検知が増える側)。"""
+    PaneMux.pane_state, PaneMux.pane_pid = "idle", execd_panes["job_wiped"]
+    r5.age_state()
+    msgs = r5.run()
+    assert len(msgs) == 1 and "idle-with-task" in msgs[0]
 
 
 # ---------------------------------------------------------------------------

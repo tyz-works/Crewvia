@@ -402,6 +402,44 @@ class TestCommentedHeadersDoNotHideOrMisassignCapabilities:
         caps, problem = lint_plan._load_deliverable_capabilities(str(path))
         assert caps == {} and problem is not None
 
+    def test_a_null_skills_section_is_a_problem_not_zero_declarations(self, tmp_path):
+        """5 巡目 (t076→t081) の finding と同族: `skills:` **キーが無い** (この config が
+        まだ書かれていない素の状態) は「宣言 0 件」の正当な既定だが (別テストで確認済み)、
+        **キーはあって値が null** (セクションが編集事故で丸ごと消えた) は同じに潰さず
+        拒否する。欠陥版はどちらも (`{}`, None) を返し、この assert が拾う — 「全 skill が
+        作れる」へ静かに倒れる (research/review 等の読み取り専用 skill が PR を作れてしまう)。
+        """
+        path = tmp_path / "skill-permissions.yaml"
+        path.write_text("skills: null\n")
+        caps, problem = lint_plan._load_deliverable_capabilities(str(path))
+        assert caps == {} and problem is not None
+
+    def test_a_missing_skills_key_is_zero_declarations_not_a_problem(self, tmp_path):
+        """対照: `skills:` キー自体が無いファイルは、上のテストとは区別して「宣言 0 件」
+        (既存の意図的な既定、退行させない)。"""
+        path = tmp_path / "skill-permissions.yaml"
+        path.write_text("title: no skills section at all\n")
+        assert lint_plan._load_deliverable_capabilities(str(path)) == ({}, None)
+
+    def test_a_null_skill_entry_is_a_problem_not_no_declaration(self, tmp_path):
+        """5 巡目 (t076→t081) の finding と同族: `research:` の直後に何も書かない (YAML の
+        null) を「このスキルは宣言していない」に静かに潰さない — 「触ったが空にした」の
+        可能性を拒否する。`research: {}` (明示的な空マッピング) なら宣言なしとして通す
+        (別テストで確認)。欠陥版はこの assert を拾う。
+        """
+        path = tmp_path / "skill-permissions.yaml"
+        path.write_text("skills:\n  research:\n  code:\n    can_produce_deliverable: true\n")
+        caps, problem = lint_plan._load_deliverable_capabilities(str(path))
+        assert caps == {} and problem is not None and "research" in problem
+
+    def test_an_explicit_empty_mapping_skill_entry_is_no_declaration(self, tmp_path):
+        """対照: `research: {}` (明示的な空マッピング) は「宣言なし」として通る
+        (null とは区別する、既存の許容パターンを退行させない)。"""
+        path = tmp_path / "skill-permissions.yaml"
+        path.write_text("skills:\n  research: {}\n  code:\n    can_produce_deliverable: true\n")
+        caps, problem = lint_plan._load_deliverable_capabilities(str(path))
+        assert problem is None and "research" not in caps and caps.get("code") is True
+
     def test_without_pyyaml_the_config_is_unreadable_not_permissively_empty(self, tmp_path, monkeypatch):
         """PyYAML が無い環境向けの簡易フォールバックは意図的に持たない — 「読めない」に倒す。"""
         monkeypatch.setattr(lint_plan, "yaml", None)
@@ -469,12 +507,28 @@ class TestMissionMark:
         q = self._write(tmp_path, "title: x\ndeliverable_required: true\nreview:\n  cycle_count: 0\n")
         assert lint_plan._mission_requires_deliverable("m", q) == (True, None)
 
-    @pytest.mark.parametrize("text", ["title: x\n", "deliverable_required: false\n", "deliverable_required: null\n"])
+    @pytest.mark.parametrize("text", ["title: x\n", "deliverable_required: false\n"])
     def test_no_mark_is_not_required(self, tmp_path, text):
         assert lint_plan._mission_requires_deliverable("m", self._write(tmp_path, text)) == (False, None)
 
     def test_a_missing_mission_yaml_is_the_only_absence_that_means_not_required(self, tmp_path):
         assert lint_plan._mission_requires_deliverable("m", str(tmp_path)) == (False, None)
+
+    @pytest.mark.parametrize("text", [
+        "title: x\ndeliverable_required: null\n",
+        "title: x\ndeliverable_required: ~\n",
+        "title: x\ndeliverable_required:\n",       # 値を書かない (YAML では null と同じ)
+        "title: x\ndeliverable_required: \"\"\n",  # 空文字列
+    ])
+    def test_a_present_but_empty_key_is_a_problem_not_a_no(self, tmp_path, text):
+        """5 巡目 (t076→t081) の finding: `dict.get()` は「キーが無い」と「キーはあるが
+        値が null/空」を同じ None に潰していた。欠陥版はこの assert を拾う (どちらも
+        (False, None) を返してしまう — キーに触れたのに黙って「必須でない」へ倒れる)。
+        『null を受け入れる』旧テストは欠陥を固定していたので、このケースを
+        test_no_mark_is_not_required から分離しここへ移した。
+        """
+        required, problem = lint_plan._mission_requires_deliverable("m", self._write(tmp_path, text))
+        assert required is False and problem and "true / false" in problem
 
     @pytest.mark.parametrize("value", ["maybe", "1", "\"true\""])
     def test_a_non_boolean_mark_is_a_problem_not_a_no(self, tmp_path, value):

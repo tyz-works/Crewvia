@@ -417,13 +417,24 @@ def _load_deliverable_capabilities(skill_permissions_path: str) -> tuple[dict, O
     既定の「作れる」に静かに倒さない)。ファイル自体が無い場合も同様に問題として返す
     (`missing_is_ok=False`) — この config は常に存在すべき前提で、無いことを「全 skill が
     作れる」に静かに倒さない。
+
+    5 巡目 (t076→t081) の finding と同族: `skills:` **キーが無い** (この config がまだ
+    1 件も書かれていない、素の状態) は「宣言 0 件」の正当な既定として扱うが、**キーがあって
+    値が明示的に `null`** (セクションの中身が丸ごと消えた・編集事故) は同じ意味に潰さず
+    「読めない」として拒否する — `can_produce_deliverable` を守る欄そのものが消えたのに
+    気付かず「全 skill が作れる」へ静かに倒れるのを防ぐ。同じ理由で、各 skill の値が
+    `null` (`research:` の直後に何も書かれていない等) も「宣言なし」に潰さず拒否する
+    (`research: {}` という明示的な空マッピングなら「宣言なし」として通す —
+    「触ったが空にした」と「意図的に空だと書いた」を区別する)。
     """
     data, problem = _load_yaml_document(skill_permissions_path, missing_is_ok=False)
     if problem is not None:
         return {}, problem
-    skills = data.get('skills')
-    if skills is None:
+    if 'skills' not in data:
         return {}, None                      # `skills:` セクション自体が無い = 宣言 0 件
+    skills = data['skills']
+    if skills is None:
+        return {}, f"{skill_permissions_path}: 'skills' が null です (セクションごと消さず、書かないなら削除すること)"
     if not isinstance(skills, dict):
         return {}, f"{skill_permissions_path}: 'skills' がマッピングではありません ({type(skills).__name__})"
 
@@ -432,7 +443,8 @@ def _load_deliverable_capabilities(skill_permissions_path: str) -> tuple[dict, O
         if not isinstance(name, str):
             return {}, f"{skill_permissions_path}: skills の下に文字列でないキーがあります ({name!r})"
         if entry is None:
-            continue                         # 空のスキル定義。宣言なしと同じ
+            return {}, (f"{skill_permissions_path}: skill {name!r} の値が null です "
+                        f"(何も宣言しないなら {{}} と書くこと)")
         if not isinstance(entry, dict):
             return {}, f"{skill_permissions_path}: skill {name!r} の値がマッピングではありません ({type(entry).__name__})"
         if 'can_produce_deliverable' not in entry:
@@ -455,13 +467,22 @@ def _mission_requires_deliverable(slug: str, queue_dir: str) -> tuple[bool, Opti
     引っかからず「true / false のどちらかだけ」の FAIL になる (黙って False にしない)。
     引用符付きのキー `"deliverable_required": true` も、本物のパーサはキーの引用符を
     構文として扱うので、通常のキーと同じに読める (丸ごと無視しない)。
+
+    5 巡目 (t076→t081) の finding: `dict.get()` は「キーが無い」と「キーはあるが値が
+    null」を同じ `None` に潰す。**キーが無い** (mission.yaml がこの機能より前に書かれた・
+    そもそも `deliverable_required` に触れたことが無い) のは「必須でない」の正当な既定。
+    だが **キーがあって値が明示的に `null` / `~` / 何も書かれていない** のは、誰かがこの欄を
+    触ったのに空にした (書き忘れ・誤消去) 可能性が高く、「必須でない」に黙って倒さない —
+    `in` 演算子でキーの有無を別に確かめてから値を読む。
     """
     path = os.path.join(queue_dir, 'missions', slug, 'mission.yaml')
     data, problem = _load_yaml_document(path)
     if problem is not None:
         return False, problem
-    value = data.get('deliverable_required')
-    if value is None or value is False:
+    if 'deliverable_required' not in data:
+        return False, None
+    value = data['deliverable_required']
+    if value is False:
         return False, None
     if value is True:
         return True, None

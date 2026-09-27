@@ -388,6 +388,47 @@ class TestProcessScan:
         found, problem = gc.scan_process_cwds()
         assert found == [] and "/400/cwd (claude)" in problem
 
+    def test_a_readonly_probe_where_stat_also_fails_with_eacces_fails_the_scan(self, tmp_path, monkeypatch):
+        """readlink・stat の両方が EACCES を返す read-only probe (族A、PR#239 2巡目 P2)。
+        `stat` の失敗を ENOENT/ESRCH 以外まで「消えた」に潰すと、この pid が実は worktree の中で
+        作業中の Worker でも `([], '')` = スキャン成功として報告され、in-use 判定を作れなくなる。"""
+        root = self._proc(tmp_path, monkeypatch)
+        self._entry(root, 700, comm="claude")
+        real_readlink, real_stat = os.readlink, os.stat
+
+        def deny_readlink(path, *a, **kw):
+            if str(path).endswith("/700/cwd"):
+                raise PermissionError(13, "denied", str(path))
+            return real_readlink(path, *a, **kw)
+
+        def deny_stat(path, *a, **kw):
+            if str(path).endswith("/700"):
+                raise PermissionError(13, "denied", str(path))
+            return real_stat(path, *a, **kw)
+        monkeypatch.setattr(gc.os, "readlink", deny_readlink)
+        monkeypatch.setattr(gc.os, "stat", deny_stat)
+        found, problem = gc.scan_process_cwds()
+        assert found == [] and problem, "EACCES で stat も読めないとき、スキャン成功 (問題なし) にしてはいけない"
+
+    def test_a_stat_enoent_after_an_unreadable_cwd_is_still_harmless(self, tmp_path, monkeypatch):
+        """stat が ENOENT/ESRCH のときは従来どおり「消えた」で continue してよい (回帰させない)。"""
+        root = self._proc(tmp_path, monkeypatch)
+        self._entry(root, 701, comm="claude")
+        real_readlink, real_stat = os.readlink, os.stat
+
+        def deny_readlink(path, *a, **kw):
+            if str(path).endswith("/701/cwd"):
+                raise PermissionError(13, "denied", str(path))
+            return real_readlink(path, *a, **kw)
+
+        def vanished_stat(path, *a, **kw):
+            if str(path).endswith("/701"):
+                raise FileNotFoundError(2, "No such file or directory", str(path))
+            return real_stat(path, *a, **kw)
+        monkeypatch.setattr(gc.os, "readlink", deny_readlink)
+        monkeypatch.setattr(gc.os, "stat", vanished_stat)
+        assert gc.scan_process_cwds() == ([], "")
+
     def test_an_unreadable_allowlisted_daemon_does_not_fail_the_scan(self, tmp_path, monkeypatch):
         root = self._proc(tmp_path, monkeypatch)
         self._entry(root, 500, comm="ssh-agent")
@@ -552,6 +593,29 @@ class TestGitContent:
         assert got[str(dirty)].reason == gc.R_DIRTY
         assert got[str(unpushed)].reason == gc.R_UNPUSHED
         assert got[str(ignored)].reason == gc.R_IGNORED
+
+
+class TestGitEnvIsolation:
+    """`_git_env()` は `-C <path>` を上書きしうる GIT_* 環境変数を継承しない
+    (族B — 検査した対象と実際に作用する対象が違う。PR#239 2巡目 P1)。"""
+
+    @pytest.mark.parametrize("key", list(gc._GIT_REPO_LOCATION_ENV_VARS))
+    def test_git_env_drops_repo_location_vars(self, monkeypatch, key):
+        monkeypatch.setenv(key, "/somewhere/else")
+        assert key not in gc._git_env()
+
+    def test_an_ambient_git_dir_pointing_elsewhere_does_not_hide_a_dirty_candidate(self, fx, monkeypatch, tmp_path):
+        """t058 QA の実機再現: 呼び出し元シェルに GIT_DIR/GIT_WORK_TREE が残っていても、
+        判定は `-C` で指定した candidate worktree を見る (decoy を指すと dirty が消えて見えていた)。"""
+        wt = _pushed_worktree(fx)
+        (wt / "work.txt").write_text("edited\n")
+        decoy = tmp_path / "decoy"
+        decoy.mkdir()
+        subprocess.run(["git", "init", "-q", str(decoy)], env=_env(), check=True)
+        monkeypatch.setenv("GIT_DIR", str(decoy / ".git"))
+        monkeypatch.setenv("GIT_WORK_TREE", str(decoy))
+        v = fx.verdict(wt)
+        assert (v.action, v.reason) == (gc.KEEP, gc.R_DIRTY), v
 
 
 class TestParseWorktreeList:

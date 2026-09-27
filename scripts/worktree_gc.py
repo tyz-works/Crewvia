@@ -111,8 +111,22 @@ PROC_ROOT = Path('/proc')
 # git
 # ---------------------------------------------------------------------------
 
+#: `git -C <path>` の指定を上書きしうる環境変数。呼び出し元のシェルにこれらが残っていると、
+#: `-C` で指定した候補 worktree ではなく env の指す別リポジトリ/worktree/index を検査してしまう
+#: (族B — 検査した対象と実際に作用する対象が違う。PR#239 2巡目 P1、t058 QA が実機で再現:
+#: GIT_DIR/GIT_WORK_TREE を dirty な candidate とは別の clean リポジトリに向けると、
+#: candidate への `git -C candidate status` の出力が空文字列になり dirty が検出できなくなった)。
+_GIT_REPO_LOCATION_ENV_VARS = (
+    'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE',
+    'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES',
+    'GIT_COMMON_DIR', 'GIT_NAMESPACE',
+)
+
+
 def _git_env() -> dict:
     env = dict(os.environ)
+    for key in _GIT_REPO_LOCATION_ENV_VARS:
+        env.pop(key, None)
     env['LC_ALL'] = 'C'
     # 読み取り専用の判定が index.lock を取りに行かない (status の opportunistic refresh を止める)。
     env['GIT_OPTIONAL_LOCKS'] = '0'
@@ -298,10 +312,16 @@ def scan_process_cwds() -> tuple[list, str]:
             if e.errno in (errno.ENOENT, errno.ESRCH):
                 continue
             try:
-                if os.stat(proc / pid).st_uid != me:
-                    continue
-            except OSError:
-                continue                  # stat もできない = 消えた
+                st_uid = os.stat(proc / pid).st_uid
+            except OSError as stat_e:
+                if stat_e.errno in (errno.ENOENT, errno.ESRCH):
+                    continue          # プロセスが消えた
+                # EACCES / EIO 等は消滅の証拠ではない (族A — 観測の失敗を「不在」に潰さない。
+                # PR#239 2巡目 P2、t058 QA が実機で再現: readlink・stat の両方が EACCES を返す
+                # read-only probe で `([], '')` = スキャン成功として報告されていた)。
+                return [], f'/proc/{pid} を stat できない ({stat_e})'
+            if st_uid != me:
+                continue
             if _cwd_unreadable_but_harmless(pid) is not None:
                 continue
             try:

@@ -29,6 +29,8 @@
 #   W  ignored なファイルがあっても remove にする                                    → 赤 (t057 / PR#239 F1)
 #   X  --apply のたびに repository-wide の git worktree prune を復活させる            → 赤 (t057 / PR#239 F2)
 #   Y  lsof が非 0 でも部分出力を完全なスキャンとみなす                              → 赤 (t057 / PR#239 F3)
+#   Z  GIT_DIR/GIT_WORK_TREE 等を継承し、-C の指定を上書きさせる                     → 赤 (t064 / PR#239 2巡目 P1)
+#   AA stat の EACCES 等 ENOENT/ESRCH 以外の OSError も「消えた」に潰す              → 赤 (t064 / PR#239 2巡目 P2)
 #
 # 隔離: 使い捨ての複製で欠陥を注入する。本番の worktree のファイルには触らない。
 # テストは一時ディレクトリの git repo (origin = bare) と隔離した queue / registry だけで動き、
@@ -233,6 +235,27 @@ inject $S "    if proc.returncode != 0:
            "    if False:
         return [], f'lsof が不完全 (rc={proc.returncode}): {(proc.stderr or \"\").strip()[:200]}'"
 expect_red "case Y" "test_a_nonzero_lsof_exit_with_partial_output_is_a_failure_not_a_partial_success"
+
+echo "== case Z: GIT_DIR/GIT_WORK_TREE 等を継承する (PR#239 2巡目 P1)"
+fresh_copy
+inject $S "    for key in _GIT_REPO_LOCATION_ENV_VARS:
+        env.pop(key, None)
+    env['LC_ALL'] = 'C'" \
+           "    env['LC_ALL'] = 'C'"
+expect_red "case Z" "test_git_env_drops_repo_location_vars"
+
+echo "== case AA: stat の EACCES 等を「消えた」に潰す (PR#239 2巡目 P2)"
+fresh_copy
+inject $S "            except OSError as stat_e:
+                if stat_e.errno in (errno.ENOENT, errno.ESRCH):
+                    continue          # プロセスが消えた
+                # EACCES / EIO 等は消滅の証拠ではない (族A — 観測の失敗を「不在」に潰さない。
+                # PR#239 2巡目 P2、t058 QA が実機で再現: readlink・stat の両方が EACCES を返す
+                # read-only probe で \`([], '')\` = スキャン成功として報告されていた)。
+                return [], f'/proc/{pid} を stat できない ({stat_e})'" \
+           "            except OSError:
+                continue                  # stat もできない = 消えた"
+expect_red "case AA" "test_a_readonly_probe_where_stat_also_fails_with_eacces_fails_the_scan"
 
 echo
 echo "PASS=$PASS FAIL=$FAIL"

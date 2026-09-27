@@ -67,6 +67,26 @@ memory `fail-closed-discard-vs-hold` / `evidence-for-destructive-decisions` の�
 2026-09-27)。lsof は一部のプロセスの検査に失敗しても集められた分の部分出力を出しつつ非 0 を返すことが
 あり、その部分出力を「見つからなかった (= 使われていない)」の証拠にしてはいけない。
 
+`readlink(cwd)` が ENOENT/ESRCH 以外 (典型は EACCES) を返したときのフォールバックの `stat(/proc/<pid>)` も、
+**その stat 自体が失敗した場合は ENOENT/ESRCH だけを「消えた」として続行し、それ以外はスキャン失敗として
+返す** (PR#239 2巡目 P2、t064、2026-09-27)。両方が EACCES を返す read-only な probe を「消えた」に潰すと、
+`([], '')` = スキャン成功として `classify()` に渡り、実際には worktree の中で作業中の Worker プロセスの
+在圏を見落として remove へ進みうる。族A (観測の失敗を「不在」に潰す) の欠陥が lsof の rc チェック
+(finding #3) と同じ型で `/proc` 経路のこの 1 箇所にだけ残っていた。
+
+## git 呼び出しの環境分離 (`_git_env()`)
+
+`run_git()` は必ず `git -C <path> ...` の形で候補 worktree を指定するが、**環境変数がその指定を上書き
+しうる** (族B — 検査した対象と実際に作用する対象が違う。PR#239 2巡目 P1、t064、2026-09-27)。
+`_git_env()` は呼び出し元のシェルから継承した `os.environ` のうち、リポジトリ/worktree/index の場所を
+決める変数 (`GIT_DIR` / `GIT_WORK_TREE` / `GIT_INDEX_FILE` / `GIT_OBJECT_DIRECTORY` /
+`GIT_ALTERNATE_OBJECT_DIRECTORIES` / `GIT_COMMON_DIR` / `GIT_NAMESPACE`) を明示的に unset する。
+これらが残っていると、`git -C candidate status` が実際には **candidate ではなく env の指す別リポジトリ**
+を検査してしまい (git hook の中・別ツールのラッパー経由・`git -C` を多用するセッションなど混入経路は
+複数考えられる)、未コミットの変更があっても「クリーン」に見え、他の条件さえ揃えば remove されうる
+(`--fetch` の `git fetch --prune origin` や `apply_removals` の再判定ステップも同じ `_git_env()` を
+通るため影響範囲は同じ)。
+
 ## `--apply` の安全策
 
 - `git worktree remove` — **`--force` を使わない** (git が dirty / locked を自分でも断る)。
@@ -112,4 +132,5 @@ env の停止スイッチも付けていない。PR を revert すれば道具�
 
 - `python3 -m pytest tests/test_worktree_gc.py -q` — 一時 git repo (origin = bare) と隔離した queue / registry で、
   各条件の keep / remove・観測できない場合の保留・`--apply` しても keep が残る・再判定・`-D` / `--force` を使わない。
-- 赤の実証: `bash tests/red_proof_t033.sh` (25 ケース。W/X/Y は PR#239 の Codex findings 3 件、t057)。
+- 赤の実証: `bash tests/red_proof_t033.sh` (27 ケース。W/X/Y は PR#239 1巡目の Codex findings 3 件 (t057)、
+  Z/AA は PR#239 2巡目の findings 2 件 (t064: GIT_DIR 系の継承・`/proc` stat の EACCES 扱い))。

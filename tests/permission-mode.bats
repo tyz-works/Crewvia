@@ -128,8 +128,10 @@ teardown() {
 
     # BENCH_MODE のため window 'PermTest-worker' へ渡された send-keys の中身に
     # --permission-mode auto が含まれることを確認する。
+    # t070 P1 (族D): 値は _shq (printf %q) でクォートしてから連結する。"auto" は特殊文字を
+    # 含まないので printf %q はクォート無しでそのまま返す (生の '$var' 埋め込みではなくなった)。
     grep -qF "PermTest-worker" "$FAKE_TMUX_LOG"
-    grep -qF -- "--permission-mode 'auto'" "$FAKE_TMUX_LOG"
+    grep -qF -- "--permission-mode auto" "$FAKE_TMUX_LOG"
 }
 
 @test "director (mux mode): 起動コマンド文字列に --permission-mode が含まれない" {

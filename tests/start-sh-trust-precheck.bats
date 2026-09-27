@@ -322,7 +322,9 @@ _kickoffs()   { grep -cF -- "ミッション開始" "$FAKE_TMUX_LOG" || true; }
 
     [ "$status" -eq 0 ]
     _launched
-    grep -qF "CLAUDE_CONFIG_DIR='${CFG}'" "$FAKE_TMUX_LOG"
+    # t070 P1: _shq (printf %q) は特殊文字を含まない値をクォート無しでそのまま返すので、
+    # ここでは生の '$VAR' 埋め込みではなく _shq を通した後の形 (この値では無クォート) を見る。
+    grep -qF "CLAUDE_CONFIG_DIR=${CFG}" "$FAKE_TMUX_LOG"
 }
 
 @test "without CLAUDE_CONFIG_DIR, the launch command clears any stale value the pane's server env might hold (t051 P1)" {
@@ -348,7 +350,7 @@ _kickoffs()   { grep -cF -- "ミッション開始" "$FAKE_TMUX_LOG" || true; }
 
     [ "$status" -eq 0 ]
     _launched
-    grep -qF "HOME='${FAKE_HOME}'" "$FAKE_TMUX_LOG"
+    grep -qF "HOME=${FAKE_HOME}" "$FAKE_TMUX_LOG"
     find "$FAKE_HOME" -depth -delete 2>/dev/null || true
 }
 
@@ -439,4 +441,115 @@ _kickoffs()   { grep -cF -- "ミッション開始" "$FAKE_TMUX_LOG" || true; }
     [[ "$output" != *"trust ダイアログで止まっています"* ]]
     ! grep -q '^kill-window' "$FAKE_TMUX_LOG"
     [ ! -e "$REFUSALS" ]
+}
+
+# ---------------------------------------------------------------------------
+# 3. LAUNCH_CMD の安全性 (t070 / B6 2巡目 — Codex review): シェルインジェクション (P1) と
+#    相対 CLAUDE_CONFIG_DIR (P2)。文字列の形を見るだけでは評価時の挙動を保証しない (Codex 指摘:
+#    「現在のテストはコマンド文字列を検査するだけで、一度も実行していない」) ので、ここでは
+#    fake tmux に送られた LAUNCH_CMD の実テキストを取り出し、隔離した bash で実際に評価する。
+# ---------------------------------------------------------------------------
+
+_launch_cmd_text() {   # mux_spawn が最初に send-keys したテキスト (ENV_EXPORTS から始まる行)
+    grep -m1 '^send-keys -t @1 export ' "$FAKE_TMUX_LOG" | sed 's/^send-keys -t @1 //'
+}
+
+@test "LAUNCH_CMD survives a TARGET_DIR containing a quote and a shell-injection payload, evaluated for real (t070 P1)" {
+    trust_fixture_setup /   # ancestor 継承で TARGET_DIR がどんな名前でも trust 判定は通す
+    INJECT_HOLDER="$(mktemp -d)"
+    INJECTED_MARKER="${INJECT_HOLDER}/INJECTED_MARKER"
+    INJECT_TARGET="${INJECT_HOLDER}/pwn'; touch ${INJECTED_MARKER}; #"
+    mkdir -p "$INJECT_TARGET"
+
+    TARGET_DIR="$INJECT_TARGET" run bash "$START_SH" worker --name Ren code
+    [ "$status" -eq 0 ]
+    _launched
+
+    LAUNCH_CMD_TEXT="$(_launch_cmd_text)"
+    [ -n "$LAUNCH_CMD_TEXT" ]
+
+    # claude の代わりに引数と cwd を書き出すだけのスタブを使い、隔離した bash で実際に評価する。
+    EVAL_DIR="$(mktemp -d)"
+    CLAUDE_RAN_MARKER="${EVAL_DIR}/claude_ran"
+    cat > "${EVAL_DIR}/claude" <<STUB
+#!/usr/bin/env bash
+{ echo "ARGS: \$*"; echo "CWD: \$PWD"; } > "${CLAUDE_RAN_MARKER}"
+STUB
+    chmod +x "${EVAL_DIR}/claude"
+
+    ( env -i PATH="${EVAL_DIR}:${PATH}" HOME="$HOME" bash -c "$LAUNCH_CMD_TEXT" ) || true
+
+    [ -f "$CLAUDE_RAN_MARKER" ]          # (a) 起動が壊れていない — claude スタブが実際に起動された
+    [ ! -f "$INJECTED_MARKER" ]          # (b) 注入されたコマンドは実行されていない
+    grep -qF "$INJECT_TARGET" "$CLAUDE_RAN_MARKER"   # cd 先は正しく (壊れず) そのディレクトリだった
+
+    find "$INJECT_HOLDER" "$EVAL_DIR" -depth -delete 2>/dev/null || true
+}
+
+@test "AGENT_NAME containing a quote does not break LAUNCH_CMD either, evaluated for real (t070 P1 / family D)" {
+    trust_fixture_setup
+    # AGENT_NAME は crewvia-worker-<name>.json のファイル名にも使われるので、ここでは "/" を
+    # 含めない (含めると単に「ファイル名の途中に区切りがある無関係な filesystem の話」になり、
+    # このテストが狙うシェル評価時の注入とは別の壊れ方になる)。
+    AGENT_INJECT="Ren'; touch INJECTED_AGENT_MARKER; #"
+
+    TARGET_DIR="$TARGET" run bash "$START_SH" worker --name "$AGENT_INJECT" code
+    [ "$status" -eq 0 ]
+    _launched
+
+    LAUNCH_CMD_TEXT="$(_launch_cmd_text)"
+    [ -n "$LAUNCH_CMD_TEXT" ]
+
+    EVAL_DIR="$(mktemp -d)"
+    CLAUDE_RAN_MARKER="${EVAL_DIR}/claude_ran"
+    cat > "${EVAL_DIR}/claude" <<STUB
+#!/usr/bin/env bash
+echo "ran" > "${CLAUDE_RAN_MARKER}"
+STUB
+    chmod +x "${EVAL_DIR}/claude"
+
+    ( cd "$EVAL_DIR" && env -i PATH="${EVAL_DIR}:${PATH}" HOME="$HOME" bash -c "$LAUNCH_CMD_TEXT" ) || true
+
+    [ -f "$CLAUDE_RAN_MARKER" ]
+    [ ! -f "${EVAL_DIR}/INJECTED_AGENT_MARKER" ]
+
+    find "$EVAL_DIR" -depth -delete 2>/dev/null || true
+}
+
+@test "a relative CLAUDE_CONFIG_DIR resolves to the same absolute dir the spawned claude will read (t070 P2)" {
+    # start.sh 自身の cwd (REL_BASE) を基準にした相対 CLAUDE_CONFIG_DIR。TARGET_DIR は別の場所 (=$TARGET)。
+    # precheck は cd される前の cwd を基準に読み、LAUNCH_CMD は WORK_DIR に cd してから claude を
+    # 起動する — 「同じ文字列」のままだと基準がずれて別の設定を見てしまう (2巡目 P2 の再現条件)。
+    REL_BASE="$(mktemp -d)"
+    mkdir -p "${REL_BASE}/.config"
+    printf '{"projects": {"%s": {"hasTrustDialogAccepted": true}}}' "$TARGET" > "${REL_BASE}/.config/.claude.json"
+
+    ( cd "$REL_BASE" && CLAUDE_CONFIG_DIR=".config" TARGET_DIR="$TARGET" bash "$START_SH" worker --name Ren code )
+    status=$?
+
+    [ "$status" -eq 0 ]
+    _launched
+    # 伝播された CLAUDE_CONFIG_DIR が REL_BASE/.config という絶対パスになっている
+    # (相対のまま ".config" が伝播されていたら、この grep は失敗する)。
+    grep -qF "CLAUDE_CONFIG_DIR=${REL_BASE}/.config" "$FAKE_TMUX_LOG"
+    ! grep -q "CLAUDE_CONFIG_DIR=.config " "$FAKE_TMUX_LOG"
+
+    find "$REL_BASE" -depth -delete 2>/dev/null || true
+}
+
+@test "a relative HOME (no CLAUDE_CONFIG_DIR) resolves to the same absolute dir too (t070 P2)" {
+    REL_HOME_PARENT="$(mktemp -d)"
+    mkdir -p "${REL_HOME_PARENT}/home"
+    printf '{"projects": {"%s": {"hasTrustDialogAccepted": true}}}' "$TARGET" > "${REL_HOME_PARENT}/home/.claude.json"
+
+    unset CLAUDE_CONFIG_DIR
+    ( cd "$REL_HOME_PARENT" && PYTHONUSERBASE="${PYTHONUSERBASE:-$HOME/.local}" HOME="home" TARGET_DIR="$TARGET" bash "$START_SH" worker --name Ren code )
+    status=$?
+
+    [ "$status" -eq 0 ]
+    _launched
+    grep -qF "HOME=${REL_HOME_PARENT}/home" "$FAKE_TMUX_LOG"
+    ! grep -q ' HOME=home ' "$FAKE_TMUX_LOG"
+
+    find "$REL_HOME_PARENT" -depth -delete 2>/dev/null || true
 }

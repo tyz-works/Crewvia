@@ -420,6 +420,29 @@ if [[ -z "$_EFFECTIVE_MUX_ENABLED" ]] && [[ -n "${CREWVIA_MUX:-}" ]]; then
   _EFFECTIVE_MUX_ENABLED=1
 fi
 
+# --- CLAUDE_CONFIG_DIR / HOME を絶対パスへ解決する (t070 / B6 2巡目 P2) ---
+# mux モードでは、trust precheck (start.sh 自身のカレントディレクトリが基準) と、後で
+# WORK_DIR に cd してから claude を起動する spawn 先とで、相対パスの解釈の基準が変わる
+# (例: /repo から CLAUDE_CONFIG_DIR=.config, TARGET_DIR=/other で起動すると、precheck は
+# /repo/.config を見るが claude は /other/.config で起動してしまう — 「同じ文字列」を
+# 渡しても「同じ解決済みの対象」にはならない)。BENCH_MODE でも下の ENV_EXPORTS への伝播は
+# 起きる (bench mode が外すのは precheck 本体と自動 kickoff だけ) ので、bench mode 条件は
+# 付けずにここで解決する — 検査経路 (precheck) と伝播経路 (ENV_EXPORTS) の両方が、この後は
+# 同じ変数を読むだけになるので「同じ解決済みの対象」であることが構造的に保証される
+# (2 箇所で別々に解決して食い違う余地を作らない。t051 P1 の続き)。
+# 解決できない (存在しない dir 等) ときは元の値のまま残す — 見つからない設定は
+# lib_trust.py 側で「無い (untrusted)」として扱われ、起動が止まる (安全側)。
+if [[ "${_EFFECTIVE_MUX_ENABLED:-0}" == "1" ]]; then
+  if [[ -n "${CLAUDE_CONFIG_DIR:-}" ]] && [[ "${CLAUDE_CONFIG_DIR}" != /* ]]; then
+    _RESOLVED_CONFIG_DIR="$(cd "${CLAUDE_CONFIG_DIR}" 2>/dev/null && pwd)" || _RESOLVED_CONFIG_DIR=""
+    [[ -n "$_RESOLVED_CONFIG_DIR" ]] && export CLAUDE_CONFIG_DIR="$_RESOLVED_CONFIG_DIR"
+  fi
+  if [[ "${HOME}" != /* ]]; then
+    _RESOLVED_HOME="$(cd "${HOME}" 2>/dev/null && pwd)" || _RESOLVED_HOME=""
+    [[ -n "$_RESOLVED_HOME" ]] && export HOME="$_RESOLVED_HOME"
+  fi
+fi
+
 # --- 起動の拒否は端末だけでなくログにも残す (t021 / backlog #18) ---
 # start.sh の拒否は端末にしか出ず、dispatcher が pane で起動した場合は誰も見ないまま消えていた。
 # 書き先は logs/start-sh/refusals.log (logs/ は gitignore 済み。dispatcher の logs/dispatcher/ と同じ流儀)。
@@ -653,6 +676,15 @@ if [[ "${_EFFECTIVE_MUX_ENABLED:-0}" == "1" ]]; then
 
   WINDOW_NAME="${AGENT_NAME}-${ROLE}"
 
+  # --- シェル文字列への値の埋め込みは必ずこれを通す (t070 P1 / family D) ---
+  # LAUNCH_CMD は mux が新しいペインのシェルへ「入力して Enter」する文字列であり、後で
+  # そのシェルが評価する。自前でクォート ('$var' 等) を組み立てると、値に ' が含まれる
+  # だけで起動が壊れ、`/tmp/x'; printf INJECTED; #` のような値ならペインの評価時に
+  # 追加のコマンドが実行される (Codex 2巡目 P1)。bash 組み込みの printf '%q' に任せる。
+  _shq() {
+    printf '%q' "$1"
+  }
+
   # --- 最後の網: pane に claude の trust ダイアログが出ていないか (t021 / backlog #28) ---
   # 上の事前検査 (lib_trust.py check) をすり抜けた場合 (git worktree・未知の継承規則・claude の版差)
   # の備え。下の「❯ が出るまで待つ」は入力行の目印を見るので、trust ダイアログの選択カーソル
@@ -678,7 +710,7 @@ if [[ "${_EFFECTIVE_MUX_ENABLED:-0}" == "1" ]]; then
     local msg="[crewvia] ERROR: $WINDOW_NAME は claude の trust ダイアログで止まっています (${1})。kickoff は着弾していません。
           ダイアログは既定が \"No, exit\" なので Enter を送りません。この窓は片付けます (ダイアログに
           dispatcher の割り当て + Enter が届くのを防ぐため)。dir を信頼してから起動し直してください:
-            ! cd '${WORK_DIR}' && claude      # \"Yes, I trust this folder\" を選び、/exit"
+            ! cd $(_shq "${WORK_DIR}") && claude      # \"Yes, I trust this folder\" を選び、/exit"
     echo "$msg" >&2
     _log_refusal trust-dialog "$msg"
     mux_kill "$WINDOW_NAME" >/dev/null 2>&1 \
@@ -690,7 +722,7 @@ if [[ "${_EFFECTIVE_MUX_ENABLED:-0}" == "1" ]]; then
           kickoff は送信していません。読めない状態を「ダイアログなし」とは扱いません (capture の失敗と
           画面が本当に空の場合を区別できないため、区別できないときは危険側 = 止める側に倒します)。
           この窓は片付けます。mux_capture ${WINDOW_NAME} で状況を確認し、dir を信頼してから起動し直してください:
-            ! cd '${WORK_DIR}' && claude      # \"Yes, I trust this folder\" を選び、/exit"
+            ! cd $(_shq "${WORK_DIR}") && claude      # \"Yes, I trust this folder\" を選び、/exit"
     echo "$msg" >&2
     _log_refusal trust-dialog-unobservable "$msg"
     mux_kill "$WINDOW_NAME" >/dev/null 2>&1 \
@@ -737,10 +769,15 @@ if [[ "${_EFFECTIVE_MUX_ENABLED:-0}" == "1" ]]; then
   # unset が主防御（herdr 汚染変数の除去）で、FORCE は副防御（unset 漏れ時のフォールバック）。
   # 選択根拠: CHILD_SESSION は transcript 保存 以外に --resume 動作にも影響するため unset は維持、
   # かつ公式 env var で transcript 保存を明示的に保証する (b)方式を採用。
-  ENV_EXPORTS="export AGENT_NAME='$AGENT_NAME' TASKVIA_URL='$TASKVIA_URL' TASKVIA_TOKEN='${TASKVIA_TOKEN:-}' CREWVIA_TASKVIA='${CREWVIA_TASKVIA:-enabled}' ROLE='$ROLE' SKILLS='${SKILLS:-}' CREWVIA_REPO='$CREWVIA_REPO' CREWVIA_REPO_ROOT='$CREWVIA_REPO_ROOT' CREWVIA_QUEUE='$CREWVIA_QUEUE' CREWVIA_APPROVAL_CHANNEL='${CREWVIA_APPROVAL_CHANNEL:-taskvia}' NTFY_URL='${NTFY_URL:-}' NTFY_TOPIC='${NTFY_TOPIC:-}' NTFY_USER='${NTFY_USER:-}' NTFY_PASS='${NTFY_PASS:-}' APPROVAL_TOKEN_TTL_SECONDS='${APPROVAL_TOKEN_TTL_SECONDS:-900}' CREWVIA_MUX='${CREWVIA_MUX:-}' CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1"
-  [[ "${ROLE}" == "worker" ]] && [[ "$WORK_DIR" != "$REPO_ROOT" ]] && ENV_EXPORTS+=" TARGET_DIR='$WORK_DIR'"
+  # 値はすべて _shq (printf %q) で安全にクォートしてから export 文へ連結する (t070 P1 /
+  # family D: 生の '$VAR' 埋め込みは、AGENT_NAME・TARGET_DIR・WORK_DIR のような外部由来の値
+  # (Worker 名・プロジェクトパス・env var) に ' が含まれるだけで起動が壊れ、`'; cmd; #` の
+  # ような値ならペインでコマンドが追加実行される)。
+  ENV_EXPORTS="export AGENT_NAME=$(_shq "$AGENT_NAME") TASKVIA_URL=$(_shq "$TASKVIA_URL") TASKVIA_TOKEN=$(_shq "${TASKVIA_TOKEN:-}") CREWVIA_TASKVIA=$(_shq "${CREWVIA_TASKVIA:-enabled}") ROLE=$(_shq "$ROLE") SKILLS=$(_shq "${SKILLS:-}") CREWVIA_REPO=$(_shq "$CREWVIA_REPO") CREWVIA_REPO_ROOT=$(_shq "$CREWVIA_REPO_ROOT") CREWVIA_QUEUE=$(_shq "$CREWVIA_QUEUE") CREWVIA_APPROVAL_CHANNEL=$(_shq "${CREWVIA_APPROVAL_CHANNEL:-taskvia}") NTFY_URL=$(_shq "${NTFY_URL:-}") NTFY_TOPIC=$(_shq "${NTFY_TOPIC:-}") NTFY_USER=$(_shq "${NTFY_USER:-}") NTFY_PASS=$(_shq "${NTFY_PASS:-}") APPROVAL_TOKEN_TTL_SECONDS=$(_shq "${APPROVAL_TOKEN_TTL_SECONDS:-900}") CREWVIA_MUX=$(_shq "${CREWVIA_MUX:-}") CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1"
+  [[ "${ROLE}" == "worker" ]] && [[ "$WORK_DIR" != "$REPO_ROOT" ]] && ENV_EXPORTS+=" TARGET_DIR=$(_shq "$WORK_DIR")"
 
   # --- CLAUDE_CONFIG_DIR: precheck が読んだ設定と、実際に起動する claude が読む設定を同一にする (t051 P1) ---
+  # (絶対パスへの解決は上の「並列モードか」ブロックの直後、precheck より前に済んでいる — t070 P2)。
   # 上の trust precheck (lib_trust.py check) は start.sh プロセスの ambient CLAUDE_CONFIG_DIR を読むが、
   # ここまでの ENV_EXPORTS には含めていなかった。spawn 先のペインは mux server が保持し続ける起動時点の
   # env (herdr-server-stale-env-inheritance) をそのまま引き継ぐため、precheck が見た設定と spawn 先が
@@ -748,35 +785,35 @@ if [[ "${_EFFECTIVE_MUX_ENABLED:-0}" == "1" ]]; then
   # 当たる／その逆)。precheck と spawn 先を同じ値に揃え、未設定なら server 側に残っているかもしれない
   # 古い値も明示的に消す (export 一覧に含めないだけでは、既に export 済みの値は消えない)。
   if [[ -n "${CLAUDE_CONFIG_DIR:-}" ]]; then
-    ENV_EXPORTS+=" CLAUDE_CONFIG_DIR='${CLAUDE_CONFIG_DIR}'"
+    ENV_EXPORTS+=" CLAUDE_CONFIG_DIR=$(_shq "${CLAUDE_CONFIG_DIR}")"
     _TRUST_UNSET_STALE_CONFIG_DIR=""
   else
     _TRUST_UNSET_STALE_CONFIG_DIR="unset CLAUDE_CONFIG_DIR; "
   fi
 
-  # --- HOME: 同じ理由 (t051 family B sweep) ---
+  # --- HOME: 同じ理由 (t051 family B sweep)。絶対パス解決も CLAUDE_CONFIG_DIR と同じ箇所で済み。---
   # CLAUDE_CONFIG_DIR が未設定のとき、precheck (lib_trust.py) は `$HOME/.claude.json` を見る。
   # HOME も CLAUDE_CONFIG_DIR と同じく ENV_EXPORTS に含めていなかったので、理論上は同じ
   # 不伝播 (herdr-server-stale-env-inheritance) が起こりうる。`set -euo pipefail` の下で
   # ここまで実行できている時点で HOME は必ず設定済みなので、unset 分岐は要らない。
-  ENV_EXPORTS+=" HOME='${HOME}'"
+  ENV_EXPORTS+=" HOME=$(_shq "${HOME}")"
 
   # --model flag (空なら省略)
   MODEL_CLI_ARG=""
   if [[ -n "$SELECTED_MODEL" ]]; then
-    MODEL_CLI_ARG=" --model '$SELECTED_MODEL'"
+    MODEL_CLI_ARG=" --model $(_shq "$SELECTED_MODEL")"
   fi
 
   # --settings flag (TARGET_DIRモードのworkerのみ。crewvia settings.json + crewvia-worker ファイルの2つを渡す)
   SETTINGS_CLI_ARG=""
   if [[ ${#SETTINGS_FLAG[@]} -gt 0 ]]; then
-    SETTINGS_CLI_ARG=" --settings '${REPO_ROOT}/.claude/settings.json' --settings '${WORK_DIR}/.claude/crewvia-worker-${AGENT_NAME}.json'"
+    SETTINGS_CLI_ARG=" --settings $(_shq "${REPO_ROOT}/.claude/settings.json") --settings $(_shq "${WORK_DIR}/.claude/crewvia-worker-${AGENT_NAME}.json")"
   fi
 
   # --permission-mode flag (空なら省略。課題2 — 理由は _resolve_permission_mode 定義を参照)
   PERMISSION_MODE_CLI_ARG=""
   if [[ -n "$SELECTED_PERMISSION_MODE" ]]; then
-    PERMISSION_MODE_CLI_ARG=" --permission-mode '$SELECTED_PERMISSION_MODE'"
+    PERMISSION_MODE_CLI_ARG=" --permission-mode $(_shq "$SELECTED_PERMISSION_MODE")"
   fi
 
   if [[ -n "$FULL_PROMPT" ]] && [[ "${CREWVIA_BENCH_MODE:-0}" != "1" ]]; then
@@ -811,7 +848,7 @@ PYEOF
   # プロセスが export した PATH を継承しない（spawn() は env 引数を持たない —
   # 上の ENV_EXPORTS と同じ理由）。scripts/bin/plan を
   # 使えるようにするため、ペイン側の $PATH に対して明示的に prepend する。
-  LAUNCH_CMD="$ENV_EXPORTS; export PATH='${REPO_ROOT}/scripts/bin:'\"\$PATH\"; unset CLAUDE_CODE_CHILD_SESSION; ${_TRUST_UNSET_STALE_CONFIG_DIR}cd '$WORK_DIR'; claude${MODEL_CLI_ARG}${SETTINGS_CLI_ARG}${PERMISSION_MODE_CLI_ARG}"
+  LAUNCH_CMD="$ENV_EXPORTS; export PATH=$(_shq "${REPO_ROOT}/scripts/bin:")\"\$PATH\"; unset CLAUDE_CODE_CHILD_SESSION; ${_TRUST_UNSET_STALE_CONFIG_DIR}cd $(_shq "$WORK_DIR"); claude${MODEL_CLI_ARG}${SETTINGS_CLI_ARG}${PERMISSION_MODE_CLI_ARG}"
 
   # Drop spawn records whose pane is gone (a retired Worker's pane closes without
   # `kill()`, so its record outlives it).  Housekeeping only: the answer never

@@ -28,6 +28,11 @@
 #   Y  start.sh: プロンプト待ちループの網に bench mode の除外を付けない (P2x2) → 赤 (bats)
 #   V2 start.sh: HOME を spawn 先に伝播しない (Director 指示の族 B 掃除で発見)     → 赤 (bats)
 #
+# t070 (B6 fix 2巡目: Codex review 2巡目の findings) で追加:
+#   INJ  start.sh: LAUNCH_CMD の cd を _shq を使わない生の '$WORK_DIR' 埋め込みに戻す (P1)  → 赤 (bats)
+#   INJ2 start.sh: ENV_EXPORTS の AGENT_NAME を生の '$AGENT_NAME' 埋め込みに戻す (P1 / 族D)  → 赤 (bats)
+#   REL  start.sh: CLAUDE_CONFIG_DIR / HOME の絶対パス解決を外す (P2)                        → 赤 (bats)
+#
 # 注意 (defense in depth): 最後の網は 3 か所 (待機中 / 送信前 / 送信後) にあり、**1 か所だけ**を外しても、
 # 別の 1 か所が同じ画面を捕まえるので、多くのテストは緑のまま。だから G / H は「その 1 か所にだけ
 # 反応するテスト」(送信前の窓・送信後の verified) が赤になることを名指しで確かめ、I は 2 か所を同時に
@@ -219,7 +224,7 @@ expect_red_py "case S" "test_ordinary_screens_are_not_mistaken_for_the_dialog"
 
 echo "== case T: CLAUDE_CONFIG_DIR を spawn 先に伝播しない (t051 P1)"
 fresh_copy
-inject scripts/start.sh "    ENV_EXPORTS+=\" CLAUDE_CONFIG_DIR='\${CLAUDE_CONFIG_DIR}'\"" "    true"
+inject scripts/start.sh '    ENV_EXPORTS+=" CLAUDE_CONFIG_DIR=$(_shq "${CLAUDE_CONFIG_DIR}")"' '    true'
 expect_red_bats "case T" "CLAUDE_CONFIG_DIR read by the precheck is forwarded to the spawned claude"
 
 echo "== case U: 未設定時に spawn 先の古い値を unset しない (t051 P1)"
@@ -255,8 +260,30 @@ expect_red_bats "case Y" "bench mode is not gated by the last-net trust dialog c
 
 echo "== case V2: HOME を spawn 先に伝播しない (族 B 掃除で発見)"
 fresh_copy
-inject scripts/start.sh "  ENV_EXPORTS+=\" HOME='\${HOME}'\"" "  true"
+inject scripts/start.sh '  ENV_EXPORTS+=" HOME=$(_shq "${HOME}")"' "  true"
 expect_red_bats "case V2" "HOME used by the precheck (when CLAUDE_CONFIG_DIR is unset) is forwarded too"
+
+echo "== case INJ: LAUNCH_CMD の cd を生の '\$WORK_DIR' 埋め込みに戻す (t070 P1 シェルインジェクション)"
+fresh_copy
+inject scripts/start.sh 'cd $(_shq "$WORK_DIR"); claude' "cd '\$WORK_DIR'; claude"
+expect_red_bats "case INJ" \
+    "LAUNCH_CMD survives a TARGET_DIR containing a quote and a shell-injection payload"
+
+echo "== case INJ2: ENV_EXPORTS の AGENT_NAME を生の '\$AGENT_NAME' 埋め込みに戻す (t070 P1 / 族D、別の箇所)"
+fresh_copy
+inject scripts/start.sh 'AGENT_NAME=$(_shq "$AGENT_NAME")' "AGENT_NAME='\$AGENT_NAME'"
+expect_red_bats "case INJ2" \
+    "AGENT_NAME containing a quote does not break LAUNCH_CMD either"
+
+echo "== case REL: CLAUDE_CONFIG_DIR / HOME の絶対パス解決を外す (t070 P2)"
+fresh_copy
+inject scripts/start.sh '    _RESOLVED_CONFIG_DIR="$(cd "${CLAUDE_CONFIG_DIR}" 2>/dev/null && pwd)" || _RESOLVED_CONFIG_DIR=""
+    [[ -n "$_RESOLVED_CONFIG_DIR" ]] && export CLAUDE_CONFIG_DIR="$_RESOLVED_CONFIG_DIR"' '    true'
+inject scripts/start.sh '    _RESOLVED_HOME="$(cd "${HOME}" 2>/dev/null && pwd)" || _RESOLVED_HOME=""
+    [[ -n "$_RESOLVED_HOME" ]] && export HOME="$_RESOLVED_HOME"' '    true'
+expect_red_bats "case REL" \
+    "a relative CLAUDE_CONFIG_DIR resolves to the same absolute dir the spawned claude will read" \
+    "a relative HOME (no CLAUDE_CONFIG_DIR) resolves to the same absolute dir too"
 
 echo
 echo "PASS=$PASS FAIL=$FAIL"

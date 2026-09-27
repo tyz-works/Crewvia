@@ -410,6 +410,33 @@ fake tmux で start.sh を mux モードで走らせるテストは `tests/trust
   `[[ "${CREWVIA_BENCH_MODE:-0}" == "1" ]] && return 0` を追加（kickoff 送信直前/後は元から
   `if BENCH_MODE != 1` ブロックの内側なので対象外だった）。
 
+**t070 (B6 fix 2巡目: Codex review 2巡目の findings) で直した 2 件 + 族 D**:
+- **P1 (シェルインジェクション)**: t051 が追加した `CLAUDE_CONFIG_DIR='${CLAUDE_CONFIG_DIR}'` / `HOME='${HOME}'`
+  を含め、LAUNCH_CMD 全体が生の `'$var'` 埋め込みで組み立てられていた。値に `'` が入るだけで壊れ、
+  `'; cmd; #` のような値ならペインが LAUNCH_CMD を評価したときに追加のコマンドが実行される
+  (AGENT_NAME・TARGET_DIR・WORK_DIR は外部由来で入力しうる)。`_shq()`（`printf '%q'`。自前でクォートを
+  組み立てない）を導入し、ENV_EXPORTS の全変数・`--model` / `--settings` / `--permission-mode` の
+  CLI 引数・`cd`・advisory メッセージ（`_abort_on_trust_dialog` 等）まで、埋め込み箇所を**全部**
+  これに通した（族 D の掃除）。**文字列の形を見るだけのテストは評価時の挙動を保証しない**
+  (Codex 指摘) ので、`tests/start-sh-trust-precheck.bats` は fake tmux に送られた LAUNCH_CMD の
+  実テキストを取り出し、claude の代わりに引数と cwd を書き出すスタブを使って**隔離した bash で
+  実際に評価する**テストを持つ。
+- **P2 (相対パスの CLAUDE_CONFIG_DIR / HOME)**: precheck は start.sh 自身の cwd を基準に相対パスを
+  開くが、LAUNCH_CMD は WORK_DIR に `cd` してから claude を起動する。相対な `CLAUDE_CONFIG_DIR` /
+  `HOME` を「同じ文字列」のまま渡しても、cd の前後で基準が変わり「同じ解決済みの対象」にはならない
+  (t051 P1 の続き)。`_EFFECTIVE_MUX_ENABLED` 判定の直後、precheck より前 (bench mode でも実行 —
+  ENV_EXPORTS への伝播は bench mode でも起きるため) で一度だけ絶対パスへ解決し、export で上書きする。
+  以降のコード (precheck 本体・ENV_EXPORTS への伝播) は同じ変数を読むだけなので、「同じ解決済みの
+  対象」であることが構造的に保証される (2 箇所で別々に解決して食い違う余地を作らない)。解決できない
+  (存在しない dir 等) ときは元の値のまま precheck に委ねる (安全側: lib_trust.py が untrusted として
+  止める)。
+- **族D の掃除で見送った関連事項**: `crewvia-worker-${AGENT_NAME}.json` のファイル名も `AGENT_NAME` を
+  埋め込むが、これは python heredoc への argv 渡し (シェル文字列への埋め込みではない) なので族D の
+  定義には当たらない。ただし `AGENT_NAME` に `/` や `..` が入ると意図しないパスに書き込みうる、族D に
+  隣接する懸念として見つけたが、AGENT_NAME の形式検証は別スコープ (名前プール / `--name` の入力検証)
+  であり本タスクでは直していない。KICKOFF_MSG は claude 自身の REPL (エージェントの判断 + 承認 hook)
+  へ渡るテキストであり、シェルが自動評価する対象ではないため族D の対象外と判断した。
+
 **戻し方**（誤判定すると Worker / Director の起動が止まる種類の変更。**env の停止スイッチは付けない**:
 trust は利用者の判断で、迂回口を作ると「信頼していない dir で起動して即死」に戻る）:
 (1) 個別に通す — 止められた dir は、表示されたコマンド（`! cd <dir> && claude` で Yes を選ぶか、`jq`

@@ -72,3 +72,13 @@ lib ごとの**破ってはいけない契約**の要約。理由・経緯・全
   なし」に倒さない — kickoff 送信直前・送信後は `_require_no_trust_dialog`（画面の検査が成功するまで
   有限回再試行、それでも駄目なら拒否）を使う。プロンプト待ちループ側の `_trust_dialog_check` は緩い網
   （観測できない間は上位のポーリングに委ねる）で、`CREWVIA_BENCH_MODE=1` はここも対象外にする（t051 P2 / P2x2）。
+- `CLAUDE_CONFIG_DIR` / `HOME` は precheck の**前**に一度だけ絶対パスへ解決する（相対のまま渡すと、
+  precheck (start.sh 自身の cwd 基準) と WORK_DIR へ `cd` してから起動する claude とで基準が変わり、
+  「同じ文字列」でも「同じ解決済みの対象」にならない。t070 P2）。解決できない値はそのまま precheck に
+  委ねる（存在しない dir は lib_trust.py が untrusted として止める。安全側）。
+- LAUNCH_CMD へ値を埋め込むときは必ず `_shq`（`printf '%q'`）を通す。自前の `'$var'` 埋め込みは、
+  AGENT_NAME・TARGET_DIR・WORK_DIR のような外部由来の値に `'` が含まれるだけで壊れ、`'; cmd; #` の
+  ような値ならペインでコマンドが追加実行される（t070 P1 シェルインジェクション）。ENV_EXPORTS・
+  `--model` / `--settings` / `--permission-mode` の CLI 引数・`cd`・advisory メッセージまで、
+  埋め込み箇所は全部 `_shq` を通す（族 D）。文字列の形を見るテストは評価時の挙動を保証しない —
+  `tests/start-sh-trust-precheck.bats` は実際に LAUNCH_CMD をスタブ claude で評価するテストを持つ。

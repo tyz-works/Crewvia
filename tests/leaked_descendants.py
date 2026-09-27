@@ -154,31 +154,45 @@ def _dir_in_cmdline(haystack: bytes, dirpath: bytes) -> bool:
 
 
 def _belongs(pid: int, marker: bytes, basetemp: bytes):
-    """(所属する理由 | None, 観測できたか)。同 uid の pid の environ が読めなければ観測できていない。
+    """(所属する理由 | None, 観測できたか)。3 つの検出手段のうち、どれか 1 つでも読めなければ
+    観測できていない (`observed=False`) —— environ だけの話ではない。
 
     **0 バイトで読めたのも観測の失敗** (`knowledge/empty-vs-unobservable.md` の O)。exec の
     最中のプロセスは environ が空で読める —— 孤児を起こした直後の 1 読みで 300 回中 8 回
     (2.7%)、印が現れるまでは 1ms 未満だった。これを「読めた・印が無い」に潰すと、印を継承した
     子孫が survivors にも unobservable にも入らず **黙って消える**。残骸を見逃さないのが
     仕事のガードとしては倒す向きが逆なので、空は「観測できなかった」に倒す。
+
+    同じ exec 遷移の隙は cmdline / cwd の読み取りにも起こりうる (どちらも同じ `/proc/<pid>/`
+    以下で、同じ瞬間に切り替わる)。environ は読めて印が無かった (= env を捨てた子孫かもしれない)
+    のに、その先の cmdline / cwd の読み取りが失敗すると、旧実装はそれを黙って「一致しなかった」
+    にしていた —— 一時的な観測失敗を「この signal では確認できなかった」ではなく
+    「basetemp 配下ではないと確認できた」に倒しており、env を捨てて basetemp で動く子孫を
+    黙って見逃しうる。3 つの signal のうち 1 つでも読めなければ `observed=False` にする。
     """
     base = _PROC / str(pid)
+    observed = True
+
     environ = _read_bytes(base / "environ")
     if not environ:
         observed = False
-    else:
-        observed = True
-        if marker in environ.split(b"\0"):
-            return "env-marker", True
+    elif marker in environ.split(b"\0"):
+        return "env-marker", True
+
     cmdline = _read_bytes(base / "cmdline")
-    if cmdline is not None and basetemp and _dir_in_cmdline(cmdline, basetemp):
+    if not cmdline:
+        observed = False
+    elif basetemp and _dir_in_cmdline(cmdline, basetemp):
         return "cmdline-in-basetemp", True
+
     try:
         cwd = os.readlink(base / "cwd").encode()
     except OSError:
-        cwd = None
-    if cwd is not None and basetemp and (cwd == basetemp or cwd.startswith(basetemp + b"/")):
-        return "cwd-in-basetemp", True
+        observed = False
+    else:
+        if basetemp and (cwd == basetemp or cwd.startswith(basetemp + b"/")):
+            return "cwd-in-basetemp", True
+
     return None, observed
 
 

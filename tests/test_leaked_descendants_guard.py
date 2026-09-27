@@ -166,6 +166,43 @@ def test_an_empty_environ_is_not_counted_as_observed(monkeypatch):
         "空の environ を「観測できた」にすると、exec 中の印つき子孫を黙って見逃す")
 
 
+def test_a_readable_environ_does_not_mask_a_failed_cmdline_read(monkeypatch):
+    """environ は読めて (印が無い) も、その先の cmdline が読めなければ「確認できた」にしない。
+
+    env を捨てた子孫の basetemp 判定は cmdline / cwd に頼る (`_dir_in_cmdline` /
+    cwd-in-basetemp)。environ と同じ exec 遷移の隙が cmdline にも起こりうるので、ここが
+    読めないだけで「basetemp 配下ではないと確認できた」に倒してはいけない
+    (旧実装は environ の読み取りにしか `observed` を連動させていなかった)。
+    """
+    monkeypatch.setattr(
+        leaked_descendants, "_read_bytes",
+        lambda path: b"PATH=/usr/bin\0" if path.name == "environ" else None)
+    why, observed = leaked_descendants._belongs(
+        os.getpid(), f"{leaked_descendants.MARKER_VAR}=no-such-session".encode(), b"/nonexistent")
+    assert why is None
+    assert observed is False, (
+        "environ は読めたが cmdline が読めなかったのに『観測できた』にした")
+
+
+def test_a_readable_environ_and_cmdline_do_not_mask_a_failed_cwd_read(monkeypatch):
+    """cwd の readlink が失敗しても、同様に『観測できた』にしない (上と同じ理由の cwd 版)。"""
+    monkeypatch.setattr(
+        leaked_descendants, "_read_bytes",
+        lambda path: b"PATH=/usr/bin\0" if path.name == "environ" else b"cat\0")
+
+    def _flaky_readlink(path):
+        if str(path).endswith("/cwd"):
+            raise OSError("denied")
+        return "/"
+
+    monkeypatch.setattr(os, "readlink", _flaky_readlink)
+    why, observed = leaked_descendants._belongs(
+        os.getpid(), f"{leaked_descendants.MARKER_VAR}=no-such-session".encode(), b"/nonexistent")
+    assert why is None
+    assert observed is False, (
+        "cwd の readlink が失敗したのに『観測できた』にした")
+
+
 def test_cmdline_match_requires_a_path_boundary_not_a_bare_prefix():
     """`/tmp/pytest-1` は `/tmp/pytest-10/test.py` の前方一致であって同じディレクトリではない。
 

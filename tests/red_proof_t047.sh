@@ -9,6 +9,7 @@
 #   B2 kill_budget: 自分の開始時刻が読めなくても候補を allowed に落とす (fail-open) → 赤
 #   C1 leaked_descendants: settle() が unobservable の間は再試行しない → 赤
 #   C2 leaked_descendants: pytest_sessionfinish が unobservable だけの結果を報告しない → 赤
+#   D  leaked_descendants: _belongs が cmdline/cwd の読み取り失敗を observed に反映しない (族A の横展開) → 赤
 #
 # 安全性: このスクリプトの注入はいずれも `partition()` / `_dir_in_cmdline()` / `settle()` /
 # `pytest_sessionfinish()` を直接・少数の候補 (存在しない合成 pid や自分で spawn した子) で
@@ -138,6 +139,53 @@ inject tests/leaked_descendants.py \
                   f\"(『無い』とは言えない。数には入れていない)\")" \
 ""
 expect_red "case C2" "test_sessionfinish_reports_but_does_not_fail_on_unobservable_only"
+
+echo "== case D: _belongs が cmdline/cwd の読み取り失敗を observed に反映しない (族A の横展開)"
+fresh_copy
+inject tests/leaked_descendants.py \
+"    base = _PROC / str(pid)
+    observed = True
+
+    environ = _read_bytes(base / \"environ\")
+    if not environ:
+        observed = False
+    elif marker in environ.split(b\"\\0\"):
+        return \"env-marker\", True
+
+    cmdline = _read_bytes(base / \"cmdline\")
+    if not cmdline:
+        observed = False
+    elif basetemp and _dir_in_cmdline(cmdline, basetemp):
+        return \"cmdline-in-basetemp\", True
+
+    try:
+        cwd = os.readlink(base / \"cwd\").encode()
+    except OSError:
+        observed = False
+    else:
+        if basetemp and (cwd == basetemp or cwd.startswith(basetemp + b\"/\")):
+            return \"cwd-in-basetemp\", True
+
+    return None, observed" \
+"    base = _PROC / str(pid)
+    environ = _read_bytes(base / \"environ\")
+    if not environ:
+        observed = False
+    else:
+        observed = True
+        if marker in environ.split(b\"\\0\"):
+            return \"env-marker\", True
+    cmdline = _read_bytes(base / \"cmdline\")
+    if cmdline is not None and basetemp and _dir_in_cmdline(cmdline, basetemp):
+        return \"cmdline-in-basetemp\", True
+    try:
+        cwd = os.readlink(base / \"cwd\").encode()
+    except OSError:
+        cwd = None
+    if cwd is not None and basetemp and (cwd == basetemp or cwd.startswith(basetemp + b\"/\")):
+        return \"cwd-in-basetemp\", True
+    return None, observed"
+expect_red "case D" "test_a_readable_environ_does_not_mask_a_failed_cmdline_read"
 
 echo
 echo "PASS=$PASS FAIL=$FAIL"

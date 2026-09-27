@@ -16,6 +16,8 @@
 #   J  dispatcher に /proc を読む分類のコピーが生える                              → 赤
 #   K  分類: grace_seconds の枠内で始まった裏 job を assignment mtime で拾わない (t049 P2) → 赤
 #   L  テスト: pane tree の teardown が group ごとでなく root だけになる (t049 P3)   → 赤
+#   M  分類: 読めない pid を静かに「子孫なし」へ倒す (t049 族A監査)              → 赤
+#   N  分類: min_start_epoch が起動より前に見えても閾値として使ってしまう (t049 族C監査) → 赤
 #
 # 隔離: 使い捨ての複製で欠陥を注入する。本番の worktree のファイルには触らない。
 # pytest は FakeMux / 隔離した queue・registry と本物の sh の親子木で動き、
@@ -171,6 +173,29 @@ inject tests/test_background_work_is_not_idle.py '    try:
     proc.wait()' '    proc.kill()
     proc.wait()'
 expect_red "case L" "test_kill_pane_tree_leaves_no_orphans_behind" "${B1_TESTS[@]}"
+
+echo "== case M (t049 族A監査): 読めない pid を静かに『子孫なし』へ倒す"
+fresh_copy
+inject scripts/lib_pane_process.py '        try:
+            st = _proc_stat(int(entry.name))
+        except OSError:
+            # この pid が「消滅」以外の理由で読めない。None に潰して静かに
+            # スキップすると、この pid を親に持つ (読めている) 子孫が
+            # children から永久に辿り着けなくなり、生きている裏 job のサブ
+            # ツリーごと見えなくなる (t049 族A監査: 観測失敗を「子孫なし」に
+            # 倒していた)。わからないことは "unknown" として呼び出し側に返す。
+            return "unknown"
+        if st is not None:
+            procs[int(entry.name)] = st' '        st = _proc_stat(int(entry.name))
+        if st is not None:
+            procs[int(entry.name)] = st'
+expect_red "case M" "test_an_unreadable_intermediate_pid_falls_to_unknown_not_idle" "${B1_TESTS[@]}"
+
+echo "== case N (t049 族C監査): min_start_epoch が起動より前に見えても閾値として使ってしまう"
+fresh_copy
+inject scripts/lib_pane_process.py '            if candidate >= 0:
+                min_start_ticks = candidate' '            min_start_ticks = candidate'
+expect_red "case N" "test_a_stale_min_start_epoch_before_boot_does_not_force_executing" "${B1_TESTS[@]}"
 
 echo
 echo "Results: PASS=$PASS FAIL=$FAIL"

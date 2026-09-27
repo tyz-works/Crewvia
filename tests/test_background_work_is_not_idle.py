@@ -147,6 +147,54 @@ def test_the_fixture_trees_classify_as_intended(panes):
     assert lib_pane_process.classify_process_tree(panes["quiet"]) == "idle_process"
 
 
+def _direct_children(pid):
+    """`_proc_stat` を直接使って ppid==pid の pid 一覧を返す (テスト専用ヘルパー)。"""
+    out = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            stat = lib_pane_process._proc_stat(int(entry.name))
+        except OSError:
+            continue
+        if stat is not None and stat[0] == pid:
+            out.append(int(entry.name))
+    return out
+
+
+def test_an_unreadable_intermediate_pid_falls_to_unknown_not_idle(monkeypatch):
+    """族A監査 (t049): `_proc_stat` が「消滅」以外の理由 (EACCES 等) である pid を
+    読めないと、それを None に潰して静かにスキップする実装では、その pid を親に
+    持つ子孫 (それ自体は読める) が誰からも「値」として指されなくなり、
+    children から永久に辿り着けなくなる。生きている裏 job のサブツリーが
+    まるごと `idle_process` に見えてしまう欠陥を、実プロセス木 + `_proc_stat`
+    への読み取り失敗の注入で固定する (`unknown` を返し、静かに `idle_process`
+    へ倒さないこと)。
+    """
+    root = subprocess.Popen(
+        ["sh", "-c", 'sleep 300 & sh -c "sleep 300 & wait" & wait'],
+        start_new_session=True)
+    try:
+        time.sleep(0.5)  # 孫の裏 job まで出そろうまで
+
+        # root の直下の子のうち、自分自身がさらに子を持つ方が wrapper (裏 job の親)。
+        direct = _direct_children(root.pid)
+        wrapper_pid = next(pid for pid in direct if _direct_children(pid))
+
+        real_proc_stat = lib_pane_process._proc_stat
+
+        def flaky_proc_stat(pid):
+            if pid == wrapper_pid:
+                raise PermissionError(13, "Permission denied (test injection)")
+            return real_proc_stat(pid)
+
+        monkeypatch.setattr(lib_pane_process, "_proc_stat", flaky_proc_stat)
+
+        assert lib_pane_process.classify_process_tree(root.pid) == "unknown"
+    finally:
+        _kill_pane_tree(root)
+
+
 # ---------------------------------------------------------------------------
 # dispatcher Rule 5
 # ---------------------------------------------------------------------------
@@ -331,6 +379,27 @@ def test_a_job_started_within_the_grace_window_is_caught_via_assignment_mtime(
         assert FakeMux.sent == []  # 裏 job を拾い、idle-with-task を通知しない
     finally:
         _kill_pane_tree(root)
+
+
+def test_a_stale_min_start_epoch_before_boot_does_not_force_executing(monkeypatch):
+    """族C監査 (t049): min_start_epoch が「起動より前」に見えると (壁時計のずれ・
+    起動を跨いで残った古い assignment)、tick への変換が負になる。これをそのまま
+    使うと、あらゆる子孫の tick 値が無条件に閾値以上になり、MCP サーバーしか
+    居ない木まで "executing" と誤読してしまう — このガード自身が壊れた状態を
+    「常に検知した」に倒す退行。負のときは判定材料として使わない (min_start_epoch
+    を渡さなかったときと同じ、grace_seconds だけの判定にフォールバックする) こと
+    を固定する。
+    """
+    monkeypatch.setattr(lib_pane_process, "PROCESS_WORK_START_GRACE", 5)
+    proc = subprocess.Popen(["sh", "-c", "sleep 300 & wait"], start_new_session=True)
+    try:
+        time.sleep(0.3)  # MCP 相当だけが立った状態。裏 job は無い
+        # 2000-01-01 (どの実行環境の起動よりも前) を min_start_epoch として渡す
+        assert lib_pane_process.classify_process_tree(
+            proc.pid, min_start_epoch=946684800.0
+        ) == "idle_process"
+    finally:
+        _kill_pane_tree(proc)
 
 
 # ---------------------------------------------------------------------------

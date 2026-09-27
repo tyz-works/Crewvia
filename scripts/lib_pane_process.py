@@ -35,7 +35,18 @@ ProcessSignal = Literal[
 
 
 def _proc_stat(pid: int) -> Optional[tuple[int, int]]:
-    """/proc/<pid>/stat から (ppid, starttime_ticks) を返す。読めなければ None。
+    """/proc/<pid>/stat から (ppid, starttime_ticks) を返す。
+
+    消滅 (`FileNotFoundError` / `ProcessLookupError` = ENOENT/ESRCH) だけを
+    None として扱う — この pid はもう居ない、という確定した事実だからである。
+    それ以外の `OSError` (EACCES 等。同じ uid の自分の子孫を読む限り実運用では
+    起きないはずだが、hidepid マウント等の環境要因は排除できない) は
+    そのまま re-raise する。読めない ≠ 居ない — これを None に潰すと、
+    その pid が親として持つ子孫 (それ自体は読める) が `children` に一度も
+    辿り着けなくなり (どの親からも「値」として指されない孤立ノードになる)、
+    生きている裏 job のサブツリーがまるごと見えなくなる (t049 族A監査)。
+    呼び出し側は「わからない」を "unknown" として扱うこと (fail-direction は
+    呼び出し側の判定ごとに決まる。lib 自身は判定しない)。
 
     comm (field 2) は括弧で囲まれ、空白や ')' を含みうるので最後の ')' で
     切ってから split する (例: "1234 (sh -c (x)) S 1 ..." )。
@@ -44,7 +55,7 @@ def _proc_stat(pid: int) -> Optional[tuple[int, int]]:
     """
     try:
         raw = Path(f"/proc/{pid}/stat").read_text()
-    except (OSError, ValueError):
+    except (FileNotFoundError, ProcessLookupError):
         return None
     close = raw.rfind(")")
     if close < 0:
@@ -129,7 +140,13 @@ def classify_process_tree(
     を渡さない (または `_boot_epoch()` が読めない) 呼び出しは、従来どおり
     tick 同士の比較だけで判定する。
     """
-    if _proc_stat(root_pid) is None:
+    try:
+        root_stat = _proc_stat(root_pid)
+    except OSError:
+        # root 自身が「消滅」以外の理由 (EACCES 等) で読めない — わからない
+        # ことを no_process (= 死んだ扱い) に潰さない (t049 族A監査)。
+        return "unknown"
+    if root_stat is None:
         return "no_process"
 
     procs: dict[int, tuple[int, int]] = {}
@@ -140,7 +157,15 @@ def classify_process_tree(
     for entry in proc_entries:
         if not entry.name.isdigit():
             continue
-        st = _proc_stat(int(entry.name))
+        try:
+            st = _proc_stat(int(entry.name))
+        except OSError:
+            # この pid が「消滅」以外の理由で読めない。None に潰して静かに
+            # スキップすると、この pid を親に持つ (読めている) 子孫が
+            # children から永久に辿り着けなくなり、生きている裏 job のサブ
+            # ツリーごと見えなくなる (t049 族A監査: 観測失敗を「子孫なし」に
+            # 倒していた)。わからないことは "unknown" として呼び出し側に返す。
+            return "unknown"
         if st is not None:
             procs[int(entry.name)] = st
 
@@ -166,7 +191,16 @@ def classify_process_tree(
     if min_start_epoch is not None:
         boot_epoch = _boot_epoch()
         if boot_epoch is not None:
-            min_start_ticks = int((min_start_epoch - boot_epoch) * ticks_per_sec)
+            candidate = int((min_start_epoch - boot_epoch) * ticks_per_sec)
+            # t049 族C監査: 負 (= assignment が「起動より前」に見える。壁時計の
+            # ずれ・古い assignment が起動を跨いで残った場合に起こりうる) を
+            # そのまま使うと、あらゆる tick 値が無条件に閾値以上になり、下の
+            # ループが MCP サーバーまで含めて全部 "executing" と誤読する —
+            # このガード自身が壊れた状態を「常に検知した」に倒してしまう。
+            # 負のときは判定材料として使わない (min_start_epoch を渡さなかった
+            # ときと同じ、grace_seconds だけの判定にフォールバックする)。
+            if candidate >= 0:
+                min_start_ticks = candidate
 
     # root 配下を幅優先で走査 (root 自身は含めない)
     stack = list(direct)

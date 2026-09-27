@@ -33,10 +33,13 @@ fail の向き (memory: fail-direction-is-per-judgment) はテスト名に出す
 """
 
 import json
+import os
+import signal
 import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Optional
 
 import pytest
 
@@ -61,6 +64,53 @@ TARGET = f"{AGENT}-worker"
 # 実プロセス木 (pane 相当)。1 テストファイルで 2 本だけ立てて使い回す
 # ---------------------------------------------------------------------------
 
+def _pgid_of(pid: int) -> Optional[int]:
+    """/proc/<pid>/stat の field 5 (pgid)。読めなければ None (= 既に居ない)。"""
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return None
+    close = raw.rfind(")")
+    if close < 0:
+        return None
+    rest = raw[close + 1:].split()
+    if len(rest) < 3:
+        return None
+    try:
+        return int(rest[2])
+    except ValueError:
+        return None
+
+
+def _members_of_group(pgid: int) -> list:
+    """この pgid に属する現存 pid の一覧 (テストの「孤児が残っていないか」の判定に使う)。"""
+    members = []
+    try:
+        entries = list(Path("/proc").iterdir())
+    except OSError:
+        return members
+    for entry in entries:
+        if entry.name.isdigit() and _pgid_of(int(entry.name)) == pgid:
+            members.append(int(entry.name))
+    return members
+
+
+def _kill_pane_tree(proc: subprocess.Popen) -> None:
+    """t049 (Codex review, PR#238 P3): root だけでなく group ごと kill する。
+
+    root の `sh` 自身しか kill しないと、非対話シェルの背後の子 (孫の `sh` /
+    `sleep`) は同じ group のまま孤児になり、自分の `sleep 300` の寿命 (最大 5分)
+    だけ生き残って標準出力の fd を掴み続ける (mutation script を繰り返すたびに
+    残骸が積み上がり、EOF 待ちの呼び出し側を遅延させうる)。spawn 側が
+    `start_new_session=True` (setsid) で自分専用の process group を持つ前提。
+    """
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except ProcessLookupError:
+        pass  # 既に居ない (group ごと消えた) — teardown の目的は既に達成
+    proc.wait()
+
+
 @pytest.fixture(scope="module")
 def panes():
     """{"busy": pid, "quiet": pid} — どちらも本番のペインと同じ形の木。
@@ -69,18 +119,21 @@ def panes():
     quiet  root sh ─ sleep(t=0, MCP 相当) ─ sh(t=0, claude 相当)   … 裏の job 無し
 
     基準時刻は「最も古い直下の子」なので、t=0 の子を生かしたままにする。
+    各木は `start_new_session=True` で自分専用の process group を持つ (setsid)。
+    teardown は `_kill_pane_tree()` で group ごと落とす (P3)。
     """
     busy = subprocess.Popen(
-        ["sh", "-c", 'sleep 300 & sh -c "sleep 2; sleep 300 & wait" & wait'])
+        ["sh", "-c", 'sleep 300 & sh -c "sleep 2; sleep 300 & wait" & wait'],
+        start_new_session=True)
     quiet = subprocess.Popen(
-        ["sh", "-c", 'sleep 300 & sh -c "sleep 300 & wait" & wait'])
+        ["sh", "-c", 'sleep 300 & sh -c "sleep 300 & wait" & wait'],
+        start_new_session=True)
     time.sleep(3.5)  # 遅れて生える子が出そろうまで
     try:
         yield {"busy": busy.pid, "quiet": quiet.pid}
     finally:
         for p in (busy, quiet):
-            p.kill()
-            p.wait()
+            _kill_pane_tree(p)
 
 
 @pytest.fixture(autouse=True)
@@ -228,6 +281,80 @@ def test_a_vanished_pane_process_falls_to_the_notifying_side(r5):
     PaneMux.pane_state, PaneMux.pane_pid = "idle", 2 ** 22
     r5.age_state()
     assert len(r5.run()) == 1
+
+
+# ---------------------------------------------------------------------------
+# P2 (Codex review, PR#238): grace_seconds の枠内で始まった裏 job も拾う
+# ---------------------------------------------------------------------------
+
+def test_a_job_started_within_the_grace_window_is_caught_via_assignment_mtime(
+    tmp_path, monkeypatch
+):
+    """しきい値 (ここでは 5 秒に上書き) の枠内で始まった裏 job は、session_start
+    だけを根拠にすると classify_process_tree が一生 idle_process と読む欠陥が
+    あった (実測: mission 20260927-mechanize-guards-b の QA Worker Arjun — 着手
+    直後に投げた裏の pytest が、watchdog の verdict でも同じ形で idle_process と
+    観測された)。既存テスト (`short_grace` で 1 秒に縮め、t=2 で job を生やす) は
+    grace より**後**に job が始まる経路しか通らないため、この穴を検出できない。
+
+    assignment file (このWorkerが「今の task」を割り当てられた時刻。job より必ず
+    前に書かれる) の mtime を根拠に足すことで、grace の枠内でも拾えることを
+    本物の check_rule5() 経由で固定する。
+    """
+    monkeypatch.setattr(lib_pane_process, "PROCESS_WORK_START_GRACE", 5)
+    root = subprocess.Popen(
+        ["sh", "-c", 'sleep 300 & sh -c "sleep 1.5; sleep 300 & wait" & wait'],
+        start_new_session=True)
+    try:
+        time.sleep(0.3)  # MCP 相当だけが立った状態 (裏 job はまだ t=1.5 に生えていない)
+
+        # Harness.__init__ 自身が lib_mux.Mux を FakeMux に差し替えるので、
+        # PaneMux への差し替えは Harness 構築の**後**でないと上書きされて消える
+        # (`Rule5.__init__` と同じ順序)。
+        h = Harness(tmp_path / "repo", monkeypatch)
+        monkeypatch.setattr(lib_mux, "Mux", PaneMux)
+        PaneMux.pane_state, PaneMux.pane_pid, PaneMux.pid_raises = "idle", root.pid, None
+        h.cycle()
+        assignment = h.ns["ASSIGNMENTS_DIR"] / AGENT
+        assignment.parent.mkdir(parents=True, exist_ok=True)
+        assignment.write_text(f"{SLUG}:t001\n")  # mtime ≈ ここ (裏 job より前)
+        h.ns["_save_state_entry"](AGENT, "idle-with-task", time.time() - 600)  # grace 経過済み
+
+        # 対照: assignment を使わない生の分類は、まだ grace(5s) の枠内なので
+        # 依然として idle_process に誤読される — これが P2 の欠陥そのもの
+        assert lib_pane_process.classify_process_tree(root.pid) == "idle_process"
+
+        time.sleep(1.8)  # 裏 job (t=1.5 に生えた) が生きている。総経過はまだ grace(5s) 未満
+
+        FakeMux.sent = []
+        h.ns["check_rule5"](AGENT, TARGET, assignment, {})
+        assert FakeMux.sent == []  # 裏 job を拾い、idle-with-task を通知しない
+    finally:
+        _kill_pane_tree(root)
+
+
+# ---------------------------------------------------------------------------
+# P3 (Codex review, PR#238): pane tree の teardown は group ごと
+# ---------------------------------------------------------------------------
+
+def test_kill_pane_tree_leaves_no_orphans_behind():
+    """root の `sh` だけを kill すると、孫の `sh` / `sleep` が同じ group のまま
+    孤児になり、自分の `sleep 300` の寿命 (最大 5分) だけ生き残って標準出力の fd を
+    掴み続ける (mutation script を繰り返すたびに残骸が積み上がる)。
+    `_kill_pane_tree()` が group ごと落とし、孤児を残さないことを固定する。
+    """
+    proc = subprocess.Popen(
+        ["sh", "-c", 'sleep 300 & sh -c "sleep 2; sleep 300 & wait" & wait'],
+        start_new_session=True)
+    time.sleep(3.5)  # 孫の裏 job まで出そろうまで
+    pgid = os.getpgid(proc.pid)
+
+    # 前提: 木の形が意図どおり (root + MCP 相当 + wrapper + 裏 job の 4 プロセス)
+    assert len(_members_of_group(pgid)) == 4
+
+    _kill_pane_tree(proc)
+    time.sleep(0.3)  # SIGKILL の反映を待つ
+    assert _members_of_group(pgid) == []
 
 
 # ---------------------------------------------------------------------------

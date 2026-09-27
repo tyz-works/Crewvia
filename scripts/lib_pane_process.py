@@ -9,6 +9,7 @@ watchdog.py にあった `classify_process_tree()` を、dispatcher.sh の Rule 
 読むのは /proc だけで、queue / registry / config は開かない。
 """
 import os
+import time
 from pathlib import Path
 from typing import Literal, Optional
 
@@ -57,8 +58,23 @@ def _proc_stat(pid: int) -> Optional[tuple[int, int]]:
         return None
 
 
+def _boot_epoch() -> Optional[float]:
+    """壁時計 (epoch 秒) と /proc の starttime (tick) を結びつける起動時刻を返す。
+
+    `/proc/uptime` の起動からの経過秒を `time.time()` から引くだけ。読めなければ
+    None (呼び出し側は `min_start_epoch` を無視して従来どおりの判定にフォールバックする)。
+    """
+    try:
+        uptime_seconds = float(Path("/proc/uptime").read_text().split()[0])
+    except (OSError, ValueError, IndexError):
+        return None
+    return time.time() - uptime_seconds
+
+
 def classify_process_tree(
-    root_pid: int, grace_seconds: Optional[int] = None
+    root_pid: int,
+    grace_seconds: Optional[int] = None,
+    min_start_epoch: Optional[float] = None,
 ) -> ProcessSignal:
     """mux ペインのプロセス木を 3 値に分類する。
 
@@ -89,6 +105,29 @@ def classify_process_tree(
 
     起動時刻は /proc の starttime (boot からの tick) 同士で比較する。壁時計に
     依存しないので、NTP 補正やサスペンドの影響を受けない。
+
+    ## t049 (Codex review, PR#238 P2): grace_seconds だけでは区別できない窓
+
+    `session_start` から `grace_seconds` 以内に始まった子孫は、それが MCP サーバー
+    由来 (無視してよい) か、着手直後に投げた本物の裏 job (無視してはいけない) か
+    を、開始時刻の絶対値だけでは区別できない — 両方とも claude 起動の数秒後に
+    生まれうる。しきい値を伸ばしても縮めても同じ形の穴が残る (`grace_seconds` の
+    枠内で始まった job は、生きている間ずっと `idle_process` のまま)。
+
+    `min_start_epoch` はこれを**別の根拠**で区別するためのオプション引数。
+    呼び出し側が「今の task の作業がいつから有効か」を示す壁時計時刻 (例:
+    assignment file の mtime) を渡すと、それ以降に始まった子孫は
+    `session_start` からの経過が `grace_seconds` の枠内でも無条件で "executing"
+    になる。assignment file は必ず「今の task の作業が始まるより前」に書かれるので
+    (`plan.sh pull` が書いてから Worker が動き出す)、以降に生える子孫は今の task
+    由来と確定できる — MCP サーバーは task の割り当てより前 (セッション起動直後)
+    に立ち上がっているので誤って拾わない。
+
+    比較には壁時計 (`min_start_epoch`) を 1 箇所だけ混ぜるため、`_boot_epoch()`
+    の読み取り誤差 (数十 ms) の分だけ従来の tick 同士の比較より粗くなるが、
+    比較対象が秒単位の `grace_seconds` なので実用上無視できる。`min_start_epoch`
+    を渡さない (または `_boot_epoch()` が読めない) 呼び出しは、従来どおり
+    tick 同士の比較だけで判定する。
     """
     if _proc_stat(root_pid) is None:
         return "no_process"
@@ -121,6 +160,14 @@ def classify_process_tree(
     threshold_ticks = grace_seconds * ticks_per_sec
     session_start = min(procs[pid][1] for pid in direct)
 
+    # t049 (P2): min_start_epoch を tick に変換しておく。boot_epoch が読めなければ
+    # 素通し (None のまま) — 従来どおり grace_seconds だけで判定する。
+    min_start_ticks: Optional[int] = None
+    if min_start_epoch is not None:
+        boot_epoch = _boot_epoch()
+        if boot_epoch is not None:
+            min_start_ticks = int((min_start_epoch - boot_epoch) * ticks_per_sec)
+
     # root 配下を幅優先で走査 (root 自身は含めない)
     stack = list(direct)
     seen: set[int] = set()
@@ -130,6 +177,8 @@ def classify_process_tree(
             continue
         seen.add(pid)
         if procs[pid][1] - session_start > threshold_ticks:
+            return "executing"
+        if min_start_ticks is not None and procs[pid][1] >= min_start_ticks:
             return "executing"
         stack.extend(children.get(pid, []))
 

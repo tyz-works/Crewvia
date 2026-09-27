@@ -26,6 +26,9 @@
 #   T  git status の失敗を clean と読む                                              → 赤
 #   U  rev-list の失敗を「push 済み」と読む                                          → 赤
 #   V  untracked を未追跡ディレクトリ 1 行に畳む (--untracked-files=normal)           → 赤
+#   W  ignored なファイルがあっても remove にする                                    → 赤 (t057 / PR#239 F1)
+#   X  --apply のたびに repository-wide の git worktree prune を復活させる            → 赤 (t057 / PR#239 F2)
+#   Y  lsof が非 0 でも部分出力を完全なスキャンとみなす                              → 赤 (t057 / PR#239 F3)
 #
 # 隔離: 使い捨ての複製で欠陥を注入する。本番の worktree のファイルには触らない。
 # テストは一時ディレクトリの git repo (origin = bare) と隔離した queue / registry だけで動き、
@@ -88,9 +91,10 @@ else ng "baseline が緑でない"; echo "$out" | tail -8; fi
 
 echo "== case A: dirty でも remove にする"
 fresh_copy
-inject $S "    if out.strip():
-        first = out.splitlines()[0]" "    if False:
-        first = out.splitlines()[0]"
+inject $S "    if dirty_lines:
+        return keep(R_DIRTY, f'{len(dirty_lines)} 件の変更 (先頭: {dirty_lines[0]})')" \
+           "    if False:
+        return keep(R_DIRTY, f'{len(dirty_lines)} 件の変更 (先頭: {dirty_lines[0]})')"
 expect_red "case A" "test_a_modified_tracked_file_keeps_it"
 
 echo "== case B: origin に無いコミットがあっても remove にする"
@@ -205,6 +209,30 @@ echo "== case V: untracked を畳む (--untracked-files=normal)"
 fresh_copy
 inject $S "'status', '--porcelain=v1', '--untracked-files=all'" "'status', '--porcelain=v1', '--untracked-files=normal'"
 expect_red "case V" "test_an_untracked_file_inside_an_untracked_directory_keeps_it"
+
+echo "== case W: ignored なファイルがあっても remove にする (PR#239 F1)"
+fresh_copy
+inject $S "    if ignored_lines:
+        return keep(R_IGNORED, f'{len(ignored_lines)} 件の ignored ファイル (先頭: {ignored_lines[0][3:]})')" \
+           "    if False:
+        return keep(R_IGNORED, f'{len(ignored_lines)} 件の ignored ファイル (先頭: {ignored_lines[0][3:]})')"
+expect_red "case W" "test_an_ignored_file_keeps_it_even_though_git_status_is_clean"
+
+echo "== case X: --apply のたびに repository-wide prune を復活させる (PR#239 F2)"
+fresh_copy
+inject $S "    applied = apply_removals(repo, queue, verdicts) if args.apply else None" \
+           "    applied = apply_removals(repo, queue, verdicts) if args.apply else None
+    if applied is not None:
+        run_git(repo, 'worktree', 'prune')"
+expect_red "case X" "test_apply_never_invokes_git_worktree_prune"
+
+echo "== case Y: lsof が非 0 でも部分出力を完全なスキャンとみなす (PR#239 F3)"
+fresh_copy
+inject $S "    if proc.returncode != 0:
+        return [], f'lsof が不完全 (rc={proc.returncode}): {(proc.stderr or \"\").strip()[:200]}'" \
+           "    if False:
+        return [], f'lsof が不完全 (rc={proc.returncode}): {(proc.stderr or \"\").strip()[:200]}'"
+expect_red "case Y" "test_a_nonzero_lsof_exit_with_partial_output_is_a_failure_not_a_partial_success"
 
 echo
 echo "PASS=$PASS FAIL=$FAIL"

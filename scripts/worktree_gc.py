@@ -18,7 +18,10 @@
 3. Worker が今使っていない: `registry/workers/*/target_dir.json` の TARGET_DIR がその worktree を指さず、
    どのプロセスの cwd (Worker の claude・pane のシェル・この実行自身) もその worktree の中に無い
 4. 未コミット・untracked の変更が無い (`git status --porcelain --untracked-files=all` が空)
-5. HEAD から辿れるコミットがすべて `origin/*` にある (merge 済み、または remote branch に push 済み)
+5. ignore されている内容も無い (`git status --ignored=matching` が空)。「ignore されている = 捨ててよい」
+   は成り立たない (`.env` 等の secrets・ローカル状態を ignore しているこの repo では、`git worktree remove`
+   は `--force` 無しでも ignored ファイルの削除を許すため)。捨ててよいと明示的に確立できていない限り keep
+6. HEAD から辿れるコミットがすべて `origin/*` にある (merge 済み、または remote branch に push 済み)
 
 ## 判定できないものは keep (破棄ではなく保留)
 
@@ -30,7 +33,12 @@
 
 - `git worktree remove` (**`--force` を使わない**。git が dirty / locked を自分でも断る)。
   ローカルブランチは `git branch -d` (**`-D` を使わない**。merge 済みと git が認めないなら残す)。
-  `rm -rf` は使わない。remote branch は触らない。最後に `git worktree prune`。
+  `rm -rf` は使わない。remote branch は触らない。
+- **repository-wide の `git worktree prune` は呼ばない。** `git worktree remove` は自分が消した対象の
+  登録だけを消すので、他の worktree には触れない。`prune` は管理対象ディレクトリの外にある worktree
+  (一度も verdict を出していない = 検証していない) のメタデータまで対象にしてしまい、移動中・一時的に
+  見えないだけの detached worktree の HEAD・reflog を消しうる。破壊の根拠は分類ではなく観測 (対象の同定)
+  に乗せる — 個別に verdict を出した対象だけを `git worktree remove` で消す
 - 消す直前に、その worktree の判定を **もう一度** やり直し、remove でなくなっていたら消さない
   (dry-run から --apply までに Worker が起動した・変更が入った、を拾う)。
 - 1 件の失敗で止めない (失敗は報告して次へ。終了コード 1)。
@@ -89,6 +97,7 @@ R_IN_USE_TARGET = 'in-use-target-dir'
 R_IN_USE_PROCESS = 'in-use-process'
 R_STATUS_FAILED = 'git-status-failed'
 R_DIRTY = 'dirty'
+R_IGNORED = 'ignored-files-present'
 R_HEAD_UNRESOLVED = 'head-unverifiable'
 R_UNPUSHED = 'unpushed-commits'
 
@@ -310,7 +319,11 @@ def _scan_with_lsof() -> tuple[list, str]:
                               timeout=60)
     except (OSError, subprocess.SubprocessError) as e:
         return [], f'/proc も lsof も使えない ({type(e).__name__}: {e})'
-    # lsof は読めなかった行があっても 1 を返すことがある。出力が空なら「見えなかった」であって「無い」ではない。
+    # lsof は一部のプロセスの検査に失敗しても部分的な stdout を出しつつ非 0 を返すことがある。
+    # 出力があっても不完全なスキャンでしかない = 「使われていない証拠」にならないので、成功 (rc=0) だけを完全とみなす。
+    if proc.returncode != 0:
+        return [], f'lsof が不完全 (rc={proc.returncode}): {(proc.stderr or "").strip()[:200]}'
+    # 出力が空なら「見えなかった」であって「無い」ではない。
     if not proc.stdout.strip():
         return [], f'lsof の出力が空 (rc={proc.returncode})'
     found, pid = [], None
@@ -411,12 +424,16 @@ def classify(wt: Worktree, ctx: Context, is_main: bool = False) -> Verdict:
             return keep(R_IN_USE_PROCESS, f'pid {pid} の cwd = {cwd}')
 
     # --- git の中身 ---
-    rc, out, err = run_git(wt.path, 'status', '--porcelain=v1', '--untracked-files=all')
+    rc, out, err = run_git(wt.path, 'status', '--porcelain=v1', '--untracked-files=all', '--ignored=matching')
     if rc != 0:
         return keep(R_STATUS_FAILED, (err or 'git を実行できない').strip()[:200])
-    if out.strip():
-        first = out.splitlines()[0]
-        return keep(R_DIRTY, f'{len(out.splitlines())} 件の変更 (先頭: {first})')
+    lines = out.splitlines()
+    dirty_lines = [line for line in lines if not line.startswith('!! ')]
+    if dirty_lines:
+        return keep(R_DIRTY, f'{len(dirty_lines)} 件の変更 (先頭: {dirty_lines[0]})')
+    ignored_lines = [line for line in lines if line.startswith('!! ')]
+    if ignored_lines:
+        return keep(R_IGNORED, f'{len(ignored_lines)} 件の ignored ファイル (先頭: {ignored_lines[0][3:]})')
     rc, out, err = run_git(wt.path, 'rev-list', '--max-count=1', 'HEAD', '--not', '--remotes=origin')
     if rc != 0:
         return keep(R_HEAD_UNRESOLVED, (err or 'git を実行できない').strip()[:200])
@@ -554,11 +571,6 @@ def main(argv=None) -> int:
         return 1
 
     applied = apply_removals(repo, queue, verdicts) if args.apply else None
-    if applied is not None:
-        rc, _out, err = run_git(repo, 'worktree', 'prune')
-        if rc != 0:
-            applied.append({'path': repo, 'status': 'failed',
-                            'detail': f'git worktree prune: {(err or "実行できない").strip()[:300]}'})
 
     if args.json:
         print(json.dumps({'summary': summarize(verdicts), 'applied': applied,

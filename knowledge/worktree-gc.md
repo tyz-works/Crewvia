@@ -29,7 +29,8 @@ python3 scripts/worktree_gc.py --apply        # remove と判定したものだ�
 | 6 | Worker が使っていない: TARGET_DIR 記録 (`registry/workers/*/target_dir.json`) が worktree を指さない | `in-use-target-dir` |
 | 7 | どのプロセスの cwd も worktree の中に無い (Worker の claude・pane のシェル・この実行自身) | `in-use-process` |
 | 8 | 未コミット・untracked の変更が無い (`git status --porcelain --untracked-files=all` が空) | `dirty` |
-| 9 | HEAD から辿れるコミットがすべて `origin/*` にある (merge 済み、または remote branch に push 済み) | `unpushed-commits` |
+| 9 | ignore されている内容も無い (`git status --ignored=matching` が空)。「ignore されている = 捨ててよい」は成り立たない — `.env` 等の secrets・ローカル状態を ignore しているこの repo では `git worktree remove` は `--force` 無しでも ignored ファイルの削除を許すため (PR#239 F1、2026-09-27) | `ignored-files-present` |
+| 10 | HEAD から辿れるコミットがすべて `origin/*` にある (merge 済み、または remote branch に push 済み) | `unpushed-commits` |
 
 判定の順序は安いものから (構造 → mission → 使用中 → git の中身)。最初に当たった keep の理由が出る。
 `--json` の `summary.keep_by_reason` が理由別件数。
@@ -62,6 +63,9 @@ memory `fail-closed-discard-vs-hold` / `evidence-for-destructive-decisions` の�
   memory `approve-judgment-needs-allowlist-and-scope`)。足したいときはコードの allowlist に理由付きで足す。
 
 `/proc` が無い環境 (macOS) は `lsof -a -d cwd -Fpn`。出力が空なら「見えなかった」であって「無い」ではない。
+**lsof の終了コードが 0 以外なら、stdout に何か出ていても不完全なスキャンとして拒否する** (PR#239 F3、
+2026-09-27)。lsof は一部のプロセスの検査に失敗しても集められた分の部分出力を出しつつ非 0 を返すことが
+あり、その部分出力を「見つからなかった (= 使われていない)」の証拠にしてはいけない。
 
 ## `--apply` の安全策
 
@@ -69,13 +73,19 @@ memory `fail-closed-discard-vs-hold` / `evidence-for-destructive-decisions` の�
 - ローカルブランチは `git branch -d` — **`-D` を使わない**。git が merge 済みと認めないなら残す
   (`branch: kept <name> (...)` と出る。失敗ではない)。detached の worktree はブランチに触れない。
   worktree を消せなかったときもブランチに触れない。
-- `rm -rf` / `shutil.rmtree` / `unlink` は使わない。remote branch は触らない。最後に `git worktree prune`。
+- `rm -rf` / `shutil.rmtree` / `unlink` は使わない。remote branch は触らない。
+- **repository-wide の `git worktree prune` は呼ばない** (PR#239 F2、2026-09-27 で削除)。元の実装は
+  `--apply` のたびに全 verdict が keep でも `state.yaml` が読めなくても無条件に走らせており、管理対象
+  ディレクトリの外にある worktree (一度も verdict を出していない対象) のメタデータまで消しうった。
+  移動中・一時的に見えないだけの detached worktree では、未 push のコミットを守る HEAD・reflog が消え、
+  git の紐付けが壊れる。個別に判定した対象は `git worktree remove` (自分が消した登録だけを消す) で消し、
+  それ以外 (`prunable` = ディレクトリが無い判定を含む) は触らない。
 - **消す直前に、その worktree の判定をもう一度やり直す** (dry-run と `--apply` の間に Worker が起動した・変更が
   入った・mission が active になった、を拾う)。remove でなくなっていれば `skipped`。
 - 1 件の失敗で止めない。失敗は報告して次へ進み、終了コード 1。
 - これらは `tests/test_worktree_gc.py::TestNoForcefulOperations` が **AST で固定**している
   (`run_git(...)` の literal 引数から verb / flag を洗い出し、`--force` / `-f` / `-D` / `--hard` 等が
-  1 つでも増えたら赤。ファイルを直接消す呼び出しも赤)。
+  1 つでも増えたら赤。ファイルを直接消す呼び出しも赤。`("worktree", "prune")` の呼び出しも赤にする)。
 
 ## 限界 (知っておくこと)
 
@@ -102,4 +112,4 @@ env の停止スイッチも付けていない。PR を revert すれば道具�
 
 - `python3 -m pytest tests/test_worktree_gc.py -q` — 一時 git repo (origin = bare) と隔離した queue / registry で、
   各条件の keep / remove・観測できない場合の保留・`--apply` しても keep が残る・再判定・`-D` / `--force` を使わない。
-- 赤の実証: `bash tests/red_proof_t033.sh` (22 ケース)。
+- 赤の実証: `bash tests/red_proof_t033.sh` (25 ケース。W/X/Y は PR#239 の Codex findings 3 件、t057)。

@@ -416,6 +416,19 @@ class TestProcessScan:
         found, problem = gc.scan_process_cwds()
         assert found == [] and problem
 
+    def test_a_nonzero_lsof_exit_with_partial_output_is_a_failure_not_a_partial_success(self, tmp_path, monkeypatch):
+        """lsof は一部のプロセスの検査に失敗しても、集められた分の stdout を出しつつ非 0 を返しうる。
+        その部分出力を「見つからなかった (= 使われていない)」の証拠にしてはいけない。"""
+        monkeypatch.setattr(gc, "PROC_ROOT", tmp_path / "no-such-proc")
+        target = tmp_path / "wt"
+        target.mkdir()
+        stdout = f"p123\nn{target}\n"
+        monkeypatch.setattr(gc.subprocess, "run",
+                            lambda *a, **kw: subprocess.CompletedProcess(
+                                a, 1, stdout=stdout, stderr="lsof: WARNING: can't stat() fuse.gvfsd-fuse\n"))
+        found, problem = gc.scan_process_cwds()
+        assert found == [] and problem, "非 0 の lsof は、出力があっても不完全なスキャンとして拒否すること"
+
 
 # ---------------------------------------------------------------------------
 # 3. git の中身
@@ -445,6 +458,39 @@ class TestGitContent:
         wt = _pushed_worktree(fx)
         (wt / "staged.txt").write_text("x\n")
         git(wt, "add", "staged.txt")
+        assert fx.verdict(wt).reason == gc.R_DIRTY
+
+    def test_an_ignored_file_keeps_it_even_though_git_status_is_clean(self, fx):
+        """`git status` (--ignored 無し) は ignored ファイルを数えないので、これが無いと remove になる。
+        中身は読まず存在だけを扱う (実際の `.env` は作らない・読まない)。"""
+        wt = _pushed_worktree(fx)
+        (wt / ".gitignore").write_text("secret.local\n")
+        git(wt, "add", ".gitignore")
+        git(wt, "commit", "-q", "-m", "gitignore")
+        fx.push(wt)
+        (wt / "secret.local").write_text("x\n")
+        v = fx.verdict(wt)
+        assert (v.action, v.reason) == (gc.KEEP, gc.R_IGNORED) and "secret.local" in v.detail
+
+    def test_an_entirely_ignored_directory_keeps_it(self, fx):
+        wt = _pushed_worktree(fx)
+        (wt / ".gitignore").write_text("secret/\n")
+        git(wt, "add", ".gitignore")
+        git(wt, "commit", "-q", "-m", "gitignore")
+        fx.push(wt)
+        (wt / "secret").mkdir()
+        (wt / "secret" / "a").write_text("x\n")
+        v = fx.verdict(wt)
+        assert v.reason == gc.R_IGNORED and "secret" in v.detail
+
+    def test_untracked_takes_priority_over_ignored_in_the_reported_reason(self, fx):
+        wt = _pushed_worktree(fx)
+        (wt / ".gitignore").write_text("secret.local\n")
+        git(wt, "add", ".gitignore")
+        git(wt, "commit", "-q", "-m", "gitignore")
+        fx.push(wt)
+        (wt / "secret.local").write_text("x\n")
+        (wt / "new.txt").write_text("x\n")
         assert fx.verdict(wt).reason == gc.R_DIRTY
 
     def test_a_commit_that_is_not_on_origin_keeps_it(self, fx):
@@ -495,10 +541,17 @@ class TestGitContent:
         (dirty / "x").write_text("x\n")
         unpushed = _pushed_worktree(fx, "unpushed")
         fx.commit(unpushed, "y.txt")
+        ignored = _pushed_worktree(fx, "ignored")
+        (ignored / ".gitignore").write_text("secret.local\n")
+        git(ignored, "add", ".gitignore")
+        git(ignored, "commit", "-q", "-m", "gitignore")
+        fx.push(ignored)
+        (ignored / "secret.local").write_text("x\n")
         got = fx.verdicts()
         assert got[str(clean)].action == gc.REMOVE
         assert got[str(dirty)].reason == gc.R_DIRTY
         assert got[str(unpushed)].reason == gc.R_UNPUSHED
+        assert got[str(ignored)].reason == gc.R_IGNORED
 
 
 class TestParseWorktreeList:
@@ -609,13 +662,43 @@ class TestApply:
         assert first.is_dir() and not second.exists()
         assert f"task/{SLUG}/a" in _branches(fx), "worktree を消せなかった branch には触れない"
 
-    def test_git_worktree_prune_runs_after_apply(self, fx):
+    def test_a_prunable_worktree_inside_the_managed_dir_is_left_registered_after_apply(self, fx):
+        """`prunable` (ディレクトリが無い) は keep 止まり (R_PRUNABLE)。--apply は repository-wide の
+        `git worktree prune` を呼ばないので、一度も verdict をやり直していない対象は登録されたまま残る
+        (旧実装はここで無条件に prune していた — 全 verdict が keep でも state.yaml が読めなくても走る P1)。"""
         wt = _pushed_worktree(fx)
         stale = _pushed_worktree(fx, "stale")
-        subprocess.run(["mv", str(stale), str(stale) + ".moved"], check=True)   # 管理外で消えた
+        subprocess.run(["mv", str(stale), str(stale) + ".moved"], check=True)
         r = fx.cli("--apply")
         assert r.returncode == 0, r.stderr
-        assert str(stale) not in git(fx.repo, "worktree", "list", "--porcelain").stdout
+        assert not wt.exists()                                     # 通常の remove 対象は消える
+        assert str(stale) in git(fx.repo, "worktree", "list", "--porcelain").stdout, \
+            "検証していない prunable entry を勝手に消してはいけない"
+
+    def test_apply_never_touches_a_foreign_worktree_outside_the_managed_dir(self, fx, tmp_path):
+        """管理対象ディレクトリの外の worktree はこのツールが一度も verdict を出していない対象。
+        `prunable` (移動中・一時的に見えないだけかもしれない) であっても --apply の影響を受けてはいけない
+        (旧実装の repository-wide `git worktree prune` は、ここで未 push のコミットを守る HEAD・reflog を
+        消しうった)。"""
+        outside = tmp_path / "elsewhere" / "wt"
+        git(fx.repo, "worktree", "add", "-q", "--detach", str(outside), "origin/main")
+        subprocess.run(["mv", str(outside), str(outside) + ".moved"], check=True)
+        r = fx.cli("--apply")
+        assert r.returncode == 0, r.stderr
+        assert str(outside) in git(fx.repo, "worktree", "list", "--porcelain").stdout
+
+    def test_apply_never_invokes_git_worktree_prune(self, fx, monkeypatch):
+        _pushed_worktree(fx, "t001")
+        calls = []
+        real = gc.run_git
+
+        def spy(cwd, *args):
+            calls.append(args)
+            return real(cwd, *args)
+        monkeypatch.setattr(gc, "run_git", spy)
+        rc = gc.main(["--repo", str(fx.repo), "--queue", str(fx.queue), "--apply"])
+        assert rc == 0
+        assert ("worktree", "prune") not in calls
 
     def test_nothing_is_removed_when_the_worktree_list_cannot_be_read(self, fx, tmp_path):
         wt = _pushed_worktree(fx)
@@ -688,8 +771,8 @@ class TestNoForcefulOperations:
                     verbs.add(consts[0])
                     flags.update(c for c in consts[1:] if c.startswith("-"))
         assert verbs == {"worktree", "status", "rev-list", "branch", "fetch"}, verbs
-        assert flags <= {"--porcelain", "-z", "--porcelain=v1", "--untracked-files=all", "--max-count=1",
-                         "--not", "--remotes=origin", "--prune", "-d"}, flags
+        assert flags <= {"--porcelain", "-z", "--porcelain=v1", "--untracked-files=all", "--ignored=matching",
+                         "--max-count=1", "--not", "--remotes=origin", "--prune", "-d"}, flags
         for banned in ("--force", "-f", "-D", "--delete", "--hard", "-B"):
             assert banned not in flags
 
@@ -701,8 +784,10 @@ class TestNoForcefulOperations:
                 calls.append(consts)
         assert ("worktree", "remove") in {c[:2] for c in calls}
         assert ("branch", "-d") in {c[:2] for c in calls}
+        assert ("worktree", "prune") not in {c[:2] for c in calls}, \
+            "repository-wide の `git worktree prune` は呼ばない (検証していない他の worktree まで消しうる)"
         for c in calls:
             if c[:1] == ("worktree",):
-                assert c[1] in {"list", "remove", "prune"}, c
+                assert c[1] in {"list", "remove"}, c
             if c[:1] == ("branch",):
                 assert c[1] == "-d", c

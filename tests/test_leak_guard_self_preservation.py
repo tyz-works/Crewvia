@@ -327,3 +327,47 @@ def test_open_pidfd_verified_returns_none_without_raising_when_os_pidfd_open_is_
     """
     monkeypatch.delattr(os, "pidfd_open", raising=False)
     assert guard._open_pidfd_verified(os.getpid(), expected_start=0) is None
+
+
+def test_open_pidfd_verified_returns_none_without_raising_when_signal_pidfd_send_signal_is_absent(monkeypatch):
+    """`os.pidfd_open` はあっても `signal.pidfd_send_signal` が属性として無い構成でも、
+    `_open_pidfd_verified` は束縛せず `None` を返す (4巡目 codex review P2-2)。
+
+    3巡目の fix は `pidfd_supported()` を両属性ゲートにしたが (finding 1)、`scan()` が実際に
+    呼ぶのは `pidfd_supported()` を経由しない `_open_pidfd_verified` という**別の呼び出し
+    経路**であり、そこには届いていなかった。ここでガードしないと `os.pidfd_open` だけで
+    束縛に成功して `pidfd` が非 None になり、後段の `_default_kill` が
+    `signal.pidfd_send_signal` を素で呼んで `AttributeError` を漏らす —— 「検出のみ」に
+    倒すはずが、その例外で `kill_all` ごと止まり、残りの survivors の後片付けと pidfd の
+    クローズが飛ばされる。
+
+    `expected_start` には**本物の** starttime を渡す (`os.pidfd_open` 不在ケースの姉妹テストの
+    ように `0` にしない) —— `0` だと starttime 不一致の再確認 (§ `_open_pidfd_verified` の
+    pid 再利用チェック) が先に `None` を返してしまい、確かめたい signal 側のゲートを経由せず
+    に「たまたま」緑になる (red proof `case J` の 1 回目の実装がまさにこれで欠陥を見逃した)。
+    """
+    monkeypatch.delattr(signal, "pidfd_send_signal", raising=False)
+    stat = guard._read_stat(os.getpid())
+    assert stat is not None, "前提: 自分の stat が読めない"
+    assert guard._open_pidfd_verified(os.getpid(), expected_start=stat[2]) is None
+
+
+def test_kill_all_does_not_crash_and_refuses_when_signal_pidfd_send_signal_is_absent(monkeypatch):
+    """P2-2 の結合確認: `signal.pidfd_send_signal` が無い環境でも `scan()` → `kill_all()` が
+    例外を漏らさず最後まで走り、「検出のみ」(refused、pidfd 理由) になる。"""
+    monkeypatch.delattr(signal, "pidfd_send_signal", raising=False)
+    monkeypatch.setattr(guard, "GRACE_SECONDS", 0.1)
+    child = _sleeper()
+    try:
+        stat = guard._read_stat(child.pid)
+        assert stat is not None, "前提: 子の stat が読めない"
+        pidfd = guard._open_pidfd_verified(child.pid, expected_start=stat[2])
+        assert pidfd is None, "signal.pidfd_send_signal が無いのに束縛してしまった"
+        survivor = guard.Survivor(child.pid, os.getpid(), "S", 0.0, "", "sleep 30", "test", pidfd=pidfd)
+        report = guard.kill_all([survivor])   # kill= 省略 = 本物の _default_kill 経路
+        assert report.fatal is None
+        assert report.killed == []
+        assert any("pidfd" in r.reason for r in report.refused), report.refused
+    finally:
+        child.kill()
+        child.wait()

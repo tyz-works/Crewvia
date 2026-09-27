@@ -372,6 +372,102 @@ else
   echo "$out_old" | tail -20
 fi
 
+echo "== case I1: leaked_descendants._read_stat が UTF-8 でない comm で UnicodeDecodeError を漏らす (4巡目 P2-1)"
+fresh_copy
+inject tests/leaked_descendants.py \
+"    try:
+        raw = (_PROC / str(pid) / \"stat\").read_bytes()
+    except OSError:
+        return None
+    rp = raw.rfind(b\")\")
+    if rp < 0:
+        return None
+    rest = raw[rp + 2:].split()
+    try:
+        state = rest[0].decode(\"ascii\", errors=\"replace\")
+        return state, int(rest[1]), int(rest[19])
+    except (IndexError, ValueError):
+        return None" \
+"    try:
+        raw = (_PROC / str(pid) / \"stat\").read_text()
+    except OSError:
+        return None
+    rp = raw.rfind(\")\")
+    if rp < 0:
+        return None
+    rest = raw[rp + 2:].split()
+    try:
+        return rest[0], int(rest[1]), int(rest[19])
+    except (IndexError, ValueError):
+        return None"
+expect_red "case I1" "test_read_stat_survives_a_non_utf8_process_name"
+
+echo "== case I2: kill_budget._ppid_and_start が UTF-8 でない comm で UnicodeDecodeError を漏らす (4巡目 P2-1、同じ族)"
+fresh_copy
+inject tests/kill_budget.py \
+"    try:
+        raw = (_PROC / str(pid) / \"stat\").read_bytes()
+    except OSError:
+        return None
+    rp = raw.rfind(b\")\")
+    if rp < 0:
+        return None
+    rest = raw[rp + 2:].split()
+    try:
+        return int(rest[1]), int(rest[19])
+    except (IndexError, ValueError):
+        return None" \
+"    try:
+        raw = (_PROC / str(pid) / \"stat\").read_text()
+    except OSError:
+        return None
+    rp = raw.rfind(\")\")
+    if rp < 0:
+        return None
+    rest = raw[rp + 2:].split()
+    try:
+        return int(rest[1]), int(rest[19])
+    except (IndexError, ValueError):
+        return None"
+expect_red "case I2" "test_ppid_and_start_survives_a_non_utf8_process_name"
+
+echo "== case I3: proc_group.descendants が UTF-8 でない comm で UnicodeDecodeError を漏らす (4巡目 P2-1、同じ族)"
+fresh_copy
+inject tests/proc_group.py \
+"        try:
+            raw = pathlib.Path(f\"/proc/{name}/stat\").read_bytes()
+        except OSError:
+            continue                 # 走査中に死んだ
+        rp = raw.rfind(b\")\")
+        if rp < 0:
+            continue
+        rest = raw[rp + 2:].split()
+        try:
+            ppid = int(rest[1])
+        except (IndexError, ValueError):
+            continue
+        children.setdefault(ppid, []).append(int(name))" \
+"        try:
+            raw = pathlib.Path(f\"/proc/{name}/stat\").read_text()
+        except OSError:
+            continue                 # 走査中に死んだ
+        rest = raw[raw.rfind(\")\") + 2:].split()
+        children.setdefault(int(rest[1]), []).append(int(name))"
+expect_red "case I3" "test_descendants_survives_a_non_utf8_process_name"
+
+echo "== case J: _open_pidfd_verified が signal.pidfd_send_signal 不在をゲートしない (4巡目 P2-2)"
+fresh_copy
+inject tests/leaked_descendants.py \
+"    if not hasattr(os, \"pidfd_open\") or not hasattr(signal, \"pidfd_send_signal\"):
+        return None
+    try:
+        fd = os.pidfd_open(pid)" \
+"    if not hasattr(os, \"pidfd_open\"):
+        return None
+    try:
+        fd = os.pidfd_open(pid)"
+expect_red "case J" "test_open_pidfd_verified_returns_none_without_raising_when_signal_pidfd_send_signal_is_absent"
+
 echo
 echo "PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ]

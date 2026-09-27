@@ -92,17 +92,26 @@ class Scan:
 
 
 def _read_stat(pid: int):
-    """(state, ppid, starttime_ticks) — 読めなければ None。`comm` は括弧の中に空白を含みうる。"""
+    """(state, ppid, starttime_ticks) — 読めなければ None。`comm` は括弧の中に空白を含みうるほか、
+    Linux のプロセス名 (`comm`、`prctl(PR_SET_NAME)` 等で設定) は NUL と `/` を除く任意のバイト列を
+    取れる。`read_text()` (str) はそれを UTF-8 としてデコードするため、無関係な 1 プロセスが
+    `b'bad-\xff'` のような不正なバイト列の名前を持つだけで `UnicodeDecodeError` を投げる ——
+    これは `OSError` のサブクラスではないので、旧実装の `except OSError` では捕まえられず、
+    走査 (`scan()`) がそのプロセスの手前で丸ごと落ちる (4巡目 codex review P2-1)。
+    ここで要るのは `comm` の中身ではなく、その後ろの state/ppid/starttime だけなので、
+    バイト列のまま `rfind` / `split` して `comm` を一切デコードしない。
+    """
     try:
-        raw = (_PROC / str(pid) / "stat").read_text()
+        raw = (_PROC / str(pid) / "stat").read_bytes()
     except OSError:
         return None
-    rp = raw.rfind(")")
+    rp = raw.rfind(b")")
     if rp < 0:
         return None
     rest = raw[rp + 2:].split()
     try:
-        return rest[0], int(rest[1]), int(rest[19])
+        state = rest[0].decode("ascii", errors="replace")
+        return state, int(rest[1]), int(rest[19])
     except (IndexError, ValueError):
         return None
 
@@ -167,12 +176,23 @@ def _open_pidfd_verified(pid: int, expected_start: int) -> int | None:
     `None` を返す (kill_all はこれを「束縛できなかった」として扱い、pid 番号への
     フォールバックはしない —— 観測失敗を許可に倒さない)。
 
-    `os.pidfd_open` が属性として無い環境 (macOS 等) では `except OSError` は
+    `os.pidfd_open` / `signal.pidfd_send_signal` が属性として無い環境 (macOS 等、あるいは
+    `os.pidfd_open` はあっても `signal.pidfd_send_signal` が無い構成) では `except OSError` は
     `AttributeError` を捕まえない。ここは `scan()` から**無条件に**呼ばれる
     (pidfd_supported() のチェックを経由しない) ので、属性が無ければ「束縛できなかった」
     と同じ `None` を返して fail closed のまま抜ける (族A: 使えない → kill しない、を維持)。
+
+    両方の属性を見るのが要る: `pidfd_supported()` は既に両方をゲートしているが (3巡目
+    codex review finding 1)、ここは `pidfd_supported()` を経由せず `scan()` から直接呼ばれる
+    **別の呼び出し経路**なので、同じ判定をここにも個別に置かないと届かない
+    (4巡目 codex review P2-2 — 3巡目の fix は判定関数自体しか直しておらず、使う側の
+    この関数には届いていなかった。`os.pidfd_open` だけ有って `signal.pidfd_send_signal` が
+    無い場合、ここでゲートしないと束縛だけは成功して `pidfd` が非 None になり、後段の
+    `_default_kill` が `signal.pidfd_send_signal` を素で呼んで `AttributeError` を漏らす ——
+    「検出のみ」に倒すはずが、その `AttributeError` で `kill_all` ごと止まり、残りの
+    survivors の後片付けと pidfd のクローズが飛ばされる)。
     """
-    if not hasattr(os, "pidfd_open"):
+    if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
         return None
     try:
         fd = os.pidfd_open(pid)

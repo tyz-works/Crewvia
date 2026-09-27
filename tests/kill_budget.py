@@ -56,12 +56,17 @@ class Refusal:
 
 
 def _ppid_and_start(pid: int):
-    """(ppid, starttime_ticks) — 読めなければ None。`comm` は括弧の中に空白を含みうる。"""
+    """(ppid, starttime_ticks) — 読めなければ None。`comm` は括弧の中に空白を含みうるほか、
+    UTF-8 として不正な任意バイト列を取れる (`leaked_descendants._read_stat` と同じ族、
+    4巡目 codex review P2-1)。`comm` の中身は要らないので、バイト列のまま解析して
+    デコードしない — `read_text()` (str) だと無関係な 1 プロセスの名前だけで
+    `UnicodeDecodeError` (`OSError` のサブクラスではない) を投げ、この関数を呼ぶ
+    `partition()` の走査全体を落とす。"""
     try:
-        raw = (_PROC / str(pid) / "stat").read_text()
+        raw = (_PROC / str(pid) / "stat").read_bytes()
     except OSError:
         return None
-    rp = raw.rfind(")")
+    rp = raw.rfind(b")")
     if rp < 0:
         return None
     rest = raw[rp + 2:].split()

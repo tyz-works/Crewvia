@@ -42,17 +42,33 @@ def kill_group(proc: subprocess.Popen) -> None:
 
 
 def descendants(pid: int) -> list[int]:
-    """`pid` の子孫の pid (`/proc` の ppid を辿る)。`pid` 自身は含まない。"""
+    """`pid` の子孫の pid (`/proc` の ppid を辿る)。`pid` 自身は含まない。
+
+    stat の読み取りはバイト列のまま解析する。`comm` は UTF-8 として不正な任意バイト列を
+    取れるので、`read_text()` (str) は無関係な 1 プロセスの名前だけで `UnicodeDecodeError`
+    (`OSError` のサブクラスではない) を投げ、走査全体 (と、それを使う `kill_tree` の後片付け)
+    を落とす (`leaked_descendants._read_stat` / `kill_budget._ppid_and_start` と同じ族、
+    4巡目 codex review P2-1)。`rfind` が見つからない・`ppid` が読めない行は無視する
+    (旧実装は例外なしに `int(rest[1])` を呼んでおり、不正な行があれば `IndexError` /
+    `ValueError` を無条件に漏らしていた)。
+    """
     children: dict[int, list[int]] = {}
     for name in os.listdir("/proc"):
         if not name.isdigit():
             continue
         try:
-            raw = pathlib.Path(f"/proc/{name}/stat").read_text()
+            raw = pathlib.Path(f"/proc/{name}/stat").read_bytes()
         except OSError:
             continue                 # 走査中に死んだ
-        rest = raw[raw.rfind(")") + 2:].split()
-        children.setdefault(int(rest[1]), []).append(int(name))
+        rp = raw.rfind(b")")
+        if rp < 0:
+            continue
+        rest = raw[rp + 2:].split()
+        try:
+            ppid = int(rest[1])
+        except (IndexError, ValueError):
+            continue
+        children.setdefault(ppid, []).append(int(name))
     out, stack = [], list(children.get(pid, []))
     while stack:
         p = stack.pop()

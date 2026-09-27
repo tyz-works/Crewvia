@@ -26,8 +26,9 @@ import time
 
 import pytest
 
+import kill_budget
 import leaked_descendants
-from proc_group import kill_group, kill_tree, run_in_own_group
+from proc_group import descendants, kill_group, kill_tree, run_in_own_group
 
 TESTS_DIR = pathlib.Path(__file__).resolve().parent
 
@@ -403,6 +404,113 @@ def test_scan_does_not_count_a_zombie(basetemp):
 def test_scan_does_not_count_the_pytest_process_itself(basetemp):
     result = leaked_descendants.scan(set(), _marker(), basetemp)
     assert os.getpid() not in {s.pid for s in result.survivors}
+
+
+# --- 1b. UTF-8 でない comm (4巡目 codex review P2-1) ------------------------------------
+#
+# Linux のプロセス名 (`comm`、`prctl(PR_SET_NAME)` で書き換えられる) は NUL と `/` を除く
+# 任意のバイト列を取れる。`_read_stat` / `_ppid_and_start` / `descendants` はどれも
+# `/proc/<pid>/stat` の `comm` を含む行を `read_text()` (str) でデコードしており、
+# `b'bad-\xff'` のような不正なバイト列 1 つで `UnicodeDecodeError` (`OSError` のサブクラス
+# ではない) を投げて走査全体を落とす。`scan()` は所有者を確かめる**前**に `_read_stat` を
+# 呼ぶので、無関係な 1 プロセスがいるだけで session-finish の後片付けが動かなくなる。
+
+_RAW_COMM_CHILD = (
+    "import ctypes, time, sys\n"
+    "libc = ctypes.CDLL(None, use_errno=True)\n"
+    "libc.prctl(15, bytes.fromhex(sys.argv[1]), 0, 0, 0)\n"  # 15 = PR_SET_NAME
+    "time.sleep(30)\n"
+)
+
+#: b"bad-\xff" — 0xff は単独では UTF-8 として不正な継続バイト。コマンドラインへ生バイト列を
+#: そのまま埋め込めないので 16 進数で渡し、子の中で `bytes.fromhex` する。
+_BAD_COMM_HEX = "6261642dff"
+
+
+def _spawn_with_raw_comm(name_hex: str) -> subprocess.Popen:
+    """`comm` (`/proc/<pid>/stat` の `(...)`) を `name_hex` の生バイト列にした子プロセスを立てる。
+
+    `prctl(PR_SET_NAME)` は root 権限なしにプロセス自身の comm を書き換えられる。exec は comm
+    を実行ファイル名にリセットしてしまうので、exec せず既存の Python プロセスのまま prctl する。
+    """
+    return subprocess.Popen([sys.executable, "-c", _RAW_COMM_CHILD, name_hex])
+
+
+def _wait_for_comm(pid: int, name_hex: str, seconds: float = 5.0) -> None:
+    expected = bytes.fromhex(name_hex)
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        try:
+            raw = pathlib.Path(f"/proc/{pid}/stat").read_bytes()
+        except OSError:
+            raw = b""
+        if expected[:15] in raw:
+            return
+        time.sleep(0.02)
+    raise AssertionError("comm がまだ書き換わっていない (prctl(PR_SET_NAME) が失敗した疑い)")
+
+
+def test_read_stat_survives_a_non_utf8_process_name():
+    """`leaked_descendants._read_stat` は comm が UTF-8 として不正でも落ちない。"""
+    child = _spawn_with_raw_comm(_BAD_COMM_HEX)
+    try:
+        _wait_for_comm(child.pid, _BAD_COMM_HEX)
+        stat = leaked_descendants._read_stat(child.pid)
+        assert stat is not None, "UTF-8 でない comm を持つだけで stat が読めなくなった"
+        state, ppid, start = stat
+        assert ppid == os.getpid()
+        assert start > 0
+    finally:
+        child.kill()
+        child.wait()
+
+
+def test_ppid_and_start_survives_a_non_utf8_process_name():
+    """`kill_budget._ppid_and_start` も同じ族 (`_read_stat` と同じ解析コードの複製)。"""
+    child = _spawn_with_raw_comm(_BAD_COMM_HEX)
+    try:
+        _wait_for_comm(child.pid, _BAD_COMM_HEX)
+        got = kill_budget._ppid_and_start(child.pid)
+        assert got is not None, "UTF-8 でない comm を持つだけで stat が読めなくなった"
+        assert got[0] == os.getpid()
+    finally:
+        child.kill()
+        child.wait()
+
+
+def test_descendants_survives_a_non_utf8_process_name():
+    """`proc_group.descendants` も同じ族 —— 無関係な UTF-8 でない comm のプロセスに走査中に
+    当たっても /proc 全体の走査が落ちない (落ちれば FIFO テストの後片付け `kill_tree` を
+    道連れにする)。UTF-8 でない comm を持つプロセス自身も、自分の子として正しく数えられる
+    (黙って取りこぼさない) ことも確かめる。"""
+    child = _spawn_with_raw_comm(_BAD_COMM_HEX)
+    try:
+        _wait_for_comm(child.pid, _BAD_COMM_HEX)
+        assert child.pid in descendants(os.getpid())
+    finally:
+        child.kill()
+        child.wait()
+
+
+def test_scan_survives_a_bystander_with_a_non_utf8_process_name(basetemp):
+    """finding P2-1 の再現形そのもの: 無関係な UTF-8 でない comm のプロセスが 1 つ居るだけで
+    `scan()` 全体が落ち、本物の孤児 (印付き) が見つからなくなる、を直したことの確認。"""
+    before = leaked_descendants.snapshot()
+    bystander = _spawn_with_raw_comm(_BAD_COMM_HEX)
+    try:
+        _wait_for_comm(bystander.pid, _BAD_COMM_HEX)
+        pid = _spawn_orphan()
+        try:
+            assert _wait_observable(pid), "孤児の environ が読めるようにならない (前提が崩れた)"
+            result = leaked_descendants.scan(before, _marker(), basetemp)
+            assert pid in {s.pid for s in result.survivors}, \
+                "UTF-8 でない comm のプロセスに巻き込まれて本物の孤児を見失った"
+        finally:
+            os.kill(pid, signal.SIGKILL)
+        assert _wait_dead(pid)
+    finally:
+        bystander.kill()
+        bystander.wait()
 
 
 # --- 2. 本物の欠陥を内側の pytest で ---------------------------------------------------------

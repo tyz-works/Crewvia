@@ -48,6 +48,41 @@ COMPACT_FILE=$(python3 -c "..." | head -1)
 `red_proof_*.sh` を実際に走らせ、狙ったテストが赤くなることを確認する。「書いた・通った」
 だけで済ませない。
 
+## 2026-09-28 Ren発見: fake 関数の引数の型 (str/bytes) を実装の変更に追従させないと mock が静かに無効化する
+
+`tests/leaked_descendants.py` の `_belongs` の cwd 判定を `os.readlink(str_path).encode()` から
+`os.readlink(os.fsencode(path))` (bytes 直渡し) に変えたところ、既存テスト
+`test_a_readable_environ_and_cmdline_do_not_mask_a_failed_cwd_read` が壊れた。このテストは
+`monkeypatch.setattr(os, "readlink", _flaky_readlink)` で `os.readlink` を差し替え、
+`_flaky_readlink(path)` の中で `str(path).endswith("/cwd")` を見て意図的に `OSError` を出す
+作りだった。呼び出し側を bytes に変えたら、`path` は bytes オブジェクトになり
+`str(path)` は `"b'/proc/1234/cwd'"` のような repr になって `.endswith("/cwd")` が常に
+`False` になった —— fake は「一致しない」側の分岐 (`return "/"`、文字列) に落ち、意図した
+`OSError` 注入が起きないまま無条件に成功するようになった。実際には `TypeError` (str と
+bytes の比較) で気づけたが、fake の分岐が単に無効化されるだけだと**エラーにすらならず
+黙ってテストの意図が消える**こともありうる。
+
+教訓: 呼び出し側の引数の型 (str か bytes か、Path か文字列か) を変えたら、その関数を
+monkeypatch している fake の**分岐条件の型も必ず一緒に見直す**こと。fake は「呼ばれれば
+動く」のではなく「呼び出し元が渡す形と一致して初めて意図通りに分岐する」。型を変える
+リファクタでは `grep` で monkeypatch している箇所を全部洗い出し、fake 側も実引数の型に
+合わせて更新すること。
+
+## 2026-09-28 Ren発見: exec 直後の一瞬を検証するテストは `_wait_observable` で待たないと環境依存で揺れる
+
+`tests/leaked_descendants.py` の `_belongs` は `environ` が exec 直後の一瞬 (実測 2.7%、
+1ms 未満で解消) 空で読めることをドキュメント化しており、判定そのものを見るテストは
+「観測できる状態になってから走査する」設計になっている (既存テストは `_wait_observable(pid)`
+を使う)。新しく書いたテスト (`test_belongs_survives_a_non_utf8_cwd`) がこの待ちを省いて
+`Popen` 直後に `_belongs` を呼んだところ、ホスト環境では毎回パスしたが、`red_proof_t047.sh`
+の PID 名前空間 (`unshare --user --pid --fork --mount-proc`) の中 (プロセス起動が重く遅い)
+では `observed=False` になって赤くなった —— 製品コードのバグではなく、テスト自身がこの
+既知のレースを踏んだだけだった。
+
+教訓: `/proc/<pid>/...` を Popen 直後に読むテストは、コメントに `_wait_observable` の
+既存パターンがあれば必ず使う。ホストで緑でも、より遅い/重い実行環境 (PID 名前空間・CI 等)
+では顕在化しうる。
+
 ## よく使うパターン
 
 <!-- 再利用できるコード・コマンド・手順 -->

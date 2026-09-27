@@ -259,7 +259,15 @@ inject tests/leaked_descendants.py \
         return \"cmdline-in-basetemp\", True
 
     try:
-        cwd = os.readlink(base / \"cwd\").encode()
+        # bytes の path を渡すと os.readlink は bytes のまま返す (str を経由しない)。\`base / \"cwd\"\`
+        # 自体は ASCII しか含まない (/proc/<pid>/cwd) が、シンボリックリンクの**指す先**
+        # (相手プロセスの cwd) は任意バイト列でありうる。旧実装 (\`os.readlink(str_path).encode()\`)
+        # は readlink が str へ decode する際に surrogateescape を使うため文字列としては読めて
+        # しまい、その後の \`.encode()\` (既定は strict UTF-8) が孤立サロゲートを再エンコードできず
+        # \`UnicodeEncodeError\` (\`OSError\` のサブクラスではない) を投げていた —— 無関係な同 UID の
+        # 1 プロセスの cwd が UTF-8 でないだけで session-finish の走査全体が落ちる (5巡目 P2-1)。
+        # bytes 経由なら str 化を一切経ないのでこの往復が起きない。
+        cwd = os.readlink(os.fsencode(base / \"cwd\"))
     except OSError:
         observed = False
     else:
@@ -279,7 +287,7 @@ inject tests/leaked_descendants.py \
     if cmdline is not None and basetemp and _dir_in_cmdline(cmdline, basetemp):
         return \"cmdline-in-basetemp\", True
     try:
-        cwd = os.readlink(base / \"cwd\").encode()
+        cwd = os.readlink(os.fsencode(base / \"cwd\"))
     except OSError:
         cwd = None
     if cwd is not None and basetemp and (cwd == basetemp or cwd.startswith(basetemp + b\"/\")):
@@ -294,8 +302,8 @@ inject tests/leaked_descendants.py \
             refused.append(kill_budget.Refusal(
                 pid, \"観測時に pidfd で同一性を束縛できなかった (pid 再利用の疑い) — kill しない\"))
             continue
-        attempted.append(pid)" \
-"        attempted.append(pid)"
+        ok, exc = _signal_one(kill, survivor, signal.SIGKILL)" \
+"        ok, exc = _signal_one(kill, survivor, signal.SIGKILL)"
 expect_red "case E" "test_kill_all_refuses_a_survivor_without_a_verified_pidfd"
 
 echo "== case F: _default_kill が pidfd ではなく pid 番号で送る (finding 3 のフォールバック復活)"
@@ -467,6 +475,59 @@ inject tests/leaked_descendants.py \
     try:
         fd = os.pidfd_open(pid)"
 expect_red "case J" "test_open_pidfd_verified_returns_none_without_raising_when_signal_pidfd_send_signal_is_absent"
+
+echo "== case K1: _belongs の cwd readlink が UTF-8 でない cwd で UnicodeEncodeError を漏らす (5巡目 P2-1)"
+fresh_copy
+inject tests/leaked_descendants.py \
+"    try:
+        # bytes の path を渡すと os.readlink は bytes のまま返す (str を経由しない)。\`base / \"cwd\"\`
+        # 自体は ASCII しか含まない (/proc/<pid>/cwd) が、シンボリックリンクの**指す先**
+        # (相手プロセスの cwd) は任意バイト列でありうる。旧実装 (\`os.readlink(str_path).encode()\`)
+        # は readlink が str へ decode する際に surrogateescape を使うため文字列としては読めて
+        # しまい、その後の \`.encode()\` (既定は strict UTF-8) が孤立サロゲートを再エンコードできず
+        # \`UnicodeEncodeError\` (\`OSError\` のサブクラスではない) を投げていた —— 無関係な同 UID の
+        # 1 プロセスの cwd が UTF-8 でないだけで session-finish の走査全体が落ちる (5巡目 P2-1)。
+        # bytes 経由なら str 化を一切経ないのでこの往復が起きない。
+        cwd = os.readlink(os.fsencode(base / \"cwd\"))
+    except OSError:
+        observed = False" \
+"    try:
+        cwd = os.readlink(base / \"cwd\").encode()
+    except OSError:
+        observed = False"
+expect_red "case K1" "test_belongs_survives_a_non_utf8_cwd"
+
+echo "== case L: kill_all が PermissionError 等 (ProcessLookupError 以外) を握り潰さず kill_all ごと止まる (5巡目 P2-2)"
+fresh_copy
+inject tests/leaked_descendants.py \
+"        ok, exc = _signal_one(kill, survivor, signal.SIGKILL)
+        if ok:
+            attempted.append(pid)
+        else:
+            # 境界 (5巡目 P2-2 / この task の主眼): シグナル送信で何が起きても、この 1 件の失敗が
+            # 残りの survivor の処理を止めない。\`pidfd_send_signal\` は \`PermissionError\` (資格情報
+            # の変化・セキュリティ制約) も出しうるが、旧実装は \`ProcessLookupError\` しか捕まえて
+            # おらず、他の例外は \`kill_all\` を丸ごと抜けて hook まで伝播し、残りの survivor の
+            # kill 試行も \`_close_survivor_pidfds\` による fd の後始末も飛んでいた。
+            refused.append(kill_budget.Refusal(
+                pid, f\"シグナルを送れなかった ({type(exc).__name__}: {exc}) — 他の survivor の処理は続ける\"))" \
+"        attempted.append(pid)
+        try:
+            kill(survivor, signal.SIGKILL)
+        except ProcessLookupError:
+            pass"
+expect_red "case L" "test_kill_all_continues_past_a_permission_error_and_closes_all_pidfds"
+
+echo "== case M: _scan_one の境界を Exception から OSError に狭めると、未知の例外が走査全体を落とす (5巡目の主眼)"
+fresh_copy
+inject tests/leaked_descendants.py \
+"        return survivor, False
+    except Exception:
+        return None, True" \
+"        return survivor, False
+    except OSError:
+        return None, True"
+expect_red "case M" "test_scan_one_boundary_catches_an_arbitrary_exception_from_belongs"
 
 echo
 echo "PASS=$PASS FAIL=$FAIL"

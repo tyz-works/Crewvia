@@ -192,9 +192,11 @@ def test_a_readable_environ_and_cmdline_do_not_mask_a_failed_cwd_read(monkeypatc
         lambda path: b"PATH=/usr/bin\0" if path.name == "environ" else b"cat\0")
 
     def _flaky_readlink(path):
-        if str(path).endswith("/cwd"):
+        # `_belongs` は bytes path で呼ぶ (5巡目 P2-1 の fix — str を経由しないことで
+        # UnicodeEncodeError の往復を断つ)。fake もそれに合わせて bytes を受け取り bytes を返す。
+        if path.endswith(b"/cwd"):
             raise OSError("denied")
-        return "/"
+        return b"/"
 
     monkeypatch.setattr(os, "readlink", _flaky_readlink)
     why, observed = leaked_descendants._belongs(
@@ -513,6 +515,109 @@ def test_scan_survives_a_bystander_with_a_non_utf8_process_name(basetemp):
         bystander.wait()
 
 
+# --- 1c. UTF-8 でない cwd (5巡目 codex review P2-1) --------------------------------------
+#
+# `_belongs` の cwd 判定 (`os.readlink(...).encode()`) は、相手プロセスの cwd が UTF-8 として
+# 不正なバイト列を含むディレクトリ名を指すだけで `UnicodeEncodeError` を投げていた
+# (4巡目 (t077) はプロセス名 (stat の comm) を直したが、同じファイルの readlink のパスは
+# 残っていた)。
+
+def _make_bad_utf8_dir(base: pathlib.Path) -> bytes:
+    """`base` の下に UTF-8 として不正なバイト列を含むディレクトリを作り、その絶対パス (bytes) を返す。"""
+    raw = os.fsencode(base) + b"/bad-\xff-dir"
+    os.mkdir(raw)
+    return raw
+
+
+def test_belongs_survives_a_non_utf8_cwd(tmp_path):
+    """`_belongs` は候補プロセスの cwd が UTF-8 として不正でも落ちない (5巡目 P2-1)。"""
+    bad_dir = _make_bad_utf8_dir(tmp_path)
+    proc = subprocess.Popen(["sleep", "30"], cwd=bad_dir)
+    try:
+        # exec 直後の一瞬は environ が空で読める (ファイル冒頭のドキュメント参照、実測 2.7%・
+        # 1ms 未満で解消) —— 判定そのものを見るこのテストは、観測できる状態になってから走査する。
+        assert _wait_observable(proc.pid), "子の environ が読めるようにならない (前提が崩れた)"
+        why, observed = leaked_descendants._belongs(
+            proc.pid, b"marker-that-matches-nothing", b"/nonexistent-basetemp")
+        assert why is None, "無関係な basetemp なのに所属してしまった"
+        assert observed is True, "cwd が読めているのに観測できなかった扱いになった"
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+def test_scan_survives_a_bystander_with_a_non_utf8_cwd(basetemp):
+    """finding P2-1 の再現形そのもの: cwd が UTF-8 でない無関係なプロセスが 1 つ居るだけで
+    `scan()` 全体が落ち、本物の孤児 (印付き) が見つからなくなる、を直したことの確認。"""
+    before = leaked_descendants.snapshot()
+    bad_dir = _make_bad_utf8_dir(pathlib.Path(basetemp))
+    bystander = subprocess.Popen(["sleep", "30"], cwd=bad_dir)
+    try:
+        pid = _spawn_orphan()
+        try:
+            assert _wait_observable(pid), "孤児の environ が読めるようにならない (前提が崩れた)"
+            result = leaked_descendants.scan(before, _marker(), basetemp)
+            assert pid in {s.pid for s in result.survivors}, \
+                "UTF-8 でない cwd のプロセスに巻き込まれて本物の孤児を見失った"
+        finally:
+            os.kill(pid, signal.SIGKILL)
+        assert _wait_dead(pid)
+    finally:
+        bystander.kill()
+        bystander.wait()
+
+
+# --- 1d. per-process の境界 (5巡目の主眼) -------------------------------------------------
+#
+# 4巡目・5巡目とも「1 つのプロセスで起きた例外が走査/片付けの全体を止める」型の再発だった。
+# ここでは箇所の手当てではなく、`_scan_one` という**境界そのもの**を検査する: per-process の
+# 処理の**任意の 1 点**に**任意の例外**を注入しても、走査全体は止まらず、そのプロセスが
+# 「観測できなかった」として報告され、他のプロセスの処理は続くこと。
+
+
+def test_scan_one_boundary_catches_an_arbitrary_exception_from_belongs(monkeypatch, basetemp):
+    """`_belongs` の中でこれまで想定していない例外 (ここでは `RuntimeError`) が起きても、
+    `_scan_one` の境界がそれを「観測できなかった」に変え、`scan()` 全体は落ちない。"""
+    def _boom(pid, marker, basetemp):
+        raise RuntimeError("injected: unanticipated failure inside _belongs")
+
+    monkeypatch.setattr(leaked_descendants, "_belongs", _boom)
+    before = leaked_descendants.snapshot()
+    pid = _spawn_orphan()
+    try:
+        result = leaked_descendants.scan(before, _marker(), basetemp)
+        assert pid not in {s.pid for s in result.survivors}, \
+            "例外を注入したのに生き残りに入った (境界が許可に倒れた)"
+        assert result.unobservable >= 1, "境界を通った例外が unobservable に数えられていない"
+    finally:
+        os.kill(pid, signal.SIGKILL)
+    assert _wait_dead(pid)
+
+
+def test_scan_one_boundary_does_not_swallow_keyboard_interrupt(monkeypatch):
+    """境界は `Exception` だけを閉じ込める。`KeyboardInterrupt` (`BaseException` 直属で
+    `Exception` を継承しない) はここで握り潰さず、`_scan_one` の外まで抜ける。"""
+    def _boom(pid, marker, basetemp):
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(leaked_descendants, "_belongs", _boom)
+    with pytest.raises(KeyboardInterrupt):
+        leaked_descendants._scan_one(
+            os.getpid(), b"marker", b"/nonexistent-basetemp", 0.0, 100, os.getuid())
+
+
+def test_scan_one_boundary_return_contract_does_not_flip_to_permission_to_kill(monkeypatch):
+    """境界に落ちたプロセスは None (survivor にしない) —— 族A: 観測できなかった → kill しない、を維持。"""
+    def _boom(pid, marker, basetemp):
+        raise RuntimeError("injected")
+
+    monkeypatch.setattr(leaked_descendants, "_belongs", _boom)
+    survivor, unobservable = leaked_descendants._scan_one(
+        os.getpid(), b"marker", b"/nonexistent-basetemp", 0.0, 100, os.getuid())
+    assert survivor is None
+    assert unobservable is True
+
+
 # --- 2. 本物の欠陥を内側の pytest で ---------------------------------------------------------
 
 _INNER_CONFTEST = """\
@@ -666,3 +771,44 @@ def test_kill_group_is_a_noop_when_the_group_is_gone():
     proc = subprocess.Popen(["true"], start_new_session=True)
     proc.wait()
     kill_group(proc)        # 例外を出さない
+
+
+def test_kill_tree_continues_past_a_permission_error_on_one_victim():
+    """`kill_tree` の per-pid loop も同じ境界を持つ (proc_group.py も同じ族、5巡目の主眼):
+    1 件が `PermissionError` を出しても、残りの victim (ここでは親自身) は kill される。"""
+    import proc_group
+
+    parent = subprocess.Popen(["sh", "-c", "sleep 30 & wait"], start_new_session=True)
+    child_pid = None
+    try:
+        deadline = time.time() + 5
+        while time.time() < deadline and child_pid is None:
+            kids = descendants(parent.pid)
+            if kids:
+                child_pid = kids[0]
+            else:
+                time.sleep(0.02)
+        assert child_pid is not None, "前提: 子 (sleep) が見つからない"
+
+        real_kill = os.kill
+        killed: list[int] = []
+
+        def _fake_kill(pid, sig):
+            if pid == child_pid:
+                raise PermissionError("simulated")
+            killed.append(pid)
+            real_kill(pid, sig)
+
+        with pytest.MonkeyPatch.context() as m:
+            m.setattr(proc_group.os, "kill", _fake_kill)
+            kill_tree(parent.pid)   # 例外を漏らさないこと自体が検証対象
+
+        assert parent.pid in killed, "PermissionError の隣の victim (親) が kill されなかった"
+    finally:
+        for pid in (p for p in (child_pid, parent.pid) if p):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        parent.wait()
+    assert _wait_dead(parent.pid)

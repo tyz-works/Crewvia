@@ -206,12 +206,17 @@ def _open_pidfd_verified(pid: int, expected_start: int) -> int | None:
 
 
 def _close_survivor_pidfds(survivors: list["Survivor"]) -> None:
-    """束縛した pidfd を全部閉じる (fd リークを避ける。破壊の成否は問わない)。"""
+    """束縛した pidfd を全部閉じる (fd リークを避ける。破壊の成否は問わない)。
+
+    1 件ごとに境界を置く —— `os.close` が (通常は起きないはずの) `OSError` 以外の何かを
+    投げても、残りの survivor の fd が閉じ忘れにならないようにする (`KeyboardInterrupt` /
+    `SystemExit` は素通りする)。
+    """
     for s in survivors:
         if s.pidfd is not None:
             try:
                 os.close(s.pidfd)
-            except OSError:
+            except Exception:
                 pass
             s.pidfd = None
 
@@ -298,7 +303,15 @@ def _belongs(pid: int, marker: bytes, basetemp: bytes):
         return "cmdline-in-basetemp", True
 
     try:
-        cwd = os.readlink(base / "cwd").encode()
+        # bytes の path を渡すと os.readlink は bytes のまま返す (str を経由しない)。`base / "cwd"`
+        # 自体は ASCII しか含まない (/proc/<pid>/cwd) が、シンボリックリンクの**指す先**
+        # (相手プロセスの cwd) は任意バイト列でありうる。旧実装 (`os.readlink(str_path).encode()`)
+        # は readlink が str へ decode する際に surrogateescape を使うため文字列としては読めて
+        # しまい、その後の `.encode()` (既定は strict UTF-8) が孤立サロゲートを再エンコードできず
+        # `UnicodeEncodeError` (`OSError` のサブクラスではない) を投げていた —— 無関係な同 UID の
+        # 1 プロセスの cwd が UTF-8 でないだけで session-finish の走査全体が落ちる (5巡目 P2-1)。
+        # bytes 経由なら str 化を一切経ないのでこの往復が起きない。
+        cwd = os.readlink(os.fsencode(base / "cwd"))
     except OSError:
         observed = False
     else:
@@ -321,40 +334,75 @@ def scan(exclude: set[int], marker_value: str, basetemp: str) -> Scan:
     """
     result = Scan()
     marker = f"{MARKER_VAR}={marker_value}".encode()
-    base = os.path.realpath(basetemp).encode() if basetemp else basetemp.encode()
+    # `os.fsencode` (surrogateescape) を使う — `.encode()` (既定 strict UTF-8) だと、basetemp の
+    # realpath が (環境によっては) 孤立サロゲートを含む str になったとき `UnicodeEncodeError` を
+    # 投げうる (`_belongs` の cwd readlink と同じ型。finding 1 で「basetemp の変換にも同じ問題が
+    # ある」と指摘された箇所)。
+    base = os.fsencode(os.path.realpath(basetemp)) if basetemp else os.fsencode(basetemp)
     me, uid = os.getpid(), os.getuid()
     boot_now = _uptime()
     hz = os.sysconf("SC_CLK_TCK")
     for pid in sorted(pids() - exclude):
         if pid == me:
             continue
+        survivor, unobservable = _scan_one(pid, marker, base, boot_now, hz, uid)
+        if survivor is not None:
+            result.survivors.append(survivor)
+        elif unobservable:
+            result.unobservable += 1
+    return result
+
+
+def _scan_one(pid: int, marker: bytes, base: bytes, boot_now: float, hz: int,
+              uid: int) -> tuple["Survivor | None", bool]:
+    """pid 1 件分の観測。戻り値は `(survivor か None, unobservable として数えるべきか)`。
+
+    ## 境界 (5巡目 codex review の主眼)
+
+    4巡目 (t077, プロセス名の UTF-8) と 5巡目 (P2-1: cwd readlink の UTF-8 / P2-2: kill の
+    PermissionError) はどちらも「**1 つのプロセスで起きた例外が、走査や片付けの全体を止める**」
+    という同じ型で、箇所ごとに 1 つずつ塞いでは隣が出ていた。この関数はその型を**構造で**終わらせる
+    境界 —— pid 1 件分の処理 (stat 読み取り・ゾンビ/所有者判定・`_belongs`・pidfd 束縛・cmdline/wchan
+    読み取り) を**丸ごと**この関数に閉じ込め、途中でどんな `Exception` が起きても (`_belongs` の
+    readlink のような、まだ見つかっていない・将来増える decode/parse の欠陥も含めて)
+    「観測できなかった」(unobservable) に倒し、**呼び出し元の `scan()` の for ループは pid を
+    1 つ進めて続ける**。族A (これまでの修正の向き) を維持するため、観測できなかった場合は
+    survivor にはしない —— kill の許可には絶対に倒さない。
+
+    ここで捕まえるのは `Exception` だけ。`KeyboardInterrupt` / `SystemExit` は `BaseException` の
+    直接のサブクラスで `Exception` を継承しないため、ここでは捕まらずそのまま外へ抜ける
+    (意図的 — 5巡目の受入条件)。
+
+    ゾンビ・別ユーザー・走査中に消えた (stat が読めなくなった) は**想定内**の「この pid は対象では
+    ない」であり、観測に失敗したわけではないので `unobservable` には数えない (最内の try/except で
+    個別に扱う。外側の `except Exception` はここに書いていない**未知の**失敗のための最後の網)。
+    """
+    try:
         stat = _read_stat(pid)
         if stat is None:
-            if (_PROC / str(pid)).exists():
-                result.unobservable += 1   # 居るのに stat が読めない / 読み取れない形 —— 「無い」にしない
-            continue                       # (居なければ走査中に死んだだけ)
+            return None, (_PROC / str(pid)).exists()   # 居るのに stat が読めない —— 「無い」にしない
         state, ppid, start = stat
         if state in ("Z", "X"):
-            continue                       # 死んでいる (回収待ちのゾンビ)
+            return None, False                          # 死んでいる (回収待ちのゾンビ)
         try:
             if (_PROC / str(pid)).stat().st_uid != uid:
-                continue                   # 別ユーザーのプロセスは見ない
+                return None, False                       # 別ユーザーのプロセスは見ない
         except OSError:
-            continue
+            return None, False                           # 走査中に死んだだけ (居なくなった)
         why, observed = _belongs(pid, marker, base)
         if why is None:
-            if not observed:
-                result.unobservable += 1
-            continue
+            return None, not observed
         # 観測した瞬間に破壊用の pidfd を束縛する (finding 3)。ここより後で pid が
         # 再利用されても、kill_all は必ずこの fd 経由で送るので誤った相手には届かない。
         pidfd = _open_pidfd_verified(pid, start)
         cmd = _read_bytes(_PROC / str(pid) / "cmdline") or b""
         wchan = (_read_bytes(_PROC / str(pid) / "wchan") or b"").decode(errors="replace")
-        result.survivors.append(Survivor(
+        survivor = Survivor(
             pid, ppid, state, max(0.0, boot_now - start / hz), wchan,
-            cmd.replace(b"\0", b" ").decode(errors="replace").strip(), why, pidfd=pidfd))
-    return result
+            cmd.replace(b"\0", b" ").decode(errors="replace").strip(), why, pidfd=pidfd)
+        return survivor, False
+    except Exception:
+        return None, True
 
 
 class KillReport:
@@ -383,6 +431,25 @@ def _default_kill(survivor: "Survivor", sig: int) -> None:
     signal.pidfd_send_signal(survivor.pidfd, sig)
 
 
+def _signal_one(kill, survivor: "Survivor", sig: int) -> tuple[bool, Exception | None]:
+    """survivor 1 件分のシグナル送信を境界に閉じ込める。`(成功したか, 例外 (無ければ None))`。
+
+    `ProcessLookupError` (相手が既に死んでいる) は「シグナルは要らなかった」として成功扱いに
+    する (kill 済みプロセスの死亡待ちループに入れてよい)。それ以外の `Exception`
+    (`pidfd_send_signal` が出しうる `PermissionError` 等) は握り潰さず呼び出し元へ返し、
+    kill_all がこの 1 件を `refused` として記録したうえで残りの survivor の処理を続けられる
+    ようにする。`KeyboardInterrupt` / `SystemExit` は `Exception` を継承しないのでここでは
+    捕まらず素通りする (意図的 — 5巡目の受入条件)。
+    """
+    try:
+        kill(survivor, sig)
+    except ProcessLookupError:
+        return True, None
+    except Exception as exc:
+        return False, exc
+    return True, None
+
+
 def kill_all(survivors: list[Survivor], kill=None) -> KillReport:
     """生き残りのうち `kill_budget` が許し、かつ pidfd を束縛できた pid だけを SIGKILL する。
 
@@ -409,11 +476,17 @@ def kill_all(survivors: list[Survivor], kill=None) -> KillReport:
             refused.append(kill_budget.Refusal(
                 pid, "観測時に pidfd で同一性を束縛できなかった (pid 再利用の疑い) — kill しない"))
             continue
-        attempted.append(pid)
-        try:
-            kill(survivor, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+        ok, exc = _signal_one(kill, survivor, signal.SIGKILL)
+        if ok:
+            attempted.append(pid)
+        else:
+            # 境界 (5巡目 P2-2 / この task の主眼): シグナル送信で何が起きても、この 1 件の失敗が
+            # 残りの survivor の処理を止めない。`pidfd_send_signal` は `PermissionError` (資格情報
+            # の変化・セキュリティ制約) も出しうるが、旧実装は `ProcessLookupError` しか捕まえて
+            # おらず、他の例外は `kill_all` を丸ごと抜けて hook まで伝播し、残りの survivor の
+            # kill 試行も `_close_survivor_pidfds` による fd の後始末も飛んでいた。
+            refused.append(kill_budget.Refusal(
+                pid, f"シグナルを送れなかった ({type(exc).__name__}: {exc}) — 他の survivor の処理は続ける"))
     deadline = time.monotonic() + GRACE_SECONDS
     while time.monotonic() < deadline:
         alive = [pid for pid in attempted if (_read_stat(pid) or ("Z",))[0] not in ("Z", "X")]

@@ -371,3 +371,75 @@ def test_kill_all_does_not_crash_and_refuses_when_signal_pidfd_send_signal_is_ab
     finally:
         child.kill()
         child.wait()
+
+
+# --- 5巡目 codex review P2-2: シグナル送信の境界 (`_signal_one`) ---------------------------
+#
+# `pidfd_send_signal` は `ProcessLookupError` の他に `PermissionError` (資格情報の変化・
+# セキュリティ制約) も出しうる。旧実装は `except ProcessLookupError` しか無く、それ以外の
+# 例外は `kill_all` を丸ごと抜けて呼び出し元 (pytest hook) まで伝播し、残りの survivor の
+# kill 試行も pidfd のクローズも飛んでいた。
+
+
+def test_signal_one_returns_false_and_the_exception_for_a_non_lookup_failure():
+    """`_signal_one` は `ProcessLookupError` 以外の `Exception` を握り潰さず `(False, 例外)` で返す。"""
+    def _raises_permission(survivor, sig):
+        raise PermissionError("simulated: signal blocked by security policy")
+
+    survivor = guard.Survivor(4_100_010, os.getpid(), "S", 0.0, "", "x", "test", pidfd=99)
+    ok, exc = guard._signal_one(_raises_permission, survivor, signal.SIGKILL)
+    assert ok is False
+    assert isinstance(exc, PermissionError)
+
+
+def test_signal_one_treats_process_lookup_error_as_success():
+    """相手が既に死んでいる (`ProcessLookupError`) のはシグナルの失敗ではない —— 成功扱い。"""
+    def _raises_lookup(survivor, sig):
+        raise ProcessLookupError("gone")
+
+    survivor = guard.Survivor(4_100_011, os.getpid(), "S", 0.0, "", "x", "test", pidfd=99)
+    ok, exc = guard._signal_one(_raises_lookup, survivor, signal.SIGKILL)
+    assert ok is True
+    assert exc is None
+
+
+def test_signal_one_does_not_swallow_keyboard_interrupt():
+    """境界は `Exception` だけを閉じ込める。`KeyboardInterrupt` はここで捕まらず素通りする。"""
+    def _raises_kbd(survivor, sig):
+        raise KeyboardInterrupt()
+
+    survivor = guard.Survivor(4_100_012, os.getpid(), "S", 0.0, "", "x", "test", pidfd=99)
+    with pytest.raises(KeyboardInterrupt):
+        guard._signal_one(_raises_kbd, survivor, signal.SIGKILL)
+
+
+def test_kill_all_continues_past_a_permission_error_and_closes_all_pidfds(monkeypatch):
+    """P2-2 の結合確認: 1 件が `PermissionError` を出しても、残りの survivor は kill され、
+    すべての pidfd が閉じられ、`kill_all` 自身は例外を漏らさず最後まで走る。"""
+    monkeypatch.setattr(guard, "GRACE_SECONDS", 0.1)
+    good_child = _sleeper()
+    bad_child = _sleeper()
+    try:
+        killed: list[int] = []
+
+        def _kill(survivor, sig):
+            if survivor.pid == bad_child.pid:
+                raise PermissionError("simulated")
+            killed.append(survivor.pid)
+
+        good_pidfd = os.pidfd_open(good_child.pid)
+        bad_pidfd = os.pidfd_open(bad_child.pid)
+        survivors = [
+            guard.Survivor(good_child.pid, os.getpid(), "S", 0.0, "", "sleep 30", "test", pidfd=good_pidfd),
+            guard.Survivor(bad_child.pid, os.getpid(), "S", 0.0, "", "sleep 30", "test", pidfd=bad_pidfd),
+        ]
+        report = guard.kill_all(survivors, kill=_kill)
+        assert killed == [good_child.pid], "PermissionError の隣の survivor が処理されなかった"
+        assert report.fatal is None
+        assert any("送れなかった" in r.reason for r in report.refused), report.refused
+        assert survivors[0].pidfd is None and survivors[1].pidfd is None, "pidfd が閉じられていない"
+    finally:
+        good_child.kill()
+        good_child.wait()
+        bad_child.kill()
+        bad_child.wait()

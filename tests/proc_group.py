@@ -33,11 +33,15 @@ def kill_group(proc: subprocess.Popen) -> None:
     """`start_new_session=True` で起こした `proc` のグループ全員を SIGKILL する。
 
     グループが既に無ければ何もしない。`proc` 自身が先に終わっていても、孤児になった子孫は
-    同じ pgid のまま残るので `os.killpg(proc.pid)` で届く。
+    同じ pgid のまま残るので `os.killpg(proc.pid)` で届く。`ProcessLookupError` (相手が既に
+    居ない) 以外の `Exception` (`PermissionError` 等) も握り潰す —— これは `run_in_own_group`
+    の `finally` 相当の掃除経路から呼ばれるので、ここで例外を漏らすと呼び出し元の後始末
+    そのものを止めてしまう (leaked_descendants.kill_all の `_signal_one` と同じ境界、
+    5巡目の主眼)。`KeyboardInterrupt` / `SystemExit` は `Exception` を継承しないので素通りする。
     """
     try:
         os.killpg(proc.pid, signal.SIGKILL)
-    except ProcessLookupError:
+    except Exception:
         pass
 
 
@@ -82,12 +86,16 @@ def kill_tree(pid: int) -> None:
 
     対話シェル (pty) は job control で裏の仕事を **別の** プロセスグループに置くので、`kill_group` では
     届かない。そういう相手の後片付けはこちらを使う。
+
+    1 件ごとに境界を置く —— `os.kill` が `ProcessLookupError` 以外の `Exception`
+    (`PermissionError` 等) を出しても、その 1 件で `victims` の残りへの kill を諦めない
+    (`leaked_descendants.kill_all` の `_signal_one` / `kill_group` と同じ族、5巡目の主眼)。
     """
     victims = descendants(pid) + [pid]
     for v in victims:
         try:
             os.kill(v, signal.SIGKILL)
-        except ProcessLookupError:
+        except Exception:
             pass
 
 

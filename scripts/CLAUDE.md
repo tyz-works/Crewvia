@@ -58,3 +58,9 @@ lib ごとの**破ってはいけない契約**の要約。理由・経緯・全
 - `done` は `--pr <N>` か `--no-pr "<理由>"` のどちらかが要る場合がある（後続の codex-review に pr_number が無いとき）。
 - 引数は厳格（未知の option は exit 2 で何も書かない）。`pull` だけ使い方の誤りが exit 1（exit 2 は「タスクなし」）。
 - queue を書き換えるサブコマンドの後、`registry/task-graph/tasks.json` を再生成する（`CREWVIA_TASK_GRAPH=0` で停止）。
+
+## worktree_gc.py
+
+- 既定は dry-run。`--apply` は `git worktree remove`（`--force` 無し）と `git branch -d`（`-D` 無し）だけ。`rm -rf` 系は使わない
+  （`tests/test_worktree_gc.py::TestNoForcefulOperations` が AST で固定）。remove は全条件を満たしたものだけで、
+  読めない・git が失敗・プロセス表を取れない、は keep（`knowledge/worktree-gc.md`）。消す直前に判定をやり直す。

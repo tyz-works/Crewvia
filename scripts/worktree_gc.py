@@ -1,0 +1,573 @@
+#!/usr/bin/env python3
+"""worktree_gc.py — 古い Worker worktree を安全に片付ける (t033 / backlog #33)。
+
+主 checkout の `git worktree list` は、archive 済み mission・merge 済みブランチの worktree が
+溜まり続けて 398 個 (2026-09-27) になっていた。手で消すと「今使っている Worker の worktree」や
+「push していないコミットのある worktree」を巻き込みうるので、**理由付きで keep / remove を出す**
+仕組みにする。
+
+    python3 scripts/worktree_gc.py                 # dry-run (既定。何も消さない・何も書かない)
+    python3 scripts/worktree_gc.py --apply         # remove と判定したものだけを消す
+    python3 scripts/worktree_gc.py --json          # 機械可読
+
+## remove にしてよいのは、次を **すべて** 満たすものだけ
+
+1. `<主 checkout>/.claude/worktrees/<mission_slug>/<name>` 配下 (主 checkout 自身・その外は keep)
+2. その mission が active でない (`queue/state.yaml` の `active_missions` に無く、`queue/missions/<slug>` も
+   残っていない = archive 済み)。state.yaml が読めなければ **全部 keep**
+3. Worker が今使っていない: `registry/workers/*/target_dir.json` の TARGET_DIR がその worktree を指さず、
+   どのプロセスの cwd (Worker の claude・pane のシェル・この実行自身) もその worktree の中に無い
+4. 未コミット・untracked の変更が無い (`git status --porcelain --untracked-files=all` が空)
+5. HEAD から辿れるコミットがすべて `origin/*` にある (merge 済み、または remote branch に push 済み)
+
+## 判定できないものは keep (破棄ではなく保留)
+
+読めない・git が失敗・プロセス表を取れない、はどれも **remove の根拠にしない** (memory
+`fail-closed-discard-vs-hold` / `evidence-for-destructive-decisions`)。ENOENT (本当に無い) だけを
+「無い」と読む。
+
+## `--apply` の安全策
+
+- `git worktree remove` (**`--force` を使わない**。git が dirty / locked を自分でも断る)。
+  ローカルブランチは `git branch -d` (**`-D` を使わない**。merge 済みと git が認めないなら残す)。
+  `rm -rf` は使わない。remote branch は触らない。最後に `git worktree prune`。
+- 消す直前に、その worktree の判定を **もう一度** やり直し、remove でなくなっていたら消さない
+  (dry-run から --apply までに Worker が起動した・変更が入った、を拾う)。
+- 1 件の失敗で止めない (失敗は報告して次へ。終了コード 1)。
+
+## 限界 (知っておくこと)
+
+- 「origin にある」は **手元の remote-tracking ref** で見る (fetch しない = 読み取り専用)。`--fetch` を付けると
+  `git fetch --prune origin` してから判定する (merge 後に remote branch が消えていれば、squash merge の
+  ブランチは「push 済みと確かめられない」= keep になる。それが保留の向き)。
+- プロセスの cwd は Linux の `/proc`、無ければ `lsof` で見る。どちらも使えなければ全部 keep。
+- 戻せない操作は `git worktree remove` と `git branch -d` だけ。どちらも、コミットが origin にあれば
+  `git worktree add` / `git checkout -b <branch> origin/<branch>` で作り直せる。
+
+## 停止スイッチは無い
+
+この判定は dry-run が既定で、`--apply` を付けない限り何も変えない。env で判定を曲げる口は作らない
+(共有規則に env 停止スイッチを付けない — memory `no-env-killswitch-for-shared-rule`)。
+"""
+
+from __future__ import annotations
+
+import argparse
+import errno
+import json
+import os
+import subprocess
+import sys
+from collections import Counter
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Optional
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from lib_task_cards import (  # noqa: E402
+    is_missing, is_unreadable, parse_yaml, read_regular_text_or_unreadable,
+)
+import lib_worker_target  # noqa: E402
+
+REMOVE = 'remove'
+KEEP = 'keep'
+
+#: 判定の理由コード (出力・集計・テストが使う。文言ではなくこの名前で突き合わせる)。
+R_REMOVE = 'all-conditions-met'
+R_MAIN = 'main-checkout'
+R_OUTSIDE = 'outside-managed-dir'
+R_LOCKED = 'locked'
+R_PRUNABLE = 'prunable'
+R_STATE_UNREADABLE = 'state-unreadable'
+R_MISSION_ACTIVE = 'mission-active'
+R_MISSION_NOT_ARCHIVED = 'mission-not-archived'
+R_MISSION_UNOBSERVABLE = 'mission-dir-unobservable'
+R_REGISTRY_UNREADABLE = 'registry-unreadable'
+R_PROCESS_SCAN_FAILED = 'process-scan-failed'
+R_IN_USE_TARGET = 'in-use-target-dir'
+R_IN_USE_PROCESS = 'in-use-process'
+R_STATUS_FAILED = 'git-status-failed'
+R_DIRTY = 'dirty'
+R_HEAD_UNRESOLVED = 'head-unverifiable'
+R_UNPUSHED = 'unpushed-commits'
+
+GIT_TIMEOUT_SECONDS = 120
+
+#: プロセス表の場所 (テストが偽の /proc に向ける)。
+PROC_ROOT = Path('/proc')
+
+
+# ---------------------------------------------------------------------------
+# git
+# ---------------------------------------------------------------------------
+
+def _git_env() -> dict:
+    env = dict(os.environ)
+    env['LC_ALL'] = 'C'
+    # 読み取り専用の判定が index.lock を取りに行かない (status の opportunistic refresh を止める)。
+    env['GIT_OPTIONAL_LOCKS'] = '0'
+    env['GIT_TERMINAL_PROMPT'] = '0'
+    return env
+
+
+def run_git(cwd, *args) -> tuple[Optional[int], str, str]:
+    """`(returncode, stdout, stderr)`。起動できない・時間切れは returncode=None (= 判定不能)。"""
+    try:
+        proc = subprocess.run(['git', '-C', str(cwd), *args], capture_output=True, text=True,
+                              env=_git_env(), timeout=GIT_TIMEOUT_SECONDS,
+                              encoding='utf-8', errors='surrogateescape')
+    except (OSError, subprocess.SubprocessError) as e:
+        return None, '', f'{type(e).__name__}: {e}'
+    return proc.returncode, proc.stdout, proc.stderr
+
+
+@dataclass
+class Worktree:
+    path: str
+    head: Optional[str] = None
+    branch: Optional[str] = None       # refs/heads/<name> (detached なら None)
+    detached: bool = False
+    bare: bool = False
+    locked: bool = False
+    prunable: bool = False
+
+
+def parse_worktree_list(raw: str) -> list[Worktree]:
+    """`git worktree list --porcelain -z` の出力。record は NUL 2 つ (空の欄) で区切られる。"""
+    out: list[Worktree] = []
+    cur: Optional[Worktree] = None
+    for field_ in raw.split('\0'):
+        if field_ == '':
+            if cur is not None:
+                out.append(cur)
+                cur = None
+            continue
+        key, _, value = field_.partition(' ')
+        if key == 'worktree':
+            if cur is not None:
+                out.append(cur)
+            cur = Worktree(path=value)
+        elif cur is None:
+            continue
+        elif key == 'HEAD':
+            cur.head = value
+        elif key == 'branch':
+            cur.branch = value
+        elif key == 'detached':
+            cur.detached = True
+        elif key == 'bare':
+            cur.bare = True
+        elif key == 'locked':
+            cur.locked = True
+        elif key == 'prunable':
+            cur.prunable = True
+    if cur is not None:
+        out.append(cur)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# 判定の材料 (Context): 1 回の走査で集める
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Context:
+    repo: str                                   # 主 checkout の realpath
+    queue: str
+    active_missions: Optional[set] = None       # None = 読めなかった
+    state_problem: str = ''
+    registry_problem: str = ''
+    target_dirs: list = field(default_factory=list)   # [(agent, realpath)]
+    process_problem: str = ''
+    process_cwds: list = field(default_factory=list)  # [(pid, realpath)]
+
+    @property
+    def managed_root(self) -> str:
+        return os.path.join(self.repo, '.claude', 'worktrees')
+
+
+def load_active_missions(queue: str) -> tuple[Optional[set], str]:
+    """`queue/state.yaml` の active_missions。読めない・形が違うなら `(None, 理由)`。
+
+    state.yaml が **無い** (ENOENT) のも「読めない」に含める: plan.sh は無ければ active ゼロと読むが、
+    片付けは「active でないと確かめられた mission」だけが対象で、確かめられないなら消さない。
+    """
+    path = os.path.join(queue, 'state.yaml')
+    text = read_regular_text_or_unreadable(path)
+    if is_unreadable(text):
+        return None, ('state.yaml が無い' if is_missing(text) else f'state.yaml が読めない ({text.reason})')
+    try:
+        data = parse_yaml(text, source=path)
+    except ValueError as e:
+        return None, f'state.yaml を解釈できない ({e})'
+    missions = data.get('active_missions')
+    if not isinstance(missions, list) or not all(isinstance(m, str) and m for m in missions):
+        return None, f"state.yaml の active_missions が文字列のリストではない ({missions!r})"
+    return set(missions), ''
+
+
+def load_target_dirs(registry: str) -> tuple[list, str]:
+    """`registry/workers/<Name>/target_dir.json` の TARGET_DIR。`([(agent, realpath)], 読めなかった理由)`。
+
+    `registry/workers` が無い (ENOENT) のは「記録が 1 つも無い」= 普通の状態。それ以外の失敗と、
+    読めない記録は、その Worker が worktree を使っているかどうか決められないので理由を返す
+    (呼び出し側は全部 keep にする)。`target_dir: null` は「crewvia 本体で起動した」事実で、worktree を指さない。
+    """
+    workers = os.path.join(registry, 'workers')
+    try:
+        names = sorted(os.listdir(workers))
+    except FileNotFoundError:
+        return [], ''
+    except OSError as e:
+        return [], f'{workers} を列挙できない ({e})'
+    found = []
+    for name in names:
+        rec = lib_worker_target.load_record(registry, name)
+        if is_missing(rec):
+            continue                      # Worker のディレクトリはあるが記録は書かれていない
+        if is_unreadable(rec):
+            return [], f'{name} の target_dir 記録が読めない ({rec.reason})'
+        if rec['target_dir'] is not None:
+            found.append((name, os.path.realpath(rec['target_dir'])))
+    return found, ''
+
+
+#: cwd を読めなくても Worker ではないと言える、ユーザー自身の常駐プロセス (comm)。カーネルは dumpable でない
+#: プロセス (ssh-agent は自分で切る・sshd / systemd --user は権限の切り替えで切れる) の
+#: `/proc/<pid>/cwd` を同じ uid にも読ませない。Worker (claude と pane のシェル) は dumpable なので読める。
+#: **allowlist** — 未知の名前で読めないものは「取れなかった」に倒す (足したいときはここに理由付きで足す)。
+UNOBSERVABLE_BUT_NOT_A_WORKER = frozenset({
+    'ssh-agent', 'sshd', 'sshd-session', 'systemd', '(sd-pam)', 'gpg-agent',
+})
+
+
+def _cwd_unreadable_but_harmless(pid: str) -> Optional[str]:
+    """同じ uid のプロセスの cwd を読めなかったとき、それが worktree を掴んでいないと言える理由。言えなければ None。
+
+    * 消えた (`/proc/<pid>` が無い) / zombie・終了処理中 (state Z / X、または cmdline が空 = mm が無い):
+      もう cwd を持たない
+    * allowlist の常駐プロセス (`UNOBSERVABLE_BUT_NOT_A_WORKER`)
+    """
+    base = PROC_ROOT / pid
+    try:
+        stat = (base / 'stat').read_text()
+        state = stat[stat.rindex(')') + 2:].split(' ', 1)[0]
+        if state in ('Z', 'X'):
+            return f'state {state}'
+        if not (base / 'cmdline').read_bytes():
+            return 'cmdline が空 (終了処理中)'
+        comm = (base / 'comm').read_text().strip()
+    except FileNotFoundError:
+        return '消えた'
+    except (OSError, ValueError):
+        return None
+    return f'comm {comm}' if comm in UNOBSERVABLE_BUT_NOT_A_WORKER else None
+
+
+def scan_process_cwds() -> tuple[list, str]:
+    """全プロセスの cwd。`([(pid, realpath)], 取れなかった理由)`。
+
+    Linux は `/proc/<pid>/cwd`。消えたプロセス (ENOENT / ESRCH) は無視してよい。他の uid のプロセスは
+    Worker になりえないので飛ばす。**自分と同じ uid のプロセスを読めなかった**ときは、その cwd が
+    worktree の中かもしれないので取れなかった扱い (ただし `_cwd_unreadable_but_harmless()` が
+    「掴んでいない」と言えるものは除く)。`/proc` が無ければ `lsof`。
+    """
+    proc = PROC_ROOT
+    if not proc.is_dir():
+        return _scan_with_lsof()
+    me = os.getuid()
+    found = []
+    try:
+        entries = [e for e in os.listdir(proc) if e.isdigit()]
+    except OSError as e:
+        return [], f'/proc を列挙できない ({e})'
+    for pid in entries:
+        try:
+            cwd = os.readlink(proc / pid / 'cwd')
+        except OSError as e:
+            if e.errno in (errno.ENOENT, errno.ESRCH):
+                continue
+            try:
+                if os.stat(proc / pid).st_uid != me:
+                    continue
+            except OSError:
+                continue                  # stat もできない = 消えた
+            if _cwd_unreadable_but_harmless(pid) is not None:
+                continue
+            try:
+                comm = (proc / pid / 'comm').read_text().strip()
+            except OSError:
+                comm = '?'
+            return [], f'/proc/{pid}/cwd ({comm}) を読めない ({e})'
+        found.append((int(pid), os.path.realpath(cwd)))
+    return found, ''
+
+
+def _scan_with_lsof() -> tuple[list, str]:
+    try:
+        proc = subprocess.run(['lsof', '-a', '-d', 'cwd', '-Fpn'], capture_output=True, text=True,
+                              timeout=60)
+    except (OSError, subprocess.SubprocessError) as e:
+        return [], f'/proc も lsof も使えない ({type(e).__name__}: {e})'
+    # lsof は読めなかった行があっても 1 を返すことがある。出力が空なら「見えなかった」であって「無い」ではない。
+    if not proc.stdout.strip():
+        return [], f'lsof の出力が空 (rc={proc.returncode})'
+    found, pid = [], None
+    for line in proc.stdout.splitlines():
+        if line.startswith('p') and line[1:].isdigit():
+            pid = int(line[1:])
+        elif line.startswith('n') and pid is not None:
+            found.append((pid, os.path.realpath(line[1:])))
+    return found, ''
+
+
+def build_context(repo: str, queue: str) -> Context:
+    ctx = Context(repo=os.path.realpath(repo), queue=queue)
+    ctx.active_missions, ctx.state_problem = load_active_missions(queue)
+    registry = os.path.join(os.path.dirname(os.path.abspath(queue)), 'registry')
+    ctx.target_dirs, ctx.registry_problem = load_target_dirs(registry)
+    ctx.process_cwds, ctx.process_problem = scan_process_cwds()
+    return ctx
+
+
+# ---------------------------------------------------------------------------
+# 判定
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Verdict:
+    path: str
+    action: str               # REMOVE | KEEP
+    reason: str
+    detail: str = ''
+    branch: Optional[str] = None
+
+    def as_dict(self) -> dict:
+        return {'path': self.path, 'action': self.action, 'reason': self.reason,
+                'detail': self.detail, 'branch': self.branch}
+
+
+def _within(path: str, root: str) -> bool:
+    return path == root or path.startswith(root.rstrip(os.sep) + os.sep)
+
+
+def mission_slug_of(wt_real: str, managed_root: str) -> Optional[str]:
+    """`<managed_root>/<slug>/<name>[/...]` の <slug>。その形でなければ None。"""
+    if not _within(wt_real, managed_root) or wt_real == managed_root:
+        return None
+    parts = Path(os.path.relpath(wt_real, managed_root)).parts
+    if len(parts) < 2 or parts[0] in ('', '.', '..'):
+        return None
+    return parts[0]
+
+
+def classify(wt: Worktree, ctx: Context, is_main: bool = False) -> Verdict:
+    """1 つの worktree を分類する。最初に当たった keep の理由を返し、全部通れば remove。
+
+    **順序は安いものから**: 構造 (main / 管理外 / lock) → mission → 使用中 → git の中身。
+    どの keep も「remove の根拠を 1 つ欠いた」という意味で、読めなかった・判定できなかったものは
+    すべてここで keep に落ちる。
+    """
+    def keep(reason, detail=''):
+        return Verdict(wt.path, KEEP, reason, detail, wt.branch)
+
+    wt_real = os.path.realpath(wt.path)
+    if is_main or wt_real == ctx.repo or wt.bare:
+        return keep(R_MAIN)
+    slug = mission_slug_of(wt_real, ctx.managed_root)
+    if slug is None:
+        return keep(R_OUTSIDE, f'{ctx.managed_root}/<mission>/<name> の外')
+    if wt.locked:
+        return keep(R_LOCKED)
+    if wt.prunable or not os.path.isdir(wt.path):
+        return keep(R_PRUNABLE, 'ディレクトリが無い (`git worktree prune` の対象)')
+
+    # --- mission ---
+    if ctx.active_missions is None:
+        return keep(R_STATE_UNREADABLE, ctx.state_problem)
+    if slug in ctx.active_missions:
+        return keep(R_MISSION_ACTIVE, slug)
+    mission_dir = os.path.join(ctx.queue, 'missions', slug)
+    try:
+        os.lstat(mission_dir)
+    except FileNotFoundError:
+        pass                                      # archive 済み (queue/missions に無い)
+    except OSError as e:
+        return keep(R_MISSION_UNOBSERVABLE, f'{mission_dir}: {e}')
+    else:
+        return keep(R_MISSION_NOT_ARCHIVED, f'{mission_dir} が残っている')
+
+    # --- 使用中 ---
+    if ctx.registry_problem:
+        return keep(R_REGISTRY_UNREADABLE, ctx.registry_problem)
+    for agent, target in ctx.target_dirs:
+        if _within(target, wt_real):
+            return keep(R_IN_USE_TARGET, f'{agent} の TARGET_DIR = {target}')
+    if ctx.process_problem:
+        return keep(R_PROCESS_SCAN_FAILED, ctx.process_problem)
+    for pid, cwd in ctx.process_cwds:
+        if _within(cwd, wt_real):
+            return keep(R_IN_USE_PROCESS, f'pid {pid} の cwd = {cwd}')
+
+    # --- git の中身 ---
+    rc, out, err = run_git(wt.path, 'status', '--porcelain=v1', '--untracked-files=all')
+    if rc != 0:
+        return keep(R_STATUS_FAILED, (err or 'git を実行できない').strip()[:200])
+    if out.strip():
+        first = out.splitlines()[0]
+        return keep(R_DIRTY, f'{len(out.splitlines())} 件の変更 (先頭: {first})')
+    rc, out, err = run_git(wt.path, 'rev-list', '--max-count=1', 'HEAD', '--not', '--remotes=origin')
+    if rc != 0:
+        return keep(R_HEAD_UNRESOLVED, (err or 'git を実行できない').strip()[:200])
+    if out.strip():
+        return keep(R_UNPUSHED, f'origin に無いコミット {out.strip()[:12]} から')
+
+    return Verdict(wt.path, REMOVE, R_REMOVE, '', wt.branch)
+
+
+def list_worktrees(repo: str) -> tuple[Optional[list[Worktree]], str]:
+    rc, out, err = run_git(repo, 'worktree', 'list', '--porcelain', '-z')
+    if rc != 0:
+        return None, (err or 'git を実行できない').strip()
+    return parse_worktree_list(out), ''
+
+
+def classify_all(repo: str, queue: str) -> tuple[list[Verdict], Optional[str]]:
+    """`(verdict のリスト, worktree 一覧を取れなかった理由)`。"""
+    worktrees, problem = list_worktrees(repo)
+    if worktrees is None:
+        return [], problem
+    ctx = build_context(repo, queue)
+    return [classify(wt, ctx, is_main=(i == 0)) for i, wt in enumerate(worktrees)], None
+
+
+# ---------------------------------------------------------------------------
+# --apply
+# ---------------------------------------------------------------------------
+
+def apply_removals(repo: str, queue: str, verdicts: list[Verdict]) -> list[dict]:
+    """remove と判定したものを 1 件ずつ、**判定をやり直してから** 消す。結果のリストを返す。
+
+    `--force` / `-D` / `rm -rf` は使わない。worktree の除去が失敗したらブランチには触れない。
+    """
+    results = []
+    for v in verdicts:
+        if v.action != REMOVE:
+            continue
+        worktrees, problem = list_worktrees(repo)
+        if worktrees is None:
+            results.append({'path': v.path, 'status': 'skipped', 'detail': f'一覧を取れない: {problem}'})
+            continue
+        current = next((w for i, w in enumerate(worktrees) if i > 0 and w.path == v.path), None)
+        if current is None:
+            results.append({'path': v.path, 'status': 'skipped', 'detail': 'もう worktree 一覧に無い'})
+            continue
+        again = classify(current, build_context(repo, queue))
+        if again.action != REMOVE:
+            results.append({'path': v.path, 'status': 'skipped',
+                            'detail': f'再判定で keep になった ({again.reason}: {again.detail})'})
+            continue
+        rc, _out, err = run_git(repo, 'worktree', 'remove', v.path)
+        if rc != 0:
+            results.append({'path': v.path, 'status': 'failed',
+                            'detail': f'git worktree remove: {(err or "実行できない").strip()[:300]}'})
+            continue
+        entry = {'path': v.path, 'status': 'removed', 'detail': '', 'branch': None}
+        branch = current.branch
+        if branch and branch.startswith('refs/heads/'):
+            name = branch[len('refs/heads/'):]
+            rc, _out, err = run_git(repo, 'branch', '-d', name)
+            if rc == 0:
+                entry['branch'] = f'deleted {name}'
+            else:
+                entry['branch'] = f'kept {name} ({(err or "実行できない").strip()[:200]})'
+        results.append(entry)
+    return results
+
+
+# ---------------------------------------------------------------------------
+# 出力
+# ---------------------------------------------------------------------------
+
+def summarize(verdicts: list[Verdict]) -> dict:
+    removes = [v for v in verdicts if v.action == REMOVE]
+    keeps = [v for v in verdicts if v.action == KEEP]
+    by_reason = Counter(v.reason for v in keeps)
+    return {'total': len(verdicts), 'remove': len(removes), 'keep': len(keeps),
+            'keep_by_reason': dict(sorted(by_reason.items(), key=lambda kv: (-kv[1], kv[0])))}
+
+
+def format_text(verdicts: list[Verdict], applied: Optional[list[dict]], quiet: bool) -> str:
+    lines = []
+    if not quiet:
+        for v in verdicts:
+            detail = f'  ({v.detail})' if v.detail else ''
+            lines.append(f'{v.action:<6} {v.reason:<26} {v.path}{detail}')
+    s = summarize(verdicts)
+    lines.append('')
+    lines.append(f"worktree {s['total']} 件: remove {s['remove']} / keep {s['keep']}")
+    for reason, n in s['keep_by_reason'].items():
+        lines.append(f'  keep {reason}: {n}')
+    if applied is None:
+        lines.append('dry-run (何も消していません)。消すには --apply')
+    else:
+        counts = Counter(r['status'] for r in applied)
+        lines.append(f"apply: removed {counts.get('removed', 0)} / skipped {counts.get('skipped', 0)}"
+                     f" / failed {counts.get('failed', 0)}")
+        for r in applied:
+            if r['status'] != 'removed':
+                lines.append(f"  {r['status']}: {r['path']} — {r['detail']}")
+            elif r.get('branch'):
+                lines.append(f"  branch: {r['branch']}  ({r['path']})")
+    return '\n'.join(lines)
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(description='古い Worker worktree を安全に片付ける (既定は dry-run)')
+    ap.add_argument('--apply', action='store_true', help='remove と判定したものを実際に消す')
+    ap.add_argument('--repo', default='.', help='主 checkout (または任意の worktree) のパス。既定: カレント')
+    ap.add_argument('--queue', default=None,
+                    help='queue ディレクトリ。既定: $CREWVIA_QUEUE、無ければ <主 checkout>/queue')
+    ap.add_argument('--fetch', action='store_true', help='判定の前に `git fetch --prune origin` する')
+    ap.add_argument('--json', action='store_true', help='JSON で出力する')
+    ap.add_argument('--quiet', action='store_true', help='1 件ずつの行を出さず集計だけ')
+    args = ap.parse_args(argv)
+
+    worktrees, problem = list_worktrees(args.repo)
+    if worktrees is None or not worktrees:
+        print(f'worktree 一覧を取れませんでした: {problem or "空"}', file=sys.stderr)
+        return 1
+    repo = worktrees[0].path            # 先頭は常に主 checkout
+    queue = args.queue or os.environ.get('CREWVIA_QUEUE') or os.path.join(repo, 'queue')
+
+    if args.fetch:
+        rc, _out, err = run_git(repo, 'fetch', '--prune', 'origin')
+        if rc != 0:
+            print(f'git fetch --prune origin に失敗しました (判定は手元の ref のままにせず中止): '
+                  f'{(err or "実行できない").strip()[:300]}', file=sys.stderr)
+            return 1
+
+    verdicts, problem = classify_all(repo, queue)
+    if problem is not None:
+        print(f'worktree 一覧を取れませんでした: {problem}', file=sys.stderr)
+        return 1
+
+    applied = apply_removals(repo, queue, verdicts) if args.apply else None
+    if applied is not None:
+        rc, _out, err = run_git(repo, 'worktree', 'prune')
+        if rc != 0:
+            applied.append({'path': repo, 'status': 'failed',
+                            'detail': f'git worktree prune: {(err or "実行できない").strip()[:300]}'})
+
+    if args.json:
+        print(json.dumps({'summary': summarize(verdicts), 'applied': applied,
+                          'worktrees': [v.as_dict() for v in verdicts]}, ensure_ascii=False, indent=2))
+    else:
+        print(format_text(verdicts, applied, args.quiet))
+    failed = any(r['status'] == 'failed' for r in (applied or []))
+    return 1 if failed else 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

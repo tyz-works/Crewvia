@@ -367,6 +367,15 @@ tag は警告して飛ばす）。t017 / PR5a
 
 bash 向け薄いラッパー（mux_spawn / mux_send 等）
 
+### `worktree_gc.py`
+
+古い Worker worktree を片付ける道具（t033 / #33）。**既定は dry-run**（何も消さない）で、`--apply` で
+remove と判定したものだけ `git worktree remove`（`--force` 無し）+ `git branch -d`（`-D` 無し）。remove は
+「管理下 (`.claude/worktrees/<slug>/<name>`)・mission が active でなく archive 済み・Worker が使っていない
+（TARGET_DIR 記録・プロセスの cwd）・clean・コミットがすべて origin にある」の全部を満たすものだけ。
+観測できなかったものはすべて keep。デーモンは読まない（戻し方は PR revert だけ）。
+設計・理由コード・限界: `knowledge/worktree-gc.md`
+
 ## `queue/`
 
 プラン置き場（plan.sh が管理）

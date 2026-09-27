@@ -398,6 +398,53 @@ class TestCommentedHeadersDoNotHideOrMisassignCapabilities:
         assert caps == {} and problem is not None and "PyYAML" in problem
 
 
+class TestKnownSkillsAndTimeoutProfilesShareTheSameStrictLoader:
+    """`_load_known_skills()` / `_load_timeout_profiles()` は `_load_deliverable_capabilities()`
+    と同じ `_load_yaml_document()` を通るが、それぞれ**自分の呼び出し箇所**で敵対的な入力に
+    対して同じ振る舞いをすることを確認する (t072 受入条件: 読み込み箇所ごとに同じ入力の組で)。
+    どちらも WARN 止まり (低リスク) な設計だが、読み込み自体が壊れていないことは別に確かめる。
+    """
+
+    def test_known_skills_reads_a_commented_header_correctly(self, tmp_path):
+        path = tmp_path / "p.yaml"
+        path.write_text("skills: # permissions\n  research:\n    can_produce_deliverable: false\n")
+        assert lint_plan._load_known_skills(str(path)) == {"research"}
+
+    def test_known_skills_reads_a_quoted_key_correctly(self, tmp_path):
+        path = tmp_path / "p.yaml"
+        path.write_text('skills:\n  "research":\n    can_produce_deliverable: false\n')
+        assert lint_plan._load_known_skills(str(path)) == {"research"}
+
+    def test_known_skills_is_empty_not_crashing_on_empty_or_unreadable_file(self, tmp_path):
+        empty = tmp_path / "empty.yaml"
+        empty.write_text("")
+        assert lint_plan._load_known_skills(str(empty)) == set()
+        assert lint_plan._load_known_skills(str(tmp_path / "nope.yaml")) == set()
+
+    def test_timeout_profiles_reads_a_commented_header_correctly(self, tmp_path):
+        path = tmp_path / "p.yaml"
+        path.write_text("profiles: # timeouts\n  default:\n    idle: 60\n    max: 600\n")
+        assert lint_plan._load_timeout_profiles(str(path)) == {"default": {"idle": 60, "max": 600}}
+
+    def test_timeout_profiles_reads_a_quoted_key_correctly(self, tmp_path):
+        path = tmp_path / "p.yaml"
+        path.write_text('profiles:\n  "default":\n    idle: 60\n    max: 600\n')
+        assert lint_plan._load_timeout_profiles(str(path)) == {"default": {"idle": 60, "max": 600}}
+
+    def test_timeout_profiles_ignores_a_yaml_1_1_style_bool_looking_value_as_not_an_int(self, tmp_path):
+        """`idle: no` は YAML 1.1 なら bool になりうるが、int でないので profile に採用しない
+        (黙って 0 扱いにしない — int チェックで弾かれ、その欄自体が profile から抜ける)。"""
+        path = tmp_path / "p.yaml"
+        path.write_text("profiles:\n  default:\n    idle: no\n    max: 600\n")
+        assert lint_plan._load_timeout_profiles(str(path)) == {"default": {"max": 600}}
+
+    def test_timeout_profiles_is_empty_not_crashing_on_empty_or_unreadable_file(self, tmp_path):
+        empty = tmp_path / "empty.yaml"
+        empty.write_text("")
+        assert lint_plan._load_timeout_profiles(str(empty)) == {}
+        assert lint_plan._load_timeout_profiles(str(tmp_path / "nope.yaml")) == {}
+
+
 class TestMissionMark:
     def _write(self, tmp_path, text):
         d = tmp_path / "missions" / "m"

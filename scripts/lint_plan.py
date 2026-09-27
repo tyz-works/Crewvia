@@ -365,7 +365,10 @@ VALID_DELIVERABLES = ('pr', 'file', 'none')
 #: 成果物 (PR / file) を宣言した task にだけ、skills との突き合わせが効く。
 DELIVERABLES_THAT_NEED_A_WRITER = ('pr', 'file')
 
-_CAPABILITY_LINE = re.compile(r'^    can_produce_deliverable:\s*([^#\s]*)\s*(?:#.*)?$')
+#: 値部分は行末までまるごと取る (`[^#\s]*` は空白を含む値 — `not a boolean` や
+#: `[false, true]` — で行全体にマッチせず、欄が「無い」ものとして読み飛ばされていた)。
+#: インラインコメントは値を取り出した後に文字列として切り落とす。
+_CAPABILITY_LINE = re.compile(r'^    can_produce_deliverable:\s*(.*)$')
 
 
 def _load_deliverable_capabilities(skill_permissions_path: str) -> tuple[dict, Optional[str]]:
@@ -374,6 +377,8 @@ def _load_deliverable_capabilities(skill_permissions_path: str) -> tuple[dict, O
     欄の無いスキルは辞書に載せない (= 呼び出し側は「作れる」と読む)。値は `true` / `false` の
     どちらかだけを受け入れ、それ以外は **文字列のまま** 返す (truthiness で False に潰さない —
     `flase` と書き間違えたスキルを「作れる」にも「作れない」にも黙って倒さないため)。
+    空白を含む値 (文字列・リスト表記など) や空値も、欄自体は「ある」ものとして拾い、
+    不正な値の文字列として返す (欄の有無と値の妥当性を別に扱う)。
     """
     try:
         with open(skill_permissions_path, encoding='utf-8') as f:
@@ -399,7 +404,7 @@ def _load_deliverable_capabilities(skill_permissions_path: str) -> tuple[dict, O
             continue
         cm = _CAPABILITY_LINE.match(line)
         if cm and current is not None:
-            raw = cm.group(1)
+            raw = re.sub(r'\s*#.*$', '', cm.group(1)).strip()
             caps[current] = {'true': True, 'false': False}.get(raw, raw)
     return caps, None
 
@@ -474,7 +479,13 @@ def check_deliverable(tasks: list[dict], skill_permissions_path: str,
 
         skills = meta.get('skills')
         if not isinstance(skills, list) or not skills:
-            continue  # skills の型・欠落は frontmatter 検査の担当
+            # skills が無い・空リストの task は producer skill を 1 つも持てない。
+            # check_frontmatter は `skills: []` を有効な frontmatter として通すので、
+            # ここで前提を預けず自分で閉じる (欠落・空リストのどちらも FAIL)。
+            results.append(('FAIL', 'deliverable',
+                            f"{prefix}: deliverable '{declared}' を宣言していますが 'skills' が空です "
+                            f"(skills={skills!r}) — 成果物を作れる skill を足すか、deliverable を none にする"))
+            continue
         table, problem = capabilities()
         if problem is not None:
             results.append(('FAIL', 'deliverable',

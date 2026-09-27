@@ -249,9 +249,22 @@ class TestCheckDeliverable:
         tasks = [_t("pr", ["code"], "t001"), _t("none", ["research"], "t002"), _t("file", ["docs"], "t003")]
         assert lint_plan.check_deliverable(tasks, perms, required=True) == []
 
-    def test_an_empty_skills_list_is_not_vacuously_all_false(self, perms):
-        """all([]) は True。skills が空の task を「作れない」と読まない (frontmatter 検査の担当)。"""
-        assert lint_plan.check_deliverable([_t("pr", [])], perms) == []
+    @pytest.mark.parametrize("declared", ["pr", "file"])
+    def test_an_empty_skills_list_fails_because_no_skill_can_produce_it(self, perms, declared):
+        """all([]) は True になり得るが、skills が空の task は producer を 1 つも持てない。
+
+        `check_frontmatter` は `skills: []` を有効な frontmatter として通すため、
+        `check_deliverable` 自身がこのケースを閉じる (前提を他の関数に預けない)。
+        """
+        fails = _fails(lint_plan.check_deliverable([_t(declared, [])], perms))
+        assert len(fails) == 1 and "t001" in fails[0] and "skills" in fails[0], fails
+
+    @pytest.mark.parametrize("declared", ["pr", "file"])
+    def test_a_missing_skills_field_also_fails(self, perms, declared):
+        """skills 欠落 (キー自体が無い) も、空リストと同じく producer が無いので FAIL。"""
+        meta = {"id": "t001", "title": "x", "status": "pending", "priority": "high", "deliverable": declared}
+        fails = _fails(lint_plan.check_deliverable([meta], perms))
+        assert len(fails) == 1 and "t001" in fails[0] and "skills" in fails[0], fails
 
     def test_an_unreadable_config_is_a_fail_not_a_pass(self, tmp_path):
         missing = str(tmp_path / "nope.yaml")
@@ -261,8 +274,18 @@ class TestCheckDeliverable:
         assert lint_plan.check_deliverable([_t()], missing) == []
         assert lint_plan.check_deliverable([_t("none", ["research"])], missing) == []
 
-    @pytest.mark.parametrize("raw", ["flase", "no", "0", "\"false\"", "maybe"])
+    @pytest.mark.parametrize("raw", [
+        "flase", "no", "0", "\"false\"", "maybe",           # 空白を含まない不正値 (従来から検出済み)
+        "not a boolean",                                     # 空白入り文字列
+        "[false, true]",                                     # リスト表記 (空白入り)
+        "null",                                               # null
+        "42",                                                 # 数値
+    ])
     def test_a_malformed_capability_is_a_fail_not_silently_true_or_false(self, tmp_path, raw):
+        """欠陥版 (`[^#\\s]*` で値を切る正規表現) に戻すと、空白を含む形 (`not a boolean` /
+        `[false, true]`) は行全体がマッチせず欄が「無い」ものとして読み飛ばされ、
+        `check_deliverable` は `pr` を通してしまう (このテストが赤になる)。
+        """
         perms = _perms(tmp_path, f"  research:\n    can_produce_deliverable: {raw}\n    allow: []\n    deny: []\n")
         fails = _fails(lint_plan.check_deliverable([_t("pr", ["research"])], perms))
         assert len(fails) == 1 and "true / false ではありません" in fails[0], fails

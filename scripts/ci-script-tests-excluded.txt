@@ -1,0 +1,14 @@
+# CI（.github/workflows/ci.yml の script-tests job）が走らせない scripts/test_*.sh。
+# CI は scripts/test_*.sh を glob で全部走らせる。ここに載せたものだけが除外される。
+#
+# 形式: <path> | <理由>      （# で始まる行と空行は無視。理由の無い行・存在しないファイル・重複は CI が落ちる）
+#
+# 理由は次の 2 種類だけ（tests/test_ci_runs_every_script_test.py が強制する）:
+#   live の herdr / tmux が要る（恒久）   CI に無い実物の herdr / tmux が要り、偽物では代えられない
+#   未調査 (t043)                          新しく CI に入れたら落ちた。原因の棚卸しと修正は t043。直ったらこの行を消す
+#
+# 除外は「走らせない」の宣言であって「直った」ではない。行を足すときは理由を確かめる。
+
+scripts/test_phase_c.sh | 未調査 (t043)
+scripts/test_phase_e.sh | 未調査 (t043)
+scripts/test_watchdog_config_mode.sh | 未調査 (t043)

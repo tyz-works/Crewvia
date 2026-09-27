@@ -64,10 +64,18 @@ sed -i \
   -e 's/^KILL_DELAY = .*/KILL_DELAY = 1/' \
   "$ROOT/scripts/watchdog.py"
 
-# B1 (#27): プロセス層の分類は lib_pane_process.py に移った (PROCESS_WORK_START_GRACE もそこ)。
+# B1 (#27): プロセス層の分類は lib_pane_process.py に移った。t065 (Codex review
+# 2巡目) で判定根拠が時刻 (PROCESS_WORK_START_GRACE) から comm の同定に変わり、
+# この定数は撤去された — 書き換えるしきい値はもう無い。木の側を同定できる comm
+# (claude/node) にする (下の fake_bin_dir 参照)。
 cp "$SRC_DIR/scripts/lib_pane_process.py" "$ROOT/scripts/lib_pane_process.py"
-sed -i -e 's/^PROCESS_WORK_START_GRACE = .*/PROCESS_WORK_START_GRACE = 1/' \
-  "$ROOT/scripts/lib_pane_process.py"
+
+# t065: MCP サーバー / claude 本体相当の comm を同定させるための偽バイナリ
+# (symlink の名前が comm になる — 実体は sh / sleep のまま機能する)。
+FAKE_BIN_DIR="$ROOT/fake-bin"
+mkdir -p "$FAKE_BIN_DIR"
+ln -sf /bin/sh "$FAKE_BIN_DIR/claude"
+ln -sf /bin/sleep "$FAKE_BIN_DIR/node"
 
 # 偽 lib_mux — 本番 backend には触れない
 cat_fake_mux() {
@@ -178,20 +186,42 @@ run_watchdog() {
 }
 
 # 監視対象の「ペイン」を立てる。
-#   idle 木      : root -> sh -> sleep, sleep     (全部ほぼ同時 = MCP 相当だけ)
-#   executing 木 : 上に加えて 2 秒後に生える子孫  (= Bash tool 実行中)
+#   idle 木      : root -> claude(comm) -> node(comm), node(comm)   (既知インフラだけ)
+#   executing 木 : 上に加えてシェル (comm=sh) の子孫が生える (= Bash tool 実行中)
+#
+# t065: 判定根拠は「いつ生えたか」ではなく comm (実行体名)。claude/node の
+# fake バイナリ (symlink) を使わないと、bare な `sh`/`sleep` はそれぞれ
+# 「シェル (job)」「同定不能 (族C の既定で job)」に見えてしまい、idle 木の
+# 前提 (MCP 相当だけ = idle_process) が成立しない。
 spawn_pane() {
   local kind="$1"
   local pidfile="$ROOT/pane.pid"
+  local claude_bin="$FAKE_BIN_DIR/claude"
+  local node_bin="$FAKE_BIN_DIR/node"
+  local runner="$ROOT/spawn_pane_runner.sh"
   rm -f "$pidfile"
-  # 自分の PID をファイルに書かせる。setsid が fork するかどうかに依存せず
-  # 「ペインのシェル」の PID を確実に取るため ($! では setsid 自身を掴みうる)。
-  # setsid でプロセスグループを分けておくと、後片付けでグループごと殺せる。
+  # 入れ子の引用符地獄を避けるため、起動スクリプトを一時ファイルに書く。
   if [[ "$kind" == "executing" ]]; then
-    setsid sh -c 'echo $$ > "$1"; sleep 300 & sh -c "sleep 2; sleep 300 & wait" & wait' _ "$pidfile" &
+    cat > "$runner" <<EOF
+#!/bin/sh
+echo \$\$ > "$pidfile"
+"$node_bin" 300 &
+sh -c "sleep 2; sleep 300 & wait" &
+wait
+EOF
   else
-    setsid sh -c 'echo $$ > "$1"; sh -c "sleep 300 & sleep 300 & wait" & wait' _ "$pidfile" &
+    cat > "$runner" <<EOF
+#!/bin/sh
+echo \$\$ > "$pidfile"
+"$claude_bin" -c "'$node_bin' 300 & '$node_bin' 300 & wait" &
+wait
+EOF
   fi
+  chmod +x "$runner"
+  # setsid でプロセスグループを分けておくと、後片付けでグループごと殺せる。
+  # 「ペインのシェル」の PID はランナー自身が echo $$ で書く ($! では setsid
+  # 自身を掴みうるため確実ではない)。
+  setsid "$runner" &
   disown 2>/dev/null || true   # 後片付けの kill で "Killed" を出力させない
   local waited=0
   while [[ ! -s "$pidfile" && "$waited" -lt 50 ]]; do sleep 0.1; waited=$((waited + 1)); done

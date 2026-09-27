@@ -106,7 +106,6 @@ import urllib.request
 import urllib.error
 from pathlib import Path
 from datetime import datetime, timezone
-from typing import Optional
 
 QUEUE_DIR      = Path(sys.argv[1])
 REGISTRY_DIR   = Path(sys.argv[2])
@@ -1469,7 +1468,7 @@ def _save_state_entry(name: str, state: str, since: float) -> None:
         log(f'WARNING: cannot write state entry for {name!r}: {e}')
 
 
-def worker_has_background_work(target: str, assignment_file: Optional[Path] = None) -> bool:
+def worker_has_background_work(target: str) -> bool:
     """True iff this Worker's pane has a tool / background job running under claude.
 
     B1 (#27): `run_in_background` の shell と Monitor は、生きている間 herdr の
@@ -1479,17 +1478,14 @@ def worker_has_background_work(target: str, assignment_file: Optional[Path] = No
     `bash -c ...` が生えていて、watchdog の idle 判定 (`classify_process_tree`) は
     `executing` と読む。**同じ定義を共有する** — 別の判定を dispatcher に置かない。
 
-    t049 (Codex review, PR#238 P2): `classify_process_tree` の `grace_seconds`
-    (既定 60秒) は claude 起動からの絶対時刻で区別するため、**着手直後** (60秒の
-    枠内) に投げた裏 job は MCP サーバーと区別が付かず、生きている間ずっと
-    `idle_process` に見える欠陥があった (実測: mission 20260927-mechanize-guards-b
-    の QA Worker Arjun が着手直後に走らせた裏の pytest が同じ形で観測された)。
-    `assignment_file` の mtime (= `plan.sh pull` がこの task を割り当てた時刻。
-    Worker が実際に動き出すのは必ずこれより後) を `classify_process_tree` の
-    `min_start_epoch` に渡すことで、grace_seconds の枠内でも「今の task の
-    assignment より後に生えた子孫」を無条件で executing と判定できるようにした。
-    MCP サーバーは assignment より前 (セッション起動直後) に立ち上がっているので
-    誤って拾わない。
+    t065 (Codex review 2巡目, PR#238 P2): `classify_process_tree` の判定根拠は
+    もう時刻 (t016 の `grace_seconds` / t049 の `min_start_epoch`) ではない。
+    `plan.sh pull` の後で初めて起動する MCP サーバー (遅延起動の Playwright
+    ブラウザ等) は時刻基準だと「assignment より後」に見え、**すべてのツール
+    呼び出しと裏 job が終わった後も Rule 5 を永久に抑制し続ける**欠陥があった
+    (偽陰性 — 本当に止まっている Worker に誰も気付けない)。今はプロセスの
+    同定 (comm) で区別するので、呼び出し側 (ここ) は assignment の時刻を
+    意識する必要が無くなった。
 
     倒す向き (この判定は**通知**を止める側): 観測できない (`unknown` / pane pid が
     引けない / 例外) ときは False = 従来どおり通知する。誤って True にすると詰まった
@@ -1500,13 +1496,7 @@ def worker_has_background_work(target: str, assignment_file: Optional[Path] = No
         pane_pid = _mux.pid(target)
         if pane_pid is None:
             return False
-        min_start_epoch = None
-        if assignment_file is not None:
-            try:
-                min_start_epoch = assignment_file.stat().st_mtime
-            except OSError:
-                min_start_epoch = None
-        return classify_process_tree(pane_pid, min_start_epoch=min_start_epoch) == 'executing'
+        return classify_process_tree(pane_pid) == 'executing'
     except Exception as e:  # 観測失敗 → 通知する側に倒す。黙って True にしない
         log(f'WARNING: Rule 5 — cannot classify pane process tree for {target!r}: {e!r}')
         return False
@@ -1551,7 +1541,7 @@ def check_rule5(name: str, target: str, assignment_file: Path, task_statuses_by_
     # B1 (#27): idle/done with a live background job is 'working' for Rule 5.
     # Only condition B (assignment exists) is affected — 'blocked' still notifies.
     # The /proc scan runs only for the idle-with-assignment case.
-    if st in ('idle', 'done') and assignment_file.exists() and worker_has_background_work(target, assignment_file):
+    if st in ('idle', 'done') and assignment_file.exists() and worker_has_background_work(target):
         st = 'working'
 
     # unknown / working → no action.  tmux always returns unknown → skip.

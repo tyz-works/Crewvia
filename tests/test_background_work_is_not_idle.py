@@ -17,9 +17,20 @@ tests/test_background_work_is_not_idle.py — 裏の shell / monitor は「止�
 watchdog はプロセス層 (t016) が既に hard idle を terminate にしない — ここではそれを
 **実プロセス木で** 通しで確かめ、上限 (max) が裏の子があっても効くことを固定する。
 
+## t065 (Codex review 2巡目, PR#238 P2): 判定根拠を時刻からプロセスの同定に移す
+
+t016 (`grace_seconds`) → t049 (`min_start_epoch`) はどちらも「いつ生えたか」という
+時刻を代理指標にしていたため、`plan.sh pull` の後で初めて起動する MCP サーバー
+(遅延起動の Playwright ブラウザ等) を本物の job と区別できず、job が全部終わった
+後も Rule 5 を永久に抑制し続ける偽陰性が残った。`lib_pane_process.classify_process_tree()`
+はもう時刻を見ない — comm (実行ファイル名) でシェル (job) と既知インフラを区別する。
+このファイルのテストもそれに合わせてある: `PROCESS_WORK_START_GRACE` は無くなった。
+
 ## 方法
 
-* プロセス木は本物 (`sh` の親子)。`PROCESS_WORK_START_GRACE` だけ 1 秒に縮める。
+* プロセス木は本物 (`sh` の親子)。MCP / ブラウザ相当は `_fake_binary()` で
+  `/bin/sh` を `node` / `chrome` 等の名前の symlink 越しに起動し、comm (実行体名)
+  だけを模擬する (実バイナリの中身は問わない — 分類は comm しか見ない)。
 * dispatcher は **本物の** dispatcher.sh の埋め込み python を `exec()` して `check_rule5()` を呼ぶ
   (`tests/test_dispatcher_notify_once.py` の Harness)。差し替えるのは mux (状態と pane pid) だけ。
 * watchdog は本物の `WorkerMonitor.check_detail()`。差し替えるのは mux の pane pid 解決だけで、
@@ -111,22 +122,46 @@ def _kill_pane_tree(proc: subprocess.Popen) -> None:
     proc.wait()
 
 
+def _fake_binary(directory, name: str, real: str = "/bin/sh") -> str:
+    """`real` への symlink を `name` という名前で作り、そのパスを返す。
+
+    /proc/<pid>/stat の comm (実行体名) は execve に渡したパス自身の
+    ベース名になる (実行ファイルの実体の名前ではない — 本ファイル内で実測
+    済み: `/bin/sleep` への symlink `chrome_test_marker` を実行すると
+    comm は `chrome_test_mar` [15 文字打ち切り] になる)。これを使って
+    node / chrome 等の永続インフラの comm を、実バイナリを入れずに模擬する。
+    `real="/bin/sh"` を使えば、模擬した名前のままシェルとして機能する
+    (comm は symlink 名のまま、中身は sh なので `-c` でさらに子を生やせる) —
+    「MCP サーバー (node) が後からブラウザ (chrome) を起動する」形を作れる。
+    """
+    p = Path(directory) / name
+    if not p.exists():
+        p.symlink_to(real)
+    return str(p)
+
+
 @pytest.fixture(scope="module")
-def panes():
+def panes(tmp_path_factory):
     """{"busy": pid, "quiet": pid} — どちらも本番のペインと同じ形の木。
 
-    busy   root sh ─ sleep(t=0, MCP 相当) ─ sh(t=0, claude 相当) ─ sleep(t=2, 裏の job)
-    quiet  root sh ─ sleep(t=0, MCP 相当) ─ sh(t=0, claude 相当)   … 裏の job 無し
+    busy   root sh ─ node(t=0, MCP 相当) ─ sh(t=0, 裏の job)
+    quiet  root sh ─ node(t=0, MCP 相当)                       … 裏の job 無し
 
-    基準時刻は「最も古い直下の子」なので、t=0 の子を生かしたままにする。
-    各木は `start_new_session=True` で自分専用の process group を持つ (setsid)。
-    teardown は `_kill_pane_tree()` で group ごと落とす (P3)。
+    MCP 相当は `_fake_binary()` で comm を `node` にする (t065: 分類は comm を
+    見るので、真の MCP サーバーでなくても「同定される既知インフラ」であれば
+    形が揃う)。**quiet にシェルを一切含めないこと** — シェル (comm) が見つかった
+    時点で job と判定するので、中身が空でも `sh -c "..."` のような wrapper を
+    quiet 側に置くと、それだけで誤って job 側に倒れてしまう。
+    各木は `start_new_session=True` で自分専用の process group を持つ
+    (setsid)。teardown は `_kill_pane_tree()` で group ごと落とす (P3)。
     """
+    fake_bin_dir = tmp_path_factory.mktemp("fake-bin-panes")
+    node_bin = _fake_binary(fake_bin_dir, "node", real="/bin/sleep")
     busy = subprocess.Popen(
-        ["sh", "-c", 'sleep 300 & sh -c "sleep 2; sleep 300 & wait" & wait'],
+        ["sh", "-c", f'{node_bin} 300 & sh -c "sleep 300 & wait" & wait'],
         start_new_session=True)
     quiet = subprocess.Popen(
-        ["sh", "-c", 'sleep 300 & sh -c "sleep 300 & wait" & wait'],
+        ["sh", "-c", f'{node_bin} 300 & wait'],
         start_new_session=True)
     time.sleep(3.5)  # 遅れて生える子が出そろうまで
     try:
@@ -134,11 +169,6 @@ def panes():
     finally:
         for p in (busy, quiet):
             _kill_pane_tree(p)
-
-
-@pytest.fixture(autouse=True)
-def short_grace(monkeypatch):
-    monkeypatch.setattr(lib_pane_process, "PROCESS_WORK_START_GRACE", 1)
 
 
 def test_the_fixture_trees_classify_as_intended(panes):
@@ -332,74 +362,128 @@ def test_a_vanished_pane_process_falls_to_the_notifying_side(r5):
 
 
 # ---------------------------------------------------------------------------
-# P2 (Codex review, PR#238): grace_seconds の枠内で始まった裏 job も拾う
+# P2 2巡目 (Codex review, PR#238): 判定根拠を時刻からプロセスの同定に移す
 # ---------------------------------------------------------------------------
 
-def test_a_job_started_within_the_grace_window_is_caught_via_assignment_mtime(
-    tmp_path, monkeypatch
-):
-    """しきい値 (ここでは 5 秒に上書き) の枠内で始まった裏 job は、session_start
-    だけを根拠にすると classify_process_tree が一生 idle_process と読む欠陥が
-    あった (実測: mission 20260927-mechanize-guards-b の QA Worker Arjun — 着手
-    直後に投げた裏の pytest が、watchdog の verdict でも同じ形で idle_process と
-    観測された)。既存テスト (`short_grace` で 1 秒に縮め、t=2 で job を生やす) は
-    grace より**後**に job が始まる経路しか通らないため、この穴を検出できない。
-
-    assignment file (このWorkerが「今の task」を割り当てられた時刻。job より必ず
-    前に書かれる) の mtime を根拠に足すことで、grace の枠内でも拾えることを
-    本物の check_rule5() 経由で固定する。
+def test_a_job_that_starts_at_the_same_instant_as_mcp_is_still_caught(tmp_path):
+    """偽陽性側の赤の実証: 裏 job が MCP と**同時に** (しきい値の前後を問わず)
+    始まっても、シェルとして同定されればその場で job と分かる。t049 までの
+    時刻ベースの判定は「着手直後 (しきい値の枠内)」に始まった job を区別
+    できなかったが、同定ベースなら「いつ生えたか」自体を見ないのでこの区別が
+    そもそも要らないことを固定する。
     """
-    monkeypatch.setattr(lib_pane_process, "PROCESS_WORK_START_GRACE", 5)
+    node_bin = _fake_binary(tmp_path, "node", real="/bin/sleep")
     root = subprocess.Popen(
-        ["sh", "-c", 'sleep 300 & sh -c "sleep 1.5; sleep 300 & wait" & wait'],
+        ["sh", "-c", f'{node_bin} 300 & sh -c "sleep 300 & wait" & wait'],
         start_new_session=True)
     try:
-        time.sleep(0.3)  # MCP 相当だけが立った状態 (裏 job はまだ t=1.5 に生えていない)
+        time.sleep(0.05)  # MCP (node) と job (sh) がほぼ同時に生えた直後
+        assert lib_pane_process.classify_process_tree(root.pid) == "executing"
+    finally:
+        _kill_pane_tree(root)
 
-        # Harness.__init__ 自身が lib_mux.Mux を FakeMux に差し替えるので、
-        # PaneMux への差し替えは Harness 構築の**後**でないと上書きされて消える
-        # (`Rule5.__init__` と同じ順序)。
+
+def test_a_late_starting_mcp_browser_does_not_suppress_rule_5_forever(tmp_path):
+    """偽陰性側の赤の実証 (今回の主眼): `plan.sh pull` の後で初めて起動する MCP
+    サーバー / ブラウザ (遅延起動の Playwright ブラウザ等) は、時刻ベースの
+    判定 (t049 の `min_start_epoch`) だと「assignment より後に生えた」という
+    理由だけで無条件に executing 扱いになり、**job が全部終わった後も Rule 5
+    を永久に抑制し続けた** (偽陰性 — Director が気付けない)。
+
+    同定ベースでは、遅れて生えた MCP/ブラウザだけが残る木は job (シェル) を
+    一切含まないので idle_process と判定され、Rule 5 が正しく機能することを
+    固定する。木は「MCP (node) が起動し、しばらくしてブラウザ (chrome) だけを
+    起動する。job (シェル) は無い」形 — job がとっくに終わった Worker を模す。
+
+    遅延は shell の `sleep N;` では作らない — `sleep` は外部コマンドなので
+    フォークされ、そのプロセス自身が (シェルでも既知インフラでもない)
+    同定不能な子として一瞬混ざり込み、テストの意図と無関係に "executing" に
+    倒れてしまう (このテスト自身が実測して踏んだ)。ここでは builtin の `read`
+    で FIFO から 1 行読むまで node は止まり、書き込まれたら node が chrome を
+    **新しい子プロセスとして** fork する (`exec` で同じ pid に入れ替えると
+    chrome の /proc starttime が node の fork 時刻のままになり、「assignment
+    より後に生えた」を再現できなくなる — この違いも実測して踏んだ)。
+    """
+    fifo_path = tmp_path / "signal"
+    os.mkfifo(fifo_path)
+    node_bin = _fake_binary(tmp_path, "node", real="/bin/sh")
+    chrome_bin = _fake_binary(tmp_path, "chrome", real="/bin/sleep")
+    root = subprocess.Popen(
+        ["sh", "-c", f'{node_bin} -c "read x < {fifo_path}; {chrome_bin} 300 & wait" & wait'],
+        start_new_session=True)
+    try:
+        time.sleep(0.3)  # node (MCP 相当) だけが立った状態。ブラウザはまだ
+        assert lib_pane_process.classify_process_tree(root.pid) == "idle_process"
+
+        with open(fifo_path, "w") as f:
+            f.write("go\n")  # 遅延起動のブラウザを今始める合図
+        time.sleep(0.3)  # chrome (遅延起動のブラウザ相当) が生えた後
+        assert lib_pane_process.classify_process_tree(root.pid) == "idle_process"
+    finally:
+        _kill_pane_tree(root)
+
+
+def test_a_late_starting_mcp_browser_lets_rule_5_notify_via_check_rule5(
+    tmp_path, monkeypatch
+):
+    """上と同じ木を、本物の `check_rule5()` 経由で確かめる — 受入条件の
+    「MCP の永続プロセスだけを持ち、job は全部終わった Worker に Rule 5 が
+    発火すること」そのもの。**ブラウザは assignment file を書いた後で初めて
+    起動する** (finding が明示的に要求する「plan.sh pull の後で初めて起動する
+    Playwright ブラウザ」の経路そのもの) — 旧実装 (t049 の `min_start_epoch`:
+    「assignment より後に生えた子孫は無条件 executing」) だと、このブラウザは
+    job が無くても永久に executing と誤読され、Rule 5 が黙り続けた (偽陰性)。
+    同定ベースでは「いつ生えたか」を見ないので、assignment の前後に関わらず
+    ブラウザは infra のまま — 通知が正しく発火することを固定する。
+    """
+    fifo_path = tmp_path / "signal"
+    os.mkfifo(fifo_path)
+    node_bin = _fake_binary(tmp_path, "node", real="/bin/sh")
+    chrome_bin = _fake_binary(tmp_path, "chrome", real="/bin/sleep")
+    root = subprocess.Popen(
+        ["sh", "-c", f'{node_bin} -c "read x < {fifo_path}; {chrome_bin} 300 & wait" & wait'],
+        start_new_session=True)
+    try:
+        time.sleep(0.3)  # node だけが立った状態。ブラウザはまだ
+
         h = Harness(tmp_path / "repo", monkeypatch)
         monkeypatch.setattr(lib_mux, "Mux", PaneMux)
         PaneMux.pane_state, PaneMux.pane_pid, PaneMux.pid_raises = "idle", root.pid, None
         h.cycle()
         assignment = h.ns["ASSIGNMENTS_DIR"] / AGENT
         assignment.parent.mkdir(parents=True, exist_ok=True)
-        assignment.write_text(f"{SLUG}:t001\n")  # mtime ≈ ここ (裏 job より前)
+        assignment.write_text(f"{SLUG}:t001\n")  # ここが「plan.sh pull」の時刻
         h.ns["_save_state_entry"](AGENT, "idle-with-task", time.time() - 600)  # grace 経過済み
 
-        # 対照: assignment を使わない生の分類は、まだ grace(5s) の枠内なので
-        # 依然として idle_process に誤読される — これが P2 の欠陥そのもの
-        assert lib_pane_process.classify_process_tree(root.pid) == "idle_process"
-
-        time.sleep(1.8)  # 裏 job (t=1.5 に生えた) が生きている。総経過はまだ grace(5s) 未満
+        # assignment を書いた**後**で初めてブラウザ (chrome) を起動する —
+        # 遅延起動の Playwright ブラウザの経路そのもの
+        with open(fifo_path, "w") as f:
+            f.write("go\n")
+        time.sleep(0.3)  # chrome が生えるまで
 
         FakeMux.sent = []
         h.ns["check_rule5"](AGENT, TARGET, assignment, {})
-        assert FakeMux.sent == []  # 裏 job を拾い、idle-with-task を通知しない
+        msgs = [m["message"] for m in FakeMux.sent]
+        assert len(msgs) == 1 and "idle-with-task" in msgs[0]
     finally:
         _kill_pane_tree(root)
 
 
-def test_a_stale_min_start_epoch_before_boot_does_not_force_executing(monkeypatch):
-    """族C監査 (t049): min_start_epoch が「起動より前」に見えると (壁時計のずれ・
-    起動を跨いで残った古い assignment)、tick への変換が負になる。これをそのまま
-    使うと、あらゆる子孫の tick 値が無条件に閾値以上になり、MCP サーバーしか
-    居ない木まで "executing" と誤読してしまう — このガード自身が壊れた状態を
-    「常に検知した」に倒す退行。負のときは判定材料として使わない (min_start_epoch
-    を渡さなかったときと同じ、grace_seconds だけの判定にフォールバックする) こと
-    を固定する。
+def test_an_unidentified_persistent_process_is_treated_as_a_job_not_infra(tmp_path):
+    """族C監査 (t065): 既知インフラの一覧に無い永続プロセスをどう倒すか。
+    未知の物を infra 側に倒す (= 黙り続ける) と、新種の MCP サーバー / 未対応の
+    ブラウザが現れるたびに同じ偽陰性が起こりうる。同定できないものは job 側
+    (executing) に倒し、偽陽性 (1 回余計に通知する) の方を選ぶことを固定する。
     """
-    monkeypatch.setattr(lib_pane_process, "PROCESS_WORK_START_GRACE", 5)
-    proc = subprocess.Popen(["sh", "-c", "sleep 300 & wait"], start_new_session=True)
+    unknown_bin = _fake_binary(tmp_path, "totally-unknown-binary", real="/bin/sleep")
+    root = subprocess.Popen(
+        ["sh", "-c", f'{unknown_bin} 300 & wait'],
+        start_new_session=True)
     try:
-        time.sleep(0.3)  # MCP 相当だけが立った状態。裏 job は無い
-        # 2000-01-01 (どの実行環境の起動よりも前) を min_start_epoch として渡す
-        assert lib_pane_process.classify_process_tree(
-            proc.pid, min_start_epoch=946684800.0
-        ) == "idle_process"
+        time.sleep(0.3)
+        assert lib_pane_process.classify_process_tree(root.pid) == "executing"
     finally:
-        _kill_pane_tree(proc)
+        _kill_pane_tree(root)
 
 
 # ---------------------------------------------------------------------------

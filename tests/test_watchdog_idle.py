@@ -172,13 +172,20 @@ class _FakeMux:
 
 
 @pytest.fixture
-def worker_pane():
+def worker_pane(tmp_path):
     """Worker ペインと同じ形の実プロセス木を立てる。
 
         root sh          … ペイン (pane_pid — 本番では /bin/bash)
-          └ sh           … claude 本体
-              ├ sleep    … MCP サーバー
-              └ sleep    … MCP サーバー
+          └ claude       … claude 本体 (comm を `claude` にした /bin/sh の symlink)
+              ├ node     … MCP サーバー (comm を `node` にした /bin/sleep の symlink)
+              └ node     … MCP サーバー (同上)
+
+    t065: 判定は comm を見る。既知インフラの子は**自動では infra を継承しない**
+    (「親が infra なら子も infra」を足すと、同定できない子まで infra 側に
+    倒れてしまい、族C の「未知は job 側」という安全な既定を壊す)。本番の MCP
+    サーバーは claude の直下でも npm/npx/node のように comm 自体が既知インフラ
+    に一致するので、ここでも `node` symlink を使い、propagation ではなく
+    実物に近い comm で揃える。
 
     本番の実測 (2026-09-21, Ren-worker pane 3850583) と同じく、
     `pgrep -P <pane_pid>` は常に 1 件 (claude 相当) を返す。これが
@@ -186,8 +193,12 @@ def worker_pane():
     子はすべて root とほぼ同時に起動するので、修正後の分類では
     executing ではなく idle_process になる。
     """
+    claude_bin = tmp_path / "claude"
+    claude_bin.symlink_to("/bin/sh")
+    node_bin = tmp_path / "node"
+    node_bin.symlink_to("/bin/sleep")
     root = subprocess.Popen(
-        ["sh", "-c", 'sh -c "sleep 300 & sleep 300 & wait" & wait']
+        ["sh", "-c", f'{claude_bin} -c "{node_bin} 300 & {node_bin} 300 & wait" & wait']
     )
     time.sleep(0.5)  # 木が出そろうまで
     try:
@@ -360,49 +371,66 @@ def test_no_children_is_no_process():
     """子を持たないプロセスは no_process。"""
     p = subprocess.Popen(["sleep", "30"])
     try:
-        assert watchdog.classify_process_tree(p.pid, grace_seconds=1) == "no_process"
+        assert watchdog.classify_process_tree(p.pid) == "no_process"
     finally:
         p.kill()
         p.wait()
 
 
-def test_startup_children_are_not_executing():
-    """起動直後に生えた子 (= MCP サーバー相当) は executing と見なさない。
+def test_startup_children_are_not_executing(tmp_path):
+    """既知の永続インフラ (= MCP サーバー相当) は executing と見なさない。
 
-    claude のペインでは MCP サーバーが claude 起動の 1-2 秒後に立ち上がる。
-    これを「作業中」と読むと、今回直した欠陥と同じく idle 判定が永久に
-    抑止されてしまう。
+    t065 (Codex review 2巡目, PR#238 P2): 判定根拠は「いつ生えたか」ではなく
+    「何であるか」(comm) に変わった。MCP サーバーは claude 起動の 1-2 秒後に
+    立ち上がる**こともあれば、もっと後で初めて起動することもある** (遅延起動の
+    Playwright ブラウザ等) — 時刻ではなく comm で区別しないと、後者を
+    「作業中」と誤読して idle 判定が永久に抑止される欠陥が再発する
+    (t016 の欠陥が向きを変えて戻ってくる)。ここでは comm を `node`
+    (既知インフラ) にした symlink 経由で確かめる。
     """
-    # root(sh) が即座に子 sleep を産む = 起動時からの常駐子プロセス
-    root = subprocess.Popen(["sh", "-c", "sleep 30 & wait"])
+    node_bin = tmp_path / "node"
+    node_bin.symlink_to("/bin/sleep")
+    root = subprocess.Popen(["sh", "-c", f"{node_bin} 30 & wait"])
     try:
-        time.sleep(1.0)
-        assert watchdog.classify_process_tree(root.pid, grace_seconds=10) == "idle_process"
+        time.sleep(0.3)
+        assert watchdog.classify_process_tree(root.pid) == "idle_process"
     finally:
         root.kill()
         root.wait()
 
 
-def test_late_started_child_is_executing():
-    """セッション起動から遅れて生えた子孫は executing (= Bash tool 実行中)。
+def test_a_shell_child_is_executing():
+    """シェル (= Bash tool の実行) が同定されたら executing。
 
         root sh
-          ├ sleep 300                  … t=0。基準時刻を t=0 に固定する
-          └ sh                         … t=0。claude 相当 (wait で生存)
-              └ sleep 300              … t=2。遅れて生えた = 実行中の tool
+          ├ sleep 300                  … MCP サーバー相当 (未同定 → job 側扱いになるので
+          │                               このテストの主眼ではない。sh の方を見る)
+          └ sh                         … Bash tool の実行そのもの (comm = "sh")
 
-    基準は「最も古い直下の子の起動時刻」なので、t=0 の子を 1 つ生かしたまま
-    にしておかないと基準が遅い方へずれて executing を検出できない。
+    t065: 「いつ生えたか」は問わない。comm がシェルであることが根拠。
     """
     root = subprocess.Popen(
-        ["sh", "-c", 'sleep 300 & sh -c "sleep 2; sleep 300 & wait" & wait']
+        ["sh", "-c", 'sleep 300 & sh -c "sleep 300 & wait" & wait']
     )
     try:
-        time.sleep(3.5)  # 遅れて生えた子が出そろうまで待つ
-        assert watchdog.classify_process_tree(root.pid, grace_seconds=1) == "executing"
-        # grace を十分大きくすれば同じ木でも executing にはならない
-        # (しきい値が効いていることの確認 — 常に executing を返す実装を弾く)
-        assert watchdog.classify_process_tree(root.pid, grace_seconds=60) == "idle_process"
+        time.sleep(0.5)
+        assert watchdog.classify_process_tree(root.pid) == "executing"
+    finally:
+        root.kill()
+        root.wait()
+
+
+def test_an_unidentified_child_is_also_executing():
+    """同定できない子 (シェルでも既知インフラでもない) も executing 側に倒す。
+
+    t065 族C監査: 未知の永続プロセスを infra 側に倒す (= 黙り続ける) と、
+    新種の MCP サーバーが現れるたびに偽陰性が起こりうる。同定できないものは
+    job 側 (executing) に倒すことを、watchdog 経由でも固定する。
+    """
+    root = subprocess.Popen(["sh", "-c", "sleep 30 & wait"])
+    try:
+        time.sleep(0.3)
+        assert watchdog.classify_process_tree(root.pid) == "executing"
     finally:
         root.kill()
         root.wait()
@@ -410,7 +438,7 @@ def test_late_started_child_is_executing():
 
 def test_process_signal_unreadable_pane_pid_is_no_process():
     """存在しない pid は no_process (例外にしない)。"""
-    assert watchdog.classify_process_tree(2 ** 22, grace_seconds=1) == "no_process"
+    assert watchdog.classify_process_tree(2 ** 22) == "no_process"
 
 
 # ---------------------------------------------------------------------------

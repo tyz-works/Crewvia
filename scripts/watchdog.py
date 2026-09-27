@@ -46,7 +46,7 @@ from lib_mux import Mux, repo_identity_ok  # noqa: E402
 import lib_retirement  # noqa: E402
 import lib_daemon_watch  # noqa: E402
 from lib_pane_process import (  # noqa: E402,F401
-    PROCESS_WORK_START_GRACE, ProcessSignal, classify_process_tree,
+    ProcessSignal, classify_process_tree,
 )
 # 「伝えた」台帳 (dispatcher と共有) の読み書き。timeout 終了の通知を 1 回だけにする (t021)。
 from lib_daemon_state import (  # noqa: E402
@@ -228,8 +228,8 @@ def parse_iso_epoch(value) -> Optional[float]:
 # Process layer (t016)
 # ---------------------------------------------------------------------------
 # 分類の実装は lib_pane_process.py (B1: dispatcher の Rule 5 も同じ定義を使う)。
-# ここで使う名前 (classify_process_tree / ProcessSignal / PROCESS_WORK_START_GRACE) は
-# import で持ってくるだけで、判定 (terminate してよいか) はこのファイルの check_detail()。
+# ここで使う名前 (classify_process_tree / ProcessSignal) は import で持ってくる
+# だけで、判定 (terminate してよいか) はこのファイルの check_detail()。
 
 
 class CheckResult(NamedTuple):

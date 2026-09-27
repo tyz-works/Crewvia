@@ -362,8 +362,6 @@ ALLOWED_DIRECT_READS = {
     # -- crewvia のファイルではない: /proc ---------------------------------
     ("lib_pane_process.py", "_proc_stat", 'Path(f"/proc/{pid}/stat").read_text()'):
         "/proc は procfs。FIFO にも通常ファイルにも置き換えられない",
-    ("lib_pane_process.py", "_boot_epoch", 'Path("/proc/uptime").read_text()'):
-        "同上 (t049 P2: 壁時計と tick を結びつける起動時刻の算出用)",
     ("lib_retirement.py", "process_alive",
      'Path(f"/proc/{pid}/stat").read_text()'):
         "同上",

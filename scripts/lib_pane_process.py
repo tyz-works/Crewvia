@@ -7,35 +7,70 @@ watchdog.py にあった `classify_process_tree()` を、dispatcher.sh の Rule 
 この lib は判定しない — 「terminate してよいか」「通知してよいか」は呼び出し側が、
 自分の判定の fail の向きで決める (knowledge/watchdog-idle-judgment.md)。
 読むのは /proc だけで、queue / registry / config は開かない。
+
+## t065 (Codex review 2巡目, PR#238 P2): 判定根拠を「いつ生えたか」から「何であるか」に移す
+
+t016 の元の分類は `grace_seconds` (セッション起動からの経過時間) で MCP サーバーの
+起動ノイズと本物の job を区別していた。t049 はこれを「assignment file の mtime
+より後か」に差し替えたが、**どちらも時刻を代理指標にしている**点は変わらず、穴が
+向きを変えて残った: `plan.sh pull` の後で初めて起動する MCP サーバー (遅延起動の
+Playwright ブラウザ等) は、時刻基準では「assignment より後」に見え、**すべての
+ツール呼び出しと裏 job が終わった後も Rule 5 を永久に抑制し続ける** (偽陰性 —
+本当に止まっている Worker に誰も気付けない。t049 の偽陽性より高くつく、
+memory `fail-direction-is-per-judgment`)。
+
+判定根拠を「そのプロセスが何であるか」(comm = 実行ファイル名) に置き換えた:
+
+  - シェル (`bash` / `sh` / `dash` / `zsh` / `ksh` / `ash`) が見つかった時点で
+    それは job である。Bash tool の実行 (`run_in_background` の裏 job も
+    Monitor も) は必ずこの形で生える (t016 実測)。シェルの子孫もすべて job
+    (シェルが起動した実体の一部だから)。
+  - シェルでなく、既知の「永続インフラ」名 (`claude` = セッション本体、
+    `node`/`npm`/`npx` = MCP サーバーの起動経路、`chrome`/`chromium`/
+    `chrome-headless-shell`/`google-chrome` = Playwright / Chrome DevTools MCP
+    が起動するブラウザ) に一致する、かつ祖先に job が居ない場合だけ infra。
+  - **それ以外 (同定できない) は job 側に倒す。** 未知の永続プロセスを infra
+    と誤認して黙り続けるより、正体不明のものを job 扱いして 1 回余計に通知する
+    方が安い (族C: memory `a-new-guard-creates-a-new-state` — 除外リストを
+    作ること自体が「リストに載っていない未知のものをどう倒すか」という新しい
+    状態を生む。ここでは常に job 側に倒すことでその状態を無害化する)。
+
+時刻 (`grace_seconds` / `min_start_epoch`) はもう判定に使わない — 同定という
+別の根拠に完全に置き換えた (t049 の `min_start_epoch` 機構は撤去)。
 """
-import os
-import time
+from collections import deque
 from pathlib import Path
 from typing import Literal, Optional
-
-# t016: プロセス層の分類しきい値。ペインのセッション (claude) 起動からこれ以上
-# 遅れて始まった子孫が居れば「Bash tool が実行中」とみなす。
-#
-# 下限の根拠: MCP サーバーは claude 起動の 1-2 秒後に立ち上がる (本番実測
-# 2026-09-21: claude et=119s に対し MCP 2 本が et=117s)。これを「実行中」と
-# 誤読すると idle 判定が永久に抑止され、今回直した欠陥がそのまま再発する。
-# 60 秒は実測値の 30 倍で、MCP の起動が多少遅れても誤読しない余裕がある。
-# 上限側は緩くて構わない — 誤読の向きが「殺さない」だからである。
-PROCESS_WORK_START_GRACE = 60
-
 
 ProcessSignal = Literal[
     "no_window",     # mux 窓が無い
     "not_probed",    # プロセス層を見るまでもなく判定が決まった (絶対上限など)
-    "unknown",       # 窓はあるが pane pid が引けない → terminate を抑制する
+    "unknown",       # 窓はあるが pane pid が引けない、または途中の pid が
+                     # 「消滅」以外の理由で読めない → terminate を抑制する
     "no_process",    # 子プロセスが 1 つも無い
-    "idle_process",  # claude と MCP サーバーだけ = 木が有るだけ
-    "executing",     # セッション起動より十分後に始まった子孫が居る = tool 実行中
+    "idle_process",  # 永続インフラ (セッション本体・MCP サーバー・その子孫) だけ
+    "executing",     # シェル (Bash tool の実行) か、同定できない子孫が居る = job 中
 ]
 
+# Bash tool の実行 (前景・run_in_background の裏 job・Monitor いずれも) は必ず
+# シェル経由で生える (t016 実測: "/bin/bash -c source ...")。シェルが見つかった
+# 時点で job — これより後の判定 (既知インフラ一覧) より優先する。
+_SHELL_COMMS = frozenset({"bash", "sh", "dash", "zsh", "ksh", "ash"})
 
-def _proc_stat(pid: int) -> Optional[tuple[int, int]]:
-    """/proc/<pid>/stat から (ppid, starttime_ticks) を返す。
+# 既知の「永続インフラ」の comm (/proc/<pid>/stat の実行体名。15 文字で切り詰め)。
+# **ここに載っていない永続プロセスは infra に含めない** — 同定できない場合は
+# job 側 (executing) に倒す (族C監査、モジュール docstring 参照)。
+_KNOWN_INFRASTRUCTURE_COMMS = frozenset({
+    "claude",                # セッション本体
+    "node", "npm", "npx",    # MCP サーバーの起動経路 (npm exec / npx 経由で node が実行体になることが多い)
+    "chrome", "chromium",    # Playwright / Chrome DevTools MCP が起動するブラウザ
+    "chrome-headless",       # "chrome-headless-shell" (21 文字) は 15 文字で切り詰まる
+    "google-chrome",
+})
+
+
+def _proc_stat(pid: int) -> Optional[tuple[int, int, str]]:
+    """/proc/<pid>/stat から (ppid, starttime_ticks, comm) を返す。
 
     消滅 (`FileNotFoundError` / `ProcessLookupError` = ENOENT/ESRCH) だけを
     None として扱う — この pid はもう居ない、という確定した事実だからである。
@@ -48,8 +83,8 @@ def _proc_stat(pid: int) -> Optional[tuple[int, int]]:
     呼び出し側は「わからない」を "unknown" として扱うこと (fail-direction は
     呼び出し側の判定ごとに決まる。lib 自身は判定しない)。
 
-    comm (field 2) は括弧で囲まれ、空白や ')' を含みうるので最後の ')' で
-    切ってから split する (例: "1234 (sh -c (x)) S 1 ..." )。
+    comm (field 2) は括弧で囲まれ、空白や ')' を含みうるので最初の '(' と
+    最後の ')' で括り出す (例: "1234 (sh -c (x)) S 1 ..." )。
     切った残りの先頭が field 3 なので、field N は rest[N - 3] になる:
       ppid = field 4 = rest[1] / starttime = field 22 = rest[19]
     """
@@ -57,36 +92,21 @@ def _proc_stat(pid: int) -> Optional[tuple[int, int]]:
         raw = Path(f"/proc/{pid}/stat").read_text()
     except (FileNotFoundError, ProcessLookupError):
         return None
-    close = raw.rfind(")")
-    if close < 0:
+    open_paren = raw.find("(")
+    close_paren = raw.rfind(")")
+    if open_paren < 0 or close_paren < 0 or close_paren <= open_paren:
         return None
-    rest = raw[close + 1:].split()
+    comm = raw[open_paren + 1:close_paren]
+    rest = raw[close_paren + 1:].split()
     if len(rest) < 20:
         return None
     try:
-        return int(rest[1]), int(rest[19])
+        return int(rest[1]), int(rest[19]), comm
     except ValueError:
         return None
 
 
-def _boot_epoch() -> Optional[float]:
-    """壁時計 (epoch 秒) と /proc の starttime (tick) を結びつける起動時刻を返す。
-
-    `/proc/uptime` の起動からの経過秒を `time.time()` から引くだけ。読めなければ
-    None (呼び出し側は `min_start_epoch` を無視して従来どおりの判定にフォールバックする)。
-    """
-    try:
-        uptime_seconds = float(Path("/proc/uptime").read_text().split()[0])
-    except (OSError, ValueError, IndexError):
-        return None
-    return time.time() - uptime_seconds
-
-
-def classify_process_tree(
-    root_pid: int,
-    grace_seconds: Optional[int] = None,
-    min_start_epoch: Optional[float] = None,
-) -> ProcessSignal:
+def classify_process_tree(root_pid: int) -> ProcessSignal:
     """mux ペインのプロセス木を 3 値に分類する。
 
     本番のペインは常にこの形をしている (2026-09-21 実測, Ren-worker):
@@ -97,48 +117,29 @@ def classify_process_tree(
             npm exec chrome-devtools   ← 同上
             /bin/bash -c source ...    ← Bash tool の実行中だけ現れる
 
-    旧実装の `pgrep -P <pane_pid>` は常に claude 1 件を返すため「子プロセスが
-    居る = 作業中」が恒真になり、idle 判定に一度も到達しなかった。ここでは
-    **いつ生えたか** で区別する:
+    旧実装 (t016) の `pgrep -P <pane_pid>` は常に claude 1 件を返すため「子
+    プロセスが居る = 作業中」が恒真になり、idle 判定に一度も到達しなかった。
+    続く実装 (t016 → t049) は「いつ生えたか」(session_start からの経過時間 /
+    assignment file の mtime との比較) で区別していたが、時刻はしょせん代理
+    指標であり、どちらの向きにも穴が残った (モジュール docstring 参照)。
 
-      "executing"    … セッション起動から grace_seconds より後に始まった子孫が
-                       居る = Bash tool が今まさに走っている。長時間のビルド /
-                       学習 / CI 待ちで activity が stale になる正当なケース
-      "idle_process" … claude と MCP サーバーだけ。木が有ること自体は
-                       「働いている」の証拠にならない
+    ここでは **そのプロセスが何であるか** (comm) で区別する:
+
+      "executing"    … シェル (Bash tool の実行) か、同定できない子孫が居る
+                       = job が走っている (と見なす)
+      "idle_process" … セッション本体・MCP サーバー・その子孫 (既知インフラ)
+                       だけ。木が有ること自体は「働いている」の証拠にならない
       "no_process"   … 子が 1 つも無い (claude が落ちた / 素のシェル)
+      "unknown"      … 途中の pid が「消滅」以外の理由で読めず、同定できない
+                       (t049 族A監査。terminate 側の抑制材料としては効くが、
+                       Rule 5 は「観測できない → 通知する」に倒す)
 
-    基準時刻は **最も古い直下の子 (= claude) の起動時刻** にする。root 自身では
-    なく子を基準にするのは、ペインの bash が Worker より先に (crewvia 起動時に)
-    生まれていることがあり、それを基準にすると claude の起動自体が "executing"
-    に見えてしまうからである。深さは問わないので、ペイン直下に後から生えた
-    プロセスも拾える。
-
-    起動時刻は /proc の starttime (boot からの tick) 同士で比較する。壁時計に
-    依存しないので、NTP 補正やサスペンドの影響を受けない。
-
-    ## t049 (Codex review, PR#238 P2): grace_seconds だけでは区別できない窓
-
-    `session_start` から `grace_seconds` 以内に始まった子孫は、それが MCP サーバー
-    由来 (無視してよい) か、着手直後に投げた本物の裏 job (無視してはいけない) か
-    を、開始時刻の絶対値だけでは区別できない — 両方とも claude 起動の数秒後に
-    生まれうる。しきい値を伸ばしても縮めても同じ形の穴が残る (`grace_seconds` の
-    枠内で始まった job は、生きている間ずっと `idle_process` のまま)。
-
-    `min_start_epoch` はこれを**別の根拠**で区別するためのオプション引数。
-    呼び出し側が「今の task の作業がいつから有効か」を示す壁時計時刻 (例:
-    assignment file の mtime) を渡すと、それ以降に始まった子孫は
-    `session_start` からの経過が `grace_seconds` の枠内でも無条件で "executing"
-    になる。assignment file は必ず「今の task の作業が始まるより前」に書かれるので
-    (`plan.sh pull` が書いてから Worker が動き出す)、以降に生える子孫は今の task
-    由来と確定できる — MCP サーバーは task の割り当てより前 (セッション起動直後)
-    に立ち上がっているので誤って拾わない。
-
-    比較には壁時計 (`min_start_epoch`) を 1 箇所だけ混ぜるため、`_boot_epoch()`
-    の読み取り誤差 (数十 ms) の分だけ従来の tick 同士の比較より粗くなるが、
-    比較対象が秒単位の `grace_seconds` なので実用上無視できる。`min_start_epoch`
-    を渡さない (または `_boot_epoch()` が読めない) 呼び出しは、従来どおり
-    tick 同士の比較だけで判定する。
+    親の分類 (job / infra) は子に伝播する: シェルの子孫はすべて job (シェルが
+    起動した実体の一部)。既知インフラの子孫はシェルに当たるまで infra
+    (Playwright MCP が起動するブラウザ等)。ルート直下 (親の分類が無い) で
+    既知インフラでもシェルでもない場合は job 側に倒す (族C: 未知の永続
+    プロセスを infra と誤認して黙り続けるより、job 扱いして 1 回余計に
+    通知する方が安い)。
     """
     try:
         root_stat = _proc_stat(root_pid)
@@ -149,7 +150,7 @@ def classify_process_tree(
     if root_stat is None:
         return "no_process"
 
-    procs: dict[int, tuple[int, int]] = {}
+    procs: dict[int, tuple[int, int, str]] = {}
     try:
         proc_entries = list(Path("/proc").iterdir())
     except OSError:
@@ -170,50 +171,38 @@ def classify_process_tree(
             procs[int(entry.name)] = st
 
     children: dict[int, list[int]] = {}
-    for pid, (ppid, _) in procs.items():
+    for pid, (ppid, _, _) in procs.items():
         children.setdefault(ppid, []).append(pid)
 
     direct = children.get(root_pid, [])
     if not direct:
         return "no_process"
 
-    ticks_per_sec = os.sysconf("SC_CLK_TCK") or 100
-    # None = 既定。呼び出し時に読む (定義時に束縛すると、モジュール定数を差し替える
-    # e2e / テストが効かない)。
-    if grace_seconds is None:
-        grace_seconds = PROCESS_WORK_START_GRACE
-    threshold_ticks = grace_seconds * ticks_per_sec
-    session_start = min(procs[pid][1] for pid in direct)
-
-    # t049 (P2): min_start_epoch を tick に変換しておく。boot_epoch が読めなければ
-    # 素通し (None のまま) — 従来どおり grace_seconds だけで判定する。
-    min_start_ticks: Optional[int] = None
-    if min_start_epoch is not None:
-        boot_epoch = _boot_epoch()
-        if boot_epoch is not None:
-            candidate = int((min_start_epoch - boot_epoch) * ticks_per_sec)
-            # t049 族C監査: 負 (= assignment が「起動より前」に見える。壁時計の
-            # ずれ・古い assignment が起動を跨いで残った場合に起こりうる) を
-            # そのまま使うと、あらゆる tick 値が無条件に閾値以上になり、下の
-            # ループが MCP サーバーまで含めて全部 "executing" と誤読する —
-            # このガード自身が壊れた状態を「常に検知した」に倒してしまう。
-            # 負のときは判定材料として使わない (min_start_epoch を渡さなかった
-            # ときと同じ、grace_seconds だけの判定にフォールバックする)。
-            if candidate >= 0:
-                min_start_ticks = candidate
-
-    # root 配下を幅優先で走査 (root 自身は含めない)
-    stack = list(direct)
+    # root 配下を幅優先で走査 (root 自身は含めない)。親の分類を子に伝播するので
+    # 深さ順 (親を先に処理) で回す必要がある — キューを使う (スタックだと深さ
+    # 優先になり、子が親より先に処理される場合がある)。
+    queue: deque[tuple[int, Optional[str]]] = deque(
+        (pid, None) for pid in direct)
     seen: set[int] = set()
-    while stack:
-        pid = stack.pop()
+    while queue:
+        pid, parent_origin = queue.popleft()
         if pid in seen:
             continue
         seen.add(pid)
-        if procs[pid][1] - session_start > threshold_ticks:
+        comm = procs[pid][2]
+        if comm in _SHELL_COMMS:
+            origin = "job"
+        elif parent_origin == "job":
+            origin = "job"
+        elif comm in _KNOWN_INFRASTRUCTURE_COMMS:
+            origin = "infra"
+        else:
+            # 同定できない (シェルでも既知インフラでもない、親も infra) —
+            # job 側に倒す (族C: モジュール docstring 参照)。
+            origin = "job"
+        if origin == "job":
             return "executing"
-        if min_start_ticks is not None and procs[pid][1] >= min_start_ticks:
-            return "executing"
-        stack.extend(children.get(pid, []))
+        for child in children.get(pid, []):
+            queue.append((child, origin))
 
     return "idle_process"

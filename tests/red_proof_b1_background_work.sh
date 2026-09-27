@@ -14,10 +14,17 @@
 #   H  watchdog: 裏の job があると max も効かなくなる                              → 赤
 #   I  watchdog: 裏の job があっても hard idle を terminate にする                 → 赤
 #   J  dispatcher に /proc を読む分類のコピーが生える                              → 赤
-#   K  分類: grace_seconds の枠内で始まった裏 job を assignment mtime で拾わない (t049 P2) → 赤
 #   L  テスト: pane tree の teardown が group ごとでなく root だけになる (t049 P3)   → 赤
-#   M  分類: 読めない pid を静かに「子孫なし」へ倒す (t049 族A監査)              → 赤
-#   N  分類: min_start_epoch が起動より前に見えても閾値として使ってしまう (t049 族C監査) → 赤
+#   M  分類: 読めない pid を静かに「子孫なし」へ倒す (族A監査)                    → 赤
+#   O  分類 (t065 P2 2巡目): シェルを job と同定しない                            → 赤
+#   P  分類 (t065 族C監査): 同定できない永続プロセスを infra 側に倒してしまう      → 赤
+#
+# t049 の時刻ベースの判定 (grace_seconds の枠内で始まった裏 job を assignment mtime
+# で拾う仕組み。旧 case K/N) は t065 でプロセスの同定に置き換えられ、丸ごと撤去した
+# (Codex review 2巡目: 時刻を代理指標にする限り、plan.sh pull の後で初めて起動する
+# MCP サーバー / ブラウザを本物の job と区別できず、偽陰性 [本当に止まっているのに
+# 気付けない] が残るため)。この赤の実証は消えたコードを再現できないので K/N は削除、
+# 代わりに O/P で同定ベースの欠陥を実証する。
 #
 # 隔離: 使い捨ての複製で欠陥を注入する。本番の worktree のファイルには触らない。
 # pytest は FakeMux / 隔離した queue・registry と本物の sh の親子木で動き、
@@ -80,14 +87,14 @@ else ng "baseline が緑でない"; echo "$out" | tail -8; fi
 
 echo "== case A: 裏の job があっても idle-with-task を通知する"
 fresh_copy
-inject scripts/dispatcher.sh "    if st in ('idle', 'done') and assignment_file.exists() and worker_has_background_work(target, assignment_file):" \
+inject scripts/dispatcher.sh "    if st in ('idle', 'done') and assignment_file.exists() and worker_has_background_work(target):" \
                              "    if False:"
 expect_red "case A" "test_a_live_background_job_is_not_idle_with_task" "${B1_TESTS[@]}"
 
 echo "== case B: 裏の job が無い pane も「裏の job あり」と読む"
 fresh_copy
-inject scripts/dispatcher.sh "        return classify_process_tree(pane_pid, min_start_epoch=min_start_epoch) == 'executing'" \
-                             "        return classify_process_tree(pane_pid, min_start_epoch=min_start_epoch) != 'no_process'"
+inject scripts/dispatcher.sh "        return classify_process_tree(pane_pid) == 'executing'" \
+                             "        return classify_process_tree(pane_pid) != 'no_process'"
 expect_red "case B" "test_the_same_pane_without_a_background_job_is_still_notified" "${B1_TESTS[@]}"
 
 echo "== case C: 分類が例外のとき黙る側に倒す"
@@ -108,30 +115,24 @@ expect_red "case D" "test_unobservable_pane_pid_falls_to_the_notifying_side" "${
 
 echo "== case E: blocked も裏の job があれば黙らせる"
 fresh_copy
-inject scripts/dispatcher.sh "    if st in ('idle', 'done') and assignment_file.exists() and worker_has_background_work(target, assignment_file):" \
-                             "    if st in ('idle', 'done', 'blocked') and assignment_file.exists() and worker_has_background_work(target, assignment_file):"
+inject scripts/dispatcher.sh "    if st in ('idle', 'done') and assignment_file.exists() and worker_has_background_work(target):" \
+                             "    if st in ('idle', 'done', 'blocked') and assignment_file.exists() and worker_has_background_work(target):"
 expect_red "case E" "test_blocked_is_still_notified_with_a_background_job" "${B1_TESTS[@]}"
 
 echo "== case F: 裏の job 中に grace を測り直さない"
 fresh_copy
 # 'working' への読み替えをやめ、裏の job があるあいだは単に return する (state entry を触らない)
-inject scripts/dispatcher.sh "worker_has_background_work(target, assignment_file):
+inject scripts/dispatcher.sh "worker_has_background_work(target):
         st = 'working'" \
-                             "worker_has_background_work(target, assignment_file):
+                             "worker_has_background_work(target):
         return"
 expect_red "case F" "test_a_background_job_restarts_the_grace_and_clears_the_dedup_key" "${B1_TESTS[@]}"
 
 echo "== case G: 分類が裏の job を executing と読まない"
 fresh_copy
-# t049 (P2) で "executing" の return が 2 か所になった (session_start 基準と
-# min_start_ticks 基準)。両方を idle_process に潰して初めて「classify_process_tree が
-# 一切 executing を返さない」欠陥になる。
-inject scripts/lib_pane_process.py 'if procs[pid][1] - session_start > threshold_ticks:
-            return "executing"' 'if procs[pid][1] - session_start > threshold_ticks:
-            return "idle_process"'
-inject scripts/lib_pane_process.py 'if min_start_ticks is not None and procs[pid][1] >= min_start_ticks:
-            return "executing"' 'if min_start_ticks is not None and procs[pid][1] >= min_start_ticks:
-            return "idle_process"'
+inject scripts/lib_pane_process.py '        if origin == "job":
+            return "executing"' '        if origin == "job":
+            pass'
 expect_red "case G (dispatcher)" "test_a_live_background_job_is_not_idle_with_task" "${B1_TESTS[@]}"
 expect_red "case G (watchdog)"   "test_watchdog_does_not_terminate_a_worker_with_a_live_background_job" "${B1_TESTS[@]}"
 
@@ -157,13 +158,6 @@ _PROC_COPY = '/proc/self/stat'
 "
 expect_red "case J" "test_watchdog_and_dispatcher_share_one_classifier" "${B1_TESTS[@]}"
 
-echo "== case K (t049 P2): grace_seconds の枠内で始まった裏 job を assignment mtime で拾わない"
-fresh_copy
-inject scripts/lib_pane_process.py '        if min_start_ticks is not None and procs[pid][1] >= min_start_ticks:
-            return "executing"
-' ''
-expect_red "case K" "test_a_job_started_within_the_grace_window_is_caught_via_assignment_mtime" "${B1_TESTS[@]}"
-
 echo "== case L (t049 P3): pane tree の teardown が group ごとでなく root だけになる"
 fresh_copy
 inject tests/test_background_work_is_not_idle.py '    try:
@@ -174,7 +168,7 @@ inject tests/test_background_work_is_not_idle.py '    try:
     proc.wait()'
 expect_red "case L" "test_kill_pane_tree_leaves_no_orphans_behind" "${B1_TESTS[@]}"
 
-echo "== case M (t049 族A監査): 読めない pid を静かに『子孫なし』へ倒す"
+echo "== case M (族A監査): 読めない pid を静かに『子孫なし』へ倒す"
 fresh_copy
 inject scripts/lib_pane_process.py '        try:
             st = _proc_stat(int(entry.name))
@@ -191,11 +185,22 @@ inject scripts/lib_pane_process.py '        try:
             procs[int(entry.name)] = st'
 expect_red "case M" "test_an_unreadable_intermediate_pid_falls_to_unknown_not_idle" "${B1_TESTS[@]}"
 
-echo "== case N (t049 族C監査): min_start_epoch が起動より前に見えても閾値として使ってしまう"
+echo "== case O (t065 P2 2巡目): 既知インフラの comm 一覧から node が抜け、MCP を job と誤読する"
 fresh_copy
-inject scripts/lib_pane_process.py '            if candidate >= 0:
-                min_start_ticks = candidate' '            min_start_ticks = candidate'
-expect_red "case N" "test_a_stale_min_start_epoch_before_boot_does_not_force_executing" "${B1_TESTS[@]}"
+inject scripts/lib_pane_process.py '    "claude",                # セッション本体
+    "node", "npm", "npx",    # MCP サーバーの起動経路 (npm exec / npx 経由で node が実行体になることが多い)' \
+                             '    "claude",                # セッション本体
+    "npm", "npx",    # MCP サーバーの起動経路 (npm exec / npx 経由で node が実行体になることが多い)'
+expect_red "case O" "test_a_late_starting_mcp_browser_does_not_suppress_rule_5_forever" "${B1_TESTS[@]}"
+
+echo "== case P (t065 族C監査): 同定できない永続プロセスを infra 側に倒してしまう"
+fresh_copy
+inject scripts/lib_pane_process.py '        else:
+            # 同定できない (シェルでも既知インフラでもない、親も infra) —
+            # job 側に倒す (族C: モジュール docstring 参照)。
+            origin = "job"' '        else:
+            origin = "infra"'
+expect_red "case P" "test_an_unidentified_persistent_process_is_treated_as_a_job_not_infra" "${B1_TESTS[@]}"
 
 echo
 echo "Results: PASS=$PASS FAIL=$FAIL"

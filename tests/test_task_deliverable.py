@@ -296,6 +296,108 @@ class TestCheckDeliverable:
         assert len(fails) == 1 and "boom" in fails[0], fails
 
 
+# ---------------------------------------------------------------------------
+# 3b. コメント付きヘッダが宣言を隠す/誤った skill に付く (2 巡目 t057→t059、PR#236 P2)
+# ---------------------------------------------------------------------------
+
+class TestCommentedHeadersDoNotHideOrMisassignCapabilities:
+    """欠陥版 (手書きの行パーサ) に戻すと、これらは黙って `pr` を通してしまう
+    (このクラスのテストが赤になる)。本物の YAML パーサに切り替えて構造ごと直した。
+    """
+
+    def _caps(self, tmp_path, content):
+        path = tmp_path / "skill-permissions.yaml"
+        path.write_text(content)
+        caps, problem = lint_plan._load_deliverable_capabilities(str(path))
+        assert problem is None, problem
+        return caps
+
+    def test_a_commented_skill_header_still_yields_its_own_declaration(self, tmp_path):
+        """(1) `research: # read only` のようなコメント付き skill ヘッダ。"""
+        caps = self._caps(tmp_path, (
+            "skills:\n"
+            "  code:\n    allow: []\n    deny: []\n"
+            "  research: # read only\n"
+            "    can_produce_deliverable: false\n    allow: []\n    deny: []\n"
+        ))
+        assert caps.get("research") is False
+        assert "code" not in caps
+
+    def test_a_commented_parent_skills_header_still_starts_the_skills_section(self, tmp_path):
+        """(2) `skills: # permissions` のようなコメント付き親ヘッダ。"""
+        caps = self._caps(tmp_path, (
+            "skills: # permissions\n"
+            "  research:\n    can_produce_deliverable: false\n    allow: []\n    deny: []\n"
+        ))
+        assert caps.get("research") is False
+
+    def test_a_capability_after_a_commented_header_is_not_misassigned_to_the_previous_skill(self, tmp_path):
+        """(3) コメント付きヘッダの後で capability が前の skill に付く誤り。
+
+        欠陥版は `research: # read only` を「ヘッダでも他の何行でもない」として読み飛ばし、
+        直後の `can_produce_deliverable: false` を直前の skill (`code`) の欄として拾ってしまう —
+        `code` (実際は書いていない) が false になり、`research` 自身の false は失われる。
+        """
+        caps = self._caps(tmp_path, (
+            "skills:\n"
+            "  code:\n    allow: []\n    deny: []\n"
+            "  research: # read only\n"
+            "    can_produce_deliverable: false\n    allow: []\n    deny: []\n"
+            "  review:\n    can_produce_deliverable: false\n    allow: []\n    deny: []\n"
+        ))
+        assert "code" not in caps, "code は宣言していないので辞書に載ってはいけない (誤って前の skill に付いた)"
+        assert caps.get("research") is False
+        assert caps.get("review") is False
+
+    def test_a_quoted_string_value_is_rejected_not_coerced(self, tmp_path):
+        """引用符付きの値 (`can_produce_deliverable: "false"`) — 拒否される (文字列のまま)。"""
+        caps = self._caps(tmp_path, (
+            'skills:\n  research:\n    can_produce_deliverable: "false"\n    allow: []\n    deny: []\n'
+        ))
+        assert caps.get("research") not in (True, False)
+
+    def test_a_flow_style_value_is_read_as_a_real_boolean(self, tmp_path):
+        """フロースタイル (`research: {can_produce_deliverable: false}`) — 真偽値として通る。"""
+        caps = self._caps(tmp_path, "skills:\n  research: {can_produce_deliverable: false}\n")
+        assert caps.get("research") is False
+
+    def test_regression_t055_whitespace_and_list_values_still_fail(self, tmp_path):
+        """(4) t055 が直した空白入り値・リスト値の回帰防止。"""
+        for raw in ("not a boolean", "[false, true]"):
+            path = tmp_path / f"p-{abs(hash(raw))}.yaml"
+            path.write_text(f"skills:\n  research:\n    can_produce_deliverable: {raw}\n")
+            caps, problem = lint_plan._load_deliverable_capabilities(str(path))
+            assert problem is None
+            assert caps.get("research") not in (True, False), raw
+
+    @pytest.mark.parametrize("skills_value", [[], None])
+    def test_regression_t055_empty_or_missing_skills_still_fail_the_lint(self, tmp_path, skills_value):
+        """(5) t055 が直した `skills: []` と `skills` 欠落の回帰防止 (check_deliverable 経由)。"""
+        meta = {"id": "t001", "title": "x", "status": "pending", "priority": "high", "deliverable": "pr"}
+        if skills_value is not None:
+            meta["skills"] = skills_value
+        perms = _perms(tmp_path, PERMS)
+        fails = _fails(lint_plan.check_deliverable([meta], perms))
+        assert len(fails) == 1 and "skills" in fails[0], fails
+
+    def test_a_skill_whose_value_is_not_a_mapping_makes_the_whole_load_unreadable(self, tmp_path):
+        """1 skill の形が壊れているだけで、他の skill も含め config 全体を「読めない」にする
+        (壊れた 1 件だけを黙って飛ばすと、その skill が絡む判定が気付かれずに緩む方向へ倒れる)。
+        """
+        path = tmp_path / "skill-permissions.yaml"
+        path.write_text("skills:\n  research: not-a-mapping\n  code:\n    can_produce_deliverable: true\n")
+        caps, problem = lint_plan._load_deliverable_capabilities(str(path))
+        assert caps == {} and problem is not None
+
+    def test_without_pyyaml_the_config_is_unreadable_not_permissively_empty(self, tmp_path, monkeypatch):
+        """PyYAML が無い環境向けの簡易フォールバックは意図的に持たない — 「読めない」に倒す。"""
+        monkeypatch.setattr(lint_plan, "yaml", None)
+        path = tmp_path / "skill-permissions.yaml"
+        path.write_text("skills:\n  research:\n    can_produce_deliverable: false\n")
+        caps, problem = lint_plan._load_deliverable_capabilities(str(path))
+        assert caps == {} and problem is not None and "PyYAML" in problem
+
+
 class TestMissionMark:
     def _write(self, tmp_path, text):
         d = tmp_path / "missions" / "m"

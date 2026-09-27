@@ -17,6 +17,11 @@ import re
 import sys
 from typing import Optional
 
+try:
+    import yaml
+except ImportError:
+    yaml = None
+
 
 # ---------------------------------------------------------------------------
 # YAML helpers (minimal — mirrors plan.sh's parse_yaml subset)
@@ -365,10 +370,27 @@ VALID_DELIVERABLES = ('pr', 'file', 'none')
 #: 成果物 (PR / file) を宣言した task にだけ、skills との突き合わせが効く。
 DELIVERABLES_THAT_NEED_A_WRITER = ('pr', 'file')
 
-#: 値部分は行末までまるごと取る (`[^#\s]*` は空白を含む値 — `not a boolean` や
-#: `[false, true]` — で行全体にマッチせず、欄が「無い」ものとして読み飛ばされていた)。
-#: インラインコメントは値を取り出した後に文字列として切り落とす。
-_CAPABILITY_LINE = re.compile(r'^    can_produce_deliverable:\s*(.*)$')
+#: `can_produce_deliverable` は厳密に小文字の `true` / `false` だけを真偽値として認める
+#: (1 巡目 t055 の後も、2 巡目 (t057→t059) でコメント付きヘッダが `current` を前の skill の
+#: まま残す形で同じ族が再発した — この欄をこれ以上正規表現の手当てで直さない。以後は本物の
+#: YAML パーサ (PyYAML) で読む)。既定の YAML 1.1 bool resolver は `yes` / `no` / `on` / `off` /
+#: `True` / `FALSE` 等も暗黙に真偽値へ丸め込むが、それは「はっきりしない綴り」を黙って
+#: true/false のどちらかに倒す挙動であり、この欄が守りたい性質 (曖昧な値は「不正」として
+#: 拒否し、既定の「作れる」側へは絶対に倒さない) と衝突する。resolver を差し替えて対象を
+#: 狭める (引用符付きの値は元々 resolver の対象外 — 常に文字列なので影響しない)。
+#: `yaml.SafeLoader` のサブクラスで、コンストラクタは何も足さない (`!!python/object` 等の
+#: 任意型構築は不可能なまま) — 下の `yaml.load(..., Loader=_StrictBoolLoader)` は
+#: `yaml.safe_load` と同じ安全性で、resolver だけを差し替えている。
+if yaml is not None:
+    class _StrictBoolLoader(yaml.SafeLoader):
+        pass
+
+    _StrictBoolLoader.yaml_implicit_resolvers = {
+        first: [r for r in resolvers if r[0] != 'tag:yaml.org,2002:bool']
+        for first, resolvers in yaml.SafeLoader.yaml_implicit_resolvers.items()
+    }
+    _StrictBoolLoader.add_implicit_resolver(
+        'tag:yaml.org,2002:bool', re.compile(r'^(?:true|false)$'), list('tf'))
 
 
 def _load_deliverable_capabilities(skill_permissions_path: str) -> tuple[dict, Optional[str]]:
@@ -379,33 +401,50 @@ def _load_deliverable_capabilities(skill_permissions_path: str) -> tuple[dict, O
     `flase` と書き間違えたスキルを「作れる」にも「作れない」にも黙って倒さないため)。
     空白を含む値 (文字列・リスト表記など) や空値も、欄自体は「ある」ものとして拾い、
     不正な値の文字列として返す (欄の有無と値の妥当性を別に扱う)。
+
+    構造 (`skills:` セクション・各 skill・その下の欄) は本物の YAML パーサで読む。**PyYAML が
+    無い環境では読めない扱いにする** (この欄専用の簡易フォールバックは書かない — 簡易パーサを
+    書くたびにコメント・引用符・フロースタイルのどれかを見落として同じ族の欠陥を作ってきたため。
+    `pip install pyyaml` は CI にも既定で入っている)。パーサが構造を理解できなかった (トップ
+    レベルがマッピングでない・`skills` がマッピングでない・ある skill の値がマッピングでない)
+    場合も、その skill だけを飛ばさず **読み込み全体を「読めない」として拒否する** (「宣言が
+    無い」と「読めない」は別の状態 — 既定の「作れる」に静かに倒さない)。
     """
     try:
         with open(skill_permissions_path, encoding='utf-8') as f:
             content = f.read()
     except (OSError, UnicodeDecodeError) as e:
         return {}, f"{skill_permissions_path}: {type(e).__name__}: {e}"
+
+    if yaml is None:
+        return {}, (f"{skill_permissions_path}: PyYAML が無いため読めません "
+                     f"(この欄専用の簡易パーサは意図的に持たない — pip install pyyaml)")
+
+    try:
+        data = yaml.load(content, Loader=_StrictBoolLoader)
+    except yaml.YAMLError as e:
+        return {}, f"{skill_permissions_path}: YAML を解釈できません ({e})"
+
+    if not isinstance(data, dict):
+        return {}, f"{skill_permissions_path}: トップレベルがマッピングではありません ({type(data).__name__})"
+    skills = data.get('skills')
+    if skills is None:
+        return {}, None                      # `skills:` セクション自体が無い = 宣言 0 件
+    if not isinstance(skills, dict):
+        return {}, f"{skill_permissions_path}: 'skills' がマッピングではありません ({type(skills).__name__})"
+
     caps: dict = {}
-    in_skills = False
-    current: Optional[str] = None
-    for line in content.splitlines():
-        if re.match(r'^skills:\s*$', line):
-            in_skills = True
+    for name, entry in skills.items():
+        if not isinstance(name, str):
+            return {}, f"{skill_permissions_path}: skills の下に文字列でないキーがあります ({name!r})"
+        if entry is None:
+            continue                         # 空のスキル定義。宣言なしと同じ
+        if not isinstance(entry, dict):
+            return {}, f"{skill_permissions_path}: skill {name!r} の値がマッピングではありません ({type(entry).__name__})"
+        if 'can_produce_deliverable' not in entry:
             continue
-        if not in_skills:
-            continue
-        m = re.match(r'^  ([a-zA-Z_][a-zA-Z0-9_-]*):\s*$', line)
-        if m:
-            current = m.group(1)
-            continue
-        if line and not line.startswith(' ') and not line.startswith('#'):
-            in_skills = False
-            current = None
-            continue
-        cm = _CAPABILITY_LINE.match(line)
-        if cm and current is not None:
-            raw = re.sub(r'\s*#.*$', '', cm.group(1)).strip()
-            caps[current] = {'true': True, 'false': False}.get(raw, raw)
+        raw = entry['can_produce_deliverable']
+        caps[name] = raw if isinstance(raw, bool) else str(raw)
     return caps, None
 
 

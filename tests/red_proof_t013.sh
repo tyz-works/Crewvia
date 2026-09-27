@@ -110,7 +110,9 @@ expect_red "case G" "test_an_unreadable_config_is_a_fail_not_a_pass"
 
 echo "== case H: 不正な can_produce_deliverable を False に倒す"
 fresh_copy
-inject scripts/lint_plan.py "{'true': True, 'false': False}.get(raw, raw)" "{'true': True, 'false': False}.get(raw, False)"
+inject scripts/lint_plan.py \
+"caps[name] = raw if isinstance(raw, bool) else str(raw)" \
+"caps[name] = raw if isinstance(raw, bool) else False"
 expect_red "case H" "test_a_malformed_capability_is_a_fail_not_silently_true_or_false"
 
 echo "== case I: mission.yaml が読めないのを「印なし」に潰す"

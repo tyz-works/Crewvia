@@ -70,8 +70,44 @@ lib ごとの**破ってはいけない契約**の要約。理由・経緯・全
 
 - `fail` は `--head <sha>`（実在する commit）必須、免除は `--no-head "<理由>"`。`handoff_path` は**絶対パスのみ**。
 - `done` は `--pr <N>` か `--no-pr "<理由>"` のどちらかが要る場合がある（後続の codex-review に pr_number が無いとき）。
+- task の成果物は `deliverable: pr|file|none`（`add` / `update --deliverable`）。`done` は `deliverable: pr` に `--pr` / `--no-pr` を求める。
+  lint は `hooks/lib_skill_perms.py` の `check_permission()` を task の skills で直接呼び、Write/Edit/(`pr` なら) `git push` が
+  実際に拒否されないかで突き合わせる（`lint_plan.py` にスキル名を書かない。`can_produce_deliverable` は宣言のみで判定には使わない — t088）。
+  必須化は `init` が mission.yaml に書く `deliverable_required: true` の mission だけ（`knowledge/assignment-routing.md` §6）。
 - 引数は厳格（未知の option は exit 2 で何も書かない）。`pull` だけ使い方の誤りが exit 1（exit 2 は「タスクなし」）。
 - queue を書き換えるサブコマンドの後、`registry/task-graph/tasks.json` を再生成する（`CREWVIA_TASK_GRAPH=0` で停止）。
+
+## 起動（`start.sh` / `lib_trust.py`）
+
+- mux モードの start.sh は、claude を起動する**前**に `lib_trust.py check <cwd>` で trust を検査する。未信頼（10）・確認不能（11）・
+  検査自体の異常終了は**すべて止める**（exit 1。「読めない」を「信頼済み」にしない）。`~/.claude.json` は書き換えない。
+  拒否は端末と `logs/start-sh/refusals.log` の両方に出す（`_log_refusal`）。副作用より前に置く。
+- kickoff 前後の最後の網（`lib_trust.py dialog`）が、`❯`（ダイアログの選択カーソルでもある）を入力行と誤認する穴を塞ぐ。
+  ダイアログの文言の定義は `lib_trust.py` の 1 箇所。戻し方は `knowledge/file-map.md`「lib_trust.py」。
+- `CLAUDE_CONFIG_DIR` は precheck (ambient env) と spawn 先 (`ENV_EXPORTS`) で必ず同じ値にする。設定されて
+  いれば伝播し、未設定なら spawn 先で明示的に `unset`（mux server 側に残る古い値を消す。t051 P1）。
+- `capture()` は「読めなかった」と「画面が本当に空」を区別できず同じ `""` を返す。空画面を「ダイアログ
+  なし」に倒さない — kickoff 送信直前・送信後は `_require_no_trust_dialog`（画面の検査が成功するまで
+  有限回再試行、それでも駄目なら拒否）を使う。プロンプト待ちループ側の `_trust_dialog_check` は緩い網
+  （観測できない間は上位のポーリングに委ねる）で、`CREWVIA_BENCH_MODE=1` はここも対象外にする（t051 P2 / P2x2）。
+- `CLAUDE_CONFIG_DIR` / `HOME` は precheck の**前**に一度だけ絶対パスへ解決する（相対のまま渡すと、
+  precheck (start.sh 自身の cwd 基準) と WORK_DIR へ `cd` してから起動する claude とで基準が変わり、
+  「同じ文字列」でも「同じ解決済みの対象」にならない。t070 P2）。解決できない値はそのまま precheck に
+  委ねる（存在しない dir は lib_trust.py が untrusted として止める。安全側）。
+- LAUNCH_CMD へ値を埋め込むときは必ず `_shq` を通す。自前の `'$var'` 埋め込みは、
+  AGENT_NAME・TARGET_DIR・WORK_DIR のような外部由来の値に `'` が含まれるだけで壊れ、`'; cmd; #` の
+  ような値ならペインでコマンドが追加実行される（t070 P1 シェルインジェクション）。ENV_EXPORTS・
+  `--model` / `--settings` / `--permission-mode` の CLI 引数・`cd`・advisory メッセージまで、
+  埋め込み箇所は全部 `_shq` を通す（族 D）。文字列の形を見るテストは評価時の挙動を保証しない —
+  `tests/start-sh-trust-precheck.bats` は実際に LAUNCH_CMD をスタブ claude で評価するテストを持つ。
+  `_shq` は bash 組み込みの `printf '%q'` を使わない（t089 / PR#237 4巡目 P2-2）: LAUNCH_CMD を
+  実際に評価するのは pane の**設定済みシェル**であり、それが bash である保証はない。`%q` は改行や
+  非 ASCII を `$'...'`（ANSI-C quoting、bash 専用）で出力するが、dash はそれを構文エラーにする。
+  代わりに、値をシングルクォートで囲み中の `'` を `'\''` に置き換える POSIX 互換の方式にした —
+  bash / dash / ash / ksh / zsh のどれでも同じ意味になる（常にクォート付きになる点が旧実装との
+  観測できる違い — `--permission-mode auto` は `--permission-mode 'auto'` になる）。
+  また LAUNCH_CMD 内の `cd $(_shq "$WORK_DIR")` は `claude...` の前を `;` ではなく `&&` でつなぐ
+  （族 A）: `cd` が失敗しても `;` は後続を実行してしまい、**別のディレクトリで Claude が起動する**。
 
 ## worktree_gc.py
 

@@ -55,6 +55,17 @@ registry に居ない名前は作らない。t017 / #14。以前は registry の
 `Mux.spawn()` の `env=` 引数は廃止（渡すと TypeError。env は起動コマンドに
 `export` として埋める）。設計: `knowledge/daemon-authority.md` §7-17、
 `knowledge/assignment-routing.md` §1
+**mux モードでは claude を起動する前に cwd の trust を検査して止める**（t021 / #28。
+`lib_trust.py check`。下記）。信頼されていない cwd では claude の trust ダイアログ
+（既定 `No, exit`）を kickoff の Enter が選んで Worker が即死し、残りの文字列がシェルに落ちた。
+拒否は非 0 で終わり、端末と `logs/start-sh/refusals.log`（1 拒否 1 行。`logs/` は gitignore 済み。
+#18: 以前の start.sh の拒否は端末にしか出なかった）の両方に残る。副作用
+（`crewvia-worker-*.json` / `settings.local.json` / registry の更新）より前なので、拒否した起動は
+何も残さない。kickoff 後の最後の網は `❯` の待機中・送信前・送信後にダイアログの文言を見て、
+出ていれば kickoff を送らず（送った後なら `verified` と言わず）窓を片付けて非 0 で止まる
+（`❯` はダイアログの選択カーソルでもあり、旧実装はそれを Claude の入力行と誤認して
+`Kickoff message sent (verified)` と言っていた）。インラインモード（`exec claude`）と
+`CREWVIA_BENCH_MODE=1` は対象外
 
 ### `plan.sh`
 
@@ -105,6 +116,10 @@ Kai-codex の codex-review が恒久に取れなくなる #13 の再発になる
 `no_pr_waiver` + stderr に残る。`--pr` との併用・空の理由は拒否）。
 `lint_plan.py` は drafting でも `status: blocked`（`blocked_reason` 必須）を受理する
 ので、PR 番号待ちの task は承認前から止めて積める。
+task の成果物は `deliverable: pr|file|none` で宣言し（`plan.sh add/update --deliverable`）、lint は
+`config/skill-permissions.yaml` の `can_produce_deliverable` だけを見て突き合わせる（`lint_plan.py` にスキル名は書かない）。
+必須化は `plan.sh init` が mission.yaml に書く `deliverable_required: true` の mission だけ。`deliverable: pr` の
+task は `done` に `--pr` / `--no-pr` が要る（t013。`knowledge/assignment-routing.md` §6）。
 **`pull` は Director（registry の `role: director`）を拒否する**（`ROLE` env では
 判定しない — dispatcher が spawn する `kai-review.sh` が継承しうる）。
 `needs-director` は呼んだ Worker の `queue/assignments/<name>` を外す
@@ -374,6 +389,103 @@ Worker が起動された `TARGET_DIR` の記録の唯一の定義（t009 / #21�
 答えが割れる）。CLI: `record <registry_dir> <agent> [<target_dir>]` / `show`。
 記録が嘘・無いときは `record` で書き直す（dispatcher は毎サイクル読み直す）。
 設計: `knowledge/assignment-routing.md`
+
+### `lib_trust.py`
+
+claude の trust ダイアログを `start.sh` が踏まないための検査（t021 / #28）。CLI:
+`check <dir>`（信頼済みなら無出力で 0 / 未信頼 10 / 確認不能 11。10 と 11 は端末向けの説明を stdout に出す）と
+`dialog`（stdin の pane capture にダイアログの文言があれば 0 / 無ければ 1 / 読めなければ 2）。
+判定は `~/.claude.json`（`CLAUDE_CONFIG_DIR` があればその下）の
+`projects["<絶対パス>"].hasTrustDialogAccepted`。**cwd 自身と `/` までの祖先のどれかが `true`**
+なら信頼済み（実測: 信頼済みの祖先の配下ではダイアログが出ない）。パスは論理（`cd && pwd`）と
+物理（`realpath`）、それぞれ NFC の形の全部を候補にし、キー側も `normpath` で畳む（正規化は一致を
+見つけやすくするためだけに使う）。`true` は `is True`（`"true"`・`1`・`null` は信頼済みにならない）。
+**倒す向き**: 読めない・JSON でない・形が違う（`projects` が object でない・cwd に関わる記録が bool でない）
+は **確認不能 = 止める**（「読めない」を「信頼済み」に潰さない。進めた場合の被害は Worker の即死と
+シェルへの文字列漏れ、止めた場合の被害は利用者が 1 行直すこと）。ファイルが**無い**（ENOENT）のは
+「何も信頼していない」が事実なので未信頼。**`~/.claude.json` は書き換えない**（trust は利用者の
+判断。止めるときは `! cd <dir> && claude`（Yes を選んで `/exit`）と `jq` の 1 行を出す）。
+読みは `lib_daemon_state.load_json_store`（通常ファイルか・JSON か・object か）。
+最後の網の文言（`Quick safety check` / `Yes, I trust this folder` / 旧版の
+`Do you trust the files in this folder` / 決定の案内と揃った `No, exit`）は claude 2.1.283 の
+バンドルで確認したもので、この 1 箇所にだけある。テスト: `tests/test_trust_precheck.py`（判定の表）・
+`tests/start-sh-trust-precheck.bats`（start.sh 経由）・`tests/red_proof_b6_trust_precheck.sh`。
+fake tmux で start.sh を mux モードで走らせるテストは `tests/trust_fixture.sh` で信頼を宣言する
+（しないと CI（`~/.claude.json` が無い）でだけ落ちる）
+
+**t051 (B6 fix / PR#237 の Codex findings) で直した 3 件**:
+- **P1 (設定の不伝播)**: precheck は `start.sh` プロセスの ambient `CLAUDE_CONFIG_DIR` を読むが、
+  spawn 先のペインは mux server が保持し続ける起動時点の env（`herdr-server-stale-env-inheritance`）
+  を引き継ぐため、precheck が見た設定と実際に起動する claude が読む設定が食い違いうる。`CLAUDE_CONFIG_DIR`
+  が設定されていれば `ENV_EXPORTS` に含めて spawn 先へも伝え、未設定なら spawn 先の起動コマンドで
+  明示的に `unset CLAUDE_CONFIG_DIR`（server 側に残っているかもしれない古い値を消す）。
+- **P2 (読めない画面を「無い」に倒す)**: `capture()` は「pane を読めなかった」ときも「画面が本当に空」
+  なときも同じ `""` を返し区別できない（`Mux.verify_sent` の docstring と同じ理由）。空を「ダイアログ
+  なし」に倒すと、まさに読めなかった側で kickoff の Enter を送ってしまう（この網が本来防ぐはずだった
+  失敗そのもの）。空画面は「観測できない」として扱い、kickoff 送信直前・送信後の網
+  （`_require_no_trust_dialog`）は画面の検査が成功する（rc=0 か rc=1）まで有限回 (3 回) 再試行し、
+  それでも駄目なら拒否する。プロンプト待ちループ側の緩い網（`_trust_dialog_check`）は観測できない間
+  中止せず、上位の 30 回ポーリングに判定を委ねる（起動直後の「まだ何も描画していない」正常系まで
+  拾わないため）。
+- **P2x2 (bench mode の除外漏れ)**: プロンプト待ちループの `_trust_dialog_check` は precheck と同じ
+  `CREWVIA_BENCH_MODE` 除外条件を持たず、bench mode の未信頼 pane まで kill していた。関数の先頭に
+  `[[ "${CREWVIA_BENCH_MODE:-0}" == "1" ]] && return 0` を追加（kickoff 送信直前/後は元から
+  `if BENCH_MODE != 1` ブロックの内側なので対象外だった）。
+
+**t070 (B6 fix 2巡目: Codex review 2巡目の findings) で直した 2 件 + 族 D**:
+- **P1 (シェルインジェクション)**: t051 が追加した `CLAUDE_CONFIG_DIR='${CLAUDE_CONFIG_DIR}'` / `HOME='${HOME}'`
+  を含め、LAUNCH_CMD 全体が生の `'$var'` 埋め込みで組み立てられていた。値に `'` が入るだけで壊れ、
+  `'; cmd; #` のような値ならペインが LAUNCH_CMD を評価したときに追加のコマンドが実行される
+  (AGENT_NAME・TARGET_DIR・WORK_DIR は外部由来で入力しうる)。`_shq()`（自前でクォートを
+  組み立てない）を導入し、ENV_EXPORTS の全変数・`--model` / `--settings` / `--permission-mode` の
+  CLI 引数・`cd`・advisory メッセージ（`_abort_on_trust_dialog` 等）まで、埋め込み箇所を**全部**
+  これに通した（族 D の掃除）。**文字列の形を見るだけのテストは評価時の挙動を保証しない**
+  (Codex 指摘) ので、`tests/start-sh-trust-precheck.bats` は fake tmux に送られた LAUNCH_CMD の
+  実テキストを取り出し、claude の代わりに引数と cwd を書き出すスタブを使って**隔離した bash で
+  実際に評価する**テストを持つ。
+
+**t089 (B6 fix 4巡目: PR#237 Codex 4巡目 P2×2) で直した 2 件**:
+- **P2-1 (trust ダイアログ検出の族B再発)**: t078 は「文言」と「ダイアログの操作構造」を要求したが、
+  画面の**どこからでも独立に**拾っていたため、無関係なパスの文言 (`/tmp/quick safety check` 等) と、
+  無関係な別の権限確認メニューが同じ画面に乗ると誤検出した。`screen_shows_trust_dialog()` は
+  「カーソルが選択肢 1 を指し、その選択肢自身が `Yes, I trust this folder` / `Yes, proceed` である」
+  ことを 1 つの正規表現 (`_TRUST_ACCEPT_OPTION_RE`) でまとめて要求するように直した — 文言と選択肢を
+  独立に探すのではなく、最初から「同じダイアログの枠の中にある」ことを保証する形にした。
+- **P2-2 (`_shq` が bash 専用)**: `_shq()` は `printf '%q'` (bash 組み込み) を使っていたが、
+  LAUNCH_CMD を実際に評価するのは pane の**設定済みシェル**であり、それが bash である保証は無い。
+  `%q` は改行・非 ASCII を `$'...'` (ANSI-C quoting、bash 専用) で出力するが、dash はそれを構文
+  エラーにする。シングルクォート方式 (`'...'`、中の `'` は `'\''`) に変えた — bash / dash のどちらでも
+  同じ意味になる (常にクォート付きになる点が観測できる違い)。あわせて LAUNCH_CMD の
+  `cd $(_shq "$WORK_DIR")` と `claude...` の間を `;` から `&&` にした (族 A): `cd` が失敗しても
+  `;` は後続を実行してしまい、**別のディレクトリで Claude が起動する**。
+  `tests/start-sh-trust-precheck.bats` は `_shq` を start.sh のソースから直接取り出し bash と dash の
+  両方で評価するテストと、`cd` の行き先を送信後に消してから評価し claude が起動しないことを確かめる
+  テストを持つ。
+- **P2 (相対パスの CLAUDE_CONFIG_DIR / HOME)**: precheck は start.sh 自身の cwd を基準に相対パスを
+  開くが、LAUNCH_CMD は WORK_DIR に `cd` してから claude を起動する。相対な `CLAUDE_CONFIG_DIR` /
+  `HOME` を「同じ文字列」のまま渡しても、cd の前後で基準が変わり「同じ解決済みの対象」にはならない
+  (t051 P1 の続き)。`_EFFECTIVE_MUX_ENABLED` 判定の直後、precheck より前 (bench mode でも実行 —
+  ENV_EXPORTS への伝播は bench mode でも起きるため) で一度だけ絶対パスへ解決し、export で上書きする。
+  以降のコード (precheck 本体・ENV_EXPORTS への伝播) は同じ変数を読むだけなので、「同じ解決済みの
+  対象」であることが構造的に保証される (2 箇所で別々に解決して食い違う余地を作らない)。解決できない
+  (存在しない dir 等) ときは元の値のまま precheck に委ねる (安全側: lib_trust.py が untrusted として
+  止める)。
+- **族D の掃除で見送った関連事項**: `crewvia-worker-${AGENT_NAME}.json` のファイル名も `AGENT_NAME` を
+  埋め込むが、これは python heredoc への argv 渡し (シェル文字列への埋め込みではない) なので族D の
+  定義には当たらない。ただし `AGENT_NAME` に `/` や `..` が入ると意図しないパスに書き込みうる、族D に
+  隣接する懸念として見つけたが、AGENT_NAME の形式検証は別スコープ (名前プール / `--name` の入力検証)
+  であり本タスクでは直していない。KICKOFF_MSG は claude 自身の REPL (エージェントの判断 + 承認 hook)
+  へ渡るテキストであり、シェルが自動評価する対象ではないため族D の対象外と判断した。
+
+**戻し方**（誤判定すると Worker / Director の起動が止まる種類の変更。**env の停止スイッチは付けない**:
+trust は利用者の判断で、迂回口を作ると「信頼していない dir で起動して即死」に戻る）:
+(1) 個別に通す — 止められた dir は、表示されたコマンド（`! cd <dir> && claude` で Yes を選ぶか、`jq`
+の 1 行）で信頼を記録すれば通る。claude 自身が出さない dir（git worktree など未知の継承規則）で
+誤って止められた場合も、記録しておけば害は無い（claude が自分で書く値と同じ）。
+(2) 全体を戻す — 該当 PR を revert → 主 checkout を `git merge --ff-only origin/main`。
+`start.sh` は起動のたびに読まれる（dispatcher が pane で起動するときも毎回新しい bash）ので、
+デーモンの再起動（`lib_daemon_watch.py restart`）は要らない。既に走っている Worker には影響しない。
+拒否の記録は `logs/start-sh/refusals.log`（消してよい）
 
 ### `lib_registry.py`
 

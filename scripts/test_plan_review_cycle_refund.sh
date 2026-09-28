@@ -47,6 +47,8 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OWN_CHECKOUT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 PLAN_SH="$OWN_CHECKOUT_ROOT/scripts/plan.sh"
+# shellcheck source=../tests/fixture_tree.sh
+source "$OWN_CHECKOUT_ROOT/tests/fixture_tree.sh"
 
 PASS_COUNT=0
 FAIL_COUNT=0
@@ -86,7 +88,11 @@ _setup() {
   # cmd_review は _load_lint_module() で os.path.dirname(QUEUE_DIR)/scripts/lint_plan.py
   # を動的 import するため、scratch 側にも実ファイルを置く必要がある
   # (lint のロジック自体はこのテストの対象外なので実物をそのまま使う)。
+  # lint_plan.py は自分の位置から lib_task_cards.py を無条件 import する (t072) ので、
+  # lib_* も一緒に写す — 名前で個別に列挙すると lib が増えるたびに CI でだけ赤くなるので
+  # glob でまとめて写す copy_scripts_libs (tests/fixture_tree.sh) を使う。
   cp "$OWN_CHECKOUT_ROOT/scripts/lint_plan.py" "$TMPDIR_TEST/scripts/"
+  copy_scripts_libs "$OWN_CHECKOUT_ROOT" "$TMPDIR_TEST"
   cp -r "$OWN_CHECKOUT_ROOT/config/." "$TMPDIR_TEST/config/"
 
   # lint_mission はタスクが1件も無いミッションを無条件で PASS 扱いにする

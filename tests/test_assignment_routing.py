@@ -516,6 +516,43 @@ class TestDonePr:
         r = sb.run("done", "--help")
         assert r.returncode == 0 and "--pr <N>" in r.stdout
 
+    def test_the_producing_task_itself_keeps_its_own_pr_number(self, sb):
+        """t095 (Codex 8巡目 P2-1、B4 の本題): 成果物を作った task 自身の card にも
+        pr_number が残ること。旧実装は propagate_pr_number() で後続の codex-review /
+        review にだけ書き、成果物を作った側の card には PR への参照が一切残らなかった。
+        """
+        self._mission(sb)
+        _done(sb, "t001", "--pr", "231")
+        assert _pr_line(sb, "t001") == "pr_number: 231"
+
+    def test_it_still_keeps_its_own_number_when_there_are_no_dependents(self, sb):
+        sb.card("t001", status="in_progress", worker="Ren")
+        r = _done(sb, "t001", "--pr", "7")
+        assert r.returncode == 0
+        assert _pr_line(sb, "t001") == "pr_number: 7"
+
+    def test_the_same_pr_number_again_is_idempotent(self, sb):
+        self._mission(sb)
+        sb.card("t001", status="in_progress", worker="Ren", extra=["pr_number: 231"])
+        r = _done(sb, "t001", "--pr", "231")
+        assert r.returncode == 0, (r.stdout, r.stderr)
+        assert _pr_line(sb, "t001") == "pr_number: 231"
+        assert _status(sb, "t001") == "done"
+
+    def test_a_conflicting_pr_number_on_the_task_itself_is_refused(self, sb):
+        """既に (`update --pr-number` 等で) 別の番号が card にある状態で違う番号が --pr で
+        渡されたら、黙って上書きしない (t095 P2-1 の受入条件)。propagate_pr_number() が
+        後続の card を「Director が手で入れた値を上書きしない」のと同じ判断。
+        """
+        self._mission(sb)
+        sb.card("t001", status="in_progress", worker="Ren", extra=["pr_number: 100"])
+        before = sb.snapshot()
+        r = _done(sb, "t001", "--pr", "231")
+        assert r.returncode != 0
+        assert "pr_number" in r.stderr and "100" in r.stderr
+        assert sb.snapshot() == before, "拒否したら何も書かないこと"
+        assert _status(sb, "t001") == "in_progress"
+
 
 class TestDoneRequiresPr:
     """t036: 待っている codex-review があるのに --pr が無い done は、何も書かずに断る。
@@ -652,7 +689,7 @@ class TestLintBlocked:
                                             extra=['blocked_reason: "PR 番号待ち"']))
         import lint_plan
         text = (mdir / "t001.md").read_text()
-        meta, _body = lint_plan._parse_frontmatter(text)
+        meta, _body = lint_plan.lib_task_cards.parse_frontmatter(text)
         assert lint_plan.check_frontmatter([meta]) == []
 
 

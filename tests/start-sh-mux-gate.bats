@@ -25,6 +25,7 @@
 
 REPO_ROOT="$(cd "$(dirname "$BATS_TEST_FILENAME")/.." && pwd)"
 START_SH="${REPO_ROOT}/scripts/start.sh"
+source "$(dirname "$BATS_TEST_FILENAME")/trust_fixture.sh"   # t021: start.sh の trust 事前検査を通す偽の設定
 
 setup_fake_env() {
     FAKE_DIR="$(mktemp -d)"
@@ -80,12 +81,14 @@ FAKESCRIPT
     export FAKE_DIR FAKE_TMUX_LOG FAKE_CLAUDE_LOG
     export PATH="${FAKE_DIR}:${PATH}"
     export CREWVIA_TASKVIA=disabled
+    trust_fixture_setup
     unset CREWVIA_BENCH_MODE
     export AGENT_NAME="GateTest"
     unset CREWVIA_TMUX_SESSION
 }
 
 teardown() {
+    trust_fixture_teardown
     if [[ -n "${FAKE_DIR:-}" && -d "$FAKE_DIR" ]]; then
         find "$FAKE_DIR" -mindepth 1 -delete 2>/dev/null || true
         rmdir "$FAKE_DIR" 2>/dev/null || true

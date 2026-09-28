@@ -116,6 +116,46 @@ Director が codex-review を開く。
 `lint_plan.py` の `VALID_STATUSES` に `blocked` を追加。**`blocked_reason` (空でない文字列) が必須** —
 理由の無い停止は、何を待っているのかが誰にも分からず、`done --pr` のような機械の解除にも任せられない。
 
+### 6. task の成果物の宣言 `deliverable` (t013 / backlog #31)
+
+「PR を作る task に Write 禁止の skill (research / review / planning) を付けた」「PR を作る task が `--pr` を
+付け忘れた」を、**スキル名からの推測ではなく task の宣言**で落とす。
+
+- **宣言**: card の frontmatter `deliverable: pr | file | none`（pr = PR を作る / file = ファイルを作る /
+  none = 作らない）。`plan.sh add --deliverable <値>` / `plan.sh update <id> --deliverable <値>` で書く。
+  不正値は exit 2 で何も書かない（`_parse_deliverable_opt()` が queue に触れる前に検証）。
+- **判定の情報源**: 実際に Write / Edit / (`pr` なら) `git push` が拒否されないかは、hook
+  (`hooks/lib_skill_perms.py`) の `check_permission()` を task の skills 全部で直接呼んで決める
+  (t088 / PR#236 7巡目 P2)。`config/skill-permissions.yaml` の各 skill の `can_produce_deliverable`
+  (`false` を持つのは `codex-review` / `review` / `research` / `planning` / `plan_review` / `verify`。
+  欄が無い skill は「宣言なし」) は **判定には使わない** — Write/MultiEdit の真偽値だけを検証する
+  ドキュメント用の宣言 (値は `true` / `false` のどちらかだけ。それ以外は lint が FAIL — truthiness で
+  潰さない)。以前は「skills の 1 つでも `can_produce_deliverable: true` なら作れる」という宣言の
+  集計だったが、`check_permission()` は skill の deny の和を allow より先に適用するため、
+  `[research, code]` のように false な skill と true な skill を混ぜた組み合わせで宣言の集計と
+  実際の権限がズレていた（宣言は「作れる」なのに hook は拒否する）。`lint_plan.py` は
+  `check_permission()` を直接呼ぶだけで、**スキル名もその規則も書かない**
+  (`test_lint_plan_carries_no_skill_name_literal` が固定)。
+- **lint（`check_deliverable()`）**:
+  - `pr` / `file` を宣言した task の skills を union した `check_permission()` が Write / Edit /
+    MultiEdit を全部拒否する → FAIL。`pr` はさらに `git push` も拒否されていないかを確認する。
+    **mission の印の有無にかかわらず**、宣言のある task には効く。
+  - 宣言の**必須化**は、この機能より後に `plan.sh init` された mission だけ。`init` が mission.yaml に
+    `deliverable_required: true` を書く。**印の無い既存 mission は、drafting / reviewing に戻っても deliverable の
+    欠落で FAIL しない**（宣言が無い = 何も検査しない）。宣言が書かれていれば値と skills の突き合わせは効く。
+  - `can_produce_deliverable` が不正・`hooks/lib_skill_perms.py` の config が読めない・
+    `deliverable_required` が `true` / `false` 以外・mission.yaml が ENOENT 以外で読めない、は
+    **「決められない」ので FAIL**（「無い」に潰さない。ENOENT だけが「印なし」）。config と
+    mission.yaml は、それが要る task があるときだけ読む。
+- **done**: `deliverable: pr` の task は `--pr <N>` か `--no-pr "<理由>"` が必須（無ければ exit 2・何も書かない。
+  理由は `no_pr_waiver` に残る — t036 と同じ作法）。card の `deliverable` が読めない値なら、PR を作る task かどうか
+  決められないので同じく拒否する（出口は `update --deliverable` か `--no-pr`）。`deliverable` の無い既存 card は従来どおり
+  （待っている codex-review があるときだけ `--pr` / `--no-pr` が要る）。
+- **既存 mission の card に宣言を付けたいとき**: `plan.sh update <id> --deliverable pr|file|none --mission <slug>`
+  を card ごとに打つ（status・worker・pr_number などは触らない。in_progress の card でも安全）。印そのものを
+  既存 mission に付けたいときだけ、mission.yaml に `deliverable_required: true` を 1 行足す（足した時点で、
+  宣言の無い card はすべて lint の FAIL になるので、先に全 card へ宣言を付けてから）。
+
 ## 戻し方 (停止スイッチは付けない)
 
 `worker_may_take()` は dispatcher と `plan.sh pull --task` の答えが割れないように 1 つの規則にしてあり、
@@ -132,6 +172,15 @@ revert すると #21 (別 repo の Worker に task が回る) と #22 (送信済
 再起動を要する。`plan.sh` は呼ばれるたびに読み直すので ff だけで戻る)。revert すると `done` は `--pr` 無しでも
 通り (`--no-pr` は未知の option として拒否される)、pr_number の無い codex-review はまた log だけになる。
 軽い手当て: `[review-no-pr]` が届く task は `plan.sh update <id> --pr-number <N> --status pending` で解消する。
+**t013 (`deliverable` の宣言) だけを戻すなら**: PR を revert → 主 checkout を `git merge --ff-only origin/main`。
+`plan.sh` / `lint_plan.py` は呼ばれるたびに読み直すので、デーモンの再起動は要らない（`config/skill-permissions.yaml` の
+`can_produce_deliverable` は hook が読まない欄なので、revert で消えても許可判定は変わらない）。誤判定で
+`plan.sh review` が lint FAIL になる・`done` が止まるときの、revert 前の軽い手当て: (a) card の宣言を直す
+`plan.sh update <id> --deliverable none`（lint も done も宣言を見て動く）、(b) mission.yaml の
+`deliverable_required: true` の行を消す（必須化だけが止まる。宣言の突き合わせは残る）、(c) `done` は
+`--no-pr "<理由>"` で通す。revert すると、card に残った `deliverable` 欄は誰にも読まれないだけで害は無い
+（旧 `parse_opts` は `--deliverable` を未知の option として拒否する）。共有規則なので env の停止スイッチは付けない。
+
 それより軽い手当て (再起動不要):
 
 - **target_dir 付きの task が回らない (記録が無い / 壊れている)**: `python3 scripts/lib_worker_target.py record
@@ -145,5 +194,7 @@ revert すると #21 (別 repo の Worker に task が回る) と #22 (送信済
   `done --pr`・lint・**本物の `dispatch()` を 1 サイクル回す** (mux だけフェイク)。
 - `bats tests/start-sh-target-dir-record.bats tests/start-sh-spawn-refusal.bats` — start.sh が記録を書く・
   断られた起動では書かない (使い捨ての checkout の複製で走る)。
+- `python3 -m pytest tests/test_task_deliverable.py -q` — `deliverable` の宣言（add / update の検証・init の印・
+  lint の突き合わせと必須化・done の `--pr` 要求）。赤の実証は `tests/red_proof_t013.sh`（12 ケース）。
 - 赤の実証: `tests/red_proof_t009.sh`、`--pr` の付け忘れ防止は `tests/red_proof_t036.sh` (done の拒否・`--no-pr`・
   dispatcher の通知の 10 ケース。`TestDoneRequiresPr` と `test_dispatcher_notify_once.py` を使う)。

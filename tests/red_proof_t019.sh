@@ -132,15 +132,25 @@ PY
 
 # ---------------------------------------------------------------------------
 # 注入 4: e2e フィクスチャから lib_task_cards.py を外す
+#
+# t072 (PR#236) 以降、このフィクスチャは lib_* を名前で列挙する代わりに
+# copy_scripts_libs() (tests/fixture_tree.sh、glob でまとめて写す共有 helper) を
+# 使うようになった — この結果 lib を個別に列挙するリストからは lib_task_cards.py が
+# 既に消えており (helper 側が担当)、旧来の「列挙から 1 行削る」注入はもう対象を持たない
+# (count=0 で FATAL)。同じ実害 (lib_task_cards.py が隔離コピーに無いと SANITY が落ちる)
+# を、copy 後に明示的にその 1 ファイルだけ消す形で再現する。
 # ---------------------------------------------------------------------------
 read -r -d '' INJECT_FIXTURE <<'PY'
 import sys, pathlib
 p = pathlib.Path(sys.argv[1]); s = p.read_text()
-old = """  for f in lint_plan.py lib_verdict.py lib_model.py lib_task_cards.py \\
-           wait_for_plan_review.sh review-plan.sh; do"""
+old = """  if ! copy_scripts_libs "$src" "$T"; then
+    fail "$label — setup: could not copy scripts/lib_* from $src"
+    _cleanup_dir "$T"
+    return 0
+  fi"""
 assert old in s, "注入点が見つからない"
-s = s.replace(old, """  for f in lint_plan.py lib_verdict.py lib_model.py \\
-           wait_for_plan_review.sh review-plan.sh; do""")
+s = s.replace(old, old + """
+  rm -f "$T/scripts/lib_task_cards.py"  # red proof (t019 injection 4): fixture missing this lib""")
 p.write_text(s)
 PY
 

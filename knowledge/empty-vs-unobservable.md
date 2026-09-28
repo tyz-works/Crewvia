@@ -85,9 +85,10 @@ if not active_missions:
 | L | `plan.sh._load_workers_from_registry` → `[]` | 観測できなかった | NO — Worker 一覧は表示と経験値加算のみ。空でも task は動く | 倒す先は安全な向きのまま。ただし **読み取りは t018 でガード経由に** (§2-2) |
 | M | `plan.sh.build_task_graph` — `not os.path.isdir(mission_dir(slug))` で `continue` | 本当に無い / stat できない | NO (可視化のみ)。ただし **DAG からその mission が黙って消える** | §3 |
 | N | `plan.sh.load_state` — `not os.path.exists(STATE_FILE)` | 本当に無い / stat できない | NO — active mission ゼロ → 何も割り当てない・何も完了しない | 安全な向き |
+| O | `leaked_descendants._belongs` — `/proc/<pid>/environ` が **0 バイトで読める** | **観測できなかった** (exec の最中) **/** 本当に環境が空 | **YES** — `observed=True` に潰すと 「読めた・印が無い」になり、印を継承した子孫が survivors にも unobservable にも入らず **黙って消える**。ガードが残骸を見逃し、テストは緑のまま (実測 2.7%) | **修正済** (t029)。`if not environ` で空も「観測できなかった」に倒す |
 
 **t016 で修正したのは A / B / D の 3 件**、**t017 で E / E2 の 2 件**、
-**t018 で H の 1 件**。いずれも「観測の失敗が、取り返しのつかない結論
+**t018 で H の 1 件**、**t029 で O の 1 件**。いずれも「観測の失敗が、取り返しのつかない結論
 (mission 完了 / Worker の終了) の側に落ちる」ものである。
 
 H だけが毛色が違う —— **t017 の修正が作った**。ガードを足して「読めなかった」

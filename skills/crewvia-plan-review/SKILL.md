@@ -70,6 +70,17 @@ Director が作成したミッションプランをレビューし、問題点�
 - [ ] review task の description に「verdict LGTM → plan.sh done、
       要修正 → plan.sh needs-director」が明示されているか
 
+### 2-8. `deliverable` 宣言と lint（B4）
+
+- [ ] 成果物のある task（PR を作る / ファイルを作る）に `--deliverable pr` / `--deliverable file` が
+      付いているか。成果物の無い task（QA・review・codex-review 等）は `--deliverable none`
+- [ ] `deliverable: pr` の skills が Write/Edit/`git push` を拒否されない組み合わせか
+      （`review` / `research` / `planning` 等の deny skill を混ぜていないか。§2-3 の裏返し）
+- [ ] mission を新規 `init` した場合、`plan.sh lint --mission <slug> --strict` が FAIL しないか
+      （`deliverable_required: true` の mission は宣言の無い task を FAIL にする）
+- [ ] `codex-review` / `review` の task で `pr_number` を Director が見込みで書いていないか
+      （実装 task の `plan.sh done --pr <N>` が自動で伝播する。手書きは上書きされない副作用がある）
+
 ---
 
 ## 推奨 task template

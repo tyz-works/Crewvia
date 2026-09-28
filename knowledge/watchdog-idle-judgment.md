@@ -227,6 +227,14 @@ dispatcher はとっくに `logs/dispatcher/` の日次ファイルへ移行し�
   永久に `executing` と読まれ terminate が抑止されうる。倒れる向きは安全側
   (殺さない) なので許容するが、`setsid` で切り離されたプロセスは子孫ではなく
   なるため実際に該当するケースは限られる。
+- **zombie の子を「不明」に数える (backlog、8 巡目、t003)。** `lib_pane_process.py` は回収されて
+  いない子 (state=Z) の cmdline / environ が空であることを「不明」として扱い、そのセッションの
+  hard-idle 終了を絶対上限まで止める。kill しない側 (安全側) の帰結で、子を回収しないほど
+  ハングしたセッションでだけ起きる。直すなら stat の state 欄で Z を分類の前に除く
+- **`lib_daemon_state.py` が未来の `job_since` を受け入れる (backlog、8 巡目、t003)。** 1e100 や
+  時計の巻き戻りで書かれた値をそのまま信用すると、Rule 5 の `BACKGROUND_JOB_MAX_SECONDS` 上限
+  (§9) が永久に効かなくなる。隣の `notify_cache_problem` は妥当性を検証しているのに、こちらは
+  していない。状態ファイルが壊れた場合にだけ起きる話で、このミッションの findings には無い
 
 ## 7. デーモンへの反映
 

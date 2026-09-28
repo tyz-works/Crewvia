@@ -182,6 +182,13 @@ memory `fail-closed-discard-vs-hold` / `evidence-for-destructive-decisions` の�
 - **`git worktree move` 自体の原子性はこのツールの外側の前提。** move がファイルシステム上の移動と
   git 内部の登録更新の両方を行う操作である以上、その 2 つが中途半端に食い違う状態はこのツールの検出・
   復旧の対象外 (git 自身の実装に委ねている)。
+- **既知の限界 (直さないと決めた backlog、5 巡目、t035 / PR#239 QA)**:
+  - `_scan_with_lsof()` は lsof の `n` 欄が出すエスケープ済みファイル名 (`\r` `\n` `\xHH`) をデコードせずに
+    そのまま realpath と比べる。`/proc` が使えない環境 (macOS 等) だけの代替経路で、見落としても隔離は
+    復旧できるため本題外と判断した (backlog #4)
+  - `.quarantine/` そのものが symlink だと `apply` は移動・lock できるが、`--list-quarantine` /
+    `--restore` は resolve した worktree と resolve しない root を比べていて見つけられない。worktree は
+    消えず lock されたまま残るので手で戻せる (backlog #4)
 
 ## 戻し方
 

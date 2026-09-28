@@ -32,6 +32,17 @@ scripts/sync-main-checkout.sh --dry-run    # 何が起きるかだけ見る (fet
 に対して実行しない (`--dry-run` も含む)。動作確認は一時ディレクトリの bare origin + checkout で
 行うこと (`tests/test_main_checkout_sync.py` がその形の実例)。
 
+### 既知の限界（backlog、3 巡目、t007。PR#246）
+
+- **`dispatcher.sh` が観測の一部失敗で同じ版ずれを再通知する（族A）**: 通知の指紋に「不明」を状態の
+  変化として含めるため、`git fetch` 失敗 → 回復、を繰り返すたびに通知が出る。`record_told` が前の
+  指紋のスロットルも消してしまうのが原因。直すならずれの原因（origin 側 / 版の記録側）ごとに独立に
+  重複排除する。
+- **`sync-main-checkout.sh` の `--repo-root` が相対パスだと壊れる（族B）**: スクリプト内で `cd` した
+  後も相対パスのまま python 側 (`lib_daemon_watch.py`) へ渡ると checkout/checkout のような二重パスを
+  読み、restart の要否が「不明」判定になって restart を skip する。既定の呼び方（引数なし、または
+  絶対パス）では起きない。直すなら先頭で絶対パス化する。
+
 ### 戻し方
 
 この機能 (版ずれ検知 + 同期スクリプト) を取り消す必要が出たら:

@@ -185,6 +185,13 @@ Dispatcher から通知を受け取る:
   --mission 20260412-billing-api \
   --skills "docs" --priority high
 
+# 成果物の種類を宣言する（B4。省略すると `deliverable_required: true` の mission では
+# plan.sh lint が FAIL する。pr の task は plan.sh done に --pr / --no-pr が要る）
+./scripts/plan.sh add "新認証ミドルウェアの実装" \
+  --skills "code" --deliverable pr
+./scripts/plan.sh add "QA: 認証ミドルウェアの動作検証" \
+  --skills "qa" --deliverable none --blocked-by t001
+
 # ステータス確認
 ./scripts/plan.sh status                              # active 全 mission の要約
 ./scripts/plan.sh status --mission <slug>             # 1 mission の詳細
@@ -199,8 +206,10 @@ Dispatcher から通知を受け取る:
 ./scripts/plan.sh archive 20260411-auth-refactor
 ```
 
-**利用可能なサブコマンド**: `init` / `add` / `pull` / `done` / `status` / `archive`。
-`pull` は Worker が使うもので、Director が直接呼ぶことはない。
+**Director が直接使うサブコマンド**: `init` / `add` / `update` / `release-dep` / `retire` / `status` / `archive` / `lint`。
+全サブコマンド一覧は `./scripts/plan.sh` を引数無しで実行すると出る（増減したら都度そちらが正）。
+`pull` / `done` / `needs-director` / `fail` は Worker が使うもので、Director が直接呼ぶことはない。
+`reap-orphan-assignment` は dispatcher が Kai-codex 専用に自動で呼ぶ（B3。§12「codex-review skill task の積み方」参照）。
 
 ### タスク分解の原則
 
@@ -560,6 +569,12 @@ Worker に crewvia 以外のプロジェクト (例: `~/workspace/taskvia`) を�
      打つ習慣がついたことが、Worker が main checkout を直接編集してしまう事故(2026-09-08)の誘因
      になったため
    - start.sh が `TARGET_DIR` の存在確認を行うので、存在しないパスなら起動失敗
+   - **trust precheck（B6）**: claude を起動する**前**に `lib_trust.py check <TARGET_DIR>` が実行され、
+     `~/.claude.json` に `hasTrustDialogAccepted: true` の記録が無いディレクトリでは起動しない
+     （exit 1、pane も registry/queue も一切汚さない）。Director が事前に信頼状態を手で確認する
+     必要は無い — 拒否されたら `logs/start-sh/refusals.log` に `REFUSED kind=trust ...` が残るので、
+     そのディレクトリで一度手動 `claude` を起動して信頼ダイアログに応えるか、既に信頼済みの祖先の下に
+     `TARGET_DIR` を置き直すこと。`~/.claude.json` 自体は start.sh が書き換えない
    - **hooks 注入（Option D 方式）**: start.sh は対象プロジェクトの `settings.local.json` を変更せず、
      `TARGET_DIR/.claude/crewvia-worker-{AGENT_NAME}.json` を専用ファイルとして作成し
      `--settings` で追加ロードする。Worker 停止時（`plan.sh done`）に自動削除される。
@@ -937,54 +952,68 @@ AGENT_NAME=$REVIEWER bash scripts/start.sh worker review
 
 ---
 
-### ⚠️ PR merge 後の稼働 tab restart 必須
+### ⚠️ merge 後は `scripts/sync-main-checkout.sh` で同期する（B2）
 
-`scripts/dispatcher.sh` / `scripts/watchdog.py` / `hooks/*.sh` などの **常駐プロセスが読み込むファイル** の fix を PR で main に merge した後は、**稼働中の tab を必ず restart** すること。
+`scripts/dispatcher.sh` / `scripts/watchdog.py` などの **常駐プロセスが読み込むファイル** の fix を PR で
+main に merge しても、稼働中の dispatcher / watchdog タブは自動では反映されない（restart するまで
+旧コードのまま動き続け、誤診断の原因になる）。以前は Director が merge のたびに手で「主 checkout を
+ff → 変わったファイルに応じて restart」を判断していたが、B2 でこれを 1 コマンドに置き換えた。
 
-restart しないと、稼働 tab は旧コードで動き続け、fix が反映されていないように見える（誤診断の原因）。
-
-**dispatcher / watchdog は `scripts/lib_mux.py kill` を直接使わないこと。** 両者は相互監視
-(`scripts/lib_daemon_watch.py`、`knowledge/daemon-authority.md` §7) をしており、素朴に kill する
-と、kill してから自分で新コードを spawn するまでの隙間をピア側が「死んだ」と誤認し、**旧コード
-のまま respawn してしまう**（手動 respawn と競合する二重起動）。restart は必ず `lib_daemon_watch.py
-restart` 経由で行う — pane の所有者確認・maintenance マーカーでの相互監視一時停止・kill 失敗時の
-安全な中断までを 1 コマンドに内包している。
-
-**restart が必要なプロセス**:
-
-| プロセス | 対象ファイル変更時 |
-|----------|-----------------|
-| `dispatcher` tab | `scripts/dispatcher.sh` / `scripts/lib_daemon_watch.sh` / `scripts/lib_mux.py` / `scripts/lib_daemon_watch.py` / `scripts/lib_retirement.py` |
-| `watchdog` tab | `scripts/watchdog.py` / `scripts/lib_daemon_watch.py` / `scripts/lib_retirement.py` / `scripts/lib_mux.py` / `scripts/lib_pane_process.py` / `scripts/lib_task_cards.py` / `scripts/lib_daemon_state.py` |
-| Worker tab | `scripts/start.sh` |
-| `Sora-director` | `agents/director.md` / `hooks/*.sh` |
-
-このテーブルの唯一の真の実装は `scripts/lib_daemon_watch.py` の `DAEMON_RESTART_FILES`
-（`tests/test_daemon_restart_files_match_load_model.py` が実際の import / source 文と
-突き合わせて固定する。t112 / PR#246）。ここは人間向けの写しなので、値がずれたら
-そちらを直してからここも揃えること。
-
-**restart 手順（maintenance マーカー経由。片方だけ変更した場合はその daemon だけでよい）**:
+dispatcher が既定 180 秒ごと（`CREWVIA_MAIN_CHECKOUT_DRIFT_INTERVAL`）に主 checkout と `origin/main` の
+ずれを検知し、ずれがあれば `[main-checkout-drift]` を Director に **1 回だけ**通知する。通知を受けたら
+（あるいは merge 直後に能動的に）以下を 1 本叩くだけでよい:
 
 ```bash
-# 1. fix を pull
-git fetch origin main && git pull --ff-only origin main
-
-# 2. pause → kill → 新コードで spawn → resume を 1 コマンドで行う
-#    (相互監視と競合しない。dispatcher / watchdog を個別に指定)
-python3 scripts/lib_daemon_watch.py restart dispatcher
-python3 scripts/lib_daemon_watch.py restart watchdog
-
-# 3. 起動確認（両デーモンの heartbeat / recorded_instance_alive をまとめて見る）
-python3 scripts/lib_daemon_watch.py status
-tail -3 logs/dispatcher/dispatcher-$(date +%Y%m%d).log
+scripts/sync-main-checkout.sh              # fetch → ff-only merge → 必要な daemon だけ restart → status
+scripts/sync-main-checkout.sh --dry-run    # 何をするか（どこまで進むか）を表示するだけ、非破壊
 ```
+
+自動で restart するのは **dispatcher / watchdog の 2 つだけ**。Worker tab や `Sora-director`
+自身の再起動が要る変更（`agents/director.md` / `hooks/*.sh` 等）は、スクリプトが「restart 推奨
+（手動で対応してください）」と表示するだけで実行はしない — Director が引き続き手で判断すること。
+
+**`--dry-run` は「pull 前の disk 基準」で restart の要否を判定するため、「pull したら restart が
+必要になる」ケースを予告できない**（2026-09-28 実測: dispatcher.sh が変わる merge でも `--dry-run`
+は `restart-needed=false` と表示し、本実行で初めて `true` になった。ミッション C の候補）。
+予告を鵜呑みにせず、まず本実行してから `lib_daemon_watch.py status` で結果を確認すること。
+
+**dispatcher / watchdog に `scripts/lib_mux.py kill` を直接使わないこと。** 両者は相互監視
+(`scripts/lib_daemon_watch.py`、`knowledge/daemon-authority.md` §7) をしており、素朴に kill する
+と、kill してから自分で新コードを spawn するまでの隙間をピア側が「死んだ」と誤認し、**旧コード
+のまま respawn してしまう**（手動 respawn と競合する二重起動）。`sync-main-checkout.sh` は内部で
+`lib_daemon_watch.py restart` を通しており、直接 `restart` コマンドを個別に打ちたい場合も同じ
+経由にすること — pane の所有者確認・maintenance マーカーでの相互監視一時停止・kill 失敗時の
+安全な中断までを内包している。
+
+**「どのファイル変更でどちらの daemon が対象か」の唯一の実装**は `scripts/lib_daemon_watch.py` の
+`DAEMON_RESTART_FILES`（`tests/test_daemon_restart_files_match_load_model.py` が実際の
+import / source 文と突き合わせて固定する。t112 / PR#246）。対応表はそこにしか無い — 散文で
+再掲すると、増減したときに直す場所が 2 つになりずれる。
 
 `restart` が `refused` で終わった場合（pane の中身が自分の checkout のものと確認できない等）は理由が
 stderr に出る。原因を確認せず `--force` へ逃げないこと — 別 checkout の daemon を巻き込む事故
 (2026-09-23 の実例) の再発防止がその確認の目的。
 
 詳細は `knowledge/dispatcher-restart-after-merge.md` を参照。
+
+### 古い worktree の整理（B9、`--apply` はユーザー了承を得てから）
+
+`.claude/worktrees/` は Worker が pull するたびに増え、放置すると際限なく肥大化する。
+`scripts/worktree_gc.py` が削除候補を判定するが、**削除ではなく隔離**（`git worktree move` +
+`git worktree lock`。`--restore` で完全に戻せる）であることに注意:
+
+```bash
+python3 scripts/worktree_gc.py --json          # 既定は dry-run。集計と候補の一覧だけ出す
+python3 scripts/worktree_gc.py --apply         # 候補を隔離する（削除しない）
+python3 scripts/worktree_gc.py --restore PATH  # 隔離を元に戻す
+python3 scripts/worktree_gc.py --list-quarantine
+```
+
+remove 判定は全条件が揃ったものだけ（gitignore 対象外のファイルが残っている・dirty・mission が
+active・主 checkout・管理外ディレクトリ、のどれかに該当すれば keep）。**`--apply` は Director が
+勝手に実行せず、必ずユーザーの了承を得てから実行すること**（隔離であっても稼働中の worktree を
+動かす操作であり、判定の誤りが Worker の作業を巻き込みうるため）。詳細は `knowledge/worktree-gc.md`
+を参照。
 
 ### ⚠️ `kai-review.sh` 自体を直す PR は「鶏と卵」— codex-review task は merge 後に積む
 
@@ -995,7 +1024,7 @@ Dispatcher は常に **main 版の `scripts/kai-review.sh`**（$CREWVIA_REPO_ROO
 - `kai-review.sh` の fix PR に対する `codex-review` task（自己レビュー用）は、
   fix PR が merge された**後**に積むこと。merge 前に積んでも旧コードでレビューされ、
   修正の検証にならない
-- これは上記「PR merge 後の稼働 tab restart 必須」と同じ根本原因（常駐/共有プロセスが
+- これは上記「merge 後は `scripts/sync-main-checkout.sh` で同期する」と同じ根本原因（常駐/共有プロセスが
   読み込むファイルは、merge するまで新コードで動かない）の一亜種
 - 詳細: `knowledge/codex-reviewer.md` §運用上の注意
 
@@ -1004,8 +1033,16 @@ Dispatcher は常に **main 版の `scripts/kai-review.sh`**（$CREWVIA_REPO_ROO
 `review`（Seo）とは別に、`--skills codex-review --blocked-by <実装 task>` で task を積むだけでよい。
 **PR 番号は手で入れない**: 実装 task を `plan.sh done <id> --pr <N> --mission <slug> "<Result>"` で閉じると、
 その task を `blocked_by` に持つ `codex-review` / `review` の task に `pr_number` が書かれ（未設定のものだけ。
-Result の本文から推測はしない）、`blocked` の codex-review は `pending` に戻る。PR 番号待ちで止めておきたい
-task は drafting のうちから `status: blocked` + `blocked_reason` で積める（lint が受理する）。
+Result の本文から推測はしない）、`blocked` の codex-review は `pending` に戻る。
+
+**推移伝播（B5）**: 直接の `blocked_by` だけでなく、`deliverable: file` または `none` を明示宣言した task
+（QA・review 等、それ自体は別の PR を作らない task）を経由した **先の** `codex-review` / `review` task にも
+PR 番号が伝わる（例: impl(pr) → qa(none) と codex-review(none) が並列 → その両方を `blocked_by` に持つ
+merge task、という 4 段構成でも merge task まで届く）。`deliverable` を宣言していない task（後方互換）は
+通過点にならず、そこで伝播が止まる。上流に `deliverable: pr` の task が **2 つ以上**ある合流点（どちらの
+PR か一意に決まらない）には書き込まず、理由を stderr に出すだけで止める — Director が手で `--pr-number`
+を入れること。PR 番号待ちで止めておきたい task は drafting のうちから `status: blocked` + `blocked_reason`
+で積める（lint が受理する）。
 既に PR が存在する場合だけ `--pr-number <N>` で最初から入れる。`--pr` は Result 1 行目の `PR #<N>` と一緒に付ける。
 **`--pr` の付け忘れは仕組みで止まる**（t036）: その task を `blocked_by` に持つ未終了の codex-review に `pr_number` が
 無いのに `--pr` が無いと `done` は拒否する（exit 2・何も書かない）。PR を作らない task は

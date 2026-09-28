@@ -139,6 +139,11 @@ exclude = {
     # ツリーに閉じ、repo の registry/workers.yaml に書く経路は存在しない。
     # (この除外は、worktree 内で検査が有効になって初めて見つかった — 修正前は素通りしていた。)
     root / "tests" / "test_registry_isolation.py",
+    # t009 (Kai-codex の孤児 assignment 掃除) の dispatcher exec() テスト。`_dispatcher_root()`
+    # が pytest の `tmp_path / "repo"` に idle Worker 1 人ぶんの workers.yaml を 1 度だけ書く
+    # (dispatcher は REGISTRY_DIR 直下のその名前を読む)。書き込みは pytest の使い捨てツリーに
+    # 閉じ、repo の registry/workers.yaml に書く経路は存在しない。
+    root / "tests" / "test_reap_orphan_assignment.py",
 }
 proximity = 15
 found = []

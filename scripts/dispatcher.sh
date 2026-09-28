@@ -227,6 +227,18 @@ CODEX_REVIEW_SKILLS = {'codex-review'}
 CODEX_REVIEW_AGENT = 'Kai-codex'  # must match registry/workers.yaml entry
 KAI_REVIEW_SH = REGISTRY_DIR.parent / 'scripts' / 'kai-review.sh'
 KAI_SPAWN_LOG_DIR = REGISTRY_DIR.parent / 'logs' / 'kai-spawn'
+PLAN_SH = REGISTRY_DIR.parent / 'scripts' / 'plan.sh'
+
+# `plan.sh` の exit code (scripts/plan.sh の PRECONDITION_UNMET / LOCK_BUSY と同じ
+# 値。plan.sh は import できる python モジュールではない (bash + heredoc) ので、
+# watchdog 側の lib_retirement.py と同様にここでも値だけを複製する —— 「共有規則に
+# env 停止スイッチを付けない」原則と同じ理由で、値そのものの複製は禁止していない
+# (規則の定義が 2 箇所に分かれるのが問題であって、固定 exit code の複製ではない)。
+PLAN_PRECONDITION_UNMET = 3
+PLAN_LOCK_BUSY = 4
+# lib_retirement.CLEANUP_COMMAND_TIMEOUT と同じ値 (watchdog → plan.sh retire の
+# 呼び出しと同種の「短時間で終わるはずの queue ロック付き操作」)。
+REAP_ORPHAN_COMMAND_TIMEOUT = 30
 
 # Rule 2: blocked-stuck threshold (seconds).  If an idle Worker's only matching
 # tasks have been blocked for longer than this, the Worker is sent shutdown.
@@ -659,7 +671,8 @@ def codex_review_slot_busy(task_statuses_by_mission):
     残り、以後の codex-review が恒久的に spawn されなかった (backlog #13)。
 
     指す task が手放し済み (`RELEASED_WORK_STATUSES`) か needs_director なら孤児で、塞がない
-    (**読むだけ**。assignment を消すのは plan.sh の役目 —— 次の pull が上書きする)。
+    (**読むだけ**。assignment を消すのは plan.sh の役目 —— 次の pull が上書きするか、
+    `reap_kai_codex_orphan_assignment()` が毎サイクル掃除する。t009 / backlog #34)。
 
     塞ぐ側に倒すもの: assignment が読めない / `<mission>:<task>` の形でない / 指す task が
     見つからない (archive 済みなど) / 進行中の status。証明できない孤児は孤児と扱わない
@@ -679,6 +692,117 @@ def codex_review_slot_busy(task_statuses_by_mission):
             f"(status={status}) を指す孤児 — spawn を塞がない")
         return False
     return True
+
+
+def _referenced_task_status(slug, task_id, task_statuses_by_mission):
+    """`slug:task_id` の status（不明なら `None`）。
+
+    `task_statuses_by_mission` は `load_all_tasks(active_missions)` の戻りで、
+    **active な mission だけ**を載せている。t117: 掃除の呼び出しが「active な
+    ミッションが 0 件」「active が全部 done」の早期 return より前に動くように
+    なったので、その 2 つの分岐では `task_statuses_by_mission` をまだ作って
+    おらず、呼び出し側は空辞書 `{}` を渡す。さらに、参照先の mission がそもそも
+    archive 済みなら `active_missions` に二度と載らないので、通常サイクルでも
+    同じ穴がある。`.get(slug, {})` で空辞書に潰すと「終了していない」に誤読し、
+    孤児が永久に残る（B3 が直すはずだった「ミッション終了後」の形そのもの）。
+
+    mission が `task_statuses_by_mission` に無いときだけ、その mission の
+    active dir → archive dir の順で card を直接読む（どちらにも無ければ
+    判定不能 = `None`）。
+    """
+    statuses = task_statuses_by_mission.get(slug)
+    if statuses is not None:
+        return statuses.get(task_id)
+    for base in (MISSIONS_DIR, ARCHIVE_DIR):
+        task_file = base / slug / 'tasks' / f'{task_id}.md'
+        if task_file.exists():
+            meta, _ = read_task_card(task_file, task_id)
+            return meta.get('status')
+    return None
+
+
+def _kai_codex_orphan_candidate(task_statuses_by_mission):
+    """`assignment/Kai-codex` が、掃除 (`plan.sh reap-orphan-assignment`) を試す価値が
+    あるかを安く判定する — 実際に消してよいかの最終判断ではない。
+
+    `plan.sh` は 1 サイクルにつき最大 1 回しか起動したくない (孤児が無いサイクルが
+    大多数)。このサイクルで既に読み込み済みの `task_statuses_by_mission` (無ければ
+    `_referenced_task_status()` が card を直接読む。t117) だけを見て、subprocess を
+    起動する価値があるかを判定する —— 実際の削除判定 (キューロックの中での読み
+    直し・`needs_director` の除外・世代照合) は `plan.sh reap-orphan-assignment`
+    側 (cmd_reap_orphan_assignment) だけが行う。ここで「消してよい」と結論しない:
+    対象はあくまで `RELEASED_WORK_STATUSES` (`codex_review_slot_busy()` と同じ
+    「終了した」の定義) で、`needs_director` は**含めない** —— plan.sh 側が
+    needs_director を保留 (削除しない) に倒すので、含めても無駄な subprocess 起動が
+    増えるだけである。
+    """
+    raw = read_assignment(CODEX_REVIEW_AGENT)
+    if is_missing(raw) or is_unreadable(raw):
+        return False
+    slug, sep, task_id = raw.strip().partition(':')
+    if not sep or not slug or not task_id:
+        return False
+    status = _referenced_task_status(slug, task_id, task_statuses_by_mission)
+    return status in RELEASED_WORK_STATUSES
+
+
+def reap_kai_codex_orphan_assignment(task_statuses_by_mission):
+    """孤児化した `assignment/Kai-codex` があれば `plan.sh reap-orphan-assignment`
+    で撤去する (t009 / backlog #34)。
+
+    毎サイクル呼ばれる前提の安さ: `_kai_codex_orphan_candidate()` が False を返す
+    大多数のサイクルでは subprocess を 1 本も起動しない。実際に起動するときも
+    `--no-wait` (キューが混んでいれば待たず諦め、次のサイクルでまた判定し直す —
+    watchdog → `plan.sh retire` (`lib_retirement.py`) と同じ理由: 5 秒ごとの
+    ポーリングループを、混んだキュー 1 つで止めない)。
+
+    ここで判定しないこと (すべて `plan.sh reap-orphan-assignment` 側の責務):
+    実際に消してよいかどうかの最終判断 (キューロック内での読み直し・
+    `needs_director` の除外・世代照合)。この関数はその subprocess を呼ぶかどうか
+    と、結果をログに残すことだけを担う。
+
+    `dispatch()` は「active なミッションが 0 件」「active が全部 done」の早期
+    return より前でこの関数を呼ぶ (t117)。その 2 つの分岐では `task_statuses_by_
+    mission` をまだ作っていないので `{}` が渡ってくる —— それでも参照先の
+    status は `_kai_codex_orphan_candidate()` → `_referenced_task_status()` が
+    card を直接読んで判定できる。
+    """
+    if not _kai_codex_orphan_candidate(task_statuses_by_mission):
+        return
+    if not PLAN_SH.is_file():
+        log(f"WARNING: plan.sh not found at {PLAN_SH} — cannot reap orphan assignment")
+        return
+    argv = ['bash', str(PLAN_SH), 'reap-orphan-assignment', CODEX_REVIEW_AGENT, '--no-wait']
+    # queue/registry のパスは env 経由で明示する (`os.environ` の継承任せにしない)。
+    # このプロセス自身の QUEUE_DIR / REGISTRY_DIR は起動時の argv (bash 側で解決済み)
+    # から来ており、周囲の env にある CREWVIA_QUEUE / CREWVIA_REPO_ROOT と必ずしも
+    # 一致しない (テストが argv だけを差し替えて exec するとズレる。本番でも
+    # 「このプロセスが実際に使っている値」を明示したほうが安全)。plan.sh は
+    # `${CREWVIA_QUEUE:-...}` で env を優先するので、ここで明示すれば ambient な
+    # env の値 (例: 実運用の本番 queue を指す開発者シェルの env) より必ず勝つ
+    # (memory: qa-ambient-repo-root-points-at-production)。
+    env = dict(os.environ)
+    env['CREWVIA_QUEUE'] = str(QUEUE_DIR)
+    env['CREWVIA_REPO_ROOT'] = str(REGISTRY_DIR.parent)
+    try:
+        proc = subprocess.run(
+            argv, capture_output=True, text=True, env=env,
+            timeout=REAP_ORPHAN_COMMAND_TIMEOUT, cwd=str(REGISTRY_DIR.parent),
+        )
+    except Exception as e:  # noqa: BLE001 — a failed cleanup must never crash the daemon
+        log(f"WARNING: plan.sh reap-orphan-assignment failed to run: {type(e).__name__}: {e}")
+        return
+    output = ((proc.stdout or '') + (proc.stderr or '')).strip()
+    if proc.returncode == 0:
+        last_line = output.splitlines()[-1] if output else ''
+        log(f"[codex-review] {last_line}" if last_line
+            else "[codex-review] reap-orphan-assignment: done (no output)")
+    elif proc.returncode in (PLAN_LOCK_BUSY, PLAN_PRECONDITION_UNMET):
+        # 何も書かれていない (キューが混んでいた / 前提が外れていた) — 次の
+        # サイクルでまた判定し直すので、ここで騒がない。
+        pass
+    else:
+        log(f"WARNING: plan.sh reap-orphan-assignment exited {proc.returncode}: {output[:300]}")
 
 
 _target_record_memo = {}      # dispatch() が毎サイクルの先頭で空にする
@@ -2056,6 +2180,18 @@ def dispatch():
             f"このサイクルは割り当ても退役も行わない")
         return
 
+    # t009 / backlog #34, t117: Kai-codex の孤児 assignment の掃除は「active な
+    # ミッションが 0 件」「active が全部 done」の早期 return より前に置く。
+    # 以前は `load_all_tasks()` の後 (=両方の早期 return の後ろ) にあり、
+    # 最後のミッションが完了した直後に assignment が孤児化すると、以後の
+    # サイクルは毎回そのどちらかの return で抜けてしまい、掃除が二度と
+    # 走らなかった (B3 が直すはずだった「ミッション終了後」の形そのもの)。
+    # ここではまだ `task_statuses_by_mission` を作っていないので `{}` を渡す —
+    # 参照先 mission の card は `_kai_codex_orphan_candidate()` が直接読む
+    # (active dir / archive dir の両方。archive 済みミッションを指す孤児も
+    # これで掃除できる)。
+    reap_kai_codex_orphan_assignment({})
+
     active_missions = list(state.get('active_missions') or [])
 
     # Bug1 fix: even with no active missions, shut down lingering idle Workers
@@ -2101,6 +2237,7 @@ def dispatch():
 
     # Load all tasks
     all_tasks, done_ids_by_mission, task_statuses_by_mission = load_all_tasks(active_missions)
+
     # t010: 状態ベースの通知 (needs_director / handoff / review-refused) が今なお
     # 成り立っている key。サイクルの最後に、成り立たなくなった記録を捨てるのに使う。
     live_state_keys = set()

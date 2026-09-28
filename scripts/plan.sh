@@ -68,13 +68,22 @@ set -euo pipefail
 # done / fail / needs-director / update で --mission を省略して task id が複数 mission に
 # 当たるとき、CREWVIA_MISSION_SLUG の mission に自分 (AGENT_NAME) が in_progress で担当している
 # 場合に限ってそれを使う (stderr に 1 行出す)。それ以外は拒否して候補とコマンドを示す。
+#
+#   plan.sh reap-orphan-assignment <agent> [--no-wait]
+#                              <agent> (例: Kai-codex) の queue/assignments/<agent> が、
+#                              既に終了した task (lib_dep_rules の「終了した」の定義。
+#                              needs_director は含めない) を指す孤児なら撤去する。
+#                              読めない / mission:task の形でない / task が見つからない /
+#                              終了していない / needs_director を指す場合は 1 バイトも
+#                              書かずに exit 3 (retire と同じ PRECONDITION_UNMET)。
+#                              --no-wait: キューロックを待たずに諦め exit 4 (dispatcher 用)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 QUEUE_DIR="${CREWVIA_QUEUE:-${REPO_ROOT}/queue}"
 
 if [[ $# -eq 0 ]]; then
-  echo "Usage: plan.sh <init|add|pull|done|needs-director|fail|update|release-dep|retire|ready-for-verification|verify-result|review|launch|task-graph|lint|status|archive|resync|dashboard|dashboard-data|resolve-mission> [args...]" >&2
+  echo "Usage: plan.sh <init|add|pull|done|needs-director|fail|update|release-dep|retire|reap-orphan-assignment|ready-for-verification|verify-result|review|launch|task-graph|lint|status|archive|resync|dashboard|dashboard-data|resolve-mission> [args...]" >&2
   exit 1
 fi
 
@@ -808,15 +817,22 @@ def save_mission(slug, data):
     _atomic_write(mission_yaml_path(slug), dump_yaml(data, key_order=MISSION_KEY_ORDER))
 
 
-def load_task(slug, task_id):
-    path = task_path(slug, task_id)
-    if not os.path.exists(path):
-        die(f"task '{task_id}' not found in mission '{slug}'")
+def _load_task_from_path(path):
+    """`path` の task card を `(meta, body)` にする。見つかる場所 (active mission /
+    archive) を問わない —— 呼び出し側が解決済みのパスを渡す (`load_task()` /
+    `cmd_reap_orphan_assignment`)。"""
     text = read_queue_file(path, 'task card')
     try:
         return parse_frontmatter(text, source=path)
     except ValueError as e:
         die(f"failed to parse {path}: {e}")
+
+
+def load_task(slug, task_id):
+    path = task_path(slug, task_id)
+    if not os.path.exists(path):
+        die(f"task '{task_id}' not found in mission '{slug}'")
+    return _load_task_from_path(path)
 
 
 def save_task(slug, task_id, meta, body):
@@ -867,6 +883,20 @@ unmet_dependencies = _DEP_RULES.unmet_dependencies
 card_dependencies = _DEP_RULES.card_dependencies
 declared_dependencies = _DEP_RULES.declared_dependencies
 
+#: 「終了した」task の status (t009 / backlog #34: `reap-orphan-assignment` が
+#: assignment を撤去してよい対象)。dispatcher.sh の `RELEASED_WORK_STATUSES`
+#: (TERMINAL_STATUSES | DEAD_DEP_STATUSES | HELD_DEP_STATUSES) と同じ定義だが、
+#: コピーではなく plan.sh がもともと持っている TERMINAL_STATUSES と、
+#: lib_dep_rules から読んだ上の 2 つを都度合成しているだけ —— 値の出どころは
+#: dispatcher.sh と同じ 3 つの集合であり、増減すればここも自動で追従する。
+#: `needs_director` は **含めない**: 正常経路 (kai-review.sh → `plan.sh
+#: needs-director`) では needs_director への遷移そのものが assignment を撤去する
+#: ので、それでも assignment が残っているのは「この needs_director が別の実行の
+#: ものかもしれない」証拠不足の状態であり、破壊的な掃除の対象にはしない
+#: (`codex_review_slot_busy()` の read-only な「塞がない」判定とは意図的に非対称。
+#: 破壊的操作はより強い証拠を要求する — memory: evidence-for-destructive-decisions)。
+ORPHAN_ASSIGNMENT_FINISHED_STATUSES = TERMINAL_STATUSES | set(DEAD_DEP_STATUSES) | set(HELD_DEP_STATUSES)
+
 
 def held_dependency_hint(task_id, held, slug):
     """保留 (failed の依存) を見た人が、次に何を打てばよいか分かる 1 行。
@@ -906,7 +936,7 @@ def held_dependency_hint(task_id, held, slug):
 #: 末尾の dispatch テーブル (tests/test_task_graph.py が突き合わせる)。
 QUEUE_MUTATING_SUBCOMMANDS = {
     'init', 'add', 'pull', 'done', 'needs-director', 'fail', 'update', 'release-dep',
-    'retire',
+    'retire', 'reap-orphan-assignment',
     'ready-for-verification', 'verify-result', 'review', 'launch', 'archive',
 }
 
@@ -2529,6 +2559,7 @@ USAGE = {
     'retire': ('plan.sh retire <task_id> --agent <name> --started-at <generation>\n'
                '                       [--mission <slug>] [--outcome reset|needs-director]\n'
                '                       [--reason "<1 行>"] [--no-wait]'),
+    'reap-orphan-assignment': 'plan.sh reap-orphan-assignment <agent> [--no-wait]',
     'ready-for-verification': 'plan.sh ready-for-verification <task_id> [--mission <slug>]',
     'verify-result': ('plan.sh verify-result <task_id> <pass|fail|needs_human_review>\n'
                       '                            [--mission <slug>] [--notes "<text>"]'),
@@ -2550,7 +2581,8 @@ USAGE = {
 POSITIONAL_ARITY = {
     'init': (1, 1), 'add': (1, 1), 'pull': (0, 0), 'done': (2, 2),
     'needs-director': (2, 2), 'fail': (1, 2), 'update': (1, 1), 'release-dep': (1, 1),
-    'retire': (1, 1), 'ready-for-verification': (1, 1), 'verify-result': (2, 2),
+    'retire': (1, 1), 'reap-orphan-assignment': (1, 1),
+    'ready-for-verification': (1, 1), 'verify-result': (2, 2),
     'review': (1, 1), 'launch': (1, 1), 'task-graph': (0, 0), 'lint': (0, 1),
     'status': (0, 0), 'archive': (1, 1), 'resync': (0, 1), 'dashboard-data': (0, 0),
     'resolve-mission': (1, 1),
@@ -5759,6 +5791,106 @@ def cmd_retire(args):
     with_lock(_do, nonblocking=bool(opts.get('--no-wait')))
 
 
+def cmd_reap_orphan_assignment(args):
+    """plan.sh reap-orphan-assignment <agent> [--no-wait]
+
+    `queue/assignments/<agent>` が、既に手放された (=「終了した」)
+    task を指すだけの孤児なら撤去する。`plan.sh retire` が「まだ in_progress の
+    実行を強制終了する」ためのものなのに対し、こちらは逆 —— **task は既に
+    決着している**のに、その決着を付けた経路 (`update --status <status>` を
+    `--reset` を経ずに使う等) が assignment を撤去し忘れた取り残しを片付ける
+    (t009 / backlog #34)。
+
+    孤児ができる経路 (Result 参照):
+      - kai-review.sh が `plan.sh done` / `needs-director` のどちらも呼ばずに
+        終わる (プロセスが外部から kill される・未捕捉の異常終了)。task は
+        in_progress のまま止まり、Director が後から手動で決着を付けても
+        (下の経路) assignment はそのまま残る。
+      - Director が `plan.sh update <id> --status <終端 status>` のように
+        **`--reset` を経ない**経路で card を終端 status に動かす。`update`
+        が assignment を撤去するのは `--reset` のときだけ (cmd_update 参照) —
+        素の `--status` はカードの status だけを書き換え、assignment には触れない。
+
+    消してよいのは「読めて、`ORPHAN_ASSIGNMENT_FINISHED_STATUSES`
+    (lib_dep_rules の DEAD_DEP_STATUSES / HELD_DEP_STATUSES + plan.sh の
+    TERMINAL_STATUSES) に入っている task を指す」ときだけ。以下はすべて
+    保留 (1 バイトも書かずに exit `PRECONDITION_UNMET`):
+      - assignment が読めない (壊れている / 種類が違う)
+      - `mission:task` の形でない
+      - 指す task が見つからない (mission が無い、active dir にも archive dir
+        にも card が無い)
+      - 指す task が終了していない (in_progress 等) — まだ本当に走っている
+        かもしれないので触らない
+      - 指す task が `needs_director` — 上の ORPHAN_ASSIGNMENT_FINISHED_STATUSES
+        のコメント参照。証拠不足を「消してよい」に倒さない
+
+    mission が archive 済み (`queue/archive/<slug>/tasks/<task>.md`) でも掃除の
+    対象は変わらない —— archive はまさに「もう決着した」ミッションの代表例で、
+    ここで active dir だけを見て「見つからない」に倒すと、B3 が本来消したかった
+    孤児 (最後のミッションが完了した直後に archive された経路) がここでも
+    保留に落ちる (t117)。active dir → archive dir の順で探す。
+
+    dispatcher が毎サイクル呼ぶ前提の安さ: 読み直しはキューロックの中で 1 回
+    だけ (assignment ファイル 1 個 + task card 1 個)。列挙は行わない。
+    """
+    opts, positional = parse_opts(args, {'--no-wait': 'bool'})
+    if not positional:
+        die("reap-orphan-assignment requires <agent> (e.g. Kai-codex)")
+    agent = positional[0]
+    require_valid_agent_name(agent)
+
+    def _do():
+        # キューロックの中で読み直す (不変条件: 読み直してから消す)。
+        raw = _TASK_CARDS.read_regular_text_or_unreadable(assignment_path(agent))
+        if _TASK_CARDS.is_missing(raw):
+            print(f"[plan.sh] assignment/{agent} は既にありません — 何もしません")
+            return
+        if _TASK_CARDS.is_unreadable(raw):
+            die(f"[plan.sh reap-orphan-assignment] assignment/{agent} を読めません"
+                f" — 証拠が無いので消しません", PRECONDITION_UNMET)
+
+        raw = raw.strip()
+        slug, sep, task_id = raw.partition(':')
+        if not sep or not slug or not task_id:
+            die(f"[plan.sh reap-orphan-assignment] assignment/{agent} の形が"
+                f" 'mission:task' ではありません ({raw!r}) — 消しません",
+                PRECONDITION_UNMET)
+
+        card_path = task_path(slug, task_id)
+        if not os.path.exists(card_path):
+            # t117: mission が active dir に無くても archive 済みかもしれない
+            # (最後のミッションが完了 → archive された直後、というのが B3 が
+            # 本来消したかった孤児の形そのもの)。
+            archived_path = os.path.join(ARCHIVE_DIR, slug, 'tasks', f"{task_id}.md")
+            if not os.path.exists(archived_path):
+                die(f"[plan.sh reap-orphan-assignment] assignment/{agent} が指す"
+                    f" task {slug}/{task_id} が見つかりません (active dir にも"
+                    f" archive dir にも無い) — 消しません", PRECONDITION_UNMET)
+            card_path = archived_path
+
+        meta, _body = _load_task_from_path(card_path)
+        status = meta.get('status')
+        if status not in ORPHAN_ASSIGNMENT_FINISHED_STATUSES:
+            die(f"[plan.sh reap-orphan-assignment] assignment/{agent} が指す"
+                f" task {slug}/{task_id} は status={status!r} — 終了していないので"
+                f"消しません", PRECONDITION_UNMET)
+
+        # 撤去は retire_assignment (= classify_assignment) を通す。世代を問わない
+        # (generation=None) のは、ここでの判断が「いま公開中の assignment の中身が
+        # この task を指しているか」だけで、後任か先任かは問うていないため
+        # (task_graph_assignment_holds と同じ立場)。読み直しと同じロックの中で
+        # 呼ぶので、上で読んだ raw と classify_assignment が見る中身の間に
+        # 他プロセスの書き込みが割り込む隙間は無い。
+        verdict = retire_assignment(agent, slug, task_id, None)
+        if verdict != ASSIGN_MINE:
+            die(f"[plan.sh reap-orphan-assignment] {describe_assignment_verdict(agent, verdict)}"
+                f" — 消しません", PRECONDITION_UNMET)
+
+        print(f"[plan.sh] Reaped orphan assignment: {agent} → {slug}:{task_id} (status={status})")
+
+    with_lock(_do, nonblocking=bool(opts.get('--no-wait')))
+
+
 # ---------------------------------------------------------------------------
 # Dispatch
 # ---------------------------------------------------------------------------
@@ -5773,6 +5905,7 @@ dispatch = {
     'update': cmd_update,
     'release-dep': cmd_release_dep,
     'retire': cmd_retire,
+    'reap-orphan-assignment': cmd_reap_orphan_assignment,
     'ready-for-verification': cmd_ready_for_verification,
     'verify-result': cmd_verify_result,
     'review': cmd_review,

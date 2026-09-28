@@ -113,7 +113,12 @@ GUARDED_READS = [
     # --- plan.sh ---------------------------------------------------------
     ("plan.sh", "try_read_queue_file", {"read_regular_text"}),
     ("plan.sh", "read_queue_file", {"try_read_queue_file"}),
-    ("plan.sh", "load_task", {"read_queue_file"}),
+    # t117: load_task() は解決済みパスのパースを _load_task_from_path() に
+    # 委譲した (cmd_reap_orphan_assignment が archive 済みの task card でも
+    # 同じパース経路を再利用するため)。ガードの入口そのものは変わらない —
+    # _load_task_from_path() が read_queue_file() を直接呼ぶ。
+    ("plan.sh", "load_task", {"_load_task_from_path"}),
+    ("plan.sh", "_load_task_from_path", {"read_queue_file"}),
     ("plan.sh", "load_mission", {"read_queue_file"}),
     ("plan.sh", "_print_mission_summary", {"try_read_queue_file"}),
     ("plan.sh", "_print_mission_detail", {"read_queue_file"}),
@@ -901,6 +906,10 @@ ALLOWED_SUBPROCESS_CALLS = {
     # -- dispatcher.sh -----------------------------------------------------
     ("dispatcher.sh", "spawn_kai_review", "cmd"):
         "kai-review.sh を起こすだけ。カードを読むのは向こうの plan.sh pull",
+    ("dispatcher.sh", "reap_kai_codex_orphan_assignment", "argv"):
+        "plan.sh reap-orphan-assignment を起こすだけ (t009 / backlog #34)。"
+        "assignment / task card を読むのは向こうの plan.sh 側 "
+        "(lib_task_cards 経由)。渡すのは agent 名の文字列だけ",
 
     # -- lib_retirement.py -------------------------------------------------
     ("lib_retirement.py", "_default_run_command", "argv"):

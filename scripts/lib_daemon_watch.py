@@ -226,9 +226,21 @@ def daemon_version_path(registry_dir, name: str) -> Path:
 
 #: Files whose content this module can act on directly: a mismatch here means
 #: `scripts/lib_daemon_watch.py restart <name>` actually fixes it.
+#: dispatcher.sh の本体 (`run_dispatch()` の python heredoc) はサイクルごとに
+#: **新しい python3 プロセス**を起動し直すので、その heredoc が `import` する
+#: `lib_*.py` はどれも次のサイクルで disk から素直に読み直される — 変更を拾うのに
+#: dispatcher の restart は要らない。restart が要るのは、この bash プロセス自身が
+#: **起動時に 1 回だけ読む**もの: `dispatcher.sh` 自身の関数定義 (heredoc のテキスト
+#: 込みで、定義された瞬間に固定される) と、`source` する `lib_daemon_watch.sh`。
+#: watchdog.py はその逆で単一の長寿命インタプリタなので、起動時に import した
+#: `lib_*.py` は最後まで disk の変更を拾わない — 直接 import はもちろん、
+#: それが更に import する先 (推移的) まで含めて全部ここに要る。
+#: どちらの一覧も `tests/test_daemon_restart_files_match_load_model.py` が実際の
+#: `source` / `import` 文 (AST) と突き合わせ、抜けがあれば落ちる。
 DAEMON_RESTART_FILES = {
     DAEMON_DISPATCHER: (
         "scripts/dispatcher.sh",
+        "scripts/lib_daemon_watch.sh",
         "scripts/lib_mux.py",
         "scripts/lib_daemon_watch.py",
         "scripts/lib_retirement.py",
@@ -237,6 +249,10 @@ DAEMON_RESTART_FILES = {
         "scripts/watchdog.py",
         "scripts/lib_daemon_watch.py",
         "scripts/lib_retirement.py",
+        "scripts/lib_mux.py",
+        "scripts/lib_pane_process.py",
+        "scripts/lib_task_cards.py",
+        "scripts/lib_daemon_state.py",
     ),
 }
 

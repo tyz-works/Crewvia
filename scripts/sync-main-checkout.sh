@@ -28,6 +28,21 @@
 # bare origin + checkout でだけ行う。dispatcher / watchdog の restart は
 # `scripts/lib_daemon_watch.py restart` を通す (pane の所有者確認・二重起動防止は
 # そちらの責務。このスクリプトはそれを素で叩かない — 不変条件 4)。
+#
+# 失敗を成功に潰さない (族A の一覧。t112 / PR#246 Codex 1 巡目 P2):
+#   箇所                          直す前                            直した後
+#   ----------------------------  --------------------------------  ------------------------------
+#   restart-targets (advisory)    process substitution の失敗が      出力を先に変数へ捕まえ、失敗を
+#                                 while read に無音で吸われる        note_failure() に積む
+#   restart-needed の比較         想定外の値 (コマンド失敗込み) は    true/false/unknown 以外・非0
+#                                 case のどの枝にも当たらず無視      終了は note_failure() に積む
+#   restart の実行                失敗しても WARNING を出すだけ      同じ WARNING に加え
+#                                                                    note_failure() に積む
+#   最後の status                 戻り値を見ない                     戻り値を見て失敗を積む
+#   全体の終了コード              上記が何件あっても exit 0          FAILURES が 1 件でもあれば
+#                                                                    非 0 で終わる (末尾の集計)
+# `git fetch` / `git merge --ff-only` 自体の失敗は元から `fail()` (即 exit 1) で
+# 正しく止まっており、この表には含めない。
 
 set -uo pipefail
 
@@ -58,6 +73,11 @@ LIB_DAEMON_WATCH="${SCRIPT_DIR}/lib_daemon_watch.py"
 say() { echo "[sync-main-checkout] $*"; }
 fail() { echo "[sync-main-checkout] $*" >&2; exit 1; }
 
+# 個別には致命的でない (即 exit しない) が、最終的な終了コードには反映する失敗の集計。
+# 上の族A の表を参照。
+FAILURES=()
+note_failure() { FAILURES+=("$1"); echo "[sync-main-checkout] FAILURE: $1" >&2; }
+
 cd "$REPO_ROOT" || fail "cannot cd to repo root: $REPO_ROOT"
 
 # --- 1. fetch (dry-run でも行う — 差分を知るには要る。working tree には触れない) ---
@@ -86,19 +106,30 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
   if [[ ${#CHANGED_FILES[@]} -gt 0 ]]; then
     say "pull されたら変わるファイル (${#CHANGED_FILES[@]} 件):"
     printf '  %s\n' "${CHANGED_FILES[@]}"
-    while IFS=' ' read -r kind name; do
-      [[ -z "$kind" ]] && continue
-      if [[ "$kind" == "daemon" ]]; then
-        say "  -> restart 対象: $name"
-      else
-        say "  -> restart 推奨 (手動。このスクリプトは実行しません): $name"
-      fi
-    done < <(printf '%s\n' "${CHANGED_FILES[@]}" | python3 "$LIB_DAEMON_WATCH" restart-targets --repo-root "$REPO_ROOT")
+    if RESTART_TARGETS_OUT="$(printf '%s\n' "${CHANGED_FILES[@]}" | python3 "$LIB_DAEMON_WATCH" restart-targets --repo-root "$REPO_ROOT")"; then
+      while IFS=' ' read -r kind name; do
+        [[ -z "$kind" ]] && continue
+        if [[ "$kind" == "daemon" ]]; then
+          say "  -> restart 対象: $name"
+        else
+          say "  -> restart 推奨 (手動。このスクリプトは実行しません): $name"
+        fi
+      done <<< "$RESTART_TARGETS_OUT"
+    else
+      note_failure "restart-targets が失敗しました (dry-run の対象一覧は不完全です)"
+    fi
   fi
   for name in dispatcher watchdog; do
-    v="$(python3 "$LIB_DAEMON_WATCH" restart-needed "$name" --repo-root "$REPO_ROOT")"
-    say "restart-needed($name) [pull 前の現在の disk 基準] = $v"
+    if v="$(python3 "$LIB_DAEMON_WATCH" restart-needed "$name" --repo-root "$REPO_ROOT")"; then
+      say "restart-needed($name) [pull 前の現在の disk 基準] = $v"
+    else
+      note_failure "restart-needed($name) が失敗しました"
+    fi
   done
+  if [[ ${#FAILURES[@]} -gt 0 ]]; then
+    say "--dry-run: ${#FAILURES[@]} 件の失敗があり、上の表示は不完全な可能性があります。"
+    exit 1
+  fi
   exit 0
 fi
 
@@ -112,10 +143,14 @@ fi
 
 # --- 3. 変わったファイルから advisory (worker / director) を報告 ---
 if [[ ${#CHANGED_FILES[@]} -gt 0 ]]; then
-  while IFS=' ' read -r kind name; do
-    [[ "$kind" == "advisory" ]] || continue
-    say "restart 推奨 (このスクリプトは実行しません — 手動で対応してください): $name"
-  done < <(printf '%s\n' "${CHANGED_FILES[@]}" | python3 "$LIB_DAEMON_WATCH" restart-targets --repo-root "$REPO_ROOT")
+  if RESTART_TARGETS_OUT="$(printf '%s\n' "${CHANGED_FILES[@]}" | python3 "$LIB_DAEMON_WATCH" restart-targets --repo-root "$REPO_ROOT")"; then
+    while IFS=' ' read -r kind name; do
+      [[ "$kind" == "advisory" ]] || continue
+      say "restart 推奨 (このスクリプトは実行しません — 手動で対応してください): $name"
+    done <<< "$RESTART_TARGETS_OUT"
+  else
+    note_failure "restart-targets が失敗しました (advisory 報告は不完全です)"
+  fi
 fi
 
 # --- 4. dispatcher / watchdog: 記録された版と disk の現在地を比較して restart ---
@@ -124,14 +159,17 @@ fi
 # (record-version が古い) やこのスクリプト以外の経路で HEAD が動いた場合もカバーする。
 ANY_RESTARTED=0
 for name in dispatcher watchdog; do
-  v="$(python3 "$LIB_DAEMON_WATCH" restart-needed "$name" --repo-root "$REPO_ROOT")"
+  if ! v="$(python3 "$LIB_DAEMON_WATCH" restart-needed "$name" --repo-root "$REPO_ROOT")"; then
+    note_failure "restart-needed($name) が非 0 で終了しました (出力: ${v:-<なし>})"
+    continue
+  fi
   case "$v" in
     true)
       say "restart-needed($name) = true -> restart します"
       if python3 "$LIB_DAEMON_WATCH" restart "$name" --repo-root "$REPO_ROOT"; then
         ANY_RESTARTED=1
       else
-        say "WARNING: restart($name) が失敗しました (理由は上に出ています)。手動で確認してください。"
+        note_failure "restart($name) が失敗しました (理由は上に出ています)。手動で確認してください。"
       fi
       ;;
     false)
@@ -140,6 +178,9 @@ for name in dispatcher watchdog; do
     unknown)
       say "restart-needed($name) = unknown (版の記録が無く比較できません — 自動 restart はしません。念のため restart するなら手で: python3 $LIB_DAEMON_WATCH restart $name)"
       ;;
+    *)
+      note_failure "restart-needed($name) が想定外の値を返しました: '$v'"
+      ;;
   esac
 done
 
@@ -147,6 +188,13 @@ done
 if [[ "$ANY_RESTARTED" -eq 1 ]]; then
   say "restart 後の状態:"
 fi
-python3 "$LIB_DAEMON_WATCH" status --repo-root "$REPO_ROOT"
+if ! python3 "$LIB_DAEMON_WATCH" status --repo-root "$REPO_ROOT"; then
+  note_failure "status サブコマンドが失敗しました"
+fi
+
+if [[ ${#FAILURES[@]} -gt 0 ]]; then
+  say "failed: ${#FAILURES[@]} 件の失敗があります (詳細は上の FAILURE 行)。HEAD=$(git rev-parse --short HEAD)"
+  exit 1
+fi
 
 say "done. HEAD=$(git rev-parse --short HEAD)"

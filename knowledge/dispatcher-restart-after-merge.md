@@ -73,14 +73,28 @@ dispatcher tab を restart せずに再検証すると **OBS-1 バグが再現�
 
 | プロセス | 再起動が必要なケース |
 |----------|-------------------|
-| `dispatcher` tab | `scripts/dispatcher.sh` / `scripts/lib_mux.py` / `scripts/lib_daemon_watch.py` / `scripts/lib_retirement.py` の変更 |
-| `watchdog` tab | `scripts/watchdog.py` / `scripts/lib_daemon_watch.py` / `scripts/lib_retirement.py` の変更 |
+| `dispatcher` tab | `scripts/dispatcher.sh` / `scripts/lib_daemon_watch.sh` / `scripts/lib_mux.py` / `scripts/lib_daemon_watch.py` / `scripts/lib_retirement.py` の変更 |
+| `watchdog` tab | `scripts/watchdog.py` / `scripts/lib_daemon_watch.py` / `scripts/lib_retirement.py` / `scripts/lib_mux.py` / `scripts/lib_pane_process.py` / `scripts/lib_task_cards.py` / `scripts/lib_daemon_state.py` の変更 |
 | Worker tab | `scripts/start.sh` の変更（スキル割り当て等） |
 | `Sora-director` | `agents/director.md` / `hooks/*.sh` の変更（プロンプト・hook 反映） |
 
 > `lib_daemon_watch.py` / `lib_retirement.py` は dispatcher・watchdog 双方が起動時に
 > import する共有モジュール。ここを直した PR は **両方** restart すること
 > (`agents/director.md` §12 と揃えてある)。
+>
+> **2026-09-28 (t112 / PR#246 Codex 1 巡目 P1) 追記**: 上の表は
+> `scripts/lib_daemon_watch.py` の `DAEMON_RESTART_FILES` の写しであり、そちらが
+> 唯一の実装。dispatcher は毎サイクル新しい python3 を起動し直すので、その
+> heredoc が import する `lib_*.py` (`lib_dep_rules.py` / `lib_task_cards.py` /
+> `lib_review_refusal.py` / `lib_worker_target.py` 等) は次のサイクルで disk から
+> 読み直され、restart は要らない — 表に載っていないのはそのため。dispatcher で
+> restart が要るのは、常駐する bash 自身が **起動時に 1 回だけ**読む
+> `dispatcher.sh` 自身と、それが `source` する `lib_daemon_watch.sh` だけ。
+> watchdog は逆に単一の長寿命インタプリタなので、起動時に import した
+> `lib_*.py` は最後まで disk の変更を拾わない — 直接 import はもちろん、
+> それが更に import する先 (推移的) まで表に要る
+> (`tests/test_daemon_restart_files_match_load_model.py` が実際の import /
+> source 文と突き合わせて固定する)。
 
 ---
 

@@ -67,7 +67,14 @@ def _make_repo(tmp_path, *, with_sync_script=True):
     """
     bare = tmp_path / "origin.git"
     checkout = tmp_path / "checkout"
-    _git(["init", "--bare", "-q", str(bare)], cwd=tmp_path)
+    # `--initial-branch=main` はホームの git 設定 (init.defaultBranch) に依存しない
+    # ようにするため。無いと、既定が "master" の環境では bare の HEAD シンボリック参照が
+    # unborn な "master" を指したままになり (push で "main" ブランチが増えても HEAD は
+    # 動かない)、`_push_remote_change()` の `git clone` がその HEAD を解決できず
+    # ("remote HEAD refers to nonexistent ref") 出来立ての clone は unborn な master の
+    # まま — そこへの commit は main ではなく master に乗り、後続の
+    # `git push origin main` が "src refspec main does not match any" で落ちる。
+    _git(["init", "--bare", "-q", "--initial-branch=main", str(bare)], cwd=tmp_path)
     _git(["init", "-q", str(checkout)], cwd=tmp_path)
     _git(["config", "user.email", "t@example.com"], cwd=checkout)
     _git(["config", "user.name", "Test"], cwd=checkout)
@@ -139,6 +146,27 @@ def test_record_and_compare_version_across_a_merge(tmp_path):
     assert w.restart_needed(registry, checkout, "dispatcher") is True
     w.record_own_version(registry, checkout, "dispatcher")
     assert w.restart_needed(registry, checkout, "dispatcher") is False
+
+
+def test_watchdog_restart_is_flagged_when_a_transitively_imported_lib_changes(tmp_path):
+    """赤の実証 (t112 / PR#246 Codex 1 巡目 P1)。`lib_pane_process.py` は
+    `watchdog.py` が起動時に直接 import する (単一の長寿命インタプリタなので
+    以後 disk の変更を拾わない) が、直す前の `DAEMON_RESTART_FILES[watchdog]` には
+    無かった — この lib だけを変える merge を経ても `restart_needed(watchdog)` は
+    ずっと false のままで、同期は watchdog を「最新」と報告しながら古いコードが
+    走り続けていた。"""
+    bare, checkout = _make_repo(tmp_path, with_sync_script=False)
+    registry = checkout / "registry"
+    w.record_own_version(registry, checkout, "watchdog")
+    assert w.restart_needed(registry, checkout, "watchdog") is False
+
+    _push_remote_change(bare, tmp_path, "scripts/lib_pane_process.py", "# v2\n")
+    _git(["fetch", "origin", "main"], cwd=checkout)
+    _git(["merge", "--ff-only", "origin/main"], cwd=checkout)
+
+    assert w.restart_needed(registry, checkout, "watchdog") is True
+    w.record_own_version(registry, checkout, "watchdog")
+    assert w.restart_needed(registry, checkout, "watchdog") is False
 
 
 def test_restart_needed_is_unknown_without_a_recorded_version(tmp_path):
@@ -297,6 +325,25 @@ def test_unknown_options_are_rejected(tmp_path):
     assert proc.returncode == 2
 
 
+def test_script_is_executable_and_runs_without_a_bash_prefix(tmp_path):
+    """権限ビット回帰ガード (t112 / PR#246 Codex 1 巡目 P2)。`_run_sync()` を含む
+    他の全テストは `["bash", str(script), ...]` で明示的に bash へ渡すため、
+    実行ビットが落ちていても (docs / 版ずれ通知が指示する直接実行の形では
+    Permission denied になっても) 気付けない。ここだけは `./sync-main-checkout.sh`
+    と同じ形 (シェバンと実行ビットに頼る直接実行) で確かめる。"""
+    _, checkout = _make_repo(tmp_path)
+    script = checkout / "scripts" / "sync-main-checkout.sh"
+    assert os.access(script, os.X_OK), (
+        f"{script} lacks the executable bit — direct execution "
+        "(as docs instruct) would fail with Permission denied")
+
+    proc = subprocess.run(
+        [str(script), "--dry-run", "--repo-root", str(checkout)],
+        cwd=str(checkout), capture_output=True, text=True, env=_isolated_env())
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "up to date" in proc.stdout
+
+
 # ---------------------------------------------------------------------------
 # restart の呼び出し配線だけを、本物の mux に一切触れずに確かめる
 # ---------------------------------------------------------------------------
@@ -357,3 +404,101 @@ def test_sync_invokes_restart_when_a_daemon_is_flagged(tmp_path):
     assert "restart watchdog" not in calls   # false だったので呼ばれない
     assert "status " in calls or "status" in calls
     assert "stub restarted dispatcher" in proc.stderr
+
+
+# ---------------------------------------------------------------------------
+# 個々の失敗が最終的な非 0 終了に落ちる (赤の実証: t112 / PR#246 Codex 1 巡目 P2)
+# ---------------------------------------------------------------------------
+#
+# `test_sync_invokes_restart_when_a_daemon_is_flagged` のスタブは常に exit 0 な
+# ので、"個々の失敗を集めて非 0 で返す" という直した振る舞いはこの下のテスト群
+# でしか確かめられない。`STUB_FAIL_CMDS` (カンマ区切りの `<cmd>` か `<cmd>:<name>`)
+# に挙がったサブコマンド呼び出しだけを exit 1 にする。
+
+_STUB_LIB_DAEMON_WATCH_WITH_FAILURES = '''#!/usr/bin/env python3
+"""スタブ: 4 つのサブコマンドを実装し、STUB_FAIL_CMDS に挙げた呼び出しだけ
+非 0 で終了する。本物の Mux には一切触れない。"""
+import argparse, json, os, sys
+
+p = argparse.ArgumentParser()
+sub = p.add_subparsers(dest="cmd", required=True)
+for name in ("restart-needed", "restart", "status"):
+    sp = sub.add_parser(name)
+    sp.add_argument("name", nargs="?")
+    sp.add_argument("--repo-root")
+    sp.add_argument("--force", action="store_true")
+sp = sub.add_parser("restart-targets")
+sp.add_argument("--repo-root")
+args = p.parse_args()
+
+fail_specs = set(x for x in os.environ.get("STUB_FAIL_CMDS", "").split(",") if x)
+key = f"{args.cmd}:{args.name}" if args.name else args.cmd
+if args.cmd in fail_specs or key in fail_specs:
+    print(f"stub: injected failure for {key}", file=sys.stderr)
+    sys.exit(1)
+
+if args.cmd == "restart-needed":
+    flags = json.loads(os.environ.get("STUB_RESTART_FLAGS", "{}"))
+    print(flags.get(args.name, "unknown"))
+elif args.cmd == "restart-targets":
+    pass  # 出力なし = 何も advisory は無い
+elif args.cmd == "restart":
+    print(f"stub restarted {args.name}", file=sys.stderr)
+elif args.cmd == "status":
+    print("stub status: ok")
+sys.exit(0)
+'''
+
+
+def _run_sync_with_failure_stub(checkout, *, fail_cmds="", restart_flags=None):
+    (checkout / "scripts" / "lib_daemon_watch.py").write_text(_STUB_LIB_DAEMON_WATCH_WITH_FAILURES)
+    env = _isolated_env()
+    env["STUB_FAIL_CMDS"] = fail_cmds
+    env["STUB_RESTART_FLAGS"] = json.dumps(
+        restart_flags or {"dispatcher": "false", "watchdog": "false"})
+    return subprocess.run(
+        ["bash", str(checkout / "scripts" / "sync-main-checkout.sh"),
+         "--repo-root", str(checkout)],
+        cwd=str(checkout), capture_output=True, text=True, env=env)
+
+
+def test_restart_needed_failure_is_not_swallowed(tmp_path):
+    """直す前: watchdog の比較が壊れていても case のどの枝にも当たらず無視され、
+    exit 0 のまま "restart-needed(watchdog)" の行も出ないだけで通り過ぎていた。"""
+    _, checkout = _make_repo(tmp_path)
+    proc = _run_sync_with_failure_stub(checkout, fail_cmds="restart-needed:watchdog")
+    assert proc.returncode != 0, proc.stdout + proc.stderr
+    assert "FAILURE" in proc.stderr
+    # 壊れていない dispatcher 側の判定は生きている (1 つの失敗が他を巻き込んで
+    # 握りつぶさない)。
+    assert "restart-needed(dispatcher) = false" in proc.stdout
+
+
+def test_restart_execution_failure_is_not_swallowed(tmp_path):
+    """直す前: restart(name) が失敗しても WARNING を出すだけで exit 0 だった。"""
+    _, checkout = _make_repo(tmp_path)
+    proc = _run_sync_with_failure_stub(
+        checkout, fail_cmds="restart:dispatcher",
+        restart_flags={"dispatcher": "true", "watchdog": "false"})
+    assert proc.returncode != 0, proc.stdout + proc.stderr
+    assert "FAILURE" in proc.stderr
+
+
+def test_status_failure_is_not_swallowed(tmp_path):
+    """直す前: 最後の status の戻り値は見ておらず、その次の "done" 行で
+    成功したように見えていた。"""
+    _, checkout = _make_repo(tmp_path)
+    proc = _run_sync_with_failure_stub(checkout, fail_cmds="status")
+    assert proc.returncode != 0, proc.stdout + proc.stderr
+    assert "FAILURE" in proc.stderr
+    assert "done." not in proc.stdout
+
+
+def test_restart_targets_failure_is_not_swallowed(tmp_path):
+    """直す前: advisory 一覧の取得が失敗しても process substitution の中で無音に
+    吸われ、advisory が 0 件だったのか取得自体が壊れていたのか区別できなかった。"""
+    bare, checkout = _make_repo(tmp_path)
+    _push_remote_change(bare, tmp_path, "README.md", "unrelated change\n")
+    proc = _run_sync_with_failure_stub(checkout, fail_cmds="restart-targets")
+    assert proc.returncode != 0, proc.stdout + proc.stderr
+    assert "FAILURE" in proc.stderr

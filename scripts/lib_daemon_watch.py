@@ -99,8 +99,11 @@ import argparse
 import contextlib
 import errno
 import fcntl
+import fnmatch
+import hashlib
 import json
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -195,6 +198,230 @@ def watch_state_path(registry_dir, name: str) -> Path:
 def reports_path(registry_dir, name: str) -> Path:
     """Undelivered Director reports owned by `name` (the *reporter*)."""
     return daemons_dir(registry_dir) / f"{name}.reports.json"
+
+
+def daemon_version_path(registry_dir, name: str) -> Path:
+    """Where `record_own_version()` snapshots what `name` actually loaded."""
+    return daemons_dir(registry_dir) / f"{name}.version.json"
+
+
+# ---------------------------------------------------------------------------
+# Main-checkout drift detection (t005 / B2 / backlog #26)
+# ---------------------------------------------------------------------------
+#
+# dispatcher.sh embeds its Python as a heredoc that bash reads once, when the
+# daemon process starts (see the file's own header comment); watchdog.py is a
+# single long-running interpreter.  Either way, a `git merge` into the main
+# checkout after that moment changes the files on disk without changing what
+# the running process has loaded.  `record_own_version()` snapshots what was
+# actually loaded — the repo's HEAD and a digest of the files that matter for
+# this daemon — once, at startup, so a later cycle can compare *that* against
+# the current disk state and notice the running instance has gone stale.
+#
+# `agents/director.md` §12 has one table of "which files require restarting
+# which process".  It stays the single source of truth here instead — the
+# drift detector (dispatcher.sh) and sync-main-checkout.sh both read it,
+# rather than keeping their own copies that could quietly drift apart from
+# each other (the same shape of bug this whole feature exists to catch).
+
+#: Files whose content this module can act on directly: a mismatch here means
+#: `scripts/lib_daemon_watch.py restart <name>` actually fixes it.
+DAEMON_RESTART_FILES = {
+    DAEMON_DISPATCHER: (
+        "scripts/dispatcher.sh",
+        "scripts/lib_mux.py",
+        "scripts/lib_daemon_watch.py",
+        "scripts/lib_retirement.py",
+    ),
+    DAEMON_WATCHDOG: (
+        "scripts/watchdog.py",
+        "scripts/lib_daemon_watch.py",
+        "scripts/lib_retirement.py",
+    ),
+}
+
+#: The rest of director.md §12's table: processes this module has no way to
+#: restart itself (a Worker tab is a Claude session; the Director is the
+#: operator watching all of this).  Kept in the same table shape so
+#: sync-main-checkout.sh can report "restart recommended" without inventing a
+#: second table that could disagree with this one.
+RESTART_ADVISORY_FILES = {
+    "worker": ("scripts/start.sh",),
+    "director": ("agents/director.md", "hooks/*.sh"),
+}
+
+
+def affected_targets(changed_files, table) -> List[str]:
+    """Which keys of `table` (a name -> glob-pattern-tuple mapping) are hit by
+    at least one path in `changed_files`.
+
+    `changed_files` are repo-root-relative, forward-slash paths — exactly
+    what `git diff --name-only` prints.  A pattern with no wildcard behaves as
+    an exact match under `fnmatch`, so literal filenames and globs (`hooks/*.sh`)
+    share one matching rule.
+    """
+    changed = list(changed_files)
+    hit = []
+    for name, patterns in table.items():
+        if any(fnmatch.fnmatch(f, pat) for f in changed for pat in patterns):
+            hit.append(name)
+    return hit
+
+
+def _git_head(repo_root) -> Optional[str]:
+    """`git rev-parse HEAD`, or None on any failure (never raises)."""
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(repo_root), "rev-parse", "HEAD"],
+            capture_output=True, timeout=10, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if out.returncode != 0:
+        return None
+    head = out.stdout.decode("utf-8", errors="replace").strip()
+    return head or None
+
+
+def _files_digest(repo_root, relpaths) -> str:
+    """sha256 over each file's path and content — a stable version fingerprint.
+
+    Reads through `read_regular_text_or_unreadable()` rather than
+    `Path.read_bytes()` directly: a plain `open()`/`read_bytes()` blocks
+    forever on a writer-less FIFO, which is exactly the hang
+    `lib_task_cards`'s guarded entry exists to prevent
+    (`tests/test_queue_reads_go_through_the_guard.py`). `relpaths` here is
+    always `DAEMON_RESTART_FILES[name]` — a fixed literal, never external
+    input — but the entry point is cheap to use and keeps this module's
+    reads on the one audited path.
+
+    Never raises: an unreadable or missing file folds into the digest as a
+    sentinel rather than aborting, so a version record can always be produced
+    (and a file that appears/disappears still changes the digest).
+    """
+    h = hashlib.sha256()
+    for rel in sorted(relpaths):
+        h.update(rel.encode("utf-8"))
+        h.update(b"\0")
+        text = read_regular_text_or_unreadable(Path(repo_root, rel))
+        h.update(b"<unreadable>" if is_unreadable(text) else text.encode("utf-8"))
+        h.update(b"\0")
+    return h.hexdigest()
+
+
+def version_entry_problem(data) -> Optional[str]:
+    """`<name>.version.json` の形が使えない理由 (使えれば None)。
+
+    書き手 (`record_own_version`) と同じ形を要求する。`head` は git が読めない
+    環境 (テスト用の非 git ディレクトリ等) では None もありうるので型だけ緩く
+    見るが、`files_digest` / `recorded_at` は必須 — これが欠けると比較のしようが
+    なく、`restart_needed()` が常に「不明」に倒れてしまう。
+    """
+    head = data.get("head")
+    if head is not None and not isinstance(head, str):
+        return f"'head' is {head!r}, expected a string or null"
+    digest = data.get("files_digest")
+    if not isinstance(digest, str) or not digest:
+        return f"'files_digest' is {digest!r}, expected a non-empty string"
+    if not is_finite_number(data.get("recorded_at")):
+        return f"'recorded_at' is {data.get('recorded_at')!r}, expected a finite timestamp"
+    files = data.get("files")
+    if not isinstance(files, list) or not all(isinstance(f, str) for f in files):
+        return f"'files' is {files!r}, expected a list of strings"
+    return None
+
+
+def record_own_version(registry_dir, repo_root, name: str) -> dict:
+    """Snapshot what this process has actually loaded, once, at startup.
+
+    Call this before the daemon's main loop starts — recording it mid-run
+    would capture the disk's current state rather than what was loaded when
+    the process began, defeating the point.
+    """
+    files = list(DAEMON_RESTART_FILES.get(name, ()))
+    record = {
+        "daemon": name,
+        "head": _git_head(repo_root),
+        "files": files,
+        "files_digest": _files_digest(repo_root, files),
+        "recorded_at": time.time(),
+    }
+    write_json_atomic(daemon_version_path(registry_dir, name), record)
+    return record
+
+
+def read_own_version(registry_dir, name: str):
+    """The recorded version, or `Unreadable` (never `None`/`{}` — see
+    `lib_daemon_state.load_json_store`)."""
+    return load_json_store(daemon_version_path(registry_dir, name),
+                           check=version_entry_problem)
+
+
+def restart_needed(registry_dir, repo_root, name: str) -> Optional[bool]:
+    """Does `name`'s recorded version differ from what is on disk right now?
+
+    None ("unknown") when the recorded version cannot be read — a daemon that
+    predates this feature, or a corrupt store.  "Cannot compare" must not be
+    reported as "no drift": that would let a genuinely stale daemon go
+    unnoticed forever, which is the exact failure this function exists to
+    catch (`knowledge/dispatcher-restart-after-merge.md`).
+    """
+    recorded = read_own_version(registry_dir, name)
+    if is_unreadable(recorded):
+        return None
+    current_digest = _files_digest(repo_root, DAEMON_RESTART_FILES.get(name, ()))
+    return current_digest != recorded.get("files_digest")
+
+
+def fetch_origin(repo_root, *, remote: str = "origin", branch: str = "main",
+                 timeout: float = 20.0) -> bool:
+    """`git fetch <remote> <branch>`. Returns success; never raises.
+
+    A hung or unreachable remote must not be able to stall the caller's
+    cycle, so this always runs under a timeout.
+    """
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(repo_root), "fetch", remote, branch],
+            capture_output=True, timeout=timeout, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return out.returncode == 0
+
+
+def commits_behind(repo_root, ref: str = "origin/main") -> Optional[int]:
+    """How many commits `ref` is ahead of HEAD, or None if it cannot be told
+    (git unavailable, `ref` unknown — e.g. fetch never succeeded)."""
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(repo_root), "rev-list", "--count", f"HEAD..{ref}"],
+            capture_output=True, timeout=10, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if out.returncode != 0:
+        return None
+    text = out.stdout.decode("utf-8", errors="replace").strip()
+    return int(text) if text.isdigit() else None
+
+
+def changed_files_vs(repo_root, ref: str = "origin/main") -> Optional[List[str]]:
+    """`git diff --name-only HEAD <ref>`, or None if it cannot be told.
+
+    Read-only: does not fetch, merge, or touch the working tree.
+    """
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(repo_root), "diff", "--name-only", "HEAD", ref],
+            capture_output=True, timeout=10, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if out.returncode != 0:
+        return None
+    text = out.stdout.decode("utf-8", errors="replace")
+    return [line for line in text.splitlines() if line]
 
 
 def lock_path(registry_dir, name: str) -> Path:
@@ -1534,6 +1761,18 @@ def main(argv: Optional[List[str]] = None) -> int:
                    help="restart even when the pane's owner cannot be shown "
                         "to be this checkout")
 
+    _sub("record-version", "snapshot this checkout's HEAD + restart-file "
+                           "digest for <name> (call once, at startup)")
+
+    _sub("restart-needed", "does <name>'s recorded version differ from disk "
+                           "right now? prints true / false / unknown")
+
+    sp = sub.add_parser(
+        "restart-targets",
+        help="which daemons/advisory targets are hit by changed files "
+             "(one repo-relative path per line on stdin)")
+    sp.add_argument("--repo-root", type=Path, default=_repo_root_default())
+
     args = parser.parse_args(argv)
     repo_root = Path(args.repo_root).resolve()
     registry_dir = repo_root / "registry"
@@ -1619,6 +1858,24 @@ def main(argv: Optional[List[str]] = None) -> int:
         # is what a script driving this will actually branch on.
         return 0 if restart(args.name, repo_root=repo_root, force=args.force,
                             log=lambda m: print(m, file=sys.stderr)) else 1
+
+    if args.cmd == "record-version":
+        record = record_own_version(registry_dir, repo_root, args.name)
+        print(json.dumps(record, sort_keys=True))
+        return 0
+
+    if args.cmd == "restart-needed":
+        v = restart_needed(registry_dir, repo_root, args.name)
+        print("unknown" if v is None else ("true" if v else "false"))
+        return 0
+
+    if args.cmd == "restart-targets":
+        changed = [line.strip() for line in sys.stdin if line.strip()]
+        for target in affected_targets(changed, DAEMON_RESTART_FILES):
+            print(f"daemon {target}")
+        for target in affected_targets(changed, RESTART_ADVISORY_FILES):
+            print(f"advisory {target}")
+        return 0
 
     return 2  # pragma: no cover - argparse rejects unknown commands
 

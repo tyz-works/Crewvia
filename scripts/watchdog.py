@@ -1273,6 +1273,18 @@ def run(repo_root: Path, interval: int) -> None:
     )
     _beat()
 
+    # B2 / #26: snapshot what this process actually loaded (HEAD + a digest of
+    # the restart-triggering files), once, at startup. A `git merge` into the
+    # main checkout after this point changes disk without changing what this
+    # long-running interpreter has already imported — recording here (not
+    # later, from inside the loop) is what lets a future cycle compare "what
+    # is running" against "what is on disk" and notice the gap.
+    try:
+        lib_daemon_watch.record_own_version(registry_dir, repo_root,
+                                            lib_daemon_watch.DAEMON_WATCHDOG)
+    except Exception as e:
+        _log(f"WARNING: record_own_version failed (non-fatal): {e!r}")
+
     _backend_name = type(_mux._backend).__name__
     _log(
         f"Starting Watchdog v2 (PID {os.getpid()}, interval={interval}s, "

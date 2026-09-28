@@ -933,6 +933,20 @@ ALLOWED_SUBPROCESS_CALLS = {
     ("lib_mux.py", "_herdr_run_raw", "cmd"): "同上 (JSON に包まない版)",
     ("lib_mux.py", "_herdr_start_server", "_HERDR_CLI['server_start']"):
         "herdr サーバーを起こす",
+
+    # -- lib_daemon_watch.py: 主 checkout の版ずれ検知 (B2 / #26) -----------
+    # どれも `git` に repo の HEAD / 履歴 / 差分ファイル名を訊くだけで、
+    # queue / registry / config のカードは 1 つも渡していない (_resolve_head_commit
+    # と同じ形)。差分の **中身** ではなく **ファイル名一覧** しか受け取らない
+    # (changed_files_vs)。
+    ("lib_daemon_watch.py", "_git_head", "git"):
+        "`git rev-parse HEAD`。queue / registry のファイルは渡していない",
+    ("lib_daemon_watch.py", "fetch_origin", "git"):
+        "`git fetch origin main`。同上",
+    ("lib_daemon_watch.py", "commits_behind", "git"):
+        "`git rev-list --count`。同上",
+    ("lib_daemon_watch.py", "changed_files_vs", "git"):
+        "`git diff --name-only`。ファイル名一覧のみで、中身は読ませていない",
 }
 
 

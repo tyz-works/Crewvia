@@ -90,6 +90,16 @@ log() {
 
 log "Starting dispatcher (PID $$, queue=$QUEUE_DIR)"
 
+# B2 / #26: この bash プロセスが起動した時点で、実際に読み込まれたコードの版
+# (HEAD sha + 対象ファイルの digest) を 1 回だけ記録する。以降 disk が
+# `git merge` で変わっても、この記録はこのプロセスが実際に持っているものを
+# 指し続ける — 起動後に record し直すと「今の disk」を記録してしまい、
+# 版ずれ検知が常に「ずれていない」を返す無意味なものになる。
+# 失敗しても dispatcher 自体の起動は止めない (`|| true`) — バージョン記録は
+# 運用上の便宜であり、dispatch を止める理由にはならない。
+python3 "${SCRIPT_DIR}/lib_daemon_watch.py" record-version dispatcher \
+  --repo-root "$REPO_ROOT" >> "$LOG_FILE" 2>&1 || log "record-version failed (non-fatal)"
+
 # ---------------------------------------------------------------------------
 # One dispatch cycle — implemented in Python for YAML / file parsing
 # ---------------------------------------------------------------------------
@@ -953,6 +963,32 @@ def prune_told(live_keys, observed_slugs):
     # ときだけ (離脱を観測できたときだけ) 捨てるので、倒す向きが変わらない。
     for k in stale:
         forget_notify(f'{k}#')
+
+
+def clear_told_key(key):
+    """台帳から 1 件だけ消す (`prune_told` と違い、queue の mission/task に紐づかない
+    通知向け — B2 の main-checkout-drift はどの mission の slug にも属さないので
+    `observed_slugs` 経由の prune では拾えない)。状態が「きれいになった」ときに
+    呼ぶことで、次に同じ fingerprint の状態が来ても再通知される (解消後の再通知)。
+    ロックが取れなければ何もしない (次のサイクルでやり直す。消し忘れの直接の害は
+    「同じ状態が繰り返し起きたときにだけ再通知が 1 サイクル遅れる」だけで、
+    通知そのものが消えるわけではない)。
+
+    台帳の記録だけでなくスロットル (`<key>#<fp>`) も捨てる — `prune_told()` と同じ
+    理由 (t021 / Kai P2): 消さないと、同じ fingerprint がもう一度起きたとき
+    `already_told` は「伝えていない」を返すのに `should_notify(throttle_key)` が
+    NOTIFY_TTL のあいだ遮り、解消後の再通知が最大 5 分遅れる。
+    """
+    with told_lock(TOLD_FILE) as held:
+        if not held:
+            return
+        told = load_told()
+        if is_unreadable(told):
+            return
+        if key in told:
+            del told[key]
+            save_told(told)
+    forget_notify(f'{key}#')
 
 
 def observed_missions(all_tasks, active_missions):
@@ -2614,6 +2650,120 @@ def run_daemon_watch():
         log(f"[daemon-watch] cycle failed: {e!r}")
 
 
+# ---------------------------------------------------------------------------
+# Main-checkout drift detection (t005 / B2 / #26)
+# ---------------------------------------------------------------------------
+#
+# merge のたびに Director が手で「主 checkout を ff → 変わったファイルに応じて
+# dispatcher / watchdog を restart」してきた (前 mission で 9 回)。忘れると
+# merge 済みの修正が本番で動かず、誤診断の元になる
+# (knowledge/dispatcher-restart-after-merge.md)。ここでは検知して Director に
+# 1 回だけ知らせるところまでを行う — restart するかどうかは
+# scripts/sync-main-checkout.sh を人が実行する (デーモンが自分で自分を
+# restart したり、Worker が主 checkout を触ったりはしない、という mission の方針)。
+
+#: 数分に 1 回でよい (`git fetch` は 5 秒ごとのサイクルでは重すぎる)。housekeeping の
+#: 周期であって dispatcher と plan.sh が答えを揃えなければならない共有規則ではないので
+#: env での調整を許す (memory: no-env-killswitch-for-shared-rule はそこが違う)。
+MAIN_CHECKOUT_DRIFT_INTERVAL = float(os.environ.get('CREWVIA_MAIN_CHECKOUT_DRIFT_INTERVAL', '180'))
+DRIFT_CHECK_STATE = REGISTRY_DIR / 'daemons' / 'main-checkout-drift-check.json'
+
+
+def drift_check_state_problem(data):
+    if not is_finite_number(data.get('last_checked_at')):
+        return f"'last_checked_at' is {data.get('last_checked_at')!r}, expected a finite timestamp"
+    return None
+
+
+def _drift_check_due(now):
+    state = load_json_store(DRIFT_CHECK_STATE, check=drift_check_state_problem)
+    if is_missing(state) or is_unreadable(state):
+        # 読めない/まだ無い場合は「調べる」側に倒す — git fetch が少し早く走る
+        # だけで、逆に倒すと壊れた台帳が検知そのものを恒久的に止めてしまう。
+        return True
+    return (now - state['last_checked_at']) >= MAIN_CHECKOUT_DRIFT_INTERVAL
+
+
+def _mark_drift_checked(now):
+    path = DRIFT_CHECK_STATE
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f'.{path.name}.{os.getpid()}.tmp')
+        tmp.write_text(json.dumps({'last_checked_at': now}))
+        os.replace(tmp, path)
+    except OSError as e:
+        log(f"WARNING: cannot write {path}: {e}")
+
+
+def check_main_checkout_drift():
+    """主 checkout の版ずれを検知し、Director に 1 回だけ知らせる。
+
+    2 つの独立した検知:
+    (a) origin/main が主 checkout の HEAD より進んでいる (merge 済みの fix が
+        まだ pull されていない)
+    (b) dispatcher / watchdog が起動時に記録した版と、ディスク上の対象ファイルが
+        一致しない (pull 済みだがそのデーモンが未 restart)
+
+    どちらも「観測できない」(git fetch 失敗・版の記録が読めない) ときは通知しない
+    — 誤報より沈黙の方が安く、確かめたい人は sync-main-checkout.sh --dry-run を
+    いつでも自分で実行できる。全体を try/except で包むのは run_daemon_watch() と
+    同じ理由: 安全網が dispatch サイクルを落としてはならない。
+    """
+    try:
+        import lib_daemon_watch
+        now = time.time()
+        if not _drift_check_due(now):
+            return
+        _mark_drift_checked(now)
+
+        origin_ahead = None
+        if lib_daemon_watch.fetch_origin(REPO_ROOT):
+            origin_ahead = lib_daemon_watch.commits_behind(REPO_ROOT)
+
+        restart_flags = {
+            name: lib_daemon_watch.restart_needed(REGISTRY_DIR, REPO_ROOT, name)
+            for name in lib_daemon_watch.DAEMONS
+        }
+        drifted_daemons = sorted(n for n, v in restart_flags.items() if v)
+        has_origin_drift = bool(origin_ahead)  # None・0 はどちらも False 扱い
+
+        if not has_origin_drift and not drifted_daemons:
+            # きれいな状態。前回の drift 通知が台帳に残っていれば畳んでおく —
+            # そうしないと、次にまったく同じ fingerprint の drift が起きたとき
+            # (滅多に無いが、同じ commit 数・同じ daemon の組の再発) already_told
+            # に遮られて再通知されない。
+            clear_told_key('main-checkout-drift')
+            return
+
+        fp = fingerprint(origin_ahead, drifted_daemons)
+
+        def build_msg():
+            lines = ['[main-checkout-drift] 主 checkout の同期が必要です。']
+            if has_origin_drift:
+                lines.append(f'- origin/main が {origin_ahead} commit 進んでいます (未 pull)。')
+            if drifted_daemons:
+                lines.append('- 稼働中で版がずれているデーモン: ' + ', '.join(drifted_daemons))
+            for name, v in restart_flags.items():
+                if v is None:
+                    lines.append(
+                        f'  ({name} は版の記録が無く比較できません — 次に restart '
+                        f'されたときから記録されます)'
+                    )
+            lines.append(
+                'scripts/sync-main-checkout.sh を実行してください '
+                '(--dry-run で内容だけ先に確認できます)。'
+            )
+            return '\n'.join(lines)
+
+        if notify_state_once('main-checkout-drift', fp, 'main-checkout-drift',
+                             '_daemon', 'main-checkout', build_msg,
+                             director_live=director_live_for_state_notices):
+            log(f'main-checkout-drift detected: origin_ahead={origin_ahead} '
+                f'restart_flags={restart_flags} -> notified director')
+    except Exception as e:
+        log(f'[main-checkout-drift] check failed: {e!r}')
+
+
 # --- CYCLE ENTRY POINT ---
 # Everything below this marker runs a full dispatch cycle.  Tests that want to
 # exercise a single helper (tests/test_orphan_daemon_guard.py) exec() the code
@@ -2624,6 +2774,7 @@ def run_daemon_watch():
 # would otherwise take the observer down with it — at exactly the moment the
 # system is least healthy and most in need of it.
 run_daemon_watch()
+check_main_checkout_drift()
 publish_agents()
 dispatch()
 # t002: both are queue/registry bookkeeping, not dispatch decisions, and both

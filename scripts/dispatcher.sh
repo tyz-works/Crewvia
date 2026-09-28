@@ -2665,7 +2665,34 @@ def run_daemon_watch():
 #: 数分に 1 回でよい (`git fetch` は 5 秒ごとのサイクルでは重すぎる)。housekeeping の
 #: 周期であって dispatcher と plan.sh が答えを揃えなければならない共有規則ではないので
 #: env での調整を許す (memory: no-env-killswitch-for-shared-rule はそこが違う)。
-MAIN_CHECKOUT_DRIFT_INTERVAL = float(os.environ.get('CREWVIA_MAIN_CHECKOUT_DRIFT_INTERVAL', '180'))
+DEFAULT_MAIN_CHECKOUT_DRIFT_INTERVAL = 180.0
+
+
+def _parse_drift_interval(raw):
+    """`CREWVIA_MAIN_CHECKOUT_DRIFT_INTERVAL` を検証する (t114 / PR#246 Codex 2巡目 P2-2)。
+
+    このモジュールは `run_dispatch()` が毎サイクル python プロセスを丸ごと作り直して
+    実行するので、この行はここに `float()` を素で置くだけで **module import 時 = 毎
+    サイクル** 評価される。空・非数・`nan`・`inf`・負の値が入ると
+    `check_main_checkout_drift()` の try/except より手前 (import 中) で例外が飛び、
+    以降の `publish_agents()` / `dispatch()` まで含めてサイクル全体が毎回黙って
+    死ぬ (bash の while ループ自体は健全な heartbeat を出し続けるので気付けない)。
+    不正な値は既定値に戻し、警告だけ出して dispatch は止めない。
+    """
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        value = None
+    if value is None or not is_finite_number(value) or value < 0:
+        log(f"WARNING: invalid CREWVIA_MAIN_CHECKOUT_DRIFT_INTERVAL={raw!r} "
+            f"(finite・非負の秒数である必要があります) — "
+            f"既定値 {DEFAULT_MAIN_CHECKOUT_DRIFT_INTERVAL} を使います")
+        return DEFAULT_MAIN_CHECKOUT_DRIFT_INTERVAL
+    return value
+
+
+MAIN_CHECKOUT_DRIFT_INTERVAL = _parse_drift_interval(
+    os.environ.get('CREWVIA_MAIN_CHECKOUT_DRIFT_INTERVAL', str(DEFAULT_MAIN_CHECKOUT_DRIFT_INTERVAL)))
 DRIFT_CHECK_STATE = REGISTRY_DIR / 'daemons' / 'main-checkout-drift-check.json'
 
 
@@ -2725,14 +2752,35 @@ def check_main_checkout_drift():
             for name in lib_daemon_watch.DAEMONS
         }
         drifted_daemons = sorted(n for n, v in restart_flags.items() if v)
-        has_origin_drift = bool(origin_ahead)  # None・0 はどちらも False 扱い
+        has_origin_drift = bool(origin_ahead)  # 検知の方向は None・0 とも False 扱いでよい
+        # (誤報より沈黙が安い、上のdocstring参照)。
+
+        # 台帳を畳んでよいのは「きれいだと確認できた」ときだけ (t114 / PR#246 Codex
+        # 2巡目 P2-1)。origin_ahead=None (fetch 失敗) や restart_flags[name]=None
+        # (版の記録が読めない) は「不明」であって「0」でも「ずれ無し」でもない。
+        # 直す前は has_origin_drift/drifted_daemons が両方 False になった瞬間に
+        # 台帳を消していたので、一時的な fetch 失敗が「解消した」と誤読され、
+        # origin が実際は進んだままの状態で次に fetch が成功すると同じ drift の
+        # fingerprint が「初めて」に見えて 2 回目の通知が出てしまう。
+        all_confirmed_clean = (
+            origin_ahead == 0
+            and all(v is False for v in restart_flags.values())
+        )
 
         if not has_origin_drift and not drifted_daemons:
-            # きれいな状態。前回の drift 通知が台帳に残っていれば畳んでおく —
-            # そうしないと、次にまったく同じ fingerprint の drift が起きたとき
-            # (滅多に無いが、同じ commit 数・同じ daemon の組の再発) already_told
-            # に遮られて再通知されない。
-            clear_told_key('main-checkout-drift')
+            if all_confirmed_clean:
+                # きれいな状態だと確認できた。前回の drift 通知が台帳に残っていれば
+                # 畳んでおく — そうしないと、次にまったく同じ fingerprint の drift が
+                # 起きたとき (滅多に無いが、同じ commit 数・同じ daemon の組の再発)
+                # already_told に遮られて再通知されない。
+                clear_told_key('main-checkout-drift')
+            else:
+                # 観測のどれかが不明 (fetch 失敗・版の記録が読めない)。過去に通知
+                # 済みの記録があるなら、それを「解消した」と誤読して消してはいけない
+                # — 消さずに保つのが安全側で、次に観測できたときにまた自然に畳まれる。
+                log('[main-checkout-drift] some observations unknown '
+                    f'(origin_ahead={origin_ahead!r} restart_flags={restart_flags!r}) — '
+                    'leaving any existing notification record untouched')
             return
 
         fp = fingerprint(origin_ahead, drifted_daemons)

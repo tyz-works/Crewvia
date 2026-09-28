@@ -215,3 +215,126 @@ def test_never_raises_even_if_lib_daemon_watch_blows_up(h):
     def boom(*a, **kw):
         raise RuntimeError("git fetch exploded")
     assert h.run(fetch_fn=boom) == []   # 例外を飲み込んで、何も送らずに終わる
+
+
+# ---------------------------------------------------------------------------
+# t114 / PR#246 Codex 2巡目 P2-1: fetch 失敗は「解消した」に潰さない
+# ---------------------------------------------------------------------------
+
+def test_fetch_failure_does_not_clear_the_ledger_and_avoid_duplicate_notify(h):
+    """一度通知した後に fetch が一時的に失敗しても、台帳を消してはいけない。
+
+    直す前は origin_ahead=None を「0 と同じ」に読み、restart_flags も両方
+    False (=ずれ無し) だったので「きれいな状態」に落ちて台帳を畳んでいた。
+    origin/main は実際には進んだままなので、次に fetch が成功して同じ
+    fingerprint (ahead=2) が戻ってきたときに 2 回目の通知が出てしまう。
+    """
+    assert len(h.run(fetch_ok=True, ahead=2,
+                     restart_flags={"dispatcher": False, "watchdog": False})) == 1
+    # fetch が一時的に失敗する (origin_ahead=None) — 観測できないだけで解消していない。
+    assert h.run(fetch_ok=False, ahead=None,
+                restart_flags={"dispatcher": False, "watchdog": False}) == []
+    # 次の fetch が成功し、drift がまだ残っている (ahead=2) — 再通知されないこと。
+    assert h.run(fetch_ok=True, ahead=2,
+                restart_flags={"dispatcher": False, "watchdog": False}) == []
+    # 実際に解消 (ahead=0) すれば、台帳は畳まれ、再発時にまた通知できる。
+    assert h.run(fetch_ok=True, ahead=0,
+                restart_flags={"dispatcher": False, "watchdog": False}) == []
+    assert len(h.run(fetch_ok=True, ahead=2,
+                     restart_flags={"dispatcher": False, "watchdog": False})) == 1
+
+
+def test_unreadable_restart_record_does_not_clear_the_ledger(h):
+    """origin は綺麗でも、いずれかのデーモンの版記録が読めない (None) だけで
+    「確認できた」ことにはならない — 同じ理由で台帳を消してはいけない。"""
+    assert len(h.run(fetch_ok=True, ahead=0,
+                     restart_flags={"dispatcher": True, "watchdog": False})) == 1
+    # dispatcher の版記録が読めなくなった (None) — 「直った」のか「観測できない」
+    # のか区別が付かないので、台帳は消さない。
+    assert h.run(fetch_ok=True, ahead=0,
+                restart_flags={"dispatcher": None, "watchdog": False}) == []
+    # 版記録が復旧し、実際にはまだ drift していた (True) — 再通知されないこと
+    # (畳まれていたら「初めて」に見えて再通知されてしまう)。
+    assert h.run(fetch_ok=True, ahead=0,
+                restart_flags={"dispatcher": True, "watchdog": False}) == []
+
+
+# ---------------------------------------------------------------------------
+# t114 / PR#246 Codex 2巡目 P2-2: 不正な env は dispatch サイクル全体を
+# 黙って毎回落とす (この harness は CYCLE ENTRY POINT を切り落とすので、
+# 「モジュール import そのものが落ちる」ことを見るには exec() を分けて行う)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("bad_value", ["", "abc", "nan", "inf", "-1"])
+def test_invalid_drift_interval_reaches_dispatch_without_crashing(tmp_path, monkeypatch, bad_value):
+    """不正な `CREWVIA_MAIN_CHECKOUT_DRIFT_INTERVAL` は、
+    `run_daemon_watch() / check_main_checkout_drift() / publish_agents() /
+    dispatch()` を毎サイクル呼ぶ本物の CYCLE ENTRY POINT を含めて exec しても
+    落ちてはいけない。直す前は module import 中 (= どの関数の try/except より
+    も手前) で `float()` が例外を投げ、この exec 自体が毎回失敗していた
+    (`publish_agents()` / `dispatch()` に一度も到達できない)。
+    """
+    root = tmp_path / "repo"
+    registry = root / "registry"
+    queue = root / "queue"
+    root.mkdir()
+    registry.mkdir()
+    (queue / "missions").mkdir(parents=True)
+    (queue / "archive").mkdir()
+    (queue / "state.yaml").write_text("active_missions: []\ndefault_mission: null\n")
+
+    FakeMux.directors = []
+    FakeMux.sent = []
+    monkeypatch.setattr(lib_mux, "Mux", FakeMux)
+    monkeypatch.setattr(lib_mux, "repo_identity_ok", lambda *a, **kw: True)
+    monkeypatch.setenv("CREWVIA_TASKVIA", "disabled")
+    monkeypatch.delenv("TASKVIA_TOKEN", raising=False)
+    monkeypatch.setenv("TASKVIA_URL", "")
+    monkeypatch.setenv("CREWVIA_MAIN_CHECKOUT_DRIFT_INTERVAL", bad_value)
+
+    log_path = root / "dispatcher.log"
+    src = DISPATCHER_SH.read_text()
+    m = re.search(r"<<'PYEOF'\n(.*?)\nPYEOF", src, re.DOTALL)
+    monkeypatch.setattr(sys, "argv", [
+        "dispatcher", str(queue), str(registry), str(root / "notify-cache.json"),
+        "300", "60", str(log_path)])
+    ns = {"__name__": "dispatcher_under_test"}
+    # 本物の CYCLE ENTRY POINT を残したまま exec する — これが落ちなければ
+    # run_daemon_watch/check_main_checkout_drift/publish_agents/dispatch の
+    # 4 つとも(無条件・順番に呼ばれる module 末尾なので)最後まで到達している。
+    exec(compile(m.group(1), "dispatcher.sh (embedded, test, full cycle)", "exec"), ns)
+
+    assert ns["MAIN_CHECKOUT_DRIFT_INTERVAL"] == ns["DEFAULT_MAIN_CHECKOUT_DRIFT_INTERVAL"]
+    assert "invalid CREWVIA_MAIN_CHECKOUT_DRIFT_INTERVAL" in log_path.read_text()
+
+
+def test_valid_drift_interval_is_used_as_is(tmp_path, monkeypatch):
+    """有効な値はフォールバックせずそのまま使う (回帰防止: 妥当な設定を壊さない)。"""
+    root = tmp_path / "repo"
+    registry = root / "registry"
+    queue = root / "queue"
+    root.mkdir()
+    registry.mkdir()
+    (queue / "missions").mkdir(parents=True)
+    (queue / "archive").mkdir()
+    (queue / "state.yaml").write_text("active_missions: []\ndefault_mission: null\n")
+
+    FakeMux.directors = []
+    FakeMux.sent = []
+    monkeypatch.setattr(lib_mux, "Mux", FakeMux)
+    monkeypatch.setattr(lib_mux, "repo_identity_ok", lambda *a, **kw: True)
+    monkeypatch.setenv("CREWVIA_TASKVIA", "disabled")
+    monkeypatch.delenv("TASKVIA_TOKEN", raising=False)
+    monkeypatch.setenv("TASKVIA_URL", "")
+    monkeypatch.setenv("CREWVIA_MAIN_CHECKOUT_DRIFT_INTERVAL", "42")
+
+    log_path = root / "dispatcher.log"
+    src = DISPATCHER_SH.read_text()
+    m = re.search(r"<<'PYEOF'\n(.*?)\nPYEOF", src, re.DOTALL)
+    monkeypatch.setattr(sys, "argv", [
+        "dispatcher", str(queue), str(registry), str(root / "notify-cache.json"),
+        "300", "60", str(log_path)])
+    ns = {"__name__": "dispatcher_under_test"}
+    exec(compile(m.group(1), "dispatcher.sh (embedded, test, full cycle)", "exec"), ns)
+
+    assert ns["MAIN_CHECKOUT_DRIFT_INTERVAL"] == 42.0

@@ -58,13 +58,43 @@ requires_tmux = pytest.mark.skipif(
 _POLL = 0.1
 _TIMEOUT = 20.0
 
+#: `scan_daemon_pids()` の結果を「起動した」と信じるまでに要求する安定時間 (t075)。
+#: pid の個数を assert する呼び出しは全部これを渡す — 1 箇所だけ直すと隣の呼び出し
+#: (`test_a_live_daemon_in_the_pane_still_refuses_the_spawn` の `running` 等) に同じ
+#: 型が残る (memory: site-patch-leaves-family-in-adjacent-sites)。
+_SPAWN_STABLE_SECONDS = 0.3
 
-def _wait_for(predicate, *, timeout=_TIMEOUT, what=""):
+
+def _wait_for(predicate, *, timeout=_TIMEOUT, what="", stable_for=0.0):
+    """Poll `predicate` until it is truthy; with `stable_for`, until it also
+    stops changing for that long before being trusted (t075 / CI flake).
+
+    Without `stable_for` this returns on the **first** truthy value, which is
+    exactly the bug: `scan_daemon_pids()` walks `/proc` against a system whose
+    scheduling this test does not control, and a launch that is still settling
+    can be caught mid-fork.  `stable_for` makes the wait itself immune to a
+    result that is *momentarily* right (or momentarily wrong) — it asks for
+    the same value on consecutive polls before handing it back, rather than
+    asking the walk to never be seen mid-transition (which no amount of
+    fixing `scan_daemon_pids` can promise on a real, shared machine).
+    """
     deadline = time.time() + timeout
+    last = None
+    stable_since = None
     while time.time() < deadline:
         value = predicate()
         if value:
-            return value
+            if stable_for <= 0:
+                return value
+            if value == last:
+                if time.time() - stable_since >= stable_for:
+                    return value
+            else:
+                last = value
+                stable_since = time.time()
+        else:
+            last = None
+            stable_since = None
         time.sleep(_POLL)
     pytest.fail(f"timed out after {timeout}s waiting for {what or predicate!r}")
 
@@ -133,7 +163,8 @@ def test_real_husk_pane_does_not_block_respawn(stub_repo, tmux_session):
     cmd = dw.spawn_command(dw.DAEMON_DISPATCHER, stub_repo)
     assert mux.spawn(dw.DAEMON_DISPATCHER, cmd, cwd=str(stub_repo)) is True
 
-    first = _wait_for(lambda: _scan(stub_repo), what="the stub dispatcher to start")
+    first = _wait_for(lambda: _scan(stub_repo), what="the stub dispatcher to start",
+                       stable_for=_SPAWN_STABLE_SECONDS)
     assert len(first) == 1, first
 
     reports = []
@@ -167,7 +198,8 @@ def test_real_husk_pane_does_not_block_respawn(stub_repo, tmux_session):
     assert verdict.action == dw.ACTION_RESPAWNED, (
         f"husk pane blocked the respawn: {verdict.action} — {verdict.reason}"
     )
-    revived = _wait_for(lambda: _scan(stub_repo), what="the dispatcher to come back")
+    revived = _wait_for(lambda: _scan(stub_repo), what="the dispatcher to come back",
+                         stable_for=_SPAWN_STABLE_SECONDS)
     assert len(revived) == 1, f"double start: {revived}"
     assert revived != first
     assert reports and "dispatcher" in reports[0]
@@ -184,7 +216,8 @@ def test_a_live_daemon_in_the_pane_still_refuses_the_spawn(stub_repo, tmux_sessi
     mux = lib_mux.Mux()
     cmd = dw.spawn_command(dw.DAEMON_DISPATCHER, stub_repo)
     assert mux.spawn(dw.DAEMON_DISPATCHER, cmd, cwd=str(stub_repo)) is True
-    running = _wait_for(lambda: _scan(stub_repo), what="the stub dispatcher to start")
+    running = _wait_for(lambda: _scan(stub_repo), what="the stub dispatcher to start",
+                         stable_for=_SPAWN_STABLE_SECONDS)
 
     assert mux.spawn(dw.DAEMON_DISPATCHER, cmd, cwd=str(stub_repo)) is False
     time.sleep(1.0)
@@ -225,7 +258,17 @@ def pty_shell():
             os.execvp("bash", ["bash"])
         spawned.append(pid)
         _wait_for(lambda: Path(f"/proc/{pid}/stat").exists(), what="the pty shell")
-        time.sleep(0.5)                   # プロンプトを出し切るまで
+        # 固定 0.5s ではなく、実際にプロンプトへ着いたこと自体を待つ (t075 / CI flake)。
+        # `.bashrc` の nvm.sh 読み込みは負荷がかかると 0.5s を超える (CPU を 2 コアへ
+        # 固定して実測: 15 回中 3 回が 550〜590ms)。固定 sleep はここでは「早すぎる」
+        # 方向にしか壊れないので、判定そのもの (`_pane_shell_is_idle`) を待つ方に倒す —
+        # 呼び出し元が期待する「プロンプトに居る」を、時間ではなく状態で保証する。
+        # `stable_for` も渡す: 1 回だけ True を捕まえても、procfs の state 欄は
+        # 混んだマシンでは瞬間的に揺れうる (実測: stable_for 無しで直した直後に
+        # このテスト自身の次の 1 回読みが False に化けた — 単発の True は「その
+        # 一瞬」の証拠でしかなく「居着いた」の証拠ではない)。
+        _wait_for(lambda: lib_mux._pane_shell_is_idle(pid), what="the shell to reach its prompt",
+                  stable_for=_SPAWN_STABLE_SECONDS)
         return pid, fd
 
     yield _spawn
@@ -371,3 +414,65 @@ def test_spawn_does_not_claim_success_when_the_pane_swallows_the_command(
     assert _scan(stub_repo) == [], "the stub daemon started after all — bad fixture"
     assert started is False, \
         "spawn reported success although the pane swallowed the command as input"
+
+
+# ---------------------------------------------------------------------------
+# 4. `_wait_for(..., stable_for=...)` 自体の固定 (t075 / CI flake)
+# ---------------------------------------------------------------------------
+#
+# CI で 2 回 (25 run 中) 踏んだ `assert len(first) == 1` の flake
+# (memory: husk-respawn-flake-spawn-transient) は、実マシンの一瞬の過渡状態
+# (数 ms 〜数十 ms) が原因で、負荷をかけたローカル環境 (2 コアへ固定 + 4 並列 ×
+# 60〜80 回、計 500 回超) でも再現しなかった — 実時間では狙って踏めない窓
+# (memory: microsecond-race-fix-needs-structural-test)。なので固定は
+# `scan_daemon_pids()` 側 (これは本番の watchdog/dispatcher が 5〜60 秒間隔でしか
+# 呼ばない関数で、起動直後を tight loop で見るのはこのテストだけ — 本番に同じ
+# 過渡状態が見えることはない) ではなく、**このテストの `_wait_for` が最初に
+# 非空になった値をそのまま信じていたこと**に置いた。狙って再現できない以上、
+# 直した `_wait_for(..., stable_for=X)` が実際に過渡状態を乗り越えることを、
+# 実時間ではなく合成した predicate で構造的に固定する。
+
+def test_wait_for_without_stable_for_returns_the_first_truthy_value():
+    """回帰の起点: 素の `_wait_for` は最初の非空値をそのまま返す (t075 以前の形)。"""
+    calls = []
+
+    def flaky():
+        calls.append(1)
+        return [1, 2] if len(calls) == 1 else [1]
+
+    assert _wait_for(flaky, timeout=2.0) == [1, 2]
+
+
+def test_wait_for_with_stable_for_rides_out_a_transient_reading():
+    """`stable_for` を渡すと、変わり続ける値を捕まえない。
+
+    最初の 2 回の呼び出しは `[1, 2]` (transient: 過渡状態で 2 件見えている体)、
+    3 回目以降は `[1]` に落ち着く。`stable_for` 無しなら 1 回目の `[1, 2]` を
+    即座に信じてしまう (上のテストがそれを固定している)。`stable_for` 付きは
+    値が変わらなくなってから初めて返すので、`[1, 2]` を一度も返さない。
+    """
+    calls = []
+
+    def flaky():
+        calls.append(1)
+        return [1, 2] if len(calls) <= 2 else [1]
+
+    result = _wait_for(flaky, timeout=2.0, stable_for=0.25)
+    assert result == [1], f"accepted an unstable transient reading: {result}"
+
+
+def test_wait_for_with_stable_for_still_reports_a_genuinely_unstable_answer():
+    """`stable_for` は「遅らせる」だけで「都合よく最後の値を選ぶ」わけではない。
+
+    値が最後まで安定しない (ここでは呼び出しごとに増え続ける) なら、timeout まで
+    誰にも真実とは認められず fail する — stable_for がタイムアウトを黙って
+    延ばすだけの緩和策になっていないことの固定。
+    """
+    calls = []
+
+    def never_settles():
+        calls.append(1)
+        return [len(calls)]     # every call returns a *different* list
+
+    with pytest.raises(pytest.fail.Exception):
+        _wait_for(never_settles, timeout=0.5, stable_for=0.25)

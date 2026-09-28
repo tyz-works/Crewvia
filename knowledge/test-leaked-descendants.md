@@ -266,3 +266,9 @@ root 所有のプロセスは EPERM で残った。キープアライブが消�
   再走査) が最後の網として引き継ぐ (このガード自身は同 uid 全体を見るので、pgid を抜けた
   子孫であっても basetemp/marker で拾える)。
 - `conftest.py idle_pane_shell` の `os.waitpid(pid, 0)` に上限を付けなかった件は上表のとおり。
+- **既知の限界（backlog、7 巡目、t031）**: `test_leaked_descendants_guard.py` の統合テストは、
+  ガードが意図的に kill しない (pidfd を使えない) カーネルに能力ゲートが無く、要約の「漏れ 1 件」の
+  assert がそのまま落ちる。`os.pidfd_open` を削除する case はテスト内の新しいインタプリタにしか
+  効かず、外側の実行環境そのものを変えられない。CI・本番のカーネルには pidfd があるため本題外。
+  観察テスト自身が `scan()` の返す pidfd を閉じないため fd がテストセッション内で漏れる件も同様
+  （プロセスは残らないので害はない）。

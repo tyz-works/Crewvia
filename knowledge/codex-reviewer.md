@@ -566,6 +566,17 @@ spawn を塞がなくなった) —— だが**ファイルそのものを消す
   AND で束縛する設計が要る。この PR はスコープを Kai-codex (dispatcher が明示的に
   `CODEX_REVIEW_AGENT` を渡して呼ぶ) に限定した。
 
+### 既知の限界（backlog、2 巡目、t011）
+
+- **assignment の識別子を検証せずパスに使う**: `queue/assignments/<agent>` の中身 (`mission:task`) を
+  `../archive/old-mission:t001` や絶対パスのような値にすり替えると、mission 外の card を掃除の根拠に
+  しうる。`assignment/<agent>` を書くのは `plan.sh pull` だけで、そういう値は書かないため壊れた入力
+  でだけ起き、消えるのはその assignment 1 つ。直すなら mission / task の識別子を検証し、不正なものは
+  触らない
+- **掃除の前提不成立 (exit 3) でも task-graph を再生成する**: `reap-orphan-assignment` が
+  `QUEUE_MUTATING_SUBCOMMANDS` に含まれているため、拒否して何もしなかった呼び出しでも
+  `registry/task-graph/tasks.json` を書き直す。派生ファイルの余分な再生成だけで実害は無い
+
 ### 戻し方
 
 PR revert → 主 checkout を `git merge --ff-only origin/main` → `lib_daemon_watch.py restart`

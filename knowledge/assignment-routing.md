@@ -155,6 +155,10 @@ Director が codex-review を開く。
   を card ごとに打つ（status・worker・pr_number などは触らない。in_progress の card でも安全）。印そのものを
   既存 mission に付けたいときだけ、mission.yaml に `deliverable_required: true` を 1 行足す（足した時点で、
   宣言の無い card はすべて lint の FAIL になるので、先に全 card へ宣言を付けてから）。
+- **既知の限界（backlog、9 巡目、t015）**: `lint_plan.py` は `skills` の各要素を検証せずに `','.join(skills)`
+  へ渡す。`skills: [1]` / `[null]` / `[true]` のような不正値 + `deliverable: pr` の card があると
+  `TypeError` で lint 全体が落ち、残りの task を検査しない。黙って通すのではなく目に見えて落ちる
+  （危険な側には倒れない）ため、本題（B4）外として直していない。
 
 ### 7. `plan.sh done --pr` の推移的な伝播 (t017 / backlog #29)
 
@@ -185,6 +189,13 @@ Director が codex-review を開く。
 1 回だけ全 task を読み、`[破損]` の card は両方の入口から除く（伝える先にも通過点にも
 祖先にもしない）。`_pr_source_ancestors()` は `blocked_by` の循環（本来あってはならない）を
 空集合に倒し、無限再帰にしない。
+
+**既知の限界（backlog、1 巡目、t019）**: 循環の**途中**で `_visiting` に当たって空集合を返した
+結果がそのまま `memo` にメモ化されるため、同じ呼び出しの中で別の task から辿り直しても不完全な
+祖先集合が再利用され、合流点の誤判定（別の task に誤った PR 番号を書く）を招きうる。循環した
+`blocked_by` を持つ task はそもそも `pending` に上がらず ready にならないため、壊れた依存が既に
+ある状態でだけ起きる。根は `plan.sh update --blocked-by` が循環を作る更新を拒否していないこと
+（ミッション C の候補）。
 
 ### 戻し方 (7. 推移的伝播だけ)
 

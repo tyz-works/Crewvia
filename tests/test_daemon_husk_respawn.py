@@ -65,7 +65,8 @@ _TIMEOUT = 20.0
 _SPAWN_STABLE_SECONDS = 0.3
 
 
-def _wait_for(predicate, *, timeout=_TIMEOUT, what="", stable_for=0.0):
+def _wait_for(predicate, *, timeout=_TIMEOUT, what="", stable_for=0.0,
+              now=time.time, sleep=time.sleep):
     """Poll `predicate` until it is truthy; with `stable_for`, until it also
     stops changing for that long before being trusted (t075 / CI flake).
 
@@ -77,25 +78,36 @@ def _wait_for(predicate, *, timeout=_TIMEOUT, what="", stable_for=0.0):
     the same value on consecutive polls before handing it back, rather than
     asking the walk to never be seen mid-transition (which no amount of
     fixing `scan_daemon_pids` can promise on a real, shared machine).
+
+    `now`/`sleep` default to the real clock (needed by every caller here that
+    waits on an actual process/pane). Tests that drive `_wait_for` with a
+    synthetic predicate instead inject a fake clock (t109 / PR #242 review):
+    a synthetic predicate whose transient window is defined in *call counts*
+    silently assumes each poll consumes exactly `_POLL` of wall time, and
+    under load `sleep(_POLL)` can take far longer than `_POLL` — which shrinks
+    the number of polls that land inside `stable_for` and makes the "should
+    still look transient" call arrive after the window and read as stable.
+    A fake clock makes virtual time advance by exactly `_POLL` per poll
+    regardless of real scheduling, so the test is deterministic.
     """
-    deadline = time.time() + timeout
+    deadline = now() + timeout
     last = None
     stable_since = None
-    while time.time() < deadline:
+    while now() < deadline:
         value = predicate()
         if value:
             if stable_for <= 0:
                 return value
             if value == last:
-                if time.time() - stable_since >= stable_for:
+                if now() - stable_since >= stable_for:
                     return value
             else:
                 last = value
-                stable_since = time.time()
+                stable_since = now()
         else:
             last = None
             stable_since = None
-        time.sleep(_POLL)
+        sleep(_POLL)
     pytest.fail(f"timed out after {timeout}s waiting for {what or predicate!r}")
 
 
@@ -431,9 +443,38 @@ def test_spawn_does_not_claim_success_when_the_pane_swallows_the_command(
 # 非空になった値をそのまま信じていたこと**に置いた。狙って再現できない以上、
 # 直した `_wait_for(..., stable_for=X)` が実際に過渡状態を乗り越えることを、
 # 実時間ではなく合成した predicate で構造的に固定する。
+#
+# `stable_for` 付きの下 2 本は predicate の遷移を「呼び出し回数」で定義している
+# ため、実クロックだと「1 poll = 実時間 `_POLL`」という前提を暗黙に置いてしまう
+# (t109 / PR #242 review P2)。負荷で `sleep(_POLL)` が `_POLL` より長くかかると
+# `stable_for` の窓に収まる poll 回数が減り、まだ過渡状態のはずの値を安定と
+# 誤認する — これは狙って再現できない実時間の窓の別形なので、`_wait_for` に
+# 注入した偽の時計で「1 poll = 仮想時間ちょうど `_POLL`」を保証し、実際の
+# スケジューリングから完全に切り離す。
+
+
+class _FakeClock:
+    """`_wait_for` に渡す `now`/`sleep` の偽実装。`sleep(s)` は仮想時計を `s` だけ
+    進めるだけで実際には待たない — 1 poll あたりの経過時間を常に `_POLL` に固定する。
+    """
+
+    def __init__(self):
+        self.value = 0.0
+
+    def time(self):
+        return self.value
+
+    def sleep(self, seconds):
+        self.value += seconds
+
 
 def test_wait_for_without_stable_for_returns_the_first_truthy_value():
-    """回帰の起点: 素の `_wait_for` は最初の非空値をそのまま返す (t075 以前の形)。"""
+    """回帰の起点: 素の `_wait_for` は最初の非空値をそのまま返す (t075 以前の形)。
+
+    `stable_for` を渡さないため poll は 1 回で終わり (predicate が最初から
+    truthy)、`sleep` は一度も呼ばれない — 実クロックのままでも回数と経過時間の
+    対応関係に依存しないので、偽の時計へ寄せる対象ではない。
+    """
     calls = []
 
     def flaky():
@@ -450,14 +491,21 @@ def test_wait_for_with_stable_for_rides_out_a_transient_reading():
     3 回目以降は `[1]` に落ち着く。`stable_for` 無しなら 1 回目の `[1, 2]` を
     即座に信じてしまう (上のテストがそれを固定している)。`stable_for` 付きは
     値が変わらなくなってから初めて返すので、`[1, 2]` を一度も返さない。
+
+    偽の時計を注入する: 実クロックだと `sleep(_POLL)` が負荷で `_POLL` より
+    長くかかったとき、2 回目の呼び出し (まだ transient のはずの `[1, 2]`) の
+    時点で既に `stable_for` 分の実時間が経ってしまい、過渡状態を安定と誤認して
+    `[1, 2]` を返し得る (t109 red proof: `_POLL=0.3` で実際に再現した)。
     """
     calls = []
+    clock = _FakeClock()
 
     def flaky():
         calls.append(1)
         return [1, 2] if len(calls) <= 2 else [1]
 
-    result = _wait_for(flaky, timeout=2.0, stable_for=0.25)
+    result = _wait_for(flaky, timeout=2.0, stable_for=0.25,
+                        now=clock.time, sleep=clock.sleep)
     assert result == [1], f"accepted an unstable transient reading: {result}"
 
 
@@ -467,12 +515,17 @@ def test_wait_for_with_stable_for_still_reports_a_genuinely_unstable_answer():
     値が最後まで安定しない (ここでは呼び出しごとに増え続ける) なら、timeout まで
     誰にも真実とは認められず fail する — stable_for がタイムアウトを黙って
     延ばすだけの緩和策になっていないことの固定。
+
+    偽の時計を注入し、実時間の `sleep`/timeout に依存せず即座に (仮想時間だけ
+    進めて) 判定する。
     """
     calls = []
+    clock = _FakeClock()
 
     def never_settles():
         calls.append(1)
         return [len(calls)]     # every call returns a *different* list
 
     with pytest.raises(pytest.fail.Exception):
-        _wait_for(never_settles, timeout=0.5, stable_for=0.25)
+        _wait_for(never_settles, timeout=0.5, stable_for=0.25,
+                  now=clock.time, sleep=clock.sleep)

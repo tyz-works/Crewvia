@@ -54,23 +54,67 @@
   runner は bash 側で同じ字クラスを直接埋め込み、コメントで揃える先を明記）に統一。
   回帰: `test_runner_rejects_a_malformed_allowlist[hyphenated-name]`
 
-## P3-3（t028 レビュー、Seo 指摘）: `tests/*.sh` 19 本の棚卸し（この PR ではCI 化しない）
+## P3-3（t028 レビュー、Seo 指摘）: `tests/*.sh` の棚卸し（t043）と CI 化（t063）
 
-`tests/*.sh` は 19 本あり、どの CI job も走らせていない（bats は `tests/*.bats` だけ拾い、
-pytest は python glob なので `.sh` を拾わない）。ファイル名の慣習ではなく **中身の性質**で
-3 分類する:
+`tests/*.sh` は（t043 棚卸し時点で）19 本あり、どの CI job も走らせていなかった（bats は
+`tests/*.bats` だけ拾い、pytest は python glob なので `.sh` を拾わない）。ファイル名の
+慣習ではなく **中身の性質**で 3 分類する:
 
-| 分類 | 判別できる中身の性質 | 該当 | 本数 |
-|---|---|---|---|
-| (i) source される lib | トップレベルに実行文・PASS/FAIL 集計・`exit` が無く、関数定義だけ。ヘッダに「使い方 (source して呼ぶ)」と明記 | `fixture_tree.sh`（`copy_scripts_libs` / `copy_plan_tree` の入口。`tests/CLAUDE.md` が定義） | 1 |
-| (ii) 使い捨ての red proof | ヘッダの「使い方」が人間向けの単発コマンド。`mktemp -d` で使い捨てコピーを作り、そこに**1 つの task id に紐づく既に直った欠陥**を注入し、既存の permanent テスト（`tests/test_*.py` / `scripts/test_*.sh`）がそれを検出することを確認するだけ。多くは特定の historical commit（`git show <固定 sha>:<path>` や `git archive HEAD` 時点の特定関数の文字列）を前提にしており、コード側の後続 refactor でその前提が黙って崩れる（memory: red-proof-scripts-go-stale-on-stacked-prs）。ここでの assert は「今の本番コードが正しいか」ではなく「過去に書いた regression テストが赤くなるか」であり、対象の regression テストは既に CI に載っている | `red_proof_t001_needs_director.sh` / `red_proof_t001_pytest_workspace.sh` / `red_proof_t001_stale_records.sh` / `red_proof_t004.sh` / `red_proof_t005.sh` / `red_proof_t009.sh` / `red_proof_t010.sh` / `red_proof_t018.sh` / `red_proof_t019.sh` / `red_proof_t020.sh` / `red_proof_t021.sh` / `red_proof_t021_pr6.sh` / `red_proof_t022.sh` / `red_proof_t025.sh` / `red_proof_t036.sh` / `red_proof_stat_and_direct_reads.sh` / `red_proof_unobservable.sh` | 17 |
-| (iii) 常時走らせる価値のある本物のテスト | 現在の本番コードを**そのまま**、実の外部プロセス（tmux/デーモン）を相手に動かし、単体テストが構造的に届かない経路（early return で到達しないログ経路など）を検証する。特定の historical commit に依存しない | `watchdog-idle-e2e.sh`（t016: `tests/test_watchdog_idle.py` は `check()` を直接叩くだけで、常駐ループを通しで動かさないと検出できない dead-code 経路がある、という明示的な理由が書かれている） | 1 |
+| 分類 | 判別できる中身の性質 |
+|---|---|
+| (i) source される lib | トップレベルに実行文・PASS/FAIL 集計・`exit` が無く、関数定義だけ。ヘッダに「使い方 (source して呼ぶ)」と明記 |
+| (ii) 使い捨ての red proof | ヘッダの「使い方」が人間向けの単発コマンド。`mktemp -d` で使い捨てコピーを作り、そこに**1 つの task id に紐づく既に直った欠陥**を注入し、既存の permanent テスト（`tests/test_*.py` / `scripts/test_*.sh`）がそれを検出することを確認するだけ。多くは特定の historical commit（`git show <固定 sha>:<path>` や `git archive HEAD` 時点の特定関数の文字列）を前提にしており、コード側の後続 refactor でその前提が黙って崩れる（memory: red-proof-scripts-go-stale-on-stacked-prs）。ここでの assert は「今の本番コードが正しいか」ではなく「過去に書いた regression テストが赤くなるか」であり、対象の regression テストは既に CI に載っている |
+| (iii) 常時走らせる価値のある本物のテスト | 現在の本番コードを**そのまま**、実の外部プロセス（tmux/デーモン）を相手に動かし、単体テストが構造的に届かない経路（early return で到達しないログ経路など）を検証する。特定の historical commit に依存しない |
 
-合計 19 本（1 + 17 + 1）。次に glob 拡張をする task（Director が積む）は (iii) の
-`watchdog-idle-e2e.sh` を CI 化対象にし、(ii) の 17 本は理由付きで allowlist に残す
-（reason は本 PR の 3 番目のカテゴリに当たらないので、新しい恒久カテゴリ
-「1 回限りの historical red proof（CI 化しない）」を追加検討する）。(i) は
-そもそも `scripts/test_*.sh` / `tests/*.py` の glob 対象にしない（テストではない）。
+t043 時点は 19 本（(i) 1 / (ii) 17 / (iii) 1）。t063 で CI 化するまでの間に
+`red_proof_t013.sh` / `red_proof_t033.sh` / `red_proof_t047.sh` / `red_proof_t055.sh` /
+`red_proof_b1_background_work.sh` / `red_proof_b6_trust_precheck.sh` / `red_proof_t017.sh`
+の 7 本が増え、t063 時点で 26 → (rebase で `red_proof_t017.sh` が追加され) 27 本。
+新しく増えた 7 本も同じ中身の性質（mktemp コピー + 特定 task id の欠陥注入 + 既存 permanent
+テストの検出確認）で (ii) と判定できた — ファイル名の慣習ではなく毎回中身を見て分類する
+という P3-3 の原則が、本数が増えても機械的に適用できることの実例。
+
+### t063: CI 化した仕組み
+
+`scripts/ci-run-script-tests.sh` / `scripts/ci-script-tests-excluded.txt` /
+`tests/test_ci_runs_every_script_test.py`（`scripts/test_*.sh` 用）と同じ「glob + 理由付き
+allowlist + 構造ガード」の形を、`tests/*.sh` 用に別ファイルで用意した:
+
+| 部品（tests/*.sh 用） | scripts/test_*.sh 用の対応物 |
+|---|---|
+| `scripts/ci-run-tests-sh.sh` | `scripts/ci-run-script-tests.sh` |
+| `scripts/ci-tests-sh-excluded.txt` | `scripts/ci-script-tests-excluded.txt` |
+| `tests/test_ci_runs_every_tests_sh.py` | `tests/test_ci_runs_every_script_test.py` |
+| `.github/workflows/ci.yml` の `tests-sh-tests` job | `script-tests` job |
+
+**コードは共有しない**（各ファイル冒頭のコメントに理由あり）: 走る本数の比率が逆
+（`scripts/test_*.sh` は大半が RUN、`tests/*.sh` は 27 本中 26 本が SKIP）・ファイル名の
+許容文字が違う（`tests/*.sh` は `watchdog-idle-e2e.sh` のようにハイフンを含む。
+`TEST_FILENAME_PATTERN = r"tests/[A-Za-z0-9_-]+\.sh"`）・除外理由の分類が違う、という
+差があり、既に 4 並行 PR (#237-240) が依存していた `ci-run-script-tests.sh` 側に共有の
+ための抽象化を挟むリスクの方が、コード重複より高いと判断した。「形」（glob + 理由付き
+allowlist + 構造ガード）は踏襲し、コメント判定・ファイル名許容文字の定義は pytest 側
+定数と揃える先を相互参照コメントで明記する（t043 P3-1/P3-2 の「3 箇所の定義が食い違う」
+事故をコード共有ではなく規律で防ぐ）。
+
+**除外理由は 2 種類だけ**（scripts/test_*.sh 側の「未調査 (t043)」はここへ持ち込まない。
+t063 の受入条件は「未調査」を含む理由が 0 行であること）:
+
+- `テストではない（source される lib。トップレベルに実行文が無い）` — `fixture_tree.sh` / `trust_fixture.sh`
+- `1 回限りの historical red proof（CI 化しない）` — red_proof_*.sh 24 本
+
+**(iii) `watchdog-idle-e2e.sh` を CI に載せる過程で見つかった欠陥**: このファイルの
+シナリオ 4（「B1 が無い origin/main は実行中の Worker も殺してしまう」という対照）は、
+B1 (#238) が既に origin/main に merge 済みだったため `git show origin/main:scripts/watchdog.py`
+が「B1 が無い版」を返さなくなっており、かつその版が新しく要求する `lib_pane_process.py`
+をこの対照のコピー先が持たない（依存 lib 一覧が t082 時点のまま）ため
+`ModuleNotFoundError` で起動直後に落ちていた。t082 が一度直したのと同じ型の再発
+（memory: red-proof-scripts-go-stale-on-stacked-prs）。**この対照は撤去した** — B1 は
+main の恒久部分になったので二度と「無い」状態には戻らず、対照を維持するには B1 merge
+前の固定 SHA (`da3784ba8dabe1d0a859c33afadfebf26026d557`) へ依存を移すしかないが、それは
+(iii)（historical commit に依存しない）の定義そのものに反する。e2e が守る価値は
+シナリオ 1-3（warn / terminate / 誤 terminate 防止が今の本番コードで実際に発火すること）
+にあり、そこは撤去の影響を受けない。詳細は `tests/watchdog-idle-e2e.sh` 内のコメント。
 
 ## P3-4（t028 レビュー、Seo 指摘）: script-tests job の直列実行時間
 
@@ -101,7 +145,17 @@ CI 全体の critical path になった時、または flaky な 1 本が週に�
 この PR が merge されると、他の open PR が新しく足した `scripts/test_*.sh` も glob で CI に入る。
 merge 後に全 open PR を `gh pr update-branch` して CI を確認する（実施は t028）。
 
+t063 (tests/*.sh の CI 化) が merge されると、同様に他の open PR が新しく足した
+`tests/*.sh` も `tests-sh-tests` job の glob に入る（除外していなければ RUN される）。
+merge 後に全 open PR を `gh pr update-branch` して CI を確認すること。
+
 ## 戻し方
 
 PR を revert する。CI は名指しの 4 本に戻り、除外ファイルと構造テストも一緒に消える（残る参照は無い）。
 一部のテストだけ CI から外したいときは revert ではなく除外ファイルに理由付きで 1 行足す。
+
+t063 (tests-sh-tests job) を戻す場合も同じ: PR を revert すれば `tests-sh-tests` job・
+`scripts/ci-run-tests-sh.sh`・`scripts/ci-tests-sh-excluded.txt`・
+`tests/test_ci_runs_every_tests_sh.py` が一緒に消え、`tests/*.sh` はどの CI job も
+走らせない元の状態に戻る（`tests/watchdog-idle-e2e.sh` のシナリオ 4 撤去だけは残る —
+実装上の欠陥修正であり、CI 化そのものとは独立）。

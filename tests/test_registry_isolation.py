@@ -93,6 +93,7 @@ class World:
         self.queue = self.other / "queue"
         self.registry = self.other / "registry"        # queue の隣 = 使われるべき registry
         (self.queue / "archive").mkdir(parents=True)
+        (self.queue / "assignments").mkdir(parents=True)
         self.registry.mkdir()
         (self.registry / "workers.yaml").write_text(_WORKERS_YAML)
         mdir = self.queue / "missions" / MISSION
@@ -112,6 +113,7 @@ class World:
             ("t006", "in_progress", "Ren"),      # ready-for-verification
             ("t007", "verifying", "Ren"),        # verify-result
             ("t008", "failed", "Ren"),           # release-dep / update --reset
+            ("t009", "done", "Kai-codex"),       # reap-orphan-assignment
         ):
             extra = ""
             if tid == "t008":
@@ -119,6 +121,10 @@ class World:
                 # 指す先は checkout (本番の代役) の registry/handoffs — 隔離実行はそれを動かさない
                 extra = f"handoff_path: {self.checkout}/registry/handoffs/Ren/t003_HANDOFF.md\n"
             (mdir / "tasks" / f"{tid}.md").write_text(_card(tid, status, worker, extra))
+        # t009 は最初から「終了した」task。reap-orphan-assignment が実際に撤去する
+        # 経路 (assignment ファイルの書き込み) を隔離実行で通す — 他の subcommand の
+        # 実行順に依存させない (陽性対照。knowledge の記述と同じ理由)。
+        (self.queue / "assignments" / "Kai-codex").write_text(f"{MISSION}:t009\n")
 
     def run(self, *args: str, with_repo_root: bool = False,
             repo_root: pathlib.Path | None = None) -> subprocess.CompletedProcess:
@@ -174,6 +180,7 @@ ISOLATED_INVOCATIONS: dict[str, list[list[str]]] = {
     "release-dep": [["release-dep", "t008", "--mission", MISSION]],
     "retire": [["retire", "t005", "--agent", "Ren", "--started-at", "2026-01-01T00:00:00Z",
                 "--mission", MISSION, "--outcome", "reset", "--no-wait"]],
+    "reap-orphan-assignment": [["reap-orphan-assignment", "Kai-codex", "--no-wait"]],
     "ready-for-verification": [["ready-for-verification", "t006", "--mission", MISSION]],
     "verify-result": [["verify-result", "t007", "pass", "--mission", MISSION]],
     "review": [["review", MISSION]],

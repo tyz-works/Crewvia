@@ -901,6 +901,10 @@ ALLOWED_SUBPROCESS_CALLS = {
     # -- dispatcher.sh -----------------------------------------------------
     ("dispatcher.sh", "spawn_kai_review", "cmd"):
         "kai-review.sh を起こすだけ。カードを読むのは向こうの plan.sh pull",
+    ("dispatcher.sh", "reap_kai_codex_orphan_assignment", "argv"):
+        "plan.sh reap-orphan-assignment を起こすだけ (t009 / backlog #34)。"
+        "assignment / task card を読むのは向こうの plan.sh 側 "
+        "(lib_task_cards 経由)。渡すのは agent 名の文字列だけ",
 
     # -- lib_retirement.py -------------------------------------------------
     ("lib_retirement.py", "_default_run_command", "argv"):

@@ -34,6 +34,12 @@
 > ままだった構造的な欠陥のため、個別の引用形式を塞ぐのではなく **`[P#]` タグ経路そのもの
 > を削除**し、auto-done 経路を JSON findings 配列 1 本に絞った。詳細は下記「t011: `[P#]`
 > タグ経路の廃止」を参照。
+> **t009 (2026-09-28, mission: 20260927-mechanize-guards-b, backlog #34)**: PR1 (#225) 以後、
+> 終了済み task / needs_director を指す `queue/assignments/Kai-codex` は spawn を塞がない
+> (`codex_review_slot_busy()` は読むだけ) が、そのミッションにもう codex-review task が
+> 無ければファイルは恒久的に残っていた。`plan.sh reap-orphan-assignment` (dispatcher が
+> 毎サイクル安く判定して呼ぶ) が掃除するようにした。詳細は下記「t009: 孤児 assignment の
+> 掃除」を参照。
 
 ---
 
@@ -477,6 +483,87 @@ Dispatcher は常に **main 版の `scripts/kai-review.sh`** を起動する
 触れない）。1 行制約が必要なのは `plan.sh needs-director` の reason だけ
 （frontmatter の `needs_director_reason` に直接書かれるため）。task ファイルの直接編集
 （heredoc 等）は禁止 — Worker が長時間ハングする事故につながる（詳細: `agents/worker.md` §5）。
+
+---
+
+## t009: 孤児 assignment の掃除 (2026-09-28, mission 20260927-mechanize-guards-b, backlog #34)
+
+### 何が起きていたか
+
+PR1 (#225 / t001) が `codex_review_slot_busy()` を「読むだけ」にした結果 (t001 の目的通り、
+終了済み task / needs_director を指す `queue/assignments/Kai-codex` は次の codex-review の
+spawn を塞がなくなった) —— だが**ファイルそのものを消す者がいなかった**。次の
+`plan.sh pull` (= 次の codex-review) が同じ agent 名で assignment を上書きすれば自然に消えるが、
+そのミッションにもう codex-review task が無ければ、孤児は `queue/assignments/Kai-codex` に
+恒久的に残る (「消すのは plan.sh の役目」— `agent_busy_elsewhere()` の docstring に書かれていた
+設計だが、実装されていなかった)。
+
+### 孤児ができる経路
+
+1. kai-review.sh が `plan.sh done` / `needs-director` のどちらも呼ばずに終わる
+   (プロセスが外部から kill される・未捕捉の異常終了)。task は in_progress のまま止まり、
+   assignment も残る。
+2. Director が `plan.sh update <id> --status <終端 status>` のように **`--reset` を経ない**
+   経路で card を終端 status に動かす。`update` が assignment を撤去するのは `--reset` の
+   ときだけ (`cmd_update` 参照) —— 素の `--status` は card だけを書き換え、assignment には
+   触れない。
+
+### 直し方
+
+- **`plan.sh reap-orphan-assignment <agent> [--no-wait]`** (新サブコマンド)。キューロックの
+  中で assignment を読み直し、指す task が「終了した」
+  (`TERMINAL_STATUSES ∪ DEAD_DEP_STATUSES ∪ HELD_DEP_STATUSES` — `retire` の
+  `PRECONDITION_UNMET` (exit 3) と同じ「前提が外れたら 1 バイトも書かない」規約) ときだけ
+  `retire_assignment()` で撤去する。**`needs_director` は「終了した」に含めない** ——
+  正常経路 (kai-review.sh → `plan.sh needs-director`) では needs_director への遷移
+  そのものが assignment を撤去するので、それでも残っているのは証拠不足であり、
+  `codex_review_slot_busy()` の read-only な「塞がない」判定とは意図的に非対称にした
+  (破壊的操作はより強い証拠を要求する — memory: evidence-for-destructive-decisions)。
+- **dispatcher.sh** が毎サイクル `reap_kai_codex_orphan_assignment()` を呼ぶ。安さの根拠は
+  `_kai_codex_orphan_candidate()`: このサイクルで既に読み込み済みの
+  `task_statuses_by_mission` だけを見て、`RELEASED_WORK_STATUSES` (needs_director は
+  含めない) に該当するときだけ `plan.sh` を subprocess で起動する。孤児が無い大多数の
+  サイクルでは subprocess を 1 本も起動しない。`--no-wait` (queue ロックが混んでいれば
+  諦めて次のサイクル) は watchdog → `plan.sh retire` (`lib_retirement.py`) と同じ理由。
+- subprocess の env は `os.environ` の継承任せにせず、dispatcher 自身が使っている
+  `CREWVIA_QUEUE` / `CREWVIA_REPO_ROOT` を明示的に上書きする。**継承任せにすると、
+  ambient な env (開発者シェルの `.crewvia-env` が本番 queue を指しているケース) が
+  `${CREWVIA_QUEUE:-...}` で勝ってしまい、意図しない queue を操作しうる**
+  (QA 中に実機で踏んだ。テストの subprocess が一瞬だけ本番 `queue/assignments/` を
+  読みに行っていた — 幸い Kai-codex の assignment が無かったため実害は無かったが、
+  memory: qa-ambient-repo-root-points-at-production と同じ族)。
+
+### Kai-codex 以外への一般化 — 検討したが実装していない
+
+「`--reset` を経ない終端遷移で assignment が取り残される」構造自体は Kai-codex 固有ではなく、
+どの Worker にも起こりうる。だが **一般化 (全 Worker を対象にした自動掃除) はこの PR の範囲では
+実装しない**:
+
+- Kai-codex は使い捨ての reviewer で、1 review = 1 実行。assignment が指す task が終了した
+  時点で「もう戻ってこない」と確定できる。
+- 通常の Worker (pane に常駐する対話セッション) は、assignment が指す task が終端 status に
+  なった**あとも、Worker 自身は生きたまま次の task を待っている**ことがある (Director が
+  `update --status skipped` で card を片付けても、Worker のペインはまだ起動中で、次の
+  `plan.sh pull` を打とうとしているかもしれない)。この状態で assignment を自動撤去すると、
+  dispatcher の Rule 5 / idle 判定が「assignment が消えた = 空いた」と読み、**判断待ちで
+  はなく単に pull 前の Worker に新しい task を送ってしまう**危険がある
+  (`agent_busy_elsewhere()` の二重割り当て拒否は card の `worker`+`status: in_progress`
+  も見るので即座の事故にはならないが、`memory: assignment-lifecycle-change-needs-consumer-audit`
+  が指す消費者全部 (`is_idle` / Rule 2 / Rule 5-A / task-graph pane_match / hooks の
+  `TASK_ID` 復元) を洗わないまま一般化すると同じ型の事故を再生産しうる)。
+- 一般化するなら、まず「Worker が本当にその task を手放して次を待っているか」を
+  assignment 以外の証拠 (例: pane が実際に `plan.sh pull` の応答待ちであること) と
+  AND で束縛する設計が要る。この PR はスコープを Kai-codex (dispatcher が明示的に
+  `CODEX_REVIEW_AGENT` を渡して呼ぶ) に限定した。
+
+### 戻し方
+
+PR revert → 主 checkout を `git merge --ff-only origin/main` → `lib_daemon_watch.py restart`
+(dispatcher / watchdog を再起動しないと、merge 済みでも古い dispatcher.sh の python が
+プロセスのメモリに載ったまま動き続ける — memory: merged-daemon-code-is-inert-until-restart)。
+`plan.sh reap-orphan-assignment` は新規サブコマンドの追加のみで、既存サブコマンドの挙動は
+変えていないため、revert 後に残る影響は無い (孤児ファイルは再び溜まるだけで、
+`codex_review_slot_busy()` が引き続き read-only に塞がないので機能的な退行はない)。
 
 ---
 

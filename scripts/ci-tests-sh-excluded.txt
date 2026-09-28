@@ -1,0 +1,46 @@
+# CI（.github/workflows/ci.yml の tests-sh-tests job）が走らせない tests/*.sh。
+# CI は tests/*.sh を glob で全部走らせる。ここに載せたものだけが除外される。
+#
+# 形式: <path> | <理由>      （# で始まる行と空行は無視。理由の無い行・存在しないファイル・重複は CI が落ちる）
+#
+# 理由は次の 2 種類だけ（tests/test_ci_runs_every_tests_sh.py の ALLOWED_REASONS が強制する）。
+# scripts/test_*.sh 側の「未調査」は絶対にここへ持ち込まない（t063 / t043 参照。
+# 同じ負債を作り直すことになる）:
+#   テストではない（source される lib。トップレベルに実行文が無い）          fixture_tree.sh / trust_fixture.sh。他のテストが source して使う関数定義だけの入口
+#   1 回限りの historical red proof（CI 化しない）                          特定 task id の既に直った欠陥を使い捨てコピーに注入し、既存の恒久テストが検出することを確かめるだけ。git show <固定 sha> や特定関数の文字列に依存し、後続 refactor で前提が崩れる (memory red-proof-scripts-go-stale-on-stacked-prs)
+#
+# 除外は「走らせない」の宣言であって「無価値」ではない。行を足すときは理由を確かめる。
+
+# --- (i) source される lib（テストではない） ---
+tests/fixture_tree.sh | テストではない（source される lib。トップレベルに実行文が無い）
+tests/trust_fixture.sh | テストではない（source される lib。トップレベルに実行文が無い）
+
+# --- (ii) 1 回限りの historical red proof ---
+tests/red_proof_b1_background_work.sh | 1 回限りの historical red proof（CI 化しない）
+tests/red_proof_b6_trust_precheck.sh | 1 回限りの historical red proof（CI 化しない）
+tests/red_proof_stat_and_direct_reads.sh | 1 回限りの historical red proof（CI 化しない）
+tests/red_proof_t001_needs_director.sh | 1 回限りの historical red proof（CI 化しない）
+tests/red_proof_t001_pytest_workspace.sh | 1 回限りの historical red proof（CI 化しない）
+tests/red_proof_t001_stale_records.sh | 1 回限りの historical red proof（CI 化しない）
+tests/red_proof_t004.sh | 1 回限りの historical red proof（CI 化しない）
+tests/red_proof_t005.sh | 1 回限りの historical red proof（CI 化しない）
+tests/red_proof_t005_main_checkout_sync.sh | 1 回限りの historical red proof（CI 化しない）
+tests/red_proof_t009.sh | 1 回限りの historical red proof（CI 化しない）
+tests/red_proof_t010.sh | 1 回限りの historical red proof（CI 化しない）
+tests/red_proof_t013.sh | 1 回限りの historical red proof（CI 化しない）
+tests/red_proof_t017.sh | 1 回限りの historical red proof（CI 化しない）
+tests/red_proof_t018.sh | 1 回限りの historical red proof（CI 化しない）
+tests/red_proof_t019.sh | 1 回限りの historical red proof（CI 化しない）
+tests/red_proof_t020.sh | 1 回限りの historical red proof（CI 化しない）
+tests/red_proof_t021.sh | 1 回限りの historical red proof（CI 化しない）
+tests/red_proof_t021_pr6.sh | 1 回限りの historical red proof（CI 化しない）
+tests/red_proof_t022.sh | 1 回限りの historical red proof（CI 化しない）
+tests/red_proof_t025.sh | 1 回限りの historical red proof（CI 化しない）
+tests/red_proof_t033.sh | 1 回限りの historical red proof（CI 化しない）
+tests/red_proof_t036.sh | 1 回限りの historical red proof（CI 化しない）
+tests/red_proof_t047.sh | 1 回限りの historical red proof（CI 化しない）
+tests/red_proof_t053.sh | 1 回限りの historical red proof（CI 化しない）
+tests/red_proof_t055.sh | 1 回限りの historical red proof（CI 化しない）
+tests/red_proof_t110.sh | 1 回限りの historical red proof（CI 化しない）
+tests/red_proof_t113.sh | 1 回限りの historical red proof（CI 化しない）
+tests/red_proof_unobservable.sh | 1 回限りの historical red proof（CI 化しない）

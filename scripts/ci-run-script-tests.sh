@@ -35,8 +35,12 @@ fi
 lineno=0
 while IFS= read -r line || [ -n "$line" ]; do
   lineno=$((lineno + 1))
-  case "$line" in ""|"#"*|[[:space:]]*"#"*) continue ;; esac
-  [ -z "${line//[[:space:]]/}" ] && continue
+  # コメント判定は行を trim した後だけを見る（pytest の parser と同じ規則。t043 P3-1:
+  # 以前は [[:space:]]*"#"* が「先頭が空白1個 + 行のどこかに#」にマッチし、
+  # 引用符付き path の途中に # を含む有効な行まで誤ってコメット扱いしていた）。
+  trimmed=$(printf '%s' "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+  case "$trimmed" in ""|"#"*) continue ;; esac
+  line="$trimmed"
   case "$line" in
     *"|"*) ;;
     *) echo "[ci-script-tests] ERROR: ${ALLOWLIST#"$ROOT"/}:$lineno: '<path> | <理由>' の形ではない（理由が無い）: $line" >&2
@@ -50,11 +54,14 @@ while IFS= read -r line || [ -n "$line" ]; do
     echo "[ci-script-tests] ERROR: ${ALLOWLIST#"$ROOT"/}:$lineno: 理由が空: $path" >&2
     problems=$((problems + 1)); continue
   fi
-  case "$path" in
-    scripts/test_*.sh) ;;
-    *) echo "[ci-script-tests] ERROR: ${ALLOWLIST#"$ROOT"/}:$lineno: scripts/test_*.sh ではない: $path" >&2
-       problems=$((problems + 1)); continue ;;
-  esac
+  # path の許容文字は tests/test_ci_runs_every_script_test.py の
+  # TEST_FILENAME_PATTERN (scripts/test_[A-Za-z0-9_]+\.sh) と同じ字クラス
+  # にする（t043 P3-2: 以前は glob `scripts/test_*.sh` で `-` 等も受理し、
+  # pytest 側だけが赤くなる食い違いがあった）。
+  if ! [[ "$path" =~ ^scripts/test_[A-Za-z0-9_]+\.sh$ ]]; then
+    echo "[ci-script-tests] ERROR: ${ALLOWLIST#"$ROOT"/}:$lineno: scripts/test_*.sh ではない: $path" >&2
+    problems=$((problems + 1)); continue
+  fi
   if [ ! -f "$ROOT/$path" ]; then
     echo "[ci-script-tests] ERROR: ${ALLOWLIST#"$ROOT"/}:$lineno: 存在しないファイル: $path" >&2
     problems=$((problems + 1)); continue

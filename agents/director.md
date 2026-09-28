@@ -972,10 +972,22 @@ scripts/sync-main-checkout.sh --dry-run    # 何をするか（どこまで進�
 自身の再起動が要る変更（`agents/director.md` / `hooks/*.sh` 等）は、スクリプトが「restart 推奨
 （手動で対応してください）」と表示するだけで実行はしない — Director が引き続き手で判断すること。
 
-**`--dry-run` は「pull 前の disk 基準」で restart の要否を判定するため、「pull したら restart が
-必要になる」ケースを予告できない**（2026-09-28 実測: dispatcher.sh が変わる merge でも `--dry-run`
-は `restart-needed=false` と表示し、本実行で初めて `true` になった。ミッション C の候補）。
-予告を鵜呑みにせず、まず本実行してから `lib_daemon_watch.py status` で結果を確認すること。
+**`--dry-run` の出力には由来が異なる 2 種類の行があり、意味を取り違えないこと**（t118 / PR#249
+Codex 1 巡目 P2 — 旧文面は `restart-needed(...)` の行だけを根拠に dry-run 全体の予告能力を
+否定していたが、`restart 対象:` の行は別の入力（incoming diff）から予告しており誤りだった）:
+
+- `-> restart 対象: <daemon>` — **pull したら変わるファイル**（`origin/main` と現在の HEAD の diff）
+  から予測した restart 予告。**dry-run 時点で表示される** — pull する前に「pull したら何が
+  restart 対象になるか」を見るための行
+- `restart-needed(<name>) [pull 前の現在の disk 基準]` — 稼働中デーモンが読み込んだ版と
+  **今の disk（= pull する前の現在の HEAD）** を比較した値。pull 前は disk がまだ変わっていない
+  ので、incoming の変更を含まず基本的に `false`（2026-09-28 実測: dispatcher.sh が変わる merge
+  でも `--dry-run` 中は `restart-needed=false` のままで、本実行で ff-only merge した後に初めて
+  `true` になった）。**この行だけを見て「restart 不要」と判断しないこと** — pull 後に何が
+  restart 対象かは上の `restart 対象:` 行で分かる
+
+まず `--dry-run` の `restart 対象:` 行で予告を確認し、本実行後は `lib_daemon_watch.py status`
+で結果を確認すること。
 
 **dispatcher / watchdog に `scripts/lib_mux.py kill` を直接使わないこと。** 両者は相互監視
 (`scripts/lib_daemon_watch.py`、`knowledge/daemon-authority.md` §7) をしており、素朴に kill する

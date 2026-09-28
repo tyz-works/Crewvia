@@ -42,6 +42,19 @@ secrets を消す方向に倒れる。`--ignored=matching` はディレクトリ
 一部のプロセスの検査に失敗した部分出力を「見つからなかった (= 使われていない)」と誤読しうる
 (`worktree_gc.py` t057 / PR#239 F3)。`returncode != 0` を先にチェックして拒否すること。
 
+## 2026-09-28 Ren発見: `/proc/<pid>/exe` は comm/cmdline と違い偽装できない構造的な同定材料になる
+
+`comm` (15文字打ち切り・`process.title` で書き換え可能) や `cmdline` (`exec` で消える・
+`process.title` で書き換わる) は代理指標にしかならない (t065/t074/t091 で繰り返し破れた)。
+`os.readlink(f"/proc/{pid}/exe")` は execve 時点の実体 inode への絶対パスをカーネルが
+解決したものなので、プロセス自身がどう argv/環境を偽装しても変わらない — 「起動元」
+(祖先関係) と組み合わせると、名前の部分一致に頼らない同定ができる
+(`scripts/lib_pane_process.py` t097: pane root の直接の子 + exe が
+`/share/claude/versions/` を含む、で Claude Code のセッション本体だけを同定した)。
+symlink 経由で実行するとこのパスは symlink の**先**(実体ファイル)を指す —
+fixture で「本番と同じパスに実体が要る」場合は `shutil.copy2` で実体ファイルを置く
+(symlink だとさらに先の実体を指してしまい一致しない)。
+
 ## 注意事項
 
 <!-- 失敗パターン・ハマりやすい落とし穴 -->

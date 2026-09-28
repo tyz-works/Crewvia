@@ -26,6 +26,22 @@ sys.exit() が効いても前の print 出力が改行なしで連結される�
 COMPACT_FILE=$(python3 -c "..." | head -1)
 ```
 
+## 2026-09-27 `git status --porcelain` は既定で ignored ファイルを数えない
+
+`git status --porcelain=v1 --untracked-files=all` は ignored なファイルを一切含まない。
+`.env` 等を `.gitignore` している repo で「クリーンかどうか」を破壊操作の判定材料にするなら、
+`--ignored=matching` も足して `!! ` prefix の行を別扱いすること（`worktree_gc.py` t057 / PR#239 F1）。
+`git worktree remove` は `--force` 無しでも ignored ファイルの削除を許すので、この見落としは実際に
+secrets を消す方向に倒れる。`--ignored=matching` はディレクトリ全体が ignore パターンにマッチする場合、
+中身を 1 つずつ列挙せず親ディレクトリ 1 行にまとめる（`--untracked-files=all` の未追跡ディレクトリ展開とは
+挙動が違う）。
+
+## 2026-09-27 lsof は一部のプロセスで失敗しても部分出力を出しつつ非 0 を返す
+
+`subprocess.run(['lsof', ...])` の `stdout` が空でないことだけを「完全なスキャンができた」根拠にすると、
+一部のプロセスの検査に失敗した部分出力を「見つからなかった (= 使われていない)」と誤読しうる
+(`worktree_gc.py` t057 / PR#239 F3)。`returncode != 0` を先にチェックして拒否すること。
+
 ## 注意事項
 
 <!-- 失敗パターン・ハマりやすい落とし穴 -->

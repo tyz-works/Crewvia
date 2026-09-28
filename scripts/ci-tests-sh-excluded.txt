@@ -15,7 +15,7 @@
 tests/fixture_tree.sh | テストではない（source される lib。トップレベルに実行文が無い）
 tests/trust_fixture.sh | テストではない（source される lib。トップレベルに実行文が無い）
 
-# --- (ii) 1 回限りの historical red proof（23 本） ---
+# --- (ii) 1 回限りの historical red proof ---
 tests/red_proof_b1_background_work.sh | 1 回限りの historical red proof（CI 化しない）
 tests/red_proof_b6_trust_precheck.sh | 1 回限りの historical red proof（CI 化しない）
 tests/red_proof_stat_and_direct_reads.sh | 1 回限りの historical red proof（CI 化しない）
@@ -24,10 +24,11 @@ tests/red_proof_t001_pytest_workspace.sh | 1 回限りの historical red proof�
 tests/red_proof_t001_stale_records.sh | 1 回限りの historical red proof（CI 化しない）
 tests/red_proof_t004.sh | 1 回限りの historical red proof（CI 化しない）
 tests/red_proof_t005.sh | 1 回限りの historical red proof（CI 化しない）
+tests/red_proof_t005_main_checkout_sync.sh | 1 回限りの historical red proof（CI 化しない）
 tests/red_proof_t009.sh | 1 回限りの historical red proof（CI 化しない）
 tests/red_proof_t010.sh | 1 回限りの historical red proof（CI 化しない）
-tests/red_proof_t017.sh | 1 回限りの historical red proof（CI 化しない）
 tests/red_proof_t013.sh | 1 回限りの historical red proof（CI 化しない）
+tests/red_proof_t017.sh | 1 回限りの historical red proof（CI 化しない）
 tests/red_proof_t018.sh | 1 回限りの historical red proof（CI 化しない）
 tests/red_proof_t019.sh | 1 回限りの historical red proof（CI 化しない）
 tests/red_proof_t020.sh | 1 回限りの historical red proof（CI 化しない）
@@ -38,5 +39,8 @@ tests/red_proof_t025.sh | 1 回限りの historical red proof（CI 化しない�
 tests/red_proof_t033.sh | 1 回限りの historical red proof（CI 化しない）
 tests/red_proof_t036.sh | 1 回限りの historical red proof（CI 化しない）
 tests/red_proof_t047.sh | 1 回限りの historical red proof（CI 化しない）
+tests/red_proof_t053.sh | 1 回限りの historical red proof（CI 化しない）
 tests/red_proof_t055.sh | 1 回限りの historical red proof（CI 化しない）
+tests/red_proof_t110.sh | 1 回限りの historical red proof（CI 化しない）
+tests/red_proof_t113.sh | 1 回限りの historical red proof（CI 化しない）
 tests/red_proof_unobservable.sh | 1 回限りの historical red proof（CI 化しない）

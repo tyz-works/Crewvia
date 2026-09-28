@@ -101,7 +101,9 @@ allowlist + 構造ガード）は踏襲し、コメント判定・ファイル�
 t063 の受入条件は「未調査」を含む理由が 0 行であること）:
 
 - `テストではない（source される lib。トップレベルに実行文が無い）` — `fixture_tree.sh` / `trust_fixture.sh`
-- `1 回限りの historical red proof（CI 化しない）` — red_proof_*.sh 24 本
+- `1 回限りの historical red proof（CI 化しない）` — red_proof_*.sh（件数は `scripts/ci-tests-sh-excluded.txt` の
+  (ii) を参照。ここに固定件数を書くと登録のたびにずれる — t116 で実際に 23 本表記のまま 24 本に
+  ずれていたのを機に、本文からは件数を外した）
 
 **(iii) `watchdog-idle-e2e.sh` を CI に載せる過程で見つかった欠陥**: このファイルの
 シナリオ 4（「B1 が無い origin/main は実行中の Worker も殺してしまう」という対照）は、

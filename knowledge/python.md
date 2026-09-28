@@ -55,6 +55,31 @@ symlink 経由で実行するとこのパスは symlink の**先**(実体ファ�
 fixture で「本番と同じパスに実体が要る」場合は `shutil.copy2` で実体ファイルを置く
 (symlink だとさらに先の実体を指してしまい一致しない)。
 
+## 2026-09-28 Ren発見: `Path.read_text()` は既定で strict decode — `/proc/<pid>/stat` のようなカーネル由来のバイト列には `errors="replace"` か `read_bytes()` を使う
+
+Linux のプロセス名 (comm) は NUL 以外の制約が無い任意バイト列 (`exec -a` や、
+ファイル名自体に不正な UTF-8 バイトを含む実行ファイルを exec するだけで作れる)。
+`Path(...).read_text()` は既定で UTF-8 strict decode するため、**無関係な1
+プロセスの名前が壊れているだけで**、その `/proc` エントリを読んだ瞬間に
+`UnicodeDecodeError` を投げる。これは `ValueError` の派生であって `OSError`
+ではないので、`except OSError` だけの呼び出し元では拾えない
+(`scripts/lib_pane_process.py` t097→t101 の回帰: `/proc` を丸ごと走査する
+関数がこれで丸ごと落ち、無関係なペインの watchdog 判定まで巻き添えにした)。
+
+対策は 2 通り、影響範囲で選ぶ:
+- 生の値 (comm 等) をそのまま使う/表示するだけなら `read_text(errors="replace")`
+  で十分 (不正バイトが U+FFFD に化けるだけで、後続のパース対象 — ppid や
+  state のような ASCII 数字フィールド — には影響しない)
+- 既に bytes で読んでいる箇所がある関数なら `read_bytes().decode("utf-8",
+  errors="replace")` に揃える (このコードベースでは `_proc_cmdline` /
+  `_proc_environ` が先行してこのパターンを使っていた — 一つの関数だけ
+  `read_text()` のまま取り残されると同じ族の欠陥が再発する)
+
+赤の実証: `shutil.copy2` で `/bin/sleep` を `os.fsdecode(b"\xffbad")` という
+ファイル名にコピーして exec すると、そのプロセスの comm (ファイル名から取られる
+— `exec -a` の argv[0] 書き換えは comm には効かない) が壊れた名前になり、
+`/proc/<pid>/stat` の `read_text()` が確実に `UnicodeDecodeError` を再現する。
+
 ## 注意事項
 
 <!-- 失敗パターン・ハマりやすい落とし穴 -->

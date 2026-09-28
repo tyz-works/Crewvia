@@ -69,7 +69,7 @@ memory: approve-judgment-needs-allowlist-and-scope と同じ)。
 
     python3 -m pytest tests/test_observation_authority_does_not_fail_open.py -v
 
-## 検出できる形・できない形 (Codex review 2 巡目 対応、t110)
+## 検出できる形・できない形 (Codex review 2 巡目 対応、t110 / t113)
 
 Codex が 1 巡目で指摘した P2 ×2: (1) `from os import stat` のように import
 した観測関数を裸の名前で呼ぶと `_risky_calls()` は "listdir" しか裸の名前を
@@ -91,6 +91,19 @@ import の並び替え・re-export・動的 import まで含めると検出器�
 (2 巡目の P2 ×2 + QA (a)) を大きく超えるため見送り、(b) は下表への明記のみで
 Director backlog に送る (Result 参照)。
 
+Codex 2 巡目レビューの残り P2 ×2 (t113、この PR の最後の fix): (1) `m: object
+= p.stat` のような型注釈つき代入 (`ast.AnnAssign`) は (a) の修正が
+`ast.Assign` しか見ていなかったため引き続き見逃していた — 注釈の無い同じ形
+(`m = p.stat`) は拾えるのに、である。ついでに `ast.NamedExpr` (代入式、
+walrus) 経由の束縛・即時呼び出しも同じ理由で見ていなかったので、あわせて
+塞いだ (P2-1)。(2) `_owner_by_line()` は「関数ごとに部分木全体へ
+`setdefault`」する作りで、`ast.walk(tree)` が外側の関数を先に見つけるため
+**入れ子関数の行がすべて外側の関数名に帰属していた** —— 入れ子の兄弟関数へ
+呼び出しを移しても `(script, function, snippet)` キーが変わらず、上の表の
+「呼び出しを別関数へ移動」の保証 (「移動先で未分類として拾われる」) が
+入れ子関数の間では成り立っていなかった。現在のスコープを追う再帰的な辿り方
+に変えて、各行を最も内側の関数へ帰属させるようにした (P2-2)。
+
 | 形 | 検出 | 根拠 |
 |---|---|---|
 | 直接 attribute (`os.stat(...)`, `p.exists()`) | する | `.attr` で判定 (モジュール名を問わない) |
@@ -99,11 +112,15 @@ Director backlog に送る (Result 参照)。
 | `from os import stat as st` → `st(...)` | する (t110) | 同上。`asname` を解決 |
 | `os.path.exists(...)` / `Path(...).exists()` | する | `.attr == "exists"` |
 | 変数束縛 (`m = p.stat` → `m()`) | する (t110、QA t054 (a)) | `_bound_risky_names_by_line()` が同じ関数内の `Assign` を辿り、右辺が risky attribute アクセスの変数名を集めて後続の裸呼び出しと突き合わせる |
+| 型注釈つき代入 (`m: object = p.stat` → `m()`) | する (t113、P2-1) | `_bound_risky_names_by_line()` は `ast.Assign` に加え `ast.AnnAssign` も同じ判定に含める (値の無い注釈だけの形は束縛が起きないので対象外) |
+| 代入式 (walrus) で束縛し、後で裸呼び出し (`if (m := p.stat): ... m()`) | する (t113、P2-1) | `_bound_risky_names_by_line()` は `ast.NamedExpr` も同じ判定に含める |
+| 代入式 (walrus) の結果をその場で呼ぶ (`(m := p.stat)()`) | する (t113、P2-1) | `Call.func` 自身が `ast.NamedExpr` になるこの形は束縛→裸呼び出しの突き合わせでは捉えられないので、`_is_risky_named_expr()` で個別に判定する |
 | `getattr(p, "stat")()` (即時呼び出し) | する (t110、QA t054 (a)) | `_is_getattr_literal_risky()` が `Call.func` 自身が `getattr(obj, "risky-name")` の形かを判定する |
 | `getattr` を変数へ束縛して後で呼ぶ (`m = getattr(p, "stat"); m()`) | する (t110、QA t054 (a)) | 上 2 つと同じ仕組み。`Assign` の右辺が `getattr(..., "risky-name")` の Call でも束縛対象に加える |
 | 同一関数内で同一文面の呼び出しが 2 回目以降 | する (t110) | `test_duplicate_call_counts_are_audited` が `_all_sites()` の出現回数を数え、`EXPECTED_OCCURRENCES` に無い増加を落とす (allowlist のキー一致だけでは通ってしまうための補強) |
-| 呼び出しを別関数へ移動 | する | `_owner_by_line()` が行番号→関数名を都度再計算するので、移動先で「未分類」として拾われる (allowlist のキーに旧関数名が入っているため) |
-| ネストした関数・ラムダの中の呼び出し | する | `ast.walk` は関数境界を無視して木全体の `Call` を辿る |
+| 呼び出しを別関数 (兄弟でない) へ移動 | する | `_owner_by_line()` が行番号→関数名を都度再計算するので、移動先で「未分類」として拾われる (allowlist のキーに旧関数名が入っているため) |
+| 呼び出しを入れ子関数の兄弟間で移動 (`def outer(): def a(): ...call...; def b(): ...`) | する (t113、P2-2 で修正。それまでは見逃していた) | 以前は `_owner_by_line()` が入れ子関数の行をすべて外側の関数名に帰属させていたため、`a()` から `b()` へ移しても `(outer, snippet)` という同じキーのままで「未分類」として拾われなかった。現在のスコープを追う再帰的な辿り方に変え、各行を最も内側の関数 (`a` または `b`) へ帰属させる |
+| ネストした関数・ラムダの中の呼び出し (検出そのもの) | する | `ast.walk` は関数境界を無視して木全体の `Call` を辿る (帰属先の正しさは上の行を参照 — 検出と帰属は別の問題) |
 | `contextlib.suppress(OSError)` で囲んだ呼び出し | 呼び出し自体はする / 握り潰しの有無はしない | `_risky_calls` は `Call` ノードだけを拾い、周囲が `try/except` か `suppress` かは見ない。呼び出しは必ず allowlist 行を要求されるので目には触れるが、「fail-open に潰していないか」の判定は reason 欄に人間が書く (この task のスコープはあくまで「未分類の呼び出しを見逃さないこと」) |
 | `try` の `else` 節での呼び出し | 呼び出し自体はする / 上と同じ限界 | `ast.walk` は `try/else` 内の `Call` も辿るが、else に置くことで何を握り潰していないかの検証は reason 欄に委ねる |
 | 呼び出し結果を変数に代入し、離れた場所で fail-open な判定に変換する (間接化) | しない | AST は呼び出し箇所そのものは拾うが、戻り値がどう使われるかまでは追跡しない (`test_every_risky_call_is_classified` の元々の設計限界。reason は人間が読んで書く前提) |
@@ -149,14 +166,39 @@ AUTHORITY_MODULES = [
 
 
 def _owner_by_line(tree: ast.AST) -> dict[int, str]:
-    """行番号 → その行を含む関数名 (`test_queue_reads_go_through_the_guard.py`
-    の `_owner_by_line()` と同じ作り)。"""
+    """行番号 → その行を含む、**最も内側の**関数名。
+
+    以前は `test_queue_reads_go_through_the_guard.py` の `_owner_by_line()` と
+    同じ「`ast.walk(tree)` で見つけた関数ごとに、その部分木全体へ
+    `setdefault` する」作りだった。`ast.walk()` は幅優先なので外側の関数が
+    先に見つかり、その `ast.walk(outer_func)` が入れ子関数の行も含めて丸ごと
+    `setdefault` してしまう —— 後から本当の持ち主 (入れ子関数自身) を処理
+    しても `setdefault` は上書きしないため、**入れ子関数の行がすべて外側の
+    関数名に帰属していた** (P2-2, PR #244 Codex review 2 巡目)。入れ子の
+    兄弟関数へ呼び出しを移しても `_owner_by_line` の答え (外側の関数名) が
+    変わらず、`OBSERVATION_SITES` のキーも変わらないため、移動が「未分類」
+    として拾われない (モジュール docstring の「呼び出しを別関数へ移動」の
+    保証に反する)。
+
+    ここでは木を根から再帰的に辿りながら「現在のスコープ (直近の関数名)」を
+    引き継ぎ、各行に到達した時点のスコープをそのまま記録する —— 各行は
+    この再帰の中でちょうど 1 回だけ訪れるので `setdefault` は不要 (後から
+    見つかった方が常に正しい、最も内側の関数)。
+    """
     owner: dict[int, str] = {}
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            for sub in ast.walk(node):
-                if hasattr(sub, "lineno"):
-                    owner.setdefault(sub.lineno, node.name)
+
+    def visit(node: ast.AST, current: str | None) -> None:
+        for child in ast.iter_child_nodes(node):
+            scope = (
+                child.name
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
+                else current
+            )
+            if scope is not None and hasattr(child, "lineno"):
+                owner[child.lineno] = scope
+            visit(child, scope)
+
+    visit(tree, None)
     return owner
 
 
@@ -198,14 +240,40 @@ def _is_getattr_literal_risky(node: ast.AST) -> bool:
     )
 
 
+def _is_risky_named_expr(node: ast.AST) -> bool:
+    """`(m := p.stat)()` のように、代入式 (walrus) の結果をその場で呼ぶ形か
+    (P2-1, PR #244 Codex review 2 巡目)。
+
+    `_bound_risky_names_by_line()` は「先に束縛して後で裸の名前で呼ぶ」形を
+    拾うが、この形は `Call.func` 自身が `ast.NamedExpr` になり束縛と呼び出しが
+    同じ式の中で起きるので、束縛→裸呼び出しの突き合わせでは捉えられない。
+    """
+    return (
+        isinstance(node, ast.NamedExpr)
+        and (
+            (isinstance(node.value, ast.Attribute) and node.value.attr in RISKY_ATTRS)
+            or _is_getattr_literal_risky(node.value)
+        )
+    )
+
+
 def _bound_risky_names_by_line(tree: ast.AST) -> dict[int, set[str]]:
     """行番号 → その行を含む関数内で、risky attribute に束縛されたローカル
     変数名の集合 (QA t054 (a): `m = p.stat` / `m = getattr(p, "stat")`)。
 
     代入の時点ではまだ呼び出していないので `.attr`/`getattr` の判定だけでは
     捉えられない。後で `m()` と呼ばれた時点で初めて観測が起きる。
-    `_owner_by_line()` と同じ「関数の subtree 全体に setdefault」の作りに
-    揃えている (ネストした関数での扱いも一貫させるため)。
+    `_owner_by_line()` と同じ「関数ごとに」束縛名を集める作りに揃えている
+    (ネストした関数での扱いも一貫させるため)。
+
+    P2-1 (PR #244 Codex review 2 巡目): 以前は `ast.Assign` しか見ておらず、
+    `m: object = p.stat` のような型注釈つき代入 (`ast.AnnAssign`) は束縛として
+    拾えなかった (注釈の無い同じ形は拾えていたのに、である)。`ast.NamedExpr`
+    (`m := p.stat`) 経由の束縛 — 呼び出しとは別の場所で束縛し、後で `m()` と
+    裸呼び出しする形 — も同じ理由で見ていなかったので、あわせて対象にする。
+    3 つの形はどれも「対象 (`target`) に risky な値 (`value`) を束縛する」
+    という同じ構造なので、`(targets, value)` に正規化してから 1 本の判定に
+    まとめる (分岐を増やさない)。
     """
     bound: dict[int, set[str]] = {}
     for func_node in ast.walk(tree):
@@ -213,16 +281,23 @@ def _bound_risky_names_by_line(tree: ast.AST) -> dict[int, set[str]]:
             continue
         names: set[str] = set()
         for node in ast.walk(func_node):
-            if not isinstance(node, ast.Assign):
+            if isinstance(node, ast.Assign):
+                targets, value = node.targets, node.value
+            elif isinstance(node, ast.AnnAssign):
+                targets, value = [node.target], node.value
+            elif isinstance(node, ast.NamedExpr):
+                targets, value = [node.target], node.value
+            else:
                 continue
-            value = node.value
+            if value is None:
+                continue  # `x: int` (注釈のみ、値の無い AnnAssign) — 束縛が起きない
             risky = (
                 (isinstance(value, ast.Attribute) and value.attr in RISKY_ATTRS)
                 or _is_getattr_literal_risky(value)
             )
             if not risky:
                 continue
-            for target in node.targets:
+            for target in targets:
                 if isinstance(target, ast.Name):
                     names.add(target.id)
         for sub in ast.walk(func_node):
@@ -239,10 +314,11 @@ def _risky_calls(path: pathlib.Path) -> list[tuple[str, str]]:
     RISKY_ATTRS の `"stat"` に自然に当たる)。`from os import listdir` の
     ような裸の名前 (`ast.Name`) の呼び出しは `_imported_risky_names()` が
     解決した別名の集合と、同じ関数内で変数や `getattr` に束縛された名前は
-    `_bound_risky_names_by_line()` と突き合わせる (QA t054 (a))。
-    `AUTHORITY_MODULES` 外のヘルパーへ委譲された呼び出しは、このファイルの
-    AST 上に risky attribute 名そのものが現れないため原理的に見えない
-    (QA t054 (b)。モジュール上の docstring 表を参照)。
+    `_bound_risky_names_by_line()` と突き合わせる (QA t054 (a))。`(m := p.stat)()`
+    のように束縛と呼び出しが同じ式で起きる形は `_is_risky_named_expr()` で
+    別に見る (P2-1)。`AUTHORITY_MODULES` 外のヘルパーへ委譲された呼び出しは、
+    このファイルの AST 上に risky attribute 名そのものが現れないため原理的に
+    見えない (QA t054 (b)。モジュール上の docstring 表を参照)。
     """
     src = path.read_text()
     tree = ast.parse(src, filename=str(path))
@@ -262,6 +338,8 @@ def _risky_calls(path: pathlib.Path) -> list[tuple[str, str]]:
         elif isinstance(func, ast.Name) and func.id in bound_by_line.get(node.lineno, ()):
             hit = True
         elif _is_getattr_literal_risky(func):
+            hit = True
+        elif _is_risky_named_expr(func):
             hit = True
         if not hit:
             continue
@@ -510,9 +588,17 @@ OBSERVATION_SITES: dict[tuple[str, str, str], tuple[str, str]] = {
         (SAFE, "OSError で None。_belongs() は None を observed=False として "
                "扱い、3 signal のうち 1 つでも読めなければ観測失敗に倒す"),
     ("leaked_descendants.py", "pids", "os.listdir(_PROC)"):
-        (SAFE, "OSError で空集合。呼び出し元 snapshot()/scan() は "
-               "差分ベースなので、列挙自体が失敗すると新規プロセスを 1 つも "
-               "検出できず kill 対象が増えない方向 (fail-closed)"),
+        (KNOWN_FAIL_OPEN,
+         "MEDIUM (P2-3, PR #244 Codex review 2 巡目): 以前は「OSError で空集合。"
+         "呼び出し元 snapshot()/scan() は差分ベースなので、列挙自体が失敗すると "
+         "新規プロセスを 1 つも検出できず kill 対象が増えない方向 (fail-closed)」"
+         "を根拠に SAFE としていたが、これは『kill を許可しない』ことだけを見て "
+         "おり、この監査の目的 (観測失敗を不在に潰さないこと) そのものに反する。"
+         "`/proc` の列挙自体が失敗する (EACCES 等) と `scan()` は 1 件も pid を "
+         "見つけられないまま `unobservable=0` の『クリーン』な `Scan` を返し、"
+         "`settle()` は即座に終わって不確かさの警告 (`_report_unobservable_only`) "
+         "が一切出ない —— 観測できなかったことが呼び出し元に一切伝わらない。"
+         "この task では直さない (スコープ外)。Director backlog へ。"),
     ("leaked_descendants.py", "_belongs",
      'os.readlink(os.fsencode(base / "cwd"))'):
         (SAFE, "OSError で observed=False。3 signal (environ/cmdline/cwd) の "
@@ -522,9 +608,17 @@ OBSERVATION_SITES: dict[tuple[str, str, str], tuple[str, str]] = {
         (SAFE, "stat が None のときの再確認。exists() の結果をそのまま "
                "unobservable フラグとして返すだけで、kill 許可には使わない"),
     ("leaked_descendants.py", "_scan_one", '(_PROC / str(pid)).stat()'):
-        (SAFE, "uid 判定用。OSError は『走査中に死んだだけ』として "
-               "survivor=None, unobservable=False (=「居ない」であって "
-               "kill 許可の根拠ではない)"),
+        (KNOWN_FAIL_OPEN,
+         "HIGH (P2-3, PR #244 Codex review 2 巡目): 以前は「uid 判定用。OSError "
+         "は『走査中に死んだだけ』として survivor=None, unobservable=False "
+         "(=「居ない」であって kill 許可の根拠ではない)」を根拠に SAFE として "
+         "いたが、`except OSError: return None, False` は ENOENT/ESRCH と "
+         "PermissionError/EIO 等を区別せず全部『居なくなった』に潰している。"
+         "`kill を許可しないこと` は SAFE の根拠にならない —— 生きているが "
+         "権限や I/O で観測できないだけのプロセスが survivors からも "
+         "unobservable からも消え、settle() が『クリーン』を返して不確かさの "
+         "警告が出ない (この監査の目的そのものに反する)。この task では直さ "
+         "ない。Director backlog へ。"),
     ("leaked_descendants.py", "_uptime", '(_PROC / "uptime").read_text()'):
         (SAFE, "boot 経過時間の補助値。読めなければ 0.0 —— age 計算がやや "
                "不正確になるだけで kill 許可/survivor 判定そのものには使わない"),

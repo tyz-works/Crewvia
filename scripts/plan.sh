@@ -817,15 +817,22 @@ def save_mission(slug, data):
     _atomic_write(mission_yaml_path(slug), dump_yaml(data, key_order=MISSION_KEY_ORDER))
 
 
-def load_task(slug, task_id):
-    path = task_path(slug, task_id)
-    if not os.path.exists(path):
-        die(f"task '{task_id}' not found in mission '{slug}'")
+def _load_task_from_path(path):
+    """`path` の task card を `(meta, body)` にする。見つかる場所 (active mission /
+    archive) を問わない —— 呼び出し側が解決済みのパスを渡す (`load_task()` /
+    `cmd_reap_orphan_assignment`)。"""
     text = read_queue_file(path, 'task card')
     try:
         return parse_frontmatter(text, source=path)
     except ValueError as e:
         die(f"failed to parse {path}: {e}")
+
+
+def load_task(slug, task_id):
+    path = task_path(slug, task_id)
+    if not os.path.exists(path):
+        die(f"task '{task_id}' not found in mission '{slug}'")
+    return _load_task_from_path(path)
 
 
 def save_task(slug, task_id, meta, body):
@@ -5810,11 +5817,18 @@ def cmd_reap_orphan_assignment(args):
     保留 (1 バイトも書かずに exit `PRECONDITION_UNMET`):
       - assignment が読めない (壊れている / 種類が違う)
       - `mission:task` の形でない
-      - 指す task が見つからない (mission が無い/archive 済みを含む)
+      - 指す task が見つからない (mission が無い、active dir にも archive dir
+        にも card が無い)
       - 指す task が終了していない (in_progress 等) — まだ本当に走っている
         かもしれないので触らない
       - 指す task が `needs_director` — 上の ORPHAN_ASSIGNMENT_FINISHED_STATUSES
         のコメント参照。証拠不足を「消してよい」に倒さない
+
+    mission が archive 済み (`queue/archive/<slug>/tasks/<task>.md`) でも掃除の
+    対象は変わらない —— archive はまさに「もう決着した」ミッションの代表例で、
+    ここで active dir だけを見て「見つからない」に倒すと、B3 が本来消したかった
+    孤児 (最後のミッションが完了した直後に archive された経路) がここでも
+    保留に落ちる (t117)。active dir → archive dir の順で探す。
 
     dispatcher が毎サイクル呼ぶ前提の安さ: 読み直しはキューロックの中で 1 回
     だけ (assignment ファイル 1 個 + task card 1 個)。列挙は行わない。
@@ -5842,12 +5856,19 @@ def cmd_reap_orphan_assignment(args):
                 f" 'mission:task' ではありません ({raw!r}) — 消しません",
                 PRECONDITION_UNMET)
 
-        if not os.path.exists(task_path(slug, task_id)):
-            die(f"[plan.sh reap-orphan-assignment] assignment/{agent} が指す"
-                f" task {slug}/{task_id} が見つかりません (mission が無い / "
-                f"archive 済みを含む) — 消しません", PRECONDITION_UNMET)
+        card_path = task_path(slug, task_id)
+        if not os.path.exists(card_path):
+            # t117: mission が active dir に無くても archive 済みかもしれない
+            # (最後のミッションが完了 → archive された直後、というのが B3 が
+            # 本来消したかった孤児の形そのもの)。
+            archived_path = os.path.join(ARCHIVE_DIR, slug, 'tasks', f"{task_id}.md")
+            if not os.path.exists(archived_path):
+                die(f"[plan.sh reap-orphan-assignment] assignment/{agent} が指す"
+                    f" task {slug}/{task_id} が見つかりません (active dir にも"
+                    f" archive dir にも無い) — 消しません", PRECONDITION_UNMET)
+            card_path = archived_path
 
-        meta, _body = load_task(slug, task_id)
+        meta, _body = _load_task_from_path(card_path)
         status = meta.get('status')
         if status not in ORPHAN_ASSIGNMENT_FINISHED_STATUSES:
             die(f"[plan.sh reap-orphan-assignment] assignment/{agent} が指す"

@@ -694,19 +694,47 @@ def codex_review_slot_busy(task_statuses_by_mission):
     return True
 
 
+def _referenced_task_status(slug, task_id, task_statuses_by_mission):
+    """`slug:task_id` の status（不明なら `None`）。
+
+    `task_statuses_by_mission` は `load_all_tasks(active_missions)` の戻りで、
+    **active な mission だけ**を載せている。t117: 掃除の呼び出しが「active な
+    ミッションが 0 件」「active が全部 done」の早期 return より前に動くように
+    なったので、その 2 つの分岐では `task_statuses_by_mission` をまだ作って
+    おらず、呼び出し側は空辞書 `{}` を渡す。さらに、参照先の mission がそもそも
+    archive 済みなら `active_missions` に二度と載らないので、通常サイクルでも
+    同じ穴がある。`.get(slug, {})` で空辞書に潰すと「終了していない」に誤読し、
+    孤児が永久に残る（B3 が直すはずだった「ミッション終了後」の形そのもの）。
+
+    mission が `task_statuses_by_mission` に無いときだけ、その mission の
+    active dir → archive dir の順で card を直接読む（どちらにも無ければ
+    判定不能 = `None`）。
+    """
+    statuses = task_statuses_by_mission.get(slug)
+    if statuses is not None:
+        return statuses.get(task_id)
+    for base in (MISSIONS_DIR, ARCHIVE_DIR):
+        task_file = base / slug / 'tasks' / f'{task_id}.md'
+        if task_file.exists():
+            meta, _ = read_task_card(task_file, task_id)
+            return meta.get('status')
+    return None
+
+
 def _kai_codex_orphan_candidate(task_statuses_by_mission):
     """`assignment/Kai-codex` が、掃除 (`plan.sh reap-orphan-assignment`) を試す価値が
     あるかを安く判定する — 実際に消してよいかの最終判断ではない。
 
     `plan.sh` は 1 サイクルにつき最大 1 回しか起動したくない (孤児が無いサイクルが
-    大多数)。このサイクルで既に読み込み済みの `task_statuses_by_mission` だけを
-    見て、subprocess を起動する価値があるかを判定する —— 実際の削除判定 (キュー
-    ロックの中での読み直し・`needs_director` の除外・世代照合) は `plan.sh
-    reap-orphan-assignment` 側 (cmd_reap_orphan_assignment) だけが行う。ここで
-    「消してよい」と結論しない: 対象はあくまで `RELEASED_WORK_STATUSES`
-    (`codex_review_slot_busy()` と同じ「終了した」の定義) で、`needs_director` は
-    **含めない** —— plan.sh 側が needs_director を保留 (削除しない) に倒すので、
-    含めても無駄な subprocess 起動が増えるだけである。
+    大多数)。このサイクルで既に読み込み済みの `task_statuses_by_mission` (無ければ
+    `_referenced_task_status()` が card を直接読む。t117) だけを見て、subprocess を
+    起動する価値があるかを判定する —— 実際の削除判定 (キューロックの中での読み
+    直し・`needs_director` の除外・世代照合) は `plan.sh reap-orphan-assignment`
+    側 (cmd_reap_orphan_assignment) だけが行う。ここで「消してよい」と結論しない:
+    対象はあくまで `RELEASED_WORK_STATUSES` (`codex_review_slot_busy()` と同じ
+    「終了した」の定義) で、`needs_director` は**含めない** —— plan.sh 側が
+    needs_director を保留 (削除しない) に倒すので、含めても無駄な subprocess 起動が
+    増えるだけである。
     """
     raw = read_assignment(CODEX_REVIEW_AGENT)
     if is_missing(raw) or is_unreadable(raw):
@@ -714,7 +742,7 @@ def _kai_codex_orphan_candidate(task_statuses_by_mission):
     slug, sep, task_id = raw.strip().partition(':')
     if not sep or not slug or not task_id:
         return False
-    status = task_statuses_by_mission.get(slug, {}).get(task_id)
+    status = _referenced_task_status(slug, task_id, task_statuses_by_mission)
     return status in RELEASED_WORK_STATUSES
 
 
@@ -732,6 +760,12 @@ def reap_kai_codex_orphan_assignment(task_statuses_by_mission):
     実際に消してよいかどうかの最終判断 (キューロック内での読み直し・
     `needs_director` の除外・世代照合)。この関数はその subprocess を呼ぶかどうか
     と、結果をログに残すことだけを担う。
+
+    `dispatch()` は「active なミッションが 0 件」「active が全部 done」の早期
+    return より前でこの関数を呼ぶ (t117)。その 2 つの分岐では `task_statuses_by_
+    mission` をまだ作っていないので `{}` が渡ってくる —— それでも参照先の
+    status は `_kai_codex_orphan_candidate()` → `_referenced_task_status()` が
+    card を直接読んで判定できる。
     """
     if not _kai_codex_orphan_candidate(task_statuses_by_mission):
         return
@@ -2146,6 +2180,18 @@ def dispatch():
             f"このサイクルは割り当ても退役も行わない")
         return
 
+    # t009 / backlog #34, t117: Kai-codex の孤児 assignment の掃除は「active な
+    # ミッションが 0 件」「active が全部 done」の早期 return より前に置く。
+    # 以前は `load_all_tasks()` の後 (=両方の早期 return の後ろ) にあり、
+    # 最後のミッションが完了した直後に assignment が孤児化すると、以後の
+    # サイクルは毎回そのどちらかの return で抜けてしまい、掃除が二度と
+    # 走らなかった (B3 が直すはずだった「ミッション終了後」の形そのもの)。
+    # ここではまだ `task_statuses_by_mission` を作っていないので `{}` を渡す —
+    # 参照先 mission の card は `_kai_codex_orphan_candidate()` が直接読む
+    # (active dir / archive dir の両方。archive 済みミッションを指す孤児も
+    # これで掃除できる)。
+    reap_kai_codex_orphan_assignment({})
+
     active_missions = list(state.get('active_missions') or [])
 
     # Bug1 fix: even with no active missions, shut down lingering idle Workers
@@ -2191,12 +2237,6 @@ def dispatch():
 
     # Load all tasks
     all_tasks, done_ids_by_mission, task_statuses_by_mission = load_all_tasks(active_missions)
-
-    # t009 / backlog #34: Kai-codex の孤児 assignment を毎サイクル安く掃除する。
-    # spawn 可否の判定 (codex_review_slot_busy) より前でも後でも結果は変わらない
-    # (孤児は読むだけでは spawn を塞がないので) が、このサイクルで新しい
-    # codex-review を送る前に片付けておいたほうがログの順序が読みやすい。
-    reap_kai_codex_orphan_assignment(task_statuses_by_mission)
 
     # t010: 状態ベースの通知 (needs_director / handoff / review-refused) が今なお
     # 成り立っている key。サイクルの最後に、成り立たなくなった記録を捨てるのに使う。

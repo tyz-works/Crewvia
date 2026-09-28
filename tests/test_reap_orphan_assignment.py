@@ -192,6 +192,61 @@ def test_keeps_an_assignment_pointing_at_a_missing_task(sandbox):
     assert (_assignments(sb) / CODEX).exists()
 
 
+# ---------------------------------------------------------------------------
+# t117: mission が archive 済みでも掃除できる (active dir だけを見て
+# 「見つからない」に倒していたのが、B3 が本来消したかった孤児 —— 最後の
+# ミッションが完了 → archive された直後 —— を永久に残す穴だった)。
+# ---------------------------------------------------------------------------
+
+def _archived_card(sb, task_id, status, **kw):
+    d = sb.queue / "archive" / MISSION / "tasks"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / f"{task_id}.md").write_text(_card_text(task_id, status, **kw))
+
+
+def test_reaps_an_assignment_pointing_at_a_finished_task_in_an_archived_mission(sandbox):
+    sb = sandbox
+    _archived_card(sb, "t001", "done", worker=CODEX, skills="codex-review")
+    (_assignments(sb) / CODEX).write_text(f"{MISSION}:t001\n")
+
+    r = _reap(sb)
+
+    assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
+    assert not (_assignments(sb) / CODEX).exists()
+
+
+def test_keeps_an_assignment_pointing_at_an_unfinished_task_in_an_archived_mission(sandbox):
+    """archive 済みでも「終了した」以外は撤去しない — 判定基準は status であって
+    archive の有無ではない。"""
+    sb = sandbox
+    _archived_card(sb, "t001", "in_progress", worker=CODEX, skills="codex-review")
+    (_assignments(sb) / CODEX).write_text(f"{MISSION}:t001\n")
+
+    r = _reap(sb)
+
+    assert r.returncode == 3, (r.returncode, r.stdout, r.stderr)
+    assert (_assignments(sb) / CODEX).read_text().strip() == f"{MISSION}:t001"
+
+
+def test_reaps_an_assignment_after_the_mission_was_archived_via_plan_sh(sandbox):
+    """`plan.sh archive` で本当にミッション全体を archive/ へ動かした後でも掃除できる
+    (red proof: 修正前は `task_path()` が active dir だけを見るので、ここで
+    PRECONDITION_UNMET になり assignment が残り続けた)。"""
+    sb = sandbox
+    _sb_card(sb, "t001", "done", worker=CODEX, skills="codex-review")
+    (_assignments(sb) / CODEX).write_text(f"{MISSION}:t001\n")
+
+    archived = sb.run("archive", MISSION)
+    assert archived.returncode == 0, (archived.returncode, archived.stdout, archived.stderr)
+    assert not (sb.queue / "missions" / MISSION).exists()
+    assert (sb.queue / "archive" / MISSION / "tasks" / "t001.md").exists()
+
+    r = _reap(sb)
+
+    assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
+    assert not (_assignments(sb) / CODEX).exists()
+
+
 def test_is_a_noop_when_the_assignment_is_already_absent(sandbox):
     sb = sandbox
     r = _reap(sb)
@@ -346,6 +401,95 @@ def test_end_to_end_reaps_the_orphan_and_spawns_the_next_review_in_one_cycle(tmp
         "1 サイクルの中で孤児 assignment が掃除されなかった")
     spawned = _kai_spawns(spy)
     assert spawned and "t010" in spawned[0], f"次の codex-review が spawn されない: {spy.calls}"
+
+
+# ---------------------------------------------------------------------------
+# (g) t117: 掃除は dispatch() の早期 return (active なし / 全部 done) の
+# 後ろではなく前で動く。red proof: 修正前はこの節の "reaps" 系がどちらも
+# assignment を残したまま return していた。
+# ---------------------------------------------------------------------------
+
+def _set_no_active_missions(root):
+    (root / "queue" / "state.yaml").write_text("active_missions: []\ndefault_mission: null\n")
+
+
+def _mark_mission_done(root, slug):
+    (root / "queue" / "missions" / slug / "mission.yaml").write_text(
+        f'title: dispatch reap test\nslug: {slug}\nstatus: done\n'
+        f'created_at: "2026-01-01T00:00:00Z"\ncompleted_at: "2026-01-02T00:00:00Z"\n'
+        f'next_task_id: 99\n')
+
+
+def _archived_dispatcher_card(root, slug, task_id, status, **kw):
+    d = root / "queue" / "archive" / slug / "tasks"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / f"{task_id}.md").write_text(_card_text(task_id, status, **kw))
+
+
+def test_dispatch_reaps_an_orphan_in_an_archived_mission_when_there_are_no_active_missions(tmp_path):
+    """B3 が本来直したかった形そのもの: 最後のミッションが完了 → archive され、
+    active_missions が空になった直後でも、次のサイクルで孤児が掃除される。"""
+    root = _dispatcher_root(tmp_path)
+    _set_no_active_missions(root)
+    _archived_dispatcher_card(root, SLUG, "t011", "done", worker=CODEX, skills="codex-review", pr=4)
+    _assign(root, CODEX, f"{SLUG}:t011\n")
+    mux = FakeMux([])
+    ns = _load_dispatcher(root, mux)
+
+    ns["dispatch"]()
+
+    assert not (root / "queue" / "assignments" / CODEX).exists(), (
+        "active なミッションが 0 件の早期 return の後ろで掃除が止まっている")
+
+
+def test_dispatch_keeps_a_live_orphan_in_an_archived_mission_when_there_are_no_active_missions(tmp_path):
+    """回帰 (t009): 参照先が実際に走っている (in_progress) なら、この早期 return
+    経路でも消してはいけない。"""
+    root = _dispatcher_root(tmp_path)
+    _set_no_active_missions(root)
+    _archived_dispatcher_card(root, SLUG, "t011", "in_progress", worker=CODEX, skills="codex-review", pr=4)
+    _assign(root, CODEX, f"{SLUG}:t011\n")
+    mux = FakeMux([])
+    ns = _load_dispatcher(root, mux)
+
+    ns["dispatch"]()
+
+    assert (root / "queue" / "assignments" / CODEX).read_text().strip() == f"{SLUG}:t011", (
+        "生きている codex-review の assignment を消してしまった")
+
+
+def test_dispatch_reaps_an_orphan_when_all_active_missions_are_done(tmp_path):
+    """`active_missions` に残っていても、mission.yaml が全部 done なら早期 return
+    する —— それでも掃除は動くこと。"""
+    root = _dispatcher_root(tmp_path)
+    _mark_mission_done(root, SLUG)
+    _put_card(_tasks_dir(root), "t011", "done", aged=True,
+              worker=CODEX, skills="codex-review", pr=4)
+    _assign(root, CODEX, f"{SLUG}:t011\n")
+    mux = FakeMux([])
+    ns = _load_dispatcher(root, mux)
+
+    ns["dispatch"]()
+
+    assert not (root / "queue" / "assignments" / CODEX).exists(), (
+        "全 active ミッションが done の早期 return の後ろで掃除が止まっている")
+
+
+def test_dispatch_keeps_a_live_orphan_when_all_active_missions_are_done(tmp_path):
+    """回帰 (t009): 全 active ミッションが done の早期 return 経路でも、走っている
+    codex-review の assignment は消さない。"""
+    root = _dispatcher_root(tmp_path)
+    _mark_mission_done(root, SLUG)
+    _put_card(_tasks_dir(root), "t011", "in_progress", aged=True,
+              worker=CODEX, skills="codex-review", pr=4)
+    _assign(root, CODEX, f"{SLUG}:t011\n")
+    mux = FakeMux([])
+    ns = _load_dispatcher(root, mux)
+
+    ns["dispatch"]()
+
+    assert (root / "queue" / "assignments" / CODEX).read_text().strip() == f"{SLUG}:t011", (
+        "生きている codex-review の assignment を消してしまった")
 
 
 if __name__ == "__main__":  # pragma: no cover

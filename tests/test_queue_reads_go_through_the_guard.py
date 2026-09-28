@@ -113,7 +113,12 @@ GUARDED_READS = [
     # --- plan.sh ---------------------------------------------------------
     ("plan.sh", "try_read_queue_file", {"read_regular_text"}),
     ("plan.sh", "read_queue_file", {"try_read_queue_file"}),
-    ("plan.sh", "load_task", {"read_queue_file"}),
+    # t117: load_task() は解決済みパスのパースを _load_task_from_path() に
+    # 委譲した (cmd_reap_orphan_assignment が archive 済みの task card でも
+    # 同じパース経路を再利用するため)。ガードの入口そのものは変わらない —
+    # _load_task_from_path() が read_queue_file() を直接呼ぶ。
+    ("plan.sh", "load_task", {"_load_task_from_path"}),
+    ("plan.sh", "_load_task_from_path", {"read_queue_file"}),
     ("plan.sh", "load_mission", {"read_queue_file"}),
     ("plan.sh", "_print_mission_summary", {"try_read_queue_file"}),
     ("plan.sh", "_print_mission_detail", {"read_queue_file"}),

@@ -525,6 +525,16 @@ spawn を塞がなくなった) —— だが**ファイルそのものを消す
   含めない) に該当するときだけ `plan.sh` を subprocess で起動する。孤児が無い大多数の
   サイクルでは subprocess を 1 本も起動しない。`--no-wait` (queue ロックが混んでいれば
   諦めて次のサイクル) は watchdog → `plan.sh retire` (`lib_retirement.py`) と同じ理由。
+  呼ぶ位置は `dispatch()` の「active なミッションが 0 件」「active が全部 done」の
+  早期 return より**前** (t117 / Codex 1 巡目 P2)。初版はこの掃除を `load_all_tasks()`
+  の後ろ (=両方の早期 return の後ろ) に置いていたため、最後のミッションが完了した
+  直後に assignment が孤児化すると、以後のサイクルは毎回どちらかの return で抜けて
+  しまい掃除が二度と走らなかった。この位置ではまだ `task_statuses_by_mission` を
+  作っていないので `{}` を渡す —— 参照先 mission が辞書に無いとき
+  (`_referenced_task_status()`) は、その mission の task card を active dir →
+  archive dir の順で直接読む。これは「参照先 mission が archive 済み」という、まさに
+  この掃除が対象にしたかった経路 (最後のミッション完了 → archive) にも対応する
+  (`plan.sh reap-orphan-assignment` 側も同じ理由で archive dir を見るよう直した)。
 - subprocess の env は `os.environ` の継承任せにせず、dispatcher 自身が使っている
   `CREWVIA_QUEUE` / `CREWVIA_REPO_ROOT` を明示的に上書きする。**継承任せにすると、
   ambient な env (開発者シェルの `.crewvia-env` が本番 queue を指しているケース) が

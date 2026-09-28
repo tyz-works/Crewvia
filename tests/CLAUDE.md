@@ -45,6 +45,34 @@ root の `CLAUDE.md` から移した、テスト専用の規則。設計と経�
 - 静的検査（`scripts/test_registry_lock.sh` 等）は worktree では除外判定が全件に当たり必ず PASS する。
   検査件数を出し、fixture の lib は helper 経由にする。
 
+## 子プロセスを残さない（`tests/leaked_descendants.py` / `tests/proc_group.py`）
+
+- plan.sh のような **bash の下で更に子を起こすもの** を `subprocess.run(timeout=)` / `Popen.kill()` で止めると、
+  殺されるのは bash だけで、下の `python3 -` は孤児になる（FIFO のテストでは `wait_for_partner` で永久に待つ）。
+  タイムアウトや後始末が要る実行は `proc_group.run_in_own_group()`（`Popen` なら `start_new_session=True` +
+  `kill_group()`）で、**木ごと**殺す。
+- 構造ガード: 各テストの後に、そのテストの間に増えて生きている **このセッションの子孫** があれば kill して、
+  そのテストを ERROR にする（`conftest.py` が `install()`）。「このセッションの子孫」は環境の印
+  `CREWVIA_PYTEST_SESSION` か cmdline / cwd が basetemp を指すこと。本番の plan.sh・デーモン・別セッションの
+  pytest は数えない・殺さない。ガードが赤くなったら、ガードではなくそのテストの後片付けを直す。
+- 設計・実測・戻し方: `knowledge/test-leaked-descendants.md`。
+- **kill の関門は `tests/kill_budget.py`（判定とは別ファイル）**。自分・祖先・セッション/グループリーダー・
+  **自分より古いプロセス**（テストの子孫が、テスト自身より先に生まれていることはない）は殺さない。許可が
+  上限（既定 16、`CREWVIA_LEAK_KILL_BUDGET`）を超えたら **1 件も殺さない** — 「本当に N 個漏れた」ではなく
+  判定が壊れている方を疑う。**このファイルは変異させない**（安全弁を壊す変異は意味を失わせる）。
+- ガードの kill は `kill_all(survivors, kill=_default_kill)` の差し替え口を通す。ガード自身のテストと
+  変異テストは **本物のシグナルを送らない**（`tests/test_leak_guard_self_preservation.py`）。
+  `_default_kill` は `signal.pidfd_send_signal` で **観測時 (`scan()`) に束縛した pidfd 限定**に送る
+  （pid 番号では送らない）— `scan()` が候補を見つけた瞬間に `os.pidfd_open` して starttime を
+  再確認し、以降その pid 番号が再利用されても束縛した fd は元のプロセスにしか届かない
+  （2 巡目 codex review finding 3 / memory: verify-and-destroy-must-share-one-connection）。
+  pidfd を束縛できなかった survivor は pid 番号へフォールバックせず kill しない。
+- **判定を壊す変異テストは PID 名前空間の中だけで走らせる**:
+  `unshare -Urpf --mount-proc python3 -m pytest …`。名前空間の外の pid は `/proc` に見えず `os.kill` も
+  ESRCH になるので、判定がどう壊れても外へ届かない。2026-09-27、`_belongs` の頭に `return "any", True` を
+  注入した変異（G1）を素の環境で走らせ、`systemd --user` / tmux / WSL キープアライブ / n8n（uid 1000）を
+  SIGKILL して WSL ごと落とした。
+
 ## red proof の作法
 
 - 修正のテストは、**欠陥を戻して赤くなること**を実証する（`tests/red_proof_*.sh`）。期待値をテスト内に

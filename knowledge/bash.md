@@ -87,3 +87,23 @@ REGISTRY_DIR/QUEUE_DIR だけ完全に隔離できる。
 実際に発火する経路 (200 文字超の単一行 reason の `[:200]` カットオフ) を使うこと —
 literal `\n` を frontmatter に埋め込んでも parser (`_scalar`) は `\n` を unescape しないため
 何も起きない。
+
+## 2026-09-27 `set -uo pipefail` のシェルスクリプトで `$(...)` の代入は必ず終了コードも見る (t068, PR#241 P2)
+
+`set -uo pipefail`（`-e` なし）な `scripts/test_*.sh` で `OUT=$(python3 - <<'PYEOF' ... PYEOF)`
+のように埋め込み Python を呼び、判定を「出力に `FAIL` が無いこと」だけに頼ると、import か
+本体が未処理の例外を出して python3 が非ゼロ終了しても、代入自体は失敗せず継続する。
+出力は空か途中までしか出ないため `grep FAIL` は空振りし、**例外による早期終了 (=検証が
+最後まで走っていない) が PASS に潰れる**（`test_watchdog_config_mode.sh` の Test 26 実例。
+`PY26=$(...)` の直後に `PY26_EXIT=$?` を捕まえ忘れていた）。
+
+対策は 2 種類あり、ブロックの assertion の形で選ぶ:
+- 「出力に FAIL が無いこと」で判定するブロック（複数ケースを1回の python3 呼び出しでループ
+  して PASS/FAIL 行を print する形）→ 代入直後に `RC=$?` を捕り、`[[ "$RC" -ne 0 ]] ||
+  grep -q "^FAIL"` で OR 判定にする（`fail`/`pass` 分岐の前）
+- 「特定の PASS 行 / 期待値との完全一致」で判定するブロック（例: `BACKEND=$(...)`; `[[
+  "$BACKEND" == "HerdrBackend" ]]`）→ 例外で出力が空になれば自動的に不一致 = 正しく fail
+  するので追加の終了コード検査は不要（このパターンは元々安全）
+
+族ごとの掃除をするときは、まず各ブロックがどちらの assertion 形かを見分けること。
+「absence-of-FAIL」形だけが終了コードの見落としに弱い。

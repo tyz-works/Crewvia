@@ -78,6 +78,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
 import watchdog  # noqa: E402
+from proc_group import kill_group  # noqa: E402
 
 
 AGENT = "TestWorker"
@@ -186,14 +187,17 @@ def worker_pane():
     子はすべて root とほぼ同時に起動するので、修正後の分類では
     executing ではなく idle_process になる。
     """
+    # 新しいセッションの頭にして、後片付けは木ごと (root だけ kill すると sleep が孤児で残る。
+    # tests/proc_group.py / tests/leaked_descendants.py)。
     root = subprocess.Popen(
-        ["sh", "-c", 'sh -c "sleep 300 & sleep 300 & wait" & wait']
+        ["sh", "-c", 'sh -c "sleep 300 & sleep 300 & wait" & wait'],
+        start_new_session=True,
     )
     time.sleep(0.5)  # 木が出そろうまで
     try:
         yield root.pid
     finally:
-        root.kill()
+        kill_group(root)
         root.wait()
 
 
@@ -374,12 +378,12 @@ def test_startup_children_are_not_executing():
     抑止されてしまう。
     """
     # root(sh) が即座に子 sleep を産む = 起動時からの常駐子プロセス
-    root = subprocess.Popen(["sh", "-c", "sleep 30 & wait"])
+    root = subprocess.Popen(["sh", "-c", "sleep 30 & wait"], start_new_session=True)
     try:
         time.sleep(1.0)
         assert watchdog.classify_process_tree(root.pid, grace_seconds=10) == "idle_process"
     finally:
-        root.kill()
+        kill_group(root)
         root.wait()
 
 
@@ -395,7 +399,8 @@ def test_late_started_child_is_executing():
     にしておかないと基準が遅い方へずれて executing を検出できない。
     """
     root = subprocess.Popen(
-        ["sh", "-c", 'sleep 300 & sh -c "sleep 2; sleep 300 & wait" & wait']
+        ["sh", "-c", 'sleep 300 & sh -c "sleep 2; sleep 300 & wait" & wait'],
+        start_new_session=True,
     )
     try:
         time.sleep(3.5)  # 遅れて生えた子が出そろうまで待つ
@@ -404,7 +409,7 @@ def test_late_started_child_is_executing():
         # (しきい値が効いていることの確認 — 常に executing を返す実装を弾く)
         assert watchdog.classify_process_tree(root.pid, grace_seconds=60) == "idle_process"
     finally:
-        root.kill()
+        kill_group(root)
         root.wait()
 
 

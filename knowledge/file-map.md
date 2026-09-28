@@ -371,6 +371,18 @@ tag は警告して飛ばす）。t017 / PR5a
 
 bash 向け薄いラッパー（mux_spawn / mux_send 等）
 
+### `worktree_gc.py`
+
+古い Worker worktree を片付ける道具（t033 / #33）。**既定は dry-run**（何も消さない）で、`--apply` で
+remove と判定したものは**削除ではなく隔離する**（`git worktree move` で `.claude/worktrees/.quarantine/
+<timestamp>/<元の相対パス>` へ移し `git worktree lock` を付ける。`git worktree remove` / `git branch -d`
+はどちらも呼ばない。t071 / PR#239 3巡目）。remove は「管理下 (`.claude/worktrees/<slug>/<name>`)・
+mission が active でなく archive 済み・Worker が使っていない（TARGET_DIR 記録・プロセスの cwd）・
+clean・コミットがすべて origin にある」の全部を満たすものだけ。観測できなかったものはすべて keep。
+隔離済みの一覧は `--list-quarantine`、元に戻すのは `--restore <隔離先 or 元のパス>`
+（lock の成否には依存しない。t080 P2-1）。デーモンは読まない（無効化は PR revert だけ。稼働中の
+隔離済み worktree を戻したいときは `--restore`）。設計・理由コード・限界: `knowledge/worktree-gc.md`
+
 ## `queue/`
 
 プラン置き場（plan.sh が管理）

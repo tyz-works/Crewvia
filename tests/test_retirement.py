@@ -171,6 +171,7 @@ sys.path.insert(0, str(REPO / "scripts"))
 
 import watchdog  # noqa: E402
 from fixture_tree import copy_plan_tree  # noqa: E402
+from proc_group import kill_group  # noqa: E402
 
 AGENT = "Retiree"
 WINDOW = f"{AGENT}-worker"
@@ -2629,6 +2630,9 @@ def _pull_parked_inside_the_queue_lock(sandbox, *, skills="code"):
         ["bash", str(sandbox.scripts / "plan.sh"), "pull",
          "--mission", SLUG, "--agent", AGENT, "--skills", skills],
         env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        # 新しいセッションの頭にする: 失敗時に bash だけ kill すると、下の `python3 -` が
+        # state.yaml の FIFO で待ったまま孤児で残る (t029)。木ごと殺せるようにする。
+        start_new_session=True,
     )
     wfd = None
     deadline = time.time() + 30
@@ -2643,7 +2647,12 @@ def _pull_parked_inside_the_queue_lock(sandbox, *, skills="code"):
                 break
             time.sleep(0.005)
     if wfd is None:
-        out, err = proc.communicate(timeout=30)
+        try:
+            out, err = proc.communicate(timeout=30)
+        except subprocess.TimeoutExpired:
+            kill_group(proc)
+            proc.communicate()
+            raise
         raise AssertionError(
             f"pull がキューロックの中まで来ていない (rc={proc.returncode}) — "
             f"テストの前提が崩れている\n{out}{err}")
@@ -2667,9 +2676,11 @@ def _pull_parked_inside_the_queue_lock(sandbox, *, skills="code"):
         try:
             proc.parked_output = proc.communicate(timeout=60)
         except subprocess.TimeoutExpired:
-            proc.kill()
+            kill_group(proc)
             proc.parked_output = proc.communicate()
             raise
+        finally:
+            kill_group(proc)       # pull が終わったあとに残った子孫があればここで掃除する
 
 
 def test_a_parked_pull_still_refreshes_the_task_graph(sandbox):

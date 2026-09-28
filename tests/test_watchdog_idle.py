@@ -100,6 +100,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
 import watchdog  # noqa: E402
+from proc_group import kill_group  # noqa: E402
 
 
 AGENT = "TestWorker"
@@ -247,12 +248,17 @@ def worker_pane(tmp_path):
         f'env -i PATH={path_value} {claude_bin} -c '
         f'"CLAUDECODE=1 {node_bin} 300 & CLAUDECODE=1 {node_bin} 300 & wait"'
     )
-    root = subprocess.Popen(["sh", "-c", f'{session_cmd} & wait'])
+    # 新しいセッションの頭にして、後片付けは木ごと (root だけ kill すると子が孤児で残る。
+    # tests/proc_group.py / tests/leaked_descendants.py)。
+    root = subprocess.Popen(
+        ["sh", "-c", f'{session_cmd} & wait'],
+        start_new_session=True,
+    )
     time.sleep(0.5)  # 木が出そろうまで
     try:
         yield root.pid
     finally:
-        root.kill()
+        kill_group(root)
         root.wait()
 
 
@@ -438,12 +444,15 @@ def test_startup_children_are_not_executing(tmp_path):
     """
     node_bin = tmp_path / "node"
     node_bin.symlink_to("/bin/sleep")
-    root = subprocess.Popen(["sh", "-c", f"{node_bin} 30 & wait"], env=_infra_env())
+    root = subprocess.Popen(
+        ["sh", "-c", f"{node_bin} 30 & wait"],
+        env=_infra_env(), start_new_session=True,
+    )
     try:
         time.sleep(0.3)
         assert watchdog.classify_process_tree(root.pid) == "idle_process"
     finally:
-        root.kill()
+        kill_group(root)
         root.wait()
 
 
@@ -461,14 +470,14 @@ def test_a_plain_shell_without_the_wrapper_marker_is_not_executing():
     "executing" だった — 逆の結果を固定していた)。
     """
     root = subprocess.Popen(
-        ["sh", "-c", 'sleep 300 & sh -c "sleep 300 & wait" & wait'],
-        env=_infra_env(),
+        ["sh", "-c", 'sleep 300 & sh -c "sleep 2; sleep 300 & wait" & wait'],
+        env=_infra_env(), start_new_session=True,
     )
     try:
         time.sleep(0.5)
         assert watchdog.classify_process_tree(root.pid) == "idle_process"
     finally:
-        root.kill()
+        kill_group(root)
         root.wait()
 
 
@@ -483,12 +492,12 @@ def test_a_bash_tool_wrapper_child_is_executing(tmp_path):
     snapshot.write_text(": # no-op fixture snapshot\n")
     script = f"source {shlex.quote(str(snapshot))} 2>/dev/null || true && eval {shlex.quote('sleep 300')}"
     wrapper = f"bash -c {shlex.quote(script)}"
-    root = subprocess.Popen(["sh", "-c", f"{wrapper} & wait"])
+    root = subprocess.Popen(["sh", "-c", f"{wrapper} & wait"], start_new_session=True)
     try:
         time.sleep(0.5)
         assert watchdog.classify_process_tree(root.pid) == "executing"
     finally:
-        root.kill()
+        kill_group(root)
         root.wait()
 
 
@@ -511,7 +520,7 @@ def test_an_unidentified_child_without_the_wrapper_marker_is_not_executing():
         time.sleep(0.3)
         assert watchdog.classify_process_tree(root.pid) == "unknown"
     finally:
-        root.kill()
+        kill_group(root)
         root.wait()
 
 

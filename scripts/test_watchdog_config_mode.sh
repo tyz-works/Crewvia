@@ -386,14 +386,40 @@ fi
 # Test 17-18: 静的チェック (start.sh の非対称解消 / ログ文言のハードコード除去)
 # ---------------------------------------------------------------------------
 echo ""
-echo "--- Test 26: start.sh passes CREWVIA_MUX explicitly to both dispatcher and watchdog spawns ---"
-START_SH="$OWN_CHECKOUT_ROOT/scripts/start.sh"
-DISPATCHER_LINE=$(grep -n 'mux_spawn "dispatcher"' "$START_SH")
-WATCHDOG_LINE=$(grep -n 'mux_spawn "watchdog"' "$START_SH")
-if echo "$DISPATCHER_LINE" | grep -q '_MUX_ENV_PREFIX' && echo "$WATCHDOG_LINE" | grep -q '_MUX_ENV_PREFIX'; then
-  pass "both mux_spawn calls (dispatcher, watchdog) embed _MUX_ENV_PREFIX"
+echo "--- Test 26: dispatcher/watchdog の spawn コマンドが両方 CREWVIA_MUX を明示 export する ---"
+# t043 で発見: この Test はもと start.sh の `mux_spawn "dispatcher"` /
+# `mux_spawn "watchdog"` 呼び出しに `_MUX_ENV_PREFIX` が埋まっているかを grep していたが、
+# その後の refactor で dispatcher/watchdog の起動は
+# `lib_daemon_watch.py spawn <name>` 経由の共有関数 spawn_command() に一本化され、
+# start.sh はもう mux_spawn を dispatcher/watchdog という名前では呼ばない
+# (start.sh 側の呼び出しは汎用の `mux_spawn "$WINDOW_NAME" ...` だけで、Worker/Director
+# 窓の起動用)。grep 対象の文字列が実体から消えたため、この Test は「テストの欠陥」
+# (テスト側が古い呼び出し形を追いかけていた) として current の spawn_command() の
+# 振る舞いを直接検証する形に直す。
+PY26=$(python3 - "$OWN_CHECKOUT_ROOT/scripts" <<'PYEOF'
+import sys
+sys.path.insert(0, sys.argv[1])
+import lib_daemon_watch as ldw
+
+env = {"CREWVIA_MUX": "herdr"}
+for name in (ldw.DAEMON_DISPATCHER, ldw.DAEMON_WATCHDOG):
+    cmd = ldw.spawn_command(name, "/tmp/red-proof-repo-root", env=env)
+    ok = "export CREWVIA_MUX='herdr';" in cmd
+    print(f"{'PASS' if ok else 'FAIL'}\t{name}\t{cmd}")
+PYEOF
+)
+PY26_EXIT=$?
+echo "$PY26" | while IFS=$'\t' read -r result rest; do
+  echo "  [$result] $rest"
+done
+# 代入コマンドの終了コードも検査する (Test 1-8 / 14-22 / 23-25 と同じ理由:
+# import か spawn_command() が未処理の例外を出すと途中まで/一切 PASS 行を
+# 出さないまま非ゼロ終了する。出力に "FAIL" が無いことだけを見ると、
+# 例外による早期終了 (=両ケースを検証できていない) が PASS に潰れる)
+if [[ "$PY26_EXIT" -ne 0 ]] || echo "$PY26" | grep -q "^FAIL"; then
+  fail "lib_daemon_watch.spawn_command() should embed CREWVIA_MUX for both dispatcher and watchdog (exit=$PY26_EXIT) — see cases above"
 else
-  fail "dispatcher/watchdog mux_spawn calls should both embed _MUX_ENV_PREFIX — dispatcher: $DISPATCHER_LINE / watchdog: $WATCHDOG_LINE"
+  pass "spawn_command() embeds CREWVIA_MUX explicitly for both dispatcher and watchdog (shared function, t043 test fix)"
 fi
 
 echo ""

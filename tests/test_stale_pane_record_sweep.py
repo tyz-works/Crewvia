@@ -589,6 +589,10 @@ ALLOWED_DELETIONS = {
     ("dispatcher.sh", "save_told", "os.replace(tmp, TOLD_FILE)"):
         "notified-state 台帳 (`registry/daemons/notified-state.json`) の temp + os.replace による"
         "原子的な書き込み。置換先は `TOLD_FILE` の 1 つに固定で、registry/mux の記録ではない",
+    ("dispatcher.sh", "_mark_drift_checked", "os.replace(tmp, path)"):
+        "main-checkout-drift の周期スロットル (`registry/daemons/main-checkout-drift-check.json`) の"
+        "temp + os.replace による原子的な書き込み (B2 / #26)。置換先は `DRIFT_CHECK_STATE` の"
+        "1 つに固定で、registry/mux の記録ではない",
     ("lib_retirement.py", "write_json_atomic", "tmp.unlink(missing_ok=True)"):
         "temp + os.replace の失敗時に自分の temp を片付ける",
     ("lib_retirement.py", "write_json_atomic", "os.replace(tmp, path)"):

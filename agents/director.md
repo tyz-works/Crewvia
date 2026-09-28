@@ -954,10 +954,15 @@ restart` 経由で行う — pane の所有者確認・maintenance マーカー�
 
 | プロセス | 対象ファイル変更時 |
 |----------|-----------------|
-| `dispatcher` tab | `scripts/dispatcher.sh` / `scripts/lib_mux.py` / `scripts/lib_daemon_watch.py` / `scripts/lib_retirement.py` |
-| `watchdog` tab | `scripts/watchdog.py` / `scripts/lib_daemon_watch.py` / `scripts/lib_retirement.py` |
+| `dispatcher` tab | `scripts/dispatcher.sh` / `scripts/lib_daemon_watch.sh` / `scripts/lib_mux.py` / `scripts/lib_daemon_watch.py` / `scripts/lib_retirement.py` |
+| `watchdog` tab | `scripts/watchdog.py` / `scripts/lib_daemon_watch.py` / `scripts/lib_retirement.py` / `scripts/lib_mux.py` / `scripts/lib_pane_process.py` / `scripts/lib_task_cards.py` / `scripts/lib_daemon_state.py` |
 | Worker tab | `scripts/start.sh` |
 | `Sora-director` | `agents/director.md` / `hooks/*.sh` |
+
+このテーブルの唯一の真の実装は `scripts/lib_daemon_watch.py` の `DAEMON_RESTART_FILES`
+（`tests/test_daemon_restart_files_match_load_model.py` が実際の import / source 文と
+突き合わせて固定する。t112 / PR#246）。ここは人間向けの写しなので、値がずれたら
+そちらを直してからここも揃えること。
 
 **restart 手順（maintenance マーカー経由。片方だけ変更した場合はその daemon だけでよい）**:
 

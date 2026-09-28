@@ -1,5 +1,58 @@
 # dispatcher.sh fix 反映には稼働 tab の restart が必要
 
+## 2026-09-28 追記: 検知と同期が仕組み化された (t005 / B2 / backlog #26)
+
+以下の「手順」節は今も正しいが、**検知は手作業でなくなった**。前 mission (mechanize-guards-a)
+で Director が merge のたびに手で ff → restart を判断していた (9 回)。今は:
+
+1. `dispatcher.sh` が起動時に自分の版 (HEAD sha + 対象ファイルの digest) を
+   `registry/daemons/<name>.version.json` に記録する (`lib_daemon_watch.record_own_version()`。
+   `watchdog.py` も起動直後に同じことをする)
+2. `dispatcher.sh` が数分に 1 回 (既定 180 秒、`CREWVIA_MAIN_CHECKOUT_DRIFT_INTERVAL` で調整):
+   - `origin/main` が主 checkout の HEAD より進んでいないか (`git fetch` を挟む。失敗はその回
+     「不明」として通知しない)
+   - 稼働中の dispatcher / watchdog の記録と、ディスク上の対象ファイルがずれていないか
+     (`lib_daemon_watch.restart_needed()`)
+   のどちらかがずれていたら、Director に **1 回だけ** 通知する (`notify_state_once()` を再利用。
+   状態が解消すれば次回また同じ状態が起きても再通知する)
+3. 通知を受けた Director (または誰でも) が `scripts/sync-main-checkout.sh` を **1 本** 実行する:
+   `git fetch` → `git merge --ff-only origin/main` → 変わったファイルから dispatcher /
+   watchdog それぞれの restart 要否を判定 (`lib_daemon_watch.restart_needed()`、pull が
+   起きたかどうかに関わらず「記録された版と今のディスク」を比較する) → 必要な方だけ
+   `lib_daemon_watch.py restart <name>` → `status` で確認。`agents/start.sh` (Worker) /
+   `agents/director.md` / `hooks/*.sh` (Director) の変更は「restart 推奨」と表示するだけで
+   実行はしない (どちらもこのスクリプトが操作できるプロセスではないため)
+
+```bash
+scripts/sync-main-checkout.sh              # 実行 (fetch → ff → 必要な restart → status)
+scripts/sync-main-checkout.sh --dry-run    # 何が起きるかだけ見る (fetch はするが何も変えない)
+```
+
+**禁止**: 開発・動作確認でこのスクリプトを本番の主 checkout (`/home/tkadmin/workspace/crewvia`)
+に対して実行しない (`--dry-run` も含む)。動作確認は一時ディレクトリの bare origin + checkout で
+行うこと (`tests/test_main_checkout_sync.py` がその形の実例)。
+
+### 戻し方
+
+この機能 (版ずれ検知 + 同期スクリプト) を取り消す必要が出たら:
+
+1. 導入 PR を revert する (`scripts/lib_daemon_watch.py` の `record_own_version` /
+   `restart_needed` / `fetch_origin` / `commits_behind` / `changed_files_vs` /
+   `affected_targets` / `DAEMON_RESTART_FILES` / `RESTART_ADVISORY_FILES` と、
+   `dispatcher.sh` の `check_main_checkout_drift()` 呼び出し・`watchdog.py` の起動時
+   `record_own_version()` 呼び出し・`scripts/sync-main-checkout.sh` 一式)
+2. 主 checkout を `git merge --ff-only origin/main` で revert 後の状態に合わせる
+3. `python3 scripts/lib_daemon_watch.py restart dispatcher` / `restart watchdog` で
+   両方を revert 後のコードで起こし直す (このコミット自体が dispatcher.sh /
+   watchdog.py を触っているので、通常の PR merge と同じ restart 手順がそのまま要る)
+4. 以降は本節の下にある「手順」に戻って手作業で運用する
+
+停止スイッチは意図的に付けていない (`CREWVIA_MAIN_CHECKOUT_DRIFT_INTERVAL` は周期の
+調整だけで、検知そのものを止める env は無い — memory:
+no-env-killswitch-for-shared-rule。止める理由が本当にあるときは revert すること)。
+
+---
+
 ## 問題の説明
 
 `scripts/dispatcher.sh`（または依存ファイル）の fix を PR で main に merge しても、
@@ -20,14 +73,28 @@ dispatcher tab を restart せずに再検証すると **OBS-1 バグが再現�
 
 | プロセス | 再起動が必要なケース |
 |----------|-------------------|
-| `dispatcher` tab | `scripts/dispatcher.sh` / `scripts/lib_mux.py` / `scripts/lib_daemon_watch.py` / `scripts/lib_retirement.py` の変更 |
-| `watchdog` tab | `scripts/watchdog.py` / `scripts/lib_daemon_watch.py` / `scripts/lib_retirement.py` の変更 |
+| `dispatcher` tab | `scripts/dispatcher.sh` / `scripts/lib_daemon_watch.sh` / `scripts/lib_mux.py` / `scripts/lib_daemon_watch.py` / `scripts/lib_retirement.py` の変更 |
+| `watchdog` tab | `scripts/watchdog.py` / `scripts/lib_daemon_watch.py` / `scripts/lib_retirement.py` / `scripts/lib_mux.py` / `scripts/lib_pane_process.py` / `scripts/lib_task_cards.py` / `scripts/lib_daemon_state.py` の変更 |
 | Worker tab | `scripts/start.sh` の変更（スキル割り当て等） |
 | `Sora-director` | `agents/director.md` / `hooks/*.sh` の変更（プロンプト・hook 反映） |
 
 > `lib_daemon_watch.py` / `lib_retirement.py` は dispatcher・watchdog 双方が起動時に
 > import する共有モジュール。ここを直した PR は **両方** restart すること
 > (`agents/director.md` §12 と揃えてある)。
+>
+> **2026-09-28 (t112 / PR#246 Codex 1 巡目 P1) 追記**: 上の表は
+> `scripts/lib_daemon_watch.py` の `DAEMON_RESTART_FILES` の写しであり、そちらが
+> 唯一の実装。dispatcher は毎サイクル新しい python3 を起動し直すので、その
+> heredoc が import する `lib_*.py` (`lib_dep_rules.py` / `lib_task_cards.py` /
+> `lib_review_refusal.py` / `lib_worker_target.py` 等) は次のサイクルで disk から
+> 読み直され、restart は要らない — 表に載っていないのはそのため。dispatcher で
+> restart が要るのは、常駐する bash 自身が **起動時に 1 回だけ**読む
+> `dispatcher.sh` 自身と、それが `source` する `lib_daemon_watch.sh` だけ。
+> watchdog は逆に単一の長寿命インタプリタなので、起動時に import した
+> `lib_*.py` は最後まで disk の変更を拾わない — 直接 import はもちろん、
+> それが更に import する先 (推移的) まで表に要る
+> (`tests/test_daemon_restart_files_match_load_model.py` が実際の import /
+> source 文と突き合わせて固定する)。
 
 ---
 

@@ -411,6 +411,73 @@ if [[ "${ROLE}" == "worker" ]] && [[ -n "${TARGET_DIR:-}" ]]; then
   export TARGET_DIR="$WORK_DIR"  # Worker 側にも canonicalized pathを渡す
 fi
 
+# --- 並列モードか (実効値の解決) ---
+# 下の mux 分岐と trust の事前検査の 2 箇所がこの値を見る (経緯は「Launch with or without mux」の
+# コメント: t002 設計判断 (A))。CREWVIA_MUX_ENABLED が明示されていれば最優先、未設定のときだけ
+# CREWVIA_MUX の有無にフォールバックする。
+_EFFECTIVE_MUX_ENABLED="${CREWVIA_MUX_ENABLED:-}"
+if [[ -z "$_EFFECTIVE_MUX_ENABLED" ]] && [[ -n "${CREWVIA_MUX:-}" ]]; then
+  _EFFECTIVE_MUX_ENABLED=1
+fi
+
+# --- CLAUDE_CONFIG_DIR / HOME を絶対パスへ解決する (t070 / B6 2巡目 P2) ---
+# mux モードでは、trust precheck (start.sh 自身のカレントディレクトリが基準) と、後で
+# WORK_DIR に cd してから claude を起動する spawn 先とで、相対パスの解釈の基準が変わる
+# (例: /repo から CLAUDE_CONFIG_DIR=.config, TARGET_DIR=/other で起動すると、precheck は
+# /repo/.config を見るが claude は /other/.config で起動してしまう — 「同じ文字列」を
+# 渡しても「同じ解決済みの対象」にはならない)。BENCH_MODE でも下の ENV_EXPORTS への伝播は
+# 起きる (bench mode が外すのは precheck 本体と自動 kickoff だけ) ので、bench mode 条件は
+# 付けずにここで解決する — 検査経路 (precheck) と伝播経路 (ENV_EXPORTS) の両方が、この後は
+# 同じ変数を読むだけになるので「同じ解決済みの対象」であることが構造的に保証される
+# (2 箇所で別々に解決して食い違う余地を作らない。t051 P1 の続き)。
+# 解決できない (存在しない dir 等) ときは元の値のまま残す — 見つからない設定は
+# lib_trust.py 側で「無い (untrusted)」として扱われ、起動が止まる (安全側)。
+if [[ "${_EFFECTIVE_MUX_ENABLED:-0}" == "1" ]]; then
+  if [[ -n "${CLAUDE_CONFIG_DIR:-}" ]] && [[ "${CLAUDE_CONFIG_DIR}" != /* ]]; then
+    _RESOLVED_CONFIG_DIR="$(cd "${CLAUDE_CONFIG_DIR}" 2>/dev/null && pwd)" || _RESOLVED_CONFIG_DIR=""
+    [[ -n "$_RESOLVED_CONFIG_DIR" ]] && export CLAUDE_CONFIG_DIR="$_RESOLVED_CONFIG_DIR"
+  fi
+  if [[ "${HOME}" != /* ]]; then
+    _RESOLVED_HOME="$(cd "${HOME}" 2>/dev/null && pwd)" || _RESOLVED_HOME=""
+    [[ -n "$_RESOLVED_HOME" ]] && export HOME="$_RESOLVED_HOME"
+  fi
+fi
+
+# --- 起動の拒否は端末だけでなくログにも残す (t021 / backlog #18) ---
+# start.sh の拒否は端末にしか出ず、dispatcher が pane で起動した場合は誰も見ないまま消えていた。
+# 書き先は logs/start-sh/refusals.log (logs/ は gitignore 済み。dispatcher の logs/dispatcher/ と同じ流儀)。
+# ログを書けなくても拒否は取り消さない (警告だけ出す)。
+_log_refusal() {
+  local kind="$1" msg="$2" dir="${REPO_ROOT}/logs/start-sh" line
+  line="$(date '+%Y-%m-%dT%H:%M:%S%z') REFUSED kind=${kind} role=${ROLE} agent=${AGENT_NAME:-?} dir=${WORK_DIR} | $(printf '%s' "$msg" | tr '\n' ' ' | tr -s ' ')"
+  { mkdir -p "$dir" && printf '%s\n' "$line" >> "${dir}/refusals.log"; } 2>/dev/null \
+    || echo "[crewvia] WARNING: 拒否をログに書けませんでした: ${dir}/refusals.log" >&2
+}
+
+# --- claude の trust ダイアログを踏む前に止める (t021 / backlog #28) ---
+# 信頼されていない cwd で claude を起動すると "Do you trust this folder?" が出る。既定の選択は
+# "No, exit" で、下の kickoff の Enter がそれを選んで claude が終了し、残りの文字列が pane の
+# シェルに落ちる。だから起動する**前**に ~/.claude.json を読んで止める。判定・倒す向き・
+# 祖先の継承・パス正規化は lib_trust.py の冒頭に理由つきで書いてある (読めない = 信頼済みとは
+# 扱わない = 止める。~/.claude.json は書き換えない)。
+# 対象は kickoff を自動で送る経路 (mux モード) だけ: インラインモード (exec claude) は利用者が
+# その端末でダイアログを見て答えられる。BENCH_MODE は自動 kickoff をしない。
+# 副作用 (crewvia-worker-*.json / settings.local.json / registry の last_active) より前に置くので、
+# 拒否した起動は target dir に何も残さない。
+if [[ "${_EFFECTIVE_MUX_ENABLED:-0}" == "1" ]] && [[ "${CREWVIA_BENCH_MODE:-0}" != "1" ]]; then
+  _TRUST_RC=0
+  _TRUST_MSG="$(python3 "${SCRIPT_DIR}/lib_trust.py" check "$WORK_DIR")" || _TRUST_RC=$?
+  if [[ $_TRUST_RC -ne 0 ]]; then
+    if [[ $_TRUST_RC -ne 10 && $_TRUST_RC -ne 11 ]]; then
+      # 検査自体が壊れた (python 不在・例外)。「信頼済み」には倒さない。
+      _TRUST_MSG="[crewvia] ERROR: trust の検査が異常終了したので (exit ${_TRUST_RC})、$WORK_DIR を信頼済みとは扱わず起動しません。${_TRUST_MSG:+ 出力: ${_TRUST_MSG}}"
+    fi
+    echo "$_TRUST_MSG" >&2
+    _log_refusal trust "$_TRUST_MSG"
+    exit 1
+  fi
+fi
+
 # --- TARGET_DIR モード: crewvia 専用 settings ファイルに絶対パス hook を書き込む ---
 # Worker が TARGET_DIR で起動すると ${CLAUDE_PROJECT_DIR} が TARGET_DIR を指し、
 # crewvia hooks（pre-tool-use.sh / post-tool-use.sh）が見つからず hook error が
@@ -600,10 +667,8 @@ fi
 #     実効値を解決すれば二重ゲートの実害（ROLE=worker で無効）は解消できる。
 # よって (A): CREWVIA_MUX_ENABLED が明示されていれば最優先でそれを尊重し
 # (0 での強制インラインも含む)、未設定時のみ CREWVIA_MUX の有無にフォールバックする。
-_EFFECTIVE_MUX_ENABLED="${CREWVIA_MUX_ENABLED:-}"
-if [[ -z "$_EFFECTIVE_MUX_ENABLED" ]] && [[ -n "${CREWVIA_MUX:-}" ]]; then
-  _EFFECTIVE_MUX_ENABLED=1
-fi
+# (_EFFECTIVE_MUX_ENABLED は WORK_DIR の決定の直後で解決済み。trust の事前検査 (t021) が同じ値を
+#  要るため、ここにあった解決をそこへ移した。答えを出すのは 1 箇所のまま。)
 if [[ "${_EFFECTIVE_MUX_ENABLED:-0}" == "1" ]]; then
   # Load mux abstraction layer (backend selected via CREWVIA_MUX or config/crewvia.yaml).
   # shellcheck source=lib_mux.sh
@@ -611,30 +676,154 @@ if [[ "${_EFFECTIVE_MUX_ENABLED:-0}" == "1" ]]; then
 
   WINDOW_NAME="${AGENT_NAME}-${ROLE}"
 
+  # --- シェル文字列への値の埋め込みは必ずこれを通す (t070 P1 / family D) ---
+  # LAUNCH_CMD は mux が新しいペインのシェルへ「入力して Enter」する文字列であり、後で
+  # そのシェルが評価する。自前でクォート ('$var' 等) を組み立てると、値に ' が含まれる
+  # だけで起動が壊れ、`/tmp/x'; printf INJECTED; #` のような値ならペインの評価時に
+  # 追加のコマンドが実行される (Codex 2巡目 P1)。
+  #
+  # bash 組み込みの printf '%q' には頼らない (t089 / PR#237 4巡目 P2-2): TmuxBackend.spawn は
+  # LAUNCH_CMD を pane の**設定済みシェル**に打ち込むだけで、そのシェルが bash である保証は無い。
+  # `%q` は改行・非 ASCII (C ロケール下) を含む値を `$'...'` (ANSI-C quoting、bash 専用の構文) で
+  # 出力するが、dash 等の POSIX シェルは `$'...'` を知らず、`$` と後続の文字列を全く別の意味に
+  # 解釈する (直接確認済み — 設定のパスが壊れ、`cd` が失敗する)。代わりに、値をシングルクォート
+  # `'...'` で囲み、値の中の `'` だけを `'\''` に置き換える POSIX 互換のクォートにする —
+  # シングルクォートの中は改行・非 ASCII を含むどんな bytes もそのまま保存され、bash / dash / ash /
+  # ksh / zsh のどのシェルでも同じ意味になる (`$'...'` のような特殊構文を一切使わない)。
+  _shq() {
+    local s=$1
+    printf "'%s'" "${s//\'/\'\\\'\'}"
+  }
+
+  # --- 最後の網: pane に claude の trust ダイアログが出ていないか (t021 / backlog #28) ---
+  # 上の事前検査 (lib_trust.py check) をすり抜けた場合 (git worktree・未知の継承規則・claude の版差)
+  # の備え。下の「❯ が出るまで待つ」は入力行の目印を見るので、trust ダイアログの選択カーソル
+  # (`❯ 1. Yes, I trust this folder`) にも反応し、kickoff の Enter が既定の "No, exit" を選んで
+  # claude が終了していた。それでも「Kickoff message sent (verified)」と言っていた (症状の本体は
+  # 失敗が不可視だったこと)。画面にダイアログの文言があれば、kickoff を送らず失敗として止める。
+  # 文言の定義は lib_trust.py の 1 箇所。
+  _trust_dialog_shown() {   # 0 = 出ている / 1 = 出ていないと確認できた / 2 = 観測できなかった (t051 P2)
+    # capture() は「pane を読めなかった」ときも「画面が本当に空」なときも同じ "" を返し、ここでは
+    # 区別できない (lib_mux.py Mux.verify_sent の docstring と同じ理由)。空を「ダイアログなし」に
+    # 倒すと、まさに読めなかった側で危険側へ倒れる (元の finding: capture 失敗が握り潰され、空画面が
+    # detector exit 1 = ダイアログなし、になっていた)。読めたと確認できるまで「無い」とは言わない。
+    local screen rc=0
+    screen="$(mux_capture "$WINDOW_NAME" 2>/dev/null)" || true
+    if [[ -z "$screen" ]]; then
+      return 2
+    fi
+    printf '%s' "$screen" | python3 "${SCRIPT_DIR}/lib_trust.py" dialog || rc=$?
+    [[ $rc -ge 2 ]] && return 2
+    return "$rc"
+  }
+  _abort_on_trust_dialog() {   # $1 = いつ見つけたか
+    local msg="[crewvia] ERROR: $WINDOW_NAME は claude の trust ダイアログで止まっています (${1})。kickoff は着弾していません。
+          ダイアログは既定が \"No, exit\" なので Enter を送りません。この窓は片付けます (ダイアログに
+          dispatcher の割り当て + Enter が届くのを防ぐため)。dir を信頼してから起動し直してください:
+            ! cd $(_shq "${WORK_DIR}") && claude      # \"Yes, I trust this folder\" を選び、/exit"
+    echo "$msg" >&2
+    _log_refusal trust-dialog "$msg"
+    mux_kill "$WINDOW_NAME" >/dev/null 2>&1 \
+      || echo "[crewvia] WARNING: $WINDOW_NAME を片付けられませんでした。手動で: mux_kill $WINDOW_NAME" >&2
+    exit 1
+  }
+  _abort_on_unobservable_dialog() {   # $1 = いつ確認しようとしたか (t051 P2)
+    local msg="[crewvia] ERROR: $WINDOW_NAME の画面を検査できないため、trust ダイアログの有無を確認できません (${1})。
+          kickoff は送信していません。読めない状態を「ダイアログなし」とは扱いません (capture の失敗と
+          画面が本当に空の場合を区別できないため、区別できないときは危険側 = 止める側に倒します)。
+          この窓は片付けます。mux_capture ${WINDOW_NAME} で状況を確認し、dir を信頼してから起動し直してください:
+            ! cd $(_shq "${WORK_DIR}") && claude      # \"Yes, I trust this folder\" を選び、/exit"
+    echo "$msg" >&2
+    _log_refusal trust-dialog-unobservable "$msg"
+    mux_kill "$WINDOW_NAME" >/dev/null 2>&1 \
+      || echo "[crewvia] WARNING: $WINDOW_NAME を片付けられませんでした。手動で: mux_kill $WINDOW_NAME" >&2
+    exit 1
+  }
+  _trust_dialog_check() {   # $1 = いつ見たか。プロンプト待ちループ専用 (`for _i in seq 1 30`) の緩い網。
+    # bench mode は自動 kickoff をしない (precheck と同じ除外条件) ので対象外にする (t051 P2x2)。
+    # 観測できない間 (rc=2) は中止しない — 上位のポーリングと、送信直前/直後の厳格な網 (下記
+    # _require_no_trust_dialog) に判定を委ねる。ここで焦って止めると、pane がまだ何も描画していない
+    # だけの正常な起動シーケンスまで拾ってしまう。
+    [[ "${CREWVIA_BENCH_MODE:-0}" == "1" ]] && return 0
+    local rc=0
+    _trust_dialog_shown || rc=$?
+    case $rc in
+      0) _abort_on_trust_dialog "$1" ;;
+      1) ;;
+      *) if [[ -z "${_TRUST_DETECTOR_WARNED:-}" ]]; then
+           echo "[crewvia] WARNING: $WINDOW_NAME の画面をまだ検査できません (${1}) — ポーリングを続けます" >&2
+           _TRUST_DETECTOR_WARNED=1
+         fi ;;
+    esac
+  }
+  _require_no_trust_dialog() {   # $1 = いつ。kickoff の送信直前・送信後専用の厳格な網 (t051 P2)。
+    # 画面の検査が成功した (= ダイアログの有無を確認できた) ことを要求する。有限回 (3回) 再試行し、
+    # それでも観測できなければ拒否する — 「読めない」を「無い」に倒して kickoff の Enter を送ってしまう
+    # (この網が本来防ぐはずだった失敗そのもの) のを避けるため。bench mode は自動 kickoff をしないので
+    # このガード自体が呼ばれない (呼び出し元が BENCH_MODE 時はブロックごとスキップする)。
+    local when="$1" attempt rc
+    for attempt in 1 2 3; do
+      rc=0
+      _trust_dialog_shown || rc=$?
+      case $rc in
+        0) _abort_on_trust_dialog "$when" ;;
+        1) return 0 ;;
+      esac
+      sleep 1
+    done
+    _abort_on_unobservable_dialog "$when"
+  }
+
   # CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1: CLAUDE_CODE_CHILD_SESSION マーカーが存在しても
   # transcript 保存を強制する公式の env var（Claude Code 2.x 以降）。unset と組み合わせる二重防御。
   # unset が主防御（herdr 汚染変数の除去）で、FORCE は副防御（unset 漏れ時のフォールバック）。
   # 選択根拠: CHILD_SESSION は transcript 保存 以外に --resume 動作にも影響するため unset は維持、
   # かつ公式 env var で transcript 保存を明示的に保証する (b)方式を採用。
-  ENV_EXPORTS="export AGENT_NAME='$AGENT_NAME' TASKVIA_URL='$TASKVIA_URL' TASKVIA_TOKEN='${TASKVIA_TOKEN:-}' CREWVIA_TASKVIA='${CREWVIA_TASKVIA:-enabled}' ROLE='$ROLE' SKILLS='${SKILLS:-}' CREWVIA_REPO='$CREWVIA_REPO' CREWVIA_REPO_ROOT='$CREWVIA_REPO_ROOT' CREWVIA_QUEUE='$CREWVIA_QUEUE' CREWVIA_APPROVAL_CHANNEL='${CREWVIA_APPROVAL_CHANNEL:-taskvia}' NTFY_URL='${NTFY_URL:-}' NTFY_TOPIC='${NTFY_TOPIC:-}' NTFY_USER='${NTFY_USER:-}' NTFY_PASS='${NTFY_PASS:-}' APPROVAL_TOKEN_TTL_SECONDS='${APPROVAL_TOKEN_TTL_SECONDS:-900}' CREWVIA_MUX='${CREWVIA_MUX:-}' CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1"
-  [[ "${ROLE}" == "worker" ]] && [[ "$WORK_DIR" != "$REPO_ROOT" ]] && ENV_EXPORTS+=" TARGET_DIR='$WORK_DIR'"
+  # 値はすべて _shq (printf %q) で安全にクォートしてから export 文へ連結する (t070 P1 /
+  # family D: 生の '$VAR' 埋め込みは、AGENT_NAME・TARGET_DIR・WORK_DIR のような外部由来の値
+  # (Worker 名・プロジェクトパス・env var) に ' が含まれるだけで起動が壊れ、`'; cmd; #` の
+  # ような値ならペインでコマンドが追加実行される)。
+  ENV_EXPORTS="export AGENT_NAME=$(_shq "$AGENT_NAME") TASKVIA_URL=$(_shq "$TASKVIA_URL") TASKVIA_TOKEN=$(_shq "${TASKVIA_TOKEN:-}") CREWVIA_TASKVIA=$(_shq "${CREWVIA_TASKVIA:-enabled}") ROLE=$(_shq "$ROLE") SKILLS=$(_shq "${SKILLS:-}") CREWVIA_REPO=$(_shq "$CREWVIA_REPO") CREWVIA_REPO_ROOT=$(_shq "$CREWVIA_REPO_ROOT") CREWVIA_QUEUE=$(_shq "$CREWVIA_QUEUE") CREWVIA_APPROVAL_CHANNEL=$(_shq "${CREWVIA_APPROVAL_CHANNEL:-taskvia}") NTFY_URL=$(_shq "${NTFY_URL:-}") NTFY_TOPIC=$(_shq "${NTFY_TOPIC:-}") NTFY_USER=$(_shq "${NTFY_USER:-}") NTFY_PASS=$(_shq "${NTFY_PASS:-}") APPROVAL_TOKEN_TTL_SECONDS=$(_shq "${APPROVAL_TOKEN_TTL_SECONDS:-900}") CREWVIA_MUX=$(_shq "${CREWVIA_MUX:-}") CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1"
+  [[ "${ROLE}" == "worker" ]] && [[ "$WORK_DIR" != "$REPO_ROOT" ]] && ENV_EXPORTS+=" TARGET_DIR=$(_shq "$WORK_DIR")"
+
+  # --- CLAUDE_CONFIG_DIR: precheck が読んだ設定と、実際に起動する claude が読む設定を同一にする (t051 P1) ---
+  # (絶対パスへの解決は上の「並列モードか」ブロックの直後、precheck より前に済んでいる — t070 P2)。
+  # 上の trust precheck (lib_trust.py check) は start.sh プロセスの ambient CLAUDE_CONFIG_DIR を読むが、
+  # ここまでの ENV_EXPORTS には含めていなかった。spawn 先のペインは mux server が保持し続ける起動時点の
+  # env (herdr-server-stale-env-inheritance) をそのまま引き継ぐため、precheck が見た設定と spawn 先が
+  # 読む設定が食い違いうる (信頼済みの設定が precheck を通ったのに別設定で起動して trust ダイアログに
+  # 当たる／その逆)。precheck と spawn 先を同じ値に揃え、未設定なら server 側に残っているかもしれない
+  # 古い値も明示的に消す (export 一覧に含めないだけでは、既に export 済みの値は消えない)。
+  if [[ -n "${CLAUDE_CONFIG_DIR:-}" ]]; then
+    ENV_EXPORTS+=" CLAUDE_CONFIG_DIR=$(_shq "${CLAUDE_CONFIG_DIR}")"
+    _TRUST_UNSET_STALE_CONFIG_DIR=""
+  else
+    _TRUST_UNSET_STALE_CONFIG_DIR="unset CLAUDE_CONFIG_DIR; "
+  fi
+
+  # --- HOME: 同じ理由 (t051 family B sweep)。絶対パス解決も CLAUDE_CONFIG_DIR と同じ箇所で済み。---
+  # CLAUDE_CONFIG_DIR が未設定のとき、precheck (lib_trust.py) は `$HOME/.claude.json` を見る。
+  # HOME も CLAUDE_CONFIG_DIR と同じく ENV_EXPORTS に含めていなかったので、理論上は同じ
+  # 不伝播 (herdr-server-stale-env-inheritance) が起こりうる。`set -euo pipefail` の下で
+  # ここまで実行できている時点で HOME は必ず設定済みなので、unset 分岐は要らない。
+  ENV_EXPORTS+=" HOME=$(_shq "${HOME}")"
 
   # --model flag (空なら省略)
   MODEL_CLI_ARG=""
   if [[ -n "$SELECTED_MODEL" ]]; then
-    MODEL_CLI_ARG=" --model '$SELECTED_MODEL'"
+    MODEL_CLI_ARG=" --model $(_shq "$SELECTED_MODEL")"
   fi
 
   # --settings flag (TARGET_DIRモードのworkerのみ。crewvia settings.json + crewvia-worker ファイルの2つを渡す)
   SETTINGS_CLI_ARG=""
   if [[ ${#SETTINGS_FLAG[@]} -gt 0 ]]; then
-    SETTINGS_CLI_ARG=" --settings '${REPO_ROOT}/.claude/settings.json' --settings '${WORK_DIR}/.claude/crewvia-worker-${AGENT_NAME}.json'"
+    SETTINGS_CLI_ARG=" --settings $(_shq "${REPO_ROOT}/.claude/settings.json") --settings $(_shq "${WORK_DIR}/.claude/crewvia-worker-${AGENT_NAME}.json")"
   fi
 
   # --permission-mode flag (空なら省略。課題2 — 理由は _resolve_permission_mode 定義を参照)
   PERMISSION_MODE_CLI_ARG=""
   if [[ -n "$SELECTED_PERMISSION_MODE" ]]; then
-    PERMISSION_MODE_CLI_ARG=" --permission-mode '$SELECTED_PERMISSION_MODE'"
+    PERMISSION_MODE_CLI_ARG=" --permission-mode $(_shq "$SELECTED_PERMISSION_MODE")"
   fi
 
   if [[ -n "$FULL_PROMPT" ]] && [[ "${CREWVIA_BENCH_MODE:-0}" != "1" ]]; then
@@ -669,7 +858,14 @@ PYEOF
   # プロセスが export した PATH を継承しない（spawn() は env 引数を持たない —
   # 上の ENV_EXPORTS と同じ理由）。scripts/bin/plan を
   # 使えるようにするため、ペイン側の $PATH に対して明示的に prepend する。
-  LAUNCH_CMD="$ENV_EXPORTS; export PATH='${REPO_ROOT}/scripts/bin:'\"\$PATH\"; unset CLAUDE_CODE_CHILD_SESSION; cd '$WORK_DIR'; claude${MODEL_CLI_ARG}${SETTINGS_CLI_ARG}${PERMISSION_MODE_CLI_ARG}"
+  #
+  # `cd ... && claude...` (t089 / PR#237 4巡目 P2-2): `cd` とそれ以前の文 (export / unset) を
+  # `;` で単純に連ねると、`cd` が失敗しても (`_shq` の値が壊れた・dir が存在しない等) 後続の
+  # `claude` がそのまま実行され、**別のディレクトリ (pane がそれまで居た cwd) で Claude が
+  # 起動する**（直接確認済み）。ここだけ `&&` にし、`cd` の失敗を後続に伝播させる。
+  # それより前の export / unset は代入・変数削除であり、失敗しても後続の意味が変わらない
+  # (族A の棚卸し: LAUNCH_CMD 内で「前のコマンドの失敗を握り潰すと危険」なのはこの 1 箇所だけ)。
+  LAUNCH_CMD="$ENV_EXPORTS; export PATH=$(_shq "${REPO_ROOT}/scripts/bin:")\"\$PATH\"; unset CLAUDE_CODE_CHILD_SESSION; ${_TRUST_UNSET_STALE_CONFIG_DIR}cd $(_shq "$WORK_DIR") && claude${MODEL_CLI_ARG}${SETTINGS_CLI_ARG}${PERMISSION_MODE_CLI_ARG}"
 
   # Drop spawn records whose pane is gone (a retired Worker's pane closes without
   # `kill()`, so its record outlives it).  Housekeeping only: the answer never
@@ -731,6 +927,8 @@ PYEOF
   # (spec §4.2-D: capture で ❯ を確認してから send する規約)
   PROMPT_READY=0
   for _i in $(seq 1 30); do
+    # `❯` はダイアログの選択カーソルでもあるので、先にダイアログかどうかを見る (t021)。
+    _trust_dialog_check "❯ の待機中"
     if mux_capture "$WINDOW_NAME" 2>/dev/null | grep -q '❯'; then
       PROMPT_READY=1
       break
@@ -768,6 +966,9 @@ PYEOF
     # なっていた。stdout だけを捨て、warning はターミナル/ログに残す。
     _KICKOFF_LANDED=0
     for _kickoff_attempt in 1 2 3; do
+      # 送る直前にもう一度: `❯` を見つけた後にダイアログが出た場合の窓 (t021)。送信直前は
+      # 厳格な網 (_require_no_trust_dialog) を使う — 観測できないまま Enter を送らない (t051 P2)。
+      _require_no_trust_dialog "kickoff 送信前 (${_kickoff_attempt}/3)"
       mux_send "$WINDOW_NAME" "$KICKOFF_MSG" >/dev/null || true
       sleep 1.5
       if mux_verify_sent "$WINDOW_NAME" "$KICKOFF_MSG"; then
@@ -777,6 +978,10 @@ PYEOF
       echo "[crewvia] WARNING: kickoff message not confirmed in $WINDOW_NAME (attempt ${_kickoff_attempt}/3)" >&2
       sleep 2
     done
+
+    # 着弾検証が通っても、画面がダイアログのままなら「verified」と言わない (t021)。ここも厳格な網
+    # (_require_no_trust_dialog) — 観測できないまま「verified」を名乗らない (t051 P2)。
+    _require_no_trust_dialog "kickoff 送信後"
 
     if [[ "$_KICKOFF_LANDED" -eq 1 ]]; then
       echo "[crewvia] Kickoff message sent to $WINDOW_NAME (verified)"

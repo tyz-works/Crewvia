@@ -65,7 +65,8 @@ PLAN_SH="${REPO_ROOT}/scripts/plan.sh"
 }
 
 @test "start.sh の mux LAUNCH_CMD にも scripts/bin の PATH 追加が含まれる (静的チェック、herdr/tmux ペインは呼び出し元の env を継承しないため)" {
-  grep -q "export PATH='\${REPO_ROOT}/scripts/bin:'" "${REPO_ROOT}/scripts/start.sh"
+  # t070 P1 (族D): 生の '$var' 埋め込みから _shq (printf %q) 経由の連結に変わった。
+  grep -qF 'export PATH=$(_shq "${REPO_ROOT}/scripts/bin:")' "${REPO_ROOT}/scripts/start.sh"
 }
 
 @test "Worker 向け KICKOFF_MSG は \$CREWVIA_REPO_ROOT の絶対パスを含まない (誘因除去の確認)" {

@@ -16,6 +16,7 @@
 # Run: bats tests/start-sh-registry-skills.bats
 
 REAL_ROOT="$(cd "$(dirname "$BATS_TEST_FILENAME")/.." && pwd)"
+source "$(dirname "$BATS_TEST_FILENAME")/trust_fixture.sh"   # t021: start.sh の trust 事前検査を通す偽の設定
 
 _real_footprint() {
     local f
@@ -32,6 +33,7 @@ _real_footprint() {
 }
 
 setup() {
+    trust_fixture_setup
     REAL_FOOTPRINT_BEFORE="$(_real_footprint)"
 
     SANDBOX="$(mktemp -d)"
@@ -91,6 +93,7 @@ setup() {
 }
 
 teardown() {
+    trust_fixture_teardown
     if [[ -n "${FAKE_DIR:-}" && -d "$FAKE_DIR" ]]; then
         find "$FAKE_DIR" -mindepth 1 -delete 2>/dev/null || true
         rmdir "$FAKE_DIR" 2>/dev/null || true

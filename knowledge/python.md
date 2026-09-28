@@ -137,6 +137,30 @@ monkeypatch している fake の**分岐条件の型も必ず一緒に見直す
 既存パターンがあれば必ず使う。ホストで緑でも、より遅い/重い実行環境 (PID 名前空間・CI 等)
 では顕在化しうる。
 
+## 2026-09-28 Ren発見: 「kill しないから SAFE」は観測失敗ガードの正しい根拠にならない
+
+`tests/test_observation_authority_does_not_fail_open.py` (t113、PR #244 Codex review 2巡目
+P2-3) で、`leaked_descendants.py::pids()` (listdir 失敗→空集合) と `_scan_one()` の uid
+stat (`except OSError: return None, False` — ENOENT/ESRCH と PermissionError/EIO を区別
+しない) が SAFE と誤分類されていた。どちらの reason も「これは kill 許可の根拠にならない
+から安全」という論法だったが、それは的外れだった —— このガードの SAFE 基準はモジュール
+docstring に明記されている 3 択 (a) ENOENT/ESRCH だけ「無い」にして他は re-raise/None/
+unobservable フラグで返す、(b) fail-closed な向き (行動しない側に倒す)、(c) 別の層に
+本当の安全装置がある、のどれかであって、「kill を許可しない」はそれ単体では基準に無い。
+
+実際の欠陥: `pids()` が listdir に失敗すると空集合を返し、`scan()` は 0 件のまま
+`unobservable=0` の『クリーン』な `Scan` を返す —— 観測が失敗したという事実そのものが
+呼び出し元 (`settle()` の `_report_unobservable_only`) に一切伝わらない。「殺せる対象が
+減る方向だから安全」という理屈は、このガードの目的 (観測失敗を不在/クリーンに潰さない
+こと) の否定になっている。
+
+教訓: 同種の「OSError を握り潰して安全な値を返す」コードを SAFE 認定するときは、
+「破壊的な結論に使われないか」だけでなく「観測の失敗そのものが (None/例外/カウンタ増分
+等で) 呼び出し元から見える形で残るか」を必ず確認する。見えなくなる (定義済みの正常系の
+値に完全に溶け込む) なら、たとえ kill/破壊に使われなくても KNOWN_FAIL_OPEN 側。allowlist
+の見直しは reason の**論法**を読む (「〜だから安全」という結論だけでなく、その結論が
+このガードの基準のどれに当たるかを名指しできるか)。
+
 ## よく使うパターン
 
 <!-- 再利用できるコード・コマンド・手順 -->

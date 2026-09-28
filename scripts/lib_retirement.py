@@ -508,6 +508,14 @@ def process_alive(pid) -> bool:
 
     A zombie counts as gone: it has exited, and only its parent's wait() is
     outstanding.
+
+    t101 (Codex review 7巡目 P1 の族): a process name may hold any byte the
+    kernel allows, so `pid` being recycled by an unrelated process with a
+    non-UTF-8 comm can make the decode below raise `UnicodeDecodeError` (a
+    `ValueError`, not caught by `except OSError`).  Read with
+    `errors="replace"` — nothing here parses the comm field, only the state
+    character after it, which stays plain ASCII regardless (same fix as
+    `lib_pane_process._proc_stat` / `lib_mux.proc_table`).
     """
     if pid is None:
         return False
@@ -516,7 +524,7 @@ def process_alive(pid) -> bool:
     except (TypeError, ValueError):
         return False
     try:
-        stat = Path(f"/proc/{pid}/stat").read_text()
+        stat = Path(f"/proc/{pid}/stat").read_text(errors="replace")
     except OSError:
         # No /proc (or no permission to read it): fall back to signal 0, where
         # PermissionError proves the process exists.

@@ -319,6 +319,17 @@ def rule5_state_problem(data):
     return None
 
 
+def job_since_state_problem(data):
+    """Rule 5 の「裏の job が連続して見え続けている」開始時刻 (`registry/mux/
+    <name>.job-since.json`) が使えない理由 (t074 追補: BACKGROUND_JOB_MAX_SECONDS
+    の安全弁が読む)。`rule5_state_problem` の `since` と同じ検証だが、意味が
+    違う (job が続くあいだ書き直されない) ので別ファイル・別スキーマにしてある。
+    """
+    if not is_finite_number(data.get('job_since')):
+        return f"'job_since' is {data.get('job_since')!r}, expected a finite timestamp"
+    return None
+
+
 def watch_state_problem(data):
     """相互監視の `<peer>.watch.json` が使えない理由。
 

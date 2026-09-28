@@ -107,3 +107,14 @@ literal `\n` を frontmatter に埋め込んでも parser (`_scalar`) は `\n` �
 
 族ごとの掃除をするときは、まず各ブロックがどちらの assertion 形かを見分けること。
 「absence-of-FAIL」形だけが終了コードの見落としに弱い。
+
+## 2026-09-28 Ren発見: mergeStateStatus=DIRTY の PR には CI が付かない (`gh pr checks` は "no checks reported" のまま)
+
+push 済みの PR で `gh pr checks <N>` が延々 "no checks reported" のままなら、まず
+`gh pr view <N> --json mergeStateStatus,mergeable` を見ること。`DIRTY`/`CONFLICTING`
+だと GitHub Actions がそもそもワークフローを起動しない (push イベント自体は届いているのに
+何も走らない、という紛らわしい状態になる)。CI が来るのを待ち続けても解決しないので、
+`git fetch origin main && git merge origin/main` で衝突を解消 → 再テスト → 追加コミットで
+push (force/rebase 禁止) してから CI を待ち直す。長寿命の feature branch (今回は PR #238、
+t016 からの一続き) は base の main が独立に進むため、何巡も codex review が続くタスクでは
+毎回この conflict を疑う価値がある。

@@ -68,10 +68,32 @@ RED (修正前の実装では失敗する = 欠陥の再現):
 
 import json
 import os
+import shlex
+import shutil
 import subprocess
 import sys
 import time
 from pathlib import Path
+
+
+def _infra_env() -> dict:
+    """t091: 明示的に `CLAUDECODE=1` だけを持つ environ (`CLAUDE_CODE_CHILD_SESSION`
+    / `CLAUDE_CODE_EXECPATH` は持たない) — 「確証のある infra」(MCP サーバー相当)
+    を再現する。
+
+    pytest をこの Claude Code の Bash tool から (= Worker として) 走らせると、
+    その Bash tool 自身の呼び出しが `CLAUDE_CODE_CHILD_SESSION=1` を持つため
+    (2026-09-28 実測)、明示しないと fixture のプロセスがこれを継承して job に
+    誤判定される (`classify_process_tree` は environ も見るようになった)。
+    """
+    return {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "CLAUDECODE": "1"}
+
+
+def _foreign_env() -> dict:
+    """t091: `CLAUDECODE` すら持たない environ — Claude Code と無関係な
+    プロセスを再現する (`unknown` 側のテスト用)。
+    """
+    return {"PATH": os.environ.get("PATH", "/usr/bin:/bin")}
 
 import pytest
 
@@ -173,24 +195,63 @@ class _FakeMux:
 
 
 @pytest.fixture
-def worker_pane():
+def worker_pane(tmp_path):
     """Worker ペインと同じ形の実プロセス木を立てる。
 
-        root sh          … ペイン (pane_pid — 本番では /bin/bash)
-          └ sh           … claude 本体
-              ├ sleep    … MCP サーバー
-              └ sleep    … MCP サーバー
+        root sh                          … ペイン (pane_pid — 本番では /bin/bash)
+          └ .../share/claude/versions/…  … claude 本体 (t097: セッション自身は
+                                             CLAUDECODE を持たない — 下記参照)
+              ├ node     … MCP サーバー (comm を `node` にした /bin/sleep の symlink。
+              │             CLAUDECODE=1 は明示的にこの子だけに与える)
+              └ node     … MCP サーバー (同上)
+
+    t097 (Codex review 6巡目 P1): 以前はこの fixture がセッション役の
+    プロセスにも `env=_infra_env()` (`CLAUDECODE=1`) を Popen 経由でそのまま
+    継承させていた。本番はこれと違う — `_herdr_server_env()` が herdr server
+    起動時点で `CLAUDECODE` / `CLAUDE_*` を消し、Claude Code はセッション自身の
+    environ にそれを書き戻さない (Director 実測 2026-09-28 12:40: `claude`
+    プロセスの environ に `CLAUDECODE` は無い。子の MCP サーバー・Bash tool には
+    明示的に付与する)。この食い違いのせいで、セッション本体が `unknown` に
+    化ける欠陥 (t097) が 6 巡もの codex review をすり抜けた。
+
+    ここではセッション役の実行ファイルを `env -i` 相当で CLAUDECODE を持たせず
+    起動し、**実体ファイル**として `tmp_path/share/claude/versions/<ver>` に
+    置く (symlink だと `/proc/<pid>/exe` はさらに先の実体 `/bin/sh` を指して
+    しまい、`lib_pane_process.SESSION_EXE_MARKER` に一致しない — 本番の
+    `~/.local/bin/claude` → `~/.local/share/claude/versions/<version>` という
+    symlink→実体ファイルの形をそのまま再現する)。MCP 相当の子だけに
+    `CLAUDECODE=1` を明示的に与える。
+
+    t065: 判定は comm を見る。既知インフラの子は**自動では infra を継承しない**
+    (「親が infra なら子も infra」を足すと、同定できない子まで infra 側に
+    倒れてしまい、族C の「未知は job 側」という安全な既定を壊す)。本番の MCP
+    サーバーは claude の直下でも npm/npx/node のように comm 自体が既知インフラ
+    に一致するので、ここでも `node` symlink を使い、propagation ではなく
+    実物に近い comm で揃える。
 
     本番の実測 (2026-09-21, Ren-worker pane 3850583) と同じく、
     `pgrep -P <pane_pid>` は常に 1 件 (claude 相当) を返す。これが
     「生きている Worker は必ず alive と判定される」欠陥の再現条件である。
     子はすべて root とほぼ同時に起動するので、修正後の分類では
-    executing ではなく idle_process になる。
+    executing ではなく idle_process になる (t097 前は `unknown` になっていた —
+    このファイルの RED 群がその欠陥を固定する)。
     """
-    # 新しいセッションの頭にして、後片付けは木ごと (root だけ kill すると sleep が孤児で残る。
+    claude_dir = tmp_path / "share" / "claude" / "versions"
+    claude_dir.mkdir(parents=True)
+    claude_bin = claude_dir / "9.9.9"
+    shutil.copy2("/bin/sh", claude_bin)
+    claude_bin.chmod(0o755)
+    node_bin = tmp_path / "node"
+    node_bin.symlink_to("/bin/sleep")
+    path_value = shlex.quote(os.environ.get("PATH", "/usr/bin:/bin"))
+    session_cmd = (
+        f'env -i PATH={path_value} {claude_bin} -c '
+        f'"CLAUDECODE=1 {node_bin} 300 & CLAUDECODE=1 {node_bin} 300 & wait"'
+    )
+    # 新しいセッションの頭にして、後片付けは木ごと (root だけ kill すると子が孤児で残る。
     # tests/proc_group.py / tests/leaked_descendants.py)。
     root = subprocess.Popen(
-        ["sh", "-c", 'sh -c "sleep 300 & sleep 300 & wait" & wait'],
+        ["sh", "-c", f'{session_cmd} & wait'],
         start_new_session=True,
     )
     time.sleep(0.5)  # 木が出そろうまで
@@ -364,58 +425,148 @@ def test_no_children_is_no_process():
     """子を持たないプロセスは no_process。"""
     p = subprocess.Popen(["sleep", "30"])
     try:
-        assert watchdog.classify_process_tree(p.pid, grace_seconds=1) == "no_process"
+        assert watchdog.classify_process_tree(p.pid) == "no_process"
     finally:
         p.kill()
         p.wait()
 
 
-def test_startup_children_are_not_executing():
-    """起動直後に生えた子 (= MCP サーバー相当) は executing と見なさない。
+def test_startup_children_are_not_executing(tmp_path):
+    """既知の永続インフラ (= MCP サーバー相当) は executing と見なさない。
 
-    claude のペインでは MCP サーバーが claude 起動の 1-2 秒後に立ち上がる。
-    これを「作業中」と読むと、今回直した欠陥と同じく idle 判定が永久に
-    抑止されてしまう。
+    t065 (Codex review 2巡目, PR#238 P2): 判定根拠は「いつ生えたか」ではなく
+    「何であるか」(comm) に変わった。MCP サーバーは claude 起動の 1-2 秒後に
+    立ち上がる**こともあれば、もっと後で初めて起動することもある** (遅延起動の
+    Playwright ブラウザ等) — 時刻ではなく comm で区別しないと、後者を
+    「作業中」と誤読して idle 判定が永久に抑止される欠陥が再発する
+    (t016 の欠陥が向きを変えて戻ってくる)。ここでは comm を `node`
+    (既知インフラ) にした symlink 経由で確かめる。
     """
-    # root(sh) が即座に子 sleep を産む = 起動時からの常駐子プロセス
-    root = subprocess.Popen(["sh", "-c", "sleep 30 & wait"], start_new_session=True)
+    node_bin = tmp_path / "node"
+    node_bin.symlink_to("/bin/sleep")
+    root = subprocess.Popen(
+        ["sh", "-c", f"{node_bin} 30 & wait"],
+        env=_infra_env(), start_new_session=True,
+    )
     try:
-        time.sleep(1.0)
-        assert watchdog.classify_process_tree(root.pid, grace_seconds=10) == "idle_process"
+        time.sleep(0.3)
+        assert watchdog.classify_process_tree(root.pid) == "idle_process"
     finally:
         kill_group(root)
         root.wait()
 
 
-def test_late_started_child_is_executing():
-    """セッション起動から遅れて生えた子孫は executing (= Bash tool 実行中)。
+def test_a_plain_shell_without_the_wrapper_marker_is_not_executing():
+    """t074 (Codex review 3巡目 P1): comm がシェルというだけでは executing に
+    ならない。本番の MCP 起動経路 (`npm exec ...` が `sh -c "..."` を挟む) と
+    comm では区別できないため、判定根拠は「誰が起動したか」(Bash tool /
+    Monitor の shell snapshot wrapper の子孫か) に変わった。
 
         root sh
-          ├ sleep 300                  … t=0。基準時刻を t=0 に固定する
-          └ sh                         … t=0。claude 相当 (wait で生存)
-              └ sleep 300              … t=2。遅れて生えた = 実行中の tool
+          ├ sleep 300      … MCP サーバー相当
+          └ sh -c "..."    … 中身は sh だが Bash tool のラッパーではない
 
-    基準は「最も古い直下の子の起動時刻」なので、t=0 の子を 1 つ生かしたまま
-    にしておかないと基準が遅い方へずれて executing を検出できない。
+    どちらも wrapper marker を持たないので idle_process (t065 まではここが
+    "executing" だった — 逆の結果を固定していた)。
     """
     root = subprocess.Popen(
         ["sh", "-c", 'sleep 300 & sh -c "sleep 2; sleep 300 & wait" & wait'],
-        start_new_session=True,
+        env=_infra_env(), start_new_session=True,
     )
     try:
-        time.sleep(3.5)  # 遅れて生えた子が出そろうまで待つ
-        assert watchdog.classify_process_tree(root.pid, grace_seconds=1) == "executing"
-        # grace を十分大きくすれば同じ木でも executing にはならない
-        # (しきい値が効いていることの確認 — 常に executing を返す実装を弾く)
-        assert watchdog.classify_process_tree(root.pid, grace_seconds=60) == "idle_process"
+        time.sleep(0.5)
+        assert watchdog.classify_process_tree(root.pid) == "idle_process"
     finally:
         kill_group(root)
         root.wait()
+
+
+def test_a_bash_tool_wrapper_child_is_executing(tmp_path):
+    """t074: Bash tool / Monitor の実際の起動形 (`bash -c "source <shell-snapshot>
+    ... && eval '<command>'"`) の子孫は executing。2026-09-27 実測 (自分の
+    `run_in_background` / Monitor 呼び出しの `/proc/<pid>/cmdline` を確認)。
+    """
+    snap_dir = tmp_path / ".claude" / "shell-snapshots"
+    snap_dir.mkdir(parents=True)
+    snapshot = snap_dir / "snapshot-test-fixture.sh"
+    snapshot.write_text(": # no-op fixture snapshot\n")
+    script = f"source {shlex.quote(str(snapshot))} 2>/dev/null || true && eval {shlex.quote('sleep 300')}"
+    wrapper = f"bash -c {shlex.quote(script)}"
+    root = subprocess.Popen(["sh", "-c", f"{wrapper} & wait"], start_new_session=True)
+    try:
+        time.sleep(0.5)
+        assert watchdog.classify_process_tree(root.pid) == "executing"
+    finally:
+        kill_group(root)
+        root.wait()
+
+
+def test_an_unidentified_child_without_the_wrapper_marker_is_not_executing():
+    """t074 族C監査の向き訂正: 同定できない子 (シェルでも既知インフラでもない)
+    は job ではない。t065 は「同定できないものは job 側に倒す」と決めていたが、
+    そのコメント (「1 回余計に通知する方が安い」) は実際の挙動 (`executing` は
+    通知/terminate を**抑制する**側) と逆だった (Codex 3巡目 P1)。起動元ベースの
+    設計は許可リストという概念自体を無くしたので、この逆転は自然に直る。
+
+    t091 補記: この子は `CLAUDECODE` すら持たない (`_foreign_env()`。Claude Code
+    と無関係なプロセスの再現) — job ではないことに変わりはないが、もはや
+    「確証を持った infra」でもないので `idle_process` ではなく `unknown` になる
+    (job/infra どちらの確証も無いノードを安易に infra に倒さない、という t091 の
+    3 値化そのもの)。job ではない、という結論は変わらない (依然 executing では
+    ない) ことがこのテストの主眼であることに変わりはない。
+    """
+    root = subprocess.Popen(
+        ["sh", "-c", "sleep 30 & wait"],
+        env=_foreign_env(), start_new_session=True,
+    )
+    try:
+        time.sleep(0.3)
+        assert watchdog.classify_process_tree(root.pid) == "unknown"
+    finally:
+        kill_group(root)
+        root.wait()
+
+
+def test_an_unrelated_process_with_a_non_utf8_name_does_not_crash_the_scan(tmp_path):
+    """t101 (Codex review 7巡目 P1 — t097 で入った回帰): comm (プロセス名) は
+    カーネルが任意のバイト列をそのまま許す。`_proc_stat` の旧実装
+    (`Path.read_text()`、strict decode) は、走査中に見つけた**無関係などの
+    プロセス**の名前が不正な UTF-8 バイトを含むだけで `UnicodeDecodeError`
+    (`_proc_cmdline`/`_proc_environ` と違い `OSError` の派生ではない) を投げ、
+    `classify_process_tree` の呼び出し元 (`except OSError` しか拾わない) まで
+    素通りしていた。`classify_process_tree` は `/proc` を丸ごと走査するので、
+    **監視対象のペインとは無関係などこかの 1 プロセスの名前が壊れているだけで、
+    その cycle の分類がすべて例外で落ちる** — watchdog の評価サイクル全体が
+    止まり、全 Worker の timeout 処理が効かなくなる。
+
+    実行ファイルの**ファイル名自体**に 0xff を含めて exec する
+    (`exec -a` の argv[0] 書き換えでは comm は変わらないことを実測済み —
+    comm は execve に渡したパスの basename から取られる)。この「無関係な
+    壊れたプロセス」は監視対象 (`target`) の祖先でも子孫でもない — それでも
+    `/proc` の全走査に引っかかることを確かめるのが本題。
+    """
+    stray_bin = tmp_path / os.fsdecode(b"\xffbad")
+    shutil.copy2("/bin/sleep", stray_bin)
+    stray_bin.chmod(0o755)
+    stray = subprocess.Popen([str(stray_bin), "300"], start_new_session=True)
+
+    target = subprocess.Popen(
+        ["sh", "-c", "sleep 30 & wait"],
+        env=_infra_env(), start_new_session=True,
+    )
+    try:
+        time.sleep(0.3)
+        assert watchdog.classify_process_tree(target.pid) == "idle_process"
+    finally:
+        kill_group(target)
+        target.wait()
+        kill_group(stray)
+        stray.wait()
 
 
 def test_process_signal_unreadable_pane_pid_is_no_process():
     """存在しない pid は no_process (例外にしない)。"""
-    assert watchdog.classify_process_tree(2 ** 22, grace_seconds=1) == "no_process"
+    assert watchdog.classify_process_tree(2 ** 22) == "no_process"
 
 
 # ---------------------------------------------------------------------------

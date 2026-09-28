@@ -340,6 +340,13 @@ def process_generation(pid, *, proc_root: str = "/proc") -> Optional[str]:
     machine that restarts daemons all day the recycled one is quite likely to
     be another crewvia process.  Comparing only the number is the same defect
     as trusting a reused Worker name (§5-2), one level down.
+
+    t101 (Codex review 7巡目 P1 の族): `pid` の再利用先が comm に不正な UTF-8
+    バイトを含む無関係なプロセスだと、`read_text()` の decode が
+    `UnicodeDecodeError`（`ValueError`）を投げうる — `except OSError` はこれを
+    拾わない。`errors="replace"` で decode 自体を失敗させない（comm を使わない
+    ので garbled でも実害が無い。`lib_pane_process._proc_stat` / `lib_mux.
+    proc_table` と同じ族の直し方）。
     """
     if pid is None:
         return None
@@ -348,7 +355,7 @@ def process_generation(pid, *, proc_root: str = "/proc") -> Optional[str]:
     except (TypeError, ValueError):
         return None
     try:
-        stat = Path(proc_root, str(pid), "stat").read_text(encoding="utf-8")
+        stat = Path(proc_root, str(pid), "stat").read_text(encoding="utf-8", errors="replace")
     except OSError:
         return None
     # comm (field 2) is parenthesised and may itself contain spaces / ')', so

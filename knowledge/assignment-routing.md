@@ -156,6 +156,48 @@ Director が codex-review を開く。
   既存 mission に付けたいときだけ、mission.yaml に `deliverable_required: true` を 1 行足す（足した時点で、
   宣言の無い card はすべて lint の FAIL になるので、先に全 card へ宣言を付けてから）。
 
+### 7. `plan.sh done --pr` の推移的な伝播 (t017 / backlog #29)
+
+セクション4の伝播は **直接の依存先だけ**だった。QA と codex-review を挟む merge task
+（`review`）は実装 task の直接の依存先ではないので番号が届かず、Director が手で
+`plan.sh update <id> --pr-number <N>` を打っていた。
+
+伝播の境界は**宣言で**決める（推測しない。B4 = セクション6の `deliverable` が前提）:
+
+- `blocked_by` を逆にたどって下流を探索し、`deliverable` が **明示的に** `file` か `none`
+  と宣言された task だけを通過する（`_is_pr_passthrough()`）。`deliverable: pr`（別の PR を
+  作る task）と、宣言の無い task（従来どおり直接依存だけ、の後方互換）はそこで止まる —
+  自分自身は到達できても、その先へは伝わらない。直接の依存先（探索の 1 段目）は自身の
+  宣言に関係なく必ず到達する（セクション4と同じ）。
+- 到達した task のうち、skills に `codex-review` / `review` を含み `pr_number` が未設定の
+  ものに書く条件は変わらない。追加で、**その task の上流（pr でない task を通る経路）に
+  `deliverable: pr` の task が 2 つ以上あれば書かない**（`_pr_source_ancestors()`。合流点 —
+  例えば複数 PR の merge 後に走る本番確認 task — はどの PR の番号か一意に決まらない。
+  書かなかった理由は stderr に出す）。祖先の数え方はグラフ全体の宣言から決まる構造的な
+  値で、呼び出し元の task 自身が `deliverable: pr` かどうかとは独立（セクション4のとおり
+  `--pr` は任意の task から渡せる）。
+- `codex_reviews_awaiting_pr()`（セクション4の付け忘れ拒否）も**同じ規則**で数える —
+  実際に番号が届く対象と、待っていると言う対象を一致させるため（PR7 との整合）。合流点は
+  「一致していないほうの待ち」なので数えない：`--pr` を渡しても書けないものを理由に
+  done を拒否すると、複数 PR が合流する task の前で毎回どちらの実装も `done` できなくなる。
+
+`propagate_pr_number()` / `codex_reviews_awaiting_pr()` は `_pr_dependents_index()` で
+1 回だけ全 task を読み、`[破損]` の card は両方の入口から除く（伝える先にも通過点にも
+祖先にもしない）。`_pr_source_ancestors()` は `blocked_by` の循環（本来あってはならない）を
+空集合に倒し、無限再帰にしない。
+
+### 戻し方 (7. 推移的伝播だけ)
+
+**PR を revert → 主 checkout を `git merge --ff-only origin/main`。** `plan.sh` は呼ばれる
+たびに読み直すので、デーモンの再起動は要らない（伝播は `done` の中だけで完結し、
+dispatcher は結果としての `pr_number` / `status` しか見ない）。revert すると:
+
+- 推移的な依存先（QA/codex-review を挟んだ merge task 等）に番号が届かなくなり、
+  Director が `plan.sh update <id> --pr-number <N> --status pending --mission <slug>`
+  で手で書く必要がある（セクション4の直接依存の伝播と付け忘れ拒否はそのまま残る）。
+  合流点の判定も一緒に戻るので、複数 PR が合流する task に誤って番号が書かれていないかを
+  revert 直後に確認する（`grep pr_number: queue/missions/<slug>/tasks/*.md` で手番 check）。
+
 ## 戻し方 (停止スイッチは付けない)
 
 `worker_may_take()` は dispatcher と `plan.sh pull --task` の答えが割れないように 1 つの規則にしてあり、

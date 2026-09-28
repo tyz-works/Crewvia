@@ -118,3 +118,18 @@ push 済みの PR で `gh pr checks <N>` が延々 "no checks reported" のま�
 push (force/rebase 禁止) してから CI を待ち直す。長寿命の feature branch (今回は PR #238、
 t016 からの一続き) は base の main が独立に進むため、何巡も codex review が続くタスクでは
 毎回この conflict を疑う価値がある。
+
+## 2026-09-28 Ren発見: 実 git を叩く red proof の `env -i` は `HOME=$WORK` (偽 HOME) にしない
+
+`tests/red_proof_t005.sh` のような既存の red proof は `env -i ... HOME="$WORK"` (使い捨ての
+一時ディレクトリ) で pytest を隔離している。これは queue/registry しか触らないテストなら
+問題ないが、**本物の `git` コマンドを叩くテスト** (t005 B2 の `test_main_checkout_sync.py`
+のような、一時ディレクトリの bare origin + checkout に対する fetch/push/merge) では偽 HOME
+の下で `git push` が非ゼロ終了する (`~/.gitconfig` が無い状態で何が壊れるかまでは切り分けて
+いないが、再現は安定していた)。`tests/CLAUDE.md` の「red proof の作法」に既にある「内側の
+`env -i` が `~/.local` の pytest を見失うので、偽 HOME ではなく本物の HOME + `CREWVIA_*` だけ
+unset する」は git を使わないケースの話だと思っていたが、**git を使うケースにも同じ理由で
+本物の HOME が要る**。`red_proof_t005_main_checkout_sync.sh` は `REAL_HOME="$HOME"` を
+スクリプト冒頭で退避し、`env -i ... HOME="$REAL_HOME"` にして解決した (repo-local な
+`git config user.email/user.name` は各テストが個別に設定済みなので、それ自体は原因ではない
+— 疑うべきは HOME 依存の git の何かで、切り分けは次に踏んだ人に委ねる)。

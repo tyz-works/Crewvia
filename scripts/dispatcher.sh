@@ -106,6 +106,7 @@ import urllib.request
 import urllib.error
 from pathlib import Path
 from datetime import datetime, timezone
+from typing import Optional
 
 QUEUE_DIR      = Path(sys.argv[1])
 REGISTRY_DIR   = Path(sys.argv[2])
@@ -148,13 +149,17 @@ import lib_review_refusal  # noqa: E402
 # 欠陥を PR #214 で 3 回出した。再発防止は
 # tests/test_daemon_state_reads_go_through_the_entry.py (この埋め込み python も走査する)。
 from lib_daemon_state import (  # noqa: E402
-    load_json_store, notify_cache_problem, rule5_state_problem, told_entry_problem,
-    told_is_fresh_timeout, told_ledger_problem, told_lock,
+    is_finite_number, job_since_state_problem, load_json_store, notify_cache_problem,
+    rule5_state_problem, told_entry_problem, told_is_fresh_timeout, told_ledger_problem,
+    told_lock,
 )
 # Worker が起動された TARGET_DIR の記録と、「この Worker にこの task を回してよいか」の
 # 判定 (t009 / #21)。定義はこのモジュールに 1 つだけ (`plan.sh pull` の target 照合と
 # 同じ正規形)。ここに Worker と task の target_dir の比較を書き戻さないこと。
 import lib_worker_target as _worker_target  # noqa: E402
+# 「ペインの裏で何かが走っているか」の定義 (watchdog の idle 判定と共有、B1 / #27)。
+# ここで /proc を読む分類を書き足さないこと — 2 か所に置くと答えが割れる。
+from lib_pane_process import classify_process_tree  # noqa: E402
 _mux = Mux()
 
 # t002: who may end a Worker process.  'watchdog' (default) = this daemon only
@@ -245,6 +250,42 @@ except ValueError:
     _bad = os.environ.get('CREWVIA_SPAWN_GRACE')
     print(f"[dispatcher] WARNING: invalid CREWVIA_SPAWN_GRACE={_bad!r} — using default 90", file=sys.stderr)
     SPAWN_GRACE_SECONDS = 90
+
+# t074 追補 (Director 実例, 2026-09-27 23:15〜23:45): Rule 5 の「裏に job があるので
+# 黙る」判断 (worker_has_background_work) には、B1 の設計上、上限が無かった。Ren の
+# `while pgrep -f "<script>" > /dev/null; do sleep 15; done` は Bash tool のラッパーの
+# 子孫なので job と判定され続け (`pgrep -f` は Claude Code が全体を包む
+# `bash -c '… eval …'` 自身の cmdline にも一致するため、赤の実証が終わった後も
+# 自己一致で永遠に回った)、15 分以上 Rule 5 が黙り続けた。
+#
+# 「子孫の末端が sleep/pgrep/tail -f のような待ち系コマンドか」で判定する案 (族C
+# 監査で検討した (a)) は採らない — 正当な CI 待ちループ (`while ...; do sleep 20;
+# done` で `gh pr checks` を呼ぶパターン。本番で常用されている) も末端は同じ
+# `sleep` になるため、"待ち系コマンドは job でない" にすると正当な長時間待ちを
+# 常に誤検知することになり、B1 が消したかった偽陽性を作り直してしまう
+# (memory `time-as-proxy-flips-false-positive-to-false-negative` と同じ形の罠:
+# 「何をしているか」の代理指標を変えても、代理指標である限り穴が向きを変えて残る)。
+#
+# 代わりに、watchdog の絶対上限 (`max_threshold`, 既定 3600秒) と同じ考え方
+# (「プロセス層はこの上限だけは抑制しない」) を Rule 5 にも 1 つ足す:
+# 「裏に job がある」という理由で idle-with-task を黙らせてよいのは、その job が
+# 継続的にそう判定され続けてから最大でもこの秒数まで — 超えたら、たとえ本物の
+# job (シェル) が生きていても通常の idle-with-task 判定に進ませる (黙る方向には
+# 倒さない安全弁。「本当に進んでいるか」を判定しようとはしない — それは
+# classify_process_tree の責務ではない)。
+#
+# デフォルト 1800 秒 (30 分): 本番で観測されている正当な長時間実行 (pytest 一式
+# が約 25 分。tests/CLAUDE.md) より長く、watchdog の絶対上限 (既定 3600 秒) より
+# 十分短い — Director が watchdog の kill を待たずに気付けるようにする。
+# Override via CREWVIA_RULE5_BACKGROUND_JOB_MAX_SECONDS for tests / tuning.
+try:
+    BACKGROUND_JOB_MAX_SECONDS = int(
+        os.environ.get('CREWVIA_RULE5_BACKGROUND_JOB_MAX_SECONDS', '1800'))
+except ValueError:
+    _bad = os.environ.get('CREWVIA_RULE5_BACKGROUND_JOB_MAX_SECONDS')
+    print(f"[dispatcher] WARNING: invalid CREWVIA_RULE5_BACKGROUND_JOB_MAX_SECONDS={_bad!r} "
+          "— using default 1800", file=sys.stderr)
+    BACKGROUND_JOB_MAX_SECONDS = 1800
 
 # Circuit breaker for Taskvia API calls
 TASKVIA_CB_FAILURES = 0
@@ -1465,12 +1506,116 @@ def _save_state_entry(name: str, state: str, since: float) -> None:
         log(f'WARNING: cannot write state entry for {name!r}: {e}')
 
 
+def _job_since_path(name: str) -> Path:
+    return STATE_JSON_DIR / f'{name}.job-since.json'
+
+
+def _load_job_since(name: str) -> tuple[Optional[float], bool]:
+    """t074 追補: 「裏の job が連続して見え続けている」開始時刻。`_load_state_entry`
+    の `since` (現在の条件 A/B の grace 計測。job があるあいだ毎サイクル
+    `time.time()` へ書き直される — `test_grace_counts_from_the_end_of_the_job`)
+    とは別物なので別ファイルに持つ (同じフィールドを 2 つの意味で使うと
+    どちらかの意味が壊れる)。
+
+    戻り値は `(job_since, reliable)`。**「無い」と「読めない」を区別する**
+    (t082 P2, Codex review 4巡目): ファイルがまだ無い (`is_missing`) のは
+    「この job を初めて見た」という正常な状態で、`reliable=True` /
+    `job_since=None` (呼び出し側が `now` で新規に計る)。ファイルは**あるのに
+    壊れている/形が合わない**のは異常な状態で、`reliable=False` を返す —
+    これを None と同じに潰して「初めて見た」扱いにすると、`job_since` を
+    保てない環境 (registry/mux が壊れている等) では**毎サイクル `now` を
+    新規タイマーとして採用し続け、`BACKGROUND_JOB_MAX_SECONDS` が永久に
+    切れない** (安全弁そのものが黙る側に壊れる)。呼び出し側は `reliable`
+    が False なら上限判定を信用せず、通常の idle-with-task 判定に流すこと
+    (「タイマーを確実に保てないときは通知を許す」)。
+    """
+    entry = load_json_store(
+        _job_since_path(name), check=job_since_state_problem,
+        warn=lambda msg: log(f"WARNING: rule5 job_since entry: {msg}"))
+    if is_missing(entry):
+        return None, True
+    if is_unreadable(entry):
+        return None, False
+    value = entry.get('job_since')
+    if is_finite_number(value):
+        return value, True
+    return None, False  # スキーマ検証済みのはずだが、念のため信用しない側に倒す
+
+
+def _save_job_since(name: str, job_since: Optional[float]) -> bool:
+    """job_since を書く。None は「job が消えた/条件から外れた」— ファイルごと消す
+    (次に job が現れたときまた新しく計り直す)。
+
+    戻り値は書き込みが**成功したか** (t082 P2)。呼び出し側は、新規タイマーの
+    保存に失敗したら (今回計った `job_since` が次のサイクルで読み直せない)
+    その事実を信用せず、上限判定を通常の idle-with-task 判定に譲ること
+    (書き込み失敗を握り潰して「保存できた」ふりをすると `_load_job_since` の
+    修正が意味を持たなくなる — 毎サイクル保存に失敗し続け、毎サイクル
+    「初めて見た」と読み直して `now` を採用し、結局上限が切れない)。
+    """
+    path = _job_since_path(name)
+    if job_since is None:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            log(f'WARNING: cannot clear job_since entry for {name!r}: {e}')
+            return False
+        return True
+    try:
+        STATE_JSON_DIR.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({'job_since': job_since}), encoding='utf-8')
+    except Exception as e:
+        log(f'WARNING: cannot write job_since entry for {name!r}: {e}')
+        return False
+    return True
+
+
+def worker_has_background_work(target: str) -> bool:
+    """True iff this Worker's pane has a tool / background job running under claude.
+
+    B1 (#27): `run_in_background` の shell と Monitor は、生きている間 herdr の
+    agent_status を `idle` / `done` にする (2026-09-27 実測: 裏の `sleep` が生きている
+    50 秒間ずっと `done`、画面末尾は `1 shell` / `1 monitor`)。ツール呼び出しが止まる
+    ので当然だが、Worker は待っているだけで停止していない。同じ瞬間、claude の直下には
+    `bash -c ...` が生えていて、watchdog の idle 判定 (`classify_process_tree`) は
+    `executing` と読む。**同じ定義を共有する** — 別の判定を dispatcher に置かない。
+
+    t074 (Codex review 3巡目 P1): `classify_process_tree` の判定根拠はもう時刻
+    (t016/t049) でも comm (t065) でもない。`lib_pane_process.py` docstring 参照
+    — 本番の `npm exec @playwright/mcp` は npm の `process.title` 書き換えと
+    `sh -c "..."` を挟む経路のせいで comm ベースの許可リストでは job と誤読され
+    (偽陰性)、Rule 5 を永久に抑制し続ける欠陥があった。今は「Bash tool /
+    Monitor のラッパー (shell snapshot を `source` する形) の子孫か」で区別する
+    ので、呼び出し側 (ここ) は名前も時刻も意識する必要が無い。
+
+    倒す向き (この判定は**通知**を止める側): 観測できない (`unknown` / pane pid が
+    引けない / 例外) ときは False = 従来どおり通知する。誤って True にすると詰まった
+    Worker の通知が黙るが、False の誤りは Director に 1 通余計に届くだけ。watchdog は
+    逆向き (`unknown` は殺さない) — 殺す側の誤りの方が高くつくから、判定ごとに向きが違う。
+    """
+    try:
+        pane_pid = _mux.pid(target)
+        if pane_pid is None:
+            return False
+        return classify_process_tree(pane_pid) == 'executing'
+    except Exception as e:  # 観測失敗 → 通知する側に倒す。黙って True にしない
+        log(f'WARNING: Rule 5 — cannot classify pane process tree for {target!r}: {e!r}')
+        return False
+
+
 def check_rule5(name: str, target: str, assignment_file: Path, task_statuses_by_mission: dict,
                 waits_on_director: bool = False) -> None:
     """Rule 5: detect blocked / idle-with-task and notify Director.
 
     A: state == "blocked"
     B: state in {"idle", "done"} AND assignment_file exists
+       AND no tool / background job (run_in_background shell, Monitor) is running in
+       the pane — such a Worker is waiting, not stopped (B1 / #27).  It is treated as
+       'working': dedup keys cleared, grace timer restarted, so once the job ends the
+       grace period counts from then.  A job that never ends is bounded by
+       watchdog's absolute max, not by this rule.
 
     State is persisted to registry/mux/<name>.state.json for grace tracking.
     Notifications are deduped via the standard NOTIFY_TTL cache.
@@ -1495,6 +1640,34 @@ def check_rule5(name: str, target: str, assignment_file: Path, task_statuses_by_
     # tmux_list_worker_windows) so the label lookup succeeds.  Using `name`
     # always returns 'unknown' (pane not found) and silently disables Rule 5.
     st = _mux.state(target)
+
+    # B1 (#27): idle/done with a live background job is 'working' for Rule 5.
+    # Only condition B (assignment exists) is affected — 'blocked' still notifies.
+    # The /proc scan runs only for the idle-with-assignment case.
+    has_job = st in ('idle', 'done') and assignment_file.exists() and worker_has_background_work(target)
+    if has_job:
+        # t074 追補 (BACKGROUND_JOB_MAX_SECONDS 参照): 「裏に job がある」で黙るのは
+        # 無期限ではない。job が連続して見え続けている時間を計り、上限を超えたら
+        # 通常の idle-with-task 判定に進ませる (黙る方向には倒さない安全弁 —
+        # Ren の pgrep 自己一致ループのように、ラッパーの子孫だが何十分も
+        # 進んでいない job を Rule 5 が永久に黙らせないため)。
+        now = time.time()
+        job_since, reliable = _load_job_since(name)
+        if job_since is None:
+            job_since = now
+            # t082 P2: 保存に失敗したら、今回計った job_since は次のサイクルで
+            # 読み直せない (= 保てていない)。reliable を落とし、上限判定を
+            # 信用しない側に倒す (握り潰して「保存できた」ふりをしない)。
+            reliable = _save_job_since(name, job_since) and reliable
+        if reliable and (now - job_since <= BACKGROUND_JOB_MAX_SECONDS):
+            st = 'working'
+        # else: 上限超え、またはタイマーを確実に保てない — st は 'idle'/'done'
+        # のまま通常の判定に流す (黙る方向には倒さない)。job_since はクリア
+        # しない (同じ長時間 job が続く限り、次サイクルも同じ経過時間を計り
+        # 続け、通常の grace/NOTIFY_TTL の判定に任せる)。
+    else:
+        # job が消えた/条件から外れた → 連続計測をリセットする
+        _save_job_since(name, None)
 
     # unknown / working → no action.  tmux always returns unknown → skip.
     if st in ('unknown', 'working'):

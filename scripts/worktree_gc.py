@@ -439,7 +439,11 @@ def scan_process_cwds() -> tuple[list, str]:
             if _cwd_unreadable_but_harmless(pid) is not None:
                 continue
             try:
-                comm = (proc / pid / 'comm').read_text().strip()
+                # t101: comm は任意バイトを含みうる (UnicodeDecodeError は
+                # ValueError であり OSError では拾えない)。ここはエラー文言用の
+                # 表示に過ぎないので errors="replace" で decode 自体を失敗させない
+                # (`_cwd_unreadable_but_harmless` の同じ族の読み取りと揃える)。
+                comm = (proc / pid / 'comm').read_text(errors="replace").strip()
             except OSError:
                 comm = '?'
             return [], f'/proc/{pid}/cwd ({comm}) を読めない ({e})'

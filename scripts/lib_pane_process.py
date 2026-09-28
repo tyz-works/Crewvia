@@ -299,9 +299,23 @@ def _proc_stat(pid: int) -> Optional[tuple[int, int, str]]:
     済み) が、デバッグ・将来の監査のために引き続き読む (タプルの形を変えると
     `_direct_children()` 等のテスト helper が壊れる)。comm も同様 (分類には
     使わないが、ログ・デバッグ表示に使える)。
+
+    t101 (Codex review 7巡目 P1, t097 で入った回帰): プロセス名 (comm) は
+    カーネルが任意のバイト列をそのまま許す (NUL 以外の制約が無い) ため、
+    `exec -a $'\xff'` 等で 0xff のような不正な UTF-8 バイトを含む名前を作れる。
+    `read_text()` は既定で strict decode するため、無関係な 1 プロセスの名前が
+    不正なだけで `UnicodeDecodeError` を投げ、`classify_process_tree` の全走査
+    (呼び出し元は `OSError` しか拾わない) を丸ごと落としていた —
+    watchdog の評価サイクル全体が止まり、全 Worker の timeout 処理が効かなく
+    なる (`_proc_cmdline` / `_proc_environ` と同じ族の欠陥。t077/t083 が
+    B8 側で直した型と同じ)。`_proc_cmdline` / `_proc_environ` は既にバイト列で
+    読んで `errors="replace"` で許容している (この関数だけが取り残されていた) —
+    同じパターンに揃える。comm は分類に使わないので、不正なバイトが U+FFFD に
+    化けても判定結果に影響しない (ppid/starttime は数字だけの ASCII なので
+    影響を受けない)。
     """
     try:
-        raw = Path(f"/proc/{pid}/stat").read_text()
+        raw = Path(f"/proc/{pid}/stat").read_bytes().decode("utf-8", errors="replace")
     except (FileNotFoundError, ProcessLookupError):
         return None
     open_paren = raw.find("(")

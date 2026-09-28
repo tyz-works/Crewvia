@@ -515,13 +515,53 @@ def test_an_unidentified_child_without_the_wrapper_marker_is_not_executing():
     3 値化そのもの)。job ではない、という結論は変わらない (依然 executing では
     ない) ことがこのテストの主眼であることに変わりはない。
     """
-    root = subprocess.Popen(["sh", "-c", "sleep 30 & wait"], env=_foreign_env())
+    root = subprocess.Popen(
+        ["sh", "-c", "sleep 30 & wait"],
+        env=_foreign_env(), start_new_session=True,
+    )
     try:
         time.sleep(0.3)
         assert watchdog.classify_process_tree(root.pid) == "unknown"
     finally:
         kill_group(root)
         root.wait()
+
+
+def test_an_unrelated_process_with_a_non_utf8_name_does_not_crash_the_scan(tmp_path):
+    """t101 (Codex review 7巡目 P1 — t097 で入った回帰): comm (プロセス名) は
+    カーネルが任意のバイト列をそのまま許す。`_proc_stat` の旧実装
+    (`Path.read_text()`、strict decode) は、走査中に見つけた**無関係などの
+    プロセス**の名前が不正な UTF-8 バイトを含むだけで `UnicodeDecodeError`
+    (`_proc_cmdline`/`_proc_environ` と違い `OSError` の派生ではない) を投げ、
+    `classify_process_tree` の呼び出し元 (`except OSError` しか拾わない) まで
+    素通りしていた。`classify_process_tree` は `/proc` を丸ごと走査するので、
+    **監視対象のペインとは無関係などこかの 1 プロセスの名前が壊れているだけで、
+    その cycle の分類がすべて例外で落ちる** — watchdog の評価サイクル全体が
+    止まり、全 Worker の timeout 処理が効かなくなる。
+
+    実行ファイルの**ファイル名自体**に 0xff を含めて exec する
+    (`exec -a` の argv[0] 書き換えでは comm は変わらないことを実測済み —
+    comm は execve に渡したパスの basename から取られる)。この「無関係な
+    壊れたプロセス」は監視対象 (`target`) の祖先でも子孫でもない — それでも
+    `/proc` の全走査に引っかかることを確かめるのが本題。
+    """
+    stray_bin = tmp_path / os.fsdecode(b"\xffbad")
+    shutil.copy2("/bin/sleep", stray_bin)
+    stray_bin.chmod(0o755)
+    stray = subprocess.Popen([str(stray_bin), "300"], start_new_session=True)
+
+    target = subprocess.Popen(
+        ["sh", "-c", "sleep 30 & wait"],
+        env=_infra_env(), start_new_session=True,
+    )
+    try:
+        time.sleep(0.3)
+        assert watchdog.classify_process_tree(target.pid) == "idle_process"
+    finally:
+        kill_group(target)
+        target.wait()
+        kill_group(stray)
+        stray.wait()
 
 
 def test_process_signal_unreadable_pane_pid_is_no_process():

@@ -360,31 +360,37 @@ AUDITED_MODULES = [
 #: 判断することになる。
 ALLOWED_DIRECT_READS = {
     # -- crewvia のファイルではない: /proc ---------------------------------
-    ("lib_pane_process.py", "_proc_stat", 'Path(f"/proc/{pid}/stat").read_text()'):
-        "/proc は procfs。FIFO にも通常ファイルにも置き換えられない",
+    ("lib_pane_process.py", "_proc_stat", 'Path(f"/proc/{pid}/stat").read_bytes()'):
+        "/proc は procfs。FIFO にも通常ファイルにも置き換えられない "
+        "(t101: comm が任意のバイトを含みうるため strict decode の "
+        "read_text() から read_bytes()+errors=\"replace\" に変えた — "
+        "無関係な1プロセスの不正な UTF-8 名で UnicodeDecodeError が "
+        "全走査を落としていた)",
     ("lib_pane_process.py", "_proc_cmdline", 'Path(f"/proc/{pid}/cmdline").read_bytes()'):
         "同上 (t074: 判定根拠を comm から cmdline に移した)",
     ("lib_pane_process.py", "_proc_environ", 'Path(f"/proc/{pid}/environ").read_bytes()'):
         "同上 (t091: exec で cmdline のマーカーが消えても environ は残る第二の証拠)",
     ("lib_retirement.py", "process_alive",
-     'Path(f"/proc/{pid}/stat").read_text()'):
-        "同上",
+     'Path(f"/proc/{pid}/stat").read_text(errors="replace")'):
+        "同上 (t101: 同じ理由で errors=\"replace\" を追加)",
     ("lib_daemon_watch.py", "process_generation",
-     'Path(proc_root, str(pid), "stat").read_text(encoding="utf-8")'):
-        "同上",
+     'Path(proc_root, str(pid), "stat").read_text(encoding="utf-8", errors="replace")'):
+        "同上 (t101: 同じ理由で errors=\"replace\" を追加)",
     ("lib_daemon_watch.py", "scan_daemon_pids",
      '(entry / "cmdline").read_bytes()'):
         "同上",
     ("lib_daemon_watch.py", "scan_daemon_pids",
      '(entry / "stat").read_text(encoding="utf-8")'):
-        "同上",
+        "同上 (t101 で監査: 呼び出し側の except が (OSError, ValueError, "
+        "IndexError) で UnicodeDecodeError=ValueError の派生を既に拾うので "
+        "変更不要)",
     ("lib_mux.py", "_read_proc",
      'path.read_text(encoding="utf-8", errors="replace")'):
         "同上",
     ("lib_mux.py", "proc_table", '(entry / "cmdline").read_bytes()'):
         "同上",
     ("lib_mux.py", "proc_table",
-     '(entry / "stat").read_text(encoding="utf-8")'):
+     '(entry / "stat").read_text(encoding="utf-8", errors="replace")'):
         "同上",
 
     # -- crewvia のファイルではない: プロセス固有の一時ファイル ------------

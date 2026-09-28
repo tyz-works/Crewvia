@@ -105,6 +105,10 @@ Kai-codex の codex-review が恒久に取れなくなる #13 の再発になる
 `no_pr_waiver` + stderr に残る。`--pr` との併用・空の理由は拒否）。
 `lint_plan.py` は drafting でも `status: blocked`（`blocked_reason` 必須）を受理する
 ので、PR 番号待ちの task は承認前から止めて積める。
+task の成果物は `deliverable: pr|file|none` で宣言し（`plan.sh add/update --deliverable`）、lint は
+`config/skill-permissions.yaml` の `can_produce_deliverable` だけを見て突き合わせる（`lint_plan.py` にスキル名は書かない）。
+必須化は `plan.sh init` が mission.yaml に書く `deliverable_required: true` の mission だけ。`deliverable: pr` の
+task は `done` に `--pr` / `--no-pr` が要る（t013。`knowledge/assignment-routing.md` §6）。
 **`pull` は Director（registry の `role: director`）を拒否する**（`ROLE` env では
 判定しない — dispatcher が spawn する `kai-review.sh` が継承しうる）。
 `needs-director` は呼んだ Worker の `queue/assignments/<name>` を外す

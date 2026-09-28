@@ -9,6 +9,21 @@
 #   - Bash コマンド:    "Bash(npm *)", "Bash(git *)"
 #   - ワイルドカード:   fnmatch 準拠 (* は任意文字列)
 #
+# can_produce_deliverable: (省略可) このスキルが Write / Edit を持たない・実行が hook の
+#   外にある (例: codex-review) ことを示すドキュメント用の宣言。値は true / false のどちらか
+#   だけ (他は `plan.sh lint` が FAIL — lint_plan.py にスキル名は書かない)。
+#   **`deliverable: pr|file` を宣言した task が実際に作れるかどうかの判定には使わない**
+#   (t088 / PR#236 7巡目 P2)。この欄だけを見て「1 つでも true な skill があれば作れる」と
+#   集計すると、下の判定フローの deny (2) が allow (3) より先に効くことを無視してしまい、
+#   `[research, code]` のように false な skill と true な skill を混ぜた task を誤って
+#   通してしまう。`plan.sh lint` は代わりに `hooks/lib_skill_perms.py` の
+#   `check_permission()` を task の skills 全部で直接呼び、Write / Edit / (`pr` なら)
+#   `git push` が実際に拒否されていないかで判定する — この欄の値と食い違うことがありうる
+#   (例: plan_review は Write を bare token で許可しているが、実際に書けるパスは
+#   `pre-tool-use.sh` 側の別の構造的ガードで plan_review.md 1 枚に絞られているため、
+#   ここでは意図的に false — hook の判定だけでは再現できない制約なので、この欄は
+#   ドキュメントとして残す)。
+#
 # SAFE_TOOLS (Read, Grep, Glob, WebSearch 等) は hook で既にスキップされるため
 # ここに記載不要。
 #
@@ -103,6 +118,7 @@ skills:
     deny: []
 
   research:
+    can_produce_deliverable: false
     allow: []
     deny:
       - "Edit"
@@ -111,6 +127,7 @@ skills:
       - "Bash(git push *)"
 
   review:
+    can_produce_deliverable: false
     allow:
       - "Bash(gh pr *)"
       - "Bash(gh api *)"
@@ -143,6 +160,7 @@ skills:
   # 参考として review skill 相当の意図 (read-only な gh/git 操作 + レビュー
   # レポート) をコメントで残す。
   codex-review:
+    can_produce_deliverable: false
     allow: []
     deny: []
 
@@ -203,6 +221,7 @@ skills:
       - "Bash(gh pr merge*)"
 
   verify:
+    can_produce_deliverable: false
     allow:
       - "Read(**)"
       - "Grep(**)"
@@ -227,6 +246,7 @@ skills:
       - "Bash(mv*)"
 
   planning:
+    can_produce_deliverable: false
     allow:
       - "Bash(*/plan.sh status*)"
       - "Bash(*/plan.sh pull*)"
@@ -242,6 +262,7 @@ skills:
       - "Bash(git push*)"
 
   plan_review:
+    can_produce_deliverable: false
     allow:
       - "Read(**)"
       - "Grep(**)"

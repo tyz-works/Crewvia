@@ -429,6 +429,9 @@ TypeScript 実装 : --skills "typescript,code"
 # ❌ NG の根本原因
 タスク skills の deny は allow より強い（判定フロー §2 in skill-permissions.yaml 参照）。
 read-only スキルを 1 つでも混ぜると、その deny が全体に適用される。
+task に `deliverable: pr` / `file` を宣言していれば、この組み合わせは `plan.sh lint` が
+機械的に落とす（`hooks/lib_skill_perms.py` の `check_permission()` を直接呼んで判定する。
+t088 / PR#236 7巡目 P2）— このチェックリストは `deliverable` を宣言していない task の保険。
 ```
 
 ### Worker 起動前チェックリスト

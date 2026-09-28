@@ -17,86 +17,60 @@ import re
 import sys
 from typing import Optional
 
-
-# ---------------------------------------------------------------------------
-# YAML helpers (minimal — mirrors plan.sh's parse_yaml subset)
-# ---------------------------------------------------------------------------
-
-def _parse_minimal_yaml(text: str) -> dict:
-    """Parse a very narrow YAML subset (scalars, inline lists, block lists/maps)."""
-    lines = text.splitlines()
-    result: dict = {}
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        if not line.strip() or line.lstrip().startswith('#'):
-            i += 1
-            continue
-        m = re.match(r'^([\w-]+):\s*(.*)$', line)
-        if not m:
-            i += 1
-            continue
-        key = m.group(1)
-        val = m.group(2).rstrip()
-        if val == '':
-            i += 1
-            items: list = []
-            sub: dict = {}
-            while i < len(lines):
-                lm = re.match(r'^\s+-\s*(.*)$', lines[i])
-                if lm:
-                    items.append(_scalar(lm.group(1).strip()))
-                    i += 1
-                else:
-                    mm = re.match(r'^  ([\w-]+):\s*(.*)$', lines[i])
-                    if mm:
-                        sub[mm.group(1)] = _scalar(mm.group(2).rstrip())
-                        i += 1
-                    else:
-                        break
-            result[key] = items if items else (sub if sub else None)
-        elif val.startswith('[') and val.endswith(']'):
-            inner = val[1:-1].strip()
-            result[key] = [_scalar(s.strip()) for s in inner.split(',')] if inner else []
-            i += 1
-        else:
-            result[key] = _scalar(val)
-            i += 1
-    return result
+try:
+    import yaml
+except ImportError:
+    yaml = None
 
 
-def _scalar(s: str):
-    if s in ('null', '~', ''):
-        return None
-    if s in ('true', 'yes'):
-        return True
-    if s in ('false', 'no'):
-        return False
-    try:
-        return int(s)
-    except ValueError:
-        pass
-    try:
-        return float(s)
-    except ValueError:
-        pass
-    return s.strip('"\'')
+def _load_scripts_module(name: str):
+    """Load `scripts/<name>.py` by path, same pattern as plan.sh's own
+    `_load_scripts_module()`.
+
+    lint_plan.py is loaded three different ways (plan.sh's `_load_lint_module()`
+    via `importlib.util.spec_from_file_location` from a `python3 -` stdin
+    interpreter whose `sys.path` does *not* include `scripts/`; its own
+    `if __name__ == '__main__':` entry point when run directly; and tests via
+    `sys.path.insert(0, SCRIPTS_DIR); import lint_plan`). Resolving relative to
+    `__file__` works in all three, unlike a plain `import lib_task_cards` that
+    would only work in the last case.
+    """
+    import importlib.util
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    path = os.path.join(script_dir, f'{name}.py')
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
-def _parse_frontmatter(text: str) -> tuple[dict, str]:
-    lines = text.splitlines()
-    if not lines or lines[0].strip() != '---':
-        raise ValueError("missing frontmatter delimiter")
-    end = None
-    for i in range(1, len(lines)):
-        if lines[i].strip() == '---':
-            end = i
-            break
-    if end is None:
-        raise ValueError("unterminated frontmatter")
-    meta_text = '\n'.join(lines[1:end])
-    body = '\n'.join(lines[end + 1:])
-    return _parse_minimal_yaml(meta_text), body
+def _load_hooks_module(name: str):
+    """Load `hooks/<name>.py` by path — same pattern as `_load_scripts_module()`
+    above, but for the sibling `hooks/` directory.
+
+    `check_deliverable()` calls into `hooks/lib_skill_perms.py`'s `check_permission()`
+    directly (t088 / PR#236 7巡目 P2) rather than re-implementing its allow/deny
+    union rules here, so this loader is only exercised lazily by the tasks that
+    actually need it (see `_hook_skill_perms()`) — a sandbox that never declares
+    `deliverable: pr|file` never needs `hooks/` to exist next to its copy of
+    `scripts/`.
+    """
+    import importlib.util
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    repo_root = os.path.dirname(script_dir)
+    path = os.path.join(repo_root, 'hooks', f'{name}.py')
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+# task カード (queue/missions/<slug>/tasks/tNNN.md) の読み取りは、識別子・
+# parser・隔離の規則を持つ唯一の入口 (CLAUDE.md 不変条件 #1)。plan.sh /
+# dispatcher.sh と同じものを読む — lint だけが別の緩い parser で読んでいると、
+# 「lint は OK と言うのに plan.sh は [破損] として保留する」食い違いが起きる
+# (t072 / PR#236 3巡目)。
+lib_task_cards = _load_scripts_module('lib_task_cards')
 
 
 # ---------------------------------------------------------------------------
@@ -218,26 +192,22 @@ def check_dependency_graph(tasks: list[dict]) -> list[tuple[str, str, str]]:
 # ---------------------------------------------------------------------------
 
 def _load_known_skills(skill_permissions_path: str) -> set[str]:
-    """Extract skill names from the 'skills:' section of skill-permissions.yaml."""
-    if not os.path.exists(skill_permissions_path):
+    """`skills:` セクション直下の skill 名の集合。読めない・空・形が不正なら空集合
+    (呼び出し側の `check_skill_alignment` が WARN にする — 「未知の skill 0 件」に
+    見えても実害は無い、という判定なので FAIL にはしない)。
+
+    旧実装は「2 マス下げの `name:` 行」を正規表現で拾う手書きパーサで、
+    コメント付きヘッダ (`skills: # permissions`) で `in_skills` に入れず全滅する
+    族Aの欠陥を t059 の改善提案として残していた (`_load_deliverable_capabilities`
+    と同じ族)。構造的な YAML 読み込みに寄せて解消する。
+    """
+    data, problem = _load_yaml_document(skill_permissions_path)
+    if problem is not None:
         return set()
-    with open(skill_permissions_path) as f:
-        content = f.read()
-    # Find the 'skills:' block and collect top-level keys (2-space indented)
-    in_skills = False
-    known: set[str] = set()
-    for line in content.splitlines():
-        if re.match(r'^skills:\s*$', line):
-            in_skills = True
-            continue
-        if in_skills:
-            # top-level key under skills: block (2-space indent)
-            m = re.match(r'^  ([a-zA-Z_][a-zA-Z0-9_-]*):\s*$', line)
-            if m:
-                known.add(m.group(1))
-            elif line and not line.startswith(' ') and not line.startswith('#'):
-                in_skills = False  # left the skills block
-    return known
+    skills = data.get('skills')
+    if not isinstance(skills, dict):
+        return set()
+    return {name for name in skills if isinstance(name, str)}
 
 
 def check_skill_alignment(tasks: list[dict], skill_permissions_path: str) -> list[tuple[str, str, str]]:
@@ -266,39 +236,28 @@ def check_skill_alignment(tasks: list[dict], skill_permissions_path: str) -> lis
 # ---------------------------------------------------------------------------
 
 def _load_timeout_profiles(timeout_profiles_path: str) -> dict:
-    """Load profiles from timeout-profiles.yaml."""
-    if not os.path.exists(timeout_profiles_path):
+    """`profiles:` セクションの `{name: {idle: int, max: int}}`。読めない・空・
+    形が不正なら空 dict (呼び出し側の `check_timeout_validity` が WARN にする)。
+
+    旧実装は 2 段の手書き状態機械 (2 マス下げでプロファイル名、4 マス下げで
+    `idle`/`max` の数字だけを正規表現で拾う) で、コメント付きヘッダやフロー
+    スタイルを同じ理由で見落としうる族Aの欠陥だった。構造的な読み込みに寄せる。
+    """
+    data, problem = _load_yaml_document(timeout_profiles_path)
+    if problem is not None:
         return {}
-    with open(timeout_profiles_path) as f:
-        content = f.read()
-    # Find 'profiles:' block
-    profiles: dict = {}
-    in_profiles = False
-    current_profile: Optional[str] = None
-    current_data: dict = {}
-    for line in content.splitlines():
-        if re.match(r'^profiles:\s*$', line):
-            in_profiles = True
+    profiles = data.get('profiles')
+    if not isinstance(profiles, dict):
+        return {}
+    result: dict = {}
+    for name, entry in profiles.items():
+        if not isinstance(name, str) or not isinstance(entry, dict):
             continue
-        if not in_profiles:
-            continue
-        # profile name (2-space indent)
-        pm = re.match(r'^  ([a-zA-Z_][a-zA-Z0-9_-]*):\s*$', line)
-        if pm:
-            if current_profile:
-                profiles[current_profile] = current_data
-            current_profile = pm.group(1)
-            current_data = {}
-            continue
-        # profile field (4-space indent)
-        fm = re.match(r'^    (idle|max):\s*(\d+)', line)
-        if fm and current_profile:
-            current_data[fm.group(1)] = int(fm.group(2))
-        elif line and not line.startswith(' ') and not line.startswith('#'):
-            break
-    if current_profile:
-        profiles[current_profile] = current_data
-    return profiles
+        result[name] = {
+            k: v for k, v in entry.items()
+            if k in ('idle', 'max') and isinstance(v, int) and not isinstance(v, bool)
+        }
+    return result
 
 
 def check_timeout_validity(tasks: list[dict], timeout_profiles_path: str) -> list[tuple[str, str, str]]:
@@ -352,27 +311,448 @@ def check_timeout_validity(tasks: list[dict], timeout_profiles_path: str) -> lis
 
 
 # ---------------------------------------------------------------------------
+# Module 5: Deliverable declaration check (t013 / backlog #31)
+# ---------------------------------------------------------------------------
+#
+# 「PR を作る task に Write 禁止の skill を付けた」を、スキル名からの推測ではなく task の
+# **宣言** (`deliverable: pr|file|none`) と、config/skill-permissions.yaml の
+# `can_produce_deliverable` 欄の突き合わせで落とす。このファイルにスキル名は書かない
+# (判定の情報源は config の 1 箇所だけ。スキルを足したら config の欄を足す)。
+
+VALID_DELIVERABLES = ('pr', 'file', 'none')
+
+#: 成果物 (PR / file) を宣言した task にだけ、skills との突き合わせが効く。
+DELIVERABLES_THAT_NEED_A_WRITER = ('pr', 'file')
+
+#: `can_produce_deliverable` / `deliverable_required` は厳密に小文字の `true` / `false` だけを
+#: 真偽値として認める (1 巡目 t055 の後も、2 巡目 (t057→t059) でコメント付きヘッダが `current` を
+#: 前の skill のまま残す形で同じ族が再発し、3 巡目 (t072) では `deliverable_required: no` が
+#: 黙って `false` になる形で mission.yaml 側にも同じ族が出た — この欄をこれ以上正規表現の手当てで
+#: 直さない。以後は本物の YAML パーサ (PyYAML) で読む)。既定の YAML 1.1 bool resolver は
+#: `yes` / `no` / `on` / `off` / `True` / `FALSE` 等も暗黙に真偽値へ丸め込むが、それは
+#: 「はっきりしない綴り」を黙って true/false のどちらかに倒す挙動であり、この 2 つの欄が守りたい
+#: 性質 (曖昧な値は「不正」として拒否し、既定の安全側 (「作れる」/「必須でない」) へは絶対に
+#: 倒さない) と衝突する。resolver を差し替えて対象を狭める (引用符付きの値は元々 resolver の
+#: 対象外 — 常に文字列なので影響しない)。
+#:
+#: **4 巡目 (t076) の finding**: resolver は「タグの無い値をどのタグと見なすか」だけを決め、
+#: `!!bool no` のように **タグを明示した値には効かない** — 明示タグは resolver を経由せず、
+#: PyYAML 既定の緩い bool コンストラクタ (`yes`/`no`/`on`/`off`/大文字小文字混在まで真偽値に
+#: 丸める) にそのまま渡る。`can_produce_deliverable: !!bool yes` が PR を作れない skill を
+#: 「作れる」に通してしまうことを読み取り専用の probe で確認済み。resolver に加えて
+#: **`tag:yaml.org,2002:bool` のコンストラクタ自体も** 厳密化する (`true`/`false` の 2 語しか
+#: 受け付けず、それ以外は `yaml.YAMLError` を送出する) — 暗黙・明示のどちらの経路で
+#: `bool` タグに辿り着いても同じ既定になる。`yaml.SafeLoader` のサブクラスで、`bool` 以外の
+#: コンストラクタは何も足さない (`!!python/object` 等の任意型構築は不可能なまま) — 下の
+#: `yaml.load(..., Loader=_StrictBoolLoader)` は `yaml.safe_load` と同じ安全性で、
+#: `bool` の resolver とコンストラクタだけを差し替えている。
+if yaml is not None:
+    class _StrictBoolLoader(yaml.SafeLoader):
+        pass
+
+    _StrictBoolLoader.yaml_implicit_resolvers = {
+        first: [r for r in resolvers if r[0] != 'tag:yaml.org,2002:bool']
+        for first, resolvers in yaml.SafeLoader.yaml_implicit_resolvers.items()
+    }
+    _StrictBoolLoader.add_implicit_resolver(
+        'tag:yaml.org,2002:bool', re.compile(r'^(?:true|false)$'), list('tf'))
+
+    def _construct_strict_bool(loader: 'yaml.SafeLoader', node: 'yaml.Node') -> bool:
+        """`tag:yaml.org,2002:bool` の構築を `true` / `false` の 2 語だけに絞る。
+
+        暗黙 resolver の絞り込み (上) は、タグの無い値にしか効かない。`!!bool no` のように
+        タグを明示した値は resolver を経由せず直接この constructor に来るため、resolver だけ
+        差し替えても `!!bool` 経由の抜け道が残る (t076 finding)。既定の
+        `SafeConstructor.bool_values` (`yes`/`no`/`on`/`off`/大文字小文字混在) を使わず、
+        ここで `true`/`false` 以外を明示的に拒否する。
+        """
+        value = loader.construct_scalar(node)
+        if value == 'true':
+            return True
+        if value == 'false':
+            return False
+        raise yaml.constructor.ConstructorError(
+            None, None,
+            f"bool は true / false のどちらかだけ (got {value!r})",
+            node.start_mark)
+
+    _StrictBoolLoader.add_constructor('tag:yaml.org,2002:bool', _construct_strict_bool)
+
+
+def _load_yaml_document(path: str, *, missing_is_ok: bool = True) -> tuple[dict, Optional[str]]:
+    """queue / config の YAML ファイル 1 つを、構造的に (本物の YAML パーサで) 読む。
+
+    `(data, problem)`。ファイルの**オープン**は `lib_task_cards.read_regular_text_or_unreadable()`
+    を通す (CLAUDE.md 不変条件 #1 — 種類の確認・ENOENT とそれ以外の区別を、この 1 箇所とだけ共有する)。
+    それ以外の読み取り失敗・YAML 構文エラー・トップレベルがマッピングでない場合は
+    `({}, <理由>)` を返し、呼び出し側に「決められない」として扱わせる
+    (「読めない」を「無い」「空」に潰さない)。空ファイル (`yaml.load` が `None` を返す) は
+    「中身が無い」として `({}, None)`。
+
+    `missing_is_ok` (既定 True): 本当に無い (ENOENT) を「印が無い」として `({}, None)` に
+    するかどうか。呼び出し側で意味が違う —— `mission.yaml` の `deliverable_required` や
+    プロファイル集の各セクションのように、**印自体が無いのが普通の状態**なら既定のままでよい。
+    `config/skill-permissions.yaml` の `can_produce_deliverable` のように、**ファイルは常に
+    存在すべき前提**で、無いことを黙って安全側の既定 (「作れる」) に倒したくない呼び出し側は
+    `missing_is_ok=False` を渡す (`_load_deliverable_capabilities` 参照)。
+
+    構造は本物の YAML パーサ (`_StrictBoolLoader` — PyYAML の SafeLoader で bool resolver だけ
+    厳密化したもの) で読む。**PyYAML が無い環境では読めない扱いにする** (この用途専用の簡易
+    フォールバックは書かない — 簡易パーサを書くたびにコメント・引用符・フロースタイルのどれかを
+    見落として同じ族の欠陥を作ってきたため。`pip install pyyaml` は CI にも既定で入っている)。
+    """
+    text = lib_task_cards.read_regular_text_or_unreadable(path)
+    if lib_task_cards.is_unreadable(text):
+        if missing_is_ok and lib_task_cards.is_missing(text):
+            return {}, None
+        return {}, f"{path}: {text.reason}"
+
+    if yaml is None:
+        return {}, (f"{path}: PyYAML が無いため読めません "
+                     f"(この用途専用の簡易パーサは意図的に持たない — pip install pyyaml)")
+
+    try:
+        data = yaml.load(text, Loader=_StrictBoolLoader)
+    except yaml.YAMLError as e:
+        return {}, f"{path}: YAML を解釈できません ({e})"
+
+    if data is None:
+        return {}, None                      # 空ファイル = 中身なし
+    if not isinstance(data, dict):
+        return {}, f"{path}: トップレベルがマッピングではありません ({type(data).__name__})"
+    return data, None
+
+
+def _load_deliverable_capabilities(skill_permissions_path: str) -> tuple[dict, Optional[str]]:
+    """`{skill: True | False | <不正な値の文字列>}` と、読めなかった理由 (読めたら None)。
+
+    欄の無いスキルは辞書に載せない (= 呼び出し側は「作れる」と読む)。値は `true` / `false` の
+    どちらかだけを受け入れ、それ以外は **文字列のまま** 返す (truthiness で False に潰さない —
+    `flase` と書き間違えたスキルを「作れる」にも「作れない」にも黙って倒さないため)。
+    空白を含む値 (文字列・リスト表記など) や空値も、欄自体は「ある」ものとして拾い、
+    不正な値の文字列として返す (欄の有無と値の妥当性を別に扱う)。
+
+    構造 (`skills:` セクション・各 skill・その下の欄) はパーサが理解できなかった (`skills` が
+    マッピングでない・ある skill の値がマッピングでない) 場合も、その skill だけを飛ばさず
+    **読み込み全体を「読めない」として拒否する** (「宣言が無い」と「読めない」は別の状態 —
+    既定の「作れる」に静かに倒さない)。ファイル自体が無い場合も同様に問題として返す
+    (`missing_is_ok=False`) — この config は常に存在すべき前提で、無いことを「全 skill が
+    作れる」に静かに倒さない。
+
+    5 巡目 (t076→t081) の finding と同族: `skills:` **キーが無い** (この config がまだ
+    1 件も書かれていない、素の状態) は「宣言 0 件」の正当な既定として扱うが、**キーがあって
+    値が明示的に `null`** (セクションの中身が丸ごと消えた・編集事故) は同じ意味に潰さず
+    「読めない」として拒否する — `can_produce_deliverable` を守る欄そのものが消えたのに
+    気付かず「全 skill が作れる」へ静かに倒れるのを防ぐ。同じ理由で、各 skill の値が
+    `null` (`research:` の直後に何も書かれていない等) も「宣言なし」に潰さず拒否する
+    (`research: {}` という明示的な空マッピングなら「宣言なし」として通す —
+    「触ったが空にした」と「意図的に空だと書いた」を区別する)。
+    """
+    data, problem = _load_yaml_document(skill_permissions_path, missing_is_ok=False)
+    if problem is not None:
+        return {}, problem
+    if 'skills' not in data:
+        return {}, None                      # `skills:` セクション自体が無い = 宣言 0 件
+    skills = data['skills']
+    if skills is None:
+        return {}, f"{skill_permissions_path}: 'skills' が null です (セクションごと消さず、書かないなら削除すること)"
+    if not isinstance(skills, dict):
+        return {}, f"{skill_permissions_path}: 'skills' がマッピングではありません ({type(skills).__name__})"
+
+    caps: dict = {}
+    for name, entry in skills.items():
+        if not isinstance(name, str):
+            return {}, f"{skill_permissions_path}: skills の下に文字列でないキーがあります ({name!r})"
+        if entry is None:
+            return {}, (f"{skill_permissions_path}: skill {name!r} の値が null です "
+                        f"(何も宣言しないなら {{}} と書くこと)")
+        if not isinstance(entry, dict):
+            return {}, f"{skill_permissions_path}: skill {name!r} の値がマッピングではありません ({type(entry).__name__})"
+        if 'can_produce_deliverable' not in entry:
+            continue
+        raw = entry['can_produce_deliverable']
+        caps[name] = raw if isinstance(raw, bool) else str(raw)
+    return caps, None
+
+
+def _mission_requires_deliverable(slug: str, queue_dir: str) -> tuple[bool, Optional[str]]:
+    """mission.yaml の `deliverable_required` を読む。`(必須か, 読めなかった理由)`。
+
+    印が無い (キーが無い・mission.yaml 自体が無い = ENOENT だけ) mission は「必須でない」。
+    それ以外の読み取り失敗・`true` / `false` 以外の値は、必須かどうか決められないので理由を返す
+    (呼び出し側が FAIL にする — 「読めない」を「印が無い」に潰さない)。
+
+    3 巡目 (t072) の finding 2 件を、手書きパーサではなく `_load_yaml_document()` (本物の
+    YAML パーサ) に寄せることで解消する: `deliverable_required: no` は (YAML 1.1 の bool
+    ではなく) 文字列 `'no'` のまま読め、下の `value is True` / `is False` の同一性判定に
+    引っかからず「true / false のどちらかだけ」の FAIL になる (黙って False にしない)。
+    引用符付きのキー `"deliverable_required": true` も、本物のパーサはキーの引用符を
+    構文として扱うので、通常のキーと同じに読める (丸ごと無視しない)。
+
+    5 巡目 (t076→t081) の finding: `dict.get()` は「キーが無い」と「キーはあるが値が
+    null」を同じ `None` に潰す。**キーが無い** (mission.yaml がこの機能より前に書かれた・
+    そもそも `deliverable_required` に触れたことが無い) のは「必須でない」の正当な既定。
+    だが **キーがあって値が明示的に `null` / `~` / 何も書かれていない** のは、誰かがこの欄を
+    触ったのに空にした (書き忘れ・誤消去) 可能性が高く、「必須でない」に黙って倒さない —
+    `in` 演算子でキーの有無を別に確かめてから値を読む。
+    """
+    path = os.path.join(queue_dir, 'missions', slug, 'mission.yaml')
+    data, problem = _load_yaml_document(path)
+    if problem is not None:
+        return False, problem
+    if 'deliverable_required' not in data:
+        return False, None
+    value = data['deliverable_required']
+    if value is False:
+        return False, None
+    if value is True:
+        return True, None
+    return False, f"{path}: deliverable_required は true / false のどちらかだけ (got {value!r})"
+
+
+# ---------------------------------------------------------------------------
+# 実際に書ける/push できるかの判定 — hook (`hooks/lib_skill_perms.py`) に委譲する
+# (t088 / PR#236 7巡目 P2)
+# ---------------------------------------------------------------------------
+#
+# finding: `[research, code]` のように `can_produce_deliverable: false` な skill と
+# `true` な skill を混ぜた task は、旧実装 (「1 つでも true な skill があれば作れる」の
+# 集計) では lint を通ってしまう。だが `hooks/lib_skill_perms.py` の `check_permission()`
+# は **全 skill の deny の和を allow より先に** 適用するので、Write / Edit は
+# research の deny によって拒否されたまま — 「lint は通るのに実際には作れない」食い違いが
+# 生まれる (族B: 検査した対象と作用する対象が違う)。
+#
+# 直し方は、この判定を lint 側に**書き写さない**こと。hook が使っているのと同じ
+# `check_permission()` をここでも呼び、その task の skills で実際に Write / Edit /
+# (`pr` なら) `git push` が拒否されていないかを確かめる。2 つの実装が別々に「同じはずの
+# 規則」を持つのをやめれば、この 2 つが食い違うことは構造的に無くなる。
+
+#: 「成果物を書ける」ことの代表 signature。hook (`pre-tool-use.sh`) は非 Bash ツールに
+#: bare な tool 名を signature として渡す (`research` / `review` / `plan_review` の
+#: allow/deny コメント参照)。3 つのうちどれか 1 つでも拒否されていなければ「書ける」。
+_WRITE_TOOL_SIGS: tuple[str, ...] = ('Write', 'Edit', 'MultiEdit')
+
+#: `deliverable: pr` は書くだけでなく push もできないと作れない。ブランチ名は
+#: `_global.deny` の "push to main/master" / "force push" パターンに **当たらない**
+#: 適当な feature branch 名にする (main/master・force 自体は別の理由で常に拒否されるべき
+#: 操作であり、この判定が確かめたい「skill の deny/allow」とは別の話)。
+_PUSH_TOOL_SIG = 'Bash(git push origin task-branch)'
+
+#: `hooks/lib_skill_perms.py` はキャッシュ付きの重い読み込みではないが、モジュール自体は
+#: 遅延読み込みする — `deliverable: pr|file` を 1 件も宣言しない mission (大半のテスト
+#: 用 sandbox を含む) は `hooks/` の存在を必要としない。
+_hook_skill_perms_module = None
+
+
+def _hook_skill_perms():
+    global _hook_skill_perms_module
+    if _hook_skill_perms_module is None:
+        _hook_skill_perms_module = _load_hooks_module('lib_skill_perms')
+    return _hook_skill_perms_module
+
+
+def _load_hook_permission_config(skill_permissions_path: str) -> tuple[Optional[dict], Optional[str]]:
+    """`skill-permissions.yaml` を hook と同じ読み方 (`lib_skill_perms.load_config()`) で読む。
+
+    読めるかどうかの一次判定 (存在確認・通常ファイルか) は他の config 読み取りと同じ
+    `lib_task_cards` の入口を通す (CLAUDE.md 不変条件 #1)。実際の YAML 解析
+    (PyYAML / PyYAML が無いときのフォールバック) は `lib_skill_perms.load_config()` に
+    完全に委譲する — allow/deny の構造をここでもう一度書かない。
+    """
+    text = lib_task_cards.read_regular_text_or_unreadable(skill_permissions_path)
+    if lib_task_cards.is_unreadable(text):
+        return None, f"{skill_permissions_path}: {text.reason}"
+    try:
+        mod = _hook_skill_perms()
+        config = mod.load_config(skill_permissions_path)
+    except Exception as e:  # noqa: BLE001 — hook 自体が壊れた入力でも lint を落とさない
+        return None, f"{skill_permissions_path}: hooks/lib_skill_perms.py で読めません ({type(e).__name__}: {e})"
+    return config, None
+
+
+_DENY_SOURCE_RE = re.compile(r'^skill:([^:]+):deny:')
+
+
+def _denying_skills(sources: set[str]) -> list[str]:
+    """`check_permission()` の `source` (`"skill:<skill>:deny:<pattern>"`) から
+    拒否した skill 名だけを取り出す (メッセージで「どれを外せばいいか」を言うため)。"""
+    found = set()
+    for src in sources:
+        m = _DENY_SOURCE_RE.match(src)
+        if m:
+            found.add(m.group(1))
+    return sorted(found)
+
+
+def _skills_can_produce(config: dict, skills: list[str], declared: str) -> tuple[bool, Optional[str]]:
+    """hook (`check_permission()`) の答えだけで、この skills の組み合わせが実際に
+    `declared` を作れるかを判定する。作れないなら理由 (人が読めるメッセージ) を添えて返す。
+
+    「1 つでも can_produce_deliverable: true な skill があれば作れる」という宣言の集計は
+    しない — `check_permission()` は deny の和を allow より先に適用するので、宣言の単純な
+    集計とは答えがズレうる (このモジュール冒頭のコメント参照)。
+    """
+    mod = _hook_skill_perms()
+    skills_csv = ','.join(skills)
+
+    # t095 (Codex 8巡目 P2-2): check_permission() は config の構造 (`_global` / `skills.<name>`
+    # がマッピングであること、`deny` / `allow` がリストであること等) を検証しない。7巡目
+    # (t088) の例外処理は config の**読み込み** (_load_hook_permission_config の
+    # mod.load_config() 呼び出し) しか覆っておらず、`skills: {code: {deny: null}}` のような
+    # 正当な YAML (load_config() 自体は例外を出さない) が check_permission() の中で
+    # `for pattern in None` の TypeError を、空の config (`yaml.safe_load('')` は None を
+    # 返す。load_config() も例外を出さない) が `None.get(...)` の AttributeError を出す。
+    # ここを捕まえずに伝播させると lint_plan.py 全体が落ち、他の task も一切検査されない。
+    # 「読めない/計算できない」を「作れる」に倒さない (族A) ため、捕まえた例外は
+    # False (作れない = その task の FAIL) にする — 他の task の検査は続く。
+    try:
+        write_results = [mod.check_permission(config, skills_csv, sig) for sig in _WRITE_TOOL_SIGS]
+    except Exception as e:  # noqa: BLE001 — hooks/lib_skill_perms.py 自体が壊れた config でも lint を落とさない
+        return False, (f"hooks/lib_skill_perms.py の check_permission() で評価できません "
+                        f"({type(e).__name__}: {e})。config/skill-permissions.yaml の構造を確認すること")
+    if all(r['decision'] == 'deny' for r in write_results):
+        sources = {r['source'] for r in write_results}
+        who = _denying_skills(sources)
+        fix = f"skill {who} を外す" if who else "拒否している skill を外す"
+        return False, (f"Write/Edit/MultiEdit が全て拒否されています ({'; '.join(sorted(sources))})。"
+                        f" {fix}こと (deny は allow より先に適用されるため、成果物を作れる skill を"
+                        f" 足しても解決しない)")
+
+    if declared == 'pr':
+        try:
+            push = mod.check_permission(config, skills_csv, _PUSH_TOOL_SIG)
+        except Exception as e:  # noqa: BLE001 — 同上
+            return False, (f"hooks/lib_skill_perms.py の check_permission() で評価できません "
+                            f"({type(e).__name__}: {e})。config/skill-permissions.yaml の構造を確認すること")
+        if push['decision'] == 'deny':
+            who = _denying_skills({push['source']})
+            fix = f"skill {who} を外す" if who else "拒否している skill を外す"
+            return False, f"git push が拒否されています ({push['source']})。{fix}こと"
+
+    return True, None
+
+
+def check_deliverable(tasks: list[dict], skill_permissions_path: str,
+                      required: bool = False,
+                      required_problem: Optional[str] = None) -> list[tuple[str, str, str]]:
+    """`deliverable` 宣言の検査。Returns list of (level, category, message).
+
+    * 値は pr / file / none のどれか (印の有無にかかわらず、書かれていれば検査する)。
+    * `required` (この mission が deliverable 必須の印を持つ) なら、全 task が宣言を持つ。
+    * `pr` / `file` を宣言した task の `can_produce_deliverable` の値がそもそも壊れて
+      いないか (true/false 以外) を先に確かめたうえで、実際に Write/Edit/(pr なら) push が
+      hook (`check_permission()`) に拒否されていないかで FAIL を決める (t088 / PR#236
+      7巡目 P2 — 「宣言のどれか 1 つが true なら作れる」という集計はしない。deny は allow
+      より先に適用されるため、宣言の単純な集計と実際の権限がズレる)。
+    """
+    results: list[tuple[str, str, str]] = []
+    caps: Optional[dict] = None
+    caps_problem: Optional[str] = None
+    hook_cfg: Optional[dict] = None
+    hook_cfg_problem: Optional[str] = None
+    hook_cfg_loaded = False
+
+    def capabilities() -> tuple[dict, Optional[str]]:
+        nonlocal caps, caps_problem
+        if caps is None:
+            caps, caps_problem = _load_deliverable_capabilities(skill_permissions_path)
+        return caps, caps_problem
+
+    def hook_config() -> tuple[Optional[dict], Optional[str]]:
+        nonlocal hook_cfg, hook_cfg_problem, hook_cfg_loaded
+        if not hook_cfg_loaded:
+            hook_cfg, hook_cfg_problem = _load_hook_permission_config(skill_permissions_path)
+            hook_cfg_loaded = True
+        return hook_cfg, hook_cfg_problem
+
+    # required の値が要るのは「キーが無い (未宣言)」task だけ —— 「キーはあるが値が null」の
+    # task は required に関わらず下のループが無条件で FAIL する (unknown deliverable) ので、
+    # ここで `.get() is None` のまま広く数えると、null だけの mission でも「必須かどうか
+    # 決められません」という無関係な追加メッセージが出る (t084)。
+    if required_problem is not None and any('deliverable' not in m for m in tasks):
+        results.append(('FAIL', 'deliverable',
+                        f"mission: deliverable が必須かどうか決められません — {required_problem}"))
+
+    for meta in tasks:
+        tid = meta.get('id', '<unknown>')
+        prefix = f"task/{tid}"
+        # t084 (Codex 6巡目 P2 と同族): `meta.get('deliverable')` は「キーが無い」と「キーは
+        # あるが値が明示的に null」を同じ None に潰す。**キーが無い** (この機能より前に書かれた
+        # task) は「未宣言」の正当な既定 (required でなければ何も言わない)。だが **キーがあって
+        # 値が null** は誰かがこの欄を触ったのに空にした可能性が高く、「未宣言」に潰さず
+        # 下の「unknown deliverable」で拒否する (`_mission_requires_deliverable` / t081 と同じ型)。
+        has_declaration = 'deliverable' in meta
+        declared = meta.get('deliverable')
+
+        if not has_declaration:
+            if required:
+                results.append(('FAIL', 'deliverable',
+                                f"{prefix}: 'deliverable' が未宣言です (この mission は必須) — "
+                                f"plan.sh update {tid} --deliverable {'|'.join(VALID_DELIVERABLES)}"))
+            continue
+
+        if declared not in VALID_DELIVERABLES:
+            results.append(('FAIL', 'deliverable',
+                            f"{prefix}: unknown deliverable {declared!r} (valid: {list(VALID_DELIVERABLES)})"))
+            continue
+
+        if declared not in DELIVERABLES_THAT_NEED_A_WRITER:
+            continue
+
+        skills = meta.get('skills')
+        if not isinstance(skills, list) or not skills:
+            # skills が無い・空リストの task は producer skill を 1 つも持てない。
+            # check_frontmatter は `skills: []` を有効な frontmatter として通すので、
+            # ここで前提を預けず自分で閉じる (欠落・空リストのどちらも FAIL)。
+            results.append(('FAIL', 'deliverable',
+                            f"{prefix}: deliverable '{declared}' を宣言していますが 'skills' が空です "
+                            f"(skills={skills!r}) — 成果物を作れる skill を足すか、deliverable を none にする"))
+            continue
+        table, problem = capabilities()
+        if problem is not None:
+            results.append(('FAIL', 'deliverable',
+                            f"{prefix}: deliverable '{declared}' を skills と突き合わせられません — {problem}"))
+            continue
+        bad = sorted({s for s in skills if s in table and table[s] not in (True, False)})
+        if bad:
+            results.append(('FAIL', 'deliverable',
+                            f"{prefix}: skill {bad} の can_produce_deliverable が true / false ではありません "
+                            f"({skill_permissions_path})"))
+            continue
+
+        config, hook_problem = hook_config()
+        if hook_problem is not None:
+            results.append(('FAIL', 'deliverable',
+                            f"{prefix}: deliverable '{declared}' を skills と突き合わせられません — {hook_problem}"))
+            continue
+
+        can_produce, reason = _skills_can_produce(config, skills, declared)
+        if not can_produce:
+            results.append(('FAIL', 'deliverable',
+                            f"{prefix}: deliverable '{declared}' を宣言していますが、skills {skills} は"
+                            f" 実際には成果物を作れません — {reason}"))
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Task loader
 # ---------------------------------------------------------------------------
 
 def _load_tasks_from_mission(slug: str, queue_dir: str) -> list[dict]:
-    mission_dir = os.path.join(queue_dir, 'missions', slug)
-    tasks_dir = os.path.join(mission_dir, 'tasks')
-    if not os.path.isdir(tasks_dir):
-        return []
-    metas = []
-    for fname in sorted(os.listdir(tasks_dir)):
-        if not fname.endswith('.md'):
-            continue
-        path = os.path.join(tasks_dir, fname)
-        with open(path) as f:
-            text = f.read()
-        try:
-            meta, _ = _parse_frontmatter(text)
-            metas.append(meta)
-        except ValueError as e:
-            metas.append({'id': fname, '_parse_error': str(e)})
-    return metas
+    """`lib_task_cards.list_task_cards()` を通す (CLAUDE.md 不変条件 #1)。
+
+    旧実装は `os.listdir` + 素の `open()` + 自前の frontmatter パーサで、
+    plan.sh / dispatcher.sh が読むのと**別の parser**でカードを読んでいた
+    (t072 / PR#236 3巡目)。食い違うと「lint は OK と言うのに plan.sh は
+    [破損] として保留する」(またはその逆) が起きうる。加えて、旧実装は
+    `os.listdir` 自体が失敗した場合の処理が無く未捕捉の例外で落ちていた
+    (`list_task_cards()` は `scan_failure_task()` の保留ノードを返す)。
+
+    読めなかったカードは `status: lib_task_cards.CORRUPT_TASK_STATUS` の
+    擬似カードとして返る (`lint_mission()` が FAIL に変換する)。
+    """
+    tasks_dir = os.path.join(queue_dir, 'missions', slug, 'tasks')
+    return [meta for meta, _body in lib_task_cards.list_task_cards(tasks_dir)]
 
 
 # ---------------------------------------------------------------------------
@@ -391,17 +771,29 @@ def lint_mission(slug: str, queue_dir: str, config_dir: str, strict: bool = Fals
 
     all_results: list[tuple[str, str, str]] = []
 
-    # Parse errors first
+    # Parse errors first (lib_task_cards.list_task_cards() holds unreadable
+    # cards as a CORRUPT_TASK_STATUS pseudo-task rather than raising — see
+    # _load_tasks_from_mission()).
     for meta in tasks:
-        if '_parse_error' in meta:
-            all_results.append(('FAIL', 'frontmatter', f"task/{meta['id']}: parse error — {meta['_parse_error']}"))
+        if meta.get('status') == lib_task_cards.CORRUPT_TASK_STATUS:
+            all_results.append(('FAIL', 'frontmatter',
+                                f"task/{meta.get('id', '<unknown>')}: "
+                                f"{meta.get('parse_error', lib_task_cards.CORRUPT_TASK_STATUS)}"))
 
-    valid_tasks = [m for m in tasks if '_parse_error' not in m]
+    valid_tasks = [m for m in tasks if m.get('status') != lib_task_cards.CORRUPT_TASK_STATUS]
 
     all_results += check_frontmatter(valid_tasks)
     all_results += check_dependency_graph(valid_tasks)
     all_results += check_skill_alignment(valid_tasks, skill_perm_path)
     all_results += check_timeout_validity(valid_tasks, timeout_path)
+    # mission.yaml は、宣言の無い (キーが無い) task があるときだけ読む (required が要るのは
+    # そのときだけ —— 「キーはあるが値が null」の task は required に関わらず check_deliverable()
+    # が無条件で FAIL するので、ここで required を知る必要が無い。t084: `.get() is None` のまま
+    # 広く数えると、null だけの mission でも不要に mission.yaml を読みに行く)。
+    required, required_problem = (
+        _mission_requires_deliverable(slug, queue_dir)
+        if any('deliverable' not in m for m in valid_tasks) else (False, None))
+    all_results += check_deliverable(valid_tasks, skill_perm_path, required, required_problem)
 
     # Print results
     has_fail = False

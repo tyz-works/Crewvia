@@ -146,6 +146,63 @@ Claude Code の内部実装の変数名なので、将来どちらかの名前�
 消失) とは別の残存リスクとして明記する。`disown` (シェル組み込み、実行中プロセスの
 親子関係・cmdline・environ には無関係) は判定に影響しない。
 
+## t097 (B1 6巡目 P1, Codex review): セッション本体が `unknown` に化け hard-idle が永久に効かない
+
+t091 は `_origin_of()` が `CLAUDECODE` の無いノードを `unknown` に倒すようにしたが、
+**このノードには Claude のセッション本体 (`claude --model ...` 自身) も含まれる**。
+本番では `_herdr_server_env()` が `CLAUDECODE` / `CLAUDE_*` を herdr server 起動時点で
+消し、start.sh の `LAUNCH_CMD` もそれを戻さない。Claude が自分の Bash tool / MCP の
+**子プロセスには** `CLAUDECODE=1` を明示的に付けて起動する (t091 の表の通り) が、
+**セッション自身の environ にはそもそも誰も `CLAUDECODE` を書き戻さない**。Director が
+本番で実測 (2026-09-28 12:40): `claude` プロセスの environ にあるのは `AGENT_NAME` /
+`CREWVIA_*` / `HERDR_*` / `CLAUDE_CODE_FORCE_SESSION_PERSISTENCE` — **`CLAUDECODE` は無い**。
+
+結果、idle な Worker (job も無い) の木は `root sh → claude (unknown) → npm exec ... (infra)`
+になり、`claude` ノード自身が `unknown` と判定されて `saw_unknown = True` になる。job が
+無いのに木全体が `unknown` になり続け、watchdog の hard-idle terminate が永久に効かない
+(絶対上限 `max_threshold` だけが安全弁として残る) — t016 が直したはずの欠陥が
+「不明」という別の仮面で戻ってきた。6巡目まで気づかれなかったのは、
+`tests/test_watchdog_idle.py` の `worker_pane` fixture が `subprocess.Popen(..., env=_infra_env())`
+でセッション役の偽プロセスに `CLAUDECODE=1` を**直接**与えていたため (本番は herdr が
+消すのでこの前提が食い違う)。
+
+**直し方**: セッション本体を「起動元」(cmdline/environ の job/infra/unknown 判定) とは
+別に、**構造的な位置と exe** で同定する。名前の部分一致 (comm が `claude` を含むか等) は
+使わない — MCP の `npm exec @playwright/mcp` が `process.title` で comm を書き換える
+のと同じ理由で、名前は代理指標にしかならない。使うのは 2 つ:
+
+  1. **祖先関係**: pane の root (`root_pid`) の**直接の子**であること (本番の木は
+     `root sh → claude → (MCP / Bash tool wrapper)` の 1 段構造。t074 の docstring 参照)
+  2. **exe**: `/proc/<pid>/exe` (symlink の最終的な実体、comm や cmdline と違い
+     `process.title` 書き換えの影響を受けない) が `/share/claude/versions/` を含むこと
+     (実測: `~/.local/bin/claude` → `~/.local/share/claude/versions/2.1.283` という
+     **実体ファイル**。`$HOME` に依存しないよう末尾側だけを見る — `BASH_TOOL_WRAPPER_MARKER`
+     と同じ設計)
+
+この 2 条件を満たすノードは `job` でも `infra` でも `unknown` でもない第 4 の分類
+**`session`** として判定から外す (`saw_unknown` に寄与しない・`executing` にもならない)。
+`session` ノードの子は、`session` という起源からは何も継承せず (job だけが子に伝播する
+という既存の規則のまま) 独立に `_origin_of()` で判定される — MCP サーバー・Bash tool
+wrapper は今まで通り評価される。
+
+**同定できない (=`unknown`) 子孫の既存の扱いは変えない** — 祖先関係が「直接の子」で
+ない、または `/proc/<pid>/exe` が消滅以外の理由で読めない、またはマーカーに一致しない
+場合は、これまで通り `_origin_of()` (cmdline → environ) にそのまま流す。
+
+**セッション本体の同定に失敗した場合の向き**: `/proc/<pid>/exe` の読み取りが「消滅」
+(ENOENT/ESRCH。BFS 列挙後に死んだだけの無害なレース) なら「session ではない」として
+`_origin_of()` に委ねる (実質 infra — 既存の消滅時の扱いと同じ)。それ以外の `OSError`
+(EACCES 等、`_proc_cmdline` / `_proc_environ` と同じ契約) は re-raise し、呼び出し側が
+木全体を `unknown` に倒す。**これは「kill が増える側」には倒れない** — `unknown` は
+watchdog では殺さない側、Rule 5 では通知する側であり (本 docstring 冒頭「3 値に分ける」
+参照)、同定失敗は最終的にこの task が直そうとした「セッションが unknown に
+化ける」のと同じ経路を通る。ただし今回はこれが**観測できる**: `unknown` は
+`watchdog.py` の `check_detail()` が `hard_idle_but_process_unknown` として
+`registry/watchdog-observations.jsonl` に記録し (warn に留め terminate しない)、
+`dispatcher.sh` の `worker_has_background_work()` は `unknown` を「job ではない」
+(= 通知する) 側として扱う。追加のログ経路を新設する必要はない — 既存の 2 つの
+呼び出し側の非対称な fail-direction がそのまま「同定失敗を握り潰さない」を満たす。
+
 ## 族ごとの掃除: job の証拠が消える経路の一覧 (2026-09-28 実測)
 
 Bash tool のラッパー配下で job の証拠 (cmdline marker / environ) がどう変わるかを
@@ -170,6 +227,7 @@ Bash tool のラッパー配下で job の証拠 (cmdline marker / environ) が�
 到達しない。安全弁は既存の watchdog 絶対上限 (`max_threshold`) のみで、この task
 (exec によるマーカー消失) の対象外の残存リスクとして明記する。
 """
+import os
 from collections import deque
 from pathlib import Path
 from typing import Literal, Optional
@@ -210,6 +268,12 @@ JOB_ENVIRON_MARKERS = ("CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_EXECPATH")
 # 丸ごと消された (`env -i` 等)」= unknown に倒す (job/infra どちらの確証も
 # 無いノードを安易に infra 側に倒さない)。
 INFRA_ENVIRON_MARKER = "CLAUDECODE"
+
+# t097: セッション本体 (`claude --model ...`) の /proc/<pid>/exe (symlink 解決後の
+# 実体ファイルパス) に必ず含まれる部分文字列。$HOME に依存しないよう末尾側だけを見る
+# (BASH_TOOL_WRAPPER_MARKER と同じ設計)。実測: `~/.local/bin/claude` は
+# `~/.local/share/claude/versions/<version>` という実体ファイルへの symlink。
+SESSION_EXE_MARKER = "/share/claude/versions/"
 
 
 def _proc_stat(pid: int) -> Optional[tuple[int, int, str]]:
@@ -318,6 +382,42 @@ def _proc_environ(pid: int) -> Optional[dict[str, str]]:
     return result
 
 
+def _proc_exe(pid: int) -> Optional[str]:
+    """/proc/<pid>/exe のリンク先 (symlink 解決後の実体ファイルパス) を返す (t097)。
+
+    comm (15 文字打ち切り・`process.title` で書き換え可能) や cmdline (`exec` で
+    消える・`process.title` で書き換わる) と違い、exe はカーネルが execve 時点の
+    実体 inode から辿った絶対パスなので、プロセス自身がどう argv/環境を偽装しても
+    変わらない (`_origin_of` と同じファイル内の他の判定基準より構造的に硬い)。
+
+    消滅 (`FileNotFoundError` / `ProcessLookupError` = ENOENT/ESRCH) だけを None
+    として扱う契約は `_proc_stat` / `_proc_cmdline` / `_proc_environ` と同じ。
+    それ以外の `OSError` (EACCES 等) は re-raise し、呼び出し側で `unknown` に倒す。
+    """
+    try:
+        return os.readlink(f"/proc/{pid}/exe")
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+
+
+def _is_session_body(pid: int) -> bool:
+    """このノードが Claude Code のセッション本体 (`claude --model ...`) かどうか (t097)。
+
+    呼び出し側 (`classify_process_tree`) が「pane root の直接の子」であることを
+    保証した上で呼ぶこと — この関数自体は祖先関係を見ない (exe だけでは pane の
+    どの深さに居るプロセスかは分からない。祖先関係との AND がモジュール docstring
+    「t097」節の同定条件)。
+
+    exe が読めない (消滅) 場合は False — 「session ではない」として `_origin_of()`
+    に委ねる (既存の消滅時の扱いと同じ、実質 infra)。それ以外の `OSError` は
+    re-raise する (`_proc_exe` と同じ契約)。
+    """
+    exe = _proc_exe(pid)
+    if exe is None:
+        return False
+    return SESSION_EXE_MARKER in exe
+
+
 def _origin_of(pid: int) -> Literal["job", "infra", "unknown"]:
     """1 ノードの起源を判定する (t091)。cmdline → environ の順に見る。
 
@@ -353,10 +453,14 @@ def classify_process_tree(root_pid: int) -> ProcessSignal:
     """mux ペインのプロセス木を 3 値に分類する。
 
     本番のペインは常にこの形をしている (2026-09-21 実測, Ren-worker。
-    t074 で「MCP はどれも Bash tool のラッパーを経由しない」ことを再実測):
+    t074 で「MCP はどれも Bash tool のラッパーを経由しない」ことを再実測。
+    t097: `claude --model ...` 自身は `_origin_of()` (cmdline/environ) の対象外 —
+    pane root の直接の子かつ exe が `SESSION_EXE_MARKER` に一致するノードは
+    `session` として判定から外す。モジュール docstring「t097」節参照):
 
         /bin/bash                      ← root_pid (pane_pid)
-          claude --model ...           ← セッション。Worker が生きている限り常駐
+          claude --model ...           ← セッション本体 (`session`。job/infra/unknown
+                                          いずれでもない第 4 分類。判定に寄与しない)
             npm exec @playwright/mcp   ← MCP サーバー。claude の 1-2 秒後に起動
             npm exec chrome-devtools   ← 同上
             /bin/bash -c source \
@@ -382,9 +486,9 @@ def classify_process_tree(root_pid: int) -> ProcessSignal:
                        こと自体は「働いている」の証拠にならない
       "no_process"   … 子が 1 つも無い (claude が落ちた / 素のシェル)
       "unknown"      … `/proc` の列挙自体 (`_proc_stat`) か、判定中の 1 ノードの
-                       cmdline / environ (`_proc_cmdline` / `_proc_environ`)
-                       のどちらかが「消滅」以外の理由で読めず木そのものが
-                       組み立てられない (即座に unknown。t049 族A監査 / t082 P1)、
+                       cmdline / environ / exe (`_proc_cmdline` / `_proc_environ` /
+                       `_proc_exe`) のどちらかが「消滅」以外の理由で読めず木そのものが
+                       組み立てられない (即座に unknown。t049 族A監査 / t082 P1 / t097)、
                        **または** job も infra の確証も無いノードが 1 つでも
                        あった (t091: `CLAUDECODE` すら無い = Claude Code と
                        無関係か env が消された。この場合は BFS を中断せず
@@ -394,10 +498,14 @@ def classify_process_tree(root_pid: int) -> ProcessSignal:
 
     親の分類が job なら子は cmdline/environ を見るまでもなく job (そのシェルが
     起動した実体の一部だから)。job はどこで見つかっても即座に確定するので
-    "executing" は即 return する。infra / unknown の親は子に伝播しない —
-    各ノードは `_origin_of()` で独立に判定される (t065 の「同定できないものは
-    job 側に倒す」族C の許可リスト方式はここでは撤去したまま — 許可リストという
-    概念自体が要らない。モジュール docstring 参照)。
+    "executing" は即 return する。infra / unknown / session の親は子に伝播しない —
+    各ノードは (pane root の直接の子なら `_is_session_body()` を先に、それ以外は)
+    `_origin_of()` で独立に判定される (t065 の「同定できないものは job 側に倒す」
+    族C の許可リスト方式はここでは撤去したまま — 許可リストという概念自体が要らない。
+    モジュール docstring 参照)。`session` 自体は `saw_unknown` に寄与せず
+    `executing` も返さない — 木に job が無く session だけが判定から外れた残り全員が
+    infra なら、この関数は `idle_process` を返す (t097 が直す欠陥そのもの:
+    従来は session ノードが `unknown` になり `idle_process` に一度も到達しなかった)。
     """
     try:
         root_stat = _proc_stat(root_pid)
@@ -448,19 +556,26 @@ def classify_process_tree(root_pid: int) -> ProcessSignal:
         if pid in seen:
             continue
         seen.add(pid)
-        if parent_origin == "job":
-            origin = "job"  # job の子孫は cmdline/environ を見るまでもなく job
-        else:
-            try:
+        try:
+            if parent_origin == "job":
+                origin = "job"  # job の子孫は cmdline/environ を見るまでもなく job
+            elif parent_origin is None and _is_session_body(pid):
+                # pane root の直接の子で、exe がセッション本体のパターンに一致 (t097)。
+                # job でも infra でも unknown でもない第 4 の分類 — 判定に寄与しない
+                # (executing にもならず saw_unknown も立てない)。子は独立に判定する
+                # (下の `for child in ...` で origin="session" を渡すが、"job" 以外は
+                # 特別扱いしないので通常どおり _origin_of() に落ちる)。
+                origin = "session"
+            else:
                 origin = _origin_of(pid)
-            except OSError:
-                # t082 P1 / t091: cmdline か environ のどちらかが消滅以外の
-                # 理由で読めない (EACCES 等)。「マーカーが無い」(= job では
-                # ない) に潰すと、読めないノードが Bash tool のラッパー自身
-                # だったときに本物の job が idle_process に化け、watchdog が
-                # hard-idle で terminate してしまう。木全体を `unknown` に
-                # 倒す (_proc_stat の列挙失敗と同じ扱い)。
-                return "unknown"
+        except OSError:
+            # t082 P1 / t091 / t097: cmdline / environ / exe のいずれかが消滅以外の
+            # 理由で読めない (EACCES 等)。「マーカーが無い」(= job でもセッションでも
+            # ない) に潰すと、読めないノードが Bash tool のラッパー自身やセッション
+            # 本体だったときに本物の job が idle_process に化け、watchdog が
+            # hard-idle で terminate してしまう。木全体を `unknown` に倒す
+            # (_proc_stat の列挙失敗と同じ扱い)。
+            return "unknown"
         if origin == "job":
             return "executing"  # job はどこで見つかっても即座に確定する
         if origin == "unknown":

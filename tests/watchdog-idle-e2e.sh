@@ -88,9 +88,19 @@ cp "$SRC_DIR/scripts/lib_task_cards.py" "$ROOT/scripts/lib_task_cards.py"
 # 機能する)。t074 以降、分類は comm を見ないのでこの名前自体は判定に効かない
 # — ただの読みやすさのため。**cmdline に wrapper marker を含めないことが
 # 唯一の条件**(下の fake bin / runner はどれもマーカーを持たない)。
+#
+# t097 (Codex review 6巡目 P1): セッション本体 (claude 相当) は symlink ではなく
+# **実体ファイル**として `.../share/claude/versions/<ver>` に置く。symlink だと
+# `/proc/<pid>/exe` はさらに先の実体 (`/bin/sh`) を指してしまい
+# `lib_pane_process.SESSION_EXE_MARKER` (`/share/claude/versions/`) に一致しない
+# (本番の `~/.local/bin/claude` → `~/.local/share/claude/versions/<version>` という
+# symlink→実体ファイルの形をそのまま再現する必要がある)。
 FAKE_BIN_DIR="$ROOT/fake-bin"
 mkdir -p "$FAKE_BIN_DIR"
-ln -sf /bin/sh "$FAKE_BIN_DIR/claude"
+CLAUDE_VERSIONS_DIR="$ROOT/share/claude/versions"
+mkdir -p "$CLAUDE_VERSIONS_DIR"
+cp /bin/sh "$CLAUDE_VERSIONS_DIR/9.9.9"
+chmod +x "$CLAUDE_VERSIONS_DIR/9.9.9"
 ln -sf /bin/sleep "$FAKE_BIN_DIR/node"
 
 # Bash tool / Monitor が実際に生成する wrapper の形 (t074 実測) を再現するための
@@ -252,9 +262,18 @@ run_watchdog() {
 }
 
 # 監視対象の「ペイン」を立てる。
-#   idle 木      : root -> claude(comm) -> node(comm), node(comm)   (wrapper marker 無し)
-#   executing 木 : 上に加えて Bash tool wrapper (shell snapshot を source する
-#                  形。t074 実測) の子孫が生える (= Bash tool 実行中)
+#   idle 木      : root -> claude(exe が share/claude/versions/ 実体, CLAUDECODE
+#                  無し) -> node(comm, CLAUDECODE=1), node(comm, CLAUDECODE=1)
+#                  (t097。claude 自身は session として判定から外れる)
+#   executing 木 : root -> node(comm) / Bash tool wrapper が直接の子 (t082 時点の
+#                  ままセッション層を模していないが、direct child の exe は
+#                  どちらも SESSION_EXE_MARKER に一致しないため t097 の分岐は
+#                  素通りし、以前と同じ判定になる)
+#
+# t097 (Codex review 6巡目 P1): idle 木のセッション役 (claude_bin) は本番同様
+# CLAUDECODE を持たない (`_is_session_body()` が exe で同定して判定から外す)。
+# 以前はここも explicit に CLAUDECODE=1 を与えていて、セッションが `unknown`
+# に化ける欠陥を隠していた。
 #
 # t082 (Codex review 4巡目 P2-3): この fixture は t074 (comm → 起動元への
 # 作り直し) に追従できておらず、素の `sh`/`sleep` (t065 時代の comm ベース
@@ -264,9 +283,10 @@ run_watchdog() {
 spawn_pane() {
   local kind="$1"
   local pidfile="$ROOT/pane.pid"
-  local claude_bin="$FAKE_BIN_DIR/claude"
+  local claude_bin="$CLAUDE_VERSIONS_DIR/9.9.9"
   local node_bin="$FAKE_BIN_DIR/node"
   local runner="$ROOT/spawn_pane_runner.sh"
+  local session_script="$ROOT/spawn_pane_session.sh"
   rm -f "$pidfile"
   # t091: environ を明示的に curate する。この e2e 自体が Claude Code の
   # Bash tool から (= Worker として) 走らせられると、その Bash tool 自身が
@@ -285,10 +305,24 @@ env -i PATH="\$PATH" CLAUDECODE=1 CLAUDE_CODE_CHILD_SESSION=1 CLAUDE_CODE_EXECPA
 wait
 EOF
   else
+    # t097 (Codex review 6巡目 P1): セッション本体 (claude_bin) 自身の environ に
+    # は CLAUDECODE を与えない (本番実測: herdr server が起動時点で消し、
+    # 誰も書き戻さない)。CLAUDECODE は MCP 相当の子だけに明示的に与える —
+    # 別ファイルに書いた session_script を claude_bin (実体は /bin/sh) に
+    # 渡して実行させることで、claude_bin プロセス自身の起動コマンドラインに
+    # は環境変数の代入を含めない (`-c "VAR=1 cmd"` だと VAR は子にしか効かない
+    # ので実害は無いが、意図を読みやすくするため分離する)。
+    cat > "$session_script" <<EOF
+#!/bin/sh
+env -i PATH="\$PATH" CLAUDECODE=1 "$node_bin" 300 &
+env -i PATH="\$PATH" CLAUDECODE=1 "$node_bin" 300 &
+wait
+EOF
+    chmod +x "$session_script"
     cat > "$runner" <<EOF
 #!/bin/sh
 echo \$\$ > "$pidfile"
-env -i PATH="\$PATH" CLAUDECODE=1 "$claude_bin" -c "'$node_bin' 300 & '$node_bin' 300 & wait" &
+env -i PATH="\$PATH" "$claude_bin" "$session_script" &
 wait
 EOF
   fi

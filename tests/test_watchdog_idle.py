@@ -69,6 +69,7 @@ RED (修正前の実装では失敗する = 欠陥の再現):
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -196,10 +197,29 @@ class _FakeMux:
 def worker_pane(tmp_path):
     """Worker ペインと同じ形の実プロセス木を立てる。
 
-        root sh          … ペイン (pane_pid — 本番では /bin/bash)
-          └ claude       … claude 本体 (comm を `claude` にした /bin/sh の symlink)
-              ├ node     … MCP サーバー (comm を `node` にした /bin/sleep の symlink)
+        root sh                          … ペイン (pane_pid — 本番では /bin/bash)
+          └ .../share/claude/versions/…  … claude 本体 (t097: セッション自身は
+                                             CLAUDECODE を持たない — 下記参照)
+              ├ node     … MCP サーバー (comm を `node` にした /bin/sleep の symlink。
+              │             CLAUDECODE=1 は明示的にこの子だけに与える)
               └ node     … MCP サーバー (同上)
+
+    t097 (Codex review 6巡目 P1): 以前はこの fixture がセッション役の
+    プロセスにも `env=_infra_env()` (`CLAUDECODE=1`) を Popen 経由でそのまま
+    継承させていた。本番はこれと違う — `_herdr_server_env()` が herdr server
+    起動時点で `CLAUDECODE` / `CLAUDE_*` を消し、Claude Code はセッション自身の
+    environ にそれを書き戻さない (Director 実測 2026-09-28 12:40: `claude`
+    プロセスの environ に `CLAUDECODE` は無い。子の MCP サーバー・Bash tool には
+    明示的に付与する)。この食い違いのせいで、セッション本体が `unknown` に
+    化ける欠陥 (t097) が 6 巡もの codex review をすり抜けた。
+
+    ここではセッション役の実行ファイルを `env -i` 相当で CLAUDECODE を持たせず
+    起動し、**実体ファイル**として `tmp_path/share/claude/versions/<ver>` に
+    置く (symlink だと `/proc/<pid>/exe` はさらに先の実体 `/bin/sh` を指して
+    しまい、`lib_pane_process.SESSION_EXE_MARKER` に一致しない — 本番の
+    `~/.local/bin/claude` → `~/.local/share/claude/versions/<version>` という
+    symlink→実体ファイルの形をそのまま再現する)。MCP 相当の子だけに
+    `CLAUDECODE=1` を明示的に与える。
 
     t065: 判定は comm を見る。既知インフラの子は**自動では infra を継承しない**
     (「親が infra なら子も infra」を足すと、同定できない子まで infra 側に
@@ -212,16 +232,22 @@ def worker_pane(tmp_path):
     `pgrep -P <pane_pid>` は常に 1 件 (claude 相当) を返す。これが
     「生きている Worker は必ず alive と判定される」欠陥の再現条件である。
     子はすべて root とほぼ同時に起動するので、修正後の分類では
-    executing ではなく idle_process になる。
+    executing ではなく idle_process になる (t097 前は `unknown` になっていた —
+    このファイルの RED 群がその欠陥を固定する)。
     """
-    claude_bin = tmp_path / "claude"
-    claude_bin.symlink_to("/bin/sh")
+    claude_dir = tmp_path / "share" / "claude" / "versions"
+    claude_dir.mkdir(parents=True)
+    claude_bin = claude_dir / "9.9.9"
+    shutil.copy2("/bin/sh", claude_bin)
+    claude_bin.chmod(0o755)
     node_bin = tmp_path / "node"
     node_bin.symlink_to("/bin/sleep")
-    root = subprocess.Popen(
-        ["sh", "-c", f'{claude_bin} -c "{node_bin} 300 & {node_bin} 300 & wait" & wait'],
-        env=_infra_env(),  # t091: 確証のある infra として固定する (下の docstring 参照)
+    path_value = shlex.quote(os.environ.get("PATH", "/usr/bin:/bin"))
+    session_cmd = (
+        f'env -i PATH={path_value} {claude_bin} -c '
+        f'"CLAUDECODE=1 {node_bin} 300 & CLAUDECODE=1 {node_bin} 300 & wait"'
     )
+    root = subprocess.Popen(["sh", "-c", f'{session_cmd} & wait'])
     time.sleep(0.5)  # 木が出そろうまで
     try:
         yield root.pid

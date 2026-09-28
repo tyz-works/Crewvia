@@ -94,6 +94,19 @@ jobs:
       - name: scripts/ci-run-script-tests.sh
         run: bash scripts/ci-run-script-tests.sh
 
+  # tests/*.sh を glob で全部走らせる（t063 / backlog #30 P3-3）。script-tests job
+  # とは別 job にする — 対象ディレクトリも走る本数の比率も逆 (大半が理由付き除外で
+  # RUN はごく少数) で、script-tests job 特有の setup (tmux / git identity) を
+  # 必要としない。knowledge/ci-script-tests.md
+  tests-sh-tests:
+    name: tests/*.sh (all, minus the reasoned allowlist)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: scripts/ci-run-tests-sh.sh
+        run: bash scripts/ci-run-tests-sh.sh
+
   bats:
     name: Bats Unit Tests
     runs-on: ubuntu-latest

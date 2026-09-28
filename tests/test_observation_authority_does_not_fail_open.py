@@ -40,8 +40,13 @@ queue/registry のファイル読み取り (`lib_task_cards` 経由) は既に
 
 対象モジュールの `.stat()` / `.exists()` / `.read_bytes()` / `.read_text()` /
 `.readlink()` / `os.access()` / `.iterdir()` / `os.listdir()` 呼び出しを AST で
-**全部** 拾う (`_risky_calls()`、`test_queue_reads_go_through_the_guard.py` と
-同じ「実際の呼び出し形」で見る流儀)。1 つでも `OBSERVATION_SITES` に無ければ
+拾う (`_risky_calls()`、`test_queue_reads_go_through_the_guard.py` と同じ
+「実際の呼び出し形」で見る流儀)。属性アクセス経由の直接呼び出し・import した
+関数の裸呼び出し (別名を含む)・同じ関数内で変数や `getattr` に一旦束縛して
+から呼ぶ形は拾う。**ただし「全部」ではない** — `AUTHORITY_MODULES` 8 ファイル
+の AST 上に呼び出しそのものが現れない形 (呼び出しを監査対象外のヘルパーへ
+委譲する等) は原理的に見えない。見える形・見えない形の一覧は下の表 (QA t054
+(2026-09-28) で実測)。1 つでも `OBSERVATION_SITES` に無ければ
 `test_every_risky_call_is_classified` が落ちる —— 新しい呼び出しは、安全だろうと
 危険だろうと、まず理由を書かせる (allowlist の思想は
 memory: approve-judgment-needs-allowlist-and-scope と同じ)。
@@ -59,15 +64,60 @@ memory: approve-judgment-needs-allowlist-and-scope と同じ)。
   pr-size-breaks-review-machinery)。reason に危険度を書く。Director backlog へ
   (Result 参照)。
 
-赤の実証: `tests/red_proof_t053.sh`。
+赤の実証: `tests/red_proof_t053.sh` (最初の実装) / `tests/red_proof_t110.sh`
+(Codex review 2 巡目、下記 P2-1 / P2-2 の穴)。
 
     python3 -m pytest tests/test_observation_authority_does_not_fail_open.py -v
+
+## 検出できる形・できない形 (Codex review 2 巡目 対応、t110)
+
+Codex が 1 巡目で指摘した P2 ×2: (1) `from os import stat` のように import
+した観測関数を裸の名前で呼ぶと `_risky_calls()` は "listdir" しか裸の名前を
+知らず見逃す、(2) `OBSERVATION_SITES` はキー (script, function, snippet) の
+有無しか見ないので、同じ関数に全く同じ文面の呼び出しを 2 つ目として足しても
+(扱いが違っても) 1 つ目の分類を黙って引き継いで通ってしまう。
+
+QA t054（Erik、2026-09-28）がさらに 2 形の素通りを実測: (a) `m = p.stat; m()`
+/ `getattr(p, "stat")()` のような変数束縛・`getattr` 経由の呼び出しは
+`Call.func` が `ast.Attribute` でないため検出されない、(b) 実際の
+`os.stat()` 等を `AUTHORITY_MODULES` 外の新しいヘルパー関数に置き、監査対象
+ファイル側はそのヘルパーを呼ぶだけにすると、監査対象ファイルの AST 上には
+リスクのある属性名が一切現れないため検出されない。(a) は同じ関数内の代入を
+たどれば安く塞げるので塞いだ (t110)。(b) はモジュール単位の静的解析の原理的
+な限界であり **塞がない** — 「監査対象のファイルが新しい lib を import した
+らその lib も監査対象に入れるか理由を書け」という自動化案も検討したが、
+import の並び替え・re-export・動的 import まで含めると検出器自体が
+`AUTHORITY_MODULES` と同じ穴を抱える別の静的解析になり、この task のスコープ
+(2 巡目の P2 ×2 + QA (a)) を大きく超えるため見送り、(b) は下表への明記のみで
+Director backlog に送る (Result 参照)。
+
+| 形 | 検出 | 根拠 |
+|---|---|---|
+| 直接 attribute (`os.stat(...)`, `p.exists()`) | する | `.attr` で判定 (モジュール名を問わない) |
+| `import os as o` → `o.stat(...)` | する | 上と同じ (attribute のまま、alias の影響を受けない) |
+| `from os import stat` → `stat(...)` | する (t110) | `_imported_risky_names()` が `from ... import` の別名を RISKY_ATTRS に解決してから裸の `Name` 呼び出しと突き合わせる |
+| `from os import stat as st` → `st(...)` | する (t110) | 同上。`asname` を解決 |
+| `os.path.exists(...)` / `Path(...).exists()` | する | `.attr == "exists"` |
+| 変数束縛 (`m = p.stat` → `m()`) | する (t110、QA t054 (a)) | `_bound_risky_names_by_line()` が同じ関数内の `Assign` を辿り、右辺が risky attribute アクセスの変数名を集めて後続の裸呼び出しと突き合わせる |
+| `getattr(p, "stat")()` (即時呼び出し) | する (t110、QA t054 (a)) | `_is_getattr_literal_risky()` が `Call.func` 自身が `getattr(obj, "risky-name")` の形かを判定する |
+| `getattr` を変数へ束縛して後で呼ぶ (`m = getattr(p, "stat"); m()`) | する (t110、QA t054 (a)) | 上 2 つと同じ仕組み。`Assign` の右辺が `getattr(..., "risky-name")` の Call でも束縛対象に加える |
+| 同一関数内で同一文面の呼び出しが 2 回目以降 | する (t110) | `test_duplicate_call_counts_are_audited` が `_all_sites()` の出現回数を数え、`EXPECTED_OCCURRENCES` に無い増加を落とす (allowlist のキー一致だけでは通ってしまうための補強) |
+| 呼び出しを別関数へ移動 | する | `_owner_by_line()` が行番号→関数名を都度再計算するので、移動先で「未分類」として拾われる (allowlist のキーに旧関数名が入っているため) |
+| ネストした関数・ラムダの中の呼び出し | する | `ast.walk` は関数境界を無視して木全体の `Call` を辿る |
+| `contextlib.suppress(OSError)` で囲んだ呼び出し | 呼び出し自体はする / 握り潰しの有無はしない | `_risky_calls` は `Call` ノードだけを拾い、周囲が `try/except` か `suppress` かは見ない。呼び出しは必ず allowlist 行を要求されるので目には触れるが、「fail-open に潰していないか」の判定は reason 欄に人間が書く (この task のスコープはあくまで「未分類の呼び出しを見逃さないこと」) |
+| `try` の `else` 節での呼び出し | 呼び出し自体はする / 上と同じ限界 | `ast.walk` は `try/else` 内の `Call` も辿るが、else に置くことで何を握り潰していないかの検証は reason 欄に委ねる |
+| 呼び出し結果を変数に代入し、離れた場所で fail-open な判定に変換する (間接化) | しない | AST は呼び出し箇所そのものは拾うが、戻り値がどう使われるかまでは追跡しない (`test_every_risky_call_is_classified` の元々の設計限界。reason は人間が読んで書く前提) |
+| **監査対象外 (`AUTHORITY_MODULES` に無いファイル) へ委譲したヘルパー呼び出し** | **しない (QA t054 (b)、意図的に塞がない)** | モジュール単位の静的解析の原理的な限界。監査対象ファイルの AST 上に risky attribute 名そのものが現れないので `_risky_calls()` は原理的に検出できない。自動追跡 (import 先も再帰的に監査対象へ入れる) は動的 import・re-export まで含めると検出器自身が同じ穴を抱えるため見送り (Result 参照)。新しいヘルパーへ観測呼び出しを切り出すときは、そのヘルパーを手動で `AUTHORITY_MODULES` に足すこと |
+
+**この表に無い見逃し形を Codex が 3 巡目に見つけたら、その時点で打ち切る**
+(ガードは完全でなくてよい。見逃す形が文書化されていればよい)。
 """
 
 from __future__ import annotations
 
 import ast
 import pathlib
+from collections import Counter
 
 import pytest
 
@@ -110,17 +160,95 @@ def _owner_by_line(tree: ast.AST) -> dict[int, str]:
     return owner
 
 
-def _risky_calls(path: pathlib.Path) -> list[tuple[str, str]]:
-    """`(関数名, ソース断片)` を、このファイルの「観測」呼び出し全部について返す。
+def _imported_risky_names(tree: ast.AST) -> dict[str, str]:
+    """`from module import name [as alias]` で束縛されたローカル名 → 元の名前。
 
-    `os.listdir(x)` は `ast.Name` (裸の関数)、`p.stat()` / `os.stat()` は
-    どちらも `ast.Attribute` (`.attr` で拾える — `os.stat` は
-    `Attribute(attr="stat", value=Name("os"))` なので RISKY_ATTRS の
-    `"stat"` に自然に当たる)。
+    `foo.stat()` のような属性アクセスはどのモジュールから来たかを問わず
+    `.attr` だけで判定できる (`import os as o` で `o` に別名を付けても
+    `o.stat()` は変わらず Attribute なので影響を受けない)。しかし
+    `from os import stat` の後の裸の `stat(...)` はローカル名を元の名前へ
+    解決しないと拾えない (P2-1, PR #244 Codex review 2 巡目 — 以前は
+    "listdir" だけを裸の名前として特別扱いしており、他の観測関数を
+    import されると見逃していた)。
+    """
+    aliases: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ImportFrom):
+            continue
+        for alias in node.names:
+            if alias.name in RISKY_ATTRS:
+                aliases[alias.asname or alias.name] = alias.name
+    return aliases
+
+
+def _is_getattr_literal_risky(node: ast.AST) -> bool:
+    """`getattr(obj, "risky-name", ...)` の形か (QA t054 (a))。
+
+    `obj` がどんな式かは問わない — 属性アクセス (`obj.attr`) の判定が
+    モジュール名を問わないのと同じで、第2引数の文字列リテラルだけを見る。
+    """
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "getattr"
+        and len(node.args) >= 2
+        and isinstance(node.args[1], ast.Constant)
+        and isinstance(node.args[1].value, str)
+        and node.args[1].value in RISKY_ATTRS
+    )
+
+
+def _bound_risky_names_by_line(tree: ast.AST) -> dict[int, set[str]]:
+    """行番号 → その行を含む関数内で、risky attribute に束縛されたローカル
+    変数名の集合 (QA t054 (a): `m = p.stat` / `m = getattr(p, "stat")`)。
+
+    代入の時点ではまだ呼び出していないので `.attr`/`getattr` の判定だけでは
+    捉えられない。後で `m()` と呼ばれた時点で初めて観測が起きる。
+    `_owner_by_line()` と同じ「関数の subtree 全体に setdefault」の作りに
+    揃えている (ネストした関数での扱いも一貫させるため)。
+    """
+    bound: dict[int, set[str]] = {}
+    for func_node in ast.walk(tree):
+        if not isinstance(func_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        names: set[str] = set()
+        for node in ast.walk(func_node):
+            if not isinstance(node, ast.Assign):
+                continue
+            value = node.value
+            risky = (
+                (isinstance(value, ast.Attribute) and value.attr in RISKY_ATTRS)
+                or _is_getattr_literal_risky(value)
+            )
+            if not risky:
+                continue
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    names.add(target.id)
+        for sub in ast.walk(func_node):
+            if hasattr(sub, "lineno"):
+                bound.setdefault(sub.lineno, names)
+    return bound
+
+
+def _risky_calls(path: pathlib.Path) -> list[tuple[str, str]]:
+    """`(関数名, ソース断片)` を、このファイルの「観測」呼び出しについて返す。
+
+    `p.stat()` / `os.stat()` はどちらも `ast.Attribute` (`.attr` で拾える —
+    `os.stat` は `Attribute(attr="stat", value=Name("os"))` なので
+    RISKY_ATTRS の `"stat"` に自然に当たる)。`from os import listdir` の
+    ような裸の名前 (`ast.Name`) の呼び出しは `_imported_risky_names()` が
+    解決した別名の集合と、同じ関数内で変数や `getattr` に束縛された名前は
+    `_bound_risky_names_by_line()` と突き合わせる (QA t054 (a))。
+    `AUTHORITY_MODULES` 外のヘルパーへ委譲された呼び出しは、このファイルの
+    AST 上に risky attribute 名そのものが現れないため原理的に見えない
+    (QA t054 (b)。モジュール上の docstring 表を参照)。
     """
     src = path.read_text()
     tree = ast.parse(src, filename=str(path))
     owner = _owner_by_line(tree)
+    risky_names = _imported_risky_names(tree)
+    bound_by_line = _bound_risky_names_by_line(tree)
     found: list[tuple[str, str]] = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
@@ -129,7 +257,11 @@ def _risky_calls(path: pathlib.Path) -> list[tuple[str, str]]:
         hit = False
         if isinstance(func, ast.Attribute) and func.attr in RISKY_ATTRS:
             hit = True
-        elif isinstance(func, ast.Name) and func.id == "listdir":
+        elif isinstance(func, ast.Name) and func.id in risky_names:
+            hit = True
+        elif isinstance(func, ast.Name) and func.id in bound_by_line.get(node.lineno, ()):
+            hit = True
+        elif _is_getattr_literal_risky(func):
             hit = True
         if not hit:
             continue
@@ -424,6 +556,40 @@ def test_every_risky_call_is_classified(site):
         f"  安全と確認できたなら status=SAFE、まだ直っていない同族の欠陥なら "
         f"status=KNOWN_FAIL_OPEN (危険度を reason に書き、Result で "
         f"Director backlog へ)。")
+
+
+#: 既定では同じ (script, function, snippet) の呼び出しは 1 回だけ現れることを
+#: 期待する。`OBSERVATION_SITES` はキーの有無しか見ないので、同じ関数に
+#: 全く同じ文面の呼び出しを 2 つ目としてコピペで足しても (例外の扱いが違って
+#: いても) 1 つ目の分類を黙って引き継いで通ってしまう (P2-2, PR #244 Codex
+#: review 2 巡目)。意図して同じ呼び出しが複数回現れる (かつそれぞれの扱いを
+#: 個別に確認済みの) 場合だけ、ここに件数を書く。書かずに件数が増えると
+#: `test_duplicate_call_counts_are_audited` が落ちる。
+EXPECTED_OCCURRENCES: dict[tuple[str, str, str], int] = {}
+
+
+def test_duplicate_call_counts_are_audited():
+    """同じ (script, function, snippet) の呼び出し回数が想定と違ったら落ちる。
+
+    `test_every_risky_call_is_classified` はキーの有無しか見ないので、既に
+    allowlist にある呼び出しと文面が全く同じ 2 つ目の呼び出しが増えても
+    (キーが同じなら) 気付かれない。件数を独立に検査することで、新しい
+    (2 つ目以降の) 呼び出しにも必ずレビューを要求する。
+    """
+    counts = Counter(_all_sites())
+    mismatches = [
+        (key, EXPECTED_OCCURRENCES.get(key, 1), actual)
+        for key, actual in counts.items()
+        if actual != EXPECTED_OCCURRENCES.get(key, 1)
+    ]
+    assert not mismatches, (
+        "呼び出しの出現回数が想定と違う (未監査の重複、または件数の更新漏れ):\n"
+        + "\n".join(
+            f"  {s}:{f}(): {seg!r} expected={e} actual={a}"
+            for (s, f, seg), e, a in mismatches
+        )
+        + "\n  意図した重複なら EXPECTED_OCCURRENCES に件数を書き、"
+          "それぞれの呼び出しの扱いが本当に同じか確認すること。")
 
 
 def test_the_allowlist_has_no_dead_entries():

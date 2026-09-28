@@ -250,12 +250,44 @@ _TRUST_ACCEPT_OPTION_RE = re.compile(
     r'[❯›>]\s*1[.)]\s*yes,?\s*(?:i\s*)?(?:trust\s*this\s*folder|proceed)\b'
 )
 
+# t099 (PR#237 5巡目) で 2 つの隣の入口が見つかった。どちらも「独立に拾う」型の再発:
+#
+# [P2-1] 最後の網の「単独の No, exit」フォールバックが `'no, exit' in flat and 'enter to confirm' in flat`
+# という**画面のどこにあっても構わない**独立部分一致のままだった。cwd のパスが `/tmp/No, exit` で、
+# 隣に (trust ダイアログとは無関係な) 普通の権限確認メニューの `Enter to confirm` フッタが出ている
+# だけで True になる (族B の再発、直接確認済み)。→ `2. No, exit` を**番号付きの選択肢として**要求し、
+# かつ `Enter to confirm` との間の距離を**近傍 (20 文字以内)** に絞る (`_TRUST_DECLINE_WITH_FOOTER_RE`)。
+# 番号も距離も要求することで、無関係な 2 箇所の偶然の一致を排除する。
+#
+# [P2-2] `_TRUST_ACCEPT_OPTION_RE` は「カーソルが選択肢 1」の形しか認めない。カーソルが選択肢 2
+# (`❯ 2. No, exit`) にある画面 (同梱 fixture `DIALOG_OLDER` の版、Enter to confirm フッタ無し) は
+# 検出漏れになる — すり抜けると start.sh はそのカーソル位置を「準備完了」と誤認し kickoff + Enter を
+# 送ってしまう (このガードが防ぐべき事故そのもの)。→ 選択肢 1 と選択肢 2 を**カーソル位置に関わらず
+# 隣接する 1 組**として同定する (`_TRUST_OPTION_PAIR_RE`): どちらの選択肢にカーソルがあっても、
+# 「1. Yes, I trust this folder / Yes, proceed」の直後に「2. No, exit」が続く画面はダイアログである。
+
+#: 選択肢 1 と選択肢 2 が、カーソルがどちらを指していても「1 組」として隣接していること
+#: (P2-2)。カーソル (`❯`/`›`/`>`) はどちらの側にあっても任意 — 組そのものの隣接だけを固定する。
+_TRUST_OPTION_PAIR_RE = re.compile(
+    r'[❯›>]?\s*1[.)]\s*yes,?\s*(?:i\s*)?(?:trust\s*this\s*folder|proceed)\b'
+    r'\s*[❯›>]?\s*2[.)]\s*no,\s*exit\b'
+)
+
+#: 選択肢 1 が capture から切れて見えない場合の網: 番号付きの選択肢 2 (`2. No, exit`) が決定の
+#: 操作案内 (`Enter to confirm`) の近傍 (20 文字以内) にあること (P2-1)。番号を要求し距離を絞ることで、
+#: cwd のパス等に含まれる無関係な "No, exit" が離れた場所のフッタと組み合わさる誤検出を防ぐ。
+_TRUST_DECLINE_WITH_FOOTER_RE = re.compile(
+    r'[❯›>]?\s*2[.)]\s*no,\s*exit\b.{0,20}enter to confirm'
+)
+
 
 def screen_shows_trust_dialog(screen):
     flat = ' '.join(str(screen).lower().split())
-    if _TRUST_ACCEPT_OPTION_RE.search(flat):
-        return True
-    return 'no, exit' in flat and 'enter to confirm' in flat
+    return bool(
+        _TRUST_ACCEPT_OPTION_RE.search(flat)
+        or _TRUST_OPTION_PAIR_RE.search(flat)
+        or _TRUST_DECLINE_WITH_FOOTER_RE.search(flat)
+    )
 
 
 def main(argv):

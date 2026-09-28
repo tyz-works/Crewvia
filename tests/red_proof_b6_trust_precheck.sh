@@ -44,6 +44,12 @@
 #   CDF  start.sh: LAUNCH_CMD の `cd ... && claude` を `cd ...; claude` に戻す
 #        (cd が失敗しても claude がそのまま起動してしまう)                                        → 赤 (bats)
 #
+# t099 (B6 fix 5巡目: PR#237 Codex 5巡目 P2×2 — 隣の入口) で追加:
+#   NOEXIT   lib_trust: 単独の "No, exit" フォールバックを番号・距離を見ない独立部分一致に戻す
+#            (cwd のパスの文言 + 離れた場所の無関係な権限確認メニューの Enter to confirm フッタ)   → 赤 (pytest)
+#   CURSOR2  lib_trust: 選択肢の組 (_TRUST_OPTION_PAIR_RE) を見ず、カーソルが選択肢 1 の形しか
+#            認めない旧実装に戻す (カーソルが選択肢 2 を指す DIALOG_OLDER の版を見逃す)            → 赤 (pytest)
+#
 # 注意 (defense in depth): 最後の網は 3 か所 (待機中 / 送信前 / 送信後) にあり、**1 か所だけ**を外しても、
 # 別の 1 か所が同じ画面を捕まえるので、多くのテストは緑のまま。だから G / H は「その 1 か所にだけ
 # 反応するテスト」(送信前の窓・送信後の verified) が赤になることを名指しで確かめ、I は 2 か所を同時に
@@ -261,9 +267,11 @@ fresh_copy
 cat > "$WORK/subm_old.txt" <<'BLOCK'
 def screen_shows_trust_dialog(screen):
     flat = ' '.join(str(screen).lower().split())
-    if _TRUST_ACCEPT_OPTION_RE.search(flat):
-        return True
-    return 'no, exit' in flat and 'enter to confirm' in flat
+    return bool(
+        _TRUST_ACCEPT_OPTION_RE.search(flat)
+        or _TRUST_OPTION_PAIR_RE.search(flat)
+        or _TRUST_DECLINE_WITH_FOOTER_RE.search(flat)
+    )
 BLOCK
 cat > "$WORK/subm_new.txt" <<'BLOCK'
 def screen_shows_trust_dialog(screen):
@@ -281,9 +289,11 @@ fresh_copy
 cat > "$WORK/s2_old.txt" <<'BLOCK'
 def screen_shows_trust_dialog(screen):
     flat = ' '.join(str(screen).lower().split())
-    if _TRUST_ACCEPT_OPTION_RE.search(flat):
-        return True
-    return 'no, exit' in flat and 'enter to confirm' in flat
+    return bool(
+        _TRUST_ACCEPT_OPTION_RE.search(flat)
+        or _TRUST_OPTION_PAIR_RE.search(flat)
+        or _TRUST_DECLINE_WITH_FOOTER_RE.search(flat)
+    )
 BLOCK
 cat > "$WORK/s2_new.txt" <<'BLOCK'
 def screen_shows_trust_dialog(screen):
@@ -299,6 +309,48 @@ def screen_shows_trust_dialog(screen):
 BLOCK
 inject_span scripts/lib_trust.py "$WORK/s2_old.txt" "$WORK/s2_new.txt"
 expect_red_py "case S2" "test_ordinary_screens_are_not_mistaken_for_the_dialog"
+
+echo "== case NOEXIT: 単独の No, exit フォールバックを番号・距離を見ない独立部分一致に戻す (t099 P2-1)"
+fresh_copy
+cat > "$WORK/noexit_old.txt" <<'BLOCK'
+def screen_shows_trust_dialog(screen):
+    flat = ' '.join(str(screen).lower().split())
+    return bool(
+        _TRUST_ACCEPT_OPTION_RE.search(flat)
+        or _TRUST_OPTION_PAIR_RE.search(flat)
+        or _TRUST_DECLINE_WITH_FOOTER_RE.search(flat)
+    )
+BLOCK
+cat > "$WORK/noexit_new.txt" <<'BLOCK'
+def screen_shows_trust_dialog(screen):
+    flat = ' '.join(str(screen).lower().split())
+    if _TRUST_ACCEPT_OPTION_RE.search(flat) or _TRUST_OPTION_PAIR_RE.search(flat):
+        return True
+    return 'no, exit' in flat and 'enter to confirm' in flat
+BLOCK
+inject_span scripts/lib_trust.py "$WORK/noexit_old.txt" "$WORK/noexit_new.txt"
+expect_red_py "case NOEXIT" "test_ordinary_screens_are_not_mistaken_for_the_dialog"
+
+echo "== case CURSOR2: 選択肢の組を見ず、カーソルが選択肢 1 の形しか認めない旧実装に戻す (t099 P2-2)"
+fresh_copy
+cat > "$WORK/cursor2_old.txt" <<'BLOCK'
+def screen_shows_trust_dialog(screen):
+    flat = ' '.join(str(screen).lower().split())
+    return bool(
+        _TRUST_ACCEPT_OPTION_RE.search(flat)
+        or _TRUST_OPTION_PAIR_RE.search(flat)
+        or _TRUST_DECLINE_WITH_FOOTER_RE.search(flat)
+    )
+BLOCK
+cat > "$WORK/cursor2_new.txt" <<'BLOCK'
+def screen_shows_trust_dialog(screen):
+    flat = ' '.join(str(screen).lower().split())
+    if _TRUST_ACCEPT_OPTION_RE.search(flat):
+        return True
+    return bool(_TRUST_DECLINE_WITH_FOOTER_RE.search(flat))
+BLOCK
+inject_span scripts/lib_trust.py "$WORK/cursor2_old.txt" "$WORK/cursor2_new.txt"
+expect_red_py "case CURSOR2" "test_the_trust_dialog_is_recognised"
 
 echo "== case T: CLAUDE_CONFIG_DIR を spawn 先に伝播しない (t051 P1)"
 fresh_copy

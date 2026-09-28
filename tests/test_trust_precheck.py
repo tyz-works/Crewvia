@@ -353,10 +353,22 @@ DIALOG_OLDER = """\
    2. No, exit
 """
 
+# t099 (P2-2): DIALOG_OLDER と同じ画面だが、カーソルが選択肢 2 (拒否) にある。フッタ (Enter to
+# confirm) も無い旧版の形。カーソル位置に関わらず、選択肢の組そのものがダイアログの証拠になる。
+DIALOG_OLDER_CURSOR_ON_DECLINE = """\
+ Do you trust the files in this folder?
+
+ /home/user/newproj
+
+   1. Yes, proceed
+ ❯ 2. No, exit
+"""
+
 
 @pytest.mark.parametrize("screen", [
     DIALOG_2_1_283,
     DIALOG_OLDER,
+    DIALOG_OLDER_CURSOR_ON_DECLINE,
     # 折り返しで文言が行をまたいでも見つける (実物と同じく、選択肢の構造も画面に乗っている)
     "Quick safety check: Is this a project you\n  created or one you trust?"
     "\n\n ❯ 1. Yes, I trust this folder\n   2. No, exit\n\n Enter to confirm · Esc to cancel",
@@ -403,6 +415,16 @@ def test_the_trust_dialog_is_recognised(screen):
     "Enter to confirm · Esc to cancel",
     # 同じ族: フレーズが「No, exit」ではなく他の phrase (quick safety check) 由来でも同様に誤検出しない。
     "user@host:/tmp/quick safety check$ claude\n\n"
+    "Do you want to proceed?\n❯ 1. Yes\n  2. No, and tell Claude what to do differently\n\n"
+    "Enter to confirm · Esc to cancel",
+    # --- 族B (続き, t099 / PR#237 5巡目 P2-1): 単独の "No, exit" フォールバックが画面のどこにあっても
+    # よい独立部分一致だったための再発。cwd のパスに文言そのもの ("No, exit") が入っており、離れた場所に
+    # ある無関係な権限確認メニューの Enter to confirm フッタと組み合わさって誤って一致してしまう。
+    "[crewvia] Working directory: /tmp/No, exit\n\n"
+    "Bash command\nnpm test\n\n"
+    "Do you want to proceed?\n❯ 1. Yes\n  2. No, and tell Claude what to do differently\n\n"
+    "Enter to confirm · Esc to cancel",
+    "user@host:/tmp/No, exit$ claude\n\n"
     "Do you want to proceed?\n❯ 1. Yes\n  2. No, and tell Claude what to do differently\n\n"
     "Enter to confirm · Esc to cancel",
 ])

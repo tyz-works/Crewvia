@@ -49,6 +49,20 @@ lib ごとの**破ってはいけない契約**の要約。理由・経緯・全
 - codex-review の差分 300KB 超の拒否は `registry/daemons/review-refusals/<mission>__<task>.json` に記録し
   （`lib_review_refusal.py` が唯一の定義）、dispatcher は記録がある間 spawn しない。記録が読めない・
   欄の値が不正なら保留。
+- Rule 5 (idle-with-task) は、`run_in_background` の shell / Monitor が生きている Worker には送らない。
+  「ペインの裏で何かが走っているか」は `lib_pane_process.classify_process_tree()` の 1 か所
+  （watchdog の idle 判定と共有）。判定根拠は comm ではなく**祖先の cmdline に Bash tool /
+  Monitor の shell snapshot wrapper が現れるか**（t074。本番の `npm exec ...` は process.title
+  書き換え + `sh -c "..."` を挟むため comm では MCP を job と誤読していた）。
+  **観測できないときは通知する側**、watchdog は殺さない側（判定ごとに向きが違う）。
+  job が連続して見え続けている時間が `BACKGROUND_JOB_MAX_SECONDS`（既定 30分）を超えたら
+  通知を再開する（起動元だけでは job の中身が進んでいるかは分からない — Ren の `pgrep -f`
+  自己一致ループの実例）。それでも黙り続ける裏で止まった job は watchdog の max が拾う。
+  この上限タイマー (`<name>.job-since.json`) は「無い」(正常) と「読めない/書けない」
+  (異常) を区別し、後者は上限判定を信用せず通常判定に流す（t082。握り潰すと安全弁自体が
+  黙る側に壊れる）。cmdline が読めないノードも「消滅」以外は `unknown` に倒す（t082 P1。
+  「マーカー無し」に潰すと本物の job が見えなくなり watchdog が誤って terminate しうる）。
+  （`knowledge/watchdog-idle-judgment.md` §7-9）。
 - 台帳・拒否記録は**消してよい**（無い = 再通知 / 拒否されていない）。通知が届かない・review が動かないときの
   手当てはそのファイルを消すこと（dispatcher の再起動は不要。`knowledge/notify-once.md`「戻し方」）。
 
@@ -62,6 +76,38 @@ lib ごとの**破ってはいけない契約**の要約。理由・経緯・全
   必須化は `init` が mission.yaml に書く `deliverable_required: true` の mission だけ（`knowledge/assignment-routing.md` §6）。
 - 引数は厳格（未知の option は exit 2 で何も書かない）。`pull` だけ使い方の誤りが exit 1（exit 2 は「タスクなし」）。
 - queue を書き換えるサブコマンドの後、`registry/task-graph/tasks.json` を再生成する（`CREWVIA_TASK_GRAPH=0` で停止）。
+
+## 起動（`start.sh` / `lib_trust.py`）
+
+- mux モードの start.sh は、claude を起動する**前**に `lib_trust.py check <cwd>` で trust を検査する。未信頼（10）・確認不能（11）・
+  検査自体の異常終了は**すべて止める**（exit 1。「読めない」を「信頼済み」にしない）。`~/.claude.json` は書き換えない。
+  拒否は端末と `logs/start-sh/refusals.log` の両方に出す（`_log_refusal`）。副作用より前に置く。
+- kickoff 前後の最後の網（`lib_trust.py dialog`）が、`❯`（ダイアログの選択カーソルでもある）を入力行と誤認する穴を塞ぐ。
+  ダイアログの文言の定義は `lib_trust.py` の 1 箇所。戻し方は `knowledge/file-map.md`「lib_trust.py」。
+- `CLAUDE_CONFIG_DIR` は precheck (ambient env) と spawn 先 (`ENV_EXPORTS`) で必ず同じ値にする。設定されて
+  いれば伝播し、未設定なら spawn 先で明示的に `unset`（mux server 側に残る古い値を消す。t051 P1）。
+- `capture()` は「読めなかった」と「画面が本当に空」を区別できず同じ `""` を返す。空画面を「ダイアログ
+  なし」に倒さない — kickoff 送信直前・送信後は `_require_no_trust_dialog`（画面の検査が成功するまで
+  有限回再試行、それでも駄目なら拒否）を使う。プロンプト待ちループ側の `_trust_dialog_check` は緩い網
+  （観測できない間は上位のポーリングに委ねる）で、`CREWVIA_BENCH_MODE=1` はここも対象外にする（t051 P2 / P2x2）。
+- `CLAUDE_CONFIG_DIR` / `HOME` は precheck の**前**に一度だけ絶対パスへ解決する（相対のまま渡すと、
+  precheck (start.sh 自身の cwd 基準) と WORK_DIR へ `cd` してから起動する claude とで基準が変わり、
+  「同じ文字列」でも「同じ解決済みの対象」にならない。t070 P2）。解決できない値はそのまま precheck に
+  委ねる（存在しない dir は lib_trust.py が untrusted として止める。安全側）。
+- LAUNCH_CMD へ値を埋め込むときは必ず `_shq` を通す。自前の `'$var'` 埋め込みは、
+  AGENT_NAME・TARGET_DIR・WORK_DIR のような外部由来の値に `'` が含まれるだけで壊れ、`'; cmd; #` の
+  ような値ならペインでコマンドが追加実行される（t070 P1 シェルインジェクション）。ENV_EXPORTS・
+  `--model` / `--settings` / `--permission-mode` の CLI 引数・`cd`・advisory メッセージまで、
+  埋め込み箇所は全部 `_shq` を通す（族 D）。文字列の形を見るテストは評価時の挙動を保証しない —
+  `tests/start-sh-trust-precheck.bats` は実際に LAUNCH_CMD をスタブ claude で評価するテストを持つ。
+  `_shq` は bash 組み込みの `printf '%q'` を使わない（t089 / PR#237 4巡目 P2-2）: LAUNCH_CMD を
+  実際に評価するのは pane の**設定済みシェル**であり、それが bash である保証はない。`%q` は改行や
+  非 ASCII を `$'...'`（ANSI-C quoting、bash 専用）で出力するが、dash はそれを構文エラーにする。
+  代わりに、値をシングルクォートで囲み中の `'` を `'\''` に置き換える POSIX 互換の方式にした —
+  bash / dash / ash / ksh / zsh のどれでも同じ意味になる（常にクォート付きになる点が旧実装との
+  観測できる違い — `--permission-mode auto` は `--permission-mode 'auto'` になる）。
+  また LAUNCH_CMD 内の `cd $(_shq "$WORK_DIR")` は `claude...` の前を `;` ではなく `&&` でつなぐ
+  （族 A）: `cd` が失敗しても `;` は後続を実行してしまい、**別のディレクトリで Claude が起動する**。
 
 ## worktree_gc.py
 

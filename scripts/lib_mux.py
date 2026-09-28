@@ -1120,6 +1120,16 @@ def proc_table(proc_root: str = "/proc"):
     we could not *read* might be, and a table that quietly dropped it would
     answer "nothing of ours in there" to the one caller that then kills the
     pane.
+
+    t101 (Codex review 7巡目 P1 の族): a process name can hold any byte the
+    kernel allows (no UTF-8 constraint), so an unrelated process elsewhere on
+    the machine can make `stat`'s decode raise `UnicodeDecodeError` — a
+    `ValueError`, not an `OSError`, so the walk's own error handling below
+    would not have caught it and the whole table build (every pane's
+    recognition for that cycle) would crash. Read with `errors="replace"`
+    (matching `_read_proc()` above) so a bad name degrades to a garbled comm
+    instead of raising; nothing here parses `stat`'s comm field, only the
+    tail after it (ppid), which stays plain ASCII digits regardless.
     """
     try:
         entries = list(Path(proc_root).iterdir())
@@ -1133,7 +1143,7 @@ def proc_table(proc_root: str = "/proc"):
         try:
             argv = [a.decode("utf-8", "replace")
                     for a in (entry / "cmdline").read_bytes().split(b"\0") if a]
-            stat = (entry / "stat").read_text(encoding="utf-8")
+            stat = (entry / "stat").read_text(encoding="utf-8", errors="replace")
         except OSError as exc:
             if exc.errno in _PROC_GONE_ERRNOS:
                 continue

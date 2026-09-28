@@ -582,6 +582,10 @@ ALLOWED_DELETIONS = {
         "同上の `.firstseen` マーカーの掃除。glob は `*.firstseen` に限られる",
     ("dispatcher.sh", "set_all_done_state", "ALL_DONE_STATE_FILE.unlink()"):
         "all-done 通知の状態ファイル。registry/mux の外",
+    ("dispatcher.sh", "_save_job_since", "path.unlink()"):
+        "Rule 5 の BACKGROUND_JOB_MAX_SECONDS 用タイマー (`<name>.job-since.json`)。"
+        "kill の認可の証拠 (`<name>.json` / `<name>-worker.json`) ではなく、job が"
+        "終わった/条件から外れたときに次回また新しく計り直すための自己クリアのみ (t074)",
     ("dispatcher.sh", "save_told", "os.replace(tmp, TOLD_FILE)"):
         "notified-state 台帳 (`registry/daemons/notified-state.json`) の temp + os.replace による"
         "原子的な書き込み。置換先は `TOLD_FILE` の 1 つに固定で、registry/mux の記録ではない",

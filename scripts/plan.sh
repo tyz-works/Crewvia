@@ -27,11 +27,16 @@ set -euo pipefail
 #                              Director (registry の role: director) は pull できない
 #   plan.sh done <task_id> "<result>" [--mission <slug>] (--pr <N> | --no-pr "<理由>")
 #                              deliverable: pr の task は --pr か --no-pr が必須 (無いと拒否。exit 2・何も書かない)
-#                              --pr <N>: この task の PR 番号。この task を blocked_by に持つ
+#                              --pr <N>: この task の PR 番号。blocked_by を逆にたどった下流のうち、
+#                              deliverable が pr でない (file / none と明示宣言された) task だけを
+#                              通過し (別の PR を作る task・宣言の無い task で止まる。#29)、到達した
 #                              codex-review / review の task に pr_number を書く (未設定のものだけ)。
+#                              上流に deliverable: pr の task が 2 つ以上ある合流点には書かない
+#                              (どの PR か一意でないため。理由は stderr に出す)。
 #                              codex-review が blocked なら pending に戻す。Result からは推測しない
-#                              この task を待つ codex-review (pr_number 未設定) があるのに --pr が無いと拒否
-#                              (exit 2、何も書かない)。PR を作らない task は --no-pr "<理由>" (card に残る)
+#                              この task を待つ codex-review (直接・推移とも。pr_number 未設定・合流点でない)
+#                              があるのに --pr が無いと拒否 (exit 2、何も書かない)。
+#                              PR を作らない task は --no-pr "<理由>" (card に残る。--no-pr のときは伝播しない)
 #   plan.sh fail <task_id> [<handoff_path>] (--head <sha> | --no-head <理由>) [--mission <slug>]
 #   plan.sh update <task_id> [--mission <slug>] [--skills <csv>] [--blocked-by <csv>]
 #                            [--priority high|medium|low] [--worker <name>] [--status <status>]
@@ -3700,30 +3705,133 @@ PR_PROPAGATION_SKILLS = ('codex-review', 'review')
 PR_NOT_AWAITED_STATUSES = {'done', 'verified', 'failed', 'skipped', 'cancelled', 'verification_failed'}
 
 
-def propagate_pr_number(slug, task_id, pr_number):
-    """`task_id` を blocked_by に持つ codex-review / review の task に `pr_number` を書く。
+def _is_pr_passthrough(meta):
+    """この task を経由して、さらに下流 (blocked_by を逆にたどった先) へ PR 番号を伝えてよいか。
 
-    伝える先の条件は 3 つの AND: この task を `blocked_by` に持つ・skills に codex-review か
-    review を含む・`pr_number` が **未設定** (Director が手で入れた値を上書きしない)。
+    `deliverable` が **明示的に宣言されていて** `file` か `none` の task だけが通過する
+    (#29)。`deliverable: pr` (別の PR を作る task) と、宣言の無い task ("従来どおり直接
+    依存だけ" の後方互換) はここで止まる — 自分自身は到達できても、その先へは伝わらない。
+    """
+    return 'deliverable' in meta and meta.get('deliverable') in ('file', 'none')
+
+
+def _pr_dependents_index(slug):
+    """`slug` の全 task から、伝播の探索に要る 3 つの索引を 1 回の走査で作る。
+
+    `[破損]` の card は依存の向きを正しく読めないので、伝える先にも・通過点にも・
+    祖先を数える対象にもしない (辺の両端から除く)。
+    戻り値: `(dependents_of, tasks_by_id, bodies)`。
+    `dependents_of[dep_id]` はその id を **直接** `blocked_by` に持つ task の meta の list。
+    """
+    tasks_by_id = {}
+    bodies = {}
+    for meta, body in list_tasks(slug):
+        if meta.get('status') == CORRUPT_TASK_STATUS:
+            continue
+        tasks_by_id[meta['id']] = meta
+        bodies[meta['id']] = body
+    dependents_of = {}
+    for meta in tasks_by_id.values():
+        deps = meta.get('blocked_by')
+        if not isinstance(deps, list):
+            continue
+        for dep in deps:
+            if dep in tasks_by_id:
+                dependents_of.setdefault(dep, []).append(meta)
+    return dependents_of, tasks_by_id, bodies
+
+
+def _reachable_pr_targets(task_id, dependents_of):
+    """`task_id` の下流 (blocked_by を逆にたどった先) のうち、PR 番号が到達する task。
+
+    直接の依存先 (level 1) は、自身の `deliverable` が何であれ必ず到達する (旧実装と
+    同じ)。そこからさらに先へ進む (通過する) のは `_is_pr_passthrough()` が真の task
+    だけ。戻り値は `{task_id: meta}` (探索順。同じ id には 1 度しか触れない —
+    ダイヤモンド合流があっても二重処理しない)。
+    """
+    reached = {}
+    queue = list(dependents_of.get(task_id, []))
+    while queue:
+        meta = queue.pop(0)
+        tid = meta['id']
+        if tid in reached:
+            continue
+        reached[tid] = meta
+        if _is_pr_passthrough(meta):
+            queue.extend(dependents_of.get(tid, []))
+    return reached
+
+
+def _pr_source_ancestors(task_id, tasks_by_id, memo, _visiting=frozenset()):
+    """`task_id` の上流 (blocked_by) を、`_is_pr_passthrough()` の task を通過してたどり、
+    見つかった `deliverable: pr` の task の id を集合で返す (グラフ全体から決まる、
+    どの done 呼び出しからも独立した構造)。
+
+    2 つ以上あれば「この task にはどの PR の番号を書けばよいか一意に決まらない」
+    (#29 の合流点)。循環 (blocked_by に本来あってはならない) は空集合に倒し、
+    無限再帰にしない。メモ化はグラフ全体を通じて 1 つの `memo` dict を使い回すこと
+    (`propagate_pr_number` / `codex_reviews_awaiting_pr` の 1 回の呼び出しの中で共有する)。
+    """
+    if task_id in memo:
+        return memo[task_id]
+    if task_id in _visiting:
+        return frozenset()
+    meta = tasks_by_id.get(task_id)
+    if meta is None:
+        return frozenset()
+    deps = meta.get('blocked_by')
+    result = set()
+    if isinstance(deps, list):
+        next_visiting = _visiting | {task_id}
+        for dep in deps:
+            dep_meta = tasks_by_id.get(dep)
+            if dep_meta is None:
+                continue
+            if dep_meta.get('deliverable') == 'pr':
+                result.add(dep)
+            elif _is_pr_passthrough(dep_meta):
+                result |= _pr_source_ancestors(dep, tasks_by_id, memo, next_visiting)
+            # else: 宣言の無い task はここで止まる (祖先を足さない)。
+    result = frozenset(result)
+    memo[task_id] = result
+    return result
+
+
+def propagate_pr_number(slug, task_id, pr_number):
+    """`task_id` の下流 (blocked_by を逆にたどった先) の codex-review / review の task に
+    `pr_number` を書く。直接の依存先だけでなく、`deliverable` が `pr` でないと明示
+    宣言された task を通過した先の推移的な依存先にも書く (#29)。
+
+    書き込む条件は 4 つの AND: `_reachable_pr_targets()` で到達する・skills に
+    codex-review か review を含む・`pr_number` が **未設定** (Director が手で入れた値を
+    上書きしない)・その task の上流 (pr でない task を通る経路) に `deliverable: pr` の
+    task が **1 つだけ** (2 つ以上なら合流点で、どの PR か一意でないので書かない。
+    理由は stderr に出す)。
+
     codex-review の task が `blocked` (PR 番号待ち) なら `pending` に戻す — 戻さないと、番号が
     入ったのに誰も dispatch しない。`blocked_reason` は消す (理由が済んだので)。review の task は
     番号だけで、status は触らない (止まっている理由が PR 番号とは限らないため)。
 
     Result の本文から番号を推測することはしない (明示フラグだけ)。キューロックの中で呼ぶこと。
-    `[破損]` の card は書き戻すと壊れた中身を正規化してしまうので触らない。
+    `[破損]` の card は書き戻すと壊れた中身を正規化してしまうので触らない (索引の時点で除く)。
     戻り値: `[(task_id, 'pr_number' | 'pr_number+unblocked')]`。
     """
+    dependents_of, tasks_by_id, bodies = _pr_dependents_index(slug)
+    reached = _reachable_pr_targets(task_id, dependents_of)
+    memo = {}
     touched = []
-    for meta, body in list_tasks(slug):
-        if meta.get('status') == CORRUPT_TASK_STATUS:
-            continue
-        deps = meta.get('blocked_by')
-        if not isinstance(deps, list) or task_id not in deps:
-            continue
+    for tid, meta in reached.items():
         skills = set(meta.get('skills') or [])
         if not skills & set(PR_PROPAGATION_SKILLS):
             continue
         if meta.get('pr_number') not in (None, ''):
+            continue
+        ancestors = _pr_source_ancestors(tid, tasks_by_id, memo)
+        if len(ancestors) >= 2:
+            print(f"[plan.sh] PR #{pr_number} を {slug}/{tid} には書きませんでした"
+                  f" (合流点: 上流に deliverable: pr の task が {len(ancestors)} 件"
+                  f" — {', '.join(sorted(ancestors))} — どの PR か一意でないため)",
+                  file=sys.stderr)
             continue
         meta['pr_number'] = pr_number
         how = 'pr_number'
@@ -3731,33 +3839,41 @@ def propagate_pr_number(slug, task_id, pr_number):
             meta['status'] = 'pending'
             meta.pop('blocked_reason', None)
             how = 'pr_number+unblocked'
-        save_task(slug, meta['id'], meta, body)
-        touched.append((meta['id'], how))
+        save_task(slug, tid, meta, bodies[tid])
+        touched.append((tid, how))
     return touched
 
 
 def codex_reviews_awaiting_pr(slug, task_id):
-    """`task_id` を **直接** blocked_by に持ち、PR 番号が要るのに未設定の codex-review task。
+    """`task_id` の下流 (直接・推移とも) で、PR 番号が要るのに未設定の codex-review task。
 
-    `propagate_pr_number` の伝え先のうち codex-review だけ (review の task は番号が無くても
-    Worker が PR を探せるので、止めるほどの事故にならない)。終わった task (done / failed /
-    skipped / cancelled ...) は番号を待っていない。`[破損]` の card は読み違えないので数えない
-    (拒否の根拠にできるのは、読めた card だけ)。キューロックの中で呼ぶこと。
+    `propagate_pr_number()` が実際に書き込む対象と **同じ規則** (`_reachable_pr_targets()` /
+    `_is_pr_passthrough()` / 合流点の判定) で数える —— ここで「待っている」と言った
+    task には、`--pr` を付けた done が実際に番号を届けられる、という対応を保つため
+    (#29 / PR7 との整合)。合流点 (上流に deliverable: pr の task が 2 つ以上) は
+    `--pr` を渡しても書かれないので、待っているとは数えない (付け忘れの拒否では
+    ない — 本番確認のような合流 task は、個々の PR の done では永久に満たせない)。
+
+    review の task は番号が無くても Worker が PR を探せるので、対象は codex-review だけ。
+    終わった task (done / failed / skipped / cancelled ...) は番号を待っていない。
+    `[破損]` の card は読み違えないので数えない (拒否の根拠にできるのは、読めた card だけ)。
+    キューロックの中で呼ぶこと。
     戻り値: 該当 task の id のリスト。
     """
+    dependents_of, tasks_by_id, _bodies = _pr_dependents_index(slug)
+    reached = _reachable_pr_targets(task_id, dependents_of)
+    memo = {}
     waiting = []
-    for meta, _body in list_tasks(slug):
-        status = meta.get('status')
-        if status == CORRUPT_TASK_STATUS or status in PR_NOT_AWAITED_STATUSES:
-            continue
-        deps = meta.get('blocked_by')
-        if not isinstance(deps, list) or task_id not in deps:
+    for tid, meta in reached.items():
+        if meta.get('status') in PR_NOT_AWAITED_STATUSES:
             continue
         if 'codex-review' not in set(meta.get('skills') or []):
             continue
         if meta.get('pr_number') not in (None, ''):
             continue
-        waiting.append(meta['id'])
+        if len(_pr_source_ancestors(tid, tasks_by_id, memo)) >= 2:
+            continue
+        waiting.append(tid)
     return waiting
 
 

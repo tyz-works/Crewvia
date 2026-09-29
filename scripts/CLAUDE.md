@@ -70,6 +70,11 @@ lib ごとの**破ってはいけない契約**の要約。理由・経緯・全
   免除して観測した時間を max から除く。**読めない・同定できない → 利用枠切れではない**、免除は必ず上限つき
   (`excuse_deadline()`)。台帳の slug は `_daemon` (mission slug だと `prune_told()` が捨てる)。
   （`knowledge/watchdog-idle-judgment.md` §10）
+- idle Worker の退役 (dispatcher): 残っている task が無い、または skill は合うが TARGET_DIR が合わず取れない
+  task しか無い (`takeable_pending` が空) Worker は no-task と同じく退役させる。TARGET_DIR の記録が
+  無い / 読めない Worker だけは合わないと確定できないので待機（C3 / t009。`knowledge/assignment-routing.md`）。
+- `sync-main-checkout.sh` は restart した daemon の新しい世代の heartbeat を上限つきで待ってから status を出す。
+  上限までに記録されなければ失敗として積む（`lib_daemon_watch.py wait-heartbeat`）。
 - 台帳・拒否記録は**消してよい**（無い = 再通知 / 拒否されていない）。通知が届かない・review が動かないときの
   手当てはそのファイルを消すこと（dispatcher の再起動は不要。`knowledge/notify-once.md`「戻し方」）。
 

@@ -2613,28 +2613,43 @@ def dispatch():
             # assignment-removal-triggers-rule2-kill).
             has_in_progress = worker_holds_work(agent_name, all_tasks)
             # #21: skill は合うが TARGET_DIR が合わない task しか残っていない Worker。
-            # それは「全部 blocked」でも「仕事なし」でもない — Rule 2 (blocked-stuck) で
-            # 退役させると、記録を持たない (PR3 より前に起動した) TARGET_DIR 付き Worker が、
-            # 自分の task を待っているだけで殺される。Director に起動要求 (下の no_worker) が
-            # 行くので、ここは何もしない。
+            # そういう task は、この Worker が (blocked が解けても) 永久に取れない。
+            # 待つ理由が無いので、no-task と同じく退役させる (C3 / t009)。旧実装は
+            # 「退役させず待機 (Director に起動要求済み)」だったが、(a) 取れない task を待つ
+            # Worker が mission 完了後も残り続け、(b) blocked な task には起動要求が
+            # 実際には出ていなかった (起動要求は unblocked_pending だけを走査する)。
+            # 自分の TARGET_DIR の task を待つ Worker は takeable_pending が空でないので、
+            # この分岐に来ず Rule 2 のまま (#21 が守ろうとした挙動は変わらない)。
             takeable_pending = [(sl, m) for sl, m in matching_pending
                                 if worker_may_take_task(agent_name, m)[0]]
-            if has_any and not takeable_pending and not has_in_progress:
+            # 例外: Worker の TARGET_DIR の記録が「無い / 読めない」ときは、target_dir 付きの
+            # task を取れないのは記録が無いからで、task が合わないと確定していない
+            # (PR3 より前に起動した Worker は自分の task を待っているだけかもしれない)。
+            # 観測できなかったものを根拠に破壊 (退役) しない — 従来どおり待機に倒す。
+            _rec_known = not is_unreadable(worker_target_record(agent_name))
+            if has_any and not takeable_pending and not has_in_progress and not _rec_known:
                 _skey = f"target_only_{agent_name}"
                 if should_notify(_skey):
-                    log(f"[target] {agent_name}: 残っている task は TARGET_DIR が合わないものだけ — "
-                        f"退役させず待機 (Director に起動要求済み)")
+                    log(f"[target] {agent_name}: 残っている task は TARGET_DIR が合わないものだけだが、"
+                        f"TARGET_DIR の記録が無い/読めないため合わないと確定できない — 退役させず待機")
                     record_notify(_skey)
-            elif not has_any and not has_in_progress:
+            elif not takeable_pending and not has_in_progress:
+                # 残っている task が無い (not has_any) か、あっても TARGET_DIR が合わず
+                # この Worker には永久に取れない (C3 / t009): どちらも「もう要らない」。
                 if in_spawn_grace(target):
                     log(f"[spawn_grace] {agent_name}: within {SPAWN_GRACE_SECONDS}s spawn grace — skip shutdown")
                 else:
                     notify_key = f"shutdown_{agent_name}"
                     if should_notify(notify_key):
+                        if has_any:
+                            log(f"[target] {agent_name}: 残っている task は TARGET_DIR が合わないものだけ "
+                                f"(この Worker は永久に取れない) — 退役を依頼 (no-task)")
                         if retire_worker(agent_name, target, 'no-task'):
                             record_notify(notify_key)
             elif has_any and not has_in_progress:
-                # Rule 2: all matching tasks are blocked.  If the most recently
+                # Rule 2: all matching tasks are blocked (C3: "matching" = the ones this
+                # Worker can actually take — a TARGET_DIR-mismatched task's blocker chain
+                # says nothing about whether *this* Worker is stuck).  If the most recently
                 # modified matching task file is older than BLOCKED_STUCK_THRESHOLD,
                 # the blocker chain has not progressed — send shutdown (worker is stuck).
                 # Uses file mtime as a proxy for last_status_change.
@@ -2669,7 +2684,7 @@ def dispatch():
                 # the worker, even if the pending task files have old mtimes.
                 has_active_blocker = any(
                     task_statuses_by_mission.get(s, {}).get(dep) == 'in_progress'
-                    for s, m in matching_pending
+                    for s, m in takeable_pending
                     for dep in (m.get('blocked_by') or [])
                 )
                 if has_active_blocker:
@@ -2678,7 +2693,7 @@ def dispatch():
                         f"→ chain progressing, worker kept alive"
                     )
                 else:
-                    newest_mtime = max(_chain_newest_mtime(s, m) for s, m in matching_pending)
+                    newest_mtime = max(_chain_newest_mtime(s, m) for s, m in takeable_pending)
                     stuck_secs = time.time() - newest_mtime
                     if stuck_secs >= BLOCKED_STUCK_THRESHOLD:
                         # t015 F1 (Seo review, MEDIUM): this 3rd kill path had no

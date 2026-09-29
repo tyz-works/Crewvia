@@ -49,9 +49,16 @@ Worker として扱われる** (= その間、TARGET_DIR 付きで起動済み�
   CREWVIA_MUX=<backend> bash scripts/start.sh worker <skills>`。skill は合う Worker が (別の TARGET_DIR で) 居る
   ときは `--fresh` を付ける (registry-first の名前引きは同じ名前を返し、`start.sh` は「既に居る」で断る)。
   名前は貼った時点で決まる (dispatcher は registry を書き換えない)。
-- **skill は合うが TARGET_DIR が合わない task しか残っていない Worker は退役させない**。Rule 2
-  (blocked-stuck) は「全部 blocked」の判定で当てはまらない。退役させると、記録を持たない TARGET_DIR 付き
-  Worker が自分の task を待っているだけで殺される。
+- **skill は合うが TARGET_DIR が合わない task しか残っていない Worker は、no-task と同じく退役させる**
+  (C3 / t009。旧実装は「退役させず待機」で、取れない blocked task のために mission 完了後も Worker が残った —
+  2026-09-29 の Seo / Zara)。取れる task (`takeable_pending`。blocked を含む) が空で、自分の card も無いとき。
+  自分の TARGET_DIR の task を待つ Worker は `takeable_pending` が空でないので対象外 (Rule 2 のまま)。
+  Rule 2 の「blocker が in_progress」「最新 mtime」も `takeable_pending` だけを見る (取れない task の
+  blocker 鎖で Worker を生かしも殺しもしない)。**例外: Worker の TARGET_DIR の記録が無い / 読めないとき**は
+  task が合わないと確定できない (PR3 より前に起動した Worker は自分の task を待っているだけかもしれない)
+  ので、従来どおり待機 (観測できなかったものを根拠に破壊しない)。ログの「Director に起動要求済み」は
+  blocked な task には実際には出ていなかったので削除した。
+  **戻し方**: PR を revert → `scripts/sync-main-checkout.sh` (dispatcher が restart される)。
 - **送信済み・pull 待ちの Worker には別の task を送らない** (#22)。task A が pending のまま、A への
   送信が通知スロットルの TTL の内にあるあいだ、その Worker は割り当て済みとして扱う。TTL を過ぎても
   pull されなければ保護は外れる (従来どおり A の再送)。

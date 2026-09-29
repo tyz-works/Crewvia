@@ -1171,6 +1171,45 @@ def read_heartbeat(registry_dir, name: str) -> Optional[dict]:
     return hb
 
 
+def heartbeat_identity(registry_dir, name: str) -> str:
+    """`<pid> <generation>` of the recorded heartbeat, or `none`.
+
+    A snapshot taken *before* a restart, so `wait_for_new_heartbeat` can tell
+    the old instance's record from the new one's.
+    """
+    hb = read_heartbeat(registry_dir, name)
+    if hb is None:
+        return "none"
+    return f"{hb['pid']} {hb.get('generation') or '-'}"
+
+
+def wait_for_new_heartbeat(registry_dir, name: str, *, before: str, since: float,
+                           timeout: float, poll: float = 1.0,
+                           now: Callable[[], float] = time.time,
+                           sleep: Callable[[float], None] = time.sleep):
+    """Wait (bounded) until `name` has recorded a heartbeat of a *new* instance.
+
+    Right after a restart the recorded heartbeat is still the old instance's
+    (dead pid) until the new daemon's first beat: printing status then reads as
+    `recorded_instance_alive=False` and looks like a failed restart (2026-09-28
+    21:11).  "New" means all of: written at/after `since`, a different
+    `<pid> <generation>` than `before`, and that instance is alive.
+
+    Returns the heartbeat dict, or None if none appeared within `timeout` —
+    the caller must treat that as a failure, not as "probably fine".
+    """
+    deadline = now() + timeout
+    while True:
+        hb = read_heartbeat(registry_dir, name)
+        if (hb is not None and hb["updated_at"] >= since
+                and heartbeat_identity(registry_dir, name) != before
+                and instance_alive(hb.get("pid"), hb.get("generation"))):
+            return hb
+        if now() >= deadline:
+            return None
+        sleep(poll)
+
+
 # ---------------------------------------------------------------------------
 # Verdicts
 # ---------------------------------------------------------------------------
@@ -1765,6 +1804,17 @@ def main(argv: Optional[List[str]] = None) -> int:
     _sub("watch", "run one mutual-watch cycle as <name>")
     _sub("status", "show both daemons' heartbeats", with_name=False)
 
+    _sub("heartbeat-id", "print '<pid> <generation>' of <name>'s recorded "
+                         "heartbeat, or 'none' (snapshot before a restart)")
+
+    p = _sub("wait-heartbeat", "wait until <name> records a heartbeat from a "
+                               "NEW instance (exit 0), or time out (exit 1)")
+    p.add_argument("--before", required=True,
+                   help="output of heartbeat-id taken before the restart")
+    p.add_argument("--since", type=float, required=True,
+                   help="epoch seconds taken before the restart")
+    p.add_argument("--timeout", type=float, default=90.0)
+
     p = _sub("pause", "suppress respawn of a daemon")
     p.add_argument("--reason", default="manual pause")
 
@@ -1815,6 +1865,20 @@ def main(argv: Optional[List[str]] = None) -> int:
                             log=lambda m: print(m, file=sys.stderr))
         verdict = watch.watch_peer()
         print(f"{verdict.action}: {verdict.reason}")
+        return 0
+
+    if args.cmd == "heartbeat-id":
+        print(heartbeat_identity(registry_dir, args.name))
+        return 0
+
+    if args.cmd == "wait-heartbeat":
+        hb = wait_for_new_heartbeat(registry_dir, args.name, before=args.before,
+                                    since=args.since, timeout=args.timeout)
+        if hb is None:
+            print(f"timeout: {args.name} recorded no heartbeat from a new instance "
+                  f"within {args.timeout:.0f}s", file=sys.stderr)
+            return 1
+        print(f"ok: {args.name} pid={hb['pid']} generation={hb.get('generation')}")
         return 0
 
     if args.cmd == "status":

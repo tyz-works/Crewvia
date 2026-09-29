@@ -1966,7 +1966,11 @@ def check_rule5(name: str, target: str, assignment_file: Path, task_statuses_by_
     if st in ('idle', 'done', 'blocked') and (st == 'blocked' or assignment_file.exists()):
         if handle_usage_limit(name, target, assignment_file):
             return
-    elif _usage_limit_path(name).exists():
+    elif st == 'working' and _usage_limit_path(name).exists():
+        # 記録を消してよい根拠は「回復を観測した」ことだけ: 動いている (working) を mux が
+        # 返した。`unknown` は一時的な lookup / RPC の失敗でも返る (HerdrBackend.state) ので回復の
+        # 証拠ではない — 消すと次に読めたとき同じ通知から新しい first_seen / reset_at が付き、
+        # 免除が延びる (t020 / P1)。idle/done で割り当てなしの Worker も観測していないので保つ。
         _retire_usage_limit(name)
 
     # B1 (#27): idle/done with a live background job is 'working' for Rule 5.

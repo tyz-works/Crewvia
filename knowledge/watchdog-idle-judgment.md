@@ -542,6 +542,27 @@ Director に**1 回**通知する (`usage-limit-overdue_<name>`)。永久に黙�
 entry (過ぎた deadline) を引き継ぐので免除されず通常の Rule 5 が出る。**通知が多く出る側**に倒れるだけで、
 免除が延びる側ではない。
 
+### 記録を消す (retire する) 経路と、その根拠 (t020 / Codex 3 巡目 P1)
+
+上の表は「読めない / 書けない / 消せない」だった。**mux の state が `unknown` / 取得失敗**の行が漏れていた:
+`HerdrBackend.state()` は一時的な lookup / RPC の失敗でも `unknown` を返すので、これは回復の証拠ではない。
+消すと first_seen / reset_at / resumed_at が作り直され、18:00 以降の `at 6pm` から翌日のリセット時刻が付いて
+免除と通知の抑制が延びる (失敗を繰り返せば何度でも)。原則: **記録・台帳キーを消してよい根拠は「回復を観測した」ことだけ**。
+
+| 経路 | 消すか | 根拠 (回復の観測か) |
+|---|---|---|
+| dispatcher `handle_usage_limit`: 読めた画面 (`observable`) に通知行が無い | 消す | 回復を観測した (画面を読んで無かった) |
+| dispatcher `check_rule5`: mux state が `working` | 消す | 回復を観測した (動いている) |
+| dispatcher `check_rule5`: mux state が `unknown` (取得失敗) | **保つ** | 観測できていない (t020 で修正。以前は消していた) |
+| dispatcher `check_rule5`: idle / done で割り当てなし | **保つ** | 画面を読んでいない = 未観測 (以前は消していた)。次に読めた健全な画面か working で畳まれる |
+| dispatcher: capture の例外 / 空 | 保つ | 観測できていない (t018) |
+| dispatcher: 記録が読めない | 消さず作り直す | (既知 (a)。有界) |
+| watchdog `_observe_usage_limit`: 読めた画面に通知行が無い | entry を捨てる | 回復を観測した |
+| watchdog: capture の例外 / 空 / 窓が無い | 保つ | 観測できていない (t018) |
+
+`unknown` / 空 / 例外 / タイムアウトを回復扱いにして消す経路は 0 件。消す関数は `_retire_usage_limit` の 1 つで、
+呼び出しは上の 2 か所だけ (`tests/test_usage_limit.py::test_an_unknown_mux_state_is_not_a_recovery_and_keeps_the_record`)。
+
 ### 戻し方
 
 PR を revert → `scripts/sync-main-checkout.sh` (主 checkout を ff し dispatcher / watchdog を restart)。
@@ -551,6 +572,6 @@ env 停止スイッチは付けていない (dispatcher と watchdog で答え�
 
 ### 検証
 
-`tests/test_usage_limit.py` (69 件: 同定の表・dispatcher 1 サイクル・watchdog の模擬時計・観測/保存の失敗)。
+`tests/test_usage_limit.py` (70 件: 同定の表・dispatcher 1 サイクル・watchdog の模擬時計・観測/保存の失敗)。
 赤の実証: `tests/red_proof_c2_usage_limit.sh` (修正前の dispatcher.sh / watchdog.py に戻すと
-(1)〜(3) が赤、加えて同定・上限・床・上限外し・空 capture・保存失敗・台帳キーの欠陥注入 13 件が赤)。
+(1)〜(3) が赤、加えて同定・上限・床・上限外し・空 capture・保存失敗・台帳キー・mux state unknown の欠陥注入 14 件が赤)。

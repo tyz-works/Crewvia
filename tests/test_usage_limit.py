@@ -677,3 +677,32 @@ def test_the_ledger_key_survives_when_it_cannot_be_cleared(r5, monkeypatch):
     PaneMux.pane_state = "working"
     r5.run()
     assert r5.entry_path.exists()
+
+
+def test_an_unknown_mux_state_is_not_a_recovery_and_keeps_the_record(r5):
+    """(t020 P1) `_mux.state()` の unknown は一時的な lookup / RPC の失敗でも返る (回復の証拠ではない)。
+    利用枠切れ → unknown → 再び同じ画面、で記録 (first_seen / reset_at / resumed_at) も台帳キーも
+    保たれ、deadline が付け直されない。割り当てなしの idle/done も未観測なので同じ。"""
+    PaneMux.screen = limited_screen(NOTICE)
+    r5.age_state()
+    r5.run()
+    past = time.time() - lib_usage_limit.GRACE_AFTER_RESET_SECONDS - 600
+    r5.rewrite_entry(reset_at=past, first_seen=past - 3600, resumed_at=past + 200)
+    before = r5.entry()
+    for st, keep_assignment in (("unknown", True), ("idle", False), ("done", False)):
+        PaneMux.pane_state = st
+        if not keep_assignment:
+            r5.assignment.unlink(missing_ok=True)
+        r5.age_state()
+        r5.run()
+        assert r5.entry_path.exists(), st
+        assert r5.entry() == before, st
+        assert f"usage-limit_{AGENT}" in _told(r5), st
+    r5.assignment.write_text(f"{SLUG}:t001\n")
+    PaneMux.pane_state = "idle"
+    PaneMux.screen = limited_screen(NOTICE)   # 再び利用枠切れの画面
+    r5.age_state()
+    r5.run()
+    assert r5.entry()["reset_at"] == before["reset_at"]       # 「明日の 18:00」に化けない
+    assert r5.entry()["first_seen"] == before["first_seen"]
+    assert r5.entry()["resumed_at"] == before["resumed_at"]

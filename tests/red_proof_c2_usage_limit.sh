@@ -156,8 +156,8 @@ expect_red "case K" "test_when_the_record_cannot_be_kept_rule5_returns"
 
 echo "== case L: 回復時に記録だけ消して台帳キーを残す"
 fresh_copy
-inject scripts/dispatcher.sh "    elif _usage_limit_path(name).exists():
-        _retire_usage_limit(name)" "    elif _usage_limit_path(name).exists():
+inject scripts/dispatcher.sh "観測していないので保つ。
+        _retire_usage_limit(name)" "観測していないので保つ。
         _save_usage_limit(name, None)"
 expect_red "case L" "test_recovery_then_the_same_notice_notifies_first_time_again"
 
@@ -165,6 +165,12 @@ echo "== case M: 台帳の fp から見え始めを外す"
 fresh_copy
 inject scripts/dispatcher.sh "    ident = f'{lib_usage_limit.identity(entry[\"notice\"])}@{int(entry[\"first_seen\"])}'" "    ident = lib_usage_limit.identity(entry['notice'])"
 expect_red "case M" "test_a_leftover_ledger_key_does_not_silence_the_next_episode"
+
+echo "== case N: mux state が unknown / 割り当てなし idle でも記録を畳む (t020 P1: 回復の観測に束縛しない)"
+fresh_copy
+inject scripts/dispatcher.sh "    elif st == 'working' and _usage_limit_path(name).exists():" \
+    "    elif _usage_limit_path(name).exists():"
+expect_red "case N" "test_an_unknown_mux_state_is_not_a_recovery_and_keeps_the_record"
 
 echo
 echo "Results: PASS=$PASS FAIL=$FAIL"

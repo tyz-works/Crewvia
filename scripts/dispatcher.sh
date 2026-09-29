@@ -1097,6 +1097,8 @@ def clear_told_key(key):
     通知向け — B2 の main-checkout-drift はどの mission の slug にも属さないので
     `observed_slugs` 経由の prune では拾えない)。状態が「きれいになった」ときに
     呼ぶことで、次に同じ fingerprint の状態が来ても再通知される (解消後の再通知)。
+    戻り値は「畳めたか」(t018): ロックが取れない・台帳が読めないは False。呼び出し側が、
+    畳めていないのに自分の記録だけ消して台帳キーを孤児にしないための印。
     ロックが取れなければ何もしない (次のサイクルでやり直す。消し忘れの直接の害は
     「同じ状態が繰り返し起きたときにだけ再通知が 1 サイクル遅れる」だけで、
     通知そのものが消えるわけではない)。
@@ -1108,14 +1110,15 @@ def clear_told_key(key):
     """
     with told_lock(TOLD_FILE) as held:
         if not held:
-            return
+            return False
         told = load_told()
         if is_unreadable(told):
-            return
+            return False
         if key in told:
             del told[key]
             save_told(told)
     forget_notify(f'{key}#')
+    return True
 
 
 def observed_missions(all_tasks, active_missions):
@@ -1805,16 +1808,32 @@ def _load_usage_limit(name: str) -> Optional[dict]:
     return entry
 
 
-def _save_usage_limit(name: str, entry: Optional[dict]) -> None:
+def _save_usage_limit(name: str, entry: Optional[dict]) -> bool:
+    """記録を書く (None = 消す)。戻り値は成否 (t018 / P2)。呼び出し側は、記録を保てない
+    (= 上限つきのタイマーを維持できない) なら利用枠切れとして扱わず通常の Rule 5 に戻すこと。
+    書けないのに True を返すと毎サイクル新しい first_seen / reset_at になり、免除の期限が
+    永遠に未来のまま Rule 5 だけが止まる (B1 の `_save_job_since` と同じ作法)。"""
     path = _usage_limit_path(name)
     try:
         if entry is None:
             path.unlink(missing_ok=True)
-            return
+            return True
         STATE_JSON_DIR.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(entry), encoding='utf-8')
+        return True
     except Exception as e:
         log(f'WARNING: cannot write usage-limit entry for {name!r}: {e}')
+        return False
+
+
+def _retire_usage_limit(name: str) -> bool:
+    """利用枠切れが終わった (回復した) Worker の記録と台帳キーを畳む。台帳キーを先に消し、
+    消せたときだけ記録を消す: 記録だけ消えて台帳キーが残ると、以後の健全な観測は「記録が無い」
+    ので二度と消しに来ない (t018 / P2)。消せなければ記録が残り、次サイクルでやり直す。"""
+    for k in (f'usage-limit_{name}', f'usage-limit-still_{name}'):
+        if not clear_told_key(k):
+            return False
+    return _save_usage_limit(name, None)
 
 
 def handle_usage_limit(name: str, target: str, assignment_file: Path) -> bool:
@@ -1828,28 +1847,34 @@ def handle_usage_limit(name: str, target: str, assignment_file: Path) -> bool:
     except Exception as e:
         log(f'WARNING: usage-limit — cannot capture {target!r}: {e!r}')
         return False   # 観測できない → 利用枠切れではない (従来どおり)
+    if not lib_usage_limit.observable(screen):
+        # capture の失敗は空文字列で返る。「見えなかった」観測は記録も台帳も触らない
+        # (消すと次に読めたとき新しい deadline が付く — t018 / P1)。免除もしない。
+        return False
     prev = _load_usage_limit(name)
     entry = lib_usage_limit.observe(prev, screen, now)
     key = f'usage-limit_{name}'
     still_key = f'usage-limit-still_{name}'
     if entry is None:
         if prev is not None or _usage_limit_path(name).exists():
-            _save_usage_limit(name, None)
-            # 解消した: 台帳から外す (次に同じ状態が来たら再通知する)。記録があったときだけ
+            # 解消した: 記録と台帳を畳む (次に同じ状態が来たら再通知する)。記録があったときだけ
             # (通常の Worker で毎サイクル台帳のロックを取らない)。
-            for k in (key, still_key):
-                clear_told_key(k)
+            _retire_usage_limit(name)
         return False
 
     same = prev is not None and (lib_usage_limit.identity(prev.get('notice'))
                                  == lib_usage_limit.identity(entry['notice']))
     entry['resumed_at'] = prev.get('resumed_at') if same else None
-    ident = lib_usage_limit.identity(entry['notice'])
+    # 台帳の fp は通知行 + 見え始め: 同じ通知行 (相対時刻など) の次の利用枠切れは別の fp になり、
+    # 前回の台帳キーが消し損ねで残っていても最初の通知が出る (t018 / P2)。
+    ident = f'{lib_usage_limit.identity(entry["notice"])}@{int(entry["first_seen"])}'
 
+    # 記録を保てない (書けない) なら上限つきのタイマーを維持できない → 通常の Rule 5 に戻す
+    # (t018 / P2)。上限超えの場合も、同じ通知行の間は同じ first_seen を保たせるため保存する。
+    if not _save_usage_limit(name, entry):
+        return False
     if now > lib_usage_limit.excuse_deadline(entry):
-        # 上限超え: 通常の Rule 5 判定へ (永久に黙らない)。記録は残す (同じ通知行の間は
-        # 同じ first_seen を保つので、毎サイクル「新しい利用枠切れ」に戻らない)。
-        _save_usage_limit(name, entry)
+        # 上限超え: 通常の Rule 5 判定へ (永久に黙らない)。
         return False
 
     # Rule 5 の grace は、利用枠切れが終わってから数え直す
@@ -1896,8 +1921,8 @@ def handle_usage_limit(name: str, target: str, assignment_file: Path) -> bool:
                      f'(リセット予定 {reset_txt}, task {task_id}, mission={slug})。'
                      f'枠がまだ戻っていない可能性があります。表示: {entry["notice"][:120]}'),
             director_live=_director_live)
-    _save_usage_limit(name, entry)
-    return True
+    # resumed_at を残す (書けなければ再開の促しが二重になりうる → 通常の Rule 5 に戻す)
+    return _save_usage_limit(name, entry)
 
 
 def check_rule5(name: str, target: str, assignment_file: Path, task_statuses_by_mission: dict,
@@ -1942,7 +1967,7 @@ def check_rule5(name: str, target: str, assignment_file: Path, task_statuses_by_
         if handle_usage_limit(name, target, assignment_file):
             return
     elif _usage_limit_path(name).exists():
-        _save_usage_limit(name, None)
+        _retire_usage_limit(name)
 
     # B1 (#27): idle/done with a live background job is 'working' for Rule 5.
     # Only condition B (assignment exists) is affected — 'blocked' still notifies.

@@ -557,3 +557,123 @@ def test_one_long_unobserved_gap_is_not_credited_to_the_limit(wd):
     wd.clock.t += 3600 * 3                                   # watchdog が 3 時間動いていなかった
     wd.monitor.check_detail()
     assert wd.monitor._limit_excluded <= watchdog.WorkerMonitor.LIMIT_EXCLUDE_MAX_STEP + 60
+
+
+# ---------------------------------------------------------------------------
+# 4. 観測・保存の失敗が「除外が上限なく続く / 通知が出ない」に倒れない (t018 / PR #252 2 巡目)
+# ---------------------------------------------------------------------------
+
+def _told(r5):
+    path = r5.h.registry / "daemons" / "notified-state.json"
+    return json.loads(path.read_text()) if path.exists() else {}
+
+
+def test_a_blank_capture_does_not_renew_the_deadline_in_dispatcher(r5):
+    """(P1) 18:00 を過ぎてから空の capture (= 失敗) を挟んでも、同じ通知から新しい deadline が付かない。"""
+    PaneMux.screen = limited_screen(NOTICE)
+    r5.age_state()
+    r5.run()
+    past = time.time() - lib_usage_limit.GRACE_AFTER_RESET_SECONDS - 600   # 上限は過ぎている
+    r5.rewrite_entry(reset_at=past, first_seen=past - 3600)
+    before = r5.entry()
+    PaneMux.screen = ""                       # Mux.capture() は失敗を空文字列で返す
+    r5.age_state()
+    blank_msgs = r5.to_director(r5.run())     # 見えなかった観測は免除しない (通常の Rule 5)
+    assert r5.entry() == before               # 記録は消えない・作り直されない
+    assert f"usage-limit_{AGENT}" in _told(r5)   # 台帳も畳まれない
+    PaneMux.screen = limited_screen(NOTICE)   # 次に読めたとき
+    r5.age_state()
+    msgs = blank_msgs + r5.to_director(r5.run())
+    assert r5.entry()["reset_at"] == before["reset_at"]   # 「明日の 18:00」に化けていない
+    assert any("idle-with-task" in m for m in msgs)       # 上限超え / 見えない間は通常の Rule 5
+    assert not any("利用枠切れです" in m for m in msgs)
+
+
+def test_a_blank_capture_does_not_renew_the_deadline_in_watchdog(wd):
+    """(P1) watchdog: 上限超えの後に空の capture を 1 回挟んでも、免除は延びない。"""
+    wd.touch(age=100)
+    wd.mux.screen = limited_screen("⚠ Usage limit reached")             # 時刻不明 (上限 = 見え始め + 6h)
+    wd.advance(60)
+    first_seen = wd.monitor._limit_entry["first_seen"]
+    wd.advance(lib_usage_limit.UNKNOWN_RESET_MAX_SECONDS + 600, step=600)
+    assert wd.monitor.usage_limit_overdue_message() is not None       # 上限を過ぎた
+    wd.mux.screen = ""
+    wd.clock.t += 30
+    wd.monitor.check_detail()
+    assert wd.monitor._limit_entry["first_seen"] == first_seen        # 記録は保たれる
+    wd.mux.screen = limited_screen("⚠ Usage limit reached")
+    wd.clock.t += 30
+    res = wd.monitor.check_detail()
+    assert wd.monitor._limit_entry["first_seen"] == first_seen        # 付け直されない
+    assert res.verdict == "terminate"                                 # 除外は延びていない
+
+
+def test_a_blank_capture_is_not_excused_in_watchdog(wd):
+    """空の capture の間は免除もしない (max から除く時間にも数えない)。"""
+    wd.touch()
+    wd.mux.screen = limited_screen("⚠ Usage limit reached")
+    wd.advance(60)
+    excluded = wd.monitor._limit_excluded
+    wd.mux.screen = ""
+    wd.advance(600)
+    assert wd.monitor._limit_excluded == excluded
+
+
+def test_when_the_record_cannot_be_kept_rule5_returns(r5):
+    """(P2) 記録を保存できない (= 上限つきのタイマーを維持できない) なら、毎サイクル通常の Rule 5。"""
+    PaneMux.screen = limited_screen(NOTICE_REL)
+    r5.entry_path.parent.mkdir(parents=True, exist_ok=True)
+    r5.entry_path.mkdir()                       # ファイルを書けない・読めない
+    for _ in range(3):
+        r5.age_state()
+        r5.h.notify_cache.unlink(missing_ok=True)
+        msgs = r5.to_director(r5.run())
+        assert any("idle-with-task" in m for m in msgs)
+        assert not any("利用枠切れです" in m for m in msgs)
+
+
+def test_the_same_pane_with_a_writable_record_is_still_excused(r5):
+    """対照: 保存できるなら従来どおり免除 (保存失敗で常に Rule 5 に戻す実装を弾く)。"""
+    PaneMux.screen = limited_screen(NOTICE_REL)
+    r5.age_state()
+    msgs = r5.to_director(r5.run())
+    assert len(msgs) == 1 and "利用枠切れです" in msgs[0]
+
+
+def test_recovery_then_the_same_notice_notifies_first_time_again(r5):
+    """(P2) working に戻って記録を消したら台帳キーも消える。同じ通知行の次の利用枠切れで最初の通知が出る。"""
+    PaneMux.screen = limited_screen(NOTICE_REL)
+    r5.age_state()
+    assert len(r5.to_director(r5.run())) == 1
+    assert f"usage-limit_{AGENT}" in _told(r5)
+    PaneMux.pane_state = "working"            # 回復して動いている (画面は読まれない)
+    r5.run()
+    assert not r5.entry_path.exists()
+    assert f"usage-limit_{AGENT}" not in _told(r5)
+    PaneMux.pane_state = "idle"
+    r5.h.notify_cache.unlink(missing_ok=True)
+    r5.age_state()
+    assert len(r5.to_director(r5.run())) == 1     # 同じ identity の次の枠切れ
+
+
+def test_a_leftover_ledger_key_does_not_silence_the_next_episode(r5):
+    """台帳キーが消し損ねで残っていても (ロック失敗など)、新しい利用枠切れは別の fp で最初の通知が出る。"""
+    PaneMux.screen = limited_screen(NOTICE_REL)
+    r5.age_state()
+    assert len(r5.to_director(r5.run())) == 1
+    r5.entry_path.unlink()                    # 記録だけ消え、台帳キーは残った状態
+    r5.h.notify_cache.unlink(missing_ok=True)
+    time.sleep(1.1)                           # first_seen は秒精度の fp 部品
+    r5.age_state()
+    assert len(r5.to_director(r5.run())) == 1
+
+
+def test_the_ledger_key_survives_when_it_cannot_be_cleared(r5, monkeypatch):
+    """台帳キーを畳めなかったら記録も残す (孤児のキーだけが残る形にしない)。次サイクルでやり直す。"""
+    PaneMux.screen = limited_screen(NOTICE_REL)
+    r5.age_state()
+    r5.run()
+    monkeypatch.setitem(r5.ns, "clear_told_key", lambda k: False)
+    PaneMux.pane_state = "working"
+    r5.run()
+    assert r5.entry_path.exists()

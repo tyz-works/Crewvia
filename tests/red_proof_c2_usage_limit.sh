@@ -14,6 +14,11 @@
 #   F  watchdog: 免除が終わった後の idle の床を外す (止まっていた沈黙で即 hard idle)   → 赤
 #   G  watchdog: 観測できなかった空白も max から除く (1 回の上限を外す)                → 赤
 #   H  watchdog: 免除の上限を外す (永久に殺さない)                                     → 赤
+#   I  dispatcher: 空の capture (失敗) を「利用枠切れではない」に潰して記録を消す (t018 P1) → 赤
+#   J  watchdog: 空の capture で entry を None に上書きする (t018 P1)                  → 赤
+#   K  dispatcher: 記録の保存失敗を飲んで True を返す (t018 P2)                        → 赤
+#   L  dispatcher: 回復時に台帳キーを消さず記録だけ消す (t018 P2)                      → 赤
+#   M  dispatcher: 台帳の fp から見え始めを外す (前回のキーが残ると最初の通知が出ない)  → 赤
 #
 # 隔離: 使い捨ての複製で欠陥を注入する (本番の worktree のファイルには触らない)。pytest は
 # FakeMux / 隔離した queue・registry で動き、本物の herdr / tmux / 本番 queue には届かない。
@@ -131,6 +136,35 @@ inject scripts/watchdog.py "        if now > lib_usage_limit.excuse_deadline(ent
             self._limit_excused_at = None" "        if False:
             self._limit_excused_at = None"
 expect_red "case H" "test_the_exemption_has_an_upper_bound_and_the_director_is_told"
+
+echo "== case I: dispatcher が空の capture で記録を消す"
+fresh_copy
+inject scripts/dispatcher.sh "    if not lib_usage_limit.observable(screen):" "    if False:"
+expect_red "case I" "test_a_blank_capture_does_not_renew_the_deadline_in_dispatcher"
+
+echo "== case J: watchdog が空の capture で entry を上書きする"
+fresh_copy
+inject scripts/watchdog.py "        if not lib_usage_limit.observable(screen):" "        if False:"
+expect_red "case J" "test_a_blank_capture_does_not_renew_the_deadline_in_watchdog"
+
+echo "== case K: dispatcher が保存失敗を飲む"
+fresh_copy
+inject scripts/dispatcher.sh "        log(f'WARNING: cannot write usage-limit entry for {name!r}: {e}')
+        return False" "        log(f'WARNING: cannot write usage-limit entry for {name!r}: {e}')
+        return True"
+expect_red "case K" "test_when_the_record_cannot_be_kept_rule5_returns"
+
+echo "== case L: 回復時に記録だけ消して台帳キーを残す"
+fresh_copy
+inject scripts/dispatcher.sh "    elif _usage_limit_path(name).exists():
+        _retire_usage_limit(name)" "    elif _usage_limit_path(name).exists():
+        _save_usage_limit(name, None)"
+expect_red "case L" "test_recovery_then_the_same_notice_notifies_first_time_again"
+
+echo "== case M: 台帳の fp から見え始めを外す"
+fresh_copy
+inject scripts/dispatcher.sh "    ident = f'{lib_usage_limit.identity(entry[\"notice\"])}@{int(entry[\"first_seen\"])}'" "    ident = lib_usage_limit.identity(entry['notice'])"
+expect_red "case M" "test_a_leftover_ledger_key_does_not_silence_the_next_episode"
 
 echo
 echo "Results: PASS=$PASS FAIL=$FAIL"

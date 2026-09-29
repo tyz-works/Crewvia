@@ -141,6 +141,14 @@ def detect(screen, now: Optional[float] = None) -> Optional[UsageLimit]:
     return found
 
 
+def observable(screen) -> bool:
+    """画面が「読めた」観測か。`Mux.capture()` は失敗 (pane が見つからない・mux 不達・timeout) を
+    空文字列で返すので、「空 / 文字列でない」は「利用枠切れではない」ではなく**「見えなかった」**。
+    見えなかった観測は記録 (first_seen / reset_at = 確立済みの deadline) を消さず、免除もしない
+    (消すと次に読めたとき同じ通知から新しい deadline が付き、免除が延びる — t018 / P1)。"""
+    return isinstance(screen, str) and bool(screen.strip())
+
+
 def observe(previous: Optional[dict], screen, now: Optional[float] = None) -> Optional[dict]:
     """1 回の観測を、Worker ごとの記録 (`entry`) に畳む。利用枠切れでなければ None。
 

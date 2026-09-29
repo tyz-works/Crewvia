@@ -517,15 +517,40 @@ Director に**1 回**通知する (`usage-limit-overdue_<name>`)。永久に黙�
 | `lib_pane_process` (裏の job) | プロセス木の判定 | 不処置: 枠切れの画面はプロセスと無関係。B1 の判定が先に働くときは従来どおり |
 | codex-review の枠切れ (`You've hit your usage limit ... try again at`) | Kai-codex の別の枠 | 不処置: 画面ではなく kai-spawn の log に出る別経路 (memory の手当て: 時刻まで待って reset)。この task の範囲外 |
 
+### 「読めない / 書けない / 消せない」の各経路 (t018 / Codex 2 巡目)
+
+観測・保存の失敗が「免除が上限なく続く」か「通知が永久に出ない」に倒れる族。C2 が足したコード全体を洗った。
+`Mux.capture()` は失敗を**空文字列**で返すので、「空」は「利用枠切れではない」ではなく「見えなかった」。
+その区別は `lib_usage_limit.observable()` の 1 か所 (dispatcher と watchdog が共有)。
+
+| 経路 | 失敗したとき | 向き | 上限を越える免除 | 通知が永久に出ない |
+|---|---|---|---|---|
+| watchdog: capture の例外 / 空 | 免除しない・その間を max から除かない。entry (確立済みの deadline) は**保つ** | 通常の idle / max | 無い | 無い |
+| watchdog: 読めた画面に通知行が無い | entry を捨てる (回復) | 通常の判定 | 無い | 無い |
+| watchdog: 上限超え | 免除しない + Director に 1 回 (fp = 通知行 + first_seen) | 通常の判定 | 無い | 無い (first_seen が変われば別 fp) |
+| dispatcher: capture の例外 / 空 | 記録も台帳も触らない・免除しない | 通常の Rule 5 | 無い | 無い |
+| dispatcher: 記録が読めない | prev=None で作り直して保存 (保存できなければ次行) | 保存成功なら次サイクルから保つ | 1 回だけ deadline が付く (壊れた記録の上書き) | 無い |
+| dispatcher: 記録を書けない | 免除しない (`_save_usage_limit` が False → `handle_usage_limit` が False) | 通常の Rule 5 | 無い (タイマーを保てない間は免除自体が無い) | 無い |
+| dispatcher: 記録を消せない (回復時) | 台帳キーを先に消し、記録は残す → 次サイクルでやり直し | 記録が残る | 無い (記録の deadline は保たれる) | 無い (fp が first_seen を含むので、キーが残っても別の枠切れは通知) |
+| dispatcher: 台帳キーを消せない (ロック / 台帳が読めない) | `clear_told_key` が False → 記録も消さない | やり直し | 無い | 無い (同上) |
+| dispatcher: 台帳に書けない (通知が記録されない) | `notify_state_once` のスロットルが直後の重複を止める | 次サイクルで再送 | 無い | 無い (送れるまで再送) |
+
+残る 2 件 (許容・どちらも有界): (a) 記録が**壊れている**と読み直せず、その 1 回だけ新しい first_seen で
+作り直して上書きする (以後は保たれる。壊れたまま毎サイクル読めないなら保存も失敗し、上の「書けない」行で
+通常の Rule 5 に戻る)。壊れた記録で通知を繰り返さない (`test_a_corrupt_record_does_not_make_the_notice_repeat`)
+ことを優先した。(b) 見えなかった観測が長く続いた後、同じ通知行の**本当に新しい**利用枠切れが来ても、前の
+entry (過ぎた deadline) を引き継ぐので免除されず通常の Rule 5 が出る。**通知が多く出る側**に倒れるだけで、
+免除が延びる側ではない。
+
 ### 戻し方
 
 PR を revert → `scripts/sync-main-checkout.sh` (主 checkout を ff し dispatcher / watchdog を restart)。
 `registry/mux/<name>.usage-limit.json` と台帳の `usage-limit*` は**消してよい** (無い = 新しい利用枠切れとして
-1 回だけ通知し直す)。記録が壊れていても通知は台帳 (通知行の同一性) が 1 回に止める。
+1 回だけ通知し直す)。記録が壊れていても通知は台帳 (通知行 + 見え始め) が 1 回に止める。
 env 停止スイッチは付けていない (dispatcher と watchdog で答えが割れるため)。
 
 ### 検証
 
-`tests/test_usage_limit.py` (61 件: 同定の表・dispatcher 1 サイクル・watchdog の模擬時計)。
+`tests/test_usage_limit.py` (69 件: 同定の表・dispatcher 1 サイクル・watchdog の模擬時計・観測/保存の失敗)。
 赤の実証: `tests/red_proof_c2_usage_limit.sh` (修正前の dispatcher.sh / watchdog.py に戻すと
-(1)〜(3) が赤、加えて同定・上限・床・上限外しの欠陥注入 8 件が赤)。
+(1)〜(3) が赤、加えて同定・上限・床・上限外し・空 capture・保存失敗・台帳キーの欠陥注入 13 件が赤)。

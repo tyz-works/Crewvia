@@ -659,6 +659,12 @@ class WorkerMonitor:
                 screen = _mux.capture(name)
             except Exception:
                 screen = ""
+        if not lib_usage_limit.observable(screen):
+            # 見えなかった観測 (capture の失敗は空文字列で返る): 免除しない・その間を max から除かない。
+            # 確立済みの entry (deadline) は保つ — 消すと次に読めたとき同じ通知から新しい deadline が
+            # 付き、免除が延びる (t018 / P1)。
+            self._limit_excused_at = None
+            return False
         entry = lib_usage_limit.observe(self._limit_entry, screen, now)
         self._limit_entry = entry
         if entry is None:

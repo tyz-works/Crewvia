@@ -18,6 +18,7 @@ tests/trust_fixture.sh | テストではない（source される lib。トッ�
 # --- (ii) 1 回限りの historical red proof ---
 tests/red_proof_b1_background_work.sh | 1 回限りの historical red proof（CI 化しない）
 tests/red_proof_b6_trust_precheck.sh | 1 回限りの historical red proof（CI 化しない）
+tests/red_proof_c2_usage_limit.sh | 1 回限りの historical red proof（CI 化しない）
 tests/red_proof_stat_and_direct_reads.sh | 1 回限りの historical red proof（CI 化しない）
 tests/red_proof_t001_needs_director.sh | 1 回限りの historical red proof（CI 化しない）
 tests/red_proof_t001_pytest_workspace.sh | 1 回限りの historical red proof（CI 化しない）

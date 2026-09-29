@@ -251,6 +251,7 @@ DAEMON_RESTART_FILES = {
         "scripts/lib_retirement.py",
         "scripts/lib_mux.py",
         "scripts/lib_pane_process.py",
+        "scripts/lib_usage_limit.py",
         "scripts/lib_task_cards.py",
         "scripts/lib_daemon_state.py",
     ),

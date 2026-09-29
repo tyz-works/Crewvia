@@ -45,6 +45,8 @@ sys.path.insert(0, str(_SCRIPTS_DIR))
 from lib_mux import Mux, repo_identity_ok  # noqa: E402
 import lib_retirement  # noqa: E402
 import lib_daemon_watch  # noqa: E402
+# 「利用枠切れ」の画面の同定 (C2 / t005)。dispatcher の Rule 5 と共有する 1 か所の定義。
+import lib_usage_limit  # noqa: E402
 from lib_pane_process import (  # noqa: E402,F401
     ProcessSignal, classify_process_tree,
 )
@@ -296,6 +298,19 @@ class WorkerMonitor:
         #: 片方が読めなくなったときに、もう片方の「読めるようになった」が
         #: 状態変化を食い潰して行が出なくなるのを避けるため。
         self._signals_observable: bool = True
+
+        #: C2 (t005): 利用枠切れの観測。`lib_usage_limit.observe()` の entry (同じ通知行の間は
+        #: first_seen / reset_at を保つ)、直近に「免除中」と観測した時刻、max から除く累計。
+        #: **メモリだけ**に持つ: この monitor は started_at も object の生成時刻なので、
+        #: watchdog の再起動で max の時計ごと作り直される (同じ寿命)。
+        self._limit_entry: Optional[dict] = None
+        self._limit_excused_at: Optional[float] = None
+        self._limit_excluded: float = 0.0
+        #: 最後に「免除中」と観測した時刻 (消えない)。idle の時計の床 — 免除が終わった後も、
+        #: 止まっていた沈黙ではなくここから数える。
+        self._limit_floor: Optional[float] = None
+        #: 上限を過ぎてもなお利用枠切れの表示が続いている (通常の判定に戻した) ときの通知用 fp
+        self._limit_overdue_fp: Optional[str] = None
 
     # ------------------------------------------------------------------
     # Signal detection helpers
@@ -621,6 +636,61 @@ class WorkerMonitor:
         return real_mtime is None or real_mtime <= notif_mtime
 
     # ------------------------------------------------------------------
+    # 利用枠切れ (C2 / t005)
+    # ------------------------------------------------------------------
+
+    #: 1 回の観測で max から除いてよい最大の長さ。watchdog が止まっていた・mux が読めなかった
+    #: 間を「利用枠切れだった」と主張しない (観測できなかった時間は通常どおり数える側)。
+    LIMIT_EXCLUDE_MAX_STEP = 300.0
+
+    def _observe_usage_limit(self, now: float) -> bool:
+        """今この Worker が「利用枠切れで免除中」なら True。
+
+        免除中のあいだ、(a) idle による終了はしない (b) max の経過時間から、免除して観測した
+        時間を除く。**判定の向き**: 画面が読めない・同定できない・窓が無い → False (= 従来どおり
+        idle / max で判定)。免除には上限があり (`lib_usage_limit.excuse_deadline`)、それを過ぎても
+        表示が続くなら False に戻して Director に 1 回通知する (`usage_limit_overdue_fp`)。
+        永久に殺さない・永久に黙る経路を作らない。
+        """
+        screen = ""
+        name = self._mux_window_name()
+        if name:
+            try:
+                screen = _mux.capture(name)
+            except Exception:
+                screen = ""
+        entry = lib_usage_limit.observe(self._limit_entry, screen, now)
+        self._limit_entry = entry
+        if entry is None:
+            self._limit_excused_at = None
+            self._limit_overdue_fp = None
+            return False
+        if now > lib_usage_limit.excuse_deadline(entry):
+            self._limit_excused_at = None
+            self._limit_overdue_fp = (
+                f"{lib_usage_limit.identity(entry['notice'])}@{int(entry['first_seen'])}")
+            return False
+        self._limit_overdue_fp = None
+        if self._limit_excused_at is not None:
+            self._limit_excluded += min(max(now - self._limit_excused_at, 0.0),
+                                        self.LIMIT_EXCLUDE_MAX_STEP)
+        self._limit_excused_at = now
+        self._limit_floor = now
+        return True
+
+    def usage_limit_overdue_message(self) -> Optional[str]:
+        """免除の上限を過ぎてなお利用枠切れなら Director への通知文、そうでなければ None。"""
+        if self._limit_overdue_fp is None or self._limit_entry is None:
+            return None
+        return (f"[watchdog] Worker {self.agent_name} (task {self.task_id}) は利用枠切れの表示の"
+                f"まま、リセット予定 ({lib_usage_limit.format_reset(self._limit_entry)}) + "
+                f"猶予を過ぎました。通常の idle / max 判定に戻します。枠が戻っているのに"
+                f"動かない Worker です (再開を促すか、task を戻してください)。")
+
+    def usage_limit_overdue_fp(self) -> Optional[str]:
+        return self._limit_overdue_fp
+
+    # ------------------------------------------------------------------
     # Core check
     # ------------------------------------------------------------------
 
@@ -644,14 +714,23 @@ class WorkerMonitor:
         判断が付かないケース (process_signal == "unknown") も殺さない側に倒す。
         """
         now = time.time()
-        idle_seconds = now - self._last_activity_mtime()
+        # C2 (t005): 利用枠切れの免除。先に観測して、idle の時計と max の経過時間へ反映する。
+        limit_excused = self._observe_usage_limit(now)
+        activity_mtime = self._last_activity_mtime()
+        if self._limit_floor is not None:
+            # 免除中に止まっていた沈黙は idle ではない。免除が終わった (表示が消えた) 後も、
+            # 最後に免除した瞬間から数える — リセット後に再開する Worker が、止まっていた
+            # 時間で即 hard_idle にならないように。
+            activity_mtime = max(activity_mtime, self._limit_floor)
+        idle_seconds = now - activity_mtime
 
         # 1. 絶対上限チェック
         #    idle とは独立した天井。プロセス層では抑制しない — 長時間 task は
         #    task frontmatter の timeout.max で明示的に引き上げる運用のままにする
         #    (knowledge/daemon-authority.md §4-3 で started_at の起点見直しは
         #    backlog 送りと決まっている)。
-        if now - self.started_at > self.max_threshold:
+        #    C2 (t005): 利用枠切れで止まっていた時間 (免除して観測した分) は数えない。
+        if now - self.started_at - self._limit_excluded > self.max_threshold:
             return CheckResult("terminate", "max_exceeded", idle_seconds, "not_probed", False)
 
         # 2. mux 窓の生存チェック
@@ -661,6 +740,10 @@ class WorkerMonitor:
         # 3. idle 判定 (常に評価する)
         process_signal = self._process_signal()
         awaiting_human = self._awaiting_human()
+
+        if limit_excused:
+            # 利用枠切れ: 止まっているのは Worker の不調ではない。idle では終了しない。
+            return CheckResult("alive", "usage_limit", idle_seconds, process_signal, awaiting_human)
 
         if idle_seconds > self.idle_threshold * 2:
             # プロセス層が terminate を抑制するケース。理由をログで区別できるよう
@@ -1245,6 +1328,7 @@ def run(repo_root: Path, interval: int) -> None:
     # ログを書かず、その非 alive が一度も起きなかったため判定が 1 行も残って
     # いなかった。
     verdict_logger = VerdictLogger()
+    usage_notify_once = make_notify_once(repo_root)
 
     # t016: log which mux backend got selected at startup. A silent
     # misconfiguration here (e.g. config/crewvia.yaml `mode:` failing to
@@ -1430,6 +1514,14 @@ def run(repo_root: Path, interval: int) -> None:
                 # 独立した記録経路。この呼び出しを削除しても以下の判定ロジックは
                 # 完全に同一に動作する。
                 _log_observation(monitor, status, detail)
+
+                # C2 (t005): 免除の上限を過ぎてもなお利用枠切れの表示が続く Worker は、
+                # 通常の判定に戻した上で Director に 1 回だけ知らせる (台帳で重複を止める)。
+                overdue_msg = monitor.usage_limit_overdue_message()
+                if overdue_msg:
+                    usage_notify_once(
+                        f"usage-limit-overdue_{agent}", monitor.usage_limit_overdue_fp(),
+                        "usage-limit", "_daemon", agent, overdue_msg)
 
                 if status == "alive":
                     pass  # healthy — no action

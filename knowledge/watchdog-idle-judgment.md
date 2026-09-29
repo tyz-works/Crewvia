@@ -455,3 +455,77 @@ registry/mux が壊れている等でこのタイマーを**確実に保てな�
   実害に置き換えた。
 - `tests/red_proof_b1_background_work.sh` に case S (P1) / T・U (P2) を追加。全 21 件
   (baseline 含む) PASS。
+
+
+## 10. 利用枠切れを idle / max と別の状態にする (C2 / t005, 2026-09-30)
+
+### 起きたこと (2026-09-27 夜)
+
+Worker の画面が `⚠ Usage limit reached · continuing automatically at 6pm` で止まったのを、
+Rule 5 も watchdog も普通の idle と読んだ。Rule 5 は 5 分おきに 5 人分発火して **2 時間で約 80 通**、
+watchdog は idle×2 で Worker を終了させ、残った Worker も**リセット後に自動では再開せず**、
+Haruto は止まっていた時間も max に数えられて t070 の途中で kill された。枠はアカウント単位なので
+起動し直しても回復しない (memory `five-hour-limit-is-per-session` の 09-28 訂正)。
+
+### 仕組み (定義は `scripts/lib_usage_limit.py` の 1 か所)
+
+* **同定は位置と構造に束縛する** (文言の部分一致にしない — B6 の族 B と同じ轍を踏まない):
+  (1) 通知行が**行頭の `⚠`** (ツール出力は `⎿` の下にインデント、`⏺` / `❯` 始まりは呼び出し・入力の写し)
+  (2) 画面末尾側 (空行を除く最後の 14 行) (3) 直下 3 行以内に**入力欄の枠** (`╭──…` / `────…`)。
+  パス・出力・引用・`cat` の中身・スクロールで上に流れた古い通知は、どれも外れる。
+  ※ 実物の画面の記録がリポジトリに無かったため、fixture は Claude Code の画面の構造から組んだ。
+  実物と形が違えば `detect()` の 3 条件を直す (テストの `_negatives()` が陰性の表)。
+* **リセット時刻**は通知行から読む (`at 6pm` / `at 11:16 PM` / `at 18:00` / `+1h57m`)。読めなければ「時刻不明」。
+  「次に来るその時刻」は**見た瞬間**に計算して記録 (`observe()`) し、同じ通知行が続く間は保つ —
+  リセットを過ぎても画面の `at 6pm` は残るので、毎回計算し直すと 18:05 に「明日の 18:00」に化ける。
+  残り時間の表示 (`+1h57m`) は毎分変わるので、同じ通知かの照合 (`identity()`) からは外す。
+* **dispatcher (Rule 5)** `handle_usage_limit()`: idle / done / blocked の Worker (割り当てあり) の画面を
+  capture し、利用枠切れなら idle-with-task を**出さない**。代わりに (1) Director に**1 回だけ**
+  「利用枠切れ (リセット予定 <時刻|不明>)」 (2) リセット予定 + 120 秒で Worker に**1 回だけ**再開を促す
+  (時刻不明は見え始め + 5 時間 5 分) (3) 促して 5 分経ってもなお続くなら Director に**1 回だけ**再通知。
+  通知は台帳 `notified-state.json` の作法 (`notify_state_once`、key `usage-limit_<name>` /
+  `usage-limit-still_<name>`、fp = 通知行の同一性)。**台帳の slug は `_daemon`** (mission の slug だと
+  `prune_told()` が毎サイクル捨てて再通知になる)。解消 (表示が消えた) したら記録も台帳も畳む。
+  記録: `registry/mux/<name>.usage-limit.json` (`first_seen` / `notice` / `reset_at` / `resumed_at`)。
+* **watchdog** `WorkerMonitor._observe_usage_limit()`: 免除中は (a) idle で終了しない
+  (`alive` / reason=`usage_limit`) (b) **max の経過時間から、免除して観測した時間を除く**。
+  免除が終わった後も idle は**最後に免除した瞬間から**数える (止まっていた沈黙で、リセット後に
+  再開する Worker が即 hard idle にならない)。1 回の観測で除ける長さは 300 秒まで
+  (watchdog が止まっていた・mux が読めなかった空白を「利用枠切れだった」と主張しない)。
+  累計はメモリだけ — monitor の `started_at` も object の生成時刻なので、再起動で max の時計ごと
+  作り直される (同じ寿命)。
+
+### 判定の向き (fail-direction)
+
+画面が読めない・空・構造が合わない・窓が無い → **常に「利用枠切れではない」** (= 今までと同じ挙動:
+Rule 5 は通知し、watchdog は idle / max で判定する)。誤検知しても、免除には**必ず上限**がある:
+`lib_usage_limit.excuse_deadline()` = リセット予定 + 1 時間 (時刻不明は見え始め + 6 時間)。
+上限を過ぎてもなお表示が続くなら、Rule 5 は通常判定に戻り、watchdog も通常の idle / max に戻して
+Director に**1 回**通知する (`usage-limit-overdue_<name>`)。永久に黙る・永久に殺さない経路は無い。
+(判定ごとに向きが違う: 「殺す」判定は殺さない側、「通知を止める」判定は通知する側。この判定は
+両方に効くので、上限で必ず元の判定に戻す形にした。)
+
+### 族ごとの掃除 (「Worker が止まって見える」を扱う全経路)
+
+| 経路 | 利用枠切れの扱い | 処置 |
+|---|---|---|
+| dispatcher Rule 5 A/B (`check_rule5`) | idle-with-task / blocked を通知 | **処置**: `handle_usage_limit()` で別扱い |
+| watchdog idle (soft / hard) | warn / terminate | **処置**: 免除 + idle の床 |
+| watchdog max (`max_exceeded`) | 止まっていた時間も数える | **処置**: 免除して観測した時間を除く |
+| dispatcher `shutdown_idle_workers` / Rule 2 blocked-stuck / no-task shutdown | 対象は**割り当てのない** idle Worker | 不処置: task を持たない Worker を退役させるだけで、枠切れの task を失わない (枠は起動し直しても戻らないが、割り当ても無いので害が無い) |
+| dispatcher spawn grace / worker-vanish | pane の有無の判定 | 不処置: 画面の内容を見ない |
+| `lib_pane_process` (裏の job) | プロセス木の判定 | 不処置: 枠切れの画面はプロセスと無関係。B1 の判定が先に働くときは従来どおり |
+| codex-review の枠切れ (`You've hit your usage limit ... try again at`) | Kai-codex の別の枠 | 不処置: 画面ではなく kai-spawn の log に出る別経路 (memory の手当て: 時刻まで待って reset)。この task の範囲外 |
+
+### 戻し方
+
+PR を revert → `scripts/sync-main-checkout.sh` (主 checkout を ff し dispatcher / watchdog を restart)。
+`registry/mux/<name>.usage-limit.json` と台帳の `usage-limit*` は**消してよい** (無い = 新しい利用枠切れとして
+1 回だけ通知し直す)。記録が壊れていても通知は台帳 (通知行の同一性) が 1 回に止める。
+env 停止スイッチは付けていない (dispatcher と watchdog で答えが割れるため)。
+
+### 検証
+
+`tests/test_usage_limit.py` (61 件: 同定の表・dispatcher 1 サイクル・watchdog の模擬時計)。
+赤の実証: `tests/red_proof_c2_usage_limit.sh` (修正前の dispatcher.sh / watchdog.py に戻すと
+(1)〜(3) が赤、加えて同定・上限・床・上限外しの欠陥注入 8 件が赤)。

@@ -1245,6 +1245,23 @@ def task_graph_placeholder(slugs):
     }
 
 
+#: mission slug 先頭の日付 (`YYYYMMDD-`) を落として短いタブ名にする。
+_TASK_GRAPH_SLUG_DATE_RE = re.compile(r'^\d{8}-')
+
+
+def task_graph_group_title(slug):
+    """`groups[].title` に出す表示名 (herdr-task-graph 0.4.0 のタブ列)。
+
+    mission.yaml の `title` は日本語の説明文 (例:
+    「herdr-task-graph をミッションごとのページに分けて切り替える」) で、
+    タブ幅に収まらない。機械的な要約は当てにならないので、確実に短く済む
+    slug 由来にした —— 先頭の日付を落とすだけで `20260929-task-graph-pages`
+    は `task-graph-pages` になる。日付が無い slug、日付だけの slug はそのまま
+    (空にはしない)。
+    """
+    return _TASK_GRAPH_SLUG_DATE_RE.sub('', slug) or slug
+
+
 #: id が使えなかった node に振り直す id の土台。実 id は `<slug>:<tNNN>` なので、
 #: この形と衝突することはない。
 TASK_GRAPH_UNUSABLE_ID = 'crewvia:id-unusable'
@@ -1405,6 +1422,14 @@ def build_task_graph(state):
         if s and s not in slugs:
             slugs.append(s)
     nodes = []
+    # groups[].id と順番だけをここで確定する。0 件の mission を除くのは、その
+    # mission が実際に 1 node も出さなかった (下の mission_nodes が空だった)
+    # ときだけ —— enforce_task_graph_contract() は node を減らさないので
+    # (循環は辺を切るだけ、id 重複は振り直すだけ)、この判定はゲート通過後の
+    # 結果とも一致する。唯一の例外は「全 mission 合わせて 0 node」で、その
+    # ときはプレースホルダ 1 件だけが出て、どの mission にも属さない —— ここで
+    # 数えた populated_slugs も同じ結論 (空) になる。
+    populated_slugs = []
     for slug in slugs:
         if not os.path.isdir(mission_dir(slug)):
             continue
@@ -1483,6 +1508,8 @@ def build_task_graph(state):
                     node['pane_id'] = pane_id
             mission_nodes.append(node)
 
+        if mission_nodes:
+            populated_slugs.append(slug)
         nodes.extend(mission_nodes)
 
     nodes = enforce_task_graph_contract(nodes, slugs)
@@ -1491,7 +1518,9 @@ def build_task_graph(state):
         title = f'crewvia / {slugs[0]}'
     else:
         title = f'crewvia / {len(slugs)} missions'
-    return {'title': title, 'tasks': nodes}
+    groups = [{'id': slug, 'title': task_graph_group_title(slug)}
+              for slug in populated_slugs]
+    return {'title': title, 'tasks': nodes, 'groups': groups}
 
 
 #: publish の直列化ロックを待つ上限 (秒)。付加機能が本体を止めないための上限で

@@ -846,6 +846,31 @@ def test_the_mirror_rejects_a_non_string_group():
     assert "group must be a string" in _reject_reason({"tasks": [dict(node, group=1)]})
 
 
+def test_top_level_groups_does_not_make_an_older_plugin_reject_the_file(sandbox):
+    """最上位に足した `groups` (herdr-task-graph 0.4.0) を、未対応の plugin
+    (0.3.0 以前) が拒否しないこと。
+
+    0.3.0 の `load_config` は最上位で `tasks` と `title` しか見ない —— `groups`
+    は未知の欄としてそのまま無視される。写し (`_reject_reason`) はそもそも
+    `tasks` 以外の最上位キーを読まないので、この主張の根拠は「未知だから
+    無視される」ではなく **構造として tasks 以外を見ない** ことそのもの。
+    手元に古い版の実物があれば (`CREWVIA_TASK_GRAPH_OLD_PLUGINS`) それにも
+    読ませる。
+    """
+    sandbox.add_task("t001", "pending", [])
+    assert sandbox.run("task-graph").returncode == 0
+    graph = assert_plugin_accepts(sandbox)
+    assert graph["groups"] == [{"id": MISSION, "title": MISSION}]
+
+    for old_plugin in OLD_PLUGINS:
+        assert old_plugin.exists(), f"CREWVIA_TASK_GRAPH_OLD_PLUGINS の {old_plugin} が無い"
+        r = run_plugin(sandbox.graph, old_plugin)
+        assert r.returncode == 0, (
+            f"{old_plugin.parent.name} が groups 付きのファイルを拒否した: {r.stderr.strip()[:400]}"
+        )
+        assert "Traceback" not in r.stderr, r.stderr[:400]
+
+
 @requires_plugin
 def test_the_real_plugin_shows_the_mission_slug_of_each_task(sandbox):
     """本物の plugin (0.3.0 以上) の画面に、同じ tNNN の mission が区別して出ること。"""

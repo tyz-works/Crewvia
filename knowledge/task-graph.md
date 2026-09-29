@@ -26,6 +26,17 @@ crewvia の queue を herdr plugin `tyz-works/herdr-task-graph`
 **0.3.0 でも残る**（§8 の観察）: config dir に entry が**無い**とサンプル（§4-2）/ agent 名は `claude`
 （Worker 名は出ない）/ 幅 200 でタイトルが短い / `open-task-graph` がタブを増やす（§9）。
 
+### 0-1. 0.4.0: mission ごとのページ切り替え（t001）と `groups` 欄（t004）
+
+plugin 0.4.0 は task の `group`（= mission slug）ごとに画面をページへ分け、タブのように切り替える。
+crewvia 側は生成物の最上位に `groups: [{"id": "<mission slug>", "title": "<表示名>"}]` を足しただけ
+（t004。並びは `queue/state.yaml` の `active_missions` の順、`title` は slug 先頭の日付
+`YYYYMMDD-` を落としたもの — mission.yaml の `title` は日本語の説明文でタブ幅に収まらないため
+採らなかった。task が 0 件の mission は載せない）。**必要な最低 version は §0 のとおり 0.3.0 の
+まま** —— `groups` はページ切り替えを使うときだけ要る欄で、0.3.0 以前は未知の最上位キーとして
+無視するだけなので (`load_config` は `tasks` と `title` しか見ない)、生成物は 0.3.0 でも壊れない
+(`tests/test_task_graph_plugin_contract.py::test_top_level_groups_does_not_make_an_older_plugin_reject_the_file`)。
+
 ---
 
 ## 1. 導入方式: config dir への symlink を推奨する

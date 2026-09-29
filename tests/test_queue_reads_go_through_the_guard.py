@@ -413,6 +413,12 @@ ALLOWED_DIRECT_READS = {
         "旧 logs/ の残骸に 1 行ポインタを残すだけの移行コード。"
         "失敗しても watchdog の判定には一切入らない",
 
+    # -- 呼び出し元の標準入力 (C1) -------------------------------------------
+    ("plan.sh", "read_body_arg", "os.fdopen(os.dup(3), 'rb')"):
+        "`--result-file -` の本文。bash が起動前に呼び出し元の stdin を fd 3 に退避したもので、"
+        "queue / registry のファイルではない (パスを開いていない)。ファイルの場合は "
+        "read_regular_text_or_unreadable を通す",
+
     # -- 意図的な 1 つの例外 (knowledge/empty-vs-unobservable.md §4) --------
     ("plan.sh", "load_state", "open(STATE_FILE)"):
         "tests/test_retirement.py の _pull_parked_inside_the_queue_lock() が、"
@@ -1190,9 +1196,11 @@ def test_the_one_deliberate_exception_is_still_the_only_one():
 
     # 例外が **1 つだけ** であることは、機械検出の allowlist のうち
     # 「crewvia のファイルを、意図的にガードの外で読む」行を数えて示す。
+    # `read_body_arg` (C1) は呼び出し元の標準入力 (fd 3) を読むだけで、crewvia のファイルではない。
+    # 数えるのは「queue / registry を、意図的にガードの外で読む」行だけ。
     deliberate = [
         key for key in ALLOWED_DIRECT_READS
-        if key[0] == "plan.sh"
+        if key[0] == "plan.sh" and key[1] != "read_body_arg"
     ]
     assert deliberate == [("plan.sh", "load_state", "open(STATE_FILE)")], (
         "queue のファイルをガードの外で読む例外が 1 つではなくなっている:\n"

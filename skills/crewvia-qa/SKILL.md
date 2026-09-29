@@ -147,7 +147,7 @@ kill $DEV_PID 2>/dev/null || true
 
 ## Step 8: 結果レポート
 
-`plan.sh done` に渡す結果サマリーのフォーマット：
+`plan.sh done` に渡す結果サマリーのフォーマット（`--result-file <path>` か `--result-file -` + クォート付きヒアドキュメントで渡す。二重引用符の位置引数はバッククォート / `$(...)` がシェルに実行される）：
 
 ```
 QA結果: [対象: <タスクタイトル>]
@@ -206,7 +206,9 @@ checkpoint: <チェックポイント名> | required: yes | result: failed   | n
 `plan.sh needs-director` で Director に差し戻すこと:
 
 ```bash
-${CREWVIA_REPO_ROOT}/scripts/plan.sh needs-director "$TASK_ID" "詰まった理由" --mission "$TASK_MISSION"
+${CREWVIA_REPO_ROOT}/scripts/plan.sh needs-director "$TASK_ID" --mission "$TASK_MISSION" --result-file - <<'RESULT_EOF'
+詰まった理由
+RESULT_EOF
 ```
 
 これは「代替検証して done を無理やり呼ぶ」よりも **常に正しく、安い選択肢** である。

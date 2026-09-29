@@ -25,7 +25,8 @@ set -euo pipefail
 #                              --skills 省略時は環境変数 SKILLS → registry の Worker の skills の順。
 #                              どれも無ければ拒否 (skill の絞り込みを丸ごと無効にしない)。
 #                              Director (registry の role: director) は pull できない
-#   plan.sh done <task_id> "<result>" [--mission <slug>] (--pr <N> | --no-pr "<理由>")
+#   plan.sh done <task_id> ("<result>" | --result-file <path|->) [--mission <slug>] (--pr <N> | --no-pr "<理由>")
+#                              Result は --result-file <path|-> で (位置引数の "…" はバッククォート/$(...) をシェルが実行する。C1)
 #                              deliverable: pr の task は --pr か --no-pr が必須 (無いと拒否。exit 2・何も書かない)
 #                              --pr <N>: この task の PR 番号。blocked_by を逆にたどった下流のうち、
 #                              deliverable が pr でない (file / none と明示宣言された) task だけを
@@ -327,6 +328,13 @@ _dashboard_task_detail() {
 if [[ "$SUBCOMMAND" == "dashboard" ]]; then
   _plan_dashboard "$@"
   exit $?
+fi
+
+# 呼び出し元の stdin を fd 3 に退避する。python 本体はこの下のヒアドキュメント (= fd 0) から
+# 読まれるので、`--result-file -` が読む「呼び出し元の標準入力」は fd 0 では取れない (C1)。
+# stdin が閉じられていても起動は止めない (その場合 `--result-file -` だけが拒否される)。
+if ! { exec 3<&0; } 2>/dev/null; then
+  exec 3</dev/null
 fi
 
 # Delegate to Python3
@@ -2575,9 +2583,9 @@ USAGE = {
             '                     [--pr-number <N>] [--deliverable pr|file|none]'),
     'pull': ('plan.sh pull [--mission <slug>] [--skills <csv>] [--agent <name>]\n'
              '                    [--target-dir <path>] [--task <task_id>]'),
-    'done': ('plan.sh done <task_id> "<result>" [--mission <slug>] [--pr <N>]\n'
+    'done': ('plan.sh done <task_id> ("<result>" | --result-file <path|->) [--mission <slug>] [--pr <N>]\n'
              '                    [--no-pr "<理由>"]   (--pr / --no-pr は codex-review が待っているとき・deliverable: pr の task で必須)'),
-    'needs-director': 'plan.sh needs-director <task_id> "<理由>" [--mission <slug>]',
+    'needs-director': 'plan.sh needs-director <task_id> ("<理由>" | --result-file <path|->) [--mission <slug>]',
     'fail': ('plan.sh fail <task_id> [<handoff_path>] (--head <sha> | --no-head "<理由>")\n'
              '                     [--mission <slug>]'),
     'update': ('plan.sh update <task_id> [--mission <slug>] [--skills <csv>] [--blocked-by <csv>]\n'
@@ -2591,7 +2599,7 @@ USAGE = {
     'reap-orphan-assignment': 'plan.sh reap-orphan-assignment <agent> [--no-wait]',
     'ready-for-verification': 'plan.sh ready-for-verification <task_id> [--mission <slug>]',
     'verify-result': ('plan.sh verify-result <task_id> <pass|fail|needs_human_review>\n'
-                      '                            [--mission <slug>] [--notes "<text>"]'),
+                      '                            [--mission <slug>] [--notes "<text>" | --notes-file <path|->]'),
     'review': 'plan.sh review <mission_slug>',
     'launch': 'plan.sh launch <mission_slug>',
     'task-graph': 'plan.sh task-graph',
@@ -2608,8 +2616,8 @@ USAGE = {
 #: 引数が紛れた事故 — どちらも余った・取り違えた positional を黙って受けたのが根)。
 #: dispatch テーブルと同じキーを持つこと (tests/test_plan_strict_args.py が突き合わせる)。
 POSITIONAL_ARITY = {
-    'init': (1, 1), 'add': (1, 1), 'pull': (0, 0), 'done': (2, 2),
-    'needs-director': (2, 2), 'fail': (1, 2), 'update': (1, 1), 'release-dep': (1, 1),
+    'init': (1, 1), 'add': (1, 1), 'pull': (0, 0), 'done': (1, 2),
+    'needs-director': (1, 2), 'fail': (1, 2), 'update': (1, 1), 'release-dep': (1, 1),
     'retire': (1, 1), 'reap-orphan-assignment': (1, 1),
     'ready-for-verification': (1, 1), 'verify-result': (2, 2),
     'review': (1, 1), 'launch': (1, 1), 'task-graph': (0, 0), 'lint': (0, 1),
@@ -3688,6 +3696,42 @@ def _gate_terminal_report(kind, meta, report):
 # needs-director command
 # ---------------------------------------------------------------------------
 
+def read_body_arg(opts, file_flag, inline, inline_desc):
+    """Result / 理由 / notes の本文を、位置引数かファイル (`-` = 標準入力) から 1 つ受け取る (C1)。
+
+    二重引用符の位置引数に入れた本文は、plan.sh が起動する**前**にシェルが展開する —— 文中の
+    バッククォートや `$(...)` はコマンド置換で**実行される** (2026-09-28、Result 中の `pgrep` 待ちが
+    実行されて Worker が 12 分止まった)。plan.sh の中では防げないので、展開の起きない経路
+    (ファイル / 標準入力) を用意する。位置引数は後方互換で残す。
+
+    どの失敗も `_usage_exit` (exit 2)。呼び出し側は queue を 1 バイトも書く前にここを通すこと。
+    「読めない」を空の本文に潰さない (`Unreadable` は `.reason` を持つ)。
+    `inline` は位置引数 / `--notes` で渡された本文 (無ければ None)、`inline_desc` はその呼び名。
+    """
+    path = opts.get(file_flag)
+    if path is None:
+        return inline
+    if inline is not None:
+        _usage_exit(f"{file_flag} と {inline_desc} は同時に指定できません")
+    if path == '-':
+        try:
+            with os.fdopen(os.dup(3), 'rb') as f:
+                raw = f.read()
+        except OSError as e:
+            _usage_exit(f"{file_flag} -: 標準入力を読めません ({e})")
+        try:
+            text = raw.decode('utf-8')
+        except UnicodeDecodeError as e:
+            _usage_exit(f"{file_flag} -: 標準入力が UTF-8 ではありません ({e})")
+    else:
+        text = _TASK_CARDS.read_regular_text_or_unreadable(path)
+        if _TASK_CARDS.is_unreadable(text):
+            _usage_exit(f"{file_flag} {path}: 読めません ({text.reason})")
+    if not text.strip():
+        _usage_exit(f"{file_flag} {path}: 本文が空です (空の Result を黙って記録しない)")
+    return text.rstrip('\n')
+
+
 def cmd_needs_director(args):
     """plan.sh needs-director <task_id> "<理由>"
 
@@ -3698,12 +3742,12 @@ def cmd_needs_director(args):
     - AGENT_NAME の assignment (この task を指すもの) を撤去する (done / fail と同じ)。
       card の `worker` は残るので、dispatcher は判断待ちの Worker を「仕事あり」と読む
     """
-    opts, positional = parse_opts(args, {'--mission': 'value'})
-    if len(positional) < 2:
-        die("needs-director requires <task_id> and <reason>\\n"
-            "Usage: plan.sh needs-director <task_id> \"<理由>\"")
+    opts, positional = parse_opts(args, {'--mission': 'value', '--result-file': 'value'})
     task_id = positional[0]
-    reason = positional[1]
+    reason = read_body_arg(opts, '--result-file',
+                           positional[1] if len(positional) > 1 else None, '位置引数の理由')
+    if reason is None:
+        _usage_exit("needs-director requires <task_id> and <reason> (or --result-file <path|->)")
 
     def _do():
         state = load_state()
@@ -3939,11 +3983,13 @@ def codex_reviews_awaiting_pr(slug, task_id):
 
 
 def cmd_done(args):
-    opts, positional = parse_opts(args, {'--mission': 'value', '--pr': 'value', '--no-pr': 'value'})
-    if len(positional) < 2:
-        die("done requires <task_id> and <result>")
+    opts, positional = parse_opts(args, {'--mission': 'value', '--pr': 'value', '--no-pr': 'value',
+                                         '--result-file': 'value'})
     task_id = positional[0]
-    result = positional[1]
+    result = read_body_arg(opts, '--result-file',
+                           positional[1] if len(positional) > 1 else None, '位置引数の Result')
+    if result is None:
+        _usage_exit("done requires <task_id> and <result> (or --result-file <path|->)")
     # --pr は、何かを書き始める前に検証する。
     pr_number = None
     if opts.get('--pr') is not None:
@@ -4534,7 +4580,8 @@ def cmd_verify_result(args):
     fail          → rework_count += 1, status: in_progress (or needs_human_review if max_rework exceeded)
     needs_human_review → status: needs_human_review
     """
-    opts, positional = parse_opts(args, {'--mission': 'value', '--notes': 'value'})
+    opts, positional = parse_opts(args, {'--mission': 'value', '--notes': 'value',
+                                         '--notes-file': 'value'})
     if len(positional) < 2:
         die("verify-result requires <task_id> <verdict>")
     task_id = positional[0]
@@ -4542,7 +4589,7 @@ def cmd_verify_result(args):
     VALID_VERDICTS = {'pass', 'fail', 'needs_human_review'}
     if verdict not in VALID_VERDICTS:
         die(f"verdict must be one of: {', '.join(sorted(VALID_VERDICTS))}")
-    notes = opts.get('--notes', '')
+    notes = read_body_arg(opts, '--notes-file', opts.get('--notes'), '--notes') or ''
 
     def _do():
         state = load_state()

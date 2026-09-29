@@ -13,6 +13,10 @@
 #   scripts/sync-main-checkout.sh              # fetch → ff merge → 必要な restart → status
 #   scripts/sync-main-checkout.sh --dry-run    # 何をするか (どこまで進むか) を表示するだけ
 #   scripts/sync-main-checkout.sh --repo-root <path>   # テスト用。既定はこのスクリプトの repo
+#   scripts/sync-main-checkout.sh --restart-wait-seconds N   # restart 後、新しい世代の heartbeat を
+#                                                            # 待つ上限 (既定 90 秒)
+#   scripts/sync-main-checkout.sh --restart-wait-seconds N   # restart 後に新しい世代の
+#                                                            # heartbeat を待つ上限 (既定 90)
 #
 # 何もしない条件 (exit 非 0、理由を出す):
 #   - fetch に失敗した
@@ -39,6 +43,9 @@
 #   restart の実行                失敗しても WARNING を出すだけ      同じ WARNING に加え
 #                                                                    note_failure() に積む
 #   最後の status                 戻り値を見ない                     戻り値を見て失敗を積む
+#   restart 直後の status         記録上の旧 pid が dead のまま      restart した daemon は新しい世代の
+#                                 表示され失敗に見えた (09-28)      heartbeat を上限つきで待ってから表示。
+#                                                                    上限までに無ければ note_failure() に積む
 #   全体の終了コード              上記が何件あっても exit 0          FAILURES が 1 件でもあれば
 #                                                                    非 0 で終わる (末尾の集計)
 # `git fetch` / `git merge --ff-only` 自体の失敗は元から `fail()` (即 exit 1) で
@@ -48,10 +55,18 @@ set -uo pipefail
 
 DRY_RUN=0
 REPO_ROOT=""
+RESTART_WAIT_SECONDS=90
+RESTARTED=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --dry-run) DRY_RUN=1; shift ;;
     --repo-root) REPO_ROOT="$2"; shift 2 ;;
+    --restart-wait-seconds)
+      if [[ $# -lt 2 || ! "$2" =~ ^[0-9]+$ ]]; then
+        echo "sync-main-checkout.sh: --restart-wait-seconds needs a whole number" >&2
+        exit 2
+      fi
+      RESTART_WAIT_SECONDS="$2"; shift 2 ;;
     -h|--help)
       sed -n '2,30p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
       exit 0
@@ -166,8 +181,16 @@ for name in dispatcher watchdog; do
   case "$v" in
     true)
       say "restart-needed($name) = true -> restart します"
+      # restart 前の heartbeat の同一性と時刻。restart 後、これと違う世代の
+      # heartbeat が記録されるまで status を出さない (下の 5.)。
+      if ! HB_BEFORE="$(python3 "$LIB_DAEMON_WATCH" heartbeat-id "$name" --repo-root "$REPO_ROOT")"; then
+        note_failure "heartbeat-id($name) が失敗しました (restart 後の世代確認ができません)"
+        HB_BEFORE="none"
+      fi
+      RESTART_SINCE="$(date +%s)"
       if python3 "$LIB_DAEMON_WATCH" restart "$name" --repo-root "$REPO_ROOT"; then
         ANY_RESTARTED=1
+        RESTARTED+=("$name|$HB_BEFORE|$RESTART_SINCE")
       else
         note_failure "restart($name) が失敗しました (理由は上に出ています)。手動で確認してください。"
       fi
@@ -185,6 +208,19 @@ for name in dispatcher watchdog; do
 done
 
 # --- 5. 確認 ---
+# restart した daemon は、新しい世代の heartbeat が記録されるまで (上限つき) 待つ。待たずに
+# status を出すと、記録上まだ旧 pid で recorded_instance_alive=False と表示され、失敗に見える
+# (2026-09-28 21:11)。上限までに記録されなければ、明示的に失敗として積む。
+for entry in "${RESTARTED[@]+"${RESTARTED[@]}"}"; do
+  IFS='|' read -r r_name r_before r_since <<< "$entry"
+  say "$r_name: 新しい世代の heartbeat を待っています (上限 ${RESTART_WAIT_SECONDS} 秒) ..."
+  if python3 "$LIB_DAEMON_WATCH" wait-heartbeat "$r_name" --repo-root "$REPO_ROOT" \
+       --before "$r_before" --since "$r_since" --timeout "$RESTART_WAIT_SECONDS"; then
+    :
+  else
+    note_failure "restart($r_name) 後 ${RESTART_WAIT_SECONDS} 秒以内に新しい世代の heartbeat が記録されませんでした (下の status は旧世代の記録を含みうる)"
+  fi
+done
 if [[ "$ANY_RESTARTED" -eq 1 ]]; then
   say "restart 後の状態:"
 fi

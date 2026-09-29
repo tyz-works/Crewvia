@@ -204,8 +204,9 @@ Dispatcher から通知を受け取る:
 ./scripts/plan.sh status --all                        # archive 含めて全件
 
 # タスク完了を記録（Worker 完了報告の受領後に Director が実行）
-./scripts/plan.sh done t002 "実装完了。middleware/auth.ts を追加しルート全件に適用。" \
-  --mission 20260411-auth-refactor
+./scripts/plan.sh done t002 --result-file /path/to/result.md --mission 20260411-auth-refactor
+# Result は --result-file <path> か --result-file - (標準入力 + クォート付きヒアドキュメント) で渡す。
+# 二重引用符の位置引数はバッククォート / $(...) がシェルに実行されるので使わない。
 # → --mission 省略時は active mission を検索。複数 mission に同 ID が存在すると曖昧エラー。
 
 # 完了 mission を archive へ退避
@@ -311,11 +312,11 @@ Write を deny されている skill (review 等) の Worker が「Result セク
 直接編集と解釈し、`cat >> queue/missions/<slug>/tasks/tNNN.md <<'EOF'` の heredoc でハングした
 （42 分間無応答）。**これは Director の指示ミスだった** — `cmd_done` は result を
 `build_task_body` 経由で body に書くだけで frontmatter には触れないため、
-**`plan.sh done <task_id> "<全文>"` に複数行を渡すのは完全に安全**。1 行制約が必要なのは
+**`plan.sh done <task_id> --result-file <path|->` に複数行を渡すのは完全に安全**（二重引用符の位置引数だと本文中のバッククォート / `$(...)` をシェルが実行する — 2026-09-28 の事故 — ので、Result は必ずファイルか標準入力で渡す）。1 行制約が必要なのは
 `plan.sh needs-director` の reason だけ（frontmatter の `needs_director_reason` に直接書かれるため）。
 
 Worker に指示を出す際は:
-- **Result は `plan.sh done` の引数で渡させる**。複数行で構わない
+- **Result は `plan.sh done --result-file <path>`（Write ツールで scratchpad に書く）か `--result-file -`（クォート付きヒアドキュメント `<<'RESULT_EOF'` を標準入力へ）で渡させる**。複数行で構わない。二重引用符の位置引数で渡させない
 - **task ファイル (`queue/missions/**/tasks/tNNN.md`) を Worker 自身に編集させる指示を書かない**
   （Director 自身が qa_checkpoints 等の frontmatter を事前設定する分には問題ない。上記 §3 参照）
 - `hooks/pre-tool-use.sh` に task ファイルへの Bash 経由書き込み (`>` / `>>` / heredoc / `sed -i` /
@@ -421,7 +422,7 @@ Worker がファイルを編集・作成できるかはスキルで決まる。
 
 > ⚠️ `review` / `research` / `verify` / `planning` (❌ deny) の Worker は **ファイルを書く手段が Bash しか無い**。
 > だからといって task ファイルへの直接書き込みを指示しないこと — Result の記録は必ず
-> `plan.sh done <task_id> "<全文>"` に一本化する（§3「Worker への指示で『task ファイルの直接編集』を
+> `plan.sh done <task_id> --result-file <path|->` に一本化する（§3「Worker への指示で『task ファイルの直接編集』を
 > 促さないこと」参照）。
 
 ### 実装タスクの skills 命名パターン
@@ -1049,7 +1050,7 @@ Dispatcher は常に **main 版の `scripts/kai-review.sh`**（$CREWVIA_REPO_ROO
 ### `codex-review` skill task の積み方（通常パス）
 
 `review`（Seo）とは別に、`--skills codex-review --blocked-by <実装 task>` で task を積むだけでよい。
-**PR 番号は手で入れない**: 実装 task を `plan.sh done <id> --pr <N> --mission <slug> "<Result>"` で閉じると、
+**PR 番号は手で入れない**: 実装 task を `plan.sh done <id> --pr <N> --mission <slug> --result-file <path|->` で閉じると、
 その task を `blocked_by` に持つ `codex-review` / `review` の task に `pr_number` が書かれ（未設定のものだけ。
 Result の本文から推測はしない）、`blocked` の codex-review は `pending` に戻る。
 

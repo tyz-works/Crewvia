@@ -63,6 +63,11 @@ lib ごとの**破ってはいけない契約**の要約。理由・経緯・全
   黙る側に壊れる）。cmdline が読めないノードも「消滅」以外は `unknown` に倒す（t082 P1。
   「マーカー無し」に潰すと本物の job が見えなくなり watchdog が誤って terminate しうる）。
   （`knowledge/watchdog-idle-judgment.md` §7-9）。
+- idle Worker の退役 (dispatcher): 残っている task が無い、または skill は合うが TARGET_DIR が合わず取れない
+  task しか無い (`takeable_pending` が空) Worker は no-task と同じく退役させる。TARGET_DIR の記録が
+  無い / 読めない Worker だけは合わないと確定できないので待機（C3 / t009。`knowledge/assignment-routing.md`）。
+- `sync-main-checkout.sh` は restart した daemon の新しい世代の heartbeat を上限つきで待ってから status を出す。
+  上限までに記録されなければ失敗として積む（`lib_daemon_watch.py wait-heartbeat`）。
 - 台帳・拒否記録は**消してよい**（無い = 再通知 / 拒否されていない）。通知が届かない・review が動かないときの
   手当てはそのファイルを消すこと（dispatcher の再起動は不要。`knowledge/notify-once.md`「戻し方」）。
 
@@ -78,6 +83,7 @@ lib ごとの**破ってはいけない契約**の要約。理由・経緯・全
   `add` / `update --blocked-by` は循環を exit 2 で拒否して何も書かない — 循環の定義は
   `lib_dep_rules.find_dependency_cycle()` 1 か所（lint_plan.py と共有。コピーしない）。lint は `deliverable: pr` の
   下流に skills `review` の task が無ければ WARN（`knowledge/plan-input-guards.md`）。
+- Result / 理由 / notes は `--result-file <path|->` / `--notes-file <path|->` で渡す（`done` / `needs-director` / `verify-result`）。二重引用符の位置引数は本文中のバッククォート・`$(...)` を**シェルが plan.sh 起動前に実行する**。`-` は呼び出し元の stdin（bash が fd 3 に退避）。併用・読めない・空・非 UTF-8 は exit 2 で何も書かない。`fail` は本文が無い。`knowledge/plan-sh-result-file.md`。
 - 引数は厳格（未知の option は exit 2 で何も書かない）。`pull` だけ使い方の誤りが exit 1（exit 2 は「タスクなし」）。
 - queue を書き換えるサブコマンドの後、`registry/task-graph/tasks.json` を再生成する（`CREWVIA_TASK_GRAPH=0` で停止）。
 

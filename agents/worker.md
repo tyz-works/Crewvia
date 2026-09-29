@@ -532,12 +532,26 @@ requires_approval に該当 → type: improvement でTaskvia /api/log に投稿�
 
 ### 🚨 Result の記録方法: `plan.sh` 経由のみ (task ファイルの直接編集は禁止)
 
-**Result（完了報告の全文）は必ず `plan.sh done <task_id> "<全文>"` の引数で渡すこと。複数行で構わない。**
+**Result（完了報告の全文）は必ず `plan.sh done` で渡すこと。複数行で構わない。渡し方は下の 2 通りのどちらか（二重引用符の位置引数は使わない）。**
+
+- **`--result-file <path>`**: Write ツールで scratchpad（`/tmp/claude-…/scratchpad`）に Result を書き、`plan done "$TASK_ID" --result-file <path> --mission "$TASK_MISSION"` で渡す。
+- **`--result-file -`（標準入力）**: Write が deny されている skill（`review` / `research` / `verify` / `planning`）や一時ファイルを作りたくないとき。**クォート付きヒアドキュメント**（`<<'RESULT_EOF'`）を標準入力に流す:
+
+  ```bash
+  plan done "$TASK_ID" --result-file - --mission "$TASK_MISSION" <<'RESULT_EOF'
+  Result の全文（バッククォートも $(...) もそのまま書いてよい）
+  RESULT_EOF
+  ```
+
+> ヒアドキュメント形式の注意: 本文に「task ファイルへ書き込むコマンドの文字列」（`cat >> queue/missions/…/tasks/tNNN.md <<'EOF'` など）を**そのまま**書くと、`hooks/pre-tool-use.sh` が Bash コマンド全体を task ファイルの直接書き込みと見なして deny する（位置引数の引用テキストは除外される t019 が、ヒアドキュメントの本文は除外されない）。そういう Result は Write で書いた `--result-file <path>` で渡す。
+
+**なぜ二重引用符の位置引数（`plan done "$TASK_ID" "<全文>"`）を使わないか**: 二重引用符の中のバッククォートと `$(...)` は、plan.sh が起動する**前**にシェルが展開する（コマンド置換）。Result に書いた `pgrep` 待ちのコマンド例が実行されて Worker が 12 分止まった（2026-09-28）。plan.sh の中では防げないので、展開が起きない経路（ファイル / クォート付きヒアドキュメント）を使う。位置引数は後方互換で残っているだけで、`--result-file` と併用すると exit 2 で拒否される（何も書かれない）。ファイルが読めない・空・UTF-8 でない場合も exit 2 で何も書かれない。
+
 `cmd_done` は渡された result を `build_task_body` 経由で **task ファイルの body に書くだけで frontmatter には一切触れない**単純な文字列補間なので、複数行を渡しても安全である。
 
 **`queue/missions/**/tasks/tNNN.md` を自分で直接編集してはいけない。** 特に `cat >> ... <<'EOF'` のような heredoc での追記は、**過去に 2 回、実際に Worker をハングさせている**（review skill の Worker が 42 分間、research skill の Worker が 9 分以上、CPU は回ったまま無応答になった）。この禁止は `hooks/pre-tool-use.sh` の構造的ガードでも強制されており（`queue/missions/**/tasks/*.md` への `>` / `>>` / heredoc / `sed -i` / `tee` は deny され、`plan.sh done` を使うよう促すメッセージが返る）、Bash しか使えない skill（次項）にとっては唯一の正規記録手段でもある。このガードは `plan.sh done` / `gh pr comment` の引数として該当パスを引用しただけの報告コマンドまで deny しないよう、クォート内の引用テキストを判定対象から除外している（t019）。ただし変数展開（`F=queue/missions/.../t001.md; cat >> "$F"`）、`dd of=...`、`python3 -c "open(...).write(...)"`、相対パスの先頭に `queue/missions/` が現れない `cd` 併用形は捕捉できない既知の残存リスク — このガードは最終防波堤であり、`plan.sh done` 経由での記録が一次防御である前提は変わらない。
 
-- **`review` / `research` / `verify` / `planning` skill は要注意**: `config/skill-permissions.yaml` でこれらの skill は `Edit` / `Write` / `MultiEdit` を deny されており、**ファイルを書く手段が Bash しかない**。だからといって heredoc で task ファイルに直接書き込もうとせず、`plan.sh done` の引数として結果を渡すこと。他のファイル（レポート・knowledge 追記等、書き込みが許可された対象）には通常通り Bash 経由での作成も選択肢になるが、task ファイルだけは例外なく `plan.sh` 経由にすること。
+- **`review` / `research` / `verify` / `planning` skill は要注意**: `config/skill-permissions.yaml` でこれらの skill は `Edit` / `Write` / `MultiEdit` を deny されており、**ファイルを書く手段が Bash しかない**。だからといって heredoc で task ファイルに直接書き込もうとせず、`plan.sh done --result-file -`（クォート付きヒアドキュメント）で結果を渡すこと。他のファイル（レポート・knowledge 追記等、書き込みが許可された対象）には通常通り Bash 経由での作成も選択肢になるが、task ファイルだけは例外なく `plan.sh` 経由にすること。
 - **1 行制約があるのは `plan.sh needs-director` の reason だけ**（frontmatter の `needs_director_reason` フィールドに直接書かれるため、改行を含めると task ファイルの frontmatter が壊れミッション全体が停止する）。`plan.sh done` の result にはこの制約は無い。長い説明・複数の見出し・箇条書きを含む Result 全文をそのまま `plan.sh done` に渡してよい。
 
 ### Pre-Done チェックリスト
@@ -605,19 +619,21 @@ Worker はここで手動 bump を呼ばないこと（二重 bump 防止）。
 **ここまで全て完了してから**、タスクを手放す:
 
 ```bash
-plan done "$TASK_ID" "実行した内容と結果の要約" --mission "$TASK_MISSION"
+plan done "$TASK_ID" --result-file "$RESULT_FILE" --mission "$TASK_MISSION"
+# $RESULT_FILE = Write で書いた Result（scratchpad）。Write が使えない skill は
+#   plan done "$TASK_ID" --result-file - --mission "$TASK_MISSION" <<'RESULT_EOF' … RESULT_EOF
 ```
 
 **成果物が PR の task は `--pr <N>` を付け、Result の 1 行目に `PR #<N>` も書く**:
 
 ```bash
-plan done "$TASK_ID" "PR #123 ..." --mission "$TASK_MISSION" --pr 123
+plan done "$TASK_ID" --result-file "$RESULT_FILE" --mission "$TASK_MISSION" --pr 123   # Result の 1 行目: PR #123 ...
 ```
 
 `--pr` は、この task を `blocked_by` に持つ `codex-review` / `review` の task に `pr_number` を書き、
 `blocked` の codex-review を `pending` に戻す（Director が手で入れる必要は無い）。**明示フラグだけ**
 （Result の本文から番号は推測されない）。伝える先が無ければ 1 行そう表示されるだけで、エラーではない。
-オプションは `plan done` の位置引数（task id と Result）の**後ろ**に置いてよいが、`--pr` の綴りを間違えると
+オプションは `plan done` の位置引数（task id。位置引数で Result を渡す旧形式なら Result も）の**後ろ**に置いてよいが、`--pr` の綴りを間違えると
 `unknown option` で拒否される（何も書かれない — Result を打ち直す）。
 
 > **移行予告**: 将来的に `plan.sh done` は `plan.sh ready-for-verification <task_id>` に移行予定。
@@ -628,7 +644,9 @@ plan done "$TASK_ID" "PR #123 ..." --mission "$TASK_MISSION" --pr 123
 チェックポイントを完遂できない・証拠が提出できない・判断が必要な場合は、代替検証で done を押し通すのではなく **Director に差し戻す**:
 
 ```bash
-plan needs-director "$TASK_ID" "詰まった理由を具体的に記述" --mission "$TASK_MISSION"
+plan needs-director "$TASK_ID" --result-file "$REASON_FILE" --mission "$TASK_MISSION"
+# 短い 1 行なら位置引数でもよい（バッククォートを含めないこと → 単一引用符 '…' で囲む）。
+# 長い・複数行・コマンド例を含む理由は --result-file <path> か --result-file - + <<'RESULT_EOF'
 ```
 
 - タスクは `needs_director` 状態になり、`done` 遷移はブロックされる
@@ -948,7 +966,7 @@ PR が不要なタスク（調査・Obsidian 操作等）の場合は `PR: な�
 ## Standing Orders
 
 - `plan.sh pull` で取得した自分のタスクのみ実行すること。他のWorkerのタスクに干渉しない
-- タスク完了後は必ず `plan.sh done <id> "<result>" --mission <slug>` を呼ぶこと
+- タスク完了後は必ず `plan.sh done <id> --result-file <path|-> --mission <slug>` を呼ぶこと（Result を二重引用符の位置引数で渡さない — バッククォートがシェルに実行される）
 - `plan.sh done` を呼ばずに次のタスクへ進まないこと
 - Directorを経由せずにプランを直接変更しない（`queue/missions/` 配下のファイルを手で編集しない）
 - ツールの denied / タイムアウト は必ずDirectorに報告すること

@@ -355,11 +355,14 @@ import argparse, json, os, sys
 
 p = argparse.ArgumentParser()
 sub = p.add_subparsers(dest="cmd", required=True)
-for name in ("restart-needed", "restart", "status"):
+for name in ("restart-needed", "restart", "status", "heartbeat-id", "wait-heartbeat"):
     sp = sub.add_parser(name)
     sp.add_argument("name", nargs="?")
     sp.add_argument("--repo-root")
     sp.add_argument("--force", action="store_true")
+    sp.add_argument("--before")
+    sp.add_argument("--since")
+    sp.add_argument("--timeout")
 sp = sub.add_parser("restart-targets")
 sp.add_argument("--repo-root")
 args = p.parse_args()
@@ -376,6 +379,10 @@ elif args.cmd == "restart":
     print(f"stub restarted {args.name}", file=sys.stderr)
 elif args.cmd == "status":
     print("stub status: ok")
+elif args.cmd == "heartbeat-id":
+    print("none")
+elif args.cmd == "wait-heartbeat":
+    print(f"ok: stub {args.name}")
 sys.exit(0)
 '''
 
@@ -422,11 +429,14 @@ import argparse, json, os, sys
 
 p = argparse.ArgumentParser()
 sub = p.add_subparsers(dest="cmd", required=True)
-for name in ("restart-needed", "restart", "status"):
+for name in ("restart-needed", "restart", "status", "heartbeat-id", "wait-heartbeat"):
     sp = sub.add_parser(name)
     sp.add_argument("name", nargs="?")
     sp.add_argument("--repo-root")
     sp.add_argument("--force", action="store_true")
+    sp.add_argument("--before")
+    sp.add_argument("--since")
+    sp.add_argument("--timeout")
 sp = sub.add_parser("restart-targets")
 sp.add_argument("--repo-root")
 args = p.parse_args()
@@ -446,6 +456,10 @@ elif args.cmd == "restart":
     print(f"stub restarted {args.name}", file=sys.stderr)
 elif args.cmd == "status":
     print("stub status: ok")
+elif args.cmd == "heartbeat-id":
+    print("none")
+elif args.cmd == "wait-heartbeat":
+    print(f"ok: stub {args.name}")
 sys.exit(0)
 '''
 

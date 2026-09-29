@@ -13,7 +13,7 @@ set -euo pipefail
 #     .lock                         fcntl 排他ロックファイル
 #
 # Usage:
-#   plan.sh init "<title>" [--mission <slug>] [--force]
+#   plan.sh init "<title>" [--mission <slug>] [--force] [--inactive]   (--inactive: state.yaml を変えない。以降は --mission 必須)
 #   plan.sh add  "<title>" [--mission <slug>] --skills <csv> [--blocked-by <csv>]
 #                          [--priority high|medium|low] [--description <text>]
 #                          [--deliverable pr|file|none]
@@ -344,6 +344,7 @@ import os
 import json
 import fcntl
 import contextlib
+import copy
 import re
 import shutil
 import hashlib
@@ -888,6 +889,7 @@ _DEP_RULES = _load_scripts_module('lib_dep_rules')
 DEAD_DEP_STATUSES = _DEP_RULES.DEAD_DEP_STATUSES
 HELD_DEP_STATUSES = _DEP_RULES.HELD_DEP_STATUSES
 unmet_dependencies = _DEP_RULES.unmet_dependencies
+find_dependency_cycle = _DEP_RULES.find_dependency_cycle
 card_dependencies = _DEP_RULES.card_dependencies
 declared_dependencies = _DEP_RULES.declared_dependencies
 
@@ -2576,7 +2578,7 @@ def taskvia_sync_workers():
 #: サブコマンドごとの usage。`-h` / `--help` と、引数の誤りの両方がこれを出す。
 #: 冒頭コメントの Usage と同じ内容 (tests/test_plan_strict_args.py が突き合わせる)。
 USAGE = {
-    'init': 'plan.sh init "<title>" [--mission <slug>] [--force]',
+    'init': 'plan.sh init "<title>" [--mission <slug>] [--force] [--inactive]',
     'add': ('plan.sh add "<title>" [--mission <slug>] --skills <csv> [--blocked-by <csv>]\n'
             '                     [--priority high|medium|low] [--description <text>]\n'
             '                     [--target-dir <path>] [--idle-timeout <s>] [--max-timeout <s>]\n'
@@ -2724,15 +2726,17 @@ def parse_opts(args, spec):
 # ---------------------------------------------------------------------------
 
 def cmd_init(args):
-    opts, positional = parse_opts(args, {'--mission': 'value', '--force': 'bool'})
+    opts, positional = parse_opts(args, {'--mission': 'value', '--force': 'bool', '--inactive': 'bool'})
     if not positional:
         die("init requires a mission title")
     title = positional[0]
     force = opts.get('--force', False)
+    inactive = opts.get('--inactive', False)
     sync_holder = [None]  # (slug, title)
 
     def _do():
         state = load_state()
+        state_before = copy.deepcopy(state)
         slug = opts.get('--mission')
         if slug:
             existing = os.path.exists(mission_dir(slug))
@@ -2782,14 +2786,25 @@ def cmd_init(args):
         }
         save_mission(slug, mission)
 
-        active = state.get('active_missions') or []
-        if slug not in active:
-            active.append(slug)
-        state['active_missions'] = active
-        state['default_mission'] = slug
-        save_state(state)
+        if inactive:
+            # dispatcher は active_missions だけを見る。ここで足さなければ、この mission の task は
+            # 誰にも配られず、default_mission も動かない (使い捨て mission が本物の作業を
+            # 押しのけない)。--force で同名の active mission を置き換えた場合の「active から外す」
+            # だけは上で state に反映済みなので、変わったときだけ保存する。
+            if state != state_before:
+                save_state(state)
+        else:
+            active = state.get('active_missions') or []
+            if slug not in active:
+                active.append(slug)
+            state['active_missions'] = active
+            state['default_mission'] = slug
+            save_state(state)
         sync_holder[0] = (slug, title)
         print(f"Initialized mission: {slug}")
+        if inactive:
+            print("  inactive: active_missions / default_mission は変えていません。"
+                  "以降のコマンドは --mission を付けること")
         print(f"  title: {title}")
         print(f"  path:  {mission_dir(slug)}")
 
@@ -2811,6 +2826,28 @@ def _parse_deliverable_opt(opts):
     if value not in DELIVERABLE_VALUES:
         _usage_exit(f"--deliverable は {'|'.join(DELIVERABLE_VALUES)} のどれか (got {opts['--deliverable']!r})")
     return value
+
+
+def _reject_dependency_cycle(slug, task_id, new_blocked):
+    """`task_id` の blocked_by を `new_blocked` にすると循環ができるなら、exit 2 で拒否する。
+
+    add / update が card を**書く前**に、書き換えと同じロックの中で呼ぶ (拒否したときは何も書かない)。
+    循環の定義は `lib_dep_rules.find_dependency_cycle()` の 1 か所 (lint_plan.py と共有)。
+    task_id がまだ card として無い (add) ときは、新しい task として graph に足す。
+    読めない card は graph から外れる (循環の検査は、読めた範囲の依存で行う)。
+    """
+    graph = {}
+    for meta, _body in list_tasks(slug, quiet=True):
+        tid = meta.get('id')
+        deps = meta.get('blocked_by')
+        if isinstance(tid, str) and isinstance(deps, list):
+            graph[tid] = [d for d in deps if isinstance(d, str)]
+    graph[task_id] = list(new_blocked)
+    cycle = find_dependency_cycle(graph)
+    if cycle:
+        print(f"plan.sh {SUBCOMMAND}: blocked_by が循環します: {' → '.join(cycle)} "
+              f"(何も書いていません)", file=sys.stderr)
+        raise UsageExit(USAGE_EXIT)
 
 
 def cmd_add(args):
@@ -2888,6 +2925,7 @@ def cmd_add(args):
         mission = load_mission(slug)
         task_num = int(mission.get('next_task_id') or 1)
         task_id = f"t{task_num:03d}"
+        _reject_dependency_cycle(slug, task_id, blocked_by)
 
         meta = {
             'id': task_id,
@@ -5491,6 +5529,7 @@ def cmd_update(args):
         if opts.get('--blocked-by') is not None:
             raw = opts['--blocked-by'].strip()
             new_blocked = [s.strip() for s in raw.split(',') if s.strip()] if raw else []
+            _reject_dependency_cycle(slug, task_id, new_blocked)
             meta['blocked_by'] = new_blocked
             changed.append(f"blocked_by={new_blocked}")
             # 外れた依存の解除が残ると、同じ id を後で付け直したときに

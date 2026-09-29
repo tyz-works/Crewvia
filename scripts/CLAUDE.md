@@ -86,6 +86,10 @@ lib ごとの**破ってはいけない契約**の要約。理由・経緯・全
   lint は `hooks/lib_skill_perms.py` の `check_permission()` を task の skills で直接呼び、Write/Edit/(`pr` なら) `git push` が
   実際に拒否されないかで突き合わせる（`lint_plan.py` にスキル名を書かない。`can_produce_deliverable` は宣言のみで判定には使わない — t088）。
   必須化は `init` が mission.yaml に書く `deliverable_required: true` の mission だけ（`knowledge/assignment-routing.md` §6）。
+- `init --inactive` は state.yaml を変えない（観察用の使い捨て mission 用。以降は `--mission` 必須）。
+  `add` / `update --blocked-by` は循環を exit 2 で拒否して何も書かない — 循環の定義は
+  `lib_dep_rules.find_dependency_cycle()` 1 か所（lint_plan.py と共有。コピーしない）。lint は `deliverable: pr` の
+  下流に skills `review` の task が無ければ WARN（`knowledge/plan-input-guards.md`）。
 - Result / 理由 / notes は `--result-file <path|->` / `--notes-file <path|->` で渡す（`done` / `needs-director` / `verify-result`）。二重引用符の位置引数は本文中のバッククォート・`$(...)` を**シェルが plan.sh 起動前に実行する**。`-` は呼び出し元の stdin（bash が fd 3 に退避）。併用・読めない・空・非 UTF-8 は exit 2 で何も書かない。`fail` は本文が無い。`knowledge/plan-sh-result-file.md`。
 - 引数は厳格（未知の option は exit 2 で何も書かない）。`pull` だけ使い方の誤りが exit 1（exit 2 は「タスクなし」）。
 - queue を書き換えるサブコマンドの後、`registry/task-graph/tasks.json` を再生成する（`CREWVIA_TASK_GRAPH=0` で停止）。

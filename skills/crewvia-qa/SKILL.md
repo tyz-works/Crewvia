@@ -123,6 +123,22 @@ terraform plan
 
 テスト終了後はテストデータを削除するか、そのまま残してよいか判断する。
 
+### 観察用の mission（本番の dispatcher を見る QA）
+
+plan.sh / dispatcher の挙動を本番で観察するために使い捨ての mission を作るときは、**必ず `--inactive` を付ける**:
+
+```bash
+./scripts/plan.sh init "probe" --mission <probe-slug> --inactive
+./scripts/plan.sh add "..." --mission <probe-slug> --skills code --deliverable none
+```
+
+`--inactive` なしの `init` は `active_missions` に足し `default_mission` も書き換える。dispatcher が probe の task を
+本物として配り（Director に Worker 起動要求が漏れる）、default_mission が probe のまま残る（2026-09-28/29 の
+t037 / t041）。`--inactive` の mission は `state.yaml` を 1 バイトも変えず、dispatcher に見えない。以降の
+`add` / `update` / `lint` / `done` / `pull --task` は `--mission <probe-slug>` を付けて呼ぶ。
+dispatcher が実際にその task を配るか観察したい QA だけは、`--inactive` なしで作り、終わったら
+`state.yaml` の `active_missions` / `default_mission` を元に戻すこと（`knowledge/plan-input-guards.md`）。
+
 ---
 
 ## Step 6: リグレッション確認

@@ -71,6 +71,8 @@ def _load_hooks_module(name: str):
 # 「lint は OK と言うのに plan.sh は [破損] として保留する」食い違いが起きる
 # (t072 / PR#236 3巡目)。
 lib_task_cards = _load_scripts_module('lib_task_cards')
+# 「依存」の判定 (循環を含む) は lib_dep_rules.py の 1 か所 (CLAUDE.md 不変条件 #3)。
+_DEP_RULES = _load_scripts_module('lib_dep_rules')
 
 
 # ---------------------------------------------------------------------------
@@ -154,35 +156,16 @@ def check_dependency_graph(tasks: list[dict]) -> list[tuple[str, str, str]]:
             if dep not in task_ids:
                 results.append(('FAIL', 'dependency', f"task/{tid}: blocked_by '{dep}' does not exist"))
 
-    # Cycle detection via DFS
+    # Cycle detection: 循環の定義は lib_dep_rules.py の 1 か所 (plan.sh add / update と共有)。
+    # 1 回の検出で 1 件を報告し、見つけた循環の task を graph から外して残りを探し直す。
     graph: dict[str, list[str]] = {m.get('id', ''): list(m.get('blocked_by') or []) for m in tasks}
-    visited: set[str] = set()
-    in_stack: set[str] = set()
-
-    def dfs(node: str, path: list[str]) -> Optional[list[str]]:
-        if node in in_stack:
-            cycle_start = path.index(node)
-            return path[cycle_start:] + [node]
-        if node in visited:
-            return None
-        visited.add(node)
-        in_stack.add(node)
-        for neighbor in graph.get(node, []):
-            if neighbor in graph:
-                found = dfs(neighbor, path + [neighbor])
-                if found:
-                    return found
-        in_stack.discard(node)
-        return None
-
-    reported_cycles: set[frozenset] = set()
-    for tid in graph:
-        cycle = dfs(tid, [tid])
-        if cycle:
-            key = frozenset(cycle)
-            if key not in reported_cycles:
-                reported_cycles.add(key)
-                results.append(('FAIL', 'dependency', f"circular dependency detected: {' → '.join(cycle)}"))
+    while True:
+        cycle = _DEP_RULES.find_dependency_cycle(graph)
+        if not cycle:
+            break
+        results.append(('FAIL', 'dependency', f"circular dependency detected: {' → '.join(cycle)}"))
+        for tid in set(cycle):
+            graph.pop(tid, None)
 
     return results
 
@@ -734,6 +717,50 @@ def check_deliverable(tasks: list[dict], skill_permissions_path: str,
     return results
 
 
+def check_pr_has_review_downstream(tasks: list[dict]) -> list[tuple[str, str, str]]:
+    """`deliverable: pr` の task の下流に、skills に `review` を含む task が無ければ WARN。
+
+    2026-09-28、Director が途中で足した PR を作る task に Codex review と merge の task を
+    積み忘れ、PR が作られても誰も merge しない状態になった。「下流」は blocked_by を逆にたどった
+    推移閉包 (直接・間接に自分を待つ task)。FAIL にしないのは既存 mission を壊さないため。
+    """
+    results: list[tuple[str, str, str]] = []
+    dependents: dict[str, list[str]] = {}
+    by_id: dict[str, dict] = {}
+    for m in tasks:
+        tid = m.get('id')
+        if not isinstance(tid, str):
+            continue
+        by_id[tid] = m
+        deps = m.get('blocked_by')
+        for dep in (deps if isinstance(deps, list) else []):
+            if isinstance(dep, str):
+                dependents.setdefault(dep, []).append(tid)
+
+    for tid, meta in by_id.items():
+        if meta.get('deliverable') != 'pr':
+            continue
+        seen: set[str] = set()
+        stack = list(dependents.get(tid, []))
+        has_review = False
+        while stack and not has_review:
+            cur = stack.pop()
+            if cur in seen:
+                continue
+            seen.add(cur)
+            skills = by_id[cur].get('skills')
+            if isinstance(skills, list) and _DEP_RULES.PR_REVIEW_SKILL in skills:
+                has_review = True
+                break
+            stack.extend(dependents.get(cur, []))
+        if not has_review:
+            results.append(('WARN', 'deliverable',
+                            f"task/{tid}: deliverable 'pr' ですが、下流 (blocked_by を逆にたどった先) に "
+                            f"skills に '{_DEP_RULES.PR_REVIEW_SKILL}' を含む task がありません — PR が作られても誰も "
+                            f"review・merge しません (Codex review と merge の task を積む)"))
+    return results
+
+
 # ---------------------------------------------------------------------------
 # Task loader
 # ---------------------------------------------------------------------------
@@ -794,6 +821,7 @@ def lint_mission(slug: str, queue_dir: str, config_dir: str, strict: bool = Fals
         _mission_requires_deliverable(slug, queue_dir)
         if any('deliverable' not in m for m in valid_tasks) else (False, None))
     all_results += check_deliverable(valid_tasks, skill_perm_path, required, required_problem)
+    all_results += check_pr_has_review_downstream(valid_tasks)
 
     # Print results
     has_fail = False

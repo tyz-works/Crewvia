@@ -455,3 +455,123 @@ registry/mux が壊れている等でこのタイマーを**確実に保てな�
   実害に置き換えた。
 - `tests/red_proof_b1_background_work.sh` に case S (P1) / T・U (P2) を追加。全 21 件
   (baseline 含む) PASS。
+
+
+## 10. 利用枠切れを idle / max と別の状態にする (C2 / t005, 2026-09-30)
+
+### 起きたこと (2026-09-27 夜)
+
+Worker の画面が `⚠ Usage limit reached · continuing automatically at 6pm` で止まったのを、
+Rule 5 も watchdog も普通の idle と読んだ。Rule 5 は 5 分おきに 5 人分発火して **2 時間で約 80 通**、
+watchdog は idle×2 で Worker を終了させ、残った Worker も**リセット後に自動では再開せず**、
+Haruto は止まっていた時間も max に数えられて t070 の途中で kill された。枠はアカウント単位なので
+起動し直しても回復しない (memory `five-hour-limit-is-per-session` の 09-28 訂正)。
+
+### 仕組み (定義は `scripts/lib_usage_limit.py` の 1 か所)
+
+* **同定は位置と構造に束縛する** (文言の部分一致にしない — B6 の族 B と同じ轍を踏まない):
+  (1) 通知行が**行頭の `⚠`** (ツール出力は `⎿` の下にインデント、`⏺` / `❯` 始まりは呼び出し・入力の写し)
+  (2) 画面末尾側 (空行を除く最後の 14 行) (3) 直下 3 行以内に**入力欄の枠** (`╭──…` / `────…`)。
+  パス・出力・引用・`cat` の中身・スクロールで上に流れた古い通知は、どれも外れる。
+  ※ 実物の画面の記録がリポジトリに無かったため、fixture は Claude Code の画面の構造から組んだ。
+  実物と形が違えば `detect()` の 3 条件を直す (テストの `_negatives()` が陰性の表)。
+* **リセット時刻**は通知行から読む (`at 6pm` / `at 11:16 PM` / `at 18:00` / `+1h57m`)。読めなければ「時刻不明」。
+  「次に来るその時刻」は**見た瞬間**に計算して記録 (`observe()`) し、同じ通知行が続く間は保つ —
+  リセットを過ぎても画面の `at 6pm` は残るので、毎回計算し直すと 18:05 に「明日の 18:00」に化ける。
+  残り時間の表示 (`+1h57m`) は毎分変わるので、同じ通知かの照合 (`identity()`) からは外す。
+* **dispatcher (Rule 5)** `handle_usage_limit()`: idle / done / blocked の Worker (割り当てあり) の画面を
+  capture し、利用枠切れなら idle-with-task を**出さない**。代わりに (1) Director に**1 回だけ**
+  「利用枠切れ (リセット予定 <時刻|不明>)」 (2) リセット予定 + 120 秒で Worker に**1 回だけ**再開を促す
+  (時刻不明は見え始め + 5 時間 5 分) (3) 促して 5 分経ってもなお続くなら Director に**1 回だけ**再通知。
+  通知は台帳 `notified-state.json` の作法 (`notify_state_once`、key `usage-limit_<name>` /
+  `usage-limit-still_<name>`、fp = 通知行の同一性)。**台帳の slug は `_daemon`** (mission の slug だと
+  `prune_told()` が毎サイクル捨てて再通知になる)。解消 (表示が消えた) したら記録も台帳も畳む。
+  記録: `registry/mux/<name>.usage-limit.json` (`first_seen` / `notice` / `reset_at` / `resumed_at`)。
+* **watchdog** `WorkerMonitor._observe_usage_limit()`: 免除中は (a) idle で終了しない
+  (`alive` / reason=`usage_limit`) (b) **max の経過時間から、免除して観測した時間を除く**。
+  免除が終わった後も idle は**最後に免除した瞬間から**数える (止まっていた沈黙で、リセット後に
+  再開する Worker が即 hard idle にならない)。1 回の観測で除ける長さは 300 秒まで
+  (watchdog が止まっていた・mux が読めなかった空白を「利用枠切れだった」と主張しない)。
+  累計はメモリだけ — monitor の `started_at` も object の生成時刻なので、再起動で max の時計ごと
+  作り直される (同じ寿命)。
+
+### 判定の向き (fail-direction)
+
+画面が読めない・空・構造が合わない・窓が無い → **常に「利用枠切れではない」** (= 今までと同じ挙動:
+Rule 5 は通知し、watchdog は idle / max で判定する)。誤検知しても、免除には**必ず上限**がある:
+`lib_usage_limit.excuse_deadline()` = リセット予定 + 1 時間 (時刻不明は見え始め + 6 時間)。
+上限を過ぎてもなお表示が続くなら、Rule 5 は通常判定に戻り、watchdog も通常の idle / max に戻して
+Director に**1 回**通知する (`usage-limit-overdue_<name>`)。永久に黙る・永久に殺さない経路は無い。
+(判定ごとに向きが違う: 「殺す」判定は殺さない側、「通知を止める」判定は通知する側。この判定は
+両方に効くので、上限で必ず元の判定に戻す形にした。)
+
+### 族ごとの掃除 (「Worker が止まって見える」を扱う全経路)
+
+| 経路 | 利用枠切れの扱い | 処置 |
+|---|---|---|
+| dispatcher Rule 5 A/B (`check_rule5`) | idle-with-task / blocked を通知 | **処置**: `handle_usage_limit()` で別扱い |
+| watchdog idle (soft / hard) | warn / terminate | **処置**: 免除 + idle の床 |
+| watchdog max (`max_exceeded`) | 止まっていた時間も数える | **処置**: 免除して観測した時間を除く |
+| dispatcher `shutdown_idle_workers` / Rule 2 blocked-stuck / no-task shutdown | 対象は**割り当てのない** idle Worker | 不処置: task を持たない Worker を退役させるだけで、枠切れの task を失わない (枠は起動し直しても戻らないが、割り当ても無いので害が無い) |
+| dispatcher spawn grace / worker-vanish | pane の有無の判定 | 不処置: 画面の内容を見ない |
+| `lib_pane_process` (裏の job) | プロセス木の判定 | 不処置: 枠切れの画面はプロセスと無関係。B1 の判定が先に働くときは従来どおり |
+| codex-review の枠切れ (`You've hit your usage limit ... try again at`) | Kai-codex の別の枠 | 不処置: 画面ではなく kai-spawn の log に出る別経路 (memory の手当て: 時刻まで待って reset)。この task の範囲外 |
+
+### 「読めない / 書けない / 消せない」の各経路 (t018 / Codex 2 巡目)
+
+観測・保存の失敗が「免除が上限なく続く」か「通知が永久に出ない」に倒れる族。C2 が足したコード全体を洗った。
+`Mux.capture()` は失敗を**空文字列**で返すので、「空」は「利用枠切れではない」ではなく「見えなかった」。
+その区別は `lib_usage_limit.observable()` の 1 か所 (dispatcher と watchdog が共有)。
+
+| 経路 | 失敗したとき | 向き | 上限を越える免除 | 通知が永久に出ない |
+|---|---|---|---|---|
+| watchdog: capture の例外 / 空 | 免除しない・その間を max から除かない。entry (確立済みの deadline) は**保つ** | 通常の idle / max | 無い | 無い |
+| watchdog: 読めた画面に通知行が無い | entry を捨てる (回復) | 通常の判定 | 無い | 無い |
+| watchdog: 上限超え | 免除しない + Director に 1 回 (fp = 通知行 + first_seen) | 通常の判定 | 無い | 無い (first_seen が変われば別 fp) |
+| dispatcher: capture の例外 / 空 | 記録も台帳も触らない・免除しない | 通常の Rule 5 | 無い | 無い |
+| dispatcher: 記録が読めない | prev=None で作り直して保存 (保存できなければ次行) | 保存成功なら次サイクルから保つ | 1 回だけ deadline が付く (壊れた記録の上書き) | 無い |
+| dispatcher: 記録を書けない | 免除しない (`_save_usage_limit` が False → `handle_usage_limit` が False) | 通常の Rule 5 | 無い (タイマーを保てない間は免除自体が無い) | 無い |
+| dispatcher: 記録を消せない (回復時) | 台帳キーを先に消し、記録は残す → 次サイクルでやり直し | 記録が残る | 無い (記録の deadline は保たれる) | 無い (fp が first_seen を含むので、キーが残っても別の枠切れは通知) |
+| dispatcher: 台帳キーを消せない (ロック / 台帳が読めない) | `clear_told_key` が False → 記録も消さない | やり直し | 無い | 無い (同上) |
+| dispatcher: 台帳に書けない (通知が記録されない) | `notify_state_once` のスロットルが直後の重複を止める | 次サイクルで再送 | 無い | 無い (送れるまで再送) |
+
+残る 2 件 (許容・どちらも有界): (a) 記録が**壊れている**と読み直せず、その 1 回だけ新しい first_seen で
+作り直して上書きする (以後は保たれる。壊れたまま毎サイクル読めないなら保存も失敗し、上の「書けない」行で
+通常の Rule 5 に戻る)。壊れた記録で通知を繰り返さない (`test_a_corrupt_record_does_not_make_the_notice_repeat`)
+ことを優先した。(b) 見えなかった観測が長く続いた後、同じ通知行の**本当に新しい**利用枠切れが来ても、前の
+entry (過ぎた deadline) を引き継ぐので免除されず通常の Rule 5 が出る。**通知が多く出る側**に倒れるだけで、
+免除が延びる側ではない。
+
+### 記録を消す (retire する) 経路と、その根拠 (t020 / Codex 3 巡目 P1)
+
+上の表は「読めない / 書けない / 消せない」だった。**mux の state が `unknown` / 取得失敗**の行が漏れていた:
+`HerdrBackend.state()` は一時的な lookup / RPC の失敗でも `unknown` を返すので、これは回復の証拠ではない。
+消すと first_seen / reset_at / resumed_at が作り直され、18:00 以降の `at 6pm` から翌日のリセット時刻が付いて
+免除と通知の抑制が延びる (失敗を繰り返せば何度でも)。原則: **記録・台帳キーを消してよい根拠は「回復を観測した」ことだけ**。
+
+| 経路 | 消すか | 根拠 (回復の観測か) |
+|---|---|---|
+| dispatcher `handle_usage_limit`: 読めた画面 (`observable`) に通知行が無い | 消す | 回復を観測した (画面を読んで無かった) |
+| dispatcher `check_rule5`: mux state が `working` | 消す | 回復を観測した (動いている) |
+| dispatcher `check_rule5`: mux state が `unknown` (取得失敗) | **保つ** | 観測できていない (t020 で修正。以前は消していた) |
+| dispatcher `check_rule5`: idle / done で割り当てなし | **保つ** | 画面を読んでいない = 未観測 (以前は消していた)。次に読めた健全な画面か working で畳まれる |
+| dispatcher: capture の例外 / 空 | 保つ | 観測できていない (t018) |
+| dispatcher: 記録が読めない | 消さず作り直す | (既知 (a)。有界) |
+| watchdog `_observe_usage_limit`: 読めた画面に通知行が無い | entry を捨てる | 回復を観測した |
+| watchdog: capture の例外 / 空 / 窓が無い | 保つ | 観測できていない (t018) |
+
+`unknown` / 空 / 例外 / タイムアウトを回復扱いにして消す経路は 0 件。消す関数は `_retire_usage_limit` の 1 つで、
+呼び出しは上の 2 か所だけ (`tests/test_usage_limit.py::test_an_unknown_mux_state_is_not_a_recovery_and_keeps_the_record`)。
+
+### 戻し方
+
+PR を revert → `scripts/sync-main-checkout.sh` (主 checkout を ff し dispatcher / watchdog を restart)。
+`registry/mux/<name>.usage-limit.json` と台帳の `usage-limit*` は**消してよい** (無い = 新しい利用枠切れとして
+1 回だけ通知し直す)。記録が壊れていても通知は台帳 (通知行 + 見え始め) が 1 回に止める。
+env 停止スイッチは付けていない (dispatcher と watchdog で答えが割れるため)。
+
+### 検証
+
+`tests/test_usage_limit.py` (70 件: 同定の表・dispatcher 1 サイクル・watchdog の模擬時計・観測/保存の失敗)。
+赤の実証: `tests/red_proof_c2_usage_limit.sh` (修正前の dispatcher.sh / watchdog.py に戻すと
+(1)〜(3) が赤、加えて同定・上限・床・上限外し・空 capture・保存失敗・台帳キー・mux state unknown の欠陥注入 14 件が赤)。

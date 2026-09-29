@@ -390,6 +390,15 @@ Worker が起動された `TARGET_DIR` の記録の唯一の定義（t009 / #21�
 記録が嘘・無いときは `record` で書き直す（dispatcher は毎サイクル読み直す）。
 設計: `knowledge/assignment-routing.md`
 
+### `lib_usage_limit.py`
+
+Worker の画面から「利用枠切れ」(`⚠ Usage limit reached · continuing automatically at 6pm`) を同定する
+唯一の定義 (C2 / t005)。`detect(screen)` / `observe(previous, screen)` / `excuse_deadline(entry)`。
+dispatcher の Rule 5 (`handle_usage_limit`) と watchdog の idle / max (`_observe_usage_limit`) が共有する。
+位置と構造に束縛 (行頭の `⚠` + 直下に入力欄の枠 + 画面末尾)、読めなければ None。免除には必ず上限
+(リセット予定 + 1 時間 / 時刻不明は見え始め + 6 時間)。設計・族の掃除・戻し方:
+`knowledge/watchdog-idle-judgment.md` §10。テスト: `tests/test_usage_limit.py` / `tests/red_proof_c2_usage_limit.sh`。
+
 ### `lib_trust.py`
 
 claude の trust ダイアログを `start.sh` が踏まないための検査（t021 / #28）。CLI:

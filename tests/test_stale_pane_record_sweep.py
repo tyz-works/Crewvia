@@ -586,6 +586,9 @@ ALLOWED_DELETIONS = {
         "Rule 5 の BACKGROUND_JOB_MAX_SECONDS 用タイマー (`<name>.job-since.json`)。"
         "kill の認可の証拠 (`<name>.json` / `<name>-worker.json`) ではなく、job が"
         "終わった/条件から外れたときに次回また新しく計り直すための自己クリアのみ (t074)",
+    ("dispatcher.sh", "_save_usage_limit", "path.unlink(missing_ok=True)"):
+        "Rule 5 の利用枠切れの記録 (`<name>.usage-limit.json`、C2 / t005)。kill の認可の証拠"
+        "(`<name>.json` / `<name>-worker.json`) ではなく、利用枠切れが解消したときの自己クリアのみ",
     ("dispatcher.sh", "save_told", "os.replace(tmp, TOLD_FILE)"):
         "notified-state 台帳 (`registry/daemons/notified-state.json`) の temp + os.replace による"
         "原子的な書き込み。置換先は `TOLD_FILE` の 1 つに固定で、registry/mux の記録ではない",

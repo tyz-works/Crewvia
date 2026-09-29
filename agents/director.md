@@ -1492,6 +1492,18 @@ card を同名の後任が pull し直していたかのどちらかなので、
 `update --reset` + 手動 `rm queue/assignments/<name>` は、世代を見ないぶん後任の
 assignment を巻き込む（= 稼働中の Worker を dispatcher に idle と誤認させて殺す）。
 
+**利用枠切れ (`[Rule 5] Worker {name} が利用枠切れです` / `再開を促した後も利用枠切れのままです`)**:
+`⚠ Usage limit reached` で止まった Worker は idle-with-task の通知ではなく、この専用通知が **1 回だけ**届く
+(C2 / t005)。枠は**アカウント単位で、起動し直しても回復しない** — kill / 再起動はしない。dispatcher が
+リセット予定の 2 分後に Worker へ再開を促す (自動、1 回)。あなたがすること:
+- 「リセット予定 時刻不明」または再通知 (促した後もなお枠切れ) が届いたら、`python3 scripts/lib_mux.py capture {name}-worker`
+  で本当に枠が戻っていないかを確かめる。戻っていて止まっているだけなら `lib_mux.py send {name}-worker "再開してください"`
+- 枠が戻っていないなら待つ。7d (週の枠) が 80% を超えていたら並列数を絞る判断をユーザーに仰ぐ
+- リセット予定 + 1 時間を過ぎても表示が続くと、Rule 5 は通常の idle-with-task 通知に戻り、watchdog も通常の
+  idle / max 判定に戻る (`[watchdog] Worker ... は利用枠切れの表示のまま` が 1 回届く)。枠が戻っているのに動かない
+  Worker なので、再開を促すか `plan.sh retire` で task を戻す
+- 記録 (`registry/mux/{name}.usage-limit.json`) と台帳の `usage-limit*` は消してよい (無い = 1 回だけ通知し直す)
+
 **注意事項**:
 - **自動対処はしない** — 通知を見て Director が判断する（誤判定リスクを避けるため）
 - **tmux モードでは発火しない** — `state()` が常に `unknown` を返すため、本番が tmux のままでも無害

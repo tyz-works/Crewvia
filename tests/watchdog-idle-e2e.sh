@@ -83,6 +83,7 @@ cp "$SRC_DIR/scripts/lib_retirement.py" "$ROOT/scripts/lib_retirement.py"
 cp "$SRC_DIR/scripts/lib_daemon_watch.py" "$ROOT/scripts/lib_daemon_watch.py"
 cp "$SRC_DIR/scripts/lib_daemon_state.py" "$ROOT/scripts/lib_daemon_state.py"
 cp "$SRC_DIR/scripts/lib_task_cards.py" "$ROOT/scripts/lib_task_cards.py"
+cp "$SRC_DIR/scripts/lib_usage_limit.py" "$ROOT/scripts/lib_usage_limit.py"
 
 # claude 本体 / MCP サーバー相当を模す偽バイナリ (中身は sh / sleep のまま
 # 機能する)。t074 以降、分類は comm を見ないのでこの名前自体は判定に効かない

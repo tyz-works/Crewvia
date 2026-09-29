@@ -63,6 +63,13 @@ lib ごとの**破ってはいけない契約**の要約。理由・経緯・全
   黙る側に壊れる）。cmdline が読めないノードも「消滅」以外は `unknown` に倒す（t082 P1。
   「マーカー無し」に潰すと本物の job が見えなくなり watchdog が誤って terminate しうる）。
   （`knowledge/watchdog-idle-judgment.md` §7-9）。
+- **利用枠切れ** (`⚠ Usage limit reached · continuing automatically at 6pm`) は idle でも max でもない
+  (C2 / t005)。同定は `lib_usage_limit.detect()` の 1 か所 (dispatcher と watchdog が共有): 行頭の `⚠` +
+  直下に入力欄の枠、で**位置と構造に束縛**する (文言の部分一致にしない)。Rule 5 は出さず Director に 1 回・
+  リセット後に Worker へ再開を促す 1 回・なお続けば Director へ再通知 1 回。watchdog は免除中 idle で終了せず、
+  免除して観測した時間を max から除く。**読めない・同定できない → 利用枠切れではない**、免除は必ず上限つき
+  (`excuse_deadline()`)。台帳の slug は `_daemon` (mission slug だと `prune_told()` が捨てる)。
+  （`knowledge/watchdog-idle-judgment.md` §10）
 - idle Worker の退役 (dispatcher): 残っている task が無い、または skill は合うが TARGET_DIR が合わず取れない
   task しか無い (`takeable_pending` が空) Worker は no-task と同じく退役させる。TARGET_DIR の記録が
   無い / 読めない Worker だけは合わないと確定できないので待機（C3 / t009。`knowledge/assignment-routing.md`）。

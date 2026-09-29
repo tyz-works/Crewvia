@@ -330,6 +330,22 @@ def job_since_state_problem(data):
     return None
 
 
+def usage_limit_state_problem(data):
+    """Rule 5 の利用枠切れの記録 (`registry/mux/<name>.usage-limit.json`、C2 / t005)
+    が使えない理由。`lib_usage_limit.observe()` が返す形 + dispatcher が足す
+    `resumed_at` (再開の促しを送った時刻 / null) と `still_notified` (再通知済みか)。
+    """
+    if not is_finite_number(data.get('first_seen')):
+        return f"'first_seen' is {data.get('first_seen')!r}, expected a finite timestamp"
+    if not isinstance(data.get('notice'), str) or not data.get('notice'):
+        return f"'notice' is {data.get('notice')!r}, expected a non-empty string"
+    for field in ('reset_at', 'resumed_at'):
+        value = data.get(field)
+        if value is not None and not is_finite_number(value):
+            return f'{field!r} is {value!r}, expected a finite number or null'
+    return None
+
+
 def watch_state_problem(data):
     """相互監視の `<peer>.watch.json` が使えない理由。
 

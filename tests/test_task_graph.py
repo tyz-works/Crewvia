@@ -732,6 +732,51 @@ def test_the_placeholder_has_no_group_because_it_belongs_to_no_mission(sandbox):
     assert "group" not in node
 
 
+# --- groups (herdr-task-graph 0.4.0 のページ表示名・並び順) ----------------
+
+def test_top_level_groups_lists_active_missions_in_state_order(sandbox):
+    """`groups` の並びは `active_missions` の並びと同じであること。
+
+    plugin はこの順でタブを並べる。逆順で出すとタブの並びが `plan.sh status`
+    などの一覧と食い違う。
+    """
+    sandbox.add_task("t001", "pending", [])
+    sandbox.add_mission("m-zulu")
+    sandbox.add_task("t001", "pending", [], mission="m-zulu")
+    assert sandbox.run("task-graph").returncode == 0
+    graph = sandbox.read_graph()
+    assert [g["id"] for g in graph["groups"]] == [MISSION, "m-zulu"]
+
+
+def test_top_level_groups_title_drops_the_slugs_date_prefix(sandbox):
+    """`title` はタブに出す短い表示名 —— slug 先頭の日付 (`YYYYMMDD-`) を落とす。"""
+    sandbox.add_task("t001", "pending", [])  # MISSION (m-alpha) 側にも 1 件置く
+    sandbox.add_mission("20260101-widgets")
+    sandbox.add_task("t001", "pending", [], mission="20260101-widgets")
+    assert sandbox.run("task-graph").returncode == 0
+    graph = sandbox.read_graph()
+    by_id = {g["id"]: g["title"] for g in graph["groups"]}
+    assert by_id["20260101-widgets"] == "widgets"
+    # 日付の無い slug (fixture の既定 mission) はそのまま。
+    assert by_id[MISSION] == MISSION
+
+
+def test_top_level_groups_omits_a_mission_with_zero_tasks(sandbox):
+    """task が 1 件も無い mission はタブとして出さない (押しても何も無い)。"""
+    sandbox.add_task("t001", "pending", [])
+    sandbox.add_mission("m-empty")  # task を 1 件も足さない
+    assert sandbox.run("task-graph").returncode == 0
+    graph = sandbox.read_graph()
+    assert [g["id"] for g in graph["groups"]] == [MISSION]
+
+
+def test_top_level_groups_is_empty_when_only_the_placeholder_is_shown(sandbox):
+    """task が 1 件も無いとき (プレースホルダのみ) は `groups` も空であること。"""
+    assert sandbox.run("task-graph").returncode == 0
+    graph = sandbox.read_graph()
+    assert graph["groups"] == []
+
+
 def test_pane_id_is_written_from_the_spawn_record(sandbox):
     sandbox.add_task("t001", "in_progress", [], worker="Ren")
     sandbox.assign("Ren", "t001")
@@ -1017,7 +1062,7 @@ def test_generated_json_shape_matches_the_plugin_contract(sandbox):
     sandbox.add_task("t001", "pending", [])
     assert sandbox.run("task-graph").returncode == 0
     graph = sandbox.read_graph()
-    assert set(graph) == {"title", "tasks"}
+    assert set(graph) == {"title", "tasks", "groups"}
     assert isinstance(graph["title"], str) and graph["title"]
     allowed_keys = {"id", "label", "group", "title", "depends_on", "status",
                     "pane_match", "pane_id"}
@@ -1025,6 +1070,11 @@ def test_generated_json_shape_matches_the_plugin_contract(sandbox):
     for node in graph["tasks"]:
         assert set(node) <= allowed_keys, f"未知のキー: {set(node) - allowed_keys}"
         assert node["status"] in allowed_status, node["status"]
+    assert isinstance(graph["groups"], list)
+    for group in graph["groups"]:
+        assert set(group) == {"id", "title"}
+        assert isinstance(group["id"], str) and group["id"]
+        assert isinstance(group["title"], str) and group["title"]
 
 
 # ---------------------------------------------------------------------------

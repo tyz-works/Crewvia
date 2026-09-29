@@ -323,6 +323,13 @@ Older versions still work, with the limits described under
 [Limitations](#limitations) and how to move off them under
 [Upgrading the plugin](#upgrading-the-plugin).
 
+Crewvia also writes a top-level `groups` array (one `{"id": "<mission slug>", "title":
+"<short name>"}` per mission that has at least one task, ordered like
+`queue/state.yaml`'s `active_missions`). **Plugin 0.4.0 or later** uses it to split the view
+into one page per mission that you switch between; 0.3.0 and earlier simply ignore the
+unknown field, so `groups` does not raise the minimum plugin version above 0.3.0 — it only
+matters once you upgrade to use per-mission pages.
+
 **Nothing here is required.** Crewvia works exactly the same without the plugin, without
 herdr, and in tmux mode: generating the file never calls herdr, and if generation itself
 fails, `plan.sh` logs one line to stderr and keeps its own exit code. Set

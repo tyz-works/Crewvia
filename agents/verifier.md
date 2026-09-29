@@ -43,13 +43,17 @@ cat queue/missions/<slug>/tasks/<task_id>.md
 
 ```bash
 # 全 check pass、acceptance_criteria 充足
-plan.sh verify-result <task_id> pass --notes "機械 check 全 pass。acceptance_criteria 3/3 充足確認。"
+plan.sh verify-result <task_id> pass --notes '機械 check 全 pass。acceptance_criteria 3/3 充足確認。'
 
 # 問題あり
-plan.sh verify-result <task_id> fail --notes "lint fail: 3 errors。acceptance_criteria item-2 未充足（テストなし）。"
+plan.sh verify-result <task_id> fail --notes 'lint fail: 3 errors。acceptance_criteria item-2 未充足（テストなし）。'
 
 # 判定不能
-plan.sh verify-result <task_id> needs_human_review --notes "acceptance_criteria が曖昧で判定できない: '正しく動く' の定義が不明。"
+# コマンド例・バッククォートを含む長い notes は --notes-file <path> か --notes-file - (クォート付きヒアドキュメント)。
+# 二重引用符の --notes はバッククォート / $(...) がシェルに実行される。
+plan.sh verify-result <task_id> needs_human_review --notes-file - <<'NOTES_EOF'
+acceptance_criteria が曖昧で判定できない: '正しく動く' の定義が不明。
+NOTES_EOF
 ```
 
 ---

@@ -861,17 +861,19 @@ class TestDispatcherRouting:
         msgs = [m for m in _director_msgs(mux) if "t001" in m and "起動" in m]
         assert msgs and "--fresh" not in msgs[0] and f"TARGET_DIR={OTHER_REPO}" in msgs[0]
 
-    def test_a_worker_left_with_only_mismatched_tasks_is_not_retired(self, repo):
-        """Rule 2 (blocked-stuck) は「全部 blocked」の判定で、TARGET_DIR 不一致は当てはまらない。"""
+    def test_a_worker_left_with_only_mismatched_tasks_is_retired(self, repo):
+        """C3 / t009 (旧: ..._is_not_retired): TARGET_DIR が合わない task は、この Worker が
+        永久に取れない。待つ理由が無いので no-task と同じく退役の marker が書かれる。
+        (自分の TARGET_DIR の task を待つ Worker・記録が無い Worker は退役しない —
+        tests/test_c3_idle_target_mismatch_and_restart_wait.py)"""
         _set_card(repo, "t001", target=OTHER_REPO)
         p = repo / "queue" / "missions" / SLUG / "tasks" / "t001.md"
         old = time.time() - 10_000
         os.utime(p, (old, old))
         wt.write_record(repo / "registry", AGENT, None)
         mux, _ = _cycle(repo)
-        assert not mux.killed
-        assert not (repo / "registry" / "retirements" / f"{AGENT}.json").exists(), (
-            "退役 marker が書かれた")
+        assert (repo / "registry" / "retirements" / f"{AGENT}.json").exists(), (
+            "取れない task しか無い idle Worker の退役 marker が書かれていない")
 
     def test_stale_record_of_a_retired_worker_is_swept_by_the_cycle(self, repo):
         _set_card(repo, "t001", target="null")

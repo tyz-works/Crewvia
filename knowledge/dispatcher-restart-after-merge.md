@@ -201,6 +201,16 @@ python3 scripts/lib_daemon_watch.py resume watchdog   --token "$TOK_W"
 > (相手が死んでも誰も起こさない)。30 分でその旨が Director に 1 度通知されるが、
 > `status` に `PAUSED` が出ていないことを確認しておくとよい。
 
+### restart 後の status は新しい世代の heartbeat を待ってから (C3 / t009)
+
+restart 直後は記録上の heartbeat がまだ旧 pid のままで、status を出すと `recorded_instance_alive=False` に
+見える (2026-09-28 21:11。15 秒後は新 pid で正常)。`sync-main-checkout.sh` は restart した daemon ごとに、
+restart 前の `heartbeat-id` (`<pid> <generation>`) と時刻を控え、`lib_daemon_watch.py wait-heartbeat` で
+**別の世代・restart 以降の時刻・生きている instance** の heartbeat が記録されるまで待つ (`--restart-wait-seconds`、
+既定 90 秒)。上限までに記録されなければ `note_failure()` に積んで非 0 で終わる (成功に潰さない)。
+`--restart-wait-seconds` は待ち時間の上限だけを変え、待つかどうかの切り替えではない。
+**戻し方**: PR を revert → `scripts/sync-main-checkout.sh`。
+
 ---
 
 ## 教訓

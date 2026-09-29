@@ -168,8 +168,8 @@ TTL の内。以前は 6 秒後に別 task を送り assignment が上書きさ�
 **Rule 2（no-task / blocked-stuck の退役）の「仕事を持っている」は card で数える**
 （`worker_holds_work()`。needs_director / blocked / verifying 等の card を持つ Worker は
 退役させない。`needs-director` が assignment を外すようになったので、assignment では
-数えられない。#13）。skill は合うが TARGET_DIR が合わない task しか残っていない Worker も
-退役させない。**codex-review の同時 1 実行は `queue/assignments/Kai-codex` の
+数えられない。#13）。skill は合うが TARGET_DIR が合わない task しか残っていない Worker は
+no-task と同じく退役させる (C3 / t009。記録が無い / 読めない Worker だけは待機)。**codex-review の同時 1 実行は `queue/assignments/Kai-codex` の
 有無ではなく、指す task で判定**（`codex_review_slot_busy()`。終わった task・
 needs_director を指す孤児は塞がない。読めない・形が違う・task が見つからないは塞ぐ側）。
 設計: `knowledge/assignment-routing.md` §2、`knowledge/daemon-authority.md` §7-16

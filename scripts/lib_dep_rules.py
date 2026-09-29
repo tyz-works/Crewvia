@@ -144,3 +144,45 @@ def card_dependencies(meta, done_ids, task_statuses):
         unmet_dependencies(blocked_by, done_ids, task_statuses, released),
         held_dependencies(blocked_by, done_ids, task_statuses, released),
     )
+
+
+def find_dependency_cycle(graph):
+    """`{task_id: [依存 id, ...]}` の中の循環を 1 つ探す。無ければ None。
+
+    循環は「a → b → a」のように、始点を末尾にも繰り返した id の list で返す。
+    **循環の定義はここ 1 か所** —— `lint_plan.py` (既存 mission の検査) と
+    `plan.sh add` / `update` (書く前の拒否) が同じ関数を呼ぶ。片方だけが循環を
+    見逃す形 (コピー) を作らない。graph に無い id (未定義の依存) は辿らない
+    (未定義の依存は別の検査の仕事)。
+    """
+    visited = set()
+    in_stack = set()
+
+    def dfs(node, path):
+        if node in in_stack:
+            # path は既に node で終わっている (呼び出し側が辿った先を足してから入る)。
+            # 末尾にもう一度 node を足すと「a → b → a → a」と重複して表示される。
+            return path[path.index(node):]
+        if node in visited:
+            return None
+        visited.add(node)
+        in_stack.add(node)
+        for neighbor in graph.get(node) or []:
+            if neighbor in graph:
+                found = dfs(neighbor, path + [neighbor])
+                if found:
+                    return found
+        in_stack.discard(node)
+        return None
+
+    for tid in graph:
+        found = dfs(tid, [tid])
+        if found:
+            return found
+    return None
+
+
+#: `deliverable: pr` の task の下流に 1 つは要る「review の task」を表す skill 名 (t013 / C4)。
+#: lint (`lint_plan.check_pr_has_review_downstream`) が読む。lint_plan.py にスキル名のリテラルを
+#: 置かない (tests/test_task_deliverable.py が固定) ので、名前はここ 1 か所。
+PR_REVIEW_SKILL = 'review'

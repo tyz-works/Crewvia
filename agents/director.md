@@ -192,6 +192,12 @@ Dispatcher から通知を受け取る:
 ./scripts/plan.sh add "QA: 認証ミドルウェアの動作検証" \
   --skills "qa" --deliverable none --blocked-by t001
 
+# 観察用の使い捨て mission は --inactive で作る（state.yaml を変えない = dispatcher に見えない。
+# 以降は --mission を付ける）。blocked_by が循環する add / update は exit 2 で拒否される。
+# deliverable: pr の task の下流に review の task が無いと plan.sh lint が WARN
+# （knowledge/plan-input-guards.md）
+./scripts/plan.sh init "probe" --mission probe-slug --inactive
+
 # ステータス確認
 ./scripts/plan.sh status                              # active 全 mission の要約
 ./scripts/plan.sh status --mission <slug>             # 1 mission の詳細

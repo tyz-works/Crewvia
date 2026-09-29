@@ -28,6 +28,7 @@ tests/red_proof_t005_main_checkout_sync.sh | 1 回限りの historical red proof
 tests/red_proof_t009.sh | 1 回限りの historical red proof（CI 化しない）
 tests/red_proof_t010.sh | 1 回限りの historical red proof（CI 化しない）
 tests/red_proof_t013.sh | 1 回限りの historical red proof（CI 化しない）
+tests/red_proof_t013_input_guards.sh | 1 回限りの historical red proof（CI 化しない）
 tests/red_proof_t017.sh | 1 回限りの historical red proof（CI 化しない）
 tests/red_proof_t018.sh | 1 回限りの historical red proof（CI 化しない）
 tests/red_proof_t019.sh | 1 回限りの historical red proof（CI 化しない）

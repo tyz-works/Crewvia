@@ -869,11 +869,11 @@ lib を通さずに読み書きする」。§5 の計測を e6d6801 → 現行�
 | 分類 | 処置 |
 |---|---|
 | S5 で lib に寄せた 11 箇所 (verifier-dispatcher `update_task_fields` / pre-compact / `_apply_risk_flags` / `.crewvia-env` / plan.sh の taskvia map ×2 / taskvia-sync `save_map` / `lib_registry.write` / assign-name 初期化 / mission の退避 ×2) | 表に**載せない** (検出 0 件であることを `test_moved_writers_no_longer_appear` が固定) |
-| ロックファイル・dir 作成 (`R_LOCK` / `R_DIR`) | 残す: 中身を持たない。queue の dir は `ensure_dir` を通す |
-| ログ・観察記録・印 (heartbeat / activity / grace marker 等。`R_LOG` / `R_MARK`) | 残す: 正本ではなく再生成できる (§5.3)。lock を足すと全 tool 呼び出しが queue を待つ |
-| デーモン側 JSON 状態・台帳・拒否記録 (`R_DAEMON_JSON`) | 残す: 不変条件 7 (消してよい) |
-| registry/mux・retirements・workers・verification・handoffs・task-graph | 残す: 各 lib が唯一の定義を持つ (§5.3)。retirement は R1 のプロトコル (書き方を変えると daemon-authority の論証をやり直す) |
-| Worker の settings・ベンチ・セットアップ・hook の権限設定 | 残す: queue / registry の外 |
+| ロックファイル 14 件・dir 作成と一時ファイル 14 件 (`R_LOCK` / `R_DIR` / `R_TMP`) | 残す: 中身を持たない。queue の dir は `ensure_dir` を通す |
+| ログ 20 件・印 24 件 (heartbeat / activity / grace marker 等。`R_LOG` / `R_MARK`) | 残す: 正本ではなく再生成できる (§5.3)。lock を足すと全 tool 呼び出しが queue を待つ |
+| デーモン側 JSON 状態・台帳・拒否記録 30 件 (`R_DAEMON_JSON`) | 残す: 不変条件 7 (消してよい) |
+| registry/mux 3・retirements 10・workers 7・verification 3・handoffs 2・task-graph の専用ロック / 印 (上の 14・24 に含む) = 25 件 | 残す: 各 lib が唯一の定義を持つ (§5.3)。retirement は R1 のプロトコル (書き方を変えると daemon-authority の論証をやり直す) |
+| Worker の settings・ベンチ・セットアップ・hook の権限設定・reviewer の一時ファイル・knowledge への追記 (計 60 件) | 残す: queue / registry の外、または書き手 1 者 (`review-plan.sh` の verdict は §5.1 の「寄せない」) |
 
 **S3 の QA (t013) から持ち越した項目**: mission の退避 (`archive` / `init --force`) の rename は `durable_rename` に通した (赤の実証: `os.fsync` と `os.rename` を
 記録するスタブで、`shutil.move` の形は述語を満たさない)。`hooks/pre-compact.sh:59` の in-place 書き込みは lib 経由にした (t012 の「寄せない」を覆した)。

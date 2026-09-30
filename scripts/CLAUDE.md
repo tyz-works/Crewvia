@@ -25,7 +25,7 @@ lib ごとの**破ってはいけない契約**の要約。理由・経緯・全
 
 - queue への書き込みの唯一の入口（`knowledge/state-store.md` §3・§4.1）。`atomic_write_text`（tmp → fsync → replace → **親 dir fsync**・
   mode 引き継ぎ）/ `atomic_remove` / `transaction()`（`queue/.lock`・取得後に読み直す・入れ子は即 `NestedTransaction`）/
-  `Txn.recover()`（R-1〜R-4。**正本は書かない**。plan.sh はまだ呼ばない = S4）/ `diagnose()`（書かない）/
+  `Txn.recover()`（R-1〜R-4。**正本は書かない**。plan.sh が `recover_before()` で呼ぶ = S4 / t016。下の「回復」）/ `diagnose()`（書かない）/
   監査ログ `queue/audit/transitions-YYYYMMDD.jsonl`（1 トランザクション = 1 行。Result・理由・本文は出さない）。
 - **plan.sh は `with_lock()` の中の `save_task` / `save_mission` / `save_state` / `publish_assignment` / `retire_assignment` /
   `classify_assignment` だけで queue を書く**（`_txn()` = lib の `Txn` への委譲）。`with_lock` の外で呼ぶと `RuntimeError`。
@@ -51,6 +51,25 @@ lib ごとの**破ってはいけない契約**の要約。理由・経緯・全
 - `parse_opts()` は queue の骨組み（`missions/` `archive/`）を作らない。作るのは `with_lock()` の中（ロックを取った後）。
 - 戻し方: PR revert → `scripts/sync-main-checkout.sh`。card・mission・state・assignment は 1 バイトも書き換えていない
   （`knowledge/state-store.md` §4.1）。
+
+## 回復（card = 正本・assignment / `.identity` = projection。S4 / t016）
+
+- **ロックを取った直後・前提検査より前**に plan.sh の `recover_before(cards, agents, add_missions, archive_slugs)` が
+  `Txn.recover()` を呼び、card が言っていることに projection を合わせる（R-1 枠を作る / R-2 孤児の枠を消す / R-3 `next_task_id` /
+  R-4 退避済みを `active_missions` から外す）。**正本（status / worker / started_at）は書かない**。範囲は名指しの card・その worker の枠・
+  **逆引き**（この card を指す枠）・呼び出し元の枠だけ（queue 全体は走査しない）。呼ぶコマンドは
+  `knowledge/state-store.md` §2.7 の表。`reap-orphan-assignment` は自身が R-2 なので呼ばない。
+- **回復は拒否を 1 つも足さない**。表に無い食い違い（`reported:<コード>`）は stderr と監査ログに 1 行出して**書かずに**本体へ進む。
+  回復自体の書き込みが失敗しても本体は止めず警告する（止めると出口が消える）。修復・報告の `op=recover` の行は lib が**その場で**
+  監査ログに追記する（本体が後で `die` しても残る）。env の停止スイッチは付けない。
+- R-2 で消してよい status の集合は `lib_state_store.is_orphan_target(status, worker)` の 1 定義（手放し済み ∪ needs_director ∪
+  worker の無い pending）。`reap-orphan-assignment` も同じ関数。blocked / verification_failed 等を足さない（Director が作業中の card に
+  `update --status` で付けても Worker は動いており、消すと動いている Worker を殺す経路になる）。
+- R-1 は**所有の証拠**（`worker = A` の in_progress の card が missions/ **と archive/** の全体でこの 1 枚だけ）を読んだときだけ書く。
+  `plan.sh archive` は status を検査しないので archive/ にも A の card が残りうる。読めない card があれば書かない。
+- `plan.sh store-check [--mission <slug>]` は同じ判定を**書かずに**列挙する読み取り専用の入口（ロックなし。2 回連続で出たものだけが本物）。
+- done は `D0 拒否 → D1 自分の card に pr_number → D2 依存先へ伝播 → D3 done → D4 枠撤去 → D5 mission done` の順（派生値は正本より前）。
+  D0 の 2 つの拒否は exit 3・何も書かない・出口をメッセージに出す。順序を戻すと `tests/test_projection_recovery_on_lock.py` が赤。
 
 ## 依存（`lib_dep_rules.py`）
 

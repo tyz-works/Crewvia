@@ -129,17 +129,31 @@ def test_control_the_reap_is_the_only_write_for_a_finished_task(sandbox):
     assert (sb.tasks / "t001.md").read_text() == before
 
 
-def test_keeps_an_assignment_pointing_at_a_needs_director_task(sandbox):
-    """needs_director は「終了した」に含めない —— 正常経路では既に撤去されているはずで、
-    それでも残っているのは証拠不足 (破壊的操作はより強い証拠を要求する)。"""
+def test_reaps_an_assignment_pointing_at_a_needs_director_task(sandbox):
+    """S4 (t016) で変わった: 撤去してよい status の集合は回復の R-2 と同じ (`lib_state_store.is_orphan_target`)。
+    needs_director に遷移するコマンド (needs-director / retire) は自分で assignment を撤去するので、それでも
+    枠が残っているのは「そのコマンドが途中で落ちた」以外に説明が無い。以前 (S3 まで) は証拠不足として消さなかった
+    (`needs_director` は「終了した」の集合に入っていない — `RELEASED_WORK_STATUSES` はそのまま)。"""
     sb = sandbox
     _sb_card(sb, "t001", "needs_director", worker=CODEX, skills="codex-review")
     (_assignments(sb) / CODEX).write_text(f"{MISSION}:t001\n")
 
     r = _reap(sb)
 
-    assert r.returncode == 3, (r.returncode, r.stdout, r.stderr)
-    assert (_assignments(sb) / CODEX).read_text().strip() == f"{MISSION}:t001"
+    assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
+    assert not (_assignments(sb) / CODEX).exists()
+
+
+def test_reaps_an_assignment_pointing_at_a_pending_task_with_no_worker(sandbox):
+    """`update --reset` / `retire --outcome reset` の残骸 (card は pending・worker なし。枠だけが残った)。"""
+    sb = sandbox
+    _sb_card(sb, "t001", "pending", worker=None, skills="codex-review")
+    (_assignments(sb) / CODEX).write_text(f"{MISSION}:t001\n")
+
+    r = _reap(sb)
+
+    assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
+    assert not (_assignments(sb) / CODEX).exists()
 
 
 @pytest.mark.parametrize("status", UNFINISHED_STATUSES)

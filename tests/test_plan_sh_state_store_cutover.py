@@ -136,7 +136,10 @@ def _drive_every_mutating_subcommand(sb: Sandbox):
     sb.run("verify-result", "t003", "pass", "--notes", SECRET_RESULT, agent="Ren")
     expected.append(("verify-result", "t003", "verifying", "verified"))
 
+    # verify-result は assignment を撤去しない (Ren → t003 が verified の card を指したまま残る)。
+    # 次の pull の回復 (S4 / R-2) が、その孤児の枠を消す。回復の行 (op=recover) は pull の行の前に出る
     sb.run("pull", "--agent", "Ren", "--skills", "bash", "--task", "t004")
+    expected.append(("recover", "t003", "verified", "verified"))
     expected.append(("pull", "t004", "pending", "in_progress"))
     gen = _field(sb.card_text("t004"), "started_at")
     assert gen
@@ -169,7 +172,7 @@ def test_every_mutating_subcommand_writes_an_audit_row(sb):
 
     for r in rows:
         assert set(r) == AUDIT_KEYS | ({"detail"} & set(r)), r
-        assert r["result"] == "ok"
+        assert r["result"] == ("repaired:R-2" if r["op"] == "recover" else "ok")
         assert r["execution_id"] is None                 # 01c が埋める。01a では null 固定
         assert re.fullmatch(r"[0-9a-f]{32}", r["txn_id"])
         assert r["ts"].endswith("Z")
@@ -181,7 +184,7 @@ def test_every_mutating_subcommand_writes_an_audit_row(sb):
     # AGENT_NAME を渡した subcommand の actor はその名前
     assert [r["actor"] for r in rows if r["op"] == "done"][:1] == ["Ren"]
     # 全 QUEUE_MUTATING_SUBCOMMANDS のうち review / launch (claude を起動する) 以外を実走した
-    ran = {op for op, *_ in expected}
+    ran = {op for op, *_ in expected if op != "recover"}
     assert ran == _mutating_subcommands() - {"review", "launch"}
 
 

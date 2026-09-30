@@ -728,12 +728,15 @@ def _kai_codex_orphan_candidate(task_statuses_by_mission):
     大多数)。このサイクルで既に読み込み済みの `task_statuses_by_mission` (無ければ
     `_referenced_task_status()` が card を直接読む。t117) だけを見て、subprocess を
     起動する価値があるかを判定する —— 実際の削除判定 (キューロックの中での読み
-    直し・`needs_director` の除外・世代照合) は `plan.sh reap-orphan-assignment`
-    側 (cmd_reap_orphan_assignment) だけが行う。ここで「消してよい」と結論しない:
-    対象はあくまで `RELEASED_WORK_STATUSES` (`codex_review_slot_busy()` と同じ
-    「終了した」の定義) で、`needs_director` は**含めない** —— plan.sh 側が
-    needs_director を保留 (削除しない) に倒すので、含めても無駄な subprocess 起動が
-    増えるだけである。
+    直し・消してよい status の判定 (回復の R-2 と同じ 1 つの定義 `is_orphan_target`)・世代照合) は
+    `plan.sh reap-orphan-assignment` 側 (cmd_reap_orphan_assignment) だけが行う。
+    ここで「消してよい」と結論しない: 対象はあくまで `RELEASED_WORK_STATUSES`
+    (`codex_review_slot_busy()` と同じ「終了した」の定義) で、`needs_director` は
+    **含めない**。vNext 01a S4 で plan.sh 側は needs_director / worker の無い pending も
+    消すようになったが (回復の R-2 と同じ集合)、この安い判定は**意図して狭いまま**にする:
+    needs_director への遷移 (kai-review.sh → `plan.sh needs-director`) は自分で枠を撤去するので
+    ここで候補に立てる意味が薄く、広げると毎サイクルの subprocess 起動が増えるだけで、
+    dispatcher の restart も要る。
     """
     raw = read_assignment(CODEX_REVIEW_AGENT)
     if is_missing(raw) or is_unreadable(raw):

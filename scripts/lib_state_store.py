@@ -110,7 +110,8 @@ _SAFE_DETAIL_RES = tuple(re.compile(p) for p in (
     r'[A-Za-z0-9_./-]{1,300}: ' + _CODE,                  # missions/<slug>/tasks: list_error:EACCES
     r'leftover: t\d+(?:, t\d+)*',                         # R-3
     r'status=(?:' + '|'.join(sorted(_KNOWN_STATUSES)) + r'|<unknown>)',
-    _IDENT + r'/' + _IDENT + r'(?:, ' + _IDENT + r'/' + _IDENT + r')*',   # duplicate_owner / owner_unprovable
+    # duplicate_owner / owner_unprovable: `<slug>/<tid>` (退避先の card は `archive/<slug>/<tid>`)
+    r'(?:archive/)?' + _IDENT + r'/' + _IDENT + r'(?:, (?:archive/)?' + _IDENT + r'/' + _IDENT + r')*',
     r'assignment body: lstat failed',
 ))
 _SAFE_RESULT_RE = re.compile(r'(ok|repaired:R-[1-4]|reported:[a-z_]+)')
@@ -210,6 +211,19 @@ class CardUnreadable(StoreReadError):
 
 class CardNotFound(StoreError):
     """task card が本当に無い (ENOENT)。"""
+
+
+class AlreadyExists(StoreError):
+    """新規作成のつもりで書く先に、既に何かが在る (または在るか確かめられない)。
+
+    回復 (R-3 等) が失敗して採番・前提が古いままでも、**既存の card / mission を上書きしない**
+    ための排他作成の拒否 (t037)。`path` は queue からの相対 (中身は含めない)。
+    """
+
+    def __init__(self, path, state):
+        self.path = path
+        self.state = state                      # 'present' / 'unobservable'
+        super().__init__(f"{path} は既に在ります ({state}) — 新規作成では上書きしません")
 
 
 class InvalidName(StoreError):
@@ -607,6 +621,17 @@ _NEEDS_DIRECTOR = 'needs_director'
 ORPHAN_ASSIGNMENT_FINISHED_STATUSES = _status.RELEASED_WORK_STATUSES
 
 
+def is_orphan_target(status, worker):
+    """assignment が指す card が、**assignment を撤去するコマンド自身の書く status** か (R-2 の集合。
+    設計 §2.3)。手放し済み (done / verified / skipped / failed) ∪ needs_director (needs-director /
+    retire) ∪ worker が空の pending (update --reset / retire reset)。R-2 と `plan.sh
+    reap-orphan-assignment` が同じ定義を使う (1 か所)。blocked / verification_failed 等は含めない —
+    Director が作業中の card に `update --status` で付けても Worker は動いており、assignment は残るのが
+    正当 (「holding でない status すべて」にすると動いている Worker を殺す経路になる)。"""
+    return (status in ORPHAN_ASSIGNMENT_FINISHED_STATUSES or status == _NEEDS_DIRECTOR
+            or (status == 'pending' and not worker))
+
+
 def agent_name_problem(agent):
     """Worker 名が assignment ファイル名として使えない理由。使えるなら None。"""
     if not isinstance(agent, str) or not agent or '/' in agent or '\0' in agent \
@@ -1000,6 +1025,28 @@ class Txn:
     def write_mission(self, slug, data):
         self._write(self.mission_path(slug), serialize_mission(data))
 
+    # ---- 新規作成 (排他) ---------------------------------------------------
+    # ロックの中で「無いことを確かめてから」書く。ENOENT 以外 (在る・EACCES 等で見えない) は
+    # 書かずに `AlreadyExists` — 回復が失敗して採番が古いままでも、既存を黙って置き換えない。
+    def path_state(self, *parts):
+        """queue 相対の `parts` が `'present'` / `'absent'` / `'unobservable'`。"""
+        return _path_state(self._p(*parts))
+
+    def card_state(self, slug, tid):
+        return _path_state(self.card_path(slug, tid))
+
+    def create_card(self, slug, tid, meta, body):
+        state = self.card_state(slug, tid)
+        if state != 'absent':
+            raise AlreadyExists(self._rel(self.card_path(slug, tid)), state)
+        self.write_card(slug, tid, meta, body)
+
+    def create_mission(self, slug, data):
+        state = _path_state(self.mission_path(slug))
+        if state != 'absent':
+            raise AlreadyExists(self._rel(self.mission_path(slug)), state)
+        self.write_mission(slug, data)
+
     def write_state(self, state):
         self._write(self.state_path, serialize_state(state))
 
@@ -1194,6 +1241,20 @@ class _Recovery:
                 self._cards[key] = self.t._read_card(path, tid)
         return self._cards[key]
 
+    def _archived_card(self, slug, tid):
+        """`archive/<slug>/tasks/<tid>.md` の card (`_read_card` の結果)。R-2 が「枠が指す card」を
+        missions/ に見つけられなかったときの 2 か所目。名前が不正なら無いものとして扱う。"""
+        key = ('archive', slug, tid)
+        if key not in self._cards:
+            try:
+                path = os.path.join(self.t._p('archive', _check_slug(slug), 'tasks'),
+                                    f"{_check_tid(tid)}.md")
+            except InvalidName:
+                self._cards[key] = ('missing', None, None, None, None)
+            else:
+                self._cards[key] = self.t._read_card(path, tid)
+        return self._cards[key]
+
     def _slot(self, agent):
         if agent in self._cleared:
             return ('absent',)
@@ -1263,6 +1324,12 @@ class _Recovery:
             return
         kind, meta, _b, reason, _e = self._card(pslug, ptid)
         if kind == 'missing':
+            # mission が退避 (plan.sh の mission 退避) 済みなら card はそちらにある。決着した task を
+            # 指したまま残った枠 (最後の mission が完了 → 退避された直後の孤児。reap-orphan-assignment の
+            # t117 と同じ形) を、ここでも消せるようにする。枠が指す task の card を**見つけられなかった**
+            # ときだけ報告に倒す (どちらにも無い = 証拠が無い)。
+            kind, meta, _b, reason, _e = self._archived_card(pslug, ptid)
+        if kind == 'missing':
             self._emit('reported:assignment_target_missing', pslug, ptid, agent)
             return
         if kind == 'unreadable':
@@ -1270,8 +1337,7 @@ class _Recovery:
             return
         status = meta.get('status')
         worker = meta.get('worker') or None
-        if status in ORPHAN_ASSIGNMENT_FINISHED_STATUSES or status == _NEEDS_DIRECTOR \
-                or (status == 'pending' and worker is None):
+        if is_orphan_target(status, worker):
             # 撤去するコマンド自身が書く status だけ (「途中で落ちた」以外に説明が無い組)。
             def _retire():
                 self.t.retire_assignment(agent, pslug, ptid, None)
@@ -1298,8 +1364,14 @@ class _Recovery:
         if not holding:
             return
         if not (isinstance(worker, str) and worker):
+            # worker が無いと枠の持ち主を決められない。R-1 は書かない (報告のみ) が、
+            # assignment を持つはずの status (in_progress / ready_for_verification / verifying /
+            # needs_human_review) は全部 finding にする (S4 持ち越し: 以前は in_progress だけだった)
             if status == 'in_progress':
                 self._emit('reported:in_progress_without_worker', slug, tid)
+            else:
+                self._emit('reported:holding_without_worker', slug, tid,
+                           detail=f"status={_safe_status(status) or '<unknown>'}")
             return
         if agent_name_problem(worker) or _safe_token(worker) is None:
             # ファイル名として通っても、識別子の形でない worker 名 (空白・= 等) は内容とみなす:
@@ -1315,13 +1387,19 @@ class _Recovery:
             if slot[1] != f"{slug}:{tid}":
                 self._emit('reported:agent_slot_busy', slug, tid, worker)   # 枠の中身は出さない
                 return
-            if status == 'in_progress':
-                verdict = self.t.classify_assignment(worker, slug, tid, str(gen) if gen else None)
-                if gen and verdict == ASSIGN_SUCCESSOR:
+            # .identity の検査は assignment を持つ status 全部 (S4 持ち越し: 以前は in_progress だけ)。
+            # 欠け・壊れ・読めない・別の task を指す、はどれも finding (修復はしない = report-only。
+            # identity → 本体の書き順なので、本体があって identity が無いのは crash では作れない)。
+            if gen:
+                verdict = self.t.classify_assignment(worker, slug, tid, str(gen))
+                if verdict == ASSIGN_SUCCESSOR:
                     self._emit('reported:generation_mismatch', slug, tid, worker)
-                elif gen and verdict == ASSIGN_UNVERIFIABLE:
+                elif verdict == ASSIGN_UNVERIFIABLE:
                     self._emit('reported:assignment_unverifiable', slug, tid, worker,
                                detail='identity unreadable or malformed')
+            elif self.t._read_identity(worker) is None:
+                self._emit('reported:assignment_unverifiable', slug, tid, worker,
+                           detail='identity unreadable or malformed')
             return
         # 枠が ABSENT。R-1 が書くのは in_progress だけ (crash で欠けが生まれるのは pull の窓だけ)
         if status != 'in_progress':
@@ -1348,32 +1426,40 @@ class _Recovery:
         **読んで確かめた**ときだけ None。2 枚以上 → duplicate_owner、読めない card が 1 枚でもあれば
         owner_unprovable。archive は読まない。読むのは status と worker だけ。"""
         owned, unprovable, list_errors = [], [], []
-        missions_dir = self.t._p('missions')
-        try:
-            slugs = sorted(os.listdir(missions_dir))
-        except FileNotFoundError:
-            slugs = []
-        except OSError as e:
-            return 'owner_unprovable', f"missions: list_error:{_errno_name(e.errno)}"
-        for s in slugs:
-            tdir = os.path.join(missions_dir, s, 'tasks')
+        # missions/ と archive/ の両方を読む。archive も所有の証拠: `plan.sh archive` は mission / task の
+        # status を検査せず rename するので、in_progress のカードを持ったまま archive された mission に
+        # A のカードが残りうる。missions/ だけを数えると、残る 1 枚だけを A の全てと読んで枠を書く
+        # (S4 / t016。設計 §2.5)。archive の card は `archive/<slug>/tasks/tNNN.md`。
+        for base, prefix in (('missions', ''), ('archive', 'archive/')):
+            base_dir = self.t._p(base)
             try:
-                names = sorted(os.listdir(tdir))
+                slugs = sorted(os.listdir(base_dir))
             except FileNotFoundError:
-                continue
+                slugs = []
             except OSError as e:
-                list_errors.append(f"{s}/tasks: list_error:{_errno_name(e.errno)}")
-                continue
-            for name in names:
-                m = _cards.TASK_FILENAME_RE.fullmatch(name)
-                if not m:
+                return 'owner_unprovable', f"{base}: list_error:{_errno_name(e.errno)}"
+            for s in slugs:
+                tdir = os.path.join(base_dir, s, 'tasks')
+                try:
+                    names = sorted(os.listdir(tdir))
+                except FileNotFoundError:
                     continue
-                t = f"t{m.group(1)}"
-                kind, meta, _b, reason, _e = self._card(s, t)
-                if kind == 'unreadable':
-                    unprovable.append(f"{s}/{t}")
-                elif kind == 'ok' and meta.get('worker') == agent and meta.get('status') == 'in_progress':
-                    owned.append(f"{s}/{t}")
+                except OSError as e:
+                    list_errors.append(f"{prefix}{s}/tasks: list_error:{_errno_name(e.errno)}")
+                    continue
+                for name in names:
+                    m = _cards.TASK_FILENAME_RE.fullmatch(name)
+                    if not m:
+                        continue
+                    t = f"t{m.group(1)}"
+                    if prefix:
+                        kind, meta, _b, reason, _e = self._archived_card(s, t)
+                    else:
+                        kind, meta, _b, reason, _e = self._card(s, t)
+                    if kind == 'unreadable':
+                        unprovable.append(f"{prefix}{s}/{t}")
+                    elif kind == 'ok' and meta.get('worker') == agent and meta.get('status') == 'in_progress':
+                        owned.append(f"{prefix}{s}/{t}")
         if list_errors:
             return 'owner_unprovable', list_errors[0]        # 形は「パス: コード」1 件 (ids と混ぜない)
         if unprovable:

@@ -514,11 +514,16 @@ spawn を塞がなくなった) —— だが**ファイルそのものを消す
   中で assignment を読み直し、指す task が「終了した」
   (`TERMINAL_STATUSES ∪ DEAD_DEP_STATUSES ∪ HELD_DEP_STATUSES` — `retire` の
   `PRECONDITION_UNMET` (exit 3) と同じ「前提が外れたら 1 バイトも書かない」規約) ときだけ
-  `retire_assignment()` で撤去する。**`needs_director` は「終了した」に含めない** ——
-  正常経路 (kai-review.sh → `plan.sh needs-director`) では needs_director への遷移
-  そのものが assignment を撤去するので、それでも残っているのは証拠不足であり、
-  `codex_review_slot_busy()` の read-only な「塞がない」判定とは意図的に非対称にした
-  (破壊的操作はより強い証拠を要求する — memory: evidence-for-destructive-decisions)。
+  `retire_assignment()` で撤去する。**`needs_director` は「終了した」(`RELEASED_WORK_STATUSES`) に含めない**
+  (この時点の設計。dispatcher の候補選択は今もこの狭い集合のまま)。
+  **訂正 (vNext 01a S4 / t016)**: 撤去してよい status の集合は、回復 (R-2) と同じ
+  `lib_state_store.is_orphan_target()` (手放し済み ∪ needs_director ∪ worker の無い pending) に揃えた。
+  needs_director に遷移するコマンド (needs-director / retire) は自分で assignment を撤去するので、それでも
+  残っているのは「そのコマンドが途中で落ちた」以外に説明の無い組で、card が正本として言っている
+  (`knowledge/state-store.md` §2.3 / §2.7)。in_progress / blocked / ready_for_verification 等は今までどおり
+  exit 3。`codex_review_slot_busy()` の read-only な「塞がない」判定との非対称 (破壊的操作はより強い証拠を要求する —
+  memory: evidence-for-destructive-decisions) は、「card が言っている status のうち撤去するコマンドが書くものだけ」に
+  絞ることで保っている。
 - **dispatcher.sh** が毎サイクル `reap_kai_codex_orphan_assignment()` を呼ぶ。安さの根拠は
   `_kai_codex_orphan_candidate()`: このサイクルで既に読み込み済みの
   `task_statuses_by_mission` だけを見て、`RELEASED_WORK_STATUSES` (needs_director は

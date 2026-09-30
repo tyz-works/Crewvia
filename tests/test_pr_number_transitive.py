@@ -87,13 +87,35 @@ class TestTransitivePropagation:
         assert _pr_line(sb, "t004") == "pr_number: 231"
 
     def test_an_existing_pr_number_on_a_transitive_target_is_not_overwritten(self, sb):
+        """S4 (t016) で変わった: 伝播先に**違う**番号が既にあるとき、以前は黙って飛ばして done を通した
+        (正本は 231・レビュー対象は 100 で確定)。今は done を拒否する (exit 3・何も書かない。設計 §2.2 D0 (a))。
+        どちらの番号が正しいかは自動では決めず、Director が伝播先を直してから再度 done する。
+        「上書きしない」は変わらない (拒否するので 100 は 100 のまま)。"""
         sb.card("t001", status="in_progress", worker="Ren", extra=["deliverable: pr"])
         sb.card("t002", skills="[qa]", blocked_by="[t001]", extra=["deliverable: none"])
         sb.card("t003", skills="[review]", blocked_by="[t002]",
                 extra=["deliverable: none", "pr_number: 100"])
+        before = sb.snapshot()
+        r = _done(sb, "t001", "--pr", "231")
+        assert r.returncode == 3, (r.stdout, r.stderr)
+        assert "t003" in r.stderr and "pr_number=100" in r.stderr
+        assert "update t003 --pr-number 231" in r.stderr, "出口をメッセージに出す"
+        assert sb.snapshot() == before and _pr_line(sb, "t003") == "pr_number: 100"
+        # 出口: 依存先を正しい番号に直せば通る
+        assert sb.run("update", "t003", "--pr-number", "231", "--mission", MISSION).returncode == 0
         r = _done(sb, "t001", "--pr", "231")
         assert r.returncode == 0, (r.stdout, r.stderr)
-        assert _pr_line(sb, "t003") == "pr_number: 100"
+        assert _pr_line(sb, "t003") == "pr_number: 231"
+
+    def test_the_same_number_on_a_transitive_target_is_not_a_conflict(self, sb):
+        """再実行 (前の done が伝播の途中で落ちた) で、依存先が既に**同じ**番号を持つのは食い違いではない。"""
+        sb.card("t001", status="in_progress", worker="Ren", extra=["deliverable: pr"])
+        sb.card("t002", skills="[qa]", blocked_by="[t001]", extra=["deliverable: none"])
+        sb.card("t003", skills="[review]", blocked_by="[t002]",
+                extra=["deliverable: none", "pr_number: 231"])
+        r = _done(sb, "t001", "--pr", "231")
+        assert r.returncode == 0, (r.stdout, r.stderr)
+        assert _pr_line(sb, "t003") == "pr_number: 231"
 
 
 class TestCorruptCardBreaksTheChain:

@@ -883,6 +883,29 @@ lib を通さずに読み書きする」。§5 の計測を e6d6801 → 現行�
 1 バイトも書き換えていない (書き方が変わっただけ)。`queue/.taskvia-map.json.lock` と `queue/audit/` は残ってよい (読み手がいない)。
 旧 verifier-dispatcher は card に `status: verifying` を直接書くので、戻した後も card は読める。
 
+### 6.2 S5 fix 2 巡目 (t033 / PR #259 Codex P2) — 「済んだが耐久性だけ失敗」は続行する
+
+`durable_rename` は `os.rename` の後に親 dir の fsync が失敗すると `StoreWriteError(committed=True, op='fsync_dir')` を出す。
+旧 `cmd_archive` / `cmd_init --force` はこれを die に写し、mission dir は移動済みなのに `active_missions` / `default_mission` が
+元の名前を指したまま残った (元が無いので再試行でも直らない)。**規則: `committed` の失敗は警告して続行し、状態の更新を
+最後までやる。exit code は 0** (`Txn._write` と同じ扱い)。共通の入口は plan.sh の `_committed_durability_failure()` / `_move_mission_dir()`。
+rename 自体の失敗 (何も動いていない) は従来どおり die・state 不変。
+
+複数の書き込みを順に行う操作 (S5 が足した・触ったもの) の全部 —— 途中の 1 歩が「済んだが耐久性だけ失敗」したとき:
+
+| 操作 | 途中の 1 歩 | 修正前 | 今 |
+|---|---|---|---|
+| `archive` | rename → state.yaml 更新 | **rename 後で die・state 未更新 (再試行でも直らない)** | (a) 警告して state 更新まで完了 |
+| `init --force` | 退避 rename → state から外す → mission 作り直し | **同上** | (a) 最後まで完了 |
+| `pull` | worktree 作成 → `.crewvia-env` (`atomic_write_text`) → JSON 出力 | die・JSON が出ない (worktree は残る) | (a) 警告して JSON まで出す |
+| `verifying` / `snapshot` / risk flags / verdict | `save_task` / `save_mission` (`Txn._write`) | 既に (a) (§2 の `_durability_unproven`) | 変更なし |
+| taskvia map | `locked_update_json` (`atomic_write_text`) | `StoreError` を警告に写して続行 | 変更なし (a) |
+| `lib_registry.write` (assign-name / bump / register) | 名簿の置換 | 例外 → assign-name が**登録済みなのに名前を返さず**落ちる | (a) 警告して続行 (名簿は新しい内容) |
+| `durable_rename` を直接呼ぶ他の経路 | — | — | 無い (呼び出しは plan.sh の 2 か所だけ。`test_queue_writes_go_through_the_store` の表が増減を見る) |
+
+「済んだ変更を未完了扱いにして後続を捨てる」経路は 0。赤の実証: `tests/test_s5_fix2_rename_fsync_failure.py` (rename 後の最初の親 dir fsync を EIO にするスタブ。
+修正前の plan.sh で archive / init --force の 2 件が赤)。
+
 ---
 
 ## 7. cutover と rollback (R2)

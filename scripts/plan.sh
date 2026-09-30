@@ -2569,6 +2569,27 @@ def _durable_makedirs(path):
         die(f"[plan.sh] cannot create directory {path}: {e}")
 
 
+def _committed_durability_failure(e):
+    """`StoreWriteError` が「変更は済んだが、親 dir の fsync だけが失敗した」(`committed`) か。
+    True のときは**続行する**: 済んだ変更を未完了扱いにして後続の書き込みを捨てると、state.yaml が
+    移動後の dir を指したまま残る (元が無いので再試行でも直らない)。`Txn._write` と同じ扱い。"""
+    return isinstance(e, _STORE.StoreWriteError) and e.committed and e.op == 'fsync_dir'
+
+
+def _move_mission_dir(src, dst, label):
+    """mission dir の退避 (archive / init --force)。rename 済み・親 dir の fsync 失敗 (`committed`) は
+    警告して続行し、呼び出し側が state.yaml の更新まで**最後までやる** (exit code は 0)。
+    rename 自体の失敗 (何も動いていない) は従来どおり die。"""
+    try:
+        _STORE.durable_rename(src, dst)
+    except _STORE.StoreError as e:
+        if not _committed_durability_failure(e):
+            die(f"[plan.sh {label}] cannot move {src} → {dst}: {e}")
+        print(f"[plan.sh {label}] warn: 移動は済みましたが、親ディレクトリの fsync に失敗しました "
+              f"({e}) — 電源断に対する耐久性は確認できていません。state.yaml の更新は続行します",
+              file=sys.stderr)
+
+
 def _ensure_queue_dirs():
     """queue の骨組み。引数を検証し終えたあとにだけ作る (`--help` は何も作らない)。"""
     _durable_makedirs(os.path.join(QUEUE_DIR, 'missions'))
@@ -2659,10 +2680,7 @@ def cmd_init(args):
                 ts = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
                 backup_name = f"{slug}.overwritten-{ts}"
                 _durable_makedirs(ARCHIVE_DIR)
-                try:
-                    _STORE.durable_rename(mission_dir(slug), os.path.join(ARCHIVE_DIR, backup_name))
-                except _STORE.StoreError as e:
-                    die(f"[plan.sh init] cannot move previous '{slug}' to archive/{backup_name}: {e}")
+                _move_mission_dir(mission_dir(slug), os.path.join(ARCHIVE_DIR, backup_name), 'init')
                 print(
                     f"[plan.sh init] previous '{slug}' moved to archive/{backup_name}",
                     file=sys.stderr,
@@ -3383,7 +3401,10 @@ def cmd_pull(args):
             try:
                 _STORE.atomic_write_text(env_file, env_text)
             except _STORE.StoreError as _e:
-                die(f"[plan.sh pull] cannot write {env_file}: {_e}")
+                if not _committed_durability_failure(_e):
+                    die(f"[plan.sh pull] cannot write {env_file}: {_e}")
+                print(f"[plan.sh pull] warn: {env_file} は書き込み済みですが、親ディレクトリの fsync に失敗しました "
+                      f"({_e})", file=sys.stderr)
         else:
             print(
                 f'[plan.sh pull] WARNING: worktree creation skipped:\n{wt.stderr.strip()}',
@@ -5205,10 +5226,7 @@ def cmd_archive(args):
         dst = os.path.join(ARCHIVE_DIR, slug)
         if os.path.exists(dst):
             die(f"archive target already exists: {dst}")
-        try:
-            _STORE.durable_rename(src, dst)
-        except _STORE.StoreError as e:
-            die(f"[plan.sh] cannot move {src} → {dst}: {e}")
+        _move_mission_dir(src, dst, 'archive')
 
         active = state.get('active_missions') or []
         if slug in active:

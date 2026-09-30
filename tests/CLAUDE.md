@@ -49,6 +49,10 @@ root の `CLAUDE.md` から移した、テスト専用の規則。設計と経�
   （`.sh` の python ヒアドキュメントは**全ブロック**）、bash は字句（変数は解決できないので書き先の語で絞らず全部拾う）。
   検査件数の下限・死んだ行・陽性/陰性対照（本物のコードから切り出した形）を持つ。読み取りの表とは混ぜない。
   検出器を触ったら `python3 -m pytest tests/test_queue_writes_go_through_the_store.py` の陽性対照が全部通ること。
+  bash の字句解析は `_lex_line` の 1 か所（heredoc の開始と書き込みの検出が同じ引用符の理解を使う）。**コメント・引用符の中の
+  `<<X` は開始ではない**（誤認すると終端語が現れず、その行から末尾までが未検査になる — 旧 S5 は `pre-tool-use.sh` 434 行 /
+  `git-helpers.sh` 104 行を見ていなかった）。`test_no_target_has_an_unclosed_heredoc_or_quote` が全対象で「閉じない heredoc / 引用符 0 件」を
+  assert する。赤の実証: `bash tests/red_proof_queue_write_scan_heredoc.sh`（約 5 秒）。
 
 ## State Store (`lib_state_store`) のテスト
 

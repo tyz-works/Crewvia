@@ -514,6 +514,39 @@ locked_update_json(path, lock_path, fn) -> dict  # 専用ロック + 読み直�
 | file mode | 既存ファイルの mode を引き継ぐ | mkstemp は 0o600 で作るので、引き継がないと Worker / デーモン / hooks の間で読めなくなる |
 | 直列化 | YAML / frontmatter の直列化は今の plan.sh の関数 (`serialize_frontmatter` / `dump_yaml`) を lib に移し、出力をバイト単位で変えない | S3 の QA (t013) が固定 fixture の前後比較で確かめる |
 
+### 3.3 S2 (t008) で実装した形 — 設計との差分と、決めたこと
+
+`scripts/lib_state_store.py`。**呼び出し元ゼロ** (`tests/test_state_store_has_no_callers_yet.py` が
+`lib_state_store` の名前の出現で固定。S3 が plan.sh を移すときにその `ALLOWED_CALLERS` を更新する)。
+
+- **`recover()` も S2 に入れた** (§3.1 は S4 の記述だったが、受入条件が「projection の再生成と食い違いの検出」
+  を含む)。R-1〜R-4 と §2.5 の「報告のみ」・逆引き・所有の証拠の走査・`op=recover` の即時追記まで。
+  **S4 が足すのは呼び出し側 (plan.sh の各コマンドが前提検査より前に呼ぶ・`Scope` を渡す・`store-check` の CLI・
+  done の D0〜D5 の順序) だけ**。`diagnose()` は同じ `_Recovery` を `apply=False` で走らせる (書くはずだったものを
+  `would-repair:R-n` として返す。ロジックの二重化なし)
+- **障害注入の口 `FAULT_HOOK`** (モジュール変数。env ではない — 不変条件 5)。書き込み・削除・監査ログの各段で
+  `hook(point, path)` を呼ぶ。既定は None。テストが fork した子の中でだけ差し込み SIGKILL を自分に送る
+  (`tests/state_store_scenarios.py`)。点は 1 回の `atomic_write_text` で 6、`atomic_remove` で 3、監査ログで 2
+- **決めたこと (設計に無かった細部)**:
+  - `nested` の判定は**スレッド単位** (別スレッドは待つ。同じスレッドの入れ子だけ `NestedTransaction`)
+  - `load_state()`: **ENOENT だけ**「まだ無い」= 空の既定値 (plan.sh `load_state` と同じ)。読めない・壊れているは
+    `StoreReadError`。`load_card()`: 無い = `CardNotFound`、読めない・`id` 欄がファイル名と食い違う = `CardUnreadable`
+    (書き戻しも `InvalidName` で拒否 — 識別子はファイル名。不変条件 2)
+  - `retire_assignment()` の削除失敗は**例外** (plan.sh の warn で握り潰す型を持たない)。本体 → identity の順
+  - 監査ログの `detail` 欄は R-3 の「前回の残りの tNNN」用 (200 字で切る。task id・Worker 名だけを入れる)
+  - **直列化は plan.sh の写し** (S3 まで二重)。`tests/test_state_store_serialization_matches_plan_sh.py` が plan.sh の関数を
+    AST で取り出して同じ入力での出力一致を固定し、本物の plan.sh が書いた card / mission / state が lib で再直列化して
+    同じバイトになることも確かめる。**plan.sh の `dump_yaml` は渡された `key_order` の表に未知のキーを追記する**
+    (1 回で終わる CLI では無害・長く生きるプロセスでは表が育つ) — lib は表をコピーして汚さない (出力は同じ)
+  - 状態の語彙 (`_TERMINAL_STATUSES` 等) は S1 (t004) の `lib_task_status.py` 合流までの暫定コピー。HELD / DEAD は
+    `lib_dep_rules` から取る (コピーしない)。**S1 が入ったら import に置き換える** (backlog)
+- **残る残骸 (無害・store-check が件数を出す)**: kill された書き手の `.<name>.tmp.*` / `retire_assignment` が本体を
+  消した後・identity を消す前で落ちた `<agent>.identity`。どちらも判定に使われない (列挙は `tNNN.md` だけ・classify は
+  本体を先に読み次の publish が上書きする)。crash 注入テストはこの 2 種だけを許容する
+- **戻し方** (S2 は本番の挙動を変えないので、戻すのは lib と テストの取り除きだけ): PR を revert →
+  `scripts/sync-main-checkout.sh` (ff + デーモン restart)。呼び出し元が無いので、戻しても plan.sh・dispatcher・hooks の
+  動作は 1 バイトも変わらない。S3 以降が merge 済みの場合は、先にそちらを revert する (依存の向きが逆)
+
 ---
 
 ## 4. 監査ログ (S3)

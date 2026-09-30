@@ -205,6 +205,14 @@ ALLOWED_JSON_PARSES: dict[tuple[str, str, str], str] = {
         "判定だけで、外側 (dict か) は強制済み・内側は phase の一致と `_recorded_pid()` の検証を通る。"
         "**証明できない形はすべて False = 待たずに従来どおり拒否** (壊れた marker が拒否を緩めない向き)。"
         "入口へ移すなら lib_daemon_state を plan.sh の依存に足すことになり、単体コピーの fixture が壊れる",
+    ("lib_state_store.py", "_read_identity", "json.loads(text)"):
+        _QUEUE_SIDE + "plan.sh `_read_assignment_identity` と同じ sidecar の読み (S2 の書き込み lib の写し。"
+        "S3 で plan.sh がこちらに寄る)。外側 (dict か) は強制済みで、読めない・形が違うは None = 世代不明 = "
+        "classify が UNVERIFIABLE (**消さない側**)。本体を先に読むので、この失敗が撤去の許可になる経路は無い",
+    ("lib_state_store.py", "locked_update_json", "json.loads(text)"):
+        _QUEUE_SIDE + "S5 で taskvia map (`queue/.taskvia-map.json`) の更新に使う専用ロック下の読み直し。"
+        "ENOENT だけ {} から始め、読めない・JSON でない・top-level が dict でないは **StoreReadError で止めて"
+        "上書きしない** (plan.sh `_load_taskvia_map` の「壊れていれば {}」より厳しい向き)。呼び出し元ゼロ (S2)",
     ("plan.sh", "_load_taskvia_map", "json.loads(text)"):
         _QUEUE_SIDE + "queue/.taskvia-map.json (Taskvia id のキャッシュ)。外側は強制済みで、"
         "壊れていれば {} = もう一度送る (冪等)",

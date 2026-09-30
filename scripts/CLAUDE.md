@@ -32,6 +32,8 @@ lib ごとの**破ってはいけない契約**の要約。理由・経緯・全
   plan.sh に直列化（`dump_yaml` 等）・原子的書き込み・assignment の判定のコピーを戻さない
   （`tests/test_state_store_serialization_matches_plan_sh.py` / `tests/test_state_store_callers.py`）。
   lib は**普通に import** する（`_load_scripts_module` は `sys.modules` に載せないので dataclass を持つ lib は読めない）。
+- queue の下のディレクトリは `os.makedirs` ではなく `ensure_dir()`（作成 + 作った dir の親を fsync）で作る。新規ファイルの mode は
+  `0666 & ~umask`（旧 `open(.., 'w')` と同じ）、既存ファイルの置き換えは元の mode を保つ（`knowledge/state-store.md` §4.2）。
 - 書けない・読めないは**例外**（`StoreWriteError` / `StoreReadError` / `LockBusy`）。`None` / `False` / 成功に潰さない。
   plan.sh の `with_lock` が終了コードに写す（`LockBusy` → 4、それ以外 → 1）。assignment 撤去の失敗だけは今までどおり warn して続行。
   監査ログだけは書けなくても遷移を止めず stderr に警告。本文（Result・理由）・env・token は出さない。

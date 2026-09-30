@@ -295,10 +295,31 @@ def _ensure_dir(dirpath, error_path):
     _fsync_dir(parent, error_path)
 
 
+def ensure_dir(dirpath):
+    """`dirpath` を (無ければ祖先ごと) **durable に**作る公開入口。作った各ディレクトリの**親**を fsync する
+    (`os.makedirs` は fsync しないので、電源断で作ったディレクトリのエントリが消えうる)。
+    既に在れば何もしない。失敗は `StoreWriteError` (`mkdir` / `fsync_dir`)。queue の下のディレクトリは
+    `os.makedirs` ではなくこれで作る (`tests/test_plan_sh_s3_fix2.py` が plan.sh の呼び出しを固定)。"""
+    dirpath = os.fspath(dirpath)
+    _ensure_dir(dirpath, dirpath)
+
+
+def _current_umask():
+    """今の umask (読むには一度書き換えるしかない。単一スレッドの CLI / ロックの中で使う)。"""
+    old = os.umask(0)
+    os.umask(old)
+    return old
+
+
+def _new_file_mode(mode=None):
+    """新規ファイルの mode。`open(path, 'w')` と同じく umask に従う (0666 & ~umask)。明示の `mode` があればそれ。"""
+    return mode if mode is not None else 0o666 & ~_current_umask()
+
+
 def _open_lock_file(lock_path):
     """ロックファイルを開く。通常ファイルでなければ (FIFO / device など) 閉じて OSError(EINVAL)。
     O_NONBLOCK は open だけのため (flock には効かない)。開いた後に外す。"""
-    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NONBLOCK, 0o644)
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NONBLOCK, 0o666)  # umask に従う (旧 open('a+') と同じ)
     try:
         if not _stat.S_ISREG(os.fstat(fd).st_mode):
             raise OSError(_errno.EINVAL, 'lock path is not a regular file')
@@ -325,7 +346,7 @@ def atomic_write_text(path, text, *, mode=None):
     """`path` に `text` を原子的に書く。ロックとは独立 (ロック外の書き手もこれを使う)。
 
     tmp (`.<name>.tmp.<random>`) → 全バイト → fsync(file) → mode → `os.replace` → fsync(親 dir)。
-    mode は既存ファイルのものを引き継ぐ (無ければ `mode`、それも無ければ 0o644)。mkstemp は
+    mode は既存ファイルのものを引き継ぐ (無ければ `mode`、それも無ければ umask に従う 0666 & ~umask)。mkstemp は
     0o600 で作るので、引き継がないと Worker / デーモン / hooks の間で読めなくなる。
     tmp の先頭が `.` なのは `tNNN.md` の列挙 (`TASK_FILENAME_RE`) に絶対に当たらないため。
 
@@ -345,7 +366,7 @@ def atomic_write_text(path, text, *, mode=None):
     try:
         final_mode = _stat.S_IMODE(os.stat(path).st_mode)
     except FileNotFoundError:
-        final_mode = 0o644 if mode is None else mode
+        final_mode = _new_file_mode(mode)       # 新規は umask に従う (既存は元の mode を保つ)
     except OSError as e:
         raise StoreWriteError(path, 'stat', e.errno) from e
 
@@ -1055,7 +1076,7 @@ class Txn:
             line = (json.dumps(row, ensure_ascii=False, sort_keys=True) + '\n').encode('utf-8')
             # O_NONBLOCK: 読み手のいない FIFO への open(O_WRONLY) は永久に待つ (queue/.lock を持ったまま)。
             # 開けても通常ファイルでなければ書かない (FIFO / socket / device)。
-            fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NONBLOCK, 0o644)
+            fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NONBLOCK, 0o666)   # umask に従う
             try:
                 if not _stat.S_ISREG(os.fstat(fd).st_mode):
                     raise StoreWriteError(path, 'audit_open', _errno.EINVAL, 'not a regular file')

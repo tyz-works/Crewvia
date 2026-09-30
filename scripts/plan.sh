@@ -1861,8 +1861,8 @@ def with_lock(callback, nonblocking=False):
     """
     global _TXN
     try:
-        os.makedirs(QUEUE_DIR, exist_ok=True)
-    except OSError as e:
+        _STORE.ensure_dir(QUEUE_DIR)
+    except _STORE.StoreError as e:
         die(f"cannot create queue dir {QUEUE_DIR}: {e}")
     try:
         with _STORE.transaction(QUEUE_DIR, op=SUBCOMMAND, actor=audit_actor(),
@@ -2546,10 +2546,19 @@ def _usage_exit(message):
     raise UsageExit(code)
 
 
+def _durable_makedirs(path):
+    """queue の下のディレクトリは `os.makedirs` ではなく lib の durable な作成 (作った dir の親を fsync) で作る。
+    `os.makedirs` は fsync しないので、電源断で `missions/<slug>` のエントリごと消えうる。"""
+    try:
+        _STORE.ensure_dir(path)
+    except _STORE.StoreError as e:
+        die(f"[plan.sh] cannot create directory {path}: {e}")
+
+
 def _ensure_queue_dirs():
     """queue の骨組み。引数を検証し終えたあとにだけ作る (`--help` は何も作らない)。"""
-    os.makedirs(os.path.join(QUEUE_DIR, 'missions'), exist_ok=True)
-    os.makedirs(os.path.join(QUEUE_DIR, 'archive'), exist_ok=True)
+    _durable_makedirs(os.path.join(QUEUE_DIR, 'missions'))
+    _durable_makedirs(os.path.join(QUEUE_DIR, 'archive'))
 
 
 def parse_opts(args, spec):
@@ -2633,7 +2642,7 @@ def cmd_init(args):
                 # so worker output is never silently lost.
                 ts = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
                 backup_name = f"{slug}.overwritten-{ts}"
-                os.makedirs(ARCHIVE_DIR, exist_ok=True)
+                _durable_makedirs(ARCHIVE_DIR)
                 shutil.move(mission_dir(slug), os.path.join(ARCHIVE_DIR, backup_name))
                 print(
                     f"[plan.sh init] previous '{slug}' moved to archive/{backup_name}",
@@ -2650,7 +2659,7 @@ def cmd_init(args):
         else:
             slug = generate_slug(title)
 
-        os.makedirs(tasks_dir(slug), exist_ok=True)
+        _durable_makedirs(tasks_dir(slug))
         mission = {
             'title': title,
             'slug': slug,
@@ -5080,7 +5089,7 @@ def cmd_archive(args):
         src = mission_dir(slug)
         if not os.path.exists(src):
             die(f"mission '{slug}' not found.")
-        os.makedirs(ARCHIVE_DIR, exist_ok=True)
+        _durable_makedirs(ARCHIVE_DIR)
         dst = os.path.join(ARCHIVE_DIR, slug)
         if os.path.exists(dst):
             die(f"archive target already exists: {dst}")

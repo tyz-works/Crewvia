@@ -213,6 +213,19 @@ class CardNotFound(StoreError):
     """task card が本当に無い (ENOENT)。"""
 
 
+class AlreadyExists(StoreError):
+    """新規作成のつもりで書く先に、既に何かが在る (または在るか確かめられない)。
+
+    回復 (R-3 等) が失敗して採番・前提が古いままでも、**既存の card / mission を上書きしない**
+    ための排他作成の拒否 (t037)。`path` は queue からの相対 (中身は含めない)。
+    """
+
+    def __init__(self, path, state):
+        self.path = path
+        self.state = state                      # 'present' / 'unobservable'
+        super().__init__(f"{path} は既に在ります ({state}) — 新規作成では上書きしません")
+
+
 class InvalidName(StoreError):
     """slug / task id / agent 名がパスとして使えない。書き込みを始める前に投げる。"""
 
@@ -1011,6 +1024,28 @@ class Txn:
 
     def write_mission(self, slug, data):
         self._write(self.mission_path(slug), serialize_mission(data))
+
+    # ---- 新規作成 (排他) ---------------------------------------------------
+    # ロックの中で「無いことを確かめてから」書く。ENOENT 以外 (在る・EACCES 等で見えない) は
+    # 書かずに `AlreadyExists` — 回復が失敗して採番が古いままでも、既存を黙って置き換えない。
+    def path_state(self, *parts):
+        """queue 相対の `parts` が `'present'` / `'absent'` / `'unobservable'`。"""
+        return _path_state(self._p(*parts))
+
+    def card_state(self, slug, tid):
+        return _path_state(self.card_path(slug, tid))
+
+    def create_card(self, slug, tid, meta, body):
+        state = self.card_state(slug, tid)
+        if state != 'absent':
+            raise AlreadyExists(self._rel(self.card_path(slug, tid)), state)
+        self.write_card(slug, tid, meta, body)
+
+    def create_mission(self, slug, data):
+        state = _path_state(self.mission_path(slug))
+        if state != 'absent':
+            raise AlreadyExists(self._rel(self.mission_path(slug)), state)
+        self.write_mission(slug, data)
 
     def write_state(self, state):
         self._write(self.state_path, serialize_state(state))

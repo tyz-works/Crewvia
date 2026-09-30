@@ -740,6 +740,16 @@ def save_mission(slug, data):
     _AUDIT_OTHER_ROWS.append((slug, None))
 
 
+def create_mission(slug, data):
+    """**新規作成**の mission.yaml を書く (排他。init 用)。既存の mission.yaml は置き換えない (t037)。"""
+    txn = _txn()
+    try:
+        txn.create_mission(slug, data)
+    except _STORE.AlreadyExists as e:
+        die(f"[plan.sh init] {e} — 何も書いていません")
+    _AUDIT_OTHER_ROWS.append((slug, None))
+
+
 def _load_task_from_path(path):
     """`path` の task card を `(meta, body)` にする。見つかる場所 (active mission /
     archive) を問わない —— 呼び出し側が解決済みのパスを渡す (`load_task()` /
@@ -773,6 +783,21 @@ def save_task(slug, task_id, meta, body):
     txn.write_card(slug, task_id, meta, body)
     txn.record(slug, task_id, from_status, meta.get('status'),
                generation=meta.get('started_at'))
+    _AUDIT_TASK_ROWS.append(task_id)
+
+
+def create_task(slug, task_id, meta, body):
+    """**新規作成**の task card を書く (排他: 既に在る・在るか確かめられないなら書かずに die)。
+
+    `save_task` は上書きが前提 (status の遷移)。add のように「新しい card のつもり」で書く経路は
+    こちら。回復が失敗して採番が古いままでも、既存の card を置き換えない (t037)。
+    """
+    txn = _txn()
+    try:
+        txn.create_card(slug, task_id, meta, body)
+    except _STORE.AlreadyExists as e:
+        die(f"[plan.sh] {e} — 何も書いていません")
+    txn.record(slug, task_id, None, meta.get('status'), generation=meta.get('started_at'))
     _AUDIT_TASK_ROWS.append(task_id)
 
 
@@ -2150,6 +2175,12 @@ def retire_assignment(agent, mission, task_id, generation):
     return verdict
 
 
+#: 直近の `recover_before()` が完了できなかったか。本体が「回復は済んだ」を前提に**既存を置き換える**
+#: 書き込み (pull の assignment 公開) の直前で見る — 回復は拒否を足さないが、前提が崩れたまま
+#: 破壊的に書くことも許さない (t037)。
+_RECOVERY_INCOMPLETE = [False]
+
+
 def recover_before(cards=(), agents=(), add_missions=(), archive_slugs=(), include_caller=True):
     """ロックを取った直後・**コマンドの前提検査より前**に、card を正本として projection
     (assignment / .identity) の食い違いを作り直す (vNext 01a S4。設計 §2.3・§2.5)。
@@ -2164,6 +2195,7 @@ def recover_before(cards=(), agents=(), add_missions=(), archive_slugs=(), inclu
     (disk full・権限) コマンドは止めず警告する — 止めると、その状態から抜ける操作まで拒否して
     復旧の出口を消す。
     """
+    _RECOVERY_INCOMPLETE[0] = False
     caller = os.environ.get('AGENT_NAME', '').strip() if include_caller else ''
     scope = _STORE.Scope(
         cards=tuple(dict.fromkeys(cards)),
@@ -2176,6 +2208,7 @@ def recover_before(cards=(), agents=(), add_missions=(), archive_slugs=(), inclu
     except _STORE.StoreError as e:
         print(f"[plan.sh warn] 回復 (projection の作り直し) を完了できませんでした: {e}"
               f" — コマンド本体は続けます", file=sys.stderr)
+        _RECOVERY_INCOMPLETE[0] = True
         return []
 
 
@@ -2756,7 +2789,7 @@ def cmd_init(args):
                 'reviewer': None,
             },
         }
-        save_mission(slug, mission)
+        create_mission(slug, mission)
 
         if inactive:
             # dispatcher は active_missions だけを見る。ここで足さなければ、この mission の task は
@@ -2899,6 +2932,23 @@ def cmd_add(args):
         recover_before(add_missions=[slug], include_caller=False)
         mission = load_mission(slug)
         task_num = int(mission.get('next_task_id') or 1)
+        # 回復 (R-3) が失敗しても (警告だけで続行する設計) next_task_id は実在の card より遅れうる。
+        # 採番を信じて書くと既存の card を上書きするので、**書き先の実在を確かめて**未使用の id まで進む
+        # (t037)。見えない (ENOENT 以外) なら、空いていると証明できないので書かずに止める。
+        skipped = []
+        while True:
+            cand = f"t{task_num:03d}"
+            state_of = _txn().card_state(slug, cand)
+            if state_of == 'absent':
+                break
+            if state_of != 'present':
+                die(f"[plan.sh add] {slug}/{cand} の card が在るか確かめられません ({state_of}) — "
+                    f"既存を上書きしないため、何も書かずに止めます")
+            skipped.append(cand)
+            task_num += 1
+        if skipped:
+            print(f"[plan.sh warn] next_task_id が実在の card より遅れていました — 既存の "
+                  f"{', '.join(skipped)} は上書きせず {cand} に追加します", file=sys.stderr)
         task_id = f"t{task_num:03d}"
         _reject_dependency_cycle(slug, task_id, blocked_by)
 
@@ -2921,7 +2971,7 @@ def cmd_add(args):
         if deliverable is not None:
             meta['deliverable'] = deliverable
         body = build_task_body(description, '')
-        save_task(slug, task_id, meta, body)
+        create_task(slug, task_id, meta, body)
         sync_holder[0] = (slug, task_id, title, skills, priority, blocked_by)
 
         mission['next_task_id'] = task_num + 1
@@ -3357,6 +3407,16 @@ def cmd_pull(args):
         # 選んだ card を指す枠 (逆引き) が残っていれば、書く前に片付ける: reset の途中で落ちて
         # 旧所有者の枠だけが残った card を別の Worker が取ると、旧所有者の枠が恒久に残る。
         recover_before(cards=[(slug, meta['id'])], include_caller=False)
+        if agent and _RECOVERY_INCOMPLETE[0]:
+            # 回復が失敗した (この Worker の枠が古いまま残りうる) なら、publish_assignment が
+            # 枠を上書きして先の task の projection を失わせないよう、別の task を持っていないと
+            # 確かめてから書く (読めない枠は「持っている」扱い)。拒否は exit 1 (exit 2 は idle)。
+            busy = agent_busy_elsewhere(agent, slug, meta['id'], slugs)
+            if busy:
+                die(f"{agent} は既に別の task を持っています: {busy}。回復 (projection の作り直し) が"
+                    f"完了できなかったため、assignment を上書きせず何も書いていません。"
+                    f"先の task を done / needs-director で手放すか、回復の失敗の原因を直してから"
+                    f"取り直してください。", PRECONDITION_UNMET)
         meta['status'] = 'in_progress'
         meta['worker'] = agent or None
         meta['started_at'] = now_generation()
@@ -5404,8 +5464,11 @@ def cmd_archive(args):
             die(f"mission '{slug}' not found.")
         _durable_makedirs(ARCHIVE_DIR)
         dst = os.path.join(ARCHIVE_DIR, slug)
-        if os.path.exists(dst):
-            die(f"archive target already exists: {dst}")
+        # ENOENT 以外 (EACCES で見えない) は「無い」と証明できない — exists() は False に潰すので lstat で (t037)
+        dst_state = _txn().path_state('archive', slug)
+        if dst_state != 'absent':
+            die(f"archive target already exists: {dst}" if dst_state == 'present'
+                else f"archive target を確かめられません ({dst_state}): {dst} — 何も動かしていません")
         _move_mission_dir(src, dst, 'archive')
 
         active = state.get('active_missions') or []

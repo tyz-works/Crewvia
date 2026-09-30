@@ -596,6 +596,29 @@ archive 参照、`store-check`、持ち越し (worker なし ×3 status・identi
 戻る。R-1〜R-4 が書いたもの (projection・`next_task_id`・`active_missions`) は正本を変えていないので、旧コードがそのまま読める。
 `queue/audit/` の `op=recover` の行は残ってよい (読み手がいない)。env の停止スイッチは付けない (不変条件 5)。
 
+### 2.8 S4 fix 2 巡目 (t037 / PR #261 Codex P1) — 回復が**失敗**しても本体が既存を壊さない
+
+**欠陥**: `recover_before` は回復の書き込みが失敗しても警告して続行する (拒否を足さない・出口を消さない設計)。add は R-3 が
+`next_task_id` を進めることを当てにしていたので、回復が失敗 (mission dir が書けない・tasks dir は書ける) すると、遅れた採番で
+**既存の `tNNN.md` を上書き**し、その後 mission.yaml の保存でまた失敗して、警告だけで task を失った。
+
+**線引き** (拒否を足さない規則との関係): 回復自体は今までどおり何も拒否しない。ただし**本体の破壊的な書き込みの前提が回復の成功に
+依存している**なら、本体が自分で前提を確かめる — 「新規作成のつもりで書く」経路は書き先の実在を lstat で確かめ (ENOENT だけが
+無い)、在る・見えないなら書かずに止まるか未使用の先へ進む。これは「回復の失敗を理由に操作を拒否する」のではなく、「回復に
+頼らず自分の書き込みを安全にする」ので、出口 (復旧の操作) は消えない。
+
+| コマンド | 本体が回復の成功を前提にしている箇所 | 回復失敗・部分成功のとき | 対応 (テスト / 根拠) |
+|---|---|---|---|
+| **add** (`cmd_add` の `create_task`) | `next_task_id` を採番としてそのまま使う | **既存 card を上書き (a)** — 修正前は赤 | `card_state` で未使用の id まで進み、`create_card` (排他) で書く。見えない (EACCES) なら書かず止まる。`test_add_with_a_failed_recovery_leaves_the_existing_card_byte_identical` / `…skips_every_existing_card_and_heals…` / `…cannot_be_observed` |
+| **init** (`create_mission`) | 書き先 slug に mission.yaml が無い (`exists()` は EACCES も False) | 既存 mission.yaml を置き換えうる (a) | `create_mission` は lstat で ENOENT のときだけ書く (`--force` は先に退避するので absent)。`test_init_does_not_replace_an_existing_mission_yaml` / `test_create_card_refuses…` |
+| **pull** (assignment / identity の `publish_assignment`) | R-2 が旧枠を片付けた・R-1 が枠を作った | 別 task を持つ Worker の枠を上書き → 先の task の projection を失う (a) | `recover_before` が `_RECOVERY_INCOMPLETE` を立てたときだけ、書く前に `agent_busy_elsewhere` (読めない枠は「持っている」)。持っていれば exit 3・何も書かない。`test_pull_with_a_failed_recovery_does_not_overwrite_the_slot_of_a_busy_worker`。回復が成功したときの挙動は変えない |
+| **archive** (`_move_mission_dir`) | 退避先 `archive/<slug>` が無い (`exists()`) | EACCES で見えない先へ rename しうる (a) | `path_state` (lstat) が `absent` のときだけ動かす。`present` は従来どおりの拒否、`unobservable` は何も動かさず止まる |
+| needs-director / done / fail / ready-for-verification / verify-result / update / retire | card を**読み直して** status を検査してから `save_task` (上書きが前提の遷移)。枠の撤去は `retire_assignment` が世代で判定 | 回復が失敗しても card が正本で、検査は card から。枠の撤去は「手放した枠・自分の世代」だけ (他の task・後任の枠は消さない) | 新規作成ではないので前提は回復に依存しない (`plan.sh` の各 `load_task` 直後の `accepts` / `refuse_transition`・`classify_assignment`) |
+| release-dep / reap / verifying / snapshot / review / launch | 回復を呼ばないコマンド (§2.7) | 影響なし | 変更なし |
+
+`save_task` は上書きが前提 (status の遷移) なので残し、新規は `create_task` / `create_mission` (lib の `Txn.create_card` /
+`create_mission`。`AlreadyExists` を投げ、plan.sh が die) に分けた。
+
 ---
 
 ## 3. State Store 書き込み lib の API (S2)

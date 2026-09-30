@@ -83,7 +83,7 @@ CODEX = "Kai-codex"
 # ORPHAN_ASSIGNMENT_FINISHED_STATUSES と同じ値であるべき集合 (plan.sh の定義を
 # コピーしてはいけないので、値そのものはテストが独自に持つ小さな真理値表として
 # だけ使う。plan.sh 側の定義がこれと食い違えば下のパラメトライズが赤くなる)。
-FINISHED_STATUSES = ["done", "verified", "skipped", "cancelled", "failed"]
+FINISHED_STATUSES = ["done", "verified", "skipped", "failed"]
 UNFINISHED_STATUSES = ["in_progress", "pending", "ready_for_verification", "verifying"]
 
 

@@ -65,6 +65,7 @@ sys.path.insert(0, str(_SCRIPTS_DIR))
 from lib_mux import Mux  # noqa: E402
 # デーモン側 JSON 状態ストアを読む入口は 1 つ (t026)。ここで `json.loads` を書き足さない。
 from lib_daemon_state import load_json_store, notify_cache_problem  # noqa: E402
+from lib_task_status import accepts as status_accepts  # noqa: E402  (語彙・許可遷移は 1 か所。vNext 01a S1)
 # task カードの読み取りは crewvia の中で 1 箇所しかない (Codex 5 巡目 P2)。
 # ここに frontmatter を直接読むコードを書き戻さないこと — plan.sh が受理する
 # カードとここが拾うカードが、静かにズレる。
@@ -389,7 +390,7 @@ def dispatch():
     for slug in active_missions:
         tasks = list_tasks_for_mission(slug)
         for meta, _, path in tasks:
-            if meta.get('status') == 'ready_for_verification':
+            if status_accepts('verifying', meta.get('status')):   # 検証を始められる status
                 rfv_tasks.append((slug, meta, path))
 
     if not rfv_tasks:

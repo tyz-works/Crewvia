@@ -169,7 +169,7 @@ def _drop_read_permission(path: pathlib.Path) -> None:
 
 def _terminal(meta) -> bool:
     """`plan.sh` / `dispatcher.sh` の完了判定と同じ形。"""
-    return meta.get("status") in {"done", "verified", "skipped", "cancelled", "failed"}
+    return meta.get("status") in {"done", "verified", "skipped", "failed"}
 
 
 # ---------------------------------------------------------------------------

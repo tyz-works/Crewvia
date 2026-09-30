@@ -63,6 +63,7 @@ scripts_dir = sys.argv[5]
 # ここに frontmatter を直接読むコードを書き戻さないこと — Taskvia に出る姿と
 # `plan.sh status` に出る姿が、静かにズレる。
 sys.path.insert(0, scripts_dir)
+from lib_task_status import TERMINAL_STATUSES  # noqa: E402  (語彙は 1 か所。vNext 01a S1)
 from lib_task_cards import (  # noqa: E402
     is_unreadable, list_task_cards, read_regular_text_or_unreadable,
 )
@@ -294,7 +295,7 @@ for slug, mission_meta, _ in records:
 # ---------- done タスク ID を収集（blocked 判定用） ----------
 done_ids = set()
 for slug, mission_meta, task in records:
-    if task.get('status') in ('done', 'verified', 'skipped'):
+    if task.get('status') in TERMINAL_STATUSES:
         tid = task.get('id', '')
         if tid:
             done_ids.add(f"{slug}:{tid}")

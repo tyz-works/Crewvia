@@ -138,6 +138,52 @@ verifier-dispatcher.sh:392。
 2 値以上並んでいたら赤」を AST で。**検査したリテラルの件数を出す** (0 件で PASS しない。
 memory `registry-dir-single-definition-and-vacuous-static-guards`)。
 
+### 1.6 実装 (S1 / t004) — 設計からの差と、挙動が変わる箇所
+
+`scripts/lib_task_status.py` (データだけ。I/O なし・import なし) に §1.3 の集合を置き、§1.5 の全箇所と
+`grep` で足した箇所 (`EXECUTING_STATUSES` = 環境変数の mission を信じてよい `in_progress` / `verifying`、
+`PR_NOT_AWAITED_STATUSES`、`PANE` の和) を寄せた。plan.sh の遷移拒否は `refuse_transition()` 1 か所。
+構造ガードは `tests/test_task_status_single_definition.py` (`.py` 全部 + `.sh` の heredoc 内 python の
+2 値以上の status リテラルを AST で。実測: ブロック 72 / リテラル 1605 / 検出 4 = 全部 allowlist
+(ペインの agent status 2・mission の status 1・status 表示の分岐 1。理由付き・該当が無くなったら赤))。
+
+**§1.3 からの差 (実装で決めたこと)**
+1. `HELD_DEP_STATUSES` の**定義**を `lib_task_status` に置いた (設計は `lib_dep_rules` に残す案)。
+   `RELEASED_WORK_STATUSES = TERMINAL | HELD` を `lib_task_status` に置く以上、HELD が向こうに無いと
+   循環 import になる。`lib_dep_rules.HELD_DEP_STATUSES` は同じオブジェクトの再公開で、依存の**意味**
+   (`unmet_dependencies` の規則) は従来どおり `lib_dep_rules` だけが持つ。
+2. 遷移の拒否の終了コードは **2** (依頼文の受入条件どおり)。これまでの拒否は 1 だった。
+3. 依頼文の受入例「done を pending から拒否」は**採らなかった**。§0 / §1.4 が「done が pending から通る」を
+   01c の Controller で狭める項目として明示しており、S1 は現状を写す。赤の実証は設計が拒否する遷移
+   (語彙に無い status からの done / fail / verify-result / needs-director / ready-for-verification) で行った。
+   `update --status` → done の回復手順 (Director) も今のまま通る。
+
+**挙動が変わる箇所 (全部)**
+
+| 箇所 | 前 | 後 |
+|---|---|---|
+| done / fail / verify-result / needs-director / ready-for-verification が**拒否する**遷移 (done・verified・failed・skipped から、needs-director / ready-for-verification は in_progress 以外から、done は needs_director から) | exit 1 | **exit 2** (何も書かない点は同じ。文面が `<command> は status=… の task には使えません (受け付けるのは: …)` に統一) |
+| done / fail / verify-result を、**語彙に無い status** (手書きの `cancelled`・status 欄なし) の card に | 通った (「以外すべて」に含まれた) | **exit 2 で拒否** (本番に該当 0 件) |
+| `update --status needs_director` | invalid status | **書ける** |
+| lint: `needs_director` の card | FAIL (unknown status) | 通る。**`needs_director_reason` が無ければ FAIL** (`blocked_reason` と同じ作法) |
+| `cancelled` の依存 | 満たされた (下流 READY) | 満たされない・保留でもない (待つ)。task-graph は上流 `[status不明]`+blocked / 下流 waiting |
+| 手書きの `cancelled` を指す assignment | 「手放した」= 孤児として塞がない・reap 対象 | 知らない status = 塞ぐ側 (証明できない孤児は孤児と扱わない) |
+| `update --status cancelled` / lint の `cancelled` | 拒否 / FAIL | 同じ (変化なし) |
+
+逆方向 (今まで拒否されていたのに通るようになる遷移) は **`update --status needs_director` だけ**。
+retire (`PRECONDITION_UNMET` = 3)・pull (`pending` だけ) は変わらない。
+
+**本番 queue での lint** (`queue/missions` + `queue/archive` の 65 mission を複製、修正前 / 後の plan.sh で
+`plan.sh lint --mission <slug>`): FAIL 7 / WARN 45 で**完全に同一** (diff なし)。FAIL は既存の
+`blocked` の `blocked_reason` 欠落 5 と `deliverable` 未宣言 2、WARN は既存の skill 未登録・deliverable・timeout。
+本番の task の status は done 706 / skipped 38 / pending 30 / blocked 5 / in_progress 3 / needs_human_review 1 で、
+`needs_director` も `cancelled` も 0 件なので、増える理由が無い。
+
+**戻し方**: PR revert → `scripts/sync-main-checkout.sh` (ff とデーモン restart)。dispatcher は常駐なので
+restart しないと旧集合のまま (memory `merged-daemon-code-is-inert-until-restart`)。env の停止スイッチは付けない。
+card は 1 バイトも書き換えていないので、戻しても旧コードがそのまま読める (`needs_director_reason` を
+lint が要求するのは新しい lint だけで、旧 lint は `needs_director` を unknown status と FAIL にするのが従来どおり)。
+
 ---
 
 ## 2. 複数ファイル更新の crash モデル (S4)

@@ -154,7 +154,9 @@ memory `registry-dir-single-definition-and-vacuous-static-guards`)。
 - **書く順序の規則**: 1 つのコマンドの中で、**正本の書き込みがコミット点**。
   - 始める側 (pull): 正本を先に書き、projection を後で書く (今の plan.sh:3365-3375 の順のまま)
   - 終わらせる側 (done / fail / needs-director / update --reset / retire): 正本を書き、projection を後で消す (今の順のまま)
-  - 正本以外の**派生値** (依存先カードの `pr_number`) は、正本より**前に**書く (done の順を変える。§2.2)
+  - 正本以外の**派生値** (依存先カードの `pr_number`) は、正本より**前に**書く (done の順を変える。§2.2)。
+    ただし派生値を書き始める**前に、その値の出どころ (自分の card の `pr_number`) を正本に永続化する**。
+    派生値だけが先に残ると、再実行が違う値を渡したときに正本と派生値が別の値で確定する (§2.2 done の D1)
   - どこで落ちても「正本が書かれる前 = コマンドが起きなかった」「正本が書かれた後 = コマンドが起きた」の
     どちらかになり、後者の projection の欠けだけを次のロック取得時に作り直せばよい
 
@@ -188,21 +190,46 @@ memory `registry-dir-single-definition-and-vacuous-static-guards`)。
 | assignment の後・lock 解放の前 | 一致 | 何もしない | |
 | lock の外 (Taskvia / worktree / `.crewvia-env`) | 一致。worktree・env が無い | queue としては正常。worktree の欠けは 01b (GIT-05) | Worker は JSON を受け取っていない |
 
-**done** (S4 で順を変える: 依存先の pr_number → card done → assignment 撤去 → mission done)
+**done** (S4 で順を変える)
+
+| 段 | 書くもの | 意味 |
+|---|---|---|
+| D0 | (書かない) 前提の検査。今の検査 (:4084-4135) に 2 つ足す: **(a)** 伝播先のうち「上流の `deliverable: pr` がこの task 1 つだけ」の card に、`--pr N` と**違う** pr_number が既にあれば拒否 (exit 3、何も書かない。食い違う card を列挙)、**(b)** 自分の card に pr_number があるのに `--no-pr` なら拒否 | 再実行で違う番号・「PR なし」を渡されたときに、前の実行が残した派生値と食い違ったまま完了させない |
+| D1 | 自分の card の `pr_number = N` だけ (status は in_progress のまま) | **番号の永続化**。以後、正本が「この task の PR は N」と言う。同じ N の再書き込みは冪等 (:4103-4110 が同値を許す) |
+| D2 | 依存先の pr_number (propagate_pr_number :3943) | 派生値 |
+| D3 | 自分の card `status = done` (+ Result・completed_at) | **done のコミット点** |
+| D4 | assignment 撤去 | projection |
+| D5 | mission done | 派生値 (報告のみの対象) |
+
+`--no-pr` / 番号なしの done は D1・D2 を飛ばす (D0 → D3)。
 
 | 落ちた点 | 残る状態 | 次のロック取得時 | 根拠 |
 |---|---|---|---|
-| pr_number 伝播の途中 (S4 後) | 依存先の一部に pr_number、card は in_progress | 何もしない。Worker / Director の**再 done で完了** (伝播は冪等: plan.sh:3943、自分の card の pr_number も同値の再指定を許す :4103-4110) | 依存先は blocked_by が満たされないので dispatch されない |
-| card done の後・assignment 撤去の前 | card done / assignment が done の task を指す | **R-2**: 孤児として撤去 | 今の reap-orphan-assignment と同じ判定 (`ORPHAN_ASSIGNMENT_FINISHED_STATUSES` :908 / cmd_reap_orphan_assignment :5909) |
-| assignment 撤去の後・mission done の前 | 全 task 終端 / mission in_progress | **報告のみ** (store-check に出す) | `update --status done` でも同じ状態が今でも正当に作れる (update は mission 完了を判定しない)。正当な状態と区別できないので書かない |
+| D1 の後・D2 の途中 | card in_progress・**pr_number = N** / 依存先の一部に N | 何もしない。再 done で完了 (次の §2.6 の表) | 依存先は blocked_by が満たされないので dispatch されない。正本と派生値は同じ N で、食い違いは「未伝播の依存先がある」だけ |
+| D3 の後・D4 の前 | card done / assignment が done の task を指す | **R-2**: 孤児として撤去 | 今の reap-orphan-assignment と同じ判定 (`ORPHAN_ASSIGNMENT_FINISHED_STATUSES` :908 / cmd_reap_orphan_assignment :5909) |
+| D4 の後・D5 の前 | 全 task 終端 / mission in_progress | **報告のみ** (store-check に出す) | `update --status done` でも同じ状態が今でも正当に作れる (update は mission 完了を判定しない)。正当な状態と区別できないので書かない |
 | (現状の順のまま落ちた場合) card done の後・伝播の前 | card done / 依存先に pr_number 無し | **報告のみ** (dispatcher.sh:2286 の既存通知がそのまま出る) | Director が `update --pr-number null` で消した状態と区別できない。**だから順を変える** |
+
+**D1 と D0 (a) の両方を置く理由** (PR #255 Codex 1 巡目 P2-1): 伝播を正本より前にしただけだと、
+`done --pr 123` が D2 の途中で落ちたあと `done --pr 456` で再実行すると、自分の card には番号が無いので
+:4103 の食い違い検査を通り、propagate_pr_number は設定済みの依存先を飛ばす (:3970) ので、
+**正本は 456・レビュー対象は 123** で完了する。同じ引数での冪等性だけでは防げない。
+- D1 で番号を先に正本へ置けば、違う番号の再実行は :4103 がそのまま拒否する (新しい検査は要らない)
+- それでも正本の番号は Director が `update --pr-number` で書き換えられる (やり直しの PR を作った・
+  打ち間違いを直した)。そのあと `done --pr 456` を打つと、正本は 456 で依存先には 123 が残っている。
+  これを拾うのが D0 (a)。**今は「Director が手で入れた値を上書きしない」で黙って飛ばしている**
+  (:3970) が、「上流がこの task 1 つだけ」の依存先で値が食い違うのは、どちらかが古い番号である以外に
+  説明が無い。飛ばすと P2-1 と同じ結果になるので、S4 で拒否に変える。出口は拒否メッセージに出す:
+  依存先を `update <dep> --pr-number <正しい番号>` で直してから再 done (どちらの番号が正しいかは
+  自動で決めない)
+- 合流点 (上流に pr の task が 2 つ以上) の依存先は今のまま書かない・拒否もしない (:3973。番号が一意でない)
 
 **その他の複数ファイル更新**
 
 | コマンド | 順序 | 落ちた点 | 次のロック取得時 |
 |---|---|---|---|
-| fail / needs-director / retire | card → assignment 撤去 (:4345→:4357 / :3816→:3826 / :5898→:5899) | card の後 | **R-2** (card が in_progress でなくなった → assignment は孤児) |
-| update --reset | card pending → assignment 撤去 (:5610→:5625) | card の後 | **R-2** |
+| fail / needs-director / retire --outcome needs-director | card → assignment 撤去 (:4345→:4357 / :3816→:3826 / :5898→:5899) | card の後 | **R-2** (card が in_progress でなくなった → assignment は孤児。card の worker は残るので旧所有者は card から分かる) |
+| update --reset / retire --outcome reset | card pending・**worker / started_at を null** (:5518-5521 / :5885-5888) → assignment 撤去 (:5625 / :5899) | card の後 | **R-2**。ただし **card から旧所有者が消えている** ので、旧所有者の枠は §2.5 の**逆引き** (`assignments/` のうちこの card を指す枠) でしか見つからない |
 | add | card → mission `next_task_id` (:2949→:2953) | card の後 | **R-3**: `next_task_id` を「既存の最大 tNNN + 1」以上に進める。**今は次の add が同じ tNNN を黙って上書きする** (:2926-2927 に存在確認が無い) |
 | verify-result pass / ready-for-verification | card → (mission done) | card の後 | mission 側は「報告のみ」(done と同じ) |
 | archive | `shutil.move(mission)` → state.yaml (:5199→:5202) | move の後 | **R-4**: state.yaml の `active_missions` に在るが `missions/` に無く `archive/` に在る slug を外す |
@@ -213,7 +240,7 @@ memory `registry-dir-single-definition-and-vacuous-static-guards`)。
 | 規則 | 条件 (すべて満たすときだけ書く) | 書くもの |
 |---|---|---|
 | **R-1** projection を作る | card が `in_progress`・`worker = A` (非空)・`started_at = G` (非空) / `assignments/A` が **ABSENT** (classify_assignment :2058 が `ENOENT` だけを ABSENT にする。:2084) | `A.identity` (G) → `assignments/A`。`publish_assignment` と同じ関数 |
-| **R-2** 孤児 projection を消す | `assignments/A` が指す card が、**assignment を撤去するコマンド自身の書く status** のどれか: 手放し済み (`ORPHAN_ASSIGNMENT_FINISHED_STATUSES` :908 = done / verified / skipped / failed。今の `reap-orphan-assignment` :5909 の判定) ∪ needs_director (needs-director / retire) ∪ worker が空の pending (update --reset / retire reset) | assignment → identity の撤去 (`retire_assignment` :2239。classify を通す) |
+| **R-2** 孤児 projection を消す | (枠 A は、呼び出し元の枠・card の worker の枠・**card を指す枠の逆引き** (§2.5) のどれで見つけてもよい) `assignments/A` が指す card が、**assignment を撤去するコマンド自身の書く status** のどれか: 手放し済み (`ORPHAN_ASSIGNMENT_FINISHED_STATUSES` :908 = done / verified / skipped / failed。今の `reap-orphan-assignment` :5909 の判定) ∪ needs_director (needs-director / retire) ∪ worker が空の pending (update --reset / retire reset) | assignment → identity の撤去 (`retire_assignment` :2239。classify を通す) |
 | **R-3** 採番を進める | `tasks/` に `next_task_id` 以上の tNNN.md がある | mission の `next_task_id = max + 1` |
 | **R-4** archive 済みを外す | slug が `active_missions` に在り、`missions/<slug>` が無く `archive/<slug>` が在る | state.yaml から外す (`default_mission` も archive と同じ規則で) |
 
@@ -226,7 +253,18 @@ needs_human_review で assignment が無い状態は crash では作れないの
 
 **R-1 で A の枠が ABSENT でないとき** (`assignments/A` が別の task を指す):
 - 指す先が手放し済み → R-2 で消してから R-1 (今の publish と同じ扱い: agent_busy_elsewhere :3032 の docstring :3047)
-- 指す先も in_progress (A が 2 枚の card を持つ) / UNVERIFIABLE → **書かない**。§2.5 の停止
+- 指す先も in_progress (A が 2 枚の card を持つ) / UNVERIFIABLE → **書かない**。§2.5 の「報告のみ」
+  (コマンドは止めない。今の前提検査がそのまま効く —— 例: pull は agent_busy_elsewhere :3032 が拒否する)
+
+**回復はコマンドの前提検査より前に走り、コマンドが拒否されても残る** (PR #255 1 巡目 P2-2 / P2-3 の族の掃除)。
+回復は「ロックを取った直後、そのコマンドが前提を検査する前」に 1 回走り、修復は**それ自体で完結した書き込み**
+として監査ログに `op=recover` の行を残す。その後にコマンド本体が今の前提検査で拒否されても (例: 同じ
+`update --reset` を打ち直したら card は既に pending・同じ `needs-director` を打ち直したら in_progress でない)、
+修復は巻き戻さない。コマンドの「exit 3 は 1 バイトも書かない」は**コマンド本体の書き込み**についての約束で、
+回復の書き込みは含まない。
+- こうしないと「同じ引数で再実行」が前提検査で弾かれ、回復が一度も走らずに projection の欠け / 孤児が残る
+- 回復は正本を書かない (§2.4 の 2.) ので、コマンドが拒否された後に残るのは「正本が既に言っていることに
+  projection を合わせた」結果だけで、コマンドが起きたかどうかの答えは変わらない
 
 **Director の手動操作との衝突**: `update --status in_progress` (--reset なし) は worker / started_at を
 残したまま開き直せるので、R-1 の条件を満たし、前の worker 名で assignment が作られうる。
@@ -254,18 +292,34 @@ needs_human_review で assignment が無い状態は crash では作れないの
    (verifier-dispatcher の `verifying` と pre-compact の本文書き込みは status / worker / started_at の
    組を変えない or 変えても R-1 の条件外 —— verifying は in_progress ではない)
 
-### 2.5 回復の走査範囲と、止めるときの範囲
+### 2.5 回復の走査範囲と、食い違いの扱い
 
-**走査範囲: そのコマンドが名指ししている task と、呼び出し元の Worker の枠だけ。**
-mission 全体・queue 全体は走査しない。
+**走査範囲: そのコマンドが名指ししている task・その task を指す枠・呼び出し元の Worker の枠だけ。**
+mission 全体・queue 全体の card は走査しない。
 
 | コマンド | 回復の対象 |
 |---|---|
-| pull (--task なし) | 呼び出し元 A の `assignments/A` と、A が worker の in_progress card (今の agent_busy_elsewhere :3052-3056 が既に全 active mission の card を読んでいる。その読みを使い、追加の走査はしない) + 選んだ card |
-| pull --task / done / fail / needs-director / ready-for-verification / verify-result / update / retire | 名指しの card + その card の worker の枠 + 呼び出し元の枠 |
+| pull (--task なし) | 呼び出し元 A の `assignments/A` と、A が worker の in_progress card (今の agent_busy_elsewhere :3052-3056 が既に全 active mission の card を読んでいる。その読みを使い、追加の走査はしない) + 選んだ card + 選んだ card を指す枠 (逆引き) |
+| pull --task / done / fail / needs-director / ready-for-verification / verify-result / update / retire | 名指しの card + その card の worker の枠 + **名指しの card を指す枠 (逆引き)** + 呼び出し元の枠 |
 | add | その mission の `tasks/` の列挙 (R-3) |
 | archive / init | state.yaml (R-4) |
-| reap-orphan-assignment | 今のまま (名指しの Worker の枠) |
+| reap-orphan-assignment | 名指しの Worker の枠 (R-2 の条件は §2.3 に揃える。今の :5909 は needs_director と worker が空の pending を消さない —— S4 で R-2 と同じ集合にする) |
+
+**逆引き** (PR #255 1 巡目 P2-2): `queue/assignments/` の本体ファイル (`.identity` と `.restarting` を除く) を
+列挙し、1 行の本文が `<slug>:<tid>` に一致する枠を拾う。`update --reset` / `retire --outcome reset` は
+assignment を撤去する**前に** card の worker / started_at を null にする (:5518-5521 / :5885-5888) ので、
+その間で落ちると card からは旧所有者が分からない。card の worker だけを見る範囲では、Director が同じ card を
+打ち直しても旧所有者の枠に届かず R-2 が走らない。別の Worker が pull すると旧所有者の枠が残ったままになる。
+- 列挙するのは `assignments/` の 1 ディレクトリだけで、件数は同時に存在する Worker の数 (十数件) で頭打ち。
+  各ファイルは 1 行。queue 全体の card の走査とは桁が違うので、理由 1 に反しない
+- 逆引きで読めない枠 (UNVERIFIABLE) は「この card を指していない」と証明できないが、**消さない・止めない**
+  (下の「報告のみ」)。読めない枠は今でも publish の前に agent_busy_elsewhere が拒否するので、その Worker の
+  次の pull で表に出る
+- 捨てた案: reset の順序を変える (assignment 撤去 → card)。撤去の後・card の前で落ちると card は A の
+  in_progress のままなので R-1 が枠を作り直し「reset は起きなかった」に戻るが、その間 dispatcher から A が
+  idle に見え、別 task の送信・退役の判定に乗る (終わらせる側は正本が先、の §2.1 の規則にも反する)
+- 捨てた案: card に `reset_from_worker` を残す。正本に「回復のためだけの欄」を足すと、欄の掃除と
+  「欄と assignment が食い違う」状態が新しく生まれる (族 C)
 
 - 理由 1: **ロックを握る時間を増やさない**。queue 全体の走査を毎回入れると、全 Worker と両デーモンの
   plan.sh が待たされる (maybe_refresh_task_graph :1873 が同じ理由でロックの外にある)
@@ -273,14 +327,34 @@ mission 全体・queue 全体は走査しない。
   無関係な Worker の done を止める経路を作らない
 - 理由 3: t024 の本番観察の波及を切る。t024 は本番の他の mission / 並行する Worker に書き込まない
 
-**「表に無い食い違い」のとき**: 範囲内で §2.3 の条件に合わない食い違い
-(A が in_progress の card を 2 枚持つ / holding status なのに assignment が無い (in_progress 以外) /
-assignment・identity が UNVERIFIABLE / card が `[破損]`) を見つけたら:
-- **そのコマンドだけ** exit 3 (`PRECONDITION_UNMET`。1 バイトも書かない) で止め、食い違いを 1 行で出す
-- 止まるのはその task / その Worker の操作だけ。他の task・他の Worker・デーモンの `retire --no-wait`
-  (exit 4) は影響を受けない。**本番の全 plan.sh 呼び出しが止まる経路は作らない**:
-  回復は範囲外を読まないので、範囲外の食い違いで die する経路がそもそも無い
-- 監査ログに `op=recover result=refused` を 1 行残す (§4)
+**「表に無い食い違い」のとき: 報告だけして、コマンドは止めない** (PR #255 1 巡目 P2-3)。
+範囲内で §2.3 の条件に合わない食い違いを見つけたら、stderr に 1 行・監査ログに
+`op=recover result=reported:<理由コード>` を 1 行残し、**書かずに**コマンド本体へ進む。コマンド本体は
+**今の前提検査 (§1.4 の表) のまま**受け付けるか拒否する。回復は拒否を 1 つも足さない。
+
+旧案 (範囲内の食い違いで exit 3) を捨てた理由: 食い違いの多くは §1.4 で維持するコマンドが**正常に作れる**
+状態で、それを「破損」として全操作を止めると、その状態から抜ける操作 —— Director の `update --reset`・
+`verify-result pass` —— まで拒否され、**復旧の出口が 1 つも無い状態**ができる。例: pending の card に
+`verify-result needs_human_review` (今は許可 :4652) → needs_human_review で assignment 無し →
+旧案では update も verify-result も exit 3。正常に作れる状態を破損と呼ばず、読めない状態 (UNVERIFIABLE /
+`[破損]`) は今の各コマンドの扱い (消さない・書かない) にそのまま任せる。
+
+| 食い違い (範囲内) | 正常な操作で作れるか (作る操作) | 回復 | 出口 (そのまま受け付けられるコマンド) |
+|---|---|---|---|
+| ready_for_verification / verifying / needs_human_review で assignment が無い | 作れる (`update --status` :5479 / pending・blocked 等への `verify-result needs_human_review` / verify-result fail が max_rework に届く :4675) | 報告のみ | `verify-result pass/fail/needs_human_review`・`update --reset`・`update --status`・`done` (Director) |
+| in_progress で worker が空 | 作れる (worker の無い card への `update --status in_progress` / `verify-result fail` :4682) | 報告のみ (R-1 は worker が非空のときだけ) | `update --reset`・`update --worker <A>` (→ 次のロック取得で R-1)・`done` / `fail` (Director)・`verify-result` |
+| A が in_progress の card を 2 枚持つ | 作れる (`update --status in_progress --worker A`) | 報告のみ (R-1 は書かない §2.3) | 片方への `update --reset`・`done` / `fail`。A の `pull` は今の agent_busy_elsewhere が拒否 (今と同じ) |
+| assignment が blocked / verification_failed / ready_for_verification 等 (R-2 の集合の外) を指す | 作れる (`--reset` なしの `update --status` —— Worker は動いている) | 報告のみ (R-2 にしない理由は §2.3) | `update --reset` (card の worker の枠を今の :5625 で撤去)・`update --status <R-2 の集合>` → 次のロック取得で R-2・`reap-orphan-assignment` (R-2 の集合に入った後) |
+| assignment / identity が UNVERIFIABLE (読めない・旧形式・形違い) | crash では作れない (書き手はすべて原子的)。権限・手作業・旧 plan.sh | 報告のみ (消さない。classify_assignment :2058 の今の結論) | その Worker の `pull` は今どおり拒否。card 側の操作 (`done` / `fail` / `update --reset` / `verify-result`) は card を書いて枠を残す (今どおり warn)。**枠の出口は Director の手作業での退避** (今と同じ。読めないものを plan.sh に消させる経路は 01a で足さない —— 証拠の無い破壊になる) |
+| card が `[破損]` | crash では作れない (atomic write)。手編集 | 報告のみ | card を名指しするコマンドは今どおり読めずに止まる (今と同じ)。出口は Director の手編集 + `plan.sh lint` |
+| 全 task 終端で mission が in_progress | 作れる (`update --status done`) | 報告のみ (§2.2) | 今と同じ (`archive` 等) |
+
+- **01a が出口を減らさないことの論証**: 回復は拒否を足さず (上)、書くのは R-1〜R-4 の projection と派生値だけで
+  正本を書かない (§2.4)。だから、ある状態で受け付けられるコマンドの集合は S4 の前と同じ (§1.4 の表)。
+  S4 で拒否が増えるのは done の D0 (§2.2) の 2 つだけで、どちらも拒否メッセージに出口 (`update --pr-number`)
+  を書き、`update` 自体は拒否されない
+- 止まる範囲も今と同じ: 回復は範囲外を読まないので、範囲外の食い違いがコマンドに影響する経路は無い。
+  **本番の全 plan.sh 呼び出しが止まる経路は作らない**
 
 **本番で観察する手順 (t024 向けの設計の制約)**:
 - 読み取り専用の `plan.sh store-check [--mission <slug>]` を S4 で足す (`QUEUE_READONLY_SUBCOMMANDS`。
@@ -288,6 +362,39 @@ assignment・identity が UNVERIFIABLE / card が `[破損]`) を見つけたら
   ロック無しなので途中のトランザクションを食い違いとして 1 回見うる → 「2 回連続で出たものだけが本物」と出力に書く
 - t024 は本番で store-check を叩くだけ。crash の注入は**本番では行わない** (原案 §14-2)。
   注入は t013 / t017 の隔離 queue (CREWVIA_QUEUE を付け替えた複製) でだけ行う
+
+### 2.6 族の表: 途中で落ちる各点 × 再実行 (PR #255 1 巡目の族の掃除)
+
+1 巡目の P2 ×3 は同じ族 —— **複数ファイル・複数段の操作の途中で落ちたときに、正本 / projection / 回復の出口の
+どれかが失われる** —— だった。§2.2 は「次のロック取得時」だけを見ており、**その次に来る操作が何か**
+(同じ引数の再実行 / 違う引数の再実行 / 別の操作) を見ていなかった。3 件ともそこから漏れた。
+下の表で全操作についてそれを並べる。各行で確かめること: **(正本)** 正本が一意に決まる (card が言っている
+ことが唯一の答えで、派生値・projection はそれに合わせられるか、食い違いが拒否メッセージか報告で見える)、
+**(出口)** その状態から抜けるコマンドが少なくとも 1 つ受け付けられる。
+
+前提 (§2.3 末尾): 回復はコマンドの前提検査より前に走り、コマンドが拒否されても修復は残る。
+
+| 操作 | 落ちた点 | 同じ引数で再実行 | 違う引数で再実行 | 別の操作 | 正本 / 出口 |
+|---|---|---|---|---|---|
+| pull | card の後・枠の前 | `pull --task` 同じ card: 回復が R-1 で A の枠を作る → card が pending でないので今どおり拒否。`pull` (--task なし): R-1 → agent_busy_elsewhere が「A は in_progress の card を持つ」で拒否 | 別の `--task`: R-1 → 同じ拒否 | 別 Worker B の `pull --task` 同じ card: 逆引きで A の枠を確認 (R-1 済みなら A のもの) → pending でないので拒否。Director `update --reset`: R-1 → reset が card を pending に・:5625 で A の枠を撤去 | 正本 = card (A, G)。Worker は JSON を受け取っていないので「持っているのに知らない」。これは今と同じで、dispatcher の Rule 5 (idle-with-task) が Director に上げる。出口: Director の `update --reset` |
+| pull | lock の外 (Taskvia / worktree / env) | queue は一致。再 pull は上と同じく拒否 | 同左 | 同左 | 正本・projection とも一致。worktree の欠けは 01b (GIT-05)。出口: `update --reset` |
+| done | D0 | 何も書いていない | — | — | 起きなかった |
+| done | D1 の後・D2 の途中 | D0 通過 (依存先の値は N か空) → D1 冪等 → D2 が残りを埋める → 完了 | `--pr M`: :4104 が拒否 (正本は N)。`--no-pr`: D0 (b) が拒否 | `fail`: card failed・pr_number N は残る。依存先の N は正本と一致 (held なので dispatch されない)。`update --reset` → 再 pull → 新しい PR M で done: :4104 が拒否 → `update --pr-number M` → 再 done: D0 (a) が依存先の N を列挙して拒否 → 依存先を `update --pr-number M` → done | 正本の番号 = N、Director が書き換えれば M。**依存先と正本が食い違ったまま done が通る経路は無い** (D0 (a))。出口: `update --pr-number` (自分 / 依存先)。これが P2-1 の行 |
+| done | D3 の後・D4 の前 | 回復が R-2 (A の枠) → 「already done」で今どおり拒否 | 同左 | dispatcher の `reap-orphan-assignment` / A の次の `pull`: R-2 | 正本 = done。出口: 回復が自動で閉じる |
+| done | D4 の後・D5 の前 | 「already done」で拒否 | 同左 | — | 正本 = 全 task done。mission は報告のみ (§2.2)。出口: 今と同じ |
+| fail / needs-director | card の後・枠撤去の前 | 回復が R-2 (card の worker の枠) → 今の前提検査で拒否 (already failed / in_progress でない) | 同左 (`--head` 違い・理由違いも同じ) | Director `update --reset`: R-2 → reset。Worker の `done`: R-2 → failed / needs_director なので今どおり拒否 | 正本 = failed / needs_director。出口: 回復 + Director の `update --reset` |
+| update --reset | card (pending・worker null) の後・枠撤去の前 | 回復が**逆引き**で A の枠を見つけ R-2 → reset を書き直す (同じ値) | `update --status in_progress --worker B`: 逆引き R-2 (回復は本体より前なので card はまだ pending・worker 空) → 本体 → 次のロック取得で B の R-1 | B の `pull --task`: 逆引き R-2 → B に公開。A の次の `pull`: 自分の枠で R-2。A の `done` (reset に気付かず報告): 逆引き R-2 → done は pending を受け付ける (今と同じ挙動。§1.4) | 正本 = pending・所有者なし。**旧所有者の枠は逆引きで必ず見つかる**。出口: 同じ card を名指しする全コマンド・A 自身の次の呼び出し。これが P2-2 の行 |
+| retire --outcome reset | 同上 (:5885 → :5899) | watchdog の再呼び出し: 逆引き R-2 → 本体は in_progress でないので今どおり exit 3 | `--outcome needs-director`: 同左 | 同上 | 同上 |
+| retire --outcome needs-director | card の後・枠撤去の前 | R-2 (card の worker の枠) → 本体は exit 3 | 同左 | Director の `update --reset` | 正本 = needs_director。出口: 回復 |
+| reap-orphan-assignment | 本体を消した後・`.identity` を消す前 (retire_assignment :2239 の順) | 「既にありません」 | — | 次の `publish_assignment` が identity を先に書くので上書きされる | 本体が無い = ABSENT (classify は本体を先に読む)。残る identity は無害。store-check が件数を出す |
+| verify-result | card の後・mission の前 (pass) | 「already verified」で拒否。回復は R-2 (verified は手放し済み) | `fail` / `needs_human_review`: 同じく拒否 | — | 正本 = verified。mission は報告のみ。出口: 今と同じ |
+| verify-result fail (→ in_progress) | card 1 枚の書き込み | — | — | 次のロック取得で worker・started_at が非空で枠が無ければ R-1 (§2.3 末尾の `update --status in_progress` と同じ扱い) | 正本 = in_progress (A, G)。出口: `update --reset` / `verify-result` |
+| archive | move の後・state.yaml の前 | 回復が R-4 → mission が無いので今どおり拒否 | 別の slug: その slug に対して通常どおり | `--mission <slug>` の他コマンド: mission が無いので今どおり拒否。`init` / 他の `archive`: R-4 | 正本 = `archive/<slug>`。出口: 回復 |
+| add | card の後・`next_task_id` の前 | 回復が R-3 で `next_task_id` を進める → 本体は**次の番号で 2 枚目を作る** (同じ内容の card が 2 枚) | 違う内容の add: R-3 → 次の番号で作る。前の card は残る | `list` / dispatcher: 前の card は通常の pending として見える | 正本 = 2 枚とも正当な card (壊れてはいない)。R-3 の修復行 (stderr と監査ログ) に**前回の残りの tNNN**を出すので Director が気付ける。出口: `update <tNNN> --status skipped`。今は次の add が同じ tNNN を**黙って上書き**する (§2.2) ので、それよりは見える |
+| ready-for-verification | card 1 枚の書き込み | — | — | — | 単一ファイル。原子的書き込みで閉じる |
+
+表から外したもの: add 以外の単一ファイルの書き込み (atomic_write_text で「書かれたか・書かれていないか」の
+2 通りしか無い)、lib_retirement の marker (自前の R1 プロトコル。§5)。
 
 ---
 
@@ -324,7 +431,8 @@ class Txn:
     write_mission(slug, data) / write_state(state)
     publish_assignment(agent, slug, tid, generation)   # identity → 本体 (今の :2040 の順)
     retire_assignment(agent, slug, tid, generation) -> verdict   # classify を通す (:2239)
-    recover(scope) -> list[Repair]               # §2.3 の R-1〜R-4 を scope の中だけで (S4)
+    recover(scope) -> list[Repair]               # §2.3 の R-1〜R-4 を scope (§2.5。逆引きを含む) の中だけで (S4)
+                                                 # コマンドの前提検査より前に呼ぶ。報告は返すが raise しない (§2.5)
     record(mission, task, from_status, to_status, generation=None, detail=None)  # 監査ログの 1 行を予約
 
 # ── 診断 (ロックを取らない・書かない) ──
@@ -356,8 +464,8 @@ locked_update_json(path, lock_path, fn) -> dict  # 専用ロック + 読み直�
 |---|---|---|
 | 置き場所 | **`queue/audit/transitions-YYYYMMDD.jsonl`** (UTC 日付) | queue/ は丸ごと gitignore (.gitignore:35)、`CREWVIA_QUEUE` を付け替えた隔離実行で自動的に隔離先に書かれる (test isolation を追加の仕組みなしで満たす)。registry/ 案: registry/ は一部が追跡下 (workers.yaml) で、状態遷移の記録はデーモンの観察ではなく queue の変更の記録なので queue 側 |
 | いつ書くか | トランザクションが**例外なく終わったとき**、ロックを離す**前**に 1 行 | ロックの中で書けば行の順序 = コミットの順序。ロックの外だと 2 つのトランザクションの行が入れ替わりうる |
-| 1 行の欄 | `ts` (µs UTC) / `txn_id` (uuid4 hex) / `op` (サブコマンド名 or `recover`) / `mission` / `task` / `actor` (AGENT_NAME。無ければ `director` か呼び出し元の名前: `dispatcher` / `watchdog` / `kai-review` / `unknown`) / `pid` / `from_status` / `to_status` / `generation` (card の started_at) / `execution_id` (**null 固定**。01c が埋める) / `result` (`ok` / `repaired:R-n` / `refused:<理由コード>`) / `files` (書いたパスの queue からの相対パス一覧) | 原案 STATE-06 の欄 + generation / files。**書かないもの**: Result 本文・reason 本文・description (原案「Task 内容を log へ出さない」)、env、token |
-| 拒否 (exit 3) を書くか | 回復の拒否 (§2.5) だけ書く。通常の前提外れ (done の二重実行等) は書かない | 通常の拒否は既に stderr と exit code がある。回復の拒否は「状態が壊れている」証拠なので残す |
+| 1 行の欄 | `ts` (µs UTC) / `txn_id` (uuid4 hex) / `op` (サブコマンド名 or `recover`) / `mission` / `task` / `actor` (AGENT_NAME。無ければ `director` か呼び出し元の名前: `dispatcher` / `watchdog` / `kai-review` / `unknown`) / `pid` / `from_status` / `to_status` / `generation` (card の started_at) / `execution_id` (**null 固定**。01c が埋める) / `result` (`ok` / `repaired:R-n` / `reported:<理由コード>`) / `files` (書いたパスの queue からの相対パス一覧) | 原案 STATE-06 の欄 + generation / files。**書かないもの**: Result 本文・reason 本文・description (原案「Task 内容を log へ出さない」)、env、token |
+| 拒否・報告を書くか | 回復の報告 (§2.5 の「報告のみ」。`op=recover result=reported:<理由コード>`) だけ書く。通常の前提外れ (done の二重実行・D0 の拒否等) は書かない | 通常の拒否は既に stderr と exit code がある。回復の報告は「表に無い食い違いがあった」証拠なので残す。回復はコマンドを拒否しない (§2.5) ので `refused` の行は無い |
 | ローテーション | 日付ごとのファイル。**01a では自動削除しない** | 1 行 ~300 B × 数百 / 日で年 100 MB に届かない。削除を足すと「消してよいか」の判定 (族 C) が増える。量が問題になったら archive と同じ手動運用を足す |
 | 書けないとき | **状態遷移は止めない**。stderr に `[plan.sh warn] audit log を書けませんでした (<path>: <errno>)` を 1 行、exit code は変えない。store-check が「audit log に書けない」を件数付きで出す | 止める案: 監査ログのディレクトリ 1 つの権限・容量の問題で**本番の全 plan.sh が止まる** —— 新しいガードの失敗状態が全体停止になる (族 C。memory `a-new-guard-creates-a-new-state`)。監査ログは正本ではなく回復にも使わない (§2.1) ので、欠けても状態は正しい。欠けたことは見える形で残す (黙って捨てない) |
 | crash で行が欠ける | コミット (正本の書き込み) の後・監査ログの前に落ちると 1 行欠ける。**許容し、ここに明記する** | 行を先に書く案: 起きなかった遷移の行が残る (こちらのほうが誤読を生む) |
@@ -441,7 +549,7 @@ queue/.lock に入れると、正本を守るためのロックが観察の書�
 | S1 (t004) | lint が `needs_director` を通す・`cancelled` を FAIL / update が `needs_director` を書ける / 定義の置き場所 (挙動は同じ) | **ユーザー承認** (t007 経由) | `plan.sh lint` を本番の active mission 全部に: FAIL が増えていない (`needs_director` の card は減る方向)。dispatcher / plan.sh の status 表示が前と同じ | PR revert → `scripts/sync-main-checkout.sh` (ff + デーモン restart) |
 | S2 (t008) | **なし** (呼び出し元ゼロ) | 通常 merge | `grep -rn lib_state_store scripts hooks` が lib 自身とテストだけ | revert |
 | S3 (t012) | plan.sh の書き込みが lib 経由 (fsync に親 dir が増える) / `queue/audit/` ができ行が増える | **ユーザー承認** (t015) | 実 Worker の pull / done が通常どおり終わる / `queue/audit/transitions-<今日>.jsonl` に行が増える / card のバイト表現が変わっていない (直前の git 状態が無いので、S3 前後に取った 1 枚の card の sha を比べる) / stderr に audit の warn が出ていない | revert → sync-main-checkout。`queue/audit/` は残ってよい (読み手がいない) |
-| S4 (t016) | 次のロック取得時の R-1〜R-4 / done の順序 / 範囲内の「表に無い食い違い」で exit 3 / `plan.sh store-check` | **ユーザー承認** (t019) | `plan.sh store-check` を 2 回: 本番の既存の食い違いの一覧 (0 件でなくてよい —— **merge 前に一度走らせた結果**と比べる) / audit に `repaired:R-n` が出たら 1 件ずつ Director が妥当か確かめる / exit 3 が特定の task 以外で出ていない | revert → sync-main-checkout。R-1〜R-4 が書いたものは正本を変えていないので、戻しても旧コードがそのまま読める (原案 §9.4) |
+| S4 (t016) | 次のロック取得時の R-1〜R-4 (前提検査より前・逆引きを含む) / done の順序 (D0〜D5) と D0 の 2 つの拒否 / 範囲内の「表に無い食い違い」の報告 (止めない) / `reap-orphan-assignment` の R-2 集合 / `plan.sh store-check` | **ユーザー承認** (t019) | `plan.sh store-check` を 2 回: 本番の既存の食い違いの一覧 (0 件でなくてよい —— **merge 前に一度走らせた結果**と比べる) / audit に `repaired:R-n` が出たら 1 件ずつ Director が妥当か確かめる / `reported:` の行を store-check の一覧と突き合わせる / done の D0 の拒否が出たら拒否メッセージの出口 (`update --pr-number`) で抜けられた | revert → sync-main-checkout。R-1〜R-4 が書いたものは正本を変えていないので、戻しても旧コードがそのまま読める (原案 §9.4) |
 | S5 (t020) | verifier-dispatcher・pre-compact・risk flags・`.crewvia-env`・taskvia map・workers.yaml の書き方 / `plan.sh verifying` 新設 / CI の構造ガード | **ユーザー承認** (t023) | compaction が起きた Worker の card に snapshot 節が付く (正しい mission の card に) / `.crewvia-env` が次の pull で作られ source できる / workers.yaml の task_count が done で増える / CI 緑 | revert → sync-main-checkout。**verifier-dispatcher は常駐デーモンなので restart が要る** (memory `merged-daemon-code-is-inert-until-restart`)。hooks は次の tool 呼び出しから新旧が入れ替わる |
 
 共通: **merge 後に主 checkout を ff するまで本番は旧コードのまま** (memory `main-checkout-lags-after-pr-merge`)。
@@ -464,7 +572,7 @@ env の停止スイッチは付けない (不変条件 5)。戻しは常に reve
 | §14-9 Agent 名 / Task ID だけで完了 | **01a では閉じない** (01c)。現状のまま (§0) |
 | §14-14 per-file replace を multi-file transaction と呼ぶ | 呼ばない。順序 + projection 再生成で定義 (§2.1) |
 | §14-15 lock 内の network / LLM | Taskvia・worktree・task-graph はロックの外のまま。lib に「ロック内で subprocess しない」を書く |
-| §14-16 silent 修復 | 修復は R-1〜R-4 の 4 つだけで、すべて監査ログに残る。それ以外は exit 3 で止めて見せる |
+| §14-16 silent 修復 | 修復は R-1〜R-4 の 4 つだけで、すべて監査ログに残る。それ以外は書かずに stderr と監査ログに報告する (止めない。止めると復旧の出口が消える §2.5) |
 | §14-17 unknown field / 本文の削除 | 直列化は今の関数を移すだけ (バイト単位で同じ)。S3 の QA で前後比較 |
 | §14-18・19 新 DB / Message Bus | なし |
 | 不変条件 1 (読み取りは lib_task_cards) | lib_state_store の読みも lib_task_cards。書き込み側に同じ規則を広げる |
@@ -482,5 +590,5 @@ env の停止スイッチは付けない (不変条件 5)。戻しは常に reve
 - S1 (t005): 本番 queue の複製 (`cp -a` した隔離 queue) で lint → FAIL の差分が `needs_director` の減少だけ / 語彙のコピー検出テストの陽性対照と件数
 - S2 (t009): 独立プロセスで同じ queue に 2 本以上のトランザクション (mock lock ではなく実 flock)、入れ子で待たずに例外、原子的書き込みの各段 (write / fsync / replace / 親 fsync) で例外を注入して元のファイルが読める、crash 注入 20 回反復、欠陥版 (親 fsync を消す・tmp を消さない) で赤
 - S3 (t013): 固定 fixture で S3 前後の card / mission / state のバイト比較、監査ログの行と欄、書き込み途中の SIGKILL
-- S4 (t017): §2.2 の表の各行を隔離 queue で作り、次のロック取得で表どおりになる / **進行中を巻き戻さない** (後任が pull し直した状態で R-2 が後任を消さない) / `update --status in_progress` (§2.3 末尾) の観察 / 本番 queue の複製で store-check の棚卸し
+- S4 (t017): §2.2 の表の各行を隔離 queue で作り、次のロック取得で表どおりになる / **進行中を巻き戻さない** (後任が pull し直した状態で R-2 が後任を消さない) / `update --status in_progress` (§2.3 末尾) の観察 / 本番 queue の複製で store-check の棚卸し / **§2.6 の表の各行を「落とす → 同じ引数 / 違う引数 / 別の操作」で再現** し、正本と出口が表どおりか (特に P2-1: `done --pr 123` を D2 の途中で落とし `--pr 456` で拒否される、P2-2: reset を枠撤去の前で落とし逆引きで旧所有者の枠が消える、P2-3: §2.5 の表の各食い違いで出口のコマンドが通る)
 - S5 (t021): 書き手ごとの同時更新と強制終了、構造ガードの陽性対照・件数・赤の実証

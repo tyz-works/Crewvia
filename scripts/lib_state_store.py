@@ -64,8 +64,8 @@ _SCRIPTS_DIR = Path(__file__).resolve().parent
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
-import lib_dep_rules as _dep_rules  # noqa: E402
 import lib_task_cards as _cards  # noqa: E402
+import lib_task_status as _status  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # 「内容を出さない」の門 (原案 §14-21 / STATE-06)
@@ -82,11 +82,8 @@ _SAFE_TOKEN_RE = re.compile(r'[A-Za-z0-9_.-]{1,64}')
 _SAFE_GENERATION_RE = re.compile(r'[A-Za-z0-9:_.+-]{1,64}')
 _MALFORMED_LINE_RE = re.compile(r'malformed line (\d+)')
 
-#: card の status として出してよい語彙 (これ以外の値は内容として扱い、出さない)。
-_KNOWN_STATUSES = frozenset({
-    'pending', 'in_progress', 'needs_director', 'done', 'failed', 'ready_for_verification',
-    'verifying', 'verified', 'needs_human_review', 'blocked', 'skipped', 'verification_failed',
-    'cancelled', _cards.CORRUPT_TASK_STATUS})
+#: card の status として出してよい語彙 (これ以外の値は内容として扱い、出さない)。語彙は lib_task_status が持つ。
+_KNOWN_STATUSES = frozenset(_status.TASK_STATUSES | {_cards.CORRUPT_TASK_STATUS})
 
 
 def _safe_token(value):
@@ -520,18 +517,12 @@ ASSIGN_OTHER_TASK = 'other_task'
 ASSIGN_SUCCESSOR = 'successor'
 ASSIGN_UNVERIFIABLE = 'unverifiable'
 
-#: 状態の語彙。S1 (t004) が `lib_task_status.py` に 1 か所へ寄せる — そのとき
-#: この 3 つをそちらの import に置き換える (backlog: 語彙のコピー)。
-#: HELD / DEAD は依存の意味なので lib_dep_rules から取る (コピーしない。不変条件 3)。
-_TERMINAL_STATUSES = frozenset({'done', 'verified', 'skipped'})
-_ASSIGNMENT_HOLDING_STATUSES = frozenset(
-    {'in_progress', 'ready_for_verification', 'verifying', 'needs_human_review'})
+#: 状態の語彙は lib_task_status が唯一の定義 (S1)。ここには status の集合を置かない。
+_TERMINAL_STATUSES = _status.TERMINAL_STATUSES
+_ASSIGNMENT_HOLDING_STATUSES = _status.ASSIGNMENT_HOLDING_STATUSES
 _NEEDS_DIRECTOR = 'needs_director'
-#: 今の reap-orphan-assignment (plan.sh:908) の判定と同じ式。
-ORPHAN_ASSIGNMENT_FINISHED_STATUSES = (
-    _TERMINAL_STATUSES
-    | frozenset(_dep_rules.DEAD_DEP_STATUSES)
-    | frozenset(_dep_rules.HELD_DEP_STATUSES))
+#: 今の reap-orphan-assignment の判定と同じ式 (終端 + failed)。
+ORPHAN_ASSIGNMENT_FINISHED_STATUSES = _status.RELEASED_WORK_STATUSES
 
 
 def agent_name_problem(agent):

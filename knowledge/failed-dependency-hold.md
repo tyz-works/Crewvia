@@ -109,8 +109,8 @@ worker.md / 過去の task 記述の「着手したらまず QA の status を�
 - **打ち間違いが解除に見えない**: `blocked_by` に無い依存の名指し、pending でない task、
   保留が無い task への引数なし実行は、どれも 1 バイトも書かずに拒否する。
 
-`cancelled` の依存は従来どおり満たされた扱い。`cancelled` は Director 自身が下した判断
-(task を中止した) なので、保留にすると自分の判断で下流が止まる。
+（当時は `cancelled` の依存を満たされた扱いにしていたが、`cancelled` は書き手が無く本番にも 0 件で、
+vNext 01a S1 で語彙から消えた。Director の「中止」は `skipped` = 完了扱い。`knowledge/state-store.md` §1.3 / §1.6）
 
 ## 実装 (規則は 1 箇所)
 

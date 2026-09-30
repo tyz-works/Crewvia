@@ -73,6 +73,8 @@ def _load_hooks_module(name: str):
 lib_task_cards = _load_scripts_module('lib_task_cards')
 # 「依存」の判定 (循環を含む) は lib_dep_rules.py の 1 か所 (CLAUDE.md 不変条件 #3)。
 _DEP_RULES = _load_scripts_module('lib_dep_rules')
+# status の語彙は lib_task_status.py の 1 か所 (vNext 01a S1)。plan.sh update と同じ集合を読む。
+_TASK_STATUS = _load_scripts_module('lib_task_status')
 
 
 # ---------------------------------------------------------------------------
@@ -80,13 +82,7 @@ _DEP_RULES = _load_scripts_module('lib_dep_rules')
 # ---------------------------------------------------------------------------
 
 VALID_PRIORITIES = {'high', 'medium', 'low'}
-VALID_STATUSES = {
-    'pending', 'in_progress', 'done', 'verified', 'failed', 'skipped',
-    'ready_for_verification', 'verifying', 'verification_failed', 'needs_human_review',
-    # t009 / #24: drafting の段階から止めておける (Director 専用 / PR 番号待ちの task)。
-    # `blocked_reason` が必須 (check_frontmatter)。理由の無い停止は、あとで誰も解けない。
-    'blocked',
-}
+VALID_STATUSES = _TASK_STATUS.TASK_STATUSES
 REQUIRED_FIELDS = ['id', 'title', 'skills', 'status', 'priority']
 
 
@@ -130,6 +126,14 @@ def check_frontmatter(tasks: list[dict]) -> list[tuple[str, str, str]]:
             if not isinstance(reason, str) or not reason.strip():
                 results.append(('FAIL', 'frontmatter',
                                 f"{prefix}: status 'blocked' requires a non-empty 'blocked_reason'"))
+
+        # `needs_director` も同じ作法: 理由の無い判断待ちは、Director が何を判断するのか
+        # 分からない。`plan.sh needs-director` は必ず書くが、`update --status` は書けてしまう。
+        if status == 'needs_director':
+            reason = meta.get('needs_director_reason')
+            if not isinstance(reason, str) or not reason.strip():
+                results.append(('FAIL', 'frontmatter',
+                                f"{prefix}: status 'needs_director' requires a non-empty 'needs_director_reason'"))
 
         if not results or all(level != 'FAIL' for level, *_ in results):
             pass  # OK entries added by caller

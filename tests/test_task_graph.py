@@ -83,6 +83,7 @@ def _call_name(node: ast.Call) -> str | None:
 # ---------------------------------------------------------------------------
 
 DEP_RULES_PY = REPO_ROOT / "scripts" / "lib_dep_rules.py"
+TASK_STATUS_PY = REPO_ROOT / "scripts" / "lib_task_status.py"
 
 
 def _dep_rules():
@@ -105,7 +106,7 @@ def test_unmet_dependency_rule_exists_as_one_helper():
     """
     mod = _dep_rules()
     assert callable(mod.unmet_dependencies)
-    assert mod.DEAD_DEP_STATUSES, "DEAD_DEP_STATUSES が空"
+    assert mod.HELD_DEP_STATUSES, "HELD_DEP_STATUSES が空"
 
 
 def test_plan_sh_takes_the_rule_from_the_module_instead_of_defining_it(tree):
@@ -126,34 +127,35 @@ _RULE_SCAN_GLOBS = ("scripts/*.sh", "scripts/*.py", "hooks/*.sh", "tests/*.py")
 
 
 def test_no_script_keeps_its_own_copy_of_the_rule():
-    """DEAD_DEP_STATUSES の中身を直書きした箇所が、本体以外に無いこと。
+    """HELD_DEP_STATUSES の中身を直書きした箇所が、定義 (lib_task_status.py) 以外に無いこと。
 
     dispatcher.sh には PR #212 のあとも同じ規則の独自コピーが残っていた
     (QA t002 の指摘 F-2b)。「今は一致している」は、片方だけ直せる形が残って
     いるかぎり保証ではない。テスト側の写し (「dispatcher.sh と同じロジック」)
     も同罪で、そちらは *本物を直しても緑のまま* になるぶん質が悪い。
 
-    探す文字列は本体の DEAD_DEP_STATUSES から組み立てる。このテスト自身に
-    リテラルを書かないので、規則の中身が変わっても探し先は自動で追従する。
+    探す文字列は本体の HELD_DEP_STATUSES から組み立てる (このテスト自身にリテラルを
+    書かない)。**走査した件数を出し、0 件では通さない** (旧版は cancelled が消えて
+    needle が 1 要素になると「, を含む needle だけ」の条件で全件素通りになった)。
+    status の集合全般のコピーは AST で `test_task_status_single_definition.py` が見る。
     """
-    mod = _dep_rules()
-    dead = tuple(mod.DEAD_DEP_STATUSES) + tuple(mod.HELD_DEP_STATUSES)
-    # 「終わらないと確定した status を並べたタプル」は、順序を入れ替えても同じコピー。
-    needles = {", ".join(repr(s) for s in order)
-               for order in itertools.permutations(dead)}
-
-    offenders = []
+    mod = _dep_rules()          # lib_dep_rules が scripts/ を sys.path に通す
+    import lib_task_status
+    held = tuple(mod.HELD_DEP_STATUSES)
+    assert held == tuple(lib_task_status.HELD_DEP_STATUSES)
+    needle = "HELD_DEP_STATUSES = (" + ", ".join(repr(s) for s in held)
+    definers = []
+    scanned = 0
     for glob in _RULE_SCAN_GLOBS:
         for path in sorted(REPO_ROOT.glob(glob)):
-            if path.resolve() == DEP_RULES_PY.resolve():
+            if path.resolve() == TASK_STATUS_PY.resolve():
                 continue
-            text = path.read_text(errors="replace")
-            if any(needle in text for needle in needles if "," in needle):
-                offenders.append(str(path.relative_to(REPO_ROOT)))
-
-    assert not offenders, (
-        f"依存規則のコピーが残っている: {offenders} — "
-        f"scripts/lib_dep_rules.py の card_dependencies() を呼ぶこと"
+            scanned += 1
+            if needle in path.read_text(errors="replace"):
+                definers.append(str(path.relative_to(REPO_ROOT)))
+    assert scanned > 20, f"走査したファイルが {scanned} 件しかない (glob が壊れている)"
+    assert not definers, (
+        f"保留の語彙のコピーが残っている: {definers} — lib_task_status.HELD_DEP_STATUSES を読むこと"
     )
 
 
@@ -292,10 +294,10 @@ STATUS_ROWS = [
     # 依存が failed → Director の判断待ち。pull / dispatch は拒否するので READY と
     # 出してはいけない。plugin に「判断待ち」は無いので blocked に畳んで印で見分ける。
     ("t014", "pending", ["t006"], "blocked", "[保留"),
-    # `cancelled` は DEAD_DEP_STATUSES 側の終端 (Director 自身の判断)。`blocked` に
-    # 畳むと「依存先は blocked なのに下流は READY」という、依存規則と食い違う画面になる。
-    ("t015", "cancelled", [], "failed", "[中止]"),
-    ("t016", "pending", ["t015"], "ready", None),    # 依存が cancelled → dispatch する
+    # `cancelled` は vNext 01a S1 で語彙から消えた (書き手 0)。手書きされても「知らない
+    # status」= 上流は [status不明] + blocked、下流は待つ (pull も進めない = 画面と規則が一致)。
+    ("t015", "cancelled", [], "blocked", "[status不明]"),
+    ("t016", "pending", ["t015"], "waiting", None),  # 依存が知らない status → 待つ
 ]
 
 

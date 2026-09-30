@@ -208,7 +208,7 @@ def test_needs_director_is_fine_when_the_assignment_is_already_gone(tmp_path):
 #: card を手放していない status。assignment が無くても Worker は「仕事あり」のまま。
 HELD_STATUSES = ["needs_director", "needs_human_review", "blocked", "verifying", "in_progress"]
 #: card を手放した status。assignment が無く他に仕事が無ければ従来どおり退役する。
-RELEASED_STATUSES = ["done", "verified", "skipped", "failed", "cancelled"]
+RELEASED_STATUSES = ["done", "verified", "skipped", "failed"]
 
 
 @pytest.mark.parametrize("status", RELEASED_STATUSES)
@@ -376,7 +376,7 @@ def _spawns(root):
 
 
 @pytest.mark.parametrize(
-    "status", ["done", "verified", "skipped", "cancelled", "failed", "needs_director"])
+    "status", ["done", "verified", "skipped", "failed", "needs_director"])
 def test_an_orphan_kai_codex_assignment_does_not_block_the_next_review(tmp_path, status):
     root = _build_repo(tmp_path)
     _codex_setup(root, assignment_task_status=status, assignment_value=f"{SLUG}:t011\n")

@@ -2277,8 +2277,8 @@ findings を出して needs_director で止まった run の assignment が残�
 1. **`cmd_needs_director` が `retire_assignment(AGENT_NAME, slug, task, None)` を呼ぶ** — `cmd_fail` と同じ形
    (キューロックの中・card の書き換えと同じトランザクション・別 task を指す assignment は消さない)。
 2. **Rule 2 の「仕事を持っている」を card で数える** — `worker_holds_work()`: card の `worker` が自分で、
-   `RELEASED_WORK_STATUSES` (done / verified / skipped / cancelled / failed。「もう完了しない」status の名前は
-   `lib_dep_rules` から取り、ここに並べ直さない) でも `pending` でもない card が
+   `RELEASED_WORK_STATUSES` (done / verified / skipped / failed。S1 で cancelled は語彙から消えた。名前は
+   `lib_task_status` から取り、ここに並べ直さない) でも `pending` でもない card が
    1 枚でもあれば持っている (needs_director / needs_human_review / blocked / verifying / in_progress / 未知の
    status)。倒す先は「殺さない」(除外側を数える)。card は `load_all_tasks()` の戻り (= `lib_task_cards` の入口) を
    使い、ここで読み直さない。`TERMINAL_STATUSES` (依存が満たされた) とは問いが違うので別の集合にしてある —

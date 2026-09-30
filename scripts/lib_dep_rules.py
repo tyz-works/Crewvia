@@ -33,27 +33,32 @@ QA FAIL の直後に review task が自動で unblock され、merge 寸前ま�
 * `failed` の依存 = **保留 (held)**。unmet に数え、誰も自動では進めない。
   Director が `plan.sh release-dep` で解除したとき (card の `released_deps`) だけ
   満たされる。保留は `plan.sh status` に理由と解除コマンド付きで出る。
-* `cancelled` の依存 = 従来どおり満たされた扱い。Director 自身が下した判断なので、
-  保留にすると自分の判断で下流が止まる。
+* `cancelled` は vNext 01a S1 で語彙から消えた (書き手が無かった)。Director の「中止」は
+  `skipped` (完了扱い)。
 
 選択肢の比較 (hard/soft 区別 vs 明示保留) は knowledge/failed-dependency-hold.md。
 """
 
 from __future__ import annotations
 
+import sys
 from collections import namedtuple
+from pathlib import Path
 
-#: 「この依存はもう完了しない」ことが確定しており、**Director 自身の判断で**そうなった
-#: status。満たされた扱いにして下流を進める。
-#:
-#: 完了した status (`done` / `verified` / `skipped` = plan.sh の
-#: TERMINAL_STATUSES) はここに入れない。あちらは done_ids として渡ってくる。
-DEAD_DEP_STATUSES = ('cancelled',)
+# status の語彙は lib_task_status.py が唯一の置き場 (vNext 01a S1)。plan.sh / lint は
+# このファイルを spec で読むので、隣の lib を import できるよう自分の場所を通す。
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-#: 「もう完了しない」が確定しているが、**誰の判断も経ていない** status。保留にして
-#: Director の解除 (`released_deps`) を待つ。ここに `failed` 以外を足すときは、
-#: それが本当に Director の判断待ちなのかを先に決めること。
-HELD_DEP_STATUSES = ('failed',)
+from lib_task_status import HELD_DEP_STATUSES, TASK_STATUSES  # noqa: E402
+
+# 「もう完了しない」が確定しているが、**誰の判断も経ていない** status (`failed`)。保留にして
+# Director の解除 (`released_deps`) を待つ。定義は lib_task_status.HELD_DEP_STATUSES
+# (語彙の分類は 1 か所)。足すときは、それが本当に Director の判断待ちなのかを先に決めること。
+#
+# `cancelled` は語彙から消えた (書き手が無かった。knowledge/state-store.md §1.3)。
+# 「Director が中止した」は `skipped` で、完了扱い (done_ids) として渡ってくる。
+# 手書きの `cancelled` は知らない status = 満たされていない (保留側) に倒れる。
+assert set(HELD_DEP_STATUSES) <= TASK_STATUSES
 
 #: `unmet` = 満たされていない依存すべて (保留を含む)。`held` = そのうち、Director の
 #: 解除待ちのもの。`held` は必ず `unmet` の部分集合。
@@ -78,8 +83,6 @@ def unmet_dependencies(blocked_by, done_ids, task_statuses, released=()):
         if dep in done_ids:
             continue
         status = task_statuses.get(dep)
-        if status in DEAD_DEP_STATUSES:
-            continue
         if status in HELD_DEP_STATUSES and dep in released:
             continue
         unmet.append(dep)

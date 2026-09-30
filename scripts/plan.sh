@@ -401,7 +401,14 @@ _scalar = _TASK_CARDS._scalar
 _split_inline_list = _TASK_CARDS._split_inline_list
 
 PRIORITY_ORDER = {'high': 0, 'medium': 1, 'low': 2}
-TERMINAL_STATUSES = {'done', 'verified', 'skipped'}
+
+# task の status の語彙・終端 / 保留 / 手放した の集合・コマンドごとの「受け付ける元の
+# status」は lib_task_status.py の 1 か所 (vNext 01a S1)。dispatcher.sh / lint_plan.py も
+# 同じモジュールを読む。ここに status の集合を書き戻さないこと —
+# tests/test_task_status_single_definition.py が AST で落とす。
+_TASK_STATUS = _load_scripts_module('lib_task_status')
+TASK_STATUSES = _TASK_STATUS.TASK_STATUSES
+TERMINAL_STATUSES = _TASK_STATUS.TERMINAL_STATUSES
 
 # Pseudo-status for a task file that failed to parse (see lib_task_cards). Never
 # 'pending', so pull/dispatch skip it automatically; never in
@@ -430,6 +437,15 @@ STATUS_ICON = {
 def die(msg, code=1):
     print(msg, file=sys.stderr)
     sys.exit(code)
+
+
+#: 「この status の task にはこのコマンドを使えない」の終了コード。何も書かずに終わる。
+REFUSED_TRANSITION = 2
+
+
+def refuse_transition(command, task_id, cur_status):
+    """許可遷移表 (lib_task_status.ACCEPTS_FROM) が拒否した。全コマンドで同じ書き方・同じ終了コード。"""
+    die(f"task '{task_id}': {_TASK_STATUS.refusal_reason(command, cur_status)}", REFUSED_TRANSITION)
 
 
 def now_iso():
@@ -886,7 +902,6 @@ def _warn_task_card(msg):
 # かは、その定義の上のコメントにまとめてある)。
 
 _DEP_RULES = _load_scripts_module('lib_dep_rules')
-DEAD_DEP_STATUSES = _DEP_RULES.DEAD_DEP_STATUSES
 HELD_DEP_STATUSES = _DEP_RULES.HELD_DEP_STATUSES
 unmet_dependencies = _DEP_RULES.unmet_dependencies
 find_dependency_cycle = _DEP_RULES.find_dependency_cycle
@@ -894,18 +909,15 @@ card_dependencies = _DEP_RULES.card_dependencies
 declared_dependencies = _DEP_RULES.declared_dependencies
 
 #: 「終了した」task の status (t009 / backlog #34: `reap-orphan-assignment` が
-#: assignment を撤去してよい対象)。dispatcher.sh の `RELEASED_WORK_STATUSES`
-#: (TERMINAL_STATUSES | DEAD_DEP_STATUSES | HELD_DEP_STATUSES) と同じ定義だが、
-#: コピーではなく plan.sh がもともと持っている TERMINAL_STATUSES と、
-#: lib_dep_rules から読んだ上の 2 つを都度合成しているだけ —— 値の出どころは
-#: dispatcher.sh と同じ 3 つの集合であり、増減すればここも自動で追従する。
+#: assignment を撤去してよい対象)。dispatcher.sh の `RELEASED_WORK_STATUSES` と同じ
+#: 集合で、両方とも lib_task_status.RELEASED_WORK_STATUSES を参照する (1 か所)。
 #: `needs_director` は **含めない**: 正常経路 (kai-review.sh → `plan.sh
 #: needs-director`) では needs_director への遷移そのものが assignment を撤去する
 #: ので、それでも assignment が残っているのは「この needs_director が別の実行の
 #: ものかもしれない」証拠不足の状態であり、破壊的な掃除の対象にはしない
 #: (`codex_review_slot_busy()` の read-only な「塞がない」判定とは意図的に非対称。
 #: 破壊的操作はより強い証拠を要求する — memory: evidence-for-destructive-decisions)。
-ORPHAN_ASSIGNMENT_FINISHED_STATUSES = TERMINAL_STATUSES | set(DEAD_DEP_STATUSES) | set(HELD_DEP_STATUSES)
+ORPHAN_ASSIGNMENT_FINISHED_STATUSES = _TASK_STATUS.RELEASED_WORK_STATUSES
 
 
 def held_dependency_hint(task_id, held, slug):
@@ -968,13 +980,6 @@ TASK_GRAPH_STATUS_MAP = {
     'verifying':              ('running', None),
     'failed':                 ('failed',  None),
     'verification_failed':    ('failed',  '[検証NG]'),
-    # `cancelled` は DEAD_DEP_STATUSES の側 —— 「もう完了しない」が確定した
-    # 終端で、`done` / `verified` / `skipped` (= TERMINAL_STATUSES) のような
-    # 「完了した」ではない。だから done ではなく failed に畳む: そうすれば
-    # 「依存先が終端 → 下流は READY」という見え方が failed とまったく同じに
-    # なり、依存規則と矛盾しない。done に畳むと、中止したものを完了したと
-    # 主張することになる。失敗ではないことは印で分ける ([skip] と同じやり方)。
-    'cancelled':              ('failed',  '[中止]'),
     # (c) blocked_reason 付きで明示的に止められている
     'blocked':                ('blocked', '[停止]'),
     # (b) 人間の判断待ち。(a) 依存待ち (= waiting) とは plugin の状態そのもので
@@ -1006,20 +1011,20 @@ PANELESS_SKILLS = {'codex-review'}
 #:
 #: 除外側を数える書き方 (`TERMINAL_STATUSES に無ければ出す`) では足りない。
 #: `cmd_fail` は **完了を記録しつつ `worker` 欄を残す** ので、`failed` の card は
-#: 終わったあとも Worker 名を持ち続ける。`cancelled` / `verification_failed` /
+#: 終わったあとも Worker 名を持ち続ける。`verification_failed` /
 #: `corrupted` も同じで、いずれも TERMINAL_STATUSES には入っていない。crewvia は
 #: Worker 名を使い回すので、それらに pane_match を出すと **無関係な task の
 #: ペイン** を指す。`pending` は `--reset` が worker を消すので通常は空だが、
 #: 残っていても「誰も就いていない」が正しい。
 #:
 #: 知らない status は出さない側に倒れる (allowlist なので既定が除外)。
-TASK_GRAPH_PANE_STATUSES = {
-    'in_progress',            # pull が assignment を公開した直後の状態
-    'verifying',              # 検証中 — card はまだ Worker のもの
-    'ready_for_verification', # 検証待ち — assignment は撤去されない
-    'needs_director',         # 判断待ち — assignment は撤去されるが card の worker は残る (t001)
-    'needs_human_review',     # 判断待ち — assignment は撤去されない
-}
+#: 中身は lib_task_status の 2 集合の和: card がまだ Worker のものである status
+#: (in_progress / ready_for_verification / verifying / needs_human_review —
+#: assignment は撤去されない) と、判断待ち (needs_director — assignment は撤去される
+#: が card の worker は残る。t001)。
+TASK_GRAPH_PANE_STATUSES = (
+    _TASK_STATUS.ASSIGNMENT_HOLDING_STATUSES | _TASK_STATUS.WAITS_ON_DIRECTOR_STATUSES
+)
 
 
 def task_graph_enabled():
@@ -2445,7 +2450,7 @@ def _taskvia_unblock_dependents(slug, completed_task_id):
     done_ids = {m['id'] for (m, _) in tasks if m.get('status') in TERMINAL_STATUSES}
     done_ids.add(completed_task_id)
     for meta, _ in tasks:
-        if meta.get('status') != 'pending':
+        if not _TASK_STATUS.accepts('pull', meta.get('status')):
             continue
         bb = meta.get('blocked_by') or []
         if not bb:
@@ -2981,7 +2986,7 @@ def mission_search_order(explicit, state):
 
 #: task id が複数 mission に当たったときに、環境変数で mission を決めてよい status。
 #: Worker が今その task を実行している (または検証中の) 間だけ。
-_ENV_MISSION_STATUSES = ('in_progress', 'verifying')
+_ENV_MISSION_STATUSES = _TASK_STATUS.EXECUTING_STATUSES
 
 
 def _env_mission_for_task(task_id, matches):
@@ -3037,7 +3042,7 @@ def agent_busy_elsewhere(agent, mission, task_id, slugs):
 
       * card: worker が `agent` で status が `in_progress` の card。
       * assignment: `queue/assignments/<agent>` が別の task を指していて、**その task が手放されて
-        いない** (in_progress / needs_director / verifying ... 。完了・failed・cancelled・pending・
+        いない** (in_progress / needs_director / verifying ... 。完了・failed・pending・
         card が見つからない、は手放し済みの孤児)。
 
     needs_director / needs_human_review の card だけでは「持っている」にしない: Kai-codex
@@ -3068,7 +3073,7 @@ def agent_busy_elsewhere(agent, mission, task_id, slugs):
     other_mission, _, other_task = published.strip().partition(':')
     if not other_mission or not other_task or not os.path.exists(mission_dir(other_mission)):
         return None   # 形が違う / mission が無い: 指す先が無い孤児
-    released = TERMINAL_STATUSES | set(DEAD_DEP_STATUSES) | set(HELD_DEP_STATUSES) | {'pending'}
+    released = _TASK_STATUS.RELEASED_WORK_STATUSES | {'pending'}
     for meta, _body in list_tasks(other_mission):
         if meta.get('id') == other_task:
             status = meta.get('status')
@@ -3247,7 +3252,7 @@ def cmd_pull(args):
                     # even when --task bypasses skill/target filters.  This prevents
                     # a blocked task from being executed when the dispatcher sends a
                     # stale kickoff message (e.g. blocked_by race, parse glitch).
-                    # cancelled deps are excluded (Director's own decision).  A
+                    # A
                     # *failed* dep is HELD until the Director releases it
                     # (plan.sh release-dep): treating it as satisfied let a review
                     # task run right after its QA failed (t007 / backlog #9).
@@ -3279,7 +3284,7 @@ def cmd_pull(args):
                     candidates.append((slug, meta, body))
                     break  # task IDs are unique within a mission
                 # Regular auto-selection flow
-                if meta.get('status') != 'pending':
+                if not _TASK_STATUS.accepts('pull', meta.get('status')):
                     continue
                 pending_count += 1
                 if requested_skills and not set(meta.get('skills', [])).issubset(requested_skills):
@@ -3298,7 +3303,7 @@ def cmd_pull(args):
                     if task_td != effective_target:
                         target_mismatch += 1
                         continue
-                # cancelled deps do not block (Director's own decision).  failed
+                # failed
                 # deps HOLD the task until the Director releases them.
                 verdict = card_dependencies(meta, done_ids, task_statuses)
                 if verdict.unmet:
@@ -3805,8 +3810,8 @@ def cmd_needs_director(args):
 
         meta, body = load_task(slug, task_id)
         cur_status = meta.get('status')
-        if cur_status not in ('in_progress',):
-            die(f"needs-director requires in_progress task (current: {cur_status})")
+        if not _TASK_STATUS.accepts('needs-director', cur_status):
+            refuse_transition('needs-director', task_id, cur_status)
 
         summary, full_text = split_long_freeform(reason)
         meta['status'] = 'needs_director'
@@ -3845,7 +3850,7 @@ def cmd_needs_director(args):
 PR_PROPAGATION_SKILLS = ('codex-review', 'review')
 
 #: もう PR 番号を待っていない status (`codex_reviews_awaiting_pr` が数えない)。
-PR_NOT_AWAITED_STATUSES = {'done', 'verified', 'failed', 'skipped', 'cancelled', 'verification_failed'}
+PR_NOT_AWAITED_STATUSES = _TASK_STATUS.PR_NOT_AWAITED_STATUSES
 
 
 def _is_pr_passthrough(meta):
@@ -3998,7 +4003,7 @@ def codex_reviews_awaiting_pr(slug, task_id):
     ない — 本番確認のような合流 task は、個々の PR の done では永久に満たせない)。
 
     review の task は番号が無くても Worker が PR を探せるので、対象は codex-review だけ。
-    終わった task (done / failed / skipped / cancelled ...) は番号を待っていない。
+    終わった task (done / failed / skipped ...) は番号を待っていない。
     `[破損]` の card は読み違えないので数えない (拒否の根拠にできるのは、読めた card だけ)。
     キューロックの中で呼ぶこと。
     戻り値: 該当 task の id のリスト。
@@ -4082,15 +4087,16 @@ def cmd_done(args):
 
         meta, body = load_task(slug, task_id)
         cur_status = meta.get('status')
-        if cur_status in ('done', 'verified', 'failed', 'skipped'):
-            die(f"task '{task_id}' is already {cur_status}.")
-        if cur_status == 'needs_director':
+        if cur_status in _TASK_STATUS.WAITS_ON_DIRECTOR_STATUSES:
             reason = meta.get('needs_director_reason', '')
             die(
                 f"task '{task_id}' is in needs_director state (理由: {reason})\n"
                 f"Director が plan.sh update {task_id} --status in_progress --reset で"
-                f" 差し戻してから再度 plan.sh done を呼んでください。"
+                f" 差し戻してから再度 plan.sh done を呼んでください。",
+                REFUSED_TRANSITION,
             )
+        if not _TASK_STATUS.accepts('done', cur_status):
+            refuse_transition('done', task_id, cur_status)
 
         # ── 自分自身の card に既にある pr_number との食い違い (t095 / PR#236 8巡目 P2-1) ──
         # 成果物を作った task 自身の card にも pr_number を残す (下の done 処理の中)。既に
@@ -4304,8 +4310,8 @@ def cmd_fail(args):
 
         meta, body = load_task(slug, task_id)
         cur_status = meta.get('status')
-        if cur_status in ('done', 'verified', 'failed', 'skipped'):
-            die(f"task '{task_id}' is already {cur_status}.")
+        if not _TASK_STATUS.accepts('fail', cur_status):
+            refuse_transition('fail', task_id, cur_status)
 
         # ── 証拠の検証 (done と共通の入口。card は 1 バイトも書く前) ─────────────
         err, fields = _gate_terminal_report('fail', meta, {
@@ -4595,11 +4601,8 @@ def cmd_ready_for_verification(args):
 
         meta, body = load_task(slug, task_id)
         cur_status = meta.get('status')
-        if cur_status != 'in_progress':
-            die(
-                f"ready-for-verification requires task to be in_progress, "
-                f"but '{task_id}' is currently '{cur_status}'."
-            )
+        if not _TASK_STATUS.accepts('ready-for-verification', cur_status):
+            refuse_transition('ready-for-verification', task_id, cur_status)
 
         meta['status'] = 'ready_for_verification'
         save_task(slug, task_id, meta, body)
@@ -4649,8 +4652,8 @@ def cmd_verify_result(args):
 
         meta, body = load_task(slug, task_id)
         cur_status = meta.get('status')
-        if cur_status in ('done', 'verified', 'skipped', 'failed'):
-            die(f"task '{task_id}' is already {cur_status}.")
+        if not _TASK_STATUS.accepts('verify-result', cur_status):
+            refuse_transition('verify-result', task_id, cur_status)
 
         # Build and append verification entry
         timestamp = now_iso()
@@ -5476,10 +5479,7 @@ def cmd_update(args):
 
     # Validate status if given
     status = opts.get('--status')
-    valid_statuses = {
-        'pending', 'in_progress', 'done', 'failed', 'blocked', 'skipped', 'verified',
-        'ready_for_verification', 'verifying', 'verification_failed', 'needs_human_review',
-    }
+    valid_statuses = TASK_STATUSES
     if status and status not in valid_statuses:
         die(f"invalid status '{status}'. Valid statuses: {', '.join(sorted(valid_statuses))}")
 
@@ -5745,7 +5745,7 @@ def cmd_release_dep(args):
 #: 「世代まで一致する reset」が成立して結末が消える。
 #: これは呼び出し側 (lib_retirement) が持っていた `--expect-status in_progress`
 #: を API の内側に取り込んだものでもある (t024)。
-RETIRE_RETIRABLE_STATUS = 'in_progress'
+#: 集合は lib_task_status.ACCEPTS_FROM['retire'] (S1 で `RETIRE_RETIRABLE_STATUS` から移した)。
 
 
 def cmd_retire(args):
@@ -5853,9 +5853,9 @@ def cmd_retire(args):
         suffix = " — 何も変更していません"
 
         cur_status = meta.get('status')
-        if cur_status != RETIRE_RETIRABLE_STATUS:
+        if not _TASK_STATUS.accepts('retire', cur_status):
             die(f"{prefix}status が '{cur_status}' です"
-                f" (終了させられるのは '{RETIRE_RETIRABLE_STATUS}' の実行だけ —"
+                f" (終了させられるのは {sorted(_TASK_STATUS.ACCEPTS_FROM['retire'])} の実行だけ —"
                 f" それ以外は実行自身が書いた結末なので、巻き戻しません){suffix}",
                 PRECONDITION_UNMET)
 
@@ -5927,8 +5927,7 @@ def cmd_reap_orphan_assignment(args):
         素の `--status` はカードの status だけを書き換え、assignment には触れない。
 
     消してよいのは「読めて、`ORPHAN_ASSIGNMENT_FINISHED_STATUSES`
-    (lib_dep_rules の DEAD_DEP_STATUSES / HELD_DEP_STATUSES + plan.sh の
-    TERMINAL_STATUSES) に入っている task を指す」ときだけ。以下はすべて
+    (= lib_task_status.RELEASED_WORK_STATUSES) に入っている task を指す」ときだけ。以下はすべて
     保留 (1 バイトも書かずに exit `PRECONDITION_UNMET`):
       - assignment が読めない (壊れている / 種類が違う)
       - `mission:task` の形でない

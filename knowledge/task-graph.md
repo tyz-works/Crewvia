@@ -195,8 +195,7 @@ worktree を指した）と、**エラーなしでサンプルが描かれる**�
 
 t001 は `pending` の READY / WAIT を plugin の導出に**委ねず**、crewvia 側で
 `card_dependencies()`（`plan.sh pull` と dispatcher が使うのと同じ 1 つの規則）を使って
-明示的に `ready` / `waiting` を書く。規則は t007 で変わった: `cancelled` の依存は満たされた
-扱い、**`failed` の依存は保留（Director が `plan.sh release-dep` するまで pull も dispatch も
+明示的に `ready` / `waiting` を書く。規則は t007 で変わった: **`failed` の依存は保留（Director が `plan.sh release-dep` するまで pull も dispatch も
 拒否）**。保留の task は `blocked` + `[保留: tXXX が failed]` の印で描かれる（`waiting` に
 すると「依存が終われば勝手に進む」と読めてしまう）。画面と pull の可否は同じ規則から来るので、
 **QA FAIL の直後でも、READY と出ている task は実際に pull できる**。よって「その瞬間の WAIT
@@ -329,7 +328,7 @@ task 化は Director の判断。
 | `WAIT` | `pending` で依存待ち |
 | `RUN` | `in_progress` / `verifying` |
 | `DONE` | `done` / `verified` / `skipped`（title に `[skip]`） |
-| `FAIL` | `failed` / `verification_failed`（`[検証NG]`）/ `cancelled`（`[中止]`）/ 読めないカード（`[破損]`） |
+| `FAIL` | `failed` / `verification_failed`（`[検証NG]`）/ 読めないカード（`[破損]`）。`cancelled` は語彙から消えた（S1）— 手書きされても `[status不明]` + `blocked` |
 | `BLOCK [停止]` | `blocked`（`blocked_reason` 付きで明示的に止めてある） |
 | `BLOCK [要判断]` | **人間の判断待ち**: `needs_director` / `needs_human_review` / `ready_for_verification` |
 | `BLOCK [status不明]` | 対応表に無い status。done にも ready にも倒さず止めて見せる |

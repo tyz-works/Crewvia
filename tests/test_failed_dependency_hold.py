@@ -29,7 +29,6 @@ review / merge task (進めてはいけない) を区別できない。`plan.sh 
 
 from __future__ import annotations
 
-import itertools
 import json
 import os
 import pathlib
@@ -78,10 +77,16 @@ def test_a_failed_dependency_is_reported_as_held():
     assert held == ["t002"], "held は failed のものだけ (pending は待つだけ)"
 
 
-def test_cancelled_stays_satisfied():
-    """`cancelled` は Director が自分で下した判断。保留にすると自分の判断で止まる。"""
-    assert _unmet(["t002"], {"t002": "cancelled"}) == []
+def test_cancelled_is_not_a_status_any_more():
+    """`cancelled` は vNext 01a S1 で語彙から消えた (書き手が 0 で本番カードも 0 件)。
+
+    手書きの `cancelled` は「知らない status」= 満たされていない・保留でもない (待つだけ)。
+    Director の「中止」は `skipped` (完了扱い)。
+    """
+    assert _unmet(["t002"], {"t002": "cancelled"}) == ["t002"]
     assert lib_dep_rules.held_dependencies(["t002"], DONE, {"t002": "cancelled"}) == []
+    assert lib_dep_rules.unmet_dependencies(
+        ["t002"], {"t002"}, {"t002": "skipped"}) == [], "skipped は完了扱い (done_ids で渡る)"
 
 
 def test_an_explicit_release_satisfies_a_failed_dependency():
@@ -219,7 +224,7 @@ PATTERNS = [
     ("done",                 [("t001", "done")],                 ["t001"], None,   "ready"),
     ("verified",             [("t001", "verified")],             ["t001"], None,   "ready"),
     ("skipped",              [("t001", "skipped")],              ["t001"], None,   "ready"),
-    ("cancelled",            [("t001", "cancelled")],            ["t001"], None,   "ready"),
+    ("cancelled",            [("t001", "cancelled")],            ["t001"], None,   "waiting"),
     ("pending",              [("t001", "pending")],              ["t001"], None,   "waiting"),
     ("in_progress",          [("t001", "in_progress")],          ["t001"], None,   "waiting"),
     ("verification_failed",  [("t001", "verification_failed")],  ["t001"], None,   "waiting"),
@@ -513,21 +518,17 @@ def test_consumers_ask_the_card_not_the_raw_lists():
             f"{name} が blocked_by を直接 unmet_dependencies() に渡している")
 
 
-def test_the_failed_status_is_not_named_by_any_consumer():
-    """終わらないと確定した status の並び (どの順でも) が本体の外に無いこと。
+def test_the_held_status_vocabulary_has_one_definition():
+    """保留 (HELD) の status の名前は lib_task_status に 1 つだけ。lib_dep_rules は同じ値を再公開するだけ。
 
-    探す文字列は本体の定数から組み立てる (このテストにリテラルを書かない)。
+    (以前は「終わらないと確定した status の並び」を本体の外で探す文字列一致だった。語彙の
+    コピー検出は AST で `tests/test_task_status_single_definition.py` が担う。)
     """
-    mod = lib_dep_rules
-    dead = tuple(mod.DEAD_DEP_STATUSES) + tuple(mod.HELD_DEP_STATUSES)
-    needles = {", ".join(repr(s) for s in order) for order in itertools.permutations(dead)}
-    for glob in ("scripts/*.sh", "scripts/*.py", "hooks/*.sh"):
-        for path in sorted(REPO_ROOT.glob(glob)):
-            if path.resolve() == DEP_RULES_PY.resolve():
-                continue
-            text = path.read_text(errors="replace")
-            assert not any(n in text for n in needles), (
-                f"{path.name} に依存規則のコピーがある")
+    import lib_task_status
+    assert lib_dep_rules.HELD_DEP_STATUSES is lib_task_status.HELD_DEP_STATUSES
+    assert set(lib_dep_rules.HELD_DEP_STATUSES) <= lib_task_status.TASK_STATUSES
+    assert not hasattr(lib_dep_rules, "DEAD_DEP_STATUSES"), (
+        "空になった DEAD_DEP_STATUSES を残さない (cancelled は語彙から消えた)")
 
 
 def test_dispatcher_gate_is_defined_before_the_cycle_entry_point():

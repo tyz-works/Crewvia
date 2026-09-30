@@ -360,7 +360,7 @@ class TestPullDoubleAssignment:
         sb.card("t002")
         assert _pull(sb, "t002").returncode == 0
 
-    @pytest.mark.parametrize("status", ["done", "failed", "cancelled", "skipped", "verified", "pending"])
+    @pytest.mark.parametrize("status", ["done", "failed", "skipped", "verified", "pending"])
     def test_orphan_assignment_pointing_at_a_released_task_is_overwritten(self, sb, status):
         """手放し済みの task を指す assignment は孤児 (#13 と同じ扱い)。塞ぐと codex-review が恒久に止まる。"""
         sb.card("t001", status=status, worker="Ren")
@@ -633,7 +633,7 @@ class TestDoneRequiresPr:
         self._waiting(sb, extra=["pr_number: 100"])
         assert sb.run("done", "t001", "finished", "--mission", MISSION).returncode == 0
 
-    @pytest.mark.parametrize("status", ["done", "failed", "skipped", "cancelled"])
+    @pytest.mark.parametrize("status", ["done", "failed", "skipped"])
     def test_a_codex_review_that_is_already_over_does_not_count(self, sb, status):
         self._waiting(sb, status=status)
         assert sb.run("done", "t001", "finished", "--mission", MISSION).returncode == 0

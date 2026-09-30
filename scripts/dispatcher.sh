@@ -140,7 +140,12 @@ import lib_retirement  # noqa: E402
 # る task と dispatcher が投げる task がズレると、痛むのは QA FAIL の直後だけで、
 # その瞬間まで誰も気付かない。tests/test_task_graph.py がコピーの再発を見張る。
 from lib_dep_rules import card_dependencies  # noqa: E402
-from lib_dep_rules import DEAD_DEP_STATUSES, HELD_DEP_STATUSES  # noqa: E402
+# task の status の語彙・終端 / 手放した / 判断待ちの集合は 1 か所 (vNext 01a S1)。plan.sh /
+# lint_plan.py も同じモジュールを読む。ここに status の集合を書き戻さないこと —
+# tests/test_task_status_single_definition.py が AST で落とす。
+from lib_task_status import (  # noqa: E402
+    RELEASED_WORK_STATUSES, TERMINAL_STATUSES, WAITS_ON_DIRECTOR_STATUSES,
+)
 # task カードの読み取りも 1 箇所しかない (Codex 5 巡目 P2)。parser・「識別子は
 # ファイル名」・信用できないカードの隔離を plan.sh 側だけに入れた結果、同じ queue を
 # 2 つの別のコードが別の規則で読む状態になり、`id` 行の無いカードで **この
@@ -203,18 +208,9 @@ WORKERS_FILE   = REGISTRY_DIR / 'workers.yaml'
 ALL_DONE_STATE_FILE = REGISTRY_DIR / 'dispatcher_all_done.flag'
 
 PRIORITY_ORDER  = {'high': 0, 'medium': 1, 'low': 2}
-TERMINAL_STATUSES = {'done', 'verified', 'skipped'}
-
-# 「Worker がその card をもう手放している」status。TERMINAL_STATUSES (= 依存が
-# 満たされた) とは問いが違う: `failed` は依存を満たさない (HELD) が、Worker は
-# 手放している。`cancelled` も同じ。Worker の生死・Kai-codex の孤児判定はこちらを
-# 使う (t001 / backlog #13)。
-# 「もう完了しない」status の名前は lib_dep_rules が持っている (ここに並べ直すと、
-# tests/test_failed_dependency_hold.py が規則のコピーとして落とす)。完了した status
-# (TERMINAL_STATUSES) にそれを足したものが「手放した」の全部。
-RELEASED_WORK_STATUSES = (
-    TERMINAL_STATUSES | set(DEAD_DEP_STATUSES) | set(HELD_DEP_STATUSES)
-)
+# `RELEASED_WORK_STATUSES` = 「Worker がその card をもう手放している」status。TERMINAL_STATUSES
+# (= 依存が満たされた) とは問いが違う: `failed` は依存を満たさない (HELD) が、Worker は手放している。
+# Worker の生死・Kai-codex の孤児判定はこちらを使う (t001 / backlog #13)。定義は lib_task_status。
 
 # Skills that mark a task as Director-only (handled directly by the Director,
 # not dispatchable to any Worker).  Tasks with these skills are excluded from
@@ -661,7 +657,7 @@ def worker_waits_on_director(agent_name, all_tasks):
     重ねて鳴らさない)。
     """
     return any(
-        meta.get('worker') == agent_name and meta.get('status') == 'needs_director'
+        meta.get('worker') == agent_name and meta.get('status') in WAITS_ON_DIRECTOR_STATUSES
         for _, meta in all_tasks
     )
 
@@ -690,7 +686,7 @@ def codex_review_slot_busy(task_statuses_by_mission):
     if not slug or not task_id:
         return True
     status = task_statuses_by_mission.get(slug, {}).get(task_id)
-    if status in RELEASED_WORK_STATUSES or status == 'needs_director':
+    if status in RELEASED_WORK_STATUSES or status in WAITS_ON_DIRECTOR_STATUSES:
         log(f"[codex-review] {CODEX_REVIEW_AGENT} の assignment は終わった task {slug}:{task_id} "
             f"(status={status}) を指す孤児 — spawn を塞がない")
         return False
@@ -2037,7 +2033,7 @@ def check_rule5(name: str, target: str, assignment_file: Path, task_statuses_by_
                     assigned_task_status = task_statuses_by_mission.get(a_slug, {}).get(a_task_id)
             except Exception:
                 assigned_task_status = None
-        if assigned_task_status == 'needs_director' or waits_on_director:
+        if assigned_task_status in WAITS_ON_DIRECTOR_STATUSES or waits_on_director:
             is_A = False
             is_B = False
 
@@ -2853,7 +2849,7 @@ def dispatch():
     # attempt, no notify recorded (so it re-checks, and re-notifies promptly,
     # once a Director comes back).
     for slug, meta in all_tasks:
-        if meta.get('status') != 'needs_director':
+        if meta.get('status') not in WAITS_ON_DIRECTOR_STATUSES:
             continue
         task_id = meta.get('id', '?')
         notify_key = f'needs_director_{slug}_{task_id}'

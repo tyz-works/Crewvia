@@ -231,10 +231,13 @@ class Sandbox:
 
     def snapshot(self):
         """queue の全ファイルの中身 (「何も書かなかった」の比較用)。`.lock` は排他ロックの入れ物で、
-        中身は常に空 (pull は取ってから断るので、拒否でも作られる)。"""
+        中身は常に空 (pull は取ってから断るので、拒否でも作られる)。`audit/` (監査ログ) は含めない:
+        S4 (t016) から、ロックを取った直後の回復が「表に無い食い違い」(手で作った card に identity が無い等)
+        を見つけると `op=recover result=reported:<コード>` の行を残す。それは状態の書き込みではなく
+        記録なので、「拒否は queue の状態を 1 バイトも書かない」の比較からは外す (状態は card・mission・state・assignment)。"""
         out = {}
         for p in sorted(self.queue.rglob("*")):
-            if p.is_file() and p.name != ".lock":
+            if p.is_file() and p.name != ".lock" and p.relative_to(self.queue).parts[0] != "audit":
                 out[str(p.relative_to(self.queue))] = p.read_bytes()
         return out
 

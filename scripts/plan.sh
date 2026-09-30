@@ -72,19 +72,26 @@ set -euo pipefail
 #
 #   plan.sh reap-orphan-assignment <agent> [--no-wait]
 #                              <agent> (例: Kai-codex) の queue/assignments/<agent> が、
-#                              既に終了した task (lib_dep_rules の「終了した」の定義。
-#                              needs_director は含めない) を指す孤児なら撤去する。
+#                              既に決着した task (lib_state_store.is_orphan_target: 手放し済み ∪
+#                              needs_director ∪ worker の無い pending。S4 で回復の R-2 と同じ集合に揃えた)
+#                              を指す孤児なら撤去する。
 #                              読めない / mission:task の形でない / task が見つからない /
-#                              終了していない / needs_director を指す場合は 1 バイトも
+#                              決着していない (in_progress 等) を指す場合は 1 バイトも
 #                              書かずに exit 3 (retire と同じ PRECONDITION_UNMET)。
 #                              --no-wait: キューロックを待たずに諦め exit 4 (dispatcher 用)
+#   plan.sh store-check [--mission <slug>]
+#                              queue の食い違い (card = 正本と assignment / .identity の projection、
+#                              next_task_id、archive 済みで active に残った slug、残骸) を**書かずに**列挙する
+#                              (読み取り専用・ロックを取らない)。ロックが無いので、途中のトランザクションを
+#                              1 回見うる: 2 回連続で出たものだけが本物。修復は次のロック取得時に
+#                              各コマンドが行う (R-1〜R-4)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 QUEUE_DIR="${CREWVIA_QUEUE:-${REPO_ROOT}/queue}"
 
 if [[ $# -eq 0 ]]; then
-  echo "Usage: plan.sh <init|add|pull|done|needs-director|fail|update|release-dep|retire|reap-orphan-assignment|ready-for-verification|verifying|snapshot|verify-result|review|launch|task-graph|lint|status|archive|resync|dashboard|dashboard-data|resolve-mission> [args...]" >&2
+  echo "Usage: plan.sh <init|add|pull|done|needs-director|fail|update|release-dep|retire|reap-orphan-assignment|ready-for-verification|verifying|snapshot|verify-result|review|launch|task-graph|lint|status|archive|resync|dashboard|dashboard-data|resolve-mission|store-check> [args...]" >&2
   exit 1
 fi
 
@@ -815,12 +822,13 @@ declared_dependencies = _DEP_RULES.declared_dependencies
 #: 「終了した」task の status (t009 / backlog #34: `reap-orphan-assignment` が
 #: assignment を撤去してよい対象)。dispatcher.sh の `RELEASED_WORK_STATUSES` と同じ
 #: 集合で、両方とも lib_task_status.RELEASED_WORK_STATUSES を参照する (1 か所)。
-#: `needs_director` は **含めない**: 正常経路 (kai-review.sh → `plan.sh
-#: needs-director`) では needs_director への遷移そのものが assignment を撤去する
-#: ので、それでも assignment が残っているのは「この needs_director が別の実行の
-#: ものかもしれない」証拠不足の状態であり、破壊的な掃除の対象にはしない
-#: (`codex_review_slot_busy()` の read-only な「塞がない」判定とは意図的に非対称。
-#: 破壊的操作はより強い証拠を要求する — memory: evidence-for-destructive-decisions)。
+#: `needs_director` はこの集合には **含めない** (S4 まではここが `reap-orphan-assignment` の
+#: 判定そのものだった)。撤去してよい status の集合は今は `lib_state_store.is_orphan_target()`
+#: (手放し済み = この集合 ∪ needs_director ∪ worker の無い pending) が持ち、回復 (R-2) と
+#: reap が同じ定義を使う: needs_director に遷移するコマンド (needs-director / retire) は自分で
+#: assignment を撤去するので、それでも枠が残っているのは「そのコマンドが途中で落ちた」以外に
+#: 説明の無い組で、card が正本として言っている (設計 §2.3)。
+#: この集合は「手放し済み」の意味だけで、依存の解釈 (lib_dep_rules) や task-graph が使う。
 ORPHAN_ASSIGNMENT_FINISHED_STATUSES = _TASK_STATUS.RELEASED_WORK_STATUSES
 
 
@@ -869,7 +877,7 @@ QUEUE_MUTATING_SUBCOMMANDS = {
 #: queue を読むだけのサブコマンド = 生成を呼ばない経路。
 #: `task-graph` 自身もここ (queue は書き換えず、生成物だけを書く)。
 QUEUE_READONLY_SUBCOMMANDS = {
-    'lint', 'status', 'resync', 'dashboard-data', 'task-graph', 'resolve-mission',
+    'lint', 'status', 'resync', 'dashboard-data', 'task-graph', 'resolve-mission', 'store-check',
 }
 
 #: crewvia の status → (plugin の status, title に付ける印)。
@@ -2142,6 +2150,35 @@ def retire_assignment(agent, mission, task_id, generation):
     return verdict
 
 
+def recover_before(cards=(), agents=(), add_missions=(), archive_slugs=(), include_caller=True):
+    """ロックを取った直後・**コマンドの前提検査より前**に、card を正本として projection
+    (assignment / .identity) の食い違いを作り直す (vNext 01a S4。設計 §2.3・§2.5)。
+
+    範囲は呼び出し側が渡す (名指しの card・呼び出し元の Worker の枠・R-3 の mission・R-4 の slug)。
+    `with_lock()` の中でだけ呼ぶ。R-1〜R-4 が書くのは projection と派生値だけで、正本
+    (status / worker / started_at) は書かない。修復・報告 1 件ごとの `op=recover` の行は lib が
+    その場で監査ログに追記する (後でコマンド本体が `die` しても残る)。
+
+    **回復は拒否を 1 つも足さない**: 表に無い食い違いは lib が stderr と監査ログに報告するだけで、
+    コマンド本体は今の前提検査のまま受け付けるか拒否する。回復自体の書き込みが失敗しても
+    (disk full・権限) コマンドは止めず警告する — 止めると、その状態から抜ける操作まで拒否して
+    復旧の出口を消す。
+    """
+    caller = os.environ.get('AGENT_NAME', '').strip() if include_caller else ''
+    scope = _STORE.Scope(
+        cards=tuple(dict.fromkeys(cards)),
+        agents=tuple(dict.fromkeys(a for a in (*agents, caller) if a)),
+        add_missions=tuple(add_missions),
+        archive_slugs=tuple(archive_slugs),
+    )
+    try:
+        return _txn().recover(scope)
+    except _STORE.StoreError as e:
+        print(f"[plan.sh warn] 回復 (projection の作り直し) を完了できませんでした: {e}"
+              f" — コマンド本体は続けます", file=sys.stderr)
+        return []
+
+
 def describe_assignment_verdict(agent, verdict):
     """撤去を見送った理由を人間に説明する 1 行。"""
     return {
@@ -2510,6 +2547,7 @@ USAGE = {
     'resync': 'plan.sh resync (<slug> | --all)',
     'dashboard-data': 'plan.sh dashboard-data [--all]',
     'resolve-mission': 'plan.sh resolve-mission <task_id> [--mission <slug>]',
+    'store-check': 'plan.sh store-check [--mission <slug>]',
 }
 
 #: サブコマンドごとに受け付ける positional の数 (最小, 最大)。余剰は黙って捨てず拒否する
@@ -2523,7 +2561,7 @@ POSITIONAL_ARITY = {
     'ready-for-verification': (1, 1), 'verifying': (1, 1), 'snapshot': (1, 1), 'verify-result': (2, 2),
     'review': (1, 1), 'launch': (1, 1), 'task-graph': (0, 0), 'lint': (0, 1),
     'status': (0, 0), 'archive': (1, 1), 'resync': (0, 1), 'dashboard-data': (0, 0),
-    'resolve-mission': (1, 1),
+    'resolve-mission': (1, 1), 'store-check': (0, 0),
 }
 
 #: 使い方の誤りの終了コード。`pull` だけは 1 — `pull` の 2 は「タスクなし (idle)」で、
@@ -2666,6 +2704,9 @@ def cmd_init(args):
     sync_holder = [None]  # (slug, title)
 
     def _do():
+        # R-4: 退避 (mission dir の rename) の途中で落ちて active_missions に残った slug を外す
+        # (state を読む前)
+        recover_before(archive_slugs=load_state().get('active_missions') or [], include_caller=False)
         state = load_state()
         state_before = copy.deepcopy(state)
         slug = opts.get('--mission')
@@ -2853,6 +2894,9 @@ def cmd_add(args):
         if not os.path.exists(mission_dir(slug)):
             die(f"mission '{slug}' not found.")
 
+        # R-3: 前回の add が card の後・next_task_id の前で落ちていれば採番を進める
+        # (今は次の add が同じ tNNN を黙って上書きする)
+        recover_before(add_missions=[slug], include_caller=False)
         mission = load_mission(slug)
         task_num = int(mission.get('next_task_id') or 1)
         task_id = f"t{task_num:03d}"
@@ -3106,6 +3150,20 @@ def cmd_pull(args):
                     + "\n".join(f"    plan.sh pull --task {specific_task} --mission {s}" for s in holders)
                 )
 
+        # 回復 (S4 / 設計 §2.5): 選ぶより前に、この Worker の枠と、この Worker が持っている
+        # card (pull の窓で落ちた残骸 = card は in_progress・枠が無い) と、名指しの card を
+        # 正本に合わせる。範囲は「呼び出し元の Worker が worker の in_progress 等の card」
+        # + 名指しの card だけ (queue 全体は走査しない)。
+        named = []
+        if agent:
+            named += [(s, m['id']) for s in slugs if os.path.exists(mission_dir(s))
+                      for (m, _b) in list_tasks(s, quiet=True)
+                      if m.get('worker') == agent and m.get('id')
+                      and m.get('status') in _TASK_STATUS.ASSIGNMENT_HOLDING_STATUSES]
+        if specific_task:
+            named += [(s, specific_task) for s in slugs if os.path.exists(task_path(s, specific_task))]
+        recover_before(cards=named, agents=(agent,) if agent else ())
+
         # Diagnostic counters per slug
         scanned = 0
         pending_count = 0
@@ -3296,6 +3354,9 @@ def cmd_pull(args):
         ))
 
         slug, meta, body = candidates[0]
+        # 選んだ card を指す枠 (逆引き) が残っていれば、書く前に片付ける: reset の途中で落ちて
+        # 旧所有者の枠だけが残った card を別の Worker が取ると、旧所有者の枠が恒久に残る。
+        recover_before(cards=[(slug, meta['id'])], include_caller=False)
         meta['status'] = 'in_progress'
         meta['worker'] = agent or None
         meta['started_at'] = now_generation()
@@ -3744,6 +3805,7 @@ def cmd_needs_director(args):
             else:
                 slug = matches[0]
 
+        recover_before(cards=[(slug, task_id)])
         if not os.path.exists(task_path(slug, task_id)):
             die(f"task '{task_id}' not found in mission '{slug}'.")
 
@@ -3931,6 +3993,32 @@ def propagate_pr_number(slug, task_id, pr_number):
     return touched
 
 
+def pr_propagation_conflicts(slug, task_id, pr_number):
+    """`propagate_pr_number()` が**書くはずだった**依存先のうち、既に**違う** pr_number を持つもの。
+
+    done の D0 (a) (設計 §2.2): 「上流の deliverable: pr がこの task 1 つだけ」の依存先で番号が食い違う
+    のは、どちらかが古い番号である以外に説明が無い。前の実行が D2 の途中で落ちて別の番号を残した・
+    Director が自分の card の番号を書き換えた、のどちらでも、飛ばして done を通すと **正本は M・
+    レビュー対象は N** で確定する (propagate は設定済みの依存先を飛ばす)。だから拒否する。
+    合流点 (上流に pr の task が 2 つ以上) は propagate も書かないので対象外。
+    戻り値: `[(task_id, 既にある pr_number)]`。キューロックの中で呼ぶこと。
+    """
+    dependents_of, tasks_by_id, _bodies = _pr_dependents_index(slug)
+    reached = _reachable_pr_targets(task_id, dependents_of)
+    memo = {}
+    conflicts = []
+    for tid, meta in reached.items():
+        if not set(meta.get('skills') or []) & set(PR_PROPAGATION_SKILLS):
+            continue
+        existing = meta.get('pr_number')
+        if existing in (None, '') or existing == pr_number:
+            continue
+        if len(_pr_source_ancestors(tid, tasks_by_id, memo)) >= 2:
+            continue
+        conflicts.append((tid, existing))
+    return conflicts
+
+
 def codex_reviews_awaiting_pr(slug, task_id):
     """`task_id` の下流 (直接・推移とも) で、PR 番号が要るのに未設定の codex-review task。
 
@@ -4021,6 +4109,7 @@ def cmd_done(args):
             else:
                 slug = matches[0]
 
+        recover_before(cards=[(slug, task_id)])
         if not os.path.exists(task_path(slug, task_id)):
             die(f"task '{task_id}' not found in mission '{slug}'.")
 
@@ -4053,6 +4142,33 @@ def cmd_done(args):
                     f" 正しい番号か確認するか、plan.sh update {task_id} --pr-number {pr_number}"
                     f" --mission {slug} で明示的に書き換えてから done してください。"
                 )
+
+        # ── D0 (S4 / 設計 §2.2): 再実行が、前の実行の残した派生値と食い違ったまま完了させない ──
+        # (b) 自分の card に pr_number があるのに --no-pr: 「PR なし」で確定すると、依存先に伝わった番号と
+        #     食い違う。(a) 伝播先に違う pr_number が既にある: 上の食い違い検査は自分の card だけを見る。
+        #     どちらも何も書かずに拒否する (exit 3)。出口は拒否メッセージに出す (`update --pr-number`)。
+        if no_pr_reason is not None and meta.get('pr_number') not in (None, ''):
+            die(
+                f"[plan.sh] {task_id}: card には既に pr_number={meta.get('pr_number')!r} があります"
+                f" (前の done が途中で落ちた・Director が設定した)。--no-pr (PR なし) では完了させません"
+                f" (依存先に伝わった番号と食い違うため)。何も書いていません。\n"
+                f"  PR があるなら: plan.sh done {task_id} \"<result>\" --pr {meta.get('pr_number')} --mission {slug}\n"
+                f"  PR が無いなら先に番号を消す: plan.sh update {task_id} --pr-number null --mission {slug}",
+                PRECONDITION_UNMET,
+            )
+        if pr_number is not None:
+            conflicts = pr_propagation_conflicts(slug, task_id, pr_number)
+            if conflicts:
+                lines = [f"[plan.sh] {task_id}: --pr {pr_number} を伝える先に、違う pr_number が既にあります"
+                         f" (前の done が途中で落ちて別の番号を残した・Director が番号を直した、のどちらか)。"
+                         f"このまま完了すると、この task は #{pr_number}・レビュー対象は別の PR で確定します。"
+                         f"何も書いていません。"]
+                for dep_id, existing in conflicts:
+                    lines.append(f"    {slug}/{dep_id}: pr_number={existing!r}")
+                lines.append("  どちらの番号が正しいかは自動では決めません。正しい番号に揃えてから再度 done:")
+                for dep_id, _existing in conflicts:
+                    lines.append(f"    plan.sh update {dep_id} --pr-number {pr_number} --mission {slug}")
+                die("\n".join(lines), PRECONDITION_UNMET)
 
         # ── PR 番号の付け忘れ (t036) ──────────────────────────────────────
         # この task を待つ codex-review に PR 番号が渡らないと、その task は pending のまま
@@ -4102,13 +4218,36 @@ def cmd_done(args):
         if err:
             die(err)
 
+        # ── 書く順序 (S4 / 設計 §2.2): 正本 (自分の card の done) が**コミット点**で、派生値
+        # (依存先の pr_number) は正本より前に書く。どこで落ちても「done が起きなかった」か「起きた」の
+        # どちらかで、起きた後の欠けは回復 (R-2) が拾う。旧順 (done → 伝播) は、done の後・伝播の前で
+        # 落ちると「done なのに依存先に pr_number が無い」状態を作り、Director が `update --pr-number null`
+        # で消した状態と区別できなかった。
+        #   D1 自分の card に pr_number だけ (status はそのまま)  ← 番号を正本に永続化する
+        #   D2 依存先へ pr_number を伝える                        ← 派生値
+        #   D3 自分の card を done に                              ← コミット点
+        #   D4 assignment の撤去                                   ← projection
+        #   D5 mission の done                                     ← 派生値
+        # D1 を先に置くのは、D2 の途中で落ちた後に**違う番号**で再実行されたとき、正本と依存先が別の
+        # 番号で確定しないため (同じ番号なら D1 は冪等、違う番号は上の検査が拒否する)。
+        if pr_number is not None and meta.get('pr_number') != pr_number:
+            # 監査ログの行は 1 トランザクション 1 行 (D3 の save_task が書く) — ここは Txn を直接使う
+            _txn().write_card(slug, task_id, {**meta, 'pr_number': pr_number}, body)
+
+        # PR 番号を、この task を待っている codex-review / review の card に伝える (#24)。
+        # done と同じトランザクションで行う: done だけ済んで番号が伝わっていない瞬間に
+        # dispatcher が「pr_number が無い」と警告して止まるのを避ける。
+        propagated = []
+        if pr_number is not None:
+            propagated = propagate_pr_number(slug, task_id, pr_number)
+
         meta['status'] = 'done'
         if pr_number is not None:
             # 成果物を作った task 自身の card にも番号を残す (B4 の本題。t095 / PR#236 8巡目
             # P2-1)。旧実装は propagate_pr_number() で後続の codex-review/review にだけ書き、
             # 成果物を作った側の card には PR への参照が一切残らなかった。食い違いの拒否は
             # 上の「自分自身の card に既にある pr_number との食い違い」で済んでいるので、
-            # ここは単純に書くだけでよい。
+            # ここは単純に書くだけでよい (D1 で書き済みの同じ値)。
             meta['pr_number'] = pr_number
         if no_pr_reason is not None:
             meta['no_pr_waiver'] = no_pr_reason
@@ -4120,14 +4259,10 @@ def cmd_done(args):
         worker_holder[0] = meta.get('worker') or ''  # capture worker for post-lock bump
         sync_holder[0] = (slug, task_id, result)
 
-        # PR 番号を、この task を待っている codex-review / review の card に伝える (#24)。
-        # done と同じトランザクションで行う: done だけ済んで番号が伝わっていない瞬間に
-        # dispatcher が「pr_number が無い」と警告して止まるのを避ける。
         if no_pr_reason is not None:
             print(f"[plan.sh warn] --no-pr で PR 番号なしの done を記録しました (理由: {no_pr_reason})"
                   f" — card の no_pr_waiver に残しました", file=sys.stderr)
         if pr_number is not None:
-            propagated = propagate_pr_number(slug, task_id, pr_number)
             if not propagated:
                 print(f"[plan.sh] --pr {pr_number}: {task_id} を blocked_by に持つ、pr_number 未設定の "
                       f"codex-review / review task はありません (何も伝えていません)")
@@ -4244,6 +4379,7 @@ def cmd_fail(args):
             else:
                 slug = matches[0]
 
+        recover_before(cards=[(slug, task_id)])
         if not os.path.exists(task_path(slug, task_id)):
             die(f"task '{task_id}' not found in mission '{slug}'.")
 
@@ -4318,6 +4454,47 @@ def cmd_fail(args):
     # Post-lock: write rework pattern to knowledge/director.md
     if knowledge_info[0]:
         _append_knowledge_director(*knowledge_info[0])
+
+
+def cmd_store_check(args):
+    """plan.sh store-check [--mission <slug>]
+
+    queue の食い違いを**書かずに**列挙する (vNext 01a S4。設計 §2.5)。card を正本として、
+    R-1〜R-4 が書くはずだったもの (`would-repair:R-n`) と、表に無い食い違い (`reported:<コード>`)、
+    観測できなかった入力 (`unobservable_input`)・kill された書き手の残骸 (`stale_tmp`)・本体の無い
+    `.identity` (`orphan_identity`) を出す。**ロックを取らない**ので、途中のトランザクションを食い違いと
+    して 1 回見うる —— 2 回連続で出たものだけが本物。修復はここではしない (次のロック取得時に各コマンドが
+    行う。本番の観察は読み取りだけ)。--mission はその mission の card と mission.yaml に絞る
+    (枠・state・残骸は queue 全体のまま)。
+    """
+    opts, _ = parse_opts(args, {'--mission': 'value'})
+    scope = _STORE.Scope.everything(QUEUE_DIR)
+    only = opts.get('--mission')
+    if only:
+        scope = _STORE.Scope(
+            cards=tuple(c for c in scope.cards if c[0] == only),
+            agents=scope.agents,
+            add_missions=(only,) if only in scope.add_missions else (),
+            archive_slugs=scope.archive_slugs,
+            unobservable=scope.unobservable,
+        )
+    findings = _STORE.diagnose(QUEUE_DIR, scope)
+    for f in findings:
+        fields = [f.kind]
+        for key in ('mission', 'task', 'agent'):
+            val = getattr(f, key)
+            if val:
+                fields.append(f"{key}={val}")
+        if f.detail:
+            fields.append(f"({f.detail})")
+        print('  '.join(fields))
+    by_kind = {}
+    for f in findings:
+        by_kind[f.kind] = by_kind.get(f.kind, 0) + 1
+    print(f"store-check: {len(findings)} finding(s)"
+          + (f" — {', '.join(f'{k}={v}' for k, v in sorted(by_kind.items()))}" if findings else ""))
+    print("  (ロックを取らずに読んでいます。途中のトランザクションを 1 回見うるので、"
+          "2 回連続で出たものだけが本物です。何も書いていません)")
 
 
 def cmd_status(args):
@@ -4535,6 +4712,7 @@ def cmd_ready_for_verification(args):
             else:
                 slug = matches[0]
 
+        recover_before(cards=[(slug, task_id)])
         if not os.path.exists(task_path(slug, task_id)):
             die(f"task '{task_id}' not found in mission '{slug}'.")
 
@@ -4676,6 +4854,7 @@ def cmd_verify_result(args):
             else:
                 slug = matches[0]
 
+        recover_before(cards=[(slug, task_id)])
         if not os.path.exists(task_path(slug, task_id)):
             die(f"task '{task_id}' not found in mission '{slug}'.")
 
@@ -5218,6 +5397,7 @@ def cmd_archive(args):
     slug = positional[0]
 
     def _do():
+        recover_before(archive_slugs=load_state().get('active_missions') or [], include_caller=False)
         state = load_state()
         src = mission_dir(slug)
         if not os.path.exists(src):
@@ -5539,6 +5719,8 @@ def cmd_update(args):
         if not os.path.exists(mission_dir(slug)):
             die(f"mission '{slug}' not found.")
 
+        # 回復は読み直しより前 (reset の途中で落ちた状態は、旧所有者の枠を逆引きでしか見つけられない)
+        recover_before(cards=[(slug, task_id)])
         meta, body = load_task(slug, task_id)
         old_status = meta.get('status')
 
@@ -5876,6 +6058,7 @@ def cmd_retire(args):
             if len(matches) > 1:
                 die(f"task '{task_id}' exists in multiple missions: {matches}. Use --mission.")
             slug = matches[0]
+        recover_before(cards=[(slug, task_id)], agents=(agent,))
         if not os.path.exists(task_path(slug, task_id)):
             die(f"task '{task_id}' not found in mission '{slug}'.")
 
@@ -5959,17 +6142,16 @@ def cmd_reap_orphan_assignment(args):
         が assignment を撤去するのは `--reset` のときだけ (cmd_update 参照) —
         素の `--status` はカードの status だけを書き換え、assignment には触れない。
 
-    消してよいのは「読めて、`ORPHAN_ASSIGNMENT_FINISHED_STATUSES`
-    (= lib_task_status.RELEASED_WORK_STATUSES) に入っている task を指す」ときだけ。以下はすべて
+    消してよいのは「読めて、`lib_state_store.is_orphan_target()` (手放し済み ∪ needs_director ∪
+    worker の無い pending。回復の R-2 と同じ 1 つの定義) に入っている task を指す」ときだけ
+    (S4 / t016 で needs_director と worker の無い pending を足した — 撤去するコマンド自身が
+    書く status で、そのコマンドが途中で落ちた以外に説明が無い)。以下はすべて
     保留 (1 バイトも書かずに exit `PRECONDITION_UNMET`):
       - assignment が読めない (壊れている / 種類が違う)
       - `mission:task` の形でない
-      - 指す task が見つからない (mission が無い、active dir にも archive dir
-        にも card が無い)
-      - 指す task が終了していない (in_progress 等) — まだ本当に走っている
-        かもしれないので触らない
-      - 指す task が `needs_director` — 上の ORPHAN_ASSIGNMENT_FINISHED_STATUSES
-        のコメント参照。証拠不足を「消してよい」に倒さない
+      - 指す task が見つからない (mission が無い、active dir にも退避先にも card が無い)
+      - 指す task が決着していない (in_progress / blocked / ready_for_verification 等) — まだ
+        本当に走っているかもしれないので触らない
 
     mission が archive 済み (`queue/archive/<slug>/tasks/<task>.md`) でも掃除の
     対象は変わらない —— archive はまさに「もう決着した」ミッションの代表例で、
@@ -5987,6 +6169,9 @@ def cmd_reap_orphan_assignment(args):
     require_valid_agent_name(agent)
 
     def _do():
+        # このコマンド自身が R-2 (孤児の枠を消す) の実行なので、別に回復は走らせない (二重に走ると
+        # 出力が変わる)。消してよい status の集合は lib の is_orphan_target と同じ 1 つの定義
+        # (手放し済み ∪ needs_director ∪ worker の無い pending。設計 §2.3)。
         # キューロックの中で読み直す (不変条件: 読み直してから消す)。
         raw = _TASK_CARDS.read_regular_text_or_unreadable(assignment_path(agent))
         if _TASK_CARDS.is_missing(raw):
@@ -6017,7 +6202,7 @@ def cmd_reap_orphan_assignment(args):
 
         meta, _body = _load_task_from_path(card_path)
         status = meta.get('status')
-        if status not in ORPHAN_ASSIGNMENT_FINISHED_STATUSES:
+        if not _STORE.is_orphan_target(status, meta.get('worker')):
             die(f"[plan.sh reap-orphan-assignment] assignment/{agent} が指す"
                 f" task {slug}/{task_id} は status={status!r} — 終了していないので"
                 f"消しません", PRECONDITION_UNMET)
@@ -6066,6 +6251,7 @@ dispatch = {
     'resync': cmd_resync,
     'dashboard-data': cmd_dashboard_data,
     'resolve-mission': cmd_resolve_mission,
+    'store-check': cmd_store_check,
 }
 
 if SUBCOMMAND not in dispatch:

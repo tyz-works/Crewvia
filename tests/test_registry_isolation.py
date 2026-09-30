@@ -197,6 +197,7 @@ ISOLATED_INVOCATIONS: dict[str, list[list[str]]] = {
     "resync": [["resync"]],
     "dashboard-data": [["dashboard-data"]],
     "resolve-mission": [["resolve-mission", "t001", "--mission", MISSION]],
+    "store-check": [["store-check"], ["store-check", "--mission", MISSION]],
 }
 
 

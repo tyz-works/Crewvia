@@ -76,6 +76,14 @@ root の `CLAUDE.md` から移した、テスト専用の規則。設計と経�
   **旧コードの危険が本物だった対照**を各所に置く（旧 pre-compact は truncate した時点で落ちると空の card が残る等）。
   赤の実証は `tests/red_proof_s5_lib_writers.sh`（12 ケース。欠陥を戻した複製に同じテストを走らせる。約 4 分）。
 
+- **S4（t016）の回復のテスト**: `tests/test_projection_recovery_on_lock.py`。plan.sh の python 本体を**本物のまま**名前空間に読み込み、
+  fork した子で `FAULT_HOOK` の k 番目に SIGKILL → **本物の plan.sh（subprocess）** で次の呼び出しを打って収束を見る（pull / done / reset /
+  needs-director / add / 退避の全点 × 次の操作。ランダム 20 回は seed 固定）。`problems()` が「card = 正本と projection の食い違い」の
+  定義そのもの。seed の queue は 1 回だけ本物の plan.sh で作り、点ごとに `cp -a` する。並行は独立プロセス（回復は**1 件も修復してはいけない**
+  = 進行中の正しい遷移を巻き戻さない）。持ち越し（worker なし・identity 欠け / 壊れ × 全 holding status）は lib の `diagnose()` を直接。
+  赤の実証は `tests/red_proof_projection_recovery.sh`（13 ケース。欠陥を注入した複製に同じテストを走らせる。約 10 分）。
+  **plan.sh の subcommand を足したら** `tests/test_registry_isolation.py` の `ISOLATED_INVOCATIONS` と usage 行・header（先頭 70 行に `--help` が要る）も揃える。
+
 ## 子プロセスを残さない（`tests/leaked_descendants.py` / `tests/proc_group.py`）
 
 - plan.sh のような **bash の下で更に子を起こすもの** を `subprocess.run(timeout=)` / `Popen.kill()` で止めると、

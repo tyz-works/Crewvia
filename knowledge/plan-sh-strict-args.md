@@ -22,7 +22,8 @@
   これは 3 か所を潰して初めて成り立つ:
   1. `plan.sh --help` (サブコマンドの位置) は bash 側で受ける。以前は「--help というサブコマンド」として
      queue の骨組み (`mkdir`) を作ってから python に渡していた
-  2. queue の骨組みは、引数を検証し終えた `parse_opts` の末尾 (`_ensure_queue_dirs()`) が作る
+  2. queue の骨組みは `parse_opts` では作らない (本文の引数 `--result-file` 等を検査する**前**だから)。作るのは
+     `with_lock()` の中、ロックを取った後 (`_ensure_queue_dirs()`。S5 / t020)。書かない読み取り専用のサブコマンドは作らない
   3. 末尾の dispatch は `SystemExit` のあとで task-graph を再生成する (途中まで書いて `die()` した実行の
      あとでも DAG を最新にするため)。`--help` / 使い方の誤りは `UsageExit` (SystemExit の子) で終わり、
      再生成を飛ばす。そうしないと `registry/task-graph/tasks.json` が書かれる
@@ -32,7 +33,7 @@
 
 ## mission の曖昧さ
 
-`done` / `fail` / `needs-director` / `update` / `ready-for-verification` / `verify-result` は、`--mission` が
+`done` / `fail` / `needs-director` / `update` / `ready-for-verification` / `verifying` / `snapshot` / `verify-result` は、`--mission` が
 無く task id が複数の active mission に当たるとき `resolve_ambiguous_mission()` (唯一の定義) で決める。
 
 * **`CREWVIA_MISSION_SLUG` の mission に、自分が実行中のとき**だけ、それを使う (stderr に 1 行)。3 つ全部が要る:

@@ -5,7 +5,10 @@ R2 (ユーザー決定): 呼び出し側を移す PR は merge 前にユーザ�
 
 - S2 (t008): 呼び出し元ゼロ。許可は lib 自身だけだった。
 - **S3 (t012): plan.sh が最初の (そして S3 時点で唯一の) 呼び出し元**。dispatcher・hooks・verifier-dispatcher・
-  taskvia-sync・watchdog 等はまだ import しない (S5 で verifier-dispatcher / hooks を plan.sh 経由に寄せる)。
+  taskvia-sync・watchdog 等はまだ import しない。
+- **S5 (t020): `lib_registry.py` (workers.yaml の原子的書き込み) と `taskvia-sync.sh` (map の `locked_update_json`) が加わる**。
+  verifier-dispatcher と hooks/pre-compact.sh は lib を import せず、**plan.sh の subcommand (`verifying` / `snapshot`)
+  を呼ぶ** (書き手を増やさない。queue の書き込みは plan.sh の `with_lock` の中だけ)。
 
 呼び出し元が増えたら `ALLOWED_CALLERS` の差分にそれが見える。赤くなったら、意図した cutover かを先に確かめる。
 検査は import 文の形ではなく**名前の出現**で固定する (bash の `sys.path` 経由・文字列の `importlib`・
@@ -20,8 +23,10 @@ REPO = pathlib.Path(__file__).resolve().parents[1]
 NAME = "lib_state_store"
 
 #: 名前を出してよいファイル (repo 相対)。テストと knowledge/ は走査の対象外。
-#: S3: plan.sh (queue の書き手)。ここに足すのは cutover (= ユーザー承認が要る PR) だけ。
-ALLOWED_CALLERS = {"scripts/lib_state_store.py", "scripts/plan.sh"}
+#: S3: plan.sh (queue の書き手)。S5: lib_registry.py (registry/workers.yaml)・taskvia-sync.sh (queue/.taskvia-map.json)。
+#: ここに足すのは cutover (= ユーザー承認が要る PR) だけ。
+ALLOWED_CALLERS = {"scripts/lib_state_store.py", "scripts/plan.sh", "scripts/lib_registry.py",
+                   "scripts/taskvia-sync.sh"}
 
 #: 走査する場所。**ディレクトリごと**で列挙しない (新しい書き手が増えても自動で対象になる)。
 SCAN_DIRS = ("scripts", "hooks", "agents", "config")

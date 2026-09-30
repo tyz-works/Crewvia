@@ -70,6 +70,10 @@ ALLOWLIST = {
     ("plan.sh", "('done', 'verified')"):
         "`plan.sh status` の表示の分岐 (done と verified は同じ「完了」表示。skipped は別の分岐)。"
         "集合として何かを判定していない",
+    ("plan.sh", "'ready-for-verification', 'verifying', 'snapshot'"):
+        "`QUEUE_MUTATING_SUBCOMMANDS` —— queue を書き換える**サブコマンド名**の集合。`done` / `verifying` は"
+        "status の名前でもあるが、ここは subcommand (S5 / t020 が `verifying` を足した。"
+        "`lib_task_status.ACCEPTS_FROM` の command キーと同じ語)。task の status を判定していない",
 }
 
 

@@ -37,8 +37,18 @@ lib ごとの**破ってはいけない契約**の要約。理由・経緯・全
 - 書けない・読めないは**例外**（`StoreWriteError` / `StoreReadError` / `LockBusy`）。`None` / `False` / 成功に潰さない。
   plan.sh の `with_lock` が終了コードに写す（`LockBusy` → 4、それ以外 → 1）。assignment 撤去の失敗だけは今までどおり warn して続行。
   監査ログだけは書けなくても遷移を止めず stderr に警告。本文（Result・理由）・env・token は出さない。
-- 障害注入は `FAULT_HOOK`（モジュール変数。env スイッチは付けない）。呼び出し元は plan.sh だけ
-  （`tests/test_state_store_callers.py` の許可表。dispatcher / hooks / verifier-dispatcher は S5 まで import しない）。
+- 障害注入は `FAULT_HOOK`（モジュール変数。env スイッチは付けない）。呼び出し元は plan.sh・`lib_registry.py`（workers.yaml の
+  原子的書き込み）・`taskvia-sync.sh`（map の `locked_update_json`）だけ（`tests/test_state_store_callers.py` の許可表）。
+  dispatcher / hooks / verifier-dispatcher は import しない —— **card を書きたいなら plan.sh の subcommand を呼ぶ**
+  （S5 / t020: verifier-dispatcher は `plan.sh verifying`、hooks/pre-compact.sh は `plan.sh snapshot`。どちらもロックの中で
+  card を読み直す。ロックの外で card を丸ごと読んで書き戻すと、その間に done が進めた status を巻き戻す）。
+- **ロック外の書き込み**の入口も lib: 1 ファイルの原子的な書き込みは `atomic_write_text`（`.crewvia-env`・workers.yaml）、
+  専用ロックが要る小さな共有 JSON は `locked_update_json`（taskvia map。キャッシュだけ `on_unreadable='reset'`）、
+  mission dir の rename は `durable_rename`（元と先の**両方**の親 dir を fsync。`shutil.move` は通さない）。
+- **構造ガード**: lib を通らない queue / registry への書き込みが増えたら CI が赤
+  （`tests/test_queue_writes_go_through_the_store.py`。表は `(ファイル, 関数) → (件数, 理由)`）。書き込みを足す・消すときは
+  表の件数を直す。通せない理由があるなら理由つきで足す（`knowledge/state-store.md` §6.1）。
+- `parse_opts()` は queue の骨組み（`missions/` `archive/`）を作らない。作るのは `with_lock()` の中（ロックを取った後）。
 - 戻し方: PR revert → `scripts/sync-main-checkout.sh`。card・mission・state・assignment は 1 バイトも書き換えていない
   （`knowledge/state-store.md` §4.1）。
 

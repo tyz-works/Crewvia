@@ -35,6 +35,7 @@ from datetime import date
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from lib_task_cards import read_regular_text  # noqa: E402
+from lib_state_store import StoreWriteError, atomic_write_text  # noqa: E402  (書き込みの入口は 1 つ。S5 / t020)
 
 
 def _lock_path(path):
@@ -179,8 +180,17 @@ def write(path, header, order, workers_by_name):
             out.append(f"    skills: [{skills_str}]\n")
             out.append(f"    task_count: {w.get('task_count', 0)}\n")
             out.append(f"    last_active: {w.get('last_active', '')}\n")
-    with open(path, 'w') as f:
-        f.writelines(out)
+    # tmp → fsync → replace → 親 dir の fsync。以前は `open(path, 'w')` で、書いている途中に落ちると
+    # workers.yaml が空/途中で残り、Worker の名簿が消えた。ロックは呼び出し側 (with_lock) のまま。
+    try:
+        atomic_write_text(path, ''.join(out))
+    except StoreWriteError as e:
+        # 置換は済んでいて、親 dir の fsync だけが失敗した: 名簿は新しい内容。ここで落とすと
+        # assign-name.sh が「登録は済んだのに名前を返さない」になる (t033)。警告して続行する。
+        if not (e.committed and e.op == 'fsync_dir'):
+            raise
+        print(f"[lib_registry] WARNING: {path} は書き込み済みですが親ディレクトリの fsync に失敗しました "
+              f"(耐久性は未確認): {e}", file=sys.stderr)
 
 
 def register_director(path, name):

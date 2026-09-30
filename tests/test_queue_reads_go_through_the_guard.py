@@ -131,7 +131,7 @@ GUARDED_READS = [
     # (plan.sh の `_read_assignment_identity` は無く、`classify_assignment` は Txn への委譲)。lib の読みは
     # すべて `lib_task_cards.read_regular_text_or_unreadable` を通る (open() を読みに使わない)。
     ("plan.sh", "_load_taskvia_map", {"try_read_queue_file"}),
-    ("plan.sh", "_apply_risk_flags", {"try_read_queue_file"}),
+    ("plan.sh", "_parse_risk_flags", {"try_read_queue_file"}),
     ("plan.sh", "_task_graph_pending_outstanding",
      {"read_regular_text_or_unreadable"}),
 
@@ -162,9 +162,8 @@ GUARDED_READS = [
      {"read_regular_text_or_unreadable"}),
     ("verifier-dispatcher.sh", "load_state", {"_read_queue_text"}),
     ("verifier-dispatcher.sh", "load_workers", {"_read_queue_text"}),
-    # 読んでから書き戻す経路。種類を見ないと、`os.replace()` が置き換えるのが
-    # *別の何か* になる。
-    ("verifier-dispatcher.sh", "update_task_fields", {"read_regular_text"}),
+    # (S5 / t020: `update_task_fields` は消えた。status の書き換えは `plan.sh verifying` —
+    #  plan.sh の load_task() が上の表のガードを通る)
 
     # --- taskvia-sync.sh --------------------------------------------------
     ("taskvia-sync.sh", "_read_queue_text", {"read_regular_text_or_unreadable"}),
@@ -907,6 +906,12 @@ ALLOWED_SUBPROCESS_CALLS = {
     ("plan.sh", "cmd_done", "sys.executable"):
         "lib_registry.py bump-task-count のサブコマンド。registry の読み書きは "
         "向こうの with_lock() + read_regular_text() の中",
+
+    # -- verifier-dispatcher.sh -------------------------------------------
+    ("verifier-dispatcher.sh", "mark_verifying", "bash"):
+        "plan.sh verifying <task_id> --verifier <name> --mission <slug> を起こすだけ (S5 / t020)。"
+        "card を読み書きするのは向こうの plan.sh 側 (ロックの中で lib_task_cards / lib_state_store 経由)。"
+        "渡すのは task id・Worker 名・mission slug の文字列だけ",
 
     # -- dispatcher.sh -----------------------------------------------------
     ("dispatcher.sh", "spawn_kai_review", "cmd"):

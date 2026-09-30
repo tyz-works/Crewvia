@@ -70,8 +70,7 @@ from lib_task_status import accepts as status_accepts  # noqa: E402  (語彙・�
 # ここに frontmatter を直接読むコードを書き戻さないこと — plan.sh が受理する
 # カードとここが拾うカードが、静かにズレる。
 from lib_task_cards import (  # noqa: E402
-    is_missing, is_unreadable, list_task_cards, read_regular_text,
-    read_regular_text_or_unreadable,
+    is_missing, is_unreadable, list_task_cards, read_regular_text_or_unreadable,
 )
 _mux = Mux()
 
@@ -238,82 +237,40 @@ def list_tasks_for_mission(slug):
 
 
 # ---------------------------------------------------------------------------
-# Task file update (atomic write to set verifier + status fields)
+# Task status change (verifying) — 書くのは plan.sh だけ (S5 / t020)
 # ---------------------------------------------------------------------------
 
-def _dump_scalar(s):
-    s = str(s)
-    if s == '':
-        return '""'
-    needs_quote = set(':#[]{},\'"\n&*!|>%@`')
-    if any(ch in needs_quote for ch in s):
-        return f'"{s}"'
-    if s.lower() in ('true', 'false', 'null', 'yes', 'no', '~'):
-        return f'"{s}"'
-    if re.fullmatch(r'-?\d+', s):
-        return f'"{s}"'
-    return s
+PLAN_SH = _SCRIPTS_DIR / 'plan.sh'
+PLAN_SH_TIMEOUT_SECONDS = 120
 
 
-def update_task_fields(task_path, updates):
-    """Atomically set specific frontmatter fields in a task .md file.
+def mark_verifying(slug, task_id, verifier):
+    """`plan.sh verifying` で card を ready_for_verification → verifying にする。
 
-    **書き換える前に、カードが通常ファイルであることを確かめる** (Codex 8 巡目
-    P2)。ここは読んでから書き戻す経路なので、種類を見ないと 2 つ壊れる ——
-    書き手のいない FIFO なら読みで無期限に止まり、止まらなかったとしても
-    `os.replace()` が置き換えるのは *別の何か* である。
+    以前はここが card を丸ごと読み、ロックなしで書き戻していた (読んでから書くまでの間に done /
+    verify-result が進めた status を古い内容で巻き戻せた)。今は queue のロックの中で plan.sh が
+    読み直し、元の status が違えば何も書かずに拒否する (exit 2)。
 
-    読めなければ例外を投げる。呼び出し側は 1 件ずつ `except Exception` で
-    受けてログに落とすので、倒れる先は「その task だけが割り当たらない」。
+    失敗は例外 (呼び出し側が 1 件ずつ受けてログに落とす。倒れる先は「その task だけが割り当たらない」)。
+    queue はこのデーモンの QUEUE_DIR に向ける (`CREWVIA_QUEUE`)。plan.sh は bash の下で python を
+    起こすので、タイムアウトは**プロセスグループごと**殺す (bash だけ殺すと下の python が孤児になる)。
     """
-    text = read_regular_text(task_path)
-    lines = text.split('\n')
-    in_fm = False
-    result_lines = []
-    updated_keys = set()
-    fm_end_idx = None
-
-    for idx, line in enumerate(lines):
-        if line.strip() == '---':
-            if not in_fm:
-                in_fm = True
-                result_lines.append(line)
-                continue
-            else:
-                # End of frontmatter — insert any keys we haven't seen yet
-                for k, v in updates.items():
-                    if k not in updated_keys:
-                        val_str = 'null' if v is None else _dump_scalar(str(v))
-                        result_lines.append(f'{k}: {val_str}')
-                        updated_keys.add(k)
-                in_fm = False
-                result_lines.append(line)
-                continue
-
-        if in_fm:
-            m = re.match(r'^([\w-]+):\s*', line)
-            if m and m.group(1) in updates:
-                k = m.group(1)
-                v = updates[k]
-                val_str = 'null' if v is None else _dump_scalar(str(v))
-                result_lines.append(f'{k}: {val_str}')
-                updated_keys.add(k)
-                continue
-
-        result_lines.append(line)
-
-    new_text = '\n'.join(result_lines)
-    tmp = str(task_path) + f'.tmp.{os.getpid()}'
+    env = dict(os.environ, CREWVIA_QUEUE=str(QUEUE_DIR), AGENT_NAME='verifier-dispatcher')
+    proc = subprocess.Popen(
+        ['bash', str(PLAN_SH), 'verifying', task_id, '--verifier', verifier, '--mission', slug],
+        env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True,
+    )
     try:
-        with open(tmp, 'w') as f:
-            f.write(new_text)
-        os.replace(tmp, str(task_path))
-    except BaseException:
+        out, err = proc.communicate(timeout=PLAN_SH_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
         try:
-            os.unlink(tmp)
+            os.killpg(proc.pid, 9)
         except OSError:
             pass
-        raise
+        proc.communicate()
+        raise RuntimeError(f"plan.sh verifying timed out after {PLAN_SH_TIMEOUT_SECONDS}s")
+    if proc.returncode != 0:
+        raise RuntimeError(f"plan.sh verifying exit {proc.returncode}: {(err or out).strip()[:300]}")
 
 
 # ---------------------------------------------------------------------------
@@ -443,10 +400,7 @@ def dispatch():
             agent_name, window = chosen
             log(f"assigning: task {task_id} (mission={slug}) → verifier {agent_name}")
             try:
-                update_task_fields(task_path, {
-                    'verifier': agent_name,
-                    'status': 'verifying',
-                })
+                mark_verifying(slug, task_id, agent_name)
                 msg = (
                     f"タスク {task_id} (mission={slug}) の検証をしてください。"
                     f"plan.sh verify-result {task_id} <pass|fail|needs_human_review>"

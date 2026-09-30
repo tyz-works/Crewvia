@@ -64,6 +64,7 @@ scripts_dir = sys.argv[5]
 # `plan.sh status` に出る姿が、静かにズレる。
 sys.path.insert(0, scripts_dir)
 from lib_task_status import TERMINAL_STATUSES  # noqa: E402  (語彙は 1 か所。vNext 01a S1)
+from lib_state_store import StoreError, locked_update_json  # noqa: E402  (queue への書き込みの入口。S5)
 from lib_task_cards import (  # noqa: E402
     is_unreadable, list_task_cards, read_regular_text_or_unreadable,
 )
@@ -140,12 +141,20 @@ def load_map(path):
         return {}
 
 
-def save_map(path, data):
+def save_map(path, changed):
+    """この実行で変えた項目 (`changed`) だけを、専用ロックの下で読み直した map に重ねて書く (S5 / t020)。
+
+    以前は同期の最初に読んだ map 全体を `open('w')` で書き戻していたので、同期の間に plan.sh の inline
+    同期が足した項目を古い内容で消しえた。項目は足す・更新するだけで消さないので、重ねる形で足りる。
+    キャッシュなので、読めない・壊れているときは空から作り直す (次の同期が冪等に埋める)。
+    """
+    def _merge(current):
+        current.update(changed)
+        return current
+
     try:
-        with open(path, 'w') as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-            f.write('\n')
-    except OSError as e:
+        locked_update_json(path, path + '.lock', _merge, on_unreadable='reset')
+    except StoreError as e:
         print(f"[taskvia-sync] WARNING: .taskvia-map.json 保存失敗: {e}", file=sys.stderr)
 
 
@@ -268,6 +277,7 @@ if not records:
 
 task_map = load_map(map_file)
 updated = False
+changed_entries = {}      # この実行で登録・更新した項目だけ (save_map が重ねて書く)
 
 # ---------- ミッション登録 (冪等) ----------
 existing_resp = http_get(f"{taskvia_url}/api/missions")
@@ -337,6 +347,7 @@ for slug, mission_meta, task in records:
         resp = http_post(f"{taskvia_url}/api/missions/{slug}/tasks", payload)
         if resp is not None:
             task_map[map_key] = {'registered': True, 'status': status}
+            changed_entries[map_key] = task_map[map_key]
             print(f"[taskvia-sync] 登録: {map_key} (blocked_by={blocked_by})")
             updated = True
         else:
@@ -350,13 +361,14 @@ for slug, mission_meta, task in records:
             )
             if resp is not None:
                 task_map[map_key]['status'] = status
+                changed_entries[map_key] = task_map[map_key]
                 print(f"[taskvia-sync] 更新: {map_key} status {last_status} → {status}")
                 updated = True
             else:
                 print(f"[taskvia-sync] WARNING: {map_key} のステータス更新失敗。スキップ。", file=sys.stderr)
 
 if updated:
-    save_map(map_file, task_map)
+    save_map(map_file, changed_entries)
     print(f"[taskvia-sync] .taskvia-map.json を保存しました ({len(task_map)} 件)。")
 else:
     print("[taskvia-sync] 変更なし。同期完了。")

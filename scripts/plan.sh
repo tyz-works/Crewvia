@@ -84,7 +84,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 QUEUE_DIR="${CREWVIA_QUEUE:-${REPO_ROOT}/queue}"
 
 if [[ $# -eq 0 ]]; then
-  echo "Usage: plan.sh <init|add|pull|done|needs-director|fail|update|release-dep|retire|reap-orphan-assignment|ready-for-verification|verify-result|review|launch|task-graph|lint|status|archive|resync|dashboard|dashboard-data|resolve-mission> [args...]" >&2
+  echo "Usage: plan.sh <init|add|pull|done|needs-director|fail|update|release-dep|retire|reap-orphan-assignment|ready-for-verification|verifying|snapshot|verify-result|review|launch|task-graph|lint|status|archive|resync|dashboard|dashboard-data|resolve-mission> [args...]" >&2
   exit 1
 fi
 
@@ -93,7 +93,7 @@ shift
 
 # `plan.sh -h` / `--help`: 何も書かずに usage を出す。サブコマンドの位置に `--help` を置いたとき
 # 「--help という名前の subcommand」として扱わず (init --help が「--help」mission を作った事故)、
-# queue の骨組みも作らない (骨組みは引数を検証し終えた python 側 `_ensure_queue_dirs()` が作る)。
+# queue の骨組みも作らない (骨組みは `with_lock()` の中、ロックを取った後 = 書く直前に `_ensure_queue_dirs()` が作る)。
 if [[ "$SUBCOMMAND" == "-h" || "$SUBCOMMAND" == "--help" || "$SUBCOMMAND" == "help" ]]; then
   sed -n '/^# Usage:/,/^$/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
   exit 0
@@ -863,7 +863,7 @@ def held_dependency_hint(task_id, held, slug):
 QUEUE_MUTATING_SUBCOMMANDS = {
     'init', 'add', 'pull', 'done', 'needs-director', 'fail', 'update', 'release-dep',
     'retire', 'reap-orphan-assignment',
-    'ready-for-verification', 'verify-result', 'review', 'launch', 'archive',
+    'ready-for-verification', 'verifying', 'snapshot', 'verify-result', 'review', 'launch', 'archive',
 }
 
 #: queue を読むだけのサブコマンド = 生成を呼ばない経路。
@@ -1870,6 +1870,7 @@ def with_lock(callback, nonblocking=False):
             _TXN = txn
             del _AUDIT_TASK_ROWS[:], _AUDIT_OTHER_ROWS[:]
             try:
+                _ensure_queue_dirs()
                 result = callback()
                 if not _AUDIT_TASK_ROWS and _AUDIT_OTHER_ROWS:
                     rows = (
@@ -2238,37 +2239,48 @@ def _load_taskvia_map(map_path):
     return data if isinstance(data, dict) else {}
 
 
+def _update_taskvia_map(fn):
+    """`queue/.taskvia-map.json` の読み直し + 更新 + 原子的書き込みを、専用ロックの下で行う (S5 / t020)。
+
+    plan.sh (inline 同期) と taskvia-sync.sh (常駐) の 2 人が書くので、以前は片方の更新をもう片方が
+    古い内容で上書きしえた (両者とも読んでから `open('w')`)。ロックは `queue/.lock` ではなく専用
+    (`queue/.taskvia-map.json.lock`) — 前後に HTTP があり、正本ではない外部ミラーのキャッシュだから。
+    読めない・壊れているときは、以前と同じく空から作り直す (次の同期が冪等に埋める)。
+    失敗は警告して続行 (同期の副産物なので task の状態は止めない)。
+    """
+    map_path = os.path.join(QUEUE_DIR, '.taskvia-map.json')
+    try:
+        _STORE.locked_update_json(map_path, map_path + '.lock', fn, on_unreadable='reset')
+    except _STORE.StoreError as e:
+        print(f"[taskvia-sync] WARNING: .taskvia-map.json 更新失敗: {e}", file=sys.stderr)
+
+
 def _taskvia_map_update(slug, task_id, status='pending'):
     """Update .taskvia-map.json after a successful inline sync.
     Keeps taskvia-sync.sh from re-registering tasks already pushed inline.
     """
-    map_path = os.path.join(QUEUE_DIR, '.taskvia-map.json')
-    task_map = _load_taskvia_map(map_path)
     map_key = f"{slug}:{task_id}"
-    task_map[map_key] = {'registered': True, 'status': status}
-    try:
-        with open(map_path, 'w') as f:
-            json.dump(task_map, f, indent=2, ensure_ascii=False)
-            f.write('\n')
-    except OSError as e:
-        print(f"[taskvia-sync] WARNING: .taskvia-map.json 更新失敗: {e}", file=sys.stderr)
+
+    def _set(task_map):
+        task_map[map_key] = {'registered': True, 'status': status}
+        return task_map
+
+    _update_taskvia_map(_set)
 
 
 def _taskvia_map_update_status(slug, task_id, status):
     """Update status of an existing .taskvia-map.json entry."""
-    map_path = os.path.join(QUEUE_DIR, '.taskvia-map.json')
-    task_map = _load_taskvia_map(map_path)
     map_key = f"{slug}:{task_id}"
-    if map_key in task_map:
-        task_map[map_key]['status'] = status
-    else:
-        task_map[map_key] = {'registered': True, 'status': status}
-    try:
-        with open(map_path, 'w') as f:
-            json.dump(task_map, f, indent=2, ensure_ascii=False)
-            f.write('\n')
-    except OSError as e:
-        print(f"[taskvia-sync] WARNING: .taskvia-map.json 更新失敗: {e}", file=sys.stderr)
+
+    def _set(task_map):
+        entry = task_map.get(map_key)
+        if isinstance(entry, dict):
+            entry['status'] = status
+        else:
+            task_map[map_key] = {'registered': True, 'status': status}
+        return task_map
+
+    _update_taskvia_map(_set)
 
 
 def _print_sync_summary(ok):
@@ -2485,6 +2497,8 @@ USAGE = {
                '                       [--reason "<1 行>"] [--no-wait]'),
     'reap-orphan-assignment': 'plan.sh reap-orphan-assignment <agent> [--no-wait]',
     'ready-for-verification': 'plan.sh ready-for-verification <task_id> [--mission <slug>]',
+    'verifying': 'plan.sh verifying <task_id> --verifier <name> [--mission <slug>]',
+    'snapshot': 'plan.sh snapshot <task_id> --section-file <path|-> [--mission <slug>]',
     'verify-result': ('plan.sh verify-result <task_id> <pass|fail|needs_human_review>\n'
                       '                            [--mission <slug>] [--notes "<text>" | --notes-file <path|->]'),
     'review': 'plan.sh review <mission_slug>',
@@ -2506,7 +2520,7 @@ POSITIONAL_ARITY = {
     'init': (1, 1), 'add': (1, 1), 'pull': (0, 0), 'done': (1, 2),
     'needs-director': (1, 2), 'fail': (1, 2), 'update': (1, 1), 'release-dep': (1, 1),
     'retire': (1, 1), 'reap-orphan-assignment': (1, 1),
-    'ready-for-verification': (1, 1), 'verify-result': (2, 2),
+    'ready-for-verification': (1, 1), 'verifying': (1, 1), 'snapshot': (1, 1), 'verify-result': (2, 2),
     'review': (1, 1), 'launch': (1, 1), 'task-graph': (0, 0), 'lint': (0, 1),
     'status': (0, 0), 'archive': (1, 1), 'resync': (0, 1), 'dashboard-data': (0, 0),
     'resolve-mission': (1, 1),
@@ -2553,6 +2567,27 @@ def _durable_makedirs(path):
         _STORE.ensure_dir(path)
     except _STORE.StoreError as e:
         die(f"[plan.sh] cannot create directory {path}: {e}")
+
+
+def _committed_durability_failure(e):
+    """`StoreWriteError` が「変更は済んだが、親 dir の fsync だけが失敗した」(`committed`) か。
+    True のときは**続行する**: 済んだ変更を未完了扱いにして後続の書き込みを捨てると、state.yaml が
+    移動後の dir を指したまま残る (元が無いので再試行でも直らない)。`Txn._write` と同じ扱い。"""
+    return isinstance(e, _STORE.StoreWriteError) and e.committed and e.op == 'fsync_dir'
+
+
+def _move_mission_dir(src, dst, label):
+    """mission dir の退避 (archive / init --force)。rename 済み・親 dir の fsync 失敗 (`committed`) は
+    警告して続行し、呼び出し側が state.yaml の更新まで**最後までやる** (exit code は 0)。
+    rename 自体の失敗 (何も動いていない) は従来どおり die。"""
+    try:
+        _STORE.durable_rename(src, dst)
+    except _STORE.StoreError as e:
+        if not _committed_durability_failure(e):
+            die(f"[plan.sh {label}] cannot move {src} → {dst}: {e}")
+        print(f"[plan.sh {label}] warn: 移動は済みましたが、親ディレクトリの fsync に失敗しました "
+              f"({e}) — 電源断に対する耐久性は確認できていません。state.yaml の更新は続行します",
+              file=sys.stderr)
 
 
 def _ensure_queue_dirs():
@@ -2611,7 +2646,9 @@ def parse_opts(args, spec):
         _usage_exit(
             f"expected {want} positional argument(s), got {len(positional)}: {positional}\n"
             f"  空白を含む値 (title / result / reason) は 1 つの引数として引用符で囲むこと")
-    _ensure_queue_dirs()
+    # queue の骨組み (missions/ archive/) はここでは作らない。ここは本文の引数 (--result-file 等) を
+    # 検査する**前**で、検査に落ちる呼び出しが queue に足跡を残していた (S5 / t020)。作るのは
+    # `with_lock()` の中 (ロックを取った後 = 書く直前)。
     return opts, positional
 
 
@@ -2643,7 +2680,7 @@ def cmd_init(args):
                 ts = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
                 backup_name = f"{slug}.overwritten-{ts}"
                 _durable_makedirs(ARCHIVE_DIR)
-                shutil.move(mission_dir(slug), os.path.join(ARCHIVE_DIR, backup_name))
+                _move_mission_dir(mission_dir(slug), os.path.join(ARCHIVE_DIR, backup_name), 'init')
                 print(
                     f"[plan.sh init] previous '{slug}' moved to archive/{backup_name}",
                     file=sys.stderr,
@@ -3354,10 +3391,20 @@ def cmd_pull(args):
         if wt.returncode == 0:
             worktree_path = wt.stdout.strip()
             env_file = os.path.join(worktree_path, '.crewvia-env')
-            with open(env_file, 'w') as _ef:
-                _ef.write(f'export CREWVIA_MISSION_SLUG={shlex.quote(mission_slug)}\n')
-                _ef.write(f'export CREWVIA_TASK_ID={shlex.quote(task_id)}\n')
-                _ef.write(f'export CREWVIA_TASK_SLUG={shlex.quote(task_slug)}\n')
+            # Worker が source する最中に読まれうる (途中までの内容で mission を取り違える)。
+            # ロックは要らない (worktree はこの task 専用) が、書き方は原子的にする。
+            env_text = (
+                f'export CREWVIA_MISSION_SLUG={shlex.quote(mission_slug)}\n'
+                f'export CREWVIA_TASK_ID={shlex.quote(task_id)}\n'
+                f'export CREWVIA_TASK_SLUG={shlex.quote(task_slug)}\n'
+            )
+            try:
+                _STORE.atomic_write_text(env_file, env_text)
+            except _STORE.StoreError as _e:
+                if not _committed_durability_failure(_e):
+                    die(f"[plan.sh pull] cannot write {env_file}: {_e}")
+                print(f"[plan.sh pull] warn: {env_file} は書き込み済みですが、親ディレクトリの fsync に失敗しました "
+                      f"({_e})", file=sys.stderr)
         else:
             print(
                 f'[plan.sh pull] WARNING: worktree creation skipped:\n{wt.stderr.strip()}',
@@ -4503,6 +4550,96 @@ def cmd_ready_for_verification(args):
     with_lock(_do)
 
 
+def _resolve_task_mission(command, task_id, state, explicit):
+    """`--mission` が無ければ active な mission から task id で探す (ready-for-verification と同じ規則)。
+    複数に当たれば `resolve_ambiguous_mission`。ロックの中で呼ぶこと。"""
+    slug = explicit
+    if not slug:
+        matches = [s for s in state.get('active_missions') or []
+                   if os.path.exists(task_path(s, task_id))]
+        if not matches:
+            die(f"task '{task_id}' not found in any active mission.")
+        slug = (resolve_ambiguous_mission(command, task_id, matches)
+                if len(matches) > 1 else matches[0])
+    if not os.path.exists(task_path(slug, task_id)):
+        die(f"task '{task_id}' not found in mission '{slug}'.")
+    return slug
+
+
+_VERIFIER_NAME_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,63}')
+
+
+def cmd_verifying(args):
+    """plan.sh verifying <task_id> --verifier <name> [--mission <slug>]
+
+    ready_for_verification → verifying に進め、`verifier` 欄を書く。**verifier-dispatcher.sh の
+    唯一の書き込み** (S5 / t020)。以前は dispatcher が card を丸ごと読んでロックなしで書き戻していた —
+    読んでから書くまでの間に done / verify-result が進めた status を、古い内容で巻き戻せた。
+    ここではロックの中で読み直し、元の status が ready_for_verification でなければ何も書かず拒否する。
+    """
+    opts, positional = parse_opts(args, {'--verifier': 'value', '--mission': 'value'})
+    if not positional:
+        die("verifying requires <task_id>")
+    task_id = positional[0]
+    verifier = opts.get('--verifier')
+    if not verifier:
+        _usage_exit("verifying requires --verifier <name>")
+    problem = _STORE.agent_name_problem(verifier)
+    if problem or not _VERIFIER_NAME_RE.fullmatch(verifier):
+        _usage_exit(f"--verifier {verifier!r}: Worker 名 (英数字と `_.-`、64 文字まで) を指定してください"
+                    + (f" ({problem})" if problem else ""))
+
+    def _do():
+        state = load_state()
+        slug = _resolve_task_mission('verifying', task_id, state, opts.get('--mission'))
+        meta, body = load_task(slug, task_id)
+        cur_status = meta.get('status')
+        if not _TASK_STATUS.accepts('verifying', cur_status):
+            refuse_transition('verifying', task_id, cur_status)
+        meta['verifier'] = verifier
+        meta['status'] = 'verifying'
+        save_task(slug, task_id, meta, body)
+        print(f"Verifying: {slug}/{task_id} (verifier={verifier})")
+
+    with_lock(_do)
+
+
+_SNAPSHOT_HEADING = '## Pre-Compact Snapshot'
+_SNAPSHOT_RE = re.compile(r'## Pre-Compact Snapshot\n[\s\S]*?(?=\n## |\Z)')
+
+
+def cmd_snapshot(args):
+    """plan.sh snapshot <task_id> --section-file <path|-> [--mission <slug>]
+
+    card の本文の `## Pre-Compact Snapshot` 節を差し替える (無ければ末尾に足す)。**hooks/pre-compact.sh の
+    唯一の書き込み** (S5 / t020)。frontmatter (status / worker / started_at ...) には触れない。
+    以前は hook が card 全体をロックなし・in-place で書き戻していたので、hook が in_progress を読んだ後に
+    done が完了すると、古い in_progress が復活した (knowledge/state-store.md §2.4-5)。
+    """
+    opts, positional = parse_opts(args, {'--section-file': 'value', '--mission': 'value'})
+    if not positional:
+        die("snapshot requires <task_id>")
+    task_id = positional[0]
+    if opts.get('--section-file') is None:
+        _usage_exit("snapshot requires --section-file <path|->")
+    section = read_body_arg(opts, '--section-file', None, 'section')
+    if not section.startswith(_SNAPSHOT_HEADING + '\n'):
+        _usage_exit(f"--section-file の本文は '{_SNAPSHOT_HEADING}' の行で始まること")
+
+    def _do():
+        state = load_state()
+        slug = _resolve_task_mission('snapshot', task_id, state, opts.get('--mission'))
+        meta, body = load_task(slug, task_id)
+        if _SNAPSHOT_RE.search(body):
+            body_new = _SNAPSHOT_RE.sub(lambda _m: section, body, count=1)
+        else:
+            body_new = body.rstrip('\n') + '\n\n' + section + '\n'
+        save_task(slug, task_id, meta, body_new)
+        print(f"Snapshot: {slug}/{task_id}")
+
+    with_lock(_do)
+
+
 def cmd_verify_result(args):
     """
     Usage: plan.sh verify-result <task_id> <verdict> [--notes "..."] [--mission <slug>]
@@ -4604,11 +4741,11 @@ def upgrade_mode(current, proposed):
     return _MODE_ORDER[max(ci, pi)]
 
 
-def _apply_risk_flags(slug, plan_review_path):
-    """Parse ## Risk Flags from plan_review.md and upgrade task verification.mode."""
+def _parse_risk_flags(plan_review_path):
+    """plan_review.md の `## Risk Flags` から [(task_id, recommended_mode)] を取り出す (card には触れない)。"""
     content, problem = try_read_queue_file(plan_review_path)
     if problem is not None:
-        return
+        return []
 
     # Find ## Risk Flags section
     in_risk_flags = False
@@ -4636,18 +4773,19 @@ def _apply_risk_flags(slug, plan_review_path):
 
     if current_task_id and recommended_mode:
         upgrades.append((current_task_id, recommended_mode))
+    return upgrades
 
-    if not upgrades:
-        return
 
-    # Apply upgrades to task files
+def _apply_risk_flag_upgrades(slug, upgrades):
+    """verification.mode の引き上げ。**`with_lock()` の中で呼ぶ** (S5 / t020)。
+
+    以前は verdict のロックが外れた後に、ロックの外で card を読み (`load_task`)、別のロックで書いていた
+    (`_write_upgrade`)。読んでから書くまでの間に done / verify-result が進めた card を、古い内容で
+    巻き戻せた。読みも書きも verdict と同じトランザクションの中に置く。
+    """
+    _txn()      # ロックの外なら RuntimeError (規約)
     for task_id, proposed_mode in upgrades:
-        task_file = None
-        for fn in os.listdir(os.path.join(MISSIONS_DIR, slug, 'tasks')):
-            if fn == f"{task_id}.md":
-                task_file = os.path.join(MISSIONS_DIR, slug, 'tasks', fn)
-                break
-        if not task_file or not os.path.exists(task_file):
+        if not os.path.exists(task_path(slug, task_id)):
             print(f"[risk-flags] task '{task_id}' not found in mission '{slug}' — skipping", file=sys.stderr)
             continue
 
@@ -4661,13 +4799,7 @@ def _apply_risk_flags(slug, plan_review_path):
             verification['mode'] = new_mode
             meta['verification'] = verification
 
-            # この書き込みは今までロックの外だった。lib_state_store 経由にした以上、
-            # トランザクション (ロック + 監査ログ) の中で書く。読みはロックの前のままで、
-            # ここを `_do_verdict` に統合してロックの外の読み書きを無くすのは S5 (t020)。
-            def _write_upgrade(slug=slug, task_id=task_id, meta=meta, body=body):
-                save_task(slug, task_id, meta, body)
-
-            with_lock(_write_upgrade)
+            save_task(slug, task_id, meta, body)
             print(
                 f"[risk-flags] task '{task_id}': verification.mode {current_mode} → {new_mode} "
                 f"(recommended_mode={proposed_mode})"
@@ -4992,10 +5124,11 @@ def cmd_review(args):
             )
         save_mission(slug, mission)
 
-    with_lock(_do_verdict)
+        # --- Step 6: apply risk_flags → verification.mode upgrade (verdict と同じトランザクション) ---
+        _apply_risk_flag_upgrades(slug, risk_upgrades)
 
-    # --- Step 6: apply risk_flags → verification.mode upgrade ---
-    _apply_risk_flags(slug, review_output)
+    risk_upgrades = _parse_risk_flags(review_output)
+    with_lock(_do_verdict)
 
 
 def cmd_launch(args):
@@ -5093,7 +5226,7 @@ def cmd_archive(args):
         dst = os.path.join(ARCHIVE_DIR, slug)
         if os.path.exists(dst):
             die(f"archive target already exists: {dst}")
-        shutil.move(src, dst)
+        _move_mission_dir(src, dst, 'archive')
 
         active = state.get('active_missions') or []
         if slug in active:
@@ -5921,6 +6054,8 @@ dispatch = {
     'retire': cmd_retire,
     'reap-orphan-assignment': cmd_reap_orphan_assignment,
     'ready-for-verification': cmd_ready_for_verification,
+    'verifying': cmd_verifying,
+    'snapshot': cmd_snapshot,
     'verify-result': cmd_verify_result,
     'review': cmd_review,
     'launch': cmd_launch,

@@ -247,6 +247,10 @@ def _sys_unlink(path):
     os.unlink(path)
 
 
+def _sys_rename(src, dst):
+    os.rename(src, dst)
+
+
 # ---------------------------------------------------------------------------
 # 原子的な書き込み
 # ---------------------------------------------------------------------------
@@ -435,6 +439,37 @@ def atomic_remove(path):
         raise
     _fault('remove:dir_synced', path)
     return True
+
+
+def durable_rename(src, dst):
+    """`src` を `dst` へ移し (同じファイルシステム上の rename)、**元と先の両方の親 dir** を fsync する。
+
+    `shutil.move` は rename の後に親を fsync しないので、電源断で「元にも先にも無い」/「両方にある」
+    が起きうる (archive / init --force の退避)。先の親が無ければ durable に作る。先が既に在れば
+    `StoreWriteError(op='rename', EEXIST)` (上書きしない — `os.rename` がディレクトリ相手に黙って
+    置き換える経路を作らない)。別のファイルシステムをまたぐ rename (EXDEV) は `StoreWriteError`
+    (コピーして消す動きは途中で落ちると二重になる。queue の中は同じ FS)。
+    """
+    src, dst = os.fspath(src), os.fspath(dst)
+    _fault('rename:begin', src)
+    dst_parent = os.path.dirname(os.path.abspath(dst))
+    src_parent = os.path.dirname(os.path.abspath(src))
+    _ensure_dir(dst_parent, dst)
+    if os.path.lexists(dst):
+        raise StoreWriteError(dst, 'rename', _errno.EEXIST, 'destination exists')
+    try:
+        _sys_rename(src, dst)
+    except OSError as e:
+        raise StoreWriteError(src, 'rename', e.errno) from e
+    _fault('rename:renamed', dst)
+    try:
+        _fsync_dir(dst_parent, dst)
+        if src_parent != dst_parent:
+            _fsync_dir(src_parent, src)
+    except StoreWriteError as e:
+        e.committed = True                    # rename は済んでいる (耐久性だけが証明できない)
+        raise
+    _fault('rename:dir_synced', dst)
 
 
 # ---------------------------------------------------------------------------
@@ -1488,10 +1523,15 @@ def diagnose(queue_dir, scope=None):
 # ロック外の小さな共有ファイル (queue/.lock を取らないもの。S5 が使う)
 # ---------------------------------------------------------------------------
 
-def locked_update_json(path, lock_path, fn):
+def locked_update_json(path, lock_path, fn, *, on_unreadable='raise'):
     """専用ロック + 読み直し + 原子的書き込み。`fn(dict) -> dict`。ファイルが無い (ENOENT) ときだけ
     `{}` から始める。読めない・JSON でないは `StoreReadError` (空に潰さない)。
-    queue/.lock を握ったままこれを呼ばない (ロックの順序: queue/.lock が最も外側)。"""
+    queue/.lock を握ったままこれを呼ばない (ロックの順序: queue/.lock が最も外側)。
+
+    `on_unreadable='reset'` は、再生成できる**キャッシュ**専用 (taskvia map: 次の同期が冪等に埋める)。
+    読めない・壊れているときに空から作り直す —— 正本には使わない (既定の 'raise' が、空に潰さない側)。"""
+    if on_unreadable not in ('raise', 'reset'):
+        raise ValueError(f'on_unreadable must be raise|reset, got {on_unreadable!r}')
     path, lock_path = os.fspath(path), os.fspath(lock_path)
     _ensure_dir(os.path.dirname(lock_path) or '.', lock_path)
     try:
@@ -1504,10 +1544,11 @@ def locked_update_json(path, lock_path, fn):
         except OSError as e:
             raise LockFailed(f"cannot lock {lock_path}: {e}") from e
         text = _cards.read_regular_text_or_unreadable(path)
+        problem = None
         if _cards.is_missing(text):
             data = {}
         elif _cards.is_unreadable(text):
-            raise StoreReadError(path, _unreadable_code(text), text.errno)
+            data, problem = {}, StoreReadError(path, _unreadable_code(text), text.errno)
         else:
             try:
                 data = json.loads(text)
@@ -1515,9 +1556,11 @@ def locked_update_json(path, lock_path, fn):
             except ValueError:
                 data, parse_failed = None, True
             if parse_failed:           # except の外で投げる (例外の連鎖に本文を残さない)
-                raise StoreReadError(path, 'json_parse_error')
-            if not isinstance(data, dict):
-                raise StoreReadError(path, 'JSON top-level is not an object')
+                data, problem = {}, StoreReadError(path, 'json_parse_error')
+            elif not isinstance(data, dict):
+                data, problem = {}, StoreReadError(path, 'JSON top-level is not an object')
+        if problem is not None and on_unreadable == 'raise':
+            raise problem
         new = fn(data)
         if not isinstance(new, dict):
             raise StoreError('locked_update_json: fn must return a dict')

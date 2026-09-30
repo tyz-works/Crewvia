@@ -360,10 +360,16 @@ needs_human_review で assignment が無い状態は crash では作れないの
    通すので、同じ task を後任が pull し直していれば ASSIGN_SUCCESSOR / MINE の判定で守られる
    (今の reap と同じ。classify_assignment :2058 / cmd_reap_orphan_assignment :5909)
 4. 冪等: R-1〜R-4 は条件が成り立たなくなる状態へ書くので、2 回目は何もしない
-5. 残る穴 (閉じないと明言する): ロックの外の書き手が残っている間 (S5 より前) は 1. が成り立たない。
-   だから **S4 は S3 の後、S5 の前**という順で、S4 の R-1 / R-2 は plan.sh の書き手しか相手にしない
-   (verifier-dispatcher の `verifying` と pre-compact の本文書き込みは status / worker / started_at の
-   組を変えない or 変えても R-1 の条件外 —— verifying は in_progress ではない)
+5. **訂正 (S5 / t020。PR #255 の Codex 4 巡目の指摘)**: この項は初版で「pre-compact の本文書き込みは status / worker /
+   started_at の組を変えないので、S4 → S5 の順で安全」と書いていたが、**誤り**だった。`hooks/pre-compact.sh` と
+   verifier-dispatcher の `update_task_fields` は、どちらも**カード全体をロックなしで読み、丸ごと書き戻す**
+   (read-modify-write)。hook が `in_progress` の card を読んだ後に `done` が完了して assignment を撤去すると、
+   hook の書き戻しで**古い `in_progress` が復活**し、S4 の R-1 がそれを正本として assignment まで再公開しうる。
+   本文の節だけを書き換えるつもりでも、書き戻すのは全欄だからである。
+   → **計画を S3 → S5 → S4 の順に入れ替えた**。S5 で ロックの外の書き手は無くなる
+   (pre-compact は `plan.sh snapshot`、verifier-dispatcher は `plan.sh verifying` —— どちらもロックの中で
+   card を読み直して書く)。それが済んで初めて 1. が成り立ち、S4 の R-1 / R-2 は「正本が言っていること」を
+   信じてよい。ロックの外に残る書き手は §5 の「寄せない」表 (正本ではないもの) だけで、構造ガード (§6) が増えたら赤にする
 
 ### 2.5 回復の走査範囲と、食い違いの扱い
 
@@ -766,15 +772,15 @@ queue の下の dir 作成 (`_ensure_queue_dirs`・init --force の archive dir�
 | ファイル | 書き手 (行) | ロック | 原子性 | 01a | 理由 |
 |---|---|---|---|---|---|
 | `missions/*/tasks/tNNN.md` | plan.sh の各コマンド (save_task :847) | queue/.lock | tmp+replace+fsync (:692) | **S3** で lib へ | |
-| 同上 | plan.sh `_apply_risk_flags` (:4712、呼び出し :5096) | **なし** (`with_lock(_do_verdict)` :5093 の後) | save_task | **S5** で `_do_verdict` の中へ | |
-| 同上 | verifier-dispatcher.sh `update_task_fields` (:257-313、呼び出し :445) | **なし** | tmp+replace、fsync なし | **S5**: `plan.sh verifying <tid> --verifier <name> --mission <slug>` を新設して置き換え | status を書く唯一のロック外経路 |
-| 同上 (本文の Pre-Compact Snapshot 節) | hooks/pre-compact.sh (:44-61) | **なし** | `open('w')` 上書き (非原子的) | **S5**: plan.sh のサブコマンド経由 (mission を `CREWVIA_MISSION_SLUG` で名指し) | 加えて :39 は `find ... -path "*/tasks/${task_id}.md" \| head -1` で **task id だけで探す** —— 別の mission の同じ tNNN に書きうる (不変条件 2 の族) |
+| 同上 | plan.sh `_apply_risk_flags` (:4712、呼び出し :5096) | **なし** (`with_lock(_do_verdict)` :5093 の後) | save_task | **S5 済**: 読み (`load_task`) も書きも `_do_verdict` と**同じトランザクションの中** (`_parse_risk_flags` は card に触れず、`_apply_risk_flag_upgrades` が lock 内で読み直す) | ロックの外で読んだ card を後で書くと、その間に done が進めた status を古い内容で巻き戻した |
+| 同上 | verifier-dispatcher.sh `update_task_fields` (:257-313、呼び出し :445) | **なし** | tmp+replace、fsync なし | **S5 済**: `plan.sh verifying <tid> --verifier <name> --mission <slug>` (新設。ロックの中で読み直し、元が `ready_for_verification` でなければ exit 2 で何も書かない)。dispatcher は `mark_verifying()` でこれを呼ぶだけ (`update_task_fields` / `_dump_scalar` は削除) | status を書く唯一のロック外経路だった |
+| 同上 (本文の Pre-Compact Snapshot 節) | hooks/pre-compact.sh (:44-61) | **なし** | `open('w')` 上書き (非原子的) | **S5 済**: `plan.sh snapshot <tid> --section-file - [--mission <slug>]` (新設)。hook は `CREWVIA_MISSION_SLUG` を渡し、無ければ plan.sh が active な mission から task id で探して**複数に当たれば拒否**する (`find ... \| head -1` で別 mission の同じ tNNN に書く穴も閉じた)。書けなければ `queue/pre-compact-fallback.log` に 1 行 | card 全体を書き戻すので done を巻き戻せた (§2.4-5 の訂正) |
 | `missions/*/mission.yaml` | plan.sh save_mission (:824) | queue/.lock | 同上 | **S3** | |
 | `missions/*/plan_review.verdict` | review-plan.sh (:622-623) | なし | tmp + mv | 寄せない | 書き手 1 者・run_id で鮮度を確かめる読み手 (t018)。原子性はある |
 | `state.yaml` | plan.sh save_state (:713) | queue/.lock | 同上 | **S3** | |
 | `assignments/<agent>` / `.identity` | plan.sh publish / retire (:2040 / :2239) | queue/.lock | 同上 / unlink (親 dir fsync なし) | **S3** (S4 で projection 化) | |
 | `assignments/<agent>.restarting` | benchmark-ctx.sh (:107 / :307 `touch`) | なし | touch | 寄せない | ベンチマーク専用・中身なし・存在だけの印 |
-| `.taskvia-map.json` | plan.sh (:2365 / :2382)、taskvia-sync.sh (:144) | **なし** | `open('w')` | **S5**: `locked_update_json` (専用ロック) | 外部ミラーのキャッシュ。queue/.lock を取らないのは、前後に HTTP があり、正本ではないため |
+| `.taskvia-map.json` | plan.sh (:2365 / :2382)、taskvia-sync.sh (:144) | **なし** | `open('w')` | **S5 済**: `locked_update_json` (専用ロック `queue/.taskvia-map.json.lock`)。plan.sh は `_update_taskvia_map(fn)`、taskvia-sync.sh は**この実行で変えた項目だけ**を読み直した map に重ねる (`save_map`)。壊れていれば空から作り直す (`on_unreadable='reset'`。キャッシュ専用の引数) | 外部ミラーのキャッシュ。queue/.lock を取らないのは、前後に HTTP があり、正本ではないため |
 | `pre-compact-fallback.log` | hooks/pre-compact.sh (:66) | なし | 追記 | 寄せない | ログ |
 | `.lock` | plan.sh / lib_retirement | — | — | — | |
 | (新) `audit/*.jsonl` | lib_state_store | queue/.lock | 追記 (O_APPEND) | S3 | §4 |
@@ -783,14 +789,14 @@ queue の下の dir 作成 (`_ensure_queue_dirs`・init --force の archive dir�
 
 | ファイル | 書き手 | 01a | 理由 |
 |---|---|---|---|
-| `<worktree>/.crewvia-env` | plan.sh pull (:3460、lock 外) | **S5**: `atomic_write_text` (ロックは不要 —— worktree はその task 専用) | Worker が source する途中で読まれうる。再 pull で書き直されない問題は 01b |
+| `<worktree>/.crewvia-env` | plan.sh pull (:3460、lock 外) | **S5 済**: `atomic_write_text` (ロックは不要 —— worktree はその task 専用) | Worker が source する途中で読まれうる。再 pull で書き直されない問題は 01b |
 
 ### 5.3 registry/
 
 | ファイル | 書き手 | ロック / 原子性 | 01a | 理由 |
 |---|---|---|---|---|
-| `workers.yaml` | lib_registry.write (:182) | 専用ロック (:66) / **`open('w')` 非原子的** | **S5**: 書き方だけ `atomic_write_text` に。ロックは lib_registry のまま | queue の状態ではない (Worker の名簿)。queue/.lock に入れると done のロック外 bump (:4246) と順序が逆になる |
-| 同上 (初期化) | assign-name.sh (:32-34) | **なし** / `printf >` | **S5**: lib_registry 経由に | |
+| `workers.yaml` | lib_registry.write (:182) | 専用ロック (:66) / ~~`open('w')` 非原子的~~ | **S5 済**: 書き方だけ `atomic_write_text` に。ロックは lib_registry のまま | queue の状態ではない (Worker の名簿)。queue/.lock に入れると done のロック外 bump (:4246) と順序が逆になる |
+| 同上 (初期化) | assign-name.sh (:32-34) | ~~なし / `printf >`~~ | **S5 済**: 初期化を**撤去** (`lib_registry.parse()` は無いファイルを「Worker がいない」と読み、最初の `write()` がロックの中・原子的に dir ごと作る) | ロックの外の初期化は、別の書き手の直後に空の名簿で上書きしえた |
 | `heartbeats/*` | hooks/post-tool-use.sh (:87)、kai-review.sh (:210) | なし / 上書き | 寄せない | 毎回再生成される mtime の印。壊れても次の tool 使用で直る。lock を足すと全 tool 呼び出しが queue を待つ |
 | `activity/*`, `notifications/*`, `approvals/*.tsv`, `*.log`, `watchdog-observations.jsonl` | hooks / デーモン | 追記 | 寄せない | ログ・観察記録。正本ではない |
 | `retirements/*` | lib_retirement (write_json_atomic :379 他) | queue/.lock (nonblocking) の中 / tmp+replace、fsync なし | **寄せない** (プリミティブの共有だけ後続で検討) | 退役は lib_retirement が唯一の定義を持つプロトコル (R1: 意図を先に永続化)。書き方を変えると knowledge/daemon-authority.md の論証をやり直すことになり、01a の範囲を超える |
@@ -822,6 +828,83 @@ queue/.lock に入れると、正本を守るためのロックが観察の書�
 | 赤の実証 | S5 の PR 説明に「pre-compact.sh の書き込みを元に戻すとこのテストが赤」の実行結果を載せる (memory `regression-test-must-prove-red`) |
 | 文書を対象にしない | 対象は `.py` と `.sh` の中のコードだけ。`.md` を文字列で走査すると、ガードを説明する文書自体が引っかかる (この PR が `scripts/test_registry_lock.sh` の近接検査 —— `.md` も走査する —— で実際に赤になった。memory `red-proof-for-a-text-pattern-guard-trips-itself`) |
 | 読み取りの先例との関係 | 読み取りの allowlist と書き込みの allowlist は**別ファイル**。同じ検出器ヘルパ (`_python_source` 等) は共有してよいが、表は混ぜない |
+
+### 6.1 S5 (t020) で実装した形 — 設計との差・挙動が変わる箇所 (全部)・族の掃除・戻し方
+
+**構造ガード**: 検出器 `tests/queue_write_scan.py` + 表とテスト `tests/test_queue_writes_go_through_the_store.py`。
+設計との差:
+
+| 項目 | 設計 (上の表) | 実装 | 理由 |
+|---|---|---|---|
+| allowlist の鍵 | (ファイル, 関数, ソースの断片) | **(ファイル名, 関数名) → (件数, 理由)** | 断片は行を書き換えただけで鍵が壊れる。件数なら、その関数に書き込みが**増えても減っても**赤になる (増えた = 新しい書き込み、減った = 表が古い) |
+| bash の検出 | 書き先の語 (`queue` / `registry` ...) で絞る | **絞らず全部拾う** (`>` / `>>` / `tee` / `touch` / `mv` / `cp` / `rm` / `mkdir` / `ln` / `install` / `truncate` / `sed -i` / `dd of=`)。引用符 (行またぎ)・コメント・`/dev/null`・fd 複製・`[[ ]]` / `(( ))` の比較は除く | 変数は解決できないので、語で絞ると `$REGISTRY_YAML` のような名前の付け方で漏れる (見逃しより誤検出) |
+| python の検出 | 設計の一覧 | 同じ + `Path.open(mode)` の第 1 引数・`tempfile.*`・`os.chmod/utime/truncate` 等。**モードが定数でなければ書き込みとみなす** | 動的なモードは判定できない |
+| 対象 | ディレクトリの glob | `scripts/*.py` `scripts/*.sh` `scripts/bin/*` `scripts/shared/*.sh` `hooks/*.py` `hooks/*.sh` `crewvia` `crewvia-stop`。テスト (`test_*`) と `lib_state_store.py` 自身は除く。python ヒアドキュメントは**全ブロック** | 先例は 1 ブロック目だけを見ていた |
+| 件数 | (下限は S5 が実測) | **61 ファイル・187 件** (lib 自身の 7 件は別に数える)。表は 71 行 (27 ファイル)。下限は 150 件 / python ブロック 10 個 | 検出器が壊れて数件しか拾わなくなっても PASS しない |
+
+閉じないもの: `exec` / `eval` / `getattr(os, name)(..)` / 変数に取り置いた関数 (`w = os.replace`) / `subprocess` で起こした別プログラムの書き込み /
+`python3 -c "..."` の文字列の中の python。**うっかり書き込みを足すことを止める補助であって、敵対的な迂回を防ぐ境界ではない**
+(読み取り側の先例と同じ割り切り)。赤の実証は `tests/red_proof_s5_lib_writers.sh` の case K・L (lib を通らない書き込みを 1 行足すと赤)。
+
+**外から見える挙動が変わる箇所 (全部)**
+
+| 箇所 | 前 | 後 |
+|---|---|---|
+| plan.sh の subcommand | 15 個 (`QUEUE_MUTATING_SUBCOMMANDS`) | **`verifying` / `snapshot` を追加して 17 個**。task-graph の再生成・監査ログの行 (`op=verifying` / `op=snapshot`) が付く。usage 行・`POSITIONAL_ARITY`・dispatch 表を揃えた |
+| verifier-dispatcher が card に書くもの | card 全体を読んで `verifier` / `status` の 2 欄だけ行置換 → tmp+replace (fsync なし・ロックなし) | `plan.sh verifying` (ロックの中で読み直し → `save_task`)。card は plan.sh の直列化で書き直される (欄の並びは `TASK_META_KEY_ORDER`、`verifier` は表に無いので末尾)。**読んだ後に status が動いていれば拒否**され、その task は次のサイクルで選び直される (今までは巻き戻していた) |
+| verifier-dispatcher の失敗 | 例外をログに落とす | 同じ (`plan.sh verifying` の非 0 終了 / タイムアウト 120 秒 (プロセスグループごと kill) を例外にしてログ)。`--verifier` は Worker 名の形 (英数字と `_.-`、64 文字まで) だけ |
+| pre-compact hook の書き込み | card の `## Pre-Compact Snapshot` 節を in-place・ロックなしで書き換え。task id だけで `find ... \| head -1` | `plan.sh snapshot` (ロック・原子的・監査ログ)。`CREWVIA_MISSION_SLUG` で mission を名指し、無ければ task id で探し**複数に当たれば書かず**に fallback ログ。queue の場所は `CREWVIA_QUEUE` を先に見る (旧は hook の親 dir の `queue/` 固定) |
+| pre-compact の失敗 | 書けない → 例外で hook が失敗しうる | fallback ログ 1 行 (`queue/pre-compact-fallback.log`。書けなくても `\|\| true`)。hook は常に exit 0 (compaction を止めない) |
+| review の verification.mode 引き上げ | verdict のロックの**後**に、ロックの外で card を読み、別のロックで書く (task ごとに 1 トランザクション) | verdict と**同じトランザクション**の中で読み直して書く。監査ログは verdict の 1 行 (mission) に加えて card ごとの行が付くのは同じ |
+| `.crewvia-env` | `open('w')` | `atomic_write_text` (新規の mode は `0666 & ~umask` で同じ)。書けなければ pull が exit 1 |
+| `queue/.taskvia-map.json` | 読んで `open('w')` (plan.sh と taskvia-sync.sh の 2 人) | `queue/.taskvia-map.json.lock` (新設) の下で読み直して重ねる。JSON の書式 (indent=2・末尾改行) は同じ。壊れていれば空から作り直す (旧と同じ) |
+| `registry/workers.yaml` | `open('w')` (途中で落ちると空/半端) | `atomic_write_text`。`assign-name.sh` は初回に `printf 'workers: []'` で作らず、最初の `write()` が (ロックの中で) dir ごと作る |
+| mission の退避 (`archive` / `init --force`) | `shutil.move` (親 dir を fsync しない) | `lib_state_store.durable_rename` (元と先の**両方**の親 dir を fsync)。先が既に在れば `StoreWriteError` → exit 1 (旧: `shutil.move` は先がディレクトリなら**その中へ**移した。plan.sh は事前に存在を検査しているので通常は届かない) |
+| 引数の検査に落ちた呼び出し | `queue/missions` `queue/archive` が作られる (`parse_opts` の末尾) | 作られない。骨組みは `with_lock()` の中 (ロックを取った後) で作る。**書かない読み取り専用の subcommand (`status` 等) も骨組みを作らなくなる** |
+
+**族の掃除 (同じデータ・同じ判定を扱うコード全体)**: 直した型は「queue / registry の状態ファイルを、`queue/.lock` (または専用ロック) の外で、
+lib を通さずに読み書きする」。§5 の計測を e6d6801 → 現行で数え直し、検出した書き込み 187 件をすべて `ALLOWED_WRITES` の 71 行に分類した
+(1 行ごとの理由は表そのもの。ここは分類の要約):
+
+| 分類 | 処置 |
+|---|---|
+| S5 で lib に寄せた 11 箇所 (verifier-dispatcher `update_task_fields` / pre-compact / `_apply_risk_flags` / `.crewvia-env` / plan.sh の taskvia map ×2 / taskvia-sync `save_map` / `lib_registry.write` / assign-name 初期化 / mission の退避 ×2) | 表に**載せない** (検出 0 件であることを `test_moved_writers_no_longer_appear` が固定) |
+| ロックファイル 14 件・dir 作成と一時ファイル 14 件 (`R_LOCK` / `R_DIR` / `R_TMP`) | 残す: 中身を持たない。queue の dir は `ensure_dir` を通す |
+| ログ 20 件・印 24 件 (heartbeat / activity / grace marker 等。`R_LOG` / `R_MARK`) | 残す: 正本ではなく再生成できる (§5.3)。lock を足すと全 tool 呼び出しが queue を待つ |
+| デーモン側 JSON 状態・台帳・拒否記録 30 件 (`R_DAEMON_JSON`) | 残す: 不変条件 7 (消してよい) |
+| registry/mux 3・retirements 10・workers 7・verification 3・handoffs 2・task-graph の専用ロック / 印 (上の 14・24 に含む) = 25 件 | 残す: 各 lib が唯一の定義を持つ (§5.3)。retirement は R1 のプロトコル (書き方を変えると daemon-authority の論証をやり直す) |
+| Worker の settings・ベンチ・セットアップ・hook の権限設定・reviewer の一時ファイル・knowledge への追記 (計 60 件) | 残す: queue / registry の外、または書き手 1 者 (`review-plan.sh` の verdict は §5.1 の「寄せない」) |
+
+**S3 の QA (t013) から持ち越した項目**: mission の退避 (`archive` / `init --force`) の rename は `durable_rename` に通した (赤の実証: `os.fsync` と `os.rename` を
+記録するスタブで、`shutil.move` の形は述語を満たさない)。`hooks/pre-compact.sh:59` の in-place 書き込みは lib 経由にした (t012 の「寄せない」を覆した)。
+
+**戻し方**: PR revert → `scripts/sync-main-checkout.sh` (ff + デーモン restart)。**verifier-dispatcher は常駐デーモンなので restart が要る**
+(merge 済みのコードは restart まで動かない)。hooks は次の tool 呼び出しから新旧が入れ替わる。queue の card・mission・state・assignment は
+1 バイトも書き換えていない (書き方が変わっただけ)。`queue/.taskvia-map.json.lock` と `queue/audit/` は残ってよい (読み手がいない)。
+旧 verifier-dispatcher は card に `status: verifying` を直接書くので、戻した後も card は読める。
+
+### 6.2 S5 fix 2 巡目 (t033 / PR #259 Codex P2) — 「済んだが耐久性だけ失敗」は続行する
+
+`durable_rename` は `os.rename` の後に親 dir の fsync が失敗すると `StoreWriteError(committed=True, op='fsync_dir')` を出す。
+旧 `cmd_archive` / `cmd_init --force` はこれを die に写し、mission dir は移動済みなのに `active_missions` / `default_mission` が
+元の名前を指したまま残った (元が無いので再試行でも直らない)。**規則: `committed` の失敗は警告して続行し、状態の更新を
+最後までやる。exit code は 0** (`Txn._write` と同じ扱い)。共通の入口は plan.sh の `_committed_durability_failure()` / `_move_mission_dir()`。
+rename 自体の失敗 (何も動いていない) は従来どおり die・state 不変。
+
+複数の書き込みを順に行う操作 (S5 が足した・触ったもの) の全部 —— 途中の 1 歩が「済んだが耐久性だけ失敗」したとき:
+
+| 操作 | 途中の 1 歩 | 修正前 | 今 |
+|---|---|---|---|
+| `archive` | rename → state.yaml 更新 | **rename 後で die・state 未更新 (再試行でも直らない)** | (a) 警告して state 更新まで完了 |
+| `init --force` | 退避 rename → state から外す → mission 作り直し | **同上** | (a) 最後まで完了 |
+| `pull` | worktree 作成 → `.crewvia-env` (`atomic_write_text`) → JSON 出力 | die・JSON が出ない (worktree は残る) | (a) 警告して JSON まで出す |
+| `verifying` / `snapshot` / risk flags / verdict | `save_task` / `save_mission` (`Txn._write`) | 既に (a) (§2 の `_durability_unproven`) | 変更なし |
+| taskvia map | `locked_update_json` (`atomic_write_text`) | `StoreError` を警告に写して続行 | 変更なし (a) |
+| `lib_registry.write` (assign-name / bump / register) | 名簿の置換 | 例外 → assign-name が**登録済みなのに名前を返さず**落ちる | (a) 警告して続行 (名簿は新しい内容) |
+| `durable_rename` を直接呼ぶ他の経路 | — | — | 無い (呼び出しは plan.sh の 2 か所だけ。`test_queue_writes_go_through_the_store` の表が増減を見る) |
+
+「済んだ変更を未完了扱いにして後続を捨てる」経路は 0。赤の実証: `tests/test_s5_fix2_rename_fsync_failure.py` (rename 後の最初の親 dir fsync を EIO にするスタブ。
+修正前の plan.sh で archive / init --force の 2 件が赤)。
 
 ---
 

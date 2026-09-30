@@ -370,48 +370,33 @@ class _FakeMuxModule:
         return lambda *a, **kw: None
 
 
-def test_verifier_does_not_block_writing_back_a_fifo_card(tmp_path):
+def test_verifier_does_not_block_writing_back_a_fifo_card(sandbox):
     """**読んでから書き戻す**経路にこそ、種類のガードが要る。
 
-    ガードが無いと 2 つ壊れる —— 読みで無期限に止まるか、止まらなかった場合は
-    `os.replace()` が置き換えるのが *別の何か* になる。
+    verifier-dispatcher の status 変更は S5 (t020) で `plan.sh verifying` に移った。ガードは
+    plan.sh の `load_task()` (`read_queue_file`) にある。ガードが無いと 2 つ壊れる —— 読みで無期限に
+    止まるか、止まらなかった場合は書き戻しが置き換えるのが *別の何か* になる。
 
-    RED (`task_path.read_text()` のまま): `_deadline` が発火する。
+    RED (`load_task()` が素の `open()` のまま): `subprocess.run(timeout=)` が発火する。
     """
-    root = tmp_path / "repo"
-    root.mkdir()
-    (root / ".git").mkdir()
-    (root / "registry").mkdir()
-    (root / "queue" / "missions" / MISSION / "tasks").mkdir(parents=True)
-    ns = _load_verifier_namespace(root)
-
-    card = root / "queue" / "missions" / MISSION / "tasks" / "t001.md"
+    sandbox.add_task("t001", status="ready_for_verification")
+    card = sandbox.tasks_dir() / "t001.md"
     _replace_with_fifo(card)
 
-    with _deadline(10):
-        with pytest.raises(Exception):
-            ns["update_task_fields"](card, {"status": "verifying"})
+    result = sandbox.run("verifying", "t001", "--verifier", "Wei", "--mission", MISSION, timeout=20)
 
+    assert result.returncode != 0, f"FIFO のカードを読めたことになっている: {result.stdout}"
     assert card.is_fifo(), "書き戻しが FIFO を置き換えてしまった"
 
 
-def test_verifier_still_writes_back_a_regular_card(tmp_path):
-    """逆向きの担保 —— 普通のカードはこれまで通り書き換わること。"""
-    root = tmp_path / "repo"
-    root.mkdir()
-    (root / ".git").mkdir()
-    (root / "registry").mkdir()
-    tasks = root / "queue" / "missions" / MISSION / "tasks"
-    tasks.mkdir(parents=True)
-    ns = _load_verifier_namespace(root)
+def test_verifier_still_writes_back_a_regular_card(sandbox):
+    """逆向きの担保 —— 普通のカードはこれまで通り書き換わること (plan.sh verifying 経由)。"""
+    sandbox.add_task("t001", status="ready_for_verification")
 
-    card = tasks / "t001.md"
-    card.write_text("---\nid: t001\nstatus: ready_for_verification\n"
-                    "verifier: null\n---\n\n## Description\n\nx\n")
+    result = sandbox.run("verifying", "t001", "--verifier", "Wei", "--mission", MISSION, timeout=30)
 
-    ns["update_task_fields"](card, {"status": "verifying", "verifier": "Wei"})
-
-    text = card.read_text()
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    text = (sandbox.tasks_dir() / "t001.md").read_text()
     assert "status: verifying" in text and "verifier: Wei" in text, text
 
 

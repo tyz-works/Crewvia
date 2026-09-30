@@ -114,6 +114,7 @@ class World:
             ("t007", "verifying", "Ren"),        # verify-result
             ("t008", "failed", "Ren"),           # release-dep / update --reset
             ("t009", "done", "Kai-codex"),       # reap-orphan-assignment
+            ("t010", "ready_for_verification", "Ren"),   # verifying (S5)
         ):
             extra = ""
             if tid == "t008":
@@ -125,6 +126,7 @@ class World:
         # 経路 (assignment ファイルの書き込み) を隔離実行で通す — 他の subcommand の
         # 実行順に依存させない (陽性対照。knowledge の記述と同じ理由)。
         (self.queue / "assignments" / "Kai-codex").write_text(f"{MISSION}:t009\n")
+        (self.other / "section.txt").write_text("## Pre-Compact Snapshot\n\n- trigger: auto\n")
 
     def run(self, *args: str, with_repo_root: bool = False,
             repo_root: pathlib.Path | None = None) -> subprocess.CompletedProcess:
@@ -182,6 +184,9 @@ ISOLATED_INVOCATIONS: dict[str, list[list[str]]] = {
                 "--mission", MISSION, "--outcome", "reset", "--no-wait"]],
     "reap-orphan-assignment": [["reap-orphan-assignment", "Kai-codex", "--no-wait"]],
     "ready-for-verification": [["ready-for-verification", "t006", "--mission", MISSION]],
+    "verifying": [["verifying", "t010", "--verifier", "Wei", "--mission", MISSION]],
+    # cwd (= World.other) に置いた節の本文。読めない/拒否でも registry を書かないことも同じ表で見る
+    "snapshot": [["snapshot", "t001", "--section-file", "section.txt", "--mission", MISSION]],
     "verify-result": [["verify-result", "t007", "pass", "--mission", MISSION]],
     "review": [["review", MISSION]],
     "launch": [["launch", MISSION]],

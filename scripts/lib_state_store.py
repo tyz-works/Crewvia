@@ -292,6 +292,20 @@ def _ensure_dir(dirpath, error_path):
     _fsync_dir(parent, error_path)
 
 
+def _open_lock_file(lock_path):
+    """ロックファイルを開く。通常ファイルでなければ (FIFO / device など) 閉じて OSError(EINVAL)。
+    O_NONBLOCK は open だけのため (flock には効かない)。開いた後に外す。"""
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NONBLOCK, 0o644)
+    try:
+        if not _stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(_errno.EINVAL, 'lock path is not a regular file')
+        os.set_blocking(fd, True)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
 def _write_all(fd, data, path):
     view = memoryview(data)
     while view:
@@ -606,7 +620,7 @@ def transaction(queue_dir, *, op, actor, nonblocking=False):
     lock_path = os.path.join(queue_dir, '.lock')
     _ensure_dir(queue_dir, lock_path)
     try:
-        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+        fd = _open_lock_file(lock_path)
     except OSError as e:
         raise LockFailed(f"cannot open queue lock {lock_path}: {e}") from e
     key = _lock_key(lock_path)
@@ -716,18 +730,49 @@ def _list_dir(path):
         return [], f"list_error:{_errno_name(e.errno)}"
 
 
+_SLUG_VALUE_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]*')
+
+
+def _state_problem(data):
+    """parse 済みの state.yaml の**形**の検査。問題なら固定コード、健全なら None。値は出さない。
+
+    - 空ファイル・`active_missions` 欄が無い → 'state_missing_key' (「active な mission が 0 件」と
+      読むと archive 場面で生きている mission が消える。**ENOENT だけ**が「まだ無い」)
+    - `active_missions` が list でない (true / 文字列 / 閉じていない inline list) → 'active_missions_not_list'
+    - 要素が slug の形の文字列でない → 'active_missions_bad_entry'
+    - `default_mission` が None か slug の形の文字列でない → 'default_mission_bad_type'
+    `active_missions:` (値なし = null) は plan.sh と同じく空 list。
+    """
+    if not isinstance(data, dict) or 'active_missions' not in data:
+        return 'state_missing_key'
+    active = data['active_missions']
+    if active is not None:
+        if not isinstance(active, list):
+            return 'active_missions_not_list'
+        if not all(isinstance(s, str) and _SLUG_VALUE_RE.fullmatch(s) for s in active):
+            return 'active_missions_bad_entry'
+    default = data.get('default_mission')
+    if default is not None and not (isinstance(default, str) and _SLUG_VALUE_RE.fullmatch(default)):
+        return 'default_mission_bad_type'
+    return None
+
+
 def _read_active_missions(queue_dir):
-    """`(active_missions, コード)`。state.yaml が無い (ENOENT) は `([], None)`、読めない・壊れているは
-    `([], コード)`。"""
+    """`(active_missions, コード)`。state.yaml が無い (ENOENT) は `([], None)`、読めない・壊れている・
+    形が違うは `([], コード)`。"""
     text = _cards.read_regular_text_or_unreadable(os.path.join(queue_dir, 'state.yaml'))
     if _cards.is_missing(text):
         return [], None
     if _cards.is_unreadable(text):
         return [], _unreadable_code(text)
     try:
-        return list(_cards.parse_yaml(text).get('active_missions') or []), None
+        data = _cards.parse_yaml(text)
     except ValueError as e:
         return [], _parse_code(e)
+    code = _state_problem(data)
+    if code:
+        return [], code
+    return list(data['active_missions'] or []), None
 
 
 def _path_state(path):
@@ -802,6 +847,11 @@ class Txn:
             return 'unreadable', None, None, _parse_code(e), None
         if meta.get('id') not in (None, '', tid):
             return 'unreadable', None, None, 'id_mismatch', None
+        # status は語彙の文字列だけ。list / mapping / 未知の値は frozenset の判定で TypeError になるか、
+        # 黙って「別の状態」になる。値は出さない (固定コード)。
+        status = meta.get('status')
+        if not (isinstance(status, str) and status in _status.TASK_STATUSES):
+            return 'unreadable', None, None, 'bad_status', None
         return 'ok', meta, body, None, None
 
     def load_mission(self, slug):
@@ -830,6 +880,7 @@ class Txn:
             code = _parse_code(e)
         else:
             code = None
+        code = code or _state_problem(data)
         if code:
             raise StoreReadError(path, code)
         if data.get('active_missions') is None:
@@ -961,8 +1012,12 @@ class Txn:
             _fault('audit:begin', path)
             _ensure_dir(os.path.dirname(path), path)
             line = (json.dumps(row, ensure_ascii=False, sort_keys=True) + '\n').encode('utf-8')
-            fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+            # O_NONBLOCK: 読み手のいない FIFO への open(O_WRONLY) は永久に待つ (queue/.lock を持ったまま)。
+            # 開けても通常ファイルでなければ書かない (FIFO / socket / device)。
+            fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NONBLOCK, 0o644)
             try:
+                if not _stat.S_ISREG(os.fstat(fd).st_mode):
+                    raise StoreWriteError(path, 'audit_open', _errno.EINVAL, 'not a regular file')
                 _write_all(fd, line, path)
                 _sys_fsync(fd)
             finally:
@@ -1378,7 +1433,7 @@ def locked_update_json(path, lock_path, fn):
     path, lock_path = os.fspath(path), os.fspath(lock_path)
     _ensure_dir(os.path.dirname(lock_path) or '.', lock_path)
     try:
-        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+        fd = _open_lock_file(lock_path)
     except OSError as e:
         raise LockFailed(f"cannot open {lock_path}: {e}") from e
     try:

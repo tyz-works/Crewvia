@@ -21,6 +21,17 @@ lib ごとの**破ってはいけない契約**の要約。理由・経緯・全
   1 つでもあればストア全体が `Unreadable`。
 - 例外は `plan.sh` の `load_state()` 1 つだけ（`knowledge/empty-vs-unobservable.md` §4）。
 
+## 書き込みの入口（`lib_state_store.py`。S2 では**呼び出し元ゼロ**）
+
+- queue への書き込みの唯一の入口（`knowledge/state-store.md` §3）。`atomic_write_text`（tmp → fsync → replace → **親 dir fsync**・
+  mode 引き継ぎ）/ `atomic_remove` / `transaction()`（`queue/.lock`・取得後に読み直す・入れ子は即 `NestedTransaction`）/
+  `Txn.recover()`（R-1〜R-4。**正本は書かない**）/ `diagnose()`（書かない）/ 監査ログ `queue/audit/transitions-YYYYMMDD.jsonl`。
+- 書けない・読めないは**例外**（`StoreWriteError` / `StoreReadError` / `LockBusy`）。`None` / `False` / 成功に潰さない。
+  監査ログだけは書けなくても遷移を止めず stderr に警告。本文（Result・理由）・env・token は出さない。
+- 障害注入は `FAULT_HOOK`（モジュール変数。env スイッチは付けない）。`plan.sh` / dispatcher / hooks はまだ import しない
+  （`tests/test_state_store_has_no_callers_yet.py`）。S3 が移すときにそのテストの許可表を更新する。
+- 直列化は plan.sh の写し（S3 まで二重）。`tests/test_state_store_serialization_matches_plan_sh.py` が一致を固定する。
+
 ## 依存（`lib_dep_rules.py`）
 
 - 「依存が満たされた」の唯一の定義（`card_dependencies()`）。pull・task-graph・status・dispatcher がここだけを読む。

@@ -42,6 +42,8 @@ tests/red_proof_t022.sh | 1 回限りの historical red proof（CI 化しない�
 tests/red_proof_t025.sh | 1 回限りの historical red proof（CI 化しない）
 tests/red_proof_t033.sh | 1 回限りの historical red proof（CI 化しない）
 tests/red_proof_t036.sh | 1 回限りの historical red proof（CI 化しない）
+tests/red_proof_t008.sh | 1 回限りの historical red proof（CI 化しない）
+tests/red_proof_t029.sh | 1 回限りの historical red proof（CI 化しない）
 tests/red_proof_t047.sh | 1 回限りの historical red proof（CI 化しない）
 tests/red_proof_t053.sh | 1 回限りの historical red proof（CI 化しない）
 tests/red_proof_t055.sh | 1 回限りの historical red proof（CI 化しない）

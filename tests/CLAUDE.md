@@ -45,6 +45,15 @@ root の `CLAUDE.md` から移した、テスト専用の規則。設計と経�
 - 静的検査（`scripts/test_registry_lock.sh` 等）は worktree では除外判定が全件に当たり必ず PASS する。
   検査件数を出し、fixture の lib は helper 経由にする。
 
+## State Store (`lib_state_store`) のテスト
+
+- crash 注入は `tests/state_store_scenarios.py`（seed・場面・収束の検査）。lib の書き込みの各段で `FAULT_HOOK` が呼ばれ、
+  fork した子が k 番目で自分に SIGKILL を送る（**子は SIGKILL か `os._exit` でしか終わらない** — pytest の後始末に戻らない）。
+  点の数の**下限**を assert する（注入口が壊れて 0 点で PASS しない）。全点 × 20 回。
+- 並行は**独立プロセス**（`tests/state_store_worker.py`）・実 flock。mock のロックで済ませない。
+- red proof は `tests/red_proof_t008.sh`（lib の保証を 1 つずつ壊した複製）。**壊した複製は `scripts/` `tests/` だけを写し、
+  本番の worktree・queue には触れない**。約 4 分。
+
 ## 子プロセスを残さない（`tests/leaked_descendants.py` / `tests/proc_group.py`）
 
 - plan.sh のような **bash の下で更に子を起こすもの** を `subprocess.run(timeout=)` / `Popen.kill()` で止めると、

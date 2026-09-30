@@ -73,11 +73,12 @@ class Runner:
 
 
 def snapshot_queue(queue: pathlib.Path, root: pathlib.Path) -> dict:
-    """queue の全ファイルの正規化した中身。監査ログのディレクトリと `.lock` は除く。"""
+    """queue の全ファイルの正規化した中身。監査ログのディレクトリと、中身の無いロックファイル
+    (`.lock` / S5 で足された `.taskvia-map.json.lock`) は除く。"""
     out = {}
     for p in sorted(queue.rglob("*")):
         rel = p.relative_to(queue).as_posix()
-        if not p.is_file() or rel.startswith("audit/") or rel == ".lock":
+        if not p.is_file() or rel.startswith("audit/") or rel in (".lock", ".taskvia-map.json.lock"):
             continue
         out[_normalize(rel, root)] = _normalize(p.read_text(), root)
     return out

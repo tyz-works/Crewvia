@@ -27,11 +27,10 @@ if [[ ! -f "$NAMES_YAML" ]]; then
   exit 1
 fi
 
-# Ensure registry directory and file exist
-mkdir -p "$REGISTRY_DIR"
-if [[ ! -f "$REGISTRY_YAML" ]]; then
-  printf 'workers: []\n' > "$REGISTRY_YAML"
-fi
+# registry の dir と workers.yaml は、ここでは作らない (S5 / t020)。以前はロックの外で
+# `printf 'workers: []' > workers.yaml` していたので、別の書き手 (bump-task-count 等) の直後に
+# 空の名簿で上書きしえた。lib_registry.parse() は無いファイルを「まだ Worker がいない」と読み、
+# 最初の write() (ロックの中・原子的) が dir ごと作る。
 
 # Registry-first lookup and assignment via python3.
 # lib_registry.py でヘッダ保存・同名 dedup・role 保存を一元化している。

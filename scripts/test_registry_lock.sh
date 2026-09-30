@@ -65,10 +65,12 @@ echo "== test_registry_lock.sh (task_161 regression test) =="
 # 呼び出し行)まで誤検知してしまう。過去に実際に発生したバグの形
 # (Python pathlib の .write_text( を workers.yaml と同一ファイル内で使っている)
 # にピンポイントで絞ることで、誤検知ゼロで意図した迂回を検出する。
-# ★shell の `>` リダイレクトは検査対象に含めていない — assign-name.sh には
-# レジストリ未作成時の初期化(`printf 'workers: []\n' > "$REGISTRY_YAML"`)という
-# 正当な既存コードがあり、これはレース対象ではない(対象ファイルが存在しない
-# 時にのみ走る一回きりの初期化であり、並行書込の相手が存在し得ない)。
+# ★shell の `>` リダイレクトは、この近接検査の対象に含めていない。かつて assign-name.sh には
+# レジストリ未作成時の初期化(`printf 'workers: []\n' > "$REGISTRY_YAML"`)があり、「一回きりで
+# 並行書込の相手が存在し得ない」と判断していたが、それは誤りだった(ロックの外で走るので、別の
+# assign-name.sh / bump-task-count の直後に空の名簿で上書きしえた)。S5 (t020) で撤去済み
+# (最初の write() がロックの中・原子的に作る)。shell の書き込み全般は
+# tests/test_queue_writes_go_through_the_store.py が(allowlist 方式で)見ている。
 # ★限界: 単純な「同一ファイル内co-occurrence」では dispatcher.sh /
 # verifier-dispatcher.sh を誤検知した(両方とも先頭付近で WORKERS_FILE =
 # .../workers.yaml を定義しつつ、遠く離れた箇所で全く別の変数(NOTIFY_CACHE)に

@@ -512,6 +512,10 @@ trust は利用者の判断で、迂回口を作ると「信頼していない d
 CLI に `add-skills PATH NAME SKILL...`（`start.sh` が使う。和集合・flow list に書き戻せない
 tag は警告して飛ばす）。t017 / PR5a
 
+**書き込みは `lib_state_store.atomic_write_text`**（tmp → fsync → replace → 親 dir の fsync。途中で落ちても元の名簿が残る。
+S5 / t020）。初期化（`workers: []`）は無く、無いファイルは `parse()` が「Worker がいない」と読み、最初の `write()` が
+ロックの中で dir ごと作る（`assign-name.sh` がロックの外で作っていた穴を塞いだ）。`knowledge/state-store.md` §5.3・§6.1
+
 ### `lib_mux.sh`
 
 bash 向け薄いラッパー（mux_spawn / mux_send 等）

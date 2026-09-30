@@ -44,6 +44,11 @@ root の `CLAUDE.md` から移した、テスト専用の規則。設計と経�
   済ませない）。allowlist の各行は理由を持ち、該当が無くなったら（直したのに残った）赤。
 - 静的検査（`scripts/test_registry_lock.sh` 等）は worktree では除外判定が全件に当たり必ず PASS する。
   検査件数を出し、fixture の lib は helper 経由にする。
+- **書き込み側**は `tests/test_queue_writes_go_through_the_store.py`（検出器 `tests/queue_write_scan.py`。S5 / t020）。
+  lib（`lib_state_store`）を通らない書き込みが**増えても減っても**赤（表は `(ファイル, 関数) → (件数, 理由)`）。python は AST
+  （`.sh` の python ヒアドキュメントは**全ブロック**）、bash は字句（変数は解決できないので書き先の語で絞らず全部拾う）。
+  検査件数の下限・死んだ行・陽性/陰性対照（本物のコードから切り出した形）を持つ。読み取りの表とは混ぜない。
+  検出器を触ったら `python3 -m pytest tests/test_queue_writes_go_through_the_store.py` の陽性対照が全部通ること。
 
 ## State Store (`lib_state_store`) のテスト
 
@@ -64,6 +69,12 @@ root の `CLAUDE.md` から移した、テスト専用の規則。設計と経�
   （作り直し: `git archive <旧 sha> | tar -x -C <dir>` → `python3 tests/plan_sh_compat_scenario.py <dir> <golden>`）。
   監査ログ（`queue/audit/`）と `.lock` は比べない。直列化の golden は `tests/fixtures/state_store_serialization_golden.json`
   （JSON の `sort_keys` を使わない — meta の key の並びが出力に効く）。
+
+- **S5（t020）の書き手のテスト**: `tests/test_s5_writers_lock_and_atomic.py`（verifier-dispatcher の `verifying`・pre-compact の
+  `snapshot`・risk flags・`.crewvia-env`・taskvia map・workers.yaml・rename の耐久性・`parse_opts` の骨組み）。
+  強制終了は `FAULT_HOOK` を fork した子の中で k 番目に SIGKILL（`_kill_child_at`）。並行は独立プロセス・実 flock。
+  **旧コードの危険が本物だった対照**を各所に置く（旧 pre-compact は truncate した時点で落ちると空の card が残る等）。
+  赤の実証は `tests/red_proof_s5_lib_writers.sh`（12 ケース。欠陥を戻した複製に同じテストを走らせる。約 4 分）。
 
 ## 子プロセスを残さない（`tests/leaked_descendants.py` / `tests/proc_group.py`）
 

@@ -128,8 +128,13 @@ def _drive_every_mutating_subcommand(sb: Sandbox):
     expected.append(("pull", "t003", "pending", "in_progress"))
     sb.run("ready-for-verification", "t003", agent="Ren")
     expected.append(("ready-for-verification", "t003", "in_progress", "ready_for_verification"))
+    sb.run("verifying", "t003", "--verifier", "Wei", agent="verifier-dispatcher")      # S5: verifier-dispatcher の書き込み
+    expected.append(("verifying", "t003", "ready_for_verification", "verifying"))
+    sb.run("snapshot", "t003", "--section-file", "-", agent="Ren",                     # S5: pre-compact hook の書き込み
+           stdin=f"## Pre-Compact Snapshot\n\n- note: {SECRET_RESULT}\n")
+    expected.append(("snapshot", "t003", "verifying", "verifying"))
     sb.run("verify-result", "t003", "pass", "--notes", SECRET_RESULT, agent="Ren")
-    expected.append(("verify-result", "t003", "ready_for_verification", "verified"))
+    expected.append(("verify-result", "t003", "verifying", "verified"))
 
     sb.run("pull", "--agent", "Ren", "--skills", "bash", "--task", "t004")
     expected.append(("pull", "t004", "pending", "in_progress"))
@@ -210,7 +215,7 @@ def test_every_mutating_subcommand_goes_through_with_lock():
     for sub in sorted(mutating):
         body = ast.get_source_segment(src, funcs[table[sub]])
         assert "with_lock(" in body, f"{sub} ({table[sub]}) が with_lock を通らない"
-    assert len(mutating) == 15                       # 空虚でない (集合が空になっていない)
+    assert len(mutating) == 17                       # 空虚でない (集合が空になっていない)
 
 
 def test_writes_without_a_transaction_fail_loudly_instead_of_writing_unlocked(tmp_path):

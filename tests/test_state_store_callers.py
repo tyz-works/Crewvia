@@ -1,12 +1,15 @@
-"""呼び出し元ゼロの確認 (S2 / R2): plan.sh・dispatcher・hooks は `lib_state_store` をまだ使わない。
+"""`lib_state_store` の呼び出し元の一覧を固定する (旧 `test_state_store_has_no_callers_yet.py`)。
 
-R2 (ユーザー決定): 呼び出し元ゼロの lib は通常どおり merge、**呼び出し側を移す PR は merge 前に
-ユーザー承認**。plan.sh は主 checkout から直接実行されるので、plan.sh が import した瞬間が
-cutover になる。この PR (S2) が本番の挙動を変えないことを、import 文の形ではなく**名前の出現**で
-固定する (bash の `sys.path` 経由・文字列の `importlib`・`-m` 起動のどれでも当たる)。
+R2 (ユーザー決定): 呼び出し側を移す PR は merge 前にユーザー承認。plan.sh は主 checkout から直接
+実行されるので、plan.sh が import した瞬間が cutover になる。
 
-**S3 (t012) が plan.sh を移すとき、このテストの `ALLOWED_CALLERS` を更新する**のが正しい手順
-(=「呼び出し元が増えた」ことが差分に見える)。赤くなったら、意図した cutover かを先に確かめる。
+- S2 (t008): 呼び出し元ゼロ。許可は lib 自身だけだった。
+- **S3 (t012): plan.sh が最初の (そして S3 時点で唯一の) 呼び出し元**。dispatcher・hooks・verifier-dispatcher・
+  taskvia-sync・watchdog 等はまだ import しない (S5 で verifier-dispatcher / hooks を plan.sh 経由に寄せる)。
+
+呼び出し元が増えたら `ALLOWED_CALLERS` の差分にそれが見える。赤くなったら、意図した cutover かを先に確かめる。
+検査は import 文の形ではなく**名前の出現**で固定する (bash の `sys.path` 経由・文字列の `importlib`・
+`-m` 起動のどれでも当たる)。
 """
 
 from __future__ import annotations
@@ -16,8 +19,9 @@ import pathlib
 REPO = pathlib.Path(__file__).resolve().parents[1]
 NAME = "lib_state_store"
 
-#: 名前を出してよいファイル (repo 相対)。S2 では lib 自身だけ (テストと knowledge/ は走査の対象外)。
-ALLOWED_CALLERS = {"scripts/lib_state_store.py"}
+#: 名前を出してよいファイル (repo 相対)。テストと knowledge/ は走査の対象外。
+#: S3: plan.sh (queue の書き手)。ここに足すのは cutover (= ユーザー承認が要る PR) だけ。
+ALLOWED_CALLERS = {"scripts/lib_state_store.py", "scripts/plan.sh"}
 
 #: 走査する場所。**ディレクトリごと**で列挙しない (新しい書き手が増えても自動で対象になる)。
 SCAN_DIRS = ("scripts", "hooks", "agents", "config")
@@ -39,10 +43,11 @@ def _mentions(text: str) -> bool:
     return NAME in text
 
 
-def test_no_production_code_references_the_store_yet():
+def test_only_the_allowed_callers_reference_the_store():
     files = _candidates()
     scanned = 0
     offenders = []
+    seen_allowed = set()
     for p in files:
         try:
             text = p.read_text(errors="replace")
@@ -50,16 +55,22 @@ def test_no_production_code_references_the_store_yet():
             continue
         scanned += 1
         rel = p.relative_to(REPO).as_posix()
-        if _mentions(text) and rel not in ALLOWED_CALLERS:
-            offenders.append(rel)
+        if _mentions(text):
+            if rel in ALLOWED_CALLERS:
+                seen_allowed.add(rel)
+            else:
+                offenders.append(rel)
     # 空虚な PASS を防ぐ: 走査した件数を出す (scripts/ hooks/ の実ファイルが十分に入っている)
     assert scanned >= 60, f"走査したファイルが少なすぎる ({scanned} 件) — 検査が空になっていないか"
-    assert offenders == [], f"lib_state_store を呼ぶコードが増えた (S3 以降の cutover か確認): {offenders}"
+    assert offenders == [], f"lib_state_store を呼ぶコードが増えた (cutover か確認。ユーザー承認が要る): {offenders}"
+    # 許可表の行が死んでいない (plan.sh が使わなくなったのに表に残る = cutover が戻された、を見逃さない)
+    assert seen_allowed == ALLOWED_CALLERS, f"許可表にあるのに名前が出ないファイル: {ALLOWED_CALLERS - seen_allowed}"
 
 
-def test_the_allowed_caller_exists_and_the_detector_finds_each_way_of_calling_it():
+def test_the_allowed_callers_exist_and_the_detector_finds_each_way_of_calling_it():
     """陽性対照: 検出器が呼び方の全形を拾う (拾えないなら上のテストは何も守っていない)。"""
-    assert (REPO / "scripts/lib_state_store.py").is_file()
+    for rel in ALLOWED_CALLERS:
+        assert (REPO / rel).is_file(), rel
     samples = [
         "import lib_state_store",
         "from lib_state_store import transaction",
@@ -72,6 +83,14 @@ def test_the_allowed_caller_exists_and_the_detector_finds_each_way_of_calling_it
     for s in samples:
         assert _mentions(s), s
     assert not _mentions("import lib_task_cards")
+
+
+def test_plan_sh_imports_the_store_the_normal_way():
+    """plan.sh は `_load_scripts_module` (sys.modules に載せない) ではなく普通の import で読む。
+    lib は dataclass を持つので、sys.modules に無いと import 時に落ちる。"""
+    text = (REPO / "scripts" / "plan.sh").read_text()
+    assert "_import_scripts_module('lib_state_store')" in text
+    assert "_load_scripts_module('lib_state_store')" not in text
 
 
 def test_documents_that_describe_the_lib_are_not_counted_as_callers():

@@ -562,8 +562,8 @@ locked_update_json(path, lock_path, fn) -> dict  # 専用ロック + 読み直�
 
 ### 3.3 S2 (t008) で実装した形 — 設計との差分と、決めたこと
 
-`scripts/lib_state_store.py`。**呼び出し元ゼロ** (`tests/test_state_store_has_no_callers_yet.py` が
-`lib_state_store` の名前の出現で固定。S3 が plan.sh を移すときにその `ALLOWED_CALLERS` を更新する)。
+`scripts/lib_state_store.py`。S2 の時点では**呼び出し元ゼロ** (`lib_state_store` の名前の出現で固定。**S3 (§4.1) で plan.sh が
+唯一の呼び出し元になり**、テストは `tests/test_state_store_callers.py` に改名して許可表に plan.sh を足した)。
 
 - **`recover()` も S2 に入れた** (§3.1 は S4 の記述だったが、受入条件が「projection の再生成と食い違いの検出」
   を含む)。R-1〜R-4 と §2.5 の「報告のみ」・逆引き・所有の証拠の走査・`op=recover` の即時追記まで。
@@ -580,10 +580,12 @@ locked_update_json(path, lock_path, fn) -> dict  # 専用ロック + 読み直�
     (書き戻しも `InvalidName` で拒否 — 識別子はファイル名。不変条件 2)
   - `retire_assignment()` の削除失敗は**例外** (plan.sh の warn で握り潰す型を持たない)。本体 → identity の順
   - 監査ログの `detail` 欄は R-3 の「前回の残りの tNNN」用 (200 字で切る。task id・Worker 名だけを入れる)
-  - **直列化は plan.sh の写し** (S3 まで二重)。`tests/test_state_store_serialization_matches_plan_sh.py` が plan.sh の関数を
-    AST で取り出して同じ入力での出力一致を固定し、本物の plan.sh が書いた card / mission / state が lib で再直列化して
-    同じバイトになることも確かめる。**plan.sh の `dump_yaml` は渡された `key_order` の表に未知のキーを追記する**
-    (1 回で終わる CLI では無害・長く生きるプロセスでは表が育つ) — lib は表をコピーして汚さない (出力は同じ)
+  - **直列化は plan.sh の写し** (S2 の時点。**S3 で plan.sh のコピーは消え、lib が唯一の定義になった** §4.1)。
+    `tests/test_state_store_serialization_matches_plan_sh.py` は、S2 では plan.sh の関数を AST で取り出して出力の一致を固定していたが、
+    S3 以降は **cutover 前 (a1f6957) の plan.sh の出力を写した golden** との一致 + 「plan.sh にコピーが戻っていない」を固定する。
+    本物の plan.sh が書いた card / mission / state が lib で再直列化して同じバイトになることも確かめる。
+    **旧 plan.sh の `dump_yaml` は渡された `key_order` の表に未知のキーを追記する** (1 回で終わる CLI では無害・
+    長く生きるプロセスでは表が育つ) — lib は表をコピーして汚さない (出力は同じ)
   - 状態の語彙 (`_TERMINAL_STATUSES` 等) は S1 (t004) の `lib_task_status.py` 合流までの暫定コピー。HELD / DEAD は
     `lib_dep_rules` から取る (コピーしない)。**S1 が入ったら import に置き換える** (backlog)
 - **2 巡目 (t029 / PR #257 Codex P2 ×2) — 読めない入力を健全と報告しない・内容を出さない**
@@ -625,6 +627,129 @@ locked_update_json(path, lock_path, fn) -> dict  # 専用ロック + 読み直�
 | 書けないとき | **状態遷移は止めない**。stderr に `[plan.sh warn] audit log を書けませんでした (<path>: <errno>)` を 1 行、exit code は変えない。store-check が「audit log に書けない」を件数付きで出す | 止める案: 監査ログのディレクトリ 1 つの権限・容量の問題で**本番の全 plan.sh が止まる** —— 新しいガードの失敗状態が全体停止になる (族 C。memory `a-new-guard-creates-a-new-state`)。監査ログは正本ではなく回復にも使わない (§2.1) ので、欠けても状態は正しい。欠けたことは見える形で残す (黙って捨てない) |
 | crash で行が欠ける | コミット (正本の書き込み) の後・監査ログの前に落ちると 1 行欠ける。回復も同じく、修復の書き込みの後・その行の追記の前に落ちると 1 行欠ける (修復ごとに追記するので最大 1 行)。**許容し、ここに明記する** | 行を先に書く案: 起きなかった遷移の行が残る (こちらのほうが誤読を生む) |
 
+### 4.1 S3 (t012) で実装した形 — 設計との差・挙動が変わる箇所 (全部)・族の掃除・戻し方
+
+**これが最初の cutover** (R2: 呼び出し側を移す PR。plan.sh は主 checkout から直接実行されるので merge = 本番の挙動が変わる。
+merge 前にユーザー承認 = t015)。projection の作り直し (S4) はまだしない — **書き込みの経路を寄せるだけ**。
+
+**構造**
+- plan.sh は `lib_state_store` を**普通に import** する (`_import_scripts_module`)。既存の `_load_scripts_module` は
+  `sys.modules` に載せないので、dataclass (`Repair` / `Scope` / `Finding`) を持つ lib はそちらでは import 時に落ちる
+  (S3 で踏んだ。`tests/test_state_store_callers.py` が「`_load_scripts_module('lib_state_store')` ではない」を固定)
+- `with_lock(callback, nonblocking)` は `_STORE.transaction(QUEUE_DIR, op=<サブコマンド>, actor=…)` の薄い写しで、
+  名前・引数・呼ばれ方は前と同じ (`tests/test_task_graph.py` / `tests/test_plan_assignment_transaction.py` の AST 規約が
+  そのまま通る)。lib の例外は終了コードに写す: `LockBusy` → **4** (文面も前と同じ) / `LockFailed` → 前と同じ
+  `cannot open queue lock … hint:` / それ以外の `StoreError` → `[plan.sh] <1 行>` で exit 1。`die()` (`SystemExit`) で
+  抜けたら本体の監査ログの行は書かない (§4)
+- `save_task` / `save_mission` / `save_state` は `with_lock` の中の `Txn` (`_txn()`) に書く。**`with_lock` の外で呼ぶと
+  `RuntimeError`** (黙ってロック無しで書く経路を残さない)。`publish_assignment` / `retire_assignment` /
+  `classify_assignment` も `Txn` への委譲で、判定と書く順序 (identity → 本体 / 本体 → identity) は lib が唯一の定義
+- **plan.sh から消えたもの** (コピーを残さない = 原案 §14-7): `_atomic_write` の実装・`dump_yaml` / `_dump_kv` /
+  `_dump_scalar` / `_dump_inline` / `_NEEDS_QUOTE` / `serialize_frontmatter` / `TASK_META_KEY_ORDER` /
+  `MISSION_KEY_ORDER` / `save_state` の直列化 / `classify_assignment` の判定本体 / `_read_assignment_identity` /
+  assignment の `os.remove`。**名前だけ残るもの**: `_atomic_write` (= `_STORE.atomic_write_text` の別名。task-graph の
+  生成物 = queue の外を書く。`tests/task_graph_publisher_harness.py` がこの名前を差し替える)、`agent_name_problem` /
+  `ASSIGN_*` / `RESERVED_AGENT_SUFFIXES` / `IDENTITY_SUFFIX` (lib の値を名前で参照するだけ)
+- 監査ログの行 (`tests/test_plan_sh_state_store_cutover.py` が全 subcommand で固定): **1 トランザクション = 1 行**。card を書いた
+  トランザクションは card の行 (`from_status` = 書く直前にロックの中で読み直した status / `to_status` / `generation` =
+  card の `started_at`)。card を書かなかったもの (init・archive・review・launch・reap-orphan-assignment) は mission か
+  assignment の task を名指す行 1 つ (status 欄は null)。mission.yaml / state.yaml / assignments に書いたことは `files` に出る。
+  `actor` = pull は `--agent`、それ以外は `AGENT_NAME`、無ければ `unknown` (Director とデーモンは plan.sh から見分けられない —
+  推測で `director` と書かない。§4 の「無ければ director」は採らなかった)。Result・理由・本文は出さない (lib の門)
+
+**挙動が変わる箇所 (全部)** — 外から見える出力 (stdout / stderr / exit code / card・mission・state・assignment のバイト列) は
+固定 fixture 39 段で cutover 前と**同一** (`tests/test_plan_sh_compat_s3.py`。golden は a1f6957 の plan.sh で作った)。
+変わるのは次だけ:
+
+| 箇所 | 前 | 後 |
+|---|---|---|
+| 書き込みの耐久性 | tmp → fsync(file) → replace。**親 dir の fsync なし** (電源断で rename が失われうる) | tmp → fsync(file) → replace (unlink) → **fsync(親 dir)**。書き込み 1 回あたり fsync が 1 回増える |
+| tmp の名前 | `<path>.tmp.<pid>` (pid の再利用で衝突しうる) | 同じ dir の `.<name>.tmp.<random>` (先頭 `.` = `tNNN.md` の列挙に当たらない)。kill で残る残骸の名前が変わる (どちらも判定に使われない) |
+| 新規 / 既存ファイルの mode | 書くたびに `open(.., 'w')` = 新規は 0666 & ~umask | 新規は 0666 & ~umask (**§4.2 で訂正**: 初版は無条件 0644 で umask 077 が緩んだ)、既存ファイルの置き換えは元の mode を保つ |
+| 監査ログ | なし | `queue/audit/transitions-YYYYMMDD.jsonl` (dir も新設)。書けなくても遷移は止めず stderr に `[state-store warn] audit log を書けませんでした (<path>: <errno>)` |
+| 書けなかったときの見え方 (disk full・権限) | Python の traceback・exit 1 | `[plan.sh] <lib の 1 行>`・exit 1 (中身は同じ = 書けなかった) |
+| assignment 撤去の失敗 | warn して続行 | 同じ (warn の文言だけ `failed to remove <path>: <lib の文言>`)。lib は例外を投げるが plan.sh の `retire_assignment` が warn に写す — card は既に書き終えているので、ここで落とすと「card だけ進む」を自分で作る。残った枠は S4 の R-2 が拾う |
+| `_apply_risk_flags` (review の後の verification.mode 引き上げ) の card 書き込み | **ロックの外** | 1 回ごとに 1 つのトランザクション (ロック + 監査ログ)。読みはロックの前のまま。S5 で `_do_verdict` に統合してロックの外の読み書きを無くす |
+| 書く meta の `id` がファイル名と食い違う card | 書けた | `InvalidName` で拒否 (不変条件 2)。読み取り側は既に `[破損]` にするので、正常な経路では来ない |
+| `dump_yaml` の未知キー | 渡された表に**追記** (同じプロセスで 2 枚以上書くと 2 枚目の並びに影響しうる) | 表をコピーして汚さない。本番の card のキーは全部表にあるので出力は同じ (手編集で未知のキーを足した card だけ、2 枚目以降で並びが変わりうる) |
+| `state.yaml` / `mission.yaml` / card の親 dir の作成 | `os.makedirs` | lib の `_ensure_dir` (作った dir の親を fsync) |
+| **親 dir の fsync だけが失敗**したとき (tasks/ が `-wx` で開けない・EIO 等。置換 / 削除は済んでいる) | 親 dir の fsync をしないので気付かない (書き込みは成功) | **トランザクションの中では続行**: stderr に `[state-store warn] 親ディレクトリの fsync に失敗しました (<path>: <ERRNO>)`・監査ログの `detail` = `fsync_dir_failed:<ERRNO>`。落とさないのは、card を書いた後・assignment を書く前で止まる (= 割れたトランザクション) のを、耐久性を証明できなかっただけで自分で作らないため。**S2 の lib から変えた 1 点**: `StoreWriteError.committed` (置換 / 削除の後の失敗か) を足し、`Txn._write` / `_remove` だけが `committed` の `fsync_dir` を握る。`atomic_write_text` / `atomic_remove` を直接呼ぶ側は従来どおり例外。ディレクトリを**作った直後**の親の fsync の失敗 (まだ何も書いていない) は握らず例外のまま。発見の経緯: `tests/test_unobservable_is_not_empty.py` が tasks/ を `0o300` にして verify-result を打つと、修正前は通り、lib のままでは exit 1 になった |
+
+**互換性の証拠**: `tests/plan_sh_compat_scenario.py` が init / add / status / lint / pull (自動選択・busy の拒否) / needs-director /
+update --reset / done・fail (成功・二重・存在しない) / release-dep / ready-for-verification / verify-result / retire / reap-orphan-assignment /
+update (拒否を含む) / archive を 39 段打ち、exit code・stdout・stderr と、archive の直前・直後の queue の全ファイル (card 6 枚・mission・state・
+assignments) を正規化して比べる。**差 0**。直列化は `tests/fixtures/state_store_serialization_golden.json` (a1f6957 の関数の出力 47 件) との
+バイト一致で固定 (plan.sh の関数は消えたので、AST で取り出して比べる旧方式は使えない)。
+
+**族の掃除** (同じデータ・同じ判定を扱うコード全体を grep で数えた。数字は cutover 後の `scripts/` `hooks/`):
+
+| 族 | 数え方 | 件数 (前 → 後) | 処置 |
+|---|---|---|---|
+| queue のデータを**原子的に書く実装** (tmp + replace) | plan.sh の `_atomic_write` 呼び出し | 6 箇所 (card・mission・state・identity・assignment・task-graph) → **0 箇所の実装** (呼び出しは lib の 1 実装。task-graph の 1 箇所は名前の別名) | 寄せた。残りの書き手は下 |
+| `queue/.lock` を取る実装 | `flock` で `.lock` を開く | plan.sh `with_lock` + `lib_retirement.queue_transaction` (2) → lib `transaction` + `queue_transaction` (2) | plan.sh は lib へ。`queue_transaction` は nonblocking 専用の別実装 (§5.3 で「寄せない」)。**同じファイルを互いに排他する**ことをテスト (`test_plan_sh_transaction_excludes_the_retirement_queue_transaction`) で固定 |
+| 「この実行の assignment か」の判定 | `classify_assignment` 相当 | plan.sh (書く側) + `lib_retirement.assignment_execution_verdict` (読む側・watchdog) (2) → lib + `assignment_execution_verdict` (2) | plan.sh は lib へ。`assignment_execution_verdict` は**読み取り専用で、失敗の倒し方が違う** (watchdog は「殺さない側」に倒す。`classify` は「消さない側」)。1 つにすると向きが混ざるので寄せない。**backlog**: 世代照合の規則 (`mission` / `task` / `started_at` の一致) が 2 か所にあること — S4 で両方を触るときに揃える |
+| Worker 名がファイル名として使えるか | `agent_name_problem` | plan.sh + `lib_worker_target.py` (別の記録 dir) (2) → lib + `lib_worker_target.py` (2) | plan.sh は lib へ (定義 1 か所)。`lib_worker_target` は `registry/workers/<name>/` 用で別の予約 suffix・別の dir。**backlog** (規則の共有は 01b で TARGET_DIR を触るときに) |
+| card / mission / state の**直列化** | `dump_yaml` 系 | plan.sh + lib (2) → lib (1) + `verifier-dispatcher.sh` の `_dump_scalar` (1) | plan.sh のコピーを消した。`verifier-dispatcher.sh` は S5 で `plan.sh verifying` に置き換える (§5.1) |
+| queue の card / mission / state / assignment を書く**plan.sh 以外**の書き手 | `open(..,'w')` / `os.replace` / `touch` | verifier-dispatcher (`update_task_fields`)・hooks/pre-compact.sh・benchmark-ctx.sh (`.restarting` の touch) (3) → 同じ 3 | **S5 / 寄せない** (§5.1 の表どおり)。S3 では触らない |
+| plan.sh に**残る**書き込み (queue / registry / worktree) | `open(..,'w'\|'a')` / `shutil.move` / `os.replace` / `os.remove` / `os.unlink` / `os.makedirs` / `_atomic_write` | 25 行 | すべて理由付きで残す (内訳): **task-graph 8** (registry/task-graph の lock 用 dir + open 4・pending 印 3・生成物 `_atomic_write` 1 — 再生成物。§5.3)・**queue の dir 作成 6** (`with_lock` の queue dir・init の missions / archive・init --force の archive dir・tasks dir・archive の archive dir。**§4.2 で lib の `ensure_dir` (作成 + 親 fsync) に通した — 「実害の無い重複」は誤りだった**)・**taskvia map 2** (S5 の `locked_update_json`)・**mission dir 全体の rename `shutil.move` 2** (init --force の退避と archive — 1 ファイルの原子的書き込みではない。途中で落ちた側は S4 の R-4 が拾う)・**`.crewvia-env` 1** (S5)・**knowledge への追記 3** (queue の外)・**worker settings の `os.remove` 1** (worktree)・**`plan_review.verdict` の `os.remove` 1** (review-plan.sh と対の 1 者。§5.1 で寄せない)・**handoff の O_EXCL 確保 + `os.replace` 1** (§5.3 で既に安全な形) |
+| 監査ログを出す subcommand | `QUEUE_MUTATING_SUBCOMMANDS` 15 個 | 0 → 13 個を実走で確認 + 2 個 (review / launch は claude を起動するので構造 (`with_lock` を通る) で確認) | `tests/test_plan_sh_state_store_cutover.py` |
+
+**赤の実証** (修正前 = a1f6957 の plan.sh に、この PR のテストだけを足したコピーで走らせた。`PYTHONDONTWRITEBYTECODE=1`・`__pycache__` 無し):
+この PR で足した / 書き換えた 4 ファイル (`test_plan_sh_state_store_cutover.py` / `test_plan_sh_compat_s3.py` / `test_state_store_callers.py` /
+`test_state_store_serialization_matches_plan_sh.py`) の 79 件中 **15 件が赤・64 件が緑**。赤は (1) 監査ログ 5 件 (行が無い・秘密が出ない検査の前提・トランザクション外の書き込みの拒否・audit 書けなくても遷移が完了・拒否は行を書かない)、
+(2) **親 dir の fsync の順序 5 件** (card / mission / state / assignment 公開 / 撤去 — `os.fsync` / `os.replace` / `os.unlink` を記録するスタブで
+「tmp の fsync → replace → 親 dir の fsync」を検出。修正前は 3 つ目が無い)、(3) 「親 dir の fsync の時点で kill」2 件 (修正前はその点が存在しない)、
+(4) 構造 3 件 (plan.sh が lib を呼ばない・直列化のコピーが plan.sh に残っている)。緑の 64 件は互換性テスト (golden が修正前の出力なので当然緑 — 退行の留め金)・
+lib 自身のテスト・「replace の前に kill しても元のカードが残る」(修正前も atomic replace なので緑 — 親 dir の fsync の欠陥は kill では再現しない、Director 追記のとおり)。
+
+**戻し方**: PR revert → `scripts/sync-main-checkout.sh` (ff とデーモン restart)。plan.sh は 1 回で終わる CLI なので、ff した次の呼び出しから旧コードに戻る
+(dispatcher / watchdog は plan.sh を subprocess で呼ぶだけで lib を import しない)。**card・mission・state・assignment は 1 バイトも書き換えていない**ので、
+戻しても旧コードがそのまま読める。`queue/audit/` は残ってよい (読み手がいない)。env の停止スイッチは付けない (不変条件 5)。
+S4 以降が merge 済みなら、先にそちらを revert する (依存の向きが逆)。
+
+### 4.2 S3 fix 2 巡目 (t032 / PR #258 Codex P2 ×2)
+
+**P2-1 init が dir を lib の外で作り fsync を飛ばす**: `cmd_init` の `os.makedirs(missions/<slug>/tasks)` は fsync しない。lib の `_ensure_dir` は
+既存 dir なら即 return するので、その後の card / mission.yaml の書き込みでも `missions/` は fsync されず、電源断で `<slug>` のエントリごと
+消えて state.yaml だけが mission を参照する。→ lib に公開の `ensure_dir(path)` (作成 + 作った各 dir の親の fsync) を足し、plan.sh の
+queue の下の dir 作成 (`_ensure_queue_dirs`・init --force の archive dir・tasks dir・archive の archive dir・`with_lock` の queue dir) を
+すべて `_durable_makedirs` → `ensure_dir` に通した。前の §4.1 の「実害の無い重複」は誤りだった (訂正)。
+
+**P2-2 新規ファイルが umask を無視して 0644**: 旧 `open(.., 'w')` は `0666 & ~umask` (umask 077 なら 0600)。lib は新規を無条件 0644 にしていた。
+→ 新規は `0666 & ~umask` (明示の `mode=` があればそれ)、既存の置き換えは元の mode を保つ。lock (`O_CREAT` の 0o644) と監査ログも 0o666 に
+して umask に従わせた (旧 lock は `open('a+')` = 0666 & ~umask)。
+
+**族の掃除 (1) queue の下の dir / ファイルの作成 (plan.sh + lib_state_store を grep)**
+
+| 作る場所 | 作り方 | queue の下の durable な経路か |
+|---|---|---|
+| plan.sh の queue の dir (`with_lock` の queue dir / missions / archive / tasks / init --force と archive の archive dir) 6 | 以前 `os.makedirs` → **`ensure_dir`** | ✔ (修正) |
+| plan.sh `task_graph_pending_lock` / `acquire_task_graph_lock` / `_mark_task_graph_pending` の `os.makedirs` 3 | registry/task-graph (queue の外・再生成物) | 対象外。`tests/test_plan_sh_s3_fix2.py` の allowlist に理由付き |
+| plan.sh `_append_knowledge_director` の `os.makedirs` 1 | knowledge/ (queue の外) | 対象外 (同 allowlist) |
+| lib の `_ensure_dir` (atomic_write_text / transaction / 監査ログ / locked_update_json の親 dir) | `os.mkdir` + 親 fsync | ✔ |
+| lib の `.lock` (`os.open O_CREAT`)・監査ログ (`os.open O_APPEND|O_CREAT`) の**ファイル自体の作成** | 作成後に親 dir を fsync しない | 正本でない (lock は空ファイルで再作成可能・監査ログは §4「欠けても状態は正しい」)。mode は umask に従うよう修正 |
+| lib の tmp (`mkstemp`) | 置換前に消えるか残骸 (§3.3) | 対象外 (判定に使われない) |
+| plan.sh の `open(..,'w'|'a')` (task-graph pending 印・taskvia map 2・`.crewvia-env`・knowledge 2) と handoff の `os.open O_EXCL` | queue の card / mission / state ではない | S5 / 寄せない (§4.1 の表)。mode は従来どおり `open()` = umask |
+| mission dir 全体の `shutil.move` 2 (init --force の退避・archive) | rename。移動後の親 dir の fsync なし | 未対応 (S4 の R-4 が途中で落ちた側を拾う。1 ファイルの原子的書き込みではない) |
+
+**族の掃除 (2) mode の比較 (S3 前 a1f6957 / P2 修正前 = PR #258 の head / 修正後。init → add → pull を実走して `stat`)**
+
+| 対象 | umask 022: 前 / 修正前 / 後 | umask 077: 前 / 修正前 / 後 |
+|---|---|---|
+| state.yaml・mission.yaml・card・assignment・identity | 644 / 644 / 644 | 600 / **644** / 600 |
+| `.lock` | 644 / 644 / 644 | 600 / 600 / 600 |
+| `audit/transitions-*.jsonl` (新設) | - / 644 / 644 | - / 600 / 600 |
+| dir (missions/<slug>・tasks/・assignments/) | 755 / 755 / 755 | 700 / 700 / 700 |
+
+修正前に壊れていたのは umask 077 の 5 種のファイルだけ (0600 が 0644 に緩んでいた = 退行)。既存 card の置き換えは chmod 済みの 0640 を保つ
+(`update` を umask 002 で打っても 0640 のまま)。
+
+**赤の実証** (PR #258 の head + この修正のテストだけのコピー): `tests/test_plan_sh_s3_fix2.py` 7 件中 6 件が赤 (init の後に `missions/` の fsync が
+呼ばれない・`os.makedirs` が plan.sh に残る・umask 077 の card が 0644・lib に `ensure_dir` が無い・陽性対照 2)。緑の 1 件は umask 022
+(前後で同じ 644 なので退行が見えない — 077 の行が本体)。t012 の赤の実証・互換性テストは引き続き PASS。
+
+**戻し方**: §4.1 と同じ (PR revert → `scripts/sync-main-checkout.sh`)。この修正は lib の `ensure_dir` の追加と mode の決め方だけで、card の中身は変わらない。
+
 ---
 
 ## 5. 全書き手の一覧 (S3 / S5)
@@ -634,6 +759,9 @@ locked_update_json(path, lock_path, fn) -> dict  # 専用ロック + 読み直�
 `os.replace` / `os.remove` / `unlink` / `>` `>>` / `touch` / `mkdir -p` を列挙し、書き先が queue/ か registry/ のものを残した。
 
 ### 5.1 queue/
+
+(**S3 (t012) で済んだ行**: `tasks/tNNN.md` の plan.sh の各コマンド・`mission.yaml`・`state.yaml`・`assignments/<agent>` / `.identity`・
+`audit/*.jsonl`。行番号は e6d6801 のもの。`_apply_risk_flags` は S3 でロックの中の 1 write に寄ったが、読みがロックの外に残るので S5 の行は変えない)
 
 | ファイル | 書き手 (行) | ロック | 原子性 | 01a | 理由 |
 |---|---|---|---|---|---|

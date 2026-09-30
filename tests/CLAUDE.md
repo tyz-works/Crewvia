@@ -53,6 +53,17 @@ root の `CLAUDE.md` から移した、テスト専用の規則。設計と経�
 - 並行は**独立プロセス**（`tests/state_store_worker.py`）・実 flock。mock のロックで済ませない。
 - red proof は `tests/red_proof_t008.sh`（lib の保証を 1 つずつ壊した複製）。**壊した複製は `scripts/` `tests/` だけを写し、
   本番の worktree・queue には触れない**。約 4 分。
+- **plan.sh の cutover（S3 / t012）のテスト**: `tests/test_plan_sh_state_store_cutover.py`（監査ログ・親 dir fsync の順序・kill・
+  `queue/.lock` の共存）。plan.sh の python 本体を `tests/task_graph_publisher_harness.load_plan_namespace()` で
+  **本物のまま**名前空間に読み込み、本番の `with_lock` / `save_task` 等を呼ぶ。親 dir の fsync は kill では再現しない
+  （電源断相当が要る）ので、`os.fsync` / `os.replace` / `os.unlink` を記録するスタブ（`Recorder`）で
+  「tmp の fsync → replace → 親 dir の fsync」の**有無と順序**を見る（陽性対照: 旧 `_atomic_write` の形を通すと述語が満たされない）。
+- **互換性テスト**: `tests/test_plan_sh_compat_s3.py` が `tests/plan_sh_compat_scenario.py`（固定 fixture の 39 段）を今の plan.sh で走らせ、
+  golden（`tests/fixtures/plan_sh_compat_s3.golden.json`。**cutover 前 a1f6957 の plan.sh で作った**）と exit code / stdout / stderr /
+  queue の全ファイルを比べる。外から見える挙動を**意図して**変えたら、`knowledge/state-store.md` §4.1 の表に足してから golden を作り直す
+  （作り直し: `git archive <旧 sha> | tar -x -C <dir>` → `python3 tests/plan_sh_compat_scenario.py <dir> <golden>`）。
+  監査ログ（`queue/audit/`）と `.lock` は比べない。直列化の golden は `tests/fixtures/state_store_serialization_golden.json`
+  （JSON の `sort_keys` を使わない — meta の key の並びが出力に効く）。
 
 ## 子プロセスを残さない（`tests/leaked_descendants.py` / `tests/proc_group.py`）
 

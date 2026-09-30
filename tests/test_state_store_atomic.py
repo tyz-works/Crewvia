@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import errno
+import json
 import os
 import stat
 
@@ -218,3 +219,90 @@ def test_write_into_unwritable_directory_is_an_error_not_a_silent_false(tmp_path
             store.atomic_write_text(d / "a", "x")
     finally:
         os.chmod(d, 0o700)
+
+
+# ---------------------------------------------------------------------------
+# S3 (t012): 親 dir の fsync だけが失敗したとき — 直接呼ぶ側には例外、トランザクションの中では割らずに続行
+# ---------------------------------------------------------------------------
+
+def _dir_fsync_fails(monkeypatch, err=errno.EIO):
+    real = os.fsync
+
+    def fail_on_dir(fd):
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError(err, "io")
+        return real(fd)
+    monkeypatch.setattr(store, "_sys_fsync", fail_on_dir)
+
+
+def test_direct_callers_see_committed_true_after_replace(tmp_path, monkeypatch):
+    p = tmp_path / "a"
+    p.write_text("old")
+    _dir_fsync_fails(monkeypatch)
+    with pytest.raises(store.StoreWriteError) as ei:
+        store.atomic_write_text(p, "new")
+    assert ei.value.op == "fsync_dir" and ei.value.committed is True
+    assert p.read_text() == "new"                       # 置換は済んでいる
+
+    q = tmp_path / "b"
+    q.write_text("x")
+    with pytest.raises(store.StoreWriteError) as ei2:
+        store.atomic_remove(q)
+    assert ei2.value.committed is True and not q.exists()
+
+
+def test_a_dir_created_for_the_write_failing_to_sync_is_not_committed(tmp_path, monkeypatch):
+    """ディレクトリを作った直後の親 dir の fsync の失敗は、まだ何も書いていない (committed=False)。
+    トランザクションはこれを**握り潰さない** (書かれていないファイルを書いたことにしない)。"""
+    _dir_fsync_fails(monkeypatch)
+    with pytest.raises(store.StoreWriteError) as ei:
+        store.atomic_write_text(tmp_path / "newdir" / "a", "x")
+    assert ei.value.op == "fsync_dir" and ei.value.committed is False
+    assert not (tmp_path / "newdir" / "a").exists()
+
+    queue = tmp_path / "q"
+    with pytest.raises(store.StoreWriteError):
+        with store.transaction(queue, op="t", actor="test") as t:
+            t.write_state({"active_missions": [], "default_mission": None})
+    assert not (queue / "state.yaml").exists()
+
+
+def test_transaction_continues_when_only_the_parent_dir_fsync_fails(tmp_path, monkeypatch):
+    """card を書いた後・assignment を書く前で止まる = 割れたトランザクションを、耐久性を証明できなかった
+    だけで作らない。全部書いて、警告と監査ログの detail に残す。"""
+    queue = tmp_path / "q"
+    with store.transaction(queue, op="seed", actor="test") as t:      # 先に dir を作っておく (fsync が要らない)
+        t.write_state({"active_missions": ["m"], "default_mission": "m"})
+        t.write_card("m", "t001", state_scenarios_card("t001"), "b\n")
+        t.publish_assignment("Other", "m", "t009", "G0")                 # assignments/ も先に作る
+        t.record("m", "t001", None, "pending")                           # audit/ も先に作る
+    _dir_fsync_fails(monkeypatch)
+    with store.transaction(queue, op="pull", actor="Haruto") as t:
+        meta, body = t.load_card("m", "t001")
+        meta.update(status="in_progress", worker="Haruto", started_at="G1")
+        t.write_card("m", "t001", meta, body)
+        t.publish_assignment("Haruto", "m", "t001", "G1")
+        t.record("m", "t001", "pending", "in_progress", generation="G1")
+    assert t.durability_failures and set(t.durability_failures) == {"EIO"}
+    assert "in_progress" in (queue / "missions" / "m" / "tasks" / "t001.md").read_text()
+    assert (queue / "assignments" / "Haruto").read_text() == "m:t001\n"           # 割れていない
+    assert (queue / "assignments" / "Haruto.identity").is_file()
+    row = [json.loads(l) for f in sorted((queue / "audit").glob("*.jsonl")) for l in f.read_text().splitlines()][-1]
+    assert row["op"] == "pull" and row["detail"] == "fsync_dir_failed:EIO"
+
+
+def state_scenarios_card(tid):
+    return {"id": tid, "title": "t", "skills": ["code"], "status": "pending", "worker": None, "started_at": None}
+
+
+def test_transaction_retire_continues_when_only_the_parent_dir_fsync_fails(tmp_path, monkeypatch, capfd):
+    queue = tmp_path / "q"
+    with store.transaction(queue, op="seed", actor="test") as t:
+        t.write_card("m", "t001", state_scenarios_card("t001"), "b\n")
+        t.publish_assignment("Haruto", "m", "t001", "G1")
+    _dir_fsync_fails(monkeypatch)
+    with store.transaction(queue, op="retire", actor="test") as t:
+        assert t.retire_assignment("Haruto", "m", "t001", None) == "mine"
+    assert not (queue / "assignments" / "Haruto").exists()
+    assert not (queue / "assignments" / "Haruto.identity").exists()
+    assert "親ディレクトリの fsync に失敗しました" in capfd.readouterr().err

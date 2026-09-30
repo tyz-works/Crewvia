@@ -410,6 +410,26 @@ _TASK_STATUS = _load_scripts_module('lib_task_status')
 TASK_STATUSES = _TASK_STATUS.TASK_STATUSES
 TERMINAL_STATUSES = _TASK_STATUS.TERMINAL_STATUSES
 
+# queue への**書き込み**は lib_state_store.py の 1 か所 (vNext 01a S3)。ロック (`queue/.lock`)・
+# 原子的な書き込み (tmp → fsync → replace → **親 dir の fsync**)・直列化・監査ログ
+# (`queue/audit/transitions-YYYYMMDD.jsonl`)・assignment の公開 / 撤去の判定がここに集まる。
+# plan.sh に同じ処理のコピーを戻さないこと (原案 §14-7)。読み取りは lib_task_cards.py。
+# 普通に import する (`_load_scripts_module` は sys.modules に載せないので、dataclass を持つ
+# lib はそちらでは読めない)。
+def _import_scripts_module(name):
+    import importlib
+    scripts_dir = os.path.join(REPO_ROOT, 'scripts')
+    if scripts_dir not in sys.path:
+        sys.path.insert(0, scripts_dir)
+    return importlib.import_module(name)
+
+
+_STORE = _import_scripts_module('lib_state_store')
+#: task-graph の生成物 (registry/task-graph/tasks.json。queue の外) を書く関数。plan.sh 自身は
+#: 書き込みの実装を持たない (同じ関数を別名で呼ぶだけ)。tests/task_graph_publisher_harness.py が
+#: この名前を差し替える。
+_atomic_write = _STORE.atomic_write_text
+
 # Pseudo-status for a task file that failed to parse (see lib_task_cards). Never
 # 'pending', so pull/dispatch skip it automatically; never in
 # TERMINAL_STATUSES, so a mission with a corrupted task is never mistaken for
@@ -466,103 +486,13 @@ def now_generation():
 
 
 # ---------------------------------------------------------------------------
-# Minimal YAML helpers (narrow subset, no external deps)
-# ---------------------------------------------------------------------------
-
-def dump_yaml(data, key_order=None):
-    """Serialize a flat dict (with optional list values) to YAML."""
-    lines = []
-    keys = key_order if key_order else list(data.keys())
-    # Append any keys not in key_order
-    if key_order:
-        for k in data.keys():
-            if k not in keys:
-                keys.append(k)
-    for k in keys:
-        if k not in data:
-            continue
-        v = data[k]
-        lines.append(_dump_kv(k, v))
-    return '\n'.join(lines) + '\n'
-
-
-def _dump_kv(key, val):
-    if val is None:
-        return f"{key}: null"
-    if isinstance(val, bool):
-        return f"{key}: {'true' if val else 'false'}"
-    if isinstance(val, int):
-        return f"{key}: {val}"
-    if isinstance(val, dict):
-        lines = [f"{key}:"]
-        for k, v in val.items():
-            lines.append(f"  {k}: {_dump_inline(v)}")
-        return '\n'.join(lines)
-    if isinstance(val, list):
-        if not val:
-            return f"{key}: []"
-        # Always inline — our lists are short (skills, blocked_by)
-        items = ', '.join(_dump_inline(x) for x in val)
-        return f"{key}: [{items}]"
-    return f"{key}: {_dump_scalar(str(val))}"
-
-
-_NEEDS_QUOTE = set(':#[]{},\'"\n&*!|>%@`')
-
-
-def _dump_scalar(s):
-    if s == '':
-        return '""'
-    if '\n' in s or '\r' in s:
-        # A raw embedded newline breaks the line-oriented parse_yaml above no
-        # matter how it's quoted (this hand-rolled parser has no block-scalar
-        # support), so a value like a multi-line needs-director reason would
-        # get written as a literal newline inside a quoted scalar and corrupt
-        # the whole file the moment it's read back (t009: took down
-        # `plan.sh status` and dispatch for the entire mission). Collapse
-        # line breaks to keep every frontmatter value on one line — callers
-        # that want to preserve the full text should put it in the task body
-        # instead (see cmd_needs_director's use of split_long_freeform).
-        #
-        # Drop trailing newline(s) first: values captured from a bash command
-        # substitution routinely carry one, and collapsing it along with any
-        # embedded ones would otherwise leave a dangling " / " at the end
-        # (t013 P3 fix — e.g. "QA FAIL: xxx\n" became "QA FAIL: xxx / ").
-        s = re.sub(r'(?:\r\n|\r|\n)+$', '', s)
-        s = re.sub(r'\r\n|\r|\n', ' / ', s)
-    if any(ch in _NEEDS_QUOTE for ch in s):
-        escaped = s.replace('\\', '\\\\').replace('"', '\\"')
-        return f'"{escaped}"'
-    if s.lower() in ('true', 'false', 'null', 'yes', 'no', '~'):
-        return f'"{s}"'
-    if re.fullmatch(r'-?\d+', s):
-        return f'"{s}"'
-    return s
-
-
-def _dump_inline(val):
-    if val is None:
-        return 'null'
-    if isinstance(val, bool):
-        return 'true' if val else 'false'
-    if isinstance(val, int):
-        return str(val)
-    # Strings: delegate to _dump_scalar so reserved-word / int-shaped strings
-    # ('true', '123', etc.) are preserved through the YAML round-trip.
-    return _dump_scalar(str(val))
-
-
-# ---------------------------------------------------------------------------
 # Frontmatter helpers (.md task files)
 # ---------------------------------------------------------------------------
-
-TASK_META_KEY_ORDER = [
-    'id', 'title', 'skills', 'priority', 'status',
-    'blocked_by', 'released_deps', 'timeout', 'target_dir', 'worker', 'started_at', 'completed_at',
-    'handoff_path', 'fail_head', 'fail_head_waiver', 'pr_number', 'no_pr_waiver', 'deliverable',
-    'acceptance_criteria', 'verification', 'rework_count', 'max_rework',
-    'qa_checkpoints', 'required_evidence', 'needs_director_reason',
-]
+#
+# 直列化 (dump_yaml / serialize_frontmatter / state.yaml の書き方) は
+# lib_state_store.py にある —— queue への書き込みの唯一の入口 (vNext 01a S3)。
+# ここに同じ規則のコピーを戻さないこと (原案 §14-7 二重実装の禁止)。
+# 読み取りの parser は lib_task_cards.py。
 
 TASK_META_DEFAULTS = {
     'acceptance_criteria': None,
@@ -570,13 +500,6 @@ TASK_META_DEFAULTS = {
     'rework_count': 0,
     'max_rework': 3,
 }
-
-
-def serialize_frontmatter(meta, body):
-    yaml_text = dump_yaml(meta, key_order=TASK_META_KEY_ORDER)
-    if not body.endswith('\n'):
-        body = body + '\n'
-    return f"---\n{yaml_text}---\n\n{body}"
 
 
 def parse_task_body(body):
@@ -705,42 +628,11 @@ def load_state():
     return data
 
 
-def _atomic_write(path, text):
-    """Write text to path via tmp + os.replace, with fsync, so a crash mid-write
-    cannot leave a half-written file behind. The caller is responsible for
-    holding any necessary lock."""
-    os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
-    tmp = f"{path}.tmp.{os.getpid()}"
-    try:
-        with open(tmp, 'w') as f:
-            f.write(text)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, path)
-    except BaseException:
-        # Best-effort cleanup; never mask the original exception.
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
-
-
 def save_state(state):
-    out = {
-        'active_missions': state.get('active_missions', []) or [],
-        'default_mission': state.get('default_mission'),
-    }
-    # active_missions as block list for readability
-    lines = []
-    if out['active_missions']:
-        lines.append('active_missions:')
-        for slug in out['active_missions']:
-            lines.append(f"  - {_dump_inline(slug)}")
-    else:
-        lines.append('active_missions: []')
-    lines.append(_dump_kv('default_mission', out['default_mission']))
-    _atomic_write(STATE_FILE, '\n'.join(lines) + '\n')
+    """state.yaml を書く。`with_lock()` の中でだけ呼べる (lib_state_store の Txn 経由)。"""
+    txn = _txn()
+    txn.write_state(state)
+    _AUDIT_OTHER_ROWS.append((None, None))
 
 
 def mission_dir(slug):
@@ -758,9 +650,6 @@ def tasks_dir(slug):
 def task_path(slug, task_id):
     return os.path.join(tasks_dir(slug), f"{task_id}.md")
 
-
-MISSION_KEY_ORDER = ['title', 'slug', 'status', 'created_at', 'completed_at', 'next_task_id', 'max_review_cycles',
-                     'deliverable_required', 'review']
 
 #: task の成果物の宣言 (`--deliverable`)。lint_plan.py の VALID_DELIVERABLES と同じ集合。
 DELIVERABLE_VALUES = ('pr', 'file', 'none')
@@ -838,8 +727,10 @@ def load_mission(slug):
 
 
 def save_mission(slug, data):
-    os.makedirs(mission_dir(slug), exist_ok=True)
-    _atomic_write(mission_yaml_path(slug), dump_yaml(data, key_order=MISSION_KEY_ORDER))
+    """mission.yaml を書く。`with_lock()` の中でだけ呼べる。"""
+    txn = _txn()
+    txn.write_mission(slug, data)
+    _AUDIT_OTHER_ROWS.append((slug, None))
 
 
 def _load_task_from_path(path):
@@ -861,8 +752,21 @@ def load_task(slug, task_id):
 
 
 def save_task(slug, task_id, meta, body):
-    os.makedirs(tasks_dir(slug), exist_ok=True)
-    _atomic_write(task_path(slug, task_id), serialize_frontmatter(meta, body))
+    """task card を書く。`with_lock()` の中でだけ呼べる。
+
+    監査ログの `from_status` は**書く直前にロックの中で読み直した**カードの status
+    (無い・読めない = None)。`to_status` は書いた status。Result / 理由 / 本文は記録しない。
+    """
+    txn = _txn()
+    try:
+        prev_meta, _prev_body = txn.load_card(slug, task_id)
+        from_status = prev_meta.get('status')
+    except _STORE.StoreError:
+        from_status = None
+    txn.write_card(slug, task_id, meta, body)
+    txn.record(slug, task_id, from_status, meta.get('status'),
+               generation=meta.get('started_at'))
+    _AUDIT_TASK_ROWS.append(task_id)
 
 
 def list_tasks(slug, base_dir=None, quiet=False):
@@ -1911,8 +1815,40 @@ def maybe_refresh_task_graph(subcommand):
 LOCK_BUSY = 4
 
 
+#: いま開いているトランザクション (`lib_state_store.Txn`)。`with_lock()` の間だけ入る。
+_TXN = None
+#: このトランザクションで書いた task card / それ以外 (mission.yaml・state.yaml・assignment) の行の候補。
+#: 監査ログは 1 トランザクション = 1 遷移の行にしたいので、card を書いたトランザクションでは
+#: card の行だけ (mission.yaml / state.yaml / assignment は `files` に出る)。card を書かなかった
+#: トランザクション (init / review / launch / reap-orphan-assignment など) では、
+#: task を名指す候補 (assignment) があればそれ、無ければ mission の行を 1 つ出す。
+_AUDIT_TASK_ROWS = []
+_AUDIT_OTHER_ROWS = []
+
+
+def _txn():
+    """queue へ書くコードが使う Txn。`with_lock()` の外で書こうとしたら実装の誤り —— 黙って
+    ロック無しで書かず、その場で落とす (書き込みは全部トランザクションの中、が規約)。"""
+    if _TXN is None:
+        raise RuntimeError(
+            "queue への書き込みは with_lock() の中でだけ行う (lib_state_store の transaction)")
+    return _TXN
+
+
+def audit_actor():
+    """監査ログの `actor`。AGENT_NAME (Worker) が無ければ 'unknown' —— Director と
+    デーモンは plan.sh から見分けられないので、推測で 'director' と書かない。"""
+    return os.environ.get('AGENT_NAME') or 'unknown'
+
+
 def with_lock(callback, nonblocking=False):
     """キューロックの下で callback を実行する。
+
+    ロックは lib_state_store.transaction() が取る (`queue/.lock`。lib_retirement の
+    queue_transaction と同じファイル)。callback が例外なしで終われば、その中で
+    `save_task` / `save_mission` / `save_state` が積んだ監査ログの行を**ロックを離す前に**
+    追記する。`die()` (SystemExit) や例外で抜けたときは本体の行を書かない
+    (knowledge/state-store.md §4)。
 
     nonblocking=True は「待てない呼び出し側」専用の取得方法である。
     watchdog の retirement は監視ループの中から plan.sh を同期で呼ぶので、
@@ -1920,36 +1856,44 @@ def with_lock(callback, nonblocking=False):
     (marker 1 件につき subprocess timeout まで)。デーモンにとっては
     「取れなければ次のサイクルで」の方が正しく、待つ価値のある仕事が無い。
     取れなかった場合は exit LOCK_BUSY で返り、1 バイトも書かない。
+
+    lib の例外は終了コードに写す: LockBusy → LOCK_BUSY (4)、それ以外の StoreError → 1。
     """
+    global _TXN
     try:
-        os.makedirs(QUEUE_DIR, exist_ok=True)
-    except OSError as e:
+        _STORE.ensure_dir(QUEUE_DIR)
+    except _STORE.StoreError as e:
         die(f"cannot create queue dir {QUEUE_DIR}: {e}")
     try:
-        lf = open(LOCK_FILE, 'a+')
-    except OSError as e:
+        with _STORE.transaction(QUEUE_DIR, op=SUBCOMMAND, actor=audit_actor(),
+                                nonblocking=nonblocking) as txn:
+            _TXN = txn
+            del _AUDIT_TASK_ROWS[:], _AUDIT_OTHER_ROWS[:]
+            try:
+                result = callback()
+                if not _AUDIT_TASK_ROWS and _AUDIT_OTHER_ROWS:
+                    rows = (
+                        [row for row in _AUDIT_OTHER_ROWS if row[1]]
+                        or [row for row in _AUDIT_OTHER_ROWS if row[0]]
+                        or _AUDIT_OTHER_ROWS
+                    )
+                    txn.record(rows[0][0], rows[0][1], None, None)
+                return result
+            finally:
+                _TXN = None
+    except _STORE.LockBusy:
         die(
-            f"cannot open queue lock {LOCK_FILE}: {e}\n"
+            f"[plan.sh] queue lock {LOCK_FILE} is held by another process "
+            f"— --no-wait なので待たずに諦めました (何も変更していません)",
+            LOCK_BUSY,
+        )
+    except _STORE.LockFailed as e:
+        die(
+            f"{e}\n"
             f"  hint: check write permission on {QUEUE_DIR}, or remove a stale lock file."
         )
-    try:
-        if nonblocking:
-            try:
-                fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except OSError:
-                die(
-                    f"[plan.sh] queue lock {LOCK_FILE} is held by another process "
-                    f"— --no-wait なので待たずに諦めました (何も変更していません)",
-                    LOCK_BUSY,
-                )
-        else:
-            fcntl.flock(lf, fcntl.LOCK_EX)
-        try:
-            return callback()
-        finally:
-            fcntl.flock(lf, fcntl.LOCK_UN)
-    finally:
-        lf.close()
+    except _STORE.StoreError as e:
+        die(f"[plan.sh] {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -1975,38 +1919,28 @@ def with_lock(callback, nonblocking=False):
 # 隣にファイルが増えても影響しない (<agent>.restarting という先例がある)。
 
 ASSIGNMENTS_DIR = os.path.join(QUEUE_DIR, 'assignments')
-IDENTITY_SUFFIX = '.identity'
+IDENTITY_SUFFIX = _STORE.IDENTITY_SUFFIX
 
 #: 「前提が外れたので 1 バイトも書かなかった」を表す終了コード。
 #: 0 (書いた) とも 1 (plan.sh 側の異常 → 呼び出し側はリトライすべき) とも
 #: 区別できるようにしてあるので、呼び出し側は保留に倒せる。
 PRECONDITION_UNMET = 3
 
-# classify_assignment() の判定結果。撤去してよいのは ASSIGN_MINE だけ。
-ASSIGN_MINE = 'mine'                  # この実行が公開した assignment
-ASSIGN_ABSENT = 'absent'              # そもそも公開されていない
-ASSIGN_OTHER_TASK = 'other_task'      # 別の task を指している
-ASSIGN_SUCCESSOR = 'successor'        # 同じ task の別の実行 (後任) のもの
-ASSIGN_UNVERIFIABLE = 'unverifiable'  # 世代を読めない (旧形式 / 破損)
-
+# classify_assignment() の判定結果。撤去してよいのは ASSIGN_MINE だけ。語彙と判定は
+# lib_state_store (vNext 01a S3) が持つ。ここは同じ値を名前で参照するだけ。
+ASSIGN_MINE = _STORE.ASSIGN_MINE                  # この実行が公開した assignment
+ASSIGN_ABSENT = _STORE.ASSIGN_ABSENT              # そもそも公開されていない
+ASSIGN_OTHER_TASK = _STORE.ASSIGN_OTHER_TASK      # 別の task を指している
+ASSIGN_SUCCESSOR = _STORE.ASSIGN_SUCCESSOR        # 同じ task の別の実行 (後任) のもの
+ASSIGN_UNVERIFIABLE = _STORE.ASSIGN_UNVERIFIABLE  # 世代を読めない (旧形式 / 破損)
 
 #: assignments ディレクトリで別の意味を持つ suffix。Worker 名として使わせない。
-RESERVED_AGENT_SUFFIXES = (IDENTITY_SUFFIX, '.restarting', '.tmp')
+RESERVED_AGENT_SUFFIXES = _STORE.RESERVED_AGENT_SUFFIXES
 
-
-def agent_name_problem(agent):
-    """Worker 名が assignment ファイル名として使えない理由。使えるなら None。
-
-    ここは撤去 (os.remove) の対象パスを組み立てる根拠でもあるので、ディレクトリ
-    を抜けられる名前を弾くのは公開側だけでなく撤去側の防御でもある。
-    """
-    if not agent or '/' in agent or '\0' in agent or agent in ('.', '..') \
-            or agent.startswith('.'):
-        return "'/' や先頭の '.' を含まない名前にしてください"
-    for suffix in RESERVED_AGENT_SUFFIXES:
-        if agent.endswith(suffix):
-            return f"'{suffix}' で終わる名前は queue/assignments/ で予約済みです"
-    return None
+#: Worker 名が assignment ファイル名として使えない理由 (使えるなら None)。撤去 (unlink) の
+#: 対象パスを組み立てる根拠でもあるので、ディレクトリを抜けられる名前を弾くのは公開側だけ
+#: でなく撤去側の防御でもある。定義は lib_state_store の 1 か所。
+agent_name_problem = _STORE.agent_name_problem
 
 
 def require_valid_agent_name(agent):
@@ -2030,38 +1964,19 @@ def assignment_identity_path(agent):
     return assignment_path(agent) + IDENTITY_SUFFIX
 
 
-def _read_assignment_identity(agent):
-    """サイドカーを読む。読めない・形が違うときは None (= 世代不明)。"""
-    text, problem = try_read_queue_file(assignment_identity_path(agent))
-    if problem is not None:
-        return None
-    try:
-        data = json.loads(text)
-    except ValueError:
-        return None
-    return data if isinstance(data, dict) else None
-
-
 def publish_assignment(agent, mission, task_id, started_at):
     """<agent> の assignment とその実行アイデンティティを公開する。
 
-    呼び出し側はキューロックを保持していること。サイドカーを先に書くのは、
-    「存在 = busy」を意味する本体が、世代の分からない状態で一瞬でも観測され
-    ないようにするため。逆順にすると、その隙間に来た後始末が世代を証明できず
-    判定不能になる。
+    呼び出し側はキューロックを保持していること (`with_lock()` の中)。サイドカーを先に
+    書くのは、「存在 = busy」を意味する本体が、世代の分からない状態で一瞬でも観測され
+    ないようにするため (順序は lib_state_store.Txn.publish_assignment が持つ)。
     """
-    os.makedirs(ASSIGNMENTS_DIR, exist_ok=True)
-    _atomic_write(assignment_identity_path(agent), json.dumps({
-        'mission': mission,
-        'task': task_id,
-        'worker': agent,
-        'started_at': started_at,
-    }, ensure_ascii=False, sort_keys=True) + '\n')
-    _atomic_write(assignment_path(agent), f"{mission}:{task_id}\n")
+    _txn().publish_assignment(agent, mission, task_id, started_at)
+    _AUDIT_OTHER_ROWS.append((mission, task_id))
 
 
 def classify_assignment(agent, mission, task_id, generation):
-    """公開中の assignment が「この実行のもの」かを判定する唯一の場所。
+    """公開中の assignment が「この実行のもの」かを判定する (lib_state_store の判定そのもの)。
 
     generation:
       - 文字列 …… 呼び出し側が特定の実行 (card の started_at) を名指ししている。
@@ -2072,42 +1987,7 @@ def classify_assignment(agent, mission, task_id, generation):
         --reset) 専用。読みと書きの間に隙間が無く後任が割り込めないので、
         世代を問う必要がそもそも無い。
     """
-    if agent_name_problem(agent):
-        # 不正な名前の assignment は存在しえない。撤去側で die すると、card を
-        # 書いたあとに落ちて片側だけ進むので、ここは「消さない」に倒す。
-        return ASSIGN_UNVERIFIABLE
-    # 「無い」= ASSIGN_ABSENT (撤去済み) と「読めない」= ASSIGN_UNVERIFIABLE
-    # (証明できないので消さない) は別の結論である。分けるのは `ENOENT` の
-    # 1 点だけで、それ以外の OSError・種類違い・デコード失敗はすべて
-    # 「証明できない」側 (knowledge/empty-vs-unobservable.md §5)。
-    #
-    # 区別を `os.path.lexists()` で取らないのは、あれが `EACCES` でも False に
-    # なるからである —— 親から実行権限が消えただけで「撤去済み」と読み、
-    # **証明できない assignment の削除を許可する**。判定は読み取りが返す
-    # `errno` に乗せる (memory: evidence-for-destructive-decisions)。
-    published = _TASK_CARDS.read_regular_text_or_unreadable(assignment_path(agent))
-    if _TASK_CARDS.is_missing(published):
-        return ASSIGN_ABSENT
-    if _TASK_CARDS.is_unreadable(published):
-        return ASSIGN_UNVERIFIABLE
-    published = published.strip()
-
-    if published != f"{mission}:{task_id}":
-        return ASSIGN_OTHER_TASK
-    if generation is None:
-        return ASSIGN_MINE
-
-    identity = _read_assignment_identity(agent)
-    if not identity:
-        # 旧 plan.sh が書いた assignment には世代が無い。証拠が無いことを
-        # 「一致した」に倒すと、まさに守りたかった後任の assignment を消す。
-        return ASSIGN_UNVERIFIABLE
-    if identity.get('mission') != mission or identity.get('task') != task_id:
-        return ASSIGN_UNVERIFIABLE
-    recorded = identity.get('started_at')
-    if recorded is None or str(recorded) != str(generation):
-        return ASSIGN_SUCCESSOR
-    return ASSIGN_MINE
+    return _txn().classify_assignment(agent, mission, task_id, generation)
 
 
 # ---------------------------------------------------------------------------
@@ -2247,18 +2127,18 @@ def retire_assignment(agent, mission, task_id, generation):
     撤去するのは「この実行のもの」と確定したときだけ。返り値は
     classify_assignment() の判定そのもので、呼び出し側はそれを見て続行するか
     保留に倒すかを決める。
+
+    削除の失敗は今までどおり warn して続行する (card は既に書き終えている。ここで落とすと
+    「card だけ進んで assignment が残る」を自分で作る)。残った枠は S4 の回復 (R-2) が拾う。
     """
-    verdict = classify_assignment(agent, mission, task_id, generation)
-    if verdict != ASSIGN_MINE:
-        return verdict
-    for path in (assignment_path(agent), assignment_identity_path(agent)):
-        try:
-            os.remove(path)
-        except FileNotFoundError:
-            pass
-        except OSError as e:
-            print(f"[plan.sh warn] failed to remove {path}: {e}", file=sys.stderr)
-    return ASSIGN_MINE
+    try:
+        verdict = _txn().retire_assignment(agent, mission, task_id, generation)
+    except _STORE.StoreWriteError as e:
+        print(f"[plan.sh warn] failed to remove {e.path}: {e}", file=sys.stderr)
+        verdict = ASSIGN_MINE
+    if verdict == ASSIGN_MINE:
+        _AUDIT_OTHER_ROWS.append((mission, task_id))
+    return verdict
 
 
 def describe_assignment_verdict(agent, verdict):
@@ -2666,10 +2546,19 @@ def _usage_exit(message):
     raise UsageExit(code)
 
 
+def _durable_makedirs(path):
+    """queue の下のディレクトリは `os.makedirs` ではなく lib の durable な作成 (作った dir の親を fsync) で作る。
+    `os.makedirs` は fsync しないので、電源断で `missions/<slug>` のエントリごと消えうる。"""
+    try:
+        _STORE.ensure_dir(path)
+    except _STORE.StoreError as e:
+        die(f"[plan.sh] cannot create directory {path}: {e}")
+
+
 def _ensure_queue_dirs():
     """queue の骨組み。引数を検証し終えたあとにだけ作る (`--help` は何も作らない)。"""
-    os.makedirs(os.path.join(QUEUE_DIR, 'missions'), exist_ok=True)
-    os.makedirs(os.path.join(QUEUE_DIR, 'archive'), exist_ok=True)
+    _durable_makedirs(os.path.join(QUEUE_DIR, 'missions'))
+    _durable_makedirs(os.path.join(QUEUE_DIR, 'archive'))
 
 
 def parse_opts(args, spec):
@@ -2753,7 +2642,7 @@ def cmd_init(args):
                 # so worker output is never silently lost.
                 ts = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
                 backup_name = f"{slug}.overwritten-{ts}"
-                os.makedirs(ARCHIVE_DIR, exist_ok=True)
+                _durable_makedirs(ARCHIVE_DIR)
                 shutil.move(mission_dir(slug), os.path.join(ARCHIVE_DIR, backup_name))
                 print(
                     f"[plan.sh init] previous '{slug}' moved to archive/{backup_name}",
@@ -2770,7 +2659,7 @@ def cmd_init(args):
         else:
             slug = generate_slug(title)
 
-        os.makedirs(tasks_dir(slug), exist_ok=True)
+        _durable_makedirs(tasks_dir(slug))
         mission = {
             'title': title,
             'slug': slug,
@@ -3146,6 +3035,9 @@ def cmd_pull(args):
     diag = {'reason': None, 'detail': ''}
 
     def _do():
+        # 監査ログの actor は pull を打った Worker (`--agent`。env の AGENT_NAME より確か)。
+        if agent:
+            _txn().actor = agent
         # ロックの中で最初に見る。退役予約が立っている Worker には、この pull が
         # 1 バイトも書かずに引き返す — card を in_progress にしてから気付くと、
         # まさにこの PR が潰した「割れたトランザクション」を自分で作ることになる。
@@ -4768,7 +4660,14 @@ def _apply_risk_flags(slug, plan_review_path):
         if new_mode != current_mode:
             verification['mode'] = new_mode
             meta['verification'] = verification
-            save_task(slug, task_id, meta, body)
+
+            # この書き込みは今までロックの外だった。lib_state_store 経由にした以上、
+            # トランザクション (ロック + 監査ログ) の中で書く。読みはロックの前のままで、
+            # ここを `_do_verdict` に統合してロックの外の読み書きを無くすのは S5 (t020)。
+            def _write_upgrade(slug=slug, task_id=task_id, meta=meta, body=body):
+                save_task(slug, task_id, meta, body)
+
+            with_lock(_write_upgrade)
             print(
                 f"[risk-flags] task '{task_id}': verification.mode {current_mode} → {new_mode} "
                 f"(recommended_mode={proposed_mode})"
@@ -5190,7 +5089,7 @@ def cmd_archive(args):
         src = mission_dir(slug)
         if not os.path.exists(src):
             die(f"mission '{slug}' not found.")
-        os.makedirs(ARCHIVE_DIR, exist_ok=True)
+        _durable_makedirs(ARCHIVE_DIR)
         dst = os.path.join(ARCHIVE_DIR, slug)
         if os.path.exists(dst):
             die(f"archive target already exists: {dst}")
@@ -5203,6 +5102,7 @@ def cmd_archive(args):
         if state.get('default_mission') == slug:
             state['default_mission'] = active[0] if active else None
         save_state(state)
+        _AUDIT_OTHER_ROWS.append((slug, None))      # 監査ログの行は mission を名指す (state.yaml だけだと mission が空)
         print(f"Archived: {slug} → archive/{slug}")
 
     with_lock(_do)

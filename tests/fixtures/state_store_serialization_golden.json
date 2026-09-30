@@ -1,0 +1,550 @@
+{
+ "cards": [
+  {
+   "meta": {
+    "id": "t001",
+    "title": "plain",
+    "skills": [
+     "code",
+     "bash"
+    ],
+    "status": "pending"
+   },
+   "body": "",
+   "expected": "---\nid: t001\ntitle: plain\nskills: [code, bash]\nstatus: pending\n---\n\n\n"
+  },
+  {
+   "meta": {
+    "id": "t001",
+    "title": "plain",
+    "skills": [
+     "code",
+     "bash"
+    ],
+    "status": "pending"
+   },
+   "body": "no trailing newline",
+   "expected": "---\nid: t001\ntitle: plain\nskills: [code, bash]\nstatus: pending\n---\n\nno trailing newline\n"
+  },
+  {
+   "meta": {
+    "id": "t001",
+    "title": "plain",
+    "skills": [
+     "code",
+     "bash"
+    ],
+    "status": "pending"
+   },
+   "body": "with newline\n",
+   "expected": "---\nid: t001\ntitle: plain\nskills: [code, bash]\nstatus: pending\n---\n\nwith newline\n"
+  },
+  {
+   "meta": {
+    "id": "t001",
+    "title": "plain",
+    "skills": [
+     "code",
+     "bash"
+    ],
+    "status": "pending"
+   },
+   "body": "## Description\nd\n\n## Result\nr\n",
+   "expected": "---\nid: t001\ntitle: plain\nskills: [code, bash]\nstatus: pending\n---\n\n## Description\nd\n\n## Result\nr\n"
+  },
+  {
+   "meta": {
+    "id": "t001",
+    "title": "colon: \"quotes\" and \\ backslash",
+    "skills": [],
+    "worker": null
+   },
+   "body": "",
+   "expected": "---\nid: t001\ntitle: \"colon: \\\"quotes\\\" and \\\\ backslash\"\nskills: []\nworker: null\n---\n\n\n"
+  },
+  {
+   "meta": {
+    "id": "t001",
+    "title": "colon: \"quotes\" and \\ backslash",
+    "skills": [],
+    "worker": null
+   },
+   "body": "no trailing newline",
+   "expected": "---\nid: t001\ntitle: \"colon: \\\"quotes\\\" and \\\\ backslash\"\nskills: []\nworker: null\n---\n\nno trailing newline\n"
+  },
+  {
+   "meta": {
+    "id": "t001",
+    "title": "colon: \"quotes\" and \\ backslash",
+    "skills": [],
+    "worker": null
+   },
+   "body": "with newline\n",
+   "expected": "---\nid: t001\ntitle: \"colon: \\\"quotes\\\" and \\\\ backslash\"\nskills: []\nworker: null\n---\n\nwith newline\n"
+  },
+  {
+   "meta": {
+    "id": "t001",
+    "title": "colon: \"quotes\" and \\ backslash",
+    "skills": [],
+    "worker": null
+   },
+   "body": "## Description\nd\n\n## Result\nr\n",
+   "expected": "---\nid: t001\ntitle: \"colon: \\\"quotes\\\" and \\\\ backslash\"\nskills: []\nworker: null\n---\n\n## Description\nd\n\n## Result\nr\n"
+  },
+  {
+   "meta": {
+    "id": "t001",
+    "title": "multi\nline\r\nreason\n",
+    "needs_director_reason": "a\nb"
+   },
+   "body": "",
+   "expected": "---\nid: t001\ntitle: multi / line / reason\nneeds_director_reason: a / b\n---\n\n\n"
+  },
+  {
+   "meta": {
+    "id": "t001",
+    "title": "multi\nline\r\nreason\n",
+    "needs_director_reason": "a\nb"
+   },
+   "body": "no trailing newline",
+   "expected": "---\nid: t001\ntitle: multi / line / reason\nneeds_director_reason: a / b\n---\n\nno trailing newline\n"
+  },
+  {
+   "meta": {
+    "id": "t001",
+    "title": "multi\nline\r\nreason\n",
+    "needs_director_reason": "a\nb"
+   },
+   "body": "with newline\n",
+   "expected": "---\nid: t001\ntitle: multi / line / reason\nneeds_director_reason: a / b\n---\n\nwith newline\n"
+  },
+  {
+   "meta": {
+    "id": "t001",
+    "title": "multi\nline\r\nreason\n",
+    "needs_director_reason": "a\nb"
+   },
+   "body": "## Description\nd\n\n## Result\nr\n",
+   "expected": "---\nid: t001\ntitle: multi / line / reason\nneeds_director_reason: a / b\n---\n\n## Description\nd\n\n## Result\nr\n"
+  },
+  {
+   "meta": {
+    "id": "t001",
+    "title": "true",
+    "priority": "123",
+    "worker": "null",
+    "started_at": "yes"
+   },
+   "body": "",
+   "expected": "---\nid: t001\ntitle: \"true\"\npriority: \"123\"\nworker: \"null\"\nstarted_at: \"yes\"\n---\n\n\n"
+  },
+  {
+   "meta": {
+    "id": "t001",
+    "title": "true",
+    "priority": "123",
+    "worker": "null",
+    "started_at": "yes"
+   },
+   "body": "no trailing newline",
+   "expected": "---\nid: t001\ntitle: \"true\"\npriority: \"123\"\nworker: \"null\"\nstarted_at: \"yes\"\n---\n\nno trailing newline\n"
+  },
+  {
+   "meta": {
+    "id": "t001",
+    "title": "true",
+    "priority": "123",
+    "worker": "null",
+    "started_at": "yes"
+   },
+   "body": "with newline\n",
+   "expected": "---\nid: t001\ntitle: \"true\"\npriority: \"123\"\nworker: \"null\"\nstarted_at: \"yes\"\n---\n\nwith newline\n"
+  },
+  {
+   "meta": {
+    "id": "t001",
+    "title": "true",
+    "priority": "123",
+    "worker": "null",
+    "started_at": "yes"
+   },
+   "body": "## Description\nd\n\n## Result\nr\n",
+   "expected": "---\nid: t001\ntitle: \"true\"\npriority: \"123\"\nworker: \"null\"\nstarted_at: \"yes\"\n---\n\n## Description\nd\n\n## Result\nr\n"
+  },
+  {
+   "meta": {
+    "id": "t001",
+    "title": "日本語のタイトル: 混在",
+    "blocked_by": [
+     "t002",
+     "t003"
+    ],
+    "pr_number": 42
+   },
+   "body": "",
+   "expected": "---\nid: t001\ntitle: \"日本語のタイトル: 混在\"\nblocked_by: [t002, t003]\npr_number: 42\n---\n\n\n"
+  },
+  {
+   "meta": {
+    "id": "t001",
+    "title": "日本語のタイトル: 混在",
+    "blocked_by": [
+     "t002",
+     "t003"
+    ],
+    "pr_number": 42
+   },
+   "body": "no trailing newline",
+   "expected": "---\nid: t001\ntitle: \"日本語のタイトル: 混在\"\nblocked_by: [t002, t003]\npr_number: 42\n---\n\nno trailing newline\n"
+  },
+  {
+   "meta": {
+    "id": "t001",
+    "title": "日本語のタイトル: 混在",
+    "blocked_by": [
+     "t002",
+     "t003"
+    ],
+    "pr_number": 42
+   },
+   "body": "with newline\n",
+   "expected": "---\nid: t001\ntitle: \"日本語のタイトル: 混在\"\nblocked_by: [t002, t003]\npr_number: 42\n---\n\nwith newline\n"
+  },
+  {
+   "meta": {
+    "id": "t001",
+    "title": "日本語のタイトル: 混在",
+    "blocked_by": [
+     "t002",
+     "t003"
+    ],
+    "pr_number": 42
+   },
+   "body": "## Description\nd\n\n## Result\nr\n",
+   "expected": "---\nid: t001\ntitle: \"日本語のタイトル: 混在\"\nblocked_by: [t002, t003]\npr_number: 42\n---\n\n## Description\nd\n\n## Result\nr\n"
+  },
+  {
+   "meta": {
+    "id": "t001",
+    "title": "x",
+    "rework_count": 0,
+    "max_rework": 3,
+    "no_pr_waiver": "理由 # hash"
+   },
+   "body": "",
+   "expected": "---\nid: t001\ntitle: x\nno_pr_waiver: \"理由 # hash\"\nrework_count: 0\nmax_rework: 3\n---\n\n\n"
+  },
+  {
+   "meta": {
+    "id": "t001",
+    "title": "x",
+    "rework_count": 0,
+    "max_rework": 3,
+    "no_pr_waiver": "理由 # hash"
+   },
+   "body": "no trailing newline",
+   "expected": "---\nid: t001\ntitle: x\nno_pr_waiver: \"理由 # hash\"\nrework_count: 0\nmax_rework: 3\n---\n\nno trailing newline\n"
+  },
+  {
+   "meta": {
+    "id": "t001",
+    "title": "x",
+    "rework_count": 0,
+    "max_rework": 3,
+    "no_pr_waiver": "理由 # hash"
+   },
+   "body": "with newline\n",
+   "expected": "---\nid: t001\ntitle: x\nno_pr_waiver: \"理由 # hash\"\nrework_count: 0\nmax_rework: 3\n---\n\nwith newline\n"
+  },
+  {
+   "meta": {
+    "id": "t001",
+    "title": "x",
+    "rework_count": 0,
+    "max_rework": 3,
+    "no_pr_waiver": "理由 # hash"
+   },
+   "body": "## Description\nd\n\n## Result\nr\n",
+   "expected": "---\nid: t001\ntitle: x\nno_pr_waiver: \"理由 # hash\"\nrework_count: 0\nmax_rework: 3\n---\n\n## Description\nd\n\n## Result\nr\n"
+  },
+  {
+   "meta": {
+    "id": "t001",
+    "title": "x",
+    "qa_checkpoints": [
+     "a: b",
+     "c"
+    ],
+    "required_evidence": [
+     1,
+     true,
+     null,
+     "s"
+    ]
+   },
+   "body": "",
+   "expected": "---\nid: t001\ntitle: x\nqa_checkpoints: [\"a: b\", c]\nrequired_evidence: [1, true, null, s]\n---\n\n\n"
+  },
+  {
+   "meta": {
+    "id": "t001",
+    "title": "x",
+    "qa_checkpoints": [
+     "a: b",
+     "c"
+    ],
+    "required_evidence": [
+     1,
+     true,
+     null,
+     "s"
+    ]
+   },
+   "body": "no trailing newline",
+   "expected": "---\nid: t001\ntitle: x\nqa_checkpoints: [\"a: b\", c]\nrequired_evidence: [1, true, null, s]\n---\n\nno trailing newline\n"
+  },
+  {
+   "meta": {
+    "id": "t001",
+    "title": "x",
+    "qa_checkpoints": [
+     "a: b",
+     "c"
+    ],
+    "required_evidence": [
+     1,
+     true,
+     null,
+     "s"
+    ]
+   },
+   "body": "with newline\n",
+   "expected": "---\nid: t001\ntitle: x\nqa_checkpoints: [\"a: b\", c]\nrequired_evidence: [1, true, null, s]\n---\n\nwith newline\n"
+  },
+  {
+   "meta": {
+    "id": "t001",
+    "title": "x",
+    "qa_checkpoints": [
+     "a: b",
+     "c"
+    ],
+    "required_evidence": [
+     1,
+     true,
+     null,
+     "s"
+    ]
+   },
+   "body": "## Description\nd\n\n## Result\nr\n",
+   "expected": "---\nid: t001\ntitle: x\nqa_checkpoints: [\"a: b\", c]\nrequired_evidence: [1, true, null, s]\n---\n\n## Description\nd\n\n## Result\nr\n"
+  },
+  {
+   "meta": {
+    "id": "t001",
+    "title": "x",
+    "zzz_unknown_key": "kept after the ordered ones",
+    "aaa": 1
+   },
+   "body": "",
+   "expected": "---\nid: t001\ntitle: x\nzzz_unknown_key: kept after the ordered ones\naaa: 1\n---\n\n\n"
+  },
+  {
+   "meta": {
+    "id": "t001",
+    "title": "x",
+    "zzz_unknown_key": "kept after the ordered ones",
+    "aaa": 1
+   },
+   "body": "no trailing newline",
+   "expected": "---\nid: t001\ntitle: x\nzzz_unknown_key: kept after the ordered ones\naaa: 1\n---\n\nno trailing newline\n"
+  },
+  {
+   "meta": {
+    "id": "t001",
+    "title": "x",
+    "zzz_unknown_key": "kept after the ordered ones",
+    "aaa": 1
+   },
+   "body": "with newline\n",
+   "expected": "---\nid: t001\ntitle: x\nzzz_unknown_key: kept after the ordered ones\naaa: 1\n---\n\nwith newline\n"
+  },
+  {
+   "meta": {
+    "id": "t001",
+    "title": "x",
+    "zzz_unknown_key": "kept after the ordered ones",
+    "aaa": 1
+   },
+   "body": "## Description\nd\n\n## Result\nr\n",
+   "expected": "---\nid: t001\ntitle: x\nzzz_unknown_key: kept after the ordered ones\naaa: 1\n---\n\n## Description\nd\n\n## Result\nr\n"
+  },
+  {
+   "meta": {
+    "id": "t001",
+    "title": "",
+    "skills": [
+     ""
+    ],
+    "target_dir": "/tmp/x y"
+   },
+   "body": "",
+   "expected": "---\nid: t001\ntitle: \"\"\nskills: [\"\"]\ntarget_dir: /tmp/x y\n---\n\n\n"
+  },
+  {
+   "meta": {
+    "id": "t001",
+    "title": "",
+    "skills": [
+     ""
+    ],
+    "target_dir": "/tmp/x y"
+   },
+   "body": "no trailing newline",
+   "expected": "---\nid: t001\ntitle: \"\"\nskills: [\"\"]\ntarget_dir: /tmp/x y\n---\n\nno trailing newline\n"
+  },
+  {
+   "meta": {
+    "id": "t001",
+    "title": "",
+    "skills": [
+     ""
+    ],
+    "target_dir": "/tmp/x y"
+   },
+   "body": "with newline\n",
+   "expected": "---\nid: t001\ntitle: \"\"\nskills: [\"\"]\ntarget_dir: /tmp/x y\n---\n\nwith newline\n"
+  },
+  {
+   "meta": {
+    "id": "t001",
+    "title": "",
+    "skills": [
+     ""
+    ],
+    "target_dir": "/tmp/x y"
+   },
+   "body": "## Description\nd\n\n## Result\nr\n",
+   "expected": "---\nid: t001\ntitle: \"\"\nskills: [\"\"]\ntarget_dir: /tmp/x y\n---\n\n## Description\nd\n\n## Result\nr\n"
+  },
+  {
+   "meta": {
+    "id": "t001",
+    "title": "x",
+    "review": {
+     "last_verdict": null,
+     "cycle_count": 0,
+     "reviewer": "a: b"
+    }
+   },
+   "body": "",
+   "expected": "---\nid: t001\ntitle: x\nreview:\n  last_verdict: null\n  cycle_count: 0\n  reviewer: \"a: b\"\n---\n\n\n"
+  },
+  {
+   "meta": {
+    "id": "t001",
+    "title": "x",
+    "review": {
+     "last_verdict": null,
+     "cycle_count": 0,
+     "reviewer": "a: b"
+    }
+   },
+   "body": "no trailing newline",
+   "expected": "---\nid: t001\ntitle: x\nreview:\n  last_verdict: null\n  cycle_count: 0\n  reviewer: \"a: b\"\n---\n\nno trailing newline\n"
+  },
+  {
+   "meta": {
+    "id": "t001",
+    "title": "x",
+    "review": {
+     "last_verdict": null,
+     "cycle_count": 0,
+     "reviewer": "a: b"
+    }
+   },
+   "body": "with newline\n",
+   "expected": "---\nid: t001\ntitle: x\nreview:\n  last_verdict: null\n  cycle_count: 0\n  reviewer: \"a: b\"\n---\n\nwith newline\n"
+  },
+  {
+   "meta": {
+    "id": "t001",
+    "title": "x",
+    "review": {
+     "last_verdict": null,
+     "cycle_count": 0,
+     "reviewer": "a: b"
+    }
+   },
+   "body": "## Description\nd\n\n## Result\nr\n",
+   "expected": "---\nid: t001\ntitle: x\nreview:\n  last_verdict: null\n  cycle_count: 0\n  reviewer: \"a: b\"\n---\n\n## Description\nd\n\n## Result\nr\n"
+  }
+ ],
+ "missions": [
+  {
+   "data": {
+    "title": "m",
+    "slug": "s",
+    "status": "drafting",
+    "next_task_id": 3,
+    "max_review_cycles": 3,
+    "deliverable_required": true,
+    "created_at": "2026-09-30T00:00:00Z",
+    "completed_at": null,
+    "review": {
+     "last_verdict": null,
+     "cycle_count": 0,
+     "reviewed_at": null,
+     "reviewer": null
+    }
+   },
+   "expected": "title: m\nslug: s\nstatus: drafting\ncreated_at: \"2026-09-30T00:00:00Z\"\ncompleted_at: null\nnext_task_id: 3\nmax_review_cycles: 3\ndeliverable_required: true\nreview:\n  last_verdict: null\n  cycle_count: 0\n  reviewed_at: null\n  reviewer: null\n"
+  },
+  {
+   "data": {
+    "slug": "s",
+    "extra": "after",
+    "title": "colon: x",
+    "next_task_id": 1
+   },
+   "expected": "title: \"colon: x\"\nslug: s\nnext_task_id: 1\nextra: after\n"
+  },
+  {
+   "data": {},
+   "expected": "\n"
+  }
+ ],
+ "states": [
+  {
+   "state": {
+    "active_missions": [],
+    "default_mission": null
+   },
+   "expected": "active_missions: []\ndefault_mission: null\n"
+  },
+  {
+   "state": {
+    "active_missions": [
+     "a",
+     "20260930-x"
+    ],
+    "default_mission": "a"
+   },
+   "expected": "active_missions:\n  - a\n  - 20260930-x\ndefault_mission: a\n"
+  },
+  {
+   "state": {
+    "active_missions": null,
+    "default_mission": "weird: name"
+   },
+   "expected": "active_missions: []\ndefault_mission: \"weird: name\"\n"
+  },
+  {
+   "state": {
+    "default_mission": "only"
+   },
+   "expected": "active_missions: []\ndefault_mission: only\n"
+  }
+ ]
+}

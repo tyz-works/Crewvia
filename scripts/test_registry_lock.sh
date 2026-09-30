@@ -146,6 +146,12 @@ exclude = {
     # (dispatcher は REGISTRY_DIR 直下のその名前を読む)。書き込みは pytest の使い捨てツリーに
     # 閉じ、repo の registry/workers.yaml に書く経路は存在しない。
     root / "tests" / "test_reap_orphan_assignment.py",
+    # S5 (t020) の書き手のテスト。`write_text` は pytest の tmp_path 配下の使い捨ての card / taskvia map /
+    # workers.yaml を組み立てるだけで、repo の registry/workers.yaml には触れない。"workers.yaml" は
+    # 見出しコメントと、assign-name.sh を tmp_path の隔離コピーで走らせる箇所に現れるだけ
+    # (registry を書く側のテストは lib_registry.write / assign-name.sh を**通して**書き、
+    # 通さない書き込みは tests/test_queue_writes_go_through_the_store.py が見る)。
+    root / "tests" / "test_s5_writers_lock_and_atomic.py",
 }
 proximity = 15
 found = []

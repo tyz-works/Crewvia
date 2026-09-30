@@ -21,16 +21,24 @@ lib ごとの**破ってはいけない契約**の要約。理由・経緯・全
   1 つでもあればストア全体が `Unreadable`。
 - 例外は `plan.sh` の `load_state()` 1 つだけ（`knowledge/empty-vs-unobservable.md` §4）。
 
-## 書き込みの入口（`lib_state_store.py`。S2 では**呼び出し元ゼロ**）
+## 書き込みの入口（`lib_state_store.py`。**plan.sh の queue への書き込みは全部ここを通る**（S3 / t012））
 
-- queue への書き込みの唯一の入口（`knowledge/state-store.md` §3）。`atomic_write_text`（tmp → fsync → replace → **親 dir fsync**・
+- queue への書き込みの唯一の入口（`knowledge/state-store.md` §3・§4.1）。`atomic_write_text`（tmp → fsync → replace → **親 dir fsync**・
   mode 引き継ぎ）/ `atomic_remove` / `transaction()`（`queue/.lock`・取得後に読み直す・入れ子は即 `NestedTransaction`）/
-  `Txn.recover()`（R-1〜R-4。**正本は書かない**）/ `diagnose()`（書かない）/ 監査ログ `queue/audit/transitions-YYYYMMDD.jsonl`。
+  `Txn.recover()`（R-1〜R-4。**正本は書かない**。plan.sh はまだ呼ばない = S4）/ `diagnose()`（書かない）/
+  監査ログ `queue/audit/transitions-YYYYMMDD.jsonl`（1 トランザクション = 1 行。Result・理由・本文は出さない）。
+- **plan.sh は `with_lock()` の中の `save_task` / `save_mission` / `save_state` / `publish_assignment` / `retire_assignment` /
+  `classify_assignment` だけで queue を書く**（`_txn()` = lib の `Txn` への委譲）。`with_lock` の外で呼ぶと `RuntimeError`。
+  plan.sh に直列化（`dump_yaml` 等）・原子的書き込み・assignment の判定のコピーを戻さない
+  （`tests/test_state_store_serialization_matches_plan_sh.py` / `tests/test_state_store_callers.py`）。
+  lib は**普通に import** する（`_load_scripts_module` は `sys.modules` に載せないので dataclass を持つ lib は読めない）。
 - 書けない・読めないは**例外**（`StoreWriteError` / `StoreReadError` / `LockBusy`）。`None` / `False` / 成功に潰さない。
+  plan.sh の `with_lock` が終了コードに写す（`LockBusy` → 4、それ以外 → 1）。assignment 撤去の失敗だけは今までどおり warn して続行。
   監査ログだけは書けなくても遷移を止めず stderr に警告。本文（Result・理由）・env・token は出さない。
-- 障害注入は `FAULT_HOOK`（モジュール変数。env スイッチは付けない）。`plan.sh` / dispatcher / hooks はまだ import しない
-  （`tests/test_state_store_has_no_callers_yet.py`）。S3 が移すときにそのテストの許可表を更新する。
-- 直列化は plan.sh の写し（S3 まで二重）。`tests/test_state_store_serialization_matches_plan_sh.py` が一致を固定する。
+- 障害注入は `FAULT_HOOK`（モジュール変数。env スイッチは付けない）。呼び出し元は plan.sh だけ
+  （`tests/test_state_store_callers.py` の許可表。dispatcher / hooks / verifier-dispatcher は S5 まで import しない）。
+- 戻し方: PR revert → `scripts/sync-main-checkout.sh`。card・mission・state・assignment は 1 バイトも書き換えていない
+  （`knowledge/state-store.md` §4.1）。
 
 ## 依存（`lib_dep_rules.py`）
 

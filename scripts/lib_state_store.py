@@ -4,9 +4,10 @@
 読み取り専用の `lib_task_cards.py` と対になる。設計は `knowledge/state-store.md` の
 §2 (crash モデル) / §3 (この API) / §4 (監査ログ)。
 
-**S2 の時点では呼び出し元ゼロ** (R2)。plan.sh・dispatcher・hooks はまだ import しない
-(`tests/test_state_store_has_no_callers_yet.py` が固定。S3 で plan.sh が移るときに外す)。
-本番の挙動はこの PR では 1 バイトも変わらない。
+**呼び出し元は plan.sh だけ** (S3 / t012 で cutover。S2 では呼び出し元ゼロだった)。plan.sh の queue への
+書き込み (card・mission・state・assignment の公開 / 撤去) と `queue/.lock` の取得は、すべてこの lib を通る。
+dispatcher・hooks・verifier-dispatcher はまだ import しない (S5 で寄せる)。許可表は
+`tests/test_state_store_callers.py`。plan.sh 側の使い方は `knowledge/state-store.md` §4.1。
 
 ## この lib が保証すること
 
@@ -165,14 +166,16 @@ class StoreWriteError(StoreError):
     """書けなかった。`op` は失敗した段 (serialize / stat / mkdir / mkstemp / write / chmod /
     fsync / replace / fsync_dir / unlink / append)、`errno` は OSError 由来のときだけ入る。
 
-    `op == 'fsync_dir'` のときは**新しい内容は既に置き換わっている** (置換の後の失敗)。
-    耐久性だけが証明できない。それ以外の op では元のファイルはそのまま残っている。"""
+    `committed` が True のとき (`op == 'fsync_dir'` の**置換 / 削除の後**の失敗) は**新しい内容は既に置き換わっている**。
+    耐久性だけが証明できない。それ以外の op では元のファイルはそのまま残っている
+    (ディレクトリを作った直後の親の fsync も `fsync_dir` だが、まだ何も書いていないので `committed` は False)。"""
 
     def __init__(self, path, op, err_no=None, detail=''):
         self.path = str(path)
         self.op = op
         self.errno = err_no
         self.detail = str(detail)
+        self.committed = False
         super().__init__(
             f"{op} failed for {self.path}"
             + (f" (errno {err_no}: {os.strerror(err_no)})" if err_no else "")
@@ -377,7 +380,11 @@ def atomic_write_text(path, text, *, mode=None):
             raise StoreWriteError(path, 'replace', e.errno) from e
         replaced = True
         _fault('atomic:replaced', path)
-        _fsync_dir(parent, path)
+        try:
+            _fsync_dir(parent, path)
+        except StoreWriteError as e:
+            e.committed = True                # 置換は済んでいる (耐久性だけが証明できない)
+            raise
         _fault('atomic:dir_synced', path)
     except BaseException:
         if not replaced:
@@ -400,18 +407,23 @@ def atomic_remove(path):
     except OSError as e:
         raise StoreWriteError(path, 'unlink', e.errno) from e
     _fault('remove:unlinked', path)
-    _fsync_dir(os.path.dirname(path) or '.', path)
+    try:
+        _fsync_dir(os.path.dirname(path) or '.', path)
+    except StoreWriteError as e:
+        e.committed = True                    # 削除は済んでいる (耐久性だけが証明できない)
+        raise
     _fault('remove:dir_synced', path)
     return True
 
 
 # ---------------------------------------------------------------------------
-# 直列化 (今の plan.sh の関数と**バイト単位で同じ**。S3 で plan.sh がこちらを使う)
+# 直列化 (cutover 前の plan.sh の関数と**バイト単位で同じ**。S3 で plan.sh のコピーは消え、ここが唯一の定義)
 # ---------------------------------------------------------------------------
 #
-# この節は plan.sh:456-565 (dump_yaml / serialize_frontmatter) と同じ規則の写しで、
-# S3 までの間だけ二重になる。`tests/test_state_store_serialization_matches_plan_sh.py` が
-# plan.sh の関数を AST で取り出して出力の一致を固定する (ずれたら赤)。
+# 出力は cutover 前 (a1f6957) の plan.sh (dump_yaml / serialize_frontmatter / save_state) の出力と
+# 1 バイトも変えない。`tests/test_state_store_serialization_matches_plan_sh.py` が、その版の出力を写した
+# golden (`tests/fixtures/state_store_serialization_golden.json`) との一致を固定する (ずれたら赤)。
+# plan.sh にこの規則のコピーを戻さない (同じテストが plan.sh の AST で落とす)。
 
 TASK_META_KEY_ORDER = [
     'id', 'title', 'skills', 'priority', 'status',
@@ -797,6 +809,7 @@ class Txn:
         self.actor = actor or 'unknown'
         self.txn_id = uuid.uuid4().hex
         self.audit_failures = 0
+        self.durability_failures = []      # 親 dir の fsync だけが失敗した書き込みの errno 名 (§4.1)
         self._records = []
         self._files = []
 
@@ -889,12 +902,36 @@ class Txn:
         return data
 
     # ---- 書き --------------------------------------------------------------
+    def _durability_unproven(self, err):
+        """置換 / 削除は済んだが、親 dir の fsync だけが失敗した (`StoreWriteError.committed`)。
+
+        **トランザクションの途中では続行する** (警告 + 監査ログの `detail`)。ここで落とすと、card を書いた後・
+        assignment を書く前で止まる = 「割れたトランザクション」を、耐久性を証明できなかったというだけで
+        自分で作る。内容は既に置き換わっているので、続行しても状態は正しい (旧 plan.sh は親 dir の fsync を
+        そもそもしていなかった = 悪化しない)。`atomic_write_text` を直接呼ぶ側は従来どおり例外を受ける。
+        """
+        self.durability_failures.append(_errno_name(err.errno))
+        _warn(f"[state-store warn] 親ディレクトリの fsync に失敗しました "
+              f"({_safe_relpath(self._rel(err.path)) or 'path'}: {_errno_name(err.errno)}) — "
+              f"内容は書き込み済みですが、電源断に対する耐久性は確認できていません")
+
     def _write(self, path, text):
-        atomic_write_text(path, text)
+        try:
+            atomic_write_text(path, text)
+        except StoreWriteError as e:
+            if not (e.committed and e.op == 'fsync_dir'):
+                raise
+            self._durability_unproven(e)
         self._files.append(self._rel(path))
 
     def _remove(self, path):
-        removed = atomic_remove(path)
+        try:
+            removed = atomic_remove(path)
+        except StoreWriteError as e:
+            if not (e.committed and e.op == 'fsync_dir'):
+                raise
+            self._durability_unproven(e)
+            removed = True
         if removed:
             self._files.append(self._rel(path))
         return removed
@@ -1005,8 +1042,12 @@ class Txn:
             'result': _safe_result(rec.get('result', 'ok')),
             'files': [f for f in map(_safe_relpath, files) if f is not None],
         }
-        if rec.get('detail'):
-            row['detail'] = _safe_detail(rec['detail'])
+        detail = rec.get('detail')
+        if not detail and self.durability_failures:
+            # 遷移は完了しているが親 dir の fsync を証明できなかった (`_durability_unproven`)。行に残す。
+            detail = f"fsync_dir_failed:{self.durability_failures[0]}"
+        if detail:
+            row['detail'] = _safe_detail(detail)
         path = audit_path(self.queue_dir)
         try:
             _fault('audit:begin', path)

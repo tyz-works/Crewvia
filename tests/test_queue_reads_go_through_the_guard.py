@@ -127,10 +127,9 @@ GUARDED_READS = [
     # t018 (Codex 9 巡目 P2): 表に無かったので最初から視界の外にいた 4 件。
     ("plan.sh", "_load_workers_from_registry", {"try_read_queue_file"}),
     ("plan.sh", "task_graph_assignment_holds", {"try_read_queue_file"}),
-    ("plan.sh", "_read_assignment_identity", {"try_read_queue_file"}),
-    # ENOENT (撤去済み) と「読めない」(証明できない) を分ける必要があるので、
-    # 文字列の problem ではなく errno を持つ `Unreadable` のほうを直接使う。
-    ("plan.sh", "classify_assignment", {"read_regular_text_or_unreadable"}),
+    # S3 (t012): assignment の判定 (classify) と sidecar の読みは lib_state_store に一本化された
+    # (plan.sh の `_read_assignment_identity` は無く、`classify_assignment` は Txn への委譲)。lib の読みは
+    # すべて `lib_task_cards.read_regular_text_or_unreadable` を通る (open() を読みに使わない)。
     ("plan.sh", "_load_taskvia_map", {"try_read_queue_file"}),
     ("plan.sh", "_apply_risk_flags", {"try_read_queue_file"}),
     ("plan.sh", "_task_graph_pending_outstanding",

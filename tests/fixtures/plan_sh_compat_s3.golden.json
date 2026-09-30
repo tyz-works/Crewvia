@@ -1,0 +1,264 @@
+{
+ "queue_before_archive": {
+  ".taskvia-map.json": "{\n  \"<SLUG>:t003\": {\n    \"registered\": true,\n    \"status\": \"pending\"\n  }\n}\n",
+  "assignments/Sora": "<SLUG>:t006\n",
+  "assignments/Sora.identity": "{\"mission\": \"<SLUG>\", \"started_at\": \"<TS>\", \"task\": \"t006\", \"worker\": \"Sora\"}\n",
+  "missions/<SLUG>/mission.yaml": "title: Compat mission\nslug: <SLUG>\nstatus: drafting\ncreated_at: \"<TS>\"\ncompleted_at: null\nnext_task_id: 7\nmax_review_cycles: 3\ndeliverable_required: true\nreview:\n  last_verdict: null\n  cycle_count: 0\n  reviewed_at: null\n  reviewer: null\n",
+  "missions/<SLUG>/tasks/t001.md": "---\nid: t001\ntitle: Plain\nskills: [bash]\npriority: medium\nstatus: done\nblocked_by: []\ntarget_dir: null\nworker: Ren\nstarted_at: \"<TS>\"\ncompleted_at: \"<TS>\"\nno_pr_waiver: compat\n---\n\n## Description\n\n\n## Result\norphan case\n",
+  "missions/<SLUG>/tasks/t002.md": "---\nid: t002\ntitle: \"Colon: \\\"quoted\\\" 日本語\"\nskills: [code, bash]\npriority: high\nstatus: done\nblocked_by: []\ntarget_dir: null\nworker: Ren\nstarted_at: \"<TS>\"\ncompleted_at: \"<TS>\"\nno_pr_waiver: compat\nneeds_director_reason: \"long reason: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx…(全文は本文を参照)\"\n---\n\n## Description\nline one # not a comment\n\n## Result\nfinished: with colon\nand a 2nd line\n\n## Needs-Director 詳細\nlong reason: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\nsecond line\n",
+  "missions/<SLUG>/tasks/t003.md": "---\nid: t003\ntitle: Blocked on first\nskills: [bash]\npriority: medium\nstatus: pending\nblocked_by: [t001]\ntarget_dir: null\nworker: null\nstarted_at: null\ncompleted_at: null\n---\n\n## Description\nedited: text\n\n## Result\n\n",
+  "missions/<SLUG>/tasks/t004.md": "---\nid: t004\ntitle: Deliverable pr\nskills: [bash]\npriority: low\nstatus: failed\nblocked_by: []\ntarget_dir: null\nworker: Ren\nstarted_at: \"<TS>\"\ncompleted_at: \"<TS>\"\nfail_head_waiver: compat\ndeliverable: pr\n---\n\n## Description\n\n\n## Result\nFAILED — head: none (--no-head: compat) — handoff: none\n",
+  "missions/<SLUG>/tasks/t005.md": "---\nid: t005\ntitle: Held dep child\nskills: [bash]\npriority: medium\nstatus: skipped\nblocked_by: [t004]\nreleased_deps: [t004]\ntarget_dir: null\nworker: null\nstarted_at: null\ncompleted_at: null\n---\n\n## Description\n\n\n## Result\n",
+  "missions/<SLUG>/tasks/t006.md": "---\nid: t006\ntitle: Verified path\nskills: [bash]\npriority: high\nstatus: verified\nblocked_by: []\ntarget_dir: null\nworker: Sora\nstarted_at: \"<TS>\"\ncompleted_at: \"<TS>\"\n---\n\n## Description\n\n\n## Result\n\n## Verification\n\n### <TS>\n**Verdict:** pass\n**Notes:** looks fine\n",
+  "state.yaml": "active_missions:\n  - <SLUG>\ndefault_mission: <SLUG>\n"
+ },
+ "queue_final": {
+  ".taskvia-map.json": "{\n  \"<SLUG>:t003\": {\n    \"registered\": true,\n    \"status\": \"pending\"\n  }\n}\n",
+  "archive/<SLUG>/mission.yaml": "title: Compat mission\nslug: <SLUG>\nstatus: drafting\ncreated_at: \"<TS>\"\ncompleted_at: null\nnext_task_id: 7\nmax_review_cycles: 3\ndeliverable_required: true\nreview:\n  last_verdict: null\n  cycle_count: 0\n  reviewed_at: null\n  reviewer: null\n",
+  "archive/<SLUG>/tasks/t001.md": "---\nid: t001\ntitle: Plain\nskills: [bash]\npriority: medium\nstatus: done\nblocked_by: []\ntarget_dir: null\nworker: Ren\nstarted_at: \"<TS>\"\ncompleted_at: \"<TS>\"\nno_pr_waiver: compat\n---\n\n## Description\n\n\n## Result\norphan case\n",
+  "archive/<SLUG>/tasks/t002.md": "---\nid: t002\ntitle: \"Colon: \\\"quoted\\\" 日本語\"\nskills: [code, bash]\npriority: high\nstatus: done\nblocked_by: []\ntarget_dir: null\nworker: Ren\nstarted_at: \"<TS>\"\ncompleted_at: \"<TS>\"\nno_pr_waiver: compat\nneeds_director_reason: \"long reason: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx…(全文は本文を参照)\"\n---\n\n## Description\nline one # not a comment\n\n## Result\nfinished: with colon\nand a 2nd line\n\n## Needs-Director 詳細\nlong reason: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\nsecond line\n",
+  "archive/<SLUG>/tasks/t003.md": "---\nid: t003\ntitle: Blocked on first\nskills: [bash]\npriority: medium\nstatus: pending\nblocked_by: [t001]\ntarget_dir: null\nworker: null\nstarted_at: null\ncompleted_at: null\n---\n\n## Description\nedited: text\n\n## Result\n\n",
+  "archive/<SLUG>/tasks/t004.md": "---\nid: t004\ntitle: Deliverable pr\nskills: [bash]\npriority: low\nstatus: failed\nblocked_by: []\ntarget_dir: null\nworker: Ren\nstarted_at: \"<TS>\"\ncompleted_at: \"<TS>\"\nfail_head_waiver: compat\ndeliverable: pr\n---\n\n## Description\n\n\n## Result\nFAILED — head: none (--no-head: compat) — handoff: none\n",
+  "archive/<SLUG>/tasks/t005.md": "---\nid: t005\ntitle: Held dep child\nskills: [bash]\npriority: medium\nstatus: skipped\nblocked_by: [t004]\nreleased_deps: [t004]\ntarget_dir: null\nworker: null\nstarted_at: null\ncompleted_at: null\n---\n\n## Description\n\n\n## Result\n",
+  "archive/<SLUG>/tasks/t006.md": "---\nid: t006\ntitle: Verified path\nskills: [bash]\npriority: high\nstatus: verified\nblocked_by: []\ntarget_dir: null\nworker: Sora\nstarted_at: \"<TS>\"\ncompleted_at: \"<TS>\"\n---\n\n## Description\n\n\n## Result\n\n## Verification\n\n### <TS>\n**Verdict:** pass\n**Notes:** looks fine\n",
+  "assignments/Sora": "<SLUG>:t006\n",
+  "assignments/Sora.identity": "{\"mission\": \"<SLUG>\", \"started_at\": \"<TS>\", \"task\": \"t006\", \"worker\": \"Sora\"}\n",
+  "state.yaml": "active_missions: []\ndefault_mission: null\n"
+ },
+ "steps": [
+  {
+   "cmd": "init Compat mission",
+   "rc": 0,
+   "stderr": "",
+   "stdout": "Initialized mission: <SLUG>\n  title: Compat mission\n  path:  <ROOT>/queue/missions/<SLUG>\n"
+  },
+  {
+   "cmd": "add Plain --skills bash",
+   "rc": 0,
+   "stderr": "",
+   "stdout": "Added: <SLUG>/t001 — Plain\n"
+  },
+  {
+   "cmd": "add Colon: \"quoted\" 日本語 --skills code,bash --priority high --description line one # not a comment",
+   "rc": 0,
+   "stderr": "",
+   "stdout": "Added: <SLUG>/t002 — Colon: \"quoted\" 日本語\n"
+  },
+  {
+   "cmd": "add Blocked on first --skills bash --blocked-by t001",
+   "rc": 0,
+   "stderr": "",
+   "stdout": "Added: <SLUG>/t003 — Blocked on first\n"
+  },
+  {
+   "cmd": "add Deliverable pr --skills bash --deliverable pr --priority low",
+   "rc": 0,
+   "stderr": "",
+   "stdout": "Added: <SLUG>/t004 — Deliverable pr\n"
+  },
+  {
+   "cmd": "add Held dep child --skills bash --blocked-by t004",
+   "rc": 0,
+   "stderr": "",
+   "stdout": "Added: <SLUG>/t005 — Held dep child\n"
+  },
+  {
+   "cmd": "add Verified path --skills bash --priority high",
+   "rc": 0,
+   "stderr": "",
+   "stdout": "Added: <SLUG>/t006 — Verified path\n"
+  },
+  {
+   "cmd": "status",
+   "rc": 0,
+   "stderr": "",
+   "stdout": "Active missions (1):\n\n  <SLUG> — Compat mission\n    Status: drafting  Progress: 0/6\n\n"
+  },
+  {
+   "cmd": "lint",
+   "rc": 1,
+   "stderr": "",
+   "stdout": "[WARN] skill: skill-permissions.yaml not found or empty: <ROOT>/config/skill-permissions.yaml\n[WARN] timeout: timeout-profiles.yaml not found or unreadable: <ROOT>/config/timeout-profiles.yaml\n[FAIL] deliverable: task/t001: 'deliverable' が未宣言です (この mission は必須) — plan.sh update t001 --deliverable pr|file|none\n[FAIL] deliverable: task/t002: 'deliverable' が未宣言です (この mission は必須) — plan.sh update t002 --deliverable pr|file|none\n[FAIL] deliverable: task/t003: 'deliverable' が未宣言です (この mission は必須) — plan.sh update t003 --deliverable pr|file|none\n[FAIL] deliverable: task/t004: deliverable 'pr' を skills と突き合わせられません — <ROOT>/config/skill-permissions.yaml: not found ([Errno 2] No such file or directory: '<ROOT>/config/skill-permissions.yaml')\n[FAIL] deliverable: task/t005: 'deliverable' が未宣言です (この mission は必須) — plan.sh update t005 --deliverable pr|file|none\n[FAIL] deliverable: task/t006: 'deliverable' が未宣言です (この mission は必須) — plan.sh update t006 --deliverable pr|file|none\n[WARN] deliverable: task/t004: deliverable 'pr' ですが、下流 (blocked_by を逆にたどった先) に skills に 'review' を含む task がありません — PR が作られても誰も review・merge しません (Codex review と merge の task を積む)\n"
+  },
+  {
+   "cmd": "pull (auto select 1)",
+   "rc": 0,
+   "stderr": "",
+   "stdout": "{\"mission\": \"<SLUG>\", \"id\": \"t002\", \"title\": \"Colon: \\\"quoted\\\" 日本語\", \"description\": \"line one # not a comment\", \"skills\": [\"code\", \"bash\"], \"priority\": \"high\", \"blocked_by\": [], \"target_dir\": null, \"task_slug\": \"colon-quoted\", \"worktree_path\": null}\n"
+  },
+  {
+   "cmd": "pull (auto select 2)",
+   "rc": 0,
+   "stderr": "",
+   "stdout": "{\"mission\": \"<SLUG>\", \"id\": \"t006\", \"title\": \"Verified path\", \"description\": \"\", \"skills\": [\"bash\"], \"priority\": \"high\", \"blocked_by\": [], \"target_dir\": null, \"task_slug\": \"verified-path\", \"worktree_path\": null}\n"
+  },
+  {
+   "cmd": "(picked by pull)",
+   "rc": 0,
+   "stderr": "",
+   "stdout": "{\"Ren\": \"t002\", \"Sora\": \"t006\"}"
+  },
+  {
+   "cmd": "status",
+   "rc": 0,
+   "stderr": "",
+   "stdout": "Active missions (1):\n\n  <SLUG> — Compat mission\n    Status: drafting  Progress: 0/6\n    🔄 t002 Colon: \"quoted\" 日本語 (Ren)\n    🔄 t006 Verified path (Sora)\n\n"
+  },
+  {
+   "cmd": "needs-director t002 long reason: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\nsecond line",
+   "rc": 0,
+   "stderr": "",
+   "stdout": "[plan.sh] Task t002 → needs_director\n[plan.sh] Reason: long reason: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx…(全文は本文を参照)\n[plan.sh] 全文は task body の '## Needs-Director 詳細' セクションに保存しました。\n[plan.sh] Director への通知: plan.sh status で確認してください\n"
+  },
+  {
+   "cmd": "update t002 --reset",
+   "rc": 0,
+   "stderr": "",
+   "stdout": "Updated: <SLUG>/t002 — reset(status=pending,worker=null,started_at=null,completed_at=null)\n"
+  },
+  {
+   "cmd": "pull --agent Ren --skills bash,code --task t002",
+   "rc": 0,
+   "stderr": "",
+   "stdout": "{\"mission\": \"<SLUG>\", \"id\": \"t002\", \"title\": \"Colon: \\\"quoted\\\" 日本語\", \"description\": \"line one # not a comment\", \"skills\": [\"code\", \"bash\"], \"priority\": \"high\", \"blocked_by\": [], \"target_dir\": null, \"task_slug\": \"colon-quoted\", \"worktree_path\": null}\n"
+  },
+  {
+   "cmd": "done t002 finished: with colon\nand a 2nd line --no-pr compat",
+   "rc": 0,
+   "stderr": "[plan.sh warn] --no-pr で PR 番号なしの done を記録しました (理由: compat) — card の no_pr_waiver に残しました\n[plan.sh warn] worker 'Ren' not found in registry — bump-task-count skipped (task 't002')\n",
+   "stdout": "Done: <SLUG>/t002\n"
+  },
+  {
+   "cmd": "done (already done)",
+   "rc": 2,
+   "stderr": "task 't002': done は status='done' の task には使えません (受け付けるのは: blocked, in_progress, needs_human_review, pending, ready_for_verification, verification_failed, verifying)\n",
+   "stdout": ""
+  },
+  {
+   "cmd": "done (no such task)",
+   "rc": 1,
+   "stderr": "task 't999' not found in any active mission.\n",
+   "stdout": ""
+  },
+  {
+   "cmd": "pull --agent Ren --skills bash,code --task t004",
+   "rc": 0,
+   "stderr": "",
+   "stdout": "{\"mission\": \"<SLUG>\", \"id\": \"t004\", \"title\": \"Deliverable pr\", \"description\": \"\", \"skills\": [\"bash\"], \"priority\": \"low\", \"blocked_by\": [], \"target_dir\": null, \"task_slug\": \"deliverable-pr\", \"worktree_path\": null}\n"
+  },
+  {
+   "cmd": "pull --task (busy Worker)",
+   "rc": 3,
+   "stderr": "Ren は既に別の task を持っています: card <SLUG>/t004 が in_progress です。task 't001' は取りません (何も書いていません)。先の task を done / needs-director で手放してから取り直してください。\n",
+   "stdout": ""
+  },
+  {
+   "cmd": "fail t004 --no-head compat",
+   "rc": 0,
+   "stderr": "[plan.sh warn] --no-head で head なしの FAIL を記録しました (理由: compat) — Director は検証対象を確認してください\n",
+   "stdout": "Failed: <SLUG>/t004\n"
+  },
+  {
+   "cmd": "fail (already failed)",
+   "rc": 2,
+   "stderr": "task 't004': fail は status='failed' の task には使えません (受け付けるのは: blocked, in_progress, needs_director, needs_human_review, pending, ready_for_verification, verification_failed, verifying)\n",
+   "stdout": ""
+  },
+  {
+   "cmd": "status",
+   "rc": 0,
+   "stderr": "",
+   "stdout": "Active missions (1):\n\n  <SLUG> — Compat mission\n    Status: drafting  Progress: 1/6\n    🔄 t006 Verified path (Sora)\n    🛑 t005 Held dep child — HELD: 依存 t004 が failed — Director の判断待ち。進めるなら `plan.sh release-dep t005 --mission <SLUG>` (fix が要るなら task を足す / 中止なら `plan.sh update t005 --mission <SLUG> --status skipped`)\n\n"
+  },
+  {
+   "cmd": "release-dep t005 --dep t004",
+   "rc": 0,
+   "stderr": "",
+   "stdout": "Released: <SLUG>/t005 — t004 (released_deps=['t004'])\n"
+  },
+  {
+   "cmd": "ready-for-verification t006",
+   "rc": 0,
+   "stderr": "",
+   "stdout": "Ready for verification: <SLUG>/t006\n"
+  },
+  {
+   "cmd": "verify-result t006 pass --notes looks fine",
+   "rc": 0,
+   "stderr": "",
+   "stdout": "verify-result: <SLUG>/t006 → verified (verdict=pass)\n"
+  },
+  {
+   "cmd": "pull --agent Ren --skills bash,code --task t001",
+   "rc": 0,
+   "stderr": "",
+   "stdout": "{\"mission\": \"<SLUG>\", \"id\": \"t001\", \"title\": \"Plain\", \"description\": \"\", \"skills\": [\"bash\"], \"priority\": \"medium\", \"blocked_by\": [], \"target_dir\": null, \"task_slug\": \"plain\", \"worktree_path\": null}\n"
+  },
+  {
+   "cmd": "retire (reset)",
+   "rc": 0,
+   "stderr": "",
+   "stdout": "Retired: <SLUG>/t001 — Ren @ <TS>\n[plan.sh] status=pending, worker=null, started_at=null, completed_at=null\n"
+  },
+  {
+   "cmd": "pull --agent Ren --skills bash,code --task t001",
+   "rc": 0,
+   "stderr": "",
+   "stdout": "{\"mission\": \"<SLUG>\", \"id\": \"t001\", \"title\": \"Plain\", \"description\": \"\", \"skills\": [\"bash\"], \"priority\": \"medium\", \"blocked_by\": [], \"target_dir\": null, \"task_slug\": \"plain\", \"worktree_path\": null}\n"
+  },
+  {
+   "cmd": "done (no AGENT_NAME: assignment stays)",
+   "rc": 0,
+   "stderr": "[plan.sh warn] --no-pr で PR 番号なしの done を記録しました (理由: compat) — card の no_pr_waiver に残しました\n[plan.sh warn] worker 'Ren' not found in registry — bump-task-count skipped (task 't001')\n",
+   "stdout": "Done: <SLUG>/t001\n"
+  },
+  {
+   "cmd": "reap-orphan-assignment Ren --no-wait",
+   "rc": 0,
+   "stderr": "",
+   "stdout": "[plan.sh] Reaped orphan assignment: Ren → <SLUG>:t001 (status=done)\n"
+  },
+  {
+   "cmd": "reap-orphan-assignment (already gone)",
+   "rc": 0,
+   "stderr": "",
+   "stdout": "[plan.sh] assignment/Ren は既にありません — 何もしません\n"
+  },
+  {
+   "cmd": "update t003 --priority medium --description edited: text",
+   "rc": 0,
+   "stderr": "",
+   "stdout": "Updated: <SLUG>/t003 — priority=medium, description=<updated>\n"
+  },
+  {
+   "cmd": "update t005 --status skipped",
+   "rc": 0,
+   "stderr": "",
+   "stdout": "Updated: <SLUG>/t005 — status=skipped\n"
+  },
+  {
+   "cmd": "update --status cancelled (refused)",
+   "rc": 1,
+   "stderr": "invalid status 'cancelled'. Valid statuses: blocked, done, failed, in_progress, needs_director, needs_human_review, pending, ready_for_verification, skipped, verification_failed, verified, verifying\n",
+   "stdout": ""
+  },
+  {
+   "cmd": "status --all",
+   "rc": 0,
+   "stderr": "",
+   "stdout": "Active missions (1):\n\n  <SLUG> — Compat mission\n    Status: drafting  Progress: 2/6\n\n"
+  },
+  {
+   "cmd": "archive (no such mission)",
+   "rc": 1,
+   "stderr": "mission 'compat-does-not-exist' not found.\n",
+   "stdout": ""
+  },
+  {
+   "cmd": "archive",
+   "rc": 0,
+   "stderr": "",
+   "stdout": "Archived: <SLUG> → archive/<SLUG>\n"
+  }
+ ]
+}

@@ -196,18 +196,14 @@ ALLOWED_JSON_PARSES: dict[tuple[str, str, str], str] = {
         _EXTERNAL_RESPONSE + "Claude Code の notification payload。★観測専用 (ログにだけ出し、"
         "check() の判定に使わない)。`except Exception` で '(unparseable)' に倒す",
     # -- (Q) queue 側の sidecar ----------------------------------------------
-    ("plan.sh", "_read_assignment_identity", "json.loads(text)"):
-        _QUEUE_SIDE + "queue/assignments の実行アイデンティティ sidecar。外側 (dict か) は強制済みで、"
-        "読めない・形が違うは None = 世代不明 (関数の docstring の契約)。"
-        "内側の欄の型は呼び出し側任せ — backlog",
     ("plan.sh", "predecessor_cleanup_pending", "json.loads(text)"):
         _QUEUE_SIDE + "registry/retirements の marker (t021)。読むのは「前任の後始末待ちと証明できるか」の"
         "判定だけで、外側 (dict か) は強制済み・内側は phase の一致と `_recorded_pid()` の検証を通る。"
         "**証明できない形はすべて False = 待たずに従来どおり拒否** (壊れた marker が拒否を緩めない向き)。"
         "入口へ移すなら lib_daemon_state を plan.sh の依存に足すことになり、単体コピーの fixture が壊れる",
     ("lib_state_store.py", "_read_identity", "json.loads(text)"):
-        _QUEUE_SIDE + "plan.sh `_read_assignment_identity` と同じ sidecar の読み (S2 の書き込み lib の写し。"
-        "S3 で plan.sh がこちらに寄る)。外側 (dict か) は強制済みで、読めない・形が違うは None = 世代不明 = "
+        _QUEUE_SIDE + "queue/assignments の実行アイデンティティ sidecar の読み (S3 で plan.sh の "
+        "`_read_assignment_identity` はこちらに一本化された)。外側 (dict か) は強制済みで、読めない・形が違うは None = 世代不明 = "
         "classify が UNVERIFIABLE (**消さない側**)。本体を先に読むので、この失敗が撤去の許可になる経路は無い",
     ("lib_state_store.py", "locked_update_json", "json.loads(text)"):
         _QUEUE_SIDE + "S5 で taskvia map (`queue/.taskvia-map.json`) の更新に使う専用ロック下の読み直し。"

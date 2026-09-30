@@ -1,15 +1,20 @@
-"""lib_state_store の直列化は plan.sh の今の直列化と**バイト単位で同じ** (設計 §3.2 直列化の行)。
+"""lib_state_store の直列化は **cutover 前の plan.sh** の直列化と**バイト単位で同じ** (設計 §3.2 直列化の行)。
 
-S3 で plan.sh がこの lib を使うまで、`dump_yaml` / `serialize_frontmatter` / `save_state` の規則は
-plan.sh と lib の 2 か所にある (§14-7「同じ規則の二重実装」の一時的な例外)。二重になっている間は
-このテストが止め具: plan.sh の関数を **AST で取り出して実行**し、同じ入力で出力が一致することを
-固定する。あわせて本物の plan.sh が書いた card / mission / state を読み戻して再直列化しても
-1 バイトも変わらないことを確かめる (S3 の QA (t013) の前倒しの一部)。
+S3 (t012) で plan.sh は自前の `dump_yaml` / `serialize_frontmatter` / `save_state` を捨て、この lib を
+使うようになった (原案 §14-7 二重実装の禁止)。「バイトが変わらない」の根拠は、cutover 前 (a1f6957) の
+plan.sh の関数を**その版で実行して得た出力**を golden として固定したもの
+(`tests/fixtures/state_store_serialization_golden.json`)。plan.sh の関数は今は無いので、AST で取り出して
+比べる方式は使えない — 旧版の出力を写した golden との比較に置き換えた。
+
+あわせて次を確かめる:
+- plan.sh に直列化のコピーが**戻っていない** (AST。関数名・`_NEEDS_QUOTE` 表・`open(..., 'w')` で queue を書く形)
+- 本物の plan.sh が書いた card / mission / state を lib で読み戻して再直列化しても 1 バイトも変わらない
 """
 
 from __future__ import annotations
 
 import ast
+import json
 import os
 import pathlib
 import re
@@ -23,85 +28,62 @@ import lib_task_cards as cards
 from fixture_tree import copy_plan_tree
 
 PLAN_SH = sc.REPO_ROOT / "scripts" / "plan.sh"
-WANTED_FUNCS = {"dump_yaml", "_dump_kv", "_dump_scalar", "_dump_inline", "serialize_frontmatter", "save_state"}
-WANTED_ASSIGNS = {"_NEEDS_QUOTE", "TASK_META_KEY_ORDER", "MISSION_KEY_ORDER"}
+GOLDEN = json.loads((pathlib.Path(__file__).parent / "fixtures" / "state_store_serialization_golden.json")
+                    .read_text(encoding="utf-8"))
+
+#: cutover 前に plan.sh が持っていた直列化の名前。plan.sh に**戻ってはいけない**。
+FORMER_PLAN_SH_SERIALIZERS = {
+    "dump_yaml", "_dump_kv", "_dump_scalar", "_dump_inline", "serialize_frontmatter",
+    "_NEEDS_QUOTE", "TASK_META_KEY_ORDER", "MISSION_KEY_ORDER",
+}
 
 
-def _plan_namespace():
+def _plan_tree() -> ast.Module:
     text = PLAN_SH.read_text()
     src = re.search(r"<<'PYEOF'\n(.*?)\nPYEOF", text, re.DOTALL).group(1)
-    tree = ast.parse(src)
-    picked = []
+    return ast.parse(src)
+
+
+def test_golden_is_not_vacuous():
+    """golden が空・少数でないこと (0 件で全部 PASS しない)。"""
+    assert len(GOLDEN["cards"]) == 40
+    assert len(GOLDEN["missions"]) == 3
+    assert len(GOLDEN["states"]) == 4
+    assert all(c["expected"].startswith("---\n") for c in GOLDEN["cards"])
+
+
+@pytest.mark.parametrize("case", GOLDEN["cards"], ids=lambda c: f"{c['meta'].get('title', '')[:12]!r}-{len(c['body'])}")
+def test_serialize_card_matches_pre_cutover_plan_sh_byte_for_byte(case):
+    assert store.serialize_card(dict(case["meta"]), case["body"]) == case["expected"]
+
+
+@pytest.mark.parametrize("case", GOLDEN["missions"])
+def test_serialize_mission_matches_pre_cutover_plan_sh(case):
+    assert store.serialize_mission(dict(case["data"])) == case["expected"]
+
+
+@pytest.mark.parametrize("case", GOLDEN["states"])
+def test_serialize_state_matches_pre_cutover_plan_sh(case):
+    assert store.serialize_state(dict(case["state"])) == case["expected"]
+
+
+def test_plan_sh_no_longer_carries_a_copy_of_the_serializer():
+    """plan.sh のモジュール直下の定義・代入に、旧直列化の名前が無い (コピーが戻ったら赤)。"""
+    tree = _plan_tree()
+    defined = set()
     for node in tree.body:
-        if isinstance(node, ast.FunctionDef) and node.name in WANTED_FUNCS:
-            picked.append(node)
-        elif isinstance(node, ast.Assign) and any(
-                isinstance(t, ast.Name) and t.id in WANTED_ASSIGNS for t in node.targets):
-            picked.append(node)
-    found = {n.name for n in picked if isinstance(n, ast.FunctionDef)} | \
-            {t.id for n in picked if isinstance(n, ast.Assign) for t in n.targets}
-    assert found == WANTED_FUNCS | WANTED_ASSIGNS, f"plan.sh から取り出せなかった: {(WANTED_FUNCS | WANTED_ASSIGNS) - found}"
-    written = []
-    ns = {"re": re, "STATE_FILE": "state.yaml", "_atomic_write": lambda path, text: written.append(text),
-          "written": written}
-    exec(compile(ast.Module(body=picked, type_ignores=[]), str(PLAN_SH), "exec"), ns)
-    return ns
-
-
-@pytest.fixture
-def plan():
-    # テストごとに新しい名前空間: plan.sh の dump_yaml は key_order を書き換える (1 回で終わる CLI では
-    # 無害)。持ち越すと、前のケースの未知のキーが次のケースの並びに混ざる。
-    return _plan_namespace()
-
-
-CARD_CORPUS = [
-    {"id": "t001", "title": "plain", "skills": ["code", "bash"], "status": "pending"},
-    {"id": "t001", "title": 'colon: "quotes" and \\ backslash', "skills": [], "worker": None},
-    {"id": "t001", "title": "multi\nline\r\nreason\n", "needs_director_reason": "a\nb"},
-    {"id": "t001", "title": "true", "priority": "123", "worker": "null", "started_at": "yes"},
-    {"id": "t001", "title": "日本語のタイトル: 混在", "blocked_by": ["t002", "t003"], "pr_number": 42},
-    {"id": "t001", "title": "x", "rework_count": 0, "max_rework": 3, "no_pr_waiver": "理由 # hash"},
-    {"id": "t001", "title": "x", "qa_checkpoints": ["a: b", "c"], "required_evidence": [1, True, None, "s"]},
-    {"id": "t001", "title": "x", "zzz_unknown_key": "kept after the ordered ones", "aaa": 1},
-    {"id": "t001", "title": "", "skills": [""], "target_dir": "/tmp/x y"},
-    {"id": "t001", "title": "x", "review": {"last_verdict": None, "cycle_count": 0, "reviewer": "a: b"}},
-]
-BODIES = ["", "no trailing newline", "with newline\n", "## Description\nd\n\n## Result\nr\n"]
-
-
-@pytest.mark.parametrize("meta", CARD_CORPUS)
-@pytest.mark.parametrize("body", BODIES)
-def test_serialize_card_matches_plan_sh_byte_for_byte(plan, meta, body):
-    assert store.serialize_card(dict(meta), body) == plan["serialize_frontmatter"](dict(meta), body)
-
-
-@pytest.mark.parametrize("data", [
-    {"title": "m", "slug": "s", "status": "drafting", "next_task_id": 3, "max_review_cycles": 3,
-     "deliverable_required": True, "created_at": "2026-09-30T00:00:00Z", "completed_at": None,
-     "review": {"last_verdict": None, "cycle_count": 0, "reviewed_at": None, "reviewer": None}},
-    {"slug": "s", "extra": "after", "title": "colon: x", "next_task_id": 1},
-    {},
-])
-def test_serialize_mission_matches_plan_sh(plan, data):
-    assert store.serialize_mission(dict(data)) == plan["dump_yaml"](dict(data), key_order=plan["MISSION_KEY_ORDER"])
-
-
-@pytest.mark.parametrize("state", [
-    {"active_missions": [], "default_mission": None},
-    {"active_missions": ["a", "20260930-x"], "default_mission": "a"},
-    {"active_missions": None, "default_mission": "weird: name"},
-    {"default_mission": "only"},
-])
-def test_serialize_state_matches_plan_sh(plan, state):
-    plan["written"].clear()
-    plan["save_state"](dict(state))
-    assert plan["written"] == [store.serialize_state(dict(state))]
-
-
-def test_key_order_tables_are_the_same_as_plan_sh(plan):
-    assert store.TASK_META_KEY_ORDER == plan["TASK_META_KEY_ORDER"]
-    assert store.MISSION_KEY_ORDER == plan["MISSION_KEY_ORDER"]
+        if isinstance(node, (ast.FunctionDef, ast.ClassDef)):
+            defined.add(node.name)
+        elif isinstance(node, ast.Assign):
+            defined |= {t.id for t in node.targets if isinstance(t, ast.Name)}
+    assert len(tree.body) > 200, "plan.sh の python 本体を読めていない (空虚な PASS)"
+    assert defined & FORMER_PLAN_SH_SERIALIZERS == set(), (
+        "plan.sh に直列化のコピーが戻っている: " + ", ".join(sorted(defined & FORMER_PLAN_SH_SERIALIZERS)))
+    # 陽性対照: 検出器が旧 plan.sh (golden の生成元と同じ形) の名前を拾えること
+    sample = ast.parse("def dump_yaml(data, key_order=None):\n    pass\n_NEEDS_QUOTE = set()\n")
+    names = {n.name for n in sample.body if isinstance(n, ast.FunctionDef)} | \
+            {t.id for n in sample.body if isinstance(n, ast.Assign) for t in n.targets}
+    assert names & FORMER_PLAN_SH_SERIALIZERS == {"dump_yaml", "_NEEDS_QUOTE"}
 
 
 def test_real_plan_sh_output_round_trips_through_the_lib_unchanged(tmp_path):
@@ -139,7 +121,7 @@ def test_real_plan_sh_output_round_trips_through_the_lib_unchanged(tmp_path):
 
 
 def test_lib_dump_yaml_does_not_mutate_its_key_order_table():
-    """plan.sh は渡された表に未知のキーを足す。長く生きるプロセスで使う lib は表を汚さない。"""
+    """旧 plan.sh の dump_yaml は渡された表に未知のキーを足した。長く生きるプロセスで使う lib は表を汚さない。"""
     before = list(store.TASK_META_KEY_ORDER)
     store.serialize_card({"id": "t001", "zzz_unknown": 1}, "b")
     store.serialize_mission({"slug": "s", "zzz_unknown": 1})

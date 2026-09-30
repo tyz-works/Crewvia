@@ -252,6 +252,12 @@ def test_pull_is_not_blocked_by_a_retirement_marker_in_the_checkout_registry(tmp
     """
     world = World(tmp_path)
     assert (world.checkout / "registry" / "retirements" / "Ren.json").exists()
+    # pull は書く直前に「別の task を持っていない」を無条件に確かめる (t038)。共有 fixture の Ren は
+    # 他 subcommand 用に in_progress の card を持つので、この検査では手放し済み (done) にする。
+    for card in (world.queue / "missions" / MISSION / "tasks").glob("t*.md"):
+        text = card.read_text()
+        if "worker: Ren" in text and "status: in_progress" in text:
+            card.write_text(text.replace("status: in_progress", "status: done"))
     proc = world.run("pull", "--agent", "Ren", "--skills", "code", "--mission", MISSION)
     assert proc.returncode == 0, proc.stdout + proc.stderr
 

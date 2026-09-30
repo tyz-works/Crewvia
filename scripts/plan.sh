@@ -2175,12 +2175,6 @@ def retire_assignment(agent, mission, task_id, generation):
     return verdict
 
 
-#: 直近の `recover_before()` が完了できなかったか。本体が「回復は済んだ」を前提に**既存を置き換える**
-#: 書き込み (pull の assignment 公開) の直前で見る — 回復は拒否を足さないが、前提が崩れたまま
-#: 破壊的に書くことも許さない (t037)。
-_RECOVERY_INCOMPLETE = [False]
-
-
 def recover_before(cards=(), agents=(), add_missions=(), archive_slugs=(), include_caller=True):
     """ロックを取った直後・**コマンドの前提検査より前**に、card を正本として projection
     (assignment / .identity) の食い違いを作り直す (vNext 01a S4。設計 §2.3・§2.5)。
@@ -2195,7 +2189,6 @@ def recover_before(cards=(), agents=(), add_missions=(), archive_slugs=(), inclu
     (disk full・権限) コマンドは止めず警告する — 止めると、その状態から抜ける操作まで拒否して
     復旧の出口を消す。
     """
-    _RECOVERY_INCOMPLETE[0] = False
     caller = os.environ.get('AGENT_NAME', '').strip() if include_caller else ''
     scope = _STORE.Scope(
         cards=tuple(dict.fromkeys(cards)),
@@ -2208,7 +2201,6 @@ def recover_before(cards=(), agents=(), add_missions=(), archive_slugs=(), inclu
     except _STORE.StoreError as e:
         print(f"[plan.sh warn] 回復 (projection の作り直し) を完了できませんでした: {e}"
               f" — コマンド本体は続けます", file=sys.stderr)
-        _RECOVERY_INCOMPLETE[0] = True
         return []
 
 
@@ -3407,16 +3399,18 @@ def cmd_pull(args):
         # 選んだ card を指す枠 (逆引き) が残っていれば、書く前に片付ける: reset の途中で落ちて
         # 旧所有者の枠だけが残った card を別の Worker が取ると、旧所有者の枠が恒久に残る。
         recover_before(cards=[(slug, meta['id'])], include_caller=False)
-        if agent and _RECOVERY_INCOMPLETE[0]:
-            # 回復が失敗した (この Worker の枠が古いまま残りうる) なら、publish_assignment が
-            # 枠を上書きして先の task の projection を失わせないよう、別の task を持っていないと
-            # 確かめてから書く (読めない枠は「持っている」扱い)。拒否は exit 1 (exit 2 は idle)。
+        if agent:
+            # 回復の成否に関係なく (フラグは持ち回さない — 1 コマンドで回復を 2 回呼ぶので、
+            # 1 回目の失敗を 2 回目の成功が消す, t038)、publish_assignment が別の task を持つ
+            # Worker の枠を上書きして先の task の projection を失わせないよう、書く直前に
+            # 別の task を持っていないと確かめる (読めない枠は「持っている」扱い)。
+            # 拒否は exit 1 (exit 2 は idle)。--task 経路の (2) と同じ agent_busy_elsewhere()。
             busy = agent_busy_elsewhere(agent, slug, meta['id'], slugs)
             if busy:
-                die(f"{agent} は既に別の task を持っています: {busy}。回復 (projection の作り直し) が"
-                    f"完了できなかったため、assignment を上書きせず何も書いていません。"
-                    f"先の task を done / needs-director で手放すか、回復の失敗の原因を直してから"
-                    f"取り直してください。", PRECONDITION_UNMET)
+                die(f"{agent} は既に別の task を持っています: {busy}。"
+                    f"task '{meta['id']}' は取りません (assignment を上書きせず何も書いていません)。"
+                    f"先の task を done / needs-director で手放してから取り直してください。",
+                    PRECONDITION_UNMET)
         meta['status'] = 'in_progress'
         meta['worker'] = agent or None
         meta['started_at'] = now_generation()

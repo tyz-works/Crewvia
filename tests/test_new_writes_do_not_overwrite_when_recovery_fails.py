@@ -144,3 +144,32 @@ def test_pull_with_a_failed_recovery_does_not_overwrite_the_slot_of_a_busy_worke
     assert e.value.code == ns["PRECONDITION_UNMET"]
     assert (slot.read_bytes(), identity.read_bytes(),
             {k: v for k, v in box.snapshot().items() if "tasks" in k}) == before
+
+
+@pytest.mark.parametrize("fail_calls", [(1,), (2,), (1, 2)], ids=["fail-then-ok", "ok-then-fail", "fail-fail"])
+def test_auto_pull_never_overwrites_a_busy_workers_slot_for_any_recovery_outcome(tmp_path, monkeypatch, fail_calls):
+    """自動 pull は recover_before を 2 回呼ぶ。成否の全組み合わせで既存の枠・card は不変 (t038)。"""
+    box = seed_running(tmp_path / "b", agent="Ren", tasks=1)
+    box.run("add", "FREE", "--skills", "bash", "--deliverable", "none")
+    slot = box.queue / "assignments" / "Ren"
+    identity = box.queue / "assignments" / "Ren.identity"
+    before = (slot.read_bytes(), identity.read_bytes(), {k: v for k, v in box.snapshot().items() if "tasks" in k})
+
+    real = store.Txn.recover
+    calls = [0]
+
+    def flaky(self, scope):
+        calls[0] += 1
+        if calls[0] in fail_calls:
+            raise store.StoreWriteError(str(box.queue / "assignments" / "Ren"), "write", 28)
+        return real(self, scope)
+
+    monkeypatch.setattr(store.Txn, "recover", flaky)
+    ns = box.namespace()
+    monkeypatch.setenv("AGENT_NAME", "Ren")
+    with pytest.raises(SystemExit) as e:
+        ns["cmd_pull"](["--agent", "Ren", "--skills", "bash"])
+    assert calls[0] >= 2
+    assert e.value.code == ns["PRECONDITION_UNMET"]
+    assert (slot.read_bytes(), identity.read_bytes(),
+            {k: v for k, v in box.snapshot().items() if "tasks" in k}) == before

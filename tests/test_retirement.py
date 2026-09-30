@@ -2727,6 +2727,10 @@ def test_red_marker_is_not_created_while_a_pull_transaction_is_open(sandbox):
     mux = FakeMux({WINDOW: pane_pid})
     _add_pending_task(sandbox, "t002")
     make_idle(sandbox)   # dispatcher が idle と判断する材料をそろえる
+    # pull は書く直前に「別の task を持っていない」を無条件に確かめる (t038)。本当に idle な Worker
+    # の状態にするため、先の task の card も手放し済みにする (枠だけ消えた in_progress は idle ではない)。
+    t001 = sandbox.queue / "missions" / SLUG / "tasks" / f"{TASK_ID}.md"
+    t001.write_text(t001.read_text().replace("status: in_progress", "status: done", 1))
 
     ex = make_executor(sandbox, mux)
 

@@ -298,7 +298,7 @@ else
   fail "needs_director の notify_key が dispatcher.sh に見つからない"
 fi
 
-if grep -q "meta.get('status') != 'needs_director'" "$DISPATCHER_SH"; then
+if grep -q "meta.get('status') not in WAITS_ON_DIRECTOR_STATUSES" "$DISPATCHER_SH"; then
   pass "status == 'needs_director' の task を対象にするフィルタが存在する"
 else
   fail "needs_director ステータスをフィルタする条件が見つからない"

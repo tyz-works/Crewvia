@@ -387,28 +387,24 @@ def test_a_normal_worker_still_gets_a_pane_match(sandbox):
 # ---------------------------------------------------------------------------
 
 def test_cancelled_does_not_contradict_the_dependency_rule(sandbox):
-    """`cancelled` の見え方が、下流の READY と矛盾しないこと。
+    """`cancelled` は語彙から消えた (vNext 01a S1)。手書きの `cancelled` は知らない status。
 
-    `cancelled` は DEAD_DEP_STATUSES 側 = 依存として「満たされた」扱いなので、
-    下流は READY になる。上流を `blocked` と表示すると、**止まっている依存の
-    下流が動ける** という読めない画面になる。
+    見え方は「上流 = `[status不明]` + blocked」「下流 = waiting」で、pull も下流を割り当てない
+    (依存規則と画面が矛盾しない)。以前は「終端 (中止) + 下流 READY」だったが、書き手が 0 で
+    本番カードも 0 件だった。Director の中止は `skipped` (`[skip]` + done)。
     """
     sandbox.add_task("t001", "cancelled", [])
     sandbox.add_task("t002", "pending", ["t001"])
     assert sandbox.run("task-graph").returncode == 0
 
     nodes = _by_id(assert_plugin_accepts(sandbox))
-    assert nodes[f"{MISSION}:t002"]["status"] == "ready"
-    assert nodes[f"{MISSION}:t001"]["status"] == "failed", (
-        "cancelled が終端に見えていない — 下流の READY と食い違う"
-    )
-    assert "[中止]" in nodes[f"{MISSION}:t001"]["title"], (
-        "cancelled が failed と区別できない"
-    )
+    assert nodes[f"{MISSION}:t002"]["status"] == "waiting"
+    assert nodes[f"{MISSION}:t001"]["status"] == "blocked"
+    assert "[status不明]" in nodes[f"{MISSION}:t001"]["title"]
 
-    # 対照: pull が実際に t002 を割り当てる
+    # 対照: pull も t002 を割り当てない (画面と規則が一致)
     r = sandbox.run("pull", "--agent", "Ren", "--skills", "code")
-    assert '"id": "t002"' in r.stdout, r.stdout
+    assert '"id": "t002"' not in r.stdout, r.stdout
 
 
 def test_every_status_the_linter_accepts_is_in_the_mapping_table():
@@ -417,7 +413,6 @@ def test_every_status_the_linter_accepts_is_in_the_mapping_table():
     表に無い status は `[status不明]` + `blocked` に落ちる。crewvia が普通に
     書く status がそこに落ちるのは、まさに F-2a で起きたこと。
     """
-    import ast
     import re
 
     plan_src = (REPO_ROOT / "scripts" / "plan.sh").read_text()
@@ -427,10 +422,9 @@ def test_every_status_the_linter_accepts_is_in_the_mapping_table():
     assert m, "TASK_GRAPH_STATUS_MAP が plan.sh に無い"
     mapped = set(re.findall(r"^\s*'([a-z_]+)':", m.group(1), re.MULTILINE))
 
-    lint_src = (REPO_ROOT / "scripts" / "lint_plan.py").read_text()
-    m = re.search(r"^VALID_STATUSES = (\{.*?\})$", lint_src, re.DOTALL | re.MULTILINE)
-    assert m, "VALID_STATUSES が lint_plan.py に無い"
-    valid = ast.literal_eval(m.group(1))
+    sys.path.insert(0, str(REPO_ROOT / "scripts"))
+    from lib_task_status import TASK_STATUSES   # lint も update も同じ集合を読む
+    valid = set(TASK_STATUSES)
 
     # `pending` は依存の状態で ready / waiting に分かれるので表には載らない。
     missing = valid - mapped - {"pending"}

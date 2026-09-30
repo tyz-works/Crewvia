@@ -14,7 +14,7 @@
 #       failed dep を満たされた扱いにすると、QA FAIL 直後に review/merge task が
 #       自動で unblock され merge 寸前まで進んだ。いまは failed dep = 保留 (HELD):
 #       Director が `plan.sh release-dep` するまで pull / dispatch は拒否する。
-#       cancelled は Director 自身の判断なので従来どおり blocking しない。
+#       Director の「中止」= skipped は完了扱いで blocking しない (`cancelled` は S1 で語彙から消えた)。
 #       (網羅的な突き合わせは tests/test_failed_dependency_hold.py)
 #
 # このテストで検証:
@@ -27,7 +27,7 @@
 #   7. 再現テスト: pending dep で blocked task を --task で pull → 拒否
 #   BC-1: dep=failed → pull 不可 (保留。理由と release-dep の案内が出る)
 #   BC-1b: release-dep 後 → pull 可
-#   BC-2: dep=cancelled → pull 可 (cancelled は blocking しない)
+#   BC-2: dep=skipped → pull 可 (Director の中止は blocking しない)
 #
 # 実行: bash scripts/test_blocked_by_guard.sh
 # 副作用: /tmp 配下に一時ディレクトリを作成し終了時に削除する
@@ -117,9 +117,9 @@ write_task t007 "Task blocked by failed dep" pending "t008"
 printf -- '---\nid: t008\ntitle: Failed dep\nskills: [bash]\npriority: medium\nstatus: failed\nblocked_by: []\nworker: null\nstarted_at: null\ncompleted_at: null\n---\n\n## Description\nFailed task.\n\n## Result\n' \
   > "$TASKS_DIR/t008.md"
 
-# t009: pending, blocked by t010 (cancelled) → pull-able (BC-2)
-write_task t009 "Task blocked by cancelled dep" pending "t010"
-printf -- '---\nid: t010\ntitle: Cancelled dep\nskills: [bash]\npriority: medium\nstatus: cancelled\nblocked_by: []\nworker: null\nstarted_at: null\ncompleted_at: null\n---\n\n## Description\nCancelled task.\n\n## Result\n' \
+# t009: pending, blocked by t010 (skipped) → pull-able (BC-2)
+write_task t009 "Task blocked by skipped dep" pending "t010"
+printf -- '---\nid: t010\ntitle: Skipped dep\nskills: [bash]\npriority: medium\nstatus: skipped\nblocked_by: []\nworker: null\nstarted_at: null\ncompleted_at: null\n---\n\n## Description\nSkipped task.\n\n## Result\n' \
   > "$TASKS_DIR/t010.md"
 
 # Helper: run plan.sh with test QUEUE (stdout only; discard stderr warnings)
@@ -191,11 +191,12 @@ else
 fi
 
 echo ""
-echo "--- Test 6: dispatcher.sh TERMINAL_STATUSES includes 'verified' ---"
-if grep -q "TERMINAL_STATUSES.*verified" "$DISPATCHER_SH"; then
-  pass "dispatcher.sh TERMINAL_STATUSES contains 'verified'"
+echo "--- Test 6: dispatcher.sh TERMINAL_STATUSES は lib_task_status の 1 か所 (verified を含む) ---"
+if grep -q "lib_task_status import" "$DISPATCHER_SH" \
+   && python3 -c "import sys; sys.path.insert(0, '$(dirname "$DISPATCHER_SH")'); from lib_task_status import TERMINAL_STATUSES as T; sys.exit(0 if 'verified' in T else 1)"; then
+  pass "dispatcher.sh reads TERMINAL_STATUSES from lib_task_status (contains 'verified')"
 else
-  fail "dispatcher.sh TERMINAL_STATUSES should include 'verified' to match plan.sh"
+  fail "dispatcher.sh TERMINAL_STATUSES should come from lib_task_status and include 'verified'"
 fi
 
 echo ""
@@ -238,12 +239,12 @@ else
 fi
 
 echo ""
-echo "--- BC-2: dep=cancelled → pull --task succeeds (Director's own decision) ---"
+echo "--- BC-2: dep=skipped → pull --task succeeds (Director's own decision) ---"
 out_bc2=$(run_plan_stdout pull --task t009 --mission "$MISSION_SLUG" --skills bash) && rc_bc2=0 || rc_bc2=$?
 if [[ "$rc_bc2" -eq 0 ]] && echo "$out_bc2" | python3 -c "import sys,json; d=json.load(sys.stdin); exit(0 if d.get('id')=='t009' else 1)" 2>/dev/null; then
-  pass "BC-2: dep=cancelled → t009 pulled"
+  pass "BC-2: dep=skipped → t009 pulled"
 else
-  fail "BC-2: cancelled dep should NOT block — rc=$rc_bc2 out=$out_bc2"
+  fail "BC-2: skipped dep should NOT block — rc=$rc_bc2 out=$out_bc2"
 fi
 
 echo ""

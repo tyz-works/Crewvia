@@ -193,9 +193,9 @@ cleanup_queue() {
   [ "$status" -eq 0 ]
 }
 
-@test "--task: blocked_by cancelled dep → pull succeeds" {
-  setup_queue "bbt-cancelled-dep"
-  add_task t001 cancelled ""
+@test "--task: blocked_by skipped dep (Director の中止) → pull succeeds" {
+  setup_queue "bbt-skipped-dep"
+  add_task t001 skipped ""
   add_task t002 pending "t001"
 
   run plan_pull_task t002

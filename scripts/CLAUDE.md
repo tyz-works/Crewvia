@@ -27,6 +27,17 @@ lib ごとの**破ってはいけない契約**の要約。理由・経緯・全
   コピーしない。**`failed` の依存は「保留（HELD）」**で、進める出口は Director の `plan.sh release-dep <id> --mission <slug>` だけ。
 - 共有規則に env 停止スイッチを付けない（dispatcher と plan.sh で答えが割れる）。
 
+## status の語彙（`lib_task_status.py`）
+
+- task の status の語彙・終端 / 手放した / 判断待ちの集合・コマンドごとの「受け付ける元の status」
+  （`ACCEPTS_FROM`）の**唯一の定義**。データだけ（I/O・import なし）。plan.sh / dispatcher.sh / lint_plan.py /
+  taskvia-sync.sh / verifier-dispatcher.sh / lib_dep_rules.py は import して使う。status を 2 つ以上並べた
+  リテラルを外に書かない（`tests/test_task_status_single_definition.py` が AST で落とす。足りない集合は
+  `lib_task_status` に足す）。
+- 拒否は `plan.sh` の `refuse_transition()` 1 か所（exit 2・何も書かない）。S1 は**現状を写す**（狭めるのは 01c）。
+  `cancelled` は語彙に無い（書き手が無かった）。手書きされても知らない status = 拒否 / 待つ / 塞ぐ側に倒れる。
+  設計・挙動が変わる箇所・戻し方: `knowledge/state-store.md` §1。
+
 ## mux（`lib_mux.py`）
 
 - `registry/mux/<name>.json`（spawn 記録）は **kill の認可の唯一の証拠**。消してよいのは mux が

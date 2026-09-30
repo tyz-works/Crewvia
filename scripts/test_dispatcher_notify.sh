@@ -137,12 +137,13 @@ from lib_dep_rules import card_dependencies  # noqa: E402
 # カードの読み取りも本物から取る。ここに dispatcher.sh の写しを置くと、
 # 本番を直してもこのテストは緑のままになる (いちばん質の悪い緑)。
 from lib_task_cards import list_task_cards  # noqa: E402
+# status の集合も本物から取る (写すと、本番の集合が変わってもこのテストだけ古いまま緑になる)。
+from lib_task_status import TERMINAL_STATUSES  # noqa: E402
 
 MISSIONS_DIR   = QUEUE_DIR / 'missions'
 STATE_FILE     = QUEUE_DIR / 'state.yaml'
 WORKERS_FILE   = REGISTRY_DIR / 'workers.yaml'
 PRIORITY_ORDER = {'high': 0, 'medium': 1, 'low': 2}
-TERMINAL_STATUSES = {'done', 'verified', 'skipped'}
 DIRECTOR_ONLY_SKILLS = {'director-only'}   # Fix A: same constant as dispatcher.sh
 
 

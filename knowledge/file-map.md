@@ -268,7 +268,7 @@ tests/red_proof_unobservable.sh）
 ### `lib_dep_rules.py`
 
 「依存が満たされた」の唯一の定義（`card_dependencies(meta, ...)` →
-`DependencyVerdict(unmet, held)`。`HELD_DEP_STATUSES` / `DEAD_DEP_STATUSES`）。
+`DependencyVerdict(unmet, held)`。`HELD_DEP_STATUSES` は `lib_task_status` の再公開。`DEAD_DEP_STATUSES` は S1 で廃止）。
 **plan.sh pull（自動・`--task`）・plan.sh task-graph・plan.sh status・
 dispatcher.sh がここだけを読む**。コピーを書き戻すと、
 ズレが出るのは QA FAIL の直後だけ（= 誰も疑わない瞬間）になる。
@@ -282,8 +282,7 @@ plan.sh を単体でコピーする隔離テストでは一緒に置くこと。
 **規則は区別できない**ので、辺ごとの hard/soft を plan 時点で選ばせる案は採らず
 （failed の理由を見る前には決められない・選び忘れが事故側に倒れる）、
 Director が failed の後に `plan.sh release-dep` で解除する形にした。
-`blocked_by` は消さず `released_deps` に記録する。`cancelled` は Director 自身の
-判断なので従来どおり満たされた扱い。`plan.sh status` が `🛑 HELD` と解除コマンド
+`blocked_by` は消さず `released_deps` に記録する。（`cancelled` は S1 で語彙から消えた）`plan.sh status` が `🛑 HELD` と解除コマンド
 を出し、task-graph は `[保留: <id> が failed]`、dispatcher は `[held]` をログに出す
 （保留が「永久保留」という別の outage にならないための出口）。
 **停止スイッチは無い**（長寿命の dispatcher と呼ばれるたびに読み直す plan.sh で

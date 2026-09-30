@@ -540,6 +540,24 @@ locked_update_json(path, lock_path, fn) -> dict  # 専用ロック + 読み直�
     (1 回で終わる CLI では無害・長く生きるプロセスでは表が育つ) — lib は表をコピーして汚さない (出力は同じ)
   - 状態の語彙 (`_TERMINAL_STATUSES` 等) は S1 (t004) の `lib_task_status.py` 合流までの暫定コピー。HELD / DEAD は
     `lib_dep_rules` から取る (コピーしない)。**S1 が入ったら import に置き換える** (backlog)
+- **2 巡目 (t029 / PR #257 Codex P2 ×2) — 読めない入力を健全と報告しない・内容を出さない**
+  - **P2-1**: `_list_dir()` は `(名前, コード)` を返す (**ENOENT だけ**「無い」= `([], None)`。それ以外は
+    `list_error:<ERRNO>`)。`Scope.everything()` は列挙に失敗した場所・読めない `state.yaml` を `Scope.unobservable` に残し、
+    `diagnose()` が `unobservable_input` の finding として返す (`[]` = 健全、を観測できたときだけにする)。
+    `os.walk` の列挙失敗 (`onerror`) も同じ finding。R-2 は読めない枠を**名指しの card が参照していなくても**
+    `reported:assignment_unverifiable` として報告する (消さない・上書きしない)。R-3 / 逆引きの列挙失敗は
+    `tasks_dir_unreadable` / `assignments_dir_unreadable`、R-4 は `missions/<slug>` と `archive/<slug>` を **lstat の errno で**
+    両方観測して確かめ (`lexists` / `isdir` は EACCES でも False)、観測できなければ `archive_state_unobservable`
+    (active から外さない)。`orphan_identity` も本体を lstat で観測できたときだけ
+  - **P2-2**: stderr・監査ログ・例外メッセージへ出してよいのは**固定コードと安全なメタデータ**だけ。
+    `lib_task_cards.parse_yaml()` の ValueError は問題の行をそのまま含むので `str(e)` を通さず、`_parse_code()`
+    (`parse_error:line=<N>`) に写す。`Unreadable.reason` も `_unreadable_code()` (`read_error:<ERRNO>` / `decode_error` /
+    `not_regular_file`) に写す。**例外は `except` の外で投げる** (`__context__` にパーサ例外 = 問題の行が残るため)。
+    監査ログの行は `_append_audit()` が唯一の出口で、全欄を門 (`_safe_token` / `_safe_status` / `_safe_generation` /
+    `_safe_result` / `_safe_relpath` / `_safe_detail` = 形の許可表) に通す。門を通らない値は `None` / `'redacted'`
+    (200 文字で切る方式は捨てた — 切っても約束は守れない)。card の `worker` が識別子の形でなければ枠を作らない
+  - 族ごとの掃除の表 (lib 内の例外捕捉 48 箇所・文字列が外へ出る 7 経路) は PR #257 の t029 の Result
+
 - **残る残骸 (無害・store-check が件数を出す)**: kill された書き手の `.<name>.tmp.*` / `retire_assignment` が本体を
   消した後・identity を消す前で落ちた `<agent>.identity`。どちらも判定に使われない (列挙は `tNNN.md` だけ・classify は
   本体を先に読み次の publish が上書きする)。crash 注入テストはこの 2 種だけを許容する

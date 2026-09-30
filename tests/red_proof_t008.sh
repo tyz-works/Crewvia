@@ -175,7 +175,7 @@ expect_red "M" "$CRASH" "test_reset_crash_between_card_and_retire_is_repaired_by
 echo "== N: state.yaml が読めないとき既定値に潰す"
 fresh_copy
 inject $LIB "        if _cards.is_unreadable(text):
-            raise StoreReadError(path, text.reason, text.errno)
+            raise StoreReadError(path, _unreadable_code(text), text.errno)
         try:
             data = _cards.parse_yaml(text, source=path)" "        if _cards.is_unreadable(text):
             return {'active_missions': [], 'default_mission': None}
@@ -204,7 +204,7 @@ expect_red "Q" "$FAST" "test_r1_never_writes_the_authoritative_card"
 
 echo "== R: audit に Result 本文を出す"
 fresh_copy
-inject $LIB "            'files': list(files)," "            'files': list(files), 'leak': open(self.card_path(rec['mission'], rec['task'])).read() if rec.get('task') and rec.get('mission') and os.path.exists(self.card_path(rec['mission'], rec['task'])) else None,"
+inject $LIB "            'files': [f for f in map(_safe_relpath, files) if f is not None]," "            'files': list(files), 'leak': open(self.card_path(rec['mission'], rec['task'])).read() if rec.get('task') and rec.get('mission') and os.path.exists(self.card_path(rec['mission'], rec['task'])) else None,"
 expect_red "R" "$FAST" "test_body_row_fields_and_no_content_leak"
 
 echo "== S: dump_yaml が key_order の表を書き換える"

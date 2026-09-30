@@ -68,6 +68,93 @@ import lib_dep_rules as _dep_rules  # noqa: E402
 import lib_task_cards as _cards  # noqa: E402
 
 # ---------------------------------------------------------------------------
+# 「内容を出さない」の門 (原案 §14-21 / STATE-06)
+# ---------------------------------------------------------------------------
+#
+# stderr・監査ログ・例外メッセージへ出してよいのは、**固定のコード**と**安全なメタデータ**
+# (ファイルパス・行番号・errno の名前・ファイル名由来の識別子・既知の status 語彙) だけ。
+# カードの本文・frontmatter の値・Result・assignment の中身・パーサ例外の文字列は出さない。
+# `lib_task_cards.parse_yaml()` の ValueError は**問題の行をそのまま含む** (`{line!r}`) ので、
+# `str(e)` を経由すると壊れた行にあった reason / secret がそのまま残る。200 文字で切っても
+# 約束は守れない — 切るのではなく、そもそも文字列を通さない。
+
+_SAFE_TOKEN_RE = re.compile(r'[A-Za-z0-9_.-]{1,64}')
+_SAFE_GENERATION_RE = re.compile(r'[A-Za-z0-9:_.+-]{1,64}')
+_MALFORMED_LINE_RE = re.compile(r'malformed line (\d+)')
+
+#: card の status として出してよい語彙 (これ以外の値は内容として扱い、出さない)。
+_KNOWN_STATUSES = frozenset({
+    'pending', 'in_progress', 'needs_director', 'done', 'failed', 'ready_for_verification',
+    'verifying', 'verified', 'needs_human_review', 'blocked', 'skipped', 'verification_failed',
+    'cancelled', _cards.CORRUPT_TASK_STATUS})
+
+
+def _safe_token(value):
+    """ファイル名・Worker 名として**そのまま出してよい**なら文字列、そうでなければ None。"""
+    return value if isinstance(value, str) and _SAFE_TOKEN_RE.fullmatch(value) else None
+
+
+def _safe_generation(value):
+    text = None if value is None else str(value)
+    return text if text is not None and _SAFE_GENERATION_RE.fullmatch(text) else None
+
+
+def _safe_status(value):
+    return value if isinstance(value, str) and value in _KNOWN_STATUSES else None
+
+
+#: 監査ログ・stderr の `detail` に出してよい**形**。自由文は通さない (パーサ例外・カードの値・枠の中身は
+#: どの形にも合わない)。合わないものは 'redacted'。
+_CODE = r'[a-z_]+(?::[A-Za-z0-9_=.-]+)*'                 # read_error:EACCES / parse_error:line=3
+_IDENT = r'[A-Za-z0-9_.-]{1,64}'
+_SAFE_DETAIL_RES = tuple(re.compile(p) for p in (
+    _CODE,
+    r'[A-Za-z0-9_./-]{1,300}: ' + _CODE,                  # missions/<slug>/tasks: list_error:EACCES
+    r'leftover: t\d+(?:, t\d+)*',                         # R-3
+    r'status=(?:' + '|'.join(sorted(_KNOWN_STATUSES)) + r'|<unknown>)',
+    _IDENT + r'/' + _IDENT + r'(?:, ' + _IDENT + r'/' + _IDENT + r')*',   # duplicate_owner / owner_unprovable
+    r'assignment body: lstat failed',
+))
+_SAFE_RESULT_RE = re.compile(r'(ok|repaired:R-[1-4]|reported:[a-z_]+)')
+_SAFE_RELPATH_RE = re.compile(r'[A-Za-z0-9_./-]{1,300}')
+
+
+def _safe_detail(value):
+    text = str(value)
+    return text if len(text) <= 300 and any(r.fullmatch(text) for r in _SAFE_DETAIL_RES) else 'redacted'
+
+
+def _safe_result(value):
+    return value if isinstance(value, str) and _SAFE_RESULT_RE.fullmatch(value) else 'redacted'
+
+
+def _safe_relpath(value):
+    return value if isinstance(value, str) and _SAFE_RELPATH_RE.fullmatch(value) else None
+
+
+def _errno_name(err_no):
+    return _errno.errorcode.get(err_no, str(err_no)) if err_no else 'unknown'
+
+
+def _parse_code(exc):
+    """パーサ例外 → 固定コード (+ 行番号)。**例外の文字列は使わない** (問題の行を含むため)。"""
+    m = _MALFORMED_LINE_RE.search(str(exc))
+    return f"parse_error:line={m.group(1)}" if m else "parse_error"
+
+
+def _unreadable_code(unreadable):
+    """`Unreadable` → 固定コード。reason の文字列は使わない (種類の判定にだけ読む)。"""
+    if unreadable.errno:
+        return f"read_error:{_errno_name(unreadable.errno)}"
+    reason = unreadable.reason
+    if reason.startswith('not a regular file'):
+        return 'not_regular_file'
+    if reason.startswith('decode error'):
+        return 'decode_error'
+    return 'unreadable'
+
+
+# ---------------------------------------------------------------------------
 # 例外
 # ---------------------------------------------------------------------------
 
@@ -234,7 +321,7 @@ def atomic_write_text(path, text, *, mode=None):
     try:
         data = text.encode('utf-8')
     except (UnicodeError, AttributeError) as e:
-        raise StoreWriteError(path, 'serialize', None, f'{type(e).__name__}: {e}') from e
+        raise StoreWriteError(path, 'serialize', None, type(e).__name__) from e
 
     parent = os.path.dirname(path) or '.'
     name = os.path.basename(path)
@@ -591,45 +678,77 @@ class Scope:
     """回復が見る範囲 (設計 §2.5)。範囲外は読まない。
 
     cards: 名指しの (slug, tid)。agents: 呼び出し元の Worker 名。
-    add_missions: R-3 を見る mission。archive_slugs: R-4 を見る slug。"""
+    add_missions: R-3 を見る mission。archive_slugs: R-4 を見る slug。
+    unobservable: スコープを組む時点で**観測できなかった入力** `(queue からの相対パス, コード)`。
+    `Scope.everything()` が列挙に失敗したディレクトリ・読めない state.yaml を、空に潰さずここに残し、
+    `diagnose()` が finding として返す (P2-1: 観測できない store を健全と報告しない)。"""
     cards: tuple = ()
     agents: tuple = ()
     add_missions: tuple = ()
     archive_slugs: tuple = ()
+    unobservable: tuple = ()
 
     @staticmethod
     def everything(queue_dir):
         """diagnose (store-check) 用: queue 全体。"""
         queue_dir = os.fspath(queue_dir)
-        cards, missions = [], []
-        for slug in _list_dir(os.path.join(queue_dir, 'missions')):
+        cards, missions, problems = [], [], []
+
+        def ls(*parts):
+            names, code = _list_dir(os.path.join(queue_dir, *parts))
+            if code:
+                problems.append((os.path.join(*parts), code))
+            return names
+
+        for slug in ls('missions'):
             missions.append(slug)
-            for name in _list_dir(os.path.join(queue_dir, 'missions', slug, 'tasks')):
+            for name in ls('missions', slug, 'tasks'):
                 m = _cards.TASK_FILENAME_RE.fullmatch(name)
                 if m:
                     cards.append((slug, f"t{m.group(1)}"))
-        agents = [a for a in _list_dir(os.path.join(queue_dir, 'assignments'))
-                  if agent_name_problem(a) is None]
-        state = _read_state_lenient(queue_dir)
+        agents = [a for a in ls('assignments') if agent_name_problem(a) is None]
+        active, code = _read_active_missions(queue_dir)
+        if code:
+            problems.append(('state.yaml', code))
         return Scope(cards=tuple(cards), agents=tuple(agents), add_missions=tuple(missions),
-                     archive_slugs=tuple(state))
+                     archive_slugs=tuple(active), unobservable=tuple(problems))
 
 
 def _list_dir(path):
+    """`(名前の一覧, コード)`。**ENOENT だけ**「無い」= `([], None)`。それ以外の失敗は
+    `([], 'list_error:<ERRNO>')` — 空リストと同じ形で返さない (呼び出し側が必ずコードを見る)。"""
     try:
-        return sorted(os.listdir(path))
-    except OSError:
-        return []
+        return sorted(os.listdir(path)), None
+    except FileNotFoundError:
+        return [], None
+    except OSError as e:
+        return [], f"list_error:{_errno_name(e.errno)}"
 
 
-def _read_state_lenient(queue_dir):
+def _read_active_missions(queue_dir):
+    """`(active_missions, コード)`。state.yaml が無い (ENOENT) は `([], None)`、読めない・壊れているは
+    `([], コード)`。"""
     text = _cards.read_regular_text_or_unreadable(os.path.join(queue_dir, 'state.yaml'))
+    if _cards.is_missing(text):
+        return [], None
     if _cards.is_unreadable(text):
-        return []
+        return [], _unreadable_code(text)
     try:
-        return list(_cards.parse_yaml(text).get('active_missions') or [])
-    except ValueError:
-        return []
+        return list(_cards.parse_yaml(text).get('active_missions') or []), None
+    except ValueError as e:
+        return [], _parse_code(e)
+
+
+def _path_state(path):
+    """`'present'` / `'absent'` / `'unobservable'`。**ENOENT だけ** absent
+    (`os.path.exists` / `lexists` は EACCES も False に潰す)。"""
+    try:
+        os.lstat(path)
+        return 'present'
+    except FileNotFoundError:
+        return 'absent'
+    except OSError:
+        return 'unobservable'
 
 
 class Txn:
@@ -685,25 +804,26 @@ class Txn:
         if _cards.is_missing(text):
             return 'missing', None, None, None, text.errno
         if _cards.is_unreadable(text):
-            return 'unreadable', None, None, text.reason, text.errno
+            return 'unreadable', None, None, _unreadable_code(text), text.errno
         try:
             meta, body = _cards.parse_frontmatter(text, source=path)
         except ValueError as e:
-            return 'unreadable', None, None, f'parse error: {e}', None
+            return 'unreadable', None, None, _parse_code(e), None
         if meta.get('id') not in (None, '', tid):
-            return ('unreadable', None, None,
-                    f"id 欄 {meta.get('id')!r} がファイル名 {tid} と食い違う (識別子はファイル名)", None)
+            return 'unreadable', None, None, 'id_mismatch', None
         return 'ok', meta, body, None, None
 
     def load_mission(self, slug):
         path = self.mission_path(slug)
         text = _cards.read_regular_text_or_unreadable(path)
         if _cards.is_unreadable(text):
-            raise StoreReadError(path, text.reason, text.errno)
+            raise StoreReadError(path, _unreadable_code(text), text.errno)
         try:
             return _cards.parse_yaml(text, source=path)
         except ValueError as e:
-            raise StoreReadError(path, f'parse error: {e}') from e
+            code = _parse_code(e)
+        # except の外で投げる: 例外の連鎖 (__context__) に問題の行を残さない
+        raise StoreReadError(path, code)
 
     def load_state(self):
         """state.yaml。**ENOENT だけ**「まだ無い」= 空の既定値。それ以外の読めない・壊れているは例外。"""
@@ -712,11 +832,15 @@ class Txn:
         if _cards.is_missing(text):
             return {'active_missions': [], 'default_mission': None}
         if _cards.is_unreadable(text):
-            raise StoreReadError(path, text.reason, text.errno)
+            raise StoreReadError(path, _unreadable_code(text), text.errno)
         try:
             data = _cards.parse_yaml(text, source=path)
         except ValueError as e:
-            raise StoreReadError(path, f'parse error: {e}') from e
+            code = _parse_code(e)
+        else:
+            code = None
+        if code:
+            raise StoreReadError(path, code)
         if data.get('active_missions') is None:
             data['active_missions'] = []
         data.setdefault('default_mission', None)
@@ -735,7 +859,7 @@ class Txn:
 
     def write_card(self, slug, tid, meta, body):
         if meta.get('id') not in (None, '', tid):
-            raise InvalidName(f"meta['id']={meta.get('id')!r} が task id {tid} と食い違う (識別子はファイル名)")
+            raise InvalidName(f"meta['id'] が task id {tid} と食い違う (識別子はファイル名。値は出さない)")
         self._write(self.card_path(slug, tid), serialize_card(meta, body))
 
     def write_mission(self, slug, data):
@@ -760,7 +884,7 @@ class Txn:
         if _cards.is_missing(text):
             return ('absent',)
         if _cards.is_unreadable(text):
-            return ('unverifiable', text.reason)
+            return ('unverifiable', _unreadable_code(text))
         return ('ok', text.strip())
 
     def _read_identity(self, agent):
@@ -822,23 +946,25 @@ class Txn:
 
     def _append_audit(self, rec, files):
         """1 行追記。失敗しても状態遷移は止めない (stderr に警告 + `audit_failures`)。"""
+        # 監査ログの**唯一の出口**。カード由来の値 (status / generation / worker 名 / 例外文字列) は
+        # ここで門を通す。通らないものは None / 'redacted' (内容を出さない。原案 §14-21)。
         row = {
             'ts': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%fZ'),
             'txn_id': self.txn_id,
-            'op': rec.get('op', self.op),
-            'mission': rec.get('mission'),
-            'task': rec.get('task'),
-            'actor': self.actor,
+            'op': _safe_token(rec.get('op', self.op)) or 'unknown',
+            'mission': _safe_token(rec.get('mission')),
+            'task': _safe_token(rec.get('task')),
+            'actor': _safe_token(self.actor) or 'unknown',
             'pid': os.getpid(),
-            'from_status': rec.get('from_status'),
-            'to_status': rec.get('to_status'),
-            'generation': rec.get('generation'),
+            'from_status': _safe_status(rec.get('from_status')),
+            'to_status': _safe_status(rec.get('to_status')),
+            'generation': _safe_generation(rec.get('generation')),
             'execution_id': None,        # 01c が埋める。01a では null 固定
-            'result': rec.get('result', 'ok'),
-            'files': list(files),
+            'result': _safe_result(rec.get('result', 'ok')),
+            'files': [f for f in map(_safe_relpath, files) if f is not None],
         }
         if rec.get('detail'):
-            row['detail'] = str(rec['detail'])[:200]
+            row['detail'] = _safe_detail(rec['detail'])
         path = audit_path(self.queue_dir)
         try:
             _fault('audit:begin', path)
@@ -885,6 +1011,11 @@ class _Recovery:
     # -- 出力 -----------------------------------------------------------------
     def _emit(self, result, mission=None, task=None, agent=None, detail=None, files=(),
               from_status=None, to_status=None, generation=None):
+        # カードの値・例外文字列が stderr / 監査ログ / 戻り値に出る**唯一の経路**。門を通す。
+        mission, task, agent = _safe_token(mission), _safe_token(task), _safe_token(agent)
+        detail = _safe_detail(detail) if detail else None
+        from_status, to_status = _safe_status(from_status), _safe_status(to_status)
+        generation = _safe_generation(generation)
         key = (result, mission, task, agent)
         if key in self._seen:
             return
@@ -914,8 +1045,8 @@ class _Recovery:
         if key not in self._cards:
             try:
                 path = self.t.card_path(slug, tid)
-            except InvalidName as e:
-                self._cards[key] = ('unreadable', None, None, str(e), None)
+            except InvalidName:
+                self._cards[key] = ('unreadable', None, None, 'invalid_name', None)
             else:
                 self._cards[key] = self.t._read_card(path, tid)
         return self._cards[key]
@@ -940,7 +1071,7 @@ class _Recovery:
         agents = [a for a in s.agents if agent_name_problem(a) is None]
         for slug, tid, meta in named:
             w = meta.get('worker')
-            if isinstance(w, str) and w and agent_name_problem(w) is None:
+            if isinstance(w, str) and w and agent_name_problem(w) is None and _safe_token(w) is not None:
                 agents.append(w)
         if named:
             wanted = {f"{slug}:{tid}" for slug, tid, _m in named}
@@ -961,7 +1092,11 @@ class _Recovery:
         本文が wanted のどれかに一致する枠の名前。読めない枠は「指していない」と証明できないが、
         消さない・止めない (store-check が別に出す)。"""
         found = []
-        for name in _list_dir(self.t._p('assignments')):
+        names, code = _list_dir(self.t._p('assignments'))
+        if code:
+            # 列挙できない = 「この card を指す枠は無い」と証明できない。空に潰さず報告する
+            self._emit('reported:assignments_dir_unreadable', detail=code)
+        for name in names:
             if agent_name_problem(name) is not None:
                 continue
             slot = self.t._read_slot(name)
@@ -972,11 +1107,16 @@ class _Recovery:
     # -- R-2: 孤児 projection を消す ----------------------------------------------
     def _r2(self, agent):
         slot = self._slot(agent)
-        if slot[0] != 'ok':
+        if slot[0] == 'absent':
+            return
+        if slot[0] == 'unverifiable':
+            # 読めない枠は消さない・上書きしない (証明できない) が、**黙って飛ばさない** (P2-1)。
+            # 名指しの card が参照していなくても、scope の枠なら報告する。
+            self._emit('reported:assignment_unverifiable', agent=agent, detail=slot[1])
             return
         pslug, sep, ptid = slot[1].rpartition(':')
         if not sep or not _cards.TASK_ID_RE.fullmatch(ptid):
-            self._emit('reported:assignment_malformed', agent=agent, detail=slot[1][:80])
+            self._emit('reported:assignment_malformed', agent=agent)      # 中身は出さない
             return
         kind, meta, _b, reason, _e = self._card(pslug, ptid)
         if kind == 'missing':
@@ -1000,12 +1140,11 @@ class _Recovery:
         if worker == agent and status in _ASSIGNMENT_HOLDING_STATUSES:
             return                                  # 正常 (この Worker が持っている)
         if status == 'in_progress':
-            self._emit('reported:assignment_owner_mismatch', pslug, ptid, agent,
-                       detail=f"card worker={worker}")
+            self._emit('reported:assignment_owner_mismatch', pslug, ptid, agent)
             return
         # blocked / verification_failed 等: Worker は動いており assignment は残るのが正当
         self._emit('reported:assignment_on_non_orphan_status', pslug, ptid, agent,
-                   detail=f"status={status}")
+                   detail=f"status={_safe_status(status) or '<unknown>'}")
 
     # -- R-1: projection を作る ---------------------------------------------------
     def _r1(self, slug, tid, meta):
@@ -1019,17 +1158,19 @@ class _Recovery:
             if status == 'in_progress':
                 self._emit('reported:in_progress_without_worker', slug, tid)
             return
-        if agent_name_problem(worker):
-            self._emit('reported:invalid_worker_name', slug, tid, worker)
+        if agent_name_problem(worker) or _safe_token(worker) is None:
+            # ファイル名として通っても、識別子の形でない worker 名 (空白・= 等) は内容とみなす:
+            # その名前で枠を作らない・値も出さない
+            self._emit('reported:invalid_worker_name', slug, tid)
             return
         slot = self._slot(worker)
         if slot[0] == 'unverifiable':
-            self._emit('reported:assignment_unverifiable', slug, tid, worker, detail=slot[1])
+            if ('reported:assignment_unverifiable', None, None, _safe_token(worker)) not in self._seen:
+                self._emit('reported:assignment_unverifiable', slug, tid, worker, detail=slot[1])
             return
         if slot[0] == 'ok':
             if slot[1] != f"{slug}:{tid}":
-                self._emit('reported:agent_slot_busy', slug, tid, worker,
-                           detail=f"assignment points to {slot[1][:80]}")
+                self._emit('reported:agent_slot_busy', slug, tid, worker)   # 枠の中身は出さない
                 return
             if status == 'in_progress':
                 verdict = self.t.classify_assignment(worker, slug, tid, str(gen) if gen else None)
@@ -1042,7 +1183,7 @@ class _Recovery:
         # 枠が ABSENT。R-1 が書くのは in_progress だけ (crash で欠けが生まれるのは pull の窓だけ)
         if status != 'in_progress':
             self._emit('reported:holding_without_assignment', slug, tid, worker,
-                       detail=f"status={status}")
+                       detail=f"status={_safe_status(status) or '<unknown>'}")
             return
         if gen is None or gen == '':
             self._emit('reported:in_progress_without_generation', slug, tid, worker)
@@ -1063,14 +1204,14 @@ class _Recovery:
         """所有の証拠の走査 (§2.5)。`worker = agent` の in_progress card が全 mission でこの 1 枚だけと
         **読んで確かめた**ときだけ None。2 枚以上 → duplicate_owner、読めない card が 1 枚でもあれば
         owner_unprovable。archive は読まない。読むのは status と worker だけ。"""
-        owned, unprovable = [], []
+        owned, unprovable, list_errors = [], [], []
         missions_dir = self.t._p('missions')
         try:
             slugs = sorted(os.listdir(missions_dir))
         except FileNotFoundError:
             slugs = []
         except OSError as e:
-            return 'owner_unprovable', f"cannot list missions: {e.strerror}"
+            return 'owner_unprovable', f"missions: list_error:{_errno_name(e.errno)}"
         for s in slugs:
             tdir = os.path.join(missions_dir, s, 'tasks')
             try:
@@ -1078,7 +1219,7 @@ class _Recovery:
             except FileNotFoundError:
                 continue
             except OSError as e:
-                unprovable.append(f"{s}/tasks: {e.strerror}")
+                list_errors.append(f"{s}/tasks: list_error:{_errno_name(e.errno)}")
                 continue
             for name in names:
                 m = _cards.TASK_FILENAME_RE.fullmatch(name)
@@ -1090,6 +1231,8 @@ class _Recovery:
                     unprovable.append(f"{s}/{t}")
                 elif kind == 'ok' and meta.get('worker') == agent and meta.get('status') == 'in_progress':
                     owned.append(f"{s}/{t}")
+        if list_errors:
+            return 'owner_unprovable', list_errors[0]        # 形は「パス: コード」1 件 (ids と混ぜない)
         if unprovable:
             return 'owner_unprovable', ', '.join(unprovable[:10])
         if owned != [f"{slug}/{tid}"]:
@@ -1101,17 +1244,18 @@ class _Recovery:
         try:
             mpath = self.t.mission_path(slug)
         except InvalidName:
+            self._emit('reported:invalid_scope_name')       # 名前は出さない (呼び出し側の値)
             return
         text = _cards.read_regular_text_or_unreadable(mpath)
         if _cards.is_missing(text):
             return
         if _cards.is_unreadable(text):
-            self._emit('reported:mission_unreadable', slug, detail=text.reason)
+            self._emit('reported:mission_unreadable', slug, detail=_unreadable_code(text))
             return
         try:
             mission = _cards.parse_yaml(text, source=mpath)
         except ValueError as e:
-            self._emit('reported:mission_unreadable', slug, detail=str(e))
+            self._emit('reported:mission_unreadable', slug, detail=_parse_code(e))
             return
         try:
             nxt = int(mission.get('next_task_id') or 1)
@@ -1120,7 +1264,11 @@ class _Recovery:
             return
         nums = []
         tdir = os.path.join(self.t._p('missions'), slug, 'tasks')
-        for name in _list_dir(tdir):
+        names, code = _list_dir(tdir)
+        if code:
+            self._emit('reported:tasks_dir_unreadable', slug, detail=code)
+            return
+        for name in names:
             m = _cards.TASK_FILENAME_RE.fullmatch(name)
             if m:
                 nums.append(int(m.group(1)))
@@ -1142,16 +1290,27 @@ class _Recovery:
         try:
             _check_slug(slug)
         except InvalidName:
+            self._emit('reported:invalid_scope_name')
             return
         try:
             state = self.t.load_state()
         except StoreReadError as e:
-            self._emit('reported:state_unreadable', detail=e.reason)
+            self._emit('reported:state_unreadable', detail=e.reason)      # e.reason は固定コード
             return
         active = list(state.get('active_missions') or [])
         if slug not in active:
             return
-        if os.path.lexists(self.t._p('missions', slug)) or not os.path.isdir(self.t._p('archive', slug)):
+        # 「missions/<slug> が無い・archive/<slug> が在る」を**両方とも観測して**確かめる。
+        # lexists / isdir は EACCES でも False に潰す — 観測できないのに「移動済み」と読んで
+        # active_missions から外すと、生きている mission を dispatcher から隠す。
+        src = _path_state(self.t._p('missions', slug))
+        dst = _path_state(self.t._p('archive', slug))
+        if src == 'present':
+            return
+        if src == 'unobservable' or dst == 'unobservable':
+            self._emit('reported:archive_state_unobservable', slug)
+            return
+        if dst == 'absent' or not os.path.isdir(self.t._p('archive', slug)):
             return
 
         def _drop():
@@ -1188,14 +1347,32 @@ def diagnose(queue_dir, scope=None):
     for rep in _Recovery(txn, scope, apply=False).run():
         kind = f"would-repair:{rep.rule}" if rep.repaired else rep.result
         findings.append(Finding(kind, rep.mission, rep.task, rep.agent, rep.detail))
+    # 観測できなかった入力は finding として残す (P2-1: 空リスト = 健全、にしない)
+    for rel, code in scope.unobservable:
+        findings.append(Finding('unobservable_input', detail=_safe_detail(f"{rel}: {code}")))
     adir = os.path.join(queue_dir, 'assignments')
-    for name in _list_dir(adir):
-        if name.endswith(IDENTITY_SUFFIX) and not os.path.lexists(os.path.join(adir, name[:-len(IDENTITY_SUFFIX)])):
-            findings.append(Finding('orphan_identity', agent=name[:-len(IDENTITY_SUFFIX)]))
-    for root, _dirs, files in os.walk(queue_dir):
+    names, code = _list_dir(adir)
+    if code and ('assignments', code) not in scope.unobservable:
+        findings.append(Finding('unobservable_input', detail=_safe_detail(f"assignments: {code}")))
+    for name in names:
+        if name.endswith(IDENTITY_SUFFIX):
+            body = name[:-len(IDENTITY_SUFFIX)]
+            state = _path_state(os.path.join(adir, body))
+            if state == 'absent':
+                findings.append(Finding('orphan_identity', agent=_safe_token(body)))
+            elif state == 'unobservable':
+                findings.append(Finding('unobservable_input', agent=_safe_token(body),
+                                        detail='assignment body: lstat failed'))
+    walk_errors = []
+    for root, _dirs, files in os.walk(queue_dir, onerror=walk_errors.append):
         for f in files:
             if re.match(r'^\..+\.tmp\..+', f):
-                findings.append(Finding('stale_tmp', detail=os.path.relpath(os.path.join(root, f), queue_dir)))
+                findings.append(Finding('stale_tmp', detail=_safe_detail(
+                    os.path.relpath(os.path.join(root, f), queue_dir))))
+    for err in walk_errors:
+        # os.walk は既定で列挙の失敗を黙って飛ばす → 残骸の走査が「見えた範囲だけ」になる
+        findings.append(Finding('unobservable_input', detail=_safe_detail(
+            f"{os.path.relpath(err.filename or queue_dir, queue_dir)}: list_error:{_errno_name(err.errno)}")))
     return findings
 
 
@@ -1222,12 +1399,15 @@ def locked_update_json(path, lock_path, fn):
         if _cards.is_missing(text):
             data = {}
         elif _cards.is_unreadable(text):
-            raise StoreReadError(path, text.reason, text.errno)
+            raise StoreReadError(path, _unreadable_code(text), text.errno)
         else:
             try:
                 data = json.loads(text)
-            except ValueError as e:
-                raise StoreReadError(path, f'not valid JSON: {e}') from e
+                parse_failed = False
+            except ValueError:
+                data, parse_failed = None, True
+            if parse_failed:           # except の外で投げる (例外の連鎖に本文を残さない)
+                raise StoreReadError(path, 'json_parse_error')
             if not isinstance(data, dict):
                 raise StoreReadError(path, 'JSON top-level is not an object')
         new = fn(data)

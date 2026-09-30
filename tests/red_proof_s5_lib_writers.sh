@@ -34,8 +34,9 @@ ok() { echo "  PASS: $1"; PASS=$((PASS + 1)); }
 ng() { echo "  FAIL: $1"; FAIL=$((FAIL + 1)); }
 
 TREE=""
+MUTATED=()      # この複製で変異させた tree 内の相対パス (expect_red が構文を確かめる)
 fresh_copy() {
-    N=$((N + 1)); TREE="$WORK/tree$N"; mkdir -p "$TREE"
+    N=$((N + 1)); TREE="$WORK/tree$N"; mkdir -p "$TREE"; MUTATED=()
     rsync -a --exclude='.git' --exclude='__pycache__' --exclude='.claude' \
           --exclude='queue' --exclude='logs' "$REPO_ROOT/" "$TREE/"
     find "$TREE" -name '__pycache__' -prune -exec rm -r {} + 2>/dev/null || true
@@ -43,6 +44,7 @@ fresh_copy() {
 
 # inject <tree 内の相対パス> <old> <new> — old が 1 か所だけ在ること (無ければ FATAL)
 inject() {
+    MUTATED+=("$1")
     F="$1" OLD="$2" NEW="$3" python3 - "$TREE/$1" <<'PY' || { echo "FATAL: 注入点が見つからない ($1)"; exit 2; }
 import os, sys, pathlib
 p = pathlib.Path(sys.argv[1]); s = p.read_text()
@@ -60,7 +62,29 @@ run_suite() {
             -p no:cacheprovider 2>&1 )
 }
 
+# 変異後のソースが構文として通ること。通らないと pytest は collection で落ち、狙ったテストが走らずに
+# 「赤」に見える (t034: case G が IndentationError だった)。plan.sh は bash に埋め込んだ python を取り出して parse する。
+assert_mutation_parses() {
+    local f
+    for f in "${MUTATED[@]}"; do
+        case "$f" in
+            scripts/plan.sh)
+                bash -n "$TREE/$f" || { echo "FATAL: 変異後の $f が bash として通らない"; exit 2; }
+                python3 - "$TREE/$f" <<'PY' || { echo "FATAL: 変異後の $f の埋め込み python が構文として通らない"; exit 2; }
+import ast, re, sys
+m = re.search(r"<<'PYEOF'\n(.*?)\nPYEOF\n", open(sys.argv[1]).read(), re.S)
+ast.parse(m.group(1))
+PY
+                ;;
+            *.py) python3 -c 'import ast,sys; ast.parse(open(sys.argv[1]).read())' "$TREE/$f" \
+                    || { echo "FATAL: 変異後の $f が python として通らない"; exit 2; } ;;
+            *.sh) bash -n "$TREE/$f" || { echo "FATAL: 変異後の $f が bash として通らない"; exit 2; } ;;
+        esac
+    done
+}
+
 expect_red() {  # expect_red <case名> <赤になるはずのテスト名の断片>
+    assert_mutation_parses
     local out; out="$(run_suite)"
     if echo "$out" | grep -q "FAILED .*$2"; then ok "$1 → 赤 ($2)"
     else ng "$1 → 赤にならなかった ($2)"; echo "$out" | tail -12; fi
@@ -82,6 +106,7 @@ echo "== case B: hooks/pre-compact.sh を旧版に戻す"
 fresh_copy
 git -C "$REPO_ROOT" show "$BASE_SHA:hooks/pre-compact.sh" > "$TREE/hooks/pre-compact.sh" \
     || { echo "FATAL: $BASE_SHA の pre-compact.sh を取り出せない"; exit 2; }
+MUTATED+=(hooks/pre-compact.sh)
 expect_red "case B (hook)" "test_the_hook_calls_plan_sh_snapshot_and_falls_back_to_a_log_when_refused"
 expect_red "case B (guard)" "test_moved_writers_no_longer_appear"
 
@@ -135,9 +160,10 @@ expect_red "case F" "test_two_writers_of_the_taskvia_map_lose_no_entries"
 
 echo "== case G: lib_registry.write を open('w') に戻す"
 fresh_copy
-inject scripts/lib_registry.py "    atomic_write_text(path, ''.join(out))" \
-       "    with open(path, 'w') as f:
-        f.writelines(out)"
+# 呼び出しは try ブロックの中 (8 スペース)。注入も 8 スペースで、行頭から丸ごと置き換える。
+inject scripts/lib_registry.py "        atomic_write_text(path, ''.join(out))" \
+       "        with open(path, 'w') as f:
+            f.writelines(out)"
 expect_red "case G" "test_registry_write_killed_at_every_point_leaves_the_old_or_the_whole_new_file"
 
 echo "== case H: assign-name.sh に初期化の printf を戻す"

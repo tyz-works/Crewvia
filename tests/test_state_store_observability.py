@@ -285,8 +285,10 @@ def test_unknown_status_value_is_redacted_in_detail_and_audit(q, capsys):
     with store.transaction(q, op="x", actor="t") as t:
         t.write_card(M, "t001", sc.card("t001", "SECRET RESULT TOKEN=sk-abc123", A, G), sc.body())
     reps = _recover(q, sc.SCOPES["done"])
-    assert [r.result for r in reps] == ["reported:assignment_on_non_orphan_status"]
-    assert reps[0].detail == "status=<unknown>"
+    # t030: 語彙にない status は card ごと読めない扱い (frozenset 判定で落とさない・別の状態に読まない)。
+    # 値は固定コード bad_status の背後に隠れ、出ない。
+    assert [r.result for r in reps] == ["reported:card_unreadable", "reported:assignment_target_unreadable"]
+    assert {r.detail for r in reps} == {"bad_status"}
     assert _leaks(q, capsys, [("reports", repr(reps))]) == []
 
 

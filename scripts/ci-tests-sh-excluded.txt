@@ -37,6 +37,7 @@ tests/red_proof_t018.sh | 1 回限りの historical red proof（CI 化しない�
 tests/red_proof_t019.sh | 1 回限りの historical red proof（CI 化しない）
 tests/red_proof_t020.sh | 1 回限りの historical red proof（CI 化しない）
 tests/red_proof_s5_lib_writers.sh | 1 回限りの historical red proof（CI 化しない）
+tests/red_proof_queue_write_scan_heredoc.sh | 1 回限りの historical red proof（CI 化しない）
 tests/red_proof_t021.sh | 1 回限りの historical red proof（CI 化しない）
 tests/red_proof_t021_pr6.sh | 1 回限りの historical red proof（CI 化しない）
 tests/red_proof_t022.sh | 1 回限りの historical red proof（CI 化しない）

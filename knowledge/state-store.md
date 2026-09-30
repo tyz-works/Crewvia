@@ -673,6 +673,7 @@ merge 前にユーザー承認 = t015)。projection の作り直し (S4) はま�
 | 書く meta の `id` がファイル名と食い違う card | 書けた | `InvalidName` で拒否 (不変条件 2)。読み取り側は既に `[破損]` にするので、正常な経路では来ない |
 | `dump_yaml` の未知キー | 渡された表に**追記** (同じプロセスで 2 枚以上書くと 2 枚目の並びに影響しうる) | 表をコピーして汚さない。本番の card のキーは全部表にあるので出力は同じ (手編集で未知のキーを足した card だけ、2 枚目以降で並びが変わりうる) |
 | `state.yaml` / `mission.yaml` / card の親 dir の作成 | `os.makedirs` | lib の `_ensure_dir` (作った dir の親を fsync) |
+| **親 dir の fsync だけが失敗**したとき (tasks/ が `-wx` で開けない・EIO 等。置換 / 削除は済んでいる) | 親 dir の fsync をしないので気付かない (書き込みは成功) | **トランザクションの中では続行**: stderr に `[state-store warn] 親ディレクトリの fsync に失敗しました (<path>: <ERRNO>)`・監査ログの `detail` = `fsync_dir_failed:<ERRNO>`。落とさないのは、card を書いた後・assignment を書く前で止まる (= 割れたトランザクション) のを、耐久性を証明できなかっただけで自分で作らないため。**S2 の lib から変えた 1 点**: `StoreWriteError.committed` (置換 / 削除の後の失敗か) を足し、`Txn._write` / `_remove` だけが `committed` の `fsync_dir` を握る。`atomic_write_text` / `atomic_remove` を直接呼ぶ側は従来どおり例外。ディレクトリを**作った直後**の親の fsync の失敗 (まだ何も書いていない) は握らず例外のまま。発見の経緯: `tests/test_unobservable_is_not_empty.py` が tasks/ を `0o300` にして verify-result を打つと、修正前は通り、lib のままでは exit 1 になった |
 
 **互換性の証拠**: `tests/plan_sh_compat_scenario.py` が init / add / status / lint / pull (自動選択・busy の拒否) / needs-director /
 update --reset / done・fail (成功・二重・存在しない) / release-dep / ready-for-verification / verify-result / retire / reap-orphan-assignment /
@@ -694,7 +695,8 @@ assignments) を正規化して比べる。**差 0**。直列化は `tests/fixtu
 | 監査ログを出す subcommand | `QUEUE_MUTATING_SUBCOMMANDS` 15 個 | 0 → 13 個を実走で確認 + 2 個 (review / launch は claude を起動するので構造 (`with_lock` を通る) で確認) | `tests/test_plan_sh_state_store_cutover.py` |
 
 **赤の実証** (修正前 = a1f6957 の plan.sh に、この PR のテストだけを足したコピーで走らせた。`PYTHONDONTWRITEBYTECODE=1`・`__pycache__` 無し):
-新テスト 79 件中 **15 件が赤・64 件が緑**。赤は (1) 監査ログ 5 件 (行が無い・秘密が出ない検査の前提・トランザクション外の書き込みの拒否・audit 書けなくても遷移が完了・拒否は行を書かない)、
+この PR で足した / 書き換えた 4 ファイル (`test_plan_sh_state_store_cutover.py` / `test_plan_sh_compat_s3.py` / `test_state_store_callers.py` /
+`test_state_store_serialization_matches_plan_sh.py`) の 79 件中 **15 件が赤・64 件が緑**。赤は (1) 監査ログ 5 件 (行が無い・秘密が出ない検査の前提・トランザクション外の書き込みの拒否・audit 書けなくても遷移が完了・拒否は行を書かない)、
 (2) **親 dir の fsync の順序 5 件** (card / mission / state / assignment 公開 / 撤去 — `os.fsync` / `os.replace` / `os.unlink` を記録するスタブで
 「tmp の fsync → replace → 親 dir の fsync」を検出。修正前は 3 つ目が無い)、(3) 「親 dir の fsync の時点で kill」2 件 (修正前はその点が存在しない)、
 (4) 構造 3 件 (plan.sh が lib を呼ばない・直列化のコピーが plan.sh に残っている)。緑の 64 件は互換性テスト (golden が修正前の出力なので当然緑 — 退行の留め金)・

@@ -198,16 +198,90 @@ _CMD_RE = re.compile(
     r'(' + '|'.join(_WRITE_CMDS) + r')\b(?=\s|$)(.*)')
 
 
-def split_heredocs(text: str):
-    """(bash の行, [python ヒアドキュメントの本文]) に分ける。python 以外のヒアドキュメントの本文は捨てる
-    (`cat > f <<EOF` の本文は書き込み先ではない)。"""
+def _lex_line(line: str, stack: list) -> tuple[str, str, list[tuple[int, str]]]:
+    r"""bash 1 行の字句解析 (heredoc の開始の判定と、書き込みの検出が**同じ引用符の理解**を使うための 1 か所)。
+    (引用符の中身を潰した行, コメントを除いた元の行, 本物の heredoc の開始 [(位置, 終端語)]) を返す。
+    `stack` は行をまたぐ引用符の状態 (破壊的に更新する)。フレームは `['code', 括弧の深さ]` / `['sq']` / `['dq']`。
+
+    * コメント (引用符の外で語頭の `#`) と、単引用符・二重引用符の**中身**の `<<X` / `>` は、開始でも書き込みでもない。
+    * 二重引用符の中の `$( ... )` はコード。そこの `<<X` は本物 (`"$(cat <<EOF` / `"$(python3 - <<'PYEOF'`)、
+      そこの引用符は入れ子 (`"$(printf '%s' "$x" | sed ..)"` で `"` を閉じ引用符と読み違えると、以降が全部ずれる)。
+    * `<<<` (here-string) は開始ではない。
+    * 単引用符の中では `\` は何も効かない (`'\'` で閉じる)。
+    """
+    out: list[str] = []
+    found: list[tuple[int, str]] = []
+    i, n = 0, len(line)
+    end = n
+    while i < n:
+        ch = line[i]
+        kind = stack[-1][0]
+        if kind == 'sq':
+            if ch == "'":
+                stack.pop()
+                out.append(ch)
+            else:
+                out.append('_')
+        elif kind == 'dq':
+            if ch == '\\' and i + 1 < n:
+                out.append('__')
+                i += 1
+            elif ch == '"':
+                stack.pop()
+                out.append(ch)
+            elif ch == '$' and line.startswith('$(', i):
+                stack.append(['code', 0])
+                out.append('$(')
+                i += 1
+            else:
+                out.append('_')
+        else:
+            frame = stack[-1]
+            if ch == '\\' and i + 1 < n:
+                out.append(line[i:i + 2])
+                i += 1
+            elif ch == "'":
+                stack.append(['sq'])
+                out.append(ch)
+            elif ch == '"':
+                stack.append(['dq'])
+                out.append(ch)
+            elif ch == '#' and (i == 0 or line[i - 1] in ' \t;&|()'):
+                end = i                                   # コメント: 行末まで読み飛ばす
+                break
+            else:
+                if ch == '(':
+                    frame[1] += 1
+                elif ch == ')':
+                    if frame[1] > 0:
+                        frame[1] -= 1
+                    elif len(stack) > 1:
+                        stack.pop()                       # `$( ... )` の終わり
+                elif ch == '<' and line.startswith('<<', i):
+                    if line.startswith('<<<', i):
+                        out.append('<<')
+                        i += 1
+                    else:
+                        m = _HEREDOC_RE.match(line, i)
+                        if m:
+                            found.append((i, m.group(2)))
+                out.append(ch)
+        i += 1
+    return ''.join(out), line[:end].rstrip(), found
+
+
+def _scan_heredocs(text: str):
+    """(bash の行, [python ヒアドキュメントの本文], [閉じなかった終端語], 本文として飛ばした行数)。"""
     bash_lines: list[str] = []
     python_blocks: list[str] = []
     pending: list[tuple[str, bool]] = []          # (終端語, python か)
     body: list[str] = []
+    skipped = 0
+    stack: list = [['code', 0]]
     for line in text.splitlines():
         if pending:
             term, is_python = pending[0]
+            skipped += 1
             if line.strip() == term:
                 pending.pop(0)
                 if is_python:
@@ -217,35 +291,34 @@ def split_heredocs(text: str):
                 body.append(line)
             continue
         bash_lines.append(line)
-        # `<<<` (here-string) は除く
-        stripped = re.sub(r'<<<', '   ', line)
-        for m in _HEREDOC_RE.finditer(stripped):
-            pending.append((m.group(2), bool(_PY_CMD_RE.search(line[:m.start()]))))
+        for pos, term in _lex_line(line, stack)[2]:
+            pending.append((term, bool(_PY_CMD_RE.search(line[:pos]))))
+    return bash_lines, python_blocks, [t for t, _ in pending], skipped
+
+
+def split_heredocs(text: str):
+    """(bash の行, [python ヒアドキュメントの本文]) に分ける。python 以外のヒアドキュメントの本文は捨てる
+    (`cat > f <<EOF` の本文は書き込み先ではない)。開始はコメント・引用符の外だけ (`_lex_line`)。"""
+    bash_lines, python_blocks, _unclosed, _skipped = _scan_heredocs(text)
     return bash_lines, python_blocks
 
 
-def _strip_comment_and_quotes(line: str, quote=None) -> tuple[str, str, str | None]:
-    """(引用符の中身を潰した行, コメントを除いた元の行, 行末で開いたままの引用符)。
-    引用符の外の `#` 以降は捨てる。引用符は行をまたぐ (複数行の文字列の中の `>` は書き込みではない)。"""
-    out, raw = [], []
-    prev = ' '
-    for i, ch in enumerate(line):
-        if quote:
-            raw.append(ch)
-            if ch == quote and prev != '\\':
-                quote = None
-                out.append(ch)
-            else:
-                out.append('_')
-        else:
-            if ch == '#' and (prev.isspace() or i == 0):
-                break
-            raw.append(ch)
-            if ch in ('"', "'") and prev != '\\':
-                quote = ch
-            out.append(ch)
-        prev = ch
-    return ''.join(out), ''.join(raw).rstrip(), quote
+def unclosed_heredocs(text: str) -> list[str]:
+    """ファイル末尾までに終端語が現れなかった heredoc の終端語。**1 件でもあれば、その行から末尾までが未検査**
+    (開始の誤認は必ずここに出る)。健全なファイルでは空。"""
+    return _scan_heredocs(text)[2]
+
+
+def coverage(text: str) -> dict:
+    """このファイルの何行を実際に検査したか。`total` = 全行、`bash` = bash として字句検査した行、
+    `heredoc_body` = heredoc の本文として飛ばした行 (python の本文は AST で検査する)。"""
+    bash_lines, blocks, unclosed, skipped = _scan_heredocs(text)
+    stack: list = [['code', 0]]
+    for raw in bash_lines:
+        _lex_line(raw, stack)
+    quote = stack[-1][0] if len(stack) > 1 else None   # 'sq' / 'dq' / 'code' ($( が開いたまま)
+    return {'total': len(text.splitlines()), 'bash': len(bash_lines), 'heredoc_body': skipped,
+            'python_blocks': len(blocks), 'unclosed': unclosed, 'open_quote_at_eof': quote}
 
 
 def _redirect_targets(masked: str) -> list[str]:
@@ -266,7 +339,7 @@ def _redirect_targets(masked: str) -> list[str]:
             if j < len(masked) and masked[j] == '|':
                 j += 1
             m = re.match(r'\s*(\S+)', masked[j:])
-            target = (m.group(1) if m else '').rstrip(';)&|')
+            target = (m.group(1) if m else '').rstrip(';)&|"')
             if target and target != '/dev/null':
                 targets.append(target)
             i = j
@@ -277,9 +350,9 @@ def _redirect_targets(masked: str) -> list[str]:
 
 def bash_sites(bash_lines: list[str], file: str) -> list[Site]:
     sites = []
-    quote = None
+    stack: list = [['code', 0]]
     for raw in bash_lines:
-        masked, plain, quote = _strip_comment_and_quotes(raw, quote)
+        masked, plain, _found = _lex_line(raw, stack)
         if not plain.strip():
             continue
         # 算術・条件式の中の `>` (比較) は書き込みではない

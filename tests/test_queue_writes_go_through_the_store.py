@@ -152,6 +152,8 @@ ALLOWED_WRITES: dict[tuple[str, str], tuple[int, str]] = {
     ('plan.sh', '<bash>'): (5, R_DIR + "。`dashboard` (読み取り専用の TUI) は検証を通った後にだけ queue の骨組みを作る"
                                  " (t006 QA)。他は TUI の一時ファイル (" + R_TMP + ")"),
     # ---- 入口のスクリプト・hooks ---------------------------------------------------------------------
+    ('git-helpers.sh', '<bash>'): (1, R_DIR + "。git worktree の親 dir (`mkdir -p \"$(dirname \"$worktree_path\")\"`)。queue の外。"
+                                      "コメント中の `<<X` が走査を打ち切っていたときは見えなかった (t035)"),
     ('kai-review.sh', '<bash>'): (6, R_MARK + "。reviewer の heartbeat と、review の一時ファイル / worktree (" + R_TMP + ")"),
     ('review-plan.sh', '<bash>'): (6, "plan_review.md / plan_review.verdict の tmp+mv と reviewer ログ。書き手 1 者で run_id で鮮度を"
                                      "確かめる読み手がいる (§5.1 の「寄せない」)"),
@@ -407,3 +409,80 @@ def test_positive_control_adding_one_write_to_a_real_file_turns_the_guard_red():
         differing = [k for k in set(mutated) | set(ALLOWED_WRITES)
                      if k[0] == name and mutated.get(k, 0) != ALLOWED_WRITES.get(k, (0, ''))[0]]
         assert differing, f"{name} に書き込みを 1 行足しても、表と食い違わない (ガードが緑のまま)"
+
+
+# ---------------------------------------------------------------------------
+# 「開始を誤認して残りを読み飛ばす」型 (t035) —— コメント・引用符の中の `<<X`
+# ---------------------------------------------------------------------------
+
+#: 書き込み 1 行を足しても検出されるべき前置き。どれも旧検出器は `<<X` を heredoc の開始と誤認し、
+#: 終端語が現れないので以降を全部読み飛ばした。
+HEREDOC_LOOKALIKES = [
+    ('コメント中の <<X', "# see: cat <<EOF in the docs\n"),
+    ('コメント中の <<-X', "foo  # <<-DONE\n"),
+    ('二重引用符の中の <<X', "echo \"x <<'PYEOF'\"\n"),
+    ('単引用符の中の <<X', "echo 'x <<EOF'\n"),
+    ('複数行の文字列の中の <<X', "msg=\"line1\nusage: cmd <<EOF\nline3\"\n"),
+    ('$(...) の中の入れ子の引用符のあとの <<X', "x=\"$(printf '%s' \"$y\" | sed 's/a/b/')\"  # <<EOF\n"),
+]
+TAIL_WRITE = 'echo x > "$CREWVIA_QUEUE/state.yaml"\n'
+
+
+@pytest.mark.parametrize('name,prefix', HEREDOC_LOOKALIKES, ids=[n for n, _ in HEREDOC_LOOKALIKES])
+def test_negative_control_heredoc_lookalike_does_not_blind_the_rest(name, prefix):
+    """コメント・引用符の中の `<<X` の**次の行**の書き込みを拾う (旧検出器は 0 件だった)。"""
+    sites = scan.shell_sites(prefix + TAIL_WRITE, 'probe.sh')
+    assert [s.kind for s in sites] == ['redirect'], f"{name}: 後ろの書き込みを見落とした: {sites}"
+    assert scan.unclosed_heredocs(prefix + TAIL_WRITE) == [], name
+
+
+def test_lookalike_does_not_hide_a_later_python_block_either():
+    script = ("# usage: cmd <<EOF\n"
+              "python3 - <<'PYEOF'\nwith open(p, 'w') as f:\n    f.write('x')\nPYEOF\n")
+    assert [s.kind for s in scan.shell_sites(script, 'probe.sh')] == ['open']
+
+
+REAL_HEREDOCS = [
+    ('"$(cat <<EOF ... EOF)" (コマンド置換の中は本物)',
+     'msg="$(cat <<EOF\nbody > not-a-write\nEOF\n)"\n', 0),   # 開始を拾えなければ本文の `>` が 1 件に見える
+    ("\"$(python3 - <<'PYEOF' ... PYEOF)\" の中の python の書き込みを拾う",
+     "x=\"$(python3 - <<'PYEOF'\nopen('f', 'w').write('x')\nPYEOF\n)\"\n", 1),
+    ('通常の cat <<EOF は本文を飛ばして次の行へ', 'cat <<EOF\nx > y\nEOF\n', 0),
+]
+
+
+@pytest.mark.parametrize('name,source,writes', REAL_HEREDOCS, ids=[n for n, _, _ in REAL_HEREDOCS])
+def test_real_heredocs_are_still_recognised(name, source, writes):
+    assert len(scan.shell_sites(source, 'probe.sh')) == writes, name
+    assert scan.unclosed_heredocs(source) == [], name
+
+
+def test_no_target_has_an_unclosed_heredoc_or_quote():
+    """**ファイルの何を実際に検査したか**。閉じない heredoc / 閉じない引用符が 1 件でもあれば、その行から末尾までが
+    未検査 (開始の誤認は必ずここに出る)。全対象ファイルで 0 件。"""
+    total = skipped = 0
+    bad = []
+    for path in scan_targets():
+        if path.suffix == '.py':
+            continue                                     # python は AST (構文が壊れていれば ast.parse が落ちる)
+        cov = scan.coverage(path.read_text(encoding='utf-8'))
+        total += cov['total']
+        skipped += cov['heredoc_body']
+        if cov['unclosed'] or cov['open_quote_at_eof']:
+            bad.append((path.name, cov['unclosed'], cov['open_quote_at_eof']))
+    print(f"[write-guard] shell lines={total} heredoc-body lines skipped={skipped} "
+          f"inspected as bash={total - skipped} ({100 * (total - skipped) // max(total, 1)}%)")
+    assert total >= 5000, f"検査した行が {total} 行しかない — 対象が消えている"
+    assert not bad, f"閉じない heredoc / 引用符 (= 以降が未検査): {bad}"
+
+
+def test_positive_control_a_write_appended_to_the_previously_blind_files_is_detected():
+    """旧検出器が 434 行 / 104 行を読み飛ばしていた実ファイル (`hooks/pre-tool-use.sh` /
+    `scripts/git-helpers.sh`) の末尾に書き込みを足すと、表と食い違う (= 赤になる)。実物は変えない。"""
+    targets = {p.name: p for p in scan_targets()}
+    baseline = _counts(collect())
+    for name in ('pre-tool-use.sh', 'git-helpers.sh'):
+        text = targets[name].read_text(encoding='utf-8') + '\n' + TAIL_WRITE
+        n_before = sum(v for k, v in baseline.items() if k[0] == name)
+        n_after = len(scan.shell_sites(text, name))
+        assert n_after == n_before + 1, f"{name}: 末尾に足した書き込みが検出されない ({n_before} → {n_after})"

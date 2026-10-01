@@ -190,7 +190,9 @@ def _converged(q):
     # 回復は DETACHED の欄を閉じない (推測で terminal にしない。execution.md §4.2)。Director の `abandon_detached_execution`
     # が済むまで、終わった task に残る active な欄の報告は消えない (済めば消える)
     if h.read_meta(q).get("execution_status") in ex.ACTIVE_STATUSES:
-        findings = [f for f in findings if f.kind != "reported:execution_active_on_finished_task"]
+        # pending に戻された DETACHED (b) も同じ (旧コードの reset の跡。次の reserve の手順 0 か abandon が閉じるまで報告のまま)
+        findings = [f for f in findings if f.kind not in (
+            "reported:execution_active_on_finished_task", "reported:execution_active_on_non_holding_status")]
     assert findings == [], findings
 
 

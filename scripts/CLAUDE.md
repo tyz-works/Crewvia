@@ -77,6 +77,19 @@ lib ごとの**破ってはいけない契約**の要約。理由・経緯・全
   コピーしない。**`failed` の依存は「保留（HELD）」**で、進める出口は Director の `plan.sh release-dep <id> --mission <slug>` だけ。
 - 共有規則に env 停止スイッチを付けない（dispatcher と plan.sh で答えが割れる）。
 
+## Git Policy（`lib_git_policy.py`。01b G2 / t008。**G3 までは呼び出し元ゼロ**）
+
+- task の branch・worktree path・base・PR base を決める唯一の場所の予定（`knowledge/git-policy.md` §2・§3）。**判断だけ**で
+  subprocess を持たない（観測 = `git show-ref` / `git worktree list` と副作用 = fetch / worktree add は呼び出し元）。
+- mission.yaml の `git:` は**無いときだけ**既定値。あって読めない・未知の mode / 欄・型違い・空・制御文字・
+  既定値以外の `worktree_root`・`parse_yaml` が黙って読み飛ばす行（4 字下げ・空行・コメント・重複キー・`git:` が 2 つ）は
+  `GitPolicyError` で停止する。**`Unreadable` を既定値に倒さない**。`git:` を足したら `policy_from_text` を通すこと
+  （lint も G3 でこれを呼ぶ。読み口を複製しない）。
+- branch 名の規則は git より**狭い**（英数字で始まる成分・`.` / `.lock` で終わらない・先頭成分が `refs` / `origin` でない等）。
+  規則を変えたら `tests/test_git_policy_resolver.py` の部分集合の検査（本物の `git check-ref-format --branch`）が通ること。
+- 呼び出し元が増える PR は cutover（ユーザー承認）。`tests/test_git_policy_resolver.py::test_git_policy_has_no_callers_yet` の
+  `ALLOWED_CALLERS` を直すのはその PR だけ。env の停止スイッチは付けない。
+
 ## status の語彙（`lib_task_status.py`）
 
 - task の status の語彙・終端 / 手放した / 判断待ちの集合・コマンドごとの「受け付ける元の status」

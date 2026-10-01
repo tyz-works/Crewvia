@@ -308,6 +308,18 @@ dispatcher。CLI: `record` / `show` / `clear`）。`load()` は欄の値まで�
 不正なら `Unreadable`（`diff_bytes: null` が通知の組み立てを落として全 mission の
 dispatch が止まる、を防ぐ）
 
+### `lib_git_policy.py`
+
+**Git Policy Resolver**（vNext 01b G2 / t008。設計 `knowledge/git-policy.md` §2・§3）。task の branch 名・worktree path・
+base・PR base を決める唯一の場所で、**判断だけ**（git も gh も呼ばない）。mission.yaml の `git:` 欄は
+`lib_task_cards` の入口 + `parse_yaml` で読む。`git:` が**無い**ときだけ既定値（今の git-helpers.sh と 1 対 1）。
+あって読めない・未知の mode / 欄・型違い・空・制御文字・`..`・絶対パス・既定値以外の `worktree_root`・
+`parse_yaml` が黙って読み飛ばす字下げ行は `GitPolicyError(code, field, detail)` で**停止**し、既定値に倒さない。
+branch 名の許可集合は git の `check-ref-format` より狭く、**部分集合であることを本物の git に通して確かめる**
+（`tests/test_git_policy_resolver.py`）。**G2 の時点で呼び出し元は 0**（同テストの `test_git_policy_has_no_callers_yet`。
+G3 の cutover で `ALLOWED_CALLERS` に足す）。各拒否を外した変異が赤になる実証は
+`python3 tests/red_proof_git_policy_resolver.py`（26 変異・約 1.5 分。本番に触れない）。
+
 ### `lib_daemon_state.py`
 
 **デーモン側 JSON 状態ストアを読む入口**（`load_json_store(path, check=...)`）。

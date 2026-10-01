@@ -737,3 +737,16 @@ env が無い理由は 3 つある: ① TARGET_DIR の Worker ② G3 前の `.cr
 | worktree path (`task_worktree_path`。repo_root の外に出ない) | `os.path.realpath` + `os.path.commonpath` と、実際に作った後の `git worktree list --porcelain -z` の path | 単体テストで `..`・symlink を含む repo_root・末尾 `/` の有無を入れて、realpath 後に repo_root の下にあることを確かめる。G1 の W0 のテストで、Resolver が出した path と `git worktree list` の path が realpath で一致することを確かめる | G2・G3 |
 | 「登録済みで branch が一致」(§1.3 W2) | `git worktree list --porcelain -z` | 自前で `.git/worktrees/*` を読まない。判定に使うのは porcelain の出力だけ。G1 のテストで W2・W3 (detached / 別 branch)・prunable を実際の git で作る | G1 (t004) |
 | base の選択 (`origin/<base>` があれば remote) | `git show-ref --verify refs/remotes/origin/<base>` | 自前の判定はしない。観測は git に任せ、選ぶ 1 行だけを bash に残す (§3) | G3 |
+
+---
+
+## 12. G2 (t008) の実績と G3 への引き継ぎ
+
+- 実装: `scripts/lib_git_policy.py`（§3 の API。`GitPolicy` / `TaskBase` / `GitPolicyError` / `MissionNotFound` / `policy_from_text` / `load_git_policy` / `task_branch` / `task_worktree_path` / `task_base` / `pr_base` / `resolve_task` / `branch_name_problem` と CLI の `resolve-task` / `pr-base`）。テスト `tests/test_git_policy_resolver.py`、変異の実証 `tests/red_proof_git_policy_resolver.py`。**呼び出し元は 0**（`test_git_policy_has_no_callers_yet`。G3 の PR が `ALLOWED_CALLERS` に足す）。
+- 設計からの差分（G3 は次の形を前提にする）:
+  - `{mission_slug}` `{task_id}` `{task_slug}` に入る値は**それぞれ 1 成分**（`/` を含まない）で、`{task_id}` は `tNNN`。`mission_slug` が `/` を含むのは設計 §2.3 の「置換に入る値も同じ規則」より厳しい側で、path の成分にもなる値だから。
+  - `git:` の検査は `parse_yaml` の読み飛ばしを 3 つで拾う: (1) 値が mapping でない (2) 字下げ行の数と読めた欄の数の不一致（4 字下げ・空行・字下げコメント・重複キー） (3) トップレベルの `git:` が 2 個（先の `git:` が空だと (2) が合ってしまうため）。
+  - `mission.yaml` が**無い**（ENOENT）は `MissionNotFound`（`GitPolicyError` の子。`code` は `unreadable`）。呼び出し元が今の `load_mission` と同じエラーに写せるように分けた。
+  - 既定値の worktree path は `repo_root` を正規化せずに連結する（git-helpers.sh は git が返した root をそのまま使うのでバイトが同じ）。`repo_root` の外へ出ない検査だけは realpath（symlink で外を指す `.claude/worktrees` を拒否）。
+- 互換性の確かめ方: 本物の `git-helpers.sh` を使い捨ての bare origin + clone で実行し、plan.sh から取り出した `_slugify` と Resolver に同じ入力（title 36 通り + mission slug 23 通り = 59 通り）を与えて branch・path がバイト単位で一致することを assert する。git-helpers が作れない入力は Resolver も拒否し、設計 §2.3 で狭めた入力（`_x`・`x.`）だけが「git は作れるが Resolver は拒否」になる。
+- **戻し方**: PR revert → `scripts/sync-main-checkout.sh`。G2 は呼び出し元ゼロで、queue・registry・card・mission を 1 バイトも書かず、デーモンの restart も要らない。revert 後に `grep -rn lib_git_policy scripts hooks` が 0 件になる。

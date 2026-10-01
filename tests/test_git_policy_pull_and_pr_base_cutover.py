@@ -290,6 +290,26 @@ def test_named_form_refuses_what_it_cannot_decide(repo, args):
     assert_refused(repo.pr_base(*args, agent=None))
 
 
+@pytest.mark.parametrize("args", [
+    ["--mission", "", "--task", ""],
+    ["--mission", "", "--task", "t001"],
+    ["--mission", MISSION, "--task", ""],
+    ["--mission", "", "--task", "", "--diff-ref"],
+    ["--task", ""],                             # 片方だけ (空)
+    ["--mission", ""],
+])
+def test_an_empty_explicit_option_is_refused_not_folded_into_the_assignment_form(repo, args):
+    """「指定されたか」は値の真偽ではなく presence。空の明示指定が、呼び出し元自身の assignment の base を成功で返してはならない。
+
+    自分が pull 済み (assignment あり・card が in_progress) の状態で空の識別子を渡す = 他の PR から取り出した識別子が
+    空だったときの形。引数なしの暗黙の形は同じ状態で成功する (対照)。
+    """
+    repo.set_git(pr_base="staging")
+    assert repo.pull().returncode == 0
+    assert repo.pr_base().stdout == "staging\n", "対照: 引数なしの暗黙の形は今までどおり自分の task の base"
+    assert_refused(repo.pr_base(*args))
+
+
 def test_archived_mission_is_refused_with_a_clear_reason(repo):
     """申し送り 2 (G2 レビュー): archive 済み mission の task は pull の対象外・`pr-base` は exit 1 (active だけを見る)。"""
     shutil.move(str(repo.queue / "missions" / MISSION), str(repo.queue / "archive" / MISSION))

@@ -3136,7 +3136,7 @@ def cmd_pr_base(args):
 
       * 引数なし: 自分 (AGENT_NAME) の assignment (`<mission>:<task>`) の task。card が `in_progress` で
         `worker` が自分であることも確かめる (assignment と card の食い違いで別の task の base を返さない)。
-      * `--mission <slug> --task <id>` (両方必須): 他人の task の PR を扱う Director / review の Worker 向け。
+      * `--mission <slug> --task <id>` (どちらかが指定されたら明示の形。両方必須・空も指定とみなして検証で拒否): 他人の task の PR を扱う Director / review の Worker 向け。
         AGENT_NAME・assignment・status・worker を見ない (所有者の検査をしない)。
 
     task が決まった後は共通: card に `target_dir` があれば `DEFAULT_PR_BASE` (範囲外。今の挙動を保つ。mission の
@@ -3148,14 +3148,15 @@ def cmd_pr_base(args):
     mission は active のはず)。
     """
     opts, _ = parse_opts(args, {'--mission': 'value', '--task': 'value', '--diff-ref': 'bool'})
-    named_mission = opts.get('--mission')
-    named_task = opts.get('--task')
-    if bool(named_mission) != bool(named_task):
+    # 「指定されたか」は presence で見る (値の真偽ではない)。`--mission "" --task ""` を引数なしの形 (自分の
+    # assignment) に倒すと、他の PR から取り出した識別子が空だったときに無関係な base を成功で返す。
+    explicit = '--mission' in opts or '--task' in opts
+    if explicit and not ('--mission' in opts and '--task' in opts):
         die("pr-base: --mission と --task は両方指定してください (片方だけでは引数なしの形に倒しません)")
 
     agent = ''
-    if named_mission:
-        slug, task_id = named_mission, named_task
+    if explicit:
+        slug, task_id = opts['--mission'], opts['--task']
     else:
         agent = os.environ.get('AGENT_NAME', '')
         if not agent:
@@ -3183,7 +3184,7 @@ def cmd_pr_base(args):
     if not os.path.exists(task_path(slug, task_id)):
         die(f"pr-base: task '{task_id}' が mission '{slug}' に無い")
     meta, _body = load_task(slug, task_id)
-    if not named_mission:
+    if not explicit:
         if meta.get('status') != 'in_progress' or (meta.get('worker') or '') != agent:
             die(f"pr-base: {slug}/{task_id} は {agent} が実行中の task ではありません "
                 f"(status={meta.get('status')}, worker={meta.get('worker')})。assignment と card が食い違っています")

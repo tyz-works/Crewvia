@@ -99,6 +99,12 @@ lib ごとの**破ってはいけない契約**の要約。理由・経緯・全
   他人の task（所有者を見ない）／`--diff-ref` = QA の diff の ref。決められなければ **exit 1・stdout 空**（`main` に倒さない。
   使い方の誤りも exit 1 — exit 2 は idle の意味）。`target_dir` の task は mission の `git:` を見ず `DEFAULT_PR_BASE`。
   退避済み（archive）の mission は見ない（exit 1）。
+- **「指定されたか」は presence で見る**（G3 fix 3）: `pr-base` は `--mission` / `--task` の**どちらかが指定されたら**明示の形に
+  入り、両方必須・値は `check_*` で検証（`--mission "" --task ""` は exit 1）。assignment への fallback は**どちらも無いときだけ**。
+  `if opts.get(...)`・`[[ -n "$x" ]]` で既定値に倒すと、他の PR から取り出した空の識別子が自分の task の base を成功で返す。
+  この PR の掃除の結果: `pr-base` の `--mission/--task` だけが該当（修正済み）。`--diff-ref` は bool で空値を取らない・
+  `AGENT_NAME` 空は拒否・`target_dir` の空は「無し」という card の既存の意味・git-helpers.sh の `${CREWVIA_QUEUE:-}` は
+  plan.sh と同じ env の既定規則（引数ではない）・`crewvia_create_pr` / `crewvia_create_worktree` の必須引数は `-z` で拒否。
 - **外から来る名前はパスにする前に検査**（G3 fix 2）: mission slug は `check_mission_slug`・task id は `check_task_id`
   （どちらも `lib_git_policy`）。`plan.sh pr-base`（assignment 由来の値も）・Resolver の CLI・`load_git_policy` が同じ関数を通る。
   **利用者に見えるエラーは `format_policy_error` 1 か所**（`[code] 欄: 詳細 (場所)`）。lint の PyYAML 例外は

@@ -354,6 +354,10 @@ if yaml is not None:
     class _StrictBoolLoader(yaml.SafeLoader):
         pass
 
+    class _StrictBoolError(yaml.constructor.ConstructorError):
+        """`true` / `false` 以外の bool。利用者に見せてよい固定の文言 (`public_reason`) を持つ (値は含めない)。"""
+        public_reason = 'bool は true / false のどちらかだけ'
+
     _StrictBoolLoader.yaml_implicit_resolvers = {
         first: [r for r in resolvers if r[0] != 'tag:yaml.org,2002:bool']
         for first, resolvers in yaml.SafeLoader.yaml_implicit_resolvers.items()
@@ -375,10 +379,7 @@ if yaml is not None:
             return True
         if value == 'false':
             return False
-        raise yaml.constructor.ConstructorError(
-            None, None,
-            f"bool は true / false のどちらかだけ (got {value!r})",
-            node.start_mark)
+        raise _StrictBoolError(None, None, _StrictBoolError.public_reason, node.start_mark)
 
     _StrictBoolLoader.add_constructor('tag:yaml.org,2002:bool', _construct_strict_bool)
 
@@ -391,9 +392,11 @@ def _yaml_error_location(e: Exception) -> str:
     """
     mark = getattr(e, 'problem_mark', None) or getattr(e, 'context_mark', None)
     kind = type(e).__name__
+    reason = getattr(e, 'public_reason', None)     # この lint が自分で決めた固定の文言だけ (PyYAML の文面は使わない)
+    head = f"{reason}: " if reason else ''
     if mark is None:
-        return f"YAML を解釈できません ({kind})"
-    return f"YAML を解釈できません ({kind}: {mark.line + 1} 行目 {mark.column + 1} 列目)"
+        return f"YAML を解釈できません ({head}{kind})"
+    return f"YAML を解釈できません ({head}{kind}: {mark.line + 1} 行目 {mark.column + 1} 列目)"
 
 
 def _load_yaml_document(path: str, *, missing_is_ok: bool = True) -> tuple[dict, Optional[str]]:

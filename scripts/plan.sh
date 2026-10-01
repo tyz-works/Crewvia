@@ -85,13 +85,15 @@ set -euo pipefail
 #                              (読み取り専用・ロックを取らない)。ロックが無いので、途中のトランザクションを
 #                              1 回見うる: 2 回連続で出たものだけが本物。修復は次のロック取得時に
 #                              各コマンドが行う (R-1〜R-4)
+#   plan.sh pr-base [--mission <slug> --task <task_id>] [--diff-ref]
+#                              PR の base を 1 行出す (読み取り専用。決められなければ exit 1・stdout 空。詳細は cmd_pr_base)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 QUEUE_DIR="${CREWVIA_QUEUE:-${REPO_ROOT}/queue}"
 
 if [[ $# -eq 0 ]]; then
-  echo "Usage: plan.sh <init|add|pull|done|needs-director|fail|update|release-dep|retire|reap-orphan-assignment|ready-for-verification|verifying|snapshot|verify-result|review|launch|task-graph|lint|status|archive|resync|dashboard|dashboard-data|resolve-mission|store-check> [args...]" >&2
+  echo "Usage: plan.sh <init|add|pull|done|needs-director|fail|update|release-dep|retire|reap-orphan-assignment|ready-for-verification|verifying|snapshot|verify-result|review|launch|task-graph|lint|status|archive|resync|dashboard|dashboard-data|resolve-mission|store-check|pr-base> [args...]" >&2
   exit 1
 fi
 
@@ -432,6 +434,9 @@ def _import_scripts_module(name):
 
 
 _STORE = _import_scripts_module('lib_state_store')
+# task の branch・worktree path・base・PR base を決めるのは lib_git_policy.py の 1 か所 (vNext 01b G3。
+# knowledge/git-policy.md §3)。plan.sh は `pr-base` で PR base を読むだけで、判断の式を持たない。
+_GIT_POLICY = _import_scripts_module('lib_git_policy')
 #: task-graph の生成物 (registry/task-graph/tasks.json。queue の外) を書く関数。plan.sh 自身は
 #: 書き込みの実装を持たない (同じ関数を別名で呼ぶだけ)。tests/task_graph_publisher_harness.py が
 #: この名前を差し替える。
@@ -902,7 +907,7 @@ QUEUE_MUTATING_SUBCOMMANDS = {
 #: queue を読むだけのサブコマンド = 生成を呼ばない経路。
 #: `task-graph` 自身もここ (queue は書き換えず、生成物だけを書く)。
 QUEUE_READONLY_SUBCOMMANDS = {
-    'lint', 'status', 'resync', 'dashboard-data', 'task-graph', 'resolve-mission', 'store-check',
+    'lint', 'status', 'resync', 'dashboard-data', 'task-graph', 'resolve-mission', 'store-check', 'pr-base',
 }
 
 #: crewvia の status → (plugin の status, title に付ける印)。
@@ -2573,6 +2578,7 @@ USAGE = {
     'dashboard-data': 'plan.sh dashboard-data [--all]',
     'resolve-mission': 'plan.sh resolve-mission <task_id> [--mission <slug>]',
     'store-check': 'plan.sh store-check [--mission <slug>]',
+    'pr-base': 'plan.sh pr-base [--mission <slug> --task <task_id>] [--diff-ref]',
 }
 
 #: サブコマンドごとに受け付ける positional の数 (最小, 最大)。余剰は黙って捨てず拒否する
@@ -2586,7 +2592,7 @@ POSITIONAL_ARITY = {
     'ready-for-verification': (1, 1), 'verifying': (1, 1), 'snapshot': (1, 1), 'verify-result': (2, 2),
     'review': (1, 1), 'launch': (1, 1), 'task-graph': (0, 0), 'lint': (0, 1),
     'status': (0, 0), 'archive': (1, 1), 'resync': (0, 1), 'dashboard-data': (0, 0),
-    'resolve-mission': (1, 1), 'store-check': (0, 0),
+    'resolve-mission': (1, 1), 'store-check': (0, 0), 'pr-base': (0, 0),
 }
 
 #: 使い方の誤りの終了コード。`pull` だけは 1 — `pull` の 2 は「タスクなし (idle)」で、
@@ -2595,6 +2601,10 @@ POSITIONAL_ARITY = {
 #: (不正引数を含む、と worker.md が明記している)。
 USAGE_EXIT = 2
 PULL_USAGE_EXIT = 1
+#: 使い方の誤りを exit 1 で返すサブコマンド。`pull` は 2 = idle のため。`pr-base` は呼び出し元が
+#: `PR_BASE="$(plan pr-base)" || exit 1` と書き、「決められない」は全部 exit 1 (exit 2 は idle の意味。
+#: knowledge/git-policy.md §3)。
+PULL_USAGE_EXIT_SUBCOMMANDS = ('pull', 'pr-base')
 
 
 class UsageExit(SystemExit):
@@ -2617,7 +2627,7 @@ def _usage_text():
 
 def _usage_exit(message):
     """使い方の誤り: メッセージと usage を stderr に出して終わる。何も書いていない。"""
-    code = PULL_USAGE_EXIT if SUBCOMMAND == 'pull' else USAGE_EXIT
+    code = PULL_USAGE_EXIT if SUBCOMMAND in PULL_USAGE_EXIT_SUBCOMMANDS else USAGE_EXIT
     print(f"plan.sh {SUBCOMMAND}: {message}", file=sys.stderr)
     print(_usage_text(), file=sys.stderr)
     raise UsageExit(code)
@@ -3118,6 +3128,70 @@ def cmd_resolve_mission(args):
     die(f"task '{task_id}' not found in mission(s): {slugs}")
 
 
+def cmd_pr_base(args):
+    """PR の base branch を 1 行出す (読み取り専用。ロックも取らない・queue を書かない)。
+
+    エージェントが PR base を取る**唯一の入口** (knowledge/git-policy.md §3・§5)。env では渡さない。
+    task の決め方は 2 つ:
+
+      * 引数なし: 自分 (AGENT_NAME) の assignment (`<mission>:<task>`) の task。card が `in_progress` で
+        `worker` が自分であることも確かめる (assignment と card の食い違いで別の task の base を返さない)。
+      * `--mission <slug> --task <id>` (両方必須): 他人の task の PR を扱う Director / review の Worker 向け。
+        AGENT_NAME・assignment・status・worker を見ない (所有者の検査をしない)。
+
+    task が決まった後は共通: card に `target_dir` があれば `DEFAULT_PR_BASE` (範囲外。今の挙動を保つ。mission の
+    `git:` は見ない)、無ければ mission.yaml の `git:` の `pr_base` (Resolver)。`--diff-ref` は branch 名の代わりに
+    diff の base の ref (crewvia の task は `origin/<pr_base>`、TARGET_DIR の task は local の `main`)。
+
+    **決められなければ exit 1・stdout 空**。`main` に倒さない (custom の `pr_base` の mission で PR の行き先を間違える)。
+    active mission だけを見る: 退避済み (archive) の mission の task は exit 1 (PR を作る・付け替えるのは merge 前で、
+    mission は active のはず)。
+    """
+    opts, _ = parse_opts(args, {'--mission': 'value', '--task': 'value', '--diff-ref': 'bool'})
+    named_mission = opts.get('--mission')
+    named_task = opts.get('--task')
+    if bool(named_mission) != bool(named_task):
+        die("pr-base: --mission と --task は両方指定してください (片方だけでは引数なしの形に倒しません)")
+
+    agent = ''
+    if named_mission:
+        slug, task_id = named_mission, named_task
+    else:
+        agent = os.environ.get('AGENT_NAME', '')
+        if not agent:
+            die("pr-base: AGENT_NAME が空です (自分の task を決められません。他人の task なら --mission と --task)")
+        require_valid_agent_name(agent)
+        published = _TASK_CARDS.read_regular_text_or_unreadable(assignment_path(agent))
+        if _TASK_CARDS.is_unreadable(published):
+            die(f"pr-base: {agent} の assignment を読めません ({published.reason})。自分の task を決められません")
+        slug, sep, task_id = published.strip().partition(':')
+        if not sep or not slug or not _TASK_CARDS.TASK_ID_RE.fullmatch(task_id):
+            die(f"pr-base: {agent} の assignment の形が違います。自分の task を決められません")
+
+    if not os.path.isdir(mission_dir(slug)):
+        where = ' (退避済み。pr-base は active な mission だけを見ます)' if os.path.isdir(
+            os.path.join(ARCHIVE_DIR, slug)) else ''
+        die(f"pr-base: mission '{slug}' が active な mission に無い{where}")
+    if not os.path.exists(task_path(slug, task_id)):
+        die(f"pr-base: task '{task_id}' が mission '{slug}' に無い")
+    meta, _body = load_task(slug, task_id)
+    if not named_mission:
+        if meta.get('status') != 'in_progress' or (meta.get('worker') or '') != agent:
+            die(f"pr-base: {slug}/{task_id} は {agent} が実行中の task ではありません "
+                f"(status={meta.get('status')}, worker={meta.get('worker')})。assignment と card が食い違っています")
+
+    if meta.get('target_dir'):
+        # 範囲外 (TARGET_DIR の task): 今の挙動を保つ。既定値を使う場所はここ 1 か所 (Resolver の定数)。
+        print(_GIT_POLICY.DEFAULT_PR_BASE)
+        return
+    try:
+        policy = _GIT_POLICY.load_git_policy(slug, queue_dir=QUEUE_DIR)
+    except _GIT_POLICY.GitPolicyError as e:
+        die(f"pr-base: mission '{slug}' の git policy を決められません: [{e.code}] {e.field}: {e.detail}")
+    value = _GIT_POLICY.pr_base(policy)
+    print(f"{_GIT_POLICY.REMOTE}/{value}" if opts.get('--diff-ref') else value)
+
+
 def _pull_worktree_failed(slug, task_id, agent, generation, category, detail):
     """worktree を作れなかった pull の出口 (GIT-05)。card を `needs_director` に送って exit 1 する。
 
@@ -3127,6 +3201,11 @@ def _pull_worktree_failed(slug, task_id, agent, generation, category, detail):
     別の Worker が取った場合は何も書かない。exit 3 (何も書いていない約束) と exit 2 (idle) は使わない。
     """
     reason = f"worktree を作れませんでした ({category}): {detail}"
+    if category == 'P1':
+        # mission.yaml の `git:` (または字下げミス 1 行) を Resolver が拒否した。task を pending に戻すだけでは
+        # 同じ理由でまた止まるので、直し方を理由に書く (どのファイルの何行目かは detail にある。行の中身は出さない)。
+        reason += (f" — mission.yaml を直してください (`plan.sh lint --mission {slug}` で同じ検査が通る)。"
+                   f"直したら Director が `plan.sh update {task_id} --status pending --reset --mission {slug}` で戻します")
     outcome = {'wrote': False, 'why': ''}
 
     def _do():
@@ -3546,6 +3625,8 @@ def cmd_pull(args):
             wt = subprocess.run(
                 ['bash', '-c', wt_cmd],
                 capture_output=True, text=True, cwd=REPO_ROOT,
+                # helper が Resolver に mission.yaml を読ませる。plan.sh 自身と同じ queue を指す。
+                env={**os.environ, 'CREWVIA_QUEUE': QUEUE_DIR},
             )
             # git の警告 (fetch 失敗・local main fallback・既存 worktree の再利用) は成功時も残す。
             if wt.stderr.strip():
@@ -3553,7 +3634,7 @@ def cmd_pull(args):
             if wt.returncode != 0:
                 err_lines = [l for l in wt.stderr.strip().splitlines() if l.strip()]
                 last = err_lines[-1] if err_lines else f'exit {wt.returncode}'
-                tag = re.search(r'\b(W[0-9])\b', last)
+                tag = re.search(r'\b([WP][0-9])\b', last)
                 wt_failure = (tag.group(1) if tag else 'W5', last)
             else:
                 candidate = wt.stdout.strip()
@@ -6378,6 +6459,7 @@ dispatch = {
     'dashboard-data': cmd_dashboard_data,
     'resolve-mission': cmd_resolve_mission,
     'store-check': cmd_store_check,
+    'pr-base': cmd_pr_base,
 }
 
 if SUBCOMMAND not in dispatch:

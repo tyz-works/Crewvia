@@ -77,9 +77,9 @@ lib ごとの**破ってはいけない契約**の要約。理由・経緯・全
   コピーしない。**`failed` の依存は「保留（HELD）」**で、進める出口は Director の `plan.sh release-dep <id> --mission <slug>` だけ。
 - 共有規則に env 停止スイッチを付けない（dispatcher と plan.sh で答えが割れる）。
 
-## Git Policy（`lib_git_policy.py`。01b G2 / t008。**G3 までは呼び出し元ゼロ**）
+## Git Policy（`lib_git_policy.py`。01b G2 / t008 で作成、G3 / t012 で呼び出し元を移した）
 
-- task の branch・worktree path・base・PR base を決める唯一の場所の予定（`knowledge/git-policy.md` §2・§3）。**判断だけ**で
+- task の branch・worktree path・base・PR base を決める唯一の場所（`knowledge/git-policy.md` §2・§3）。**判断だけ**で
   subprocess を持たない（観測 = `git show-ref` / `git worktree list` と副作用 = fetch / worktree add は呼び出し元）。
 - mission.yaml の `git:` は**無いときだけ**既定値。あって読めない・未知の mode / 欄・型違い・空・制御文字・
   既定値以外の `worktree_root`・`parse_yaml` が結果に反映しなかった行（4 字下げ・flow 形式・空行やコメントの後ろ・重複キー。
@@ -88,8 +88,23 @@ lib ごとの**破ってはいけない契約**の要約。理由・経緯・全
 - `task_branch_pattern` は置換子の直後に区切り（末尾か `/`。`{task_id}` だけ `-` も可）を必須にする（別の task が同じ branch になる pattern を通さない）。
 - branch 名の規則は git より**狭い**（英数字で始まる成分・`.` / `.lock` で終わらない・先頭成分が `refs` / `origin` でない等）。
   規則を変えたら `tests/test_git_policy_resolver.py` の部分集合の検査（本物の `git check-ref-format --branch`）が通ること。
-- 呼び出し元が増える PR は cutover（ユーザー承認）。`tests/test_git_policy_resolver.py::test_git_policy_has_no_callers_yet` の
-  `ALLOWED_CALLERS` を直すのはその PR だけ。env の停止スイッチは付けない。
+- **G3（t012）で呼び出し元になった**: `git-helpers.sh`（CLI `lib_git_policy.py resolve-task --lines` / `pr-base --lines`。
+  `crewvia_create_worktree` / `_remove_worktree` / `_create_pr` が branch・path・base・PR base を**ここから**得る。式のコピーを持たない）・
+  `plan.sh`（`_GIT_POLICY`。pull の失敗の分類 **P1** = Resolver の拒否と `plan.sh pr-base`）・`kai-review.sh`（diff base）・
+  `worktree_gc.py`（片付けの根 `DEFAULT_WORKTREE_ROOT`）・`lint_plan.py`（`check_git_policy`）。呼び出し元の集合は
+  `tests/test_git_policy_resolver.py::test_git_policy_callers_are_exactly_the_cutover_set` の `ALLOWED_CALLERS`
+  （増やすのは cutover = ユーザー承認の PR だけ）。env の停止スイッチは付けない。
+- **`plan.sh pr-base`** はエージェントが PR base を取る唯一の入口（読み取り専用・ロックなし。`.crewvia-env` には PR base を**出さない**。
+  `knowledge/git-policy.md` §5）。引数なし = 自分の assignment の task（card が in_progress・worker が自分）／`--mission --task` =
+  他人の task（所有者を見ない）／`--diff-ref` = QA の diff の ref。決められなければ **exit 1・stdout 空**（`main` に倒さない。
+  使い方の誤りも exit 1 — exit 2 は idle の意味）。`target_dir` の task は mission の `git:` を見ず `DEFAULT_PR_BASE`。
+  退避済み（archive）の mission は見ない（exit 1）。
+- **mission.yaml の無関係な字下げミス 1 行でも pull は止まる**（Resolver が `parse_yaml` の読み飛ばしを fail closed で拒否する）。
+  出口: pull は exit 1・JSON なし・card を `needs_director`（理由に `(P1)`・行番号・ファイルの場所・直し方。**行の中身は出さない**）。
+  事前には `plan.sh lint --mission <slug>` が同じ検査で FAIL にする。直したら `plan.sh update <id> --status pending --reset`。
+- **Resolver の外に branch / base / worktree root のリテラル（`origin/main`・`--base main`・`.claude/worktrees` …）を書かない**:
+  `tests/test_git_decisions_go_through_policy.py` が (ファイル, 関数) の allowlist で赤にする（寄せない箇所は理由つき。
+  文書は agents/*.md・skills/*/SKILL.md の fenced code block だけ）。**task id は `tNNN` の形**（Resolver はそれ以外を拒否する）。
 
 ## status の語彙（`lib_task_status.py`）
 

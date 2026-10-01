@@ -784,3 +784,99 @@ env が無い理由は 3 つある: ① TARGET_DIR の Worker ② G3 前の `.cr
   - (P2-2) 迷子の `git` キーを**形で列挙して塞ぐ方式をやめた**。flow 形式 `{git: {mode: integration}}` は 1・2 巡目の列挙のどれにも当たらず default の direct を返した。`policy_from_text` は `_unparsed_line` で「その行を除いて `parse_yaml` し直した結果が同じ行 (= 結果に寄与していない行。飛ばされた行・上書きされた重複キー)」が 1 行でもあれば `malformed` で停止する（形を見ず `parse_yaml` 自身に聞くので、列挙に無い形も族ごと閉じる。飛ばされた行が 1 つでもあれば少なくとも 1 つは検出される）。これで §13 先の「(2) 字下げ行の数と欄の数の不一致」「(3) トップレベル `git:` が 2 個」は `_unparsed_line` に吸収された（`git:` 2 個の全組み合わせで `_unparsed_line` が先に拾うことを確認して `heads != 1` は外した）。`_stray_git_key_line` は `review:` の下の `- git: x` のように parse_yaml が**読んで残す**形のための副の網として残す。今ある 67 本の mission.yaml（queue と archive）は `_unparsed_line` に 1 本も掛からない（実測）。
   - (P2-1) `task_branch_pattern` は置換子の直後に区切りを必須にした（`_check_pattern_boundaries`）: 次の文字は末尾か `/`、`{task_id}` だけは `-` も可（`tNNN` は `-` を含まない）。`{mission_slug}-` `{task_slug}-` は slug 自身が `-` を含むので境界にならず拒否。mission `demo` の t100 (slug `0fix`) と t1000 (slug `fix`) が `task/demo/t1000fix` で衝突する pattern は設定の段階で止まる。既定の `task/{mission_slug}/{task_id}-{task_slug}` は通る。
   - worktree path の同族の衝突: path は pattern に依らず `<worktree_root>/<mission_slug>/<task_id>-<task_slug>` で、`mission_slug` は 1 成分 (自分の dir)、`task_id` は `-` を含まない `tNNN` なので `(mission, task_id, slug) → path` は単射（表: `t100`+`0fix` → `t100-0fix`、`t1000`+`fix` → `t1000-fix`）。総当たりテスト `test_every_accepted_pattern_maps_distinct_tasks_to_distinct_branches_and_paths` が 3 pattern × 150 組で branch と path の両方の単射を assert する。
+
+---
+
+## 14. G3 (t012) の実績・申し送りへの回答・戻し方
+
+§4 の「寄せる (G3)」の行を全部寄せた。cutover (ユーザー承認の PR)。env の停止スイッチは付けていない。
+
+### 14.1 実装
+
+| 場所 | 変更 |
+|---|---|
+| `scripts/lib_git_policy.py` | CLI に `--lines` (値だけを 1 行ずつ。bash が `read` で読む)・拒否時の stderr に mission.yaml の**場所**を追加 (行の中身は出さない) |
+| `scripts/git-helpers.sh` | `crewvia_create_worktree` / `crewvia_remove_worktree` が `resolve-task --lines` を 1 回呼ぶ。branch・path の式 (旧 :105・:108・:174)・base の `origin/main` / `main` のリテラル (旧 :133-136) を消した。base を**選ぶ**1 行 (remote-tracking があれば remote、無ければ local に倒して警告) は bash に残るが、名前は Resolver の候補 (`base_remote` / `base_local`) を使うのでリテラルは無い。`crewvia_create_pr` は `pr-base` を `--base` に渡す (署名は `<mission_slug> <branch> <title> <body>` に**変えた** — 呼び出し元ゼロで、mission が分からないと PR base を決められないため。取れなければ push も PR 作成もしない)。`_crewvia_worktree_lookup` は `git worktree list --porcelain -z` を **NUL のまま**読む (旧: NUL を改行に直して読んでいたので、改行を含む path の別の worktree が `worktree <期待する path>` の行を偽造できた。G1 の Codex (t006) からの持ち越し) |
+| `scripts/plan.sh` | `import lib_git_policy` (`_GIT_POLICY`)。pull の失敗分類に **P1** (Resolver の拒否) を追加し、理由に直し方を書く。helper を呼ぶときに `CREWVIA_QUEUE` を渡す。`plan.sh pr-base` を追加 (§3・§5。読み取り専用・ロックなし)。使い方の誤りは `pull` と同じく exit 1 (`pr-base` は呼び出し元が `|| exit 1` と書くので、exit 2 = idle と混ざらない) |
+| `scripts/kai-review.sh` | diff base を `lib_git_policy.py pr-base` から得る。**決められなければ `fail_needs_director`** (mission が分からない・`git:` が壊れている・fetch の失敗)。`main` に倒さない (D20) |
+| `scripts/worktree_gc.py` | 片付けの根を `lib_git_policy.DEFAULT_WORKTREE_ROOT` から (3 か所) |
+| `scripts/lint_plan.py` | `check_git_policy`: Resolver の `policy_from_text` を呼び、さらに本物の YAML パーサの読みと突き合わせて**食い違えば FAIL**。PyYAML が無ければ FAIL (簡易パーサに倒さない。D16)。tasks が 0 件の mission でも検査する |
+| `tests/test_git_decisions_go_through_policy.py` + `tests/git_decision_scan.py` | 構造ガード (§6)。`tests/guard_report.py` + `conftest.py` の `pytest_terminal_summary` で、**成功しても検査件数が CI ログに出る** (01a backlog 2。書き込み側のガードにも適用) |
+| `tests/test_git_policy_resolver.py` | G2 の「呼び出し元ゼロ」テストを外し、`test_git_policy_callers_are_exactly_the_cutover_set` に。互換性テストは**凍結した G3 前の helper** (`tests/fixtures/git-helpers-pre-g3.sh`) と G3 後の helper を同じ 59 通りの入力で走らせ、branch・path のバイト一致を見る |
+| `tests/test_git_policy_pull_and_pr_base_cutover.py` | 挙動 (38 件)。`tests/red_proof_git_policy_cutover.py` が赤の実証 |
+| `scripts/test_handoff_path.sh` / `scripts/test_kai_review.sh` | 前者は一時 queue に mission を置き task id を `tNNN` に直した。後者は diff base の 3 件 (既定 / custom `pr_base` / 決められない) を追加 |
+
+### 14.2 設計 (§5) と task カード本文の食い違い — 設計に従った
+
+task カード (t012) の「やること」には「`.crewvia-env` に設計どおりの変数（`CREWVIA_PR_BASE` ほか）を出す」とあるが、**設計 §5 は
+その案を Codex review 1 巡目 P2 で捨てている** (env が無い 3 つの場合 — TARGET_DIR の Worker・G3 前の `.crewvia-env`・cwd が主 checkout に
+戻った shell — を `:-main` が区別できない)。`.crewvia-env` は**今までと同じ 3 行のまま**で、PR base は `plan.sh pr-base` で取る。
+受入条件の「`.crewvia-env` は追加の行だけが違う」は、追加の行が 0 行で満たされる (テスト `test_default_pull_cuts_from_origin_main_and_env_file_has_no_extra_lines`)。
+
+### 14.3 申し送り (Director / G2 のレビュー t011) への回答
+
+**1. mission.yaml の無関係な字下げミス 1 行で、その mission の全 task の pull が止まる件。**
+
+- 止まる理由: Resolver は `parse_yaml` が読み飛ばした行を fail closed で拒否する (§2.2。`mode: integration` が黙って direct になるのを防ぐため。
+  読み飛ばされた行が git の宣言かどうかは `git:` が無い mission では判別できない)。**本番の mission.yaml 67 本 (queue/missions と queue/archive) を Resolver に通した結果は
+  67 本とも通る (拒否 0・読めない 0・`git:` を書いた mission 0)。lint (本物の YAML パーサとの突き合わせ) も 0 件**
+  (`policy_from_text` + `lint_plan.check_git_policy` を 67 本に走らせた。読み取りだけ)。
+- 出口 (pull): **exit 1・stdout 空・card を `needs_director`・assignment なし・worktree なし**。pending に戻さない (戻すと dispatcher が同じ task を配り続ける。§1.2)。
+  理由 (`needs_director_reason`) は先頭に `(P1)` と `<欄>: <N> 行目が…`、全文 (本文の `## Needs-Director 詳細` と stderr) に mission.yaml の**場所**と**直し方**
+  (`plan.sh lint --mission <slug>` で同じ検査が通る → 直したら Director が `plan.sh update <id> --status pending --reset --mission <slug>`)。
+  **mission.yaml の行の中身は理由にも stderr にも出さない** (行番号だけ。G2 の P2-2)。同じ mission の他の task も、pull されるたびに同じ理由で `needs_director` になる (1 回ずつ Director に通知される)。
+- 事前の出口 (lint): `plan.sh lint <mission>` が同じ入力で FAIL にする。Director は `git:` を書いた / mission.yaml を手で直した後に lint を打つ。
+- 出口が閉じていないことのテスト: 直して reset すれば同じ task が取れる (`test_after_fixing_the_file_a_reset_task_pulls_normally`)。
+- 運用上の注意: pull の `needs_director` が連発するのは「mission.yaml が壊れた」ときだけ。通知を受けたら mission.yaml を見る。
+
+**2. `load_git_policy` は `queue/missions/` だけを見る — archive 済み mission の扱い。** 設計 (§3) は「card が読めない・無い (archive 済みを含む) なら exit 1」と
+書いていたので、それに従った。
+
+| 場面 | 扱い | 理由 |
+|---|---|---|
+| pull | 対象外 | pull は `queue/missions/` の active な mission の task だけを探す (今も同じ)。archive 済み mission の task は pull されない |
+| `plan.sh pr-base` (引数なし・名指し) | **exit 1・stdout 空**。stderr に「退避済み (archive)。pr-base は active な mission だけを見ます」 | PR を作る・stacked PR を付け替える・review するのは merge 前で、mission は active のはず。archive 後の PR の base が要る場面は、plan.sh の管轄外 (Director が `gh pr view --json baseRefName` で見る)。黙って `main` に倒さない (D18) |
+| `kai-review.sh` | `lib_git_policy.py pr-base` が `MissionNotFound` で拒否 → `fail_needs_director` | review は merge 前 (mission は active) |
+| `lint` | archive 済みは対象外 (今までどおり) | |
+
+archive 済み mission の policy も読めるようにする案は、読み口 (`queue/archive/<slug>/mission.yaml`) を Resolver が 2 か所持つことになるので、
+必要になるまで足さない (§10 の backlog)。
+
+### 14.4 設計になかったこと
+
+- **task id は `tNNN`** (`TASK_ID_RE`) の形でないと Resolver が拒否する。旧 helper は任意の id を通した。本番の id は `next_task_id` から作られ常に `tNNN`。
+  それ以外を使っていたのは `scripts/test_handoff_path.sh` (`tselftest-<pid>`) だけで、直した。
+- §4.2 の表に無かった行を構造ガードの走査が見つけた: **`agents/verifier.md` の code block の `git diff main...HEAD`**。G4 (t016) の「書き換える」行に足す
+  (今は allowlist の G4 の理由で載っている)。
+- 検出器の誤検出を 1 つ直した: lint のメッセージ `task/{tid}: ...` を branch の pattern と読んでいた (`task/<成分>/<成分>` の形に絞った)。
+
+### 14.5 族の掃除 (同じ「Git の判断のリテラル」を扱う場所)
+
+構造ガードの走査 (コード 58 ファイル・文書 7 本の code block 132 個) の結果。G3 前の木 (`bd4485a`) に同じ検出器を当てると **36 件 / 19 キー**、G3 後は **22 件 / 12 キー**
+(14 件を寄せた)。
+
+| 場所 | G3 前 | 処置 |
+|---|---|---|
+| `scripts/git-helpers.sh` | 8 件 (branch・path ×2・base ×4・`--base main`) | **寄せた** (0 件) |
+| `scripts/kai-review.sh` | 3 件 (`main:` の fetch・`origin/main...HEAD` の表示) | **寄せた** (0 件) |
+| `scripts/worktree_gc.py` | 3 件 (`'.claude', 'worktrees'`) | **寄せた** (`DEFAULT_WORKTREE_ROOT`。0 件) |
+| `scripts/plan.sh` / `scripts/lint_plan.py` | 0 件 | リテラルを足していない (`pr-base` は Resolver の定数を使う) |
+| `scripts/lib_daemon_watch.py` ×3・`scripts/dispatcher.sh` ×1・`scripts/sync-main-checkout.sh` ×6 | 10 件 | **寄せない** (主 checkout の追従。§4.1。allowlist に理由つき) |
+| `hooks/pre-tool-use.sh` ×1・`hooks/lib_main_repo_git_guard.py` ×1 | 2 件 | **寄せない** (worktree_root は既定値に固定。§2.1・§10-5) |
+| `agents/*.md`・`skills/*/SKILL.md` の code block | 10 件 | **G4 (t016) が書き換える**。allowlist に載せ、G4 で外す (死んだ行で赤になるので外し忘れない) |
+| `knowledge/*.md`・本文の地の文 | 対象外 | 戻し方・経緯・実測の記録 (§6) |
+
+### 14.6 戻し方 (R2)
+
+- **PR revert → `scripts/sync-main-checkout.sh`**。G3 は queue・registry・card・mission を 1 バイトも書き換えず、デーモンの restart も要らない
+  (plan.sh は呼び出しごとに新しいプロセス、kai-review は spawn ごとに読む)。
+- **G4 が入っているなら先に G4 を revert する** (G4 の文書は `plan pr-base` を呼ぶので、G3 だけ戻すと PR を作るたびに exit 1 で止まる。止まる側に倒れるので PR の行き先は間違えない)。
+- **`git:` を書いた mission があるなら revert の前に消す** (旧 plan.sh は黙って無視するので、custom の base が効かなくなる)。G3 の本番確認 (t019) の後までは書かない (§7)。
+- revert した後に `needs_director` (P1) になっていた card は、Director が今の出口 (`plan.sh update <id> --status pending --reset`) で戻す。
+
+### 14.7 本番で変わること (Result の転記元)
+
+- branch 名・worktree path・base は Resolver から来る (**policy 未指定の mission は G3 前とバイト単位で同じ**。59 通りの互換テスト)。`.crewvia-env` は 3 行のまま。
+- `plan.sh pr-base` が増える (読み取り専用)。kai-review の diff base が `pr-base` 経由 (既定値では `main`)。lint が `git:` を検査する。
+- mission.yaml に字下げミスがあると、その mission の pull は `needs_director` (P1) で止まる (本番 67 本は 0 件)。
+- 構造ガードと CI ログの件数表示が増える。

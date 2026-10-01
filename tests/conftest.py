@@ -92,6 +92,17 @@ def pytest_unconfigure(config):
     pytest_workspace_sweep.run_cleanup(TEST_DESTINATION, PRODUCTION_DESTINATION)
 
 
+def pytest_terminal_summary(terminalreporter):
+    """構造ガードが検査した件数を、成功しても最後に出す (`tests/guard_report.py`。01a backlog 2)。
+    ガードのテストが走らなかった回 (一部だけ選んだ回) は何も出さない。"""
+    import guard_report
+    report = guard_report.lines()
+    if report:
+        terminalreporter.write_sep("-", "structural guards: inspected counts")
+        for line in report:
+            terminalreporter.write_line(line)
+
+
 @pytest.fixture
 def production_destination(monkeypatch):
     """Put the environment back the way the 2026-09-23 incident found it.

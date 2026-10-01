@@ -231,6 +231,11 @@ def test_the_scan_is_not_vacuous():
     scanned = [s for s in sites if s.file != STORE_LIB]
     print(f"[write-guard] scanned files={len(scan_targets())} write sites={len(scanned)} "
           f"(+ {len([s for s in sites if s.file == STORE_LIB])} inside {STORE_LIB})")
+    # 成功したテストの print は pytest が捨てる。CI ログに件数が残るよう conftest の summary に載せる (01a backlog 2)
+    import guard_report
+    guard_report.record('queue-writes', files=len(scan_targets()), write_sites=len(scanned),
+                        inside_lib=len([s for s in sites if s.file == STORE_LIB]),
+                        allowlist_rows=len(ALLOWED_WRITES))
     assert len(scanned) >= MIN_SCANNED_WRITES, (
         f"検査した書き込みが {len(scanned)} 件しかない (下限 {MIN_SCANNED_WRITES})。検出器が壊れている")
     inside = [s for s in sites if s.file == STORE_LIB]

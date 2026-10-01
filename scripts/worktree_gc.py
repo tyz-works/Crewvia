@@ -119,6 +119,11 @@ from lib_task_cards import (  # noqa: E402
     is_missing, is_unreadable, parse_yaml, read_regular_text_or_unreadable,
 )
 import lib_worker_target  # noqa: E402
+# worktree の根は Git Policy の 1 か所 (worktree_root は既定値に固定。knowledge/git-policy.md §2.1・§4.1)。
+from lib_git_policy import DEFAULT_WORKTREE_ROOT  # noqa: E402
+
+#: 片付けの根 (主 checkout からの相対の成分)。
+MANAGED_ROOT_PARTS = tuple(DEFAULT_WORKTREE_ROOT.split('/'))
 
 REMOVE = 'remove'
 KEEP = 'keep'
@@ -321,7 +326,7 @@ class Context:
 
     @property
     def managed_root(self) -> str:
-        return os.path.join(self.repo, '.claude', 'worktrees')
+        return os.path.join(self.repo, *MANAGED_ROOT_PARTS)
 
 
 def load_active_missions(queue: str) -> tuple[Optional[set], str]:
@@ -679,7 +684,7 @@ def apply_quarantine(repo: str, queue: str, verdicts: list[Verdict]) -> list[dic
     1 回の `--apply` で隔離したものは全部同じタイムスタンプの下に入る。
     """
     results = []
-    managed_root = os.path.join(os.path.realpath(repo), '.claude', 'worktrees')
+    managed_root = os.path.join(os.path.realpath(repo), *MANAGED_ROOT_PARTS)
     # 秒精度だと、同じ元パスを 2 回に分けて隔離する 2 回の `--apply` が同じ秒に収まった瞬間、隔離先が
     # 文字列として一致し、2 回目が「隔離先が既に存在する」で failed になる (quarantine が世代として
     # 突き合わせる値である以上、衝突してはいけない。crewvia の `now_generation()` と同じ理由)。
@@ -751,7 +756,7 @@ def find_quarantine_entries(repo: str) -> tuple[Optional[list[tuple[Worktree, st
     worktrees, problem = list_worktrees(repo)
     if worktrees is None:
         return None, problem
-    managed_root = os.path.join(os.path.realpath(repo), '.claude', 'worktrees')
+    managed_root = os.path.join(os.path.realpath(repo), *MANAGED_ROOT_PARTS)
     out = []
     for wt in worktrees:
         wt_real = os.path.realpath(wt.path)

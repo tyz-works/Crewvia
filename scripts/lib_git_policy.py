@@ -492,10 +492,17 @@ def _build_parser() -> argparse.ArgumentParser:
     r = sub.add_parser("resolve-task")
     for a in ("--queue", "--mission", "--task", "--task-slug", "--repo-root"):
         r.add_argument(a, required=True)
+    r.add_argument("--lines", action="store_true",
+                   help="JSON でなく値だけを 1 行ずつ (branch / worktree_path / base_remote / base_local / pr_base の順)")
     b = sub.add_parser("pr-base")
     for a in ("--queue", "--mission"):
         b.add_argument(a, required=True)
+    b.add_argument("--lines", action="store_true", help="JSON でなく値だけを 1 行")
     return p
+
+
+#: `resolve-task --lines` の出力の順 (bash の呼び出し元 = git-helpers.sh がこの順で読む)。
+RESOLVE_TASK_LINE_ORDER = ("branch", "worktree_path", "base_remote", "base_local", "pr_base")
 
 
 def main(argv=None) -> int:
@@ -508,9 +515,15 @@ def main(argv=None) -> int:
         else:
             out = {"pr_base": pr_base(policy)}
     except GitPolicyError as e:
-        print(f"lib_git_policy: [{e.code}] {e.field}: {e.detail}", file=sys.stderr)
+        # どのファイルか (mission.yaml の path) を添える。行の中身は出さない (detail は行番号だけ。G2 の P2-2)。
+        where = mission_yaml_path(args.mission, args.queue)
+        print(f"lib_git_policy: [{e.code}] {e.field}: {e.detail} ({where})", file=sys.stderr)
         return 2
-    print(json.dumps(out, ensure_ascii=False, sort_keys=False))
+    if args.lines:
+        keys = RESOLVE_TASK_LINE_ORDER if args.verb == "resolve-task" else ("pr_base",)
+        print("\n".join(out[k] for k in keys))
+    else:
+        print(json.dumps(out, ensure_ascii=False, sort_keys=False))
     return 0
 
 

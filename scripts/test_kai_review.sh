@@ -1421,6 +1421,54 @@ fi
 printf 'active_missions:\n  - %s\ndefault_mission: %s\n' "$MISSION_SLUG" "$MISSION_SLUG" > "$QUEUE/state.yaml"
 
 # ---------------------------------------------------------------------------
+# vNext 01b G3: diff base は mission の Git Policy (lib_git_policy の pr_base) が決める
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- G3: diff base — policy 未指定は origin/main (今までと同じ) ---"
+write_task t240 "G3 default diff base"
+FAKE_GH_HEAD_BRANCH="feature-branch" FAKE_CODEX_FIXTURE="$FIXTURES_DIR/clean.txt" \
+  run_kai --pr 1 --task t240 --mission "$MISSION_SLUG" --dry-run > "$TMPDIR_TEST/t240.out" 2>&1
+rc240=$?
+if [[ $rc240 -eq 0 ]] && grep -q "Computing diff (origin/main...HEAD)" "$TMPDIR_TEST/t240.out"; then
+  pass "policy 未指定: diff base は origin/main"
+else
+  fail "default diff base should be origin/main — rc=$rc240 (see $TMPDIR_TEST/t240.out)"
+fi
+
+echo ""
+echo "--- G3: diff base — mission の git.pr_base を使う (origin に develop を作る) ---"
+git -C "$UPSTREAM" branch develop main >/dev/null 2>&1
+MISSION_YAML_BACKUP="$TMPDIR_TEST/mission.yaml.backup"
+cp "$QUEUE/missions/$MISSION_SLUG/mission.yaml" "$MISSION_YAML_BACKUP"
+printf 'git:\n  mode: direct\n  base_branch: main\n  pr_base: develop\n' >> "$QUEUE/missions/$MISSION_SLUG/mission.yaml"
+write_task t241 "G3 custom diff base"
+FAKE_GH_HEAD_BRANCH="feature-branch" FAKE_CODEX_FIXTURE="$FIXTURES_DIR/clean.txt" \
+  run_kai --pr 1 --task t241 --mission "$MISSION_SLUG" --dry-run > "$TMPDIR_TEST/t241.out" 2>&1
+rc241=$?
+if [[ $rc241 -eq 0 ]] && grep -q "Computing diff (origin/develop...HEAD)" "$TMPDIR_TEST/t241.out"; then
+  pass "git.pr_base: develop → diff base は origin/develop"
+else
+  fail "custom pr_base should be the diff base — rc=$rc241 (see $TMPDIR_TEST/t241.out)"
+fi
+
+echo ""
+echo "--- G3: diff base — policy を決められない (git: が壊れている) → main に倒さず NEEDS FIX・codex を呼ばない ---"
+cp "$MISSION_YAML_BACKUP" "$QUEUE/missions/$MISSION_SLUG/mission.yaml"
+printf 'git:\n  mode: integration\n' >> "$QUEUE/missions/$MISSION_SLUG/mission.yaml"
+write_task t242 "G3 broken policy diff base"
+CODEX_LOG_G3="$TMPDIR_TEST/g3_codex.log"
+FAKE_GH_HEAD_BRANCH="feature-branch" FAKE_CODEX_FIXTURE="$FIXTURES_DIR/clean.txt" FAKE_CODEX_LOG="$CODEX_LOG_G3" \
+  run_kai --pr 1 --task t242 --mission "$MISSION_SLUG" --dry-run > "$TMPDIR_TEST/t242.out" 2>&1
+rc242=$?
+if grep -q "cannot resolve the PR base" "$TMPDIR_TEST/t242.out" && ! grep -q "Computing diff" "$TMPDIR_TEST/t242.out" \
+   && [[ ! -s "$CODEX_LOG_G3" ]]; then
+  pass "git: が壊れている → PR base を決められないと NEEDS FIX (main の diff を取らず、codex も呼ばない)"
+else
+  fail "broken git policy must fail closed — rc=$rc242 (see $TMPDIR_TEST/t242.out)"
+fi
+cp "$MISSION_YAML_BACKUP" "$QUEUE/missions/$MISSION_SLUG/mission.yaml"
+
+# ---------------------------------------------------------------------------
 echo ""
 echo "================================"
 echo "Results: ${PASS_COUNT} passed, ${FAIL_COUNT} failed"

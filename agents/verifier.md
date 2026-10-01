@@ -25,9 +25,20 @@ cat registry/verification/<task_id>/<latest>.json
 
 ### Step 2: diff を確認する
 
+diff の base は `main` と決め打たず、**検証対象の task** の値を**名指しの形**で `plan pr-base --diff-ref` に聞く
+（`<slug>` は検証中の task が属する mission。Verifier は実装者の assignment を持たない）。
+crewvia 本体の task は `origin/<pr_base>` を fetch して確かめてから diff を取る。取れなければ diff を取らず、判定を `needs_human_review` にして理由を notes に書く（`main` に倒さない）。
+
 ```bash
-git diff main...HEAD -- <変更ファイル>
-git log main..HEAD --oneline
+DIFF_REF="$(plan pr-base --diff-ref --mission <slug> --task <task_id>)" || { echo "diff の base を決められない。needs_human_review にする" >&2; exit 1; }
+case "$DIFF_REF" in
+  origin/*)   # crewvia 本体の task。PR base をここで取る
+    git fetch origin "${DIFF_REF#origin/}" \
+      && git rev-parse --verify --quiet "${DIFF_REF}^{commit}" >/dev/null \
+      || { echo "${DIFF_REF} を取れない。needs_human_review にする" >&2; exit 1; } ;;
+esac          # それ以外 (TARGET_DIR の task は local の main) は何もしない
+git diff "${DIFF_REF}...HEAD" -- <変更ファイル>
+git log "${DIFF_REF}..HEAD" --oneline
 ```
 
 ### Step 3: acceptance_criteria を照合する

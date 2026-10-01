@@ -62,7 +62,9 @@ R_MAIN_CHECKOUT = ("主 checkout を origin/main に追従させる手順 / 検�
                    "(crewvia の本番 branch は mission ごとに変わらない)。knowledge/git-policy.md §4.1")
 R_HOOK_ROOT = ("hook が自分の worktree への編集を拒否しないための除外。worktree_root は Resolver が既定値に固定している "
                "(§2.1) 間は値が一致する。広げるときに寄せる (§10-5)")
-R_G4 = "G4 (t016) が `plan pr-base` / 文言の変更で書き換える文書。G4 でここの行を外す (外さないと死んだ行で赤)"
+R_DOC_DEFAULT = ("文書の code block に書いた**既定の形**の説明 (worktree の命名)。決めるのは pull (JSON の `worktree_path` と "
+                 "`git branch --show-current` が正) と本文に明記してある。PR base の決め打ちではない (G4 / t016)")
+R_DOC_INVESTIGATE = "調査の例 (`git log origin/task/...`)。task の base ではなく、task branch の remote の見方 (G4 / t016。knowledge/git-policy.md §4.2)"
 
 #: 検出した判断のうち、**寄せない** (or G4 が書き換える) もの。`(ファイル, 関数) → (件数, 理由)`。
 ALLOWED: dict[tuple[str, str], tuple[int, str]] = {
@@ -73,19 +75,16 @@ ALLOWED: dict[tuple[str, str], tuple[int, str]] = {
     ("scripts/sync-main-checkout.sh", "<top>"): (6, R_MAIN_CHECKOUT + " (ff 本体と報告)"),
     ("hooks/pre-tool-use.sh", "<top>"): (1, R_HOOK_ROOT + " (編集ガードの case パターン)"),
     ("hooks/lib_main_repo_git_guard.py", "has_main_repo_reference"): (1, R_HOOK_ROOT + " (git ガードの除外)"),
-    ("agents/director.md", "<code block>"): (2, R_G4 + " (worktree の命名の文言・stacked PR の `--base main`)"),
-    ("agents/verifier.md", "<code block>"): (1, R_G4 + " (verifier の diff base `main...HEAD`。§4.2 の表に無かった行を G3 の走査が見つけた)"),
-    ("agents/worker-codex.md", "<code block>"): (1, R_G4 + " (「origin/main との diff」の文言)"),
-    ("agents/worker.md", "<code block>"): (4, R_G4 + " (PR 作成の `--base main` ×2・worktree の命名・worktree_path の例)"),
-    ("skills/crewvia-qa/SKILL.md", "<code block>"): (2, R_G4 + " (QA の `git diff main...HEAD`)"),
+    ("agents/director.md", "<code block>"): (2, R_DOC_DEFAULT + " ×1・" + R_DOC_INVESTIGATE + " ×1"),
+    ("agents/worker.md", "<code block>"): (2, R_DOC_DEFAULT + " (命名の説明・pull の JSON の例)"),
 }
 
-#: 検査した対象の下限 (G3 着手時に実測: code 58 ファイル・文書 7 本 132 block・拾った 22 件)。検出器が壊れて数件しか
-#: 拾わなくなっても PASS しないための床。多少の増減で赤にならない余裕を持たせてある。
+#: 検査した対象の下限 (G4 着手時に実測: code 58 ファイル・文書 7 本 133 block・拾った 16 件。G3 では文書の書き換え前で 22 件)。
+#: 検出器が壊れて数件しか拾わなくなっても PASS しないための床。多少の増減で赤にならない余裕を持たせてある。
 MIN_CODE_FILES = 50
 MIN_DOC_FILES = 5
 MIN_CODE_BLOCKS = 100
-MIN_HITS = 15
+MIN_HITS = 12
 
 
 def _excluded(rel: str) -> bool:
@@ -203,13 +202,23 @@ def test_the_resolver_and_the_callers_hold_no_git_decision_literal_outside_the_t
 # ---------------------------------------------------------------------------
 
 BASH_FORMS = [
-    ('local base="origin/main"', "origin/main"),                                   # git-helpers.sh (G3 前) の base
-    ("gh pr create \\\n    --title \"$t\" \\\n    --base main \\\n    --head x", "--base main"),   # 複数行の gh pr create
+    ('local base="origin/main"', "origin/<literal>"),                              # git-helpers.sh (G3 前) の base
+    ("gh pr create \\\n    --title \"$t\" \\\n    --base main \\\n    --head x", "--base <literal>"),   # 複数行の gh pr create
     ('git fetch --force origin "main:${BASE_FETCH_LOCAL_REF}"', "main: refspec"),   # kai-review.sh (G3 前)
-    ('git show-ref --verify --quiet "refs/remotes/origin/main"', "origin/main"),
+    ('git show-ref --verify --quiet "refs/remotes/origin/main"', "origin/<literal>"),
     ('git show-ref --verify "refs/heads/main"', "refs main"),
     ('"${_GUARD_REPO_REAL}"/.claude/worktrees/*)', ".claude/worktrees"),           # pre-tool-use.sh の case パターン
     ('git diff main...HEAD --name-only', "main..."),
+    # G4: main 以外のリテラルも拾う (G3 の QA t013。`--base develop` は赤にならなかった)
+    ("gh pr create --title t --base develop", "--base <literal>"),
+    ("gh pr edit 12 --base=release/1.2", "--base <literal>"),
+    ('gh pr edit 12 --base "develop"', "--base <literal>"),
+    ('git fetch origin && git rev-parse origin/develop', "origin/<literal>"),
+    ('git diff develop...HEAD --name-only', "<literal>..HEAD"),
+    ('git log develop..HEAD --oneline', "<literal>..HEAD"),
+    ('git log origin/release/1.2..HEAD --oneline', "origin/<literal>"),
+    ('git log release..HEAD --oneline', "<literal>..HEAD"),               # verifier.md (G4 前) の `main..HEAD` は 2 ドットで拾えていなかった
+
     ('git worktree add -b "task/$m/$t-$s" "$p" "$base"', "task/$ branch"),
 ]
 
@@ -223,21 +232,23 @@ def test_positive_controls_bash(src, what):
 def test_positive_control_literal_after_a_comment_with_a_heredoc_opener():
     """コメント中の `<<EOF` で残りを読み飛ばす盲点 (t035) の再発防止: その**後**のリテラルも拾う。"""
     src = "# see <<EOF in the docs\nbase=origin/main\n"
-    assert [h.what for h in scan.shell_hits(src, "x.sh")] == ["origin/main"]
+    assert [h.what for h in scan.shell_hits(src, "x.sh")] == ["origin/<literal>"]
 
 
 def test_positive_control_python_heredoc_body_in_a_sh_file():
     src = "echo hi\npython3 - <<'PYEOF'\nref = 'origin/main'\nPYEOF\n"
-    assert [h.what for h in scan.shell_hits(src, "x.sh")] == ["origin/main"]
+    assert [h.what for h in scan.shell_hits(src, "x.sh")] == ["origin/<literal>"]
 
 
 PY_FORMS = [
     ('def fetch_origin(repo_root, *, remote: str = "origin", branch: str = "main",\n                 timeout=3):\n    pass\n', '"main" (exact)'),
-    ('def commits_behind(repo_root, *, ref: str = "origin/main"):\n    pass\n', "origin/main"),
+    ('def commits_behind(repo_root, *, ref: str = "origin/main"):\n    pass\n', "origin/<literal>"),
+    ('def f(ref: str = "origin/develop"):\n    pass\n', "origin/<literal>"),          # G4: main 以外
+    ("cmd = ['gh', 'pr', 'create', '--base develop']\n", "--base <literal>"),
     ("import os\nx = os.path.join(self.repo, '.claude', 'worktrees')\n", ".claude/worktrees (joined)"),
     ("p = '/tmp/x/.claude/worktrees/' + name\n", ".claude/worktrees"),
     ("b = f'task/{m}/{t}-{s}'\n", "task/ pattern"),
-    ("ref = f'refs/remotes/origin/main'\n", "origin/main"),
+    ("ref = f'refs/remotes/origin/main'\n", "refs/remotes/origin/main"),
     ("ref = 'refs/heads/main'\n", "refs/heads/main"),
 ]
 
@@ -254,7 +265,7 @@ def test_positive_control_document_code_block_but_not_prose():
           "また地の文に --base main と書く。\n")
     hits, blocks = scan.doc_hits(md, "x.md")
     assert blocks == 1
-    assert [h.what for h in hits] == ["main..."], hits
+    assert sorted(h.what for h in hits) == ["<literal>..HEAD", "main..."], hits   # 同じ 1 行を 2 つの形が拾う
 
 
 @pytest.mark.parametrize("src", [
@@ -265,6 +276,22 @@ def test_positive_control_document_code_block_but_not_prose():
 ])
 def test_negative_controls_python(src):
     assert scan.python_hits(src, "x.py") == []
+
+
+@pytest.mark.parametrize("src", [
+    'gh pr create --base "$PR_BASE"',
+    "gh pr edit 1 --base \"${PR_BASE}\"",
+    'git diff "${DIFF_REF}...HEAD" --name-only',
+    'git log "${DIFF_REF}..HEAD" --oneline',
+    'git diff "$DIFF_REF...HEAD"',
+    'case "$DIFF_REF" in\n  origin/*)\n    git fetch origin "${DIFF_REF#origin/}" ;;\nesac',   # 文書の手順そのもの
+    'PR_BASE="$(plan pr-base --mission $M --task $T)" || exit 1',
+    'git push origin HEAD',
+    'git merge-base HEAD origin_x',
+])
+def test_negative_controls_bash_env_and_placeholder_forms(src):
+    """env 参照・変数・glob は通す (リテラルだけを拾う。G4 の検出対象の拡張が文書の正しい書き方を赤にしない)。"""
+    assert scan.shell_hits(src + "\n", "x.sh") == [], scan.shell_hits(src + "\n", "x.sh")
 
 
 def test_negative_controls_bash_comments_only():
@@ -297,6 +324,15 @@ def _hits_with_extra(rel: str, extra: str) -> list[scan.Hit]:
     ("scripts/kai-review.sh", '\nfoo() { git fetch origin "main:x"; }\n'),
     ("agents/worker.md", "\n```bash\ngh pr create --base main\n```\n"),
     ("skills/crewvia-qa/SKILL.md", "\n```bash\ngit diff main...HEAD\n```\n"),
+    # G4: main 以外のリテラル (G3 では赤にならなかった) と、2 ドットの形・env 参照を書き換えた文書への書き戻し
+    ("agents/worker.md", "\n```bash\ngh pr create --base develop\n```\n"),
+    ("agents/director.md", "\n```bash\ngh pr edit 1 --base release/2\n```\n"),
+    ("agents/verifier.md", "\n```bash\ngit log main..HEAD --oneline\n```\n"),
+    ("agents/verifier.md", "\n```bash\ngit diff origin/develop...HEAD\n```\n"),
+    ("agents/worker-codex.md", "\n```bash\ngit diff origin/main\n```\n"),
+    ("skills/crewvia-qa/SKILL.md", "\n```bash\ngit diff develop...HEAD --name-only\n```\n"),
+    ("scripts/plan.sh", "\n_BASE = 'origin/develop'\n"),
+    ("scripts/git-helpers.sh", "\n_z() {\n  gh pr create --title t --base develop\n}\n"),
 ])
 def test_adding_a_literal_to_a_real_file_turns_the_guard_red(rel, extra):
     baseline, _ = collect()

@@ -30,10 +30,15 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import queue_write_scan as qws  # noqa: E402
 
 #: bash の行 / 文書のコードブロックの行に当てる正規表現 (名前, パターン)。
+#: `main` だけでなく**任意のリテラル**を拾う (G3 の QA t013: `--base develop`・`origin/develop` は赤にならなかった)。
+#: 変数・コマンド置換・glob・プレースホルダ (`$PR_BASE`・`${DIFF_REF}`・`origin/*`・`origin/<pr_base>`) は通す:
+#: リテラルは**英字で始まる語**だけ。`origin/` の直後・`--base` の値・`..HEAD` の直前がそれに当たるもの。
+_LIT = r"[A-Za-z][\w.\-]*"
 BASH_PATTERNS = (
-    ("origin/main", re.compile(r"\borigin/main\b")),
-    ("--base main", re.compile(r"--base[ =]+['\"]?main\b")),
-    ("main...", re.compile(r"\bmain\.\.\.")),
+    ("origin/<literal>", re.compile(rf"\borigin/{_LIT}")),
+    ("--base <literal>", re.compile(rf"--base[ =]+['\"]?{_LIT}")),
+    ("<literal>..HEAD", re.compile(rf"(?<![\w$}}\"'/.\-]){_LIT}(?:/{_LIT})*\.{{2,3}}HEAD\b")),
+    ("main...", re.compile(r"\bmain\.\.\.?")),
     ("refs main", re.compile(r"refs/(?:heads|remotes/origin)/main\b")),
     ("main: refspec", re.compile(r"['\"]main:")),
     (".claude/worktrees", re.compile(r"\.claude/worktrees")),
@@ -41,7 +46,12 @@ BASH_PATTERNS = (
 )
 
 #: Python の文字列定数に当てる (部分一致)。
-PY_SUBSTRINGS = ("origin/main", "refs/remotes/origin/main", "refs/heads/main", ".claude/worktrees")
+PY_SUBSTRINGS = ("refs/remotes/origin/main", "refs/heads/main", ".claude/worktrees")
+#: Python の定数中の `origin/<literal>` / `--base <literal>` (`origin/main` を含む。`origin/{x}` や `origin/*` は通す)。
+_PY_LITERAL_RES = (
+    ("origin/<literal>", re.compile(rf"\borigin/{_LIT}")),
+    ("--base <literal>", re.compile(rf"--base[ =]+['\"]?{_LIT}")),
+)
 # branch の pattern の形: `task/<成分>/<成分>` で置換子 `{` を含む (`task/{tid}: msg` のような lint のメッセージは 1 つ目の / の後に
 # 空白が来るので当たらない)。
 _PY_TASK_BRANCH_RE = re.compile(r"^task/\S*\{\S*/\S|^task/\S+/\S*\{")
@@ -116,13 +126,11 @@ def python_hits(source: str, file: str, line_offset: int = 0) -> list[Hit]:
         if text == "main":
             add(node, '"main" (exact)', text)
             continue
-        for needle in PY_SUBSTRINGS:
-            if needle in text:
-                add(node, needle, text)
-                break
-        else:
-            if _PY_TASK_BRANCH_RE.match(text):
-                add(node, "task/ pattern", text)
+        found = next((needle for needle in PY_SUBSTRINGS if needle in text), None) \
+            or next((name for name, pat in _PY_LITERAL_RES if pat.search(text)), None) \
+            or ("task/ pattern" if _PY_TASK_BRANCH_RE.match(text) else None)
+        if found:
+            add(node, found, text)
     return hits
 
 

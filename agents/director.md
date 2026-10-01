@@ -881,7 +881,9 @@ curl -s -X POST "$TASKVIA_URL/api/log" \
 
 ### ブランチ・worktree の自動管理
 
-Worker が `plan.sh pull` を実行すると、ブランチと worktree が **自動的に** 作成される。
+Worker が `plan.sh pull` を実行すると、ブランチと worktree が **自動的に** 作成される。以下は**既定の形**で、
+mission.yaml の `git:`（`branch_pattern` / `pr_base` など）で変わりうる。実際の値を決めるのは pull（JSON の `worktree_path` と
+Worker の完了報告のブランチ名が正）。
 
 ```
 ブランチ命名規則: task/{mission_slug}/{task_id}-{task_slug}
@@ -926,15 +928,20 @@ Director が代わりに PR を作成する必要はない。
 
 **対策**:
 
-1. **子 PR の base を main に変更してから親を merge する（推奨）**
+1. **子 PR の base を PR base に変更してから親を merge する（推奨）**
+   PR base は `main` と決め打たず、**子 PR の task** の値を**名指しの形**で `plan pr-base` に聞く（Director は `AGENT_NAME` も
+   assignment も持たないので引数なしの形は使えない）。`<mission>/<tid>` は**子 PR の本文**の `task: <mission>/<tid>` 行から取る。
    ```bash
-   # 子PRのbaseをmainに切り替える
-   gh pr edit {子PR番号} --base main
+   # 子PRのbaseを、子PRのtaskのPR baseに切り替える
+   PR_BASE="$(plan pr-base --mission {子PRのmission} --task {子PRのtask_id})" || { echo "PR base を決められない。ユーザーに判断を仰ぐ" >&2; exit 1; }
+   gh pr edit {子PR番号} --base "$PR_BASE"
    # その後、親PRをsquash merge
    gh pr merge {親PR番号} --squash
    ```
+   `plan pr-base` が exit 1 のとき（`task:` 行が無い・card が読めない・mission が退避済み・`git:` が壊れている）は
+   `gh pr edit` を実行せず、**親の merge も保留する**（付け替えずに親を merge すると子が自動 close される）。base は手で決めず、ユーザーに判断を仰ぐ。
 
-2. **stacked 構造を避け、機能ごとに独立したブランチを main から切る**
+2. **stacked 構造を避け、機能ごとに独立したブランチを PR base から切る**
 
 **Reviewer Worker（`review` スキル）への周知**: PR レビュー依頼を受けた際、stacked 構造かどうかを確認し、上記の手順をDirectorに提案すること。
 

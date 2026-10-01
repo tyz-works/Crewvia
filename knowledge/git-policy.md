@@ -19,7 +19,7 @@ vNext 01b の実装 PR (G1〜G4) はこの設計に従う。**コードの根拠
   | G1 | t004 | GIT-05。cutover |
   | G2 | t008 | Resolver。呼び出し元ゼロ |
   | G3 | t012 | 委譲・`.crewvia-env`・構造ガード。cutover |
-  | G4 | t016 | 文書の書き換え。cutover |
+  | G4 | t016 | 文書の書き換え。cutover (実績は §15) |
   | 本番確認 | t019 | |
   | 記録 | t020 | |
 
@@ -880,3 +880,78 @@ archive 済み mission の policy も読めるようにする案は、読み口 
 - `plan.sh pr-base` が増える (読み取り専用)。kai-review の diff base が `pr-base` 経由 (既定値では `main`)。lint が `git:` を検査する。
 - mission.yaml に字下げミスがあると、その mission の pull は `needs_director` (P1) で止まる (本番 67 本は 0 件)。
 - 構造ガードと CI ログの件数表示が増える。
+
+---
+
+## 15. G4 (t016) の実績・戻し方
+
+§4.2 の「書き換える」行を全部書き換えた。cutover (ユーザー承認の PR)。**文書だけの変更**で、コード・queue・registry・デーモンは 1 バイトも変えていない。
+env の停止スイッチは付けていない。
+
+### 15.1 task カード本文と設計 (§5) の食い違い — 設計に従った
+
+task カード (t016) の題と本文は「`.crewvia-env` の PR base 参照 (`CREWVIA_PR_BASE`)」に書き換える、とあるが、**設計 §5 はその案を Codex review 1 巡目 P2 で捨てている**
+(G3 の §14.2 と同じ食い違い)。文書は env を読まず、その都度 `plan pr-base` を呼ぶ。`.crewvia-env` は 3 行のまま。
+カードの「env が無いときの既定値を設計どおりに書く」は、設計では「**既定値を文書に書かない**。取れなければ止まる」(§5・D18・D19) になる。
+既定値 `main` を持つ場所は plan.sh の `target_dir` の task の 1 か所だけ (TARGET_DIR の Worker に env が無いこと自体は、card の `target_dir` で plan.sh が区別する)。
+
+### 15.2 書き換えた箇所の全一覧 (§4.2 との突き合わせ。漏れ 0)
+
+| 場所 (G4 後の行は `git diff origin/main` で確認) | 前 | 後 | §4.2 の行 |
+|---|---|---|---|
+| `agents/worker.md` PR 作成 (Step 1) | `--base main` | `PR_BASE="$(plan pr-base)" \|\| {…exit 1;}` → `--base "$PR_BASE"`。止まったら PR を作らず `plan needs-director` と地の文に追記 | `:584` |
+| `agents/worker.md` Git コミットルール「作業完了時の手順」 | `--base main` | 同上 | `:922` |
+| `agents/worker.md` stacked PR の判定 | 「base が `main` / `master` 以外」「`gh pr edit --base main`」の提案 | 対象 PR 本文の `task:` 行 → `plan pr-base --mission <M> --task <T>` の値と `baseRefName` を比べる。取れなければ「PR base を決められない」を報告して merge の提案を保留 (main と比べない)。提案文の `--base` も同じ値 | `:937-945` |
+| `agents/worker.md` worktree 命名 ×2 (作業スコープ・Git コミットルール) | 形を断定 | 「既定の形」と添え、決めるのは pull (JSON の `worktree_path` と `git branch --show-current`) | `:148-152`・`:865-879` |
+| `agents/worker.md` `worktree_path` が空 | (G1 で書き換え済み) | 変更なし | `:294-301` |
+| `agents/director.md` stacked PR の付け替え | `gh pr edit {子PR} --base main` | **子 PR** 本文の `task:` 行 → `PR_BASE="$(plan pr-base --mission … --task …)" \|\| {…exit 1;}` → `--base "$PR_BASE"`。exit 1 なら `gh pr edit` も親の merge も保留してユーザーに判断を仰ぐ。「`main` から切る」→「PR base から切る」 | `:921-935` |
+| `agents/director.md` branch / worktree の命名 | 断定 | 既定の形で、`git:` で変わりうる | `:884-900` |
+| `agents/worker-codex.md` | 「origin/main との diff」 | 「mission の PR base (`lib_git_policy.py pr-base --mission <slug>`。決められなければ needs-director) との diff」 | `:122-125` |
+| `skills/crewvia-qa/SKILL.md` Step 1・Step 6 | `git diff main...HEAD --name-only` ×2 | §4.2「QA の diff の手順」(`plan pr-base --diff-ref` → `origin/*` なら fetch して検査 → diff)。Step 6 は `"${DIFF_REF:?…}"` (空のまま打つと HEAD...HEAD の**空の diff が黙って通る**のを止める) | `:17`・`:148` |
+| `agents/verifier.md` Step 2 | `git diff main...HEAD`・`git log main..HEAD` | 名指しの形 `plan pr-base --diff-ref --mission <slug> --task <task_id>` (Verifier は実装者の assignment も `AGENT_NAME` も持たない) → QA と同じ fetch・検査 → diff / log。取れなければ `needs_human_review` | **表に無かった行** (§14.4。G3 の走査が発見)。`git log main..HEAD` は 2 ドットで、G3 の検出器 (`main...` だけ) は拾えていなかった |
+| `agents/director.md` の `git log origin/task/...` (code block) | — | **書き換えない** (調査の例。task branch の remote の見方で、base ではない) | `:1156-1163` |
+| `director.md` の主 checkout 同期 (`origin/main`) | — | 書き換えない | `:962-1002` |
+| `skills/crewvia-plan-review/SKILL.md` | — | 書き換えない (head は PR の属性) | `:127-129` |
+| `knowledge/*.md` の `origin/main` | — | 書き換えない (戻し方・記録) | — |
+
+`target_dir` の task の指示は変えていない (`plan pr-base` が card の `target_dir` を見て `main` を返す。`--diff-ref` は local の `main`)。
+
+### 15.3 構造ガードの拡張 (G3 の QA t013 からの追加)
+
+G3 の検出器は `main` のリテラルしか拾わなかった (`--base develop`・`origin/develop` は赤にならない)。G4 で**任意のリテラル**に広げた:
+
+| 形 | 前 | 後 |
+|---|---|---|
+| `origin/<x>` | `origin/main` | 英字で始まる語なら何でも (`origin/develop`・`origin/release/1.2`)。Python の定数にも同じ |
+| `--base <x>` | `--base main` | `--base develop`・`--base=release/1.2`・`--base "develop"` |
+| `<x>...HEAD` | `main...` | `develop...HEAD`・**`main..HEAD` (2 ドット。verifier.md がこれで、G3 は拾えていなかった)** |
+| 通す形 | — | `"$PR_BASE"`・`"${DIFF_REF}...HEAD"`・`origin/*)`・`${DIFF_REF#origin/}`・`origin/<pr_base>` (変数・glob・プレースホルダ。literal は英字で始まる語だけ) |
+
+走査: コード 58 ファイル・文書 7 本の code block 133 個 (G3 は 132)。拾った件数は **22 → 16** (文書の書き換えで 7 件減 — director 1・verifier 1・worker-codex 1・worker 2・crewvia-qa 2。広げた形で**増えたのは 1 件**: director.md の `git log origin/task/…` — 上の表の調査の例。allowlist に理由つき)。
+文書の allowlist の残りは `.claude/worktrees/…` の**既定の形の説明**だけ (director 1・worker 2。決めるのは pull と本文に書いてある)。`R_G4` の行 (verifier・worker-codex・crewvia-qa、worker の `--base main` ×2、director の `--base main`) は全部外した (死んだ行で赤になるため)。
+陽性対照: 本物のファイルに `--base develop`・`origin/develop`・`develop...HEAD`・`main..HEAD` を 1 行足すと赤 (テスト 8 件を足した。`test_adding_a_literal_to_a_real_file_turns_the_guard_red` は 7 → 15 件)。陰性対照: env・変数・glob の形 9 件が緑。
+
+### 15.4 テスト
+
+- `tests/test_agent_docs_take_pr_base_from_plan_pr_base.py` (31 件): 文書の code block を**そのまま取り出して**実際に評価する。使い捨ての clone + 隔離 queue + stub の `gh` (`gh pr create` は打たない)。§5 の (1)〜(10) を全部:
+  PR 作成 4 (worktree の cwd で `develop`・**同じ task で cwd を主 checkout に移して `develop`**・TARGET_DIR は `main`・assignment 無しは exit 1 で `gh pr create` が呼ばれない) /
+  stacked 判定・付け替え (AGENT_NAME も assignment も無い Director の shell で子 PR の task の値・対象 PR の task と比べる・`task:` 行なし / 存在しない mission / 空 / 退避済み → exit 1 で `gh pr edit` が呼ばれない) /
+  diff (`origin/develop` がまだ無い clone で fetch して diff・TARGET_DIR で `origin` の remote が無くても `main...HEAD`・fetch 失敗で diff を出さず exit 1・verifier の名指しの形) / Step 6 の空の DIFF_REF。
+- 赤の実証 `tests/red_proof_agent_docs_pr_base.py` (約 6 分): 7 つの欠陥 (D1 env 既定値 `${CREWVIA_PR_BASE:-main}`・D2 `--base main`・D3 常に `origin/`・D4 失敗時の止めを外す・D5 stacked 判定を main と比べる・D6 verifier を `main...HEAD`・D7 fetch 失敗の握りつぶし) を注入した複製で、**全部が狙ったテスト名の FAILED** (collection error 0)。ベースラインは 94 件緑。
+- **気づき**: 文書の snippet 抽出の開始行を欠陥注入で消える文言 (`plan pr-base`) にしていたとき、D1〜D3 は「開始行が見つからない」で赤になっていた (意味のある赤ではない)。開始を `^PR_BASE=` / `^DIFF_REF=` に緩めて、**挙動の違い**で赤になることを確かめた。
+
+### 15.5 設計 §4.2 の記述の訂正
+
+§4.2 の「crewvia の task で fetch をここでする理由: pull の fetch (git-helpers.sh:72) は `base_branch` だけを取る」は**実測と違う**: pull は `git fetch origin` (refspec 指定なし) で、通常の clone では**全 branch の remote-tracking を更新する**。
+QA の手順の fetch は、それでも残す (pull の後に PR base の branch が増えた・shallow / 限定 refspec の clone・fetch が失敗したときに止める、の 3 つで要る)。ただし「`origin/<pr_base>` が無い clone」は pull の直後には普通は起きない。テストは pull の後で remote-tracking ref を消して作った。
+
+### 15.6 戻し方 (R2)
+
+- **PR revert → `scripts/sync-main-checkout.sh`**。文書だけなので restart は要らない。構造ガードも文書と一緒に戻る (テストと検出器の変更を含む)。
+- **動いている Worker のセッションには、起動時に読み込んだ版が残る** (次の起動から入れ替わる)。revert しても、すでに起動した Worker は `plan pr-base` を呼び続ける。G3 が入っていれば動く (G3 の戻しは G4 の戻しより後)。
+- **順序は G4 → G3** (§14.6)。G3 だけを戻すと、G4 の文書を持つ Worker が PR を作るたびに exit 1 で止まる (止まる側に倒れる。PR の行き先は間違えない)。
+
+### 15.7 本番で変わること (Result の転記元)
+
+- 次に PR を作る Worker / 付け替える Director / QA・Verifier の diff が `plan pr-base` の値を使う (既定値では `main` / `origin/main` で同じ)。取れなければ PR を作らず・diff を取らず止まる。
+- 本番確認 (t018 の承認後): 次に PR を作った Worker の PR の base が `main` (`gh pr view --json baseRefName`)・QA Worker の diff が `origin/main...HEAD` で取れている。

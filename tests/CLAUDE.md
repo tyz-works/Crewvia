@@ -61,7 +61,9 @@ root の `CLAUDE.md` から移した、テスト専用の規則。設計と経�
   形は書き込み側のガードと同じ allowlist（`(ファイル, 関数) → (件数, 理由)`。鍵に断片の文字列を使わない）。対象はコード
   （scripts・hooks・トップ）と、agents/*.md・skills/*/SKILL.md の **fenced code block の中だけ**（地の文は見ない）。
   検査件数の下限・死んだ行・陽性対照（本物から切り出した形）・**本物のファイルに 1 行足すと赤になる**実証を持つ。
-  文書の行は G4（t016）が書き換えて allowlist から外す（外さないと死んだ行で赤）。
+  文書の行は G4（t016）が書き換えて allowlist から外した（外さないと死んだ行で赤）。**G4 で検出対象を `main` から任意のリテラルに広げた**
+  （`--base <literal>`・`origin/<literal>`・`<literal>..HEAD` / `...HEAD`。env・変数・glob・プレースホルダは通す）。リテラルを足すと赤になる
+  陽性対照と、env 参照の形が緑になる陰性対照を持つ。
 - **件数は成功しても CI ログに出る**: ガードは `tests/guard_report.py` の `record()` に検査件数を残し、`conftest.py` の
   `pytest_terminal_summary` が `[structural-guard] git-decisions: code_files=… hits=…` を最後に出す（01a backlog 2）。
   新しい構造ガードを足すときも `record()` する。
@@ -71,6 +73,12 @@ root の `CLAUDE.md` から移した、テスト専用の規則。設計と経�
 - 挙動: `tests/test_git_policy_pull_and_pr_base_cutover.py`（custom の base / `plan.sh pr-base` の拒否 / `target_dir` の task が回帰しない /
   mission.yaml の字下げミスの出口 / `crewvia_create_pr` / NUL 区切りの worktree lookup）。本物の helper を使うテストは
   queue に mission.yaml を置き、task id を `tNNN` にする（`knowledge/test-isolation.md`）。
+
+- **文書の手順そのものの評価**（G4 / t016）: `tests/test_agent_docs_take_pr_base_from_plan_pr_base.py` が agents/*.md・skills/*/SKILL.md の
+  code block を**取り出して**使い捨ての clone + stub `gh` で実際に走らせる（PR 作成・stacked PR の判定と付け替え・QA / verifier の diff）。
+  snippet の開始行は欠陥注入で消える文言（`plan pr-base`）にしない（`^PR_BASE=` / `^DIFF_REF=`）。消えると「開始行が無い」で赤になり、
+  挙動の違いで赤になることの実証にならない。赤の実証は `tests/red_proof_agent_docs_pr_base.py`（7 欠陥・約 6 分）。
+  pull は `git fetch origin` で全 branch の remote-tracking を取るので、「まだ無い clone」は pull の**後**に ref を消して作る。
 
 - 名前の検証と診断の secret 漏れ: `tests/test_git_policy_untrusted_names_and_error_text.py`（`pr-base` の traversal・
   PyYAML 例外・`e.detail` の整形が 1 か所であること。secret 文字列を仕込む）。

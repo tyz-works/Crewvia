@@ -149,7 +149,7 @@ Worker は状況に応じて 2 種類の cwd で起動される。どちらで�
 
 `TARGET_DIR` env var が未設定の場合、`plan.sh pull` は **専用 worktree** を自動作成し JSON に `worktree_path` を返す。
 
-- cwd は `$CREWVIA_REPO/.claude/worktrees/<mission_slug>/<task_id>-<task_slug>/` になる
+- cwd は**既定では** `$CREWVIA_REPO/.claude/worktrees/<mission_slug>/<task_id>-<task_slug>/` になる（mission.yaml の `git:` で変わりうる。決めるのは pull なので、**JSON の `worktree_path` と `git branch --show-current` を見ること**。形を推測して打たない）
 - `git status` / `git log` はその worktree が指す crewvia ブランチの状態を示す
 - `CLAUDE.md` / `.claude/settings.json` は crewvia のものが読み込まれる（worktree も同じリポジトリ）
 - plan.sh の呼び出しは `plan <subcommand> ...`（`scripts/start.sh` が PATH に追加する `scripts/bin/plan` ラッパー）を使う。$CREWVIA_REPO の絶対パスを覚える/打つ必要はない
@@ -578,7 +578,12 @@ requires_approval に該当 → type: improvement でTaskvia /api/log に投稿�
 
 **PR 作成（コード・ドキュメント変更の場合）**:
 
+PR の base は**自分で決めない**。`plan pr-base` が mission の policy（TARGET_DIR の task は従来どおり `main`）から答える。
+`AGENT_NAME` と自分の assignment から task を決めるので、cwd が主 checkout に戻っていても同じ値が出る。
+取れなければ exit 1 になる — **`main` に倒して PR を作らない**。PR を作らず `plan needs-director <id> "<stderr>"` で Director に渡す。
+
 ```bash
+PR_BASE="$(plan pr-base)" || { echo "PR base を決められない。Director に報告して待つ" >&2; exit 1; }
 gh pr create \
   --title "{type}: {内容}" \
   --body "## 概要
@@ -590,7 +595,7 @@ gh pr create \
 
 task: ${TASK_MISSION}/${TASK_ID}
 branch: $(git branch --show-current)" \
-  --base main
+  --base "$PR_BASE"
 
 # PR URL を確認して完了報告に含める
 PR_URL=$(gh pr view --json url -q .url)
@@ -872,7 +877,8 @@ hook が動作するためには **`export CREWVIA_TASK_ID="$TASK_ID"` を必ず
 
 ### ブランチ運用（worktree ベース）
 
-`plan.sh pull` が成功すると、Worker は専用の worktree に自動的に配置される。
+`plan.sh pull` が成功すると、Worker は専用の worktree に自動的に配置される。以下は**既定の形**で、実際の値を決めるのは pull
+（JSON の `worktree_path` と `git branch --show-current` が正）:
 
 ```
 worktree パス: .claude/worktrees/{mission_slug}/{task_id}-{task_slug}/
@@ -916,7 +922,8 @@ git add {変更ファイル}
 git commit -m "{type}: {内容} (task/{task_id})"
 git push origin {branch}
 
-# PR を作成する（Worker-driven PR モデル）
+# PR を作成する（Worker-driven PR モデル）。base は上の「PR 作成」と同じく plan pr-base から取る
+PR_BASE="$(plan pr-base)" || { echo "PR base を決められない。Director に報告して待つ" >&2; exit 1; }
 gh pr create \
   --title "{type}: {内容}" \
   --body "## 概要
@@ -928,7 +935,7 @@ gh pr create \
 
 task: ${TASK_MISSION}/${TASK_ID}
 branch: $(git branch --show-current)" \
-  --base main
+  --base "$PR_BASE"
 
 # PR URL を確認して完了報告に含める
 gh pr view --json url -q .url
@@ -947,11 +954,26 @@ PR merge は `review` スキルの Worker (Seo) が行う。**自分でマージ
 gh pr view {PR番号} --json baseRefName -q .baseRefName
 ```
 
-base が `main` / `master` 以外の場合は stacked PR。Director に以下を提案すること:
+その base を、**対象 PR の task の PR base**（mission の policy が決める値）と比べる。一致しなければ stacked PR。
+対象 PR の task は PR 本文の `task: <mission>/<tid>` 行から取り、**名指しの形**で `plan pr-base` に聞く
+（自分の review task ではなく対象 PR の task の値。所有者は見ない）:
+
+```bash
+PR_NUM={PR番号}
+TASK_LINE="$(gh pr view "$PR_NUM" --json body -q .body | sed -n 's/^task: //p' | head -1)"
+MISSION="${TASK_LINE%%/*}"; TID="${TASK_LINE#*/}"
+EXPECTED_BASE="$(plan pr-base --mission "$MISSION" --task "$TID")" || { echo "PR base を決められない。Director に報告して待つ" >&2; exit 1; }
+ACTUAL_BASE="$(gh pr view "$PR_NUM" --json baseRefName -q .baseRefName)"
+[ "$ACTUAL_BASE" = "$EXPECTED_BASE" ] || echo "stacked PR: base=$ACTUAL_BASE (期待 $EXPECTED_BASE)"
+```
+
+- `task:` 行が無い PR（人が作った PR など）・card が読めない・exit 1 のときは、**main と比べて stacked かどうかを決めない**。
+  「PR base を決められない」を Director に報告し、merge の提案を保留する。
+- stacked PR だったら Director に以下を提案する（`{EXPECTED_BASE}` は上で取った値）:
 
 > 「この PR は stacked 構造です。親 PR を squash merge すると子 PR が自動クローズされるリスクがあります。
-> 子 PR の base を main に変更してから親を merge することを推奨します:
-> `gh pr edit {子PR番号} --base main`」
+> 子 PR の base を {EXPECTED_BASE} に変更してから親を merge することを推奨します:
+> `gh pr edit {子PR番号} --base {EXPECTED_BASE}`」
 
 **自分でマージ操作はしない** — 提案のみ行い、実行はDirectorの判断に委ねること。
 

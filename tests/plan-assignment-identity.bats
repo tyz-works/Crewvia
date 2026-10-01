@@ -487,20 +487,26 @@ assert d['started_at'] == '''$started''', d
   cleanup_queue
 }
 
-@test "a done with an unusable agent name leaves the card and the assignment alone" {
+@test "a done with an unusable agent name does not die and never touches a path built from that name" {
   setup_queue "ai-done-bad-agent"
   add_task t001
 
   run plan pull --agent Ren --skills bash --task t001 --mission "$TEST_MISSION"
   [ "$status" -eq 0 ]
 
-  # 撤去側は名前が不正でも die しない (die すると card を書いたあとに落ちて
-  # 片側だけ進む)。「消さない」に倒れること。
+  # AGENT_NAME が不正でも撤去側は die しない (die すると card を書いたあとに落ちて片側だけ進む)。
+  # 不正な名前から作ったパス (`../../Ren` = queue の外) には触れない (陽性対照: そこに置いた印のファイル)。
+  local outside="$ASSIGN_DIR/../../Ren"
+  echo sentinel > "$outside"
   run plan_as "../../Ren" done t001 "result" --mission "$TEST_MISSION"
   [ "$status" -eq 0 ]
 
   [ "$(card_field t001 status)" = "done" ]
-  [ -f "$ASSIGN_DIR/Ren" ]
+  [ -f "$outside" ]
+  rm -f "$outside"
+  # 01c E3: 枠の撤去は **card の worker (Ren) の枠**で、AGENT_NAME は撤去の根拠にしない。AGENT_NAME が不正でも
+  # 正規の持ち主の枠は done と同じトランザクションで外れる (以前は「消さない」に倒れて次の回復まで残った)
+  [ ! -f "$ASSIGN_DIR/Ren" ]
 
   cleanup_queue
 }

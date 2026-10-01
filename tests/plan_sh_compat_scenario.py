@@ -13,6 +13,10 @@ golden (`tests/fixtures/plan_sh_compat_s3.golden.json`) は **cutover 前 (a1f69
 
     python3 tests/plan_sh_compat_scenario.py <cutover 前の repo の root> <出力 json>
 
+**意図した変更 (GIT-05 / 01b G1)**: pull の JSON の `worktree_path` は、隔離コピーが stub の git-helpers.sh を持つので
+`<ROOT>/.claude/worktrees/<SLUG>/<id>-<task_slug>` になる (cutover 前は helper が無く null)。golden の 6 箇所をこの値に
+書き換えた。それ以外の 33 段・queue の全ファイルは cutover 前のまま。
+
 `<root>` は `scripts/plan.sh` と `scripts/lib_*` `scripts/lint_plan.py` を持つ repo
 (`git archive <sha> | tar -x -C <dir>`)。
 """

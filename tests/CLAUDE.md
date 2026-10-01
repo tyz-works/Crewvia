@@ -21,7 +21,7 @@ root の `CLAUDE.md` から移した、テスト専用の規則。設計と経�
 - 入口は `tests/fixture_tree.py`（`copy_plan_tree(root)`）と `tests/fixture_tree.sh`
   （`copy_plan_tree` / `copy_scripts_libs`）だけ。`lib_*` を glob で写すので、新しい lib は何もしなくても付いてくる。
   自分で `cp` / `shutil.copy` を書かない（`tests/test_fixture_tree_is_the_only_copier.py` が赤にする）。
-- lib を上書きするスタブは helper の**後**に置く。`git-helpers.sh` / `review-plan.sh` は意図して写さない。
+- lib を上書きするスタブは helper の**後**に置く。`copy_plan_tree` は `scripts/git-helpers.sh` として**本物でなく stub**（`tests/fixtures/git-helpers-stub.sh`。git を呼ばず fixture の中に dir を作るだけ）を写す: GIT-05 以降、plan.sh pull は helper が無いと needs_director に倒すため、「不在」を隔離の継ぎ目にできない。本物の git の動作を見るテストは使い捨ての clone に本物を自分で置く（`tests/test_pull_worktree_failure_is_not_success.py`）。`review-plan.sh` は写さない。
 - registry は queue の隣に置く（`registry_dir()` 1 箇所）。実 registry を書くテストは作らない
   （`knowledge/test-isolation.md`）。
 

@@ -36,6 +36,10 @@ MUTATORS = {"publish_assignment", "retire_assignment"}
 #: assignment のパスを組み立ててよい関数 (ヘルパー自身)。
 PATH_OWNERS = {"assignment_path", "assignment_identity_path"}
 
+#: retire を呼ぶ共有の本体。自分では with_lock を取らず、呼び出し元がロック内にいることを下で確かめる
+#: (needs-director コマンドと pull の worktree 失敗の出口が同じ遷移を通すため。GIT-05)。
+LOCKED_HELPERS = {"transition_to_needs_director"}
+
 
 def _plan_py_source() -> str:
     """plan.sh に埋め込まれた python 本体を取り出す。"""
@@ -117,10 +121,17 @@ def test_assignment_mutations_happen_inside_the_queue_lock(tree: ast.Module) -> 
             continue
         # ヘルパー同士の呼び出し (retire が publish を使う等) は、呼び出し元が
         # ロック内にいるかで判定されるので除外する。
-        if fn.name in MUTATORS or fn.name in PATH_OWNERS:
+        if fn.name in MUTATORS or fn.name in PATH_OWNERS or fn.name in LOCKED_HELPERS:
             continue
         if fn.name not in locked_callbacks:
             offenders.append(f"{name}() in {fn.name} (line {node.lineno})")
+
+    # LOCKED_HELPERS の呼び出し元は、すべて with_lock に渡されたコールバックの内側にいる。
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and _call_name(node) in LOCKED_HELPERS:
+            fn = owners.get(id(node))
+            if fn is None or fn.name not in locked_callbacks:
+                offenders.append(f"{_call_name(node)}() in {fn.name if fn else '<module>'} (line {node.lineno})")
 
     assert not offenders, (
         "assignment の変更がキューロックの外にある: "

@@ -3118,6 +3118,41 @@ def cmd_resolve_mission(args):
     die(f"task '{task_id}' not found in mission(s): {slugs}")
 
 
+def _pull_worktree_failed(slug, task_id, agent, generation, category, detail):
+    """worktree を作れなかった pull の出口 (GIT-05)。card を `needs_director` に送って exit 1 する。
+
+    この関数は戻らない。stdout に JSON を出さない (Worker に「取れなかった」以外の読み方をさせない)。
+    2 つ目のロックで、card が**この pull が書いた予約のまま** (in_progress・同じ worker・同じ started_at) の
+    ときだけ書く (compare-and-set。呼び出し元の照合 = 01c ではない)。その間に Director が reset した・
+    別の Worker が取った場合は何も書かない。exit 3 (何も書いていない約束) と exit 2 (idle) は使わない。
+    """
+    reason = f"worktree を作れませんでした ({category}): {detail}"
+    outcome = {'wrote': False, 'why': ''}
+
+    def _do():
+        recover_before(cards=[(slug, task_id)], include_caller=False)
+        if not os.path.exists(task_path(slug, task_id)):
+            outcome['why'] = 'card が無くなっています'
+            return
+        meta, body = load_task(slug, task_id)
+        if (meta.get('status') != 'in_progress'
+                or (meta.get('worker') or '') != (agent or '')
+                or meta.get('started_at') != generation):
+            outcome['why'] = (f"card がこの pull の予約ではなくなっています "
+                              f"(status={meta.get('status')}, worker={meta.get('worker')})")
+            return
+        transition_to_needs_director(slug, task_id, meta, body, reason, agent)
+        outcome['wrote'] = True
+
+    with_lock(_do)
+    if outcome['wrote']:
+        die(f"[plan.sh pull] {slug}/{task_id}: {reason}\n"
+            f"[plan.sh pull] task を needs_director にしました。worktree を作らず、主 checkout で作業を始めてはいけません。"
+            f"Director が原因を片付けて `plan.sh update {task_id} --status pending --reset --mission {slug}` で戻します。")
+    die(f"[plan.sh pull] {slug}/{task_id}: {reason}\n"
+        f"[plan.sh pull] 書き換えませんでした: {outcome['why']}。worktree は無いので作業を始めてはいけません。")
+
+
 def cmd_pull(args):
     opts, _ = parse_opts(args, {
         '--mission': 'value',
@@ -3155,6 +3190,7 @@ def cmd_pull(args):
         effective_target = os.path.abspath(env_td) if env_td else None
 
     chosen_holder = [None]
+    started_holder = [None]   # この pull が書いた started_at (worktree 失敗時の compare-and-set 用)
     diag = {'reason': None, 'detail': ''}
 
     def _do():
@@ -3414,6 +3450,7 @@ def cmd_pull(args):
         meta['status'] = 'in_progress'
         meta['worker'] = agent or None
         meta['started_at'] = now_generation()
+        started_holder[0] = meta['started_at']
         save_task(slug, meta['id'], meta, body)
 
         # assignment の公開は card の書き換えと同じトランザクションで行う。
@@ -3492,39 +3529,59 @@ def cmd_pull(args):
     worktree_path = None
     task_target_dir = chosen_holder[0].get('target_dir')
 
-    git_helpers = os.path.join(REPO_ROOT, 'scripts', 'git-helpers.sh')
-    if not task_target_dir and os.path.exists(git_helpers):
-        wt_cmd = (
-            f'source {shlex.quote(git_helpers)} && '
-            f'crewvia_create_worktree {shlex.quote(mission_slug)} '
-            f'{shlex.quote(task_id)} {shlex.quote(task_slug)}'
-        )
-        wt = subprocess.run(
-            ['bash', '-c', wt_cmd],
-            capture_output=True, text=True, cwd=REPO_ROOT,
-        )
-        if wt.returncode == 0:
-            worktree_path = wt.stdout.strip()
-            env_file = os.path.join(worktree_path, '.crewvia-env')
-            # Worker が source する最中に読まれうる (途中までの内容で mission を取り違える)。
-            # ロックは要らない (worktree はこの task 専用) が、書き方は原子的にする。
-            env_text = (
-                f'export CREWVIA_MISSION_SLUG={shlex.quote(mission_slug)}\n'
-                f'export CREWVIA_TASK_ID={shlex.quote(task_id)}\n'
-                f'export CREWVIA_TASK_SLUG={shlex.quote(task_slug)}\n'
-            )
-            try:
-                _STORE.atomic_write_text(env_file, env_text)
-            except _STORE.StoreError as _e:
-                if not _committed_durability_failure(_e):
-                    die(f"[plan.sh pull] cannot write {env_file}: {_e}")
-                print(f"[plan.sh pull] warn: {env_file} は書き込み済みですが、親ディレクトリの fsync に失敗しました "
-                      f"({_e})", file=sys.stderr)
+    # GIT-05: crewvia 本体の task (target_dir なし) は、worktree を作れなかったら成功扱いにしない。
+    # null の `worktree_path` を成功で返すと、Worker は cd せず主 checkout で作業を始める。
+    # 失敗は needs_director へ (pending に戻すと同じ Worker に配り直され続ける。knowledge/git-policy.md §1.2)。
+    wt_failure = None   # (分類, 詳細)
+    if not task_target_dir:
+        git_helpers = os.path.join(REPO_ROOT, 'scripts', 'git-helpers.sh')
+        if not os.path.isfile(git_helpers):
+            wt_failure = ('N2', 'scripts/git-helpers.sh が無いので worktree を作れません')
         else:
-            print(
-                f'[plan.sh pull] WARNING: worktree creation skipped:\n{wt.stderr.strip()}',
-                file=sys.stderr,
+            wt_cmd = (
+                f'source {shlex.quote(git_helpers)} && '
+                f'crewvia_create_worktree {shlex.quote(mission_slug)} '
+                f'{shlex.quote(task_id)} {shlex.quote(task_slug)}'
             )
+            wt = subprocess.run(
+                ['bash', '-c', wt_cmd],
+                capture_output=True, text=True, cwd=REPO_ROOT,
+            )
+            # git の警告 (fetch 失敗・local main fallback・既存 worktree の再利用) は成功時も残す。
+            if wt.stderr.strip():
+                print(wt.stderr.rstrip('\n'), file=sys.stderr)
+            if wt.returncode != 0:
+                err_lines = [l for l in wt.stderr.strip().splitlines() if l.strip()]
+                last = err_lines[-1] if err_lines else f'exit {wt.returncode}'
+                tag = re.search(r'\b(W[0-9])\b', last)
+                wt_failure = (tag.group(1) if tag else 'W5', last)
+            else:
+                candidate = wt.stdout.strip()
+                if not candidate or not os.path.isdir(candidate):
+                    wt_failure = ('N6', f'worktree の path を得られませんでした: {candidate!r}')
+                else:
+                    env_file = os.path.join(candidate, '.crewvia-env')
+                    # Worker が source する最中に読まれうる (途中までの内容で mission を取り違える)。
+                    # ロックは要らない (worktree はこの task 専用) が、書き方は原子的にする。
+                    # 再利用 (W2) でも毎回書き直す。
+                    env_text = (
+                        f'export CREWVIA_MISSION_SLUG={shlex.quote(mission_slug)}\n'
+                        f'export CREWVIA_TASK_ID={shlex.quote(task_id)}\n'
+                        f'export CREWVIA_TASK_SLUG={shlex.quote(task_slug)}\n'
+                    )
+                    try:
+                        _STORE.atomic_write_text(env_file, env_text)
+                        worktree_path = candidate
+                    except _STORE.StoreError as _e:
+                        if _committed_durability_failure(_e):
+                            print(f"[plan.sh pull] warn: {env_file} は書き込み済みですが、親ディレクトリの fsync に失敗しました "
+                                  f"({_e})", file=sys.stderr)
+                            worktree_path = candidate
+                        else:
+                            wt_failure = ('N7', f'{env_file} を書けません ({_e})')
+
+    if wt_failure is not None:
+        _pull_worktree_failed(mission_slug, task_id, agent, started_holder[0], *wt_failure)
 
     chosen_holder[0]['task_slug'] = task_slug
     chosen_holder[0]['worktree_path'] = worktree_path
@@ -3829,6 +3886,38 @@ def read_body_arg(opts, file_flag, inline, inline_desc):
     return text.rstrip('\n')
 
 
+def transition_to_needs_director(slug, task_id, meta, body, reason, agent_name):
+    """card を `needs_director` に遷移させ、`agent_name` の assignment を撤去する。`with_lock()` の中でだけ呼ぶ。
+
+    `needs-director` コマンドと、`pull` が worktree を作れなかったときの出口 (GIT-05) の**共通の本体**
+    (コピーしない)。呼び出し側が status の受け付けを済ませていること。返り値は (summary, full_text)。
+    """
+    summary, full_text = split_long_freeform(reason)
+    meta['status'] = 'needs_director'
+    meta['needs_director_reason'] = summary
+    if full_text is not None:
+        body = body.rstrip() + '\n\n## Needs-Director 詳細\n' + full_text.strip() + '\n'
+    save_task(slug, task_id, meta, body)
+
+    # done / fail と同じく、撤去は card の書き換えと同じトランザクションの中で
+    # (generation=None の理由も cmd_done を参照)。撤去しないと、codex-review の
+    # Kai-codex のように「同時 1 実行」を assignment の有無で判定する側が、終わった
+    # run の assignment に恒久的に塞がれる (backlog #13)。判断待ちの Worker が
+    # 「仕事なし」と読まれて退役されないことは dispatcher 側が card で見る
+    # (`worker_holds_work()`) — assignment を外す前提はそちらに置いてある。
+    # 順序は card (正本) が先・assignment (projection) が後。逆にすると「in_progress なのに枠が無い」が
+    # 生まれ、S4 の R-1 が枠を作り直す。
+    if agent_name:
+        verdict = retire_assignment(agent_name, slug, task_id, None)
+        if verdict not in (ASSIGN_MINE, ASSIGN_ABSENT):
+            print(
+                f"[plan.sh warn] {describe_assignment_verdict(agent_name, verdict)}"
+                f" — 削除しませんでした ({agent_name} は別の作業に就いている可能性があります)",
+                file=sys.stderr,
+            )
+    return summary, full_text
+
+
 def cmd_needs_director(args):
     """plan.sh needs-director <task_id> "<理由>"
 
@@ -3868,28 +3957,8 @@ def cmd_needs_director(args):
         if not _TASK_STATUS.accepts('needs-director', cur_status):
             refuse_transition('needs-director', task_id, cur_status)
 
-        summary, full_text = split_long_freeform(reason)
-        meta['status'] = 'needs_director'
-        meta['needs_director_reason'] = summary
-        if full_text is not None:
-            body = body.rstrip() + '\n\n## Needs-Director 詳細\n' + full_text.strip() + '\n'
-        save_task(slug, task_id, meta, body)
-
-        # done / fail と同じく、撤去は card の書き換えと同じトランザクションの中で
-        # (generation=None の理由も cmd_done を参照)。撤去しないと、codex-review の
-        # Kai-codex のように「同時 1 実行」を assignment の有無で判定する側が、終わった
-        # run の assignment に恒久的に塞がれる (backlog #13)。判断待ちの Worker が
-        # 「仕事なし」と読まれて退役されないことは dispatcher 側が card で見る
-        # (`worker_holds_work()`) — assignment を外す前提はそちらに置いてある。
-        agent_name = os.environ.get('AGENT_NAME', '')
-        if agent_name:
-            verdict = retire_assignment(agent_name, slug, task_id, None)
-            if verdict not in (ASSIGN_MINE, ASSIGN_ABSENT):
-                print(
-                    f"[plan.sh warn] {describe_assignment_verdict(agent_name, verdict)}"
-                    f" — 削除しませんでした ({agent_name} は別の作業に就いている可能性があります)",
-                    file=sys.stderr,
-                )
+        summary, full_text = transition_to_needs_director(
+            slug, task_id, meta, body, reason, os.environ.get('AGENT_NAME', ''))
 
         print(f"[plan.sh] Task {task_id} → needs_director")
         print(f"[plan.sh] Reason: {summary}")

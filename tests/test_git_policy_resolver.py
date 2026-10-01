@@ -9,12 +9,15 @@
    invalid mode / path traversal / invalid branch component / target_dir / worktree 失敗)。
    target_dir と worktree 失敗は G1 / G3 の範囲なので、Resolver の側は「target_dir に worktree path を返さない」
    「失敗を黙って別の path に倒さず拒否する」の形で固定する。
-2. 互換性: **今の git-helpers.sh (本物を実行) と plan.sh の `_slugify` (本文から取り出して実行)** に、Resolver と
-   同じ入力を与えて branch / path が一致する表 (生成。50 通り以上)。
+2. 互換性: **G3 前の git-helpers.sh (tests/fixtures/git-helpers-pre-g3.sh に凍結) と G3 後の git-helpers.sh (本物)** に、
+   plan.sh の `_slugify` (本文から取り出して実行) が作った同じ入力を与えて、branch / path が**バイト単位で一致**する表
+   (生成。50 通り以上。それぞれ使い捨ての clone)。G3 後の helper は Resolver から値を得るので、これが
+   「policy 未指定の mission で修正前後の pull が同じ branch・同じ path で worktree を作る」の本体。
 3. §2.2 の拒否の各行。
 4. §2.3 の branch 名の規則が `git check-ref-format --branch` の**部分集合**であること (本物の git に通す)。
 5. `git:` 付きの mission.yaml を `Txn.write_mission` で書き戻してもバイトが変わらない (原案 §14-17)。
-6. 呼び出し元が 0 (G3 で外す。01a S2 の `test_state_store_has_no_callers_yet` と同じ作法)。
+6. 呼び出し元が cutover の集合と**ちょうど**一致する (G2 の「呼び出し元ゼロ」は G3 で外した。01a S2 の
+   `test_state_store_has_no_callers_yet` と同じ作法で、増えたら赤)。
 
 テストは `CREWVIA_QUEUE` / `CREWVIA_REPO_ROOT` を触らない。queue は tmp に作り、git は使い捨ての bare origin + clone。
 本番の queue・`.claude/worktrees` には触れない。
@@ -175,15 +178,13 @@ def _compat_cases():
     return cases
 
 
-@pytest.fixture(scope="module")
-def clone(tmp_path_factory):
-    """使い捨ての bare origin + clone。本物の git-helpers.sh をここで走らせる。"""
-    base = tmp_path_factory.mktemp("gitpolicy-compat")
-    home = base / "home"
+def _make_clone(base, name):
+    """使い捨ての bare origin + clone。"""
+    home = base / f"home-{name}"
     home.mkdir()
     env = _git_env(home)
-    origin = base / "origin.git"
-    work = base / "clone"
+    origin = base / f"origin-{name}.git"
+    work = base / f"clone-{name}"
 
     def run(*args, cwd):
         subprocess.run(args, cwd=cwd, env=env, check=True, capture_output=True, text=True)
@@ -198,18 +199,47 @@ def clone(tmp_path_factory):
     return {"root": work, "env": env}
 
 
-def _real_helper(clone, mission, tid, task_slug):
-    """本物の `crewvia_create_worktree`。(rc, 作られた path, その worktree の branch)。"""
-    cmd = (f'source {SCRIPTS / "git-helpers.sh"} && '
-           f'crewvia_create_worktree "$1" "$2" "$3"')
+@pytest.fixture(scope="module")
+def clone(tmp_path_factory):
+    """G3 後の (本物の) git-helpers.sh を走らせる使い捨ての clone。queue は tmp に作る (mission.yaml は都度置く)。"""
+    base = tmp_path_factory.mktemp("gitpolicy-compat-new")
+    c = _make_clone(base, "new")
+    queue = base / "queue"
+    (queue / "missions").mkdir(parents=True)
+    c["queue"] = queue
+    c["env"] = {**c["env"], "CREWVIA_QUEUE": str(queue)}
+    return c
+
+
+@pytest.fixture(scope="module")
+def pre_g3_clone(tmp_path_factory):
+    """G3 前の git-helpers.sh (凍結した複製) を走らせる使い捨ての clone。"""
+    return _make_clone(tmp_path_factory.mktemp("gitpolicy-compat-old"), "old")
+
+
+PRE_G3_HELPER = REPO / "tests" / "fixtures" / "git-helpers-pre-g3.sh"
+
+
+def _run_helper(helper, clone, mission, tid, task_slug):
+    """`crewvia_create_worktree`。(rc, 作られた path, その worktree の branch, base を作ったときの警告を含む stderr)。"""
+    cmd = f'source {helper} && crewvia_create_worktree "$1" "$2" "$3"'
     r = subprocess.run(["bash", "-c", cmd, "x", mission, tid, task_slug], cwd=clone["root"],
                        env=clone["env"], capture_output=True, text=True)
     if r.returncode != 0:
-        return r.returncode, None, None
+        return r.returncode, None, None, r.stderr
     path = r.stdout.strip().splitlines()[-1]
     b = subprocess.run(["git", "-C", path, "branch", "--show-current"], env=clone["env"],
                        capture_output=True, text=True, check=True).stdout.strip()
-    return 0, path, b
+    return 0, path, b, r.stderr
+
+
+def _real_helper(clone, mission, tid, task_slug):
+    """G3 後の本物の `crewvia_create_worktree`。mission.yaml (`git:` なし) を queue に置いてから呼ぶ。"""
+    d = clone["queue"] / "missions" / mission
+    if not d.exists():
+        d.mkdir(parents=True)
+        (d / "mission.yaml").write_text(f"mission: {mission}\n")
+    return _run_helper(SCRIPTS / "git-helpers.sh", clone, mission, tid, task_slug)[:3]
 
 
 def test_compat_table_has_at_least_fifty_cases():
@@ -218,28 +248,23 @@ def test_compat_table_has_at_least_fifty_cases():
 
 @pytest.mark.parametrize("mission,tid,title", _compat_cases(),
                          ids=[f"{m[:18]}-{t}-{i}" for i, (m, t, _) in enumerate(_compat_cases())])
-def test_default_branch_and_path_equal_the_real_git_helpers(clone, mission, tid, title):
-    """git-helpers.sh が作れる入力では Resolver の出力と**バイト単位で一致**。Resolver が通す入力は git-helpers も通る。"""
+def test_default_branch_and_path_equal_the_pre_g3_git_helpers(clone, pre_g3_clone, mission, tid, title):
+    """policy 未指定の mission で、G3 前の helper と G3 後の helper が**同じ branch・同じ path** で worktree を作る。
+
+    G3 前の helper (凍結) が作れる入力は G3 後も作れて、バイト単位で同じ。G3 後が拒否してよいのは設計 §2.3 で
+    git より狭くした入力だけ。逆に G3 後が作れる入力は G3 前も作れる (新しく通す入力を増やさない)。
+    """
     task_slug = SLUGIFY(title, tid)
-    root = str(clone["root"])
-    policy = gp.default_policy()
-    try:
-        branch = gp.task_branch(policy, mission_slug=mission, task_id=tid, task_slug=task_slug)
-        path = gp.task_worktree_path(policy, repo_root=root, mission_slug=mission, task_id=tid,
-                                     task_slug=task_slug)
-        refused = None
-    except gp.GitPolicyError as e:
-        branch = path = None
-        refused = e
-    rc, real_path, real_branch = _real_helper(clone, mission, tid, task_slug)
-    if refused is None:
-        assert rc == 0, f"Resolver が通すのに git-helpers が失敗: {mission} {tid} {task_slug!r}"
-        assert real_branch == branch
-        assert real_path == path
+    old_rc, old_path, old_branch, _ = _run_helper(PRE_G3_HELPER, pre_g3_clone, mission, tid, task_slug)
+    new_rc, new_path, new_branch = _real_helper(clone, mission, tid, task_slug)
+    if new_rc == 0:
+        assert old_rc == 0, f"G3 後だけが作れる (入力を広げた): {mission} {tid} {task_slug!r}"
+        # path は clone のルートが違うので、ルートを除いた相対部分が同じ (ルートより後ろは式の出力そのもの)
+        assert new_path[len(str(clone["root"])):] == old_path[len(str(pre_g3_clone["root"])):]
+        assert new_branch == old_branch
     else:
-        # Resolver が拒否してよいのは (a) git も作れない入力 (b) 設計上 git より狭くした入力だけ。
-        assert rc != 0 or mission in NARROWER_THAN_GIT, \
-            f"Resolver が拒否したが git-helpers は作れた: {mission} {tid} {task_slug!r} ({refused})"
+        assert old_rc != 0 or mission in NARROWER_THAN_GIT, \
+            f"G3 前は作れたのに G3 後が拒否した: {mission} {tid} {task_slug!r}"
 
 
 #: git は通すが §2.3 の許可集合 (狭い側) が拒否する mission slug (`_x`: 英数字で始まらない、`x.`: 成分が . で終わる)。理由は設計 §2.3 の表。
@@ -252,11 +277,13 @@ def test_compat_every_generated_slug_is_a_valid_component():
         assert gp.branch_name_problem(f"x/{s}") is None, (title, s)
 
 
-def test_default_pattern_literals_match_git_helpers_source():
-    """git-helpers.sh の式 (リテラル) が Resolver の既定値と同じ。G3 で消すときの突き合わせ元。"""
-    src = (SCRIPTS / "git-helpers.sh").read_text()
+def test_default_pattern_literals_match_the_frozen_pre_g3_helper():
+    """G3 前の式 (凍結した複製のリテラル) が Resolver の既定値と同じ。G3 後の helper にはこの式が残っていない。"""
+    src = PRE_G3_HELPER.read_text()
     assert 'local branch="task/${mission_slug}/${task_id}-${task_slug}"' in src
     assert '${repo_root}/.claude/worktrees/${mission_slug}/${task_id}-${task_slug}' in src
+    live = (SCRIPTS / "git-helpers.sh").read_text()
+    assert 'local branch="task/' not in live and '/.claude/worktrees/${mission_slug}' not in live
     assert gp.DEFAULT_TASK_BRANCH_PATTERN == "task/{mission_slug}/{task_id}-{task_slug}"
     assert gp.DEFAULT_WORKTREE_ROOT == ".claude/worktrees"
 
@@ -896,8 +923,15 @@ def test_cli_rejection_is_exit_2_with_code_on_stderr_and_empty_stdout(tmp_path):
 
 NAME = "lib_git_policy"
 #: 名前を出してよいファイル (repo 相対)。テストと knowledge/ は走査の対象外。
-#: **ここに足すのは cutover (= ユーザー承認が要る PR。G3) だけ**。
-ALLOWED_CALLERS = {"scripts/lib_git_policy.py"}
+#: G3 (cutover。ユーザー承認済みの PR) で呼び出し元になった集合。**ここに足すのは cutover (= ユーザー承認が要る PR) だけ**。
+ALLOWED_CALLERS = {
+    "scripts/lib_git_policy.py",   # 自身 (docstring・CLI)
+    "scripts/plan.sh",             # pull の worktree 失敗の分類・`pr-base`
+    "scripts/git-helpers.sh",      # crewvia_create_worktree / remove / create_pr が CLI を呼ぶ
+    "scripts/kai-review.sh",       # diff base (pr-base)
+    "scripts/worktree_gc.py",      # 片付けの根 (DEFAULT_WORKTREE_ROOT)
+    "scripts/lint_plan.py",        # mission.yaml の git: の検査
+}
 SCAN_DIRS = ("scripts", "hooks", "agents", "config", "skills")
 SCAN_FILES = ("crewvia", "crewvia-stop")
 
@@ -909,13 +943,15 @@ def _candidates():
         if not base.is_dir():
             continue
         # 文書 (.md) は対象にしない (ガードを説明する文書が自分で引っかかる型)
+        # テスト (scripts/ に置いてある test_*.sh・e2e ハーネス) は呼び出し元ではなく検証する側なので対象にしない
         files += [p for p in base.rglob("*")
-                  if p.is_file() and "__pycache__" not in p.parts and p.suffix not in (".md", ".pyc")]
+                  if p.is_file() and "__pycache__" not in p.parts and p.suffix not in (".md", ".pyc")
+                  and not p.name.startswith(("test_", "e2e_harness"))]
     files += [REPO / f for f in SCAN_FILES if (REPO / f).is_file()]
     return files
 
 
-def test_git_policy_has_no_callers_yet():
+def test_git_policy_callers_are_exactly_the_cutover_set():
     scanned = 0
     offenders = []
     seen = set()
@@ -929,7 +965,7 @@ def test_git_policy_has_no_callers_yet():
         if NAME in text:
             (seen.add(rel) if rel in ALLOWED_CALLERS else offenders.append(rel))
     assert scanned >= 60, f"走査したファイルが少なすぎる ({scanned} 件)"
-    assert offenders == [], (f"lib_git_policy を呼ぶコードが増えた (G3 の cutover か確認。ユーザー承認が要る): "
+    assert offenders == [], (f"lib_git_policy を呼ぶコードが増えた (cutover か確認。ユーザー承認が要る): "
                              f"{offenders}")
     assert seen == ALLOWED_CALLERS
 

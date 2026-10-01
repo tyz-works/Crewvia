@@ -69,6 +69,12 @@ plan.sh などを一時ディレクトリへ写す fixture が「要ると思っ
   （`copy_plan_tree` / `copy_scripts_libs`）。`lib_*` を **glob で**まとめて写す — 新しい lib は何もしなくても
   次のコピーから付いてくる。
 - 意図して**本物を写さない**もの: `git-helpers.sh`（GIT-05 以降、plan.sh pull は helper が無いと needs_director に倒すので、隔離コピーには「不在」でなく stub `tests/fixtures/git-helpers-stub.sh` を置く。以前は「不在」を継ぎ目にしていた。本物を置くとテストの外側に worktree を作る）、`review-plan.sh`（claude を起動する）。必要なテストが自分で置く。
+  **G3（01b）以降、本物の helper は branch / path / base を Resolver（`lib_git_policy.py`。lib の glob で写る）から得る**ので、
+  本物を置くテストは (1) queue に `missions/<slug>/mission.yaml` を置く（無い mission は Resolver が拒否する）、
+  (2) task id を本番と同じ `tNNN` の形にする（Resolver は `tNNN` だけを通す。`tselftest-1234` のような id は拒否される）。
+  `scripts/test_handoff_path.sh` は後者に合わせて直した（一時 queue + `t9<pid>`）。
+  **このテストは `_crewvia_repo_root` が指す repo に実際に worktree を作る**（CI は clone なので無害）。本番の repo の worktree から
+  手元で走らせず、使い捨ての clone に変更後の `scripts/` を写して走らせる（t012 でそうした）。
 - 構造テスト `tests/test_fixture_tree_is_the_only_copier.py`: tests/ と scripts/test_*.sh の中で
   plan.sh / `lib_*` を**名前を指して**コピーしている箇所を Python は AST、shell / bats は論理行で拾い、
   helper を通っていなければ赤。許容リスト `ALLOWED` の各行は理由を持ち、該当が無くなったら（直したのに残った）赤。

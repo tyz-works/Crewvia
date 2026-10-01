@@ -46,12 +46,21 @@ fail() { FAIL_COUNT=$((FAIL_COUNT + 1)); echo "  FAIL: $1"; }
 
 RUN_ID="selftest-$$"
 MISSION_SLUG="t158handoffpath${RUN_ID}"
-TASK_ID="t${RUN_ID}"
+# task id は本番と同じ tNNN の形 (Resolver が tNNN だけを通す。task の識別子は card のファイル名)
+TASK_ID="t9$$"
 AGENT_NAME="agent${RUN_ID}"
 WT=""
 WRITTEN_PATH=""
 
+# crewvia_create_worktree は branch / path を Resolver (lib_git_policy.py) から得る (vNext 01b G3)。Resolver は
+# queue の mission.yaml を読むので、使い捨ての queue に mission を 1 つ置く (crewvia の実 queue には触れない)。
+TMP_QUEUE="$(mktemp -d)"
+mkdir -p "${TMP_QUEUE}/missions/${MISSION_SLUG}"
+echo "mission: ${MISSION_SLUG}" > "${TMP_QUEUE}/missions/${MISSION_SLUG}/mission.yaml"
+export CREWVIA_QUEUE="$TMP_QUEUE"
+
 cleanup() {
+  rm -rf "${TMP_QUEUE:-}"
   if [[ -n "$WRITTEN_PATH" && -f "$WRITTEN_PATH" ]]; then
     rm -f "$WRITTEN_PATH"
   fi

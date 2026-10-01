@@ -316,8 +316,11 @@ base・PR base を決める唯一の場所で、**判断だけ**（git も gh �
 あって読めない・未知の mode / 欄・型違い・空・制御文字・`..`・絶対パス・既定値以外の `worktree_root`・
 `parse_yaml` が黙って読み飛ばす字下げ行は `GitPolicyError(code, field, detail)` で**停止**し、既定値に倒さない。
 branch 名の許可集合は git の `check-ref-format` より狭く、**部分集合であることを本物の git に通して確かめる**
-（`tests/test_git_policy_resolver.py`）。**G2 の時点で呼び出し元は 0**（同テストの `test_git_policy_has_no_callers_yet`。
-G3 の cutover で `ALLOWED_CALLERS` に足す）。各拒否を外した変異が赤になる実証は
+（`tests/test_git_policy_resolver.py`）。**G3（t012）で呼び出し元になった**: `git-helpers.sh`（CLI `resolve-task --lines` /
+`pr-base --lines`）・`plan.sh`（pull の失敗の分類 P1・`plan.sh pr-base`）・`kai-review.sh`（diff base）・`worktree_gc.py`（片付けの根）・
+`lint_plan.py`（`git:` の検査）。呼び出し元の集合は `test_git_policy_callers_are_exactly_the_cutover_set` の `ALLOWED_CALLERS`
+（増やすのは cutover = ユーザー承認の PR だけ）。Resolver の外に branch / base / worktree root のリテラルが増えたら
+`tests/test_git_decisions_go_through_policy.py` が赤にする（`knowledge/git-policy.md` §6・§14）。各拒否を外した変異が赤になる実証は
 `python3 tests/red_proof_git_policy_resolver.py`（29 変異・約 2 分。本番に触れない）。
 
 ### `lib_daemon_state.py`

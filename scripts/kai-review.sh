@@ -305,12 +305,24 @@ fi
 # そのため origin から都度 `main` を一意な local ref へ fetch し、必ず最新の
 # origin/main を diff base とする (旧実装からの意図的な改善。PR head の
 # fetch と同じパターンを流用)。
-BASE_FETCH_LOCAL_REF="refs/kai-review-fetch/base-main-$$"
-if ! git -C "$WORK_DIR" fetch --force origin "main:${BASE_FETCH_LOCAL_REF}" 2>&1; then
-  fail_needs_director "NEEDS FIX: git fetch origin main failed while resolving diff base"
+#
+# 何を base にするかは mission の Git Policy (lib_git_policy の pr_base。既定は main) が決める
+# (vNext 01b G3。knowledge/git-policy.md §4.1)。決められなければ (mission が分からない・mission.yaml の
+# `git:` が壊れている) main に倒さず止める: 違う base の PR を「差分が多い / 少ない」まま通さない。
+if [[ -z "$MISSION_SLUG" ]]; then
+  fail_needs_director "NEEDS FIX: cannot resolve the PR base for ${TASK_ID} — the mission is unknown (fail-closed, no fallback to main)"
+fi
+if ! PR_BASE_BRANCH="$(python3 "${SCRIPT_DIR}/lib_git_policy.py" pr-base --lines \
+       --queue "${CREWVIA_QUEUE:-${CREWVIA_REPO_ROOT:-$REPO_ROOT}/queue}" --mission "$MISSION_SLUG" 2>&1)" \
+   || [[ -z "$PR_BASE_BRANCH" ]]; then
+  fail_needs_director "NEEDS FIX: cannot resolve the PR base for ${MISSION_SLUG}/${TASK_ID} — ${PR_BASE_BRANCH:-no output} (fail-closed, no fallback to main)"
+fi
+BASE_FETCH_LOCAL_REF="refs/kai-review-fetch/base-${PR_BASE_BRANCH//\//_}-$$"
+if ! git -C "$WORK_DIR" fetch --force origin "${PR_BASE_BRANCH}:${BASE_FETCH_LOCAL_REF}" 2>&1; then
+  fail_needs_director "NEEDS FIX: git fetch origin ${PR_BASE_BRANCH} failed while resolving diff base"
 fi
 DIFF_BASE="$BASE_FETCH_LOCAL_REF"
-_info "Computing diff (origin/main...HEAD) in ${REVIEW_WT} ..."
+_info "Computing diff (origin/${PR_BASE_BRANCH}...HEAD) in ${REVIEW_WT} ..."
 if ! DIFF_CONTENT="$(git -C "$REVIEW_WT" diff "${DIFF_BASE}...HEAD" 2>&1)"; then
   fail_needs_director "NEEDS FIX: git diff ${DIFF_BASE}...HEAD failed in review worktree — ${DIFF_CONTENT}"
 fi

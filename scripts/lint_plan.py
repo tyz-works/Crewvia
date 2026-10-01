@@ -77,6 +77,23 @@ _DEP_RULES = _load_scripts_module('lib_dep_rules')
 _TASK_STATUS = _load_scripts_module('lib_task_status')
 
 
+def _import_scripts_module(name: str):
+    """`scripts/<name>.py` を**普通に import** する (dataclass を持つ lib は `_load_scripts_module` では読めない:
+    spec 経由は sys.modules に載せないため)。lint_plan が 3 通りの読み込まれ方をする (上の docstring) ので、
+    scripts/ を sys.path に足してから読む。"""
+    import importlib
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    if script_dir not in sys.path:
+        sys.path.insert(0, script_dir)
+    return importlib.import_module(name)
+
+
+# task の branch / base / PR base の判断は lib_git_policy.py の 1 か所 (vNext 01b G3)。lint は mission.yaml の
+# `git:` を**自分では読まず**、Resolver の `policy_from_text` を呼ぶ (読み口の二重実装をしない。
+# knowledge/git-policy.md §2.4)。hooks/lib_skill_perms.check_permission() を呼ぶのと同じ作法。
+_GIT_POLICY = _import_scripts_module('lib_git_policy')
+
+
 # ---------------------------------------------------------------------------
 # Module 1: Frontmatter schema check
 # ---------------------------------------------------------------------------
@@ -337,6 +354,10 @@ if yaml is not None:
     class _StrictBoolLoader(yaml.SafeLoader):
         pass
 
+    class _StrictBoolError(yaml.constructor.ConstructorError):
+        """`true` / `false` 以外の bool。利用者に見せてよい固定の文言 (`public_reason`) を持つ (値は含めない)。"""
+        public_reason = 'bool は true / false のどちらかだけ'
+
     _StrictBoolLoader.yaml_implicit_resolvers = {
         first: [r for r in resolvers if r[0] != 'tag:yaml.org,2002:bool']
         for first, resolvers in yaml.SafeLoader.yaml_implicit_resolvers.items()
@@ -358,12 +379,24 @@ if yaml is not None:
             return True
         if value == 'false':
             return False
-        raise yaml.constructor.ConstructorError(
-            None, None,
-            f"bool は true / false のどちらかだけ (got {value!r})",
-            node.start_mark)
+        raise _StrictBoolError(None, None, _StrictBoolError.public_reason, node.start_mark)
 
     _StrictBoolLoader.add_constructor('tag:yaml.org,2002:bool', _construct_strict_bool)
+
+
+def _yaml_error_location(e: Exception) -> str:
+    """PyYAML の例外を「解析の種類 + 行・列」だけの固定形にする (利用者に見える診断の唯一の整形)。
+
+    例外の文字列には問題の行の抜粋 (`owner: [SENTINEL_SECRET` のような無関係な欄の中身) が入るので、
+    `str(e)` も `e.problem` / `e.context` も使わない (`!r` の値・タグ名も入りうる)。使うのは例外の型名と位置だけ。
+    """
+    mark = getattr(e, 'problem_mark', None) or getattr(e, 'context_mark', None)
+    kind = type(e).__name__
+    reason = getattr(e, 'public_reason', None)     # この lint が自分で決めた固定の文言だけ (PyYAML の文面は使わない)
+    head = f"{reason}: " if reason else ''
+    if mark is None:
+        return f"YAML を解釈できません ({head}{kind})"
+    return f"YAML を解釈できません ({head}{kind}: {mark.line + 1} 行目 {mark.column + 1} 列目)"
 
 
 def _load_yaml_document(path: str, *, missing_is_ok: bool = True) -> tuple[dict, Optional[str]]:
@@ -401,7 +434,7 @@ def _load_yaml_document(path: str, *, missing_is_ok: bool = True) -> tuple[dict,
     try:
         data = yaml.load(text, Loader=_StrictBoolLoader)
     except yaml.YAMLError as e:
-        return {}, f"{path}: YAML を解釈できません ({e})"
+        return {}, f"{path}: {_yaml_error_location(e)}"
 
     if data is None:
         return {}, None                      # 空ファイル = 中身なし
@@ -495,6 +528,55 @@ def _mission_requires_deliverable(slug: str, queue_dir: str) -> tuple[bool, Opti
     if value is True:
         return True, None
     return False, f"{path}: deliverable_required は true / false のどちらかだけ (got {value!r})"
+
+
+# ---------------------------------------------------------------------------
+# mission.yaml の `git:` (Git Policy。vNext 01b G3)
+# ---------------------------------------------------------------------------
+
+
+def check_git_policy(slug: str, queue_dir: str) -> list[tuple[str, str, str]]:
+    """mission.yaml の `git:` を Resolver に通す。拒否は FAIL (未実装 mode・未知の欄・危険な値・壊れた字下げ)。
+
+    2 つの読み手の突き合わせ (knowledge/git-policy.md §2.4):
+
+      1. Resolver (`policy_from_text`) — plan.sh pull が実際に使う読み。`parse_yaml` は字下げ違いの行を黙って読み飛ばす
+         ので、Resolver 自身が「結果に反映されなかった行」を拒否する。
+      2. 本物の YAML パーサ (`_load_yaml_document`) — `git:` の subtree を読み、Resolver の読みと**食い違えば FAIL**。
+         (1) が拾えない形があっても、2 つの読み手が割れたことで気づける。PyYAML が無いときは読めない扱い
+         (簡易パーサに倒さない)。
+
+    メッセージは行番号とファイルの場所だけ (mission.yaml の行の中身は出さない)。
+    """
+    path = os.path.join(queue_dir, 'missions', slug, 'mission.yaml')
+    text = lib_task_cards.read_regular_text_or_unreadable(path)
+    if lib_task_cards.is_unreadable(text):
+        if lib_task_cards.is_missing(text):
+            return []   # mission.yaml が無い mission の扱いは今までどおり (この検査の対象外)
+        return [('FAIL', 'git-policy', f"{path}: 読めない ({text.reason})")]
+    try:
+        policy = _GIT_POLICY.policy_from_text(text, source=path)
+    except _GIT_POLICY.GitPolicyError as e:
+        return [('FAIL', 'git-policy', _GIT_POLICY.format_policy_error(e, path))]
+
+    data, problem = _load_yaml_document(path)
+    if problem is not None:
+        return [('FAIL', 'git-policy', f"{problem} (git: を本物の YAML パーサで突き合わせられません)")]
+    if 'git' not in data:
+        return [] if policy.source == 'default' else [
+            ('FAIL', 'git-policy', f"{path}: Resolver は git: を読んだが本物の YAML パーサには無い")]
+    block = data['git']
+    if not isinstance(block, dict):
+        return [('FAIL', 'git-policy', f"{path}: git: の値が mapping ではない (本物の YAML パーサの読み)")]
+    mismatches = []
+    for key, raw in block.items():
+        if key not in _GIT_POLICY.POLICY_FIELDS or getattr(policy, key) != raw:
+            mismatches.append(str(key))
+    if mismatches:
+        return [('FAIL', 'git-policy',
+                 f"{path}: git: の欄 {', '.join(mismatches)} を、plan.sh の読み (parse_yaml) と本物の YAML パーサで"
+                 "別の値に読んでいる (引用符・字下げ・型を確かめる)")]
+    return []
 
 
 # ---------------------------------------------------------------------------
@@ -793,14 +875,17 @@ def _load_tasks_from_mission(slug: str, queue_dir: str) -> list[dict]:
 def lint_mission(slug: str, queue_dir: str, config_dir: str, strict: bool = False) -> int:
     """Run all lint checks on a mission. Returns 0 (pass) or 1 (fail)."""
     tasks = _load_tasks_from_mission(slug, queue_dir)
+    git_results = check_git_policy(slug, queue_dir)
     if not tasks:
         print(f"[WARN] mission: no tasks found in mission '{slug}'")
-        return 0
+        for level, category, message in git_results:
+            print(f"[{level}] {category}: {message}")
+        return 1 if any(level == 'FAIL' for level, _c, _m in git_results) else 0
 
     skill_perm_path = os.path.join(config_dir, 'skill-permissions.yaml')
     timeout_path = os.path.join(config_dir, 'timeout-profiles.yaml')
 
-    all_results: list[tuple[str, str, str]] = []
+    all_results: list[tuple[str, str, str]] = list(git_results)
 
     # Parse errors first (lib_task_cards.list_task_cards() holds unreadable
     # cards as a CORRUPT_TASK_STATUS pseudo-task rather than raising — see

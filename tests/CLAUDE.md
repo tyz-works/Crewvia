@@ -54,6 +54,27 @@ root の `CLAUDE.md` から移した、テスト専用の規則。設計と経�
   `git-helpers.sh` 104 行を見ていなかった）。`test_no_target_has_an_unclosed_heredoc_or_quote` が全対象で「閉じない heredoc / 引用符 0 件」を
   assert する。赤の実証: `bash tests/red_proof_queue_write_scan_heredoc.sh`（約 5 秒）。
 
+## Git Policy（01b G3 / t012）のテスト
+
+- **構造ガード** `tests/test_git_decisions_go_through_policy.py`（検出器 `tests/git_decision_scan.py`）: Resolver (`lib_git_policy.py`) の外に
+  branch / base / worktree root のリテラル（`origin/main`・`--base main`・`main...`・`.claude/worktrees`・`"main"` の既定値 …）が増えたら赤。
+  形は書き込み側のガードと同じ allowlist（`(ファイル, 関数) → (件数, 理由)`。鍵に断片の文字列を使わない）。対象はコード
+  （scripts・hooks・トップ）と、agents/*.md・skills/*/SKILL.md の **fenced code block の中だけ**（地の文は見ない）。
+  検査件数の下限・死んだ行・陽性対照（本物から切り出した形）・**本物のファイルに 1 行足すと赤になる**実証を持つ。
+  文書の行は G4（t016）が書き換えて allowlist から外す（外さないと死んだ行で赤）。
+- **件数は成功しても CI ログに出る**: ガードは `tests/guard_report.py` の `record()` に検査件数を残し、`conftest.py` の
+  `pytest_terminal_summary` が `[structural-guard] git-decisions: code_files=… hits=…` を最後に出す（01a backlog 2）。
+  新しい構造ガードを足すときも `record()` する。
+- **互換性**: `tests/fixtures/git-helpers-pre-g3.sh` は G3 前の helper を**凍結した複製**（比較元。直さない）。
+  `tests/test_git_policy_resolver.py` が同じ入力（59 通り）を G3 前後の helper に与え、branch と worktree path がバイト単位で
+  一致することを使い捨ての clone で確かめる。
+- 挙動: `tests/test_git_policy_pull_and_pr_base_cutover.py`（custom の base / `plan.sh pr-base` の拒否 / `target_dir` の task が回帰しない /
+  mission.yaml の字下げミスの出口 / `crewvia_create_pr` / NUL 区切りの worktree lookup）。本物の helper を使うテストは
+  queue に mission.yaml を置き、task id を `tNNN` にする（`knowledge/test-isolation.md`）。
+
+- 名前の検証と診断の secret 漏れ: `tests/test_git_policy_untrusted_names_and_error_text.py`（`pr-base` の traversal・
+  PyYAML 例外・`e.detail` の整形が 1 か所であること。secret 文字列を仕込む）。
+
 ## State Store (`lib_state_store`) のテスト
 
 - crash 注入は `tests/state_store_scenarios.py`（seed・場面・収束の検査）。lib の書き込みの各段で `FAULT_HOOK` が呼ばれ、

@@ -1,16 +1,15 @@
 #!/usr/bin/env bash
+# FROZEN REFERENCE (vNext 01b G3 / t012): origin/main bd4485a (G2 merge) の scripts/git-helpers.sh を**そのまま**凍結した複製。
+# G3 で本物の helper は branch / path / base を Resolver から得るようになった。このファイルは「G3 前と同じ branch・path・base で
+# worktree を作る」ことを同じ入力で突き合わせる互換性テスト (tests/test_git_policy_resolver.py) の**比較元**で、
+# 本番では使われない。直さない (直すと比較元でなくなる)。
 set -euo pipefail
 
 # git-helpers.sh — Crewvia Git ワークフローヘルパー
 # Usage:
 #   source scripts/git-helpers.sh
 #   crewvia_create_worktree "mission-slug" "t001" "task-slug"
-#   crewvia_create_pr "mission-slug" "task/mission-slug/t001-task-slug" "タイトル" "本文"
-#
-# branch 名・worktree の path・base・PR base は **scripts/lib_git_policy.py (Git Policy Resolver) が決める**
-# (knowledge/git-policy.md §3)。このファイルは git の観測 (show-ref / worktree list) と副作用 (fetch /
-# worktree add) だけを持ち、判断のコピーを持たない。Resolver が拒否したら (mission.yaml の `git:` が壊れている
-# 等) 失敗する (既定値に倒さない)。queue の場所は CREWVIA_QUEUE (無ければ <repo root>/queue)。
+#   crewvia_create_pr "task/mission-slug/t001-task-slug" "タイトル" "本文"
 
 
 # _crewvia_repo_root — main repo root (works in linked worktrees too)
@@ -22,39 +21,6 @@ _crewvia_repo_root() {
   else
     dirname "$git_common_dir"
   fi
-}
-
-
-# _crewvia_policy_cli <verb> [args...] — Resolver の CLI を呼ぶ (Resolver は scripts/ の自分の隣にある)。
-#   stdout: CLI の出力。拒否 (exit 2)・lib が無い・python が無い、はすべて return 1 (stderr に理由)。
-_crewvia_policy_cli() {
-  local here
-  here="$(cd -P -- "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd -P)" || return 1
-  python3 "${here}/lib_git_policy.py" "$@"
-}
-
-
-# _crewvia_queue_dir <repo_root> — queue の場所。plan.sh と同じ規則 (CREWVIA_QUEUE、無ければ <repo root>/queue)。
-_crewvia_queue_dir() {
-  echo "${CREWVIA_QUEUE:-${1}/queue}"
-}
-
-
-# _crewvia_resolve_task <mission_slug> <task_id> <task_slug> <repo_root>
-#   Resolver の resolve-task を 1 回呼び、5 行 (branch / worktree path / base_remote / base_local / pr_base) を
-#   stdout に出す。拒否は stderr に `P1: git policy ...` を出して return 1。
-_crewvia_resolve_task() {
-  local out rc=0
-  # 成功時の stderr は空 (Resolver は警告を出さない)。失敗時は stdout と stderr が混ざるが、末尾の 1 行が理由。
-  out="$(_crewvia_policy_cli resolve-task --lines --queue "$(_crewvia_queue_dir "$4")" --mission "$1" \
-           --task "$2" --task-slug "$3" --repo-root "$4" 2>&1)" || rc=$?
-  if [[ $rc -ne 0 ]]; then
-    # 理由の本体 (どの欄か・何行目か・どのファイルか) は CLI の最後の 1 行。card の要約 (200 文字) に行番号が入るよう、
-    # 前置きを短くして先頭に置く。
-    echo "crewvia_create_worktree: P1: $(printf '%s\n' "$out" | tail -n 1 | sed 's/^lib_git_policy: //')" >&2
-    return 1
-  fi
-  printf '%s\n' "$out"
 }
 
 
@@ -94,33 +60,31 @@ _crewvia_physical_dir() {
 # _crewvia_worktree_lookup <path> — `git worktree list --porcelain -z` で <path> の登録を調べる (観測だけ)。
 #   stdout 1 行: `none` | `registered <ref|detached> <prunable:0|1>`。git の出力を読めなければ return 1。
 #   path は両側を物理パスに正規化して完全一致で比べる。正規化できない登録は「一致しない」(= 再利用しない側)。
-#   -z の出力は NUL 区切り (属性ごとに NUL、レコードの区切りは空の属性)。**NUL のまま読む** (改行に直すと、
-#   改行を含む path の worktree が `worktree <別の path>` の行を偽造できる)。
 _crewvia_worktree_lookup() {
-  local want="${1:-}" want_real result
+  local want="${1:-}" want_real listing field
   want_real="$(_crewvia_physical_dir "$want")" || { echo none; return 0; }
-  # git の出力を NUL のままパイプで読む (一時ファイルを使わない)。git が失敗したら pipefail で関数が失敗する。
-  result="$(git worktree list --porcelain -z | {
-    local field cur_path="" cur_ref="detached" cur_prun=0 found="" real
-    while IFS= read -r -d '' field; do
-      case "$field" in
-        "")
-          if [[ -n "$cur_path" && -z "$found" ]] && real="$(_crewvia_physical_dir "$cur_path")" && [[ "$real" == "$want_real" ]]; then
-            found="registered ${cur_ref} ${cur_prun}"
-          fi
-          cur_path=""; cur_ref="detached"; cur_prun=0 ;;
-        "worktree "*) cur_path="${field#worktree }" ;;
-        "branch "*) cur_ref="${field#branch }" ;;
-        prunable*) cur_prun=1 ;;
-      esac
-    done
-    # 最後のレコードの後ろに区切りが無い出力でも取りこぼさない
-    if [[ -n "$cur_path" && -z "$found" ]] && real="$(_crewvia_physical_dir "$cur_path")" && [[ "$real" == "$want_real" ]]; then
-      found="registered ${cur_ref} ${cur_prun}"
+  listing="$(git worktree list --porcelain -z | tr '\0' '\n' | sed 's/^$/\x01/')" || return 1
+  local cur_path="" cur_ref="detached" cur_prun=0 found=""
+  _crewvia_flush() {
+    if [[ -n "$cur_path" && -z "$found" ]]; then
+      local real
+      if real="$(_crewvia_physical_dir "$cur_path")" && [[ "$real" == "$want_real" ]]; then
+        found="registered ${cur_ref} ${cur_prun}"
+      fi
     fi
-    echo "${found:-none}"
-  })" || return 1
-  echo "$result"
+    cur_path=""; cur_ref="detached"; cur_prun=0
+  }
+  while IFS= read -r field; do
+    case "$field" in
+      $'\x01') _crewvia_flush ;;
+      "worktree "*) cur_path="${field#worktree }" ;;
+      "branch "*) cur_ref="${field#branch }" ;;
+      prunable*) cur_prun=1 ;;
+    esac
+  done <<<"$listing"
+  _crewvia_flush
+  unset -f _crewvia_flush
+  echo "${found:-none}"
 }
 
 
@@ -142,16 +106,10 @@ crewvia_create_worktree() {
     return 1
   fi
 
+  local branch="task/${mission_slug}/${task_id}-${task_slug}"
   local repo_root
   repo_root="$(_crewvia_repo_root)" || { echo "crewvia_create_worktree: W5: cannot determine the repo root" >&2; return 1; }
-  # branch・path・base の候補は Resolver から得る (式をここに持たない)。拒否は P1 で失敗する。
-  local resolved branch worktree_path base_remote base_local _pr_base
-  resolved="$(_crewvia_resolve_task "$mission_slug" "$task_id" "$task_slug" "$repo_root")" || return 1
-  { IFS= read -r branch; IFS= read -r worktree_path; IFS= read -r base_remote; IFS= read -r base_local; IFS= read -r _pr_base; } <<<"$resolved"
-  if [[ -z "$branch" || -z "$worktree_path" || -z "$base_remote" || -z "$base_local" ]]; then
-    echo "crewvia_create_worktree: P1: Resolver の出力が不完全です" >&2
-    return 1
-  fi
+  local worktree_path="${repo_root}/.claude/worktrees/${mission_slug}/${task_id}-${task_slug}"
 
   if [[ -e "$worktree_path" || -L "$worktree_path" ]]; then
     local found
@@ -176,12 +134,10 @@ crewvia_create_worktree() {
 
   git fetch origin 2>/dev/null || echo "warning: git fetch origin failed, using local state" >&2
 
-  # base を選ぶ 1 行 (規則: remote-tracking があれば remote、無ければ local に倒して警告。lib_git_policy.task_base と同じ。
-  # 観測は git に任せる)。候補の名前は Resolver が決める。
-  local base="$base_remote"
-  if ! git show-ref --verify --quiet "refs/remotes/${base_remote}"; then
-    base="$base_local"
-    echo "warning: ${base_remote} not found, falling back to local ${base_local}" >&2
+  local base="origin/main"
+  if ! git show-ref --verify --quiet "refs/remotes/origin/main"; then
+    base="main"
+    echo "warning: origin/main not found, falling back to local main" >&2
   fi
 
   mkdir -p "$(dirname "$worktree_path")" || {
@@ -217,10 +173,9 @@ crewvia_remove_worktree() {
     return 1
   fi
 
-  local repo_root resolved worktree_path _b
+  local repo_root
   repo_root="$(_crewvia_repo_root)"
-  resolved="$(_crewvia_resolve_task "$mission_slug" "$task_id" "$task_slug" "$repo_root")" || return 1
-  { IFS= read -r _b; IFS= read -r worktree_path; } <<<"$resolved"
+  local worktree_path="${repo_root}/.claude/worktrees/${mission_slug}/${task_id}-${task_slug}"
 
   if ! git worktree list --porcelain | grep -qF "worktree ${worktree_path}"; then
     echo "crewvia_remove_worktree: worktree not found, skipping: $worktree_path" >&2
@@ -231,24 +186,13 @@ crewvia_remove_worktree() {
 }
 
 
-# crewvia_create_pr <mission_slug> <branch> <title> <body>
-#   Pushes the branch and opens a PR against the mission's PR base (Resolver の pr_base。既定は main)。
-#   Prints the PR URL to stdout. PR base を決められなければ (mission.yaml の `git:` が壊れている・mission が無い)
-#   push も PR 作成もせず return 1 (main に倒さない)。
+# crewvia_create_pr <branch> <title> <body>
+#   Pushes the branch and opens a PR against main.
+#   Prints the PR URL to stdout.
 crewvia_create_pr() {
-  local mission_slug="${1:-}" branch="${2:-}" title="${3:-}" body="${4:-}"
-  if [[ -z "$mission_slug" || -z "$branch" ]]; then
-    echo "crewvia_create_pr: mission_slug, branch are required" >&2
-    return 1
-  fi
-
-  local repo_root pr_base_line pr_base_value
-  repo_root="$(_crewvia_repo_root)" || return 1
-  pr_base_line="$(_crewvia_policy_cli pr-base --lines --queue "$(_crewvia_queue_dir "$repo_root")" --mission "$mission_slug")" || {
-    echo "crewvia_create_pr: PR base を決められません (mission ${mission_slug})" >&2
-    return 1
-  }
-  pr_base_value="$pr_base_line"
+  local branch="$1"
+  local title="$2"
+  local body="$3"
 
   git push -u origin "$branch"
 
@@ -256,7 +200,7 @@ crewvia_create_pr() {
   pr_url=$(gh pr create \
     --title "$title" \
     --body "$body" \
-    --base "$pr_base_value" \
+    --base main \
     --head "$branch")
 
   echo "$pr_url"

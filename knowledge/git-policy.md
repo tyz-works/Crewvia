@@ -766,3 +766,21 @@ env が無い理由は 3 つある: ① TARGET_DIR の Worker ② G3 前の `.cr
 - **戻し方**: PR revert → `scripts/sync-main-checkout.sh`。G1 は新しい status も欄も書かない
   (`needs_director` と `needs_director_reason` は既存)。戻しても旧コードがそのまま読める。needs_director になった card は
   Director が今の出口 (`plan.sh update <id> --status pending --reset`) で戻す。
+
+---
+
+## 13. G2 (t008) の実績と G3 への引き継ぎ
+
+- 実装: `scripts/lib_git_policy.py`（§3 の API。`GitPolicy` / `TaskBase` / `GitPolicyError` / `MissionNotFound` / `policy_from_text` / `load_git_policy` / `task_branch` / `task_worktree_path` / `task_base` / `pr_base` / `resolve_task` / `branch_name_problem` と CLI の `resolve-task` / `pr-base`）。テスト `tests/test_git_policy_resolver.py`、変異の実証 `tests/red_proof_git_policy_resolver.py`。**呼び出し元は 0**（`test_git_policy_has_no_callers_yet`。G3 の PR が `ALLOWED_CALLERS` に足す）。
+- 設計からの差分（G3 は次の形を前提にする）:
+  - `{mission_slug}` `{task_id}` `{task_slug}` に入る値は**それぞれ 1 成分**（`/` を含まない）で、`{task_id}` は `tNNN`。`mission_slug` が `/` を含むのは設計 §2.3 の「置換に入る値も同じ規則」より厳しい側で、path の成分にもなる値だから。
+  - `git:` の検査は `parse_yaml` の読み飛ばしを 3 つで拾う: (1) 値が mapping でない (2) 字下げ行の数と読めた欄の数の不一致（4 字下げ・空行・字下げコメント・重複キー） (3) トップレベルの `git:` が 2 個（先の `git:` が空だと (2) が合ってしまうため）。
+  - `mission.yaml` が**無い**（ENOENT）は `MissionNotFound`（`GitPolicyError` の子。`code` は `unreadable`）。呼び出し元が今の `load_mission` と同じエラーに写せるように分けた。
+  - 既定値の worktree path は `repo_root` を正規化せずに連結する（git-helpers.sh は git が返した root をそのまま使うのでバイトが同じ）。`repo_root` の外へ出ない検査だけは realpath（symlink で外を指す `.claude/worktrees` を拒否）。
+- 互換性の確かめ方: 本物の `git-helpers.sh` を使い捨ての bare origin + clone で実行し、plan.sh から取り出した `_slugify` と Resolver に同じ入力（title 36 通り + mission slug 23 通り = 59 通り）を与えて branch・path がバイト単位で一致することを assert する。git-helpers が作れない入力は Resolver も拒否し、設計 §2.3 で狭めた入力（`_x`・`x.`）だけが「git は作れるが Resolver は拒否」になる。
+- **戻し方**: PR revert → `scripts/sync-main-checkout.sh`。G2 は呼び出し元ゼロで、queue・registry・card・mission を 1 バイトも書かず、デーモンの restart も要らない。revert 後に `grep -rn lib_git_policy scripts hooks` が 0 件になる。
+- **Codex review 2 巡目 (t025)**: (P2-1) 0 桁目でない `git` キー (字下げ・タブ・入れ子・リスト項目・引用符つき) は `parse_yaml` が黙って読み飛ばし「git: が無い」と区別できなかった。`policy_from_text` は既定値に倒す前に `_stray_git_key_line` で拾い `malformed` にする。「`git` という語が mission.yaml にあるのに既定値」になる入力は 0 (テスト `test_no_input_has_a_git_key_somewhere_and_the_default_policy`)。(P2-2) 解析エラーの理由は `parse_yaml` の例外の全文 (問題の行の中身を含む) ではなく**行番号だけ**にし、例外は連鎖させない (`__cause__` / `__context__` が None)。Resolver から出る文字列 (例外・CLI の stderr) に mission の他の欄・行の中身が出ないことを、秘密文字列を仕込んだテストで全拒否例 × 5 通りの置き方で確かめる。
+- **Codex review 3 巡目 (t026。この PR の最後の fix)**:
+  - (P2-2) 迷子の `git` キーを**形で列挙して塞ぐ方式をやめた**。flow 形式 `{git: {mode: integration}}` は 1・2 巡目の列挙のどれにも当たらず default の direct を返した。`policy_from_text` は `_unparsed_line` で「その行を除いて `parse_yaml` し直した結果が同じ行 (= 結果に寄与していない行。飛ばされた行・上書きされた重複キー)」が 1 行でもあれば `malformed` で停止する（形を見ず `parse_yaml` 自身に聞くので、列挙に無い形も族ごと閉じる。飛ばされた行が 1 つでもあれば少なくとも 1 つは検出される）。これで §13 先の「(2) 字下げ行の数と欄の数の不一致」「(3) トップレベル `git:` が 2 個」は `_unparsed_line` に吸収された（`git:` 2 個の全組み合わせで `_unparsed_line` が先に拾うことを確認して `heads != 1` は外した）。`_stray_git_key_line` は `review:` の下の `- git: x` のように parse_yaml が**読んで残す**形のための副の網として残す。今ある 67 本の mission.yaml（queue と archive）は `_unparsed_line` に 1 本も掛からない（実測）。
+  - (P2-1) `task_branch_pattern` は置換子の直後に区切りを必須にした（`_check_pattern_boundaries`）: 次の文字は末尾か `/`、`{task_id}` だけは `-` も可（`tNNN` は `-` を含まない）。`{mission_slug}-` `{task_slug}-` は slug 自身が `-` を含むので境界にならず拒否。mission `demo` の t100 (slug `0fix`) と t1000 (slug `fix`) が `task/demo/t1000fix` で衝突する pattern は設定の段階で止まる。既定の `task/{mission_slug}/{task_id}-{task_slug}` は通る。
+  - worktree path の同族の衝突: path は pattern に依らず `<worktree_root>/<mission_slug>/<task_id>-<task_slug>` で、`mission_slug` は 1 成分 (自分の dir)、`task_id` は `-` を含まない `tNNN` なので `(mission, task_id, slug) → path` は単射（表: `t100`+`0fix` → `t100-0fix`、`t1000`+`fix` → `t1000-fix`）。総当たりテスト `test_every_accepted_pattern_maps_distinct_tasks_to_distinct_branches_and_paths` が 3 pattern × 150 組で branch と path の両方の単射を assert する。

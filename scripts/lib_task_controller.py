@@ -34,6 +34,7 @@ DETACHED の持ち主でない呼び出し) への操作は task の遷移だけ
 from __future__ import annotations
 
 import dataclasses
+import json
 import os
 import sys
 from datetime import datetime, timezone
@@ -204,6 +205,27 @@ def _check_generation(now):
     return now
 
 
+def _check_now(now):
+    """`now` を取る全操作 (start / complete / fail / release / reset / abandon) の最初の書き込みの前の検証。
+    None (= 今の時刻) か世代の形の文字列だけ。それ以外は `INVALID_ARGUMENT` (record の直列化で落ちて card だけ
+    確定した状態を作らない)。reserve は必須の `_check_generation` を使う。"""
+    if now is None:
+        return None
+    return _check_generation(now)
+
+
+def _check_caller(caller):
+    if not isinstance(caller, Caller):
+        raise _err(ex.INVALID_ARGUMENT, "caller は Caller で指定してください")
+    return caller
+
+
+def _check_body(body):
+    if body is not None and not isinstance(body, str):
+        raise _err(ex.INVALID_ARGUMENT, "body は文字列か None")
+    return body
+
+
 def _check_git_context(git_context):
     if git_context is None:
         return None
@@ -228,6 +250,10 @@ def _check_updates(meta_updates):
         return {}
     if not isinstance(meta_updates, dict) or _FORBIDDEN_UPDATE_KEYS & set(meta_updates):
         raise _err(ex.INVALID_ARGUMENT, "meta_updates は status / worker / started_at / 試行の欄を含められません")
+    try:
+        json.dumps(meta_updates, allow_nan=False)           # 直列化できない値は card の書き込みで落ちる (書く前に弾く)
+    except (TypeError, ValueError):
+        raise _err(ex.INVALID_ARGUMENT, "meta_updates の値は JSON にできる値だけ") from None
     return dict(meta_updates)
 
 
@@ -414,6 +440,7 @@ def abandon_detached_execution(txn, slug, tid, *, now=None):
     触れずに `failed` / `ABANDONED_OUTSIDE_CONTROLLER` にする。終わった task (done / failed 等) に残る欄と record を
     履歴として閉じるのが主な用途 (store-check の `execution_active_on_finished_task`)。
     DETACHED でない・active でない試行は `INVALID_TRANSITION` (何も書かない・拒否の行は残す)。呼び出し元は E4 が足す。"""
+    _check_now(now)
     meta, body = _load(txn, slug, tid)
     if _view(meta) != ex.DETACHED or meta.get('execution_status') not in ex.ACTIVE_STATUSES:
         _refuse(txn, ex.INVALID_TRANSITION, f"{slug}/{tid}: 閉じるべき DETACHED の試行がありません", slug, tid, meta)
@@ -437,6 +464,7 @@ def start_execution(txn, slug, tid, execution_id, git_context=None, *, now=None)
       (判断には使わない。W2 で前の試行の commit が残った worktree を再利用したとき、どの commit から始めた試行かを追う)。
     """
     git = _check_git_context(git_context)
+    _check_now(now)
     meta, body = _load(txn, slug, tid)
     caller = Caller(execution_id, 'flag') if execution_id is not None else NO_CALLER
     view = _view(meta)
@@ -480,6 +508,9 @@ def _finish(txn, slug, tid, meta, body, caller, *, new_status, end_code, to_stat
             clear_owner, retire_slot, meta_updates, new_body, now, required_exec_status=None,
             abandon_detached=False):
     """終わらせる操作の共通の骨 (照合 → 遷移の検査 → card → record → 枠 → 監査)。"""
+    _check_caller(caller)
+    _check_now(now)
+    _check_body(new_body)
     decision, check = _authorize(txn, slug, tid, meta, caller, operation=operation)
     updates = _check_updates(meta_updates)
     body_out = body if new_body is None else new_body
@@ -622,6 +653,8 @@ def mark_task(txn, slug, tid, caller=NO_CALLER, *, command, to_status, meta_upda
     allowed = {'ready-for-verification': 'ready_for_verification', 'verifying': 'verifying'}
     if allowed.get(command) != to_status:
         raise _err(ex.INVALID_ARGUMENT, "mark_task は ready-for-verification / verifying の遷移だけ", slug, tid)
+    _check_caller(caller)
+    _check_body(body)
     meta, card_body = _load(txn, slug, tid)
     # operation=None: 再送を成功にする操作ではない (TERMINAL の試行に名乗り付きで来れば `_authorize` が conflict で拒否する)
     decision, check = _authorize(txn, slug, tid, meta, caller, operation=None)

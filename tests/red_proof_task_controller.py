@@ -27,6 +27,7 @@ REPO = pathlib.Path(__file__).resolve().parents[1]
 LIB = "scripts/lib_task_controller.py"
 UNIT = "tests/test_task_controller_unit.py"
 CRASH = "tests/test_task_controller_crash_injection.py"
+TIME_ARGS = "tests/test_task_controller_time_args_and_closed_findings.py"
 
 # (id, 説明, 置換元, 置換先, テストファイル, 赤になるべきテスト名 (部分一致のどれか 1 つ以上が FAILED), -k)
 MUTATIONS = [
@@ -62,7 +63,14 @@ MUTATIONS = [
      "    txn.write_card(slug, tid, meta, body)                       # コミット点\n    _write_record(txn, slug, tid, meta)\n    if agent is not None:",
      "    _write_record(txn, slug, tid, meta)\n    txn.write_card(slug, tid, meta, body)\n    if agent is not None:",
      CRASH, ["test_crash_at_every_point_converges"], "test_crash_at_every_point and reserve and not after_detached"),
+    ("M09", "now を最初の書き込みの前に検証しない (t030 / PR #270 P2-1。欠陥版は card を確定させてから TypeError)",
+     "    if now is None:\n        return None\n    return _check_generation(now)\n",
+     "    return now\n", TIME_ARGS,
+     ["test_a_bad_now_is_refused_before_the_first_write_in_every_operation"], None),
 ]
+# P2-2 (diagnose が閉じた試行を active と報告する) は lib_state_store 側の欠陥で、この runner は LIB だけを変異させる。
+# 赤の実証は「修正前の lib_state_store.py に戻して TIME_ARGS を走らせる」(test_a_detached_report_goes_away… と
+# test_an_attempt_closed_normally_is_not_reported… が FAILED。t030 の Result に実測を記す)。
 
 
 def _copy_tree(dest: pathlib.Path) -> None:

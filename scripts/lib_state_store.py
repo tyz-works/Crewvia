@@ -1514,6 +1514,10 @@ class _Recovery:
             status_of_card[(slug, tid)] = meta['current_execution_id']
             if view != _ex.DETACHED:
                 continue
+            if meta.get('execution_status') not in _ex.ACTIVE_STATUSES:
+                # 試行はもう閉じている (`abandon_detached_execution` 済み・正常に終わった後に旧コードが取り直した)。
+                # 閉じた試行を active と報告し続けない (消す手段が無い報告になる)
+                continue
             status = meta.get('status')
             if status in _ASSIGNMENT_HOLDING_STATUSES:
                 # (a): 空でない started_at が予約の値と違う (旧コードの pull が取り直した持ち主)

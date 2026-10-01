@@ -77,7 +77,7 @@ lib ごとの**破ってはいけない契約**の要約。理由・経緯・全
   コピーしない。**`failed` の依存は「保留（HELD）」**で、進める出口は Director の `plan.sh release-dep <id> --mission <slug>` だけ。
 - 共有規則に env 停止スイッチを付けない（dispatcher と plan.sh で答えが割れる）。
 
-## Execution + Task Controller（`lib_execution.py` / `lib_task_controller.py`。01c E1 / t004 で作成。**呼び出し元ゼロ**）
+## Execution + Task Controller（`lib_execution.py` / `lib_task_controller.py`。01c E1 / t004 で作成。**呼び出し元は plan.sh の pull だけ**（E2 / t008））
 
 - `lib_execution.py` = card 1 枚から決まること（`ex-<32 hex>` の形・試行の欄 `EXECUTION_FIELDS`・`attempt_view`（照合・冪等・R-1・
   reserve の手順 0・store-check が呼ぶ**唯一の読み方**）・record の形と card への追従）。`lib_task_controller.py` = 遷移（reserve /
@@ -86,8 +86,21 @@ lib ごとの**破ってはいけない契約**の要約。理由・経緯・全
   import すると循環する）。
 - **domain error は `ControllerError.code`（固定コード）が契約**。文字列の解析を契約にしない。メッセージ・監査行・record には
   コード・位置・識別子だけを出し、card の本文・他の欄・Result・入力の行を出さない（secret を仕込んだテストで固定）。
-- 呼び出し元は E2 以降で増える。増やすのは cutover なので、`tests/test_task_controller_has_no_callers_yet.py` の `ALLOWED_MENTIONS` を
-  意図して広げる（ユーザー承認が要る PR）。設計は `knowledge/execution.md`（§14 が E1 の実績と戻し方）。
+- 呼び出し元は E3 / E4 で増える。増やすのは cutover なので、`tests/test_task_controller_has_no_callers_yet.py` の `ALLOWED_MENTIONS` と
+  `PLAN_SH_ALLOWED_OPERATIONS`（plan.sh が呼んでよい Controller の操作）を意図して広げる（ユーザー承認が要る PR）。設計は
+  `knowledge/execution.md`（§14 が E1 の実績と戻し方・§15 が E2 の実績と戻し方）。
+- **pull（E2）の形**: ロック 1（recover → 再開の判定 → 候補選び → `reserve_task`）→ **準備ロック**（`lib_state_store.acquire_prepare_lock`。task ごと・
+  LOCK_NB・取れなければ exit 1 で何も書かない）→ ロック外（Taskvia・worktree・`.crewvia-env`）→ ロック 2（`start_execution`、失敗なら
+  `fail_execution(WORKSPACE_CREATE_FAILED)`）→ JSON。**start は JSON を出す前**にコミットする（`reserved` ⇔ JSON はまだ誰にも渡っていない。だから
+  同じ Worker の再 pull は `reserved` を新しい試行にせず再開できる。`running` は再開しない）。ロックの順序は 準備ロック → `queue/.lock` → 小さな共有ファイル。
+- **start と G1 の CAS は `_pull_cas_ok`（新しい欄 `current_execution_id == X ∧ execution_status == reserved` と、今までの欄 in_progress ∧ worker ∧
+  `started_at` の AND）**。新しい欄だけにしない: 旧形式の書き手（今の `update --reset`・rollback 中の旧コード）は execution の欄を更新しない
+  （E4 まで）ので、解放済みの予約が `X / reserved` のまま残る。reset の後に Director が card を開き直した形は、今までの欄だけが拒否する。
+- `.crewvia-env` の 4 行目 `CREWVIA_EXECUTION_ID` は**任意**（必須にしない・card には書かない名乗り）。pull の JSON に `execution_id` / `attempt`。
+  `task_slug` は最初の reserve で card に固定（title を変えても branch は変わらない。式は `lib_execution.slugify_title` の 1 か所）。
+  Controller の domain error は `[plan.sh] error_code=<CODE>` を stderr の**最後の行**に出す（exit 2 は使わない = idle）。
+- 戻し方: PR revert → `scripts/sync-main-checkout.sh`。新しい欄・record・identity の欄・`.crewvia-env` の 4 行目は残ってよい（旧コードは読まない）。
+  reserved のまま残った試行は Director が `update --reset`（`knowledge/execution.md` §15.4）。
 ## Git Policy（`lib_git_policy.py`。01b G2 / t008 で作成、G3 / t012 で呼び出し元を移した）
 
 - task の branch・worktree path・base・PR base を決める唯一の場所（`knowledge/git-policy.md` §2・§3）。**判断だけ**で

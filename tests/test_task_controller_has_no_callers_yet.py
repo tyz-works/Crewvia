@@ -1,4 +1,7 @@
-"""`lib_task_controller` の呼び出し元がゼロであることを固定する (vNext 01c E1。01a S2 / 01b G2 と同じ作法)。
+"""`lib_task_controller` の呼び出し元の集合を固定する (vNext 01c E1。01a S2 / 01b G2 と同じ作法)。
+
+**E2 (t008) で最初の呼び出し元が入った: `scripts/plan.sh` の `pull` だけ** (reserve / start / G1 の fail)。
+ファイル名の `_has_no_callers_yet` は E1 のときの名前で、今は「許可した呼び出し元だけ」を固定する。
 
 R2 (ユーザー決定): 呼び出し側を移す PR は merge 前にユーザー承認。Controller を plan.sh / dispatcher / hooks が
 import した瞬間が cutover (E2 以降)。E1 は本番の挙動を変えない lib だけなので、名前を出してよいのは
@@ -18,7 +21,10 @@ NAME = "lib_task_controller"
 
 #: 名前を出してよいファイル。`lib_execution.py` / `lib_task_status.py` はコメントで説明するだけ (import しない。
 #: 下の `test_the_mentions_in_the_allowed_files_are_not_imports` が固定する)。
-ALLOWED_MENTIONS = {"scripts/lib_task_controller.py", "scripts/lib_execution.py", "scripts/lib_task_status.py"}
+ALLOWED_MENTIONS = {"scripts/lib_task_controller.py", "scripts/lib_execution.py", "scripts/lib_task_status.py",
+                    # E2 (t008): 最初の呼び出し元 = pull (reserve / start / G1 の fail)。cutover = ユーザー承認の PR。
+                    # E3 (done 等) / E4 (reset / retire) は plan.sh の別のコマンドが増えるだけで、このファイルの集合は変わらない。
+                    "scripts/plan.sh"}
 
 SCAN_DIRS = ("scripts", "hooks", "agents", "config")
 SCAN_FILES = ("crewvia",)
@@ -69,3 +75,16 @@ def test_the_mentions_in_the_allowed_files_are_not_imports():
         for line in (REPO / rel).read_text().splitlines():
             if NAME in line:
                 assert not form.search(line), (rel, line)
+
+
+#: plan.sh が Controller から呼んでよい操作 (E2 = pull だけ。E3 で done / fail / needs-director / ready-for-verification /
+#: verify-result、E4 で reset / retire が足される。足すのは cutover = ユーザー承認の PR)。
+PLAN_SH_ALLOWED_OPERATIONS = {"reserve_task", "start_execution", "fail_execution", "Caller"}
+
+
+def test_plan_sh_calls_only_the_pull_operations_of_the_controller():
+    text = (REPO / "scripts" / "plan.sh").read_text()
+    used = set(re.findall(r"_CONTROLLER\.(\w+)", text))
+    assert used == PLAN_SH_ALLOWED_OPERATIONS, (
+        f"plan.sh が呼ぶ Controller の操作が変わった (cutover か確認。ユーザー承認が要る): {sorted(used)}")
+    # 他の module (dispatcher / hooks / デーモン) は import しない (上の 1 本目が名前の出現で固定)

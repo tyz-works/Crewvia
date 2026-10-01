@@ -203,7 +203,8 @@ fi
 #     いずれも main checkout そのものではないので対象外)
 #   - $CREWVIA_REPO の外 (target project 等、無関係のパス)
 # 注意: cwd は見ない。「TARGET_DIR 未設定なら plan.sh pull は worktree を返すか、
-# 失敗で exit 1 して JSON を出さない (card は needs_director。GIT-05)」という不変条件があるため、TASK_ID 解決済み + TARGET_DIR
+# 失敗で exit 1 して JSON を出さない (card は needs_director。GIT-05。01c E2 から、JSON を出す前に試行を start
+# (reserved → running) するので、start の CAS が外れた pull も exit 1・JSON なし)」という不変条件があるため、TASK_ID 解決済み + TARGET_DIR
 # 未設定なのに worktree の外を指すパスを編集しようとしている時点で、cwd が実際どこに
 # あるかによらず既に異常な状態 — パスだけで判定して構わない（むしろ「cwd も main に
 # 迷い込んでいる」というより深刻なケースも同時に拾える）。

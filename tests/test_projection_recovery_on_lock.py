@@ -435,8 +435,11 @@ def test_concurrent_recovery_never_rewrites_a_correct_in_flight_transaction(tmp_
     assert problems(box) == []
     repaired = [r for r in box.audit_rows() if str(r["result"]).startswith("repaired:")]
     assert repaired == [], f"回復が進行中の正しい遷移を修復した: {repaired}"
-    # 陽性対照: 回復の入口は本当に走っている (どの pull / done も名指しの card で回復を通る。監査ログの本体の行は 24)
-    assert len([r for r in box.audit_rows() if r["op"] in ("pull", "done")]) == len(workers) * per_worker * 2
+    # 陽性対照: 回復の入口は本当に走っている (どの pull / done も名指しの card で回復を通る)。監査ログの本体の行は
+    # pull が 2 行 (01c E2: reserve の行と start の行。今までは 1 行) + done が 1 行 = 1 回の pull・done の組で 3 行
+    ops = [r["op"] for r in box.audit_rows() if r["op"] in ("pull", "done")]
+    assert ops.count("pull") == len(workers) * per_worker * 2 and ops.count("done") == len(workers) * per_worker
+    assert len(ops) == len(workers) * per_worker * 3
 
 
 def test_recovery_does_not_remove_a_successors_assignment(tmp_path):

@@ -124,8 +124,23 @@ root の `CLAUDE.md` から移した、テスト専用の規則。設計と経�
   並行 `test_task_controller_concurrency.py`（**独立プロセス** `task_controller_worker.py`・実 flock・2〜4 プロセス × 20 回）・
   crash 注入 `test_task_controller_crash_injection.py`（`FAULT_HOOK` の k 番目で fork した子が SIGKILL。点の数の下限を assert。
   回復後に `diagnose` が空 — DETACHED の報告は Director が閉じるまで残るので、その 2 種だけ除く）。helper は `task_controller_helpers.py`。
-- 呼び出し元ゼロの固定は `test_task_controller_has_no_callers_yet.py`（名前の出現。E2 で許可表を広げる）。
+- 呼び出し元の集合の固定は `test_task_controller_has_no_callers_yet.py`（名前の出現 + plan.sh が呼ぶ操作 `PLAN_SH_ALLOWED_OPERATIONS`。E2 で plan.sh の pull を足した。
+  E3 / E4 で広げるのは cutover = ユーザー承認の PR）。
 - **長い反復は `timeout` を付け、最初は 2 回で形を確かめてから 20 回**（crash 注入は全体で約 3 分。background で待たない）。
+
+## pull の Controller 化（01c E2 / t008）のテスト
+
+- `tests/test_pull_execution_e2.py`（helper は `tests/pull_execution_helpers.py` の `Box`）: 隔離 plan.sh + 隔離 queue + **途中で止められる / 失敗させられる / 別のコマンドを差し込める
+  stub の `git-helpers.sh`**（`<root>/hold/<task>.{enabled,reached,go,cmd,fail}` の合図ファイルで操る。本番のコードにテスト用のフックを足さない）。
+  pull の途中で落とす地点は `fork_start` / `fork_run`（fork した子で**本物の `cmd_pull`** を呼び、名前空間の協力者を差し替えて自分に SIGKILL。スレッドと fork を混ぜない）。
+  並行は独立プロセス（`Box.popen` は自分のセッション = `kill_group` で木ごと殺せる）・実 flock。**旧形式の書き手**は今の `plan.sh update --reset`（E4 まで execution の欄を触らない）。
+- 互換性は `test_plan_sh_compat_s3.py`（E2 が足した出力だけを取り除いて cutover 前の golden と比べる。取り除く物が実在することも固定）。
+- `tests/test_pull_execution_e2_rollback.py`: 旧コード（E2 の前の commit `505d16b` の scripts/ を取り出したもの）の plan.sh を同じ queue に打つ。git の履歴が無い浅い clone では skip（QA が d887acf で通す）。
+- 赤の実証: `python3 tests/red_proof_e2_pull.py`（10 変異・約 10 分。赤は「狙ったテスト名の FAILED」だけ。置換元がちょうど 1 回でなければ BROKEN）。
+- **fixture の設計の罠**: 準備ロックを握った pull の stub は `.enabled` を作ってから `.go` を待つ。欠陥版（準備ロックを外す）では 2 本目も同じ stub で待つので、
+  待ちの上限（20 秒）を持たせてある（無限に待たない）。
+- **Bash の heredoc / `-c` に「git」と「archive」を並べると** `~/.claude/hooks/memory-save-gate.sh` がミッション完了系と誤認してブロックする
+  （memory `memory-save-gate-substring-match`）。該当する文書・テストの編集は Edit / Write ツールで行う。
 
 ## 子プロセスを残さない（`tests/leaked_descendants.py` / `tests/proc_group.py`）
 

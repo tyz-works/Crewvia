@@ -1816,7 +1816,9 @@ def diagnose(queue_dir, scope=None):
 def locked_update_json(path, lock_path, fn, *, on_unreadable='raise'):
     """専用ロック + 読み直し + 原子的書き込み。`fn(dict) -> dict`。ファイルが無い (ENOENT) ときだけ
     `{}` から始める。読めない・JSON でないは `StoreReadError` (空に潰さない)。
-    queue/.lock を握ったままこれを呼ばない (ロックの順序: queue/.lock が最も外側)。
+    queue/.lock を握ったままこれを呼ばない (ロックの順序: 準備ロック (`acquire_prepare_lock`。pull の準備を task ごとに
+    直列化する 1 段) → queue/.lock → この小さな共有ファイルのロック。queue/.lock は S5 の小さな共有ファイルより外側で、
+    準備ロックはその更に外側)。
 
     `on_unreadable='reset'` は、再生成できる**キャッシュ**専用 (taskvia map: 次の同期が冪等に埋める)。
     読めない・壊れているときに空から作り直す —— 正本には使わない (既定の 'raise' が、空に潰さない側)。"""
@@ -1861,3 +1863,66 @@ def locked_update_json(path, lock_path, fn, *, on_unreadable='raise'):
             os.close(fd)
         except OSError:
             pass
+
+
+# ---------------------------------------------------------------------------
+# 準備ロック (task ごと。pull の「ロック外の準備」を直列化する。execution.md §6.1 / 01c E2)
+# ---------------------------------------------------------------------------
+
+class PrepareLock:
+    """`queue/missions/<slug>/executions/<tid>.prepare.lock` の flock (LOCK_EX | LOCK_NB)。
+
+    持ち主のプロセスが死ねば kernel が外す (ファイルの有無は意味を持たない。消さない — archive が dir ごと動かす)。
+    `release()` は冪等。with でも使える。"""
+
+    def __init__(self, fd, path):
+        self._fd = fd
+        self.path = path
+
+    def release(self):
+        fd, self._fd = self._fd, None
+        if fd is None:
+            return
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.release()
+        return False
+
+
+def acquire_prepare_lock(queue_dir, slug, tid):
+    """同じ task の pull の準備 (Taskvia・worktree・`.crewvia-env`) を直列化する準備ロックを**待たずに**取る。
+
+    取れなければ `LockBusy` (同じ task の pull が準備中)。何も書かない (ロックファイルを作るだけ)。
+    **`queue/.lock` を握ったまま取らない** (ロックの順序: 準備ロックは `queue/.lock` の外側の 1 段。
+    このスレッドが `queue/.lock` を握っていれば `NestedTransaction`)。LOCK_NB なので、仮に逆順で取るコードが
+    入っても待ちの輪にはならず `LockBusy` になる。"""
+    queue_dir = os.fspath(queue_dir)
+    key = _lock_key(os.path.join(queue_dir, '.lock'))
+    with _HELD_GUARD:
+        if _HELD.get(key) == threading.get_ident():
+            raise NestedTransaction("準備ロックは queue/.lock を握ったまま取りません (ロックの順序)")
+    path = os.path.join(queue_dir, 'missions', _check_slug(slug), 'executions', f"{_check_tid(tid)}.prepare.lock")
+    _ensure_dir(os.path.dirname(path), path)
+    try:
+        fd = _open_lock_file(path)
+    except OSError as e:
+        raise LockFailed(f"cannot open prepare lock {path}: {e}") from e
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as e:
+        os.close(fd)
+        if e.errno in (_errno.EWOULDBLOCK, _errno.EAGAIN):
+            raise LockBusy(f"prepare lock {path} is held by another pull") from e
+        raise LockFailed(f"cannot lock {path}: {e}") from e
+    return PrepareLock(fd, path)

@@ -39,7 +39,7 @@ X = h.xid(1)
 
 # 全引数の表に載せた名前 (載っていない引数が増えたら赤)
 _COVERED = {
-    "reserve_task": {"txn", "slug", "tid", "agent", "now", "id_factory"},
+    "reserve_task": {"txn", "slug", "tid", "agent", "now", "id_factory", "foreign_slot_checked"},
     "start_execution": {"txn", "slug", "tid", "execution_id", "git_context", "now"},
     "complete_execution": {"txn", "slug", "tid", "caller", "to_status", "meta_updates", "body", "now"},
     "fail_execution": {"txn", "slug", "tid", "caller", "failure_code", "to_status", "meta_updates", "body", "now"},

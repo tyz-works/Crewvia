@@ -140,10 +140,12 @@ def test_default_pull_cuts_from_origin_main_and_env_file_has_no_extra_lines(repo
     assert json.loads(p.stdout)["worktree_path"] == str(repo.wt)
     assert head_of(repo.wt) == git(repo.root, "rev-parse", "origin/main").stdout.strip()
     assert git(repo.wt, "branch", "--show-current").stdout.strip() == f"task/{MISSION}/t001-task-t001"
-    # §5: PR base は env で渡さない。.crewvia-env は G3 の前と同じ 3 行だけ (追加の行は無い)。
+    # §5: PR base は env で渡さない。.crewvia-env は G3 の前と同じ 3 行 + 01c E2 が足した任意の 1 行
+    # (`CREWVIA_EXECUTION_ID`。末尾。追加の行だけで、前の 3 行は 1 バイトも変わらない)。
     lines = (repo.wt / ".crewvia-env").read_text().splitlines()
     assert [l.split("=")[0] for l in lines] == [
-        "export CREWVIA_MISSION_SLUG", "export CREWVIA_TASK_ID", "export CREWVIA_TASK_SLUG"], lines
+        "export CREWVIA_MISSION_SLUG", "export CREWVIA_TASK_ID", "export CREWVIA_TASK_SLUG",
+        "export CREWVIA_EXECUTION_ID"], lines
     assert "PR_BASE" not in (repo.wt / ".crewvia-env").read_text()
 
 

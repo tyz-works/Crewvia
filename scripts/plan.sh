@@ -437,6 +437,10 @@ _STORE = _import_scripts_module('lib_state_store')
 # task の branch・worktree path・base・PR base を決めるのは lib_git_policy.py の 1 か所 (vNext 01b G3。
 # knowledge/git-policy.md §3)。plan.sh は `pr-base` で PR base を読むだけで、判断の式を持たない。
 _GIT_POLICY = _import_scripts_module('lib_git_policy')
+# 試行 (Execution) の予約・開始・終了は lib_task_controller.py の 1 か所 (vNext 01c。knowledge/execution.md)。
+# 呼び出し元は **pull だけ** (E2)。他のコマンドを移すのは E3 / E4 (どれも cutover = ユーザー承認の PR)。
+_EXEC = _import_scripts_module('lib_execution')
+_CONTROLLER = _import_scripts_module('lib_task_controller')
 #: task-graph の生成物 (registry/task-graph/tasks.json。queue の外) を書く関数。plan.sh 自身は
 #: 書き込みの実装を持たない (同じ関数を別名で呼ぶだけ)。tests/task_graph_publisher_harness.py が
 #: この名前を差し替える。
@@ -2003,14 +2007,14 @@ def assignment_identity_path(agent):
     return assignment_path(agent) + IDENTITY_SUFFIX
 
 
-def publish_assignment(agent, mission, task_id, started_at):
+def publish_assignment(agent, mission, task_id, started_at, execution_id=None):
     """<agent> の assignment とその実行アイデンティティを公開する。
 
     呼び出し側はキューロックを保持していること (`with_lock()` の中)。サイドカーを先に
     書くのは、「存在 = busy」を意味する本体が、世代の分からない状態で一瞬でも観測され
     ないようにするため (順序は lib_state_store.Txn.publish_assignment が持つ)。
     """
-    _txn().publish_assignment(agent, mission, task_id, started_at)
+    _txn().publish_assignment(agent, mission, task_id, started_at, execution_id=execution_id)
     _AUDIT_OTHER_ROWS.append((mission, task_id))
 
 
@@ -3201,13 +3205,169 @@ def cmd_pr_base(args):
     print(f"{_GIT_POLICY.REMOTE}/{value}" if opts.get('--diff-ref') else value)
 
 
-def _pull_worktree_failed(slug, task_id, agent, generation, category, detail):
+#: pull の domain error → exit code (execution.md §4.4)。exit 2 は pull では「タスクなし (idle)」の意味なので、
+#: Controller のどのコードも 2 にしない (memory pull-exit-2-is-idle-usage-errors-must-be-1)。照合の 3 つだけ 3。
+_PULL_EXECUTION_EXIT_CODES = frozenset({
+    _EXEC.EXECUTION_NOT_FOUND, _EXEC.EXECUTION_NOT_CURRENT, _EXEC.EXECUTION_ALREADY_TERMINAL})
+
+
+def _error_code_line(code):
+    """機械が読む経路: stderr の**最後の行**に固定形式で出す (文言は変えてよいが、この 1 行の形は変えない)。"""
+    return f"[plan.sh] error_code={code}"
+
+
+def _pull_controller_die(e):
+    """Controller の domain error を pull の終わり方に写す。固定コード + 位置・識別子だけ (card の中身は出さない)。"""
+    code = 3 if e.code in _PULL_EXECUTION_EXIT_CODES else 1
+    die(f"[plan.sh pull] {e.message}\n{_error_code_line(e.code)}", code)
+
+
+def _pull_cas_ok(meta, agent, generation, execution_id):
+    """card が**この pull の予約のまま**か (compare-and-set の条件)。
+
+    新しい欄 (`current_execution_id == X` かつ `execution_status == reserved`) **と** 今までの欄 (in_progress・
+    同じ worker・同じ `started_at`) の AND。移行中 (E4b まで) は旧形式の書き手 (今の `update --reset`・rollback 中の
+    旧コード) が status / worker / started_at だけを動かし、execution の欄を更新しない。新しい欄だけで見ると、
+    解放済みの予約 (pending・worker null) に `X / reserved` が残ったまま CAS が通り、Director の reset を上書きする
+    (execution.md §6 の Codex 3 巡目 P1)。"""
+    return (meta.get('status') == 'in_progress'
+            and (meta.get('worker') or '') == (agent or '')
+            and meta.get('started_at') == generation
+            and meta.get('current_execution_id') == execution_id
+            and meta.get('execution_status') == _EXEC.RESERVED)
+
+
+def _is_reserved_by(meta, agent):
+    """card が `agent` の**予約だけ済んだ** (start していない) 試行か — 再開 (N8) の対象。
+
+    in_progress・worker が自分・試行が ACTIVE かつ `reserved`。`running` は再開しない (JSON が渡った可能性があり、
+    同じ名前の別プロセスが作業中かもしれない。出口は Director の `update --reset` / 退役)。DETACHED (旧コードが
+    card を取り直した・手放した) は再開しない。試行の欄が壊れた card は対象にしない (読めない = 推測しない)。"""
+    if not agent or meta.get('status') != 'in_progress' or (meta.get('worker') or '') != agent:
+        return False
+    if _EXEC.fields_problem(meta) is not None:
+        return False
+    return (_EXEC.attempt_view(meta, _TASK_STATUS.ASSIGNMENT_HOLDING_STATUSES) == _EXEC.ACTIVE
+            and meta.get('execution_status') == _EXEC.RESERVED)
+
+
+def _reserved_cards_of(agent, slugs):
+    """`agent` の予約済み (start 前) の card を `[(slug, meta, body)]` で。`agent_busy_elsewhere` と同じ範囲
+    (`mission_search_order` の slugs)。キューロックの中で呼ぶ。"""
+    found = []
+    for slug in slugs:
+        if not os.path.exists(mission_dir(slug)):
+            continue
+        for meta, body in list_tasks(slug, quiet=True):
+            if meta.get('id') and _is_reserved_by(meta, agent):
+                found.append((slug, meta, body))
+    return found
+
+
+def _resume_reserved(slug, meta, body, agent, slugs):
+    """自分の予約の再開 (N8)。**新しい試行を作らない** (attempt を増やさない)。キューロックの中で呼ぶ。
+
+    やるのは枠 (assignment / identity) を card に合わせることだけ: 予約の途中 (card の後・枠の前) で死ぬと、
+    card は新しい試行 Y・identity は前の試行 X のままになりうる。R-1 は枠が**無い**ときだけ作り直すので、
+    食い違ったままの identity は `reported:generation_mismatch` のまま残る (E1 QA の O1)。**card が正本・枠は
+    projection** なので、card の持ち主 (自分) が card の試行 Y で公開し直す (reserve が自分の古い枠を上書きするのと
+    同じ書き込み)。別の task を指す枠・読めない枠は上書きしない (`agent_busy_elsewhere` が拒否する)。"""
+    task_id = meta['id']
+    busy = agent_busy_elsewhere(agent, slug, task_id, slugs)
+    if busy:
+        die(f"{agent} は既に別の task を持っています: {busy}。"
+            f"task '{task_id}' は再開しません (assignment を上書きせず何も書いていません)。",
+            PRECONDITION_UNMET)
+    execution_id = meta['current_execution_id']
+    verdict = classify_assignment_for_execution(agent, slug, task_id, meta.get('started_at'), execution_id)
+    if verdict in (ASSIGN_ABSENT, ASSIGN_SUCCESSOR):
+        publish_assignment(agent, slug, task_id, meta.get('started_at'), execution_id=execution_id)
+    elif verdict != ASSIGN_MINE:
+        die(f"{agent} の枠を {slug}/{task_id} のものと確かめられません ({verdict})。task '{task_id}' は再開しません "
+            f"(何も書いていません)。", PRECONDITION_UNMET)
+
+
+def classify_assignment_for_execution(agent, mission, task_id, generation, execution_id):
+    """`classify_assignment` の、試行 (execution_id) を名指しする版。identity に ID があれば ID で、無ければ世代で比べる
+    (execution.md §2.2。判定は lib_state_store の 1 か所)。"""
+    return _txn().classify_assignment(agent, mission, task_id, generation, execution_id=execution_id)
+
+
+def _pull_result(slug, meta, body):
+    """pull が stdout に出す JSON の元 (今までの欄。`task_slug` / `worktree_path` / `execution_id` / `attempt` は後で足す)。"""
+    desc, _result = parse_task_body(body)
+    return {
+        'mission': slug,
+        'id': meta['id'],
+        'title': meta['title'],
+        'description': desc,
+        'skills': meta.get('skills') or [],
+        'priority': meta.get('priority', 'medium'),
+        'blocked_by': meta.get('blocked_by') or [],
+        'target_dir': meta.get('target_dir'),  # None for crewvia-local tasks
+    }
+
+
+def _pull_start(slug, task_id, agent, generation, execution_id, git_context):
+    """pull の 2 つ目のロック: reserved → running (start)。card が**この pull の予約のまま** (`_pull_cas_ok`) のときだけ。
+    戻り値: `(started, why)`。外れたら何も書かない (JSON を出させない)。"""
+    outcome = {'started': False, 'why': ''}
+
+    def _do():
+        recover_before(cards=[(slug, task_id)], include_caller=False)
+        if agent:
+            _txn().actor = agent
+        if not os.path.exists(task_path(slug, task_id)):
+            outcome['why'] = 'card が無くなっています'
+            return
+        meta, _body = load_task(slug, task_id)
+        if not _pull_cas_ok(meta, agent, generation, execution_id):
+            outcome['why'] = (f"card がこの pull の予約ではなくなっています "
+                              f"(status={meta.get('status')}, worker={meta.get('worker')})")
+            return
+        try:
+            result = _CONTROLLER.start_execution(_txn(), slug, task_id, execution_id, git_context)
+        except _EXEC.ControllerError as e:
+            outcome['why'] = f"Controller が拒否しました ({e.code})"
+            return
+        if result.idempotent:
+            outcome['why'] = '試行は既に running です (別の pull が start 済み)'
+            return
+        outcome['started'] = True
+
+    with_lock(_do)
+    return outcome['started'], outcome['why']
+
+
+def _pull_git_context(slug, task_id, task_slug, worktree_path):
+    """record の `git` に入れる値 (記録だけ。判断には使わない)。決められない欄は入れない。branch / PR base は Resolver から、
+    `head_at_start` は worktree の HEAD (W2 で前の試行の commit が残った worktree を再利用したとき、どの commit から
+    始めた試行かを後から追う)。base は観測 (`git show-ref`) が要るので記録しない。"""
+    ctx = {'worktree': worktree_path}
+    try:
+        policy = _GIT_POLICY.load_git_policy(slug, queue_dir=QUEUE_DIR)
+        ctx['branch'] = _GIT_POLICY.task_branch(policy, mission_slug=slug, task_id=task_id, task_slug=task_slug)
+        ctx['pr_base'] = _GIT_POLICY.pr_base(policy)
+    except _GIT_POLICY.GitPolicyError:
+        pass        # worktree は作れている (= Resolver は通った)。記録の欄が欠けるだけ
+    try:
+        head = subprocess.run(['git', '-C', worktree_path, 'rev-parse', 'HEAD'], capture_output=True, text=True,
+                              timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return ctx          # git が無い・止まった: 記録の欄が欠けるだけ (start を止めない。判断に使わない欄)
+    if head.returncode == 0 and head.stdout.strip():
+        ctx['head_at_start'] = head.stdout.strip()
+    return ctx
+
+
+def _pull_worktree_failed(slug, task_id, agent, generation, execution_id, category, detail):
     """worktree を作れなかった pull の出口 (GIT-05)。card を `needs_director` に送って exit 1 する。
 
     この関数は戻らない。stdout に JSON を出さない (Worker に「取れなかった」以外の読み方をさせない)。
-    2 つ目のロックで、card が**この pull が書いた予約のまま** (in_progress・同じ worker・同じ started_at) の
-    ときだけ書く (compare-and-set。呼び出し元の照合 = 01c ではない)。その間に Director が reset した・
-    別の Worker が取った場合は何も書かない。exit 3 (何も書いていない約束) と exit 2 (idle) は使わない。
+    2 つ目のロックで、card が**この pull が書いた予約のまま** (`_pull_cas_ok`) のときだけ書く (compare-and-set)。
+    書くときは試行を `failed` / `WORKSPACE_CREATE_FAILED` で閉じる (Controller の `fail_execution`)。その間に
+    Director が reset した・別の Worker が取った場合は何も書かない。exit 3 (何も書いていない約束) と
+    exit 2 (idle) は使わない。
     """
     reason = f"worktree を作れませんでした ({category}): {detail}"
     if category == 'P1':
@@ -3223,13 +3383,24 @@ def _pull_worktree_failed(slug, task_id, agent, generation, category, detail):
             outcome['why'] = 'card が無くなっています'
             return
         meta, body = load_task(slug, task_id)
-        if (meta.get('status') != 'in_progress'
-                or (meta.get('worker') or '') != (agent or '')
-                or meta.get('started_at') != generation):
+        if not _pull_cas_ok(meta, agent, generation, execution_id):
             outcome['why'] = (f"card がこの pull の予約ではなくなっています "
                               f"(status={meta.get('status')}, worker={meta.get('worker')})")
             return
-        transition_to_needs_director(slug, task_id, meta, body, reason, agent)
+        # `transition_to_needs_director` (needs-director コマンドとの共通の本体) と同じ書き込みを、試行の終端と
+        # 同じ card の書き込みに入れる: needs_director_reason と長文の詳細は同じ card に、枠の撤去は Controller が行う。
+        summary, full_text = split_long_freeform(reason)
+        new_body = (body if full_text is None
+                    else body.rstrip() + '\n\n## Needs-Director 詳細\n' + full_text.strip() + '\n')
+        if agent:
+            _txn().actor = agent
+        try:
+            _CONTROLLER.fail_execution(
+                _txn(), slug, task_id, _CONTROLLER.Caller(execution_id, 'flag', agent), _EXEC.WORKSPACE_CREATE_FAILED,
+                to_status='needs_director', meta_updates={'needs_director_reason': summary}, body=new_body)
+        except _EXEC.ControllerError as e:
+            outcome['why'] = f"Controller が拒否しました ({e.code})"
+            return
         outcome['wrote'] = True
 
     with_lock(_do)
@@ -3278,7 +3449,8 @@ def cmd_pull(args):
         effective_target = os.path.abspath(env_td) if env_td else None
 
     chosen_holder = [None]
-    started_holder = [None]   # この pull が書いた started_at (worktree 失敗時の compare-and-set 用)
+    started_holder = [None]   # この pull が書いた (再開では card の) started_at (start / worktree 失敗時の compare-and-set 用)
+    execution_holder = [None]   # この pull が予約した (再開では card の) 試行: {'id', 'attempt', 'task_slug'}
     diag = {'reason': None, 'detail': ''}
 
     def _do():
@@ -3330,6 +3502,20 @@ def cmd_pull(args):
             named += [(s, specific_task) for s in slugs if os.path.exists(task_path(s, specific_task))]
         recover_before(cards=named, agents=(agent,) if agent else ())
 
+        # 再開 (N8。execution.md §6): この Worker が**予約だけして start に進めなかった**試行 (pull が準備中に死んだ)
+        # を、新しい試行にせず同じ task・同じ試行のまま続ける。`--task` なしの pull は候補選びの前に探す
+        # (`--task` の pull は下の in_progress 分岐が同じ判定をする)。2 枚以上は決められないので拒否する。
+        resumable = None
+        if agent and not specific_task:
+            mine = _reserved_cards_of(agent, slugs)
+            if len(mine) > 1:
+                die(f"{agent} は予約済みの task を複数持っています: "
+                    f"{[f"{s}/{m.get('id')}" for s, m, _b in mine]}。"
+                    f"どれを再開するか決められません (何も書いていません)。Director が `update --reset` で整理してください。",
+                    PRECONDITION_UNMET)
+            if mine and (mine[0][1].get('target_dir') or None) == effective_target:
+                resumable = mine[0]
+
         # Diagnostic counters per slug
         scanned = 0
         pending_count = 0
@@ -3360,10 +3546,14 @@ def cmd_pull(args):
                     if st in TERMINAL_STATUSES:
                         die(f"task '{specific_task}' is already {st} (use plan.sh status to review)")
                     if st == 'in_progress':
+                        if agent and _is_reserved_by(meta, agent) and (meta.get('target_dir') or None) == effective_target:
+                            resumable = (slug, meta, body)      # 自分の予約の再開 (N8。下で枠を整えて準備に進む)
+                            break
                         die(
                             f"task '{specific_task}' is already in_progress "
                             f"(assigned to {meta.get('worker', '?')}). "
-                            f"If the worker crashed, reset the task status manually."
+                            f"If the worker crashed, reset the task status manually.\n"
+                            f"{_error_code_line(_EXEC.TASK_ALREADY_RESERVED)}"
                         )
                     if st != 'pending':
                         die(f"task '{specific_task}' has unexpected status: {st}")
@@ -3473,6 +3663,16 @@ def cmd_pull(args):
                 file=sys.stderr,
             )
 
+        if resumable is not None:
+            slug, meta, body = resumable
+            _resume_reserved(slug, meta, body, agent, slugs)
+            started_holder[0] = meta.get('started_at')
+            execution_holder[0] = {
+                'id': meta['current_execution_id'], 'attempt': meta.get('execution_count'),
+                'task_slug': meta.get('task_slug') or _EXEC.slugify_title(meta.get('title') or '', meta['id'])}
+            chosen_holder[0] = _pull_result(slug, meta, body)
+            return
+
         if not candidates:
             if specific_task:
                 die(f"task '{specific_task}' not found in mission(s): {slugs}")
@@ -3535,30 +3735,20 @@ def cmd_pull(args):
                     f"task '{meta['id']}' は取りません (assignment を上書きせず何も書いていません)。"
                     f"先の task を done / needs-director で手放してから取り直してください。",
                     PRECONDITION_UNMET)
-        meta['status'] = 'in_progress'
-        meta['worker'] = agent or None
-        meta['started_at'] = now_generation()
-        started_holder[0] = meta['started_at']
-        save_task(slug, meta['id'], meta, body)
-
-        # assignment の公開は card の書き換えと同じトランザクションで行う。
-        # ロックの外に出すと、(a) card が in_progress なのに assignment が
-        # 無い瞬間が生まれて dispatcher に idle と誤認され、(b) 後始末側の
-        # 「判定してから消す」と直列化できなくなる。
-        if agent:
-            publish_assignment(agent, slug, meta['id'], meta['started_at'])
-
-        desc, _result = parse_task_body(body)
-        chosen_holder[0] = {
-            'mission': slug,
-            'id': meta['id'],
-            'title': meta['title'],
-            'description': desc,
-            'skills': meta.get('skills') or [],
-            'priority': meta.get('priority', 'medium'),
-            'blocked_by': meta.get('blocked_by') or [],
-            'target_dir': meta.get('target_dir'),  # None for crewvia-local tasks
-        }
+        # 予約 = pending → in_progress / (なし or terminal) → reserved を Controller 1 か所で行う。card がコミット点 →
+        # record → identity → 枠の順で、**card の書き換えと同じトランザクション**の中 (assignment の公開をロックの外に
+        # 出すと、(a) card が in_progress なのに assignment が無い瞬間が生まれて dispatcher に idle と誤認され、
+        # (b) 後始末側の「判定してから消す」と直列化できない)。`started_at` は今どおり `now_generation()` (watchdog の
+        # idle 時計の起点。時刻形であることは Controller が確かめる。execution.md §0)。
+        try:
+            # `agent_busy_elsewhere` を通した後なので、別の task を指す枠は孤児 (上書きしてよい。読めない枠は上で拒否済み)
+            ctx = _CONTROLLER.reserve_task(_txn(), slug, meta['id'], agent or None, now=now_generation(),
+                                           foreign_slot_checked=True)
+        except _EXEC.ControllerError as e:
+            _pull_controller_die(e)
+        started_holder[0] = ctx.started_at
+        execution_holder[0] = {'id': ctx.execution_id, 'attempt': ctx.attempt, 'task_slug': ctx.task_slug}
+        chosen_holder[0] = _pull_result(slug, meta, body)
 
     # 退役予約で断られたとき、それが「死んだ前任の後始末待ち」と証明できれば、
     # 後始末が終わるのを待って**判定からやり直す** (t021)。待つのはロックの外:
@@ -3600,20 +3790,33 @@ def cmd_pull(args):
     # assignment は _do() の中 (キューロック内) で公開済み。ここから先の
     # Taskvia sync / worktree 作成は subprocess や HTTP を伴うので、ロックを
     # 抱えたまま実行してはいけない。
+    task_id = chosen_holder[0]['id']
+    mission_slug = chosen_holder[0]['mission']
+    execution_id = execution_holder[0]['id']
+
+    # 準備ロック (task ごと・待たない。execution.md §6.1): 同じ予約の pull が**準備中**なら、この pull は何も書かず・
+    # worktree にも `.crewvia-env` にも触れずに引き返す (2 本とも同じ branch / path に `git worktree add` して、
+    # 失敗側が成功側の start より先に G1 を書き両方失敗する、を作らない)。queue/.lock の**外側** (ロック 1 は外した後)。
+    # 持ち主が死ねば kernel が外すので、準備中に殺された pull の後の再 pull は取れて再開できる。
+    try:
+        prepare_lock = _STORE.acquire_prepare_lock(QUEUE_DIR, mission_slug, task_id)
+    except _STORE.LockBusy:
+        die(f"[plan.sh pull] {mission_slug}/{task_id}: 同じ予約の pull が進行中です (何も書いていません)。"
+            f"終わるまで待ってから取り直してください。\n{_error_code_line(_EXEC.TASK_ALREADY_RESERVED)}")
+    except _STORE.StoreError as e:
+        die(f"[plan.sh pull] {mission_slug}/{task_id}: 準備ロックを取れません: {e}")
+    # 取れた後に card を読み直す (ロックなしの読み)。先の pull が start 済み・reset 済みなら無駄な worktree 操作をしない。
+    # この読みは早期の打ち切りで、正しさは start の CAS が持つ (読みと CAS の間に変わっても CAS が外れて何も書かない)。
+    if not _pull_cas_ok(load_task(mission_slug, task_id)[0], agent, started_holder[0], execution_id):
+        die(f"[plan.sh pull] {mission_slug}/{task_id}: この pull の予約ではなくなっています (別の pull が進めた・"
+            f"reset された)。何も書かず、worktree にも触れていません。\n{_error_code_line(_EXEC.TASK_ALREADY_RESERVED)}")
+
     ok = taskvia_sync_pull(chosen_holder[0]['mission'], chosen_holder[0]['id'], agent)
     _print_sync_summary(ok)
 
-    # Derive a URL-safe task slug from the title for worktree naming
-    def _slugify(title, fallback):
-        ascii_only = re.sub(r'[^\x00-\x7F]+', ' ', title)
-        normalized = re.sub(r'[^a-zA-Z0-9]+', ' ', ascii_only)
-        parts = [p.lower() for p in normalized.split() if p]
-        slug = '-'.join(parts)[:40].rstrip('-')
-        return slug or fallback
-
-    task_id = chosen_holder[0]['id']
-    mission_slug = chosen_holder[0]['mission']
-    task_slug = _slugify(chosen_holder[0]['title'], task_id)
+    # task_slug は最初の reserve で card に**固定**した値 (title を変えても branch / worktree は変わらない。
+    # git-policy.md §10 の 1)。
+    task_slug = execution_holder[0]['task_slug']
     worktree_path = None
     task_target_dir = chosen_holder[0].get('target_dir')
 
@@ -3658,6 +3861,8 @@ def cmd_pull(args):
                         f'export CREWVIA_MISSION_SLUG={shlex.quote(mission_slug)}\n'
                         f'export CREWVIA_TASK_ID={shlex.quote(task_id)}\n'
                         f'export CREWVIA_TASK_SLUG={shlex.quote(task_slug)}\n'
+                        # 任意 (必須にしない): 読む側は無くても動く。名乗り (照合の入力) であって card には書かない。
+                        f'export CREWVIA_EXECUTION_ID={shlex.quote(execution_id)}\n'
                     )
                     try:
                         _STORE.atomic_write_text(env_file, env_text)
@@ -3671,10 +3876,23 @@ def cmd_pull(args):
                             wt_failure = ('N7', f'{env_file} を書けません ({_e})')
 
     if wt_failure is not None:
-        _pull_worktree_failed(mission_slug, task_id, agent, started_holder[0], *wt_failure)
+        _pull_worktree_failed(mission_slug, task_id, agent, started_holder[0], execution_id, *wt_failure)
+
+    # start (reserved → running) は JSON を出す**前**にコミットする: reserved の試行では誰も作業を始めていない
+    # (だから同じ Worker の再 pull が同じ試行を再開できる) という不変条件。CAS が外れたら何も書かず JSON も出さない。
+    git_context = (_pull_git_context(mission_slug, task_id, task_slug, worktree_path)
+                   if worktree_path is not None else None)
+    started, why = _pull_start(mission_slug, task_id, agent, started_holder[0], execution_id, git_context)
+    if not started:
+        die(f"[plan.sh pull] {mission_slug}/{task_id}: 開始 (start) できませんでした: {why}。書き換えていません。"
+            f"JSON を出さないので、この pull の結果で作業を始めてはいけません。\n"
+            f"{_error_code_line(_EXEC.TASK_ALREADY_RESERVED)}")
+    prepare_lock.release()
 
     chosen_holder[0]['task_slug'] = task_slug
     chosen_holder[0]['worktree_path'] = worktree_path
+    chosen_holder[0]['execution_id'] = execution_id
+    chosen_holder[0]['attempt'] = execution_holder[0]['attempt']
 
     print(json.dumps(chosen_holder[0], ensure_ascii=False))
 

@@ -138,14 +138,13 @@ def test_custom_task_branch_pattern():
 # ---------------------------------------------------------------------------
 
 def _load_slugify():
-    """plan.sh の `_slugify` を本文から取り出す (写しを持たない。変わったらこのテストが読み直す)。"""
+    """pull が task_slug を作る式。01c E2 で plan.sh の `_slugify` のコピーを消し、式の置き場は
+    `lib_execution.slugify_title` の 1 か所になった (reserve が card に固定する)。plan.sh が pull の中で呼ぶのも同じ関数。"""
     src = (SCRIPTS / "plan.sh").read_text()
-    m = re.search(r"^( +)def _slugify\(title, fallback\):\n(?:\1 .*\n)+", src, re.M)
-    assert m, "plan.sh の _slugify が見つからない"
-    assert len(re.findall(r"def _slugify\(", src)) == 1
-    ns: dict = {"re": re}
-    exec(textwrap.dedent(m.group(0)), ns)  # noqa: S102 — plan.sh の本文そのもの
-    return ns["_slugify"]
+    assert "def _slugify(" not in src, "plan.sh に task_slug の式のコピーが戻っている"
+    sys.path.insert(0, str(SCRIPTS))
+    import lib_execution
+    return lib_execution.slugify_title
 
 
 SLUGIFY = _load_slugify()

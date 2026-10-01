@@ -896,6 +896,8 @@ ALLOWED_SUBPROCESS_CALLS = {
     # -- plan.sh -----------------------------------------------------------
     ("plan.sh", "cmd_pull", "bash"):
         "pull 後の worktree 作成スクリプト。queue のファイルは渡していない",
+    ("plan.sh", "_pull_git_context", "git"):
+        "start の記録に入れる worktree の HEAD (`git rev-parse HEAD`)。queue のファイルは渡していない",
     ("plan.sh", "cmd_review", "bash"):
         "scripts/review-plan.sh を起こす。プラン本体は向こうが "
         "lib_task_cards 経由で読む",

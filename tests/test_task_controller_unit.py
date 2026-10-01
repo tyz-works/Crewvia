@@ -1023,14 +1023,14 @@ def test_domain_error_codes_and_exit_codes_match_the_design_table():
     assert set(ex.EXIT_CODES) == set(ex.ERROR_CODES)
 
 
-def test_slugify_is_the_same_formula_as_plan_sh_until_e2_deletes_the_copy():
+def test_plan_sh_no_longer_carries_a_copy_of_the_slugify_formula():
+    """E2 で plan.sh の `_slugify` を消した (task_slug は reserve が card に固定する。式の置き場は `lib_execution` の 1 か所)。"""
     text = (h.REPO_ROOT / "scripts" / "plan.sh").read_text()
     for line in ("ascii_only = re.sub(r'[^\\x00-\\x7F]+', ' ', title)",
                  "normalized = re.sub(r'[^a-zA-Z0-9]+', ' ', ascii_only)",
-                 "parts = [p.lower() for p in normalized.split() if p]",
-                 "slug = '-'.join(parts)[:40].rstrip('-')",
-                 "return slug or fallback"):
-        assert line in text, line
+                 "slug = '-'.join(parts)[:40].rstrip('-')"):
+        assert line not in text, line
+    assert "def _slugify" not in text
     assert ex.slugify_title("E1: Task Controller + Execution の lib (呼び出し元ゼロ)", "t004") == "e1-task-controller-execution-lib"
     assert ex.slugify_title("x" * 80, "t1") == "x" * 40
     assert ex.slugify_title("a b  c-d_e", "t1") == "a-b-c-d-e"

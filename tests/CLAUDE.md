@@ -72,6 +72,9 @@ root の `CLAUDE.md` から移した、テスト専用の規則。設計と経�
   mission.yaml の字下げミスの出口 / `crewvia_create_pr` / NUL 区切りの worktree lookup）。本物の helper を使うテストは
   queue に mission.yaml を置き、task id を `tNNN` にする（`knowledge/test-isolation.md`）。
 
+- 名前の検証と診断の secret 漏れ: `tests/test_git_policy_untrusted_names_and_error_text.py`（`pr-base` の traversal・
+  PyYAML 例外・`e.detail` の整形が 1 か所であること。secret 文字列を仕込む）。
+
 ## State Store (`lib_state_store`) のテスト
 
 - crash 注入は `tests/state_store_scenarios.py`（seed・場面・収束の検査）。lib の書き込みの各段で `FAULT_HOOK` が呼ばれ、

@@ -99,6 +99,11 @@ lib ごとの**破ってはいけない契約**の要約。理由・経緯・全
   他人の task（所有者を見ない）／`--diff-ref` = QA の diff の ref。決められなければ **exit 1・stdout 空**（`main` に倒さない。
   使い方の誤りも exit 1 — exit 2 は idle の意味）。`target_dir` の task は mission の `git:` を見ず `DEFAULT_PR_BASE`。
   退避済み（archive）の mission は見ない（exit 1）。
+- **外から来る名前はパスにする前に検査**（G3 fix 2）: mission slug は `check_mission_slug`・task id は `check_task_id`
+  （どちらも `lib_git_policy`）。`plan.sh pr-base`（assignment 由来の値も）・Resolver の CLI・`load_git_policy` が同じ関数を通る。
+  **利用者に見えるエラーは `format_policy_error` 1 か所**（`[code] 欄: 詳細 (場所)`）。lint の PyYAML 例外は
+  `lint_plan._yaml_error_location`（型名 + 行・列だけ。`str(e)` は出さない）。`e.detail` を自前で並べると
+  `tests/test_git_policy_untrusted_names_and_error_text.py` が赤。
 - **mission.yaml の無関係な字下げミス 1 行でも pull は止まる**（Resolver が `parse_yaml` の読み飛ばしを fail closed で拒否する）。
   出口: pull は exit 1・JSON なし・card を `needs_director`（理由に `(P1)`・行番号・ファイルの場所・直し方。**行の中身は出さない**）。
   事前には `plan.sh lint --mission <slug>` が同じ検査で FAIL にする。直したら `plan.sh update <id> --status pending --reset`。

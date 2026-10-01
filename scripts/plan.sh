@@ -3168,6 +3168,14 @@ def cmd_pr_base(args):
         if not sep or not slug or not _TASK_CARDS.TASK_ID_RE.fullmatch(task_id):
             die(f"pr-base: {agent} の assignment の形が違います。自分の task を決められません")
 
+    # パスを組み立てる前に、mission と task の両方の識別子を検証する (`--mission ../archive/demo` で active な
+    # mission の外の card を読ませない。assignment 由来の値も同じ関数を通す)。
+    try:
+        _GIT_POLICY.check_mission_slug(slug)
+        _GIT_POLICY.check_task_id(task_id)
+    except _GIT_POLICY.GitPolicyError as e:
+        die(f"pr-base: 識別子が使えません: {_GIT_POLICY.format_policy_error(e)}")
+
     if not os.path.isdir(mission_dir(slug)):
         where = ' (退避済み。pr-base は active な mission だけを見ます)' if os.path.isdir(
             os.path.join(ARCHIVE_DIR, slug)) else ''
@@ -3187,7 +3195,7 @@ def cmd_pr_base(args):
     try:
         policy = _GIT_POLICY.load_git_policy(slug, queue_dir=QUEUE_DIR)
     except _GIT_POLICY.GitPolicyError as e:
-        die(f"pr-base: mission '{slug}' の git policy を決められません: [{e.code}] {e.field}: {e.detail}")
+        die(f"pr-base: mission '{slug}' の git policy を決められません: {_GIT_POLICY.format_policy_error(e)}")
     value = _GIT_POLICY.pr_base(policy)
     print(f"{_GIT_POLICY.REMOTE}/{value}" if opts.get('--diff-ref') else value)
 

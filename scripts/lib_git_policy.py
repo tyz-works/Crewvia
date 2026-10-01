@@ -78,6 +78,17 @@ class GitPolicyError(Exception):
         super().__init__(f"git policy [{code}] {field}: {detail}")
 
 
+def format_policy_error(e: "GitPolicyError", where: str = "") -> str:
+    """利用者に見えるエラー文字列の**唯一の整形**。`[code] 欄: 詳細` (+ ` (場所)`)。
+
+    stderr・lint の診断・card の理由・CLI はすべてここを通す (経路ごとに 例外の detail を自前で並べない)。
+    `detail` に入るのは欄の名前・行番号・その欄自身の値だけ (`GitPolicyError` の約束)。mission.yaml の他の行・
+    PyYAML / `parse_yaml` の例外の文面は入れない (入れる側がこの型に変換してから渡す)。
+    """
+    text = f"[{e.code}] {e.field}: {e.detail}"
+    return f"{text} ({where})" if where else text
+
+
 class MissionNotFound(GitPolicyError):
     """mission.yaml が**本当に無い** (ENOENT)。今の `load_mission` と同じく呼び出し元のエラーとして扱える。
 
@@ -380,15 +391,25 @@ def policy_from_text(text: str, source: str = "<mission.yaml>") -> GitPolicy:
     return GitPolicy(source="mission", **values)
 
 
+def check_mission_slug(slug) -> str:
+    """mission の slug をパスに使う**前**の検査 (queue の下の dir 名として使える形)。
+
+    ファイルシステムを見る呼び出し元 (`load_git_policy`・`plan.sh pr-base`) はパスを組み立てる前にここを通す
+    (`../archive/demo` で active な mission の外を読ませない)。task id の検査は `check_task_id`。
+    """
+    if (not isinstance(slug, str) or slug == "" or "/" in slug or "\\" in slug
+            or slug in (".", "..") or _CONTROL_RE.search(slug)):
+        raise GitPolicyError("invalid_value", "mission_slug", f"mission の slug として使えない: {slug!r}")
+    return slug
+
+
 def mission_yaml_path(slug: str, queue_dir: str) -> str:
     return os.path.join(queue_dir, "missions", slug, "mission.yaml")
 
 
 def load_git_policy(slug: str, *, queue_dir: str) -> GitPolicy:
     """`<queue_dir>/missions/<slug>/mission.yaml` から Policy を読む。読めなければ拒否 (既定値に倒さない)。"""
-    if (not isinstance(slug, str) or slug == "" or "/" in slug or "\\" in slug
-            or slug in (".", "..") or _CONTROL_RE.search(slug)):
-        raise GitPolicyError("invalid_value", "mission_slug", f"mission の slug として使えない: {slug!r}")
+    check_mission_slug(slug)
     path = mission_yaml_path(slug, queue_dir)
     text = read_regular_text_or_unreadable(path)
     if is_unreadable(text):
@@ -403,7 +424,8 @@ def load_git_policy(slug: str, *, queue_dir: str) -> GitPolicy:
 # ---------------------------------------------------------------------------
 
 
-def _check_task_id(task_id) -> str:
+def check_task_id(task_id) -> str:
+    """task id (`tNNN`) をパスに使う前の検査。"""
     _check_text(task_id, "task_id")
     if not TASK_ID_RE.fullmatch(task_id):
         raise GitPolicyError("invalid_value", "task_id", f"tNNN の形ではない: {task_id!r}")
@@ -413,7 +435,7 @@ def _check_task_id(task_id) -> str:
 def _component_values(mission_slug, task_id, task_slug) -> dict:
     return {
         "mission_slug": _check_component(mission_slug, "mission_slug"),
-        "task_id": _check_task_id(task_id),
+        "task_id": check_task_id(task_id),
         "task_slug": _check_component(task_slug, "task_slug"),
     }
 
@@ -517,7 +539,7 @@ def main(argv=None) -> int:
     except GitPolicyError as e:
         # どのファイルか (mission.yaml の path) を添える。行の中身は出さない (detail は行番号だけ。G2 の P2-2)。
         where = mission_yaml_path(args.mission, args.queue)
-        print(f"lib_git_policy: [{e.code}] {e.field}: {e.detail} ({where})", file=sys.stderr)
+        print(f"lib_git_policy: {format_policy_error(e, where)}", file=sys.stderr)
         return 2
     if args.lines:
         keys = RESOLVE_TASK_LINE_ORDER if args.verb == "resolve-task" else ("pr_base",)

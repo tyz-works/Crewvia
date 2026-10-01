@@ -383,6 +383,19 @@ if yaml is not None:
     _StrictBoolLoader.add_constructor('tag:yaml.org,2002:bool', _construct_strict_bool)
 
 
+def _yaml_error_location(e: Exception) -> str:
+    """PyYAML の例外を「解析の種類 + 行・列」だけの固定形にする (利用者に見える診断の唯一の整形)。
+
+    例外の文字列には問題の行の抜粋 (`owner: [SENTINEL_SECRET` のような無関係な欄の中身) が入るので、
+    `str(e)` も `e.problem` / `e.context` も使わない (`!r` の値・タグ名も入りうる)。使うのは例外の型名と位置だけ。
+    """
+    mark = getattr(e, 'problem_mark', None) or getattr(e, 'context_mark', None)
+    kind = type(e).__name__
+    if mark is None:
+        return f"YAML を解釈できません ({kind})"
+    return f"YAML を解釈できません ({kind}: {mark.line + 1} 行目 {mark.column + 1} 列目)"
+
+
 def _load_yaml_document(path: str, *, missing_is_ok: bool = True) -> tuple[dict, Optional[str]]:
     """queue / config の YAML ファイル 1 つを、構造的に (本物の YAML パーサで) 読む。
 
@@ -418,7 +431,7 @@ def _load_yaml_document(path: str, *, missing_is_ok: bool = True) -> tuple[dict,
     try:
         data = yaml.load(text, Loader=_StrictBoolLoader)
     except yaml.YAMLError as e:
-        return {}, f"{path}: YAML を解釈できません ({e})"
+        return {}, f"{path}: {_yaml_error_location(e)}"
 
     if data is None:
         return {}, None                      # 空ファイル = 中身なし
@@ -541,7 +554,7 @@ def check_git_policy(slug: str, queue_dir: str) -> list[tuple[str, str, str]]:
     try:
         policy = _GIT_POLICY.policy_from_text(text, source=path)
     except _GIT_POLICY.GitPolicyError as e:
-        return [('FAIL', 'git-policy', f"{path}: [{e.code}] {e.field}: {e.detail}")]
+        return [('FAIL', 'git-policy', _GIT_POLICY.format_policy_error(e, path))]
 
     data, problem = _load_yaml_document(path)
     if problem is not None:

@@ -1084,9 +1084,11 @@ t023 と t024 で P1 が続けて「正本に無い値」「回復の範囲が�
 
 **決定 (§9.1 の「表に書けない行」の 1〜3)**:
 
-1. **rollback 中の P1 の後に record Y の `agent` が null になる件 → 報告のまま** (`reported:execution_record_owner_unknown`)。
-   card に `execution_agent` は足さない。record は判断に使わない (F2) ので履歴の欠けだけで、欄を 1 つ足すと旧コードが読まない
-   新しい正本の欄が増え、片方だけの欄の整合 (`STATE_INVALID`) の例外も増える。割に合わない。
+1. **rollback 中の P1 の後に record Y の `agent` が null になる件 → card に `execution_agent` を足す** (予約した agent の写し。
+   `execution_reserved_at` と同じ扱いで、次の reserve まで変わらない。`worker` は reset / retire / `update --worker` で変わるので使わない)。
+   record の `agent` は card から再生成でき (R-5)、旧コードが worker を null にしても履歴が欠けない。agent なしの予約 (`agent=None`) と
+   旧コードの跡で欄が無い card だけ record の `agent` が null になり、`reported:execution_record_owner_unknown` で報告する
+   (数えるだけ。判断には使わない)。欄は任意で、無い card は不整合にしない (`fields_problem` は型だけ見る)。
 2. **終端の task に DETACHED (b) の欄が残る件 → Director 用の閉じる手段を作る**。`abandon_detached_execution` (card の試行を
    `failed` / `ABANDONED_OUTSIDE_CONTROLLER` で閉じる。task の status には触れない。閉じるものが無ければ `INVALID_TRANSITION`)。
    報告は終端の task を別コード `reported:execution_active_on_finished_task` に分け、E4b の gate (0 件の確認) に混ぜない。holding 以外の

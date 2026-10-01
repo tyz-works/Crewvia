@@ -126,6 +126,7 @@ root の `CLAUDE.md` から移した、テスト専用の規則。設計と経�
   回復後に `diagnose` が空 — DETACHED の報告は Director が閉じるまで残るので、その 2 種だけ除く）。helper は `task_controller_helpers.py`。
 - 呼び出し元ゼロの固定は `test_task_controller_has_no_callers_yet.py`（名前の出現。E2 で許可表を広げる）。
 - **長い反復は `timeout` を付け、最初は 2 回で形を確かめてから 20 回**（crash 注入は全体で約 3 分。background で待たない）。
+
 ## 子プロセスを残さない（`tests/leaked_descendants.py` / `tests/proc_group.py`）
 
 - plan.sh のような **bash の下で更に子を起こすもの** を `subprocess.run(timeout=)` / `Popen.kill()` で止めると、

@@ -1075,3 +1075,71 @@ env の停止スイッチは付けない (不変条件 5)。戻しは常に reve
 - S3 (t013): 固定 fixture で S3 前後の card / mission / state のバイト比較、監査ログの行と欄、書き込み途中の SIGKILL
 - S4 (t017): §2.2 の表の各行を隔離 queue で作り、次のロック取得で表どおりになる / **進行中を巻き戻さない** (後任が pull し直した状態で R-2 が後任を消さない) / `update --status in_progress` (§2.3 末尾) の観察 / 本番 queue の複製で store-check の棚卸し / **§2.6 の表の各行を「落とす → 同じ引数 / 違う引数 / 別の操作」で再現** し、正本と出口が表どおりか (特に P2-1: `done --pr 123` を D2 の途中で落とし `--pr 456` で拒否される、P2-2: reset を枠撤去の前で落とし逆引きで旧所有者の枠が消える、P2-3: §2.5 の表の各食い違いで出口のコマンドが通る、3 巡目 P2-a: A の in_progress card を 2 枚 (うち 1 枚は `--mission` で名指ししない別 mission・`init --inactive` の mission) にし A の枠を消して、`done` / `update` / `pull --task` のどれで回復が走っても枠が書かれず `reported:duplicate_owner` が出る。`[破損]` card を 1 枚置いて `owner_unprovable`。欠陥版 (所有の証拠の走査を消す) で赤、3 巡目 P2-b: `needs-director` を枠撤去の前で落とし、同じ `needs-director` の再実行が exit 3 になった後に監査ログに `op=recover result=repaired:R-2` の行がある。欠陥版 (回復の行を with の出口で書く) で赤)
 - S5 (t021): 書き手ごとの同時更新と強制終了、構造ガードの陽性対照・件数・赤の実証
+
+---
+
+## 10. 実績: Cutover / Rollback の記録と 01b / 01c への引き継ぎ (t025)
+
+§7 は cutover の**計画**、この節は**実績**。材料は t024 (本番確認。観測は 2026-10-01 08:57〜09:25 JST、
+主 checkout HEAD = origin/main = `c90ca6d`) の Result。コードは変えていない。
+
+### 10.1 各 cutover の実績
+
+merge の時刻は `git log --first-parent origin/main` の committer 時刻 (JST)。
+
+| 段 | PR | merge 日時 | 本番で変わったこと (観測) | merge 後に確かめたこと | 戻したか |
+|---|---|---|---|---|---|
+| S1 | #256 | 09-30 13:35 | lint が `needs_director` を通し `cancelled` を FAIL にする。status 語彙の置き場が `lib_task_status.py` 1 か所 | 完了済み 63 mission を隔離 root で lint → 60 pass / 3 FAIL。**S1 の前 (`6958117`) で同じ複製を lint しても 60 / 3 で文言も同一**なので S1 が増やした FAIL は 0。盤上の全 card (done 736 / skipped 38 / pending 11 / blocked 5 / in_progress 2 / needs_human_review 1) が `TASK_STATUSES` に収まり、`cancelled` は 0 件。進行中 2 mission の `plan.sh lint` は rc=0 | 戻していない (revert コミットは main に無い) |
+| S2 | #257 | 09-30 15:59 | なし (呼び出し元ゼロ) | — | 戻していない |
+| S3 | #258 | 09-30 19:30 | plan.sh の書き込みが `lib_state_store` 経由。`queue/audit/transitions-<UTC日付>.jsonl` が増える | 64 行すべて同じ 13 欄・`execution_id` は全行 null・200 字超の値 0・secret 系語 0・`files` に絶対パス 0・ファイル 0644。自分の `pull` が 1 行 (`op=pull result=ok from=pending to=in_progress`)。stderr に audit の warn は出ていない | 戻していない |
+| S5 | #259 | 09-30 22:49 | 書き手の lib 集約 / `plan.sh verifying` 新設 / CI の構造ガード。(#260 は構造ガードの盲点を直しただけ・09-30 23:32) | `.crewvia-env` が pull で生成され source できる。通常運用に支障なし | 戻していない |
+| S4 | #261 | 10-01 08:56 | ロック取得時の回復 R-1〜R-4 / `plan.sh store-check` / done の順序 / `op=recover` 行 | R-1 を暗黙に実機観測 (枠と `.identity` が元とバイト一致・`op=recover result=repaired:R-1` が update 本体と同じ txn_id)。R-2 は明示 verb (`reap-orphan-assignment`) でだけ観測。観察用 mission (`init --inactive`) は archive し、`state.yaml` 前後の diff は空 | 戻していない |
+
+- **順序**: merge は S1 → S2 → S3 → S5 → S4 (S4 が最後。ID の順ではない)。
+- **ff とデーモン**: merge 後に主 checkout を ff するまで本番は旧コード。S4 は merge 08:56:28 → ファイル mtime 08:56:34 → dispatcher restart 08:56:43 (`sync-main-checkout.sh` の一連の動き)。
+- **dispatcher が新しい版か**は 3 点で証明した (memory `prove-which-code-version-a-spawned-task-ran`): `registry/daemons/dispatcher.version.json` の head と、プロセスの `lstart` が ff 後の mtime より後であること、送信後の新しい plan.sh にしか書けない監査行。dispatcher 自身の新規ログ行は diff に無く、特定できなかった。
+- **watchdog は旧版のままで正しい**: S1〜S5 が触った `lib_dep_rules` / `lib_registry` / `lib_task_status` / `lib_state_store` は watchdog の `files` にも import にも無く、`files_digest` は現ファイルの再計算と一致。`sync-main-checkout.sh` は digest が食い違ったときだけ restart する設計どおり。
+- **verifier-dispatcher** (S5 が常駐と書いたもの) は t024 の時点で 0 プロセス。restart 対象なし。
+
+### 10.2 戻し方
+
+どの段も**戻し方は PR revert → `scripts/sync-main-checkout.sh`**。env の停止スイッチは付けない (不変条件 5)。
+
+| 段 | 追加の注意 |
+|---|---|
+| S1 | 追加なし。語彙が `needs_director` を通さなくなるので、revert 前に `needs_director` の card が盤上に無いことを見る (t024 の時点では 0 件) |
+| S2 | 追加なし |
+| S3 | `queue/audit/` は残ってよい (読み手がいない)。旧 plan.sh は書かない |
+| S4 | R-1〜R-4 が書いたものは正本 (card) を変えていないので、旧コードがそのまま読める (原案 §9.4) |
+| S5 | **常駐デーモンは restart が要る** (verifier-dispatcher。memory `merged-daemon-code-is-inert-until-restart`)。hooks は次の tool 呼び出しから入れ替わる |
+
+**実際に戻す必要が出たか: 5 段とも 0 回**。ただし CI は 1 回赤くなった (§10.3 の 2)。
+
+### 10.3 01b / 01c への引き継ぎ
+
+#### 01a の既知の課題・backlog (どれも 01a の完了を止めない — Director 判断)
+
+1. **監査ログの穴 (S3 の QA t013)**: 拒否・失敗した操作 (exit 1/2/3) は行を出さず、`result` は常に `ok`。`actor` は Director / デーモン / `--no-pr` の done で `unknown`。呼び出し元の照合は 01c の仕事 (§0) なので、01b 以降で扱う。
+2. **構造ガードの件数が CI ログに出ない**: `tests/test_queue_writes_go_through_the_store.py` の `[write-guard] scanned …` は、pytest が `-v` のみで `-s` なしのため成功したテストの print が捨てられる。下限 (書き込み 150 件・python ブロック 10・shell 5000 行) は assert されているので**空虚な PASS にはならない** (可視性のみ)。ローカル実測は `scanned files=61 write sites=188 (+7 inside lib_state_store.py)` / `shell lines=18179 heredoc-body skipped=10477 inspected as bash=7702 (42%)`。直し方の候補: pytest の terminal summary / `-rP` / 件数を assert メッセージに含める。shell 側 (`[ci-tests-sh]` `[ci-script-tests]`) は件数が出ている。
+3. **S4: done の D1 後に落ちて `--pr` なしで再試行する経路 (Codex t018 4 巡目)**: `deliverable: none` で下流が review だけの task は D2 (伝播) が走らず done が確定する (下流 review card に `pr_number` が入らない)。直し方の候補: 永続化済みの `pr_number` で伝播を再開する / 再試行経路で `--pr` を要求する。
+4. **S4: pull の窓で落ちた card (QA F2)**: その Worker か card に次の plan.sh が触れるまで食い違いのまま残る (dispatcher / watchdog は回復を起こさない)。案: dispatcher の周期で `store-check` を回す。
+5. `worker.md` に「pull が exit 3 (別の in_progress card を持つ) で拒否されたときの対処」を 1 行足す。
+6. verifier-dispatcher の「枠なし = idle」と、S4 の R-2 撤去対象の拡大の組み合わせは**未実走** (本番で未稼働)。
+7. **R-2 は明示の `reap-orphan-assignment` でしか本番観察していない**。update / pull などロック取得時に消える暗黙の R-2 は未観察 (R-1 は暗黙で観察済み)。
+8. Minerva 再開時に t017 の `holding_without_worker` (`needs_human_review` で worker なし。`store-check` に出続ける) を決着させる。消す手順はまだ無い。
+9. **worker なしの in_progress への報告**: Director が cutover の review task を `update --status in_progress --reset` で開くと、worker なしの in_progress として `reported:in_progress_without_worker` が **1 呼び出し 1 行**出る (t019 で 3 行)。**正当な状態への報告**で異常ではない。閉じ方は通常どおり `plan.sh done` / `verify-result`。01c が Execution ID を足す前に「Director 実行 task は報告しない」(worker 欄が空 + 呼び出し元が Director) か、報告の dedup を決める。
+10. watchdog の `DAEMON_RESTART_FILES` は直接 import したものだけ。将来 watchdog が `lib_task_status` 等を import するなら一覧に足さないと restart 判定に乗らない。
+11. 完了済み mission 3 件 (`20260927-qaprobe` / `t037-probe-orphan` / `t041-probe-b4`) は lint FAIL のまま (S1 以前から。QA の probe fixture)。archive を lint する入口が無く、隔離 root を自作する必要がある。**`hooks/` を symlink し忘れると 63 本全部が FAIL に見える** (`lint_plan.py` が `hooks/lib_skill_perms.py` を repo root 基準で読む)。
+12. flake: S4 merge 直後の main CI 1 回目が `scripts/test_wait_for_plan_review.sh` Test 9 で赤 (`lib_verdict rc=1` で `TIMEOUT_NONE`、期待は `TIMEOUT_FRESH`)。S4 はそのファイルを触っておらず、`gh run rerun --failed` で全 job 緑。秒精度の `date +%s` とファイル mtime の競合と読めるが**未確認の推測** (memory `second-precision-timestamp-is-not-a-generation`)。
+
+#### 01b (Git Policy) へ
+
+- §0 の表のとおり、worktree 作成失敗で主 checkout に残る (GIT-05) / 再 pull で `.crewvia-env` が書き直されない / branch・base・PR base・fetch 失敗の扱いは 01a で**触っていない**。S5 は `.crewvia-env` の書き方 (原子的) だけを直した。
+- 上の 1 (監査ログの穴: 失敗した操作の行・`actor` の `unknown`) は、Git の判断を監査に載せるときに先に決める。
+
+#### 01c (Execution + Controller) へ — Execution ID が乗る場所
+
+- 監査ログの `execution_id` 欄は **全行 null 固定で予約済み** (64 行で確認)。今の「試行」の識別は `generation` 欄 = card の `started_at`。
+- projection は `queue/assignments/<agent>` (本文 `<slug>:<tid>`) と `<agent>.identity` (JSON: mission / task / worker / started_at)。Execution ID を足すなら **identity の JSON に欄を足し**、**正本は card の frontmatter** (`worker` / `started_at` の隣) に置く。R-1 は identity → assignment を card から再生成するので、card に `execution_id` があれば回復で落ちない。逆に **card に無い値を identity にだけ置くと R-1 が復元できない**。
+- §2.1 の再判断条件 (正本が 2 枚以上に分かれる = Execution record が card と別ファイル) は 01c で必ず通る。`executions/<id>.yaml` を作るなら、**card からの再生成可能性を先に決める**。
+- 呼び出し元の照合・遷移の幅を狭める・pull の冪等化は §0 のとおり 01c。S1 の遷移表 (§1.4) は現状を写しただけなので、狭める PR はそこから始める。

@@ -881,6 +881,35 @@ def test_abandon_detached_execution_is_the_directors_way_to_close_a_finished_tas
         h.raises_code(ex.INVALID_TRANSITION, ctl.abandon_detached_execution, t, MISSION, "t001")
 
 
+def test_a_record_left_behind_for_an_unnamed_card_is_only_counted_never_repaired_and_never_used_to_decide(q):
+    """設計転記 3 (§9.5 表外): 名指しされない card の record が遅れたまま残る。回復は書かず、store-check が
+    `reported:execution_record_stale` で数えるだけ。判断 (冪等の答え) は card から返る — record は使わない。"""
+    ctx = h.reserve_and_start(q, factory=h.ids())
+    with h.tx(q, op="done") as t:
+        ctl.complete_execution(t, MISSION, "t001", h.caller(ctx.execution_id), to_status="done",
+                               meta_updates={"completed_at": T2})
+    rec_path = pathlib.Path(q) / "missions" / MISSION / "executions" / f"{ctx.execution_id}.json"
+    stale = json.loads(rec_path.read_text())
+    assert stale["status"] == "completed"
+    stale["status"], stale["end_code"] = "running", None                     # 旧コードの時代・欠けた書き込みの跡
+    rec_path.write_text(json.dumps(stale, sort_keys=True, indent=2) + "\n")
+
+    before = h.snapshot(q)
+    unnamed = store.Scope(cards=((MISSION, "t002"),), agents=())          # t001 を名指ししない
+    with h.tx(q, op="next", actor="test") as t:
+        out = t.recover(unnamed)
+    assert [r for r in out if r.repaired] == [] and h.snapshot(q) == before          # 書かない
+    kinds = [f.kind for f in store.diagnose(q, store.Scope.everything(q))]
+    assert kinds.count("reported:execution_record_stale") == 1                        # 数える
+    assert h.snapshot(q) == before                                                    # 数えるだけ (diagnose も書かない)
+
+    with h.tx(q, op="done") as t:                                                      # 判断は card から: 同じ終端の再送は成功
+        again = ctl.complete_execution(t, MISSION, "t001", h.caller(ctx.execution_id), to_status="done",
+                                       meta_updates={"completed_at": T2})
+    assert again.status == "completed"
+    assert json.loads(rec_path.read_text())["status"] == "running"                    # 冪等の再送も record を直さない
+
+
 # ---------------------------------------------------------------------------
 # mark_task (試行を変えない task の遷移)
 # ---------------------------------------------------------------------------

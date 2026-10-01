@@ -1066,3 +1066,35 @@ t023 と t024 で P1 が続けて「正本に無い値」「回復の範囲が�
 5. 試行の `stale` / `abandoned` / `recovered` — §0 (原案の後続)。reserved のまま放置された試行 (Worker が再 pull しない) は今どおり
    Rule 5 → Director の reset。
 6. record の掃除 (archive 以外で消す経路) — 作らない。1 試行 ~600 B で、量が問題になったら archive と同じ手動運用。
+
+---
+
+## 14. E1 の実績と、§9.1「表に書けない行」への決定 (t004)
+
+呼び出し元ゼロの lib を入れた。本番の挙動は変わらない (plan.sh・dispatcher・hooks は `lib_task_controller` を import しない。
+`tests/test_task_controller_has_no_callers_yet.py` が名前の出現で固定し、E2 が最初の呼び出し元を足すときに許可表を意図して広げる)。
+
+- 置き場: `scripts/lib_execution.py` (card 1 枚から決まること: ID の形・欄・`attempt_view`・照合・record の形)、
+  `scripts/lib_task_controller.py` (reserve / start / complete / fail / release / reset / mark / abandon_detached / get。書き込みは
+  すべて渡された `lib_state_store.Txn` の中)。書き込みの lib が controller を import すると循環するので、遷移から独立な部分は
+  `lib_execution` に置いた。`lib_state_store` は `lib_execution` だけを import する。
+- 検証: 単体 (原案 §10.5 の 14 項目 + 表) `tests/test_task_controller_unit.py` / 独立プロセスの並行 reserve
+  (2〜4 プロセス × 20 回) `tests/test_task_controller_concurrency.py` / 全書き込み点で SIGKILL する crash 注入 (13 場面 × 点 × 20 回)
+  `tests/test_task_controller_crash_injection.py`。
+
+**決定 (§9.1 の「表に書けない行」の 1〜3)**:
+
+1. **rollback 中の P1 の後に record Y の `agent` が null になる件 → 報告のまま** (`reported:execution_record_owner_unknown`)。
+   card に `execution_agent` は足さない。record は判断に使わない (F2) ので履歴の欠けだけで、欄を 1 つ足すと旧コードが読まない
+   新しい正本の欄が増え、片方だけの欄の整合 (`STATE_INVALID`) の例外も増える。割に合わない。
+2. **終端の task に DETACHED (b) の欄が残る件 → Director 用の閉じる手段を作る**。`abandon_detached_execution` (card の試行を
+   `failed` / `ABANDONED_OUTSIDE_CONTROLLER` で閉じる。task の status には触れない。閉じるものが無ければ `INVALID_TRANSITION`)。
+   報告は終端の task を別コード `reported:execution_active_on_finished_task` に分け、E4b の gate (0 件の確認) に混ぜない。holding 以外の
+   非終端 (pending 等) は従来どおり `reported:execution_active_on_non_holding_status` (次の reserve の手順 0 か abandon が閉じる)。
+   CLI の口 (`plan.sh update --close-execution` 等) は呼び出し側を移す PR (E3 / E4a) で足す。
+3. **名指しされない card の record の遅れ → 数えるだけ**。回復 (apply) は書かず、`diagnose` が `reported:execution_record_stale` で
+   数える。判断 (冪等の答え) は card から返り、record を使わない。`test_a_record_left_behind_for_an_unnamed_card_is_only_counted_…` が固定。
+
+**戻し方 (E1)**: PR を revert し、`scripts/sync-main-checkout.sh` で主 checkout を ff する。呼び出し元ゼロなので本番の queue・registry・
+デーモンには何も書かれておらず、データの戻しは要らない。lib_state_store の拡張は既定値 (`execution_id` を渡さない) で今とバイトが同じ
+(01a S3 の互換 golden が変わっていないことで確かめる)。

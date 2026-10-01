@@ -943,8 +943,10 @@ def _candidates():
         if not base.is_dir():
             continue
         # 文書 (.md) は対象にしない (ガードを説明する文書が自分で引っかかる型)
+        # テスト (scripts/ に置いてある test_*.sh・e2e ハーネス) は呼び出し元ではなく検証する側なので対象にしない
         files += [p for p in base.rglob("*")
-                  if p.is_file() and "__pycache__" not in p.parts and p.suffix not in (".md", ".pyc")]
+                  if p.is_file() and "__pycache__" not in p.parts and p.suffix not in (".md", ".pyc")
+                  and not p.name.startswith(("test_", "e2e_harness"))]
     files += [REPO / f for f in SCAN_FILES if (REPO / f).is_file()]
     return files
 

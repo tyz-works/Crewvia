@@ -26,6 +26,10 @@ set -euo pipefail
 #                              どれも無ければ拒否 (skill の絞り込みを丸ごと無効にしない)。
 #                              Director (registry の role: director) は pull できない
 #   plan.sh done <task_id> ("<result>" | --result-file <path|->) [--mission <slug>] (--pr <N> | --no-pr "<理由>")
+#                [--execution <id>]
+#                              --execution <id>: (e3-execution-flag-compat) 受け付けて読み捨てる。done / fail / needs-director /
+#                              ready-for-verification / verifying / verify-result に共通。E3 が照合に使う前から、rollback した
+#                              先でも起動済みの Worker・kai-review.sh が付ける `--execution` で報告が止まらないための互換
 #                              Result は --result-file <path|-> で (位置引数の "…" はバッククォート/$(...) をシェルが実行する。C1)
 #                              deliverable: pr の task は --pr か --no-pr が必須 (無いと拒否。exit 2・何も書かない)
 #                              --pr <N>: この task の PR 番号。blocked_by を逆にたどった下流のうち、
@@ -38,7 +42,7 @@ set -euo pipefail
 #                              この task を待つ codex-review (直接・推移とも。pr_number 未設定・合流点でない)
 #                              があるのに --pr が無いと拒否 (exit 2、何も書かない)。
 #                              PR を作らない task は --no-pr "<理由>" (card に残る。--no-pr のときは伝播しない)
-#   plan.sh fail <task_id> [<handoff_path>] (--head <sha> | --no-head <理由>) [--mission <slug>]
+#   plan.sh fail <task_id> [<handoff_path>] (--head <sha> | --no-head <理由>) [--mission <slug>] [--execution <id>]
 #   plan.sh update <task_id> [--mission <slug>] [--skills <csv>] [--blocked-by <csv>]
 #                            [--priority high|medium|low] [--worker <name>] [--status <status>]
 #                            [--description <text>] [--reset] [--deliverable pr|file|none]
@@ -2554,10 +2558,10 @@ USAGE = {
     'pull': ('plan.sh pull [--mission <slug>] [--skills <csv>] [--agent <name>]\n'
              '                    [--target-dir <path>] [--task <task_id>]'),
     'done': ('plan.sh done <task_id> ("<result>" | --result-file <path|->) [--mission <slug>] [--pr <N>]\n'
-             '                    [--no-pr "<理由>"]   (--pr / --no-pr は codex-review が待っているとき・deliverable: pr の task で必須)'),
-    'needs-director': 'plan.sh needs-director <task_id> ("<理由>" | --result-file <path|->) [--mission <slug>]',
+             '                    [--no-pr "<理由>"] [--execution <id>]   (--pr / --no-pr は codex-review が待っているとき・deliverable: pr の task で必須)'),
+    'needs-director': 'plan.sh needs-director <task_id> ("<理由>" | --result-file <path|->) [--mission <slug>] [--execution <id>]',
     'fail': ('plan.sh fail <task_id> [<handoff_path>] (--head <sha> | --no-head "<理由>")\n'
-             '                     [--mission <slug>]'),
+             '                     [--mission <slug>] [--execution <id>]'),
     'update': ('plan.sh update <task_id> [--mission <slug>] [--skills <csv>] [--blocked-by <csv>]\n'
                '                       [--priority high|medium|low] [--worker <name>] [--status <status>]\n'
                '                       [--description <text>] [--reset] [--pr-number <N>]\n'
@@ -2567,11 +2571,12 @@ USAGE = {
                '                       [--mission <slug>] [--outcome reset|needs-director]\n'
                '                       [--reason "<1 行>"] [--no-wait]'),
     'reap-orphan-assignment': 'plan.sh reap-orphan-assignment <agent> [--no-wait]',
-    'ready-for-verification': 'plan.sh ready-for-verification <task_id> [--mission <slug>]',
-    'verifying': 'plan.sh verifying <task_id> --verifier <name> [--mission <slug>]',
+    'ready-for-verification': 'plan.sh ready-for-verification <task_id> [--mission <slug>] [--execution <id>]',
+    'verifying': 'plan.sh verifying <task_id> --verifier <name> [--mission <slug>] [--execution <id>]',
     'snapshot': 'plan.sh snapshot <task_id> --section-file <path|-> [--mission <slug>]',
     'verify-result': ('plan.sh verify-result <task_id> <pass|fail|needs_human_review>\n'
-                      '                            [--mission <slug>] [--notes "<text>" | --notes-file <path|->]'),
+                      '                            [--mission <slug>] [--notes "<text>" | --notes-file <path|->]\n'
+                      '                            [--execution <id>]'),
     'review': 'plan.sh review <mission_slug>',
     'launch': 'plan.sh launch <mission_slug>',
     'task-graph': 'plan.sh task-graph',
@@ -4240,7 +4245,8 @@ def cmd_needs_director(args):
     - AGENT_NAME の assignment (この task を指すもの) を撤去する (done / fail と同じ)。
       card の `worker` は残るので、dispatcher は判断待ちの Worker を「仕事あり」と読む
     """
-    opts, positional = parse_opts(args, {'--mission': 'value', '--result-file': 'value'})
+    opts, positional = parse_opts(args, {'--mission': 'value', '--result-file': 'value',
+                                         '--execution': 'value'})
     task_id = positional[0]
     reason = read_body_arg(opts, '--result-file',
                            positional[1] if len(positional) > 1 else None, '位置引数の理由')
@@ -4489,7 +4495,7 @@ def codex_reviews_awaiting_pr(slug, task_id):
 
 def cmd_done(args):
     opts, positional = parse_opts(args, {'--mission': 'value', '--pr': 'value', '--no-pr': 'value',
-                                         '--result-file': 'value'})
+                                         '--result-file': 'value', '--execution': 'value'})
     task_id = positional[0]
     result = read_body_arg(opts, '--result-file',
                            positional[1] if len(positional) > 1 else None, '位置引数の Result')
@@ -4791,7 +4797,7 @@ def cmd_fail(args):
     `_gate_terminal_report` / `_validate_fail_evidence` を参照 (done と同じ入口を通る)。
     """
     opts, positional = parse_opts(args, {
-        '--mission': 'value', '--head': 'value', '--no-head': 'value',
+        '--mission': 'value', '--head': 'value', '--no-head': 'value', '--execution': 'value',
     })
     if not positional:
         die("fail requires <task_id>")
@@ -5127,7 +5133,7 @@ def _print_mission_detail(slug):
 
 
 def cmd_ready_for_verification(args):
-    opts, positional = parse_opts(args, {'--mission': 'value'})
+    opts, positional = parse_opts(args, {'--mission': 'value', '--execution': 'value'})
     if not positional:
         die("ready-for-verification requires <task_id>")
     task_id = positional[0]
@@ -5190,7 +5196,7 @@ def cmd_verifying(args):
     読んでから書くまでの間に done / verify-result が進めた status を、古い内容で巻き戻せた。
     ここではロックの中で読み直し、元の status が ready_for_verification でなければ何も書かず拒否する。
     """
-    opts, positional = parse_opts(args, {'--verifier': 'value', '--mission': 'value'})
+    opts, positional = parse_opts(args, {'--verifier': 'value', '--mission': 'value', '--execution': 'value'})
     if not positional:
         die("verifying requires <task_id>")
     task_id = positional[0]
@@ -5264,7 +5270,7 @@ def cmd_verify_result(args):
     needs_human_review → status: needs_human_review
     """
     opts, positional = parse_opts(args, {'--mission': 'value', '--notes': 'value',
-                                         '--notes-file': 'value'})
+                                         '--notes-file': 'value', '--execution': 'value'})
     if len(positional) < 2:
         die("verify-result requires <task_id> <verdict>")
     task_id = positional[0]

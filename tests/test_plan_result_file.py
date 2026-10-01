@@ -410,5 +410,5 @@ def test_free_text_options_not_in_the_table_are_only_single_line_reasons():
     """本文を持たないと判断した引数の一覧。増えたらここで気付く (表に理由を足すこと)。"""
     text = PLAN_SH.read_text()
     fn = re.search(r"^def cmd_fail\(args\):(.*?)(?=^def )", text, re.M | re.S).group(1)
-    assert set(re.findall(r"'(--[a-z-]+)':\s*'value'", fn)) == {"--mission", "--head", "--no-head"}
+    assert set(re.findall(r"'(--[a-z-]+)':\s*'value'", fn)) == {"--mission", "--head", "--no-head", "--execution"}
     assert set(NOT_BODY) == {"fail"}

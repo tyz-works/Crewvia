@@ -690,8 +690,14 @@ start の CAS は「試行がまだ reserved か」しか言えず、「他の p
   外す)。lib_state_store.py:1609-1616 の「queue/.lock が最も外側」は S5 の小さな共有ファイルの規則で、準備ロックはそれより外の
   1 段として足す (E2 でその docstring に追記する)。LOCK_NB なので、仮に逆順で取るコードが入っても待ちの輪 (deadlock) にはならず
   exit 1 になる。
-- **古いロックが残らない**: flock は持ち主のプロセスが死ねば kernel が外す。準備中に殺された pull の後は、次の再 pull が取れて
+- **古いロックが残らない**: flock は持ち主が死ねば kernel が外す。準備中に殺された pull の後は、次の再 pull が取れて
   再開できる (N8 の経路のまま)。ファイルの有無ではなく flock で判断するので、残ったファイルは意味を持たない。
+  **ただし flock は「開いたファイル記述」に付く**: 準備の subprocess (worktree を作る helper・`git rev-parse`) に記述子を渡して
+  (`PrepareLock.fileno()` → `subprocess.run(pass_fds=...)`) あるので、**python だけが SIGKILL されても、子孫が記述子を持っている間は
+  ロックが外れない** (t031 / Codex P2。渡していなかった間は、親だけの kill で子孫が排他の外で動き続け、再試行が別の helper を同時に走らせた)。
+  子孫が終われば kernel が外す。親だけが死んで子孫が生きている間の再 pull は exit 1「同じ予約の pull が進行中」(`TASK_ALREADY_RESERVED`・何も書かない)。
+  残る限界: helper の下で detach する子孫 (例: git の自動 gc のデーモン化) も記述子を持ち続けるので、その間は再 pull が待たされる
+  (fail closed。外す手段は無く、子孫が終わるのを待つ)。
 - **network をロックの中に入れない (§14-15)** に当たらない: §14-15 は queue/.lock の話で、準備ロックは同じ task の pull だけを
   止める (他の task・他のコマンドは止めない)。
 - 捨てた案: pull ごとの nonce を card に書き、start / G1 の CAS を「最後に再開した pull だけ」にする。古い側は書けなくなるが、
@@ -1239,3 +1245,27 @@ PR を revert し、`scripts/sync-main-checkout.sh` で主 checkout を ff す�
 - 名乗り (`CREWVIA_EXECUTION_ID` / `--execution`) を使う照合は E3。pull の JSON の `execution_id` を shell 変数に取り出す手順 (特に `target_dir` の task は
   `.crewvia-env` が無い) は worker.md に E3 で書く。今の worker.md は `.crewvia-env` の export と再開の手順だけ。
 - `update --reset` / retire が試行を release / fail にするのは E4a。それまで reset は試行を閉じず、次の reserve の手順 0 が閉じる (テストで固定)。
+
+### 15.6 Codex 1 巡目 (t031 / PR #271): 準備ロックを子孫にも持たせる
+
+- **P2**: 準備ロックは python の flock で、記述子は worktree を作る subprocess に渡っていなかった。作成中に python だけが SIGKILL されると、bash / git の子孫は
+  生き残るのに kernel がロックを外し、再試行は同じ予約を再開して**別の helper を同時に走らせる** (作りかけの worktree を見るか `WORKSPACE_CREATE_FAILED`)。
+  t008 の crash テストはプロセスグループごと kill するのでこの形を見逃していた。
+- **修正**: `PrepareLock.fileno()` を `pass_fds` で helper と `git rev-parse` に渡す (flock は開いたファイル記述に付くので、子孫が持っている間は外れない)。
+  捨てた案: 「回復を許す前に子孫が止まっていることを確かめる」 — 子孫を同定する証拠 (pid・起動時刻) を別に持つことになり、pid の使い回しの問題を足す。
+  記述子の継承は kernel が子孫の生死と排他を結ぶので、証拠が要らない。
+- **族ごとの掃除 (pull の中で排他を取った後に起動する subprocess)**:
+
+| subprocess | 排他 | (a) 親だけ kill で排他の外に出るか | (b) 再試行と同時に走るか | 処置 |
+|---|---|---|---|---|
+| `bash -c "source git-helpers.sh && crewvia_create_worktree …"` (plan.sh `cmd_pull`) | 準備ロック | **出ていた** | **走っていた** | 直した (`pass_fds`)。20 回反復のテスト |
+| helper の下の git (`fetch` / `worktree add` / `show-ref` 等) | 準備ロック | helper の子孫なので記述子を継承 → 出ない | 再試行は exit 1 | 同じ修正で足りる (bash / git は継承した記述子を閉じない) |
+| `git -C <worktree> rev-parse HEAD` (`_pull_git_context`) | 準備ロック | 出ていた (短時間・読み取りだけ) | 走りうるが読み取りだけで害なし | 一貫のため `pass_fds` を渡した |
+| Taskvia (`urllib.request.urlopen`。`taskvia_sync_pull`) | 準備ロック | 子プロセスを起こさない (python の中) → 親が死ねば止まる | n/a | 不処置 |
+| ロック 1 / 2 (`queue/.lock`) の中 | `queue/.lock` | subprocess を起こさない (grep `subprocess\.` で pull の経路は上の 2 つだけ) | n/a | 不処置 |
+| task-graph の再生成 (`maybe_refresh_task_graph`) | 自前のロック | python の中・コマンドの最後 | n/a | 不処置 |
+| kai-review.sh の pull | (同じ `cmd_pull`) | 同上 | 同上 | 同じ経路。変更なし |
+| `_resolve_head_commit` の git (`done` / `fail` の経路。pull ではない) | なし | n/a | n/a | 範囲外 |
+
+- テスト: `tests/test_pull_execution_e2_parent_kill.py` (helper stub が `$PPID` = python の pid を残し、**その pid だけ**を SIGKILL。子孫が生きている間に再 pull を
+  打ち、helper が同時に 2 本走らない・exit 1・card 不変、子孫が終わった後は同じ試行を再開、を 20 回)。赤の実証 E09 (`pass_fds` を外す)。

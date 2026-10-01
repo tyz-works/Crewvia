@@ -134,6 +134,8 @@ root の `CLAUDE.md` から移した、テスト専用の規則。設計と経�
   stub の `git-helpers.sh`**（`<root>/hold/<task>.{enabled,reached,go,cmd,fail}` の合図ファイルで操る。本番のコードにテスト用のフックを足さない）。
   pull の途中で落とす地点は `fork_start` / `fork_run`（fork した子で**本物の `cmd_pull`** を呼び、名前空間の協力者を差し替えて自分に SIGKILL。スレッドと fork を混ぜない）。
   並行は独立プロセス（`Box.popen` は自分のセッション = `kill_group` で木ごと殺せる）・実 flock。**旧形式の書き手**は今の `plan.sh update --reset`（E4 まで execution の欄を触らない）。
+- `tests/test_pull_execution_e2_parent_kill.py`（t031）: **python の pid だけ**を SIGKILL（stub が `$PPID` を `hold/<task>.parent` に残す。プロセスグループごと kill すると
+  子孫も死んでこの形を見逃す）。子孫が生きている間に再 pull → helper が同時に 2 本走らない（`hold/<task>.invocations` を数える）。20 回反復。
 - 互換性は `test_plan_sh_compat_s3.py`（E2 が足した出力だけを取り除いて cutover 前の golden と比べる。取り除く物が実在することも固定）。
 - `tests/test_pull_execution_e2_rollback.py`: 旧コード（E2 の前の commit `505d16b` の scripts/ を取り出したもの）の plan.sh を同じ queue に打つ。git の履歴が無い浅い clone では skip（QA が d887acf で通す）。
 - 赤の実証: `python3 tests/red_proof_e2_pull.py`（10 変異・約 10 分。赤は「狙ったテスト名の FAILED」だけ。置換元がちょうど 1 回でなければ BROKEN）。

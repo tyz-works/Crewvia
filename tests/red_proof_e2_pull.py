@@ -21,6 +21,8 @@
 - E06 O1: 再開が自分の古い枠を公開し直さない
 - E07 O2: 時刻でない `now` を通す
 - E08 start を JSON の前にコミットしない
+- E09 (t031) 準備ロックの記述子を worktree を作る helper に渡さない (`pass_fds` を外す): 親の python だけが SIGKILL されると
+  子孫が生きていてもロックが外れ、再試行の pull が別の helper を同時に走らせる
 """
 
 from __future__ import annotations
@@ -38,6 +40,7 @@ PLAN = "scripts/plan.sh"
 STORE = "scripts/lib_state_store.py"
 CTL = "scripts/lib_task_controller.py"
 TEST = "tests/test_pull_execution_e2.py"
+PARENT_KILL = "tests/test_pull_execution_e2_parent_kill.py"      # t031 (PR #271 Codex P2)
 
 T = "test_pull_execution_e2.py"
 # (id, 説明, ファイル, 置換元, 置換先, 赤になるべきテスト名 (部分一致のどれか 1 つ以上が FAILED))
@@ -96,6 +99,11 @@ MUTATIONS = [
      "    started, why = _pull_start(mission_slug, task_id, agent, started_holder[0], execution_id, git_context)\n",
      "    started, why = True, ''\n",
      ["test_pull_issues_one_execution_and_every_place_agrees"]),
+    ("E09", "準備ロックの記述子を helper に渡さない (親だけ kill → 子孫が排他の外で動く)", PLAN,
+     "                pass_fds=(prepare_lock.fileno(),),\n            )",
+     "            )",
+     ["test_killing_only_the_parent_python_during_worktree_creation_keeps_the_lock_while_the_helper_lives"],
+     PARENT_KILL),
 ]
 
 
@@ -116,9 +124,9 @@ def _env() -> dict:
     return env
 
 
-def _run(root: pathlib.Path, k_expr: str | None):
+def _run(root: pathlib.Path, k_expr: str | None, tests=(TEST, PARENT_KILL)):
     _purge_pyc(root)
-    cmd = [sys.executable, "-m", "pytest", TEST, "-q", "-p", "no:cacheprovider", "-rfE"]
+    cmd = [sys.executable, "-m", "pytest", *tests, "-q", "-p", "no:cacheprovider", "-rfE"]
     if k_expr:
         cmd += ["-k", k_expr]
     r = subprocess.run(cmd, cwd=root, env=_env(), capture_output=True, text=True, timeout=1500)
@@ -149,7 +157,7 @@ def main(argv) -> int:
             return 1
         print(f"対照 (変異なし): 緑 ({re.search(r'(\d+) passed', out).group(1)} passed)")
 
-        for mid, desc, rel, old, new, targets in selected:
+        for mid, desc, rel, old, new, targets, *rest in selected:
             work = pathlib.Path(tmp) / mid
             shutil.copytree(base, work)
             f = work / rel
@@ -159,14 +167,15 @@ def main(argv) -> int:
                 shutil.rmtree(work, ignore_errors=True)
                 continue
             f.write_text(src.replace(old, new))
-            rc, failed, errors, out = _run(work, " or ".join(targets))
+            rc, failed, errors, out = _run(work, " or ".join(targets), (rest[0],) if rest else (TEST,))
             hit = sorted(n for n in failed if any(t in n for t in targets))
             if errors or "SyntaxError" in out or "ImportError" in out or "collected 0 items" in out:
                 results.append((mid, desc, "BROKEN", "collection error / import error (変異が壊れている)"))
             elif hit:
                 # 赤の中身: 狙ったテストの **assert の失敗** (`AssertionError` / `assert ...`) だけを RED と数える。
                 # 例外 (KeyError / TypeError 等) で落ちたものは EXC (テスト対象の切り出しの失敗かもしれない) で、RED にしない
-                asserts = [n for n in hit if failed[n].startswith(("AssertionError", "assert ", "Failed: DID NOT RAISE"))]
+                # pytest.fail / DID NOT RAISE (`Failed: `) はテスト自身の判定なので assert の失敗に数える
+                asserts = [n for n in hit if failed[n].startswith(("AssertionError", "assert ", "Failed: "))]
                 reasons = "; ".join(f"{n}: {failed[n][:110]}" for n in hit)
                 results.append((mid, desc, "RED" if asserts else "EXC", reasons))
             else:

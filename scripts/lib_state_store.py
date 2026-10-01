@@ -1872,12 +1872,21 @@ def locked_update_json(path, lock_path, fn, *, on_unreadable='raise'):
 class PrepareLock:
     """`queue/missions/<slug>/executions/<tid>.prepare.lock` の flock (LOCK_EX | LOCK_NB)。
 
-    持ち主のプロセスが死ねば kernel が外す (ファイルの有無は意味を持たない。消さない — archive が dir ごと動かす)。
+    持ち主が死ねば kernel が外す — **ただし、同じ開いたファイル記述を持つ子孫が生きている間は外れない** (`fileno()`・
+    pull が準備の subprocess に渡す。execution.md §6.1)。ファイルの有無は意味を持たない。消さない (mission dir ごと動かす)。
     `release()` は冪等。with でも使える。"""
 
     def __init__(self, fd, path):
         self._fd = fd
         self.path = path
+
+    def fileno(self):
+        """ロックを持つ**開いたファイル記述**の番号。準備の subprocess (worktree を作る helper・git) に
+        `pass_fds=(lock.fileno(),)` で渡す: flock は開いたファイル記述に付き、子孫が記述子を持っている間は
+        親が SIGKILL されても外れない (親だけが死んで子孫が生き残る形で、排他の外で準備が動き続けない)。"""
+        if self._fd is None:
+            raise ValueError("released prepare lock")
+        return self._fd
 
     def release(self):
         fd, self._fd = self._fd, None

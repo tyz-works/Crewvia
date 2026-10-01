@@ -12,6 +12,8 @@ git は呼ばない stub の `git-helpers.sh` を、**途中で止められる /
     <root>/hold/<task>.go        これが現れたら続ける
     <root>/hold/<task>.cmd       あれば、その中身を bash で実行してから続ける (旧形式の reset 等を差し込む)
     <root>/hold/<task>.fail      あれば、実行後に W5 で失敗する
+    <root>/hold/<task>.parent    helper を起こした python (plan.sh の本体) の pid (親だけを kill するテスト用)
+    <root>/hold/<task>.invocations  helper が走るたびに 1 行 (pid)。同時に 2 本走っていないことを数える
 """
 
 from __future__ import annotations
@@ -47,6 +49,8 @@ crewvia_create_worktree() {
   root="$(cd -P -- "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)" || return 1
   local hold="${root}/hold"
   local wt="${root}/.claude/worktrees/${mission_slug}/${task_id}-${task_slug}"
+  echo "$PPID" > "${hold}/${task_id}.parent"          # この helper を起こした plan.sh の python の pid (親だけ kill するため)
+  echo "$$" >> "${hold}/${task_id}.invocations"        # helper が走った回数 (同時に 2 本走っていないことを見る)
   if [[ -e "${hold}/${task_id}.enabled" ]]; then
     : > "${hold}/${task_id}.reached"
     local n=0
@@ -201,7 +205,7 @@ class Box:
         (self.root / "hold" / f"{tid}.go").write_text("")
 
     def unhold(self, tid="t001"):
-        for suffix in ("enabled", "reached", "go", "cmd", "fail"):
+        for suffix in ("enabled", "reached", "go", "cmd", "fail", "parent", "invocations"):
             (self.root / "hold" / f"{tid}.{suffix}").unlink(missing_ok=True)
 
     # -- namespace (fork した子の中で本物の cmd_pull を呼ぶ) ---------------------------

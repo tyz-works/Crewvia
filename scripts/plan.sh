@@ -3339,7 +3339,7 @@ def _pull_start(slug, task_id, agent, generation, execution_id, git_context):
     return outcome['started'], outcome['why']
 
 
-def _pull_git_context(slug, task_id, task_slug, worktree_path):
+def _pull_git_context(slug, task_id, task_slug, worktree_path, pass_fds=()):
     """record の `git` に入れる値 (記録だけ。判断には使わない)。決められない欄は入れない。branch / PR base は Resolver から、
     `head_at_start` は worktree の HEAD (W2 で前の試行の commit が残った worktree を再利用したとき、どの commit から
     始めた試行かを後から追う)。base は観測 (`git show-ref`) が要るので記録しない。"""
@@ -3352,7 +3352,7 @@ def _pull_git_context(slug, task_id, task_slug, worktree_path):
         pass        # worktree は作れている (= Resolver は通った)。記録の欄が欠けるだけ
     try:
         head = subprocess.run(['git', '-C', worktree_path, 'rev-parse', 'HEAD'], capture_output=True, text=True,
-                              timeout=30)
+                              timeout=30, pass_fds=pass_fds)
     except (OSError, subprocess.SubprocessError):
         return ctx          # git が無い・止まった: 記録の欄が欠けるだけ (start を止めない。判断に使わない欄)
     if head.returncode == 0 and head.stdout.strip():
@@ -3839,6 +3839,9 @@ def cmd_pull(args):
                 capture_output=True, text=True, cwd=REPO_ROOT,
                 # helper が Resolver に mission.yaml を読ませる。plan.sh 自身と同じ queue を指す。
                 env={**os.environ, 'CREWVIA_QUEUE': QUEUE_DIR},
+                # 準備ロックの記述子を子孫に持たせる: この python だけが SIGKILL されても、helper / git が生きている間は
+                # ロックが外れない (外れると、再試行の pull が同じ予約を再開して**別の helper を同時に走らせる**)。
+                pass_fds=(prepare_lock.fileno(),),
             )
             # git の警告 (fetch 失敗・local main fallback・既存 worktree の再利用) は成功時も残す。
             if wt.stderr.strip():
@@ -3880,7 +3883,8 @@ def cmd_pull(args):
 
     # start (reserved → running) は JSON を出す**前**にコミットする: reserved の試行では誰も作業を始めていない
     # (だから同じ Worker の再 pull が同じ試行を再開できる) という不変条件。CAS が外れたら何も書かず JSON も出さない。
-    git_context = (_pull_git_context(mission_slug, task_id, task_slug, worktree_path)
+    git_context = (_pull_git_context(mission_slug, task_id, task_slug, worktree_path,
+                                      pass_fds=(prepare_lock.fileno(),))
                    if worktree_path is not None else None)
     started, why = _pull_start(mission_slug, task_id, agent, started_holder[0], execution_id, git_context)
     if not started:

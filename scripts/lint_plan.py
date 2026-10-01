@@ -93,6 +93,10 @@ def _import_scripts_module(name: str):
 # knowledge/git-policy.md §2.4)。hooks/lib_skill_perms.check_permission() を呼ぶのと同じ作法。
 _GIT_POLICY = _import_scripts_module('lib_git_policy')
 
+# 試行 (Execution) の欄の整合は lib_execution.fields_problem の 1 か所 (vNext 01c E1)。Controller の STATE_INVALID・
+# 回復 R-5 の報告・この lint が同じ関数を呼ぶ (規則を複製しない)。欄が無い card (今の全 card) には何も言わない。
+_EXECUTION = _import_scripts_module('lib_execution')
+
 
 # ---------------------------------------------------------------------------
 # Module 1: Frontmatter schema check
@@ -155,6 +159,18 @@ def check_frontmatter(tasks: list[dict]) -> list[tuple[str, str, str]]:
         if not results or all(level != 'FAIL' for level, *_ in results):
             pass  # OK entries added by caller
 
+    return results
+
+
+def check_execution_fields(tasks: list[dict]) -> list[tuple[str, str, str]]:
+    """試行の欄 (`current_execution_id` 等) の整合。片方だけある・形が違う・status と終了コードの組が表に無い、は FAIL。
+    メッセージは**固定コード**と task id だけ (値は出さない)。"""
+    results = []
+    for meta in tasks:
+        problem = _EXECUTION.fields_problem(meta)
+        if problem:
+            results.append(('FAIL', 'execution',
+                            f"task/{meta.get('id', '<unknown>')}: 試行の欄が壊れています ({problem})"))
     return results
 
 
@@ -899,6 +915,7 @@ def lint_mission(slug: str, queue_dir: str, config_dir: str, strict: bool = Fals
     valid_tasks = [m for m in tasks if m.get('status') != lib_task_cards.CORRUPT_TASK_STATUS]
 
     all_results += check_frontmatter(valid_tasks)
+    all_results += check_execution_fields(valid_tasks)
     all_results += check_dependency_graph(valid_tasks)
     all_results += check_skill_alignment(valid_tasks, skill_perm_path)
     all_results += check_timeout_validity(valid_tasks, timeout_path)

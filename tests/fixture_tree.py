@@ -35,9 +35,10 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 #: plan.sh が自分の位置から import する補助。`lib_*` は名前でなく glob で拾う。
 #:
-#: **写さないもの (意図)**: `git-helpers.sh` — plan.sh は「その有無」で pull 時に worktree を
-#: 自動作成するかを決めるので、隔離コピーに置くとテストの外側 (本物の repo) に worktree を作る。
-#: `review-plan.sh` — `plan.sh review` が claude を起動する。どちらも必要なテストが自分で置く。
+#: `git-helpers.sh` は本物ではなく **stub** (`tests/fixtures/git-helpers-stub.sh`) を写す。plan.sh pull は
+#: helper が無いと needs_director に倒す (GIT-05) ので、隔離の継ぎ目は「不在」ではなく stub (git を呼ばず
+#: fixture の中に dir を作るだけ。本物の repo には届かない)。
+#: **写さないもの (意図)**: `review-plan.sh` — `plan.sh review` が claude を起動する。必要なテストが自分で置く。
 _PLAN_SUPPORT = ("lint_plan.py",)
 
 
@@ -59,4 +60,6 @@ def copy_plan_tree(root: pathlib.Path, src_root: pathlib.Path | None = None) -> 
     dest.mkdir(parents=True, exist_ok=True)
     for src in plan_tree_files(src_root):
         shutil.copy2(src, dest / src.name)
+    shutil.copy2((src_root or REPO_ROOT) / "tests" / "fixtures" / "git-helpers-stub.sh",
+                 dest / "git-helpers.sh")
     return dest / "plan.sh"

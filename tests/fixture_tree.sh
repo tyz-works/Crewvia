@@ -12,9 +12,10 @@
 #   copy_plan_tree    "$SRC_ROOT" "$DEST_ROOT"          # plan.sh + lint_plan.py + lib_*
 #
 # どちらも `DEST_ROOT/scripts/` だけに書く (queue / registry は呼び出し側が作る)。
-# 写さないもの: git-helpers.sh (plan.sh は「その有無」で pull 時の worktree 自動作成を決める。
-# 置くとテストの外側に worktree を作る) / review-plan.sh (claude を起動する)。必要なテストが
-# 自分で置く。
+# git-helpers.sh は本物ではなく **stub** (tests/fixtures/git-helpers-stub.sh) を写す。plan.sh pull は helper が
+# 無いと needs_director に倒す (GIT-05) ので、隔離の継ぎ目は「不在」ではなく stub (git を呼ばず fixture の
+# 中に dir を作るだけ)。本物の helper が要るテストは自分で置く。
+# 写さないもの: review-plan.sh (claude を起動する)。必要なテストが自分で置く。
 #
 # 「tests/ と scripts/test_*.sh が plan.sh / lib_* を個別にコピーしていたら赤」を
 # tests/test_registry_isolation.py が構造で固定している。
@@ -38,4 +39,5 @@ copy_plan_tree() {
         [ -f "${src_root}/scripts/${f}" ] || continue
         cp "${src_root}/scripts/${f}" "${dest_root}/scripts/${f}" || return 1
     done
+    cp "${src_root}/tests/fixtures/git-helpers-stub.sh" "${dest_root}/scripts/git-helpers.sh" || return 1
 }

@@ -740,7 +740,36 @@ env が無い理由は 3 つある: ① TARGET_DIR の Worker ② G3 前の `.cr
 
 ---
 
-## 12. G2 (t008) の実績と G3 への引き継ぎ
+## 12. G1 (t004) の実装記録と戻し方
+
+§1 の設計どおりに実装した。設計との差分だけを書く。
+
+- 実装: `scripts/git-helpers.sh` の `crewvia_create_worktree` (W2 再利用・W3/W4/W5 失敗。失敗は stderr の最後の行に `W<n>:` を出す。
+  stdout は path 1 行のまま) と `scripts/plan.sh` の `_pull_worktree_failed()` / `transition_to_needs_director()`
+  (`needs-director` コマンドと同じ本体を共有)。失敗は 2 つ目のロックで compare-and-set (status=in_progress・同じ worker・
+  この pull が書いた `started_at`) してから書く。外れたら何も書かず exit 1。
+- テスト: `tests/test_pull_worktree_failure_is_not_success.py` (使い捨ての bare origin + clone と本物の helper。W0・W2・W3・W4・W5 の (a) (b) (c)・
+  W6・N2・N6・N7・CAS・再配布なし・`target_dir`)。隔離 fixture は helper の「不在」ではなく stub
+  (`tests/fixtures/git-helpers-stub.sh`) を写す (§1.4)。
+- 族の掃除 (同じ「worktree を作れなかったのに成功」を扱う場所):
+
+  | 場所 | 処置 |
+  |---|---|
+  | `plan.sh pull` の worktree 作成 (N2〜N7) | 直した (B) |
+  | `kai-review.sh` の `plan.sh pull --task` (codex-review も同じ pull を通り worktree を作る) | 不処置。pull が exit 1 なら今も `plan pull failed — aborting review` で止まる。card は needs_director になるので dispatcher は再 spawn しない |
+  | `hooks/pre-tool-use.sh` の編集ガードのコメント | 事実に合わせて直した (「worktree を返すか exit 1」) |
+  | `agents/worker.md` の pull の手順・exit code 表 | 直した (exit 1 で cwd のまま作業しない・`worktree_path` が null になるのは `target_dir` の task だけ) |
+  | `scripts/start.sh` の kickoff 文言 (`worktree_path` が含まれる場合は cd) | 不処置。TARGET_DIR の Worker は null を受ける (範囲外)。crewvia 本体の Worker は exit 1 なら JSON を受けない |
+  | `scripts/test_handoff_path.sh` | 不処置。本物の helper の stdout が path であることだけを使う (契約は不変) |
+  | `crewvia_remove_worktree` | 不処置 (呼び出し元なし。§0) |
+
+- **戻し方**: PR revert → `scripts/sync-main-checkout.sh`。G1 は新しい status も欄も書かない
+  (`needs_director` と `needs_director_reason` は既存)。戻しても旧コードがそのまま読める。needs_director になった card は
+  Director が今の出口 (`plan.sh update <id> --status pending --reset`) で戻す。
+
+---
+
+## 13. G2 (t008) の実績と G3 への引き継ぎ
 
 - 実装: `scripts/lib_git_policy.py`（§3 の API。`GitPolicy` / `TaskBase` / `GitPolicyError` / `MissionNotFound` / `policy_from_text` / `load_git_policy` / `task_branch` / `task_worktree_path` / `task_base` / `pr_base` / `resolve_task` / `branch_name_problem` と CLI の `resolve-task` / `pr-base`）。テスト `tests/test_git_policy_resolver.py`、変異の実証 `tests/red_proof_git_policy_resolver.py`。**呼び出し元は 0**（`test_git_policy_has_no_callers_yet`。G3 の PR が `ALLOWED_CALLERS` に足す）。
 - 設計からの差分（G3 は次の形を前提にする）:

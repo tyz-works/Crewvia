@@ -244,7 +244,14 @@ PULL_RC=$?
 |---|---|---|
 | `0` | タスク取得成功。stdout に JSON を出力 | JSON をパースして実行に進む |
 | `2` | タスクなし（idle）。stderr に reason を出力 | 30秒待機して再試行 |
-| `1` | 実エラー（parse 失敗 / lock 取得失敗 / 不正引数等）。stderr に詳細 | 即座に Director に報告し終了 |
+| `1` | 実エラー（parse 失敗 / lock 取得失敗 / 不正引数 / **worktree を作れなかった**等）。stderr に詳細。stdout に JSON は出ない | 即座に Director に報告し終了。**cwd（主 checkout）で作業を始めない** |
+| `3` | `pull --task` の前提が外れた（別の target の task 等）。**何も書いていない** | stderr の理由を Director に報告して待つ |
+
+**worktree を作れなかった pull（exit 1・stderr に `worktree を作れませんでした (W3/W4/W5/N2/N6/N7)`）**: task は `needs_director` になり、
+assignment は外れている（plan.sh がやる）。あなたは何も片付けない（dir を消さない・branch を付け替えない）。stderr をそのまま Director に
+見せて待つ。主 checkout では**1 行も編集しない**。Director が原因（残った dir・branch を握る別の worktree）を片付けて
+`plan.sh update <id> --status pending --reset` で戻す。同じ task を再度 pull したとき、その task 自身の branch で登録済みの
+worktree は再利用される（`.crewvia-env` は書き直される）。
 
 **`||` で雑に握り潰さない**。idle と error を取り違えると、壊れた plan ファイルや lock 競合を「ただのアイドル」として無限にリトライしてしまう。
 
@@ -266,6 +273,8 @@ PULL_RC=$?
 
 `mission` フィールドは Worker の所属 mission slug。完了報告時 `plan.sh done` に `--mission <slug>` で渡すこと（active mission が複数あると task_id が衝突する可能性があるため）。
 
+`worktree_path` が null になるのは `target_dir` が非 null の task だけ（TARGET_DIR の checkout で作業する）。crewvia 本体の task
+（`target_dir` が null）では、成功した pull は必ず非 null で実在する worktree を返す（作れなければ上の exit 1）。
 `worktree_path` が null でない場合は専用 worktree が作成済み。タスク作業はその worktree 内で行う（後述）。
 
 idle 時の stderr 例（参考、Worker は内容を解釈しなくて良い）:

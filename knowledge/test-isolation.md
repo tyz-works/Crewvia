@@ -68,8 +68,7 @@ plan.sh などを一時ディレクトリへ写す fixture が「要ると思っ
 - 入口は 2 つ: `tests/fixture_tree.py`（`copy_plan_tree(root)`）と `tests/fixture_tree.sh`
   （`copy_plan_tree` / `copy_scripts_libs`）。`lib_*` を **glob で**まとめて写す — 新しい lib は何もしなくても
   次のコピーから付いてくる。
-- 意図して写さないもの: `git-helpers.sh`（plan.sh は「その有無」で pull 時の worktree 自動作成を決めるので、
-  置くとテストの外側に worktree を作る）、`review-plan.sh`（claude を起動する）。必要なテストが自分で置く。
+- 意図して**本物を写さない**もの: `git-helpers.sh`（GIT-05 以降、plan.sh pull は helper が無いと needs_director に倒すので、隔離コピーには「不在」でなく stub `tests/fixtures/git-helpers-stub.sh` を置く。以前は「不在」を継ぎ目にしていた。本物を置くとテストの外側に worktree を作る）、`review-plan.sh`（claude を起動する）。必要なテストが自分で置く。
 - 構造テスト `tests/test_fixture_tree_is_the_only_copier.py`: tests/ と scripts/test_*.sh の中で
   plan.sh / `lib_*` を**名前を指して**コピーしている箇所を Python は AST、shell / bats は論理行で拾い、
   helper を通っていなければ赤。許容リスト `ALLOWED` の各行は理由を持ち、該当が無くなったら（直したのに残った）赤。

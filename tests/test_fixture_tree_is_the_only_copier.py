@@ -161,6 +161,9 @@ def _fake_checkout(root: pathlib.Path) -> pathlib.Path:
     for name in ("plan.sh", "lint_plan.py", "lib_a.py", "lib_brand_new.py", "lib_x.sh",
                  "git-helpers.sh", "review-plan.sh", "watchdog.py"):
         (scripts / name).write_text(f"# {name}\n")
+    stub = root / "tests" / "fixtures"
+    stub.mkdir(parents=True)
+    (stub / "git-helpers-stub.sh").write_text("# stub\n")
     return root
 
 
@@ -169,8 +172,10 @@ def test_python_helper_copies_every_lib_by_glob(tmp_path):
     plan = fixture_tree.copy_plan_tree(tmp_path / "dest", src_root=src)
     copied = sorted(p.name for p in (tmp_path / "dest" / "scripts").iterdir())
     assert plan == tmp_path / "dest" / "scripts" / "plan.sh"
-    # 新しい lib (lib_brand_new.py) は、一覧に足さなくても写る。git-helpers.sh / review-plan.sh は写さない
-    assert copied == ["lib_a.py", "lib_brand_new.py", "lib_x.sh", "lint_plan.py", "plan.sh"]
+    # 新しい lib (lib_brand_new.py) は、一覧に足さなくても写る。review-plan.sh は写さない。
+    # git-helpers.sh は本物ではなく stub が入る (GIT-05: 「不在」は pull が needs_director になるので継ぎ目にできない)
+    assert copied == ["git-helpers.sh", "lib_a.py", "lib_brand_new.py", "lib_x.sh", "lint_plan.py", "plan.sh"]
+    assert (tmp_path / "dest" / "scripts" / "git-helpers.sh").read_text() == "# stub\n"
 
 
 def test_python_helper_covers_every_real_lib():
@@ -181,7 +186,7 @@ def test_python_helper_covers_every_real_lib():
 
 @pytest.mark.parametrize("fn,expected", [
     ("copy_scripts_libs", ["lib_a.py", "lib_brand_new.py", "lib_x.sh"]),
-    ("copy_plan_tree", ["lib_a.py", "lib_brand_new.py", "lib_x.sh", "lint_plan.py", "plan.sh"]),
+    ("copy_plan_tree", ["git-helpers.sh", "lib_a.py", "lib_brand_new.py", "lib_x.sh", "lint_plan.py", "plan.sh"]),
 ])
 def test_shell_helper_copies_every_lib_by_glob(tmp_path, fn, expected):
     src = _fake_checkout(tmp_path / "src")

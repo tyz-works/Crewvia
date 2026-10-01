@@ -23,6 +23,7 @@ vNext 01b の実装 PR (G1〜G4) はこの設計に従う。**コードの根拠
   | 本番確認 | t019 | |
   | 記録 | t020 | |
 
+- 情報が取れないときに既定値へ倒す箇所の全一覧と、自前の Git の規則を本物の git と突き合わせる手順は §11。
 - 順序: G1 は G2 より先に入る (t004 の blocked_by は t003 だけ)。そのため **G1 は Resolver なしで書ける形**にする (§1.7)。
   G3 は G1 と G2 の両方の後に入る。
 
@@ -143,7 +144,7 @@ plan.sh には git の知識を増やさない。
 | # | G1 の後 |
 |---|---|
 | N1 | 変えない (範囲外。意図どおり) |
-| N2 | **テストの継ぎ目として残す**。理由は下 |
+| N2 | **B (needs_director・exit 1・JSON なし)**。理由は `scripts/git-helpers.sh が無いので worktree を作れません`。テスト fixture の側を直す (下) |
 | N3 | W2 なら再利用して path を返す。W3・W4 なら B (needs_director・exit 1・JSON なし) |
 | N4 | B |
 | N5 | B (起きないが、同じ出口に入れる) |
@@ -151,19 +152,36 @@ plan.sh には git の知識を増やさない。
 | N7 | B に入れる (`die` で in_progress のまま止めない)。耐久性だけの失敗 (`_committed_durability_failure` plan.sh:2635) は今どおり警告して続行する (01a S5 の規則。memory `committed-but-not-durable-must-finish`) |
 | N8 | 01c の範囲 (pull の冪等化)。G1 では JSON が出ないので、Worker は主 checkout で作業を始めない (§1.6)。card は in_progress のまま残り、出口は Director の `update --reset` (今と同じ) |
 
-**N2 を失敗にしない理由**。`git-helpers.sh` が無いことは、テストの隔離が使っている継ぎ目になっている。
+**N2 を失敗にする理由** (Codex review 1 巡目 P1 で改めた)。
+
+- helper が無いときに成功 JSON + `worktree_path: null` を返すと、Worker は cd せず主 checkout に残る。GIT-05 が塞ぐ動作そのもの。
+- 「本番では git で追跡されているから無いのは壊れたときだけ」は根拠にならない。`git ls-files --error-unmatch` は index の検査で、
+  作業ツリーにファイルがあることを保証しない (誤って消した・checkout が途中で止まった・権限で読めない)。
+  **壊れたときに安全側に倒れること**がこの出口の仕事。
+- plan.sh は「本番か・テストか」を判定しない。helper が無ければ、どこで動いていても B。
+
+**テスト fixture の直し方**。今の fixture は helper の「不在」を隔離の継ぎ目にしている。
 
 - `tests/fixture_tree.sh:15` と `tests/fixture_tree.py:38` は、意図して git-helpers.sh を写さない。
 - `scripts/test_kai_review.sh:160-168` は「置くとテストの外側に worktree を作る」と書いている。
+  本物の helper は `git rev-parse --git-common-dir` (git-helpers.sh:12-20) で root を決めるので、fixture が本物の repo の中にあると、
+  worktree は本物の repo の `.claude/worktrees` にできる。
 - `copy_plan_tree` を使うテストは 37 ファイルある (`grep -rl 'copy_plan_tree\|fixture_tree' tests scripts`)。
+  pull の JSON の `worktree_path` が null であることを assert しているテストは 0 件 (`grep` で確認。G1 で全 suite を流して再確認する)。
 
-これを失敗にすると、crewvia-local の task を pull するテスト fixture が全部 needs_director に倒れる。
-本番の主 checkout では git-helpers.sh は git で追跡されているので、無いのは checkout が壊れたときだけ。G1 は次の 2 つを入れる。
+G1 はこの継ぎ目を **「不在」から「stub」へ** 置き換える。本番の出口は緩めない。
 
-1. N2 の経路でも stderr に 1 行出す (`[plan.sh pull] scripts/git-helpers.sh が無いので worktree を作りません`)。黙らせない。
-2. 「`scripts/git-helpers.sh` が git で追跡されている」を CI のテストで固定する (`git ls-files --error-unmatch`)。
+1. `tests/fixtures/git-helpers-stub.sh` を足す。`crewvia_create_worktree <mission> <task> <slug>` だけを持ち、git を呼ばない。
+   自分の位置 (`BASH_SOURCE`) から fixture の root を決め、`<fixture root>/.claude/worktrees/<mission>/<task>-<slug>` を `mkdir -p` して
+   その絶対パスを stdout に 1 行出す。fixture の外には書けない (root を git に聞かないので、本物の repo に届く経路が無い)。
+2. `copy_plan_tree` (sh / py の両方) が、この stub を `<dest>/scripts/git-helpers.sh` として写す。本物の helper は写さない。
+   stub の 1 行目に印 (`# crewvia test stub: git-helpers`) を置き、`tests/test_fixture_tree_is_the_only_copier.py` に
+   「隔離コピーの git-helpers.sh は stub だけ」を足す。
+3. 本物の git の動作を見るテスト (G1 の W0〜W7・`scripts/test_handoff_path.sh`) は、使い捨ての clone の中に本物の helper を自分で置く (今と同じ)。
+4. helper の不在そのものを確かめるテストを 1 本足す。stub を消した fixture で pull → exit 1・stdout 空・card が needs_director・assignment なし。
 
-env のスイッチで継ぎ目を作り直すことはしない (不変条件 5)。
+env のスイッチで継ぎ目を作り直すことはしない (不変条件 5)。stub は「ファイルの中身」であって env ではない。
+「`scripts/git-helpers.sh` が git で追跡されている」の CI テストは足してよいが、**安全の根拠には使わない** (上の理由)。
 
 ### 1.5 記録
 
@@ -198,9 +216,10 @@ worktree の作成はロックの外。落ちる点ごとに、次のロック�
 - `scripts/plan.sh` `cmd_pull`:
   - §1.2 の 2 つ目のロック。
   - `cmd_needs_director` と共有する遷移関数。
-  - N6・N7 を B に入れる。
-  - N2 の stderr 行。
+  - N2・N6・N7 を B に入れる。
   - 成功時に git-helpers の stderr を流す。
+- `tests/fixtures/git-helpers-stub.sh` と `copy_plan_tree` (sh / py) の変更、fixture の構造テスト (§1.4)。
+  **plan.sh の変更と同じ PR に入れる**。別の PR にすると、間の commit で 37 ファイルのテストが needs_director に倒れる。
 - `hooks/pre-tool-use.sh:205-207` のコメントを事実に合わせる (「pull は worktree を返すか、失敗で exit 1 して JSON を出さない」)。
 - `agents/worker.md`:
   - pull が exit 1 のときの手当て。cwd で作業を始めない。`plan` の stderr を Director に見せる。待つ。
@@ -271,14 +290,48 @@ git:
 ### 2.3 branch 名の規則
 
 git の `check-ref-format` を**写さない**。より狭い許可集合を決めて、その中だけを通す。
-狭い集合は git の規則の部分集合なので、通したものが git に拒否されることは無い。
+狭い集合が git の規則の部分集合であることは、**書いた規則を本物の `git check-ref-format --branch` に通して確かめる** (下の手順)。
+「部分集合のはず」と推論で済ませない (1 巡目の規則は `release.`・`-release`・`task/demo/t001-work.` を通していたが、git はすべて拒否する)。
 
-- 成分は `/` で区切る。各成分は `[A-Za-z0-9._-]+` で、`.` で始まらず、`.lock` で終わらない。
-- `..` と `@{` を含まない。先頭・末尾の `/` と、連続した `/` を含まない。全体で 200 文字以内。
-- 置換に入る値も同じ規則で検査する。今の値はすべて許可集合に入る。
-  - `{task_slug}` は `_slugify` で `[a-z0-9-]`、40 文字以内 (plan.sh:3482-3487)。
+規則 (すべて満たすものだけを通す):
+
+- 成分は `/` で区切る。先頭・末尾の `/` と、連続した `/` を含まない。全体で 200 文字以内。
+- 各成分は `[A-Za-z0-9][A-Za-z0-9._-]*`。**英数字で始まる** (`.`・`-`・`_` で始めない。全体の先頭の `-` もこれで落ちる)。
+- 各成分は `.` で終わらず、`.lock` で終わらない (全体の末尾の `.` もこれで落ちる)。
+- `..` を含まない。
+- 全体が `HEAD` でない。最初の成分が `refs` でも `origin` (`REMOTE`) でもない (git は通すが、`refs/heads/x`・`origin/main` を
+  branch 名に書くと base の解決 (`origin/<base_branch>`) と読み違える。狭める側なので部分集合は崩れない)。
+- 置換に入る値も同じ規則で検査し、置換後の全体も検査する。今の値はすべて許可集合に入る。
+  - `{task_slug}` は `_slugify` で `[a-z0-9-]`、40 文字以内、末尾の `-` を落とす (plan.sh:3482-3487)。空なら task_id。
   - `{task_id}` は `tNNN`。
   - `{mission_slug}` は日付 + kebab。
+
+境界例 (`git check-ref-format --branch` の結果は git 2.43.0 で実測):
+
+| 名前 | git | この規則 | 落とす規則 |
+|---|---|---|---|
+| `release.` | 拒否 | 拒否 | 成分が `.` で終わる |
+| `-release` | 拒否 | 拒否 | 英数字で始まらない |
+| `task/demo/t001-work.` | 拒否 | 拒否 | 成分が `.` で終わる |
+| `a/b.lock`・`a.lock/b` | 拒否 | 拒否 | `.lock` で終わる成分 |
+| `a/.b` | 拒否 | 拒否 | 英数字で始まらない |
+| `a..b`・`a//b`・`/a`・`a/` | 拒否 | 拒否 | `..`・`/` の規則 |
+| `a@{b` | 拒否 | 拒否 | `@` は文字集合に無い |
+| `HEAD` | 拒否 | 拒否 | `HEAD` |
+| `a/-b`・`_a`・`a/_b` | 通す | 拒否 | 英数字で始まらない (狭める側) |
+| `@`・`a@b` | 通す | 拒否 | 文字集合 (狭める側) |
+| `origin/main`・`refs/heads/x` | 通す | 拒否 | 最初の成分 (狭める側) |
+| `a./b` | 通す | 拒否 | 成分が `.` で終わる (狭める側) |
+| `main`・`develop`・`release/2026.10`・`task/20261001-x/t001-y` | 通す | 通す | |
+
+**部分集合の確かめ方 (G2 / t008 の受入条件)**:
+
+1. 上の表の全行と、規則の各条項の境界を突く合成例 (各条項につき「1 文字足す・引く」形) を単体テストのパラメタに置く。
+2. 加えて、文字集合 `[A-Za-z0-9._/@{}~^:?*\[\\ -]` と制御文字から長さ 1〜6 の文字列を固定 seed で数千件生成する。
+3. 規則が**通した**ものは、すべて `git check-ref-format --branch` も rc=0 であることを assert する
+   (Resolver は subprocess を呼ばないが、テストは git を呼んでよい)。1 件でも外れたら赤。
+4. 既定の pattern で今の active / archive の全 task の branch を作り、全部が規則を通り、git も通すことを assert する (既存の名前を拒否しない側の確認)。
+5. 赤の実証: 規則から「英数字で始まる」を外すと 3 が赤になることを PR 説明に載せる。
 
 ### 2.4 読み口と lint
 
@@ -357,7 +410,15 @@ def pr_base(policy) -> str
   関数の中で `resolve-task` を 1 回呼び、branch / path / base の候補を受け取る。:62・:65・:74-78 のリテラルを消す。
   §1.3 の判定はそのまま bash に残る。
 - plan.sh は Python なので CLI を通さず `import lib_git_policy` する (lib は普通に import する。scripts/CLAUDE.md「書き込みの入口」の注意)。
-  pull は `pr_base(policy)` を `.crewvia-env` に書く (§5)。
+- **`plan.sh pr-base` (G3)**: Worker が PR base を取る唯一の入口 (§5)。読むだけで、queue を書かない (ロックも取らない)。
+  - 引数なし: `AGENT_NAME` の assignment (`<mission>:<task>`。plan.sh:3082 と同じ読み口) から task を決める。
+    `--mission <slug> --task <tid>` を渡せばそれを使う。
+  - task の card が `status == in_progress` かつ `worker == AGENT_NAME` であることを確かめる (他人の task の base を返さない)。
+  - card に `target_dir` があれば `lib_git_policy.DEFAULT_PR_BASE` (`main`) を返す。mission の `git:` は見ない (範囲外。今の挙動を保つ。
+    この既定値を使う場所は plan.sh のこの分岐 1 か所だけで、リテラルの `"main"` は書かない。§0・§6)。
+  - それ以外は `pr_base(load_git_policy(slug))`。
+  - stdout は branch 名 1 行だけ。**決められなければ exit 1・stdout 空** (`AGENT_NAME` が空・assignment が無い / 読めない /
+    形が違う・card が合わない・`GitPolicyError`)。理由は stderr。exit 2 は idle の意味なので使わない。
 - **G2 は呼び出し元ゼロ**で merge する (R2)。G2 の時点で `grep -rn lib_git_policy scripts hooks` に出るのは lib 自身とテストだけ。
 
 ---
@@ -382,10 +443,11 @@ def pr_base(policy) -> str
 | `scripts/git-helpers.sh:117-135` `crewvia_create_pr` (`--base main` :131) | PR base | **寄せる (G3)** | 呼び出し元ゼロ。消さずに `pr-base` を使う。消す案は API を変えるので範囲外 |
 | `scripts/plan.sh:3482-3491` `_slugify` | branch / path の成分 | 寄せない | task_slug は task の属性で policy ではない。pattern の `{task_slug}` に入る値として Resolver が検査する (§2.3) |
 | `scripts/plan.sh:3495-3527` | worktree を作るか (`target_dir` / git-helpers の有無)・失敗の扱い | G1 で §1.2 / §1.4 | `target_dir` で分ける部分は範囲外の境界なので残す |
-| `scripts/plan.sh:3511-3515` `.crewvia-env` | Worker に渡す値 | **G3 で `CREWVIA_PR_BASE` を足す** (§5) | |
+| `scripts/plan.sh:3511-3515` `.crewvia-env` | Worker に渡す値 | **変えない**。PR base は env で渡さない (§5) | |
+| (新規) `scripts/plan.sh pr-base` | Worker 向けの PR base | **G3 で足す** (§3・§5) | |
 | `scripts/sync-main-checkout.sh:99-154` | 主 checkout を `origin/main` に ff | **寄せない** | 本番 crewvia を更新する手順で、task の policy ではない。crewvia の本番 branch は mission ごとに変わらない |
 | `scripts/lib_daemon_watch.py:393` `fetch_origin(branch="main")`・`:410` `commits_behind(ref="origin/main")`・`:426` `changed_files_vs` | 主 checkout の drift | **寄せない** | 同上 (dispatcher.sh:3048-3130 `check_main_checkout_drift` が使う) |
-| `scripts/kai-review.sh:307-313` diff base (`fetch origin main` → `...HEAD`) | review の diff の base | **寄せる (G3)**: `lib_git_policy.py pr-base --mission "$MISSION_SLUG"` の値を fetch する | kai-review は mission を知っている (:82・:130-140 で pull の前に解決して保持)。PR の実 base (`gh pr view --json baseRefName`) を使う案は、stacked PR のレビューの意味を変えるので範囲外 (§10) |
+| `scripts/kai-review.sh:307-313` diff base (`fetch origin main` → `...HEAD`) | review の diff の base | **寄せる (G3)**: `lib_git_policy.py pr-base --mission "$MISSION_SLUG"` の値を fetch する。**取れなければ `main` に倒さず**、今の fetch 失敗 (:309-311) と同じ `fail_needs_director` で止める | kai-review は mission を知っている (:82・:130-140 で pull の前に解決して保持)。PR の実 base (`gh pr view --json baseRefName`) を使う案は、stacked PR のレビューの意味を変えるので範囲外 (§10) |
 | `scripts/kai-review.sh:290-293` review 用 worktree (`mktemp -d`・detached) | 一時 worktree の path | 寄せない | task の worktree ではない。使い捨てで、PR head を detached で見るだけ |
 | `scripts/worktree_gc.py:324・:682・:754` `.claude/worktrees` | 片付けの根 | **G3 で `lib_git_policy.DEFAULT_WORKTREE_ROOT` を import** | 値を 1 か所に置く。worktree_root は既定値に固定なので、定数の共有で足りる (§2.1) |
 | `scripts/worktree_gc.py:163` `.quarantine` | 隔離先 | 寄せない | gc 自身の規則 |
@@ -401,8 +463,8 @@ def pr_base(policy) -> str
 
 | 場所 | 書いてあること | 扱い |
 |---|---|---|
-| `agents/worker.md:584`・`:922` | `gh pr create ... --base main` | **書き換える** → `--base "${CREWVIA_PR_BASE:-main}"` (§5) |
-| `agents/worker.md:937-945` | stacked PR の判定「base が main / master 以外」・`gh pr edit {子PR} --base main` | **書き換える** → `${CREWVIA_PR_BASE:-main}` |
+| `agents/worker.md:584`・`:922` | `gh pr create ... --base main` | **書き換える** → `PR_BASE="$(plan pr-base)" \|\| exit 1` の後に `--base "$PR_BASE"` (§5) |
+| `agents/worker.md:937-945` | stacked PR の判定「base が main / master 以外」・`gh pr edit {子PR} --base main` | **書き換える** → 同じく `plan pr-base` の値 |
 | `agents/worker.md:148-152`・`:865-879` | worktree path と branch の形 | **文言を変える**: 「既定では」と添え、決めるのは pull で、JSON の `worktree_path` と `git branch --show-current` を見る、と書く。形の説明は残す |
 | `agents/worker.md:294-301` | `worktree_path` が空なら cd しない | G1 で「空になるのは target_dir の task だけ」を書く |
 | `agents/director.md:884-900` | branch / worktree の命名 | 同上 (既定値として書き、mission.yaml の `git:` で変わると足す。§2 の G3 以降の注意も) |
@@ -410,7 +472,7 @@ def pr_base(policy) -> str
 | `agents/director.md:962-1002` | 主 checkout の同期 | 寄せない (§4.1 sync と同じ) |
 | `agents/director.md:1156-1163` | `git log origin/task/...` | 寄せない (調査の例) |
 | `agents/worker-codex.md:122-125` | 「origin/main との diff」 | **書き換える** → 「mission の PR base (`lib_git_policy.py pr-base`) との diff」(kai-review.sh の G3 の変更に合わせる) |
-| `skills/crewvia-qa/SKILL.md:17`・`:148` | `git diff main...HEAD` | **書き換える** → `git diff "origin/${CREWVIA_PR_BASE:-main}...HEAD"`。local `main` は主 checkout と ref を共有していて古くなる (kai-review.sh:296-306 が実測した理由と同じ)。`origin/<base>` は pull の fetch (git-helpers.sh:72) で更新される |
+| `skills/crewvia-qa/SKILL.md:17`・`:148` | `git diff main...HEAD` | **書き換える** → `PR_BASE="$(plan pr-base)" \|\| exit 1` の後に `git diff "origin/${PR_BASE}...HEAD"`。local `main` は主 checkout と ref を共有していて古くなる (kai-review.sh:296-306 が実測した理由と同じ)。`origin/<base>` は pull の fetch (git-helpers.sh:72) で更新される |
 | `skills/crewvia-plan-review/SKILL.md:127-129` | PR head の checkout / push | 寄せない (head は PR の属性) |
 | `agents/verifier.md:64` | push の禁止 | 対象外 |
 | `knowledge/*.md` の `origin/main` | 戻し方 (`git merge --ff-only origin/main`)・経緯・実測 | **書き換えない**。主 checkout の同期 (寄せない側) か、記録。構造ガードの対象外 (§6) |
@@ -419,16 +481,21 @@ def pr_base(policy) -> str
 
 ## 5. PR base を Worker に渡す方法 (G3 / G4)
 
+1 巡目の案 (`.crewvia-env` に `CREWVIA_PR_BASE` を書き、文書は `${CREWVIA_PR_BASE:-main}`) は捨てた (Codex review 1 巡目 P2)。
+env が無い理由は 3 つある: ① TARGET_DIR の Worker ② G3 前の `.crewvia-env` ③ cwd が主 checkout に戻った shell。
+`:-main` は 3 つを区別できない。③ は cutover 後も起きる (Bash の cwd は主 checkout に戻る。memory
+`bash-cwd-resets-to-main-checkout-in-worktree-tasks`) ので、`pr_base: develop` の mission で PR 作成と QA の diff が黙って `main` を使う。
+「cutover 前は custom の policy が無い」は ② の言い訳にしかならず、③ には効かない。
+
 | 決定 | 内容 |
 |---|---|
-| 渡す変数 | `.crewvia-env` に `export CREWVIA_PR_BASE=<pr_base>` を 1 行足す (G3)。`CREWVIA_BASE_BRANCH` は出さない: Worker が base を使う場面は無い (branch は pull が作る)。必要になった時点で足す |
-| 書くとき | pull が毎回原子的に書く (`_STORE.atomic_write_text`)。**W2 の再利用でも書き直す** (§1.3)。再 pull で古い値が残らない |
-| 文書の書き方 | Worker の Bash は**呼び出しごとに env が消える** (Claude Code の Bash tool は cwd だけを持ち越す)。だから「最初に 1 回 source」では効かない。PR を作るコードブロックの先頭で、その都度読む: `[ -f .crewvia-env ] && . ./.crewvia-env` → `gh pr create ... --base "${CREWVIA_PR_BASE:-main}"` |
-| `-f` で確かめる理由 | `source .crewvia-env && gh pr create ...` の形は、TARGET_DIR の Worker (`.crewvia-env` が無い) で PR を作らずに止まる |
-| 既定値 `:-main` | env が無い 3 つの場合に、今と同じ `main` になる: ① TARGET_DIR の Worker (範囲外。今も main)、② G3 より前に作られた worktree の `.crewvia-env` (この行が無い)、③ cwd が主 checkout に戻ってしまった shell (`.crewvia-env` は gitignore 済み .gitignore:34 で、主 checkout には無い)。②③ で既定値に落ちても、G3 の cutover を確認するまで `git:` を書かない (§2.1) ので、そのときの policy は必ず `main` になり、食い違わない |
-| `:?` (無ければ止める) を採らない理由 | ① の TARGET_DIR の Worker を止めてしまう。範囲外の挙動を変えることになる |
+| 渡し方 | **env では渡さない**。PR base が要るコードブロックは、その都度 `plan pr-base` (§3) で Resolver から取る。`.crewvia-env` には足さない。`CREWVIA_BASE_BRANCH` も出さない (Worker が base を使う場面は無い。branch は pull が作る) |
+| 区別の置き場所 | ① と「crewvia 本体の task で情報が欠けた」の区別は、**env の有無ではなく card の `target_dir`** で plan.sh がする。① は `main` (今の挙動。既定値は plan.sh の 1 か所だけ)。crewvia 本体の task は Resolver の値で、取れなければ exit 1 |
+| cwd に依らない理由 | `plan pr-base` は `AGENT_NAME` (start.sh:292・:786 で Worker の起動 env に入る。Bash の呼び出しごとに消えない) と assignment から task を決める。cwd も `.crewvia-env` も読まない。③ でも正しい値が出る |
+| 文書の書き方 | `PR_BASE="$(plan pr-base)" \|\| { echo "PR base を決められない。Director に報告して待つ" >&2; exit 1; }` → `gh pr create ... --base "$PR_BASE"`。**既定値 (`:-main`) を文書に書かない** |
+| 止まるとき | exit 1 は「PR を作らずに止まる」。Worker は `plan needs-director <id> "<stderr>"` で Director に渡す (worker.md の pull exit 1 の手当てと同じ段落)。止まるのは「assignment が無い / 合わない」と「mission.yaml の `git:` が壊れている」のときで、どちらも黙って `main` にすると PR の行き先を間違える |
 | 書き換える範囲 | §4.2 の「書き換える」行だけ。knowledge/ は対象外 |
-| G4 の QA (t022) | 3 つの shell で、書き換えた全コードブロックを実際に評価する: env あり (custom `pr_base: develop` の隔離 mission) / env なし (G3 前の形の `.crewvia-env`) / TARGET_DIR (`.crewvia-env` なし)。`gh` は stub にして、`--base` に渡った値を記録する |
+| G4 の QA (t022) | 書き換えた全コードブロックを実際に評価する。`gh` は stub にして、`--base` に渡った値を記録する。shell は 4 つ: (1) worktree の cwd・custom `pr_base: develop` の隔離 mission → `develop` (2) **同じ task で cwd を主 checkout に移した shell** → `develop` (1 巡目の案ではここが `main` になる。赤の実証にする) (3) TARGET_DIR の Worker → `main` (4) assignment を消した shell → exit 1 で `gh` が呼ばれない |
 
 ---
 
@@ -460,8 +527,8 @@ def pr_base(policy) -> str
 |---|---|---|---|---|
 | G1 (t004) | worktree を作れない pull が exit 1 + needs_director になる (今は成功・主 checkout)。登録済みで branch が一致する path は再利用する。再 pull で `.crewvia-env` が書き直される。成功時も git の警告が stderr に出る | **ユーザー承認** (t007) | **実際の Worker の pull で worktree と `.crewvia-env` ができる** (通常の割り当て 1 件。JSON の `worktree_path` が非 null・dir がある・`.crewvia-env` を source でき 3 変数が出る・`git -C <wt> branch --show-current` が task branch)。再利用の経路を 1 件観察する (`update --reset` で戻した task の再 pull。observation 用 mission は `init --inactive`。memory `disposable-mission-init-exposes-to-dispatcher-immediately`)。監査ログに `op=pull to=needs_director` が**出ていない** (出ていれば 1 件ずつ理由を読む) | PR revert → `scripts/sync-main-checkout.sh`。G1 は新しい status も欄も書かない (`needs_director` と `needs_director_reason` は既存のもの)。戻しても旧コードがそのまま読める。needs_director になった card は Director が今の出口で戻す |
 | G2 (t008) | **なし** (呼び出し元ゼロ) | 通常 merge | `grep -rn lib_git_policy scripts hooks` が lib 自身とテストだけ | revert |
-| G3 (t012) | branch / path / base の式が Resolver から来る (既定値では同じバイト)。`.crewvia-env` に `CREWVIA_PR_BASE` が増える。kai-review の diff base が `pr-base` 経由 (既定値では `main`)。lint が `git:` を検査する。CI に構造ガード | **ユーザー承認** (t015) | 実際の Worker の pull で、作られた branch 名と path が G3 前の式の値と同じ (同じ mission の G3 前の worktree と並べる)。`.crewvia-env` に `CREWVIA_PR_BASE=main`。次の codex-review が通常どおり diff を取る (kai-review のログの `Computing diff`)。active mission 全部の `plan.sh lint` が rc=0 (`git:` を書いた mission は 0 件のはず) | revert → sync-main-checkout。`.crewvia-env` の余分な行は旧 Worker 文書が読まないので害が無い。**`git:` を書いた mission があるなら revert の前に消す** (旧 plan.sh は黙って無視するので、custom の base が効かなくなる。§2.1) |
-| G4 (t016) | エージェント向け文書の `--base` と diff base が env 参照になる (既定値では同じ `main` / `origin/main`) | **ユーザー承認** (t018) | 次に PR を作った Worker の PR の base が `main` (`gh pr view --json baseRefName`)。QA Worker の diff が `origin/main...HEAD` で取れている | revert。文書なので restart は不要。**動いている Worker のセッションには、起動時に読み込んだ版が残る** (次の起動から入れ替わる) |
+| G3 (t012) | branch / path / base の式が Resolver から来る (既定値では同じバイト)。`plan.sh pr-base` が増える。kai-review の diff base が `pr-base` 経由 (既定値では `main`)。lint が `git:` を検査する。CI に構造ガード | **ユーザー承認** (t015) | 実際の Worker の pull で、作られた branch 名と path が G3 前の式の値と同じ (同じ mission の G3 前の worktree と並べる)。その Worker の assignment で `plan pr-base` が `main` を返し、cwd を主 checkout に移しても同じ。次の codex-review が通常どおり diff を取る (kai-review のログの `Computing diff`)。active mission 全部の `plan.sh lint` が rc=0 (`git:` を書いた mission は 0 件のはず) | revert → sync-main-checkout。**G4 が入っていれば先に G4 を revert する** (G4 の文書は `plan pr-base` を呼ぶので、G3 だけ戻すと PR を作るたびに exit 1 で止まる。止まる側に倒れるので PR の行き先は間違えない)。**`git:` を書いた mission があるなら revert の前に消す** (旧 plan.sh は黙って無視するので、custom の base が効かなくなる。§2.1) |
+| G4 (t016) | エージェント向け文書の `--base` と diff base が `plan pr-base` の値になる (既定値では同じ `main` / `origin/main`)。取れなければ PR を作らず止まる | **ユーザー承認** (t018) | 次に PR を作った Worker の PR の base が `main` (`gh pr view --json baseRefName`)。QA Worker の diff が `origin/main...HEAD` で取れている | revert。文書なので restart は不要。**動いている Worker のセッションには、起動時に読み込んだ版が残る** (次の起動から入れ替わる) |
 
 共通:
 - **merge 後に主 checkout を ff するまで、本番は旧コードのまま** (memory `main-checkout-lags-after-pr-merge`)。Director の確認は、
@@ -487,7 +554,7 @@ def pr_base(policy) -> str
 | §14-7 同じ規則の二重実装 | branch / path / base の式は lib_git_policy の 1 か所。lint も Resolver を呼ぶ。needs_director の遷移は cmd_needs_director と共有する。コピーは構造ガードで落とす (§6) |
 | §14-10・11 Agent 単位 / 試行ごとの branch | pattern に `{mission_slug}` と `{task_id}` を必須にし、`{agent}` を置換子に持たない (§2.1) |
 | §14-12 Git 状態から Task 状態を推測して確定 | しない。W2 の再利用は「同じ task の branch」を見るだけで、card は書かない。B の needs_director は**pull が自分で起こした失敗**の記録で、git の状態から完了・失敗を推測していない |
-| §14-13 worktree の失敗で主 checkout に fallback | G1 で塞ぐ (§1.4)。残る null は N1 (target_dir。原案 GIT-05 の例外) と N2 (テストの継ぎ目。本番では git の追跡を CI で固定) |
+| §14-13 worktree の失敗で主 checkout に fallback | G1 で塞ぐ (§1.4)。残る null は N1 (target_dir。原案 GIT-05 の例外) だけ。helper が無い (N2) も B に入れる |
 | §14-15 lock 内の network / subprocess | worktree 作成・fetch はロックの外のまま。2 つ目のロックは card の読み直しと書き込みだけ |
 | §14-16 silent 修復 / silent fallback | 未知の mode・未知の欄・読めない mission.yaml・既定値以外の worktree_root を拒否する (§2.2)。fetch の失敗と local main への fallback は GIT-04 で**残す**動作だが、成功時も stderr に出す (§1.5) |
 | §14-17 unknown field の削除 | `git:` は `dump_yaml` で往復してバイトが変わらないことをテストで固定する (§2.4) |
@@ -496,7 +563,7 @@ def pr_base(policy) -> str
 | 不変条件 2 (識別子はファイル名) | `{task_id}` には card のファイル名から来る id を入れる (pull の `meta['id']` は `normalize_card` がファイル名と照合済み) |
 | 不変条件 3 (依存は lib_dep_rules) | 触らない。B は `failed` を書かないので、依存の保留も起きない |
 | 不変条件 4 (デーモンの再起動) | restart 不要 (§7)。必要になれば sync-main-checkout 経由 |
-| 不変条件 5 (env の停止スイッチなし) | 付けない。N2 の継ぎ目は「ファイルが無い」で、env ではない |
+| 不変条件 5 (env の停止スイッチなし) | 付けない。テストの隔離は env ではなく、fixture が写す stub の helper (§1.4) |
 | 不変条件 6・7 | 触らない |
 | 01a: plan.sh は `with_lock` の中だけで queue を書く | B の書き込みは 2 つ目の `with_lock` の中 |
 | 01a: ロック取得の直後に `recover_before` | B の 2 つ目のロックも呼ぶ (§1.2) |
@@ -519,19 +586,23 @@ def pr_base(policy) -> str
   - 2 つ目のロックの CAS: worktree 作成の間に `update --reset` を差し込んで、pull が何も書かない。
   - §1.6 の「needs_director を書いた後・枠の撤去の前」で落とし、次のロックで R-2 が枠を消す。
   - 欠陥版 (B を元の WARNING に戻す) で、主 checkout に残る形が赤になる。
-  - N2 の継ぎ目の既存テストが緑のまま。
+  - `copy_plan_tree` を使う既存の 37 ファイルが stub の helper で緑のまま。fixture の root の外に dir が 1 つもできていない (本物の repo の `git worktree list` が前後で同じ)。
+  - stub を消した fixture の pull が B (N2)。
 - **G2 (t009)**:
   - 原案 §10.4 の各行を単体テストにする。
   - 既定値の branch / path が git-helpers.sh の式と同じ (G2 の時点の main の式と照合)。
   - §2.2 の拒否の各行 (4 字下げ・未知の欄・型・空・制御文字・`..`・絶対パス・`integration`・`Unreadable`)。
+  - §2.3 の境界表の全行と、`git check-ref-format --branch` との部分集合の確かめ (§2.3 の手順 1〜5)。
   - `dump_yaml` で往復してもバイトが変わらない。
   - 呼び出し元がゼロ。
 - **G3 (t013)**:
   - 既存の mission (`git:` なし) で、G3 の前と後の branch と path がバイト単位で一致する。
-  - custom の `base_branch` / `pr_base` を書いた隔離 mission で、base と `.crewvia-env` に反映される。
+  - custom の `base_branch` / `pr_base` を書いた隔離 mission で、task branch の base と `plan pr-base` の値に反映される。
+  - `plan pr-base` の拒否: `AGENT_NAME` 空・assignment なし・形が違う・card の worker が別人・card が in_progress でない・`git:` が壊れている → exit 1・stdout 空。`target_dir` の task は mission の `pr_base` に関わらず `main`。
+  - kai-review: `pr-base` が拒否される mission で `fail_needs_director` になり、`main` の diff を取らない。
   - 構造ガードの陽性対照・件数の下限・赤の実証・死んだ allowlist 行。
   - lint が parse_yaml と本物の YAML パーサの食い違いを FAIL にする。
-- **G4 (t022)**: §5 の 3 つの shell。書き換えていない決め打ちが文書に残っていない (構造ガードの文書側が緑で、件数が 0 でない)。
+- **G4 (t022)**: §5 の 4 つの shell。書き換えていない決め打ちが文書に残っていない (構造ガードの文書側が緑で、件数が 0 でない)。
 
 ---
 
@@ -548,3 +619,54 @@ def pr_base(policy) -> str
 6. **fetch のタイムアウト**: git-helpers.sh:72 の `git fetch origin` に上限が無い。認証のプロンプトで止まると pull が戻らない
    (ロックの外なので他は止まらない)。`GIT_TERMINAL_PROMPT=0` と上限を付けるかを、実測してから決める。
 7. **TARGET_DIR の task の branch / base**: 原案どおり後続。
+
+---
+
+## 11. 情報が取れないときの既定値の一覧 (族の掃除。Codex review 1 巡目)
+
+1 巡目の P1 (helper が無い → 成功 + null) と P2 (env が無い → `main`) は同じ族で、
+「情報が取れないときに既定値 (`main` / null / 成功) に倒す」。設計全体からこの形を全部拾い、次のどちらかに分ける。
+
+- **(a) 保つ** — 今の挙動を保つ既定値として正しい。理由を書く。
+- **(b) 止める** — 停止・exit 1・needs_director にする。
+
+拾い方: 本文の「fallback」「既定」「倒す」「続行」「null」「`:-`」と、§1.1 の N 表・§1.3 の W 表・§2.2 の表を 1 行ずつ見た。
+
+| # | 場所 | 取れない情報 | 倒し先 | 判定 | 理由 |
+|---|---|---|---|---|---|
+| D1 | pull・N1 (§1.4) | (取れないのではなく) card に `target_dir` がある | `worktree_path: null` | (a) | 情報は取れている (card の欄)。原案 GIT-05 の例外で範囲外。Worker は TARGET_DIR の checkout で作業する |
+| D2 | pull・N2 (§1.4) | `scripts/git-helpers.sh` | 成功 + null | **(b) B** | 1 巡目 P1。null は Worker を主 checkout に残す。テストの隔離は stub に移す |
+| D3 | pull・N3〜N5 (§1.3 W3〜W5) | worktree を作れた / 使えるか | 成功 + null (今) | **(b) B** | 主 checkout に残る |
+| D4 | pull・N6 | helper の stdout (path) | `worktree_path: ""` | **(b) B** | 空文字は Worker に null と同じに読まれる |
+| D5 | pull・N7 | `.crewvia-env` を書けたか | `die` で in_progress のまま | **(b) B** | 誰も片付けない card を残さない |
+| D6 | pull・N7 の耐久性だけの失敗 | 親 dir の fsync | 警告して続行 | (a) | 内容は書けている。01a S5 の規則 (`committed-but-not-durable-must-finish`)。止めると再試行でも直らない半端が残る |
+| D7 | §1.3 の path の正規化 | `realpath` | 「一致しない」 | (b) 側 | 一致しない → W4/W5 → B。再利用 (W2) の側に倒さない |
+| D8 | §1.3 W6 | `git fetch origin` の結果 | 警告して手元の `origin/<base>` で続行 | (a) | GIT-04。base が少し古い害は小さい (PR は GitHub 上で base と突き合わされ、CI もそこで走る)。止めるとネットワーク断の間 1 件も pull できない。警告は成功時も stderr に出す (§1.5) |
+| D9 | §1.3 W7 | `refs/remotes/origin/<base_branch>` | local `<base_branch>` に fallback して警告 | (a) | GIT-04 の現状維持。local も無ければ W5 → B。custom の `base_branch` でも同じ規則 (どちらも無い = B) |
+| D10 | §1.3 W1 | 既存 branch の base | base を無視して既存の branch を使う | (a) | GIT-04 の現状維持。「同じ task の branch = 同じ task の作業」。再 pull で作業を捨てない |
+| D11 | pull で `agent` が空 (§1.2) | 呼び出し元の名前 | `worker` 空のまま CAS | (a) | 今の pull の挙動。撤去する枠が無いだけで、needs_director の遷移は同じ |
+| D12 | `_slugify` (plan.sh:3482-3487) | title から slug を作れない (ASCII が無い) | task_id | (a) | 決定的で一意 (不変条件 2)。branch 名の規則 (§2.3) も通る |
+| D13 | mission.yaml に `git:` キーが無い (§2.2) | policy | 既定値 (`main` 等) | (a) | 「書いていない」は明示の状態で、今ある全 mission の形 (GIT-01)。読めないとは区別する (D14・D15) |
+| D14 | `git:` があるが mapping でない・字下げで読み飛ばされた・未知の欄・型 (§2.2) | policy | (今の parse_yaml なら `None` → 既定値) | **(b) 拒否** | `mode: integration` が黙って direct になる |
+| D15 | mission.yaml が `Unreadable` (§2.2) | policy | — | **(b) 拒否** | 不変条件 1 |
+| D16 | lint の本物の YAML パーサ (§2.4) | PyYAML | — | **(b) FAIL** | `_load_yaml_document` は PyYAML が無いと「読めない」を返す (lint_plan.py:369 の docstring)。簡易パーサに fallback しない |
+| D17 | `plan pr-base` で card に `target_dir` (§3・§5) | (取れている) | `DEFAULT_PR_BASE` (`main`) | (a) | 範囲外の task の今の挙動。区別は card の欄で、env の有無ではない |
+| D18 | `plan pr-base` で `AGENT_NAME`・assignment・card が取れない / 合わない (§3) | どの task か | — | **(b) exit 1** | 1 巡目 P2。黙って `main` にすると custom `pr_base` の mission で PR の行き先を間違える |
+| D19 | Worker 文書の PR 作成・stacked PR・QA の diff (§4.2・§5) | PR base | (1 巡目案は `:-main`) | **(b) 止める** | D18 に従う。文書に既定値を書かない |
+| D20 | kai-review の diff base (§4.1) | mission の `pr_base` | (1 巡目案は書いていない) | **(b) `fail_needs_director`** | 今の fetch 失敗 (kai-review.sh:309-311) と同じ出口。`main` の diff でレビューすると、違う base の PR を「差分が多い / 少ない」まま通す |
+| D21 | `worktree_root` (§2.1) | 既定値以外の値 | — | **(b) 拒否** (`unsupported_value`) | hooks と gc が既定値を自分で知っているので、別の値を通すと編集ガードと片付けが壊れる |
+| D22 | `mode` (§2.1) | `direct` 以外 | — | **(b) 拒否** (`unsupported_mode`) | 未実装を黙って direct に倒さない |
+| D23 | pull が途中で死ぬ (N8) | — | card が in_progress のまま | (保留) | 01c (pull の冪等化)。JSON が出ないので Worker は主 checkout で作業を始めない。出口は Director の `update --reset` |
+
+### 11.1 Git の規則を自前で書いた箇所と、本物の判定との突き合わせ
+
+自前の規則は「本物より狭い」ことを推論で済ませず、本物に通して確かめる (§2.3 の 1 巡目の誤りの再発防止)。
+
+| 自前の規則 | 本物の判定 | 突き合わせの手順 | 段 |
+|---|---|---|---|
+| branch 名 (§2.3) | `git check-ref-format --branch <name>` | §2.3 の手順 1〜5 (境界表・生成した入力・既存 task 全部・赤の実証) | G2 (t008) の受入条件 |
+| `{task_slug}` (`_slugify`) | 同上 (成分として) | `_slugify` に記号・非 ASCII・長い title・`-` だけの title を入れ、出力を `x/<slug>` の形で `git check-ref-format --branch` に通す | G2 |
+| `{mission_slug}` | 同上 (成分として) | `init` は `--mission` の slug を検査しない (plan.sh:2737 は存在の確認だけ)。だから規則の外の slug の mission は作れる。その mission の task は Resolver が置換後に §2.3 で拒否し、pull は B (needs_director) になる。黙って別の名前に直さない。テストは記号・空白を含む slug の隔離 mission で pull が B になること。今の active / archive の全 mission の slug を規則に通す (2026-10-01 時点で全件が `[A-Za-z0-9][A-Za-z0-9._-]*` に入ることを確認済み) | G2・G3 |
+| worktree path (`task_worktree_path`。repo_root の外に出ない) | `os.path.realpath` + `os.path.commonpath` と、実際に作った後の `git worktree list --porcelain -z` の path | 単体テストで `..`・symlink を含む repo_root・末尾 `/` の有無を入れて、realpath 後に repo_root の下にあることを確かめる。G1 の W0 のテストで、Resolver が出した path と `git worktree list` の path が realpath で一致することを確かめる | G2・G3 |
+| 「登録済みで branch が一致」(§1.3 W2) | `git worktree list --porcelain -z` | 自前で `.git/worktrees/*` を読まない。判定に使うのは porcelain の出力だけ。G1 のテストで W2・W3 (detached / 別 branch)・prunable を実際の git で作る | G1 (t004) |
+| base の選択 (`origin/<base>` があれば remote) | `git show-ref --verify refs/remotes/origin/<base>` | 自前の判定はしない。観測は git に任せ、選ぶ 1 行だけを bash に残す (§3) | G3 |

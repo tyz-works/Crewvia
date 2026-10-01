@@ -284,15 +284,40 @@ def _git_block_line_count(text: str):
     return heads, count
 
 
+_STRAY_GIT_RE = re.compile(r"^[ \t]+(?:-[ \t]+)?[\"']?git[\"']?[ \t]*:")
+
+
+def _stray_git_key_line(text: str):
+    """0 桁目でない `git` キーの行 (1 始まりの行番号)。無ければ None。コメント行は対象外。"""
+    for n, line in enumerate(text.splitlines(), 1):
+        if _STRAY_GIT_RE.match(line):
+            return n
+    return None
+
+
 def policy_from_text(text: str, source: str = "<mission.yaml>") -> GitPolicy:
     """mission.yaml の全文から Policy を作る。純関数 (lint と `load_git_policy` の共通の芯)。
 
     `git:` キーが無ければ既定値。あれば全欄を検査して、1 つでも外れれば `GitPolicyError`。
     """
+    # parse_yaml の例外は問題の行をそのまま含む (関係ない欄の中身が出る)。理由には行番号だけを使い、
+    # 例外は連鎖させない (except の外で raise する。`__context__` に行の中身を残さない)。
+    parse_error = None
     try:
         data = parse_yaml(text, source=source)
     except ValueError as e:
-        raise GitPolicyError("malformed", "mission.yaml", f"読めない: {e}") from e
+        m = re.search(r"malformed line (\d+)", str(e))
+        parse_error = f"{m.group(1)} 行目が解析できない" if m else "解析できない"
+    if parse_error is not None:
+        raise GitPolicyError("malformed", "mission.yaml", f"読めない: {parse_error}")
+
+    # `git` という名前のキーが 0 桁目以外にある (字下げ・タブ・入れ子・リスト項目・引用符つき) mission.yaml は、
+    # parse_yaml が黙って読み飛ばすので「git: が無い」と区別できない。既定値に倒す前に停止する。
+    stray = _stray_git_key_line(text)
+    if stray is not None:
+        raise GitPolicyError("malformed", "git",
+                             f"{stray} 行目に字下げされた git キーがある (git: は 0 桁目に書く。"
+                             "字下げた行は parse_yaml が読み飛ばす)")
 
     heads, indented = _git_block_line_count(text)
     if "git" not in data:

@@ -415,7 +415,7 @@ def test_resolver_refuses_instead_of_falling_back_to_another_checkout():
 # §2.2 検証の規則 (fail closed)
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("text,code", [
+REJECTIONS = [
     ("git:\n", "malformed"),                                    # git: だけ (parse_yaml では None)
     ("git: null\n", "malformed"),
     ("git: ~\n", "malformed"),
@@ -432,6 +432,10 @@ def test_resolver_refuses_instead_of_falling_back_to_another_checkout():
     ("git:\n  mode: direct\ngit:\n  pr_base: develop\n", "malformed"),   # git: が 2 つ
     ("git:\ngit:\n  pr_base: develop\n", "malformed"),   # 先の git: が空 (字下げ行の数は合ってしまう。git: の数で拾う)
     ("git:\n  mode integration\n", "malformed"),               # コロンなし (読み飛ばされる)
+    ("\"git\":\n  mode: integration\n", "malformed"),          # 0 桁目でも引用符つきのキーは parse_yaml が読めない
+    ("git\t:\n  mode: integration\n", "malformed"),             # コロンの前のタブ
+    ("\ufeffgit:\n  mode: integration\n", "malformed"),         # BOM つきの先頭キー
+    ("{git: {mode: integration}}\n", "malformed"),               # 文書全体が flow 形式
     ("git:\n  pr-base: develop\n", "unknown_key"),
     ("git:\n  baseBranch: develop\n", "unknown_key"),
     ("git:\n  mode: direct\n  remote: upstream\n", "unknown_key"),
@@ -448,7 +452,10 @@ def test_resolver_refuses_instead_of_falling_back_to_another_checkout():
     ("git:\n  worktree_root: elsewhere\n", "unsupported_value"),
     ("git:\n  worktree_root: ../x\n", "invalid_value"),
     ("git:\n  worktree_root: /x\n", "invalid_value"),
-])
+]
+
+
+@pytest.mark.parametrize("text,code", REJECTIONS)
 def test_policy_rejections(text, code):
     with pytest.raises(gp.GitPolicyError) as ei:
         gp.policy_from_text(_mission_text(text))
@@ -482,6 +489,142 @@ def test_error_detail_does_not_leak_other_mission_fields():
     with pytest.raises(gp.GitPolicyError) as ei:
         gp.policy_from_text(text)
     assert "SECRET" not in str(ei.value)
+
+
+# ---- 「git という語が mission.yaml にあるのに policy なし (既定値)」になる入力を 0 に (Codex 2 巡目 P2-1) ----
+
+#: `parse_yaml` は字下げ行を黙って読み飛ばす。0 桁目の `git:` しか見ない検査はこれをすり抜け、
+#: `mode: integration` が黙って direct になった。字下げ・タブ・入れ子・リスト項目・引用符つきの `git` キーは全部停止。
+INDENTED_GIT = [
+    "title: Demo\n git:\n   mode: integration\n",
+    "title: Demo\n\tgit:\n\t\tmode: integration\n",
+    "title: Demo\nreview:\n  git:\n    mode: integration\n",
+    "title: Demo\nreview:\n  - git: x\n",
+    "title: Demo\n  - git: x\n",
+    "  git:\n    mode: integration\n",
+    "title: Demo\n git: {mode: integration}\n",
+    "title: Demo\n  git: null\n",
+    "title: Demo\n  git:\n",
+    "title: Demo\n  \"git\": x\n",
+    "title: Demo\n  'git': x\n",
+    "title: Demo\n    git:\n      pr_base: develop\n",
+    "git:\n  mode: direct\nnotes:\n  git:\n    pr_base: develop\n",   # 本物の git: があっても迷子の git: は拒否
+    "title: Demo\n git :\n",                                         # `git :` (コロンの前の空白)
+]
+
+#: `git` という語を含むが「git キー」ではない入力は、今までどおり既定値 (誤って拒否しない側の確認)。
+GIT_WORD_BUT_NO_KEY = [
+    "title: git workflow\n",
+    "title: Demo\nnotes: git: not a key\n",
+    "title: Demo\ndescription: use git\n",
+    "title: Demo\nreview:\n  gitlab: x\n",
+    "title: Demo\n# git:\n",
+    "title: Demo\n  # git: x\n",
+    "title: Demo\ngithub: x\n",
+    "title: Demo\ngit-policy: x\n",
+]
+
+
+@pytest.mark.parametrize("text", INDENTED_GIT)
+def test_an_indented_or_orphan_git_key_is_never_the_default_policy(text):
+    with pytest.raises(gp.GitPolicyError) as ei:
+        gp.policy_from_text(text)
+    assert ei.value.code == "malformed", (text, ei.value)
+    assert ei.value.field == "git"
+
+
+@pytest.mark.parametrize("text", GIT_WORD_BUT_NO_KEY)
+def test_the_word_git_without_a_git_key_is_still_the_default(text):
+    assert gp.policy_from_text(text) == gp.default_policy()
+
+
+def test_no_input_has_a_git_key_somewhere_and_the_default_policy():
+    """全拒否例・全字下げ例で「git キーの行がある」なら、既定値が返らない (族 (1) の網羅)。"""
+    key = re.compile(r"^[ \t]*(?:-[ \t]+)?[\"']?git[\"']?[ \t]*:", re.M)
+    inputs = [_mission_text(t) for t, _ in REJECTIONS] + INDENTED_GIT + [
+        _mission_text(_git_block(mode="direct")), _mission_text(_git_block(base_branch="develop"))]
+    n = 0
+    for text in inputs:
+        if not key.search(text):
+            continue
+        n += 1
+        try:
+            p = gp.policy_from_text(text)
+        except gp.GitPolicyError:
+            continue
+        assert p.source == "mission", f"git キーがあるのに既定値: {text!r}"
+    assert n >= 40, n
+
+
+# ---- エラーに mission の他の欄・行の中身を出さない (Codex 2 巡目 P2-2) ----
+
+SECRET = "SECRET-7f3a"
+#: 解析できない行 (コロンが無い)・関係ない欄・字下げの孤児。どれも git の欄ではない。
+LEAK_WRAPPERS = [
+    ("plain", lambda body: f"notes: {SECRET}\n" + body),
+    ("block", lambda body: f"review:\n  {SECRET}-key: {SECRET}-val\n" + body),
+    ("trailer", lambda body: body + f"tail: {SECRET}\n"),
+    ("garbage", lambda body: f"{SECRET} garbage line without colon\n" + body),
+    ("garbage-after", lambda body: body + f"{SECRET} garbage after\n"),
+]
+
+
+def _all_surfaces(exc: BaseException) -> str:
+    import traceback
+    parts = [str(exc), repr(exc), repr(exc.args), getattr(exc, "detail", ""), getattr(exc, "field", ""),
+             getattr(exc, "code", ""), "".join(traceback.format_exception(exc))]
+    for chained in (exc.__cause__, exc.__context__):
+        if chained is not None:
+            parts.append("".join(traceback.format_exception(chained)))
+    return "\n".join(parts)
+
+
+@pytest.mark.parametrize("wrap_name,wrap", LEAK_WRAPPERS, ids=[n for n, _ in LEAK_WRAPPERS])
+@pytest.mark.parametrize("body,code", REJECTIONS + [(t, "malformed") for t in INDENTED_GIT],
+                         ids=[f"rej{i}" for i in range(len(REJECTIONS) + len(INDENTED_GIT))])
+def test_no_error_path_leaks_other_fields_or_line_contents(wrap_name, wrap, body, code):
+    text = wrap(body if body in INDENTED_GIT else _mission_text(body))
+    try:
+        gp.policy_from_text(text)
+    except gp.GitPolicyError as e:
+        assert SECRET not in _all_surfaces(e), (wrap_name, body, e)
+        assert e.__cause__ is None and e.__context__ is None, "parser の例外 (行の中身を含む) を連鎖させない"
+    else:
+        pytest.fail(f"拒否されるはずの入力が通った: {wrap_name} {body!r}")
+
+
+def test_parse_failure_reports_only_the_line_number():
+    with pytest.raises(gp.GitPolicyError) as ei:
+        gp.policy_from_text(f"title: x\n{SECRET} no colon here\nnotes: y\n")
+    e = ei.value
+    assert e.code == "malformed"
+    assert "2" in e.detail, "行番号は出す"
+    assert SECRET not in _all_surfaces(e)
+
+
+def test_cli_stderr_never_carries_other_fields_or_line_contents(tmp_path):
+    q = tmp_path / "queue"
+    for name, text in {
+        "20261001-garbage": f"title: x\n{SECRET} no colon here\ngit:\n  mode: direct\n",
+        "20261001-indent": f"notes: {SECRET}\n git:\n   mode: integration\n",
+        "20261001-bad": f"notes: {SECRET}\ngit:\n  pr_base: 123\n",
+        "20261001-mode": f"notes: {SECRET}\ngit:\n  mode: integration\n",
+    }.items():
+        d = q / "missions" / name
+        d.mkdir(parents=True)
+        (d / "mission.yaml").write_text(text)
+        for verb in (["pr-base", "--queue", str(q), "--mission", name],
+                     ["resolve-task", "--queue", str(q), "--mission", name, "--task", "t001", "--task-slug", "x",
+                      "--repo-root", "/tmp/r"]):
+            r = _cli(*verb)
+            assert r.returncode == 2 and r.stdout == "", (name, r)
+            assert SECRET not in r.stdout + r.stderr, (name, r.stderr)
+    # 読めない mission.yaml (UTF-8 でない) の理由にも中身を出さない
+    d = q / "missions" / "20261001-bin"
+    d.mkdir(parents=True)
+    (d / "mission.yaml").write_bytes(f"notes: {SECRET}\n".encode() + b"\xff\xfe\n")
+    r = _cli("pr-base", "--queue", str(q), "--mission", "20261001-bin")
+    assert r.returncode == 2 and "unreadable" in r.stderr and SECRET not in r.stderr
 
 
 def test_unparsable_mission_yaml_is_malformed_not_default():

@@ -142,6 +142,20 @@ MUTATIONS = [
      '    if heads != 1:\n',
      '    if False:\n',
      ["test_policy_rejections"]),
+    ("M27", "字下げされた・孤立した git キーの検出を外す (既定値に倒れる。Codex 2 巡目 P2-1)",
+     '    stray = _stray_git_key_line(text)\n    if stray is not None:\n',
+     '    stray = None\n    if stray is not None:\n',
+     ["test_an_indented_or_orphan_git_key_is_never_the_default_policy",
+      "test_no_input_has_a_git_key_somewhere_and_the_default_policy"]),
+    ("M28", "解析エラーの理由に parser の例外の全文 (行の中身) を入れる (Codex 2 巡目 P2-2)",
+     '        parse_error = f"{m.group(1)} 行目が解析できない" if m else "解析できない"\n',
+     '        parse_error = str(e)\n',
+     ["test_parse_failure_reports_only_the_line_number", "test_no_error_path_leaks_other_fields_or_line_contents",
+      "test_cli_stderr_never_carries_other_fields_or_line_contents"]),
+    ("M29", "解析エラーに元の例外を連鎖させる (`__cause__` に行の中身が残る)",
+     '        raise GitPolicyError("malformed", "mission.yaml", f"読めない: {parse_error}")\n',
+     '        raise GitPolicyError("malformed", "mission.yaml", f"読めない: {parse_error}") from ValueError(text)\n',
+     ["test_no_error_path_leaks_other_fields_or_line_contents"]),
 ]
 
 

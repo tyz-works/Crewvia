@@ -318,7 +318,7 @@ base・PR base を決める唯一の場所で、**判断だけ**（git も gh �
 branch 名の許可集合は git の `check-ref-format` より狭く、**部分集合であることを本物の git に通して確かめる**
 （`tests/test_git_policy_resolver.py`）。**G2 の時点で呼び出し元は 0**（同テストの `test_git_policy_has_no_callers_yet`。
 G3 の cutover で `ALLOWED_CALLERS` に足す）。各拒否を外した変異が赤になる実証は
-`python3 tests/red_proof_git_policy_resolver.py`（26 変異・約 1.5 分。本番に触れない）。
+`python3 tests/red_proof_git_policy_resolver.py`（29 変異・約 2 分。本番に触れない）。
 
 ### `lib_daemon_state.py`
 

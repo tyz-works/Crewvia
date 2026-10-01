@@ -410,15 +410,32 @@ def pr_base(policy) -> str
   関数の中で `resolve-task` を 1 回呼び、branch / path / base の候補を受け取る。:62・:65・:74-78 のリテラルを消す。
   §1.3 の判定はそのまま bash に残る。
 - plan.sh は Python なので CLI を通さず `import lib_git_policy` する (lib は普通に import する。scripts/CLAUDE.md「書き込みの入口」の注意)。
-- **`plan.sh pr-base` (G3)**: Worker が PR base を取る唯一の入口 (§5)。読むだけで、queue を書かない (ロックも取らない)。
-  - 引数なし: `AGENT_NAME` の assignment (`<mission>:<task>`。plan.sh:3082 と同じ読み口) から task を決める。
-    `--mission <slug> --task <tid>` を渡せばそれを使う。
-  - task の card が `status == in_progress` かつ `worker == AGENT_NAME` であることを確かめる (他人の task の base を返さない)。
-  - card に `target_dir` があれば `lib_git_policy.DEFAULT_PR_BASE` (`main`) を返す。mission の `git:` は見ない (範囲外。今の挙動を保つ。
-    この既定値を使う場所は plan.sh のこの分岐 1 か所だけで、リテラルの `"main"` は書かない。§0・§6)。
-  - それ以外は `pr_base(load_git_policy(slug))`。
-  - stdout は branch 名 1 行だけ。**決められなければ exit 1・stdout 空** (`AGENT_NAME` が空・assignment が無い / 読めない /
-    形が違う・card が合わない・`GitPolicyError`)。理由は stderr。exit 2 は idle の意味なので使わない。
+- **`plan.sh pr-base` (G3)**: エージェントが PR base を取る唯一の入口 (§5)。読むだけで、queue を書かない (ロックも取らない)。
+  task の決め方で 2 つの形がある。どちらも、task が決まった後の規則 (下の「共通」) は同じ。
+  - **自分の task (引数なし)**: 自分の PR を作る Worker と、自分の task の diff を取る QA Worker 向け。
+    - `AGENT_NAME` の assignment (`<mission>:<task>`。plan.sh:3082 と同じ読み口) から task を決める。
+    - task の card が `status == in_progress` かつ `worker == AGENT_NAME` であることを確かめる。
+      assignment と card が食い違ったとき、黙って別の task の base を返さないため。
+  - **名指し (`--mission <slug> --task <tid>`。2 つとも必須)**: 他人の task の PR を扱う Director と review の Worker 向け
+    (§4.2 の stacked PR の 2 行)。Codex review 2 巡目 P2-1 で足した。
+    - `AGENT_NAME`・assignment・`status`・`worker` を見ない (所有者の検査をしない)。Director には assignment が無く、
+      review の Worker の assignment は review の task を指すので、引数なしの形は使えない。
+    - 片方だけ渡したら exit 1 (引数なしの形に黙って倒さない)。
+    - card は `lib_task_cards` の入口で読む (不変条件 1)。読めない・無い (archive 済みを含む) なら exit 1。
+    - 所有者を見なくてよい理由: 読み取り専用で、出力は branch 名 1 行だけ。どの task かは呼び出し元が名指しするので、
+      引数なしの形が防いでいる「assignment と card の食い違い」は起きない。名指しの元 (PR 本文の `task:` 行) は §4.2 に書く。
+  - **共通** (task が決まった後):
+    - card に `target_dir` があれば `lib_git_policy.DEFAULT_PR_BASE` (`main`) を返す。mission の `git:` は見ない (範囲外。今の挙動を保つ。
+      この既定値を使う場所は plan.sh のこの分岐 1 か所だけで、リテラルの `"main"` は書かない。§0・§6)。
+    - それ以外は `pr_base(load_git_policy(slug))`。policy の検証 (§2.2) は 2 つの形で同じ。
+    - stdout は branch 名 1 行だけ。**決められなければ exit 1・stdout 空** (`AGENT_NAME` が空・assignment が無い / 読めない /
+      形が違う・card が合わない・名指しの引数が片方だけ・card が読めない・`GitPolicyError`)。理由は stderr。exit 2 は idle の意味なので使わない。
+  - **`--diff-ref`** (どちらの形にも付けられる。QA の diff 用。Codex review 2 巡目 P2-2 で足した): branch 名の代わりに diff の base の ref を 1 行出す。
+    - card に `target_dir` がある → `DEFAULT_PR_BASE` そのもの (`main`。**local の ref**)。今の QA の文言 `git diff main...HEAD` と同じ ref で、
+      fetch も ref の検査もしない (§0 の「今の挙動を保つ」)。TARGET_DIR の checkout には `origin/main` が無いことがあり、
+      target_dir の task では pull が fetch しない (plan.sh:3496 で helper を飛ばす) ので、`origin/` を返すと今通る diff が落ちる。
+    - それ以外 → `f"{REMOTE}/{pr_base}"` (`origin/main` など)。ref を取ってくるのは呼び出し側の文書の手順 (§4.2) で、plan.sh は git を呼ばない。
+    - 2 つを分けるのは card の `target_dir` で、env (`TARGET_DIR`) ではない (§5 と同じ置き場所)。
 - **G2 は呼び出し元ゼロ**で merge する (R2)。G2 の時点で `grep -rn lib_git_policy scripts hooks` に出るのは lib 自身とテストだけ。
 
 ---
@@ -464,22 +481,64 @@ def pr_base(policy) -> str
 | 場所 | 書いてあること | 扱い |
 |---|---|---|
 | `agents/worker.md:584`・`:922` | `gh pr create ... --base main` | **書き換える** → `PR_BASE="$(plan pr-base)" \|\| exit 1` の後に `--base "$PR_BASE"` (§5) |
-| `agents/worker.md:937-945` | stacked PR の判定「base が main / master 以外」・`gh pr edit {子PR} --base main` | **書き換える** → 同じく `plan pr-base` の値 |
+| `agents/worker.md:937-945` | review の Worker の stacked PR の判定「base が main / master 以外」・`gh pr edit {子PR} --base main` の提案 | **書き換える** → 名指しの形 `plan pr-base --mission <M> --task <T>` (§3)。`<M>/<T>` は対象 PR の本文の `task: <mission>/<tid>` 行 (worker.md:582・:920 が書く) から取る。判定は `gh pr view --json baseRefName` とその値の比較、提案文の `--base` もその値 |
 | `agents/worker.md:148-152`・`:865-879` | worktree path と branch の形 | **文言を変える**: 「既定では」と添え、決めるのは pull で、JSON の `worktree_path` と `git branch --show-current` を見る、と書く。形の説明は残す |
 | `agents/worker.md:294-301` | `worktree_path` が空なら cd しない | G1 で「空になるのは target_dir の task だけ」を書く |
 | `agents/director.md:884-900` | branch / worktree の命名 | 同上 (既定値として書き、mission.yaml の `git:` で変わると足す。§2 の G3 以降の注意も) |
-| `agents/director.md:921-935` | stacked PR の `gh pr edit --base main` | **書き換える** |
+| `agents/director.md:921-935` | stacked PR の `gh pr edit --base main` | **書き換える** → 名指しの形 `PR_BASE="$(plan pr-base --mission <M> --task <T>)" \|\| exit 1` の後に `gh pr edit {子PR} --base "$PR_BASE"`。`<M>/<T>` は**子 PR** の本文の `task:` 行 |
 | `agents/director.md:962-1002` | 主 checkout の同期 | 寄せない (§4.1 sync と同じ) |
 | `agents/director.md:1156-1163` | `git log origin/task/...` | 寄せない (調査の例) |
 | `agents/worker-codex.md:122-125` | 「origin/main との diff」 | **書き換える** → 「mission の PR base (`lib_git_policy.py pr-base`) との diff」(kai-review.sh の G3 の変更に合わせる) |
-| `skills/crewvia-qa/SKILL.md:17`・`:148` | `git diff main...HEAD` | **書き換える** → `PR_BASE="$(plan pr-base)" \|\| exit 1` の後に `git diff "origin/${PR_BASE}...HEAD"`。local `main` は主 checkout と ref を共有していて古くなる (kai-review.sh:296-306 が実測した理由と同じ)。`origin/<base>` は pull の fetch (git-helpers.sh:72) で更新される |
+| `skills/crewvia-qa/SKILL.md:17`・`:148` | `git diff main...HEAD` | **書き換える** → 下の「QA の diff の手順」。crewvia の task は `origin/<pr_base>` を fetch して確かめてから diff、TARGET_DIR の task は今と同じ `main...HEAD` |
 | `skills/crewvia-plan-review/SKILL.md:127-129` | PR head の checkout / push | 寄せない (head は PR の属性) |
 | `agents/verifier.md:64` | push の禁止 | 対象外 |
 | `knowledge/*.md` の `origin/main` | 戻し方 (`git merge --ff-only origin/main`)・経緯・実測 | **書き換えない**。主 checkout の同期 (寄せない側) か、記録。構造ガードの対象外 (§6) |
 
+**QA の diff の手順** (`skills/crewvia-qa/SKILL.md:17`・`:148` の置き換え。Codex review 2 巡目 P2-2):
+
+```bash
+DIFF_REF="$(plan pr-base --diff-ref)" || { echo "diff の base を決められない。Director に報告して待つ" >&2; exit 1; }
+case "$DIFF_REF" in
+  origin/*)   # crewvia 本体の task。pull の fetch は base_branch しか取らないので、PR base をここで取る
+    git fetch origin "${DIFF_REF#origin/}" \
+      && git rev-parse --verify --quiet "${DIFF_REF}^{commit}" >/dev/null \
+      || { echo "${DIFF_REF} を取れない。Director に報告して待つ" >&2; exit 1; } ;;
+esac          # それ以外 (TARGET_DIR の task は local の main) は今と同じく何もしない
+git diff "${DIFF_REF}...HEAD" --name-only
+```
+
+- `origin/*` で分けるのは plan.sh の出力で、env ではない (§3 `--diff-ref`・§5)。TARGET_DIR の task の値は `main` で、
+  今の文言とバイトまで同じ diff になる (fetch しない・ref を検査しない)。
+- crewvia の task で fetch をここでする理由: pull の fetch (git-helpers.sh:72) は `base_branch` だけを取る。`pr_base` が
+  `base_branch` と違う mission では `refs/remotes/origin/<pr_base>` が無いか古い。fetch の失敗は止める
+  (kai-review.sh:309-311 と同じ向き。QA の diff の範囲が間違うと、見るべきファイルを見落とす。task の base の GIT-04 とは別の判断。§3)。
+- local の `main` を使わない理由は 1 巡目と同じ (主 checkout と ref を共有していて古くなる。kai-review.sh:296-306)。
+
+**実行者と前提** (Codex review 2 巡目の族の掃除。「書き換える」行と、新しい手順を呼ぶ行の全部):
+
+前提の値の出どころ:
+- `plan` コマンドは start.sh:388・:868 が PATH に入れる (Director・Worker の両方。TARGET_DIR の Worker も crewvia の `scripts/bin`)。
+- `AGENT_NAME` は start.sh:292・:786 で起動 env に入る。
+- assignment と card は pull が書く。
+
+| 行 | 誰が | どこで (cwd) | 新しい手順の前提 (env・ref・所有者) | 満たされるか | 満たされないとき |
+|---|---|---|---|---|---|
+| worker.md:584・:922 PR 作成 | 実装の Worker (crewvia の task) | crewvia の worktree。cwd が主 checkout に戻った shell も | `AGENT_NAME`・自分の assignment・card が in_progress で worker が自分。ref は使わない (`--base` は名前を GitHub に渡すだけ) | 満たす。pull の直後から done まで assignment と card は自分のもの。cwd を読まないので主 checkout でも同じ値 (§5 の ③) | exit 1 → PR を作らず `plan needs-director` (§5) |
+| 同上 | 実装の Worker (TARGET_DIR の task) | TARGET_DIR の checkout | 同上。ref は使わない | 満たす。card の `target_dir` で `main` が返る = 今の `--base main` と同じ | 同上。TARGET_DIR の Worker が今は通る PR 作成で止まるのは assignment が無い / 合わないときだけで、そのときの `main` は黙った推測 (§5) |
+| worker.md:937-945 stacked PR の判定 | review の Worker (Seo。crewvia / TARGET_DIR) | 自分の review task の worktree か TARGET_DIR | 名指しの形: 対象 PR の本文の `task:` 行・その card が読めること。所有者は見ない。ref は使わない (`baseRefName` との文字列比較) | 満たす。Worker の PR 作成の手順 (worker.md:582・:920) が `task:` 行を必ず書く。mission は merge 前なので archive されていない | `task:` 行が無い (人が作った PR など)・card が読めない → exit 1。**main と比べて stacked かどうかを決めない**。「PR base を決められない」を Director に報告し、merge の提案を保留する |
+| director.md:921-935 stacked PR の base 付け替え | Director | 主 checkout | 名指しの形: **子 PR** の本文の `task:` 行・card。`AGENT_NAME`・assignment は無くてよい。ref は使わない | 満たす。stacked の付け替えは親の merge の前で、子の mission は active | exit 1 → `gh pr edit` を実行せず、親の merge も保留する (付け替えずに親を merge すると子が自動 close される)。base は手で決めない。ユーザーに判断を仰ぐ |
+| worker-codex.md:122-125 (kai-review.sh の G3) | Kai-codex (kai-review.sh) | 主 checkout (`WORK_DIR` = `CREWVIA_REPO_ROOT`。kai-review.sh:269) | `lib_git_policy.py pr-base --mission "$MISSION_SLUG"` (CLI。plan pr-base ではないので所有者を見ない)。mission は pull 前に解決済み (:82・:130-140)。ref は都度 fetch (:309) | crewvia の PR は満たす。TARGET_DIR の PR は今も kai-review の対象外 (crewvia の repo で PR を fetch する作り。変えない) | §4.1 の kai-review 行: `fail_needs_director` |
+| crewvia-qa SKILL.md:17・:148 QA の diff | QA の Worker (crewvia の task) | crewvia の worktree | `AGENT_NAME`・自分の QA task の assignment と card (引数なしの形)。ref は `origin/<pr_base>` を手順の中で fetch して確かめる | 満たす。crewvia の repo には `origin` がある。`HEAD` 側は cwd に依る (cwd が主 checkout に戻ると主 checkout の HEAD になる) のは今と同じで、範囲外 (worker.md の「毎回 cd」の規則で扱う) | plan が exit 1・fetch / 検査の失敗 → diff を取らずに止まり Director に報告。`main` に倒さない |
+| 同上 | QA の Worker (TARGET_DIR の task) | TARGET_DIR の checkout | `AGENT_NAME`・自分の assignment と card。ref は local の `main` (今と同じ)。`origin` も fetch も要らない | 満たす。返る値は `main` で、手順は fetch も検査もしない | plan が exit 1 のときだけ止まる (今は通る。assignment が無い / 合わないときで、そのときは何の task を QA しているか確かめられていない)。`main` が無い checkout で diff が失敗するのは今と同じ |
+| 文言だけの行 (worker.md:148-152・:865-879・:294-301・director.md:884-900) | 読む人全員 | — | コマンドが無いので前提も無い | — | — |
+| 寄せない・対象外の行 | — | — | 今の手順のまま | — | — |
+
+QA の Worker が**自分の task 以外の PR**の diff を取る手順は、今の SKILL.md に無い (QA の task はその mission の PR を見る)。
+足すときは名指しの形に `--diff-ref` を付ける。
+
 ---
 
-## 5. PR base を Worker に渡す方法 (G3 / G4)
+## 5. PR base をエージェントに渡す方法 (G3 / G4)
 
 1 巡目の案 (`.crewvia-env` に `CREWVIA_PR_BASE` を書き、文書は `${CREWVIA_PR_BASE:-main}`) は捨てた (Codex review 1 巡目 P2)。
 env が無い理由は 3 つある: ① TARGET_DIR の Worker ② G3 前の `.crewvia-env` ③ cwd が主 checkout に戻った shell。
@@ -492,10 +551,12 @@ env が無い理由は 3 つある: ① TARGET_DIR の Worker ② G3 前の `.cr
 | 渡し方 | **env では渡さない**。PR base が要るコードブロックは、その都度 `plan pr-base` (§3) で Resolver から取る。`.crewvia-env` には足さない。`CREWVIA_BASE_BRANCH` も出さない (Worker が base を使う場面は無い。branch は pull が作る) |
 | 区別の置き場所 | ① と「crewvia 本体の task で情報が欠けた」の区別は、**env の有無ではなく card の `target_dir`** で plan.sh がする。① は `main` (今の挙動。既定値は plan.sh の 1 か所だけ)。crewvia 本体の task は Resolver の値で、取れなければ exit 1 |
 | cwd に依らない理由 | `plan pr-base` は `AGENT_NAME` (start.sh:292・:786 で Worker の起動 env に入る。Bash の呼び出しごとに消えない) と assignment から task を決める。cwd も `.crewvia-env` も読まない。③ でも正しい値が出る |
+| 他人の task の PR | Director と review の Worker は**名指しの形** `plan pr-base --mission <M> --task <T>` (§3) を使う。`<M>/<T>` は PR 本文の `task:` 行から取る。所有者は見ない。env も cwd も読まないのは同じ。誰がどの形を使うかは §4.2 の「実行者と前提」の表 |
+| QA の diff | `plan pr-base --diff-ref` (§3) の ref を使う。crewvia の task は `origin/<pr_base>` を手順の中で fetch して確かめ、TARGET_DIR の task は今と同じ local の `main` (§4.2「QA の diff の手順」) |
 | 文書の書き方 | `PR_BASE="$(plan pr-base)" \|\| { echo "PR base を決められない。Director に報告して待つ" >&2; exit 1; }` → `gh pr create ... --base "$PR_BASE"`。**既定値 (`:-main`) を文書に書かない** |
 | 止まるとき | exit 1 は「PR を作らずに止まる」。Worker は `plan needs-director <id> "<stderr>"` で Director に渡す (worker.md の pull exit 1 の手当てと同じ段落)。止まるのは「assignment が無い / 合わない」と「mission.yaml の `git:` が壊れている」のときで、どちらも黙って `main` にすると PR の行き先を間違える |
 | 書き換える範囲 | §4.2 の「書き換える」行だけ。knowledge/ は対象外 |
-| G4 の QA (t022) | 書き換えた全コードブロックを実際に評価する。`gh` は stub にして、`--base` に渡った値を記録する。shell は 4 つ: (1) worktree の cwd・custom `pr_base: develop` の隔離 mission → `develop` (2) **同じ task で cwd を主 checkout に移した shell** → `develop` (1 巡目の案ではここが `main` になる。赤の実証にする) (3) TARGET_DIR の Worker → `main` (4) assignment を消した shell → exit 1 で `gh` が呼ばれない |
+| G4 の QA (t022) | 書き換えた全コードブロックを実際に評価する。`gh` は stub にして、`--base` に渡った値を記録する。PR 作成の shell は 4 つ: (1) worktree の cwd・custom `pr_base: develop` の隔離 mission → `develop` (2) **同じ task で cwd を主 checkout に移した shell** → `develop` (1 巡目の案ではここが `main` になる。赤の実証にする) (3) TARGET_DIR の Worker → `main` (4) assignment を消した shell → exit 1 で `gh` が呼ばれない。**Director が実行する場合** (Codex review 2 巡目 P2-1): (5) `AGENT_NAME` も assignment も無い shell (cwd は主 checkout) で director.md の stacked PR の手順を評価し、子 PR 本文の `task:` 行の task (`pr_base: develop`) → `gh pr edit --base develop`。同じ shell で引数なしの形は exit 1 (名指しが要ることの対照) (6) review の Worker の shell (自分の review task の assignment あり) で worker.md の stacked PR の判定が、自分の task ではなく対象 PR の task の値 (`develop`) と比べる (7) `task:` 行の無い PR・片方だけの引数・archive 済みの task → exit 1 で `gh pr edit` が呼ばれない。**QA の diff** (P2-2): (8) crewvia の task・`pr_base: develop`・`origin/develop` がまだ無い clone → 手順が fetch して `origin/develop...HEAD` (9) TARGET_DIR の task・**`origin` の remote が無く local `main` だけある** checkout → `main...HEAD` が今と同じ出力で通る (赤の実証: `--diff-ref` を常に `origin/` にした欠陥版で落ちる) (10) crewvia の task で fetch が失敗する (remote を壊した clone) → diff を取らず exit 1 |
 
 ---
 
@@ -527,8 +588,8 @@ env が無い理由は 3 つある: ① TARGET_DIR の Worker ② G3 前の `.cr
 |---|---|---|---|---|
 | G1 (t004) | worktree を作れない pull が exit 1 + needs_director になる (今は成功・主 checkout)。登録済みで branch が一致する path は再利用する。再 pull で `.crewvia-env` が書き直される。成功時も git の警告が stderr に出る | **ユーザー承認** (t007) | **実際の Worker の pull で worktree と `.crewvia-env` ができる** (通常の割り当て 1 件。JSON の `worktree_path` が非 null・dir がある・`.crewvia-env` を source でき 3 変数が出る・`git -C <wt> branch --show-current` が task branch)。再利用の経路を 1 件観察する (`update --reset` で戻した task の再 pull。observation 用 mission は `init --inactive`。memory `disposable-mission-init-exposes-to-dispatcher-immediately`)。監査ログに `op=pull to=needs_director` が**出ていない** (出ていれば 1 件ずつ理由を読む) | PR revert → `scripts/sync-main-checkout.sh`。G1 は新しい status も欄も書かない (`needs_director` と `needs_director_reason` は既存のもの)。戻しても旧コードがそのまま読める。needs_director になった card は Director が今の出口で戻す |
 | G2 (t008) | **なし** (呼び出し元ゼロ) | 通常 merge | `grep -rn lib_git_policy scripts hooks` が lib 自身とテストだけ | revert |
-| G3 (t012) | branch / path / base の式が Resolver から来る (既定値では同じバイト)。`plan.sh pr-base` が増える。kai-review の diff base が `pr-base` 経由 (既定値では `main`)。lint が `git:` を検査する。CI に構造ガード | **ユーザー承認** (t015) | 実際の Worker の pull で、作られた branch 名と path が G3 前の式の値と同じ (同じ mission の G3 前の worktree と並べる)。その Worker の assignment で `plan pr-base` が `main` を返し、cwd を主 checkout に移しても同じ。次の codex-review が通常どおり diff を取る (kai-review のログの `Computing diff`)。active mission 全部の `plan.sh lint` が rc=0 (`git:` を書いた mission は 0 件のはず) | revert → sync-main-checkout。**G4 が入っていれば先に G4 を revert する** (G4 の文書は `plan pr-base` を呼ぶので、G3 だけ戻すと PR を作るたびに exit 1 で止まる。止まる側に倒れるので PR の行き先は間違えない)。**`git:` を書いた mission があるなら revert の前に消す** (旧 plan.sh は黙って無視するので、custom の base が効かなくなる。§2.1) |
-| G4 (t016) | エージェント向け文書の `--base` と diff base が `plan pr-base` の値になる (既定値では同じ `main` / `origin/main`)。取れなければ PR を作らず止まる | **ユーザー承認** (t018) | 次に PR を作った Worker の PR の base が `main` (`gh pr view --json baseRefName`)。QA Worker の diff が `origin/main...HEAD` で取れている | revert。文書なので restart は不要。**動いている Worker のセッションには、起動時に読み込んだ版が残る** (次の起動から入れ替わる) |
+| G3 (t012) | branch / path / base の式が Resolver から来る (既定値では同じバイト)。`plan.sh pr-base` が増える。kai-review の diff base が `pr-base` 経由 (既定値では `main`)。lint が `git:` を検査する。CI に構造ガード | **ユーザー承認** (t015) | 実際の Worker の pull で、作られた branch 名と path が G3 前の式の値と同じ (同じ mission の G3 前の worktree と並べる)。その Worker の assignment で `plan pr-base` が `main` を返し、cwd を主 checkout に移しても同じ。Director の shell で名指しの形 (`--mission <M> --task <T>`) が `main` を返す。次の codex-review が通常どおり diff を取る (kai-review のログの `Computing diff`)。active mission 全部の `plan.sh lint` が rc=0 (`git:` を書いた mission は 0 件のはず) | revert → sync-main-checkout。**G4 が入っていれば先に G4 を revert する** (G4 の文書は `plan pr-base` を呼ぶので、G3 だけ戻すと PR を作るたびに exit 1 で止まる。止まる側に倒れるので PR の行き先は間違えない)。**`git:` を書いた mission があるなら revert の前に消す** (旧 plan.sh は黙って無視するので、custom の base が効かなくなる。§2.1) |
+| G4 (t016) | エージェント向け文書の `--base` と diff base が `plan pr-base` の値になる (既定値では同じ `main` / `origin/main`)。取れなければ PR を作らず止まる | **ユーザー承認** (t018) | 次に PR を作った Worker の PR の base が `main` (`gh pr view --json baseRefName`)。QA Worker の diff が `origin/main...HEAD` で取れている (TARGET_DIR の QA があれば `main...HEAD`)。stacked PR があれば Director の付け替えが名指しの形で通る | revert。文書なので restart は不要。**動いている Worker のセッションには、起動時に読み込んだ版が残る** (次の起動から入れ替わる) |
 
 共通:
 - **merge 後に主 checkout を ff するまで、本番は旧コードのまま** (memory `main-checkout-lags-after-pr-merge`)。Director の確認は、
@@ -599,10 +660,12 @@ env が無い理由は 3 つある: ① TARGET_DIR の Worker ② G3 前の `.cr
   - 既存の mission (`git:` なし) で、G3 の前と後の branch と path がバイト単位で一致する。
   - custom の `base_branch` / `pr_base` を書いた隔離 mission で、task branch の base と `plan pr-base` の値に反映される。
   - `plan pr-base` の拒否: `AGENT_NAME` 空・assignment なし・形が違う・card の worker が別人・card が in_progress でない・`git:` が壊れている → exit 1・stdout 空。`target_dir` の task は mission の `pr_base` に関わらず `main`。
+  - 名指しの形 (`--mission --task`): `AGENT_NAME` 空・assignment なし・card が done / pending / 別の worker でも値を返す。片方だけの引数・card が無い / 読めない・`git:` が壊れている → exit 1。policy の拒否は引数なしの形と同じ集合 (同じ関数を通る)。
+  - `--diff-ref`: `target_dir` の task → `main`、それ以外 → `origin/<pr_base>`。2 つの形の両方で。
   - kai-review: `pr-base` が拒否される mission で `fail_needs_director` になり、`main` の diff を取らない。
   - 構造ガードの陽性対照・件数の下限・赤の実証・死んだ allowlist 行。
   - lint が parse_yaml と本物の YAML パーサの食い違いを FAIL にする。
-- **G4 (t022)**: §5 の 4 つの shell。書き換えていない決め打ちが文書に残っていない (構造ガードの文書側が緑で、件数が 0 でない)。
+- **G4 (t022)**: §5 の (1)〜(10) の shell (PR 作成 4・Director と review の名指し 3・QA の diff 3)。書き換えていない決め打ちが文書に残っていない (構造ガードの文書側が緑で、件数が 0 でない)。
 
 ---
 
@@ -657,6 +720,10 @@ env が無い理由は 3 つある: ① TARGET_DIR の Worker ② G3 前の `.cr
 | D21 | `worktree_root` (§2.1) | 既定値以外の値 | — | **(b) 拒否** (`unsupported_value`) | hooks と gc が既定値を自分で知っているので、別の値を通すと編集ガードと片付けが壊れる |
 | D22 | `mode` (§2.1) | `direct` 以外 | — | **(b) 拒否** (`unsupported_mode`) | 未実装を黙って direct に倒さない |
 | D23 | pull が途中で死ぬ (N8) | — | card が in_progress のまま | (保留) | 01c (pull の冪等化)。JSON が出ないので Worker は主 checkout で作業を始めない。出口は Director の `update --reset` |
+| D24 | `plan pr-base` の名指しの形で、片方だけの引数・card が無い / 読めない (§3。2 巡目 P2-1) | どの task か | — | **(b) exit 1** | 引数なしの形に倒すと、Director の shell では assignment が無いので結局 exit 1、review の Worker では**自分の review task** の値が黙って返る |
+| D25 | stacked PR の手順で、PR 本文に `task:` 行が無い (§4.2) | 子 PR の task | (今は決め打ちの `main`) | **(b) 止める** | `gh pr edit` も stacked の判定もせず、Director が / ユーザーに判断を仰ぐ。`main` と比べると custom `pr_base` の mission で「stacked でない」を「stacked」と誤る |
+| D26 | QA の diff で card に `target_dir` (§3 `--diff-ref`。2 巡目 P2-2) | (取れている) | local の `main` (今の文言) | (a) | 範囲外の task の今の挙動。TARGET_DIR の checkout に `origin/main` があるとは限らず、pull も fetch しない |
+| D27 | QA の diff で `origin/<pr_base>` の fetch / 検査が失敗 (§4.2) | 新しい PR base | (local の `main` に倒す案は採らない) | **(b) 止める** | diff の範囲を間違えると見るべきファイルを見落とす。kai-review (D20) と同じ向き。task の base の D8 とは別の判断 |
 
 ### 11.1 Git の規則を自前で書いた箇所と、本物の判定との突き合わせ
 

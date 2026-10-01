@@ -964,3 +964,71 @@ QA の手順の fetch は、それでも残す (pull の後に PR base の branc
 
 - 次に PR を作る Worker / 付け替える Director / QA・Verifier の diff が `plan pr-base` の値を使う (既定値では `main` / `origin/main` で同じ)。取れなければ PR を作らず・diff を取らず止まる。
 - 本番確認 (t018 の承認後): 次に PR を作った Worker の PR の base が `main` (`gh pr view --json baseRefName`)・QA Worker の diff が `origin/main...HEAD` で取れている。
+
+---
+
+## 16. 01b の Cutover / Rollback の実績と 01c への引き継ぎ (t019 の本番確認・t020)
+
+01a の `knowledge/state-store.md` §10 と同じ形。出典は t019 (本番確認) の Result と、各 review / QA / Codex task の Result。
+観察時の head: origin/main = 主 checkout HEAD = `3411012` (G4 #267 の merge commit)。G1 = `0b0fe90`・G3 = `7fb0c77`・G4 = `3411012` がすべて祖先。
+main の CI run 36842952557 (3411012) は 6 job すべて success、pytest 4234 passed / 2 skipped。
+
+### 16.1 各 cutover で本番に起きたこと (観察済み)
+
+| PR | merge | 本番で実際に変わったこと | 戻し方 | 実際に戻したか |
+|---|---|---|---|---|
+| G1 #264 | 0b0fe90 (2026-10-01 12:16 JST) | worktree を作れない pull が **exit 1・stdout 空・`needs_director`** になった (観察用 mission で実機確認。path に別 dir を置く 1 形 = W4)。主 checkout は HEAD・branch とも不変、assignment は残らない。登録済みで branch 一致の path は再利用 (W2。`reusing registered worktree`・path / HEAD 同一・作業ファイル保持)。再 pull で `.crewvia-env` が 3 行に書き直された。監査ログには `pull in_progress -> needs_director` が出る (G1 前は exit 0 + `worktree_path: null` + in_progress で、Worker が主 checkout に残った) | PR revert → `scripts/sync-main-checkout.sh`。新 status・新欄なし。needs_director の card は `update --status pending --reset` | 戻していない |
+| G2 #265 | bd4485a | なし (呼び出し元ゼロ)。G3 で呼び出し元ができた | revert | 戻していない |
+| G3 #266 | 7fb0c77 (16:17 JST) | branch 名・worktree path・base が Resolver 由来。**既定値で G3 前とバイトが同じ** (本番の pull の branch / path は t016 までと同形、base = `origin/main`)。`.crewvia-env` は 3 行のまま (§14.2)。`plan.sh pr-base` が増え、worktree / 主 checkout / cwd が無関係な場所 / 名指しのどれでも `main`。kai-review の diff base が `pr-base` 経由 (G3 後に Kai が review を完了)。lint が `git:` を検査 (本 mission 29 task で rc=0)。`git:` を書いた mission は 0 件。CI に構造ガード | revert → sync。**G4 が入っていれば先に G4 を revert**。`git:` を書いた mission があれば revert の前に消す | 戻していない |
+| G4 #267 | 3411012 (18:28 JST) | agents / skills の `--base` と diff base が `plan pr-base` 経由 (`agents/worker.md` に 6 か所)。構造ガードが任意リテラルを拾う形に広がった (hits 22 → 16)。CI ログに検査件数が出る (`git-decisions: code_files=58 doc_files=7 code_blocks=133 hits=16 allowlisted=16 unlisted=0` / `queue-writes: files=62 write_sites=188`) = 01a backlog 2 は実機で解消 | revert (文書なので restart 不要。動いている Worker のセッションには起動時の版が残る) | 戻していない |
+
+共通:
+- **戻した cutover は 0 回**。デーモンの restart は G1〜G4 で一度も要らなかった。dispatcher (2026-10-01 09:07 JST 起動) と watchdog が読むコードの最後の変更は c90ca6d (S4・08:56 JST) で、G1〜G4 が daemon 側で触ったのは `lib_git_policy.py` だけ。`grep lib_git_policy scripts/dispatcher.sh scripts/watchdog.py scripts/lib_daemon_watch.py scripts/sync-main-checkout.sh` は 0 件 = daemon は G1〜G4 の差分を import しない (§7 の「restart は要らない」が実測で成り立った)。plan.sh は呼び出しごとに新しい python で、probe の stderr に G1 の文言 (新版にしか無い行) が出ていることで新版を確認した。
+- env の停止スイッチは付けていない (不変条件 5)。
+- **G4 後の PR の base (`gh pr view --json baseRefName` が `main`) は t019 の時点で未観察**だった (G4 後に作られた PR がまだ無かった)。この記録の PR (t020) が最初の G4 後の PR なので、その `baseRefName` で確かめる (結果は t020 の Result)。
+- 本番の観察のしかた: 失敗の仕掛けは「観察用 mission (`init --inactive`) の task の worktree path に別 dir を置く」1 形だけ。共有の `.claude/worktrees/` の権限・`.git` の lock・`git config` は触らない。後片付けは `update --reset` → `git worktree remove --force` → `git branch -D` → 置いた dir → mission dir の順。
+
+### 16.2 QA の「本番の不変」の基準 (Director 判断。G3 の QA t013)
+
+稼働中の mission があると、QA の前後で本番の `queue/` `registry/` のハッシュは**一致しない**。今後の QA の「本番の不変」は次を基準にする:
+**主 checkout の git 状態 (HEAD・status・`worktree list` の自分の分) が不変** + **自分の task 以外の差分は他 task の動きと説明できる**。
+t019 もこの形で報告した (`state.yaml` は前後で同一・`git branch` 差 0・`worktree list` の差は他セッションの scratchpad の worktree が消えた 1 件だけ)。
+
+### 16.3 backlog (族ごと。どれも 01b の完了を止めない)
+
+**A. worktree 作成 (GIT-05) まわり — G1 の review t007**
+1. 予約後・worktree 判定前の例外 (bash 起動失敗・signal) で、card が in_progress + 枠が残り worktree が無い。exit 非 0 で JSON も出ないので成功扱いにはならない。後片付けは watchdog / Director。
+2. codex-review (kai-review.sh) も worktree を使わないのに同じ pull を通り、worktree を作れないと review を abort して `needs_director` (止まる側。§12 の族の掃除で不処置にした行)。
+3. path が symlink で登録済み・自分の branch でも「W3: … not <branch>」の文面で失敗する (止まる側だが文面が誤解を招く)。
+4. QA の「本物の helper での配り直し無し 3 形」のハーネスが PR に入っていない (PR の redispatch テストは N2 だけ。QA の scratchpad の `qa_redispatch.py`)。Codex 指摘: porcelain の NUL 区切り (P2)。
+
+**B. Resolver / pull — G3 の review t015・QA t013**
+5. **mission.yaml が無い mission の pull が `needs_director` になる** (G3 前は成功)。理由の文の「`plan.sh lint --mission` で同じ検査が通る」はこの場合合っていない (lint は mission.yaml が無いと通す)。本番の active な mission は全部 mission.yaml を持つ。
+6. `kai-review.sh --dry-run` で mission を解決できないと exit 1 (以前は警告で続行)。**未実走**。
+7. **G4 が入るまで custom の `git:` を書かない**としていたが、G4 は入った (3411012)。§7 の「custom の `git:` を本番の mission に書くのは G3 の本番確認 (t019) の後」も満たした。ただし下の 12 (引用符つきの直書き) が決まるまでは、書くなら構造ガードの穴を承知の上で。
+8. merge の前に main の CI が `scripts/test_*.sh` の flake で赤 → 再実行で緑 (01a t024 の backlog 12 と同じ族。秒精度の時刻と mtime の競合という**未確認の推測**)。
+
+**C. 文書・構造ガード — G4 の Codex t017 2 巡目・review t018**
+9. 構造ガードの `<literal>..HEAD` パターンが**引用符で囲んだ直書き** (`git diff "develop...HEAD"`) を拾わない。パターンを足して塞ぐ形は穴が尽きない (§13 の迷子の `git` キーと同じ型。memory `structural-guard-beats-site-patches`)。**文書の code block を shell として解析する方式に変えるか**を判断する。
+10. `agents/worker.md` の stacked 判定で `gh pr view … baseRefName` が失敗しても止まらず、空と期待値を比べて誤って「stacked PR」と報告する (`|| exit 1` と空の検査が要る)。
+11. `skills/crewvia-qa/SKILL.md:20` と §4.2 のコメント「pull の fetch は `base_branch` しか取らない」は §15.5 の訂正前のまま。
+12. `--single-branch` の段落が「TARGET_DIR の task は fetch しない」と食い違って読める (当たるのは crewvia 本体の clone)。
+
+**D. 監査ログ (01a backlog 1 の続き)**
+13. 拒否 (exit 1/2/3) の行は出ない・`actor` が `unknown` の穴は 01b でも**直していない**。G1 の拒否は `pull ... -> needs_director` の成功遷移として出る一方、idle (exit 2) と `already in_progress` の拒否は行にならない。呼び出し元の照合は 01c。
+
+**E. 01a の backlog のうち 01b で動きがあったもの**
+- 01a backlog 2 (構造ガードの件数が CI ログに出ない) は G3 / G4 で解消し、本番の CI ログで確認した (§16.1 の G4 行)。
+- 01a backlog 1・3〜12 は 01b で触っていない。
+
+### 16.4 01c (Execution ID + Task Controller) への引き継ぎ
+
+01b が 01c に渡す前提と、Execution ID が Git Policy と接する場所:
+
+1. **1 task = 1 branch = 1 worktree**。branch pattern は `{mission_slug}` と `{task_id}` (と `{task_slug}`) だけで、agent も attempt も無い。Execution ID を attempt ごとに分けるなら、pattern に `{attempt}` を足す案と、足さず 1 task = 1 branch のまま retry で再利用 (W2) する案がある。**今は後者** (§3 の W2 が本番で働いている)。足す場合、§13 の境界規則 (置換子の直後に区切り) と path の単射の総当たりテストを通す。
+2. **再 pull の再利用 (W2) は「同じ task の再取得」を前提にする**。01c が pull の冪等化 (N8) で新しい Execution を作るなら、W2 の「登録済み・branch 一致なら再利用」と「新しい attempt は新しい worktree」がぶつかる。
+3. **pull の冪等化 (N8)**: pull が途中で死ぬと同じ Worker は同じ task を取り直せない。出口は Director の `update --reset` のまま (t019 の観察でも `--reset` が出口として働いた)。**01c の最初の話題**。§10 の 1 (title を変えると branch が変わる。task_slug を card に固定する案) も同じ議論に載せる。
+4. **`.crewvia-env` に `CREWVIA_EXECUTION_ID` を足すとき、必須にしない**。G3 の「env では PR base を渡さない」(§5) と同じ理由で、env が無い shell (古い worktree・Director・TARGET_DIR) がある。正本は card、env は便宜。
+5. **G1 の CAS** (「pull 自身が作った予約」を `worker` / `started_at` で確かめる) は 01c の呼び出し元照合の代わりではない。Execution ID が入ったらそちらで置き換える。
+6. 01a から続く: Execution ID の置き場所 (card の frontmatter が正本・`identity` の JSON は projection。`state-store.md` §10.3)・監査ログの `execution_id` 欄 (全行 null で予約済み)・呼び出し元の照合・遷移の幅を狭める PR・上の 13。
+7. §10 の backlog (3 stacked PR の review diff base・4 `base_branch` を `main` 以外にした mission の保護・5 worktree_root の拡張・6 fetch のタイムアウト・7 TARGET_DIR の branch / base) は**まだ未着手**。custom の `git:` を本番で使い始める前に 4 を決める。

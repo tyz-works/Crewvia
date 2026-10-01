@@ -15,7 +15,7 @@ vNext 01c の実装 PR (E1〜E4) が従う設計。**コードの根拠はすべ
   **E4 は E4a (t016: marker の producer を切り替える) と E4b (新 task: 世代の照合を外す) に分ける提案** (§7・§9.2 の 4)。
   以下で単に「E4」と書くときは両方を指す
 - この文書の決定は 9 つ (§1〜§9)。どれも「選んだ案・捨てた案・理由」を書く。§10 が禁止事項・不変条件との確認表、
-  §11 が E1〜E4 に渡す族ごとの掃除の対象一覧
+  §11 が E1〜E4 に渡す族ごとの掃除の対象一覧。§9.5 が往復 (新 → rollback → roll forward) × 各書き込み点の crash の表 (t024)
 
 ## 0. このミッションでやらないこと
 
@@ -48,14 +48,15 @@ vNext 01c の実装 PR (E1〜E4) が従う設計。**コードの根拠はすべ
 
 ### 1.2 決定: card の frontmatter が正本。record は projection
 
-**正本 (authority) は task card 1 枚のまま。** card に 5 欄を足す (`started_at` の直後。`TASK_META_KEY_ORDER` に入れる):
+**正本 (authority) は task card 1 枚のまま。** card に 6 欄を足す (`started_at` の直後。`TASK_META_KEY_ORDER` に入れる):
 
 | 欄 | 型 | 意味 | 書き手 |
 |---|---|---|---|
 | `current_execution_id` | `ex-<32 hex>` / なし | **最新の**試行の ID。新しい reserve まで残る (terminal になっても消さない) | reserve |
 | `execution_status` | `reserved` / `running` / `completed` / `failed` / `released` / なし | その試行の status。task の `status` とは別の欄 (原案 EXEC-05「同じ field で表現しない」) | Controller の全操作 |
-| `execution_end_code` | §4.4 の終了コード / なし | その試行を**終わらせた操作**の固定コード (`DONE` / `VERIFIED` / `WORKER_FAILED` / `NEEDS_DIRECTOR` / `VERIFICATION_REJECTED` / `RESET_BY_DIRECTOR` / `RETIRED` / `WORKSPACE_CREATE_FAILED`)。`execution_status` を terminal にする**同じ card の書き込み**で入れる。active の間と reserve の直後は空。§4.4 の再送判定はこの欄だけを読む (record・task の status を読まない) | terminal にする Controller の操作 |
+| `execution_end_code` | §4.4 の終了コード / なし | その試行を**終わらせた操作**の固定コード (`DONE` / `VERIFIED` / `WORKER_FAILED` / `NEEDS_DIRECTOR` / `VERIFICATION_REJECTED` / `RESET_BY_DIRECTOR` / `RETIRED` / `WORKSPACE_CREATE_FAILED` / `ABANDONED_OUTSIDE_CONTROLLER`)。`execution_status` を terminal にする**同じ card の書き込み**で入れる。active の間と reserve の直後は空。§4.4 の再送判定はこの欄だけを読む (record・task の status を読まない) | terminal にする Controller の操作 |
 | `execution_count` | 整数 / なし | 最新の試行の attempt 番号 (= この task で発行した試行の数)。1 から単調増加 (EXEC-02) | reserve |
+| `execution_reserved_at` | `started_at` と同じ形 / なし | その試行を予約したとき reserve が `started_at` に書いた値の**写し**。次の reserve まで変えない (reset・retire・`verify-result fail` が `started_at` を null にしても残す)。§1.2 の「試行の読み方」で、card の今の `started_at` がこの試行の予約のものか (= Controller の外で取り直されていないか) を **card 1 枚で**判定するのに使う (t024 / Codex P1) | reserve |
 | `task_slug` | 文字列 / なし | 最初の reserve で title から作って**固定**する。以後の reserve はこの値を使う (git-policy.md §10 の 1) | 最初の reserve |
 
 - `execution_end_code` を card に置く理由 (Codex P1-1): §4.4 は同じ ID の再送を「同じ操作なら成功・違えば conflict」で分け、
@@ -65,9 +66,27 @@ vNext 01c の実装 PR (E1〜E4) が従う設計。**コードの根拠はすべ
 - 欄の組の整合 (lint と `STATE_INVALID`。E1): `execution_status` が `reserved` / `running` なら `execution_end_code` は空、
   `completed` / `failed` / `released` なら空でなく、組み合わせが §4.4 の表にあるもの (`completed` は `DONE` / `VERIFIED` だけ等)。
 
-- **active な試行** = `execution_status ∈ {reserved, running}` **かつ** task の status が assignment を持つ status
-  (`ASSIGNMENT_HOLDING_STATUSES` lib_task_status.py:56-61)。両方を要求する理由は §9.3 (旧コードに戻した後に残る古い欄を
-  active と読まないため)。1 task の active な試行は最大 1 件 (EXEC-05) — 欄が 1 組しか無いので構造的に 1 件。
+- **試行の読み方 (`attempt_view(meta)`。E1 の `lib_task_controller` に 1 か所。照合・冪等・R-1・reserve・reset・store-check が
+  これだけを呼ぶ)**: card の欄だけから 4 つのどれかを返す。上から順に判定する。
+
+  | 答え | 条件 | 意味 |
+  |---|---|---|
+  | `NONE` | `current_execution_id` が無い | 試行なし (legacy の card) |
+  | `DETACHED` | (a) `started_at` が空でなく `execution_reserved_at` と違う、または (b) `execution_status ∈ {reserved, running}` で task の status が `ASSIGNMENT_HOLDING_STATUSES` (lib_task_status.py:56-61) に無い | 欄は前の試行 X のものだが、card は X の外で取り直された (a: 旧コードの pull) か、X を Controller の外で手放した (b: 旧コードの reset / done 等、Director の `update --status X`)。**card の今の持ち主は X の持ち主ではない** |
+  | `ACTIVE` | `DETACHED` でなく `execution_status ∈ {reserved, running}` (⇒ task は holding) | X が今の試行 |
+  | `TERMINAL` | `DETACHED` でなく `execution_status` が terminal | X は終わった。`started_at` は X の予約の値か null (reset・retire・`verify-result fail` が消した) |
+
+  - **active な試行** = `ACTIVE`。1 task の active な試行は最大 1 件 (EXEC-05) — 欄が 1 組しか無いので構造的に 1 件。
+  - (a) の根拠: 新コードで `started_at` を書くのは reserve (`execution_reserved_at` と同じ値を同じ書き込みで) だけで、他は null にする
+    だけ (plan.sh:3540 / :5951 / :6319 を Controller に移した後も同じ)。だから「空でない `started_at` が `execution_reserved_at` と違う」は
+    **Controller を通らない pull (旧コード) が card を取り直した**ことを card 1 枚で示す。µs の世代 (`now_generation`) が 2 回の pull で
+    一致する確率は今の世代の照合と同じ前提で無視する。
+  - (b) は「持ち主のいない active」。DETACHED は**保存しない** (毎回 card から計算する) ので、Director が `update --status blocked` →
+    `update --status in_progress` で戻せば ACTIVE に戻る (§4.2 の「推測で terminal にしない」と同じ)。
+  - DETACHED の読み方: 照合 (§2.2・§5.2) では「今の試行なし」として読み、X を名乗った呼び出しは `EXECUTION_NOT_CURRENT`
+    (§4.4 の冪等は TERMINAL だけ)。R-1 は identity に `execution_id` を入れない。reserve と `update --reset` は DETACHED の active な欄を
+    `failed` / `ABANDONED_OUTSIDE_CONTROLLER` で閉じる (§1.4 の手順 0)。store-check は holding の card の (a) を
+    `reported:execution_detached`、(b) を `reported:execution_active_on_non_holding_status` (§4.2) で報告する。
 - **ID の形式**: `ex-` + `uuid.uuid4().hex` (32 桁の小文字 16 進。UUID v4 の衝突耐性 = EXEC-01 の下限)。agent 名・task ID・時刻から作らない。
   生成器は Controller の引数で注入する (`id_factory`。既定は uuid4。テストは固定列を渡す)。発行後は変えない。
 - **attempt**: reserve が card の `execution_count` を読んで +1 し、同じロックの中で card に書く。並行 reserve は `queue/.lock` で
@@ -132,7 +151,7 @@ record の欄は 2 種類に分ける。**R-5 が card に合わせるのは「�
 | execution_id / attempt | 不変 | `current_execution_id` / `execution_count` | — (必ずある。どちらも次の reserve まで card で変わらない) |
 | mission / task | 不変 | ファイル名 (不変条件 2) | — |
 | agent | **不変** | 作るとき**だけ** `worker` | 作るときに worker が空 → null で作り `reported:execution_record_owner_unknown` (下の「いつ作られるか」で、通常運用では起きない) |
-| reserved_at | **不変** | 作るとき**だけ** `started_at` (reserve が同じ値で書く) | 同上 |
+| reserved_at | **不変** | card の `execution_reserved_at` (card でも次の reserve まで変わらない。t024 で card に置いた) | — (必ずある) |
 | git.branch / base / pr_base / worktree | 不変 | `task_slug` + Resolver (`lib_git_policy`。決定的) | `task_slug` が無い legacy の card は対象外 (record を持たない) |
 | status / end_code | **追従** | `execution_status` / `execution_end_code` | — (必ずある) |
 | running_at / ended_at / git.head_at_start | 追従 (書いた操作が入れる) | **card に無い** (判断に使わない詳細) | R-5 が作る・合わせるときは既存の値を残し、無ければ null。R-5 の監査行に残す |
@@ -168,7 +187,9 @@ record の欄は 2 種類に分ける。**R-5 が card に合わせるのは「�
 - 読めない record (EACCES・壊れた JSON) は**消さない・上書きしない**。`reported:execution_record_unreadable` (01a の UNVERIFIABLE と同じ扱い)。
 - card が `[破損]` なら何もしない (01a と同じ)。
 - **過去の試行の record は R-5 の対象外** (card の `current_execution_id` が指すものだけ)。凍結の意味。
-- R-1 の identity の再生成は `execution_id` 欄を card の `current_execution_id` から入れる (§2 の行 5)。
+- R-1 の identity の再生成は `execution_id` 欄を card の `current_execution_id` から入れる (§2 の行 5)。**入れるのは
+  `attempt_view` が ACTIVE のときだけ**。DETACHED (a) の card (旧コードの pull が B に取り直させた) の枠は B のもので、X を入れると
+  B の identity が古い試行を名乗る。DETACHED の card の identity は `started_at` だけで作る (legacy と同じ形。§2.2 末尾の規則で読める)。
 
 | 操作 | 落ちた点 | 次のロック取得時 | 根拠 |
 |---|---|---|---|
@@ -178,7 +199,31 @@ record の欄は 2 種類に分ける。**R-5 が card に合わせるのは「�
 | reset / retire / verify-result fail | card (worker・started_at を null) の後・record の前 | 同上。record は reserve の時点か、この操作の直前の回復で既にある (§1.3「いつ作られるか」) | 不変の欄は card から取り直さない |
 | `update --worker B` (active な試行) | card の後 | R-5 は何もしない (追従する欄は変わっていない)。record の agent は予約した A のまま | record の agent は履歴 |
 | どれでも | record の後・assignment の前 | 01a の R-1 / R-2 のまま | record は判断に使わないので、record が先に進んでいても結論は変わらない |
-| reserve (前の試行が凍結される) | 新しい card の後 | R-5 は新しい X だけを見る。前の試行の record は reserve の**前**の回復で card に合わせ済み (reserve は回復の後に走る) | 前の試行の terminal 状態は reserve より前に card にあった |
+| reserve の手順 0 (前の試行 X を閉じる) | card (X を `failed` / `ABANDONED_OUTSIDE_CONTROLLER`) の後・record X の前 | X はまだ card の `current_execution_id` なので R-5 が record X を合わせる。task は pending のままなので次の pull が reserve をやり直す (X は terminal なので手順 0 は飛ばす) | 前の試行の終端が正本 (card) に先に入る |
+| 同上 | record X の後・新しい card の前 | 何もしない (record X は card と一致済み) | 同上 |
+| reserve (前の試行が凍結される) | 新しい card (Y) の後 | R-5 は新しい Y だけを見る。前の試行 X の record は、Y を書く**前**に card 上で terminal になり、R-5 (reserve の前の回復) か手順 0 で card に合わせ済み | **X の終端は Y を書く前に必ず card にあった** (下の手順 0) |
+
+**reserve の手順 0 (前の試行の終端を正本に残す。t024 / Codex P2-2)**。reserve は pending の card にしか通らない。その card の
+`attempt_view` が DETACHED で `execution_status` が reserved / running (= X が active のまま、task は誰も持っていない: 旧コードの
+reset・Director の `update --status pending` の後。pending なので (b) の条件を必ず満たす。旧コードの pull の後の `update --status pending`
+では (a) も満たすが、扱いは同じ) なら、Y を発行する**前に、同じロックの中で**次の順に書く:
+
+1. card: `execution_status = failed`・`execution_end_code = ABANDONED_OUTSIDE_CONTROLLER` (他の欄は変えない) — **コミット点**
+2. record X: 追従する欄を card に合わせる (R-5 と同じ書き込み。無ければ card から作る)・監査に `reported:stale_execution_status`
+3. 以後は通常の reserve (card に Y → record Y → identity → 枠)
+
+- 旧案 (§9.3 の 1 巡目) は「Y の card を書いた後で X の record を凍結する」で、Y の card の直後に落ちると X は card の
+  `current_execution_id` から外れ、R-5 (最新 ID だけ) が二度と X を扱わない。X の終端が card に一度も保存されないので回復できなかった。
+  手順 0 は**終端を正本に先に書く**ので、どこで落ちても「X の終端は card にある or X は card の今の試行で R-5 の範囲」のどちらか。
+- 捨てた案: card に `previous_execution_id` を持ち R-5 が 2 件を合わせる。欄が増え、旧コードの往復が 2 回続くと 3 件目が漏れる
+  (同じ族の再発)。手順 0 は「current を進めるのは reserve だけ、進める前に前の current を card 上で terminal にする」という不変条件で、
+  件数に依らない。
+- これで **「card の current でない record は、card が current を進めた時点の terminal に合っている」** が全経路で成り立つ。
+  例外は record を手で消した・読めない場合だけ (報告。§1.4 の R-5 と同じ)。store-check は current でない record が active のまま
+  (card を手で編集した・lib を通らない書き込みがあった等。どの Controller の経路からも作られない) を `reported:execution_record_superseded_active` で報告する (書かない。履歴の欠けで、状態の
+  判断には使わない)。
+- 手順 0 は `update --reset` でも同じ: reset の対象が DETACHED で欄が reserved / running なら `RESET_BY_DIRECTOR` ではなく `ABANDONED_OUTSIDE_CONTROLLER`
+  で閉じる (試行は reset の前に Controller の外で手放されていた。§4.2)。
 
 ### 1.5 監査ログの `execution_id`
 
@@ -201,7 +246,7 @@ record・identity・枠の本文・退役 marker・監査ログ・呼び出し�
 | 1 | 終了理由 (record `end_code`、旧案の `failure.code`) | §4.4 の再送判定 | 判断 | **card に持つ** (`execution_end_code`。§1.2)。record は写し。再送判定は card だけを読む |
 | 2 | 予約した agent / 予約時刻 (record `agent` / `reserved_at`) | R-5 の食い違い判定 (旧案) | 回復 | **判断に使わない** (R-5 の比較から外す。§1.4)。作るときだけ card から取り、以後不変 (§1.3) |
 | 3 | 同上 | §8 の監査の `actor` (旧案「record / card の worker」) | 記録 | **card から**: 本体の操作の前の card の `worker`。record は読まない (§8 を直した) |
-| 4 | 同上 | §9.3 の `reported:execution_fields_stale` (card の `started_at` ≠ record の `reserved_at`) | 報告だけ | **判断に使わない**: 報告を出すだけで何も書かない。task が holding・試行が active・card の `started_at` が空でないときだけ比べる (reset の後の null で誤報しない)。直すのは Director の `update --reset` で、その可否は card が決める |
+| 4 | 予約時の世代 (旧案は record `reserved_at`) | `attempt_view` の DETACHED (a) (旧案の `reported:execution_fields_stale`) | 判断 | **card に持つ** (`execution_reserved_at`。t024)。旧案は record と比べる報告だけで、しかも試行が active の card しか見なかったので、X を completed にした後に旧コードが取り直した card (Codex P1) を見逃した。card の `started_at` と `execution_reserved_at` の比較は試行の status に依らず、照合・冪等の判断に使う (§1.2) |
 | 5 | 試行の status / attempt / ID (record) | R-5 の比較 | 回復 | card が正本 (`execution_status` / `execution_count` / `current_execution_id`)。record を card に合わせる向きだけ |
 | 6 | running_at / ended_at / git.head_at_start (record) | 表示・`get_execution` | 表示 | **判断に使わない** (§1.3)。欠けても null |
 | 7 | `execution_id` / `started_at` (identity) | `classify_assignment` (#4)・`assignment_execution_verdict` (#11)・R-1 (#5) | 照合 | **card から再生成**: R-1 が `current_execution_id` / `started_at` から作り直す (§1.4 末尾)。食い違えば card が勝つ |
@@ -210,6 +255,8 @@ record・identity・枠の本文・退役 marker・監査ログ・呼び出し�
 | 10 | `CREWVIA_EXECUTION_ID` (`.crewvia-env`・env)・`--execution`・pull の JSON | §5.2 の照合 | 照合 | **名乗り**。card の `current_execution_id` と比べるだけで、card に書かない。欠けたら「名乗りなし」(§5.2) |
 | 11 | 監査ログ (`caller_check` / `execution_id` / `refused:`) | E5 の merge 条件 (§9.2 の 1)・本番確認 | cutover の判断 (人) | **判断の唯一の根拠にしない**: 監査は行が欠けうる (state-store.md §4) ので、欠けると `unverified` が少なく数えられる向きに誤る。E5 の条件は監査の 0 件に加えて、**コードと手順から言えること** (worker.md・kai-review・skill が ID を渡す・生きている Worker のセッションが全部その変更の後に起動した。§9.4) を要る |
 | 12 | `.crewvia-env` の `CREWVIA_TASK_SLUG` | worktree のパス | 表示・パス | card の `task_slug` (§1.2) から pull が毎回書く。判断に使わない |
+| 13 | 前の試行の終端 (旧案は reserve の後に record だけを凍結) | 前の試行の record・store-check | 回復 | **card に先に書く** (§1.4 の手順 0。t024 / Codex P2-2)。旧案は終端が card に一度も入らず、新しい ID を書いた直後に落ちると回復の範囲 (最新 ID) から外れた |
+| 14 | 同じ予約の pull が進行中か (プロセスの中) | §6 の再開 | 判断 | **正本に置かない・推測しない**: 準備ロック (§6.1。kernel の flock) が持つ。card は「reserved か」だけを答え、「誰かが準備中か」は flock が答える。flock は持ち主のプロセスが死ねば kernel が外すので、古い値が残らない |
 
 - 表に無い値で判断・回復・照合に使うものを足す PR は、この表に行を足す (E1〜E4 の Result の族の表 §11 と同じ)。
 
@@ -225,7 +272,7 @@ record・identity・枠の本文・退役 marker・監査ログ・呼び出し�
 | # | 場所 | 何をしている | R/W | 移す段 |
 |---|---|---|---|---|
 | 1 | plan.sh:487-497 `now_generation` | 世代を作る | 源 | 残す (時刻として。§0) |
-| 2 | plan.sh:3538-3541 `cmd_pull._do` | card に `started_at` を書き、`started_holder` に持つ | W | E2: 同じ場所で reserve が `current_execution_id` / `execution_status` / `execution_count` / `task_slug` も書く |
+| 2 | plan.sh:3538-3541 `cmd_pull._do` | card に `started_at` を書き、`started_holder` に持つ | W | E2: 同じ場所で reserve が `current_execution_id` / `execution_status` / `execution_count` / `execution_reserved_at` (= 書いた `started_at`) / `task_slug` も書く |
 | 3 | plan.sh:2006-2014 → lib_state_store.py:1054-1060 `publish_assignment` | identity に `started_at` を写す | W | E1: identity に `execution_id` 欄を足す (引数で渡す)。E2 から呼び出し側が渡す |
 | 4 | lib_state_store.py:1082-1104 `Txn.classify_assignment` | identity の `started_at` と世代を比べ MINE / SUCCESSOR | R | E1: 引数 `execution_id` を足す (§2.2 の規則)。E4 で世代の比較を外す |
 | 5 | lib_state_store.py:1359-1422 `_r1` (**R-1**) | card の `started_at` で identity を作り直す / 一致を確かめる (`generation_mismatch`) | R/W | E1: card に `current_execution_id` があれば identity にも入れ、照合も ID で。legacy の card は今のまま |
@@ -251,11 +298,13 @@ record・identity・枠の本文・退役 marker・監査ログ・呼び出し�
 
 | card | 名乗られた証拠 | 判定 |
 |---|---|---|
-| `current_execution_id = X` (E2 以降に予約された試行) | execution_id = X | **一致** |
+| `current_execution_id = X` (E2 以降に予約された試行) で `attempt_view` が ACTIVE / TERMINAL | execution_id = X | **一致** |
 | 同上 | execution_id = Y (≠ X) | **不一致** (`EXECUTION_NOT_CURRENT`)。`started_at` が一致していても不一致 (ID が優先) |
 | 同上 | execution_id なし・`started_at` だけ (旧 marker・旧引数) | `started_at` が一致すれば**一致**、ただし監査行に `caller_check=legacy_generation` を残す (E4 の後は不一致に倒す) |
 | `current_execution_id` なし (legacy の試行) | `started_at` | 今の世代の照合のまま |
 | 同上 | execution_id | **不一致** (この card はその ID を発行していない) |
+| `attempt_view` が DETACHED (欄は X だが card は X の外で取り直された・手放された。§1.2) | execution_id = X または Y | **不一致** (`EXECUTION_NOT_CURRENT`)。X はこの card が発行したが、今の持ち主の試行ではない |
+| 同上 | `started_at` だけ | 「`current_execution_id` なし」の行と同じ (今の世代の照合)。旧コードの pull で取り直した持ち主は旧コードの世代を持っているので、それで照合する。監査行は `caller_check=detached_execution` |
 
 identity (projection) 側も同じ: identity に `execution_id` があれば ID で、無ければ `started_at` で比べる。
 「片方にだけ ID がある」組 (card に X・identity に ID なし) は、identity が E2 前に公開されたもの (= その時点の card には X が無い) か
@@ -364,7 +413,7 @@ EXEC-04 の遷移 (reserved → running → completed / failed、reserved → fa
 
 | 操作 (コマンド) | 試行 from → to | task from (§4.3 で狭めた後) → to | worker / 枠 |
 |---|---|---|---|
-| reserve (pull の 1 つ目のロック) | (なし or terminal) → reserved | pending → in_progress | worker = A・枠を公開 (identity に ID) |
+| reserve (pull の 1 つ目のロック) | (なし or terminal) → reserved。前の試行が DETACHED で reserved / running なら先に手順 0 で failed `ABANDONED_OUTSIDE_CONTROLLER` (§1.4) | pending → in_progress | worker = A・枠を公開 (identity に ID) |
 | start (pull の 2 つ目のロック。**新設**) | reserved → running | in_progress → in_progress | 変えない |
 | worktree を作れない (G1) | reserved → failed `WORKSPACE_CREATE_FAILED` | in_progress → needs_director | worker 残す・枠撤去 (今と同じ) |
 | done | running → completed `DONE` | in_progress → done | 枠撤去 (今と同じ) |
@@ -375,7 +424,7 @@ EXEC-04 の遷移 (reserved → running → completed / failed、reserved → fa
 | verify-result fail (≥ max) / needs_human_review | running (変えない) | ready_for_verification / verifying → needs_human_review | 今と同じ |
 | fail (Worker) | running → failed `WORKER_FAILED` | in_progress → failed | 枠撤去 |
 | needs-director | running → failed `NEEDS_DIRECTOR` | in_progress → needs_director | worker 残す・枠撤去 |
-| update --reset | reserved → released `RESET_BY_DIRECTOR` / running → failed `RESET_BY_DIRECTOR` / それ以外は変えない | any → pending (+ `--status` の後書きは今どおり) | worker・started_at を null・枠撤去 (今と同じ) |
+| update --reset | ACTIVE: reserved → released `RESET_BY_DIRECTOR` / running → failed `RESET_BY_DIRECTOR`。DETACHED で reserved / running: failed `ABANDONED_OUTSIDE_CONTROLLER` (§1.4 の手順 0 と同じ書き込み)。それ以外は変えない | any → pending (+ `--status` の後書きは今どおり) | worker・started_at を null・枠撤去 (今と同じ) |
 | retire --outcome reset | reserved → released `RETIRED` / running → failed `RETIRED` | in_progress → pending | 同上 |
 | retire --outcome needs-director | 同上 | in_progress → needs_director | worker 残す・枠撤去 |
 | update --status X (--reset なし。Director) | **変えない** | any → X | 今と同じ (枠は触らない) |
@@ -384,9 +433,10 @@ EXEC-04 の遷移 (reserved → running → completed / failed、reserved → fa
 - 試行の無い task への操作 (legacy の card・Director の `update --status in_progress --reset` で開いた card・needs_director の後等) は
   **task の遷移だけ** (`mark_task`)。試行の欄は触らない (§5.3 の「試行なし」の経路)。
 - `update --status X` で active な試行が残ったまま task が holding でない status になった card (例: running のまま `blocked`) は、
-  §1.2 の定義で「active でない」。試行の欄は書き換えない (推測で terminal にしない。原案 §14-16)。store-check が
-  `reported:execution_active_on_non_holding_status` を出す。次の reserve は pending からしか通らないので、Director が `--reset` する
-  (そのとき reset が試行を failed `RESET_BY_DIRECTOR` にする)。
+  §1.2 の `attempt_view` で DETACHED (b) (active でない)。試行の欄は書き換えない (推測で terminal にしない。原案 §14-16。
+  `update --status in_progress` で戻せば ACTIVE に戻る)。store-check が `reported:execution_active_on_non_holding_status` を出す。
+  次の reserve は pending からしか通らないので、Director が `--reset` する (そのとき reset が試行を failed
+  `ABANDONED_OUTSIDE_CONTROLLER` にする)。`--reset` なしで pending にした場合は次の reserve の手順 0 が同じく閉じる (§1.4)。
 
 ### 4.3 今の task 遷移のうち狭めるもの (state-store.md §1.4 / lib_task_status.py:82-91 を 1 行ずつ)
 
@@ -425,8 +475,13 @@ EXEC-04 の遷移 (reserved → running → completed / failed、reserved → fa
 
 ### 4.4 冪等と domain error (CTRL-04 / CTRL-05)
 
-**冪等**: 名乗った ID が card の `current_execution_id` と一致し、その試行が既に terminal のとき、答えは **card の
-`execution_end_code` だけ**で決める (record・task の status は読まない。§1.2 / §1.6 の 1):
+**冪等**: 名乗った ID が card の `current_execution_id` と一致し、`attempt_view` が **TERMINAL** のとき、答えは **card の
+`execution_end_code` だけ**で決める (record・task の status は読まない。§1.2 / §1.6 の 1)。
+**DETACHED のときは表を引かず `EXECUTION_NOT_CURRENT`** (t024 / Codex P1): X を completed にした後に旧コードが card を取り直した
+(別の作業が in_progress) なら、X の done の再送を「成功」と答えると、呼び出し元は今の task が完了したと読む。新コードだけで同じことが
+起きる経路 (reset → 再 pull) では新しい ID が発行され、X の再送は `EXECUTION_NOT_CURRENT` になる。DETACHED (a) はその再 pull が
+Controller の外で起きた形なので、同じ答えに揃える。`started_at` が null の TERMINAL (reset・retire・`verify-result fail` の後) は
+取り直されていないので、今までどおり表を引く:
 
 | card の `execution_end_code` (status) | 来た操作 (同じ ID) | 結果 |
 |---|---|---|
@@ -435,13 +490,15 @@ EXEC-04 の遷移 (reserved → running → completed / failed、reserved → fa
 | `WORKER_FAILED` (failed) | fail | 成功・何も書かない |
 | `NEEDS_DIRECTOR` (failed) | needs-director | 成功・何も書かない |
 | `VERIFICATION_REJECTED` (failed) | verify-result fail | 成功・何も書かない (verifier の再送) |
+| `RETIRED` (failed / released) | retire (`--execution` が同じ ID) | 成功・何も書かない (watchdog の `_settle_terminated` が card の書き込みの後に死んで打ち直す場合。E4a) |
 | `DONE` / `VERIFIED` | 上の行以外 (fail / needs-director / done を `VERIFIED` に等) | **conflict** (`EXECUTION_ALREADY_TERMINAL`・exit 3・何も書かない) |
 | `WORKER_FAILED` / `NEEDS_DIRECTOR` / `VERIFICATION_REJECTED` | 上の行以外 | conflict |
-| `RESET_BY_DIRECTOR` / `RETIRED` / `WORKSPACE_CREATE_FAILED` (failed / released) | done / fail / needs-director / verify-result | conflict (`EXECUTION_NOT_CURRENT` と同じ扱い: その試行は持ち主以外の操作で終わり、もう誰の作業でもない) |
+| `RESET_BY_DIRECTOR` / `RETIRED` / `WORKSPACE_CREATE_FAILED` / `ABANDONED_OUTSIDE_CONTROLLER` (failed / released) | done / fail / needs-director / verify-result | conflict (`EXECUTION_NOT_CURRENT` と同じ扱い: その試行は持ち主以外の操作で終わり、もう誰の作業でもない) |
 
 - **終了コードの書き手** (どれも terminal にする card の書き込みと同じ 1 回): done → `DONE`、verify-result pass → `VERIFIED`、fail → `WORKER_FAILED`、
   needs-director → `NEEDS_DIRECTOR`、verify-result fail (< max) → `VERIFICATION_REJECTED`、update --reset → `RESET_BY_DIRECTOR`、
-  retire → `RETIRED`、G1 → `WORKSPACE_CREATE_FAILED`。
+  retire → `RETIRED`、G1 → `WORKSPACE_CREATE_FAILED`、reserve の手順 0 と DETACHED への update --reset →
+  `ABANDONED_OUTSIDE_CONTROLLER` (§1.4)。
 - **reset の後に Director が task の status を変えても答えは変わらない**: `update --status X` (--reset なし) は試行の欄を触らない (§4.2)
   ので `execution_end_code` は残る。次の reserve が新しい ID を発行した後は、古い ID の再送は `EXECUTION_NOT_CURRENT`。
 - crash の点 (§1.4): 終了コードは terminal の status と同じ card の書き込みに入るので、「status は terminal・理由は不明」の card は
@@ -503,9 +560,12 @@ ID の出どころは **`--execution <id>` (明示) > env `CREWVIA_EXECUTION_ID`
 | active (X) | X | 通す | `verified` |
 | active (X) | Y (≠ X) | **拒否** `EXECUTION_NOT_CURRENT` (exit 3)。env 由来なら、どこから来た値か (env) と直し方 (`unset CREWVIA_EXECUTION_ID` か `--execution` を渡す) を拒否文に書く | 拒否の行 (§8) |
 | active (X) | なし | **E3 では通す** (warn を stderr に 1 行) | `unverified` |
-| terminal (X) | X | §4.4 の冪等 / conflict | `verified` |
-| 試行なし (legacy の card・Director が開いた card・needs_director の後) | なし | 通す (task の遷移だけ。§4.3 の表で受け付ける from に限る) | `no_execution` (legacy の in_progress は `legacy_generation`) |
-| 試行なし | X | 拒否 `EXECUTION_NOT_FOUND` (exit 3) | 拒否の行 |
+| TERMINAL (X) | X | §4.4 の冪等 / conflict | `verified` |
+| TERMINAL (X) (Director が開いた card・needs_director の後) | なし | 「試行なし」と同じ (task の遷移だけ。試行の欄は触らない) | `no_execution` |
+| 試行なし (`NONE`: legacy の card) | なし | 通す (task の遷移だけ。§4.3 の表で受け付ける from に限る) | `no_execution` (legacy の in_progress は `legacy_generation`) |
+| 試行なし (`NONE`) | X | 拒否 `EXECUTION_NOT_FOUND` (exit 3) | 拒否の行 |
+| DETACHED (欄は X。§1.2) | X / Y | 拒否 `EXECUTION_NOT_CURRENT` (exit 3)。X を名乗っても冪等の表を引かない (§4.4) | 拒否の行 |
+| DETACHED | なし | 「試行なし」と同じ (task の遷移だけ。X の欄は触らない — X を閉じるのは reserve / reset の手順 0 だけ) | `detached_execution` |
 
 - **agent 名は照合の根拠にしない** (AC-04)。名前は監査の `actor` と、枠 (assignment) の場所を決めるのにだけ使う。
 - **名乗りなしを E3 で拒否しない理由**: `.crewvia-env` を必須にしない (git-policy.md §16.4 の 4)。env の無い shell は今ある:
@@ -556,10 +616,15 @@ ID の出どころは **`--execution <id>` (明示) > env `CREWVIA_EXECUTION_ID`
 同じ task・同じ試行のまま再開する。`running` の試行は再開しない。**
 
 ```text
-ロック 1: recover → 候補選び → reserve (card: in_progress / X / reserved / attempt / task_slug、record、identity(X)、枠)
-ロック外: Taskvia → worktree (W0〜W7) → git rev-parse HEAD → .crewvia-env (X を含む)
+ロック 1: recover → 候補選び → reserve (手順 0 → card: in_progress / X / reserved / attempt / execution_reserved_at /
+          task_slug、record、identity(X)、枠) または再開の判定 (書かない)
+準備ロック: queue/missions/<slug>/executions/<tid>.prepare.lock を LOCK_EX|LOCK_NB で取る (§6.1)。取れなければ exit 1・何も書かない
+          取れたら card を読み直し (ロックなしの読み)、X が reserved でなければ exit 1・何も書かない
+ロック外: Taskvia → worktree (W0〜W7) → git rev-parse HEAD → .crewvia-env (X を含む)          [準備ロックを持ったまま]
 ロック 2: recover → start (CAS: current_execution_id == X かつ execution_status == reserved → running、record)
           失敗 (worktree / env): CAS が同じなら fail_execution(X, WORKSPACE_CREATE_FAILED) + needs_director (G1 の出口)
+          CAS が外れたら何も書かず exit 1 (JSON を出さない)                                     [準備ロックを持ったまま]
+準備ロックを外す
 stdout:   JSON (execution_id / attempt を含む)
 ```
 
@@ -599,6 +664,54 @@ stdout:   JSON (execution_id / attempt を含む)
 | start を作らず、reserve 1 回で running にする (今の形) | reserved と running を区別できず、「JSON が渡ったか」を正本から言えない。N8 の再開を安全にできない (running の再開は上の理由で危険) |
 | 同じ Worker の再 pull は running でも同じ試行を返す | 上の「running を再開しない理由」 |
 
+### 6.1 同じ予約の並行 pull (t024 / Codex P2-1)
+
+**問題**: 再開は「同じ agent・reserved」だけを見るので、最初の pull がまだロック外 (worktree の準備中) にいる間に 2 本目の pull
+(同じ agent 名。dispatcher の指示の再送・Worker の打ち直し・退役されていない前任) が来ると、2 本とも同じ branch / path に
+`git worktree add` する。片方が W4 / W5 で失敗し、その失敗側が成功側の start より先にロック 2 を取ると、CAS (X・reserved) は
+一致するので試行を failed `WORKSPACE_CREATE_FAILED` にし、task は needs_director、成功側の start も CAS で外れる (両方失敗)。
+start の CAS は「試行がまだ reserved か」しか言えず、「他の pull が準備中か」を言えない。
+
+**決定: ロック外の準備 (Taskvia・worktree・`.crewvia-env`) とロック 2 を、task ごとの準備ロックで直列化する。待たない。**
+
+- **準備ロック**: `queue/missions/<slug>/executions/<tid>.prepare.lock` を `flock(LOCK_EX | LOCK_NB)`。最初の pull も再開も、
+  ロック 1 を外した後・Taskvia の前に取り、ロック 2 のコミット (start / G1 の失敗 / CAS 外れ) の後に外す。中身は空で、消さない
+  (archive が dir ごと動かす)。取得・解放は lib_state_store の口を通す (不変条件 1・構造ガード §10 の §14-8)。
+- **取れない = 同じ task の pull が準備中** → その pull は **exit 1・何も書かない・worktree と `.crewvia-env` に触れない・JSON を
+  出さない** (`TASK_ALREADY_RESERVED`、文面は「同じ予約の pull が進行中」)。監査の行は出さない (ロックの外で決まる拒否。§8 の
+  「ロック」と同じ理由)。待たない理由: 待つと先の pull の後に W2 で同じ worktree を再利用し、ロック 2 で CAS が外れるだけ
+  (やることが無い)。
+- **取れた後に card を読み直す** (ロックなしの読み。`lib_task_cards`): X が reserved でなければ (先の pull が start 済み・reset 済み)
+  exit 1・何も書かない。この読みは「無駄な worktree 操作をしない」ための早期打ち切りで、正しさは CAS が持つ (読みと CAS の間に
+  変わっても、CAS が外れて何も書かない)。
+- **これで「失敗側が他の pull の進行中を見分ける」が構造になる**: G1 の失敗を書けるのは準備ロックを持つ pull だけで、持っている間は
+  同じ task の他の pull は worktree に触れていない。だから W4 / W5 の失敗は「他の pull と競合した」ではなく、その pull 単独の失敗。
+- **ロックの順序**: 準備ロックは queue/.lock の**外側**で、queue/.lock を握ったまま準備ロックを取らない (ロック 1 は準備ロックの前に
+  外す)。lib_state_store.py:1609-1616 の「queue/.lock が最も外側」は S5 の小さな共有ファイルの規則で、準備ロックはそれより外の
+  1 段として足す (E2 でその docstring に追記する)。LOCK_NB なので、仮に逆順で取るコードが入っても待ちの輪 (deadlock) にはならず
+  exit 1 になる。
+- **古いロックが残らない**: flock は持ち主のプロセスが死ねば kernel が外す。準備中に殺された pull の後は、次の再 pull が取れて
+  再開できる (N8 の経路のまま)。ファイルの有無ではなく flock で判断するので、残ったファイルは意味を持たない。
+- **network をロックの中に入れない (§14-15)** に当たらない: §14-15 は queue/.lock の話で、準備ロックは同じ task の pull だけを
+  止める (他の task・他のコマンドは止めない)。
+- 捨てた案: pull ごとの nonce を card に書き、start / G1 の CAS を「最後に再開した pull だけ」にする。古い側は書けなくなるが、
+  新しい側の `git worktree add` が古い側の作りかけと衝突して失敗すると、正しく作れた worktree があるのに needs_director になる。
+  直列化しない限り、どちらの失敗が本物かを CAS では言えない。
+- 捨てた案: 準備をロック 1 の中に入れる。Taskvia (network) と git を queue/.lock の中で走らせることになる (§14-15)。
+
+**E2 のテスト項目** (独立プロセス・実 flock。§12 の E2 行に入れる):
+
+1. 1 本目を worktree の直前 (準備ロック取得後) で止め、同じ agent の 2 本目を走らせる → 2 本目は exit 1・card / record / 監査の
+   本体行 / worktree / `.crewvia-env` が 1 バイトも変わらない。1 本目を進めると start → running・JSON
+2. 1 本目をロック 1 の後・準備ロックの前で止め、2 本目が準備ロックを取って最後まで進む → 1 本目は準備ロックか読み直しで exit 1、
+   JSON を出さない・何も書かない
+3. 準備ロックを持つ側に W4 / W5 を注入 → G1 が `failed WORKSPACE_CREATE_FAILED` + needs_director (他に準備中の pull が無いので正しい)。
+   その間に来た 2 本目は exit 1
+4. 準備ロックを持つ pull を SIGKILL → 次の再 pull が準備ロックを取れ、同じ X で再開 (attempt が増えない)
+5. 欠陥版 (準備ロックを外す) で finding の経路 (2 本とも失敗・X が `WORKSPACE_CREATE_FAILED`) が再現して赤になる
+   (memory `regression-test-must-prove-red`)
+6. 別の task の pull は準備ロックで止まらない (task ごと)
+
 ---
 
 ## 7. 進行中の task の扱い (原案 §9.3)
@@ -623,7 +736,8 @@ stdout:   JSON (execution_id / attempt を含む)
   (memory `prove-which-code-version-a-spawned-task-ran` の 3 点。`DAEMON_RESTART_FILES` lib_daemon_watch.py:240-258 は両デーモンとも
   `lib_retirement.py` を含むので sync-main-checkout.sh が両方を restart する) (1) `plan.sh store-check` が全 active mission で
   `reported:legacy_execution` (in_progress / ready_for_verification / verifying / needs_human_review で `current_execution_id` が無い card。
-  E1 で足す報告) を 0 件 (2) `registry/retirements/*.json` と `*.progress.json` で `task_execution_id` の無い marker が 0 件。
+  E1 で足す報告) と `reported:execution_detached` (holding の card で `attempt_view` が DETACHED (a): rollback 中に旧コードの pull が
+  取り直した持ち主で、legacy と同じく `started_at` でしか照合できない。§1.2) を合わせて 0 件 (2) `registry/retirements/*.json` と `*.progress.json` で `task_execution_id` の無い marker が 0 件。
   (0) の後は旧形式の marker を作るプロセスが残っていないので、(2) の数は**減るだけ**で、確認から restart までの間に増えない
   (E4a のコードが card に ID の無い task を退役させるときだけ欄が空になるが、それは (1) の legacy card で、0 件なら作られない。§9.4)。
   待てない card は Director が `update --reset` で legacy の試行を手放す — これは今ある手作業で、migration ではない
@@ -657,7 +771,7 @@ stdout:   JSON (execution_id / attempt を含む)
 | 拒否 (exit 1/2/3) の行が無い・`result` は常に `ok` | **照合と遷移の拒否だけ**行にする: `EXECUTION_NOT_CURRENT` / `EXECUTION_NOT_FOUND` / `EXECUTION_ALREADY_TERMINAL` / `INVALID_TRANSITION` / `TASK_ALREADY_RESERVED`。`result=refused:<CODE>`。回復の行と同じ経路 (ロックの中で**即時**追記。本体の `die` を待たない。state-store.md §2.3 末尾) | E1 (lib の `Txn.refuse(code, ...)`) / E2・E3・E4 |
 | 同上 (行にしないもの) | `NO_TASK` (pull の idle。Worker が数十秒ごとに打つ — 1 日数千行の雑音)・使い方の誤り (引数)・`TASK_NOT_FOUND`・ロック (取れていないので順序を保証できない)・`StoreError` | — |
 | `actor` が `unknown` | (1) 照合に通った操作は `actor` = 本体の操作の**前の card の `worker`** (record は読まない。§1.6 の 3) (2) デーモンは subprocess の env に `AGENT_NAME` を入れる: lib_retirement の retire は `watchdog`、dispatcher の reap は `dispatcher` (verifier-dispatcher.sh:258 と同じ前例) (3) それ以外は今どおり `AGENT_NAME` か `unknown`。**`audit_actor` の docstring (plan.sh:1876-1879)「Director と デーモンは見分けられない」は事実と違う** (Director のセッションにも AGENT_NAME がある。start.sh:292 / :786) ので直す | E1 (lib) / E3・E4 |
-| 照合の結果が残らない | 本体の行に `caller_check` (`verified` / `unverified` / `legacy_generation` / `no_execution`) を足す。E5 の判断材料 (§5.2) | E1 / E3 |
+| 照合の結果が残らない | 本体の行に `caller_check` (`verified` / `unverified` / `legacy_generation` / `no_execution` / `detached_execution`) を足す。E5 の判断材料 (§5.2) | E1 / E3 |
 | `_SAFE_RESULT_RE` (lib_state_store.py:117) が `repaired:R-[1-4]` と `reported:` だけ | `repaired:R-5` と `refused:[A-Z_]+` を足す | E1 |
 | state-store.md §10.3 の 9 (Director が開いた card への `in_progress_without_worker` が 1 呼び出し 1 行) | **01c では閉じない** (backlog)。「Director が開いた card」を判定する根拠が plan.sh に無い (§5.3 の理由と同じ)。dedup は報告の仕組みの変更で、照合とは別 | — |
 
@@ -674,7 +788,7 @@ stdout:   JSON (execution_id / attempt を含む)
 | PR | 本番で変わること | merge 前 | merge 後に Director が本番で確かめること | 戻し方 |
 |---|---|---|---|---|
 | **E1** (t004) | **なし** (呼び出し元ゼロ)。lib_state_store の拡張は既定値で今とバイトが同じ | 通常 merge (t007) | `grep -rn lib_task_controller scripts hooks` が lib 自身とテストだけ / 01a S3 の互換 golden が変わっていない (CI) | revert |
-| **E2** (t008) | pull が ID を発行 (card に 5 欄 (`execution_end_code` は空)・`executions/` に record・identity に `execution_id`・`.crewvia-env` に `CREWVIA_EXECUTION_ID`・JSON に `execution_id` / `attempt`) / pull が 2 つ目のロックを取る (start) / **同じ Worker の再 pull が reserved の試行を再開** / G1 の CAS が ID に / `task_slug` を card に固定 (title を変えても branch が変わらない) / 監査行の `execution_id` | **ユーザー承認** (t011) | 実 Worker の pull 1 回で: card に 5 欄・record が 1 つ・identity に ID・`.crewvia-env` が 4 行・監査行に ID が出る / 既存の進行中 card (legacy) の done が今どおり通る / dispatcher の busy / idle が変わらない (枠の本文は同じ) / `store-check` の差分が `legacy_execution` の報告だけ | revert → `scripts/sync-main-checkout.sh`。**新しい欄・record・identity の欄は残ってよい**: 旧コードは欄を `dump_yaml` で保持し (読まない)、`executions/` を読まず、identity の `started_at` だけを見る (§9.3) |
+| **E2** (t008) | pull が ID を発行 (card に 6 欄 (`execution_end_code` は空)・`executions/` に record・identity に `execution_id`・`.crewvia-env` に `CREWVIA_EXECUTION_ID`・JSON に `execution_id` / `attempt`) / pull が 2 つ目のロックを取る (start) / **同じ Worker の再 pull が reserved の試行を再開** / G1 の CAS が ID に / `task_slug` を card に固定 (title を変えても branch が変わらない) / 監査行の `execution_id` | **ユーザー承認** (t011) | 実 Worker の pull 1 回で: card に 6 欄 (`execution_reserved_at` = `started_at`)・record が 1 つ・identity に ID・`.crewvia-env` が 4 行・監査行に ID が出る / 既存の進行中 card (legacy) の done が今どおり通る / dispatcher の busy / idle が変わらない (枠の本文は同じ) / `store-check` の差分が `legacy_execution` の報告だけ | revert → `scripts/sync-main-checkout.sh`。**新しい欄・record・identity の欄は残ってよい**: 旧コードは欄を `dump_yaml` で保持し (読まない)、`executions/` を読まず、identity の `started_at` だけを見る (§9.3) |
 | **E3** (t012) | done / fail / needs-director / ready-for-verification / verify-result が ID を照合 (違う ID は exit 3)・**§4.3 の狭め** (done が pending / blocked / 検証待ちから通らない等)・`verify-result fail` が pending (新しい試行へ)・ID を名乗った再送が冪等 (exit 0)・拒否の行・`caller_check`・kai-review.sh が ID を渡す・worker.md / skill / director.md が `--execution` を使う・`plan.sh status` に ID 表示 | **ユーザー承認** (t015)。**狭めの表 (§4.3) と verify-result fail の変更を承認の対象として明示する** | 実 Worker の done が `caller_check=verified` / 旧プロンプトの Worker の done が `unverified` で通る / Kai の review が done / needs-director まで通る / Director の cutover review task の `update --status in_progress --reset` → done が通る / 監査に `refused:` が出たら 1 件ずつ妥当か | revert → sync。card の新しい欄は E2 と同じく残ってよい。**狭めを戻すと再び pending から done が通る** (戻すのは制限を外す方向なので壊れない) |
 | **E4a** (t016) | **退役 marker / progress に `task_execution_id` を書き始める** (producer の切り替え)・retire が `--execution` を受け付け・`update --reset` / retire が試行を release / fail (`execution_end_code`)・reap の照合が ID 優先・デーモンの `AGENT_NAME`。**世代の照合は残す** (新旧の marker を両方読む) | **ユーザー承認** (t019)。0 件の確認は**要らない** (旧形式も読める) | **dispatcher と watchdog の両方が restart された**こと (起動時刻 > sync。§7 の (0)) / 新しい marker・progress に `task_execution_id` / 退役の全経路で新しい試行を殺さない (QA t017 の観察を本番で 1 件) / 監査の retire 行の actor が `watchdog` | revert → sync。**両デーモンとも常駐なので restart が要る** (どちらも `lib_retirement` を import する: `DAEMON_RESTART_FILES` lib_daemon_watch.py:240-258。memory `merged-daemon-code-is-inert-until-restart`)。新しい marker の `task_execution_id` は旧コードが読まない (余分な欄) |
 | **E4b** (新 task) | **世代の照合を外す** (§2.4 の 4: #4・#8・#11・#12 の `started_at` の分岐と、旧形式 marker の読み口) | **§7 の (0)〜(2)** + **ユーザー承認** | 退役が ID だけで通る / `caller_check=legacy_generation` が出ない / 保留 (Director への hold) が増えていない | revert → sync (両デーモン restart)。E4a のコードに戻るので新旧の marker を両方読める |
@@ -728,7 +842,7 @@ merge 前に何かを確かめる段でも確かめない段でも、merge か�
 
 | 残るもの | 旧コード (d887acf) の読み方 | 根拠 |
 |---|---|---|
-| card の `current_execution_id` / `execution_status` / `execution_end_code` / `execution_count` / `task_slug` | 読まない。書き直すときは末尾に保持する (並びは変わる) | lib_state_store.py:510-524 `dump_yaml` |
+| card の `current_execution_id` / `execution_status` / `execution_end_code` / `execution_count` / `execution_reserved_at` / `task_slug` | 読まない。書き直すときは末尾に保持する (並びは変わる) | lib_state_store.py:510-524 `dump_yaml` |
 | 同上 (lint) | 未知キーの検査が無いので通る | §1.1 の grep |
 | `queue/missions/<slug>/executions/*.json` | 読まない。archive は dir ごと動かす | `list_tasks` は `tasks/` だけを読む (E1 で確かめる) |
 | identity の `execution_id` 欄 | 読まない (`started_at` だけを比べる) | lib_state_store.py:1097-1104 / lib_retirement.py:649-659 |
@@ -736,16 +850,104 @@ merge 前に何かを確かめる段でも確かめない段でも、merge か�
 | 監査行の `execution_id` / `caller_check` / `refused:` | 読み手がいない | state-store.md §10.2 の S3 行と同じ |
 | 退役 marker の `task_execution_id` | 読まない | lib_retirement の読みは `task_started_at` だけ |
 
-**戻した後にもう一度進める (roll forward) とき**: 旧コードが動いている間に、旧コードは `execution_status` を更新しない。
-旧コードの pull は `started_at` と worker を書き直すが `current_execution_id` / `execution_status` は前の値のまま残るので、
-「in_progress・active に見える古い試行」の card ができうる。新しいコードはこれを §2.2 の表で読むと `started_at` が record の
-`reserved_at` と食い違う。**再び進める前に Director が `store-check` を走らせ**、E1 で足す `reported:execution_fields_stale`
-(task が holding・試行が active・card の `started_at` が空でない card で、`started_at` ≠ `current_execution_id` の record の
-`reserved_at`。record は判断に使わず、報告にだけ使う。§1.6 の 4) が 0 件であることを
-確かめる。0 でなければその card を `update --reset` する (試行の欄は reset が terminal にする)。
-pending / 終端の card に残った active な `execution_status` は §1.2 の定義で active でない (task が holding でない) ので、
-次の reserve は通常どおり上書きし、前の試行の record を `failed` / `end_code=ABANDONED_OUTSIDE_CONTROLLER` で凍結して
-`reported:stale_execution_status` を残す (正本の task status が「誰も持っていない」と言っているので推測ではない)。
+**戻した後にもう一度進める (roll forward) とき** (t024 で書き直し。旧案の `reported:execution_fields_stale` は試行が active の
+card しか見ず、X を completed にした後に旧コードが `update --reset` → pull した card — 別の作業が in_progress なのに
+`X / completed / DONE` が残る — を見逃した。Codex P1):
+
+- 旧コードは execution の 6 欄を書かず消さない (`dump_yaml` が保持)。変えるのは task の status / worker / `started_at` と projection だけ。
+  旧コードが `started_at` を書くのは pull (新しい µs の値) と reset / retire (null) だけ (plan.sh:3540 / :5951 / :6319)。
+- だから roll forward の後、新コードは**どの card も `attempt_view` (§1.2) で card 1 枚から読み分けられる**:
+  旧コードの pull が取り直した card は試行の status に依らず (active でも completed でも) DETACHED (a)、旧コードが手放した active な
+  試行は DETACHED (b)。DETACHED の X を名乗った再送は **`EXECUTION_NOT_CURRENT` (exit 3・何も書かない)** で、§4.4 の冪等の表を
+  引かない。旧コードの持ち主 (名乗りなし) の操作は「試行なし」として task の遷移だけ (§5.2)。
+- **roll forward の前に Director がやることは無い** (正しさは card から構造で決まり、手順に頼らない。原案 §14-3・4)。roll forward の
+  後に `store-check` を走らせ、`reported:execution_detached` (holding の DETACHED (a)) と `execution_active_on_non_holding_status`
+  (DETACHED (b)) を**確認として**見る。DETACHED (a) の card は旧コードの持ち主が終えるのを待つか、Director が `update --reset` で
+  手放させる (reset は DETACHED の active な欄を `ABANDONED_OUTSIDE_CONTROLLER` で閉じ、terminal の欄はそのまま残す)。E4b の前には
+  §7 の (1) で 0 件にする。
+- 欄を退避する案 (roll forward の前に DETACHED の card の欄を `previous_*` に移す) は捨てた: roll forward の前に走るのは旧コード
+  (§9.4 の切り替わりの時点) で、旧コードにはその処理が無い。roll forward の後に新コードで退避しても、`attempt_view` が同じ判定を
+  欄を動かさずに出せるので、正本の書き換えが増えるだけ。
+- pending の card に残った active な欄 (DETACHED (b)) は、次の reserve の手順 0 (§1.4) が Y を書く**前に** card 上で
+  `failed` / `ABANDONED_OUTSIDE_CONTROLLER` にし、record X を合わせ、`reported:stale_execution_status` を残す (正本の task status が
+  「誰も持っていない」と言っているので推測ではない)。
+
+### 9.5 往復 (新 → rollback → roll forward) と各書き込み点の crash (t024 の族の掃除)
+
+t023 と t024 で P1 が続けて「正本に無い値」「回復の範囲が最新 ID だけ」「rollback / roll forward の往復」から出た。往復と crash の
+組み合わせを全部並べ、各行で**正本 (card) から判定・回復できる**ことを示す。表に書けない行は末尾に列挙する (実装 task の card へ)。
+
+**前提 (表の各行が使う 3 つの事実)**:
+
+- **F1** 旧コード (d887acf) は execution の 6 欄と record を書かない・読まない・消さない。変えるのは task の status / worker /
+  `started_at` と identity / 枠。旧コードの `started_at` の書き手は pull (新しい値) と reset / retire (null) だけ (§9.3)。
+- **F2** 新コードの判断は `attempt_view` (card だけ)。record は R-5 が「card の current」だけを card に合わせる。identity は R-1 が card
+  から作り直す (ACTIVE のときだけ ID を入れる)。どちらも名指しの card に、コマンドの本体の前に走る。旧コードの回復 (R-1 / R-2) は
+  R-5 を持たないので、rollback 中は record が遅れたまま残る — record は判断に使わないので結論は変わらない。
+- **F3** current を進めるのは新コードの reserve だけで、進める前に前の current を card 上で terminal にし record を合わせる
+  (§1.4 の手順 0)。だから「current でない record は terminal で card に合っている」が全経路で成り立つ。
+  旧コードは current を進めない (F1) ので、往復を何回挟んでもこの不変条件は崩れない。
+
+**旧コードが card にしうること** (F1 から全部): (i) 触らない (ii) holding のまま `started_at` を変えない操作
+(旧 `verify-result fail` は in_progress・worker・`started_at` を残す・ready-for-verification・verifying) (iii) 非 holding にする
+(旧 done / fail / needs-director / verify-result pass / retire needs-director / `update --status X`) (iv) reset / retire reset
+(pending・`started_at` null) (v) (iv) の後の旧 pull (in_progress・新しい `started_at`)。roll forward 後の `attempt_view` は、
+新コードが残した欄 (下の表の「card」列) と (i)〜(v) で次のとおり機械的に決まる:
+
+| 欄 \ 旧コードの操作 | (i) | (ii) | (iii) | (iv) | (v) |
+|---|---|---|---|---|---|
+| ACTIVE の X | ACTIVE (同じ持ち主) | ACTIVE (旧来の「同じ試行のやり直し」。§9.4 の E3 行) | DETACHED (b) | DETACHED (b) | DETACHED (a) |
+| TERMINAL の X | TERMINAL | — (holding でない task には旧コードも (ii) を打てない。Director が開いた card は TERMINAL のまま) | TERMINAL | TERMINAL (`started_at` null。新コードの reset の後と同じ) | **DETACHED (a)** (Codex P1 の形) |
+| NONE | NONE | NONE | NONE | NONE | NONE |
+
+**操作 × 書き込み点**:
+
+| # | 操作: 落ちた点 | card (正本) に残るもの | 新コードのまま次のロック | rollback を挟んだ後 → roll forward 後の判定 |
+|---|---|---|---|---|
+| P0a | pull 手順 0: card (X `ABANDONED_OUTSIDE_CONTROLLER`) の後・record X の前 | pending・X terminal | R-5 が record X。次の pull が Y を発行 (X は terminal なので手順 0 なし) | (i)/(iv): TERMINAL(X)・R-5 が record X / (v): DETACHED (a)・R-5 が record X (X はまだ current)。X の再送は NOT_CURRENT |
+| P0b | pull 手順 0: record X の後・card (Y) の前 | 同上 (record も一致) | 同上 | 同上 |
+| P1 | reserve: card (Y reserved) の後・record Y の前 | in_progress・A・Y reserved・`execution_reserved_at` = `started_at` | R-5 が record Y (agent = A)・R-1 が identity (Y)・A の再 pull が再開 (§6) | (i): ACTIVE(Y)・旧 R-1 が作った ID なしの identity は §2.2 末尾で読み、次の R-1 が ID を入れる / (iv): DETACHED (b) → 次の reserve の手順 0 が Y を閉じる。record Y はそこで作られ、worker が null なので agent = null + `reported:execution_record_owner_unknown` (**履歴の欠け。表外 1**) / (v): DETACHED (a) |
+| P2 | reserve: record Y の後・identity / 枠の前 | 同上 | R-1 / R-2 (01a のまま) | P1 と同じ (record Y は agent = A で既にある) |
+| P3 | ロック外 (準備中) で死ぬ | 同上 | 準備ロックは kernel が外す。A の再 pull が再開 (§6.1) | (i): ACTIVE(Y) → 再開 (旧コードの間の A の再 pull は旧 `--task` で exit 1・何も書かない) / (iv)(v): P1 と同じ |
+| P4 | start: card (running) の後・record の前 | in_progress・Y running | R-5 が status。再開しない (running)・Director の reset | (i): ACTIVE(Y)。持ち主は JSON を受け取っていない (同じプロセスの数行) ので Director の reset / (iv): DETACHED (b) → 手順 0 / (v): DETACHED (a) |
+| P5 | start: record の後・JSON の前 | 同上 | 同上 | 同上 |
+| P6 | G1: card (needs_director・Y `WORKSPACE_CREATE_FAILED`) の後・record / 枠撤去の前 | needs_director・Y terminal | R-5・R-2 | 旧 R-2 が枠を撤去・record は roll forward 後に名指しされたとき R-5 / TERMINAL(Y)。(iv)(v) は TERMINAL / DETACHED (a) |
+| D1 | done: card (done・Y `DONE`) の後・record の前 | done・Y terminal・`started_at` は Y の値 | R-5・R-2。Y の done の再送は冪等 (exit 0) | (i)(iii): TERMINAL・再送は冪等 / (iv) (旧 Director の `update --status pending --reset`): TERMINAL・再送は冪等 (新コードの reset の後と同じ答え。§4.4) / **(v): DETACHED (a)・再送は NOT_CURRENT** (Codex P1 の行) |
+| D2 | done: record の後・枠撤去の前 | 同上 | R-2 | 同上 |
+| FL1 | fail / needs-director: card (Y `WORKER_FAILED` / `NEEDS_DIRECTOR`) の後・record の前 | failed / needs_director・Y terminal | R-5・R-2。同じ操作の再送は冪等 | D1 と同じ形 (`--reset` で pending → (v) で DETACHED (a)) |
+| V1 | verify-result fail: card (pending・worker / `started_at` null・Y `VERIFICATION_REJECTED`) の後・record の前 | pending・Y terminal | R-5・R-2。verifier の再送は冪等。次の pull が Z (手順 0 なし) | (i): TERMINAL・再送は冪等 / (v): DETACHED (a)・verifier の再送は NOT_CURRENT、旧 pull の持ち主は「試行なし」 |
+| U1 | update --reset: card (pending・null・Y `RESET_BY_DIRECTOR` / `ABANDONED_OUTSIDE_CONTROLLER`) の後・record の前 | pending・Y terminal | R-5・R-2 | V1 と同じ形 |
+| T1 | retire: card (pending / needs_director・null・Y `RETIRED`) の後・record の前 (watchdog が progress を書く前) | 同上 | R-5・R-2。watchdog の `--execution Y` の打ち直しは冪等 (§4.4 の RETIRED 行) | (i): 旧 watchdog の `--started-at` の打ち直しは card の `started_at` (null) と合わず今と同じ拒否 → 今と同じ `_settle_terminated` の扱い (§9.4 の E4a 行。旧コードの挙動そのもの) / roll forward 後: TERMINAL・新 watchdog の打ち直しは冪等 |
+| A1 | crash なし: 新コードの ACTIVE(Y) のまま rollback し、持ち主 A が旧 done / fail を打つ | done / failed・Y running のまま (旧コードは欄を触らない) | — | (iii): DETACHED (b)。Y の再送は NOT_CURRENT。task は正しく done / failed。**record Y と欄は running のまま残る (表外 2)** |
+| A2 | crash なし: 新コードの ACTIVE(Y) のまま rollback し、旧 `verify-result fail` | in_progress・A・Y running | — | (ii): ACTIVE(Y)。A の新 done (Y) が通る (旧来の同じ試行のやり直し) |
+| R1 | 往復を 2 回以上 | F1・F3 により欄は最後の新コードの書き込みのまま、`started_at` は最後の書き手の値 | — | 上の (i)〜(v) の表を最後の旧コードの操作で引くだけ (`attempt_view` は保存しない値なので、往復の回数に依らない) |
+| R2 | TERMINAL の X に旧コードが (iv) → (v) → (iv) (取り直した B をさらに reset)、または roll forward 後に新コードが DETACHED (a) の card を `update --reset` | pending・`started_at` null・X terminal | — | TERMINAL(X)。X の再送は §4.4 の表 (DONE なら冪等) で、**今その card を持つ者はいない**ので「別の作業が in_progress なのに成功」(Codex P1 の害) にはならない。答えは新コードの「done の後に reset」と同じ (§4.4「reset の後に status を変えても答えは変わらない」)。B がいたことは card から消えている (表外 6) |
+
+**表に書けない行 (実装 task の card に送る項目。Director が転記する)**:
+
+1. **(E2 / E1) rollback 中の P1 + 旧 reset**: record Y の `agent` が null で作られる (旧コードは R-5 を持たず、record を作る前に
+   worker が null になる)。状態の判断には影響しない (record は判断に使わない) が履歴が欠ける。`reported:execution_record_owner_unknown`
+   で報告するだけにするか、card に `execution_agent` (予約した agent の写し。`execution_reserved_at` と同じ扱い) を足すかを E1 で決める。
+2. **(E1 / E4a) A1: task が終端 (done / failed / verified / skipped) のまま DETACHED (b) の欄が残る**。手順 0 は reserve と reset でしか
+   走らず、終端の task は再 pull されないので、record と欄は running のまま、`execution_active_on_non_holding_status` の報告が消えない。
+   状態の判断には影響しない (照合は NOT_CURRENT、task の status は正しい)。Director の閉じる手段 (例: `update --close-execution`) を
+   作るか、終端の task では報告しない (報告の条件を holding 以外の非終端だけにする) かを決める。
+3. **(E1) 名指しされない card の record**: R-5 は名指しの card にしか走らないので、roll forward の後に一度も触られない card
+   (旧コードが done にした等) の record は遅れたまま。store-check の `reported:execution_record_stale` (current の record が card と
+   食い違う) で数えるだけにし、直すのは次に名指ししたコマンド。履歴だけの欠けで、F2 により判断は変わらない。
+4. **(E4a) 旧 watchdog の打ち直し (T1 の (i))**: 旧コードの挙動のまま (今の rc の扱い) で、新しい答えは作らない。E4a の QA (t017) で
+   「新 retire の後に旧 watchdog が `--started-at` で打ち直す」を 1 件通し、今と同じ拒否で後始末が壊れないことを確かめる。
+5. **(E2) 準備ロックの導入前の版との並行**: 旧コードの pull と新コードの再開が同じ task で同時に走る形 (rollback / roll forward の
+   瞬間) は、旧コードは準備ロックを取らないので §6.1 の直列化が効かない。旧コードの pull は pending からしか予約しない (in_progress は
+   `--task` で exit 1) ので、新コードの reserved の試行の worktree に旧 pull が触れる経路は無いはずだが、E2 の QA で「reserved の card に
+   旧コードの `pull --task` を打つ → exit 1・worktree に触れない」を 1 件確かめる。
+6. **(判断の記録。card には送らない) R2: 間に B がいた事実は card から消える**。旧コードの reset が `started_at` を null にした時点で
+   (F1)、旧コードが B に取り直させた痕跡は正本に残らない。新コードだけの経路 (reset → 再 pull → reset) なら current が Y に進むので
+   X の再送は NOT_CURRENT になり、答えが割れる。割れても害が無いことで受け入れる: どちらも card を持つ者がいない (pending) ので
+   書き込みは起きず、X の再送への「成功」は X についての事実 (X は DONE で終わった) で、今の task の完了を意味しない (task は pending と
+   出ている)。痕跡を残すには旧コードの書き込みが要り、旧コードは変えられない。新コードの `update --reset` が DETACHED (a) を消す
+   ときに印を残す案 (`execution_reserved_at` を空にして「封じた」と読む) は、旧コードの (iv) で同じ印が残らないので、答えを
+   揃えられず、欄の組の整合 (片方だけの欄は `STATE_INVALID`) に例外を足すだけなので採らない。
 
 ---
 
@@ -823,8 +1025,8 @@ pending / 終端の card に残った active な `execution_status` は §1.2 �
 
 | 段 | 対象 (§2.1 の # と行) | 確かめること |
 |---|---|---|
-| **E1** | lib_state_store: #3 (`publish_assignment` に `execution_id`)・#4 (`classify_assignment`)・#5 (R-1)・R-5 の新設・#14 (監査の `execution_id` / `caller_check` / `refused:`)・`_SAFE_RESULT_RE` (:117)・`TASK_META_KEY_ORDER` (:498-504)・`diagnose` (store-check: `legacy_execution` / `execution_fields_stale` / `execution_active_on_non_holding_status` / `execution_record_unreadable`)。lib_task_status: `ACCEPTS_FROM` の狭め (**データだけ**。E1 では plan.sh がまだ読むので、狭めた表は別名で置き、E3 で差し替える)。新 `lib_task_controller.py`。lint_plan: 片方だけの欄・`execution_status` と `execution_end_code` の組が §1.2 の整合に外れるものを FAIL。R-5 は追従する欄 (status / end_code) だけを合わせ、不変の欄を上書きしない (§1.3・§1.4) | 既定値で 01a S3 の互換 golden がバイト一致 / `executions/` を読む・数えるコードが他に無い (`grep -rn "tasks/" scripts/*.py scripts/plan.sh` で列挙を洗う) / 構造ガード (queue 書き込みは lib を通る) に record の書き込みが入る / 監査の門のテストに `_safe_execution_id` |
-| **E2** | plan.sh: #2 (:3538-3549)・#7 (G1 の CAS :3204-3241・:3281・:3674)・`.crewvia-env` (:3653-3663)・JSON (:3552-3561・:3676-3679)・`--task` の in_progress 分岐 (:3360-3369)・候補選びの前の再開 (:3316-3331 の回復の後)・`_slugify` (:3607-3616) と `task_slug` の固定。hooks/pre-tool-use.sh:205-207 のコメント。agents/worker.md:297-307 (`CREWVIA_EXECUTION_ID` の export)。kai-review.sh:226-237 (JSON を捨てない準備) | 既存の pull の互換 (COMPAT-01): skill / priority / blocked_by / target_dir / Taskvia disabled / git offline (W6) / 監査行 / 並行 pull で予約 1 件 / pull を reserve〜start の各点で殺して再 pull |
+| **E1** | lib_state_store: #3 (`publish_assignment` に `execution_id`)・#4 (`classify_assignment`)・#5 (R-1)・R-5 の新設・#14 (監査の `execution_id` / `caller_check` / `refused:`)・`_SAFE_RESULT_RE` (:117)・`TASK_META_KEY_ORDER` (:498-504)・`diagnose` (store-check: `legacy_execution` / `execution_detached` / `execution_active_on_non_holding_status` / `execution_record_unreadable` / `execution_record_stale` / `execution_record_superseded_active`)。`lib_task_controller.attempt_view` (§1.2。照合・冪等・R-1・reserve の手順 0・reset・store-check が呼ぶ唯一の読み方) と終了コード `ABANDONED_OUTSIDE_CONTROLLER`・card の `execution_reserved_at`。lib_task_status: `ACCEPTS_FROM` の狭め (**データだけ**。E1 では plan.sh がまだ読むので、狭めた表は別名で置き、E3 で差し替える)。新 `lib_task_controller.py`。lint_plan: 片方だけの欄・`execution_status` と `execution_end_code` の組が §1.2 の整合に外れるものを FAIL。R-5 は追従する欄 (status / end_code) だけを合わせ、不変の欄を上書きしない (§1.3・§1.4) | 既定値で 01a S3 の互換 golden がバイト一致 / `executions/` を読む・数えるコードが他に無い (`grep -rn "tasks/" scripts/*.py scripts/plan.sh` で列挙を洗う) / 構造ガード (queue 書き込みは lib を通る) に record の書き込みが入る / 監査の門のテストに `_safe_execution_id` |
+| **E2** | plan.sh: #2 (:3538-3549)・#7 (G1 の CAS :3204-3241・:3281・:3674)・`.crewvia-env` (:3653-3663)・JSON (:3552-3561・:3676-3679)・`--task` の in_progress 分岐 (:3360-3369)・候補選びの前の再開 (:3316-3331 の回復の後)・`_slugify` (:3607-3616) と `task_slug` の固定・reserve の手順 0 (§1.4)・準備ロック (§6.1。lib_state_store.py:1609-1616 のロック順序の docstring に追記)。hooks/pre-tool-use.sh:205-207 のコメント。agents/worker.md:297-307 (`CREWVIA_EXECUTION_ID` の export)。kai-review.sh:226-237 (JSON を捨てない準備) | 既存の pull の互換 (COMPAT-01): skill / priority / blocked_by / target_dir / Taskvia disabled / git offline (W6) / 監査行 / 並行 pull で予約 1 件 / pull を reserve〜start の各点で殺して再 pull |
 | **E3** | plan.sh: cmd_done (:4331-4340・:4489-4497)・cmd_fail (:4601-4602・:4649-4657)・transition_to_needs_director (:3979-4008)・cmd_needs_director (:4047-4051)・cmd_ready_for_verification (:4934-4938)・cmd_verifying (:4988-4991)・cmd_verify_result (:5076-5108)・#16 `_env_mission_for_task` (:3014-3033)・`audit_actor` (:1876-1879)・`accepts(` / `refuse_transition(` の 17 件。kai-review.sh (:165・:712・:234)。verifier-dispatcher.sh (:258-260・:403-408)。文書: worker.md (done / fail / needs-director の手順)・director.md:205-207・verifier.md:59-67・skills/crewvia-qa/SKILL.md:179-238・skills/crewvia-plan-review/SKILL.md・`plan.sh status` の表示 | §4.3 の全行 (狭めた拒否と、狭めない行が今どおり通る)・§5.2 の全行・§4.4 の冪等と conflict・Director の手順 (§5.3) が全部通る・kai-review の 17 か所の needs-director |
 | **E4** | plan.sh: cmd_update --reset (:5945-5953・:6053-6064)・cmd_retire (:6182-6338)・cmd_reap_orphan_assignment (:6341-6439)。lib_retirement: #9〜#13 (:550-592・:605-660・:766-828・:1025-1066・:1494-1610・:1917-1980・:2037-2071)。watchdog.py の `DAEMON_RESTART_FILES` / `files_digest` (state-store.md §10.3 の 10)。dispatcher.sh:777-786 (`AGENT_NAME`)。director.md:1138-1143・:1485-1497・:1511。ここまでが **E4a** (producer の切り替えを含む。世代の照合は残す)。**E4b**: 世代の照合を外す: #4・#8・#11・#12 と旧形式 marker の読み口 | 退役の全経路で新しい試行を殺さない (同名の後任が再 pull した後の退役・旧 marker・reserved の試行の退役)・§7 の 0 件の確認手順・`assignment_execution_verdict` の 4 つの答え (SAME / OTHER / ABSENT / UNREADABLE) が ID でも同じ向きに倒れる |
 
@@ -836,10 +1038,16 @@ pending / 終端の card に残った active な `execution_status` は §1.2 �
   次のロック取得で R-5 が §1.4 の表どおり / 遷移表の全行 (原案 §10.5 の 14 項目) / 同じ terminal の再送が冪等・違う terminal が conflict /
   ID 生成器の注入 / 呼び出し元ゼロ (`grep`) / terminal の card の後・record の前で落とし、同じ ID の再送の答えが §4.4 の表どおり
   (`WORKER_FAILED` と `RESET_BY_DIRECTOR` で違う。reset の後に `update --status X` しても同じ) / 正しく保存済みの record がある card を
-  reset・`update --worker B` した後の回復で、record の agent / reserved_at が変わらない / 欠陥版 (R-5 を消す・照合を `started_at` だけにする・R-5 に agent の比較を戻す・再送判定を record から読む) で赤
+  reset・`update --worker B` した後の回復で、record の agent / reserved_at が変わらない / 欠陥版 (R-5 を消す・照合を `started_at` だけにする・R-5 に agent の比較を戻す・再送判定を record から読む) で赤 /
+  **`attempt_view` の (i)〜(v) × 欄の表 (§9.5) の全セル** を、旧コード (d887acf) の plan.sh を実際に打って作った card で確かめる
+  (旧コードの操作を手で模した fixture にしない) / X completed → 旧 `update --reset` → 旧 pull → 新コードの X の done の再送が
+  `EXECUTION_NOT_CURRENT` (Codex P1。欠陥版「冪等を DETACHED でも引く」で赤) / 手順 0 の card の後・record X の後・card (Y) の後で
+  crash 注入し、どの点でも store-check に `execution_record_superseded_active` が出ない (Codex P2-2。欠陥版「Y を書いてから X を凍結」で赤)
 - **E2 (t009)**: COMPAT-01 / 原案 §10.6 の全項目を固定 fixture で前後比較 / 並行 pull / pull を reserve の後・worktree の後・env の後・
   start の後で殺し、同じ Worker の再 pull が同じ ID を返す (reserved) / 返さない (running) / 進行中の legacy card の done・retire が今どおり /
-  Kai の pull (JSON を捨てる今の kai-review でも壊れない) / G1 の W4 で `failed WORKSPACE_CREATE_FAILED` + needs_director
+  Kai の pull (JSON を捨てる今の kai-review でも壊れない) / G1 の W4 で `failed WORKSPACE_CREATE_FAILED` + needs_director /
+  **§6.1 の E2 のテスト項目 1〜6** (同じ予約の並行 pull) / §9.5 の P0a〜P6 の各点で crash 注入 → 新コードのまま・旧コードを挟んで
+  (隔離 queue で d887acf の plan.sh を打つ) の両方で表どおり / §9.5 の表外 5 (旧 `pull --task` が reserved の card で exit 1)
 - **E3 (t013)**: §5.2 の全行を全コマンドで / §4.3 の狭めた行と残した行 / Director の手順 (§5.3) / verify-result fail → pending → 再 pull で attempt 2 /
   旧 worker.md の Worker (名乗りなし) が `unverified` で通る / 監査の `refused:` 行が `die` の後も残る / 欠陥版 (照合を外す) で赤
 - **E4a / E4b (t017 と E4b の QA)**: E4a は新 request + 旧 progress / 旧 request + 新 progress の組 (片方のデーモンだけ restart された間。§9.4) で

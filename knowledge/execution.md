@@ -1274,10 +1274,10 @@ PR を revert し、`scripts/sync-main-checkout.sh` で主 checkout を ff す�
 
 ## 16. E3 の実績 (t012): 報告の 6 コマンドが Controller を通り、呼び出し元を Execution ID で照合する
 
-**これは cutover** (本番の挙動が変わる。merge 前にユーザー承認 = t015)。承認の対象として明示するもの: (1) §4.3 の**狭め** (done が pending / blocked / 検証待ちから通らない等)・
+**これは cutover** (本番の挙動が変わる。PR #273。merge 前にユーザー承認 = t015)。承認の対象として明示するもの: (1) §4.3 の**狭め** (done が pending / blocked / 検証待ちから通らない等)・
 (2) **`verify-result fail` が新しい試行になる** (task は pending・worker を手放し、次の pull が attempt + 1)・(3) 名乗った ID が違えば **exit 3** で拒否・
 (4) 遷移・照合の拒否が**監査ログに `refused:` の行**を残す・(5) done / fail / needs-director が **card の worker の枠**を撤去する (`AGENT_NAME` が無くても)。
-前提の互換 (`--execution` を受け付けて読み捨てる) は別 PR **#272** (E3 より先に merge する。§16.4)。
+前提の互換 (`--execution` を受け付けて読み捨てる) は別 PR **#272** (E3 より先に merge する。§16.4。#272 の CI は最初 `test_plan_result_file` の fail の option の表で赤だった — option を足す PR は、その option 集合を固定する既存テストを全 pytest で洗うこと)。
 
 ### 16.1 何が変わったか (plan.sh の 6 コマンド + `update --close-execution`)
 
@@ -1418,7 +1418,7 @@ director.md の手順 (`update --status in_progress --reset` → done は今の�
   拒否の行を残さない / actor を置き換える / verifier-dispatcher が `--execution` を渡さない / `--close-execution` が live な試行を閉じる)。**全て「狙ったテスト名の assert の失敗」で RED** (collection / import の失敗は数えない)。
 - 既存テストの更新 (狭め・枠の撤去・拒否の行の違いだけ): `test_task_status_single_definition` (設計の写し)・`test_needs_director_releases_assignment` / `test_projection_recovery_on_lock` / `test_plan_sh_state_store_cutover` (孤児の枠を手で作る・
   拒否の行・E3 の終了コード)・`test_s5_writers_lock_and_atomic` (verifying の拒否の行)・`test_plan_result_file` (verify-result は検証待ちから)・`test_plan_assignment_transaction` (`_retire_caller_slot`)・
-  `test_fail_evidence` (done / fail の書き手の検出が Controller 呼び出しも数える)・`test_task_controller_time_args_and_closed_findings` (引数の表)・`test_task_controller_has_no_callers_yet` (plan.sh が呼んでよい操作)・`test_plan_sh_compat_s3` (表にした違いだけ)。
+  `tests/plan-assignment-identity.bats` (不正な AGENT_NAME の done は card の worker の枠を外す。bats)・`test_fail_evidence` (done / fail の書き手の検出が Controller 呼び出しも数える)・`test_task_controller_time_args_and_closed_findings` (引数の表)・`test_task_controller_has_no_callers_yet` (plan.sh が呼んでよい操作)・`test_plan_sh_compat_s3` (表にした違いだけ)。
 
 ### 16.7 E4 以降に送るもの
 

@@ -1426,3 +1426,24 @@ director.md の手順 (`update --status in_progress --reset` → done は今の�
 - **E5 (提案)**: 名乗りなしの done / fail / needs-director / verify-result を拒否する (§9.2 の 1)。条件は監査ログで `caller_check=unverified` が crewvia 本体の task で 0 件になること。
 - **`--mission ""` と他の `opts.get(...)` の真偽 (§16.5 の F1)**: 範囲外の残り。backlog。
 - 拒否コード `TASK_ALREADY_RESERVED` の名前 (E2 の申し送り): pull が legacy / running の card を `--task` で再 pull したとき stderr に出る。E3 では**変えなかった** (E2 の拒否文言・テストを動かさない)。名前を `TASK_NOT_AVAILABLE` 等に変えるかは E4。
+
+### 16.8 Codex 2 巡目 (t032 / PR #273): 再送の確認は、値を計算して経路を選ぶより前に
+
+- **P2**: `cmd_verify_result` は冪等の確認より前に `rework_count + 1` を計算し、その値で `fail_execution` / `mark_task` を選んでいた。上限の 1 つ手前 (max 3・count 1) の fail は count 2 で試行を閉じ、
+  **再送は 3 を計算して `mark_task` を選び、終わった試行を exit 3 で拒否**した (冪等の成功にならない)。上限ちょうどの fail は `needs_human_review` にしたあと、**再送のたびに count が増え検証の記録 (`**Verdict:**` の節) が重複**した。
+- **修正**: count を増やす前・経路を選ぶ前に「この判定がもう記録されているか」を確かめる。fail は `fail_execution(VERIFICATION_REJECTED, dry_run=True)` が `IDEMPOTENT` (試行が既に `VERIFICATION_REJECTED`)。needs_human_review の verdict / 上限に達した fail は、
+  task が既に `needs_human_review` で (nhr の verdict なら常に・fail なら count が既に上限以上のとき) 同じ判定の再送とみなす。名乗り (照合) は dry_run が先に行うので、違う試行の再送は今までどおり exit 3。
+  nhr の verdict で人間の判断待ちになった後 (count は増えていない) の fail は**新しい判定**で、1 度だけ記録され、その再送が冪等になる。
+- **族ごとの掃除 (「冪等の確認より前に状態から値を計算して経路を選ぶ」箇所)**: E3 で Controller に移した操作を 1 つずつ見た。
+
+| 操作 | 値を計算する箇所 | 再送の経路 | 結果 |
+|---|---|---|---|
+| done | `completed_at` / `pr_number` (D1〜D2) | **dry_run が先** (E3 の初版から) | 冪等 (exit 0)・何も書かない |
+| fail | `completed_at` / 証拠 | dry_run が先 (初版から) | 冪等 |
+| needs-director | reason の整形のみ (状態に依存しない) | Controller が `IDEMPOTENT` を返す | 冪等 |
+| ready-for-verification / verifying | 無い | status が既に進んでいるので `INVALID_TRANSITION` (exit 2) | 何も書かない (拒否の行だけ) |
+| verify-result pass | `completed_at` (状態に依存しない) | Controller が `IDEMPOTENT` | 冪等 |
+| **verify-result fail / needs_human_review** | **`rework_count + 1` で経路を選ぶ** | **直した (上記)** | 冪等 |
+
+  境界のある値 (`rework_count`・`attempt` / `execution_count`) は、境界の手前・ちょうど・超えた後の再送を `tests/test_execution_e3_resend_idempotent.py` (13 件) が固定する (card・record・枠・Verification の節・監査の `ok` 行・count が増えない)。
+  赤の実証: 修正前の plan.sh で同テストが 4 件 FAILED (`assert 3 == 0` 等)・修正後は緑。

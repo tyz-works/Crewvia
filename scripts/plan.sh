@@ -5400,10 +5400,30 @@ def cmd_verify_result(args):
         #                        次の pull が**新しい試行** (attempt + 1) を予約する (今までは同じ Worker が in_progress のまま)
         #   fail (>= max) / needs_human_review → 試行は running のまま・task needs_human_review
         # 同じ ID の同じ verdict の再送 (pass / fail) は成功 (exit 0・何も書かない)。
+        # ── 再送の確認は、rework_count を増やす・経路を選ぶより**前**に (t032 / Codex 2 巡目 P2) ──
+        # 値を先に状態から計算して経路を選ぶと、同じ verdict の再送が (a) 上限の 1 つ手前: 2 回目に count が上限へ進み
+        # 終わった試行を mark_task が拒否する (b) 上限: count と検証の記録が重複する。判定がもう記録されているかを先に確かめる:
+        #   - fail: この試行が VERIFICATION_REJECTED で終わっている (Controller の dry_run が IDEMPOTENT)
+        #   - needs_human_review の verdict / 上限に達した fail: task が既に needs_human_review で、
+        #     (nhr の verdict なら常に・fail なら rework_count が既に上限以上のとき) 同じ判定の再送とみなす
+        # どちらも照合 (名乗り) は dry_run が先に行う (違う試行の再送は拒否)。何も書かず exit 0。
+        max_rework = meta.get('max_rework') or 3
+        try:
+            probe = _CONTROLLER.fail_execution(_txn(), slug, task_id, caller, _EXEC.VERIFICATION_REJECTED,
+                                               to_status='pending', dry_run=True) if verdict == 'fail' else None
+            if probe is None and verdict != 'pass' and meta.get('status') == 'needs_human_review':
+                probe = _CONTROLLER.complete_execution(_txn(), slug, task_id, caller, to_status='verified', dry_run=True)
+        except _EXEC.ControllerError as e:
+            _controller_die('verify-result', e)
+        already_escalated = (meta.get('status') == 'needs_human_review' and probe is not None
+                             and (verdict == 'needs_human_review'
+                                  or (verdict == 'fail' and (meta.get('rework_count') or 0) >= max_rework)))
+        if probe == _CONTROLLER.IDEMPOTENT or already_escalated:
+            print(f"verify-result: {slug}/{task_id} (verdict={verdict}) — already recorded (idempotent)")
+            return
         rework_updates = {}
         if verdict == 'fail':
             rework = (meta.get('rework_count') or 0) + 1
-            max_rework = meta.get('max_rework') or 3
             rework_updates = {'rework_count': rework}
         try:
             if verdict == 'pass':

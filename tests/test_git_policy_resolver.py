@@ -951,3 +951,97 @@ def test_the_resolver_runs_no_subprocess_and_imports_no_git_tooling():
     imported |= {n.module.split(".")[0] for n in ast.walk(tree) if isinstance(n, ast.ImportFrom) and n.module}
     assert not (imported & {"subprocess", "shutil", "pty", "multiprocessing"}), imported
     assert "os.system" not in src and "os.popen" not in src and "os.exec" not in src
+
+
+# ---------------------------------------------------------------------------
+# G2 fix 3 巡目 (t026): branch pattern の境界・parse_yaml が飛ばした行
+# ---------------------------------------------------------------------------
+
+#: 飛ばされる形を列挙して塞ぐのをやめ、「parse_yaml が結果に反映しなかった行が 1 行でもあれば停止」にした。
+#: 列挙に無い形 (flow 形式・git を含まない迷子の行) もここで止まる。
+FLOW_AND_UNLISTED_SKIPPED_LINES = [
+    "title: Demo\n  {git: {mode: integration}}\n",
+    "title: Demo\n  {\"git\": {mode: integration}}\n",
+    "title: Demo\n  [git, mode]\n",
+    "title: Demo\n  just a stray line\n",
+    "title: Demo\n    deeply: nested\n",
+    "title: Demo\nreview:\n  a: 1\n    b: 2\n",
+    "git:\n  mode: direct\n\n  base_branch: develop\n",
+]
+
+
+@pytest.mark.parametrize("text", FLOW_AND_UNLISTED_SKIPPED_LINES)
+def test_a_line_parse_yaml_skipped_is_never_concluded_as_no_git(text):
+    with pytest.raises(gp.GitPolicyError) as ei:
+        gp.policy_from_text(text)
+    assert ei.value.code == "malformed", (text, ei.value)
+    assert ei.value.field == "git"
+    assert "integration" not in str(ei.value) and "stray line" not in str(ei.value)  # 行の中身は出さない
+
+
+def test_a_mission_yaml_with_nothing_skipped_is_still_the_default():
+    """誤って拒否しない側: 今ある mission.yaml の形 (review: の mapping・コメント・空行) は既定値のまま。"""
+    text = ("title: \"x\"\nslug: 20261001-demo\n# comment\n\nnext_task_id: 3\nreview:\n  last_verdict: approve\n"
+            "  cycle_count: 1\n  reviewer: null\ntags:\n  - a\n  - b\n")
+    assert gp.policy_from_text(text) == gp.default_policy()
+
+
+# ---- branch pattern の境界 (別の task が同じ branch にならない) ----
+
+COLLIDING_PATTERNS = [
+    "task/{mission_slug}/{task_id}{task_slug}",   # t100 + 0fix と t1000 + fix
+    "task/{mission_slug}/{task_slug}{task_id}",
+    "task/{mission_slug}{task_id}",
+    "task/{mission_slug}-{task_id}",              # mission 自身が - を含む
+    "task/{mission_slug}/{task_id}{task_slug}-x",
+    "task/{task_id}-{mission_slug}{task_slug}",
+    "task/{mission_slug}/{task_id}-{task_slug}-extra",   # slug の後ろの - は境界にならない
+]
+
+
+@pytest.mark.parametrize("pattern", COLLIDING_PATTERNS)
+def test_a_branch_pattern_without_a_separator_is_refused(pattern):
+    with pytest.raises(gp.GitPolicyError) as ei:
+        _policy(task_branch_pattern=json.dumps(pattern))
+    assert ei.value.code == "invalid_value"
+    assert ei.value.field == "task_branch_pattern"
+
+
+@pytest.mark.parametrize("pattern", [
+    "task/{mission_slug}/{task_id}-{task_slug}",     # 既定値
+    "task/{mission_slug}/{task_id}",
+    "work/{task_id}/{mission_slug}",
+    "{mission_slug}/{task_id}-{task_slug}",
+    "t/{mission_slug}/{task_slug}/{task_id}",
+    "x-{mission_slug}/{task_id}-{task_slug}",
+])
+def test_a_branch_pattern_with_separators_is_accepted(pattern):
+    assert _policy(task_branch_pattern=json.dumps(pattern)).task_branch_pattern == pattern
+
+
+def test_the_colliding_pair_from_the_review_is_refused_at_validation():
+    """指摘の組: mission demo の t100 (slug 0fix) と t1000 (slug fix) が同じ branch になる pattern は設定の段階で拒否される。"""
+    pattern = "task/{mission_slug}/{task_id}{task_slug}"
+    a = pattern.replace("{mission_slug}", "demo").replace("{task_id}", "t100").replace("{task_slug}", "0fix")
+    b = pattern.replace("{mission_slug}", "demo").replace("{task_id}", "t1000").replace("{task_slug}", "fix")
+    assert a == b  # 前提: 実際に衝突する
+    with pytest.raises(gp.GitPolicyError):
+        _policy(task_branch_pattern=json.dumps(pattern))
+
+
+def test_every_accepted_pattern_maps_distinct_tasks_to_distinct_branches_and_paths(tmp_path):
+    """受理される pattern では、(mission, task_id, slug) が違えば branch も worktree path も違う (総当たり)。"""
+    missions = ["demo", "demo-t1", "20261001-a", "a-b", "a"]
+    ids = ["t1", "t10", "t100", "t1000", "t11"]
+    slugs = ["fix", "0fix", "1", "x-1", "t1-fix", "10"]
+    patterns = ["task/{mission_slug}/{task_id}-{task_slug}", "work/{task_id}/{mission_slug}/{task_slug}",
+                "{mission_slug}/{task_slug}/{task_id}"]
+    for pattern in patterns:
+        pol = _policy(task_branch_pattern=json.dumps(pattern))
+        branches, paths = {}, {}
+        for m, i, s in itertools.product(missions, ids, slugs):
+            key = (m, i, s)
+            b = gp.task_branch(pol, mission_slug=m, task_id=i, task_slug=s)
+            w = gp.task_worktree_path(pol, repo_root=str(tmp_path), mission_slug=m, task_id=i, task_slug=s)
+            assert branches.setdefault(b, key) == key, (pattern, b, key, branches[b])
+            assert paths.setdefault(w, key) == key, (pattern, w, key, paths[w])

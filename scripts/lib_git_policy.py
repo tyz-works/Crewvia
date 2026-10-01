@@ -197,8 +197,30 @@ def _check_pattern(value, field: str) -> str:
         raise GitPolicyError("invalid_value", field, f"対応しない波括弧がある: {value!r}")
     if not _PATTERN_LITERAL_RE.fullmatch(literal):
         raise GitPolicyError("invalid_value", field, f"置換子以外の部分に使えない文字がある: {value!r}")
+    _check_pattern_boundaries(value, field)
     _check_branch(_render(value, _SAMPLE_VALUES), field)
     return value
+
+
+def _check_pattern_boundaries(value: str, field: str) -> None:
+    """置換子の直後に区切りを必須にする (別の task が同じ branch になる pattern を通さない)。
+
+    区切りが無いと mission / task の同一性が一意に決まらない: `{mission_slug}/{task_id}{task_slug}` では
+    mission `demo` の task `t100` (slug `0fix`) と `t1000` (slug `fix`) が同じ branch `demo/t1000fix` になる。
+    規則: 置換子の次の文字は、末尾か、`/` (成分は `/` を含まない = 境界が動かない)。ただし `{task_id}` だけは
+    `-` でもよい (`t` + 数字で `-` を含まないので、`-` で必ず終わる)。`{mission_slug}-` や `{task_slug}-` は
+    slug 自身が `-` を含むので境界にならない。
+    """
+    for m in _PLACEHOLDER_RE.finditer(value):
+        name = m.group(1)
+        nxt = value[m.end():m.end() + 1]
+        if nxt == "":
+            continue
+        allowed = ("/", "-") if name == "task_id" else ("/",)
+        if nxt not in allowed:
+            raise GitPolicyError("invalid_value", field,
+                                 f"置換子 {{{name}}} の直後は {' か '.join(allowed)} (区切り) が要る。"
+                                 f"別の task が同じ branch になる: {value!r}")
 
 
 def _render(pattern: str, values: dict) -> str:
@@ -254,44 +276,50 @@ def default_policy() -> GitPolicy:
     return GitPolicy(source="default", **_DEFAULTS)
 
 
-def _git_block_line_count(text: str):
-    """トップレベルの `git:` 行の数と、その下の字下げ行 (空行・コメントを除く) の数。
-
-    `parse_yaml` は `git:` の下の字下げ行のうち 2 字下げの `key: value` 以外を**黙って読み飛ばす**
-    (lib_task_cards.py の「Deeply nested / orphaned indented line — skip silently」)。空行・字下げた
-    コメントの後ろの行も読み飛ばされる。読めた欄の数とこの数が合わなければ、何かが落ちている。
-    """
-    heads = 0
-    lines = text.splitlines()
-    count = 0
-    in_block = False
-    for line in lines:
-        if re.match(r"^git:", line):
-            heads += 1
-            in_block = True
-            count = 0 if heads == 1 else count
-            continue
-        if not in_block:
-            continue
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            # 空行・コメントは数えない。ただし `parse_yaml` はここで子の走査を打ち切る (後ろが読み飛ばされる)
-            continue
-        if line[0] in (" ", "\t"):
-            count += 1
-            continue
-        in_block = False
-    return heads, count
+def _top_level_git_heads(text: str) -> int:
+    return sum(1 for line in text.splitlines() if re.match(r"^git:", line))
 
 
 _STRAY_GIT_RE = re.compile(r"^[ \t]+(?:-[ \t]+)?[\"']?git[\"']?[ \t]*:")
 
 
 def _stray_git_key_line(text: str):
-    """0 桁目でない `git` キーの行 (1 始まりの行番号)。無ければ None。コメント行は対象外。"""
+    """0 桁目でない `git` キーの行 (1 始まりの行番号)。無ければ None。コメント行は対象外。
+
+    **主たる網ではない** (主は `_unparsed_line`)。parse_yaml が読んで結果に残す形 (`review:` の下の `- git: x`)
+    は `_unparsed_line` に掛からないが、git の宣言の書き損じなので 1 巡目から拒否している (互換のため残す)。
+    """
     for n, line in enumerate(text.splitlines(), 1):
         if _STRAY_GIT_RE.match(line):
             return n
+    return None
+
+
+def _unparsed_line(text: str, data: dict):
+    """`parse_yaml` が結果に反映しなかった行 (1 始まりの行番号)。無ければ None。
+
+    `parse_yaml` は字下げた行のうち読めない形を**黙って読み飛ばす** (lib_task_cards.py の
+    「Deeply nested / orphaned indented line — skip silently」)。飛ばされる形を列挙して塞ぐと、列挙に無い形
+    (flow 形式 `{git: {...}}`・`git` の綴り違いの入れ子・…) が `git: が無い` と区別できずに既定値へ倒れる
+    (G2 の 1・2 巡目で同じ型が 2 回出た)。そこで**形を見ずに、parse_yaml 自身に聞く**: その行を除いて
+    読み直した結果が同じなら、その行は結果に何も寄与していない (= 飛ばされた・上書きされた重複)。
+    空行・コメントは対象外。
+
+    飛ばされた行が 1 つでもあれば、少なくとも 1 つは検出される (飛ばされた行 S を除くと後ろの行が読まれ始めて
+    結果が変わるときは、その後ろの行が飛ばされていた行で、それを除いても結果は変わらない)。
+    mission.yaml は小さい (数十行) ので行数分の再解析で足りる。
+    """
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        rest = "\n".join(lines[:i] + lines[i + 1:])
+        try:
+            same = parse_yaml(rest) == data
+        except ValueError:
+            same = False  # 除くと解析できなくなる = 結果に寄与している
+        if same:
+            return i + 1
     return None
 
 
@@ -311,15 +339,20 @@ def policy_from_text(text: str, source: str = "<mission.yaml>") -> GitPolicy:
     if parse_error is not None:
         raise GitPolicyError("malformed", "mission.yaml", f"読めない: {parse_error}")
 
-    # `git` という名前のキーが 0 桁目以外にある (字下げ・タブ・入れ子・リスト項目・引用符つき) mission.yaml は、
-    # parse_yaml が黙って読み飛ばすので「git: が無い」と区別できない。既定値に倒す前に停止する。
+    # parse_yaml が黙って飛ばした行が 1 行でもあれば、`git:` の有無を結論できない (その行が git の宣言かもしれない)。
+    # 既定値に倒す前に停止する。飛ばされる形の列挙はしない (`_unparsed_line`)。
+    unparsed = _unparsed_line(text, data)
+    if unparsed is not None:
+        raise GitPolicyError("malformed", "git",
+                             f"{unparsed} 行目が解析結果に反映されていない (字下げ・入れ子・flow 形式・重複キー・空行や"
+                             "コメントの後ろの行は parse_yaml が読み飛ばす。git: は 0 桁目に 2 字下げの `key: value` で書く)")
+
     stray = _stray_git_key_line(text)
     if stray is not None:
         raise GitPolicyError("malformed", "git",
-                             f"{stray} 行目に字下げされた git キーがある (git: は 0 桁目に書く。"
-                             "字下げた行は parse_yaml が読み飛ばす)")
+                             f"{stray} 行目に字下げされた git キーがある (git: は 0 桁目に書く)")
 
-    heads, indented = _git_block_line_count(text)
+    heads = _top_level_git_heads(text)
     if "git" not in data:
         # `git:` 行が 1 本もないときだけ既定値。行はあるのに key が無いことは起きない (parse_yaml が拾う) が、
         # 起きたら黙って既定値にしない。
@@ -334,12 +367,7 @@ def policy_from_text(text: str, source: str = "<mission.yaml>") -> GitPolicy:
         raise GitPolicyError("malformed", "git",
                              f"git: の値が mapping ではない ({type(block).__name__})。"
                              "2 字下げの `key: value` で書く")
-    if heads != 1:
-        raise GitPolicyError("malformed", "git", f"トップレベルの git: が {heads} 個ある")
-    if indented != len(block):
-        raise GitPolicyError("malformed", "git",
-                             f"git: の下の字下げ行 {indented} 行のうち {len(block)} 欄しか読めていない "
-                             "(4 字下げ・空行・コメント・重複キーは読み飛ばされる)")
+    # トップレベルの `git:` が 2 個ある場合は、先の方が上書きされて結果に寄与しないので `_unparsed_line` が拾う。
 
     for key in block:
         if key not in POLICY_FIELDS:

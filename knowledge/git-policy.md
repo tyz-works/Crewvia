@@ -500,12 +500,21 @@ def pr_base(policy) -> str
 DIFF_REF="$(plan pr-base --diff-ref)" || { echo "diff の base を決められない。Director に報告して待つ" >&2; exit 1; }
 case "$DIFF_REF" in
   origin/*)   # crewvia 本体の task。pull の fetch は base_branch しか取らないので、PR base をここで取る
-    git fetch origin "${DIFF_REF#origin/}" \
+    # 明示の src:dst で取る。素の `git fetch origin <branch>` は refspec が絞られた clone (--single-branch 等) では
+    # FETCH_HEAD しか更新せず、古い origin/<branch> を読んでしまう
+    git fetch origin "+refs/heads/${DIFF_REF#origin/}:refs/remotes/${DIFF_REF}" \
       && git rev-parse --verify --quiet "${DIFF_REF}^{commit}" >/dev/null \
       || { echo "${DIFF_REF} を取れない。Director に報告して待つ" >&2; exit 1; } ;;
 esac          # それ以外 (TARGET_DIR の task は local の main) は今と同じく何もしない
 git diff "${DIFF_REF}...HEAD" --name-only
 ```
+
+**fetch は明示の src:dst で** (Codex review PR #267 2 巡目 P2-1): 素の `git fetch origin <branch>` は、設定された fetch refspec がその branch を写すときだけ
+`refs/remotes/origin/<branch>` を更新する。`--single-branch` の clone (TARGET_DIR のリポジトリでありうる) では FETCH_HEAD しか更新されず、続く rev-parse が
+(a) 取れた branch を「無い」と拒否するか、(b) **古い tracking ref を受け入れて違う diff をレビューする**。手順は
+`git fetch origin "+refs/heads/<b>:refs/remotes/origin/<b>"` で取る。crewvia 本体の task の 3 つの居場所 (worktree・主 checkout・TARGET_DIR) のうち、
+worktree と主 checkout は ref を共有する。TARGET_DIR の task は `main` で fetch しない (local の ref だけを見る)。テストは
+`test_diff_base_fetch_reaches_the_remote_tip_in_a_clone_whose_fetch_refspec_is_narrowed` (QA・verifier × ref が無い・古い × 2 cwd)。
 
 - `origin/*` で分けるのは plan.sh の出力で、env ではない (§3 `--diff-ref`・§5)。TARGET_DIR の task の値は `main` で、
   今の文言とバイトまで同じ diff になる (fetch しない・ref を検査しない)。

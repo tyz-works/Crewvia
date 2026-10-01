@@ -33,7 +33,9 @@ crewvia 本体の task は `origin/<pr_base>` を fetch して確かめてから
 DIFF_REF="$(plan pr-base --diff-ref --mission <slug> --task <task_id>)" || { echo "diff の base を決められない。needs_human_review にする" >&2; exit 1; }
 case "$DIFF_REF" in
   origin/*)   # crewvia 本体の task。PR base をここで取る
-    git fetch origin "${DIFF_REF#origin/}" \
+    # 明示の src:dst で取る。素の `git fetch origin <branch>` は refspec が絞られた clone (--single-branch 等) では
+    # FETCH_HEAD しか更新せず、古い origin/<branch> を読んでしまう
+    git fetch origin "+refs/heads/${DIFF_REF#origin/}:refs/remotes/${DIFF_REF}" \
       && git rev-parse --verify --quiet "${DIFF_REF}^{commit}" >/dev/null \
       || { echo "${DIFF_REF} を取れない。needs_human_review にする" >&2; exit 1; } ;;
 esac          # それ以外 (TARGET_DIR の task は local の main) は何もしない

@@ -50,6 +50,10 @@ exit 0
 """
 
 
+class SnippetNotFound(Exception):
+    """文書から手順を切り出せなかった。**テストの assert ではない** (red proof はこれで落ちたものを赤と数えない)。"""
+
+
 def snippet(rel: str, start: str, end: str, index: int = 0) -> str:
     """`rel` の fenced code block から、`start` に当たる行から `end` に当たる行まで (含む) を取り出す。`index` 番目の開始行。"""
     found = []
@@ -61,8 +65,9 @@ def snippet(rel: str, start: str, end: str, index: int = 0) -> str:
                         found.append("\n".join(block[i:j + 1]))
                         break
                 else:
-                    raise AssertionError(f"{rel}: 終端 {end!r} が見つからない")
-    assert len(found) > index, f"{rel}: 開始 {start!r} が {len(found)} 個しか無い (index={index})"
+                    raise SnippetNotFound(f"{rel}: 終端 {end!r} が見つからない")
+    if len(found) <= index:
+        raise SnippetNotFound(f"{rel}: 開始 {start!r} が {len(found)} 個しか無い (index={index})")
     return found[index]
 
 
@@ -109,7 +114,9 @@ def base_passed(calls: list[str], verb: str) -> str:
 
 
 def pr_create_script(index: int) -> str:
-    return snippet("agents/worker.md", r'^PR_BASE=', r'--base "\$PR_BASE"', index)
+    # 終わりの目印は `--base` の行そのもの (値は含めない)。値を目印にすると、`--base main` に戻す欠陥が切り出しの失敗で落ち、
+    # 「base の値の assert」で落ちたことの証拠にならない。
+    return snippet("agents/worker.md", r'^PR_BASE=', r'^\s*--base\b', index)
 
 
 def test_worker_md_has_two_pr_create_blocks_that_both_use_plan_pr_base():
@@ -284,6 +291,61 @@ def test_qa_diff_fetches_the_pr_base_when_the_clone_does_not_have_it_yet(repo, d
     assert git(repo.root, "rev-parse", "--verify", "--quiet", "origin/develop", check=False).returncode == 0, "手順が fetch した"
     assert "change.txt" in p.stdout.split()
     assert "dev.txt" not in p.stdout.split(), "develop にある変更は diff に出ない (base が develop)"
+
+
+def narrow_fetch_refspec(repo: Repo):
+    """`--single-branch` の clone と同じ: `origin` の fetch refspec が main だけを写す (TARGET_DIR の repo でありうる)。"""
+    git(repo.root, "config", "remote.origin.fetch", "+refs/heads/main:refs/remotes/origin/main")
+
+
+def advance_origin_develop(repo: Repo) -> str:
+    """origin の develop を 1 commit 進める。clone 側の `refs/remotes/origin/develop` は進めない (= 古いまま・無いまま)。"""
+    git(repo.root, "checkout", "-q", "develop")
+    (repo.root / "dev2.txt").write_text("newer\n")
+    git(repo.root, "add", "dev2.txt")
+    git(repo.root, "commit", "-q", "-m", "develop moves")
+    git(repo.root, "push", "-q", "origin", "develop")
+    tip = git(repo.root, "rev-parse", "HEAD").stdout.strip()
+    git(repo.root, "checkout", "-q", "main")
+    return tip
+
+
+def commit_change(repo: Repo):
+    (repo.wt / "change.txt").write_text("x\n")
+    git(repo.wt, "add", "change.txt")
+    git(repo.wt, "commit", "-q", "-m", "change")
+
+
+@pytest.mark.parametrize("doc", ["qa", "verifier"])
+@pytest.mark.parametrize("state", ["missing", "stale"])
+@pytest.mark.parametrize("cwd_of", ["worktree", "main_checkout"])
+def test_diff_base_fetch_reaches_the_remote_tip_in_a_clone_whose_fetch_refspec_is_narrowed(repo, docs, doc, state, cwd_of):
+    """素の `git fetch origin <branch>` は、設定の refspec がその branch を写さないと FETCH_HEAD しか更新しない。
+    すると rev-parse は (a) 無い ref を拒否するか、(b) **古い `origin/<branch>` を受け入れて違う diff をレビューする**。
+    手順は明示の `+refs/heads/<b>:refs/remotes/origin/<b>` で取るので、どちらでも origin の先端を見る。
+    worktree と主 checkout は ref を共有するので、cwd を変えても同じ (crewvia 本体の task の 3 つの居場所のうち 2 つ。
+    3 つ目の TARGET_DIR の task は `main` で fetch しない = test_qa_diff_of_a_target_dir_task_...)。"""
+    repo.branch_off("develop", "dev.txt")
+    repo.set_git(base_branch="main", pr_base="develop")
+    assert repo.pull().returncode == 0
+    old_tip = git(repo.root, "rev-parse", "origin/develop").stdout.strip()
+    new_tip = advance_origin_develop(repo)
+    assert new_tip != old_tip
+    if state == "missing":
+        drop_remote_tracking(repo, "develop")
+    else:      # push が tracking ref も進めてしまうので、古い先端に戻して「古い clone」にする
+        git(repo.root, "update-ref", "refs/remotes/origin/develop", old_tip)
+        assert git(repo.root, "rev-parse", "origin/develop").stdout.strip() == old_tip, "前提: 古い"
+    narrow_fetch_refspec(repo)
+    commit_change(repo)
+    script, agent = (qa_diff_script(), AGENT) if doc == "qa" else (verifier_diff_script(), None)
+    p = docs.run(script, repo.wt if cwd_of == "worktree" else repo.root, agent=agent)
+    assert p.returncode == 0, ("手順が取れた branch を拒否した / 取れない", p.stderr)
+    tip = git(repo.root, "rev-parse", "origin/develop").stdout.strip()
+    assert tip == new_tip, f"origin/develop が origin の先端でない (古い ref を見て diff した): {tip} != {new_tip}"
+    if cwd_of == "worktree":      # 主 checkout の HEAD は main で、task の commit を持たない。diff の中身は worktree でだけ見る
+        assert "change.txt" in p.stdout
+        assert "dev2.txt" not in p.stdout, "develop の最新の変更が diff に出た = 古い origin/develop と比べている"
 
 
 def test_qa_diff_for_a_default_mission_is_origin_main(repo, docs):

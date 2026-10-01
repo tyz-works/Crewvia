@@ -77,7 +77,8 @@ root の `CLAUDE.md` から移した、テスト専用の規則。設計と経�
 - **文書の手順そのものの評価**（G4 / t016）: `tests/test_agent_docs_take_pr_base_from_plan_pr_base.py` が agents/*.md・skills/*/SKILL.md の
   code block を**取り出して**使い捨ての clone + stub `gh` で実際に走らせる（PR 作成・stacked PR の判定と付け替え・QA / verifier の diff）。
   snippet の開始行は欠陥注入で消える文言（`plan pr-base`）にしない（`^PR_BASE=` / `^DIFF_REF=`）。消えると「開始行が無い」で赤になり、
-  挙動の違いで赤になることの実証にならない。赤の実証は `tests/red_proof_agent_docs_pr_base.py`（7 欠陥・約 6 分）。
+  挙動の違いで赤になることの実証にならない。赤の実証は `tests/red_proof_agent_docs_pr_base.py`（8 欠陥・約 8 分）。**赤と数えるのは、狙ったテスト名が「テストの assert」で落ちたときだけ**（runner が `FAILED <id> - <reason>` の reason を見る。文書の切り出しの失敗は `SnippetNotFound`、collection / ImportError も数えない。欠陥ごとに assert の識別子 `why` も持てる）。snippet の終端の目印に、欠陥が書き換える値（`--base "$PR_BASE"` の値）を入れない（`--base` の行頭だけ）。
+  fetch → diff の組（crewvia-qa・verifier.md）は `--single-branch` 相当（`remote.origin.fetch` を main だけに絞る）の clone で、tracking ref が**無い / 古い**場合の両方をworktree・主 checkout の cwd で試す。fetch は明示の `+refs/heads/<b>:refs/remotes/origin/<b>`。
   pull は `git fetch origin` で全 branch の remote-tracking を取るので、「まだ無い clone」は pull の**後**に ref を消して作る。
 
 - 名前の検証と診断の secret 漏れ: `tests/test_git_policy_untrusted_names_and_error_text.py`（`pr-base` の traversal・

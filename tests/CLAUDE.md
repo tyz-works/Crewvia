@@ -118,6 +118,15 @@ root の `CLAUDE.md` から移した、テスト専用の規則。設計と経�
   赤の実証は `tests/red_proof_projection_recovery.sh`（13 ケース。欠陥を注入した複製に同じテストを走らせる。約 10 分）。
   **plan.sh の subcommand を足したら** `tests/test_registry_isolation.py` の `ISOLATED_INVOCATIONS` と usage 行・header（先頭 70 行に `--help` が要る）も揃える。
 
+## Task Controller（01c E1 / t004）のテスト
+
+- 単体 `test_task_controller_unit.py`（原案 §10.5 の 14 項目は `test_10_5_NN`。「何も書かない」は `snapshot` の sha256 一致）・
+  並行 `test_task_controller_concurrency.py`（**独立プロセス** `task_controller_worker.py`・実 flock・2〜4 プロセス × 20 回）・
+  crash 注入 `test_task_controller_crash_injection.py`（`FAULT_HOOK` の k 番目で fork した子が SIGKILL。点の数の下限を assert。
+  回復後に `diagnose` が空 — DETACHED の報告は Director が閉じるまで残るので、その 2 種だけ除く）。helper は `task_controller_helpers.py`。
+- 呼び出し元ゼロの固定は `test_task_controller_has_no_callers_yet.py`（名前の出現。E2 で許可表を広げる）。
+- **長い反復は `timeout` を付け、最初は 2 回で形を確かめてから 20 回**（crash 注入は全体で約 3 分。background で待たない）。
+
 ## 子プロセスを残さない（`tests/leaked_descendants.py` / `tests/proc_group.py`）
 
 - plan.sh のような **bash の下で更に子を起こすもの** を `subprocess.run(timeout=)` / `Popen.kill()` で止めると、

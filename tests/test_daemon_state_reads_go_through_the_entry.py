@@ -205,6 +205,11 @@ ALLOWED_JSON_PARSES: dict[tuple[str, str, str], str] = {
         _QUEUE_SIDE + "queue/assignments の実行アイデンティティ sidecar の読み (S3 で plan.sh の "
         "`_read_assignment_identity` はこちらに一本化された)。外側 (dict か) は強制済みで、読めない・形が違うは None = 世代不明 = "
         "classify が UNVERIFIABLE (**消さない側**)。本体を先に読むので、この失敗が撤去の許可になる経路は無い",
+    ("lib_state_store.py", "read_execution_record", "json.loads(text)"):
+        _QUEUE_SIDE + "queue/missions/<slug>/executions/<ID>.json (01c E1。試行の record = card からの projection)。"
+        "読み口は `lib_task_cards` の入口 (`read_regular_text_or_unreadable`) を通した後の parse だけで、外側 (dict か) は強制済み。"
+        "**JSON でない・dict でないは `('unreadable', 固定コード)` で、「無い」にも既定値にも倒さない** (消さない・上書きしない = "
+        "R-5 は報告だけ)。record は判断に使わない (正本は card) ので、壊れていても照合・冪等の答えは変わらない",
     ("lib_state_store.py", "locked_update_json", "json.loads(text)"):
         _QUEUE_SIDE + "S5 で taskvia map (`queue/.taskvia-map.json`) の更新に使う専用ロック下の読み直し。"
         "ENOENT だけ {} から始め、読めない・JSON でない・top-level が dict でないは **StoreReadError で止めて"

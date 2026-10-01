@@ -90,6 +90,24 @@ ACCEPTS_FROM = {
     'verifying': frozenset({'ready_for_verification'}),
 }
 
+#: 01c (execution.md §4.3) で狭める「受け付ける元の status」。**E1 ではデータとして置くだけ** —— plan.sh はまだ
+#: `ACCEPTS_FROM` (現状を写した表) を読む。`lib_task_controller` だけがこちらを読み、E3 が plan.sh の呼び出しを
+#: Controller に移すとき `ACCEPTS_FROM` をこの表で差し替える (差し替えるまで挙動は 1 バイトも変わらない)。
+#: 狭めた行にも出口がある (表の理由は execution.md §4.3): done が通らなくなる pending / blocked は
+#: `update --status in_progress` → done または `update --status done`、検証待ちは `verify-result`、
+#: fail が通らなくなる pending / blocked は `update --status skipped|failed` …。
+#: `fail` の `needs_director` は残す (Director が判断待ちの task を諦める出口。試行は needs-director で既に failed)。
+ACCEPTS_FROM_NARROWED = {
+    'pull': frozenset({'pending'}),
+    'needs-director': frozenset({'in_progress'}),
+    'done': frozenset({'in_progress'}),
+    'fail': frozenset({'in_progress', 'needs_director'}),
+    'ready-for-verification': frozenset({'in_progress'}),
+    'verify-result': frozenset({'ready_for_verification', 'verifying', 'needs_human_review'}),
+    'retire': frozenset({'in_progress'}),
+    'verifying': frozenset({'ready_for_verification'}),
+}
+
 
 def accepts(command, status):
     """`command` が `status` の task を受け付けるか。知らない command は KeyError。"""

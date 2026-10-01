@@ -24,9 +24,11 @@ NAME = "lib_state_store"
 
 #: 名前を出してよいファイル (repo 相対)。テストと knowledge/ は走査の対象外。
 #: S3: plan.sh (queue の書き手)。S5: lib_registry.py (registry/workers.yaml)・taskvia-sync.sh (queue/.taskvia-map.json)。
+#: 01c E1: lib_task_controller.py (試行の予約・終了。`Txn` を受けて書く lib で、それ自身の呼び出し元はゼロ —
+#: `tests/test_task_controller_has_no_callers_yet.py` が固定する。本番の queue を書く経路はまだ増えていない)。
 #: ここに足すのは cutover (= ユーザー承認が要る PR) だけ。
 ALLOWED_CALLERS = {"scripts/lib_state_store.py", "scripts/plan.sh", "scripts/lib_registry.py",
-                   "scripts/taskvia-sync.sh"}
+                   "scripts/taskvia-sync.sh", "scripts/lib_task_controller.py"}
 
 #: 走査する場所。**ディレクトリごと**で列挙しない (新しい書き手が増えても自動で対象になる)。
 SCAN_DIRS = ("scripts", "hooks", "agents", "config")

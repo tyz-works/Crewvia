@@ -1066,3 +1066,68 @@ t023 と t024 で P1 が続けて「正本に無い値」「回復の範囲が�
 5. 試行の `stale` / `abandoned` / `recovered` — §0 (原案の後続)。reserved のまま放置された試行 (Worker が再 pull しない) は今どおり
    Rule 5 → Director の reset。
 6. record の掃除 (archive 以外で消す経路) — 作らない。1 試行 ~600 B で、量が問題になったら archive と同じ手動運用。
+
+---
+
+## 14. E1 の実績と、§9.1「表に書けない行」への決定 (t004)
+
+呼び出し元ゼロの lib を入れた。本番の挙動は変わらない (plan.sh・dispatcher・hooks は `lib_task_controller` を import しない。
+`tests/test_task_controller_has_no_callers_yet.py` が名前の出現で固定し、E2 が最初の呼び出し元を足すときに許可表を意図して広げる)。
+
+- 置き場: `scripts/lib_execution.py` (card 1 枚から決まること: ID の形・欄・`attempt_view`・照合・record の形)、
+  `scripts/lib_task_controller.py` (reserve / start / complete / fail / release / reset / mark / abandon_detached / get。書き込みは
+  すべて渡された `lib_state_store.Txn` の中)。書き込みの lib が controller を import すると循環するので、遷移から独立な部分は
+  `lib_execution` に置いた。`lib_state_store` は `lib_execution` だけを import する。
+- 検証: 単体 (原案 §10.5 の 14 項目 + 表) `tests/test_task_controller_unit.py` / 独立プロセスの並行 reserve
+  (2〜4 プロセス × 20 回) `tests/test_task_controller_concurrency.py` / 全書き込み点で SIGKILL する crash 注入 (13 場面 × 点 × 20 回)
+  `tests/test_task_controller_crash_injection.py`。
+
+**決定 (§9.1 の「表に書けない行」の 1〜3)**:
+
+1. **rollback 中の P1 の後に record Y の `agent` が null になる件 → card に `execution_agent` を足す** (予約した agent の写し。
+   `execution_reserved_at` と同じ扱いで、次の reserve まで変わらない。`worker` は reset / retire / `update --worker` で変わるので使わない)。
+   record の `agent` は card から再生成でき (R-5)、旧コードが worker を null にしても履歴が欠けない。agent なしの予約 (`agent=None`) と
+   旧コードの跡で欄が無い card だけ record の `agent` が null になり、`reported:execution_record_owner_unknown` で報告する
+   (数えるだけ。判断には使わない)。欄は任意で、無い card は不整合にしない (`fields_problem` は型だけ見る)。
+2. **終端の task に DETACHED (b) の欄が残る件 → Director 用の閉じる手段を作る**。`abandon_detached_execution` (card の試行を
+   `failed` / `ABANDONED_OUTSIDE_CONTROLLER` で閉じる。task の status には触れない。閉じるものが無ければ `INVALID_TRANSITION`)。
+   報告は終端の task を別コード `reported:execution_active_on_finished_task` に分け、E4b の gate (0 件の確認) に混ぜない。holding 以外の
+   非終端 (pending 等) は従来どおり `reported:execution_active_on_non_holding_status` (次の reserve の手順 0 か abandon が閉じる)。
+   CLI の口 (`plan.sh update --close-execution` 等) は呼び出し側を移す PR (E3 / E4a) で足す。
+3. **名指しされない card の record の遅れ → 数えるだけ**。回復 (apply) は書かず、`diagnose` が `reported:execution_record_stale` で
+   数える。判断 (冪等の答え) は card から返り、record を使わない。`test_a_record_left_behind_for_an_unnamed_card_is_only_counted_…` が固定。
+
+**戻し方 (E1)**: PR を revert し、`scripts/sync-main-checkout.sh` で主 checkout を ff する。呼び出し元ゼロなので本番の queue・registry・
+デーモンには何も書かれておらず、データの戻しは要らない。lib_state_store の拡張は既定値 (`execution_id` を渡さない) で今とバイトが同じ
+(01a S3 の互換 golden が変わっていないことで確かめる)。
+
+### 14.2 Codex 1 巡目 (PR #270 / t029): 「書いてから失敗する」族と「崩れた record で落ちる」族
+
+- **P2-2 / 族 1**: `reserve_task` は候補の ID の検証 (形・現在の試行との衝突・既存 record との衝突) を、手順 0 の `_abandon` より**前**に終える。
+  `_finish` の `abandon_detached` 経路も、task の遷移の検査を `_abandon` より前に置いた (今の表では RESET に command が無く拒否されないが、
+  表が変わっても「書いてから拒否」にならない)。拒否の**監査行**だけは書いてよい (§8)。それ以外 (card・record・枠・identity) は
+  `tests/test_task_controller_malformed_inputs.py::test_every_refusal_writes_nothing_but_the_audit_row` が全拒否コード (27 場面) で sha256 の一致を見る。
+
+  | 操作 | 最初の書き込み | それより前に終わる検証 |
+  |---|---|---|
+  | reserve | (手順 0 の) `_abandon` か card | agent・now・status・枠の持ち主・**候補 ID** |
+  | start | card | git_context・ID の形・NOT_FOUND / NOT_CURRENT / terminal |
+  | complete / fail / release / reset | `_abandon` か card | 引数・照合・meta_updates・試行の遷移・task の遷移 |
+  | abandon_detached | card | DETACHED かつ active |
+  | mark | card | 引数・照合・task の遷移・meta_updates |
+
+- **P2-1 / 族 2**: record の形の検査は `lib_execution.record_shape_problem` の 1 か所 (必須: execution_id / mission / task / reserved_at (空でない文字列)・
+  attempt (bool でない int)・status (既知の語)・git (dict)。任意: agent / end_code / running_at / ended_at は None か文字列)。
+  `record_problem` (照合・`_write_record`・`_execution_of`) / `get_execution` / diagnose が同じ関数を通る。崩れた record は
+  **card から導く** (`record_from_card`。判断に使わない) か、書き込みでは**上書きせず**報告に回す (`reported:execution_record_identity_mismatch`)。
+  任意欄の**欠け**は健全 (`record.get`)。
+- **P2-3**: diagnose の record 走査は、集合判定 (`status in ACTIVE_STATUSES`) の前に `record_shape_problem` を通し、崩れた record は
+  `reported:execution_record_malformed` (detail は固定コード。値は出さない) にして次の record へ進む (01a S2 の `status: []` と同じ族)。
+
+| 経路 | 欄が欠ける | 型が違う (`[]` / `{}` / int) | 空 | 結果 |
+|---|---|---|---|---|
+| start / complete / fail / 冪等の再送 (`_execution_of`) | card から導く | 同左 | 同左 | 例外なし・record は書き換えない |
+| `_write_record` | 上書きしない | 同左 | 同左 | 報告だけ (R-5 が `identity_mismatch`) |
+| `get_execution` | `STATE_INVALID` | 同左 | 同左 | 例外で落ちない |
+| diagnose | `reported:execution_record_malformed` | 同左 | 同左 | 他の task の検査を続ける |
+| recover (R-5) | 上書きしない・報告 | 同左 | 同左 | 例外なし |

@@ -77,6 +77,17 @@ lib ごとの**破ってはいけない契約**の要約。理由・経緯・全
   コピーしない。**`failed` の依存は「保留（HELD）」**で、進める出口は Director の `plan.sh release-dep <id> --mission <slug>` だけ。
 - 共有規則に env 停止スイッチを付けない（dispatcher と plan.sh で答えが割れる）。
 
+## Execution + Task Controller（`lib_execution.py` / `lib_task_controller.py`。01c E1 / t004 で作成。**呼び出し元ゼロ**）
+
+- `lib_execution.py` = card 1 枚から決まること（`ex-<32 hex>` の形・試行の欄 `EXECUTION_FIELDS`・`attempt_view`（照合・冪等・R-1・
+  reserve の手順 0・store-check が呼ぶ**唯一の読み方**）・record の形と card への追従）。`lib_task_controller.py` = 遷移（reserve /
+  start / complete / fail / release / reset / mark / abandon_detached / get）。書き込みは全部 `lib_state_store.Txn` の中で、
+  card → record → assignment（identity → 本体）の順。**`lib_state_store` が import してよいのは `lib_execution` だけ**（controller を
+  import すると循環する）。
+- **domain error は `ControllerError.code`（固定コード）が契約**。文字列の解析を契約にしない。メッセージ・監査行・record には
+  コード・位置・識別子だけを出し、card の本文・他の欄・Result・入力の行を出さない（secret を仕込んだテストで固定）。
+- 呼び出し元は E2 以降で増える。増やすのは cutover なので、`tests/test_task_controller_has_no_callers_yet.py` の `ALLOWED_MENTIONS` を
+  意図して広げる（ユーザー承認が要る PR）。設計は `knowledge/execution.md`（§14 が E1 の実績と戻し方）。
 ## Git Policy（`lib_git_policy.py`。01b G2 / t008 で作成、G3 / t012 で呼び出し元を移した）
 
 - task の branch・worktree path・base・PR base を決める唯一の場所（`knowledge/git-policy.md` §2・§3）。**判断だけ**で

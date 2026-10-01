@@ -65,6 +65,7 @@ _SCRIPTS_DIR = Path(__file__).resolve().parent
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
+import lib_execution as _ex  # noqa: E402
 import lib_task_cards as _cards  # noqa: E402
 import lib_task_status as _status  # noqa: E402
 
@@ -81,6 +82,7 @@ import lib_task_status as _status  # noqa: E402
 
 _SAFE_TOKEN_RE = re.compile(r'[A-Za-z0-9_.-]{1,64}')
 _SAFE_GENERATION_RE = re.compile(r'[A-Za-z0-9:_.+-]{1,64}')
+_SAFE_EXECUTION_ID_RE = _ex.EXECUTION_ID_RE
 _MALFORMED_LINE_RE = re.compile(r'malformed line (\d+)')
 
 #: card の status として出してよい語彙 (これ以外の値は内容として扱い、出さない)。語彙は lib_task_status が持つ。
@@ -101,6 +103,15 @@ def _safe_status(value):
     return value if isinstance(value, str) and value in _KNOWN_STATUSES else None
 
 
+def _safe_execution_id(value):
+    """`ex-<32 hex>` の完全一致だけ。外れたら None (名乗られた値・壊れた値を監査ログに残さない。execution.md §1.5)。"""
+    return value if isinstance(value, str) and _SAFE_EXECUTION_ID_RE.fullmatch(value) else None
+
+
+def _safe_caller_check(value):
+    return value if isinstance(value, str) and value in _ex.CALLER_CHECKS else None
+
+
 #: 監査ログ・stderr の `detail` に出してよい**形**。自由文は通さない (パーサ例外・カードの値・枠の中身は
 #: どの形にも合わない)。合わないものは 'redacted'。
 _CODE = r'[a-z_]+(?::[A-Za-z0-9_=.-]+)*'                 # read_error:EACCES / parse_error:line=3
@@ -113,8 +124,9 @@ _SAFE_DETAIL_RES = tuple(re.compile(p) for p in (
     # duplicate_owner / owner_unprovable: `<slug>/<tid>` (退避先の card は `archive/<slug>/<tid>`)
     r'(?:archive/)?' + _IDENT + r'/' + _IDENT + r'(?:, (?:archive/)?' + _IDENT + r'/' + _IDENT + r')*',
     r'assignment body: lstat failed',
+    r'presented=ex-[0-9a-f]{32}',                         # 照合に失敗した名乗り (形が正しいときだけ。execution.md §1.5)
 ))
-_SAFE_RESULT_RE = re.compile(r'(ok|repaired:R-[1-4]|reported:[a-z_]+)')
+_SAFE_RESULT_RE = re.compile(r'(ok|repaired:R-[1-5]|reported:[a-z_]+|refused:[A-Z_]+)')
 _SAFE_RELPATH_RE = re.compile(r'[A-Za-z0-9_./-]{1,300}')
 
 
@@ -497,7 +509,9 @@ def durable_rename(src, dst):
 
 TASK_META_KEY_ORDER = [
     'id', 'title', 'skills', 'priority', 'status',
-    'blocked_by', 'released_deps', 'timeout', 'target_dir', 'worker', 'started_at', 'completed_at',
+    'blocked_by', 'released_deps', 'timeout', 'target_dir', 'worker', 'started_at',
+    *_ex.EXECUTION_FIELDS,                     # 01c: 試行の欄は `started_at` の直後 (execution.md §1.2)
+    'completed_at',
     'handoff_path', 'fail_head', 'fail_head_waiver', 'pr_number', 'no_pr_waiver', 'deliverable',
     'acceptance_criteria', 'verification', 'rework_count', 'max_rework',
     'qa_checkpoints', 'required_evidence', 'needs_director_reason',
@@ -654,6 +668,12 @@ def _check_tid(tid):
     if not isinstance(tid, str) or not _cards.TASK_ID_RE.fullmatch(tid):
         raise InvalidName(f"invalid task id {tid!r} (tNNN の形だけ)")
     return tid
+
+
+def _check_execution_id(value):
+    if not _ex.is_execution_id(value):
+        raise InvalidName("invalid execution id (ex-<32 hex> の形だけ。値は出さない)")
+    return value
 
 
 def _check_agent(agent):
@@ -880,6 +900,25 @@ def _path_state(path):
         return 'unobservable'
 
 
+def read_execution_record(queue_dir, slug, execution_id):
+    """ロックなしで record を読む (`get_execution` と `Txn.read_execution_record` の唯一の読み口)。
+    `('absent',)` / `('unreadable', 固定コード)` / `('ok', dict)`。"""
+    path = os.path.join(os.fspath(queue_dir), 'missions', _check_slug(slug), 'executions',
+                        f"{_check_execution_id(execution_id)}.json")
+    text = _cards.read_regular_text_or_unreadable(path)
+    if _cards.is_missing(text):
+        return ('absent',)
+    if _cards.is_unreadable(text):
+        return ('unreadable', _unreadable_code(text))
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return ('unreadable', 'json_parse_error')
+    if not isinstance(data, dict):
+        return ('unreadable', 'json_not_object')
+    return ('ok', data)
+
+
 class Txn:
     """`transaction()` が渡す。**書き込みはステージしない** — 呼び出し側が書いた順に、その場で
     atomic に書く (設計 §3.2。順序の規則そのものが crash モデルなので、書く順を保つ)。"""
@@ -903,6 +942,10 @@ class Txn:
 
     def mission_path(self, slug):
         return self._p('missions', _check_slug(slug), 'mission.yaml')
+
+    def execution_record_path(self, slug, execution_id):
+        """`queue/missions/<slug>/executions/<execution_id>.json` (識別子はファイル名。execution.md §1.2)。"""
+        return self._p('missions', _check_slug(slug), 'executions', f"{_check_execution_id(execution_id)}.json")
 
     @property
     def state_path(self):
@@ -1050,13 +1093,29 @@ class Txn:
     def write_state(self, state):
         self._write(self.state_path, serialize_state(state))
 
+    # ---- Execution record (projection。判断には使わない。execution.md §1.2) ------------
+    def read_execution_record(self, slug, execution_id):
+        """`('absent',)` (ENOENT だけ) / `('unreadable', 固定コード)` / `('ok', dict)`。
+        読めない・JSON でない・オブジェクトでないは `unreadable` —— 「無い」に潰さない。"""
+        return read_execution_record(self.queue_dir, slug, execution_id)
+
+    def write_execution_record(self, slug, execution_id, record):
+        """record を原子的に書く (card の後・assignment の前。呼び出し側が順序を守る)。"""
+        self._write(self.execution_record_path(slug, execution_id),
+                    json.dumps(record, ensure_ascii=False, sort_keys=True, indent=2) + '\n')
+
     # ---- assignment (projection) ------------------------------------------
-    def publish_assignment(self, agent, slug, tid, generation):
-        """identity → 本体の順 (本体 = 「存在 = busy」が世代不明で観測されないように)。"""
+    def publish_assignment(self, agent, slug, tid, generation, execution_id=None):
+        """identity → 本体の順 (本体 = 「存在 = busy」が世代不明で観測されないように)。
+
+        `execution_id` (01c) は**指定されたときだけ** identity に欄を出す (None なら今とバイトが同じ。空文字は
+        「指定されなかった」に倒さず `InvalidName`)。形は `ex-<32 hex>`。"""
         _check_agent(agent), _check_slug(slug), _check_tid(tid)
-        self._write(self.identity_path(agent), json.dumps({
-            'mission': slug, 'task': tid, 'worker': agent, 'started_at': generation,
-        }, ensure_ascii=False, sort_keys=True) + '\n')
+        identity = {'mission': slug, 'task': tid, 'worker': agent, 'started_at': generation}
+        if execution_id is not None:
+            identity['execution_id'] = _check_execution_id(execution_id)
+        self._write(self.identity_path(agent), json.dumps(
+            identity, ensure_ascii=False, sort_keys=True) + '\n')
         self._write(self.assignment_path(agent), f"{slug}:{tid}\n")
 
     def _read_slot(self, agent):
@@ -1079,9 +1138,12 @@ class Txn:
             return None
         return data if isinstance(data, dict) else None
 
-    def classify_assignment(self, agent, slug, tid, generation):
+    def classify_assignment(self, agent, slug, tid, generation, execution_id=None):
         """公開中の assignment が「この実行のもの」かの判定 (plan.sh classify_assignment と同じ結論)。
-        generation=None は「いま card が示している実行」(同じロックの中で card を読んだ直後)。"""
+        generation=None は「いま card が示している実行」(同じロックの中で card を読んだ直後)。
+
+        `execution_id` (01c) は identity にも ID があるときだけ ID で比べる (`lib_execution.identity_matches`。
+        片方にだけ ID があるときは今までどおり `started_at`)。None なら今と同じ判定。"""
         if agent_name_problem(agent):
             return ASSIGN_UNVERIFIABLE
         slot = self._read_slot(agent)
@@ -1098,8 +1160,7 @@ class Txn:
             return ASSIGN_UNVERIFIABLE
         if identity.get('mission') != slug or identity.get('task') != tid:
             return ASSIGN_UNVERIFIABLE
-        recorded = identity.get('started_at')
-        if recorded is None or str(recorded) != str(generation):
+        if not _ex.identity_matches(identity, execution_id=execution_id, generation=generation):
             return ASSIGN_SUCCESSOR
         return ASSIGN_MINE
 
@@ -1114,11 +1175,38 @@ class Txn:
         return ASSIGN_MINE
 
     # ---- 監査ログ -----------------------------------------------------------
-    def record(self, mission, task, from_status, to_status, generation=None, detail=None):
-        """コマンド本体の監査ログの 1 行を予約する (with が例外なしで抜けたときに書く)。"""
+    def record(self, mission, task, from_status, to_status, generation=None, detail=None,
+               execution_id=None, caller_check=None):
+        """コマンド本体の監査ログの 1 行を予約する (with が例外なしで抜けたときに書く)。
+
+        `execution_id` は書いた後の card の `current_execution_id` (`generation` が書いた後の `started_at` なのと同じ。
+        legacy の card は None)。`caller_check` は照合の結果 (`lib_execution.CALLER_CHECKS`)。None なら行に出さない。"""
         self._records.append(dict(
             op=self.op, mission=mission, task=task, from_status=from_status,
-            to_status=to_status, generation=generation, detail=detail, result='ok'))
+            to_status=to_status, generation=generation, detail=detail, result='ok',
+            execution_id=execution_id, caller_check=caller_check))
+
+    def report(self, result, mission, task, detail=None, execution_id=None):
+        """`reported:<コード>` の行を、いま追記する (本体の書き込みとは別。execution.md §1.4 の手順 0 が使う)。"""
+        if not (isinstance(result, str) and result.startswith('reported:')):
+            raise ValueError("report() は 'reported:<コード>' だけ")
+        self._append_audit(dict(op=self.op, mission=mission, task=task, result=result, detail=detail,
+                                execution_id=execution_id), ())
+
+    def refuse(self, code, mission, task, from_status=None, execution_id=None, presented=None):
+        """照合・遷移の**拒否**の行を、いま (with の出口を待たず) 追記する (execution.md §8)。
+
+        コマンド本体の `die` / 例外の後でも残る (回復の行と同じ経路)。`result=refused:<CODE>`。`execution_id` は
+        **card の** ID で、呼び出し元が名乗った値ではない (照合に失敗した値を記録の正として残さない)。
+        名乗られた ID は形が正しいときだけ `detail` に `presented=ex-…`。コードが `lib_execution.AUDITED_REFUSALS`
+        に無ければ何も書かない (idle・使い方の誤り・ロックは行にしない)。拒否の行を足しても、コマンド本体は
+        1 バイトも書かない (行は監査ログであって queue の正本ではない)。"""
+        if code not in _ex.AUDITED_REFUSALS:
+            return
+        detail = f"presented={presented}" if _safe_execution_id(presented) else None
+        self._append_audit(dict(
+            op=self.op, mission=mission, task=task, from_status=from_status, to_status=None,
+            result=f"refused:{code}", detail=detail, execution_id=execution_id), ())
 
     def _flush_body_records(self):
         files = tuple(self._files)
@@ -1141,10 +1229,12 @@ class Txn:
             'from_status': _safe_status(rec.get('from_status')),
             'to_status': _safe_status(rec.get('to_status')),
             'generation': _safe_generation(rec.get('generation')),
-            'execution_id': None,        # 01c が埋める。01a では null 固定
+            'execution_id': _safe_execution_id(rec.get('execution_id')),   # 書き手が渡さなければ null (01a と同じ)
             'result': _safe_result(rec.get('result', 'ok')),
             'files': [f for f in map(_safe_relpath, files) if f is not None],
         }
+        if _safe_caller_check(rec.get('caller_check')):
+            row['caller_check'] = rec['caller_check']        # 照合した操作だけ。出さない行は今とバイトが同じ
         detail = rec.get('detail')
         if not detail and self.durability_failures:
             # 遷移は完了しているが親 dir の fsync を証明できなかった (`_durability_unproven`)。行に残す。
@@ -1200,7 +1290,7 @@ class _Recovery:
 
     # -- 出力 -----------------------------------------------------------------
     def _emit(self, result, mission=None, task=None, agent=None, detail=None, files=(),
-              from_status=None, to_status=None, generation=None):
+              from_status=None, to_status=None, generation=None, execution_id=None):
         # カードの値・例外文字列が stderr / 監査ログ / 戻り値に出る**唯一の経路**。門を通す。
         mission, task, agent = _safe_token(mission), _safe_token(task), _safe_token(agent)
         detail = _safe_detail(detail) if detail else None
@@ -1220,7 +1310,8 @@ class _Recovery:
                   f"agent={agent}" + (f" ({detail})" if detail else ""))
         self.t._append_audit(dict(
             op='recover', mission=mission, task=task, result=result, detail=detail,
-            from_status=from_status, to_status=to_status, generation=generation), files)
+            from_status=from_status, to_status=to_status, generation=generation,
+            execution_id=execution_id), files)
 
     def _do_writes(self, fn):
         """書き込みを行い、そこで書いたファイルの相対パスを返す。dry-run では何もしない。"""
@@ -1284,9 +1375,13 @@ class _Recovery:
             self._r2(agent)
 
         for slug, tid, meta in named:
+            self._r5(slug, tid, meta)
+        for slug, tid, meta in named:
             self._r1(slug, tid, meta)
         for slug in dict.fromkeys(s.add_missions):
             self._r3(slug)
+        if not self.apply:
+            self._execution_findings(named)          # store-check だけ (書かない・回復は拒否も報告も足さない)
         for slug in dict.fromkeys(s.archive_slugs):
             self._r4(slug)
         return self.out
@@ -1355,6 +1450,113 @@ class _Recovery:
         self._emit('reported:assignment_on_non_orphan_status', pslug, ptid, agent,
                    detail=f"status={_safe_status(status) or '<unknown>'}")
 
+    # -- 試行 (01c) ---------------------------------------------------------------
+    @staticmethod
+    def _execution_view(meta):
+        """`(view, 固定コード)`。欄が壊れていれば `(None, コード)` —— 既定値に倒さない (呼び出し側が報告する)。"""
+        try:
+            return _ex.attempt_view(meta, _ASSIGNMENT_HOLDING_STATUSES), None
+        except ValueError as e:
+            return None, str(e)          # lib_execution.fields_problem の固定コードだけ (値を含まない)
+
+    def _active_execution_id(self, meta):
+        """identity に入れる ID。**`attempt_view` が ACTIVE のときだけ** (DETACHED (a) の card の枠は取り直した別の
+        持ち主のもので、古い試行 X を名乗ると B の identity が古い試行を名乗る。execution.md §1.4 末尾)。"""
+        view, problem = self._execution_view(meta)
+        return meta['current_execution_id'] if problem is None and view == _ex.ACTIVE else None
+
+    # -- R-5: record を card に合わせる ---------------------------------------------
+    def _r5(self, slug, tid, meta):
+        """名指しの card の**今の試行**の record を、追従する欄 (status / end_code) だけ card に合わせる。
+        無ければ card から作る。不変の欄 (agent / reserved_at / git.* …) は上書きしない。過去の試行の record は
+        対象外 (凍結。execution.md §1.4)。読めない・identity が食い違う record は消さない・上書きしない (報告だけ)。"""
+        if not _ex.has_execution_fields(meta):
+            return
+        problem = _ex.fields_problem(meta)
+        if problem:
+            self._emit('reported:execution_fields_invalid', slug, tid, detail=problem)
+            return
+        xid = meta['current_execution_id']
+        got = self.t.read_execution_record(slug, xid)
+        if got[0] == 'unreadable':
+            self._emit('reported:execution_record_unreadable', slug, tid, detail=got[1])
+            return
+        if got[0] == 'absent':
+            record = _ex.record_from_card(meta, slug, tid)
+            if record['agent'] is None:
+                self._emit('reported:execution_record_owner_unknown', slug, tid)
+            files = self._do_writes(lambda: self.t.write_execution_record(slug, xid, record))
+            self._emit('repaired:R-5', slug, tid, files=files,
+                       from_status=meta.get('status'), to_status=meta.get('status'), execution_id=xid)
+            return
+        record = got[1]
+        if _ex.record_problem(record, meta, slug, tid):
+            self._emit('reported:execution_record_identity_mismatch', slug, tid)
+            return
+        if _ex.record_follows_card(record, meta):
+            return
+        if not self.apply:
+            # store-check: 名指しされない card の record が遅れたまま残る (execution.md §9.5 表外 3)。数えるだけ。
+            self._emit('reported:execution_record_stale', slug, tid)
+            return
+        updated = _ex.follow_card(record, meta)
+        files = self._do_writes(lambda: self.t.write_execution_record(slug, xid, updated))
+        self._emit('repaired:R-5', slug, tid, files=files,
+                   from_status=meta.get('status'), to_status=meta.get('status'), execution_id=xid)
+
+    def _execution_findings(self, named):
+        """diagnose 専用の報告 (execution.md §4.2 / §7 / §9.5)。**書かない・拒否を足さない**。"""
+        status_of_card = {}
+        for slug, tid, meta in named:
+            if not _ex.has_execution_fields(meta) or _ex.fields_problem(meta):
+                continue
+            view, _problem = self._execution_view(meta)
+            status_of_card[(slug, tid)] = meta['current_execution_id']
+            if view != _ex.DETACHED:
+                continue
+            if meta.get('execution_status') not in _ex.ACTIVE_STATUSES:
+                # 試行はもう閉じている (`abandon_detached_execution` 済み・正常に終わった後に旧コードが取り直した)。
+                # 閉じた試行を active と報告し続けない (消す手段が無い報告になる)
+                continue
+            status = meta.get('status')
+            if status in _ASSIGNMENT_HOLDING_STATUSES:
+                # (a): 空でない started_at が予約の値と違う (旧コードの pull が取り直した持ち主)
+                self._emit('reported:execution_detached', slug, tid, detail=f"status={_safe_status(status) or '<unknown>'}")
+            elif status in _status.RELEASED_WORK_STATUSES:
+                # (b) で task が終わっている: 履歴だけの欠け。E4b の gate に混ぜない別コード (Director は
+                # `abandon_detached_execution` で閉じられる)
+                self._emit('reported:execution_active_on_finished_task', slug, tid,
+                           detail=f"status={_safe_status(status) or '<unknown>'}")
+            else:
+                self._emit('reported:execution_active_on_non_holding_status', slug, tid,
+                           detail=f"status={_safe_status(status) or '<unknown>'}")
+        # current でない record が active のまま (card を手で編集した・lib を通らない書き込みがあった)
+        for slug in dict.fromkeys(self.scope.add_missions):
+            names, code = _list_dir(os.path.join(self.t._p('missions'), slug, 'executions'))
+            if code:
+                self._emit('reported:execution_record_unreadable', slug, detail=code)
+                continue
+            for name in names:
+                if not name.endswith('.json') or not _ex.is_execution_id(name[:-5]):
+                    continue
+                xid = name[:-5]
+                got = self.t.read_execution_record(slug, xid)
+                if got[0] == 'unreadable':
+                    self._emit('reported:execution_record_unreadable', slug, detail=got[1])
+                    continue
+                if got[0] != 'ok':
+                    continue
+                if _ex.record_shape_problem(got[1]):
+                    # 欠けた欄・型の違う欄 (`status: []` 等) は集合判定に使わない (unhashable で store-check ごと落ちる)。
+                    # 値は出さず、record の位置 (mission) だけを報告して次の record へ進む
+                    self._emit('reported:execution_record_malformed', slug, detail=_ex.record_shape_problem(got[1]))
+                    continue
+                rec_task = got[1].get('task')
+                if (got[1].get('status') in _ex.ACTIVE_STATUSES and isinstance(rec_task, str)
+                        and (slug, rec_task) in status_of_card
+                        and status_of_card[(slug, rec_task)] != xid):
+                    self._emit('reported:execution_record_superseded_active', slug, rec_task)
+
     # -- R-1: projection を作る ---------------------------------------------------
     def _r1(self, slug, tid, meta):
         status = meta.get('status')
@@ -1363,6 +1565,7 @@ class _Recovery:
         holding = status in _ASSIGNMENT_HOLDING_STATUSES
         if not holding:
             return
+        xid = self._active_execution_id(meta)
         if not (isinstance(worker, str) and worker):
             # worker が無いと枠の持ち主を決められない。R-1 は書かない (報告のみ) が、
             # assignment を持つはずの status (in_progress / ready_for_verification / verifying /
@@ -1391,7 +1594,7 @@ class _Recovery:
             # 欠け・壊れ・読めない・別の task を指す、はどれも finding (修復はしない = report-only。
             # identity → 本体の書き順なので、本体があって identity が無いのは crash では作れない)。
             if gen:
-                verdict = self.t.classify_assignment(worker, slug, tid, str(gen))
+                verdict = self.t.classify_assignment(worker, slug, tid, str(gen), execution_id=xid)
                 if verdict == ASSIGN_SUCCESSOR:
                     self._emit('reported:generation_mismatch', slug, tid, worker)
                 elif verdict == ASSIGN_UNVERIFIABLE:
@@ -1416,10 +1619,11 @@ class _Recovery:
             return
 
         def _publish():
-            self.t.publish_assignment(worker, slug, tid, str(gen))
+            self.t.publish_assignment(worker, slug, tid, str(gen), execution_id=xid)
         files = self._do_writes(_publish)
         self._emit('repaired:R-1', slug, tid, worker, files=files,
-                   from_status=status, to_status=status, generation=str(gen))
+                   from_status=status, to_status=status, generation=str(gen),
+                   execution_id=meta.get('current_execution_id'))
 
     def _ownership_problem(self, agent, slug, tid):
         """所有の証拠の走査 (§2.5)。`worker = agent` の in_progress card が全 mission でこの 1 枚だけと

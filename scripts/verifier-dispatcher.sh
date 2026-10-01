@@ -244,7 +244,21 @@ PLAN_SH = _SCRIPTS_DIR / 'plan.sh'
 PLAN_SH_TIMEOUT_SECONDS = 120
 
 
-def mark_verifying(slug, task_id, verifier):
+_EXECUTION_ID_RE = re.compile(r'ex-[0-9a-f]{32}')
+
+
+def card_execution_id(meta):
+    """card の**今の試行**の ID (`ex-<32hex>`)。名乗りに使うので、**active (reserved / running) な試行のときだけ**返す
+    (legacy の card・terminal の試行・形が違う値は None = 名乗らない。名乗って拒否されるより、名乗りなしで通す方が
+    E3 の方針 (execution.md §5.2) に合う。これは照合の根拠ではなく「どの試行を検証に出すか」の名指し)。"""
+    xid = meta.get('current_execution_id')
+    if (isinstance(xid, str) and _EXECUTION_ID_RE.fullmatch(xid)
+            and meta.get('execution_status') in ('reserved', 'running')):
+        return xid
+    return None
+
+
+def mark_verifying(slug, task_id, verifier, execution_id=None):
     """`plan.sh verifying` で card を ready_for_verification → verifying にする。
 
     以前はここが card を丸ごと読み、ロックなしで書き戻していた (読んでから書くまでの間に done /
@@ -256,8 +270,10 @@ def mark_verifying(slug, task_id, verifier):
     起こすので、タイムアウトは**プロセスグループごと**殺す (bash だけ殺すと下の python が孤児になる)。
     """
     env = dict(os.environ, CREWVIA_QUEUE=str(QUEUE_DIR), AGENT_NAME='verifier-dispatcher')
+    env.pop('CREWVIA_EXECUTION_ID', None)      # 名乗りは引数 (`--execution`) だけ。このデーモンの env から別 task の ID を継がない
+    claim = ['--execution', execution_id] if execution_id is not None else []
     proc = subprocess.Popen(
-        ['bash', str(PLAN_SH), 'verifying', task_id, '--verifier', verifier, '--mission', slug],
+        ['bash', str(PLAN_SH), 'verifying', task_id, '--verifier', verifier, '--mission', slug, *claim],
         env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True,
     )
     try:
@@ -400,11 +416,14 @@ def dispatch():
             agent_name, window = chosen
             log(f"assigning: task {task_id} (mission={slug}) → verifier {agent_name}")
             try:
-                mark_verifying(slug, task_id, agent_name)
+                xid = card_execution_id(meta)
+                mark_verifying(slug, task_id, agent_name, xid)
+                # verify-result は「どの試行を判定するか」を名指しする (verifier は試行の持ち主ではない。execution.md §5.1)
+                exec_arg = f" --execution {xid}" if xid else ""
                 msg = (
                     f"タスク {task_id} (mission={slug}) の検証をしてください。"
                     f"plan.sh verify-result {task_id} <pass|fail|needs_human_review>"
-                    f" [--notes \"...\"] で結果を記録してください。"
+                    f"{exec_arg} [--notes \"...\"] で結果を記録してください。"
                 )
                 tmux_send(window['window_target'], msg)
                 assigned_verifiers.add(agent_name)

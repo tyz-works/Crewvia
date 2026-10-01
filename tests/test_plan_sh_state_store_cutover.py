@@ -114,9 +114,8 @@ def _drive_every_mutating_subcommand(sb: Sandbox):
     sb.run("update", "t001", "--reset")
     expected.append(("update", "t001", "needs_director", "pending"))
     sb.run("pull", "--agent", "Ren", "--skills", "bash", "--task", "t001")
-    # 01c E2: 前の試行は (E4 まで) 旧形式の needs-director / reset が閉じないので、reserve の手順 0 が閉じる
-    # (`reported:stale_execution_status` の行。from / to は無い) → reserve の行 → start の行
-    expected.append(("pull", "t001", None, None))
+    # 01c E3: needs-director が試行を `failed` / `NEEDS_DIRECTOR` で閉じているので、reserve の手順 0 は走らない
+    # (E2 の間は閉じなかったので `reported:stale_execution_status` の行が出ていた)。reserve の行 → start の行
     expected.append(("pull", "t001", "pending", "in_progress"))
     expected.append(("pull", "t001", "in_progress", "in_progress"))     # 01c E2: start の行
     sb.run("done", "t001", SECRET_RESULT, "--no-pr", "audit test", agent="Ren")
@@ -154,14 +153,16 @@ def _drive_every_mutating_subcommand(sb: Sandbox):
     sb.run("retire", "t004", "--agent", "Ren", "--started-at", gen, "--outcome", "reset", "--no-wait")
     expected.append(("retire", "t004", "in_progress", "pending"))
 
-    # 孤児の assignment: done は AGENT_NAME 無しで打つ (assignment を撤去しない) → reap が撤去する
+    # 孤児の assignment: 01c E3 から done は card の worker の枠を撤去する (AGENT_NAME が無くても) ので、孤児の枠は
+    # 手で作る (done の後に残った枠 = 旧コード・回復前の状態の再現) → reap が撤去する
     sb.run("pull", "--agent", "Ren", "--skills", "bash", "--task", "t004")
     expected.append(("pull", "t004", None, None))        # 01c E2: 旧形式の retire が閉じなかった前の試行を reserve の手順 0 が閉じる
     expected.append(("pull", "t004", "pending", "in_progress"))
     expected.append(("pull", "t004", "in_progress", "in_progress"))     # 01c E2: start の行
     sb.run("done", "t004", SECRET_RESULT, "--no-pr", "audit test")
     expected.append(("done", "t004", "in_progress", "done"))
-    assert (sb.queue / "assignments" / "Ren").exists()
+    assert not (sb.queue / "assignments" / "Ren").exists()        # card の worker (Ren) の枠が done と同じトランザクションで外れた
+    (sb.queue / "assignments" / "Ren").write_text(f"{sb.slug}:t004\n")
     sb.run("reap-orphan-assignment", "Ren", "--no-wait")
     expected.append(("reap-orphan-assignment", "t004", None, None))
 
@@ -171,6 +172,11 @@ def _drive_every_mutating_subcommand(sb: Sandbox):
     sb.run("archive", slug)
     expected.append(("archive", None, None, None))
     return expected
+
+
+#: 試行の ID を持つ行を出す subcommand (01c E2 = pull、E3 = done / fail / needs-director / ready-for-verification /
+#: verifying / verify-result)。reset / retire / update (E4) は null のまま
+CONTROLLER_OPS = {"pull", "done", "fail", "needs-director", "ready-for-verification", "verifying", "verify-result"}
 
 
 def test_every_mutating_subcommand_writes_an_audit_row(sb):
@@ -185,8 +191,8 @@ def test_every_mutating_subcommand_writes_an_audit_row(sb):
         assert r["result"] == ("repaired:R-2" if r["op"] == "recover" else
                                "reported:stale_execution_status" if (r["from_status"], r["to_status"]) == (None, None)
                                and r["op"] == "pull" else "ok")      # 01c E2: reserve の手順 0 の報告行
-        # 01c E2: pull の reserve / start の行だけ試行の ID が入る。他の subcommand は E3 / E4 まで null
-        assert (r["execution_id"] is not None) == (r["op"] == "pull"), r
+        # 試行の ID が入るのは Controller を通る subcommand (E2: pull・E3: 報告の 6 コマンド)。他は E4 まで null
+        assert (r["execution_id"] is not None) == (r["op"] in CONTROLLER_OPS), r
         assert re.fullmatch(r"[0-9a-f]{32}", r["txn_id"])
         assert r["ts"].endswith("Z")
         # 書いたパスが 1 つは出る (報告の行 `reported:` は何も書かないので files が空)
@@ -262,19 +268,23 @@ def test_a_failing_audit_log_never_stops_the_transition(sb):
     assert (sb.queue / "assignments" / "Ren").exists()
 
 
-def test_a_refused_command_writes_no_audit_row_and_no_card_change(sb):
-    """`die()` (SystemExit) で抜けたトランザクションは本体の行を書かない (§4)。"""
+def test_a_refused_command_writes_no_body_row_and_no_card_change(sb):
+    """`die()` (SystemExit) で抜けたトランザクションは本体の行を書かない (§4)。01c E3 から、**遷移・照合の拒否**だけは
+    本体の行とは別に `result=refused:<CODE>` の行を 1 つ残す (execution.md §8。カードは 1 バイトも変わらない)。"""
     sb.run("init", "Refuse")
     sb.run("add", "A", "--skills", "bash")
     before_rows = len(sb.audit_rows())
     before_card = sb.card_text("t001")
-    p = sb.run("done", "t001", "x", "--no-pr", "r", expect=None)      # pending でも done は通る (現状を写す)
-    assert p.returncode == 0
-    p2 = sb.run("done", "t001", "x", "--no-pr", "r", expect=2)        # 2 回目: done は done から拒否 (exit 2)
-    rows_after = sb.audit_rows()
-    assert len(rows_after) == before_rows + 1                          # 1 回目の行だけ
-    assert before_card != sb.card_text("t001")
-    assert "受け付けるのは" in p2.stderr
+    p = sb.run("done", "t001", "x", "--no-pr", "r", expect=2)         # pending からの done は拒否 (E3 で狭めた。exit 2)
+    new_rows = sb.audit_rows()[before_rows:]
+    assert [r["result"] for r in new_rows] == ["refused:INVALID_TRANSITION"]     # 拒否の行だけ。本体の `ok` の行は無い
+    assert new_rows[0]["task"] == "t001" and new_rows[0]["to_status"] is None
+    assert before_card == sb.card_text("t001")
+    assert "受け付けるのは" in p.stderr
+    # 陽性対照: 通る遷移 (pull → done) では本体の行が出る
+    sb.run("pull", "--agent", "Ren", "--skills", "bash", "--task", "t001")
+    sb.run("done", "t001", "x", "--no-pr", "r", agent="Ren")
+    assert any(r["op"] == "done" and r["result"] == "ok" for r in sb.audit_rows())
 
 
 # ---------------------------------------------------------------------------

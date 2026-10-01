@@ -54,6 +54,14 @@ cat queue/missions/<slug>/tasks/<task_id>.md
 
 ### Step 4: 判定する
 
+**どの試行を判定するか名指しする**: verifier-dispatcher の指示文に `--execution ex-…` が入っているときは、**その値をそのまま**
+`plan.sh verify-result` に付ける（下の例は省略している）。plan.sh は card の今の試行と照合し、違えば exit 3 で拒否する
+（検証に出した後で Worker が差し戻し・再 pull されていた等。**打ち直さず**、Director に報告する）。同じ判定の再送は成功になる。
+指示文に ID が無いときは付けない（`--execution ""` のような空の指定は拒否される）。
+
+`fail` 判定は**その試行を終わらせ**（`VERIFICATION_REJECTED`）、task を `pending` に戻して worker を手放す。次の pull が新しい試行
+（attempt + 1）を予約する（rework_count が上限に達していれば `needs_human_review`。試行は閉じず人間の判断待ち）。
+
 ```bash
 # 全 check pass、acceptance_criteria 充足
 plan.sh verify-result <task_id> pass --notes '機械 check 全 pass。acceptance_criteria 3/3 充足確認。'
@@ -96,6 +104,6 @@ NOTES_EOF
 
 ## rework 時の対応
 
-`fail` 判定後、Director が Worker に差し戻しを行う。Verifier は rework_count を直接操作しない（plan.sh verify-result fail が自動 increment する）。
+`fail` 判定後、task は `pending` に戻り、次の pull が新しい試行で Worker に割り当てる（01c E3 から。以前は同じ Worker が in_progress のまま直していた）。Verifier は rework_count を直接操作しない（plan.sh verify-result fail が自動 increment する）。
 
 rework 後に再度 `ready_for_verification` に遷移したタスクが自分に割り当たることがある。その場合は前回の Verification セクションを読み、改善されているかを確認してから判定すること。

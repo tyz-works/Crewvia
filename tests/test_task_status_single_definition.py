@@ -300,13 +300,15 @@ def sandbox(tmp_path):
 
 ALL = sorted(lib_task_status.TASK_STATUSES) + ["cancelled"]
 
-#: **設計の写し** (knowledge/state-store.md §1.4 の表)。本物の ACCEPTS_FROM を読み返さず、
-#: 表の言葉をそのまま書く (本物を直すと、ここが赤くなって設計との食い違いを知らせる)。
+#: **設計の写し** (knowledge/execution.md §4.3 の表。01c E3 で狭めた後。S1 までは state-store.md §1.4 の「現状の写し」だった)。
+#: 本物の ACCEPTS_FROM を読み返さず、表の言葉をそのまま書く (本物を直すと、ここが赤くなって設計との食い違いを知らせる)。
 #: 値 = そのコマンドが**拒否する**元の status (`cancelled` = 語彙に無い status の代表)。
+#: done は in_progress だけ・fail は in_progress と needs_director (Director が判断待ちの task を諦める出口)・
+#: verify-result は検証に出ている task (ready_for_verification / verifying / needs_human_review) だけ。
 REFUSED = {
-    "done": {"done", "verified", "failed", "skipped", "needs_director", "cancelled"},
-    "fail": {"done", "verified", "failed", "skipped", "cancelled"},
-    "verify-result": {"done", "verified", "failed", "skipped", "cancelled"},
+    "done": set(ALL) - {"in_progress"},
+    "fail": set(ALL) - {"in_progress", "needs_director"},
+    "verify-result": set(ALL) - {"ready_for_verification", "verifying", "needs_human_review"},
     "needs-director": set(ALL) - {"in_progress"},
     "ready-for-verification": set(ALL) - {"in_progress"},
 }

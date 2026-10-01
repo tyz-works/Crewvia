@@ -125,8 +125,19 @@ root の `CLAUDE.md` から移した、テスト専用の規則。設計と経�
   crash 注入 `test_task_controller_crash_injection.py`（`FAULT_HOOK` の k 番目で fork した子が SIGKILL。点の数の下限を assert。
   回復後に `diagnose` が空 — DETACHED の報告は Director が閉じるまで残るので、その 2 種だけ除く）。helper は `task_controller_helpers.py`。
 - 呼び出し元の集合の固定は `test_task_controller_has_no_callers_yet.py`（名前の出現 + plan.sh が呼ぶ操作 `PLAN_SH_ALLOWED_OPERATIONS`。E2 で plan.sh の pull を足した。
-  E3 / E4 で広げるのは cutover = ユーザー承認の PR）。
+  E3 で報告の 6 コマンドと `--close-execution` を足した。E4 で広げるのは cutover = ユーザー承認の PR）。
 - **長い反復は `timeout` を付け、最初は 2 回で形を確かめてから 20 回**（crash 注入は全体で約 3 分。background で待たない）。
+
+## 報告の 6 コマンドの Controller 化（01c E3 / t012）のテスト
+
+- `tests/test_execution_e3_caller_table.py`（helper は `tests/execution_e3_helpers.py`。`pull_execution_helpers.Box` の上）: 呼び出し元ごとの表（`knowledge/execution.md` §5.2）を**報告コマンド × 名乗りの形**で 1 行ずつ。
+  「何も書かない」は `box.snapshot()`（監査ログを除く queue のバイト列）の一致。拒否は監査ログの `refused:` の行で見る。狭めた遷移は `NARROWED` の表（31 の組）。secret は card の欄・名乗りの値に仕込む。
+- `tests/test_verifier_dispatcher_names_the_attempt.py`: verifier-dispatcher.sh の python ヒアドキュメントから `ast` で関数だけを取り出して走らせる（写しを書かない・tmux に触れない）。
+- `tests/test_plan_sh_execution_flag_rollback.py`: 互換 commit（`git log --all --grep=e3-execution-flag-compat`）の plan.sh を履歴から取り出して `--execution` 付きの報告が通ることを見る。履歴が無い浅い clone は skip。
+- 互換性は `test_plan_sh_compat_s3.py`（**違いは `E3_EXPECTED_DIFFERENCES` の表にしたものだけ**。表と完全一致したときだけ golden に戻して比べる）。scenario は孤児の枠を書き直して、cutover 前の版でも E3 の版でも同じ場面（reap）を作る。
+- **既存テストが E3 で赤くなる型**: (1) 「AGENT_NAME が無い done は枠を撤去しない」を前提に孤児の枠を作っていた → 枠は手で書き直す。(2) 「拒否は監査の行を作らない」→ `refused:` の行を数える。
+  (3) status の表の「設計の写し」→ 狭めた表。(4) `with_lock` の外から Controller を呼ばない構造ガード（LOCKED_HELPERS）に `_retire_caller_slot`。
+- 赤の実証: `python3 tests/red_proof_e3_caller.py`（11 変異・約 6 分）。`red_proof_e2_pull.py` の道具を import する。赤は「狙ったテスト名の assert の失敗」だけ。
 
 ## pull の Controller 化（01c E2 / t008）のテスト
 

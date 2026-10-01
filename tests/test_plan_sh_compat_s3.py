@@ -83,6 +83,36 @@ def without_e2_additions(result):
     }
 
 
+# --- 01c E3 (done / fail / needs-director / ready-for-verification / verify-result を Controller 経由にした) の違い ----
+# **違いは下の表にしたものだけ** (COMPAT-01)。表の `have` と**完全に一致する**ときだけ golden の値に置き換えて比べる
+# (他の違いは置き換えられず、そのまま赤になる)。
+#   1. 遷移を狭めた (execution.md §4.3): done は in_progress だけ・fail は in_progress / needs_director。拒否の文言の
+#      「受け付けるのは: …」の列挙が短くなる (exit 2・何も書かないのは同じ)
+#   2. 遷移・照合の拒否は stderr の**最後の行**に固定形式 `[plan.sh] error_code=<CODE>` を出す (execution.md §4.4)
+#   3. (scenario 側) 枠の撤去は card の worker の枠になった — `plan_sh_compat_scenario.py` が孤児の枠を書き直して同じ場面を作る
+E3_EXPECTED_DIFFERENCES = {
+    "done (already done)": {
+        "rc": 2, "stdout": "",
+        "stderr": "task 't002': done は status='done' の task には使えません (受け付けるのは: in_progress)\n"
+                  "[plan.sh] error_code=INVALID_TRANSITION\n"},
+    "fail (already failed)": {
+        "rc": 2, "stdout": "",
+        "stderr": "task 't004': fail は status='failed' の task には使えません (受け付けるのは: in_progress, needs_director)\n"
+                  "[plan.sh] error_code=INVALID_TRANSITION\n"},
+}
+
+
+def without_e3_differences(steps, golden_steps):
+    """表にした違いだけを golden の値に戻す (表と完全に一致しなければ戻さない = 赤のまま)。"""
+    out = []
+    for have, want in zip(steps, golden_steps):
+        table = E3_EXPECTED_DIFFERENCES.get(have["cmd"])
+        if table and all(have[k] == v for k, v in table.items()):
+            have = dict(have, stderr=want["stderr"])
+        out.append(have)
+    return out
+
+
 def _run(tmp_path):
     return scenario.run_scenario(REPO, tmp_path)
 
@@ -101,7 +131,7 @@ def test_every_step_matches_the_pre_cutover_output(tmp_path):
     got = without_e2_additions(_run(tmp_path))
     assert len(got["steps"]) == len(GOLDEN["steps"])
     diffs = []
-    for want, have in zip(GOLDEN["steps"], got["steps"]):
+    for want, have in zip(GOLDEN["steps"], without_e3_differences(got["steps"], GOLDEN["steps"])):
         if want != have:
             diffs.append({"step": want["cmd"], "want": want, "have": have})
     assert not diffs, "外から見える挙動が変わった:\n" + json.dumps(diffs, ensure_ascii=False, indent=1)

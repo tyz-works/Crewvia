@@ -77,12 +77,15 @@ def test_the_mentions_in_the_allowed_files_are_not_imports():
                 assert not form.search(line), (rel, line)
 
 
-#: plan.sh が Controller から呼んでよい操作 (E2 = pull だけ。E3 で done / fail / needs-director / ready-for-verification /
-#: verify-result、E4 で reset / retire が足される。足すのは cutover = ユーザー承認の PR)。
-PLAN_SH_ALLOWED_OPERATIONS = {"reserve_task", "start_execution", "fail_execution", "Caller"}
+#: plan.sh が Controller から呼んでよい操作 (E2 = pull の reserve / start / fail。**E3 (t012) で done / fail / needs-director /
+#: ready-for-verification / verifying / verify-result と `update --close-execution`** — `complete_execution` / `mark_task` /
+#: `abandon_detached_execution` と、名乗り (`Caller` / `NO_CALLER`)・冪等の判定 (`IDEMPOTENT`) が足された。
+#: E4 で reset / retire が足される。足すのは cutover = ユーザー承認の PR)。
+PLAN_SH_ALLOWED_OPERATIONS = {"reserve_task", "start_execution", "fail_execution", "complete_execution", "mark_task",
+                              "abandon_detached_execution", "Caller", "NO_CALLER", "IDEMPOTENT"}
 
 
-def test_plan_sh_calls_only_the_pull_operations_of_the_controller():
+def test_plan_sh_calls_only_the_allowed_operations_of_the_controller():
     text = (REPO / "scripts" / "plan.sh").read_text()
     used = set(re.findall(r"_CONTROLLER\.(\w+)", text))
     assert used == PLAN_SH_ALLOWED_OPERATIONS, (

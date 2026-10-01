@@ -2247,8 +2247,10 @@ def handle_codex_review(slug, meta, live_state_keys, task_statuses_by_mission):
                     f"[review-refused] task {task_id} (mission={slug}): codex-review は拒否済みです "
                     f"({lib_review_refusal.describe(rec)})。差分が大きいと codex は途中を切り詰め、"
                     f"空の結果を信用できないため、dispatcher は再 spawn しません。"
-                    f"手動差分レビューに切り替え、結果を plan.sh done {task_id} --mission {slug} "
-                    f"で報告してください。codex-review を意図して再試行するなら "
+                    f"手動差分レビューに切り替え、結果を報告してください (task は pending のままなので、"
+                    f"先に plan.sh update {task_id} --status in_progress --reset --mission {slug} で開いてから "
+                    f"plan.sh done {task_id} --mission {slug}。pending のままの done は拒否されます。01c E3)。"
+                    f"codex-review を意図して再試行するなら "
                     f"{_refusal_clear_hint(slug, task_id)} 、PR を分割したなら "
                     f"plan.sh update {task_id} --pr-number <新PR> --mission {slug}。"
                 )

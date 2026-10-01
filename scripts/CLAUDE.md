@@ -77,7 +77,7 @@ lib ごとの**破ってはいけない契約**の要約。理由・経緯・全
   コピーしない。**`failed` の依存は「保留（HELD）」**で、進める出口は Director の `plan.sh release-dep <id> --mission <slug>` だけ。
 - 共有規則に env 停止スイッチを付けない（dispatcher と plan.sh で答えが割れる）。
 
-## Execution + Task Controller（`lib_execution.py` / `lib_task_controller.py`。01c E1 / t004 で作成。**呼び出し元は plan.sh の pull だけ**（E2 / t008））
+## Execution + Task Controller（`lib_execution.py` / `lib_task_controller.py`。01c E1 / t004 で作成。**呼び出し元は plan.sh だけ**: pull（E2 / t008）・done / fail / needs-director / ready-for-verification / verifying / verify-result と `update --close-execution`（E3 / t012））
 
 - `lib_execution.py` = card 1 枚から決まること（`ex-<32 hex>` の形・試行の欄 `EXECUTION_FIELDS`・`attempt_view`（照合・冪等・R-1・
   reserve の手順 0・store-check が呼ぶ**唯一の読み方**）・record の形と card への追従）。`lib_task_controller.py` = 遷移（reserve /
@@ -86,9 +86,9 @@ lib ごとの**破ってはいけない契約**の要約。理由・経緯・全
   import すると循環する）。
 - **domain error は `ControllerError.code`（固定コード）が契約**。文字列の解析を契約にしない。メッセージ・監査行・record には
   コード・位置・識別子だけを出し、card の本文・他の欄・Result・入力の行を出さない（secret を仕込んだテストで固定）。
-- 呼び出し元は E3 / E4 で増える。増やすのは cutover なので、`tests/test_task_controller_has_no_callers_yet.py` の `ALLOWED_MENTIONS` と
+- 呼び出し元は E4（reset / retire）で増える。増やすのは cutover なので、`tests/test_task_controller_has_no_callers_yet.py` の `ALLOWED_MENTIONS` と
   `PLAN_SH_ALLOWED_OPERATIONS`（plan.sh が呼んでよい Controller の操作）を意図して広げる（ユーザー承認が要る PR）。設計は
-  `knowledge/execution.md`（§14 が E1 の実績と戻し方・§15 が E2 の実績と戻し方）。
+  `knowledge/execution.md`（§14 が E1・§15 が E2・§16 が E3 の実績と戻し方）。
 - **pull（E2）の形**: ロック 1（recover → 再開の判定 → 候補選び → `reserve_task`）→ **準備ロック**（`lib_state_store.acquire_prepare_lock`。task ごと・
   LOCK_NB・取れなければ exit 1 で何も書かない）→ ロック外（Taskvia・worktree・`.crewvia-env`）→ ロック 2（`start_execution`、失敗なら
   `fail_execution(WORKSPACE_CREATE_FAILED)`）→ JSON。**start は JSON を出す前**にコミットする（`reserved` ⇔ JSON はまだ誰にも渡っていない。だから
@@ -101,6 +101,17 @@ lib ごとの**破ってはいけない契約**の要約。理由・経緯・全
   Controller の domain error は `[plan.sh] error_code=<CODE>` を stderr の**最後の行**に出す（exit 2 は使わない = idle）。
 - 戻し方: PR revert → `scripts/sync-main-checkout.sh`。新しい欄・record・identity の欄・`.crewvia-env` の 4 行目は残ってよい（旧コードは読まない）。
   reserved のまま残った試行は Director が `update --reset`（`knowledge/execution.md` §15.4）。
+- **報告の 6 コマンド（E3）**: `done` / `fail` / `needs-director` / `ready-for-verification` / `verifying` / `verify-result` は名乗り（`--execution <id>` > env
+  `CREWVIA_EXECUTION_ID`。`_execution_caller` がロックの前に決める）を Controller が card の今の試行と照合する。違えば exit 3（`EXECUTION_NOT_CURRENT` / `NOT_FOUND` /
+  `ALREADY_TERMINAL`）・遷移の拒否は exit 2（表は `lib_task_status.ACCEPTS_FROM` の 1 か所。done は in_progress だけ・fail は in_progress / needs_director・verify-result は検証待ちだけ）・
+  いずれも何も書かず、stderr の**最後の行**は `[plan.sh] error_code=<CODE>`。**空の `--execution ""` / 空の env は exit 1**（名乗りなしに倒さない）。名乗りなしは E3 では通す（E5 で拒否）。
+  ID を名乗った同じ操作の再送は成功（exit 0・何も書かない）。**done / fail は Controller の `dry_run=True` で検査してから**派生値（pr_number の伝播）・証拠の検証に進む。
+  `verify-result fail`（< max）は試行を `VERIFICATION_REJECTED` で終え task を pending に戻す（次の pull が新しい試行）。
+- **plan.sh から Controller を呼ぶときは `_load_task_for_report` を通す**: 読めない card・語彙に無い status は今までどおり exit 2（Controller は `STATE_INVALID` exit 1 にするので、plan.sh の寛容な読み口で今の答えを保つ）。
+  `_controller_die(command, e)` が `ControllerError` を終わり方に写す（固定コード + 識別子だけ）。枠の撤去は Controller が **card の worker の枠**を外し、`_retire_caller_slot` が `AGENT_NAME` の枠の後始末を残す
+  （`with_lock` のコールバックの中だけで呼ぶ。`transition_to_needs_director` のような LOCKED_HELPERS からは呼ばない）。
+- `plan.sh update <id> --close-execution` は Director 用の「閉じる手段」: DETACHED で active な試行（E2 の間に終わった task に残った running 等）を task に触れず `ABANDONED_OUTSIDE_CONTROLLER` で閉じる。
+- 戻し方（E3）: PR revert → sync。**revert 先でも `--execution` が通る互換（commit `e3-execution-flag-compat`・別 PR）を先に merge しておく**（起動済みの Worker・走っている kai-review.sh が付け続ける）。`knowledge/execution.md` §16.4。
 ## Git Policy（`lib_git_policy.py`。01b G2 / t008 で作成、G3 / t012 で呼び出し元を移した）
 
 - task の branch・worktree path・base・PR base を決める唯一の場所（`knowledge/git-policy.md` §2・§3）。**判断だけ**で

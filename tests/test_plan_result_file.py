@@ -311,6 +311,8 @@ def test_needs_director_rejects_unusable_file_and_writes_nothing(sb, label):
 
 def test_verify_result_notes_file(sb):
     in_progress_task(sb)
+    # verify-result は検証に出ている task (ready_for_verification / verifying / needs_human_review) だけ (01c E3。execution.md §4.3)
+    _ok(sb.plan("ready-for-verification", "t001", "--mission", MISSION))
     sentinel = sb.root / "SENTINEL_VR"
     path = _file(sb, "notes.md", f"確認 `touch {sentinel}` $(touch {sentinel})\n".encode())
     _ok(sb.plan("verify-result", "t001", "needs_human_review", "--notes-file", str(path),
@@ -410,5 +412,5 @@ def test_free_text_options_not_in_the_table_are_only_single_line_reasons():
     """本文を持たないと判断した引数の一覧。増えたらここで気付く (表に理由を足すこと)。"""
     text = PLAN_SH.read_text()
     fn = re.search(r"^def cmd_fail\(args\):(.*?)(?=^def )", text, re.M | re.S).group(1)
-    assert set(re.findall(r"'(--[a-z-]+)':\s*'value'", fn)) == {"--mission", "--head", "--no-head"}
+    assert set(re.findall(r"'(--[a-z-]+)':\s*'value'", fn)) == {"--mission", "--head", "--no-head", "--execution"}
     assert set(NOT_BODY) == {"fail"}

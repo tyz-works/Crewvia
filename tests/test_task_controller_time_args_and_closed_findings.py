@@ -14,12 +14,12 @@ Controller の公開関数の全引数 (`inspect.signature` から導く。表�
 | reserve_task | txn / slug / tid | `_require_txn` / `_load` (INVALID_ARGUMENT・TASK_NOT_FOUND) |
 |  | agent / now / id_factory | `_check_agent_arg` / `_check_generation` / 候補 ID の形と衝突 |
 | start_execution | execution_id / git_context / now | 形・照合 / `_check_git_context` / `_check_now` |
-| complete_execution | caller / to_status / meta_updates / body / now | `_check_caller` / 表 / `_check_updates` / `_check_body` / `_check_now` |
-| fail_execution | caller / failure_code / to_status / meta_updates / body / now | 同上 + 表 |
+| complete_execution | caller / to_status / meta_updates / meta_remove / body / now / dry_run | `_check_caller` / 表 / `_check_updates` / `_check_updates` / `_check_body` / `_check_now` / (真偽。書くかどうかだけ) |
+| fail_execution | caller / failure_code / to_status / meta_updates / meta_remove / body / now / dry_run | 同上 + 表 |
 | release_execution | caller / reason_code / to_status / now | `_check_caller` / 表 / 表 / `_check_now` |
 | reset_task | caller / now | `_check_caller` / `_check_now` |
 | abandon_detached_execution | now | `_check_now` |
-| mark_task | caller / command / to_status / meta_updates / body | `_check_caller` / 表 / 表 / `_check_updates` / `_check_body` |
+| mark_task | caller / command / to_status / meta_updates / meta_remove / body | `_check_caller` / 表 / 表 / `_check_updates` / `_check_updates` / `_check_body` |
 | get_execution | queue_dir / slug / execution_id | 形 (EXECUTION_NOT_FOUND / INVALID_ARGUMENT)。読むだけ |
 """
 
@@ -41,12 +41,14 @@ X = h.xid(1)
 _COVERED = {
     "reserve_task": {"txn", "slug", "tid", "agent", "now", "id_factory", "foreign_slot_checked"},
     "start_execution": {"txn", "slug", "tid", "execution_id", "git_context", "now"},
-    "complete_execution": {"txn", "slug", "tid", "caller", "to_status", "meta_updates", "body", "now"},
-    "fail_execution": {"txn", "slug", "tid", "caller", "failure_code", "to_status", "meta_updates", "body", "now"},
+    "complete_execution": {"txn", "slug", "tid", "caller", "to_status", "meta_updates", "meta_remove", "body", "now",
+                           "dry_run"},
+    "fail_execution": {"txn", "slug", "tid", "caller", "failure_code", "to_status", "meta_updates", "meta_remove", "body",
+                       "now", "dry_run"},
     "release_execution": {"txn", "slug", "tid", "caller", "reason_code", "to_status", "now"},
     "reset_task": {"txn", "slug", "tid", "caller", "now"},
     "abandon_detached_execution": {"txn", "slug", "tid", "now"},
-    "mark_task": {"txn", "slug", "tid", "caller", "command", "to_status", "meta_updates", "body"},
+    "mark_task": {"txn", "slug", "tid", "caller", "command", "to_status", "meta_updates", "meta_remove", "body"},
     "get_execution": {"queue_dir", "slug", "execution_id"},
 }
 

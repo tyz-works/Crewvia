@@ -379,7 +379,8 @@ def test_random_crash_injection_converges_20_times(tmp_path):
         repaired += sum(1 for r in box.audit_rows() if str(r["result"]).startswith("repaired:"))
         # 回復の行は固定の形だけ (Result・理由の本文は出ない)
         for r in box.audit_rows():
-            assert r["result"] == "ok" or r["result"].startswith(("repaired:", "reported:")), r
+            # 01c E3: 落ちた done が既にコミットしていた後の done の再実行は、遷移の拒否の行 (`refused:`。何も書かない) を残す
+            assert r["result"] == "ok" or r["result"].startswith(("repaired:", "reported:", "refused:")), r
     assert repaired >= 1, "20 回のどこでも回復が走っていない — 場面の選び方が空回りしている"
 
 
@@ -661,7 +662,9 @@ def test_recovery_removes_an_orphan_slot_that_points_into_the_archive(tmp_path):
     """Director が手で退避した「通常 Worker の孤児 assignment」(done 後も残った・退避された mission の task を指す)。
     枠が指す card を missions/ に見つけられなくても、archive/ の card が決着済みなら R-2 が消す。"""
     box = seed_running(tmp_path / "s", tasks=1)
-    box.run("done", "t001", "x", "--no-pr", "x")                      # AGENT_NAME 無し = 枠を撤去しない
+    box.run("done", "t001", "x", "--no-pr", "x")                      # 01c E3: AGENT_NAME が無くても card の worker (Ren) の枠が外れる
+    assert box.slots() == {}
+    (box.queue / "assignments" / "Ren").write_text(f"{box.slug}:t001\n")   # done の後に残った枠 (旧コード・回復前) を再現する
     assert box.slots() == {"Ren": f"{box.slug}:t001"}
     slug = box.slug
     box.run("archive", slug)

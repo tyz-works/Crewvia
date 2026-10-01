@@ -80,7 +80,8 @@ def _called_names(fn: ast.FunctionDef) -> set[str]:
 
 
 def _terminal_status_writers(tree: ast.Module) -> set[str]:
-    """`meta['status'] = 'done' | 'failed'` を **定数で** 書く関数の名前。
+    """`meta['status'] = 'done' | 'failed'` を **定数で** 書く関数の名前。01c E3 から done / fail は status を Controller に書かせる
+    (`complete_execution(.., to_status='done')` / `fail_execution(.., to_status='failed')`) ので、その呼び出しも書き手として数える。
 
     `verified` (Verifier の判定) / `skipped` は Worker の結末報告ではないので
     対象外。`update --status` は変数で書く (人間の手作業。cmd_update の docstring)。
@@ -88,6 +89,12 @@ def _terminal_status_writers(tree: ast.Module) -> set[str]:
     writers: set[str] = set()
     for fn in _functions(tree).values():
         for node in ast.walk(fn):
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                    and node.func.attr in {"complete_execution", "fail_execution"}):
+                for kw in node.keywords:
+                    if (kw.arg == "to_status" and isinstance(kw.value, ast.Constant)
+                            and kw.value.value in {"done", "failed"}):
+                        writers.add(fn.name)
             if not isinstance(node, ast.Assign):
                 continue
             for tgt in node.targets:

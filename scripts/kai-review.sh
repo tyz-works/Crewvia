@@ -114,6 +114,9 @@ fi
 
 # AGENT_NAME を export しておくと plan.sh done が assignment file を掃除できる
 export AGENT_NAME="$AGENT"
+# 名乗りは**この実行の pull の JSON から**だけ取る (EXEC_ARGS)。親 shell から継いだ別 task の ID を名乗って
+# 自分の done / needs-director が EXECUTION_NOT_CURRENT で拒否されないよう、env の名乗りは捨てる (execution.md §5.2)。
+unset CREWVIA_EXECUTION_ID
 
 _info "Starting review: PR#${PR_NUM} task=${TASK_ID} agent=${AGENT} model=${MODEL}"
 
@@ -154,6 +157,10 @@ fi
 #   何を呼ぶはずだったかを stdout に表示するだけにする (F6, PR#180)。
 # fail_needs_director: エラーログ + needs-director + exit 1。スクリプト自体が
 #   完走できなかった failure path 用。
+# EXEC_ARGS: pull の JSON から取った今の試行の名乗り (`--execution <id>`)。pull しない経路 (--skip-pull・dry-run) と、JSON に
+# execution_id が無い plan.sh (E2 より前) では空 = 名乗らない (E3 は名乗りなしを拒否しない。execution.md §5.2 / §5.4)。
+EXEC_ARGS=()
+
 call_needs_director() {
   if [[ $DRY_RUN -eq 1 ]]; then
     # P3 fix (PR#180 Seo review): 実呼び出し (下の行) には `--` 区切りが無いため、
@@ -162,7 +169,7 @@ call_needs_director() {
     _info "[DRY-RUN] would call: plan.sh needs-director ${TASK_ID} ${MISSION_SLUG:+--mission ${MISSION_SLUG} }${1}"
     return 0
   fi
-  "$PLAN_SH" needs-director "$TASK_ID" ${MISSION_SLUG:+--mission "$MISSION_SLUG"} "$1"
+  "$PLAN_SH" needs-director "$TASK_ID" ${MISSION_SLUG:+--mission "$MISSION_SLUG"} ${EXEC_ARGS[@]+"${EXEC_ARGS[@]}"} "$1"
 }
 
 fail_needs_director() {
@@ -227,13 +234,23 @@ if [[ $SKIP_PULL -eq 0 && $DRY_RUN -eq 0 ]]; then
   if [[ -n "$MISSION_SLUG" ]]; then
     PULL_ARGS+=(--mission "$MISSION_SLUG")
   fi
-  # plan.sh pull は結果を stdout に JSON で吐くが、ここでは status/assignment 更新が
-  # 主目的なので出力は捨てる。ただし失敗時は stderr が見える方が良いので tee はしない。
+  # plan.sh pull は結果を stdout に JSON で吐く。**捨てない**: `execution_id` を取り出して done / needs-director に
+  # `--execution` で渡す (今の試行を名乗る。違う試行なら plan.sh が拒否する。execution.md §5.4)。JSON が読めない・欄が
+  # 無い (E2 より前の plan.sh) ときは名乗らない。失敗時は stderr が見える方が良いので tee はしない。
   # (task がまだ in_progress に遷移できていない = needs-director を打っても plan.sh 側で
   #  弾かれる可能性が高いため、ここは元のまま plain exit とする)
-  if ! "$PLAN_SH" "${PULL_ARGS[@]}" >/dev/null; then
+  if ! PULL_JSON="$("$PLAN_SH" "${PULL_ARGS[@]}")"; then
     _error "plan.sh pull failed for task ${TASK_ID} — aborting review"
     exit 1
+  fi
+  PULL_EXECUTION_ID="$(printf '%s' "$PULL_JSON" | python3 -c 'import json,sys
+try:
+    v = json.load(sys.stdin).get("execution_id")
+except Exception:
+    v = None
+print(v if isinstance(v, str) else "")' 2>/dev/null || true)"
+  if [[ -n "$PULL_EXECUTION_ID" ]]; then
+    EXEC_ARGS=(--execution "$PULL_EXECUTION_ID")
   fi
 elif [[ $DRY_RUN -eq 1 ]]; then
   _info "DRY_RUN=1: skipping plan.sh pull (no writes to plan.sh in dry-run mode)"
@@ -709,7 +726,7 @@ elif [[ $NEEDS_FIX -eq 1 ]]; then
   call_needs_director "$NEEDS_FIX_MSG"
 else
   _info "Review passed (structured signal confirmed safe: no P0-P2 findings)"
-  "$PLAN_SH" done "$TASK_ID" ${MISSION_SLUG:+--mission "$MISSION_SLUG"} "$DONE_MSG"
+  "$PLAN_SH" done "$TASK_ID" ${MISSION_SLUG:+--mission "$MISSION_SLUG"} ${EXEC_ARGS[@]+"${EXEC_ARGS[@]}"} "$DONE_MSG"
 fi
 
 _info "Review complete."

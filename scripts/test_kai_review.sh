@@ -1067,6 +1067,60 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# 01c E3 (t012): kai-review.sh は plan.sh pull の JSON を捨てず、`execution_id` を done / needs-director に
+# `--execution` で渡す (execution.md §5.4)。pull する経路 (--skip-pull なし) で、card の今の試行を名乗って
+# 通ったこと (監査行の caller_check=verified) と、card の試行が閉じたことを実 plan.sh で確かめる。
+# ---------------------------------------------------------------------------
+audit_row_has() {
+  # audit_row_has <task> <op> <fragment>: queue/audit の行のうち task と op が一致する行に fragment があるか
+  local task="$1" op="$2" frag="$3"
+  cat "$QUEUE"/audit/transitions-*.jsonl 2>/dev/null | grep "\"task\": \"$task\"" | grep "\"op\": \"$op\"" | grep -q -- "$frag"
+}
+
+echo ""
+echo "--- E3: pull の JSON の execution_id を done に渡す (実行系) → caller_check=verified・試行が completed になる ---"
+write_task t240 "e3 kai names the attempt on done"
+FAKE_GH_HEAD_BRANCH="feature-branch" FAKE_CODEX_FIXTURE="$FIXTURES_DIR/real_json_clean.txt" \
+  run_kai --pr 1 --task t240 --mission "$MISSION_SLUG" > "$TMPDIR_TEST/t240.out" 2>&1
+rc240=$?
+st240="$(task_status t240)"
+if [[ $rc240 -eq 0 && "$st240" == "done" ]] \
+   && audit_row_has t240 done '"caller_check": "verified"' \
+   && grep -q '^execution_status: completed' "$TASKS_DIR/t240.md" && grep -q '^execution_end_code: DONE' "$TASKS_DIR/t240.md"; then
+  pass "pull の JSON の execution_id を done に渡す → caller_check=verified・試行 completed / DONE"
+else
+  fail "E3: kai-review.sh should name the attempt on done — rc=$rc240 status=$st240 (see $TMPDIR_TEST/t240.out)"
+fi
+
+echo ""
+echo "--- E3: pull の JSON の execution_id を needs-director に渡す (実行系) → caller_check=verified・試行が NEEDS_DIRECTOR で failed ---"
+write_task t241 "e3 kai names the attempt on needs-director"
+FAKE_GH_HEAD_BRANCH="feature-branch" FAKE_CODEX_FIXTURE="$FIXTURES_DIR/real_json_findings.txt" \
+  run_kai --pr 1 --task t241 --mission "$MISSION_SLUG" > "$TMPDIR_TEST/t241.out" 2>&1
+rc241=$?
+st241="$(task_status t241)"
+if [[ $rc241 -eq 0 && "$st241" == "needs_director" ]] \
+   && audit_row_has t241 needs-director '"caller_check": "verified"' \
+   && grep -q '^execution_end_code: NEEDS_DIRECTOR' "$TASKS_DIR/t241.md"; then
+  pass "pull の JSON の execution_id を needs-director に渡す → caller_check=verified・試行 failed / NEEDS_DIRECTOR"
+else
+  fail "E3: kai-review.sh should name the attempt on needs-director — rc=$rc241 status=$st241 (see $TMPDIR_TEST/t241.out)"
+fi
+
+echo ""
+echo "--- E3: 親 shell から継いだ別の task の CREWVIA_EXECUTION_ID を名乗らない (env の名乗りは捨てる) ---"
+write_task t242 "e3 kai drops an inherited execution id"
+CREWVIA_EXECUTION_ID="ex-00000000000000000000000000000000" \
+FAKE_GH_HEAD_BRANCH="feature-branch" FAKE_CODEX_FIXTURE="$FIXTURES_DIR/real_json_clean.txt" \
+  run_kai --pr 1 --task t242 --mission "$MISSION_SLUG" > "$TMPDIR_TEST/t242.out" 2>&1
+rc242=$?
+if [[ $rc242 -eq 0 && "$(task_status t242)" == "done" ]] && audit_row_has t242 done '"caller_check": "verified"'; then
+  pass "継いだ CREWVIA_EXECUTION_ID は捨てられ、この実行の pull の ID で done が通る"
+else
+  fail "E3: an inherited CREWVIA_EXECUTION_ID must not be presented by kai-review.sh — rc=$rc242 (see $TMPDIR_TEST/t242.out)"
+fi
+
+# ---------------------------------------------------------------------------
 # F-A (t007, Seo 指摘): [P#] タグ抽出が出力全体への無アンカー grep だったため、
 # レビュー対象の diff/コードが文字列 "[P3]" 等を含んでいて codex がそれを
 # 地の文で引用しただけで HAD_SIGNAL=1 が立ち、同じ出力中の散文 critical

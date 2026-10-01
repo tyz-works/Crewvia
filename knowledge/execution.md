@@ -690,8 +690,14 @@ start の CAS は「試行がまだ reserved か」しか言えず、「他の p
   外す)。lib_state_store.py:1609-1616 の「queue/.lock が最も外側」は S5 の小さな共有ファイルの規則で、準備ロックはそれより外の
   1 段として足す (E2 でその docstring に追記する)。LOCK_NB なので、仮に逆順で取るコードが入っても待ちの輪 (deadlock) にはならず
   exit 1 になる。
-- **古いロックが残らない**: flock は持ち主のプロセスが死ねば kernel が外す。準備中に殺された pull の後は、次の再 pull が取れて
+- **古いロックが残らない**: flock は持ち主が死ねば kernel が外す。準備中に殺された pull の後は、次の再 pull が取れて
   再開できる (N8 の経路のまま)。ファイルの有無ではなく flock で判断するので、残ったファイルは意味を持たない。
+  **ただし flock は「開いたファイル記述」に付く**: 準備の subprocess (worktree を作る helper・`git rev-parse`) に記述子を渡して
+  (`PrepareLock.fileno()` → `subprocess.run(pass_fds=...)`) あるので、**python だけが SIGKILL されても、子孫が記述子を持っている間は
+  ロックが外れない** (t031 / Codex P2。渡していなかった間は、親だけの kill で子孫が排他の外で動き続け、再試行が別の helper を同時に走らせた)。
+  子孫が終われば kernel が外す。親だけが死んで子孫が生きている間の再 pull は exit 1「同じ予約の pull が進行中」(`TASK_ALREADY_RESERVED`・何も書かない)。
+  残る限界: helper の下で detach する子孫 (例: git の自動 gc のデーモン化) も記述子を持ち続けるので、その間は再 pull が待たされる
+  (fail closed。外す手段は無く、子孫が終わるのを待つ)。
 - **network をロックの中に入れない (§14-15)** に当たらない: §14-15 は queue/.lock の話で、準備ロックは同じ task の pull だけを
   止める (他の task・他のコマンドは止めない)。
 - 捨てた案: pull ごとの nonce を card に書き、start / G1 の CAS を「最後に再開した pull だけ」にする。古い側は書けなくなるが、
@@ -1131,3 +1137,135 @@ t023 と t024 で P1 が続けて「正本に無い値」「回復の範囲が�
 | `get_execution` | `STATE_INVALID` | 同左 | 同左 | 例外で落ちない |
 | diagnose | `reported:execution_record_malformed` | 同左 | 同左 | 他の task の検査を続ける |
 | recover (R-5) | 上書きしない・報告 | 同左 | 同左 | 例外なし |
+
+
+---
+
+## 15. E2 の実績 (t008): pull が Controller の最初の呼び出し元になった
+
+**これは cutover** (本番の挙動が変わる。merge 前にユーザー承認 = t011)。`plan.sh pull` だけが `lib_task_controller` を呼ぶ
+(`reserve_task` / `start_execution` / `fail_execution`。`tests/test_task_controller_has_no_callers_yet.py` が集合を固定)。
+dispatcher の busy / idle 判定 (`queue/assignments/<agent>` の有無・本文 `<slug>:<tid>`) は変えていない (COMPAT-02)。
+
+### 15.1 pull の形 (§6 のとおり。実装した順序)
+
+```text
+ロック 1: recover → (--task なしなら) 自分の予約済みの card を探す → 候補選び → reserve_task
+          または 再開 (_resume_reserved: 枠を card に合わせるだけ。attempt は増やさない)
+準備ロック: acquire_prepare_lock (LOCK_EX|LOCK_NB。取れなければ exit 1・何も書かない) → card を読み直し (_pull_cas_ok)
+ロック外: Taskvia → worktree (W0〜W7) → .crewvia-env (4 行目に CREWVIA_EXECUTION_ID) → git rev-parse HEAD   [準備ロックを持ったまま]
+ロック 2: recover → _pull_cas_ok → start_execution (git の文脈つき)。外れたら何も書かず exit 1 (JSON なし)
+          worktree / env の失敗なら _pull_cas_ok → fail_execution(WORKSPACE_CREATE_FAILED) + needs_director (G1)
+準備ロックを外す → JSON (今までの欄 + execution_id + attempt)
+```
+
+- **監査行**: reserve の行 (`op=pull`・`pending → in_progress`・`execution_id`) と start の行 (`in_progress → in_progress`・
+  `caller_check=verified`) の 2 行 (今までは 1 行)。再開は枠を公開し直したときだけ 1 行 (何も書かないときは 0 行)。
+- **exit code**: pull の domain error は `EXECUTION_NOT_FOUND` / `NOT_CURRENT` / `ALREADY_TERMINAL` だけ 3、他は 1。**2 にしない** (idle)。
+  stderr の最後の行 `[plan.sh] error_code=<CODE>` (`TASK_ALREADY_RESERVED` / `STATE_INVALID` 等)。`--task` の既存の「already in_progress」文言も
+  この行を付けた (文言は変えていない)。
+- **`.crewvia-env`**: 今までの 3 行 + 4 行目 `export CREWVIA_EXECUTION_ID=ex-…` (**必須にしない**。読む側は無くても動く。名乗り = 照合の入力で、
+  card には書かない)。`PR_BASE` は出さない (git-policy.md §5 のまま)。
+- **record の `git`**: branch (Resolver) / pr_base (Resolver) / worktree / `head_at_start` (`git rev-parse HEAD`)。base は観測 (`git show-ref`) が
+  要るので記録しない (判断に使わない欄。None)。`target_dir` の task は worktree が無いので git の文脈なし。
+- **`task_slug`**: 最初の reserve が card に固定し、再開・以後の reserve はその値を使う。plan.sh の `_slugify` のコピーは消した
+  (式の置き場は `lib_execution.slugify_title` の 1 か所。E1 の単体テストは「plan.sh に式が無い」ことを固定する)。
+- **O2**: `lib_task_controller._check_generation` は世代の形に加えて**時刻として読めること** (watchdog の `parse_iso_epoch` と同じ読み方)
+  を要求する。`'yesterday'` は世代の形に合うが idle 時計の起点にならない。pull は今までどおり `now_generation()` (µs 精度の UTC)。
+
+### 15.2 決定
+
+1. **O1 (E1 QA): 「reserve / 再開が自分の古い枠を上書きする」を採る。R-1 に「execution_id の食い違う identity を作り直す」は足さない。**
+   - 状態: card は新しい Y・枠 (assignment + identity) は同じ task の前の試行 X のまま。R-1 は枠が**無い**ときだけ作り直すので
+     `reported:generation_mismatch` が出続け、reserve の再送は `TASK_ALREADY_RESERVED` (E1 QA が 240/240 で再現)。
+   - 採った規則: 再開 (`_resume_reserved`。同じ Worker の再 pull) が、**card の持ち主 (自分) の試行 Y で枠を公開し直す**
+     (`classify_assignment` が ABSENT / SUCCESSOR のとき `publish_assignment(.., execution_id=Y)`)。別の task を指す枠・読めない枠は上書きしない
+     (`agent_busy_elsewhere` と同じ exit 3)。**card が正本・枠は projection** なので、持ち主が card から公開し直すのは回復の向きと同じ。
+   - 捨てた案 (R-1 の拡張): R-1 は名指しの card に対して**本体より前**に走る回復で、他の Worker の取り直しの後でも走る。食い違う identity を
+     「card の試行で作り直す」と、別の Worker が後任として公開した枠を巻き戻しうる (R-1 は所有の証拠 = card の worker が自分、を読むが、
+     reserved の窓では所有が移った直後と区別できない)。再開は**持ち主自身**が自分の再 pull で打つので、この曖昧さが無い。
+   - 補足: plan.sh の pull は reserve の**前**に回復 (R-2) が走り、pending の card を指す孤児の古い枠を消す。だから O1 の状態は
+     「reserve の card の後に古い枠が現れる」とき (rollback 中の旧書き手・Controller を直接呼ぶ側) にだけできる。テストはその状態を
+     card の後ろの全書き込み点で作って再 pull の収束を見る。
+2. **CAS は新しい欄と今までの欄の AND (Codex 3 巡目 P1)**: `_pull_cas_ok` = `in_progress` ∧ worker 一致 ∧ `started_at` 一致 ∧
+   `current_execution_id == X` ∧ `execution_status == reserved`。旧形式の `update --reset` は status / worker / started_at だけを動かし
+   execution の欄を更新しない (E4 まで)。`attempt_view` の DETACHED (b) が「status が holding でない」ケースを拾うので、reset だけなら
+   Controller の照合が先に拒否するが、**reset の後に Director が `update --status in_progress` で card を開き直す**と status は holding・
+   欄は X / reserved のまま ACTIVE に戻る — このときは AND の今までの欄 (worker 空・`started_at` null) だけが拒否する (赤の実証 E05)。
+   start (`_pull_start`) と G1 (`_pull_worktree_failed`) が同じ関数を通る (コピーしない)。
+3. **準備ロック (§6.1)**: `lib_state_store.acquire_prepare_lock(queue_dir, slug, tid)` (`PrepareLock`)。`queue/missions/<slug>/executions/<tid>.prepare.lock`
+   の flock (LOCK_EX|LOCK_NB)。**ロックの順序**: 準備ロック → `queue/.lock` → S5 の小さな共有ファイルのロック。`queue/.lock` を握ったまま
+   取ろうとすると `NestedTransaction` (入れ子の構造ガード)。`diagnose` は `executions/` の `ex-<32hex>.json` だけを record として数えるので、
+   `.prepare.lock` は走査に出ない。
+4. **再開の対象 (`_is_reserved_by`)**: in_progress ∧ worker == 自分 ∧ 試行が ACTIVE ∧ `execution_status == reserved`。**`running` は再開しない**
+   (JSON が渡った可能性)・DETACHED は再開しない・試行の欄が壊れた card は対象にしない。`--task` なしの pull は候補選びの**前**に探し、
+   2 枚以上は exit 3 (どれか決められない)。target_dir が違う card は再開しない (今の候補選びと同じ比較)。
+5. **進行中の legacy card (欄なし)**: 書き換えない。`pull --task` は今どおり exit 1「already in_progress」・`done` は今どおり通る
+   (`test_a_legacy_in_progress_card_is_not_rewritten_and_pull_still_refuses_it`)。
+6. **kai-review.sh**: 変更なし。`pull --task <id> --agent Kai-codex --skills codex-review [--mission]` は同じ `cmd_pull` を通り、JSON を捨てても
+   card・record・枠は揃う (`test_kai_review_style_pull_discarding_the_json_goes_through_the_same_path`)。dispatcher の二重着弾は今どおり exit 1。
+   ID を `done` / `needs-director` に渡す準備 (JSON を捨てない) は E3。
+7. **Controller が今の pull より厳しかった 2 点を、今の pull に合わせた (既存テストが全 pytest で見つけた)**:
+   - **孤児の枠の上書き**: 今の pull は、別の task を指す枠が**孤児** (手放し済み・pending・無い mission を指す) なら上書きする
+     (`agent_busy_elsewhere` が判定。`tests/test_assignment_routing.py`)。E1 の `reserve_task` は別の task を指す枠を一律 `TASK_NOT_ELIGIBLE` にしていた
+     (孤児かどうかは**他の card の status** で決まり、Controller は他の card を読まない)。**`reserve_task(foreign_slot_checked=True)`**
+     (既定 False。呼び出し側が孤児と確かめ済みのときだけ) を足し、pull は `agent_busy_elsewhere` を通した後なので True を渡す。
+     読めない枠・生きている別の task を指す枠は、`agent_busy_elsewhere` が先に exit 3 で拒否する (今と同じ)。
+   - **worker 名の範囲**: E1 は agent 名を `_safe_token` (英数字・`_.-`) に絞っていたが、今の pull は枠のファイル名として使える名前 (非 ASCII の
+     名前も) を受け付ける。空白・制御文字 (card の frontmatter・identity・record を壊しうる) だけを拒否する規則に緩めた
+     (`_check_agent_arg`。名前の中身は監査ログに出ない: `actor` は門が `unknown` にする)。名前の使い回しは変えない。
+   - この型 (**新しい lib が今のコードより厳しい**) の掃除: reserve の拒否条件を 1 つずつ今の pull と突き合わせた。status (`ACCEPTS_FROM_NARROWED['pull']` と
+     `ACCEPTS_FROM['pull']` は同じ `{pending}`)・agent 名 (上)・枠 (上)・`now` の形 (pull は常に時刻形)・試行の欄の整合 (欄を持つ card だけ。本番の
+     queue / archive に `task_slug` / `execution_*` を持つ card は 0 枚 — `grep -rlE '^(task_slug|execution_[a-z_]+|current_execution_id):' queue/missions queue/archive`)・
+     mission slug / task id の形 (card の列挙が既に `tNNN` と slug を要る)。
+
+### 15.3 検証
+
+- 互換性: `tests/test_plan_sh_compat_s3.py` を、E2 が足した 4 つ (pull の JSON の 2 欄・card の試行の欄・`executions/`・identity の `execution_id`) を
+  **取り除いた**出力で、cutover 前の golden と比べる (task の選択・exit code・stderr・assignment の本文・card の他の欄・他の subcommand の出力は
+  1 バイトも変わらない。取り除く物が実際にあることも別のテストで固定)。`.crewvia-env` は `test_git_policy_pull_and_pr_base_cutover.py` が「前の 3 行 + 4 行目」を固定。
+- `tests/test_pull_execution_e2.py` (45 件): ID の置き場の一致・並行 pull (2 形 × 20 回)・準備ロック (§6.1 の E2 項目 1〜4・6)・
+  reserve〜start の各点の SIGKILL (段階 4 点 × 再 pull 2 形 + lib の書き込み点の全点)・CAS (旧形式の reset / Director の開き直し / 後任の取り直し)・
+  O1・O2・legacy・secret。`tests/test_pull_execution_e2_rollback.py`: 旧コード (`505d16b`) の `pull --task` が reserved の card で exit 1・worktree に触れない
+  (§9.5 の表外 5。git の履歴が無い浅い clone では skip)。
+- 赤の実証: `tests/red_proof_e2_pull.py` (E01 冪等化・E02a/b/c ID の発行・E03 二重予約の拒否・E04 準備ロック・E05 CAS・E06 O1・E07 O2・E08 start)。
+  赤は「狙ったテスト名の FAILED」だけ。
+
+### 15.4 戻し方 (E2)
+
+PR を revert し、`scripts/sync-main-checkout.sh` で主 checkout を ff する。**新しい欄・record・identity の欄・`.crewvia-env` の 4 行目は残ってよい**
+(§9.3): 旧コードは card の試行の欄を `dump_yaml` で保持して読まず、`executions/` を読まず、identity の `started_at` だけを比べ、
+次の pull が `.crewvia-env` を 3 行で書き直す。**reserved のまま残った試行** (pull の途中で死んだ後に revert した場合) は、旧コードが
+`pull --task` を「already in_progress」で拒否する (exit 1・worktree に触れない) ので、Director が `plan.sh update <id> --status pending --reset` で戻す
+(今までの「worker が落ちた」と同じ手順)。revert の後にもう一度進める (roll forward) とき、旧コードが取り直した card は `attempt_view` が DETACHED として
+読む (§9.3・§9.5)。env の停止スイッチは付けていない (不変条件 5)。
+
+### 15.5 E3 以降に送るもの
+
+- 名乗り (`CREWVIA_EXECUTION_ID` / `--execution`) を使う照合は E3。pull の JSON の `execution_id` を shell 変数に取り出す手順 (特に `target_dir` の task は
+  `.crewvia-env` が無い) は worker.md に E3 で書く。今の worker.md は `.crewvia-env` の export と再開の手順だけ。
+- `update --reset` / retire が試行を release / fail にするのは E4a。それまで reset は試行を閉じず、次の reserve の手順 0 が閉じる (テストで固定)。
+
+### 15.6 Codex 1 巡目 (t031 / PR #271): 準備ロックを子孫にも持たせる
+
+- **P2**: 準備ロックは python の flock で、記述子は worktree を作る subprocess に渡っていなかった。作成中に python だけが SIGKILL されると、bash / git の子孫は
+  生き残るのに kernel がロックを外し、再試行は同じ予約を再開して**別の helper を同時に走らせる** (作りかけの worktree を見るか `WORKSPACE_CREATE_FAILED`)。
+  t008 の crash テストはプロセスグループごと kill するのでこの形を見逃していた。
+- **修正**: `PrepareLock.fileno()` を `pass_fds` で helper と `git rev-parse` に渡す (flock は開いたファイル記述に付くので、子孫が持っている間は外れない)。
+  捨てた案: 「回復を許す前に子孫が止まっていることを確かめる」 — 子孫を同定する証拠 (pid・起動時刻) を別に持つことになり、pid の使い回しの問題を足す。
+  記述子の継承は kernel が子孫の生死と排他を結ぶので、証拠が要らない。
+- **族ごとの掃除 (pull の中で排他を取った後に起動する subprocess)**:
+
+| subprocess | 排他 | (a) 親だけ kill で排他の外に出るか | (b) 再試行と同時に走るか | 処置 |
+|---|---|---|---|---|
+| `bash -c "source git-helpers.sh && crewvia_create_worktree …"` (plan.sh `cmd_pull`) | 準備ロック | **出ていた** | **走っていた** | 直した (`pass_fds`)。20 回反復のテスト |
+| helper の下の git (`fetch` / `worktree add` / `show-ref` 等) | 準備ロック | helper の子孫なので記述子を継承 → 出ない | 再試行は exit 1 | 同じ修正で足りる (bash / git は継承した記述子を閉じない) |
+| `git -C <worktree> rev-parse HEAD` (`_pull_git_context`) | 準備ロック | 出ていた (短時間・読み取りだけ) | 走りうるが読み取りだけで害なし | 一貫のため `pass_fds` を渡した |
+| Taskvia (`urllib.request.urlopen`。`taskvia_sync_pull`) | 準備ロック | 子プロセスを起こさない (python の中) → 親が死ねば止まる | n/a | 不処置 |
+| ロック 1 / 2 (`queue/.lock`) の中 | `queue/.lock` | subprocess を起こさない (grep `subprocess\.` で pull の経路は上の 2 つだけ) | n/a | 不処置 |
+| task-graph の再生成 (`maybe_refresh_task_graph`) | 自前のロック | python の中・コマンドの最後 | n/a | 不処置 |
+| kai-review.sh の pull | (同じ `cmd_pull`) | 同上 | 同上 | 同じ経路。変更なし |
+| `_resolve_head_commit` の git (`done` / `fail` の経路。pull ではない) | なし | n/a | n/a | 範囲外 |
+
+- テスト: `tests/test_pull_execution_e2_parent_kill.py` (helper stub が `$PPID` = python の pid を残し、**その pid だけ**を SIGKILL。子孫が生きている間に再 pull を
+  打ち、helper が同時に 2 本走らない・exit 1・card 不変、子孫が終わった後は同じ試行を再開、を 20 回)。赤の実証 E09 (`pass_fds` を外す)。

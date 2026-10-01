@@ -108,17 +108,23 @@ def _drive_every_mutating_subcommand(sb: Sandbox):
 
     sb.run("pull", "--agent", "Ren", "--skills", "bash", "--task", "t001")
     expected.append(("pull", "t001", "pending", "in_progress"))
+    expected.append(("pull", "t001", "in_progress", "in_progress"))     # 01c E2: start の行
     sb.run("needs-director", "t001", SECRET_REASON, agent="Ren")
     expected.append(("needs-director", "t001", "in_progress", "needs_director"))
     sb.run("update", "t001", "--reset")
     expected.append(("update", "t001", "needs_director", "pending"))
     sb.run("pull", "--agent", "Ren", "--skills", "bash", "--task", "t001")
+    # 01c E2: 前の試行は (E4 まで) 旧形式の needs-director / reset が閉じないので、reserve の手順 0 が閉じる
+    # (`reported:stale_execution_status` の行。from / to は無い) → reserve の行 → start の行
+    expected.append(("pull", "t001", None, None))
     expected.append(("pull", "t001", "pending", "in_progress"))
+    expected.append(("pull", "t001", "in_progress", "in_progress"))     # 01c E2: start の行
     sb.run("done", "t001", SECRET_RESULT, "--no-pr", "audit test", agent="Ren")
     expected.append(("done", "t001", "in_progress", "done"))
 
     sb.run("pull", "--agent", "Ren", "--skills", "bash", "--task", "t002")
     expected.append(("pull", "t002", "pending", "in_progress"))
+    expected.append(("pull", "t002", "in_progress", "in_progress"))     # 01c E2: start の行
     sb.run("fail", "t002", "--no-head", "audit test", agent="Ren")
     expected.append(("fail", "t002", "in_progress", "failed"))
     sb.run("release-dep", "t003")
@@ -126,6 +132,7 @@ def _drive_every_mutating_subcommand(sb: Sandbox):
 
     sb.run("pull", "--agent", "Ren", "--skills", "bash", "--task", "t003")
     expected.append(("pull", "t003", "pending", "in_progress"))
+    expected.append(("pull", "t003", "in_progress", "in_progress"))     # 01c E2: start の行
     sb.run("ready-for-verification", "t003", agent="Ren")
     expected.append(("ready-for-verification", "t003", "in_progress", "ready_for_verification"))
     sb.run("verifying", "t003", "--verifier", "Wei", agent="verifier-dispatcher")      # S5: verifier-dispatcher の書き込み
@@ -141,6 +148,7 @@ def _drive_every_mutating_subcommand(sb: Sandbox):
     sb.run("pull", "--agent", "Ren", "--skills", "bash", "--task", "t004")
     expected.append(("recover", "t003", "verified", "verified"))
     expected.append(("pull", "t004", "pending", "in_progress"))
+    expected.append(("pull", "t004", "in_progress", "in_progress"))     # 01c E2: start の行
     gen = _field(sb.card_text("t004"), "started_at")
     assert gen
     sb.run("retire", "t004", "--agent", "Ren", "--started-at", gen, "--outcome", "reset", "--no-wait")
@@ -148,7 +156,9 @@ def _drive_every_mutating_subcommand(sb: Sandbox):
 
     # 孤児の assignment: done は AGENT_NAME 無しで打つ (assignment を撤去しない) → reap が撤去する
     sb.run("pull", "--agent", "Ren", "--skills", "bash", "--task", "t004")
+    expected.append(("pull", "t004", None, None))        # 01c E2: 旧形式の retire が閉じなかった前の試行を reserve の手順 0 が閉じる
     expected.append(("pull", "t004", "pending", "in_progress"))
+    expected.append(("pull", "t004", "in_progress", "in_progress"))     # 01c E2: start の行
     sb.run("done", "t004", SECRET_RESULT, "--no-pr", "audit test")
     expected.append(("done", "t004", "in_progress", "done"))
     assert (sb.queue / "assignments" / "Ren").exists()
@@ -171,15 +181,19 @@ def test_every_mutating_subcommand_writes_an_audit_row(sb):
     assert got == expected
 
     for r in rows:
-        assert set(r) == AUDIT_KEYS | ({"detail"} & set(r)), r
-        assert r["result"] == ("repaired:R-2" if r["op"] == "recover" else "ok")
-        assert r["execution_id"] is None                 # 01c が埋める。01a では null 固定
+        assert set(r) == AUDIT_KEYS | ({"detail", "caller_check"} & set(r)), r
+        assert r["result"] == ("repaired:R-2" if r["op"] == "recover" else
+                               "reported:stale_execution_status" if (r["from_status"], r["to_status"]) == (None, None)
+                               and r["op"] == "pull" else "ok")      # 01c E2: reserve の手順 0 の報告行
+        # 01c E2: pull の reserve / start の行だけ試行の ID が入る。他の subcommand は E3 / E4 まで null
+        assert (r["execution_id"] is not None) == (r["op"] == "pull"), r
         assert re.fullmatch(r"[0-9a-f]{32}", r["txn_id"])
         assert r["ts"].endswith("Z")
-        assert isinstance(r["files"], list) and r["files"], r    # 書いたパスが 1 つは出る
+        # 書いたパスが 1 つは出る (報告の行 `reported:` は何も書かないので files が空)
+        assert isinstance(r["files"], list) and (r["files"] or r["result"].startswith("reported:")), r
         assert all(not os.path.isabs(f) for f in r["files"])
     # pull は generation (card の started_at) を出し、actor は --agent の Worker
-    pulls = [r for r in rows if r["op"] == "pull"]
+    pulls = [r for r in rows if r["op"] == "pull" and r["result"] == "ok"]
     assert pulls and all(r["actor"] == "Ren" and r["generation"] for r in pulls)
     # AGENT_NAME を渡した subcommand の actor はその名前
     assert [r["actor"] for r in rows if r["op"] == "done"][:1] == ["Ren"]

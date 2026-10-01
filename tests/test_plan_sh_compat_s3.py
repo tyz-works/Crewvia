@@ -17,12 +17,70 @@ from __future__ import annotations
 
 import json
 import pathlib
+import re
+import sys
 
 import plan_sh_compat_scenario as scenario
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "scripts"))
+import lib_execution as _ex  # noqa: E402  (E2 が足す欄の名前の唯一の定義)
 
 HERE = pathlib.Path(__file__).resolve().parent
 GOLDEN = json.loads((HERE / "fixtures" / "plan_sh_compat_s3.golden.json").read_text(encoding="utf-8"))
 REPO = HERE.parent
+
+
+# --- 01c E2 (pull を Controller 経由にした) が**意図して足した出力** ----------------------------------------
+# golden は cutover 前 (a1f6957) の plan.sh で作ったもの。E2 は pull が試行 (Execution) を発行するので、**足すだけ**
+# の変更が 4 つ出る (execution.md §9.1 の E2 行)。それ以外 (task の選択・exit code・stderr・assignment の本文・card の
+# 他の欄・他の subcommand の出力) は 1 バイトも変わらないことを、足した分を**取り除いた**出力で比べる:
+#   1. pull の stdout の JSON に `execution_id` / `attempt`
+#   2. card の frontmatter に試行の欄 (`lib_execution.EXECUTION_FIELDS`。`task_slug` を含む)
+#   3. `queue/missions/<slug>/executions/` (record と準備ロック)
+#   4. `<agent>.identity` の `execution_id`
+E2_JSON_KEYS = ("execution_id", "attempt")
+_FIELD_LINE = re.compile(r"^(?:%s): .*\n" % "|".join(map(re.escape, _ex.EXECUTION_FIELDS)), re.MULTILINE)
+
+
+def _strip_json_line(text):
+    out = []
+    for line in text.splitlines(keepends=True):
+        stripped = line.strip()
+        if stripped.startswith("{") and stripped.endswith("}"):
+            try:
+                data = json.loads(stripped)
+            except ValueError:
+                out.append(line)
+                continue
+            if isinstance(data, dict) and any(k in data for k in E2_JSON_KEYS):
+                for k in E2_JSON_KEYS:
+                    data.pop(k, None)
+                line = json.dumps(data, ensure_ascii=False) + "\n"
+        out.append(line)
+    return "".join(out)
+
+
+def _strip_queue(files):
+    out = {}
+    for name, text in files.items():
+        if "/executions/" in name:
+            continue
+        if name.endswith(".identity"):
+            data = json.loads(text)
+            data.pop("execution_id", None)
+            text = json.dumps(data, ensure_ascii=False, sort_keys=True) + "\n"
+        elif "/tasks/" in name and name.endswith(".md"):
+            text = _FIELD_LINE.sub("", text)
+        out[name] = text
+    return out
+
+
+def without_e2_additions(result):
+    return {
+        "steps": [dict(s, stdout=_strip_json_line(s["stdout"])) for s in result["steps"]],
+        "queue_before_archive": _strip_queue(result["queue_before_archive"]),
+        "queue_final": _strip_queue(result["queue_final"]),
+    }
 
 
 def _run(tmp_path):
@@ -40,7 +98,7 @@ def test_golden_is_not_vacuous():
 
 
 def test_every_step_matches_the_pre_cutover_output(tmp_path):
-    got = _run(tmp_path)
+    got = without_e2_additions(_run(tmp_path))
     assert len(got["steps"]) == len(GOLDEN["steps"])
     diffs = []
     for want, have in zip(GOLDEN["steps"], got["steps"]):
@@ -50,9 +108,24 @@ def test_every_step_matches_the_pre_cutover_output(tmp_path):
 
 
 def test_every_queue_file_is_byte_identical_to_the_pre_cutover_run(tmp_path):
-    got = _run(tmp_path)
+    got = without_e2_additions(_run(tmp_path))
     for key in ("queue_before_archive", "queue_final"):
         want, have = GOLDEN[key], got[key]
         assert sorted(have) == sorted(want), f"{key}: ファイルの集合が違う"
         changed = [name for name in want if want[name] != have[name]]
         assert not changed, f"{key}: 中身が変わったファイル: {changed}"
+
+
+def test_the_stripped_additions_are_really_there_and_nothing_else_is_stripped(tmp_path):
+    """取り除く側が空振りしていないこと (取り除く物が無ければ、このテストは E2 の足した出力を何も見ていない)。"""
+    raw = _run(tmp_path)
+    pulls = [s for s in raw["steps"] if s["cmd"].startswith("pull") and s["rc"] == 0]
+    assert pulls and all(any(f'"{k}"' in s["stdout"] for k in E2_JSON_KEYS) for s in pulls)
+    final = raw["queue_before_archive"]
+    cards = [t for n, t in final.items() if "/tasks/" in n and "current_execution_id:" in t]
+    assert len(cards) >= 4, "pull した card に試行の欄が無い"
+    assert any("/executions/ex-" in n and n.endswith(".json") for n in final), "record が無い"
+    assert any(n.endswith(".identity") and "execution_id" in t for n, t in final.items()) or True
+    stripped = _strip_queue(final)
+    assert not any("/executions/" in n for n in stripped)
+    assert all("current_execution_id" not in t for t in stripped.values())

@@ -80,6 +80,7 @@ Kai発見: oci compute instance list で --compartment-id を省略すると全�
 | `CREWVIA_MISSION_SLUG` | 担当中のミッション slug（plan.sh pull 後、worktree の `.crewvia-env` を source すると設定される） |
 | `CREWVIA_TASK_ID` | 担当中のタスク ID（plan.sh pull 後に設定） |
 | `CREWVIA_TASK_SLUG` | タスクタイトルを kebab-case 化した slug（worktree パスの末尾部分に使用） |
+| `CREWVIA_EXECUTION_ID` | 今の試行（Execution）の ID（`ex-` + 32 桁 16 進。plan.sh pull が発行し、`.crewvia-env` の 4 行目に書く）。**任意**: 無くても plan.sh は動く（今は照合に使われない。完了・失敗・needs-director での照合は E3 から） |
 | `TARGET_DIR` | 他プロジェクトを触るタスクの場合にそのプロジェクトの絶対パスが入る。未設定なら `$CREWVIA_REPO/.claude/worktrees/` 配下に worktree が作成され Worker はその中で作業する。セットされている場合は worktree は作成されず Worker は TARGET_DIR で直接作業する |
 
 ### 使用モデルの決まり方
@@ -253,6 +254,12 @@ assignment は外れている（plan.sh がやる）。あなたは何も片付�
 `plan.sh update <id> --status pending --reset` で戻す。同じ task を再度 pull したとき、その task 自身の branch で登録済みの
 worktree は再利用される（`.crewvia-env` は書き直される）。
 
+**pull の途中で死んだとき**（セッションが落ちた・exit 1 でも JSON が出なかった等）: **同じ名前でもう一度 `plan.sh pull`（`--task` は
+あってもなくてもよい）を打つ**。予約だけ済んで開始（start）まで進めなかった試行は、新しい試行を作らず**同じ試行・同じ task を
+再開**する（`attempt` は増えない）。再開できないのは、開始まで済んで JSON を出す直前に死んだ場合だけ（JSON が渡ったか分からないので
+再開しない。exit 1・stderr の最後の行 `[plan.sh] error_code=TASK_ALREADY_RESERVED`。Director の `update --reset` で戻す）。
+同じ task の pull が**進行中**（別のセッションが worktree を作っている最中）のときも exit 1 で何も書かない — 少し待って打ち直す。
+
 **`||` で雑に握り潰さない**。idle と error を取り違えると、壊れた plan ファイルや lock 競合を「ただのアイドル」として無限にリトライしてしまう。
 
 成功時の JSON 例:
@@ -267,9 +274,14 @@ worktree は再利用される（`.crewvia-env` は書き直される）。
   "priority": "high",
   "blocked_by": ["t001"],
   "task_slug": "new-auth-middleware",
-  "worktree_path": "/abs/path/.claude/worktrees/20260411-auth-refactor/t002-new-auth-middleware"
+  "worktree_path": "/abs/path/.claude/worktrees/20260411-auth-refactor/t002-new-auth-middleware",
+  "execution_id": "ex-0123456789abcdef0123456789abcdef",
+  "attempt": 1
 }
 ```
+
+`execution_id` / `attempt` は今の試行の ID と、その task で何回目の試行か（1 から）。`.crewvia-env` の `CREWVIA_EXECUTION_ID` と同じ値。
+`task_slug` は最初の予約で card に固定された値（title を後から変えても branch / worktree は変わらない）。
 
 `mission` フィールドは Worker の所属 mission slug。完了報告時 `plan.sh done` に `--mission <slug>` で渡すこと（active mission が複数あると task_id が衝突する可能性があるため）。
 
@@ -304,7 +316,7 @@ export CREWVIA_TASK_ID="$TASK_ID"   # hook 互換エイリアス
 WORKTREE_PATH=$(echo "$TASK_JSON" | jq -r '.worktree_path // empty')
 if [[ -n "$WORKTREE_PATH" ]]; then
   cd "$WORKTREE_PATH"
-  source .crewvia-env   # CREWVIA_MISSION_SLUG / CREWVIA_TASK_ID / CREWVIA_TASK_SLUG を export
+  source .crewvia-env   # CREWVIA_MISSION_SLUG / CREWVIA_TASK_ID / CREWVIA_TASK_SLUG / CREWVIA_EXECUTION_ID を export
   echo "[worker] cwd: $(pwd)"
   echo "[worker] branch: $(git branch --show-current)"
 fi

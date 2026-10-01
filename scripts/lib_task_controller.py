@@ -36,6 +36,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -193,15 +194,32 @@ def _refuse(txn, code, message, slug, tid, meta, caller=None):
 def _check_agent_arg(agent):
     if agent is None:
         return None
-    problem = store.agent_name_problem(agent)
-    if problem or store._safe_token(agent) is None:        # 識別子の形でない名前は内容とみなす
+    # 枠のファイル名として使えるか (`agent_name_problem`) と、空白・制御文字を含まないこと。名前は worker 名 (ポジション) で
+    # 英数字に限らない: 今の pull は非 ASCII の名前 (例: 日本語の名前) も受け付けるので、`_safe_token` の英数字だけに
+    # 絞らない (COMPAT-01。E2 の cutover で全 pull を止めない)。空白・制御文字 (改行・タブ) は card の frontmatter・
+    # identity・record を壊しうるので拒否する。監査ログの `actor` は門 (`_safe_token`) が `unknown` にするので、名前の中身は
+    # 監査ログに出ない (record の `agent` と card の `worker` は名前そのもの)。
+    if store.agent_name_problem(agent) or re.search(r'[\s\x00-\x1f\x7f]', agent):
         raise _err(ex.INVALID_ARGUMENT, "agent 名が枠のファイル名として使えません")
     return agent
 
 
+def _is_iso_instant(text):
+    """watchdog の `parse_iso_epoch` と同じ読み方 (`Z` → `+00:00`・`datetime.fromisoformat`・タイムゾーン付き) で
+    時刻として読めるか。`started_at` は watchdog の idle 時計の起点でもあるので、時刻でない文字列は通さない (E1 O2)。"""
+    try:
+        parsed = datetime.fromisoformat(text[:-1] + '+00:00' if text.endswith('Z') else text)
+    except ValueError:
+        return False
+    return parsed.tzinfo is not None
+
+
 def _check_generation(now):
-    if not isinstance(now, str) or store._safe_generation(now) is None:
-        raise _err(ex.INVALID_ARGUMENT, "now は世代の形の文字列で指定してください")
+    """`now` (= card の `started_at`・`execution_reserved_at`) は世代の形 **かつ時刻として読める** 文字列だけ。
+    `'yesterday'` は世代の形 (`[A-Za-z0-9:_.+-]{1,64}`) には合うが時刻ではなく、watchdog が idle の起点として
+    読めない (idle 判定が黙って壊れる)。"""
+    if not isinstance(now, str) or store._safe_generation(now) is None or not _is_iso_instant(now):
+        raise _err(ex.INVALID_ARGUMENT, "now は時刻 (ISO 8601。例 2026-10-01T10:00:00.123456Z) の文字列で指定してください")
     return now
 
 
@@ -360,7 +378,7 @@ def _check_task_status(txn, command, slug, tid, meta, caller=None):
 # reserve (pull の 1 つ目のロック)
 # ---------------------------------------------------------------------------
 
-def reserve_task(txn, slug, tid, agent, *, now, id_factory=None):
+def reserve_task(txn, slug, tid, agent, *, now, id_factory=None, foreign_slot_checked=False):
     """pending の task を予約する。pending → in_progress / (なし or terminal) → reserved。
 
     1 トランザクションで: (手順 0: 前の試行 X が card 上で active のまま pending に戻っていたら、Y を発行する**前に** X を
@@ -375,6 +393,11 @@ def reserve_task(txn, slug, tid, agent, *, now, id_factory=None):
     - attempt は card の `execution_count` + 1 (無ければ 1)。同じロックの中で決めるので並行 reserve で重複しない
       (2 本目は status が pending でないので `TASK_ALREADY_RESERVED`)。
     - 依存・skill・target_dir・busy の判定はしない (pull の候補選びの仕事。呼び出し側が先に済ませる)。
+    - `foreign_slot_checked` (既定 False): 呼び出し側が「`agent` の枠が別の task を指していても、それは**孤児** (手放し済みの
+      task・無い mission を指す) で上書きしてよい」と確かめ済みのときだけ True。False なら、別の task を指す枠・読めない枠を
+      `TASK_NOT_ELIGIBLE` で拒否する (孤児かどうかは他の card の status で決まり、Controller は他の card を読まない)。
+      plan.sh の pull は `agent_busy_elsewhere` (card の in_progress と枠の両方・孤児は上書き・読めない枠は拒否) を先に通すので True
+      (今の pull が孤児の枠を上書きする挙動を保つ。COMPAT-02)。
     """
     agent = _check_agent_arg(agent)
     _check_generation(now)
@@ -385,7 +408,7 @@ def reserve_task(txn, slug, tid, agent, *, now, id_factory=None):
             _refuse(txn, ex.TASK_ALREADY_RESERVED, f"{slug}/{tid}: 既に予約・実行中です", slug, tid, meta)
         raise _err(ex.TASK_NOT_ELIGIBLE,
                    f"{slug}/{tid}: status={store._safe_status(status) or '<unknown>'} の task は予約できません", slug, tid)
-    if agent is not None and txn.classify_assignment(agent, slug, tid, None) in (
+    if agent is not None and not foreign_slot_checked and txn.classify_assignment(agent, slug, tid, None) in (
             store.ASSIGN_OTHER_TASK, store.ASSIGN_UNVERIFIABLE):
         raise _err(ex.TASK_NOT_ELIGIBLE, f"{slug}/{tid}: {agent} の枠が別の task を指している (または読めない)", slug, tid)
 

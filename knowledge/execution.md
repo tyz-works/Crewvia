@@ -1100,3 +1100,34 @@ t023 と t024 で P1 が続けて「正本に無い値」「回復の範囲が�
 **戻し方 (E1)**: PR を revert し、`scripts/sync-main-checkout.sh` で主 checkout を ff する。呼び出し元ゼロなので本番の queue・registry・
 デーモンには何も書かれておらず、データの戻しは要らない。lib_state_store の拡張は既定値 (`execution_id` を渡さない) で今とバイトが同じ
 (01a S3 の互換 golden が変わっていないことで確かめる)。
+
+### 14.2 Codex 1 巡目 (PR #270 / t029): 「書いてから失敗する」族と「崩れた record で落ちる」族
+
+- **P2-2 / 族 1**: `reserve_task` は候補の ID の検証 (形・現在の試行との衝突・既存 record との衝突) を、手順 0 の `_abandon` より**前**に終える。
+  `_finish` の `abandon_detached` 経路も、task の遷移の検査を `_abandon` より前に置いた (今の表では RESET に command が無く拒否されないが、
+  表が変わっても「書いてから拒否」にならない)。拒否の**監査行**だけは書いてよい (§8)。それ以外 (card・record・枠・identity) は
+  `tests/test_task_controller_malformed_inputs.py::test_every_refusal_writes_nothing_but_the_audit_row` が全拒否コード (27 場面) で sha256 の一致を見る。
+
+  | 操作 | 最初の書き込み | それより前に終わる検証 |
+  |---|---|---|
+  | reserve | (手順 0 の) `_abandon` か card | agent・now・status・枠の持ち主・**候補 ID** |
+  | start | card | git_context・ID の形・NOT_FOUND / NOT_CURRENT / terminal |
+  | complete / fail / release / reset | `_abandon` か card | 引数・照合・meta_updates・試行の遷移・task の遷移 |
+  | abandon_detached | card | DETACHED かつ active |
+  | mark | card | 引数・照合・task の遷移・meta_updates |
+
+- **P2-1 / 族 2**: record の形の検査は `lib_execution.record_shape_problem` の 1 か所 (必須: execution_id / mission / task / reserved_at (空でない文字列)・
+  attempt (bool でない int)・status (既知の語)・git (dict)。任意: agent / end_code / running_at / ended_at は None か文字列)。
+  `record_problem` (照合・`_write_record`・`_execution_of`) / `get_execution` / diagnose が同じ関数を通る。崩れた record は
+  **card から導く** (`record_from_card`。判断に使わない) か、書き込みでは**上書きせず**報告に回す (`reported:execution_record_identity_mismatch`)。
+  任意欄の**欠け**は健全 (`record.get`)。
+- **P2-3**: diagnose の record 走査は、集合判定 (`status in ACTIVE_STATUSES`) の前に `record_shape_problem` を通し、崩れた record は
+  `reported:execution_record_malformed` (detail は固定コード。値は出さない) にして次の record へ進む (01a S2 の `status: []` と同じ族)。
+
+| 経路 | 欄が欠ける | 型が違う (`[]` / `{}` / int) | 空 | 結果 |
+|---|---|---|---|---|
+| start / complete / fail / 冪等の再送 (`_execution_of`) | card から導く | 同左 | 同左 | 例外なし・record は書き換えない |
+| `_write_record` | 上書きしない | 同左 | 同左 | 報告だけ (R-5 が `identity_mismatch`) |
+| `get_execution` | `STATE_INVALID` | 同左 | 同左 | 例外で落ちない |
+| diagnose | `reported:execution_record_malformed` | 同左 | 同左 | 他の task の検査を続ける |
+| recover (R-5) | 上書きしない・報告 | 同左 | 同左 | 例外なし |

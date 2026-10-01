@@ -1542,6 +1542,11 @@ class _Recovery:
                     continue
                 if got[0] != 'ok':
                     continue
+                if _ex.record_shape_problem(got[1]):
+                    # 欠けた欄・型の違う欄 (`status: []` 等) は集合判定に使わない (unhashable で store-check ごと落ちる)。
+                    # 値は出さず、record の位置 (mission) だけを報告して次の record へ進む
+                    self._emit('reported:execution_record_malformed', slug, detail=_ex.record_shape_problem(got[1]))
+                    continue
                 rec_task = got[1].get('task')
                 if (got[1].get('status') in _ex.ACTIVE_STATUSES and isinstance(rec_task, str)
                         and (slug, rec_task) in status_of_card

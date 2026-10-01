@@ -363,16 +363,17 @@ def reserve_task(txn, slug, tid, agent, *, now, id_factory=None):
             store.ASSIGN_OTHER_TASK, store.ASSIGN_UNVERIFIABLE):
         raise _err(ex.TASK_NOT_ELIGIBLE, f"{slug}/{tid}: {agent} の枠が別の task を指している (または読めない)", slug, tid)
 
-    abandoned = None
-    if _view(meta) == ex.DETACHED and meta['execution_status'] in ex.ACTIVE_STATUSES:
-        abandoned = meta['current_execution_id']
-        meta = _abandon(txn, slug, tid, meta, body, now=None)
-
+    # 候補の ID の検証は**最初の書き込み (手順 0 の `_abandon`) より前**に終える (拒否は何も書かない)
     xid = (id_factory or ex.uuid4_execution_id)()
     if not ex.is_execution_id(xid):
         raise _err(ex.INVALID_ARGUMENT, "id_factory が execution id の形でない値を返しました", slug, tid)
     if xid == meta.get('current_execution_id') or txn.read_execution_record(slug, xid)[0] != 'absent':
         raise _err(ex.INVALID_ARGUMENT, "id_factory が既存の試行と同じ execution id を返しました", slug, tid)
+
+    abandoned = None
+    if _view(meta) == ex.DETACHED and meta['execution_status'] in ex.ACTIVE_STATUSES:
+        abandoned = meta['current_execution_id']
+        meta = _abandon(txn, slug, tid, meta, body, now=None)
 
     previous_status = status
     meta = dict(meta)
@@ -491,6 +492,7 @@ def _finish(txn, slug, tid, meta, body, caller, *, new_status, end_code, to_stat
     if decision == TASK_ONLY:
         if abandon_detached and _view(meta) == ex.DETACHED and meta.get('execution_status') in ex.ACTIVE_STATUSES:
             # 試行は reset の前に Controller の外で手放されていた: RESET ではなく ABANDONED で閉じる (§4.2)
+            _check_task_status(txn, command, slug, tid, meta, caller)           # 書く前に遷移を検査する
             meta = _abandon(txn, slug, tid, meta, body, now=now)
         _check_task_status(txn, command, slug, tid, meta, caller)
         out = dict(meta)
@@ -654,13 +656,8 @@ def get_execution(queue_dir, slug, execution_id):
     if got[0] == 'unreadable':
         raise _err(ex.STATE_INVALID, f"{slug}: record が読めません ({got[1]})", slug, None, execution_id)
     record = got[1]
-    try:
-        ok = (record.get('schema_version') == ex.RECORD_SCHEMA_VERSION and record.get('execution_id') == execution_id
-              and record.get('mission') == slug and record.get('status') in ex.EXECUTION_STATUSES
-              and isinstance(record.get('git'), dict) and isinstance(record.get('attempt'), int)
-              and isinstance(record.get('task'), str) and isinstance(record.get('reserved_at'), str))
-    except Exception:       # noqa: BLE001 — 形が違う record は STATE_INVALID にする (中身は出さない)
-        ok = False
+    ok = (ex.record_shape_problem(record) is None and record.get('execution_id') == execution_id
+          and record.get('mission') == slug)
     if not ok:
         raise _err(ex.STATE_INVALID, f"{slug}: record の形が不正です", slug, None, execution_id)
     return Execution.from_record(record)

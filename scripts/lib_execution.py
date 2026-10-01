@@ -383,16 +383,41 @@ def record_problem(record, meta, mission, task):
     R-5 が触らず報告する。`agent` / `reserved_at` は比べない (card の worker / started_at は null や別の名前になるのが
     正常で、record と食い違って当然。execution.md §1.4)。
     """
-    if not isinstance(record, dict):
-        return 'identity_mismatch'
-    if record.get('schema_version') != RECORD_SCHEMA_VERSION:
+    if record_shape_problem(record):
         return 'identity_mismatch'
     if (record.get('execution_id') != meta['current_execution_id']
             or record.get('attempt') != meta['execution_count']
             or record.get('mission') != mission or record.get('task') != task):
         return 'identity_mismatch'
+    return None
+
+
+def record_shape_problem(record):
+    """record の**形**の検査 (欄の有無と型。値は card と比べない)。`None` (健全) か固定コード `'record_not_object'` /
+    `'record_schema'` / `'record_field_type'`。値は返さない。
+
+    判断・回復・診断のどの経路も、record を読む前にこれを通す: 欠けた欄で KeyError、`status: []` で
+    unhashable の TypeError、を起こさない (崩れた projection は card から導くか finding にする。execution.md §14)。
+    `Execution.from_record` が読む欄 (必須: execution_id / mission / task / attempt / status / reserved_at / git、
+    任意: agent / end_code / running_at / ended_at) がすべて対象。"""
+    if not isinstance(record, dict):
+        return 'record_not_object'
+    if record.get('schema_version') != RECORD_SCHEMA_VERSION:
+        return 'record_schema'
+    for key in ('execution_id', 'mission', 'task', 'reserved_at'):
+        if not isinstance(record.get(key), str) or record[key] == '':       # 空は「欄が無い」と同じ (card から導く)
+            return 'record_field_type'
+    attempt = record.get('attempt')
+    if not isinstance(attempt, int) or isinstance(attempt, bool):
+        return 'record_field_type'
+    status = record.get('status')
+    if not isinstance(status, str) or status not in EXECUTION_STATUSES:
+        return 'record_field_type'
+    for key in ('agent', 'end_code', 'running_at', 'ended_at'):
+        if record.get(key) is not None and not isinstance(record[key], str):
+            return 'record_field_type'
     if not isinstance(record.get('git'), dict):
-        return 'identity_mismatch'
+        return 'record_field_type'
     return None
 
 

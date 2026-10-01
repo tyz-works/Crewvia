@@ -122,7 +122,7 @@ bash scripts/kai-review.sh \
 3. gh pr view <PR#> --json headRefName で head branch 取得
 4. refs/pull/<PR#>/head を fetch し、専用の使い捨て worktree を --detach で作成
    (主 working tree の HEAD は動かさない)
-5. origin/main との diff を自前取得し、stdin で
+5. mission の PR base（`lib_git_policy.py pr-base --mission <slug>`。決められなければ needs-director）との diff を自前取得し、stdin で
    codex exec --output-schema config/kai-review-findings.schema.json -m <model>
    -o <mktemp output file> "<review prompt>" を実行 (t006 以降。旧 `review`
    サブコマンドは使わない)

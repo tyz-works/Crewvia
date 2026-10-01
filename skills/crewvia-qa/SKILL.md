@@ -14,8 +14,21 @@ QA Worker として実装を検証する。**実装者とは別の Worker が担
 ```bash
 # PR・タスク内容を確認
 gh pr view <PR番号> --json title,body,files 2>/dev/null || true
-git diff main...HEAD --name-only
+DIFF_REF="$(plan pr-base --diff-ref)" || { echo "diff の base を決められない。Director に報告して待つ" >&2; exit 1; }
+case "$DIFF_REF" in
+  origin/*)   # crewvia 本体の task。pull の fetch は base_branch しか取らないので、PR base をここで取る
+    # 明示の src:dst で取る。素の `git fetch origin <branch>` は refspec が絞られた clone (--single-branch 等) では
+    # FETCH_HEAD しか更新せず、古い origin/<branch> を読んでしまう
+    git fetch origin "+refs/heads/${DIFF_REF#origin/}:refs/remotes/${DIFF_REF}" \
+      && git rev-parse --verify --quiet "${DIFF_REF}^{commit}" >/dev/null \
+      || { echo "${DIFF_REF} を取れない。Director に報告して待つ" >&2; exit 1; } ;;
+esac          # それ以外 (TARGET_DIR の task は local の main) は何もしない
+git diff "${DIFF_REF}...HEAD" --name-only
 ```
+
+diff の base は `main` と決め打たない。`plan pr-base --diff-ref` が自分の QA task の mission の policy から答える
+（crewvia 本体の task は `origin/<pr_base>`、TARGET_DIR の task は local の `main`）。取れなければ diff を取らず、
+Director に報告して待つ（`main` に倒さない）。
 
 確認すべき観点：
 - **何が変わったか** — 新機能 / バグ修正 / リファクタリング / インフラ変更
@@ -144,8 +157,8 @@ dispatcher が実際にその task を配るか観察したい QA だけは、`-
 ## Step 6: リグレッション確認
 
 ```bash
-# 変更されたファイルから影響範囲を推定
-git diff main...HEAD --name-only
+# 変更されたファイルから影響範囲を推定（DIFF_REF は Step 1 で取ったもの。別の shell なら Step 1 の手順をやり直す）
+git diff "${DIFF_REF:?Step 1 の手順で DIFF_REF を取り直す}...HEAD" --name-only
 ```
 
 変更に関係しない主要な機能を 1〜2 個ピックアップしてスモークテストする。

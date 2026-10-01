@@ -737,3 +737,32 @@ env が無い理由は 3 つある: ① TARGET_DIR の Worker ② G3 前の `.cr
 | worktree path (`task_worktree_path`。repo_root の外に出ない) | `os.path.realpath` + `os.path.commonpath` と、実際に作った後の `git worktree list --porcelain -z` の path | 単体テストで `..`・symlink を含む repo_root・末尾 `/` の有無を入れて、realpath 後に repo_root の下にあることを確かめる。G1 の W0 のテストで、Resolver が出した path と `git worktree list` の path が realpath で一致することを確かめる | G2・G3 |
 | 「登録済みで branch が一致」(§1.3 W2) | `git worktree list --porcelain -z` | 自前で `.git/worktrees/*` を読まない。判定に使うのは porcelain の出力だけ。G1 のテストで W2・W3 (detached / 別 branch)・prunable を実際の git で作る | G1 (t004) |
 | base の選択 (`origin/<base>` があれば remote) | `git show-ref --verify refs/remotes/origin/<base>` | 自前の判定はしない。観測は git に任せ、選ぶ 1 行だけを bash に残す (§3) | G3 |
+
+---
+
+## 12. G1 (t004) の実装記録と戻し方
+
+§1 の設計どおりに実装した。設計との差分だけを書く。
+
+- 実装: `scripts/git-helpers.sh` の `crewvia_create_worktree` (W2 再利用・W3/W4/W5 失敗。失敗は stderr の最後の行に `W<n>:` を出す。
+  stdout は path 1 行のまま) と `scripts/plan.sh` の `_pull_worktree_failed()` / `transition_to_needs_director()`
+  (`needs-director` コマンドと同じ本体を共有)。失敗は 2 つ目のロックで compare-and-set (status=in_progress・同じ worker・
+  この pull が書いた `started_at`) してから書く。外れたら何も書かず exit 1。
+- テスト: `tests/test_pull_worktree_failure_is_not_success.py` (使い捨ての bare origin + clone と本物の helper。W0・W2・W3・W4・W5 の (a) (b) (c)・
+  W6・N2・N6・N7・CAS・再配布なし・`target_dir`)。隔離 fixture は helper の「不在」ではなく stub
+  (`tests/fixtures/git-helpers-stub.sh`) を写す (§1.4)。
+- 族の掃除 (同じ「worktree を作れなかったのに成功」を扱う場所):
+
+  | 場所 | 処置 |
+  |---|---|
+  | `plan.sh pull` の worktree 作成 (N2〜N7) | 直した (B) |
+  | `kai-review.sh` の `plan.sh pull --task` (codex-review も同じ pull を通り worktree を作る) | 不処置。pull が exit 1 なら今も `plan pull failed — aborting review` で止まる。card は needs_director になるので dispatcher は再 spawn しない |
+  | `hooks/pre-tool-use.sh` の編集ガードのコメント | 事実に合わせて直した (「worktree を返すか exit 1」) |
+  | `agents/worker.md` の pull の手順・exit code 表 | 直した (exit 1 で cwd のまま作業しない・`worktree_path` が null になるのは `target_dir` の task だけ) |
+  | `scripts/start.sh` の kickoff 文言 (`worktree_path` が含まれる場合は cd) | 不処置。TARGET_DIR の Worker は null を受ける (範囲外)。crewvia 本体の Worker は exit 1 なら JSON を受けない |
+  | `scripts/test_handoff_path.sh` | 不処置。本物の helper の stdout が path であることだけを使う (契約は不変) |
+  | `crewvia_remove_worktree` | 不処置 (呼び出し元なし。§0) |
+
+- **戻し方**: PR revert → `scripts/sync-main-checkout.sh`。G1 は新しい status も欄も書かない
+  (`needs_director` と `needs_director_reason` は既存)。戻しても旧コードがそのまま読める。needs_director になった card は
+  Director が今の出口 (`plan.sh update <id> --status pending --reset`) で戻す。

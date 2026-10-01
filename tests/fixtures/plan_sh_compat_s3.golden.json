@@ -84,13 +84,13 @@
    "cmd": "pull (auto select 1)",
    "rc": 0,
    "stderr": "",
-   "stdout": "{\"mission\": \"<SLUG>\", \"id\": \"t002\", \"title\": \"Colon: \\\"quoted\\\" 日本語\", \"description\": \"line one # not a comment\", \"skills\": [\"code\", \"bash\"], \"priority\": \"high\", \"blocked_by\": [], \"target_dir\": null, \"task_slug\": \"colon-quoted\", \"worktree_path\": null}\n"
+   "stdout": "{\"mission\": \"<SLUG>\", \"id\": \"t002\", \"title\": \"Colon: \\\"quoted\\\" 日本語\", \"description\": \"line one # not a comment\", \"skills\": [\"code\", \"bash\"], \"priority\": \"high\", \"blocked_by\": [], \"target_dir\": null, \"task_slug\": \"colon-quoted\", \"worktree_path\": \"<ROOT>/.claude/worktrees/<SLUG>/t002-colon-quoted\"}\n"
   },
   {
    "cmd": "pull (auto select 2)",
    "rc": 0,
    "stderr": "",
-   "stdout": "{\"mission\": \"<SLUG>\", \"id\": \"t006\", \"title\": \"Verified path\", \"description\": \"\", \"skills\": [\"bash\"], \"priority\": \"high\", \"blocked_by\": [], \"target_dir\": null, \"task_slug\": \"verified-path\", \"worktree_path\": null}\n"
+   "stdout": "{\"mission\": \"<SLUG>\", \"id\": \"t006\", \"title\": \"Verified path\", \"description\": \"\", \"skills\": [\"bash\"], \"priority\": \"high\", \"blocked_by\": [], \"target_dir\": null, \"task_slug\": \"verified-path\", \"worktree_path\": \"<ROOT>/.claude/worktrees/<SLUG>/t006-verified-path\"}\n"
   },
   {
    "cmd": "(picked by pull)",
@@ -120,7 +120,7 @@
    "cmd": "pull --agent Ren --skills bash,code --task t002",
    "rc": 0,
    "stderr": "",
-   "stdout": "{\"mission\": \"<SLUG>\", \"id\": \"t002\", \"title\": \"Colon: \\\"quoted\\\" 日本語\", \"description\": \"line one # not a comment\", \"skills\": [\"code\", \"bash\"], \"priority\": \"high\", \"blocked_by\": [], \"target_dir\": null, \"task_slug\": \"colon-quoted\", \"worktree_path\": null}\n"
+   "stdout": "{\"mission\": \"<SLUG>\", \"id\": \"t002\", \"title\": \"Colon: \\\"quoted\\\" 日本語\", \"description\": \"line one # not a comment\", \"skills\": [\"code\", \"bash\"], \"priority\": \"high\", \"blocked_by\": [], \"target_dir\": null, \"task_slug\": \"colon-quoted\", \"worktree_path\": \"<ROOT>/.claude/worktrees/<SLUG>/t002-colon-quoted\"}\n"
   },
   {
    "cmd": "done t002 finished: with colon\nand a 2nd line --no-pr compat",
@@ -144,7 +144,7 @@
    "cmd": "pull --agent Ren --skills bash,code --task t004",
    "rc": 0,
    "stderr": "",
-   "stdout": "{\"mission\": \"<SLUG>\", \"id\": \"t004\", \"title\": \"Deliverable pr\", \"description\": \"\", \"skills\": [\"bash\"], \"priority\": \"low\", \"blocked_by\": [], \"target_dir\": null, \"task_slug\": \"deliverable-pr\", \"worktree_path\": null}\n"
+   "stdout": "{\"mission\": \"<SLUG>\", \"id\": \"t004\", \"title\": \"Deliverable pr\", \"description\": \"\", \"skills\": [\"bash\"], \"priority\": \"low\", \"blocked_by\": [], \"target_dir\": null, \"task_slug\": \"deliverable-pr\", \"worktree_path\": \"<ROOT>/.claude/worktrees/<SLUG>/t004-deliverable-pr\"}\n"
   },
   {
    "cmd": "pull --task (busy Worker)",
@@ -192,7 +192,7 @@
    "cmd": "pull --agent Ren --skills bash,code --task t001",
    "rc": 0,
    "stderr": "",
-   "stdout": "{\"mission\": \"<SLUG>\", \"id\": \"t001\", \"title\": \"Plain\", \"description\": \"\", \"skills\": [\"bash\"], \"priority\": \"medium\", \"blocked_by\": [], \"target_dir\": null, \"task_slug\": \"plain\", \"worktree_path\": null}\n"
+   "stdout": "{\"mission\": \"<SLUG>\", \"id\": \"t001\", \"title\": \"Plain\", \"description\": \"\", \"skills\": [\"bash\"], \"priority\": \"medium\", \"blocked_by\": [], \"target_dir\": null, \"task_slug\": \"plain\", \"worktree_path\": \"<ROOT>/.claude/worktrees/<SLUG>/t001-plain\"}\n"
   },
   {
    "cmd": "retire (reset)",
@@ -204,7 +204,7 @@
    "cmd": "pull --agent Ren --skills bash,code --task t001",
    "rc": 0,
    "stderr": "",
-   "stdout": "{\"mission\": \"<SLUG>\", \"id\": \"t001\", \"title\": \"Plain\", \"description\": \"\", \"skills\": [\"bash\"], \"priority\": \"medium\", \"blocked_by\": [], \"target_dir\": null, \"task_slug\": \"plain\", \"worktree_path\": null}\n"
+   "stdout": "{\"mission\": \"<SLUG>\", \"id\": \"t001\", \"title\": \"Plain\", \"description\": \"\", \"skills\": [\"bash\"], \"priority\": \"medium\", \"blocked_by\": [], \"target_dir\": null, \"task_slug\": \"plain\", \"worktree_path\": \"<ROOT>/.claude/worktrees/<SLUG>/t001-plain\"}\n"
   },
   {
    "cmd": "done (no AGENT_NAME: assignment stays)",

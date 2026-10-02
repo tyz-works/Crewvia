@@ -592,6 +592,6 @@ def test_the_tested_subcommands_are_exactly_dispatch_plus_bash_side_branches():
 
 
 def test_header_usage_documents_the_strict_rules():
-    head = "\n".join(PLAN_SH.read_text().splitlines()[:70])
+    head = "\n".join(PLAN_SH.read_text().splitlines()[:90])     # 冒頭の usage コメントが伸びた分 (e3-execution-flag-compat)
     for needle in ("--help", "CREWVIA_MISSION_SLUG", "SKILLS", "role: director"):
         assert needle in head, needle

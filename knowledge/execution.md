@@ -1447,3 +1447,20 @@ director.md の手順 (`update --status in_progress --reset` → done は今の�
 
   境界のある値 (`rework_count`・`attempt` / `execution_count`) は、境界の手前・ちょうど・超えた後の再送を `tests/test_execution_e3_resend_idempotent.py` (13 件) が固定する (card・record・枠・Verification の節・監査の `ok` 行・count が増えない)。
   赤の実証: 修正前の plan.sh で同テストが 4 件 FAILED (`assert 3 == 0` 等)・修正後は緑。
+
+### 16.9 Codex 3 巡目 (t033 / PR #273): 再送の根拠は状態の推測ではなく、この試行に結び付いた記録
+
+- **P2**: t032 の `already_escalated` は「前の報告があった」ことを **task の status と rework_count だけ**から推し量った。`update --status needs_human_review` の後の最初の `verify-result needs_human_review --notes ...` は、検証の記録を 1 つも残さず成功 (冪等) で返り、
+  fail で上限に達してエスカレーションした後の**違う** needs_human_review の判定と notes も飲み込まれた。
+- **修正**: `## Verification` の各項目に `**Execution:** <この試行の id>` の行を足し (試行なしは `-`)、再送は「**同じ試行・同じ verdict・同じ notes の項目が card に既にある**」ときだけ (`_verification_recorded`。status・回数は見ない)。
+  試行が既に終わっている行 (pass / 上限手前の fail) は Controller の記録 (`execution_end_code`) が根拠で、さらに notes が一致する項目が無ければ **exit 3 (conflict)** で飲まない。
+- **「再送と判定する根拠」の列 (族の掃除)**:
+
+| 操作 | 再送と判定する根拠 | 違う内容の 2 回目 (verdict / notes / PR 番号) |
+|---|---|---|
+| done / fail / needs-director / verify-result pass | 試行の終了 record (`execution_end_code` + 名乗りの照合。Controller の `IDEMPOTENT`) | 試行が終わっているので名乗り付きは conflict (exit 3)・名乗りなしは遷移の拒否 (exit 2)。新しい記録にはならない |
+| ready-for-verification / verifying | 無い (status が進んでいれば `INVALID_TRANSITION` exit 2) | 同上・何も書かない |
+| verify-result fail (上限手前) | 試行の終了 record + **同じ notes の Verification 項目** | notes が違えば exit 3 (飲まない) |
+| verify-result needs_human_review / 上限に達した fail | **同じ試行・verdict・notes の Verification 項目** (status / count は根拠にしない) | 新しい項目として記録される (status は needs_human_review のまま) |
+
+  根拠が status・回数の推測の行は 0 件。赤の実証: 修正前の plan.sh で新テスト 4 件が FAILED・修正後は緑 (`tests/test_execution_e3_resend_idempotent.py`)。

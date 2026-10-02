@@ -60,6 +60,10 @@ def _strip_json_line(text):
     return "".join(out)
 
 
+# t033: `## Verification` の項目に足した `**Execution:** <id>` の行 (再送を「この試行の記録」で判定する根拠。execution.md §16.9)
+_VERIFICATION_EXECUTION_LINE = re.compile(r"^\*\*Execution:\*\* \S+\n", re.M)
+
+
 def _strip_queue(files):
     out = {}
     for name, text in files.items():
@@ -71,6 +75,7 @@ def _strip_queue(files):
             text = json.dumps(data, ensure_ascii=False, sort_keys=True) + "\n"
         elif "/tasks/" in name and name.endswith(".md"):
             text = _FIELD_LINE.sub("", text)
+            text = _VERIFICATION_EXECUTION_LINE.sub("", text)
         out[name] = text
     return out
 

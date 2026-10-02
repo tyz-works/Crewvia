@@ -5339,6 +5339,27 @@ def cmd_snapshot(args):
     with_lock(_do)
 
 
+def _verification_entry_tail(execution_tag, verdict, notes):
+    """## Verification の 1 項目の、時刻の行より後ろ。再送の照合はこの全文一致 (試行・verdict・notes)。"""
+    lines = [f"**Verdict:** {verdict}", f"**Execution:** {execution_tag}"]
+    if notes:
+        lines.append(f"**Notes:** {notes}")
+    return '\n'.join(lines)
+
+
+def _verification_recorded(body, execution_tag, verdict, notes):
+    """この試行 (execution_tag)・この verdict・この notes の検証の記録が card に既にあるか。status や回数は見ない。"""
+    marker = '## Verification\n'
+    if marker not in body:
+        return False
+    tail = _verification_entry_tail(execution_tag, verdict, notes)
+    for block in body.split(marker, 1)[1].split('\n### ')[1:]:
+        _ts, _, rest = block.partition('\n')
+        if rest.split('\n## ')[0].strip() == tail:
+            return True
+    return False
+
+
 def cmd_verify_result(args):
     """
     Usage: plan.sh verify-result <task_id> <verdict> [--notes "..."] [--mission <slug>]
@@ -5384,10 +5405,8 @@ def cmd_verify_result(args):
 
         # Build and append verification entry
         timestamp = now_iso()
-        entry_lines = [f"\n### {timestamp}", f"**Verdict:** {verdict}"]
-        if notes:
-            entry_lines.append(f"**Notes:** {notes}")
-        verification_entry = '\n'.join(entry_lines) + '\n'
+        execution_tag = meta.get('current_execution_id') or '-'
+        verification_entry = f"\n### {timestamp}\n" + _verification_entry_tail(execution_tag, verdict, notes) + '\n'
 
         if '## Verification' in body:
             body_new = body.rstrip() + '\n' + verification_entry
@@ -5415,10 +5434,18 @@ def cmd_verify_result(args):
                 probe = _CONTROLLER.complete_execution(_txn(), slug, task_id, caller, to_status='verified', dry_run=True)
         except _EXEC.ControllerError as e:
             _controller_die('verify-result', e)
-        already_escalated = (meta.get('status') == 'needs_human_review' and probe is not None
-                             and (verdict == 'needs_human_review'
-                                  or (verdict == 'fail' and (meta.get('rework_count') or 0) >= max_rework)))
-        if probe == _CONTROLLER.IDEMPOTENT or already_escalated:
+        # 「再送」の根拠は status / rework_count からの推測ではなく、**この試行に結び付いた検証の記録** (## Verification の
+        # 項目の `**Execution:**` 行・verdict・notes) (t033 / Codex 3 巡目 P2)。同じ試行・同じ verdict・同じ notes の項目が
+        # 既にあるときだけ再送。違う verdict / notes は新しい記録として残す。
+        recorded = _verification_recorded(body, execution_tag, verdict, notes)
+        if probe == _CONTROLLER.IDEMPOTENT:
+            # 試行が既にこの verdict で終わっている。notes が違う 2 回目は黙って飲まず conflict (exit 3)
+            if not recorded:
+                die(f"verify-result: {slug}/{task_id} は既に verdict={verdict} で記録済みです "
+                    f"(notes が違う 2 回目は受け付けません。追記は Director が update で)", code=3)
+            print(f"verify-result: {slug}/{task_id} (verdict={verdict}) — already recorded (idempotent)")
+            return
+        if meta.get('status') == 'needs_human_review' and probe is not None and recorded:
             print(f"verify-result: {slug}/{task_id} (verdict={verdict}) — already recorded (idempotent)")
             return
         rework_updates = {}

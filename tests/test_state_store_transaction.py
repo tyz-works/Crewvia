@@ -185,24 +185,41 @@ def test_state_missing_is_default_but_unreadable_is_an_error(q):
 
 # ---- assignment (projection) -----------------------------------------------------
 
+X1 = "ex-" + "1" * 32
+X2 = "ex-" + "2" * 32
+
+
+def test_an_identity_without_an_id_is_not_this_attempts_slot_and_is_never_removed(q):
+    """E4b: 世代 (started_at) では照合しない。ID の無い identity (E2 より前・旧コードの publish) は、同じ世代の値でも
+    名指しした試行のものとは言えない (SUCCESSOR・撤去しない)。ID なしの名指し (None = いま card が示す実行) は枠が task を指せば MINE。"""
+    with store.transaction(q, op="a", actor="t") as t:
+        t.publish_assignment(A, M, "t001", G)                       # execution_id なし
+        assert t.classify_assignment(A, M, "t001", X1) == store.ASSIGN_SUCCESSOR
+        assert t.retire_assignment(A, M, "t001", X1) == store.ASSIGN_SUCCESSOR
+        assert (q / "assignments" / A).exists()
+        assert t.classify_assignment(A, M, "t001", None) == store.ASSIGN_MINE
+        os.unlink(q / "assignments" / f"{A}.identity")
+        assert t.classify_assignment(A, M, "t001", X1) == store.ASSIGN_UNVERIFIABLE   # identity が無い
+
+
 def test_publish_writes_identity_before_body_and_retire_uses_classify(q):
     order = []
     with store.transaction(q, op="a", actor="t") as t:
         store.FAULT_HOOK = lambda p, path: order.append(os.path.basename(path)) if p == "atomic:replaced" else None
         try:
-            t.publish_assignment(A, M, "t001", G)
+            t.publish_assignment(A, M, "t001", G, execution_id=X1)
         finally:
             store.FAULT_HOOK = None
         assert order == [f"{A}.identity", A]
-        assert t.classify_assignment(A, M, "t001", G) == store.ASSIGN_MINE
-        assert t.classify_assignment(A, M, "t001", "other-gen") == store.ASSIGN_SUCCESSOR
+        assert t.classify_assignment(A, M, "t001", X1) == store.ASSIGN_MINE
+        assert t.classify_assignment(A, M, "t001", X2) == store.ASSIGN_SUCCESSOR
         assert t.classify_assignment(A, M, "t002", None) == store.ASSIGN_OTHER_TASK
-        # 後任 (別の世代) は消さない
-        assert t.retire_assignment(A, M, "t001", "other-gen") == store.ASSIGN_SUCCESSOR
+        # 後任 (別の試行) は消さない
+        assert t.retire_assignment(A, M, "t001", X2) == store.ASSIGN_SUCCESSOR
         assert (q / "assignments" / A).exists()
-        assert t.retire_assignment(A, M, "t001", G) == store.ASSIGN_MINE
+        assert t.retire_assignment(A, M, "t001", X1) == store.ASSIGN_MINE
         assert not (q / "assignments" / A).exists() and not (q / "assignments" / f"{A}.identity").exists()
-        assert t.classify_assignment(A, M, "t001", G) == store.ASSIGN_ABSENT
+        assert t.classify_assignment(A, M, "t001", X1) == store.ASSIGN_ABSENT
 
 
 def test_unreadable_slot_is_unverifiable_not_absent(q):

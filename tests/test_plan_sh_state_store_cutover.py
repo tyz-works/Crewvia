@@ -148,9 +148,9 @@ def _drive_every_mutating_subcommand(sb: Sandbox):
     expected.append(("recover", "t003", "verified", "verified"))
     expected.append(("pull", "t004", "pending", "in_progress"))
     expected.append(("pull", "t004", "in_progress", "in_progress"))     # 01c E2: start の行
-    gen = _field(sb.card_text("t004"), "started_at")
-    assert gen
-    sb.run("retire", "t004", "--agent", "Ren", "--started-at", gen, "--outcome", "reset", "--no-wait")
+    xid = _field(sb.card_text("t004"), "current_execution_id")
+    assert xid
+    sb.run("retire", "t004", "--agent", "Ren", "--execution", xid, "--outcome", "reset", "--no-wait")
     expected.append(("retire", "t004", "in_progress", "pending"))
 
     # 孤児の assignment: 01c E3 から done は card の worker の枠を撤去する (AGENT_NAME が無くても) ので、孤児の枠は

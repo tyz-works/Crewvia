@@ -163,9 +163,9 @@ expect_red "case I" "without_a_worker" "test_diagnose_reports_a_holding_card_wit
 
 echo "== case J: identity の検査を in_progress だけに"
 fresh_copy
-inject scripts/lib_state_store.py "            if gen:
-                verdict = self.t.classify_assignment(worker, slug, tid, str(gen))" "            if gen and status == 'in_progress':
-                verdict = self.t.classify_assignment(worker, slug, tid, str(gen))"
+inject scripts/lib_state_store.py "            if xid:
+                verdict = self.t.classify_assignment(worker, slug, tid, execution_id=xid)" "            if xid and status == 'in_progress':
+                verdict = self.t.classify_assignment(worker, slug, tid, execution_id=xid)"
 inject scripts/lib_state_store.py "            elif self.t._read_identity(worker) is None:" "            elif status == 'in_progress' and self.t._read_identity(worker) is None:"
 expect_red "case J" "broken_identity" "test_diagnose_reports_a_broken_identity_for_every_assignment_holding_status"
 

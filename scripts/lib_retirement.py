@@ -44,7 +44,7 @@ detection is deliberately left in place as a backstop (R5).
     discarded     identity re-check failed — deliberately NOT killed (R7)
     cleanup_failed terminated, but the queue repair did not happen; left for a
                   human.  Two ways in: plan.sh kept failing (retried every
-                  cycle), or the assignment generation was never recorded, so
+                  cycle), or the attempt's Execution ID was never recorded, so
                   no automatic repair is allowed at all (t024 — not retried,
                   since re-asking can only reach the same answer)
 
@@ -74,16 +74,17 @@ The check is only worth what the *use* is bound to, which is what t020
   - **Bind the queue cleanup to the assignment, not the name.**  `status` and
     `worker` both return to their old values when a human resets a task and
     the same Worker name pulls it again, so the retirement also records the
-    task's `started_at` — the generation `plan.sh pull` rewrites on every
-    execution — and asserts it under plan.sh's lock.
+    task's Execution ID — the attempt `plan.sh pull` reserves on every
+    execution (E4b: this replaced the `started_at` generation) — and asserts
+    it under plan.sh's lock.
 
 t024 turned that binding into a single call.  The cleanup is
-`plan.sh retire <task> --agent <name> --started-at <generation> --mission
+`plan.sh retire <task> --agent <name> --execution <id> --mission
 <slug>`: this module hands over the evidence and reads the answer, and does
 not get to choose which preconditions are asserted.  Every one of the nine P1s
 these three review rounds produced was a caller deciding to assert less, so
-the choice is gone from the interface.  **No generation, no cleanup** — the
-marker goes to `cleanup_failed` and a human is told once, because a generation
+the choice is gone from the interface.  **No Execution ID, no cleanup** — the
+marker goes to `cleanup_failed` and a human is told once, because the ID
 cannot be recovered afterwards (re-reading the card returns the successor's).
 
 ## Evidence (t020, Codex P1-2)
@@ -110,9 +111,9 @@ decision and the act, and things happen in it.
     Worker that finishes the timed-out task and pulls the next one keeps its
     pid and its created_at.  `assignment_execution_verdict()` asks the
     assignment instead — the thing `plan.sh pull` republishes, with its
-    generation, inside the queue lock — and **only a positive match lets the
+    Execution ID, inside the queue lock — and **only a positive match lets the
     retirement proceed**.  An assignment that says the Worker moved on is a
-    discard; a generation we cannot read at all is a hold, because a discard
+    discard; an ID we cannot read at all is a hold, because a discard
     there would be re-decided identically every cycle (`_unprovable()`,
     t026).  Upstream, neither dispatcher nor `plan.sh pull` will hand a task
     to a Worker that has a marker, so the situation mostly does not arise;
@@ -551,54 +552,10 @@ def process_alive(pid) -> bool:
 # Assignment identity
 # ---------------------------------------------------------------------------
 
-#: Returned by `read_task_started_at()` when the card could not be read at all.
-#: Distinct from `None`, which is the card saying "no execution has started" —
-#: a real value worth asserting later.  Collapsing the two would let an
-#: unreadable card be recorded as `started_at: null` and then match a card that
-#: genuinely has none.
-UNKNOWN_STARTED_AT = object()
-
-
-def read_task_started_at(queue_dir, mission: str, task_id: str):
-    """`started_at` from a task card, or `UNKNOWN_STARTED_AT`.
-
-    This is the *assignment generation*: `plan.sh pull` rewrites it on every
-    execution, so it is what separates "the assignment this retirement is
-    about" from "another run of the same task, by a Worker with the same
-    name".  status and worker both come back to their old values on a reset +
-    re-pull, which is why neither can play this role (Codex P1-1).
-
-    Read with a deliberately small parser rather than plan.sh: this runs on
-    every retirement request, inside watchdog's cycle, and must not be able to
-    block on the queue lock.  Only the frontmatter is scanned, and only for one
-    key whose value is a quoted scalar.
-    """
-    if not queue_dir or not mission or not task_id:
-        return UNKNOWN_STARTED_AT
-    path = Path(queue_dir) / "missions" / str(mission) / "tasks" / f"{task_id}.md"
-    # カードも固定パスのガードを通す (Codex 9 巡目 P2)。ここは watchdog の
-    # サイクルの中で退役要求ごとに走るので、上限の無い `read_text()` が
-    # 書き手のいない FIFO に当たると **退役処理全体が返らない**。
-    text = read_regular_text_or_unreadable(path)
-    if is_unreadable(text):
-        return UNKNOWN_STARTED_AT
-    in_frontmatter = False
-    for line in text.splitlines():
-        if line.strip() == "---":
-            if in_frontmatter:
-                break            # end of frontmatter, key absent
-            in_frontmatter = True
-            continue
-        if not in_frontmatter or not line.startswith("started_at:"):
-            continue
-        raw = line.split(":", 1)[1].strip().strip('"').strip("'").strip()
-        return None if raw.lower() in ("", "null", "none", "~") else raw
-    return None
-
-
 #: Returned by `read_task_execution_id()` when the card could not be read, or its execution fields are broken.
-#: Distinct from `None` ("this card has no *active* attempt of its own": a legacy card, or one an old-code pull took
-#: over) — the same split `UNKNOWN_STARTED_AT` makes for the generation.
+#: Distinct from `None` ("this card has no attempt of its own to bind to": a legacy card, or one an old-code pull took
+#: over): the request leaves the key out for the first and records `null` for the second.  Neither authorises an
+#: automatic cleanup (E4b) — both go to the Director.
 UNKNOWN_EXECUTION_ID = object()
 
 _EXECUTION_FRONTMATTER_KEYS = ("status", "started_at") + tuple(_ex.EXECUTION_FIELDS)
@@ -612,13 +569,15 @@ def _scalar(raw: str):
 def read_task_execution_id(queue_dir, mission: str, task_id: str):
     """The Execution ID a retirement of this card's current holder should be bound to, or a sentinel.
 
-    Same reading discipline as `read_task_started_at()` (bounded read, frontmatter only, scalars only, no queue
-    lock).  The answer comes from `lib_execution.attempt_view` — the one reader of "whose attempt is this" — so a
-    card an old-code pull took over (`DETACHED`) or a legacy card (`NONE`) yields `None` (the generation is the only
-    evidence there is) and never the stale ID of the attempt that was left behind.
+    Bounded read, frontmatter only, scalars only, no queue lock (this runs inside watchdog's cycle and must not block
+    on the queue lock).  The answer comes from `lib_execution.attempt_view` — the one reader of "whose attempt is this"
+    — so a card an old-code pull took over (`DETACHED`) or a legacy card (`NONE`) yields `None` and never the stale ID
+    of the attempt that was left behind.
 
-    - `ex-<32hex>`          the card's attempt is ACTIVE: bind the retirement to it.
-    - `None`                no active attempt of this holder (legacy / DETACHED / TERMINAL): fall back to the generation.
+    - `ex-<32hex>`          the card's attempt is ACTIVE or already TERMINAL: bind the retirement to it.  A terminal
+                            attempt is still the attempt this Worker was running, and `plan.sh retire` answers "nothing
+                            owed" for it (exit 3, quiet) instead of the hold a missing ID would turn into (E4b).
+    - `None`                no attempt of this holder to bind to (legacy / DETACHED): hold for the Director.
     - `UNKNOWN_EXECUTION_ID` unreadable card or broken execution fields: nothing is known (the key is left out).
     """
     if not queue_dir or not mission or not task_id:
@@ -651,18 +610,18 @@ def read_task_execution_id(queue_dir, mission: str, task_id: str):
         view = _ex.attempt_view(meta, _task_status.ASSIGNMENT_HOLDING_STATUSES)
     except ValueError:
         return UNKNOWN_EXECUTION_ID
-    return meta["current_execution_id"] if view == _ex.ACTIVE else None
+    return meta["current_execution_id"] if view in (_ex.ACTIVE, _ex.TERMINAL) else None
 
 
 #: `assignment_execution_verdict()` answers.
 EXEC_SAME = "same"        # the assignment still names the execution we recorded
-EXEC_OTHER = "other"      # it names a different task, or a different generation
+EXEC_OTHER = "other"      # it names a different task, or a different execution
 EXEC_ABSENT = "absent"    # nothing is published — that execution has ended
 EXEC_UNREADABLE = "unreadable"  # the assignment is there but cannot be read
 
 
 def assignment_execution_verdict(queue_dir, agent: str, mission, task_id,
-                                 generation, execution_id=None) -> Tuple[str, str]:
+                                 execution_id=None) -> Tuple[str, str]:
     """Does `queue/assignments/<agent>` still name the execution we recorded?
 
     Returns `(verdict, detail)`.
@@ -678,13 +637,15 @@ def assignment_execution_verdict(queue_dir, agent: str, mission, task_id,
 
     The assignment is the right thing to ask because `plan.sh pull` publishes
     it inside the queue lock together with the card, and publishes the
-    generation beside it (`<agent>.identity`).  Read-only and deliberately
+    Execution ID beside it (`<agent>.identity`).  Read-only and deliberately
     small: this runs inside watchdog's cycle and must not take the queue lock.
 
     **Only a positive match returns `EXEC_SAME`.**  Every way of failing to
-    read the generation — none recorded, no sidecar, a sidecar without one —
-    comes back `EXEC_UNREADABLE`, because the one thing left to compare is a
-    string that a reset + re-pull reproduces exactly (Codex 5 巡目 P1-1).
+    read the ID — none recorded, no sidecar, a sidecar without one (published
+    before E2) — comes back `EXEC_UNREADABLE`: the card match above is not the
+    evidence it looks like, because a reset + re-pull of the same card by the
+    same name republishes a byte-identical assignment (Codex 5 巡目 P1-1).  The
+    generation (`started_at`) is no longer a fallback (E4b).
     """
     if not queue_dir or not agent or not task_id:
         return EXEC_UNREADABLE, "no assignment to compare against"
@@ -700,37 +661,25 @@ def assignment_execution_verdict(queue_dir, agent: str, mission, task_id,
     if published != expected:
         return EXEC_OTHER, (f"assignment names {published!r}, not {expected!r} "
                             f"— the Worker has moved on")
-    if generation is None and execution_id is None:
-        # Nothing was recorded to compare against, so nothing here can be
-        # matched.  The card match above is *not* the remaining evidence it
-        # looks like: a reset + re-pull of the same card by the same name
-        # republishes a byte-identical assignment, which is the one case the
-        # generation exists to separate (Codex 5 巡目 P1-1).
-        return EXEC_UNREADABLE, "no generation was recorded for this retirement"
+    if execution_id is None:
+        # Nothing was recorded to compare against, so nothing here can be matched.  The card match above is *not*
+        # the remaining evidence it looks like: a reset + re-pull of the same card by the same name republishes a
+        # byte-identical assignment, which is the one case the ID exists to separate (Codex 5 巡目 P1-1).
+        return EXEC_UNREADABLE, "no execution id was recorded for this retirement"
 
     identity = read_json(base.with_name(base.name + ".identity"))
     if identity is not None and not isinstance(identity, dict):
         return EXEC_UNREADABLE, f"queue/assignments/{agent}.identity is not an object"
-    if execution_id is not None and (identity or {}).get("execution_id") is not None:
-        # Both sides name an attempt: the ID decides, even if started_at happens to agree (execution.md §2.2).
-        if identity["execution_id"] != execution_id:
-            return EXEC_OTHER, ("assignment execution differs from the recorded one "
-                                "— same card, different execution")
-        return EXEC_SAME, ""
-    current = (identity or {}).get("started_at")
-    if identity is None or current is None:
-        # `plan.sh pull` always writes the sidecar next to the assignment, so
-        # this is an old or hand-made state.  That makes it unusual, not
-        # proven: the assignment in front of us may still be a successor's.
+    recorded = (identity or {}).get("execution_id")
+    if recorded is None:
+        # `plan.sh pull` always writes the sidecar next to the assignment, and since E2 it carries the ID, so this
+        # is an old or hand-made state.  That makes it unusual, not proven: the assignment in front of us may
+        # still be a successor's.
         return EXEC_UNREADABLE, (f"queue/assignments/{agent}.identity is missing "
-                                 f"or carries no started_at")
-    if generation is None:
-        # An ID was recorded but the sidecar names none (published before E2): the generation is the only thing
-        # left to compare and there is none to compare it with.
-        return EXEC_UNREADABLE, "the sidecar names no execution and no generation was recorded"
-    if str(current).strip() != str(generation).strip():
-        return EXEC_OTHER, (f"assignment generation {current!r} != recorded "
-                            f"{generation!r} — same card, different execution")
+                                 f"or carries no execution_id")
+    if recorded != execution_id:
+        return EXEC_OTHER, ("assignment execution differs from the recorded one "
+                            "— same card, different execution")
     return EXEC_SAME, ""
 
 
@@ -837,7 +786,6 @@ def identity_matches(recorded: Optional[dict], current: Optional[dict]) -> Tuple
 def build_request(agent: str, window_target: str, reason: str, identity: dict,
                   mission: Optional[str] = None, task_id: Optional[str] = None,
                   message: str = SHUTDOWN_MESSAGE,
-                  task_started_at=UNKNOWN_STARTED_AT,
                   detail: Optional[dict] = None,
                   task_execution_id=UNKNOWN_EXECUTION_ID) -> dict:
     """A dispatcher-side retirement request.
@@ -847,17 +795,12 @@ def build_request(agent: str, window_target: str, reason: str, identity: dict,
     in_progress task, which is precisely why the request cannot live in task
     frontmatter (§3-3 案A).
 
-    `task_started_at` is the assignment generation this retirement is bound to.
-    The key is **omitted entirely** when it could not be read, so that a later
-    cleanup can tell "this task had no started_at" apart from "we never found
-    out".  Neither one authorises an automatic cleanup — see
-    `RetirementExecutor._bound_generation()` — but keeping them distinguishable
-    is what stops a fabricated `null` from matching a genuinely unstarted card.
-
-    `task_execution_id` is the Execution ID of the attempt this retirement ends (E4a, execution.md §2.1 #9).  Same
-    discipline: omitted when it could not be read, `None` when the card had no active attempt of its own (legacy /
-    taken over by old code — the generation is the evidence then).  An old-format marker simply lacks the key, and
-    every reader falls back to `task_started_at` for it.
+    `task_execution_id` is the Execution ID of the attempt this retirement ends (execution.md §2.1 #9).  The key is
+    **omitted entirely** when it could not be read, so that a later cleanup can tell "this card had no attempt of its
+    own" (`None`) apart from "we never found out".  Neither authorises an automatic cleanup — see
+    `RetirementExecutor._bound_execution()` — but keeping them distinguishable is what stops a fabricated `null` from
+    matching a genuinely unstarted card.  A marker with no (valid) ID is an old-format one; since E4b nothing reads
+    its `task_started_at` any more, so it is held for the Director like any other unprovable marker.
     """
     req = {
         # A name for *this* retirement, minted here and carried by the progress
@@ -875,8 +818,6 @@ def build_request(agent: str, window_target: str, reason: str, identity: dict,
         "task_id": task_id,
         "spawn_identity": dict(identity),
     }
-    if task_started_at is not UNKNOWN_STARTED_AT:
-        req["task_started_at"] = task_started_at
     if task_execution_id is not UNKNOWN_EXECUTION_ID:
         req["task_execution_id"] = task_execution_id
     if detail:
@@ -894,7 +835,7 @@ def _carried_from_request(req: dict) -> dict:
     depend on a second file still being on disk — losing the request after the
     Worker is already dead would otherwise mean nobody ever learns which task
     to reset, or which *execution* of it this retirement was bound to.
-    `task_started_at` is carried by key presence for the same reason
+    `task_execution_id` is carried by key presence for the same reason
     `build_request()` omits it: absent means "never found out", and that has
     to stay distinguishable from a recorded `None`.
     """
@@ -906,8 +847,6 @@ def _carried_from_request(req: dict) -> dict:
         "task_id": req.get("task_id"),
         "reason": req.get("reason"),
     }
-    if "task_started_at" in req:
-        carried["task_started_at"] = req["task_started_at"]
     if "task_execution_id" in req:
         carried["task_execution_id"] = req["task_execution_id"]
     if req.get("detail"):
@@ -1113,19 +1052,18 @@ class RetirementExecutor:
         """The request itself.  **Runs under the queue lock; no subprocesses.**
 
         Reading the card here rather than before taking the lock is not
-        incidental: `plan.sh pull` rewrites `started_at` and publishes the
-        assignment in one transaction, so a generation read outside the lock
+        incidental: `plan.sh pull` reserves the attempt and publishes the
+        assignment in one transaction, so an ID read outside the lock
         can name an execution that the assignment published a moment later has
         already replaced.
         """
         # Read here rather than taken from the caller: every caller would have
         # to remember, and the one that forgot would hand the cleanup to a
         # human for no reason (Codex P1-1).  One place decides.  This is also
-        # the *only* moment the generation can be read — by cleanup time the
+        # the *only* moment the ID can be read — by cleanup time the
         # card may belong to a successor.
-        started_at = read_task_started_at(self.queue_dir, mission, task_id)
         execution_id = read_task_execution_id(self.queue_dir, mission, task_id)
-        if task_id and started_at is UNKNOWN_STARTED_AT:
+        if task_id and execution_id is UNKNOWN_EXECUTION_ID:
             # The Worker can still be retired — the reason for that is the
             # timeout, not the card — but the *queue* cleanup afterwards will
             # be deferred to a human, because nothing left can bind it to this
@@ -1133,7 +1071,7 @@ class RetirementExecutor:
             # cause (an unreadable card, a missing queue_dir) is still visible;
             # by cleanup time all that is left is the absent key.
             self.log(
-                f"[retire] {agent}: WARNING could not read started_at for "
+                f"[retire] {agent}: WARNING could not read the execution id for "
                 f"{mission}/{task_id} (queue_dir={self.queue_dir}) — the Worker will "
                 f"still be retired, but the queue cleanup will be handed to the "
                 f"Director instead of run automatically"
@@ -1148,7 +1086,7 @@ class RetirementExecutor:
             return False
         req = build_request(agent, window_target, reason, identity,
                             mission=mission, task_id=task_id, message=message,
-                            task_started_at=started_at, detail=detail,
+                            detail=detail,
                             task_execution_id=execution_id)
         # Create-if-absent, atomically.  The queue lock serialises this against
         # `plan.sh`; this keeps the *two daemons* from overwriting each other,
@@ -1283,10 +1221,10 @@ class RetirementExecutor:
 
         When the request on disk is not the one this progress file was built
         from, the request is handed back as `None`: every step then runs on the
-        progress file's own evidence (its pid, its task, its generation), which
+        progress file's own evidence (its pid, its task, its execution id), which
         is what `_orphaned()` already does correctly for "the request vanished
         mid-flight".  Mixing the two instead — progress from one retirement,
-        mission/task/generation from another — is what lets a timeout's cleanup
+        mission/task/execution id from another — is what lets a timeout's cleanup
         obligation be dropped, or another retirement's evidence be applied to a
         live execution (Codex 4 巡目 P1-2).
 
@@ -1577,16 +1515,16 @@ class RetirementExecutor:
         # stopping are not interchangeable:
         #
         #   - the assignment *says* the Worker moved on (another task, or
-        #     another generation of this one, or none at all) → discard.  The
+        #     another execution of this one, or none at all) → discard.  The
         #     marker goes away and the timeout is re-decided from the card on a
         #     later cycle if the Worker really is stuck.
-        #   - we simply cannot read the generation → hold.  A discard here
+        #   - we simply cannot read the execution id → hold.  A discard here
         #     would be re-requested and re-discarded every cycle, forever,
         #     because the card says the same thing next time (`_unprovable()`).
         if req.get("task_id") and self.queue_dir:
             verdict, detail = assignment_execution_verdict(
                 self.queue_dir, agent, req.get("mission"), req.get("task_id"),
-                self._bound_generation(req, None), self._bound_execution(req, None))
+                self._bound_execution(req, None))
             if verdict == EXEC_UNREADABLE:
                 return GUARD_UNPROVABLE, (
                     f"cannot prove the assignment still names the execution this "
@@ -1664,12 +1602,12 @@ class RetirementExecutor:
         The hold exists because nothing could be proved; it does not have to
         outlive that.  If the assignment later says outright that this Worker
         moved on — it is gone, or it names another task — the premise is
-        falsified without the generation entering into it, and the marker can
+        falsified without the Execution ID entering into it, and the marker can
         be dropped exactly as `_guard()` would have dropped it.  That is the
         common recovery: the Worker was never stuck, it finished, and nobody
         had to touch anything.
 
-        **Only those two answers release it.**  A generation that becomes
+        **Only those two answers release it.**  An ID that becomes
         readable and matching would mean quietly resuming a retirement the
         Director has already been told was stopped, and re-deciding that
         behind their back is the churn the hold exists to prevent.
@@ -1689,7 +1627,7 @@ class RetirementExecutor:
             return None
         verdict, detail = assignment_execution_verdict(
             self.queue_dir, agent, mission, task_id,
-            self._bound_generation(req, prog), self._bound_execution(req, prog))
+            self._bound_execution(req, prog))
         if verdict not in (EXEC_OTHER, EXEC_ABSENT):
             return None
         why = f"held, then settled by the assignment ({verdict}: {detail})"
@@ -2000,39 +1938,17 @@ class RetirementExecutor:
         return "terminated"
 
     @staticmethod
-    def _bound_generation(req: Optional[dict], prog: Optional[dict]) -> Optional[str]:
-        """The assignment generation this retirement is bound to, or None.
-
-        `None` means "no evidence", and there is no way to acquire it later:
-        re-reading the card now would return whatever generation is current,
-        which is precisely the successor's when there is one.  A recorded
-        `null` is not evidence either — a card with no `started_at` names no
-        execution to end.
-
-        Request first, then progress: the request is where `request()` wrote
-        it, and the progress file carries it forward for the case where the
-        request is gone by the time the cleanup runs.  Key *presence* is what
-        distinguishes "never found out" from a recorded value, which is why
-        `build_request()` omits the key rather than storing a sentinel.
-        """
-        for source in ((req or {}), (prog or {})):
-            if "task_started_at" not in source:
-                continue
-            value = source["task_started_at"]
-            if value is None:
-                return None
-            text = str(value).strip()
-            return text or None
-        return None
-
-    @staticmethod
     def _bound_execution(req: Optional[dict], prog: Optional[dict]) -> Optional[str]:
-        """The Execution ID this retirement is bound to, or None (E4a).
+        """The Execution ID this retirement is bound to, or None (E4a; E4b removed the generation fallback).
 
-        Same rules as `_bound_generation()`: request first, then the progress file that carries it forward; key
-        *presence* separates "never found out" from a recorded value, and a recorded `null` is not evidence.  A value
-        that is not an `ex-<32hex>` is not evidence either (a hand-edited marker must not turn into an argument of
-        `plan.sh retire`).  An old-format marker has no key at all → None → the caller falls back to the generation.
+        `None` means "no evidence", and there is no way to acquire it later: re-reading the card now would return
+        whatever attempt is current, which is precisely the successor's when there is one.  Request first, then the
+        progress file that carries it forward for the case where the request is gone by the time the cleanup runs;
+        key *presence* separates "never found out" from a recorded value, and a recorded `null` is not evidence.  A
+        value that is not an `ex-<32hex>` is not evidence either (a hand-edited marker must not turn into an argument
+        of `plan.sh retire`) — it is **held for the Director** (`_cleanup_deferred`), like a missing key.  An old-format
+        marker (only `task_started_at`) has no `task_execution_id` key → None → the same hold: nothing reads the
+        generation any more.
         """
         for source in ((req or {}), (prog or {})):
             if "task_execution_id" not in source:
@@ -2043,13 +1959,13 @@ class RetirementExecutor:
 
     def _cleanup_deferred(self, agent: str, prog: dict, mission: str,
                           task_id: str) -> Optional[str]:
-        """Terminated, but nothing may be rewritten: the generation is unknown.
+        """Terminated, but nothing may be rewritten: the Execution ID is unknown.
 
-        Without the generation the only preconditions left are status and
+        Without the ID the only preconditions left are status and
         worker, and both come back to their original values when a human
         resets the task and a same-named Worker pulls it again — crewvia
         reuses names by design.  Asserting only those would reset the
-        successor's live execution, which is the exact race the generation
+        successor's live execution, which is the exact race the Execution ID
         check exists to prevent; weakening the premise *is* the defect, not a
         fallback (Codex 3 巡目 P1-2).
 
@@ -2064,7 +1980,7 @@ class RetirementExecutor:
         it: the same shape as the hold above, and the reason both go through
         `_report_fields()` rather than each deciding for itself.
         """
-        why = (f"{mission}/{task_id} の実行世代 (started_at) を記録できていないため、"
+        why = (f"{mission}/{task_id} の試行の ID (execution id) を記録できていないため、"
                f"自動の後始末は行いません")
         if prog.get("cleanup_deferred"):
             return self._retry_pending_report(agent, prog)
@@ -2075,7 +1991,7 @@ class RetirementExecutor:
         reported = self._report_fields(
             agent, prog,
             f"watchdog が Worker {agent} を終了しましたが、その実行の世代 "
-            f"(started_at) を記録できていませんでした。前提を弱めて自動で "
+            f"(execution id) を記録できていませんでした。前提を弱めて自動で "
             f"reset すると、同名の後任が作業中の task を巻き戻す恐れがあるため、"
             f"**queue は何も書き換えていません**。\n"
             f"task {task_id} (mission={mission}) が in_progress のまま取り残されて"
@@ -2108,7 +2024,7 @@ class RetirementExecutor:
         outside it (PR #181's multi-line reason, the literal "null" worker).
 
         One call, not a set of fields (t024).  `plan.sh retire` takes the
-        evidence — which mission, which task, which worker, which *generation*
+        evidence — which mission, which task, which worker, which *attempt (Execution ID)*
         — and decides for itself, inside the queue lock, whether anything is
         owed.  This module hands over the evidence and reads the answer; it
         does not get to choose which preconditions to assert.  That choice was
@@ -2119,13 +2035,12 @@ class RetirementExecutor:
         task_id = (req or {}).get("task_id") or prog.get("task_id")
 
         if task_id and mission:
-            # Asked before plan.sh is even looked at: without the generation
+            # Asked before plan.sh is even looked at: without the Execution ID
             # there is no call to make, so a missing plan.sh is not the thing
             # to report, and reporting both would tell the Director twice
-            # about one marker.  See `_bound_generation()`.
-            generation = self._bound_generation(req, prog)
+            # about one marker.  See `_bound_execution()`.
             execution_id = self._bound_execution(req, prog)
-            if generation is None and execution_id is None:
+            if execution_id is None:
                 return self._cleanup_deferred(agent, prog, mission, task_id)
             if not self._plan_sh_usable():
                 return self._cleanup_failed(
@@ -2137,13 +2052,8 @@ class RetirementExecutor:
             # the 70s termination stall this module was written to remove
             # (Codex 4 巡目 P2).  Nothing is lost by giving up: the marker stays
             # in flight and the next cycle asks again.
-            # The attempt's ID is the evidence when the marker has one; the generation only for an old-format marker
-            # (or a card with no active attempt of its own).  Never both: plan.sh gives the ID priority anyway, and
-            # naming two things invites the day one of them is wrong.
-            evidence = (["--execution", execution_id] if execution_id is not None
-                        else ["--started-at", generation])
             argv = ["bash", str(self.plan_sh), "retire", task_id,
-                    "--agent", agent, *evidence,
+                    "--agent", agent, "--execution", execution_id,
                     "--mission", mission, "--no-wait"]
             env = dict(os.environ)
             # The audit log's `actor` for the retire row: this daemon, not "unknown" (execution.md §8).
@@ -2177,7 +2087,7 @@ class RetirementExecutor:
                     f"変更していません ({detail})。確認だけお願いします。"
                 )
                 if not self._report_timeout_once(agent, req, prog, mission, task_id,
-                                                 generation, "other_state", detail):
+                                                 execution_id, "other_state", detail):
                     self._report(agent, prog, message)
             elif rc != 0:
                 return self._cleanup_failed(
@@ -2190,7 +2100,7 @@ class RetirementExecutor:
                 )
                 reason = (req or {}).get("reason") or prog.get("reason") or "unknown"
                 if not self._report_timeout_once(agent, req, prog, mission, task_id,
-                                                 generation, "reset", ""):
+                                                 execution_id, "reset", ""):
                     self._report(
                         agent, prog,
                         f"watchdog が Worker {agent} を終了しました "
@@ -2264,7 +2174,7 @@ class RetirementExecutor:
     OWED_NOTICE_GIVE_UP_SECONDS = 1800
 
     def _report_timeout_once(self, agent: str, req: Optional[dict], prog: dict,
-                             mission: str, task_id: str, generation: str,
+                             mission: str, task_id: str, execution_id: str,
                              outcome: str, why: str) -> bool:
         """Tell the Director about a *timeout* retirement, once.  False = not handled here.
 
@@ -2284,7 +2194,7 @@ class RetirementExecutor:
         if reason != "timeout" or self.notify_once is None:
             return False
         detail = (req or {}).get("detail") or prog.get("detail") or {}
-        fp = str((req or {}).get("request_id") or prog.get("request_id") or f"gen:{generation}")
+        fp = str((req or {}).get("request_id") or prog.get("request_id") or f"exec:{execution_id}")
         key = f"timeout_{mission}_{task_id}"
         message = self._timeout_message(agent, mission, task_id, detail, outcome, why)
         self._deliver_notice(key, fp, mission, task_id, message)
@@ -2414,7 +2324,7 @@ class RetirementExecutor:
         # `PHASE_CLEANUP_FAILED` without the flag never reaches this path: its
         # own retry (`_cleanup_failed()`) resends every cycle unconditionally.
         if prog.get("cleanup_deferred"):
-            reason = prog.get("cleanup_error") or "実行世代 (started_at) を記録できていません"
+            reason = prog.get("cleanup_error") or "試行の ID (execution id) を記録できていません"
             recipe = (f"plan.sh update {task_id} --status pending --reset "
                       f"--mission {mission} を手で実行してください。"
                       if task_id and mission else "")

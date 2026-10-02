@@ -1147,12 +1147,13 @@ class Txn:
             return None
         return data if isinstance(data, dict) else None
 
-    def classify_assignment(self, agent, slug, tid, generation, execution_id=None):
+    def classify_assignment(self, agent, slug, tid, execution_id=None):
         """公開中の assignment が「この実行のもの」かの判定 (plan.sh classify_assignment と同じ結論)。
-        generation=None は「いま card が示している実行」(同じロックの中で card を読んだ直後)。
+        execution_id=None は「いま card が示している実行」(同じロックの中で card を読んだ直後。枠が task を指すだけで足りる)。
 
-        `execution_id` (01c) は identity にも ID があるときだけ ID で比べる (`lib_execution.identity_matches`。
-        片方にだけ ID があるときは今までどおり `started_at`)。None なら今と同じ判定。"""
+        `execution_id` を渡すと identity の `execution_id` と比べる (`lib_execution.identity_matches`)。E4b で世代
+        (`started_at`) の比較は外した: identity に ID が無い (E2 より前・旧コードの publish) もこの試行のものとは
+        言えないので SUCCESSOR (撤去しない・保留。resume は公開し直す)。identity が無い・読めないときだけ UNVERIFIABLE。"""
         if agent_name_problem(agent):
             return ASSIGN_UNVERIFIABLE
         slot = self._read_slot(agent)
@@ -1162,21 +1163,21 @@ class Txn:
             return ASSIGN_UNVERIFIABLE
         if slot[1] != f"{slug}:{tid}":
             return ASSIGN_OTHER_TASK
-        if generation is None:
+        if execution_id is None:
             return ASSIGN_MINE
         identity = self._read_identity(agent)
         if not identity:
             return ASSIGN_UNVERIFIABLE
         if identity.get('mission') != slug or identity.get('task') != tid:
             return ASSIGN_UNVERIFIABLE
-        if not _ex.identity_matches(identity, execution_id=execution_id, generation=generation):
+        if not _ex.identity_matches(identity, execution_id=execution_id):
             return ASSIGN_SUCCESSOR
         return ASSIGN_MINE
 
-    def retire_assignment(self, agent, slug, tid, generation):
+    def retire_assignment(self, agent, slug, tid, execution_id=None):
         """撤去する唯一の入口。「この実行のもの」と確定したときだけ消し、判定を返す。
         消せなかったら `StoreWriteError` (plan.sh の warn で握り潰す型を持たない)。"""
-        verdict = self.classify_assignment(agent, slug, tid, generation)
+        verdict = self.classify_assignment(agent, slug, tid, execution_id)
         if verdict != ASSIGN_MINE:
             return verdict
         self._remove(self.assignment_path(agent))
@@ -1611,8 +1612,8 @@ class _Recovery:
             # .identity の検査は assignment を持つ status 全部 (S4 持ち越し: 以前は in_progress だけ)。
             # 欠け・壊れ・読めない・別の task を指す、はどれも finding (修復はしない = report-only。
             # identity → 本体の書き順なので、本体があって identity が無いのは crash では作れない)。
-            if gen:
-                verdict = self.t.classify_assignment(worker, slug, tid, str(gen), execution_id=xid)
+            if xid:
+                verdict = self.t.classify_assignment(worker, slug, tid, execution_id=xid)
                 if verdict == ASSIGN_SUCCESSOR:
                     self._emit('reported:generation_mismatch', slug, tid, worker)
                 elif verdict == ASSIGN_UNVERIFIABLE:

@@ -242,6 +242,17 @@ class FakeMux:
         return True
 
 
+#: fixture の card が今持っている試行 (E4b: 退役は試行の ID だけで束縛される)。
+SANDBOX_XID = "ex-" + "a" * 32
+OTHER_XID = "ex-" + "b" * 32       # 同名の後任・別 task の試行
+
+
+def execution_fields(execution_id: str = SANDBOX_XID, started_at: str = "2026-09-21T00:00:00Z") -> str:
+    """running な試行の frontmatter 行 (`plan.sh pull` が card に書く欄の組)。"""
+    return (f'current_execution_id: {execution_id}\nexecution_status: running\nexecution_count: 1\n'
+            f'execution_reserved_at: "{started_at}"\ntask_slug: retirement-fixture\n')
+
+
 class Sandbox:
     """使い捨ての crewvia repo。本番の queue/ registry/ には触れない。"""
 
@@ -265,10 +276,13 @@ class Sandbox:
     def assignment_identity_file(self) -> Path:
         return self.queue / "assignments" / (AGENT + ".identity")
 
-    def publish_assignment(self, started_at: str) -> None:
+    def publish_assignment(self, started_at: str, execution_id: str = None) -> None:
         """`plan.sh pull` が公開するもの一式 — 本体 + 実行アイデンティティ。
 
-        サイドカーを省くと `classify_assignment()` は「世代を証明できない」に
+        `execution_id` を省くと fixture の card の試行 (`SANDBOX_XID`)。E4b で世代 (`started_at`) の比較は無くなり、
+        枠の identity は試行の ID で照合される。
+
+        サイドカーを省くと `classify_assignment()` は「試行を証明できない」に
         倒れ、後始末は (正しく) 何もしない。本番の pull は必ず両方書くので、
         片方だけ置いた fixture は本番より弱い状態を試していることになる。
         """
@@ -279,6 +293,7 @@ class Sandbox:
             "task": TASK_ID,
             "worker": AGENT,
             "started_at": started_at,
+            "execution_id": execution_id or SANDBOX_XID,
         }, ensure_ascii=False, sort_keys=True) + "\n")
 
     def task_status(self) -> str:
@@ -337,7 +352,7 @@ def sandbox(tmp_path):
     (mission / "tasks" / f"{TASK_ID}.md").write_text(
         f"---\nid: {TASK_ID}\ntitle: retirement fixture\nskills: [code]\n"
         f"priority: high\nstatus: in_progress\nblocked_by: []\ntarget_dir: null\n"
-        f'worker: {AGENT}\nstarted_at: "2026-09-21T00:00:00Z"\ncompleted_at: null\n'
+        f'worker: {AGENT}\nstarted_at: "2026-09-21T00:00:00Z"\n{execution_fields()}completed_at: null\n'
         f"---\n\n## Description\nfixture\n\n## Result\n"
     )
     sb.publish_assignment("2026-09-21T00:00:00Z")
@@ -1176,17 +1191,16 @@ def test_red_cleanup_does_not_clear_a_successor_assignment(sandbox):
     mux = FakeMux({WINDOW: pane_pid})
     ex = make_executor(sandbox, mux)
 
-    # Worker は既に殺し終えていて、後始末だけが残っている状態。世代は記録済み —
-    # ここで見たいのは「世代を持っていてなお後任を巻き込まないか」なので、
-    # 世代を落とすと後始末が保留に倒れてしまい、肝心の経路を通らない。
-    original_started_at = sandbox.task_started_at()
+    # Worker は既に殺し終えていて、後始末だけが残っている状態。試行の ID は記録済み —
+    # ここで見たいのは「ID を持っていてなお後任を巻き込まないか」なので、
+    # ID を落とすと後始末が保留に倒れてしまい、肝心の経路を通らない。
     lib_retirement.write_json_atomic(
         lib_retirement.progress_path(sandbox.registry, AGENT),
         lib_retirement.build_progress(
             None, lib_retirement.PHASE_TERMINATED,
             window_gone=True, pane_pid=pane_pid,
             mission=SLUG, task_id=TASK_ID, reason="timeout",
-            task_started_at=original_started_at))
+            task_execution_id=SANDBOX_XID))
 
     # その間に人間が reset → 後任 Worker が同じ task を pull した
     _set_task_field(sandbox, "worker", "Successor")
@@ -1422,7 +1436,9 @@ def test_red_cleanup_does_not_reset_a_same_named_successors_execution(sandbox):
     second_started_at = '"2026-09-22T09:00:00Z"'
     assert second_started_at.strip('"') != first_started_at
     _set_task_field(sandbox, "started_at", second_started_at)
-    sandbox.publish_assignment(second_started_at.strip('"'))
+    _set_task_field(sandbox, "current_execution_id", "ex-" + "b" * 32)   # 後任の試行 (E4b: 区別は ID)
+    _set_task_field(sandbox, "execution_reserved_at", second_started_at)
+    sandbox.publish_assignment(second_started_at.strip('"'), "ex-" + "b" * 32)
 
     ex.process_all()                      # 後始末が走る cycle
 
@@ -1745,7 +1761,6 @@ def test_cleanup_is_bound_to_the_execution_by_a_single_plan_sh_call(sandbox):
     形に戻ると、「どれを渡すか」の判断が呼び出し側ごとに分かれ、1 つ緩めた場所
     から同じ型の事故が再発する (3 巡で 9 件の P1 がまさにそれだった)。
     """
-    started_at = sandbox.task_started_at()
     pane_pid = sandbox.spawn_worker_process()
     sandbox.record_identity(WINDOW, pane_pid)
     mux = FakeMux({WINDOW: pane_pid})
@@ -1769,7 +1784,7 @@ def test_cleanup_is_bound_to_the_execution_by_a_single_plan_sh_call(sandbox):
     argv = calls[0]
     assert argv[2] == "retire", f"新 API を通っていない: {argv}"
     assert argv[3] == TASK_ID
-    assert argv[4:] == ["--agent", AGENT, "--started-at", started_at,
+    assert argv[4:] == ["--agent", AGENT, "--execution", SANDBOX_XID,
                         "--mission", SLUG, "--no-wait"], (
         f"証拠以外のものを渡している: {argv}")
     # --no-wait は「何を主張するか」ではなく「待てるかどうか」の指定なので、
@@ -2156,7 +2171,8 @@ def test_red_progress_is_bound_to_the_request_that_created_it(sandbox):
     other.write_text(other.read_text()
                      .replace("status: pending", "status: in_progress")
                      .replace("worker: null", f"worker: {AGENT}")
-                     .replace("started_at: null", 'started_at: "2099-01-01T00:00:00Z"'))
+                     .replace("started_at: null", 'started_at: "2099-01-01T00:00:00Z"\n'
+                              + execution_fields(OTHER_XID, "2099-01-01T00:00:00Z").rstrip("\n")))
 
     ex = make_executor(sandbox, mux, grace_period=3600)
     assert ex.request(AGENT, WINDOW, "timeout", mission=SLUG, task_id=TASK_ID)
@@ -2166,13 +2182,13 @@ def test_red_progress_is_bound_to_the_request_that_created_it(sandbox):
     replacement = lr.build_request(
         AGENT, WINDOW, "no-task",
         {"pane_pid": pane_pid, "created_at": None},
-        mission=SLUG, task_id="t002", task_started_at="2099-01-01T00:00:00Z")
+        mission=SLUG, task_id="t002", task_execution_id=OTHER_XID)
     lr.write_json_atomic(lr.request_path(sandbox.registry, AGENT), replacement)
-    sandbox.publish_assignment("2099-01-01T00:00:00Z")  # t002 の assignment
+    sandbox.publish_assignment("2099-01-01T00:00:00Z", OTHER_XID)  # t002 の assignment
     sandbox.assignment_file.write_text(f"{SLUG}:t002\n")
     sandbox.assignment_identity_file.write_text(json.dumps({
         "mission": SLUG, "task": "t002", "worker": AGENT,
-        "started_at": "2099-01-01T00:00:00Z"}, ensure_ascii=False, sort_keys=True) + "\n")
+        "started_at": "2099-01-01T00:00:00Z", "execution_id": OTHER_XID}, ensure_ascii=False, sort_keys=True) + "\n")
 
     ex.now = lambda: time.time() + 7200
     for _ in range(6):
@@ -2221,7 +2237,7 @@ def test_red_plan_sh_retire_can_refuse_to_wait_for_the_queue_lock(sandbox):
     with _HeldLock(sandbox.queue):
         started = time.monotonic()
         res = _plan(sandbox, "retire", TASK_ID, "--agent", AGENT,
-                    "--started-at", "2026-09-21T00:00:00Z",
+                    "--execution", SANDBOX_XID,
                     "--mission", SLUG, "--no-wait", timeout=30)
         elapsed = time.monotonic() - started
 

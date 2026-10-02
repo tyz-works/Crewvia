@@ -280,10 +280,10 @@ CALLER_CHECKS = frozenset({CHECK_VERIFIED, CHECK_UNVERIFIED, CHECK_LEGACY_GENERA
                            CHECK_DETACHED})
 
 
-def execution_matches(view, meta, *, execution_id=None, started_at=None):
-    """名乗られた証拠が card の今の試行と一致するか。移行期の規則の**唯一の定義** (execution.md §2.2)。
+def execution_matches(view, meta, *, execution_id=None):
+    """名乗られた試行の ID が card の今の試行と一致するか。照合の規則の**唯一の定義** (execution.md §2.2)。
 
-    `view` は `attempt_view(meta, ...)` の答え。証拠は `execution_id` と `started_at` (旧 marker・旧引数) の 2 種類で、
+    `view` は `attempt_view(meta, ...)` の答え。証拠は `execution_id` だけ (E4b で世代 = `started_at` の照合を外した)。
     **「指定されたか」は None かどうかで見る** (空文字を「無い」に倒さない —— 空の明示指定は `MISMATCH`)。
 
     戻り値 `(MATCH|MISMATCH, caller_check)`:
@@ -291,47 +291,26 @@ def execution_matches(view, meta, *, execution_id=None, started_at=None):
     | view | 証拠 | 判定 | caller_check |
     |---|---|---|---|
     | ACTIVE / TERMINAL | execution_id = X | match | verified |
-    | 同上 | execution_id ≠ X | mismatch (`started_at` が一致していても。ID が優先) | — |
-    | 同上 | execution_id なし・started_at のみ | `started_at` が予約の値なら match | legacy_generation |
-    | NONE | started_at のみ | 今の世代の照合: card の `started_at` と一致で match | legacy_generation |
-    | NONE | execution_id | mismatch (この card はその ID を発行していない) | — |
-    | DETACHED | execution_id | mismatch | — |
-    | DETACHED | started_at のみ | card の `started_at` と一致で match (旧コードの持ち主の世代) | detached_execution |
+    | 同上 | execution_id ≠ X | mismatch | — |
+    | NONE / DETACHED | execution_id | mismatch (この card の今の持ち主の試行ではない) | — |
     | どれでも | 証拠なし | mismatch (照合できない。呼び出し側が「名乗りなし」の経路を決める) | — |
     """
-    if execution_id is not None:
-        if view in (ACTIVE, TERMINAL):
-            return ((MATCH, CHECK_VERIFIED) if execution_id == meta.get('current_execution_id')
-                    else (MISMATCH, None))
-        return (MISMATCH, None)              # NONE / DETACHED
-    if started_at is None:
+    if execution_id is None:
         return (MISMATCH, None)
-    recorded = meta.get('started_at')
-    same = recorded not in (None, '') and str(recorded) == str(started_at)
     if view in (ACTIVE, TERMINAL):
-        # 予約時の世代 (card の `started_at` は reset 等で null になりうるので `execution_reserved_at` と比べる)
-        return ((MATCH, CHECK_LEGACY_GENERATION) if str(started_at) == meta.get('execution_reserved_at')
+        return ((MATCH, CHECK_VERIFIED) if execution_id == meta.get('current_execution_id')
                 else (MISMATCH, None))
-    if view == NONE:
-        return ((MATCH, CHECK_LEGACY_GENERATION) if same else (MISMATCH, None))
-    return ((MATCH, CHECK_DETACHED) if same else (MISMATCH, None))     # DETACHED
+    return (MISMATCH, None)              # NONE / DETACHED
 
 
-def identity_matches(identity, *, execution_id=None, generation=None):
-    """projection (`.identity`) が「この試行のもの」か。execution.md §2.2 の末尾の規則。
+def identity_matches(identity, *, execution_id=None):
+    """projection (`.identity`) が「この試行のもの」か。ID だけで比べる (E4b で世代の比較を外した)。
 
-    identity と呼び出し側の**両方**に `execution_id` があれば ID で、そうでなければ `started_at` で比べる。
-    「片方にだけ ID がある」組 (card に X・identity に ID なし) は、identity が E2 前に公開されたものか旧コードの
-    publish なので、`started_at` が一致すれば一致 (読めないに倒すと cutover の瞬間に全 Worker の枠が
-    UNVERIFIABLE になる)。ID が両方にあって違えば、`started_at` が一致していても不一致 (ID が優先)。
+    identity か呼び出し側のどちらかに `execution_id` が無ければ**一致と言わない** (`False`): identity に ID が無いのは
+    E2 より前の publish か旧コードの publish で、いまの card の試行のものだと証明できない。
     """
     recorded_id = identity.get('execution_id')
-    if recorded_id is not None and execution_id is not None:
-        return recorded_id == execution_id
-    recorded = identity.get('started_at')
-    if recorded is None or generation is None:
-        return False
-    return str(recorded) == str(generation)
+    return recorded_id is not None and execution_id is not None and recorded_id == execution_id
 
 
 # ---------------------------------------------------------------------------

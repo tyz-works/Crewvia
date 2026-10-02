@@ -17,8 +17,8 @@
 # ここで固定する性質:
 #   1. pull は assignment と *同じロックの中で* 実行世代を記録する
 #   2. done / fail は自分の task を指していない assignment を消さない
-#   3. retire は世代が一致しない限り 1 バイトも書かない (exit 3)
-#   4. retire は世代を証明できないとき「実行しない」に倒す (exit 3)
+#   3. retire は試行の ID が一致しない限り 1 バイトも書かない (exit 3)。世代 (started_at) では名指ししない (E4b)
+#   4. retire は ID を証明できないとき「実行しない」に倒す (exit 3)
 #
 # Run: bats tests/plan-assignment-identity.bats
 
@@ -248,9 +248,9 @@ assert d['started_at'] == '''$started''', d
   run plan pull --agent Ren --skills bash --task t001 --mission "$TEST_MISSION"
   [ "$status" -eq 0 ]
   local gen
-  gen="$(card_field t001 started_at)"
+  gen="$(card_field t001 current_execution_id)"
 
-  run plan retire t001 --agent Ren --started-at "$gen" --mission "$TEST_MISSION"
+  run plan retire t001 --agent Ren --execution "$gen" --mission "$TEST_MISSION"
   [ "$status" -eq 0 ]
 
   [ "$(card_field t001 status)" = "pending" ]
@@ -270,7 +270,7 @@ assert d['started_at'] == '''$started''', d
   run plan pull --agent Ren --skills bash --task t001 --mission "$TEST_MISSION"
   [ "$status" -eq 0 ]
   local gen1
-  gen1="$(card_field t001 started_at)"
+  gen1="$(card_field t001 current_execution_id)"
 
   # 人間が差し戻し、同名 Worker が pull し直す (crewvia は名前を使い回す)。
   run plan update t001 --reset --mission "$TEST_MISSION"
@@ -278,17 +278,17 @@ assert d['started_at'] == '''$started''', d
   run plan pull --agent Ren --skills bash --task t001 --mission "$TEST_MISSION"
   [ "$status" -eq 0 ]
   local gen2
-  gen2="$(card_field t001 started_at)"
+  gen2="$(card_field t001 current_execution_id)"
   [ "$gen1" != "$gen2" ]
 
   # 世代 1 に向けて出された後始末が、いま動いている世代 2 に着弾する状況。
-  run plan retire t001 --agent Ren --started-at "$gen1" --mission "$TEST_MISSION"
+  run plan retire t001 --agent Ren --execution "$gen1" --mission "$TEST_MISSION"
   [ "$status" -eq "$PRECONDITION_UNMET" ]
 
   # 1 バイトも変わっていないこと。
   [ "$(card_field t001 status)" = "in_progress" ]
   [ "$(card_field t001 worker)" = "Ren" ]
-  [ "$(card_field t001 started_at)" = "$gen2" ]
+  [ "$(card_field t001 current_execution_id)" = "$gen2" ]
   [ -f "$ASSIGN_DIR/Ren" ]
   [ "$(cat "$ASSIGN_DIR/Ren")" = "$TEST_MISSION:t001" ]
   [ -f "$ASSIGN_DIR/Ren.identity" ]
@@ -303,9 +303,9 @@ assert d['started_at'] == '''$started''', d
   run plan pull --agent Ren --skills bash --task t001 --mission "$TEST_MISSION"
   [ "$status" -eq 0 ]
   local gen
-  gen="$(card_field t001 started_at)"
+  gen="$(card_field t001 current_execution_id)"
 
-  run plan retire t001 --agent Omar --started-at "$gen" --mission "$TEST_MISSION"
+  run plan retire t001 --agent Omar --execution "$gen" --mission "$TEST_MISSION"
   [ "$status" -eq "$PRECONDITION_UNMET" ]
 
   [ "$(card_field t001 status)" = "in_progress" ]
@@ -322,12 +322,12 @@ assert d['started_at'] == '''$started''', d
   run plan pull --agent Ren --skills bash --task t001 --mission "$TEST_MISSION"
   [ "$status" -eq 0 ]
   local gen
-  gen="$(card_field t001 started_at)"
+  gen="$(card_field t001 current_execution_id)"
 
   run plan_as Ren done t001 "result" --mission "$TEST_MISSION"
   [ "$status" -eq 0 ]
 
-  run plan retire t001 --agent Ren --started-at "$gen" --mission "$TEST_MISSION"
+  run plan retire t001 --agent Ren --execution "$gen" --mission "$TEST_MISSION"
   [ "$status" -eq "$PRECONDITION_UNMET" ]
 
   [ "$(card_field t001 status)" = "done" ]
@@ -342,12 +342,12 @@ assert d['started_at'] == '''$started''', d
   run plan pull --agent Ren --skills bash --task t001 --mission "$TEST_MISSION"
   [ "$status" -eq 0 ]
   local gen
-  gen="$(card_field t001 started_at)"
+  gen="$(card_field t001 current_execution_id)"
 
   # 旧 plan.sh が書いた assignment (世代の記録がない) を模す。
   rm -f "$ASSIGN_DIR/Ren.identity"
 
-  run plan retire t001 --agent Ren --started-at "$gen" --mission "$TEST_MISSION"
+  run plan retire t001 --agent Ren --execution "$gen" --mission "$TEST_MISSION"
   [ "$status" -eq "$PRECONDITION_UNMET" ]
 
   # 証拠が足りないときは前提を弱めず「実行しない」に倒す。
@@ -365,19 +365,19 @@ assert d['started_at'] == '''$started''', d
   run plan pull --agent Ren --skills bash --task t001 --mission "$TEST_MISSION"
   [ "$status" -eq 0 ]
   local gen
-  gen="$(card_field t001 started_at)"
+  gen="$(card_field t001 current_execution_id)"
 
   # assignment だけ先に消えている (クラッシュ後の取り残し card)。
   rm -f "$ASSIGN_DIR/Ren" "$ASSIGN_DIR/Ren.identity"
 
-  run plan retire t001 --agent Ren --started-at "$gen" --mission "$TEST_MISSION"
+  run plan retire t001 --agent Ren --execution "$gen" --mission "$TEST_MISSION"
   [ "$status" -eq 0 ]
   [ "$(card_field t001 status)" = "pending" ]
 
   cleanup_queue
 }
 
-@test "retire requires an explicit generation" {
+@test "retire requires an explicit execution id and no longer takes a generation" {
   setup_queue "ai-retire-needs-gen"
   add_task t001
 
@@ -387,7 +387,14 @@ assert d['started_at'] == '''$started''', d
   run plan retire t001 --agent Ren --mission "$TEST_MISSION"
   [ "$status" -eq 1 ]
 
-  # 世代を省略しても「とりあえず実行」にならないこと。
+  # E4b: 世代 (--started-at) での名指しは外した。未知のオプションで何も書かない。
+  local gen
+  gen="$(card_field t001 started_at)"
+  run plan retire t001 --agent Ren --started-at "$gen" --mission "$TEST_MISSION"
+  [ "$status" -ne 0 ]
+  [ "$status" -ne "$PRECONDITION_UNMET" ]
+
+  # ID を省略しても「とりあえず実行」にならないこと。
   [ "$(card_field t001 status)" = "in_progress" ]
   [ -f "$ASSIGN_DIR/Ren" ]
 
@@ -401,9 +408,9 @@ assert d['started_at'] == '''$started''', d
   run plan pull --agent Ren --skills bash --task t001 --mission "$TEST_MISSION"
   [ "$status" -eq 0 ]
   local gen
-  gen="$(card_field t001 started_at)"
+  gen="$(card_field t001 current_execution_id)"
 
-  run plan retire t001 --agent Ren --started-at "$gen" --mission "$TEST_MISSION" \
+  run plan retire t001 --agent Ren --execution "$gen" --mission "$TEST_MISSION" \
     --outcome needs-director --reason "watchdog terminated the worker"
   [ "$status" -eq 0 ]
 
@@ -425,7 +432,7 @@ assert d['started_at'] == '''$started''', d
   run plan pull --agent Ren --skills bash --task t001 --mission "$TEST_MISSION"
   [ "$status" -eq 0 ]
   local gen
-  gen="$(card_field t001 started_at)"
+  gen="$(card_field t001 current_execution_id)"
 
   run plan_as Ren needs-director t001 "人手の判断が要る" --mission "$TEST_MISSION"
   [ "$status" -eq 0 ]
@@ -436,7 +443,7 @@ assert d['started_at'] == '''$started''', d
   [ ! -e "$ASSIGN_DIR/Ren" ]
 
   # worker も started_at も needs-director では変わらないので、世代まで一致する。
-  run plan retire t001 --agent Ren --started-at "$gen" --mission "$TEST_MISSION"
+  run plan retire t001 --agent Ren --execution "$gen" --mission "$TEST_MISSION"
   [ "$status" -eq "$PRECONDITION_UNMET" ]
 
   [ "$(card_field t001 status)" = "needs_director" ]
@@ -460,7 +467,7 @@ assert d['started_at'] == '''$started''', d
   local victim="$TEST_QUEUE/victim"
   echo "keep me" > "$victim"
 
-  run plan retire t001 --agent "../../victim" --started-at "2026-01-01T00:00:00Z" \
+  run plan retire t001 --agent "../../victim" --execution "ex-00000000000000000000000000000000" \
     --mission "$TEST_MISSION"
   [ "$status" -ne 0 ]
   [ "$status" -ne "$PRECONDITION_UNMET" ]   # 前提ではなく名前が不正、で落ちること

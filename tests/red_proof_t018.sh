@@ -199,12 +199,12 @@ import sys, pathlib
 p = pathlib.Path(sys.argv[1]); s = p.read_text()
 old = """    text = read_regular_text_or_unreadable(path)
     if is_unreadable(text):
-        return UNKNOWN_STARTED_AT"""
+        return UNKNOWN_EXECUTION_ID"""
 assert old in s, "注入点が見つからない"
 s = s.replace(old, """    try:
         text = path.read_text(encoding="utf-8")
     except OSError:
-        return UNKNOWN_STARTED_AT""")
+        return UNKNOWN_EXECUTION_ID""")
 p.write_text(s)
 PY
 
@@ -239,7 +239,7 @@ run_case "P2-c: 表に無い関数に、新しい直接読み取りが入る" \
 
 run_case "P2-d: 退役がカードを直接読む" \
          "$INJECT_P2_RETIREMENT" \
-         "no_unguarded_read_remains or read_task_started_at" \
+         "no_unguarded_read_remains or read_task_execution_id" \
          "scripts/lib_retirement.py"
 
 

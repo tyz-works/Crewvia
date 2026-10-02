@@ -143,8 +143,8 @@ def run_scenario(src_root: pathlib.Path, root: pathlib.Path) -> dict:
 
     # --- retire (reset) / reap-orphan-assignment / update ---------------------------------
     r.run("pull", "--agent", "Ren", "--skills", "bash,code", "--task", "t001")
-    gen = r.field("t001", "started_at")
-    r.run("retire", "t001", "--agent", "Ren", "--started-at", gen, "--outcome", "reset", "--no-wait",
+    xid = r.field("t001", "current_execution_id")      # E4b: retire は試行の ID で名指しする (世代 `--started-at` は無い)
+    r.run("retire", "t001", "--agent", "Ren", "--execution", xid, "--outcome", "reset", "--no-wait",
           label="retire (reset)")
     r.run("pull", "--agent", "Ren", "--skills", "bash,code", "--task", "t001")
     r.run("done", "t001", "orphan case", "--no-pr", "compat", label="done (no AGENT_NAME: assignment stays)")

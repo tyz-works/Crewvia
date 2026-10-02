@@ -103,7 +103,6 @@ CASES = {
     ("release-dep", "--dep"): (None, ["release-dep", "t002", "--mission", M, "--dep", "t999"]),
     ("retire", "--mission"): (None, ["retire", "t001", "--agent", "Ren", "--execution", "{X}", "--mission", NOPE]),
     ("retire", "--agent"): (None, ["retire", "t001", "--execution", "{X}", "--mission", M, "--agent", "bad name!"]),
-    ("retire", "--started-at"): (None, ["retire", "t001", "--agent", "Ren", "--mission", M, "--started-at", ""]),
     ("retire", "--execution"): (None, ["retire", "t001", "--agent", "Ren", "--mission", M, "--execution", ""]),
     ("retire", "--outcome"): (None, ["retire", "t001", "--agent", "Ren", "--execution", "{X}", "--mission", M,
                                      "--outcome", "bogus"]),

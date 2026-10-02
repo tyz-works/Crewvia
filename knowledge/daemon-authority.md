@@ -311,19 +311,19 @@ idle に見えるので kill される。`cmd_done()` / `cmd_fail()` に至っ�
 **`plan.sh retire` — 後始末の 1 本の API。**
 
 ```
-plan.sh retire <task_id> --agent <name> (--execution <id> | --started-at <generation>)
+plan.sh retire <task_id> --agent <name> --execution <id>
                [--mission <slug>] [--outcome reset|needs-director] [--reason "<1 行>"]
 ```
 
-「この実行 (mission, task, worker, 世代) を終了扱いにして後始末する」を 1 操作で行う。
-呼び出し側が status / worker / 世代を個別に組み立てる形だと、どれを渡すか・省くかの
+「この実行 (mission, task, worker, 試行の ID) を終了扱いにして後始末する」を 1 操作で行う。
+呼び出し側が status / worker / 試行を個別に組み立てる形だと、どれを渡すか・省くかの
 判断が呼び出し側ごとに分かれ、1 つ緩めた場所から同じ型の事故が再発する。
 
-- **E4a (01c) 以降、名指しは `--execution <ex-…>` (試行の ID。優先) か `--started-at` (旧形式の世代)。どちらも無ければ
-  使い方の誤り。空の値は exit 1** (`knowledge/execution.md` §17)。以下の「必須」は、どちらかが必須の意味に読む。
-- `--started-at` は**必須**。省略を許すと名前だけで束縛された後始末に戻る。世代を
+- **E4b (01c) 以降、名指しは `--execution <ex-…>` (試行の ID) だけ。省略は使い方の誤り・空の値は exit 1・世代
+  (`--started-at`) は未知のオプション** (`knowledge/execution.md` §17・§18)。E4a までは `--started-at` (旧形式の世代) も受けていた。
+- `--execution` は**必須**。省略を許すと名前だけで束縛された後始末に戻る。ID を
   読めなかった呼び出し側は retire を呼ばず Director に上げること。
-- 前提 (status が未終了 / worker 一致 / 世代一致 / assignment が自分のものか不在) が
+- 前提 (status が未終了 / worker 一致 / 試行の ID 一致 / assignment が自分のものか不在) が
   1 つでも外れたら **1 バイトも書かずに exit 3** (`PRECONDITION_UNMET`)。0 (書いた)
   とも 1 (plan.sh 側の異常) とも区別できるので、呼び出し側は保留に倒せる。
 - 前提を弱めて実行する経路は用意しない。
@@ -670,7 +670,8 @@ t012 (Codex) の 2 巡目。§6-3 が「根拠が揃う前に後始末に到達�
 `--expect-started-at` として足し、t024 で `plan.sh retire --started-at`
 (§3-5) に吸収した。
 
-`started_at` は retirement request を書く時点で `read_task_started_at()` が
+(E4b で世代は試行の ID に置き換わった。以下は t024 当時の設計。) `started_at` は retirement request を書く時点で
+`read_task_started_at()` (E4b で `read_task_execution_id()` に) が
 task カードから読み、request → progress と引き継ぐ。**呼び出し側に渡させない**
 のは、忘れた 1 箇所が黙って名前ベースの判定に落ちるため (memory:
 `approve-judgment-needs-allowlist-and-scope` — 判定 unit は 1 つに絞る)。

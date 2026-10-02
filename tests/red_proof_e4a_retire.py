@@ -15,10 +15,10 @@
 
 変異の対応 (受入条件の「赤の実証: 照合を世代に戻した変異・照合を外した変異で『新しい試行を退役させる』テストが赤」+ 必須条件):
 
-- R01 照合を世代に戻す: retire が `--execution` を無視し、card の今の世代で照合する (新しい試行を退役させる)
+- (R01 は E4b で欠番: 世代の照合そのものが無くなった。世代に戻す変異は `tests/red_proof_e4b_generation.py`)
 - R02 照合を外す: retire が試行の照合の結果を見ない
-- R03 `--execution ""` を「指定なし」に倒す (値の真偽で判定。世代だけの経路に落ちる。01b G3 の型)
-- R04 marker に ID を書かない (producer を戻す。後始末が世代の経路のまま)
+- R03 `--execution ""` の拒否を外す (空の明示指定を名乗りの照合に流す。01b G3 の型)
+- R04 marker に ID を書かない (producer を戻す。E4b の後は ID の無い marker は保留)
 - R05 assignment の照合が ID を見ない (世代が同じ後任に SIGTERM が届く)
 - R06 `update --reset` が試行を閉じない
 - R07 retire が別の終了コードで試行を閉じる (RETIRED でなく RESET_BY_DIRECTOR)
@@ -47,37 +47,29 @@ DISP = "scripts/dispatcher.sh"
 TEST = "tests/test_execution_e4a_retire_reset.py"
 
 MUTATIONS = [
-    ("R01", "照合を世代に戻す (--execution を無視して card の今の世代で照合 = 新しい試行を退役させる)", PLAN,
-     "        meta, body = load_task(slug, task_id)\n\n        # ── 前提の確認。ここから下で 1 バイトでも書く前に、全部通す。",
-     "        meta, body = load_task(slug, task_id)\n"
-     "        nonlocal execution_id, generation\n"
-     "        execution_id, generation = None, str(meta.get('started_at'))\n\n"
-     "        # ── 前提の確認。ここから下で 1 バイトでも書く前に、全部通す。",
-     ["test_the_execution_id_decides_even_when_the_generation_is_identical",
-      "test_a_stale_attempt_cannot_retire_its_successor"], TEST),
     ("R02", "照合を外す (名乗りが何であれ card の今の試行として通す)", PLAN,
      "        meta, body = load_task(slug, task_id)\n\n        # ── 前提の確認。ここから下で 1 バイトでも書く前に、全部通す。",
      "        meta, body = load_task(slug, task_id)\n"
-     "        nonlocal execution_id, generation\n"
-     "        execution_id, generation = meta.get('current_execution_id'), None\n\n"
+     "        nonlocal execution_id\n"
+     "        execution_id = meta.get('current_execution_id')\n\n"
      "        # ── 前提の確認。ここから下で 1 バイトでも書く前に、全部通す。",
      ["test_a_wrong_execution_is_refused_with_exit_3_and_nothing_is_written",
       "test_a_stale_attempt_cannot_retire_its_successor",
       "test_the_execution_id_decides_even_when_the_generation_is_identical"], TEST),
-    ("R03", "--execution \"\" を指定なしに倒す (世代だけの経路に落ちる)", PLAN,
-     "    if '--execution' in opts:\n        execution_id = opts['--execution'].strip()",
-     "    if opts.get('--execution'):\n        execution_id = opts['--execution'].strip()",
+    ("R03", "--execution \"\" の拒否を外す (空の明示指定が名乗りの照合に流れて exit 3 になる)", PLAN,
+     "    if not execution_id:\n        die(\"[plan.sh retire] --execution には",
+     "    if False:\n        die(\"[plan.sh retire] --execution には",
      ["test_an_empty_or_missing_claim_is_refused_with_exit_1_and_nothing_is_written"], TEST),
     ("R04", "marker に ID を書かない (producer を戻す)", RET,
      "    if task_execution_id is not UNKNOWN_EXECUTION_ID:\n        req[\"task_execution_id\"] = task_execution_id\n",
      "",
      ["test_the_marker_and_the_cleanup_are_bound_to_the_execution",
       "test_the_progress_file_carries_the_execution_forward_after_the_request_is_gone"], TEST),
-    ("R05", "assignment の照合が ID を見ない (世代が同じ後任に SIGTERM が届く)", RET,
-     "    if execution_id is not None and (identity or {}).get(\"execution_id\") is not None:\n",
-     "    if False:\n",
+    ("R05", "assignment の照合が ID の違いを見ない (世代が同じ後任に SIGTERM が届く)", RET,
+     "    if recorded != execution_id:\n        return EXEC_OTHER,",
+     "    if False:\n        return EXEC_OTHER,",
      ["test_a_successor_with_the_same_generation_is_not_signalled_at_the_guard",
-      "test_assignment_verdict_prefers_the_execution_id_over_the_generation"], TEST),
+      "test_assignment_verdict_compares_the_execution_id_only"], TEST),
     ("R06", "update --reset が試行を閉じない", PLAN,
      "                    _CONTROLLER.reset_task(_txn(), slug, task_id, _CONTROLLER.NO_CALLER,\n"
      "                                           meta_updates={'completed_at': None})\n",
@@ -106,8 +98,8 @@ MUTATIONS = [
      "        if False:\n            die(f\"{prefix}試行の欄が壊れています",
      ["test_a_card_with_broken_execution_fields_is_not_retired"], TEST),
     ("R12", "DETACHED の card の古い ID を marker に束縛する", RET,
-     "    return meta[\"current_execution_id\"] if view == _ex.ACTIVE else None\n",
-     "    return meta[\"current_execution_id\"] if view in (_ex.ACTIVE, _ex.DETACHED) else None\n",
+     "    return meta[\"current_execution_id\"] if view in (_ex.ACTIVE, _ex.TERMINAL) else None\n",
+     "    return meta[\"current_execution_id\"] if view in (_ex.ACTIVE, _ex.TERMINAL, _ex.DETACHED) else None\n",
      ["test_the_marker_reader_binds_only_an_active_attempt"], TEST),
 ]
 CONTROL_TESTS = (TEST, "tests/test_execution_e4a_daemon_env.py")

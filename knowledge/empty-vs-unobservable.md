@@ -133,7 +133,7 @@ H だけが毛色が違う —— **t017 の修正が作った**。ガードを�
 | `dispatcher.publish_agents` — assignment 本体 (ガードしたカード読み取りの **直前**) | `dispatch()` より前に走るので全 mission の割り当て | **修正済** (t018) |
 | `dispatcher.check_rule5` — assignment ×2 | Rule 5 の通知 | **修正済** (t018) |
 | `dispatcher._mux_created_at` / `_spawn_time_fallback` / `_load_state_entry` — registry/mux | dispatch サイクル全体 | **修正済** (t018) |
-| `lib_retirement.read_task_started_at` / `read_json` / `assignment_execution_verdict` / `created_at_from_cache` | **watchdog のサイクルの中の退役処理** | **修正済** (t018) |
+| `lib_retirement.read_task_execution_id` (旧 `read_task_started_at`。E4b) / `read_json` / `assignment_execution_verdict` / `created_at_from_cache` | **watchdog のサイクルの中の退役処理** | **修正済** (t018) |
 | `watchdog._newest_notification` — 通知本体 | idle 判定 | **修正済** (t018) |
 | `lib_daemon_watch.load_config` / `read_pause_state` | 相互監視 | **修正済** (t018) |
 | `lib_mux.read_pane_record` / `_config_mode` | spawn / kill の判定 | **修正済** (t018) |

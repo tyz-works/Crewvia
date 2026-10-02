@@ -162,8 +162,8 @@ def test_waiting_pull_does_not_hold_the_queue_lock(sandbox):
         time.sleep(1.5)
         assert proc.poll() is None, "pull が待っていない (テストの前提が崩れている)"
         started = time.monotonic()
-        other = _plan(sandbox, "retire", TASK_ID, "--agent", "Someone", "--started-at",
-                      "nope", "--mission", SLUG, "--no-wait", timeout=20)
+        other = _plan(sandbox, "retire", TASK_ID, "--agent", "Someone", "--execution",
+                      "ex-" + "0" * 32, "--mission", SLUG, "--no-wait", timeout=20)
         elapsed = time.monotonic() - started
         assert other.returncode != 4, (
             f"待機中の pull がキューロックを握っている (retire --no-wait が LOCK_BUSY): "
@@ -379,8 +379,12 @@ def test_a_second_timeout_of_the_same_task_is_a_new_event_and_is_told(sandbox):
     card = re.sub(r"^status:.*$", "status: in_progress", card, flags=re.M)
     card = re.sub(r"^worker:.*$", f"worker: {AGENT}", card, flags=re.M)
     card = re.sub(r"^started_at:.*$", 'started_at: "2026-09-21T01:00:00Z"', card, flags=re.M)
+    card = re.sub(r"^current_execution_id:.*$", "current_execution_id: ex-" + "c" * 32, card, flags=re.M)
+    card = re.sub(r"^execution_reserved_at:.*$", 'execution_reserved_at: "2026-09-21T01:00:00Z"', card, flags=re.M)
+    card = re.sub(r"^execution_status:.*$", "execution_status: running", card, flags=re.M)
+    card = re.sub(r"^execution_end_code:.*\n", "", card, flags=re.M)
     sandbox.task_file.write_text(card)
-    sandbox.publish_assignment("2026-09-21T01:00:00Z")
+    sandbox.publish_assignment("2026-09-21T01:00:00Z", "ex-" + "c" * 32)
     mux.windows[WINDOW] = sandbox.spawn_worker_process()
     sandbox.record_identity(WINDOW, mux.windows[WINDOW])
 

@@ -12,7 +12,7 @@ Codex 8 巡目の P2 は「今回の 2 箇所」の指摘ではなく、**同じ
 **それでも足りなかった** (Codex 9 巡目 P2)。t017 の表は「この関数はガードを
 通っている」ことしか見ておらず、**表に載っていない関数**——
 `plan.sh:_load_workers_from_registry`、`dispatcher.publish_agents` の
-assignment 読み取り、`lib_retirement.read_task_started_at`、`plan.sh` の
+assignment 読み取り、`lib_retirement.read_task_execution_id`、`plan.sh` の
 assignment 読み取り —— は最初から視界の外にいた。人が表を書き足すかぎり、
 次に足された読み取りも同じ理由で漏れる。
 
@@ -182,7 +182,7 @@ GUARDED_READS = [
     # watchdog のサイクルの中で退役要求ごとに走る。止まると退役処理全体が
     # 返らない。
     ("lib_retirement.py", "read_json", {"load_json_store"}),
-    ("lib_retirement.py", "read_task_started_at",
+    ("lib_retirement.py", "read_task_execution_id",
      {"read_regular_text_or_unreadable"}),
     ("lib_retirement.py", "assignment_execution_verdict",
      {"read_regular_text_or_unreadable"}),

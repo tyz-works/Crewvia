@@ -254,6 +254,9 @@ DAEMON_RESTART_FILES = {
         "scripts/lib_usage_limit.py",
         "scripts/lib_task_cards.py",
         "scripts/lib_daemon_state.py",
+        # E4a (01c): lib_retirement が退役 marker に書く試行の ID を読むために import する
+        "scripts/lib_execution.py",
+        "scripts/lib_task_status.py",
     ),
 }
 

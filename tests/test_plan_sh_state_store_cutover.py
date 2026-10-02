@@ -156,7 +156,7 @@ def _drive_every_mutating_subcommand(sb: Sandbox):
     # 孤児の assignment: 01c E3 から done は card の worker の枠を撤去する (AGENT_NAME が無くても) ので、孤児の枠は
     # 手で作る (done の後に残った枠 = 旧コード・回復前の状態の再現) → reap が撤去する
     sb.run("pull", "--agent", "Ren", "--skills", "bash", "--task", "t004")
-    expected.append(("pull", "t004", None, None))        # 01c E2: 旧形式の retire が閉じなかった前の試行を reserve の手順 0 が閉じる
+    # 01c E4a: retire が前の試行を `failed` / `RETIRED` で閉じるので、reserve の手順 0 は走らない (行が出ない)
     expected.append(("pull", "t004", "pending", "in_progress"))
     expected.append(("pull", "t004", "in_progress", "in_progress"))     # 01c E2: start の行
     sb.run("done", "t004", SECRET_RESULT, "--no-pr", "audit test")
@@ -175,8 +175,9 @@ def _drive_every_mutating_subcommand(sb: Sandbox):
 
 
 #: 試行の ID を持つ行を出す subcommand (01c E2 = pull、E3 = done / fail / needs-director / ready-for-verification /
-#: verifying / verify-result)。reset / retire / update (E4) は null のまま
+#: verifying / verify-result)。E4a の update --reset / retire は試行があった task のときだけ ID が入る (EXECUTION_OPTIONAL_OPS)
 CONTROLLER_OPS = {"pull", "done", "fail", "needs-director", "ready-for-verification", "verifying", "verify-result"}
+EXECUTION_OPTIONAL_OPS = {"update", "retire"}
 
 
 def test_every_mutating_subcommand_writes_an_audit_row(sb):
@@ -192,7 +193,8 @@ def test_every_mutating_subcommand_writes_an_audit_row(sb):
                                "reported:stale_execution_status" if (r["from_status"], r["to_status"]) == (None, None)
                                and r["op"] == "pull" else "ok")      # 01c E2: reserve の手順 0 の報告行
         # 試行の ID が入るのは Controller を通る subcommand (E2: pull・E3: 報告の 6 コマンド)。他は E4 まで null
-        assert (r["execution_id"] is not None) == (r["op"] in CONTROLLER_OPS), r
+        if r["op"] not in EXECUTION_OPTIONAL_OPS:
+            assert (r["execution_id"] is not None) == (r["op"] in CONTROLLER_OPS), r
         assert re.fullmatch(r"[0-9a-f]{32}", r["txn_id"])
         assert r["ts"].endswith("Z")
         # 書いたパスが 1 つは出る (報告の行 `reported:` は何も書かないので files が空)

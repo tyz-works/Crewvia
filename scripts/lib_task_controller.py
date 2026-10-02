@@ -664,10 +664,12 @@ def fail_execution(txn, slug, tid, caller=NO_CALLER, failure_code=None, *, to_st
                    abandon_detached=(failure_code == ex.RESET_BY_DIRECTOR), meta_remove=meta_remove, dry_run=dry_run)
 
 
-def release_execution(txn, slug, tid, caller=NO_CALLER, reason_code=None, *, to_status=_S_PENDING, now=None):
+def release_execution(txn, slug, tid, caller=NO_CALLER, reason_code=None, *, to_status=_S_PENDING, now=None,
+                      meta_updates=None, body=None):
     """reserved → released (まだ誰も作業を始めていない試行を手放す)。`reason_code` は `RESET_BY_DIRECTOR` / `RETIRED`。
     running の試行は released にできない (`INVALID_TRANSITION`。結果なしで手放すのは `fail_execution`)。
-    `to_status` は pending (worker・started_at を null) か、RETIRED の `needs_director` (worker を残す)。枠は撤去する。"""
+    `to_status` は pending (worker・started_at を null) か、RETIRED の `needs_director` (worker を残す)。枠は撤去する。
+    `meta_updates` / `body` は `fail_execution` と同じ (retire の needs-director が理由を同じ card の書き込みに入れる)。"""
     if reason_code not in _RELEASE_RULES:
         raise _err(ex.INVALID_ARGUMENT, "reason_code は RESET_BY_DIRECTOR / RETIRED だけ", slug, tid)
     allowed = _FAIL_RULES[reason_code][0]
@@ -677,27 +679,28 @@ def release_execution(txn, slug, tid, caller=NO_CALLER, reason_code=None, *, to_
     meta, card_body = _load(txn, slug, tid)
     return _finish(txn, slug, tid, meta, card_body, caller, new_status=ex.RELEASED, end_code=reason_code,
                    to_status=to_status, command=command, operation=command, clear_owner=(to_status == _S_PENDING),
-                   retire_slot=True, meta_updates=None, new_body=None, now=now,
+                   retire_slot=True, meta_updates=meta_updates, new_body=body, now=now,
                    required_exec_status={ex.RESERVED}, abandon_detached=(reason_code == ex.RESET_BY_DIRECTOR))
 
 
-def reset_task(txn, slug, tid, caller=NO_CALLER, *, now=None):
+def reset_task(txn, slug, tid, caller=NO_CALLER, *, now=None, meta_updates=None):
     """Director の `update --reset`: task を pending に戻し、試行は次のどれかで閉じる (execution.md §4.2)。
 
     - ACTIVE: reserved → released / running → failed (どちらも `RESET_BY_DIRECTOR`)
     - DETACHED で active: `failed` / `ABANDONED_OUTSIDE_CONTROLLER` (試行は reset の前に Controller の外で手放されていた)
     - 試行なし (legacy)・TERMINAL: **task の遷移だけ** (terminal の欄は残す)
     worker・started_at を null にし、枠を撤去する。遷移元は問わない (今の `update` と同じ。any → pending)。
+    `meta_updates` は同じ card の書き込みに入れる他の欄 (`update --reset` の `completed_at = None`)。
     """
     meta, body = _load(txn, slug, tid)
     view = _view(meta)
     if view == ex.ACTIVE and meta['execution_status'] == ex.RESERVED:
         return _finish(txn, slug, tid, meta, body, caller, new_status=ex.RELEASED, end_code=ex.RESET_BY_DIRECTOR,
                        to_status=_S_PENDING, command=None, operation=None, clear_owner=True, retire_slot=True,
-                       meta_updates=None, new_body=None, now=now, required_exec_status={ex.RESERVED})
+                       meta_updates=meta_updates, new_body=None, now=now, required_exec_status={ex.RESERVED})
     return _finish(txn, slug, tid, meta, body, caller, new_status=ex.FAILED, end_code=ex.RESET_BY_DIRECTOR,
                    to_status=_S_PENDING, command=None, operation=None, clear_owner=True, retire_slot=True,
-                   meta_updates=None, new_body=None, now=now, abandon_detached=True)
+                   meta_updates=meta_updates, new_body=None, now=now, abandon_detached=True)
 
 
 #: `mark_task` が扱う (command, to_status)。どれも**試行を変えない** task の遷移。verify-result の `needs_human_review`

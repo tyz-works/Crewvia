@@ -262,9 +262,10 @@ def test_a_stale_id_after_a_reset_and_a_new_attempt_is_not_current(box):
 
 
 def test_a_detached_card_refuses_a_claim_and_treats_no_claim_as_task_only(box):
-    """旧形式の reset の後 (card は pending・試行の欄は running のまま = DETACHED)。X を名乗っても冪等の表を引かない。"""
+    """旧形式の reset の後 (card は pending・試行の欄は running のまま = DETACHED)。X を名乗っても冪等の表を引かない。
+    (E4a の前は `update --reset` がこの形を作った。今は試行を閉じるので、旧コードの reset を card に直接再現する)"""
     xid = take(box)
-    box.reset()
+    e3.old_code_reset(box)
     assert box.card()["execution_status"] == "running" and box.card()["status"] == "pending"
     before = box.snapshot()
     p = run(box, *report_argv("done"), "--execution", xid)

@@ -124,12 +124,12 @@ def test_target_dir_task_goes_through_the_controller_without_a_worktree(box, tmp
 
 def test_a_second_attempt_closes_the_first_and_counts_up(box):
     first = out(box.pull("Ren"))
-    box.reset()                                                  # 旧形式の reset (E4 まで試行の欄は触らない)
+    box.old_reset()                                              # 旧形式の reset (試行の欄は触らない。E4a の reset は閉じる)
     assert box.card()["status"] == "pending"
     second = out(box.pull("Sora"))
     assert second["attempt"] == 2 and second["execution_id"] != first["execution_id"]
     rec1 = box.record(first["execution_id"])
-    # reset は試行を閉じない (E4a から) ので、reserve の手順 0 が「Controller の外で手放された試行」として閉じる
+    # 旧形式の reset は試行を閉じないので、reserve の手順 0 が「Controller の外で手放された試行」として閉じる
     assert (rec1["status"], rec1["end_code"]) == ("failed", "ABANDONED_OUTSIDE_CONTROLLER")
     assert box.card()["execution_count"] == 2
     assert box.slot("Ren") is None and box.slot("Sora") == f"{MISSION}:t001"
@@ -450,7 +450,7 @@ def test_the_preparation_lock_is_per_task(tmp_path):
 # ---------------------------------------------------------------------------
 
 def _old_reset_cmd(box):
-    return (f"AGENT_NAME=Director {box.plan_sh} update t001 --status pending --reset --mission {MISSION}\n")
+    return box.old_format_reset_cmd("t001")
 
 
 def test_an_old_format_reset_during_preparation_is_not_overwritten_by_start(box):

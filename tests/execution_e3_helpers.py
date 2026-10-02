@@ -97,3 +97,14 @@ def refusals(box, op=None):
 def bodies_unchanged(box, before):
     """queue のバイト列 (監査ログを除く) が `before` と同じか。何も書かなかったことの比較。"""
     return box.snapshot() == before
+
+
+def old_code_reset(box, tid="t001", worker="Ren"):
+    """**旧コード (E4a より前) の `update --reset`** が card にしたこと: status / worker / started_at / completed_at だけを動かし、
+    試行の欄には触れない (E4a の `update --reset` は試行を閉じる)。DETACHED の場面 (execution.md §1.2 (b)) を作る道具。"""
+    with store.transaction(box.queue, op="seed", actor="test") as t:
+        meta, body = t.load_card(MISSION, tid)
+        meta = dict(meta)
+        meta.update(status="pending", worker=None, started_at=None, completed_at=None)
+        t.write_card(MISSION, tid, meta, body)
+        t.retire_assignment(worker, MISSION, tid, None)

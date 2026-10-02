@@ -311,7 +311,7 @@ idle に見えるので kill される。`cmd_done()` / `cmd_fail()` に至っ�
 **`plan.sh retire` — 後始末の 1 本の API。**
 
 ```
-plan.sh retire <task_id> --agent <name> --started-at <generation>
+plan.sh retire <task_id> --agent <name> (--execution <id> | --started-at <generation>)
                [--mission <slug>] [--outcome reset|needs-director] [--reason "<1 行>"]
 ```
 
@@ -319,6 +319,8 @@ plan.sh retire <task_id> --agent <name> --started-at <generation>
 呼び出し側が status / worker / 世代を個別に組み立てる形だと、どれを渡すか・省くかの
 判断が呼び出し側ごとに分かれ、1 つ緩めた場所から同じ型の事故が再発する。
 
+- **E4a (01c) 以降、名指しは `--execution <ex-…>` (試行の ID。優先) か `--started-at` (旧形式の世代)。どちらも無ければ
+  使い方の誤り。空の値は exit 1** (`knowledge/execution.md` §17)。以下の「必須」は、どちらかが必須の意味に読む。
 - `--started-at` は**必須**。省略を許すと名前だけで束縛された後始末に戻る。世代を
   読めなかった呼び出し側は retire を呼ばず Director に上げること。
 - 前提 (status が未終了 / worker 一致 / 世代一致 / assignment が自分のものか不在) が

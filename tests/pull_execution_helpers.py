@@ -129,6 +129,15 @@ class Box:
         p = self.plan("update", tid, "--status", "pending", "--reset", "--mission", MISSION, agent="Director")
         assert p.returncode == 0, p.stderr
 
+    def old_format_reset_cmd(self, tid="t001"):
+        """旧形式の reset (E4a より前の plan.sh・rollback 中の旧コードの書き方) を打つシェル 1 行。試行の欄は触らない。"""
+        script = pathlib.Path(__file__).resolve().parent / "old_format_reset.py"
+        return f"{sys.executable} '{script}' '{self.queue}' {MISSION} {tid}\n"
+
+    def old_reset(self, tid="t001"):
+        p = subprocess.run(["sh", "-c", self.old_format_reset_cmd(tid)], capture_output=True, text=True)
+        assert p.returncode == 0, p.stderr
+
     # -- 読み取り ----------------------------------------------------------------
     def card(self, tid="t001"):
         meta, _ = cards.parse_frontmatter((self.queue / "missions" / MISSION / "tasks" / f"{tid}.md").read_text(),

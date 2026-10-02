@@ -786,6 +786,9 @@ def reap_kai_codex_orphan_assignment(task_statuses_by_mission):
     env = dict(os.environ)
     env['CREWVIA_QUEUE'] = str(QUEUE_DIR)
     env['CREWVIA_REPO_ROOT'] = str(REGISTRY_DIR.parent)
+    # 監査ログの actor を `unknown` にしない (execution.md §8 の (2)。verifier-dispatcher.sh と同じ前例)。
+    # Director のシェルから継いだ AGENT_NAME を、この subprocess の行に載せない。
+    env['AGENT_NAME'] = 'dispatcher'
     try:
         proc = subprocess.run(
             argv, capture_output=True, text=True, env=env,

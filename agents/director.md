@@ -1147,8 +1147,9 @@ watchdog は idle / max threshold を超えた Worker を**自ら終了させ、
 1. shutdown メッセージを Worker へ送り、応答が無ければ SIGTERM → SIGKILL と段階的に進める
    （各ステップの間に猶予があり、応答すれば止まる）
 2. Worker プロセスの終了を確認したら `plan.sh retire` で task を `pending` に戻し、assignment を
-   削除する（世代 = `started_at` で束縛されるので、猶予期間中に別 Worker がその task を pull し
-   直していた場合は後任を巻き込まない — 詳細 `knowledge/daemon-authority.md`）
+   削除する（試行の ID = `task_execution_id`（旧形式の marker は世代 = `started_at`）で束縛されるので、
+   猶予期間中に別 Worker がその task を pull し直していた場合は後任を巻き込まない。終わらせた試行は `RETIRED` で閉じる
+   — 詳細 `knowledge/daemon-authority.md`・`knowledge/execution.md` §17）
 3. mux 経由で Director の pane に **事後報告**を直接送る（Taskvia を介さない）。ポーリング不要
    — 何か操作した拍子に届く。**timeout 終了は `[timeout]` の 1 通**で、task id・mission・どちらの上限か
    （idle×2 / max）・経過秒・**`plan.sh update <id> --status pending --reset` が要るか**（後始末が成功していれば
@@ -1346,7 +1347,7 @@ Dispatcher からの通知を受け取った時だけ対応すればよい。
 | `要求スキル [...] の Worker を起動してください (task {id}, mission={slug})` | 該当スキルを持つ Worker が存在しない | 必要スキルで `bash scripts/start.sh worker <skill>` を実行 |
 | `全ミッション完了` | 全 active mission が done 状態になった | `plan.sh archive <slug>` で退避 → ユーザーへ完了報告 |
 | `タスク {id} (mission={slug}) が failed になりました。handoff_path: {path} — ...。plan.sh add で継続タスクを追加してください。` | Worker が graceful handoff でタスクを中断した | 以下の Handoff 再計画フローを実行 |
-| `[Rule 5] Worker {name} が blocked / idle-with-task です (task {id}, mission={slug}, {n}秒継続)。画面末尾: ...` | herdr モードで Worker が承認待ち・質問待ち・停止状態 | 画面末尾を読み (1) 質問なら `python3 scripts/lib_mux.py send {name}-worker "<回答>"` (2) 承認ダイアログならユーザーへエスカレーション (3) 回復不能なら kill + `plan.sh retire {id} --agent {name} --mission {slug} --started-at <card の started_at>` |
+| `[Rule 5] Worker {name} が blocked / idle-with-task です (task {id}, mission={slug}, {n}秒継続)。画面末尾: ...` | herdr モードで Worker が承認待ち・質問待ち・停止状態 | 画面末尾を読み (1) 質問なら `python3 scripts/lib_mux.py send {name}-worker "<回答>"` (2) 承認ダイアログならユーザーへエスカレーション (3) 回復不能なら kill + `plan.sh retire {id} --agent {name} --mission {slug} --execution <`plan.sh status` の進行中の行の ex-…>`（ID の無い旧形式の card だけ `--started-at <card の started_at>`） |
 
 ### Handoff 再計画フロー
 
@@ -1493,13 +1494,20 @@ herdr モードでのみ動作。Worker の `agent_status` を毎ポーリング
 **kill した Worker の後始末は `plan.sh retire` を使う**:
 
 ```bash
-# card の started_at (= 実行世代) を確認してから渡す
+# 終わらせる試行の ID を `plan.sh status --mission {slug}` の進行中の行 ([ex-… attempt N]) から読んで渡す
+./scripts/plan.sh retire {task_id} --agent {name} --mission {slug} --execution {ex-…}
+
+# 試行の ID が無い旧形式の card (status の行に [ex-…] が出ない) だけ、card の started_at (= 実行世代) で名指しする
 ./scripts/plan.sh retire {task_id} --agent {name} --mission {slug} \
   --started-at "$(sed -n 's/^started_at: *//p' queue/missions/{slug}/tasks/{task_id}.md | tr -d '"')"
 ```
 
+`--execution ""` / `--started-at ""`（空の指定）は exit 1 で何も書かない（空を「名乗りなし」に倒さない）。
+両方渡せば ID が優先。終わらせた試行は Controller が閉じる（reserved → released / running → failed、終了コード `RETIRED`）。
+同じ ID の再送は exit 0（何も書かない）。
+
 card の status 差し戻しと `queue/assignments/{name}` の撤去が 1 つのトランザクションで
-行われる。前提（status が未終了 / worker 一致 / 世代一致）が外れていた場合は **exit 3 で
+行われる。前提（status が未終了 / worker 一致 / 試行（または世代）一致）が外れていた場合は **exit 3 で
 何も変更しない** — その間に Worker が自分で `plan.sh done` を通していたか、差し戻し済みの
 card を同名の後任が pull し直していたかのどちらかなので、`plan.sh status` で確かめること。
 `update --reset` + 手動 `rm queue/assignments/<name>` は、世代を見ないぶん後任の

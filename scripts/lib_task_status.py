@@ -73,31 +73,22 @@ PR_NOT_AWAITED_STATUSES = frozenset({
     'done', 'verified', 'failed', 'skipped', 'verification_failed',
 })
 
-#: コマンドごとの「受け付ける元の status」。**S1 は現状を写す** (狭めるのは 01c)。
-#: 「〜以外すべて」だった受け付け方は、語彙 (TASK_STATUSES) からの引き算で書く —— 語彙に
-#: 無い status (`cancelled` の手書きカード・status 欄なし) は、以前は「以外すべて」に
-#: 含まれて通っていたが、いまは拒否される。
-_ALREADY_FINISHED = frozenset({'done', 'verified', 'failed', 'skipped'})
-
+#: コマンドごとの「受け付ける元の status」(01c E3 / execution.md §4.3 で狭めた後の表)。
+#: S1 (01a) は現状を写しただけだった (狭めるのは 01c)。E3 で done / fail / verify-result を狭めた:
+#:
+#: - done: in_progress だけ。pending / blocked / 検証待ち (ready_for_verification・verifying・needs_human_review) /
+#:   verification_failed からは通らない (一度も予約されていない task・Director が止めた task・検証を迂回する done)。
+#:   出口: Director の `update --status in_progress --reset` → done、または `update --status done`。検証待ちは `verify-result`。
+#: - fail: in_progress と needs_director (Director が判断待ちの task を諦める出口。試行は needs-director で既に failed)。
+#:   pending / blocked / 検証待ち / verification_failed からは通らない (走っていない task に失敗の証拠は付けられない)。
+#:   出口: `update --status skipped|failed`、検証待ちは `verify-result fail` / `needs_human_review`。
+#: - verify-result: 検証に出ている task (ready_for_verification・verifying・needs_human_review) だけ。
+#:   pending から needs_human_review を作れた穴 (state-store.md §2.5) を塞ぐ。
+#:
+#: 「〜以外すべて」だった受け付け方は、語彙 (TASK_STATUSES) に無い status (`cancelled` の手書きカード・status 欄なし) を
+#: 通していたが、いまは**列挙した status だけ**を受け付ける (知らない status は拒否)。
+#: 読むのは `plan.sh` (retire / pull / verifying の `accepts`) と `lib_task_controller` (移した全コマンド)。
 ACCEPTS_FROM = {
-    'pull': frozenset({'pending'}),
-    'needs-director': frozenset({'in_progress'}),
-    'done': TASK_STATUSES - _ALREADY_FINISHED - WAITS_ON_DIRECTOR_STATUSES,
-    'fail': TASK_STATUSES - _ALREADY_FINISHED,
-    'ready-for-verification': frozenset({'in_progress'}),
-    'verify-result': TASK_STATUSES - _ALREADY_FINISHED,
-    'retire': frozenset({'in_progress'}),
-    'verifying': frozenset({'ready_for_verification'}),
-}
-
-#: 01c (execution.md §4.3) で狭める「受け付ける元の status」。**E1 ではデータとして置くだけ** —— plan.sh はまだ
-#: `ACCEPTS_FROM` (現状を写した表) を読む。`lib_task_controller` だけがこちらを読み、E3 が plan.sh の呼び出しを
-#: Controller に移すとき `ACCEPTS_FROM` をこの表で差し替える (差し替えるまで挙動は 1 バイトも変わらない)。
-#: 狭めた行にも出口がある (表の理由は execution.md §4.3): done が通らなくなる pending / blocked は
-#: `update --status in_progress` → done または `update --status done`、検証待ちは `verify-result`、
-#: fail が通らなくなる pending / blocked は `update --status skipped|failed` …。
-#: `fail` の `needs_director` は残す (Director が判断待ちの task を諦める出口。試行は needs-director で既に failed)。
-ACCEPTS_FROM_NARROWED = {
     'pull': frozenset({'pending'}),
     'needs-director': frozenset({'in_progress'}),
     'done': frozenset({'in_progress'}),

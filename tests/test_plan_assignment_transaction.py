@@ -39,7 +39,9 @@ PATH_OWNERS = {"assignment_path", "assignment_identity_path"}
 #: retire を呼ぶ共有の本体。自分では with_lock を取らず、呼び出し元がロック内にいることを下で確かめる
 #: (needs-director コマンドと pull の worktree 失敗の出口が同じ遷移を通すため。GIT-05)。
 #: `_resume_reserved` は pull の再開 (01c E2) が自分の枠を card に合わせて公開し直す本体 (呼び出し元 `_do` は with_lock の中)。
-LOCKED_HELPERS = {"transition_to_needs_director", "_resume_reserved"}
+#: `_retire_caller_slot` は done / fail / needs-director / verify-result fail が Controller の呼び出しの後に `AGENT_NAME` の枠を
+#: 撤去する後始末 (01c E3。呼び出し元はどれも with_lock の中。下の呼び出し元の検査がそれを確かめる)。
+LOCKED_HELPERS = {"transition_to_needs_director", "_resume_reserved", "_retire_caller_slot"}
 
 
 def _plan_py_source() -> str:

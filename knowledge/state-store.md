@@ -117,6 +117,9 @@ S1 ではコマンドの受け付ける集合を**変えずに**表へ移す。�
 `update --status` → `done` —— がどこで拒否されるか読めなくなる)。
 例外は上の 2 点 (`needs_director` を書ける・`cancelled` を消す) だけ。
 
+> **01c E3 (t012) で狭めた** (呼び出し元の照合と一緒に。`knowledge/execution.md` §4.3 / §16): 下の表の **done は in_progress だけ・fail は in_progress と needs_director・verify-result は検証待ち
+> (ready_for_verification / verifying / needs_human_review) だけ**になった (`lib_task_status.ACCEPTS_FROM` が現在の表。下は S1 の「現状の写し」として残す)。
+
 | コマンド | 受け付ける from (現状) | to | 根拠 |
 |---|---|---|---|
 | pull | pending (+ 依存・skill・target の条件) | in_progress | plan.sh:3365 |

@@ -485,10 +485,10 @@ Controller の外で起きた形なので、同じ答えに揃える。`started_
 
 | card の `execution_end_code` (status) | 来た操作 (同じ ID) | 結果 |
 |---|---|---|
-| `DONE` (completed) | done | **成功 (exit 0)・何も書かない**・stdout に `already completed (idempotent)`。今は「already done」exit 2 なので、**ID を名乗った呼び出しだけ**挙動が変わる |
+| `DONE` (completed) | done (**同じ中身**) | **成功 (exit 0)・何も書かない**・stdout に `already completed (idempotent)`。今は「already done」exit 2 なので、**ID を名乗った呼び出しだけ**挙動が変わる。中身 (`--pr` / `--no-pr` / Result) が違えば conflict (§16.10) |
 | `VERIFIED` (completed) | verify-result pass | 成功・何も書かない |
-| `WORKER_FAILED` (failed) | fail | 成功・何も書かない |
-| `NEEDS_DIRECTOR` (failed) | needs-director | 成功・何も書かない |
+| `WORKER_FAILED` (failed) | fail (**同じ中身**) | 成功・何も書かない (head / no-head / handoff が違えば conflict。§16.10) |
+| `NEEDS_DIRECTOR` (failed) | needs-director (**同じ中身**) | 成功・何も書かない (reason が違えば conflict。§16.10) |
 | `VERIFICATION_REJECTED` (failed) | verify-result fail | 成功・何も書かない (verifier の再送) |
 | `RETIRED` (failed / released) | retire (`--execution` が同じ ID) | 成功・何も書かない (watchdog の `_settle_terminated` が card の書き込みの後に死んで打ち直す場合。E4a) |
 | `DONE` / `VERIFIED` | 上の行以外 (fail / needs-director / done を `VERIFIED` に等) | **conflict** (`EXECUTION_ALREADY_TERMINAL`・exit 3・何も書かない) |
@@ -503,7 +503,10 @@ Controller の外で起きた形なので、同じ答えに揃える。`started_
   ので `execution_end_code` は残る。次の reserve が新しい ID を発行した後は、古い ID の再送は `EXECUTION_NOT_CURRENT`。
 - crash の点 (§1.4): 終了コードは terminal の status と同じ card の書き込みに入るので、「status は terminal・理由は不明」の card は
   できない。record が遅れていても答えは同じ。
-- 「同じ操作」は操作の種類だけで判定する。引数の違い (done の `--pr` 違い) は今の D0 の検査 (state-store.md §2.2) が拒否する。
+- 「同じ操作」はまず操作の種類で判定し (Controller の `IDEMPOTENT`)、**そのうえで要求の中身を card と比べる** (t034 / §16.10)。
+  done は `--pr` / `--no-pr` / Result 本文、fail は head / no-head / handoff、needs-director は reason。**違えば conflict (exit 3・何も書かない・
+  値は出さず項目名だけ)**、同じなら成功 (exit 0)。上の表の「成功」は**同じ中身の再送**の行で、違う中身の 2 回目は新しい記録にならず conflict。
+  (E3 の初版は中身を見ずに exit 0 を返し、`done "first" --pr 5` → `done "CORRECTED" --pr 6` が成功に見えて card は最初のままだった)
 - ID を名乗らない呼び出しは今と同じ (done の二重は exit 2)。
 
 **domain error の固定コードと exit code** (exit 2 は pull では idle の意味。memory `pull-exit-2-is-idle-usage-errors-must-be-1`):
@@ -795,7 +798,7 @@ start の CAS は「試行がまだ reserved か」しか言えず、「他の p
 |---|---|---|---|---|
 | **E1** (t004) | **なし** (呼び出し元ゼロ)。lib_state_store の拡張は既定値で今とバイトが同じ | 通常 merge (t007) | `grep -rn lib_task_controller scripts hooks` が lib 自身とテストだけ / 01a S3 の互換 golden が変わっていない (CI) | revert |
 | **E2** (t008) | pull が ID を発行 (card に 6 欄 (`execution_end_code` は空)・`executions/` に record・identity に `execution_id`・`.crewvia-env` に `CREWVIA_EXECUTION_ID`・JSON に `execution_id` / `attempt`) / pull が 2 つ目のロックを取る (start) / **同じ Worker の再 pull が reserved の試行を再開** / G1 の CAS が ID に / `task_slug` を card に固定 (title を変えても branch が変わらない) / 監査行の `execution_id` | **ユーザー承認** (t011) | 実 Worker の pull 1 回で: card に 6 欄 (`execution_reserved_at` = `started_at`)・record が 1 つ・identity に ID・`.crewvia-env` が 4 行・監査行に ID が出る / 既存の進行中 card (legacy) の done が今どおり通る / dispatcher の busy / idle が変わらない (枠の本文は同じ) / `store-check` の差分が `legacy_execution` の報告だけ | revert → `scripts/sync-main-checkout.sh`。**新しい欄・record・identity の欄は残ってよい**: 旧コードは欄を `dump_yaml` で保持し (読まない)、`executions/` を読まず、identity の `started_at` だけを見る (§9.3) |
-| **E3** (t012) | done / fail / needs-director / ready-for-verification / verify-result が ID を照合 (違う ID は exit 3)・**§4.3 の狭め** (done が pending / blocked / 検証待ちから通らない等)・`verify-result fail` が pending (新しい試行へ)・ID を名乗った再送が冪等 (exit 0)・拒否の行・`caller_check`・kai-review.sh が ID を渡す・worker.md / skill / director.md が `--execution` を使う・`plan.sh status` に ID 表示 | **ユーザー承認** (t015)。**狭めの表 (§4.3) と verify-result fail の変更を承認の対象として明示する** | 実 Worker の done が `caller_check=verified` / 旧プロンプトの Worker の done が `unverified` で通る / Kai の review が done / needs-director まで通る / Director の cutover review task の `update --status in_progress --reset` → done が通る / 監査に `refused:` が出たら 1 件ずつ妥当か | revert → sync。card の新しい欄は E2 と同じく残ってよい。**狭めを戻すと再び pending から done が通る** (戻すのは制限を外す方向なので壊れない) |
+| **E3** (t012) | done / fail / needs-director / ready-for-verification / verify-result が ID を照合 (違う ID は exit 3)・**§4.3 の狭め** (done が pending / blocked / 検証待ちから通らない等)・`verify-result fail` が pending (新しい試行へ)・ID を名乗った再送が冪等 (exit 0)・拒否の行・`caller_check`・kai-review.sh が ID を渡す・worker.md / skill / director.md が `--execution` を使う・`plan.sh status` に ID 表示 | **ユーザー承認** (t015)。**狭めの表 (§4.3) と verify-result fail の変更を承認の対象として明示する** | 実 Worker の done が `caller_check=verified` / 旧プロンプトの Worker の done が `unverified` で通る / Kai の review が done / needs-director まで通る / Director の cutover review task の `update --status in_progress --reset` → done が通る / 監査に `refused:` が出たら 1 件ずつ妥当か | revert → sync。card の新しい欄は E2 と同じく残ってよい。**狭めを戻すと再び pending から done が通る** (戻すのは制限を外す方向なので壊れない)。**revert 先でも `--execution` を受け付ける (読み捨てる) 互換を E3 の前に別 PR (#272) で入れた** — 起動済みの Worker・走っている kai-review.sh は revert の後も `--execution` を付けて報告し続けるので、戻し先が `unknown option` で拒否すると完了・失敗の報告が止まる。**#272 を E3 より先に merge すること** (§16.4) |
 | **E4a** (t016) | **退役 marker / progress に `task_execution_id` を書き始める** (producer の切り替え)・retire が `--execution` を受け付け・`update --reset` / retire が試行を release / fail (`execution_end_code`)・reap の照合が ID 優先・デーモンの `AGENT_NAME`。**世代の照合は残す** (新旧の marker を両方読む) | **ユーザー承認** (t019)。0 件の確認は**要らない** (旧形式も読める) | **dispatcher と watchdog の両方が restart された**こと (起動時刻 > sync。§7 の (0)) / 新しい marker・progress に `task_execution_id` / 退役の全経路で新しい試行を殺さない (QA t017 の観察を本番で 1 件) / 監査の retire 行の actor が `watchdog` | revert → sync。**両デーモンとも常駐なので restart が要る** (どちらも `lib_retirement` を import する: `DAEMON_RESTART_FILES` lib_daemon_watch.py:240-258。memory `merged-daemon-code-is-inert-until-restart`)。新しい marker の `task_execution_id` は旧コードが読まない (余分な欄) |
 | **E4b** (新 task) | **世代の照合を外す** (§2.4 の 4: #4・#8・#11・#12 の `started_at` の分岐と、旧形式 marker の読み口) | **§7 の (0)〜(2)** + **ユーザー承認** | 退役が ID だけで通る / `caller_check=legacy_generation` が出ない / 保留 (Director への hold) が増えていない | revert → sync (両デーモン restart)。E4a のコードに戻るので新旧の marker を両方読める |
 
@@ -1269,3 +1272,245 @@ PR を revert し、`scripts/sync-main-checkout.sh` で主 checkout を ff す�
 
 - テスト: `tests/test_pull_execution_e2_parent_kill.py` (helper stub が `$PPID` = python の pid を残し、**その pid だけ**を SIGKILL。子孫が生きている間に再 pull を
   打ち、helper が同時に 2 本走らない・exit 1・card 不変、子孫が終わった後は同じ試行を再開、を 20 回)。赤の実証 E09 (`pass_fds` を外す)。
+
+---
+
+## 16. E3 の実績 (t012): 報告の 6 コマンドが Controller を通り、呼び出し元を Execution ID で照合する
+
+**これは cutover** (本番の挙動が変わる。PR #273。merge 前にユーザー承認 = t015)。承認の対象として明示するもの: (1) §4.3 の**狭め** (done が pending / blocked / 検証待ちから通らない等)・
+(2) **`verify-result fail` が新しい試行になる** (task は pending・worker を手放し、次の pull が attempt + 1)・(3) 名乗った ID が違えば **exit 3** で拒否・
+(4) 遷移・照合の拒否が**監査ログに `refused:` の行**を残す・(5) done / fail / needs-director が **card の worker の枠**を撤去する (`AGENT_NAME` が無くても)。
+前提の互換 (`--execution` を受け付けて読み捨てる) は別 PR **#272** (E3 より先に merge する。§16.4。#272 の CI は最初 `test_plan_result_file` の fail の option の表で赤だった — option を足す PR は、その option 集合を固定する既存テストを全 pytest で洗うこと)。
+
+### 16.1 何が変わったか (plan.sh の 6 コマンド + `update --close-execution`)
+
+| コマンド | 呼ぶ Controller の操作 | 試行 | task |
+|---|---|---|---|
+| `done` | `complete_execution(to_status=done)`。**先に `dry_run=True`** (照合・遷移の検査だけ。派生値 D1 / D2 を書く前) | running → completed `DONE` | in_progress → done・枠撤去 (D4)・D5 は今のまま |
+| `fail` | `fail_execution(WORKER_FAILED)`。先に dry_run (証拠の検証より前) | running → failed `WORKER_FAILED` | in_progress / needs_director → failed |
+| `needs-director` | `fail_execution(NEEDS_DIRECTOR)` | running → failed `NEEDS_DIRECTOR` | in_progress → needs_director (worker は残す) |
+| `ready-for-verification` / `verifying` | `mark_task` | 変えない (running のまま・枠は残る) | in_progress → ready_for_verification / → verifying (`verifier` 欄を同じ書き込みで) |
+| `verify-result pass` | `complete_execution(to_status=verified)` | running → completed `VERIFIED` | 検証待ち → verified (枠は残す。R-2 が後で消す) |
+| `verify-result fail` (< max) | `fail_execution(VERIFICATION_REJECTED)` | running → failed `VERIFICATION_REJECTED` | 検証待ち → **pending**・worker / started_at を null・枠撤去。次の pull が attempt + 1 |
+| `verify-result fail` (≥ max) / `needs_human_review` | `mark_task` (`needs_human_review`) | 変えない (running) | → needs_human_review |
+| `update <id> --close-execution` (新) | `abandon_detached_execution` | DETACHED で active な試行 → failed `ABANDONED_OUTSIDE_CONTROLLER` | **触れない** (§16.2 の 7) |
+
+- **名乗りの出どころ**は `--execution <id>` (明示) > env `CREWVIA_EXECUTION_ID` (§5.2)。`_execution_caller` (plan.sh) が**ロックを取る前**に決める。agent 名は照合の根拠にしない。
+- **ID を名乗った同じ操作の再送は成功** (exit 0・何も書かない・stdout に `already completed (idempotent)` 等)。D0〜D5・Taskvia・registry の bump も走らせない。違う結果への変更は conflict (exit 3)。
+- 拒否の終わり方: exit code は `lib_execution.EXIT_CODES` (遷移の拒否 2・照合の 3 つ 3・読めない card 1)、stderr の**最後の行**は `[plan.sh] error_code=<CODE>` (固定形式。テストで固定)。
+  文言は固定の文 + 識別子だけ (card の中身・名乗られた値は出さない。secret を仕込んだテストで固定)。
+- **kai-review.sh** は pull の JSON を捨てず `execution_id` を取り出して done / needs-director に渡す (JSON が読めない・欄が無い・`--skip-pull` は名乗らない)。**親 shell から継いだ `CREWVIA_EXECUTION_ID` は捨てる** (別 task の ID を名乗って自分の報告が拒否されない)。
+- **verifier-dispatcher.sh** は card の今の試行 (active のときだけ) を `verifying` に `--execution` で渡し、verifier への指示文にも入れる。壊れた値・terminal の試行は名乗りなし。
+- **`plan.sh status --mission`** の進行中の行に `[ex-… attempt N]` を出す (Director が `--execution` に渡す値。terminal の試行・legacy は出さない)。
+- 文書: worker.md (pull の JSON から `EXECUTION_ID` を取る・`${EXECUTION_ID:+--execution "$EXECUTION_ID"}`・拒否されたら打ち直さない・再送は安全)・director.md (done に `--execution`・狭めの出口)・verifier.md・crewvia-qa / crewvia-plan-review の skill。
+  **E5 まで名乗りなしは通る** (§5.2)。AC-04 は「違う ID では終わらせられない」までで、「名乗らなければ終わらせられる」穴は E5 まで残る (§10)。
+
+### 16.2 決定
+
+1. **照合・遷移の検査と書き込みを分ける (`dry_run`)**: done は D1 / D2 (pr_number の伝播) をコミット点の**前**に書く。検査が書き込みの後ろにあると、拒否された done が依存先に番号を書いたまま終わる。
+   Controller の `complete_execution` / `fail_execution` に `dry_run=True` を足し、**同じ `_finish` が検査だけを行って判定 (`PROCEED` / `IDEMPOTENT` / `TASK_ONLY`) を返す** (検査を 2 か所に書かない)。
+   done / fail は plan.sh が先に dry_run → 証拠の検証 (fail)・D0〜D2 (done) → 本番の呼び出し。status の拒否が証拠の検証より先、という今の順序も保つ。赤の実証 R07。
+2. **狭めは `lib_task_status.ACCEPTS_FROM` を書き換える** (表の置き場は 1 か所): E1 が別名で置いた `ACCEPTS_FROM_NARROWED` は消した。Controller と plan.sh (`pull` / `retire`) が同じ表を読む。
+   plan.sh の `accepts(` の呼び出しは移したコマンドから消えた (残るのは pull / retire。構造ガード `tests/test_task_status_single_definition.py` の設計の写し `REFUSED` を狭めた表に直した)。
+3. **読めない card・語彙に無い status の card は、今までどおり exit 2 の拒否** (`_load_task_for_report`): Controller は card を厳密に読み `STATE_INVALID` (exit 1) にするが、今までの plan.sh は寛容な読み口で
+   「この status の task には使えません」(exit 2) だった。**新しい lib が今のコードより厳しくならない**ように、Controller の前に plan.sh の読み口で今の答えを保つ (memory `new-lib-stricter-than-legacy-path-breaks-compat`)。
+   試行の欄が壊れた card (E2 以降の card だけ) は新しい条件で `STATE_INVALID` (exit 1・何も書かない)。
+4. **枠の撤去は card の worker の枠** (`txn.retire_assignment(owner, …, None)`)。今までは `AGENT_NAME` の枠だった。Director が (AGENT_NAME が Worker でなくても・無くても) Worker の task を終わらせると、
+   Worker の枠が同じトランザクションで外れる (以前は次の回復 R-2 まで残り、Worker が busy に見えた)。**他の task を指す枠・後任の枠は外さない** (classify が ASSIGN_MINE のときだけ)。
+   `AGENT_NAME` の枠の後始末 (`_retire_caller_slot`) は Controller の後に残した (card の worker ではない AGENT_NAME が持つ、**この task を指す**枠。今までと同じ警告つき)。
+   この違いを前提にしていたテスト 4 本 (「AGENT_NAME 無しの done は枠を撤去しない」で孤児の枠を作っていた) は、孤児の枠を手で書き直す形に直した (`reap-orphan-assignment` の互換 golden も同じ場面を両方の版で作る)。
+5. **監査**: 遷移・照合の拒否は `refused:<CODE>` の行 (card の ID・名乗られた ID は `presented=` で形が正しいときだけ。本体の `die` の後でも残る)。本体の行に `execution_id` / `caller_check`。
+   **`actor` は `AGENT_NAME` を置き換えない** (§8 の (1) を縮めた): `AGENT_NAME` が無い (`unknown`) 呼び出しのときだけ**操作の前の card の worker** で補う (`Txn.record(actor_hint=)`)。
+   Director が Worker の代わりに done を打った行を Worker の行にしない。Controller が `save_task` を通さず `record()` で行を予約するので、`with_lock` の「card を書いたトランザクションは card の行だけ」の判定に `Txn.has_body_record` を足した
+   (足さないと mission の done で task を持たない余分な行が 1 本出る)。
+6. **`verify-result fail` が新しい試行**になる点 (§9.2 の 3 は「承認で外せるよう commit を分ける」と提案していた): Controller 側の規則は E1 で既にある (`_FAIL_RULES` の `VERIFICATION_REJECTED`) ので、**変更は plan.sh の `cmd_verify_result` の 1 分岐 + テスト 2 本 (`test_verify_fail_below_the_limit_starts_a_new_attempt` と `test_verify_fail_at_the_limit_…`) + 文書**に局在する。
+   commit は**分けていない** (`cmd_verify_result` 全体が Controller 経由に書き換わり、1 分岐だけの commit を切り出すと他の分岐が旧形式の書き込みに戻る)。ユーザーが承認で「今の in_progress のまま」を選んだ場合は、Controller に
+   「試行を変えずに task を in_progress に戻す」遷移 (今は無い。`mark_task` の対象外) を足して plan.sh の分岐を差し替える別 commit にする。
+   rework_count の上限 (`max_rework`) に達したときと `needs_human_review` の verdict は試行を閉じない (`mark_task`)。
+7. **E2〜E3 の間にできた card の扱い (必須条件)**: E2 の間は done / needs-director / fail が試行を閉じないので、終わった task に `running` の試行が残る
+   (`store-check` の `reported:execution_active_on_finished_task` / `execution_active_on_non_holding_status`)。**E3 の後に新しく出ない** (テスト `test_after_e3_a_finished_task_leaves_no_active_attempt_behind`)。
+   すでにできた分は **`plan.sh update <id> --close-execution [--mission <slug>]`** で閉じる (§14.1 の決定 2 が「CLI の口は E3 / E4a で足す」としていたもの): DETACHED で active な試行を、**task に触れず** (status / worker / started_at / 枠は 1 バイトも変えない)
+   `failed` / `ABANDONED_OUTSIDE_CONTROLLER` にする (card → record)。持ち主のいる (ACTIVE の) 試行は閉じない・他の更新オプションと併用できない・閉じるものが無ければ exit 2。報告から外す案は採らなかった
+   (rollback 中の旧コードの跡 §9.5 の表外 2 も同じ手段で閉じられ、報告を残したまま Director が 1 件ずつ消せる)。本番では merge → sync の後に `store-check` の件数を見て、件数ぶん打つ (Director の作業。件数は merge 後に確認)。
+8. **今の運用が通ることをテストで固定** (§5.3): cutover review task の `update --status in_progress --reset` → `done` (試行なしの経路・`caller_check=no_execution`)・kai-review の pull → done / needs-director・
+   verifier (持ち主でない) の verify-result・target_dir の task (pull の JSON の ID)・Director が `--execution` を付けた done・Director が見た後の reset → 再 pull は exit 3。
+9. **dispatcher の文面を 1 か所直した**: `[review-refused]` の通知は「手動差分レビューの結果を `plan.sh done`」と案内していたが、その task は pending のままで、E3 の狭めで done が拒否される。
+   「`update --status in_progress --reset` で開いてから done」に直した (dispatcher は常駐なので sync の restart で反映)。族の掃除 (§16.5 の F5) で見つけた。
+10. **done が `reserved` の試行を拒否する (新しい条件)**: 今までは in_progress なら done が通った。`reserved` (pull が start に進む前に落ちた・Worker は JSON を受け取っていない) の試行を完了にはできない (`INVALID_TRANSITION`)。
+    出口: 同じ Worker の再 pull が再開する (§6)・Director は `update --status in_progress --reset` で開いてから done (試行なしの経路)。
+
+### 16.3 互換性 (COMPAT-01): 違いは表にしたものだけ
+
+固定 fixture (`tests/plan_sh_compat_scenario.py` の 39 段) を今の plan.sh で走らせ、cutover 前 (a1f6957) の golden と比べる `tests/test_plan_sh_compat_s3.py`。E3 で出た差は 2 段の stderr だけ (と、孤児の枠の場面を両方の版で作るための scenario の 1 行 — 下の表の最終行) で、**表の `have` と完全一致するときだけ golden に戻して比べる**
+(`E3_EXPECTED_DIFFERENCES`。表に無い違いはそのまま赤)。queue の全ファイルはバイト一致 (E2 の足した欄・record・identity を取り除いた比較。E3 の終了コードの欄も試行の欄なので同じ正規化に入る)。
+
+| 場面 | 今まで | E3 の後 |
+|---|---|---|
+| 遷移の拒否 (`done` が done の task へ等) の stderr | 1 行 `task 't002': done は status='done' の task には使えません (受け付けるのは: <広い列挙>)` | 同じ書き出し + 狭めた列挙 (`in_progress`) + **最後の行に `[plan.sh] error_code=INVALID_TRANSITION`**。exit 2・何も書かない |
+| `done` が pending / blocked / 検証待ち / verification_failed から | 通る (exit 0) | **exit 2** (§4.3) |
+| `fail` が pending / blocked / 検証待ち / verification_failed から | 通る | **exit 2** |
+| `verify-result` が pending / in_progress / blocked / needs_director / verification_failed から | 通る | **exit 2** |
+| `verify-result fail` (< max) | task は in_progress・worker 残す・stdout `→ in_progress` | **task は pending・worker / started_at null・枠撤去**・stdout `→ pending`・試行 failed |
+| ID を名乗らない active な試行への報告 | 通る | **同じ** (stdout・exit も同じ。監査の `caller_check=unverified`) |
+| `--execution <id>` の付いた報告 | exit 2 (unknown option) | 今の試行なら通る・違えば **exit 3** (`EXECUTION_NOT_CURRENT`)・形が違えば exit 3 (`EXECUTION_NOT_FOUND`)・空は exit 1 |
+| 同じ ID の `done` の再送 | exit 2 | **exit 0** (idempotent。ID を名乗った呼び出しだけ) |
+| AGENT_NAME が Worker でない (無い) done / fail / needs-director | Worker の枠が残る (次の回復まで) | **card の worker の枠が外れる** (§16.2 の 4) |
+| 監査ログ | 拒否は行なし・`execution_id` は pull だけ | 遷移・照合の拒否は `refused:` の行・6 コマンドの行に `execution_id` / `caller_check` |
+| 試行が `reserved` の task への done | 通る | exit 2 (§16.2 の 10) |
+
+### 16.4 戻し方 (E3) — **#272 を先に merge する**
+
+PR を revert し、`scripts/sync-main-checkout.sh` で主 checkout を ff する (dispatcher は文面を 1 か所変えたので restart される)。**新しい card の欄・record・identity の欄は残ってよい** (§9.3)。狭めを戻すと再び pending から done が通る
+(制限を外す方向なので壊れない)。revert したあとの注意は 3 つ:
+
+- **起動済みの Worker のプロンプト・走っている kai-review.sh は `--execution` を付けて報告し続ける**。戻し先の plan.sh が `unknown option` で拒否すると完了・失敗の報告が止まる (設計レビュー t002 の P2)。
+  採った対策: **`--execution` を受け付けて読み捨てる互換を E3 の前に別 PR (#272・commit `e3-execution-flag-compat`) で入れた**。E3 の revert はその commit を巻き戻さないので、戻し先でも `--execution` 付きの報告が通る
+  (`tests/test_plan_sh_execution_flag_rollback.py`: 互換 commit の plan.sh を git の履歴から取り出して、6 コマンドが `--execution` 付きで通ることを確かめる。履歴に無い浅い clone は skip)。**#272 が E3 より先に merge されていることを承認の前に確認する**
+  (E3 の PR は #272 の commit を含む。#272 を後に merge すると、E3 を revert したときに互換も一緒に消える)。もう 1 つの案 (rollback 手順に「残っている呼び出し元の切り替え」を含める) は採らなかった: 起動済みの全セッションと走っている bash を 1 つずつ止める手順は漏れる。
+- **E3 の間に verify-result fail で pending に戻った task**: revert 後の旧コードは pending の card を普通に pull できる (worker は null)。同じ試行 (VERIFICATION_REJECTED で terminal) の欄は残り、次の pull (旧コード) は欄を触らない →
+  roll forward の後 `attempt_view` が §9.5 の (iv) → (v) として DETACHED / TERMINAL を card から読み分ける。Director がやることは無い。
+- **E3 の間に閉じた試行が増える**: 旧コードは試行を閉じない。revert 後に旧コードが done した task は `running` の試行が残る (E2 の間と同じ形)。
+  **`update --close-execution` は E3 (#273) で足したので、revert すると消える** (t034 / Codex P3)。revert の間は閉じる手段が無く、
+  roll forward (#273 を戻して入れ直す) の**後**にだけ使える。revert の間は `running` の残りを数えるだけにして (`store-check`)、閉じるのは roll forward の後に回す。
+
+### 16.5 族ごとの掃除 (直した型と同じ型を、同じデータ・同じ判定を扱うコードと文書について)
+
+**F1 「指定されたか」を値の真偽で判定する (01b G3 の型)** — `--execution` / `CREWVIA_EXECUTION_ID` を読む / 渡す箇所を `grep -rn -- "--execution\|CREWVIA_EXECUTION_ID" scripts hooks agents skills crewvia` で数えた (テスト・knowledge を除く: 57 行 / 10 ファイル。文書 4・plan.sh・kai-review.sh・verifier-dispatcher.sh・lib_task_controller.py・scripts/CLAUDE.md)。
+
+| 箇所 | 判定 | 処置 |
+|---|---|---|
+| plan.sh `_execution_caller` (flag) | `'--execution' in opts` (presence)。空・空白だけは exit 1 | 直した。赤の実証 R02 |
+| plan.sh `_execution_caller` (env) | `os.environ.get(...) is not None`。空は exit 1 | 直した。赤の実証 R03 |
+| kai-review.sh `PULL_EXECUTION_ID` | `[[ -n ... ]]` — **自分で pull の JSON から取り出した値**で、空は「JSON に欄が無い」の意味 (明示の指定ではない) | 不処置 (名乗らない側に倒すのが正。E3 は名乗りなしを拒否しない) |
+| kai-review.sh 継いだ env | `unset CREWVIA_EXECUTION_ID` | 直した (継いだ別 task の ID を名乗らない) |
+| verifier-dispatcher `card_execution_id` | `is not None` / 形の検査。壊れた値は None | 不処置 (card の値で、明示の指定ではない) |
+| worker.md `${EXECUTION_ID:+--execution …}` | ID が取れていないとき `--execution` ごと外す (空を渡さない) | 文書で明記 |
+| `--mission ""` (6 コマンドの `opts.get('--mission')` の真偽) | 空は省略と同じに倒れ、task id で mission を探す (曖昧なら拒否) | **不処置**: 識別の名乗りではなく所在の指定で、`$TASK_MISSION` が消えた Worker (Bash ツールは呼び出しごとに env が消える) の報告が今これで通っている。拒否に変えると出口を消す |
+| plan.sh の他の `opts.get(...)` の真偽 (数えた 21 か所) | 21 のうち 6 コマンドに関わるのは `--mission` だけ。残りは add / update / pull / status / archive / resync / pr-base の任意の option (空が意味を持つもの `--worker ''`・`--blocked-by ''` を含む) | E3 の範囲外 (01b G3 が `pr-base` を直した族の残り。backlog) |
+
+**F2 新しい lib が今のコードより厳しい** — Controller の拒否条件を 1 つずつ今の plan.sh と突き合わせた (memory `new-lib-stricter-than-legacy-path-breaks-compat`):
+
+| Controller の拒否 | 今まで | 処置 |
+|---|---|---|
+| card が読めない・語彙に無い status (`STATE_INVALID`) | exit 2 (`status='cancelled'` の task には使えません) | **今の答えを保った** (`_load_task_for_report`。§16.2 の 3)。単体テスト `test_an_unknown_status_is_refused` |
+| 試行の欄が壊れた card (`fields_problem`) | 欄を知らない (読まない) | 新しい条件 (E2 以降の card だけ・手編集した card)。exit 1・何も書かない。不処置 (E1 の malformed テストが固定) |
+| `meta_updates` / `meta_remove` の形 (禁止キー・JSON 化) | 無い | plan.sh が渡す欄 (`completed_at` / `pr_number` / `no_pr_waiver` / `needs_director_reason` / `rework_count` / `verifier` / fail の証拠欄) に禁止キーは無い。不処置 |
+| 遷移の表 (§4.3) | 広い表 | 狭めた (表にした差。§16.3) |
+| `reserved` の試行への done | 通る | 新しい条件 (§16.2 の 10)。出口あり |
+| 名乗った ID の照合 | 無い | 新しい条件 (名乗った呼び出しだけ) |
+| 試行の `running` を要求 (complete) | 要求しない | 同じ (reserved のみ新しく拒否) |
+
+**F3 `AGENT_NAME` を根拠に枠を撤去する** — `grep -n "retire_assignment(" scripts/plan.sh` は 6 行 (定義 2・`_retire_caller_slot` 1・`update --reset` 1・`retire` 1・`reap-orphan-assignment` 1)。
+done / fail / needs-director / verify-result fail は Controller (card の worker) に移し、`_retire_caller_slot` は AGENT_NAME の枠の後始末として残した。`update --reset` / `retire` は **E4** (対象外・今のまま)。reap は変えない。
+
+**F4 報告コマンドを打つ呼び出し元 (ID を渡す箇所)** — `grep -rlE "plan(\.sh)? (done|needs-director|fail|ready-for-verification|verify-result|verifying)"` で 20 ファイル:
+worker.md (41 行: 全部の例を直した)・director.md (16: done の例に `--execution` と出口を書いた)・crewvia-qa (7)・crewvia-plan-review (17)・verifier.md (6) は文書を直した。
+worker-codex.md (15) は Kai-codex の説明で、実際の呼び出しは kai-review.sh (直した)。verifier-dispatcher.sh (4・直した)・kai-review.sh (9・直した)・benchmark-ctx.sh (2: ID を名乗らず通る。不処置)・start.sh (3: kickoff の文面は pull だけ・コメント)・
+hooks (8: コマンド文字列の例・コメント)・lint_plan.py / lib_review_refusal.py / cleanup-target-dir.sh / scripts/CLAUDE.md / lib_task_status.py (各 1〜2: コメント)・README (5: 概要。不処置)・dispatcher.sh (10: コメント 9 + **[review-refused] の案内 1** — 直した。F5)。
+
+**F5 狭めた遷移の消費者 (狭めた status から done / fail / verify-result を勧めている箇所)** — dispatcher.sh の `[review-refused]` 通知 (task は pending のまま「`plan.sh done`」と案内 → 拒否される。**直した**)。
+director.md の手順 (`update --status in_progress --reset` → done は今のまま通る)・plan.sh の needs_director への done の拒否文 (出口を出す。今のまま)・`verifier-dispatcher` が `ready_for_verification` だけを拾う (`accepts('verifying')`) — 他に勧めている箇所は無かった。
+
+**F6 status の集合・表のコピー** — `tests/test_task_status_single_definition.py` (AST) が通る。Controller の `_MARK_TARGETS` は command → 単一の status リテラルの dict (集合ではない)。表の置き場は `lib_task_status.ACCEPTS_FROM` の 1 か所のまま。
+
+### 16.6 検証
+
+- `tests/test_execution_e3_caller_table.py` (113 件): 呼び出し元ごとの表 (§5.2 の各行 × 報告コマンド)・空の明示指定・形の違う名乗り・再送・conflict・Director が開いた card・取り直された後・DETACHED・狭めた遷移 (31 の組)・
+  検証の流れ・`verify-result fail` が新しい試行・`--close-execution`・監査 (actor・拒否の行)・secret・kai-review の形・target_dir の task。
+  `tests/test_verifier_dispatcher_names_the_attempt.py` (13 件)・`scripts/test_kai_review.sh` (3 本足した: pull の JSON の ID で done / needs-director が `verified`・継いだ env を捨てる)・
+  `tests/test_plan_sh_execution_flag_rollback.py` (3 件。#272 と同じ)。
+- 赤の実証: `python3 tests/red_proof_e3_caller.py` (11 変異: 照合を外す / 空の `--execution` を名乗りなしに倒す / 空の env / 狭めを戻す / 冪等を外す / verify-result fail が worker を手放さない / dry_run を派生値の後に回す /
+  拒否の行を残さない / actor を置き換える / verifier-dispatcher が `--execution` を渡さない / `--close-execution` が live な試行を閉じる)。**全て「狙ったテスト名の assert の失敗」で RED** (collection / import の失敗は数えない)。
+- 既存テストの更新 (狭め・枠の撤去・拒否の行の違いだけ): `test_task_status_single_definition` (設計の写し)・`test_needs_director_releases_assignment` / `test_projection_recovery_on_lock` / `test_plan_sh_state_store_cutover` (孤児の枠を手で作る・
+  拒否の行・E3 の終了コード)・`test_s5_writers_lock_and_atomic` (verifying の拒否の行)・`test_plan_result_file` (verify-result は検証待ちから)・`test_plan_assignment_transaction` (`_retire_caller_slot`)・
+  `tests/plan-assignment-identity.bats` (不正な AGENT_NAME の done は card の worker の枠を外す。bats)・`test_fail_evidence` (done / fail の書き手の検出が Controller 呼び出しも数える)・`test_task_controller_time_args_and_closed_findings` (引数の表)・`test_task_controller_has_no_callers_yet` (plan.sh が呼んでよい操作)・`test_plan_sh_compat_s3` (表にした違いだけ)。
+
+### 16.7 E4 以降に送るもの
+
+- `update --reset` / `retire` が試行を release / fail にするのは **E4a** (§7)。それまで reset は試行を閉じず、次の reserve の手順 0 か `--close-execution` が閉じる (テストで固定)。
+- **E5 (提案)**: 名乗りなしの done / fail / needs-director / verify-result を拒否する (§9.2 の 1)。条件は監査ログで `caller_check=unverified` が crewvia 本体の task で 0 件になること。
+- **`--mission ""` と他の `opts.get(...)` の真偽 (§16.5 の F1)**: 範囲外の残り。backlog。
+- 拒否コード `TASK_ALREADY_RESERVED` の名前 (E2 の申し送り): pull が legacy / running の card を `--task` で再 pull したとき stderr に出る。E3 では**変えなかった** (E2 の拒否文言・テストを動かさない)。名前を `TASK_NOT_AVAILABLE` 等に変えるかは E4。
+
+### 16.8 Codex 2 巡目 (t032 / PR #273): 再送の確認は、値を計算して経路を選ぶより前に
+
+- **P2**: `cmd_verify_result` は冪等の確認より前に `rework_count + 1` を計算し、その値で `fail_execution` / `mark_task` を選んでいた。上限の 1 つ手前 (max 3・count 1) の fail は count 2 で試行を閉じ、
+  **再送は 3 を計算して `mark_task` を選び、終わった試行を exit 3 で拒否**した (冪等の成功にならない)。上限ちょうどの fail は `needs_human_review` にしたあと、**再送のたびに count が増え検証の記録 (`**Verdict:**` の節) が重複**した。
+- **修正**: count を増やす前・経路を選ぶ前に「この判定がもう記録されているか」を確かめる。fail は `fail_execution(VERIFICATION_REJECTED, dry_run=True)` が `IDEMPOTENT` (試行が既に `VERIFICATION_REJECTED`)。needs_human_review の verdict / 上限に達した fail は、
+  task が既に `needs_human_review` で (nhr の verdict なら常に・fail なら count が既に上限以上のとき) 同じ判定の再送とみなす。名乗り (照合) は dry_run が先に行うので、違う試行の再送は今までどおり exit 3。
+  nhr の verdict で人間の判断待ちになった後 (count は増えていない) の fail は**新しい判定**で、1 度だけ記録され、その再送が冪等になる。
+- **族ごとの掃除 (「冪等の確認より前に状態から値を計算して経路を選ぶ」箇所)**: E3 で Controller に移した操作を 1 つずつ見た。
+
+| 操作 | 値を計算する箇所 | 再送の経路 | 結果 |
+|---|---|---|---|
+| done | `completed_at` / `pr_number` (D1〜D2) | **dry_run が先** (E3 の初版から) | 冪等 (exit 0)・何も書かない |
+| fail | `completed_at` / 証拠 | dry_run が先 (初版から) | 冪等 |
+| needs-director | reason の整形のみ (状態に依存しない) | Controller が `IDEMPOTENT` を返す | 冪等 |
+| ready-for-verification / verifying | 無い | status が既に進んでいるので `INVALID_TRANSITION` (exit 2) | 何も書かない (拒否の行だけ) |
+| verify-result pass | `completed_at` (状態に依存しない) | Controller が `IDEMPOTENT` | 冪等 |
+| **verify-result fail / needs_human_review** | **`rework_count + 1` で経路を選ぶ** | **直した (上記)** | 冪等 |
+
+  境界のある値 (`rework_count`・`attempt` / `execution_count`) は、境界の手前・ちょうど・超えた後の再送を `tests/test_execution_e3_resend_idempotent.py` (13 件) が固定する (card・record・枠・Verification の節・監査の `ok` 行・count が増えない)。
+  赤の実証: 修正前の plan.sh で同テストが 4 件 FAILED (`assert 3 == 0` 等)・修正後は緑。
+
+### 16.9 Codex 3 巡目 (t033 / PR #273): 再送の根拠は状態の推測ではなく、この試行に結び付いた記録
+
+- **P2**: t032 の `already_escalated` は「前の報告があった」ことを **task の status と rework_count だけ**から推し量った。`update --status needs_human_review` の後の最初の `verify-result needs_human_review --notes ...` は、検証の記録を 1 つも残さず成功 (冪等) で返り、
+  fail で上限に達してエスカレーションした後の**違う** needs_human_review の判定と notes も飲み込まれた。
+- **修正**: `## Verification` の各項目に `**Execution:** <この試行の id>` の行を足し (試行なしは `-`)、再送は「**同じ試行・同じ verdict・同じ notes の項目が card に既にある**」ときだけ (`_verification_recorded`。status・回数は見ない)。
+  試行が既に終わっている行 (pass / 上限手前の fail) は Controller の記録 (`execution_end_code`) が根拠で、さらに notes が一致する項目が無ければ **exit 3 (conflict)** で飲まない。
+- **「再送と判定する根拠」の列 (族の掃除)**:
+
+| 操作 | 再送と判定する根拠 | 違う内容の 2 回目 (verdict / notes / PR 番号) |
+|---|---|---|
+| done / fail / needs-director | 試行の終了 record (`execution_end_code` + 名乗りの照合。Controller の `IDEMPOTENT`) **+ 要求の中身が card と同じこと** (t034。§16.10) | 名乗り付きは conflict (exit 3・何も書かない)・名乗りなしは遷移の拒否 (exit 2)。新しい記録にはならない。**t033 の時点では中身を比べず exit 0 で飲んでいた (t034 で直した)** |
+| verify-result pass | 試行の終了 record (`execution_end_code` + 名乗りの照合。Controller の `IDEMPOTENT`) | 試行が終わっているので名乗り付きは conflict (exit 3)・名乗りなしは遷移の拒否 (exit 2)。新しい記録にはならない |
+| ready-for-verification / verifying | 無い (status が進んでいれば `INVALID_TRANSITION` exit 2) | 同上・何も書かない |
+| verify-result fail (上限手前) | 試行の終了 record + **同じ notes の Verification 項目** | notes が違えば exit 3 (飲まない) |
+| verify-result needs_human_review / 上限に達した fail | **同じ試行・verdict・notes の Verification 項目** (status / count は根拠にしない) | 新しい項目として記録される (status は needs_human_review のまま) |
+
+  根拠が status・回数の推測の行は 0 件。赤の実証: 修正前の plan.sh で新テスト 4 件が FAILED・修正後は緑 (`tests/test_execution_e3_resend_idempotent.py`)。
+
+### 16.10 Codex 4 巡目 (t034 / PR #273 + #272): 同じ ID・**違う中身**の再送を exit 0 で飲まない
+
+- **P2-1 (#273)**: t032 / t033 が直したのは「**同じ**中身の再送が二重に書かない」と verify-result の notes だけだった。done / fail / needs-director の IDEMPOTENT 分岐は
+  中身を見ずに exit 0 を返していた。実測 (t015): `done t001 "first" --pr 5 --execution X` → `done t001 "CORRECTED" --pr 6 --execution X` が exit 0・card は最初のまま
+  (pr_number 5・Result も最初)。`needs-director "reason A"` → `"reason B"`、`fail --no-head x` → `fail --head <sha>` も同じ。E3 の前は 2 回目はすべて exit 2 だったので、
+  打ち直した Worker が気付けた。**E3 が「気付く手段」を黙って外していた**。
+- **修正**: IDEMPOTENT の分岐で**要求を card と比べる**。違えば **exit 3** (`EXECUTION_ALREADY_TERMINAL`・固定の文言 + **違う項目の名前だけ**・何も書かない・名乗られた値も card の中身も出さない)。
+  同じなら今までどおり exit 0。比べ方は書き込みと同じ正規化:
+
+  | コマンド | 比べるもの (要求 ↔ card) | 正規化 |
+  |---|---|---|
+  | done | `--pr` ↔ `pr_number` / `--no-pr` ↔ `no_pr_waiver` (かつ `pr_number` が空) / Result 本文 ↔ `## Result` | 理由の空白を畳む・Result は前後の空白を除く。**`--pr` も `--no-pr` も無い再送は PR について何も主張しない** (最初の done が付けずに通った・`update --pr-number` で入れた番号を持つ card がある) |
+  | fail | `--head` ↔ `fail_head` / `--no-head` ↔ `fail_head_waiver` / handoff ↔ `handoff_path` | head は完全 SHA に解決 (略称の再送は同じ)・理由の空白を畳む・handoff は normpath。**handoff を付けない再送は「handoff なし」の主張** (card に残っていれば違う中身)。`--head` と `--no-head` の両方・どちらも無い再送は最初の fail が通った形ではないので違う中身 |
+  | needs-director | reason ↔ `needs_director_reason` (要約) + 長い理由は本文の `## Needs-Director 詳細` | 200 字超は要約と全文の両方を比べる (末尾だけ違う再送も違う中身) |
+  | verify-result pass | 同じ試行・同じ verdict・同じ notes の `## Verification` 項目 (t033 と同じ根拠) | 上の fail と同じ。**pass は t033 で漏れていた** (notes が違う再送が exit 0 で飲まれた。この巡で直した) |
+
+- **「違う内容の 2 回目」の列 (t032 / t033 の「同じ内容の再送」の表を全コマンドに広げた。実装から導いて、実測した結果)**:
+
+  | コマンド | 同じ中身の 2 回目 | 違う中身の 2 回目 | 根拠 |
+  |---|---|---|---|
+  | pull (予約の再開) | 再開 (新しい試行を作らない・exit 0) | 中身を持つ引数が無い (識別は agent と task)。別の agent は `TASK_ALREADY_RESERVED` (exit 1) | §6 / E2 |
+  | done | exit 0・何も書かない | **conflict (exit 3)**: `--pr` / `--no-pr` / Result のどれか | `_done_resend_differences` |
+  | fail | exit 0・何も書かない | **conflict (exit 3)**: head / no-head / handoff のどれか | `_fail_resend_differences` |
+  | needs-director | exit 0・何も書かない | **conflict (exit 3)**: reason | `transition_to_needs_director` の戻りと card を比べる |
+  | ready-for-verification | status が進んでいるので exit 2 (`INVALID_TRANSITION`)・何も書かない | 同じ (引数は `--execution` だけで、中身の違いは無い) | `ACCEPTS_FROM` |
+  | verifying | 同上 (exit 2) | 同じ (違う `--verifier` も exit 2・何も書かない) | `ACCEPTS_FROM` |
+  | verify-result pass | exit 0・何も書かない | **conflict (exit 3)**: notes | 同じ notes の Verification 項目 |
+  | verify-result fail (上限手前) | exit 0・何も書かない | **conflict (exit 3)**: notes | t033 |
+  | verify-result needs_human_review / 上限に達した fail | exit 0・何も書かない | 新しい項目として記録される (status は needs_human_review のまま) | t033 (人間の判断待ちに追記する運用) |
+  | update --close-execution | 閉じた後は何もしない (exit 0) | 中身を持つ引数が無い (`--mission` だけ) | §16.2 の 7 |
+  | update --reset | (E3 では Controller を通らない) | — | E4 |
+
+  **exit 0 で中身を捨てる行は 0 件** (「新しい項目として記録される」行は捨てずに残す)。赤の実証: 修正前の plan.sh で `tests/test_execution_e3_resend_differs.py` の
+  conflict を期待する行が FAILED (done / fail / needs-director の 3 例を含む)・修正後は緑。同じ中身の再送は両方で exit 0。
+  逆を固定していた `test_a_resend_of_done_does_not_redo_the_derived_writes_or_the_mission_done` (`--pr 99` の 2 回目が exit 0) は、同じ中身は成功・違う中身は conflict に直した。
+- **P2-2 (#272)**: `tests/test_plan_sh_execution_flag_rollback.py` の `_compat_sha()` は `git log --all --grep=e3-execution-flag-compat -n 1` (いちばん新しい一致)
+  を使っていた。#273 の **squash commit の本文**に互換 commit の件名が写る (`* e3-execution-flag-compat: ...`) ので、merge 後は squash commit が先に当たり、E3 の plan.sh を
+  「戻し先」として取り出して 3 件赤になる (CI は浅い clone で skip されるので CI では気付けない)。**候補の commit から `scripts/plan.sh` に `def _execution_caller` を含むものを除く**。
+  赤の実証: #273 の squash の形 (互換 commit の上に E3 の tree + 互換の件名を本文に持つ commit) を積んだ隔離 clone で、修正前 3 failed・修正後 3 passed。
+  (memory `contrast-test-dies-when-its-subject-merges` と同じ型: 履歴の「いちばん新しい一致」は自分の subject が merge されると別の物を掴む)
+- **P3**: §16.4 の `update --close-execution` は #273 で足したので revert すると消える (roll forward の後にしか使えない) と訂正した。`kai-review.sh` は pull の出力から
+  `execution_id` を読めず名乗りなしへ切り替えるとき、stderr に 1 行 (`execution_id を読めませんでした`) 残す (E5 の観察で数える。
+  `tests/test_kai_review_warns_when_it_cannot_name_the_attempt.py`。警告を外すと 4 件 FAILED)。

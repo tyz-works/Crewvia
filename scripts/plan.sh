@@ -46,6 +46,9 @@ set -euo pipefail
 #   plan.sh update <task_id> [--mission <slug>] [--skills <csv>] [--blocked-by <csv>]
 #                            [--priority high|medium|low] [--worker <name>] [--status <status>]
 #                            [--description <text>] [--reset] [--deliverable pr|file|none]
+#   plan.sh update <task_id> --close-execution [--mission <slug>]
+#                              task に触れず、Controller の外で手放されて active のまま残った試行 (終わった task に残った
+#                              running 等。store-check の execution_active_on_finished_task) を failed / ABANDONED_OUTSIDE_CONTROLLER で閉じる
 #   plan.sh release-dep <task_id> [--dep <csv>] [--mission <slug>]
 #                              failed の依存で保留されている task を、Director が明示的に
 #                              進めてよいと決める (省略時は今 failed の依存すべて)。
@@ -1918,7 +1921,7 @@ def with_lock(callback, nonblocking=False):
             try:
                 _ensure_queue_dirs()
                 result = callback()
-                if not _AUDIT_TASK_ROWS and _AUDIT_OTHER_ROWS:
+                if not _AUDIT_TASK_ROWS and not txn.has_body_record and _AUDIT_OTHER_ROWS:
                     rows = (
                         [row for row in _AUDIT_OTHER_ROWS if row[1]]
                         or [row for row in _AUDIT_OTHER_ROWS if row[0]]
@@ -2565,7 +2568,8 @@ USAGE = {
     'update': ('plan.sh update <task_id> [--mission <slug>] [--skills <csv>] [--blocked-by <csv>]\n'
                '                       [--priority high|medium|low] [--worker <name>] [--status <status>]\n'
                '                       [--description <text>] [--reset] [--pr-number <N>]\n'
-               '                       [--deliverable pr|file|none]'),
+               '                       [--deliverable pr|file|none]\n'
+               '       plan.sh update <task_id> --close-execution [--mission <slug>]'),
     'release-dep': 'plan.sh release-dep <task_id> [--dep <csv>] [--mission <slug>]',
     'retire': ('plan.sh retire <task_id> --agent <name> --started-at <generation>\n'
                '                       [--mission <slug>] [--outcome reset|needs-director]\n'
@@ -3225,6 +3229,132 @@ def _pull_controller_die(e):
     """Controller の domain error を pull の終わり方に写す。固定コード + 位置・識別子だけ (card の中身は出さない)。"""
     code = 3 if e.code in _PULL_EXECUTION_EXIT_CODES else 1
     die(f"[plan.sh pull] {e.message}\n{_error_code_line(e.code)}", code)
+
+
+def _execution_caller(opts):
+    """done / fail / needs-director / ready-for-verification / verifying / verify-result が名乗る試行 (execution.md §5.2)。
+
+    ID の出どころは **`--execution <id>` (明示) > env `CREWVIA_EXECUTION_ID`**。どちらも無ければ「名乗りなし」
+    (E3 は拒否しない。`.crewvia-env` を必須にしないため。拒否に進むのは E5)。agent 名は照合の根拠にしない (AC-04)。
+
+    **「指定されたか」は presence で見る** (01b G3): `--execution ""` / 空の env を名乗りなしに倒さない
+    (`retire --started-at ""` と同じく exit 1・何も書かない)。名乗った値の形が違えば Controller が
+    `EXECUTION_NOT_FOUND` (exit 3) で拒否する。**ロックを取る前に呼ぶこと** (拒否は何も書かない)。
+    """
+    agent = os.environ.get('AGENT_NAME') or None
+    if '--execution' in opts:
+        value = opts['--execution']
+        if not value.strip():
+            die("[plan.sh] --execution には execution id (ex-…) が必要です。空の値は「名乗りなし」として扱いません"
+                " (名乗らないなら --execution ごと外してください)。何も書いていません。")
+        return _CONTROLLER.Caller(value, 'flag', agent)
+    value = os.environ.get('CREWVIA_EXECUTION_ID')
+    if value is not None:
+        if not value.strip():
+            die("[plan.sh] 環境変数 CREWVIA_EXECUTION_ID が空です。空の値は「名乗りなし」として扱いません。"
+                " `unset CREWVIA_EXECUTION_ID` するか、--execution で ID を渡してください。何も書いていません。")
+        return _CONTROLLER.Caller(value, 'env', agent)
+    return _CONTROLLER.NO_CALLER
+
+
+def _controller_die(command, e):
+    """Controller の domain error を終わり方に写す (pull 以外の全コマンド)。exit code は `lib_execution.EXIT_CODES`
+    (遷移の拒否 `INVALID_TRANSITION` は今までの `REFUSED_TRANSITION` と同じ 2。照合の 3 つは 3)。stderr の**最後の行**に
+    固定形式の `error_code=<CODE>` を出す。メッセージは固定の文言 + 識別子だけ (card の中身・名乗られた値は出さない)。"""
+    prefix = '' if e.message.startswith("task '") else f"[plan.sh {command}] "
+    die(f"{prefix}{e.message}\n{_error_code_line(e.code)}", _EXEC.EXIT_CODES[e.code])
+
+
+def _resend_conflict(command, slug, task_id, fields):
+    """同じ ID の再送だが**中身が記録と違う**ときの終わり方 (exit 3・何も書かない。execution.md §4.4 / §16.10)。
+
+    Controller の IDEMPOTENT は「同じ試行が同じ操作で終わっている」ことしか言わない。done の `--pr` / Result・fail の head /
+    handoff・needs-director の reason が違うまま exit 0 を返すと、打ち直した Worker は直ったと読むが card は最初のまま
+    (E3 の前は 2 回目はすべて exit 2 だった)。文言は固定で、出すのは項目名だけ (名乗られた値・card の中身は出さない)。
+    コードは「その試行は既に終わっていて、別の中身への変更」の `EXECUTION_ALREADY_TERMINAL` (verify-result の conflict と同じ)。
+    """
+    code = _EXEC.EXECUTION_ALREADY_TERMINAL
+    die(f"[plan.sh {command}] {slug}/{task_id}: 同じ試行の {command} は既に記録済みで、今回の指定は記録と違います"
+        f" (違う項目: {', '.join(fields)})。同じ ID の再送は同じ中身だけ受け付けます。何も書いていません。\n"
+        f"{_error_code_line(code)}", _EXEC.EXIT_CODES[code])
+
+
+def _result_section_matches(body, result):
+    """card の `## Result` が `result` と同じか (done の再送の比較)。
+
+    done は `build_task_body(desc, result)` の後ろに、needs-director の `## Needs-Director 詳細` のような**末尾の節**を残す
+    (`append_trailing_body_section`)。`parse_task_body` はそれも Result の一部として返すので、`result` の後ろが空か、
+    `## ` で始まる節のときだけ同じとみなす (前方一致だけだと、記録より短い Result の再送が通る)。
+    """
+    stored = parse_task_body(body)[1]
+    wanted = result.strip()
+    if not stored.startswith(wanted):
+        return False
+    rest = stored[len(wanted):]
+    return rest == '' or (rest.startswith('\n') and rest.lstrip().startswith('## '))
+
+
+def _done_resend_differences(meta, body, result, pr_number, no_pr_reason):
+    """`done` の再送の要求と card の違う項目 (空なら同じ中身)。`--pr` も `--no-pr` も無い再送は PR について何も主張しない
+    (最初の done も付けずに通った・Director が `update --pr-number` で入れた番号を持つ card がありうる)。"""
+    diffs = []
+    if pr_number is not None and meta.get('pr_number') != pr_number:
+        diffs.append('--pr')
+    if no_pr_reason is not None and (meta.get('no_pr_waiver') != no_pr_reason
+                                     or meta.get('pr_number') not in (None, '')):
+        diffs.append('--no-pr')
+    if not _result_section_matches(body, result):
+        diffs.append('Result')
+    return diffs
+
+
+def _fail_resend_differences(meta, head, no_head, handoff_path):
+    """`fail` の再送の要求と card の違う項目。比べ方は書き込み (`_validate_fail_evidence`) と同じ正規化
+    (理由の空白の畳み方・head の完全 SHA 化・handoff の normpath)。handoff を付けなかった再送は「handoff なし」の主張。"""
+    diffs = []
+    if (head is None) == (no_head is None):
+        diffs.append('--head/--no-head')      # 最初の fail が通った形ではない (両方・どちらも無い)
+    elif no_head is not None:
+        if meta.get('fail_head_waiver') != ' '.join(str(no_head).split()) or meta.get('fail_head'):
+            diffs.append('--no-head')
+    else:
+        full, _why = _resolve_head_commit(head)
+        if full is None or meta.get('fail_head') != full:
+            diffs.append('--head')
+    recorded = os.path.normpath(handoff_path) if handoff_path else None
+    if (meta.get('handoff_path') or None) != recorded:
+        diffs.append('handoff_path')
+    return diffs
+
+
+def _load_task_for_report(command, slug, task_id):
+    """報告コマンド (done / fail / needs-director / ready-for-verification / verifying / verify-result) が card を読む入口。
+
+    **語彙に無い status の card・読めない card** (手書きの `cancelled`・壊れた frontmatter = `corrupted`) は、今までどおり
+    「この status の task には使えません」で拒否する (exit 2・何も書かない。COMPAT-01)。Controller は card を厳密に読み、
+    読めない card を `STATE_INVALID` (exit 1) にするので、その前に plan.sh の寛容な読み口で今の答えを保つ
+    (新しい lib が今のコードより厳しくならないように。memory new-lib-stricter-than-legacy-path-breaks-compat)。
+    `with_lock()` の中で呼ぶ。戻り値は (meta, body)。"""
+    meta, body = load_task(slug, task_id)
+    if meta.get('status') not in _TASK_STATUS.TASK_STATUSES:
+        refuse_transition(command, task_id, meta.get('status'))
+    return meta, body
+
+
+def _retire_caller_slot(slug, task_id):
+    """`AGENT_NAME` の枠 (この task を指すもの) を撤去する。Controller は **card の worker の枠**を撤去するので、
+    ここは「card の worker ではない AGENT_NAME が持つ、この task を指す枠」(今までの done / fail / needs-director が
+    していたこと) を保つための後始末 (既に撤去済みなら何もしない。他の task を指す・後任の枠は消さず警告するだけ)。
+    `with_lock()` の中で、Controller の呼び出しの**後**に呼ぶ。"""
+    agent_name = os.environ.get('AGENT_NAME', '')
+    if agent_name:
+        verdict = retire_assignment(agent_name, slug, task_id, None)
+        if verdict not in (ASSIGN_MINE, ASSIGN_ABSENT):
+            print(
+                f"[plan.sh warn] {describe_assignment_verdict(agent_name, verdict)}"
+                f" — 削除しませんでした ({agent_name} は別の作業に就いている可能性があります)",
+                file=sys.stderr,
+            )
 
 
 def _pull_cas_ok(meta, agent, generation, execution_id):
@@ -4203,43 +4333,33 @@ def read_body_arg(opts, file_flag, inline, inline_desc):
     return text.rstrip('\n')
 
 
-def transition_to_needs_director(slug, task_id, meta, body, reason, agent_name):
-    """card を `needs_director` に遷移させ、`agent_name` の assignment を撤去する。`with_lock()` の中でだけ呼ぶ。
+def transition_to_needs_director(slug, task_id, meta, body, reason, caller):
+    """card を `needs_director` に遷移させる (試行は `failed` / `NEEDS_DIRECTOR`)。`with_lock()` の中でだけ呼ぶ。
 
-    `needs-director` コマンドと、`pull` が worktree を作れなかったときの出口 (GIT-05) の**共通の本体**
-    (コピーしない)。呼び出し側が status の受け付けを済ませていること。返り値は (summary, full_text)。
+    遷移・照合・card の worker の枠の撤去は Controller の `fail_execution`。ここは reason の整形と body だけ
+    (`AGENT_NAME` の枠の後始末 `_retire_caller_slot` は呼び出し側の `with_lock` のコールバックが行う)。
+    返り値は (summary, full_text, idempotent) — 同じ ID の needs-director の再送は成功で何も書かない (`idempotent`)。
+    呼び出し側が `ControllerError` を `_controller_die` で終わらせる。
+    pull の G1 (worktree を作れなかった) は同じ書き込みを `WORKSPACE_CREATE_FAILED` で行う (`_pull_worktree_failed`)。
     """
     summary, full_text = split_long_freeform(reason)
-    meta['status'] = 'needs_director'
-    meta['needs_director_reason'] = summary
     if full_text is not None:
         body = body.rstrip() + '\n\n## Needs-Director 詳細\n' + full_text.strip() + '\n'
-    save_task(slug, task_id, meta, body)
-
-    # done / fail と同じく、撤去は card の書き換えと同じトランザクションの中で
-    # (generation=None の理由も cmd_done を参照)。撤去しないと、codex-review の
-    # Kai-codex のように「同時 1 実行」を assignment の有無で判定する側が、終わった
-    # run の assignment に恒久的に塞がれる (backlog #13)。判断待ちの Worker が
-    # 「仕事なし」と読まれて退役されないことは dispatcher 側が card で見る
-    # (`worker_holds_work()`) — assignment を外す前提はそちらに置いてある。
-    # 順序は card (正本) が先・assignment (projection) が後。逆にすると「in_progress なのに枠が無い」が
-    # 生まれ、S4 の R-1 が枠を作り直す。
-    if agent_name:
-        verdict = retire_assignment(agent_name, slug, task_id, None)
-        if verdict not in (ASSIGN_MINE, ASSIGN_ABSENT):
-            print(
-                f"[plan.sh warn] {describe_assignment_verdict(agent_name, verdict)}"
-                f" — 削除しませんでした ({agent_name} は別の作業に就いている可能性があります)",
-                file=sys.stderr,
-            )
-    return summary, full_text
+    # 順序は card (正本) が先・assignment (projection) が後 (Controller の中の順序)。逆にすると「in_progress なのに枠が無い」が
+    # 生まれ、S4 の R-1 が枠を作り直す。撤去しないと、codex-review の Kai-codex のように「同時 1 実行」を assignment の
+    # 有無で判定する側が、終わった run の assignment に恒久的に塞がれる (backlog #13)。判断待ちの Worker が
+    # 「仕事なし」と読まれて退役されないことは dispatcher 側が card で見る (`worker_holds_work()`)。
+    result = _CONTROLLER.fail_execution(_txn(), slug, task_id, caller, _EXEC.NEEDS_DIRECTOR, to_status='needs_director',
+                                        meta_updates={'needs_director_reason': summary}, body=body)
+    return summary, full_text, (result is not None and result.idempotent)
 
 
 def cmd_needs_director(args):
     """plan.sh needs-director <task_id> "<理由>"
 
-    in_progress タスクを needs_director 状態に遷移させる。
-    Director の介入を求める。
+    in_progress タスクを needs_director 状態に遷移させる (試行は failed / NEEDS_DIRECTOR)。
+    Director の介入を求める。呼び出し元は `--execution <id>` (または env `CREWVIA_EXECUTION_ID`) で今の試行を名乗る
+    (違う試行なら exit 3。名乗らなければ E3 では通す)。
     - TERMINAL_STATUSES に含まれないため、後続 blocked_by は解除されない
     - Dispatcher は pending 以外の非終端ステータスと同じく割り当て対象外
     - AGENT_NAME の assignment (この task を指すもの) を撤去する (done / fail と同じ)。
@@ -4252,6 +4372,7 @@ def cmd_needs_director(args):
                            positional[1] if len(positional) > 1 else None, '位置引数の理由')
     if reason is None:
         _usage_exit("needs-director requires <task_id> and <reason> (or --result-file <path|->)")
+    caller = _execution_caller(opts)
 
     def _do():
         state = load_state()
@@ -4270,13 +4391,19 @@ def cmd_needs_director(args):
         if not os.path.exists(task_path(slug, task_id)):
             die(f"task '{task_id}' not found in mission '{slug}'.")
 
-        meta, body = load_task(slug, task_id)
-        cur_status = meta.get('status')
-        if not _TASK_STATUS.accepts('needs-director', cur_status):
-            refuse_transition('needs-director', task_id, cur_status)
-
-        summary, full_text = transition_to_needs_director(
-            slug, task_id, meta, body, reason, os.environ.get('AGENT_NAME', ''))
+        meta, body = _load_task_for_report('needs-director', slug, task_id)
+        try:
+            summary, full_text, idempotent = transition_to_needs_director(slug, task_id, meta, body, reason, caller)
+        except _EXEC.ControllerError as e:
+            _controller_die('needs-director', e)
+        if idempotent:
+            # 理由が card と違う再送は成功にしない (exit 3・何も書かない。§16.10)。長い理由は先頭だけが frontmatter に入り、
+            # 全文は本文の節にあるので、frontmatter の要約と全文の両方を比べる。
+            if meta.get('needs_director_reason') != summary or (full_text is not None and full_text.strip() not in body):
+                _resend_conflict('needs-director', slug, task_id, ['reason'])
+            print(f"[plan.sh] Task {task_id} → needs_director — already recorded (idempotent)")
+            return
+        _retire_caller_slot(slug, task_id)         # card の worker の枠は Controller が外した。AGENT_NAME の枠の後始末
 
         print(f"[plan.sh] Task {task_id} → needs_director")
         print(f"[plan.sh] Reason: {summary}")
@@ -4517,6 +4644,7 @@ def cmd_done(args):
         no_pr_reason = ' '.join(str(opts['--no-pr']).split())
         if not no_pr_reason:
             _usage_exit('--no-pr には理由 (空でない 1 行) が必要です')
+    caller = _execution_caller(opts)
     sync_holder = [None]  # (slug, task_id, result)
     worker_holder = [None]  # worker name for registry bump (None = _do未実行, '' = worker未設定)
 
@@ -4554,18 +4682,31 @@ def cmd_done(args):
         if not os.path.exists(task_path(slug, task_id)):
             die(f"task '{task_id}' not found in mission '{slug}'.")
 
-        meta, body = load_task(slug, task_id)
+        meta, body = _load_task_for_report('done', slug, task_id)
         cur_status = meta.get('status')
-        if cur_status in _TASK_STATUS.WAITS_ON_DIRECTOR_STATUSES:
-            reason = meta.get('needs_director_reason', '')
-            die(
-                f"task '{task_id}' is in needs_director state (理由: {reason})\n"
-                f"Director が plan.sh update {task_id} --status in_progress --reset で"
-                f" 差し戻してから再度 plan.sh done を呼んでください。",
-                REFUSED_TRANSITION,
-            )
-        if not _TASK_STATUS.accepts('done', cur_status):
-            refuse_transition('done', task_id, cur_status)
+        # ── 照合と遷移の検査は、何かを書く**前**に Controller で (dry_run。書き込みは下の D3 の `complete_execution`) ──
+        # 派生値 (D1 / D2) をコミット点より前に書くので、書いた後で拒否になる窓を作らない。名乗った試行が今の試行でなければ
+        # exit 3、遷移が通らなければ exit 2 (done は in_progress だけ。execution.md §4.3)。ID を名乗った同じ done の再送は
+        # **成功 (exit 0・何も書かない)**。
+        try:
+            decision = _CONTROLLER.complete_execution(_txn(), slug, task_id, caller, to_status='done', dry_run=True)
+        except _EXEC.ControllerError as e:
+            if e.code == _EXEC.INVALID_TRANSITION and cur_status in _TASK_STATUS.WAITS_ON_DIRECTOR_STATUSES:
+                reason = meta.get('needs_director_reason', '')
+                die(
+                    f"task '{task_id}' is in needs_director state (理由: {reason})\n"
+                    f"Director が plan.sh update {task_id} --status in_progress --reset で"
+                    f" 差し戻してから再度 plan.sh done を呼んでください。\n{_error_code_line(e.code)}",
+                    REFUSED_TRANSITION,
+                )
+            _controller_die('done', e)
+        if decision == _CONTROLLER.IDEMPOTENT:
+            # 同じ ID の再送でも、--pr / --no-pr / Result が card と違えば成功にしない (exit 3・何も書かない。§16.10)
+            diffs = _done_resend_differences(meta, body, result, pr_number, no_pr_reason)
+            if diffs:
+                _resend_conflict('done', slug, task_id, diffs)
+            print(f"Done: {slug}/{task_id} — already completed (idempotent)")
+            return
 
         # ── 自分自身の card に既にある pr_number との食い違い (t095 / PR#236 8巡目 P2-1) ──
         # 成果物を作った task 自身の card にも pr_number を残す (下の done 処理の中)。既に
@@ -4682,21 +4823,27 @@ def cmd_done(args):
         if pr_number is not None:
             propagated = propagate_pr_number(slug, task_id, pr_number)
 
-        meta['status'] = 'done'
+        done_updates = {}
         if pr_number is not None:
             # 成果物を作った task 自身の card にも番号を残す (B4 の本題。t095 / PR#236 8巡目
             # P2-1)。旧実装は propagate_pr_number() で後続の codex-review/review にだけ書き、
             # 成果物を作った側の card には PR への参照が一切残らなかった。食い違いの拒否は
             # 上の「自分自身の card に既にある pr_number との食い違い」で済んでいるので、
             # ここは単純に書くだけでよい (D1 で書き済みの同じ値)。
-            meta['pr_number'] = pr_number
+            done_updates['pr_number'] = pr_number
         if no_pr_reason is not None:
-            meta['no_pr_waiver'] = no_pr_reason
-        meta['completed_at'] = now_iso()
+            done_updates['no_pr_waiver'] = no_pr_reason
+        done_updates['completed_at'] = now_iso()
         trailing = extract_trailing_body_section(body)
         desc, _ = parse_task_body(body)
         new_body = append_trailing_body_section(build_task_body(desc, result), trailing)
-        save_task(slug, task_id, meta, new_body)
+        # D3 (コミット点): status・試行の終了コード (`DONE`)・completed_at / pr_number / Result を**同じ card の書き込み**で。
+        # 枠の撤去 (D4。card の worker の枠) も Controller の中 (card の後)。
+        try:
+            _CONTROLLER.complete_execution(_txn(), slug, task_id, caller, to_status='done',
+                                           meta_updates=done_updates, body=new_body)
+        except _EXEC.ControllerError as e:
+            _controller_die('done', e)
         worker_holder[0] = meta.get('worker') or ''  # capture worker for post-lock bump
         sync_holder[0] = (slug, task_id, result)
 
@@ -4711,18 +4858,9 @@ def cmd_done(args):
                 print(f"[plan.sh] PR #{pr_number} → {slug}/{dep_id} "
                       f"({'pr_number を設定し blocked を pending に戻した' if how.endswith('unblocked') else 'pr_number を設定'})")
 
-        # assignment の撤去は card の書き換えと同じトランザクションで行う。
-        # generation=None なのは、この経路が「いま card が示している実行」を
-        # 同じロックの中で終了させているため (読みと書きの間に隙間が無い)。
-        agent_name = os.environ.get('AGENT_NAME', '')
-        if agent_name:
-            verdict = retire_assignment(agent_name, slug, task_id, None)
-            if verdict not in (ASSIGN_MINE, ASSIGN_ABSENT):
-                print(
-                    f"[plan.sh warn] {describe_assignment_verdict(agent_name, verdict)}"
-                    f" — 削除しませんでした ({agent_name} は別の作業に就いている可能性があります)",
-                    file=sys.stderr,
-                )
+        # assignment の撤去は card の書き換えと同じトランザクションで行う (D4)。generation=None なのは、この経路が
+        # 「いま card が示している実行」を同じロックの中で終了させているため (読みと書きの間に隙間が無い)。
+        _retire_caller_slot(slug, task_id)
 
         # Mission complete?
         tasks = list_tasks(slug)
@@ -4803,6 +4941,7 @@ def cmd_fail(args):
         die("fail requires <task_id>")
     task_id = positional[0]
     handoff_path = positional[1] if len(positional) > 1 else None
+    caller = _execution_caller(opts)
     knowledge_info = [None]  # populated inside _do if rework limit reached
 
     def _do():
@@ -4824,10 +4963,21 @@ def cmd_fail(args):
         if not os.path.exists(task_path(slug, task_id)):
             die(f"task '{task_id}' not found in mission '{slug}'.")
 
-        meta, body = load_task(slug, task_id)
-        cur_status = meta.get('status')
-        if not _TASK_STATUS.accepts('fail', cur_status):
-            refuse_transition('fail', task_id, cur_status)
+        meta, body = _load_task_for_report('fail', slug, task_id)
+        # ── 照合と遷移の検査 (証拠の検証より先。今までも status の拒否が先だった)。fail は in_progress と needs_director
+        # (Director が判断待ちの task を諦める出口) だけ。同じ ID の fail の再送は成功 (exit 0・何も書かない) ──
+        try:
+            decision = _CONTROLLER.fail_execution(_txn(), slug, task_id, caller, _EXEC.WORKER_FAILED,
+                                                  to_status='failed', dry_run=True)
+        except _EXEC.ControllerError as e:
+            _controller_die('fail', e)
+        if decision == _CONTROLLER.IDEMPOTENT:
+            # 証拠 (head / no-head / handoff) が card と違う再送は成功にしない (exit 3・何も書かない。§16.10)
+            diffs = _fail_resend_differences(meta, opts.get('--head'), opts.get('--no-head'), handoff_path)
+            if diffs:
+                _resend_conflict('fail', slug, task_id, diffs)
+            print(f"Failed: {slug}/{task_id} — already failed (idempotent)")
+            return
 
         # ── 証拠の検証 (done と共通の入口。card は 1 バイトも書く前) ─────────────
         err, fields = _gate_terminal_report('fail', meta, {
@@ -4846,13 +4996,13 @@ def cmd_fail(args):
         # card) の全部を塞ぐより、failed に至る唯一の入口で塞ぐ方が漏れないため。
         # 開き直す側の掃除は cmd_update が別に行う (card を failed 以外の間も綺麗に保つ)。
         recorded_handoff = fields.get('handoff_path')
-        meta['status'] = 'failed'
-        meta['completed_at'] = now_iso()
+        fail_updates = {'completed_at': now_iso()}
+        fail_remove = []
         for key, val in fields.items():
             if val is None:
-                meta.pop(key, None)     # 前回の FAIL の証拠を持ち越さない
+                fail_remove.append(key)     # 前回の FAIL の証拠を持ち越さない
             else:
-                meta[key] = val
+                fail_updates[key] = val
         if fields.get('fail_head'):
             evidence = f"head: {fields['fail_head']}"
         else:
@@ -4864,7 +5014,11 @@ def cmd_fail(args):
                 desc, f"FAILED — {evidence} — handoff: {recorded_handoff or 'none'}"),
             trailing
         )
-        save_task(slug, task_id, meta, new_body)
+        try:
+            _CONTROLLER.fail_execution(_txn(), slug, task_id, caller, _EXEC.WORKER_FAILED, to_status='failed',
+                                       meta_updates=fail_updates, meta_remove=fail_remove, body=new_body)
+        except _EXEC.ControllerError as e:
+            _controller_die('fail', e)
         print(f"Failed: {slug}/{task_id}")
         if fields.get('fail_head_waiver'):
             print(
@@ -4874,15 +5028,7 @@ def cmd_fail(args):
             )
 
         # done と同じく、撤去は card の書き換えと同じトランザクションの中で。
-        agent_name = os.environ.get('AGENT_NAME', '')
-        if agent_name:
-            verdict = retire_assignment(agent_name, slug, task_id, None)
-            if verdict not in (ASSIGN_MINE, ASSIGN_ABSENT):
-                print(
-                    f"[plan.sh warn] {describe_assignment_verdict(agent_name, verdict)}"
-                    f" — 削除しませんでした ({agent_name} は別の作業に就いている可能性があります)",
-                    file=sys.stderr,
-                )
+        _retire_caller_slot(slug, task_id)
 
         # Rework learning loop: record in knowledge/director.md if rework limit was reached
         rework = meta.get('rework_count') or 0
@@ -5119,7 +5265,14 @@ def _print_mission_detail(slug):
                 parts.append(f"max={to['max']}s")
             if parts:
                 timeout_suffix = f" [{' '.join(parts)}]"
-        print(f"[{icon}] {tid} {title} {suffix}{timeout_suffix}")
+        # 今の試行 (active) の ID と attempt。Director が done / fail / retire に `--execution <id>` を渡すのに使う
+        # (execution.md §5.3)。terminal の試行・legacy の card (欄なし) には出さない。
+        exec_suffix = ''
+        xid = m.get('current_execution_id')
+        if (isinstance(xid, str) and _EXEC.is_execution_id(xid)
+                and m.get('execution_status') in _EXEC.ACTIVE_STATUSES):
+            exec_suffix = f" [{xid} attempt {m.get('execution_count')}]"
+        print(f"[{icon}] {tid} {title} {suffix}{timeout_suffix}{exec_suffix}")
 
     total = len(tasks)
     done_count = sum(1 for (m, _) in tasks if m.get('status') == 'done')
@@ -5137,6 +5290,7 @@ def cmd_ready_for_verification(args):
     if not positional:
         die("ready-for-verification requires <task_id>")
     task_id = positional[0]
+    caller = _execution_caller(opts)
 
     def _do():
         state = load_state()
@@ -5157,13 +5311,13 @@ def cmd_ready_for_verification(args):
         if not os.path.exists(task_path(slug, task_id)):
             die(f"task '{task_id}' not found in mission '{slug}'.")
 
-        meta, body = load_task(slug, task_id)
-        cur_status = meta.get('status')
-        if not _TASK_STATUS.accepts('ready-for-verification', cur_status):
-            refuse_transition('ready-for-verification', task_id, cur_status)
-
-        meta['status'] = 'ready_for_verification'
-        save_task(slug, task_id, meta, body)
+        _load_task_for_report('ready-for-verification', slug, task_id)
+        # 試行は変えない (running のまま・枠は残る)。active な試行があれば名乗りを照合する
+        try:
+            _CONTROLLER.mark_task(_txn(), slug, task_id, caller, command='ready-for-verification',
+                                  to_status='ready_for_verification')
+        except _EXEC.ControllerError as e:
+            _controller_die('ready-for-verification', e)
         print(f"Ready for verification: {slug}/{task_id}")
 
     with_lock(_do)
@@ -5207,17 +5361,17 @@ def cmd_verifying(args):
     if problem or not _VERIFIER_NAME_RE.fullmatch(verifier):
         _usage_exit(f"--verifier {verifier!r}: Worker 名 (英数字と `_.-`、64 文字まで) を指定してください"
                     + (f" ({problem})" if problem else ""))
+    caller = _execution_caller(opts)
 
     def _do():
         state = load_state()
         slug = _resolve_task_mission('verifying', task_id, state, opts.get('--mission'))
-        meta, body = load_task(slug, task_id)
-        cur_status = meta.get('status')
-        if not _TASK_STATUS.accepts('verifying', cur_status):
-            refuse_transition('verifying', task_id, cur_status)
-        meta['verifier'] = verifier
-        meta['status'] = 'verifying'
-        save_task(slug, task_id, meta, body)
+        _load_task_for_report('verifying', slug, task_id)
+        try:
+            _CONTROLLER.mark_task(_txn(), slug, task_id, caller, command='verifying', to_status='verifying',
+                                  meta_updates={'verifier': verifier})
+        except _EXEC.ControllerError as e:
+            _controller_die('verifying', e)
         print(f"Verifying: {slug}/{task_id} (verifier={verifier})")
 
     with_lock(_do)
@@ -5259,6 +5413,27 @@ def cmd_snapshot(args):
     with_lock(_do)
 
 
+def _verification_entry_tail(execution_tag, verdict, notes):
+    """## Verification の 1 項目の、時刻の行より後ろ。再送の照合はこの全文一致 (試行・verdict・notes)。"""
+    lines = [f"**Verdict:** {verdict}", f"**Execution:** {execution_tag}"]
+    if notes:
+        lines.append(f"**Notes:** {notes}")
+    return '\n'.join(lines)
+
+
+def _verification_recorded(body, execution_tag, verdict, notes):
+    """この試行 (execution_tag)・この verdict・この notes の検証の記録が card に既にあるか。status や回数は見ない。"""
+    marker = '## Verification\n'
+    if marker not in body:
+        return False
+    tail = _verification_entry_tail(execution_tag, verdict, notes)
+    for block in body.split(marker, 1)[1].split('\n### ')[1:]:
+        _ts, _, rest = block.partition('\n')
+        if rest.split('\n## ')[0].strip() == tail:
+            return True
+    return False
+
+
 def cmd_verify_result(args):
     """
     Usage: plan.sh verify-result <task_id> <verdict> [--notes "..."] [--mission <slug>]
@@ -5279,6 +5454,7 @@ def cmd_verify_result(args):
     if verdict not in VALID_VERDICTS:
         die(f"verdict must be one of: {', '.join(sorted(VALID_VERDICTS))}")
     notes = read_body_arg(opts, '--notes-file', opts.get('--notes'), '--notes') or ''
+    caller = _execution_caller(opts)
 
     def _do():
         state = load_state()
@@ -5299,43 +5475,87 @@ def cmd_verify_result(args):
         if not os.path.exists(task_path(slug, task_id)):
             die(f"task '{task_id}' not found in mission '{slug}'.")
 
-        meta, body = load_task(slug, task_id)
-        cur_status = meta.get('status')
-        if not _TASK_STATUS.accepts('verify-result', cur_status):
-            refuse_transition('verify-result', task_id, cur_status)
+        meta, body = _load_task_for_report('verify-result', slug, task_id)
 
         # Build and append verification entry
         timestamp = now_iso()
-        entry_lines = [f"\n### {timestamp}", f"**Verdict:** {verdict}"]
-        if notes:
-            entry_lines.append(f"**Notes:** {notes}")
-        verification_entry = '\n'.join(entry_lines) + '\n'
+        execution_tag = meta.get('current_execution_id') or '-'
+        verification_entry = f"\n### {timestamp}\n" + _verification_entry_tail(execution_tag, verdict, notes) + '\n'
 
         if '## Verification' in body:
             body_new = body.rstrip() + '\n' + verification_entry
         else:
             body_new = body.rstrip() + '\n\n## Verification\n' + verification_entry
 
-        # Status transition
-        if verdict == 'pass':
-            meta['status'] = 'verified'
-            meta['completed_at'] = now_iso()
-        elif verdict == 'fail':
+        # Status transition (遷移・照合・試行の終了は Controller。execution.md §4.2 / §4.3)
+        #   pass               → 試行 running → completed (VERIFIED)・task verified (枠は残す。R-2 が後で消す)
+        #   fail (< max)       → 試行 running → failed (VERIFICATION_REJECTED)・task pending・worker / started_at を null・枠撤去。
+        #                        次の pull が**新しい試行** (attempt + 1) を予約する (今までは同じ Worker が in_progress のまま)
+        #   fail (>= max) / needs_human_review → 試行は running のまま・task needs_human_review
+        # 同じ ID の同じ verdict の再送 (pass / fail) は成功 (exit 0・何も書かない)。
+        # ── 再送の確認は、rework_count を増やす・経路を選ぶより**前**に (t032 / Codex 2 巡目 P2) ──
+        # 値を先に状態から計算して経路を選ぶと、同じ verdict の再送が (a) 上限の 1 つ手前: 2 回目に count が上限へ進み
+        # 終わった試行を mark_task が拒否する (b) 上限: count と検証の記録が重複する。判定がもう記録されているかを先に確かめる:
+        #   - fail: この試行が VERIFICATION_REJECTED で終わっている (Controller の dry_run が IDEMPOTENT)
+        #   - needs_human_review の verdict / 上限に達した fail: task が既に needs_human_review で、
+        #     (nhr の verdict なら常に・fail なら rework_count が既に上限以上のとき) 同じ判定の再送とみなす
+        # どちらも照合 (名乗り) は dry_run が先に行う (違う試行の再送は拒否)。何も書かず exit 0。
+        max_rework = meta.get('max_rework') or 3
+        try:
+            probe = _CONTROLLER.fail_execution(_txn(), slug, task_id, caller, _EXEC.VERIFICATION_REJECTED,
+                                               to_status='pending', dry_run=True) if verdict == 'fail' else None
+            # pass も同じ確認を先に行う (t034): 下の `complete_execution` の冪等 (`result_exec.idempotent`) は notes を見ずに
+            # exit 0 を返すので、notes が違う pass の再送が飲まれていた。needs_human_review の verdict は上限後の追記を
+            # 新しい項目として残す運用なので、status が needs_human_review のときだけ同じ probe を使う (t033)。
+            if probe is None and (verdict == 'pass' or meta.get('status') == 'needs_human_review'):
+                probe = _CONTROLLER.complete_execution(_txn(), slug, task_id, caller, to_status='verified', dry_run=True)
+        except _EXEC.ControllerError as e:
+            _controller_die('verify-result', e)
+        # 「再送」の根拠は status / rework_count からの推測ではなく、**この試行に結び付いた検証の記録** (## Verification の
+        # 項目の `**Execution:**` 行・verdict・notes) (t033 / Codex 3 巡目 P2)。同じ試行・同じ verdict・同じ notes の項目が
+        # 既にあるときだけ再送。違う verdict / notes は新しい記録として残す。
+        recorded = _verification_recorded(body, execution_tag, verdict, notes)
+        if probe == _CONTROLLER.IDEMPOTENT:
+            # 試行が既にこの verdict で終わっている。notes が違う 2 回目は黙って飲まず conflict (exit 3)
+            if not recorded:
+                _resend_conflict('verify-result', slug, task_id, ['notes'])     # 追記は Director が update で
+            print(f"verify-result: {slug}/{task_id} (verdict={verdict}) — already recorded (idempotent)")
+            return
+        if verdict != 'pass' and meta.get('status') == 'needs_human_review' and probe is not None and recorded:
+            print(f"verify-result: {slug}/{task_id} (verdict={verdict}) — already recorded (idempotent)")
+            return
+        rework_updates = {}
+        if verdict == 'fail':
             rework = (meta.get('rework_count') or 0) + 1
-            max_rework = meta.get('max_rework') or 3
-            meta['rework_count'] = rework
-            if rework >= max_rework:
-                meta['status'] = 'needs_human_review'
-                print(
-                    f"rework_count ({rework}) >= max_rework ({max_rework}): "
-                    f"escalating to needs_human_review"
-                )
-            else:
-                meta['status'] = 'in_progress'
-        else:  # needs_human_review
-            meta['status'] = 'needs_human_review'
-
-        save_task(slug, task_id, meta, body_new)
+            rework_updates = {'rework_count': rework}
+        try:
+            if verdict == 'pass':
+                result_exec = _CONTROLLER.complete_execution(
+                    _txn(), slug, task_id, caller, to_status='verified',
+                    meta_updates={'completed_at': now_iso()}, body=body_new)
+                new_status = 'verified'
+            elif verdict == 'fail' and rework < max_rework:
+                result_exec = _CONTROLLER.fail_execution(
+                    _txn(), slug, task_id, caller, _EXEC.VERIFICATION_REJECTED, to_status='pending',
+                    meta_updates=rework_updates, body=body_new)
+                new_status = 'pending'
+            else:      # needs_human_review の verdict、または fail で rework が上限に達した
+                if verdict == 'fail':
+                    print(
+                        f"rework_count ({rework}) >= max_rework ({max_rework}): "
+                        f"escalating to needs_human_review"
+                    )
+                result_exec = _CONTROLLER.mark_task(
+                    _txn(), slug, task_id, caller, command='verify-result', to_status='needs_human_review',
+                    meta_updates=rework_updates, body=body_new)
+                new_status = 'needs_human_review'
+        except _EXEC.ControllerError as e:
+            _controller_die('verify-result', e)
+        if result_exec is not None and result_exec.idempotent:
+            print(f"verify-result: {slug}/{task_id} (verdict={verdict}) — already recorded (idempotent)")
+            return
+        if verdict == 'fail' and new_status == 'pending':
+            _retire_caller_slot(slug, task_id)
 
         # Check mission completion (only on pass→verified)
         if verdict == 'pass':
@@ -5346,7 +5566,7 @@ def cmd_verify_result(args):
                 mission['completed_at'] = now_iso()
                 save_mission(slug, mission)
 
-        print(f"verify-result: {slug}/{task_id} → {meta['status']} (verdict={verdict})")
+        print(f"verify-result: {slug}/{task_id} → {new_status} (verdict={verdict})")
 
     with_lock(_do)
 
@@ -6077,6 +6297,35 @@ def _reserve_unique_path(base):
 # ---------------------------------------------------------------------------
 
 
+def _update_close_execution(opts, task_id):
+    """`plan.sh update <id> --close-execution [--mission <slug>]` — Director 用の「閉じる手段」(execution.md §14.1 の決定 2)。
+
+    done / fail / needs-director が試行を閉じない E2 の間にできた card (task は終わっているのに試行が running のまま残った。
+    `store-check` の `reported:execution_active_on_finished_task`) と、Controller の外で card が手放された後に残った試行
+    (DETACHED の active) を、**task に触れずに** `failed` / `ABANDONED_OUTSIDE_CONTROLLER` で閉じる (card → record の順。
+    status / worker / started_at / 枠は 1 バイトも変えない)。閉じるものが無ければ exit 2 (`INVALID_TRANSITION`・何も書かない)。
+    他の更新オプションとは併用できない (使い方の誤り。何も書かない)。ACTIVE な試行 (今の持ち主がいる) は閉じない。
+    """
+    others = [k for k in opts if k not in ('--mission', '--close-execution')]
+    if others:
+        _usage_exit(f"--close-execution は他の更新オプションと併用できません ({', '.join(sorted(others))})")
+    if not re.fullmatch(r't\d+', task_id):
+        die(f"invalid task_id '{task_id}': expected format tNNN (e.g. t001, t012)")
+
+    def _do():
+        state = load_state()
+        slug = _resolve_task_mission('update', task_id, state, opts.get('--mission'))
+        recover_before(cards=[(slug, task_id)])
+        try:
+            closed = _CONTROLLER.abandon_detached_execution(_txn(), slug, task_id)
+        except _EXEC.ControllerError as e:
+            _controller_die('update', e)
+        print(f"Closed execution {closed.execution_id} of {slug}/{task_id}"
+              f" (status={closed.status}, end_code={closed.end_code}); task は変更していません")
+
+    with_lock(_do)
+
+
 def cmd_update(args):
     """Update specific frontmatter fields of an existing task.
 
@@ -6118,12 +6367,16 @@ def cmd_update(args):
         '--reset': 'bool',
         '--pr-number': 'value',
         '--deliverable': 'value',
+        '--close-execution': 'bool',
     })
 
     if not positional:
         die("update requires a task_id (e.g. t005)")
-    deliverable = _parse_deliverable_opt(opts)
     task_id = positional[0]
+    if opts.get('--close-execution'):
+        _update_close_execution(opts, task_id)
+        return
+    deliverable = _parse_deliverable_opt(opts)
 
     # Validate task_id format
     if not re.fullmatch(r't\d+', task_id):

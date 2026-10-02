@@ -204,10 +204,16 @@ Dispatcher から通知を受け取る:
 ./scripts/plan.sh status --all                        # archive 含めて全件
 
 # タスク完了を記録（Worker 完了報告の受領後に Director が実行）
-./scripts/plan.sh done t002 --result-file /path/to/result.md --mission 20260411-auth-refactor
+./scripts/plan.sh done t002 --result-file /path/to/result.md --mission 20260411-auth-refactor --execution ex-<32桁16進>
 # Result は --result-file <path> か --result-file - (標準入力 + クォート付きヒアドキュメント) で渡す。
 # 二重引用符の位置引数はバッククォート / $(...) がシェルに実行されるので使わない。
 # → --mission 省略時は active mission を検索。複数 mission に同 ID が存在すると曖昧エラー。
+# → --execution: 「どの試行を完了と判断したか」の名指し。`plan.sh status --mission <slug>` の進行中の行
+#   `[ex-… attempt N]` の値をそのまま渡す。Director が見た後に Worker が reset → 再 pull していれば exit 3
+#   (EXECUTION_NOT_CURRENT) で止まる (誤って新しい試行を完了にしない)。付けなくても通る (今は拒否しない。
+#   試行の無い card・Director が `update --status in_progress --reset` で開いた card には ID が無いので付けない)。
+#   done が通る元の status は in_progress だけ。pending / blocked / 検証待ち から完了にしたいときは
+#   `update --status in_progress --reset` で開いてから done するか、`update --status done` を使う。
 
 # 完了 mission を archive へ退避
 ./scripts/plan.sh archive 20260411-auth-refactor

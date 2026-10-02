@@ -108,6 +108,15 @@ def _safe_execution_id(value):
     return value if isinstance(value, str) and _SAFE_EXECUTION_ID_RE.fullmatch(value) else None
 
 
+def _row_actor(actor, hint):
+    """監査行の `actor`。`actor` が使えなければ (無い・`unknown`・門を通らない) `hint` (操作の前の card の worker)、
+    それも使えなければ `unknown`。**`actor` が使えるときは置き換えない**。"""
+    safe = _safe_token(actor)
+    if safe and safe != 'unknown':
+        return safe
+    return _safe_token(hint) or 'unknown'
+
+
 def _safe_caller_check(value):
     return value if isinstance(value, str) and value in _ex.CALLER_CHECKS else None
 
@@ -1176,15 +1185,24 @@ class Txn:
 
     # ---- 監査ログ -----------------------------------------------------------
     def record(self, mission, task, from_status, to_status, generation=None, detail=None,
-               execution_id=None, caller_check=None):
+               execution_id=None, caller_check=None, actor_hint=None):
         """コマンド本体の監査ログの 1 行を予約する (with が例外なしで抜けたときに書く)。
 
         `execution_id` は書いた後の card の `current_execution_id` (`generation` が書いた後の `started_at` なのと同じ。
-        legacy の card は None)。`caller_check` は照合の結果 (`lib_execution.CALLER_CHECKS`)。None なら行に出さない。"""
+        legacy の card は None)。`caller_check` は照合の結果 (`lib_execution.CALLER_CHECKS`)。None なら行に出さない。
+        `actor_hint` は**操作の前の card の worker** (execution.md §8「`actor` が `unknown` の穴」): このトランザクションの
+        `actor` が `unknown` (AGENT_NAME が無い呼び出し) のときだけ代わりに使う。AGENT_NAME がある呼び出しの `actor` は
+        置き換えない (Director が Worker の代わりに done を打った行を Worker の行にしない)。"""
         self._records.append(dict(
             op=self.op, mission=mission, task=task, from_status=from_status,
             to_status=to_status, generation=generation, detail=detail, result='ok',
-            execution_id=execution_id, caller_check=caller_check))
+            execution_id=execution_id, caller_check=caller_check, actor_hint=actor_hint))
+
+    @property
+    def has_body_record(self):
+        """コマンド本体の行が予約済みか (`record()` が 1 回以上呼ばれた)。plan.sh の `with_lock` が「card を書いたトランザクション」
+        の判定に使う (Controller は `save_task` を通さず `record()` で行を予約するので、`_AUDIT_TASK_ROWS` だけでは見えない)。"""
+        return bool(self._records)
 
     def report(self, result, mission, task, detail=None, execution_id=None):
         """`reported:<コード>` の行を、いま追記する (本体の書き込みとは別。execution.md §1.4 の手順 0 が使う)。"""
@@ -1224,7 +1242,7 @@ class Txn:
             'op': _safe_token(rec.get('op', self.op)) or 'unknown',
             'mission': _safe_token(rec.get('mission')),
             'task': _safe_token(rec.get('task')),
-            'actor': _safe_token(self.actor) or 'unknown',
+            'actor': _row_actor(self.actor, rec.get('actor_hint')),
             'pid': os.getpid(),
             'from_status': _safe_status(rec.get('from_status')),
             'to_status': _safe_status(rec.get('to_status')),

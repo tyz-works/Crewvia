@@ -143,6 +143,8 @@ description: |
 
 `plan.sh done` に渡す結果サマリーのフォーマット（`--result-file <path>` か `--result-file -` + クォート付きヒアドキュメントで渡す。二重引用符の位置引数はバッククォート / `$(...)` がシェルに実行される）:
 
+**今の試行を名乗る**: `plan.sh done` / `plan.sh needs-director` には、pull の JSON の `execution_id` を `--execution` で渡す（`${EXECUTION_ID:+--execution "$EXECUTION_ID"}` の形。`agents/worker.md`「完了・失敗・差し戻しの報告には、この `execution_id` を名乗る」）。違う試行・取り直された後の古い試行からの報告は exit 3 で拒否され、何も書かれない（打ち直さず Director に報告する）。
+
 ```
 プランレビュー結果: [mission: <slug>]
 

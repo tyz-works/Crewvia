@@ -148,6 +148,10 @@ def run_scenario(src_root: pathlib.Path, root: pathlib.Path) -> dict:
           label="retire (reset)")
     r.run("pull", "--agent", "Ren", "--skills", "bash,code", "--task", "t001")
     r.run("done", "t001", "orphan case", "--no-pr", "compat", label="done (no AGENT_NAME: assignment stays)")
+    # 01c E3: done は card の worker (Ren) の枠を AGENT_NAME が無くても外す (execution.md §4.2)。cutover 前の plan.sh は
+    # 外さず、孤児の枠 (Ren → t001) を reap が撤去する場面を作っていた。**同じ場面を両方の版で作る**ため、枠を書き直す
+    # (cutover 前の版では同じバイトの書き直しで何も変わらない。golden は作り直していない)。
+    (r.queue / "assignments" / "Ren").write_text(f"{r.slug()}:t001\n")
     r.run("reap-orphan-assignment", "Ren", "--no-wait")
     r.run("reap-orphan-assignment", "Ren", "--no-wait", label="reap-orphan-assignment (already gone)")
     r.run("update", "t003", "--priority", "medium", "--description", "edited: text")

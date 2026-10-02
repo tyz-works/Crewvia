@@ -181,16 +181,21 @@ def test_needs_director_keeps_an_assignment_that_points_at_another_task(tmp_path
     assert "削除しませんでした" in r.stderr, r.stderr
 
 
-def test_needs_director_without_an_agent_name_touches_no_assignment(tmp_path):
-    """AGENT_NAME が無い呼び出し (Director の手動実行など) は、どの assignment も外さない。"""
+def test_needs_director_without_an_agent_name_releases_only_the_card_workers_assignment(tmp_path):
+    """AGENT_NAME が無い呼び出し (Director の手動実行など)。01c E3 から、撤去するのは **card の worker の枠** (この task を指すもの)
+    で、AGENT_NAME は撤去の根拠にしない (agent 名だけで決めない。AC-04)。他の task を指す枠・他の Worker の枠は外さない。
+    以前は AGENT_NAME が無いと何も外さず、Worker の枠は次の回復 (R-2) まで残って Worker が busy に見えた。"""
     sb = Sandbox(tmp_path)
     _sb_card(sb, "t001", "in_progress", worker=CODEX, skills="codex-review")
+    _sb_card(sb, "t002", "in_progress", worker="Other", skills="codex-review")
     (_assignments(sb) / CODEX).write_text(f"{MISSION}:t001\n")
+    (_assignments(sb) / "Other").write_text(f"{MISSION}:t002\n")
 
     r = _needs_director(sb, "t001", agent=None)
 
     assert r.returncode == 0, r.stderr
-    assert (_assignments(sb) / CODEX).exists()
+    assert not (_assignments(sb) / CODEX).exists()
+    assert (_assignments(sb) / "Other").read_text().strip() == f"{MISSION}:t002"
 
 
 def test_needs_director_is_fine_when_the_assignment_is_already_gone(tmp_path):

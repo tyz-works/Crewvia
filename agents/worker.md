@@ -80,7 +80,7 @@ Kai発見: oci compute instance list で --compartment-id を省略すると全�
 | `CREWVIA_MISSION_SLUG` | 担当中のミッション slug（plan.sh pull 後、worktree の `.crewvia-env` を source すると設定される） |
 | `CREWVIA_TASK_ID` | 担当中のタスク ID（plan.sh pull 後に設定） |
 | `CREWVIA_TASK_SLUG` | タスクタイトルを kebab-case 化した slug（worktree パスの末尾部分に使用） |
-| `CREWVIA_EXECUTION_ID` | 今の試行（Execution）の ID（`ex-` + 32 桁 16 進。plan.sh pull が発行し、`.crewvia-env` の 4 行目に書く）。**任意**: 無くても plan.sh は動く（今は照合に使われない。完了・失敗・needs-director での照合は E3 から） |
+| `CREWVIA_EXECUTION_ID` | 今の試行（Execution）の ID（`ex-` + 32 桁 16 進。plan.sh pull が発行し、`.crewvia-env` の 4 行目に書く）。`plan done` / `fail` / `needs-director` / `ready-for-verification` は**この値（または `--execution <id>`）で「どの試行の報告か」を名乗り**、plan.sh が card の今の試行と照合する（違う試行・別の Worker が取り直した後の古い試行からの報告は **exit 3 で拒否**され、何も書かれない）。**任意**: 無くても動く（名乗りなしは今は通る）が、**Bash ツールは呼び出しごとに env が消えうる**ので、下の `--execution` で明示するのが確実 |
 | `TARGET_DIR` | 他プロジェクトを触るタスクの場合にそのプロジェクトの絶対パスが入る。未設定なら `$CREWVIA_REPO/.claude/worktrees/` 配下に worktree が作成され Worker はその中で作業する。セットされている場合は worktree は作成されず Worker は TARGET_DIR で直接作業する |
 
 ### 使用モデルの決まり方
@@ -283,6 +283,16 @@ worktree は再利用される（`.crewvia-env` は書き直される）。
 `execution_id` / `attempt` は今の試行の ID と、その task で何回目の試行か（1 から）。`.crewvia-env` の `CREWVIA_EXECUTION_ID` と同じ値。
 `task_slug` は最初の予約で card に固定された値（title を後から変えても branch / worktree は変わらない）。
 
+**完了・失敗・差し戻しの報告には、この `execution_id` を名乗る**: `plan done` / `plan fail` / `plan needs-director` /
+`plan ready-for-verification` に `--execution "$EXECUTION_ID"`（JSON の `execution_id` の値。下の export 手順で保持する）を付ける。
+plan.sh は名乗った ID を card の今の試行と照合し、**違えば exit 3 で拒否**する（stderr の最後の行 `[plan.sh] error_code=EXECUTION_NOT_CURRENT`）。
+これは「自分の報告が、今の試行に対するものだ」を機械で確かめるためで、拒否されたら**同じコマンドを打ち直さない** —
+別の Worker が取り直した・Director が差し戻した可能性があるので、`plan status --mission "$TASK_MISSION"` で card の今の状態を見て、
+自分の試行がもう今のものでなければ**作業を止めて** Director に直接報告する（報告コマンドを別の形で打ち直して通そうとしない）。
+ID を名乗って同じ `done` を再送すると（ネットワークや呼び出しの失敗で結果が分からないとき）**成功（exit 0・何も書かない）**になるので、
+done の結果が分からないときは打ち直してよい。**`--execution ""`（空）は拒否される**（名乗りなしに倒さない）ので、ID が取れていないときは
+`--execution` ごと外す（`${EXECUTION_ID:+--execution "$EXECUTION_ID"}` の形が安全）。
+
 `mission` フィールドは Worker の所属 mission slug。完了報告時 `plan.sh done` に `--mission <slug>` で渡すこと（active mission が複数あると task_id が衝突する可能性があるため）。
 
 `worktree_path` が null になるのは `target_dir` が非 null の task だけ（TARGET_DIR の checkout で作業する）。crewvia 本体の task
@@ -311,6 +321,9 @@ export TASK_ID=$(echo "$TASK_JSON" | jq -r .id)
 export TASK_TITLE=$(echo "$TASK_JSON" | jq -r .title)
 export TASK_MISSION=$(echo "$TASK_JSON" | jq -r .mission)
 export CREWVIA_TASK_ID="$TASK_ID"   # hook 互換エイリアス
+# 今の試行の ID（完了・失敗・差し戻しの報告で `--execution` に渡す。E2 より前の plan.sh は JSON に持たないので空になりうる）。
+# `target_dir` の task は worktree も `.crewvia-env` も無いので、ここで JSON から取るのが唯一の入手経路
+export EXECUTION_ID=$(echo "$TASK_JSON" | jq -r '.execution_id // empty')
 
 # worktree_path が設定されていれば worktree に移動して env を設定
 WORKTREE_PATH=$(echo "$TASK_JSON" | jq -r '.worktree_path // empty')
@@ -645,15 +658,15 @@ Worker はここで手動 bump を呼ばないこと（二重 bump 防止）。
 **ここまで全て完了してから**、タスクを手放す:
 
 ```bash
-plan done "$TASK_ID" --result-file "$RESULT_FILE" --mission "$TASK_MISSION"
+plan done "$TASK_ID" --result-file "$RESULT_FILE" --mission "$TASK_MISSION" ${EXECUTION_ID:+--execution "$EXECUTION_ID"}
 # $RESULT_FILE = Write で書いた Result（scratchpad）。Write が使えない skill は
-#   plan done "$TASK_ID" --result-file - --mission "$TASK_MISSION" <<'RESULT_EOF' … RESULT_EOF
+#   plan done "$TASK_ID" --result-file - --mission "$TASK_MISSION" ${EXECUTION_ID:+--execution "$EXECUTION_ID"} <<'RESULT_EOF' … RESULT_EOF
 ```
 
 **成果物が PR の task は `--pr <N>` を付け、Result の 1 行目に `PR #<N>` も書く**:
 
 ```bash
-plan done "$TASK_ID" --result-file "$RESULT_FILE" --mission "$TASK_MISSION" --pr 123   # Result の 1 行目: PR #123 ...
+plan done "$TASK_ID" --result-file "$RESULT_FILE" --mission "$TASK_MISSION" --pr 123 ${EXECUTION_ID:+--execution "$EXECUTION_ID"}   # Result の 1 行目: PR #123 ...
 ```
 
 `--pr` は、この task を `blocked_by` に持つ `codex-review` / `review` の task に `pr_number` を書き、
@@ -670,7 +683,7 @@ plan done "$TASK_ID" --result-file "$RESULT_FILE" --mission "$TASK_MISSION" --pr
 チェックポイントを完遂できない・証拠が提出できない・判断が必要な場合は、代替検証で done を押し通すのではなく **Director に差し戻す**:
 
 ```bash
-plan needs-director "$TASK_ID" --result-file "$REASON_FILE" --mission "$TASK_MISSION"
+plan needs-director "$TASK_ID" --result-file "$REASON_FILE" --mission "$TASK_MISSION" ${EXECUTION_ID:+--execution "$EXECUTION_ID"}
 # 短い 1 行なら位置引数でもよい（バッククォートを含めないこと → 単一引用符 '…' で囲む）。
 # 長い・複数行・コマンド例を含む理由は --result-file <path> か --result-file - + <<'RESULT_EOF'
 ```
@@ -791,7 +804,7 @@ mkdir -p "$(dirname "$HANDOFF_PATH")"
 **Step 4**: plan.sh fail を実行:
 
 ```bash
-plan fail "$TASK_ID" "$HANDOFF_PATH" --head "$(git rev-parse HEAD)" --mission "$TASK_MISSION"
+plan fail "$TASK_ID" "$HANDOFF_PATH" --head "$(git rev-parse HEAD)" --mission "$TASK_MISSION" ${EXECUTION_ID:+--execution "$EXECUTION_ID"}
 ```
 
 `--head`（検証対象の commit SHA）は**必須**。HANDOFF.md に同じ head を書いておくこと（Step 3 の

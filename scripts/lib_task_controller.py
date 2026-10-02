@@ -5,8 +5,9 @@
 §5 (呼び出し元の照合)。語彙と card 1 枚から決まる判定 (`attempt_view` / `execution_matches` / 欄の整合 / record の形) は
 `lib_execution.py` (純粋)。この module は**書く側**で、`lib_state_store` の `Txn` (ロック保持中) を受け取る。
 
-**呼び出し元はまだゼロ** (E1)。plan.sh が呼ぶのは E2 (pull)・E3 (done 等)・E4 (reset / retire) で、どれも cutover
-(ユーザー承認の PR)。呼び出し元が増えたら `tests/test_task_controller_has_no_callers_yet.py` が赤になる。
+**呼び出し元は plan.sh だけ**: E2 (t008) で pull (reserve / start / G1 の fail)、E3 (t012) で done / fail / needs-director /
+ready-for-verification / verifying / verify-result と `update --close-execution`。E4 で reset / retire が足される。どれも
+cutover (ユーザー承認の PR)。呼び出し元が増えたら `tests/test_task_controller_has_no_callers_yet.py` が赤になる。
 
 ## 書く順序 (正本が先・projection が後。state-store.md §2.1)
 
@@ -23,6 +24,12 @@
 - 名乗られた値・card の中身を、例外メッセージ・監査ログに出さない (固定コード + 識別子だけ)。
 - Director 専用の照合バイパス (`--as-director` 等) は作らない (確かめられない役割で照合を外す経路が agent 名だけの
   照合になる。execution.md §5.3)。Director は `--execution` で ID を名指しするだけ。
+
+## 検査と書き込みを分ける (`dry_run`)
+
+`complete_execution` / `fail_execution` の `dry_run=True` は**照合と遷移の検査だけ**を同じ規則 (`_finish`) で行い、判定
+(`PROCEED` / `IDEMPOTENT` / `TASK_ONLY`) を返す (何も書かない。拒否は同じ拒否の行と domain error)。コミット点より前に派生値を
+書く呼び出し側 (done の pr_number の伝播) が、書く**前**に「この操作は通る」を確かめるのに使う (検査が 2 か所に分かれない)。
 
 ## 戻り値
 
@@ -50,7 +57,7 @@ import lib_state_store as store  # noqa: E402
 import lib_task_status as _status  # noqa: E402
 
 _HOLDING = _status.ASSIGNMENT_HOLDING_STATUSES
-_ACCEPTS = _status.ACCEPTS_FROM_NARROWED
+_ACCEPTS = _status.ACCEPTS_FROM
 
 # task の status とコマンドの名前は**単独のリテラル**で持つ (集合・組に並べない。status の集合の唯一の定義は
 # lib_task_status。`tests/test_task_status_single_definition.py` が AST で落とす)。
@@ -261,18 +268,22 @@ def _check_git_context(git_context):
 _FORBIDDEN_UPDATE_KEYS = frozenset({'id', 'status', 'worker', 'started_at'} | set(ex.EXECUTION_FIELDS))
 
 
-def _check_updates(meta_updates):
-    """card に同時に書く他の欄 (completed_at・pr_number・needs_director_reason …。plan.sh が決める)。
-    status / worker / started_at / 試行の欄は Controller だけが書く。"""
+def _check_updates(meta_updates, meta_remove=()):
+    """card に同時に書く他の欄 (completed_at・pr_number・needs_director_reason …。plan.sh が決める) と、同時に**消す**欄
+    (`meta_remove`。fail が前回の証拠を持ち越さない: `fail_head` 等)。status / worker / started_at / 試行の欄は
+    Controller だけが書く (消すのも不可)。戻り値: `(updates, remove)`。"""
     if meta_updates is None:
-        return {}
+        meta_updates = {}
     if not isinstance(meta_updates, dict) or _FORBIDDEN_UPDATE_KEYS & set(meta_updates):
         raise _err(ex.INVALID_ARGUMENT, "meta_updates は status / worker / started_at / 試行の欄を含められません")
+    if (not isinstance(meta_remove, (tuple, list, frozenset, set)) or not all(isinstance(k, str) for k in meta_remove)
+            or _FORBIDDEN_UPDATE_KEYS & set(meta_remove) or set(meta_remove) & set(meta_updates)):
+        raise _err(ex.INVALID_ARGUMENT, "meta_remove は status / worker / started_at / 試行の欄・meta_updates の欄を含められません")
     try:
         json.dumps(meta_updates, allow_nan=False)           # 直列化できない値は card の書き込みで落ちる (書く前に弾く)
     except (TypeError, ValueError):
         raise _err(ex.INVALID_ARGUMENT, "meta_updates の値は JSON にできる値だけ") from None
-    return dict(meta_updates)
+    return dict(meta_updates), tuple(meta_remove)
 
 
 def _owner_slot(meta):
@@ -369,8 +380,11 @@ def _idempotent_or_conflict(txn, slug, tid, meta, caller, operation):
 def _check_task_status(txn, command, slug, tid, meta, caller=None):
     """§4.3 の狭めた表。`command` が None なら検査しない (Director の `update --reset` は any → pending)。"""
     if command is not None and meta.get('status') not in _ACCEPTS[command]:
+        # 文言は今までの `refuse_transition` (lib_task_status.refusal_reason) と同じ形。status は門を通した値だけ
+        allowed = ', '.join(sorted(_ACCEPTS[command]))
+        shown = store._safe_status(meta.get('status')) or '<unknown>'
         _refuse(txn, ex.INVALID_TRANSITION,
-                f"{command} は status={store._safe_status(meta.get('status')) or '<unknown>'} の task には使えません",
+                f"task '{tid}': {command} は status={shown!r} の task には使えません (受け付けるのは: {allowed})",
                 slug, tid, meta, caller)
 
 
@@ -527,30 +541,43 @@ _FAIL_RULES = {
 _RELEASE_RULES = {ex.RESET_BY_DIRECTOR: None, ex.RETIRED: _C_RETIRE}
 
 
+def _apply_updates(out, updates, remove):
+    out.update(updates)
+    for key in remove:
+        out.pop(key, None)
+
+
 def _finish(txn, slug, tid, meta, body, caller, *, new_status, end_code, to_status, command, operation,
             clear_owner, retire_slot, meta_updates, new_body, now, required_exec_status=None,
-            abandon_detached=False):
-    """終わらせる操作の共通の骨 (照合 → 遷移の検査 → card → record → 枠 → 監査)。"""
+            abandon_detached=False, meta_remove=(), dry_run=False):
+    """終わらせる操作の共通の骨 (照合 → 遷移の検査 → card → record → 枠 → 監査)。
+
+    `dry_run=True` は**照合と遷移の検査だけ**を同じ規則で行い、何も書かずに判定 (`PROCEED` / `IDEMPOTENT` / `TASK_ONLY`)
+    を返す (拒否は同じ拒否の行と domain error)。呼び出し側が、コミット点より前に派生値を書く操作 (done の pr_number の
+    伝播) の**前**に「この操作は通る」を確かめるのに使う — 検査が 2 か所に分かれず、書いた後で拒否になる窓が無い。
+    """
     _check_caller(caller)
     _check_now(now)
     _check_body(new_body)
     decision, check = _authorize(txn, slug, tid, meta, caller, operation=operation)
-    updates = _check_updates(meta_updates)
+    updates, remove = _check_updates(meta_updates, meta_remove)
     body_out = body if new_body is None else new_body
     previous = meta.get('status')
     owner = _owner_slot(meta)
+    hint = owner if check == ex.CHECK_VERIFIED else None        # 監査の actor が unknown のときの補い (§8)
 
     if decision == IDEMPOTENT:
-        return _execution_of(txn, slug, tid, meta, idempotent=True)
+        return decision if dry_run else _execution_of(txn, slug, tid, meta, idempotent=True)
 
     if decision == TASK_ONLY:
+        _check_task_status(txn, command, slug, tid, meta, caller)               # 書く前に遷移を検査する
+        if dry_run:
+            return decision
         if abandon_detached and _view(meta) == ex.DETACHED and meta.get('execution_status') in ex.ACTIVE_STATUSES:
             # 試行は reset の前に Controller の外で手放されていた: RESET ではなく ABANDONED で閉じる (§4.2)
-            _check_task_status(txn, command, slug, tid, meta, caller)           # 書く前に遷移を検査する
             meta = _abandon(txn, slug, tid, meta, body, now=now)
-        _check_task_status(txn, command, slug, tid, meta, caller)
         out = dict(meta)
-        out.update(updates)
+        _apply_updates(out, updates, remove)
         out['status'] = to_status
         if clear_owner:
             out.update(worker=None, started_at=None)
@@ -558,7 +585,7 @@ def _finish(txn, slug, tid, meta, body, caller, *, new_status, end_code, to_stat
         if retire_slot and owner is not None:
             txn.retire_assignment(owner, slug, tid, None)
         txn.record(slug, tid, previous, to_status, out.get('started_at'),
-                   execution_id=out.get('current_execution_id'), caller_check=check)
+                   execution_id=out.get('current_execution_id'), caller_check=check, actor_hint=hint)
         return None
 
     # PROCEED: 試行を動かす
@@ -570,8 +597,10 @@ def _finish(txn, slug, tid, meta, body, caller, *, new_status, end_code, to_stat
         _refuse(txn, ex.INVALID_TRANSITION,
                 f"{slug}/{tid}: 試行を {current} から {new_status} にはできません", slug, tid, meta, caller)
     _check_task_status(txn, command, slug, tid, meta, caller)
+    if dry_run:
+        return decision
     out = dict(meta)
-    out.update(updates)
+    _apply_updates(out, updates, remove)
     out.update(status=to_status, execution_status=new_status, execution_end_code=end_code)
     if clear_owner:
         out.update(worker=None, started_at=None)
@@ -580,16 +609,18 @@ def _finish(txn, slug, tid, meta, body, caller, *, new_status, end_code, to_stat
     if retire_slot and owner is not None:
         txn.retire_assignment(owner, slug, tid, None)
     txn.record(slug, tid, previous, to_status, out.get('started_at'),
-               execution_id=out['current_execution_id'], caller_check=check)
+               execution_id=out['current_execution_id'], caller_check=check, actor_hint=hint)
     return _execution_of(txn, slug, tid, out)
 
 
-def complete_execution(txn, slug, tid, caller=NO_CALLER, *, to_status, meta_updates=None, body=None, now=None):
+def complete_execution(txn, slug, tid, caller=NO_CALLER, *, to_status, meta_updates=None, meta_remove=(), body=None,
+                       now=None, dry_run=False):
     """running → completed。`to_status` が `done` (終了コード `DONE`・枠を撤去) か `verified` (`VERIFIED`・枠は残す。
     R-2 が後で消す。state-store.md §7)。task の遷移元は §4.3 の狭めた表 (done は in_progress だけ・verified は検証待ち)。
 
     `meta_updates` / `body` は plan.sh が決めた他の欄 (`completed_at`・`pr_number`・Result 本文) を**同じ card の書き込み**に
     入れるため。status / worker / started_at / 試行の欄は渡せない。同じ ID の同じ操作の再送は冪等 (何も書かない)。
+    `dry_run=True` は照合と遷移の検査だけを行い判定 (`PROCEED` / `IDEMPOTENT` / `TASK_ONLY`) を返す (何も書かない)。
     """
     rules = {_S_DONE: (ex.DONE, _C_DONE, _C_DONE, True),
              _S_VERIFIED: (ex.VERIFIED, _C_VERIFY_RESULT, _OP_VERIFY_PASS, False)}
@@ -600,11 +631,11 @@ def complete_execution(txn, slug, tid, caller=NO_CALLER, *, to_status, meta_upda
     return _finish(txn, slug, tid, meta, card_body, caller, new_status=ex.COMPLETED, end_code=end,
                    to_status=to_status, command=command, operation=operation, clear_owner=False,
                    retire_slot=retire, meta_updates=meta_updates, new_body=body, now=now,
-                   required_exec_status={ex.RUNNING})
+                   required_exec_status={ex.RUNNING}, meta_remove=meta_remove, dry_run=dry_run)
 
 
-def fail_execution(txn, slug, tid, caller=NO_CALLER, failure_code=None, *, to_status, meta_updates=None, body=None,
-                   now=None):
+def fail_execution(txn, slug, tid, caller=NO_CALLER, failure_code=None, *, to_status, meta_updates=None,
+                   meta_remove=(), body=None, now=None, dry_run=False):
     """reserved | running → failed。`failure_code` は終了コード (`_FAIL_RULES` の 6 つ)、`to_status` は task の遷移先で、
     組み合わせは §4.2 の表だけ:
 
@@ -630,7 +661,7 @@ def fail_execution(txn, slug, tid, caller=NO_CALLER, failure_code=None, *, to_st
                    to_status=to_status, command=command, operation=operation, clear_owner=clear_owner,
                    retire_slot=retire, meta_updates=meta_updates, new_body=body, now=now,
                    required_exec_status=({ex.RESERVED} if failure_code == ex.WORKSPACE_CREATE_FAILED else None),
-                   abandon_detached=(failure_code == ex.RESET_BY_DIRECTOR))
+                   abandon_detached=(failure_code == ex.RESET_BY_DIRECTOR), meta_remove=meta_remove, dry_run=dry_run)
 
 
 def release_execution(txn, slug, tid, caller=NO_CALLER, reason_code=None, *, to_status=_S_PENDING, now=None):
@@ -669,26 +700,35 @@ def reset_task(txn, slug, tid, caller=NO_CALLER, *, now=None):
                    meta_updates=None, new_body=None, now=now, abandon_detached=True)
 
 
-def mark_task(txn, slug, tid, caller=NO_CALLER, *, command, to_status, meta_updates=None, body=None):
+#: `mark_task` が扱う (command, to_status)。どれも**試行を変えない** task の遷移。verify-result の `needs_human_review`
+#: (verdict が needs_human_review、または fail で rework が上限に達した) は検証待ちの task を人間の判断待ちにするだけで、
+#: 試行 (running) はそのまま (§4.2)。
+_MARK_TARGETS = {'ready-for-verification': 'ready_for_verification', 'verifying': 'verifying',
+                 _C_VERIFY_RESULT: 'needs_human_review'}
+
+
+def mark_task(txn, slug, tid, caller=NO_CALLER, *, command, to_status, meta_updates=None, meta_remove=(), body=None):
     """**試行を変えない** task の遷移 (ready-for-verification: in_progress → ready_for_verification・
-    verifying: ready_for_verification → verifying)。試行が active なら名乗りを照合する (違えば拒否)。
-    試行の欄・record・枠には触らない。戻り値は今の試行 (試行なしなら None)。"""
-    allowed = {'ready-for-verification': 'ready_for_verification', 'verifying': 'verifying'}
-    if allowed.get(command) != to_status:
-        raise _err(ex.INVALID_ARGUMENT, "mark_task は ready-for-verification / verifying の遷移だけ", slug, tid)
+    verifying: ready_for_verification → verifying・verify-result の needs_human_review: 検証待ち → needs_human_review)。
+    試行が active なら名乗りを照合する (違えば拒否)。試行の欄・record・枠には触らない。
+    戻り値は今の試行 (試行なしなら None)。"""
+    if _MARK_TARGETS.get(command) != to_status:
+        raise _err(ex.INVALID_ARGUMENT, "mark_task は ready-for-verification / verifying / verify-result(needs_human_review) の遷移だけ", slug, tid)
     _check_caller(caller)
     _check_body(body)
     meta, card_body = _load(txn, slug, tid)
     # operation=None: 再送を成功にする操作ではない (TERMINAL の試行に名乗り付きで来れば `_authorize` が conflict で拒否する)
     decision, check = _authorize(txn, slug, tid, meta, caller, operation=None)
     _check_task_status(txn, command, slug, tid, meta, caller)
-    updates = _check_updates(meta_updates)
+    updates, remove = _check_updates(meta_updates, meta_remove)
     out = dict(meta)
-    out.update(updates)
+    _apply_updates(out, updates, remove)
     out['status'] = to_status
     txn.write_card(slug, tid, out, card_body if body is None else body)
+    owner = _owner_slot(meta)
     txn.record(slug, tid, meta.get('status'), to_status, out.get('started_at'),
-               execution_id=out.get('current_execution_id'), caller_check=check)
+               execution_id=out.get('current_execution_id'), caller_check=check,
+               actor_hint=owner if check == ex.CHECK_VERIFIED else None)
     return _execution_of(txn, slug, tid, out) if decision == PROCEED else None
 
 

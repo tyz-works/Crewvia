@@ -311,6 +311,8 @@ def test_needs_director_rejects_unusable_file_and_writes_nothing(sb, label):
 
 def test_verify_result_notes_file(sb):
     in_progress_task(sb)
+    # verify-result は検証に出ている task (ready_for_verification / verifying / needs_human_review) だけ (01c E3。execution.md §4.3)
+    _ok(sb.plan("ready-for-verification", "t001", "--mission", MISSION))
     sentinel = sb.root / "SENTINEL_VR"
     path = _file(sb, "notes.md", f"確認 `touch {sentinel}` $(touch {sentinel})\n".encode())
     _ok(sb.plan("verify-result", "t001", "needs_human_review", "--notes-file", str(path),

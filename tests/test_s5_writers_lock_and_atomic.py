@@ -104,7 +104,9 @@ def test_verifying_refuses_a_card_that_moved_on_and_writes_nothing(sb):
 
     assert "受け付けるのは" in p.stderr
     assert _card_path(sb).read_bytes() == before
-    assert len(sb.audit_rows()) == rows_before          # 拒否は監査ログの行も作らない
+    # 本体の行は作らない。01c E3 から遷移の拒否は `refused:<CODE>` の行を 1 つだけ残す (execution.md §8)
+    new_rows = sb.audit_rows()[rows_before:]
+    assert [r["result"] for r in new_rows] == ["refused:INVALID_TRANSITION"]
 
 
 def test_verifying_moves_ready_to_verifying_and_records_the_verifier(sb):

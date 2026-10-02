@@ -53,13 +53,13 @@ set -euo pipefail
 #                              failed の依存で保留されている task を、Director が明示的に
 #                              進めてよいと決める (省略時は今 failed の依存すべて)。
 #                              依存の辺は消えず、card に released_deps として残る
-#   plan.sh retire <task_id> --agent <name> (--execution <id> | --started-at <generation>)
+#   plan.sh retire <task_id> --agent <name> --execution <id>
 #                            [--mission <slug>] [--outcome reset|needs-director]
 #                            [--reason "<1 行>"] [--no-wait]
 #                              実行アイデンティティで束縛した後始末。前提が外れたら
 #                              1 バイトも書かずに exit 3 (詳細は cmd_retire)。
-#                              --execution: 試行の ID (plan.sh status の ex-…。退役 marker の task_execution_id)。
-#                              両方あれば ID が優先。--started-at は移行期の旧形式 (ID の無い marker) 用
+#                              --execution: 試行の ID (plan.sh status の ex-…。退役 marker の task_execution_id)。必須
+#                              (E4b で世代 = --started-at での名指しを外した。渡すと未知のオプションとして exit 1)
 #                              終了させた試行は Controller が閉じる (RETIRED)。同じ ID の再送は exit 0
 #                              --no-wait: キューロックを待たずに諦め exit 4。
 #                              待てない常駐デーモン (watchdog) 用
@@ -2028,19 +2028,19 @@ def publish_assignment(agent, mission, task_id, started_at, execution_id=None):
     _AUDIT_OTHER_ROWS.append((mission, task_id))
 
 
-def classify_assignment(agent, mission, task_id, generation):
+def classify_assignment(agent, mission, task_id, execution_id=None):
     """公開中の assignment が「この実行のもの」かを判定する (lib_state_store の判定そのもの)。
 
-    generation:
-      - 文字列 …… 呼び出し側が特定の実行 (card の started_at) を名指ししている。
-        ロックを取る前に対象を決めた後始末は必ずこちらを使う。世代を証明でき
-        ない場合は ASSIGN_UNVERIFIABLE を返し、決して「一致した」に倒さない。
+    execution_id:
+      - 文字列 (ex-…) …… 呼び出し側が特定の試行を名指ししている。identity の `execution_id` と比べ、identity に
+        ID が無ければ ASSIGN_SUCCESSOR、identity が読めなければ ASSIGN_UNVERIFIABLE を返し、決して「一致した」に倒さない。
+        ロックを取る前に対象を決めた後始末は必ずこちらを使う。
       - None …… 呼び出し側は「いま card が示している実行」を対象にしている。
         同じロックの中で card を読んでから呼ぶ経路 (done / fail / update
         --reset) 専用。読みと書きの間に隙間が無く後任が割り込めないので、
-        世代を問う必要がそもそも無い。
+        試行を問う必要がそもそも無い。
     """
-    return _txn().classify_assignment(agent, mission, task_id, generation)
+    return _txn().classify_assignment(agent, mission, task_id, execution_id)
 
 
 # ---------------------------------------------------------------------------
@@ -2174,7 +2174,7 @@ def predecessor_cleanup_pending(agent):
     return pid is not None and _pid_is_gone(pid)
 
 
-def retire_assignment(agent, mission, task_id, generation):
+def retire_assignment(agent, mission, task_id, execution_id=None):
     """assignment を撤去する唯一の入口。キューロック保持が前提。
 
     撤去するのは「この実行のもの」と確定したときだけ。返り値は
@@ -2185,7 +2185,7 @@ def retire_assignment(agent, mission, task_id, generation):
     「card だけ進んで assignment が残る」を自分で作る)。残った枠は S4 の回復 (R-2) が拾う。
     """
     try:
-        verdict = _txn().retire_assignment(agent, mission, task_id, generation)
+        verdict = _txn().retire_assignment(agent, mission, task_id, execution_id)
     except _STORE.StoreWriteError as e:
         print(f"[plan.sh warn] failed to remove {e.path}: {e}", file=sys.stderr)
         verdict = ASSIGN_MINE
@@ -2574,7 +2574,7 @@ USAGE = {
                '                       [--deliverable pr|file|none]\n'
                '       plan.sh update <task_id> --close-execution [--mission <slug>]'),
     'release-dep': 'plan.sh release-dep <task_id> [--dep <csv>] [--mission <slug>]',
-    'retire': ('plan.sh retire <task_id> --agent <name> (--execution <id> | --started-at <generation>)\n'
+    'retire': ('plan.sh retire <task_id> --agent <name> --execution <id>\n'
                '                       [--mission <slug>] [--outcome reset|needs-director]\n'
                '                       [--reason "<1 行>"] [--no-wait]'),
     'reap-orphan-assignment': 'plan.sh reap-orphan-assignment <agent> [--no-wait]',
@@ -3241,7 +3241,7 @@ def _execution_caller(opts):
     (E3 は拒否しない。`.crewvia-env` を必須にしないため。拒否に進むのは E5)。agent 名は照合の根拠にしない (AC-04)。
 
     **「指定されたか」は presence で見る** (01b G3): `--execution ""` / 空の env を名乗りなしに倒さない
-    (`retire --started-at ""` と同じく exit 1・何も書かない)。名乗った値の形が違えば Controller が
+    (`retire --execution ""` と同じく exit 1・何も書かない)。名乗った値の形が違えば Controller が
     `EXECUTION_NOT_FOUND` (exit 3) で拒否する。**ロックを取る前に呼ぶこと** (拒否は何も書かない)。
     """
     agent = os.environ.get('AGENT_NAME') or None
@@ -3364,10 +3364,13 @@ def _pull_cas_ok(meta, agent, generation, execution_id):
     """card が**この pull の予約のまま**か (compare-and-set の条件)。
 
     新しい欄 (`current_execution_id == X` かつ `execution_status == reserved`) **と** 今までの欄 (in_progress・
-    同じ worker・同じ `started_at`) の AND。移行中 (E4b まで) は旧形式の書き手 (今の `update --reset`・rollback 中の
-    旧コード) が status / worker / started_at だけを動かし、execution の欄を更新しない。新しい欄だけで見ると、
-    解放済みの予約 (pending・worker null) に `X / reserved` が残ったまま CAS が通り、Director の reset を上書きする
-    (execution.md §6 の Codex 3 巡目 P1)。"""
+    同じ worker・同じ `started_at`) の AND。旧形式の書き手 (rollback 中の旧コード・Director の手編集) は status / worker /
+    started_at だけを動かし、execution の欄を更新しない。新しい欄だけで見ると、解放済みの予約 (pending・worker null) に
+    `X / reserved` が残ったまま CAS が通り、Director の reset を上書きする (execution.md §6 の Codex 3 巡目 P1)。
+
+    **E4b でも外さない** (execution.md §18.3): `started_at` の項は名乗りを世代で照合するものではなく、この pull 自身が
+    書いた予約 (X) が card にそのまま残っているかを card 1 枚で確かめるもの。旧書き手が本番に残っていないことは
+    **証明できない** (rollback で戻る。§9.3) ので、外す利得 (1 項) より外した後の穴 (reset の上書き) が大きい。"""
     return (meta.get('status') == 'in_progress'
             and (meta.get('worker') or '') == (agent or '')
             and meta.get('started_at') == generation
@@ -3417,7 +3420,7 @@ def _resume_reserved(slug, meta, body, agent, slugs):
             f"task '{task_id}' は再開しません (assignment を上書きせず何も書いていません)。",
             PRECONDITION_UNMET)
     execution_id = meta['current_execution_id']
-    verdict = classify_assignment_for_execution(agent, slug, task_id, meta.get('started_at'), execution_id)
+    verdict = classify_assignment_for_execution(agent, slug, task_id, execution_id)
     if verdict in (ASSIGN_ABSENT, ASSIGN_SUCCESSOR):
         publish_assignment(agent, slug, task_id, meta.get('started_at'), execution_id=execution_id)
     elif verdict != ASSIGN_MINE:
@@ -3425,10 +3428,9 @@ def _resume_reserved(slug, meta, body, agent, slugs):
             f"(何も書いていません)。", PRECONDITION_UNMET)
 
 
-def classify_assignment_for_execution(agent, mission, task_id, generation, execution_id):
-    """`classify_assignment` の、試行 (execution_id) を名指しする版。identity に ID があれば ID で、無ければ世代で比べる
-    (execution.md §2.2。判定は lib_state_store の 1 か所)。"""
-    return _txn().classify_assignment(agent, mission, task_id, generation, execution_id=execution_id)
+def classify_assignment_for_execution(agent, mission, task_id, execution_id):
+    """`classify_assignment` の、試行 (execution_id) を名指しする版 (判定は lib_state_store の 1 か所。ID だけで比べる)。"""
+    return _txn().classify_assignment(agent, mission, task_id, execution_id)
 
 
 def _pull_result(slug, meta, body):
@@ -6703,11 +6705,11 @@ def cmd_release_dep(args):
 
 
 def cmd_retire(args):
-    """plan.sh retire <task_id> --agent <name> (--execution <id> | --started-at <generation>)
+    """plan.sh retire <task_id> --agent <name> --execution <id>
                                 [--mission <slug>] [--outcome reset|needs-director]
                                 [--reason "<1 行>"] [--no-wait]
 
-    「この実行 (mission, task, worker, 世代) を終了扱いにして後始末する」を
+    「この実行 (mission, task, worker, 試行の ID) を終了扱いにして後始末する」を
     1 つの操作として提供する。card の status 書き換えと assignment の撤去は
     同じキューロックの中で行われ、どちらも起きるか、どちらも起きないかのどちらか。
 
@@ -6717,18 +6719,17 @@ def cmd_retire(args):
     Worker を終了させる」と決める。決定から着弾までの間に card は動きうる:
     Worker が最後に plan.sh done を通していたかもしれないし、人間が差し戻して
     同名の後任が pull し直したかもしれない。呼び出し側が status / worker /
-    世代を個別に渡す形だと、どれを渡すか・渡さないかの判断が呼び出し側ごとに
+    試行を個別に渡す形だと、どれを渡すか・渡さないかの判断が呼び出し側ごとに
     分かれ、1 つ緩めた場所から同じ型の事故が再発する。判定を 1 箇所に集約し、
     緩める余地を API から無くしてある。
 
-    `--execution` か `--started-at` のどちらかが必須なのはそのためである。status と worker は、
+    `--execution` が必須なのはそのためである。status と worker は、
     人間が差し戻して同名 Worker が pull し直すと元の値にそのまま戻る (crewvia は
-    名前をポジションとして使い回す)。「この実行」を名指しできるのは、試行の ID
+    名前をポジションとして使い回す)。「この実行」を名指しできるのは試行の ID
     (`--execution <ex-…>`。`plan.sh status` が進行中の行に出す値・退役 marker の
-    `task_execution_id`) か、世代 = `pull` が毎回書き換える started_at だけである。
-    **両方あれば ID が優先** (E4a。execution.md §2.2 — `started_at` が一致していても
-    ID が違えば不一致)。`--started-at` は移行期の旧形式 (ID の無い marker・ID の無い
-    legacy の card) のための読み口で、E4b で外す。
+    `task_execution_id`) だけである。E4b で世代 (`started_at`) での名指し
+    (`--started-at`) と旧形式 marker の読み口は外した (渡すと未知のオプションで exit 1)。
+    ID が card の今の試行と違えば不一致 (`started_at` は見ない)。
 
     終了させた試行は Controller が閉じる (reserved → released / running → failed、
     どちらも終了コード `RETIRED`)。同じ ID の再送 (watchdog が card の書き込みの後に
@@ -6753,7 +6754,6 @@ def cmd_retire(args):
     opts, positional = parse_opts(args, {
         '--mission': 'value',
         '--agent': 'value',
-        '--started-at': 'value',
         '--execution': 'value',
         '--outcome': 'value',
         '--reason': 'value',
@@ -6771,38 +6771,19 @@ def cmd_retire(args):
         die("retire requires --agent <name> (終了させる実行の Worker 名)")
     require_valid_agent_name(agent)
 
-    # 証拠 (試行の ID か世代) は省略不可。省略を許すと「名前だけで束縛された後始末」に戻ってしまう。
-    # 「指定されたか」は presence で見る (01b G3): `--execution ""` を世代だけの経路・名乗りなしに倒さない。
-    execution_id = None
-    if '--execution' in opts:
-        execution_id = opts['--execution'].strip()
-        if not execution_id:
-            die("[plan.sh retire] --execution には execution id (ex-…) が必要です。空の値は「名乗りなし」として"
-                "扱いません。何も書いていません。")
-    generation = None
-    if '--started-at' in opts:
-        raw_generation = opts['--started-at']
-        if raw_generation is None or not raw_generation.strip():
-            die(
-                "retire --started-at には世代が必要です (空の値は指定として扱いません)。\n"
-                "  card の started_at (plan.sh pull が毎回書き換える実行世代) を渡すか、--execution <id> を渡してください。\n"
-                "  世代を読めなかった場合は retire を呼ばず、Director に上げること —\n"
-                "  名前だけで束縛された後始末は、同名の後任の実行を巻き込みます。"
-            )
-        generation = raw_generation.strip()
-        if generation.lower() in ('null', 'none'):
-            die(
-                "--started-at null は実行を指していません "
-                "(started_at が null の card には終了させるべき実行がありません)"
-            )
-    if execution_id is None and generation is None:
+    # 証拠 (試行の ID) は省略不可。省略を許すと「名前だけで束縛された後始末」に戻ってしまう。
+    # 「指定されたか」は presence で見る (01b G3): `--execution ""` を名乗りなしに倒さない。
+    if '--execution' not in opts:
         die(
-            "retire requires --execution <id> or --started-at <generation>\n"
-            "  終了させる実行を名指ししてください。plan.sh status の進行中の行の ex-… (--execution)、\n"
-            "  または card の started_at (plan.sh pull が毎回書き換える実行世代。--started-at)。\n"
+            "retire requires --execution <id>\n"
+            "  終了させる試行を名指ししてください。plan.sh status の進行中の行の ex-…、または退役 marker の task_execution_id。\n"
             "  読めなかった場合は retire を呼ばず、Director に上げること —\n"
             "  名前だけで束縛された後始末は、同名の後任の実行を巻き込みます。"
         )
+    execution_id = opts['--execution'].strip()
+    if not execution_id:
+        die("[plan.sh retire] --execution には execution id (ex-…) が必要です。空の値は「名乗りなし」として"
+            "扱いません。何も書いていません。")
 
     outcome = (opts.get('--outcome') or 'reset').strip()
     if outcome not in ('reset', 'needs-director'):
@@ -6860,30 +6841,17 @@ def cmd_retire(args):
             die(f"{prefix}worker は {cur_worker!r} で、{agent!r} ではありません{suffix}",
                 PRECONDITION_UNMET)
 
-        # 照合の規則は lib_execution.execution_matches の 1 か所 (ID が優先・世代は移行期の旧形式だけ)。
-        matched, _check = _EXEC.execution_matches(view, meta, execution_id=execution_id, started_at=generation)
+        # 照合の規則は lib_execution.execution_matches の 1 か所 (ID だけ。世代は見ない)。
+        matched, _check = _EXEC.execution_matches(view, meta, execution_id=execution_id)
         if matched != _EXEC.MATCH:
-            if execution_id is not None:
-                die(f"{prefix}指定された execution はこの task の今の試行ではありません"
-                    f" (同じ task の別の実行です){suffix}", PRECONDITION_UNMET)
-            cur_generation = meta.get('started_at')
-            if cur_generation is not None:
-                cur_generation = str(cur_generation).strip()
-            die(f"{prefix}started_at は {cur_generation!r} で、指定された "
-                f"{generation!r} と異なります (同じ task の別の実行です){suffix}",
-                PRECONDITION_UNMET)
-        # 世代で名指しされても、card の今の持ち主が ID を持つ試行なら、その世代は予約時の世代でなければならない
-        # (`execution_matches` が ACTIVE / TERMINAL でそう検査する)。
+            die(f"{prefix}指定された execution はこの task の今の試行ではありません"
+                f" (同じ task の別の実行です){suffix}", PRECONDITION_UNMET)
 
         # assignment は「この実行のもの」と確定したときだけ撤去する。存在しない
         # 場合 (既に片付いた card の取り残し) は撤去すべきものが無いだけなので
         # 続行してよいが、それ以外 — 特に世代を証明できない場合 — は保留に倒す。
-        # identity に ID があれば ID で、無ければ世代で比べる (判定は lib_state_store の 1 か所)。
-        card_generation = generation if generation is not None else meta.get('started_at')
-        verdict = classify_assignment_for_execution(
-            agent, slug, task_id, card_generation,
-            execution_id if execution_id is not None else (
-                meta.get('current_execution_id') if view == _EXEC.ACTIVE else None))
+        # identity の ID と比べる (判定は lib_state_store の 1 か所。identity に ID が無ければ保留)。
+        verdict = classify_assignment_for_execution(agent, slug, task_id, execution_id)
         if verdict not in (ASSIGN_MINE, ASSIGN_ABSENT):
             die(f"{prefix}{describe_assignment_verdict(agent, verdict)}{suffix}",
                 PRECONDITION_UNMET)
@@ -6916,8 +6884,7 @@ def cmd_retire(args):
         except _EXEC.ControllerError as e:
             _controller_die('retire', e)
 
-        shown = execution_id if execution_id is not None else generation
-        print(f"Retired: {slug}/{task_id} — {agent} @ {shown}")
+        print(f"Retired: {slug}/{task_id} — {agent} @ {execution_id}")
         print(f"[plan.sh] {applied}")
         if verdict == ASSIGN_ABSENT:
             print(f"[plan.sh] assignment/{agent} は既にありませんでした")

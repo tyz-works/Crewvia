@@ -3,7 +3,7 @@
 設計: `knowledge/execution.md` §4.3 (狭める遷移)・§4.4 (冪等 / conflict)・§5.1〜5.3 (呼び出し元ごとの表)・§8 (監査)。受入条件:
 
 1. **呼び出し元ごとの表 (§5.2 / §5.3) を 1 行ずつ**: 通るべき経路が通る・拒否すべき経路が exit で拒否され**何も書かない**
-2. `--execution ""` (空の明示指定) は名乗りなしに倒さず exit 1 (retire `--started-at ""` と同じ。01b G3)
+2. `--execution ""` (空の明示指定) は名乗りなしに倒さず exit 1 (retire `--execution ""` と同じ。01b G3)
 3. 狭めた遷移 (§4.3) は exit 2・何も書かない。今の運用 (Director が開いた card の done・kai-review・verifier) は通る
 4. `verify-result fail` は新しい試行 (attempt + 1)
 5. 拒否の行・`caller_check`・`actor` (§8)。名乗られた値・card の中身は stderr / 監査ログに出ない
@@ -246,7 +246,7 @@ def test_the_old_attempt_cannot_close_a_card_the_director_reopened(box):
 
 
 def test_a_stale_id_after_a_reset_and_a_new_attempt_is_not_current(box):
-    """Director が見た後に Worker が reset → 再 pull していれば `EXECUTION_NOT_CURRENT` で止まる (退役の `--started-at` と同じ事故)。"""
+    """Director が見た後に Worker が reset → 再 pull していれば `EXECUTION_NOT_CURRENT` で止まる (退役の世代の照合が防いでいたのと同じ事故)。"""
     old = take(box, "Ren")
     box.reset()                                                           # 旧形式の reset (E4 まで試行の欄は触らない)
     new = take(box, "Sora")

@@ -97,12 +97,23 @@ MIS
 #: 「この実行のものだと証明できない」に倒れて何もしない — 本番の pull は必ず
 #: 両方を書くので、片方だけの fixture は本番より弱い状態を試すことになる。
 TASK_GENERATION="2026-09-21T00:00:00Z"
+#: E4b: 後始末は世代ではなく試行の ID (`current_execution_id`) で束縛される。card と identity の両方に同じ ID を置く。
+TASK_EXECUTION_ID="ex-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
 # write_task <sandbox> <status> <worker|null> <max_seconds>
 write_task() {
   local sb="$1" status="$2" worker="$3" maxs="$4"
-  local started="\"${TASK_GENERATION}\""
-  [[ "$worker" == "null" ]] && started="null"
+  local started="\"${TASK_GENERATION}\"" execfields=""
+  if [[ "$worker" == "null" ]]; then
+    started="null"
+  else
+    execfields="current_execution_id: ${TASK_EXECUTION_ID}
+execution_status: running
+execution_count: 1
+execution_reserved_at: \"${TASK_GENERATION}\"
+task_slug: retirement-test-task
+"
+  fi
   cat > "$sb/queue/missions/${MISSION}/tasks/t001.md" <<TASK
 ---
 id: t001
@@ -110,7 +121,7 @@ title: retirement test task
 status: ${status}
 worker: ${worker}
 started_at: ${started}
-skills: [bash]
+${execfields}skills: [bash]
 priority: high
 blocked_by: []
 timeout:
@@ -135,8 +146,8 @@ TASK
 publish_assignment() {
   local sb="$1" agent="$2"
   echo "${MISSION}:t001" > "$sb/queue/assignments/${agent}"
-  printf '{"mission": "%s", "started_at": "%s", "task": "t001", "worker": "%s"}\n' \
-    "$MISSION" "$TASK_GENERATION" "$agent" > "$sb/queue/assignments/${agent}.identity"
+  printf '{"execution_id": "%s", "mission": "%s", "started_at": "%s", "task": "t001", "worker": "%s"}\n' \
+    "$TASK_EXECUTION_ID" "$MISSION" "$TASK_GENERATION" "$agent" > "$sb/queue/assignments/${agent}.identity"
 }
 
 # spawn_fake_worker <name> — create a tmux window running `sleep 9999`.

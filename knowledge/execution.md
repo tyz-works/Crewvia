@@ -1533,7 +1533,7 @@ director.md の手順 (`update --status in_progress --reset` → done は今の�
 
 ### 17.2 E4b に送るもの
 
-世代 (`started_at`) の照合と旧形式 marker (`task_execution_id` なし) の読み口を外すのは E4b (t025)。§7 の条件 (E4a が両デーモンで動いている・旧形式 marker = 0・legacy の進行中 = 0) が先。
+世代 (`started_at`) の照合と旧形式 marker (`task_execution_id` なし) の読み口を外すのは E4b (t025。**§18 で実施済み**)。§7 の条件 (E4a が両デーモンで動いている・旧形式 marker = 0・legacy の進行中 = 0) が先。
 
 ### 17.3 戻し方 (E4a)
 
@@ -1545,3 +1545,96 @@ revert 中に retire / reset された task の試行は閉じられない (E2 �
 
 `tests/test_execution_e4a_retire_reset.py` / `tests/test_execution_e4a_daemon_env.py`。赤の実証は `python3 tests/red_proof_e4a_retire.py` (12 変異。R01 照合を世代に戻す・
 R02 照合を外す・R03 空の `--execution` を指定なしに倒す ほか)。R01/R02 は classify の 2 枚目の層 (identity の ID) でも止まるので、変異は名乗りそのものを差し替える形にした。
+
+## 18. E4b の実績 (t025): 世代 (`started_at`) の照合と旧形式 marker の読み口を外した
+
+設計は §2.1 の #4・#8・#11・#12 と §2.4 の 4・§7。E4a (§17) が書き始めた `task_execution_id` だけが退役の証拠になり、世代は照合に使わない。
+
+### 18.1 merge 条件 (§7 の (0)〜(2)) — 本番を**読むだけ**で数えた結果 (2026-10-03)
+
+| 条件 | 数え方 | 結果 |
+|---|---|---|
+| (0) E4a が両デーモンで動いている | 主 checkout `git log -1` / `ps -o pid,lstart` の dispatcher・watchdog | HEAD `3dd3d7d` (E4a #274・2026-10-03T00:49:06+09:00)。dispatcher 3182381 (00:50:00)・watchdog 3182676 (00:50:01) は sync より**後**に起動。新しい marker の `task_execution_id` は、まだ退役が起きていないので**確かめられていない** (merge の直前に Director が次の退役で確かめる) |
+| (1) legacy の進行中 | holding の status (in_progress / ready_for_verification / verifying / needs_human_review) で `current_execution_id` の無い card (`store-check` の `reported:legacy_execution` と同じ数え方) | **1 件**: `queue/missions/20260912-minerva-stage0-1/tasks/t017.md` (needs_human_review・worker なし・started_at なし・枠なし・execution の欄なし) |
+| (2) 旧形式 marker | `registry/retirements/*.json` / `*.progress.json` で `task_execution_id` の無いもの | **0 件** (`registry/retirements/` は空) |
+
+**(1) の 1 件は設計 (§7) の「legacy の進行中」に当たらない — E4b の後も壊れず、照合できない経路が生まれない。** E4b が外すのは
+#4 (identity と世代の比較)・#8 (retire の世代名指し)・#11 (marker と identity の世代の比較)・#12 (marker の世代) で、4 つとも
+**worker・枠・started_at のどれかを前提にする**。この card はどれも持たない: 退役 marker は枠を持つ Worker の task にだけできる
+(束縛する試行も無い: `read_task_execution_id` = None)、`plan.sh retire` はどの ID でも worker 不一致で exit 3、枠が無いので identity と比べる
+相手がいない。閉じる道 (`verify-result` / `update --reset` / 閉じた後の再 pull) は照合に世代を使わない (名乗りなしの経路。
+`caller_check` の**ラベル**が `legacy_generation` / `no_execution` になるだけ)。`tests/test_execution_e4b_legacy_holding_card.py`
+(同じ形の card を隔離 queue に置き、`verify-result pass|fail` / `update --reset` / 再 pull が通り、試行の欄を発明せず、
+`retire` が exit 3 で何も書かないことを 6 本で示す)。Minerva の再開 (ユーザーが週末に再開予定) は E4b の影響を受けない。
+**この判断はテストで示したが、数え方の定義 (§7 (1)) には入る**ので、merge の可否は Director が最終確認する (入れ替えるのは Director)。
+
+### 18.2 外したもの・残したもの (E3 の `--execution` 互換・E4a の新旧両読みの仕分け)
+
+| 対象 | 処置 | 理由 |
+|---|---|---|
+| #4 `Txn.classify_assignment(generation)` / `retire_assignment(generation)` | **外した** (引数は `execution_id`。None = 「いま card が示す実行」) | 世代の比較 |
+| `lib_execution.identity_matches(generation=)` / `execution_matches(started_at=)` | **外した** (ID だけ。ID の無い identity は SUCCESSOR・撤去しない) | 世代の比較 |
+| #8 `plan.sh retire --started-at` | **外した** (未知のオプション。`--execution` 必須) | 世代の名指し |
+| #11 `assignment_execution_verdict(generation)` | **外した** (ID の無い identity は `EXEC_UNREADABLE` = 保留) | 世代の比較 |
+| #12 `_bound_generation` / marker の `task_started_at` の読み書き / `read_task_started_at` / `UNKNOWN_STARTED_AT` | **外した**。marker は `task_started_at` を書かない。壊れた / 無い / 旧形式の ID は保留 | 旧形式 marker の読み口 |
+| #13 `_settle_terminated` の `--started-at` | **外した** (`--execution` だけ) | 同上 |
+| R-1 (#5) の legacy card の世代照合 (`generation_mismatch`) | **外した** (ID のある card だけ identity の ID と比べる) | legacy は「試行なし」 (§5.2) |
+| `read_task_execution_id` が TERMINAL を束縛しない | **変えた** (ACTIVE / TERMINAL を束縛。legacy / DETACHED は None) | 世代が無い今、終わった試行を束縛しないと「ID を記録できていない」保留 = Director への通知になる (E4a は世代で quiet に通っていた)。TERMINAL の試行への `plan.sh retire` は exit 3 (何も書かない・quiet) |
+| E3 の `--execution` (done 等 6 コマンド) | **残す** | 公開された名乗りの口。世代の照合ではない。rollback 先の互換 (#272) |
+| `CHECK_LEGACY_GENERATION` / `CHECK_DETACHED` (監査の `caller_check` のラベル) | **残す** | 名乗りなしの経路の**ラベル**で、世代を比べない (読み手の互換。名前の変更は監査ログの語彙変更) |
+| `attempt_view` の DETACHED (a) (`started_at` ≠ `execution_reserved_at`) | **残す** | 名乗りの照合ではなく、旧コードの pull が card を取り直したことを card 1 枚から見分ける検出 (§9.3 の roll forward) |
+| `identity.started_at` を書くこと | **残す** (比べない) | projection の不変条件 (state-store.md §2) と rollback 先の旧コードが読む |
+| watchdog の idle 時計 / Taskvia / `log_to_obsidian.sh` | **残す** | 時刻としての使い道 (§2.3) |
+
+### 18.3 E2 の CAS (`_pull_cas_ok`) は**外さない**
+
+CAS の `started_at` の項は名乗りを世代で照合するものではなく、**この pull 自身が書いた予約 (X) が card にそのまま残っているか**を card 1 枚で確かめる
+(旧形式の書き手が status / worker / started_at だけを動かし、execution の欄を更新しない形への備え。§6 の Codex 3 巡目 P1・赤の実証 E05)。
+外す根拠は「旧書き手が本番に残っていない」ことだが、**それは証明できない**: sync 後の plan.sh は新しいコードだが、rollback (§9.3) で旧コードに戻れる
+(E4a の plan.sh に戻れば `update --reset` は試行を閉じるが、E3 以前に戻れば閉じない)。1 項を外す利得より、外した後の穴 (reset の上書き) の方が大きいので残す。
+`_pull_cas_ok` の docstring に同じ理由を書いた。
+
+### 18.4 族の掃除 — §11.1 の grep を同じコマンドで数え直した (`git grep`・追跡ファイルのみ。origin/main (E4a) → この PR)
+
+| パターン | 本体 (`scripts/ hooks/ crewvia` − `scripts/test_`) | テスト | 処置 |
+|---|---|---|---|
+| `started_at` | 142 → 94 | 257 → 242 | 残りは分類済み (下) |
+| `started-at` | 17 → 3 (コメント 3: 「外した」の説明と `--expect-started-at` の履歴) | 34 → 14 (外した後の拒否のテスト・説明) | 全件 |
+| `task_started_at` | 15 → 2 (コメント 2: 旧形式の説明) | 18 → 15 (旧形式 marker を作るテスト) | 全件 |
+| `read_task_started_at` / `UNKNOWN_STARTED_AT` / `_bound_generation` | 4 / 8 / 7 → **0** | 3 / 2 / 0 → **0** | 構造ガードが 0 を固定 |
+| `classify_assignment` | 22 → 22 (引数が世代から ID に変わった) | 10 → 13 | 全件 (`retire_assignment` 9・テスト 14 も同じ引数の変更) |
+| `assignment_execution_verdict` | 6 → 6 | 4 → 4 | 引数から世代を除いた |
+| `execution_matches` / `identity_matches` | 7 → 6 / 7 → 7 | 7 → 8 / 3 → 6 | 引数から世代を除いた |
+
+残りの `started_at` (本体 94) の分類 (照合に使うものが残っていないこと): 書く側 (`reserve` が `now` を card と `execution_reserved_at` に・reset / retire / `verify-result fail` が null・`publish_assignment` が identity に・
+監査の `generation` 欄・R-1 が identity を作り直す) / 時刻 (watchdog の idle 時計・`now_iso` の Taskvia・`log_to_obsidian.sh`) /
+card 1 枚の検出 (`attempt_view` の DETACHED (a)・`is_detached_a`) / CAS の項 (§18.3) / `lib_daemon_watch.*` と `lib_mux.py` の `generation` は別の意味 (デーモン・server の世代)。
+**`started_at` を名乗り (引数・marker・identity) と比べる式は 0**: `tests/test_execution_e4b_no_generation_readers.py` が (a) 外した読み口の語が本体に戻らない (b) 照合の関数に世代の引数が無い
+(c) `lib_retirement.py` に `started_at` / `generation` を含む比較式が無い、を固定する。
+
+文書 (エージェントへの指示): `agents/director.md` の `retire` の例と Rule 5 の行から `--started-at` を外した (ID の無い旧形式の card は `plan.sh update … --reset`)。
+`knowledge/daemon-authority.md` の retire の節・`knowledge/plan-sh-strict-args.md`・`knowledge/empty-vs-unobservable.md`・`scripts/CLAUDE.md`・`tests/` の
+`--started-at` を使っていた 4 本 (`test_registry_isolation`・`test_retirement_wait_and_timeout_notice`・`test_plan_sh_state_store_cutover`・`test_execution_e3_caller_table` の説明) と bats 9 本を ID に直した。
+
+### 18.5 E4a の Codex / review から持ち越した 5 件の処置
+
+1. **(t018) 今の ID・古い世代・ID なしの identity の組**: 世代は引数ですらなくなった (`--started-at` は未知のオプション)。ID だけで card と照合し、枠の identity に ID が無ければ
+   「この試行の枠」と証明できないので exit 3・何も書かない (世代で補わない)。ID のある identity なら通る。テスト `test_the_current_id_retires_even_when_the_identity_carries_no_id_…`。
+2. **(t019 #1) `_bound_execution` が壊れた ID で世代に倒れる**: 壊れた ID は None = 保留 (kill の前は `phase=unprovable`・後は `_cleanup_deferred`)。`test_a_marker_with_a_malformed_execution_id_…` /
+   `test_a_dead_worker_with_a_malformed_execution_id_…` (5 形: 非 hex・空・int・None・旧形式)。
+3. **(t019 #2) 消し込みの対象に入れる**: `--started-at` のテスト 4 本と `plan-sh-strict-args.md:47` を直した (上)。
+4. **(t019 #3) 旧形式 marker + 同じ世代の同名後任は見分けられない (E4a の既知の residual)**: 旧形式の読み口ごと外して閉じた (旧形式は保留)。
+5. **(t019 #4) red proof R09 の KeyError**: `env.get("AGENT_NAME")` (assert の失敗になる)。
+
+### 18.6 戻し方 (E4b)
+
+PR を revert し、`scripts/sync-main-checkout.sh` で主 checkout を ff する (watchdog・dispatcher が読む `lib_retirement.py` を変えるので両デーモンの restart が要る。同スクリプトの restart 判定に乗る)。
+E4a のコードに戻るので新旧の marker を両方読める (§17.3)。E4b の間に書かれた marker は `task_started_at` を持たない — E4a のコードはそれを「旧形式でない」marker として ID だけで読めるので問題ない
+(ID の無い marker は E4a でも世代 = 無し → 保留)。E4b の間に `--started-at` を使えなかった Director の手順は、戻すと再び使える。
+
+### 18.7 検証
+
+`tests/test_execution_e4a_retire_reset.py` (退役の全経路・旧形式 / 壊れた ID の保留・TERMINAL の束縛)・`tests/test_execution_e4b_no_generation_readers.py` (構造ガード)・
+`tests/test_execution_e4b_legacy_holding_card.py` (§18.1 の 1 件)・`tests/test_state_store_transaction.py` / `tests/test_task_controller_unit.py` (照合の規則)・
+`tests/plan-assignment-identity.bats`。赤の実証: `python3 tests/red_proof_e4b_generation.py` (7 変異: 世代の名指しを戻す・ID の無い identity を一致にする・保留を外す・壊れた ID を使う・TERMINAL を束縛しない・
+旧形式の世代を証拠に戻す・後任を後任と見ない) と、更新した `tests/red_proof_e4a_retire.py` (R01 は欠番・11 変異) — 全部「狙ったテスト名の assert の失敗」で RED。

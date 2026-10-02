@@ -4,9 +4,10 @@
 設計: `knowledge/execution.md` §2.1 (#8〜#13)・§2.2 (移行期の規則)・§4.2 / §4.4 (試行の終わらせ方・冪等)・§7 (E4a / E4b の分割)・
 §16.7 / §17。受入条件:
 
-1. 退役の全経路で、**同名の別 Worker・新しい試行を殺さない / 消さない**。旧形式の marker (`task_execution_id` なし) も読める
+1. 退役の全経路で、**同名の別 Worker・新しい試行を殺さない / 消さない**。E4b で世代の照合と旧形式の marker (`task_execution_id` なし)
+   の読み口を外した: ID だけで通り、旧形式は保留 (Director へ)
 2. 実 `RetirementExecutor` + 実 plan.sh (隔離コピー) で、退役の依頼 → 実行 → 回収が通る
-3. `--execution ""` (空の明示指定) は世代だけの経路・名乗りなしに倒さず exit 1 (retire `--started-at ""` と同じ)
+3. `--execution ""` (空の明示指定) は名乗りなしに倒さず exit 1。`--started-at` は未知のオプション (E4b)
 4. Director の cutover review task の閉じ方 (`update --status in_progress --reset` → フラグなしの `done`) と
    Director の `reap-orphan-assignment` が E4a の後も通る
 5. `update --reset` は試行を閉じる (reserved → released / running → failed `RESET_BY_DIRECTOR` / DETACHED は ABANDONED)
@@ -125,12 +126,17 @@ def test_retire_needs_director_keeps_the_worker_and_stores_the_reason(box):
     assert box.slot(AGENT) is None                       # 枠は撤去 (Worker は死んでいる)
 
 
-def test_retire_by_generation_still_works_on_an_active_attempt_and_closes_it(box):
-    take(box)
+def test_retire_by_generation_is_gone_and_writes_nothing(box):
+    """E4b: 世代 (`--started-at`) での名指しは外した。未知のオプションとして拒否し、何も書かない。"""
+    xid = take(box)
     gen = box.card()["started_at"]
-    p = retire(box, "--started-at", gen)
-    assert p.returncode == 0, (p.stdout, p.stderr)
-    assert state(box) == ("pending", None, None, "failed", "RETIRED")
+    before = box.snapshot()
+    for argv in (["--started-at", gen], ["--started-at", gen, "--execution", xid]):
+        p = retire(box, *argv)
+        assert p.returncode != 0 and "unknown option" in p.stderr, (p.stdout, p.stderr)
+        assert gen not in p.stderr                          # 値は出さない
+        assert box.snapshot() == before
+    assert state(box)[0] == "in_progress"
 
 
 def test_a_wrong_execution_is_refused_with_exit_3_and_nothing_is_written(box):
@@ -165,7 +171,7 @@ def test_a_stale_attempt_cannot_retire_its_successor(box):
 
 
 def test_the_execution_id_decides_even_when_the_generation_is_identical(box):
-    """世代 (started_at) では区別できない後任 (同じ値) でも、ID が違えば不一致 (§2.2: ID が優先)。"""
+    """世代 (started_at) では区別できない後任 (同じ値) でも、ID が違えば不一致。"""
     x = take(box)
     gen_x = box.card()["started_at"]
     box.reset()
@@ -175,18 +181,27 @@ def test_the_execution_id_decides_even_when_the_generation_is_identical(box):
     p = retire(box, "--execution", x)
     assert p.returncode == 3, (p.stdout, p.stderr)
     assert box.snapshot() == before
-    p = retire(box, "--execution", x, "--started-at", gen_x)      # 世代が一致していても ID が違えば不一致
-    assert p.returncode == 3, (p.stdout, p.stderr)
-    assert box.snapshot() == before
     assert state(box)[0] == "in_progress"
 
 
-def test_the_execution_id_wins_over_a_stale_generation_in_the_other_direction(box):
+def test_the_current_id_retires_even_when_the_identity_carries_no_id_and_a_stale_generation_is_not_an_argument(box):
+    """E4a (t018) から持ち越し: 今の ID・古い世代・ID なしの identity の組。世代は引数ですらなくなった (`--started-at` は
+    未知のオプション・何も書かない) ので、card の今の ID だけが照合の根拠。ID なしの identity は「この試行の枠」と
+    証明できないので exit 3 で保留し、何も書かない (世代で補わない)。ID のある identity なら通る。"""
     x = take(box)
     gen_x = box.card()["started_at"]
     box.reset()
     y = take(box)
-    p = retire(box, "--execution", y, "--started-at", gen_x)      # 世代は古いが ID は今の試行
+    before = box.snapshot()
+    p = retire(box, "--execution", y, "--started-at", gen_x)
+    assert p.returncode != 0 and "unknown option" in p.stderr and box.snapshot() == before
+    set_identity(box, execution_id=None)                          # E2 より前の publish の形
+    p = retire(box, "--execution", y)
+    assert p.returncode == 3, (p.stdout, p.stderr)
+    assert box.slot(AGENT) == f"{MISSION}:{TID}" and state(box)[0] == "in_progress"
+    assert box.card()["current_execution_id"] == y and x != y
+    set_identity(box, execution_id=y)                             # 公開し直された (resume / pull)
+    p = retire(box, "--execution", y)
     assert p.returncode == 0, (p.stdout, p.stderr)
     assert box.card()["current_execution_id"] == y and state(box)[3:] == ("failed", "RETIRED")
 
@@ -194,16 +209,11 @@ def test_the_execution_id_wins_over_a_stale_generation_in_the_other_direction(bo
 @pytest.mark.parametrize("argv", [
     ["--execution", ""],
     ["--execution", "   "],
-    ["--execution", "", "--started-at", "2026-10-01T00:00:00Z"],
-    ["--started-at", ""],
     [],
 ])
 def test_an_empty_or_missing_claim_is_refused_with_exit_1_and_nothing_is_written(box, argv):
-    """空の明示指定を世代だけの経路・名乗りなしに倒さない (01b G3)。`--execution ""` に有効な世代を添えても同じ。"""
+    """空の明示指定・指定なしを名乗りなしの経路に倒さない (01b G3)。"""
     take(box)
-    gen = box.card()["started_at"]
-    if argv[-2:] == ["--started-at", "2026-10-01T00:00:00Z"]:
-        argv = argv[:-1] + [gen]                         # 世代は今の card のもの。それでも空の --execution で止まる
     before = box.snapshot()
     p = retire(box, *argv)
     assert p.returncode == 1, (p.stdout, p.stderr)
@@ -230,22 +240,23 @@ def test_a_resend_after_a_different_end_is_refused(box):
     assert box.snapshot() == before
 
 
-def test_a_legacy_card_is_retired_by_generation_and_refuses_an_execution(box):
+def test_a_legacy_card_is_not_retired_by_plan_retire_and_is_closed_by_the_director_reset(box):
+    """E4b: legacy の card (`current_execution_id` なし) は試行を持たない。どの ID でも退役できない (exit 3・何も書かない)。
+    手放すのは Director の `update --reset` (今ある手作業。試行を発明しない)。"""
     e3.legacy_in_progress(box, "t002", AGENT)
-    gen = box.card("t002")["started_at"]
     before = box.snapshot()
     assert retire(box, "--execution", OTHER_ID, tid="t002").returncode == 3
     assert box.snapshot() == before
-    p = retire(box, "--started-at", gen, tid="t002")
+    p = update_reset(box, "t002")
     assert p.returncode == 0, (p.stdout, p.stderr)
     m = box.card("t002")
     assert m["status"] == "pending" and m["worker"] is None
     assert "current_execution_id" not in m and "execution_status" not in m      # 試行を発明しない
 
 
-def test_a_card_taken_over_by_old_code_is_retired_by_generation_not_by_the_stale_id(box):
-    """旧コードの pull が取り直した card (DETACHED (a))。X の欄は前の試行のもの —— X では退役できず、世代でだけ。
-    X の欄は触らない (閉じるのは次の reserve / `update --close-execution`)。"""
+def test_a_card_taken_over_by_old_code_is_not_retired_by_the_stale_id(box):
+    """旧コードの pull が取り直した card (DETACHED (a))。X の欄は前の試行のもの —— X では退役できない (exit 3・何も書かない)。
+    世代で名乗る道は E4b で無い。X の欄は触らない (閉じるのは次の reserve / `update --close-execution`)。"""
     x = take(box)
     gen2 = "2026-10-02T08:00:00.000000Z"
     set_card(box, started_at=gen2)
@@ -254,21 +265,20 @@ def test_a_card_taken_over_by_old_code_is_retired_by_generation_not_by_the_stale
     assert retire(box, "--execution", x).returncode == 3
     assert box.snapshot() == before
     p = retire(box, "--started-at", gen2)
-    assert p.returncode == 0, (p.stdout, p.stderr)
+    assert p.returncode != 0 and "unknown option" in p.stderr
+    assert box.snapshot() == before
     m = box.card()
-    assert (m["status"], m["worker"], m["started_at"]) == ("pending", None, None)
+    assert (m["status"], m["worker"], m["started_at"]) == ("in_progress", AGENT, gen2)
     assert (m["execution_status"], m.get("execution_end_code")) == ("running", None)   # X の欄はそのまま
 
 
 def test_a_card_with_broken_execution_fields_is_not_retired(box):
     take(box)
     set_card(box, execution_status="bogus")
-    gen = box.card()["started_at"]
     before = box.snapshot()
-    for argv in (["--started-at", gen], ["--execution", box.card()["current_execution_id"]]):
-        p = retire(box, *argv)
-        assert p.returncode == 3, (p.stdout, p.stderr)
-        assert box.snapshot() == before
+    p = retire(box, "--execution", box.card()["current_execution_id"])
+    assert p.returncode == 3, (p.stdout, p.stderr)
+    assert box.snapshot() == before
 
 
 def test_the_error_text_never_carries_card_content(box):
@@ -442,32 +452,34 @@ def test_the_marker_reader_binds_only_an_active_attempt(box):
     set_card(box, started_at="2026-10-02T08:00:00.000000Z")            # DETACHED (a): 古い ID を束縛しない
     assert rt.read_task_execution_id(box.queue, MISSION, TID) is None
     e3.legacy_in_progress(box, "t002", AGENT)
-    assert rt.read_task_execution_id(box.queue, MISSION, "t002") is None          # legacy: 世代だけ
+    assert rt.read_task_execution_id(box.queue, MISSION, "t002") is None          # legacy: 束縛する試行が無い (保留)
     assert rt.read_task_execution_id(box.queue, MISSION, "t999") is rt.UNKNOWN_EXECUTION_ID   # 読めない
     set_card(box, execution_status="bogus", started_at=None)
     assert rt.read_task_execution_id(box.queue, MISSION, TID) is rt.UNKNOWN_EXECUTION_ID     # 欄が壊れている
 
 
-def test_a_terminal_attempt_is_not_bound(box):
+def test_a_terminal_attempt_is_still_bound_so_plan_retire_can_answer_nothing_is_owed(box):
+    """E4b: 世代が無い今、TERMINAL の試行も束縛する (束縛しないと「ID を記録できていない」保留 = Director への通知になる)。
+    plan.sh retire は終わった試行には何も書かず exit 3 (静かな other_state) で答える。"""
     xid = take(box)
     assert run(box, "done", TID, "r", "--mission", MISSION, "--execution", xid).returncode == 0
-    assert rt.read_task_execution_id(box.queue, MISSION, TID) is None
+    assert rt.read_task_execution_id(box.queue, MISSION, TID) == xid
+    before = box.snapshot()
+    assert retire(box, "--execution", xid).returncode == 3
+    assert box.snapshot() == before
 
 
-def test_assignment_verdict_prefers_the_execution_id_over_the_generation(box):
+def test_assignment_verdict_compares_the_execution_id_only(box):
     xid = take(box)
-    gen = box.card()["started_at"]
     verdict = rt.assignment_execution_verdict
-    assert verdict(box.queue, AGENT, MISSION, TID, gen, xid)[0] == rt.EXEC_SAME
-    assert verdict(box.queue, AGENT, MISSION, TID, gen, OTHER_ID)[0] == rt.EXEC_OTHER      # 世代が同じでも ID が違えば別
-    assert verdict(box.queue, AGENT, MISSION, TID, "2026-01-01T00:00:00Z", xid)[0] == rt.EXEC_SAME   # ID が同じなら世代が違っても
-    assert verdict(box.queue, AGENT, MISSION, TID, None, xid)[0] == rt.EXEC_SAME
-    assert verdict(box.queue, AGENT, MISSION, TID, None, None)[0] == rt.EXEC_UNREADABLE     # 証拠なしは保留
-    # 旧形式の枠 (identity に ID なし) は世代で読める (§2.2 の末尾)。世代が無ければ読めないに倒す
+    assert verdict(box.queue, AGENT, MISSION, TID, xid)[0] == rt.EXEC_SAME
+    assert verdict(box.queue, AGENT, MISSION, TID, OTHER_ID)[0] == rt.EXEC_OTHER
+    assert verdict(box.queue, AGENT, MISSION, TID, None)[0] == rt.EXEC_UNREADABLE     # 証拠なしは保留
+    # 旧形式の枠 (identity に ID なし) は世代で読まない (E4b)。読めないに倒す (後任のものかもしれない)
     set_identity(box, execution_id=None)
-    assert verdict(box.queue, AGENT, MISSION, TID, gen, xid)[0] == rt.EXEC_SAME
-    assert verdict(box.queue, AGENT, MISSION, TID, None, xid)[0] == rt.EXEC_UNREADABLE
-    assert verdict(box.queue, AGENT, MISSION, TID, "2026-01-01T00:00:00Z", xid)[0] == rt.EXEC_OTHER
+    assert verdict(box.queue, AGENT, MISSION, TID, xid)[0] == rt.EXEC_UNREADABLE
+    assert verdict(box.queue, AGENT, MISSION, TID, None)[0] == rt.EXEC_UNREADABLE
+    assert verdict(box.queue, AGENT, "other-mission", TID, xid)[0] == rt.EXEC_OTHER
 
 
 class FakeMux:
@@ -594,8 +606,8 @@ def test_the_marker_and_the_cleanup_are_bound_to_the_execution(rig):
     assert box.slot(AGENT) is None
     (argv, env), = _retire_calls(rig)
     assert argv[3] == TID and "--execution" in argv and xid in argv
-    assert "--started-at" not in argv                                # 両方は渡さない
-    assert env["AGENT_NAME"] == "watchdog"
+    assert "--started-at" not in argv                                # 世代は渡さない (E4b)
+    assert env.get("AGENT_NAME") == "watchdog"
     assert not _alive(rig.pane_pid)
     rows = [r for r in audit_rows_for(box, "retire") if r["result"] == "ok"]
     assert rows and rows[-1]["actor"] == "watchdog" and rows[-1]["execution_id"] == xid
@@ -615,33 +627,91 @@ def test_the_progress_file_carries_the_execution_forward_after_the_request_is_go
     assert xid in argv
 
 
-def test_an_old_format_marker_without_the_execution_is_read_and_cleans_up_by_generation(rig):
-    """E4a は旧形式の marker (`task_execution_id` なし) を読める。確認の 0 件を merge 条件にしない理由 (§7)。"""
+def test_an_old_format_marker_is_held_for_the_director_and_nothing_is_written(rig):
+    """E4b: 旧形式の marker (`task_execution_id` なし・`task_started_at` だけ) の読み口は無い。世代で後始末せず保留 →
+    Director (`_cleanup_deferred`)。plan.sh retire を呼ばず、queue に何も書かない。"""
     box = rig.box
     take(box)
     assert rig.request()
     req_path = rt.request_path(rig.registry, AGENT)
     doc = json.loads(req_path.read_text())
-    gen = doc["task_started_at"]
+    assert "task_started_at" not in doc                              # 書かなくなった
     del doc["task_execution_id"]
+    doc["task_started_at"] = box.card()["started_at"]                # E4a の producer が書いた旧形式
     req_path.write_text(json.dumps(doc))
-    assert rig.drive(), rig.logs
-    assert state(box) == ("pending", None, None, "failed", "RETIRED")      # 世代の照合でも試行は閉じる
-    (argv, _env), = _retire_calls(rig)
-    assert "--started-at" in argv and gen in argv and "--execution" not in argv
+    before = box.snapshot()
+    rig.drive()
+    assert not _retire_calls(rig)
+    assert box.snapshot() == before and state(box)[0] == "in_progress"
+    _assert_held_unprovable(rig)
+    assert not any(box.card()["started_at"] in n for n in rig.notes)
 
 
-def test_a_marker_that_names_a_legacy_card_binds_the_generation_only(rig):
+def _assert_held_unprovable(rig):
+    """kill の前の guard で止まる: Worker は殺されず (`phase=unprovable`)、Director に 1 度だけ上がる。後始末は走らない。"""
+    prog = json.loads(rt.progress_path(rig.registry, AGENT).read_text())
+    assert prog["phase"] == "unprovable" and prog["director_notified"] is True
+    assert "no execution id" in prog["unprovable_reason"]
+    assert _alive(rig.pane_pid), "ID の無い marker で Worker を殺した"
+    assert rig.notes, "Director に上げていない"
+
+
+@pytest.mark.parametrize("bad", ["ex-NOT-HEX", "not-an-id", "", 7, ["ex-" + "0" * 32]])
+def test_a_marker_with_a_malformed_execution_id_is_held_not_read_as_a_generation(rig, bad):
+    """持ち越し (t019 #1): 手編集の `task_execution_id` は世代に倒さず保留 (`_cleanup_deferred`)。plan.sh の引数にしない。"""
+    box = rig.box
+    take(box)
+    assert rig.request()
+    req_path = rt.request_path(rig.registry, AGENT)
+    doc = json.loads(req_path.read_text())
+    doc["task_execution_id"] = bad
+    req_path.write_text(json.dumps(doc))
+    before = box.snapshot()
+    rig.drive()
+    assert not _retire_calls(rig) and box.snapshot() == before
+    _assert_held_unprovable(rig)
+
+
+@pytest.mark.parametrize("bad", ["ex-NOT-HEX", "", 7, None, "OLD-FORMAT"])
+def test_a_dead_worker_with_a_malformed_execution_id_is_deferred_to_the_director_and_the_queue_is_untouched(rig, bad):
+    """持ち越し (t019 #1): Worker が死んだ後 (terminated) に marker の ID が壊れていても (手編集)、世代には倒れず
+    `_cleanup_deferred` の保留 (queue は何も書かない・Director に 1 度)。`OLD-FORMAT` は E4a の producer が書いた旧形式
+    (`task_execution_id` なし・`task_started_at` だけ) — その世代で後始末しない (読み口が無い)。"""
+    box = rig.box
+    take(box)
+    assert rig.request()
+    rig.ex.process_all()                                             # → notified
+    _sigkill_and_wait(rig.pane_pid)
+    rig.ex.process_all()                                             # → terminated (後始末だけが残る)
+    for path in (rt.request_path(rig.registry, AGENT), rt.progress_path(rig.registry, AGENT)):
+        if path.exists():
+            doc = json.loads(path.read_text())
+            if bad == "OLD-FORMAT":
+                doc.pop("task_execution_id", None)
+                doc["task_started_at"] = box.card()["started_at"]
+            else:
+                doc["task_execution_id"] = bad
+            path.write_text(json.dumps(doc))
+    before = box.snapshot()
+    rig.drive()
+    assert not _retire_calls(rig) and box.snapshot() == before
+    prog = json.loads(rt.progress_path(rig.registry, AGENT).read_text())
+    assert prog["cleanup_deferred"] is True and prog["phase"] == rt.PHASE_CLEANUP_FAILED
+    assert any("execution id" in n for n in rig.notes), rig.notes
+    assert state(box)[0] == "in_progress"
+
+
+def test_a_marker_that_names_a_legacy_card_is_held_for_the_director(rig):
     box = rig.box
     e3.legacy_in_progress(box, "t002", AGENT)
-    window = WINDOW
-    assert rig.ex.request(AGENT, window, "timeout", mission=MISSION, task_id="t002")
+    assert rig.ex.request(AGENT, WINDOW, "timeout", mission=MISSION, task_id="t002")
     doc = rig.marker()
-    assert doc["task_execution_id"] is None and doc["task_started_at"] == e3.sc.GEN
-    assert rig.drive(), rig.logs
-    (argv, _env), = _retire_calls(rig)
-    assert "--started-at" in argv and "--execution" not in argv
-    assert box.card("t002")["status"] == "pending"
+    assert doc["task_execution_id"] is None and "task_started_at" not in doc
+    before = box.snapshot()
+    rig.drive()
+    assert not _retire_calls(rig) and box.snapshot() == before
+    assert box.card("t002")["status"] == "in_progress"
+    _assert_held_unprovable(rig)
 
 
 @pytest.mark.parametrize("same_generation", [False, True])

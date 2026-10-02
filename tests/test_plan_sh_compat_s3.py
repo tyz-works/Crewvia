@@ -107,6 +107,13 @@ E3_EXPECTED_DIFFERENCES = {
 }
 
 
+# --- 01c E4b (retire が試行の ID だけで名指しする) の違い ----
+#   1. `retire` の成功行の末尾は名指しした値: 世代 (`@ <TS>`) だった行が試行の ID (`@ ex-…`) になる。ほかの行は同じ
+#      (scenario 側が `--execution <card の current_execution_id>` で打つ。cutover 前の plan.sh は `--execution` を持たないので
+#      golden を作り直すときはこの 1 段を `--started-at` に戻す)
+E4B_RETIRE_SHOWN = re.compile(r"^(Retired: \S+ — \S+ @ )ex-[0-9a-f]{32}$", re.M)
+
+
 def without_e3_differences(steps, golden_steps):
     """表にした違いだけを golden の値に戻す (表と完全に一致しなければ戻さない = 赤のまま)。"""
     out = []
@@ -114,6 +121,8 @@ def without_e3_differences(steps, golden_steps):
         table = E3_EXPECTED_DIFFERENCES.get(have["cmd"])
         if table and all(have[k] == v for k, v in table.items()):
             have = dict(have, stderr=want["stderr"])
+        if have["cmd"] == "retire (reset)":
+            have = dict(have, stdout=E4B_RETIRE_SHOWN.sub(r"\1<TS>", have["stdout"]))
         out.append(have)
     return out
 

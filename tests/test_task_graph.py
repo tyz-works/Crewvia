@@ -979,7 +979,7 @@ def test_lock_busy_retire_writes_nothing(sandbox):
         time.sleep(0.01)
         r = sandbox.run(
             "retire", "t001", "--agent", "Ren",
-            "--started-at", "2026-01-01T00:00:00.000000Z", "--no-wait",
+            "--execution", "ex-" + "0" * 32, "--no-wait",
         )
         assert r.returncode == LOCK_BUSY, (r.returncode, r.stdout, r.stderr)
         assert _mtime(sandbox.graph) == before, "ロックを取れなかった実行が生成を呼んでいる"
@@ -1551,9 +1551,9 @@ def test_retire_no_wait_returns_inside_the_watchdogs_timeout(sandbox, tmp_path):
     r = sandbox.run("pull", "--agent", "Ren", "--skills", "code")
     assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
     card = (sandbox.queue / "missions" / MISSION / "tasks" / "t001.md").read_text()
-    m = re.search(r"^started_at:\s*(\S+)\s*$", card, re.MULTILINE)
-    assert m, f"pull が started_at を書いていない: {card!r}"
-    generation = m.group(1).strip('"\'')
+    m = re.search(r"^current_execution_id:\s*(\S+)\s*$", card, re.MULTILINE)
+    assert m, f"pull が current_execution_id を書いていない: {card!r}"
+    execution_id = m.group(1).strip('"\'')
 
     staller = _stall_holding(
         tmp_path,
@@ -1566,7 +1566,7 @@ def test_retire_no_wait_returns_inside_the_watchdogs_timeout(sandbox, tmp_path):
         r = subprocess.run(
             ["bash", str(sandbox.root / "scripts" / "plan.sh"),
              "retire", "t001", "--agent", "Ren",
-             "--started-at", generation, "--no-wait"],
+             "--execution", execution_id, "--no-wait"],
             env=sandbox.env(), capture_output=True, text=True,
             timeout=WATCHDOG_RETIRE_TIMEOUT,
         )

@@ -750,40 +750,54 @@ def test_status_and_end_code_pairs_follow_the_table(status, end, ok):
     assert (ex.fields_problem(meta) is None) == ok
 
 
-@pytest.mark.parametrize("view_meta,presented,started,expected", [
-    # ID が優先 (started_at が一致していても不一致)
-    (_act(), h.xid(1), None, (ex.MATCH, "verified")),
-    (_act(), h.xid(2), None, (ex.MISMATCH, None)),
-    # 名乗りが started_at だけ (旧 marker): 予約の値と一致すれば legacy_generation
-    (_act(), None, T0, (ex.MATCH, "legacy_generation")),
-    (_act(), None, T1, (ex.MISMATCH, None)),
-    # legacy の card: 今の世代の照合
-    (_m(), None, T0, (ex.MATCH, "legacy_generation")),
-    (_m(), None, T1, (ex.MISMATCH, None)),
-    (_m(), h.xid(1), None, (ex.MISMATCH, None)),
-    # DETACHED: ID は不一致・started_at だけなら旧コードの持ち主の世代で照合
-    (_act(started_at=T1), h.xid(1), None, (ex.MISMATCH, None)),
-    (_act(started_at=T1), None, T1, (ex.MATCH, "detached_execution")),
-    (_act(started_at=T1), None, T0, (ex.MISMATCH, None)),
+@pytest.mark.parametrize("view_meta,presented,expected", [
+    # ID だけが証拠 (E4b: 世代 = started_at の照合は無い)
+    (_act(), h.xid(1), (ex.MATCH, "verified")),
+    (_act(), h.xid(2), (ex.MISMATCH, None)),
+    # legacy の card (試行なし): どの ID も不一致 (その ID を発行していない)
+    (_m(), h.xid(1), (ex.MISMATCH, None)),
+    # DETACHED: ID は不一致 (card の今の持ち主は X の持ち主ではない)
+    (_act(started_at=T1), h.xid(1), (ex.MISMATCH, None)),
     # 証拠なし
-    (_act(), None, None, (ex.MISMATCH, None)),
+    (_act(), None, (ex.MISMATCH, None)),
+    (_m(), None, (ex.MISMATCH, None)),
 ])
-def test_execution_matches_table(view_meta, presented, started, expected):
+def test_execution_matches_table(view_meta, presented, expected):
     view = ex.attempt_view(view_meta, HOLD)
-    assert ex.execution_matches(view, view_meta, execution_id=presented, started_at=started) == expected
+    assert ex.execution_matches(view, view_meta, execution_id=presented) == expected
+
+
+def test_the_generation_is_not_an_argument_of_the_matching_rule_any_more():
+    """E4b: `started_at` を渡す口が無い (渡しても受け付けない)。世代の照合が戻ったら (引数が戻ったら) 赤。"""
+    view = ex.attempt_view(_act(), HOLD)
+    with pytest.raises(TypeError):
+        ex.execution_matches(view, _act(), started_at=T0)
+    with pytest.raises(TypeError):
+        ex.identity_matches({"started_at": T0, "execution_id": h.xid(1)}, execution_id=h.xid(1), generation=T0)
 
 
 def test_an_empty_presented_value_is_not_treated_as_absent():
     view = ex.attempt_view(_act(), HOLD)
     assert ex.execution_matches(view, _act(), execution_id="") == (ex.MISMATCH, None)
-    assert ex.execution_matches(view, _act(), execution_id=None, started_at="") == (ex.MISMATCH, None)
 
 
-def test_a_reset_terminal_attempt_still_answers_a_marker_that_carries_the_reserved_generation():
+def test_a_reset_terminal_attempt_answers_its_own_id_and_no_generation():
     meta = _act(execution_status="failed", execution_end_code="RETIRED", status="pending", started_at=None, worker=None)
     view = ex.attempt_view(meta, HOLD)
     assert view == ex.TERMINAL
-    assert ex.execution_matches(view, meta, started_at=T0) == (ex.MATCH, "legacy_generation")
+    assert ex.execution_matches(view, meta, execution_id=h.xid(1)) == (ex.MATCH, "verified")
+    assert ex.execution_matches(view, meta, execution_id=h.xid(2)) == (ex.MISMATCH, None)
+
+
+@pytest.mark.parametrize("identity,claimed,expected", [
+    ({"execution_id": h.xid(1), "started_at": T0}, h.xid(1), True),
+    ({"execution_id": h.xid(1), "started_at": T0}, h.xid(2), False),     # 世代が同じでも ID が違えば別
+    ({"started_at": T0}, h.xid(1), False),                               # ID の無い identity (E2 より前) は証明にならない
+    ({"execution_id": h.xid(1)}, None, False),
+    ({"execution_id": None, "started_at": T0}, None, False),
+])
+def test_identity_matches_compares_the_execution_id_only(identity, claimed, expected):
+    assert ex.identity_matches(identity, execution_id=claimed) is expected
 
 
 # ---------------------------------------------------------------------------

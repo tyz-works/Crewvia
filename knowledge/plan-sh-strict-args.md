@@ -44,7 +44,7 @@
 * `update` は以前、`--mission` 省略時に default_mission へ黙って当てていた (複数に当たっても拒否しなかった)。
   複数に当たるときは同じ規則で決める。1 つにしか当たらなければ従来どおり (default_mission)
 * `retire` は対象外: watchdog が呼ぶので `AGENT_NAME` は退役対象の Worker ではない。退役は
-  `--agent` / `--started-at` で束縛されている
+  `--agent` / `--execution` で束縛されている (E4b: 世代 `--started-at` は無い)
 * `pull --task <id>` が複数 mission に当たって `--mission` が無いときは拒否。以前は最初に当たった mission で
   `die` するか、優先度順で先頭を取っていた (別 mission の同じ tNNN を in_progress にしうる)
 

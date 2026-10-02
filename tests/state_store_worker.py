@@ -48,7 +48,7 @@ def claim(queue, name, n):
                 gen = meta["started_at"]
                 meta.update(status="pending", worker=None, started_at=None)
                 t.write_card(MISSION, "t001", meta, body)
-                t.retire_assignment(name, MISSION, "t001", gen)
+                t.retire_assignment(name, MISSION, "t001", None)   # E4b: 世代では名指ししない (card の持ち主の枠)
                 t.record(MISSION, "t001", "in_progress", "pending", gen)
                 released += 1
     return {"name": name, "claimed": claimed, "released": released}

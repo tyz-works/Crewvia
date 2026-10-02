@@ -180,7 +180,7 @@ ISOLATED_INVOCATIONS: dict[str, list[list[str]]] = {
         ["update", "t008", "--reset", "--mission", MISSION],
     ],
     "release-dep": [["release-dep", "t008", "--mission", MISSION]],
-    "retire": [["retire", "t005", "--agent", "Ren", "--started-at", "2026-01-01T00:00:00Z",
+    "retire": [["retire", "t005", "--agent", "Ren", "--execution", "ex-" + "0" * 32,
                 "--mission", MISSION, "--outcome", "reset", "--no-wait"]],
     "reap-orphan-assignment": [["reap-orphan-assignment", "Kai-codex", "--no-wait"]],
     "ready-for-verification": [["ready-for-verification", "t006", "--mission", MISSION]],

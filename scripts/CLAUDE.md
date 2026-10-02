@@ -94,8 +94,9 @@ lib ごとの**破ってはいけない契約**の要約。理由・経緯・全
   `fail_execution(WORKSPACE_CREATE_FAILED)`）→ JSON。**start は JSON を出す前**にコミットする（`reserved` ⇔ JSON はまだ誰にも渡っていない。だから
   同じ Worker の再 pull は `reserved` を新しい試行にせず再開できる。`running` は再開しない）。ロックの順序は 準備ロック → `queue/.lock` → 小さな共有ファイル。
 - **start と G1 の CAS は `_pull_cas_ok`（新しい欄 `current_execution_id == X ∧ execution_status == reserved` と、今までの欄 in_progress ∧ worker ∧
-  `started_at` の AND）**。新しい欄だけにしない: 旧形式の書き手（今の `update --reset`・rollback 中の旧コード）は execution の欄を更新しない
-  （E4 まで）ので、解放済みの予約が `X / reserved` のまま残る。reset の後に Director が card を開き直した形は、今までの欄だけが拒否する。
+  `started_at` の AND）**。新しい欄だけにしない: 旧形式の書き手（rollback 中の旧コード・Director の手編集）は execution の欄を更新しない
+  ので、解放済みの予約が `X / reserved` のまま残る。reset の後に Director が card を開き直した形は、今までの欄だけが拒否する。
+  **E4b でも外さない**（旧書き手が本番に残っていないことは証明できない。`knowledge/execution.md` §18.3）。
 - `.crewvia-env` の 4 行目 `CREWVIA_EXECUTION_ID` は**任意**（必須にしない・card には書かない名乗り）。pull の JSON に `execution_id` / `attempt`。
   `task_slug` は最初の reserve で card に固定（title を変えても branch は変わらない。式は `lib_execution.slugify_title` の 1 か所）。
   Controller の domain error は `[plan.sh] error_code=<CODE>` を stderr の**最後の行**に出す（exit 2 は使わない = idle）。
@@ -113,6 +114,7 @@ lib ごとの**破ってはいけない契約**の要約。理由・経緯・全
   （`with_lock` のコールバックの中だけで呼ぶ。`transition_to_needs_director` のような LOCKED_HELPERS からは呼ばない）。
 - `plan.sh update <id> --close-execution` は Director 用の「閉じる手段」: DETACHED で active な試行（E2 の間に終わった task に残った running 等）を task に触れず `ABANDONED_OUTSIDE_CONTROLLER` で閉じる。
 - 戻し方（E3）: PR revert → sync。**revert 先でも `--execution` が通る互換（commit `e3-execution-flag-compat`・別 PR）を先に merge しておく**（起動済みの Worker・走っている kai-review.sh が付け続ける）。`knowledge/execution.md` §16.4。
+- **退役は試行の ID だけで束縛する（E4a で ID を書き始め、E4b で世代を外した）**: `plan.sh retire` は `--execution <ex-…>` 必須（世代 `--started-at` は未知のオプション・空の `--execution ""` は exit 1）。退役 marker / progress の `task_execution_id`（`lib_retirement.read_task_execution_id` が ACTIVE / TERMINAL の試行だけ束縛・legacy / DETACHED は None）が後始末の唯一の証拠で、**ID が無い・`ex-<32hex>` でない・旧形式（`task_started_at` だけ）の marker は kill の前なら `phase=unprovable`、後なら `_cleanup_deferred` で Director へ保留**（世代で後始末しない・queue は何も書かない）。枠の照合（`classify_assignment` / `assignment_execution_verdict`）は identity の `execution_id` だけ: ID の無い identity は「この試行のもの」と言えない（撤去しない）。`identity.started_at` は projection として書き続けるが**比べない**。世代の読み口を戻さない構造ガード: `tests/test_execution_e4b_no_generation_readers.py`・赤の実証 `python3 tests/red_proof_e4b_generation.py`（`knowledge/execution.md` §18）。
 ## Git Policy（`lib_git_policy.py`。01b G2 / t008 で作成、G3 / t012 で呼び出し元を移した）
 
 - task の branch・worktree path・base・PR base を決める唯一の場所（`knowledge/git-policy.md` §2・§3）。**判断だけ**で

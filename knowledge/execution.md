@@ -485,10 +485,10 @@ Controller の外で起きた形なので、同じ答えに揃える。`started_
 
 | card の `execution_end_code` (status) | 来た操作 (同じ ID) | 結果 |
 |---|---|---|
-| `DONE` (completed) | done | **成功 (exit 0)・何も書かない**・stdout に `already completed (idempotent)`。今は「already done」exit 2 なので、**ID を名乗った呼び出しだけ**挙動が変わる |
+| `DONE` (completed) | done (**同じ中身**) | **成功 (exit 0)・何も書かない**・stdout に `already completed (idempotent)`。今は「already done」exit 2 なので、**ID を名乗った呼び出しだけ**挙動が変わる。中身 (`--pr` / `--no-pr` / Result) が違えば conflict (§16.10) |
 | `VERIFIED` (completed) | verify-result pass | 成功・何も書かない |
-| `WORKER_FAILED` (failed) | fail | 成功・何も書かない |
-| `NEEDS_DIRECTOR` (failed) | needs-director | 成功・何も書かない |
+| `WORKER_FAILED` (failed) | fail (**同じ中身**) | 成功・何も書かない (head / no-head / handoff が違えば conflict。§16.10) |
+| `NEEDS_DIRECTOR` (failed) | needs-director (**同じ中身**) | 成功・何も書かない (reason が違えば conflict。§16.10) |
 | `VERIFICATION_REJECTED` (failed) | verify-result fail | 成功・何も書かない (verifier の再送) |
 | `RETIRED` (failed / released) | retire (`--execution` が同じ ID) | 成功・何も書かない (watchdog の `_settle_terminated` が card の書き込みの後に死んで打ち直す場合。E4a) |
 | `DONE` / `VERIFIED` | 上の行以外 (fail / needs-director / done を `VERIFIED` に等) | **conflict** (`EXECUTION_ALREADY_TERMINAL`・exit 3・何も書かない) |
@@ -503,7 +503,10 @@ Controller の外で起きた形なので、同じ答えに揃える。`started_
   ので `execution_end_code` は残る。次の reserve が新しい ID を発行した後は、古い ID の再送は `EXECUTION_NOT_CURRENT`。
 - crash の点 (§1.4): 終了コードは terminal の status と同じ card の書き込みに入るので、「status は terminal・理由は不明」の card は
   できない。record が遅れていても答えは同じ。
-- 「同じ操作」は操作の種類だけで判定する。引数の違い (done の `--pr` 違い) は今の D0 の検査 (state-store.md §2.2) が拒否する。
+- 「同じ操作」はまず操作の種類で判定し (Controller の `IDEMPOTENT`)、**そのうえで要求の中身を card と比べる** (t034 / §16.10)。
+  done は `--pr` / `--no-pr` / Result 本文、fail は head / no-head / handoff、needs-director は reason。**違えば conflict (exit 3・何も書かない・
+  値は出さず項目名だけ)**、同じなら成功 (exit 0)。上の表の「成功」は**同じ中身の再送**の行で、違う中身の 2 回目は新しい記録にならず conflict。
+  (E3 の初版は中身を見ずに exit 0 を返し、`done "first" --pr 5` → `done "CORRECTED" --pr 6` が成功に見えて card は最初のままだった)
 - ID を名乗らない呼び出しは今と同じ (done の二重は exit 2)。
 
 **domain error の固定コードと exit code** (exit 2 は pull では idle の意味。memory `pull-exit-2-is-idle-usage-errors-must-be-1`):
@@ -1366,7 +1369,9 @@ PR を revert し、`scripts/sync-main-checkout.sh` で主 checkout を ff す�
   (E3 の PR は #272 の commit を含む。#272 を後に merge すると、E3 を revert したときに互換も一緒に消える)。もう 1 つの案 (rollback 手順に「残っている呼び出し元の切り替え」を含める) は採らなかった: 起動済みの全セッションと走っている bash を 1 つずつ止める手順は漏れる。
 - **E3 の間に verify-result fail で pending に戻った task**: revert 後の旧コードは pending の card を普通に pull できる (worker は null)。同じ試行 (VERIFICATION_REJECTED で terminal) の欄は残り、次の pull (旧コード) は欄を触らない →
   roll forward の後 `attempt_view` が §9.5 の (iv) → (v) として DETACHED / TERMINAL を card から読み分ける。Director がやることは無い。
-- **E3 の間に閉じた試行が増える**: 旧コードは試行を閉じない。revert 後に旧コードが done した task は `running` の試行が残る (E2 の間と同じ形)。`update --close-execution` が閉じる (§16.2 の 7)。
+- **E3 の間に閉じた試行が増える**: 旧コードは試行を閉じない。revert 後に旧コードが done した task は `running` の試行が残る (E2 の間と同じ形)。
+  **`update --close-execution` は E3 (#273) で足したので、revert すると消える** (t034 / Codex P3)。revert の間は閉じる手段が無く、
+  roll forward (#273 を戻して入れ直す) の**後**にだけ使える。revert の間は `running` の残りを数えるだけにして (`store-check`)、閉じるのは roll forward の後に回す。
 
 ### 16.5 族ごとの掃除 (直した型と同じ型を、同じデータ・同じ判定を扱うコードと文書について)
 
@@ -1458,9 +1463,54 @@ director.md の手順 (`update --status in_progress --reset` → done は今の�
 
 | 操作 | 再送と判定する根拠 | 違う内容の 2 回目 (verdict / notes / PR 番号) |
 |---|---|---|
-| done / fail / needs-director / verify-result pass | 試行の終了 record (`execution_end_code` + 名乗りの照合。Controller の `IDEMPOTENT`) | 試行が終わっているので名乗り付きは conflict (exit 3)・名乗りなしは遷移の拒否 (exit 2)。新しい記録にはならない |
+| done / fail / needs-director | 試行の終了 record (`execution_end_code` + 名乗りの照合。Controller の `IDEMPOTENT`) **+ 要求の中身が card と同じこと** (t034。§16.10) | 名乗り付きは conflict (exit 3・何も書かない)・名乗りなしは遷移の拒否 (exit 2)。新しい記録にはならない。**t033 の時点では中身を比べず exit 0 で飲んでいた (t034 で直した)** |
+| verify-result pass | 試行の終了 record (`execution_end_code` + 名乗りの照合。Controller の `IDEMPOTENT`) | 試行が終わっているので名乗り付きは conflict (exit 3)・名乗りなしは遷移の拒否 (exit 2)。新しい記録にはならない |
 | ready-for-verification / verifying | 無い (status が進んでいれば `INVALID_TRANSITION` exit 2) | 同上・何も書かない |
 | verify-result fail (上限手前) | 試行の終了 record + **同じ notes の Verification 項目** | notes が違えば exit 3 (飲まない) |
 | verify-result needs_human_review / 上限に達した fail | **同じ試行・verdict・notes の Verification 項目** (status / count は根拠にしない) | 新しい項目として記録される (status は needs_human_review のまま) |
 
   根拠が status・回数の推測の行は 0 件。赤の実証: 修正前の plan.sh で新テスト 4 件が FAILED・修正後は緑 (`tests/test_execution_e3_resend_idempotent.py`)。
+
+### 16.10 Codex 4 巡目 (t034 / PR #273 + #272): 同じ ID・**違う中身**の再送を exit 0 で飲まない
+
+- **P2-1 (#273)**: t032 / t033 が直したのは「**同じ**中身の再送が二重に書かない」と verify-result の notes だけだった。done / fail / needs-director の IDEMPOTENT 分岐は
+  中身を見ずに exit 0 を返していた。実測 (t015): `done t001 "first" --pr 5 --execution X` → `done t001 "CORRECTED" --pr 6 --execution X` が exit 0・card は最初のまま
+  (pr_number 5・Result も最初)。`needs-director "reason A"` → `"reason B"`、`fail --no-head x` → `fail --head <sha>` も同じ。E3 の前は 2 回目はすべて exit 2 だったので、
+  打ち直した Worker が気付けた。**E3 が「気付く手段」を黙って外していた**。
+- **修正**: IDEMPOTENT の分岐で**要求を card と比べる**。違えば **exit 3** (`EXECUTION_ALREADY_TERMINAL`・固定の文言 + **違う項目の名前だけ**・何も書かない・名乗られた値も card の中身も出さない)。
+  同じなら今までどおり exit 0。比べ方は書き込みと同じ正規化:
+
+  | コマンド | 比べるもの (要求 ↔ card) | 正規化 |
+  |---|---|---|
+  | done | `--pr` ↔ `pr_number` / `--no-pr` ↔ `no_pr_waiver` (かつ `pr_number` が空) / Result 本文 ↔ `## Result` | 理由の空白を畳む・Result は前後の空白を除く。**`--pr` も `--no-pr` も無い再送は PR について何も主張しない** (最初の done が付けずに通った・`update --pr-number` で入れた番号を持つ card がある) |
+  | fail | `--head` ↔ `fail_head` / `--no-head` ↔ `fail_head_waiver` / handoff ↔ `handoff_path` | head は完全 SHA に解決 (略称の再送は同じ)・理由の空白を畳む・handoff は normpath。**handoff を付けない再送は「handoff なし」の主張** (card に残っていれば違う中身)。`--head` と `--no-head` の両方・どちらも無い再送は最初の fail が通った形ではないので違う中身 |
+  | needs-director | reason ↔ `needs_director_reason` (要約) + 長い理由は本文の `## Needs-Director 詳細` | 200 字超は要約と全文の両方を比べる (末尾だけ違う再送も違う中身) |
+  | verify-result pass | 同じ試行・同じ verdict・同じ notes の `## Verification` 項目 (t033 と同じ根拠) | 上の fail と同じ。**pass は t033 で漏れていた** (notes が違う再送が exit 0 で飲まれた。この巡で直した) |
+
+- **「違う内容の 2 回目」の列 (t032 / t033 の「同じ内容の再送」の表を全コマンドに広げた。実装から導いて、実測した結果)**:
+
+  | コマンド | 同じ中身の 2 回目 | 違う中身の 2 回目 | 根拠 |
+  |---|---|---|---|
+  | pull (予約の再開) | 再開 (新しい試行を作らない・exit 0) | 中身を持つ引数が無い (識別は agent と task)。別の agent は `TASK_ALREADY_RESERVED` (exit 1) | §6 / E2 |
+  | done | exit 0・何も書かない | **conflict (exit 3)**: `--pr` / `--no-pr` / Result のどれか | `_done_resend_differences` |
+  | fail | exit 0・何も書かない | **conflict (exit 3)**: head / no-head / handoff のどれか | `_fail_resend_differences` |
+  | needs-director | exit 0・何も書かない | **conflict (exit 3)**: reason | `transition_to_needs_director` の戻りと card を比べる |
+  | ready-for-verification | status が進んでいるので exit 2 (`INVALID_TRANSITION`)・何も書かない | 同じ (引数は `--execution` だけで、中身の違いは無い) | `ACCEPTS_FROM` |
+  | verifying | 同上 (exit 2) | 同じ (違う `--verifier` も exit 2・何も書かない) | `ACCEPTS_FROM` |
+  | verify-result pass | exit 0・何も書かない | **conflict (exit 3)**: notes | 同じ notes の Verification 項目 |
+  | verify-result fail (上限手前) | exit 0・何も書かない | **conflict (exit 3)**: notes | t033 |
+  | verify-result needs_human_review / 上限に達した fail | exit 0・何も書かない | 新しい項目として記録される (status は needs_human_review のまま) | t033 (人間の判断待ちに追記する運用) |
+  | update --close-execution | 閉じた後は何もしない (exit 0) | 中身を持つ引数が無い (`--mission` だけ) | §16.2 の 7 |
+  | update --reset | (E3 では Controller を通らない) | — | E4 |
+
+  **exit 0 で中身を捨てる行は 0 件** (「新しい項目として記録される」行は捨てずに残す)。赤の実証: 修正前の plan.sh で `tests/test_execution_e3_resend_differs.py` の
+  conflict を期待する行が FAILED (done / fail / needs-director の 3 例を含む)・修正後は緑。同じ中身の再送は両方で exit 0。
+  逆を固定していた `test_a_resend_of_done_does_not_redo_the_derived_writes_or_the_mission_done` (`--pr 99` の 2 回目が exit 0) は、同じ中身は成功・違う中身は conflict に直した。
+- **P2-2 (#272)**: `tests/test_plan_sh_execution_flag_rollback.py` の `_compat_sha()` は `git log --all --grep=e3-execution-flag-compat -n 1` (いちばん新しい一致)
+  を使っていた。#273 の **squash commit の本文**に互換 commit の件名が写る (`* e3-execution-flag-compat: ...`) ので、merge 後は squash commit が先に当たり、E3 の plan.sh を
+  「戻し先」として取り出して 3 件赤になる (CI は浅い clone で skip されるので CI では気付けない)。**候補の commit から `scripts/plan.sh` に `def _execution_caller` を含むものを除く**。
+  赤の実証: #273 の squash の形 (互換 commit の上に E3 の tree + 互換の件名を本文に持つ commit) を積んだ隔離 clone で、修正前 3 failed・修正後 3 passed。
+  (memory `contrast-test-dies-when-its-subject-merges` と同じ型: 履歴の「いちばん新しい一致」は自分の subject が merge されると別の物を掴む)
+- **P3**: §16.4 の `update --close-execution` は #273 で足したので revert すると消える (roll forward の後にしか使えない) と訂正した。`kai-review.sh` は pull の出力から
+  `execution_id` を読めず名乗りなしへ切り替えるとき、stderr に 1 行 (`execution_id を読めませんでした`) 残す (E5 の観察で数える。
+  `tests/test_kai_review_warns_when_it_cannot_name_the_attempt.py`。警告を外すと 4 件 FAILED)。

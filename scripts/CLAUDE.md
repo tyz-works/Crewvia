@@ -105,7 +105,8 @@ lib ごとの**破ってはいけない契約**の要約。理由・経緯・全
   `CREWVIA_EXECUTION_ID`。`_execution_caller` がロックの前に決める）を Controller が card の今の試行と照合する。違えば exit 3（`EXECUTION_NOT_CURRENT` / `NOT_FOUND` /
   `ALREADY_TERMINAL`）・遷移の拒否は exit 2（表は `lib_task_status.ACCEPTS_FROM` の 1 か所。done は in_progress だけ・fail は in_progress / needs_director・verify-result は検証待ちだけ）・
   いずれも何も書かず、stderr の**最後の行**は `[plan.sh] error_code=<CODE>`。**空の `--execution ""` / 空の env は exit 1**（名乗りなしに倒さない）。名乗りなしは E3 では通す（E5 で拒否）。
-  ID を名乗った同じ操作の再送は成功（exit 0・何も書かない）。**done / fail は Controller の `dry_run=True` で検査してから**派生値（pr_number の伝播）・証拠の検証に進む。
+  ID を名乗った同じ操作の再送は、**中身（done の `--pr` / `--no-pr` / Result・fail の head / handoff・needs-director の reason）が card と同じときだけ**成功（exit 0・何も書かない）。
+  違えば exit 3・何も書かない・値は出さない（`_resend_conflict`。`knowledge/execution.md` §16.10。IDEMPOTENT の分岐を足したら比較も足す）。**done / fail は Controller の `dry_run=True` で検査してから**派生値（pr_number の伝播）・証拠の検証に進む。
   `verify-result fail`（< max）は試行を `VERIFICATION_REJECTED` で終え task を pending に戻す（次の pull が新しい試行）。
 - **plan.sh から Controller を呼ぶときは `_load_task_for_report` を通す**: 読めない card・語彙に無い status は今までどおり exit 2（Controller は `STATE_INVALID` exit 1 にするので、plan.sh の寛容な読み口で今の答えを保つ）。
   `_controller_die(command, e)` が `ControllerError` を終わり方に写す（固定コード + 識別子だけ）。枠の撤去は Controller が **card の worker の枠**を外し、`_retire_caller_slot` が `AGENT_NAME` の枠の後始末を残す

@@ -3265,6 +3265,68 @@ def _controller_die(command, e):
     die(f"{prefix}{e.message}\n{_error_code_line(e.code)}", _EXEC.EXIT_CODES[e.code])
 
 
+def _resend_conflict(command, slug, task_id, fields):
+    """同じ ID の再送だが**中身が記録と違う**ときの終わり方 (exit 3・何も書かない。execution.md §4.4 / §16.10)。
+
+    Controller の IDEMPOTENT は「同じ試行が同じ操作で終わっている」ことしか言わない。done の `--pr` / Result・fail の head /
+    handoff・needs-director の reason が違うまま exit 0 を返すと、打ち直した Worker は直ったと読むが card は最初のまま
+    (E3 の前は 2 回目はすべて exit 2 だった)。文言は固定で、出すのは項目名だけ (名乗られた値・card の中身は出さない)。
+    コードは「その試行は既に終わっていて、別の中身への変更」の `EXECUTION_ALREADY_TERMINAL` (verify-result の conflict と同じ)。
+    """
+    code = _EXEC.EXECUTION_ALREADY_TERMINAL
+    die(f"[plan.sh {command}] {slug}/{task_id}: 同じ試行の {command} は既に記録済みで、今回の指定は記録と違います"
+        f" (違う項目: {', '.join(fields)})。同じ ID の再送は同じ中身だけ受け付けます。何も書いていません。\n"
+        f"{_error_code_line(code)}", _EXEC.EXIT_CODES[code])
+
+
+def _result_section_matches(body, result):
+    """card の `## Result` が `result` と同じか (done の再送の比較)。
+
+    done は `build_task_body(desc, result)` の後ろに、needs-director の `## Needs-Director 詳細` のような**末尾の節**を残す
+    (`append_trailing_body_section`)。`parse_task_body` はそれも Result の一部として返すので、`result` の後ろが空か、
+    `## ` で始まる節のときだけ同じとみなす (前方一致だけだと、記録より短い Result の再送が通る)。
+    """
+    stored = parse_task_body(body)[1]
+    wanted = result.strip()
+    if not stored.startswith(wanted):
+        return False
+    rest = stored[len(wanted):]
+    return rest == '' or (rest.startswith('\n') and rest.lstrip().startswith('## '))
+
+
+def _done_resend_differences(meta, body, result, pr_number, no_pr_reason):
+    """`done` の再送の要求と card の違う項目 (空なら同じ中身)。`--pr` も `--no-pr` も無い再送は PR について何も主張しない
+    (最初の done も付けずに通った・Director が `update --pr-number` で入れた番号を持つ card がありうる)。"""
+    diffs = []
+    if pr_number is not None and meta.get('pr_number') != pr_number:
+        diffs.append('--pr')
+    if no_pr_reason is not None and (meta.get('no_pr_waiver') != no_pr_reason
+                                     or meta.get('pr_number') not in (None, '')):
+        diffs.append('--no-pr')
+    if not _result_section_matches(body, result):
+        diffs.append('Result')
+    return diffs
+
+
+def _fail_resend_differences(meta, head, no_head, handoff_path):
+    """`fail` の再送の要求と card の違う項目。比べ方は書き込み (`_validate_fail_evidence`) と同じ正規化
+    (理由の空白の畳み方・head の完全 SHA 化・handoff の normpath)。handoff を付けなかった再送は「handoff なし」の主張。"""
+    diffs = []
+    if (head is None) == (no_head is None):
+        diffs.append('--head/--no-head')      # 最初の fail が通った形ではない (両方・どちらも無い)
+    elif no_head is not None:
+        if meta.get('fail_head_waiver') != ' '.join(str(no_head).split()) or meta.get('fail_head'):
+            diffs.append('--no-head')
+    else:
+        full, _why = _resolve_head_commit(head)
+        if full is None or meta.get('fail_head') != full:
+            diffs.append('--head')
+    recorded = os.path.normpath(handoff_path) if handoff_path else None
+    if (meta.get('handoff_path') or None) != recorded:
+        diffs.append('handoff_path')
+    return diffs
+
+
 def _load_task_for_report(command, slug, task_id):
     """報告コマンド (done / fail / needs-director / ready-for-verification / verifying / verify-result) が card を読む入口。
 
@@ -4335,6 +4397,10 @@ def cmd_needs_director(args):
         except _EXEC.ControllerError as e:
             _controller_die('needs-director', e)
         if idempotent:
+            # 理由が card と違う再送は成功にしない (exit 3・何も書かない。§16.10)。長い理由は先頭だけが frontmatter に入り、
+            # 全文は本文の節にあるので、frontmatter の要約と全文の両方を比べる。
+            if meta.get('needs_director_reason') != summary or (full_text is not None and full_text.strip() not in body):
+                _resend_conflict('needs-director', slug, task_id, ['reason'])
             print(f"[plan.sh] Task {task_id} → needs_director — already recorded (idempotent)")
             return
         _retire_caller_slot(slug, task_id)         # card の worker の枠は Controller が外した。AGENT_NAME の枠の後始末
@@ -4635,6 +4701,10 @@ def cmd_done(args):
                 )
             _controller_die('done', e)
         if decision == _CONTROLLER.IDEMPOTENT:
+            # 同じ ID の再送でも、--pr / --no-pr / Result が card と違えば成功にしない (exit 3・何も書かない。§16.10)
+            diffs = _done_resend_differences(meta, body, result, pr_number, no_pr_reason)
+            if diffs:
+                _resend_conflict('done', slug, task_id, diffs)
             print(f"Done: {slug}/{task_id} — already completed (idempotent)")
             return
 
@@ -4902,6 +4972,10 @@ def cmd_fail(args):
         except _EXEC.ControllerError as e:
             _controller_die('fail', e)
         if decision == _CONTROLLER.IDEMPOTENT:
+            # 証拠 (head / no-head / handoff) が card と違う再送は成功にしない (exit 3・何も書かない。§16.10)
+            diffs = _fail_resend_differences(meta, opts.get('--head'), opts.get('--no-head'), handoff_path)
+            if diffs:
+                _resend_conflict('fail', slug, task_id, diffs)
             print(f"Failed: {slug}/{task_id} — already failed (idempotent)")
             return
 
@@ -5430,7 +5504,10 @@ def cmd_verify_result(args):
         try:
             probe = _CONTROLLER.fail_execution(_txn(), slug, task_id, caller, _EXEC.VERIFICATION_REJECTED,
                                                to_status='pending', dry_run=True) if verdict == 'fail' else None
-            if probe is None and verdict != 'pass' and meta.get('status') == 'needs_human_review':
+            # pass も同じ確認を先に行う (t034): 下の `complete_execution` の冪等 (`result_exec.idempotent`) は notes を見ずに
+            # exit 0 を返すので、notes が違う pass の再送が飲まれていた。needs_human_review の verdict は上限後の追記を
+            # 新しい項目として残す運用なので、status が needs_human_review のときだけ同じ probe を使う (t033)。
+            if probe is None and (verdict == 'pass' or meta.get('status') == 'needs_human_review'):
                 probe = _CONTROLLER.complete_execution(_txn(), slug, task_id, caller, to_status='verified', dry_run=True)
         except _EXEC.ControllerError as e:
             _controller_die('verify-result', e)
@@ -5441,11 +5518,10 @@ def cmd_verify_result(args):
         if probe == _CONTROLLER.IDEMPOTENT:
             # 試行が既にこの verdict で終わっている。notes が違う 2 回目は黙って飲まず conflict (exit 3)
             if not recorded:
-                die(f"verify-result: {slug}/{task_id} は既に verdict={verdict} で記録済みです "
-                    f"(notes が違う 2 回目は受け付けません。追記は Director が update で)", code=3)
+                _resend_conflict('verify-result', slug, task_id, ['notes'])     # 追記は Director が update で
             print(f"verify-result: {slug}/{task_id} (verdict={verdict}) — already recorded (idempotent)")
             return
-        if meta.get('status') == 'needs_human_review' and probe is not None and recorded:
+        if verdict != 'pass' and meta.get('status') == 'needs_human_review' and probe is not None and recorded:
             print(f"verify-result: {slug}/{task_id} (verdict={verdict}) — already recorded (idempotent)")
             return
         rework_updates = {}

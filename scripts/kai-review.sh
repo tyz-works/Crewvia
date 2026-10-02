@@ -251,6 +251,10 @@ except Exception:
 print(v if isinstance(v, str) else "")' 2>/dev/null || true)"
   if [[ -n "$PULL_EXECUTION_ID" ]]; then
     EXEC_ARGS=(--execution "$PULL_EXECUTION_ID")
+  else
+    # 名乗りなしへ切り替わる。E3 は名乗りなしを拒否しないので動作は変わらないが、E5 の観察で「名乗れなかった実行」を
+    # 数えられるよう 1 行残す (固定の文言。pull の JSON の中身は出さない。execution.md §16.9)。
+    _warn "plan.sh pull の出力から execution_id を読めませんでした — done / needs-director を名乗りなしで報告します (task ${TASK_ID})"
   fi
 elif [[ $DRY_RUN -eq 1 ]]; then
   _info "DRY_RUN=1: skipping plan.sh pull (no writes to plan.sh in dry-run mode)"

@@ -197,12 +197,19 @@ def test_a_different_result_for_a_terminal_execution_is_a_conflict(box, first, s
 
 
 def test_a_resend_of_done_does_not_redo_the_derived_writes_or_the_mission_done(box):
-    """done の再送は D1〜D5 (pr_number の伝播・mission の done) を走らせない。`--pr` が違っても何も書かない。"""
+    """done の再送は D1〜D5 (pr_number の伝播・mission の done) を走らせない。同じ中身は成功、`--pr` / Result が違えば conflict (exit 3)。
+
+    違う中身を exit 0 で飲んでいた形 (`--pr 99` の再送が成功) は t034 で直した (knowledge/execution.md §16.10)。どちらも何も書かない。
+    """
     xid = take(box)
     assert run(box, *report_argv("done"), "--execution", xid).returncode == 0
     before = box.snapshot()
-    again = run(box, "done", "t001", "r2", "--pr", "99", "--mission", MISSION, "--execution", xid)
-    assert again.returncode == 0 and box.snapshot() == before
+    same = run(box, *report_argv("done"), "--execution", xid)
+    assert same.returncode == 0 and "idempotent" in same.stdout and box.snapshot() == before
+    for argv in (("done", "t001", "r", "--pr", "99"), ("done", "t001", "r2")):
+        again = run(box, *argv, "--mission", MISSION, "--execution", xid)
+        assert again.returncode == 3 and last_error_code(again.stderr) == "EXECUTION_ALREADY_TERMINAL"
+        assert box.snapshot() == before
     assert "pr_number" not in box.card()
 
 

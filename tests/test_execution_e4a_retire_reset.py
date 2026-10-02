@@ -503,6 +503,16 @@ def _alive(pid):
     return stat[stat.rindex(")") + 2] != "Z"
 
 
+def _sigkill_and_wait(pid, tries=200):
+    """SIGKILL の直後はカーネルがまだ pid を片付けていない窓がある。消えるまで待ってから先へ進む。"""
+    os.kill(pid, signal.SIGKILL)
+    for _ in range(tries):
+        if not _alive(pid):
+            return
+        time.sleep(0.05)
+    raise AssertionError(f"pid {pid} が SIGKILL 後も消えない")
+
+
 class Rig:
     """実 `RetirementExecutor` + 実 plan.sh (隔離コピー) + FakeMux + `sleep` の Worker 役。"""
 
@@ -598,7 +608,7 @@ def test_the_progress_file_carries_the_execution_forward_after_the_request_is_go
     prog = json.loads(rt.progress_path(rig.registry, AGENT).read_text())
     assert prog.get("task_execution_id") == xid
     rt.request_path(rig.registry, AGENT).unlink()                    # request が先に消えても progress が証拠を持つ
-    os.kill(rig.pane_pid, signal.SIGKILL)
+    _sigkill_and_wait(rig.pane_pid)
     assert rig.drive(), rig.logs
     assert state(rig.box)[3:] == ("failed", "RETIRED")
     (argv, _env), = _retire_calls(rig)
@@ -643,11 +653,7 @@ def test_a_successor_with_the_same_name_is_not_retired_after_the_worker_died(rig
     gen_x = box.card()["started_at"]
     assert rig.request()
     rig.ex.process_all()
-    os.kill(rig.pane_pid, signal.SIGKILL)
-    for _ in range(100):
-        if not _alive(rig.pane_pid):
-            break
-        time.sleep(0.05)
+    _sigkill_and_wait(rig.pane_pid)
     rig.ex.process_all()                                             # → terminated (後始末だけが残る)
     become_successor(box, started_at=gen_x if same_generation else None)
     before = _without_records(box.snapshot())
@@ -680,11 +686,7 @@ def test_a_resend_of_the_cleanup_after_the_card_was_written_still_settles_the_ma
     xid = take(box)
     assert rig.request()
     rig.ex.process_all()
-    os.kill(rig.pane_pid, signal.SIGKILL)
-    for _ in range(100):
-        if not _alive(rig.pane_pid):
-            break
-        time.sleep(0.05)
+    _sigkill_and_wait(rig.pane_pid)
     first = {"n": 0}
     real = rig._run
 

@@ -24,13 +24,34 @@ COMPAT_MARKER = "e3-execution-flag-compat"
 FAKE_ID = "ex-" + "0" * 32          # 旧コードは読み捨てる。形が正しければ何でもよい
 
 
+#: E3 本体の plan.sh だけが持つ関数。互換 commit (戻し先) の plan.sh には無い。
+E3_CALLER_MARKER = "def _execution_caller"
+
+
+def _plan_sh_at(sha):
+    p = subprocess.run(["git", "-C", str(h.REPO_ROOT), "show", f"{sha}:scripts/plan.sh"],
+                       capture_output=True, text=True)
+    return p.stdout if p.returncode == 0 else None
+
+
 def _compat_sha():
-    p = subprocess.run(["git", "-C", str(h.REPO_ROOT), "log", "--all", "--format=%H", "-n", "1",
+    """互換 commit (戻し先の plan.sh) の SHA。
+
+    `--grep` の「いちばん新しい一致」は使わない: E3 の PR を squash merge すると、その commit の**本文**に互換 commit の
+    件名が写り (`* e3-execution-flag-compat: ...`)、本文に印を持つ E3 の squash commit が先に当たって、E3 の plan.sh を
+    「戻し先」として取り出してしまう (merge 後にローカルで赤くなり、浅い clone の CI では skip されて気付けない)。
+    一致した commit のうち、plan.sh が E3 本体の印 (`_execution_caller`) を持つものを除く。
+    """
+    p = subprocess.run(["git", "-C", str(h.REPO_ROOT), "log", "--all", "--format=%H",
                         f"--grep={COMPAT_MARKER}"], capture_output=True, text=True)
-    sha = p.stdout.strip()
-    if p.returncode != 0 or not sha:
+    candidates = p.stdout.split() if p.returncode == 0 else []
+    if not candidates:
         pytest.skip(f"{COMPAT_MARKER} の commit が git の履歴に無い (浅い clone)")
-    return sha
+    for sha in candidates:
+        text = _plan_sh_at(sha)
+        if text is not None and E3_CALLER_MARKER not in text:
+            return sha
+    pytest.skip(f"{COMPAT_MARKER} に一致する commit に、戻し先の plan.sh (E3 より前) が無い")
 
 
 def _install_compat_plan(box, tmp_path):

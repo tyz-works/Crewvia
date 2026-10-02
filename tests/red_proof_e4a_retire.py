@@ -48,15 +48,19 @@ TEST = "tests/test_execution_e4a_retire_reset.py"
 
 MUTATIONS = [
     ("R01", "照合を世代に戻す (--execution を無視して card の今の世代で照合 = 新しい試行を退役させる)", PLAN,
-     "matched, _check = _EXEC.execution_matches(view, meta, execution_id=execution_id, started_at=generation)\n",
-     "matched, _check = _EXEC.execution_matches(view, meta, execution_id=None,\n"
-     "                                                  started_at=generation if generation is not None\n"
-     "                                                  else str(meta.get('started_at')))\n",
+     "        meta, body = load_task(slug, task_id)\n\n        # ── 前提の確認。ここから下で 1 バイトでも書く前に、全部通す。",
+     "        meta, body = load_task(slug, task_id)\n"
+     "        nonlocal execution_id, generation\n"
+     "        execution_id, generation = None, str(meta.get('started_at'))\n\n"
+     "        # ── 前提の確認。ここから下で 1 バイトでも書く前に、全部通す。",
      ["test_the_execution_id_decides_even_when_the_generation_is_identical",
       "test_a_stale_attempt_cannot_retire_its_successor"], TEST),
-    ("R02", "照合を外す (試行が違っても通す)", PLAN,
-     "        if matched != _EXEC.MATCH:\n            if execution_id is not None:",
-     "        if False:\n            if execution_id is not None:",
+    ("R02", "照合を外す (名乗りが何であれ card の今の試行として通す)", PLAN,
+     "        meta, body = load_task(slug, task_id)\n\n        # ── 前提の確認。ここから下で 1 バイトでも書く前に、全部通す。",
+     "        meta, body = load_task(slug, task_id)\n"
+     "        nonlocal execution_id, generation\n"
+     "        execution_id, generation = meta.get('current_execution_id'), None\n\n"
+     "        # ── 前提の確認。ここから下で 1 バイトでも書く前に、全部通す。",
      ["test_a_wrong_execution_is_refused_with_exit_3_and_nothing_is_written",
       "test_a_stale_attempt_cannot_retire_its_successor",
       "test_the_execution_id_decides_even_when_the_generation_is_identical"], TEST),

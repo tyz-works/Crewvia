@@ -578,7 +578,7 @@ def test_the_marker_and_the_cleanup_are_bound_to_the_execution(rig):
     box = rig.box
     xid = take(box)
     assert rig.request()
-    assert rig.marker()["task_execution_id"] == xid
+    assert rig.marker().get("task_execution_id") == xid
     assert rig.drive(), rig.logs
     assert state(box) == ("pending", None, None, "failed", "RETIRED")
     assert box.slot(AGENT) is None
@@ -596,7 +596,7 @@ def test_the_progress_file_carries_the_execution_forward_after_the_request_is_go
     assert rig.request()
     rig.ex.process_all()                                             # → notified (progress を書く)
     prog = json.loads(rt.progress_path(rig.registry, AGENT).read_text())
-    assert prog["task_execution_id"] == xid
+    assert prog.get("task_execution_id") == xid
     rt.request_path(rig.registry, AGENT).unlink()                    # request が先に消えても progress が証拠を持つ
     os.kill(rig.pane_pid, signal.SIGKILL)
     assert rig.drive(), rig.logs

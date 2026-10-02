@@ -1514,3 +1514,34 @@ director.md の手順 (`update --status in_progress --reset` → done は今の�
 - **P3**: §16.4 の `update --close-execution` は #273 で足したので revert すると消える (roll forward の後にしか使えない) と訂正した。`kai-review.sh` は pull の出力から
   `execution_id` を読めず名乗りなしへ切り替えるとき、stderr に 1 行 (`execution_id を読めませんでした`) 残す (E5 の観察で数える。
   `tests/test_kai_review_warns_when_it_cannot_name_the_attempt.py`。警告を外すと 4 件 FAILED)。
+
+## 17. E4a の実績 (t016): 退役が試行の ID で照合され、`update --reset` / retire が試行を閉じる
+
+### 17.1 何が変わったか (producer の切り替え。世代の照合は残す)
+
+- **退役 marker / progress に `task_execution_id` を書く** (`lib_retirement.read_task_execution_id`。card の今の試行が ACTIVE のときだけ ID を束縛する。
+  DETACHED / TERMINAL / legacy は `None` = 世代だけで束縛。card が読めない・欄が壊れているときは `UNKNOWN_EXECUTION_ID` で ID を書かない)。`task_started_at` も今までどおり書く。
+- **`plan.sh retire` は `--execution <id>` か `--started-at <世代>` のどちらかが必須**。両方なら ID が優先。**空の明示指定 (`--execution ""` / `--started-at ""`) は exit 1** で
+  何も書かない (presence で見る。env や名乗りなしに倒さない)。名乗りの ID が今の試行でなければ exit 3 (名乗られた値はエラーに出さない)。
+  試行の欄が壊れた card は名乗りがあっても止める。同じ ID の再送 (retire で閉じた試行) は exit 0・何も書かない。
+- **試行の閉じ方**: retire は RESERVED を release、RUNNING を fail (終了コード `RETIRED`)。`update --status pending --reset` は RUNNING を `RESET_BY_DIRECTOR` で fail、
+  RESERVED を release、旧コードが残した DETACHED を abandoned で閉じる。legacy card は task だけ。同名の後任の枠 (identity の ID が違う) は消さない。
+- **assignment の照合** (`assignment_execution_verdict`): marker と identity の両方に ID があれば ID で比べる (世代が同じでも別の試行なら OTHER)。どちらかに無ければ今の世代。
+- **actor**: watchdog が retire を打つとき、dispatcher が reap を打つとき `AGENT_NAME` を `watchdog` / `dispatcher` に固定 (Director のシェルから継いだ名前を監査行に載せない)。
+- **Director の閉じ方** (`update --status in_progress --reset` → フラグなしの `done`) と `reap-orphan-assignment` は E4a の後も通る
+  (`test_the_cutover_review_task_closing_flow_*` / `test_the_directors_reap_of_an_orphan_slot_*`)。
+
+### 17.2 E4b に送るもの
+
+世代 (`started_at`) の照合と旧形式 marker (`task_execution_id` なし) の読み口を外すのは E4b (t025)。§7 の条件 (E4a が両デーモンで動いている・旧形式 marker = 0・legacy の進行中 = 0) が先。
+
+### 17.3 戻し方 (E4a)
+
+PR を revert し、`scripts/sync-main-checkout.sh` で主 checkout を ff する (watchdog・dispatcher が読むコードを変えるので restart が要る。同スクリプトの restart 判定に乗る)。
+marker / progress に残った `task_execution_id` は旧コードが読み捨てる (世代の欄は残してある)。E4a の間に閉じた試行の欄・record は残ってよい。
+revert 中に retire / reset された task の試行は閉じられない (E2 の間と同じ形。`running` の残りは roll forward の後に `update --close-execution` で閉じる)。
+
+### 17.4 検証
+
+`tests/test_execution_e4a_retire_reset.py` / `tests/test_execution_e4a_daemon_env.py`。赤の実証は `python3 tests/red_proof_e4a_retire.py` (12 変異。R01 照合を世代に戻す・
+R02 照合を外す・R03 空の `--execution` を指定なしに倒す ほか)。R01/R02 は classify の 2 枚目の層 (identity の ID) でも止まるので、変異は名乗りそのものを差し替える形にした。

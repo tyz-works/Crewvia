@@ -6428,6 +6428,27 @@ def cmd_update(args):
 
         changed = []
 
+        # ── 検証はすべて、何かを書く (--reset の Controller 呼び出し) より前に済ませる (t035 / PR #274 Codex P1)。
+        # Controller は即座に書く (巻き戻さない) ので、後ろで die すると、拒否されたコマンドが生きている Worker の枠を
+        # 奪い試行を閉じてしまう。ここから下で die してよい option は無い。
+        new_blocked = None
+        if opts.get('--blocked-by') is not None:
+            raw = opts['--blocked-by'].strip()
+            new_blocked = [s.strip() for s in raw.split(',') if s.strip()] if raw else []
+            _reject_dependency_cycle(slug, task_id, new_blocked)
+        pr_number_update = _UNSET = object()
+        if opts.get('--pr-number') is not None:
+            raw_pr = opts['--pr-number'].strip()
+            if raw_pr.lower() in ('null', 'none', ''):
+                pr_number_update = None
+            else:
+                try:
+                    pr_number_update = int(raw_pr)
+                except ValueError:
+                    die("--pr-number must be a positive integer (or 'null' to clear)")
+                if pr_number_update <= 0:
+                    die("--pr-number must be a positive integer (or 'null' to clear)")
+
         reset_by_controller = False
         if opts.get('--reset'):
             # Capture old worker BEFORE nulling it (needed to clean up assignment file)
@@ -6465,10 +6486,7 @@ def cmd_update(args):
             meta['skills'] = new_skills
             changed.append(f"skills={new_skills}")
 
-        if opts.get('--blocked-by') is not None:
-            raw = opts['--blocked-by'].strip()
-            new_blocked = [s.strip() for s in raw.split(',') if s.strip()] if raw else []
-            _reject_dependency_cycle(slug, task_id, new_blocked)
+        if new_blocked is not None:
             meta['blocked_by'] = new_blocked
             changed.append(f"blocked_by={new_blocked}")
             # 外れた依存の解除が残ると、同じ id を後で付け直したときに
@@ -6522,21 +6540,14 @@ def cmd_update(args):
             body = build_task_body(opts['--description'], result_text)
             changed.append('description=<updated>')
 
-        if opts.get('--pr-number') is not None:
-            raw_pr = opts['--pr-number'].strip()
-            if raw_pr.lower() in ('null', 'none', ''):
+        if pr_number_update is not _UNSET:
+            if pr_number_update is None:
                 if 'pr_number' in meta:
                     del meta['pr_number']
                 changed.append('pr_number=null')
             else:
-                try:
-                    n = int(raw_pr)
-                except ValueError:
-                    die("--pr-number must be a positive integer (or 'null' to clear)")
-                if n <= 0:
-                    die("--pr-number must be a positive integer (or 'null' to clear)")
-                meta['pr_number'] = n
-                changed.append(f"pr_number={n}")
+                meta['pr_number'] = pr_number_update
+                changed.append(f"pr_number={pr_number_update}")
 
         if deliverable is not None:
             meta['deliverable'] = deliverable

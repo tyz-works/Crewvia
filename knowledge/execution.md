@@ -277,7 +277,7 @@ record・identity・枠の本文・退役 marker・監査ログ・呼び出し�
 | 4 | lib_state_store.py:1082-1104 `Txn.classify_assignment` | identity の `started_at` と世代を比べ MINE / SUCCESSOR | R | E1: 引数 `execution_id` を足す (§2.2 の規則)。E4 で世代の比較を外す |
 | 5 | lib_state_store.py:1359-1422 `_r1` (**R-1**) | card の `started_at` で identity を作り直す / 一致を確かめる (`generation_mismatch`) | R/W | E1: card に `current_execution_id` があれば identity にも入れ、照合も ID で。legacy の card は今のまま |
 | 6 | lib_state_store.py:1312-1356 `_r2` (**R-2**) / :624-632 `is_orphan_target` | 世代を見ない (`retire_assignment(..., None)`) | — | 変えない (撤去するのは card が手放した枠だけ。世代が要らない) |
-| 7 | plan.sh:3204-3241 `_pull_worktree_failed` (**G1 の CAS** :3226-3228) | status・worker・`started_at` がこの pull の予約のままか | R | E2: `current_execution_id == X` かつ `execution_status == reserved` の CAS に置き換え (git-policy.md §16.4 の 5) |
+| 7 | plan.sh:3204-3241 `_pull_worktree_failed` (**G1 の CAS** :3226-3228) | status・worker・`started_at` がこの pull の予約のままか | R | E2: **置き換えではなく AND**。`current_execution_id == X` ∧ `execution_status == reserved` の**上に**、今までの項 (in_progress・worker 一致・`started_at` 一致) を残す (`_pull_cas_ok`。§15.2 の 2・§18.3。Codex 3 巡目 P1)。移行中は旧形式の書き手 (rollback 中の旧コード・Director の手編集) が status / worker / started_at だけを動かし execution の欄を更新しないので、新しい欄だけでは解放済みの予約に `X / reserved` が残ったまま CAS が通る |
 | 8 | plan.sh:6182-6338 `cmd_retire` (必須の `--started-at` :6243-6256、照合 :6299-6305、classify :6310) | worker・`started_at`・枠の世代 | R | E4: `--execution <id>` を足す。移行期は両方を受け付ける (§2.2) |
 | 9 | lib_retirement.py:1025-1066 `_write_request` / :766-799 `build_request` / :808-828 `_carried_from_request` | 退役 marker に `task_started_at` を写す | R card → W marker | **E4a**: marker と progress に `task_execution_id` を足す (card の `current_execution_id` を同じロックの中で読む)。`task_started_at` は残す。E4b より先に入れる (§7) |
 | 10 | lib_retirement.py:550-592 `read_task_started_at` | card の `started_at` 行を読む | R | E4: `read_task_execution_id` を足す (同じ読み口) |
@@ -288,6 +288,8 @@ record・identity・枠の本文・退役 marker・監査ログ・呼び出し�
 | 15 | plan.sh:5945-5953 `update --reset` / :6315-6321 retire reset | `started_at` を null にする | W | E4: 試行を release / fail に (§4)。`started_at` の null は今どおり。`current_execution_id` は残す |
 | 16 | plan.sh:3014-3033 `_env_mission_for_task` | `CREWVIA_MISSION_SLUG` + `AGENT_NAME == worker` + status (mission の曖昧さの解決だけ) | R | E3: `CREWVIA_EXECUTION_ID` が card の `current_execution_id` と一致すれば、それを証拠に使う (agent 名の一致より強い)。無ければ今のまま |
 | 17 | agents/director.md:1138-1143 / :1485-1497 / :1511 | Director が `sed` で card の `started_at` を読み `retire --started-at` を打つ | 文書 | E4: `--execution` を `plan.sh status` の表示から渡す形に |
+| 18 | agents/director.md の Rule 5 の通知の対応表 (`[Rule 5] Worker {name} が blocked / idle-with-task です` の行の `(3) 回復不能なら kill + plan.sh retire`) と「kill した Worker の後始末は `plan.sh retire`」の節 | Rule 5 で Director が打つ `retire` の名指し (旧: `--started-at`) | 文書 | E4: 上の #17 と同じ形 (`--execution <plan.sh status の ex-…>`)。ID の無い旧形式の card は retire では手放せず `update --status pending --reset` (E4b) |
+| 19 | scripts/plan.sh の冒頭の使い方 (`retire` の行 :56-62・`done` / `fail` の `--execution` の行 :29-32 ・:45) と `--help` の文言・:6731 / :4866 / :6981 のコメント | `--started-at` / 世代の名指しの説明 | 文書 | E3: `--execution` の行を足す (戻し先の互換のため読み捨てる注記つき)。E4b: `retire` の `--started-at` を外した旨に書き直す。**コメントの残り (`exit 1` と書いたが実際は使い方の誤りで exit 2・`generation=None` のまま) は §19.2 の backlog** |
 
 `execution_id` が今コードに現れるのは #14 の 1 か所 (null 固定) だけ (`grep -rn execution_id scripts/ hooks/ | grep -v test_` = 1 件)。
 
@@ -624,7 +626,8 @@ ID の出どころは **`--execution <id>` (明示) > env `CREWVIA_EXECUTION_ID`
 準備ロック: queue/missions/<slug>/executions/<tid>.prepare.lock を LOCK_EX|LOCK_NB で取る (§6.1)。取れなければ exit 1・何も書かない
           取れたら card を読み直し (ロックなしの読み)、X が reserved でなければ exit 1・何も書かない
 ロック外: Taskvia → worktree (W0〜W7) → git rev-parse HEAD → .crewvia-env (X を含む)          [準備ロックを持ったまま]
-ロック 2: recover → start (CAS: current_execution_id == X かつ execution_status == reserved → running、record)
+ロック 2: recover → start (CAS: `_pull_cas_ok` = in_progress ∧ worker 一致 ∧ started_at 一致 ∧ current_execution_id == X ∧ execution_status == reserved
+          → running、record。新しい欄だけの CAS ではない。理由は §2.1 #7・§15.2 の 2)
           失敗 (worktree / env): CAS が同じなら fail_execution(X, WORKSPACE_CREATE_FAILED) + needs_director (G1 の出口)
           CAS が外れたら何も書かず exit 1 (JSON を出さない)                                     [準備ロックを持ったまま]
 準備ロックを外す
@@ -648,7 +651,7 @@ stdout:   JSON (execution_id / attempt を含む)
     枠を作らない)。
 - 再開は**新しい試行を作らない** (attempt を増やさない)。ロック外の段 (Taskvia・worktree W2・`.crewvia-env` の書き直し) を最初から
   やり直し、start を打つ。Taskvia の再送は今の再 pull と同じ (冪等ではないが壊さない)。
-- **G1 (needs_director の出口) との関係**: G1 の CAS (#7) を ID の CAS に置き換える (git-policy.md §16.4 の 5)。worktree を作れない
+- **G1 (needs_director の出口) との関係**: G1 の CAS (#7) に ID の項を足す (git-policy.md §16.4 の 5。**今までの項は外さない** — AND。§15.2 の 2・§18.3)。worktree を作れない
   ときは reserved → failed で、再開はされない (needs_director は pull の候補にならない: git-policy.md §1.2 の B)。
   「pending に戻すと同じ Worker に配り直され続ける」(git-policy.md §1.2 の A を捨てた理由) は、reserved の再開でも起きない:
   再開は「同じ Worker が自分で打った再 pull」だけで、dispatcher は in_progress を配らない。
@@ -811,7 +814,8 @@ start の CAS は「試行がまだ reserved か」しか言えず、「他の p
 
 1. **E5 を足す (提案)**: 「名乗りなしの done / fail / needs-director / verify-result を拒否する」(§5.2)。t020 の本番確認の後。
    条件は監査ログの `caller_check=unverified` が crewvia 本体の task で 0 件、target_dir の task の ID の受け渡しが worker.md に
-   入っていること。これが入るまで AC-04 は部分的 (§10)。E3 に入れない理由は §5.2 (env を必須にしない・cutover の瞬間に
+   入っていること。これが入るまで AC-04 は部分的 (§10)。**【決定 (Director 判断) E5 は 01c に入れず後続に送った**。条件はこの項のとおり
+   (監査の `caller_check=unverified` が 0 件・target_dir の task の ID の受け渡し・生きているセッションが ID を渡す版の後に起動。§9.4 の E5 行)。実績は §19.3】E3 に入れない理由は §5.2 (env を必須にしない・cutover の瞬間に
    動いている Worker の done を止めない)。
 2. **E2 の中で pull の start (2 つ目のロック) を必ず先に書く**: 冪等化 (N8) と G1 の CAS の置き換えは start の上に乗る。
    start を後回しにすると、E2 の途中の commit で G1 の CAS が ID を見られない。

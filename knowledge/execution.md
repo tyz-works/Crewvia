@@ -277,7 +277,7 @@ record・identity・枠の本文・退役 marker・監査ログ・呼び出し�
 | 4 | lib_state_store.py:1082-1104 `Txn.classify_assignment` | identity の `started_at` と世代を比べ MINE / SUCCESSOR | R | E1: 引数 `execution_id` を足す (§2.2 の規則)。E4 で世代の比較を外す |
 | 5 | lib_state_store.py:1359-1422 `_r1` (**R-1**) | card の `started_at` で identity を作り直す / 一致を確かめる (`generation_mismatch`) | R/W | E1: card に `current_execution_id` があれば identity にも入れ、照合も ID で。legacy の card は今のまま |
 | 6 | lib_state_store.py:1312-1356 `_r2` (**R-2**) / :624-632 `is_orphan_target` | 世代を見ない (`retire_assignment(..., None)`) | — | 変えない (撤去するのは card が手放した枠だけ。世代が要らない) |
-| 7 | plan.sh:3204-3241 `_pull_worktree_failed` (**G1 の CAS** :3226-3228) | status・worker・`started_at` がこの pull の予約のままか | R | E2: `current_execution_id == X` かつ `execution_status == reserved` の CAS に置き換え (git-policy.md §16.4 の 5) |
+| 7 | plan.sh:3204-3241 `_pull_worktree_failed` (**G1 の CAS** :3226-3228) | status・worker・`started_at` がこの pull の予約のままか | R | E2: **置き換えではなく AND**。`current_execution_id == X` ∧ `execution_status == reserved` の**上に**、今までの項 (in_progress・worker 一致・`started_at` 一致) を残す (`_pull_cas_ok`。§15.2 の 2・§18.3。Codex 3 巡目 P1)。移行中は旧形式の書き手 (rollback 中の旧コード・Director の手編集) が status / worker / started_at だけを動かし execution の欄を更新しないので、新しい欄だけでは解放済みの予約に `X / reserved` が残ったまま CAS が通る |
 | 8 | plan.sh:6182-6338 `cmd_retire` (必須の `--started-at` :6243-6256、照合 :6299-6305、classify :6310) | worker・`started_at`・枠の世代 | R | E4: `--execution <id>` を足す。移行期は両方を受け付ける (§2.2) |
 | 9 | lib_retirement.py:1025-1066 `_write_request` / :766-799 `build_request` / :808-828 `_carried_from_request` | 退役 marker に `task_started_at` を写す | R card → W marker | **E4a**: marker と progress に `task_execution_id` を足す (card の `current_execution_id` を同じロックの中で読む)。`task_started_at` は残す。E4b より先に入れる (§7) |
 | 10 | lib_retirement.py:550-592 `read_task_started_at` | card の `started_at` 行を読む | R | E4: `read_task_execution_id` を足す (同じ読み口) |
@@ -288,6 +288,8 @@ record・identity・枠の本文・退役 marker・監査ログ・呼び出し�
 | 15 | plan.sh:5945-5953 `update --reset` / :6315-6321 retire reset | `started_at` を null にする | W | E4: 試行を release / fail に (§4)。`started_at` の null は今どおり。`current_execution_id` は残す |
 | 16 | plan.sh:3014-3033 `_env_mission_for_task` | `CREWVIA_MISSION_SLUG` + `AGENT_NAME == worker` + status (mission の曖昧さの解決だけ) | R | E3: `CREWVIA_EXECUTION_ID` が card の `current_execution_id` と一致すれば、それを証拠に使う (agent 名の一致より強い)。無ければ今のまま |
 | 17 | agents/director.md:1138-1143 / :1485-1497 / :1511 | Director が `sed` で card の `started_at` を読み `retire --started-at` を打つ | 文書 | E4: `--execution` を `plan.sh status` の表示から渡す形に |
+| 18 | agents/director.md の Rule 5 の通知の対応表 (`[Rule 5] Worker {name} が blocked / idle-with-task です` の行の `(3) 回復不能なら kill + plan.sh retire`) と「kill した Worker の後始末は `plan.sh retire`」の節 | Rule 5 で Director が打つ `retire` の名指し (旧: `--started-at`) | 文書 | E4: 上の #17 と同じ形 (`--execution <plan.sh status の ex-…>`)。ID の無い旧形式の card は retire では手放せず `update --status pending --reset` (E4b) |
+| 19 | scripts/plan.sh の冒頭の使い方 (`retire` の行 :56-62・`done` / `fail` の `--execution` の行 :29-32 ・:45) と `--help` の文言・:6731 / :4866 / :6981 のコメント | `--started-at` / 世代の名指しの説明 | 文書 | E3: `--execution` の行を足す (戻し先の互換のため読み捨てる注記つき)。E4b: `retire` の `--started-at` を外した旨に書き直す。**コメントの残り (`exit 1` と書いたが実際は使い方の誤りで exit 2・`generation=None` のまま) は §19.2 の backlog** |
 
 `execution_id` が今コードに現れるのは #14 の 1 か所 (null 固定) だけ (`grep -rn execution_id scripts/ hooks/ | grep -v test_` = 1 件)。
 
@@ -624,7 +626,8 @@ ID の出どころは **`--execution <id>` (明示) > env `CREWVIA_EXECUTION_ID`
 準備ロック: queue/missions/<slug>/executions/<tid>.prepare.lock を LOCK_EX|LOCK_NB で取る (§6.1)。取れなければ exit 1・何も書かない
           取れたら card を読み直し (ロックなしの読み)、X が reserved でなければ exit 1・何も書かない
 ロック外: Taskvia → worktree (W0〜W7) → git rev-parse HEAD → .crewvia-env (X を含む)          [準備ロックを持ったまま]
-ロック 2: recover → start (CAS: current_execution_id == X かつ execution_status == reserved → running、record)
+ロック 2: recover → start (CAS: `_pull_cas_ok` = in_progress ∧ worker 一致 ∧ started_at 一致 ∧ current_execution_id == X ∧ execution_status == reserved
+          → running、record。新しい欄だけの CAS ではない。理由は §2.1 #7・§15.2 の 2)
           失敗 (worktree / env): CAS が同じなら fail_execution(X, WORKSPACE_CREATE_FAILED) + needs_director (G1 の出口)
           CAS が外れたら何も書かず exit 1 (JSON を出さない)                                     [準備ロックを持ったまま]
 準備ロックを外す
@@ -648,7 +651,7 @@ stdout:   JSON (execution_id / attempt を含む)
     枠を作らない)。
 - 再開は**新しい試行を作らない** (attempt を増やさない)。ロック外の段 (Taskvia・worktree W2・`.crewvia-env` の書き直し) を最初から
   やり直し、start を打つ。Taskvia の再送は今の再 pull と同じ (冪等ではないが壊さない)。
-- **G1 (needs_director の出口) との関係**: G1 の CAS (#7) を ID の CAS に置き換える (git-policy.md §16.4 の 5)。worktree を作れない
+- **G1 (needs_director の出口) との関係**: G1 の CAS (#7) に ID の項を足す (git-policy.md §16.4 の 5。**今までの項は外さない** — AND。§15.2 の 2・§18.3)。worktree を作れない
   ときは reserved → failed で、再開はされない (needs_director は pull の候補にならない: git-policy.md §1.2 の B)。
   「pending に戻すと同じ Worker に配り直され続ける」(git-policy.md §1.2 の A を捨てた理由) は、reserved の再開でも起きない:
   再開は「同じ Worker が自分で打った再 pull」だけで、dispatcher は in_progress を配らない。
@@ -811,7 +814,8 @@ start の CAS は「試行がまだ reserved か」しか言えず、「他の p
 
 1. **E5 を足す (提案)**: 「名乗りなしの done / fail / needs-director / verify-result を拒否する」(§5.2)。t020 の本番確認の後。
    条件は監査ログの `caller_check=unverified` が crewvia 本体の task で 0 件、target_dir の task の ID の受け渡しが worker.md に
-   入っていること。これが入るまで AC-04 は部分的 (§10)。E3 に入れない理由は §5.2 (env を必須にしない・cutover の瞬間に
+   入っていること。これが入るまで AC-04 は部分的 (§10)。**【決定 (Director 判断) E5 は 01c に入れず後続に送った**。条件はこの項のとおり
+   (監査の `caller_check=unverified` が 0 件・target_dir の task の ID の受け渡し・生きているセッションが ID を渡す版の後に起動。§9.4 の E5 行)。実績は §19.3】E3 に入れない理由は §5.2 (env を必須にしない・cutover の瞬間に
    動いている Worker の done を止めない)。
 2. **E2 の中で pull の start (2 つ目のロック) を必ず先に書く**: 冪等化 (N8) と G1 の CAS の置き換えは start の上に乗る。
    start を後回しにすると、E2 の途中の commit で G1 の CAS が ID を見られない。
@@ -1638,3 +1642,76 @@ E4a のコードに戻るので新旧の marker を両方読める (§17.3)。E4
 `tests/test_execution_e4b_legacy_holding_card.py` (§18.1 の 1 件)・`tests/test_state_store_transaction.py` / `tests/test_task_controller_unit.py` (照合の規則)・
 `tests/plan-assignment-identity.bats`。赤の実証: `python3 tests/red_proof_e4b_generation.py` (7 変異: 世代の名指しを戻す・ID の無い identity を一致にする・保留を外す・壊れた ID を使う・TERMINAL を束縛しない・
 旧形式の世代を証拠に戻す・後任を後任と見ない) と、更新した `tests/red_proof_e4a_retire.py` (R01 は欠番・11 変異) — 全部「狙ったテスト名の assert の失敗」で RED。
+
+
+---
+
+## 19. 01c の実績の締め (t021): cutover / rollback の観測・backlog・後続への引き継ぎ
+
+01a の `state-store.md` §10・01b の `git-policy.md` §16 と同じ形。本番の観察は t020 (コード変更なし・観察のみ。観察時 origin/main = 主 checkout HEAD = `4bf3f2e`、E2・E3 (前提 #272 含む)・E4a・E4b をすべて祖先に持つ)。
+
+### 19.1 cutover と rollback (§9.1 の表の実績)
+
+| 段 | merge (JST) | 本番で変わったこと (t020 が観察できたもの) | 戻し方 | 実際に戻したか |
+|---|---|---|---|---|
+| E2 `d0cd944` (#271) | 10-02 06:02 | pull が ID を発行。t020 自身の pull で card (`current_execution_id`・running・attempt 1)・identity・`executions/` の record・監査 pull 行 2 本・`.crewvia-env`・pull の JSON の **5 点が一致** | revert → `scripts/sync-main-checkout.sh`。card の欄・record・identity の欄は残ってよい (§9.3) | 戻していない |
+| E3 前提 `b9b2abb` (#272) / E3 `a19a0f9` (#273) | 10-02 13:37 / 13:58 | done 等が ID を照合 (違う ID は exit 3・`refused:` 行)・`caller_check`。E3 以降の done: `verified` 8・needs-director `verified` 4・`no_execution` 3 (Director の開いた card・update)・`unverified` 1 (E3 merge 直後の旧プロンプトの Worker の done) | revert → sync。**#272 が先に入っているので `--execution` は戻し先でも読み捨てで通る** (§16.4) | 戻していない |
+| E4a `3dd3d7d` (#274) / E4b `4bf3f2e` (#275) | 10-03 00:49 / 07:40 | marker / progress に `task_execution_id`・watchdog が ID で retire (actor=`watchdog`)・世代の照合なし | revert → sync (両デーモン restart) | 戻していない |
+
+どの段も rollback は**実行していない**。手順は書いただけでなく、E3 は旧コードの plan.sh を履歴から取り出して `--execution` 付きの 6 コマンドが通ることをテストで確かめた (§16.4)。E4 は §9.5 の往復の表で確かめた。
+
+観察できたこと・できていないこと (t020):
+- 観察用 mission (後で archive) の 2 人の Worker で: 他人の task の done は `--execution` でも env でも exit 3 `EXECUTION_NOT_CURRENT`・card / record / assignments の sha256 は前後で不変・監査に `refused:EXECUTION_NOT_CURRENT` が 2 行だけ増えた。
+- 退役は、実在しない window に**手書きの marker** (`task_execution_id` 入り) を置き、本物の watchdog に cleanup させて観察した。card は `execution_status=failed` / `execution_end_code=RETIRED`、marker と progress は消滅、監査 retire 行は actor=`watchdog`・`caller_check=verified`。
+- **限界**: 実 pane の SIGTERM / SIGKILL の経路は通っていない (window gone の cleanup-only 経路)。本番の Worker は殺していない。自然発生の退役は観察期間中に無かった。
+- dispatcher / watchdog は E4b merge (07:40:40) の**後** (07:40:48 / 07:40:49) に起動し、`registry/daemons/*.version.json` の head が `4bf3f2e`。新しい版にしか書けない行 (監査の `execution_id` / `caller_check` / retire の actor) も観察できた (§9.1 の 3 点の証明)。
+- `store-check` は観察の前後とも 6 件で出力に差分なし、通知台帳に新しい行なし。E3 以降の `refused:` は観察用の 2 件だけで、**本番の Worker・Director の操作が拒否された例は 0**。
+- 観察後の片付け: 観察用 mission は archive へ。worktree・`task/*` branch・`queue/missions` の一覧・`state.yaml`・`registry/retirements/`・`queue/assignments/` が前後で同一。
+
+### 19.2 backlog (族ごと。01c の完了を止めない)
+
+各 review / Codex / QA の Result で「backlog」「Director 判断」とされたもの。直すときはまず同じ族のものをまとめて洗う (族の直し漏れが 01c で繰り返し P2 になった)。
+
+**(A) 拒否・報告の見え方**
+1. (E1 review t007) `lint_plan.check_execution_fields` のメッセージが frontmatter の `id` 欄を使う。識別子はファイル名 (不変条件 2) なので表示だけの問題だが、揃える。
+2. (E1 review t007) `reserve_task` の `TASK_NOT_ELIGIBLE` / `TASK_NOT_FOUND` は `_refuse` を通らず、監査ログに拒否の行が残らない (`TASK_ALREADY_RESERVED` は残る)。
+3. (E1 review t007) `execution_fields_invalid` / `record_unreadable` / `record_malformed` / `record_superseded_active` (手編集起因の報告) を消す Controller の操作がまだ無い。`update --close-execution` は DETACHED で active な試行だけを閉じる (§16.2 の 7)。
+4. (E1 review t007) `now` は、時刻形でない世代形の文字列 (`'yesterday'`) をまだ通す (`_check_now` が `_check_generation` と同じ検査)。**E2 で pull 側を確かめた結果**: pull は `now_generation()` で自分で作る (plan.sh:3885。呼び出し元から受けない) ので、通る入り口は Controller を直接呼ぶ側だけ。時刻形の検査を足すかは、直接呼ぶ側が増えたときに決める。
+5. (E4b review t028) R-1 の `reported:generation_mismatch` が、ID の無い holding card では出なくなった (§18.2)。本番で該当するのは Minerva t017 だけで、worker が無いので別の finding (`holding_without_worker`) になる。
+6. (E4b review t028) E4a の書いた「task 付きで `task_execution_id: null` の marker」が E4b の merge の瞬間にあると、`_cleanup_deferred` の通知が 1 件増える。今回の merge 時は 0 件。
+
+**(B) pull / 準備ロック / worktree**
+7. (E2 t009 / t011) 異なる task の同時 pull で `git worktree add` が git のロック競合 (`config.lock`) で W5 → `needs_director` になる (負荷下 2〜3%、E2 の前と同率)。helper の再試行で直す (E2 が増やした問題ではない)。
+8. (E2) `executions/<task>.prepare.lock` が 0 バイトで残り、archive にも移る。掃除の規則を決める (消してよいが、いつ消すかが無い)。
+9. (E2) pull が card だけ書いて死んだ窓では枠が無く、dispatcher が idle と見て別の task を送る。旧コードと同種で、収束する (reserved の再開は同じ Worker の再 pull だけ)。
+10. (E2) `_resume_reserved` が枠を Controller を通さずに書く (E4 以降の候補。§15.2 の 1 の「持ち主が card から公開し直す」は回復の向きと同じなので害は確認していない)。
+11. (E2) 準備ロックの記述子を継承した、detach した子孫がいる間は再 pull が待たされる (§6.1 / §15.6)。
+12. (E2 Codex P3) compat テストに `or True` が残っている (緑のまま何も確かめない箇所。直す)。
+
+**(C) verify-result・reset・docs**
+13. (E3 t013) 上限に達して `needs_human_review` になった後、notes の違う `verify-result fail` を打つたびに `rework_count` が上限を超えて増える。§16.9 の「新しい項目として記録」どおりだが、**上限を超えた後の回数の扱い**が文書に無い。決める。
+14. (E3 t013) `docs/qa-operations.md:113` が §16.5 の F4 の表に無い (族の洗い出しの漏れ)。
+15. (E4a review t019) `update --reset` に他の欄 (`--skills` 等) を併せると、Controller の書き込みと `save_task` の 2 回に分かれる (同じロックの中)。間で crash すると reset だけが残るが、他の欄が付かないだけで壊れない。
+16. (E4b review t028) `scripts/plan.sh` のコメント: :62 / :6731 が `--started-at` を「exit 1」と書く (実際は使い方の誤りで exit 2)。:4866 / :6981 のコメントが `generation=None` のまま。
+
+**(D) テストの後始末・QA**
+17. (E3 t013) QA ハーネスのテスト用 tmux セッション (`crewvia-retiretest-*`) が残り、隔離のデーモンのコピーが動き続けた (Director が停止)。テストの後始末の族 (`tests/CLAUDE.md` の隔離の規則に「ハーネスの終了時に自分の session を殺す」を足す候補)。
+18. (E3 t013) QA の所見のうち、Director 判断とされた 4 件は t013 の Result に残っている (本節の 13・14 を含む)。
+
+### 19.3 判断の記録と、後続への引き継ぎ
+
+**判断**
+- **R2** (§9.5 の 6): 旧コードの reset が `started_at` を null にするので「間に B がいた」痕跡は card から消える。どちらも持ち主がいない (pending) ので書き込みは起きない。「封印」案 (新コードの reset が `execution_reserved_at` を空にして印にする) は、旧コードの経路で同じ印が残らず答えを揃えられないので採らなかった。
+- **E2 の CAS は置き換えでなく AND** (§2.1 の 7・§15.2 の 2・§18.3。Codex 3 巡目 P1): 移行中は旧形式の書き手が status / worker / `started_at` だけを動かすため。E4b でも外さなかった。
+- **E3 の戻し方**: 戻し先が `--execution` を受け付けて読み捨てる互換 (#272) を E3 の**前**に別 PR で入れた (§16.4。Codex 3 巡目 P2)。
+- **E5 (名乗りなしの done / fail を拒否する段) は 01c に入れず後続に送った** (Director 判断)。条件は §9.2 の 1: 監査の `caller_check=unverified` が 0 件 (監査は欠けうるので唯一の根拠にしない・§1.6 の 11)・target_dir の task の ID の受け渡しが worker.md にある・生きているセッションが、ID を渡す版の後に起動している (§9.4 の E5 行)。
+
+**後続へ (vNext 01 の完了と、次に送るもの)**
+1. **E5**: t020 の時点で `unverified` は crewvia 本体の task で E3 直後の 1 件だけ (以後は `verified` か `no_execution`)。ただし **Director 自身の done に `--execution` が付いているか**・**target_dir の task の ID の受け渡し (worker.md)** は未確認。着手前に再集計する。
+2. `reported:execution_active_on_finished_task` 5 件 (t012 / t013 / t014 / t032 / t033。E2〜E3 の間に終わった task): 自然には消えない。`update --close-execution` で閉じる (§16.1) か、許容して残すかを Director が決める。
+3. `reported:holding_without_worker` の Minerva t017 (既存。Minerva の再開で解消)。
+4. 範囲外として後続 mission に送ったもの: Execution status の `stale` / `abandoned` / `recovered` (原案 EXEC-04)・退役の実 pane 経路の本番観察 (自然発生待ち)・`caller_check` の `legacy_generation` / `detached_execution` ラベルの整理 (出力は 0 件。監査ログの互換を見て決める)。
+5. 本節 §19.2 の backlog。
+6. 手書き marker による退役の観察の手順は、memory `observe-retirement-with-handwritten-marker-on-nonexistent-window` に残した。
+
+01c で 01a / 01b から引き継いだもの (state-store.md §10.3 の 1・§0・git-policy.md §16.4) は、Execution ID・pull の冪等化 (N8)・G1 の CAS・世代の置き換え (E4b) として入った。**残るのは上の 1〜4 と §19.2 だけ**。

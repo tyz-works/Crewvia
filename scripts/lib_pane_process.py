@@ -628,9 +628,18 @@ def _classify(root_pid: int, notes: Optional[list[str]]) -> ProcessSignal:
         seen.add(pid)
         if _proc_state(pid) == "Z":
             # §11 (t003): zombie は仕事をしていない (回収待ちの死骸)。environ が EACCES で
-            # 木全体を unknown にしていた主因。子は親の回収時に再親化されて木から
-            # 消えるので、zombie の下に「見えなくなる job」は無い。判定に寄与させない
+            # 木全体を unknown にしていた主因。zombie 自身は判定に寄与させない
             # (saw_unknown も立てない)。state が読めない / 消滅は None = 通常の分類へ。
+            #
+            # §11-12 (t013): ただし **children map に載っている子は必ずキューに積む**。
+            # map は /proc の一括読み込みで、ここの state 読みとは時間差がある。その間に
+            # 包み役 (Bash tool の `bash -c` 等) が終わって Z になると、子の job を飛ばして
+            # 働いている Worker を idle_process (= hard_idle で terminate) に倒してしまう。
+            # zombie の起源は読めない (環境が消える) ので、子には "zombie" を渡す: "job" では
+            # ない (job を捏造しない) が None でもない (pane 直下の session 判定に入らない) =
+            # 子は `_origin_of()` で独立に判定される。読めなければ従来どおり unknown 側。
+            for child in children.get(pid, []):
+                queue.append((child, "zombie"))
             continue
         try:
             if parent_origin == "job":

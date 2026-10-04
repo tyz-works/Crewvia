@@ -196,6 +196,43 @@ def test_a_state_that_cannot_be_read_is_not_taken_for_a_zombie(monkeypatch, tree
     assert lib_pane_process.classify_process_tree(pane) == "unknown"
 
 
+def _wrapper_with_job_child(snap):
+    """pane 直下の包み役 (sh) とその子の job wrapper。包み役が Z になる競合を作る土台。"""
+    return f"{_env_prefix({'CLAUDECODE': '1'})} sh -c {shlex.quote(_job_wrapper_cmd(snap, 'sleep 300') + ' & wait')}"
+
+
+def test_a_wrapper_that_turns_zombie_after_the_snapshot_keeps_its_job(trees, tmp_path, monkeypatch):
+    """t013 (Codex 3 巡目 P1): children map を作った後 (state を読む時点) で包み役が Z になっても、
+    その子の job は木から消えない。修正前は idle_process (= 働いている Worker を terminate)。
+
+    マイクロ秒の窓は実時間で再現できないので、`_proc_state` の差し替えで構造的に作る
+    (snapshot 時は生きている = 実プロセスの木・読む時点で Z)。"""
+    snap = _write_wrapper_snapshot(tmp_path)
+    pane = trees([_wrapper_with_job_child(snap)])
+    wrapper = next(p for p in _direct_children(pane) if _direct_children(p))
+    real = lib_pane_process._proc_state
+    monkeypatch.setattr(lib_pane_process, "_proc_state",
+                        lambda pid: "Z" if pid == wrapper else real(pid))
+    assert lib_pane_process.classify_process_tree(pane) == "executing"
+
+
+def test_the_children_of_a_zombie_are_not_taken_for_a_session_body(trees, tmp_path, monkeypatch):
+    """zombie の子は parent_origin に None を渡されない (pane 直下限定の session 判定に入らない)。"""
+    snap = _write_wrapper_snapshot(tmp_path)
+    pane = trees([_wrapper_with_job_child(snap)])
+    wrapper = next(p for p in _direct_children(pane) if _direct_children(p))
+    grandchildren = _descendants(wrapper)
+    assert grandchildren, "前提: zombie になる包み役に子が居る"
+    seen = []
+    monkeypatch.setattr(lib_pane_process, "_is_session_body", lambda pid: seen.append(pid) or False)
+    real = lib_pane_process._proc_state
+    monkeypatch.setattr(lib_pane_process, "_proc_state",
+                        lambda pid: "Z" if pid == wrapper else real(pid))
+    lib_pane_process.classify_process_tree(pane)
+    assert wrapper not in seen
+    assert not set(grandchildren) & set(seen)
+
+
 # ---------------------------------------------------------------------------
 # 3. 見送りの通知
 # ---------------------------------------------------------------------------
@@ -596,3 +633,22 @@ def test_run_observes_every_monitor_each_cycle_and_forgets_through_one_helper():
              and isinstance(n.func.value, ast.Name)]
     assert {("verdict_logger", "forget"), ("warn_throttle", "forget"),
             ("suppressed_notifier", "forget")} <= set(inner)
+
+
+def test_the_suppression_message_names_the_mission_and_separates_reason_from_evidence(
+        notifier, tmp_path, monkeypatch):
+    """t013: mission slug を入れる (task id だけでは別 mission の同名 task と区別できない)。
+    理由と根拠 (該当ノード) を分けて書く。"""
+    n, clock, sent, _ = notifier
+    monkeypatch.setattr(watchdog, "explain_unknown_tree", lambda pid: ["pid=7 state=S errno=EACCES(13)"])
+    card = {"worker": AGENT, "timeout": {"idle": 300, "max": 36000}}
+    monitor = watchdog.WorkerMonitor(task_id=TASK_ID, task_card=card, profiles=watchdog.PROFILES,
+                                     repo_root=tmp_path, mission_slug="20261004-some-mission")
+    monitor._last_pane_pid = 4242
+    n.observe(monitor, _detail("hard_idle_but_process_unknown"))
+    clock.t += 700
+    n.observe(monitor, _detail("hard_idle_but_process_unknown"))
+    msg = sent[0]
+    assert "mission 20261004-some-mission" in msg
+    assert "終了を見送っています。理由:" in msg and "・該当ノード pid=7 state=S errno=EACCES(13)" in msg
+    assert "ため終了" not in msg

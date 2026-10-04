@@ -252,12 +252,14 @@ class WorkerMonitor:
     """Monitors a single in-progress task / Worker."""
 
     def __init__(self, task_id: str, task_card: dict, profiles: dict[str, dict[str, int]],
-                 repo_root: Path) -> None:
+                 repo_root: Path, mission_slug: str = "") -> None:
         timeout = task_card.get("timeout") or {}
         profile_name = task_card.get("worker_profile") or DEFAULT_PROFILE
         base = profiles.get(profile_name) or profiles[DEFAULT_PROFILE]
 
         self.task_id = task_id
+        #: 通知文用 (t013)。task id だけでは別 mission の同名 task と区別できない。
+        self.mission_slug: str = mission_slug
         self.agent_name: str = str(task_card.get("worker") or os.environ.get("AGENT_NAME", "unknown"))
         self.idle_threshold: int = int(timeout.get("idle") or base["idle"])
         self.max_threshold: int = int(timeout.get("max") or base["max"])
@@ -765,11 +767,12 @@ class WorkerMonitor:
         if kind == "process_unknown":
             notes = explain_unknown_tree(self._last_pane_pid) if self._last_pane_pid else []
             detail_text = "; ".join(notes[:5]) if notes else "再走査では理由を特定できなかった"
-            why += f"。ノード: {detail_text}"
+            why += f"・該当ノード {detail_text}"
         return (
-            f"[watchdog] Worker {self.agent_name} (task {self.task_id}) は無音 "
+            f"[watchdog] Worker {self.agent_name} (mission {self.mission_slug or '?'} "
+            f"task {self.task_id}) は無音 "
             f"{detail.idle_seconds:.0f}s (hard_idle しきい値 {self.idle_threshold * 2}s 超) ですが、"
-            f"{why} ため終了を見送っています。見送りは {lasted:.0f}s 続いています。"
+            f"終了を見送っています。理由: {why}。見送りは {lasted:.0f}s 続いています。"
             f"止まっていないか確認してください (max {self.max_threshold}s で終了します)。")
 
     # ------------------------------------------------------------------
@@ -1679,6 +1682,7 @@ def run(repo_root: Path, interval: int) -> None:
                     task_card=meta,
                     profiles=PROFILES,
                     repo_root=repo_root,
+                    mission_slug=slug,
                 )
 
             # §11 (t011): 見送り通知の台帳の後始末は forget / observe の経路に頼らず、

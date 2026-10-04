@@ -754,3 +754,33 @@ SuppressedIdleNotifier の状態を「特定の呼び出し経路でしか進ま
 | `_state[key]["notified"]` | `observe` が書くだけ | 読む箇所は無い (t009 で `forget` の判定を台帳に移した。残りは情報のみ) | — | — |
 
 赤の実証 (`tests/red_proof_hard_idle_unknown.py` に 5 点): `cycle` の flush を外す / 孤児キーの掃除を外す / 通知判定の前の flush を外す / flush が例外を握らない / run が `cycle` を呼ばない。
+
+**11-12. zombie を飛ばすときに集めた子孫を落とさない (PR #278 Codex P1 3 巡目 / t013)**: 指摘は「`_classify` は children map を作ってから `_proc_state()` を読む。その間に包み役 (Bash tool の `bash -c` 等) が終わって zombie になると、`continue` がその子孫のキュー投入まで飛ばす」。生きている長いテストが木から消えて `executing` ではなく `idle_process` になり、**働いている Worker を hard_idle で terminate する向き**に倒れる (§11 の「kill が増えるのは zombie しか根拠がない場合だけ」を破る)。
+
+直し: zombie 自身は判定に寄与させない (`saw_unknown` も立てない) が、**children map に載っている子は必ずキューに積む**。子に渡す parent_origin は `"zombie"`:
+- `"job"` ではない — zombie の起源は読めない (環境が消える) ので、job を捏造して `executing` にしない (kill を止める向きの誤判定も作らない)。
+- `None` でもない — `None` は「pane root の直接の子」の印で、`_is_session_body()` に入る。孫を session と読む誤りを避ける。
+- よって子は `_origin_of()` で**独立に**判定される。cmdline の wrapper marker / environ の job シグナルがあれば job (= executing)、読めなければ従来どおり unknown 側 (kill しない)、CLAUDECODE があれば infra。
+
+選ばなかった案: zombie の子を無条件に "job" として伝播 (job 判定の捏造。zombie の下の本物の infra を executing にして hard_idle を永久に止める = 本件の元の欠陥の逆向き)。
+
+`_classify` の「スキップ / 早期 return / continue」の全分岐 (既に集めた子孫を落として kill 側に倒れないか):
+
+| 分岐 | 何をする | 集めた子孫を落とすか | kill 側に倒れるか |
+|---|---|---|---|
+| root の `_proc_stat` が OSError | `unknown` を即 return | 子孫を集める前 (落とす物が無い) | しない (unknown は殺さない) |
+| root が消滅 (None) | `no_process` | 同上 | 元から (pane が無い) |
+| `/proc` の列挙 / 個別 `_proc_stat` の OSError | `unknown` を即 return | 木が組めない = 判定を放棄 | しない |
+| 直接の子が無い | `no_process` | 無い | 元から |
+| `pid in seen` で continue | 二重処理の抑止 | 無い (既にキュー済み・処理済み) | しない |
+| **zombie で continue** | 判定に寄与させない | **落としていた → 本件で子をキューに積む** | **していた → 直した** |
+| session 本体 (`_is_session_body`) | origin=session で子を積む | 落とさない | しない |
+| `_origin_of` / `_is_session_body` の OSError | `saw_unknown` を立て、子を `"unknown"` で積んで continue | 落とさない (t003) | しない (unknown) |
+| `origin == "job"` で return `executing` | 確定 | 残りは不要 (job が最優先) | しない (殺さない向き) |
+| `origin == "unknown"` / infra | 子を積む | 落とさない | しない |
+
+`_origin_of` が cmdline / environ の消滅 (None) で `infra` を返すのは、その pid 自身が居なくなっただけで子は children map から積まれる (落とさない)。落としていたのは zombie 分岐だけ。
+
+検証: `test_a_wrapper_that_turns_zombie_after_the_snapshot_keeps_its_job` (実プロセスの木 + `_proc_state` の差し替えで「snapshot 時は生きている・読む時点で Z」を作る。マイクロ秒の窓は実時間で再現できない)、`test_the_children_of_a_zombie_are_not_taken_for_a_session_body`。赤の実証は `tests/red_proof_hard_idle_unknown.py` に 3 点 (子を積まない / 子に None を渡す / 通知文から mission を外す)。
+
+**通知文 (t013 追加)**: 文頭に `mission <slug>` を入れた (task id だけでは別 mission の同名 task と区別できない。`WorkerMonitor(mission_slug=...)`、run が slug を渡す)。文末は「…ため終了を見送っています」をやめ、「終了を見送っています。理由: <理由>・該当ノード pid=… state=… errno=…。」と理由と根拠を分けた。

@@ -575,3 +575,130 @@ env 停止スイッチは付けていない (dispatcher と watchdog で答え�
 `tests/test_usage_limit.py` (70 件: 同定の表・dispatcher 1 サイクル・watchdog の模擬時計・観測/保存の失敗)。
 赤の実証: `tests/red_proof_c2_usage_limit.sh` (修正前の dispatcher.sh / watchdog.py に戻すと
 (1)〜(3) が赤、加えて同定・上限・床・上限外し・空 capture・保存失敗・台帳キー・mux state unknown の欠陥注入 14 件が赤)。
+
+## 11. `unknown` が hard_idle の終了を永久に止めた件 — 出どころ・届かない warn・直し方 (調査+設計, 2026-10-04, mission 20261004-watchdog-hard-idle-unknown t001)
+
+**この節は調査と設計だけ。コードは変えていない** (実装は t003)。再現スクリプトは scratchpad にあり、要点を下に引用する。
+
+### 11-1. 何が起きたか (observations の実測。2026-09-28 以降 14,244 行)
+
+01c で Worker が長く止まったまま max まで終了されなかった 2 件は、**executing ではなく `unknown` で止まっていた**
+(§6 の「`run_in_background` の置き土産」仮説は外れ)。
+
+| 件 | 経過 |
+|---|---|
+| Ren / t004 | 10-01 21:25 (JST) に idle_process → `unknown` へ変わり (最後の活動の約 90 秒後)、idle 1816s で soft_idle の warn、3608s で `hard_idle_but_process_unknown` の warn が **192 回 / 5898 秒**、最後は max_exceeded (idle 9536s) で terminate |
+| Mateo / t021 | 同じ形 (10-03 07:48 JST)。unknown になったのは最後の活動の約 70 秒後。`hard_idle_but_process_unknown` が **225 回 / 7132 秒**、max_exceeded (idle 10772s) で terminate |
+
+全体の数え方 (`bt2.py`):
+
+- `hard_idle_but_process_unknown` は **この 2 件だけ** (417 行)。`hard_idle_but_executing` は **0 行**。
+- 抑止された hard_idle の episode は 5 件 = unknown 2 + **awaiting_human 3** (Hugo t078・Arjun t066 は人間が応答して復帰、**Arjun t017 は 3691 秒 warn のまま max で終了**)。
+- 1 サイクルだけ `unknown` に振れた行が他に 9 (Seo t004 / t011 / t040・Ren t005 / t033・Amara t023 …)。idle は小さく影響なし。= 通常運用でも unknown は時々出る。長く続くのが問題。
+- 同じ期間の terminate は 7 回: hard_idle 3 (Sofia t084・Astrid t013・Ren t016、いずれも idle 3606〜3630s) + max 4 (うち 3 が上の抑止された 3 episode)。**`idle_process` で止まった Worker は 3600 秒で正しく終了している** — 穴は「木に unknown が 1 つあると」だけ。
+
+### 11-2. unknown の出どころ — 木が unknown を返す形の全列挙と実測
+
+`classify_process_tree()` が `unknown` を返す経路は 5 つ (`scripts/lib_pane_process.py`)。当時の木は残っていないので、
+**各形を実プロセスで作って実際に unknown になるか**を測った (`repro.py` / `paths.py`。自分で立てた木だけを対象にし、mux / herdr / registry には触れていない)。
+
+| # | 形 | 実測 | 経路 |
+|---|---|---|---|
+| A | **zombie の子** (回収されていない `state=Z`) | **unknown** | `/proc/<pid>/environ` が **EACCES (errno 13)** → `_origin_of` が OSError → 木全体を即 `unknown` (§9 / t082 P1 の「読めない」) |
+| B | **非 dumpable のプロセス** (`prctl(PR_SET_DUMPABLE, 0)` した子。ブラウザの sandbox 子プロセス等が該当しうるが本番では未確認) | **unknown** | 同上 (environ が EACCES) |
+| C | `CLAUDECODE` の無い子 (`env -i` で起動 / Claude と無関係) | **unknown** | `_origin_of` が unknown を返す (t091) |
+| D | environ が空 (`execve(..., envp=[])`) | **unknown** | 同上 |
+| E | pid 列挙の失敗・`/proc` の読めない (hidepid 等) | 未再現 (本番に無い環境要因) | `_proc_stat` / `iterdir` の OSError |
+
+**本番に A の実例が今ある** (2026-10-04 17:00 に読み取りだけで確認): Ren の稼働中セッション (pid 3402938) に、回収されていない
+`npm exec @playw` / `npm exec chrome` / `sh` の zombie が 3 つぶら下がっている (うち 2 つはセッション起動の 2 秒後 = MCP が起動直後に死んで回収されないまま
+2.7 日)。3 つとも `cmdline` は空 (読める)、`environ` は **EACCES**。`_origin_of` を実 pid に当てると 3 つとも `PermissionError`。
+
+**どの形が 01c の 2 件に当たるか** (確からしさ付き):
+
+| 形 | 確からしさ | 根拠 |
+|---|---|---|
+| **A (zombie の MCP / sh の子)** | **約 70%** | ① 2 件とも idle_process → unknown が **最後の活動の 1〜1.5 分後に 1 回だけ** 切り替わり、以後 hard_idle 全期間 unknown のまま (木の中に「居続ける」ものがある)。② zombie は親が回収するまで消えないので永続する (本番の実例が 2.7 日)。③ 通常運用の unknown が 1 サイクルだけ出て消える 9 行は、zombie が回収される / 一瞬だけ居る形に合う。④ A は **Worker が止まる原因ではなく結果** と読める: MCP が落ちて回収されない = claude が止まっている (API 待ちで固まった等) と同時に起きる。2 件とも Rule 5 が **3 時間 1 度も出ていない** (dispatcher のログに Mateo の idle-with-task が無い) のは、herdr が画面を `working` と見ていた (= claude がリクエスト待ちで固まっていた) と整合する |
+| B (非 dumpable の子) | 約 20% | ブラウザを使う MCP の下で起きうるが、これが永続すると**ブラウザを使った全 Worker で長い unknown** が出るはず。実測は 2 件だけ |
+| C / D (env が消えた子) | 約 5% | crewvia のテストは `env -i` を多用するが、Worker の pane の中で走るのは Bash tool 経由 = 子は job。job が居れば `executing` が勝つ。長く止まった Worker が `env -i` の子だけを残す形は考えにくい |
+| その他 | 約 5% | — |
+
+**確証は持てない** (当時の木は無い)。次の 1 回で確定させる手段は 11-3 の通知に「unknown にした node の pid / state / errno」を載せること (観測の足し算。t003 に含める)。
+
+**もう 1 つ見つかった欠陥 (A の副作用)**: OSError で **木全体を即 `unknown` にして返す**ので、**job が同じ木にあっても job が見つからない**。
+docstring は「他のノードに本物の job があれば job が勝つ」と言うが、勝つのは `origin == "unknown"` の場合だけで、OSError の経路は勝たない。
+実測 (`order2.py`): root の子が [zombie, `sleep` (job)] の順 (pid の若い順 = BFS の順) → **`unknown`**、[job, zombie] の順 → `executing`。
+つまり zombie を抱えたセッション (本番の Ren) では、Bash tool で長いコマンドを走らせても pid の並び次第で `executing` にならず、
+Rule 5 は「job ではない」と読んで通知する側に倒れる (実害は余計な idle-with-task)。watchdog は unknown も executing も殺さないので kill の向きには影響しない。
+
+### 11-3. warn が Director に届かないこと
+
+`scripts/watchdog.py` の `elif status == "warn":` は `_log(msg)` と `taskvia_alert()` だけ。`_notify_director` (= `make_notify_once` の `send`) は通らない。
+実測の症状:
+
+- Taskvia が無い・届かない環境では alert は黙って捨てられる。そうでなくても Taskvia は Director の画面ではなく、**Director には届かない**。
+- `WARN: Mateo/t021 ... idle 1822s` の行が **サイクルごと (約 32 秒) に 1 行ずつ**ログに出る (hard_idle の warn だけで 225 + 192 行)。同じ内容の繰り返しでログが埋まり、「何が変わったか」が読めない (§4 の VerdictLogger は変化時 + 10 cycle ごとだが、この `WARN:` 行は別経路で毎回出る)。
+- `soft_idle` (idle 1800s) と `hard_idle_but_*` (3600s) の両方が同じ経路なので、「終了を見送った」という重い warn が soft_idle と区別なく流れる。
+
+**dedup の仕組みは既にある**: `make_notify_once(repo_root)` の `notify_once(key, fp, kind, slug, task, message)` (`registry/daemons/notified-state.json` の台帳。送れたときだけ記録・台帳が壊れていれば再送側)。
+利用枠切れの `usage_notify_once(f"usage-limit-overdue_{agent}", fp, "usage-limit", "_daemon", agent, msg)` が同じ型の前例。
+**同じ Worker・同じ試行で 1 回**にするには、`key = f"hard-idle-suppressed_{agent}"`・`fp = f"{task_id}@{int(monitor.started_at)}:{reason}"`
+(試行が変われば `started_at` が変わり再通知、同じ試行で理由が変われば再通知、同じ理由が続く間は 1 回)。slug は `_daemon` (mission slug だと `prune_told()` が捨てる — §10 と同じ理由)。
+抑止が解けた (`alive` / `terminate` / task 完了) ときは台帳キーを消す (回復を観測した場合だけ。§10 の原則)。
+
+### 11-4. 直し方の案と比較
+
+| 案 | 殺しすぎる側 | 殺さなすぎる側 | 評価 |
+|---|---|---|---|
+| (a) unknown / executing による抑止に上限 (Rule 5 の `BACKGROUND_JOB_MAX_SECONDS` と同じ型) | **増える**: 上限を過ぎた unknown を殺す = 「分からない」を根拠に kill (t074 で Director が名指しした向き)。実測では 2 件とも活動の再開は無かったので誤殺は 0 だが、原理的には観測できない Worker を殺す | 変わらない (原因は直らない。zombie があれば上限まで待つ) | 原因を直さず時間で割り切る。**executing 側には証拠が無い** (0 行) ので足す理由がない |
+| (b) unknown の原因ごとに分類を直す | A (zombie) を除くのは**ちょうど正しい** — zombie は仕事をしておらず、子は親が回収済み・再親化済みで木から消えるので「見えなくなる job」は無い。B / C / D を job / infra に倒すのは**殺しすぎる**側 (job 扱いは executing = 抑止なので逆に殺さなさすぎ。B を infra に倒すと本物の job を見逃す) → **B / C / D は触らない** | A を直しても B / C / D の unknown は残る | **A だけ直す**。unknown の実測 2 件の約 70% を、kill の向きを変えずに消せる |
+| (c) 抑止が長く続いたら terminate でなく **Director に通知** | 変わらない (kill は増えない) | 変わらない (止まった Worker は今までどおり max まで居るが、**3600 秒の時点で Director が気づける**) | **A / B / C / D / executing / awaiting_human の全部を拾う**。直せない形 (B・未知の形) の最後の受け皿 |
+| (d) heartbeat / pane 画面の変化が無い時間で判定 | 画面の変化はスピナー・経過秒数の表示で止まらない可能性があり、固まった claude でも「動いている」に見えうる (殺さなさすぎ)。逆に TUI が静止する待ち (人間待ち) を「止まっている」と読むと殺しすぎ | — | **heartbeat は既に idle の時計に入っている** (`_last_activity_mtime` = activity + heartbeat + notification の最新)。足せるのは画面だけで、capture の誤読と §10 の「画面が読めない」の扱いを新たに増やす。実装コスト大・向きが不確か。**不採用** |
+
+**推奨: (b) の zombie 除外 + (c) の Director 通知 (1 つの変更として出す)**。
+(b) は原因 A を直し (hard_idle が本来の 3600 秒で動く)、(c) は直せない形 (B ほか) と awaiting_human まで同じ抜け道で塞ぐ。
+(a) は入れない: unknown を殺す根拠にしない向きを保つ。通知で人が判断し、max (3 時間) が最後の網のまま。
+
+**変更の向き**: (b) は `idle_process` → terminate が増える (zombie が原因だった Worker だけ・3600 秒の時点)。(c) は kill を増やさず通知だけ増える。**kill が新しく起きる条件は「zombie 以外に unknown / job の証拠が無い木で、3600 秒 idle」だけ** = 他の idle_process の Worker と同じ条件。
+
+### 11-5. 族の掃除の範囲
+
+| 項目 | 同じ修正に入れるか | 理由 |
+|---|---|---|
+| zombie を unknown に数える (§6 backlog) | **入れる** (本件の主因) | stat の state 欄 (`rest[0]`) が `Z` のノードは、分類の前に木から除く。`_proc_stat` は `(ppid, starttime, comm)` を返し state を返さないので、タプルを変えると `_direct_children()` 等の test helper が壊れる (docstring に明記)。state は別関数 (`_proc_state`) で読むか、タプルを拡張して helper を追従する (t003 が選ぶ) |
+| OSError で job の探索を打ち切る (11-2 で見つけた順序依存) | **入れる** | zombie を除けば A は消えるが、B のような OSError が job より先に来る順序依存は残る。unknown を見つけても BFS を続けて job を探し、**job が見つかれば executing、無ければ unknown** に揃える (`origin == "unknown"` の経路と同じ扱い。docstring の約束どおり) |
+| `job_since` の未来値 (§6 backlog) | **別 PR** | Rule 5 の上限タイマーの話で、unknown の件と原因が違う。状態ファイルが壊れた場合だけ |
+| dispatcher `worker_has_background_work()` | **変更なし** | `unknown` → False (通知する) は正しい向きのまま。zombie 除外で `idle_process` を返すようになっても答えは同じ (False)。A を直した後は pid 順に依存せず `executing` が出る (11-2 の順序依存が消える) |
+| Rule 5 (§7 / §8) の上限 `CREWVIA_RULE5_BACKGROUND_JOB_MAX_SECONDS` | **変更なし** | executing を黙る側の上限で、本件は watchdog の hard_idle 側 |
+| watchdog の `WARN:` を毎サイクル出す行 | **入れる** | (c) と同じ分岐。Director 通知は台帳で 1 回、`WARN:` のログ行と Taskvia alert は suppress 理由が変わった時 + 10 cycle ごと (VerdictLogger と同じ間隔) に落とす |
+| awaiting_human の通知 | **入れる (推奨)** | 同じ `hard_idle_but_*` の抜け道。Arjun t017 (3691 秒の warn → max) が実例。人間待ちが 1 時間以上続くのは Director が知ってよい |
+| `max_exceeded` はプロセス層で抑制しない (§6) | 変更なし | 最後の網として残す |
+
+### 11-6. 推奨案の過去データへの当てはめ (`bt2.py`、2026-09-28 〜 10-04 の全行)
+
+| 観点 | 結果 |
+|---|---|
+| (c) の通知 (抑止が 600 秒続いたら 1 回) の件数 | **5 件 / 7 日**: Ren t004・Mateo t021 (unknown)、Arjun t017・Hugo t078・Arjun t066 (awaiting_human)。unknown + executing だけに絞れば **2 件**。executing は 0 件 |
+| 通知が届くはずだった時刻 | idle 約 4200 秒の時点 (= hard_idle の warn が始まって 600 秒後)。実際の終了より Ren は約 5300 秒、Mateo は約 6500 秒早い |
+| (b) zombie 除外で終了が早まる Worker | 2 件が **A だった場合に限り** hard_idle (idle 3608 秒) で終了: Ren t004 は max より **5928 秒早く**、Mateo t021 は **7164 秒早く** (合計約 3.6 時間の「止まった Worker の滞在」が消える)。A でなければ変わらない (通知だけが効く) |
+| 新しく**誤って殺す**Worker | **0**。`unknown` かつ idle > 2×threshold の行は 417 行で、すべてこの 2 件の中にあり、2 件とも idle は 3608 → 9506 / 10740 と単調に伸びた (**活動が再開した行は無い**) |
+| 影響を受けない側 | `idle_process` で terminate された 3 件 (Sofia t084・Astrid t013・Ren t016) は変わらない。awaiting_human で人間が戻った 2 件 (Hugo t078・Arjun t066) は kill されない (通知だけ。通知は Director の判断材料) |
+
+**限界**: observations は `process_signal` の結果だけで木を持たないので、2 件が本当に A だったかは過去データからは確定できない。
+当てはめが示すのは「推奨案が過去のどの Worker にも誤った kill を足さない」「通知なら 2 件とも 600 秒後に届く」の 2 点。
+
+### 11-7. 付随して見つけたもの (本件の範囲外・Director に報告)
+
+- **本番に孤児の `claude` が居る**: pid 3402938 (`AGENT_NAME=Ren`、2026-10-01 22:58 起動、ppid=1、tty なし、状態 `Rl`、**CPU 時間 2 日 19 時間 > 経過 2 日 18 時間**)。pane の外で CPU を回し続けている。上の zombie 3 つの親でもある。読み取りだけで確認し触っていない。止める・止めないは Director / ユーザーの判断。
+- Arjun t017 の長い無音は `awaiting_human` で止まっていた (ログイン期限の仮説は memory にある。未確証)。
+
+### 11-8. t003 (実装) に渡す変更範囲
+
+1. `lib_pane_process.py`: state が `Z` のノードを `_origin_of` の前に除外 (`_proc_state` を追加、または `_proc_stat` を拡張して helper を追従)。zombie は子を持たないので `children` の伝播は不要。
+2. `lib_pane_process.py`: `_origin_of` が OSError のとき即 return せず `saw_unknown = True` にして BFS を続ける (job が見つかれば `executing`)。ただし `_proc_stat` の列挙失敗 (E) は従来どおり即 `unknown` (木そのものが組み立てられない)。
+3. `watchdog.py`: `hard_idle_but_*` (unknown / executing / awaiting_human) が 600 秒続いたら `make_notify_once` で Director に 1 回 (`key=hard-idle-suppressed_<agent>`、`fp=<task>@<started_at>:<reason>`、slug=`_daemon`)。通知文に unknown にした node の pid / state / errno を載せる (確証を取る手段)。解けたら台帳キーを消す。
+4. `watchdog.py`: warn 分岐の `WARN:` ログ行と Taskvia alert を、理由が変わった時 + 10 cycle ごとに間引く。
+5. 閾値 600 秒は `CREWVIA_*` の env にしない (規則を共有する値には停止スイッチを付けない)。`config/crewvia.yaml` の `daemons:` に既定値を置く案は t002 (承認ゲート) で決める。
+6. テスト: 実プロセスの zombie を作って `idle_process` / 順序依存の 2 並びで `executing` になること (`repro.py` / `order2.py` の形)。赤の実証 (修正前に戻すと赤)。B / C / D は `unknown` のまま残ること (誤って infra に倒していない対照)。
+7. **本番反映は watchdog の restart が要る** (§7 / `knowledge/dispatcher-restart-after-merge.md`)。`lib_pane_process.py` は dispatcher も import するので両デーモン同時 (`sync-main-checkout.sh`)。
+8. 戻し方: PR revert → `sync-main-checkout.sh`。台帳の `hard-idle-suppressed_*` は消してよい (無い = 再通知)。

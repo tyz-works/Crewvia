@@ -378,6 +378,94 @@ def test_a_pending_forget_lost_by_a_restart_is_redone_from_the_ledger(tmp_path):
     assert _told_keys(told) == set()
 
 
+def _flaky_forget(told, fail_times):
+    """最初の fail_times 回だけ台帳の掃除に失敗する forget_key (ロック失敗の再現)。"""
+    state = {"n": 0}
+
+    def forget(key):
+        state["n"] += 1
+        if state["n"] <= fail_times:
+            return False
+        return lib_daemon_state.told_forget(told, key)
+    return forget
+
+
+def _notifier_with(tmp_path, clock, sent, forget_key):
+    told = tmp_path / "registry" / "daemons" / "notified-state.json"
+    notify_once = watchdog.make_notify_once(
+        tmp_path, send=lambda msg: sent.append(msg) or True, log=lambda m: None, now=clock)
+    return watchdog.SuppressedIdleNotifier(
+        notify_once, forget_key, 600, now=clock,
+        has_key=lambda k: watchdog._told_has_key(told, k),
+        list_keys=lambda: watchdog._told_keys(told)), told
+
+
+def test_a_failed_ledger_deletion_is_retried_by_the_cycle_without_any_forget(tmp_path):
+    """PR #278 Codex P2 (t011): 掃除が失敗して pending に残り、forget が二度と呼ばれなくても次のサイクルで消える。"""
+    clock, sent = Clock(), []
+    told = tmp_path / "registry" / "daemons" / "notified-state.json"
+    n, told = _notifier_with(tmp_path, clock, sent, _flaky_forget(told, 1))
+    monitor, d = _monitor(tmp_path), _detail("hard_idle_but_executing", "executing")
+    n.observe(monitor, d)
+    clock.t += 700
+    n.observe(monitor, d)
+    n.observe(monitor, watchdog.CheckResult("alive", "active", 5.0, "idle_process", False))
+    assert _told_keys(told) == {f"hard-idle-suppressed_{AGENT}"}      # 1 回目の掃除は失敗
+    n.cycle({AGENT})                                                  # forget は来ない。サイクルだけが回る
+    assert _told_keys(told) == set()
+
+
+def test_a_pending_deletion_is_done_before_the_suppressed_branch_decides_to_notify(tmp_path):
+    """掃除が残ったまま同じ試行で次の見送りが始まっても、通知は落ちない。"""
+    clock, sent = Clock(), []
+    told = tmp_path / "registry" / "daemons" / "notified-state.json"
+    n, told = _notifier_with(tmp_path, clock, sent, _flaky_forget(told, 1))
+    monitor, d = _monitor(tmp_path), _detail("hard_idle_but_executing", "executing")
+    n.observe(monitor, d)
+    clock.t += 700
+    n.observe(monitor, d)
+    assert len(sent) == 1
+    n.observe(monitor, watchdog.CheckResult("alive", "active", 5.0, "idle_process", False))  # 掃除は失敗
+    n.observe(monitor, d)                                              # 再発 (cycle を挟まない)
+    clock.t += 700
+    n.observe(monitor, d)
+    assert len(sent) == 2                                              # 古いキーに阻まれない
+
+
+def test_a_flush_that_raises_does_not_stop_the_cycle(tmp_path):
+    clock, sent = Clock(), []
+
+    def boom(key):
+        raise OSError("disk")
+    n, told = _notifier_with(tmp_path, clock, sent, boom)
+    lib_daemon_state.told_record(told, f"hard-idle-suppressed_{AGENT}",
+                                 {"fp": "x", "kind": "k", "slug": "_daemon", "task": "t", "at": 1.0})
+    n.cycle(set())                                                    # 例外は外に出ない
+    assert _told_keys(told) == {f"hard-idle-suppressed_{AGENT}"}      # 次のサイクルでまた試す
+
+
+def test_an_orphan_key_of_an_unmonitored_worker_is_swept_but_a_monitored_one_is_kept(tmp_path):
+    """通知後に再起動し、Worker が終わっていた (forget の対象が二度と現れない) キーを掃除する。"""
+    clock, sent = Clock(), []
+    n, told = _notifier_with(tmp_path, clock, sent, lambda k: lib_daemon_state.told_forget(
+        tmp_path / "registry" / "daemons" / "notified-state.json", k))
+    entry = {"fp": "x", "kind": "k", "slug": "_daemon", "task": "t", "at": 1.0}
+    lib_daemon_state.told_record(told, f"hard-idle-suppressed_{AGENT}", entry)
+    lib_daemon_state.told_record(told, "hard-idle-suppressed_Gone", entry)
+    lib_daemon_state.told_record(told, "usage-limit-overdue_Gone", entry)   # 別の族のキーには触らない
+    n.cycle({AGENT})
+    assert _told_keys(told) == {f"hard-idle-suppressed_{AGENT}", "usage-limit-overdue_Gone"}
+
+
+def test_an_unreadable_ledger_is_never_swept(tmp_path):
+    clock, sent = Clock(), []
+    n, told = _notifier_with(tmp_path, clock, sent, lambda k: True)
+    told.parent.mkdir(parents=True, exist_ok=True)
+    told.write_text("{not json")
+    n.cycle(set())
+    assert told.read_text() == "{not json"
+
+
 def test_a_healthy_worker_never_touches_the_ledger_lock(tmp_path):
     """台帳に key が無い Worker (大多数) の毎サイクルの観測は forget_key (= ロック + 書き込み) を呼ばない。"""
     calls = []
@@ -494,6 +582,8 @@ def _run_calls():
 def test_run_observes_every_monitor_each_cycle_and_forgets_through_one_helper():
     calls, run = _run_calls()
     assert ("suppressed_notifier", "observe") in calls
+    # 台帳の後始末は forget の経路に頼らず 1 サイクルに 1 回 (Worker ごとのループの外)。
+    assert calls.count(("suppressed_notifier", "cycle")) == 1
     assert ("warn_throttle", "should_emit") in calls
     # 監視から外すときの後始末は forget_monitor の 1 か所 (verdict_logger.forget を直に
     # 呼ぶ場所が残ると、見送り通知の台帳キーと WARN の間引きの記憶が取り残される)。

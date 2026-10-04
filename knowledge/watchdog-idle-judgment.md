@@ -740,3 +740,17 @@ Director が `sync-main-checkout.sh` で ff + 両デーモン再起動 (3 点の
 
 **11-10. 回復の判定は永続の台帳で (PR #278 Codex P2 / t009)**: `SuppressedIdleNotifier.forget()` は通知済みかをプロセス内の `st["notified"]` で決めていたため、watchdog の再起動をまたいで回復すると台帳キーが残り、同じ試行で次の見送りが 600 秒続いても通知が出なかった。いまは `has_key` (台帳の読み取り・ロックなし) で決める。台帳に無ければ forget_key (ロック + 書き込み) を呼ばない。台帳が読めなければ「居るかもしれない」で消す側に倒す。族の洗い出し (台帳の書き込み / 掃除でプロセス内状態に依存するもの): `SuppressedIdleNotifier._state/_pending_forget` = **本件で直した** / `usage-limit-overdue_*` の notify_once = 書くだけで掃除なし (fp で重複を止めるので再起動で二重にならない・対象外) / timeout 通知の台帳 = dispatcher の TTL prune が掃除 (プロセス内状態に依存しない) / `VerdictLogger`・`WarnLineThrottle` = ログのみで再起動は「初回扱い」(安全側)。赤の実証: forget を旧条件に戻すと `test_recovery_across_a_watchdog_restart_still_clears_the_ledger` と `test_a_pending_forget_lost_by_a_restart_is_redone_from_the_ledger` が落ちる。
 
+
+**11-11. 台帳の掃除は呼び出し経路に頼らない (PR #278 Codex P2 2 巡目 / t011)**: 指摘は「`flush()` が `forget()` からしか呼ばれない」。掃除が失敗して `_pending_forget` に残ると、その Worker の `forget` が二度と来ない状況 (回復済み・終了済み・次の観測が見送りの分岐) では永久に残り、同じ試行の次の見送りで古いキーが notify_once を黙らせる (しかも通知を判定したあとに flush が消すと 1 回落ちる)。直し: `SuppressedIdleNotifier.cycle(monitored_agents)` を run の 1 サイクルに 1 回 (Worker ごとのループの外) 呼び、そこで `flush` と孤児キーの掃除をする。`observe` の見送り分岐は通知の判定の前に `flush` する。`flush` は例外を握ってサイクルを止めず、次のサイクルで再試行する。
+
+SuppressedIdleNotifier の状態を「特定の呼び出し経路でしか進まないか」で全部洗った表 (3 つの状況で収束するか):
+
+| 状態 | 進める経路 | watchdog 再起動 | 呼び出されない経路 (forget が来ない) | 失敗の後 |
+|---|---|---|---|---|
+| `_pending_forget` | `forget` (追加) / `flush` (消す) | 失う → 台帳の `has_key` と `cycle` の孤児掃除が作り直す | **`cycle` が毎サイクル flush** (本件で直した) | `flush` が例外も握り、次のサイクルで再試行 |
+| 台帳キー (永続) | `observe` の通知 (書く) / `forget` (消す) | 残る → 回復は `has_key`、Worker が終わっていれば `cycle` の孤児掃除 (監視中のキーは残す。見送りの最中の再起動で二重通知にしない) | **`cycle` の孤児掃除** (本件で足した) | 台帳が読めなければ消さない (消す側に倒すのは `forget` の `has_key` だけ) |
+| `_state[key]["since"]` (episode の開始時刻) | `observe` (setdefault) / `forget` (pop) | 失う → 再起動時から数え直し = 通知が最大しきい値ぶん遅れるだけ (安全側。通知は台帳の fp が重複を止める) | 監視から外すときは必ず `forget_monitor` を通る (構造テスト) | 影響なし (メモリ上のみ) |
+| `_state[key]["kind"]` / `["msg"]` | `observe` | 失う → 再診断 1 回 | 同上 | 送れなかった場合は同じ文面で再送 (既存テスト) |
+| `_state[key]["notified"]` | `observe` が書くだけ | 読む箇所は無い (t009 で `forget` の判定を台帳に移した。残りは情報のみ) | — | — |
+
+赤の実証 (`tests/red_proof_hard_idle_unknown.py` に 5 点): `cycle` の flush を外す / 孤児キーの掃除を外す / 通知判定の前の flush を外す / flush が例外を握らない / run が `cycle` を呼ばない。

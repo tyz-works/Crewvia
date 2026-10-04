@@ -1312,6 +1312,16 @@ def _told_has_key(told_path: Path, key: str) -> bool:
     return key in told
 
 
+def _told_keys(told_path: Path):
+    """台帳のキー全部。台帳が無ければ空、読めなければ None (呼び出し側は「何もしない」に倒す)。"""
+    told = load_json_store(told_path, check=told_ledger_problem)
+    if _store_missing(told):
+        return set()
+    if _store_unreadable(told):
+        return None
+    return set(told)
+
+
 class SuppressedIdleNotifier:
     """hard_idle の終了を見送った状態が続いたら Director に 1 回知らせる (§11 / t003)。
 
@@ -1322,11 +1332,14 @@ class SuppressedIdleNotifier:
     観測した場合だけ消す)。台帳の slug は `_daemon` (mission slug だと `prune_told()` が捨てる)。
     """
 
-    def __init__(self, notify_once, forget_key, threshold: float, now=None, has_key=None) -> None:
+    def __init__(self, notify_once, forget_key, threshold: float, now=None, has_key=None,
+                 list_keys=None) -> None:
         self._notify_once = notify_once
         self._forget_key = forget_key
         # 台帳にこの key が居るか (読むだけ・ロックなし)。None なら「居るかもしれない」扱い。
         self._has_key = has_key
+        # 台帳の全キー (読むだけ。読めなければ None)。None の関数なら孤児の掃除はしない。
+        self._list_keys = list_keys
         self.threshold = threshold
         self._now = now or time.time
         self._state: dict[tuple[str, str], dict] = {}
@@ -1347,6 +1360,10 @@ class SuppressedIdleNotifier:
         lasted = now - st["since"]
         if lasted < self.threshold:
             return
+        # 前の試行の掃除が残っていれば、通知を判定する前に済ませる。台帳に古いキーが居ると
+        # notify_once が同じ fp と見て黙り、あとから flush が消して通知が 1 回落ちる
+        # (PR #278 Codex P2 2 巡目)。
+        self.flush()
         if st["kind"] != kind or st["msg"] is None:
             # 診断 (unknown の再走査) は種別が決まったとき 1 回だけ。毎サイクル /proc を
             # 歩かない。送れなかった場合も同じ文面で再送する。
@@ -1370,10 +1387,33 @@ class SuppressedIdleNotifier:
         self.flush()
 
     def flush(self) -> None:
-        """台帳キーの掃除を (失敗したものは次のサイクルで) やり直す。"""
+        """台帳キーの掃除を (失敗したものは次のサイクルで) やり直す。失敗でサイクルは止めない。"""
         for key in list(self._pending_forget):
-            if self._forget_key(key):
+            try:
+                done = self._forget_key(key)
+            except Exception as e:  # 台帳の不調で watchdog のサイクルを巻き込まない
+                _log(f"hard-idle 通知台帳の掃除に失敗 ({key}): {e}")
+                done = False
+            if done:
                 self._pending_forget.discard(key)
+
+    def cycle(self, monitored_agents) -> None:
+        """watchdog の 1 サイクルにつき 1 回 (Worker ごとではない)。forget / observe の呼び出し経路に
+        依存しない 2 つの収束をここに集める (PR #278 Codex P2 2 巡目)。
+
+        1. 掃除のやり直し (`flush`)。forget が二度と呼ばれない Worker (回復済み・終了済み) の
+           失敗した掃除もここで済む。
+        2. 孤児の掃除。台帳に見送りのキーが居るのに、その Worker がもう監視されていない
+           (通知後に watchdog が再起動し、Worker が終わったあとなど。forget は監視中の Worker にしか
+           呼ばれない) キーは、観測の根拠が無いので消す。監視中のキーには触らない (見送りの最中に
+           再起動しても二重通知にしない)。台帳が読めなければ何もしない。
+        """
+        keys = self._list_keys() if self._list_keys is not None else None
+        live = {f"{HARD_IDLE_SUPPRESSED_KEY_PREFIX}{a}" for a in monitored_agents}
+        for key in keys or ():
+            if key.startswith(HARD_IDLE_SUPPRESSED_KEY_PREFIX) and key not in live:
+                self._pending_forget.add(key)
+        self.flush()
 
 
 class WarnLineThrottle:
@@ -1522,6 +1562,7 @@ def run(repo_root: Path, interval: int) -> None:
         lambda key: told_forget(told_path, key, warn=_log),
         watch_config.hard_idle_suppressed_notify_seconds,
         has_key=lambda key: _told_has_key(told_path, key),
+        list_keys=lambda: _told_keys(told_path),
     )
     warn_throttle = WarnLineThrottle()
 
@@ -1639,6 +1680,10 @@ def run(repo_root: Path, interval: int) -> None:
                     profiles=PROFILES,
                     repo_root=repo_root,
                 )
+
+            # §11 (t011): 見送り通知の台帳の後始末は forget / observe の経路に頼らず、
+            # 1 サイクルに 1 回ここで収束させる (失敗した掃除のやり直し・孤児のキー)。
+            suppressed_notifier.cycle({m.agent_name for m in monitors.values()})
 
             # Evaluate every monitor's status up front (side-effect free) before
             # acting on any of them. This lets us tell "every single monitored

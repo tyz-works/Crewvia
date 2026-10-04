@@ -740,19 +740,20 @@ class WorkerMonitor:
             return "mux_pid_unavailable"
         return kind
 
-    def suppression_fp(self, kind: str) -> str:
-        """通知の fingerprint: 試行 (Execution ID。旧形式 card は started_at) + 種別。
-
-        同じ試行・同じ種別が続く間は 1 回。試行が変われば (同名 Worker の次の task) 再通知、
-        同じ試行で種別が変われば (unknown → awaiting_human 等) 再通知。
-        """
+    def suppression_ident(self) -> str:
+        """episode の識別子: 試行 (Execution ID。旧形式 card は started_at)。"""
         if self.execution_id:
             ident = self.execution_id
         elif self.card_started_at:
             ident = f"{self.task_id}@{self.card_started_at}"
         else:
             ident = self.task_id
-        return f"{ident}:{kind}"
+        return ident
+
+    def suppression_fp(self, kind: str) -> str:
+        """通知の fingerprint: `<episode の識別子>:<種別>`。台帳キーが種別ごとなので、同じ試行の
+        同じ種別は episode の間 1 回 (理由が往復しても再通知しない。§11-13)。"""
+        return f"{self.suppression_ident()}:{kind}"
 
     def suppression_message(self, kind: str, detail: "CheckResult", lasted: float) -> str:
         """Director への通知文。unknown のときは unknown にしたノード (pid / state / errno) を載せる。"""
@@ -1305,118 +1306,173 @@ HARD_IDLE_SUPPRESSED_KEY_PREFIX = "hard-idle-suppressed_"
 HARD_IDLE_SUPPRESSED_KIND = "hard-idle-suppressed"
 
 
-def _told_has_key(told_path: Path, key: str) -> bool:
-    """台帳に key が居るか。読めない台帳は「居るかもしれない」(消す側に倒す。消し忘れの害のほうが大きい)。"""
-    told = load_json_store(told_path, check=told_ledger_problem)
-    if _store_missing(told):
-        return False
-    if _store_unreadable(told):
-        return True
-    return key in told
+SUPPRESSION_KINDS = ("executing", "process_unknown", "mux_pid_unavailable", "awaiting_human")
+_KIND_SEP = "@"
 
 
-def _told_keys(told_path: Path):
-    """台帳のキー全部。台帳が無ければ空、読めなければ None (呼び出し側は「何もしない」に倒す)。"""
+def _told_entries(told_path: Path):
+    """台帳の {key: fp}。無ければ {}、読めなければ None (呼び出し側が向きを決める)。"""
     told = load_json_store(told_path, check=told_ledger_problem)
     if _store_missing(told):
-        return set()
+        return {}
     if _store_unreadable(told):
         return None
-    return set(told)
+    return {k: (v.get("fp") if isinstance(v, dict) else None) for k, v in told.items()}
+
+
+def suppression_key(agent: str, kind: str) -> str:
+    return f"{HARD_IDLE_SUPPRESSED_KEY_PREFIX}{agent}{_KIND_SEP}{kind}"
+
+
+def _split_suppression_key(key: str):
+    """台帳キー → (agent, kind)。見送りのキーでなければ None。"""
+    if not key.startswith(HARD_IDLE_SUPPRESSED_KEY_PREFIX):
+        return None
+    agent, sep, kind = key[len(HARD_IDLE_SUPPRESSED_KEY_PREFIX):].rpartition(_KIND_SEP)
+    return (agent, kind) if sep else None
+
+
+class SuppressionPlan(NamedTuple):
+    """`plan_suppression` の出力。notify = (台帳キー, fp, 理由) か None。forget = 消す台帳キー。"""
+    notify: Optional[tuple] = None
+    forget: tuple = ()
+
+
+def plan_suppression(told, agent: str, kind: Optional[str], ident: str,
+                     lasted: float, threshold: float, unsettled: bool = False) -> SuppressionPlan:
+    """見送り通知の状態の規則 (§11-13。ここ 1 か所。I/O もプロセス内の状態も持たない)。
+
+    episode = ある Worker・ある Execution ID (`ident`) の「見送りが続いている区間」。
+      始まり: 見送り (`kind` あり) の最初の観測。
+      終わり: 見送りでない観測 (`kind` None = 回復) / Worker が監視から外れる (消滅。呼び出し側が
+              kind None で渡す) / Execution ID の変化。終わったら Worker の台帳キーを全部消す。
+    episode の中では**理由 (kind) ごとに最大 1 回**通知する (理由が往復しても再通知しない)。
+
+    told: 台帳の {key: fp} (無ければ {}、読めなければ None)。通知済みかは台帳だけで決める
+    (watchdog が再起動しても同じ答えになる)。
+    - kind なし: この Worker の全キーを消す。台帳が読めなければ全種別のキーを消しにいく。
+    - `unsettled` (同じプロセスで episode を閉じたあと、掃除が済んだと台帳で確認できていない):
+      台帳に居る自分のキーは閉じた episode のものなので、居ないものとして判定し、消す。
+      閉じた episode の古いキーが次の episode の通知を黙らせるのを防ぐ。
+    - 見送りで lasted < threshold: 何もしない。
+    - 見送りで lasted >= threshold: 台帳に (key, fp) が既に居れば黙る。無ければ通知する
+      (台帳が読めなければ通知する = 再送側)。Execution ID の違う古い試行のキーは消す。
+    """
+    if kind is None:
+        if told is None:
+            return SuppressionPlan(forget=tuple(suppression_key(agent, k) for k in SUPPRESSION_KINDS))
+        return SuppressionPlan(forget=tuple(
+            k for k in told if _split_suppression_key(k) is not None
+            and _split_suppression_key(k)[0] == agent))
+    mine = ()
+    if unsettled:                       # 閉じた episode の古いキー。居ないものとして扱って消す
+        mine = (tuple(k for k in told if (_split_suppression_key(k) or (None,))[0] == agent)
+                if told is not None else tuple(suppression_key(agent, k) for k in SUPPRESSION_KINDS))
+    if lasted < threshold:
+        return SuppressionPlan(forget=mine)
+    key, fp = suppression_key(agent, kind), f"{ident}:{kind}"
+    stale = ()
+    if told is not None:
+        live = {k: v for k, v in told.items() if k not in mine}
+        stale = tuple(
+            k for k, v in live.items()
+            if k != key and _split_suppression_key(k) is not None
+            and _split_suppression_key(k)[0] == agent
+            and not str(v).startswith(f"{ident}:"))
+        if live.get(key) == fp:
+            return SuppressionPlan(forget=mine + stale)
+    return SuppressionPlan(notify=(key, fp, kind), forget=mine + stale)
 
 
 class SuppressedIdleNotifier:
-    """hard_idle の終了を見送った状態が続いたら Director に 1 回知らせる (§11 / t003)。
+    """hard_idle の終了を見送った状態が続いたら Director に知らせる (§11 / t003、§11-13 / t016)。
 
-    watchdog は unknown / executing / awaiting_human を殺さない (向きは変えない)。その代わり、
-    見送りが `threshold` 秒続いたことを `notify_once` (台帳つき) で Director に届ける —
-    以前は warn の行がログと Taskvia に出るだけで、Director の画面には何も届かなかった。
-    解けたとき (alive / terminate / task 完了) は台帳キーを消す (次に同じ状態が来たら再通知。
-    観測した場合だけ消す)。台帳の slug は `_daemon` (mission slug だと `prune_told()` が捨てる)。
+    watchdog は unknown / executing / awaiting_human を殺さない (向きは変えない)。判定は
+    `plan_suppression` (純粋関数) が全部決める。このクラスは台帳を読んで渡し、plan を実行するだけ。
+    プロセス内に持つのは episode の開始時刻と通知文の使い回しだけ (どちらも失っても安全側)。
+    台帳の slug は `_daemon` (mission slug だと `prune_told()` が捨てる)。
     """
 
-    def __init__(self, notify_once, forget_key, threshold: float, now=None, has_key=None,
-                 list_keys=None) -> None:
+    def __init__(self, notify_once, forget_key, threshold: float, now=None,
+                 read_ledger=None) -> None:
         self._notify_once = notify_once
         self._forget_key = forget_key
-        # 台帳にこの key が居るか (読むだけ・ロックなし)。None なら「居るかもしれない」扱い。
-        self._has_key = has_key
-        # 台帳の全キー (読むだけ。読めなければ None)。None の関数なら孤児の掃除はしない。
-        self._list_keys = list_keys
+        # 台帳の {key: fp} (読むだけ)。None の関数 / 読めない (None) は「分からない」。
+        self._read_ledger = read_ledger or (lambda: None)
         self.threshold = threshold
         self._now = now or time.time
+        # (agent, task_id) -> {"ident", "since", "msg", "msg_kind"}
         self._state: dict[tuple[str, str], dict] = {}
-        self._pending_forget: set[str] = set()
+        # episode を閉じた Worker (掃除が済んだと台帳で確認できるまで)。再起動で失っても、台帳の
+        # 規則 (plan_suppression) だけで収束する (失うのは「閉じた直後に再発し、かつ掃除が失敗し続ける」
+        # 窓だけ。§11-13)。
+        self._unsettled: set[str] = set()
 
-    @staticmethod
-    def ledger_key(monitor: "WorkerMonitor") -> str:
-        return f"{HARD_IDLE_SUPPRESSED_KEY_PREFIX}{monitor.agent_name}"
+    def _read(self):
+        try:
+            return self._read_ledger()
+        except Exception as e:
+            _log(f"hard-idle 通知台帳の読み取りに失敗: {e}")
+            return None
+
+    def _execute(self, plan: SuppressionPlan, send) -> bool:
+        """plan を実行する。台帳の不調で例外を外に出さない (失敗は次のサイクルの再計算で戻る)。"""
+        for key in plan.forget:
+            try:
+                self._forget_key(key)
+            except Exception as e:
+                _log(f"hard-idle 通知台帳の掃除に失敗 ({key}): {e}")
+        if plan.notify is None:
+            return True
+        key, fp, kind = plan.notify
+        try:
+            return bool(send(key, fp, kind))
+        except Exception as e:
+            _log(f"hard-idle 見送りの通知に失敗 ({key}): {e}")
+            return False
 
     def observe(self, monitor: "WorkerMonitor", detail: "CheckResult") -> None:
-        key = (monitor.agent_name, monitor.task_id)
+        agent, ident = monitor.agent_name, monitor.suppression_ident()
+        skey = (agent, monitor.task_id)
         kind = monitor.suppression_kind(detail)
         if kind is None:
             self.forget(monitor)
             return
         now = self._now()
-        st = self._state.setdefault(key, {"since": now, "notified": False, "kind": None, "msg": None})
+        st = self._state.get(skey)
+        if st is None or st["ident"] != ident:        # episode の始まり (新しい Execution ID も)
+            st = self._state[skey] = {"ident": ident, "since": now, "msg": None, "msg_kind": None}
         lasted = now - st["since"]
-        if lasted < self.threshold:
-            return
-        # 前の試行の掃除が残っていれば、通知を判定する前に済ませる。台帳に古いキーが居ると
-        # notify_once が同じ fp と見て黙り、あとから flush が消して通知が 1 回落ちる
-        # (PR #278 Codex P2 2 巡目)。
-        self.flush()
-        if st["kind"] != kind or st["msg"] is None:
-            # 診断 (unknown の再走査) は種別が決まったとき 1 回だけ。毎サイクル /proc を
-            # 歩かない。送れなかった場合も同じ文面で再送する。
-            st["kind"] = kind
-            st["msg"] = monitor.suppression_message(kind, detail, lasted)
-        if self._notify_once(self.ledger_key(monitor), monitor.suppression_fp(kind),
-                             HARD_IDLE_SUPPRESSED_KIND, "_daemon", monitor.task_id, st["msg"]):
-            st["notified"] = True
+        told = self._read()
+        plan = plan_suppression(told, agent, kind, ident, lasted, self.threshold,
+                                unsettled=agent in self._unsettled)
+        if agent in self._unsettled and told is not None and not plan.forget:
+            self._unsettled.discard(agent)            # 掃除が済んだことを台帳で確認した
+        if plan.notify is not None and st["msg_kind"] != kind:
+            # 診断 (unknown の再走査) は種別が決まったとき 1 回だけ。毎サイクル /proc を歩かない。
+            st["msg_kind"], st["msg"] = kind, monitor.suppression_message(kind, detail, lasted)
+        self._execute(plan, lambda key, fp, k: self._notify_once(
+            key, fp, HARD_IDLE_SUPPRESSED_KIND, "_daemon", monitor.task_id, st["msg"]))
 
     def forget(self, monitor: "WorkerMonitor") -> None:
-        """この Worker の見送りが解けた (または監視から外れた)。台帳にキーが居れば消す。
-
-        消すかどうかは**永続の台帳**で決める。プロセス内の `notified` に頼ると、watchdog の
-        再起動をまたいで回復したとき (新しいプロセスの `_state` は空) キーが残り、同じ試行で
-        次に見送りが始まっても通知が出ない (PR #278 Codex P2 / t009)。
-        """
+        """この Worker の episode が終わった (回復・監視から外れた)。台帳の自分のキーを全部消す。"""
         self._state.pop((monitor.agent_name, monitor.task_id), None)
-        key = self.ledger_key(monitor)
-        if self._has_key is None or self._has_key(key):
-            self._pending_forget.add(key)
-        self.flush()
-
-    def flush(self) -> None:
-        """台帳キーの掃除を (失敗したものは次のサイクルで) やり直す。失敗でサイクルは止めない。"""
-        for key in list(self._pending_forget):
-            try:
-                done = self._forget_key(key)
-            except Exception as e:  # 台帳の不調で watchdog のサイクルを巻き込まない
-                _log(f"hard-idle 通知台帳の掃除に失敗 ({key}): {e}")
-                done = False
-            if done:
-                self._pending_forget.discard(key)
+        plan = plan_suppression(self._read(), monitor.agent_name, None, "", 0, 0)
+        if plan.forget:
+            self._unsettled.add(monitor.agent_name)
+        self._execute(plan, None)
 
     def cycle(self, monitored_agents) -> None:
-        """watchdog の 1 サイクルにつき 1 回 (Worker ごとではない)。forget / observe の呼び出し経路に
-        依存しない 2 つの収束をここに集める (PR #278 Codex P2 2 巡目)。
-
-        1. 掃除のやり直し (`flush`)。forget が二度と呼ばれない Worker (回復済み・終了済み) の
-           失敗した掃除もここで済む。
-        2. 孤児の掃除。台帳に見送りのキーが居るのに、その Worker がもう監視されていない
-           (通知後に watchdog が再起動し、Worker が終わったあとなど。forget は監視中の Worker にしか
-           呼ばれない) キーは、観測の根拠が無いので消す。監視中のキーには触らない (見送りの最中に
-           再起動しても二重通知にしない)。台帳が読めなければ何もしない。
-        """
-        keys = self._list_keys() if self._list_keys is not None else None
-        live = {f"{HARD_IDLE_SUPPRESSED_KEY_PREFIX}{a}" for a in monitored_agents}
-        for key in keys or ():
-            if key.startswith(HARD_IDLE_SUPPRESSED_KEY_PREFIX) and key not in live:
-                self._pending_forget.add(key)
-        self.flush()
+        """watchdog の 1 サイクルにつき 1 回 (Worker ごとではない)。監視されていない Worker の
+        キー (通知後に watchdog が再起動して Worker が終わった等。forget は監視中の Worker にしか
+        来ない) は episode が終わっているので消す。台帳が読めなければ何もしない。"""
+        told = self._read()
+        if told is None:
+            return
+        live = set(monitored_agents)
+        orphans = {parts[0] for k in told if (parts := _split_suppression_key(k)) and parts[0] not in live}
+        for agent in sorted(orphans):
+            self._execute(plan_suppression(told, agent, None, "", 0, 0), None)
 
 
 class WarnLineThrottle:
@@ -1564,8 +1620,7 @@ def run(repo_root: Path, interval: int) -> None:
         usage_notify_once,
         lambda key: told_forget(told_path, key, warn=_log),
         watch_config.hard_idle_suppressed_notify_seconds,
-        has_key=lambda key: _told_has_key(told_path, key),
-        list_keys=lambda: _told_keys(told_path),
+        read_ledger=lambda: _told_entries(told_path),
     )
     warn_throttle = WarnLineThrottle()
 

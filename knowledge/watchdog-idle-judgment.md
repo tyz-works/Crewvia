@@ -738,22 +738,9 @@ Director が `sync-main-checkout.sh` で ff + 両デーモン再起動 (3 点の
 **戻し方**: PR を revert → `sync-main-checkout.sh`。台帳の `hard-idle-suppressed_*` は消してよい (無い = 再通知)。
 通知だけ止めたいなら `daemons.hard_idle_suppressed_notify_seconds` を大きくする (env は無い。watchdog の再起動が要る)。
 
-**11-10. 回復の判定は永続の台帳で (PR #278 Codex P2 / t009)**: `SuppressedIdleNotifier.forget()` は通知済みかをプロセス内の `st["notified"]` で決めていたため、watchdog の再起動をまたいで回復すると台帳キーが残り、同じ試行で次の見送りが 600 秒続いても通知が出なかった。いまは `has_key` (台帳の読み取り・ロックなし) で決める。台帳に無ければ forget_key (ロック + 書き込み) を呼ばない。台帳が読めなければ「居るかもしれない」で消す側に倒す。族の洗い出し (台帳の書き込み / 掃除でプロセス内状態に依存するもの): `SuppressedIdleNotifier._state/_pending_forget` = **本件で直した** / `usage-limit-overdue_*` の notify_once = 書くだけで掃除なし (fp で重複を止めるので再起動で二重にならない・対象外) / timeout 通知の台帳 = dispatcher の TTL prune が掃除 (プロセス内状態に依存しない) / `VerdictLogger`・`WarnLineThrottle` = ログのみで再起動は「初回扱い」(安全側)。赤の実証: forget を旧条件に戻すと `test_recovery_across_a_watchdog_restart_still_clears_the_ledger` と `test_a_pending_forget_lost_by_a_restart_is_redone_from_the_ledger` が落ちる。
+**11-10. 回復の判定は永続の台帳で (PR #278 Codex P2 / t009)**: 回復 (forget) が通知済みかをプロセス内の `st["notified"]` で決めていたため、watchdog の再起動をまたぐと台帳キーが残り、同じ試行の次の見送りで通知が出なかった。**§11-13 で構造ごと置き換えた** — 通知済みかは台帳だけで決め (`plan_suppression`)、プロセス内の状態に判定を依存させない。再発防止は網羅テスト (`tests/test_suppression_notifier_model.py` の I3。再起動と削除失敗の出来事を含む)。赤の実証: `tests/red_proof_hard_idle_unknown.py` の「【1 巡目 t009】」。族の洗い出し (台帳の書き込み / 掃除でプロセス内状態に依存するもの): `usage-limit-overdue_*` の notify_once = 書くだけで掃除なし (fp で重複を止めるので再起動で二重にならない・対象外) / timeout 通知の台帳 = dispatcher の TTL prune が掃除 / `VerdictLogger`・`WarnLineThrottle` = ログのみで再起動は「初回扱い」(安全側)。
 
-
-**11-11. 台帳の掃除は呼び出し経路に頼らない (PR #278 Codex P2 2 巡目 / t011)**: 指摘は「`flush()` が `forget()` からしか呼ばれない」。掃除が失敗して `_pending_forget` に残ると、その Worker の `forget` が二度と来ない状況 (回復済み・終了済み・次の観測が見送りの分岐) では永久に残り、同じ試行の次の見送りで古いキーが notify_once を黙らせる (しかも通知を判定したあとに flush が消すと 1 回落ちる)。直し: `SuppressedIdleNotifier.cycle(monitored_agents)` を run の 1 サイクルに 1 回 (Worker ごとのループの外) 呼び、そこで `flush` と孤児キーの掃除をする。`observe` の見送り分岐は通知の判定の前に `flush` する。`flush` は例外を握ってサイクルを止めず、次のサイクルで再試行する。
-
-SuppressedIdleNotifier の状態を「特定の呼び出し経路でしか進まないか」で全部洗った表 (3 つの状況で収束するか):
-
-| 状態 | 進める経路 | watchdog 再起動 | 呼び出されない経路 (forget が来ない) | 失敗の後 |
-|---|---|---|---|---|
-| `_pending_forget` | `forget` (追加) / `flush` (消す) | 失う → 台帳の `has_key` と `cycle` の孤児掃除が作り直す | **`cycle` が毎サイクル flush** (本件で直した) | `flush` が例外も握り、次のサイクルで再試行 |
-| 台帳キー (永続) | `observe` の通知 (書く) / `forget` (消す) | 残る → 回復は `has_key`、Worker が終わっていれば `cycle` の孤児掃除 (監視中のキーは残す。見送りの最中の再起動で二重通知にしない) | **`cycle` の孤児掃除** (本件で足した) | 台帳が読めなければ消さない (消す側に倒すのは `forget` の `has_key` だけ) |
-| `_state[key]["since"]` (episode の開始時刻) | `observe` (setdefault) / `forget` (pop) | 失う → 再起動時から数え直し = 通知が最大しきい値ぶん遅れるだけ (安全側。通知は台帳の fp が重複を止める) | 監視から外すときは必ず `forget_monitor` を通る (構造テスト) | 影響なし (メモリ上のみ) |
-| `_state[key]["kind"]` / `["msg"]` | `observe` | 失う → 再診断 1 回 | 同上 | 送れなかった場合は同じ文面で再送 (既存テスト) |
-| `_state[key]["notified"]` | `observe` が書くだけ | 読む箇所は無い (t009 で `forget` の判定を台帳に移した。残りは情報のみ) | — | — |
-
-赤の実証 (`tests/red_proof_hard_idle_unknown.py` に 5 点): `cycle` の flush を外す / 孤児キーの掃除を外す / 通知判定の前の flush を外す / flush が例外を握らない / run が `cycle` を呼ばない。
+**11-11. 台帳の掃除は呼び出し経路に頼らない (PR #278 Codex P2 2 巡目 / t011)**: 掃除が失敗してプロセス内の `_pending_forget` に残ると、その Worker の `forget` が二度と来ない状況で永久に残り、次の見送りで古いキーが通知を黙らせた。**§11-13 で構造ごと置き換えた** — `_pending_forget` を廃止し、掃除は毎回台帳を読んで「居る分を消す」(`forget` = 回復・消滅の観測、`cycle` = 監視されていない Worker のキー)。失敗は次のサイクルの再計算で自然にやり直される。再発防止は網羅テスト (I3・I5)。赤の実証: 「【2 巡目 t011】」。
 
 **11-12. zombie を飛ばすときに集めた子孫を落とさない (PR #278 Codex P1 3 巡目 / t013)**: 指摘は「`_classify` は children map を作ってから `_proc_state()` を読む。その間に包み役 (Bash tool の `bash -c` 等) が終わって zombie になると、`continue` がその子孫のキュー投入まで飛ばす」。生きている長いテストが木から消えて `executing` ではなく `idle_process` になり、**働いている Worker を hard_idle で terminate する向き**に倒れる (§11 の「kill が増えるのは zombie しか根拠がない場合だけ」を破る)。
 
@@ -799,4 +786,10 @@ SuppressedIdleNotifier の状態を「特定の呼び出し経路でしか進ま
 - 見送り・lasted がしきい値未満: 何もしない。
 - 見送り・しきい値以上: `told[key] == fp` なら黙る。そうでなければその理由を通知する。fp の Execution ID が現在と違う古い試行のキーは消す (I4: 前の試行から引き継がない)。台帳が読めなければ通知する (再送側に倒す。従来どおり)。
 
-網羅テスト (`tests/test_suppression_notifier_model.py`): 出来事 10 種の長さ 6 までの全ての並びを、実際の `SuppressedIdleNotifier` と tmp の台帳ファイルに流し、毎ステップ I1〜I5 を assert する。
+**実装の実績 (t016)**: `watchdog.plan_suppression()` (純粋関数。docstring に episode の定義) と、それを実行するだけの `SuppressedIdleNotifier` (`observe` / `forget` / `cycle`)。台帳キーは `hard-idle-suppressed_<agent>@<kind>`・fp `<Execution ID>:<kind>` (旧キー `hard-idle-suppressed_<agent>` は孤児として消えない — 接頭辞が一致しても `@` を含まないので触らない。台帳は消してよい = 再通知、で足りる)。コンストラクタは `has_key` / `list_keys` をやめ `read_ledger` (台帳の {key: fp}。無ければ {}、読めなければ None) 1 つにした。プロセス内に残るのは episode の開始時刻・通知文の使い回し・`_unsettled` (同じプロセスで episode を閉じた Worker。掃除が済んだと台帳で確認できるまで、台帳の自分のキーを「閉じた episode のもの」として扱う)。
+
+**網羅テスト** (`tests/test_suppression_notifier_model.py`): 出来事 11 種 (S_unk / S_exe / S_awh / recover / restart / write_fail / delete_fail / delete_raise / new_exec / vanish / tick。故障の 3 種は次のサイクルに効く) の**長さ 5 までの全ての並び** + 出来事を絞った全列挙 3 組 (長さ 6〜7) + seed 固定のランダム列 (長さ 6〜14)。実際の `SuppressedIdleNotifier` と tmp の台帳ファイルに流し、毎ステップ I1〜I5 を assert する。全 11 種の長さ 6 は 177 万並びで重いので、深い並びは出来事を絞って稼ぐ (閉じる掃除の失敗 → 再発 → 通知は長さ 6〜7 でないと現れず、最初は長さ 5 の全列挙だけで見逃した)。約 3 分。
+
+**既知の穴 (I2 から外している)**: 回復の掃除が失敗したまま watchdog が再起動し、同じ Execution ID で見送りが再発すると、古いキーが通知を黙らせる (掃除が成功するまで。`_unsettled` はプロセス内の状態で、再起動で失う)。掃除は毎サイクル台帳を読んでやり直すので、窓は「台帳の削除が失敗し続けている間」だけ。台帳に episode の印を持たせれば塞げるが、台帳の形を変えるので見送った。
+
+**赤の実証** (`tests/red_proof_hard_idle_unknown.py`): 1 巡目 (回復の判定をプロセス内の状態に戻す)・2 巡目 (cycle が掃除をやり直さない)・4 巡目 (台帳キーが理由ごとでなく Worker ごと) の欠陥を 1 つずつ戻すと網羅テストが狙った不変条件 (I3 / I3 / I1) で落ちる。他に: 閉じた episode の古いキーを消さない (I2) / 古い試行のキーを消さない (I4) / 掃除の例外を外に出す (I5)。

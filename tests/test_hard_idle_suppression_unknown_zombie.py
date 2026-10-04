@@ -1,0 +1,450 @@
+#!/usr/bin/env python3
+"""
+tests/test_hard_idle_suppression_unknown_zombie.py — hard_idle が unknown で永久に止まった件
+(§11 / mission 20261004-watchdog-hard-idle-unknown t003)
+
+設計: knowledge/watchdog-idle-judgment.md §11。
+
+  1. zombie (state=Z) は木から外す → zombie だけの木は idle_process (hard_idle で終了できる)
+  2. 読めない (EACCES) ノードで木全体を即 unknown にしない → job が他にあれば executing
+     (pid の並びに依存しない)。job が無ければ unknown のまま
+  3. unknown / executing / awaiting_human / mux_pid_unavailable の見送りが続いたら
+     Director に 1 回 (fp は Execution ID)。解けたら台帳キーを消す
+  4. `WARN:` の行は理由が変わった時 + 10 cycle ごと
+  5. 閾値は config `daemons.hard_idle_suppressed_notify_seconds` (既定 600・env なし)
+
+実プロセスを立てる (zombie は親が回収しない子、非 dumpable は prctl(PR_SET_DUMPABLE, 0))。
+EACCES にならない環境 (root 等) では、赤の実証にならないので skip する。
+
+実行: env -u AGENT_NAME python3 -m pytest tests/test_hard_idle_suppression_unknown_zombie.py -v
+"""
+
+import os
+import shlex
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import pytest
+
+TESTS_DIR = Path(__file__).resolve().parent
+SCRIPTS_DIR = TESTS_DIR.parent / "scripts"
+sys.path.insert(0, str(SCRIPTS_DIR))
+sys.path.insert(0, str(TESTS_DIR))
+
+import lib_daemon_state  # noqa: E402
+import lib_daemon_watch  # noqa: E402
+import lib_pane_process  # noqa: E402
+import watchdog  # noqa: E402
+from test_background_work_is_not_idle import (  # noqa: E402
+    _direct_children, _env_prefix, _job_wrapper_cmd, _kill_pane_tree, _mcp_like_cmd,
+    _write_wrapper_snapshot,
+)
+from test_usage_limit import NOTICE_REL, limited_screen  # noqa: E402
+from test_watchdog_idle import (  # noqa: E402
+    AGENT, TASK_ID, WINDOW, _FakeMux, _make_monitor, _write_activity,
+)
+
+# ---------------------------------------------------------------------------
+# 実プロセス木
+# ---------------------------------------------------------------------------
+
+#: 親が回収しない子 = zombie。親自身は CLAUDECODE を持つ infra (本番の `npm exec` 相当)。
+_ZOMBIE_PARENT = 'import os,time\nif os.fork()==0: os._exit(0)\ntime.sleep(300)'
+#: 非 dumpable (PR_SET_DUMPABLE=0): 生きているが environ が EACCES (ブラウザの sandbox 子等の形)。
+_NONDUMP = 'import ctypes,time\nctypes.CDLL(None).prctl(4,0,0,0,0)\ntime.sleep(300)'
+
+
+def _py_cmd(code: str, *, claudecode: bool = True) -> str:
+    env = {"CLAUDECODE": "1"} if claudecode else {}
+    return f"{_env_prefix(env)} {shlex.quote(sys.executable)} -c {shlex.quote(code)}"
+
+
+def _descendants(pid):
+    out, frontier = [], [pid]
+    while frontier:
+        nxt = []
+        for p in frontier:
+            kids = _direct_children(p)
+            out.extend(kids)
+            nxt.extend(kids)
+        frontier = nxt
+    return out
+
+
+def _spawn(cmds, *, wait_for=None):
+    """root sh の下に cmds を並べて走らせる (spawn 順 = pid 順)。"""
+    root = subprocess.Popen(["sh", "-c", " & ".join(cmds) + " & wait"], start_new_session=True)
+    deadline = time.time() + 6
+    while time.time() < deadline:
+        time.sleep(0.2)
+        if wait_for is None or wait_for(root.pid):
+            time.sleep(0.3)
+            break
+    return root
+
+
+def _zombies(root_pid):
+    return [p for p in _descendants(root_pid) if lib_pane_process._proc_state(p) == "Z"]
+
+
+@pytest.fixture
+def trees():
+    started = []
+
+    def make(cmds, wait_for=None):
+        root = _spawn(cmds, wait_for=wait_for)
+        started.append(root)
+        return root.pid
+
+    yield make
+    for proc in started:
+        _kill_pane_tree(proc)
+
+
+def _require_unreadable_environ(pid):
+    try:
+        Path(f"/proc/{pid}/environ").read_bytes()
+    except PermissionError:
+        return
+    except OSError:
+        pass
+    pytest.skip("この環境では対象ノードの environ が EACCES にならない (root 等)。赤の実証にならない")
+
+
+# ---------------------------------------------------------------------------
+# 1. zombie は木から外す
+# ---------------------------------------------------------------------------
+
+def test_a_zombie_child_does_not_make_the_tree_unknown(trees):
+    mcp = _mcp_like_cmd("npm exec @playwright/mcp@latest")
+    pane = trees([mcp, _py_cmd(_ZOMBIE_PARENT)], wait_for=_zombies)
+    zombie = _zombies(pane)
+    assert zombie, "前提: zombie が立っている"
+    _require_unreadable_environ(zombie[0])
+    assert lib_pane_process.classify_process_tree(pane) == "idle_process"
+
+
+def test_watchdog_terminates_hard_idle_for_a_zombie_only_tree(trees, tmp_path, monkeypatch):
+    """原因 A の Worker は本来の 3600 秒 (idle*2) で hard_idle の terminate になる。"""
+    mcp = _mcp_like_cmd("npm exec @playwright/mcp@latest")
+    pane = trees([mcp, _py_cmd(_ZOMBIE_PARENT)], wait_for=_zombies)
+    _require_unreadable_environ(_zombies(pane)[0])
+    monkeypatch.setattr(watchdog, "_mux", _FakeMux(WINDOW, pane))
+    monitor = _make_monitor(tmp_path, idle=300)
+    _write_activity(tmp_path, age_seconds=3000)
+    detail = monitor.check_detail()
+    assert (detail.verdict, detail.reason, detail.process_signal) == (
+        "terminate", "hard_idle", "idle_process")
+
+
+def test_usage_limit_with_a_zombie_tree_stays_alive(trees, tmp_path, monkeypatch):
+    """対照 (review t002 指摘 1): 利用枠切れの免除 (limit_excused) は zombie 除外より先に効く。"""
+    mcp = _mcp_like_cmd("npm exec @playwright/mcp@latest")
+    pane = trees([mcp, _py_cmd(_ZOMBIE_PARENT)], wait_for=_zombies)
+
+    class Mux(_FakeMux):
+        def capture(self, *a, **kw):
+            return limited_screen(NOTICE_REL)
+
+    monkeypatch.setattr(watchdog, "_mux", Mux(WINDOW, pane))
+    monitor = _make_monitor(tmp_path, idle=300)
+    _write_activity(tmp_path, age_seconds=3000)
+    detail = monitor.check_detail()
+    assert (detail.verdict, detail.reason) == ("alive", "usage_limit")
+
+
+# ---------------------------------------------------------------------------
+# 2. 読めないノードは job の探索を打ち切らない / B・C・D は unknown のまま
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("order", ["unreadable-first", "job-first"])
+def test_a_job_wins_over_an_unreadable_node_in_either_order(trees, tmp_path, order):
+    snap = _write_wrapper_snapshot(tmp_path)
+    job = _job_wrapper_cmd(snap, "sleep 300")
+    nondump = _py_cmd(_NONDUMP)
+    pane = trees([nondump, job] if order == "unreadable-first" else [job, nondump])
+    nd = next(p for p in _descendants(pane)
+              if "prctl" in (lib_pane_process._proc_cmdline(p) or ""))
+    _require_unreadable_environ(nd)
+    assert lib_pane_process.classify_process_tree(pane) == "executing"
+
+
+def test_an_unreadable_node_without_a_job_stays_unknown(trees):
+    pane = trees([_mcp_like_cmd("npm exec chrome"), _py_cmd(_NONDUMP)])
+    nd = next(p for p in _descendants(pane)
+              if "prctl" in (lib_pane_process._proc_cmdline(p) or ""))
+    _require_unreadable_environ(nd)
+    # 殺す根拠にしない向きは変えない: 読めないものは infra にも job にも倒さない。
+    assert lib_pane_process.classify_process_tree(pane) == "unknown"
+    notes = lib_pane_process.explain_unknown_tree(pane)
+    assert any(f"pid={nd}" in n and "errno=EACCES(13)" in n and "state=S" in n for n in notes), notes
+
+
+def test_a_process_without_claudecode_stays_unknown(trees):
+    """C: CLAUDECODE の無い子は infra に倒さない (t091 の契約。zombie 除外の巻き添えにしない)。"""
+    pane = trees([_mcp_like_cmd("npm exec foreign", claudecode=False)])
+    assert lib_pane_process.classify_process_tree(pane) == "unknown"
+    assert any("origin=unknown" in n for n in lib_pane_process.explain_unknown_tree(pane))
+
+
+def test_a_state_that_cannot_be_read_is_not_taken_for_a_zombie(monkeypatch, trees):
+    """`_proc_state` が None (読めない) のノードは外さない = 通常の分類に進む。"""
+    pane = trees([_mcp_like_cmd("npm exec foreign", claudecode=False)])
+    monkeypatch.setattr(lib_pane_process, "_proc_state", lambda pid: None)
+    assert lib_pane_process.classify_process_tree(pane) == "unknown"
+
+
+# ---------------------------------------------------------------------------
+# 3. 見送りの通知
+# ---------------------------------------------------------------------------
+
+class Clock:
+    def __init__(self):
+        self.t = 1_000_000.0
+
+    def __call__(self):
+        return self.t
+
+
+def _monitor(tmp_path, *, execution_id="ex-" + "a" * 32, card_started="2026-10-04T10:00:00Z"):
+    card = {
+        "worker": AGENT,
+        "timeout": {"idle": 300, "max": 36000},
+        "started_at": card_started,
+    }
+    if execution_id:
+        card["current_execution_id"] = execution_id
+    return watchdog.WorkerMonitor(task_id=TASK_ID, task_card=card,
+                                  profiles=watchdog.PROFILES, repo_root=tmp_path)
+
+
+def _detail(reason, process="unknown", awaiting=False, idle=3700.0):
+    return watchdog.CheckResult("warn", reason, idle, process, awaiting)
+
+
+@pytest.fixture
+def notifier(tmp_path):
+    clock = Clock()
+    sent = []
+    notify_once = watchdog.make_notify_once(
+        tmp_path, send=lambda msg: sent.append(msg) or True, log=lambda m: None, now=clock)
+    told = tmp_path / "registry" / "daemons" / "notified-state.json"
+    n = watchdog.SuppressedIdleNotifier(
+        notify_once, lambda key: lib_daemon_state.told_forget(told, key), 600, now=clock)
+    return n, clock, sent, told
+
+
+def _told_keys(told):
+    store = lib_daemon_state.load_json_store(told, check=lib_daemon_state.told_ledger_problem)
+    return set() if lib_daemon_state.is_missing(store) else set(store)
+
+
+@pytest.mark.parametrize("reason,process,awaiting,needle", [
+    ("hard_idle_but_process_unknown", "unknown", False, "process=unknown"),
+    ("hard_idle_but_executing", "executing", False, "process=executing"),
+    ("hard_idle_but_awaiting_human", "idle_process", True, "awaiting_human"),
+])
+def test_a_suppressed_hard_idle_notifies_the_director_once_after_the_threshold(
+        notifier, tmp_path, monkeypatch, reason, process, awaiting, needle):
+    n, clock, sent, told = notifier
+    monkeypatch.setattr(watchdog, "explain_unknown_tree", lambda pid: ["pid=7 state=Z errno=EACCES(13)"])
+    monitor = _monitor(tmp_path)
+    monitor._last_pane_pid = 4242
+    detail = _detail(reason, process, awaiting)
+    n.observe(monitor, detail)                    # 見送りの開始
+    clock.t += 599
+    n.observe(monitor, detail)
+    assert sent == []                             # しきい値の前は黙る
+    clock.t += 2
+    n.observe(monitor, detail)
+    assert len(sent) == 1 and needle in sent[0]
+    for _ in range(20):                           # 以後のサイクルでは再送しない
+        clock.t += 32
+        n.observe(monitor, detail)
+    assert len(sent) == 1
+    assert _told_keys(told) == {f"hard-idle-suppressed_{AGENT}"}
+
+
+def test_unknown_message_carries_the_node_diagnosis(notifier, tmp_path, monkeypatch):
+    n, clock, sent, _ = notifier
+    monkeypatch.setattr(watchdog, "explain_unknown_tree", lambda pid: ["pid=7 state=Z errno=EACCES(13)"])
+    monitor = _monitor(tmp_path)
+    monitor._last_pane_pid = 4242
+    n.observe(monitor, _detail("hard_idle_but_process_unknown"))
+    clock.t += 700
+    n.observe(monitor, _detail("hard_idle_but_process_unknown"))
+    assert "pid=7 state=Z errno=EACCES(13)" in sent[0]
+
+
+def test_a_missing_pane_pid_is_reported_as_mux_pid_unavailable(notifier, tmp_path, monkeypatch):
+    """窓はあるが pane pid が引けない (mux の不調) — 木を見ていないので理由を分ける。"""
+    n, clock, sent, _ = notifier
+    monkeypatch.setattr(watchdog, "_mux", type("M", (), {
+        "list": lambda self, suffix=None: [WINDOW], "pid": lambda self, name: None})())
+    monitor = _monitor(tmp_path)
+    assert monitor._process_signal() == "unknown"
+    detail = _detail("hard_idle_but_process_unknown")
+    assert monitor.suppression_kind(detail) == "mux_pid_unavailable"
+    n.observe(monitor, detail)
+    clock.t += 700
+    n.observe(monitor, detail)
+    assert len(sent) == 1 and "mux_pid_unavailable" in sent[0]
+
+
+def test_the_fingerprint_is_the_execution_id_with_a_started_at_fallback(tmp_path):
+    new = _monitor(tmp_path, execution_id="ex-" + "b" * 32)
+    assert new.suppression_fp("executing") == "ex-" + "b" * 32 + ":executing"
+    legacy = _monitor(tmp_path, execution_id="", card_started="2026-10-04T10:00:00Z")
+    assert legacy.suppression_fp("executing") == f"{TASK_ID}@2026-10-04T10:00:00Z:executing"
+    # 同じ card なら監視 object を作り直しても (watchdog の再起動) 同じ fp
+    assert _monitor(tmp_path, execution_id="").suppression_fp("executing") == legacy.suppression_fp("executing")
+
+
+def test_a_new_attempt_by_the_same_worker_notifies_again(notifier, tmp_path):
+    n, clock, sent, _ = notifier
+    d = _detail("hard_idle_but_executing", "executing")
+    first = _monitor(tmp_path, execution_id="ex-" + "1" * 32)
+    n.observe(first, d)
+    clock.t += 700
+    n.observe(first, d)
+    n.forget(first)                                # 試行の終わり
+    second = _monitor(tmp_path, execution_id="ex-" + "2" * 32)
+    n.observe(second, d)
+    clock.t += 700
+    n.observe(second, d)
+    assert len(sent) == 2
+
+
+def test_recovery_clears_the_ledger_key_and_a_relapse_notifies_again(notifier, tmp_path):
+    n, clock, sent, told = notifier
+    monitor = _monitor(tmp_path)
+    d = _detail("hard_idle_but_executing", "executing")
+    n.observe(monitor, d)
+    clock.t += 700
+    n.observe(monitor, d)
+    assert _told_keys(told) == {f"hard-idle-suppressed_{AGENT}"}
+    n.observe(monitor, watchdog.CheckResult("alive", "active", 5.0, "idle_process", False))
+    assert _told_keys(told) == set()               # 解けた = 台帳キーを消す
+    n.observe(monitor, d)                          # 再発
+    clock.t += 700
+    n.observe(monitor, d)
+    assert len(sent) == 2
+
+
+def test_a_failed_send_is_retried_and_not_recorded(tmp_path):
+    clock = Clock()
+    results = iter([False, True])
+    sent = []
+    nonce = watchdog.make_notify_once(
+        tmp_path, send=lambda m: sent.append(m) or next(results), log=lambda m: None, now=clock)
+    told = tmp_path / "registry" / "daemons" / "notified-state.json"
+    n = watchdog.SuppressedIdleNotifier(nonce, lambda k: lib_daemon_state.told_forget(told, k), 600, now=clock)
+    monitor, d = _monitor(tmp_path), _detail("hard_idle_but_executing", "executing")
+    n.observe(monitor, d)
+    clock.t += 700
+    n.observe(monitor, d)                          # 送れなかった
+    assert _told_keys(told) == set()
+    clock.t += 32
+    n.observe(monitor, d)                          # 次のサイクルで再送
+    assert len(sent) == 2 and _told_keys(told) == {f"hard-idle-suppressed_{AGENT}"}
+
+
+def test_an_unsuppressed_verdict_is_never_notified(notifier, tmp_path):
+    n, clock, sent, _ = notifier
+    monitor = _monitor(tmp_path)
+    for detail in (_detail("soft_idle", "idle_process"),
+                   watchdog.CheckResult("terminate", "hard_idle", 4000.0, "idle_process", False)):
+        n.observe(monitor, detail)
+        clock.t += 5000
+        n.observe(monitor, detail)
+    assert sent == []
+
+
+def test_told_forget_is_idempotent(tmp_path):
+    told = tmp_path / "registry" / "daemons" / "notified-state.json"
+    assert lib_daemon_state.told_forget(told, "absent") is True          # 台帳が無い
+    entry = {"fp": "x", "kind": "k", "slug": "_daemon", "task": "t", "at": 1.0}
+    assert lib_daemon_state.told_record(told, "a", entry)
+    assert lib_daemon_state.told_record(told, "b", entry)
+    assert lib_daemon_state.told_forget(told, "a") is True
+    assert _told_keys(told) == {"b"}
+    assert lib_daemon_state.told_forget(told, "a") is True
+
+
+# ---------------------------------------------------------------------------
+# 4. WARN 行の間引き
+# ---------------------------------------------------------------------------
+
+def test_warn_lines_are_thinned_to_reason_changes_and_every_n_cycles(tmp_path):
+    th = watchdog.WarnLineThrottle(summary_every=10)
+    monitor = _monitor(tmp_path)
+    d1, d2 = _detail("hard_idle_but_process_unknown"), _detail("hard_idle_but_awaiting_human")
+    emitted = [th.should_emit(monitor, d1) for _ in range(25)]
+    assert [i for i, e in enumerate(emitted) if e] == [0, 10, 20]
+    assert th.should_emit(monitor, d2) is True                            # 理由が変わった
+    th.forget(monitor)                                                    # warn でなくなった
+    assert th.should_emit(monitor, d1) is True                            # 初回扱いに戻る
+
+
+# ---------------------------------------------------------------------------
+# 5. 設定値
+# ---------------------------------------------------------------------------
+
+def _cfg(tmp_path, text, env=None):
+    path = tmp_path / "crewvia.yaml"
+    path.write_text(text)
+    return lib_daemon_watch.load_config(path, env=env or {})
+
+
+def test_the_threshold_default_is_in_one_place_and_the_shipped_config_matches(tmp_path):
+    assert lib_daemon_watch.WatchConfig().hard_idle_suppressed_notify_seconds == 600
+    shipped = lib_daemon_watch.load_config(env={})
+    assert shipped.hard_idle_suppressed_notify_seconds == 600
+
+
+def test_the_threshold_comes_from_config_and_has_no_env_override(tmp_path):
+    text = "daemons:\n  hard_idle_suppressed_notify_seconds: 123\n"
+    assert _cfg(tmp_path, text).hard_idle_suppressed_notify_seconds == 123
+    env = {"CREWVIA_DAEMON_HARD_IDLE_SUPPRESSED_NOTIFY_SECONDS": "5"}
+    assert _cfg(tmp_path, text, env).hard_idle_suppressed_notify_seconds == 123
+
+
+@pytest.mark.parametrize("bad", ["abc", "0", "-5", "null"])
+def test_an_unusable_threshold_falls_back_to_the_default(tmp_path, bad):
+    cfg = _cfg(tmp_path, f"daemons:\n  hard_idle_suppressed_notify_seconds: {bad}\n")
+    assert cfg.hard_idle_suppressed_notify_seconds == 600
+
+
+# ---------------------------------------------------------------------------
+# 6. 配線 (run() の中。ループ全体は走らせられないので AST で固定する)
+# ---------------------------------------------------------------------------
+
+def _run_calls():
+    import ast
+    tree = ast.parse((SCRIPTS_DIR / "watchdog.py").read_text())
+    run = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "run")
+    calls = []
+    for node in ast.walk(run):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) \
+                and isinstance(node.func.value, ast.Name):
+            calls.append((node.func.value.id, node.func.attr))
+    return calls, run
+
+
+def test_run_observes_every_monitor_each_cycle_and_forgets_through_one_helper():
+    calls, run = _run_calls()
+    assert ("suppressed_notifier", "observe") in calls
+    assert ("warn_throttle", "should_emit") in calls
+    # 監視から外すときの後始末は forget_monitor の 1 か所 (verdict_logger.forget を直に
+    # 呼ぶ場所が残ると、見送り通知の台帳キーと WARN の間引きの記憶が取り残される)。
+    direct = [c for c in calls if c == ("verdict_logger", "forget")]
+    assert len(direct) == 1, "verdict_logger.forget は forget_monitor の中の 1 回だけ"
+    import ast
+    helper = next(n for n in ast.walk(run) if isinstance(n, ast.FunctionDef) and n.name == "forget_monitor")
+    inner = [(n.func.value.id, n.func.attr) for n in ast.walk(helper)
+             if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+             and isinstance(n.func.value, ast.Name)]
+    assert {("verdict_logger", "forget"), ("warn_throttle", "forget"),
+            ("suppressed_notifier", "forget")} <= set(inner)

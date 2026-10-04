@@ -784,3 +784,19 @@ SuppressedIdleNotifier の状態を「特定の呼び出し経路でしか進ま
 検証: `test_a_wrapper_that_turns_zombie_after_the_snapshot_keeps_its_job` (実プロセスの木 + `_proc_state` の差し替えで「snapshot 時は生きている・読む時点で Z」を作る。マイクロ秒の窓は実時間で再現できない)、`test_the_children_of_a_zombie_are_not_taken_for_a_session_body`。赤の実証は `tests/red_proof_hard_idle_unknown.py` に 3 点 (子を積まない / 子に None を渡す / 通知文から mission を外す)。
 
 **通知文 (t013 追加)**: 文頭に `mission <slug>` を入れた (task id だけでは別 mission の同名 task と区別できない。`WorkerMonitor(mission_slug=...)`、run が slug を渡す)。文末は「…ため終了を見送っています」をやめ、「終了を見送っています。理由: <理由>・該当ノード pid=… state=… errno=…。」と理由と根拠を分けた。
+
+**11-13. 見送り通知の状態を 1 つの純粋関数にする (PR #278 Codex P2 4 巡目 / t016。設計)**: 1・2・4 巡目の指摘は同じ型 — 通知の状態が「プロセス内 (`_state` / `_pending_forget`)」と「台帳 (Worker ごとに 1 キー・fp が `<Execution ID>:<種別>` の 1 つ)」に散り、一部の経路だけ直しても別の経路が残った。4 巡目は、1 キーに fp が 1 つしか入らないため、episode の中で unknown → executing → unknown と理由が往復するたびに fp が変わり同じ理由が何度も通知される、というもの。
+
+**episode の定義 (ここ 1 か所)**: ある Worker・ある Execution ID の「見送りが続いている区間」。
+- 始まり: 見送り (`suppression_kind() is not None`) を最初に観測したとき。
+- 終わり: ① 見送りでない判定 (alive / terminate など) を観測 ② Worker が監視から外れる (消滅) ③ Execution ID が変わる。終わったら、その Worker の台帳キーを全部消す。
+- episode の中では**理由 (kind) ごとに最大 1 回**通知する。理由が往復しても、通知済みの理由は再通知しない。しきい値 (既定 600 秒) は episode の経過時間で、再起動すると数え直す (通知が最大しきい値ぶん遅れるだけ。台帳が重複を止める)。
+
+**永続の状態は台帳だけ**: キーを理由ごとに分ける — `hard-idle-suppressed_<agent>@<kind>`・fp `<Execution ID>:<kind>`。「その理由は通知済みか」は台帳の fp を見れば分かる。プロセス内に判定を依存させない (`_pending_forget` は廃止。掃除は毎回台帳を読んで「居る分を消す」ので、失敗は次のサイクルで自然にやり直される)。
+
+**純粋関数**: `plan_suppression(told, agent, kind, ident, lasted, threshold) -> SuppressionPlan(notify, forget)`。`told` は `{key: fp}` (台帳が無ければ `{}`、読めなければ `None`)。I/O をしない。`SuppressedIdleNotifier` は (1) 台帳を読む (2) `plan_suppression` に渡す (3) plan を実行する (台帳の掃除・notify_once) だけ。
+- 見送りでない (kind なし。回復・消滅): その Worker の全キーを消す。台帳が読めなければ全種別のキーを消しにいく (消す側に倒す)。
+- 見送り・lasted がしきい値未満: 何もしない。
+- 見送り・しきい値以上: `told[key] == fp` なら黙る。そうでなければその理由を通知する。fp の Execution ID が現在と違う古い試行のキーは消す (I4: 前の試行から引き継がない)。台帳が読めなければ通知する (再送側に倒す。従来どおり)。
+
+網羅テスト (`tests/test_suppression_notifier_model.py`): 出来事 10 種の長さ 6 までの全ての並びを、実際の `SuppressedIdleNotifier` と tmp の台帳ファイルに流し、毎ステップ I1〜I5 を assert する。

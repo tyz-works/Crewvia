@@ -908,6 +908,11 @@ class WatchConfig:
     respawn_grace_seconds: int = 120
     pause_report_after_seconds: int = 1800
     hold_report_after_seconds: int = 1800
+    #: t003 / §11: hard_idle の終了が unknown / executing / awaiting_human で見送られた状態が
+    #: この秒数続いたら Director に 1 回知らせる (watchdog だけが読む)。**env は付けない** —
+    #: 停止スイッチではなく、両デーモンで揃える必要も無い値 (`_CONFIG_KEYS` に入れない)。
+    #: 既定値を持つのはここ 1 か所。
+    hard_idle_suppressed_notify_seconds: int = 600
     #: How long each side waits for the per-daemon lock (see `daemon_lock`).
     #: The watch side is short on purpose — a watcher that blocks on the lock
     #: is a watcher that is not running its own daemon's cycle, and holding is
@@ -965,6 +970,15 @@ def load_config(config_path=None, env=None) -> WatchConfig:
                 setattr(cfg, key, int(block[key]))
             except (TypeError, ValueError):
                 pass
+
+    # env を読まない値 (上の `hard_idle_suppressed_notify_seconds` の注記)。正の整数だけ受け入れる。
+    if "hard_idle_suppressed_notify_seconds" in block:
+        try:
+            value = int(block["hard_idle_suppressed_notify_seconds"])
+            if value > 0:
+                cfg.hard_idle_suppressed_notify_seconds = value
+        except (TypeError, ValueError):
+            pass
 
     if "CREWVIA_DAEMON_MUTUAL_WATCH" in env:
         cfg.enabled = _truthy(str(env["CREWVIA_DAEMON_MUTUAL_WATCH"]))

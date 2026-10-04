@@ -122,6 +122,14 @@ daemons:
   # 「作業が終わった」の証拠ではなく、作業途中の相手を起こすと二重起動になるため。
   pause_report_after_seconds: 1800
 
+  # watchdog が hard_idle (idle 1 時間超) の終了を「見送った」状態 — 木に unknown がある・
+  # 裏で job が走っている (executing)・人間待ち (awaiting_human)・mux から pane pid が
+  # 引けない (mux_pid_unavailable) — がこの秒数続いたら、Director に 1 回だけ知らせます
+  # (同じ試行・同じ理由では再送しません)。**終了はしません** (殺す条件は変わらない。
+  # 最後の網は max)。env での上書きは付けていません (watchdog だけが読む値です)。
+  # 既定値は scripts/lib_daemon_watch.py の WatchConfig で持ちます。
+  hard_idle_suppressed_notify_seconds: 600
+
 # ===== Taskvia 連携 =====
 # Taskvia 承認フローの使用モードを指定します。
 #

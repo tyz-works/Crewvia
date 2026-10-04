@@ -227,6 +227,7 @@ Bash tool のラッパー配下で job の証拠 (cmdline marker / environ) が�
 到達しない。安全弁は既存の watchdog 絶対上限 (`max_threshold`) のみで、この task
 (exec によるマーカー消失) の対象外の残存リスクとして明記する。
 """
+import errno
 import os
 from collections import deque
 from pathlib import Path
@@ -330,6 +331,25 @@ def _proc_stat(pid: int) -> Optional[tuple[int, int, str]]:
         return int(rest[1]), int(rest[19]), comm
     except ValueError:
         return None
+
+
+def _proc_state(pid: int) -> Optional[str]:
+    """/proc/<pid>/stat の state 欄 (`R` `S` `Z` ...) を返す (t003 / §11)。
+
+    `_proc_stat` のタプルは `_direct_children()` 等のテスト helper が 3 要素で
+    展開しているので拡張せず、state だけ別関数で読む。消滅・読めない・壊れた行は
+    None (= 「zombie と確定できない」。呼び出し側は通常どおり分類に進む —
+    zombie でないものを zombie と読んで木から外す向きの誤りを作らない)。
+    """
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_bytes().decode("utf-8", errors="replace")
+    except OSError:
+        return None
+    close_paren = raw.rfind(")")
+    if close_paren < 0:
+        return None
+    rest = raw[close_paren + 1:].split()
+    return rest[0] if rest else None
 
 
 def _proc_cmdline(pid: int) -> Optional[str]:
@@ -464,6 +484,36 @@ def _origin_of(pid: int) -> Literal["job", "infra", "unknown"]:
 
 
 def classify_process_tree(root_pid: int) -> ProcessSignal:
+    """mux ペインのプロセス木を 3 値に分類する (本体は `_classify`)。
+
+    §11 (t003) の変更 2 点 (詳細は `_classify` の docstring 末尾):
+      - state が `Z` (zombie) のノードは木から外す (仕事をしておらず、
+        environ が EACCES で `unknown` の主因だった)。
+      - cmdline / environ / exe が読めない (EACCES 等) ノードで木全体を即
+        `unknown` にせず、BFS を続けて job を探す (job が見つかれば `executing`)。
+    """
+    return _classify(root_pid, None)
+
+
+def explain_unknown_tree(root_pid: int) -> list[str]:
+    """`classify_process_tree` が `unknown` を返した理由のノード別の一覧 (診断用)。
+
+    通知文に載せて「何が unknown にしたか」(pid / state / errno) を確定させるための
+    読み取り専用の再走査。判定には使わない。空 = 説明できる材料が無い (木が変わった等)。
+    """
+    notes: list[str] = []
+    _classify(root_pid, notes)
+    return notes
+
+
+def _errno_name(exc: OSError) -> str:
+    code = getattr(exc, "errno", None)
+    if code is None:
+        return type(exc).__name__
+    return f"{errno.errorcode.get(code, code)}({code})"
+
+
+def _classify(root_pid: int, notes: Optional[list[str]]) -> ProcessSignal:
     """mux ペインのプロセス木を 3 値に分類する。
 
     本番のペインは常にこの形をしている (2026-09-21 実測, Ren-worker。
@@ -523,9 +573,11 @@ def classify_process_tree(root_pid: int) -> ProcessSignal:
     """
     try:
         root_stat = _proc_stat(root_pid)
-    except OSError:
+    except OSError as exc:
         # root 自身が「消滅」以外の理由 (EACCES 等) で読めない — わからない
         # ことを no_process (= 死んだ扱い) に潰さない (t049 族A監査)。
+        if notes is not None:
+            notes.append(f"pane root pid={root_pid} stat unreadable errno={_errno_name(exc)}")
         return "unknown"
     if root_stat is None:
         return "no_process"
@@ -533,19 +585,23 @@ def classify_process_tree(root_pid: int) -> ProcessSignal:
     procs: dict[int, tuple[int, int, str]] = {}
     try:
         proc_entries = list(Path("/proc").iterdir())
-    except OSError:
+    except OSError as exc:
+        if notes is not None:
+            notes.append(f"/proc enumeration failed errno={_errno_name(exc)}")
         return "unknown"
     for entry in proc_entries:
         if not entry.name.isdigit():
             continue
         try:
             st = _proc_stat(int(entry.name))
-        except OSError:
+        except OSError as exc:
             # この pid が「消滅」以外の理由で読めない。None に潰して静かに
             # スキップすると、この pid を親に持つ (読めている) 子孫が
             # children から永久に辿り着けなくなり、生きている裏 job のサブ
             # ツリーごと見えなくなる (t049 族A監査: 観測失敗を「子孫なし」に
             # 倒していた)。わからないことは "unknown" として呼び出し側に返す。
+            if notes is not None:
+                notes.append(f"pid={entry.name} stat unreadable errno={_errno_name(exc)}")
             return "unknown"
         if st is not None:
             procs[int(entry.name)] = st
@@ -570,6 +626,12 @@ def classify_process_tree(root_pid: int) -> ProcessSignal:
         if pid in seen:
             continue
         seen.add(pid)
+        if _proc_state(pid) == "Z":
+            # §11 (t003): zombie は仕事をしていない (回収待ちの死骸)。environ が EACCES で
+            # 木全体を unknown にしていた主因。子は親の回収時に再親化されて木から
+            # 消えるので、zombie の下に「見えなくなる job」は無い。判定に寄与させない
+            # (saw_unknown も立てない)。state が読めない / 消滅は None = 通常の分類へ。
+            continue
         try:
             if parent_origin == "job":
                 origin = "job"  # job の子孫は cmdline/environ を見るまでもなく job
@@ -582,14 +644,26 @@ def classify_process_tree(root_pid: int) -> ProcessSignal:
                 origin = "session"
             else:
                 origin = _origin_of(pid)
-        except OSError:
+        except OSError as exc:
             # t082 P1 / t091 / t097: cmdline / environ / exe のいずれかが消滅以外の
             # 理由で読めない (EACCES 等)。「マーカーが無い」(= job でもセッションでも
             # ない) に潰すと、読めないノードが Bash tool のラッパー自身やセッション
             # 本体だったときに本物の job が idle_process に化け、watchdog が
-            # hard-idle で terminate してしまう。木全体を `unknown` に倒す
-            # (_proc_stat の列挙失敗と同じ扱い)。
-            return "unknown"
+            # hard-idle で terminate してしまう。よって `idle_process` にはしない。
+            #
+            # §11 (t003): ただし木全体を即 `unknown` にもしない (旧実装は即 return で、
+            # 別ノードに本物の job があっても pid の並び次第で `executing` にならなかった
+            # = docstring の「job が他所で見つかればそちらが勝つ」に反していた)。
+            # `unknown` 扱いにして BFS を続ける: job が見つかれば `executing`、
+            # 無ければ最後に `unknown`。読めないノードの子は origin 不明のまま渡す
+            # ("job" でなければ特別扱いしないので、子は独立に判定される)。
+            if notes is not None:
+                notes.append(
+                    f"pid={pid} state={_proc_state(pid) or '?'} errno={_errno_name(exc)}")
+            saw_unknown = True
+            for child in children.get(pid, []):
+                queue.append((child, "unknown"))
+            continue
         if origin == "job":
             return "executing"  # job はどこで見つかっても即座に確定する
         if origin == "unknown":
@@ -598,6 +672,10 @@ def classify_process_tree(root_pid: int) -> ProcessSignal:
             # そちらを優先する (job が最優先の signal であることは変わらない)。
             # job が他に無ければ、最後に unknown として返す。
             saw_unknown = True
+            if notes is not None:
+                notes.append(
+                    f"pid={pid} state={_proc_state(pid) or '?'} origin=unknown "
+                    f"(CLAUDECODE も job も無い)")
         for child in children.get(pid, []):
             queue.append((child, origin))
 

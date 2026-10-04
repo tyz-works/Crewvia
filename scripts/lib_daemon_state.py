@@ -271,6 +271,29 @@ def told_record(path, key, entry, warn=None):
         return write_told_atomic(path, told)
 
 
+def told_forget(path, key, warn=None):
+    """台帳から 1 エントリ消す (ロックの下で read-modify-write)。畳めた (または元から無い) なら True。
+
+    「状態が解けた」ことを**観測したとき**に呼ぶ (t003 / §11-3: hard_idle の抑止が解けた
+    Worker。次に同じ状態が来たら再通知される)。ロックが取れない・台帳が読めない・書けない
+    は False — 消し忘れの害は「再通知が遅れる」だけで、通知が消えるわけではない
+    (呼び出し側は次のサイクルでやり直す)。
+    """
+    with told_lock(path) as held:
+        if not held:
+            _safe_warn(warn, f'notified-state: {path} のロックを取れなかった')
+            return False
+        told = load_json_store(path, check=told_ledger_problem, warn=warn)
+        if is_missing(told):
+            return True
+        if is_unreadable(told):
+            return False
+        if key not in told:
+            return True
+        del told[key]
+        return write_told_atomic(path, told)
+
+
 # ---------------------------------------------------------------------------
 # 数値の欄
 # ---------------------------------------------------------------------------

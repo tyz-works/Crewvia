@@ -738,3 +738,5 @@ Director が `sync-main-checkout.sh` で ff + 両デーモン再起動 (3 点の
 **戻し方**: PR を revert → `sync-main-checkout.sh`。台帳の `hard-idle-suppressed_*` は消してよい (無い = 再通知)。
 通知だけ止めたいなら `daemons.hard_idle_suppressed_notify_seconds` を大きくする (env は無い。watchdog の再起動が要る)。
 
+**11-10. 回復の判定は永続の台帳で (PR #278 Codex P2 / t009)**: `SuppressedIdleNotifier.forget()` は通知済みかをプロセス内の `st["notified"]` で決めていたため、watchdog の再起動をまたいで回復すると台帳キーが残り、同じ試行で次の見送りが 600 秒続いても通知が出なかった。いまは `has_key` (台帳の読み取り・ロックなし) で決める。台帳に無ければ forget_key (ロック + 書き込み) を呼ばない。台帳が読めなければ「居るかもしれない」で消す側に倒す。族の洗い出し (台帳の書き込み / 掃除でプロセス内状態に依存するもの): `SuppressedIdleNotifier._state/_pending_forget` = **本件で直した** / `usage-limit-overdue_*` の notify_once = 書くだけで掃除なし (fp で重複を止めるので再起動で二重にならない・対象外) / timeout 通知の台帳 = dispatcher の TTL prune が掃除 (プロセス内状態に依存しない) / `VerdictLogger`・`WarnLineThrottle` = ログのみで再起動は「初回扱い」(安全側)。赤の実証: forget を旧条件に戻すと `test_recovery_across_a_watchdog_restart_still_clears_the_ledger` と `test_a_pending_forget_lost_by_a_restart_is_redone_from_the_ledger` が落ちる。
+

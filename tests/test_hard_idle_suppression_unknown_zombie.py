@@ -333,6 +333,64 @@ def test_recovery_clears_the_ledger_key_and_a_relapse_notifies_again(notifier, t
     assert len(sent) == 2
 
 
+def _restarted_notifier(tmp_path, clock, sent):
+    """watchdog 再起動 = 新しい SuppressedIdleNotifier (プロセス内の状態は空)。本番と同じ has_key つき。"""
+    notify_once = watchdog.make_notify_once(
+        tmp_path, send=lambda msg: sent.append(msg) or True, log=lambda m: None, now=clock)
+    told = tmp_path / "registry" / "daemons" / "notified-state.json"
+    return watchdog.SuppressedIdleNotifier(
+        notify_once, lambda k: lib_daemon_state.told_forget(told, k), 600, now=clock,
+        has_key=lambda k: watchdog._told_has_key(told, k))
+
+
+def test_recovery_across_a_watchdog_restart_still_clears_the_ledger(notifier, tmp_path):
+    """PR #278 Codex P2 (t009): 通知したあと watchdog が再起動し、回復を新プロセスが観測した。"""
+    n, clock, sent, told = notifier
+    monitor, d = _monitor(tmp_path), _detail("hard_idle_but_executing", "executing")
+    n.observe(monitor, d)
+    clock.t += 700
+    n.observe(monitor, d)
+    assert len(sent) == 1 and _told_keys(told) == {f"hard-idle-suppressed_{AGENT}"}
+    n2 = _restarted_notifier(tmp_path, clock, sent)               # 再起動
+    n2.observe(monitor, watchdog.CheckResult("alive", "active", 5.0, "idle_process", False))
+    assert _told_keys(told) == set()                              # 回復 → 消える
+    n2.observe(monitor, d)                                        # 同じ試行でまた見送り
+    clock.t += 700
+    n2.observe(monitor, d)
+    assert len(sent) == 2                                         # 通知が出る
+
+
+def test_a_pending_forget_lost_by_a_restart_is_redone_from_the_ledger(tmp_path):
+    """消せなかった (ロック失敗) まま再起動しても、次の観測が台帳から掃除をやり直す。"""
+    clock, sent = Clock(), []
+    told = tmp_path / "registry" / "daemons" / "notified-state.json"
+    n = _restarted_notifier(tmp_path, clock, sent)
+    broken = watchdog.SuppressedIdleNotifier(
+        n._notify_once, lambda k: False, 600, now=clock, has_key=n._has_key)
+    monitor, d = _monitor(tmp_path), _detail("hard_idle_but_executing", "executing")
+    broken.observe(monitor, d)
+    clock.t += 700
+    broken.observe(monitor, d)
+    broken.observe(monitor, watchdog.CheckResult("alive", "active", 5.0, "idle_process", False))
+    assert _told_keys(told) == {f"hard-idle-suppressed_{AGENT}"}  # 消せなかった (in-process の pending は再起動で失う)
+    n3 = _restarted_notifier(tmp_path, clock, sent)
+    n3.observe(monitor, watchdog.CheckResult("alive", "active", 5.0, "idle_process", False))
+    assert _told_keys(told) == set()
+
+
+def test_a_healthy_worker_never_touches_the_ledger_lock(tmp_path):
+    """台帳に key が無い Worker (大多数) の毎サイクルの観測は forget_key (= ロック + 書き込み) を呼ばない。"""
+    calls = []
+    told = tmp_path / "registry" / "daemons" / "notified-state.json"
+    n = watchdog.SuppressedIdleNotifier(
+        lambda *a: True, lambda k: calls.append(k) or True, 600,
+        has_key=lambda k: watchdog._told_has_key(told, k))
+    monitor = _monitor(tmp_path)
+    for _ in range(3):
+        n.observe(monitor, watchdog.CheckResult("alive", "active", 5.0, "idle_process", False))
+    assert calls == []
+
+
 def test_a_failed_send_is_retried_and_not_recorded(tmp_path):
     clock = Clock()
     results = iter([False, True])

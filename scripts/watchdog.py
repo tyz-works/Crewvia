@@ -52,6 +52,7 @@ from lib_pane_process import (  # noqa: E402,F401
 )
 # 「伝えた」台帳 (dispatcher と共有) の読み書き。timeout 終了の通知を 1 回だけにする (t021)。
 from lib_daemon_state import (  # noqa: E402
+    is_missing as _store_missing, is_unreadable as _store_unreadable,
     load_json_store, told_forget, told_ledger_problem, told_matches, told_record,
 )
 # task カードの読み取りは crewvia の中で 1 箇所しかない (Codex 5 巡目 P2)。
@@ -1301,6 +1302,16 @@ HARD_IDLE_SUPPRESSED_KEY_PREFIX = "hard-idle-suppressed_"
 HARD_IDLE_SUPPRESSED_KIND = "hard-idle-suppressed"
 
 
+def _told_has_key(told_path: Path, key: str) -> bool:
+    """台帳に key が居るか。読めない台帳は「居るかもしれない」(消す側に倒す。消し忘れの害のほうが大きい)。"""
+    told = load_json_store(told_path, check=told_ledger_problem)
+    if _store_missing(told):
+        return False
+    if _store_unreadable(told):
+        return True
+    return key in told
+
+
 class SuppressedIdleNotifier:
     """hard_idle の終了を見送った状態が続いたら Director に 1 回知らせる (§11 / t003)。
 
@@ -1311,9 +1322,11 @@ class SuppressedIdleNotifier:
     観測した場合だけ消す)。台帳の slug は `_daemon` (mission slug だと `prune_told()` が捨てる)。
     """
 
-    def __init__(self, notify_once, forget_key, threshold: float, now=None) -> None:
+    def __init__(self, notify_once, forget_key, threshold: float, now=None, has_key=None) -> None:
         self._notify_once = notify_once
         self._forget_key = forget_key
+        # 台帳にこの key が居るか (読むだけ・ロックなし)。None なら「居るかもしれない」扱い。
+        self._has_key = has_key
         self.threshold = threshold
         self._now = now or time.time
         self._state: dict[tuple[str, str], dict] = {}
@@ -1344,10 +1357,16 @@ class SuppressedIdleNotifier:
             st["notified"] = True
 
     def forget(self, monitor: "WorkerMonitor") -> None:
-        """この Worker の見送りが解けた (または監視から外れた)。通知済みなら台帳キーを消す。"""
-        st = self._state.pop((monitor.agent_name, monitor.task_id), None)
-        if st and st["notified"]:
-            self._pending_forget.add(self.ledger_key(monitor))
+        """この Worker の見送りが解けた (または監視から外れた)。台帳にキーが居れば消す。
+
+        消すかどうかは**永続の台帳**で決める。プロセス内の `notified` に頼ると、watchdog の
+        再起動をまたいで回復したとき (新しいプロセスの `_state` は空) キーが残り、同じ試行で
+        次に見送りが始まっても通知が出ない (PR #278 Codex P2 / t009)。
+        """
+        self._state.pop((monitor.agent_name, monitor.task_id), None)
+        key = self.ledger_key(monitor)
+        if self._has_key is None or self._has_key(key):
+            self._pending_forget.add(key)
         self.flush()
 
     def flush(self) -> None:
@@ -1502,6 +1521,7 @@ def run(repo_root: Path, interval: int) -> None:
         usage_notify_once,
         lambda key: told_forget(told_path, key, warn=_log),
         watch_config.hard_idle_suppressed_notify_seconds,
+        has_key=lambda key: _told_has_key(told_path, key),
     )
     warn_throttle = WarnLineThrottle()
 

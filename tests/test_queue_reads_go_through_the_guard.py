@@ -369,6 +369,9 @@ ALLOWED_DIRECT_READS = {
         "read_text() から read_bytes()+errors=\"replace\" に変えた — "
         "無関係な1プロセスの不正な UTF-8 名で UnicodeDecodeError が "
         "全走査を落としていた)",
+    ("lib_pane_process.py", "_proc_state", 'Path(f"/proc/{pid}/stat").read_bytes()'):
+        "同上 (t003 / §11: zombie (state=Z) を木から外すための state 欄。t101 と同じく "
+        "read_bytes()+errors=\"replace\")",
     ("lib_pane_process.py", "_proc_cmdline", 'Path(f"/proc/{pid}/cmdline").read_bytes()'):
         "同上 (t074: 判定根拠を comm から cmdline に移した)",
     ("lib_pane_process.py", "_proc_environ", 'Path(f"/proc/{pid}/environ").read_bytes()'):

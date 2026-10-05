@@ -1448,6 +1448,10 @@ class SuppressedIdleNotifier:
                                 unsettled=agent in self._unsettled)
         if agent in self._unsettled and told is not None and not plan.forget:
             self._unsettled.discard(agent)            # 掃除が済んだことを台帳で確認した
+        if plan.notify is not None:
+            # 通知する plan の forget には閉じた episode のキーの掃除が入っている。ここで閉じた episode の扱いは終わり
+            # (削除が失敗していれば古い fp が一致して黙る = 既知の穴。次のサイクルで通知を重ねない)
+            self._unsettled.discard(agent)
         if plan.notify is not None and st["msg_kind"] != kind:
             # 診断 (unknown の再走査) は種別が決まったとき 1 回だけ。毎サイクル /proc を歩かない。
             st["msg_kind"], st["msg"] = kind, monitor.suppression_message(kind, detail, lasted)

@@ -285,3 +285,15 @@ def test_the_two_sequences_codex_found_are_covered_by_the_model(tmp_path, monkey
     for ev in ("S_unk", "tick", "S_exe", "S_unk", "S_exe", "S_unk", "tick", "S_unk"):
         h.step(ev)
     assert len(h.calls) == 2
+
+
+def test_a_deletion_that_recovers_after_a_relapse_does_not_renotify_every_cycle(tmp_path, monkeypatch):
+    """5 巡目 (t017) の指摘 + t006 で見つかった連投。回復時の削除が失敗し、再発後 600 秒を過ぎてから削除が通ると、
+    新しいキーを記録した plan で `_unsettled` が解けず、次のサイクルからそのキーを古いものとして消して再送し続けた。
+    この並びは長さ 9 で、長さ 5 の全列挙と絞った列挙 (長さ 6〜7) の外にある。"""
+    seq = ("S_unk", "tick", "delete_fail", "recover", "delete_fail", "S_unk", "tick", "S_unk", "S_unk")
+    run_sequence(tmp_path, monkeypatch, seq)
+    h = Harness(tmp_path, monkeypatch)
+    for ev in seq:
+        h.step(ev)
+    assert len(h.calls) == 2                      # episode 1 と 2 で 1 通ずつ

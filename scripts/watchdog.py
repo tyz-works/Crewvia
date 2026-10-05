@@ -48,11 +48,12 @@ import lib_daemon_watch  # noqa: E402
 # 「利用枠切れ」の画面の同定 (C2 / t005)。dispatcher の Rule 5 と共有する 1 か所の定義。
 import lib_usage_limit  # noqa: E402
 from lib_pane_process import (  # noqa: E402,F401
-    ProcessSignal, classify_process_tree,
+    ProcessSignal, classify_process_tree, explain_unknown_tree,
 )
 # 「伝えた」台帳 (dispatcher と共有) の読み書き。timeout 終了の通知を 1 回だけにする (t021)。
 from lib_daemon_state import (  # noqa: E402
-    load_json_store, told_ledger_problem, told_matches, told_record,
+    is_missing as _store_missing, is_unreadable as _store_unreadable,
+    load_json_store, told_forget, told_ledger_problem, told_matches, told_record,
 )
 # task カードの読み取りは crewvia の中で 1 箇所しかない (Codex 5 巡目 P2)。
 # ここに frontmatter を直接読むコードを書き戻さないこと — plan.sh が `[破損]`
@@ -251,17 +252,30 @@ class WorkerMonitor:
     """Monitors a single in-progress task / Worker."""
 
     def __init__(self, task_id: str, task_card: dict, profiles: dict[str, dict[str, int]],
-                 repo_root: Path) -> None:
+                 repo_root: Path, mission_slug: str = "") -> None:
         timeout = task_card.get("timeout") or {}
         profile_name = task_card.get("worker_profile") or DEFAULT_PROFILE
         base = profiles.get(profile_name) or profiles[DEFAULT_PROFILE]
 
         self.task_id = task_id
+        #: 通知文用 (t013)。task id だけでは別 mission の同名 task と区別できない。
+        self.mission_slug: str = mission_slug
         self.agent_name: str = str(task_card.get("worker") or os.environ.get("AGENT_NAME", "unknown"))
         self.idle_threshold: int = int(timeout.get("idle") or base["idle"])
         self.max_threshold: int = int(timeout.get("max") or base["max"])
         self.started_at: float = time.time()
         self.repo_root = repo_root
+
+        #: §11 (t003): 「見送り」通知の fingerprint 用。試行の識別は Execution ID
+        #: (`current_execution_id`)。ID の無い旧形式 card だけ card の `started_at` (pull の
+        #: 時刻。試行ごとに書き直される・watchdog の再起動で変わらない) に fallback する —
+        #: `self.started_at` (この object の生成時刻) は再起動で変わるので使わない。
+        self.execution_id: str = str(task_card.get("current_execution_id") or "")
+        self.card_started_at: str = str(task_card.get("started_at") or "")
+        #: `_process_signal` が直近の呼び出しで見た pane pid と「pid が引けなかった」か。
+        #: 通知文で理由 (mux の不調 / 木の中の unknown) を区別し、診断の再走査に使う。
+        self._last_pane_pid: Optional[int] = None
+        self._pid_unavailable: bool = False
 
         # t044: when *this* monitoring target began.  Signals older than this
         # are not its silence — see `_signal_floor` and `_last_activity_mtime`.
@@ -605,6 +619,8 @@ class WorkerMonitor:
 
     def _process_signal(self) -> ProcessSignal:
         """プロセス層のシグナル。**生死の判定ではない** — classify_process_tree() 参照。"""
+        self._last_pane_pid = None
+        self._pid_unavailable = False
         name = self._mux_window_name()
         if not name:
             return "no_window"
@@ -613,7 +629,11 @@ class WorkerMonitor:
             # 窓はあるのに pane pid が引けない = mux backend の不調。実行中か
             # ハング中かを見分ける材料が無いので "unknown" とし、terminate を
             # 抑制する側に倒す (fail closed)。_is_mass_kill() と同じ向き。
+            # §11 (t003): この経路は木を見ていない (node が無い)。Director への通知では
+            # `mux_pid_unavailable` として、木の中の unknown と区別する。
+            self._pid_unavailable = True
             return "unknown"
+        self._last_pane_pid = pane_pid
         return classify_process_tree(pane_pid)
 
     def _awaiting_human(self) -> bool:
@@ -695,6 +715,66 @@ class WorkerMonitor:
 
     def usage_limit_overdue_fp(self) -> Optional[str]:
         return self._limit_overdue_fp
+
+    # ------------------------------------------------------------------
+    # hard_idle の終了を見送っている状態 (§11 / t003)
+    # ------------------------------------------------------------------
+
+    #: check_detail() の reason → 通知上の種別。`hard_idle_but_process_unknown` だけは
+    #: `suppression_kind()` が `mux_pid_unavailable` に分けることがある。
+    SUPPRESSED_REASONS = {
+        "hard_idle_but_executing": "executing",
+        "hard_idle_but_process_unknown": "process_unknown",
+        "hard_idle_but_awaiting_human": "awaiting_human",
+    }
+
+    def suppression_kind(self, detail: "CheckResult") -> Optional[str]:
+        """この判定が「hard_idle の終了を見送った」ものなら種別、そうでなければ None。
+
+        種別: executing / process_unknown / mux_pid_unavailable / awaiting_human。
+        """
+        if detail.verdict != "warn":
+            return None
+        kind = self.SUPPRESSED_REASONS.get(detail.reason)
+        if kind == "process_unknown" and self._pid_unavailable:
+            return "mux_pid_unavailable"
+        return kind
+
+    def suppression_ident(self) -> str:
+        """episode の識別子: 試行 (Execution ID。旧形式 card は started_at)。"""
+        if self.execution_id:
+            ident = self.execution_id
+        elif self.card_started_at:
+            ident = f"{self.task_id}@{self.card_started_at}"
+        else:
+            ident = self.task_id
+        return ident
+
+    def suppression_fp(self, kind: str) -> str:
+        """通知の fingerprint: `<episode の識別子>:<種別>`。台帳キーが種別ごとなので、同じ試行の
+        同じ種別は episode の間 1 回 (理由が往復しても再通知しない。§11-13)。"""
+        return f"{self.suppression_ident()}:{kind}"
+
+    def suppression_message(self, kind: str, detail: "CheckResult", lasted: float) -> str:
+        """Director への通知文。unknown のときは unknown にしたノード (pid / state / errno) を載せる。"""
+        why = {
+            "executing": "裏で job が走っている (process=executing)",
+            "awaiting_human": "人間の入力・承認待ち (awaiting_human)",
+            "mux_pid_unavailable": (
+                "mux から pane の pid が引けない (mux_pid_unavailable。mux の不調で、"
+                "プロセス木は見ていない)"),
+            "process_unknown": "プロセス木に job か infra か判定できないノードがある (process=unknown)",
+        }[kind]
+        if kind == "process_unknown":
+            notes = explain_unknown_tree(self._last_pane_pid) if self._last_pane_pid else []
+            detail_text = "; ".join(notes[:5]) if notes else "再走査では理由を特定できなかった"
+            why += f"・該当ノード {detail_text}"
+        return (
+            f"[watchdog] Worker {self.agent_name} (mission {self.mission_slug or '?'} "
+            f"task {self.task_id}) は無音 "
+            f"{detail.idle_seconds:.0f}s (hard_idle しきい値 {self.idle_threshold * 2}s 超) ですが、"
+            f"終了を見送っています。理由: {why}。見送りは {lasted:.0f}s 続いています。"
+            f"止まっていないか確認してください (max {self.max_threshold}s で終了します)。")
 
     # ------------------------------------------------------------------
     # Core check
@@ -1222,6 +1302,209 @@ class VerdictLogger:
         self._state.pop((monitor.agent_name, monitor.task_id), None)
 
 
+HARD_IDLE_SUPPRESSED_KEY_PREFIX = "hard-idle-suppressed_"
+HARD_IDLE_SUPPRESSED_KIND = "hard-idle-suppressed"
+
+
+SUPPRESSION_KINDS = ("executing", "process_unknown", "mux_pid_unavailable", "awaiting_human")
+_KIND_SEP = "@"
+
+
+def _told_entries(told_path: Path):
+    """台帳の {key: fp}。無ければ {}、読めなければ None (呼び出し側が向きを決める)。"""
+    told = load_json_store(told_path, check=told_ledger_problem)
+    if _store_missing(told):
+        return {}
+    if _store_unreadable(told):
+        return None
+    return {k: (v.get("fp") if isinstance(v, dict) else None) for k, v in told.items()}
+
+
+def suppression_key(agent: str, kind: str) -> str:
+    return f"{HARD_IDLE_SUPPRESSED_KEY_PREFIX}{agent}{_KIND_SEP}{kind}"
+
+
+def _split_suppression_key(key: str):
+    """台帳キー → (agent, kind)。見送りのキーでなければ None。"""
+    if not key.startswith(HARD_IDLE_SUPPRESSED_KEY_PREFIX):
+        return None
+    agent, sep, kind = key[len(HARD_IDLE_SUPPRESSED_KEY_PREFIX):].rpartition(_KIND_SEP)
+    return (agent, kind) if sep else None
+
+
+class SuppressionPlan(NamedTuple):
+    """`plan_suppression` の出力。notify = (台帳キー, fp, 理由) か None。forget = 消す台帳キー。"""
+    notify: Optional[tuple] = None
+    forget: tuple = ()
+
+
+def plan_suppression(told, agent: str, kind: Optional[str], ident: str,
+                     lasted: float, threshold: float, unsettled: bool = False) -> SuppressionPlan:
+    """見送り通知の状態の規則 (§11-13。ここ 1 か所。I/O もプロセス内の状態も持たない)。
+
+    episode = ある Worker・ある Execution ID (`ident`) の「見送りが続いている区間」。
+      始まり: 見送り (`kind` あり) の最初の観測。
+      終わり: 見送りでない観測 (`kind` None = 回復) / Worker が監視から外れる (消滅。呼び出し側が
+              kind None で渡す) / Execution ID の変化。終わったら Worker の台帳キーを全部消す。
+    episode の中では**理由 (kind) ごとに最大 1 回**通知する (理由が往復しても再通知しない)。
+
+    told: 台帳の {key: fp} (無ければ {}、読めなければ None)。通知済みかは台帳だけで決める
+    (watchdog が再起動しても同じ答えになる)。
+    - kind なし: この Worker の全キーを消す。台帳が読めなければ全種別のキーを消しにいく。
+    - `unsettled` (同じプロセスで episode を閉じたあと、掃除が済んだと台帳で確認できていない):
+      台帳に居る自分のキーは閉じた episode のものなので、居ないものとして判定し、消す。
+      閉じた episode の古いキーが次の episode の通知を黙らせるのを防ぐ。
+    - 見送りで lasted < threshold: 何もしない。
+    - 見送りで lasted >= threshold: 台帳に (key, fp) が既に居れば黙る。無ければ通知する
+      (台帳が読めなければ通知する = 再送側)。Execution ID の違う古い試行のキーは消す。
+    """
+    if kind is None:
+        if told is None:
+            return SuppressionPlan(forget=tuple(suppression_key(agent, k) for k in SUPPRESSION_KINDS))
+        return SuppressionPlan(forget=tuple(
+            k for k in told if _split_suppression_key(k) is not None
+            and _split_suppression_key(k)[0] == agent))
+    mine = ()
+    if unsettled:                       # 閉じた episode の古いキー。居ないものとして扱って消す
+        mine = (tuple(k for k in told if (_split_suppression_key(k) or (None,))[0] == agent)
+                if told is not None else tuple(suppression_key(agent, k) for k in SUPPRESSION_KINDS))
+    if lasted < threshold:
+        return SuppressionPlan(forget=mine)
+    key, fp = suppression_key(agent, kind), f"{ident}:{kind}"
+    stale = ()
+    if told is not None:
+        live = {k: v for k, v in told.items() if k not in mine}
+        stale = tuple(
+            k for k, v in live.items()
+            if k != key and _split_suppression_key(k) is not None
+            and _split_suppression_key(k)[0] == agent
+            and not str(v).startswith(f"{ident}:"))
+        if live.get(key) == fp:
+            return SuppressionPlan(forget=mine + stale)
+    return SuppressionPlan(notify=(key, fp, kind), forget=mine + stale)
+
+
+class SuppressedIdleNotifier:
+    """hard_idle の終了を見送った状態が続いたら Director に知らせる (§11 / t003、§11-13 / t016)。
+
+    watchdog は unknown / executing / awaiting_human を殺さない (向きは変えない)。判定は
+    `plan_suppression` (純粋関数) が全部決める。このクラスは台帳を読んで渡し、plan を実行するだけ。
+    プロセス内に持つのは episode の開始時刻と通知文の使い回しだけ (どちらも失っても安全側)。
+    台帳の slug は `_daemon` (mission slug だと `prune_told()` が捨てる)。
+    """
+
+    def __init__(self, notify_once, forget_key, threshold: float, now=None,
+                 read_ledger=None) -> None:
+        self._notify_once = notify_once
+        self._forget_key = forget_key
+        # 台帳の {key: fp} (読むだけ)。None の関数 / 読めない (None) は「分からない」。
+        self._read_ledger = read_ledger or (lambda: None)
+        self.threshold = threshold
+        self._now = now or time.time
+        # (agent, task_id) -> {"ident", "since", "msg", "msg_kind"}
+        self._state: dict[tuple[str, str], dict] = {}
+        # episode を閉じた Worker (掃除が済んだと台帳で確認できるまで)。再起動で失っても、台帳の
+        # 規則 (plan_suppression) だけで収束する (失うのは「閉じた直後に再発し、かつ掃除が失敗し続ける」
+        # 窓だけ。§11-13)。
+        self._unsettled: set[str] = set()
+
+    def _read(self):
+        try:
+            return self._read_ledger()
+        except Exception as e:
+            _log(f"hard-idle 通知台帳の読み取りに失敗: {e}")
+            return None
+
+    def _execute(self, plan: SuppressionPlan, send) -> bool:
+        """plan を実行する。台帳の不調で例外を外に出さない (失敗は次のサイクルの再計算で戻る)。"""
+        for key in plan.forget:
+            try:
+                self._forget_key(key)
+            except Exception as e:
+                _log(f"hard-idle 通知台帳の掃除に失敗 ({key}): {e}")
+        if plan.notify is None:
+            return True
+        key, fp, kind = plan.notify
+        try:
+            return bool(send(key, fp, kind))
+        except Exception as e:
+            _log(f"hard-idle 見送りの通知に失敗 ({key}): {e}")
+            return False
+
+    def observe(self, monitor: "WorkerMonitor", detail: "CheckResult") -> None:
+        agent, ident = monitor.agent_name, monitor.suppression_ident()
+        skey = (agent, monitor.task_id)
+        kind = monitor.suppression_kind(detail)
+        if kind is None:
+            self.forget(monitor)
+            return
+        now = self._now()
+        st = self._state.get(skey)
+        if st is None or st["ident"] != ident:        # episode の始まり (新しい Execution ID も)
+            st = self._state[skey] = {"ident": ident, "since": now, "msg": None, "msg_kind": None}
+        lasted = now - st["since"]
+        told = self._read()
+        plan = plan_suppression(told, agent, kind, ident, lasted, self.threshold,
+                                unsettled=agent in self._unsettled)
+        if agent in self._unsettled and told is not None and not plan.forget:
+            self._unsettled.discard(agent)            # 掃除が済んだことを台帳で確認した
+        if plan.notify is not None:
+            # 通知する plan の forget には閉じた episode のキーの掃除が入っている。ここで閉じた episode の扱いは終わり
+            # (削除が失敗していれば古い fp が一致して黙る = 既知の穴。次のサイクルで通知を重ねない)
+            self._unsettled.discard(agent)
+        if plan.notify is not None and st["msg_kind"] != kind:
+            # 診断 (unknown の再走査) は種別が決まったとき 1 回だけ。毎サイクル /proc を歩かない。
+            st["msg_kind"], st["msg"] = kind, monitor.suppression_message(kind, detail, lasted)
+        self._execute(plan, lambda key, fp, k: self._notify_once(
+            key, fp, HARD_IDLE_SUPPRESSED_KIND, "_daemon", monitor.task_id, st["msg"]))
+
+    def forget(self, monitor: "WorkerMonitor") -> None:
+        """この Worker の episode が終わった (回復・監視から外れた)。台帳の自分のキーを全部消す。"""
+        self._state.pop((monitor.agent_name, monitor.task_id), None)
+        plan = plan_suppression(self._read(), monitor.agent_name, None, "", 0, 0)
+        if plan.forget:
+            self._unsettled.add(monitor.agent_name)
+        self._execute(plan, None)
+
+    def cycle(self, monitored_agents) -> None:
+        """watchdog の 1 サイクルにつき 1 回 (Worker ごとではない)。監視されていない Worker の
+        キー (通知後に watchdog が再起動して Worker が終わった等。forget は監視中の Worker にしか
+        来ない) は episode が終わっているので消す。台帳が読めなければ何もしない。"""
+        told = self._read()
+        if told is None:
+            return
+        live = set(monitored_agents)
+        orphans = {parts[0] for k in told if (parts := _split_suppression_key(k)) and parts[0] not in live}
+        for agent in sorted(orphans):
+            self._execute(plan_suppression(told, agent, None, "", 0, 0), None)
+
+
+class WarnLineThrottle:
+    """`WARN:` のログ行と Taskvia alert を間引く (§11 / t003)。
+
+    以前は warn のあいだ毎サイクル (約 32 秒) 同じ行を出していた (hard_idle の見送りだけで
+    225 行 / 7132 秒)。理由が変わった時と、同じ理由が続く間は `summary_every` サイクルごと
+    (`VerdictLogger` と同じ間隔) だけ出す。warn でなくなったら `forget` で初回扱いに戻す。
+    """
+
+    def __init__(self, summary_every: int = VERDICT_SUMMARY_EVERY) -> None:
+        self.summary_every = summary_every
+        self._state: dict[tuple[str, str], tuple[str, int]] = {}
+
+    def should_emit(self, monitor: "WorkerMonitor", detail: "CheckResult") -> bool:
+        key = (monitor.agent_name, monitor.task_id)
+        previous = self._state.get(key)
+        if previous is None or previous[0] != detail.reason:
+            self._state[key] = (detail.reason, 0)
+            return True
+        repeats = previous[1] + 1
+        self._state[key] = (detail.reason, repeats)
+        return self.summary_every > 0 and repeats % self.summary_every == 0
+
+    def forget(self, monitor: "WorkerMonitor") -> None:
+        self._state.pop((monitor.agent_name, monitor.task_id), None)
+
+
 _LEGACY_POINTER_MARK = "[moved]"
 
 
@@ -1335,6 +1618,21 @@ def run(repo_root: Path, interval: int) -> None:
     # いなかった。
     verdict_logger = VerdictLogger()
     usage_notify_once = make_notify_once(repo_root)
+    watch_config = lib_daemon_watch.load_config()
+    told_path = repo_root / "registry" / "daemons" / "notified-state.json"
+    suppressed_notifier = SuppressedIdleNotifier(
+        usage_notify_once,
+        lambda key: told_forget(told_path, key, warn=_log),
+        watch_config.hard_idle_suppressed_notify_seconds,
+        read_ledger=lambda: _told_entries(told_path),
+    )
+    warn_throttle = WarnLineThrottle()
+
+    def forget_monitor(monitor: "WorkerMonitor") -> None:
+        """監視対象から外すときの後始末 (verdict の記憶・WARN の間引き・見送り通知の台帳)。"""
+        verdict_logger.forget(monitor)
+        warn_throttle.forget(monitor)
+        suppressed_notifier.forget(monitor)
 
     # t016: log which mux backend got selected at startup. A silent
     # misconfiguration here (e.g. config/crewvia.yaml `mode:` failing to
@@ -1358,7 +1656,7 @@ def run(repo_root: Path, interval: int) -> None:
         repo_root=repo_root,
         self_name=lib_daemon_watch.DAEMON_WATCHDOG,
         mux=_mux,
-        config=lib_daemon_watch.load_config(),
+        config=watch_config,
         log=_log,
     )
     _beat()
@@ -1428,7 +1726,7 @@ def run(repo_root: Path, interval: int) -> None:
                     # same agent/task comes back (a --reset then re-pull) its
                     # first verdict is silently swallowed as "unchanged" for
                     # up to VERDICT_SUMMARY_EVERY cycles.
-                    verdict_logger.forget(monitors[key])
+                    forget_monitor(monitors[key])
                     del monitors[key]
 
             # Add monitors for new in_progress tasks
@@ -1443,7 +1741,12 @@ def run(repo_root: Path, interval: int) -> None:
                     task_card=meta,
                     profiles=PROFILES,
                     repo_root=repo_root,
+                    mission_slug=slug,
                 )
+
+            # §11 (t011): 見送り通知の台帳の後始末は forget / observe の経路に頼らず、
+            # 1 サイクルに 1 回ここで収束させる (失敗した掃除のやり直し・孤児のキー)。
+            suppressed_notifier.cycle({m.agent_name for m in monitors.values()})
 
             # Evaluate every monitor's status up front (side-effect free) before
             # acting on any of them. This lets us tell "every single monitored
@@ -1529,6 +1832,12 @@ def run(repo_root: Path, interval: int) -> None:
                         f"usage-limit-overdue_{agent}", monitor.usage_limit_overdue_fp(),
                         "usage-limit", "_daemon", agent, overdue_msg)
 
+                # §11 (t003): hard_idle の終了を見送った状態が続いたら Director に 1 回。
+                # 解けたら (warn でなくなったら) 台帳キーも消す。
+                suppressed_notifier.observe(monitor, detail)
+                if status != "warn":
+                    warn_throttle.forget(monitor)
+
                 if status == "alive":
                     pass  # healthy — no action
 
@@ -1538,8 +1847,12 @@ def run(repo_root: Path, interval: int) -> None:
                         f"WARN: {agent}/{task_id} (mission={slug}) idle {idle:.0f}s "
                         f"(threshold={monitor.idle_threshold}s)"
                     )
-                    _log(msg)
-                    taskvia_alert(taskvia_url, taskvia_token, agent, msg)
+                    # §11 (t003): 同じ理由の warn を毎サイクル出さない (理由が変わった時 +
+                    # VERDICT_SUMMARY_EVERY サイクルごと)。終了を見送った場合は理由も添える。
+                    if warn_throttle.should_emit(monitor, detail):
+                        msg += f" reason={detail.reason}"
+                        _log(msg)
+                        taskvia_alert(taskvia_url, taskvia_token, agent, msg)
 
                 elif status == "terminate":
                     # Checked before anything is logged or sent.  The monitor is
@@ -1552,7 +1865,7 @@ def run(repo_root: Path, interval: int) -> None:
                     # if watchdog kept re-deciding.
                     if (authority == KILL_AUTHORITY_WATCHDOG
                             and retirement.has_marker(agent)):
-                        verdict_logger.forget(monitor)
+                        forget_monitor(monitor)
                         del monitors[(slug, task_id)]
                         continue
 
@@ -1567,7 +1880,7 @@ def run(repo_root: Path, interval: int) -> None:
                     )
                     if authority == KILL_AUTHORITY_DISPATCHER:
                         graceful_terminate(monitor)
-                        verdict_logger.forget(monitor)
+                        forget_monitor(monitor)
                         del monitors[(slug, task_id)]
                     else:
                         window = monitor._mux_window_name() or f"{agent}-worker"
@@ -1581,7 +1894,7 @@ def run(repo_root: Path, interval: int) -> None:
                             # Keeping the monitor would re-fire terminate every
                             # cycle; the marker is now the record of intent, and
                             # it survives a restart in a way the monitor never did.
-                            verdict_logger.forget(monitor)
+                            forget_monitor(monitor)
                             del monitors[(slug, task_id)]
                         else:
                             # Fail closed (no spawn identity to prove who this
@@ -1602,7 +1915,7 @@ def run(repo_root: Path, interval: int) -> None:
                         taskvia_url, taskvia_token, agent,
                         f"KILL: {agent}/{task_id} mux window が消失 (backend={backend_name})",
                     )
-                    verdict_logger.forget(monitor)
+                    forget_monitor(monitor)
                     del monitors[(slug, task_id)]
 
             # t002: advance every in-flight retirement by at most one step.

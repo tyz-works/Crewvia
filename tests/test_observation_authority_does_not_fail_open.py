@@ -389,7 +389,13 @@ OBSERVATION_SITES: dict[tuple[str, str, str], tuple[str, str]] = {
     ("lib_pane_process.py", "_proc_exe", 'os.readlink(f"/proc/{pid}/exe")'):
         (SAFE, "同上契約。_is_session_body() は exe が読めない場合 False = "
                "infra 側委譲で、危険側 (job 見逃し) には倒れない (t097)"),
-    ("lib_pane_process.py", "classify_process_tree", 'Path("/proc").iterdir()'):
+    ("lib_pane_process.py", "_proc_state",
+     'Path(f"/proc/{pid}/stat").read_bytes()'):
+        (SAFE, "§11 (t003): 全 OSError を None (= zombie と確定できない) にするが、"
+               "None は『木から外す』の根拠にならない (外すのは state が Z と読めた時だけ)。"
+               "読めないノードは通常の分類に進み、そちらの cmdline/environ の OSError が "
+               "unknown に倒す。zombie でないものを zombie と読む向きの誤りは作らない"),
+    ("lib_pane_process.py", "_classify", 'Path("/proc").iterdir()'):
         (SAFE, "列挙自体が失敗した場合の扱いはこの1呼び出しの外 (呼び出し元は "
                "個々の pid だけを辿るので、iterdir 失敗は root 直下の列挙のみに "
                "影響し pane 内の既知 pid ツリーには波及しない"),

@@ -349,7 +349,10 @@ def test_an_unreadable_wrapper_is_unknown_not_infra(panes, monkeypatch):
 
     monkeypatch.setattr(lib_pane_process, "_proc_cmdline", flaky_proc_cmdline)
 
-    assert lib_pane_process.classify_process_tree(panes["busy"]) == "unknown"
+    # §11 (t003): 読めないノードで木全体を即 unknown にはしなくなった (BFS を続ける)。
+    # ラッパーの子 (本物の job) は独立に job と読めるので executing が出るのが正しい。
+    # 守るべき向きは変わらない: **idle_process (= kill してよい) には決してならない**。
+    assert lib_pane_process.classify_process_tree(panes["busy"]) in ("unknown", "executing")
 
 
 def test_watchdog_does_not_terminate_when_the_wrapper_cmdline_is_unreadable(
@@ -376,7 +379,9 @@ def test_watchdog_does_not_terminate_when_the_wrapper_cmdline_is_unreadable(
     monitor = _make_monitor(tmp_path, idle=300)
     _write_activity(tmp_path, age_seconds=3000)
     detail = monitor.check_detail()
-    assert detail.process_signal == "unknown"
+    # §11 (t003): 読めないラッパーの子 (本物の job) は独立に job と読めるので executing。
+    # どちらでも kill しない側 (terminate にならない) であることが受入条件。
+    assert detail.process_signal in ("unknown", "executing")
     assert detail.verdict != "terminate"
 
 

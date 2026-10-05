@@ -609,6 +609,7 @@ env 停止スイッチは付けていない (dispatcher と watchdog で答え�
 | C | `CLAUDECODE` の無い子 (`env -i` で起動 / Claude と無関係) | **unknown** | `_origin_of` が unknown を返す (t091) |
 | D | environ が空 (`execve(..., envp=[])`) | **unknown** | 同上 |
 | E | pid 列挙の失敗・`/proc` の読めない (hidepid 等) | 未再現 (本番に無い環境要因) | `_proc_stat` / `iterdir` の OSError |
+| F | **窓はあるが pane pid が引けない** (mux の不調。木を見ていない) | node が無い経路 (`watchdog.py` の `_process_signal` が `unknown` を返す) | `_mux.pid(name)` が None。**通知文で `mux_pid_unavailable` と理由を区別する** (t002 review 指摘 2。実装: 11-9) |
 
 **本番に A の実例が今ある** (2026-10-04 17:00 に読み取りだけで確認): Ren の稼働中セッション (pid 3402938) に、回収されていない
 `npm exec @playw` / `npm exec chrome` / `sh` の zombie が 3 つぶら下がっている (うち 2 つはセッション起動の 2 秒後 = MCP が起動直後に死んで回収されないまま
@@ -642,8 +643,10 @@ Rule 5 は「job ではない」と読んで通知する側に倒れる (実害�
 
 **dedup の仕組みは既にある**: `make_notify_once(repo_root)` の `notify_once(key, fp, kind, slug, task, message)` (`registry/daemons/notified-state.json` の台帳。送れたときだけ記録・台帳が壊れていれば再送側)。
 利用枠切れの `usage_notify_once(f"usage-limit-overdue_{agent}", fp, "usage-limit", "_daemon", agent, msg)` が同じ型の前例。
-**同じ Worker・同じ試行で 1 回**にするには、`key = f"hard-idle-suppressed_{agent}"`・`fp = f"{task_id}@{int(monitor.started_at)}:{reason}"`
-(試行が変われば `started_at` が変わり再通知、同じ試行で理由が変われば再通知、同じ理由が続く間は 1 回)。slug は `_daemon` (mission slug だと `prune_told()` が捨てる — §10 と同じ理由)。
+**同じ Worker・同じ試行で 1 回**にするには、`key = f"hard-idle-suppressed_{agent}"`・`fp = f"{current_execution_id}:{reason}"`
+(**承認済みの変更**: 当初案の `task@started_at` は `monitor.started_at` が watchdog の再起動で変わるので使わない。試行の識別は Execution ID。
+ID の無い旧形式 card だけ **card の `started_at`** (pull の時刻。試行ごとに書き直され、再起動で変わらない) に fallback する。
+試行が変われば再通知、同じ試行で理由が変われば再通知、同じ理由が続く間は 1 回)。slug は `_daemon` (mission slug だと `prune_told()` が捨てる — §10 と同じ理由)。
 抑止が解けた (`alive` / `terminate` / task 完了) ときは台帳キーを消す (回復を観測した場合だけ。§10 の原則)。
 
 ### 11-4. 直し方の案と比較
@@ -669,7 +672,7 @@ Rule 5 は「job ではない」と読んで通知する側に倒れる (実害�
 | OSError で job の探索を打ち切る (11-2 で見つけた順序依存) | **入れる** | zombie を除けば A は消えるが、B のような OSError が job より先に来る順序依存は残る。unknown を見つけても BFS を続けて job を探し、**job が見つかれば executing、無ければ unknown** に揃える (`origin == "unknown"` の経路と同じ扱い。docstring の約束どおり) |
 | `job_since` の未来値 (§6 backlog) | **別 PR** | Rule 5 の上限タイマーの話で、unknown の件と原因が違う。状態ファイルが壊れた場合だけ |
 | dispatcher `worker_has_background_work()` | **変更なし** | `unknown` → False (通知する) は正しい向きのまま。zombie 除外で `idle_process` を返すようになっても答えは同じ (False)。A を直した後は pid 順に依存せず `executing` が出る (11-2 の順序依存が消える) |
-| Rule 5 (§7 / §8) の上限 `CREWVIA_RULE5_BACKGROUND_JOB_MAX_SECONDS` | **変更なし** | executing を黙る側の上限で、本件は watchdog の hard_idle 側 |
+| Rule 5 (§7 / §8) の上限 `CREWVIA_RULE5_BACKGROUND_JOB_MAX_SECONDS` | **変更なし** | executing を黙る側の上限で、本件は watchdog の hard_idle 側。**木の読み方が変わる影響**: 読めないノードで即 unknown にしなくなり、job が他にあれば `executing` が出る = **executing が増える = Rule 5 が黙る側に動く**。黙りっぱなしは `CREWVIA_RULE5_BACKGROUND_JOB_MAX_SECONDS` (既定 30 分) が抑える (上限を過ぎれば通常の idle-with-task 判定に戻る) |
 | watchdog の `WARN:` を毎サイクル出す行 | **入れる** | (c) と同じ分岐。Director 通知は台帳で 1 回、`WARN:` のログ行と Taskvia alert は suppress 理由が変わった時 + 10 cycle ごと (VerdictLogger と同じ間隔) に落とす |
 | awaiting_human の通知 | **入れる (推奨)** | 同じ `hard_idle_but_*` の抜け道。Arjun t017 (3691 秒の warn → max) が実例。人間待ちが 1 時間以上続くのは Director が知ってよい |
 | `max_exceeded` はプロセス層で抑制しない (§6) | 変更なし | 最後の網として残す |
@@ -702,3 +705,93 @@ Rule 5 は「job ではない」と読んで通知する側に倒れる (実害�
 6. テスト: 実プロセスの zombie を作って `idle_process` / 順序依存の 2 並びで `executing` になること (`repro.py` / `order2.py` の形)。赤の実証 (修正前に戻すと赤)。B / C / D は `unknown` のまま残ること (誤って infra に倒していない対照)。
 7. **本番反映は watchdog の restart が要る** (§7 / `knowledge/dispatcher-restart-after-merge.md`)。`lib_pane_process.py` は dispatcher も import するので両デーモン同時 (`sync-main-checkout.sh`)。
 8. 戻し方: PR revert → `sync-main-checkout.sh`。台帳の `hard-idle-suppressed_*` は消してよい (無い = 再通知)。
+
+### 11-9. 実装の実績 (t003, 2026-10-04) と戻し方
+
+承認済みの設計 (11-8 の 1〜8) に、ユーザー承認 (2026-10-04) の追加決定 4 点を入れて実装した。
+
+| 変更 | 場所 | 要点 |
+|---|---|---|
+| zombie を木から外す | `lib_pane_process._classify` / `_proc_state` | state が `Z` と**読めたときだけ**外す (読めない・消滅は None = 通常の分類へ。zombie でないものを zombie と読む向きの誤りを作らない)。`_proc_stat` のタプルは変えない (`_direct_children()` 等の helper を壊さない) |
+| 読めないノードで即 unknown にしない | 同上 | cmdline / environ / exe の OSError は `saw_unknown` を立てて BFS を続ける。job が見つかれば `executing`、無ければ最後に `unknown`。読めないノードの子は origin `unknown` で渡す (独立に判定)。**列挙そのものの失敗 (E) は従来どおり即 unknown** |
+| unknown の診断 | `explain_unknown_tree(root_pid)` | 読み取り専用の再走査。`pid=N state=S errno=EACCES(13)` / `origin=unknown` を返す。通知文に載る (次に起きたとき A / B / C / D のどれか確定できる) |
+| 見送りの通知 | `watchdog.SuppressedIdleNotifier` | `hard_idle_but_*` が `daemons.hard_idle_suppressed_notify_seconds` (既定 600) 続いたら `notify_once` で Director に 1 回。**unknown / executing / awaiting_human の 3 種 + mux_pid_unavailable**。key `hard-idle-suppressed_<agent>`・fp `<Execution ID>:<種別>`・slug `_daemon`。解けた (warn でなくなった・監視から外れた) ら `told_forget` で台帳キーを消す (消せなければ次のサイクルで再試行) |
+| WARN 行の間引き | `watchdog.WarnLineThrottle` | 理由が変わった時 + 10 cycle ごと (`VerdictLogger` と同じ間隔)。warn でなくなれば初回扱いに戻る。行の末尾に `reason=` を足した |
+| 設定値 | `lib_daemon_watch.WatchConfig` / `config/crewvia.yaml` | **env は付けない** (watchdog だけが読む値で停止スイッチではない。`_CONFIG_KEYS` に入れない)。既定値 600 は `WatchConfig` の 1 か所。0 以下・数でない値は既定値 |
+
+**利用枠切れとの関係** (t002 review 指摘 1): `limit_excused` は `check_detail()` の中で idle の判定より先に効くので、利用枠切れの表示が出ている間は
+zombie の有無に関わらず `alive / usage_limit` のまま (影響なし)。免除の上限を過ぎてなお表示が続くときは**従来どおり通常の idle / max 判定に戻る**
+(その場合の zombie は今回の変更で木から外れ、hard_idle の判定が本来の秒数で動く)。テスト: `test_usage_limit_with_a_zombie_tree_stays_alive`。
+
+**残る既知の穴 (通知で受ける)**: B (非 dumpable の子) / C / D は今までどおり `unknown` で、kill の根拠にしない。長く続けば 600 秒後に Director に届く。
+最後の網は max (3 時間) のまま。
+
+**検証**: `tests/test_hard_idle_suppression_unknown_zombie.py` (実プロセスの zombie / 非 dumpable / CLAUDECODE 無し + 通知・間引き・設定値・run() の配線)。
+赤の実証 `tests/red_proof_hard_idle_unknown.py` (8 欠陥・約 2 分): zombie 除外・即 unknown・通知しきい値・fp・台帳の掃除・mux_pid_unavailable・WARN の間引き・run() の配線
+を 1 つずつ戻すと、狙ったテストが落ちる。プロセス系の新規テストは単独 100 回で回した (結果は PR 本文)。
+既存の `test_an_unreadable_wrapper_is_unknown_not_infra` / `..._cmdline_is_unreadable` は「`unknown`」から「`unknown` か `executing`」に緩めた
+(ラッパーの子が job と読めるので executing が出るのが新しい正解。**守る向きは同じ: `idle_process` (= kill してよい) にならない**)。
+
+**本番反映**: merge しても watchdog / dispatcher は再起動するまで古いコードのまま (`lib_pane_process.py` は dispatcher も import する)。
+Director が `sync-main-checkout.sh` で ff + 両デーモン再起動 (3 点の証明は `knowledge/dispatcher-restart-after-merge.md`)。この task は本番を再起動していない。
+
+**戻し方**: PR を revert → `sync-main-checkout.sh`。台帳の `hard-idle-suppressed_*` は消してよい (無い = 再通知)。
+通知だけ止めたいなら `daemons.hard_idle_suppressed_notify_seconds` を大きくする (env は無い。watchdog の再起動が要る)。
+
+**11-10. 回復の判定は永続の台帳で (PR #278 Codex P2 / t009)**: 回復 (forget) が通知済みかをプロセス内の `st["notified"]` で決めていたため、watchdog の再起動をまたぐと台帳キーが残り、同じ試行の次の見送りで通知が出なかった。**§11-13 で構造ごと置き換えた** — 通知済みかは台帳だけで決め (`plan_suppression`)、プロセス内の状態に判定を依存させない。再発防止は網羅テスト (`tests/test_suppression_notifier_model.py` の I3。再起動と削除失敗の出来事を含む)。赤の実証: `tests/red_proof_hard_idle_unknown.py` の「【1 巡目 t009】」。族の洗い出し (台帳の書き込み / 掃除でプロセス内状態に依存するもの): `usage-limit-overdue_*` の notify_once = 書くだけで掃除なし (fp で重複を止めるので再起動で二重にならない・対象外) / timeout 通知の台帳 = dispatcher の TTL prune が掃除 / `VerdictLogger`・`WarnLineThrottle` = ログのみで再起動は「初回扱い」(安全側)。
+
+**11-11. 台帳の掃除は呼び出し経路に頼らない (PR #278 Codex P2 2 巡目 / t011)**: 掃除が失敗してプロセス内の `_pending_forget` に残ると、その Worker の `forget` が二度と来ない状況で永久に残り、次の見送りで古いキーが通知を黙らせた。**§11-13 で構造ごと置き換えた** — `_pending_forget` を廃止し、掃除は毎回台帳を読んで「居る分を消す」(`forget` = 回復・消滅の観測、`cycle` = 監視されていない Worker のキー)。失敗は次のサイクルの再計算で自然にやり直される。再発防止は網羅テスト (I3・I5)。赤の実証: 「【2 巡目 t011】」。
+
+**11-12. zombie を飛ばすときに集めた子孫を落とさない (PR #278 Codex P1 3 巡目 / t013)**: 指摘は「`_classify` は children map を作ってから `_proc_state()` を読む。その間に包み役 (Bash tool の `bash -c` 等) が終わって zombie になると、`continue` がその子孫のキュー投入まで飛ばす」。生きている長いテストが木から消えて `executing` ではなく `idle_process` になり、**働いている Worker を hard_idle で terminate する向き**に倒れる (§11 の「kill が増えるのは zombie しか根拠がない場合だけ」を破る)。
+
+直し: zombie 自身は判定に寄与させない (`saw_unknown` も立てない) が、**children map に載っている子は必ずキューに積む**。子に渡す parent_origin は `"zombie"`:
+- `"job"` ではない — zombie の起源は読めない (環境が消える) ので、job を捏造して `executing` にしない (kill を止める向きの誤判定も作らない)。
+- `None` でもない — `None` は「pane root の直接の子」の印で、`_is_session_body()` に入る。孫を session と読む誤りを避ける。
+- よって子は `_origin_of()` で**独立に**判定される。cmdline の wrapper marker / environ の job シグナルがあれば job (= executing)、読めなければ従来どおり unknown 側 (kill しない)、CLAUDECODE があれば infra。
+
+選ばなかった案: zombie の子を無条件に "job" として伝播 (job 判定の捏造。zombie の下の本物の infra を executing にして hard_idle を永久に止める = 本件の元の欠陥の逆向き)。
+
+`_classify` の「スキップ / 早期 return / continue」の全分岐 (既に集めた子孫を落として kill 側に倒れないか):
+
+| 分岐 | 何をする | 集めた子孫を落とすか | kill 側に倒れるか |
+|---|---|---|---|
+| root の `_proc_stat` が OSError | `unknown` を即 return | 子孫を集める前 (落とす物が無い) | しない (unknown は殺さない) |
+| root が消滅 (None) | `no_process` | 同上 | 元から (pane が無い) |
+| `/proc` の列挙 / 個別 `_proc_stat` の OSError | `unknown` を即 return | 木が組めない = 判定を放棄 | しない |
+| 直接の子が無い | `no_process` | 無い | 元から |
+| `pid in seen` で continue | 二重処理の抑止 | 無い (既にキュー済み・処理済み) | しない |
+| **zombie で continue** | 判定に寄与させない | **落としていた → 本件で子をキューに積む** | **していた → 直した** |
+| session 本体 (`_is_session_body`) | origin=session で子を積む | 落とさない | しない |
+| `_origin_of` / `_is_session_body` の OSError | `saw_unknown` を立て、子を `"unknown"` で積んで continue | 落とさない (t003) | しない (unknown) |
+| `origin == "job"` で return `executing` | 確定 | 残りは不要 (job が最優先) | しない (殺さない向き) |
+| `origin == "unknown"` / infra | 子を積む | 落とさない | しない |
+
+`_origin_of` が cmdline / environ の消滅 (None) で `infra` を返すのは、その pid 自身が居なくなっただけで子は children map から積まれる (落とさない)。落としていたのは zombie 分岐だけ。
+
+検証: `test_a_wrapper_that_turns_zombie_after_the_snapshot_keeps_its_job` (実プロセスの木 + `_proc_state` の差し替えで「snapshot 時は生きている・読む時点で Z」を作る。マイクロ秒の窓は実時間で再現できない)、`test_the_children_of_a_zombie_are_not_taken_for_a_session_body`。赤の実証は `tests/red_proof_hard_idle_unknown.py` に 3 点 (子を積まない / 子に None を渡す / 通知文から mission を外す)。
+
+**通知文 (t013 追加)**: 文頭に `mission <slug>` を入れた (task id だけでは別 mission の同名 task と区別できない。`WorkerMonitor(mission_slug=...)`、run が slug を渡す)。文末は「…ため終了を見送っています」をやめ、「終了を見送っています。理由: <理由>・該当ノード pid=… state=… errno=…。」と理由と根拠を分けた。
+
+**11-13. 見送り通知の状態を 1 つの純粋関数にする (PR #278 Codex P2 4 巡目 / t016。設計)**: 1・2・4 巡目の指摘は同じ型 — 通知の状態が「プロセス内 (`_state` / `_pending_forget`)」と「台帳 (Worker ごとに 1 キー・fp が `<Execution ID>:<種別>` の 1 つ)」に散り、一部の経路だけ直しても別の経路が残った。4 巡目は、1 キーに fp が 1 つしか入らないため、episode の中で unknown → executing → unknown と理由が往復するたびに fp が変わり同じ理由が何度も通知される、というもの。
+
+**episode の定義 (ここ 1 か所)**: ある Worker・ある Execution ID の「見送りが続いている区間」。
+- 始まり: 見送り (`suppression_kind() is not None`) を最初に観測したとき。
+- 終わり: ① 見送りでない判定 (alive / terminate など) を観測 ② Worker が監視から外れる (消滅) ③ Execution ID が変わる。終わったら、その Worker の台帳キーを全部消す。
+- episode の中では**理由 (kind) ごとに最大 1 回**通知する。理由が往復しても、通知済みの理由は再通知しない。しきい値 (既定 600 秒) は episode の経過時間で、再起動すると数え直す (通知が最大しきい値ぶん遅れるだけ。台帳が重複を止める)。
+
+**永続の状態は台帳だけ**: キーを理由ごとに分ける — `hard-idle-suppressed_<agent>@<kind>`・fp `<Execution ID>:<kind>`。「その理由は通知済みか」は台帳の fp を見れば分かる。プロセス内に判定を依存させない (`_pending_forget` は廃止。掃除は毎回台帳を読んで「居る分を消す」ので、失敗は次のサイクルで自然にやり直される)。
+
+**純粋関数**: `plan_suppression(told, agent, kind, ident, lasted, threshold) -> SuppressionPlan(notify, forget)`。`told` は `{key: fp}` (台帳が無ければ `{}`、読めなければ `None`)。I/O をしない。`SuppressedIdleNotifier` は (1) 台帳を読む (2) `plan_suppression` に渡す (3) plan を実行する (台帳の掃除・notify_once) だけ。
+- 見送りでない (kind なし。回復・消滅): その Worker の全キーを消す。台帳が読めなければ全種別のキーを消しにいく (消す側に倒す)。
+- 見送り・lasted がしきい値未満: 何もしない。
+- 見送り・しきい値以上: `told[key] == fp` なら黙る。そうでなければその理由を通知する。fp の Execution ID が現在と違う古い試行のキーは消す (I4: 前の試行から引き継がない)。台帳が読めなければ通知する (再送側に倒す。従来どおり)。
+
+**実装の実績 (t016)**: `watchdog.plan_suppression()` (純粋関数。docstring に episode の定義) と、それを実行するだけの `SuppressedIdleNotifier` (`observe` / `forget` / `cycle`)。台帳キーは `hard-idle-suppressed_<agent>@<kind>`・fp `<Execution ID>:<kind>` (旧キー `hard-idle-suppressed_<agent>` は孤児として消えない — 接頭辞が一致しても `@` を含まないので触らない。台帳は消してよい = 再通知、で足りる)。コンストラクタは `has_key` / `list_keys` をやめ `read_ledger` (台帳の {key: fp}。無ければ {}、読めなければ None) 1 つにした。プロセス内に残るのは episode の開始時刻・通知文の使い回し・`_unsettled` (同じプロセスで episode を閉じた Worker。掃除が済んだと台帳で確認できるまで、台帳の自分のキーを「閉じた episode のもの」として扱う)。
+
+**網羅テスト** (`tests/test_suppression_notifier_model.py`): 出来事 11 種 (S_unk / S_exe / S_awh / recover / restart / write_fail / delete_fail / delete_raise / new_exec / vanish / tick。故障の 3 種は次のサイクルに効く) の**長さ 5 までの全ての並び** + 出来事を絞った全列挙 3 組 (長さ 6〜7) + seed 固定のランダム列 (長さ 6〜14)。実際の `SuppressedIdleNotifier` と tmp の台帳ファイルに流し、毎ステップ I1〜I5 を assert する。全 11 種の長さ 6 は 177 万並びで重いので、深い並びは出来事を絞って稼ぐ (閉じる掃除の失敗 → 再発 → 通知は長さ 6〜7 でないと現れず、最初は長さ 5 の全列挙だけで見逃した)。約 3 分。
+
+**既知の穴 (I2 から外している)**: 回復の掃除が失敗したまま watchdog が再起動し、同じ Execution ID で見送りが再発すると、古いキーが通知を黙らせる (掃除が成功するまで。`_unsettled` はプロセス内の状態で、再起動で失う)。掃除は毎サイクル台帳を読んでやり直すので、窓は「台帳の削除が失敗し続けている間」だけ。台帳に episode の印を持たせれば塞げるが、台帳の形を変えるので見送った。
+
+**5 巡目 (t017) の指摘と、t006 で見つかった連投 (t018 で修正)**: Codex 5 巡目の P2「新しい通知を記録する前に `_unsettled` を解け」は当初 backlog (「黙るだけ」) としたが、最終レビュー (t006) で前提が違うと分かった — 回復時と再発後 ~600 秒の間、台帳の削除が失敗し続けた後に成功すると、新しいキーを記録した同じ plan で `_unsettled` が解けず、次のサイクルからそのキーを閉じた episode のものとして消して再送し、回復か max まで毎サイクル通知した。`observe` で通知する plan のとき `_unsettled` を解く 2 行で直した (削除がまだ失敗していれば古い fp が一致して黙る = 上の既知の穴に戻るだけ)。網羅テストが見逃したのは、この並びが長さ 9 で、全列挙 (長さ 5) と絞った列挙 (長さ 6〜7) の長さの外にあったため。名指しのテスト `test_a_deletion_that_recovers_after_a_relapse_does_not_renotify_every_cycle` と red_proof「【5 巡目 t017】」を足した。
+
+**赤の実証** (`tests/red_proof_hard_idle_unknown.py`): 1 巡目 (回復の判定をプロセス内の状態に戻す)・2 巡目 (cycle が掃除をやり直さない)・4 巡目 (台帳キーが理由ごとでなく Worker ごと) の欠陥を 1 つずつ戻すと網羅テストが狙った不変条件 (I3 / I3 / I1) で落ちる。他に: 閉じた episode の古いキーを消さない (I2) / 古い試行のキーを消さない (I4) / 掃除の例外を外に出す (I5)。

@@ -13,7 +13,7 @@ mission `20261004-watchdog-hard-idle-unknown` で t017 が `needs_director` の�
 
 ユーザーと合意済み (2026-10-05):
 
-- **段階上げ**: 判断待ちが後続を止めていたら、**5 分で Director に再通知・10 分で Telegram でユーザーに通知**。
+- **段階上げ**: Director の判断待ちが続いたら、**5 分で Director に再通知・10 分で Telegram でユーザーに通知** (初版は「後続を止めていたら」だったが、後続の有無を条件にしない形にユーザーが変更。§5-2)。
   どちらも config で変えられる。
 - **Telegram のボタンで判断できる**: Director がユーザーに選択肢を出すとき、待たずに Telegram にボタン付きで送る。
   押された答えは Director の画面に届き、Director が進める。込み入った指示は Telegram への返信文か
@@ -64,20 +64,63 @@ CYCLE ENTRY POINT)。ネットワーク I/O を足すので次を満たす:
    `python3 scripts/lib_telegram.py poll` を `timeout 8` 付きで起動する (`urlopen(timeout=5)`。
    DNS・TLS の stall もサブプロセスごと打ち切る)。戻り値は終了コードではなく**標準出力の JSON**
    (`{"forwarded": n, "undelivered": n, "error": "<種別>"}`)。サブプロセスが死んでも、
-   呼び出し側は「今回は何も受けなかった」で次のサイクルに進む。
+   呼び出し側は「今回は何も受けなかった」で次のサイクルに進む。`poll` は専用ロック
+   (`registry/daemons/telegram-poll.lock`、非ブロッキング `flock`) を取り、取れなければ何もせず戻る
+   (前のサブプロセスが残っていても 2 つ重ならない = offset の書き手は常に 1 者)。
 2. **間引く。** 5 秒ごとには呼ばない。`TG_POLL_INTERVAL` (既定 10 秒、config `telegram.poll_interval_seconds`) の
    スロットル。スロットルの時刻は他の通知スロットルと同じ入口 (`should_notify` 系) ではなく、
-   **受信専用の状態** (§2-5 の `telegram-state.json`) に置く (通知の `NOTIFY_TTL` と混ぜない)。
-3. **未設定なら 1 バイトも触らない。** `CREWVIA_TG_BOT_TOKEN` / `CREWVIA_TG_CHAT_ID` のどちらかが空なら、
-   サブプロセスを起動せず、ファイルを作らず、ログも出さない (公開前提・Taskvia 非依存と同じ型。
-   `CREWVIA_TASK_GRAPH=0` の「1 バイトも書かない」と同じ扱い)。
-   - これは**共有規則の env 停止スイッチではない** (不変条件 5 の対象外)。受信を読むのは dispatcher だけで、
-     plan.sh と答えが割れる規則が無い。「未設定 = 機能が無い」という構成の話。
-   - **開かれている質問が 1 件も無いときは受信しない** (§2 の質問台帳に `open` が 0 件なら何もしない)。
-     通常運用のほとんどのサイクルで外部への通信がゼロになる。代わりに、
-     **bot 宛の雑多なメッセージ (`/start` 等) は拾わない・offset も進めない** (§2-6)。
+   **受信専用の状態** (§2-5 の `telegram-offset.json` の `last_poll_at`) に置く (通知の `NOTIFY_TTL` と混ぜない)。
+3. **未設定なら 1 バイトも触らない。** 認証情報 (§1-1 の `resolve_credentials()`) が解決できなければ、
+   サブプロセスを起動せず、質問台帳も offset も作らず、ログも出さない (公開前提・Taskvia 非依存と同じ型。
+   `CREWVIA_TASK_GRAPH=0` の「1 バイトも書かない」と同じ扱い)。**例外は 1 つだけ**: 受信側の状態
+   (§1-1 の `telegram-receiver.json`) は、**既にファイルがあるとき**に限り `enabled: false` へ書き換える
+   (「有効だったのに無効になった」を送信側に見せるため。**初めから未設定なら何も作らない**)。
+   - これは**共有規則の env 停止スイッチではない** (不変条件 5 の対象外) — ただし「設定済みか」の答えを
+     送信側 (`ask_user.sh`) と受信側 (dispatcher) が**別々に出す**と不変条件 5 と同じ型の事故になる。
+     それを §1-1 で塞ぐ (設計レビュー t002 の P1-2)。
+   - **受信を起動する条件**: 認証情報が解決でき、かつ**未回答の質問がある** = 「`open` かつ期限内」
+     (定義は §2-3b。期限切れの掃除は `poll` の冒頭で済ませる) が 1 件以上。通常運用のほとんどのサイクルで
+     外部への通信がゼロになる。**bot 宛の雑多なメッセージ (`/start` 等) は拾わない・offset も進めない** (§2-6)。
+   - 掃除だけは通信を伴わないので、**台帳ファイルがあれば**サイクルごとの間引き (上の 2) で走らせる
+     (期限切れの `open` を `expired` に書き、ボタンを消す `editMessageReplyMarkup` が要るものだけ通信する。§2-3b)。
 4. **mux 非依存。** 転送は既存の `tmux_send()` (= `_mux.send`) を使う。tmux でも herdr でも同じ。
    mux が無いインラインモードでは dispatcher が動かないので、受信も動かない (§7 に「届かない」の扱い)。
+
+### 1-1. 受信側の状態と認証情報 — 送信側と答えを割らない (t002 P1-2)
+
+**問題**: `lib_daemon_watch.spawn_command` は env を allowlist (`_SPAWN_ENV_VARS`) だけ運び、秘密
+(`TASKVIA_TOKEN` 等) は意図的に運ばない (`scripts/lib_daemon_watch.py` の `_SPAWN_ENV_VARS` の注記: コマンド文に
+秘密を書くと `ps`・pane の scrollback・mux のログに出る)。watchdog が dispatcher を respawn すると
+`CREWVIA_TG_*` は落ち、受信と段階 2 が**黙って**止まる。一方 Director のシェルには token があり、
+`ask_user.sh ask` は送れてしまう (押されたボタンを誰も受けない)。memory: `daemon-secret-env-lost-on-respawn`。
+
+**直し方は 2 層** (どちらも要る):
+
+1. **割れを起こさない仕組み (最低限・必須)**: dispatcher が毎サイクル (変化したとき + 30 秒ごとの心拍) に
+   `registry/daemons/telegram-receiver.json` を書く。**書き手は dispatcher だけ**。
+   ```json
+   {"enabled": true,  "checked_at": 1759650000.0, "reason": "ok"}
+   {"enabled": false, "checked_at": 1759650030.0, "reason": "no_credentials"}
+   ```
+   `reason` は固定コード (`ok` / `no_credentials` / `credential_command_failed` …)。**token・chat_id・参照の文字列は書かない**。
+   - `ask_user.sh ask` は送る前に必ずこれを読み、**`enabled == true` かつ `checked_at` が 3 × `poll_interval` 以内**
+     でなければ**断る** (exit 4。stderr に固定コード `receiver_disabled` / `receiver_stale` / `receiver_unknown`
+     (ファイルが無い) を出す)。これは初版の「dispatcher の生存確認」を置き換える — 心拍が新しければ
+     生きていて、かつ受信できる状態だと言える。`ask` は断るので、押されても誰も受けないボタンは出ない。
+     Director は `AskUserQuestion` に戻る。
+   - **割れを Director に 1 回知らせる**: dispatcher が「前回 `enabled: true` で今回 `enabled: false`」を観測したとき、
+     既存の `notify_state_once` で Director に 1 通 (key `telegram_receiver_disabled`、fp = `reason`):
+     「Telegram 受信が無効になりました (理由コード)。dispatcher が env を失った可能性 (respawn)。`lib_daemon_watch.py restart` を
+     認証情報つきで行うか、§10 の選択肢を設定してください」。状態を離れた (`enabled: true` に戻った) ら台帳から捨てる。
+   - 受信側の状態の書き方は他の台帳と同じ入口 (`lib_daemon_state`・`telegram_receiver_problem()`・原子的置換)。
+     壊れていたら `ask` は断る側に倒す (**観測できなかったことを「有効」に倒さない**)。
+2. **respawn 後も認証情報を届ける方法**: コマンド文・env allowlist には秘密を載せない (**採らない**)。
+   選択肢の比較は **§10 (ユーザー判断)**。推奨は「`poll` / `ask` のたびに 1Password CLI (`opx`) で取り出す」。
+   どの方式でも、**認証情報の解決は `lib_telegram.resolve_credentials()` の 1 か所**で、`ask_user.sh` と
+   dispatcher の `poll` / 段階 2 の送信が同じ関数を通す (割れる余地を作らない)。
+
+本番確認 (PR-A): 「`lib_daemon_watch.py restart` (または watchdog の自動 respawn) の後にも、ボタンが受信される
+(または `ask` が `receiver_disabled` で断られ、Director に通知が 1 通来る)」ことを 1 回観察する。
 
 ### 副次: getUpdates の消費者は dispatcher の 1 者だけ
 
@@ -116,7 +159,7 @@ CYCLE ENTRY POINT)。ネットワーク I/O を足すので次を満たす:
   (`[telegram-answer] q=…`) ので推測されうるが、札は callback_data にしか載らない。
 - **callback_data** (Telegram の上限 64 バイト): `<qid>.<nonce>.<index>` (例 `q-1a2b3c4d.9f3a1c.1` = 20 バイト前後)。
   ラベルの文字列は入れない (入れると 64 バイトを超え、改竄にも弱い)。ラベルは**記録から** index で引く。
-- 質問の最大同時数・保管: `open` は最大 8 件 (超えたら `ask` が拒否 = §7)。`answered` / `withdrawn` / `expired` は
+- 質問の最大同時数・保管: 「未回答の質問がある」(`open` かつ期限内。定義は §2-3b) は最大 8 件 (超えたら `ask` が拒否 = §7)。`answered` / `withdrawn` / `expired` は
   7 日で掃除する (消してよい台帳。不変条件 7 の仲間 — **消えても復旧手順になる**: 古いボタンは「不明」で拒否されるだけ)。
 
 ### 2-2. 受け付ける条件 (全部 AND。1 つでも欠けたら転送しない)
@@ -144,36 +187,60 @@ callback_query (ボタン) の場合:
 ```
 open ──ボタン/返信──▶ answered   (記録: answer + update_id、forwarded=false → 転送後 true)
 open ──ask_user.sh cancel──▶ withdrawn  (Director が画面など別の手段で答えを得た)
-open ──expires_at 超過──▶ expired
+open ──expires_at 超過──▶ expired       (§2-3b: poll の冒頭 / ask の冒頭が書く)
+open ──message_id が null のまま 5 分──▶ withdrawn  (§2-3b: ask が途中で落ちた残骸)
 ```
 
 | ケース | 扱い |
 |---|---|
 | **二重押し** (answered の質問のボタンをもう一度) | 転送しない。`answerCallbackQuery` で「回答済み: <ラベル>」。**先に確定した 1 つだけが有効**。状態変更は `told_lock` の下で「`open` → `answered`」を 1 回だけ行う (CAS)。違う選択肢を後から押しても上書きしない |
-| **古いボタン** (期限切れ・台帳に無い・nonce 不一致) | 転送しない。`answerCallbackQuery` で「期限切れ / 不明な質問」。期限切れなら `editMessageReplyMarkup` でボタンを消す (best effort。失敗しても無視) |
-| **Director が既に別の手段で答えを得た後の押下** | Director は答えを得た時点で `ask_user.sh cancel --q <id> --by screen` を呼ぶ (§4)。`withdrawn` なので押下は転送されず、「画面で回答済み」と返し、メッセージのボタンも消す。**Director が cancel を忘れた場合**は転送される — その場合も Director の規則 (§3) で、実行の直前に状態を確かめ直すので、既に済んだ操作を二重に実行しない |
-| 質問に `--task` が付いていて、その task が既に `needs_director` を離れていた | 転送はする (ユーザーは押した)。行に `task_state=<status>` を添える (§3)。Director が状態を見て判断する |
+| **古いボタン** (台帳に無い・nonce 不一致・`answered` / `withdrawn` / `expired` の質問) | 転送しない。`answerCallbackQuery` で「期限切れ / 回答済み / 不明な質問」。ボタンは**期限・取り下げの時点で既に消してある** (§2-3b) ので、押せるのは消す前の競合だけ |
+| **Director が既に別の手段で答えを得た後の押下** | Director は答えを得た時点で `ask_user.sh cancel --q <id> --by screen` を呼ぶ (§4)。`cancel` が `withdrawn` にして**ボタンも消す** (best effort)。消える前の競合で押された場合は転送されず、「画面で回答済み」と返す。**Director が cancel を忘れた場合**は転送される — その場合も Director の規則 (§3) で、実行の直前に状態を確かめ直すので、既に済んだ操作を二重に実行しない |
+| 質問に `--task` が付いていて、その task が既に判断待ちを離れていた | 転送はする (ユーザーは押した)。行に `task_state=<status>` を添える (§3)。Director が状態を見て判断する |
 | 転送 (mux send) に失敗した・Director 不在 | `answered` / `forwarded=false` のまま。**`answerCallbackQuery` は先に返す** (ボタンの待ち表示を止める)。次の受信サイクルで `forwarded=false` の answered を再送する。期限は質問の `expires_at` ではなく**答えが入った時刻から 24 時間**で諦め、Telegram に「Director に届きませんでした」と 1 回返す |
+| 質問の `message_id` がまだ `null` (ask の ③ の前) の `open` を指す押下 | **転送せず、offset を進めない** (次のサイクルで同じ update をもう一度受ける)。窓は ask の ②→③ の間だけで小さい。5 分を超えて `null` のままなら §2-3b で `withdrawn` になり、その後の押下は「不明」で拒否される (t002 P3-1) |
 | 台帳が `Unreadable` | 転送しない・offset を**進めない**・`answerCallbackQuery` も呼ばない (ボタンの待ち表示が残る)。ログに `WARNING: telegram-questions` を 1 回/10 分。台帳を消せば復旧 (§2-1)。fail の向き: **観測できなかったことを「答えが無い」に倒さない** |
+
+### 2-3b. 期限と掃除 — 誰がいつ `expired` / `withdrawn` を書くか (t002 P2-1)
+
+- **書き手は 2 者**: (1) `lib_telegram.py poll` の冒頭、(2) `ask_user.sh ask` の冒頭。どちらも `told_lock` の下で
+  台帳を読み直し、次を**同じ関数 `sweep_questions(ledger, now)`** (純粋関数。新しい台帳を返す) で行う:
+  1. `status == open` かつ `now ≥ expires_at` → `expired`
+  2. `status == open` かつ `message_id == null` かつ `now - created_at ≥ 300 秒` → `withdrawn`
+     (ask が ①〜③ の間で落ちた残骸。ボタンはまだ出ていないか、出ていて台帳に記録が無い。出ていた場合のために
+     ②の `sendMessage` の応答を ③ より先にログへ残さない — 残骸のボタンは「不明」で拒否される)
+  3. `answered` / `withdrawn` / `expired` で 7 日を過ぎたもの → 削除
+- 掃除で `open` を離れた質問のうち `message_id` を持つものには、`editMessageReplyMarkup` でボタンを消す
+  (best effort。失敗しても台帳は進める)。**この通信は掃除が新しく `expired` / `withdrawn` にした質問の分だけ**で、
+  `open` が 0 件になった後は走らない。
+- **「未回答の質問がある」の定義** (受信を起動する条件 §1-3 と `ask` の上限 8 件で**同じ関数**を使う):
+  `status == open` かつ `expires_at > now` かつ (`message_id != null` または `now - created_at < 300 秒`)。
+  期限切れ・残骸の `open` を数えて受信が止まらない / 8 件で `ask` が詰まる、を防ぐ。掃除は数える前に必ず走る。
 
 ### 2-4. offset
 
-- `telegram-state.json` に `{"offset": N, "last_poll_at": …}`。`getUpdates(offset=N, timeout=0, allowed_updates=["callback_query","message"])`。
+- `telegram-offset.json` に `{"offset": N, "last_poll_at": …}` (**書き手は `poll` だけ**。§1-3 の `telegram-poll.lock` で
+  2 つの `poll` が重ならない。`ask_user.sh` や段階 2 の送信は触らない — t002 P2-3)。
+  `getUpdates(offset=N, timeout=0, allowed_updates=["callback_query","message"])`。
 - **offset を進めるのは、その update を処理し終えた (台帳に答えを書いた / 拒否して返信した / 無関係と確定した) 後**。
   処理途中で落ちたら同じ update をもう一度受ける (**at-least-once**)。重複しても §2-3 の CAS が 1 回に畳む。
   (`update_id` を `answer.update_id` に残し、同じ update_id の再処理は何もしない。)
-- 台帳が `Unreadable` のときは offset を進めない (上表)。
+- 台帳が `Unreadable` のとき、および `message_id == null` の `open` を指す押下があるときは offset を進めない (§2-3)。
 
 ### 2-5. 置き場のまとめ
 
-| ファイル | 内容 | 消してよいか |
-|---|---|---|
-| `registry/daemons/telegram-questions.json` | 質問台帳 (§2-1) | 消してよい (古いボタンが不明になるだけ) |
-| `registry/daemons/telegram-state.json` | offset・最後の受信時刻・エラー通知のスロットル | 消してよい (offset が 0 に戻る → 古い update を再受信するが、台帳に無い質問のボタンは拒否される。**ただし `message` の返信は reply_to で台帳と照合されるので誤転送しない**) |
-| `registry/daemons/escalation-state.json` | 段階上げの台帳 (§5-4、PR-B) | 消してよい (時計が最初からになる = 通知が遅れる側。§5-4) |
+| ファイル | 書き手 | 内容 | 消してよいか |
+|---|---|---|---|
+| `registry/daemons/telegram-questions.json` | `ask_user.sh`・`poll` (どちらも `told_lock` の下) | 質問台帳 (§2-1) | 消してよい (古いボタンが不明になるだけ) |
+| `registry/daemons/telegram-offset.json` | `poll` のみ (`telegram-poll.lock`) | offset・最後の受信時刻 | 消してよい (offset が 0 に戻る → 古い update を再受信するが、台帳に無い質問のボタンは拒否される。`message` の返信は `reply_to` で台帳と照合されるので誤転送しない) |
+| `registry/daemons/telegram-send.json` | `ask_user.sh`・dispatcher の段階 2 送信 (**どちらも `told_lock` と同じ型のロック**の下で読み直して書く) | `last_sent_at`・バックオフ (`backoff_until`・連続失敗数)・429 の `retry_after`・失敗ログのスロットル | 消してよい (レート制限の記憶が消える = 最初の 1 通だけ制限が緩む) |
+| `registry/daemons/telegram-receiver.json` | dispatcher のみ | 受信側の状態 (§1-1) | 消してよい (`ask` が `receiver_unknown` で断る側に倒れる。次の心拍で復旧) |
+| `registry/daemons/escalation-state.json` | dispatcher のみ (PR-B) | 段階上げの台帳 (§5-4) | 消してよい (時計が最初からになる = 通知が遅れる側。§5-4) |
 
-3 つとも `notified-state.json` と同じ置き場・同じ入口 (`lib_daemon_state`)・同じ「消してよい」の位置づけ。
-CLAUDE.md の不変条件 7 の列挙に 3 つを足す (PR-A / PR-B で、それぞれ自分のファイルの分)。
+**書き手が 2 者以上のファイルは `telegram-questions.json` と `telegram-send.json` だけで、どちらもロックの下で読み直す。**
+offset とレート系を別ファイルにしたのはそのため (offset は 1 者、レートは 2 者)。
+5 つとも `notified-state.json` と同じ置き場・同じ入口 (`lib_daemon_state`)・同じ「消してよい」の位置づけ。
+CLAUDE.md の不変条件 7 の列挙に足す (PR-A で 4 つ、PR-B で `escalation-state.json`)。
 
 ### 2-6. 受け取らないもの
 
@@ -254,11 +321,11 @@ scripts/ask_user.sh list          # open な質問 (確認用)
 ```
 
 - `ask` の標準出力は `qid` 1 行だけ。終了コード: **0 = 送信成功**、**3 = Telegram 未設定** (Director は
-  `AskUserQuestion` に戻る)、**4 = 送信失敗** (ネットワーク・Bot API のエラー。同じく戻る)、**5 = open が上限**、
+  `AskUserQuestion` に戻る)、**4 = 送信できない** (ネットワーク・Bot API のエラー、または**受信側が無効 / 古い / 不明** = §1-1 の `receiver_disabled` / `receiver_stale` / `receiver_unknown`。stderr に固定コード。同じく戻る)、**5 = 未回答の質問が上限 (8 件)**、
   1 = 使い方の誤り (`pull` の規則と同じ。exit 2 は使わない — Worker が無限リトライする前例、
   memory: `pull-exit-2-is-idle-usage-errors-must-be-1`)。**本文・token・URL は終了時のエラーに出さない**
   (解析エラーに元の行が漏れる族、memory: `parser-error-leaks-source-line-family`。固定コード + 位置だけ)。
-- 順序: ① 質問を台帳に `open`・`message_id=null` で書く (ロック下) → ② `sendMessage` (inline_keyboard) →
+- 順序: ⓪ `telegram-receiver.json` を確かめ (§1-1。無効・古い・不明なら exit 4)、`sweep_questions()` を走らせる (§2-3b) → ① 質問を台帳に `open`・`message_id=null` で書く (ロック下) → ② `sendMessage` (inline_keyboard) →
   ③ 成功したら `message_id` を台帳に書く。② が失敗したら①のエントリを `withdrawn` にして exit 4。
   ③ が失敗 (台帳に書けない) したら、ボタンは出ているが台帳が答えを受けられない → `editMessageReplyMarkup` で消し、
   exit 4。**ボタンが出ているのに台帳に無い状態を作らない**。
@@ -267,19 +334,20 @@ scripts/ask_user.sh list          # open な質問 (確認用)
 - **選択肢は 2〜4 個** (Telegram の 1 行に収まる。`AskUserQuestion` と同じ上限)。ラベルは 40 文字まで。
   末尾に自動で「💬 返信で答える」の注記を本文に足す (ボタンではない。返信文は §2-2 で受ける)。
 
-### `AskUserQuestion` との併用
+### `AskUserQuestion` との併用 (ユーザー決定 2026-10-05: Telegram 設定済みなら使わない)
 
 `AskUserQuestion` は画面を**占有する** (modal)。Telegram の答えは mux send で入力欄に入るので、
-modal の最中に届いた文が取り込まれる保証がない (**未確認。本番確認で 1 回観察する**)。そのため推奨する手順:
+modal の最中に届いた文が取り込まれる保証がない。**ユーザー決定: Telegram が使えるときは `AskUserQuestion` を使わない。**
+手順:
 
-1. 画面でも見えるよう、質問と選択肢を**通常のテキストで画面に出す** (`AskUserQuestion` は呼ばない)。
+1. 質問と選択肢を**通常のテキストで会話に書く** (画面に居るユーザーはそれを読んで打ち込める)。
 2. `ask_user.sh ask …` で Telegram に送り、`qid` を控えて**ターンを終える** (入力待ち)。
 3. 画面で答えが打たれたら (ユーザーが席にいた) → `ask_user.sh cancel --q <qid> --by screen` → 実行。
    Telegram の行が来たら → §3-2 の手順 (verify → 状態の確かめ直し → 実行)。
-4. exit 3 / 4 (Telegram が使えない) のときだけ、従来どおり `AskUserQuestion` を使う。
+4. `ask` が exit 3 (未設定) / exit 4 (送信失敗・受信側が無効 = §1-1) のときだけ、従来どおり `AskUserQuestion` を使う。
 
 `AskUserQuestion` と Telegram を**同時に**出す案は採らない (modal が答えを取り込まない可能性と、
-2 つの答えが食い違ったときの優先の規則が要る)。**ユーザーに決めてほしいこと 1** に挙げる。
+2 つの答えが食い違ったときの優先の規則が要る)。modal の挙動の観察は PR-A の本番確認に残すが、結論は決定を変えない。
 
 ## 5. 段階上げ (PR-B)
 
@@ -288,7 +356,7 @@ modal の最中に届いた文が取り込まれる保証がない (**未確認�
 | 候補 | 含める? | 理由 |
 |---|---|---|
 | `needs_director` | **含める** | 本件の事故そのもの。`WAITS_ON_DIRECTOR_STATUSES` |
-| `needs_human_review` (`verify-result needs_human_review`) | **含める** | `plan.sh` の表示は `needs_director` と同じ `blocked` / `[要判断]` (plan.sh:943-944)。人間の判断を待つ点が同じで、後続を止める点も同じ |
+| `needs_human_review` (`verify-result needs_human_review`) | **含める** | `plan.sh` の表示は `needs_director` と同じ `blocked` / `[要判断]` (plan.sh:943-944)。人間の判断を待つ点が同じ |
 | `ask_user.sh` で出して未回答の質問 (`open`) | **含めない** | 質問はすでに Telegram で**ユーザーの手元に届いている**。段階上げの目的 (ユーザーに届かない) が既に満たされている。期限 (`expires_at`) が来たら `expired` になり、Director が気付く (§2-3 の転送行ではなく、`ask_user.sh list` + dispatcher の 1 回通知で十分。PR-A のスコープ外の拡張として §9 に記録) |
 | `failed` の依存 (held) | **含めない** | `[held]` の経路が既にある (`plan.sh release-dep`)。保留の通知を足す話は別 (今回の事故と違う入口。§8 に残す) |
 
@@ -298,57 +366,74 @@ modal の最中に届いた文が取り込まれる保証がない (**未確認�
 (plan.sh:978-979)。広げると Kai-codex の枠の判定が変わる。`tests/test_task_status_single_definition.py` が
 AST で「status の集合を別の場所に書かない」を固定しているので、新しい集合もそこに載せる。
 
-### 5-2. 「後続を止めているか」 — `lib_dep_rules` を通す (不変条件 3)
+### 5-2. 「後続」は条件ではなく文面の材料 (ユーザー決定 2026-10-05 で変更)
 
-判断待ちの card `W` (mission `M`) が後続を**止めている** ⇔ `M` の中に、`status == pending` で、
-`unmet_dependencies(D.blocked_by, done_ids, task_statuses, D.released_deps)` に `W.id` を含む card `D` が 1 枚以上ある。
+初版の設計は「判断待ちの card が**後続を止めているとき**だけ段階上げする」だった (後続の無い最後の task は対象外)。
+**ユーザー決定で変更**: **後続の無い最後の task の判断待ちも段階上げする**。「後続を止めているか」は
+段階上げの**条件ではなくなった**。
 
-- 判定は `lib_dep_rules.unmet_dependencies` / `card_dependencies` を**そのまま呼ぶ**。コピーしない。
-  dispatcher は既に `dependency_gate()` で同じ入力を作っている (`dispatcher.sh:892`)。新しい純粋関数
-  `blocked_dependents(waiting_id, cards, …)` は、`dependency_gate` の結果を使って
-  `waiting_id in verdict.unmet` の card を集めるだけ。**依存の定義を持たない**。
-- **直接の後続だけ数える。** 推移的な後続 (D の後続 E) は、D が `pending` のまま unmet なので、
-  直接の後続 D が 1 枚あれば止まっていると言える。直接の後続が 0 枚なら推移的な後続も無い。
-- 破損カード (`[破損]`・`Unreadable`) が mission にあるとき: **観測できない = 判定しない**
-  (`observed_missions` と同じ。「止めていない」に倒さず、**段階上げの時計も進めない**)。
-  ただし判断待ちの card 自体が読めている限り、それは `needs_director` の通知 (既存) の対象のまま。
-- **止めていない判断待ちは段階上げしない。** (後続が無い最後の task が `needs_director` のとき、
-  mission は完了しないが、後続を止めてはいない。この穴は §8・**ユーザーに決めてほしいこと 2** に挙げる。)
+- 判断待ち (§5-1 の `AWAITING_DECISION_STATUSES`) の card は、**後続の有無にかかわらず**時計が回る。
+  理由: 最後の task が `needs_director` のまま放置されると mission が完了せず `全ミッション完了` も出ない
+  (誰にも気付かれない停止)。後続の有無で通知を切ると、止まっている事実の一部しか拾えない。
+- 後続の数 (`dependents`) は**文面の材料としてだけ**使う (§6 の「後続 N 件が待機中」。0 件なら行ごと省く)。
+  数え方は初版のまま `lib_dep_rules` を通す (不変条件 3): mission の中に `status == pending` で
+  `unmet_dependencies(D.blocked_by, done_ids, task_statuses, D.released_deps)` に `W.id` を含む card `D`。
+  dispatcher は既に `dependency_gate()` (`dispatcher.sh:892`) で同じ入力を作る。
+  **依存の定義を持たない** (`blocked_dependents()` は `dependency_gate` の結果から `waiting_id in verdict.unmet` を集めるだけ)。
+- 数えられない (破損カード・`Unreadable`) ときは `dependents = None` として**文面から行を省くだけ**で、段階上げは止めない
+  (card 自体が読めている限り判断待ちは判定できる)。card 自体が読めないときは §5-4 の「観測できない」。
+- 副作用の確認: 「後続を止めているか」の条件を外したので、`decide()` の入力から `dependents` を**判定に使う欄が無くなる**
+  (文面用に渡すだけ。判定の表に出てこない)。判定に使う入力が減る分、表は小さくなる。
 
 ### 5-3. 段階と時計
 
 | 段階 | 既定の経過 | 何をする | 送り先 |
 |---|---|---|---|
 | 0 | 0 分 | 既存の `[needs_director]` 通知 (状態が変わるまで 1 回。`notify_state_once`) | Director |
-| 1 | 5 分 | **Director に再通知**: 「後続 N 件を止めて M 分経過」 | Director (mux send) |
+| 1 | 5 分 | **Director に再通知**: 「M 分経過」 | Director (mux send) |
 | 2 | 10 分 | **Telegram でユーザーに通知**: §6 の文面 | ユーザー (Telegram) |
+
+**段階 1・段階 2 とも 1 回だけ** (ユーザー決定。3 回目以降も、同じ段階の繰り返しも無い)。
 
 config (`config/crewvia.yaml` の `escalation:` ブロック。コメント付き。`daemons:` ブロックの書き方に揃える):
 
 ```yaml
 escalation:
-  director_after_seconds: 300     # 段階 1
-  telegram_after_seconds: 600     # 段階 2 (director_after_seconds より大きいこと。逆なら読み込みで拒否)
-  # 0 以下 = その段階を使わない。telegram: 未設定 (env 無し) なら段階 2 は何もしない
+  director_after_seconds: 300     # 段階 1。0 以下 = 段階 1 を使わない
+  telegram_after_seconds: 600     # 段階 2。0 以下 = 段階 2 を使わない
 ```
 
-環境変数での上書き (`CREWVIA_ESCALATION_DIRECTOR_AFTER_SECONDS` / `CREWVIA_ESCALATION_TELEGRAM_AFTER_SECONDS`)
-は、**他のしきい値と同じ型で付ける** (config より優先)。不変条件 5 との関係: これは dispatcher だけが読む値で、
-plan.sh と答えが割れる共有規則ではない (「後続を止めているか」の**規則**は `lib_dep_rules` の 1 か所で、しきい値は規則ではない)。
-**不正値**は `_parse_drift_interval` と同じく WARNING を 1 回出して既定値に倒す。
+**cfg の意味 (t002 P2-2)** — 2 つの値は独立に「0 以下 = その段階を使わない」で、**使う段階どうしの順序だけ**を検証する:
 
-**時計の起点**: card には `needs_director` に入った時刻が**無い** (`needs_director_reason` のみ。`lib_state_store.py:526`)。
+| `director_after` | `telegram_after` | 意味 | 検証 |
+|---|---|---|---|
+| > 0 | > 0 | 段階 1 → 段階 2 | `telegram_after > director_after` でなければ**拒否** (WARNING を 1 回 + 既定値 300 / 600 に倒す) |
+| ≤ 0 | > 0 | 段階 1 は無い。経過が `telegram_after` を超えたら段階 2 | 順序の検証は**かけない** (比べる相手が無い) |
+| > 0 | ≤ 0 | 段階 1 だけ | — |
+| ≤ 0 | ≤ 0 | 何も鳴らさない (段階 0 の既存通知だけ) | — |
+
+数値でない値・NaN・inf も WARNING + 既定値 (`_parse_drift_interval` と同じ型)。環境変数での上書き
+(`CREWVIA_ESCALATION_DIRECTOR_AFTER_SECONDS` / `CREWVIA_ESCALATION_TELEGRAM_AFTER_SECONDS`) は他のしきい値と同じ型で付ける
+(config より優先)。不変条件 5 との関係: dispatcher だけが読む**しきい値**で、plan.sh と答えが割れる共有規則ではない。
+
+**「飛ばさない」規則の範囲 (P2-2)**: 段階 1 が**使える**とき (`director_after > 0` かつ Director が在席かつ段階 1 の送信が
+失敗していない) だけ、段階 2 の前に段階 1 を必ず経る。段階 1 が使えない (cfg で無効・Director 不在・送信失敗) ときは、
+段階 2 は段階 1 を待たない (§5-4 の `decide()` の規則 R5/R6)。
+
+**時計の起点**: card には判断待ちに入った時刻が**無い** (`needs_director_reason` のみ。`lib_state_store.py:526`)。
 card に `needs_director_at` を足す案は、serialization の golden (`tests/fixtures/state_store_serialization_golden.json`)・
 Taskvia の契約・旧コードとの互換 (`rollback-compat-for-new-flag-must-merge-before-the-cutover-pr`) を全部動かす。
 **採らない**。代わりに**段階上げの台帳に「初めて見た時刻」を持つ** (§5-4)。
 台帳を消すと時計が最初からになる = 通知が**遅れる**側に倒れる (早まって鳴らさない)。
-これは `needs_director` の既存の 1 回通知が (Director 不在でスキップしても) 戻ったらすぐ送る性質と矛盾しない
-(段階 0 は時計を使わない)。
 
 **dispatcher が止まっていた間の時間**: 時計は壁時計の差。dispatcher が 1 時間止まって戻ると、最初に見た時刻が
-1 時間前なので**段階 1・2 が同じサイクルで両方発火する**。1 サイクルで 1 段階だけ進める
+1 時間前なので段階 1・2 が同じサイクルで両方発火しうる。**1 サイクルで 1 段階だけ**進める
 (段階 1 を送ったら、その同じサイクルでは段階 2 を評価しない)。次のサイクルで段階 2。
-`telegram_after_seconds` を過ぎていても、`director` 段階を**飛ばさない**。
+
+**観測できなかった間 (t002 P3-2)**: `first_seen` は壁時計の差なので、「観測できない間は時計を止める」は実現できない
+(台帳を `keep` しても経過は伸びる)。**書き直した規則**: 観測できない間は**鳴らさない** (`none` / `keep`)。
+観測が戻った最初のサイクルで、`first_seen` からの経過どおりに評価する (戻った直後に段階 1・2 が連続で出うるが、
+1 サイクル 1 段階なので 2 サイクルに分かれる)。「遅れる側」であって「欠落」ではない。
 
 ### 5-4. dedup と台帳 — **純粋関数 + 網羅テスト**から設計する
 
@@ -359,54 +444,89 @@ Taskvia の契約・旧コードとの互換 (`rollback-compat-for-new-flag-must
 
 ```json
 {"<slug>/<tid>": {"execution_id": "ex-…", "first_seen": 1759650000.0,
-                  "stage_sent": 0 | 1 | 2, "stage_sent_at": 1759650300.0}}
+                  "stage_sent": 0 | 1 | 2, "stage_sent_at": 1759650300.0,
+                  "stage1_failed_at": null | 1759650400.0}}
 ```
 
 - **キーは `<slug>/<tid>`、dedup は `execution_id` 単位。** 同じ task が pending に戻って再び走り、別の試行
-  (`ex-…` が変わる) で再び `needs_director` になったら**新しい事象**として最初から (`first_seen` を取り直す)。
+  (`ex-…` が変わる) で再び判断待ちになったら**新しい事象**として最初から (`first_seen` を取り直す)。
   `execution_id` が card に無い (旧形式) ときは、`needs_director_reason` の fp (`notified-state` の `fingerprint`) で代用する。
-- **解けたら台帳を消す**: その card が判断待ちでなくなった (status が `AWAITING_DECISION_STATUSES` を離れた) か、
-  後続が無くなった (止めていない) とき。消すのは**観測できた mission のそれだけ** (`prune_told` と同じ
-  `observed_missions` の規則。破損カードのある mission は触らない)。
-  **「後続が無くなった」で台帳を消すと、A (止めている) → B (止めていない) → A で時計が戻る**のは仕様 (別の事象)。
+- **解けたら台帳を消す**: その card が判断待ちでなくなった (status が `AWAITING_DECISION_STATUSES` を離れた) とき。
+  消すのは**観測できた mission のそれだけ** (`prune_told` と同じ `observed_missions` の規則。破損カードのある mission は触らない)。
+  (初版の「後続が無くなったとき消す」は、後続の条件を外したので無くなった。)
 
 純粋関数 (`scripts/lib_escalation.py`。副作用なし・I/O なし・時計は引数):
 
 ```python
-def decide(card_view, dependents, ledger_entry, now, cfg) -> Decision
+def decide(card_view, ledger_entry, now, cfg, director_live, telegram_available) -> Decision
 # card_view: (slug, tid, status, execution_id, observable: bool)
-# dependents: 直接の後続の件数 (lib_dep_rules を通して数えたもの。観測できなければ None)
-# ledger_entry: None | {execution_id, first_seen, stage_sent, stage_sent_at}
+# ledger_entry: None | {execution_id, first_seen, stage_sent, stage_sent_at, stage1_failed_at}
+# cfg: (director_after, telegram_after)  — ≤0 = その段階を使わない。順序の検証は読み込み側 (§5-3)
+# director_live: mux に Director が居るか (mux list の結果。呼び出し側が遅延評価で 1 回だけ)
+# telegram_available: 認証情報が解決でき、受信側が enabled (§1-1) で、送信のバックオフ中でないか
 # Decision: (action, ledger_update)
 #   action: none | director_renotice | telegram_notice
 #   ledger_update: keep | set(entry) | delete
+
+def apply_failure(entry, action, now) -> entry
+# 送信が失敗したときの台帳の更新 (純粋関数)。director_renotice の失敗 → stage1_failed_at を (未設定なら) now に。
+# telegram_notice の失敗 → 変更なし (Telegram 側のバックオフ §7 が再試行の間隔を持つ)
 ```
 
-入力の全組み合わせ表 (これを **テストの母集団**にする。`tests/test_escalation_decide.py` は表の全行を
-パラメータにして、さらに**ランダムな列 (長さ 1〜12) の網羅**を足す — 「網羅テストが長さ 9〜10 の並びを見ていなかった」
-前例 (memory: `backlog-premise-needs-simulation`) への対策):
+**判定の規則** (`elapsed = now - first_seen`、`d` = `director_after`、`t` = `telegram_after`。上から順に最初に当たった 1 つ):
 
-| status | dependents | 台帳 | 経過 | execution_id | → action / ledger |
-|---|---|---|---|---|---|
-| 判断待ちでない | * | あり | * | * | none / **delete** |
-| 判断待ちでない | * | なし | * | * | none / keep |
-| 判断待ち | `None` (観測できない) | * | * | * | none / **keep** (時計も進めない・消さない) |
-| 判断待ち | 0 | あり | * | * | none / **delete** |
-| 判断待ち | 0 | なし | * | * | none / keep |
-| 判断待ち | ≥1 | なし | * | * | none / **set(first_seen=now, stage 0)** |
-| 判断待ち | ≥1 | あり、execution_id が違う | * | 違う | none / **set(first_seen=now, stage 0)** (新しい試行) |
-| 判断待ち | ≥1 | あり、同じ | < director | * | none / keep |
-| 判断待ち | ≥1 | stage 0 | ≥ director | 同じ | director_renotice / set(stage 1) |
-| 判断待ち | ≥1 | stage 1 | < telegram | 同じ | none / keep |
-| 判断待ち | ≥1 | stage 1 | ≥ telegram | 同じ | telegram_notice / set(stage 2) |
-| 判断待ち | ≥1 | stage 0 | ≥ telegram (停止明け) | 同じ | director_renotice / set(stage 1) (**飛ばさない**) |
-| 判断待ち | ≥1 | stage 2 | * | 同じ | none / keep (**3 回目以降は鳴らさない**) |
-| 判断待ち | ≥1 | あり、`first_seen` が未来 (時計が戻った) | * | 同じ | none / **set(first_seen=now)** (壊れた記録を信じない) |
+| # | 条件 | → action / ledger |
+|---|---|---|
+| R1 | status が判断待ちでない | 台帳あり: `none` / **delete**。なし: `none` / keep |
+| R2 | 判断待ち、`observable == False` | `none` / keep (§5-3「観測できなかった間」) |
+| R3 | 判断待ち、台帳なし | `none` / **set(first_seen=now, stage_sent=0, stage1_failed_at=None)** |
+| R4 | 台帳あり、`execution_id` が違う (新しい試行) | `none` / **set(first_seen=now, stage_sent=0, …)** |
+| R4b | 台帳あり、`first_seen > now` (時計が戻った・壊れた記録) | `none` / **set(first_seen=now)** (他の欄は保つ) |
+| R5 | `stage_sent == 2` | `none` / keep (**3 回目以降は鳴らさない**。段階 2 は 1 試行に 1 回) |
+| R6 | **段階 2 が到達可能** かつ `t > 0` かつ `elapsed ≥ t` — ここで「到達可能」= `stage_sent ≥ 1` **または** `d ≤ 0` **または** `not director_live` **または** `stage1_failed_at != None` | `telegram_available`: `telegram_notice` / set(stage 2)。**でなければ** `none` / keep (見送り。使えるようになったら送る) |
+| R7 | `d > 0` かつ `stage_sent == 0` かつ `elapsed ≥ d` かつ `director_live` | `director_renotice` / set(stage 1)。(R6 に当たらなかった = 段階 2 に進める条件が揃っていない、または `elapsed < t`) |
+| R8 | 上のどれでもない (経過が足りない・段階 1 を送るべき Director が居ない・など) | `none` / keep |
 
-**台帳に書くのは「送れた後」だけ**: `director_renotice` / `telegram_notice` の実行が失敗したら
-(`tmux_send` が False・Director 不在・Telegram 送信失敗・§7)、`ledger_update` を**適用しない**
-(= 同じ段階をもう一度試す)。`notify_state_once` と同じ向き (「送れなかった通知は記録しない — 戻ったらすぐ送る」)。
-ただし Telegram 側は送信失敗を**繰り返し叩かない**ためのバックオフを持つ (§7 の「失敗の通知 1 回/10 分」と同じスロットルを使う)。
+R6 と R7 の関係が P1-1 の直し方 (t002): **Director 不在 (`director_live == False`) の間は R6 の「到達可能」が成り立つので、
+`elapsed ≥ t` で段階 2 が出る** (段階 1 を待って永久に止まらない)。Director が戻っても `stage_sent == 2` なので段階 1 は出ない
+(「1 回だけ」・Director が不在だった間に段階 2 が既に出ている。戻った Director には既存の `[needs_director]` が
+(Director 不在では記録されず) 戻った時点で届く)。段階 1 の送信が**失敗**したとき (在席なのに `tmux_send` が False)
+は、`apply_failure` が `stage1_failed_at` を書き、次のサイクルから R6 の「到達可能」が成り立つ。
+段階 1 の再試行は `elapsed < t` の間だけ意味があり、間隔は既存の `should_notify(<key>#<execution_id>)` スロットル (`NOTIFY_TTL`) に任せる
+(5 秒ごとに失敗を叩かない)。
+
+**台帳に書くのは「送れた後」だけ**: `director_renotice` / `telegram_notice` の実行が成功したときだけ `ledger_update` を適用する。
+失敗したら適用せず (`telegram_notice` は何も書かず、`director_renotice` は `apply_failure`)、同じ段階をもう一度試す。
+`notify_state_once` と同じ向き (「送れなかった通知は記録しない — 戻ったらすぐ送る」)。
+
+**テストの母集団 (全直積)** — `tests/test_escalation_decide.py` は次の軸の**全直積**を `decide()` に流す (純粋関数なので
+全部で数千通りでも一瞬):
+
+| 軸 | 値 |
+|---|---|
+| status | 判断待ちの 2 種 (`needs_director` / `needs_human_review`)・判断待ちでない |
+| observable | True / False |
+| 台帳 | なし / 同じ試行 / 別の試行 / `first_seen` が未来 |
+| `stage_sent` (台帳あり) | 0 / 1 / 2 |
+| `stage1_failed_at` | None / あり |
+| 経過 | `< min(d,t の正のもの)` / `d ≤ elapsed < t` / `elapsed ≥ t` (と、`d` / `t` ちょうどの境界) |
+| cfg | (d>0, t>0) / (d≤0, t>0) / (d>0, t≤0) / (d≤0, t≤0) — さらに d・t が 0・負・極端に小さい値 |
+| director_live | True / False |
+| telegram_available | True / False |
+
+各行について (1) 上の規則表を**テスト内で再実装しない** (期待値は表の行そのものを手で書いた oracle のテーブル。
+`regression-test-must-prove-red`)、(2) 次の**不変条件**を全行に対して検査する:
+
+- `stage_sent` は単調増加 (`ledger_update` で下がらない。`set(new)` は R3/R4 の新しい事象のときだけ 0 に戻る)
+- 同じ `(execution_id, stage)` に対して `director_renotice` / `telegram_notice` が 2 回出ない (`decide` の戻り値を適用して畳み込み、列の中で数える)
+- 判断待ちでなくなったら必ず `delete` (台帳なしなら keep)
+- `telegram_notice` は `t > 0` かつ `telegram_available` かつ `elapsed ≥ t` のときだけ。`director_renotice` は `d > 0` かつ `director_live` かつ `stage_sent == 0` のときだけ
+- **Director 不在で `t > 0` かつ `elapsed ≥ t` かつ `telegram_available` なら、`stage_sent < 2` の限り必ず `telegram_notice`** (P1-1 の回帰)
+- 1 回の `decide` は高々 1 つの action (1 サイクル 1 段階)
+
+さらに**ランダムな入力の列** (長さ 1〜12。`backlog-premise-needs-simulation` の「網羅テストが長さ 9〜10 の並びを見ていなかった」
+への対策) を `decide` → 成功/失敗を確率で決めて `apply_failure` or `ledger_update` を適用、を繰り返す畳み込みで流し、
+Director の在・不在と送信失敗 (段階 1・段階 2 とも) を列の中で混ぜて、上の不変条件を検査する。
 
 **台帳が `Unreadable`**: 純粋関数を呼ばず、段階上げ全体を**見送る** (`WARNING: escalation-state` を 1 回/10 分)。
 `notify_state_once` の「台帳が読めなければ再送側に倒す」とは**向きが違う** — 再送側に倒すと、台帳が壊れている間
@@ -421,10 +541,10 @@ def decide(card_view, dependents, ledger_entry, now, cfg) -> Decision
 Telegram (段階 2) と、Director 宛の再通知 (段階 1) は**同じ項目**を同じ順に並べる (見た目の差は先頭のタグだけ)。
 
 ```
-🛑 crewvia: Director の判断待ちが後続を止めています
+🛑 crewvia: Director の判断待ちが続いています
 mission: 20261004-watchdog-hard-idle-unknown
 task: t017 (needs_director) — 止まって 10 分
-後続 2 件が待機中: t006, t007
+後続 2 件が待機中: t006, t007        ← 後続が 0 件・数えられないときは行ごと省く (§5-2)
 理由: <needs_director_reason の 1 行目 (200 文字まで)>
 👉 Director の画面で `plan.sh status` を見て対処してください
 セッション: <session_link>        ← 設定されているときだけ
@@ -457,88 +577,118 @@ task: t017 (needs_director) — 止まって 10 分
 
 | 判定 | 向き | 理由 |
 |---|---|---|
-| Telegram 未設定 (env が空) | **何もしない**。ファイルも作らず、ログも出さない | 公開前提。Taskvia 非依存と同じ型 |
+| Telegram 未設定 (認証情報が解決できない) | **何もしない**。ファイルも作らず、ログも出さない。ただし**受信側の状態ファイルが既にあれば `enabled: false` に書き換える** (§1-3・§1-1) | 公開前提。Taskvia 非依存と同じ型。送信側 (`ask_user.sh`) との答えを割らない |
+| **dispatcher が respawn で認証情報を失った** (§1-1) | `telegram-receiver.json` が `enabled: false` に変わり、`ask` は断り (exit 4)、Director に 1 通 | 黙って止まらない。割れた状態でボタンを出さない |
 | `sendMessage` が失敗 (ネットワーク・HTTP エラー・`ok:false`) | **dispatcher のサイクルを止めない**。その通知は**記録せず**、バックオフ後に再試行 | 送れないことで割り当てを止めない。`notify_state_once` と同じ「送れなかった通知は記録しない」 |
-| Telegram が長く落ちている | バックオフは指数 (30 秒 → 1 分 → 2 分 … 上限 10 分)。**ログは 10 分に 1 回** `WARNING: telegram unreachable (<種別>)` | 5 秒ごとに失敗を叩かない・ログを埋めない |
+| Telegram が長く落ちている | バックオフは指数 (30 秒 → 1 分 → 2 分 … 上限 10 分。`telegram-send.json`)。**ログは 10 分に 1 回** `WARNING: telegram unreachable (<種別>)`。段階 2 の `decide()` には `telegram_available = False` で渡る | 5 秒ごとに失敗を叩かない・ログを埋めない |
 | 受信 (`getUpdates`) が失敗 | 何も受けなかった扱い。offset は進めない。サイクルは続行 | 次回に同じ update を受けるだけ (at-least-once) |
 | `telegram-questions.json` が `Unreadable` | 転送しない・offset を進めない (§2-3) | 観測できなかったことを「答え無し」に倒さない |
+| `telegram-receiver.json` が `Unreadable` / 古い (心拍が 3 × `poll_interval` を超える) / 無い | `ask` は**断る** (§1-1) | 観測できなかったことを「有効」に倒さない |
 | `escalation-state.json` が `Unreadable` | **段階上げを見送る** (§5-4) | 再送側に倒すと壊れている間ずっと送り続ける |
-| Director 不在 (mux に `-director` が無い) | 転送・段階 1 は**見送って記録しない** (戻ったらすぐ送る)。**段階 2 (Telegram) は Director の有無と無関係に送る** | ユーザーに届けるのが段階 2 の目的で、Director が居ないほどユーザーに知らせる価値がある |
-| mux が無い (インラインモード) | dispatcher が動かないので受信も段階上げも動かない。`ask_user.sh ask` は**送れる** (ボタンは押せるが転送されない) → `ask` は dispatcher の生存を確認し、**無ければ exit 4 の「受信側が居ない」** で断る | 押しても誰にも届かないボタンを出さない |
+| Director 不在 (mux に `-director` が無い) | 転送・段階 1 は**見送って記録しない** (戻ったらすぐ送る)。**段階 2 (Telegram) は Director の有無と無関係に送る** — `decide()` の `director_live = False` が R6 の「到達可能」を満たす (§5-4。t002 P1-1 で整合させた) | ユーザーに届けるのが段階 2 の目的で、Director が居ないほどユーザーに知らせる価値がある |
+| mux が無い (インラインモード) | dispatcher が動かないので受信も段階上げも動かない。`ask` は `telegram-receiver.json` の心拍が無い・古いので**断る** (`receiver_unknown` / `receiver_stale`)。「dispatcher の生存確認」を別に持たない (心拍がそれを兼ねる) | 押しても誰にも届かないボタンを出さない |
 
 ### レート制限
 
-- 送信は**全体で 1 秒に 1 通**まで (Telegram の個人チャットの目安は 1 通/秒、1 分に 20 通)。`telegram-state.json` の `last_sent_at` で数える。
+- 送信は**全体で 1 秒に 1 通**まで (Telegram の個人チャットの目安は 1 通/秒、1 分に 20 通)。`telegram-send.json` の `last_sent_at` で数える
+  (書き手は `ask_user.sh` と dispatcher の段階 2 送信の 2 者 — どちらもロックの下で読み直す。§2-5)。
 - 段階上げは 1 task ごとに最大 1 通 (段階 2 は 1 試行につき 1 回)。**1 サイクルで送る段階上げの通知は最大 3 通**
   (多数の task が同時に 10 分を超えたとき。残りは次のサイクル)。
-- 質問 (`ask_user.sh ask`) は `open` が 8 件を超えたら拒否 (exit 5)。
+- 質問 (`ask_user.sh ask`) は「未回答の質問がある」(§2-3b の定義) が 8 件を超えたら拒否 (exit 5)。
 - Bot API が 429 (`retry_after`) を返したら、その秒数だけ送信を止める (§7 のバックオフと同じ状態に載せる)。
 
 ## 8. このミッションでやらないこと (記録)
 
 - Worker のツール実行の承認 (pre-tool-use / Taskvia)。
 - `failed` + held の依存の通知を Telegram に載せること (別の入口。`[held]` ログが既にある)。
-- **後続が無い最後の task が `needs_director` のときの段階上げ** (§5-2)。
-- `ask_user.sh` の `open` 質問が期限切れになったときの Director への通知。
-- 複数ユーザー / 複数 chat。`CREWVIA_TG_CHAT_ID` は 1 つだけ。
+- `ask_user.sh` の `open` 質問が期限切れになったときの Director への通知 (期限切れはボタンが消えるだけ。§2-3b)。
+- 複数ユーザー / 複数 chat。chat_id は 1 つだけ。
 - Webhook (`setWebhook`)。公開サーバーが要る (公開前提で誰でも立てられる、に反する)。
+- 段階 1・段階 2 の繰り返し通知 (ユーザー決定: 1 回だけ)。
+- (初版にあった「後続が無い最後の task の判断待ちを段階上げしない」は、ユーザー決定で**やる**に変えた。§5-2)
 
 ## 9. 実装の分割
 
 ### PR-A: Telegram の経路
 
 - `scripts/lib_telegram.py` (新): Bot API のクライアント (urllib、token は引数にもログにも出さない、timeout 付き、
-  失敗は例外ではなく戻り値)・callback_data の生成と照合 (純粋関数)・質問台帳の読み書き (`lib_daemon_state` 経由)・
+  失敗は例外ではなく戻り値)・**`resolve_credentials()` (認証情報の解決の唯一の入口。§1-1・§10)**・
+  callback_data の生成と照合 (純粋関数)・`sweep_questions()` (純粋関数。§2-3b)・質問台帳の読み書き (`lib_daemon_state` 経由)・
   `poll` / `send` / `ask` / `verify` / `cancel` / `list` の動詞。
-- `scripts/ask_user.sh` (新): 厳格引数のラッパー。
-- `scripts/lib_daemon_state.py`: `telegram_questions_problem()` / `telegram_state_problem()` を追加 (書き手も通す)。
-- `scripts/dispatcher.sh`: サイクルに受信を 1 か所足す (§1 の条件。サブプロセス・間引き・未設定なら無し・`open` が 0 件なら無し)。
-  転送の再送 (`forwarded=false`) もここ。
-- `agents/director.md`: §16 の表に `[telegram-answer]` の行・§3-2 の規則・§3-3 の分類器の手順・§4 の併用手順。
-- `config/crewvia.yaml`: `telegram:` ブロック (`poll_interval_seconds`・`session_link`・`question_ttl_minutes`)。
-  CLAUDE.md の環境変数表に `CREWVIA_TG_BOT_TOKEN` / `CREWVIA_TG_CHAT_ID` / `CREWVIA_DIRECTOR_SESSION_URL`、不変条件 7 に新しい台帳。
-- `.gitignore`: `registry/daemons/telegram-*.json`。
-- テスト (**偽の Bot API サーバー** = `http.server` をテスト内で立て、`CREWVIA_TG_API_BASE` ではなく
-  **lib の引数 `api_base`** で向ける。env の `TEST` 専用スイッチを本番コードに足さない):
-  callback_data の照合 (§2-2 の 5 条件を 1 つずつ欠かした表)・二重押し・古いボタン・withdrawn 後の押下・
-  chat_id 違い・message_id 違い・nonce 違い・返信でないメッセージ・offset の at-least-once・
-  台帳 `Unreadable`・未設定で 1 バイトも書かない (ファイル一覧の前後比較)・token が argv / ログ / 例外文に出ない
-  (token を偽の値で入れ、全出力を grep)・サブプロセスの timeout (応答しないサーバー)。
+- `scripts/ask_user.sh` (新): 厳格引数のラッパー。`ask` は送る前に `telegram-receiver.json` を確かめて断る (§1-1)。
+- `scripts/lib_daemon_state.py`: `telegram_questions_problem()` / `telegram_offset_problem()` / `telegram_send_problem()` /
+  `telegram_receiver_problem()` を追加 (書き手も通す)。
+- `scripts/dispatcher.sh`: サイクルに受信を 1 か所足す (§1 の条件。サブプロセス・間引き・未設定なら無し・未回答の質問が無ければ通信無し)。
+  転送の再送 (`forwarded=false`) もここ。**`telegram-receiver.json` の心拍の書き込みと、`enabled: true → false` の
+  Director への 1 回通知 (`notify_state_once`、key `telegram_receiver_disabled`)** もここ。
+- `agents/director.md`: §16 の表に `[telegram-answer]` の行・§3-2 の規則・§3-3 の分類器の手順・§4 の手順
+  (**ユーザー決定: Telegram が使えるときは `AskUserQuestion` を使わず、会話に書いて `ask_user.sh ask` で送りターンを終える**)。
+- `config/crewvia.yaml`: `telegram:` ブロック (`poll_interval_seconds`・`session_link`・`question_ttl_minutes`、および §10 で
+  選んだ認証情報の参照 — 秘密そのものは書かない)。
+  CLAUDE.md の環境変数表に `CREWVIA_TG_BOT_TOKEN` / `CREWVIA_TG_CHAT_ID` / `CREWVIA_DIRECTOR_SESSION_URL`、不変条件 7 に新しい台帳 (5 つのうち 4 つ)。
+  `lib_daemon_watch.py` の `_SPAWN_ENV_VARS` には**足さない** (コマンド文に秘密を載せない。§1-1)。
+- `.gitignore`: `registry/daemons/telegram-*.json` と `telegram-poll.lock`。
+- テスト (**偽の Bot API サーバー** = `http.server` をテスト内で立て、**lib の引数 `api_base`** で向ける。
+  env の `TEST` 専用スイッチを本番コードに足さない): callback_data の照合 (§2-2 の 5 条件を 1 つずつ欠かした表)・二重押し・
+  古いボタン・withdrawn 後の押下・chat_id 違い・message_id 違い・nonce 違い・返信でないメッセージ・offset の at-least-once・
+  **`message_id == null` の open への押下で offset が進まない**・台帳 `Unreadable`・未設定で 1 バイトも書かない
+  (ファイル一覧の前後比較。**ただし受信側の状態ファイルが既にあれば `enabled:false` に書き換わる**)・token が argv / ログ / 例外文に出ない
+  (token を偽の値で入れ、全出力を grep)・サブプロセスの timeout (応答しないサーバー)・
+  **`sweep_questions()` の表 (期限切れ・`message_id == null` の残骸・7 日の削除・「未回答の質問がある」の定義)**・
+  **`telegram-send.json` の 2 者同時書き込み (ロックの下で `last_sent_at` を数え損ねない)**・
+  **`telegram-receiver.json` が `disabled` / 古い / 無い / 壊れているとき `ask` が断る (exit 4 と固定コード)**・
+  **認証情報が無い dispatcher で `enabled:false` と Director への通知 1 通 (同じ状態で 2 通目が出ない)**。
   既存の `tests/CLAUDE.md` の隔離規則 (`env -u AGENT_NAME`、`CREWVIA_MUX_TEST_ISOLATION`) に従う。
 - 本番確認: 本物の bot・本物の Director で (1) `ask` → ボタン → `[telegram-answer]` が画面に届く、
-  (2) §3-3 の分類器の観察、(3) §4 の modal の観察 (`AskUserQuestion` の最中に届くか)。
+  (2) §3-3 の分類器の観察、(3) §4 の modal の観察、(4) **dispatcher を `lib_daemon_watch.py restart` (または watchdog の respawn) した後も
+  ボタンが受信される、または `ask` が `receiver_disabled` で断られ Director に通知が 1 通来る** (§1-1)。
   **dispatcher の restart が必要** (`merged-daemon-code-is-inert-until-restart`。`scripts/sync-main-checkout.sh`)。
 
 ### PR-B: 段階上げ (PR-A の後)
 
 - `scripts/lib_task_status.py`: `AWAITING_DECISION_STATUSES` (§5-1)。`tests/test_task_status_single_definition.py` に載せる。
-- `scripts/lib_escalation.py` (新): `decide()` (純粋関数)・`blocked_dependents()`・台帳の shape (`lib_daemon_state` に
-  `escalation_state_problem()`)。
+- `scripts/lib_escalation.py` (新): `decide()`・`apply_failure()` (純粋関数)・`blocked_dependents()` (文面用)・
+  台帳の shape (`lib_daemon_state` に `escalation_state_problem()`)・config の読み込みと検証 (§5-3 の cfg 表)。
 - `scripts/dispatcher.sh`: `needs_director` ブロックの隣に段階上げを 1 か所 (`all_tasks` を使い回す)。段階 1 は既存の
-  `tmux_send`、段階 2 は PR-A の送信 (Telegram 未設定なら段階 2 は何もしない。**段階 1 は未設定でも動く** — これだけで
-  今回の事故 (Director への再通知が無い) は塞がる)。
+  `tmux_send`、段階 2 は PR-A の送信 (認証情報が無い・受信側が無効なら `telegram_available = False`)。
+  **段階 1 は Telegram 未設定でも動く** — これだけで今回の事故 (Director への再通知が無い) は塞がる。
 - `config/crewvia.yaml`: `escalation:` ブロック。
 - `agents/director.md`: §16 の表に段階 1 の再通知の行。
-- テスト: §5-4 の表の全行 + ランダムな列の網羅 (長さ 1〜12・`decide` を畳み込んで台帳の不変条件 =
-  「stage は単調増加・同じ (execution_id, stage) で 2 回鳴らない・解けたら必ず delete」を検査)・
-  dispatcher の 1 サイクル harness (`dispatcher-real-code-namespace-harness`) で、`needs_director` + pending の後続 →
-  5 分後に Director へ・10 分後に偽の Bot API へ・解けたら台帳が消える・台帳が `Unreadable` で鳴らない・
-  破損カードで時計が進まない。**赤の実証** (`regression-test-must-prove-red`): 段階 2 の dedup を外して落ちること。
-- 本番確認: 使い捨ての mission で `needs_director` + 後続を作り、config の秒数を短くして 2 段階が順に届くこと。
+- テスト: §5-4 の**全直積** + 手書きの oracle 表 + 不変条件 + ランダムな列 (長さ 1〜12)・
+  cfg の検証 (逆順・0・負・NaN → WARNING + 既定値)・dispatcher の 1 サイクル harness
+  (`dispatcher-real-code-namespace-harness`) で、`needs_director` (後続あり / **後続なし**) → 5 分後に Director へ・
+  10 分後に偽の Bot API へ・**Director 不在でも 10 分後に Telegram へ**・解けたら台帳が消える・台帳が `Unreadable` で鳴らさない・
+  破損カードで鳴らさない (戻ったら経過どおり)。**赤の実証** (`regression-test-must-prove-red`): 段階 2 の dedup を外して落ちること、
+  R6 の「Director 不在」の分岐を外して落ちること。
+- 本番確認: 使い捨ての mission で `needs_director` (後続あり・なし) を作り、config の秒数を短くして 2 段階が順に届くこと。
   (使い捨て mission の `init` は `active_missions` に即露出する — memory: `disposable-mission-init-exposes-to-dispatcher-immediately`。)
 
-## 10. ユーザーに決めてほしいこと
+## 10. ユーザー決定と、決めてほしいこと
 
-1. **`ask_user.sh` と `AskUserQuestion` の併用**: 推奨は「Telegram を設定済みのときは `AskUserQuestion` を使わず、
-   通常のテキストで画面に出して `ask_user.sh ask`、ターンを終える」(modal が mux send を取り込む保証が無いため)。
-   画面に居るときも打ち込めば答えられる。同時に出したい (画面のボタンも欲しい) 場合は、PR-A の本番確認で
-   modal の挙動を観察してから決める。
-2. **後続の無い最後の task が `needs_director` のとき**に段階上げするか。推奨は「しない (今回は後続を止めた場合に絞る)」。
-   する場合は「同 mission に進められる task が他に無い」を `lib_dep_rules` とは別の規則で足すことになり、
-   `mission 完了を待っている` という状態の定義が新しく要る。
-3. **段階 1 の既定 5 分は、段階 0 の通知からの経過ではなく「判断待ちを最初に見てからの経過」**
-   (§5-3)。Director がずっと席に居ない間、5 分ごとに Director に再通知する (繰り返す) 案は採らず
-   **1 回だけ** (3 回目以降は鳴らさない)。繰り返したいなら間隔を足す。
+### 決定済み (2026-10-05。この文書の反映先)
+
+1. **`AskUserQuestion` と Telegram**: Telegram が使えるときは `AskUserQuestion` を使わず、会話に書いて `ask_user.sh ask` で送り、
+   ターンを終える (§4)。
+2. **後続の無い最後の task の判断待ちも段階上げする** (初版の推奨「しない」から変更)。「後続を止めているか」は条件ではなくなった (§5-2)。
+3. **段階 1・段階 2 とも 1 回だけ** (§5-3)。
+
+### 決めてほしいこと — P1-2: respawn の後も認証情報を dispatcher に届ける方法
+
+前提: ユーザーのルールは「秘密は opx / 1Password CLI 経由、`.env` を読まない、コマンド文に秘密を書かない」。
+`lib_daemon_watch` の `_SPAWN_ENV_VARS` は秘密を運ばない (§1-1)。**どの方式でも §1-1 の層 1 (受信側の状態の記録 + `ask` が断る +
+割れを Director に 1 回) は入れる** — 方式は「層 2: 届け方」の選択。chat_id も token と同じ経路で運ぶ
+(個人の識別子なので、公開リポジトリの `config/crewvia.yaml` には値を書かない)。
+
+| 案 | 仕組み | 得 | 失 |
+|---|---|---|---|
+| **A (推奨): `poll` / `ask` のたびに 1Password CLI (`opx`) で取り出す** | config には**参照だけ** (`telegram.token_ref` / `telegram.chat_id_ref` = `op://…` 形式。秘密ではない) を置く。`resolve_credentials()` が `poll` サブプロセス・`ask_user.sh` の中で `opx` を呼び、値はプロセスのメモリにだけ置く (env にもファイルにもコマンド文にも出さない) | respawn に強い (env を運ばないので落ちない)。ユーザーのルールにそのまま合う。token の入れ替えが 1Password 側だけで済む。送信側と受信側が**同じ関数**を通すので「設定済みか」が構造的に割れにくい | `opx` が dispatcher の環境で使える必要がある (1Password のロック・デーモンの端末に認証が無いと失敗 → `enabled: false` / `credential_command_failed` で見える)。`poll` ごとに外部コマンドを呼ぶ (間引き 10 秒 + 結果を 1 サイクル内メモリのみ。呼び出しの遅れは `timeout 8` に含める)。**本番でヘッドレスの dispatcher から `opx` が通るかは未確認** (PR-A の本番確認の前に 1 回確かめる) |
+| B: 権限 0600 のファイル (例 `registry/daemons/` の外のユーザー専用ファイルを 1 つ) を `resolve_credentials()` が読む | ユーザーが 1 度だけ手で作る (Claude はそのファイルを読み書きしない。`~/.claude/rules/security.md` の対象に加える) | respawn に強い。外部コマンドが要らない | **平文の秘密がディスクに残る** (「秘密は opx 経由」のルールの例外)。WSL ではファイルの権限が Windows 側から見えうる。ローテーションが手作業 |
+| C: `_SPAWN_ENV_VARS` に `CREWVIA_TG_*` を足して respawn のコマンド文に載せる | `lib_daemon_watch` の allowlist を 1 行足す | 実装が最小 | **コマンド文に秘密が載る** (`ps`・pane の scrollback・mux のログ。`_SPAWN_ENV_VARS` の注記が避けている事故そのもの)・「コマンド文に秘密を書かない」に反する。**採らない** |
+| D: 届け方は設計しない (層 1 だけ) | respawn で落ちたら `enabled: false` になり、Director に通知が来る。ユーザーが認証情報つきで手で dispatcher を再起動する | 秘密の扱いが増えない | respawn のたびに受信と段階 2 が止まる (watchdog の自動 respawn は設計上起きる)。最も要る場面 (長時間の無人運転) で効かなくなる |
+
+**推奨は A**。理由: respawn に強い・ユーザーのルールに合う・平文を残さない、の 3 つを同時に満たすのは A だけ。
+A が本番のヘッドレスな dispatcher から動かないと分かった場合は、B (平文ファイルを許すかをユーザーに再確認) か D にフォールバックする。
+**この PR-A の実装前に、ユーザーが案を選ぶこと** (A なら `op://` の参照 2 つを教えてもらい、`opx` がデーモンから通るかを 1 回確認する)。
 
 ## 11. 検証 (設計時の実測)
 

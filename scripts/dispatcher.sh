@@ -3250,6 +3250,14 @@ def run_telegram_cycle():
                          '押されても転送されません)。必要なら質問し直してください。'),
                 director_live=director_live_for_state_notices)
         poll = summary.get('poll') or {}
+        if poll.get('offset_unreadable'):
+            # offset ファイルが読めない (壊れ / 型違い / 権限)。0 から読み直して受信は続く (重複は台帳が止める)。次の書き込みで直る。
+            # 直らない (書き込みも失敗する) 場合に黙らないよう、同じ理由は 1 回だけ Director に知らせる。
+            notify_state_once(
+                'telegram_offset_unreadable', fingerprint([str(poll['offset_unreadable'])]), 'telegram-offset', '_daemon', 'telegram',
+                lambda: ('[telegram] telegram-offset.json が読めません (' + str(poll['offset_unreadable']) + ')。0 から読み直して受信は続けています。'
+                         '直らなければ registry/daemons/telegram-offset.json を消してください (消してよい。復旧手順)。'),
+                director_live=director_live_for_state_notices)
         if poll.get('error') and should_notify('telegram_poll_warn'):
             log(f"WARNING: telegram poll failed ({poll.get('error')})")
             record_notify('telegram_poll_warn')

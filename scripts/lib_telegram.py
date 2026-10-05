@@ -21,6 +21,7 @@
 """
 
 import contextlib
+import errno
 import fcntl
 import hashlib
 import json
@@ -955,9 +956,14 @@ def _receive_updates(registry_dir, creds, api_base, now, out, identity):
     if not open_questions(ledger, now):
         return []                                   # 未回答の質問が無ければ通信しない
     offset_state = read_offset(registry_dir)
-    if is_unreadable(offset_state) and not is_missing(offset_state):
+    if is_unreadable(offset_state):
+        # 読めない offset は「0 から読み直す」に倒す (at-least-once。重複は台帳の CAS と forwarded が止める)。
+        # 無い (ENOENT) は通常運用。**それ以外**は壊れ / 型違い / 権限なしなので、1 度だけ見える形で残す (黙って直し続けない)。
+        # この後の書き込み (どの経路でも) が正しい形で上書きするので、壊れたままにはならない。
+        if not is_missing(offset_state):
+            out['offset_unreadable'] = (errno.errorcode.get(offset_state.errno, 'EIO') if offset_state.errno else 'invalid')   # 固定の語だけ (解析エラーの本文は出さない)
         offset_state = {}
-    offset = 0 if is_missing(offset_state) or is_unreadable(offset_state) else offset_state['offset']
+    offset = offset_state['offset'] if offset_state else 0
     if offset and not is_bound(offset_state, identity):
         offset = 0      # 他の bot の (または識別子の無い) offset は捨てて最初から。update_id は bot ごとの列で、使うと新しい bot の update を飛ばす
     res = api_call(creds.token, 'getUpdates',

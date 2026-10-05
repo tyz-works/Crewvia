@@ -9,7 +9,8 @@ env の TEST 専用スイッチを本番コードに足さない (設計 §9)。
         api.queue_update({...})           # getUpdates が返す update を積む (update_id は自動採番も可)
         api.url                           # → "http://127.0.0.1:<port>"
         api.calls                         # → [(method, payload), ...] (受けた呼び出しの全記録)
-        api.mode = "ok" | "http500" | "hang" | "ratelimit"
+        api.mode = "ok" | "http500" | "http400" | "hang" | "ratelimit"
+        api.method_modes["editMessageReplyMarkup"] = "hang"   # メソッドごとに上書き (他は api.mode)
 
 トークンはパスの一部 (`/bot<token>/<method>`)。違う token は 401 で拒否する (token を取り違えたテストが緑にならない)。
 """
@@ -24,6 +25,7 @@ class FakeBotApi:
     def __init__(self, token="123456:FAKE-TOKEN-abcdefghij", hang_seconds=3.0):
         self.token = token
         self.mode = "ok"
+        self.method_modes = {}          # {メソッド名: モード}。無いメソッドは self.mode
         self.hang_seconds = hang_seconds
         self.retry_after = 7
         self.calls = []                 # [(method, payload)]
@@ -68,11 +70,14 @@ class FakeBotApi:
                 method = parts[1]
                 with api._lock:
                     api.calls.append((method, payload))
-                if api.mode == "hang":
+                mode = api.method_modes.get(method, api.mode)
+                if mode == "hang":
                     time.sleep(api.hang_seconds)
-                if api.mode == "http500":
+                if mode == "http500":
                     return self._send(500, {"ok": False, "error_code": 500, "description": "boom"})
-                if api.mode == "ratelimit":
+                if mode == "http400":
+                    return self._send(400, {"ok": False, "error_code": 400, "description": "Bad Request: message can't be edited"})
+                if mode == "ratelimit":
                     return self._send(429, {"ok": False, "error_code": 429, "description": "Too Many Requests",
                                             "parameters": {"retry_after": api.retry_after}})
                 return self._send(200, {"ok": True, "result": api._result(method, payload)})

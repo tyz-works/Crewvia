@@ -449,6 +449,9 @@ def telegram_question_entry_problem(key, entry):
     unbutton = entry.get('unbutton')
     if unbutton is not None and not isinstance(unbutton, bool):
         return f'entry {key!r}: unbutton is not a boolean'
+    tries = entry.get('unbutton_tries')
+    if tries is not None and (not isinstance(tries, int) or isinstance(tries, bool) or tries < 0):
+        return f'entry {key!r}: unbutton_tries is not a non-negative integer'
     problem = _telegram_identity_problem(entry, f'entry {key!r}')
     if problem:
         return problem

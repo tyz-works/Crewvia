@@ -66,6 +66,15 @@ CLOSED_RETENTION_SECONDS = 7 * 24 * 3600   # answered / withdrawn / expired を�
 FORWARD_GIVE_UP_SECONDS = 24 * 3600        # 答えを Director に転送できなかった場合に諦める (§2-3)
 LEDGER_LOCK_WAIT_SECONDS = 2.0
 API_TIMEOUT_SECONDS = 5
+#: poll の 1 回の通信の持ち時間 (dispatcher のサブプロセスの上限 `timeout 8` より短く)。受信 (getUpdates) は最初に走り、
+#: 後始末 (answerCallbackQuery・ボタンを消す・諦めの通知) は**残りだけ**を使う (§2-3d)。
+POLL_BUDGET_SECONDS = 6.5
+BUDGET_MIN_REMAINING_SECONDS = 1.0          # 残りがこれ未満なら後始末の通信は次のサイクルに回す
+CLEANUP_MAX_PER_CYCLE = 3                   # 1 サイクルで後始末に使う通信の件数 (種類ごと)
+UNBUTTON_MAX_TRIES = 5                      # 一時的な失敗でボタンを消す試みを諦める回数
+UNBUTTON_GIVE_UP_SECONDS = 3600             # 閉じてからこれを過ぎたら諦める
+#: ボタンを消せないことが確定する Bot API の応答 (編集できない・消えたメッセージ・bot が外された)。待っても直らない。
+UNBUTTON_PERMANENT_ERRORS = frozenset({'api_400', 'api_403', 'api_404'})
 OP_TIMEOUT_SECONDS = 15
 MIN_SEND_INTERVAL_SECONDS = 1.0
 BACKOFF_BASE_SECONDS = 30
@@ -784,30 +793,85 @@ def _poll_lock(registry_dir):
             os.close(fd)
 
 
-def _unbutton_pending(registry_dir, creds, api_base, now):
-    """掃除で閉じた質問のボタンを消す (best effort)。失敗しても台帳は進める。"""
+class _Budget:
+    """poll 1 回の通信の持ち時間。後始末はここから**残りだけ**を取る (受信を締め出さない)。"""
+
+    def __init__(self, seconds=POLL_BUDGET_SECONDS, clock=time.monotonic):
+        self._clock = clock
+        self._deadline = clock() + seconds
+
+    def timeout(self):
+        """次の 1 回の通信に使える秒数。残りが足りなければ `None` (その通信は次のサイクルに回す)。"""
+        remaining = self._deadline - self._clock()
+        if remaining < BUDGET_MIN_REMAINING_SECONDS:
+            return None
+        return min(float(API_TIMEOUT_SECONDS), remaining)
+
+
+def _unbutton_give_up(entry, now):
+    """ボタンを消す試みを諦める条件 (通信しない・純粋)。「消えないボタン」は押されても台帳の照合で断られる (§2-3d)。"""
+    if entry.get('message_id') is None:
+        return True
+    tries = entry.get('unbutton_tries') or 0
+    closed = entry.get('closed_at')
+    aged = is_finite_number(closed) and now - closed >= UNBUTTON_GIVE_UP_SECONDS
+    return tries >= UNBUTTON_MAX_TRIES or bool(aged)
+
+
+def _settle_unbutton(registry_dir, qid, outcome, now):
+    """`outcome`: `done` (消せた・消せないと確定) / `giveup` / `retry` (一時的な失敗 — 回数を 1 足す)。"""
+    def apply(ledger_now):
+        e = ledger_now.get(qid)
+        if e is None or not e.get('unbutton'):
+            return ledger_now, None
+        out = dict(ledger_now)
+        ne = dict(e)
+        if outcome == 'retry':
+            ne['unbutton_tries'] = (ne.get('unbutton_tries') or 0) + 1
+        else:
+            ne['unbutton'] = False
+            ne.pop('unbutton_tries', None)
+        out[qid] = ne
+        return out, None
+    with contextlib.suppress(LedgerBusy, LedgerUnreadable):
+        update_questions(registry_dir, apply, now=now)
+
+
+def _unbutton_pending(registry_dir, creds, api_base, now, *, budget=None, limit=CLEANUP_MAX_PER_CYCLE):
+    """掃除で閉じた質問のボタンを消す (best effort)。失敗しても台帳は進める。
+
+    **持ち時間と件数に上限がある** (`budget` の残り・`limit` 件)。残りが足りなければ次のサイクルに回す。
+    確定した失敗 (Bot API の 400 / 403 / 404) は諦めて `unbutton` を外す。一時的な失敗は回数 (`UNBUTTON_MAX_TRIES`) か
+    閉じてからの時間 (`UNBUTTON_GIVE_UP_SECONDS`) で諦める。試行の少ない順に回し、失敗し続ける 1 件が他を止めない。
+    """
     ledger = read_questions(registry_dir)
     if is_unreadable(ledger) or is_missing(ledger):
         return 0
-    targets = {qid: e['message_id'] for qid, e in ledger.items()
-               if e.get('unbutton') and e.get('message_id') is not None}
-    for qid, message_id in targets.items():
-        api_call(creds.token, 'editMessageReplyMarkup',
-                 {'chat_id': creds.chat_id, 'message_id': message_id, 'reply_markup': {'inline_keyboard': []}},
-                 api_base=api_base)
-
-    def clear(ledger_now):
-        out = dict(ledger_now)
-        for qid in targets:
-            if qid in out and out[qid].get('unbutton'):
-                e = dict(out[qid])
-                e['unbutton'] = False
-                out[qid] = e
-        return out, None
-    if targets:
-        with contextlib.suppress(LedgerBusy, LedgerUnreadable):
-            update_questions(registry_dir, clear, now=now)
-    return len(targets)
+    budget = budget or _Budget()
+    pending = [(qid, e) for qid, e in ledger.items() if e.get('unbutton')]
+    for qid, e in pending:
+        if _unbutton_give_up(e, now):
+            _settle_unbutton(registry_dir, qid, 'giveup', now)
+    todo = sorted(((e.get('unbutton_tries') or 0, e.get('closed_at') or 0, qid, e['message_id'])
+                   for qid, e in pending if not _unbutton_give_up(e, now)))[:limit]
+    attempted = 0
+    for _tries, _closed, qid, message_id in todo:
+        timeout = budget.timeout()
+        if timeout is None:
+            break
+        res = api_call(creds.token, 'editMessageReplyMarkup',
+                       {'chat_id': creds.chat_id, 'message_id': message_id, 'reply_markup': {'inline_keyboard': []}},
+                       api_base=api_base, timeout=timeout)
+        attempted += 1
+        if res.ok:
+            _settle_unbutton(registry_dir, qid, 'done', now)
+        elif res.error in UNBUTTON_PERMANENT_ERRORS:
+            _settle_unbutton(registry_dir, qid, 'giveup', now)
+        elif res.error == 'rate_limited':
+            break                                   # 次のサイクルまで待つ (回数には数えない。時間の上限が諦めを担う)
+        else:
+            _settle_unbutton(registry_dir, qid, 'retry', now)
+    return attempted
 
 
 def sweep_file(registry_dir, now):
@@ -819,9 +883,14 @@ def sweep_file(registry_dir, now):
     return True
 
 
-def poll_once(registry_dir, creds, *, api_base=API_BASE_DEFAULT, now=None):
-    """→ `{'skipped'?, 'error'?, 'processed', 'answered', 'rejected'}`。**例外を出さない**。"""
+def poll_once(registry_dir, creds, *, api_base=API_BASE_DEFAULT, now=None, budget=None):
+    """→ `{'skipped'?, 'error'?, 'processed', 'answered', 'rejected'}`。**例外を出さない**。
+
+    順序は **受信 → 台帳と offset への記録 → 後始末** (§2-3d)。受信より前にネットワークを呼ばない。
+    後始末 (answerCallbackQuery・ボタンを消す・諦めの通知) は `budget` の残りだけを使い、足りなければ次のサイクルに回す。
+    """
     now = time.time() if now is None else now
+    budget = budget or _Budget()
     out = {'processed': 0, 'answered': 0, 'rejected': 0, 'error': None}
     with _poll_lock(registry_dir) as held:
         if not held:
@@ -837,95 +906,110 @@ def poll_once(registry_dir, creds, *, api_base=API_BASE_DEFAULT, now=None):
         except LedgerUnreadable:
             out['error'] = 'ledger_unreadable'      # offset を進めず、answerCallbackQuery も呼ばない (§2-3)
             return out
-        _unbutton_pending(registry_dir, creds, api_base, now)
-        _give_up_forwarding(registry_dir, creds, api_base, now)
-        ledger = read_questions(registry_dir)
-        if is_unreadable(ledger):
-            out['error'] = 'ledger_unreadable'
-            return out
-        if not open_questions(ledger, now):
-            return out                              # 未回答の質問が無ければ通信しない
-        offset_state = read_offset(registry_dir)
-        if is_unreadable(offset_state) and not is_missing(offset_state):
-            offset_state = {}
-        offset = 0 if is_missing(offset_state) or is_unreadable(offset_state) else offset_state['offset']
-        if offset and not is_bound(offset_state, identity):
-            offset = 0      # 他の bot の (または識別子の無い) offset は捨てて最初から。update_id は bot ごとの列で、使うと新しい bot の update を飛ばす
-        res = api_call(creds.token, 'getUpdates',
-                       {'offset': offset, 'timeout': 0, 'allowed_updates': ['callback_query', 'message']},
-                       api_base=api_base)
-        if not res.ok or not isinstance(res.result, list):
-            out['error'] = res.error or 'bad_response'
-            _write_json_locked(_path(registry_dir, OFFSET_FILE), dict(identity, offset=offset, last_poll_at=now))
-            return out
-        updates = [u for u in res.result if isinstance(u, dict)
-                   and isinstance(u.get('update_id'), int) and not isinstance(u.get('update_id'), bool)]
-        updates.sort(key=lambda u: u['update_id'])
-        replies = []
-        hold_ids = []
-
-        def process(ledger_now):
-            cur = ledger_now
-            for update in updates:
-                d = classify_update(update, cur, creds.chat_id, now, identity)
-                if d.kind == 'hold':
-                    hold_ids.append(update['update_id'])
-                elif d.kind == 'answer':
-                    cur = apply_answer(cur, d.qid, d.answer, now)
-                    out['answered'] += 1
-                if d.kind in ('answer', 'reject') and d.callback_id:
-                    replies.append((d.callback_id, d.reply))
-                    if d.kind == 'reject':
-                        out['rejected'] += 1
-                out['processed'] += 1
-            return cur, None
-
-        try:
-            update_questions(registry_dir, process, now=now)
-        except (LedgerBusy, LedgerUnreadable) as e:
-            out['error'] = 'ledger_busy' if isinstance(e, LedgerBusy) else 'ledger_unreadable'
-            out['answered'] = out['rejected'] = out['processed'] = 0
-            return out                              # offset を進めない → 次のサイクルで同じ update を受ける
-        if updates:
-            new_offset = min(hold_ids) if hold_ids else updates[-1]['update_id'] + 1
-            new_offset = max(new_offset, offset)
-        else:
-            new_offset = offset
-        _write_json_locked(_path(registry_dir, OFFSET_FILE), dict(identity, offset=new_offset, last_poll_at=now))
-        for cb_id, text in replies:                  # 台帳に書いた後に返す (待ち表示を止めるだけ。失敗は無視)
-            api_call(creds.token, 'answerCallbackQuery', {'callback_query_id': cb_id, 'text': text}, api_base=api_base)
+        replies = _receive_updates(registry_dir, creds, api_base, now, out, identity)
+        for cb_id, text in replies[:CLEANUP_MAX_PER_CYCLE * 2]:   # 台帳に書いた後に返す (待ち表示を止めるだけ。失敗・時間切れは無視)
+            timeout = budget.timeout()
+            if timeout is None:
+                break
+            api_call(creds.token, 'answerCallbackQuery', {'callback_query_id': cb_id, 'text': text},
+                     api_base=api_base, timeout=timeout)
+        _unbutton_pending(registry_dir, creds, api_base, now, budget=budget)
+        _give_up_forwarding(registry_dir, creds, api_base, now, budget=budget)
     return out
 
 
-def _give_up_forwarding(registry_dir, creds, api_base, now):
-    """答えが入ってから 24 時間転送できなかったものを諦め、Telegram に 1 回だけ返す (§2-3)。"""
+def _receive_updates(registry_dir, creds, api_base, now, out, identity):
+    """getUpdates → 台帳に記録 → offset。→ 後で返す `[(callback_id, text)]` (通信はしない)。"""
+    ledger = read_questions(registry_dir)
+    if is_unreadable(ledger):
+        out['error'] = 'ledger_unreadable'
+        return []
+    if not open_questions(ledger, now):
+        return []                                   # 未回答の質問が無ければ通信しない
+    offset_state = read_offset(registry_dir)
+    if is_unreadable(offset_state) and not is_missing(offset_state):
+        offset_state = {}
+    offset = 0 if is_missing(offset_state) or is_unreadable(offset_state) else offset_state['offset']
+    if offset and not is_bound(offset_state, identity):
+        offset = 0      # 他の bot の (または識別子の無い) offset は捨てて最初から。update_id は bot ごとの列で、使うと新しい bot の update を飛ばす
+    res = api_call(creds.token, 'getUpdates',
+                   {'offset': offset, 'timeout': 0, 'allowed_updates': ['callback_query', 'message']},
+                   api_base=api_base)
+    if not res.ok or not isinstance(res.result, list):
+        out['error'] = res.error or 'bad_response'
+        _write_json_locked(_path(registry_dir, OFFSET_FILE), dict(identity, offset=offset, last_poll_at=now))
+        return []
+    updates = [u for u in res.result if isinstance(u, dict)
+               and isinstance(u.get('update_id'), int) and not isinstance(u.get('update_id'), bool)]
+    updates.sort(key=lambda u: u['update_id'])
+    replies = []
+    hold_ids = []
+
+    def process(ledger_now):
+        cur = ledger_now
+        for update in updates:
+            d = classify_update(update, cur, creds.chat_id, now, identity)
+            if d.kind == 'hold':
+                hold_ids.append(update['update_id'])
+            elif d.kind == 'answer':
+                cur = apply_answer(cur, d.qid, d.answer, now)
+                out['answered'] += 1
+            if d.kind in ('answer', 'reject') and d.callback_id:
+                replies.append((d.callback_id, d.reply))
+                if d.kind == 'reject':
+                    out['rejected'] += 1
+            out['processed'] += 1
+        return cur, None
+
+    try:
+        update_questions(registry_dir, process, now=now)
+    except (LedgerBusy, LedgerUnreadable) as e:
+        out['error'] = 'ledger_busy' if isinstance(e, LedgerBusy) else 'ledger_unreadable'
+        out['answered'] = out['rejected'] = out['processed'] = 0
+        return []                                   # offset を進めない → 次のサイクルで同じ update を受ける
+    if updates:
+        new_offset = min(hold_ids) if hold_ids else updates[-1]['update_id'] + 1
+        new_offset = max(new_offset, offset)
+    else:
+        new_offset = offset
+    _write_json_locked(_path(registry_dir, OFFSET_FILE), dict(identity, offset=new_offset, last_poll_at=now))
+    return replies
+
+
+def _give_up_forwarding(registry_dir, creds, api_base, now, *, budget=None, limit=CLEANUP_MAX_PER_CYCLE):
+    """答えが入ってから 24 時間転送できなかったものを諦め、Telegram に 1 回だけ返す (§2-3)。
+
+    持ち時間と件数に上限がある。**残りが足りなければ印を付けない** (印 → 通知の順なので、印だけ付いて通知が出ない穴を作らない)。
+    """
     ledger = read_questions(registry_dir)
     if is_unreadable(ledger) or is_missing(ledger):
         return
-    stale = [qid for qid, e in ledger.items()
-             if e['status'] == 'answered' and e.get('forwarded') is False
-             and now - e['answer']['at'] >= FORWARD_GIVE_UP_SECONDS]
-    if not stale:
-        return
+    budget = budget or _Budget()
+    stale = sorted(((e['answer']['at'], qid) for qid, e in ledger.items()
+                    if e['status'] == 'answered' and e.get('forwarded') is False
+                    and now - e['answer']['at'] >= FORWARD_GIVE_UP_SECONDS))
+    for _at, qid in stale[:limit]:
+        timeout = budget.timeout()
+        if timeout is None:
+            return
 
-    def mark(ledger_now):
-        out = dict(ledger_now)
-        done = []
-        for qid in stale:
-            if qid in out and out[qid]['status'] == 'answered' and out[qid].get('forwarded') is False:
-                e = dict(out[qid])
-                e['forwarded'] = 'gave_up'
-                out[qid] = e
-                done.append(qid)
-        return out, done
-    try:
-        done = update_questions(registry_dir, mark, now=now)
-    except (LedgerBusy, LedgerUnreadable):
-        return
-    for qid in done:
-        api_call(creds.token, 'sendMessage',
-                 {'chat_id': creds.chat_id, 'text': f'Director に届きませんでした (質問 {qid})。画面で確認してください。'},
-                 api_base=api_base)
+        def mark(ledger_now, qid=qid):
+            e = ledger_now.get(qid)
+            if e is None or e['status'] != 'answered' or e.get('forwarded') is not False:
+                return ledger_now, False
+            out = dict(ledger_now)
+            ne = dict(e)
+            ne['forwarded'] = 'gave_up'
+            out[qid] = ne
+            return out, True
+        try:
+            marked = update_questions(registry_dir, mark, now=now)
+        except (LedgerBusy, LedgerUnreadable):
+            return
+        if marked:
+            api_call(creds.token, 'sendMessage',
+                     {'chat_id': creds.chat_id, 'text': f'Director に届きませんでした (質問 {qid})。画面で確認してください。'},
+                     api_base=api_base, timeout=timeout)
 
 
 # ---------------------------------------------------------------------------
@@ -1288,7 +1372,7 @@ def cmd_cancel(argv):
         return EXIT_NOT_OPEN
     creds, _ = resolve_credentials(config)                          # ボタンを消す (best effort。失敗しても withdrawn は有効)
     if creds is not None:
-        _unbutton_pending(registry, creds, opts['api_base'] or API_BASE_DEFAULT, now)
+        _unbutton_pending(registry, creds, opts['api_base'] or API_BASE_DEFAULT, now, budget=_Budget())
     _emit({'status': 'withdrawn'})
     return EXIT_OK
 

@@ -292,6 +292,50 @@ open ──message_id が null のまま 5 分──▶ withdrawn  (§2-3b: ask 
   (返信は台帳に結びつかないので、無関係なメッセージと区別せず無言で捨てる。ユーザーへの通知を足すなら別の変更)。
 - **Director に届くのは「一致」のセルだけ** (answer → `forwarded=false` → 転送)。reject / ignore / hold は何も届かない。
 
+### 2-3d. 1 サイクルの通信の全表 — 受信は後始末に締め出されない (PR #281 の Codex P1・3 巡目)
+
+**不変条件: どんな後始末の失敗が続いても、open な質問への押下は 1 サイクル以内に受信され、台帳に記録される。**
+
+修正前は `poll_once` が `getUpdates` の**前**に `_unbutton_pending` を呼び、閉じた質問ごとの `editMessageReplyMarkup` を
+最大 `API_TIMEOUT_SECONDS` (5 秒) まで待っていた。失敗したものは `unbutton` のまま次のサイクルで再試行されるので、
+Telegram が遅い・編集が失敗し続ける (古い / 消されたメッセージ) と、dispatcher のサブプロセスの上限 (`timeout 8`) を後始末だけで使い切り、
+`getUpdates` に届かないサイクルが永久に続いた。
+
+順序は **受信 → 台帳と offset への記録 → 後始末**。後始末は `poll` 1 回の持ち時間 (`POLL_BUDGET_SECONDS` = 6.5 秒。`timeout 8` より短い) の
+**残りだけ**を使う (`_Budget.timeout()`。残りが `BUDGET_MIN_REMAINING_SECONDS` = 1 秒未満なら通信せず次のサイクルへ。1 回の通信の timeout は
+`min(5, 残り)`)。種類ごとに 1 サイクルの件数にも上限がある (`CLEANUP_MAX_PER_CYCLE` = 3)。
+
+| # | 通信 | どこで | 受信との順序 | 持ち時間 | 失敗したとき |
+|---|---|---|---|---|---|
+| 1 | `getUpdates` | `poll` の `_receive_updates` | **最初** (ここより前に通信しない) | 5 秒 (全体の持ち時間の最初の分) | `error` を返し offset は据え置き。次のサイクルで同じ update |
+| 2 | `answerCallbackQuery` | `poll_once` (台帳と offset への記録の**後**) | 受信の後 | 残り・件数 6 まで | 無視 (ボタンの待ち表示が残るだけ。答えは台帳にある) |
+| 3 | `editMessageReplyMarkup` (閉じた質問のボタンを消す) | `_unbutton_pending` | 受信の後 | 残り・3 件まで・試行の少ない順 | 下の表 |
+| 4 | `sendMessage` (転送を諦めた通知) | `_give_up_forwarding` | 受信の後 | 残り・3 件まで | **残りが足りなければ印 (`gave_up`) を付けない** (印 → 通知の順なので、印だけ付いて通知が出ない穴を作らない) |
+| — | `sendMessage` (質問の送信) / `editMessageReplyMarkup` (ask の巻き戻し) / `cancel` の消去 | `ask_user.sh` の別プロセス | poll とは別のプロセス (poll のロックも持ち時間も共有しない) | 自分の 5 秒 | poll の受信を遅らせない。`cancel` の消去は `_Budget` 付き |
+| — | getMe / 再送ループ | 無い (使っていない) | — | — | — |
+
+`run_cycle` (dispatcher のサイクル) は通信しない (サブプロセスを起動するだけ。`timeout 8`)。したがって 1 サイクルに受信より前に走る
+ネットワーク呼び出しは**無い**。表の 2〜4 は、1 つの `poll` の中で持ち時間を分け合う。
+
+**ボタンを消す試みの諦め** (`unbutton` を外す条件。`_settle_unbutton`):
+
+| 結果 | 扱い |
+|---|---|
+| 成功 | `unbutton: false` |
+| Bot API の 400 / 403 / 404 (編集できないメッセージ・消えたメッセージ・bot が外された) | 待っても直らない → その場で `unbutton: false` |
+| 429 (`rate_limited`) | そのサイクルの後始末を止める。回数には数えない (閉じてからの時間が諦めを担う) |
+| network / 5xx / その他 (一時的) | `unbutton_tries` を 1 足す。`UNBUTTON_MAX_TRIES` (5) 回で諦める |
+| 閉じてから `UNBUTTON_GIVE_UP_SECONDS` (1 時間) 経過 | 結果にかかわらず諦める |
+| `message_id` が無い | 通信せず外す |
+
+**諦めても安全な理由**: 「消えないボタン」は押されても、閉じた質問 (`expired` / `withdrawn` / `answered`) は §2-3 の照合 (台帳の status) で
+拒否され、転送されない (`answerCallbackQuery` で「期限切れ / 取り下げ」)。ボタンを消すのは見た目の後始末で、答えの正しさを守っているのは台帳。
+試行の少ない順に回すので、失敗し続ける 1 件が他の件を止めない。`needs_net` (`run_cycle` が poll を起動する条件) も `unbutton` が外れれば偽になり、
+永久に poll を起動し続けない。`unbutton_tries` は任意の欄 (`telegram_question_entry_problem` が非負整数を検査)。旧コードは読み捨てる。
+
+テスト: `tests/test_telegram_receive_not_starved.py` (`timeout 8` のサブプロセスで編集が遅い再現・全後始末メソッド × 失敗の種類 × 1 サイクルで受信・
+順序・件数と時間の上限・諦めの表・構造 (poll の経路の `api_call` は全部 `timeout=` を取る・受信が後始末より先))。
+
 ### 2-4. offset
 
 - `telegram-offset.json` に `{"offset": N, "last_poll_at": …, "bot_id": …, "chat_hash": …}` (識別子は §2-5b。別の bot のものは使わず捨てる) (**書き手は `poll` だけ**。§1-3 の `telegram-poll.lock` で

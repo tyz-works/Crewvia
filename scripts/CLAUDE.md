@@ -236,6 +236,7 @@ lib ごとの**破ってはいけない契約**の要約。理由・経緯・全
   **壊れていたら**転送しない・offset を進めない・`ask` は断る（観測できなかったことを「答え無し」「有効」に倒さない）。台帳を消せば復旧。
 - 判定は純粋関数（`classify_update` / `sweep_questions` / `receiver_verdict` / `parse_callback_data` / `apply_answer`）。callback_data は **`fullmatch`**
   （`$` は末尾の改行を許す）。受け付ける条件は全部 AND（chat・from・nonce・message_id・index・open かつ期限内）。先に確定した 1 つだけが有効（CAS）。
+- **受信は後始末に締め出されない**（§2-3d）: `poll_once` は 受信 → 記録 → 後始末 の順で、後始末（answerCallbackQuery・ボタンを消す・諦めの通知）は `_Budget` の残りだけを使い、件数にも上限がある。poll の経路の `api_call` は必ず `timeout=` を取る（構造テストが赤にする）。確定した失敗（400/403/404）・回数・時間で `unbutton` は外れる。
 - 受信側の心拍は定数 30 秒・stale は 90 秒（`poll_interval` と独立）。`ask` は stale / disabled / unknown / 別の bot（`bot_id`・`chat_hash` の不一致）で断る。
 - テスト: `tests/test_telegram_pure.py`（純粋関数・認証情報）/ `tests/test_telegram_fake_bot_api.py`（偽の Bot API サーバー `tests/telegram_fake_api.py`・
   token の漏れを全 cmdline / 出力 / 状態ファイルで grep）/ `tests/test_telegram_dispatcher_glue.py`（dispatcher.sh の差し込みと bash 側の取り出し）。

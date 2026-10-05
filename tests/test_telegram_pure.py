@@ -213,6 +213,121 @@ def test_text_reply_to_a_closed_question_is_not_forwarded():
         assert t.classify_update({"update_id": 1, "message": msg}, ledger, CHAT, NOW).kind == "ignore"
 
 
+# ---------------------------------------------------------------------------
+# update の種類 × 照合の結果 — 全セルの表 (設計 §2-3c。Codex P1 の族: 「照合できない」の理由を取り違えると答えが失われる)
+# ---------------------------------------------------------------------------
+
+#: 列: 照合の結果。それぞれの台帳を作る
+OUTCOMES = ("match", "mismatch", "pending", "expired", "withdrawn", "answered")
+
+
+def ledger_for(outcome, *, with_pending_elsewhere=False):
+    """update の相手になる質問の台帳。message_id は常に 4711。`pending` は message_id が null の open が別にある形。"""
+    answered = {"kind": "choice", "index": 0, "at": NOW - 5, "update_id": 1}
+    e = {
+        "match": entry(),
+        "mismatch": None,                                   # 照合する質問が無い
+        "pending": entry(message_id=None, created_at=NOW - 10),
+        "expired": entry(status="expired", closed_at=NOW - 5),
+        "withdrawn": entry(status="withdrawn", closed_at=NOW - 5),
+        "answered": entry(status="answered", answer=answered, closed_at=NOW - 5),
+    }[outcome]
+    ledger = {} if e is None else {"q-1a2b3c4d": e}
+    if with_pending_elsewhere:
+        ledger["q-1a2b3c4e"] = entry(message_id=None, created_at=NOW - 10, nonce="bbbbbb")
+    return ledger
+
+
+def callback_for(outcome):
+    nonce = "9f3a1c"
+    qid = "q-ffffffff" if outcome == "mismatch" else "q-1a2b3c4d"
+    return press(qid=qid, nonce=nonce, message_id=4711)
+
+
+def reply_for(outcome, text="先に見て"):
+    # 返信先: match / expired / withdrawn / answered は記録済みの message_id 4711。pending は「まだ記録されていない」ので別の番号 77
+    reply_to = 77 if outcome in ("pending", "mismatch") else 4711
+    return {"update_id": 9100, "message": {"message_id": 7, "chat": {"id": int(CHAT)}, "from": {"id": int(CHAT)},
+                                           "text": text, "reply_to_message": {"message_id": reply_to}}}
+
+
+#: 手書きの oracle: (種類, 結果) → (kind, offset を進めるか)。**Director に届くのは answer のときだけ** (forward される)。
+#: Telegram への返信 (answerCallbackQuery) は callback の answer / reject のときだけ。
+TABLE = {
+    ("callback_query", "match"): ("answer", True),
+    ("callback_query", "mismatch"): ("reject", True),
+    ("callback_query", "pending"): ("hold", False),
+    ("callback_query", "expired"): ("reject", True),
+    ("callback_query", "withdrawn"): ("reject", True),
+    ("callback_query", "answered"): ("reject", True),
+    ("reply", "match"): ("answer", True),
+    ("reply", "mismatch"): ("ignore", True),
+    ("reply", "pending"): ("hold", False),                  # Codex P1: message_id の記録前に届いた返信を失わない
+    ("reply", "expired"): ("ignore", True),                 # 閉じた質問への返信は無関係 (誤転送しない)。保留しない
+    ("reply", "withdrawn"): ("ignore", True),
+    ("reply", "answered"): ("ignore", True),
+}
+
+
+@pytest.mark.parametrize("kind,outcome", sorted(TABLE))
+def test_update_kind_by_match_outcome_table(kind, outcome):
+    ledger = ledger_for(outcome)
+    upd = callback_for(outcome) if kind == "callback_query" else reply_for(outcome)
+    d = t.classify_update(upd, ledger, CHAT, NOW)
+    want_kind, want_advance = TABLE[(kind, outcome)]
+    assert d.kind == want_kind, (kind, outcome, d.kind)
+    assert (d.kind != "hold") is want_advance
+    if kind == "callback_query":
+        assert (d.callback_id is not None) is (want_kind in ("answer", "reject")), "待ち表示を止める返信は answer / reject だけ"
+    else:
+        assert d.callback_id is None
+
+
+@pytest.mark.parametrize("outcome", OUTCOMES)
+def test_updates_that_can_never_be_an_answer_are_ignored_whatever_the_ledger_holds(outcome):
+    """普通のメッセージ (返信でない)・編集・その他の update・他 chat・他人・テキストでない返信は、台帳がどうでも ignore。
+    特に「保留の質問がある」ことが、これらを保留に変えてはいけない (offset が止まり続ける)。"""
+    for pending_elsewhere in (False, True):
+        ledger = ledger_for(outcome, with_pending_elsewhere=pending_elsewhere)
+        updates = {
+            "plain_message": {"update_id": 1, "message": {"message_id": 2, "chat": {"id": int(CHAT)}, "from": {"id": int(CHAT)}, "text": "雑談"}},
+            "bot_command": {"update_id": 2, "message": {"message_id": 3, "chat": {"id": int(CHAT)}, "from": {"id": int(CHAT)}, "text": "/start"}},
+            "edited_message": {"update_id": 3, "edited_message": {"message_id": 7, "chat": {"id": int(CHAT)}, "text": "x"}},
+            "member_update": {"update_id": 4, "my_chat_member": {"chat": {"id": int(CHAT)}}},
+            "empty": {"update_id": 5},
+            "reply_other_chat": dict(reply_for(outcome), message=dict(reply_for(outcome)["message"], chat={"id": 999})),
+            "reply_other_sender": dict(reply_for(outcome), message=dict(reply_for(outcome)["message"], **{"from": {"id": 888}})),
+            "reply_without_text": {"update_id": 6, "message": {"message_id": 7, "chat": {"id": int(CHAT)}, "from": {"id": int(CHAT)},
+                                                                 "photo": [{"file_id": "x"}], "reply_to_message": {"message_id": 77}}},
+            "callback_other_chat": press(chat="999", sender="999"),
+        }
+        for name, upd in updates.items():
+            assert t.classify_update(upd, ledger, CHAT, NOW).kind == "ignore", (outcome, pending_elsewhere, name)
+
+
+def test_a_reply_to_a_closed_question_is_not_held_by_a_pending_one():
+    """閉じた質問 (期限切れ・取り下げ・回答済み) のメッセージへの返信は、別に保留の質問があっても保留しない (offset が 5 分止まる)。"""
+    for outcome in ("expired", "withdrawn", "answered"):
+        ledger = ledger_for(outcome, with_pending_elsewhere=True)
+        assert t.classify_update(reply_for(outcome), ledger, CHAT, NOW).kind == "ignore", outcome
+
+
+def test_a_blank_reply_is_never_held():
+    ledger = ledger_for("pending")
+    assert t.classify_update(reply_for("pending", text="  \n "), ledger, CHAT, NOW).kind == "ignore"
+
+
+def test_a_reply_is_held_only_while_the_pending_window_is_open():
+    base = {"q-1a2b3c4e": entry(message_id=None, created_at=NOW - 10)}
+    assert t.classify_update(reply_for("pending"), base, CHAT, NOW).kind == "hold"
+    old = {"q-1a2b3c4e": entry(message_id=None, created_at=NOW - t.NULL_MESSAGE_GRACE_SECONDS)}
+    assert t.classify_update(reply_for("pending"), old, CHAT, NOW).kind == "ignore", "猶予 (5 分) を過ぎた残骸は保留しない"
+    expired = {"q-1a2b3c4e": entry(message_id=None, created_at=NOW - 10, expires_at=NOW - 1)}
+    assert t.classify_update(reply_for("pending"), expired, CHAT, NOW).kind == "ignore"
+    answered = {"q-1a2b3c4e": entry(status="answered", message_id=None, answer={"kind": "choice", "index": 0, "at": NOW, "update_id": 1})}
+    assert t.classify_update(reply_for("pending"), answered, CHAT, NOW).kind == "ignore"
+
+
 def test_other_update_kinds_are_ignored():
     for upd in ({"update_id": 1, "edited_message": {"text": "x"}}, {"update_id": 2}, {"update_id": 3, "message": {"text": "/start"}}):
         assert t.classify_update(upd, {"q-1a2b3c4d": entry()}, CHAT, NOW).kind == "ignore"

@@ -462,6 +462,14 @@ def classify_update(update, ledger, chat_id, now):
                     return Decision('ignore')
                 answer = {'kind': 'text', 'text': text, 'at': now, 'update_id': update.get('update_id')}
                 return Decision('answer', qid, answer=answer)
+        # 照合できる質問が無い。ただし「まだ message_id が記録されていない open がある」(ask の送信 ② と記録 ③ の間) なら、
+        # この返信はその質問への答えかもしれない — 捨てて offset を進めると、ユーザーの答えが黙って失われる (Codex P1)。
+        # ボタンの押下 (message_id が null の open を指す) と同じく**保留**する。窓は猶予 (5 分) で閉じる (sweep が withdrawn にする)。
+        # (返信先がすでに記録済みの別の質問のメッセージなら、それは「閉じた質問への返信」で保留の理由にならない。)
+        if sanitize_answer_text(msg['text']) and all(e.get('message_id') != reply_to for e in ledger.values()) and any(
+                e['status'] == 'open' and e.get('message_id') is None and now < e['expires_at']
+                and now - e['created_at'] < NULL_MESSAGE_GRACE_SECONDS for e in ledger.values()):
+            return Decision('hold')
         return Decision('ignore')
     return Decision('ignore')
 

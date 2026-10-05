@@ -444,6 +444,49 @@ def test_press_on_a_question_without_message_id_holds_the_offset_but_later_updat
     assert box.ledger()["q-00000002"]["answer"]["index"] == 1
 
 
+def test_a_text_reply_received_before_message_id_is_recorded_is_not_lost(box, api):
+    """Codex P1 (PR #281): 送信 (②) は済んだが message_id の記録 (③) の前に、文章の返信が届く窓。
+
+    返信は `reply_to_message.message_id` で照合するので、記録前は一致する質問が無い。以前は「無関係」として捨て、offset も進めたので、
+    ユーザーの答えが黙って失われた。ボタンの押下と同じく、まだ message_id の無い open がある間は消費せず offset を進めない。
+    """
+    box.heartbeat()
+    box.registry.mkdir(parents=True, exist_ok=True)
+    now = time.time()
+    (box.registry / t.QUESTIONS_FILE).write_text(json.dumps({"q-00000001": {
+        "nonce": "aaaaaa", "question": "x", "options": ["a", "b"], "message_id": None, "status": "open",
+        "created_at": now - 5, "expires_at": now + 3600, "forwarded": False}}))
+    uid = api.queue_update(reply_update(int(CHAT), 77, "先に #281 を見て"))
+    res = t.poll_once(box.registry, box.creds(), api_base=api.url, now=now)
+    assert res["answered"] == 0 and box.ledger()["q-00000001"]["status"] == "open"
+    assert json.loads((box.registry / t.OFFSET_FILE).read_text())["offset"] == uid, "offset を進めない (同じ update をもう一度受ける)"
+    # ③ が終わって message_id が記録された → 次の poll で同じ返信が照合され、答えになる
+    ledger = box.ledger()
+    ledger["q-00000001"]["message_id"] = 77
+    (box.registry / t.QUESTIONS_FILE).write_text(json.dumps(ledger))
+    res = t.poll_once(box.registry, box.creds(), api_base=api.url, now=now + 5)
+    assert res["answered"] == 1
+    assert box.ledger()["q-00000001"]["answer"] == {"kind": "text", "text": "先に #281 を見て", "at": now + 5, "update_id": uid}
+    assert json.loads((box.registry / t.OFFSET_FILE).read_text())["offset"] == uid + 1
+
+
+def test_a_held_text_reply_is_given_up_after_the_null_message_grace(box, api):
+    """保留は永久ではない: message_id が null のまま 5 分で withdrawn (残骸) → 返信は無関係として捨て、offset が進む。"""
+    box.heartbeat()
+    box.registry.mkdir(parents=True, exist_ok=True)
+    now = time.time()
+    (box.registry / t.QUESTIONS_FILE).write_text(json.dumps({"q-00000001": {
+        "nonce": "aaaaaa", "question": "x", "options": ["a", "b"], "message_id": None, "status": "open",
+        "created_at": now - 5, "expires_at": now + 3600, "forwarded": False}}))
+    uid = api.queue_update(reply_update(int(CHAT), 77, "遅れて届いた返信"))
+    t.poll_once(box.registry, box.creds(), api_base=api.url, now=now)
+    keep = box.ask().stdout.strip()                      # 別の未回答の質問 (poll が走る条件)
+    assert keep
+    res = t.poll_once(box.registry, box.creds(), api_base=api.url, now=now + 301)
+    assert box.ledger()["q-00000001"]["status"] == "withdrawn"
+    assert json.loads((box.registry / t.OFFSET_FILE).read_text())["offset"] == uid + 1
+
+
 def test_unreadable_ledger_forwards_nothing_does_not_advance_and_does_not_answer(box, api):
     box.heartbeat()
     qid = box.ask().stdout.strip()

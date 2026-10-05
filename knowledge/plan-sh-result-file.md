@@ -12,7 +12,7 @@
 | subcommand | 本文を受け取る引数 | ファイル / 標準入力で渡す形 | 備考 |
 |---|---|---|---|
 | `done` | `<result>`（位置引数） | `--result-file <path\|->` | QA Gate / `required_evidence` は展開後の本文に同じにかかる |
-| `needs-director` | `<reason>`（位置引数） | `--result-file <path\|->` | 長い・複数行は従来どおり `split_long_freeform` が body の詳細節へ |
+| `needs-director` | `<reason>`（位置引数） | `--result-file <path\|->` | `--result-file` では理由（frontmatter・通知）は**ファイルの最初の空でない行**（200 字で切る）、全文は body の `## Needs-Director 詳細` 節（1 行だけで 200 字以内なら詳細節は無し）。位置引数の長い・複数行は従来どおり `split_long_freeform` |
 | `verify-result` | `--notes` | `--notes-file <path\|->` | option の値なので位置引数は無い |
 | `fail` | **無し** | — | 引数は `handoff_path`（パス）と `--head <sha>` / `--no-head "<1 行の理由>"` だけ。Result の本文を持たない |
 

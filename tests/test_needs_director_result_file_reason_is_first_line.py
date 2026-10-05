@@ -60,3 +60,45 @@ def test_positional_reason_keeps_the_old_join(box):
     p = run(box, "needs-director", "t001", "a\nb", "--mission", MISSION, "--execution", xid)
     assert p.returncode == 0, p.stderr
     assert box.card()["needs_director_reason"] == "a / b"
+
+
+def test_single_overlong_line_without_newline_keeps_the_text_past_the_cut(box, tmp_path):
+    # 改行のない 200 字超の 1 行: rest == first でも要約は切れているので全文を詳細節に残す (PR #282 t005 P1)
+    text = "あ" * 300 + "END"
+    assert nd(box, text, tmp_path).returncode == 0
+    r = box.card()["needs_director_reason"]
+    assert r.startswith("あ" * 200) and "END" not in r and "\n" not in r
+    body = box.card_text()
+    assert "## Needs-Director 詳細" in body and "あ" * 300 + "END" in body
+
+
+LONG = "い" * 250
+CASES = {
+    "empty-ish": ("\n  \n", None),
+    "one-short-line": ("短い 1 行 END", None),
+    "one-long-line": (LONG + "END", None),
+    "multi-short-first": ("短い先頭\n" + LONG + "END\n", None),
+    "multi-long-first": (LONG + "\n本文 END\n", None),
+    "leading-blank-then-short": ("\n\n短い先頭\n本文 END\n", None),
+    "leading-blank-then-long": ("\n\n" + LONG + "\n本文 END\n", None),
+}
+
+
+@pytest.mark.parametrize("name", [k for k in CASES if k != "empty-ish"])
+def test_full_text_survives_somewhere_for_every_shape(box, tmp_path, name):
+    text, _ = CASES[name]
+    assert nd(box, text, tmp_path).returncode == 0
+    reason = box.card()["needs_director_reason"]
+    whole = text.strip()
+    # 理由がそのまま全文か、全文が card 本文のどこかに残る (どちらでもない = 一部が消えた)
+    assert reason == whole or whole in box.card_text()
+    assert "END" in reason or "END" in box.card_text()
+
+
+def test_blank_only_file_is_refused_and_writes_nothing(box, tmp_path):
+    xid = take(box)
+    f = tmp_path / "reason.md"
+    f.write_text(CASES["empty-ish"][0])
+    p = run(box, "needs-director", "t001", "--result-file", str(f), "--mission", MISSION, "--execution", xid)
+    assert p.returncode == 2
+    assert "needs_director_reason" not in box.card()

@@ -639,13 +639,14 @@ def split_result_file_reason(text, limit=FREEFORM_SUMMARY_LIMIT):
 
     要約は**ファイルの最初の空でない行** (limit 字で切る)。呼び出し元 (kai-review.sh 等) が先頭行に 1 行の要約を
     置く約束で、見出し・file・本文を ' / ' で連結した形 (`split_long_freeform`) だと通知 (dispatcher → Director) が
-    読めない。先頭行が全文なら全文は None (本文に重ねて書かない)。
+    読めない。先頭行が全文 (1 行だけで limit 字以内) のときだけ全文は None (本文に重ねて書かない)。
+    1 行だけでも limit 字を超えるなら要約は切れているので全文を残す。
     """
     text = text or ''
     first = next((ln.strip() for ln in text.splitlines() if ln.strip()), '')
     rest = text.strip()
     summary = first if len(first) <= limit else first[:limit].rstrip() + '…(全文は本文を参照)'
-    return summary, (None if rest == first else text)
+    return summary, (None if rest == first and len(first) <= limit else text)
 
 
 # ---------------------------------------------------------------------------

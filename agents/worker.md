@@ -689,6 +689,7 @@ plan needs-director "$TASK_ID" --result-file "$REASON_FILE" --mission "$TASK_MIS
 ```
 
 - タスクは `needs_director` 状態になり、`done` 遷移はブロックされる
+- `--result-file` では**ファイルの最初の空でない行が通知の要約**になる（200 字で切れ、全文は card の `## Needs-Director 詳細` に残る）。1 行目に要約を書く
 - 後続タスクの `blocked_by` は解除されない（依存関係を保つ）
 - Director が `plan.sh update <task_id> --status pending --reset` で差し戻し、追加指示を出す（`--status in_progress --reset` は罠 — `--reset` 適用後に `--status` が上書きするため in_progress/worker=null のまま止まる）
 - `plan.sh needs-director` は「代替検証して done を無理やり呼ぶ」より **常に安い選択肢**であること

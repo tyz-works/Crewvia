@@ -133,3 +133,18 @@ def test_permission_denied_offset_still_receives(reg, api):
         assert res["answered"] == 1 and res.get("offset_unreadable") == "EACCES"
     finally:
         path.chmod(0o600)
+
+
+# --- 同じ族: 送信状態 (telegram-send.json) が読めない ---------------------------------------------------------
+
+def test_unreadable_send_state_is_rewritten_by_the_next_send_and_availability_says_no(reg, api):
+    """`telegram_available` は読めない送信状態を「使えない」と答える (黙って True にしない)。送る側は 1 回送って書き直す。"""
+    ident = creds()
+    (reg / t.RECEIVER_FILE).write_text(json.dumps({"enabled": True, "checked_at": NOW, "reason": "ok",
+                                                   "bot_id": ident.bot_id, "chat_hash": ident.chat_hash}))
+    (reg / t.SEND_FILE).write_text("{not json")
+    assert t.telegram_available(reg, NOW) is False
+    res = t.send_message(reg, ident, "hi", api_base=api.url, now=NOW)
+    assert res.ok, res.error
+    assert json.loads((reg / t.SEND_FILE).read_text())["bot_id"] == ident.bot_id     # 正しい形に直った
+    assert t.telegram_available(reg, NOW + 60) is True

@@ -215,6 +215,19 @@ def test_a_broken_lib_never_raises_out_of_the_cycle(h, monkeypatch):
     assert TOKEN not in h.log_text(), "例外の型名だけをログに出す (メッセージに token が混ざっても漏らさない)"
 
 
+def test_an_unreadable_offset_is_reported_to_the_director_once(h, monkeypatch):
+    """poll が offset_unreadable を返したら Director に 1 回だけ知らせる (同じ理由を毎サイクル繰り返さない)。"""
+    h.configure()
+    ns = h.load()
+    monkeypatch.setattr(t, "run_cycle", lambda *a, **k: {
+        "receiver": None, "forwarded": 0, "polled": True, "identity_changed": [], "poll": {"offset_unreadable": "EACCES"}})
+    FakeMux.sent = []
+    ns["run_telegram_cycle"]()
+    ns["run_telegram_cycle"]()
+    lines = [m for m in telegram_messages() if "telegram-offset.json" in m]
+    assert len(lines) == 1 and "EACCES" in lines[0]
+
+
 # ---------------------------------------------------------------------------
 # bash 側: 起動時に 1 回・前置代入・取り直しは長い間隔だけ
 # ---------------------------------------------------------------------------

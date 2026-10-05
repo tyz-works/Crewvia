@@ -426,6 +426,29 @@ CLAUDE.md の不変条件 7 の列挙に足す (PR-A で 4 つ、PR-B で `escal
 メソッド名が文字列定数でない呼び出しも落とす (証明できない)。許可表の項目が消えても落ちる (表が腐らない)。陽性対照 (迂回の実際の形 4 つ) を置いてある。
 **赤の実証**: ① 関所の照合を外す → 再現テスト 2 件が赤。② 関所を迂回する `api_call(..., 'deleteMessage', ...)` を足す → 構造テストが赤。③ 後始末を旧実装に戻す → 5 件赤。
 
+### 2-5d. 状態ファイルの読み口: 無い / 読めない / 形が違う (PR #281 の Codex P2・5 巡目)
+
+5 巡目の P2: `_receive_updates` が読めない offset を `{}` に置き換えた後 `offset_state['offset']` を引き、KeyError。ファイルが壊れている限り毎サイクル同じ所で落ち、押下が受信されなかった
+(dispatcher のサイクル自体は `run_cycle` の外側の `try/except` で落ちないが、受信は永久に止まる)。**読めない値を `{}` / `None` に潰してから中身を読む**形が原因なので、`lib_telegram.py` の全読み口を表にした。
+`load_json_store` は 3 つとも別の値で返す: 無い = `Unreadable(ENOENT)` (`is_missing`)・読めない / 形が違う (型違い・負の値・list・通常ファイルでない・権限) = それ以外の `Unreadable`。
+
+| 読み口 | 無い | 読めない / 形が違う | 備考 |
+|---|---|---|---|
+| `read_questions` を読むだけの所 (`_unbutton_pending`・`_give_up_forwarding`・`forward_pending`・`cmd_verify`・`cmd_list`) | 何もしない / `not_found` | 何もしない (`unreadable` / `ledger_unreadable` を返す)。**中身は読まない** | 台帳は消して復旧 |
+| `update_questions` | `{}` から始める | `LedgerUnreadable` を投げる (書かない) | 呼び出し側が `suppress` |
+| `run_cycle` の台帳 | 何もしない | 転送せず offset も進めない (log) | |
+| `read_offset` (`_receive_updates`) | 0 から (通常運用・黙る) | **0 から読み直す** (at-least-once。台帳の CAS と `forwarded` で重複は転送されない)。`offset_unreadable` に固定の語 (`EACCES` / `invalid` 等) を 1 回出し、dispatcher が Director に 1 回だけ通知。次の書き込みで正しい形に上書き | 本件。以前は `{}` にして KeyError |
+| `read_offset` (`run_cycle` の `last_poll_at`) | `None` (間隔の判定を飛ばして poll) | `None` (同上。poll が offset を書き直す) | 読めない状態は poll を止めない |
+| `read_receiver` / `receiver_verdict` | 断る | 断る (`ask_user.sh` は exit 4) | 安全側 |
+| `write_receiver_state` | 作る / 何も作らない (未設定) | 書き直す (`exists` は「無い」でないので真) | 書き手は dispatcher だけ |
+| `_update_send_state` | `{}` | `{}` で 1 回送り、書き直す。バックオフの記憶は失う (1 通だけ余計に送りうる。Telegram 側の 429 が再びバックオフを作る) | 意図。`telegram_available` は逆に「使えない」を返す (段階上げは送らない側に倒す) |
+| `telegram_available` | True | False | |
+| `load_telegram_config` (config) | 既定値 | 既定値 (= 未設定 = 何も送らない側) | |
+
+読めない値を空と同じ形で読み進める所は上の `read_offset` 1 か所だけだった。残りは「読まない」か「書き直す」のどちらかを意図して選んでいる。
+**テスト**: `tests/test_telegram_unreadable_offset_still_receives.py` (壊れ・型違い・負・list・通常ファイルでない・権限なしの 6 形で押下が受信され、offset が直り、重複は転送されない・送信状態の族)・
+`tests/test_telegram_dispatcher_glue.py::test_an_unreadable_offset_is_reported_to_the_director_once`。
+
 ### 2-6. 受け取らないもの
 
 `/start` などの bot コマンド、他 chat、返信でないテキスト、`edited_message`、画像等は、**転送もせず返信もしない**。

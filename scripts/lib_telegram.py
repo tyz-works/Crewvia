@@ -425,6 +425,28 @@ def is_bound(record, identity):
     return record.get('bot_id') == identity['bot_id'] and record.get('chat_hash') == identity['chat_hash']
 
 
+#: 質問のメッセージを**対象にする** Bot API のメソッド (message_id が要る)。chat ごとの連番なので、別の chat の質問には使えない。
+QUESTION_TARGET_METHODS = frozenset({'editMessageReplyMarkup', 'editMessageText', 'deleteMessage'})
+
+
+def question_api_call(creds, entry, method, payload, *, api_base=API_BASE_DEFAULT, timeout=API_TIMEOUT_SECONDS):
+    """**質問に結び付く Bot API 呼び出しの唯一の関所** (PR #281 の Codex P1・4 巡目。設計 §2-5c)。
+
+    質問 (台帳の `entry`) の `bot_id` + `chat_hash` が今の認証情報と一致しなければ、**通信せずに** `identity_mismatch` を返す
+    (別の chat の `message_id` は無関係なメッセージを指しうる)。`chat_id` は `creds` から、`message_id` は `entry` から**ここで埋める**
+    (呼び出し側が渡した値は上書きする — 質問と別の宛先を指せない)。呼び出し側は `identity_mismatch` をその質問の後始末の対象から外す。
+    lib_telegram.py の中で `api_call` を直接呼べるのは `tests/test_telegram_question_gate.py` の許可表にある 3 箇所だけ (構造テスト)。
+    """
+    if not is_bound(entry, identity_of(creds)):
+        return ApiResult(False, error='identity_mismatch')
+    body = dict(payload, chat_id=creds.chat_id)
+    if method in QUESTION_TARGET_METHODS:
+        if entry.get('message_id') is None:
+            return ApiResult(False, error='no_message_id')
+        body['message_id'] = entry['message_id']
+    return api_call(creds.token, method, body, api_base=api_base, timeout=timeout)
+
+
 def rebind_ledger(ledger, identity, now):
     """今の認証情報のものでない `open` の質問を `withdrawn` にする (**純粋関数**。→ `(新しい台帳, 取り下げた qid の列)`)。
 
@@ -808,9 +830,12 @@ class _Budget:
         return min(float(API_TIMEOUT_SECONDS), remaining)
 
 
-def _unbutton_give_up(entry, now):
-    """ボタンを消す試みを諦める条件 (通信しない・純粋)。「消えないボタン」は押されても台帳の照合で断られる (§2-3d)。"""
+def _unbutton_give_up(entry, now, identity=None):
+    """ボタンを消す試みを諦める条件 (通信しない・純粋)。「消えないボタン」は押されても台帳の照合で断られる (§2-3d)。
+    `identity` を渡すと、今の認証情報の質問でないものも諦める (別の bot / chat では消せない。§2-5c)。"""
     if entry.get('message_id') is None:
+        return True
+    if not is_bound(entry, identity):
         return True
     tries = entry.get('unbutton_tries') or 0
     closed = entry.get('closed_at')
@@ -848,20 +873,23 @@ def _unbutton_pending(registry_dir, creds, api_base, now, *, budget=None, limit=
     if is_unreadable(ledger) or is_missing(ledger):
         return 0
     budget = budget or _Budget()
+    identity = identity_of(creds)
     pending = [(qid, e) for qid, e in ledger.items() if e.get('unbutton')]
     for qid, e in pending:
-        if _unbutton_give_up(e, now):
+        if _unbutton_give_up(e, now, identity):
             _settle_unbutton(registry_dir, qid, 'giveup', now)
     todo = sorted(((e.get('unbutton_tries') or 0, e.get('closed_at') or 0, qid, e['message_id'])
-                   for qid, e in pending if not _unbutton_give_up(e, now)))[:limit]
+                   for qid, e in pending if not _unbutton_give_up(e, now, identity)))[:limit]
     attempted = 0
     for _tries, _closed, qid, message_id in todo:
         timeout = budget.timeout()
         if timeout is None:
             break
-        res = api_call(creds.token, 'editMessageReplyMarkup',
-                       {'chat_id': creds.chat_id, 'message_id': message_id, 'reply_markup': {'inline_keyboard': []}},
-                       api_base=api_base, timeout=timeout)
+        res = question_api_call(creds, ledger[qid], 'editMessageReplyMarkup', {'reply_markup': {'inline_keyboard': []}},
+                                api_base=api_base, timeout=timeout)
+        if res.error == 'identity_mismatch':
+            _settle_unbutton(registry_dir, qid, 'giveup', now)   # 通信していない (予算にも数えない)。即「諦め」(§2-5c)
+            continue
         attempted += 1
         if res.ok:
             _settle_unbutton(registry_dir, qid, 'done', now)
@@ -1007,9 +1035,9 @@ def _give_up_forwarding(registry_dir, creds, api_base, now, *, budget=None, limi
         except (LedgerBusy, LedgerUnreadable):
             return
         if marked:
-            api_call(creds.token, 'sendMessage',
-                     {'chat_id': creds.chat_id, 'text': f'Director に届きませんでした (質問 {qid})。画面で確認してください。'},
-                     api_base=api_base, timeout=timeout)
+            question_api_call(creds, ledger[qid], 'sendMessage',
+                              {'text': f'Director に届きませんでした (質問 {qid})。画面で確認してください。'},
+                              api_base=api_base, timeout=timeout)     # 別の chat の質問の通知を今の chat に出さない (§2-5c)
 
 
 # ---------------------------------------------------------------------------
@@ -1307,9 +1335,8 @@ def cmd_ask(argv):
         update_questions(registry, attach, now=now)
     except (LedgerBusy, LedgerUnreadable):
         # ボタンは出ているが台帳が答えを受けられない → ボタンを消して断る (ボタンが出ているのに台帳に無い状態を作らない)
-        api_call(creds.token, 'editMessageReplyMarkup',
-                 {'chat_id': creds.chat_id, 'message_id': sent.message_id, 'reply_markup': {'inline_keyboard': []}},
-                 api_base=api_base)
+        question_api_call(creds, dict(entry, message_id=sent.message_id), 'editMessageReplyMarkup',
+                          {'reply_markup': {'inline_keyboard': []}}, api_base=api_base)
         with contextlib.suppress(LedgerBusy, LedgerUnreadable):
             update_questions(registry, lambda l: (_close(l, qid, 'withdrawn', now, unbutton=False), None), now=now)
         sys.stderr.write('ledger_unavailable\n')

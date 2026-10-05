@@ -271,7 +271,9 @@ def _functions():
 
 
 def _api_calls(fn):
-    return [n for n in ast.walk(fn) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "api_call"]
+    # 質問に結び付く呼び出しは関所 `question_api_call` 経由 (t024・設計 §2-5c)。関所も通信なので同じ検査に含める。
+    return [n for n in ast.walk(fn) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+            and n.func.id in ("api_call", "question_api_call")]
 
 
 @pytest.mark.parametrize("name", ["poll_once", "_unbutton_pending", "_give_up_forwarding"])
@@ -279,14 +281,14 @@ def test_every_network_call_on_the_poll_path_takes_a_time_budget(name):
     calls = _api_calls(_functions()[name])
     assert calls, name
     for c in calls:
-        assert any(k.arg == "timeout" for k in c.keywords), f"{name}:{c.lineno} の api_call に timeout (持ち時間) が無い"
+        assert any(k.arg == "timeout" for k in c.keywords), f"{name}:{c.lineno} の通信呼び出し (api_call / question_api_call) に timeout (持ち時間) が無い"
 
 
 def test_poll_once_receives_before_any_cleanup_call():
     fn = _functions()["poll_once"]
     receive = [n.lineno for n in ast.walk(fn) if isinstance(n, ast.Call) and getattr(n.func, "id", "") == "_receive_updates"]
     later = [n.lineno for n in ast.walk(fn) if isinstance(n, ast.Call)
-             and getattr(n.func, "id", "") in ("api_call", "_unbutton_pending", "_give_up_forwarding")]
+             and getattr(n.func, "id", "") in ("api_call", "question_api_call", "_unbutton_pending", "_give_up_forwarding")]
     assert receive and later and min(receive) < min(later)
     receive_fn = _functions()["_receive_updates"]
     assert [c.args[1].value for c in _api_calls(receive_fn)][:1] == ["getUpdates"]

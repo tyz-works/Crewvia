@@ -385,6 +385,8 @@ CLAUDE.md の不変条件 7 の列挙に足す (PR-A で 4 つ、PR-B で `escal
 | `telegram-receiver.json` | dispatcher のみ | 既存の `receiver_verdict` が `receiver_mismatch` で `ask` を断る (P1-2 / §1-1)。心拍が次のサイクルで新しい identity を書き直す | 識別子欠け = `receiver_unknown` で断る (既存) | 既存 (§1-1) |
 | `escalation-state.json` (段階上げ・PR-B) | dispatcher のみ | 質問と結び付かない (時計だけ) ので束縛しない | 同左 | — |
 
+**質問を参照する呼び出しは関所を通る** — 状態ファイルの表では呼び出しの漏れを追えない (P1・4 巡目)。§2-5c。
+
 決めたこと:
 
 - **offset は「最初から」(`0`) にした。「getUpdates の最新に合わせる」は選ばない**。新しい bot が未読の update を持っているなら、それは**新しい bot 宛の
@@ -398,6 +400,31 @@ CLAUDE.md の不変条件 7 の列挙に足す (PR-A で 4 つ、PR-B で `escal
   (転送されないだけ)。通知を確実にするなら台帳側 (`closed_reason: identity_changed` かつ未通知) から導く案があるが、この PR では足さない (backlog)。
 - **env の停止スイッチは付けない** (不変条件 5)。束縛の判定は `lib_telegram.is_bound` の 1 か所で、`ask` / `poll` / 送信が同じ答えを出す。
 - 質問台帳・offset を**消してよい**(不変条件 7) ことは変わらない。識別子つきになっても、消せば「古いボタンが不明になる」だけ。
+
+### 2-5c. 質問に結び付く Bot API 呼び出しは関所を通る (PR #281 の Codex P1・4 巡目)
+
+**P1 の欠陥**: §2-5b は質問台帳と offset を bot_id + chat_hash に結び付けたが、**ボタンの後始末** (`editMessageReplyMarkup`) は今の認証情報の `chat_id` で、
+台帳に残った前の bot / chat の質問の `message_id` を編集しにいった。`message_id` は chat ごとの連番なので、認証情報が変わった後に
+(`withdrawn: identity_changed` でなく `expired` で後始末待ちだったもの等)、新しい chat の**同じ番号の無関係なメッセージ**を編集しうる。
+**同じ族 (束縛の確認漏れ) の 2 回目**。§2-5b の「状態ファイルの全表」は、ファイルを挙げたが**ファイルを使う呼び出し**を挙げなかった。表で追うのをやめ、構造で押さえる。
+
+| 質問を参照する呼び出し | 関所 | 束縛が合わないとき |
+|---|---|---|
+| 後始末: `editMessageReplyMarkup` (`_unbutton_pending`) | `question_api_call` | 通信せず `identity_mismatch` → その質問の `unbutton` を外す (**即「諦め」**。§2-3d の予算にも回数にも数えない) |
+| 諦めの通知: `sendMessage` (`_give_up_forwarding`) | 同 | 送らない (別の chat に別の chat の質問の通知を出さない)。`forwarded: gave_up` の印は付く |
+| `ask` の失敗時にボタンを消す: `editMessageReplyMarkup` (`cmd_ask`) | 同 | 同上 (今の identity で書いた直後の質問なので通常は一致する) |
+
+**関所の仕様 (`lib_telegram.question_api_call(creds, entry, method, payload)`)**:
+- `is_bound(entry, identity_of(creds))` でなければ**呼ばずに** `ApiResult(False, error='identity_mismatch')`。識別子の無い旧形式の質問も不一致 (§2-5b)。
+- `chat_id` は `creds` から、`message_id` は `entry` から**関所が埋める** (呼び出し側が渡した値は上書き)。`editMessageReplyMarkup` / `editMessageText` / `deleteMessage` で
+  `message_id` が無ければ `no_message_id` (通信しない)。
+- 呼び出し側は `identity_mismatch` をその質問の後始末の対象から外す。押されても台帳の照合 (§2-5b) で断られるので、ボタンが残っても安全。
+- 関所の外で `api_call` を直接呼べるのは、質問の `message_id` を参照しない 3 つだけ: `send_message` (質問を新しく**送る**)・`_receive_updates` (`getUpdates`)・
+  `poll_once` の `answerCallbackQuery` (今の bot の getUpdates が返した `callback_query_id` への応答)。
+
+**構造テスト** `tests/test_telegram_question_gate.py`: `lib_telegram.py` を ast で走査し、`api_call(...)` / `x.api_call(...)` の呼び出しが**関所の関数の中か、上の許可表の (関数, メソッド) にあるか**を確かめる。
+メソッド名が文字列定数でない呼び出しも落とす (証明できない)。許可表の項目が消えても落ちる (表が腐らない)。陽性対照 (迂回の実際の形 4 つ) を置いてある。
+**赤の実証**: ① 関所の照合を外す → 再現テスト 2 件が赤。② 関所を迂回する `api_call(..., 'deleteMessage', ...)` を足す → 構造テストが赤。③ 後始末を旧実装に戻す → 5 件赤。
 
 ### 2-6. 受け取らないもの
 

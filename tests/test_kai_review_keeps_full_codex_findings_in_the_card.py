@@ -94,13 +94,13 @@ def _findings(n, body_len):
          "file": f"scripts/f{i}.sh"} for i in range(n)]})
 
 
-def _skip_if_no_base(p):
+def _assert_base_resolved(p):
     assert "pr-base" not in p.stderr or "cannot resolve the PR base" not in p.stderr, (p.stdout, p.stderr)
 
 
 def test_needs_director_keeps_every_finding_body_in_full(tmp_path):
     p, capture = run_kai_review(tmp_path, _findings(3, 2500))
-    _skip_if_no_base(p)
+    _assert_base_resolved(p)
     text = (capture / "needs-director.txt").read_text()
     for i in range(3):
         assert f"BODY{i}-" in text and f"-END{i}" in text and "x" * 2500 in text, (i, p.stdout, p.stderr)
@@ -116,7 +116,7 @@ def test_needs_director_keeps_every_finding_body_in_full(tmp_path):
 def test_done_on_a_clean_review_also_keeps_the_full_output(tmp_path):
     out = json.dumps({"findings": [{"priority": "P3", "title": "nit", "body": "N" * 2500 + "-TAIL", "file": None}]})
     p, capture = run_kai_review(tmp_path, out)
-    _skip_if_no_base(p)
+    _assert_base_resolved(p)
     text = (capture / "done.txt").read_text()
     assert text.splitlines()[0].startswith("LGTM: PR#1 feat") and "P3×1" in text.splitlines()[0]
     assert "N" * 2500 + "-TAIL" in text

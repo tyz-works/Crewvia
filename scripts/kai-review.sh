@@ -748,18 +748,18 @@ RESULT_FILE="$(mktemp "${TMPDIR:-/tmp}/kai-review-result.XXXXXX")"
 {
   printf '%s\n\n' "$RESULT_FIRST_LINE"
   if [[ "$JUDGE_METHOD" == "json" ]]; then
-    echo "## Findings"
+    echo "### Findings"
     echo ""
     printf '%s' "$REVIEW_CONTENT" | jq -r '
       (.findings // []) | if length == 0 then "(none)" else
         to_entries[] | .key as $i | .value
-        | "### \($i + 1). [\((.priority // "?") | tostring)] \(.title // "(no title)")\n"
+        | "#### \($i + 1). [\((.priority // "?") | tostring)] \(.title // "(no title)")\n"
           + "- file: \(.file // "-")" + (if .line != null then "\n- line: \(.line)" else "" end)
           + "\n\n\(.body // "")\n" end' 2>/dev/null \
       || echo "(findings could not be formatted — see the raw output below)"
     echo ""
   fi
-  echo "## Codex raw output"
+  echo "### Codex raw output"
   echo ""
   printf '%s\n' "$REVIEW_CONTENT"
 } > "$RESULT_FILE"

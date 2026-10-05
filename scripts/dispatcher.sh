@@ -101,9 +101,55 @@ python3 "${SCRIPT_DIR}/lib_daemon_watch.py" record-version dispatcher \
   --repo-root "$REPO_ROOT" >> "$LOG_FILE" 2>&1 || log "record-version failed (non-fatal)"
 
 # ---------------------------------------------------------------------------
+# Telegram の認証情報 (PR-A / 設計 §1-1)。**起動時に 1 回** (respawn のたびにここを通る) 取り出し、
+# この bash プロセスの**シェル変数**に持つ。export しない (argv にも bash の env にも出さない)。
+# サイクルごとの python には、下の run_dispatch の **前置代入** (env コマンドを付けない) で
+# その呼び出しにだけ渡す。python のサイクルごとに 1Password を呼ばない。
+# 取り出せなかった間 (1Password のロック・op が PATH に無い・ファイルの権限) は、長い間隔
+# TG_RESOLVE_RETRY_SECONDS (600 秒) でだけ取り直す (サイクル単位では呼ばない。t016 P3-1)。
+# 未設定 (config の telegram.credentials.source が無い) なら何もしない。
+# ---------------------------------------------------------------------------
+TG_RESOLVE_RETRY_SECONDS=600
+tg_token=""
+tg_chat=""
+tg_reason="no_credentials"
+tg_resolved_at=0
+
+_tg_resolve() {
+  local out
+  tg_token=""
+  tg_chat=""
+  out="$(python3 "${SCRIPT_DIR}/lib_telegram.py" resolve 2>/dev/null)" || out="credential_command_failed"
+  tg_reason="$(printf '%s\n' "$out" | sed -n 1p)"
+  [[ -n "$tg_reason" ]] || tg_reason="credential_command_failed"
+  if [[ "$tg_reason" == "ok" ]]; then
+    tg_token="$(printf '%s\n' "$out" | sed -n 2p)"
+    tg_chat="$(printf '%s\n' "$out" | sed -n 3p)"
+  fi
+  tg_resolved_at="$(date +%s)"
+}
+
+_tg_maybe_retry() {
+  # 設定されているのに取り出せていない (no_credentials = 未設定は対象外) ときだけ、長い間隔で取り直す。
+  if [[ "$tg_reason" != "ok" && "$tg_reason" != "no_credentials" ]] \
+     && (( $(date +%s) - tg_resolved_at >= TG_RESOLVE_RETRY_SECONDS )); then
+    _tg_resolve
+    log "telegram credentials retry: ${tg_reason}"
+  fi
+}
+
+_tg_resolve
+if [[ "$tg_reason" != "no_credentials" ]]; then
+  log "telegram credentials: ${tg_reason}"
+fi
+
+# ---------------------------------------------------------------------------
 # One dispatch cycle — implemented in Python for YAML / file parsing
 # ---------------------------------------------------------------------------
 run_dispatch() {
+  # 認証情報は前置代入で python にだけ渡す (`env VAR=… python3` は env の argv に token が載るので使わない)。
+  _CREWVIA_TG_RESOLVED_TOKEN="$tg_token" _CREWVIA_TG_RESOLVED_CHAT_ID="$tg_chat" \
+  _CREWVIA_TG_RESOLVE_REASON="$tg_reason" \
   python3 - "$QUEUE_DIR" "$REGISTRY_DIR" "$NOTIFY_CACHE" "$NOTIFY_TTL" "$STATE_GRACE" "$LOG_FILE" <<'PYEOF'
 import sys
 import os
@@ -133,6 +179,13 @@ LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
 REPO_ROOT = REGISTRY_DIR.parent
 _SCRIPTS_DIR = REPO_ROOT / 'scripts'
 sys.path.insert(0, str(_SCRIPTS_DIR))
+
+# Telegram (PR-A): dispatcher.sh が起動時に取り出した認証情報は前置代入でここに届く。**すぐ os.environ から外して**
+# このモジュールの変数に持つ — 以降の subprocess (mux send・git 等) が継承しない。Telegram の通信だけは
+# lib_telegram.run_cycle が `poll` のサブプロセスにだけ env で渡す。token をログ・例外文に出さない。
+_TG_CARRIED = {k: os.environ.pop(k, '') for k in ('_CREWVIA_TG_RESOLVED_TOKEN', '_CREWVIA_TG_RESOLVED_CHAT_ID')}
+_TG_RESOLVE_REASON = os.environ.pop('_CREWVIA_TG_RESOLVE_REASON', '') or 'no_credentials'
+
 from lib_mux import Mux, repo_identity_ok  # noqa: E402
 import lib_retirement  # noqa: E402
 # 「依存が満たされた」の定義は crewvia の中で 1 箇所しかない (t010 / QA t002 の
@@ -3140,6 +3193,61 @@ def check_main_checkout_drift():
         log(f'[main-checkout-drift] check failed: {e!r}')
 
 
+# ---------------------------------------------------------------------------
+# Telegram の経路 (PR-A / knowledge/director-escalation-telegram.md §1・§1-1・§3)
+# ---------------------------------------------------------------------------
+#
+# 1 サイクルに足すのは `lib_telegram.run_cycle()` の 1 呼び出しだけ (ロジックは lib 側・純粋関数 + 網羅テスト)。
+# ネットワークは `poll` のサブプロセス (timeout 8) の中だけ — サイクルを塞がない。未設定で台帳が無ければ
+# 何も読まず何も書かない。受信側の心拍 (telegram-receiver.json) の書き手はここだけ。
+# 全体を try/except で包むのは run_daemon_watch() と同じ理由: 安全網が dispatch サイクルを落としてはならない。
+
+TELEGRAM_DISABLED_KEY = 'telegram_receiver_disabled'
+
+
+def run_telegram_cycle():
+    try:
+        import lib_telegram
+        config = lib_telegram.load_telegram_config()
+        creds, reason = lib_telegram.resolve_credentials(
+            config, environ={'_CREWVIA_TG_RESOLVED_TOKEN': _TG_CARRIED['_CREWVIA_TG_RESOLVED_TOKEN'],
+                             '_CREWVIA_TG_RESOLVED_CHAT_ID': _TG_CARRIED['_CREWVIA_TG_RESOLVED_CHAT_ID']},
+            carried=True)
+        if creds is None and reason == 'no_credentials' and _TG_RESOLVE_REASON != 'ok':
+            reason = _TG_RESOLVE_REASON      # 起動時に取り出せなかった理由 (固定コード) を心拍に残す
+
+        def forward(line):
+            # Director 不在・送信失敗は False → forwarded=false のまま次のサイクルで再送 (§2-3)
+            if not director_live_for_state_notices():
+                return False
+            return tmux_send(_director_name(), line)
+
+        summary = lib_telegram.run_cycle(
+            REGISTRY_DIR / 'daemons', QUEUE_DIR, config, reason, forward, creds=creds, log=log)
+        receiver = summary.get('receiver') or {}
+        if receiver.get('file_exists') and receiver.get('enabled') is False:
+            # 「受信が無効になった」を Director に 1 回 (状態ベース。同じ理由コードの間は繰り返さない)
+            rsn = receiver.get('reason', 'unknown')
+            notify_state_once(
+                TELEGRAM_DISABLED_KEY, fingerprint(rsn), 'telegram-receiver', '_daemon', 'telegram',
+                lambda: ('[telegram] Telegram 受信が無効です (理由コード: ' + str(rsn) + ')。'
+                         'dispatcher が起動時に認証情報を取り出せなかった可能性 (1Password のロック・op が PATH に無い・'
+                         'ファイルの権限)。原因を直して lib_daemon_watch.py restart を行うか、config の '
+                         'telegram.credentials を見直してください。この間 ask_user.sh ask は断られ (exit 4)、'
+                         'AskUserQuestion を使ってください。'),
+                director_live=director_live_for_state_notices)
+        elif receiver.get('enabled') is True:
+            told = load_told()
+            if not is_unreadable(told) and TELEGRAM_DISABLED_KEY in told:
+                clear_told_key(TELEGRAM_DISABLED_KEY)
+        poll = summary.get('poll') or {}
+        if poll.get('error') and should_notify('telegram_poll_warn'):
+            log(f"WARNING: telegram poll failed ({poll.get('error')})")
+            record_notify('telegram_poll_warn')
+    except Exception as e:
+        log(f'[telegram] cycle failed: {type(e).__name__}')
+
+
 # --- CYCLE ENTRY POINT ---
 # Everything below this marker runs a full dispatch cycle.  Tests that want to
 # exercise a single helper (tests/test_orphan_daemon_guard.py) exec() the code
@@ -3151,6 +3259,8 @@ def check_main_checkout_drift():
 # system is least healthy and most in need of it.
 run_daemon_watch()
 check_main_checkout_drift()
+# Telegram は dispatch() の成否から独立させる (心拍 = `ask` が見る受信側の生存表明。dispatch が毎回落ちても止めない)
+run_telegram_cycle()
 publish_agents()
 dispatch()
 # t002: both are queue/registry bookkeeping, not dispatch decisions, and both
@@ -3176,6 +3286,7 @@ while true; do
   # watchdog からは死んで見える → respawn → dispatcher が 2 つ、になる。
   # そのため無条件・先頭で書く。
   daemon_beat dispatcher "$REPO_ROOT" "$REGISTRY_DIR"
+  _tg_maybe_retry
   run_dispatch || log "dispatch cycle error (exit $?)"
   sleep 5
 done

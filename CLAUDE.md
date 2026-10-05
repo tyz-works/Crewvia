@@ -43,6 +43,16 @@
 
 ---
 
+## Telegram 連携（任意）
+
+- Director がユーザーに選択肢つきの質問をボタンで送り、答えを Director の画面に届ける。入口は `scripts/ask_user.sh`（ロジックは `scripts/lib_telegram.py`）。**Telegram が使えるとき Director は `AskUserQuestion` を使わない**（手順: `agents/director.md` §16）
+- 設定は `config/crewvia.yaml` の `telegram:`。**認証情報は値を書かず**、`telegram.credentials.source`（`op` = 1Password / `file` = リポジトリ外の 0600 ファイル）で取り出し方を **1 つだけ**選ぶ。`CREWVIA_TG_*` の env は読まない。未設定なら何も読まず・書かず・送らない
+- 受信は dispatcher のサイクルに 1 か所（`getUpdates(timeout=0)` をサブプロセス + timeout で）。dispatcher は起動時（respawn のたび）に認証情報を 1 回取り出し、サイクルごとの python へ前置代入で渡す（`env VAR=… cmd` は argv に載るので使わない）
+- bot は crewvia 専用（他のツールが同じ bot を `getUpdates` で読むと更新を奪い合う）
+- 設計: `knowledge/director-escalation-telegram.md`
+
+---
+
 ## ディレクトリ構成（骨格）
 
 各ファイルの設計の経緯・実測・理由は **`knowledge/file-map.md`**（旧本節。ファイルごとの見出し）と、そこから張った設計文書にある。
@@ -66,6 +76,7 @@ scripts/
   lib_worker_target.py  Worker の TARGET_DIR 記録
   lib_registry.py       workers.yaml を書く入口
   lib_review_refusal.py codex-review の拒否記録
+  lib_telegram.py       Telegram の経路（質問台帳・受信・認証情報の解決）/ ask_user.sh  Director の質問の入口
   kai-review.sh         Codex reviewer 起動ラッパー / taskvia-sync.sh  queue → Taskvia 同期
 queue/    state.yaml / missions/<slug>/{mission.yaml,tasks/tNNN.md} / archive/
 registry/ workers.yaml / workers/ / heartbeats/ / mux/ / retirements/ / task-graph/ / daemons/
@@ -79,7 +90,7 @@ registry/ workers.yaml / workers/ / heartbeats/ / mux/ / retirements/ / task-gra
 4. デーモンの再起動は `lib_daemon_watch.py restart`。`lib_mux.py kill` / `spawn` を素で叩かない
 5. 共有規則に env 停止スイッチを付けない（dispatcher と plan.sh で答えが割れる）
 6. `handoff_path` は絶対パスのみ
-7. `registry/daemons/*` の通知台帳（`notified-state.json`）・拒否記録（`review-refusals/`）は消してよい。それが復旧手順
+7. `registry/daemons/*` の通知台帳（`notified-state.json`）・拒否記録（`review-refusals/`）・Telegram の状態（`telegram-questions.json` / `telegram-offset.json` / `telegram-send.json` / `telegram-receiver.json`）は消してよい。それが復旧手順（質問台帳を消すと古いボタンが「不明」で断られるだけ）
 
 ---
 
@@ -127,6 +138,7 @@ registry/ workers.yaml / workers/ / heartbeats/ / mux/ / retirements/ / task-gra
 | `NTFY_USER` | ntfy Basic 認証ユーザー名。`auth-default-access: deny-all` サーバーでは必須 |
 | `NTFY_PASS` | ntfy Basic 認証パスワード |
 | `APPROVAL_TOKEN_TTL_SECONDS` | ntfy ワンタイムトークンの有効期限（秒）。デフォルト: 900 |
+| `CREWVIA_DIRECTOR_SESSION_URL` | Telegram の質問の文面に付ける Director のセッション URL（`/remote-control` が出すもの）。`ask_user.sh ask --session-link` > この env > config `telegram.session_link` の順。無ければ行ごと省く。**認証情報（bot token・chat_id）は env ではなく config の `telegram.credentials` で取り出す** |
 | `CREWVIA_VERIFICATION_UI` | Taskvia 側の verification UI 表示制御。**Taskvia の Vercel env に設定** |
 
 ---

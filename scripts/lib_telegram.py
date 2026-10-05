@@ -302,7 +302,9 @@ def api_call(token, method, payload, *, api_base=API_BASE_DEFAULT, timeout=API_T
     req = urllib.request.Request(url, data=body, headers={'Content-Type': 'application/json'}, method='POST')
     status = 200
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 — api_base は呼び出し側が固定
+        # `urllib.request.urlopen` (モジュールの大域) ではなく自前の opener を使う: 同じ既定の handler (環境のプロキシ設定を含む) で、
+        # 他のコードが大域の `urlopen` を差し替えていても (テストが戻し忘れる等) 影響されない。
+        with urllib.request.build_opener().open(req, timeout=timeout) as resp:  # noqa: S310 — api_base は呼び出し側が固定
             raw = resp.read(1 << 20)
     except urllib.error.HTTPError as e:
         status = e.code

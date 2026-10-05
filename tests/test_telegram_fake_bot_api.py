@@ -614,6 +614,13 @@ def test_token_does_not_leak_when_the_server_is_unreachable_or_slow(box, api, ca
     assert TOKEN not in repr(vars_of(res))
 
 
+def test_api_call_does_not_depend_on_the_global_urlopen(api, monkeypatch):
+    """他のテスト・コードが `urllib.request.urlopen` を差し替えて戻さなくても通信できる (全 pytest でだけ落ちた回帰)。"""
+    import urllib.request
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("patched")))
+    assert t.api_call(TOKEN, "getMe", {}, api_base=api.url).ok is True
+
+
 def vars_of(res):
     return {k: getattr(res, k) for k in res.__slots__}
 

@@ -77,6 +77,8 @@ MUTANTS = [
      FAKE, "test_backoff_doubles_up_to_the_cap_and_success_resets"),
     ("例外の型でなく token 入りの文を出す", LIB, "        sys.stderr.write(f'internal_error:{type(e).__name__}\\n')",
      "        sys.stderr.write(f'internal_error:{type(e).__name__}:{e}\\n')", FAKE, "test_an_unexpected_exception_prints_only_its_type_never_its_message"),
+    ("大域の urlopen を使う", LIB, "urllib.request.build_opener().open(req, timeout=timeout)", "urllib.request.urlopen(req, timeout=timeout)",
+     FAKE, "test_api_call_does_not_depend_on_the_global_urlopen"),
     ("dispatcher: env コマンドで token を渡す", SH, '  _CREWVIA_TG_RESOLVED_TOKEN="$tg_token" _CREWVIA_TG_RESOLVED_CHAT_ID="$tg_chat" \\\n  _CREWVIA_TG_RESOLVE_REASON="$tg_reason" \\\n  python3 -',
      '  env _CREWVIA_TG_RESOLVED_TOKEN="$tg_token" _CREWVIA_TG_RESOLVED_CHAT_ID="$tg_chat" \\\n  _CREWVIA_TG_RESOLVE_REASON="$tg_reason" \\\n  python3 -',
      GLUE, "test_the_dispatch_call_passes_credentials_by_prefix_assignment_not_env"),

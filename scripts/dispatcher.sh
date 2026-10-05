@@ -3240,6 +3240,15 @@ def run_telegram_cycle():
             told = load_told()
             if not is_unreadable(told) and TELEGRAM_DISABLED_KEY in told:
                 clear_told_key(TELEGRAM_DISABLED_KEY)
+        changed = summary.get('identity_changed') or []
+        if changed:
+            # 認証情報 (bot / chat) が変わり、前の bot で出した未回答の質問を取り下げた。ボタンは別の bot では消せない。
+            notify_state_once(
+                'telegram_identity_changed', fingerprint(sorted(changed)), 'telegram-identity', '_daemon', 'telegram',
+                lambda: ('[telegram] 認証情報 (bot / chat) が変わったため、前の bot で出した未回答の質問 ' + str(len(changed)) +
+                         ' 件 (' + ', '.join(sorted(changed)) + ') を取り下げました (別の bot ではボタンを消せません。'
+                         '押されても転送されません)。必要なら質問し直してください。'),
+                director_live=director_live_for_state_notices)
         poll = summary.get('poll') or {}
         if poll.get('error') and should_notify('telegram_poll_warn'):
             log(f"WARNING: telegram poll failed ({poll.get('error')})")

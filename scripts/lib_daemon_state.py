@@ -399,6 +399,21 @@ def _is_hex(value, length):
             and all(c in '0123456789abcdef' for c in value))
 
 
+def _telegram_identity_problem(data, where):
+    """永続する Telegram の状態に付く識別子 (`bot_id` / `chat_hash`。**秘密でない**・receiver.json と同じ)。両方あるか両方無いか。
+    無い = 識別子導入前の旧形式 = 今の認証情報のものと言えない (`lib_telegram.is_bound`)。"""
+    has_bot, has_chat = 'bot_id' in data, 'chat_hash' in data
+    if has_bot != has_chat:
+        return f'{where}: bot_id and chat_hash must come together'
+    if has_bot:
+        bot_id = data['bot_id']
+        if not isinstance(bot_id, int) or isinstance(bot_id, bool) or bot_id < 0:
+            return f'{where}: bot_id is not a non-negative integer'
+        if not _is_hex(data['chat_hash'], 12):
+            return f'{where}: chat_hash is not 12 hex'
+    return None
+
+
 def telegram_question_entry_problem(key, entry):
     """質問台帳の 1 エントリが使えない理由 (使えれば `None`)。"""
     if not (isinstance(key, str) and len(key) == 10 and key.startswith('q-') and _is_hex(key[2:], 8)):
@@ -434,6 +449,12 @@ def telegram_question_entry_problem(key, entry):
     unbutton = entry.get('unbutton')
     if unbutton is not None and not isinstance(unbutton, bool):
         return f'entry {key!r}: unbutton is not a boolean'
+    problem = _telegram_identity_problem(entry, f'entry {key!r}')
+    if problem:
+        return problem
+    reason = entry.get('closed_reason')
+    if reason is not None and not isinstance(reason, str):
+        return f'entry {key!r}: closed_reason is not a string'
     answer = entry.get('answer')
     if entry['status'] == 'answered' and not isinstance(answer, dict):
         return f'entry {key!r}: answered without an answer'
@@ -473,7 +494,7 @@ def telegram_offset_problem(data):
     last = data.get('last_poll_at')
     if last is not None and not is_finite_number(last):
         return f"'last_poll_at' is {last!r}, expected a finite timestamp or null"
-    return None
+    return _telegram_identity_problem(data, 'offset')
 
 
 def telegram_send_problem(data):
@@ -485,7 +506,7 @@ def telegram_send_problem(data):
     failures = data.get('consecutive_failures')
     if failures is not None and (not isinstance(failures, int) or isinstance(failures, bool) or failures < 0):
         return f"'consecutive_failures' is {failures!r}, expected a non-negative integer or null"
-    return None
+    return _telegram_identity_problem(data, 'send state')
 
 
 def telegram_receiver_problem(data):

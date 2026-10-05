@@ -124,6 +124,12 @@ def all_text(box, *procs):
     return "\n".join(chunks)
 
 
+def box_identity(box):
+    """手で書いた台帳の質問に付ける識別子 (今の認証情報のもの)。識別子の無い旧形式は別の bot のものとして取り下げられる。"""
+    c = box.creds()
+    return {"bot_id": c.bot_id, "chat_hash": c.chat_hash}
+
+
 def press_button(box, api, qid, index=0, *, update_id=None, callback_id="cb-1"):
     led = box.ledger()[qid]
     api.queue_update(callback_update(int(CHAT), led["message_id"], f"{qid}.{led['nonce']}.{index}",
@@ -321,7 +327,7 @@ def test_expired_questions_do_not_count_toward_the_limit(box, api):
     box.registry.mkdir(parents=True, exist_ok=True)
     now = time.time()
     old = {f"q-0000000{i}": {"nonce": "9f3a1c", "question": "x", "options": ["a", "b"], "message_id": 10 + i,
-                              "status": "open", "created_at": now - 7200, "expires_at": now - 3600, "forwarded": False}
+                              "status": "open", "created_at": now - 7200, "expires_at": now - 3600, "forwarded": False, **box_identity(box)}
            for i in range(8)}
     (box.registry / t.QUESTIONS_FILE).write_text(json.dumps(old))
     assert box.ask().returncode == 0
@@ -425,9 +431,9 @@ def test_press_on_a_question_without_message_id_holds_the_offset_but_later_updat
     now = time.time()
     ledger = {
         "q-00000001": {"nonce": "aaaaaa", "question": "x", "options": ["a", "b"], "message_id": None, "status": "open",
-                       "created_at": now - 10, "expires_at": now + 3600, "forwarded": False},
+                       "created_at": now - 10, "expires_at": now + 3600, "forwarded": False, **box_identity(box)},
         "q-00000002": {"nonce": "bbbbbb", "question": "y", "options": ["a", "b"], "message_id": 77, "status": "open",
-                       "created_at": now - 10, "expires_at": now + 3600, "forwarded": False},
+                       "created_at": now - 10, "expires_at": now + 3600, "forwarded": False, **box_identity(box)},
     }
     (box.registry / t.QUESTIONS_FILE).write_text(json.dumps(ledger))
     api.queue_update(callback_update(int(CHAT), 76, "q-00000001.aaaaaa.0", update_id=9101, callback_id="hold"))
@@ -455,7 +461,7 @@ def test_a_text_reply_received_before_message_id_is_recorded_is_not_lost(box, ap
     now = time.time()
     (box.registry / t.QUESTIONS_FILE).write_text(json.dumps({"q-00000001": {
         "nonce": "aaaaaa", "question": "x", "options": ["a", "b"], "message_id": None, "status": "open",
-        "created_at": now - 5, "expires_at": now + 3600, "forwarded": False}}))
+        "created_at": now - 5, "expires_at": now + 3600, "forwarded": False, **box_identity(box)}}))
     uid = api.queue_update(reply_update(int(CHAT), 77, "先に #281 を見て"))
     res = t.poll_once(box.registry, box.creds(), api_base=api.url, now=now)
     assert res["answered"] == 0 and box.ledger()["q-00000001"]["status"] == "open"
@@ -477,7 +483,7 @@ def test_a_held_text_reply_is_given_up_after_the_null_message_grace(box, api):
     now = time.time()
     (box.registry / t.QUESTIONS_FILE).write_text(json.dumps({"q-00000001": {
         "nonce": "aaaaaa", "question": "x", "options": ["a", "b"], "message_id": None, "status": "open",
-        "created_at": now - 5, "expires_at": now + 3600, "forwarded": False}}))
+        "created_at": now - 5, "expires_at": now + 3600, "forwarded": False, **box_identity(box)}}))
     uid = api.queue_update(reply_update(int(CHAT), 77, "遅れて届いた返信"))
     t.poll_once(box.registry, box.creds(), api_base=api.url, now=now)
     keep = box.ask().stdout.strip()                      # 別の未回答の質問 (poll が走る条件)

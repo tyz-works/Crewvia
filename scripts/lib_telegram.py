@@ -403,11 +403,43 @@ def sanitize_answer_text(text):
     return text
 
 
+def identity_of(creds):
+    """永続する状態に結び付ける、秘密でない識別子 (`bot_id` と `chat_hash`。receiver.json と同じもの)。"""
+    return {'bot_id': creds.bot_id, 'chat_hash': creds.chat_hash}
+
+
+def is_bound(record, identity):
+    """状態 (質問・offset・送信状態) が今の認証情報のものか。**識別子の無い (旧形式の) 状態は「束縛の証拠が無い」= 別物**。
+    `identity is None` は束縛を見ない呼び出し (純粋関数の単体テスト用) で、本番の呼び出しは必ず渡す。"""
+    if identity is None:
+        return True
+    return record.get('bot_id') == identity['bot_id'] and record.get('chat_hash') == identity['chat_hash']
+
+
+def rebind_ledger(ledger, identity, now):
+    """今の認証情報のものでない `open` の質問を `withdrawn` にする (**純粋関数**。→ `(新しい台帳, 取り下げた qid の列)`)。
+
+    別の bot / chat の message_id・callback は今の bot で照合できず、message_id は chat ごとの連番で衝突しうる。
+    ボタンを消す試みはしない (`unbutton: False` — 別の bot では消せない)。閉じた質問 (answered 等) は触らない
+    (answered の転送は台帳の中身だけで済む)。
+    """
+    out, withdrawn = {}, []
+    for qid, entry in ledger.items():
+        if entry['status'] == 'open' and not is_bound(entry, identity):
+            e = dict(entry)
+            e['status'], e['closed_at'], e['unbutton'], e['closed_reason'] = 'withdrawn', now, False, 'identity_changed'
+            out[qid] = e
+            withdrawn.append(qid)
+        else:
+            out[qid] = entry
+    return out, sorted(withdrawn)
+
+
 def _same_id(a, b):
     return isinstance(a, int) and not isinstance(a, bool) and str(a) == str(b)
 
 
-def classify_update(update, ledger, chat_id, now):
+def classify_update(update, ledger, chat_id, now, identity=None):
     """update 1 件をどう扱うか (**純粋関数**。§2-2 の全条件 AND・§2-3 の各ケース)。
 
     * 他 chat・形の合わない callback_data・無関係なメッセージ → `ignore` (転送も返信もしない)
@@ -416,6 +448,8 @@ def classify_update(update, ledger, chat_id, now):
     * 全部通れば `answer`
     """
     chat = str(chat_id)
+    if identity is not None:      # 今の bot / chat のものでない質問は、照合の相手にも保留の理由にもしない
+        ledger = {q: e for q, e in ledger.items() if is_bound(e, identity)}
     cq = update.get('callback_query')
     if isinstance(cq, dict):
         sender = (cq.get('from') or {}).get('id')
@@ -623,7 +657,7 @@ def write_receiver_state(registry_dir, creds, reason, now, *, heartbeat=RECEIVER
     return {'enabled': want['enabled'], 'reason': want['reason'], 'wrote': wrote, 'file_exists': True}
 
 
-def _update_send_state(registry_dir, fn):
+def _update_send_state(registry_dir, fn, identity=None):
     path = _path(registry_dir, SEND_FILE)
     with told_lock(str(path), wait=LEDGER_LOCK_WAIT_SECONDS) as held:
         if not held:
@@ -631,7 +665,11 @@ def _update_send_state(registry_dir, fn):
         state = load_json_store(path, check=telegram_send_problem)
         if is_missing(state) or is_unreadable(state):
             state = {}
+        if identity is not None and state and not is_bound(state, identity):
+            state = {}      # 別の bot / chat のレート・バックオフの記憶は引き継がない (識別子の無い旧形式も同じ)
         new_state, extra = fn(dict(state))
+        if identity is not None:
+            new_state['bot_id'], new_state['chat_hash'] = identity['bot_id'], identity['chat_hash']
         if telegram_send_problem(new_state) is None:
             _write_json_locked(path, new_state)
         return extra
@@ -664,7 +702,8 @@ def send_message(registry_dir, creds, text, *, api_base=API_BASE_DEFAULT, reply_
         state['last_sent_at'] = start + wait
         return state, {'blocked': False, 'wait': wait}
 
-    got = _update_send_state(registry_dir, reserve)
+    identity = identity_of(creds)
+    got = _update_send_state(registry_dir, reserve, identity)
     if got is None:
         return SendResult(False, 'send_state_busy')
     if got['blocked']:
@@ -695,7 +734,7 @@ def send_message(registry_dir, creds, text, *, api_base=API_BASE_DEFAULT, reply_
             warn_flag['v'] = True
         return state, None
 
-    _update_send_state(registry_dir, record)
+    _update_send_state(registry_dir, record, identity)
     if res.ok:
         message_id = res.result.get('message_id') if isinstance(res.result, dict) else None
         if not isinstance(message_id, int) or isinstance(message_id, bool):
@@ -788,8 +827,10 @@ def poll_once(registry_dir, creds, *, api_base=API_BASE_DEFAULT, now=None):
         if not held:
             out['skipped'] = 'busy'
             return out
+        identity = identity_of(creds)
         try:
-            update_questions(registry_dir, lambda ledger: (sweep_questions(ledger, now), None), now=now)
+            out['identity_changed'] = update_questions(
+                registry_dir, lambda ledger: rebind_ledger(sweep_questions(ledger, now), identity, now), now=now)
         except LedgerBusy:
             out['skipped'] = 'ledger_busy'
             return out
@@ -808,12 +849,14 @@ def poll_once(registry_dir, creds, *, api_base=API_BASE_DEFAULT, now=None):
         if is_unreadable(offset_state) and not is_missing(offset_state):
             offset_state = {}
         offset = 0 if is_missing(offset_state) or is_unreadable(offset_state) else offset_state['offset']
+        if offset and not is_bound(offset_state, identity):
+            offset = 0      # 他の bot の (または識別子の無い) offset は捨てて最初から。update_id は bot ごとの列で、使うと新しい bot の update を飛ばす
         res = api_call(creds.token, 'getUpdates',
                        {'offset': offset, 'timeout': 0, 'allowed_updates': ['callback_query', 'message']},
                        api_base=api_base)
         if not res.ok or not isinstance(res.result, list):
             out['error'] = res.error or 'bad_response'
-            _write_json_locked(_path(registry_dir, OFFSET_FILE), {'offset': offset, 'last_poll_at': now})
+            _write_json_locked(_path(registry_dir, OFFSET_FILE), dict(identity, offset=offset, last_poll_at=now))
             return out
         updates = [u for u in res.result if isinstance(u, dict)
                    and isinstance(u.get('update_id'), int) and not isinstance(u.get('update_id'), bool)]
@@ -824,7 +867,7 @@ def poll_once(registry_dir, creds, *, api_base=API_BASE_DEFAULT, now=None):
         def process(ledger_now):
             cur = ledger_now
             for update in updates:
-                d = classify_update(update, cur, creds.chat_id, now)
+                d = classify_update(update, cur, creds.chat_id, now, identity)
                 if d.kind == 'hold':
                     hold_ids.append(update['update_id'])
                 elif d.kind == 'answer':
@@ -848,7 +891,7 @@ def poll_once(registry_dir, creds, *, api_base=API_BASE_DEFAULT, now=None):
             new_offset = max(new_offset, offset)
         else:
             new_offset = offset
-        _write_json_locked(_path(registry_dir, OFFSET_FILE), {'offset': new_offset, 'last_poll_at': now})
+        _write_json_locked(_path(registry_dir, OFFSET_FILE), dict(identity, offset=new_offset, last_poll_at=now))
         for cb_id, text in replies:                  # 台帳に書いた後に返す (待ち表示を止めるだけ。失敗は無視)
             api_call(creds.token, 'answerCallbackQuery', {'callback_query_id': cb_id, 'text': text}, api_base=api_base)
     return out
@@ -933,7 +976,7 @@ def run_cycle(registry_dir, queue_dir, config, carried_reason, forward, *, now=N
     未設定 (`creds is None`) で台帳が無ければ、何も読まず何も書かない。
     """
     now = time.time() if now is None else now
-    summary = {'receiver': None, 'forwarded': 0, 'polled': False, 'poll': None}
+    summary = {'receiver': None, 'forwarded': 0, 'polled': False, 'poll': None, 'identity_changed': []}
     try:
         summary['receiver'] = write_receiver_state(registry_dir, creds, carried_reason, now)
         ledger = read_questions(registry_dir)
@@ -956,6 +999,14 @@ def run_cycle(registry_dir, queue_dir, config, carried_reason, forward, *, now=N
         if creds is None:
             sweep_file(registry_dir, now)
             return summary
+        # 認証情報 (bot / chat) が変わっていたら、前の bot の open な質問を取り下げる (poll の前・サイクルごとに安く)。
+        # 取り下げた qid は呼び出し側 (dispatcher) が Director に 1 回知らせる。
+        identity = identity_of(creds)
+        try:
+            summary['identity_changed'] = update_questions(
+                registry_dir, lambda l: rebind_ledger(l, identity, now), now=now)
+        except (LedgerBusy, LedgerUnreadable):
+            pass
         ledger = read_questions(registry_dir)
         if is_unreadable(ledger) or is_missing(ledger):
             return summary
@@ -1119,8 +1170,10 @@ def cmd_ask(argv):
         return EXIT_CANNOT_SEND
     ttl = (ttl_minutes if ttl_minutes is not None else config['question_ttl_minutes']) * 60
     qid = 'q-' + secrets.token_hex(4)
+    identity = identity_of(creds)
     entry = {'nonce': secrets.token_hex(3), 'question': _shorten(question, QUESTION_MAX), 'options': list(options),
-             'message_id': None, 'status': 'open', 'created_at': now, 'expires_at': now + ttl, 'forwarded': False}
+             'message_id': None, 'status': 'open', 'created_at': now, 'expires_at': now + ttl, 'forwarded': False,
+             'bot_id': identity['bot_id'], 'chat_hash': identity['chat_hash']}
     if slug:
         entry['slug'], entry['task'] = slug, tid
         meta = None
@@ -1131,7 +1184,7 @@ def cmd_ask(argv):
             entry['execution_id'] = meta['current_execution_id']
 
     def register(ledger):
-        ledger = sweep_questions(ledger, now)                      # ⓪ 掃除 (poll と同じ関数)
+        ledger, _ = rebind_ledger(sweep_questions(ledger, now), identity, now)   # ⓪ 掃除 (poll と同じ関数)。別の bot の open は上限に数えない
         if len(open_questions(ledger, now)) >= MAX_OPEN_QUESTIONS:
             return ledger, False
         new = dict(ledger)

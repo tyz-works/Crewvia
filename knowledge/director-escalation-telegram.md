@@ -140,8 +140,8 @@ env で渡していた認証情報は落ち、受信と段階 2 が**黙って**
      1Password のロック・遅延・利用制限が毎サイクルに乗る)。呼び出しは **dispatcher の起動 (= respawn) ごとに 1 回**。
      `ask_user.sh` は呼び出しごとに同じ関数で取り出す (Director の 1 回の質問につき 1 回)。
    - **`file` (代替・B)**: リポジトリ外の権限 0600 のファイル (config `telegram.credentials.file`、例
-     `~/.local/share/crewvia/telegram.env`) を `resolve_credentials()` が読む。**所有者が自分でなく、または権限が
-     0600 でない (group / other に何か付いている) ときは中身を開かず**「停止」(`reason: credential_file_permissions`
+     `~/.local/share/crewvia/telegram.env`) を `resolve_credentials()` が読む。**所有者が自分でなく、または権限に
+     group / other のビットが 1 つでも付いている (= `mode & 0o077 != 0`。0600 に限らず 0400 も通す。t016 P3-2) ときは中身を開かず**「停止」(`reason: credential_file_permissions`
      を receiver.json に。§1-1 の層 1 でそのまま `enabled: false` になる)。シンボリックリンクは辿らない。
      このファイルは Claude (Director / Worker) が読み書きしない (§10 の運用)。
    - **優先順位は 1 つだけ (t014 P2-4)**: 認証情報は **`telegram.credentials.source` が指す 1 つの取り出し方からだけ**
@@ -156,6 +156,12 @@ env で渡していた認証情報は落ち、受信と段階 2 が**黙って**
      — Director のシェルに `_CREWVIA_TG_RESOLVED_*` や `CREWVIA_TG_*` があっても `ask` の解決結果は変わらない)。
      トークンを 1Password 側で差し替えた直後は、dispatcher (起動時の値) と `ask` (新しい値) が別の bot になりうる —
      それは (4) の `receiver_mismatch` が断るので、dispatcher を restart すれば直る (`ask` が断る間は `AskUserQuestion` に戻る)。
+   - **取り出せなかった間の取り直し (t016 P3-1。PR-A で決定・実装済み)**: 取り出しは起動時の 1 回だけなので、起動時に 1Password が
+     ロックされていると、後で解錠しても restart まで `enabled: false` のままになる。そこで **取り出せなかった間 (`reason` が
+     `no_credentials` 以外) だけ**、`dispatcher.sh` の bash ループが **`TG_RESOLVE_RETRY_SECONDS = 600` (10 分) 間隔**で取り直す
+     (`_tg_maybe_retry`。サイクル単位では呼ばない・成功したら以後は呼ばない・`no_credentials` = 未設定は対象外で何も呼ばず何もログに出さない)。
+     解錠は最大 10 分で反映され、1Password の呼び出しは「起動 + 失敗の間の 10 分に 1 回」に収まる。10 分の値は定数で、config・env には出さない
+     (dispatcher だけが使うしきい値)。
 
 本番確認 (PR-A): 「`lib_daemon_watch.py restart` (または watchdog の自動 respawn) の後にも、ボタンが受信される
 (または `ask` が `receiver_disabled` で断られ、Director に通知が 1 通来る)」ことを 1 回観察する。

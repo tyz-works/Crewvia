@@ -131,7 +131,11 @@ env で渡していた認証情報は落ち、受信と段階 2 が**黙って**
    - **`op` (本命・A')**: config には `op://…` の**参照だけ** (`telegram.credentials.token_ref` / `chat_id_ref`。秘密ではない)。
      `dispatcher.sh` が**起動時に 1 回** (bash の外側・`while true` の前。respawn のたびに通る) 1Password CLI で取り出し、
      その bash プロセスの**シェル変数**に持つ (`export` しない。argv にも bash プロセスの env にも出ない)。サイクルごとの python
-     (`poll`・段階 2 の送信・心拍) には `env VAR=… python3 …` でその呼び出しにだけ渡す。python のサイクルごとに
+     (`poll`・段階 2 の送信・心拍) には **bash の前置代入** (`_CREWVIA_TG_RESOLVED_TOKEN="$tg_token" _CREWVIA_TG_RESOLVED_CHAT_ID="$tg_chat" python3 - <<'PYEOF'`
+     のように、**`env` コマンドを付けない**) でその呼び出しにだけ渡す。**`env VAR=… python3` は使わない**: `env` は外部コマンドなので
+     `VAR=…` が env の argv になり、サイクルごと (5 秒) に `ps` / `/proc/<pid>/cmdline` に token が出る (t016)。前置代入なら argv には出ず、
+     子の environ にだけ載る (同一ユーザーのみ・その呼び出しの間だけ)。運搬用の変数名は **`_CREWVIA_TG_RESOLVED_*` で、
+     ユーザーが設定しうる `CREWVIA_TG_*` と分ける** (下の優先順位の「env を読まない」と食い違わないため)。python のサイクルごとに
      1Password を呼ばない (t014 P2-3 — dispatcher の python はサイクルごとに新しいプロセスで、サイクル単位に呼ぶと
      1Password のロック・遅延・利用制限が毎サイクルに乗る)。呼び出しは **dispatcher の起動 (= respawn) ごとに 1 回**。
      `ask_user.sh` は呼び出しごとに同じ関数で取り出す (Director の 1 回の質問につき 1 回)。
@@ -147,7 +151,9 @@ env で渡していた認証情報は落ち、受信と段階 2 が**黙って**
    - **認証情報の解決は `lib_telegram.resolve_credentials(config)` の 1 か所**で、`ask_user.sh`・dispatcher の起動時・
      dispatcher の `poll` / 段階 2 の送信・心拍が同じ関数を通す。dispatcher が起動時に取り出した値を python に渡すのは
      「同じ関数が `source` どおりに取り出した結果の運搬」であって別の解決経路ではない (python 側は渡された値を
-     `resolve_credentials(config, resolved=…)` が受け、`source` と食い違う運搬は受けない)。
+     `resolve_credentials(config, carried=True)` が `_CREWVIA_TG_RESOLVED_*` から受け、`source` と食い違う運搬は受けない。
+     `carried=True` を渡すのは dispatcher が起動する python の動詞 (`poll`・段階 2 の送信・心拍) だけで、**`ask_user.sh` は運搬用の変数を読まない**
+     — Director のシェルに `_CREWVIA_TG_RESOLVED_*` や `CREWVIA_TG_*` があっても `ask` の解決結果は変わらない)。
      トークンを 1Password 側で差し替えた直後は、dispatcher (起動時の値) と `ask` (新しい値) が別の bot になりうる —
      それは (4) の `receiver_mismatch` が断るので、dispatcher を restart すれば直る (`ask` が断る間は `AskUserQuestion` に戻る)。
 
@@ -672,7 +678,7 @@ task: t017 (needs_director) — 止まって 10 分
   1 行 (取り出し方は `op` / `file` のどちらか 1 つ・env は読まない・詳細は本文書 §1-1)。不変条件 7 に新しい台帳 (5 つのうち 4 つ)。
   (将来 §10 の選択を変えて env を使う案にしたときは、その時点で表に足す。)
 - `scripts/dispatcher.sh`: **起動時 (ループの前) に認証情報を 1 回取り出す** (`lib_telegram.py resolve` を呼び、結果をシェル変数に。
-  `export` しない・python には `env VAR=… ` でその呼び出しにだけ渡す。§1-1)。取り出せなければ `reason` を心拍に書いて `enabled: false`。
+  `export` しない・python には bash の前置代入 (`env` を付けない) で `_CREWVIA_TG_RESOLVED_*` をその呼び出しにだけ渡す。§1-1)。取り出せなければ `reason` を心拍に書いて `enabled: false`。
   `lib_daemon_watch.py` の `_SPAWN_ENV_VARS` には**足さない** (コマンド文に秘密を載せない。§1-1)。
 - `.gitignore`: `registry/daemons/telegram-*.json` と `telegram-poll.lock`。
 - テスト (**偽の Bot API サーバー** = `http.server` をテスト内で立て、**lib の引数 `api_base`** で向ける。
@@ -687,7 +693,8 @@ task: t017 (needs_director) — 止まって 10 分
   **認証情報が無い dispatcher で `enabled:false` と Director への通知 1 通 (同じ状態で 2 通目が出ない)**・
   **心拍の間隔 (定数 30 秒) と stale (90 秒) の境界 (「間隔 + 1 サイクル」で stale にならない・「90 秒ちょうど / +1 秒」・`poll_interval` を変えても動かない。t014 P2-1)**・
   **`receiver_mismatch` (`bot_id` 違い・`chat_hash` 違いで `ask` が exit 4。ファイルに token・chat_id が出ない)**・
-  **`resolve_credentials()` の優先順位 (`source=op` のとき `file` と env の `CREWVIA_TG_*` を読まない・逆も。env だけ設定された Director のシェルで `no_credentials` になる)**・
+  **`resolve_credentials()` の優先順位 (`source=op` のとき `file` と env の `CREWVIA_TG_*` を読まない・逆も。env だけ設定された Director のシェルで `no_credentials` になる。`ask` は `_CREWVIA_TG_RESOLVED_*` が環境にあっても読まない・`carried=True` の動詞だけが読む)**・
+  **dispatcher の 1 サイクルの間、全プロセスの `/proc/*/cmdline` に偽 token が出ない (サイクルを回しながら `/proc` を繰り返し走査し、偽 token と偽 chat_id の文字列を探す。陽性対照として `env VAR=<偽 token> sleep` の形を 1 回走らせ、検出器が拾うことを先に確かめる。t016)**・
   **`file` の権限 (0600 以外・所有者違い・シンボリックリンクで中身を開かず `credential_file_permissions`)**・
   **`op` の呼び出し回数 (偽の `op` スクリプトで dispatcher の複数サイクルを回して 1 回だけ。python のサイクルごとに呼ばない。t014 P2-3)**・
   `op` が PATH に無い / 失敗 / 空 → `credential_command_failed` (値・参照・stderr の中身が receiver.json とログに出ない)。
@@ -739,7 +746,7 @@ env の `CREWVIA_TG_*` は読まない (§1-1 に優先順位の全体)。**ど�
 
 | 案 | 仕組み | 得 | 失 |
 |---|---|---|---|
-| **A' (本命): dispatcher の起動時に 1 回 1Password CLI で取り出す** | config には**参照だけ** (`op://…`)。`dispatcher.sh` が bash の外側・ループの前 (respawn のたびに通る) で 1 回取り出し、シェル変数に持つ (`export` しない)。python のサイクルには `env VAR=…` でその呼び出しにだけ渡す。`ask_user.sh` は呼び出しごとに同じ関数で取り出す | respawn に強い (起動のたびに取り直す)。ユーザーのルール (秘密は 1Password 経由) に合う。コマンド文・argv・ファイルに秘密が出ない (python の子プロセスの env に呼び出しの間だけ載る — 同一ユーザーのみ・短時間)。1Password の呼び出しは **dispatcher の起動ごとに 1 回 + 質問ごとに 1 回**で、サイクル単位に乗らない。トークンの入れ替えは 1Password 側 + dispatcher の restart | `op` が dispatcher の環境 (herdr 配下のヘッドレスなペイン) で通る必要がある (ロック中・認証プロンプト・PATH に `op` 無し → `credential_command_failed`)。**このマシンの非対話シェルでは `command -v opx` が見つからなかった (t014)** ので、通るかは**未確認で一段強く疑わしい** → 本番確認 (§9 (5)) でユーザー立ち会いのもとで確かめる。dispatcher の bash プロセスの存続中、値がそのプロセスのメモリに残る (同一ユーザーの `/proc/<pid>/environ` には出ない — `export` しないため) |
+| **A' (本命): dispatcher の起動時に 1 回 1Password CLI で取り出す** | config には**参照だけ** (`op://…`)。`dispatcher.sh` が bash の外側・ループの前 (respawn のたびに通る) で 1 回取り出し、シェル変数に持つ (`export` しない)。python のサイクルには bash の前置代入 (`env` を付けない) でその呼び出しにだけ渡す。`ask_user.sh` は呼び出しごとに同じ関数で取り出す | respawn に強い (起動のたびに取り直す)。ユーザーのルール (秘密は 1Password 経由) に合う。コマンド文・argv・ファイルに秘密が出ない (python の子プロセスの env に呼び出しの間だけ載る — 同一ユーザーのみ・短時間)。1Password の呼び出しは **dispatcher の起動ごとに 1 回 + 質問ごとに 1 回**で、サイクル単位に乗らない。トークンの入れ替えは 1Password 側 + dispatcher の restart | `op` が dispatcher の環境 (herdr 配下のヘッドレスなペイン) で通る必要がある (ロック中・認証プロンプト・PATH に `op` 無し → `credential_command_failed`)。**このマシンの非対話シェルでは `command -v opx` が見つからなかった (t014)** ので、通るかは**未確認で一段強く疑わしい** → 本番確認 (§9 (5)) でユーザー立ち会いのもとで確かめる。dispatcher の bash プロセスの存続中、値がそのプロセスのメモリに残る (同一ユーザーの `/proc/<pid>/environ` には出ない — `export` しないため) |
 | **B (代替): リポジトリ外の 0600 ファイル** | `telegram.credentials.file` (例 `~/.local/share/crewvia/telegram.env`) を `resolve_credentials()` が読む。所有者が自分でなく / 権限が 0600 でなければ**中身を開かず**停止 (`credential_file_permissions`) | respawn に強い。外部コマンド・1Password のロックに依存しない (デーモンから確実に使える) | **平文の秘密がディスクに残る** (「秘密は opx / 1Password 経由」のルールの**例外**。下の理由)。WSL では権限が Windows 側から見えうる。ローテーションが手作業 |
 | (C: 採らない) `_SPAWN_ENV_VARS` に足して respawn のコマンド文に載せる | allowlist に 1 行 | 実装が最小 | **コマンド文に秘密が載る** (`ps`・pane の scrollback・mux のログ。`_SPAWN_ENV_VARS` の注記が避けている事故そのもの) |
 | (D: 届け方を設計しない) | respawn で落ちたら `enabled: false` + Director に通知。ユーザーが手で再起動 | 秘密の扱いが増えない | respawn のたびに受信と段階 2 が止まる (watchdog の自動 respawn は設計上起きる)。長時間の無人運転で効かない |

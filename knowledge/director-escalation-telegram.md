@@ -294,7 +294,7 @@ open ──message_id が null のまま 5 分──▶ withdrawn  (§2-3b: ask 
 
 ### 2-4. offset
 
-- `telegram-offset.json` に `{"offset": N, "last_poll_at": …}` (**書き手は `poll` だけ**。§1-3 の `telegram-poll.lock` で
+- `telegram-offset.json` に `{"offset": N, "last_poll_at": …, "bot_id": …, "chat_hash": …}` (識別子は §2-5b。別の bot のものは使わず捨てる) (**書き手は `poll` だけ**。§1-3 の `telegram-poll.lock` で
   2 つの `poll` が重ならない。`ask_user.sh` や段階 2 の送信は触らない — t002 P2-3)。
   `getUpdates(offset=N, timeout=0, allowed_updates=["callback_query","message"])`。
 - **offset を進めるのは、その update を処理し終えた (台帳に答えを書いた / 拒否して返信した / 無関係と確定した) 後**。
@@ -316,6 +316,44 @@ open ──message_id が null のまま 5 分──▶ withdrawn  (§2-3b: ask 
 offset とレート系を別ファイルにしたのはそのため (offset は 1 者、レートは 2 者)。
 5 つとも `notified-state.json` と同じ置き場・同じ入口 (`lib_daemon_state`)・同じ「消してよい」の位置づけ。
 CLAUDE.md の不変条件 7 の列挙に足す (PR-A で 4 つ、PR-B で `escalation-state.json`)。
+
+### 2-5b. 認証情報が変わったとき・旧形式のとき — 永続する状態ファイルの全表 (PR #281 の Codex P1・2 巡目)
+
+**P1 の欠陥**: 質問台帳と offset が「どの bot・どの chat のものか」を持たなかった。認証情報を切り替える (source の `op` ↔ `file`・1Password で
+トークンを差し替える・別の bot / chat にする) と、(1) **前の bot の offset を新しい bot の `getUpdates` に使う** (`update_id` の列は bot ごと。
+新しい bot の update を飛ばす / 古いものを読み直す)、(2) **前の bot で出した open な質問が、新しい bot の返信・ボタンと照合されうる**
+(`message_id` は chat ごとの連番で衝突する → 別の質問への答えとして Director に転送される)。**同じ族** = 永続する状態が「誰のものか」を持たず、
+今の認証情報のものと取り違える。そこで永続する状態ファイルを**全部**挙げ、2 つの場合の扱いを 1 行ずつ決めた。
+
+**識別子**: `bot_id` (token の `:` の前の数字) と `chat_hash` (chat_id の sha256 の先頭 12 hex) — **秘密でない**。`telegram-receiver.json` が既に持つものと
+同じ値 (`Credentials.bot_id` / `.chat_hash`)。token・chat_id そのものは書かない。`lib_daemon_state` の検証は「両方あるか両方無いか」「bot_id が非負の整数」
+「chat_hash が 12 hex」(違えばファイルが読めない扱い = 不変条件 1 のとおり黙って潰さない)。
+
+**「束縛されている」の定義 (`lib_telegram.is_bound`)**: 状態の `bot_id` と `chat_hash` が**今の解決結果と両方一致**。識別子の無い (旧形式の) 状態は
+**束縛の証拠が無い = 別物**として扱う (「無いから同じ」と読まない — 識別子導入前に別の bot で書かれた可能性を排除できない)。
+
+| 状態ファイル | 書き手 | 認証情報が変わったとき (識別子が不一致) | 識別子が無い旧形式のとき (この PR の中で書かれたもの) | 通知 |
+|---|---|---|---|---|
+| `telegram-questions.json` の **open** な質問 | `ask` / `poll` / `run_cycle` | **`withdrawn`** (`closed_reason: identity_changed`・`unbutton: false`)。**ボタンを消す試みはしない** (別の bot の message_id では消せない)。照合の相手にも保留の理由にもしない (`classify_update` に identity を渡し、束縛されていない質問を台帳から除く)。`ask` の上限 (8 件) にも数えない | 同じ (別の bot のものかもしれない) → `withdrawn` | **Director に 1 回** (取り下げた qid の列。dispatcher が `notify_state_once`)。押された古いボタンは「不明な質問」で断られる (転送されない) |
+| 同 **answered / expired / withdrawn** の質問 | 同 | **触らない** (閉じた質問は照合の相手にならない。`answered` で `forwarded=false` のものは台帳の中身だけで転送できるので、切り替えの前に受けた答えを失わない) | 触らない | 無し |
+| `telegram-offset.json` | `poll` のみ | **捨てて最初から** (`offset=0`)。新しい bot の `getUpdates` に古い bot の `update_id` を使わない。以後は新しい identity を書く | 同じ (捨てる) | 無し (台帳が先に取り下げられているので、読み直した古い update は不明として断られるだけ) |
+| `telegram-send.json` (レート・バックオフ) | `ask` と dispatcher の送信 (ロックの下) | **空から** (別の bot のバックオフ・429 の `retry_after` で新しい bot の送信を止めない)。以後は新しい identity を書く | 同じ (空から) | 無し |
+| `telegram-receiver.json` | dispatcher のみ | 既存の `receiver_verdict` が `receiver_mismatch` で `ask` を断る (P1-2 / §1-1)。心拍が次のサイクルで新しい identity を書き直す | 識別子欠け = `receiver_unknown` で断る (既存) | 既存 (§1-1) |
+| `escalation-state.json` (段階上げ・PR-B) | dispatcher のみ | 質問と結び付かない (時計だけ) ので束縛しない | 同左 | — |
+
+決めたこと:
+
+- **offset は「最初から」(`0`) にした。「getUpdates の最新に合わせる」は選ばない**。新しい bot が未読の update を持っているなら、それは**新しい bot 宛の
+  本物の答え**かもしれず、最新に飛ぶと黙って失う (P1 が直した「答えが黙って失われる」と同じ型)。最初から読んでも安全なのは、古い質問は上のとおり取り下げ済みで、
+  新しい bot の update は台帳 (今の identity の質問だけ) と照合され、照合できないものは reject / ignore で捨てられるため。コストは Telegram が保持する
+  未読 update (最大 24 時間・100 件/回) の読み直しだけ。
+- **取り下げは poll の前・サイクルごとに安く行う** (`run_cycle` が `creds` を得た直後。`poll_once` の先頭でも同じ関数を呼ぶ — `ask` と `poll` が別のプロセスで
+  動くので、どちらが先でも束縛されない質問が照合に使われない)。2 回目以降は取り下げる対象が無い (純粋関数・冪等) ので、通知は 1 回になる。
+- **既知の限界**: 取り下げた qid は `run_cycle` の `summary['identity_changed']` でその 1 サイクルだけ出る。Director が不在のサイクルに当たると、
+  `notify_state_once` は「記録せず見送る」が、次のサイクルには列が空なので**届かない**。取り下げ自体は台帳 (`closed_reason`) に残るので、見落としても答えを取り違えない
+  (転送されないだけ)。通知を確実にするなら台帳側 (`closed_reason: identity_changed` かつ未通知) から導く案があるが、この PR では足さない (backlog)。
+- **env の停止スイッチは付けない** (不変条件 5)。束縛の判定は `lib_telegram.is_bound` の 1 か所で、`ask` / `poll` / 送信が同じ答えを出す。
+- 質問台帳・offset を**消してよい**(不変条件 7) ことは変わらない。識別子つきになっても、消せば「古いボタンが不明になる」だけ。
 
 ### 2-6. 受け取らないもの
 

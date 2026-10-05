@@ -28,6 +28,7 @@ SH = "scripts/dispatcher.sh"
 PURE = "tests/test_telegram_pure.py"
 FAKE = "tests/test_telegram_fake_bot_api.py"
 GLUE = "tests/test_telegram_dispatcher_glue.py"
+IDB = "tests/test_telegram_identity_binding.py"
 
 # (名前, 壊すファイル, 置換元 (ちょうど 1 回), 置換先, 実行するテストファイル, 赤になるべきテスト名の部分一致)
 MUTANTS = [
@@ -88,6 +89,22 @@ MUTANTS = [
     ("普通のメッセージも保留する (offset が止まり続ける)", LIB, "        if reply_to is None or not isinstance(msg.get('text'), str):\n            return Decision('ignore')",
      "        if reply_to is None and any(e.get('message_id') is None for e in ledger.values()):\n            return Decision('hold')\n        if reply_to is None or not isinstance(msg.get('text'), str):\n            return Decision('ignore')",
      PURE, "test_updates_that_can_never_be_an_answer_are_ignored_whatever_the_ledger_holds"),
+    ("束縛: 他の bot の offset を捨てない (P1 2 巡目)", LIB, "        if offset and not is_bound(offset_state, identity):\n            offset = 0",
+     "        if False:\n            offset = 0", IDB, "test_the_old_bots_offset_is_not_used_for_the_new_bot"),
+    ("束縛: 他の bot の open な質問を取り下げない", LIB, "        if entry['status'] == 'open' and not is_bound(entry, identity):",
+     "        if False:", IDB, "test_a_reply_in_the_new_chat_is_not_matched_to_the_old_bots_question"),
+    ("束縛: chat_hash を見ない (別 chat の同じ bot)", LIB, "    return record.get('bot_id') == identity['bot_id'] and record.get('chat_hash') == identity['chat_hash']",
+     "    return record.get('bot_id') == identity['bot_id']", IDB, "test_a_same_bot_but_different_chat_is_also_a_different_identity"),
+    ("束縛: 識別子の無い旧形式を今のものとみなす", LIB, "    return record.get('bot_id') == identity['bot_id'] and record.get('chat_hash') == identity['chat_hash']",
+     "    return record.get('bot_id', identity['bot_id']) == identity['bot_id'] and record.get('chat_hash', identity['chat_hash']) == identity['chat_hash']",
+     IDB, "test_a_question_without_an_identity_is_treated_as_someone_elses"),
+    ("束縛: 閉じた質問まで取り下げる", LIB, "        if entry['status'] == 'open' and not is_bound(entry, identity):",
+     "        if not is_bound(entry, identity):", IDB, "test_closed_questions_of_the_old_bot_are_left_alone"),
+    ("束縛: 別の bot の send 状態 (バックオフ) を引き継ぐ", LIB, "        if identity is not None and state and not is_bound(state, identity):\n            state = {}",
+     "        pass", IDB, "test_send_state_of_another_bot_is_not_inherited"),
+    ("束縛: 取り下げを毎サイクル報告する (通知が連投になる)", LIB, "        if entry['status'] == 'open' and not is_bound(entry, identity):\n            e = dict(entry)",
+     "        if not is_bound(entry, identity) and entry['status'] in ('open', 'withdrawn'):\n            e = dict(entry)",
+     IDB, "test_rebind_is_pure_and_idempotent"),
     ("dispatcher: env コマンドで token を渡す", SH, '  _CREWVIA_TG_RESOLVED_TOKEN="$tg_token" _CREWVIA_TG_RESOLVED_CHAT_ID="$tg_chat" \\\n  _CREWVIA_TG_RESOLVE_REASON="$tg_reason" \\\n  python3 -',
      '  env _CREWVIA_TG_RESOLVED_TOKEN="$tg_token" _CREWVIA_TG_RESOLVED_CHAT_ID="$tg_chat" \\\n  _CREWVIA_TG_RESOLVE_REASON="$tg_reason" \\\n  python3 -',
      GLUE, "test_the_dispatch_call_passes_credentials_by_prefix_assignment_not_env"),

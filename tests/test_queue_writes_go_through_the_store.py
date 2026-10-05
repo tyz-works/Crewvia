@@ -112,6 +112,7 @@ ALLOWED_WRITES: dict[tuple[str, str], tuple[int, str]] = {
     ('dispatcher.sh', 'log'): (1, R_LOG),
     ('dispatcher.sh', '<module>'): (1, R_DIR + " (ログ dir)"),
     ('dispatcher.sh', '<bash>'): (5, R_LOG + "。dispatcher.log への追記と registry/logs dir の作成。+1 = Telegram の認証情報を取り出す `lib_telegram.py resolve` の stderr を捨てる (`2>/dev/null`。secret を端末・ログに出さない向き)"),
+    ('lib_telegram.py', 'api_call'): (1, "ファイルの書き込みではない: `urllib.request.build_opener().open(req)` の HTTP 呼び出し (検出器が `.open(` の形を拾う)。Telegram Bot API への POST で、queue / registry には何も書かない"),
     ('lib_telegram.py', '_poll_lock'): (2, R_LOCK + "。registry/daemons/telegram-poll.lock (poll の専用ロック。非ブロッキング flock で 2 つの poll が重ならない = offset の書き手は 1 者。中身は読まない) + その dir の作成"),
     ('verifier-dispatcher.sh', 'record_notify'): (1, R_DAEMON_JSON + "。通知スロットルの cache (/tmp)"),
     ('verifier-dispatcher.sh', 'log'): (1, R_LOG),

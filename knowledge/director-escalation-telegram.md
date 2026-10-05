@@ -20,7 +20,8 @@ mission `20261004-watchdog-hard-idle-unknown` で t017 が `needs_director` の�
   /remote-control (セッションのリンクを本文に付ける)。
 - Worker のツール実行の承認 (`hooks/pre-tool-use.sh` / Taskvia) は**対象外**。
 - **bot は crewvia 専用**。ai-editorial と共用すると両者の `getUpdates` が互いの更新を奪う
-  (offset を進めた側だけが受け取る)。env は `CREWVIA_TG_BOT_TOKEN` / `CREWVIA_TG_CHAT_ID`。
+  (offset を進めた側だけが受け取る)。認証情報 (bot token・chat_id) は **config で選んだ 1 つの取り出し方**
+  (1Password か、リポジトリ外の 0600 ファイル。§1-1・§10) からだけ解決する。`CREWVIA_TG_*` の env は**読まない**。
 - 秘密を読まない・書かない。`.env` を開かない。テストは偽の Bot API サーバーで。
 
 ### 参考実装 (`~/workspace/ai-editorial/scripts/tg_send.sh` / `tg_poll.sh`) から**写さないもの**
@@ -75,7 +76,7 @@ CYCLE ENTRY POINT)。ネットワーク I/O を足すので次を満たす:
    `CREWVIA_TASK_GRAPH=0` の「1 バイトも書かない」と同じ扱い)。**例外は 1 つだけ**: 受信側の状態
    (§1-1 の `telegram-receiver.json`) は、**既にファイルがあるとき**に限り `enabled: false` へ書き換える
    (「有効だったのに無効になった」を送信側に見せるため。**初めから未設定なら何も作らない**)。
-   - これは**共有規則の env 停止スイッチではない** (不変条件 5 の対象外) — ただし「設定済みか」の答えを
+   - これは**共有規則の env 停止スイッチではない** (不変条件 5 の対象外。認証情報の env も読まない — §1-1) — ただし「設定済みか」の答えを
      送信側 (`ask_user.sh`) と受信側 (dispatcher) が**別々に出す**と不変条件 5 と同じ型の事故になる。
      それを §1-1 で塞ぐ (設計レビュー t002 の P1-2)。
    - **受信を起動する条件**: 認証情報が解決でき、かつ**未回答の質問がある** = 「`open` かつ期限内」
@@ -91,33 +92,64 @@ CYCLE ENTRY POINT)。ネットワーク I/O を足すので次を満たす:
 **問題**: `lib_daemon_watch.spawn_command` は env を allowlist (`_SPAWN_ENV_VARS`) だけ運び、秘密
 (`TASKVIA_TOKEN` 等) は意図的に運ばない (`scripts/lib_daemon_watch.py` の `_SPAWN_ENV_VARS` の注記: コマンド文に
 秘密を書くと `ps`・pane の scrollback・mux のログに出る)。watchdog が dispatcher を respawn すると
-`CREWVIA_TG_*` は落ち、受信と段階 2 が**黙って**止まる。一方 Director のシェルには token があり、
+env で渡していた認証情報は落ち、受信と段階 2 が**黙って**止まる。一方 Director のシェルには token があり、
 `ask_user.sh ask` は送れてしまう (押されたボタンを誰も受けない)。memory: `daemon-secret-env-lost-on-respawn`。
 
 **直し方は 2 層** (どちらも要る):
 
-1. **割れを起こさない仕組み (最低限・必須)**: dispatcher が毎サイクル (変化したとき + 30 秒ごとの心拍) に
+1. **割れを起こさない仕組み (最低限・必須)**: dispatcher が「変化したとき + `RECEIVER_HEARTBEAT_SECONDS` (定数 30 秒) ごと」に
    `registry/daemons/telegram-receiver.json` を書く。**書き手は dispatcher だけ**。
    ```json
-   {"enabled": true,  "checked_at": 1759650000.0, "reason": "ok"}
+   {"enabled": true,  "checked_at": 1759650000.0, "reason": "ok", "bot_id": 123456789, "chat_hash": "3fa9c2…"}
    {"enabled": false, "checked_at": 1759650030.0, "reason": "no_credentials"}
    ```
-   `reason` は固定コード (`ok` / `no_credentials` / `credential_command_failed` …)。**token・chat_id・参照の文字列は書かない**。
-   - `ask_user.sh ask` は送る前に必ずこれを読み、**`enabled == true` かつ `checked_at` が 3 × `poll_interval` 以内**
-     でなければ**断る** (exit 4。stderr に固定コード `receiver_disabled` / `receiver_stale` / `receiver_unknown`
-     (ファイルが無い) を出す)。これは初版の「dispatcher の生存確認」を置き換える — 心拍が新しければ
+   `reason` は固定コード (`ok` / `no_credentials` / `credential_command_failed` / `credential_file_permissions` …)。
+   **token・chat_id・参照の文字列・ファイルのパスは書かない**。書くのは**秘密でない識別子だけ**:
+   `bot_id` (bot の数値 id = token の `:` より前の部分) と `chat_hash` (chat_id の SHA-256 の先頭 12 桁。
+   chat_id そのものは書かない)。`enabled: false` のときは両方とも書かない。
+   - **心拍の間隔と stale のしきい値は同じ値にしない (t014 P2-1)**: 心拍の間隔は `poll_interval` と**独立の定数**
+     `RECEIVER_HEARTBEAT_SECONDS = 30`、stale のしきい値は **`3 × RECEIVER_HEARTBEAT_SECONDS` = 90 秒** (心拍から導く。
+     `poll_interval` を変えても動かない)。実際の書き込み間隔は 30 秒 + サイクル 1 回 (5 秒 + 処理時間) 程度なので、
+     正常運転で古さが 90 秒に届くことはない。テストの境界: 「心拍の間隔ちょうど + 1 サイクル」は stale にならない・
+     「しきい値ちょうど」と「+ 1 秒」で stale になる・`poll_interval` を 5 / 60 秒に変えても結果が変わらない。
+   - `ask_user.sh ask` は送る前に必ずこれを読み、次の**全部**を満たさなければ**断る** (exit 4。stderr に固定コード):
+     (1) `enabled == true` (`receiver_disabled`)、(2) `checked_at` が上の stale しきい値以内 (`receiver_stale`)、
+     (3) ファイルがある (`receiver_unknown`)、(4) **`ask` 自身が `resolve_credentials()` で解決した bot の `bot_id` と
+     `chat_hash` が、ファイルの値と一致する (`receiver_mismatch`。t014 P2-4)**。(4) は「送る側と受ける側が
+     別の bot / 別の chat に解決した」を捕まえる (優先順位を 1 つに決める (下の 2) 以外の保険)。比べるのは
+     秘密でない識別子だけで、token は比べない・書かない。これは初版の「dispatcher の生存確認」を置き換える — 心拍が新しければ
      生きていて、かつ受信できる状態だと言える。`ask` は断るので、押されても誰も受けないボタンは出ない。
      Director は `AskUserQuestion` に戻る。
    - **割れを Director に 1 回知らせる**: dispatcher が「前回 `enabled: true` で今回 `enabled: false`」を観測したとき、
      既存の `notify_state_once` で Director に 1 通 (key `telegram_receiver_disabled`、fp = `reason`):
-     「Telegram 受信が無効になりました (理由コード)。dispatcher が env を失った可能性 (respawn)。`lib_daemon_watch.py restart` を
-     認証情報つきで行うか、§10 の選択肢を設定してください」。状態を離れた (`enabled: true` に戻った) ら台帳から捨てる。
+     「Telegram 受信が無効になりました (理由コード)。dispatcher が起動時に認証情報を取り出せなかった可能性 (1Password のロック・`op` が PATH に無い・ファイルの権限)。
+     原因を直して `lib_daemon_watch.py restart` を行うか、`telegram.credentials.source` を見直してください」。状態を離れた (`enabled: true` に戻った) ら台帳から捨てる。
    - 受信側の状態の書き方は他の台帳と同じ入口 (`lib_daemon_state`・`telegram_receiver_problem()`・原子的置換)。
      壊れていたら `ask` は断る側に倒す (**観測できなかったことを「有効」に倒さない**)。
-2. **respawn 後も認証情報を届ける方法**: コマンド文・env allowlist には秘密を載せない (**採らない**)。
-   選択肢の比較は **§10 (ユーザー判断)**。推奨は「`poll` / `ask` のたびに 1Password CLI (`opx`) で取り出す」。
-   どの方式でも、**認証情報の解決は `lib_telegram.resolve_credentials()` の 1 か所**で、`ask_user.sh` と
-   dispatcher の `poll` / 段階 2 の送信が同じ関数を通す (割れる余地を作らない)。
+2. **respawn 後も認証情報を届ける方法 (ユーザー決定 2026-10-05。§10)**: コマンド文・env allowlist (`_SPAWN_ENV_VARS`) には
+   秘密を載せない。**取り出し方は config で 1 つだけ選ぶ**: `telegram.credentials.source: op | file`。
+   - **`op` (本命・A')**: config には `op://…` の**参照だけ** (`telegram.credentials.token_ref` / `chat_id_ref`。秘密ではない)。
+     `dispatcher.sh` が**起動時に 1 回** (bash の外側・`while true` の前。respawn のたびに通る) 1Password CLI で取り出し、
+     その bash プロセスの**シェル変数**に持つ (`export` しない。argv にも bash プロセスの env にも出ない)。サイクルごとの python
+     (`poll`・段階 2 の送信・心拍) には `env VAR=… python3 …` でその呼び出しにだけ渡す。python のサイクルごとに
+     1Password を呼ばない (t014 P2-3 — dispatcher の python はサイクルごとに新しいプロセスで、サイクル単位に呼ぶと
+     1Password のロック・遅延・利用制限が毎サイクルに乗る)。呼び出しは **dispatcher の起動 (= respawn) ごとに 1 回**。
+     `ask_user.sh` は呼び出しごとに同じ関数で取り出す (Director の 1 回の質問につき 1 回)。
+   - **`file` (代替・B)**: リポジトリ外の権限 0600 のファイル (config `telegram.credentials.file`、例
+     `~/.local/share/crewvia/telegram.env`) を `resolve_credentials()` が読む。**所有者が自分でなく、または権限が
+     0600 でない (group / other に何か付いている) ときは中身を開かず**「停止」(`reason: credential_file_permissions`
+     を receiver.json に。§1-1 の層 1 でそのまま `enabled: false` になる)。シンボリックリンクは辿らない。
+     このファイルは Claude (Director / Worker) が読み書きしない (§10 の運用)。
+   - **優先順位は 1 つだけ (t014 P2-4)**: 認証情報は **`telegram.credentials.source` が指す 1 つの取り出し方からだけ**
+     解決する。**`CREWVIA_TG_BOT_TOKEN` / `CREWVIA_TG_CHAT_ID` 等の env は読まない** (Director のシェルに env があって
+     dispatcher には無い、で違う bot に解決する割れの根を作らない)。`source` が未設定・不正なら「未設定」(`no_credentials`)。
+     `op` / `file` の**両方が設定されていても `source` が選んだ方だけ**を使う (もう一方は読まない・失敗しても無関係)。
+   - **認証情報の解決は `lib_telegram.resolve_credentials(config)` の 1 か所**で、`ask_user.sh`・dispatcher の起動時・
+     dispatcher の `poll` / 段階 2 の送信・心拍が同じ関数を通す。dispatcher が起動時に取り出した値を python に渡すのは
+     「同じ関数が `source` どおりに取り出した結果の運搬」であって別の解決経路ではない (python 側は渡された値を
+     `resolve_credentials(config, resolved=…)` が受け、`source` と食い違う運搬は受けない)。
+     トークンを 1Password 側で差し替えた直後は、dispatcher (起動時の値) と `ask` (新しい値) が別の bot になりうる —
+     それは (4) の `receiver_mismatch` が断るので、dispatcher を restart すれば直る (`ask` が断る間は `AskUserQuestion` に戻る)。
 
 本番確認 (PR-A): 「`lib_daemon_watch.py restart` (または watchdog の自動 respawn) の後にも、ボタンが受信される
 (または `ask` が `receiver_disabled` で断られ、Director に通知が 1 通来る)」ことを 1 回観察する。
@@ -125,7 +157,7 @@ CYCLE ENTRY POINT)。ネットワーク I/O を足すので次を満たす:
 ### 副次: getUpdates の消費者は dispatcher の 1 者だけ
 
 `getUpdates` は 1 つの bot に対して**消費者が 1 者**でなければならない (複数だと更新を奪い合う)。
-`ask_user.sh` (Director 側) は**送信だけ**で、受信はしない。`CREWVIA_TG_*` が指す bot を
+`ask_user.sh` (Director 側) は**送信だけ**で、受信はしない。config の `telegram.credentials` が指す bot を
 他のツールが `getUpdates` で読んではいけない — これを `scripts/CLAUDE.md` と README に 1 行足す (PR-A)。
 
 ## 2. 質問と答えの対応づけ
@@ -166,7 +198,7 @@ CYCLE ENTRY POINT)。ネットワーク I/O を足すので次を満たす:
 
 callback_query (ボタン) の場合:
 
-1. `callback_query.from.id` が `CREWVIA_TG_CHAT_ID` と一致 (個人チャットでは user id == chat id)。
+1. `callback_query.from.id` が解決した `chat_id` (§1-1) と一致 (個人チャットでは user id == chat id)。
    **`message.chat.id` も一致**を要求する (グループに bot が入った場合、他人の押下を排除)。
 2. `callback_data` が `<qid>.<nonce>.<index>` の形に厳密に一致 (正規表現で全体マッチ。余りは拒否)。
 3. `qid` が台帳にあり、**`nonce` が一致**し、**`callback_query.message.message_id` が記録の `message_id` と一致**
@@ -176,7 +208,7 @@ callback_query (ボタン) の場合:
 
 テキスト返信の場合 (「込み入った指示は返信文で」):
 
-1. `message.chat.id` / `from.id` が `CREWVIA_TG_CHAT_ID` と一致。
+1. `message.chat.id` / `from.id` が解決した `chat_id` と一致。
 2. **`message.reply_to_message.message_id` が `open` な質問の `message_id` と一致**する場合だけ受け付ける。
    返信でない雑多なメッセージは**質問に結びつけない = 転送しない**。単独のメッセージを「最新の質問への答え」と
    推測すると、別の話題を判断として転送してしまう。
@@ -198,7 +230,7 @@ open ──message_id が null のまま 5 分──▶ withdrawn  (§2-3b: ask 
 | **Director が既に別の手段で答えを得た後の押下** | Director は答えを得た時点で `ask_user.sh cancel --q <id> --by screen` を呼ぶ (§4)。`cancel` が `withdrawn` にして**ボタンも消す** (best effort)。消える前の競合で押された場合は転送されず、「画面で回答済み」と返す。**Director が cancel を忘れた場合**は転送される — その場合も Director の規則 (§3) で、実行の直前に状態を確かめ直すので、既に済んだ操作を二重に実行しない |
 | 質問に `--task` が付いていて、その task が既に判断待ちを離れていた | 転送はする (ユーザーは押した)。行に `task_state=<status>` を添える (§3)。Director が状態を見て判断する |
 | 転送 (mux send) に失敗した・Director 不在 | `answered` / `forwarded=false` のまま。**`answerCallbackQuery` は先に返す** (ボタンの待ち表示を止める)。次の受信サイクルで `forwarded=false` の answered を再送する。期限は質問の `expires_at` ではなく**答えが入った時刻から 24 時間**で諦め、Telegram に「Director に届きませんでした」と 1 回返す |
-| 質問の `message_id` がまだ `null` (ask の ③ の前) の `open` を指す押下 | **転送せず、offset を進めない** (次のサイクルで同じ update をもう一度受ける)。窓は ask の ②→③ の間だけで小さい。5 分を超えて `null` のままなら §2-3b で `withdrawn` になり、その後の押下は「不明」で拒否される (t002 P3-1) |
+| 質問の `message_id` がまだ `null` (ask の ③ の前) の `open` を指す押下 | **転送せず、offset を進めない** (次のサイクルで同じ update をもう一度受ける)。窓は ask の ②→③ の間だけで小さい。5 分を超えて `null` のままなら §2-3b で `withdrawn` になり、その後の押下は「不明」で拒否される (t002 P3-1)。**head-of-line**: その update より**後ろの** update (他の質問への答え) も処理はする (CAS と `update_id` で冪等)。ただし offset は先頭の保留で止まるので、後ろの update は次のサイクルでも再び届き、同じ結果に畳まれる。最大 5 分 (保留が `withdrawn` になるまで) 続く (t014 P3-3) |
 | 台帳が `Unreadable` | 転送しない・offset を**進めない**・`answerCallbackQuery` も呼ばない (ボタンの待ち表示が残る)。ログに `WARNING: telegram-questions` を 1 回/10 分。台帳を消せば復旧 (§2-1)。fail の向き: **観測できなかったことを「答えが無い」に倒さない** |
 
 ### 2-3b. 期限と掃除 — 誰がいつ `expired` / `withdrawn` を書くか (t002 P2-1)
@@ -483,14 +515,20 @@ def apply_failure(entry, action, now) -> entry
 | R4 | 台帳あり、`execution_id` が違う (新しい試行) | `none` / **set(first_seen=now, stage_sent=0, …)** |
 | R4b | 台帳あり、`first_seen > now` (時計が戻った・壊れた記録) | `none` / **set(first_seen=now)** (他の欄は保つ) |
 | R5 | `stage_sent == 2` | `none` / keep (**3 回目以降は鳴らさない**。段階 2 は 1 試行に 1 回) |
-| R6 | **段階 2 が到達可能** かつ `t > 0` かつ `elapsed ≥ t` — ここで「到達可能」= `stage_sent ≥ 1` **または** `d ≤ 0` **または** `not director_live` **または** `stage1_failed_at != None` | `telegram_available`: `telegram_notice` / set(stage 2)。**でなければ** `none` / keep (見送り。使えるようになったら送る) |
-| R7 | `d > 0` かつ `stage_sent == 0` かつ `elapsed ≥ d` かつ `director_live` | `director_renotice` / set(stage 1)。(R6 に当たらなかった = 段階 2 に進める条件が揃っていない、または `elapsed < t`) |
+| R6 | **段階 2 が到達可能** かつ `t > 0` かつ `elapsed ≥ t` かつ **`telegram_available`** — ここで「到達可能」= `stage_sent ≥ 1` **または** `d ≤ 0` **または** `not director_live` **または** `stage1_failed_at != None` | `telegram_notice` / set(stage 2)。**`telegram_available == False` のときは R6 に当たらなかった扱い**で、`none` で終わらせず**次の R7 以降へ落ちる** (t014 P2-2。見送りは R8 の `none` / keep。使えるようになったら次のサイクルで R6 が当たる) |
+| R7 | `d > 0` かつ `stage_sent == 0` かつ `elapsed ≥ d` かつ `director_live` | `director_renotice` / set(stage 1)。(R6 に当たらなかった = 段階 2 に進める条件が揃っていない・`elapsed < t`・または Telegram が使えない) |
 | R8 | 上のどれでもない (経過が足りない・段階 1 を送るべき Director が居ない・など) | `none` / keep |
 
 R6 と R7 の関係が P1-1 の直し方 (t002): **Director 不在 (`director_live == False`) の間は R6 の「到達可能」が成り立つので、
-`elapsed ≥ t` で段階 2 が出る** (段階 1 を待って永久に止まらない)。Director が戻っても `stage_sent == 2` なので段階 1 は出ない
-(「1 回だけ」・Director が不在だった間に段階 2 が既に出ている。戻った Director には既存の `[needs_director]` が
-(Director 不在では記録されず) 戻った時点で届く)。段階 1 の送信が**失敗**したとき (在席なのに `tmux_send` が False)
+`elapsed ≥ t` かつ Telegram が使えれば段階 2 が出る** (段階 1 を待って永久に止まらない)。Director が戻っても `stage_sent == 2` なので段階 1 は出ない
+(「1 回だけ」・Director が不在だった間に段階 2 が既に出ている)。戻った Director に何が届くかは条件付き:
+既存の `[needs_director]` (段階 0) が Director の離席**後**に出ていた (= Director 不在で記録されなかった) ときは、
+戻った時点で届く。段階 0 が離席**前**に届いていたときは、戻っても Director には何も来ない (ユーザーには段階 2 が届いているので害は無い)。
+
+**Telegram 未設定 (`telegram_available == False`) でも段階 1 は出る (t014 P2-2)**: R6 は Telegram が使えないと当たらず R7 に落ちるので、
+`d > 0`・Director 在席・`stage_sent == 0`・`elapsed ≥ d` なら、`elapsed ≥ t` を過ぎていても (段階 1 の送信が失敗し続けた後に
+`stage1_failed_at` が付いていても) `director_renotice` が出る。段階 1 は成功すれば `stage_sent == 1` になり、
+Telegram が使えるようになった次のサイクルで R6 が当たる。段階 1 の送信が**失敗**したとき (在席なのに `tmux_send` が False)
 は、`apply_failure` が `stage1_failed_at` を書き、次のサイクルから R6 の「到達可能」が成り立つ。
 段階 1 の再試行は `elapsed < t` の間だけ意味があり、間隔は既存の `should_notify(<key>#<execution_id>)` スロットル (`NOTIFY_TTL`) に任せる
 (5 秒ごとに失敗を叩かない)。
@@ -521,7 +559,11 @@ R6 と R7 の関係が P1-1 の直し方 (t002): **Director 不在 (`director_li
 - 同じ `(execution_id, stage)` に対して `director_renotice` / `telegram_notice` が 2 回出ない (`decide` の戻り値を適用して畳み込み、列の中で数える)
 - 判断待ちでなくなったら必ず `delete` (台帳なしなら keep)
 - `telegram_notice` は `t > 0` かつ `telegram_available` かつ `elapsed ≥ t` のときだけ。`director_renotice` は `d > 0` かつ `director_live` かつ `stage_sent == 0` のときだけ
-- **Director 不在で `t > 0` かつ `elapsed ≥ t` かつ `telegram_available` なら、`stage_sent < 2` の限り必ず `telegram_notice`** (P1-1 の回帰)
+- (前提: 以下の 2 つは **「判断待ち・`observable`・同じ試行の台帳あり・`first_seen ≤ now`」= R1〜R4b を通過した行**だけに課す。
+  R1 (判断待ちでない)・R2 (観測できない)・R3/R4 (台帳なし / 別の試行)・R4b (時計が戻った) の行では `none` / `set` / `delete` が
+  正しいので成り立たない — 全直積に前提を付けずに書くとそのまま赤になる。t014 P3-1)
+- **Director 不在で `t > 0` かつ `elapsed ≥ t` かつ `telegram_available` なら、`stage_sent < 2` の限り必ず `telegram_notice`** (P1-1 の回帰。上の前提つき)
+- **`telegram_available == False`・`d > 0`・`director_live`・`stage_sent == 0`・`elapsed ≥ d` なら必ず `director_renotice`** (t014 P2-2 の回帰。上の前提つき。`stage1_failed_at` の有無・`elapsed` が `t` の前か後かを問わない)
 - 1 回の `decide` は高々 1 つの action (1 サイクル 1 段階)
 
 さらに**ランダムな入力の列** (長さ 1〜12。`backlog-premise-needs-simulation` の「網羅テストが長さ 9〜10 の並びを見ていなかった」
@@ -583,7 +625,7 @@ task: t017 (needs_director) — 止まって 10 分
 | Telegram が長く落ちている | バックオフは指数 (30 秒 → 1 分 → 2 分 … 上限 10 分。`telegram-send.json`)。**ログは 10 分に 1 回** `WARNING: telegram unreachable (<種別>)`。段階 2 の `decide()` には `telegram_available = False` で渡る | 5 秒ごとに失敗を叩かない・ログを埋めない |
 | 受信 (`getUpdates`) が失敗 | 何も受けなかった扱い。offset は進めない。サイクルは続行 | 次回に同じ update を受けるだけ (at-least-once) |
 | `telegram-questions.json` が `Unreadable` | 転送しない・offset を進めない (§2-3) | 観測できなかったことを「答え無し」に倒さない |
-| `telegram-receiver.json` が `Unreadable` / 古い (心拍が 3 × `poll_interval` を超える) / 無い | `ask` は**断る** (§1-1) | 観測できなかったことを「有効」に倒さない |
+| `telegram-receiver.json` が `Unreadable` / 古い (心拍が 3 × `RECEIVER_HEARTBEAT_SECONDS` = 90 秒を超える) / 無い / `bot_id`・`chat_hash` が `ask` の解決結果と違う | `ask` は**断る** (§1-1。`receiver_stale` / `receiver_unknown` / `receiver_mismatch`) | 観測できなかったことを「有効」に倒さない |
 | `escalation-state.json` が `Unreadable` | **段階上げを見送る** (§5-4) | 再送側に倒すと壊れている間ずっと送り続ける |
 | Director 不在 (mux に `-director` が無い) | 転送・段階 1 は**見送って記録しない** (戻ったらすぐ送る)。**段階 2 (Telegram) は Director の有無と無関係に送る** — `decide()` の `director_live = False` が R6 の「到達可能」を満たす (§5-4。t002 P1-1 で整合させた) | ユーザーに届けるのが段階 2 の目的で、Director が居ないほどユーザーに知らせる価値がある |
 | mux が無い (インラインモード) | dispatcher が動かないので受信も段階上げも動かない。`ask` は `telegram-receiver.json` の心拍が無い・古いので**断る** (`receiver_unknown` / `receiver_stale`)。「dispatcher の生存確認」を別に持たない (心拍がそれを兼ねる) | 押しても誰にも届かないボタンを出さない |
@@ -623,9 +665,14 @@ task: t017 (needs_director) — 止まって 10 分
   Director への 1 回通知 (`notify_state_once`、key `telegram_receiver_disabled`)** もここ。
 - `agents/director.md`: §16 の表に `[telegram-answer]` の行・§3-2 の規則・§3-3 の分類器の手順・§4 の手順
   (**ユーザー決定: Telegram が使えるときは `AskUserQuestion` を使わず、会話に書いて `ask_user.sh ask` で送りターンを終える**)。
-- `config/crewvia.yaml`: `telegram:` ブロック (`poll_interval_seconds`・`session_link`・`question_ttl_minutes`、および §10 で
-  選んだ認証情報の参照 — 秘密そのものは書かない)。
-  CLAUDE.md の環境変数表に `CREWVIA_TG_BOT_TOKEN` / `CREWVIA_TG_CHAT_ID` / `CREWVIA_DIRECTOR_SESSION_URL`、不変条件 7 に新しい台帳 (5 つのうち 4 つ)。
+- `config/crewvia.yaml`: `telegram:` ブロック (`poll_interval_seconds`・`session_link`・`question_ttl_minutes`・
+  `credentials: {source: op|file, token_ref, chat_id_ref, file}` — **参照とパスだけで秘密そのものは書かない**。§1-1・§10)。
+  CLAUDE.md の環境変数表: **`CREWVIA_TG_BOT_TOKEN` / `CREWVIA_TG_CHAT_ID` は載せない** (採った案では env を読まない。t014 P3-4)。
+  載せるのは `CREWVIA_DIRECTOR_SESSION_URL` だけ。認証情報は表ではなく「Telegram 連携」の節に config の `telegram.credentials` として
+  1 行 (取り出し方は `op` / `file` のどちらか 1 つ・env は読まない・詳細は本文書 §1-1)。不変条件 7 に新しい台帳 (5 つのうち 4 つ)。
+  (将来 §10 の選択を変えて env を使う案にしたときは、その時点で表に足す。)
+- `scripts/dispatcher.sh`: **起動時 (ループの前) に認証情報を 1 回取り出す** (`lib_telegram.py resolve` を呼び、結果をシェル変数に。
+  `export` しない・python には `env VAR=… ` でその呼び出しにだけ渡す。§1-1)。取り出せなければ `reason` を心拍に書いて `enabled: false`。
   `lib_daemon_watch.py` の `_SPAWN_ENV_VARS` には**足さない** (コマンド文に秘密を載せない。§1-1)。
 - `.gitignore`: `registry/daemons/telegram-*.json` と `telegram-poll.lock`。
 - テスト (**偽の Bot API サーバー** = `http.server` をテスト内で立て、**lib の引数 `api_base`** で向ける。
@@ -637,12 +684,22 @@ task: t017 (needs_director) — 止まって 10 分
   **`sweep_questions()` の表 (期限切れ・`message_id == null` の残骸・7 日の削除・「未回答の質問がある」の定義)**・
   **`telegram-send.json` の 2 者同時書き込み (ロックの下で `last_sent_at` を数え損ねない)**・
   **`telegram-receiver.json` が `disabled` / 古い / 無い / 壊れているとき `ask` が断る (exit 4 と固定コード)**・
-  **認証情報が無い dispatcher で `enabled:false` と Director への通知 1 通 (同じ状態で 2 通目が出ない)**。
+  **認証情報が無い dispatcher で `enabled:false` と Director への通知 1 通 (同じ状態で 2 通目が出ない)**・
+  **心拍の間隔 (定数 30 秒) と stale (90 秒) の境界 (「間隔 + 1 サイクル」で stale にならない・「90 秒ちょうど / +1 秒」・`poll_interval` を変えても動かない。t014 P2-1)**・
+  **`receiver_mismatch` (`bot_id` 違い・`chat_hash` 違いで `ask` が exit 4。ファイルに token・chat_id が出ない)**・
+  **`resolve_credentials()` の優先順位 (`source=op` のとき `file` と env の `CREWVIA_TG_*` を読まない・逆も。env だけ設定された Director のシェルで `no_credentials` になる)**・
+  **`file` の権限 (0600 以外・所有者違い・シンボリックリンクで中身を開かず `credential_file_permissions`)**・
+  **`op` の呼び出し回数 (偽の `op` スクリプトで dispatcher の複数サイクルを回して 1 回だけ。python のサイクルごとに呼ばない。t014 P2-3)**・
+  `op` が PATH に無い / 失敗 / 空 → `credential_command_failed` (値・参照・stderr の中身が receiver.json とログに出ない)。
   既存の `tests/CLAUDE.md` の隔離規則 (`env -u AGENT_NAME`、`CREWVIA_MUX_TEST_ISOLATION`) に従う。
 - 本番確認: 本物の bot・本物の Director で (1) `ask` → ボタン → `[telegram-answer]` が画面に届く、
   (2) §3-3 の分類器の観察、(3) §4 の modal の観察、(4) **dispatcher を `lib_daemon_watch.py restart` (または watchdog の respawn) した後も
   ボタンが受信される、または `ask` が `receiver_disabled` で断られ Director に通知が 1 通来る** (§1-1)。
   **dispatcher の restart が必要** (`merged-daemon-code-is-inert-until-restart`。`scripts/sync-main-checkout.sh`)。
+  (5) **ヘッドレスな dispatcher から 1Password が通るか** — **ユーザー立ち会いで**確かめる (§10)。PATH に `op` が無い・ロック中・
+  プロンプトが要る場合に、`receiver.json` が `enabled: false` / `reason: credential_command_failed` を出し、Director に通知が 1 通来ることを見る。
+  通らなければ `source: file` に切り替えて (4) をやり直す。**`~/.config` 配下を読まず、1Password の中身 (token・chat_id) を
+  取り出して表示しない** — 確認は「`reason: ok` と `bot_id` が出たか」だけで行う。
 
 ### PR-B: 段階上げ (PR-A の後)
 
@@ -659,7 +716,7 @@ task: t017 (needs_director) — 止まって 10 分
   (`dispatcher-real-code-namespace-harness`) で、`needs_director` (後続あり / **後続なし**) → 5 分後に Director へ・
   10 分後に偽の Bot API へ・**Director 不在でも 10 分後に Telegram へ**・解けたら台帳が消える・台帳が `Unreadable` で鳴らさない・
   破損カードで鳴らさない (戻ったら経過どおり)。**赤の実証** (`regression-test-must-prove-red`): 段階 2 の dedup を外して落ちること、
-  R6 の「Director 不在」の分岐を外して落ちること。
+  R6 の「Director 不在」の分岐を外して落ちること、**R6 の `telegram_available == False` を `none` / keep で終わらせる版 (R7 に落とさない) で P2-2 の不変条件が落ちること**。
 - 本番確認: 使い捨ての mission で `needs_director` (後続あり・なし) を作り、config の秒数を短くして 2 段階が順に届くこと。
   (使い捨て mission の `init` は `active_missions` に即露出する — memory: `disposable-mission-init-exposes-to-dispatcher-immediately`。)
 
@@ -672,23 +729,39 @@ task: t017 (needs_director) — 止まって 10 分
 2. **後続の無い最後の task の判断待ちも段階上げする** (初版の推奨「しない」から変更)。「後続を止めているか」は条件ではなくなった (§5-2)。
 3. **段階 1・段階 2 とも 1 回だけ** (§5-3)。
 
-### 決めてほしいこと — P1-2: respawn の後も認証情報を dispatcher に届ける方法
+### 決定済み (2026-10-05, 2 回目) — P1-2: respawn の後も認証情報を dispatcher に届ける方法
 
-前提: ユーザーのルールは「秘密は opx / 1Password CLI 経由、`.env` を読まない、コマンド文に秘密を書かない」。
-`lib_daemon_watch` の `_SPAWN_ENV_VARS` は秘密を運ばない (§1-1)。**どの方式でも §1-1 の層 1 (受信側の状態の記録 + `ask` が断る +
-割れを Director に 1 回) は入れる** — 方式は「層 2: 届け方」の選択。chat_id も token と同じ経路で運ぶ
+**1Password を本命 (A')・ダメならリポジトリ外の 0600 ファイル (B)**。取り出し方は config (`telegram.credentials.source: op | file`) で
+**1 つだけ選ぶ**。送る側 (`ask_user.sh`) と受ける側 (dispatcher) は同じ設定・同じ `resolve_credentials()` を通る。
+env の `CREWVIA_TG_*` は読まない (§1-1 に優先順位の全体)。**どの方式でも §1-1 の層 1 (受信側の状態の記録 + `ask` が断る +
+割れを Director に 1 回 + `bot_id` / `chat_hash` の照合) は入れる**。chat_id も token と同じ経路で運ぶ
 (個人の識別子なので、公開リポジトリの `config/crewvia.yaml` には値を書かない)。
 
 | 案 | 仕組み | 得 | 失 |
 |---|---|---|---|
-| **A (推奨): `poll` / `ask` のたびに 1Password CLI (`opx`) で取り出す** | config には**参照だけ** (`telegram.token_ref` / `telegram.chat_id_ref` = `op://…` 形式。秘密ではない) を置く。`resolve_credentials()` が `poll` サブプロセス・`ask_user.sh` の中で `opx` を呼び、値はプロセスのメモリにだけ置く (env にもファイルにもコマンド文にも出さない) | respawn に強い (env を運ばないので落ちない)。ユーザーのルールにそのまま合う。token の入れ替えが 1Password 側だけで済む。送信側と受信側が**同じ関数**を通すので「設定済みか」が構造的に割れにくい | `opx` が dispatcher の環境で使える必要がある (1Password のロック・デーモンの端末に認証が無いと失敗 → `enabled: false` / `credential_command_failed` で見える)。`poll` ごとに外部コマンドを呼ぶ (間引き 10 秒 + 結果を 1 サイクル内メモリのみ。呼び出しの遅れは `timeout 8` に含める)。**本番でヘッドレスの dispatcher から `opx` が通るかは未確認** (PR-A の本番確認の前に 1 回確かめる) |
-| B: 権限 0600 のファイル (例 `registry/daemons/` の外のユーザー専用ファイルを 1 つ) を `resolve_credentials()` が読む | ユーザーが 1 度だけ手で作る (Claude はそのファイルを読み書きしない。`~/.claude/rules/security.md` の対象に加える) | respawn に強い。外部コマンドが要らない | **平文の秘密がディスクに残る** (「秘密は opx 経由」のルールの例外)。WSL ではファイルの権限が Windows 側から見えうる。ローテーションが手作業 |
-| C: `_SPAWN_ENV_VARS` に `CREWVIA_TG_*` を足して respawn のコマンド文に載せる | `lib_daemon_watch` の allowlist を 1 行足す | 実装が最小 | **コマンド文に秘密が載る** (`ps`・pane の scrollback・mux のログ。`_SPAWN_ENV_VARS` の注記が避けている事故そのもの)・「コマンド文に秘密を書かない」に反する。**採らない** |
-| D: 届け方は設計しない (層 1 だけ) | respawn で落ちたら `enabled: false` になり、Director に通知が来る。ユーザーが認証情報つきで手で dispatcher を再起動する | 秘密の扱いが増えない | respawn のたびに受信と段階 2 が止まる (watchdog の自動 respawn は設計上起きる)。最も要る場面 (長時間の無人運転) で効かなくなる |
+| **A' (本命): dispatcher の起動時に 1 回 1Password CLI で取り出す** | config には**参照だけ** (`op://…`)。`dispatcher.sh` が bash の外側・ループの前 (respawn のたびに通る) で 1 回取り出し、シェル変数に持つ (`export` しない)。python のサイクルには `env VAR=…` でその呼び出しにだけ渡す。`ask_user.sh` は呼び出しごとに同じ関数で取り出す | respawn に強い (起動のたびに取り直す)。ユーザーのルール (秘密は 1Password 経由) に合う。コマンド文・argv・ファイルに秘密が出ない (python の子プロセスの env に呼び出しの間だけ載る — 同一ユーザーのみ・短時間)。1Password の呼び出しは **dispatcher の起動ごとに 1 回 + 質問ごとに 1 回**で、サイクル単位に乗らない。トークンの入れ替えは 1Password 側 + dispatcher の restart | `op` が dispatcher の環境 (herdr 配下のヘッドレスなペイン) で通る必要がある (ロック中・認証プロンプト・PATH に `op` 無し → `credential_command_failed`)。**このマシンの非対話シェルでは `command -v opx` が見つからなかった (t014)** ので、通るかは**未確認で一段強く疑わしい** → 本番確認 (§9 (5)) でユーザー立ち会いのもとで確かめる。dispatcher の bash プロセスの存続中、値がそのプロセスのメモリに残る (同一ユーザーの `/proc/<pid>/environ` には出ない — `export` しないため) |
+| **B (代替): リポジトリ外の 0600 ファイル** | `telegram.credentials.file` (例 `~/.local/share/crewvia/telegram.env`) を `resolve_credentials()` が読む。所有者が自分でなく / 権限が 0600 でなければ**中身を開かず**停止 (`credential_file_permissions`) | respawn に強い。外部コマンド・1Password のロックに依存しない (デーモンから確実に使える) | **平文の秘密がディスクに残る** (「秘密は opx / 1Password 経由」のルールの**例外**。下の理由)。WSL では権限が Windows 側から見えうる。ローテーションが手作業 |
+| (C: 採らない) `_SPAWN_ENV_VARS` に足して respawn のコマンド文に載せる | allowlist に 1 行 | 実装が最小 | **コマンド文に秘密が載る** (`ps`・pane の scrollback・mux のログ。`_SPAWN_ENV_VARS` の注記が避けている事故そのもの) |
+| (D: 届け方を設計しない) | respawn で落ちたら `enabled: false` + Director に通知。ユーザーが手で再起動 | 秘密の扱いが増えない | respawn のたびに受信と段階 2 が止まる (watchdog の自動 respawn は設計上起きる)。長時間の無人運転で効かない |
 
-**推奨は A**。理由: respawn に強い・ユーザーのルールに合う・平文を残さない、の 3 つを同時に満たすのは A だけ。
-A が本番のヘッドレスな dispatcher から動かないと分かった場合は、B (平文ファイルを許すかをユーザーに再確認) か D にフォールバックする。
-**この PR-A の実装前に、ユーザーが案を選ぶこと** (A なら `op://` の参照 2 つを教えてもらい、`opx` がデーモンから通るかを 1 回確認する)。
+**選び方 (config)**: 既定は `source` 未設定 = Telegram 未設定 (公開前提。何も起きない)。`op` を使うか `file` を使うかはユーザーが
+config に書く。**`op` で本番確認 (§9 (5)) が通らなければ `file` に切り替える** — その切り替えはユーザーの判断 (ルールの例外を使うため)。
+
+**B がルールの例外である理由 (§10 に残す)**: ユーザーのルールは「秘密は opx / 1Password CLI 経由、コマンド文に秘密を書かない」。
+B は平文をディスクに置くので例外になる。それでも選択肢に残すのは、**デーモンから確実に使える秘密の置き場がこのマシンに他に無い**ため:
+
+- **systemd の credential (systemd-creds)**: `--user` に対応しておらず、root が要る。`sudo` は原則禁止。
+- **gpg**: gpg-agent の期限が切れるとデーモンが復号できない (無人運転で止まる)。
+- **Windows の資格情報マネージャー**: herdr 配下では WSL interop が無く (`herdr-env-lacks-wsl-interop`)、デーモンから呼べない。
+
+**bot token が漏れた場合の影響範囲** (B を許す判断の材料): chat_id の照合があるので**押下は偽造できない** (§2-2 の 1)。
+できるのは (1) その bot として任意のメッセージをユーザーに送り付ける、(2) `getUpdates` を奪って受信を妨害する、の 2 つ。
+**BotFather で token を無効化 (revoke) すれば止まる**。ボタンの答えは §3-2 の規則 (台帳の `verify`・実行直前の確認・破壊的操作は
+Telegram だけを根拠にしない) で守られているので、漏洩しても承認の偽造にはならない。B の運用: ファイルは**ユーザーが 1 度だけ手で作る**
+(Claude はそのファイルを読み書きしない。`~/.claude/rules/security.md` の対象に `~/.local/share/crewvia/*.env` を加える)。
+
+**未確認 (本番確認でユーザー立ち会い)**: ヘッドレスの dispatcher から 1Password が通るか。**`~/.config` 配下を読まない・1Password の中身を
+取り出さない** (ユーザーのルール)。確認は §9 (5) の「`reason: ok` と `bot_id` が出たか」だけで行う。
 
 ## 11. 検証 (設計時の実測)
 

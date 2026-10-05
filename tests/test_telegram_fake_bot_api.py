@@ -399,6 +399,26 @@ def test_offset_does_not_advance_when_the_ledger_is_locked_and_the_update_is_re_
     assert len(forwarded) == 1 and box.ledger()[qid]["status"] == "answered"
 
 
+def test_offset_does_not_advance_when_only_the_answering_step_cannot_lock(box, api, monkeypatch):
+    """sweep は通るが、答えを書く段 (process) でロックが取れない: 答えを書けていないので offset を進めてはいけない。"""
+    box.heartbeat()
+    qid = box.ask().stdout.strip()
+    press_button(box, api, qid, 0)
+    real = t.update_questions
+
+    def busy_on_process(registry_dir, fn, *, now, warn=None):
+        if fn.__name__ == "process":
+            raise t.LedgerBusy()
+        return real(registry_dir, fn, now=now, warn=warn)
+    monkeypatch.setattr(t, "update_questions", busy_on_process)
+    res = t.poll_once(box.registry, box.creds(), api_base=api.url, now=time.time())
+    assert res["error"] == "ledger_busy" and res["answered"] == 0
+    assert json.loads((box.registry / t.OFFSET_FILE).read_text())["offset"] == 0 if (box.registry / t.OFFSET_FILE).exists() else True
+    assert api.calls_of("answerCallbackQuery") == [], "答えを書けなかったので、ボタンの待ち表示も止めない (次のサイクルで同じ update をもう一度受ける)"
+    monkeypatch.setattr(t, "update_questions", real)
+    assert t.poll_once(box.registry, box.creds(), api_base=api.url, now=time.time() + 30)["answered"] == 1
+
+
 def test_press_on_a_question_without_message_id_holds_the_offset_but_later_updates_are_processed(box, api):
     box.heartbeat()
     box.registry.mkdir(parents=True, exist_ok=True)
@@ -568,6 +588,20 @@ def test_token_never_leaks_through_outputs_files_or_errors(box, api):
     assert TOKEN.split(":")[1] not in all_text(box, *procs)
 
 
+def test_an_unexpected_exception_prints_only_its_type_never_its_message(box, api, monkeypatch, capsys):
+    """想定外の例外の文字列に token が混ざっても (URL に token が入る例外など)、終了時の出力には型名だけ。"""
+    box.heartbeat()
+
+    def boom(*a, **k):
+        raise RuntimeError(f"cannot reach https://api.telegram.org/bot{TOKEN}/getUpdates")
+    monkeypatch.setattr(t, "read_questions", boom)
+    monkeypatch.setenv(t.CARRIED_TOKEN_VAR, TOKEN)
+    rc = t.main(["list", "--registry-dir", str(box.registry), "--config", str(box.config)])
+    captured = capsys.readouterr()
+    assert rc == t.EXIT_CANNOT_SEND and "internal_error:RuntimeError" in captured.err
+    assert TOKEN not in captured.out + captured.err and TOKEN.split(":")[1] not in captured.out + captured.err
+
+
 def test_token_does_not_leak_when_the_server_is_unreachable_or_slow(box, api, capsys):
     res = t.api_call(TOKEN, "getMe", {}, api_base="http://127.0.0.1:9", timeout=0.5)
     assert res.ok is False and res.error == "network"
@@ -698,7 +732,7 @@ def test_concurrent_senders_never_lose_a_slot(box, api):
     [th.join() for th in threads]
     assert all(r.ok for r in results), [r.error for r in results]
     state = json.loads((box.registry / t.SEND_FILE).read_text())
-    assert state["last_sent_at"] == pytest.approx(now + 7 * t.MIN_SEND_INTERVAL_SECONDS), "予約を 1 つも数え損ねない"
+    assert state["last_sent_at"] == pytest.approx(now + 7 * t.MIN_SEND_INTERVAL_SECONDS, abs=0.01, rel=0), "予約を 1 つも数え損ねない (epoch 秒なので絶対許容。相対許容だと約 1900 秒の幅になり何も検出しない)"
 
 
 def test_backoff_doubles_up_to_the_cap_and_success_resets(box, api):
@@ -726,7 +760,7 @@ def test_rate_limit_retry_after_and_warning_throttle(box, api):
     r = t.send_message(box.registry, box.creds(), "x", api_base=api.url, now=now, sleep=lambda s: None)
     assert r.error == "rate_limited" and r.warn is True
     st = json.loads((box.registry / t.SEND_FILE).read_text())
-    assert st["backoff_until"] == pytest.approx(now + 77)
+    assert st["backoff_until"] == pytest.approx(now + 77, abs=0.01, rel=0)
     blocked = t.send_message(box.registry, box.creds(), "x", api_base=api.url, now=now + 10, sleep=lambda s: None)
     assert blocked.error == "backoff"
     again = t.send_message(box.registry, box.creds(), "x", api_base=api.url, now=now + 80, sleep=lambda s: None)

@@ -21,6 +21,9 @@ from pathlib import Path
 
 import pytest
 
+# tree() が比べない registry の名前 (読み取りだけ)。登録簿の静的検査 (test_registry_lock.sh) が近くの書き込みと取り違えないよう、上に置く
+IGNORED_REGISTRY_NAMES = ("workers.yaml",)
+
 THIS_DIR = Path(__file__).resolve().parent
 SCRIPTS = THIS_DIR.parent / "scripts"
 sys.path.insert(0, str(THIS_DIR))
@@ -71,7 +74,7 @@ class TgHarness(Harness):
     def tree(self):
         return {str(p.relative_to(self.registry)): (p.read_bytes() if p.is_file() else None)
                 for p in sorted(self.registry.rglob("*"))
-                if p.name not in ("workers.yaml",)}
+                if p.name not in IGNORED_REGISTRY_NAMES}
 
 
 @pytest.fixture

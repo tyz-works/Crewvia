@@ -36,6 +36,13 @@ CHAT = "5550001"
 class TgHarness(Harness):
     def __init__(self, root, monkeypatch, carried=True, reason=""):
         super().__init__(root, monkeypatch)
+        # 全 pytest の途中で `lib_mux` が別のモジュールオブジェクトに差し替わっていても、dispatcher の埋め込み python が
+        # `from lib_mux import Mux` で引くのは sys.modules の今のもの。**そちらに** FakeMux を差す
+        # (継承元は import 時の `lib_mux` に差すので、単独では緑・全体では「Director 不在」になる)。
+        import importlib
+        live_mux = importlib.import_module("lib_mux")
+        monkeypatch.setattr(live_mux, "Mux", FakeMux)
+        monkeypatch.setattr(live_mux, "repo_identity_ok", lambda *a, **kw: True)
         (root / "config").mkdir()
         self.cred = root / "telegram.env"
         self.cred.write_text(f"bot_token={TOKEN}\nchat_id={CHAT}\n")

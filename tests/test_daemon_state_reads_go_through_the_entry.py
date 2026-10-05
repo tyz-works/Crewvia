@@ -180,6 +180,13 @@ ALLOWED_JSON_PARSES: dict[tuple[str, str, str], str] = {
     ("lib_mux.py", "_herdr_pane_get_bound", "json.loads(data.split(b\"\\n\")[0].decode())"):
         _EXTERNAL_RESPONSE + "herdr socket の `pane.get` 応答 (束縛済み接続)。デーモン側状態ストア "
         "(registry/daemons) のファイルではない。壊れていれば None = 「観測できなかった」と読む",
+    # -- (E) Telegram Bot API の応答 / poll サブプロセスの標準出力 (PR-A) -----------------
+    ("lib_telegram.py", "api_call", "json.loads(raw.decode('utf-8', errors='replace'))"):
+        _EXTERNAL_RESPONSE + "Telegram Bot API の HTTP 応答。壊れていれば `ApiResult(error='bad_json')` = 何も受けなかった扱い "
+        "(offset を進めない・転送しない)。外側 (dict か) は直後に強制し、`ok` / `result` の型は使う側が検証する",
+    ("lib_telegram.py", "run_cycle", "json.loads(proc.stdout)"):
+        _EXTERNAL_RESPONSE + "dispatcher が起動した `poll` サブプロセスの標準出力 (要約 JSON)。壊れていれば `poll_failed` = "
+        "「今回は何も受けなかった」で次のサイクルへ。要約はログ用で、判断 (転送・答えの確定) は台帳 (入口を通る) だけが根拠",
     # -- (E) Taskvia の HTTP 応答 --------------------------------------------
     ("plan.sh", "_taskvia_request", "json.loads(resp.read().decode())"):
         _EXTERNAL_RESPONSE + "Taskvia の HTTP 応答。同期は best-effort (Taskvia 非依存)",

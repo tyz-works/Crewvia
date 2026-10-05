@@ -38,7 +38,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from lib_task_cards import (  # noqa: E402
-    is_missing, is_unreadable, read_regular_text_or_unreadable, read_task_card,
+    CORRUPT_TASK_STATUS, is_missing, is_unreadable, read_regular_text_or_unreadable, read_task_card,
 )
 from lib_daemon_state import (  # noqa: E402
     is_finite_number, load_json_store, told_lock, write_told_atomic,
@@ -189,7 +189,7 @@ class Credentials:
 
 
 def _validated(token, chat_id):
-    if not (isinstance(token, str) and _TOKEN_RE.match(token) and isinstance(chat_id, str) and _CHAT_RE.match(chat_id)):
+    if not (isinstance(token, str) and _TOKEN_RE.fullmatch(token) and isinstance(chat_id, str) and _CHAT_RE.fullmatch(chat_id)):
         return None, 'credential_invalid'
     return Credentials(token, chat_id), 'ok'
 
@@ -341,7 +341,7 @@ def parse_callback_data(data):
     """`<qid>.<nonce>.<index>` に**全体一致**したときだけ `(qid, nonce, index)`。余りは拒否。"""
     if not isinstance(data, str):
         return None
-    m = _CALLBACK_RE.match(data)
+    m = _CALLBACK_RE.fullmatch(data)
     if not m:
         return None
     return m.group(1), m.group(2), int(m.group(3))
@@ -886,15 +886,17 @@ def pending_forwards(ledger):
 
 def card_status(queue_dir, slug, task):
     """転送の時点の card の status (読めなければ `unreadable`)。**判断の根拠ではない** (§3-1)。"""
-    if not slug or not task or not _SLUG_RE.match(slug) or not _TASK_RE.match(task):
+    if not slug or not task or not _SLUG_RE.fullmatch(slug) or not _TASK_RE.fullmatch(task):
         return None
     path = Path(queue_dir) / 'missions' / slug / 'tasks' / f'{task}.md'
     try:
-        card = read_task_card(path, task)
+        meta, _body = read_task_card(path, task)
     except Exception:  # noqa: BLE001
         return 'unreadable'
-    status = card.get('status') if isinstance(card, dict) else None
-    return status if isinstance(status, str) and status else 'unreadable'
+    status = meta.get('status') if isinstance(meta, dict) else None
+    if not isinstance(status, str) or not status or status == CORRUPT_TASK_STATUS:
+        return 'unreadable'                 # 隔離された (破損) card は status を信用しない
+    return status
 
 
 def mark_forwarded(registry_dir, qid, now):
@@ -911,7 +913,7 @@ def mark_forwarded(registry_dir, qid, now):
 
 
 def run_cycle(registry_dir, queue_dir, config, carried_reason, forward, *, now=None, creds=None,
-              api_base=None, log=lambda msg: None, runner=subprocess.run, python=sys.executable):
+              api_base=None, config_path=None, log=lambda msg: None, runner=subprocess.run, python=sys.executable):
     """dispatcher の 1 サイクルが呼ぶ入口。**例外を出さない**。→ 要約 dict。
 
     1. 受信側の心拍 (`telegram-receiver.json`)。結果の `enabled` / `reason` を呼び出し側が Director への通知に使う。
@@ -930,12 +932,17 @@ def run_cycle(registry_dir, queue_dir, config, carried_reason, forward, *, now=N
         if is_unreadable(ledger):
             log('WARNING: telegram-questions: 台帳を使えない — 転送せず offset も進めません (台帳を消せば復旧)')
             return summary
-        for qid, entry in pending_forwards(ledger):
-            line = format_forward_line(qid, entry, card_status(queue_dir, entry.get('slug'), entry.get('task')))
-            if forward(line):
-                with contextlib.suppress(LedgerBusy, LedgerUnreadable):
-                    if mark_forwarded(registry_dir, qid, now):
-                        summary['forwarded'] += 1
+        def forward_pending():
+            current = read_questions(registry_dir)
+            if is_unreadable(current) or is_missing(current):
+                return
+            for qid, entry in pending_forwards(current):
+                line = format_forward_line(qid, entry, card_status(queue_dir, entry.get('slug'), entry.get('task')))
+                if forward(line):
+                    with contextlib.suppress(LedgerBusy, LedgerUnreadable):
+                        if mark_forwarded(registry_dir, qid, now):
+                            summary['forwarded'] += 1
+        forward_pending()
         if creds is None:
             sweep_file(registry_dir, now)
             return summary
@@ -957,6 +964,8 @@ def run_cycle(registry_dir, queue_dir, config, carried_reason, forward, *, now=N
         cmd = ['timeout', '8', python, str(Path(__file__).resolve()), 'poll', '--registry-dir', str(registry_dir)]
         if api_base:
             cmd += ['--api-base', api_base]
+        if config_path:
+            cmd += ['--config', str(config_path)]
         env = dict(os.environ)
         env[CARRIED_TOKEN_VAR], env[CARRIED_CHAT_VAR] = creds.token, creds.chat_id
         summary['polled'] = True
@@ -968,6 +977,7 @@ def run_cycle(registry_dir, queue_dir, config, carried_reason, forward, *, now=N
                 summary['poll'] = {'error': 'poll_failed'}
         except Exception:  # noqa: BLE001
             summary['poll'] = {'error': 'poll_timeout'}
+        forward_pending()                          # 今受けた答えを次のサイクルまで待たせない
     except Exception as e:  # noqa: BLE001 — dispatcher のサイクルを落とさない。型名だけ (値・token は出さない)
         log(f'WARNING: telegram cycle failed ({type(e).__name__})')
     return summary
@@ -1074,7 +1084,7 @@ def cmd_ask(argv):
     slug = tid = None
     if opts['task']:
         slug, sep, tid = opts['task'].partition('/')
-        if not sep or not _SLUG_RE.match(slug) or not _TASK_RE.match(tid):
+        if not sep or not _SLUG_RE.fullmatch(slug) or not _TASK_RE.fullmatch(tid):
             return _usage_exit('ask')
     ttl_minutes = None
     if opts['ttl_minutes'] is not None:
@@ -1103,12 +1113,12 @@ def cmd_ask(argv):
              'message_id': None, 'status': 'open', 'created_at': now, 'expires_at': now + ttl, 'forwarded': False}
     if slug:
         entry['slug'], entry['task'] = slug, tid
-        card = None
+        meta = None
         qdir = Path(opts['queue_dir']) if opts['queue_dir'] else default_queue_dir()
         with contextlib.suppress(Exception):
-            card = read_task_card(qdir / 'missions' / slug / 'tasks' / f'{tid}.md', tid)
-        if isinstance(card, dict) and isinstance(card.get('current_execution_id'), str):
-            entry['execution_id'] = card['current_execution_id']
+            meta, _body = read_task_card(qdir / 'missions' / slug / 'tasks' / f'{tid}.md', tid)
+        if isinstance(meta, dict) and isinstance(meta.get('current_execution_id'), str) and meta['current_execution_id']:
+            entry['execution_id'] = meta['current_execution_id']
 
     def register(ledger):
         ledger = sweep_questions(ledger, now)                      # ⓪ 掃除 (poll と同じ関数)
@@ -1127,7 +1137,8 @@ def cmd_ask(argv):
         return EXIT_TOO_MANY_OPEN
     target = f'{slug}/{tid}' if slug else None
     text = build_question_text(question, None, target=target,
-                               session_link=(opts['session_link'] or config['session_link']), expires_at=now + ttl)
+                               session_link=(opts['session_link'] or os.environ.get('CREWVIA_DIRECTOR_SESSION_URL', '').strip()
+                                             or config['session_link']), expires_at=now + ttl)
     keyboard = {'inline_keyboard': [[{'text': label, 'callback_data': make_callback_data(qid, entry['nonce'], i)}]
                                     for i, label in enumerate(options)]}
     sent = send_message(registry, creds, text, api_base=api_base, reply_markup=keyboard)
@@ -1172,8 +1183,8 @@ def _close(ledger, qid, status, now, *, unbutton):
 
 
 def cmd_verify(argv):
-    opts = _parse(argv, {'--q': 'one', '--registry-dir': 'one'})
-    if not opts['q'] or not re.match(r'^q-[0-9a-f]{8}$', opts['q']):
+    opts = _parse(argv, {'--q': 'one', '--registry-dir': 'one', '--config': 'one'})
+    if not opts['q'] or not re.fullmatch(r'q-[0-9a-f]{8}', opts['q']):
         return _usage_exit('verify')
     registry = Path(opts['registry_dir']) if opts['registry_dir'] else default_registry_dir()
     ledger = read_questions(registry)
@@ -1199,7 +1210,7 @@ def cmd_verify(argv):
 def cmd_cancel(argv):
     opts = _parse(argv, {'--q': 'one', '--by': 'one', '--note': 'one', '--registry-dir': 'one',
                          '--config': 'one', '--api-base': 'one'})
-    if not opts['q'] or not re.match(r'^q-[0-9a-f]{8}$', opts['q']) or opts['by'] not in ('screen', 'other'):
+    if not opts['q'] or not re.fullmatch(r'q-[0-9a-f]{8}', opts['q']) or opts['by'] not in ('screen', 'other'):
         return _usage_exit('cancel')
     registry, config = _common(opts)
     now = time.time()
@@ -1220,7 +1231,7 @@ def cmd_cancel(argv):
 
 
 def cmd_list(argv):
-    opts = _parse(argv, {'--registry-dir': 'one'})
+    opts = _parse(argv, {'--registry-dir': 'one', '--config': 'one'})
     registry = Path(opts['registry_dir']) if opts['registry_dir'] else default_registry_dir()
     ledger = read_questions(registry)
     if is_missing(ledger):

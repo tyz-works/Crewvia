@@ -855,6 +855,16 @@ mtime → role 解決 → throttle）、throttle マーカーは role が direct
 消費する。Worker のツール呼び出しはマーカーに一切触れないため、Worker が並行して動いていても
 Director の通知窓が奪われることはない（t049）。詳細設計は `knowledge/daemon-authority.md` を参照。
 
+### Telegram (optional): ask the user with buttons
+
+When the Director needs a decision it can send a question with buttons to Telegram (`scripts/ask_user.sh`) instead of blocking
+on the terminal; the answer is forwarded to the Director's screen by the dispatcher. Nothing happens unless you configure it:
+set `telegram.credentials.source` in `config/crewvia.yaml` to `op` (1Password CLI, with `op://` references) or `file` (a `0600`
+file outside the repository containing `bot_token=` and `chat_id=`). The bot token is never written to the config, the
+command line or the logs, and `CREWVIA_TG_*` environment variables are not read. **Use a bot dedicated to crewvia** — a second
+consumer of `getUpdates` on the same bot steals updates. Restart the dispatcher after configuring it. Design:
+`knowledge/director-escalation-telegram.md`.
+
 ### Communication flow
 
 1. Director decomposes mission → registers tasks with `plan.sh add`

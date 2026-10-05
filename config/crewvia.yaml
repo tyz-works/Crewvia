@@ -183,3 +183,27 @@ approval_channel:
     # Taskvia 側の APPROVAL_TOKEN_TTL_SECONDS と合わせること（デフォルト: 900）
     # 環境変数: APPROVAL_TOKEN_TTL_SECONDS
     token_ttl_seconds: 900
+
+# ===== Telegram（Director の質問・ボタン・受信。任意） =====
+# Director がユーザーに選択肢つきの質問を Telegram で送り、ボタンの答えを Director の画面に届ける
+# （scripts/ask_user.sh。設計: knowledge/director-escalation-telegram.md）。
+# **未設定（credentials.source が空）なら何も起きない**（何も読まず・書かず・送らない）。
+#
+# 認証情報（bot token・chat_id）はここに**値を書かない**。取り出し方を 1 つだけ選ぶ:
+#   source: op    1Password CLI。token_ref / chat_id_ref に op://… の参照だけを書く。
+#                 dispatcher が起動時（respawn のたび）に 1 回取り出す。
+#   source: file  リポジトリ外の権限 0600（group / other のビットが 0）の 1 ファイル。
+#                 中身は `bot_token=<token>` と `chat_id=<id>` の 2 行。権限が合わなければ読まずに停止する。
+#                 平文がディスクに残る（「秘密は 1Password 経由」の例外。1Password がデーモンから使えないときだけ）。
+# `CREWVIA_TG_*` の env は読まない（Director と dispatcher で別の bot に解決する割れを作らないため）。
+# bot は crewvia 専用にすること（他のツールと共用すると getUpdates の更新を奪い合う）。
+telegram:
+  poll_interval_seconds: 10       # ボタンの答えを受ける間隔の下限（未回答の質問があるときだけ通信する）
+  question_ttl_minutes: 60        # ask_user.sh ask の質問の有効期間の既定
+  session_link: ""                # /remote-control の URL など。質問の文面に付ける（空なら行ごと省く）
+  credentials:
+    source: ""                    # "" = 未設定 / op / file
+    token_ref: ""                 # source: op のとき。例 op://<vault>/<item>/token
+    chat_id_ref: ""               # source: op のとき。例 op://<vault>/<item>/chat_id
+    file: ""                      # source: file のとき。例 ~/.local/share/crewvia/telegram.env
+    op_command: op                # 1Password CLI のコマンド名（PATH に無い場合は絶対パス）

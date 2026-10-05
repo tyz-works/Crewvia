@@ -172,6 +172,16 @@ call_needs_director() {
   "$PLAN_SH" needs-director "$TASK_ID" ${MISSION_SLUG:+--mission "$MISSION_SLUG"} ${EXEC_ARGS[@]+"${EXEC_ARGS[@]}"} "$1"
 }
 
+# call_needs_director_file: 理由が長い (findings の全文を残す) 経路。plan.sh needs-director は位置引数の理由と
+#   --result-file を同時に取らないので、ファイルの先頭行に 1 行の要約を置き、ファイルだけを渡す。
+call_needs_director_file() {
+  if [[ $DRY_RUN -eq 1 ]]; then
+    _info "[DRY-RUN] would call: plan.sh needs-director ${TASK_ID} ${MISSION_SLUG:+--mission ${MISSION_SLUG} }--result-file <file>"
+    return 0
+  fi
+  "$PLAN_SH" needs-director "$TASK_ID" ${MISSION_SLUG:+--mission "$MISSION_SLUG"} ${EXEC_ARGS[@]+"${EXEC_ARGS[@]}"} --result-file "$1"
+}
+
 fail_needs_director() {
   _error "$1"
   call_needs_director "$1"
@@ -185,6 +195,7 @@ fail_needs_director() {
 REVIEW_WT=""
 OUTPUT_FILE=""
 STDERR_FILE=""
+RESULT_FILE=""           # card に全文を残す Result / 理由のファイル (plan.sh が読んだ後に消す)
 FETCH_LOCAL_REF=""
 BASE_FETCH_LOCAL_REF=""  # t006: origin/main を都度 fetch する一時 ref (下記参照)
 
@@ -194,6 +205,9 @@ cleanup() {
   fi
   if [[ -n "$STDERR_FILE" ]]; then
     rm -f "$STDERR_FILE"
+  fi
+  if [[ -n "$RESULT_FILE" ]]; then
+    rm -f "$RESULT_FILE"
   fi
   if [[ -n "$REVIEW_WT" && -d "$REVIEW_WT" ]]; then
     git -C "${WORK_DIR:-$REPO_ROOT}" worktree remove --force "$REVIEW_WT" 2>/dev/null \
@@ -701,12 +715,54 @@ fi
 _info "Findings judgment: method=${JUDGE_METHOD} needs_fix=${NEEDS_FIX}"
 
 # --- 結果報告 ---
-# 先頭200文字をサマリとして使用
-SUMMARY="${REVIEW_CONTENT:0:200}"
-SUMMARY="${SUMMARY//$'\n'/ }"  # 改行をスペースに置換
+# Codex の出力は全文を card に残す (旧実装は先頭 200 文字で切り、一時ファイルも消えるため指摘が失われた)。
+# 全文をファイルに書いて `--result-file` で渡す。needs-director は位置引数の理由と --result-file を同時に取らない
+# ので、ファイルの先頭行に 1 行の要約を置く。要約は切り詰めた生出力ではなく findings の JSON から作る。
+FINDINGS_SUMMARY=""
+if [[ "$JUDGE_METHOD" == "json" ]]; then
+  FINDINGS_SUMMARY="$(printf '%s' "$REVIEW_CONTENT" | jq -r '
+    (.findings // []) as $f
+    | if ($f | length) == 0 then "no findings"
+      else
+        ($f | map((.priority // "?") | tostring) | group_by(.) | map("\(.[0])×\(length)") | join(", ")) as $counts
+        | ($f | sort_by((.priority // "~") | tostring) | .[0].title // "(no title)" | tostring
+           | gsub("[\r\n]+"; " ") | .[0:100]) as $first
+        | "\($counts): \($first)"
+      end' 2>/dev/null)" || FINDINGS_SUMMARY=""
+fi
+if [[ -z "$FINDINGS_SUMMARY" ]]; then
+  # JSON の findings を読めなかった経路 (no-signal 等)。生出力の先頭だけをヒントにする (全文はファイルに残る)。
+  FINDINGS_SUMMARY="no structured findings (method=${JUDGE_METHOD}): ${REVIEW_CONTENT:0:100}"
+  FINDINGS_SUMMARY="${FINDINGS_SUMMARY//$'\n'/ }"
+fi
 
-DONE_MSG="LGTM: PR#${PR_NUM} ${HEAD_BRANCH} reviewed by Kai (model=${MODEL}) — ${SUMMARY}"
-NEEDS_FIX_MSG="NEEDS FIX: PR#${PR_NUM} ${HEAD_BRANCH} — ${SUMMARY}"
+DONE_MSG="LGTM: PR#${PR_NUM} ${HEAD_BRANCH} reviewed by Kai (model=${MODEL}) — ${FINDINGS_SUMMARY}"
+NEEDS_FIX_MSG="NEEDS FIX: PR#${PR_NUM} ${HEAD_BRANCH} — ${FINDINGS_SUMMARY}"
+if [[ $NEEDS_FIX -eq 1 ]]; then
+  RESULT_FIRST_LINE="$NEEDS_FIX_MSG"
+else
+  RESULT_FIRST_LINE="$DONE_MSG"
+fi
+
+RESULT_FILE="$(mktemp "${TMPDIR:-/tmp}/kai-review-result.XXXXXX")"
+{
+  printf '%s\n\n' "$RESULT_FIRST_LINE"
+  if [[ "$JUDGE_METHOD" == "json" ]]; then
+    echo "## Findings"
+    echo ""
+    printf '%s' "$REVIEW_CONTENT" | jq -r '
+      (.findings // []) | if length == 0 then "(none)" else
+        to_entries[] | .key as $i | .value
+        | "### \($i + 1). [\((.priority // "?") | tostring)] \(.title // "(no title)")\n"
+          + "- file: \(.file // "-")" + (if .line != null then "\n- line: \(.line)" else "" end)
+          + "\n\n\(.body // "")\n" end' 2>/dev/null \
+      || echo "(findings could not be formatted — see the raw output below)"
+    echo ""
+  fi
+  echo "## Codex raw output"
+  echo ""
+  printf '%s\n' "$REVIEW_CONTENT"
+} > "$RESULT_FILE"
 
 if [[ $DRY_RUN -eq 1 ]]; then
   # F6, PR#180: plan.sh には一切書き込まず、判定結果を人が読める形で表示するだけ。
@@ -718,19 +774,20 @@ if [[ $DRY_RUN -eq 1 ]]; then
   echo " Task     : ${TASK_ID}${MISSION_SLUG:+ (mission=${MISSION_SLUG})}"
   echo " Judge    : method=${JUDGE_METHOD} needs_fix=${NEEDS_FIX}"
   if [[ $NEEDS_FIX -eq 1 ]]; then
-    echo " Verdict  : NEEDS-DIRECTOR相当 (実行時は plan.sh needs-director を呼ぶ)"
-    echo " Message  : ${NEEDS_FIX_MSG}"
+    echo " Verdict  : NEEDS-DIRECTOR相当 (実行時は plan.sh needs-director --result-file を呼ぶ)"
   else
-    echo " Verdict  : DONE/LGTM相当 (実行時は plan.sh done を呼ぶ)"
-    echo " Message  : ${DONE_MSG}"
+    echo " Verdict  : DONE/LGTM相当 (実行時は plan.sh done --result-file を呼ぶ)"
   fi
+  echo " Message  : ${RESULT_FIRST_LINE}"
+  echo " --- result file (card に残る全文) ---"
+  cat "$RESULT_FILE"
   echo "=================================================="
 elif [[ $NEEDS_FIX -eq 1 ]]; then
   _info "Review found issues requiring fixes"
-  call_needs_director "$NEEDS_FIX_MSG"
+  call_needs_director_file "$RESULT_FILE"
 else
   _info "Review passed (structured signal confirmed safe: no P0-P2 findings)"
-  "$PLAN_SH" done "$TASK_ID" ${MISSION_SLUG:+--mission "$MISSION_SLUG"} ${EXEC_ARGS[@]+"${EXEC_ARGS[@]}"} "$DONE_MSG"
+  "$PLAN_SH" done "$TASK_ID" ${MISSION_SLUG:+--mission "$MISSION_SLUG"} ${EXEC_ARGS[@]+"${EXEC_ARGS[@]}"} --result-file "$RESULT_FILE"
 fi
 
 _info "Review complete."

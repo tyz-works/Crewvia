@@ -795,3 +795,21 @@ Director が `sync-main-checkout.sh` で ff + 両デーモン再起動 (3 点の
 **5 巡目 (t017) の指摘と、t006 で見つかった連投 (t018 で修正)**: Codex 5 巡目の P2「新しい通知を記録する前に `_unsettled` を解け」は当初 backlog (「黙るだけ」) としたが、最終レビュー (t006) で前提が違うと分かった — 回復時と再発後 ~600 秒の間、台帳の削除が失敗し続けた後に成功すると、新しいキーを記録した同じ plan で `_unsettled` が解けず、次のサイクルからそのキーを閉じた episode のものとして消して再送し、回復か max まで毎サイクル通知した。`observe` で通知する plan のとき `_unsettled` を解く 2 行で直した (削除がまだ失敗していれば古い fp が一致して黙る = 上の既知の穴に戻るだけ)。網羅テストが見逃したのは、この並びが長さ 9 で、全列挙 (長さ 5) と絞った列挙 (長さ 6〜7) の長さの外にあったため。名指しのテスト `test_a_deletion_that_recovers_after_a_relapse_does_not_renotify_every_cycle` と red_proof「【5 巡目 t017】」を足した。
 
 **赤の実証** (`tests/red_proof_hard_idle_unknown.py`): 1 巡目 (回復の判定をプロセス内の状態に戻す)・2 巡目 (cycle が掃除をやり直さない)・4 巡目 (台帳キーが理由ごとでなく Worker ごと) の欠陥を 1 つずつ戻すと網羅テストが狙った不変条件 (I3 / I3 / I1) で落ちる。他に: 閉じた episode の古いキーを消さない (I2) / 古い試行のキーを消さない (I4) / 掃除の例外を外に出す (I5)。
+
+**11-14. 本番確認 (t007, 2026-10-05 11:08〜)**: #278 (merge 11:05:54 JST、`18ea9d1`) が本番で動いていること、判定が設計どおりであること、見られなかったものを記録する。
+
+| 項目 | 結果 |
+|---|---|
+| 走っているコードの版 | **新版**。watchdog pid 1724197 の起動は 11:07:17 (`ps -o lstart`)、dispatcher pid 1723894 は 11:07:16 で、どちらも merge の約 1 分後。`registry/daemons/{watchdog,dispatcher}.version.json` の `head` は両方 `18ea9d1…` (主 checkout の HEAD = `origin/main` と一致)。watchdog.log に `Starting Watchdog v2 (PID 1724197 …)` と、`Luna: resuming interrupted retirement at phase=sigterm_sent` (再起動をまたぐ retirement の再開) が出ている |
+| 稼働中の Worker の判定 | 再起動直後の時点で監視対象は Ren (この task の Worker) だけ。Luna は再起動の前から retirement 中 (verdict ではなく `[retire]` の経路で終了した)。Ren: `alive reason=active process=idle_process awaiting_human=false`。**terminate された正常な Worker は無い** |
+| 新版でしか出ない出力 | 見送り通知・間引かれた WARN 行 (`reason=` 付き) は、hard_idle が起きなかったので**まだ 1 行も出ていない** (正常な Worker だけなので当然)。「新しい reason が出た」ことの本番での確認は**未実施** |
+| 本番で unknown の形を作って観測 (項目 3) | **省略**。理由: 通知まで見るには、自分の Worker を 3600 秒 (hard_idle) + 600 秒 (通知しきい値) 無活動にして unknown の木を保つ必要があり、実際の Director 通知が飛ぶ。その間 `max` (3600 秒) で自分が終了する危険もある。代わりに読み取りだけで木の分類を実測した (下) |
+
+**木の分類の実測** (自分の claude pid 1724671 を根にして、短命の子を自分で立てた。mux / registry には触れていない):
+
+- 素の木: `executing` (実行中の Bash tool 自身が job として見える。`idle_process` が出るのはツール呼び出しの外のとき)
+- zombie の子 (`state=Z` を確認) + 非 dumpable の子 (`prctl(PR_SET_DUMPABLE, 0)` = 11-2 の形 B) を足した木: **`executing`** (旧版なら environ が EACCES で木全体が `unknown`。新版は読めないノードで打ち切らず、同じ木の job を見つけて executing になる = 11-9 の「job が見つかれば executing」)
+- さらに `sleep` の job を足した木: `executing`
+
+限界: これは job が居る木での確認で、**job の無い木で zombie だけが残る形が `idle_process` になること** (今回の主因 A の直り) は、本番では測っていない (Worker が動いている間は Bash tool 自身が job になるので、自分では作れない)。そこは `tests/test_hard_idle_suppression_unknown_zombie.py` の実プロセステストが根拠。
+次に本物の hard_idle が起きたとき、通知文の `pid / state / errno` が A〜D の確定材料になる。

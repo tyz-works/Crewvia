@@ -96,3 +96,124 @@ def test_the_old_bots_offset_is_not_used_for_the_new_bot(reg, apis):
     assert api_b.calls_of("getUpdates")[0]["offset"] == 0, "他の bot の offset は捨てて最初から"
     assert res["answered"] == 1 and read(reg, t.QUESTIONS_FILE)["q-0000000b"]["status"] == "answered"
     assert read(reg, t.OFFSET_FILE)["bot_id"] == creds_b().bot_id and read(reg, t.OFFSET_FILE)["offset"] == uid + 1
+
+
+# ---------------------------------------------------------------------------
+# 表の各セル: 状態ファイル × (認証情報が変わった / 識別子の無い旧形式 / 同じ)
+# ---------------------------------------------------------------------------
+
+def test_a_same_bot_but_different_chat_is_also_a_different_identity(reg, apis):
+    """bot_id が同じでも chat が違えば message_id の連番は別。chat_hash も見る。"""
+    api_a, _ = apis
+    other_chat = t.Credentials(TOKEN_A, CHAT_B)
+    write(reg, t.QUESTIONS_FILE, open_question(identity=other_chat))
+    t.poll_once(reg, creds_a(), api_base=api_a.url, now=NOW)
+    assert read(reg, t.QUESTIONS_FILE)["q-0000000a"]["status"] == "withdrawn"
+
+
+def test_a_question_without_an_identity_is_treated_as_someone_elses(reg, apis):
+    """識別子導入前 (この PR の中で書かれた旧形式) は「今の認証情報のもの」と言えない → 取り下げ。別の bot の可能性を排除できない。"""
+    api_a, _ = apis
+    write(reg, t.QUESTIONS_FILE, open_question())
+    api_a.queue_update(reply_update(int(CHAT_A), 4711, "旧形式の質問への返信"))
+    res = t.poll_once(reg, creds_a(), api_base=api_a.url, now=NOW)
+    led = read(reg, t.QUESTIONS_FILE)["q-0000000a"]
+    assert res["answered"] == 0 and led["status"] == "withdrawn" and led["closed_reason"] == "identity_changed"
+    assert led["unbutton"] is False
+
+
+def test_an_offset_without_an_identity_is_discarded(reg, apis):
+    api_a, _ = apis
+    write(reg, t.OFFSET_FILE, {"offset": 9100, "last_poll_at": NOW - 100})
+    write(reg, t.QUESTIONS_FILE, open_question(identity=creds_a()))
+    t.poll_once(reg, creds_a(), api_base=api_a.url, now=NOW)
+    assert api_a.calls_of("getUpdates")[0]["offset"] == 0
+    assert read(reg, t.OFFSET_FILE)["bot_id"] == creds_a().bot_id
+
+
+def test_the_same_identity_keeps_its_offset_and_its_questions(reg, apis):
+    """対照: 認証情報が変わっていなければ何も捨てない (取り下げ過ぎ・offset の巻き戻しの検出)。"""
+    api_a, _ = apis
+    write(reg, t.OFFSET_FILE, dict(t.identity_of(creds_a()), offset=9100, last_poll_at=NOW - 100))
+    write(reg, t.QUESTIONS_FILE, open_question(identity=creds_a()))
+    res = t.poll_once(reg, creds_a(), api_base=api_a.url, now=NOW)
+    assert api_a.calls_of("getUpdates")[0]["offset"] == 9100
+    assert read(reg, t.QUESTIONS_FILE)["q-0000000a"]["status"] == "open" and res["identity_changed"] == []
+
+
+def test_closed_questions_of_the_old_bot_are_left_alone(reg, apis):
+    """answered / expired 等は触らない (answered の転送は台帳の中身だけで済む)。open だけを取り下げる。"""
+    api_a, _ = apis
+    old = creds_a()
+    led = open_question("q-00000001", identity=old, status="answered", answer={"kind": "choice", "index": 0, "label": "A", "update_id": 5, "at": NOW - 5}, forwarded=False)
+    led.update(open_question("q-00000002", identity=old, status="expired", closed_at=NOW - 10))
+    led.update(open_question("q-00000003", identity=old))
+    write(reg, t.QUESTIONS_FILE, led)
+    res = t.poll_once(reg, creds_b(), api_base=api_b_url(apis), now=NOW)
+    got = read(reg, t.QUESTIONS_FILE)
+    assert got["q-00000001"]["status"] == "answered" and got["q-00000001"]["forwarded"] is False
+    assert got["q-00000002"]["status"] == "expired"
+    assert got["q-00000003"]["status"] == "withdrawn" and res["identity_changed"] == ["q-00000003"]
+
+
+def api_b_url(apis):
+    return apis[1].url
+
+
+def test_a_button_of_the_old_bot_is_rejected_not_forwarded(reg, apis):
+    """取り下げた後に押された古いボタン (同じ message_id・同じ nonce) は「不明な質問」。答えとして通らない。"""
+    _, api_b = apis
+    write(reg, t.QUESTIONS_FILE, open_question(identity=creds_a()))
+    api_b.queue_update(callback_update(int(CHAT_B), 4711, "q-0000000a.9f3a1c.0", update_id=1))
+    res = t.poll_once(reg, creds_b(), api_base=api_b.url, now=NOW)
+    got = read(reg, t.QUESTIONS_FILE)["q-0000000a"]
+    assert res["answered"] == 0 and "answer" not in got and got["status"] == "withdrawn"
+
+
+def test_send_state_of_another_bot_is_not_inherited(reg, apis):
+    """別の bot のバックオフ・レート記憶で新しい bot の送信を止めない (識別子の無い旧形式も同じ)。"""
+    _, api_b = apis
+    for stale in (dict(t.identity_of(creds_a()), backoff_until=NOW + 3600, last_sent_at=NOW),
+                  {"backoff_until": NOW + 3600, "last_sent_at": NOW}):
+        write(reg, t.SEND_FILE, stale)
+        res = t.send_message(reg, creds_b(), "hello", api_base=api_b.url, now=NOW, sleep=lambda s: None, clock=lambda: NOW)
+        assert res.ok, res
+        assert read(reg, t.SEND_FILE)["bot_id"] == creds_b().bot_id
+    assert len(api_b.calls_of("sendMessage")) == 2
+
+
+def test_send_state_of_the_same_bot_still_backs_off(reg, apis):
+    """対照: 同じ identity のバックオフは今までどおり効く。"""
+    _, api_b = apis
+    write(reg, t.SEND_FILE, dict(t.identity_of(creds_b()), backoff_until=NOW + 3600))
+    res = t.send_message(reg, creds_b(), "hello", api_base=api_b.url, now=NOW, sleep=lambda s: None, clock=lambda: NOW)
+    assert not res.ok and api_b.calls_of("sendMessage") == []
+
+
+def test_identity_fields_are_validated_and_never_secret():
+    ok = {"offset": 1, "last_poll_at": None, "bot_id": 123456, "chat_hash": "0123456789ab"}
+    assert lds.telegram_offset_problem(ok) is None
+    assert lds.telegram_offset_problem({"offset": 1}) is None, "識別子の無い旧形式は読める (使うかは lib_telegram.is_bound が決める)"
+    assert lds.telegram_offset_problem(dict(ok, chat_hash=None)) and lds.telegram_offset_problem({"offset": 1, "bot_id": 1})
+    assert lds.telegram_offset_problem(dict(ok, bot_id=True)) and lds.telegram_offset_problem(dict(ok, chat_hash="XYZ"))
+    c = creds_a()
+    assert TOKEN_A not in json.dumps(t.identity_of(c)) and CHAT_A not in json.dumps(t.identity_of(c))
+
+
+def test_rebind_frees_the_open_question_limit_from_the_old_bots_questions(reg):
+    """旧 bot の open な質問 8 件が、新しい bot の ask を上限で断らない (rebind が先)。"""
+    old = {}
+    for i in range(t.MAX_OPEN_QUESTIONS):
+        old.update(open_question(f"q-0000000{i}", message_id=100 + i, identity=creds_a()))
+    write(reg, t.QUESTIONS_FILE, old)
+    got, withdrawn = t.rebind_ledger(old, t.identity_of(creds_b()), NOW)
+    assert len(withdrawn) == t.MAX_OPEN_QUESTIONS and len(t.open_questions(got, NOW)) == 0
+
+
+def test_rebind_is_pure_and_idempotent():
+    led = open_question(identity=creds_a())
+    before = json.dumps(led, sort_keys=True)
+    once, w1 = t.rebind_ledger(led, t.identity_of(creds_b()), NOW)
+    twice, w2 = t.rebind_ledger(once, t.identity_of(creds_b()), NOW)
+    assert json.dumps(led, sort_keys=True) == before, "入力を書き換えない"
+    assert w1 == ["q-0000000a"] and w2 == [] and twice == once, "2 回目は何も取り下げない (Director への通知は 1 回)"

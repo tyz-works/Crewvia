@@ -884,3 +884,17 @@ def test_card_state_comes_from_the_card_when_readable(box, api):
     forwarded = []
     box.cycle(forwarded)
     assert forwarded and forwarded[0].endswith("task_state=needs_director")
+
+
+# ---------------------------------------------------------------------------
+# 認証情報の切り替え (PR #281 Codex P1 2 巡目): 前の bot の open な質問の取り下げは Director に 1 回だけ届く
+# ---------------------------------------------------------------------------
+
+def test_a_credential_switch_withdraws_old_questions_and_reports_them_once(box, api):
+    box.heartbeat()
+    qid = box.ask().stdout.strip()
+    other = t.Credentials("654321:FAKE-TOKEN-BBBBBBBBBB", "5550002")
+    first = box.cycle([], creds=other)
+    assert first["identity_changed"] == [qid] and box.ledger()[qid]["status"] == "withdrawn"
+    second = box.cycle([], creds=other)
+    assert second["identity_changed"] == [], "2 回目のサイクルは何も取り下げない = 通知は 1 回"

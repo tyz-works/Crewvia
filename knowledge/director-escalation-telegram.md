@@ -949,3 +949,37 @@ Telegram だけを根拠にしない) で守られているので、漏洩して
 - `WAITS_ON_DIRECTOR_STATUSES = {'needs_director'}` (`lib_task_status.py:69`)。
 - Telegram の仕様 (callback_data 64 バイト・1 秒 1 通・本文 4096) は設計時の知識で、**PR-A の実装時に
   公式の Bot API ドキュメントで再確認する** (この文書では実測していない)。
+
+## 11. PR-B の実装メモ (t007)
+
+- `scripts/lib_escalation.py`: `decide()` / `apply_failure()` (純粋関数。規則表 R1〜R8 は §5-4 のまま)・`run_cycle()` (台帳の読み書きと送信の順序)・
+  `load_cfg()` / `parse_cfg()` (§5-3)・`escalation_state_problem()` (台帳の形。`lib_daemon_state` ではなくこの lib に置いた — 書き手も読み手もここだけ)。
+  通信はしない (送信は dispatcher が関数で渡す)。`blocked_dependents()` は `lib_dep_rules.card_dependencies` を通す (依存の定義を持たない)。
+- `dispatcher.sh`: `run_escalation_cycle()` を `needs_director` / handoff の後・`prune_told` の前に 1 か所 (`all_tasks` を使い回す)。
+  段階 2 は `lib_telegram.send_message` (プロセス内。token は `_TG_RUNTIME` に持ち env に出さない・`timeout` は 5 秒)。`telegram_available` は
+  `lib_telegram.telegram_available`。1 サイクルの Telegram は最大 3 通。
+- **問い合わせは鳴らしうるときだけ**: mux (`director_live`) と Telegram の可否は、経過が最小のしきい値に届いた card があるときにだけ 1 回評価する
+  (`_could_act`)。待機中の task が増えても毎サイクル `mux list` を叩かない (`test_a_cycle_with_only_already_told_states_does_not_ask_the_mux`)。
+- 台帳は「送れた後だけ」書く。書けなければその周期の残りの送信を止める (記録できないまま送り続けない)。台帳が `Unreadable` なら段階上げ全体を見送る (§5-4)。
+- Director 宛 (段階 1) は 1 行 (` / ` 区切り。mux send は改行で複数送信になるため)、Telegram 宛は同じ項目の複数行。
+- テスト: `tests/test_escalation_decide.py` (手書き oracle 表 25 行・全直積の不変条件・ランダム列 400 本・cfg・台帳の形・文面) /
+  `tests/test_escalation_dispatcher_cycle.py` (本物の dispatcher 1 サイクル + 偽の Bot API。t017 → t006 の事故の再現)。
+  赤の実証 (欠陥を戻して落ちること): R5 の dedup 除去 / R6 の「Director 不在」分岐除去 / R6 で Telegram 不可のとき R7 に落とさない版 /
+  dispatcher の呼び出し除去 (13 本赤)。
+- 本番確認 (未実施 — dispatcher の restart が要る。`scripts/sync-main-checkout.sh`): 使い捨て mission で §9 の手順。
+
+### 11-1. 記録してから送る (PR #283 Codex P2 / t029)
+
+初版は「送ってから台帳に書く」で、**台帳が読めるが書けない**状態 (ディレクトリの権限・ロックが取れ続けない) だと、
+次のサイクルが古い段階を読んで同じ通知を 5 秒ごとに送った。直し:
+
+1. 段階 N を送る**前**に、台帳へ `sending_stage=N` / `sending_at` を書く。**書けなければ送らない** (そのサイクルは見送り)。
+2. 送れたら `stage_sent=N` に進めて sending を外す。失敗したら sending を外し (段階 1 は `stage1_failed_at`) 次のサイクルで再試行。
+3. 結果の書き込みが失敗しても sending が残る → `decide()` の **R5b** (期限内の sending は `none` / keep) が同じ段階を止める。
+4. sending が `SENDING_TIMEOUT_SECONDS` (600 秒) を過ぎたら「失敗」として読む (段階 1 なら `stage1_failed_at`)。送り直せるのは、**その前に送る前の書き込みが成功した**ときだけ
+   — 保存が壊れている間は何度でも見送りで、連投にならない。倒れる向き = 保存が壊れている間は通知が欠ける側。
+5. 見送りは Director に知らせる (`[escalation] escalation-state に書けない…`)。間引きは台帳ではなく notify cache (`should_notify`。別ファイル・プロセスをまたぐ・NOTIFY_TTL に 1 回)。
+   Director 不在・送信失敗なら log だけ。notify cache も書けないと毎サイクル届きうるが、dispatcher の他の通知と同じ前提 (台帳に依存させないことを優先した)。
+
+テスト: `tests/test_escalation_ledger_failures.py` (書き込み失敗を出来事とする長さ 1〜40 のランダム列 300 本 + 個別の再現)・`test_escalation_decide.py` の R5b 行。
+赤の実証: 送る前の書き込みを外す → 112 本赤 / R5b を外す → 31 本赤。

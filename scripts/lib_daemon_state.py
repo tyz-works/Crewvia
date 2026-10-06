@@ -380,3 +380,159 @@ def watch_state_problem(data):
         if value is not None and not is_finite_number(value):
             return f'{field!r} is {value!r}, expected a finite number or null'
     return None
+
+
+# ---------------------------------------------------------------------------
+# Telegram の経路 (PR-A) の状態ファイル — `lib_telegram.py` が書き、dispatcher が読む
+# ---------------------------------------------------------------------------
+#
+# 設計: knowledge/director-escalation-telegram.md §2。書き手も読み手と**同じ検証関数**を通す
+# (読み手だけが厳しいと、書いたばかりの台帳を自分が読めなくなる。`told_entry_problem` と同じ理由)。
+# 時刻はすべて epoch 秒 (有限の数)。**壊れたエントリが 1 つでもあれば台帳全体が Unreadable**。
+
+TELEGRAM_QUESTION_STATUSES = ('open', 'answered', 'withdrawn', 'expired')
+TELEGRAM_FORWARDED_VALUES = (False, True, 'gave_up')
+
+
+def _is_hex(value, length):
+    return (isinstance(value, str) and len(value) == length
+            and all(c in '0123456789abcdef' for c in value))
+
+
+def _telegram_identity_problem(data, where):
+    """永続する Telegram の状態に付く識別子 (`bot_id` / `chat_hash`。**秘密でない**・receiver.json と同じ)。両方あるか両方無いか。
+    無い = 識別子導入前の旧形式 = 今の認証情報のものと言えない (`lib_telegram.is_bound`)。"""
+    has_bot, has_chat = 'bot_id' in data, 'chat_hash' in data
+    if has_bot != has_chat:
+        return f'{where}: bot_id and chat_hash must come together'
+    if has_bot:
+        bot_id = data['bot_id']
+        if not isinstance(bot_id, int) or isinstance(bot_id, bool) or bot_id < 0:
+            return f'{where}: bot_id is not a non-negative integer'
+        if not _is_hex(data['chat_hash'], 12):
+            return f'{where}: chat_hash is not 12 hex'
+    return None
+
+
+def telegram_question_entry_problem(key, entry):
+    """質問台帳の 1 エントリが使えない理由 (使えれば `None`)。"""
+    if not (isinstance(key, str) and len(key) == 10 and key.startswith('q-') and _is_hex(key[2:], 8)):
+        return f'ledger key {key!r} is not q-<8 hex>'
+    if not isinstance(entry, dict):
+        return f'entry {key!r} is {type(entry).__name__}, expected an object'
+    if not _is_hex(entry.get('nonce'), 6):
+        return f'entry {key!r}: nonce is not 6 hex'
+    if not isinstance(entry.get('question'), str):
+        return f'entry {key!r}: question is not a string'
+    options = entry.get('options')
+    if not (isinstance(options, list) and 2 <= len(options) <= 4
+            and all(isinstance(o, str) and o for o in options)):
+        return f'entry {key!r}: options is not 2-4 non-empty strings'
+    if entry.get('status') not in TELEGRAM_QUESTION_STATUSES:
+        return f'entry {key!r}: status is {entry.get("status")!r}'
+    message_id = entry.get('message_id')
+    if message_id is not None and (not isinstance(message_id, int) or isinstance(message_id, bool)):
+        return f'entry {key!r}: message_id is not an integer or null'
+    for field in ('created_at', 'expires_at'):
+        if not is_finite_number(entry.get(field)):
+            return f'entry {key!r}: {field} is not a finite timestamp'
+    closed_at = entry.get('closed_at')
+    if closed_at is not None and not is_finite_number(closed_at):
+        return f'entry {key!r}: closed_at is not a finite timestamp or null'
+    for field in ('slug', 'task', 'execution_id'):
+        value = entry.get(field)
+        if value is not None and not isinstance(value, str):
+            return f'entry {key!r}: {field} is not a string'
+    if entry.get('forwarded') not in TELEGRAM_FORWARDED_VALUES or isinstance(entry.get('forwarded'), int) \
+            and not isinstance(entry.get('forwarded'), bool):
+        return f'entry {key!r}: forwarded is {entry.get("forwarded")!r}'
+    unbutton = entry.get('unbutton')
+    if unbutton is not None and not isinstance(unbutton, bool):
+        return f'entry {key!r}: unbutton is not a boolean'
+    tries = entry.get('unbutton_tries')
+    if tries is not None and (not isinstance(tries, int) or isinstance(tries, bool) or tries < 0):
+        return f'entry {key!r}: unbutton_tries is not a non-negative integer'
+    problem = _telegram_identity_problem(entry, f'entry {key!r}')
+    if problem:
+        return problem
+    reason = entry.get('closed_reason')
+    if reason is not None and not isinstance(reason, str):
+        return f'entry {key!r}: closed_reason is not a string'
+    answer = entry.get('answer')
+    if entry['status'] == 'answered' and not isinstance(answer, dict):
+        return f'entry {key!r}: answered without an answer'
+    if answer is not None:
+        if not isinstance(answer, dict):
+            return f'entry {key!r}: answer is not an object'
+        if answer.get('kind') not in ('choice', 'text'):
+            return f'entry {key!r}: answer.kind is {answer.get("kind")!r}'
+        if answer['kind'] == 'choice' and not (
+                isinstance(answer.get('index'), int) and not isinstance(answer.get('index'), bool)
+                and 0 <= answer['index'] < len(options)):
+            return f'entry {key!r}: answer.index is out of range'
+        if answer['kind'] == 'text' and not isinstance(answer.get('text'), str):
+            return f'entry {key!r}: answer.text is not a string'
+        if not is_finite_number(answer.get('at')):
+            return f'entry {key!r}: answer.at is not a finite timestamp'
+        update_id = answer.get('update_id')
+        if not isinstance(update_id, int) or isinstance(update_id, bool):
+            return f'entry {key!r}: answer.update_id is not an integer'
+    return None
+
+
+def telegram_questions_problem(data):
+    """質問台帳 (`telegram-questions.json`) 全体が使えない理由。"""
+    for key, entry in data.items():
+        problem = telegram_question_entry_problem(key, entry)
+        if problem:
+            return problem
+    return None
+
+
+def telegram_offset_problem(data):
+    """`telegram-offset.json` = `{"offset": int>=0, "last_poll_at": 時刻 | null}`。"""
+    offset = data.get('offset')
+    if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
+        return f"'offset' is {offset!r}, expected a non-negative integer"
+    last = data.get('last_poll_at')
+    if last is not None and not is_finite_number(last):
+        return f"'last_poll_at' is {last!r}, expected a finite timestamp or null"
+    return _telegram_identity_problem(data, 'offset')
+
+
+def telegram_send_problem(data):
+    """`telegram-send.json` (レート制限の記憶。2 者が書く)。欄はすべて任意で、あれば有限の数 / 整数。"""
+    for field in ('last_sent_at', 'backoff_until', 'last_warn_at'):
+        value = data.get(field)
+        if value is not None and not is_finite_number(value):
+            return f'{field!r} is {value!r}, expected a finite timestamp or null'
+    failures = data.get('consecutive_failures')
+    if failures is not None and (not isinstance(failures, int) or isinstance(failures, bool) or failures < 0):
+        return f"'consecutive_failures' is {failures!r}, expected a non-negative integer or null"
+    return _telegram_identity_problem(data, 'send state')
+
+
+def telegram_receiver_problem(data):
+    """`telegram-receiver.json` (dispatcher だけが書く受信側の状態。設計 §1-1)。
+
+    token・chat_id・参照・パスはここに**入れない** (欄を限る)。`bot_id` / `chat_hash` は秘密でない識別子。
+    """
+    if not isinstance(data.get('enabled'), bool):
+        return f"'enabled' is {data.get('enabled')!r}, expected a boolean"
+    if not is_finite_number(data.get('checked_at')):
+        return f"'checked_at' is {data.get('checked_at')!r}, expected a finite timestamp"
+    reason = data.get('reason')
+    if not (isinstance(reason, str) and reason and all(c.isalnum() or c == '_' for c in reason)):
+        return f"'reason' is {reason!r}, expected a fixed code"
+    if data['enabled']:
+        bot_id = data.get('bot_id')
+        if not isinstance(bot_id, int) or isinstance(bot_id, bool) or bot_id < 0:
+            return f"'bot_id' is {bot_id!r}, expected a non-negative integer"
+        if not _is_hex(data.get('chat_hash'), 12):
+            return "'chat_hash' is not 12 hex"
+    elif 'bot_id' in data or 'chat_hash' in data:
+        return 'a disabled receiver must not carry bot_id / chat_hash'
+    extra = set(data) - {'enabled', 'checked_at', 'reason', 'bot_id', 'chat_hash'}
+    if extra:
+        return f'unexpected fields {sorted(extra)!r}'
+    return None

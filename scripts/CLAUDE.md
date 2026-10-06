@@ -222,6 +222,26 @@ lib ごとの**破ってはいけない契約**の要約。理由・経緯・全
 - 台帳・拒否記録は**消してよい**（無い = 再通知 / 拒否されていない）。通知が届かない・review が動かないときの
   手当てはそのファイルを消すこと（dispatcher の再起動は不要。`knowledge/notify-once.md`「戻し方」）。
 
+## Telegram（`lib_telegram.py` / `ask_user.sh`。PR-A / 設計 `knowledge/director-escalation-telegram.md`）
+
+- **token は argv・ログ・例外文・状態ファイルに出さない。** Bot API は `urllib` をプロセス内で呼び、失敗は例外でなく固定コードの値
+  （`ApiResult.error`）。`Credentials` は `repr` に値を出さない。dispatcher の python は起動直後に `_CREWVIA_TG_RESOLVED_*` を `os.environ` から
+  外し、poll のサブプロセスにだけ env で渡す（`lib_telegram.run_cycle`）。**`env VAR=… cmd` は使わない**（env の argv に載る。bash の前置代入を使う）。
+- **認証情報の解決は `resolve_credentials()` の 1 か所**（config の `telegram.credentials.source` が `op` / `file` のどちらか 1 つ。`CREWVIA_TG_*` の env は読まない。
+  `ask` は運搬用の変数を読まない・`carried=True` の動詞だけが読む）。`file` は 0600（group / other のビットが 0・所有者が自分・通常ファイル・symlink 不可）で
+  なければ**中身を開かない**。dispatcher.sh は起動時に 1 回だけ取り出し（失敗の間は 600 秒間隔でだけ取り直す）、シェル変数に持つ（`export` しない）。
+- **未設定なら 1 バイトも書かない。** 例外は受信側の状態ファイル（`telegram-receiver.json`）が既にあるときの `enabled: false` への書き換えだけ。
+  設定されているのに取り出せない（`credential_command_failed` 等）ときは `enabled: false` のファイルを作る（`ask` が断る・Director に 1 通）。
+- 状態ファイルは `lib_daemon_state.load_json_store` の入口で読み、`told_lock` + `write_told_atomic` で書く。形の検証は `telegram_*_problem()`（書き手も同じ関数）。
+  **壊れていたら**転送しない・offset を進めない・`ask` は断る（観測できなかったことを「答え無し」「有効」に倒さない）。台帳を消せば復旧。
+- 判定は純粋関数（`classify_update` / `sweep_questions` / `receiver_verdict` / `parse_callback_data` / `apply_answer`）。callback_data は **`fullmatch`**
+  （`$` は末尾の改行を許す）。受け付ける条件は全部 AND（chat・from・nonce・message_id・index・open かつ期限内）。先に確定した 1 つだけが有効（CAS）。
+- **受信は後始末に締め出されない**（§2-3d）: `poll_once` は 受信 → 記録 → 後始末 の順で、後始末（answerCallbackQuery・ボタンを消す・諦めの通知）は `_Budget` の残りだけを使い、件数にも上限がある。poll の経路の `api_call` は必ず `timeout=` を取る（構造テストが赤にする）。確定した失敗（400/403/404）・回数・時間で `unbutton` は外れる。
+- 受信側の心拍は定数 30 秒・stale は 90 秒（`poll_interval` と独立）。`ask` は stale / disabled / unknown / 別の bot（`bot_id`・`chat_hash` の不一致）で断る。
+- テスト: `tests/test_telegram_pure.py`（純粋関数・認証情報）/ `tests/test_telegram_fake_bot_api.py`（偽の Bot API サーバー `tests/telegram_fake_api.py`・
+  token の漏れを全 cmdline / 出力 / 状態ファイルで grep）/ `tests/test_telegram_dispatcher_glue.py`（dispatcher.sh の差し込みと bash 側の取り出し）。
+  本物の Bot API は叩かない。`api_base` は lib の引数（`--api-base`）で、env のテスト用スイッチは本番コードに無い。
+
 ## plan.sh
 
 - `fail` は `--head <sha>`（実在する commit）必須、免除は `--no-head "<理由>"`。`handoff_path` は**絶対パスのみ**。

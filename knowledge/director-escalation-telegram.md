@@ -242,7 +242,7 @@ open ──message_id が null のまま 5 分──▶ withdrawn  (§2-3b: ask 
 | **Director が既に別の手段で答えを得た後の押下** | Director は答えを得た時点で `ask_user.sh cancel --q <id> --by screen` を呼ぶ (§4)。`cancel` が `withdrawn` にして**ボタンも消す** (best effort)。消える前の競合で押された場合は転送されず、「画面で回答済み」と返す。**Director が cancel を忘れた場合**は転送される — その場合も Director の規則 (§3) で、実行の直前に状態を確かめ直すので、既に済んだ操作を二重に実行しない |
 | 質問に `--task` が付いていて、その task が既に判断待ちを離れていた | 転送はする (ユーザーは押した)。行に `task_state=<status>` を添える (§3)。Director が状態を見て判断する |
 | 転送 (mux send) に失敗した・Director 不在 | `answered` / `forwarded=false` のまま。**`answerCallbackQuery` は先に返す** (ボタンの待ち表示を止める)。次の受信サイクルで `forwarded=false` の answered を再送する。期限は質問の `expires_at` ではなく**答えが入った時刻から 24 時間**で諦め、Telegram に「Director に届きませんでした」と 1 回返す |
-| 質問の `message_id` がまだ `null` (ask の ③ の前) の `open` を指す押下 | **転送せず、offset を進めない** (次のサイクルで同じ update をもう一度受ける)。窓は ask の ②→③ の間だけで小さい。5 分を超えて `null` のままなら §2-3b で `withdrawn` になり、その後の押下は「不明」で拒否される (t002 P3-1)。**head-of-line**: その update より**後ろの** update (他の質問への答え) も処理はする (CAS と `update_id` で冪等)。ただし offset は先頭の保留で止まるので、後ろの update は次のサイクルでも再び届き、同じ結果に畳まれる。最大 5 分 (保留が `withdrawn` になるまで) 続く (t014 P3-3) |
+| 質問の `message_id` がまだ `null` (ask の ③ の前) の `open` を指す押下 (**文章の返信も同じ**: 返信先がどの質問にも一致せず、未確定の open がある間は保留。§2-3c) | **転送せず、offset を進めない** (次のサイクルで同じ update をもう一度受ける)。窓は ask の ②→③ の間だけで小さい。5 分を超えて `null` のままなら §2-3b で `withdrawn` になり、その後の押下は「不明」で拒否される (t002 P3-1)。**head-of-line**: その update より**後ろの** update (他の質問への答え) も処理はする (CAS と `update_id` で冪等)。ただし offset は先頭の保留で止まるので、後ろの update は次のサイクルでも再び届き、同じ結果に畳まれる。最大 5 分 (保留が `withdrawn` になるまで) 続く (t014 P3-3) |
 | 台帳が `Unreadable` | 転送しない・offset を**進めない**・`answerCallbackQuery` も呼ばない (ボタンの待ち表示が残る)。ログに `WARNING: telegram-questions` を 1 回/10 分。台帳を消せば復旧 (§2-1)。fail の向き: **観測できなかったことを「答えが無い」に倒さない** |
 
 ### 2-3b. 期限と掃除 — 誰がいつ `expired` / `withdrawn` を書くか (t002 P2-1)
@@ -261,9 +261,84 @@ open ──message_id が null のまま 5 分──▶ withdrawn  (§2-3b: ask 
   `status == open` かつ `expires_at > now` かつ (`message_id != null` または `now - created_at < 300 秒`)。
   期限切れ・残骸の `open` を数えて受信が止まらない / 8 件で `ask` が詰まる、を防ぐ。掃除は数える前に必ず走る。
 
+### 2-3c. update の種類 × 照合の結果 — 全セルの表 (PR #281 の Codex P1)
+
+**P1 の欠陥**: 送信 (§4 ②) は済んだが `message_id` の記録 (③) の前に届いた**文章の返信**は、`reply_to_message.message_id` で照合する
+相手がまだ台帳に無く、「無関係」として捨てられ offset も進んだ → 二度と読めず、ユーザーの答えが黙って失われた。ボタンの押下は
+`message_id == null` の open を指すと保留する (§2-3) のに、返信には同じ扱いが無かった。**同じ族** = 「照合できない」理由を取り違えると答えが
+失われる (「待てば照合できる」を「無関係」と読む)。理由ごとに扱いを 1 つずつ決め、全セルを表駆動で押さえる
+(`tests/test_telegram_pure.py::TABLE`・手書きの oracle。実装の判定を呼び直さない)。
+
+行 = update の種類 (自分の chat・自分の発言のとき)、列 = 照合の結果。セルは「**判定 / offset / Director に届くもの**」:
+
+| 種類 ＼ 結果 | 一致 (open・期限内) | 不一致 (台帳に無い・札違い・別メッセージ・範囲外) | **未確定** (message_id が null の open がある) | 期限切れ | 取り下げ | 回答済み |
+|---|---|---|---|---|---|---|
+| **callback_query** (ボタン) | answer / 進める / **転送** | reject (「不明な質問」) / 進める / 無し | **hold / 進めない** / 無し (次のサイクルで同じ update を再受信) | reject (「期限切れ」) / 進める / 無し | reject (「画面で回答済み」) / 進める / 無し | reject (「回答済み: <ラベル>」) / 進める / 無し |
+| **返信** (reply_to_message あり・本文あり) | answer / 進める / **転送** | ignore / 進める / 無し (関係の無いメッセージへの返信) | **hold / 進めない** / 無し (**P1**。返信先が台帳のどのメッセージとも一致せず、猶予内の未確定な open がある間だけ) | ignore / 進める / 無し | ignore / 進める / 無し | ignore / 進める / 無し |
+| **普通のメッセージ** (返信でない・`/start` 等の bot コマンドを含む) | ignore / 進める / 無し | 同左 | 同左 (**保留しない** — 返信でないものは質問に結びつけない。§2-2) | 同左 | 同左 | 同左 |
+| **編集** (`edited_message`)・その他の update (`my_chat_member` 等)・テキストの無い返信 (画像等) | ignore / 進める / 無し | 同左 | 同左 | 同左 | 同左 | 同左 |
+| **他 chat・他人の発言・他人の押下** (どの種類でも) | ignore / 進める / 無し | 同左 | 同左 | 同左 | 同左 | 同左 |
+
+決めたこと:
+
+- **保留 (hold) になるのは 2 セルだけ**: 「ボタンが未確定の質問を指す」と「返信先が台帳のどのメッセージとも一致せず、猶予内の未確定な open がある」。
+  どちらも「待てば照合できるかもしれない」理由があるときだけ。**保留の理由を広げない** — 普通のメッセージ・閉じた質問への返信まで保留すると、
+  offset が最大 5 分止まる (その間、他の質問の答えも毎サイクル再受信する)。
+- 返信先が**すでに記録済みの別の質問**のメッセージ (期限切れ・取り下げ・回答済み) なら、それは「閉じた質問への返信」で、未確定な質問が別にあっても
+  保留しない (ignore)。
+- **保留の上限** = §2-3b の猶予 (`created_at` から 300 秒)。猶予を過ぎた `message_id == null` の open は sweep が `withdrawn` にする。以後その返信は
+  不一致として ignore され、offset が進む。保留中も**後ろの update は処理する** (offset だけが先頭の保留で止まる。§2-3 の head-of-line)。
+- 閉じた質問へのボタン押下には `answerCallbackQuery` で理由を返す (待ち表示を止める)。**閉じた質問への返信には Telegram に何も返さない**
+  (返信は台帳に結びつかないので、無関係なメッセージと区別せず無言で捨てる。ユーザーへの通知を足すなら別の変更)。
+- **Director に届くのは「一致」のセルだけ** (answer → `forwarded=false` → 転送)。reject / ignore / hold は何も届かない。
+
+### 2-3d. 1 サイクルの通信の全表 — 受信は後始末に締め出されない (PR #281 の Codex P1・3 巡目)
+
+**不変条件: どんな後始末の失敗が続いても、open な質問への押下は 1 サイクル以内に受信され、台帳に記録される。**
+
+修正前は `poll_once` が `getUpdates` の**前**に `_unbutton_pending` を呼び、閉じた質問ごとの `editMessageReplyMarkup` を
+最大 `API_TIMEOUT_SECONDS` (5 秒) まで待っていた。失敗したものは `unbutton` のまま次のサイクルで再試行されるので、
+Telegram が遅い・編集が失敗し続ける (古い / 消されたメッセージ) と、dispatcher のサブプロセスの上限 (`timeout 8`) を後始末だけで使い切り、
+`getUpdates` に届かないサイクルが永久に続いた。
+
+順序は **受信 → 台帳と offset への記録 → 後始末**。後始末は `poll` 1 回の持ち時間 (`POLL_BUDGET_SECONDS` = 6.5 秒。`timeout 8` より短い) の
+**残りだけ**を使う (`_Budget.timeout()`。残りが `BUDGET_MIN_REMAINING_SECONDS` = 1 秒未満なら通信せず次のサイクルへ。1 回の通信の timeout は
+`min(5, 残り)`)。種類ごとに 1 サイクルの件数にも上限がある (`CLEANUP_MAX_PER_CYCLE` = 3)。
+
+| # | 通信 | どこで | 受信との順序 | 持ち時間 | 失敗したとき |
+|---|---|---|---|---|---|
+| 1 | `getUpdates` | `poll` の `_receive_updates` | **最初** (ここより前に通信しない) | 5 秒 (全体の持ち時間の最初の分) | `error` を返し offset は据え置き。次のサイクルで同じ update |
+| 2 | `answerCallbackQuery` | `poll_once` (台帳と offset への記録の**後**) | 受信の後 | 残り・件数 6 まで | 無視 (ボタンの待ち表示が残るだけ。答えは台帳にある) |
+| 3 | `editMessageReplyMarkup` (閉じた質問のボタンを消す) | `_unbutton_pending` | 受信の後 | 残り・3 件まで・試行の少ない順 | 下の表 |
+| 4 | `sendMessage` (転送を諦めた通知) | `_give_up_forwarding` | 受信の後 | 残り・3 件まで | **残りが足りなければ印 (`gave_up`) を付けない** (印 → 通知の順なので、印だけ付いて通知が出ない穴を作らない) |
+| — | `sendMessage` (質問の送信) / `editMessageReplyMarkup` (ask の巻き戻し) / `cancel` の消去 | `ask_user.sh` の別プロセス | poll とは別のプロセス (poll のロックも持ち時間も共有しない) | 自分の 5 秒 | poll の受信を遅らせない。`cancel` の消去は `_Budget` 付き |
+| — | getMe / 再送ループ | 無い (使っていない) | — | — | — |
+
+`run_cycle` (dispatcher のサイクル) は通信しない (サブプロセスを起動するだけ。`timeout 8`)。したがって 1 サイクルに受信より前に走る
+ネットワーク呼び出しは**無い**。表の 2〜4 は、1 つの `poll` の中で持ち時間を分け合う。
+
+**ボタンを消す試みの諦め** (`unbutton` を外す条件。`_settle_unbutton`):
+
+| 結果 | 扱い |
+|---|---|
+| 成功 | `unbutton: false` |
+| Bot API の 400 / 403 / 404 (編集できないメッセージ・消えたメッセージ・bot が外された) | 待っても直らない → その場で `unbutton: false` |
+| 429 (`rate_limited`) | そのサイクルの後始末を止める。回数には数えない (閉じてからの時間が諦めを担う) |
+| network / 5xx / その他 (一時的) | `unbutton_tries` を 1 足す。`UNBUTTON_MAX_TRIES` (5) 回で諦める |
+| 閉じてから `UNBUTTON_GIVE_UP_SECONDS` (1 時間) 経過 | 結果にかかわらず諦める |
+| `message_id` が無い | 通信せず外す |
+
+**諦めても安全な理由**: 「消えないボタン」は押されても、閉じた質問 (`expired` / `withdrawn` / `answered`) は §2-3 の照合 (台帳の status) で
+拒否され、転送されない (`answerCallbackQuery` で「期限切れ / 取り下げ」)。ボタンを消すのは見た目の後始末で、答えの正しさを守っているのは台帳。
+試行の少ない順に回すので、失敗し続ける 1 件が他の件を止めない。`needs_net` (`run_cycle` が poll を起動する条件) も `unbutton` が外れれば偽になり、
+永久に poll を起動し続けない。`unbutton_tries` は任意の欄 (`telegram_question_entry_problem` が非負整数を検査)。旧コードは読み捨てる。
+
+テスト: `tests/test_telegram_receive_not_starved.py` (`timeout 8` のサブプロセスで編集が遅い再現・全後始末メソッド × 失敗の種類 × 1 サイクルで受信・
+順序・件数と時間の上限・諦めの表・構造 (poll の経路の `api_call` は全部 `timeout=` を取る・受信が後始末より先))。
+
 ### 2-4. offset
 
-- `telegram-offset.json` に `{"offset": N, "last_poll_at": …}` (**書き手は `poll` だけ**。§1-3 の `telegram-poll.lock` で
+- `telegram-offset.json` に `{"offset": N, "last_poll_at": …, "bot_id": …, "chat_hash": …}` (識別子は §2-5b。別の bot のものは使わず捨てる) (**書き手は `poll` だけ**。§1-3 の `telegram-poll.lock` で
   2 つの `poll` が重ならない。`ask_user.sh` や段階 2 の送信は触らない — t002 P2-3)。
   `getUpdates(offset=N, timeout=0, allowed_updates=["callback_query","message"])`。
 - **offset を進めるのは、その update を処理し終えた (台帳に答えを書いた / 拒否して返信した / 無関係と確定した) 後**。
@@ -285,6 +360,94 @@ open ──message_id が null のまま 5 分──▶ withdrawn  (§2-3b: ask 
 offset とレート系を別ファイルにしたのはそのため (offset は 1 者、レートは 2 者)。
 5 つとも `notified-state.json` と同じ置き場・同じ入口 (`lib_daemon_state`)・同じ「消してよい」の位置づけ。
 CLAUDE.md の不変条件 7 の列挙に足す (PR-A で 4 つ、PR-B で `escalation-state.json`)。
+
+### 2-5b. 認証情報が変わったとき・旧形式のとき — 永続する状態ファイルの全表 (PR #281 の Codex P1・2 巡目)
+
+**P1 の欠陥**: 質問台帳と offset が「どの bot・どの chat のものか」を持たなかった。認証情報を切り替える (source の `op` ↔ `file`・1Password で
+トークンを差し替える・別の bot / chat にする) と、(1) **前の bot の offset を新しい bot の `getUpdates` に使う** (`update_id` の列は bot ごと。
+新しい bot の update を飛ばす / 古いものを読み直す)、(2) **前の bot で出した open な質問が、新しい bot の返信・ボタンと照合されうる**
+(`message_id` は chat ごとの連番で衝突する → 別の質問への答えとして Director に転送される)。**同じ族** = 永続する状態が「誰のものか」を持たず、
+今の認証情報のものと取り違える。そこで永続する状態ファイルを**全部**挙げ、2 つの場合の扱いを 1 行ずつ決めた。
+
+**識別子**: `bot_id` (token の `:` の前の数字) と `chat_hash` (chat_id の sha256 の先頭 12 hex) — **秘密でない**。`telegram-receiver.json` が既に持つものと
+同じ値 (`Credentials.bot_id` / `.chat_hash`)。token・chat_id そのものは書かない。`lib_daemon_state` の検証は「両方あるか両方無いか」「bot_id が非負の整数」
+「chat_hash が 12 hex」(違えばファイルが読めない扱い = 不変条件 1 のとおり黙って潰さない)。
+
+**「束縛されている」の定義 (`lib_telegram.is_bound`)**: 状態の `bot_id` と `chat_hash` が**今の解決結果と両方一致**。識別子の無い (旧形式の) 状態は
+**束縛の証拠が無い = 別物**として扱う (「無いから同じ」と読まない — 識別子導入前に別の bot で書かれた可能性を排除できない)。
+
+| 状態ファイル | 書き手 | 認証情報が変わったとき (識別子が不一致) | 識別子が無い旧形式のとき (この PR の中で書かれたもの) | 通知 |
+|---|---|---|---|---|
+| `telegram-questions.json` の **open** な質問 | `ask` / `poll` / `run_cycle` | **`withdrawn`** (`closed_reason: identity_changed`・`unbutton: false`)。**ボタンを消す試みはしない** (別の bot の message_id では消せない)。照合の相手にも保留の理由にもしない (`classify_update` に identity を渡し、束縛されていない質問を台帳から除く)。`ask` の上限 (8 件) にも数えない | 同じ (別の bot のものかもしれない) → `withdrawn` | **Director に 1 回** (取り下げた qid の列。dispatcher が `notify_state_once`)。押された古いボタンは「不明な質問」で断られる (転送されない) |
+| 同 **answered / expired / withdrawn** の質問 | 同 | **触らない** (閉じた質問は照合の相手にならない。`answered` で `forwarded=false` のものは台帳の中身だけで転送できるので、切り替えの前に受けた答えを失わない) | 触らない | 無し |
+| `telegram-offset.json` | `poll` のみ | **捨てて最初から** (`offset=0`)。新しい bot の `getUpdates` に古い bot の `update_id` を使わない。以後は新しい identity を書く | 同じ (捨てる) | 無し (台帳が先に取り下げられているので、読み直した古い update は不明として断られるだけ) |
+| `telegram-send.json` (レート・バックオフ) | `ask` と dispatcher の送信 (ロックの下) | **空から** (別の bot のバックオフ・429 の `retry_after` で新しい bot の送信を止めない)。以後は新しい identity を書く | 同じ (空から) | 無し |
+| `telegram-receiver.json` | dispatcher のみ | 既存の `receiver_verdict` が `receiver_mismatch` で `ask` を断る (P1-2 / §1-1)。心拍が次のサイクルで新しい identity を書き直す | 識別子欠け = `receiver_unknown` で断る (既存) | 既存 (§1-1) |
+| `escalation-state.json` (段階上げ・PR-B) | dispatcher のみ | 質問と結び付かない (時計だけ) ので束縛しない | 同左 | — |
+
+**質問を参照する呼び出しは関所を通る** — 状態ファイルの表では呼び出しの漏れを追えない (P1・4 巡目)。§2-5c。
+
+決めたこと:
+
+- **offset は「最初から」(`0`) にした。「getUpdates の最新に合わせる」は選ばない**。新しい bot が未読の update を持っているなら、それは**新しい bot 宛の
+  本物の答え**かもしれず、最新に飛ぶと黙って失う (P1 が直した「答えが黙って失われる」と同じ型)。最初から読んでも安全なのは、古い質問は上のとおり取り下げ済みで、
+  新しい bot の update は台帳 (今の identity の質問だけ) と照合され、照合できないものは reject / ignore で捨てられるため。コストは Telegram が保持する
+  未読 update (最大 24 時間・100 件/回) の読み直しだけ。
+- **取り下げは poll の前・サイクルごとに安く行う** (`run_cycle` が `creds` を得た直後。`poll_once` の先頭でも同じ関数を呼ぶ — `ask` と `poll` が別のプロセスで
+  動くので、どちらが先でも束縛されない質問が照合に使われない)。2 回目以降は取り下げる対象が無い (純粋関数・冪等) ので、通知は 1 回になる。
+- **既知の限界**: 取り下げた qid は `run_cycle` の `summary['identity_changed']` でその 1 サイクルだけ出る。Director が不在のサイクルに当たると、
+  `notify_state_once` は「記録せず見送る」が、次のサイクルには列が空なので**届かない**。取り下げ自体は台帳 (`closed_reason`) に残るので、見落としても答えを取り違えない
+  (転送されないだけ)。通知を確実にするなら台帳側 (`closed_reason: identity_changed` かつ未通知) から導く案があるが、この PR では足さない (backlog)。
+- **env の停止スイッチは付けない** (不変条件 5)。束縛の判定は `lib_telegram.is_bound` の 1 か所で、`ask` / `poll` / 送信が同じ答えを出す。
+- 質問台帳・offset を**消してよい**(不変条件 7) ことは変わらない。識別子つきになっても、消せば「古いボタンが不明になる」だけ。
+
+### 2-5c. 質問に結び付く Bot API 呼び出しは関所を通る (PR #281 の Codex P1・4 巡目)
+
+**P1 の欠陥**: §2-5b は質問台帳と offset を bot_id + chat_hash に結び付けたが、**ボタンの後始末** (`editMessageReplyMarkup`) は今の認証情報の `chat_id` で、
+台帳に残った前の bot / chat の質問の `message_id` を編集しにいった。`message_id` は chat ごとの連番なので、認証情報が変わった後に
+(`withdrawn: identity_changed` でなく `expired` で後始末待ちだったもの等)、新しい chat の**同じ番号の無関係なメッセージ**を編集しうる。
+**同じ族 (束縛の確認漏れ) の 2 回目**。§2-5b の「状態ファイルの全表」は、ファイルを挙げたが**ファイルを使う呼び出し**を挙げなかった。表で追うのをやめ、構造で押さえる。
+
+| 質問を参照する呼び出し | 関所 | 束縛が合わないとき |
+|---|---|---|
+| 後始末: `editMessageReplyMarkup` (`_unbutton_pending`) | `question_api_call` | 通信せず `identity_mismatch` → その質問の `unbutton` を外す (**即「諦め」**。§2-3d の予算にも回数にも数えない) |
+| 諦めの通知: `sendMessage` (`_give_up_forwarding`) | 同 | 送らない (別の chat に別の chat の質問の通知を出さない)。`forwarded: gave_up` の印は付く |
+| `ask` の失敗時にボタンを消す: `editMessageReplyMarkup` (`cmd_ask`) | 同 | 同上 (今の identity で書いた直後の質問なので通常は一致する) |
+
+**関所の仕様 (`lib_telegram.question_api_call(creds, entry, method, payload)`)**:
+- `is_bound(entry, identity_of(creds))` でなければ**呼ばずに** `ApiResult(False, error='identity_mismatch')`。識別子の無い旧形式の質問も不一致 (§2-5b)。
+- `chat_id` は `creds` から、`message_id` は `entry` から**関所が埋める** (呼び出し側が渡した値は上書き)。`editMessageReplyMarkup` / `editMessageText` / `deleteMessage` で
+  `message_id` が無ければ `no_message_id` (通信しない)。
+- 呼び出し側は `identity_mismatch` をその質問の後始末の対象から外す。押されても台帳の照合 (§2-5b) で断られるので、ボタンが残っても安全。
+- 関所の外で `api_call` を直接呼べるのは、質問の `message_id` を参照しない 3 つだけ: `send_message` (質問を新しく**送る**)・`_receive_updates` (`getUpdates`)・
+  `poll_once` の `answerCallbackQuery` (今の bot の getUpdates が返した `callback_query_id` への応答)。
+
+**構造テスト** `tests/test_telegram_question_gate.py`: `lib_telegram.py` を ast で走査し、`api_call(...)` / `x.api_call(...)` の呼び出しが**関所の関数の中か、上の許可表の (関数, メソッド) にあるか**を確かめる。
+メソッド名が文字列定数でない呼び出しも落とす (証明できない)。許可表の項目が消えても落ちる (表が腐らない)。陽性対照 (迂回の実際の形 4 つ) を置いてある。
+**赤の実証**: ① 関所の照合を外す → 再現テスト 2 件が赤。② 関所を迂回する `api_call(..., 'deleteMessage', ...)` を足す → 構造テストが赤。③ 後始末を旧実装に戻す → 5 件赤。
+
+### 2-5d. 状態ファイルの読み口: 無い / 読めない / 形が違う (PR #281 の Codex P2・5 巡目)
+
+5 巡目の P2: `_receive_updates` が読めない offset を `{}` に置き換えた後 `offset_state['offset']` を引き、KeyError。ファイルが壊れている限り毎サイクル同じ所で落ち、押下が受信されなかった
+(dispatcher のサイクル自体は `run_cycle` の外側の `try/except` で落ちないが、受信は永久に止まる)。**読めない値を `{}` / `None` に潰してから中身を読む**形が原因なので、`lib_telegram.py` の全読み口を表にした。
+`load_json_store` は 3 つとも別の値で返す: 無い = `Unreadable(ENOENT)` (`is_missing`)・読めない / 形が違う (型違い・負の値・list・通常ファイルでない・権限) = それ以外の `Unreadable`。
+
+| 読み口 | 無い | 読めない / 形が違う | 備考 |
+|---|---|---|---|
+| `read_questions` を読むだけの所 (`_unbutton_pending`・`_give_up_forwarding`・`forward_pending`・`cmd_verify`・`cmd_list`) | 何もしない / `not_found` | 何もしない (`unreadable` / `ledger_unreadable` を返す)。**中身は読まない** | 台帳は消して復旧 |
+| `update_questions` | `{}` から始める | `LedgerUnreadable` を投げる (書かない) | 呼び出し側が `suppress` |
+| `run_cycle` の台帳 | 何もしない | 転送せず offset も進めない (log) | |
+| `read_offset` (`_receive_updates`) | 0 から (通常運用・黙る) | **0 から読み直す** (at-least-once。台帳の CAS と `forwarded` で重複は転送されない)。`offset_unreadable` に固定の語 (`EACCES` / `invalid` 等) を 1 回出し、dispatcher が Director に 1 回だけ通知。次の書き込みで正しい形に上書き | 本件。以前は `{}` にして KeyError |
+| `read_offset` (`run_cycle` の `last_poll_at`) | `None` (間隔の判定を飛ばして poll) | `None` (同上。poll が offset を書き直す) | 読めない状態は poll を止めない |
+| `read_receiver` / `receiver_verdict` | 断る | 断る (`ask_user.sh` は exit 4) | 安全側 |
+| `write_receiver_state` | 作る / 何も作らない (未設定) | 書き直す (`exists` は「無い」でないので真) | 書き手は dispatcher だけ |
+| `_update_send_state` | `{}` | `{}` で 1 回送り、書き直す。バックオフの記憶は失う (1 通だけ余計に送りうる。Telegram 側の 429 が再びバックオフを作る) | 意図。`telegram_available` は逆に「使えない」を返す (段階上げは送らない側に倒す) |
+| `telegram_available` | True | False | |
+| `load_telegram_config` (config) | 既定値 | 既定値 (= 未設定 = 何も送らない側) | |
+
+読めない値を空と同じ形で読み進める所は上の `read_offset` 1 か所だけだった。残りは「読まない」か「書き直す」のどちらかを意図して選んでいる。
+**テスト**: `tests/test_telegram_unreadable_offset_still_receives.py` (壊れ・型違い・負・list・通常ファイルでない・権限なしの 6 形で押下が受信され、offset が直り、重複は転送されない・送信状態の族)・
+`tests/test_telegram_dispatcher_glue.py::test_an_unreadable_offset_is_reported_to_the_director_once`。
 
 ### 2-6. 受け取らないもの
 

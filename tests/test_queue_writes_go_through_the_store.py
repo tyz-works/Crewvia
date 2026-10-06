@@ -156,7 +156,8 @@ ALLOWED_WRITES: dict[tuple[str, str], tuple[int, str]] = {
     # ---- 入口のスクリプト・hooks ---------------------------------------------------------------------
     ('git-helpers.sh', '<bash>'): (1, R_DIR + "。git worktree の親 dir (`mkdir -p \"$(dirname \"$worktree_path\")\"`)。queue の外。"
                                       "コメント中の `<<X` が走査を打ち切っていたときは見えなかった (t035)"),
-    ('kai-review.sh', '<bash>'): (6, R_MARK + "。reviewer の heartbeat と、review の一時ファイル / worktree (" + R_TMP + ")"),
+    ('kai-review.sh', '<bash>'): (8, R_MARK + "。reviewer の heartbeat と、review の一時ファイル / worktree (" + R_TMP + ")。"
+                                 "card に残す Result の一時ファイル (mktemp。queue / registry ではない)"),
     ('review-plan.sh', '<bash>'): (6, "plan_review.md / plan_review.verdict の tmp+mv と reviewer ログ。書き手 1 者で run_id で鮮度を"
                                      "確かめる読み手がいる (§5.1 の「寄せない」)"),
     ('start.sh', '<bash>'): (7, "Worker の settings / prompt の一時ファイルと refusals.log (registry/start-sh)。queue の状態を書かない。"

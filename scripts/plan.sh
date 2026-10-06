@@ -634,6 +634,21 @@ def split_long_freeform(text, limit=FREEFORM_SUMMARY_LIMIT):
     return summary, text
 
 
+def split_result_file_reason(text, limit=FREEFORM_SUMMARY_LIMIT):
+    """`needs-director --result-file` の理由を (frontmatter の要約, 全文 or None) に分ける。
+
+    要約は**ファイルの最初の空でない行** (limit 字で切る)。呼び出し元 (kai-review.sh 等) が先頭行に 1 行の要約を
+    置く約束で、見出し・file・本文を ' / ' で連結した形 (`split_long_freeform`) だと通知 (dispatcher → Director) が
+    読めない。先頭行が全文 (1 行だけで limit 字以内) のときだけ全文は None (本文に重ねて書かない)。
+    1 行だけでも limit 字を超えるなら要約は切れているので全文を残す。
+    """
+    text = text or ''
+    first = next((ln.strip() for ln in text.splitlines() if ln.strip()), '')
+    rest = text.strip()
+    summary = first if len(first) <= limit else first[:limit].rstrip() + '…(全文は本文を参照)'
+    return summary, (None if rest == first and len(first) <= limit else text)
+
+
 # ---------------------------------------------------------------------------
 # State / mission / task I/O
 # ---------------------------------------------------------------------------
@@ -4338,7 +4353,7 @@ def read_body_arg(opts, file_flag, inline, inline_desc):
     return text.rstrip('\n')
 
 
-def transition_to_needs_director(slug, task_id, meta, body, reason, caller):
+def transition_to_needs_director(slug, task_id, meta, body, reason, caller, splitter=None):
     """card を `needs_director` に遷移させる (試行は `failed` / `NEEDS_DIRECTOR`)。`with_lock()` の中でだけ呼ぶ。
 
     遷移・照合・card の worker の枠の撤去は Controller の `fail_execution`。ここは reason の整形と body だけ
@@ -4347,7 +4362,7 @@ def transition_to_needs_director(slug, task_id, meta, body, reason, caller):
     呼び出し側が `ControllerError` を `_controller_die` で終わらせる。
     pull の G1 (worktree を作れなかった) は同じ書き込みを `WORKSPACE_CREATE_FAILED` で行う (`_pull_worktree_failed`)。
     """
-    summary, full_text = split_long_freeform(reason)
+    summary, full_text = (splitter or split_long_freeform)(reason)
     if full_text is not None:
         body = body.rstrip() + '\n\n## Needs-Director 詳細\n' + full_text.strip() + '\n'
     # 順序は card (正本) が先・assignment (projection) が後 (Controller の中の順序)。逆にすると「in_progress なのに枠が無い」が
@@ -4398,7 +4413,9 @@ def cmd_needs_director(args):
 
         meta, body = _load_task_for_report('needs-director', slug, task_id)
         try:
-            summary, full_text, idempotent = transition_to_needs_director(slug, task_id, meta, body, reason, caller)
+            summary, full_text, idempotent = transition_to_needs_director(
+                slug, task_id, meta, body, reason, caller,
+                splitter=split_result_file_reason if opts.get("--result-file") else None)
         except _EXEC.ControllerError as e:
             _controller_die('needs-director', e)
         if idempotent:

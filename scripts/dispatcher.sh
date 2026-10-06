@@ -3213,6 +3213,16 @@ def _escalation_warn(msg):
         record_notify('escalation_warn')
 
 
+def _escalation_trouble(msg):
+    """台帳に書けない (通知を見送った) ことを Director に知らせる。台帳に依存しない: 間引きは
+    プロセスをまたぐ notify cache (should_notify。NOTIFY_TTL に 1 回) で、台帳とは別のファイル。
+    Director 不在・送信失敗は log だけ (記録しないので戻ったら次の TTL 明けに届く)。"""
+    _escalation_warn('WARNING: ' + msg)
+    key = 'escalation_ledger_unwritable'
+    if should_notify(key) and director_live_for_state_notices() and tmux_send(_director_name(), '[escalation] ' + msg):
+        record_notify(key)
+
+
 def run_escalation_cycle(all_tasks, done_ids_by_mission, task_statuses_by_mission, active_missions):
     try:
         import lib_escalation
@@ -3243,7 +3253,8 @@ def run_escalation_cycle(all_tasks, done_ids_by_mission, task_statuses_by_missio
             telegram_available=lambda: creds is not None and lib_telegram.telegram_available(registry_dir, now),
             send_director=lambda text: tmux_send(_director_name(), text),
             send_telegram=send_telegram,
-            execution_id_of=execution_id_of, session_link=session_link, log=_escalation_warn)
+            execution_id_of=execution_id_of, session_link=session_link, log=_escalation_warn,
+            trouble=_escalation_trouble)
     except Exception as e:
         log(f'[escalation] cycle failed: {type(e).__name__}')
 

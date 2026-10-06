@@ -270,3 +270,17 @@ def test_token_never_appears_in_logs_ledger_or_director_messages(h, api):
     msgs += h.cycle()
     blob = h.log_text() + h.ledger_path.read_text() + "".join(msgs) + "".join(m["message"] for m in FakeMux.sent)
     assert TOKEN not in blob and CHAT not in blob
+
+
+def test_unwritable_ledger_sends_nothing_and_tells_the_director_once(h, api, monkeypatch):
+    import lib_escalation
+    stuck_with_follower(h)
+    h.cycle()
+    h.age(9999)
+    monkeypatch.setattr(lib_escalation, "write_ledger", lambda *a, **k: False)
+    got = []
+    for _ in range(4):
+        got += h.cycle()
+    assert not sends(api) and not [m for m in got if "Director の判断待ちが続いています" in m]
+    troubles = [m for m in got if m.startswith("[escalation] escalation-state に書けない")]
+    assert len(troubles) == 1, "間引きは台帳ではなく notify cache (プロセスをまたぐ) にある"

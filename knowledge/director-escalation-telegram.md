@@ -967,3 +967,19 @@ Telegram だけを根拠にしない) で守られているので、漏洩して
   赤の実証 (欠陥を戻して落ちること): R5 の dedup 除去 / R6 の「Director 不在」分岐除去 / R6 で Telegram 不可のとき R7 に落とさない版 /
   dispatcher の呼び出し除去 (13 本赤)。
 - 本番確認 (未実施 — dispatcher の restart が要る。`scripts/sync-main-checkout.sh`): 使い捨て mission で §9 の手順。
+
+### 11-1. 記録してから送る (PR #283 Codex P2 / t029)
+
+初版は「送ってから台帳に書く」で、**台帳が読めるが書けない**状態 (ディレクトリの権限・ロックが取れ続けない) だと、
+次のサイクルが古い段階を読んで同じ通知を 5 秒ごとに送った。直し:
+
+1. 段階 N を送る**前**に、台帳へ `sending_stage=N` / `sending_at` を書く。**書けなければ送らない** (そのサイクルは見送り)。
+2. 送れたら `stage_sent=N` に進めて sending を外す。失敗したら sending を外し (段階 1 は `stage1_failed_at`) 次のサイクルで再試行。
+3. 結果の書き込みが失敗しても sending が残る → `decide()` の **R5b** (期限内の sending は `none` / keep) が同じ段階を止める。
+4. sending が `SENDING_TIMEOUT_SECONDS` (600 秒) を過ぎたら「失敗」として読む (段階 1 なら `stage1_failed_at`)。送り直せるのは、**その前に送る前の書き込みが成功した**ときだけ
+   — 保存が壊れている間は何度でも見送りで、連投にならない。倒れる向き = 保存が壊れている間は通知が欠ける側。
+5. 見送りは Director に知らせる (`[escalation] escalation-state に書けない…`)。間引きは台帳ではなく notify cache (`should_notify`。別ファイル・プロセスをまたぐ・NOTIFY_TTL に 1 回)。
+   Director 不在・送信失敗なら log だけ。notify cache も書けないと毎サイクル届きうるが、dispatcher の他の通知と同じ前提 (台帳に依存させないことを優先した)。
+
+テスト: `tests/test_escalation_ledger_failures.py` (書き込み失敗を出来事とする長さ 1〜40 のランダム列 300 本 + 個別の再現)・`test_escalation_decide.py` の R5b 行。
+赤の実証: 送る前の書き込みを外す → 112 本赤 / R5b を外す → 31 本赤。

@@ -39,6 +39,9 @@ ENV_TELEGRAM_AFTER = 'CREWVIA_ESCALATION_TELEGRAM_AFTER_SECONDS'
 
 #: 1 サイクルに送る Telegram の段階 2 の上限 (残りは次のサイクル。設計 §7)
 MAX_TELEGRAM_PER_CYCLE = 3
+#: 「送る」を台帳に書いた (sending) まま結果が書けなかったものを、失敗扱いにして 1 度だけ送り直せるようにするまでの秒数。
+#: 送る前の書き込みが成功した後にしか再送しないので、保存が壊れている間に連投にはならない (設計 §11)。
+SENDING_TIMEOUT_SECONDS = 600.0
 REASON_MAX = 200
 TELEGRAM_TEXT_MAX = 2000
 
@@ -59,7 +62,25 @@ def _set(entry):
 
 def new_entry(execution_id, now):
     return {'execution_id': execution_id, 'first_seen': now, 'stage_sent': 0,
-            'stage_sent_at': None, 'stage1_failed_at': None}
+            'stage_sent_at': None, 'stage1_failed_at': None, 'sending_stage': None, 'sending_at': None}
+
+
+def clear_sending(entry):
+    return dict(entry, sending_stage=None, sending_at=None)
+
+
+def _expire_sending(entry, now):
+    """期限切れの sending は「失敗」として読む (段階 1 なら stage1_failed_at を残す)。純粋。"""
+    stage = entry.get('sending_stage')
+    if stage is None:
+        return entry
+    at = entry.get('sending_at')
+    if is_finite_number(at) and 0 <= now - at < SENDING_TIMEOUT_SECONDS:
+        return entry
+    out = clear_sending(entry)
+    if stage == 1 and out.get('stage1_failed_at') is None:
+        out['stage1_failed_at'] = now
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -81,24 +102,28 @@ def decide(card, entry, now, cfg, director_live, telegram_available):
         return Decision(ACTION_NONE, _set(dict(entry, first_seen=now)))
     if entry['stage_sent'] == 2:                                            # R5
         return Decision(ACTION_NONE, KEEP)
+    entry = _expire_sending(entry, now)
+    if entry.get('sending_stage') is not None:                              # R5b 送る途中 (結果が未記録)
+        return Decision(ACTION_NONE, KEEP)
     elapsed = now - entry['first_seen']
     reachable = (entry['stage_sent'] >= 1 or d <= 0 or not director_live
                  or entry['stage1_failed_at'] is not None)
     if reachable and t > 0 and elapsed >= t and telegram_available:         # R6
-        return Decision(ACTION_TELEGRAM, _set(dict(entry, stage_sent=2, stage_sent_at=now)))
+        return Decision(ACTION_TELEGRAM, _set(clear_sending(dict(entry, stage_sent=2, stage_sent_at=now))))
     if d > 0 and entry['stage_sent'] == 0 and elapsed >= d and director_live:   # R7
-        return Decision(ACTION_DIRECTOR, _set(dict(entry, stage_sent=1, stage_sent_at=now)))
+        return Decision(ACTION_DIRECTOR, _set(clear_sending(dict(entry, stage_sent=1, stage_sent_at=now))))
     return Decision(ACTION_NONE, KEEP)                                      # R8
 
 
 def apply_failure(entry, action, now):
-    """送信が失敗したときの台帳の更新。段階 1 の失敗だけが印を残す (段階 2 はバックオフが間隔を持つ)。"""
-    if action == ACTION_DIRECTOR and entry is not None:
-        out = dict(entry)
-        if out.get('stage1_failed_at') is None:
-            out['stage1_failed_at'] = now
-        return out
-    return entry
+    """送信が失敗したときの台帳の更新 (sending の印は外す)。段階 1 の失敗だけが stage1_failed_at を残す
+    (段階 2 はバックオフが間隔を持つ)。"""
+    if entry is None or action not in (ACTION_DIRECTOR, ACTION_TELEGRAM):
+        return entry
+    out = clear_sending(entry)
+    if action == ACTION_DIRECTOR and out.get('stage1_failed_at') is None:
+        out['stage1_failed_at'] = now
+    return out
 
 
 def blocked_dependents(slug, waiting_id, tasks_in_mission, done_ids, task_statuses):
@@ -226,6 +251,11 @@ def escalation_entry_problem(key, entry):
     for f in ('stage_sent_at', 'stage1_failed_at'):
         if f not in entry or not _is_stamp(entry[f]):
             return f"{key}: {f!r} is {entry.get(f)!r}"
+    stage = entry.get('sending_stage')                  # 任意 (無ければ送る途中ではない)
+    if stage not in (None, 1, 2) or isinstance(stage, bool):
+        return f"{key}: 'sending_stage' is {stage!r}"
+    if not _is_stamp(entry.get('sending_at')) or (stage is not None and entry.get('sending_at') is None):
+        return f"{key}: 'sending_at' is {entry.get('sending_at')!r}"
     return None
 
 
@@ -256,12 +286,13 @@ def write_ledger(registry_dir, ledger):
 
 def run_cycle(registry_dir, all_tasks, done_ids_by_mission, task_statuses_by_mission, active_missions,
               observed_slugs, now, cfg, *, director_live, telegram_available, send_director, send_telegram,
-              execution_id_of, session_link='', log=lambda msg: None):
+              execution_id_of, session_link='', log=lambda msg: None, trouble=None):
     """段階上げの 1 サイクル。**例外は呼び出し側が受ける**。→ 実行した action の `[(key, action, ok)]`。
 
     director_live / telegram_available は**呼べる値** (判断待ちの card があるときだけ・1 回だけ評価する)。
     send_director(text) / send_telegram(text) は成功なら True。
     """
+    trouble = trouble or log
     awaiting = [(slug, meta) for slug, meta in all_tasks if meta.get('status') in AWAITING_DECISION_STATUSES]
     ledger = read_ledger(registry_dir)
     if is_missing(ledger):
@@ -320,24 +351,26 @@ def run_cycle(registry_dir, all_tasks, done_ids_by_mission, task_statuses_by_mis
                     else '🛑 crewvia: Director の判断待ちが続いています')
             lines = notice_lines(head, slug, tid, card.status, now - entry['first_seen'], dependents,
                                  meta.get('needs_director_reason') or '', session_link)
+            # 記録してから送る: 「段階 N を送る」を先に台帳へ書き、書けなければ送らない (設計 §11)。
+            # 送った後の書き込みが失敗しても sending が残るので、次のサイクルは (期限まで) 同じ段階を送らない。
+            # 倒れる向き = 保存が壊れている間は通知が欠ける側。連投にはならない。
+            stage = 1 if action == ACTION_DIRECTOR else 2
+            new_ledger[key] = dict(entry, sending_stage=stage, sending_at=now)
+            if not write_ledger(registry_dir, new_ledger):
+                new_ledger[key] = entry
+                trouble(f'escalation-state に書けないので {key} の段階 {stage} の通知を見送ります '
+                        f'(registry/daemons/{LEDGER_NAME} の権限・空き容量・ロックを確認)')
+                return results
+            ledger = dict(new_ledger)
             if action == ACTION_DIRECTOR:
                 ok = bool(send_director(director_text(lines)))
             else:
                 ok = bool(send_telegram(telegram_text(lines)))
                 telegram_sent += 1
             results.append((key, action, ok))
-            if not ok:
-                failed = apply_failure(entry, action, now)
-                if failed is not entry and failed != entry:
-                    new_ledger[key] = failed
-                    if not write_ledger(registry_dir, new_ledger):
-                        log(f'WARNING: escalation-state に書けない ({key})')
-                    ledger = dict(new_ledger)
-                continue
-            # 送れた後だけ台帳を進める。書けなければ以降の送信を止める (記録できないまま送り続けない)
-            new_ledger[key] = update[1]
+            new_ledger[key] = update[1] if ok else apply_failure(_expire_sending(entry, now), action, now)
             if not write_ledger(registry_dir, new_ledger):
-                log(f'WARNING: escalation-state に書けない ({key}) — この周期の残りを見送ります')
+                log(f'WARNING: escalation-state に結果を書けない ({key}) — sending が残るので同じ段階は送り直しません')
                 return results
             ledger = dict(new_ledger)
             continue
@@ -346,5 +379,5 @@ def run_cycle(registry_dir, all_tasks, done_ids_by_mission, task_statuses_by_mis
         elif update[0] == 'delete':
             new_ledger.pop(key, None)
     if new_ledger != ledger and not write_ledger(registry_dir, new_ledger):
-        log(f'WARNING: escalation-state に書けない — 次のサイクルでやり直します')
+        trouble('escalation-state に書けない (時計・削除の更新) — 次のサイクルでやり直します')
     return results

@@ -28,9 +28,10 @@ def card(status="needs_director", ex=EX, observable=True):
     return E.CardView("m", "t017", status, ex, observable)
 
 
-def entry(first_seen=NOW - 100, stage=0, failed=None, ex=EX):
+def entry(first_seen=NOW - 100, stage=0, failed=None, ex=EX, sending=None, sending_at=None):
     return {"execution_id": ex, "first_seen": first_seen, "stage_sent": stage,
-            "stage_sent_at": None if stage == 0 else first_seen + 1, "stage1_failed_at": failed}
+            "stage_sent_at": None if stage == 0 else first_seen + 1, "stage1_failed_at": failed,
+            "sending_stage": sending, "sending_at": sending_at}
 
 
 def kind(decision):
@@ -63,6 +64,16 @@ ROWS = [
     ("R7 段階 1 は 1 回だけ", card(), entry(NOW - 400, 1), (D, T), True, True, "none", "keep", None),
     ("R7 needs_human_review も対象", card("needs_human_review"), entry(NOW - 300, 0), (D, T), True, True,
      "director_renotice", "set", 1),
+    ("R5b 段階 1 を送る途中 (期限内) → 送らない", card(), entry(NOW - 400, 0, sending=1, sending_at=NOW - 5), (D, T), True, True,
+     "none", "keep", None),
+    ("R5b 段階 2 を送る途中 (期限内) → 送らない", card(), entry(NOW - 700, 1, sending=2, sending_at=NOW - 5), (D, T), True, True,
+     "none", "keep", None),
+    ("R5b 段階 1 の sending が期限切れ → 失敗扱いで 1 度だけ送り直せる", card(), entry(NOW - 900, 0, sending=1, sending_at=NOW - 601),
+     (D, T), True, False, "director_renotice", "set", 1),
+    ("R5b 段階 1 の sending が期限切れ・10 分超 → 失敗扱いで段階 2 に進める", card(), entry(NOW - 900, 0, sending=1, sending_at=NOW - 601),
+     (D, T), True, True, "telegram_notice", "set", 2),
+    ("R5b sending の時刻が未来 (壊れた記録) は期限切れ扱い", card(), entry(NOW - 400, 0, sending=1, sending_at=NOW + 99), (D, T), True, True,
+     "director_renotice", "set", 1),
     ("cfg 両方無効 → 何も鳴らさない", card(), entry(NOW - 99999, 0), (0, 0), True, True, "none", "keep", None),
     ("cfg 段階 1 だけ", card(), entry(NOW - 99999, 1), (D, 0), True, True, "none", "keep", None),
     ("cfg 段階 2 だけ・10 分", card(), entry(NOW - 600, 0), (0, T), True, True, "telegram_notice", "set", 2),
@@ -83,7 +94,8 @@ def test_oracle_table(name, c, e, cfg, dl, ta, action, ledger, stage):
 def test_new_event_resets_first_seen_and_clears_failure_mark():
     got = E.decide(card(ex=OTHER_EX), entry(NOW - 9999, 2, failed=NOW - 1), NOW, (D, T), True, True)
     assert got.ledger_update[1] == {"execution_id": OTHER_EX, "first_seen": NOW, "stage_sent": 0,
-                                    "stage_sent_at": None, "stage1_failed_at": None}
+                                    "stage_sent_at": None, "stage1_failed_at": None,
+                                    "sending_stage": None, "sending_at": None}
 
 
 def test_apply_failure_marks_only_stage_one_and_keeps_the_first_mark():

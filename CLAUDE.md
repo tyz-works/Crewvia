@@ -90,7 +90,7 @@ registry/ workers.yaml / workers/ / heartbeats/ / mux/ / retirements/ / task-gra
 4. デーモンの再起動は `lib_daemon_watch.py restart`。`lib_mux.py kill` / `spawn` を素で叩かない
 5. 共有規則に env 停止スイッチを付けない（dispatcher と plan.sh で答えが割れる）
 6. `handoff_path` は絶対パスのみ
-7. `registry/daemons/*` の通知台帳（`notified-state.json`）・拒否記録（`review-refusals/`）・Telegram の状態（`telegram-questions.json` / `telegram-offset.json` / `telegram-send.json` / `telegram-receiver.json`）は消してよい。それが復旧手順（質問台帳を消すと古いボタンが「不明」で断られるだけ）
+7. `registry/daemons/*` の通知台帳（`notified-state.json`）・拒否記録（`review-refusals/`）・Telegram の状態（`telegram-questions.json` / `telegram-offset.json` / `telegram-send.json` / `telegram-receiver.json`）・段階上げの台帳（`escalation-state.json`。消すと時計が最初からになる = 通知が遅れる側）は消してよい。それが復旧手順（質問台帳を消すと古いボタンが「不明」で断られるだけ）
 
 ---
 
@@ -122,6 +122,7 @@ registry/ workers.yaml / workers/ / heartbeats/ / mux/ / retirements/ / task-gra
 | `CREWVIA_DAEMON_RESPAWN_GRACE_SECONDS` / `CREWVIA_DAEMON_PAUSE_REPORT_AFTER_SECONDS` / `CREWVIA_DAEMON_HOLD_REPORT_AFTER_SECONDS` / `CREWVIA_DAEMON_WATCH_LOCK_TIMEOUT_SECONDS` / `CREWVIA_DAEMON_MAINTENANCE_LOCK_TIMEOUT_SECONDS` | 相互監視の残りのしきい値（既定 120 / 1800 / 1800 / 2 / 60 秒）。`config/crewvia.yaml` の `daemons:` ブロック（コメント付き）より優先。詳細: `knowledge/daemon-authority.md` §7-8 |
 | `CREWVIA_RULE5_BACKGROUND_JOB_MAX_SECONDS` | Rule 5（`agents/director.md` §17）が「裏で `run_in_background` / Monitor が生きている」を理由に通知を黙らせる上限（既定 1800 秒 = 30 分）。この秒数を超えて job が見え続けたら、生きていても通常の idle-with-task 判定に戻す（B1 / t074。`knowledge/watchdog-idle-judgment.md` §8） |
 | `CREWVIA_MAIN_CHECKOUT_DRIFT_INTERVAL` | dispatcher が主 checkout と `origin/main` のずれ（`main-checkout-drift`）を確認する周期（既定 180 秒）。ずれを見つけると Director に 1 回だけ通知し、`scripts/sync-main-checkout.sh` を実行すれば ff とデーモン restart まで完結する（B2 / t114。`knowledge/dispatcher-restart-after-merge.md`） |
+| `CREWVIA_ESCALATION_DIRECTOR_AFTER_SECONDS` / `CREWVIA_ESCALATION_TELEGRAM_AFTER_SECONDS` | Director の判断待ちの段階上げ（段階 1 = Director に再通知 / 段階 2 = Telegram）の経過秒（既定 300 / 600）。`config/crewvia.yaml` の `escalation:` より優先。0 以下でその段階を使わない。dispatcher だけが読むしきい値（共有規則ではない）。`knowledge/director-escalation-telegram.md` §5 |
 | `CREWVIA_TASK_GRAPH` | herdr-task-graph 用 `tasks.json` の生成 ON/OFF。既定は有効、`0` で完全に無効（1 バイトも書かず、ログも出さない）。生成は queue を書き換える plan.sh サブコマンドすべてに乗るので、重い・壊れたときの退避路として残してある |
 | `CREWVIA_TASK_GRAPH_FILE` | 生成物の書き先。既定は `$CREWVIA_REPO_ROOT/registry/task-graph/tasks.json`（未設定時のみ plan.sh の位置基準にフォールバック）。plugin にはこのパスを **plugin の config dir への symlink** で参照させる（`HERDR_TASKS_FILE` は稼働中の herdr のペインに届かないので使わない。`knowledge/task-graph.md`） |
 | `CREWVIA_MUX` | mux バックエンド選択: `tmux` / `herdr`。config `mode:` より優先 |

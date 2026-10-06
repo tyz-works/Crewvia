@@ -215,7 +215,7 @@ def test_the_vocabulary_is_self_consistent():
     assert "cancelled" not in S.TASK_STATUSES
     assert len(S.TASK_STATUSES) == 12
     for group in (S.TERMINAL_STATUSES, S.RELEASED_WORK_STATUSES, S.ASSIGNMENT_HOLDING_STATUSES,
-                  S.WAITS_ON_DIRECTOR_STATUSES, S.PR_NOT_AWAITED_STATUSES, S.EXECUTING_STATUSES,
+                  S.WAITS_ON_DIRECTOR_STATUSES, S.AWAITING_DECISION_STATUSES, S.PR_NOT_AWAITED_STATUSES, S.EXECUTING_STATUSES,
                   set(S.HELD_DEP_STATUSES)):
         assert group <= S.TASK_STATUSES, group - S.TASK_STATUSES
     for command, sources in S.ACCEPTS_FROM.items():

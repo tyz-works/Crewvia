@@ -2994,6 +2994,9 @@ def dispatch():
                              director_live=director_live_for_state_notices):
             log(f"handoff detected: {slug}/{task_id} -> notified director")
 
+    # PR-B: 判断待ちが続いたら 5 分で Director に再通知・10 分で Telegram (設計 §5)。all_tasks を使い回す。
+    run_escalation_cycle(all_tasks, done_ids_by_mission, task_statuses_by_mission, active_missions)
+
     # t010: 状態を離れた task の「伝えた」記録を捨てる (Director が pending に戻し、
     # 同じ理由でまた落ちたのは新しい事象なので、届かなければならない)。
     prune_told(live_state_keys, observed_missions(all_tasks, active_missions))
@@ -3194,6 +3197,58 @@ def check_main_checkout_drift():
 
 
 # ---------------------------------------------------------------------------
+# 段階上げ (PR-B / knowledge/director-escalation-telegram.md §5)
+# ---------------------------------------------------------------------------
+#
+# 判断待ち (AWAITING_DECISION_STATUSES) が続いたら、5 分で Director に再通知・10 分で Telegram。
+# 判定は lib_escalation.decide() (純粋関数・網羅テスト)。ここは入力を集めて送るだけ。
+# 全体を try/except で包むのは run_telegram_cycle() と同じ理由: 安全網が dispatch サイクルを落としてはならない。
+
+_TG_RUNTIME = {'creds': None}      # run_telegram_cycle() が今サイクルの認証情報を置く (env には出さない)
+
+
+def _escalation_warn(msg):
+    if should_notify('escalation_warn'):
+        log(msg)
+        record_notify('escalation_warn')
+
+
+def run_escalation_cycle(all_tasks, done_ids_by_mission, task_statuses_by_mission, active_missions):
+    try:
+        import lib_escalation
+        import lib_telegram
+        now = time.time()
+        cfg = lib_escalation.load_cfg(REPO_ROOT / 'config' / 'crewvia.yaml', warn=_escalation_warn)
+        creds = _TG_RUNTIME['creds']
+        registry_dir = REGISTRY_DIR / 'daemons'
+        tg_config = lib_telegram.load_telegram_config()
+        session_link = (os.environ.get('CREWVIA_DIRECTOR_SESSION_URL') or tg_config.get('session_link') or '').strip()
+
+        def send_telegram(text):
+            res = lib_telegram.send_message(registry_dir, creds, text)
+            if not res.ok and res.warn:
+                log(f'WARNING: telegram unreachable ({res.error})')
+            return res.ok
+
+        def execution_id_of(meta):
+            ex = meta.get('current_execution_id')
+            if isinstance(ex, str) and ex:
+                return ex
+            return 'fp:' + fingerprint('needs_director', (meta.get('needs_director_reason') or '').strip())
+
+        lib_escalation.run_cycle(
+            REGISTRY_DIR, all_tasks, done_ids_by_mission, task_statuses_by_mission, set(active_missions),
+            observed_missions(all_tasks, active_missions), now, cfg,
+            director_live=director_live_for_state_notices,
+            telegram_available=lambda: creds is not None and lib_telegram.telegram_available(registry_dir, now),
+            send_director=lambda text: tmux_send(_director_name(), text),
+            send_telegram=send_telegram,
+            execution_id_of=execution_id_of, session_link=session_link, log=_escalation_warn)
+    except Exception as e:
+        log(f'[escalation] cycle failed: {type(e).__name__}')
+
+
+# ---------------------------------------------------------------------------
 # Telegram の経路 (PR-A / knowledge/director-escalation-telegram.md §1・§1-1・§3)
 # ---------------------------------------------------------------------------
 #
@@ -3213,6 +3268,7 @@ def run_telegram_cycle():
             config, environ={'_CREWVIA_TG_RESOLVED_TOKEN': _TG_CARRIED['_CREWVIA_TG_RESOLVED_TOKEN'],
                              '_CREWVIA_TG_RESOLVED_CHAT_ID': _TG_CARRIED['_CREWVIA_TG_RESOLVED_CHAT_ID']},
             carried=True)
+        _TG_RUNTIME['creds'] = creds
         if creds is None and reason == 'no_credentials' and _TG_RESOLVE_REASON != 'ok':
             reason = _TG_RESOLVE_REASON      # 起動時に取り出せなかった理由 (固定コード) を心拍に残す
 

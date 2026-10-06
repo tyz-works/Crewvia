@@ -184,6 +184,17 @@ approval_channel:
     # 環境変数: APPROVAL_TOKEN_TTL_SECONDS
     token_ttl_seconds: 900
 
+# Director の判断待ち (needs_director / needs_human_review) が続いたときの段階上げ。
+# dispatcher が判定する (設計: knowledge/director-escalation-telegram.md §5)。段階 1・2 とも 1 試行に 1 回だけ。
+#   段階 1: Director に再通知（Telegram の設定が無くても動く）
+#   段階 2: Telegram でユーザーに通知（Telegram が使えるときだけ。使えなければ見送って次のサイクルで再評価）
+# 0 以下 = その段階を使わない。両方使うときは telegram_after_seconds > director_after_seconds
+# （逆順・数値でない値は WARNING + 既定値）。env: CREWVIA_ESCALATION_DIRECTOR_AFTER_SECONDS /
+# CREWVIA_ESCALATION_TELEGRAM_AFTER_SECONDS（config より優先）。
+escalation:
+  director_after_seconds: 300
+  telegram_after_seconds: 600
+
 # ===== Telegram（Director の質問・ボタン・受信。任意） =====
 # Director がユーザーに選択肢つきの質問を Telegram で送り、ボタンの答えを Director の画面に届ける
 # （scripts/ask_user.sh。設計: knowledge/director-escalation-telegram.md）。

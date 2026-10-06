@@ -68,6 +68,11 @@ EXECUTING_STATUSES = frozenset({'in_progress', 'verifying'})
 #: worker は残る。
 WAITS_ON_DIRECTOR_STATUSES = frozenset({'needs_director'})
 
+#: 人の判断を待っている status (段階上げの対象。knowledge/director-escalation-telegram.md §5-1)。
+#: `WAITS_ON_DIRECTOR_STATUSES` は広げない — あれは assignment を撤去する / 孤児の枠を作る集合として
+#: 使われ、`needs_human_review` は assignment を撤去しない。
+AWAITING_DECISION_STATUSES = frozenset(WAITS_ON_DIRECTOR_STATUSES | {'needs_human_review'})
+
 #: もう PR 番号を待っていない status (`codex_reviews_awaiting_pr` が数えない)。
 PR_NOT_AWAITED_STATUSES = frozenset({
     'done', 'verified', 'failed', 'skipped', 'verification_failed',

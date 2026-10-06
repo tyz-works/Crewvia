@@ -949,3 +949,21 @@ Telegram だけを根拠にしない) で守られているので、漏洩して
 - `WAITS_ON_DIRECTOR_STATUSES = {'needs_director'}` (`lib_task_status.py:69`)。
 - Telegram の仕様 (callback_data 64 バイト・1 秒 1 通・本文 4096) は設計時の知識で、**PR-A の実装時に
   公式の Bot API ドキュメントで再確認する** (この文書では実測していない)。
+
+## 11. PR-B の実装メモ (t007)
+
+- `scripts/lib_escalation.py`: `decide()` / `apply_failure()` (純粋関数。規則表 R1〜R8 は §5-4 のまま)・`run_cycle()` (台帳の読み書きと送信の順序)・
+  `load_cfg()` / `parse_cfg()` (§5-3)・`escalation_state_problem()` (台帳の形。`lib_daemon_state` ではなくこの lib に置いた — 書き手も読み手もここだけ)。
+  通信はしない (送信は dispatcher が関数で渡す)。`blocked_dependents()` は `lib_dep_rules.card_dependencies` を通す (依存の定義を持たない)。
+- `dispatcher.sh`: `run_escalation_cycle()` を `needs_director` / handoff の後・`prune_told` の前に 1 か所 (`all_tasks` を使い回す)。
+  段階 2 は `lib_telegram.send_message` (プロセス内。token は `_TG_RUNTIME` に持ち env に出さない・`timeout` は 5 秒)。`telegram_available` は
+  `lib_telegram.telegram_available`。1 サイクルの Telegram は最大 3 通。
+- **問い合わせは鳴らしうるときだけ**: mux (`director_live`) と Telegram の可否は、経過が最小のしきい値に届いた card があるときにだけ 1 回評価する
+  (`_could_act`)。待機中の task が増えても毎サイクル `mux list` を叩かない (`test_a_cycle_with_only_already_told_states_does_not_ask_the_mux`)。
+- 台帳は「送れた後だけ」書く。書けなければその周期の残りの送信を止める (記録できないまま送り続けない)。台帳が `Unreadable` なら段階上げ全体を見送る (§5-4)。
+- Director 宛 (段階 1) は 1 行 (` / ` 区切り。mux send は改行で複数送信になるため)、Telegram 宛は同じ項目の複数行。
+- テスト: `tests/test_escalation_decide.py` (手書き oracle 表 25 行・全直積の不変条件・ランダム列 400 本・cfg・台帳の形・文面) /
+  `tests/test_escalation_dispatcher_cycle.py` (本物の dispatcher 1 サイクル + 偽の Bot API。t017 → t006 の事故の再現)。
+  赤の実証 (欠陥を戻して落ちること): R5 の dedup 除去 / R6 の「Director 不在」分岐除去 / R6 で Telegram 不可のとき R7 に落とさない版 /
+  dispatcher の呼び出し除去 (13 本赤)。
+- 本番確認 (未実施 — dispatcher の restart が要る。`scripts/sync-main-checkout.sh`): 使い捨て mission で §9 の手順。

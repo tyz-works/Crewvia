@@ -993,6 +993,7 @@ PR-A (#281)・PR-B (#283) の merge と dispatcher の restart の後に本番�
 
 - `dispatcher.version.json`: `head = a60fdff3942dd34ba0684a6dc05e27315d28117b` (= `origin/main`)・`files_digest = 051ffb53…caaad0b`。
 - dispatcher の起動は 22:48:27 (ps の lstart)。receiver は `enabled: true / reason: ok / bot_id: 8958114524`。
+- **`files_digest` が覆う範囲に注意**: 覆うのは `dispatcher.sh`・`lib_daemon_watch.*`・`lib_mux.py`・`lib_retirement.py` だけで、`lib_escalation.py` / `lib_telegram.py` は入っていない。この 2 つが a60fdff の版であることは、`head = a60fdff` かつ `scripts/` に未コミットの変更が無いこと (dispatcher はサイクルごとに新しい python で import し直す) で証明している。
 
 ### 12-2. Telegram の往復 — 合格
 
@@ -1012,17 +1013,21 @@ PR-A (#281)・PR-B (#283) の merge と dispatcher の restart の後に本番�
 
 - 段階 1・2 とも **1 回だけ**。23:04 まで台帳は `stage_sent=2` のまま追加の送信なし。
 - Telegram の送信記録 (`telegram-send.json`): `last_sent_at` は段階 2 の時刻と一致・`consecutive_failures=0`。
-  ユーザーの端末での受信の目視は Director の確認に委ねた (この文書時点では未記録)。
+  受信の目視: 段階 1 は Director の画面に 1 回届いた。段階 2 はユーザーの Telegram に **1 通だけ**届いた (2026-10-07、ユーザーが確認)。
+  段階 1 の文面に出た「理由: (理由未記載)」は、`esc-obs-t011` の card に `needs_director_reason` が無かったため (使い捨て mission の作り方の都合)。通常の needs_director では理由が入る。§6 の文面の確認としては、この欄は読まない。
+  PR-B merge 直後 (Telegram 未設定の時点) にも段階 1 が 1 回届いている (段階 2 は無し)。
 - 解除: t001 を done にすると 20 秒以内に `escalation-state.json` が `{}` に戻り、以後送信なし。
 - 後始末: `state.yaml` を元に戻し (`active_missions` から外した)。t002 は pending のまま残り mission は非 active。
 - 観察の型: 台帳を 15 秒ごとに記録し、遷移の行だけ抜き出す。経過は `first_seen` との差で出す。
 
-### 12-4. 分類器の観察 — 通った
+### 12-4. 分類器の観察 — probe は通った (確かめとしては弱い)
 
 - Telegram の答えを根拠に Director が無害な操作 (`plan.sh update t002 --mission esc-obs-t011 --description "classifier probe"`) を実行した。
   card の description が `classifier probe` に変わっていて、**実行は拒否されなかった**。
-- merge は試していない。§3-2 のとおり、破壊的・外向きの操作は Telegram の答えだけを根拠にしない。
+- **留保**: この probe (description の update) は、普段の Director の操作でも止められない種類なので、分類器の確かめとしては弱い。**merge など外部に影響する操作を、Telegram の答えだけを根拠に分類器が通すかは未確認**。
+- merge は試していない。§3-2 のとおり、破壊的・外向きの操作は Telegram の答えだけを根拠にしない。§6 の「認められなければ画面で確認を求める」手順はそのまま残す。
 
 ### 12-5. 残り
 
-- 札の再押下の実測 (12-2)。ユーザーの端末での段階 2 の受信確認 (12-3)。
+- 札の再押下の実測 (12-2)。
+- 外部に影響する操作 (merge 等) を Telegram の答えだけで分類器が通すかの確認 (12-4)。

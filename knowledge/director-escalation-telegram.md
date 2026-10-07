@@ -966,7 +966,7 @@ Telegram だけを根拠にしない) で守られているので、漏洩して
   `tests/test_escalation_dispatcher_cycle.py` (本物の dispatcher 1 サイクル + 偽の Bot API。t017 → t006 の事故の再現)。
   赤の実証 (欠陥を戻して落ちること): R5 の dedup 除去 / R6 の「Director 不在」分岐除去 / R6 で Telegram 不可のとき R7 に落とさない版 /
   dispatcher の呼び出し除去 (13 本赤)。
-- 本番確認 (未実施 — dispatcher の restart が要る。`scripts/sync-main-checkout.sh`): 使い捨て mission で §9 の手順。
+- 本番確認: 実施済み (§12)。
 
 ### 11-1. 記録してから送る (PR #283 Codex P2 / t029)
 
@@ -983,3 +983,46 @@ Telegram だけを根拠にしない) で守られているので、漏洩して
 
 テスト: `tests/test_escalation_ledger_failures.py` (書き込み失敗を出来事とする長さ 1〜40 のランダム列 300 本 + 個別の再現)・`test_escalation_decide.py` の R5b 行。
 赤の実証: 送る前の書き込みを外す → 112 本赤 / R5b を外す → 31 本赤。
+
+## 12. 本番確認 (t011, 2026-10-07)
+
+PR-A (#281)・PR-B (#283) の merge と dispatcher の restart の後に本番で確かめた結果。認証情報は §10 の A' (`source: op` + `crewvia-op`)。
+判定は `registry/daemons/telegram-receiver.json` の `enabled` / `reason` / `bot_id` だけで行い、`~/.local/share/crewvia/*` は開いていない。
+
+### 12-1. 走っているコードの版
+
+- `dispatcher.version.json`: `head = a60fdff3942dd34ba0684a6dc05e27315d28117b` (= `origin/main`)・`files_digest = 051ffb53…caaad0b`。
+- dispatcher の起動は 22:48:27 (ps の lstart)。receiver は `enabled: true / reason: ok / bot_id: 8958114524`。
+
+### 12-2. Telegram の往復 — 合格
+
+- Director が `ask_user.sh ask` で試験の質問 `q-d9708959` を送信 (exit 0・22:49:14)。ユーザーが「届いた」を押した (22:50:53)。
+- Director の画面に `[telegram-answer] q=q-d9708959 task=…/t011 choice="届いた" index=0 task_state=in_progress` が届いた。
+- 台帳: `status=answered` / `forwarded=true` / `closed_at` あり / `execution_id` は t011 の実行 ID。`ask_user.sh verify` も同じ値。
+- **札の再利用不可は、台帳が `answered` で閉じていることまでの確認**。もう一度押してもらう実測はしていない (残す)。
+
+### 12-3. 段階上げ — 合格
+
+使い捨て mission (`esc-obs-t011`) の t001 を `needs_director`、t002 を `blocked_by t001` にし、`active_missions` に足して dispatcher に見せた。
+
+| 事象 | 時刻 | `first_seen` (22:49:55) からの経過 |
+|---|---|---|
+| 段階 1 (`stage_sent=1`) | 22:55:01 | 301.8 秒 (設定 300) |
+| 段階 2 (`stage_sent=2`) | 23:00:11 | 605.4 秒 (設定 600) |
+
+- 段階 1・2 とも **1 回だけ**。23:04 まで台帳は `stage_sent=2` のまま追加の送信なし。
+- Telegram の送信記録 (`telegram-send.json`): `last_sent_at` は段階 2 の時刻と一致・`consecutive_failures=0`。
+  ユーザーの端末での受信の目視は Director の確認に委ねた (この文書時点では未記録)。
+- 解除: t001 を done にすると 20 秒以内に `escalation-state.json` が `{}` に戻り、以後送信なし。
+- 後始末: `state.yaml` を元に戻し (`active_missions` から外した)。t002 は pending のまま残り mission は非 active。
+- 観察の型: 台帳を 15 秒ごとに記録し、遷移の行だけ抜き出す。経過は `first_seen` との差で出す。
+
+### 12-4. 分類器の観察 — 通った
+
+- Telegram の答えを根拠に Director が無害な操作 (`plan.sh update t002 --mission esc-obs-t011 --description "classifier probe"`) を実行した。
+  card の description が `classifier probe` に変わっていて、**実行は拒否されなかった**。
+- merge は試していない。§3-2 のとおり、破壊的・外向きの操作は Telegram の答えだけを根拠にしない。
+
+### 12-5. 残り
+
+- 札の再押下の実測 (12-2)。ユーザーの端末での段階 2 の受信確認 (12-3)。

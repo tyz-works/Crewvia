@@ -3585,9 +3585,12 @@ def cmd_pull(args):
         # (store-check の in_progress_without_worker)。**ロックを取る前・何かを読む前**に断る
         # (retirement_reservation('') / registered_worker('') に空を渡さない)。exit 2 は idle の意味
         # (Worker が無限に再試行する) なので使わず exit 1。
-        die("pull requires the worker's name: pass --agent <name> or set AGENT_NAME. "
-            "(agent が空のまま pull すると worker 不明の in_progress card ができるので、何も書かずに断ります。"
-            "テスト用の `env -u AGENT_NAME` / `env -i` を pull に持ち込まないでください)")
+        # UsageExit (何も書かずに終わった印) で出す: 普通の SystemExit (die) だと末尾の dispatch が
+        # task-graph を再生成してしまい、「1 バイトも書かない」に反する。
+        print("pull requires the worker's name: pass --agent <name> or set AGENT_NAME. "
+              "(agent が空のまま pull すると worker 不明の in_progress card ができるので、何も書かずに断ります。"
+              "テスト用の `env -u AGENT_NAME` / `env -i` を pull に持ち込まないでください)", file=sys.stderr)
+        raise UsageExit(1)
     require_valid_agent_name(agent)
 
     # Director は pull しない。判定は registry 上の role で — **`ROLE` 環境変数は見ない**:

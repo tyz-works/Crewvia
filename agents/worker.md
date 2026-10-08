@@ -687,7 +687,7 @@ plan done "$TASK_ID" --result-file "$RESULT_FILE" --mission "$TASK_MISSION" --pr
 オプションは `plan done` の位置引数（task id。位置引数で Result を渡す旧形式なら Result も）の**後ろ**に置いてよいが、`--pr` の綴りを間違えると
 `unknown option` で拒否される（何も書かれない — Result を打ち直す）。
 
-> **移行予告**: 将来的に `plan.sh done` は `plan.sh ready-for-verification <task_id>` に移行予定。
+> **移行予告**: 将来的に `plan.sh done` は `plan.sh ready-for-verification <task_id> --execution ex-…` に移行予定。
 > Verifier 機能（M-QA-4）が導入されるまでは `done` を使い続けてよい。
 
 #### 詰まったとき: plan.sh needs-director
@@ -847,7 +847,7 @@ handoff_path: $HANDOFF_PATH
 {branch_name}
 
 ## head
-{git rev-parse HEAD の出力 — plan.sh fail --head に渡すものと同じ}
+{git rev-parse HEAD の出力 — plan.sh fail の --head に渡すものと同じ}
 
 ## 進捗サマリー
 [ここに何をどこまでやったかを記述]

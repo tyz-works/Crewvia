@@ -15,7 +15,7 @@ import re
 from pathlib import Path
 
 import guard_report
-from test_execution_e5_doc_examples_name_the_execution import HEREDOC_RE, INLINE_RE, doc_files
+from test_execution_e5_doc_examples_name_the_execution import INLINE_RE, classify, doc_files
 
 ROOT = Path(__file__).resolve().parent.parent
 REPORT = r"plan(?:\.sh)?\s+(?:done|fail|needs-director|ready-for-verification|verify-result)\b"
@@ -34,36 +34,18 @@ ALLOWLIST: dict[tuple[str, str], str] = {}
 
 
 def statements(text):
-    """`[(行番号, 行の literal, 対象の文字列)]`。fenced は論理行・地の文はインラインコードの中身。"""
-    out, lines = [], text.split("\n")
-    fenced, heredoc_end, i = False, None, 0
-    while i < len(lines):
-        raw, stripped = lines[i], lines[i].strip()
-        if heredoc_end is not None:
-            if stripped == heredoc_end:
-                heredoc_end = None
-            i += 1
-            continue
-        if stripped.startswith("```"):
-            fenced = not fenced
-            i += 1
-            continue
-        if not fenced:
+    """`[(行番号, 行の literal, 対象の文字列)]`。fenced は論理行・地の文はインラインコードの中身。字句の状態は共有の `classify`。"""
+    out = []
+    for item in classify(text)[0]:
+        if item[0] == "prose":
+            _k, n, raw = item
             for m in INLINE_RE.finditer(raw):
                 if re.search(REPORT, m.group(1)):      # 禁止を説明する地の文 (`current_execution_id` の名指し等) は対象外
-                    out.append((i + 1, raw, m.group(1)))
-            i += 1
-            continue
-        start, logical = i, raw
-        while logical.rstrip().endswith("\\") and i + 1 < len(lines):
-            i += 1
-            logical = logical.rstrip()[:-1] + " " + lines[i].strip()
-        h = HEREDOC_RE.search(logical)
-        if h:
-            heredoc_end = h.group(2)
-        if not logical.lstrip().startswith("#"):       # コメント行 (Director の代理報告の説明) は実行されない
-            out.append((start + 1, raw, logical))
-        i += 1
+                    out.append((n, raw, m.group(1)))
+        elif item[0] == "stmt":
+            _k, n, raw, logical = item
+            if not logical.lstrip().startswith("#"):   # コメント行 (Director の代理報告の説明) は実行されない
+                out.append((n, raw, logical))
     return out
 
 

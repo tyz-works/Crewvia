@@ -101,7 +101,12 @@ while [[ $# -gt 0 ]]; do
     --model)      MODEL="$2";        shift 2 ;;
     --agent)      AGENT="$2";        shift 2 ;;
     --skip-pull)  SKIP_PULL=1;       shift 1 ;;
-    --execution)  EXECUTION_FLAG_GIVEN=1; EXPLICIT_EXECUTION_ID="${2:-}"; shift $(( $# >= 2 ? 2 : 1 )) ;;
+    # 値が無い・次のオプション (`-` 始まり) のときは値を食わない (`--execution --dry-run` で --dry-run を失わない)。
+    # 空のまま下の検査が拒否する
+    --execution)
+      EXECUTION_FLAG_GIVEN=1
+      if [[ $# -ge 2 && "$2" != -* ]]; then EXPLICIT_EXECUTION_ID="$2"; shift 2
+      else EXPLICIT_EXECUTION_ID=""; shift 1; fi ;;
     --dry-run)    DRY_RUN=1;         shift 1 ;;
     -h|--help)
       sed -n '3,43p' "$0" | sed 's/^# //'
@@ -114,10 +119,23 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# --execution は渡されたのに空 (未設定の変数の展開など) なら、card の試行を採用せず**何も読まず**拒否する
-if [[ $EXECUTION_FLAG_GIVEN -eq 1 && -z "$EXPLICIT_EXECUTION_ID" ]]; then
-  _error "--execution の値が空です (省略するか、ex-… を渡してください)"
-  exit 1
+# --execution は渡されたのに空・欠落 (未設定の変数の展開、次のオプションが続く)・ID の形でないなら、card の試行を採用せず
+# **何も読まず・pull せず**拒否する (副作用の前)。ID の形は lib_execution の定義 (EXECUTION_ID_RE) を使う (コピーしない)
+if [[ $EXECUTION_FLAG_GIVEN -eq 1 ]]; then
+  if [[ -z "$EXPLICIT_EXECUTION_ID" ]]; then
+    _error "--execution の値が空です (省略するか、ex-… を渡してください)"
+    exit 1
+  fi
+  if ! python3 - "$SCRIPT_DIR" "$EXPLICIT_EXECUTION_ID" <<'PYEOF'
+import sys
+sys.path.insert(0, sys.argv[1])
+from lib_execution import EXECUTION_ID_RE
+sys.exit(0 if EXECUTION_ID_RE.fullmatch(sys.argv[2]) else 1)
+PYEOF
+  then
+    _error "--execution の値が ex-<32 桁の 16 進> の形ではありません"
+    exit 1
+  fi
 fi
 
 # --- 必須引数チェック ---

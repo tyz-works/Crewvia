@@ -156,3 +156,32 @@ def test_an_unset_variable_expands_to_the_same_refusal(tmp_path):
 def test_omitting_the_flag_still_reads_the_card(tmp_path):
     p, calls = run_kai(tmp_path, ["--skip-pull"])
     assert f"--execution {XID}" in calls, (calls, p.stderr)
+
+
+# ---------------------------------------------------------------------------
+# t012 (PR #287 Codex 3 巡目 P1): 値の欠落が次のオプションを食わない・ID の形でない値は副作用の前に拒否
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("extra", [
+    ["--execution", "--dry-run"],                         # 値が無く後続オプション: --dry-run を失って本物の pull をしていた
+    ["--execution", "--skip-pull"],
+    ["--execution", "-x"],
+    ["--skip-pull", "--execution", "-x"],
+    ["--execution", "foo"],                               # 形が違う
+    ["--execution", "ex-" + "b" * 31],                    # 桁が足りない
+    ["--execution", "ex-" + "B" * 32],                    # 大文字
+    ["--execution", XID + "0"],                           # 余分
+    ["--execution", f" {XID}"],
+], ids=["then-dry-run", "then-skip-pull", "then-dash-x", "skip-then-dash-x", "foo", "short", "upper", "long", "leading-space"])
+def test_a_missing_or_malformed_execution_value_is_refused_before_any_side_effect(tmp_path, extra):
+    p, calls = run_kai(tmp_path, extra)
+    assert p.returncode == 1, (p.stdout, p.stderr)
+    assert "--execution" in p.stderr or "Unknown option" in p.stderr   # -x は値として食わず、未知のオプションとして拒否される
+    assert calls == "", calls                              # pull / done / needs-director の plan.sh 呼び出しが 0 回
+    assert XID not in p.stdout + p.stderr                  # card を読んで採用していない
+
+
+def test_a_well_formed_execution_value_is_still_accepted(tmp_path):
+    other = "ex-" + "c" * 32
+    p, calls = run_kai(tmp_path, ["--skip-pull", "--execution", other])
+    assert f"--execution {other}" in calls, (calls, p.stderr)

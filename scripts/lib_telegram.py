@@ -646,13 +646,32 @@ def read_offset(registry_dir, warn=None):
     return load_json_store(_path(registry_dir, OFFSET_FILE), check=telegram_offset_problem, warn=warn)
 
 
+def _offset_newer(a, b):
+    """a が b より新しい進捗か。update_id は単調増加なので offset が大きい方。同じなら last_poll_at の新しい方 (無い = 最も古い)。"""
+    if a['offset'] != b['offset']:
+        return a['offset'] > b['offset']
+    la, lb = a.get('last_poll_at'), b.get('last_poll_at')
+    return is_finite_number(la) and (not is_finite_number(lb) or la > lb)
+
+
 def read_offset_effective(registry_dir, warn=None):
-    """本体を読み、**本体が読めない (無いではない) ときだけ**退避先を読む。→ 本体と同じ形の結果。"""
+    """本体と退避先を読み、新しい方の進捗を採る。→ `(採った状態, 本体の状態)`。
+
+    * 本体が無い (ENOENT) → 退避先は見ない (通常運用。古い退避先の残りを使わない)。
+    * 本体が読めない → 読めれば退避先。
+    * 本体も退避先も読める → **offset の大きい方** (同じなら last_poll_at の新しい方)。本体が読めるが置換できないとき
+      (immutable・sticky dir の所有者違い 等) `store_offset` は退避先にだけ進捗を書くので、古い本体を読み続けて
+      同じ update を読み直し・間引きが効かなくなるのを防ぐ。退避先の削除に失敗して古い退避先が残っても本体の新しい値が勝つ。
+    * 退避先が無い・読めない → 本体 (従来どおり)。
+    """
     state = read_offset(registry_dir, warn=warn)
-    if is_unreadable(state) and not is_missing(state):
-        fallback = load_json_store(_path(registry_dir, OFFSET_FALLBACK_FILE), check=telegram_offset_problem, warn=warn)
-        if not is_unreadable(fallback) and not is_missing(fallback):
-            return fallback, state
+    if is_missing(state):
+        return state, state
+    fallback = load_json_store(_path(registry_dir, OFFSET_FALLBACK_FILE), check=telegram_offset_problem, warn=warn)
+    if is_unreadable(fallback) or is_missing(fallback):
+        return state, state
+    if is_unreadable(state) or _offset_newer(fallback, state):
+        return fallback, state
     return state, state
 
 

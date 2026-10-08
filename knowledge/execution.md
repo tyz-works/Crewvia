@@ -1715,3 +1715,106 @@ E4a のコードに戻るので新旧の marker を両方読める (§17.3)。E4
 6. 手書き marker による退役の観察の手順は、memory `observe-retirement-with-handwritten-marker-on-nonexistent-window` に残した。
 
 01c で 01a / 01b から引き継いだもの (state-store.md §10.3 の 1・§0・git-policy.md §16.4) は、Execution ID・pull の冪等化 (N8)・G1 の CAS・世代の置き換え (E4b) として入った。**残るのは上の 1〜4 と §19.2 だけ**。
+
+---
+
+## 20. E5 の設計 (mission 20261008-e5-reject-unnamed-reports t001): 名乗りなしの報告を拒否する
+
+§19.3 の後続 1。**この節は設計だけで実装しない**。根拠は 2026-10-08 時点の main `01f0d26` と `queue/audit/transitions-*.jsonl` 全 9 本 (10-01 以降)。
+監査は欠けうる (§1.6 の 11) ので、出どころは (A) 監査の実測、(B) 実装からの列挙の 2 本で別々に出し、突き合わせた。
+
+### 20.1 (A) unverified の出どころ (監査の実測)
+
+`caller_check` を持つ行は 10-01 21:03 以降。内訳 (op × caller_check): done は verified 47・no_execution 3・**unverified 2**、needs-director は verified 30・**unverified 1**、
+`update` は no_execution 7・**unverified 2**、pull 100 / retire 6 は verified のみ。`refused:` は `EXECUTION_NOT_CURRENT` の 2 行 (t020 の観察用) だけ。
+**fail / ready-for-verification / verifying / verify-result の行は 1 本も無い** (本番で打たれていない。この 4 つの経路は実測が無く、§20.2 の実装の列挙だけが根拠)。
+verified の done は全部 Worker (Ren 22・Arjun 9・Luna 7・Kai-codex 4・Seo 2・ほか 3)。**Director (Sora) の done が verified になった例は 0 件**。
+
+| # | 時刻 (UTC) | 行 | 誰が | 何があった | 分類 |
+|---|---|---|---|---|---|
+| 1 | 10-02 04:58 | done 01c/t015 | Sora (Director) | Director が Worker の代わりに done。`--execution` を付けていない (director.md:207 の例は付ける形だが「付けなくても通る」と書いてある) | **経路の穴 (Director の手順)** |
+| 2 | 10-05 17:49 | update kai-review-full-findings/t001 `in_progress→pending` | Sora | Director の `update --status pending --reset` (回復) | **対象外 (§20.3)** |
+| 3 | 10-05 18:31 | update director-escalation-telegram/t026 `in_progress→pending` | Sora | 同上 | **対象外 (§20.3)** |
+| 4 | 10-05 21:10 | needs-director director-escalation-telegram/t006 | **Seo** (review Worker) | セッションの記録を見ると、pull の JSON には `execution_id` があったが、セッション中の Bash で `--execution` / `EXECUTION_ID` を使った呼び出しが 0 回。最後の呼び出し (`cd <worktree> && ./scripts/plan.sh needs-director … --result-file …`) は `source .crewvia-env` もしていない | **Worker の手順が ID を持ち越さない** |
+| 5 | 10-08 05:30 | done pull-reject-empty-agent/t005 | **Ren** (code Worker・今日) | 同じ型。pull は `plan.sh pull --task t005 --mission …` を env 無しの素の Bash で打ち、done も `cd <worktree> && ./scripts/plan.sh done … --pr 285` だけ。セッション中 `--execution` / `EXECUTION_ID` は 0 回 | **同上** |
+
+なお Director の 3 つの `no_execution` done (10-02 t018/t019/t028) は、Director が `update --reset` で開いた card (試行なし) で、E5 の対象外 (§20.3)。
+
+**#4 と #5 の共通の原因** (記録の読み取りで言えること。Worker の system prompt は記録に残らないので、worker.md が読まれていたかは未確認):
+1. Worker に最初に届く指示文が ID に触れない。dispatcher の割り当て文 (`dispatcher.sh:2675-2678`: 「タスク t005 (mission=…) を実行して。plan pull --task … で取得後、作業→plan done で完了。」) と
+   start.sh の起動文 (`:946` / `:948`) はどちらも `--execution` を言わない。Ren の t005 も Seo の t006 もこの文面で始まり、この文面どおりに動いた。
+2. ID は pull の JSON の中にあるだけ。Claude Code の Bash は呼び出しごとに env が消える (worker.md:83) ので、`export EXECUTION_ID` (worker.md:326) は次の呼び出しに残らず、
+   done を打つ呼び出しで `${EXECUTION_ID:+--execution …}` が空になる。**空になっても何の警告も出ない**。
+3. 名乗りなしで通ったときの警告が実装に無い。§5.2 は「E3 では通す (warn を stderr に 1 行)」と書いているが、`lib_task_controller.py:361` は `PROCEED, CHECK_UNVERIFIED` を返すだけで、
+   `plan.sh` に warn を出す箇所は見つからない (`grep -n unverified scripts/plan.sh` が 0 件)。**Ren も Seo も、自分の報告が名乗りなしだったことを知る手段が無かった**。
+   (`kai-review.sh:270-271` の「ID を読めなかった」警告は kai-review の内側の話で、Worker の手順とは別。)
+
+### 20.2 (B) 呼び出し元の列挙 (実装から)
+
+6 コマンド (done / fail / needs-director / ready-for-verification / verifying / verify-result) を `agents/` `skills/` `scripts/` `hooks/` `README.md` `docs/` から拾った。
+
+| 呼び出し元 | 今 ID を渡すか・どこから得るか | PR-1 での直し方 |
+|---|---|---|
+| **dispatcher の割り当て文** `dispatcher.sh:2675-2678` | 渡さない・触れない | 文面に追記: 「pull の JSON の `execution_id` を、報告 (done / fail / needs-director / ready-for-verification) の `--execution` に渡す」。ID は割り当て時点では未発行 (pull が発行する) ので値は入れられない |
+| **start.sh の起動文** `:946` `:948` | 同上 | 同じ追記 (target_dir 版 `:946` も) |
+| **plan.sh pull の出力** | JSON に `execution_id` / `attempt` (worker.md:278) | JSON は変えない。**stderr に 1 行**、そのまま貼れる形で: `[plan.sh] 報告には --execution <ex-…> を付ける (done / fail / needs-director / ready-for-verification)`。Seo の pull は `2>&1 \| head` で、Worker の pull は素の Bash なので見える。stdout の JSON を壊さない |
+| **worker.md** | 手順 (:286-294, :324-332, :661-686, :808) は ID を渡す形。**ただし例の一部が渡さない**: :124 (フロー図)・:189 (`plan done t002 "result" --mission <slug>`、target_dir 節の例)・:1026 (まとめ) | 全部の例を `${EXECUTION_ID:+--execution "$EXECUTION_ID"}` 付きに揃える。**「env は呼び出しごとに消える」を手順の最初に**書き、`export` ではなく done の**同じ呼び出しの中で** `.crewvia-env` を source するか card の ID を `plan.sh status` で読み直す形を勧める |
+| **worker-codex.md** :131-133, :175-177, :190 | 渡さない例 | 例を揃える。実際の Kai-codex の経路は kai-review.sh (下)。手動の経路は Director が `kai-review.sh` を手で打つ形 (:191) |
+| **kai-review.sh** :160-271 | 渡す。pull の JSON から取り `EXEC_ARGS` で done / needs-director (17 か所) に付ける。JSON が読めなければ名乗りなし + stderr に固定文言 (:270)。`--skip-pull` / dry-run は pull しない | 変更不要。**E5 の後は「JSON が読めない」経路が拒否に変わる** — 拒否文が `error_code=` で出るので `call_needs_director` の失敗の扱いを PR-2 で確かめる (Kai-codex の done が止まると codex-review が恒久に止まる。memory `pull-refusal-must-spare-orphan-assignments` と同じ型) |
+| **skills/crewvia-qa** :181 / :240 | 文は渡す形 (:181)。**例のコマンド (:240 の `needs-director`) は渡さない** | :240 の例に `${EXECUTION_ID:+--execution "$EXECUTION_ID"}` を足す |
+| **skills/crewvia-plan-review** :146 | 文は渡す形。完了・差し戻しのコマンド例 (:70-71, :110) は ID なしの略記 | 例に付ける |
+| **agents/verifier.md** :58-75 | 本文で ID を渡すと言い、例は「省略している」 | 例を実形にする |
+| **verifier-dispatcher.sh** :261-274 (verifying)・:419-422 (verify-result の指示文) | 渡す。card の `current_execution_id` を読む (active のときだけ)。env は `pop` | 変更不要 (本番 0 プロセス。card に ID が無ければ試行が無く対象外) |
+| **agents/director.md** :207-211・:300-309・:325 | done の例は `--execution` 付き。ただし **「付けなくても通る」と書いてある**。fail の例・needs-director の説明は ID に触れない | PR-1 で「付ける」に書き換え (拒否は PR-2)。Director が代理で打つ done / fail / needs-director は必ず `plan.sh status` の `ex-…` を渡す |
+| **dispatcher の Director 向け通知文** `dispatcher.sh:2308` ([review-refused]) | `plan.sh done {task_id} --mission {slug}` — 渡さない。ただし直前の `update --status in_progress --reset` で開いた card (試行なし) への done なので対象外 | 変更不要。他の通知文 (2308 以外) に 6 コマンドを打たせる文面は見つからない |
+| **target_dir の task** (worktree も `.crewvia-env` も無い) | worker.md:324-332 が JSON から `EXECUTION_ID` を取る (**唯一の入手経路**)。監査に該当する done は 1 本も無い | 実測が無い。PR-1 の後に隔離環境で target_dir の task を 1 本通して確かめる (§20.5) |
+| **hooks/** | 6 コマンドを打たない (grep で出るのは判定ロジックのコメントと文面だけ) | 変更不要 |
+| **scripts/bin/plan** | env を継承して exec するだけ | 変更不要 |
+| **README.md** :876, :889, :918 | ID に触れない | 文の補足のみ |
+| **watchdog / lib_retirement / dispatcher の自動報告** | 6 コマンドを打たない (retire は E4 で `--execution` 済み) | 対象外 |
+
+(A) と (B) の突き合わせ: #4 #5 は「指示文が ID に触れず、手順の例にも ID の無いものが残り、名乗りなしが黙って通る」の 3 つが同時に働いた結果で、(B) の上 2 行 + worker.md / skills の例に当たる。
+#1 は director.md の「付けなくても通る」。**監査に出ない経路** (fail / ready-for-verification / verifying / verify-result) は (B) で形を揃えるしかなく、PR-1 の後に 1 本ずつ通す (§20.5)。
+
+### 20.3 拒否の対象と対象外
+
+- **対象**: 6 コマンドで、card が **active (reserved / running) の試行を持ち、呼び出しが名乗らない** とき (`_authorize` の `# 名乗りなし` の `view == ACTIVE` の分岐、`lib_task_controller.py:360-361`)。**Director の done / fail / needs-director も対象** (§5.3。Director 専用の抜け道は作らない)。
+- **対象外 (今のまま通す)**: 試行なしの card (`no_execution`・`legacy_generation`)・DETACHED (`detached_execution`)・TERMINAL で名乗りなし (`no_execution`)。これらは task の遷移だけで試行の欄を触らない — 拒否すると、Director が `update --reset` で開いた card の done が通らなくなる。
+- **`update` は対象外で、拒否の候補に入れない** (§5.3): 手動の回復の出口。Worker が死んで誰も ID を名乗れない状況で、Director が `update --status pending --reset` で card を開ける唯一の経路。E5 で塞ぐと、止まった task の出口が消える。
+  `update` の `unverified` は E4a 以降 `--reset` が active な試行を閉じるときに付く印で、**通常運用で出続ける** (表 #2 #3)。**E5 の「0 件」の条件は 6 コマンドだけで数える** (`update` / `retire` / `pull` を除く)。
+- exit は 3 (照合の族)、`error_code` は新設 **`EXECUTION_REQUIRED`** (`lib_execution.EXIT_CODES` に 3 で足す)。既存の `EXECUTION_NOT_FOUND` は「その card はその ID を発行していない」の意味で、名乗りなしには使わない (直し方の文が違う)。
+  拒否文 (固定文言 + 識別子だけ。名乗られた値は無いので出す物も無い):
+  `{slug}/{tid}: この task は実行中の試行があります。報告には今の試行の execution id を名乗ってください (--execution <ex-…>。ID は pull の JSON の execution_id か \`plan.sh status --mission {slug}\` の進行中の行 [ex-… attempt N])。何も書いていません。` + 最後の行 `[plan.sh] error_code=EXECUTION_REQUIRED`。
+- **何も書かない**: 既存の拒否と同じ `_refuse` (監査に `refused:EXECUTION_REQUIRED` の 1 行だけ。card・record・枠は 1 バイトも書かない)。**task-graph は再生成しない** — 既存の `_controller_die` が `die()` (普通の `SystemExit`) なので末尾の dispatch が再生成するかを PR-2 の最初に実測し、再生成するなら
+  `UsageExit` の型で出す (memory `no-write-refusal-must-use-usageexit`。PR #285 の pull と同じ指摘)。既存の `EXECUTION_NOT_CURRENT` も同じ経路なので、直すなら 3 つまとめて。
+- `--execution ""` / 空の `CREWVIA_EXECUTION_ID` の拒否 (exit 1) は今のまま。
+
+### 20.4 段取り
+
+**PR-1 (呼び出し元を揃える。plan.sh の判定は変えない)**
+1. §20.2 の表の「直し方」を全部入れる: dispatcher / start.sh の文面・worker.md / worker-codex.md / skills / verifier.md / director.md の例と文・pull の stderr の 1 行。
+2. **名乗りなしの警告を実装する** (§5.2 に書いてあって無かったもの): 名乗りなしで `PROCEED, UNVERIFIED` になるとき stderr に固定文言 1 行 (`[plan.sh] 名乗りなしで報告しました (execution id を --execution で渡してください)。将来は拒否されます`)。
+   終了コード・書き込み・監査の行は変えない。**これで Worker は自分が名乗っていないことを初めて知り、観察期間の機械が数えられる** (監査の `unverified` + 警告)。
+3. テストは「警告が出る / 名乗れば出ない / 出ても exit 0 と書き込みが今と同じ」「文面が `--execution` に触れる (dispatcher の割り当て文・start.sh の起動文)」。
+
+**観察 (本番)**: 生きている全セッション (Worker・Director) が **PR-1 の後に起動** していること (プロセスの起動時刻 > PR-1 の sync。prove-which-code-version-a-spawned-task-ran の 3 点) + 6 コマンドの `caller_check=unverified` が 0 件、を **一定期間** (提案: 2 ミッション分または 7 日の長い方。Director が決める)。
+監査は欠けうる (§1.6 の 11) ので、機械の根拠に **警告の stderr** と、fail / ready-for-verification / verifying / verify-result を 1 本ずつ隔離環境で通した記録を足す。**Director の代理の done / fail / needs-director が 1 本以上 verified で通った** ことも条件に入れる (今は 0 件。表 #1)。
+旧プロンプトのまま生きている長寿命のセッションは、読み替えでは救えない (§9.4 の E5 行) — PR-1 の後に再起動する。
+
+**PR-2 (拒否の cutover。ユーザー承認)**
+- `_authorize` の名乗りなし + ACTIVE の分岐を `_refuse(EXECUTION_REQUIRED)` に。§20.3 の task-graph の確認。`kai-review.sh` の「JSON が読めない」経路 (:270) の挙動 (拒否されたら `needs_director` に倒れるか、止まるか) をテストで確かめる。
+- テスト: 名乗りなし × 6 コマンド × (active / terminal / 試行なし / detached) の表 (`test_execution_e3_caller_table.py` に行を足す)・拒否が何も書かない (card / record / 枠 / task-graph の sha256)・`update` が通る。**赤の実証** (分岐を戻すと対象のテストだけが赤)。
+- **rollback**: revert → `scripts/sync-main-checkout.sh`。戻し先は名乗りなしを通す E3 のコードで、`--execution` も今どおり照合するので、**#272 のような別 PR の互換は不要** (戻しで新しく拒否される呼び出しが無い)。
+  新しい `error_code` は plan.sh 以外が読まない (監査の `refused:` 行は文字列のまま残る)。
+- **PR-2 の前に「拒否したら何が止まるか」を確かめる**: (a) 観察期間の監査 + 警告の 0 件、(b) 隔離 queue に PR-2 のコードを入れ、Worker の実セッション相当 (素の Bash で pull → done) を worker.md の手順どおりに通して全 6 コマンドが通る、(c) 本番での dry-run は PR-1 の警告の期間がそのまま当たる (拒否しないで警告だけ出す期間)。別の段は足さない。
+
+### 20.5 Director / ユーザーが決めること (未決)
+
+1. **観察期間の長さ** (提案: 2 ミッション分または 7 日の長い方)。長いほど旧プロンプトの Worker が減り、短いほど AC-04 の穴が長く残る。
+2. **警告を stderr だけにするか、監査行にも印を足すか**。監査に `warned: true` を足すと数えやすいが、監査の形を変える (state-store の互換)。提案: stderr だけ (監査には既に `unverified` がある)。
+3. **Director の done / fail に `--execution` を必須にしてよいか**。Director の代理報告が止まる場面 (Worker が死んで card が active のまま) では `update --reset` で開けば通る (§20.3)。それで足りるかの確認。
+4. **target_dir の task を観察に含める方法**。本番に該当する done が無い。隔離環境の 1 本で足りるとするか、実 target_dir の mission で 1 本見てから PR-2 か。
+5. **`EXECUTION_REQUIRED` を新設する** (提案) か、`EXECUTION_NOT_FOUND` に寄せるか。直し方の文が違うので新設を勧める。
+6. **拒否の task-graph 再生成** (§20.3): 既存の `EXECUTION_NOT_CURRENT` / `NOT_FOUND` / `ALREADY_TERMINAL` も同じなら、PR-2 で 3 つまとめて直してよいか。
+7. **Worker の持ち越しの構造的な直し**: 手順の文面だけでは Ren と Seo の型が再発しうる。拒否文に ID を出す案は採らない (agent 名から ID を引くのと同じで、§5.2 の捨てた案と同じ理由)。
+   他に、ID を持つラッパーを worktree に置いて `plan done` がそこ経由になる案がある。どちらも PR-2 の範囲外で、必要なら別 mission。

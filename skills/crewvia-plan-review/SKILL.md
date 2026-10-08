@@ -79,7 +79,7 @@ Director が作成したミッションプランをレビューし、問題点�
 - [ ] mission を新規 `init` した場合、`plan.sh lint --mission <slug> --strict` が FAIL しないか
       （`deliverable_required: true` の mission は宣言の無い task を FAIL にする）
 - [ ] `codex-review` / `review` の task で `pr_number` を Director が見込みで書いていないか
-      （実装 task の `plan.sh done --pr <N>` が自動で伝播する。手書きは上書きされない副作用がある）
+      （実装 task の `plan.sh done --pr <N> --execution <ex-…>` が自動で伝播する。手書きは上書きされない副作用がある）
 
 ---
 
@@ -107,8 +107,8 @@ description: |
   - 各 finding の修正/放置判断
 
   verdict rule:
-  - findings なし、または全て low で放置可 → plan.sh done (「LGTM: 問題なし」を明記)
-  - 修正が必要な finding あり → plan.sh needs-director (finding 一覧と修正提案を記載)
+  - findings なし、または全て low で放置可 → plan.sh done --execution <ex-…> (「LGTM: 問題なし」を明記)
+  - 修正が必要な finding あり → plan.sh needs-director --execution <ex-…> (finding 一覧と修正提案を記載)
 ```
 
 ### PR fix task
@@ -133,8 +133,8 @@ description: |
   - gh pr view #XXX --json commits で commit が PR に含まれることを確認
 
   verdict rule:
-  - PR commits に自分の commit が含まれる → plan.sh done
-  - 含まれない (branch mismatch 等) → plan.sh needs-director (branch mismatch として報告)
+  - PR commits に自分の commit が含まれる → plan.sh done --execution <ex-…>
+  - 含まれない (branch mismatch 等) → plan.sh needs-director --execution <ex-…> (branch mismatch として報告)
 ```
 
 ---
@@ -143,7 +143,7 @@ description: |
 
 `plan.sh done` に渡す結果サマリーのフォーマット（`--result-file <path>` か `--result-file -` + クォート付きヒアドキュメントで渡す。二重引用符の位置引数はバッククォート / `$(...)` がシェルに実行される）:
 
-**今の試行を名乗る**: `plan.sh done` / `plan.sh needs-director` には、pull の JSON の `execution_id` を `--execution` で渡す（`${EXECUTION_ID:+--execution "$EXECUTION_ID"}` の形。`agents/worker.md`「完了・失敗・差し戻しの報告には、この `execution_id` を名乗る」）。違う試行・取り直された後の古い試行からの報告は exit 3 で拒否され、何も書かれない（打ち直さず Director に報告する）。
+**今の試行を名乗る**: `plan.sh done` / `plan.sh needs-director` には、**自分の pull の JSON の `execution_id`** を `--execution ex-…` とリテラルで渡す（pull の直後に控え、会話の中で持ち越す。`agents/worker.md`「完了・失敗・差し戻しの報告には、この `execution_id` を名乗る」）。Bash は呼び出しごとに env が消える。**`.crewvia-env` を source し直す・`plan status` / card の `current_execution_id` から取り直すのは禁止**（reset 後の置き換えの試行の ID を名乗ってしまう）。ID が分からなくなったら取り直さず、名乗りなしで報告するか Director に聞く。名乗りなしだと plan.sh が stderr に警告を出し、将来は拒否される。違う試行・取り直された後の古い試行からの報告は exit 3 で拒否され、何も書かれない（打ち直さず Director に報告する）。
 
 ```
 プランレビュー結果: [mission: <slug>]
@@ -177,9 +177,9 @@ review skill の Worker がタスク完了を報告する際の verdict 表現�
 
 | 状況 | verdict | plan.sh コマンド |
 |------|---------|----------------|
-| findings なし / 全て low で放置可 | LGTM: 問題なし（理由を明記） | `plan.sh done` |
-| 修正が必要な finding あり | NEEDS FIX: <finding 一覧と修正提案> | `plan.sh needs-director` |
-| PR commits に自分の commit が含まれない | BRANCH MISMATCH: <branch 名と状況> | `plan.sh needs-director` |
+| findings なし / 全て low で放置可 | LGTM: 問題なし（理由を明記） | `plan.sh done --execution <ex-…>` |
+| 修正が必要な finding あり | NEEDS FIX: <finding 一覧と修正提案> | `plan.sh needs-director --execution <ex-…>` |
+| PR commits に自分の commit が含まれない | BRANCH MISMATCH: <branch 名と状況> | `plan.sh needs-director --execution <ex-…>` |
 
 **重要**: 「修正すれば問題ない」と自己判断して `plan.sh done` しない。修正要否の判断は Director に委ねる。
 
@@ -215,13 +215,13 @@ Priya がプラン設計時に **Claude (Seo) のみ / Seo + Kai-codex の 2 人
   blocked_by: [<実装 task の ID>]
   description: |
     対象 PR: #XXX
-    verdict rule: LGTM → plan.sh done / 要修正 → plan.sh needs-director
+    verdict rule: LGTM → plan.sh done / 要修正 → plan.sh needs-director（どちらも --execution で今の試行を名乗る）
 
 # Kai-codex review task（Dispatcher が自動 spawn）
 - title: "PR#XXX Codex review (Kai)"
   skills: [codex-review]
   blocked_by: [<実装 task の ID>]
-  # pr_number は書かない: 実装 task の `plan.sh done <id> --pr <N>` が自動で入れる（未設定のものだけ）。
+  # pr_number は書かない: 実装 task の `plan.sh done <id> --pr <N> --execution <ex-…>` が自動で入れる（未設定のものだけ）。
   # dispatcher は pr_number が入るまで spawn しない（ready なのに無ければ Director に 1 回だけ通知）。
   # 既に PR がある task のときだけ手で書く
   description: |
@@ -242,7 +242,7 @@ plan.sh add "Codex review (Kai)"      --skills codex-review  --blocked-by t003
 
 ### Phase 2 の Priya への注意
 
-- **codex-review skill task は、PR を作る実装 task を `blocked_by` に持たせる**。`pr_number` はその実装 task が `plan.sh done --pr <N>` で閉じたときに自動で入る。PR 番号を見込みで書かない。実装 Worker が `--pr` を付け忘れても、`plan.sh done` は、その task を `blocked_by` に持つ未終了の codex-review に `pr_number` が無ければ**拒否する**（exit 2・何も書かない。PR を作らない task は `--no-pr "<理由>"` で免除され、card の `no_pr_waiver` に残る）。それでも `pr_number` が無いまま ready になった task は dispatcher が spawn せず、Director に `[review-no-pr]` を **1 回だけ**通知する（`blocked` の task は Director が意図して止めているので通知しない）。PR 番号待ちの止まり方を明示したいときは `status: blocked` + `blocked_reason`（drafting でも lint を通る）
+- **codex-review skill task は、PR を作る実装 task を `blocked_by` に持たせる**。`pr_number` はその実装 task が `plan.sh done --pr <N> --execution <ex-…>` で閉じたときに自動で入る。PR 番号を見込みで書かない。実装 Worker が `--pr` を付け忘れても、`plan.sh done` は、その task を `blocked_by` に持つ未終了の codex-review に `pr_number` が無ければ**拒否する**（exit 2・何も書かない。PR を作らない task は `--no-pr "<理由>"` で免除され、card の `no_pr_waiver` に残る）。それでも `pr_number` が無いまま ready になった task は dispatcher が spawn せず、Director に `[review-no-pr]` を **1 回だけ**通知する（`blocked` の task は Director が意図して止めているので通知しない）。PR 番号待ちの止まり方を明示したいときは `status: blocked` + `blocked_reason`（drafting でも lint を通る）
 - Kai-codex は registry に登録済みなので `plan.sh done` で task_count が自動 bump される
 - Kai-codex のカードは Taskvia カンバンに表示される（plan.sh pull 経由で in_progress → done が sync される）
 - タイムアウト時は Director が `rm queue/assignments/Kai-codex` + `plan.sh update <task> --reset` で復旧する

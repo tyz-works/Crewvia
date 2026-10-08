@@ -105,7 +105,7 @@ lib ごとの**破ってはいけない契約**の要約。理由・経緯・全
 - **報告の 6 コマンド（E3）**: `done` / `fail` / `needs-director` / `ready-for-verification` / `verifying` / `verify-result` は名乗り（`--execution <id>` > env
   `CREWVIA_EXECUTION_ID`。`_execution_caller` がロックの前に決める）を Controller が card の今の試行と照合する。違えば exit 3（`EXECUTION_NOT_CURRENT` / `NOT_FOUND` /
   `ALREADY_TERMINAL`）・遷移の拒否は exit 2（表は `lib_task_status.ACCEPTS_FROM` の 1 か所。done は in_progress だけ・fail は in_progress / needs_director・verify-result は検証待ちだけ）・
-  いずれも何も書かず、stderr の**最後の行**は `[plan.sh] error_code=<CODE>`。**空の `--execution ""` / 空の env は exit 1**（名乗りなしに倒さない）。名乗りなしは E3 では通す（E5 で拒否）。
+  いずれも何も書かず、stderr の**最後の行**は `[plan.sh] error_code=<CODE>`。**空の `--execution ""` / 空の env は exit 1**（名乗りなしに倒さない）。名乗りなしは E3 では通す（E5 で拒否）。**E5 PR-1 から、名乗りなしで通った 6 コマンドは stderr に固定 1 行の警告を出す**（`lib_task_controller.UNNAMED_WARNING`。`_authorize(warn=…)` が ACTIVE の名乗りなし分岐で出す。dry_run・retire・reset・G1 の fail は出さない。終了コード・書き込み・監査は変えない）。pull は stderr に `[plan.sh] 報告には --execution ex-… を付ける (…)` を 1 行足す（stdout の JSON は同じ）。
   ID を名乗った同じ操作の再送は、**中身（done の `--pr` / `--no-pr` / Result・fail の head / handoff・needs-director の reason）が card と同じときだけ**成功（exit 0・何も書かない）。
   違えば exit 3・何も書かない・値は出さない（`_resend_conflict`。`knowledge/execution.md` §16.10。IDEMPOTENT の分岐を足したら比較も足す）。**done / fail は Controller の `dry_run=True` で検査してから**派生値（pr_number の伝播）・証拠の検証に進む。
   `verify-result fail`（< max）は試行を `VERIFICATION_REJECTED` で終え task を pending に戻す（次の pull が新しい試行）。

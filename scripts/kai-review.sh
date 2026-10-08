@@ -8,7 +8,13 @@ set -euo pipefail
 # Usage:
 #   bash scripts/kai-review.sh --pr <PR#> --task <task_id>
 #                              [--mission <slug>] [--model <model>] [--agent <name>]
-#                              [--skip-pull] [--dry-run]
+#                              [--skip-pull] [--execution <ex-…>] [--dry-run]
+#
+# --execution : 報告 (done / needs-director) で名乗る試行の ID。--skip-pull のとき、省略すれば**起動時に 1 回だけ**
+#               card の current_execution_id (active な試行・card の worker が自分のときだけ) を読んで固定する。
+#               報告の時点では読み直さない (試行が替わっていれば plan.sh が照合で拒否する)。
+#               読めなければ名乗りなし + 警告 1 行。
+#               **渡されたのに値が空** (未設定の変数の展開など) は「省略」ではなく exit 1 (card を読まず・何も報告しない)。
 #
 # --skip-pull vs --dry-run (F6, PR#180):
 #   --skip-pull : plan.sh pull だけを飛ばす（task は既に in_progress 前提）。
@@ -83,6 +89,8 @@ MISSION_SLUG=""
 MODEL="$DEFAULT_MODEL"
 AGENT="$DEFAULT_AGENT"
 SKIP_PULL=0  # デバッグ用: plan.sh pull を skip する (task が既に in_progress の場合の再実行時など)
+EXPLICIT_EXECUTION_ID=""  # --execution: --skip-pull の再実行で名乗る試行 (省略時は card から読む)
+EXECUTION_FLAG_GIVEN=0    # --execution が**渡されたか** (値が空でも 1)。空は「省略」ではなく拒否 (plan.sh の --execution "" と揃える)
 DRY_RUN=0    # F6: plan.sh への書き込み (pull/done/needs-director) を一切行わない smoke-test モード
 
 while [[ $# -gt 0 ]]; do
@@ -93,6 +101,12 @@ while [[ $# -gt 0 ]]; do
     --model)      MODEL="$2";        shift 2 ;;
     --agent)      AGENT="$2";        shift 2 ;;
     --skip-pull)  SKIP_PULL=1;       shift 1 ;;
+    # 値が無い・次のオプション (`-` 始まり) のときは値を食わない (`--execution --dry-run` で --dry-run を失わない)。
+    # 空のまま下の検査が拒否する
+    --execution)
+      EXECUTION_FLAG_GIVEN=1
+      if [[ $# -ge 2 && "$2" != -* ]]; then EXPLICIT_EXECUTION_ID="$2"; shift 2
+      else EXPLICIT_EXECUTION_ID=""; shift 1; fi ;;
     --dry-run)    DRY_RUN=1;         shift 1 ;;
     -h|--help)
       sed -n '3,43p' "$0" | sed 's/^# //'
@@ -104,6 +118,25 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+# --execution は渡されたのに空・欠落 (未設定の変数の展開、次のオプションが続く)・ID の形でないなら、card の試行を採用せず
+# **何も読まず・pull せず**拒否する (副作用の前)。ID の形は lib_execution の定義 (EXECUTION_ID_RE) を使う (コピーしない)
+if [[ $EXECUTION_FLAG_GIVEN -eq 1 ]]; then
+  if [[ -z "$EXPLICIT_EXECUTION_ID" ]]; then
+    _error "--execution の値が空です (省略するか、ex-… を渡してください)"
+    exit 1
+  fi
+  if ! python3 - "$SCRIPT_DIR" "$EXPLICIT_EXECUTION_ID" <<'PYEOF'
+import sys
+sys.path.insert(0, sys.argv[1])
+from lib_execution import EXECUTION_ID_RE
+sys.exit(0 if EXECUTION_ID_RE.fullmatch(sys.argv[2]) else 1)
+PYEOF
+  then
+    _error "--execution の値が ex-<32 桁の 16 進> の形ではありません"
+    exit 1
+  fi
+fi
 
 # --- 必須引数チェック ---
 if [[ -z "$PR_NUM" || -z "$TASK_ID" ]]; then
@@ -274,6 +307,39 @@ elif [[ $DRY_RUN -eq 1 ]]; then
   _info "DRY_RUN=1: skipping plan.sh pull (no writes to plan.sh in dry-run mode)"
 else
   _info "SKIP_PULL=1: skipping plan.sh pull (assumes task is already in_progress with worker=${AGENT})"
+  # pull しないので JSON が無い。名乗りは --execution (優先) か、**起動時にこの 1 回だけ**読む card の今の試行
+  # (active で、card の worker が自分のときだけ)。読んだ値は SKIP_EXECUTION_ID / EXEC_ARGS に固定し、報告の時点で
+  # card を読み直さない。報告の時点で試行が替わっていたら、固定した ID を plan.sh が照合して exit 3 で拒否する
+  # (置き換えの試行を名乗って通ることは無い。execution.md §20.4 の P1)。
+  SKIP_EXECUTION_ID="$EXPLICIT_EXECUTION_ID"
+  if [[ $EXECUTION_FLAG_GIVEN -eq 0 ]]; then
+    SKIP_EXECUTION_ID="$(python3 - "${CREWVIA_QUEUE:-${CREWVIA_REPO_ROOT:-$REPO_ROOT}/queue}" "$MISSION_SLUG" "$TASK_ID" "$SCRIPT_DIR" "$AGENT" 2>/dev/null <<'PYEOF' || true
+import glob, os, re, sys
+queue, slug, tid, scripts, agent = sys.argv[1:6]
+sys.path.insert(0, scripts)
+import lib_task_cards as cards
+pattern = os.path.join(queue, 'missions', slug or '*', 'tasks', tid + '.md')
+paths = glob.glob(pattern)
+if len(paths) != 1:
+    sys.exit(0)
+meta, _body = cards.read_task_card(paths[0], tid)
+if cards.is_unreadable(meta) or not isinstance(meta, dict):
+    sys.exit(0)
+# card の持ち主が別の Worker なら、その試行は自分のものではない (置き換えの試行を名乗らない)
+holder = meta.get('worker')
+if isinstance(holder, str) and holder and holder != agent:
+    sys.exit(0)
+xid = meta.get('current_execution_id')
+if isinstance(xid, str) and re.fullmatch(r'ex-[0-9a-f]{32}', xid) and meta.get('execution_status') in ('reserved', 'running'):
+    print(xid)
+PYEOF
+)"
+  fi
+  if [[ -n "$SKIP_EXECUTION_ID" ]]; then
+    EXEC_ARGS=(--execution "$SKIP_EXECUTION_ID")
+  else
+    _warn "--skip-pull: 今の試行の execution_id を読めませんでした — done / needs-director を名乗りなしで報告します (task ${TASK_ID})"
+  fi
 fi
 
 # --- gh コマンド確認 ---

@@ -1824,3 +1824,33 @@ verified の done は全部 Worker (Ren 22・Arjun 9・Luna 7・Kai-codex 4・Se
 5. **拒否コード `EXECUTION_REQUIRED` を新設する** (`EXECUTION_NOT_FOUND` に寄せない。直し方の文が違う)。
 6. **既存の拒否 (`NOT_CURRENT` / `NOT_FOUND` / `ALREADY_TERMINAL`) の task-graph 再生成も PR-2 でまとめて `UsageExit` 型に直す** (§20.3 で再生成は確定)。
 7. **ID 持ち越しの構造的な直し (ID を持つラッパー等) は別 mission**。拒否文に ID を出す案は採らない (agent 名から ID を引くのと同じで、§5.2 の捨てた案と同じ理由)。PR-1 / PR-2 の範囲外。
+
+### 20.6 PR-1 の実績 (t005, mission 20261008-e5-reject-unnamed-reports)
+
+- **plan.sh の判定は変えていない**。足したのは stderr の 2 行だけ: (1) 名乗りなしで `PROCEED, UNVERIFIED` になった 6 コマンドの警告 (`lib_task_controller.UNNAMED_WARNING`。`_authorize(warn=…)`、dry_run と retire / reset / G1 の fail には出さない)、(2) pull の `報告には --execution ex-… を付ける`。
+- §20.2 の表の対応: dispatcher の割り当て文・start.sh の起動文 (2 か所) → `--execution` と pull の JSON の `execution_id` に触れる / worker.md → 例を `--execution ex-…` に揃え、「env は呼び出しごとに消える」ので pull の JSON の値を会話で持ち越す形を手順の前に (**当初の「同じ呼び出しで `.crewvia-env` を source し直す」形は P1 で撤回 — 下の §20.7**) / worker-codex.md・verifier.md・skills 2 本・director.md → 例と文を実形に (director.md は「付けなくても通る」を「必ず付ける」に) / kai-review.sh `--skip-pull` → card の `current_execution_id` (active のときだけ) を読む、`--execution <id>` でも渡せる、読めなければ警告 (読み方は §20.7 で締めた) / verifier-dispatcher.sh・hooks・scripts/bin/plan → 変更なし。
+- 構造テスト `tests/test_execution_e5_doc_examples_name_the_execution.py`: agents/ skills/ の 6 コマンドの例 (fenced の論理行・地の文のインラインコードの行) がすべて `--execution` か `${EXECUTION_ID:+` を含む。直す前の実測は 39 例中 36 が名乗りなし。
+- 挙動テスト `tests/test_execution_e5_unnamed_report_warning.py`、互換テスト `test_plan_sh_compat_s3.py` は E5 の stderr 2 行だけを取り除いて golden と比べる。
+- **merge 後に dispatcher restart が要る** (割り当て文は dispatcher.sh の python に埋まっている)。Worker / Director は PR-1 の後に起動し直す (§20.4 の観察の条件)。
+
+### 20.7 PR #287 の Codex P1 (t009): 報告の ID は自分の pull の JSON から持ち越す
+
+- **指摘**: 20.6 の手順 (「同じ呼び出しで `.crewvia-env` を source し直す」「`plan status` から取り直す」) は、Director の reset → 別 Worker の再 pull で `.crewvia-env` (plan.sh は worktree を再利用して**新しい試行の ID で上書き**する) と card の今の試行が置き換えの試行の ID になるため、古い Worker がその ID を名乗って照合を通り、置き換えの試行を done / fail できる。**§5.2 の捨てた案 (cwd の worktree の `.crewvia-env` を読んで補う) と同じ穴**で、20.6 はそれを手順として書いてしまっていた。
+- **決定**: 報告に使う ID は**その Worker 自身の pull の JSON の `execution_id` だけ**。pull の直後に控え、以後の報告には `--execution ex-…` を**リテラルで**書く (Bash の env は呼び出しごとに消えるので、会話の中で値を持ち越す)。`.crewvia-env` / `plan status` / card の `current_execution_id` から報告用の ID を**取り直す手順は agents/ skills/ README から全部消した** (worker.md の `$EXECUTION_ID` を使う例も `--execution ex-…` のリテラルに)。ID が分からなくなったら取り直さず、名乗りなしで報告する (今は警告で通る) か `needs-director` で Director に聞く。
+- **Director の代理報告は例外ではなく別物**: Director は `plan.sh status` で**見て判断した試行を名指し**する (§5.3)。Worker の「自分の報告の ID を取り直す」とは、名乗る主体と意味が違う (Director は reset 後ならその新しい試行を判断し直す立場)。文面でこの違いを書いた。
+- **kai-review.sh `--skip-pull`**: card を読むのは**起動時の 1 回だけ**で、`SKIP_EXECUTION_ID` / `EXEC_ARGS` に固定し、報告の時点で読み直さない。報告の時点で試行が替わっていれば、固定した ID を plan.sh が照合して exit 3 で拒否する (置き換えの試行を名乗って通ることは無い)。加えて、card の `worker` が自分 (`--agent`) と違うときは読まない (他の Worker が持つ試行を引き継がない)。`--execution <id>` を渡されたらそれを優先。
+- **構造テスト** `tests/test_execution_e5_docs_carry_the_id_from_pull_not_refetch.py`: agents/ skills/ の fenced code (コメント行・ヒアドキュメント本文を除く) と報告コマンドを含むインラインコードに、`--execution` へ変数/コマンド置換を渡す・`EXECUTION_ID` を env/コマンドから代入する・`source .crewvia-env` と報告が同じ文・`current_execution_id` を読む・`plan status` と `--execution` が同じ文、の形が無い。直す前の worker.md で 4 件・crewvia-qa SKILL.md で 1 件が赤。
+- plan.sh の env フォールバック (`--execution` が無いとき `CREWVIA_EXECUTION_ID` を読む) は PR-1 では残す。`.crewvia-env` を source した呼び出しで `--execution` を付け忘れると同じ穴が開くので、文書は**常にリテラルの `--execution`** を要求している (フォールバックの扱いは PR-2 の拒否と一緒に決める)。
+
+### 20.8 PR #287 の Codex 2 巡目 (t011): 空の `--execution` は拒否・警告は遷移の検査の後
+
+- **P1 (kai-review.sh)**: `--skip-pull --execution "$X"` で `$X` が空だと、「フラグが無い」と区別がつかず card の `current_execution_id` を採用して名乗っていた。**フラグが渡されたか**を `EXECUTION_FLAG_GIVEN` に持ち、渡されて空 (値が無い末尾の `--execution` も) なら引数の解析の直後に exit 1 (card を読まず・pull / done / needs-director を打たない。plan.sh の `--execution ""` = exit 1 と揃えた)。省略したときだけ card を読む。
+- **P2 (lib_task_controller)**: 名乗りなしの警告を `_authorize` の中で出していたので、遷移が拒否される報告 (`mark_task` 経路: 例 in_progress の task への `verifying`、`_finish` 経路を Controller から直接呼んだとき) でも「名乗りなしで報告しました」が出ていた。`_authorize` は警告を出さず、`_warn_unnamed(check)` を**遷移の検査 (`_check_task_status` と試行の遷移表) が全部通った後**にだけ呼ぶ (dry_run は出さない)。plan.sh 経由の done / fail / needs-director は plan.sh が dry_run で先に検査するので、この誤りは `mark_task` 経路でだけ見えていた。
+- **同じ型 (検査の前の副作用・出力) の棚卸し**: `lib_task_controller` の `print` / `sys.std*` は `_warn_unnamed` の 1 か所だけ。検査より前に書く操作は拒否の行 (`_refuse` の監査の `refused:` 行) だけで、これは拒否そのものの記録。他の経路に無い。
+- テスト: `tests/test_execution_e5_warning_after_transition_check.py` (plan.sh 経由・kai-review.sh) / `..._controller.py` (Controller 直接)。赤の実証: 欠陥版 (警告を `_authorize` に戻す・`-z` で省略扱いに戻す) で 9 + 8 件が赤、直すと全緑。
+
+### 20.9 PR #287 の Codex 3 巡目 (t012): `--execution` の値の欠落・形の検査 / 構造テストの盲点
+
+- **P1 (kai-review.sh)**: `--pr 1 --task t001 --execution --dry-run` で `--dry-run` が `--execution` の値として食われ、dry-run の要求が消えて本物の pull を打っていた。直し方は 2 段。(1) 値が無い・次が `-` で始まるときは値を食わない (後続のオプションはそのまま解析される)。(2) 渡されたのに空、または `ex-<32 桁の小文字 16 進>` (`lib_execution.EXECUTION_ID_RE`。コピーせず import) でなければ、引数の解析の直後 (pull・card 読み・codex 起動の前) に exit 1。`--execution -x` は `-x` が未知のオプションとして拒否される (どちらでも副作用 0)。
+- **他のオプションの棚卸し (直さない・backlog)**: `--pr` / `--task` / `--mission` / `--model` / `--agent` は `"$2"` をそのまま取るので同じ型 (`--mission --dry-run` で MISSION_SLUG=`--dry-run`・dry-run を失う、`--model --dry-run` / `--agent --dry-run` も同様。値が無い末尾は `set -u` の unbound variable で exit 1)。`--skip-pull` / `--dry-run` は値を取らず対象外。
+- **構造テストの盲点**: `agents/` `skills/` を走査する 2 本のテストが、コメント行 `# … <<'RESULT_EOF' … RESULT_EOF` をヒアドキュメントの開始と読み、終端語が現れず worker.md の 677 行以降が未走査だった (`knowledge` の「コメント中の `<<X` が字句検出器を盲目にする」と同じ型)。字句の状態は `classify()` の 1 か所 (両テストが共有) にし、(a) 行頭 `#` は開始でない (b) fence が閉じたらヒアドキュメントを解除 (c) 本文として飛ばした行・閉じなかった開始を数える。`test_every_line_naming_a_report_command_is_scanned` が独立の素朴検出 (6 コマンドの名前を含む行) ⊆ 走査した行を検査し、走査漏れそのものを赤にする。盲点を開けて新しく赤になったのは worker.md の 2 行 (移行予告の `plan.sh ready-for-verification <task_id>` に `--execution ex-…` を足す / 引き継ぎ書テンプレートの `plan.sh fail --head` の言及を言い換え)。検出する例は 39 → 49 件。

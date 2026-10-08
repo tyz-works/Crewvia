@@ -74,6 +74,13 @@ _C_RETIRE = 'retire'
 _OP_VERIFY_PASS = 'verify-result:pass'
 _OP_VERIFY_FAIL = 'verify-result:fail'
 
+#: 名乗りなしの警告を出す操作 (6 コマンドの再送の名前。retire / reset / G1 の fail は含めない。execution.md §20.4 の 2)
+_WARN_UNNAMED_OPERATIONS = frozenset({_C_DONE, _C_FAIL, _C_NEEDS_DIRECTOR, _OP_VERIFY_PASS, _OP_VERIFY_FAIL})
+
+#: 名乗りなしで通ったときに stderr へ出す固定の 1 行 (識別子も値も含めない。終了コード・書き込みは変えない)
+UNNAMED_WARNING = ("[plan.sh] 名乗りなしで報告しました (execution id を --execution で渡してください)。"
+                   "将来は拒否されます")
+
 #: `Caller.source` の語彙 (どこから ID を得たか。拒否の文言で env 由来の直し方を言うのに使う)
 SOURCES = ('flag', 'env', 'none')
 
@@ -366,6 +373,13 @@ def _authorize(txn, slug, tid, meta, caller, *, operation):
     return TASK_ONLY, ex.CHECK_NO_EXECUTION
 
 
+def _warn_unnamed(check):
+    """名乗りなしで通った報告の警告 (stderr に固定 1 行)。**遷移の検査が通った後**にだけ呼ぶ。
+    `check` が unverified なのは `_authorize` の「名乗りなし × ACTIVE」の分岐だけ。"""
+    if check == ex.CHECK_UNVERIFIED:
+        print(UNNAMED_WARNING, file=sys.stderr)
+
+
 def _idempotent_or_conflict(txn, slug, tid, meta, caller, operation):
     end = meta.get('execution_end_code')
     if operation is not None and ex.IDEMPOTENT_OPERATION.get(end) == operation:
@@ -559,6 +573,7 @@ def _finish(txn, slug, tid, meta, body, caller, *, new_status, end_code, to_stat
     _check_caller(caller)
     _check_now(now)
     _check_body(new_body)
+    # dry_run は同じ操作の本番の呼び出しの前に走るので、警告は書く側 1 回だけ
     decision, check = _authorize(txn, slug, tid, meta, caller, operation=operation)
     updates, remove = _check_updates(meta_updates, meta_remove)
     body_out = body if new_body is None else new_body
@@ -599,6 +614,8 @@ def _finish(txn, slug, tid, meta, body, caller, *, new_status, end_code, to_stat
     _check_task_status(txn, command, slug, tid, meta, caller)
     if dry_run:
         return decision
+    if operation in _WARN_UNNAMED_OPERATIONS:
+        _warn_unnamed(check)                                    # 遷移の検査が全部通った後 (拒否される報告に「通った」は出さない)
     out = dict(meta)
     _apply_updates(out, updates, remove)
     out.update(status=to_status, execution_status=new_status, execution_end_code=end_code)
@@ -723,6 +740,7 @@ def mark_task(txn, slug, tid, caller=NO_CALLER, *, command, to_status, meta_upda
     # operation=None: 再送を成功にする操作ではない (TERMINAL の試行に名乗り付きで来れば `_authorize` が conflict で拒否する)
     decision, check = _authorize(txn, slug, tid, meta, caller, operation=None)
     _check_task_status(txn, command, slug, tid, meta, caller)
+    _warn_unnamed(check)                                        # 遷移の検査が通った後
     updates, remove = _check_updates(meta_updates, meta_remove)
     out = dict(meta)
     _apply_updates(out, updates, remove)

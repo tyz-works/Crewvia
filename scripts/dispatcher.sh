@@ -2675,6 +2675,8 @@ def dispatch():
                     f"タスク {task_id} (mission={slug}) を実行して。"
                     f"plan pull --task {task_id} --mission {slug} で取得後、"
                     f"作業→plan done で完了。"
+                    f"pull の JSON の execution_id を、完了・失敗・差し戻しの報告の "
+                    f"--execution に渡すこと (Bash は呼び出しごとに env が消えるので、報告のたびに --execution ex-… を付ける)。"
                 )
                 if tmux_send(target, msg):
                     record_notify(notify_key)

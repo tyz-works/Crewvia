@@ -98,12 +98,25 @@ def test_new_event_resets_first_seen_and_clears_failure_mark():
                                     "sending_stage": None, "sending_at": None}
 
 
-def test_apply_failure_marks_only_stage_one_and_keeps_the_first_mark():
+def test_apply_failure_marks_only_stage_one_and_moves_the_mark_to_the_latest_failure():
     e = entry(NOW - 300, 0)
     assert E.apply_failure(e, "telegram_notice", NOW) == e
     marked = E.apply_failure(e, "director_renotice", NOW)
     assert marked["stage1_failed_at"] == NOW and marked["stage_sent"] == 0
-    assert E.apply_failure(marked, "director_renotice", NOW + 50)["stage1_failed_at"] == NOW
+    # 再試行の間引きの起点は直近の失敗 (最初の失敗のままだと、2 回目以降の失敗の直後にまた送ってしまう)
+    assert E.apply_failure(marked, "director_renotice", NOW + 50)["stage1_failed_at"] == NOW + 50
+
+
+def test_stage1_retry_throttle_boundaries():
+    failed = dict(entry(NOW - 400, 0), stage1_failed_at=NOW - 10)
+    R = E.STAGE1_RETRY_SECONDS
+    assert E.stage1_retry_throttled(failed, "director_renotice", NOW)
+    assert E.stage1_retry_throttled(dict(failed, stage1_failed_at=NOW - R + 1), "director_renotice", NOW)
+    assert not E.stage1_retry_throttled(dict(failed, stage1_failed_at=NOW - R), "director_renotice", NOW)
+    assert not E.stage1_retry_throttled(dict(failed, stage1_failed_at=NOW + 5), "director_renotice", NOW)  # 時計が戻った
+    assert not E.stage1_retry_throttled(dict(failed, stage1_failed_at=None), "director_renotice", NOW)
+    assert not E.stage1_retry_throttled(failed, "telegram_notice", NOW)    # 段階 2 は Telegram のバックオフが持つ
+    assert not E.stage1_retry_throttled(None, "director_renotice", NOW)
 
 
 # ---------------------------------------------------------------------------

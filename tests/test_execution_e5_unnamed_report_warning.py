@@ -273,3 +273,10 @@ def test_skip_pull_accepts_an_explicit_execution_id(tmp_path):
     p, calls = run_skip_pull(tmp_path, "", extra=("--execution", other))
     assert SKIP_WARN not in p.stderr
     assert f"--execution {other}" in calls, (calls, p.stderr)
+
+
+def test_skip_pull_does_not_adopt_an_attempt_held_by_another_worker(tmp_path):
+    """t009 (P1): card の worker が自分でなければ、その試行 (置き換えの試行) を名乗らない。"""
+    p, calls = run_skip_pull(tmp_path, f"current_execution_id: {XID}\nexecution_status: running\n", extra=("--agent", "Someone-else"))
+    assert p.stderr.count(SKIP_WARN) == 1, p.stderr
+    assert XID not in calls and calls, (calls, p.stderr)

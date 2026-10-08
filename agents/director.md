@@ -209,7 +209,7 @@ Dispatcher から通知を受け取る:
 # 二重引用符の位置引数はバッククォート / $(...) がシェルに実行されるので使わない。
 # → --mission 省略時は active mission を検索。複数 mission に同 ID が存在すると曖昧エラー。
 # → --execution: 「どの試行を完了と判断したか」の名指し。`plan.sh status --mission <slug>` の進行中の行
-#   `[ex-… attempt N]` の値をそのまま渡す。Director が見た後に Worker が reset → 再 pull していれば exit 3
+#   `[ex-… attempt N]` の値をそのまま渡す（Director の代理報告は Worker の取り直しとは別: Director は status で**見て判断した試行を指名**する。Worker は自分の pull の ID を名乗る = execution.md §20.2）。Director が見た後に Worker が reset → 再 pull していれば exit 3
 #   (EXECUTION_NOT_CURRENT) で止まる (誤って新しい試行を完了にしない)。**Director の代理報告 (done / fail / needs-director) も必ず付ける**
 #   (Director 専用の抜け道は無い。付けないと「名乗りなし」の警告が出て、将来は拒否される = execution.md §20)。
 #   試行の無い card・Director が `update --status in_progress --reset` で開いた card には ID が無いので付けない

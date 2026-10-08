@@ -10,8 +10,10 @@ set -euo pipefail
 #                              [--mission <slug>] [--model <model>] [--agent <name>]
 #                              [--skip-pull] [--execution <ex-…>] [--dry-run]
 #
-# --execution : 報告 (done / needs-director) で名乗る試行の ID。--skip-pull のとき、省略すれば card の
-#               current_execution_id (active な試行だけ) を読む。読めなければ名乗りなし + 警告 1 行。
+# --execution : 報告 (done / needs-director) で名乗る試行の ID。--skip-pull のとき、省略すれば**起動時に 1 回だけ**
+#               card の current_execution_id (active な試行・card の worker が自分のときだけ) を読んで固定する。
+#               報告の時点では読み直さない (試行が替わっていれば plan.sh が照合で拒否する)。
+#               読めなければ名乗りなし + 警告 1 行。
 #
 # --skip-pull vs --dry-run (F6, PR#180):
 #   --skip-pull : plan.sh pull だけを飛ばす（task は既に in_progress 前提）。
@@ -279,12 +281,15 @@ elif [[ $DRY_RUN -eq 1 ]]; then
   _info "DRY_RUN=1: skipping plan.sh pull (no writes to plan.sh in dry-run mode)"
 else
   _info "SKIP_PULL=1: skipping plan.sh pull (assumes task is already in_progress with worker=${AGENT})"
-  # pull しないので JSON が無い。名乗りは --execution か、card の今の試行 (active のときだけ。verifier-dispatcher と同じ読み方)。
+  # pull しないので JSON が無い。名乗りは --execution (優先) か、**起動時にこの 1 回だけ**読む card の今の試行
+  # (active で、card の worker が自分のときだけ)。読んだ値は SKIP_EXECUTION_ID / EXEC_ARGS に固定し、報告の時点で
+  # card を読み直さない。報告の時点で試行が替わっていたら、固定した ID を plan.sh が照合して exit 3 で拒否する
+  # (置き換えの試行を名乗って通ることは無い。execution.md §20.4 の P1)。
   SKIP_EXECUTION_ID="$EXPLICIT_EXECUTION_ID"
   if [[ -z "$SKIP_EXECUTION_ID" ]]; then
-    SKIP_EXECUTION_ID="$(python3 - "${CREWVIA_QUEUE:-${CREWVIA_REPO_ROOT:-$REPO_ROOT}/queue}" "$MISSION_SLUG" "$TASK_ID" "$SCRIPT_DIR" 2>/dev/null <<'PYEOF' || true
+    SKIP_EXECUTION_ID="$(python3 - "${CREWVIA_QUEUE:-${CREWVIA_REPO_ROOT:-$REPO_ROOT}/queue}" "$MISSION_SLUG" "$TASK_ID" "$SCRIPT_DIR" "$AGENT" 2>/dev/null <<'PYEOF' || true
 import glob, os, re, sys
-queue, slug, tid, scripts = sys.argv[1:5]
+queue, slug, tid, scripts, agent = sys.argv[1:6]
 sys.path.insert(0, scripts)
 import lib_task_cards as cards
 pattern = os.path.join(queue, 'missions', slug or '*', 'tasks', tid + '.md')
@@ -293,6 +298,10 @@ if len(paths) != 1:
     sys.exit(0)
 meta, _body = cards.read_task_card(paths[0], tid)
 if cards.is_unreadable(meta) or not isinstance(meta, dict):
+    sys.exit(0)
+# card の持ち主が別の Worker なら、その試行は自分のものではない (置き換えの試行を名乗らない)
+holder = meta.get('worker')
+if isinstance(holder, str) and holder and holder != agent:
     sys.exit(0)
 xid = meta.get('current_execution_id')
 if isinstance(xid, str) and re.fullmatch(r'ex-[0-9a-f]{32}', xid) and meta.get('execution_status') in ('reserved', 'running'):

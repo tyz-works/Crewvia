@@ -873,7 +873,7 @@ consumer of `getUpdates` on the same bot steals updates. Restart the dispatcher 
 4. Dispatcher assigns tasks to idle Workers via mux backend (`tmux send-keys` or `herdr pane run`)
 5. Worker pulls assigned task via `plan.sh pull --task <id> --mission <slug>`, executes it
 6. Before risky tool calls, PreToolUse hook requests approval from Taskvia
-7. Worker reports completion via `plan.sh done <id> --execution <ex-…>` (the `execution_id` from the pull JSON; Bash drops env between calls, so name it on every report — an unnamed report still passes but prints a warning on stderr and will be refused later), then waits for next Dispatcher assign
+7. Worker reports completion via `plan.sh done <id> --execution <ex-…>` (the `execution_id` from your own pull JSON, written literally — never re-read from `.crewvia-env` / `plan status`; Bash drops env between calls, so name it on every report — an unnamed report still passes but prints a warning on stderr and will be refused later), then waits for next Dispatcher assign
 8. Dispatcher notifies Director when a new Worker skill is needed or all missions are complete
 9. Director responds to Dispatcher notifications (spawns Workers / archives mission)
 

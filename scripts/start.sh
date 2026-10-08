@@ -943,9 +943,9 @@ PYEOF
     if [[ "${ROLE}" == "worker" ]]; then
       # TARGET_DIR が設定されている場合は --target-dir を渡して target 不一致タスクをスキップ
       if [[ -n "${TARGET_DIR:-}" ]]; then
-        KICKOFF_MSG="ミッション開始。plan pull --agent ${AGENT_NAME} --skills ${SKILLS} --target-dir ${TARGET_DIR} でタスクを取得し、指示に従って作業してください。完了したら plan done で報告し（pull の JSON の execution_id を、報告の --execution に渡してください。Bash は呼び出しごとに env が消えるので、done / fail / needs-director / ready-for-verification のたびに --execution ex-… を付けます）、待機してください（Dispatcher が次のタスクを自動割り当てします）。"
+        KICKOFF_MSG="ミッション開始。plan pull --agent ${AGENT_NAME} --skills ${SKILLS} --target-dir ${TARGET_DIR} でタスクを取得し、指示に従って作業してください。完了したら plan done で報告し（pull の JSON の execution_id を、報告の --execution に渡してください。Bash は呼び出しごとに env が消えるので、完了・失敗・差し戻しのたびに --execution ex-… を付けます）、待機してください（Dispatcher が次のタスクを自動割り当てします）。"
       else
-        KICKOFF_MSG="ミッション開始。plan pull --agent ${AGENT_NAME} --skills ${SKILLS} でタスクを取得し、指示に従って作業してください。JSON に worktree_path が含まれる場合はそのディレクトリに cd し、.crewvia-env を source してから作業してください（例: cd <worktree_path> && source .crewvia-env）。完了したら plan done で報告し（pull の JSON の execution_id を、報告の --execution に渡してください。Bash は呼び出しごとに env が消えるので、done / fail / needs-director / ready-for-verification のたびに --execution ex-… を付けます）、待機してください（Dispatcher が次のタスクを自動割り当てします）。"
+        KICKOFF_MSG="ミッション開始。plan pull --agent ${AGENT_NAME} --skills ${SKILLS} でタスクを取得し、指示に従って作業してください。JSON に worktree_path が含まれる場合はそのディレクトリに cd し、.crewvia-env を source してから作業してください（例: cd <worktree_path> && source .crewvia-env）。完了したら plan done で報告し（pull の JSON の execution_id を、報告の --execution に渡してください。Bash は呼び出しごとに env が消えるので、完了・失敗・差し戻しのたびに --execution ex-… を付けます）、待機してください（Dispatcher が次のタスクを自動割り当てします）。"
       fi
     else
       KICKOFF_MSG="ミッション開始。plan status で状態を確認し、タスク分解・Worker 割り当て・全体管理を開始してください。"

@@ -654,7 +654,7 @@ def _offset_newer(a, b):
     return is_finite_number(la) and (not is_finite_number(lb) or la > lb)
 
 
-def read_offset_effective(registry_dir, warn=None):
+def read_offset_effective(registry_dir, warn=None, identity=None):
     """本体と退避先を読み、新しい方の進捗を採る。→ `(採った状態, 本体の状態)`。
 
     * 本体が無い (ENOENT) → 退避先は見ない (通常運用。古い退避先の残りを使わない)。
@@ -663,6 +663,10 @@ def read_offset_effective(registry_dir, warn=None):
       (immutable・sticky dir の所有者違い 等) `store_offset` は退避先にだけ進捗を書くので、古い本体を読み続けて
       同じ update を読み直し・間引きが効かなくなるのを防ぐ。退避先の削除に失敗して古い退避先が残っても本体の新しい値が勝つ。
     * 退避先が無い・読めない → 本体 (従来どおり)。
+    * `identity` (今の認証情報の `bot_id` / `chat_hash`) があれば、**大小を比べる前に**それに結び付いた記録だけを候補にする
+      (`is_bound`)。bot 切り替え後に旧 bot の大きい offset が本体に残っていても、新 bot の退避先が選ばれる (でないと
+      `_receive_updates` が識別子の不一致で毎回 0 に戻り、同じ最初の batch を取り直して後の回答が飢える)。
+      候補 1 つ → それ。どちらも結び付いていない → 従来どおり (`_receive_updates` が 0 から始める)。
     """
     state = read_offset(registry_dir, warn=warn)
     if is_missing(state):
@@ -670,6 +674,12 @@ def read_offset_effective(registry_dir, warn=None):
     fallback = load_json_store(_path(registry_dir, OFFSET_FALLBACK_FILE), check=telegram_offset_problem, warn=warn)
     if is_unreadable(fallback) or is_missing(fallback):
         return state, state
+    if identity is not None and not is_unreadable(state):
+        state_ok, fallback_ok = is_bound(state, identity), is_bound(fallback, identity)
+        if state_ok != fallback_ok:
+            return (state if state_ok else fallback), state
+        if not state_ok:
+            return state, state
     if is_unreadable(state) or _offset_newer(fallback, state):
         return fallback, state
     return state, state
@@ -837,10 +847,15 @@ def send_message(registry_dir, creds, text, *, api_base=API_BASE_DEFAULT, reply_
     return SendResult(False, res.error, warn=warn_flag['v'])
 
 
-def telegram_available(registry_dir, now, creds_ok=True):
-    """段階 2 (PR-B) の入力: 受信側が有効で、送信がバックオフ中でないか。"""
+def telegram_available(registry_dir, now, creds_ok=True, identity=None):
+    """段階 2 (PR-B) の入力: 受信側が有効で、送信がバックオフ中でないか。
+
+    `identity` (今の認証情報の `identity_of`) があれば、受信側の状態が別の bot / chat のものなら使えない・
+    送信状態が別の bot / chat のもの (旧形式を含む) ならバックオフを引き継がない (`_update_send_state` と同じ扱い)。
+    """
     receiver = read_receiver(registry_dir)
-    ok, _ = receiver_verdict(receiver, now)
+    mine = (identity['bot_id'], identity['chat_hash']) if identity is not None else None
+    ok, _ = receiver_verdict(receiver, now, mine)
     if not (creds_ok and ok):
         return False
     state = load_json_store(_path(registry_dir, SEND_FILE), check=telegram_send_problem)
@@ -848,6 +863,8 @@ def telegram_available(registry_dir, now, creds_ok=True):
         return False
     if is_missing(state):
         return True
+    if identity is not None and not is_bound(state, identity):
+        return True     # 別の bot / chat のバックオフは今の bot のものではない
     until = state.get('backoff_until')
     return not (is_finite_number(until) and now < until)
 
@@ -1017,7 +1034,7 @@ def _receive_updates(registry_dir, creds, api_base, now, out, identity):
         return []
     if not open_questions(ledger, now) and not watched_buttons(ledger, now, identity):
         return []                                   # 未回答の質問も、押されうる閉じた質問のボタンも無ければ通信しない
-    offset_state, primary = read_offset_effective(registry_dir)
+    offset_state, primary = read_offset_effective(registry_dir, identity=identity)
     if is_missing(primary) or not is_unreadable(primary):
         out['offset_ok'] = True                     # 読めた (無い = 通常運用を含む)。呼び出し側が「読めない」の通知を畳む根拠
     if is_unreadable(offset_state):
@@ -1200,7 +1217,7 @@ def run_cycle(registry_dir, queue_dir, config, carried_reason, forward, *, now=N
         if not needs_net:
             sweep_file(registry_dir, now)
             return summary
-        offset, _primary = read_offset_effective(registry_dir)
+        offset, _primary = read_offset_effective(registry_dir, identity=identity)
         last = None if is_missing(offset) or is_unreadable(offset) else offset.get('last_poll_at')
         interval = config.get('poll_interval_seconds', DEFAULT_POLL_INTERVAL_SECONDS)
         if is_finite_number(last) and 0 <= now - last < interval:

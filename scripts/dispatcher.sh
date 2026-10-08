@@ -3252,7 +3252,7 @@ def run_escalation_cycle(all_tasks, done_ids_by_mission, task_statuses_by_missio
             REGISTRY_DIR, all_tasks, done_ids_by_mission, task_statuses_by_mission, set(active_missions),
             observed_missions(all_tasks, active_missions), now, cfg,
             director_live=director_live_for_state_notices,
-            telegram_available=lambda: creds is not None and lib_telegram.telegram_available(registry_dir, now),
+            telegram_available=lambda: creds is not None and lib_telegram.telegram_available(registry_dir, now, identity=lib_telegram.identity_of(creds)),
             send_director=lambda text: tmux_send(_director_name(), text),
             send_telegram=send_telegram,
             execution_id_of=execution_id_of, session_link=session_link, log=_escalation_warn,

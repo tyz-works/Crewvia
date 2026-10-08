@@ -127,3 +127,72 @@ def test_unreadable_fallback_or_missing_primary_behave_as_before(reg):
     (reg / t.OFFSET_FILE).write_text(json.dumps(offset_doc(3, NOW)))
     (reg / t.OFFSET_FALLBACK_FILE).write_text("{not json")
     assert t.read_offset_effective(reg)[0]["offset"] == 3
+
+
+# --- PR #289 追加 2 (Codex P2): 大小を比べる前に識別子で候補を選ぶ ------------------------------------------------------
+
+OLD_BOT = t.Credentials("999999:OLD-BOT-TOKEN-abcdefghij", CHAT)
+
+
+def old_offset_doc(offset, last_poll_at):
+    return {"offset": offset, "last_poll_at": last_poll_at, "bot_id": OLD_BOT.bot_id, "chat_hash": OLD_BOT.chat_hash}
+
+
+def test_old_bot_large_primary_loses_to_current_bot_fallback(reg, api, primary_replace_fails):
+    """(a) 本体 = 旧 bot の大きい offset (書けない)・退避先 = 新 bot の小さい offset → 退避先。2 回目で同じ update を取り直さない。"""
+    (reg / t.OFFSET_FILE).write_text(json.dumps(old_offset_doc(5000, NOW - 100)))
+    (reg / t.OFFSET_FALLBACK_FILE).write_text(json.dumps(offset_doc(2, NOW - 50)))
+    ident = t.identity_of(creds())
+    state, _ = t.read_offset_effective(reg, identity=ident)
+    assert state["offset"] == 2 and state["bot_id"] == creds().bot_id
+
+    uid = api.queue_update(callback_update(int(CHAT), 77, f"{QID}.9f3a1c.1"))
+    first = t.poll_once(reg, creds(), api_base=api.url, now=NOW)
+    assert first["answered"] == 1
+    assert api.calls_of("getUpdates")[0]["offset"] == 2, "旧 bot の大きい offset (→ 0 へのリセット) に負けた"
+    second = t.poll_once(reg, creds(), api_base=api.url, now=NOW + 60)
+    assert api.calls_of("getUpdates")[1]["offset"] == uid + 1, "毎回最初の batch を取り直している"
+    assert second["processed"] == 0 and second["rejected"] == 0
+    cur, _ = t.read_offset_effective(reg, identity=ident)
+    assert cur["last_poll_at"] == NOW + 60, "退避先の last_poll_at (間引き) が無視された"
+
+
+def test_both_current_bot_still_takes_the_larger(reg):
+    """(b) 両方とも今の bot → 大きい方。"""
+    ident = t.identity_of(creds())
+    (reg / t.OFFSET_FILE).write_text(json.dumps(offset_doc(5, NOW)))
+    (reg / t.OFFSET_FALLBACK_FILE).write_text(json.dumps(offset_doc(6, NOW + 1)))
+    assert t.read_offset_effective(reg, identity=ident)[0]["offset"] == 6
+    (reg / t.OFFSET_FALLBACK_FILE).write_text(json.dumps(offset_doc(4, NOW + 1)))
+    assert t.read_offset_effective(reg, identity=ident)[0]["offset"] == 5
+
+
+def test_both_old_bot_falls_back_to_primary(reg):
+    """(c) どちらも旧 bot → 従来どおり本体 (_receive_updates が 0 から始める)。"""
+    ident = t.identity_of(creds())
+    (reg / t.OFFSET_FILE).write_text(json.dumps(old_offset_doc(5, NOW)))
+    (reg / t.OFFSET_FALLBACK_FILE).write_text(json.dumps(old_offset_doc(9, NOW)))
+    state, primary = t.read_offset_effective(reg, identity=ident)
+    assert state["offset"] == 5 and primary["offset"] == 5
+
+
+def test_current_bot_primary_beats_old_bot_larger_fallback(reg):
+    """逆向き: 退避先の方が旧 bot で大きくても、今の bot の本体が勝つ。"""
+    ident = t.identity_of(creds())
+    (reg / t.OFFSET_FILE).write_text(json.dumps(offset_doc(3, NOW)))
+    (reg / t.OFFSET_FALLBACK_FILE).write_text(json.dumps(old_offset_doc(900, NOW + 5)))
+    assert t.read_offset_effective(reg, identity=ident)[0]["offset"] == 3
+
+
+def test_availability_ignores_state_of_another_bot(reg):
+    """同じ型 (識別子を見ずに状態を使う) — `telegram_available` が旧 bot の受信状態・バックオフを今の bot のものとして読まない。"""
+    ident = t.identity_of(creds())
+    (reg / t.RECEIVER_FILE).write_text(json.dumps({"enabled": True, "checked_at": NOW, "reason": "ok",
+                                                   "bot_id": creds().bot_id, "chat_hash": creds().chat_hash}))
+    old = {"backoff_until": NOW + 900, "bot_id": OLD_BOT.bot_id, "chat_hash": OLD_BOT.chat_hash}
+    (reg / t.SEND_FILE).write_text(json.dumps(old))
+    assert t.telegram_available(reg, NOW) is False, "識別子を渡さない従来の呼び方は変えない"
+    assert t.telegram_available(reg, NOW, identity=ident) is True
+    (reg / t.RECEIVER_FILE).write_text(json.dumps({"enabled": True, "checked_at": NOW, "reason": "ok",
+                                                   "bot_id": OLD_BOT.bot_id, "chat_hash": OLD_BOT.chat_hash}))
+    assert t.telegram_available(reg, NOW, identity=ident) is False, "別の bot の受信状態"

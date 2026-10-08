@@ -13,6 +13,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from pathlib import Path
 
 import pytest
@@ -27,7 +28,9 @@ import lib_telegram as t  # noqa: E402
 from telegram_fake_api import FakeBotApi, callback_update, plain_update, reply_update  # noqa: E402
 
 CHAT = "5550001"
-TOKEN = "123456:FAKE-TOKEN-abcdefghij"
+# プロセスごとに一意の偽 token。/proc の argv 走査は他の pytest プロセス（並行実行・別ファイル）の
+# 偽 token を拾って誤報になるので、固定値を共有しない (memory: proc-cmdline-token-scan-flakes-under-parallel-pytest)。
+TOKEN = f"123456:FAKE-TOKEN-{uuid.uuid4().hex}"
 
 
 class Box:

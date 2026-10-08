@@ -1036,3 +1036,13 @@ PR-A (#281)・PR-B (#283) の merge と dispatcher の restart の後に本番�
 
 - 札の再押下の実測 (12-2)。
 - 外部に影響する操作 (merge 等) を Telegram の答えだけで分類器が通すかの確認 (12-4)。
+
+## 13. P3 4 件の解消 (PR #281 の merge 時に残したもの)
+
+1. **未設定の `cancel` が 0 byte の lock を作る**: 台帳が無ければロックを取る前に `not_found` (exit 6) で抜ける。`list` / `verify` は読むだけでロックを取らない (確認済み)。
+2. **閉じた質問のボタンの再押下**: `watched_buttons()` = ボタンを消す途中 (`unbutton`) か、閉じて `CLOSED_WATCH_SECONDS` (600 秒) 以内の質問。`run_cycle` の `needs_net` と `_receive_updates` の「通信しない」条件の両方に足した。
+   質問 0 件・閉じて 10 分を過ぎたものだけなら今までどおり getUpdates を叩かない。10 分を過ぎたボタンの再押下は応答されない (台帳の照合で断られる側。Telegram 側の待ち表示は数秒で止まる)。
+3. **`telegram_offset_unreadable` の台帳**: poll が `offset_ok` (本体が読めた / 無い) を返したら dispatcher が `clear_told_key` する。offset を読まなかった poll (台帳が使えない・質問なし) は `offset_ok` を返さない = 畳まない。
+4. **offset の本体が書けない** (パスがディレクトリ等): 本体が書けなければ `telegram-offset-fallback.json` に書く。本体と退避先が**両方読めたら offset の大きい方** (同じなら `last_poll_at` の新しい方。Codex P2 / PR #289: 本体が読めるが置換できない immutable・sticky dir の所有者違い でも古い本体を読み続けない。退避先の削除に失敗して古い退避先が残っても本体の新しい値が勝つ)・本体だけ読めれば本体・本体が読めなければ退避先・本体が**無い** (ENOENT) ときは退避先を見ない、で採るので、(a) 同じ update を読み直さず (b) `last_poll_at` の間引きも効く。
+   poll は `offset_unwritable` を返し、dispatcher が Director に 1 回だけ知らせる (`telegram_offset_unwritable`。このときは「読めない」の通知を重ねない)。本体に書けた poll は `offset_write_ok` を返し、退避先を消して台帳を畳む。
+   dispatcher の受信サイクルの変更なので merge 後に **dispatcher の restart が要る**。

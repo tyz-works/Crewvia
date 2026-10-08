@@ -143,10 +143,11 @@ def test_receive_comes_before_every_other_network_call(reg, api):
 
 
 def test_cleanup_runs_even_when_no_question_is_open(reg, api):
-    """open が 0 件でも (受信は通信しない) ボタンを消す後始末は走る — 順序を入れ替えて後始末を落としていないこと。"""
+    """open が 0 件でも ボタンを消す後始末は走る — 順序を入れ替えて後始末を落としていないこと。
+    ボタンが残っている間は、押下に「回答済み」等を返すため受信も先に走る (受信 → 後始末の順は変わらない)。"""
     (reg / t.QUESTIONS_FILE).write_text(json.dumps({"q-00000001": entry("expired", message_id=200)}))
     t.poll_once(reg, creds(), api_base=api.url, now=NOW)
-    assert order(api) == ["editMessageReplyMarkup"]
+    assert order(api) == ["getUpdates", "editMessageReplyMarkup"]
     assert ledger_of(reg)["q-00000001"]["unbutton"] is False
 
 

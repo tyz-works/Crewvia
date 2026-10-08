@@ -25,6 +25,7 @@ set -euo pipefail
 #                              --skills 省略時は環境変数 SKILLS → registry の Worker の skills の順。
 #                              どれも無ければ拒否 (skill の絞り込みを丸ごと無効にしない)。
 #                              Director (registry の role: director) は pull できない
+#                              --agent も AGENT_NAME も空 (空白のみ含む) なら exit 1 で拒否 (何も書かない)。テスト用の env -u / env -i を pull に使わない
 #   plan.sh done <task_id> ("<result>" | --result-file <path|->) [--mission <slug>] (--pr <N> | --no-pr "<理由>")
 #                [--execution <id>]
 #                              --execution <id>: (e3-execution-flag-compat) 受け付けて読み捨てる。done / fail / needs-director /
@@ -2577,7 +2578,8 @@ USAGE = {
             '                     [--target-dir <path>] [--idle-timeout <s>] [--max-timeout <s>]\n'
             '                     [--pr-number <N>] [--deliverable pr|file|none]'),
     'pull': ('plan.sh pull [--mission <slug>] [--skills <csv>] [--agent <name>]\n'
-             '                    [--target-dir <path>] [--task <task_id>]'),
+             '                    [--target-dir <path>] [--task <task_id>]\n'
+             '                    (--agent も AGENT_NAME も空なら exit 1 で拒否)'),
     'done': ('plan.sh done <task_id> ("<result>" | --result-file <path|->) [--mission <slug>] [--pr <N>]\n'
              '                    [--no-pr "<理由>"] [--execution <id>]   (--pr / --no-pr は codex-review が待っているとき・deliverable: pr の task で必須)'),
     'needs-director': 'plan.sh needs-director <task_id> ("<理由>" | --result-file <path|->) [--mission <slug>] [--execution <id>]',

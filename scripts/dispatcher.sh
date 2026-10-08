@@ -3321,12 +3321,21 @@ def run_telegram_cycle():
         poll = summary.get('poll') or {}
         # 回復 (読めた / 書けた) を観測したら一度だけ通知の台帳を畳む。`_daemon` slug は prune_told の対象外なので、畳まないと
         # 同じ障害の 2 回目が永久に黙る。観測していない poll (台帳が使えない・質問なしで offset を読まなかった) では畳まない。
-        for ok_flag, told_key in (('offset_ok', 'telegram_offset_unreadable'), ('offset_write_ok', 'telegram_offset_unwritable')):
+        for ok_flag, told_key in (('offset_ok', 'telegram_offset_unreadable'), ('offset_write_ok', 'telegram_offset_unwritable'),
+                                  ('offset_write_ok', 'telegram_offset_fallback_unwritable'), ('offset_fallback_ok', 'telegram_offset_fallback_unwritable')):
             if poll.get(ok_flag):
                 told = load_told()
                 if not is_unreadable(told) and told_key in told:
                     clear_told_key(told_key)
-        if poll.get('offset_unwritable'):
+        if poll.get('offset_fallback_unwritable'):
+            # 本体にも退避先にも書けない。退避先で継続できていない: 進捗も間引きも残らず、毎サイクル同じ update を読み直す。
+            notify_state_once(
+                'telegram_offset_fallback_unwritable', fingerprint(['fallback-unwritable']), 'telegram-offset', '_daemon', 'telegram',
+                lambda: ('[telegram] offset を保存できません: registry/daemons/telegram-offset.json にも退避先 '
+                         'telegram-offset-fallback.json にも書けません。同じ update を読み直し続け、間引き (poll_interval) も効きません。'
+                         'どちらのパスも消して (消してよい。復旧手順)、権限・ディレクトリ化を直してください。'),
+                director_live=director_live_for_state_notices)
+        elif poll.get('offset_unwritable'):
             # offset の本体が書けない (パスがディレクトリ等)。退避先 (telegram-offset-fallback.json) で二重処理と間引きは保っている。
             notify_state_once(
                 'telegram_offset_unwritable', fingerprint(['unwritable']), 'telegram-offset', '_daemon', 'telegram',

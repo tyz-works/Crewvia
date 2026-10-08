@@ -693,7 +693,12 @@ def store_offset(registry_dir, data, out):
             _path(registry_dir, OFFSET_FALLBACK_FILE).unlink(missing_ok=True)
         return True
     out['offset_unwritable'] = True
-    return _write_json_locked(_path(registry_dir, OFFSET_FALLBACK_FILE), data)
+    if _write_json_locked(_path(registry_dir, OFFSET_FALLBACK_FILE), data):
+        out['offset_fallback_ok'] = True
+        return True
+    # 退避先にも書けない: 進捗も間引きも残らず、同じ update を読み直し続ける。「退避先で継続」ではなく劣化として呼び出し元に返す。
+    out['offset_fallback_unwritable'] = True
+    return False
 
 
 class LedgerBusy(Exception):

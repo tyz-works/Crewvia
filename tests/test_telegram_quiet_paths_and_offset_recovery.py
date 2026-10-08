@@ -186,6 +186,20 @@ def test_offset_recovery_removes_the_fallback_and_reports_write_ok(reg, api):
     assert not (reg / t.OFFSET_FALLBACK_FILE).exists() and (reg / t.OFFSET_FILE).is_file()
 
 
+def test_offset_unwritable_in_both_places_is_reported_as_degraded_not_as_fallback(reg, api):
+    """本体も退避先もディレクトリ → 退避先で継続とは言えない。専用の印を返し、本体だけのときは出さない。"""
+    write_ledger(reg, **{QID: entry(QID)})
+    _block_offset(reg)
+    (reg / t.OFFSET_FALLBACK_FILE).mkdir()
+    res = t.poll_once(reg, creds(), api_base=api.url, now=NOW)
+    assert res.get("offset_unwritable") is True and res.get("offset_fallback_unwritable") is True
+    assert not res.get("offset_fallback_ok")
+    (reg / t.OFFSET_FALLBACK_FILE).rmdir()
+    ok = t.poll_once(reg, creds(), api_base=api.url, now=NOW + 60)
+    assert ok.get("offset_unwritable") is True and ok.get("offset_fallback_ok") is True
+    assert not ok.get("offset_fallback_unwritable"), "本体だけ書けないときは従来どおり (退避先で継続)"
+
+
 def test_fallback_is_ignored_while_the_main_offset_is_merely_missing(reg):
     (reg / t.OFFSET_FALLBACK_FILE).write_text(json.dumps({"offset": 9, "last_poll_at": NOW}))
     state, _ = t.read_offset_effective(reg)

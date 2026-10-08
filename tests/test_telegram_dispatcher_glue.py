@@ -273,6 +273,23 @@ def test_an_unwritable_offset_is_told_once_and_cleared_on_recovery(h, monkeypatc
     assert not [m for m in telegram_messages() if "読めません" in m], "書けない通知があるときは読めない通知で二重に鳴らさない"
 
 
+def test_offset_unwritable_everywhere_is_told_as_degraded_once_and_cleared_on_recovery(h, monkeypatch):
+    """(a) 両方書けない → 劣化の文面を 1 回・「退避先で継続」は出さない (b) 本体だけ → 従来の文面 (c) 回復で畳み、再発で再通知。"""
+    h.configure()
+    ns = h.load()
+    both = {"offset_unwritable": True, "offset_fallback_unwritable": True}
+    _poll_cycle(monkeypatch, [both, both, {"offset_unwritable": True, "offset_fallback_ok": True},    # 退避先に書けた = 回復
+                              both, {"offset_write_ok": True, "offset_ok": True}, both])
+    FakeMux.sent = []
+    for _ in range(6):
+        ns["run_telegram_cycle"]()
+    degraded = [m for m in telegram_messages() if "保存できません" in m]
+    assert len(degraded) == 3, "初回・退避先の回復後・本体の回復後の再発の 3 回だけ (連続では 1 回)"
+    assert not [m for m in degraded if "受信は続けています" in m], "書けないのに「退避先で継続」と言っている"
+    body_only = [m for m in telegram_messages() if "書けません" in m and "保存できません" not in m]
+    assert len(body_only) == 1, "退避先に書けた 3 サイクル目だけ従来の文面 (本体だけ書けない)"
+
+
 # ---------------------------------------------------------------------------
 # bash 側: 起動時に 1 回・前置代入・取り直しは長い間隔だけ
 # ---------------------------------------------------------------------------

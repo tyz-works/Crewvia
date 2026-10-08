@@ -245,7 +245,7 @@ PULL_RC=$?
 |---|---|---|
 | `0` | タスク取得成功。stdout に JSON を出力 | JSON をパースして実行に進む |
 | `2` | タスクなし（idle）。stderr に reason を出力 | 30秒待機して再試行 |
-| `1` | 実エラー（parse 失敗 / lock 取得失敗 / 不正引数 / **worktree を作れなかった**等）。stderr に詳細。stdout に JSON は出ない | 即座に Director に報告し終了。**cwd（主 checkout）で作業を始めない** |
+| `1` | 実エラー（parse 失敗 / lock 取得失敗 / 不正引数 / **agent が空**（`--agent` も `AGENT_NAME` も無い・空白だけ。何も書かずに断る。テスト用の `env -u AGENT_NAME` / `env -i` を pull に使わない）/ **worktree を作れなかった**等）。stderr に詳細。stdout に JSON は出ない | 即座に Director に報告し終了。**cwd（主 checkout）で作業を始めない** |
 | `3` | `pull --task` の前提が外れた（別の target の task 等）。**何も書いていない** | stderr の理由を Director に報告して待つ |
 
 **worktree を作れなかった pull（exit 1・stderr に `worktree を作れませんでした (W3/W4/W5/N2/N6/N7)`）**: task は `needs_director` になり、

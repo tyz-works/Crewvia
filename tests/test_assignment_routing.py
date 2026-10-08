@@ -411,11 +411,14 @@ class TestPullDoubleAssignment:
         assert sb.assignment("Ren") == f"{MISSION}:t001"
         assert "status: pending" in sb.text("t002")
 
-    def test_a_worker_without_a_name_is_not_subject_to_the_check(self, sb):
-        """--agent も AGENT_NAME も無い pull (手動) は、持っている task を確かめる相手がいない。"""
+    def test_a_pull_without_a_name_is_refused_before_the_check(self, sb):
+        """--agent も AGENT_NAME も無い pull は、持っている task を確かめる相手がいないので断る (exit 1・何も書かない)。
+        以前は通って worker=null の in_progress card を作った (tests/test_pull_refuses_empty_agent.py)。"""
         sb.card("t001")
+        before = sb.text("t001")
         r = sb.run("pull", "--task", "t001", "--mission", MISSION, "--skills", "code")
-        assert r.returncode == 0, (r.stdout, r.stderr)
+        assert r.returncode == 1, (r.stdout, r.stderr)
+        assert sb.text("t001") == before
 
 
 # ---------------------------------------------------------------------------

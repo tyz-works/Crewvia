@@ -3575,10 +3575,18 @@ def cmd_pull(args):
         '--target-dir': 'value',
         '--task': 'value',   # specific task ID (dispatcher-assigned; bypasses skill/target/blocked filters)
     })
-    agent = opts.get('--agent') or os.environ.get('AGENT_NAME', '')
+    agent = (opts.get('--agent') or os.environ.get('AGENT_NAME', '')).strip()
     specific_task = opts.get('--task')
-    if agent:
-        require_valid_agent_name(agent)
+    if not agent:
+        # 誰が取るのか分からない pull は始めない。空のまま進むと card は in_progress・worker=null・
+        # execution の agent=null・監査の actor=unknown になり、dispatcher が「仕事なし」と見て退役させる
+        # (store-check の in_progress_without_worker)。**ロックを取る前・何かを読む前**に断る
+        # (retirement_reservation('') / registered_worker('') に空を渡さない)。exit 2 は idle の意味
+        # (Worker が無限に再試行する) なので使わず exit 1。
+        die("pull requires the worker's name: pass --agent <name> or set AGENT_NAME. "
+            "(agent が空のまま pull すると worker 不明の in_progress card ができるので、何も書かずに断ります。"
+            "テスト用の `env -u AGENT_NAME` / `env -i` を pull に持ち込まないでください)")
+    require_valid_agent_name(agent)
 
     # Director は pull しない。判定は registry 上の role で — **`ROLE` 環境変数は見ない**:
     # dispatcher が spawn する kai-review.sh は Director の env を継承しうるので、env で

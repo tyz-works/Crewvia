@@ -25,6 +25,7 @@ set -euo pipefail
 #                              --skills 省略時は環境変数 SKILLS → registry の Worker の skills の順。
 #                              どれも無ければ拒否 (skill の絞り込みを丸ごと無効にしない)。
 #                              Director (registry の role: director) は pull できない
+#                              --agent も AGENT_NAME も空 (空白のみ含む) なら exit 1 で拒否 (何も書かない)。テスト用の env -u / env -i を pull に使わない
 #   plan.sh done <task_id> ("<result>" | --result-file <path|->) [--mission <slug>] (--pr <N> | --no-pr "<理由>")
 #                [--execution <id>]
 #                              --execution <id>: (e3-execution-flag-compat) 受け付けて読み捨てる。done / fail / needs-director /
@@ -2577,7 +2578,8 @@ USAGE = {
             '                     [--target-dir <path>] [--idle-timeout <s>] [--max-timeout <s>]\n'
             '                     [--pr-number <N>] [--deliverable pr|file|none]'),
     'pull': ('plan.sh pull [--mission <slug>] [--skills <csv>] [--agent <name>]\n'
-             '                    [--target-dir <path>] [--task <task_id>]'),
+             '                    [--target-dir <path>] [--task <task_id>]\n'
+             '                    (--agent も AGENT_NAME も空なら exit 1 で拒否)'),
     'done': ('plan.sh done <task_id> ("<result>" | --result-file <path|->) [--mission <slug>] [--pr <N>]\n'
              '                    [--no-pr "<理由>"] [--execution <id>]   (--pr / --no-pr は codex-review が待っているとき・deliverable: pr の task で必須)'),
     'needs-director': 'plan.sh needs-director <task_id> ("<理由>" | --result-file <path|->) [--mission <slug>] [--execution <id>]',
@@ -3575,10 +3577,21 @@ def cmd_pull(args):
         '--target-dir': 'value',
         '--task': 'value',   # specific task ID (dispatcher-assigned; bypasses skill/target/blocked filters)
     })
-    agent = opts.get('--agent') or os.environ.get('AGENT_NAME', '')
+    agent = (opts.get('--agent') or os.environ.get('AGENT_NAME', '')).strip()
     specific_task = opts.get('--task')
-    if agent:
-        require_valid_agent_name(agent)
+    if not agent:
+        # 誰が取るのか分からない pull は始めない。空のまま進むと card は in_progress・worker=null・
+        # execution の agent=null・監査の actor=unknown になり、dispatcher が「仕事なし」と見て退役させる
+        # (store-check の in_progress_without_worker)。**ロックを取る前・何かを読む前**に断る
+        # (retirement_reservation('') / registered_worker('') に空を渡さない)。exit 2 は idle の意味
+        # (Worker が無限に再試行する) なので使わず exit 1。
+        # UsageExit (何も書かずに終わった印) で出す: 普通の SystemExit (die) だと末尾の dispatch が
+        # task-graph を再生成してしまい、「1 バイトも書かない」に反する。
+        print("pull requires the worker's name: pass --agent <name> or set AGENT_NAME. "
+              "(agent が空のまま pull すると worker 不明の in_progress card ができるので、何も書かずに断ります。"
+              "テスト用の `env -u AGENT_NAME` / `env -i` を pull に持ち込まないでください)", file=sys.stderr)
+        raise UsageExit(1)
+    require_valid_agent_name(agent)
 
     # Director は pull しない。判定は registry 上の role で — **`ROLE` 環境変数は見ない**:
     # dispatcher が spawn する kai-review.sh は Director の env を継承しうるので、env で

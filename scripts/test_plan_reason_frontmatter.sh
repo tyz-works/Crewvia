@@ -211,7 +211,7 @@ fi
 
 echo ""
 echo "--- Test 8: plan.sh pull still finds the healthy pending task (t004) despite corrupted t003 ---"
-pull_out=$(run_plan_stdout pull --mission "$MISSION_SLUG" --skills bash) && rc_pull=0 || rc_pull=$?
+pull_out=$(run_plan_stdout pull --agent TestWorker --mission "$MISSION_SLUG" --skills bash) && rc_pull=0 || rc_pull=$?
 picked=$(echo "$pull_out" | python3 -c "import sys,json; print(json.load(sys.stdin).get('id','?'))" 2>/dev/null || echo "?")
 if [[ "$rc_pull" -eq 0 ]] && [[ "$picked" == "t004" ]]; then
   pass "pull picks the healthy pending task t004 despite corrupted t003"

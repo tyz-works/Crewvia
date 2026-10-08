@@ -98,16 +98,6 @@ def test_a_non_time_now_is_refused_before_anything_is_written(tmp_path):
     assert box.snapshot() == before
 
 
-def test_pull_without_an_agent_still_works_and_creates_no_slot(box):
-    p = box.plan("pull", "--skills", "code", "--task", "t001", "--mission", MISSION)
-    res = out(p)
-    meta = box.card()
-    assert meta["worker"] is None and meta["current_execution_id"] == res["execution_id"]
-    assert "execution_agent" not in meta
-    assert not (box.queue / "assignments").exists() or not any((box.queue / "assignments").iterdir())
-    assert box.record(res["execution_id"])["agent"] is None
-
-
 def test_target_dir_task_goes_through_the_controller_without_a_worktree(box, tmp_path):
     td = tmp_path / "target"
     td.mkdir()

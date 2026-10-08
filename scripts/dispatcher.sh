@@ -3319,7 +3319,22 @@ def run_telegram_cycle():
                          '押されても転送されません)。必要なら質問し直してください。'),
                 director_live=director_live_for_state_notices)
         poll = summary.get('poll') or {}
-        if poll.get('offset_unreadable'):
+        # 回復 (読めた / 書けた) を観測したら一度だけ通知の台帳を畳む。`_daemon` slug は prune_told の対象外なので、畳まないと
+        # 同じ障害の 2 回目が永久に黙る。観測していない poll (台帳が使えない・質問なしで offset を読まなかった) では畳まない。
+        for ok_flag, told_key in (('offset_ok', 'telegram_offset_unreadable'), ('offset_write_ok', 'telegram_offset_unwritable')):
+            if poll.get(ok_flag):
+                told = load_told()
+                if not is_unreadable(told) and told_key in told:
+                    clear_told_key(told_key)
+        if poll.get('offset_unwritable'):
+            # offset の本体が書けない (パスがディレクトリ等)。退避先 (telegram-offset-fallback.json) で二重処理と間引きは保っている。
+            notify_state_once(
+                'telegram_offset_unwritable', fingerprint(['unwritable']), 'telegram-offset', '_daemon', 'telegram',
+                lambda: ('[telegram] registry/daemons/telegram-offset.json に書けません (ディレクトリ・権限など)。'
+                         '退避先 telegram-offset-fallback.json で受信は続けていますが、直らないと毎サイクル同じ状態です。'
+                         'そのパスを消して (消してよい。復旧手順) ください。'),
+                director_live=director_live_for_state_notices)
+        elif poll.get('offset_unreadable'):
             # offset ファイルが読めない (壊れ / 型違い / 権限)。0 から読み直して受信は続く (重複は台帳が止める)。次の書き込みで直る。
             # 直らない (書き込みも失敗する) 場合に黙らないよう、同じ理由は 1 回だけ Director に知らせる。
             notify_state_once(

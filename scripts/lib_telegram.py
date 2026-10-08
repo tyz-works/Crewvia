@@ -93,6 +93,10 @@ CARRIED_CHAT_VAR = '_CREWVIA_TG_RESOLVED_CHAT_ID'
 
 QUESTIONS_FILE = 'telegram-questions.json'
 OFFSET_FILE = 'telegram-offset.json'
+#: offset の本体が書けない (パスがディレクトリ等) ときの退避先。本体が読めない間だけ読み、本体に書けたら消す。
+OFFSET_FALLBACK_FILE = 'telegram-offset-fallback.json'
+#: 閉じた (answered / withdrawn / expired) 質問のボタンが Telegram に残っている間、押下に応答を返すために受信を続ける秒数。
+CLOSED_WATCH_SECONDS = 600
 SEND_FILE = 'telegram-send.json'
 RECEIVER_FILE = 'telegram-receiver.json'
 POLL_LOCK_FILE = 'telegram-poll.lock'
@@ -370,6 +374,24 @@ def open_questions(ledger, now):
     return {qid: e for qid, e in ledger.items() if is_unanswered(e, now)}
 
 
+def watched_buttons(ledger, now, identity=None):
+    """閉じた質問のうち、ボタンがまだ Telegram に残っていて押されうるもの (応答を返すために受信を続ける対象)。
+
+    ボタンを消す途中 (`unbutton`) か、閉じて `CLOSED_WATCH_SECONDS` 以内。質問が 0 件・すべて古いなら空 (通信しない節約は保つ)。
+    """
+    out = {}
+    for qid, e in ledger.items():
+        if e.get('status') == 'open' or e.get('message_id') is None:
+            continue
+        if identity is not None and not is_bound(e, identity):
+            continue
+        closed = e.get('closed_at')
+        recent = is_finite_number(closed) and 0 <= now - closed < CLOSED_WATCH_SECONDS
+        if e.get('unbutton') or recent:
+            out[qid] = e
+    return out
+
+
 def sweep_questions(ledger, now):
     """期限・残骸・保管期間の掃除 (§2-3b)。**純粋関数**: 新しい台帳を返す (入力は書き換えない)。
 
@@ -622,6 +644,27 @@ def read_receiver(registry_dir, warn=None):
 
 def read_offset(registry_dir, warn=None):
     return load_json_store(_path(registry_dir, OFFSET_FILE), check=telegram_offset_problem, warn=warn)
+
+
+def read_offset_effective(registry_dir, warn=None):
+    """本体を読み、**本体が読めない (無いではない) ときだけ**退避先を読む。→ 本体と同じ形の結果。"""
+    state = read_offset(registry_dir, warn=warn)
+    if is_unreadable(state) and not is_missing(state):
+        fallback = load_json_store(_path(registry_dir, OFFSET_FALLBACK_FILE), check=telegram_offset_problem, warn=warn)
+        if not is_unreadable(fallback) and not is_missing(fallback):
+            return fallback, state
+    return state, state
+
+
+def store_offset(registry_dir, data, out):
+    """offset を書く。本体に書けなければ退避先へ (二重処理と間引きを保つ)。結果は `out` の印で呼び出し側に返す。"""
+    if _write_json_locked(_path(registry_dir, OFFSET_FILE), data):
+        out['offset_write_ok'] = True
+        with contextlib.suppress(OSError):
+            _path(registry_dir, OFFSET_FALLBACK_FILE).unlink(missing_ok=True)
+        return True
+    out['offset_unwritable'] = True
+    return _write_json_locked(_path(registry_dir, OFFSET_FALLBACK_FILE), data)
 
 
 class LedgerBusy(Exception):
@@ -953,9 +996,11 @@ def _receive_updates(registry_dir, creds, api_base, now, out, identity):
     if is_unreadable(ledger):
         out['error'] = 'ledger_unreadable'
         return []
-    if not open_questions(ledger, now):
-        return []                                   # 未回答の質問が無ければ通信しない
-    offset_state = read_offset(registry_dir)
+    if not open_questions(ledger, now) and not watched_buttons(ledger, now, identity):
+        return []                                   # 未回答の質問も、押されうる閉じた質問のボタンも無ければ通信しない
+    offset_state, primary = read_offset_effective(registry_dir)
+    if is_missing(primary) or not is_unreadable(primary):
+        out['offset_ok'] = True                     # 読めた (無い = 通常運用を含む)。呼び出し側が「読めない」の通知を畳む根拠
     if is_unreadable(offset_state):
         # 読めない offset は「0 から読み直す」に倒す (at-least-once。重複は台帳の CAS と forwarded が止める)。
         # 無い (ENOENT) は通常運用。**それ以外**は壊れ / 型違い / 権限なしなので、1 度だけ見える形で残す (黙って直し続けない)。
@@ -971,7 +1016,7 @@ def _receive_updates(registry_dir, creds, api_base, now, out, identity):
                    api_base=api_base)
     if not res.ok or not isinstance(res.result, list):
         out['error'] = res.error or 'bad_response'
-        _write_json_locked(_path(registry_dir, OFFSET_FILE), dict(identity, offset=offset, last_poll_at=now))
+        store_offset(registry_dir, dict(identity, offset=offset, last_poll_at=now), out)
         return []
     updates = [u for u in res.result if isinstance(u, dict)
                and isinstance(u.get('update_id'), int) and not isinstance(u.get('update_id'), bool)]
@@ -1006,7 +1051,7 @@ def _receive_updates(registry_dir, creds, api_base, now, out, identity):
         new_offset = max(new_offset, offset)
     else:
         new_offset = offset
-    _write_json_locked(_path(registry_dir, OFFSET_FILE), dict(identity, offset=new_offset, last_poll_at=now))
+    store_offset(registry_dir, dict(identity, offset=new_offset, last_poll_at=now), out)
     return replies
 
 
@@ -1131,11 +1176,12 @@ def run_cycle(registry_dir, queue_dir, config, carried_reason, forward, *, now=N
         needs_net = bool(open_questions(ledger, now)) or any(
             e.get('unbutton') for e in ledger.values()) or any(
             e['status'] == 'answered' and e.get('forwarded') is False
-            and now - e['answer']['at'] >= FORWARD_GIVE_UP_SECONDS for e in ledger.values())
+            and now - e['answer']['at'] >= FORWARD_GIVE_UP_SECONDS for e in ledger.values()
+        ) or bool(watched_buttons(ledger, now, identity))
         if not needs_net:
             sweep_file(registry_dir, now)
             return summary
-        offset = read_offset(registry_dir)
+        offset, _primary = read_offset_effective(registry_dir)
         last = None if is_missing(offset) or is_unreadable(offset) else offset.get('last_poll_at')
         interval = config.get('poll_interval_seconds', DEFAULT_POLL_INTERVAL_SECONDS)
         if is_finite_number(last) and 0 <= now - last < interval:
@@ -1394,6 +1440,9 @@ def cmd_cancel(argv):
         return _usage_exit('cancel')
     registry, config = _common(opts)
     now = time.time()
+    if is_missing(read_questions(registry)):
+        _emit({'status': 'not_found'})              # 台帳が無い (未設定を含む) なら、ロックを作らず何も書かずに抜ける
+        return EXIT_NOT_OPEN
     try:
         entry = update_questions(registry, lambda l: (_close(l, opts['q'], 'withdrawn', now, unbutton=True), l.get(opts['q'])), now=now)
         after = read_questions(registry)

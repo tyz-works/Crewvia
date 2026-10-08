@@ -139,7 +139,7 @@ run_plan_all() {
 echo ""
 echo "--- Test 1: pull --task blocked task exits non-zero ---"
 CREWVIA_QUEUE="$QUEUE" CREWVIA_REPO_ROOT="$OWN_CHECKOUT_ROOT" \
-  bash "$PLAN_SH" pull --task t004 --mission "$MISSION_SLUG" --skills bash \
+  bash "$PLAN_SH" pull --agent "W142" --task t004 --mission "$MISSION_SLUG" --skills bash \
   > /dev/null 2>&1 && rc1=0 || rc1=$?
 if [[ "$rc1" -ne 0 ]]; then
   pass "pull --task blocked task exits non-zero (rc=$rc1)"
@@ -149,7 +149,7 @@ fi
 
 echo ""
 echo "--- Test 2: pull --task blocked task shows 'blocked by unfinished' error ---"
-msg2=$(run_plan_all pull --task t004 --mission "$MISSION_SLUG" --skills bash)
+msg2=$(run_plan_all pull --agent "W152" --task t004 --mission "$MISSION_SLUG" --skills bash)
 if echo "$msg2" | grep -q "blocked by unfinished"; then
   pass "error message contains 'blocked by unfinished dependencies'"
 else
@@ -158,7 +158,7 @@ fi
 
 echo ""
 echo "--- Test 3: pull --task unblocked task (dep=done) succeeds ---"
-out3=$(run_plan_stdout pull --task t003 --mission "$MISSION_SLUG" --skills bash) && rc3=0 || rc3=$?
+out3=$(run_plan_stdout pull --agent "W161" --task t003 --mission "$MISSION_SLUG" --skills bash) && rc3=0 || rc3=$?
 if [[ "$rc3" -eq 0 ]] && echo "$out3" | python3 -c "import sys,json; d=json.load(sys.stdin); exit(0 if d.get('id')=='t003' else 1)" 2>/dev/null; then
   pass "pull --task unblocked task (dep done) → t003 pulled"
 else
@@ -170,7 +170,7 @@ reset_task t003 "Third task (blocked_by t001=done)" "t001"
 
 echo ""
 echo "--- Test 4: pull --task with 'verified' dependency → unblocked ---"
-out4=$(run_plan_stdout pull --task t005 --mission "$MISSION_SLUG" --skills bash) && rc4=0 || rc4=$?
+out4=$(run_plan_stdout pull --agent "W173" --task t005 --mission "$MISSION_SLUG" --skills bash) && rc4=0 || rc4=$?
 if [[ "$rc4" -eq 0 ]] && echo "$out4" | python3 -c "import sys,json; d=json.load(sys.stdin); exit(0 if d.get('id')=='t005' else 1)" 2>/dev/null; then
   pass "pull --task: 'verified' dep counts as done → t005 pulled"
 else
@@ -182,7 +182,7 @@ reset_task t005 "Task blocked by verified dep" "t006"
 
 echo ""
 echo "--- Test 5: normal pull (no --task) skips blocked t004, picks free task ---"
-out5=$(run_plan_stdout pull --skills bash --mission "$MISSION_SLUG") && rc5=0 || rc5=$?
+out5=$(run_plan_stdout pull --agent "W185" --skills bash --mission "$MISSION_SLUG") && rc5=0 || rc5=$?
 picked=$(echo "$out5" | python3 -c "import sys,json; print(json.load(sys.stdin).get('id','?'))" 2>/dev/null || echo "?")
 if [[ "$rc5" -eq 0 ]] && [[ "$picked" != "t004" ]]; then
   pass "normal pull picks '$picked', not blocked t004"
@@ -201,7 +201,7 @@ fi
 
 echo ""
 echo "--- Test 7: error message names unmet dependency ---"
-msg7=$(run_plan_all pull --task t004 --mission "$MISSION_SLUG" --skills bash)
+msg7=$(run_plan_all pull --agent "W204" --task t004 --mission "$MISSION_SLUG" --skills bash)
 if echo "$msg7" | grep -q "t002"; then
   pass "error message names the unmet dependency 't002'"
 else
@@ -210,7 +210,7 @@ fi
 
 echo ""
 echo "--- BC-1: dep=failed → pull --task is refused (held) ---"
-out_bc1=$(run_plan_all pull --task t007 --mission "$MISSION_SLUG" --skills bash)
+out_bc1=$(run_plan_all pull --agent "W213" --task t007 --mission "$MISSION_SLUG" --skills bash)
 if echo "$out_bc1" | grep -q "HELD" && echo "$out_bc1" | grep -q "release-dep t007" \
    && ! echo "$out_bc1" | grep -q '"id": "t007"'; then
   pass "BC-1: dep=failed → --task pull refused with HELD + release-dep hint"
@@ -220,7 +220,7 @@ fi
 
 echo ""
 echo "--- BC-1 normal pull: dep=failed task is NOT auto-selected ---"
-out_bc1n=$(run_plan_stdout pull --skills bash --mission "$MISSION_SLUG") && rc_bc1n=0 || rc_bc1n=$?
+out_bc1n=$(run_plan_stdout pull --agent "W223" --skills bash --mission "$MISSION_SLUG") && rc_bc1n=0 || rc_bc1n=$?
 picked_bc1n=$(echo "$out_bc1n" | python3 -c "import sys,json; print(json.load(sys.stdin).get('id','?'))" 2>/dev/null || echo "?")
 if [[ "$picked_bc1n" != "t007" ]]; then
   pass "BC-1 normal pull: held t007 was not selected (picked=$picked_bc1n)"
@@ -231,7 +231,7 @@ fi
 echo ""
 echo "--- BC-1b: release-dep → pull --task succeeds ---"
 run_plan_all release-dep t007 --mission "$MISSION_SLUG" > /dev/null
-out_bc1b=$(run_plan_stdout pull --task t007 --mission "$MISSION_SLUG" --skills bash) && rc_bc1b=0 || rc_bc1b=$?
+out_bc1b=$(run_plan_stdout pull --agent "W234" --task t007 --mission "$MISSION_SLUG" --skills bash) && rc_bc1b=0 || rc_bc1b=$?
 if [[ "$rc_bc1b" -eq 0 ]] && echo "$out_bc1b" | python3 -c "import sys,json; d=json.load(sys.stdin); exit(0 if d.get('id')=='t007' else 1)" 2>/dev/null; then
   pass "BC-1b: released failed dep → t007 pulled"
 else
@@ -240,7 +240,7 @@ fi
 
 echo ""
 echo "--- BC-2: dep=skipped → pull --task succeeds (Director's own decision) ---"
-out_bc2=$(run_plan_stdout pull --task t009 --mission "$MISSION_SLUG" --skills bash) && rc_bc2=0 || rc_bc2=$?
+out_bc2=$(run_plan_stdout pull --agent "W243" --task t009 --mission "$MISSION_SLUG" --skills bash) && rc_bc2=0 || rc_bc2=$?
 if [[ "$rc_bc2" -eq 0 ]] && echo "$out_bc2" | python3 -c "import sys,json; d=json.load(sys.stdin); exit(0 if d.get('id')=='t009' else 1)" 2>/dev/null; then
   pass "BC-2: dep=skipped → t009 pulled"
 else

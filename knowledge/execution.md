@@ -1841,3 +1841,10 @@ verified の done は全部 Worker (Ren 22・Arjun 9・Luna 7・Kai-codex 4・Se
 - **kai-review.sh `--skip-pull`**: card を読むのは**起動時の 1 回だけ**で、`SKIP_EXECUTION_ID` / `EXEC_ARGS` に固定し、報告の時点で読み直さない。報告の時点で試行が替わっていれば、固定した ID を plan.sh が照合して exit 3 で拒否する (置き換えの試行を名乗って通ることは無い)。加えて、card の `worker` が自分 (`--agent`) と違うときは読まない (他の Worker が持つ試行を引き継がない)。`--execution <id>` を渡されたらそれを優先。
 - **構造テスト** `tests/test_execution_e5_docs_carry_the_id_from_pull_not_refetch.py`: agents/ skills/ の fenced code (コメント行・ヒアドキュメント本文を除く) と報告コマンドを含むインラインコードに、`--execution` へ変数/コマンド置換を渡す・`EXECUTION_ID` を env/コマンドから代入する・`source .crewvia-env` と報告が同じ文・`current_execution_id` を読む・`plan status` と `--execution` が同じ文、の形が無い。直す前の worker.md で 4 件・crewvia-qa SKILL.md で 1 件が赤。
 - plan.sh の env フォールバック (`--execution` が無いとき `CREWVIA_EXECUTION_ID` を読む) は PR-1 では残す。`.crewvia-env` を source した呼び出しで `--execution` を付け忘れると同じ穴が開くので、文書は**常にリテラルの `--execution`** を要求している (フォールバックの扱いは PR-2 の拒否と一緒に決める)。
+
+### 20.8 PR #287 の Codex 2 巡目 (t011): 空の `--execution` は拒否・警告は遷移の検査の後
+
+- **P1 (kai-review.sh)**: `--skip-pull --execution "$X"` で `$X` が空だと、「フラグが無い」と区別がつかず card の `current_execution_id` を採用して名乗っていた。**フラグが渡されたか**を `EXECUTION_FLAG_GIVEN` に持ち、渡されて空 (値が無い末尾の `--execution` も) なら引数の解析の直後に exit 1 (card を読まず・pull / done / needs-director を打たない。plan.sh の `--execution ""` = exit 1 と揃えた)。省略したときだけ card を読む。
+- **P2 (lib_task_controller)**: 名乗りなしの警告を `_authorize` の中で出していたので、遷移が拒否される報告 (`mark_task` 経路: 例 in_progress の task への `verifying`、`_finish` 経路を Controller から直接呼んだとき) でも「名乗りなしで報告しました」が出ていた。`_authorize` は警告を出さず、`_warn_unnamed(check)` を**遷移の検査 (`_check_task_status` と試行の遷移表) が全部通った後**にだけ呼ぶ (dry_run は出さない)。plan.sh 経由の done / fail / needs-director は plan.sh が dry_run で先に検査するので、この誤りは `mark_task` 経路でだけ見えていた。
+- **同じ型 (検査の前の副作用・出力) の棚卸し**: `lib_task_controller` の `print` / `sys.std*` は `_warn_unnamed` の 1 か所だけ。検査より前に書く操作は拒否の行 (`_refuse` の監査の `refused:` 行) だけで、これは拒否そのものの記録。他の経路に無い。
+- テスト: `tests/test_execution_e5_warning_after_transition_check.py` (plan.sh 経由・kai-review.sh) / `..._controller.py` (Controller 直接)。赤の実証: 欠陥版 (警告を `_authorize` に戻す・`-z` で省略扱いに戻す) で 9 + 8 件が赤、直すと全緑。

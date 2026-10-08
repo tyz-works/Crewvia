@@ -340,7 +340,7 @@ _NOT_CURRENT_END_CODES = frozenset({ex.RESET_BY_DIRECTOR, ex.RETIRED, ex.WORKSPA
                                     ex.ABANDONED_OUTSIDE_CONTROLLER})
 
 
-def _authorize(txn, slug, tid, meta, caller, *, operation, warn=False):
+def _authorize(txn, slug, tid, meta, caller, *, operation):
     """`(PROCEED|IDEMPOTENT|TASK_ONLY, caller_check)`。拒否は拒否の行を残して domain error。
 
     `operation` は §4.4 の再送の表で「同じ操作」かを言うための名前 (`done` / `verify-result:pass` / `fail` /
@@ -365,14 +365,19 @@ def _authorize(txn, slug, tid, meta, caller, *, operation, warn=False):
                 f"{slug}/{tid}: 名乗った execution は、この task の今の試行ではありません{hint}", slug, tid, meta, caller)
     # 名乗りなし
     if view == ex.ACTIVE:
-        if warn:
-            print(UNNAMED_WARNING, file=sys.stderr)
         return PROCEED, ex.CHECK_UNVERIFIED
     if view == ex.DETACHED:
         return TASK_ONLY, ex.CHECK_DETACHED
     if view == ex.NONE and meta.get('status') in _HOLDING:
         return TASK_ONLY, ex.CHECK_LEGACY_GENERATION
     return TASK_ONLY, ex.CHECK_NO_EXECUTION
+
+
+def _warn_unnamed(check):
+    """名乗りなしで通った報告の警告 (stderr に固定 1 行)。**遷移の検査が通った後**にだけ呼ぶ。
+    `check` が unverified なのは `_authorize` の「名乗りなし × ACTIVE」の分岐だけ。"""
+    if check == ex.CHECK_UNVERIFIED:
+        print(UNNAMED_WARNING, file=sys.stderr)
 
 
 def _idempotent_or_conflict(txn, slug, tid, meta, caller, operation):
@@ -569,8 +574,7 @@ def _finish(txn, slug, tid, meta, body, caller, *, new_status, end_code, to_stat
     _check_now(now)
     _check_body(new_body)
     # dry_run は同じ操作の本番の呼び出しの前に走るので、警告は書く側 1 回だけ
-    decision, check = _authorize(txn, slug, tid, meta, caller, operation=operation,
-                                 warn=(not dry_run and operation in _WARN_UNNAMED_OPERATIONS))
+    decision, check = _authorize(txn, slug, tid, meta, caller, operation=operation)
     updates, remove = _check_updates(meta_updates, meta_remove)
     body_out = body if new_body is None else new_body
     previous = meta.get('status')
@@ -610,6 +614,8 @@ def _finish(txn, slug, tid, meta, body, caller, *, new_status, end_code, to_stat
     _check_task_status(txn, command, slug, tid, meta, caller)
     if dry_run:
         return decision
+    if operation in _WARN_UNNAMED_OPERATIONS:
+        _warn_unnamed(check)                                    # 遷移の検査が全部通った後 (拒否される報告に「通った」は出さない)
     out = dict(meta)
     _apply_updates(out, updates, remove)
     out.update(status=to_status, execution_status=new_status, execution_end_code=end_code)
@@ -732,8 +738,9 @@ def mark_task(txn, slug, tid, caller=NO_CALLER, *, command, to_status, meta_upda
     _check_body(body)
     meta, card_body = _load(txn, slug, tid)
     # operation=None: 再送を成功にする操作ではない (TERMINAL の試行に名乗り付きで来れば `_authorize` が conflict で拒否する)
-    decision, check = _authorize(txn, slug, tid, meta, caller, operation=None, warn=True)
+    decision, check = _authorize(txn, slug, tid, meta, caller, operation=None)
     _check_task_status(txn, command, slug, tid, meta, caller)
+    _warn_unnamed(check)                                        # 遷移の検査が通った後
     updates, remove = _check_updates(meta_updates, meta_remove)
     out = dict(meta)
     _apply_updates(out, updates, remove)

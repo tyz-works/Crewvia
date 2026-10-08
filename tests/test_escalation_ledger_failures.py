@@ -114,7 +114,8 @@ def test_an_unrecorded_result_is_retried_once_after_the_timeout_when_storage_is_
     assert env.stages() == [1, 1]
 
 
-def test_send_failure_is_recorded_and_retried_next_cycle(env):
+def test_send_failure_is_recorded_and_retried_after_the_interval(env, monkeypatch):
+    monkeypatch.setattr(E, 'STAGE1_RETRY_SECONDS', 60.0)    # 既定 (300) だと再試行が段階 2 (+300) と重なる
     env.cycle()
     env.now += 301
     env.director_ok = False
@@ -124,6 +125,8 @@ def test_send_failure_is_recorded_and_retried_next_cycle(env):
     assert entry["stage_sent"] == 0 and entry["stage1_failed_at"] is not None and entry["sending_stage"] is None
     env.director_ok = True
     env.cycle()
+    assert env.stages() == [1], "失敗の直後は間引き間隔が過ぎるまで送り直さない"
+    env.cycle(dt=E.STAGE1_RETRY_SECONDS)
     assert env.stages() == [1, 1] and E.read_ledger(env.reg)["m/t017"]["stage_sent"] == 1
 
 

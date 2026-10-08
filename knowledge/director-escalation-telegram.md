@@ -676,7 +676,7 @@ def decide(card_view, ledger_entry, now, cfg, director_live, telegram_available)
 #   ledger_update: keep | set(entry) | delete
 
 def apply_failure(entry, action, now) -> entry
-# 送信が失敗したときの台帳の更新 (純粋関数)。director_renotice の失敗 → stage1_failed_at を (未設定なら) now に。
+# 送信が失敗したときの台帳の更新 (純粋関数)。director_renotice の失敗 → stage1_failed_at を now に (**直近の失敗の時刻**。再試行の間引きの起点。t002 / P3)。
 # telegram_notice の失敗 → 変更なし (Telegram 側のバックオフ §7 が再試行の間隔を持つ)
 ```
 
@@ -705,12 +705,17 @@ R6 と R7 の関係が P1-1 の直し方 (t002): **Director 不在 (`director_li
 `stage1_failed_at` が付いていても) `director_renotice` が出る。段階 1 は成功すれば `stage_sent == 1` になり、
 Telegram が使えるようになった次のサイクルで R6 が当たる。段階 1 の送信が**失敗**したとき (在席なのに `tmux_send` が False)
 は、`apply_failure` が `stage1_failed_at` を書き、次のサイクルから R6 の「到達可能」が成り立つ。
-段階 1 の再試行は `elapsed < t` の間だけ意味があり、間隔は既存の `should_notify(<key>#<execution_id>)` スロットル (`NOTIFY_TTL`) に任せる
-(5 秒ごとに失敗を叩かない)。
+段階 1 の再試行は `elapsed < t` の間だけ意味があり、間隔は**台帳の `stage1_failed_at`** が持つ: `run_cycle` が `stage1_retry_throttled()`
+(直近の失敗から `STAGE1_RETRY_SECONDS` = 300 秒未満なら送らない・sending も書かない) で見送る (5 秒ごとに失敗を叩かない)。
+初版は `should_notify` (`NOTIFY_TTL`) に任せる想定で書いたが、実装には呼び出しが無く、送れない間は dispatcher のサイクルごとに
+`mux send` を試していた (PR #283 の P3 → t002)。`decide()` (純粋関数・規則表) は変えない — 間引きは R7 が `director_renotice` を返した後の `run_cycle` 側。
+段階 2 は `telegram_available` の Telegram 側バックオフ (§7) が間隔を持つので同じ型の対処は要らない。
 
-**台帳に書くのは「送れた後」だけ**: `director_renotice` / `telegram_notice` の実行が成功したときだけ `ledger_update` を適用する。
-失敗したら適用せず (`telegram_notice` は何も書かず、`director_renotice` は `apply_failure`)、同じ段階をもう一度試す。
-`notify_state_once` と同じ向き (「送れなかった通知は記録しない — 戻ったらすぐ送る」)。
+**台帳は「記録してから送る」(§11-1)**: 段階 N を送る**前**に `sending_stage` / `sending_at` を台帳へ書き、書けなければ送らない。
+送れたら `decide()` が返した `ledger_update` (`stage_sent=N`) を適用し、失敗したら `stage_sent` は進めず `sending` を外す
+(`apply_failure`。段階 1 は `stage1_failed_at` を直近の失敗の時刻に更新)。**段階の進捗 (`stage_sent`) を進めるのが「送れた後」だけ**で、
+失敗した段階は間引き間隔 (段階 1 = `STAGE1_RETRY_SECONDS` / 段階 2 = Telegram のバックオフ) を空けて試し直す。
+`notify_state_once` の「送れなかった通知は記録しない」とは別の仕組み (あちらは fingerprint を送れた後に書く)。
 
 **テストの母集団 (全直積)** — `tests/test_escalation_decide.py` は次の軸の**全直積**を `decide()` に流す (純粋関数なので
 全部で数千通りでも一瞬):
@@ -796,7 +801,7 @@ task: t017 (needs_director) — 止まって 10 分
 |---|---|---|
 | Telegram 未設定 (認証情報が解決できない) | **何もしない**。ファイルも作らず、ログも出さない。ただし**受信側の状態ファイルが既にあれば `enabled: false` に書き換える** (§1-3・§1-1) | 公開前提。Taskvia 非依存と同じ型。送信側 (`ask_user.sh`) との答えを割らない |
 | **dispatcher が respawn で認証情報を失った** (§1-1) | `telegram-receiver.json` が `enabled: false` に変わり、`ask` は断り (exit 4)、Director に 1 通 | 黙って止まらない。割れた状態でボタンを出さない |
-| `sendMessage` が失敗 (ネットワーク・HTTP エラー・`ok:false`) | **dispatcher のサイクルを止めない**。その通知は**記録せず**、バックオフ後に再試行 | 送れないことで割り当てを止めない。`notify_state_once` と同じ「送れなかった通知は記録しない」 |
+| `sendMessage` が失敗 (ネットワーク・HTTP エラー・`ok:false`) | **dispatcher のサイクルを止めない**。その通知は**送れた印 (`stage_sent`) を付けず**、バックオフ後に再試行 | 送れないことで割り当てを止めない。`notify_state_once` と同じ「送れなかった通知は記録しない」 |
 | Telegram が長く落ちている | バックオフは指数 (30 秒 → 1 分 → 2 分 … 上限 10 分。`telegram-send.json`)。**ログは 10 分に 1 回** `WARNING: telegram unreachable (<種別>)`。段階 2 の `decide()` には `telegram_available = False` で渡る | 5 秒ごとに失敗を叩かない・ログを埋めない |
 | 受信 (`getUpdates`) が失敗 | 何も受けなかった扱い。offset は進めない。サイクルは続行 | 次回に同じ update を受けるだけ (at-least-once) |
 | `telegram-questions.json` が `Unreadable` | 転送しない・offset を進めない (§2-3) | 観測できなかったことを「答え無し」に倒さない |
@@ -960,7 +965,7 @@ Telegram だけを根拠にしない) で守られているので、漏洩して
   `lib_telegram.telegram_available`。1 サイクルの Telegram は最大 3 通。
 - **問い合わせは鳴らしうるときだけ**: mux (`director_live`) と Telegram の可否は、経過が最小のしきい値に届いた card があるときにだけ 1 回評価する
   (`_could_act`)。待機中の task が増えても毎サイクル `mux list` を叩かない (`test_a_cycle_with_only_already_told_states_does_not_ask_the_mux`)。
-- 台帳は「送れた後だけ」書く。書けなければその周期の残りの送信を止める (記録できないまま送り続けない)。台帳が `Unreadable` なら段階上げ全体を見送る (§5-4)。
+- 台帳は**送る前に `sending` を書き** (§11-1)、`stage_sent` は送れた後だけ進める。書けなければその周期の残りの送信を止める (記録できないまま送り続けない)。台帳が `Unreadable` なら段階上げ全体を見送る (§5-4)。
 - Director 宛 (段階 1) は 1 行 (` / ` 区切り。mux send は改行で複数送信になるため)、Telegram 宛は同じ項目の複数行。
 - テスト: `tests/test_escalation_decide.py` (手書き oracle 表 25 行・全直積の不変条件・ランダム列 400 本・cfg・台帳の形・文面) /
   `tests/test_escalation_dispatcher_cycle.py` (本物の dispatcher 1 サイクル + 偽の Bot API。t017 → t006 の事故の再現)。
@@ -974,11 +979,11 @@ Telegram だけを根拠にしない) で守られているので、漏洩して
 次のサイクルが古い段階を読んで同じ通知を 5 秒ごとに送った。直し:
 
 1. 段階 N を送る**前**に、台帳へ `sending_stage=N` / `sending_at` を書く。**書けなければ送らない** (そのサイクルは見送り)。
-2. 送れたら `stage_sent=N` に進めて sending を外す。失敗したら sending を外し (段階 1 は `stage1_failed_at`) 次のサイクルで再試行。
+2. 送れたら `stage_sent=N` に進めて sending を外す。失敗したら sending を外し (段階 1 は `stage1_failed_at` = 直近の失敗の時刻)、段階 1 は `STAGE1_RETRY_SECONDS` (300 秒) 後・段階 2 は Telegram のバックオフ後に再試行 (次のサイクルでは試さない。t002)。
 3. 結果の書き込みが失敗しても sending が残る → `decide()` の **R5b** (期限内の sending は `none` / keep) が同じ段階を止める。
 4. sending が `SENDING_TIMEOUT_SECONDS` (600 秒) を過ぎたら「失敗」として読む (段階 1 なら `stage1_failed_at`)。送り直せるのは、**その前に送る前の書き込みが成功した**ときだけ
    — 保存が壊れている間は何度でも見送りで、連投にならない。倒れる向き = 保存が壊れている間は通知が欠ける側。
-5. 見送りは Director に知らせる (`[escalation] escalation-state に書けない…`)。間引きは台帳ではなく notify cache (`should_notify`。別ファイル・プロセスをまたぐ・NOTIFY_TTL に 1 回)。
+5. 見送りは Director に知らせる (`[escalation] escalation-state に書けない…`)。見送りの**通知**の間引きは台帳ではなく notify cache (`should_notify`。別ファイル・プロセスをまたぐ・NOTIFY_TTL に 1 回)。送信失敗の**再試行**の間引きは台帳の `stage1_failed_at` (この節の 2)。
    Director 不在・送信失敗なら log だけ。notify cache も書けないと毎サイクル届きうるが、dispatcher の他の通知と同じ前提 (台帳に依存させないことを優先した)。
 
 テスト: `tests/test_escalation_ledger_failures.py` (書き込み失敗を出来事とする長さ 1〜40 のランダム列 300 本 + 個別の再現)・`test_escalation_decide.py` の R5b 行。

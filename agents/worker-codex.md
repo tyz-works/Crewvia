@@ -32,7 +32,7 @@ Phase 2 で登録した **Codex Kai** の worker 名は **`Kai-codex`** に決�
 
 ## Phase 2 スコープ (現行)
 
-Phase 2 では **Kai-codex を dispatcher が自動 spawn する**。Priya は `skills: [codex-review]` の task を実装 task に `blocked_by` で積むだけで、Director の手動介入なしで review が走る（`pr_number` は実装 task の `plan.sh done <id> --pr <N>` が自動で書く）。
+Phase 2 では **Kai-codex を dispatcher が自動 spawn する**。Priya は `skills: [codex-review]` の task を実装 task に `blocked_by` で積むだけで、Director の手動介入なしで review が走る（`pr_number` は実装 task の `plan.sh done <id> --pr <N> --execution <ex-…>` が自動で書く）。
 
 **運用フロー (Phase 2)**:
 
@@ -40,7 +40,7 @@ Phase 2 では **Kai-codex を dispatcher が自動 spawn する**。Priya は `
    ```bash
    plan.sh add "Codex review" --skills codex-review --blocked-by t003
    ```
-   実装 task t003 が `plan.sh done t003 --pr 42 --mission <slug> "PR #42 ..."` で閉じると、この task に `pr_number: 42` が入り
+   実装 task t003 が `plan.sh done t003 --pr 42 --mission <slug> "PR #42 ..." --execution <ex-…>` で閉じると、この task に `pr_number: 42` が入り
    （未設定のときだけ）、`blocked` なら `pending` に戻る。既に PR がある task を積むときだけ `--pr-number 42` で最初から入れる
 2. Dispatcher が 5s poll で検知 → `nohup kai-review.sh --pr 42 --task tXXX --mission <slug> --agent Kai-codex` を background spawn
 3. kai-review.sh が `plan.sh pull` で task を in_progress にし、Taskvia PATCH を発火
@@ -70,7 +70,7 @@ Priya が計画時に codex-review task を積めば、Dispatcher が自動で `
 
 ```bash
 # Priya の plan-review skill から発行される typical な add コマンド
-# （PR 番号はまだ無いので --pr-number は付けない。実装 task の `plan.sh done --pr <N>` が入れる）
+# （PR 番号はまだ無いので --pr-number は付けない。実装 task の `plan.sh done <id> --pr <N> --execution <ex-…>` が入れる）
 plan.sh add "Codex review (Kai)" \
   --skills codex-review \
   --blocked-by t<impl_task> \
@@ -128,9 +128,9 @@ bash scripts/kai-review.sh \
    サブコマンドは使わない)
 6. 出力ファイル (JSON) の findings を読み込み
 7. 判定:
-   ├─ findings なし / all low  → plan.sh done <task_id> "LGTM: ..."
-   ├─ 修正必要                 → plan.sh needs-director <task_id> "NEEDS FIX: <findings>"
-   └─ branch mismatch 検出     → plan.sh needs-director <task_id> "BRANCH MISMATCH: <details>"
+   ├─ findings なし / all low  → plan.sh done <task_id> "LGTM: ..." --execution <ex-…>
+   ├─ 修正必要                 → plan.sh needs-director <task_id> "NEEDS FIX: <findings>" --execution <ex-…>
+   └─ branch mismatch 検出     → plan.sh needs-director <task_id> "BRANCH MISMATCH: <details>" --execution <ex-…>
 8. plan.sh done が自動で:
    → Taskvia PATCH (done) 発火
    → registry/workers.yaml の Kai-codex.task_count を bump (lib_registry.bump_task_count)
@@ -172,9 +172,9 @@ Kai が特に注目する 3 つの観点と verdict rule：
 
 | Verdict | 条件 | plan.sh コマンド |
 |---|---|---|
-| **LGTM** | findings なし または low リスクのみ | `plan.sh done <task_id> "LGTM: <summary>"` |
-| **NEEDS FIX** | correctness / silent failure の findings あり | `plan.sh needs-director <task_id> "NEEDS FIX: <findings>"` |
-| **BRANCH MISMATCH** | fix が想定 branch に存在しない | `plan.sh needs-director <task_id> "BRANCH MISMATCH: <details>"` |
+| **LGTM** | findings なし または low リスクのみ | `plan.sh done <task_id> "LGTM: <summary>" --execution <ex-…>` |
+| **NEEDS FIX** | correctness / silent failure の findings あり | `plan.sh needs-director <task_id> "NEEDS FIX: <findings>" --execution <ex-…>` |
+| **BRANCH MISMATCH** | fix が想定 branch に存在しない | `plan.sh needs-director <task_id> "BRANCH MISMATCH: <details>" --execution <ex-…>` |
 
 ---
 
@@ -187,7 +187,7 @@ Phase 1 では Claude Seo と Codex Kai の **2 人体制**で review する。
 - **Kai (Codex)**: Director が対象 PR を決定後、手動で `kai-review.sh` を呼び出す（plan task として組み込まない）
 
 ```
-[Seo task]  plan.sh done "LGTM" / needs-director "NEEDS FIX"
+[Seo task]  plan.sh done <id> "LGTM" --execution <ex-…> / needs-director <id> "NEEDS FIX" --execution <ex-…>
 [Director が kai-review.sh 手動実行]  exit 0 → plan.sh done / NEEDS FIX なら plan.sh needs-director
 
 [2人の verdict 突合]

@@ -873,7 +873,7 @@ consumer of `getUpdates` on the same bot steals updates. Restart the dispatcher 
 4. Dispatcher assigns tasks to idle Workers via mux backend (`tmux send-keys` or `herdr pane run`)
 5. Worker pulls assigned task via `plan.sh pull --task <id> --mission <slug>`, executes it
 6. Before risky tool calls, PreToolUse hook requests approval from Taskvia
-7. Worker reports completion via `plan.sh done`, then waits for next Dispatcher assign
+7. Worker reports completion via `plan.sh done <id> --execution <ex-…>` (the `execution_id` from the pull JSON; Bash drops env between calls, so name it on every report — an unnamed report still passes but prints a warning on stderr and will be refused later), then waits for next Dispatcher assign
 8. Dispatcher notifies Director when a new Worker skill is needed or all missions are complete
 9. Director responds to Dispatcher notifications (spawns Workers / archives mission)
 
@@ -886,7 +886,7 @@ Assignments are checked by machine, not by the Worker's self-check (see `knowled
 - The Dispatcher does not send a second task to a Worker whose first task was sent but not yet pulled.
 - `plan.sh pull --task` refuses (exit 3, writes nothing) a task whose `target_dir` does not match the
   Worker's `TARGET_DIR`, and a Worker that already holds a different task (in progress or assigned).
-- `plan.sh done <id> "<result>" --pr <N>` writes `pr_number` onto the `codex-review` / `review` tasks that
+- `plan.sh done <id> "<result>" --pr <N> --execution <ex-…>` writes `pr_number` onto the `codex-review` / `review` tasks that
   are blocked by `<id>` and un-blocks a `blocked` `codex-review` task. `--pr` is explicit only; the result
   text is never parsed. A drafted plan may mark a task `status: blocked` if it has a `blocked_reason`.
   If a `codex-review` task is waiting on `<id>` for its PR number, `done` without `--pr` is refused (exit 2,

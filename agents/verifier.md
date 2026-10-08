@@ -4,7 +4,7 @@
 
 ## 基本原則
 
-1. **判定するが、修正しない**: 問題を発見しても自分で直さない。`plan.sh verify-result <task_id> fail` で差し戻す。
+1. **判定するが、修正しない**: 問題を発見しても自分で直さない。`plan.sh verify-result <task_id> fail --execution <ex-…>` で差し戻す。
 2. **曖昧なら pass しない**: acceptance_criteria が測定不能・不明確な場合は `needs_human_review` を選ぶ。
 3. **高リスクは `needs_human_review`**: auth/billing/migration/delete 系で不確実性がある場合は人間にエスカレーション。
 4. **権限の範囲内で検査する**: `verify` スキルの allow リストにないツールは使わない。
@@ -55,7 +55,7 @@ cat queue/missions/<slug>/tasks/<task_id>.md
 ### Step 4: 判定する
 
 **どの試行を判定するか名指しする**: verifier-dispatcher の指示文に `--execution ex-…` が入っているときは、**その値をそのまま**
-`plan.sh verify-result` に付ける（下の例は省略している）。plan.sh は card の今の試行と照合し、違えば exit 3 で拒否する
+`plan.sh verify-result` に付ける（下の例の `${EXECUTION_ID:+--execution "$EXECUTION_ID"}` は、指示文の `ex-…` を `EXECUTION_ID` に入れた形。空なら外れる）。plan.sh は card の今の試行と照合し、違えば exit 3 で拒否する
 （検証に出した後で Worker が差し戻し・再 pull されていた等。**打ち直さず**、Director に報告する）。同じ判定の再送は成功になる。
 指示文に ID が無いときは付けない（`--execution ""` のような空の指定は拒否される）。
 
@@ -64,15 +64,15 @@ cat queue/missions/<slug>/tasks/<task_id>.md
 
 ```bash
 # 全 check pass、acceptance_criteria 充足
-plan.sh verify-result <task_id> pass --notes '機械 check 全 pass。acceptance_criteria 3/3 充足確認。'
+plan.sh verify-result <task_id> pass ${EXECUTION_ID:+--execution "$EXECUTION_ID"} --notes '機械 check 全 pass。acceptance_criteria 3/3 充足確認。'
 
 # 問題あり
-plan.sh verify-result <task_id> fail --notes 'lint fail: 3 errors。acceptance_criteria item-2 未充足（テストなし）。'
+plan.sh verify-result <task_id> fail ${EXECUTION_ID:+--execution "$EXECUTION_ID"} --notes 'lint fail: 3 errors。acceptance_criteria item-2 未充足（テストなし）。'
 
 # 判定不能
 # コマンド例・バッククォートを含む長い notes は --notes-file <path> か --notes-file - (クォート付きヒアドキュメント)。
 # 二重引用符の --notes はバッククォート / $(...) がシェルに実行される。
-plan.sh verify-result <task_id> needs_human_review --notes-file - <<'NOTES_EOF'
+plan.sh verify-result <task_id> needs_human_review ${EXECUTION_ID:+--execution "$EXECUTION_ID"} --notes-file - <<'NOTES_EOF'
 acceptance_criteria が曖昧で判定できない: '正しく動く' の定義が不明。
 NOTES_EOF
 ```

@@ -210,8 +210,11 @@ Dispatcher から通知を受け取る:
 # → --mission 省略時は active mission を検索。複数 mission に同 ID が存在すると曖昧エラー。
 # → --execution: 「どの試行を完了と判断したか」の名指し。`plan.sh status --mission <slug>` の進行中の行
 #   `[ex-… attempt N]` の値をそのまま渡す。Director が見た後に Worker が reset → 再 pull していれば exit 3
-#   (EXECUTION_NOT_CURRENT) で止まる (誤って新しい試行を完了にしない)。付けなくても通る (今は拒否しない。
-#   試行の無い card・Director が `update --status in_progress --reset` で開いた card には ID が無いので付けない)。
+#   (EXECUTION_NOT_CURRENT) で止まる (誤って新しい試行を完了にしない)。**Director の代理報告 (done / fail / needs-director) も必ず付ける**
+#   (Director 専用の抜け道は無い。付けないと「名乗りなし」の警告が出て、将来は拒否される = execution.md §20)。
+#   試行の無い card・Director が `update --status in_progress --reset` で開いた card には ID が無いので付けない
+#   (その card の done は名乗りなしで通る。対象外)。Worker が死んで ID を名乗れる者がいないときは
+#   `plan.sh update <id> --status pending --reset` で card を開ける。
 #   done が通る元の status は in_progress だけ。pending / blocked / 検証待ち から完了にしたいときは
 #   `update --status in_progress --reset` で開いてから done するか、`update --status done` を使う。
 
@@ -297,11 +300,11 @@ required_evidence:
 - 部分文字列の存在チェック（正規表現不使用）
 - 証拠が提出できないケースは Director が **事前に `required_evidence: []`（空リスト）** で作成する
   — Worker が実行時に自己申告で例外扱いにすることはできない
-- Worker が詰まった場合は `plan.sh needs-director` で差し戻すこと
+- Worker が詰まった場合は `plan.sh needs-director` で差し戻すこと（Director が代わりに打つ `done` / `fail` / `needs-director` も `plan.sh status --mission <slug>` の `[ex-… attempt N]` を `--execution` で名乗る）
 
 **`needs_director` ステータスの扱い**:
 
-- Worker が `plan.sh needs-director <task_id> "<理由>"` を呼ぶと、タスクは `needs_director` 状態になる
+- Worker が `plan.sh needs-director <task_id> "<理由>" --execution <ex-…>` を呼ぶと、タスクは `needs_director` 状態になる
 - `plan.sh status` で 🆘 アイコンとともに表示される
 - Director は reason を読んで対処方針を決定し、`plan.sh update <task_id> --status pending --reset` で差し戻す
   （`--status in_progress --reset` は罠 — `--reset` の適用後に `--status` が上書きするため、最終状態が `status=in_progress / worker=null` になり dispatch 不能・pull 拒否のまま静かに全停止する。`--status pending` にすること）
@@ -318,11 +321,11 @@ Write を deny されている skill (review 等) の Worker が「Result セク
 直接編集と解釈し、`cat >> queue/missions/<slug>/tasks/tNNN.md <<'EOF'` の heredoc でハングした
 （42 分間無応答）。**これは Director の指示ミスだった** — `cmd_done` は result を
 `build_task_body` 経由で body に書くだけで frontmatter には触れないため、
-**`plan.sh done <task_id> --result-file <path|->` に複数行を渡すのは完全に安全**（二重引用符の位置引数だと本文中のバッククォート / `$(...)` をシェルが実行する — 2026-09-28 の事故 — ので、Result は必ずファイルか標準入力で渡す）。1 行制約が必要なのは
+**`plan.sh done <task_id> --result-file <path|-> --execution <ex-…>` に複数行を渡すのは完全に安全**（二重引用符の位置引数だと本文中のバッククォート / `$(...)` をシェルが実行する — 2026-09-28 の事故 — ので、Result は必ずファイルか標準入力で渡す）。1 行制約が必要なのは
 `plan.sh needs-director` の reason だけ（frontmatter の `needs_director_reason` に直接書かれるため）。
 
 Worker に指示を出す際は:
-- **Result は `plan.sh done --result-file <path>`（Write ツールで scratchpad に書く）か `--result-file -`（クォート付きヒアドキュメント `<<'RESULT_EOF'` を標準入力へ）で渡させる**。複数行で構わない。二重引用符の位置引数で渡させない
+- **Result は `plan.sh done --result-file <path> --execution <ex-…>`（Write ツールで scratchpad に書く）か `--result-file -`（クォート付きヒアドキュメント `<<'RESULT_EOF'` を標準入力へ）で渡させる**。複数行で構わない。二重引用符の位置引数で渡させない
 - **task ファイル (`queue/missions/**/tasks/tNNN.md`) を Worker 自身に編集させる指示を書かない**
   （Director 自身が qa_checkpoints 等の frontmatter を事前設定する分には問題ない。上記 §3 参照）
 - `hooks/pre-tool-use.sh` に task ファイルへの Bash 経由書き込み (`>` / `>>` / heredoc / `sed -i` /
@@ -390,7 +393,7 @@ Worker に指示を出す際は:
 | `planning` | プランレビュー（タスク分解・依存関係・スキル割り当ての妥当性検証）。Bash(plan.sh status/pull), git log/diff は可。Edit/Write は deny |
 | `plan_review` | plan_review.md への verdict 出力専用（Write 可 / Edit・Bash 全面 deny）。planning とは権限が異なる。crewvia-plan-review skill 参照 |
 | `verify` | 実機検証・smoke test |
-| `codex-review` | Codex CLI (Kai-codex) による自動 review 専用。plan task には積むだけで良く、Dispatcher が `kai-review.sh` を自動 spawn する（Director が Worker を起動する必要はない）。`pr_number` が無いまま ready になった task は spawn されず、Director に `[review-no-pr]` が 1 回だけ届くが、**PR がまだ無い段階では手で入れない** — 実装 task を `blocked_by` に持たせ、実装 task を `plan.sh done <id> --pr <N>` で閉じると `pr_number` が自動で入る（下記「`codex-review` skill task の積み方」）。詳細は `knowledge/codex-reviewer.md` |
+| `codex-review` | Codex CLI (Kai-codex) による自動 review 専用。plan task には積むだけで良く、Dispatcher が `kai-review.sh` を自動 spawn する（Director が Worker を起動する必要はない）。`pr_number` が無いまま ready になった task は spawn されず、Director に `[review-no-pr]` が 1 回だけ届くが、**PR がまだ無い段階では手で入れない** — 実装 task を `blocked_by` に持たせ、実装 task を `plan.sh done <id> --pr <N> --execution <ex-…>` で閉じると `pr_number` が自動で入る（下記「`codex-review` skill task の積み方」）。詳細は `knowledge/codex-reviewer.md` |
 
 ### skill 別デフォルトモデル
 
@@ -428,7 +431,7 @@ Worker がファイルを編集・作成できるかはスキルで決まる。
 
 > ⚠️ `review` / `research` / `verify` / `planning` (❌ deny) の Worker は **ファイルを書く手段が Bash しか無い**。
 > だからといって task ファイルへの直接書き込みを指示しないこと — Result の記録は必ず
-> `plan.sh done <task_id> --result-file <path|->` に一本化する（§3「Worker への指示で『task ファイルの直接編集』を
+> `plan.sh done <task_id> --result-file <path|-> --execution <ex-…>` に一本化する（§3「Worker への指示で『task ファイルの直接編集』を
 > 促さないこと」参照）。
 
 ### 実装タスクの skills 命名パターン
@@ -1063,7 +1066,7 @@ Dispatcher は常に **main 版の `scripts/kai-review.sh`**（$CREWVIA_REPO_ROO
 ### `codex-review` skill task の積み方（通常パス）
 
 `review`（Seo）とは別に、`--skills codex-review --blocked-by <実装 task>` で task を積むだけでよい。
-**PR 番号は手で入れない**: 実装 task を `plan.sh done <id> --pr <N> --mission <slug> --result-file <path|->` で閉じると、
+**PR 番号は手で入れない**: 実装 task を `plan.sh done <id> --pr <N> --mission <slug> --result-file <path|-> --execution <ex-…>` で閉じると、
 その task を `blocked_by` に持つ `codex-review` / `review` の task に `pr_number` が書かれ（未設定のものだけ。
 Result の本文から推測はしない）、`blocked` の codex-review は `pending` に戻る。
 

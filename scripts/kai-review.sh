@@ -8,7 +8,10 @@ set -euo pipefail
 # Usage:
 #   bash scripts/kai-review.sh --pr <PR#> --task <task_id>
 #                              [--mission <slug>] [--model <model>] [--agent <name>]
-#                              [--skip-pull] [--dry-run]
+#                              [--skip-pull] [--execution <ex-…>] [--dry-run]
+#
+# --execution : 報告 (done / needs-director) で名乗る試行の ID。--skip-pull のとき、省略すれば card の
+#               current_execution_id (active な試行だけ) を読む。読めなければ名乗りなし + 警告 1 行。
 #
 # --skip-pull vs --dry-run (F6, PR#180):
 #   --skip-pull : plan.sh pull だけを飛ばす（task は既に in_progress 前提）。
@@ -83,6 +86,7 @@ MISSION_SLUG=""
 MODEL="$DEFAULT_MODEL"
 AGENT="$DEFAULT_AGENT"
 SKIP_PULL=0  # デバッグ用: plan.sh pull を skip する (task が既に in_progress の場合の再実行時など)
+EXPLICIT_EXECUTION_ID=""  # --execution: --skip-pull の再実行で名乗る試行 (省略時は card から読む)
 DRY_RUN=0    # F6: plan.sh への書き込み (pull/done/needs-director) を一切行わない smoke-test モード
 
 while [[ $# -gt 0 ]]; do
@@ -93,6 +97,7 @@ while [[ $# -gt 0 ]]; do
     --model)      MODEL="$2";        shift 2 ;;
     --agent)      AGENT="$2";        shift 2 ;;
     --skip-pull)  SKIP_PULL=1;       shift 1 ;;
+    --execution)  EXPLICIT_EXECUTION_ID="${2:-}"; shift 2 ;;
     --dry-run)    DRY_RUN=1;         shift 1 ;;
     -h|--help)
       sed -n '3,43p' "$0" | sed 's/^# //'
@@ -274,6 +279,32 @@ elif [[ $DRY_RUN -eq 1 ]]; then
   _info "DRY_RUN=1: skipping plan.sh pull (no writes to plan.sh in dry-run mode)"
 else
   _info "SKIP_PULL=1: skipping plan.sh pull (assumes task is already in_progress with worker=${AGENT})"
+  # pull しないので JSON が無い。名乗りは --execution か、card の今の試行 (active のときだけ。verifier-dispatcher と同じ読み方)。
+  SKIP_EXECUTION_ID="$EXPLICIT_EXECUTION_ID"
+  if [[ -z "$SKIP_EXECUTION_ID" ]]; then
+    SKIP_EXECUTION_ID="$(python3 - "${CREWVIA_QUEUE:-${CREWVIA_REPO_ROOT:-$REPO_ROOT}/queue}" "$MISSION_SLUG" "$TASK_ID" "$SCRIPT_DIR" 2>/dev/null <<'PYEOF' || true
+import glob, os, re, sys
+queue, slug, tid, scripts = sys.argv[1:5]
+sys.path.insert(0, scripts)
+import lib_task_cards as cards
+pattern = os.path.join(queue, 'missions', slug or '*', 'tasks', tid + '.md')
+paths = glob.glob(pattern)
+if len(paths) != 1:
+    sys.exit(0)
+meta, _body = cards.read_task_card(paths[0], tid)
+if cards.is_unreadable(meta) or not isinstance(meta, dict):
+    sys.exit(0)
+xid = meta.get('current_execution_id')
+if isinstance(xid, str) and re.fullmatch(r'ex-[0-9a-f]{32}', xid) and meta.get('execution_status') in ('reserved', 'running'):
+    print(xid)
+PYEOF
+)"
+  fi
+  if [[ -n "$SKIP_EXECUTION_ID" ]]; then
+    EXEC_ARGS=(--execution "$SKIP_EXECUTION_ID")
+  else
+    _warn "--skip-pull: 今の試行の execution_id を読めませんでした — done / needs-director を名乗りなしで報告します (task ${TASK_ID})"
+  fi
 fi
 
 # --- gh コマンド確認 ---

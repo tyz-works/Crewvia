@@ -4066,6 +4066,10 @@ def cmd_pull(args):
     chosen_holder[0]['execution_id'] = execution_id
     chosen_holder[0]['attempt'] = execution_holder[0]['attempt']
 
+    # 名乗りの入手経路を pull の時点で見せる (Bash は呼び出しごとに env が消えるので、報告のたびに貼る形で言う。
+    # stdout の JSON は変えない。execution.md §20.2)
+    print(f"[plan.sh] 報告には --execution {execution_id} を付ける (done / fail / needs-director / ready-for-verification)",
+          file=sys.stderr)
     print(json.dumps(chosen_holder[0], ensure_ascii=False))
 
 

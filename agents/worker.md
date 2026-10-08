@@ -80,7 +80,7 @@ Kai発見: oci compute instance list で --compartment-id を省略すると全�
 | `CREWVIA_MISSION_SLUG` | 担当中のミッション slug（plan.sh pull 後、worktree の `.crewvia-env` を source すると設定される） |
 | `CREWVIA_TASK_ID` | 担当中のタスク ID（plan.sh pull 後に設定） |
 | `CREWVIA_TASK_SLUG` | タスクタイトルを kebab-case 化した slug（worktree パスの末尾部分に使用） |
-| `CREWVIA_EXECUTION_ID` | 今の試行（Execution）の ID（`ex-` + 32 桁 16 進。plan.sh pull が発行し、`.crewvia-env` の 4 行目に書く）。`plan done` / `fail` / `needs-director` / `ready-for-verification` は**この値（または `--execution <id>`）で「どの試行の報告か」を名乗り**、plan.sh が card の今の試行と照合する（違う試行・別の Worker が取り直した後の古い試行からの報告は **exit 3 で拒否**され、何も書かれない）。**任意**: 無くても動く（名乗りなしは今は通る）が、**Bash ツールは呼び出しごとに env が消えうる**ので、下の `--execution` で明示するのが確実 |
+| `CREWVIA_EXECUTION_ID` | 今の試行（Execution）の ID（`ex-` + 32 桁 16 進。plan.sh pull が発行し、`.crewvia-env` の 4 行目に書く）。`plan done` / `fail` / `needs-director` / `ready-for-verification` は**この値（または `--execution <id>`）で「どの試行の報告か」を名乗り**、plan.sh が card の今の試行と照合する（違う試行・別の Worker が取り直した後の古い試行からの報告は **exit 3 で拒否**され、何も書かれない）。**Bash ツールは呼び出しごとに env が消える**ので、`export` した値は次の呼び出しに残らない。報告のたびに下の `--execution` で明示すること（名乗りなしは今は通るが、plan.sh が stderr に警告を出し、将来は拒否される） |
 | `TARGET_DIR` | 他プロジェクトを触るタスクの場合にそのプロジェクトの絶対パスが入る。未設定なら `$CREWVIA_REPO/.claude/worktrees/` 配下に worktree が作成され Worker はその中で作業する。セットされている場合は worktree は作成されず Worker は TARGET_DIR で直接作業する |
 
 ### 使用モデルの決まり方
@@ -121,7 +121,7 @@ plan pull --agent "$AGENT_NAME" --skills "$SKILLS" を実行（初回）
   │     ↓
   │   実行 → PostToolUse hook がログを自動投稿
   │     ↓
-  │   実行完了 → plan done <id> "<result>" --mission <slug>
+  │   実行完了 → plan done <id> "<result>" --mission <slug> --execution <ex-…>
   │     ↓
   │   待機（Dispatcher からの次の assign を待つ）
   │     ↓
@@ -162,7 +162,7 @@ crewvia 自身のツール (`scripts/plan.sh` / `scripts/dispatcher.sh` / `hooks
 
 | 用途 | 使うパス | 具体例 |
 |---|---|---|
-| **呼び出し**（タスク管理コマンドの実行） | `plan` コマンド（PATH 経由のラッパー）。$CREWVIA_REPO の絶対パスを書く必要はない | `plan done t011 "result" --mission <slug>` |
+| **呼び出し**（タスク管理コマンドの実行） | `plan` コマンド（PATH 経由のラッパー）。$CREWVIA_REPO の絶対パスを書く必要はない | `plan done t011 "result" --mission <slug> --execution <ex-…>` |
 | **編集**（Edit / Write ツールでのファイル変更） | 必ず worktree 内のパス（`pwd` 起点の相対パス、または `git rev-parse --show-toplevel` で得た絶対パス） | `Edit(file_path="$(pwd)/scripts/plan.sh")` — **`$CREWVIA_REPO/scripts/plan.sh` を Edit/Write の対象にしない** |
 
 なぜ区別が必要か:
@@ -186,7 +186,7 @@ task の `target_dir` が非 null の場合、`plan.sh pull` は **worktree を�
 - `CLAUDE.md` / `.claude/settings.json` は target project のものが claude に読み込まれる
 - plan.sh の呼び出しは `plan` コマンド（PATH 経由のラッパー）を使う:
   ```bash
-  plan done t002 "result" --mission <slug>
+  plan done t002 "result" --mission <slug> --execution ex-…   # ex-… は pull の JSON の execution_id（下記）
   ```
 - registry / knowledge は **必ず `$CREWVIA_REPO` 経由の絶対パスで呼ぶ**
 - hooks (pre-tool-use.sh / post-tool-use.sh) は `~/.claude/settings.json`(ユーザーレベル)ではなく、
@@ -282,6 +282,20 @@ worktree は再利用される（`.crewvia-env` は書き直される）。
 
 `execution_id` / `attempt` は今の試行の ID と、その task で何回目の試行か（1 から）。`.crewvia-env` の `CREWVIA_EXECUTION_ID` と同じ値。
 `task_slug` は最初の予約で card に固定された値（title を後から変えても branch / worktree は変わらない）。
+
+**Bash は呼び出しごとに env が消える。`export EXECUTION_ID=…`（下の手順）は、次の Bash 呼び出しで空になる。** 報告（done / fail / needs-director / ready-for-verification）を打つ**同じ呼び出しの中で** ID を取り直すこと:
+
+```bash
+# worktree の task: 同じ呼び出しの中で .crewvia-env を source して取り直す
+cd "$WORKTREE_PATH" && source .crewvia-env && EXECUTION_ID="$CREWVIA_EXECUTION_ID" && \
+  plan done "$TASK_ID" --result-file <path> --mission "$TASK_MISSION" ${EXECUTION_ID:+--execution "$EXECUTION_ID"}
+# target_dir の task（worktree も .crewvia-env も無い）: pull の JSON の execution_id（pull が stderr にも貼る）をそのまま書く
+plan done "$TASK_ID" --result-file <path> --mission "$TASK_MISSION" --execution ex-…
+# 忘れた・分からない: card の今の試行を読み直す（進行中の行の [ex-… attempt N]）
+plan status --mission "$TASK_MISSION"
+```
+
+名乗りなしで報告すると plan.sh が stderr に「名乗りなしで報告しました」と出す（それでも今は通る）。その警告が出たら ID を付けて打ち直さず、次の報告から必ず付ける。
 
 **完了・失敗・差し戻しの報告には、この `execution_id` を名乗る**: `plan done` / `plan fail` / `plan needs-director` /
 `plan ready-for-verification` に `--execution "$EXECUTION_ID"`（JSON の `execution_id` の値。下の export 手順で保持する）を付ける。
@@ -392,7 +406,7 @@ Dispatcher から `タスクなし、shutdown` を受信したら **即座に** 
 Watchdog がタイムアウトを通知した場合（「タイムアウトのため中断します」）、**30 秒以内** に以下を完了させること:
 
 1. HANDOFF.md を作成（最低限: 進捗 / 残作業 / 注意点の 3 点 + **検証・作業した head**（`git rev-parse HEAD` の出力））
-2. `plan.sh fail <task_id> "$HANDOFF_PATH" --head "$(git rev-parse HEAD)"` を実行
+2. `plan.sh fail <task_id> "$HANDOFF_PATH" --head "$(git rev-parse HEAD)" --execution <ex-…>` を実行
    （`--head` は必須。handoff にその head が書かれていないと拒否される — 古い handoff の再提出を防ぐため。
    git 管理外で head が無いときだけ `--no-head "<理由 1 行>"`。記録に残り Director に見える）
    `$HANDOFF_PATH` は **絶対パス**（`crewvia_handoff_path "$AGENT_NAME" "$TASK_ID"`、§7 Step 2）。
@@ -568,24 +582,24 @@ requires_approval に該当 → type: improvement でTaskvia /api/log に投稿�
 
 **Result（完了報告の全文）は必ず `plan.sh done` で渡すこと。複数行で構わない。渡し方は下の 2 通りのどちらか（二重引用符の位置引数は使わない）。**
 
-- **`--result-file <path>`**: Write ツールで scratchpad（`/tmp/claude-…/scratchpad`）に Result を書き、`plan done "$TASK_ID" --result-file <path> --mission "$TASK_MISSION"` で渡す。
+- **`--result-file <path>`**: Write ツールで scratchpad（`/tmp/claude-…/scratchpad`）に Result を書き、`plan done "$TASK_ID" --result-file <path> --mission "$TASK_MISSION" --execution <ex-…>` で渡す。
 - **`--result-file -`（標準入力）**: Write が deny されている skill（`review` / `research` / `verify` / `planning`）や一時ファイルを作りたくないとき。**クォート付きヒアドキュメント**（`<<'RESULT_EOF'`）を標準入力に流す:
 
   ```bash
-  plan done "$TASK_ID" --result-file - --mission "$TASK_MISSION" <<'RESULT_EOF'
+  plan done "$TASK_ID" --result-file - --mission "$TASK_MISSION" ${EXECUTION_ID:+--execution "$EXECUTION_ID"} <<'RESULT_EOF'
   Result の全文（バッククォートも $(...) もそのまま書いてよい）
   RESULT_EOF
   ```
 
 > ヒアドキュメント形式の注意: 本文に「task ファイルへ書き込むコマンドの文字列」（`cat >> queue/missions/…/tasks/tNNN.md <<'EOF'` など）を**そのまま**書くと、`hooks/pre-tool-use.sh` が Bash コマンド全体を task ファイルの直接書き込みと見なして deny する（位置引数の引用テキストは除外される t019 が、ヒアドキュメントの本文は除外されない）。そういう Result は Write で書いた `--result-file <path>` で渡す。
 
-**なぜ二重引用符の位置引数（`plan done "$TASK_ID" "<全文>"`）を使わないか**: 二重引用符の中のバッククォートと `$(...)` は、plan.sh が起動する**前**にシェルが展開する（コマンド置換）。Result に書いた `pgrep` 待ちのコマンド例が実行されて Worker が 12 分止まった（2026-09-28）。plan.sh の中では防げないので、展開が起きない経路（ファイル / クォート付きヒアドキュメント）を使う。位置引数は後方互換で残っているだけで、`--result-file` と併用すると exit 2 で拒否される（何も書かれない）。ファイルが読めない・空・UTF-8 でない場合も exit 2 で何も書かれない。
+**なぜ二重引用符の位置引数（`plan done "$TASK_ID" "<全文>" --execution <ex-…>`）を使わないか**: 二重引用符の中のバッククォートと `$(...)` は、plan.sh が起動する**前**にシェルが展開する（コマンド置換）。Result に書いた `pgrep` 待ちのコマンド例が実行されて Worker が 12 分止まった（2026-09-28）。plan.sh の中では防げないので、展開が起きない経路（ファイル / クォート付きヒアドキュメント）を使う。位置引数は後方互換で残っているだけで、`--result-file` と併用すると exit 2 で拒否される（何も書かれない）。ファイルが読めない・空・UTF-8 でない場合も exit 2 で何も書かれない。
 
 `cmd_done` は渡された result を `build_task_body` 経由で **task ファイルの body に書くだけで frontmatter には一切触れない**単純な文字列補間なので、複数行を渡しても安全である。
 
 **`queue/missions/**/tasks/tNNN.md` を自分で直接編集してはいけない。** 特に `cat >> ... <<'EOF'` のような heredoc での追記は、**過去に 2 回、実際に Worker をハングさせている**（review skill の Worker が 42 分間、research skill の Worker が 9 分以上、CPU は回ったまま無応答になった）。この禁止は `hooks/pre-tool-use.sh` の構造的ガードでも強制されており（`queue/missions/**/tasks/*.md` への `>` / `>>` / heredoc / `sed -i` / `tee` は deny され、`plan.sh done` を使うよう促すメッセージが返る）、Bash しか使えない skill（次項）にとっては唯一の正規記録手段でもある。このガードは `plan.sh done` / `gh pr comment` の引数として該当パスを引用しただけの報告コマンドまで deny しないよう、クォート内の引用テキストを判定対象から除外している（t019）。ただし変数展開（`F=queue/missions/.../t001.md; cat >> "$F"`）、`dd of=...`、`python3 -c "open(...).write(...)"`、相対パスの先頭に `queue/missions/` が現れない `cd` 併用形は捕捉できない既知の残存リスク — このガードは最終防波堤であり、`plan.sh done` 経由での記録が一次防御である前提は変わらない。
 
-- **`review` / `research` / `verify` / `planning` skill は要注意**: `config/skill-permissions.yaml` でこれらの skill は `Edit` / `Write` / `MultiEdit` を deny されており、**ファイルを書く手段が Bash しかない**。だからといって heredoc で task ファイルに直接書き込もうとせず、`plan.sh done --result-file -`（クォート付きヒアドキュメント）で結果を渡すこと。他のファイル（レポート・knowledge 追記等、書き込みが許可された対象）には通常通り Bash 経由での作成も選択肢になるが、task ファイルだけは例外なく `plan.sh` 経由にすること。
+- **`review` / `research` / `verify` / `planning` skill は要注意**: `config/skill-permissions.yaml` でこれらの skill は `Edit` / `Write` / `MultiEdit` を deny されており、**ファイルを書く手段が Bash しかない**。だからといって heredoc で task ファイルに直接書き込もうとせず、`plan.sh done --result-file - --execution <ex-…>`（クォート付きヒアドキュメント）で結果を渡すこと。他のファイル（レポート・knowledge 追記等、書き込みが許可された対象）には通常通り Bash 経由での作成も選択肢になるが、task ファイルだけは例外なく `plan.sh` 経由にすること。
 - **1 行制約があるのは `plan.sh needs-director` の reason だけ**（frontmatter の `needs_director_reason` フィールドに直接書かれるため、改行を含めると task ファイルの frontmatter が壊れミッション全体が停止する）。`plan.sh done` の result にはこの制約は無い。長い説明・複数の見出し・箇条書きを含む Result 全文をそのまま `plan.sh done` に渡してよい。
 
 ### Pre-Done チェックリスト
@@ -605,7 +619,7 @@ requires_approval に該当 → type: improvement でTaskvia /api/log に投稿�
 
 PR の base は**自分で決めない**。`plan pr-base` が mission の policy（TARGET_DIR の task は従来どおり `main`）から答える。
 `AGENT_NAME` と自分の assignment から task を決めるので、cwd が主 checkout に戻っていても同じ値が出る。
-取れなければ exit 1 になる — **`main` に倒して PR を作らない**。PR を作らず `plan needs-director <id> "<stderr>"` で Director に渡す。
+取れなければ exit 1 になる — **`main` に倒して PR を作らない**。PR を作らず `plan needs-director <id> "<stderr>" --execution <ex-…>` で Director に渡す。
 
 ```bash
 PR_BASE="$(plan pr-base)" || { echo "PR base を決められない。Director に報告して待つ" >&2; exit 1; }
@@ -1023,7 +1037,7 @@ PR が不要なタスク（調査・Obsidian 操作等）の場合は `PR: な�
 ## Standing Orders
 
 - `plan.sh pull` で取得した自分のタスクのみ実行すること。他のWorkerのタスクに干渉しない
-- タスク完了後は必ず `plan.sh done <id> --result-file <path|-> --mission <slug>` を呼ぶこと（Result を二重引用符の位置引数で渡さない — バッククォートがシェルに実行される）
+- タスク完了後は必ず `plan.sh done <id> --result-file <path|-> --mission <slug> ${EXECUTION_ID:+--execution "$EXECUTION_ID"}` を呼ぶこと（Result を二重引用符の位置引数で渡さない — バッククォートがシェルに実行される）
 - `plan.sh done` を呼ばずに次のタスクへ進まないこと
 - Directorを経由せずにプランを直接変更しない（`queue/missions/` 配下のファイルを手で編集しない）
 - ツールの denied / タイムアウト は必ずDirectorに報告すること

@@ -74,6 +74,13 @@ _C_RETIRE = 'retire'
 _OP_VERIFY_PASS = 'verify-result:pass'
 _OP_VERIFY_FAIL = 'verify-result:fail'
 
+#: 名乗りなしの警告を出す操作 (6 コマンドの再送の名前。retire / reset / G1 の fail は含めない。execution.md §20.4 の 2)
+_WARN_UNNAMED_OPERATIONS = frozenset({_C_DONE, _C_FAIL, _C_NEEDS_DIRECTOR, _OP_VERIFY_PASS, _OP_VERIFY_FAIL})
+
+#: 名乗りなしで通ったときに stderr へ出す固定の 1 行 (識別子も値も含めない。終了コード・書き込みは変えない)
+UNNAMED_WARNING = ("[plan.sh] 名乗りなしで報告しました (execution id を --execution で渡してください)。"
+                   "将来は拒否されます")
+
 #: `Caller.source` の語彙 (どこから ID を得たか。拒否の文言で env 由来の直し方を言うのに使う)
 SOURCES = ('flag', 'env', 'none')
 
@@ -333,7 +340,7 @@ _NOT_CURRENT_END_CODES = frozenset({ex.RESET_BY_DIRECTOR, ex.RETIRED, ex.WORKSPA
                                     ex.ABANDONED_OUTSIDE_CONTROLLER})
 
 
-def _authorize(txn, slug, tid, meta, caller, *, operation):
+def _authorize(txn, slug, tid, meta, caller, *, operation, warn=False):
     """`(PROCEED|IDEMPOTENT|TASK_ONLY, caller_check)`。拒否は拒否の行を残して domain error。
 
     `operation` は §4.4 の再送の表で「同じ操作」かを言うための名前 (`done` / `verify-result:pass` / `fail` /
@@ -358,6 +365,8 @@ def _authorize(txn, slug, tid, meta, caller, *, operation):
                 f"{slug}/{tid}: 名乗った execution は、この task の今の試行ではありません{hint}", slug, tid, meta, caller)
     # 名乗りなし
     if view == ex.ACTIVE:
+        if warn:
+            print(UNNAMED_WARNING, file=sys.stderr)
         return PROCEED, ex.CHECK_UNVERIFIED
     if view == ex.DETACHED:
         return TASK_ONLY, ex.CHECK_DETACHED
@@ -559,7 +568,9 @@ def _finish(txn, slug, tid, meta, body, caller, *, new_status, end_code, to_stat
     _check_caller(caller)
     _check_now(now)
     _check_body(new_body)
-    decision, check = _authorize(txn, slug, tid, meta, caller, operation=operation)
+    # dry_run は同じ操作の本番の呼び出しの前に走るので、警告は書く側 1 回だけ
+    decision, check = _authorize(txn, slug, tid, meta, caller, operation=operation,
+                                 warn=(not dry_run and operation in _WARN_UNNAMED_OPERATIONS))
     updates, remove = _check_updates(meta_updates, meta_remove)
     body_out = body if new_body is None else new_body
     previous = meta.get('status')
@@ -721,7 +732,7 @@ def mark_task(txn, slug, tid, caller=NO_CALLER, *, command, to_status, meta_upda
     _check_body(body)
     meta, card_body = _load(txn, slug, tid)
     # operation=None: 再送を成功にする操作ではない (TERMINAL の試行に名乗り付きで来れば `_authorize` が conflict で拒否する)
-    decision, check = _authorize(txn, slug, tid, meta, caller, operation=None)
+    decision, check = _authorize(txn, slug, tid, meta, caller, operation=None, warn=True)
     _check_task_status(txn, command, slug, tid, meta, caller)
     updates, remove = _check_updates(meta_updates, meta_remove)
     out = dict(meta)

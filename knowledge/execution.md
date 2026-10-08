@@ -1824,3 +1824,11 @@ verified の done は全部 Worker (Ren 22・Arjun 9・Luna 7・Kai-codex 4・Se
 5. **拒否コード `EXECUTION_REQUIRED` を新設する** (`EXECUTION_NOT_FOUND` に寄せない。直し方の文が違う)。
 6. **既存の拒否 (`NOT_CURRENT` / `NOT_FOUND` / `ALREADY_TERMINAL`) の task-graph 再生成も PR-2 でまとめて `UsageExit` 型に直す** (§20.3 で再生成は確定)。
 7. **ID 持ち越しの構造的な直し (ID を持つラッパー等) は別 mission**。拒否文に ID を出す案は採らない (agent 名から ID を引くのと同じで、§5.2 の捨てた案と同じ理由)。PR-1 / PR-2 の範囲外。
+
+### 20.6 PR-1 の実績 (t005, mission 20261008-e5-reject-unnamed-reports)
+
+- **plan.sh の判定は変えていない**。足したのは stderr の 2 行だけ: (1) 名乗りなしで `PROCEED, UNVERIFIED` になった 6 コマンドの警告 (`lib_task_controller.UNNAMED_WARNING`。`_authorize(warn=…)`、dry_run と retire / reset / G1 の fail には出さない)、(2) pull の `報告には --execution ex-… を付ける`。
+- §20.2 の表の対応: dispatcher の割り当て文・start.sh の起動文 (2 か所) → `--execution` と pull の JSON の `execution_id` に触れる / worker.md → 例を `${EXECUTION_ID:+--execution …}` に揃え、「env は呼び出しごとに消える」と同じ呼び出しで取り直す形を手順の前に / worker-codex.md・verifier.md・skills 2 本・director.md → 例と文を実形に (director.md は「付けなくても通る」を「必ず付ける」に) / kai-review.sh `--skip-pull` → card の `current_execution_id` (active のときだけ) を読む、`--execution <id>` でも渡せる、読めなければ警告 / verifier-dispatcher.sh・hooks・scripts/bin/plan → 変更なし。
+- 構造テスト `tests/test_execution_e5_doc_examples_name_the_execution.py`: agents/ skills/ の 6 コマンドの例 (fenced の論理行・地の文のインラインコードの行) がすべて `--execution` か `${EXECUTION_ID:+` を含む。直す前の実測は 39 例中 36 が名乗りなし。
+- 挙動テスト `tests/test_execution_e5_unnamed_report_warning.py`、互換テスト `test_plan_sh_compat_s3.py` は E5 の stderr 2 行だけを取り除いて golden と比べる。
+- **merge 後に dispatcher restart が要る** (割り当て文は dispatcher.sh の python に埋まっている)。Worker / Director は PR-1 の後に起動し直す (§20.4 の観察の条件)。

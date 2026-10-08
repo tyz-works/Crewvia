@@ -42,6 +42,9 @@ MAX_TELEGRAM_PER_CYCLE = 3
 #: 「送る」を台帳に書いた (sending) まま結果が書けなかったものを、失敗扱いにして 1 度だけ送り直せるようにするまでの秒数。
 #: 送る前の書き込みが成功した後にしか再送しないので、保存が壊れている間に連投にはならない (設計 §11)。
 SENDING_TIMEOUT_SECONDS = 600.0
+#: 段階 1 (Director への mux send) が失敗したあと、同じ段階をもう一度試すまでの最短秒数 (dispatcher の NOTIFY_TTL と同じ 5 分)。
+#: これが無いと、送れない間は dispatcher のサイクル (約 5 秒) ごとに再送を試みる (設計 §5-4 / §11-1 の「間引き」)。
+STAGE1_RETRY_SECONDS = 300.0
 REASON_MAX = 200
 TELEGRAM_TEXT_MAX = 2000
 
@@ -117,13 +120,25 @@ def decide(card, entry, now, cfg, director_live, telegram_available):
 
 def apply_failure(entry, action, now):
     """送信が失敗したときの台帳の更新 (sending の印は外す)。段階 1 の失敗だけが stage1_failed_at を残す
-    (段階 2 はバックオフが間隔を持つ)。"""
+    (段階 2 はバックオフが間隔を持つ)。stage1_failed_at は**直近の失敗の時刻** (再試行の間引きの起点。
+    R6 の「到達可能」は None かどうかだけを見るので、更新しても変わらない)。"""
     if entry is None or action not in (ACTION_DIRECTOR, ACTION_TELEGRAM):
         return entry
     out = clear_sending(entry)
-    if action == ACTION_DIRECTOR and out.get('stage1_failed_at') is None:
+    if action == ACTION_DIRECTOR:
         out['stage1_failed_at'] = now
     return out
+
+
+def stage1_retry_throttled(entry, action, now):
+    """段階 1 の送信が直近 `STAGE1_RETRY_SECONDS` 以内に失敗していれば True (今回は送らない)。純粋。
+
+    時計が戻っている (失敗の時刻が未来) ときは止めない (永久に黙る側に倒さない)。
+    """
+    if action != ACTION_DIRECTOR or entry is None:
+        return False
+    failed = entry.get('stage1_failed_at')
+    return is_finite_number(failed) and 0 <= now - failed < STAGE1_RETRY_SECONDS
 
 
 def blocked_dependents(slug, waiting_id, tasks_in_mission, done_ids, task_statuses):
@@ -342,6 +357,8 @@ def run_cycle(registry_dir, all_tasks, done_ids_by_mission, task_statuses_by_mis
         action, update = decision
         if action == ACTION_TELEGRAM and telegram_sent >= MAX_TELEGRAM_PER_CYCLE:
             continue                                    # 残りは次のサイクル (記録しない)
+        if stage1_retry_throttled(entry, action, now):
+            continue                                    # 失敗した段階 1 は間隔を空けて再試行 (sending も書かない)
         if action != ACTION_NONE:
             slug, tid = card.slug, card.tid
             tasks = [m for s, m in all_tasks if s == slug]

@@ -25,6 +25,7 @@ sys.path.insert(0, str(THIS_DIR.parent / "scripts"))
 from telegram_fake_api import FakeBotApi  # noqa: E402
 from test_dispatcher_notify_once import DISPATCHER_SH, FakeMux, SLUG  # noqa: E402
 from test_telegram_dispatcher_glue import CHAT, TOKEN, TgHarness  # noqa: E402
+import lib_escalation  # noqa: E402
 import lib_telegram  # noqa: E402
 
 EX = "ex-" + "c" * 32
@@ -58,6 +59,14 @@ class EscHarness(TgHarness):
 
     def ledger(self):
         return json.loads(self.ledger_path.read_text())
+
+    def age_failure(self, seconds):
+        """stage1_failed_at を seconds 昔にずらす (壁時計を触らない)。"""
+        data = self.ledger()
+        for e in data.values():
+            if e.get("stage1_failed_at") is not None:
+                e["stage1_failed_at"] -= seconds
+        self.ledger_path.write_text(json.dumps(data))
 
     def age(self, seconds, key=None):
         data = self.ledger()
@@ -176,6 +185,8 @@ def test_director_send_failure_is_retried_and_marks_stage_one_failed(h, api):
     entry = h.ledger()[f"{SLUG}/t017"]
     assert entry["stage_sent"] == 0 and entry["stage1_failed_at"] is not None
     FakeMux.send_ok = True
+    assert not escalations(h.cycle()), "失敗の直後は間引き間隔が過ぎるまで送り直さない"
+    h.age_failure(lib_escalation.STAGE1_RETRY_SECONDS)
     assert len(escalations(h.cycle())) == 1
 
 

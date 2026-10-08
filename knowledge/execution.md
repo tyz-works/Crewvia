@@ -1773,7 +1773,7 @@ verified の done は全部 Worker (Ren 22・Arjun 9・Luna 7・Kai-codex 4・Se
 | **README.md** :876, :889, :918 | ID に触れない | 文の補足のみ |
 | **watchdog / lib_retirement / dispatcher の自動報告** | 6 コマンドを打たない (retire は E4 で `--execution` 済み) | 対象外 |
 
-**列挙を機械に任せる** (t003 のレビュー指摘 P2-2: サイトを人が数えると漏れる。実際 t001 の表は worker.md の 3 か所しか挙げておらず、上の 9 か所が正): PR-1 に構造テストを入れる —
+**列挙を機械に任せる** (t002 のレビュー指摘 P2-2: サイトを人が数えると漏れる。実際 t001 の表は worker.md の 3 か所しか挙げておらず、上の 9 か所が正): PR-1 に構造テストを入れる —
 `agents/*.md` と `skills/**/*.md` の中の **6 コマンドの例** (fenced code の行、および `plan(.sh)? <cmd> <引数…>` の形のインラインコード。コマンド名だけの言及は対象外) は、
 すべて `--execution` か `${EXECUTION_ID:+` を同じ文 (行、またはヒアドキュメントの開始行まで) に含む。**漏れたら赤**。例外は理由つき allowlist (キーは行の literal)。
 列挙は `grep -rnE 'plan(\.sh)? +(done|fail|needs-director|ready-for-verification|verifying|verify-result)\b' agents skills` を起点に、実装 (テスト) から導く。表を直すだけで終えない。
@@ -1792,7 +1792,6 @@ verified の done は全部 Worker (Ren 22・Arjun 9・Luna 7・Kai-codex 4・Se
   `{slug}/{tid}: この task は実行中の試行があります。報告には今の試行の execution id を名乗ってください (--execution <ex-…>。ID は pull の JSON の execution_id か \`plan.sh status --mission {slug}\` の進行中の行 [ex-… attempt N])。何も書いていません。` + 最後の行 `[plan.sh] error_code=EXECUTION_REQUIRED`。
 - **何も書かない**: 既存の拒否と同じ `_refuse` (監査に `refused:EXECUTION_REQUIRED` の 1 行だけ。card・record・枠は 1 バイトも書かない)。**task-graph の再生成は確定で起きている**: 既存の `_controller_die` は `die()` (普通の `SystemExit`) で、plan.sh 末尾の dispatch が再生成する (t002 の確認)。
   なので **PR-2 で `UsageExit` の型にまとめて直す** — 新しい `EXECUTION_REQUIRED` と既存の `EXECUTION_NOT_CURRENT` / `EXECUTION_NOT_FOUND` / `EXECUTION_ALREADY_TERMINAL` の 4 つ (memory `no-write-refusal-must-use-usageexit`。PR #285 の pull と同じ指摘)。
-  `UsageExit` の型で出す (memory `no-write-refusal-must-use-usageexit`。PR #285 の pull と同じ指摘)。既存の `EXECUTION_NOT_CURRENT` も同じ経路なので、直すなら 3 つまとめて。
 - `--execution ""` / 空の `CREWVIA_EXECUTION_ID` の拒否 (exit 1) は今のまま。
 
 ### 20.4 段取り
@@ -1805,7 +1804,7 @@ verified の done は全部 Worker (Ren 22・Arjun 9・Luna 7・Kai-codex 4・Se
 4. **構造テスト**: agents/ と skills/ の 6 コマンドの例はすべて `--execution` か `${EXECUTION_ID:+…}` を含む。漏れたら赤 (§20.2)。
 5. テストは「警告が出る / 名乗れば出ない / 出ても exit 0 と書き込みが今と同じ」「文面が `--execution` に触れる (dispatcher の割り当て文・start.sh の起動文)」。
 
-**観察 (本番)**: 生きている全セッション (Worker・Director) が **PR-1 の後に起動** していること (プロセスの起動時刻 > PR-1 の sync。prove-which-code-version-a-spawned-task-ran の 3 点) + 6 コマンドの `caller_check=unverified` が 0 件、を **一定期間** (提案: 2 ミッション分または 7 日の長い方。Director が決める)。
+**観察 (本番)**: 生きている全セッション (Worker・Director) が **PR-1 の後に起動** していること (プロセスの起動時刻 > PR-1 の sync。prove-which-code-version-a-spawned-task-ran の 3 点) + 6 コマンドの `caller_check=unverified` が 0 件、を **一定期間** (2 ミッション分または 7 日の長い方。§20.5 の決定 1)。
 監査は欠けうる (§1.6 の 11) ので、機械の根拠に **警告の stderr** と、fail / ready-for-verification / verifying / verify-result を 1 本ずつ隔離環境で通した記録を足す。**Director の代理の done / fail / needs-director が 1 本以上 verified で通った** ことも条件に入れる (今は 0 件。表 #1)。
 旧プロンプトのまま生きている長寿命のセッションは、読み替えでは救えない (§9.4 の E5 行) — PR-1 の後に再起動する。
 

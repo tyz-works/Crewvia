@@ -31,6 +31,8 @@ import time
 
 import pytest
 
+from e5_autoname import AutoName
+
 import test_plan_sh_state_store_cutover as cut   # Sandbox / _namespace / _seed_card (モジュールごと import。scripts/ を sys.path に足す)
 import lib_state_store as store
 import task_graph_publisher_harness as harness
@@ -147,6 +149,7 @@ def test_the_old_read_modify_write_really_did_revert_a_concurrent_transition(sb)
 
 def _popen_plan(sb, *args, stdin_text=None):
     env = dict(sb.env, AGENT_NAME="Ren")
+    args = sb.__dict__.setdefault("names", AutoName()).before(args)      # E5 PR-2: 自分の pull の execution_id を報告で名乗る
     p = subprocess.Popen([str(sb.plan), *args], env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                          stderr=subprocess.PIPE, text=True)
     p.pending_input = stdin_text or ""            # communicate(input=) で渡す (先に close すると flush に失敗する)

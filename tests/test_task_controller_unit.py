@@ -422,13 +422,15 @@ def test_a_legacy_card_has_no_execution_so_a_presented_id_is_not_found_and_no_id
     assert h.audit_rows(q)[-1]["caller_check"] == "legacy_generation"
 
 
-def test_no_caller_on_an_active_execution_passes_as_unverified(q):
-    """E3 は名乗りなしを拒否しない (execution.md §5.2)。照合の結果は監査に残る。"""
+def test_no_caller_on_an_active_execution_is_refused_and_a_named_caller_is_verified(q):
+    """E5 PR-2: 名乗りなしの報告は実行中の試行に対して拒否される (execution.md §20.3)。名乗れば照合の結果が監査に残る。"""
     ctx = h.reserve_and_start(q, factory=h.ids())
     with h.tx(q, op="done") as t:
-        out = ctl.complete_execution(t, MISSION, "t001", ctl.NO_CALLER, to_status="done")
+        h.raises_code(ex.EXECUTION_REQUIRED, ctl.complete_execution, t, MISSION, "t001", ctl.NO_CALLER, to_status="done")
+    with h.tx(q, op="done") as t:
+        out = ctl.complete_execution(t, MISSION, "t001", h.caller(ctx.execution_id), to_status="done")
     assert out.end_code == "DONE"
-    assert h.audit_rows(q)[-1]["caller_check"] == "unverified"
+    assert h.audit_rows(q)[-1]["caller_check"] == "verified"
     assert h.read_record(q, ctx.execution_id)["status"] == "completed"
 
 
@@ -943,7 +945,7 @@ def test_mark_task_checks_the_caller_when_the_attempt_is_active_and_never_touche
     assert h.slot_text(q) == f"{MISSION}:t001"                                            # 枠は残る (今と同じ)
     with h.tx(q) as t:
         ctl.mark_task(t, MISSION, "t001", h.caller(ctx.execution_id), command="verifying", to_status="verifying")
-        h.raises_code(ex.INVALID_TRANSITION, ctl.mark_task, t, MISSION, "t001", ctl.NO_CALLER,
+        h.raises_code(ex.INVALID_TRANSITION, ctl.mark_task, t, MISSION, "t001", h.caller(ctx.execution_id),
                       command="ready-for-verification", to_status="ready_for_verification")
 
 
@@ -1025,7 +1027,7 @@ def test_the_controller_needs_a_transaction_and_a_consistent_caller():
 def test_domain_error_codes_and_exit_codes_match_the_design_table():
     assert ex.EXIT_CODES[ex.INVALID_TRANSITION] == 2                                         # 今の REFUSED_TRANSITION
     assert {c for c, n in ex.EXIT_CODES.items() if n == 3} == {
-        ex.EXECUTION_NOT_FOUND, ex.EXECUTION_NOT_CURRENT, ex.EXECUTION_ALREADY_TERMINAL}
+        ex.EXECUTION_NOT_FOUND, ex.EXECUTION_NOT_CURRENT, ex.EXECUTION_ALREADY_TERMINAL, ex.EXECUTION_REQUIRED}
     assert all(ex.EXIT_CODES[c] == 1 for c in (ex.STATE_INVALID, ex.TASK_NOT_FOUND, ex.TASK_NOT_ELIGIBLE,
                                                ex.TASK_ALREADY_RESERVED, ex.GIT_POLICY_INVALID, ex.LOCK_FAILED))
     # pull の idle (exit 2) になりうる domain error は無い (memory: pull-exit-2-is-idle-usage-errors-must-be-1)

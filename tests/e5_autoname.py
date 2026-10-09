@@ -27,6 +27,9 @@ class AutoName:
     def after(self, args, stdout, returncode=None):
         if returncode == 0 and args and args[0] in ENDING:
             self.ids.pop(args[1] if len(args) > 1 else None, None)       # 試行は終わった。以後の報告は名乗る相手がいない
+        if returncode == 0 and args and len(args) > 1 and (
+                args[0] == "retire" or (args[0] == "update" and ("--reset" in args or "--close-execution" in args))):
+            self.ids.pop(args[1], None)                                  # reset / retire で試行は閉じた。保存した ID は捨てる (次の pull が新しい ID を入れる)
         if args and args[0] == "pull" and stdout:
             try:
                 data = json.loads(stdout)

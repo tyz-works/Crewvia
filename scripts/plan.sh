@@ -3254,10 +3254,12 @@ def _pull_controller_die(e):
 def _execution_caller(opts):
     """done / fail / needs-director / ready-for-verification / verifying / verify-result が名乗る試行 (execution.md §5.2)。
 
-    ID の出どころは **`--execution <id>` (明示) > env `CREWVIA_EXECUTION_ID`**。どちらも無ければ「名乗りなし」
-    (E3 は拒否しない。`.crewvia-env` を必須にしないため。拒否に進むのは E5)。agent 名は照合の根拠にしない (AC-04)。
+    ID の出どころは **`--execution <id>` だけ**。env `CREWVIA_EXECUTION_ID` は読まない (E5 / execution.md §20.11): `.crewvia-env` は
+    Director の reset や別 Worker の再 pull で新しい試行の ID に上書きされうるので、古い Worker が source して付け忘れると
+    置き換えの試行を名乗って照合を通ってしまう。`--execution` が無ければ「名乗りなし」(active の試行があれば
+    EXECUTION_REQUIRED exit 3)。agent 名は照合の根拠にしない (AC-04)。
 
-    **「指定されたか」は presence で見る** (01b G3): `--execution ""` / 空の env を名乗りなしに倒さない
+    **「指定されたか」は presence で見る** (01b G3): `--execution ""` を名乗りなしに倒さない
     (`retire --execution ""` と同じく exit 1・何も書かない)。名乗った値の形が違えば Controller が
     `EXECUTION_NOT_FOUND` (exit 3) で拒否する。**ロックを取る前に呼ぶこと** (拒否は何も書かない)。
     """
@@ -3268,12 +3270,10 @@ def _execution_caller(opts):
             die("[plan.sh] --execution には execution id (ex-…) が必要です。空の値は「名乗りなし」として扱いません"
                 " (名乗らないなら --execution ごと外してください)。何も書いていません。")
         return _CONTROLLER.Caller(value, 'flag', agent)
-    value = os.environ.get('CREWVIA_EXECUTION_ID')
-    if value is not None:
-        if not value.strip():
-            die("[plan.sh] 環境変数 CREWVIA_EXECUTION_ID が空です。空の値は「名乗りなし」として扱いません。"
-                " `unset CREWVIA_EXECUTION_ID` するか、--execution で ID を渡してください。何も書いていません。")
-        return _CONTROLLER.Caller(value, 'env', agent)
+    if os.environ.get('CREWVIA_EXECUTION_ID'):
+        # 値は出さない。env を黙って無視すると「名乗ったはずなのに拒否された」理由が分からない
+        print("[plan.sh] env の CREWVIA_EXECUTION_ID は名乗りに使いません。--execution <ex-…> で渡してください。",
+              file=sys.stderr)
     return _CONTROLLER.NO_CALLER
 
 
@@ -4042,8 +4042,8 @@ def cmd_pull(args):
                         f'export CREWVIA_MISSION_SLUG={shlex.quote(mission_slug)}\n'
                         f'export CREWVIA_TASK_ID={shlex.quote(task_id)}\n'
                         f'export CREWVIA_TASK_SLUG={shlex.quote(task_slug)}\n'
-                        # 任意 (必須にしない): 読む側は無くても動く。名乗り (照合の入力) であって card には書かない。
-                        f'export CREWVIA_EXECUTION_ID={shlex.quote(execution_id)}\n'
+                        # 試行の ID はここに書かない: 再 pull で上書きされる古い値を source して名乗る事故の元になる
+                        # (名乗りは pull の JSON の execution_id を `--execution` で渡す。execution.md §20.11)。
                     )
                     try:
                         _STORE.atomic_write_text(env_file, env_text)
@@ -4405,7 +4405,7 @@ def cmd_needs_director(args):
     """plan.sh needs-director <task_id> "<理由>"
 
     in_progress タスクを needs_director 状態に遷移させる (試行は failed / NEEDS_DIRECTOR)。
-    Director の介入を求める。呼び出し元は `--execution <id>` (または env `CREWVIA_EXECUTION_ID`) で今の試行を名乗る
+    Director の介入を求める。呼び出し元は `--execution <id>` で今の試行を名乗る
     (違う試行なら exit 3。名乗らなければ E3 では通す)。
     - TERMINAL_STATUSES に含まれないため、後続 blocked_by は解除されない
     - Dispatcher は pending 以外の非終端ステータスと同じく割り当て対象外

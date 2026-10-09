@@ -252,7 +252,7 @@ record・identity・枠の本文・退役 marker・監査ログ・呼び出し�
 | 7 | `execution_id` / `started_at` (identity) | `classify_assignment` (#4)・`assignment_execution_verdict` (#11)・R-1 (#5) | 照合 | **card から再生成**: R-1 が `current_execution_id` / `started_at` から作り直す (§1.4 末尾)。食い違えば card が勝つ |
 | 8 | `<slug>:<tid>` (枠の本文 `queue/assignments/<agent>`) | dispatcher の busy・`is_orphan_target` | 判断 | **card から再生成** (R-1 / R-2。01a のまま) |
 | 9 | `task_execution_id` / `task_started_at` (退役 marker) | `_guard` / `_cleanup_deferred` / `_settle_terminated` (#12・#13)・retire の照合 (#8) | 照合 | **名乗り (証拠) であって正本ではない**: request を書いたロックの中で card から写した「どの試行を終わらせるか」。照合の答えは card が出す (card の今の試行と一致したときだけ後始末する)。marker が欠ける・読めない・欄が無いときは**保留して Director** (今の `_cleanup_deferred` と同じ hold。推測で後始末しない)。card から再生成しない理由: 後始末の時点で card は後任の試行に進んでいるかもしれず、そのとき card から作ると後任を終わらせる |
-| 10 | `CREWVIA_EXECUTION_ID` (`.crewvia-env`・env)・`--execution`・pull の JSON | §5.2 の照合 | 照合 | **名乗り**。card の `current_execution_id` と比べるだけで、card に書かない。欠けたら「名乗りなし」(§5.2) |
+| 10 | `--execution`・pull の JSON (env `CREWVIA_EXECUTION_ID` は名乗りに使わない = §20.11) | §5.2 の照合 | 照合 | **名乗り**。card の `current_execution_id` と比べるだけで、card に書かない。欠けたら「名乗りなし」(§5.2) |
 | 11 | 監査ログ (`caller_check` / `execution_id` / `refused:`) | E5 の merge 条件 (§9.2 の 1)・本番確認 | cutover の判断 (人) | **判断の唯一の根拠にしない**: 監査は行が欠けうる (state-store.md §4) ので、欠けると `unverified` が少なく数えられる向きに誤る。E5 の条件は監査の 0 件に加えて、**コードと手順から言えること** (worker.md・kai-review・skill が ID を渡す・生きている Worker のセッションが全部その変更の後に起動した。§9.4) を要る |
 | 12 | `.crewvia-env` の `CREWVIA_TASK_SLUG` | worktree のパス | 表示・パス | card の `task_slug` (§1.2) から pull が毎回書く。判断に使わない |
 | 13 | 前の試行の終端 (旧案は reserve の後に record だけを凍結) | 前の試行の record・store-check | 回復 | **card に先に書く** (§1.4 の手順 0。t024 / Codex P2-2)。旧案は終端が card に一度も入らず、新しい ID を書いた直後に落ちると回復の範囲 (最新 ID) から外れた |
@@ -558,12 +558,12 @@ pull の JSON には今 `started_at` も無く、Worker は自分の世代を知
 
 ### 5.2 照合の規則 (E3 から。done / fail / needs-director / ready-for-verification / verify-result 共通)
 
-ID の出どころは **`--execution <id>` (明示) > env `CREWVIA_EXECUTION_ID`** の順。どちらも無ければ「名乗りなし」。
+ID の出どころは **`--execution <id>` だけ** (E5 §20.11 から。E3〜PR-2 は `--execution` > env `CREWVIA_EXECUTION_ID` の順だった)。無ければ「名乗りなし」。
 
 | card の今の試行 | 名乗り | 判定 | 監査行の `caller_check` |
 |---|---|---|---|
 | active (X) | X | 通す | `verified` |
-| active (X) | Y (≠ X) | **拒否** `EXECUTION_NOT_CURRENT` (exit 3)。env 由来なら、どこから来た値か (env) と直し方 (`unset CREWVIA_EXECUTION_ID` か `--execution` を渡す) を拒否文に書く | 拒否の行 (§8) |
+| active (X) | Y (≠ X) | **拒否** `EXECUTION_NOT_CURRENT` (exit 3) | 拒否の行 (§8) |
 | active (X) | なし | **E3 では通す** (warn を stderr に 1 行) | `unverified` |
 | TERMINAL (X) | X | §4.4 の冪等 / conflict | `verified` |
 | TERMINAL (X) (Director が開いた card・needs_director の後) | なし | 「試行なし」と同じ (task の遷移だけ。試行の欄は触らない) | `no_execution` |
@@ -1171,7 +1171,7 @@ dispatcher の busy / idle 判定 (`queue/assignments/<agent>` の有無・本�
 - **exit code**: pull の domain error は `EXECUTION_NOT_FOUND` / `NOT_CURRENT` / `ALREADY_TERMINAL` だけ 3、他は 1。**2 にしない** (idle)。
   stderr の最後の行 `[plan.sh] error_code=<CODE>` (`TASK_ALREADY_RESERVED` / `STATE_INVALID` 等)。`--task` の既存の「already in_progress」文言も
   この行を付けた (文言は変えていない)。
-- **`.crewvia-env`**: 今までの 3 行 + 4 行目 `export CREWVIA_EXECUTION_ID=ex-…` (**必須にしない**。読む側は無くても動く。名乗り = 照合の入力で、
+- **`.crewvia-env`** (E5 で 4 行目は消えた = §20.11): 今までの 3 行 + 4 行目 `export CREWVIA_EXECUTION_ID=ex-…` (**必須にしない**。読む側は無くても動く。名乗り = 照合の入力で、
   card には書かない)。`PR_BASE` は出さない (git-policy.md §5 のまま)。
 - **record の `git`**: branch (Resolver) / pr_base (Resolver) / worktree / `head_at_start` (`git rev-parse HEAD`)。base は観測 (`git show-ref`) が
   要るので記録しない (判断に使わない欄。None)。`target_dir` の task は worktree が無いので git の文脈なし。
@@ -1299,7 +1299,7 @@ PR を revert し、`scripts/sync-main-checkout.sh` で主 checkout を ff す�
 | `verify-result fail` (≥ max) / `needs_human_review` | `mark_task` (`needs_human_review`) | 変えない (running) | → needs_human_review |
 | `update <id> --close-execution` (新) | `abandon_detached_execution` | DETACHED で active な試行 → failed `ABANDONED_OUTSIDE_CONTROLLER` | **触れない** (§16.2 の 7) |
 
-- **名乗りの出どころ**は `--execution <id>` (明示) > env `CREWVIA_EXECUTION_ID` (§5.2)。`_execution_caller` (plan.sh) が**ロックを取る前**に決める。agent 名は照合の根拠にしない。
+- **名乗りの出どころ**は `--execution <id>` だけ (E5 で env を外した = §20.11。当時は `--execution` > env)。`_execution_caller` (plan.sh) が**ロックを取る前**に決める。agent 名は照合の根拠にしない。
 - **ID を名乗った同じ操作の再送は成功** (exit 0・何も書かない・stdout に `already completed (idempotent)` 等)。D0〜D5・Taskvia・registry の bump も走らせない。違う結果への変更は conflict (exit 3)。
 - 拒否の終わり方: exit code は `lib_execution.EXIT_CODES` (遷移の拒否 2・照合の 3 つ 3・読めない card 1)、stderr の**最後の行**は `[plan.sh] error_code=<CODE>` (固定形式。テストで固定)。
   文言は固定の文 + 識別子だけ (card の中身・名乗られた値は出さない。secret を仕込んだテストで固定)。
@@ -1793,7 +1793,7 @@ verified の done は全部 Worker (Ren 22・Arjun 9・Luna 7・Kai-codex 4・Se
   (旧文は全員に「`plan.sh status` から ID を得よ」と勧めていた。reset / 再 pull の後の古い Worker がそれに従うと置き換えの試行を名乗って照合を通る = §20.7 の失敗の再現。)
 - **何も書かない**: 既存の拒否と同じ `_refuse` (監査に `refused:EXECUTION_REQUIRED` の 1 行だけ。card・record・枠は 1 バイトも書かない)。**task-graph の再生成は確定で起きている**: 既存の `_controller_die` は `die()` (普通の `SystemExit`) で、plan.sh 末尾の dispatch が再生成する (t002 の確認)。
   なので **PR-2 で `UsageExit` の型にまとめて直す** — 新しい `EXECUTION_REQUIRED` と既存の `EXECUTION_NOT_CURRENT` / `EXECUTION_NOT_FOUND` / `EXECUTION_ALREADY_TERMINAL` の 4 つ (memory `no-write-refusal-must-use-usageexit`。PR #285 の pull と同じ指摘)。
-- `--execution ""` / 空の `CREWVIA_EXECUTION_ID` の拒否 (exit 1) は今のまま。
+- `--execution ""` の拒否 (exit 1) は今のまま。(空の env の拒否は §20.11 で、env を読まなくなったので無くなった。)
 
 ### 20.4 段取り
 
@@ -1852,7 +1852,7 @@ verified の done は全部 Worker (Ren 22・Arjun 9・Luna 7・Kai-codex 4・Se
 - **Director の代理報告は例外ではなく別物**: Director は `plan.sh status` で**見て判断した試行を名指し**する (§5.3)。Worker の「自分の報告の ID を取り直す」とは、名乗る主体と意味が違う (Director は reset 後ならその新しい試行を判断し直す立場)。文面でこの違いを書いた。
 - **kai-review.sh `--skip-pull`**: card を読むのは**起動時の 1 回だけ**で、`SKIP_EXECUTION_ID` / `EXEC_ARGS` に固定し、報告の時点で読み直さない。報告の時点で試行が替わっていれば、固定した ID を plan.sh が照合して exit 3 で拒否する (置き換えの試行を名乗って通ることは無い)。加えて、card の `worker` が自分 (`--agent`) と違うときは読まない (他の Worker が持つ試行を引き継がない)。`--execution <id>` を渡されたらそれを優先。
 - **構造テスト** `tests/test_execution_e5_docs_carry_the_id_from_pull_not_refetch.py`: agents/ skills/ の fenced code (コメント行・ヒアドキュメント本文を除く) と報告コマンドを含むインラインコードに、`--execution` へ変数/コマンド置換を渡す・`EXECUTION_ID` を env/コマンドから代入する・`source .crewvia-env` と報告が同じ文・`current_execution_id` を読む・`plan status` と `--execution` が同じ文、の形が無い。直す前の worker.md で 4 件・crewvia-qa SKILL.md で 1 件が赤。
-- plan.sh の env フォールバック (`--execution` が無いとき `CREWVIA_EXECUTION_ID` を読む) は PR-1 では残す。`.crewvia-env` を source した呼び出しで `--execution` を付け忘れると同じ穴が開くので、文書は**常にリテラルの `--execution`** を要求している (フォールバックの扱いは PR-2 の拒否と一緒に決める)。
+- plan.sh の env フォールバック (`--execution` が無いとき `CREWVIA_EXECUTION_ID` を読む) は PR-1 では残す。`.crewvia-env` を source した呼び出しで `--execution` を付け忘れると同じ穴が開くので、文書は**常にリテラルの `--execution`** を要求している (フォールバックの扱いは PR-2 の拒否と一緒に決める)。 **→ §20.11 で外した。**
 
 ### 20.8 PR #287 の Codex 2 巡目 (t011): 空の `--execution` は拒否・警告は遷移の検査の後
 
@@ -1897,3 +1897,27 @@ verified の done は全部 Worker (Ren 22・Arjun 9・Luna 7・Kai-codex 4・Se
 - **rollback**: revert → `scripts/sync-main-checkout.sh`。戻し先は名乗りなしを通す E3 のコードで、`--execution` も今どおり照合するので、**#272 のような別 PR の互換は不要** (戻しで新しく拒否される呼び出しが無い)。
   新しい `error_code` は plan.sh 以外が読まない (監査の `refused:` 行は文字列のまま残る)。
 - **PR-2 の前に「拒否したら何が止まるか」を確かめる**: (a) 観察期間の監査 + 警告の 0 件、(b) 隔離 queue に PR-2 のコードを入れ、Worker の実セッション相当 (素の Bash で pull → done) を worker.md の手順どおりに通して全 6 コマンドが通る、(c) 本番での dry-run は PR-1 の警告の期間がそのまま当たる (拒否しないで警告だけ出す期間)。別の段は足さない。
+
+### 20.11 env の名乗りを外す (mission 20261009-e5-env-and-backlog t001)
+
+**merge は PR #291 (PR-2) の後 (2026-10-15 20:33 JST 以降)**。PR は PR-2 の branch の上に積む (base = `plan pr-base`)。
+
+- **決定 (ユーザー, 2026-10-09, Telegram q-a6761e02): A = plan.sh は env を一切読まない。名乗りは `--execution` だけ。** §5.2 の捨てた案と §20.7 末尾の「フォールバックの扱いは PR-2 と一緒に決める」の決着。
+- **`_execution_caller`** (plan.sh): `--execution` があればそれ (空は exit 1)。無ければ**名乗りなし** (active の試行があれば `EXECUTION_REQUIRED` exit 3・何も書かない)。env `CREWVIA_EXECUTION_ID` が**空でない**とき、無視したことを stderr に 1 行 (「env の CREWVIA_EXECUTION_ID は名乗りに使いません。--execution <ex-…> で渡してください。」。**値は出さない**)。理由: 黙って無視すると「名乗ったつもりが EXECUTION_REQUIRED」の原因が見えない。空の env は読まないので §20.5 の「空の env の exit 1」は無くなった (名乗りの出どころでなくなったので、倒す先が無い)。
+- **Controller**: `Caller.source` の語彙から `env` を外した (`flag` / `none`)。`NOT_CURRENT` の拒否文の env 由来の案内 (`unset CREWVIA_EXECUTION_ID` …) も消した。
+- **`.crewvia-env` の 4 行目 `export CREWVIA_EXECUTION_ID=…` は消した** (3 行に戻る)。消費者の洗い出し (実装から。`grep -rn CREWVIA_EXECUTION_ID scripts hooks agents skills crewvia tests`):
+
+| 場所 | 読むか | 扱い |
+|---|---|---|
+| plan.sh `_execution_caller` | 読んでいた (名乗り) | 外した。非空の env は警告 1 行 |
+| plan.sh pull (`.crewvia-env` を書く) | 書いていた | 4 行目を書かない。再 pull (W2) は毎回 3 行で上書きするので古い 4 行のファイルも直る |
+| lib_task_controller.py (`source='env'`・拒否文) | 読んでいた | 外した |
+| kai-review.sh `unset CREWVIA_EXECUTION_ID` | 消すだけ | **残す**: 継いだ env が plan.sh に届いても無視されるが、警告 1 行が毎報告に出るのを避け、子の claude / codex に別 task の ID を継がせない。`test_kai_review.sh` の E3 テストは「継いだ env があっても pull の ID で done が通る」ままで意味が残る |
+| verifier-dispatcher.sh `env.pop(...)` | 消すだけ | 同上。残す (`test_verifier_dispatcher_names_the_attempt.py`) |
+| agents/worker.md の環境変数表 | 説明 | 「`.crewvia-env` に書かれる」を「書かれない」に直した |
+| scripts/CLAUDE.md | 説明 | 直した |
+| hooks / skills / director.md / worker-codex.md / crewvia | 読まない・env の名乗りを前提にした文は無い | 変更なし |
+| 既存の worktree に残る 4 行の `.crewvia-env` | source されうる | 無害: plan.sh は env を読まない (非空なら警告 1 行)。**主題のテスト**が 4 行の古い ID と別 Worker が上書きした新しい ID の両方で EXECUTION_REQUIRED を固定する |
+
+- **テスト**: `tests/test_execution_env_id_is_never_a_claim.py` (主題: stale `.crewvia-env` の再現・env だけ × 4 コマンド × 今の ID / 古い ID・flag が env に勝つ・空の env は読まない・pull が 4 行目を書かない)。赤の実証は `tests/red_proof_e3_caller.py` の R03 (env を名乗りに戻す)。
+- **戻し方**: revert → `scripts/sync-main-checkout.sh`。dispatcher / watchdog の restart は不要 (plan.sh は呼び出しごとに読み直される。デーモンは `_execution_caller` を持たない)。

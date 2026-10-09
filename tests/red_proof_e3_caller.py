@@ -17,7 +17,7 @@
 
 - R01 照合を外す: active な試行に**別の ID を名乗っても**通る (他人の task を done できる)
 - R02 `--execution ""` を名乗りなしに倒す (値の真偽で「指定されたか」を判定する。01b G3 の型)
-- R03 空の env `CREWVIA_EXECUTION_ID=` を名乗りなしに倒す
+- R03 env `CREWVIA_EXECUTION_ID` を名乗りに使う (t001 / execution.md §20.11)
 - R04 狭めを戻す: done が pending / blocked から通る
 - R05 冪等を外す: 同じ ID の同じ操作の再送が conflict になる
 - R06 `verify-result fail` が worker を手放さない (新しい試行にならない)
@@ -46,6 +46,7 @@ STATUS = "scripts/lib_task_status.py"
 STORE = "scripts/lib_state_store.py"
 VERIFIER = "scripts/verifier-dispatcher.sh"
 TABLE = "tests/test_execution_e3_caller_table.py"
+ENVTEST = "tests/test_execution_env_id_is_never_a_claim.py"
 VTEST = "tests/test_verifier_dispatcher_names_the_attempt.py"
 
 # (id, 説明, ファイル, 置換元, 置換先, 赤になるべきテスト名 (部分一致のどれか 1 つ以上が FAILED), テストファイル)
@@ -66,10 +67,10 @@ MUTATIONS = [
      "    if '--execution' in opts:\n",
      "    if opts.get('--execution'):\n",
      ["test_an_empty_explicit_claim_is_refused_not_turned_into_no_claim"], TABLE),
-    ("R03", "空の env CREWVIA_EXECUTION_ID を名乗りなしに倒す", PLAN,
-     "    value = os.environ.get('CREWVIA_EXECUTION_ID')\n    if value is not None:\n",
-     "    value = os.environ.get('CREWVIA_EXECUTION_ID')\n    if value:\n",
-     ["test_an_empty_explicit_claim_is_refused_not_turned_into_no_claim"], TABLE),
+    ("R03", "env CREWVIA_EXECUTION_ID を名乗りに使う", PLAN,
+     "    if os.environ.get('CREWVIA_EXECUTION_ID'):\n",
+     "    if os.environ.get('CREWVIA_EXECUTION_ID'):\n        return _CONTROLLER.Caller(os.environ['CREWVIA_EXECUTION_ID'], 'flag', agent)\n    if False:\n",
+     ["test_env_alone_is_unnamed_for_every_report", "test_stale_crewvia_env_sourced_by_an_old_worker_cannot_name_the_replacement_attempt"], ENVTEST),
     ("R04", "狭めを戻す (done が pending / blocked から通る)", STATUS,
      "    'done': frozenset({'in_progress'}),\n",
      "    'done': frozenset({'in_progress', 'pending', 'blocked'}),\n",

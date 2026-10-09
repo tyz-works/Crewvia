@@ -92,9 +92,8 @@ class Sandbox:
 
     def shell(self, script: str):
         """`bash -c` で、人間 / Worker が実際に打つ形 (二重引用符の位置引数) を再現する。"""
-        extra = {"CREWVIA_EXECUTION_ID": self.names.ids["t001"]} if "t001" in self.names.ids else {}
         return subprocess.run(
-            ["bash", "-c", script], env=self.env(PLAN=str(PLAN_SH), **extra), cwd=str(self.root),
+            ["bash", "-c", script], env=self.env(PLAN=str(PLAN_SH)), cwd=str(self.root),
             capture_output=True, text=True, timeout=60,
         )
 

@@ -251,10 +251,12 @@ PYEOF
 }
 
 # report_refused_hint: done / needs-director が拒否された (exit 3 = 名乗りの照合の拒否) ときの後始末の案内。
-# card は in_progress のまま (拒否は何も書かない) なので、Director が回復する。Result の全文は消さずに残す。
+# 拒否は何も書かないが、task の今の状態は error_code ごとに違う (別の試行が既に進行中 / 既に終わっている、など) ので、
+# in_progress と断定せず、reset も勧めない。まず status で確かめてから Director が回復の要否を判断する。Result の全文は消さずに残す。
 report_refused_hint() {
-  _error "plan.sh ${1} が拒否されました (exit ${2})。task ${TASK_ID} は in_progress のままです — Director が"\
-" \`plan.sh update ${TASK_ID} --status pending --reset${MISSION_SLUG:+ --mission ${MISSION_SLUG}}\` で開き直してください"
+  _error "plan.sh ${1} が拒否されました (exit ${2})。task ${TASK_ID} の今の状態を"\
+" \`plan.sh status${MISSION_SLUG:+ --mission ${MISSION_SLUG}}\` で確かめてから、回復が要るかを判断してください"\
+" (別の試行が進行中・既に終わっている場合があります)"
   if [[ -n "$RESULT_FILE" && -f "$RESULT_FILE" ]]; then
     _error "review の Result の全文は ${RESULT_FILE} に残しました"
     RESULT_FILE=""      # cleanup で消さない

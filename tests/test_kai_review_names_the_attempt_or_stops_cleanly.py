@@ -5,7 +5,7 @@
   古いプロセスがそれを done / fail できてしまう。execution.md §20.7 / §20.10)。codex も gh も起動せず、done / needs-director も
   打たず、固定文言 (task id だけ。JSON の中身は出さない) を stderr に出して exit 非 0 で止まる
 - 名乗れている実行は今までどおり通る
-- `--skip-pull --execution X` で名乗った試行が替わっていて報告が拒否されたら、exit 3 のまま終わり、回復手順 (`update --reset`) を
+- `--skip-pull --execution X` で名乗った試行が替わっていて報告が拒否されたら、exit 3 のまま終わり、案内 (`plan.sh status` で確かめる。無条件の reset は勧めない) を
   stderr に出す (これは変えていない経路)
 
 kai-review.sh は repo の外に置いた偽の plan.sh (名乗りなしの報告を exit 3 で拒否する) と偽の gh / codex で走らせる。
@@ -131,7 +131,9 @@ def test_a_named_report_refused_by_plan_sh_ends_with_exit_3_and_a_recovery_hint(
     p, calls = run_kai(tmp_path, "", None, refuse_named=True, extra_args=("--skip-pull", "--execution", XID))
     assert p.returncode == 3, (p.returncode, p.stdout, p.stderr)
     assert "needs-director refused-named" in calls
-    assert "update t001 --status pending --reset --mission m-test" in p.stderr, p.stderr
+    assert "plan.sh status --mission m-test" in p.stderr, p.stderr
+    # Codex P2: どの拒否でも in_progress と断定せず、無条件の reset を勧めない (別の試行が進行中・既に終わっている場合がある)
+    assert "--reset" not in p.stderr and "in_progress" not in p.stderr, p.stderr
 
 
 def test_skip_pull_still_reads_the_card_once_at_startup(tmp_path):

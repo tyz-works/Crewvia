@@ -80,7 +80,7 @@ Kai発見: oci compute instance list で --compartment-id を省略すると全�
 | `CREWVIA_MISSION_SLUG` | 担当中のミッション slug（plan.sh pull 後、worktree の `.crewvia-env` を source すると設定される） |
 | `CREWVIA_TASK_ID` | 担当中のタスク ID（plan.sh pull 後に設定） |
 | `CREWVIA_TASK_SLUG` | タスクタイトルを kebab-case 化した slug（worktree パスの末尾部分に使用） |
-| `CREWVIA_EXECUTION_ID` | `.crewvia-env` に書かれる試行の ID（`ex-` + 32 桁 16 進）。**報告の名乗りには使わない**: このファイルは Director の reset と別 Worker の再 pull で**新しい試行の ID に上書きされる**ので、そこから読むと古い Worker が置き換えの試行を名乗って照合を通ってしまう（`knowledge/execution.md` §5.2 の捨てた案・§20.4）。報告（`plan done` / `fail` / `needs-director` / `ready-for-verification`）に使う ID は**自分の pull の JSON の `execution_id` だけ**で、`--execution ex-…` にリテラルで書く（plan.sh が card の今の試行と照合し、違えば **exit 3 で拒否**・何も書かれない）。Bash は呼び出しごとに env が消えるので、値は会話の中で持ち越す |
+| `CREWVIA_EXECUTION_ID` | **設定されない**（以前の `.crewvia-env` の 4 行目は E5 で消えた。既存の worktree に古い 4 行目が残っていても source しないでよい）。plan.sh は env の `CREWVIA_EXECUTION_ID` を**名乗りに使わない**（非空だと「使いません」と 1 行出して無視する）。報告（`plan done` / `fail` / `needs-director` / `ready-for-verification`）に使う ID は**自分の pull の JSON の `execution_id` だけ**で、`--execution ex-…` にリテラルで書く（plan.sh が card の今の試行と照合し、違えば **exit 3 で拒否**・付けなければ active の試行があるので `EXECUTION_REQUIRED` で exit 3・どちらも何も書かれない）。Bash は呼び出しごとに env が消えるので、値は会話の中で持ち越す（`knowledge/execution.md` §20.11） |
 | `TARGET_DIR` | 他プロジェクトを触るタスクの場合にそのプロジェクトの絶対パスが入る。未設定なら `$CREWVIA_REPO/.claude/worktrees/` 配下に worktree が作成され Worker はその中で作業する。セットされている場合は worktree は作成されず Worker は TARGET_DIR で直接作業する |
 
 ### 使用モデルの決まり方

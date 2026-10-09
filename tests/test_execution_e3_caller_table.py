@@ -58,12 +58,15 @@ def test_row_active_and_the_right_id_by_flag_passes_and_is_audited_as_verified(b
 
 
 @pytest.mark.parametrize("command", REPORTS)
-def test_row_active_and_the_right_id_by_env_passes(box, command):
+@pytest.mark.parametrize("which", ["current", "stale"])
+def test_row_env_alone_is_not_a_claim(box, command, which):
+    """env の CREWVIA_EXECUTION_ID は名乗りに使わない (E5 / execution.md §20.11)。正しい今の ID でも古い ID でも同じ。"""
     xid = take(box)
-    p = run(box, *report_argv(command), env={"CREWVIA_EXECUTION_ID": xid})
-    assert p.returncode == 0, (p.stdout, p.stderr)
-    assert card_outcome(box) == OUTCOME[command]
-    assert audit_rows_for(box, command)[0]["caller_check"] == "verified"
+    before = box.snapshot()
+    p = run(box, *report_argv(command), env={"CREWVIA_EXECUTION_ID": xid if which == "current" else OTHER_ID})
+    assert p.returncode == 3 and last_error_code(p.stderr) == "EXECUTION_REQUIRED", (p.stdout, p.stderr)
+    assert "--execution" in p.stderr and xid not in p.stderr and OTHER_ID not in p.stderr   # 値は出さない
+    assert box.snapshot() == before
 
 
 @pytest.mark.parametrize("command", REPORTS)
@@ -79,14 +82,6 @@ def test_row_active_and_a_wrong_id_is_refused_with_exit_3_and_nothing_is_written
     assert rows[0]["execution_id"] == xid                              # card の ID。名乗られた値を正として残さない
     assert rows[0]["detail"] == f"presented={OTHER_ID}"
     assert not [r for r in audit_rows_for(box, command) if r["result"] == "ok"]
-
-
-@pytest.mark.parametrize("command", REPORTS)
-def test_row_active_and_a_wrong_id_from_env_says_where_the_value_came_from(box, command):
-    take(box)
-    p = run(box, *report_argv(command), env={"CREWVIA_EXECUTION_ID": OTHER_ID})
-    assert p.returncode == 3 and last_error_code(p.stderr) == "EXECUTION_NOT_CURRENT"
-    assert "CREWVIA_EXECUTION_ID" in p.stderr and "unset" in p.stderr         # 直し方を拒否文に出す (§5.2)
 
 
 def test_the_flag_wins_over_the_environment(box):
@@ -137,12 +132,7 @@ def test_an_empty_explicit_claim_is_refused_not_turned_into_no_claim(box, comman
         p = run(box, *report_argv(command), "--execution", empty)
         assert p.returncode == 1, (empty, p.stdout, p.stderr)
         assert "--execution" in p.stderr
-    # 空の env も同じ (env の名乗りを「無い」に倒さない)。正しい値を持つ --execution があっても env の空は…
-    # flag が優先されるので、env だけが空のときを見る
-    p = run(box, *report_argv(command), env={"CREWVIA_EXECUTION_ID": ""})
-    assert p.returncode == 1 and "CREWVIA_EXECUTION_ID" in p.stderr
-    assert box.snapshot() == before and len(box.audit_rows()) == rows_before
-    # 空の env でも、明示の正しい --execution があればそちらが勝つ (flag > env)
+    # 空の env は読まない (名乗りなしと同じ)。--execution があればそちらだけが使われる
     ok = run(box, *report_argv(command), "--execution", xid, env={"CREWVIA_EXECUTION_ID": ""})
     assert ok.returncode == 0, ok.stderr
 

@@ -92,9 +92,8 @@ class Sandbox:
 
     def shell(self, script: str):
         """`bash -c` で、人間 / Worker が実際に打つ形 (二重引用符の位置引数) を再現する。"""
-        extra = {"CREWVIA_EXECUTION_ID": self.names.ids["t001"]} if "t001" in self.names.ids else {}
         return subprocess.run(
-            ["bash", "-c", script], env=self.env(PLAN=str(PLAN_SH), **extra), cwd=str(self.root),
+            ["bash", "-c", script], env=self.env(PLAN=str(PLAN_SH)), cwd=str(self.root),
             capture_output=True, text=True, timeout=60,
         )
 
@@ -155,7 +154,7 @@ def test_control_double_quoted_argument_executes_the_command_substitution(sb):
     in_progress_task(sb)
     sentinel = sb.root / "SENTINEL_POSITIONAL"
     r = sb.shell(f'bash "$PLAN" done t001 "PR #1 `touch {sentinel}` $(touch {sentinel}.b)" '
-                 f'--mission {MISSION} --no-pr "テスト"')
+                 f'--mission {MISSION} --no-pr "テスト" --execution {sb.names.ids["t001"]}')
     _ok(r)
     assert sentinel.exists(), "対照が効いていない: 二重引用符でもコマンド置換されなかった"
     assert pathlib.Path(f"{sentinel}.b").exists()
@@ -195,6 +194,7 @@ def test_stdin_through_a_quoted_heredoc_in_a_real_shell(sb):
     sentinel = sb.root / "SENTINEL_HEREDOC"
     r = sb.shell(
         f'bash "$PLAN" done t001 --result-file - --mission {MISSION} --no-pr "テスト" '
+        f'--execution {sb.names.ids["t001"]} '
         f"<<'RESULT_EOF'\nPR #1\n`touch {sentinel}` $(touch {sentinel})\nRESULT_EOF\n")
     _ok(r)
     assert not sentinel.exists()

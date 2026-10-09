@@ -3601,19 +3601,27 @@ def cmd_pull(args):
               "(agent が空のまま pull すると worker 不明の in_progress card ができるので、何も書かずに断ります。"
               "テスト用の `env -u AGENT_NAME` / `env -i` を pull に持ち込まないでください)", file=sys.stderr)
         raise UsageExit(1)
-    require_valid_agent_name(agent)
+    # ここから下の「ロックの前の拒否」は、何も書かずに断る = UsageExit (die だと末尾の dispatch が task-graph を再生成する)。
+    # exit 1 (exit 2 は idle の意味で Worker が無限に再試行する)。
+    def _refuse_before_writing(message):
+        print(message, file=sys.stderr)
+        raise UsageExit(1)
+
+    name_problem = agent_name_problem(agent)
+    if name_problem:
+        _refuse_before_writing(f"invalid agent name {agent!r}: {name_problem}")
 
     # Director は pull しない。判定は registry 上の role で — **`ROLE` 環境変数は見ない**:
     # dispatcher が spawn する kai-review.sh は Director の env を継承しうるので、env で
     # 判定すると Kai-codex が Director として拒否される (memory: crewvia-director-pull-pitfall)。
     registered = registered_worker(agent)
     if registered and registered.get('role', '').strip('"\' ').lower() == 'director':
-        die(f"{agent!r} は registry/workers.yaml で role: director です。Director は task を pull しません "
+        _refuse_before_writing(f"{agent!r} は registry/workers.yaml で role: director です。Director は task を pull しません "
             f"(Worker に割り当てる側)。`plan.sh status` で状態を見るか、Worker として起動し直してください。")
 
     requested_skills = pull_skills(opts.get('--skills'), registered)
     if not requested_skills:
-        die("pull requires the worker's skills: pass --skills <csv>, set the SKILLS environment "
+        _refuse_before_writing("pull requires the worker's skills: pass --skills <csv>, set the SKILLS environment "
             "variable, or register the agent's skills in registry/workers.yaml. "
             "(skills を空にすると skill の絞り込みが丸ごと無効になるので、黙って進めません)")
 

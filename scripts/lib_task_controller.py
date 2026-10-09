@@ -366,8 +366,9 @@ def _authorize(txn, slug, tid, meta, caller, *, operation, require_name=False):
             # E5 PR-2 (execution.md §20.3): 6 つの報告コマンドは、実行中の試行があるなら名乗る。固定文言 + 識別子だけ
             _refuse(txn, ex.EXECUTION_REQUIRED,
                     f"{slug}/{tid}: この task は実行中の試行があります。報告には今の試行の execution id を名乗ってください"
-                    f" (--execution <ex-…>。ID は pull の JSON の execution_id か `plan.sh status --mission {slug}` の進行中の行"
-                    f" [ex-… attempt N])。何も書いていません。", slug, tid, meta, caller)
+                    f" (--execution <ex-…>)。Worker: 自分の pull の JSON の execution_id を名乗る。分からなければ報告せずに止まり"
+                    f" Director に知らせる (`plan.sh status` や card から取り直さない)。Director の代理報告: `plan.sh status --mission {slug}`"
+                    f" の進行中の行 [ex-… attempt N] を見て、判断した試行を名乗る。何も書いていません。", slug, tid, meta, caller)
         return PROCEED, ex.CHECK_UNVERIFIED
     if view == ex.DETACHED:
         return TASK_ONLY, ex.CHECK_DETACHED

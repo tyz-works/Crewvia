@@ -1788,8 +1788,9 @@ verified の done は全部 Worker (Ren 22・Arjun 9・Luna 7・Kai-codex 4・Se
 - **`update` は対象外で、拒否の候補に入れない** (§5.3): 手動の回復の出口。Worker が死んで誰も ID を名乗れない状況で、Director が `update --status pending --reset` で card を開ける唯一の経路。E5 で塞ぐと、止まった task の出口が消える。
   `update` の `unverified` は E4a 以降 `--reset` が active な試行を閉じるときに付く印で、**通常運用で出続ける** (表 #2 #3)。**E5 の「0 件」の条件は 6 コマンドだけで数える** (`update` / `retire` / `pull` を除く)。
 - exit は 3 (照合の族)、`error_code` は新設 **`EXECUTION_REQUIRED`** (`lib_execution.EXIT_CODES` に 3 で足す)。既存の `EXECUTION_NOT_FOUND` は「その card はその ID を発行していない」の意味で、名乗りなしには使わない (直し方の文が違う)。
-  拒否文 (固定文言 + 識別子だけ。名乗られた値は無いので出す物も無い):
-  `{slug}/{tid}: この task は実行中の試行があります。報告には今の試行の execution id を名乗ってください (--execution <ex-…>。ID は pull の JSON の execution_id か \`plan.sh status --mission {slug}\` の進行中の行 [ex-… attempt N])。何も書いていません。` + 最後の行 `[plan.sh] error_code=EXECUTION_REQUIRED`。
+  拒否文 (固定文言 + 識別子だけ。名乗られた値は無いので出す物も無い。**役割で分ける** — §20.10 の Codex P2):
+  `{slug}/{tid}: この task は実行中の試行があります。報告には今の試行の execution id を名乗ってください (--execution <ex-…>)。Worker: 自分の pull の JSON の execution_id を名乗る。分からなければ報告せずに止まり Director に知らせる (\`plan.sh status\` や card から取り直さない)。Director の代理報告: \`plan.sh status --mission {slug}\` の進行中の行 [ex-… attempt N] を見て、判断した試行を名乗る。何も書いていません。` + 最後の行 `[plan.sh] error_code=EXECUTION_REQUIRED`。
+  (旧文は全員に「`plan.sh status` から ID を得よ」と勧めていた。reset / 再 pull の後の古い Worker がそれに従うと置き換えの試行を名乗って照合を通る = §20.7 の失敗の再現。)
 - **何も書かない**: 既存の拒否と同じ `_refuse` (監査に `refused:EXECUTION_REQUIRED` の 1 行だけ。card・record・枠は 1 バイトも書かない)。**task-graph の再生成は確定で起きている**: 既存の `_controller_die` は `die()` (普通の `SystemExit`) で、plan.sh 末尾の dispatch が再生成する (t002 の確認)。
   なので **PR-2 で `UsageExit` の型にまとめて直す** — 新しい `EXECUTION_REQUIRED` と既存の `EXECUTION_NOT_CURRENT` / `EXECUTION_NOT_FOUND` / `EXECUTION_ALREADY_TERMINAL` の 4 つ (memory `no-write-refusal-must-use-usageexit`。PR #285 の pull と同じ指摘)。
 - `--execution ""` / 空の `CREWVIA_EXECUTION_ID` の拒否 (exit 1) は今のまま。
@@ -1811,6 +1812,88 @@ verified の done は全部 Worker (Ren 22・Arjun 9・Luna 7・Kai-codex 4・Se
 **PR-2 (拒否の cutover。ユーザー承認)**
 - `_authorize` の名乗りなし + ACTIVE の分岐を `_refuse(EXECUTION_REQUIRED)` に。§20.3 の task-graph の確認。`kai-review.sh` の「JSON が読めない」経路 (:270) の挙動 (拒否されたら `needs_director` に倒れるか、止まるか) をテストで確かめる。
 - テスト: 名乗りなし × 6 コマンド × (active / terminal / 試行なし / detached) の表 (`test_execution_e3_caller_table.py` に行を足す)・拒否が何も書かない (card / record / 枠 / task-graph の sha256)・`update` が通る・**`kai-review.sh --skip-pull` の done / needs-director が名乗って通る** (PR-1 の直しの回帰)・既存 3 拒否と新規の 4 つが task-graph を再生成しない (sha256)。**赤の実証** (分岐を戻すと対象のテストだけが赤)。
+- **kai-review.sh: 経路ごとの最終状態 (Codex P1 後。t001 の Result の表を置き換える)**
+
+  | 経路 | 名乗り | 報告が拒否された / 名乗れなかったとき |
+  |---|---|---|
+  | 通常 pull・JSON に execution_id | pull の ID (固定) | 拒否されない |
+  | 通常 pull・JSON が読めない | **名乗らない・card を読まない** | codex 起動前に exit 1 で止まる。done / needs-director は打たない。card は in_progress / worker=Kai-codex のまま → 約 10 分後に vanished-worker 通知で Director へ (reset か代理報告) |
+  | `--skip-pull` (card に active・worker 自分) | card を**起動時 1 回** | 拒否されない |
+  | `--skip-pull` (読めない) | 名乗れず警告 | 報告が exit 3 → script も exit 3・`update --reset` の案内・Result 全文は残す |
+  | `--skip-pull --execution X` | X | 試行が替わっていれば NOT_CURRENT exit 3、同じ案内 |
+  | `--dry-run` | 報告しない | 拒否は起きない |
+
+- **rollback**: revert → `scripts/sync-main-checkout.sh`。戻し先は名乗りなしを通す E3 のコードで、`--execution` も今どおり照合するので、**#272 のような別 PR の互換は不要** (戻しで新しく拒否される呼び出しが無い)。
+  新しい `error_code` は plan.sh 以外が読まない (監査の `refused:` 行は文字列のまま残る)。
+- **PR-2 の前に「拒否したら何が止まるか」を確かめる**: (a) 観察期間の監査 + 警告の 0 件、(b) 隔離 queue に PR-2 のコードを入れ、Worker の実セッション相当 (素の Bash で pull → done) を worker.md の手順どおりに通して全 6 コマンドが通る、(c) 本番での dry-run は PR-1 の警告の期間がそのまま当たる (拒否しないで警告だけ出す期間)。別の段は足さない。
+
+### 20.5 決定 (2026-10-08, ユーザーが画面で 7 点とも推奨どおり承認)
+
+1. **観察期間** = 2 ミッション分または 7 日の長い方。
+2. **警告は stderr のみ**。監査の形は変えない (監査には既に `unverified` が残る)。
+3. **Director の done / fail / needs-director も `--execution` 必須** (例外経路を作らない)。Director の代理報告が止まる場面は `update --status pending --reset` で開ける (§20.3)。
+4. **target_dir の task は隔離環境で 1 本通して確かめる**。実 target_dir の mission での確認は待たない。
+5. **拒否コード `EXECUTION_REQUIRED` を新設する** (`EXECUTION_NOT_FOUND` に寄せない。直し方の文が違う)。
+6. **既存の拒否 (`NOT_CURRENT` / `NOT_FOUND` / `ALREADY_TERMINAL`) の task-graph 再生成も PR-2 でまとめて `UsageExit` 型に直す** (§20.3 で再生成は確定)。
+7. **ID 持ち越しの構造的な直し (ID を持つラッパー等) は別 mission**。拒否文に ID を出す案は採らない (agent 名から ID を引くのと同じで、§5.2 の捨てた案と同じ理由)。PR-1 / PR-2 の範囲外。
+
+### 20.6 PR-1 の実績 (t005, mission 20261008-e5-reject-unnamed-reports)
+
+- **plan.sh の判定は変えていない**。足したのは stderr の 2 行だけ: (1) 名乗りなしで `PROCEED, UNVERIFIED` になった 6 コマンドの警告 (`lib_task_controller.UNNAMED_WARNING`。`_authorize(warn=…)`、dry_run と retire / reset / G1 の fail には出さない)、(2) pull の `報告には --execution ex-… を付ける`。
+- §20.2 の表の対応: dispatcher の割り当て文・start.sh の起動文 (2 か所) → `--execution` と pull の JSON の `execution_id` に触れる / worker.md → 例を `--execution ex-…` に揃え、「env は呼び出しごとに消える」ので pull の JSON の値を会話で持ち越す形を手順の前に (**当初の「同じ呼び出しで `.crewvia-env` を source し直す」形は P1 で撤回 — 下の §20.7**) / worker-codex.md・verifier.md・skills 2 本・director.md → 例と文を実形に (director.md は「付けなくても通る」を「必ず付ける」に) / kai-review.sh `--skip-pull` → card の `current_execution_id` (active のときだけ) を読む、`--execution <id>` でも渡せる、読めなければ警告 (読み方は §20.7 で締めた) / verifier-dispatcher.sh・hooks・scripts/bin/plan → 変更なし。
+- 構造テスト `tests/test_execution_e5_doc_examples_name_the_execution.py`: agents/ skills/ の 6 コマンドの例 (fenced の論理行・地の文のインラインコードの行) がすべて `--execution` か `${EXECUTION_ID:+` を含む。直す前の実測は 39 例中 36 が名乗りなし。
+- 挙動テスト `tests/test_execution_e5_unnamed_report_warning.py`、互換テスト `test_plan_sh_compat_s3.py` は E5 の stderr 2 行だけを取り除いて golden と比べる。
+- **merge 後に dispatcher restart が要る** (割り当て文は dispatcher.sh の python に埋まっている)。Worker / Director は PR-1 の後に起動し直す (§20.4 の観察の条件)。
+
+### 20.7 PR #287 の Codex P1 (t009): 報告の ID は自分の pull の JSON から持ち越す
+
+- **指摘**: 20.6 の手順 (「同じ呼び出しで `.crewvia-env` を source し直す」「`plan status` から取り直す」) は、Director の reset → 別 Worker の再 pull で `.crewvia-env` (plan.sh は worktree を再利用して**新しい試行の ID で上書き**する) と card の今の試行が置き換えの試行の ID になるため、古い Worker がその ID を名乗って照合を通り、置き換えの試行を done / fail できる。**§5.2 の捨てた案 (cwd の worktree の `.crewvia-env` を読んで補う) と同じ穴**で、20.6 はそれを手順として書いてしまっていた。
+- **決定**: 報告に使う ID は**その Worker 自身の pull の JSON の `execution_id` だけ**。pull の直後に控え、以後の報告には `--execution ex-…` を**リテラルで**書く (Bash の env は呼び出しごとに消えるので、会話の中で値を持ち越す)。`.crewvia-env` / `plan status` / card の `current_execution_id` から報告用の ID を**取り直す手順は agents/ skills/ README から全部消した** (worker.md の `$EXECUTION_ID` を使う例も `--execution ex-…` のリテラルに)。ID が分からなくなったら取り直さず、`needs-director` で Director に聞く (**PR-2 から、名乗りなしの報告は実行中の試行に対して拒否される = §20.10**。それも名乗りなしでは拒否されるので、ID が全く分からないときは作業を止めて Director に直接報告する)。
+- **Director の代理報告は例外ではなく別物**: Director は `plan.sh status` で**見て判断した試行を名指し**する (§5.3)。Worker の「自分の報告の ID を取り直す」とは、名乗る主体と意味が違う (Director は reset 後ならその新しい試行を判断し直す立場)。文面でこの違いを書いた。
+- **kai-review.sh `--skip-pull`**: card を読むのは**起動時の 1 回だけ**で、`SKIP_EXECUTION_ID` / `EXEC_ARGS` に固定し、報告の時点で読み直さない。報告の時点で試行が替わっていれば、固定した ID を plan.sh が照合して exit 3 で拒否する (置き換えの試行を名乗って通ることは無い)。加えて、card の `worker` が自分 (`--agent`) と違うときは読まない (他の Worker が持つ試行を引き継がない)。`--execution <id>` を渡されたらそれを優先。
+- **構造テスト** `tests/test_execution_e5_docs_carry_the_id_from_pull_not_refetch.py`: agents/ skills/ の fenced code (コメント行・ヒアドキュメント本文を除く) と報告コマンドを含むインラインコードに、`--execution` へ変数/コマンド置換を渡す・`EXECUTION_ID` を env/コマンドから代入する・`source .crewvia-env` と報告が同じ文・`current_execution_id` を読む・`plan status` と `--execution` が同じ文、の形が無い。直す前の worker.md で 4 件・crewvia-qa SKILL.md で 1 件が赤。
+- plan.sh の env フォールバック (`--execution` が無いとき `CREWVIA_EXECUTION_ID` を読む) は PR-1 では残す。`.crewvia-env` を source した呼び出しで `--execution` を付け忘れると同じ穴が開くので、文書は**常にリテラルの `--execution`** を要求している (フォールバックの扱いは PR-2 の拒否と一緒に決める)。
+
+### 20.8 PR #287 の Codex 2 巡目 (t011): 空の `--execution` は拒否・警告は遷移の検査の後
+
+- **P1 (kai-review.sh)**: `--skip-pull --execution "$X"` で `$X` が空だと、「フラグが無い」と区別がつかず card の `current_execution_id` を採用して名乗っていた。**フラグが渡されたか**を `EXECUTION_FLAG_GIVEN` に持ち、渡されて空 (値が無い末尾の `--execution` も) なら引数の解析の直後に exit 1 (card を読まず・pull / done / needs-director を打たない。plan.sh の `--execution ""` = exit 1 と揃えた)。省略したときだけ card を読む。
+- **P2 (lib_task_controller)**: 名乗りなしの警告を `_authorize` の中で出していたので、遷移が拒否される報告 (`mark_task` 経路: 例 in_progress の task への `verifying`、`_finish` 経路を Controller から直接呼んだとき) でも「名乗りなしで報告しました」が出ていた。`_authorize` は警告を出さず、`_warn_unnamed(check)` を**遷移の検査 (`_check_task_status` と試行の遷移表) が全部通った後**にだけ呼ぶ (dry_run は出さない)。plan.sh 経由の done / fail / needs-director は plan.sh が dry_run で先に検査するので、この誤りは `mark_task` 経路でだけ見えていた。
+- **同じ型 (検査の前の副作用・出力) の棚卸し**: `lib_task_controller` の `print` / `sys.std*` は `_warn_unnamed` の 1 か所だけ。検査より前に書く操作は拒否の行 (`_refuse` の監査の `refused:` 行) だけで、これは拒否そのものの記録。他の経路に無い。
+- テスト: `tests/test_execution_e5_warning_after_transition_check.py` (plan.sh 経由・kai-review.sh) / `..._controller.py` (Controller 直接)。赤の実証: 欠陥版 (警告を `_authorize` に戻す・`-z` で省略扱いに戻す) で 9 + 8 件が赤、直すと全緑。
+
+### 20.9 PR #287 の Codex 3 巡目 (t012): `--execution` の値の欠落・形の検査 / 構造テストの盲点
+
+- **P1 (kai-review.sh)**: `--pr 1 --task t001 --execution --dry-run` で `--dry-run` が `--execution` の値として食われ、dry-run の要求が消えて本物の pull を打っていた。直し方は 2 段。(1) 値が無い・次が `-` で始まるときは値を食わない (後続のオプションはそのまま解析される)。(2) 渡されたのに空、または `ex-<32 桁の小文字 16 進>` (`lib_execution.EXECUTION_ID_RE`。コピーせず import) でなければ、引数の解析の直後 (pull・card 読み・codex 起動の前) に exit 1。`--execution -x` は `-x` が未知のオプションとして拒否される (どちらでも副作用 0)。
+- **他のオプションの棚卸し (直さない・backlog)**: `--pr` / `--task` / `--mission` / `--model` / `--agent` は `"$2"` をそのまま取るので同じ型 (`--mission --dry-run` で MISSION_SLUG=`--dry-run`・dry-run を失う、`--model --dry-run` / `--agent --dry-run` も同様。値が無い末尾は `set -u` の unbound variable で exit 1)。`--skip-pull` / `--dry-run` は値を取らず対象外。
+- **構造テストの盲点**: `agents/` `skills/` を走査する 2 本のテストが、コメント行 `# … <<'RESULT_EOF' … RESULT_EOF` をヒアドキュメントの開始と読み、終端語が現れず worker.md の 677 行以降が未走査だった (`knowledge` の「コメント中の `<<X` が字句検出器を盲目にする」と同じ型)。字句の状態は `classify()` の 1 か所 (両テストが共有) にし、(a) 行頭 `#` は開始でない (b) fence が閉じたらヒアドキュメントを解除 (c) 本文として飛ばした行・閉じなかった開始を数える。`test_every_line_naming_a_report_command_is_scanned` が独立の素朴検出 (6 コマンドの名前を含む行) ⊆ 走査した行を検査し、走査漏れそのものを赤にする。盲点を開けて新しく赤になったのは worker.md の 2 行 (移行予告の `plan.sh ready-for-verification <task_id>` に `--execution ex-…` を足す / 引き継ぎ書テンプレートの `plan.sh fail --head` の言及を言い換え)。検出する例は 39 → 49 件。
+
+### 20.10 PR-2 の実績 (mission 20261009-e5-pr2-reject-unnamed t001): 名乗りなし + active の報告を `EXECUTION_REQUIRED` (exit 3) で拒否
+
+**merge は観察期間の明け (2026-10-15 20:33 JST 以降) まで保留** (ユーザー決定 2026-10-09)。PR は作って CI 緑・レビューまで進める。
+
+- **判定**: `lib_task_controller._authorize(require_name=…)` の「名乗りなし × ACTIVE」の分岐が `_refuse(EXECUTION_REQUIRED)`。`require_name` が立つのは報告の操作だけ
+  (`_finish` の `operation` が `_REPORT_OPERATIONS` = done / fail / needs-director / verify-result の pass・fail、と `mark_task` = ready-for-verification / verifying / verify-result の needs_human_review)。
+  retire・`update --reset`・pull の G1 の fail は `operation` が別 (または None) なので名乗りなしで通る。**試行なし・DETACHED・TERMINAL の名乗りなしも今のまま通る** (§20.3)。
+  拒否は遷移の検査より前 (名乗りなしで、遷移も不正な報告は `EXECUTION_REQUIRED` が先)。`dry_run` も同じ拒否。
+- **コード**: `lib_execution.EXECUTION_REQUIRED` (`EXIT_CODES` = 3・`AUDITED_REFUSALS` に追加)。拒否文は §20.3 の固定文言 + 識別子 (slug/task id) だけ。最後の行 `[plan.sh] error_code=EXECUTION_REQUIRED`。監査は `refused:EXECUTION_REQUIRED` の 1 行 (`presented` の欄は無い)。
+- **task-graph**: `plan.sh` の `_controller_die` が、照合の拒否 4 つ (`EXECUTION_REQUIRED` / `NOT_CURRENT` / `NOT_FOUND` / `ALREADY_TERMINAL`。`_NO_WRITE_REFUSALS`) を `UsageExit` で出す。
+  `die()` (普通の `SystemExit`) だと末尾の dispatch が task-graph を再生成していた。残りの `INVALID_TRANSITION` などは今までどおり `die()` (範囲外。pull の `_pull_controller_die` も触っていない)。
+- **PR-1 の警告を撤去**: `UNNAMED_WARNING` / `_warn_unnamed` は、名乗りなしの ACTIVE が拒否になって出る場面が無くなったので消した (死んだコードを残さない)。`unverified` の `caller_check` は `update --reset` が active な試行を閉じる行にだけ残る (§20.3 の `update`)。
+  PR-1 の警告のテスト 3 本 (`test_execution_e5_unnamed_report_warning.py` ほか 2 本) は、拒否のテストに置き換えた (`..._unnamed_report_refused.py` / `..._required_refusal_controller.py` / `..._report_gate_and_kai_review_flag.py`)。
+- **kai-review.sh** (§20.2 の表の「JSON が読めない」経路): 名乗りなしの done / needs-director が拒否されると Kai-codex の card が in_progress のまま残る。
+  当初は pull の JSON が読めなかったとき card の試行を読んで名乗る fallback を入れたが、**Codex P1 で撤去した (下の「Codex P1 / P2」)**。今は
+  (1) pull の JSON から `execution_id` を読めなければ、codex を起動せず done / needs-director も打たず、固定文言 (task id だけ) を stderr に出して **exit 1 で止まる**。
+  (2) 報告が拒否された (exit 3: `--skip-pull --execution X` の X が古い等) ときは、拒否の終了コードをそのまま返し、Director の回復手順 (`plan.sh update <id> --status pending --reset`) を stderr に出し、Result の全文は消さずに残す (`report_refused_hint`)。
+  `--skip-pull` の起動時 1 回の card 読み (§20.7) は変えない。
+
+#### Codex P1 / P2 (PR #291 追加コミット, mission 20261009-e5-pr2-reject-unnamed t005)
+
+- **P1 (kai-review.sh)**: pull 直後の「JSON が読めなければ card の `current_execution_id` を名乗る」fallback は、pull のロックを放した後に走る。その間に Director が reset → 別の Kai-codex が再 pull すると、worker 名が同じなので card の ID は**置き換えの試行**のものになり、古いプロセスが置き換えの試行を done / fail できる (§20.7 の穴)。1 回だけ読む、では防げない。
+  **決定**: fallback を削除。ID を読めなければ止まる (上)。`--skip-pull` の起動時 1 回の読みは別物 (Director が手で再実行する経路・自分の worker の active 試行だけ・報告の時点で読み直さない) なので残す。
+- **P2 (lib_task_controller.py)**: `EXECUTION_REQUIRED` の拒否文が全員に「`plan.sh status` から ID を得よ」と勧めていた。**役割で分けた**: Worker は自分の pull の ID を名乗り、分からなければ報告せずに止まって Director に知らせる (status・card から取り直さない)。Director の代理報告は status の進行中の行の `[ex-… attempt N]` を見て判断した試行を名乗る。worker.md / skills 2 本の「Director に聞く (`needs-director`)」も、名乗りなしの `needs-director` が拒否されるので「報告せずに止まって Director に知らせる」に直した。
+- **回復経路 (実装で確認)**: ID を読めずに止まった Kai-codex の card は `in_progress` / worker=`Kai-codex` のまま残る。Kai-codex は mux の窓を持たず、kai-review.sh は起動時に heartbeat を touch する。dispatcher の vanished-worker 検知 (`status==in_progress` ∧ worker の窓なし ∧ heartbeat が `AGENT_PRESENCE_TTL`=600 秒より古い) が、**止まってから約 10 分後に Director へ 1 回**
+  `plan.sh update <id> --status pending --reset --mission <slug>` を添えて通知する (`vanished_worker_<slug>_<tid>`)。Director は `plan.sh status` を見て代理で報告するか、その reset で開ける。
+  reset 後は card が pending・worker なしになり、`reap-orphan-assignment` (R-2 の孤児) か次の pull が枠を片付けるので、以後の codex-review は止まらない。**止まっている間 (最大 10 分 + Director の応答)** は `Kai-codex` の枠が in_progress を指して塞がるため、他の codex-review は待つ。恒久には止まらない。Rule 5 (idle-with-task) は窓のある Worker の画面を見る規則なので Kai-codex には効かない。
 - **rollback**: revert → `scripts/sync-main-checkout.sh`。戻し先は名乗りなしを通す E3 のコードで、`--execution` も今どおり照合するので、**#272 のような別 PR の互換は不要** (戻しで新しく拒否される呼び出しが無い)。
   新しい `error_code` は plan.sh 以外が読まない (監査の `refused:` 行は文字列のまま残る)。
 - **PR-2 の前に「拒否したら何が止まるか」を確かめる**: (a) 観察期間の監査 + 警告の 0 件、(b) 隔離 queue に PR-2 のコードを入れ、Worker の実セッション相当 (素の Bash で pull → done) を worker.md の手順どおりに通して全 6 コマンドが通る、(c) 本番での dry-run は PR-1 の警告の期間がそのまま当たる (拒否しないで警告だけ出す期間)。別の段は足さない。

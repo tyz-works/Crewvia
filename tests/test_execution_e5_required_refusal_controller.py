@@ -68,3 +68,23 @@ def test_a_reset_by_the_director_needs_no_claim(q):
     with h.tx(q) as t:
         ctl.reset_task(t, MISSION, "t001", ctl.NO_CALLER, now=h.T1)
     assert h.read_meta(q, "t001")["status"] == "pending"
+
+
+def test_the_refusal_text_does_not_tell_a_worker_to_refetch_the_id_from_status(q):
+    """Codex P2 (PR #291): 拒否文が全員に「`plan.sh status` から ID を得よ」と勧めると、reset / 再 pull の後の古い Worker が
+    置き換えの試行を名乗って照合を通る (execution.md §20.7)。Worker 向けは pull の JSON の ID だけ・分からなければ止まる。
+    `plan.sh status` を勧めるのは Director の代理報告 (見て判断した試行を名乗る) の文だけ。"""
+    with h.tx(q) as t:
+        e = h.raises_code(ex.EXECUTION_REQUIRED, CALLS["done"], t)
+    msg = str(e)
+    worker_part, _, director_part = msg.partition("Director の代理報告")
+    assert director_part, msg                                              # 役割で分けてある
+    assert "pull の JSON の execution_id" in worker_part
+    assert "止まり" in worker_part and "Director に知らせる" in worker_part
+    assert "取り直さない" in worker_part                                    # status / card を入手元にしない、と明示
+    assert "plan.sh status" in director_part and "進行中の行" in director_part
+    # Worker 向けの部分は status を「ID の入手元」として勧めない (否定の文脈でだけ出る)
+    for ok in ("`plan.sh status` や card から取り直さない",):
+        worker_part = worker_part.replace(ok, "")
+    assert "plan.sh status" not in worker_part, worker_part
+    assert "ex-" in director_part                                          # 識別子の形だけ・値は出さない

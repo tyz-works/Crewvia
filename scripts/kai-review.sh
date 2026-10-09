@@ -323,7 +323,7 @@ if [[ $SKIP_PULL -eq 0 && $DRY_RUN -eq 0 ]]; then
   fi
   # plan.sh pull は結果を stdout に JSON で吐く。**捨てない**: `execution_id` を取り出して done / needs-director に
   # `--execution` で渡す (今の試行を名乗る。違う試行なら plan.sh が拒否する。execution.md §5.4)。JSON が読めない・欄が
-  # 無い (E2 より前の plan.sh) ときは名乗らない。失敗時は stderr が見える方が良いので tee はしない。
+  # 無い (E2 より前の plan.sh) ときは名乗れないので止まる (下)。失敗時は stderr が見える方が良いので tee はしない。
   # (task がまだ in_progress に遷移できていない = needs-director を打っても plan.sh 側で
   #  弾かれる可能性が高いため、ここは元のまま plain exit とする)
   if ! PULL_JSON="$("$PLAN_SH" "${PULL_ARGS[@]}")"; then
@@ -337,18 +337,15 @@ except Exception:
     v = None
 print(v if isinstance(v, str) else "")' 2>/dev/null || true)"
   if [[ -z "$PULL_EXECUTION_ID" ]]; then
-    # JSON から読めなかった。E5 PR-2 から、名乗りなしの done / needs-director は (試行が active なら) EXECUTION_REQUIRED で
-    # 拒否され、Kai-codex の card が in_progress のまま残る。今 pull したばかりの card の試行 (active・worker が自分) を
-    # 起動時のこの 1 回だけ読んで名乗る (--skip-pull と同じ読み方。報告の時点で読み直さない)。
-    PULL_EXECUTION_ID="$(read_card_execution_id)"
+    # 自分の pull の JSON から ID を読めなかった。**card から取り直さない** (execution.md §20.7 / §20.10 の Codex P1):
+    # pull のロックを放した後に Director が reset → 別の Kai-codex が再 pull すると、worker 名は同じなので card の
+    # current_execution_id は置き換えの試行の ID になり、それを名乗ると古いこのプロセスが置き換えの試行を done / fail
+    # できてしまう。codex も起動せず、done / needs-director も打たずに止まる (固定の文言。pull の JSON の中身は出さない)。
+    # card は in_progress のまま残り、Director が status を見て代理で報告するか `update --status pending --reset` で開ける。
+    _error "plan.sh pull の出力から execution_id を読めませんでした — task ${TASK_ID} は何も報告せずに止まります。in_progress のまま残るので Director が回復してください"
+    exit 1
   fi
-  if [[ -n "$PULL_EXECUTION_ID" ]]; then
-    EXEC_ARGS=(--execution "$PULL_EXECUTION_ID")
-  else
-    # 名乗れない。試行が active なら done / needs-director は拒否される (exit 3 → report_refused_hint)。固定の文言で 1 行残す
-    # (pull の JSON の中身は出さない。execution.md §16.9)。
-    _warn "plan.sh pull の出力と card から execution_id を読めませんでした — done / needs-director は名乗りなしで報告します。試行が実行中なら拒否されます (task ${TASK_ID})"
-  fi
+  EXEC_ARGS=(--execution "$PULL_EXECUTION_ID")
 elif [[ $DRY_RUN -eq 1 ]]; then
   _info "DRY_RUN=1: skipping plan.sh pull (no writes to plan.sh in dry-run mode)"
 else

@@ -3277,12 +3277,22 @@ def _execution_caller(opts):
     return _CONTROLLER.NO_CALLER
 
 
+#: 何も書かずに終わる照合の拒否 (E5 PR-2。execution.md §20.5 の 6)。UsageExit で出して task-graph を再生成しない
+_NO_WRITE_REFUSALS = frozenset({
+    _EXEC.EXECUTION_NOT_FOUND, _EXEC.EXECUTION_NOT_CURRENT, _EXEC.EXECUTION_ALREADY_TERMINAL, _EXEC.EXECUTION_REQUIRED})
+
+
 def _controller_die(command, e):
     """Controller の domain error を終わり方に写す (pull 以外の全コマンド)。exit code は `lib_execution.EXIT_CODES`
     (遷移の拒否 `INVALID_TRANSITION` は今までの `REFUSED_TRANSITION` と同じ 2。照合の 3 つは 3)。stderr の**最後の行**に
     固定形式の `error_code=<CODE>` を出す。メッセージは固定の文言 + 識別子だけ (card の中身・名乗られた値は出さない)。"""
     prefix = '' if e.message.startswith("task '") else f"[plan.sh {command}] "
-    die(f"{prefix}{e.message}\n{_error_code_line(e.code)}", _EXEC.EXIT_CODES[e.code])
+    text = f"{prefix}{e.message}\n{_error_code_line(e.code)}"
+    if e.code in _NO_WRITE_REFUSALS:
+        # 照合の拒否 4 つは何も書かない: 普通の SystemExit (die) だと末尾の dispatch が task-graph を再生成してしまう
+        print(text, file=sys.stderr)
+        raise UsageExit(_EXEC.EXIT_CODES[e.code])
+    die(text, _EXEC.EXIT_CODES[e.code])
 
 
 def _resend_conflict(command, slug, task_id, fields):

@@ -28,6 +28,8 @@ import sys
 
 import pytest
 
+from e5_autoname import AutoName
+
 import state_store_scenarios as sc       # scripts/ を sys.path に足す
 import lib_retirement
 import lib_state_store as store
@@ -61,8 +63,11 @@ class Sandbox:
         env = dict(self.env)
         if agent:
             env["AGENT_NAME"] = agent
+        names = self.__dict__.setdefault("names", AutoName())     # E5 PR-2: 自分の pull の execution_id を報告で名乗る
+        args = names.before(args)
         p = subprocess.run([str(self.plan), *args], env=env, capture_output=True, text=True, timeout=120,
                            input=stdin)
+        names.after(args, p.stdout, p.returncode)
         if expect is not None:
             assert p.returncode == expect, f"plan.sh {args}: rc={p.returncode}\n{p.stdout}\n{p.stderr}"
         return p

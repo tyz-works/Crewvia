@@ -23,6 +23,8 @@ import sys
 
 import pytest
 
+from e5_autoname import AutoName
+
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "scripts"))
 
@@ -38,6 +40,7 @@ class Sandbox:
 
     def __init__(self, tmp_path):
         self.root = tmp_path / "repo"
+        self.names = AutoName()
         (self.root / ".git").mkdir(parents=True)
         (self.root / "registry" / "mux").mkdir(parents=True)
         copy_plan_tree(self.root)
@@ -61,9 +64,12 @@ class Sandbox:
         }
 
     def plan(self, *args):
-        return subprocess.run(
+        args = self.names.before(args)                    # E5 PR-2: 自分の pull の execution_id を報告で名乗る
+        r = subprocess.run(
             ["bash", str(self.root / "scripts" / "plan.sh"), *args],
             env=self.env(), cwd=str(self.root), capture_output=True, text=True, timeout=120)
+        self.names.after(args, r.stdout, r.returncode)
+        return r
 
     def ok(self, *args):
         r = self.plan(*args)

@@ -100,12 +100,17 @@ def test_the_flag_wins_over_the_environment(box):
 
 
 @pytest.mark.parametrize("command", REPORTS)
-def test_row_active_and_no_claim_passes_as_unverified(box, command):
+def test_row_active_and_no_claim_is_refused_with_execution_required(box, command):
+    """E5 PR-2 (execution.md §20.3): 実行中の試行があるのに名乗りなし → exit 3・何も書かない (監査は拒否の 1 行だけ)。"""
     take(box)
+    before = box.snapshot()
     p = run(box, *report_argv(command))
-    assert p.returncode == 0, (p.stdout, p.stderr)
-    assert card_outcome(box) == OUTCOME[command]
-    assert audit_rows_for(box, command)[0]["caller_check"] == "unverified"       # E5 の判断材料 (§5.2)
+    assert p.returncode == 3, (p.stdout, p.stderr)
+    assert last_error_code(p.stderr) == "EXECUTION_REQUIRED"
+    assert box.snapshot() == before
+    rows = refusals(box, command)
+    assert len(rows) == 1 and rows[0]["result"] == "refused:EXECUTION_REQUIRED"
+    assert "presented" not in str(rows[0].get("detail", ""))            # 名乗りが無いので、名乗られた値の欄も無い
 
 
 def test_the_agent_name_is_not_the_basis_of_the_check(box):
@@ -602,3 +607,126 @@ def test_two_tasks_do_not_confuse_each_others_ids(box):
     assert p.returncode == 3 and box.snapshot() == before
     assert run(box, *report_argv("done", "t002"), "--execution", b, agent="Sora").returncode == 0
     assert run(box, *report_argv("done", "t001"), "--execution", a, agent="Ren").returncode == 0
+
+
+# ---------------------------------------------------------------------------
+# 6. E5 PR-2: 名乗りなしの表 (6 コマンド × active / terminal / 試行なし / detached) と task-graph
+# ---------------------------------------------------------------------------
+
+def _to_ready(box, xid):
+    assert run(box, *report_argv("ready-for-verification"), "--execution", xid).returncode == 0
+
+
+def _to_verifying(box, xid):
+    _to_ready(box, xid)
+    assert run(box, *report_argv("verifying"), "--execution", xid, agent="verifier-dispatcher").returncode == 0
+
+
+#: 6 コマンド (verify-result は 3 つの verdict) の「通る状態」を作る関数。ACTIVE で名乗りなしなら全部 EXECUTION_REQUIRED
+UNNAMED_COMMANDS = {
+    "done": lambda box, xid: None,
+    "fail": lambda box, xid: None,
+    "needs-director": lambda box, xid: None,
+    "ready-for-verification": lambda box, xid: None,
+    "verifying": _to_ready,
+    "verify-pass": _to_verifying,
+    "verify-fail": _to_verifying,
+    "verify-nhr": _to_verifying,
+}
+
+
+@pytest.mark.parametrize("command", list(UNNAMED_COMMANDS))
+def test_unnamed_table_active_is_refused_for_all_six_commands(box, command):
+    xid = take(box)
+    UNNAMED_COMMANDS[command](box, xid)
+    before = box.snapshot()
+    agent = "V1" if command.startswith("verify-") else ("verifier-dispatcher" if command == "verifying" else "Ren")
+    p = run(box, *report_argv(command), agent=agent)
+    assert p.returncode == 3 and last_error_code(p.stderr) == "EXECUTION_REQUIRED", (p.stdout, p.stderr)
+    assert box.snapshot() == before
+
+
+@pytest.mark.parametrize("command", ["done", "fail", "needs-director"])
+def test_unnamed_table_terminal_attempt_passes_the_task_only_path(box, command):
+    """試行が終わっている card (Director が `update --reset` せず開き直した等) への名乗りなしは対象外 (§20.3)。"""
+    xid = take(box)
+    assert run(box, *report_argv("needs-director"), "--execution", xid).returncode == 0
+    assert run(box, "update", "t001", "--status", "in_progress", "--reset", "--mission", MISSION, agent="Sora").returncode == 0
+    p = run(box, *report_argv(command), agent="Sora")
+    assert p.returncode == 0, (p.stdout, p.stderr)
+    assert audit_rows_for(box, command)[-1]["caller_check"] == "no_execution"
+
+
+@pytest.mark.parametrize("command", ["done", "fail", "needs-director"])
+def test_unnamed_table_no_attempt_passes(box, command):
+    legacy_in_progress(box, "t002")
+    p = run(box, *report_argv(command, "t002"))
+    assert p.returncode == 0, (p.stdout, p.stderr)
+    assert audit_rows_for(box, command)[-1]["caller_check"] == "legacy_generation"
+
+
+def test_unnamed_table_detached_is_not_refused_for_a_missing_claim(box):
+    """DETACHED (旧形式の reset の後) は名乗りなしでも `EXECUTION_REQUIRED` にならない (遷移の検査が答える)。"""
+    take(box)
+    e3.old_code_reset(box)
+    p = run(box, *report_argv("done"))
+    assert last_error_code(p.stderr) == "INVALID_TRANSITION" and p.returncode == 2
+
+
+def test_update_without_a_claim_still_works_on_an_active_attempt(box):
+    take(box)
+    p = run(box, "update", "t001", "--status", "pending", "--reset", "--mission", MISSION, agent="Sora")
+    assert p.returncode == 0, p.stderr
+    assert box.card()["status"] == "pending"
+
+
+def test_a_director_reopened_card_accepts_done_without_a_claim(box):
+    """`update --status in_progress --reset` で開いた card への done が通り続ける (出口を塞がない)。既存の運用の固定。"""
+    xid = take(box)
+    assert run(box, *report_argv("needs-director"), "--execution", xid).returncode == 0
+    assert run(box, "update", "t001", "--status", "in_progress", "--reset", "--mission", MISSION, agent="Sora").returncode == 0
+    assert run(box, *report_argv("done"), agent="Sora").returncode == 0
+
+
+# task-graph: 照合の拒否 4 つは何も書かない (UsageExit。末尾の dispatch が task-graph を再生成しない)
+GRAPH_REFUSALS = {
+    "EXECUTION_REQUIRED": lambda xid: [],
+    "EXECUTION_NOT_CURRENT": lambda xid: ["--execution", OTHER_ID],
+    "EXECUTION_NOT_FOUND": lambda xid: ["--execution", "not-an-id"],
+}
+
+
+def _graph_env(box):
+    path = box.root / "task-graph-sandbox" / "tasks.json"
+    path.parent.mkdir(exist_ok=True)
+    return path, {"CREWVIA_TASK_GRAPH": "1", "CREWVIA_TASK_GRAPH_FILE": str(path)}
+
+
+@pytest.mark.parametrize("code", list(GRAPH_REFUSALS))
+def test_refusals_do_not_regenerate_the_task_graph(box, code):
+    xid = take(box)
+    path, env = _graph_env(box)
+    path.write_text("SENTINEL")
+    p = run(box, *report_argv("done"), *GRAPH_REFUSALS[code](xid), env=env)
+    assert p.returncode == 3 and last_error_code(p.stderr) == code, (p.stdout, p.stderr)
+    assert path.read_text() == "SENTINEL"                                # 書かれていない (sha256 不変)
+
+
+def test_already_terminal_refusal_does_not_regenerate_the_task_graph(box):
+    xid = take(box)
+    assert run(box, *report_argv("done"), "--execution", xid).returncode == 0
+    path, env = _graph_env(box)
+    path.write_text("SENTINEL")
+    p = run(box, *report_argv("fail"), "--execution", xid, env=env)
+    assert p.returncode == 3 and last_error_code(p.stderr) == "EXECUTION_ALREADY_TERMINAL", p.stderr
+    assert path.read_text() == "SENTINEL"
+
+
+def test_positive_control_a_successful_report_regenerates_the_task_graph(box):
+    """陰性の検査 (上の SENTINEL 不変) が意味を持つ対照: グラフが有効なら、通った報告は SENTINEL を書き換える。"""
+    xid = take(box)
+    path, env = _graph_env(box)
+    path.write_text("SENTINEL")
+    p = run(box, *report_argv("done"), "--execution", xid, env=env)
+    assert p.returncode == 0, p.stderr
+    assert path.read_text() != "SENTINEL"

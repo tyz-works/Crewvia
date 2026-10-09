@@ -56,8 +56,22 @@ class Runner:
             env["AGENT_NAME"] = agent
         return env
 
+    def named(self, args):
+        """E5 PR-2: 実行中の試行がある task への報告は名乗りが要る。この scenario の Worker は自分の試行の ID を知っている
+        (card が持つ ID。cutover 前の版には欄が無いので何も足さない) ので、報告に `--execution` を足す。
+        ログの `cmd` は足す前の引数で作る (golden と同じ文字列)。"""
+        if len(args) < 2 or args[0] not in ("done", "fail", "needs-director", "ready-for-verification", "verifying",
+                                            "verify-result") or "--execution" in args:
+            return args
+        try:
+            xid = self.field(args[1], "current_execution_id")
+            active = self.field(args[1], "execution_status") in ("reserved", "running")
+        except (OSError, IndexError):
+            return args
+        return (*args, "--execution", xid) if xid and active else args
+
     def run(self, *args, agent=None, label=None):
-        p = subprocess.run([str(self.plan), *args], env=self.env(agent), capture_output=True, text=True,
+        p = subprocess.run([str(self.plan), *self.named(args)], env=self.env(agent), capture_output=True, text=True,
                            timeout=120)
         self.log.append({
             "cmd": label or " ".join(args),

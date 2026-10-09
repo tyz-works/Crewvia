@@ -1,14 +1,14 @@
-"""E5 PR-1 (t005): 名乗りなしの報告に警告を出す。**plan.sh の判定 (通す / 拒否) は変えない**。
+"""E5 の呼び出し側の支え: 名乗りなしの報告の拒否 (PR-2) と、名乗りを促す指示文 (PR-1)。
 
-設計: `knowledge/execution.md` §20.2・§20.4 の 2 / 3 / 5・§20.5 の決定 2 (警告は stderr のみ)。受入条件:
+設計: `knowledge/execution.md` §20.2・§20.3・§20.4・§20.10。受入条件:
 
-1. 名乗りなし × active な試行 × 報告 (done / fail / needs-director / ready-for-verification / verify-result) → stderr に固定の 1 行。exit 0
-2. 名乗れば出ない
-3. **出ても書き込みは今と同じ**: card・record・監査の行・queue 全体が、警告の有無以外では変わらない (名乗りなしの結果 == E3 の結果)
-4. 警告が出ない場面: 試行なしの card・DETACHED・`update --reset` / `retire` (対象外)
-5. pull は stderr に「報告には --execution ex-… を付ける」を 1 行足す。stdout の JSON は変えない
-6. dispatcher の割り当て文・start.sh の起動文が `--execution` に触れる
-7. `kai-review.sh --skip-pull` は card の current_execution_id を読んで名乗る (`--execution` で上書きもできる。読めなければ警告)
+1. 名乗りなし × active な試行 × 報告 (done / fail / needs-director / ready-for-verification / verifying / verify-result)
+   → exit 3・`error_code=EXECUTION_REQUIRED`。**何も書かない** (queue 全体のバイト列が不変・監査は `refused:EXECUTION_REQUIRED` の 1 行)
+2. 名乗れば今までどおり通る (flag でも env でも)。警告は無い (PR-1 の警告は PR-2 で拒否に置き換わった)
+3. 対象外は通る: 試行なしの card・`update --reset` / Director の回復
+4. pull は stderr に「報告には --execution ex-… を付ける」を 1 行足す。stdout の JSON は変えない
+5. dispatcher の割り当て文・start.sh の起動文が `--execution` に触れる
+6. `kai-review.sh --skip-pull` は card の current_execution_id を読んで名乗る (`--execution` で上書きもできる。読めなければ警告)
 
 **本番の queue / registry / mux には触れない** (`execution_e3_helpers` が `Box` で隔離する)。
 """
@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import stat
 import subprocess
 from pathlib import Path
@@ -25,11 +24,11 @@ from pathlib import Path
 import pytest
 
 import execution_e3_helpers as e3
-from execution_e3_helpers import (MISSION, Box, audit_rows_for, legacy_in_progress, report_argv, run, set_card, take)
+from execution_e3_helpers import (MISSION, Box, audit_rows_for, last_error_code, legacy_in_progress, refusals,
+                                  report_argv, run, set_card, take)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-WARNING = ("[plan.sh] 名乗りなしで報告しました (execution id を --execution で渡してください)。"
-           "将来は拒否されます")
+OLD_WARNING = "名乗りなしで報告しました"                                  # PR-1 の警告 (PR-2 で消えた)
 OUTCOME = {
     "done": ("completed", "DONE", "done"),
     "fail": ("failed", "WORKER_FAILED", "failed"),
@@ -49,30 +48,35 @@ def card_outcome(box, tid="t001"):
     return m["execution_status"], m.get("execution_end_code"), m["status"]
 
 
-def warnings_in(stderr):
-    return [ln for ln in stderr.splitlines() if "名乗りなしで報告しました" in ln]
-
-
 # ---------------------------------------------------------------------------
-# 1〜3. 警告が出る / 名乗れば出ない / 出ても結果は同じ
+# 1〜2. 名乗りなしは拒否 (何も書かない) / 名乗れば通る
 # ---------------------------------------------------------------------------
+
+def assert_required_refusal(box, p, command, before):
+    assert p.returncode == 3, (p.stdout, p.stderr)
+    assert last_error_code(p.stderr) == "EXECUTION_REQUIRED", p.stderr
+    assert "--execution" in p.stderr and OLD_WARNING not in p.stderr
+    assert box.snapshot() == before                                       # card・record・枠・identity は 1 バイトも変わらない
+    rows = refusals(box, command)
+    assert len(rows) == 1 and rows[0]["result"] == "refused:EXECUTION_REQUIRED", rows
+
 
 @pytest.mark.parametrize("command", REPORTS)
-def test_unnamed_report_on_an_active_attempt_warns_once_and_still_passes(box, command):
+def test_unnamed_report_on_an_active_attempt_is_refused_and_writes_nothing(box, command):
     take(box)
+    before = box.snapshot()
     p = run(box, *report_argv(command))
-    assert p.returncode == 0, (p.stdout, p.stderr)
-    assert warnings_in(p.stderr) == [WARNING], p.stderr
-    assert card_outcome(box) == OUTCOME[command]
-    assert [r["caller_check"] for r in audit_rows_for(box, command)] == ["unverified"]
+    assert_required_refusal(box, p, command, before)
+    assert card_outcome(box) == ("running", None, "in_progress")
 
 
 @pytest.mark.parametrize("command", REPORTS)
-def test_naming_the_attempt_does_not_warn(box, command):
+def test_naming_the_attempt_passes_without_a_warning(box, command):
     xid = take(box)
     p = run(box, *report_argv(command), "--execution", xid)
     assert p.returncode == 0, p.stderr
-    assert warnings_in(p.stderr) == []
+    assert OLD_WARNING not in p.stderr and "EXECUTION_REQUIRED" not in p.stderr
+    assert card_outcome(box) == OUTCOME[command]
     assert [r["caller_check"] for r in audit_rows_for(box, command)] == ["verified"]
 
 
@@ -81,85 +85,84 @@ def test_the_environment_variable_counts_as_naming(box, command):
     xid = take(box)
     p = run(box, *report_argv(command), env={"CREWVIA_EXECUTION_ID": xid})
     assert p.returncode == 0, p.stderr
-    assert warnings_in(p.stderr) == []
+    assert OLD_WARNING not in p.stderr
 
 
-def _normalize(box, root):
-    """queue のバイト列から、名乗りの有無で変わってよい物 (試行 ID・時刻) を落とす。"""
-    out = {}
-    for path, data in sorted(box.snapshot().items()):
-        text = data.decode("utf-8", "replace") if isinstance(data, bytes) else str(data)
-        text = re.sub(r"ex-[0-9a-f]{32}", "ex-X", text).replace(str(root), "ROOT")
-        text = re.sub(r"\d{4}-\d\d-\d\dT[\d:.]+(?:Z|[+-]\d\d:?\d\d)?", "T", text)
-        out[re.sub(r"ex-[0-9a-f]{32}", "ex-X", str(path))] = text
-    return out
+def test_the_refusal_names_identifiers_only(box):
+    """拒否文は固定文言 + slug/task id だけ。card の本文・他の欄を出さない (secret を仕込んで確かめる)。"""
+    take(box)
+    set_card(box, title=e3.SECRET)
+    p = run(box, *report_argv("done"))
+    assert p.returncode == 3 and e3.SECRET not in p.stdout + p.stderr
+    assert f"{MISSION}/t001" in p.stderr
+    assert all(e3.SECRET not in json.dumps(r) for r in box.audit_rows())
 
 
-@pytest.mark.parametrize("command", REPORTS)
-def test_the_warning_changes_nothing_but_stderr(tmp_path, command):
-    """同じ場面を 2 つ作り、片方は名乗り・片方は名乗りなしで報告する。queue は (ID・時刻を除いて) 同じ。
-    差は監査の `caller_check` だけ (verified / unverified)。"""
-    a = Box(tmp_path / "a", tasks=("t001",))
-    b = Box(tmp_path / "b", tasks=("t001",))
-    xa, xb = take(a), take(b)
-    pa = run(a, *report_argv(command), "--execution", xa)
-    pb = run(b, *report_argv(command))
-    assert pa.returncode == pb.returncode == 0
-    assert pa.stdout.replace(xa, "ex-X") == pb.stdout.replace(xb, "ex-X")
-    assert _normalize(a, tmp_path / "a") == _normalize(b, tmp_path / "b")
-    assert len(audit_rows_for(a)) == len(audit_rows_for(b))
-
-
-def test_verify_result_unnamed_warns_and_named_does_not(box):
+def test_verify_result_unnamed_is_refused_and_named_passes(box):
     xid = take(box)
     assert run(box, *report_argv("ready-for-verification"), "--execution", xid).returncode == 0
     assert run(box, *report_argv("verifying"), "--execution", xid, agent="verifier-dispatcher").returncode == 0
-    p = run(box, *report_argv("verify-pass"), agent="V1")
+    before = box.snapshot()
+    for verdict in ("verify-pass", "verify-fail", "verify-nhr"):
+        assert_required_refusal_for(box, run(box, *report_argv(verdict), agent="V1"), before)
+    p = run(box, *report_argv("verify-pass"), "--execution", xid, agent="V1")
     assert p.returncode == 0, p.stderr
-    assert warnings_in(p.stderr) == [WARNING]
     assert box.card()["status"] == "verified"
 
 
-def test_verifying_unnamed_warns(box):
+def assert_required_refusal_for(box, p, before):
+    assert p.returncode == 3 and last_error_code(p.stderr) == "EXECUTION_REQUIRED", (p.stdout, p.stderr)
+    assert box.snapshot() == before
+
+
+def test_verifying_unnamed_is_refused(box):
     xid = take(box)
     assert run(box, *report_argv("ready-for-verification"), "--execution", xid).returncode == 0
+    before = box.snapshot()
     p = run(box, *report_argv("verifying"), agent="verifier-dispatcher")
-    assert p.returncode == 0, p.stderr
-    assert warnings_in(p.stderr) == [WARNING]
+    assert_required_refusal(box, p, "verifying", before)
+    assert box.card()["status"] == "ready_for_verification"
 
 
-def test_a_refused_unnamed_report_does_not_warn(box):
-    """名乗りなしでも拒否される報告 (遷移の狭め) では「通った」警告を出さない。"""
+def test_the_director_is_not_exempt(box):
+    """§20.5 の決定 3: Director の done / fail / needs-director も名乗りが要る (例外経路を作らない)。"""
     take(box)
-    set_card(box, status="pending")
-    p = run(box, *report_argv("done"))
-    assert p.returncode != 0
-    assert warnings_in(p.stderr) == []
+    before = box.snapshot()
+    for command in ("done", "fail", "needs-director"):
+        p = run(box, *report_argv(command), agent="Sora")
+        assert p.returncode == 3 and last_error_code(p.stderr) == "EXECUTION_REQUIRED", (command, p.stderr)
+    assert box.snapshot() == before
 
 
 # ---------------------------------------------------------------------------
-# 4. 警告が出ない場面 (対象外)
+# 3. 対象外 (通る)
 # ---------------------------------------------------------------------------
 
-def test_a_card_without_an_attempt_does_not_warn(box):
+def test_a_card_without_an_attempt_still_passes_unnamed(box):
     legacy_in_progress(box, "t002", "Ren")
     p = run(box, *report_argv("done", "t002"))
     assert p.returncode == 0, p.stderr
-    assert warnings_in(p.stderr) == []
+    assert box.card("t002")["status"] == "done"
 
 
-def test_reset_and_the_director_recovery_do_not_warn(box):
+def test_reset_and_the_director_recovery_still_pass_unnamed(box):
     take(box)
     p = run(box, "update", "t001", "--status", "pending", "--reset", "--mission", MISSION, agent="Sora")
     assert p.returncode == 0, p.stderr
-    assert warnings_in(p.stderr) == []
+    assert "EXECUTION_REQUIRED" not in p.stderr
+    # 開き直した card への Director の done は名乗りなしで通る (試行は閉じている)
+    assert run(box, "update", "t001", "--status", "in_progress", "--reset", "--mission", MISSION, agent="Sora").returncode == 0
+    done = run(box, *report_argv("done"), agent="Sora")
+    assert done.returncode == 0, done.stderr
 
 
-def test_a_resend_naming_the_attempt_does_not_warn(box):
+def test_a_transition_refusal_after_the_claim_check_keeps_its_own_code(box):
+    """名乗りなし + active の拒否は遷移の検査より前。名乗れば遷移の拒否 (exit 2) が出る。"""
     xid = take(box)
-    assert run(box, *report_argv("done"), "--execution", xid).returncode == 0
-    again = run(box, *report_argv("done"), "--execution", xid)
-    assert again.returncode == 0 and warnings_in(again.stderr) == []
+    set_card(box, status="pending")
+    p = run(box, *report_argv("done"), "--execution", xid)
+    assert p.returncode in (2, 3), p.stderr
+    assert "EXECUTION_REQUIRED" not in p.stderr
 
 
 # ---------------------------------------------------------------------------

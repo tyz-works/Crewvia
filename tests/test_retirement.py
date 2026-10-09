@@ -157,6 +157,7 @@ import errno
 import fcntl
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -1914,6 +1915,20 @@ def test_verdict_logger_logs_reason_change_within_same_verdict(monkeypatch):
 import multiprocessing  # noqa: E402  (t025 群でのみ使う)
 
 
+def _named_report(sandbox, args):
+    """E5 PR-2: 実行中の試行がある task への報告は名乗りが要る。この fixture の Worker は自分の試行の ID を知っている
+    (sandbox が card に書いた値) ので、報告に `--execution` で付ける。名乗りが主題のテストは `--execution` を自分で渡す。"""
+    if len(args) < 2 or args[0] not in ("done", "fail", "needs-director", "ready-for-verification") or "--execution" in args:
+        return args
+    card = sandbox.queue / "missions" / SLUG / "tasks" / f"{args[1]}.md"
+    if not card.is_file():
+        return args
+    text = card.read_text()
+    xid = re.search(r"^current_execution_id: (ex-[0-9a-f]{32})$", text, re.M)
+    active = re.search(r"^execution_status: (reserved|running)$", text, re.M)
+    return [*args, "--execution", xid.group(1)] if xid and active else args
+
+
 def _plan(sandbox, *args, timeout=60):
     """sandbox の中で本物の plan.sh を回す。"""
     env = dict(os.environ)
@@ -1922,6 +1937,7 @@ def _plan(sandbox, *args, timeout=60):
     # 本番の Worker は必ずこれを持っている。無いと `plan.sh done` は
     # assignment を撤去しないので、fixture が本番より弱い状態を試してしまう。
     env["AGENT_NAME"] = AGENT
+    args = _named_report(sandbox, args)
     return subprocess.run(
         ["bash", str(sandbox.scripts / "plan.sh"), *args],
         env=env, capture_output=True, text=True, timeout=timeout,

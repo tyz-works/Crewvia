@@ -948,7 +948,8 @@ def test_pull_and_done_refresh_the_graph(sandbox):
     assert nodes[f"{MISSION}:t001"]["status"] == "running"
     assert nodes[f"{MISSION}:t001"]["pane_match"] == "Ren-worker"
 
-    r = sandbox.run("done", "t001", "done: https://example.invalid/pr/1")
+    xid = json.loads(r.stdout)["execution_id"]               # E5 PR-2: 自分の pull の execution_id を報告で名乗る
+    r = sandbox.run("done", "t001", "done: https://example.invalid/pr/1", "--execution", xid)
     assert r.returncode == 0, r.stderr
     nodes = _by_id(sandbox.read_graph())
     assert nodes[f"{MISSION}:t001"]["status"] == "done"

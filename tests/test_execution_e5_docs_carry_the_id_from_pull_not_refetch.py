@@ -44,8 +44,16 @@ def statements(text):
                     out.append((n, raw, m.group(1)))
         elif item[0] == "stmt":
             _k, n, raw, logical = item
-            if not logical.lstrip().startswith("#"):   # コメント行 (Director の代理報告の説明) は実行されない
+            body = logical.lstrip()
+            if not body.startswith("#"):
                 out.append((n, raw, logical))
+            else:
+                # コメント行は実行されないが、**例として書かれた報告コマンド** (`#   plan done … --execution …`。worker.md の
+                # Write が使えない skill 向けの形) は読者が写す。`#` を外した本文が報告コマンドで始まるものだけ文として見る
+                # (Director の代理報告の説明のような地の文のコメントは、報告コマンドで始まらないので対象外のまま)
+                example = body.lstrip("#").lstrip()
+                if re.match(REPORT, example):
+                    out.append((n, raw, example))
     return out
 
 
@@ -105,6 +113,15 @@ def test_control_each_refetch_route_is_flagged():
     assert _hits("`plan.sh status` の値を `plan.sh done t1 --execution X` に\n") == []   # 別々のインラインコード
     assert _hits("`plan.sh done t1 --execution \"$(plan status)\"` で\n") == [1]
     assert _hits("```bash\nplan status --mission m && plan done t1 --execution ex-1\n```\n") == [2]
+
+
+def test_control_commented_example_commands_are_checked_but_prose_comments_are_not():
+    # 例として書かれた報告コマンドのコメント行 (worker.md の `#   plan done … --execution …` の形)。取り直しなら赤
+    assert _hits("```bash\n#   plan done t1 --mission m --execution \"$(plan status)\"\n```\n") == [2]
+    assert _hits("```bash\n#   plan done t1 --mission m --execution \"$XID\"\n```\n") == [2]
+    assert _hits("```bash\n#   plan done t1 --mission m --execution ex-…\n```\n") == []
+    # 報告コマンドで始まらない地の文のコメントは、取り直しを説明していても対象外 (director.md の代理報告の説明)
+    assert _hits("```bash\n# → --execution: plan.sh status の値を渡す\n```\n") == []
 
 
 def test_control_literal_id_and_unrelated_source_pass():

@@ -1836,7 +1836,7 @@ verified の done は全部 Worker (Ren 22・Arjun 9・Luna 7・Kai-codex 4・Se
 ### 20.7 PR #287 の Codex P1 (t009): 報告の ID は自分の pull の JSON から持ち越す
 
 - **指摘**: 20.6 の手順 (「同じ呼び出しで `.crewvia-env` を source し直す」「`plan status` から取り直す」) は、Director の reset → 別 Worker の再 pull で `.crewvia-env` (plan.sh は worktree を再利用して**新しい試行の ID で上書き**する) と card の今の試行が置き換えの試行の ID になるため、古い Worker がその ID を名乗って照合を通り、置き換えの試行を done / fail できる。**§5.2 の捨てた案 (cwd の worktree の `.crewvia-env` を読んで補う) と同じ穴**で、20.6 はそれを手順として書いてしまっていた。
-- **決定**: 報告に使う ID は**その Worker 自身の pull の JSON の `execution_id` だけ**。pull の直後に控え、以後の報告には `--execution ex-…` を**リテラルで**書く (Bash の env は呼び出しごとに消えるので、会話の中で値を持ち越す)。`.crewvia-env` / `plan status` / card の `current_execution_id` から報告用の ID を**取り直す手順は agents/ skills/ README から全部消した** (worker.md の `$EXECUTION_ID` を使う例も `--execution ex-…` のリテラルに)。ID が分からなくなったら取り直さず、名乗りなしで報告する (今は警告で通る) か `needs-director` で Director に聞く。
+- **決定**: 報告に使う ID は**その Worker 自身の pull の JSON の `execution_id` だけ**。pull の直後に控え、以後の報告には `--execution ex-…` を**リテラルで**書く (Bash の env は呼び出しごとに消えるので、会話の中で値を持ち越す)。`.crewvia-env` / `plan status` / card の `current_execution_id` から報告用の ID を**取り直す手順は agents/ skills/ README から全部消した** (worker.md の `$EXECUTION_ID` を使う例も `--execution ex-…` のリテラルに)。ID が分からなくなったら取り直さず、`needs-director` で Director に聞く (**PR-2 から、名乗りなしの報告は実行中の試行に対して拒否される = §20.10**。それも名乗りなしでは拒否されるので、ID が全く分からないときは作業を止めて Director に直接報告する)。
 - **Director の代理報告は例外ではなく別物**: Director は `plan.sh status` で**見て判断した試行を名指し**する (§5.3)。Worker の「自分の報告の ID を取り直す」とは、名乗る主体と意味が違う (Director は reset 後ならその新しい試行を判断し直す立場)。文面でこの違いを書いた。
 - **kai-review.sh `--skip-pull`**: card を読むのは**起動時の 1 回だけ**で、`SKIP_EXECUTION_ID` / `EXEC_ARGS` に固定し、報告の時点で読み直さない。報告の時点で試行が替わっていれば、固定した ID を plan.sh が照合して exit 3 で拒否する (置き換えの試行を名乗って通ることは無い)。加えて、card の `worker` が自分 (`--agent`) と違うときは読まない (他の Worker が持つ試行を引き継がない)。`--execution <id>` を渡されたらそれを優先。
 - **構造テスト** `tests/test_execution_e5_docs_carry_the_id_from_pull_not_refetch.py`: agents/ skills/ の fenced code (コメント行・ヒアドキュメント本文を除く) と報告コマンドを含むインラインコードに、`--execution` へ変数/コマンド置換を渡す・`EXECUTION_ID` を env/コマンドから代入する・`source .crewvia-env` と報告が同じ文・`current_execution_id` を読む・`plan status` と `--execution` が同じ文、の形が無い。直す前の worker.md で 4 件・crewvia-qa SKILL.md で 1 件が赤。
@@ -1854,3 +1854,24 @@ verified の done は全部 Worker (Ren 22・Arjun 9・Luna 7・Kai-codex 4・Se
 - **P1 (kai-review.sh)**: `--pr 1 --task t001 --execution --dry-run` で `--dry-run` が `--execution` の値として食われ、dry-run の要求が消えて本物の pull を打っていた。直し方は 2 段。(1) 値が無い・次が `-` で始まるときは値を食わない (後続のオプションはそのまま解析される)。(2) 渡されたのに空、または `ex-<32 桁の小文字 16 進>` (`lib_execution.EXECUTION_ID_RE`。コピーせず import) でなければ、引数の解析の直後 (pull・card 読み・codex 起動の前) に exit 1。`--execution -x` は `-x` が未知のオプションとして拒否される (どちらでも副作用 0)。
 - **他のオプションの棚卸し (直さない・backlog)**: `--pr` / `--task` / `--mission` / `--model` / `--agent` は `"$2"` をそのまま取るので同じ型 (`--mission --dry-run` で MISSION_SLUG=`--dry-run`・dry-run を失う、`--model --dry-run` / `--agent --dry-run` も同様。値が無い末尾は `set -u` の unbound variable で exit 1)。`--skip-pull` / `--dry-run` は値を取らず対象外。
 - **構造テストの盲点**: `agents/` `skills/` を走査する 2 本のテストが、コメント行 `# … <<'RESULT_EOF' … RESULT_EOF` をヒアドキュメントの開始と読み、終端語が現れず worker.md の 677 行以降が未走査だった (`knowledge` の「コメント中の `<<X` が字句検出器を盲目にする」と同じ型)。字句の状態は `classify()` の 1 か所 (両テストが共有) にし、(a) 行頭 `#` は開始でない (b) fence が閉じたらヒアドキュメントを解除 (c) 本文として飛ばした行・閉じなかった開始を数える。`test_every_line_naming_a_report_command_is_scanned` が独立の素朴検出 (6 コマンドの名前を含む行) ⊆ 走査した行を検査し、走査漏れそのものを赤にする。盲点を開けて新しく赤になったのは worker.md の 2 行 (移行予告の `plan.sh ready-for-verification <task_id>` に `--execution ex-…` を足す / 引き継ぎ書テンプレートの `plan.sh fail --head` の言及を言い換え)。検出する例は 39 → 49 件。
+
+### 20.10 PR-2 の実績 (mission 20261009-e5-pr2-reject-unnamed t001): 名乗りなし + active の報告を `EXECUTION_REQUIRED` (exit 3) で拒否
+
+**merge は観察期間の明け (2026-10-15 20:33 JST 以降) まで保留** (ユーザー決定 2026-10-09)。PR は作って CI 緑・レビューまで進める。
+
+- **判定**: `lib_task_controller._authorize(require_name=…)` の「名乗りなし × ACTIVE」の分岐が `_refuse(EXECUTION_REQUIRED)`。`require_name` が立つのは報告の操作だけ
+  (`_finish` の `operation` が `_REPORT_OPERATIONS` = done / fail / needs-director / verify-result の pass・fail、と `mark_task` = ready-for-verification / verifying / verify-result の needs_human_review)。
+  retire・`update --reset`・pull の G1 の fail は `operation` が別 (または None) なので名乗りなしで通る。**試行なし・DETACHED・TERMINAL の名乗りなしも今のまま通る** (§20.3)。
+  拒否は遷移の検査より前 (名乗りなしで、遷移も不正な報告は `EXECUTION_REQUIRED` が先)。`dry_run` も同じ拒否。
+- **コード**: `lib_execution.EXECUTION_REQUIRED` (`EXIT_CODES` = 3・`AUDITED_REFUSALS` に追加)。拒否文は §20.3 の固定文言 + 識別子 (slug/task id) だけ。最後の行 `[plan.sh] error_code=EXECUTION_REQUIRED`。監査は `refused:EXECUTION_REQUIRED` の 1 行 (`presented` の欄は無い)。
+- **task-graph**: `plan.sh` の `_controller_die` が、照合の拒否 4 つ (`EXECUTION_REQUIRED` / `NOT_CURRENT` / `NOT_FOUND` / `ALREADY_TERMINAL`。`_NO_WRITE_REFUSALS`) を `UsageExit` で出す。
+  `die()` (普通の `SystemExit`) だと末尾の dispatch が task-graph を再生成していた。残りの `INVALID_TRANSITION` などは今までどおり `die()` (範囲外。pull の `_pull_controller_die` も触っていない)。
+- **PR-1 の警告を撤去**: `UNNAMED_WARNING` / `_warn_unnamed` は、名乗りなしの ACTIVE が拒否になって出る場面が無くなったので消した (死んだコードを残さない)。`unverified` の `caller_check` は `update --reset` が active な試行を閉じる行にだけ残る (§20.3 の `update`)。
+  PR-1 の警告のテスト 3 本 (`test_execution_e5_unnamed_report_warning.py` ほか 2 本) は、拒否のテストに置き換えた (`..._unnamed_report_refused.py` / `..._required_refusal_controller.py` / `..._report_gate_and_kai_review_flag.py`)。
+- **kai-review.sh** (§20.2 の表の「JSON が読めない」経路): 名乗りなしの done / needs-director が拒否されると、`set -e` で落ちて Kai-codex の card が in_progress のまま残り (assignment も残る)、codex-review が恒久に止まる。直し方は 2 つ。
+  (1) pull の JSON から `execution_id` を読めなかったとき、**今 pull したばかりの card の試行** (active・worker が自分) を起動時にこの 1 回だけ読んで名乗る (`read_card_execution_id`。`--skip-pull` と同じ読み方・報告の時点で読み直さない)。
+  (2) それも読めず報告が拒否されたら (exit 3)、拒否の終了コードをそのまま返し、Director の回復手順 (`plan.sh update <id> --status pending --reset`) を stderr に出し、review の Result の全文は消さずに残す (`report_refused_hint`)。
+  経路ごとの最終状態の表は t001 の Result。
+- **rollback**: revert → `scripts/sync-main-checkout.sh`。戻し先は名乗りなしを通す E3/E5 PR-1 のコードで、`--execution` も今どおり照合するので、別 PR の互換は不要 (戻しで新しく拒否される呼び出しが無い)。新しい `error_code` は plan.sh 以外が読まない。
+- **merge 後**: plan.sh は呼び出しごとに読み直されるので、拒否の挙動に dispatcher の restart は要らない (`lib_execution` を import する `lib_retirement` / `lib_daemon_watch` が受けた変更は定数 `EXECUTION_REQUIRED` の追加だけで、デーモンの判定は変わらない。`lib_task_controller` を import するデーモンは無い)。kai-review.sh も起動のたびに読み直す。起動済みの Worker は PR-1 の後に起動していること (§20.4 の観察の条件) が前提。
+- **範囲外 (直さない・Director 判断)**: plan.sh の `CREWVIA_EXECUTION_ID` env フォールバック (§20.7 末尾。`.crewvia-env` を source した呼び出しで `--execution` を付け忘れると、env の ID が名乗りになって通る = 既存の穴で PR-2 で広がらない。別 PR) / kai-review.sh の他オプションの値の欠落 (§20.9 の backlog) / `_pull_controller_die` の `UsageExit` 化。

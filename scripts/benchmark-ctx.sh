@@ -102,6 +102,12 @@ if [[ -z "$WORKER_NAME" ]]; then
         || echo "BenchWorker")
 fi
 
+# 名前は指示文の `--agent <名前>` にクォートなしで貼る。plan.sh pull が受け付けない名前・
+# シェルで形が変わる名前は、何も起動する前に止める (定義は lib_agent_name.py に 1 つ。コピーしない)。
+_name_problem=$(python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import lib_agent_name as m; print(m.shell_pasteable_agent_name_problem(sys.argv[2]) or "")' "$SCRIPT_DIR" "$WORKER_NAME") \
+    || die "worker 名の検証に失敗しました"
+[[ -z "$_name_problem" ]] || die "invalid worker name '${WORKER_NAME}': ${_name_problem}"
+
 GATE_FILE="/tmp/crewvia-bench-gate-${WORKER_NAME}"
 WORKER_WINDOW="${WORKER_NAME}-worker"
 RESTARTING_FLAG="$REPO_ROOT/queue/assignments/${WORKER_NAME}.restarting"

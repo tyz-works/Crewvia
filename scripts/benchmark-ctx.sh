@@ -102,6 +102,12 @@ if [[ -z "$WORKER_NAME" ]]; then
         || echo "BenchWorker")
 fi
 
+# 名前は指示文の `--agent <名前>` にクォートなしで貼る。plan.sh pull が受け付けない名前・
+# シェルで形が変わる名前は、何も起動する前に止める (定義は lib_agent_name.py に 1 つ。コピーしない)。
+_name_problem=$(python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import lib_agent_name as m; print(m.shell_pasteable_agent_name_problem(sys.argv[2]) or "")' "$SCRIPT_DIR" "$WORKER_NAME") \
+    || die "worker 名の検証に失敗しました"
+[[ -z "$_name_problem" ]] || die "invalid worker name '${WORKER_NAME}': ${_name_problem}"
+
 GATE_FILE="/tmp/crewvia-bench-gate-${WORKER_NAME}"
 WORKER_WINDOW="${WORKER_NAME}-worker"
 RESTARTING_FLAG="$REPO_ROOT/queue/assignments/${WORKER_NAME}.restarting"
@@ -215,7 +221,7 @@ settings['systemPrompt'] = (
     "Your cwd is the bench/fixture TypeScript project. "
     f"CREWVIA_REPO env var = {crewvia_repo} (use this for plan.sh calls).\n\n"
     "For each bench task:\n"
-    "1. Pull: $CREWVIA_REPO/scripts/plan.sh pull --task <id> --mission <mission>\n"
+    f"1. Pull: $CREWVIA_REPO/scripts/plan.sh pull --task <id> --mission <mission> --agent {agent_name}\n"
     "2. Read description; fix the TypeScript bug in src/\n"
     "3. Verify: npm test\n"
     "4. Commit: git add -A && git commit -m 'fix: <desc> (task/<id>)'\n"
@@ -281,7 +287,7 @@ _wait_for_task_done() {
 _send_task_kickoff() {
     local task_id="$1" mission="$2"
     # Use $CREWVIA_REPO absolute path — Worker CWD is bench/fixture, not crewvia root
-    local msg="タスク ${task_id} (mission=${mission}) を実行して。\$CREWVIA_REPO/scripts/plan.sh pull --task ${task_id} --mission ${mission} で取得後、作業→\$CREWVIA_REPO/scripts/plan.sh done で完了。"
+    local msg="タスク ${task_id} (mission=${mission}) を実行して。\$CREWVIA_REPO/scripts/plan.sh pull --task ${task_id} --mission ${mission} --agent ${WORKER_NAME} で取得後、作業→\$CREWVIA_REPO/scripts/plan.sh done で完了。"
     mux_send "$WORKER_WINDOW" "$msg"
     log "Kickoff sent: $task_id"
 }

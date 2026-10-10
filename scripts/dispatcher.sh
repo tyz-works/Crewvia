@@ -228,6 +228,8 @@ import lib_usage_limit  # noqa: E402
 # 判定 (t009 / #21)。定義はこのモジュールに 1 つだけ (`plan.sh pull` の target 照合と
 # 同じ正規形)。ここに Worker と task の target_dir の比較を書き戻さないこと。
 import lib_worker_target as _worker_target  # noqa: E402
+# 割り当て文に貼る Worker 名の検証 (plan.sh pull --agent が受け付ける形と同じ定義。コピーしない)。
+from lib_agent_name import shell_pasteable_agent_name_problem as _shell_pasteable_problem  # noqa: E402
 # 「ペインの裏で何かが走っているか」の定義 (watchdog の idle 判定と共有、B1 / #27)。
 # ここで /proc を読む分類を書き足さないこと — 2 か所に置くと答えが割れる。
 from lib_pane_process import classify_process_tree  # noqa: E402
@@ -1233,6 +1235,18 @@ def _director_name():
     """Return the name of the live Director window, falling back to 'Sora-director'."""
     names = _mux.list(suffix='-director')
     return names[0] if names else 'Sora-director'
+
+
+def pull_agent_flag(agent_name):
+    """割り当て文の `plan pull` に付ける ` --agent <名前>` (先頭に空白つき)。付けられない名前なら空文字。
+
+    pull が担当者なし (agent=null) で試行を始める事故は、Worker のシェルの AGENT_NAME が空だったことが原因。
+    文で名前を明示すれば env に頼らない。シェルに貼るので、plan.sh pull が拒否する名前
+    (agent_name_problem) や空白・引用符を含む名前は付けず従来の文にする — 壊れた文を送らない。
+    """
+    if _shell_pasteable_problem(agent_name):
+        return ''
+    return f' --agent {agent_name}'
 
 
 def tmux_send(target, message):
@@ -2673,7 +2687,7 @@ def dispatch():
             if should_notify(notify_key):
                 msg = (
                     f"タスク {task_id} (mission={slug}) を実行して。"
-                    f"plan pull --task {task_id} --mission {slug} で取得後、"
+                    f"plan pull --task {task_id} --mission {slug}{pull_agent_flag(agent_name)} で取得後、"
                     f"作業→plan done で完了。"
                     f"pull の JSON の execution_id を、完了・失敗・差し戻しの報告の "
                     f"--execution に渡すこと (Bash は呼び出しごとに env が消えるので、報告のたびに --execution ex-… を付ける)。"

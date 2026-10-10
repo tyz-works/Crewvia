@@ -37,6 +37,7 @@ def _run(tmp_path, name):
 
 @pytest.mark.parametrize("name", [
     "Bench Worker", "a;touch x", "$(touch x)", "`id`", "a'b", " Luna", "x.restarting", "x.identity", ".hidden", "a/b",
+    "-worker", "--help", "-",
 ])
 def test_invalid_worker_name_exits_1_before_any_side_effect(tmp_path, name):
     r, marker = _run(tmp_path, name)

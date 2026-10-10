@@ -39,6 +39,9 @@ def test_assignment_message_names_the_agent(repo):
     (" Luna", ""),
     ("Lu na", ""),
     ("Lu'na", ""),
+    ("-worker", ""),
+    ("--help", ""),
+    ("-", ""),
     ("a;rm", ""),
     (".hidden", ""),
     ("a/b", ""),
@@ -62,9 +65,9 @@ def test_the_name_rule_has_one_definition_shared_by_pull_and_the_dispatcher(repo
     assert lib_state_store.IDENTITY_SUFFIX == lib_agent_name.IDENTITY_SUFFIX
     _, ns = _cycle(repo)
     assert ns["_shell_pasteable_problem"] is lib_agent_name.shell_pasteable_agent_name_problem
-    # 純粋 lib: import するのは __future__ と標準ライブラリの shlex だけ (dispatcher が読んでも I/O も依存も増えない)
+    # 純粋 lib: import するのは __future__ と標準ライブラリの re だけ (dispatcher が読んでも I/O も依存も増えない)
     tree = ast.parse((TESTS_DIR.parent / "scripts" / "lib_agent_name.py").read_text())
     imports = [n for n in ast.walk(tree) if isinstance(n, (ast.Import, ast.ImportFrom))]
     assert all((isinstance(n, ast.ImportFrom) and n.module == "__future__")
-                   or (isinstance(n, ast.Import) and [a.name for a in n.names] == ["shlex"])
+                   or (isinstance(n, ast.Import) and [a.name for a in n.names] == ["re"])
                    for n in imports), imports

@@ -5,7 +5,7 @@
 dispatcher は State Store を import しない取り決め
 (`tests/test_state_store_callers.py`。名前が出ただけで呼び出し元と数える) なので、規則だけをここに置く。
 
-このモジュールは **データと純粋関数だけ** を持つ (I/O なし・標準ライブラリ以外を
+このモジュールは **データと純粋関数だけ** を持つ (I/O なし・標準ライブラリの re 以外を
 import しない)。State Store は同じ名前で re-export する (plan.sh の
 `_STORE.agent_name_problem` 等はそのまま)。
 
@@ -15,7 +15,7 @@ registry の記録のファイル名) で、ここには寄せていない。
 
 from __future__ import annotations
 
-import shlex
+import re
 
 IDENTITY_SUFFIX = '.identity'
 #: assignments ディレクトリで別の意味を持つ suffix。Worker 名として使わせない。
@@ -33,15 +33,25 @@ def agent_name_problem(agent):
     return None
 
 
+#: 指示文の `--agent <名前>` にクォートなしで貼ってよい名前の**正の形** (許可リスト)。
+#: 英数字で始まり、英数字・`_`・`.`・`-` だけ。先頭が `-` だと plan.sh の parse_opts が option と読んで
+#: 拒否し、空白・`;`・`$(...)` はシェルで形が変わる。拒否する形を足していくのをやめて、通す形を 1 つ決める。
+#: 本番の Worker 名 (config/worker-names.yaml・registry/workers.yaml・`Kai-codex` 等) は全部この形で、
+#: tests/test_agent_name_pull_roundtrip.py が確かめている。
+PASTEABLE_AGENT_NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]*')
+
+
 def shell_pasteable_agent_name_problem(agent):
     """Worker 名を指示文の `--agent <名前>` にクォートなしで貼れない理由。貼れるなら None。
 
-    `agent_name_problem` に加え、前後の空白・シェルで形が変わる名前 (空白・`;`・`$(...)` など) を断る。
-    dispatcher の `pull_agent_flag` と benchmark-ctx.sh が同じ答えになるよう、ここに 1 つだけ置く。
+    `agent_name_problem` (assignment のファイル名として使えるか) に加え、`PASTEABLE_AGENT_NAME` の
+    許可リストに合わない名前を断る。dispatcher の `pull_agent_flag` と benchmark-ctx.sh が同じ答えに
+    なるよう、ここに 1 つだけ置く。通した名前が `plan.sh pull` の引数解析で同じ名前として
+    受理されることは、往復の性質テストが本物の parse_opts で確かめる。
     """
     problem = agent_name_problem(agent)
     if problem:
         return problem
-    if not agent.strip() or agent != agent.strip() or shlex.quote(agent) != agent:
-        return "空白・引用符・シェルのメタ文字を含まない名前にしてください"
+    if not PASTEABLE_AGENT_NAME.fullmatch(agent):
+        return "英数字で始まり、英数字・'_'・'.'・'-' だけの名前にしてください (空白・引用符・シェルのメタ文字・先頭の '-' は不可)"
     return None

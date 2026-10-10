@@ -17,17 +17,10 @@ import pytest
 TESTS_DIR = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(TESTS_DIR))
 
-from test_assignment_routing import _set_card, _cycle, _kickoffs  # noqa: E402,F401
-from test_dispatcher_retirement_exclusion import AGENT, _build_repo, _load_dispatcher  # noqa: E402
-
-
-@pytest.fixture
-def repo(tmp_path):
-    root = _build_repo(tmp_path)
-    (root / "registry" / "workers.yaml").write_text(
-        f"workers:\n  - name: {AGENT}\n    skills: [code]\n    experience: 0\n"
-        "  - name: Sora\n    skills: [director]\n    role: director\n    experience: 0\n")
-    return root
+# `repo` (idle Worker 1 人 + Director の使い捨て registry) は test_assignment_routing の fixture を使う。
+# ここで registry を組み立て直さない (scripts/test_registry_lock.sh の静的検査の除外を増やさない)。
+from test_assignment_routing import _set_card, _cycle, _kickoffs, repo  # noqa: E402,F401
+from test_dispatcher_retirement_exclusion import AGENT  # noqa: E402
 
 
 def test_assignment_message_names_the_agent(repo):

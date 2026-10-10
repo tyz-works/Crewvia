@@ -790,7 +790,7 @@ Director が `sync-main-checkout.sh` で ff + 両デーモン再起動 (3 点の
 
 **網羅テスト** (`tests/test_suppression_notifier_model.py`): 出来事 11 種 (S_unk / S_exe / S_awh / recover / restart / write_fail / delete_fail / delete_raise / new_exec / vanish / tick。故障の 3 種は次のサイクルに効く) の**長さ 5 までの全ての並び** + 出来事を絞った全列挙 3 組 (長さ 6〜7) + seed 固定のランダム列 (長さ 6〜14)。実際の `SuppressedIdleNotifier` と tmp の台帳ファイルに流し、毎ステップ I1〜I5 を assert する。全 11 種の長さ 6 は 177 万並びで重いので、深い並びは出来事を絞って稼ぐ (閉じる掃除の失敗 → 再発 → 通知は長さ 6〜7 でないと現れず、最初は長さ 5 の全列挙だけで見逃した)。約 3 分。
 
-**既知の穴 (I2 から外している)**: 回復の掃除が失敗したまま watchdog が再起動し、同じ Execution ID で見送りが再発すると、古いキーが通知を黙らせる (掃除が成功するまで。`_unsettled` はプロセス内の状態で、再起動で失う)。掃除は毎サイクル台帳を読んでやり直すので、窓は「台帳の削除が失敗し続けている間」だけ。台帳に episode の印を持たせれば塞げるが、台帳の形を変えるので見送った。
+**既知の穴 (I2 から外している)**: 回復の掃除が失敗したまま watchdog が再起動し、同じ Execution ID で見送りが再発すると、古いキーが通知を黙らせる (掃除が成功するまで。`_unsettled` はプロセス内の状態で、再起動で失う)。掃除は毎サイクル台帳を読んでやり直すので、窓は「台帳の削除が失敗し続けている間」だけ。台帳に episode の印を持たせれば塞げるが、台帳の形を変えるので見送った。**→ §11-15 で訂正と設計**: 実測では、閉じるサイクルで 1 回削除に失敗すれば足り、再起動後は episode が終わるまで黙る。塞ぎ方は fp に無音区間の起点を足すもので、台帳の形は変えない。
 
 **5 巡目 (t017) の指摘と、t006 で見つかった連投 (t018 で修正)**: Codex 5 巡目の P2「新しい通知を記録する前に `_unsettled` を解け」は当初 backlog (「黙るだけ」) としたが、最終レビュー (t006) で前提が違うと分かった — 回復時と再発後 ~600 秒の間、台帳の削除が失敗し続けた後に成功すると、新しいキーを記録した同じ plan で `_unsettled` が解けず、次のサイクルからそのキーを閉じた episode のものとして消して再送し、回復か max まで毎サイクル通知した。`observe` で通知する plan のとき `_unsettled` を解く 2 行で直した (削除がまだ失敗していれば古い fp が一致して黙る = 上の既知の穴に戻るだけ)。網羅テストが見逃したのは、この並びが長さ 9 で、全列挙 (長さ 5) と絞った列挙 (長さ 6〜7) の長さの外にあったため。名指しのテスト `test_a_deletion_that_recovers_after_a_relapse_does_not_renotify_every_cycle` と red_proof「【5 巡目 t017】」を足した。
 
@@ -813,3 +813,78 @@ Director が `sync-main-checkout.sh` で ff + 両デーモン再起動 (3 点の
 
 限界: これは job が居る木での確認で、**job の無い木で zombie だけが残る形が `idle_process` になること** (今回の主因 A の直り) は、本番では測っていない (Worker が動いている間は Bash tool 自身が job になるので、自分では作れない)。そこは `tests/test_hard_idle_suppression_unknown_zombie.py` の実プロセステストが根拠。
 次に本物の hard_idle が起きたとき、通知文の `pid / state / errno` が A〜D の確定材料になる。
+
+**11-15. 見送り通知の既知の穴 (台帳削除の失敗中に再起動 → 黙る) を塞ぐ (設計, 2026-10-11, mission 20261011-small-backlog-agent-flag-and-suppression-hole t004。実装は t006)**
+
+**11-15-1. 穴の正確な形 (実測で §11-13 の記述を訂正する)**: §11-13 は窓を「台帳の削除が失敗し続けている間」と書いたが、実物の `SuppressedIdleNotifier` と網羅テストの Harness で並びを流すと、**削除の失敗は閉じるサイクルの 1 回で足り、再起動のあと黙りは episode が終わるまで続く**。再起動後のプロセスは `_unsettled` を持たず、Worker は監視中で見送り中なので `forget` も `cycle` の孤児掃除も来ない。誰も削除をやり直さない。
+
+| 並び (Harness の出来事) | 長さ | 通知 | 結果 |
+|---|---|---|---|
+| `S_unk tick delete_fail recover restart S_unk tick` | 7 | 1 | **episode 2 が黙る** (最短の再現) |
+| 同上 + `S_unk tick S_unk` | 10 | 1 | 3 サイクル後も黙ったまま。台帳のキーも残る |
+| `S_unk tick delete_fail recover restart delete_fail S_unk tick` | 8 | 1 | 再発のサイクルでも削除が失敗する形。黙る |
+| `S_unk tick delete_fail vanish restart S_unk tick` | 7 | 1 | 消滅 → 同じ試行で再び監視される形。黙る |
+| `S_unk tick delete_fail recover restart S_exe tick` | 7 | 2 | 違う理由は黙らない。ただし古い `process_unknown` のキーが残る (後で unknown に戻れば黙る) |
+| `S_unk tick delete_fail recover recover restart S_unk tick` | 8 | 2 | 再起動前に削除をやり直せた。黙らない |
+| `S_unk tick delete_fail recover restart recover S_unk tick` | 8 | 2 | 再起動後に回復を観測して消せた。黙らない |
+| `S_unk tick delete_fail recover restart new_exec tick` | 7 | 1 | 新しい試行は見送りでない (alive)。回復の観測で古いキーが消え、episode 2 は始まっていない (正しい) |
+| `S_unk tick delete_fail recover S_unk tick` | 6 | 2 | 再起動なし。`_unsettled` が効いて黙らない |
+
+穴が開く条件は次の 3 つの AND。どれも本番で現実にありうる。
+1. episode を閉じたサイクルの `told_forget` が失敗する。主な原因は `told_lock` の 2 秒待ち切れで、dispatcher と取り合う。台帳が**読めない**ときは穴にならない: 再起動後の `plan_suppression` は `told=None` で通知する側に倒れる。
+2. 削除をやり直す前に watchdog が再起動する。merge のたびの `sync-main-checkout.sh` と flap の respawn。
+3. 同じ Execution ID で、同じ理由の見送りが再発する。
+
+**11-15-2. 塞ぎ方の案**
+
+| | A. fp に「無音区間の起点」を足す (推奨) | B. 閉じた印を台帳に書く | C. 閉じた印を別ファイルに書く (`_unsettled` の永続化) | D. 再起動後は同じ試行の残りキーを信用しない |
+|---|---|---|---|---|
+| やること | fp を `<Execution ID>:<kind>` から `<Execution ID>:<kind>@<起点>` にする。起点は `check_detail()` が idle の計算に使う `activity_mtime` (floor・利用枠の floor を適用した後) の整数秒。台帳キーは変えない | 閉じるとき、キーを消す代わりに entry に `closed` を書く (または fp を `…:closed` に書き換える) | `registry/daemons/` に watchdog 専用の小さなファイルを足し、閉じた Worker を記録する。消せたら外す | 起動後の最初の観測で、同じ試行のキーが残っていたら (出どころが分からないので) 居ないものとして再通知する |
+| 台帳の形の変化 | なし (fp の値が伸びるだけ。`TOLD_ENTRY_FIELDS` も検証も同じ) | entry に欄が増える。または fp の意味が変わる | 台帳は変えない。ファイルが 1 つ増える (CLAUDE.md 不変条件 7 の「消してよい」一覧に足す) | なし |
+| 新コードが旧キーを読む | 旧 fp (起点なし) は新 fp と一致しない。merge 時に通知済みの episode があれば 1 回だけ再通知する (再送側) | 旧 entry に印が無いので「閉じていない」= 黙る。今の穴が残るだけ | 印のファイルが無い = 閉じた Worker は居ない。今の穴が残るだけ | 再起動直後に 1 回だけ再通知する |
+| rollback で旧コードが新キーを読む | 旧コードの比較 `told[key] == "<ID>:<kind>"` が一致しない。1 回だけ再通知して上書きする。古い試行の掃除 `startswith("<ID>:")` は同じに動く | 旧コードは印を読まない。`closed` の entry を通知済みとみなして黙る = 今の穴 | 旧コードはファイルを読まない。孤児ファイルが残る (消してよい) | 変化なし |
+| 書き込み失敗時の倒れ方 | fp の記録失敗は今と同じで、次のサイクルで再送する (I1 の除外)。起点が観測できないとき `_last_activity_mtime()` は `now` を返し、idle≈0 で見送りにならないので、起点の無い見送りは生じない | 印の書き込みは削除と同じファイル・同じロックなので、**削除が失敗する条件 (ロック・書けない) でそのまま失敗する**。穴が塞がらない | ロックは取り合わない。それでも置き場が書けない (ディスク・権限) と失敗し、そのときは黙る側に倒れる。読めないときは「閉じた」とみなし通知する側 | 再起動のたびに、通知済みの見送り中 Worker × 理由ぶん 1 通ずつ重なる (連投側。flap なら 15 分に 3 回) |
+| I1〜I5 への影響 | I1 は変えない。I2 の除外を「同じ無音区間 + 再起動」の 1 つに狭める (11-15-3) | 変えない (塞がらないので I2 の除外も残る) | I2 の除外を「印のファイルが書けなかった」に置き換える | **I1 を破る** (再起動で再通知) |
+| 判定 | 外部に永続している観測 (ファイルの mtime・card の `started_at`) から episode を識別するので、プロセス内の状態に頼らない。§11-13 の「永続の状態は台帳だけ」に沿う | 却下: 失敗の原因が同じなので塞がらない | 却下: 2 つ目の永続状態が台帳と食い違う組み合わせ (印あり・キーなし等) を新たに作る。§11-13 で 1 つにまとめた状態をまた散らす | 却下: 黙りの代わりに再起動のたびの重複。I1 を変える理由が弱い |
+
+**A が塞げる理由**: 見送りは `idle_seconds > idle_threshold × 2` のときだけ起きる。activity / heartbeat / 通知のどれかが動けば idle は 0 に戻り、見送りでなくなる (episode が閉じる)。つまり 1 つの見送り区間の中で `activity_mtime` は変わらず、回復を挟んで再発すれば必ず新しい値になる。再起動をまたいでも同じ値になる: floor は card の `started_at` (`monitoring_since`) で、ファイルの mtime もプロセスの外にある。
+
+**A でも残るもの (I2 の唯一の例外。同じ無音区間はすでに伝えてある)**: 閉じた原因が活動ではない場合、たとえば `hard_idle` の terminate を判定したが Worker が残った、または消滅したあと同じ試行で再び監視された、で起点が変わらない場合。このとき削除失敗 + 再起動 + 再発の並びは黙る。ただし Director は**同じ無音区間・同じ理由**で通知を受けている。黙っても「Director が知らない見送り」は生じない。同じ形を再起動なしで踏んだ場合は `_unsettled` が今どおり再通知する。
+- 起点が再起動で変わる例外: `_limit_floor` (利用枠切れの免除) はプロセス内の状態なので、免除を挟んだ無音区間で再起動すると起点が変わり、1 回だけ再通知する (連投側)。card に `started_at` が無い試行は floor がオブジェクトの生成時刻になる (§8 の `min()`) ので、無音区間に一度も信号が無いまま再起動すると同じく 1 回だけ再通知する。どちらも重複 1 通で、黙る側には倒れない。
+
+**11-15-3. 推奨 (A) と t006 が守る不変条件**
+
+実装の範囲 (t006):
+1. `WorkerMonitor.check_detail()` が `activity_mtime` (floor と `_limit_floor` を適用した後の値) を monitor の属性に残す (例 `self.idle_since`。毎回上書き)。`CheckResult` の形は変えない。観測ログ・テストの 14 か所が位置引数で組み立てているため。
+2. fp を作るのは 1 か所 (`suppression_fp(kind, idle_since)` か `plan_suppression` の中。どちらか一方): `f"{ident}:{kind}@{int(idle_since)}"`。`idle_since` が None (check_detail を通っていない monitor) なら今の `f"{ident}:{kind}"`。`plan_suppression` には起点を引数で渡す (純粋関数のまま)。
+3. 古い試行の掃除 (`not str(v).startswith(f"{ident}:")`)・キーの形・`_split_suppression_key`・`_unsettled` は**変えない**。`_unsettled` は活動なしで閉じた episode の再発 (再起動なし) をまだ受け持つ。
+4. env の停止スイッチは付けない。台帳は「消してよい = 再通知」のまま。書き手・ロックは変えない (`told_record` / `told_forget` が `told_lock` の中)。
+
+不変条件 (§11-13 の I1〜I5 を改める。網羅テストの docstring も同じ文に):
+- **I1** 同じ (Execution ID, episode, 理由) の通知は最大 1 回 (台帳への書き込みが失敗した通知は除く)。**変えない。**
+- **I2** episode 内である理由の見送りが、プロセスが観測した範囲で 600 秒続き、台帳の書き込み・削除が成功していれば、その理由の通知が出ている。**例外は 1 つだけ**: その episode が前の episode と同じ無音区間 (起点が同じ) で、間に再起動を挟み、前の episode で同じ理由の通知が出ている場合 (同じ無音区間を Director は知っている)。§11-13 の「回復の掃除失敗 + 再起動 + 再発」の除外 (`blocked_episodes`) は**撤去する**。
+- **I3〜I5** 変えない。
+
+**11-15-4. 網羅テスト (`tests/test_suppression_notifier_model.py`) に足すもの**
+- Harness に無音区間の時計を持たせる: `clock`。`recover` と `new_exec` で `clock = t` (活動または新しい試行)。見送りの出来事・`tick`・`restart` では動かさない。`_monitor()` は観測の前に monitor の起点の属性を `clock` にする。今は `idle_seconds=3700` 固定の CheckResult を渡しているので、起点は Harness の時計から渡す (`now - 3700` から逆算すると毎サイクル変わり、I1 を偽の赤にする)。
+- 出来事を 1 つ足す: `quiet_close`。見送りでない判定 (`terminate` / `hard_idle`) で `clock` を動かさない = 活動なしで閉じる。`vanish` も `clock` を動かさない。
+- `blocked_episodes` を撤去し、I2 の例外を 11-15-3 の 1 つに置き換える (前の episode と同じ `clock`・間に `restart`・前の episode で同じ理由を通知済み)。
+- **今回の穴を再現する最短の並び**: `S_unk tick delete_fail recover restart S_unk tick` (長さ 7。`delete_fail` は自分ではサイクルを回さない修飾子)。いまの「cleanup-and-relapse」(`S_exe tick recover delete_fail restart`、長さ 5〜7) はこの形 (`S_exe` 版) をすでに含む。今は `blocked_episodes` で I2 から外れているだけなので、除外を撤去すればこの列挙が穴を捕まえる。長さの範囲は 7 のままで足りる。
+- 新しい絞った列挙 `quiet-close-and-relapse`: (`S_exe`, `tick`, `quiet_close`, `delete_fail`, `restart`) を長さ 5〜7。残る形 (活動なしで閉じる → 削除失敗 → 再起動 → 再発) が I2 の例外にだけ入り、それ以外では通知が出ることを確かめる。
+- 名指しのテスト 3 本 (列挙の長さを超える・意味を固定する):
+  - `S_unk tick delete_fail recover restart S_unk tick S_unk tick S_unk` (長さ 10): 通知 2 通。黙りが episode の終わりまで続く形の留め金
+  - `S_unk tick delete_fail recover restart delete_fail S_unk tick` (長さ 8): 再発のサイクルでも削除が失敗する。通知 2 通
+  - `S_unk tick delete_fail vanish restart S_unk tick` (長さ 7): 活動なしの消滅。通知 1 通 (I2 の例外が効く形として固定する)
+- 所要時間 (2026-10-11 実測、このファイルの 12 件で 177.7 秒): 全 11 種の長さ 5 の全列挙が 61.9 秒、`cleanup-and-relapse` 54.1 秒、`reasons-and-attempts` 34.6 秒、`failures-on-close` 23.4 秒、残りは 1 秒未満。`quiet_close` を全列挙に入れると 12 種の長さ 5 = 248,832 並びで、今の 161,051 の約 1.5 倍 (見込み約 93 秒)。新しい絞った列挙は `cleanup-and-relapse` と同じ規模 (5 種・長さ 5〜7) で約 54 秒。合計は約 4.4 分の見込み。t006 は実測し、5 分を超えるなら `quiet_close` を全列挙から外して絞った列挙だけで受ける。
+
+**11-15-5. 赤の実証 (`tests/red_proof_hard_idle_unknown.py` に足す)**
+- 「【11-15 t006】fp に起点を足さない」: `suppression_fp` (または plan_suppression の fp の組み立て) を `f"{ident}:{kind}"` に戻す → `test_every_sequence_over_a_reduced_alphabet_keeps_the_invariants[cleanup-and-relapse]` が **I2** で落ち、名指しの長さ 10 の並びも落ちる。
+- 「起点に毎サイクル変わる値を使う」: `idle_since` を `now - idle_seconds` に置き換える (または Harness に合わせて `self._now()`) → 長さ 5 の全列挙が **I1** で落ちる (理由ごとに 1 回が毎サイクルの再通知になる)。
+- 「I2 の例外を広げすぎる」の対照: 名指しの 3 本は通知の数を直接 assert する (I2 の例外の書き方に左右されない)。例外を「間に restart があれば許す」に緩めても、長さ 10 の並びの「2 通」が赤を出す。例外が穴を隠していないことの確認として、t006 の PR 本文に「1 つ目の欠陥を入れる → 名指しの長さ 10 が赤」を載せる。
+- 既存の「閉じた episode の古いキーを次の episode の前に消さない」(`unsettled=False`) は、A の後は `recover` の再発を fp の不一致でも止めるので、`cleanup-and-relapse` の I2 では赤にならなくなる。狙い先を `quiet-close-and-relapse` の **I2** (再起動なしで活動なしの再発) に付け替える。赤のまま残ることを t006 で確認する。
+
+**11-15-6. 戻し方**: PR を revert → `scripts/sync-main-checkout.sh`。**watchdog の restart が要る** (merge しても再起動まで古いコード。`sync-main-checkout.sh` が両デーモンを再起動する。dispatcher は fp を読まないが、まとめて再起動して構わない)。台帳に残った新形式の fp (`…@<起点>`) は旧コードでは一致しないので、通知済みの見送り中 Worker があれば理由ごとに 1 回だけ再通知して上書きされる (黙る側には倒れない)。気になるなら `hard-idle-suppressed_*` のキーを消してよい (無い = 再通知)。env の停止スイッチは無い。
+
+**11-15-7. Director の判断が要る分岐 (推奨つき。決めなくても t006 は推奨で進められる)**
+- (a) `_unsettled` を残すか: **推奨 = 残す**。A は活動で閉じた episode の穴を塞ぐが、活動なしで閉じた episode の再発 (再起動なし) はまだ `_unsettled` が受け持つ。外すと、その形でも同じ無音区間として黙る (I2 の例外を「再起動なし」にも広げることになる)。§11-13 の 5 巡目の連投は `_unsettled` から出たので、外すと状態は台帳だけになり単純になる。外すなら別 task に分け、I2 の例外の文を変える承認を取る。
+- (b) `quiet_close` を全列挙に入れるか: 11-15-4 の規則 (5 分) で t006 が決める。Director の判断は不要。

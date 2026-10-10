@@ -229,7 +229,7 @@ import lib_usage_limit  # noqa: E402
 # 同じ正規形)。ここに Worker と task の target_dir の比較を書き戻さないこと。
 import lib_worker_target as _worker_target  # noqa: E402
 # 割り当て文に貼る Worker 名の検証 (plan.sh pull --agent が受け付ける形と同じ定義。コピーしない)。
-from lib_state_store import agent_name_problem as _agent_name_problem  # noqa: E402
+from lib_agent_name import agent_name_problem as _agent_name_problem  # noqa: E402
 # 「ペインの裏で何かが走っているか」の定義 (watchdog の idle 判定と共有、B1 / #27)。
 # ここで /proc を読む分類を書き足さないこと — 2 か所に置くと答えが割れる。
 from lib_pane_process import classify_process_tree  # noqa: E402

@@ -55,3 +55,21 @@ def test_assignment_message_names_the_agent(repo):
 def test_pull_agent_flag_only_for_names_pull_accepts_and_shell_safe(repo, name, expected):
     _, ns = _cycle(repo)
     assert ns["pull_agent_flag"](name) == expected
+
+
+def test_the_name_rule_has_one_definition_shared_by_pull_and_the_dispatcher(repo):
+    """名前の規則は lib_agent_name の 1 つ (PR #294 Codex P2)。lib_state_store は同じ関数を re-export し
+    (plan.sh pull --agent の受け付け)、dispatcher は lib_state_store を import せずに同じ関数を使う。"""
+    sys.path.insert(0, str(TESTS_DIR.parent / "scripts"))
+    import ast
+    import lib_agent_name
+    import lib_state_store
+    assert lib_state_store.agent_name_problem is lib_agent_name.agent_name_problem
+    assert lib_state_store.RESERVED_AGENT_SUFFIXES is lib_agent_name.RESERVED_AGENT_SUFFIXES
+    assert lib_state_store.IDENTITY_SUFFIX == lib_agent_name.IDENTITY_SUFFIX
+    _, ns = _cycle(repo)
+    assert ns["_agent_name_problem"] is lib_agent_name.agent_name_problem
+    # 純粋 lib: import するのは __future__ だけ (dispatcher が読んでも I/O も依存も増えない)
+    tree = ast.parse((TESTS_DIR.parent / "scripts" / "lib_agent_name.py").read_text())
+    imports = [n for n in ast.walk(tree) if isinstance(n, (ast.Import, ast.ImportFrom))]
+    assert all(isinstance(n, ast.ImportFrom) and n.module == "__future__" for n in imports), imports

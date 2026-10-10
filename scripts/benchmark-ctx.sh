@@ -215,7 +215,7 @@ settings['systemPrompt'] = (
     "Your cwd is the bench/fixture TypeScript project. "
     f"CREWVIA_REPO env var = {crewvia_repo} (use this for plan.sh calls).\n\n"
     "For each bench task:\n"
-    "1. Pull: $CREWVIA_REPO/scripts/plan.sh pull --task <id> --mission <mission>\n"
+    f"1. Pull: $CREWVIA_REPO/scripts/plan.sh pull --task <id> --mission <mission> --agent {agent_name}\n"
     "2. Read description; fix the TypeScript bug in src/\n"
     "3. Verify: npm test\n"
     "4. Commit: git add -A && git commit -m 'fix: <desc> (task/<id>)'\n"
@@ -281,7 +281,7 @@ _wait_for_task_done() {
 _send_task_kickoff() {
     local task_id="$1" mission="$2"
     # Use $CREWVIA_REPO absolute path — Worker CWD is bench/fixture, not crewvia root
-    local msg="タスク ${task_id} (mission=${mission}) を実行して。\$CREWVIA_REPO/scripts/plan.sh pull --task ${task_id} --mission ${mission} で取得後、作業→\$CREWVIA_REPO/scripts/plan.sh done で完了。"
+    local msg="タスク ${task_id} (mission=${mission}) を実行して。\$CREWVIA_REPO/scripts/plan.sh pull --task ${task_id} --mission ${mission} --agent ${WORKER_NAME} で取得後、作業→\$CREWVIA_REPO/scripts/plan.sh done で完了。"
     mux_send "$WORKER_WINDOW" "$msg"
     log "Kickoff sent: $task_id"
 }

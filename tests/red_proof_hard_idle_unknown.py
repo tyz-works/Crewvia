@@ -70,7 +70,7 @@ MUTATIONS = [
     ("古い試行 (別 Execution ID) のキーを消さない", WD,
      '            and (not str(v).startswith(f"{ident}:") or (k in expected and v != expected[k])))',
      '            and False)',
-     [("test_every_sequence_up_to_length_5_keeps_the_invariants", "I4")]),
+     [("test_every_sequence_up_to_length_5_keeps_the_invariants", ("I4", "I6"))]),
     # --- §11-15 (t019): fp に無音区間の起点を足す ---
     ("【11-15 t019】fp に起点を足さない", WD,
      '    return f"{ident}:{kind}" if origin is None else f"{ident}:{kind}@{origin}"',

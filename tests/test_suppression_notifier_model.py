@@ -109,7 +109,8 @@ class Harness:
         self.interval = 0                               # 無音区間の通し番号 (新しい episode / 起点の変化で増える)
         self.last_origin: int | None = None             # 進行中の episode で最後に観測した起点
         self.origin: int | None = None                  # 今のサイクルの起点
-        self.told_fps: set[str] = set()                 # 台帳に記録できた通知の fp (起点つき。モデルの履歴)
+        self.restarts = 0
+        self.told_fps: dict[str, int] = {}              # 台帳に記録できた通知の fp (起点つき) -> 記録時の再起動の数
         # 実物のシグナルファイル (registry/notifications/<agent>/)。mtime は T0 から 1000 秒ずつ進める
         self.notif_dir = base / "registry" / "notifications" / AGENT
         self.notif_dir.mkdir(parents=True, exist_ok=True)   # 1 並びごとに作り直さない (mkdir が遅い環境がある)
@@ -194,6 +195,7 @@ class Harness:
             return
         if ev == "restart":
             self.notifier = self._new_notifier()
+            self.restarts += 1
             self.proc_since = None
             self.t += CYCLE
             return
@@ -278,7 +280,7 @@ class Harness:
                 triple = (int(ident[3:]), self.ep_key[1], self.interval, kind)
                 self.notified[triple] = self.notified.get(triple, 0) + 1
                 if recorded:
-                    self.told_fps.add(fp)
+                    self.told_fps[fp] = self.restarts
                 else:
                     self.unrecorded.add(triple)
                 # I1
@@ -289,8 +291,10 @@ class Harness:
             lasted = self.t - self.proc_since
             fp_now = f"{_exec_id(self.exec_n)}:{self.kind}@{self.origin}"
             key_now = watchdog.suppression_key(AGENT, self.kind)
-            # 例外 (§11-15-10): 今の起点つき fp が、前に記録できた通知のもので、台帳にまだ最新として残っている
-            told_before = fp_now in self.told_fps and ledger.get(key_now) == fp_now
+            # 例外 (§11-15-10): 今の起点つき fp が、前に記録できた通知のもので、台帳にまだ最新として残っていて、
+            # その記録のあとに再起動があった (プロセス内の `_unsettled` を失った)。再起動なしでは例外にしない
+            told_before = (fp_now in self.told_fps and self.restarts > self.told_fps[fp_now]
+                           and ledger.get(key_now) == fp_now)
             if lasted >= THRESHOLD and clean and not told_before:
                 assert self.notified.get(triple, 0) >= 1, \
                     f"I2: {triple} は {lasted:.0f}s 続いたのに通知が出ていない"

@@ -44,6 +44,7 @@ from __future__ import annotations
 import itertools
 import os
 import random
+import re
 import sys
 from pathlib import Path
 
@@ -447,3 +448,19 @@ def test_named_sequences_notify_exactly_as_designed(tmp_path, monkeypatch, name)
     text, expected = NAMED_SEQUENCES[name]
     h = _run_and_count(tmp_path, monkeypatch, tuple(text.split()))
     assert len(h.calls) == expected, f"{name}: 通知 {len(h.calls)} 通 (期待 {expected}): {[c[0] for c in h.calls]}"
+
+
+@pytest.mark.parametrize("seq", [
+    ("recover", "S_unk", "tick", "gap", "S_unk", "tick"),
+    ("recover", "S_unk", "tick", "signal_lost", "tick", "tick"),
+], ids=["gap", "signal_lost"])
+def test_a_new_interval_notification_carries_its_own_durations_not_the_previous_ones(tmp_path, monkeypatch, seq):
+    """起点が変わって fp が新しくなった通知は、その区間の無音秒数・見送りの継続秒数で文面を作り直す
+    (種別が同じでも前の区間の文面を使い回さない)。"""
+    h = _run_and_count(tmp_path, monkeypatch, seq)
+    assert len(h.sent) == 2, h.sent
+    first, second = h.sent
+    assert first != second
+    idle = lambda m: re.search(r"無音 (\d+)s", m).group(1)
+    lasted = lambda m: re.search(r"見送りは (\d+)s", m).group(1)
+    assert (idle(first), lasted(first)) != (idle(second), lasted(second))

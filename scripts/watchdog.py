@@ -1424,7 +1424,7 @@ class SuppressedIdleNotifier:
         self._read_ledger = read_ledger or (lambda: None)
         self.threshold = threshold
         self._now = now or time.time
-        # (agent, task_id) -> {"ident", "since", "msg", "msg_kind"}
+        # (agent, task_id) -> {"ident", "since", "msg", "msg_fp"}
         self._state: dict[tuple[str, str], dict] = {}
         # episode を閉じた Worker (掃除が済んだと台帳で確認できるまで)。再起動で失っても、台帳の
         # 規則 (plan_suppression) だけで収束する (失うのは「閉じた直後に再発し、かつ掃除が失敗し続ける」
@@ -1464,7 +1464,7 @@ class SuppressedIdleNotifier:
         now = self._now()
         st = self._state.get(skey)
         if st is None or st["ident"] != ident:        # episode の始まり (新しい Execution ID も)
-            st = self._state[skey] = {"ident": ident, "since": now, "msg": None, "msg_kind": None}
+            st = self._state[skey] = {"ident": ident, "since": now, "msg": None, "msg_fp": None}
         lasted = now - st["since"]
         told = self._read()
         plan = plan_suppression(told, agent, kind, ident, lasted, self.threshold,
@@ -1475,9 +1475,10 @@ class SuppressedIdleNotifier:
             # 通知する plan の forget には閉じた episode のキーの掃除が入っている。ここで閉じた episode の扱いは終わり
             # (削除が失敗していれば古い fp が一致して黙る = 既知の穴。次のサイクルで通知を重ねない)
             self._unsettled.discard(agent)
-        if plan.notify is not None and st["msg_kind"] != kind:
-            # 診断 (unknown の再走査) は種別が決まったとき 1 回だけ。毎サイクル /proc を歩かない。
-            st["msg_kind"], st["msg"] = kind, monitor.suppression_message(kind, detail, lasted)
+        if plan.notify is not None and st["msg_fp"] != plan.notify[1]:
+            # 文面の同一性は fp (ident・種別・起点)。種別だけだと、起点が変わって新しい区間の通知を予定しても
+            # 前の区間の秒数・診断が載る。同じ fp の送り直しは作り直さない (毎サイクル /proc を歩かない)。
+            st["msg_fp"], st["msg"] = plan.notify[1], monitor.suppression_message(kind, detail, lasted)
         self._execute(plan, lambda key, fp, k: self._notify_once(
             key, fp, HARD_IDLE_SUPPRESSED_KIND, "_daemon", monitor.task_id, st["msg"]))
 

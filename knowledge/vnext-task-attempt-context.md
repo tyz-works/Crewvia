@@ -214,6 +214,8 @@ archive済みmissionは明示restoreを同transactionで実行し元Task IDを�
 >   - mission を再び active にする手段も無い。done の mission に task を足しても done のまま（`cmd_add` `plan.sh:2893-`、§2.2）で、dispatcher はその mission を done とみなして Worker を退役させる（`dispatcher.sh:2446-2476`）。
 > - **archive 済み mission の restore**: 無い（plan.sh のサブコマンド表 `plan.sh:7035-7059`）。Taskvia の ID / map を維持できるかは未確認。
 
+> この節の reopen について、元の設計そのものの未解決課題を §15-1 に書いた（下流が検証待ち・検証中のときに無効化されない）。
+
 ## 6. 永続化・競合・障害回復
 
 Mission 01のGlobal Control Lock→reload→precondition→schema validation→同filesystem temp+fsync+replace→directory fsyncを継承する。Task/Attempt/assignment更新には単一ファイルatomicだけでは不足する。
@@ -545,3 +547,30 @@ pull の途中で落ちた card は、次に plan.sh が触るまで食い違い
 | P4 budget/retrieval | 無い | 大: tokenizer・予算・段階的検索・cache の無効化 | 対応する事故の記録は、本調査では見つけていない（未確認） | モデルの外部事実は未確認のまま |
 | P5 Curator shadow | 無い | 大: provider adapter・評価 fixture・shadow 比較の費用 | 同上（未確認） | 費用の上限はレビューで決める（§13） |
 | P6 opt-in 運用 | 無い | 大: isolated end-to-end・新旧の共存・rollback の rehearsal | — | Verifier を運用していないこと（§2.1）が、done = submit の前提を崩す |
+
+## 15. レビューで見つかった元の設計の未解決課題 (2026-10-12 追加)
+
+方針: レビュー（Codex など）で元の設計（§3〜§13 の本文）の穴が見つかったら、本文は書き換えずにこの節へ 1 項目ずつ積む。解決は段階の取捨の後の設計 task で行い、この文書のレビューの往復は続けない。
+
+### 15-1. reopen の下流の無効化に、検証待ち・検証中の下流が含まれていない (PR #297 Codex P2、t002)
+
+**漏れている状態**
+- §5 の reopen は、下流の扱いを次の 3 つしか定義していない。
+  - pending の下流: blocked にする。
+  - running の下流: cancel_requested にし、lease を fence する。
+  - verified の下流: invalidation event を出し、needs_human_review にする。
+- submit の後の下流は、この 3 つのどれにも当たらない。このとき下流は「Attempt が submitted、Task が ready_for_verification / verifying、Worker lease は解放済み」の状態にある。
+- そのため、この間に上流を reopen すると、下流は無効化の対象にも fence の対象にもならない。
+
+**起きる害: 古い上流に基づく結果が承認されうる**
+- §5 の verify pass の条件は「submitted、commit/package/generation 一致、AC 充足」である。
+- 比べているのは下流自身の commit / package / generation で、上流の reopen ではどれも変わらない。
+- このため、reopen 前の上流を前提にした下流の結果を Verifier が pass できてしまう。
+
+**直し方の方向（Codex の提案。まだ決めていない）**
+- submitted の Attempt（Task が ready_for_verification / verifying）について、上流の reopen 時に Verifier の lease を無効化する規則を定める。
+- 検証を確定する時点（verify pass / fail の受付）で、依存先の世代と検証の有効性を確かめ直す。§5 の「Controller の eligible predicate で generation と検証有効性を検査する」を、検証の確定にも適用する。
+
+**今の実装との関係**
+- reopen も Verifier の運用も今は無い（§2.1、§5 の注記）。
+- このため、今の運用でこの害が起きることはない。P2（reopen）を設計するときに解く。

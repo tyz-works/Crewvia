@@ -276,6 +276,10 @@ class WorkerMonitor:
         #: 通知文で理由 (mux の不調 / 木の中の unknown) を区別し、診断の再走査に使う。
         self._last_pane_pid: Optional[int] = None
         self._pid_unavailable: bool = False
+        #: §11-15 (t019): 無音区間の起点 = `check_detail()` が idle の計算に使った activity_mtime
+        #: (floor と利用枠の floor を適用した後)。判定のたびに上書きする。check_detail を通っていない
+        #: monitor は None (fp に起点を足さない)。
+        self.idle_since: Optional[float] = None
 
         # t044: when *this* monitoring target began.  Signals older than this
         # are not its silence — see `_signal_floor` and `_last_activity_mtime`.
@@ -750,10 +754,14 @@ class WorkerMonitor:
             ident = self.task_id
         return ident
 
+    def suppression_origin(self) -> Optional[int]:
+        """無音区間の起点 (整数秒)。check_detail を通っていなければ None。"""
+        return int(self.idle_since) if self.idle_since is not None else None
+
     def suppression_fp(self, kind: str) -> str:
-        """通知の fingerprint: `<episode の識別子>:<種別>`。台帳キーが種別ごとなので、同じ試行の
-        同じ種別は episode の間 1 回 (理由が往復しても再通知しない。§11-13)。"""
-        return f"{self.suppression_ident()}:{kind}"
+        """通知の fingerprint: `<episode の識別子>:<種別>@<起点>` (§11-15)。台帳キーが種別ごとなので、
+        同じ試行・同じ種別・同じ無音区間は 1 回 (理由が往復しても再通知しない。§11-13)。"""
+        return suppression_fp(self.suppression_ident(), kind, self.suppression_origin())
 
     def suppression_message(self, kind: str, detail: "CheckResult", lasted: float) -> str:
         """Director への通知文。unknown のときは unknown にしたノード (pid / state / errno) を載せる。"""
@@ -808,6 +816,7 @@ class WorkerMonitor:
             # 最後に免除した瞬間から数える — リセット後に再開する Worker が、止まっていた
             # 時間で即 hard_idle にならないように。
             activity_mtime = max(activity_mtime, self._limit_floor)
+        self.idle_since = activity_mtime
         idle_seconds = now - activity_mtime
 
         # 1. 絶対上限チェック
@@ -1332,6 +1341,11 @@ def _split_suppression_key(key: str):
     return (agent, kind) if sep else None
 
 
+def suppression_fp(ident: str, kind: str, origin: Optional[int]) -> str:
+    """見送り通知の fingerprint を作る唯一の場所 (§11-15-3)。読み戻さない (比較は等値だけ)。"""
+    return f"{ident}:{kind}" if origin is None else f"{ident}:{kind}@{origin}"
+
+
 class SuppressionPlan(NamedTuple):
     """`plan_suppression` の出力。notify = (台帳キー, fp, 理由) か None。forget = 消す台帳キー。"""
     notify: Optional[tuple] = None
@@ -1339,7 +1353,8 @@ class SuppressionPlan(NamedTuple):
 
 
 def plan_suppression(told, agent: str, kind: Optional[str], ident: str,
-                     lasted: float, threshold: float, unsettled: bool = False) -> SuppressionPlan:
+                     lasted: float, threshold: float, unsettled: bool = False,
+                     origin: Optional[int] = None) -> SuppressionPlan:
     """見送り通知の状態の規則 (§11-13。ここ 1 か所。I/O もプロセス内の状態も持たない)。
 
     episode = ある Worker・ある Execution ID (`ident`) の「見送りが続いている区間」。
@@ -1354,7 +1369,12 @@ def plan_suppression(told, agent: str, kind: Optional[str], ident: str,
     - `unsettled` (同じプロセスで episode を閉じたあと、掃除が済んだと台帳で確認できていない):
       台帳に居る自分のキーは閉じた episode のものなので、居ないものとして判定し、消す。
       閉じた episode の古いキーが次の episode の通知を黙らせるのを防ぐ。
-    - 見送りで lasted < threshold: 何もしない。
+    - fp は `<ident>:<kind>@<origin>` (origin = 無音区間の起点の整数秒。§11-15)。比較は台帳の fp との
+      **等値**だけ (読み戻さない・大小で比べない)。起点が変わると別の無音区間として通知する。
+    - 同じ Execution ID の**別の理由**のキーは、その理由の今の起点での fp と等しくなければ消す
+      (起点が動いたあと、新しい区間の同じ理由が古い区間の fp で黙らないように。§11-15-12 の決定 1)。
+      lasted がしきい値未満でも掃除する。
+    - 見送りで lasted < threshold: 通知はしない。
     - 見送りで lasted >= threshold: 台帳に (key, fp) が既に居れば黙る。無ければ通知する
       (台帳が読めなければ通知する = 再送側)。Execution ID の違う古い試行のキーは消す。
     """
@@ -1368,19 +1388,22 @@ def plan_suppression(told, agent: str, kind: Optional[str], ident: str,
     if unsettled:                       # 閉じた episode の古いキー。居ないものとして扱って消す
         mine = (tuple(k for k in told if (_split_suppression_key(k) or (None,))[0] == agent)
                 if told is not None else tuple(suppression_key(agent, k) for k in SUPPRESSION_KINDS))
-    if lasted < threshold:
-        return SuppressionPlan(forget=mine)
-    key, fp = suppression_key(agent, kind), f"{ident}:{kind}"
+    key, fp = suppression_key(agent, kind), suppression_fp(ident, kind, origin)
     stale = ()
     if told is not None:
         live = {k: v for k, v in told.items() if k not in mine}
+        # 他の理由のキー: 古い試行のものと、別の起点 (別の無音区間) のものを消す。期待する fp は
+        # その理由の今の起点で組み直して等値で比べる (台帳の fp を読み戻さない)。
+        expected = {suppression_key(agent, k): suppression_fp(ident, k, origin) for k in SUPPRESSION_KINDS}
         stale = tuple(
             k for k, v in live.items()
             if k != key and _split_suppression_key(k) is not None
             and _split_suppression_key(k)[0] == agent
-            and not str(v).startswith(f"{ident}:"))
-        if live.get(key) == fp:
-            return SuppressionPlan(forget=mine + stale)
+            and (not str(v).startswith(f"{ident}:") or (k in expected and v != expected[k])))
+    if lasted < threshold:
+        return SuppressionPlan(forget=mine + stale)
+    if told is not None and live.get(key) == fp:
+        return SuppressionPlan(forget=mine + stale)
     return SuppressionPlan(notify=(key, fp, kind), forget=mine + stale)
 
 
@@ -1445,7 +1468,7 @@ class SuppressedIdleNotifier:
         lasted = now - st["since"]
         told = self._read()
         plan = plan_suppression(told, agent, kind, ident, lasted, self.threshold,
-                                unsettled=agent in self._unsettled)
+                                unsettled=agent in self._unsettled, origin=monitor.suppression_origin())
         if agent in self._unsettled and told is not None and not plan.forget:
             self._unsettled.discard(agent)            # 掃除が済んだことを台帳で確認した
         if plan.notify is not None:

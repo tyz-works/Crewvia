@@ -819,6 +819,26 @@ def check_deliverable(tasks: list[dict], skill_permissions_path: str,
     return results
 
 
+def deliverable_refusal(skills: list, declared: Optional[str], skill_permissions_path: str) -> Optional[str]:
+    """`plan.sh add` / `update` が card を書く前に呼ぶ入口 (t001)。
+
+    この skills で `declared` の成果物を作れないなら、拒否の理由 (人が読める 1 文) を返す。
+    作れる・判定の対象外 (`declared` が未宣言 / `none`) なら None。
+
+    判定は `check_deliverable()` に **そのまま委譲する** —— 1 task だけの一覧を渡して FAIL が出るかを
+    見るだけで、規則 (check_permission() の呼び方・codex-review など hook の外の skill の扱い・
+    config が読めないときの拒否) をここに書き写さない。lint と add / update の答えが割れない構造。
+    """
+    if declared is None:
+        return None
+    results = check_deliverable([{'id': 'new', 'skills': skills, 'deliverable': declared}],
+                                skill_permissions_path)
+    fails = [msg for level, _cat, msg in results if level == 'FAIL']
+    if not fails:
+        return None
+    return '; '.join(m.replace('task/new: ', '', 1) for m in fails)
+
+
 def check_pr_has_review_downstream(tasks: list[dict]) -> list[tuple[str, str, str]]:
     """`deliverable: pr` の task の下流に、skills に `review` を含む task が無ければ WARN。
 

@@ -114,9 +114,8 @@ def run_scenario(src_root: pathlib.Path, root: pathlib.Path) -> dict:
     import shutil
     cfg, hooks = root / "config", root / "hooks"
     cfg.mkdir(exist_ok=True)
-    hooks.mkdir(exist_ok=True)
     shutil.copy(pathlib.Path(src_root) / "config" / "skill-permissions.yaml", cfg / "skill-permissions.yaml")
-    shutil.copy(pathlib.Path(src_root) / "hooks" / "lib_skill_perms.py", hooks / "lib_skill_perms.py")
+    shutil.copytree(pathlib.Path(src_root) / "hooks", hooks)   # hooks/ を丸ごと (lib を名前で指さない)
     for title, extra in specs:
         r.run("add", title, *extra)
     shutil.rmtree(cfg)

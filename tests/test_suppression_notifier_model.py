@@ -273,7 +273,8 @@ class Harness:
             for fp, recorded in new_calls:
                 ident, _, rest = fp.rpartition(":")
                 kind, _, origin = rest.partition("@")
-                assert origin == str(self.origin), f"fp の起点が今の起点と違う: {fp} / {self.origin}"
+                if origin:      # 起点の無い fp (旧形式) は他の不変条件 (I2) に捕まえさせる
+                    assert origin == str(self.origin), f"fp の起点が今の起点と違う: {fp} / {self.origin}"
                 triple = (int(ident[3:]), self.ep_key[1], self.interval, kind)
                 self.notified[triple] = self.notified.get(triple, 0) + 1
                 if recorded:

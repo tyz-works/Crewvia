@@ -75,7 +75,7 @@ MUTATIONS = [
     ("【11-15 t019】fp に起点を足さない", WD,
      '    return f"{ident}:{kind}" if origin is None else f"{ident}:{kind}@{origin}"',
      '    return f"{ident}:{kind}"',
-     [("test_every_sequence_over_a_reduced_alphabet_keeps_the_invariants", ("I2", "fp の起点")),
+     [("test_every_sequence_over_a_reduced_alphabet_keeps_the_invariants", "I2"),
       "test_named_sequences_notify_exactly_as_designed[restart-after-failed-cleanup-keeps-notifying]"]),
     ("【t012】起点の比較を一方向に戻す (記録の起点以上なら黙る)", WD,
      '    if told is not None and live.get(key) == fp:',

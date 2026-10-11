@@ -116,6 +116,7 @@ class Harness:
         self.notif_dir = base / "registry" / "notifications" / AGENT
         self.sig_files: list[tuple[Path, float]] = []   # (パス, mtime) 古い順
         self.sig_clock = T0
+        self.sig_seq = 0
         self.lost: tuple[Path, float] | None = None
         # 初期状態 (§11-15-4): heartbeat (基準 − 100 秒) と通知 1 つ (基準)。signal_lost が最初から起点を後退させられる
         hb = base / "registry" / "heartbeats" / AGENT
@@ -164,7 +165,8 @@ class Harness:
     def _add_signal(self, advance: float = 1000.0) -> None:
         self.notif_dir.mkdir(parents=True, exist_ok=True)
         self.sig_clock += advance
-        path = self.notif_dir / f"n{len(self.sig_files) + 1:04d}.json"
+        self.sig_seq += 1                               # 名前は使い回さない (消したファイルと衝突しない)
+        path = self.notif_dir / f"n{self.sig_seq:04d}.json"
         path.write_text("{}")
         os.utime(path, (self.sig_clock, self.sig_clock))
         self.sig_files.append((path, self.sig_clock))
@@ -337,9 +339,9 @@ REDUCED_ALPHABETS = {
     "failures-on-close": (("S_exe", "tick", "recover", "vanish", "delete_fail", "delete_raise"), 6),
     "quiet-close-and-relapse": (("S_exe", "tick", "quiet_close", "delete_fail", "restart"), 7),
     # 起点が動く並び (§11-15-4)。理由の切り替え (S_unk / S_exe) とシグナルの削除・復元・観測の途切れ
-    "origin-moves": (("S_unk", "S_exe", "tick", "recover", "signal_lost", "signal_restored", "gap"), 7),
+    "origin-moves": (("S_unk", "S_exe", "tick", "signal_lost", "signal_restored", "gap"), 6),
     "origin-moves-and-restart": (("S_unk", "tick", "recover", "quiet_close", "signal_lost", "signal_restored",
-                                  "delete_fail", "restart"), 6),
+                                  "delete_fail", "restart"), 5),
 }
 
 

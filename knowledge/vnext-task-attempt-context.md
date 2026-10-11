@@ -309,6 +309,8 @@ validation: {}          # gates + diagnostics
 
 関連性→正規根拠→revision一致→鮮度で並べ、同hash重複排除。新しい要約が古い承認済みcontractを上書きしない。検索要求は `execution_id, question, desired_source_types, max_tokens`、応答は根拠span・hash・token count・不足理由。cache keyはTask generation/revision、repo SHA+dirty diff hash、source manifest、policy/prompt/adapter版。源変更でinvalidateする。
 
+> **【未解決 (2026-10-12)】** この式は、継続セッションに既にある会話履歴の占有量を引いていない。§15-2 を参照。
+
 各モデル固有tokenizerを優先し、不可なら保守的上界+余裕を使用しestimatedと表示。runtimeが追加注入するsystem/toolを含め計測。usageのinput/output/cache read/writeとcontext占有を混同しない。試行・Task・Missionで累積呼出し/時間/usageを予算化する。価格profile未確認なら金額計算はdisabled、価格確認日と通貨を必須にする。
 
 > **【現行との差 (2026-10-11 確認)】** 該当する実装は無い。モデルの選び分けは `config/crewvia.yaml` の `model_per_skill`（skill ごとに決める。`config/crewvia.yaml:38`）だけで、token 予算という概念は無い。
@@ -577,3 +579,21 @@ pull の途中で落ちた card は、次に plan.sh が触るまで食い違い
 **今の実装との関係**
 - reopen も Verifier の運用も今は無い（§2.1、§5 の注記）。
 - このため、今の運用でこの害が起きることはない。P2（reopen）を設計するときに解く。
+
+### 15-2. §8 のトークン予算が、継続セッションの既存履歴を計上していない (PR #297 Codex P2、t002)
+
+**漏れているもの**
+- §8 の `P = min(config.package_limit, E, W-S-O-H-M)` は、`S`（system/tool）、`O`、`H`、`M` を引くが、Worker のセッションに既に積まれている会話履歴（過去の会話・ツール結果・前の Package）の占有量を引く項が無い。
+- §9 の `session_isolation` は既定が `legacy` で、同じセッションを使い続ける。このため、継続セッションでは 2 件目以降の Task の開始時点で、履歴がすでに window の一部を占めている。
+
+**起きる害**
+- Package が `P` に収まって §8 の検査を通っても、既存履歴と合わせた実際の入力が window を超えうる。
+- 超えた場合は、予期しない自動圧縮（Package の mandatory 部分が要約に巻き込まれうる）か、入力の拒否が起きる。どちらも §8 の「mandatory を落とさない」を守れない。
+
+**直し方の方向（Codex の提案。まだ決めていない）**
+- 既存履歴の占有量 `X` を `P` の式から差し引く（`W-S-O-H-M-X`）。
+- `X` を計測できないとき、または差し引いた残りが必要量に足りないときの動作（作業開始の拒否・圧縮・新規セッション（`fresh_context` / `fresh_process`）への切り替え）と、その切り替え条件を定義する。
+
+**今の運用との関係**
+- 今の Worker は同じセッションで続けて Task を pull する。`agents/worker.md:117-133` のループは、done の後に待機して Dispatcher の次の assign で `plan pull` に戻り、終了するのは「タスクなし、shutdown」を受けたときだけである。
+- ただし今は Package も §8 の予算も無い（§8 の注記）。このため、今の運用では「予算を通ったのに超える」害は起きない。Context 層（P1 以降）を入れるときに解く。

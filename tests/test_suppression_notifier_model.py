@@ -44,7 +44,6 @@ from __future__ import annotations
 import itertools
 import os
 import random
-import shutil
 import sys
 from pathlib import Path
 
@@ -112,8 +111,10 @@ class Harness:
         self.origin: int | None = None                  # 今のサイクルの起点
         self.told_fps: set[str] = set()                 # 台帳に記録できた通知の fp (起点つき。モデルの履歴)
         # 実物のシグナルファイル (registry/notifications/<agent>/)。mtime は T0 から 1000 秒ずつ進める
-        shutil.rmtree(base / "registry" / "notifications", ignore_errors=True)
         self.notif_dir = base / "registry" / "notifications" / AGENT
+        self.notif_dir.mkdir(parents=True, exist_ok=True)   # 1 並びごとに作り直さない (mkdir が遅い環境がある)
+        for old in self.notif_dir.iterdir():
+            old.unlink()
         self.sig_files: list[tuple[Path, float]] = []   # (パス, mtime) 古い順
         self.sig_clock = T0
         self.sig_seq = 0
@@ -163,7 +164,6 @@ class Harness:
 
     # --- シグナル (起点の元) --------------------------------------------------
     def _add_signal(self, advance: float = 1000.0) -> None:
-        self.notif_dir.mkdir(parents=True, exist_ok=True)
         self.sig_clock += advance
         self.sig_seq += 1                               # 名前は使い回さない (消したファイルと衝突しない)
         path = self.notif_dir / f"n{self.sig_seq:04d}.json"
@@ -337,7 +337,7 @@ REDUCED_ALPHABETS = {
     "cleanup-and-relapse": (("S_exe", "tick", "recover", "delete_fail", "restart"), 7),
     "reasons-and-attempts": (("S_exe", "S_unk", "tick", "vanish", "new_exec", "write_fail"), 6),
     "failures-on-close": (("S_exe", "tick", "recover", "vanish", "delete_fail", "delete_raise"), 6),
-    "quiet-close-and-relapse": (("S_exe", "tick", "quiet_close", "delete_fail", "restart"), 7),
+    "quiet-close-and-relapse": (("S_exe", "tick", "quiet_close", "delete_fail", "restart"), 6),
     # 起点が動く並び (§11-15-4)。理由の切り替え (S_unk / S_exe) とシグナルの削除・復元・観測の途切れ
     "origin-moves": (("S_unk", "S_exe", "tick", "signal_lost", "signal_restored", "gap"), 6),
     "origin-moves-and-restart": (("S_unk", "tick", "recover", "quiet_close", "signal_lost", "signal_restored",

@@ -4,7 +4,8 @@
 欠陥を注入した版に**同じテスト**を走らせる。ファイルは in-place で書き換えて必ず元に戻す
 (finally)。置換元がちょうど 1 回でなければ BROKEN (注入点が消えている = 失効)。
 赤と数えるのは `FAILED <テスト名>` が出たときだけ (collection error は数えない)。
-実行: env -u AGENT_NAME python3 tests/red_proof_hard_idle_unknown.py   (約 2 分)
+実行: env -u AGENT_NAME python3 tests/red_proof_hard_idle_unknown.py   (全部だと網羅テストが長く数時間。
+RED_PROOF_ONLY=<変異名の一部> RED_PROOF_K=<pytest -k の式> で 1 つずつ回す)
 """
 import os
 import subprocess
@@ -113,7 +114,11 @@ def main() -> int:
     bad = 0
     env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1", COLUMNS="400")  # FAILED 行が端末幅で切れると理由の印が消える
     env.pop("AGENT_NAME", None)
+    only = os.environ.get("RED_PROOF_ONLY")        # 変異名の部分文字列で絞る (網羅テストが長いので 1 つずつ回せるように)
+    extra = ["-k", os.environ["RED_PROOF_K"]] if os.environ.get("RED_PROOF_K") else []
     for name, path, old, new, targets in MUTATIONS:
+        if only and only not in name:
+            continue
         original = path.read_text()
         if original.count(old) != 1:
             print(f"BROKEN  {name}: 注入点が {original.count(old)} 回 (失効)")
@@ -122,7 +127,7 @@ def main() -> int:
         try:
             path.write_text(original.replace(old, new))
             out = subprocess.run(
-                [sys.executable, "-m", "pytest", *TESTS, "-q", "-p", "no:cacheprovider"],
+                [sys.executable, "-m", "pytest", *TESTS, "-q", "-p", "no:cacheprovider", *extra],
                 cwd=ROOT, env=env, capture_output=True, text=True, timeout=900).stdout
         finally:
             path.write_text(original)

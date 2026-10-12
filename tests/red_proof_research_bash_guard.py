@@ -114,6 +114,9 @@ MUTATIONS = [
     ("9 git fetch に --prune / --prune-tags / -p を戻す", [
         (GUARD_REL, '    ("fetch",): _git(max_pos=2, check=_check_git_fetch),', '    ("fetch",): _git(short="p", long="prune prune-tags", max_pos=2, check=_check_git_fetch),'),
     ], "test_codex_reproductions_are_denied"),
+    ("9b git fetch の --no-prune --no-prune-tags 必須を外す (t016)", [
+        (GUARD_REL, '    if not {"--no-prune", "--no-prune-tags"} <= keys:', '    if False:'),
+    ], "test_git_fetch_only_three_forms"),
     # ---- t009 (Codex 3 巡目 P1×3)
     ("10a source の場所を検査しない (4e8a822 の形: どの cwd の .crewvia-env でも可)", [
         (GUARD_REL, '    if os.path.basename(path) != ".crewvia-env" or not _is_trusted_path(path, ctx, (".crewvia-env",)):',

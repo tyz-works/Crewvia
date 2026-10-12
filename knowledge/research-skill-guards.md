@@ -97,7 +97,7 @@ hook の位置 `hooks/..`）の `scripts/plan.sh`」か「自分の worktree（`
 | 探す | `grep egrep fgrep rg ugrep jq find`（`find` は述語の allowlist。`-exec -delete -fprint* -ok*` は不可） |
 | `sed` | `-n` の行指定 `p`/`=` と `s///[gIip]` だけ（`-i -f` と `w e r` は不可） |
 | その他 | `echo pwd date which printenv true false sleep cd`（`printf` は不可。t009） |
-| git | `log show diff status rev-parse ls-files blame rev-list merge-base describe ls-tree cat-file show-ref for-each-ref name-rev shortlog check-ignore version ls-remote`、`branch`/`tag`（位置引数があるときは `--list` 必須）、`remote [-v]`・`remote show`・`worktree list`・`stash list`・`config --get/--list`、`fetch`（下記）。**表はサブコマンドごと**（t007。同じ字でも値の取り方がサブコマンドで違う: `git grep -L` は値を取らず `git log -L` は取る）。**短いオプションは `-X` の 2 文字だけ**（`-sb`・`-vv`・`-LOecho`・`-n5` のような束ね・結合値は一律に不可。数字だけの `-10` は log / rev-list で可）。**値を取るオプションは `--name=<値>` だけ**（`--max-count 5` は不可）。pager・外部コマンドを起動しうるもの（`-O`・`--open-files-in-pager`・`--ext-diff`・`--textconv`・`-c`・`--filters`・`--upload-pack`・`--exec`）は列挙しない。`git grep` は外した（`grep -r` / `rg` で代わりになる）。**大域オプションは全部不可**（`-C`・`-c`・`--git-dir`・`--work-tree`・`--exec-path`・`--no-pager`・`-P` …。`cd` してから git を呼ぶ）。**差分を出す git は `--no-ext-diff --no-textconv` の両方が必須**（t009。下の表）: `git diff`・`git show` は常に、`git log` は差分系のオプション（`-p`・`--stat`・`--name-only`・`--follow`・`--cherry-pick`・`--word-diff` …。「差分を出さない」と列挙した `--oneline`・`--graph`・`--format=`・`--max-count=` 等以外のすべて）があるとき、`git blame` は `--no-textconv`。`git diff --no-index` は不可。`git fetch` は `git fetch` / `git fetch origin` / `git fetch origin <ref>` の 3 形だけ（オプションは一切不可 = `--prune`・`--prune-tags`・`--tags`・`--force`・`-q` も不可。ref は `:` `+` `*` `^` を含まない名前）。`ls-remote` の `<transport>::` は不可 |
+| git | `log show diff status rev-parse ls-files blame rev-list merge-base describe ls-tree cat-file show-ref for-each-ref name-rev shortlog check-ignore version ls-remote`、`branch`/`tag`（位置引数があるときは `--list` 必須）、`remote [-v]`・`remote show`・`worktree list`・`stash list`・`config --get/--list`、`fetch`（下記）。**表はサブコマンドごと**（t007。同じ字でも値の取り方がサブコマンドで違う: `git grep -L` は値を取らず `git log -L` は取る）。**短いオプションは `-X` の 2 文字だけ**（`-sb`・`-vv`・`-LOecho`・`-n5` のような束ね・結合値は一律に不可。数字だけの `-10` は log / rev-list で可）。**値を取るオプションは `--name=<値>` だけ**（`--max-count 5` は不可）。pager・外部コマンドを起動しうるもの（`-O`・`--open-files-in-pager`・`--ext-diff`・`--textconv`・`-c`・`--filters`・`--upload-pack`・`--exec`）は列挙しない。`git grep` は外した（`grep -r` / `rg` で代わりになる）。**大域オプションは全部不可**（`-C`・`-c`・`--git-dir`・`--work-tree`・`--exec-path`・`--no-pager`・`-P` …。`cd` してから git を呼ぶ）。**差分を出す git は `--no-ext-diff --no-textconv` の両方が必須**（t009。下の表）: `git diff`・`git show` は常に、`git log` は差分系のオプション（`-p`・`--stat`・`--name-only`・`--follow`・`--cherry-pick`・`--word-diff` …。「差分を出さない」と列挙した `--oneline`・`--graph`・`--format=`・`--max-count=` 等以外のすべて）があるとき、`git blame` は `--no-textconv`。`git diff --no-index` は不可。`git fetch` は `git fetch --no-prune --no-prune-tags [origin [<ref>]]` の 3 形だけ（t016。`--no-prune` と `--no-prune-tags` が**両方**揃っているときだけ通す。git config の `fetch.prune` / `remote.<name>.prune` / `fetch.pruneTags` が true でも ref・tag を消さないため。これ以外のオプションは一切不可 = `--prune`・`--prune-tags`・`--tags`・`--force`・`-q` も不可。ref は `:` `+` `*` `^` を含まない名前）。`ls-remote` の `<transport>::` は不可 |
 | gh | `pr view/diff/checks/list/status`・`run list/view`・`issue view/list`・`repo view`・`release list/view`・`workflow list/view`・`search *`（`--web` は不可）。`gh api` は **パス 1 つ + `--jq`/`-q`/`--paginate` だけ**（`-X`/`--method`/`-f`/`-F`/`--field`/`--raw-field`/`--input`/`-H` は結合形も含め不可、`graphql` も不可） |
 | plan.sh | `status pull pr-base store-check`、`done`/`needs-director` は上の `--result-file` の形だけ |
 
@@ -113,7 +113,7 @@ hook の位置 `hooks/..`）の `scripts/plan.sh`」か「自分の worktree（`
 | `cat > f <<'EOF'` / `cat >> f` でメモを書く | Write ツールで `notes/<tid>*.md` に書く |
 | `plan.sh done t001 "$(cat <<'EOF' …)"` / `needs-director t001 "理由"` | Write でメモ → `--result-file <パス>` |
 | `ls *.md` | `ls`、`ls ./*.md`、Glob ツール |
-| `git fetch origin main -q` / `git fetch --prune` | `git fetch origin main 2>/dev/null`（刈り込みは不可） |
+| `git fetch origin main -q` / `git fetch --prune` / `git fetch origin`（オプション無し） | `git fetch --no-prune --no-prune-tags origin main 2>/dev/null`（刈り込みは不可。`--no-prune --no-prune-tags` が必須） |
 | `git -C <dir> log` | `cd <dir> && git log` |
 | `git status -sb` / `git log -n5` / `git log --max-count 5` | `git status -s -b`、`git log --max-count=5`（`git log -5` も可） |
 | `git grep x` | `grep -rn x .`、`rg x`、Grep ツール |
@@ -165,10 +165,12 @@ heredoc で Result を渡す `plan.sh done`）、残りの 4 件（`#` を含む
 | 2 (t007) | `git grep -LOecho`（pager として echo を起動） | git の表をサブコマンドごと・束ね不可・`git grep` を外す |
 | 2 | `uniq in '2'>/dev/null`（引用符つきの fd 番号で書き込み） | リダイレクトは完全一致の 2 トークンだけ |
 | 2 | `/tmp/plan.sh status`（basename だけの判定） | 字面と realpath の両方で本 repo / 自分の worktree の plan.sh |
-| 2 | `git fetch --prune --prune-tags` | fetch は 3 形だけ・オプション無し |
+| 2 | `git fetch --prune --prune-tags` | fetch は 3 形だけ・オプションは `--no-prune --no-prune-tags` の両方が必須（t016） |
 | 3 (t009) | `cd /other` → `source .crewvia-env`・PATH 探索・symlink | 自分の worktree / repo root の `.crewvia-env` をパスで指す形だけ |
 | 3 | `printf 'abc%n' PATH` | `printf` を外す |
 | 3 | `git diff --no-index /dev/null x`（GIT_EXTERNAL_DIFF）・diff / show / log -p の textconv | `--no-ext-diff --no-textconv` 必須・`--no-index` 不可・blame も `--no-textconv` |
+
+Codex review は 7 巡（P1 計 13・P2 計 7）で打ち切った（ユーザー決定 q-f0849c5f「次の巡で収束」）。以降に見つかる「設定・環境由来で honest Worker がうっかり踏む」類は個別 PR で塞ぐ。悪意ある回避は脅威モデルの対象外。
 
 残る経路: 上の「git が設定から外部プログラムを起動する経路」の **残る（対象外）** の行。ほかに、許可したコマンドの実装そのものの
 脆弱性（`jq` / `rg` 等）と、`cd` で入れる場所の制限は無い（読むことは許可している）。必要になれば OS レベルのサンドボックスで対処する。

@@ -183,9 +183,9 @@ ALLOWED = [
     "grep -rn 'x\\|y' --include=*.md . | grep -v '^./queue'",
     "cd /tmp && pwd && ls",
     "git log --oneline -3 && git diff --no-ext-diff --no-textconv origin/main --stat",
-    "git fetch origin main",
-    "git fetch origin",
-    "git fetch",
+    "git fetch --no-prune --no-prune-tags origin main",
+    "git fetch --no-prune --no-prune-tags origin",
+    "git fetch --no-prune --no-prune-tags",
     "git status -s",
     "git log --max-count=5 --format=%H -p --no-ext-diff --no-textconv -- hooks/x.py",
     "git log -10 --since=2.weeks",
@@ -836,11 +836,24 @@ def test_quoted_fd_number_reproduction_does_not_write(tmp_path):
 
 
 @pytest.mark.parametrize("cmd,decision", [
-    # 指摘 4: git fetch / git fetch origin / git fetch origin <ref> だけ。オプションは一切不可
-    ("git fetch", "allow"),
-    ("git fetch origin", "allow"),
-    ("git fetch origin main", "allow"),
-    ("git fetch origin task/x-y_z.1", "allow"),
+    # 指摘 4 / t016: git fetch --no-prune --no-prune-tags [origin [<ref>]] だけ。ほかのオプションは不可
+    ("git fetch --no-prune --no-prune-tags", "allow"),
+    ("git fetch --no-prune --no-prune-tags origin", "allow"),
+    ("git fetch --no-prune --no-prune-tags origin main", "allow"),
+    ("git fetch --no-prune --no-prune-tags origin task/x-y_z.1", "allow"),
+    # 旧 3 形 (prune 設定が true だと ref・tag を消す) と、片方だけの形は拒否
+    ("git fetch", "deny"),
+    ("git fetch origin", "deny"),
+    ("git fetch origin main", "deny"),
+    ("git fetch --no-prune origin", "deny"),
+    ("git fetch --no-prune-tags origin main", "deny"),
+    # --no-prune 2 つが揃っていても、ほかのオプション・形は引き続き拒否
+    ("git fetch --no-prune --no-prune-tags --prune origin", "deny"),
+    ("git fetch --no-prune --no-prune-tags --tags origin", "deny"),
+    ("git fetch --no-prune --no-prune-tags -q origin", "deny"),
+    ("git fetch --no-prune --no-prune-tags --force origin main", "deny"),
+    ("git fetch --no-prune --no-prune-tags origin main:main", "deny"),
+    ("git fetch --no-prune --no-prune-tags upstream", "deny"),
     ("git fetch --prune --prune-tags origin", "deny"),
     ("git fetch --prune origin", "deny"),
     ("git fetch --prune-tags origin", "deny"),
@@ -864,6 +877,11 @@ def test_quoted_fd_number_reproduction_does_not_write(tmp_path):
 ])
 def test_git_fetch_only_three_forms(cmd, decision):
     assert LIB.check_bash(cmd)[0] == decision, (cmd, LIB.check_bash(cmd)[1])
+
+
+def test_git_fetch_deny_reason_names_the_required_options():
+    d, reason = LIB.check_bash("git fetch origin main")
+    assert d == "deny" and "--no-prune --no-prune-tags" in reason, reason
 
 
 def test_plan_sh_must_resolve_to_the_trusted_script(fake_repo, tmp_path):

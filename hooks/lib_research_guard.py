@@ -421,11 +421,17 @@ _FETCH_REF_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._/@-]*$")
 
 
 def _check_git_fetch(opts, pos, ctx) -> None:
-    """git fetch は `git fetch` / `git fetch origin` / `git fetch origin <ref>` の 3 形だけ (t007)。
+    """git fetch は `git fetch --no-prune --no-prune-tags [origin [<ref>]]` の 3 形だけ (t007 / t016)。
 
-    オプションは表に 1 つも無い (--prune / --prune-tags / --tags / --force 等はすべて列挙外で拒否)。
+    オプションは --no-prune と --no-prune-tags だけで、両方が揃っているときだけ通す
+    (git config の fetch.prune / remote.<name>.prune / fetch.pruneTags が true でも ref・tag を消さない)。
+    --prune / --tags / --force 等はすべて列挙外で拒否。
     ref は `:` `+` `*` `^` を含まない名前 (字の集合で絞る) = ローカルの ref を書き換える refspec にならない。
     """
+    keys = {k for k, _ in opts}
+    if not {"--no-prune", "--no-prune-tags"} <= keys:
+        raise _Reject("git fetch には --no-prune --no-prune-tags を付けてください "
+                      "(git config の prune 設定で ref・tag が消えるのを防ぎます)")
     if pos and pos[0].value != "origin":
         raise _Reject("git fetch の remote は origin だけ許可します (git fetch / git fetch origin / git fetch origin <ref>)")
     if len(pos) == 2 and not _FETCH_REF_RE.match(pos[1].value):
@@ -608,7 +614,7 @@ GIT_SPECS: dict[tuple, Spec] = {
     ("version",): _git(max_pos=0),
     ("ls-remote",): _git(short="qht", long="heads tags refs quiet get-url symref", long_arg="sort",
                          check=_check_no_ext_transport),
-    ("fetch",): _git(max_pos=2, check=_check_git_fetch),
+    ("fetch",): _git(long="no-prune no-prune-tags", max_pos=2, check=_check_git_fetch),
     ("branch",): _git(short="arvl", long="all remotes verbose list show-current",
                       long_arg="contains merged no-merged sort format points-at",
                       check=_require_list_if_positional),

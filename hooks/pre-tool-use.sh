@@ -551,12 +551,29 @@ esac
 #   - Write/Edit/MultiEdit/NotebookEdit: queue/missions/<自分の slug>/notes/<自分の tid>*.md
 #     (と、skill-permissions.yaml の research_write_scope を設定したときだけ obsidian の新規ノート)
 #     なら allow (yaml の deny より優先)、それ以外は deny。
-#   - Bash: 読み取り専用の allowlist に無い形は deny。通った形は下の通常の判定へ進む。
+#   - Bash: 解釈の要らない読み取り専用の形 (lib の SPECS 表) 以外は deny。通った形は下の通常の判定へ進む。
 # 対象外: SKILLS (と task card の skills) に research を含まないセッション。
+# card は env の TASK_ID の有無に関係なく assignment から引く (t005 / Codex P2: 上の _TASK_FILE は
+# TASK_ID が空のときしか埋まらないので、それに頼ると TASK_ID 設定済みの research を見逃す)。
 _RG_SKILLS=",${SKILLS:-},"
-if [ -n "${_TASK_FILE:-}" ] && [ -f "${_TASK_FILE:-}" ]; then
-  _RG_SKILLS="${_RG_SKILLS}$(grep '^skills:' "$_TASK_FILE" 2>/dev/null | head -1 | sed 's/^skills:[[:space:]]*//' | tr -d '[]"' | tr -d ' ' || true),"
-fi
+_RG_CARDS="${_TASK_FILE:-}"
+case "${AGENT_NAME:-}" in
+  ""|*/*|.*) ;;
+  *)
+    if [ -f "${_CREWVIA_REPO}/queue/assignments/${AGENT_NAME}" ]; then
+      _RG_ASG="$(tr -d '\n' < "${_CREWVIA_REPO}/queue/assignments/${AGENT_NAME}" 2>/dev/null || true)"
+      case "$_RG_ASG" in
+        *:*) _RG_CARDS="${_RG_CARDS}
+${_CREWVIA_REPO}/queue/missions/${_RG_ASG%%:*}/tasks/${_RG_ASG##*:}.md" ;;
+      esac
+    fi
+    ;;
+esac
+while IFS= read -r _RG_CARD; do
+  if [ -n "$_RG_CARD" ] && [ -f "$_RG_CARD" ]; then
+    _RG_SKILLS="${_RG_SKILLS}$(grep '^skills:' "$_RG_CARD" 2>/dev/null | head -1 | sed 's/^skills:[[:space:]]*//' | tr -d '[]"' | tr -d ' ' || true),"
+  fi
+done <<< "$_RG_CARDS"
 case "$_RG_SKILLS" in
   *,research,*)
     _RG_PY="${_CREWVIA_REPO}/hooks/lib_research_guard.py"
@@ -572,7 +589,7 @@ case "$_RG_SKILLS" in
       emit_decision "deny" "$_RG_REASON"
       exit 0
     elif [ "$TOOL_NAME" = "Bash" ]; then
-      _RG_RESULT="$(printf '%s' "$COMMAND" | python3 "$_RG_PY" bash 2>/dev/null || echo '{"decision":"deny","reason":"research guard crashed"}')"
+      _RG_RESULT="$(printf '%s' "$COMMAND" | python3 "$_RG_PY" bash --repo "$_CREWVIA_REPO" --agent "${AGENT_NAME:-}" --cwd "$(pwd)" 2>/dev/null || echo '{"decision":"deny","reason":"research guard crashed"}')"
       _RG_DECISION="$(echo "$_RG_RESULT" | jq -r '.decision // "deny"' 2>/dev/null || echo deny)"
       if [ "$_RG_DECISION" != "allow" ]; then
         _RG_REASON="$(echo "$_RG_RESULT" | jq -r '.reason // "research guard"' 2>/dev/null || echo "research guard")"

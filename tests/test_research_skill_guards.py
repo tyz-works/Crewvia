@@ -4,9 +4,12 @@
 証明しない)。設計: knowledge/research-skill-guards.md
 """
 
+import importlib.util
 import json
 import os
+import shlex
 import shutil
+import string
 import subprocess
 from pathlib import Path
 
@@ -144,99 +147,417 @@ def test_card_skills_count_even_when_env_skills_lack_research(fake_repo):
 
 
 # ---------------------------------------------------------------- (2) bash allowlist
+#
+# t005: 「解釈が要らない形だけ通す」allowlist (knowledge/research-skill-guards.md §2)。
+
+
+def _load_guard():
+    spec = importlib.util.spec_from_file_location("lib_research_guard_under_test", GUARD)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+LIB = _load_guard()
+
+
+def _lib(cmd, **ctx):
+    out = subprocess.run(["python3", "-I", str(GUARD), "bash", cmd], capture_output=True, text=True)
+    return json.loads(out.stdout)["decision"]
+
 
 ALLOWED = [
     "ls -la",
     "sed -n '1,200p' scripts/watchdog.py",
+    "sed -n '688,700p;735,745p' scripts/watchdog.py",
     "grep -n 'foo' scripts/plan.sh | head -40",
+    "grep -rn 'x\\|y' --include=*.md . | grep -v '^./queue'",
     "cd /tmp && pwd && ls",
     "git log --oneline -3 && git diff origin/main --stat",
     "git fetch origin main -q",
     "git -C /tmp/x status -sb",
+    "git rev-list --left-right --count origin/main...HEAD",
+    "git branch -a",
+    "git branch --list 'task/*'",
+    "git tag -l 'v1*'",
+    "git config --get remote.origin.url",
+    "git remote -v",
+    "git worktree list",
     "gh pr view 12 --json state",
+    "gh pr view 12 --json state --jq .state",
     "gh run list --branch main --limit 3 2>&1 | head -5",
     "gh api repos/o/r/pulls/1/comments",
-    "gh api -X GET repos/o/r",
+    "gh api repos/o/r/pulls --paginate --jq '.[].number'",
+    "gh api -q .name repos/o/r",
     "wc -l a b; cat a 2>/dev/null",
     "find . -name '*.py' -not -path './node_modules/*'",
-    "awk '{print $1}' file",
     "timeout 120 ugrep -G 'foo' knowledge/",
     "./scripts/plan.sh pull --agent X --skills research",
     "./scripts/plan.sh status",
-    "source .crewvia-env && echo $CREWVIA_TASK_ID",
+    "plan status --mission m",
+    "source .crewvia-env && ls",
+    ". .crewvia-env",
     "echo hi 2>&1 >/dev/null",
-    "./scripts/plan.sh done t001 --mission m --result-file - <<'EOF'\nresult > text $(not run) `nor this`\nEOF",
-    "python3 -m json.tool < x.json",
+    "echo \"--- merge-base vs origin/main ---\" && git log --oneline origin/main -1",
+    "cat -n f | sed 's/^/ /'",
+    "ls queue/missions/*/notes",
+    "jq -r .name < x.json",
+    "head -150 f && tail -n 5 f",
+    "sort -u f | uniq -c",
+    "printf '%s\\n' a b",
+    "printenv AGENT_NAME",
+    "./scripts/plan.sh needs-director --help 2>&1 | head -20",
 ]
 DENIED = [
+    # 書き込み
     "echo x > f",
     "echo x >> f",
     "cat a > b",
-    "cat > f <<'EOF'\nx\nEOF",
-    "cat <<EOF\n$(rm -rf x)\nEOF",  # 引用符なし heredoc
+    "cat a 2> err.txt",
+    "cat a &> out",
+    "cat a >out",
+    "cat a >| out",
+    "cat a <> f",
     "tee f",
     "echo x | tee f",
     "sed -i 's/a/b/' f",
+    "sed -ni 's/a/b/' f",
     "sed -n 'w out' f",
     "sed 's/a/b/w out' f",
+    "sed 's/a/b/e' f",
     "cp a b",
     "mv a b",
     "rm a",
     "mkdir d",
     "touch f",
-    "python3 -c \"open('f','w').write('x')\"",
-    "python3 script.py",
+    "dd if=a of=b",
+    "uniq in out",
+    "uniq in o*",
+    "sort -o out in",
+    "sort --output=out in",
+    "sort --compress-program=sh in",
+    "tree -o out",
+    # heredoc は全面拒否 (t005 項目 1)
+    "cat > f <<'EOF'\nx\nEOF",
+    "cat <<'EOF'\nx\nEOF",
+    "cat <<EOF\n$(rm -rf x)\nEOF",
+    "cat <<< 'x'",
+    "./scripts/plan.sh done t001 --mission m --result-file - <<'EOF'\nresult\nEOF",
+    # 展開・状態変更 (t005 項目 2)
+    "echo $(rm x)",
+    "echo `rm x`",
+    "echo $HOME",
+    "echo ${HOME}",
+    "ls # comment",
+    "grep -n '#' f",
+    "ls & rm x",
+    "FOO=1 ls",
+    "X=1",
+    "export X=1",
+    "unset PATH",
+    "alias ls=rm",
+    "declare -x X=1",
+    "set -e",
+    "source evil.sh",
+    ". evil.sh",
+    "source ./x/.crewvia-env",
+    "ls && source .crewvia-env",
+    "env ls",
+    "command ls",
+    "builtin cd",
+    "exec ls",
+    "eval ls",
+    "xargs rm",
+    "nohup ls",
+    "time ls",
+    "timeout 5 rm x",
+    "timeout 5 timeout 5 ls",
+    "timeout -s KILL 5 ls",
+    "(rm x)",
+    "{ rm x; }",
+    "! ls",
+    "ls {a,-o}",
+    "ls <(rm x)",
+    "/tmp/ls",
+    "bin/cat f",
+    "sort * ",
+    "grep -e * f",
+    "cat -n*",
+    # 言語を持つツール (t005 項目 3)
+    "awk '{print $1}' file",
+    "awk '{print 1}' file",
+    "python3 -m json.tool < x.json",
     "python3 -c 'print(1)'",
-    "bash -c 'echo x > f'",
-    "sh script.sh",
+    "python3 script.py",
     "node -e 1",
     "perl -e 1",
-    "xargs rm",
+    "xxd f",
+    "bash -c 'ls'",
+    "sh script.sh",
+    "yq . f",
+    # オプションの allowlist (t005 項目 4)
     "find . -delete",
     "find . -exec rm {} \\;",
     "find . -fprint out",
-    "awk 'BEGIN{print 1 > \"f\"}'",
-    "awk '{system(\"rm x\")}' f",
-    "echo $(rm x)",
-    "echo `rm x`",
-    "ls & rm x",
-    "FOO=1 ls",
+    "find . -newer x -okdir rm",
+    "jq . a --rawfile x y",
+    "jq -f prog.jq a",
+    "grep --pre=sh x f",
+    "rg --pre sh x",
+    "rg --hostname-bin=sh x",
+    "ugrep --save-config x",
+    "ugrep --filter=x f",
+    "less f",
     "git add .",
     "git commit -m x",
     "git push origin HEAD",
     "git checkout -b x",
     "git -c core.pager=x log",
+    "git --exec-path=/tmp log",
     "git log --output=out",
     "git diff --ext-diff",
+    "git diff --textconv",
+    "git grep -O x",
+    # 表では値を取る (-L <range>) が git grep では値を取らない -L の「値」に -O を隠す形。
+    # - で始まる値を拒否する規則だけが止める (取り違えの防止)
+    "git grep -L -O vim x",
+    "git cat-file --filters HEAD:x",
+    "git fetch --upload-pack=sh origin",
+    "git fetch origin main:main",
+    "git fetch origin +x:y",
+    "git ls-remote 'ext::sh -c x'",
+    "git branch newbranch",
+    "git tag v9",
+    "git config user.name x",
+    "git remote add x y",
+    "git stash",
+    "git help log",
+    # gh (t005 項目 4)
     "gh pr merge 1",
     "gh pr create",
+    "gh pr view 1 --web",
+    "gh api -X GET repos/o/r",
     "gh api -X POST repos/o/r/issues",
+    "gh api --method=DELETE repos/o/r",
     "gh api repos/o/r/issues -f title=x",
-    "gh api graphql -f query=x",
+    "gh api repos/o/r -Ffoo=bar",
+    "gh api repos/o/r --raw-field=a=b",
+    "gh api repos/o/r --input f",
+    "gh api repos/o/r -H 'X: y'",
+    "gh api graphql",
+    "gh api a b",
     "curl http://x",
+    # plan.sh
     "./scripts/plan.sh add x",
     "./scripts/plan.sh update t001 --status done",
+    "./scripts/plan.sh done t001 'result text'",
+    "./scripts/plan.sh done t001 --result-file -",
+    "./scripts/plan.sh done t001 --result-file /tmp/r.md",
+    "./scripts/plan.sh needs-director t001 'reason'",
+    "../scripts/plan.sh status",
+    # 区切りの組み合わせ
     "ls; echo x > f",
     "ls && cp a b",
     "ls | tee f",
-    "cat a 2> err.txt",
-    "cat a &> out",
-    "cat a >out",
-    "dd if=a of=b",
-    "jq . a --rawfile x y",
+    "ls || rm x",
 ]
 
 
 @pytest.mark.parametrize("cmd", ALLOWED)
-def test_allowlist_passes_normal_investigation(fake_repo, cmd):
-    out = subprocess.run(["python3", "-I", str(GUARD), "bash", cmd], capture_output=True, text=True)
-    assert json.loads(out.stdout)["decision"] == "allow", (cmd, out.stdout)
+def test_allowlist_passes_normal_investigation(cmd):
+    assert _lib(cmd) == "allow"
 
 
 @pytest.mark.parametrize("cmd", DENIED)
 def test_writes_and_unknown_forms_are_denied_by_the_lib(cmd):
-    out = subprocess.run(["python3", "-I", str(GUARD), "bash", cmd], capture_output=True, text=True)
-    assert json.loads(out.stdout)["decision"] == "deny", (cmd, out.stdout)
+    assert _lib(cmd) == "deny"
+
+
+# Codex (t003) の指摘の再現。どれも PR #299 の初版 (b5d1b81) では allow だった
+CODEX_REPRODUCTIONS = [
+    "command rm victim",                                   # 指摘 1
+    "cat /dev/null # <<'EOF'\ntouch victim\nEOF",          # 指摘 2
+    "cat /dev/null <<'EOF'\nEOF\ntouch victim",            # 指摘 2 (heredoc そのもの)
+    "awk -v x=1 'BEGIN {system(\"touch victim\")}'",       # 指摘 3
+    "python3 -m json.tool input.json victim",              # 指摘 4
+    "xxd -r input victim",                                 # 指摘 4
+    "sort -ovictim input",                                 # 指摘 4
+    "gh api -XDELETE repos/o/r",                           # 指摘 5
+    "gh api -fa=b repos/o/r",                              # 指摘 5
+    "gh api -Fa=b repos/o/r",                              # 指摘 5
+    "export PATH=/tmp; ls",                                # 指摘 6
+    "export LD_PRELOAD=x; ls",                             # 指摘 6
+]
+
+
+@pytest.mark.parametrize("cmd", CODEX_REPRODUCTIONS)
+def test_codex_reproductions_are_denied_by_the_lib(cmd):
+    assert _lib(cmd) == "deny"
+
+
+@pytest.mark.parametrize("cmd", CODEX_REPRODUCTIONS)
+@pytest.mark.parametrize("token", ["", "tok"])
+def test_codex_reproductions_are_denied_by_the_hook(fake_repo, cmd, token):
+    assert _bash(fake_repo, cmd, token=token) == "deny"
+
+
+# ---- 列挙: 表 (lib の all_specs) から全組み合わせを作る。表に行を足すとテストも増える
+
+_CANDIDATES = string.ascii_letters + string.digits + "%+.@_=,:"
+
+
+def _spec_ids():
+    return [" ".join(prefix) for prefix, _ in LIB.all_specs()]
+
+
+@pytest.mark.parametrize("prefix_s", _spec_ids())
+def test_every_unlisted_option_is_denied_in_split_and_attached_form(prefix_s):
+    spec = dict((" ".join(p), s) for p, s in LIB.all_specs())[prefix_s]
+    prefix = prefix_s.split()
+    if spec.any_args:
+        pytest.skip("any_args (echo): 引数を検査しない行。読み書きも実行もしない builtin だけに使う")
+    listed = set(spec.short) | set(spec.short_arg)
+    checked = 0
+    for c in _CANDIDATES:
+        if c in listed or (spec.digits and c.isdigit()):
+            continue
+        forms = [[f"-{c}victim"]]
+        if not (spec.numeric and c.isdigit()):
+            forms.append([f"-{c}", "victim"])
+        if spec.short:
+            forms.append([f"-{spec.short[0]}{c}victim"])   # 許可された文字の後ろに結合
+        for extra in forms:
+            words = [*prefix, *extra]
+            cmd = " ".join(shlex.quote(w) for w in words)
+            decision, reason = LIB.check_bash(cmd)
+            assert decision == "deny", (cmd, reason)
+            checked += 1
+    for long in ("zz-not-listed", "output", "exec"):
+        if long in spec.all_long():
+            continue
+        for extra in ([f"--{long}"], [f"--{long}=victim"], [f"--{long}", "victim"]):
+            cmd = " ".join(shlex.quote(w) for w in [*prefix, *extra])
+            assert LIB.check_bash(cmd)[0] == "deny", cmd
+            checked += 1
+    for name in spec.long:   # 値を取らない長いオプションに = で値を付けた形
+        cmd = " ".join(shlex.quote(w) for w in [*prefix, f"--{name}=victim"])
+        assert LIB.check_bash(cmd)[0] == "deny", cmd
+        checked += 1
+    assert checked >= 20
+
+
+def test_enumeration_covers_the_whole_table():
+    ids = _spec_ids()
+    assert len(ids) >= 80
+    for must in ("sort", "grep", "rg", "ugrep", "jq", "sed", "git log", "git fetch", "gh api", "gh pr view",
+                 "./scripts/plan.sh done"):
+        assert must in ids
+
+
+# GNU getopt_long と git の parse-options は長いオプションの「一意な前方一致」を受け付ける。
+# allowlist の名前が危ない名前の前方一致になっていると、その名前で危ないオプションが動く。
+DANGEROUS_LONG = {
+    # git の大域オプション (--exec-path / --git-dir / --work-tree / --config-env / -c) は _check_git が
+    # サブコマンドの前で別に拒否する (DENIED)。ここはサブコマンドのオプション
+    "git": ["output", "ext-diff", "textconv", "open-files-in-pager", "upload-pack", "exec", "filters",
+            "set-upstream", "contents"],
+    "sort": ["output", "compress-program", "temporary-directory"],
+    "sed": ["in-place", "file", "follow-symlinks"],
+    "grep": ["pre"], "egrep": ["pre"], "fgrep": ["pre"],
+    "rg": ["pre", "pre-glob", "hostname-bin", "search-zip"],
+    "ugrep": ["filter", "pager", "save-config", "config", "view", "query", "decompress"],
+    "jq": ["from-file", "rawfile", "slurpfile", "library-path"],
+    "tree": ["output", "fromfile"],
+    # gh (cobra / pflag) は前方一致を受け付けないので載せない (完全一致の allowlist で足りる)
+}
+
+
+@pytest.mark.parametrize("prefix_s", _spec_ids())
+def test_no_listed_long_option_abbreviates_a_dangerous_one(prefix_s):
+    spec = dict((" ".join(p), s) for p, s in LIB.all_specs())[prefix_s]
+    for name in spec.all_long():
+        for bad in DANGEROUS_LONG.get(prefix_s.split()[0], []):
+            assert not bad.startswith(name), (prefix_s, name, bad)
+
+
+def test_glob_words_cannot_become_options(tmp_path):
+    # 展開すると -o… になりうる語は通さない。先頭が字そのものなら展開しても先頭は変わらない
+    assert LIB.check_bash("ls *.md")[0] == "deny"
+    assert LIB.check_bash("ls ?x")[0] == "deny"
+    assert LIB.check_bash("ls [-]o")[0] == "deny"
+    assert LIB.check_bash("ls a*.md")[0] == "allow"
+    assert LIB.check_bash("ls '-'*")[0] == "deny"
+    assert LIB.check_bash("grep -r x --include=*.md .")[0] == "allow"
+    assert LIB.check_bash("grep -r x -e*")[0] == "deny"
+
+
+def test_source_crewvia_env_is_the_one_fixed_form():
+    assert LIB.check_bash("source .crewvia-env")[0] == "allow"
+    assert LIB.check_bash("source .crewvia-env && ./scripts/plan.sh status")[0] == "allow"
+    for bad in ("source .crewvia-env x", "source ../.crewvia-env", "cd /x && source .crewvia-env",
+                "timeout 5 source .crewvia-env", "source '.crewvia-env'x"):
+        assert LIB.check_bash(bad)[0] == "deny", bad
+
+
+@pytest.mark.parametrize("cmd", [
+    "cat <<'EOF'\nx\nEOF",
+    "cat <<EOF\nx\nEOF",
+    "cat <<-'EOF'\n\tx\n\tEOF",
+    "cat <<< x",
+    "cat /dev/null # <<'EOF'\ntouch victim\nEOF",
+    "./scripts/plan.sh done t001 --result-file - <<'EOF'\nx\nEOF",
+    "grep -n '<<' f",
+])
+def test_heredoc_is_rejected_up_front_with_guidance(cmd):
+    # heredoc は文字の段階で拒否し、代わりの手順 (Write でメモ → --result-file) を返す。
+    # 字句解析も本文の行をコマンドとして検査するので二重に止まるが、案内はこの段でしか出ない
+    decision, reason = LIB.check_bash(cmd)
+    assert decision == "deny"
+    assert "heredoc" in reason and "--result-file" in reason, reason
+
+
+# ---- plan.sh done / needs-director の結果は --result-file <自分の notes> だけ (t005 項目 1)
+
+
+@pytest.mark.parametrize("sub", ["done", "needs-director"])
+def test_plan_result_file_must_be_own_notes(fake_repo, sub):
+    notes = fake_repo / "queue/missions" / SLUG / "notes"
+    (notes / "t001-result.md").write_text("result\n")
+    rel = f"queue/missions/{SLUG}/notes/t001-result.md"
+    ok = [
+        f"./scripts/plan.sh {sub} t001 --mission {SLUG} --execution ex-1 --result-file {rel}",
+        f"./scripts/plan.sh {sub} t001 --result-file {notes / 't001-result.md'}",
+        f"cd /tmp && ./scripts/plan.sh {sub} t001 --result-file {notes / 't001-result.md'}",
+    ]
+    for cmd in ok:
+        assert _bash(fake_repo, cmd) == "native", cmd   # 通る (TASKVIA_TOKEN 空 = native に委ねる)
+    other = fake_repo / "queue/missions" / OTHER_SLUG / "notes"
+    other.mkdir()
+    (other / "t001-x.md").write_text("x")
+    (notes / "t002-x.md").write_text("x")
+    bad = [
+        f"./scripts/plan.sh {sub} t001 --result-file {other / 't001-x.md'}",       # 他 mission
+        f"./scripts/plan.sh {sub} t001 --result-file {notes / 't002-x.md'}",       # 他 task
+        f"./scripts/plan.sh {sub} t001 --result-file queue/missions/{SLUG}/tasks/t001.md",
+        f"./scripts/plan.sh {sub} t001 --result-file -",
+        f"./scripts/plan.sh {sub} t001 'inline text'",
+        f"./scripts/plan.sh {sub} t001",
+        f"cd /tmp && ./scripts/plan.sh {sub} t001 --result-file {rel}",           # cd の後ろの相対パス
+        f"./scripts/plan.sh {sub} t001 --result-file {rel} --result-file {rel}",
+        f"./scripts/plan.sh {sub} t001 --result-file - <<'EOF'\nx\nEOF",
+    ]
+    for cmd in bad:
+        assert _bash(fake_repo, cmd) == "deny", cmd
+
+
+def test_plan_result_file_needs_an_assignment(fake_repo):
+    (fake_repo / "queue/missions" / SLUG / "notes" / "t001-r.md").write_text("r")
+    (fake_repo / "queue/assignments/Jiwon").unlink()
+    cmd = f"./scripts/plan.sh done t001 --result-file queue/missions/{SLUG}/notes/t001-r.md"
+    assert _bash(fake_repo, cmd, skills="research") == "deny"
+
+
+# ---- hook 側
 
 
 @pytest.mark.parametrize("cmd", ["echo x > f", "tee f", "sed -i s/a/b/ f", "cp a b", "rm a", "python3 -c \"open('f','w')\""])
@@ -256,11 +577,28 @@ def test_mixed_skill_set_is_still_guarded(fake_repo):
     assert _bash(fake_repo, "echo x > f", skills="docs,research") == "deny"
 
 
+def test_card_skills_count_even_when_task_id_is_already_set(fake_repo):
+    # Codex 指摘 7 (P2): env の TASK_ID が設定済みで SKILLS が空 / research を含まなくても、
+    # assignment の card の skills に research があれば対象
+    for skills in ("", "docs"):
+        for cmd in ("echo x > f", "command rm victim"):
+            assert _bash(fake_repo, cmd, skills=skills, extra={"TASK_ID": "t001"}) == "deny", (skills, cmd)
+        note = fake_repo / "queue/missions" / SLUG / "notes" / "t001-x.md"
+        assert _write(fake_repo, note, skills=skills, extra={"TASK_ID": "t001"}) == "allow"
+        assert _write(fake_repo, fake_repo / "hooks/x.sh", skills=skills, extra={"TASK_ID": "t001"}) == "deny"
+
+
+def test_task_id_set_but_card_is_not_research_is_unchanged(fake_repo):
+    _set_card_skills(fake_repo, "code")
+    assert _bash(fake_repo, "echo x > f", skills="code", extra={"TASK_ID": "t001"}) == "native"
+
+
 def test_other_skills_bash_is_unchanged(fake_repo):
     # research を含まない skill の Bash は今までどおり (リダイレクトも hook では止めない)
     _set_card_skills(fake_repo, "code")
     assert _bash(fake_repo, "echo x > f", skills="code") == "native"
     assert _bash(fake_repo, "cp a b", skills="bash") == "native"
+    assert _bash(fake_repo, "cat <<'EOF'\nx\nEOF", skills="code") == "native"
 
 
 def test_crashing_guard_fails_closed(fake_repo):

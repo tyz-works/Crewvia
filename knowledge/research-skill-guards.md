@@ -6,7 +6,7 @@
 ## 何を止めて何を通すか
 
 判定は `hooks/lib_research_guard.py` の 1 か所（`hooks/pre-tool-use.sh` の "Research scope guard" から呼ぶ）。
-SKILLS（と task card の skills）に `research` を含むセッションだけが対象。**判断に迷う形は deny**（fail closed）。
+SKILLS（と task card の skills）に `research` を含むセッションだけが対象。card は env の `TASK_ID` の有無に関係なく `queue/assignments/<AGENT_NAME>` から引く（t005。`TASK_ID` が設定済みでも card の skills を見る）。**判断に迷う形は deny**（fail closed）。
 どちらの判定も `TASKVIA_TOKEN` が空でも効く（native へ委ねる分岐より前）。
 
 ### 1. Write / Edit / MultiEdit / NotebookEdit
@@ -26,28 +26,73 @@ slug と tid は `queue/assignments/<AGENT_NAME>`（`<slug>:<tid>`）から引�
 obsidian を有効にするには `config/skill-permissions.yaml` の末尾 `research_write_scope.obsidian_research_dir` に絶対パス（`~` 可）を書く
 （公開リポジトリなので既定値は空。ローカル変更として持つ）。
 
-使い方: research の Worker は調査メモを `queue/missions/<slug>/notes/<tid>-<topic>.md` に Write で残し、`plan.sh done` の Result にそのパスを書く。
+### research Worker が done / needs-director する手順
 
-### 2. Bash（読み取り専用の allowlist）
+Bash の heredoc（`<<`）は全面的に拒否する（§2）。結果は **Write でメモに書いて、そのパスを `--result-file` に渡す**:
 
-通る形:
-`cat head tail wc ls stat file realpath diff sort uniq cut tr jq grep rg ugrep find`（`-exec -delete -fprint*` 以外）・`sed`（`-n` の行指定 `p` と `s///[gIp]` だけ。`-i -f` と `w e r` は不可）・
-`awk`（`> | system getline close` を含まないプログラムだけ）・`echo printf pwd date which test sleep`・`cd`・`source .crewvia-env`・`timeout/time <許可コマンド>`・
-`git log|show|diff|status|rev-parse|ls-files|grep|blame|rev-list|cat-file|ls-tree|merge-base|describe|fetch|branch -a|remote -v|worktree list`（`-c`・`--output`・`--ext-diff` は不可）・
-`gh pr view|diff|checks|list|status`・`gh run list|view`・`gh issue view|list`・`gh api`（GET のみ。`-f -F --input` と `graphql` は不可）・
-`plan.sh status|pull|done|needs-director|pr-base|store-check`（`--result-file -` を `<<'EOF'` の引用符つき heredoc で渡す形も可）・`python3 -m json.tool`。
-パイプ・`&&`・`||`・`;` でつないだ各区間がすべて通ったときだけ通る。`2>&1`・`2>/dev/null` は可。
+1. Write で `queue/missions/<slug>/notes/<tid>-result.md`（`<tid>` で始まる `.md` なら名前は自由）に Result を書く。
+   リポジトリの絶対パス（主 checkout の `queue/`）で書くのが確実。調査の途中のメモも同じ dir に残してよい（上書き可）。
+2. `plan.sh done <tid> --mission <slug> --execution ex-… --result-file <1 のパス>`
+   （判断を仰ぐときは `plan.sh needs-director <tid> --mission <slug> --execution ex-… --result-file <パス>`。要約はファイルの先頭行に）。
 
-通らない形: `>` `>>`（`/dev/null` 宛て以外）・`tee`・`sed -i`・`cp mv rm mkdir touch chmod`・`xargs`・`$(…)`・バッククォート・プロセス置換・`&`・
-引用符なしの heredoc・先頭の `VAR=value`・`bash -c`・**`python3`（`-m json.tool` 以外）**・`curl wget`・`git add|commit|push|checkout|reset|merge`。
+`--result-file` に渡せるのは自分の assignment の `notes/<tid>*.md` だけ（`-`・他の task / mission・card は不可）。
+相対パスは hook の cwd で解決する。同じコマンドの前に `cd` があるときは絶対パスで渡す。
+位置引数の結果文字列（`plan.sh done t001 "…"`）は通らない。
 
-**python3 / node / perl は一律不可**にした（`open(..,'w')` を静的に見分けられないため）。読むだけの用途は grep / sed -n / jq / yq で代える。
-**`git fetch` は通す**（.git の remote ref を更新するだけで作業ツリーは変えない。過去の research Worker が毎回使っていた）。
+### 2. Bash（解釈の要らない読み取り専用の形だけ。t005 で狭めた）
 
-過去の research Worker（Jiwon, mission 20260921-daemon-authority-and-mutual-watch t001）の Bash 実績 40 件で実測:
-読み取りの調査（sed -n / grep / wc / ls / git log / gh run list / plan.sh pull|needs-director / awk の読み）は止まらない。
-止まったのは `git add|commit|push`・`sed -i`・heredoc への `cat >>`・`python3 -c`（読むだけ）・`awk` の一部だけ
-（前の 4 つは意図した遮断、`python3 -c` は上の代替で足りる）。
+PR #299 の初版は bash の文法を部分的に解釈して危ない形を探していたが、Codex review（t003）で同じ型の穴が 6 件出た
+（`command rm`・コメント内の heredoc・`awk -v`・出力先を位置引数 / 結合形で取るオプション・`gh api -XDELETE`・`export PATH`）。
+1 件ずつ塞ぐのをやめ、**解釈が要らない形だけを通す**側へ狭めた。調査の読み取りが多少不便になるのは許容する
+（ファイルを読むのは Read / Grep / Glob ツールで足りる。これらは hook の対象外で今までどおり使える）。
+
+**文字の段階で拒否**（引用符の中も一律）: `$`（変数・コマンド置換すべて）・バッククォート・`#`・`<<`（heredoc と here-string）。
+
+**引用符の外で拒否**: `( ) { } !`（サブシェル・グループ・ブレース展開・否定）・`&`（バックグラウンド）・
+`>` `>>`（`/dev/null` 宛てと `2>&1` 以外）・`<>` `<&` `<(` `>(`。glob（`* ? [`）は**先頭が `-` でない字そのもの**で始まる語だけ
+（`ls queue/missions/*/notes` は可、`ls *.md` は不可 — 展開結果が `-o…` のようなオプションになりうるため）。`--include=*.md` のように
+`--名前=` の後ろの glob は可。
+
+**コマンド名**は lib の表（`SPECS` / `GIT_SPECS` / `GH_SPECS` / `PLAN_SPECS`）に完全一致するものだけ（パス指定は `plan.sh` だけ。`plan` も可）。
+`export unset alias declare set source . env command builtin exec eval xargs nohup time` と先頭の `X=…` は表に無いので拒否
+= PATH や LD_PRELOAD を変えて許可コマンドを差し替えられない。例外は 2 つ:
+- `source .crewvia-env`（または `. .crewvia-env`）: **先頭の区間**で、ファイル名が完全一致する固定形だけ。
+  `cd <worktree>` は別の Bash 呼び出しで先に済ませる（cwd は呼び出しをまたいで残る）。
+- `timeout <秒数> <許可コマンド>`: 後ろを同じ規則で検査する（`timeout` の入れ子・オプションは不可）。
+
+**言語を持つツールは全部不可**: `awk python3 node perl xxd yq bash sh`（`python3 -m json.tool` も不可。整形は `jq`）。
+
+**オプションは allowlist**（denylist ではない）: 表に列挙したオプション以外の `-`/`--` で始まる語は拒否。
+結合形（`-ovictim`・`-XDELETE`・`-fa=b`）も 1 字ずつ表と照合するので、列挙外の頭文字なら拒否される。
+次の語から値を取るオプションの値が `-` で始まるものも拒否（取り違えで後ろのオプションを見逃さない）。
+出力先を取るもの（`sort -o`・`tee`・`split`・`tree -o`・`uniq` の 2 つ目の位置引数 ...）は表に入れていない / 列挙していない。
+
+| 種類 | 通る形（オプションは lib の表を見る） |
+|---|---|
+| 読む | `cat head tail wc ls stat file realpath dirname basename diff cmp nl sort uniq cut tr rev tac column paste comm od strings readlink sha256sum md5sum du df tree` |
+| 探す | `grep egrep fgrep rg ugrep jq find`（`find` は述語の allowlist。`-exec -delete -fprint* -ok*` は不可） |
+| `sed` | `-n` の行指定 `p`/`=` と `s///[gIip]` だけ（`-i -f` と `w e r` は不可） |
+| その他 | `echo printf pwd date which printenv true false sleep cd` |
+| git | `log show diff status rev-parse ls-files grep blame rev-list cat-file ls-tree merge-base describe shortlog name-rev show-ref for-each-ref diff-tree diff-files diff-index count-objects whatchanged show-branch check-ignore version var ls-remote fetch`、`branch`/`tag`（位置引数があるときは `--list` 必須）、`remote [-v]`・`remote show`・`worktree list`・`stash list`・`config --get/--list`。大域オプションは `-C <dir>`・`--no-pager` 等だけ（`-c`・`--exec-path`・`--git-dir` は不可）。`fetch` の refspec（`a:b`・`+`）と `<transport>::` は不可 |
+| gh | `pr view/diff/checks/list/status`・`run list/view`・`issue view/list`・`repo view`・`release list/view`・`workflow list/view`・`search *`（`--web` は不可）。`gh api` は **パス 1 つ + `--jq`/`-q`/`--paginate` だけ**（`-X`/`--method`/`-f`/`-F`/`--field`/`--raw-field`/`--input`/`-H` は結合形も含め不可、`graphql` も不可） |
+| plan.sh | `status pull pr-base store-check`、`done`/`needs-director` は上の `--result-file` の形だけ |
+
+止まるものの代替:
+
+| 止まる形 | 代わり |
+|---|---|
+| `grep '^# x'`（`#` を含む） | Grep ツール、または `grep -n '^. x'` |
+| `echo "$AGENT_NAME"` | `printenv AGENT_NAME` |
+| `awk '/a/,/b/' f` | `sed -n '/a/,/b/p' f`、または Read ツール |
+| `python3 -m json.tool` / `python3 -c` で読む | `jq`、Read ツール |
+| `cat > f <<'EOF'` / `cat >> f` でメモを書く | Write ツールで `notes/<tid>*.md` に書く |
+| `plan.sh done t001 "$(cat <<'EOF' …)"` / `needs-director t001 "理由"` | Write でメモ → `--result-file <パス>` |
+| `ls *.md` | `ls`、`ls ./*.md`、Glob ツール |
+| `cd X && source .crewvia-env && …` | 1 回目の Bash で `cd X`、2 回目で `source .crewvia-env && …` |
+
+過去の research Worker（Jiwon, mission 20260921-daemon-authority-and-mutual-watch t001）の Bash 44 件で実測（t005）:
+通るのは 27 件（初版は 32 件）。止まる 17 件のうち 13 件は意図した遮断（heredoc での書き込み・`sed -i`・`git add/commit/push`・`python3 -c`・
+heredoc で Result を渡す `plan.sh done`）、残りの 4 件（`#` を含む grep・`awk`・`echo "$X"`・位置引数の `needs-director` 理由 ×2）は上の表の代替で足りる。
 
 ## hook を変えたときの効き方
 
@@ -55,4 +100,7 @@ hook は Worker のツール呼び出しごとに起動されるので、merge �
 
 ## テスト
 
-`tests/test_research_skill_guards.py`。赤の実証: ガードの塊を外す（または allowlist に `python3` を足す）と該当テストが赤になる。
+`tests/test_research_skill_guards.py`。Bash は表（`all_specs()`）から「列挙外のオプションの分離形・結合形・許可文字の後ろへの結合」を
+全組み合わせで回す（表に行を足すとテストも増える）。GNU getopt と git は長いオプションの前方一致を受け付けるので、表の名前が危ない名前の
+前方一致になっていないことも確かめる。Codex の指摘の再現は `CODEX_REPRODUCTIONS`。
+赤の実証: `python3 tests/red_proof_research_bash_guard.py`（t005 の項目 1〜5 を 1 つずつ戻した複製で同じテストを走らせる）。

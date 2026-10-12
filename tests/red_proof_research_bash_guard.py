@@ -106,6 +106,10 @@ MUTATIONS = [
     ("8b 字面の検査を外し realpath だけで判定する (symlink 経由を通す)", [
         (GUARD_REL, '        if lexical == os.path.join(root, "scripts", "plan.sh"):', '        if real == os.path.join(root_real, "scripts", "plan.sh"):'),
     ], "test_plan_sh_must_resolve_to_the_trusted_script"),
+    ("8c 同じコマンドの中の cd の行き先を cwd として追跡する", [
+        (GUARD_REL, '            ctx["cd_seen"] = True\n            ctx["cwd"] = None',
+         '            ctx["cd_seen"] = True\n            ctx["cwd"] = args[-1].value if args else None'),
+    ], "test_cd_in_the_same_command_does_not_vouch_for_a_relative_plan_sh"),
     ("9 git fetch に --prune / --prune-tags / -p を戻す", [
         (GUARD_REL, '    ("fetch",): _git(max_pos=2, check=_check_git_fetch),', '    ("fetch",): _git(short="p", long="prune prune-tags", max_pos=2, check=_check_git_fetch),'),
     ], "test_codex_reproductions_are_denied"),

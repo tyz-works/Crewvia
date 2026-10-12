@@ -61,8 +61,10 @@ cwd に `2` というファイルを作る（Codex 2 巡目の指摘 2）。glob
 hook の位置 `hooks/..`）の `scripts/plan.sh`」か「自分の worktree（`.claude/worktrees/<自分の slug>/<自分の tid>-*/`）の `scripts/plan.sh`」で
 あるときだけ通す。素の `plan` / `plan.sh`（alias・PATH で解決される）・別の場所の plan.sh・`..` を含むパス・symlink 経由は不可
 （plan.sh は `BASH_SOURCE` の dirname を論理パスで辿って lib を読むので、信頼する plan.sh への symlink を別の dir に置くと別の lib を
-読ませられる。realpath だけでなく字面も見る理由）。同じコマンドの中の `cd` は、絶対パス（`..`・`~` なし）か `./` で始まる相対だけを
-追跡し、それ以外（引数なし・`-`・CDPATH を引きうる相対）の後ろでは相対パスの plan.sh を拒否する。
+読ませられる。realpath だけでなく字面も見る理由）。**同じコマンドの中に `cd` があれば、その後ろの相対パスの plan.sh は拒否**
+（絶対パスなら可）。`cd` の後の cwd は字面から確定できない: パイプの中の `cd` はサブシェルで効かず（`cd <repo> | ./scripts/plan.sh`）、
+`false && cd <repo>; …`・`timeout 5 cd <repo>; …` も効かない。追跡すると「repo にいる」と判定したまま元の cwd の plan.sh が走る。
+`cd` は別の Bash 呼び出しで先に済ませる（cwd は呼び出しをまたいで残り、hook はその cwd で解決する）。
 `export unset alias declare set source . env command builtin exec eval xargs nohup time` と先頭の `X=…` は表に無いので拒否
 = PATH や LD_PRELOAD を変えて許可コマンドを差し替えられない。例外は 2 つ:
 - `source .crewvia-env`（または `. .crewvia-env`）: **先頭の区間**で、ファイル名が完全一致する固定形だけ。

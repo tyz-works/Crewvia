@@ -772,21 +772,6 @@ def _trusted_root() -> str:
     return os.environ.get("CREWVIA_REPO_ROOT") or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-def _cd_target(args: list[_Word], cwd: str | None) -> str | None:
-    """cd の後の cwd。字面だけで確定できない形 (引数なし = HOME・`-`・`~`・..・CDPATH を引きうる相対) は None。"""
-    pos = [w.value for w in args if not w.value.startswith("-") or w.value == "-"]
-    if len(pos) != 1 or args[-1].glob_at >= 0:
-        return None
-    d = pos[0]
-    if d == "-" or d.startswith("~") or ".." in d.split("/"):
-        return None
-    if os.path.isabs(d):
-        return os.path.normpath(d)
-    if cwd and d.startswith("./"):
-        return os.path.normpath(os.path.join(cwd, d))
-    return None
-
-
 def _is_trusted_plan(cmd: str, ctx: dict) -> bool:
     """コマンド語が「本 repo の scripts/plan.sh」か「自分の worktree の scripts/plan.sh」を指すか (t007)。
 
@@ -799,7 +784,7 @@ def _is_trusted_plan(cmd: str, ctx: dict) -> bool:
         return False
     cwd = ctx.get("cwd")
     if not os.path.isabs(cmd) and not cwd:
-        return False
+        return False  # 同じコマンドの中で cd した後 (cwd 不明) の相対パス
     lexical = os.path.normpath(cmd if os.path.isabs(cmd) else os.path.join(cwd, cmd))
     real = os.path.realpath(lexical)
     root_lex = os.path.normpath(os.path.abspath(_trusted_root()))
@@ -858,8 +843,11 @@ def _check_segment(words: list[_Word], index: int, ctx: dict, depth: int = 0) ->
     if cmd in SPECS:
         _run_spec(SPECS[cmd], args, cmd, ctx)
         if cmd == "cd":
+            # 同じコマンドの中の cd の後ろの cwd は字面から確定できない (パイプの中の cd はサブシェル、
+            # `false && cd x;`・`timeout 5 cd x` は効かない、CDPATH・失敗)。追跡せず「不明」にする
+            # = 後ろの相対パスの plan.sh / --result-file は拒否 (絶対パスで渡す)
             ctx["cd_seen"] = True
-            ctx["cwd"] = _cd_target(args, ctx.get("cwd"))
+            ctx["cwd"] = None
         return
     raise _Reject(
         f"{cmd!r} は research の読み取り専用 allowlist にありません "

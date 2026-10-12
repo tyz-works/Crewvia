@@ -38,7 +38,7 @@ def fake_repo(tmp_path):
     return repo
 
 
-def _run(repo, payload, skills="research", token="", extra=None):
+def _run(repo, payload, skills="research", token="", extra=None, cwd=None):
     env = {
         "HOME": str(repo),
         "PATH": os.environ["PATH"],
@@ -51,7 +51,7 @@ def _run(repo, payload, skills="research", token="", extra=None):
     env.update(extra or {})
     p = subprocess.run(
         ["bash", *(["-x"] if os.environ.get("RG_TRACE") else []), str(repo / "hooks" / "pre-tool-use.sh")],
-        input=json.dumps(payload), capture_output=True, text=True, env=env, cwd=str(repo), timeout=60,
+        input=json.dumps(payload), capture_output=True, text=True, env=env, cwd=str(cwd or repo), timeout=60,
     )
     assert p.returncode == 0, p.stderr[-3000:]
     if not p.stdout.strip():
@@ -561,7 +561,7 @@ def test_plan_result_file_must_be_own_notes(fake_repo, sub):
     ok = [
         f"./scripts/plan.sh {sub} t001 --mission {SLUG} --execution ex-1 --result-file {rel}",
         f"./scripts/plan.sh {sub} t001 --result-file {notes / 't001-result.md'}",
-        f"cd {fake_repo} && ./scripts/plan.sh {sub} t001 --result-file {notes / 't001-result.md'}",
+        f"cd {fake_repo} && {fake_repo}/scripts/plan.sh {sub} t001 --result-file {notes / 't001-result.md'}",
     ]
     for cmd in ok:
         assert _bash(fake_repo, cmd) == "native", cmd   # 通る (TASKVIA_TOKEN 空 = native に委ねる)
@@ -576,7 +576,7 @@ def test_plan_result_file_must_be_own_notes(fake_repo, sub):
         f"./scripts/plan.sh {sub} t001 --result-file -",
         f"./scripts/plan.sh {sub} t001 'inline text'",
         f"./scripts/plan.sh {sub} t001",
-        f"cd {fake_repo} && ./scripts/plan.sh {sub} t001 --result-file {rel}",    # cd の後ろの相対パス
+        f"cd {fake_repo} && {fake_repo}/scripts/plan.sh {sub} t001 --result-file {rel}",  # cd の後ろの相対パス
         f"./scripts/plan.sh {sub} t001 --result-file {rel} --result-file {rel}",
         f"./scripts/plan.sh {sub} t001 --result-file - <<'EOF'\nx\nEOF",
     ]
@@ -794,7 +794,7 @@ def test_plan_sh_must_resolve_to_the_trusted_script(fake_repo, tmp_path):
         f"{fake_repo}/scripts/plan.sh status",
         f"timeout 60 {fake_repo}/scripts/plan.sh status",
         f"{wt}/scripts/plan.sh status",                       # 自分の worktree
-        f"cd {wt} && ./scripts/plan.sh status",
+        f"cd {wt} && {wt}/scripts/plan.sh status",            # cd の後ろでも絶対パスなら可
     ]
     for cmd in ok:
         assert _bash(fake_repo, cmd) == "native", cmd
@@ -809,6 +809,7 @@ def test_plan_sh_must_resolve_to_the_trusted_script(fake_repo, tmp_path):
         f"cd {evil} && ./scripts/plan.sh status",
         f"cd {tmp_path}/lf && ./scripts/plan.sh status",
         "cd scripts && ./plan.sh status",                    # 相対の cd は CDPATH を引きうる = 確定できない
+        f"cd {wt} && ./scripts/plan.sh status",              # 同じコマンドの cd の後ろの相対パスは不可 (下の test)
         f"{other_wt}/scripts/plan.sh status",                # 他の task の worktree
         f"{other_slug_wt}/scripts/plan.sh status",           # 他の mission の worktree
         f"timeout 60 {evil}/scripts/plan.sh status",
@@ -831,3 +832,32 @@ def test_plan_sh_trusted_root_comes_from_crewvia_repo_root(fake_repo, tmp_path):
     link.symlink_to(fake_repo)
     for cmd in (f"{link}/scripts/plan.sh status", f"{fake_repo}/scripts/plan.sh status"):
         assert _bash(fake_repo, cmd, extra={"CREWVIA_REPO_ROOT": str(link)}) == "native", cmd
+
+
+@pytest.mark.parametrize("tmpl", [
+    # 同じコマンドの中の cd は効かないことがある (パイプ = サブシェル・条件で飛ばされる・外部コマンド扱い)。
+    # cd を追跡すると「repo にいる」と判定したまま、元の cwd (evil) の scripts/plan.sh が走る
+    "cd {repo} | ./scripts/plan.sh status",
+    "cd {repo} |& ./scripts/plan.sh status",
+    "false && cd {repo}; ./scripts/plan.sh status",
+    "true || cd {repo}; ./scripts/plan.sh status",
+    "timeout 5 cd {repo}; ./scripts/plan.sh status",
+    "cd {repo}/nonexistent || ./scripts/plan.sh status",
+    "cd {repo} && ls; ./scripts/plan.sh status",
+    "cd {repo} && ./scripts/plan.sh status",
+])
+def test_cd_in_the_same_command_does_not_vouch_for_a_relative_plan_sh(fake_repo, tmp_path, tmpl):
+    evil = tmp_path / "evil"
+    (evil / "scripts").mkdir(parents=True)
+    (evil / "scripts" / "plan.sh").write_text("#!/bin/bash\ntouch victim\n")
+    (fake_repo / "scripts").mkdir()
+    (fake_repo / "scripts" / "plan.sh").write_text("#!/bin/bash\n")
+    cmd = tmpl.format(repo=fake_repo)
+    # 前提: パイプの中の cd は効かず、元の cwd の plan.sh が走る (本物の bash で確かめる)
+    if tmpl.startswith("cd {repo} | "):
+        p = subprocess.run(["bash", "-c", "cd {} | pwd".format(shlex.quote(str(fake_repo)))], cwd=str(evil),
+                           capture_output=True, text=True)
+        assert p.stdout.strip() == str(evil)
+    assert _bash(fake_repo, cmd, cwd=evil) == "deny", cmd
+    assert _bash(fake_repo, "./scripts/plan.sh status", cwd=evil) == "deny"     # cwd の plan.sh は信頼しない
+    assert _bash(fake_repo, f"{fake_repo}/scripts/plan.sh status", cwd=evil) == "native"

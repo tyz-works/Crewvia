@@ -22,12 +22,9 @@ OTHER_SLUG = "20261012-other"
 @pytest.fixture()
 def fake_repo(tmp_path):
     repo = tmp_path / "repo"
-    (repo / "hooks").mkdir(parents=True)
+    # hooks/ は丸ごと写す (名前で指して写すと lib を足すたびに CI でだけ赤くなる)
+    shutil.copytree(REPO_ROOT / "hooks", repo / "hooks")
     (repo / "config").mkdir()
-    for name in ("pre-tool-use.sh", "lib_skill_perms.py", "lib_research_guard.py", "lib_approval_channel.sh"):
-        src = REPO_ROOT / "hooks" / name
-        if src.exists():
-            shutil.copy(src, repo / "hooks" / name)
     shutil.copy(REPO_ROOT / "config" / "skill-permissions.yaml", repo / "config" / "skill-permissions.yaml")
     for slug in (SLUG, OTHER_SLUG):
         (repo / "queue" / "missions" / slug / "tasks").mkdir(parents=True)

@@ -146,6 +146,12 @@ MUTATIONS = [
     ("12e git blame の --no-textconv の要求を外す", [
         (GUARD_REL, '                     long_arg="date", check=_require_no_textconv),', '                     long_arg="date"),'),
     ], "test_default_git_runs_textconv_and_the_required_flags_stop_it"),
+    ("13a find の述語の値の glob 検査を先頭だけに戻す", [
+        (GUARD_REL, '                if v.glob_at >= 0:\n                    raise _Reject(f"find {a} の値に', '                if v.glob_at == 0:\n                    raise _Reject(f"find {a} の値に'),
+    ], "test_writes_and_unknown_forms_are_denied_by_the_lib"),
+    ("13b find の始点の glob 検査を外す", [
+        (GUARD_REL, '        if w.glob_at >= 0:\n            raise _Reject("find の始点に', '        if False:\n            raise _Reject("find の始点に'),
+    ], "test_writes_and_unknown_forms_are_denied_by_the_lib"),
 ]
 
 

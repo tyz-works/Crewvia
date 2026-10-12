@@ -405,13 +405,15 @@ def _check_find(words: list[_Word]) -> None:
                 if i + 1 >= len(words):
                     raise _Reject(f"find {a} の値がありません")
                 v = words[i + 1]
-                if v.glob_at == 0:
-                    raise _Reject(f"find {a} の値が引用符の無い glob で始まっています ('...' で囲んでください)")
+                if v.glob_at >= 0:
+                    raise _Reject(f"find {a} の値に引用符の無い glob は使えません ('...' で囲んでください)")
                 i += 2
                 continue
             raise _Reject(f"find {a} は allowlist にありません (-exec -delete -fprint* -ok 等は不可)")
         if seen_pred:
             raise _Reject(f"find の述語の後ろの {a!r} は解釈できません")
+        if w.glob_at >= 0:
+            raise _Reject("find の始点に引用符の無い glob は使えません (展開で述語になりうる)")
         i += 1  # 始点
 
 

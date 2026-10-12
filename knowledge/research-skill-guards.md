@@ -107,6 +107,7 @@ hook の位置 `hooks/..`）の `scripts/plan.sh`」か「自分の worktree（`
 |---|---|
 | `grep '^# x'`（`#` を含む） | Grep ツール、または `grep -n '^. x'` |
 | `echo "$AGENT_NAME"` | `printenv AGENT_NAME` |
+| `find . -name *.md`（引用符の無い glob） | `find . -name '*.md'`（述語の値・始点とも引用符で囲む） |
 | `awk '/a/,/b/' f` | `sed -n '/a/,/b/p' f`、または Read ツール |
 | `python3 -m json.tool` / `python3 -c` で読む | `jq`、Read ツール |
 | `cat > f <<'EOF'` / `cat >> f` でメモを書く | Write ツールで `notes/<tid>*.md` に書く |

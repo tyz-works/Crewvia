@@ -320,6 +320,12 @@ DENIED = [
     "find . -exec rm {} \\;",
     "find . -fprint out",
     "find . -newer x -okdir rm",
+    # find の述語の値・始点の引用符の無い glob (t015。展開で -delete 等の述語になりうる)
+    "find . -name -*",
+    "find . -name *.md",
+    "find . -path ./a*",
+    "find -* .",
+    "find * -name x",
     "jq . a --rawfile x y",
     "jq -f prog.jq a",
     "grep --pre=sh x f",

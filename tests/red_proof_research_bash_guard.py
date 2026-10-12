@@ -113,7 +113,7 @@ MUTATIONS = [
     ], "test_cd_in_the_same_command_does_not_vouch_for_a_relative_plan_sh"),
     ("9 git fetch に --prune / --prune-tags / -p を戻す", [
         (GUARD_REL, '    ("fetch",): _git(long="no-prune no-prune-tags", max_pos=2, check=_check_git_fetch),', '    ("fetch",): _git(short="p", long="no-prune no-prune-tags prune prune-tags", max_pos=2, check=_check_git_fetch),'),
-    ], "test_codex_reproductions_are_denied"),
+    ], "test_git_fetch_only_three_forms"),
     ("9b git fetch の --no-prune --no-prune-tags 必須を外す (t016)", [
         (GUARD_REL, '    if not {"--no-prune", "--no-prune-tags"} <= keys:', '    if False:'),
     ], "test_git_fetch_only_three_forms"),

@@ -1035,3 +1035,55 @@ def test_log_without_diff_options_does_not_run_textconv(tmp_path):
         assert LIB.check_bash(cmd)[0] == "allow", cmd
         subprocess.run(cmd.split(), cwd=str(r), capture_output=True, check=True)
         assert not marker.exists(), cmd
+
+
+# ---- t011 (Codex 4 巡目 P2): research の範囲例外は _global.deny を上書きしない ----
+
+
+def _add_global_deny(repo, *patterns):
+    cfg = repo / "config" / "skill-permissions.yaml"
+    text = cfg.read_text()
+    assert "_global:\n  deny:\n" in text
+    block = "".join(f'    - "{p}"\n' for p in patterns)
+    cfg.write_text(text.replace("_global:\n  deny:\n", "_global:\n  deny:\n" + block, 1))
+
+
+@pytest.mark.parametrize("tool", ["Write", "Edit", "MultiEdit", "NotebookEdit"])
+@pytest.mark.parametrize("token", ["", "tok"])
+def test_global_deny_beats_the_research_write_scope(fake_repo, tool, token):
+    note = fake_repo / "queue/missions" / SLUG / "notes" / "t001-x.md"
+    assert _write(fake_repo, note, tool=tool, token=token) == "allow"  # 対照: 足す前は通る
+    _add_global_deny(fake_repo, tool)
+    assert _write(fake_repo, note, tool=tool, token=token) == "deny"
+
+
+def test_global_deny_on_one_tool_leaves_the_other_tools_scope_intact(fake_repo):
+    note = fake_repo / "queue/missions" / SLUG / "notes" / "t001-x.md"
+    _add_global_deny(fake_repo, "Write")
+    assert _write(fake_repo, note, tool="Write") == "deny"
+    assert _write(fake_repo, note, tool="Edit") == "allow"
+    assert _write(fake_repo, fake_repo / "hooks/x.sh", tool="Edit") == "deny"  # 範囲外は従来どおり
+
+
+def test_global_deny_beats_the_research_bash_allowlist(fake_repo):
+    assert _bash(fake_repo, "ls -la") == "native"  # 対照: allowlist を通る
+    _add_global_deny(fake_repo, "Bash(ls*)")
+    assert _bash(fake_repo, "ls -la") == "deny"
+    assert _bash(fake_repo, "ls -la", token="tok") == "deny"
+
+
+def test_other_skills_deny_beats_the_research_write_scope(fake_repo):
+    # research と同時に付いた skill の deny も範囲例外より先。deny を持たない skill (docs) は対照
+    cfg = fake_repo / "config" / "skill-permissions.yaml"
+    text = cfg.read_text()
+    assert "\nskills:\n" in text
+    cfg.write_text(text.replace("\nskills:\n", "\nskills:\n  zz_nowrite:\n    deny:\n      - \"Write\"\n", 1))
+    note = fake_repo / "queue/missions" / SLUG / "notes" / "t001-x.md"
+    assert _write(fake_repo, note, skills="research,docs") == "allow"
+    assert _write(fake_repo, note, skills="research,zz_nowrite") == "deny"
+
+
+def test_unreadable_skill_perms_denies_the_research_write(fake_repo):
+    (fake_repo / "hooks" / "lib_skill_perms.py").write_text("raise SystemExit(7)\n")
+    note = fake_repo / "queue/missions" / SLUG / "notes" / "t001-x.md"
+    assert _write(fake_repo, note) == "deny"

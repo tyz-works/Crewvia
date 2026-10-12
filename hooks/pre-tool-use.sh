@@ -582,6 +582,19 @@ case "$_RG_SKILLS" in
       _RG_DECISION="$(echo "$_RG_RESULT" | jq -r '.decision // "deny"' 2>/dev/null || echo deny)"
       _RG_REASON="$(echo "$_RG_RESULT" | jq -r '.reason // "research guard"' 2>/dev/null || echo "research guard")"
       if [ "$_RG_DECISION" = "allow" ]; then
+        # 範囲例外が上書きしてよいのは research 自身の deny (Edit/Write/MultiEdit) だけ (Codex 4 巡目 P2 / t011)。
+        # _global.deny と research 以外の skill の deny は、この allow で exit する前に評価する
+        # (_global.deny は「何があっても上書きできない」絶対安全弁。下の通常の判定まで進まないのでここで見る)。
+        # 評価は yaml が正本。lib_skill_perms の deny だけを採用し、none / allow は範囲例外の答えを変えない。
+        # 読めない・落ちた場合は deny (fail closed)。
+        _RG_OTHER_SKILLS="$(printf '%s' "$_RG_SKILLS" | tr ',' '\n' | grep -v -e '^$' -e '^research$' | sort -u | paste -sd, - || true)"
+        _RG_PERM="$(python3 "${_CREWVIA_REPO}/hooks/lib_skill_perms.py" "${_CREWVIA_REPO}/config/skill-permissions.yaml" "$_RG_OTHER_SKILLS" "$TOOL_NAME" 2>/dev/null || echo '{"decision":"deny","source":"lib_skill_perms crashed"}')"
+        if [ "$(echo "$_RG_PERM" | jq -r '.decision // "deny"' 2>/dev/null || echo deny)" = "deny" ]; then
+          _RG_PERM_SOURCE="$(echo "$_RG_PERM" | jq -r '.source // "unknown"' 2>/dev/null || echo unknown)"
+          echo "[pre-tool-use] 🚫 research write scope overridden by deny: ${TOOL_NAME} (${_RG_PERM_SOURCE})" >&2
+          emit_decision "deny" "Permission denied: ${_RG_PERM_SOURCE}"
+          exit 0
+        fi
         emit_decision "allow" "Research write scope: ${_RG_REASON}"
         exit 0
       fi

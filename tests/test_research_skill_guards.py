@@ -1087,3 +1087,24 @@ def test_unreadable_skill_perms_denies_the_research_write(fake_repo):
     (fake_repo / "hooks" / "lib_skill_perms.py").write_text("raise SystemExit(7)\n")
     note = fake_repo / "queue/missions" / SLUG / "notes" / "t001-x.md"
     assert _write(fake_repo, note) == "deny"
+
+
+# ---- t013 (Codex 5 巡目 P2): yaml が読めないとき research の範囲例外は allow しない / date は +FORMAT だけ ----
+
+
+def test_missing_yaml_denies_the_research_write_scope(fake_repo):
+    note = fake_repo / "queue/missions" / SLUG / "notes" / "t001-x.md"
+    assert _write(fake_repo, note) == "allow"  # 対照: yaml がある間は通る
+    (fake_repo / "config" / "skill-permissions.yaml").unlink()
+    assert _write(fake_repo, note) == "deny"
+    assert _write(fake_repo, note, tool="Edit") == "deny"
+
+
+@pytest.mark.parametrize("cmd", ["date 101212002026", "date -s 2026-01-01", "date --set=2026-01-01", "date +%F 101212002026"])
+def test_date_rejects_clock_setting_forms(cmd):
+    assert LIB.check_bash(cmd)[0] != "allow", cmd
+
+
+@pytest.mark.parametrize("cmd", ["date", "date +%F", "date -d yesterday +%s", "date -u +%Y"])
+def test_date_format_forms_still_pass(cmd):
+    assert LIB.check_bash(cmd)[0] == "allow", cmd

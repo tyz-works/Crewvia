@@ -589,8 +589,14 @@ case "$_RG_SKILLS" in
         # 読めない・落ちた場合は deny (fail closed)。
         _RG_OTHER_SKILLS="$(printf '%s' "$_RG_SKILLS" | tr ',' '\n' | grep -v -e '^$' -e '^research$' | sort -u | paste -sd, - || true)"
         _RG_PERM="$(python3 "${_CREWVIA_REPO}/hooks/lib_skill_perms.py" "${_CREWVIA_REPO}/config/skill-permissions.yaml" "$_RG_OTHER_SKILLS" "$TOOL_NAME" 2>/dev/null || echo '{"decision":"deny","source":"lib_skill_perms crashed"}')"
-        if [ "$(echo "$_RG_PERM" | jq -r '.decision // "deny"' 2>/dev/null || echo deny)" = "deny" ]; then
-          _RG_PERM_SOURCE="$(echo "$_RG_PERM" | jq -r '.source // "unknown"' 2>/dev/null || echo unknown)"
+        # yaml が読めなかった (yaml_not_found / usage_error) 場合は none が返るが、_global / 他 skill の制限を
+        # 見ていないので allow にしない (fail closed。t013 / Codex 5 巡目 P2)。
+        _RG_PERM_DECISION="$(echo "$_RG_PERM" | jq -r '.decision // "deny"' 2>/dev/null || echo deny)"
+        _RG_PERM_SOURCE="$(echo "$_RG_PERM" | jq -r '.source // "unknown"' 2>/dev/null || echo unknown)"
+        case "$_RG_PERM_SOURCE" in
+          yaml_not_found|usage_error|unknown) _RG_PERM_DECISION="deny"; _RG_PERM_SOURCE="skill-permissions.yaml を読めない (${_RG_PERM_SOURCE})" ;;
+        esac
+        if [ "$_RG_PERM_DECISION" = "deny" ]; then
           echo "[pre-tool-use] 🚫 research write scope overridden by deny: ${TOOL_NAME} (${_RG_PERM_SOURCE})" >&2
           emit_decision "deny" "Permission denied: ${_RG_PERM_SOURCE}"
           exit 0

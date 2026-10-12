@@ -436,6 +436,14 @@ def _check_no_ext_transport(opts, pos, ctx) -> None:
             raise _Reject("git の <transport>::<address> 形式は拒否します")
 
 
+def _check_date_format_only(opts, pos, ctx) -> None:
+    """date の位置引数は `+FORMAT` 1 つだけ。数字の位置引数 (date 101212002026 = 時計の設定) は拒否 (t013)。
+    -s / --set は表に無い (オプションとして解釈されず拒否される)。"""
+    for w in pos:
+        if not w.value.startswith("+"):
+            raise _Reject("date の位置引数は +FORMAT だけ許可します (時計の設定になりうる形は拒否)")
+
+
 def _require_one_of(*names: str):
     def check(opts, pos, ctx) -> None:
         if not any(k in names for k, _ in opts):
@@ -507,7 +515,7 @@ SPECS: dict[str, Spec] = {
     "comm": Spec(short="123iz", long=_w("nocheck-order check-order"), max_pos=2),
     "echo": Spec(any_args=True),
     "pwd": Spec(short="LP", max_pos=0),
-    "date": Spec(short="uR", short_arg="d", long=_w("utc rfc-email"), long_arg=_w("date"), max_pos=1),
+    "date": Spec(short="uR", short_arg="d", long=_w("utc rfc-email"), long_arg=_w("date"), max_pos=1, check=_check_date_format_only),
     "which": Spec(short="a"),
     "printenv": Spec(),  # echo "$X" の代わり (env の値を読むだけ。オプション無し)
     "true": Spec(max_pos=0),

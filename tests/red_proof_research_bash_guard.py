@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""tests/red_proof_research_bash_guard.py — research の Bash ガード (t005) の赤の実証。
+"""tests/red_proof_research_bash_guard.py — research の Bash ガード (t005 / t007) の赤の実証。
 
-t005 の項目 1〜5 を 1 つずつ戻した複製 (hooks/ と config/skill-permissions.yaml と
+t005 の項目 1〜5 と t007 (Codex 2 巡目) の項目 6〜9 を 1 つずつ戻した複製 (hooks/ と config/skill-permissions.yaml と
 tests/test_research_skill_guards.py だけを一時 dir に写したもの) で同じテストを走らせ、
 狙ったテストが **assert で** 赤になることを確かめる。本番の worktree・queue には触れない。
 
@@ -68,6 +68,47 @@ MUTATIONS = [
     ("5 card を TASK_ID の fallback 経路からだけ引く (P2 を戻す)", [
         (HOOK_REL, '_RG_CARDS="${_TASK_FILE:-}"\ncase "${AGENT_NAME:-}" in', '_RG_CARDS="${_TASK_FILE:-}"\ncase "/" in'),
     ], "test_card_skills_count_even_when_task_id_is_already_set"),
+    # ---- t007 (Codex 2 巡目 P1×4)
+    ("6a git の束ね・結合値の拒否を外す (strict を無効に)", [
+        (GUARD_REL, 'return Spec(short=short, long=_w(long), long_arg=_w(long_arg), long_opt=_w(long_opt), strict=True, **kw)',
+         'return Spec(short=short, long=_w(long), long_arg=_w(long_arg), long_opt=_w(long_opt), strict=False, **kw)'),
+    ], "test_git_specs_are_per_subcommand_and_strict"),
+    ("6b strict のうち束ねの拒否だけを外す", [
+        (GUARD_REL, '        if spec.strict and len(a) > 2:', '        if False:'),
+    ], "test_every_unlisted_option_is_denied_in_split_and_attached_form"),
+    # 戻しても -LOecho は strict (束ねの拒否) が止めるので、赤は「git grep が表に無い」と DENIED の git grep -n で取る
+    ("6c git grep を表に戻す", [
+        (GUARD_REL, '    ("version",): _git(max_pos=0),', '    ("version",): _git(max_pos=0),\n    ("grep",): _git(short="nLO"),'),
+    ], "test_git_specs_are_per_subcommand_and_strict"),
+    ("6d git の大域オプション (--no-pager / -C) を読み飛ばす", [
+        (GUARD_REL, '    if sub.startswith("-"):\n        # -c / -C',
+         '    if sub in ("--no-pager", "-P", "-C"):\n        return _check_git(words[2 if sub == "-C" else 1:], ctx)\n    if sub.startswith("-"):\n        # -c / -C'),
+    ], "test_git_global_options_are_denied"),
+    ("7a 引用符つきの数字を fd として読み捨てる (c35cb83 の drop_fd_number に戻す)", [
+        (GUARD_REL, '        if c in "<>":\n            raise _Reject("リダイレクトは',
+         '        if c == ">" and word.isdigit() and _ALLOWED_REDIRECT.match("2" + cmd[i:]):\n'
+         '            i += _ALLOWED_REDIRECT.match("2" + cmd[i:]).end() - 1\n'
+         '            word, has_word, glob_at = "", False, -1\n'
+         '            continue\n'
+         '        if c in "<>":\n            raise _Reject("リダイレクトは'),
+    ], "test_codex_reproductions_are_denied"),
+    ("7b > /dev/null 一般を通す (2>/dev/null と 2>&1 以外)", [
+        (GUARD_REL, '        if c in "<>":\n            raise _Reject("リダイレクトは',
+         '        if c == ">" and cmd.startswith(">/dev/null", i):\n'
+         '            flush_word()\n'
+         '            i += len(">/dev/null")\n'
+         '            continue\n'
+         '        if c in "<>":\n            raise _Reject("リダイレクトは'),
+    ], "test_only_two_exact_redirect_tokens"),
+    ("8a plan.sh を basename で判定する (c35cb83 に戻す)", [
+        (GUARD_REL, '        if not _is_trusted_plan(cmd, ctx):', '        if ".." in cmd.split("/"):'),
+    ], "test_codex_reproductions_are_denied"),
+    ("8b 字面の検査を外し realpath だけで判定する (symlink 経由を通す)", [
+        (GUARD_REL, '        if lexical == os.path.join(root, "scripts", "plan.sh"):', '        if real == os.path.join(root_real, "scripts", "plan.sh"):'),
+    ], "test_plan_sh_must_resolve_to_the_trusted_script"),
+    ("9 git fetch に --prune / --prune-tags / -p を戻す", [
+        (GUARD_REL, '    ("fetch",): _git(max_pos=2, check=_check_git_fetch),', '    ("fetch",): _git(short="p", long="prune prune-tags", max_pos=2, check=_check_git_fetch),'),
+    ], "test_codex_reproductions_are_denied"),
 ]
 
 

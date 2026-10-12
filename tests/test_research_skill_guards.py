@@ -161,8 +161,17 @@ def _load_guard():
 LIB = _load_guard()
 
 
+@pytest.fixture(autouse=True)
+def _pin_trusted_root(monkeypatch):
+    # plan.sh の信頼先 (CREWVIA_REPO_ROOT) と cwd を固定する (t007)。開発機のセッション env の
+    # CREWVIA_REPO_ROOT が主 checkout を指していても、lib を直に呼ぶテストの答えが変わらないように
+    monkeypatch.setenv("CREWVIA_REPO_ROOT", str(REPO_ROOT))
+    monkeypatch.chdir(REPO_ROOT)
+
+
 def _lib(cmd, **ctx):
-    out = subprocess.run(["python3", "-I", str(GUARD), "bash", cmd], capture_output=True, text=True)
+    out = subprocess.run(["python3", "-I", str(GUARD), "bash", cmd], capture_output=True, text=True,
+                         cwd=str(REPO_ROOT), env=dict(os.environ))
     return json.loads(out.stdout)["decision"]
 
 
@@ -174,8 +183,12 @@ ALLOWED = [
     "grep -rn 'x\\|y' --include=*.md . | grep -v '^./queue'",
     "cd /tmp && pwd && ls",
     "git log --oneline -3 && git diff origin/main --stat",
-    "git fetch origin main -q",
-    "git -C /tmp/x status -sb",
+    "git fetch origin main",
+    "git fetch origin",
+    "git fetch",
+    "git status -s",
+    "git log --max-count=5 --format=%H -p -- hooks/x.py",
+    "git log -10 --since=2.weeks",
     "git rev-list --left-right --count origin/main...HEAD",
     "git branch -a",
     "git branch --list 'task/*'",
@@ -194,14 +207,14 @@ ALLOWED = [
     "timeout 120 ugrep -G 'foo' knowledge/",
     "./scripts/plan.sh pull --agent X --skills research",
     "./scripts/plan.sh status",
-    "plan status --mission m",
     "source .crewvia-env && ls",
     ". .crewvia-env",
-    "echo hi 2>&1 >/dev/null",
+    "echo hi 2>&1 | head -1",
+    "cat a 2>/dev/null; ls x 2>/dev/null && ls",
     "echo \"--- merge-base vs origin/main ---\" && git log --oneline origin/main -1",
     "cat -n f | sed 's/^/ /'",
     "ls queue/missions/*/notes",
-    "jq -r .name < x.json",
+    "jq -r .name x.json",
     "head -150 f && tail -n 5 f",
     "sort -u f | uniq -c",
     "printf '%s\\n' a b",
@@ -318,9 +331,10 @@ DENIED = [
     "git diff --ext-diff",
     "git diff --textconv",
     "git grep -O x",
-    # 表では値を取る (-L <range>) が git grep では値を取らない -L の「値」に -O を隠す形。
-    # - で始まる値を拒否する規則だけが止める (取り違えの防止)
     "git grep -L -O vim x",
+    "git grep -n x f",         # git grep は外した (t007。grep -r / rg で代わりになる)
+    # 値を次の語から取るオプションの「値」に別のオプションを隠す形。- で始まる値を拒否する規則だけが止める
+    "sort -k -o x",
     "git cat-file --filters HEAD:x",
     "git fetch --upload-pack=sh origin",
     "git fetch origin main:main",
@@ -355,6 +369,10 @@ DENIED = [
     "./scripts/plan.sh done t001 --result-file /tmp/r.md",
     "./scripts/plan.sh needs-director t001 'reason'",
     "../scripts/plan.sh status",
+    "plan status --mission m",          # 素の plan (alias / PATH で解決される。t007)
+    "plan.sh status",
+    "/tmp/plan.sh status",
+    "./scripts/../scripts/plan.sh status",
     # 区切りの組み合わせ
     "ls; echo x > f",
     "ls && cp a b",
@@ -387,6 +405,11 @@ CODEX_REPRODUCTIONS = [
     "gh api -Fa=b repos/o/r",                              # 指摘 5
     "export PATH=/tmp; ls",                                # 指摘 6
     "export LD_PRELOAD=x; ls",                             # 指摘 6
+    # Codex 2 巡目 (t003 → t007)。どれも c35cb83 では allow だった
+    "git grep -LOecho zzz_unmatched -- hooks/lib_research_guard.py",  # 2-1 git のオプション表
+    "uniq /dev/null '2'>/dev/null",                        # 2-2 引用符つきの fd 番号
+    "/tmp/plan.sh status",                                 # 2-3 plan.sh の実体
+    "git fetch --prune --prune-tags origin",               # 2-4 fetch の刈り込み
 ]
 
 
@@ -443,6 +466,16 @@ def test_every_unlisted_option_is_denied_in_split_and_attached_form(prefix_s):
         cmd = " ".join(shlex.quote(w) for w in [*prefix, f"--{name}=victim"])
         assert LIB.check_bash(cmd)[0] == "deny", cmd
         checked += 1
+    if spec.strict:          # git (t007): 列挙済みの字でも束ね・結合値は拒否、値は --name=<値> だけ
+        for c in spec.short:
+            for extra in ([f"-{c}{c}"], [f"-{c}victim"], [f"-{c}Oecho"], [f"-{c}{spec.short[0]}"]):
+                cmd = " ".join(shlex.quote(w) for w in [*prefix, *extra])
+                assert LIB.check_bash(cmd)[0] == "deny", cmd
+                checked += 1
+        for name in spec.long_arg:
+            cmd = " ".join(shlex.quote(w) for w in [*prefix, f"--{name}", "victim"])
+            assert LIB.check_bash(cmd)[0] == "deny", cmd
+            checked += 1
     assert checked >= 20
 
 
@@ -460,7 +493,8 @@ DANGEROUS_LONG = {
     # git の大域オプション (--exec-path / --git-dir / --work-tree / --config-env / -c) は _check_git が
     # サブコマンドの前で別に拒否する (DENIED)。ここはサブコマンドのオプション
     "git": ["output", "ext-diff", "textconv", "open-files-in-pager", "upload-pack", "exec", "filters",
-            "set-upstream", "contents"],
+            "set-upstream", "contents", "exec-path", "receive-pack", "prune", "prune-tags", "force",
+            "work-tree", "config-env", "paginate"],
     "sort": ["output", "compress-program", "temporary-directory"],
     "sed": ["in-place", "file", "follow-symlinks"],
     "grep": ["pre"], "egrep": ["pre"], "fgrep": ["pre"],
@@ -527,7 +561,7 @@ def test_plan_result_file_must_be_own_notes(fake_repo, sub):
     ok = [
         f"./scripts/plan.sh {sub} t001 --mission {SLUG} --execution ex-1 --result-file {rel}",
         f"./scripts/plan.sh {sub} t001 --result-file {notes / 't001-result.md'}",
-        f"cd /tmp && ./scripts/plan.sh {sub} t001 --result-file {notes / 't001-result.md'}",
+        f"cd {fake_repo} && ./scripts/plan.sh {sub} t001 --result-file {notes / 't001-result.md'}",
     ]
     for cmd in ok:
         assert _bash(fake_repo, cmd) == "native", cmd   # 通る (TASKVIA_TOKEN 空 = native に委ねる)
@@ -542,7 +576,7 @@ def test_plan_result_file_must_be_own_notes(fake_repo, sub):
         f"./scripts/plan.sh {sub} t001 --result-file -",
         f"./scripts/plan.sh {sub} t001 'inline text'",
         f"./scripts/plan.sh {sub} t001",
-        f"cd /tmp && ./scripts/plan.sh {sub} t001 --result-file {rel}",           # cd の後ろの相対パス
+        f"cd {fake_repo} && ./scripts/plan.sh {sub} t001 --result-file {rel}",    # cd の後ろの相対パス
         f"./scripts/plan.sh {sub} t001 --result-file {rel} --result-file {rel}",
         f"./scripts/plan.sh {sub} t001 --result-file - <<'EOF'\nx\nEOF",
     ]
@@ -605,3 +639,195 @@ def test_crashing_guard_fails_closed(fake_repo):
     (fake_repo / "hooks" / "lib_research_guard.py").write_text("raise SystemExit(7)\n")
     assert _bash(fake_repo, "ls") == "deny"
     assert _write(fake_repo, fake_repo / "queue/missions" / SLUG / "notes" / "t001-x.md") == "deny"
+
+
+# ---- t007 (Codex 2 巡目 P1×4): 解釈して判定する部分を、解釈不要の形へさらに狭める
+
+
+def test_git_specs_are_per_subcommand_and_strict():
+    # 指摘 1: 共有の表をやめる。git grep は外す。どの表も strict (束ね不可・値は --name=<値>)
+    assert ("grep",) not in LIB.GIT_SPECS
+    specs = list(LIB.GIT_SPECS.values())
+    assert len({id(s) for s in specs}) == len(specs), "git のサブコマンドが表を共有している"
+    for key, spec in LIB.GIT_SPECS.items():
+        assert spec.strict and not spec.short_arg and not spec.digits, key
+
+
+@pytest.mark.parametrize("key", sorted(LIB.GIT_SPECS), ids=lambda k: " ".join(k))
+def test_each_listed_git_short_option_alone_still_passes(key):
+    # 束ねを拒否しても 1 字ずつなら通る (表が死んでいないことの確認)
+    spec = LIB.GIT_SPECS[key]
+    for c in spec.short:
+        need = ["--list"] if key == ("config",) else []   # config は読み取りの形 (--get / --list) が要る
+        cmd = " ".join(["git", *key, f"-{c}", *need])
+        assert LIB.check_bash(cmd)[0] == "allow", (cmd, LIB.check_bash(cmd)[1])
+
+
+@pytest.mark.parametrize("cmd", [
+    "git grep -LOecho zzz_unmatched -- hooks/lib_research_guard.py",
+    "git grep -L -Oecho x",
+    "git log -LOecho x",
+    "git log -pOecho",
+    "git show -sOecho",
+    "git diff -wO echo",
+    "git log -pL1,2:f",
+    "git log -n5",
+    "git blame -L1,5 f",
+    "git log --max-count 5",
+    "git log --open-files-in-pager=echo",
+    "git log -c",
+    "git diff --ext-diff",
+    "git log --textconv -p",
+    "git cat-file --textconv HEAD:x",
+    "git cat-file --filters HEAD:x",
+    "git ls-remote --upload-pack=echo origin",
+    "git ls-remote --exec=echo origin",
+    "git status -sb",
+    "git branch -vv",
+])
+def test_git_bundles_and_pager_options_are_denied(cmd):
+    assert LIB.check_bash(cmd)[0] == "deny", cmd
+
+
+@pytest.mark.parametrize("glob", ["-c core.pager=echo", "-ccore.pager=echo", "-C .", "-C.", "--git-dir=.git",
+                                  "--work-tree=.", "--exec-path=/tmp", "--no-pager", "-P", "-p",
+                                  "--config-env=core.pager=X", "--namespace=x", "--bare"])
+def test_git_global_options_are_denied(glob):
+    for sub in ("log", "status", "fetch"):
+        cmd = f"git {glob} {sub}"
+        assert LIB.check_bash(cmd)[0] == "deny", cmd
+
+
+@pytest.mark.parametrize("cmd,decision", [
+    # 指摘 2: 許すのは引用符の外の完全一致のトークン 2>/dev/null と 2>&1 (直前が空白) だけ
+    ("cat a 2>/dev/null", "allow"),
+    ("cat a 2>&1 | head", "allow"),
+    ("cat a 2>/dev/null&& ls", "allow"),
+    ("cat a 2>/dev/null;ls", "allow"),
+    ("uniq /dev/null '2'>/dev/null", "deny"),
+    ('uniq /dev/null "2">/dev/null', "deny"),
+    ("uniq /dev/null \\2>/dev/null", "deny"),
+    ("uniq /dev/null x'2'>/dev/null", "deny"),
+    # 引用符の中の > は文字: 2'>'/dev/null は「2>/dev/null という名前」の 1 語。uniq の位置引数が 2 つになり拒否
+    ("uniq /dev/null 2'>'/dev/null", "deny"),
+    ("cat a 1>/dev/null", "deny"),
+    ("cat a >/dev/null", "deny"),
+    ("cat a >>/dev/null", "deny"),
+    ("cat a &>/dev/null", "deny"),
+    ("cat a 2>>/dev/null", "deny"),
+    ("cat a 2> /dev/null", "deny"),
+    ("cat a 2>/dev/nullx", "deny"),
+    ("cat a 2>/dev/null/x", "deny"),
+    ("cat a 2>&2", "deny"),
+    ("cat a 2>&1x", "deny"),
+    ("cat a x2>/dev/null", "deny"),
+    ("cat a 22>/dev/null", "deny"),
+    ("cat a 2>/dev/stdout", "deny"),
+    ("cat < a", "deny"),
+    ("cat 0<a", "deny"),
+    ("2>/dev/null cat a", "deny"),
+])
+def test_only_two_exact_redirect_tokens(cmd, decision):
+    assert LIB.check_bash(cmd)[0] == decision, (cmd, LIB.check_bash(cmd)[1])
+
+
+def test_quoted_fd_number_reproduction_does_not_write(tmp_path):
+    # 指摘 2 の実害 (uniq が cwd に 2 という名前のファイルを作る) を本物の bash で確かめ、ガードが止める形であること
+    (tmp_path / "in").write_text("a\n")
+    cmd = "uniq in '2'>/dev/null"
+    subprocess.run(["bash", "-c", cmd], cwd=str(tmp_path), check=False)
+    assert (tmp_path / "2").exists(), "前提: bash では '2' が uniq の出力先になる"
+    assert LIB.check_bash(cmd)[0] == "deny"
+
+
+@pytest.mark.parametrize("cmd,decision", [
+    # 指摘 4: git fetch / git fetch origin / git fetch origin <ref> だけ。オプションは一切不可
+    ("git fetch", "allow"),
+    ("git fetch origin", "allow"),
+    ("git fetch origin main", "allow"),
+    ("git fetch origin task/x-y_z.1", "allow"),
+    ("git fetch --prune --prune-tags origin", "deny"),
+    ("git fetch --prune origin", "deny"),
+    ("git fetch --prune-tags origin", "deny"),
+    ("git fetch -p origin", "deny"),
+    ("git fetch -P origin", "deny"),
+    ("git fetch --tags origin", "deny"),
+    ("git fetch --force origin main", "deny"),
+    ("git fetch -q origin", "deny"),
+    ("git fetch origin main -q", "deny"),
+    ("git fetch --all", "deny"),
+    ("git fetch --depth=1 origin", "deny"),
+    ("git fetch origin main:main", "deny"),
+    ("git fetch origin +main", "deny"),
+    ("git fetch origin 'refs/heads/*'", "deny"),
+    ("git fetch origin 'main^'", "deny"),
+    ("git fetch origin a b", "deny"),
+    ("git fetch upstream", "deny"),
+    ("git fetch /tmp/repo", "deny"),
+    ("git fetch 'ext::sh -c x'", "deny"),
+    ("git fetch origin 'ext::x'", "deny"),
+])
+def test_git_fetch_only_three_forms(cmd, decision):
+    assert LIB.check_bash(cmd)[0] == decision, (cmd, LIB.check_bash(cmd)[1])
+
+
+def test_plan_sh_must_resolve_to_the_trusted_script(fake_repo, tmp_path):
+    # 指摘 3: コマンド語を cwd に対して解決し、字面と realpath の両方が信頼する plan.sh であること
+    (fake_repo / "scripts").mkdir()
+    (fake_repo / "scripts" / "plan.sh").write_text("#!/bin/bash\n")
+    evil = tmp_path / "evil"
+    (evil / "scripts").mkdir(parents=True)
+    (evil / "scripts" / "plan.sh").write_text("#!/bin/bash\ntouch victim\n")
+    link_file = tmp_path / "lf" / "scripts"
+    link_file.mkdir(parents=True)
+    (link_file / "plan.sh").symlink_to(fake_repo / "scripts" / "plan.sh")   # 信頼する plan.sh への symlink
+    (tmp_path / "ld").symlink_to(fake_repo / "scripts")                       # 信頼する scripts/ への symlink
+    wt = fake_repo / ".claude/worktrees" / SLUG / "t001-demo"
+    other_wt = fake_repo / ".claude/worktrees" / SLUG / "t002-demo"
+    other_slug_wt = fake_repo / ".claude/worktrees" / OTHER_SLUG / "t001-demo"
+    for w in (wt, other_wt, other_slug_wt):
+        (w / "scripts").mkdir(parents=True)
+        (w / "scripts" / "plan.sh").write_text("#!/bin/bash\n")
+    ok = [
+        "./scripts/plan.sh status",
+        "scripts/plan.sh status",
+        f"{fake_repo}/scripts/plan.sh status",
+        f"timeout 60 {fake_repo}/scripts/plan.sh status",
+        f"{wt}/scripts/plan.sh status",                       # 自分の worktree
+        f"cd {wt} && ./scripts/plan.sh status",
+    ]
+    for cmd in ok:
+        assert _bash(fake_repo, cmd) == "native", cmd
+    bad = [
+        f"{evil}/scripts/plan.sh status",
+        "/tmp/plan.sh status",
+        "plan status",
+        "plan.sh status",
+        f"{link_file}/plan.sh status",                       # symlink 経由 (plan.sh は自分の位置から lib を読む)
+        f"{tmp_path}/ld/plan.sh status",
+        "./scripts/../scripts/plan.sh status",
+        f"cd {evil} && ./scripts/plan.sh status",
+        f"cd {tmp_path}/lf && ./scripts/plan.sh status",
+        "cd scripts && ./plan.sh status",                    # 相対の cd は CDPATH を引きうる = 確定できない
+        f"{other_wt}/scripts/plan.sh status",                # 他の task の worktree
+        f"{other_slug_wt}/scripts/plan.sh status",           # 他の mission の worktree
+        f"timeout 60 {evil}/scripts/plan.sh status",
+    ]
+    for cmd in bad:
+        assert _bash(fake_repo, cmd) == "deny", cmd
+    (fake_repo / "queue/assignments/Jiwon").unlink()        # assignment が無ければ worktree は信頼しない
+    assert _bash(fake_repo, f"{wt}/scripts/plan.sh status") == "deny"
+
+
+def test_plan_sh_trusted_root_comes_from_crewvia_repo_root(fake_repo, tmp_path):
+    # CREWVIA_REPO_ROOT があればそれ、無ければ hook の位置 (fake_repo) を信頼する
+    other = tmp_path / "other-repo"
+    (other / "scripts").mkdir(parents=True)
+    (other / "scripts" / "plan.sh").write_text("#!/bin/bash\n")
+    assert _bash(fake_repo, f"{other}/scripts/plan.sh status") == "deny"
+    assert _bash(fake_repo, f"{other}/scripts/plan.sh status", extra={"CREWVIA_REPO_ROOT": str(other)}) == "native"
+    assert _bash(fake_repo, "./scripts/plan.sh status", extra={"CREWVIA_REPO_ROOT": str(other)}) == "deny"
+    link = tmp_path / "repo-link"                              # repo root 自体が symlink の場所
+    link.symlink_to(fake_repo)
+    for cmd in (f"{link}/scripts/plan.sh status", f"{fake_repo}/scripts/plan.sh status"):
+        assert _bash(fake_repo, cmd, extra={"CREWVIA_REPO_ROOT": str(link)}) == "native", cmd

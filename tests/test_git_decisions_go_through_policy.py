@@ -75,6 +75,9 @@ ALLOWED: dict[tuple[str, str], tuple[int, str]] = {
     ("scripts/sync-main-checkout.sh", "<top>"): (6, R_MAIN_CHECKOUT + " (ff 本体と報告)"),
     ("hooks/pre-tool-use.sh", "<top>"): (1, R_HOOK_ROOT + " (編集ガードの case パターン)"),
     ("hooks/lib_main_repo_git_guard.py", "has_main_repo_reference"): (1, R_HOOK_ROOT + " (git ガードの除外)"),
+    ("hooks/lib_research_guard.py", "own_worktree_plan"): (1, R_HOOK_ROOT + " (research の Bash が信頼する plan.sh = 自分の "
+                                                            "worktree の scripts/plan.sh。hooks/ は scripts/ を import しない — "
+                                                            "hook の fixture は hooks/ だけを写す。t007)"),
     ("agents/director.md", "<code block>"): (2, R_DOC_DEFAULT + " ×1・" + R_DOC_INVESTIGATE + " ×1"),
     ("agents/worker.md", "<code block>"): (2, R_DOC_DEFAULT + " (命名の説明・pull の JSON の例)"),
 }

@@ -16,6 +16,8 @@
 (2) bash: research の Bash は「解釈が要らない形」だけを通す読み取り専用の allowlist (t005)。
     $ / バッククォート / # / heredoc / 状態を変える builtin・ラッパー / 言語を持つツール (awk・python3 等)
     は拒否し、残りはコマンドごとのオプション allowlist (SPECS / GIT_SPECS / GH_SPECS / PLAN_SPECS) で検査する。
+    t007: git の表はサブコマンドごと・束ね不可・値は --name=<値> だけ・大域オプション不可、fetch は 3 形だけ。
+    リダイレクトは 2>/dev/null と 2>&1 の完全一致だけ。plan.sh は本 repo か自分の worktree の実体だけ。
     plan.sh done / needs-director の結果は --result-file <自分の notes/<tid>*.md> だけ (--repo/--agent/--cwd が要る)。
 """
 
@@ -130,9 +132,9 @@ def check_write(repo: str, agent: str, raw_path: str, cwd: str, yaml_path: str) 
 # を通す。展開・置換・heredoc・コメント・状態を変える builtin は文字や語の段階で拒否し、
 # 残った「コマンド名 + 引数」の並びを、コマンドごとのオプション allowlist で検査する。
 #   - 文字で拒否: `$` (変数・コマンド置換すべて) / バッククォート / `#` / `<<` (heredoc・here-string)
-#   - 引用符の外で拒否: ( ) { } ! (サブシェル・グループ・ブレース展開・否定)
+#   - 引用符の外で拒否: ( ) { } ! (サブシェル・グループ・ブレース展開・否定)、2>/dev/null と 2>&1 以外の > <
 #   - glob (* ? [) は「先頭が - でない字そのもの」で始まる語だけ (展開しても別のオプションにならない)
-#   - コマンド名は下の表のどれかに完全一致 (パス指定は plan.sh だけ)。export / env / command /
+#   - コマンド名は下の表のどれかに完全一致 (パス指定は信頼する場所の plan.sh だけ)。export / env / command /
 #     exec / eval / xargs / 先頭の X=… などは表に無いので拒否 = PATH / LD_PRELOAD は変えられない
 #   - オプションは表に列挙したものだけ。結合形 (-ovictim / -XDELETE) も 1 字ずつ表と照合する。
 #     値を次の語から取るオプションの値が - で始まるものは拒否 (取り違えで別オプションを見逃さない)
@@ -162,13 +164,17 @@ _FORBIDDEN_TEXT = (
     ("\x00", "NUL を含むコマンドは拒否します"),
 )
 _GLOB_CHARS = "*?["
+# 許すリダイレクトはこの 2 つの完全一致のトークンだけ (直後は区切りか末尾)
+_ALLOWED_REDIRECT = re.compile(r"2>(?:/dev/null|&1)(?=[ \t\n;|&]|$)")
 _REJECT_UNQUOTED = "(){}!"
 
 
 def _tokenize(cmd: str) -> list[list[_Word]]:
     """区切り (; | || && |& 改行) で区間に分け、各区間を語の列にする。
 
-    リダイレクトは /dev/null 宛ての出力・fd の複製 (2>&1)・入力 (< file) だけを認め、語からは除く。
+    リダイレクトは引用符の外にある完全一致のトークン `2>/dev/null` と `2>&1` だけ (直前が空白・
+    直後が区切り) を認め、語からは除く (t007)。それ以外の `>` `<` は引用符の外に現れたら拒否する。
+    fd 番号を「溜まった語」から判定しない (`'2'>/dev/null` の 2 は uniq の位置引数になる)。
     """
     for needle, why in _FORBIDDEN_TEXT:
         if needle in cmd:
@@ -178,34 +184,20 @@ def _tokenize(cmd: str) -> list[list[_Word]]:
     word = ""
     has_word = False
     glob_at = -1
-    pending_in = False  # 直前が `<` (次の語は読む入力ファイル。引数ではない)
     i, n = 0, len(cmd)
 
     def flush_word() -> None:
-        nonlocal word, has_word, glob_at, pending_in
+        nonlocal word, has_word, glob_at
         if has_word:
-            if pending_in:
-                if glob_at >= 0:
-                    raise _Reject("入力リダイレクト先に glob は使えません")
-                pending_in = False
-            else:
-                cur.append(_Word(word, glob_at))
+            cur.append(_Word(word, glob_at))
         word, has_word, glob_at = "", False, -1
 
     def end_seg() -> None:
         nonlocal cur
         flush_word()
-        if pending_in:
-            raise _Reject("入力リダイレクト (<) の先がありません")
         if cur:
             segs.append(cur)
         cur = []
-
-    def drop_fd_number() -> None:
-        # `2>&1` の 2 は直前の語として溜まっている (引用符の無い数字だけ)
-        nonlocal word, has_word, glob_at
-        if has_word and word.isdigit() and glob_at < 0:
-            word, has_word, glob_at = "", False, -1
 
     while i < n:
         c = cmd[i]
@@ -262,30 +254,15 @@ def _tokenize(cmd: str) -> list[list[_Word]]:
                 end_seg()
                 i += 2
                 continue
-            if cmd.startswith("&>", i):
-                m = re.match(r"&>>?[ \t]*/dev/null(?=[ \t\n;|&]|$)", cmd[i:])
-                if not m or pending_in:
-                    raise _Reject("&> は /dev/null 宛てだけ許可します")
-                flush_word()
-                i += m.end()
+            raise _Reject("バックグラウンド実行 (&) と &> は拒否します")
+        if c == "2" and not has_word and i > 0 and cmd[i - 1] in " \t":
+            m = _ALLOWED_REDIRECT.match(cmd, i)
+            if m:
+                i = m.end()
                 continue
-            raise _Reject("バックグラウンド実行 (&) は拒否します")
-        if c == "<":
-            drop_fd_number()
-            if cmd.startswith(("<>", "<&", "<("), i) or pending_in:
-                raise _Reject("<> / <& / <( は拒否します")
-            flush_word()
-            pending_in = True
-            i += 1
-            continue
-        if c == ">":
-            drop_fd_number()
-            m = re.match(r">>?[ \t]*/dev/null(?=[ \t\n;|&]|$)", cmd[i:]) or re.match(r">&[12](?=[ \t\n;|&]|$)", cmd[i:])
-            if not m or pending_in:
-                raise _Reject("ファイルへのリダイレクト (>, >>) は拒否します (/dev/null と 2>&1 だけ可)")
-            flush_word()
-            i += m.end()
-            continue
+        if c in "<>":
+            raise _Reject("リダイレクトは引用符の外の 2>/dev/null と 2>&1 だけ許可します "
+                          "(> / >> / < / &> / 1> / 引用符・\\ 付きの fd 番号は不可。読むファイルは引数で渡す)")
         if c in _REJECT_UNQUOTED:
             raise _Reject(f"引用符の外の {c} (サブシェル・グループ・ブレース展開・否定) は拒否します")
         if c in _GLOB_CHARS and glob_at < 0:
@@ -313,10 +290,14 @@ class Spec:
     max_pos:   位置引数の上限 (None = 無制限)。上限があるコマンドの位置引数は glob 不可
     any_args:  引数を一切検査しない (echo のように、どんな引数でも読み書きも実行もしないもの)
     check:     追加の検査 (opts, positionals, ctx) -> None (拒否は _Reject)
+    strict:    git 用 (t007)。短いオプションは `-X` の 2 文字だけ (束ね・結合値は不可。数字だけの -N は numeric
+               のとき可)、値を取るオプションは `--name=value` の形だけ (short_arg は持てない)
     """
 
     def __init__(self, short="", short_arg="", long=(), long_arg=(), long_opt=(), numeric=False,
-                 digits=False, max_pos=None, any_args=False, check=None):
+                 digits=False, max_pos=None, any_args=False, check=None, strict=False):
+        if strict and (short_arg or digits):
+            raise ValueError("strict な表は値を取る短いオプション・結合形の数字を持てない")
         self.short = short
         self.short_arg = short_arg
         self.long = frozenset(long)
@@ -327,6 +308,7 @@ class Spec:
         self.max_pos = max_pos
         self.any_args = any_args
         self.check = check
+        self.strict = strict
 
     def all_long(self) -> frozenset:
         return self.long | self.long_arg | self.long_opt
@@ -430,10 +412,19 @@ def _check_find(words: list[_Word]) -> None:
         i += 1  # 始点
 
 
+_FETCH_REF_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._/@-]*$")
+
+
 def _check_git_fetch(opts, pos, ctx) -> None:
-    for w in pos:
-        if ":" in w.value or w.value.startswith("+"):
-            raise _Reject("git fetch の refspec (src:dst / +) はローカルの ref を書き換えるため拒否します")
+    """git fetch は `git fetch` / `git fetch origin` / `git fetch origin <ref>` の 3 形だけ (t007)。
+
+    オプションは表に 1 つも無い (--prune / --prune-tags / --tags / --force 等はすべて列挙外で拒否)。
+    ref は `:` `+` `*` `^` を含まない名前 (字の集合で絞る) = ローカルの ref を書き換える refspec にならない。
+    """
+    if pos and pos[0].value != "origin":
+        raise _Reject("git fetch の remote は origin だけ許可します (git fetch / git fetch origin / git fetch origin <ref>)")
+    if len(pos) == 2 and not _FETCH_REF_RE.match(pos[1].value):
+        raise _Reject("git fetch origin <ref> の ref に : + * ^ 等は使えません (ローカルの ref を書き換える形になりうる)")
 
 
 def _check_no_ext_transport(opts, pos, ctx) -> None:
@@ -506,47 +497,82 @@ SPECS: dict[str, Spec] = {
     "sed": Spec(short="nErszu", short_arg="el", long=_w("quiet silent regexp-extended posix separate null-data unbuffered debug sandbox"), long_arg=_w("expression line-length"), check=_check_sed),
 }
 
-_GIT_READ_SPEC = Spec(
-    short="pszrtlivwcaEFhHqobuWIMCnmdk", short_arg="eLSG", numeric=True, digits=True,
-    long=_w(
-        "oneline stat shortstat numstat name-only name-status patch no-patch graph all reverse first-parent "
-        "no-merges merges follow abbrev-commit no-color cached staged ignore-all-space ignore-space-change "
-        "full-diff raw summary dirstat exit-code quiet source topo-order date-order left-right cherry-pick "
-        "cherry-mark boundary branches tags remotes ancestry-path simplify-by-decoration no-abbrev full-index "
-        "check no-renames minimal patience histogram no-walk parents children walk-reflogs invert-grep all-match "
-        "regexp-ignore-case extended-regexp fixed-strings perl-regexp no-ext-diff no-textconv no-prefix "
-        "function-context pickaxe-all pickaxe-regex compact-summary root no-commit-id count "
-        "show-toplevel git-dir symbolic-full-name verify is-inside-work-tree absolute-git-dir show-prefix "
-        "git-common-dir show-cdup others modified deleted exclude-standard error-unmatch full-name stage ignored "
-        "directory unmerged line-number ignore-case word-regexp files-with-matches files-without-match heading "
-        "break untracked invert-match only-matching show-function null column porcelain line-porcelain "
-        "incremental show-email show-name show-number full-tree long object-only is-ancestor fork-point "
-        "octopus independent always exact-match heads hash head exists verbose human-readable non-matching "
-        "no-index list ahead-behind no-ahead-behind short-stat batch-check batch symref get-url refs branch "
-        "short-sha"
-    ),
-    long_arg=_w("since until after before author committer grep max-count skip date format diff-filter sort "
-                "contains merged no-merged points-at match exclude max-depth"),
-    long_opt=_w("color decorate word-diff unified relative find-renames find-copies dirstat-by-file abbrev pretty "
-                "short abbrev-ref untracked-files ignored-mode porcelain-v dirty broken"),
-)
-GIT_SPECS: dict[tuple, Spec] = {(s,): _GIT_READ_SPEC for s in _w(
-    "log show diff status rev-parse ls-files grep blame rev-list cat-file ls-tree merge-base describe shortlog "
-    "name-rev show-ref for-each-ref diff-tree diff-files diff-index count-objects whatchanged show-branch "
-    "check-ignore version var"
-)}
-GIT_SPECS[("ls-remote",)] = Spec(short="qht", long=_w("heads tags refs quiet get-url symref"), long_arg=_w("sort"), check=_check_no_ext_transport)
-GIT_SPECS[("fetch",)] = Spec(short="qvp", long=_w("prune prune-tags tags no-tags all quiet verbose dry-run"), long_arg=_w("depth"), check=lambda o, p, c: (_check_git_fetch(o, p, c), _check_no_ext_transport(o, p, c)))
-GIT_SPECS[("branch",)] = Spec(short="arvl", long=_w("all remotes verbose list show-current"), long_arg=_w("contains merged no-merged sort format points-at"), check=_require_list_if_positional)
-GIT_SPECS[("tag",)] = Spec(short="ln", digits=True, long=_w("list"), long_arg=_w("contains sort points-at merged no-merged"), check=_require_list_if_positional)
-GIT_SPECS[("remote",)] = Spec(short="v", long=_w("verbose"), max_pos=0)
-GIT_SPECS[("remote", "show")] = Spec(short="n", max_pos=1)
-GIT_SPECS[("worktree", "list")] = Spec(short="vz", long=_w("porcelain verbose"), max_pos=0)
-GIT_SPECS[("stash", "list")] = Spec(long=_w("oneline stat"), max_pos=0)
-GIT_SPECS[("config",)] = Spec(short="lz", long=_w("get get-all get-regexp list show-origin show-scope local global system name-only null"), max_pos=2,
-                              check=_require_one_of("--get", "--get-all", "--get-regexp", "--list", "-l"))
-# git の大域オプションで通すもの (-c / --exec-path / --git-dir / --work-tree / --config-env 等は不可)
-_GIT_GLOBAL_NOARG = ("--no-pager", "-P", "--no-optional-locks", "--no-replace-objects")
+def _git(short="", long="", long_arg="", long_opt="", **kw) -> Spec:
+    return Spec(short=short, long=_w(long), long_arg=_w(long_arg), long_opt=_w(long_opt), strict=True, **kw)
+
+
+# git はサブコマンドごとに「通すオプション + 値の取り方」を持つ (t007。共有の表は使わない: git grep の -L は
+# 値を取らないが git log の -L は取る、のように同じ字でも引数の個数がサブコマンドで違う)。
+# git grep は外した (grep -r / rg で代わりになる。-O / --open-files-in-pager が pager を起動する)。
+# pager・外部コマンドを起動しうるもの (-O / --open-files-in-pager / --ext-diff / --textconv / -c /
+# --exec-path / --upload-pack / --filters ...) は列挙しない。短いオプションの束ね (-LOecho) は Spec.strict が拒否。
+GIT_SPECS: dict[tuple, Spec] = {
+    ("log",): _git(
+        short="p", numeric=True,
+        long="oneline stat shortstat numstat name-only name-status patch no-patch graph all reverse first-parent "
+             "no-merges merges follow abbrev-commit no-color topo-order date-order left-right cherry-pick cherry-mark "
+             "boundary branches tags remotes ancestry-path simplify-by-decoration no-abbrev full-diff raw summary "
+             "no-renames walk-reflogs invert-grep all-match regexp-ignore-case extended-regexp fixed-strings "
+             "perl-regexp no-ext-diff no-textconv source parents children compact-summary root "
+             "ignore-all-space ignore-space-change",
+        long_arg="since until after before author committer grep max-count skip date format diff-filter",
+        long_opt="color decorate unified abbrev pretty find-renames word-diff dirstat"),
+    ("show",): _git(
+        short="ps",
+        long="oneline stat shortstat numstat name-only name-status patch no-patch no-color abbrev-commit raw summary "
+             "no-renames no-ext-diff no-textconv source compact-summary first-parent ignore-all-space "
+             "ignore-space-change",
+        long_arg="format diff-filter date",
+        long_opt="color decorate unified abbrev pretty word-diff find-renames"),
+    ("diff",): _git(
+        short="wb",
+        long="stat shortstat numstat name-only name-status patch no-patch cached staged no-color raw summary "
+             "exit-code quiet no-renames minimal patience histogram ignore-all-space ignore-space-change "
+             "ignore-blank-lines no-ext-diff no-textconv no-index compact-summary no-prefix full-index check "
+             "merge-base function-context",
+        long_arg="diff-filter",
+        long_opt="color unified word-diff find-renames dirstat abbrev relative"),
+    ("status",): _git(short="sb", long="short branch long show-stash ahead-behind no-ahead-behind",
+                      long_opt="porcelain untracked-files ignored"),
+    ("rev-parse",): _git(short="q", long="show-toplevel git-dir absolute-git-dir git-common-dir is-inside-work-tree "
+                                     "is-inside-git-dir show-prefix show-cdup verify quiet symbolic-full-name symbolic",
+                         long_opt="abbrev-ref short"),
+    ("ls-files",): _git(short="comdsz", long="cached others modified deleted stage ignored directory unmerged "
+                                            "exclude-standard error-unmatch full-name",
+                        long_arg="exclude"),
+    ("blame",): _git(short="wsln", long="porcelain line-porcelain incremental show-email show-name show-number root "
+                                       "show-stats",
+                     long_arg="date"),
+    ("rev-list",): _git(numeric=True, long="count all left-right first-parent no-merges merges reverse topo-order "
+                                           "date-order cherry-pick cherry-mark boundary ancestry-path",
+                        long_arg="max-count since until after before author grep skip"),
+    ("merge-base",): _git(long="is-ancestor fork-point all octopus independent"),
+    ("describe",): _git(long="tags all always long exact-match contains first-parent", long_opt="abbrev"),
+    ("ls-tree",): _git(short="rtdlz", long="name-only name-status full-name full-tree long object-only",
+                       long_opt="abbrev"),
+    ("cat-file",): _git(short="ptse", max_pos=2),
+    ("show-ref",): _git(short="q", long="heads tags verify quiet", long_opt="hash abbrev"),
+    ("for-each-ref",): _git(long_arg="format sort count contains no-contains merged no-merged points-at"),
+    ("name-rev",): _git(long="name-only tags all", long_arg="refs exclude"),
+    ("shortlog",): _git(short="sne", long="summary numbered email", long_arg="since until"),
+    ("check-ignore",): _git(short="vn", long="verbose non-matching no-index"),
+    ("version",): _git(max_pos=0),
+    ("ls-remote",): _git(short="qht", long="heads tags refs quiet get-url symref", long_arg="sort",
+                         check=_check_no_ext_transport),
+    ("fetch",): _git(max_pos=2, check=_check_git_fetch),
+    ("branch",): _git(short="arvl", long="all remotes verbose list show-current",
+                      long_arg="contains merged no-merged sort format points-at",
+                      check=_require_list_if_positional),
+    ("tag",): _git(short="l", long="list", long_arg="contains sort points-at merged no-merged",
+                   check=_require_list_if_positional),
+    ("remote",): _git(short="v", long="verbose", max_pos=0),
+    ("remote", "show"): _git(short="n", max_pos=1),
+    ("worktree", "list"): _git(short="vz", long="porcelain verbose", max_pos=0),
+    ("stash", "list"): _git(long="oneline stat", max_pos=0),
+    ("config",): _git(short="lz", long="get get-all get-regexp list show-origin show-scope local global system "
+                                     "name-only null",
+                      max_pos=2, check=_require_one_of("--get", "--get-all", "--get-regexp", "--list", "-l")),
+}
 
 _GH_COMMON = Spec(
     short="cv", short_arg="qtRLsbBHAlSaue",
@@ -656,6 +682,8 @@ def _parse(spec: Spec, words: list[_Word], label: str):
         if a.startswith("--"):
             name, eq, val = a[2:].partition("=")
             if name in spec.long_arg:
+                if not eq and spec.strict:
+                    raise _Reject(f"{label} --{name} の値は --{name}=<値> の形で渡してください (次の語は値にしない)")
                 if not eq:
                     val = _value_word(words, i + 1, f"{label} --{name}")
                     i += 1
@@ -668,6 +696,8 @@ def _parse(spec: Spec, words: list[_Word], label: str):
             opts.append(("--" + name, val if eq or name in spec.long_arg else None))
             i += 1
             continue
+        if spec.strict and len(a) > 2:
+            raise _Reject(f"{label}: 短いオプションの束ね・結合値 {a!r} は拒否します (-X を 1 つずつ。値は --name=<値>)")
         j = 1
         while j < len(a):
             c = a[j]
@@ -701,33 +731,20 @@ def _run_spec(spec: Spec, words: list[_Word], label: str, ctx: dict) -> None:
 
 
 def _check_git(words: list[_Word], ctx: dict) -> None:
-    i = 0
-    while i < len(words):
-        a = words[i].value
-        if words[i].glob_at >= 0:
-            raise _Reject("git の大域オプション・サブコマンドに glob は使えません")
-        if a == "-C":
-            _value_word(words, i + 1, "git -C")
-            i += 2
-            continue
-        if a.startswith("-C") and len(a) > 2:
-            i += 1
-            continue
-        if a in _GIT_GLOBAL_NOARG:
-            i += 1
-            continue
-        if a.startswith("-"):
-            raise _Reject(f"git の大域オプション {a} は拒否します (-c / --exec-path / --git-dir 等)")
-        break
-    if i >= len(words):
+    if not words:
         raise _Reject("git のサブコマンドがありません")
-    sub = words[i].value
-    nxt = words[i + 1].value if i + 1 < len(words) else None
+    if words[0].glob_at >= 0 or (len(words) > 1 and words[1].glob_at >= 0):
+        raise _Reject("git のサブコマンドに glob は使えません")
+    sub = words[0].value
+    if sub.startswith("-"):
+        # -c / -C / --git-dir / --work-tree / --exec-path / --no-pager ... 大域オプションは一律に拒否 (t007)
+        raise _Reject(f"git の大域オプション {sub} は拒否します (-C の代わりに cd してから git を呼ぶ)")
+    nxt = words[1].value if len(words) > 1 else None
     if (sub, nxt) in GIT_SPECS:
-        _run_spec(GIT_SPECS[(sub, nxt)], words[i + 2:], f"git {sub} {nxt}", ctx)
+        _run_spec(GIT_SPECS[(sub, nxt)], words[2:], f"git {sub} {nxt}", ctx)
         return
     if (sub,) in GIT_SPECS:
-        _run_spec(GIT_SPECS[(sub,)], words[i + 1:], f"git {sub}", ctx)
+        _run_spec(GIT_SPECS[(sub,)], words[1:], f"git {sub}", ctx)
         return
     raise _Reject(f"git {sub} は読み取り専用の allowlist にありません")
 
@@ -750,6 +767,64 @@ def _check_plan(words: list[_Word], ctx: dict) -> None:
     _run_spec(PLAN_SPECS[(sub,)], words[1:], f"plan.sh {sub}", ctx)
 
 
+def _trusted_root() -> str:
+    """plan.sh を信頼する repo: CREWVIA_REPO_ROOT、無ければこの lib の位置 (hooks/..)。"""
+    return os.environ.get("CREWVIA_REPO_ROOT") or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _cd_target(args: list[_Word], cwd: str | None) -> str | None:
+    """cd の後の cwd。字面だけで確定できない形 (引数なし = HOME・`-`・`~`・..・CDPATH を引きうる相対) は None。"""
+    pos = [w.value for w in args if not w.value.startswith("-") or w.value == "-"]
+    if len(pos) != 1 or args[-1].glob_at >= 0:
+        return None
+    d = pos[0]
+    if d == "-" or d.startswith("~") or ".." in d.split("/"):
+        return None
+    if os.path.isabs(d):
+        return os.path.normpath(d)
+    if cwd and d.startswith("./"):
+        return os.path.normpath(os.path.join(cwd, d))
+    return None
+
+
+def _is_trusted_plan(cmd: str, ctx: dict) -> bool:
+    """コマンド語が「本 repo の scripts/plan.sh」か「自分の worktree の scripts/plan.sh」を指すか (t007)。
+
+    素の `plan` / `plan.sh` (alias・PATH で解決される) は不可。パスは cwd に対して解決し、
+    (1) 字面 (normpath) が信頼する場所のどれかと一致し、(2) realpath もその場所の realpath と一致すること。
+    plan.sh は自分の位置 (BASH_SOURCE の dirname を論理パスで) から lib を読むので、realpath だけを
+    見ると「信頼する plan.sh への symlink を別の dir に置く」形で別の lib を読ませられる。字面も見て塞ぐ。
+    """
+    if "/" not in cmd or ".." in cmd.split("/") or cmd.startswith("~"):
+        return False
+    cwd = ctx.get("cwd")
+    if not os.path.isabs(cmd) and not cwd:
+        return False
+    lexical = os.path.normpath(cmd if os.path.isabs(cmd) else os.path.join(cwd, cmd))
+    real = os.path.realpath(lexical)
+    root_lex = os.path.normpath(os.path.abspath(_trusted_root()))
+    root_real = os.path.realpath(root_lex)
+    for root in {root_lex, root_real}:
+        if lexical == os.path.join(root, "scripts", "plan.sh"):
+            return real == os.path.join(root_real, "scripts", "plan.sh")
+    asg = _read_assignment(root_real, ctx.get("agent", ""))
+    if not asg:
+        return False
+    slug, tid = asg
+    wt_re = re.compile(r"^" + re.escape(tid) + r"(?:-[^/]*)?$")
+
+    def own_worktree_plan(path: str, root: str) -> bool:
+        wt = os.path.dirname(os.path.dirname(path))
+        return (path == os.path.join(wt, "scripts", "plan.sh")
+                and os.path.dirname(wt) == os.path.join(root, ".claude", "worktrees", slug)
+                and bool(wt_re.match(os.path.basename(wt))))
+
+    if not any(own_worktree_plan(lexical, r) for r in {root_lex, root_real}):
+        return False
+    rel = os.path.relpath(lexical, root_lex if lexical.startswith(root_lex + os.sep) else root_real)
+    return own_worktree_plan(real, root_real) and real == os.path.join(root_real, rel)
+
+
 _TIMEOUT_DURATION = re.compile(r"^\d+(?:\.\d+)?[smhd]?$")
 
 
@@ -765,7 +840,10 @@ def _check_segment(words: list[_Word], index: int, ctx: dict, depth: int = 0) ->
             raise _Reject("timeout は `timeout <秒数> <許可されたコマンド>` の形だけ許可します")
         _check_segment(args[1:], index, ctx, depth + 1)
         return
-    if cmd == "plan" or (os.path.basename(cmd) == "plan.sh" and ".." not in cmd.split("/")):
+    if os.path.basename(cmd) in ("plan.sh", "plan"):
+        if not _is_trusted_plan(cmd, ctx):
+            raise _Reject("plan.sh は本 repo (CREWVIA_REPO_ROOT) か自分の worktree の scripts/plan.sh を "
+                          "パスで指したものだけ許可します (素の plan・別の場所の plan.sh・symlink・.. は不可)")
         _check_plan(args, ctx)
         return
     if cmd == "git":
@@ -781,6 +859,7 @@ def _check_segment(words: list[_Word], index: int, ctx: dict, depth: int = 0) ->
         _run_spec(SPECS[cmd], args, cmd, ctx)
         if cmd == "cd":
             ctx["cd_seen"] = True
+            ctx["cwd"] = _cd_target(args, ctx.get("cwd"))
         return
     raise _Reject(
         f"{cmd!r} は research の読み取り専用 allowlist にありません "
@@ -789,7 +868,7 @@ def _check_segment(words: list[_Word], index: int, ctx: dict, depth: int = 0) ->
 
 
 def check_bash(command: str, repo: str = "", agent: str = "", cwd: str = "") -> tuple[str, str]:
-    ctx = {"repo": repo, "agent": agent, "cwd": cwd, "cd_seen": False}
+    ctx = {"repo": repo, "agent": agent, "cwd": cwd or os.getcwd(), "cd_seen": False}
     try:
         segs = _tokenize(command)
         if not segs:

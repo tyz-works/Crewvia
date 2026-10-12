@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """tests/red_proof_research_bash_guard.py — research の Bash ガード (t005 / t007) の赤の実証。
 
-t005 の項目 1〜5 と t007 (Codex 2 巡目) の項目 6〜9 を 1 つずつ戻した複製 (hooks/ と config/skill-permissions.yaml と
+t005 の項目 1〜5・t007 (Codex 2 巡目) の項目 6〜9・t009 (Codex 3 巡目) の項目 10〜12 を 1 つずつ戻した複製 (hooks/ と config/skill-permissions.yaml と
 tests/test_research_skill_guards.py だけを一時 dir に写したもの) で同じテストを走らせ、
 狙ったテストが **assert で** 赤になることを確かめる。本番の worktree・queue には触れない。
 
-  python3 tests/red_proof_research_bash_guard.py        (約 5 分)
+  python3 tests/red_proof_research_bash_guard.py        (約 15 分)
 
 各変異は置換元がちょうど 1 回現れることを確かめる (0 回なら BROKEN = 注入点が消えた)。
 項目 1 の heredoc の文字検査は、外しても字句解析が本文の行をコマンドとして検査するので deny のまま
@@ -44,9 +44,10 @@ MUTATIONS = [
     ("2c export / command / env を表に足す (状態変更・ラッパー)", [
         (GUARD_REL, '    "echo": Spec(any_args=True),', '    "echo": Spec(any_args=True),\n    "export": Spec(any_args=True),\n    "command": Spec(any_args=True),\n    "env": Spec(any_args=True),'),
     ], "test_codex_reproductions_are_denied"),
-    ("2d 先頭以外の source .crewvia-env を許す", [
-        (GUARD_REL, 'and index == 0 and depth == 0 and', 'and depth == 0 and'),
-    ], "test_source_crewvia_env_is_the_one_fixed_form"),
+    # 相対パスは cd の後ろで cwd 不明 = 拒否のまま (二重に守られている)。赤は cd の後ろの絶対パスの source で取る
+    ("2d 先頭以外の source を許す", [
+        (GUARD_REL, '    if index != 0 or depth != 0:\n        raise _Reject("source は', '    if depth != 0:\n        raise _Reject("source は'),
+    ], "test_source_is_bound_to_the_own_worktree_env_file"),
     ("3 awk / python3 / xxd を表に戻す (言語を持つツール)", [
         (GUARD_REL, '    "echo": Spec(any_args=True),', '    "echo": Spec(any_args=True),\n    "awk": Spec(any_args=True),\n    "python3": Spec(any_args=True),\n    "xxd": Spec(any_args=True),'),
     ], "test_codex_reproductions_are_denied"),
@@ -101,10 +102,10 @@ MUTATIONS = [
          '        if c in "<>":\n            raise _Reject("リダイレクトは'),
     ], "test_only_two_exact_redirect_tokens"),
     ("8a plan.sh を basename で判定する (c35cb83 に戻す)", [
-        (GUARD_REL, '        if not _is_trusted_plan(cmd, ctx):', '        if ".." in cmd.split("/"):'),
+        (GUARD_REL, '        if not _is_trusted_path(cmd, ctx, ("scripts", "plan.sh")):', '        if ".." in cmd.split("/"):'),
     ], "test_codex_reproductions_are_denied"),
     ("8b 字面の検査を外し realpath だけで判定する (symlink 経由を通す)", [
-        (GUARD_REL, '        if lexical == os.path.join(root, "scripts", "plan.sh"):', '        if real == os.path.join(root_real, "scripts", "plan.sh"):'),
+        (GUARD_REL, '        if lexical == os.path.join(root, *rel):', '        if real == os.path.join(root_real, *rel):'),   # t009 で .crewvia-env と共通 (10c と同じ注入点)
     ], "test_plan_sh_must_resolve_to_the_trusted_script"),
     ("8c 同じコマンドの中の cd の行き先を cwd として追跡する", [
         (GUARD_REL, '            ctx["cd_seen"] = True\n            ctx["cwd"] = None',
@@ -113,6 +114,38 @@ MUTATIONS = [
     ("9 git fetch に --prune / --prune-tags / -p を戻す", [
         (GUARD_REL, '    ("fetch",): _git(max_pos=2, check=_check_git_fetch),', '    ("fetch",): _git(short="p", long="prune prune-tags", max_pos=2, check=_check_git_fetch),'),
     ], "test_codex_reproductions_are_denied"),
+    # ---- t009 (Codex 3 巡目 P1×3)
+    ("10a source の場所を検査しない (4e8a822 の形: どの cwd の .crewvia-env でも可)", [
+        (GUARD_REL, '    if os.path.basename(path) != ".crewvia-env" or not _is_trusted_path(path, ctx, (".crewvia-env",)):',
+         '    if os.path.basename(path) != ".crewvia-env":'),
+    ], "test_source_is_bound_to_the_own_worktree_env_file"),
+    ("10b スラッシュ無しの source .crewvia-env (PATH 探索) を通す", [
+        (GUARD_REL, '    if "/" not in path:\n        raise _Reject(', '    if "/" not in path:\n        return\n        raise _Reject('),
+    ], "test_codex_reproductions_are_denied"),
+    # 字面だけで判定する (worktree 側の realpath の検査を外す) = 自分の worktree に置いた symlink の .crewvia-env を通す。
+    # (8b の「字面を外す」は source では効かない: 信頼する .crewvia-env を指す symlink は中身が同じ)
+    ("10c source / plan.sh の realpath の検査を外す (symlink の .crewvia-env を通す)", [
+        (GUARD_REL, '    return own_worktree_file(real, root_real) and real == os.path.join(root_real, under)', '    return True'),
+    ], "test_source_is_bound_to_the_own_worktree_env_file"),
+    ("11 printf を表に戻す", [
+        (GUARD_REL, '    "echo": Spec(any_args=True),', '    "echo": Spec(any_args=True),\n    "printf": Spec(),'),
+    ], "test_codex_reproductions_are_denied"),
+    ("12a git diff の必須フラグの検査を外す", [
+        (GUARD_REL, '        check=_require_no_ext_programs),   # --no-index', '        ),   # --no-index'),
+    ], "test_codex_reproductions_are_denied"),
+    ("12b git diff に --no-index を戻す", [
+        (GUARD_REL, '"ignore-blank-lines no-ext-diff no-textconv compact-summary', '"ignore-blank-lines no-ext-diff no-textconv no-index compact-summary'),
+    ], "test_diffing_git_needs_no_ext_diff_and_no_textconv"),
+    ("12c git show の必須フラグの検査を外す", [
+        (GUARD_REL, '        long_opt="color decorate unified abbrev pretty word-diff find-renames",\n        check=_require_no_ext_programs),',
+         '        long_opt="color decorate unified abbrev pretty word-diff find-renames"),'),
+    ], "test_codex_reproductions_are_denied"),
+    ("12d git log の差分系オプションでも必須フラグを求めない", [
+        (GUARD_REL, '    if any(k not in _LOG_NO_DIFF for k, _ in opts):', '    if False:'),
+    ], "test_codex_reproductions_are_denied"),
+    ("12e git blame の --no-textconv の要求を外す", [
+        (GUARD_REL, '                     long_arg="date", check=_require_no_textconv),', '                     long_arg="date"),'),
+    ], "test_default_git_runs_textconv_and_the_required_flags_stop_it"),
 ]
 
 

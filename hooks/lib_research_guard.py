@@ -18,6 +18,9 @@
     は拒否し、残りはコマンドごとのオプション allowlist (SPECS / GIT_SPECS / GH_SPECS / PLAN_SPECS) で検査する。
     t007: git の表はサブコマンドごと・束ね不可・値は --name=<値> だけ・大域オプション不可、fetch は 3 形だけ。
     リダイレクトは 2>/dev/null と 2>&1 の完全一致だけ。plan.sh は本 repo か自分の worktree の実体だけ。
+    t009: source は自分の worktree (か repo root) の .crewvia-env をパスで指す形だけ。printf は外した。
+    差分を出す git (diff / show / 差分系オプション付きの log / blame) は --no-ext-diff --no-textconv 必須。
+    守るもの・対象外 (脅威モデル) は knowledge/research-skill-guards.md の先頭。
     plan.sh done / needs-director の結果は --result-file <自分の notes/<tid>*.md> だけ (--repo/--agent/--cwd が要る)。
 """
 
@@ -440,6 +443,40 @@ def _require_one_of(*names: str):
     return check
 
 
+# 差分を出す git は外部 diff (GIT_EXTERNAL_DIFF / diff.<driver>.command) と textconv (diff.<driver>.textconv)
+# を既定で起動しうる (t009。Codex 3 巡目: `git diff --no-index /dev/null x` が GIT_EXTERNAL_DIFF を起動した)。
+# 列挙で --ext-diff / --textconv を外すだけでは止まらないので、無効にするフラグが両方付いた形だけ通す。
+_NO_EXT_PROGRAMS = ("--no-ext-diff", "--no-textconv")
+# git log のうち差分を出さないオプション。これ以外 (-p / --stat / --follow / --cherry-pick …) が 1 つでもあれば
+# 差分の機構が動くとみなし、_NO_EXT_PROGRAMS を求める (列挙外は「差分あり」に倒す = fail closed)
+_LOG_NO_DIFF = frozenset(
+    ["-N", "--no-patch", "--no-ext-diff", "--no-textconv"]
+    + ["--" + n for n in _w(
+        "oneline graph all reverse first-parent no-merges merges abbrev-commit no-color topo-order date-order "
+        "left-right boundary branches tags remotes ancestry-path simplify-by-decoration no-abbrev walk-reflogs "
+        "invert-grep all-match regexp-ignore-case extended-regexp fixed-strings perl-regexp source parents "
+        "children since until after before author committer grep max-count skip date format "
+        "color decorate abbrev pretty")]
+)
+
+
+def _require_no_ext_programs(opts, pos, ctx) -> None:
+    keys = {k for k, _ in opts}
+    if not all(f in keys for f in _NO_EXT_PROGRAMS):
+        raise _Reject("差分を出す git は --no-ext-diff --no-textconv を付けてください "
+                      "(外部 diff・textconv のプログラムを起動しない形だけ許可します)")
+
+
+def _require_no_ext_programs_if_diff(opts, pos, ctx) -> None:
+    if any(k not in _LOG_NO_DIFF for k, _ in opts):
+        _require_no_ext_programs(opts, pos, ctx)
+
+
+def _require_no_textconv(opts, pos, ctx) -> None:
+    if not any(k == "--no-textconv" for k, _ in opts):
+        raise _Reject("git blame は既定で textconv を起動するので --no-textconv を付けてください")
+
+
 def _require_list_if_positional(opts, pos, ctx) -> None:
     if pos and not any(k in ("-l", "--list") for k, _ in opts):
         raise _Reject("名前を渡すと作成になるため、位置引数があるときは -l / --list が必要です")
@@ -469,7 +506,6 @@ SPECS: dict[str, Spec] = {
     "paste": Spec(short="sz", short_arg="d"),
     "comm": Spec(short="123iz", long=_w("nocheck-order check-order"), max_pos=2),
     "echo": Spec(any_args=True),
-    "printf": Spec(),  # オプション無し (-v で変数を書く形は拒否)
     "pwd": Spec(short="LP", max_pos=0),
     "date": Spec(short="uR", short_arg="d", long=_w("utc rfc-email"), long_arg=_w("date"), max_pos=1),
     "which": Spec(short="a"),
@@ -516,22 +552,25 @@ GIT_SPECS: dict[tuple, Spec] = {
              "perl-regexp no-ext-diff no-textconv source parents children compact-summary root "
              "ignore-all-space ignore-space-change",
         long_arg="since until after before author committer grep max-count skip date format diff-filter",
-        long_opt="color decorate unified abbrev pretty find-renames word-diff dirstat"),
+        long_opt="color decorate unified abbrev pretty find-renames word-diff dirstat",
+        check=_require_no_ext_programs_if_diff),
     ("show",): _git(
         short="ps",
         long="oneline stat shortstat numstat name-only name-status patch no-patch no-color abbrev-commit raw summary "
              "no-renames no-ext-diff no-textconv source compact-summary first-parent ignore-all-space "
              "ignore-space-change",
         long_arg="format diff-filter date",
-        long_opt="color decorate unified abbrev pretty word-diff find-renames"),
+        long_opt="color decorate unified abbrev pretty word-diff find-renames",
+        check=_require_no_ext_programs),
     ("diff",): _git(
         short="wb",
         long="stat shortstat numstat name-only name-status patch no-patch cached staged no-color raw summary "
              "exit-code quiet no-renames minimal patience histogram ignore-all-space ignore-space-change "
-             "ignore-blank-lines no-ext-diff no-textconv no-index compact-summary no-prefix full-index check "
+             "ignore-blank-lines no-ext-diff no-textconv compact-summary no-prefix full-index check "
              "merge-base function-context",
         long_arg="diff-filter",
-        long_opt="color unified word-diff find-renames dirstat abbrev relative"),
+        long_opt="color unified word-diff find-renames dirstat abbrev relative",
+        check=_require_no_ext_programs),   # --no-index は列挙しない (repo の外のファイルを比べる形)
     ("status",): _git(short="sb", long="short branch long show-stash ahead-behind no-ahead-behind",
                       long_opt="porcelain untracked-files ignored"),
     ("rev-parse",): _git(short="q", long="show-toplevel git-dir absolute-git-dir git-common-dir is-inside-work-tree "
@@ -541,8 +580,8 @@ GIT_SPECS: dict[tuple, Spec] = {
                                             "exclude-standard error-unmatch full-name",
                         long_arg="exclude"),
     ("blame",): _git(short="wsln", long="porcelain line-porcelain incremental show-email show-name show-number root "
-                                       "show-stats",
-                     long_arg="date"),
+                                       "show-stats no-textconv",
+                     long_arg="date", check=_require_no_textconv),
     ("rev-list",): _git(numeric=True, long="count all left-right first-parent no-merges merges reverse topo-order "
                                            "date-order cherry-pick cherry-mark boundary ancestry-path",
                         long_arg="max-count since until after before author grep skip"),
@@ -772,10 +811,11 @@ def _trusted_root() -> str:
     return os.environ.get("CREWVIA_REPO_ROOT") or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-def _is_trusted_plan(cmd: str, ctx: dict) -> bool:
-    """コマンド語が「本 repo の scripts/plan.sh」か「自分の worktree の scripts/plan.sh」を指すか (t007)。
+def _is_trusted_path(cmd: str, ctx: dict, rel: tuple[str, ...]) -> bool:
+    """パスの語が「本 repo の <rel>」か「自分の worktree の <rel>」を指すか (t007 / t009)。
 
-    素の `plan` / `plan.sh` (alias・PATH で解決される) は不可。パスは cwd に対して解決し、
+    rel は ("scripts", "plan.sh") か (".crewvia-env",)。
+    素の `plan` / `plan.sh` / `.crewvia-env` (alias・PATH で解決される) は不可。パスは cwd に対して解決し、
     (1) 字面 (normpath) が信頼する場所のどれかと一致し、(2) realpath もその場所の realpath と一致すること。
     plan.sh は自分の位置 (BASH_SOURCE の dirname を論理パスで) から lib を読むので、realpath だけを
     見ると「信頼する plan.sh への symlink を別の dir に置く」形で別の lib を読ませられる。字面も見て塞ぐ。
@@ -790,24 +830,46 @@ def _is_trusted_plan(cmd: str, ctx: dict) -> bool:
     root_lex = os.path.normpath(os.path.abspath(_trusted_root()))
     root_real = os.path.realpath(root_lex)
     for root in {root_lex, root_real}:
-        if lexical == os.path.join(root, "scripts", "plan.sh"):
-            return real == os.path.join(root_real, "scripts", "plan.sh")
+        if lexical == os.path.join(root, *rel):
+            return real == os.path.join(root_real, *rel)
     asg = _read_assignment(root_real, ctx.get("agent", ""))
     if not asg:
         return False
     slug, tid = asg
     wt_re = re.compile(r"^" + re.escape(tid) + r"(?:-[^/]*)?$")
 
-    def own_worktree_plan(path: str, root: str) -> bool:
-        wt = os.path.dirname(os.path.dirname(path))
-        return (path == os.path.join(wt, "scripts", "plan.sh")
+    def own_worktree_file(path: str, root: str) -> bool:
+        wt = path
+        for _ in rel:
+            wt = os.path.dirname(wt)
+        return (path == os.path.join(wt, *rel)
                 and os.path.dirname(wt) == os.path.join(root, ".claude", "worktrees", slug)
                 and bool(wt_re.match(os.path.basename(wt))))
 
-    if not any(own_worktree_plan(lexical, r) for r in {root_lex, root_real}):
+    if not any(own_worktree_file(lexical, r) for r in {root_lex, root_real}):
         return False
-    rel = os.path.relpath(lexical, root_lex if lexical.startswith(root_lex + os.sep) else root_real)
-    return own_worktree_plan(real, root_real) and real == os.path.join(root_real, rel)
+    under = os.path.relpath(lexical, root_lex if lexical.startswith(root_lex + os.sep) else root_real)
+    return own_worktree_file(real, root_real) and real == os.path.join(root_real, under)
+
+
+def _check_source(args: list[_Word], index: int, depth: int, ctx: dict) -> None:
+    """source / . は自分の worktree (か本 repo) の .crewvia-env をパスで指す形だけ (t009)。
+
+    - 先頭の区間・timeout の外・引数はファイル 1 つだけ (`source f x` は位置引数を書き換える)
+    - スラッシュ無しの `.crewvia-env` は PATH を探す (bash の sourcepath) ので不可。`./.crewvia-env` か絶対パス
+    - 字面と realpath の両方が信頼する場所 = symlink 不可 (plan.sh と同じ _is_trusted_path)。
+      index 0 なので同じコマンドの cd の後ろにはならない (cwd は hook の cwd)
+    """
+    if index != 0 or depth != 0:
+        raise _Reject("source は コマンドの先頭で `source ./.crewvia-env` (か絶対パス) の形だけ許可します")
+    if len(args) != 1 or args[0].glob_at >= 0:
+        raise _Reject("source の引数は .crewvia-env のパス 1 つだけです")
+    path = args[0].value
+    if "/" not in path:
+        raise _Reject("`source .crewvia-env` は PATH を探すので不可です。`source ./.crewvia-env` と書いてください")
+    if os.path.basename(path) != ".crewvia-env" or not _is_trusted_path(path, ctx, (".crewvia-env",)):
+        raise _Reject("source できるのは自分の worktree (か本 repo) の .crewvia-env だけです "
+                      "(別の場所・symlink・.. は不可)")
 
 
 _TIMEOUT_DURATION = re.compile(r"^\d+(?:\.\d+)?[smhd]?$")
@@ -818,15 +880,16 @@ def _check_segment(words: list[_Word], index: int, ctx: dict, depth: int = 0) ->
     if head.glob_at >= 0:
         raise _Reject("コマンド名に glob は使えません")
     cmd, args = head.value, words[1:]
-    if cmd in ("source", ".") and index == 0 and depth == 0 and [w.value for w in args] == [".crewvia-env"]:
-        return  # 固定形 1 つだけ: 先頭の区間の `source .crewvia-env`
+    if cmd in ("source", "."):
+        _check_source(args, index, depth, ctx)
+        return
     if cmd == "timeout" and depth == 0:
         if len(args) < 2 or args[0].glob_at >= 0 or not _TIMEOUT_DURATION.match(args[0].value):
             raise _Reject("timeout は `timeout <秒数> <許可されたコマンド>` の形だけ許可します")
         _check_segment(args[1:], index, ctx, depth + 1)
         return
     if os.path.basename(cmd) in ("plan.sh", "plan"):
-        if not _is_trusted_plan(cmd, ctx):
+        if not _is_trusted_path(cmd, ctx, ("scripts", "plan.sh")):
             raise _Reject("plan.sh は本 repo (CREWVIA_REPO_ROOT) か自分の worktree の scripts/plan.sh を "
                           "パスで指したものだけ許可します (素の plan・別の場所の plan.sh・symlink・.. は不可)")
         _check_plan(args, ctx)

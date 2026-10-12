@@ -182,12 +182,12 @@ ALLOWED = [
     "grep -n 'foo' scripts/plan.sh | head -40",
     "grep -rn 'x\\|y' --include=*.md . | grep -v '^./queue'",
     "cd /tmp && pwd && ls",
-    "git log --oneline -3 && git diff origin/main --stat",
+    "git log --oneline -3 && git diff --no-ext-diff --no-textconv origin/main --stat",
     "git fetch origin main",
     "git fetch origin",
     "git fetch",
     "git status -s",
-    "git log --max-count=5 --format=%H -p -- hooks/x.py",
+    "git log --max-count=5 --format=%H -p --no-ext-diff --no-textconv -- hooks/x.py",
     "git log -10 --since=2.weeks",
     "git rev-list --left-right --count origin/main...HEAD",
     "git branch -a",
@@ -207,8 +207,8 @@ ALLOWED = [
     "timeout 120 ugrep -G 'foo' knowledge/",
     "./scripts/plan.sh pull --agent X --skills research",
     "./scripts/plan.sh status",
-    "source .crewvia-env && ls",
-    ". .crewvia-env",
+    "source ./.crewvia-env && ls",
+    ". ./.crewvia-env",
     "echo hi 2>&1 | head -1",
     "cat a 2>/dev/null; ls x 2>/dev/null && ls",
     "echo \"--- merge-base vs origin/main ---\" && git log --oneline origin/main -1",
@@ -217,7 +217,6 @@ ALLOWED = [
     "jq -r .name x.json",
     "head -150 f && tail -n 5 f",
     "sort -u f | uniq -c",
-    "printf '%s\\n' a b",
     "printenv AGENT_NAME",
     "./scripts/plan.sh needs-director --help 2>&1 | head -20",
 ]
@@ -275,6 +274,14 @@ DENIED = [
     ". evil.sh",
     "source ./x/.crewvia-env",
     "ls && source .crewvia-env",
+    "ls && source ./.crewvia-env",
+    "source .crewvia-env",
+    "printf '%s\\n' a b",
+    "printf x",
+    "git diff",
+    "git show HEAD",
+    "git log -p",
+    "git blame f",
     "env ls",
     "command ls",
     "builtin cd",
@@ -410,6 +417,13 @@ CODEX_REPRODUCTIONS = [
     "uniq /dev/null '2'>/dev/null",                        # 2-2 引用符つきの fd 番号
     "/tmp/plan.sh status",                                 # 2-3 plan.sh の実体
     "git fetch --prune --prune-tags origin",               # 2-4 fetch の刈り込み
+    # Codex 3 巡目 (t003 → t009)。どれも 4e8a822 では allow だった
+    "source .crewvia-env",                                 # 3-1 PATH を探す (bash の sourcepath)
+    "printf 'abc%n' PATH",                                 # 3-2 %n が変数 (PATH) を書く
+    "git diff --no-index /dev/null /etc/hostname",         # 3-3 GIT_EXTERNAL_DIFF を起動する
+    "git diff",                                            # 3-3 diff.<driver>.command / textconv
+    "git show HEAD",                                       # 3-3
+    "git log -p",                                          # 3-3
 ]
 
 
@@ -526,11 +540,82 @@ def test_glob_words_cannot_become_options(tmp_path):
 
 
 def test_source_crewvia_env_is_the_one_fixed_form():
-    assert LIB.check_bash("source .crewvia-env")[0] == "allow"
-    assert LIB.check_bash("source .crewvia-env && ./scripts/plan.sh status")[0] == "allow"
-    for bad in ("source .crewvia-env x", "source ../.crewvia-env", "cd /x && source .crewvia-env",
-                "timeout 5 source .crewvia-env", "source '.crewvia-env'x"):
+    # t009: スラッシュ無し (PATH を探す) は不可。先頭の区間で、信頼する場所の .crewvia-env をパスで指す形だけ
+    assert LIB.check_bash("source ./.crewvia-env")[0] == "allow"
+    assert LIB.check_bash(f"source {REPO_ROOT}/.crewvia-env")[0] == "allow"
+    assert LIB.check_bash("source ./.crewvia-env && ./scripts/plan.sh status")[0] == "allow"
+    for bad in ("source .crewvia-env", ". .crewvia-env", "source ./.crewvia-env x", "source ../.crewvia-env",
+                "cd /x && source ./.crewvia-env", "cd /x && source .crewvia-env", "timeout 5 source ./.crewvia-env",
+                "source './.crewvia-env'x", "source ./scripts/../.crewvia-env", "source ./.crewvia-en?",
+                "source /tmp/.crewvia-env", "source", "source ./hooks/pre-tool-use.sh"):
         assert LIB.check_bash(bad)[0] == "deny", bad
+
+
+def test_source_is_bound_to_the_own_worktree_env_file(fake_repo, tmp_path):
+    # Codex 3 巡目 指摘 1: どの cwd の .crewvia-env でも source できた。cd を 1 回目の呼び出し、source を
+    # 2 回目の呼び出しに分けると、2 回目の hook の cwd は cd 先 (= 別の checkout) になる
+    wt = fake_repo / ".claude/worktrees" / SLUG / "t001-demo"
+    other_wt = fake_repo / ".claude/worktrees" / SLUG / "t002-demo"
+    other_slug_wt = fake_repo / ".claude/worktrees" / OTHER_SLUG / "t001-demo"
+    evil = tmp_path / "evil"
+    for d in (wt, other_wt, other_slug_wt, evil):
+        d.mkdir(parents=True)
+        (d / ".crewvia-env").write_text("touch victim\n")
+    (fake_repo / ".crewvia-env").write_text("\n")
+    linked = fake_repo / ".claude/worktrees" / SLUG / "t001-linked"
+    linked.mkdir()
+    (linked / ".crewvia-env").symlink_to(evil / ".crewvia-env")          # 自分の worktree の名前の symlink
+    (fake_repo / ".claude/worktrees" / SLUG / "t001-dirlink").symlink_to(evil)   # worktree dir ごと symlink
+    ok = [
+        ("source ./.crewvia-env", wt),
+        (". ./.crewvia-env", wt),
+        (f"source {wt}/.crewvia-env", evil),                   # 絶対パスなら cwd に依らない
+        ("source ./.crewvia-env && ls", wt),
+        ("source ./.crewvia-env", fake_repo),                   # repo root の .crewvia-env
+    ]
+    for cmd, cwd in ok:
+        assert _bash(fake_repo, cmd, cwd=cwd) == "native", (cmd, cwd)
+    bad = [
+        ("cd " + str(evil), fake_repo, "native"),               # 1 回目: cd だけなら通る (読み取り)
+        ("source ./.crewvia-env", evil, "deny"),                # 2 回目: cd 先の .crewvia-env は不可
+        ("source .crewvia-env", wt, "deny"),                    # PATH を探す形は自分の worktree でも不可
+        ("source ./.crewvia-env", other_wt, "deny"),            # 他の task の worktree
+        ("source ./.crewvia-env", other_slug_wt, "deny"),       # 他の mission の worktree
+        (f"source {evil}/.crewvia-env", wt, "deny"),
+        ("source ./.crewvia-env", linked, "deny"),              # symlink の .crewvia-env
+        (f"source {linked}/.crewvia-env", wt, "deny"),
+        (f"source {fake_repo}/.claude/worktrees/{SLUG}/t001-dirlink/.crewvia-env", wt, "deny"),
+        (f"source {wt}/../t002-demo/.crewvia-env", wt, "deny"),
+        (f"cd {wt} && source ./.crewvia-env", evil, "deny"),    # 同じコマンドの cd の後ろ (先頭の区間でない)
+        (f"cd {wt} && source {wt}/.crewvia-env", evil, "deny"),
+    ]
+    for cmd, cwd, want in bad:
+        assert _bash(fake_repo, cmd, cwd=cwd) == want, (cmd, cwd)
+    (fake_repo / "queue/assignments/Jiwon").unlink()            # assignment が無ければ worktree は信頼しない
+    assert _bash(fake_repo, "source ./.crewvia-env", cwd=wt) == "deny"
+
+
+def test_bare_source_searches_path_before_cwd(tmp_path):
+    # 前提の確認: bash の source はスラッシュ無しの名前を PATH から先に探す (= cwd の検査では足りない)
+    on_path = tmp_path / "bin"
+    on_path.mkdir()
+    (on_path / ".crewvia-env").write_text("echo FROM_PATH\n")
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    (cwd / ".crewvia-env").write_text("echo FROM_CWD\n")
+    p = subprocess.run(["bash", "-c", "source .crewvia-env"], cwd=str(cwd), capture_output=True, text=True,
+                       env={"PATH": f"{on_path}:/usr/bin:/bin"})
+    assert p.stdout.strip() == "FROM_PATH"
+
+
+def test_printf_is_not_allowed_because_percent_n_writes_a_variable():
+    # Codex 3 巡目 指摘 2。前提: bash の printf の %n は -v 無しでも変数を書く
+    p = subprocess.run(["bash", "-c", "printf 'abc%n' X; echo; echo \"[$X]\""], capture_output=True, text=True)
+    assert p.stdout.splitlines()[-1] == "[3]"
+    for cmd in ("printf 'abc%n' PATH", "printf x", "printf '%s\\n' a", "timeout 5 printf x"):
+        assert LIB.check_bash(cmd)[0] == "deny", cmd
+    assert "printf" not in LIB.SPECS
+    assert LIB.check_bash("echo -e 'a\\tb'")[0] == "allow"      # 代わりは echo
 
 
 @pytest.mark.parametrize("cmd", [
@@ -659,6 +744,10 @@ def test_each_listed_git_short_option_alone_still_passes(key):
     spec = LIB.GIT_SPECS[key]
     for c in spec.short:
         need = ["--list"] if key == ("config",) else []   # config は読み取りの形 (--get / --list) が要る
+        if key in (("diff",), ("show",), ("log",)):
+            need = ["--no-ext-diff", "--no-textconv"]         # 差分を出す git は両方必須 (t009)
+        if key == ("blame",):
+            need = ["--no-textconv", "f"]
         cmd = " ".join(["git", *key, f"-{c}", *need])
         assert LIB.check_bash(cmd)[0] == "allow", (cmd, LIB.check_bash(cmd)[1])
 
@@ -861,3 +950,88 @@ def test_cd_in_the_same_command_does_not_vouch_for_a_relative_plan_sh(fake_repo,
     assert _bash(fake_repo, cmd, cwd=evil) == "deny", cmd
     assert _bash(fake_repo, "./scripts/plan.sh status", cwd=evil) == "deny"     # cwd の plan.sh は信頼しない
     assert _bash(fake_repo, f"{fake_repo}/scripts/plan.sh status", cwd=evil) == "native"
+
+
+# ---- t009 (Codex 3 巡目 指摘 3): 差分を出す git は外部 diff・textconv を起動しない形だけ
+
+@pytest.mark.parametrize("cmd, decision", [
+    ("git diff --no-ext-diff --no-textconv HEAD~1", "allow"),
+    ("git diff --no-textconv --no-ext-diff --stat", "allow"),
+    ("git show --no-ext-diff --no-textconv HEAD", "allow"),
+    ("git show --no-ext-diff --no-textconv --stat HEAD", "allow"),
+    ("git log -p --no-ext-diff --no-textconv -3", "allow"),
+    ("git log --stat --no-ext-diff --no-textconv", "allow"),
+    ("git blame --no-textconv f", "allow"),
+    ("git log --oneline -3", "allow"),                      # 差分を出さない log はフラグ不要
+    ("git log --format=%H --max-count=5 --since=2.weeks", "allow"),
+    ("git log --graph --decorate --all", "allow"),
+    ("git diff", "deny"),
+    ("git diff HEAD~1", "deny"),
+    ("git diff --stat", "deny"),
+    ("git diff --no-ext-diff HEAD~1", "deny"),
+    ("git diff --no-textconv HEAD~1", "deny"),
+    ("git diff --no-index /dev/null /etc/hostname", "deny"),
+    ("git diff --no-ext-diff --no-textconv --no-index /dev/null /etc/hostname", "deny"),
+    ("git show HEAD", "deny"),
+    ("git show --stat HEAD", "deny"),
+    ("git show --no-patch HEAD", "deny"),                   # show は一律
+    ("git show --no-ext-diff HEAD", "deny"),
+    ("git log -p", "deny"),
+    ("git log --patch", "deny"),
+    ("git log -p --no-ext-diff", "deny"),
+    ("git log --stat", "deny"),
+    ("git log --follow -- f", "deny"),
+    ("git log --cherry-pick HEAD...x", "deny"),
+    ("git log --word-diff", "deny"),
+    ("git log --name-only", "deny"),
+    ("git blame f", "deny"),
+    ("git blame -w f", "deny"),
+])
+def test_diffing_git_needs_no_ext_diff_and_no_textconv(cmd, decision):
+    assert LIB.check_bash(cmd)[0] == decision, (cmd, LIB.check_bash(cmd)[1])
+
+
+def _textconv_repo(tmp_path):
+    # textconv を設定した使い捨ての repo (本物の git で「起動する / しない」を確かめる)
+    r = tmp_path / "tc"
+    r.mkdir()
+    marker = tmp_path / "ran"
+    g = ["git", "-C", str(r)]
+    subprocess.run([*g, "init", "-q"], check=True)
+    for k, v in (("user.email", "a@b"), ("user.name", "a"),
+                 ("diff.tc.textconv", f"sh -c 'touch {marker}; cat \"$0\"'")):
+        subprocess.run([*g, "config", k, v], check=True)
+    (r / ".gitattributes").write_text("*.txt diff=tc\n")
+    (r / "f.txt").write_text("a\n")
+    subprocess.run([*g, "add", "-A"], check=True)
+    subprocess.run([*g, "commit", "-qm", "1"], check=True)
+    (r / "f.txt").write_text("a\nb\n")
+    subprocess.run([*g, "commit", "-qam", "2"], check=True)
+    return r, marker
+
+
+@pytest.mark.parametrize("cmd", [
+    "git diff HEAD~1", "git show HEAD", "git log -p -1", "git blame f.txt",
+])
+def test_default_git_runs_textconv_and_the_required_flags_stop_it(tmp_path, cmd):
+    # 前提: フラグ無しの形は本物の git で textconv を起動する (= 列挙から --textconv を外すだけでは止まらない)。
+    # git blame も既定で起動する (Codex の指摘外。t009 の実測で見つけた)。フラグを足した形は起動しない
+    r, marker = _textconv_repo(tmp_path)
+    subprocess.run(cmd.split(), cwd=str(r), capture_output=True, check=True)
+    assert marker.exists(), cmd
+    assert LIB.check_bash(cmd)[0] == "deny", cmd
+    marker.unlink()
+    words = cmd.split()
+    fixed = [*words[:2], *(["--no-textconv"] if words[1] == "blame" else ["--no-ext-diff", "--no-textconv"]), *words[2:]]
+    subprocess.run(fixed, cwd=str(r), capture_output=True, check=True)
+    assert not marker.exists(), fixed
+    assert LIB.check_bash(" ".join(fixed))[0] == "allow", fixed
+
+
+def test_log_without_diff_options_does_not_run_textconv(tmp_path):
+    # フラグ不要にしている log の形が本当に textconv を起動しないこと (_LOG_NO_DIFF の根拠)
+    r, marker = _textconv_repo(tmp_path)
+    for cmd in ("git log --oneline -3", "git log --graph --decorate --all", "git log --format=%H --max-count=5"):
+        assert LIB.check_bash(cmd)[0] == "allow", cmd
+        subprocess.run(cmd.split(), cwd=str(r), capture_output=True, check=True)
+        assert not marker.exists(), cmd

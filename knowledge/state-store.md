@@ -901,6 +901,7 @@ queue の下の dir 作成 (`_ensure_queue_dirs`・init --force の archive dir�
 | `assignments/<agent>` / `.identity` | plan.sh publish / retire (:2040 / :2239) | queue/.lock | 同上 / unlink (親 dir fsync なし) | **S3** (S4 で projection 化) | |
 | `assignments/<agent>.restarting` | benchmark-ctx.sh (:107 / :307 `touch`) | なし | touch | 寄せない | ベンチマーク専用・中身なし・存在だけの印 |
 | `.taskvia-map.json` | plan.sh (:2365 / :2382)、taskvia-sync.sh (:144) | **なし** | `open('w')` | **S5 済**: `locked_update_json` (専用ロック `queue/.taskvia-map.json.lock`)。plan.sh は `_update_taskvia_map(fn)`、taskvia-sync.sh は**この実行で変えた項目だけ**を読み直した map に重ねる (`save_map`)。壊れていれば空から作り直す (`on_unreadable='reset'`。キャッシュ専用の引数) | 外部ミラーのキャッシュ。queue/.lock を取らないのは、前後に HTTP があり、正本ではないため |
+| `missions/<slug>/notes/<tid>*.md` | research スキルの Worker (Write/Edit。hooks/pre-tool-use.sh の Research scope guard が自分の assignment の slug・tid だけ許可) | なし (task ごとに別ファイル・書き手 1 者) | Write ツール (非原子的。メモは正本ではない) | 寄せない | 調査メモ。plan.sh・dispatcher は読まない。`knowledge/research-skill-guards.md` |
 | `pre-compact-fallback.log` | hooks/pre-compact.sh (:66) | なし | 追記 | 寄せない | ログ |
 | `.lock` | plan.sh / lib_retirement | — | — | — | |
 | (新) `audit/*.jsonl` | lib_state_store | queue/.lock | 追記 (O_APPEND) | S3 | §4 |

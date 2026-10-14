@@ -13,7 +13,7 @@
 | 段 | 決めたこと |
 |---|---|
 | P1 Attempt 履歴 | 試行（Execution）は 01c で済んでいる。足りないのは (a) 試行ごとの Result・終わり方・head が card で上書きされて残らないこと、(b) 「Codex の指摘の修正」「QA の差し戻し」を新 task でなく同じ task の次の試行として開く手段。**`queue/missions/<m>/history/tNNN/` に、遷移ごとに 1 ファイルを足す台帳**を作り（上書きしない）、`plan.sh retry` を足す。総試行の上限は `max_attempts`（既定 5〜6。§7 の判断 2）。語の衝突を避けるため、reopen の回数は `generation` と呼ばず **`reopen_count`** にする |
-| P2 reopen | `plan.sh reopen` を足す（done / verified / skipped → pending）。**依存先が pending のままなら、依存の規則（`lib_dep_rules.py`）が何も変わらなくても自動で待つ**。足りないのは進行中・検証待ち・検証中・完了済みの下流で、これは `--cascade` が**試行を閉じる**ことで無効化する（元文書 §15-1 の答え）。mission を active に戻す修正は小さいので**単独の先頭 PR**。archive の restore は**やらない**（需要の記録が無い） |
+| P2 reopen | `plan.sh reopen` を足す（done / verified / skipped → pending）。**依存先が pending のままなら、依存の規則（`lib_dep_rules.py`）が何も変わらなくても自動で待つ**。cascade は原子的ではなく、**下流 → 最後に I の順に書いて、途中で止まったら同じコマンドの再実行で完了させる（roll forward。§4.3.1）**。足りないのは進行中・検証待ち・検証中・完了済みの下流で、これは `--cascade` が**試行を閉じる**ことで無効化する（元文書 §15-1 の答え）。mission を active に戻す修正は小さいので**単独の先頭 PR**。archive の restore は**やらない**（需要の記録が無い） |
 | P3 checkpoint | 退役の前に worktree の dirty diff（と、ペインが生きていれば capture）を `registry/checkpoints/` に保存し、次の試行の `pull` が `previous_attempt` として渡す。**保存の失敗は退役を止めない**。PreCompact が動かない原因は `AGENT_NAME` / `CREWVIA_AGENT_NAME` の食い違いと task の特定で、`plan.sh snapshot --self` で直す。handoff の path に mission を含める |
 | PR | 8 本（A〜H）+ 任意 2 本。どれも 300KB よりずっと小さい見込み。独立して先に出せるのは A（mission を active に戻す）と C（PreCompact） |
 
@@ -48,9 +48,15 @@
 - **1 遷移 = 1 ファイル**。名前は `<seq4>-<kind>-<execution_id>.md`（`seq4` はその task の台帳の通し番号。ゼロ埋め）。**既存のファイルを上書きも追記もしない**（競合しないので、1 本の追記ファイルより壊れにくい）。
 - `kind`: `end`（試行が終わった）/ `retry` / `reopen` / `reset` / `retire` の 5 つ。
 - 中身は frontmatter + 本文。frontmatter: `execution_id` / `attempt` / `end_code`（`end` のとき）/ `ended_at` / `head`（分かれば）/ `pr_number` / `worker` / `actor` / `reason`（`retry` / `reopen` / `reset` のとき必須）/ `checkpoint_dir`（§5。あれば）。本文: `end` のときだけ、その試行が書いた Result 全文。
-- **書く場所は Controller の `_finish`（`lib_task_controller.py:564-`）の 1 か所**。報告の 6 コマンド・retire・reset・G1 の fail は全部ここを通る（元文書の表の「試行を持つ報告と予約は、すべて Controller を通る」。`update --status` だけは通らない — §3.6）。Result は `_finish` が受け取る `body` から取る。
+- **書く場所は Controller の `_finish`（`lib_task_controller.py:564-`）の 1 か所**。報告の 6 コマンド・retire・reset・G1 の fail は全部ここを通る（元文書の表の「試行を持つ報告と予約は、すべて Controller を通る」。`update --status` だけは通らない — §3.6）。**台帳に入れる Result は `_finish` の `body_out` の `## Result` 節から取る**。`_finish` の引数 `body`（`lib_task_controller.py:564`）は `_load` が更新前に読んだ card 本文（`:647`・`:676`）で、今回の報告は入っていない。報告した Result は plan.sh が組んだ本文（done: `plan.sh:4878`、fail: `:5051`、needs-director: `:3550`・`:6909`）として `body=` で渡り、`_finish` では `new_body` になる。`body_out = body if new_body is None else new_body`（`:579`）が `txn.write_card` に渡る本文そのもの（`:599`・`:624`）なので、台帳はこの `body_out` を、同じ呼び出しの `write_card` の直前に書く。`new_body` が無い操作（retire・reset）は `body_out` = 旧本文 = その試行が最後に持っていた Result で、これが正しい。
 - **書き込みは `lib_state_store` の `Txn` に新しい 1 メソッド（`write_history`）を足して通す**。`tests/test_queue_writes_go_through_the_store.py` の許可表に 1 行足す。plan.sh や Controller から直に `open()` しない。
-- **順序: 台帳 → card**（派生値は正本より前。card がコミット点）。card の書き込みが失敗しても、台帳に残るのは「まだ起きていない遷移」の 1 ファイル。ファイル名に `execution_id` と `kind` を含めるので、再試行は同じ名前に当たり、**中身が同じなら何もせず、違えば拒否する**（再送の冪等。execution.md §16.10 と同じ作法）。台帳だけが先に残った場合は、回復（R-1〜R-5）の対象にしない — 孤児の台帳は害が無く、`store-check` が「card に対応する遷移が無い台帳」を**報告だけ**する。
+- **順序: 台帳 → card**（派生値は正本より前。card がコミット点）。card の書き込みが失敗しても、台帳に残るのは「まだ起きていない遷移」の 1 ファイル（孤児）。孤児の台帳は害が無く、回復（R-1〜R-5）の対象にしない。`store-check` が「card に対応する遷移が無い台帳」を**報告だけ**する。
+- **再送の冪等（孤児の台帳があるとき）**。名前には `seq4`、中身には `ended_at` が入るので、再送で採番や時刻を作り直すと別ファイルが増える・内容が食い違う。次の規則で**既存イベントを見つけて再利用**する（全部ロックの中。ロックが直列化するので採番は競合しない）:
+  1. **イベントの同定キー = (`execution_id`, `kind`, `reopen_count`)**。`reopen_count` はその操作を始めた時点の card の値（card がコミット点なので、card が更新されていない再送では同じ値）。ファイル名の `<kind>-<execution_id>` で候補を絞り（`history/tNNN/*-<kind>-<execution_id>.md`）、frontmatter の `reopen_count` で確定する。`retry` / `reopen` / `reset` は新しい試行を作らず `execution_id` が前の試行のものなので、`reopen_count` を足して「同じ ID の 2 回目の reopen」と区別する。
+  2. **見つかったら `seq4` と `ended_at` をそのファイルから読んで再利用**し、続く card と record の書き込み（`_write_record(..., ended_at=)` は `lib_task_controller.py:625`）にも**この `ended_at`** を渡す（再送のときの `now` は使わない）。台帳は書き直さない。
+  3. **見つからなければ** `seq4` = 台帳の最大 + 1、`ended_at` = 今。
+  4. **再送で比べる欄**: `execution_id` / `attempt` / `end_code` / `head` / `pr_number` / `worker` / `actor` / `reason` / `checkpoint_dir` と本文（Result 全文）。**除くのは `seq4`（名前）と `ended_at` だけ**。全部同じなら台帳は何も書かず card へ進む。1 つでも違えば exit 3（`HISTORY_MISMATCH`、card は書かない。違う欄の名前だけを出し、値は出さない）。つまり**孤児ができた後は、同じ報告を送り直すことで先へ進む**。Result を直して送り直したいときは、同じ報告で card を先に通してから、次の試行・`reopen` で扱う（孤児を差し替える手段は作らない。§8）。
+  5. 同定キーに合う候補が 2 つ以上あるのは台帳の破損（採番が競合しないので通常は無い）。`HISTORY_AMBIGUOUS` で止め、`store-check` が報告する。
 - **台帳が書けなかったとき**: 遷移を止める（exit 1、何も書かない）。履歴を失ったまま進めるのは、この設計の目的に反する。ただし retire だけは、`plan.sh retire` が `RETIRED` で閉じる出口なので、台帳が書けなくても閉じる（警告を出し、`reason` に「台帳なし」を card ではなく監査ログの `result` に残す）。**この例外の根拠は「退役が止まると誰も窓を閉じない」（`daemon-authority.md` §5）**。
 - 容量: Result は今も card に全文が載っているので、台帳は card と同じ量が試行の数だけ増える。1 task あたりの上限（`max_attempts` 5〜6）× Result の大きさ。mission を archive すると `history/` ごと動く（`_move_mission_dir`。`plan.sh:6093-6126`）。
 - 読み口: `plan.sh history <id> [--mission <slug>]`（読み取り専用・ロックなし。台帳が読めないファイルを含むときは、そのファイルを飛ばさず `Unreadable` 相当で止まる — 空に潰さない）。`pull` の JSON に `previous_attempt`（§3.5）を足す。
@@ -101,9 +107,9 @@
 2. `reopen_count += 1`、`completed_at` を消す、`worker` / `started_at` を消す。`pr_number` と `task_slug` は残す。旧 Result は台帳の `end`（既に書いてあるはず）を指す `reopen` を足す。
 3. mission が done なら戻す（§4.2）。
 4. 下流の処理（§4.3）。
-5. 台帳に `reopen` を書く（理由つき）→ card → … の順（§3.2）。
+5. 書く順は §4.3 の **roll forward の順**（下流 → 最後に I）。task ごとに台帳 `reopen`（理由つき）→ card の順（§3.2）。
 
-**同じ reopen の再送**: 遷移元が pending になっているので exit 3（`NOT_REOPENABLE`）。冪等キーは足さない（`execution_id` が無い操作なので、前提の status が冪等の役をする）。
+**同じ reopen の再送**: I の card が最後に書かれるので、**I が pending なら reopen は完了している**（exit 3 `NOT_REOPENABLE`）。I がまだ done / verified / skipped なら**途中で止まった reopen**で、同じコマンドを再実行すれば続きから完了する（§4.3 の roll forward。I 自身の台帳は §3.2 の同定キーで再利用する）。
 
 ### 4.2 mission を active に戻す（独立した先頭 PR）
 
@@ -124,7 +130,17 @@
 
 - 既定の `--cascade` は `reviews`（§7 の判断 5）。
 - 下流の `released_deps` に I の id があれば消す（`released_deps` は failed の依存を解除する欄。I が戻ったら解除の根拠が無い。`plan.sh:6536` と同じ作法）。
-- 全部を**1 回のロックの中・1 つの Txn**で行う。途中で失敗したら何も書かない（下流の一部だけ開いた状態を作らない）。
+#### 4.3.1 書き込みの順序と roll forward（途中で止まっても安全側に倒れる）
+
+**原子的にはしない**。`Txn` は書き込みをステージせず、呼ばれた順に 1 ファイルずつ atomic に書き（`lib_state_store.py:922-924` の docstring・`:1042` の `_write`・`:1063` の `write_card`）、rollback も無い。書く順がそのまま crash モデルで、`knowledge/state-store.md:679` もこれを採った理由を述べている。したがって「1 つの Txn」が保証するのは **1 回のロック + 1 つの監査 txn_id** であって、全部書くか全部書かないかではない。途中の I/O エラー・プロセス停止は起きうるものとして、次のように設計する。
+
+1. **検査を全部先に**（§4.1-1 と、下流の列挙・拒否の判定。何も書く前）。ここで拒否されれば何も書かれない。
+2. **下流 → 上流の順に 1 task ずつ書く**。閉包の各 task を、**I から遠い順**（その task に依存する task が先）に処理する。順序は `downstream_closure` が返す（依存の深さの降順。同じ深さは task id 順で決定的）。各 task は「台帳 `reopen`（§3.2）→ card」で、進行中の下流は `reset_task` と同じ操作（試行を閉じて pending）。
+3. **I の card を最後に書く**（`reopen_count += 1`・status pending）。I の card が**完了の印**。
+4. **途中で止まったときの状態は、古い結果が通る側には倒れない**。この順で作られる中間状態は「I が done のまま・下流の一部が pending」だけで、危険な逆（**下流が done / verified のまま上流が pending**）は、どの時点でも作られない（各 task は、それに依存する task が全部戻った後に戻る）。中間状態の害は、pending に戻った下流（例: R）が、まだ done の I に対して pull されうること — R が見るのは I の現在の PR head で、reopen の前の状態そのものなので、無駄な作業が増えるだけ。R が走っている間に再実行で I が pending になれば、R の試行は `RESET_BY_DIRECTOR` で閉じられる（§4.3 表の in_progress の行）。
+5. **再実行で完了する（roll forward）**。同じ `plan.sh reopen I --reason … --cascade …` を送り直す。I がまだ done なので入口の検査を通り、処理は前の続きになる: 既に pending の下流は**何もしない**（`reopen_count` を足さない — 足すのは done / verified から戻すときだけ）、まだ戻っていない下流だけを同じ順で処理し、最後に I を書く。I の台帳 `reopen` は §3.2 の同定キーで既存のものを再利用する（`--reason` が違えば `HISTORY_MISMATCH`。同じ `--reason` で再実行する）。**出力に「再実行で完了した」と、何件が既に戻っていたかを出す**。
+6. **途中状態の見つけ方**（`store-check`。**報告だけ・直さない**。直すのは Director が同じコマンドを再実行すること）。下流 T の台帳に `kind: reopen` の イベントがあり、その `root`（= I の id）の `root_reopen_count`（= 始めた時点の I の `reopen_count` + 1）が、I の現在の `reopen_count` より大きいとき、`cascade-incomplete: <I> <T>` を出す。T の台帳 `reopen` の frontmatter に `root` と `root_reopen_count` を足すのは、このため（cascade で戻された task にだけ付ける）。I の台帳 `reopen` が残っていて I がまだ done のとき（I の card 書き込み前に止まった）も、同じ `cascade-incomplete` として I 自身を指して出す。
+7. **journal は使わない**。01a が退けた理由（`state-store.md:212-219`: 回復に要る情報は既に正本にある・ジャーナルと card の食い違いという新しい状態を生む）がそのまま当てはまる。roll forward に要る入力は、Director が再実行で渡す引数（I・`--reason`・`--cascade`）と、下流の card・台帳（どこまで戻ったか）で足りる。見つけるのに要る印（手順 6）は、台帳が既に持つ frontmatter の 2 欄で済む。
 
 ### 4.4 Git（merge 済みの task の reopen）
 
@@ -217,7 +233,8 @@ reopen は依存の辺を足さないので、循環を作らない。下流の�
 
 ## 8. 未解決の課題（この文書のレビューで積む場所）
 
-Codex の往復は 3 巡で打ち切り、残った P2 以下はここに積む（元文書 §15 と同じ方針）。今は空。
+Codex の往復は 3 巡で打ち切り、残った P2 以下はここに積む（元文書 §15 と同じ方針）。
 
+- 実装の PR（D・F）の QA で確かめること: (1) cascade を各書き込みの後で kill して再実行し、`cascade-incomplete` が出て再実行で消えること・`reopen_count` が二重に増えないこと。(2) 孤児の台帳を作ってから同じ報告を送り直すと、新しいファイルが増えず `ended_at` が台帳と card・record で一致すること。(3) 孤児の台帳のあとに違う Result で送ると `HISTORY_MISMATCH` で card が書かれないこと（この拒否のあとの出口が「同じ報告を送り直す」だけでよいかは、運用で足りなければ孤児の差し替えを別に設計する）。
 - 範囲外として残したこと: Verifier の運用と、その verify pass が依存先の変更を見る検査（PR-J）。`update --status` の Controller 化（P0 の残り）。回復を dispatcher が起こす・待つ（P0 の残り）。
 - 確かめていないこと: mission の戻し先 `in_progress` が lint / dispatcher で想定どおりか（PR-A）。retry / reopen の後に `worktree_gc` で隔離済みの worktree を pull が作り直せるか（PR-E の QA）。reopen した codex-review task が、`registry/daemons/review-refusals/` の古い拒否記録で spawn されないことがあるか（記録は消してよい。`scripts/CLAUDE.md` の「通知・記録」）。`done` → `pending` を Taskvia が受け付けるか。

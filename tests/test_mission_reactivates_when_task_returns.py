@@ -58,7 +58,8 @@ def test_add_to_done_mission_reactivates_it(box):
     assert "Reactivated" in p.stdout
 
 
-@pytest.mark.parametrize("args", [("--status", "pending"), ("--status", "in_progress"), ("--reset",)])
+@pytest.mark.parametrize("args", [("--status", "pending"), ("--status", "in_progress"), ("--reset",),
+                                  ("--reset", "--status", "in_progress")])
 def test_update_returning_a_task_to_unfinished_reactivates(box, args):
     _make_done(box)
     p = box.plan("update", "t002", *args, "--mission", M, agent="Director")
@@ -84,3 +85,18 @@ def test_update_not_returning_to_unfinished_keeps_done(box):
     p = box.plan("update", "t002", "--priority", "low", "--mission", M, agent="Director")
     assert p.returncode == 0, p.stderr
     assert _mission_status(box) == "done"
+
+
+@pytest.mark.parametrize("final", ["done", "skipped"])
+def test_reset_with_explicit_terminal_status_keeps_mission_done(box, final):
+    """`--reset --status done|skipped`: 明示の status が reset の pending を上書きし task は終端のまま。
+    mission を戻すと全 task が終端なのに in_progress が残る (Codex 1 巡目 P2)。判定は確定値で。"""
+    _make_done(box)
+    before = _mission_path(box).read_text()
+    p = box.plan("update", "t002", "--reset", "--status", final, "--mission", M, agent="Director")
+    assert p.returncode == 0, p.stderr
+    assert f"status: {final}" in (box.queue / "missions" / M / "tasks" / "t002.md").read_text()
+    assert _mission_status(box) == "done"
+    assert _has_completed_at(box)
+    assert "Reactivated" not in p.stdout
+    assert _mission_path(box).read_text() == before

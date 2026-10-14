@@ -6621,8 +6621,12 @@ def cmd_update(args):
             save_task(slug, task_id, meta, body)
         print(f"Updated: {slug}/{task_id} — {', '.join(changed)}")
 
-        # task を未完了に戻す経路 (--status pending|in_progress / --reset) では、done の mission も戻す
-        if opts.get('--reset') or status in ('pending', 'in_progress'):
+        # task を未完了に戻す経路 (--status pending|in_progress / --reset) では、done の mission も戻す。
+        # 判定は入力の option でなく**書いた後の task の確定 status**で: `--reset --status done` は
+        # reset の pending を明示の status が上書きし、task は終端のまま。それで mission を戻すと
+        # 全 task が終端なのに in_progress が残る (Codex 1 巡目 P2)。
+        if ((opts.get('--reset') or status in ('pending', 'in_progress'))
+                and meta.get('status') not in TERMINAL_STATUSES):
             _reactivate_done_mission(slug, via=f'update {task_id}')
 
         # Dispatcher Rule 5 の誤報を防ぐため、差し戻した Worker の assignment も

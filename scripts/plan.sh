@@ -2597,7 +2597,7 @@ USAGE = {
     'reap-orphan-assignment': 'plan.sh reap-orphan-assignment <agent> [--no-wait]',
     'ready-for-verification': 'plan.sh ready-for-verification <task_id> [--mission <slug>] [--execution <id>]',
     'verifying': 'plan.sh verifying <task_id> --verifier <name> [--mission <slug>] [--execution <id>]',
-    'snapshot': 'plan.sh snapshot <task_id> --section-file <path|-> [--mission <slug>]',
+    'snapshot': 'plan.sh snapshot (<task_id> [--mission <slug>] | --self) --section-file <path|->',
     'verify-result': ('plan.sh verify-result <task_id> <pass|fail|needs_human_review>\n'
                       '                            [--mission <slug>] [--notes "<text>" | --notes-file <path|->]\n'
                       '                            [--execution <id>]'),
@@ -2622,7 +2622,7 @@ POSITIONAL_ARITY = {
     'init': (1, 1), 'add': (1, 1), 'pull': (0, 0), 'done': (1, 2),
     'needs-director': (1, 2), 'fail': (1, 2), 'update': (1, 1), 'release-dep': (1, 1),
     'retire': (1, 1), 'reap-orphan-assignment': (1, 1),
-    'ready-for-verification': (1, 1), 'verifying': (1, 1), 'snapshot': (1, 1), 'verify-result': (2, 2),
+    'ready-for-verification': (1, 1), 'verifying': (1, 1), 'snapshot': (0, 1), 'verify-result': (2, 2),
     'review': (1, 1), 'launch': (1, 1), 'task-graph': (0, 0), 'lint': (0, 1),
     'status': (0, 0), 'archive': (1, 1), 'resync': (0, 1), 'dashboard-data': (0, 0),
     'resolve-mission': (1, 1), 'store-check': (0, 0), 'pr-base': (0, 0),
@@ -5443,18 +5443,61 @@ _SNAPSHOT_HEADING = '## Pre-Compact Snapshot'
 _SNAPSHOT_RE = re.compile(r'## Pre-Compact Snapshot\n[\s\S]*?(?=\n## |\Z)')
 
 
+def _snapshot_self_target(agent):
+    """`snapshot --self` の書き込み先 (mission, task_id, execution_id)。ロックの中で呼ぶこと。
+
+    AGENT_NAME の assignment (`mission:task`) が指す card が、(1) in_progress で (2) worker が自分で
+    (3) classify_assignment が現在の試行について ASSIGN_MINE と答えるときだけ。1 つでも欠ければ
+    書かずに拒否する (exit 1。task-graph も再生成しない)。env の task id は使わない — task は 1 セッションの
+    中で変わり、hook の env には届かない (knowledge/vnext-02-attempt-reopen-checkpoint.md §5.6)。
+    """
+    def refuse(why):
+        print(f"plan.sh snapshot --self: {why} (何も書いていません)", file=sys.stderr)
+        raise UsageExit(PULL_USAGE_EXIT)
+
+    problem = agent_name_problem(agent)
+    if problem:
+        refuse(f"AGENT_NAME {agent!r} は使えません ({problem})")
+    published = _TASK_CARDS.read_regular_text_or_unreadable(assignment_path(agent))
+    if _TASK_CARDS.is_unreadable(published):
+        refuse(f"assignment/{agent} を読めない / 存在しません")
+    mission, _, task_id = published.strip().partition(':')
+    if not mission or not task_id or not os.path.exists(task_path(mission, task_id)):
+        refuse(f"assignment/{agent} の指す card がありません")
+    try:
+        meta, _body = load_task(mission, task_id)
+    except (Exception, SystemExit):
+        refuse(f"{mission}/{task_id} の card を読めません")
+    if meta.get('worker') != agent or meta.get('status') != 'in_progress':
+        refuse(f"{mission}/{task_id} は {agent} が in_progress で持つ card ではありません")
+    execution_id = meta.get('current_execution_id')
+    if not isinstance(execution_id, str) or not execution_id:
+        refuse(f"{mission}/{task_id} に現在の試行 (current_execution_id) がありません")
+    verdict = classify_assignment(agent, mission, task_id, execution_id)
+    if verdict != ASSIGN_MINE:
+        refuse(describe_assignment_verdict(agent, verdict))
+    return mission, task_id, execution_id
+
+
 def cmd_snapshot(args):
-    """plan.sh snapshot <task_id> --section-file <path|-> [--mission <slug>]
+    """plan.sh snapshot (<task_id> [--mission <slug>] | --self) --section-file <path|->
 
     card の本文の `## Pre-Compact Snapshot` 節を差し替える (無ければ末尾に足す)。**hooks/pre-compact.sh の
     唯一の書き込み** (S5 / t020)。frontmatter (status / worker / started_at ...) には触れない。
     以前は hook が card 全体をロックなし・in-place で書き戻していたので、hook が in_progress を読んだ後に
     done が完了すると、古い in_progress が復活した (knowledge/state-store.md §2.4-5)。
+
+    `--self`: task を引数でなく `AGENT_NAME` の assignment から決める (hook の env には task が無い)。
+    <task_id> / --mission とは併用できない。節の先頭に mission/task と execution_id の行を足す。
     """
-    opts, positional = parse_opts(args, {'--section-file': 'value', '--mission': 'value'})
-    if not positional:
+    opts, positional = parse_opts(args, {'--section-file': 'value', '--mission': 'value', '--self': 'bool'})
+    use_self = bool(opts.get('--self'))
+    if use_self:
+        if positional or opts.get('--mission'):
+            _usage_exit("--self は <task_id> / --mission と併用できません")
+    elif not positional:
         die("snapshot requires <task_id>")
-    task_id = positional[0]
+    task_id = positional[0] if positional else None
     if opts.get('--section-file') is None:
         _usage_exit("snapshot requires --section-file <path|->")
     section = read_body_arg(opts, '--section-file', None, 'section')
@@ -5462,15 +5505,21 @@ def cmd_snapshot(args):
         _usage_exit(f"--section-file の本文は '{_SNAPSHOT_HEADING}' の行で始まること")
 
     def _do():
-        state = load_state()
-        slug = _resolve_task_mission('snapshot', task_id, state, opts.get('--mission'))
-        meta, body = load_task(slug, task_id)
-        if _SNAPSHOT_RE.search(body):
-            body_new = _SNAPSHOT_RE.sub(lambda _m: section, body, count=1)
+        if use_self:
+            slug, tid, execution_id = _snapshot_self_target(os.environ.get('AGENT_NAME', '').strip())
+            written = (_SNAPSHOT_HEADING + '\n' + f"- mission_task: {slug}/{tid}\n- execution_id: {execution_id}\n"
+                       + section[len(_SNAPSHOT_HEADING) + 1:])
         else:
-            body_new = body.rstrip('\n') + '\n\n' + section + '\n'
-        save_task(slug, task_id, meta, body_new)
-        print(f"Snapshot: {slug}/{task_id}")
+            state = load_state()
+            slug = _resolve_task_mission('snapshot', task_id, state, opts.get('--mission'))
+            tid, written = task_id, section
+        meta, body = load_task(slug, tid)
+        if _SNAPSHOT_RE.search(body):
+            body_new = _SNAPSHOT_RE.sub(lambda _m: written, body, count=1)
+        else:
+            body_new = body.rstrip('\n') + '\n\n' + written + '\n'
+        save_task(slug, tid, meta, body_new)
+        print(f"Snapshot: {slug}/{tid}")
 
     with_lock(_do)
 

@@ -6625,8 +6625,10 @@ def cmd_update(args):
         # 判定は入力の option でなく**書いた後の task の確定 status**で: `--reset --status done` は
         # reset の pending を明示の status が上書きし、task は終端のまま。それで mission を戻すと
         # 全 task が終端なのに in_progress が残る (Codex 1 巡目 P2)。
-        if ((opts.get('--reset') or status in ('pending', 'in_progress'))
-                and meta.get('status') not in TERMINAL_STATUSES):
+        # (status の集合リテラルは lib_task_status の外に書かない: tests/test_task_status_single_definition.py)
+        final_status = meta.get('status')
+        if ((opts.get('--reset') or status is not None)
+                and (final_status == 'pending' or final_status == 'in_progress')):
             _reactivate_done_mission(slug, via=f'update {task_id}')
 
         # Dispatcher Rule 5 の誤報を防ぐため、差し戻した Worker の assignment も

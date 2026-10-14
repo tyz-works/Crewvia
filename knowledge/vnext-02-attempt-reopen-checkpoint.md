@@ -41,14 +41,17 @@
 
 ### 3.1 何を土台にして何を足すか
 
-土台は 01c の 7 欄。**足す card の欄は `reopen_count` と、上限を上書きする `max_attempts`（任意）だけ**。試行ごとの内容は card に積まず、台帳に置く（card に積むと、Result 中の `## ` 見出しが末尾の節として持ち越される問題と、card 全体の書き戻しが節の編集でも全欄の書き込みになる問題を、どちらも踏む）。
+土台は 01c の 7 欄。**足す card の欄は `reopen_count`・上限を上書きする `max_attempts`（任意）・Result の帰属を持つ `result_execution_id`（§3.2）だけ**。試行ごとの内容は card に積まず、台帳に置く（card に積むと、Result 中の `## ` 見出しが末尾の節として持ち越される問題と、card 全体の書き戻しが節の編集でも全欄の書き込みになる問題を、どちらも踏む）。
 
 ### 3.2 台帳 `queue/missions/<m>/history/tNNN/`
 
 - **1 遷移 = 1 ファイル**。名前は `<seq4>-<kind>-<execution_id>.md`（`seq4` はその task の台帳の通し番号。ゼロ埋め）。**既存のファイルを上書きも追記もしない**（競合しないので、1 本の追記ファイルより壊れにくい）。
 - `kind`: `end`（試行が終わった）/ `retry` / `reopen` / `reset` / `retire` の 5 つ。
 - 中身は frontmatter + 本文。frontmatter: `execution_id` / `attempt` / `end_code`（`end` のとき）/ `ended_at` / `head`（分かれば）/ `pr_number` / `worker` / `actor` / `reason`（`retry` / `reopen` / `reset` のとき必須）/ `checkpoint_dir`（§5。あれば）。本文: `end` のときだけ、その試行が書いた Result 全文。
-- **書く場所は Controller の `_finish`（`lib_task_controller.py:564-`）の 1 か所**。報告の 6 コマンド・retire・reset・G1 の fail は全部ここを通る（元文書の表の「試行を持つ報告と予約は、すべて Controller を通る」。`update --status` だけは通らない — §3.6）。**台帳に入れる Result は `_finish` の `body_out` の `## Result` 節から取る**。`_finish` の引数 `body`（`lib_task_controller.py:564`）は `_load` が更新前に読んだ card 本文（`:647`・`:676`）で、今回の報告は入っていない。報告した Result は plan.sh が組んだ本文（done: `plan.sh:4878`、fail: `:5051`、needs-director: `:3550`・`:6909`）として `body=` で渡り、`_finish` では `new_body` になる。`body_out = body if new_body is None else new_body`（`:579`）が `txn.write_card` に渡る本文そのもの（`:599`・`:624`）なので、台帳はこの `body_out` を、同じ呼び出しの `write_card` の直前に書く。`new_body` が無い操作（retire・reset）は `body_out` = 旧本文 = その試行が最後に持っていた Result で、これが正しい。
+- **書く場所は Controller の `_finish`（`lib_task_controller.py:564-`）の 1 か所**。報告の 6 コマンド・retire・reset・G1 の fail は全部ここを通る（元文書の表の「試行を持つ報告と予約は、すべて Controller を通る」。`update --status` だけは通らない — §3.6）。**台帳に入れる Result は `_finish` の `body_out` の `## Result` 節から取る**。`_finish` の引数 `body`（`lib_task_controller.py:564`）は `_load` が更新前に読んだ card 本文（`:647`・`:676`）で、今回の報告は入っていない。報告した Result は plan.sh が組んだ本文（done: `plan.sh:4878`、fail: `:5051`、needs-director: `:3550`・`:6909`）として `body=` で渡り、`_finish` では `new_body` になる。`body_out = body if new_body is None else new_body`（`:579`）が `txn.write_card` に渡る本文そのもの（`:599`・`:624`）なので、台帳はこの `body_out` を、同じ呼び出しの `write_card` の直前に書く。`new_body` が無い操作（retire・reset）の `body_out` は旧本文だが、**旧本文の Result が今の試行のものとは限らない**（試行 1 が done → reopen → 試行 2 を pull → 報告前に reset、の旧 Result は試行 1 のもの。`reserve_task` / `start_execution` は本文を保持する）。
+  - **帰属は card の欄 `result_execution_id` で持つ**（足す card の欄は `reopen_count` / `max_attempts` に加えてこの 1 つ。§3.1）。Result を書く操作（`new_body` がある `_finish`）が、その試行の `execution_id` をこの欄に入れる（本文と同じ書き込み）。
+  - **台帳の `end` に Result 全文を入れるのは `result_execution_id` == 閉じる試行の `execution_id` のときだけ**。違う・欄が無いときは本文を空にし、frontmatter に `result: none`（試行は Result を書かずに終わった）を書く。旧 Result は、それを書いた試行の `end`（その試行が閉じたときに台帳へ写してある）にだけ残り、別の試行の履歴には現れない。欄が無い既存の card（この設計より前に done になったもの）は帰属が分からないので `result: unattributed` として、旧本文の Result を入れずに `reopen` / `retry` の理由だけを残す。
+  - **消さずに欄で束縛する理由**: reopen / retry の時点で本文の Result を消す案は、本文を書き換える card 書き込みが 1 回増える（節だけの編集でも card 全体の書き戻しになる問題を踏む）うえ、消す前に台帳へ写し終えたことの確認（台帳 → card の順の延長）が要る。欄で束縛すれば本文は触らず、`pull` が渡す `previous_attempt` も同じ欄で「前の試行の Result」と明示できる。
 - **書き込みは `lib_state_store` の `Txn` に新しい 1 メソッド（`write_history`）を足して通す**。`tests/test_queue_writes_go_through_the_store.py` の許可表に 1 行足す。plan.sh や Controller から直に `open()` しない。
 - **順序: 台帳 → card**（派生値は正本より前。card がコミット点）。card の書き込みが失敗しても、台帳に残るのは「まだ起きていない遷移」の 1 ファイル（孤児）。孤児の台帳は害が無く、回復（R-1〜R-5）の対象にしない。`store-check` が「card に対応する遷移が無い台帳」を**報告だけ**する。
 - **再送の冪等（孤児の台帳があるとき）**。名前には `seq4`、中身には `ended_at` が入るので、再送で採番や時刻を作り直すと別ファイルが増える・内容が食い違う。次の規則で**既存イベントを見つけて再利用**する（全部ロックの中。ロックが直列化するので採番は競合しない）:
@@ -129,6 +132,9 @@
 | done / verified（完了済み） | `--cascade reviews` は skills に `codex-review` / `review` / `qa` を含む task だけ、`all` は全部、`none` は何もしない。対象は `reopen_count += 1` で pending に戻す。**対象外の完了済み下流は、拒否も無効化もせず、reopen の出力に「古い結果に基づく下流」として列挙する**（Director が判断する） | `reopen_task` を下流の各 task に適用 |
 
 - 既定の `--cascade` は `reviews`（§7 の判断 5）。
+- **経路上の中間 task も無効化の対象に含める（閉包）**。`lib_dep_rules` の「依存が満たされた」は**直接の依存だけ**を見る（`unmet_dependencies`）。I → A（非レビュー）→ R（review）が全部 done のとき、R だけ戻すと R は A の done を根拠にすぐ pull でき、I の修正前の結果をもう一度確定してしまう。したがって対象 R の集合に対し、**I から R への依存の経路上にある task（I の下流かつ R の上流）をすべて対象に足す**。足された中間 task は、skills に関わらず done / verified なら `reopen_count += 1` で pending に戻す（A は I が再完了するまで pending のまま pull されず、R は A の再完了まで待つ）。`downstream_closure` の隣に `path_closure(graph, root, targets)`（root の下流集合 ∩ targets の上流集合）を `lib_dep_rules.py` に足して 1 か所にする。書く順は §4.3.1 のまま（I から遠い順）。
+- **経路上の中間 task を対象外にする指定は拒否する**。将来 `--keep <id>` のような除外を足しても、`<id>` が対象 R への経路上にあり done / verified なら exit 3（該当する経路を出す）。除外できるのは経路上にない完了済み下流だけで、それは今まで通り「古い結果に基づく下流」として列挙する。
+- **`lib_dep_rules` の依存判定を推移的にする案は採らない**: 判定は dispatcher・`plan.sh pull`・lint が共有する唯一の規則で（不変条件 3）、変えると reopen と無関係な既存の全 task の割り当てが変わり影響が大きい。cascade の側で経路を閉じれば、規則を変えずに同じ保護が得られる。
 - 下流の `released_deps` に I の id があれば消す（`released_deps` は failed の依存を解除する欄。I が戻ったら解除の根拠が無い。`plan.sh:6536` と同じ作法）。
 #### 4.3.1 書き込みの順序と roll forward（途中で止まっても安全側に倒れる）
 
@@ -170,15 +176,16 @@ reopen は依存の辺を足さないので、循環を作らない。下流の�
 ### 5.2 内容
 
 - `meta.json`: `execution_id` / `mission` / `task` / `taken_at` / `reason`（`timeout` / `hard_idle` / `window_gone` …）/ `branch` / `head` / `dirty`（bool）/ 各ファイルの `truncated` と元のサイズ。
-- `dirty.patch`: `git diff HEAD --binary --no-ext-diff --no-textconv`（`--no-textconv` は必須: 読み取りの git が textconv を起動する。memory: git-blame-runs-textconv-by-default）。上限 1MB で切り、切ったら `truncated: true`。
-- `untracked.tar` ではなく **`untracked/` に個別ファイル**（1 ファイル 64KB 以下・合計 2MB 以下。超えた分は一覧だけ）。シンボリックリンクは辿らない。
+- `dirty.patch`: `git diff HEAD --no-ext-diff --no-textconv`（**`--binary` は付けない**。`--no-textconv` は必須: 読み取りの git が textconv を起動する。memory: git-blame-runs-textconv-by-default）。上限 1MB で切り、切ったら `truncated: true`。テキストの差分だけが入り、バイナリは `Binary files … differ` の 1 行になる。
+- **バイナリ差分は保存しない**。`--binary` の出力は圧縮・符号化されていて、§5.3 の文字列 redaction では中の秘密を検出できず、redaction が正常終了しても復元可能な秘密が残るため。代わりに `binary-files.txt` に変更されたバイナリ（`git diff HEAD --numstat` で `-` と出るもの）の**ファイル名・サイズ・blob sha（`git hash-object`）だけ**を記録する。**バイナリの内容はこの checkpoint から復元できない**（`meta.json` に `binary_files: <件数>` と `binary_restorable: false` を書き、Worker 向けの読み方にも明記する）。必要なら blob sha を手がかりに worktree が残っていれば取り戻す。
+- `untracked.tar` ではなく **`untracked/` に個別ファイル**（1 ファイル 64KB 以下・合計 2MB 以下。超えた分は一覧だけ）。シンボリックリンクは辿らない。**バイナリ（先頭 8KB に NUL を含む）の untracked ファイルも内容は保存せず**、`binary-files.txt` に名前・サイズ・blob sha だけ載せる。
 - `status.txt`: `git status --porcelain=v1 -z` の結果。
 - `pane.txt`: ペインが**まだ生きているとき**だけ、最後の 200 行（`lib_mux.py capture`）。window が消えた場合は無い（それでも他は取れる — worktree の path は record の `git.worktree`（`lib_execution.py:327-355`）から得る。ペインの有無に依存しない）。
 
 ### 5.3 秘密
 
 - **ファイル名で除外**: `.env*` / `*.pem` / `*.key` / `*.p12` / `*.pfx` / `*_rsa` / `*_dsa` / `*_ed25519` / `*credentials*` / `*.secret*`（利用者の security.md の一覧と同じ）。パッチの該当ファイルの hunk は落とし、`meta.json` に除外した件数だけ書く。
-- **内容の redaction**（patch・untracked・pane の全部）: `op://…`・`-----BEGIN … PRIVATE KEY-----` から END まで・`(ghp|gho|ghs|github_pat)_…`・`sk-…`・`AKIA…`・`xox[abprs]-…`・`Bearer <長い文字列>`・`(TOKEN|SECRET|PASSWORD|PASSWD|API_KEY)\s*[=:]\s*\S+` の値を `[REDACTED:<n>]` にする。置換の件数を `meta.json` に書く。**redaction が走らなかった（例外）ときはそのファイルを保存しない**（生のまま残さない側に倒す）。
+- **内容の redaction**（patch・untracked・pane の全部。バイナリは保存しないので対象外）: `op://…`・`-----BEGIN … PRIVATE KEY-----` から END まで・`(ghp|gho|ghs|github_pat)_…`・`sk-…`・`AKIA…`・`xox[abprs]-…`・`Bearer <長い文字列>`・`(TOKEN|SECRET|PASSWORD|PASSWD|API_KEY)\s*[=:]\s*\S+` の値を `[REDACTED:<n>]` にする。置換の件数を `meta.json` に書く。**redaction が走らなかった（例外）ときはそのファイルを保存しない**（生のまま残さない側に倒す）。
 - 正規表現は `timeout 120` を要する検索ではないが、**バックトラックしない形**（量指定子を入れ子にしない）で書き、テストで長い 1 行（1MB）を通す。
 
 ### 5.4 失敗しても退役を止めない

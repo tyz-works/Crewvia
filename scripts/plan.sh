@@ -2890,6 +2890,28 @@ def _reject_dependency_cycle(slug, task_id, new_blocked):
         raise UsageExit(USAGE_EXIT)
 
 
+def _reactivate_done_mission(slug, mission=None, via=''):
+    """done の mission に未完了の task が戻ってきたら、mission を `in_progress` に戻す (vNext 02 PR-A)。
+
+    `with_lock` の中だけで呼ぶ。dispatcher は mission.yaml の `status != done` で「全ミッション完了」を
+    判定する (dispatcher.sh の all_done) ので、done のまま task を足すと idle Worker が退役する。
+    done より前の値は残っていないため戻す値は `in_progress` 固定。`completed_at` は消す。
+    `mission` を渡すと、その dict を書き換えて呼び出し元が保存する (二重書き込みを避ける)。
+    戻したら True。done でなければ何もしない (False)。
+    """
+    own = mission is None
+    if own:
+        mission = load_mission(slug)
+    if mission.get('status') != 'done':
+        return False
+    mission['status'] = 'in_progress'
+    mission['completed_at'] = None
+    if own:
+        save_mission(slug, mission)
+    print(f"Reactivated: mission '{slug}' done -> in_progress ({via})")
+    return True
+
+
 def cmd_add(args):
     opts, positional = parse_opts(args, {
         '--mission': 'value',
@@ -3010,6 +3032,7 @@ def cmd_add(args):
         sync_holder[0] = (slug, task_id, title, skills, priority, blocked_by)
 
         mission['next_task_id'] = task_num + 1
+        _reactivate_done_mission(slug, mission, via=f'add {task_id}')
         save_mission(slug, mission)
         suffix = f" [target: {target_dir}]" if target_dir else ""
         print(f"Added: {slug}/{task_id} — {title}{suffix}")
@@ -6597,6 +6620,16 @@ def cmd_update(args):
         if not (reset_by_controller and len(changed) == 1):
             save_task(slug, task_id, meta, body)
         print(f"Updated: {slug}/{task_id} — {', '.join(changed)}")
+
+        # task を未完了に戻す経路 (--status pending|in_progress / --reset) では、done の mission も戻す。
+        # 判定は入力の option でなく**書いた後の task の確定 status**で: `--reset --status done` は
+        # reset の pending を明示の status が上書きし、task は終端のまま。それで mission を戻すと
+        # 全 task が終端なのに in_progress が残る (Codex 1 巡目 P2)。
+        # (status の集合リテラルは lib_task_status の外に書かない: tests/test_task_status_single_definition.py)
+        final_status = meta.get('status')
+        if ((opts.get('--reset') or status is not None)
+                and (final_status == 'pending' or final_status == 'in_progress')):
+            _reactivate_done_mission(slug, via=f'update {task_id}')
 
         # Dispatcher Rule 5 の誤報を防ぐため、差し戻した Worker の assignment も
         # 撤去する。以前はこれを with_lock() の *外* で行っていたため、ロックを

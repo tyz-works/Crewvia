@@ -240,8 +240,18 @@ reopen は依存の辺を足さないので、循環を作らない。下流の�
 
 ## 8. 未解決の課題（この文書のレビューで積む場所）
 
-Codex の往復は 3 巡で打ち切り、残った P2 以下はここに積む（元文書 §15 と同じ方針）。
+Codex の往復は 3 巡で打ち切った (PR #301 の t002)。以下は実装 PR の網羅テストで解く。残った P2 以下はここに積む（元文書 §15 と同じ方針）。
 
+- **cascade の経路閉包で `skipped` の中間 task が漏れる**（Codex 3 巡目 P2。実装 PR F）。
+  - 漏れている状態: `lib_task_status.py` の `TERMINAL_STATUSES` に `skipped` がある。I → A(`skipped`) → R(`done`) の形で I を reopen すると、A が終端として扱われ経路が切れ、R が無効化されない。R は I の再完了より前に pull できてしまう。
+  - 起きる害: 古い I の結果に依存した R（review / qa 等）が、I の再完了を待たずに走り、無意味な結果を `done` にする。
+  - 直し方の方向（未決）: (a) `skipped` も経路上なら無効化の対象にする。(b) 経路上に `skipped` の task がある reopen を拒否する。Director の推奨は (b) 拒否（`skipped` は Director が意図して飛ばした task なので、勝手に開けない）。
+  - 解く PR: F。網羅テストに入れるケース: I → A(`skipped`) → R(`done`)、`skipped` が経路の途中・末端・複数本の経路の片方にある形、`--cascade none|reviews|all` それぞれ、拒否の場合は何も書かれない（`reopen_count` も増えない）こと。
+- **Result の帰属を `new_body` の有無で判定すると、古い Result が現在の試行に再帰属される**（Codex 3 巡目 P2。実装 PR D）。
+  - 漏れている状態: `verify-result` は既存の本文に Verification 節を足した `body_new` を渡す。帰属を「`new_body` があるか」で決めると、Result 節を置き換えていないこの呼び出しでも、既存の（古い）Result が現在の試行のものとして台帳に書かれる。
+  - 起きる害: 台帳の Result と試行（`execution_id`）の対応が崩れ、前の試行の Result が今の試行の結果として `previous_attempt` や監査に出る。
+  - 直し方の方向（未決）: 帰属を更新するのは Result 節を実際に置き換えた呼び出し（`done` / `fail` / `needs-director` の `--result-file`）だけ、と明示の引数で指定する（`new_body` の有無から推測しない）。
+  - 解く PR: D。網羅テストに入れるケース: `verify-result` だけを呼んだ後の台帳の帰属が変わらないこと、`done` / `fail` / `needs-director` の `--result-file` ありとなし、Result 節を置き換えず本文の別の節だけを足す呼び出し、同じ報告の再送。
 - 実装の PR（D・F）の QA で確かめること: (1) cascade を各書き込みの後で kill して再実行し、`cascade-incomplete` が出て再実行で消えること・`reopen_count` が二重に増えないこと。(2) 孤児の台帳を作ってから同じ報告を送り直すと、新しいファイルが増えず `ended_at` が台帳と card・record で一致すること。(3) 孤児の台帳のあとに違う Result で送ると `HISTORY_MISMATCH` で card が書かれないこと（この拒否のあとの出口が「同じ報告を送り直す」だけでよいかは、運用で足りなければ孤児の差し替えを別に設計する）。
 - 範囲外として残したこと: Verifier の運用と、その verify pass が依存先の変更を見る検査（PR-J）。`update --status` の Controller 化（P0 の残り）。回復を dispatcher が起こす・待つ（P0 の残り）。
 - 確かめていないこと: mission の戻し先 `in_progress` が lint / dispatcher で想定どおりか（PR-A）。retry / reopen の後に `worktree_gc` で隔離済みの worktree を pull が作り直せるか（PR-E の QA）。reopen した codex-review task が、`registry/daemons/review-refusals/` の古い拒否記録で spawn されないことがあるか（記録は消してよい。`scripts/CLAUDE.md` の「通知・記録」）。`done` → `pending` を Taskvia が受け付けるか。

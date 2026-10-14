@@ -1,0 +1,223 @@
+# vNext 02 — Attempt 履歴 (P1)・reopen (P2)・checkpoint (P3) の実装設計
+
+作成日: 2026-10-14。状態: 設計（未実装）。mission `20261014-vnext-02-attempt-reopen-checkpoint` t001。
+元の提案: `knowledge/vnext-task-attempt-context.md`（以下「元文書」。§12 の P1・P2・P3 を、今の main に載る形に落とす）。
+
+- 根拠のコードは **main `7f2638c`**（#300、2026-10-14）の行番号。`scripts/plan.sh:N` のように書く。確かめていないことは「未確認」。
+- ユーザー決定（2026-10-14）: P1 + P2 + P3 を進める。P0 の残り・P4〜P6（budget / Curator / opt-in 運用）は対象外。
+- **実装の PR は、未 merge の #291 → #293 → #292（E5 PR-2。2026-10-15 20:33 JST 以降に merge 予定）が入った後の main に載せる**。#298（`add` / `update` の deliverable lint）も別に未 merge。各 PR がどの未 merge PR と同じ箇所を触るかは §6 に表で示す（`gh pr diff` で確かめた）。
+- この文書は文書だけの PR。コードは変えていない。
+
+## 0. 要約
+
+| 段 | 決めたこと |
+|---|---|
+| P1 Attempt 履歴 | 試行（Execution）は 01c で済んでいる。足りないのは (a) 試行ごとの Result・終わり方・head が card で上書きされて残らないこと、(b) 「Codex の指摘の修正」「QA の差し戻し」を新 task でなく同じ task の次の試行として開く手段。**`queue/missions/<m>/history/tNNN/` に、遷移ごとに 1 ファイルを足す台帳**を作り（上書きしない）、`plan.sh retry` を足す。総試行の上限は `max_attempts`（既定 5〜6。§7 の判断 2）。語の衝突を避けるため、reopen の回数は `generation` と呼ばず **`reopen_count`** にする |
+| P2 reopen | `plan.sh reopen` を足す（done / verified / skipped → pending）。**依存先が pending のままなら、依存の規則（`lib_dep_rules.py`）が何も変わらなくても自動で待つ**。足りないのは進行中・検証待ち・検証中・完了済みの下流で、これは `--cascade` が**試行を閉じる**ことで無効化する（元文書 §15-1 の答え）。mission を active に戻す修正は小さいので**単独の先頭 PR**。archive の restore は**やらない**（需要の記録が無い） |
+| P3 checkpoint | 退役の前に worktree の dirty diff（と、ペインが生きていれば capture）を `registry/checkpoints/` に保存し、次の試行の `pull` が `previous_attempt` として渡す。**保存の失敗は退役を止めない**。PreCompact が動かない原因は `AGENT_NAME` / `CREWVIA_AGENT_NAME` の食い違いと task の特定で、`plan.sh snapshot --self` で直す。handoff の path に mission を含める |
+| PR | 8 本（A〜H）+ 任意 2 本。どれも 300KB よりずっと小さい見込み。独立して先に出せるのは A（mission を active に戻す）と C（PreCompact） |
+
+## 1. 現状の確認（7f2638c）
+
+元文書 §2 の表は 2262728 の時点。そのうち、この設計が使う事実を 7f2638c で取り直した。
+
+1. **試行は 1 枚の card に 7 欄で持つ**。`current_execution_id` / `execution_status` / `execution_end_code` / `execution_count` / `execution_reserved_at` / `execution_agent` / `task_slug`（`lib_execution.py:85-88`）。attempt 番号は `execution_count + 1` をロックの中で決める（`lib_task_controller.py:458`）。record（`executions/<id>.json`）は projection で、判断には使わない。
+2. **Result は上書きされる**。`fail` は Result を `FAILED — head: … — handoff: …` で置き換える（`plan.sh:5041-5055`）。`done` も同じ。前の試行の Result は card に残らない。残るのは監査ログの 1 行（理由・本文は出さない）と、凍結された record（Result は持たない）だけ。
+3. **`update --reset` は理由も世代も残さない**。`reset_task` が試行を `RESET_BY_DIRECTOR` で閉じ、遷移元を問わず pending にする（`lib_task_controller.py:703-720`）。同時に `handoff_path` / `fail_head` を消す（`plan.sh:6568-6572`）ので、前の試行の引き継ぎは card から消える。
+4. **mission は done のまま戻らない**。`done` の D5 だけが `mission.status = 'done'` を書く（`plan.sh:4905-4910`）。`cmd_add` は mission の status を戻さず（`plan.sh:3012-3013` は `next_task_id` を進めて保存するだけ）、dispatcher は active な mission が全部 done なら idle の Worker を退役させる（`dispatcher.sh:2446-2476`）。mission の status は `drafting` / `ready` / `reviewing` / `in_progress` / `done` が書かれる（`plan.sh:4908`・`:5829`・`:5996`・`:6034`）。**done の前が何だったかは card に残らない**（戻す値は未確認。§3.1）。
+5. **依存の判定は 1 か所**。`lib_dep_rules.py` の `card_dependencies()` / `unmet_dependencies()`。pending の下流は、上流が終端でなくなれば自動で unmet になる（`done_ids` を毎回 status から作るため。`plan.sh:1425`・`:2439`）。
+6. **下流の PR 番号の伝播**: `propagate_pr_number` は未設定の `pr_number` にだけ書く（`plan.sh:4556-4600`）。違う値が既にあれば `done` を拒否する（`pr_propagation_conflicts` `:4603-`）。
+7. **PreCompact が card に書けない原因は 2 つ**。(i) hook が読む `CREWVIA_TASK_ID`（`hooks/pre-compact.sh:22`）を `start.sh` の `ENV_EXPORTS`（`start.sh:786`）が渡さない。(ii) hook が agent 名を `CREWVIA_AGENT_NAME` から読む（`pre-compact.sh:24`）が、`start.sh` が渡すのは `AGENT_NAME`。(ii) は元文書に無かった発見。実機のログは未確認。
+8. **退役**: watchdog の `terminate` は Worker に 1-2 行の報告を頼み 60 秒待つだけ（`watchdog.py:132`・`:963-975`）。worktree の未 commit の作業を保存する処理は無い。
+9. **handoff の path** は `registry/handoffs/<agent>/<task_id>_HANDOFF.md`（`git-helpers.sh:83`）。mission を含まない。
+
+## 2. 用語
+
+- **試行 (Attempt)** = Execution。新しい ID の発行系は作らない（元文書 §4 と同じ）。
+- **`reopen_count`**（新しい card の欄）= その task を done / verified / skipped から開け直した回数。元文書の `generation` に当たるが、**`generation` の語は使わない**: 既に `started_at` を「実行世代」と呼ぶ `now_generation`（`plan.sh:502`）と監査ログの `generation` 欄がある。`execution_count`（試行数）・`rework_count`（verify-result の差し戻し）・`reopen_count` の 3 つは別の数で、足し合わせない。
+- **台帳 (history)** = 試行と遷移の追記専用の記録（§3.2）。
+
+## 3. P1: Attempt 履歴
+
+### 3.1 何を土台にして何を足すか
+
+土台は 01c の 7 欄。**足す card の欄は `reopen_count` と、上限を上書きする `max_attempts`（任意）だけ**。試行ごとの内容は card に積まず、台帳に置く（card に積むと、Result 中の `## ` 見出しが末尾の節として持ち越される問題と、card 全体の書き戻しが節の編集でも全欄の書き込みになる問題を、どちらも踏む）。
+
+### 3.2 台帳 `queue/missions/<m>/history/tNNN/`
+
+- **1 遷移 = 1 ファイル**。名前は `<seq4>-<kind>-<execution_id>.md`（`seq4` はその task の台帳の通し番号。ゼロ埋め）。**既存のファイルを上書きも追記もしない**（競合しないので、1 本の追記ファイルより壊れにくい）。
+- `kind`: `end`（試行が終わった）/ `retry` / `reopen` / `reset` / `retire` の 5 つ。
+- 中身は frontmatter + 本文。frontmatter: `execution_id` / `attempt` / `end_code`（`end` のとき）/ `ended_at` / `head`（分かれば）/ `pr_number` / `worker` / `actor` / `reason`（`retry` / `reopen` / `reset` のとき必須）/ `checkpoint_dir`（§5。あれば）。本文: `end` のときだけ、その試行が書いた Result 全文。
+- **書く場所は Controller の `_finish`（`lib_task_controller.py:564-`）の 1 か所**。報告の 6 コマンド・retire・reset・G1 の fail は全部ここを通る（元文書の表の「試行を持つ報告と予約は、すべて Controller を通る」。`update --status` だけは通らない — §3.6）。Result は `_finish` が受け取る `body` から取る。
+- **書き込みは `lib_state_store` の `Txn` に新しい 1 メソッド（`write_history`）を足して通す**。`tests/test_queue_writes_go_through_the_store.py` の許可表に 1 行足す。plan.sh や Controller から直に `open()` しない。
+- **順序: 台帳 → card**（派生値は正本より前。card がコミット点）。card の書き込みが失敗しても、台帳に残るのは「まだ起きていない遷移」の 1 ファイル。ファイル名に `execution_id` と `kind` を含めるので、再試行は同じ名前に当たり、**中身が同じなら何もせず、違えば拒否する**（再送の冪等。execution.md §16.10 と同じ作法）。台帳だけが先に残った場合は、回復（R-1〜R-5）の対象にしない — 孤児の台帳は害が無く、`store-check` が「card に対応する遷移が無い台帳」を**報告だけ**する。
+- **台帳が書けなかったとき**: 遷移を止める（exit 1、何も書かない）。履歴を失ったまま進めるのは、この設計の目的に反する。ただし retire だけは、`plan.sh retire` が `RETIRED` で閉じる出口なので、台帳が書けなくても閉じる（警告を出し、`reason` に「台帳なし」を card ではなく監査ログの `result` に残す）。**この例外の根拠は「退役が止まると誰も窓を閉じない」（`daemon-authority.md` §5）**。
+- 容量: Result は今も card に全文が載っているので、台帳は card と同じ量が試行の数だけ増える。1 task あたりの上限（`max_attempts` 5〜6）× Result の大きさ。mission を archive すると `history/` ごと動く（`_move_mission_dir`。`plan.sh:6093-6126`）。
+- 読み口: `plan.sh history <id> [--mission <slug>]`（読み取り専用・ロックなし。台帳が読めないファイルを含むときは、そのファイルを飛ばさず `Unreadable` 相当で止まる — 空に潰さない）。`pull` の JSON に `previous_attempt`（§3.5）を足す。
+
+### 3.3 retry（`plan.sh retry <id> --reason "<理由>" [--mission <slug>]`）
+
+「同じ成果の、未達の作業をもう一度」。**新しい task を足さない**。
+
+- 遷移元: `failed` / `needs_director` / `needs_human_review` / `verification_failed`（今の `ACCEPTS_FROM` の語彙。`lib_task_status.py`）。遷移先: `pending`。
+- 試行が active（reserved / running）なら拒否（exit 3）。先に `update --close-execution` か `reset`。
+- 保つもの: `pr_number`・`task_slug`（= branch 名。`lib_task_controller.py:460`）・`execution_count`・`rework_count`。消すもの: `worker` / `started_at` / `completed_at`。**`handoff_path` と `fail_head` は消さず、台帳の `end` に写してから card の欄を消す**（今の `update --reset` は写さずに消す。§1-3）。次の `pull` が `previous_attempt` で渡す。
+- 理由は必須（空・制御文字は拒否）。理由は台帳にだけ書き、監査ログには出さない（監査ログは理由の本文を持たない方針。`lib_state_store.py:1231-1268`）。
+- 上限: `execution_count >= max_attempts` なら exit 3（`ATTEMPT_CAP`）。上書きは `--over-cap "<理由>"` で、台帳の `retry` に残る。**上限の検査は retry / reopen の入口だけ**に置き、`reserve_task` には置かない — 既に `execution_count` が 6 の card がある（元文書 §14.1。20261011-small-backlog… の t005）ので、reserve に置くと今の card が pull できなくなる。
+- 実装は Controller に `reopen_task(kind='retry')` を 1 つ足す。**`update --reset` の代わりに retry を使う運用**に変えるが、`--reset` は消さない（互換。§6 の PR-H で director.md に「理由が要る差し戻しは retry」と書く）。
+
+### 3.4 pr_number・branch・worktree
+
+- `pr_number`: 残す。同じ PR に追加 commit を積む運用と一致する。`done --pr <N>` で別の番号を出すと既存の拒否（`plan.sh:4757-4761`）に当たる — retry で新しい PR を作りたいときは Director が `update --pr-number` で明示的に変える（今のまま）。
+- branch: `task/{mission_slug}/{task_id}-{task_slug}`（`lib_git_policy.py:44`）。`task_slug` は最初の reserve で card に固定されるので retry でも変わらない。同じ branch を再利用し、開始時の SHA を新しい試行の record に残す（01c で済み。`execution.md:343`・`:371`）。
+- worktree: 登録済みの worktree を中身を確かめず再利用する（W2。`git-policy.md:125`・`:132`）。別の Worker が前の Worker の未 commit の作業の上で始まる。これは retry では**望ましい**（作業の継続）が、`worktree_gc.py` が完了済み task の worktree を隔離している場合は worktree が無い。**retry / reopen の後に pull が worktree を作り直せるか（branch が残っていれば作れるか）は未確認** — PR-E の QA 項目にする。
+
+### 3.5 下流（codex-review / qa の task）との関係
+
+今の運用は、修正のたびに fix task と再確認の task を新しく足す（元文書 §14.1: レビュー後に足した task が 82 / 199）。retry / reopen を入れた後の運用:
+
+1. 実装 task I（deliverable: pr）の下流に review R と QA Q が `blocked_by: [I]` で付いている。
+2. R が指摘（P1/P2）を出す → Director は **I を `reopen --cascade reviews --reason "Codex 1 巡目 P2: …"`**（I が done の場合。§4）。I は pending、R と Q も done なら pending に戻る。
+3. **I が pending の間、R と Q は依存で待つ**（§1-5）。「QA の再確認が後の fix 回より先に pull される」問題（memory: qa-recheck-pulled-before-later-fix-tasks）は、blocked_by を後から足せないことが原因だった。今回は blocked_by が元から付いたままなので起きない。
+4. I が再び done → R・Q が pull できる。R の `pr_number` は既に設定済みで、I が同じ PR 番号で done する限り衝突しない（§1-6）。
+
+`pull` の JSON に足す `previous_attempt`: `{execution_id, attempt, end_code, ended_at, head, history_path, checkpoint_dir}`（無ければ欄ごと省く）。R・Q の Worker は自分の台帳（前回の指摘・前回の FAIL）を `history_path` から読める。
+
+### 3.6 `update --status` は通さない
+
+`update --status` は Controller を通らず語彙の検査だけで書く（`plan.sh:6430-6433`）。このため台帳が書かれない。**P1 では塞がず、`update --status` を台帳が書かれない経路として文書に明記する**（元文書 §12 の P0(e) `update --status` の Controller 化は P0 の残りで対象外）。台帳は「Controller を通った遷移の記録」であり、`store-check` が card の status と台帳の最後の遷移が食い違う task を**報告だけ**する（直さない）。
+
+### 3.7 総試行数の上限
+
+`max_attempts` の既定は **5**（元文書 §13 の案）。`config/crewvia.yaml` に `attempts.max_total`、card に `max_attempts`（任意）。差し戻し（verify-result）の上限は今の `max_rework`（既定 3。`plan.sh:528`）のまま、**別の数として並べる**。実測では `execution_count` の最大が 6（元文書 §14.1）なので、既定を 5 にすると今の運用で 1 回は `--over-cap` が要る。値は §7 の判断 2。
+
+## 4. P2: reopen
+
+### 4.1 `plan.sh reopen <id> --reason "<理由>" [--mission <slug>] [--cascade none|reviews|all] [--branch reuse]`
+
+「確定した結果の再評価」。遷移元: `done` / `verified` / `skipped`。遷移先: `pending`。`failed` 等は retry（§3.3）。
+
+1. 検査（全部ロックの中。何も書く前に）: 遷移元の status ・試行が active でない（active なら exit 3）・`reopen_count` と `execution_count` の上限・mission が archive されていない（されていれば exit 3 で「新 mission に新 task を」と案内。§4.5）。
+2. `reopen_count += 1`、`completed_at` を消す、`worker` / `started_at` を消す。`pr_number` と `task_slug` は残す。旧 Result は台帳の `end`（既に書いてあるはず）を指す `reopen` を足す。
+3. mission が done なら戻す（§4.2）。
+4. 下流の処理（§4.3）。
+5. 台帳に `reopen` を書く（理由つき）→ card → … の順（§3.2）。
+
+**同じ reopen の再送**: 遷移元が pending になっているので exit 3（`NOT_REOPENABLE`）。冪等キーは足さない（`execution_id` が無い操作なので、前提の status が冪等の役をする）。
+
+### 4.2 mission を active に戻す（独立した先頭 PR）
+
+- `cmd_add` と `reopen` / `retry` と `update --status pending|in_progress`（done の mission にある task を未完了に戻す経路）で、mission の `status` が `done` なら戻す。**戻す値は `in_progress`**（`plan.sh:6034` が mission の起動で書く値）。`done` より前の値は残っていないので、`ready` / `reviewing` には戻せない。`completed_at` は消す。**戻す値の選び方は PR-A で、dispatcher と lint が `in_progress` を想定どおり扱うことを確かめてから確定する（未確認）**。
+- 戻すのは `plan.sh` だけ（dispatcher は mission を書かない）。dispatcher は次のサイクルで mission が done でないことを読む（`dispatcher.sh:2446-2476`）。すでに退役した idle の Worker は戻らない — 退役済みの Worker を呼び戻す手段は別の問題で、ここでは扱わない（Director が `./crewvia` で起動し直す。運用記録の通り）。
+- 元文書 §15 の困りごと (b) は、この PR だけで直る。
+
+### 4.3 下流の無効化（元文書 §15-1 の答え）
+
+下流 = `blocked_by` の推移閉包で I に依存する task。閉包の列挙は **`lib_dep_rules.py` に `downstream_closure(graph, tid)` を足して 1 か所**にする（plan.sh にコピーしない。不変条件 3。訪問済みの集合で止まるので、循環があっても終わる — ただし `add` / `update --blocked-by` が循環を拒否している（`find_dependency_cycle`）ので、通常は無い）。
+
+| 下流の状態 | 何が起きるか | 仕組み |
+|---|---|---|
+| pending / blocked | 何もしない。I が終端でなくなるので**自動で待つ** | `lib_dep_rules` は変えない |
+| reserved / running（in_progress） | `--cascade` が無ければ **reopen を拒否**（exit 3、該当 task を列挙）。あれば、その試行を `RESET_BY_DIRECTOR` で閉じて pending に戻す（`reset_task` と同じ）。Worker は次の報告で `EXECUTION_NOT_CURRENT` / `ALREADY_TERMINAL` を受ける | 既存の Controller の操作 |
+| **ready_for_verification / verifying（元文書 §15-1）** | in_progress と同じ。`mark_task` はこれらの状態でも試行を running のまま持つ（`lib_task_controller.py:730-`）ので、試行を閉じれば**検証の結果は `verify-result` の名乗りの照合で拒否される**。「上流が変わったのに下流の検証が pass する」害は、試行を閉じることで塞ぐ | 同上。verify pass 側にも「依存先の `reopen_count` の和が予約時と同じか」を見る検査を足すかは、Verifier を運用していないので**足さない**（Verifier を動かす段で解く。§8） |
+| done / verified（完了済み） | `--cascade reviews` は skills に `codex-review` / `review` / `qa` を含む task だけ、`all` は全部、`none` は何もしない。対象は `reopen_count += 1` で pending に戻す。**対象外の完了済み下流は、拒否も無効化もせず、reopen の出力に「古い結果に基づく下流」として列挙する**（Director が判断する） | `reopen_task` を下流の各 task に適用 |
+
+- 既定の `--cascade` は `reviews`（§7 の判断 5）。
+- 下流の `released_deps` に I の id があれば消す（`released_deps` は failed の依存を解除する欄。I が戻ったら解除の根拠が無い。`plan.sh:6536` と同じ作法）。
+- 全部を**1 回のロックの中・1 つの Txn**で行う。途中で失敗したら何も書かない（下流の一部だけ開いた状態を作らない）。
+
+### 4.4 Git（merge 済みの task の reopen）
+
+`-r2` のような世代つきの branch は、今の Git Policy ではできない（置換子は `{mission_slug}` `{task_id}` `{task_slug}` だけ。`git-policy.md:252`・`:257-259`）。**P2 の v1 は、PR が merge 済みの task の reopen を扱わない**: `reopen --branch reuse`（既定）は未 merge の PR の task 用で、同じ branch・同じ PR を使う。merge 済みか否かを plan.sh は調べない（`gh` をロックの中で呼ばない）ので、**Director が確認して `--branch reuse` を明示する**（省略は拒否）。merge 済みの task の修正は、今までどおり新 task（元の task を `related` に書く）。Policy に世代の置換子を足す改訂は任意の PR-I（§6）。
+
+### 4.5 archive の restore はやらない
+
+archive 済み mission の task の reopen は拒否する（exit 3、「新 mission に新 task を」）。理由: (1) 元文書 §14.1 の困りごと (a)〜(h) に、archive 済み mission を開け直したい事例が無い。(2) restore は mission dir を戻し、`state.yaml` の `active_missions` と `default_mission` を直し、Taskvia の archive 同期（`taskvia_sync_archive` `plan.sh:2456-`）を逆向きに行う必要があるが、Taskvia 側で archive 済みの mission が復元できるかは**未確認**。需要が出たら別 mission で設計する。
+
+### 4.6 循環
+
+reopen は依存の辺を足さないので、循環を作らない。下流の列挙だけが辺をたどる（§4.3、訪問済みの集合）。`add` / `update --blocked-by` の循環の拒否（`find_dependency_cycle`）は今のまま。
+
+## 5. P3: checkpoint
+
+困りごと (c) は「Worker が無言で止まり、未 commit の作業が失われかけた」（2026-10-04・10-05・10-11 の 3 回。元文書 §14.1）。
+
+### 5.1 誰が書き、誰が読み、どこに置き、いつ消すか
+
+| | 内容 |
+|---|---|
+| **書く** | 退役の実行者（watchdog 側の `lib_retirement.py`）。`plan.sh retire --execution` を呼ぶ**前**に、`lib_checkpoint.py`（新しい lib。**worktree を読むだけ**で何も変えない）を呼ぶ。queue には書かない（queue への書き込みは Txn だけ） |
+| **読む** | `pull`（次の試行に `previous_attempt.checkpoint_dir` を渡す）・Worker（`worker.md` に「`checkpoint_dir` があれば先に読め」を足す。PR-H）・Director（needs_director 通知に path を載せる） |
+| **置く** | `registry/checkpoints/<mission>/<tid>/<execution_id>/`（gitignored。handoff と同じ registry 側。mode 0700 / 0600）。**queue の外**に置く理由: patch は大きくなりうる・秘密を含みうる・queue は Git に載せない運用でも mission ごと動く |
+| **消す** | `scripts/checkpoint_gc.py`（`worktree_gc.py` と同じ作法: 既定は dry-run、`--apply` でも**削除でなく隔離**）。対象は「task が終端で、保存から 30 日を過ぎたもの」。未解決の task（終端でない）のは消さない。期間は §7 の判断 7 |
+
+### 5.2 内容
+
+- `meta.json`: `execution_id` / `mission` / `task` / `taken_at` / `reason`（`timeout` / `hard_idle` / `window_gone` …）/ `branch` / `head` / `dirty`（bool）/ 各ファイルの `truncated` と元のサイズ。
+- `dirty.patch`: `git diff HEAD --binary --no-ext-diff --no-textconv`（`--no-textconv` は必須: 読み取りの git が textconv を起動する。memory: git-blame-runs-textconv-by-default）。上限 1MB で切り、切ったら `truncated: true`。
+- `untracked.tar` ではなく **`untracked/` に個別ファイル**（1 ファイル 64KB 以下・合計 2MB 以下。超えた分は一覧だけ）。シンボリックリンクは辿らない。
+- `status.txt`: `git status --porcelain=v1 -z` の結果。
+- `pane.txt`: ペインが**まだ生きているとき**だけ、最後の 200 行（`lib_mux.py capture`）。window が消えた場合は無い（それでも他は取れる — worktree の path は record の `git.worktree`（`lib_execution.py:327-355`）から得る。ペインの有無に依存しない）。
+
+### 5.3 秘密
+
+- **ファイル名で除外**: `.env*` / `*.pem` / `*.key` / `*.p12` / `*.pfx` / `*_rsa` / `*_dsa` / `*_ed25519` / `*credentials*` / `*.secret*`（利用者の security.md の一覧と同じ）。パッチの該当ファイルの hunk は落とし、`meta.json` に除外した件数だけ書く。
+- **内容の redaction**（patch・untracked・pane の全部）: `op://…`・`-----BEGIN … PRIVATE KEY-----` から END まで・`(ghp|gho|ghs|github_pat)_…`・`sk-…`・`AKIA…`・`xox[abprs]-…`・`Bearer <長い文字列>`・`(TOKEN|SECRET|PASSWORD|PASSWD|API_KEY)\s*[=:]\s*\S+` の値を `[REDACTED:<n>]` にする。置換の件数を `meta.json` に書く。**redaction が走らなかった（例外）ときはそのファイルを保存しない**（生のまま残さない側に倒す）。
+- 正規表現は `timeout 120` を要する検索ではないが、**バックトラックしない形**（量指定子を入れ子にしない）で書き、テストで長い 1 行（1MB）を通す。
+
+### 5.4 失敗しても退役を止めない
+
+`lib_retirement` の段階に `checkpoint` を足す。**期限 20 秒（`daemons.checkpoint_seconds`）で打ち切り、失敗・期限切れは dir を作らず（途中までの dir は消す）、ログと Director への一回きりの通知に残して、退役を続ける**。理由: 退役が止まると誰も窓を閉じない（`daemon-authority.md` §5）。保存が失敗したことは**成功扱いにせず**、`plan.sh retire` に `--checkpoint none` を渡して台帳の `retire` に「checkpoint なし」と書く。判断 6 で確認する。
+
+### 5.5 `retire` / 台帳への接続
+
+`plan.sh retire --execution <id> --checkpoint <dir|none>` を足す（任意の option。無ければ今まで通り）。台帳の `retire` の `checkpoint_dir` に入る。**dir の存在は plan.sh が検査する**（`lib_checkpoint.py verify <dir>` が `meta.json` の `execution_id` と照合 — 別の試行の dir を指せない）。
+
+### 5.6 PreCompact を task に届ける（困りごと (d)）
+
+- 原因 (i): task は pull のあとに決まるが、`ENV_EXPORTS` は起動時の 1 回（`start.sh:786`）。(ii): `CREWVIA_AGENT_NAME` は誰も設定しない（§1-7）。
+- 直し方: hook は `plan.sh snapshot --self --section-file -` を呼ぶ。`--self` は `AGENT_NAME`（`start.sh` が渡す）の assignment（`queue/assignments/<agent>` = `mission:task`）から mission と task を決め、`classify_assignment` の規則で「card が in_progress・worker が自分」を確かめる。決められなければ書かずに拒否（今の `resolve_ambiguous_mission` と同じ。別 mission の同じ `tNNN` に書かない）。節の見出しに `execution_id` を入れる。
+- `CREWVIA_TASK_ID` を `ENV_EXPORTS` に足す案は採らない: task は 1 セッションの中で変わる（Worker は pull ループを回す。`worker.md:112-134`）。
+- 書く内容は今と同じ（trigger / agent / task / timestamp）。**作業内容は保存しない**（P3 の checkpoint は退役の経路。PreCompact は compact 後に「どの task か」を思い出すためのもの）。
+
+### 5.7 handoff の path に mission を含める（困りごと (e)）
+
+`crewvia_handoff_path <agent> <mission> <task_id>` → `registry/handoffs/<agent>/<mission>/<task_id>_HANDOFF.md`（`git-helpers.sh:83`）。**古い path も読む**（`plan.sh fail` の `handoff_path` は絶対パスのみ・存在を検査する、不変条件 6。新旧どちらでも通る）。呼び出し側の `agents/worker.md:410`・`:811` と、読み手の dispatcher の通知（`handoff_path` を card から読む）を揃える。実際に衝突した事例は見つけていない（未確認）ので、緊急ではない — 先頭ではなく PR-B。
+
+## 6. PR の分割と順序
+
+300KB を超える PR は `kai-review.sh` が fail-closed で拒否する（memory: pr-size-breaks-review-machinery）。どの PR も差分は数十〜百数十 KB の見込み（実装 + テスト）。下の「触る箇所」は `gh pr diff` で確かめた未 merge PR との重なり。
+
+| PR | 範囲 | 依存 | 触る箇所（未 merge PR との重なり） | rollback | 本番確認 |
+|---|---|---|---|---|---|
+| **A** mission の再活性化（P2 の小物。**単独で先に出せる**） | `cmd_add` と `update --status`（done の mission の task を未完了に）で mission を `in_progress` に戻す。`completed_at` を消す。lint / dispatcher が `in_progress` を想定どおり扱うことの確認 | なし | `plan.sh` の `cmd_add`（#298 が `:3005` 付近を触る — #298 の後に出すか、衝突を手で解く） | PR revert。mission.yaml は手で `done` に戻せる | 使い捨て mission で done → add → status が戻り、dispatcher が「全ミッション完了」を出さない |
+| **C** PreCompact（P3 (d)。**単独で先に出せる**） | `hooks/pre-compact.sh` / `plan.sh snapshot --self` | なし | `cmd_snapshot`（#291/#293/#292/#298 のどれも触らない） | PR revert。fallback ログに戻る | 実 Worker の PreCompact で card の節が出る（`/compact` を打つ）。fallback ログ `queue/pre-compact-fallback.log` が増えない |
+| **B** handoff の path（P3 (e)） | `git-helpers.sh` / `worker.md` / テスト | #291 の merge（`worker.md` を #291・#293 が触る） | 同左 | revert（新旧どちらも読めるので、書き手を戻すだけ） | 新しい path で fail → dispatcher の通知に中身が載る |
+| **D** 台帳（P1 (a)） | `Txn.write_history`・`_finish` の呼び出し・`plan.sh history`・`pull` の `previous_attempt`・store-check の報告 | #291・#293 の merge（`lib_task_controller.py` を触る） | `lib_task_controller.py:_finish`（#291/#293 が `:570-614` 付近を触る） | revert。台帳は残ってよい（旧コードは読まない） | 1 task を done → fail（別 task）で `history/` に 1 ファイルずつ増える。card と台帳の Result が同じ |
+| **E** retry と総試行数の上限（P1 (b)(d)） | Controller `reopen_task(kind='retry')`・`plan.sh retry`・`max_attempts` | D | `plan.sh`・`lib_task_controller.py` | revert。`update --reset` は残してあるので運用は戻れる | 使い捨て mission で fail → retry → pull で `previous_attempt` が出る・上限で exit 3 |
+| **F** reopen と下流の無効化（P2） | `plan.sh reopen`・`--cascade`・`lib_dep_rules.downstream_closure`・mission の再活性化（A と同じ関数） | D・E | 同上 + `lib_dep_rules.py` | revert | 使い捨て mission で I → R → Q を作り、I を reopen して R・Q が pending に戻り、I の再 done まで pull されない |
+| **G** checkpoint（P3） | `lib_checkpoint.py`・`lib_retirement.py` の段階・`plan.sh retire --checkpoint`・`checkpoint_gc.py` | D | `lib_retirement.py`（未 merge PR は触らない） | revert（`--checkpoint` は任意 option なので、戻しても retire は動く） | 観察用の手書き marker（memory: observe-retirement-with-handwritten-marker）で、dirty な worktree の patch が出る・秘密がマスクされる |
+| **H** 運用規則の文書 | `agents/director.md`（「修正は新 task でなく retry / reopen」）・`worker.md`（`previous_attempt` / `checkpoint_dir` を読む）・`scripts/CLAUDE.md` | E・F・G の本番確認 | `agents/*.md`（#291 が触る）。**運用の変更なのでユーザーの承認が要る** | revert | 次の mission で Director が retry を使い、新 task の数が減る |
+| **I**（任意）Git Policy の世代置換子 | merge 済みの task の reopen | F | `lib_git_policy.py`・git-helpers | revert | — |
+| **J**（任意）Verifier の依存先の検査 | verify pass が依存先の `reopen_count` を見る | Verifier を運用する段 | — | — | — |
+
+順序: **A と C を先頭**（独立・小さい・今の困りごとを直す）→ #291 系の merge 後に B・D → E → F・G（並行可。同じファイルを触るので順番に merge）→ H。各 PR の merge と cutover はユーザーの承認（plan.sh は主 checkout から直接実行されるので merge = cutover。memory: main-checkout-lags-after-pr-merge）。
+
+## 7. ユーザーに決めてもらう点
+
+1. **着手の順序**: A（mission の再活性化）と C（PreCompact）を #291 系の merge を待たずに先に出す。**推奨: はい**（どちらも独立で小さく、困りごと (b)(d) をすぐ直す）。
+2. **総試行数の上限**: 5（元文書の案）か 6 か。実測で `execution_count` の最大は 6（t005）。**推奨: 6**（今の運用で `--over-cap` を常用させない）。差し戻しの `max_rework` 3 は変えない。
+3. **merge 済みの task の reopen**: v1 は扱わず、新 task で続ける。Git Policy に世代の置換子を足す（PR-I）か。**推奨: 扱わない**（PR-I は需要が出てから）。
+4. **archive の restore**: やらない。**推奨: やらない**（需要の記録が無い。Taskvia の復元は未確認）。
+5. **`--cascade` の既定**: `reviews`（codex-review / review / qa の完了済み下流だけ自動で開け直し、他は列挙のみ）か `all` か `none` か。**推奨: `reviews`**（検証系は古い head の結果が無意味になる。他の下流は Director が判断する）。
+6. **checkpoint の保存失敗**: 退役を止めない（期限 20 秒で打ち切り、Director に 1 回通知）。**推奨: 止めない**（止めると誰も窓を閉じない）。
+7. **checkpoint の保持期間**: 30 日（終端の task のみ。元文書 §13 の案と同じ）。**推奨: 30 日**。
+8. **Director の運用規則の変更**: 「Codex の指摘の修正は新 task でなく retry / reopen」にする（PR-H）。**推奨: 承認する**（レビュー後に足した task は 41%）。ただし PR-E・F の本番確認の後。
+9. **語**: `generation` を使わず `reopen_count` にする。**推奨: そのまま**。
+
+## 8. 未解決の課題（この文書のレビューで積む場所）
+
+Codex の往復は 3 巡で打ち切り、残った P2 以下はここに積む（元文書 §15 と同じ方針）。今は空。
+
+- 範囲外として残したこと: Verifier の運用と、その verify pass が依存先の変更を見る検査（PR-J）。`update --status` の Controller 化（P0 の残り）。回復を dispatcher が起こす・待つ（P0 の残り）。
+- 確かめていないこと: mission の戻し先 `in_progress` が lint / dispatcher で想定どおりか（PR-A）。retry / reopen の後に `worktree_gc` で隔離済みの worktree を pull が作り直せるか（PR-E の QA）。reopen した codex-review task が、`registry/daemons/review-refusals/` の古い拒否記録で spawn されないことがあるか（記録は消してよい。`scripts/CLAUDE.md` の「通知・記録」）。`done` → `pending` を Taskvia が受け付けるか。

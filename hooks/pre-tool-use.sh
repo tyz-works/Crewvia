@@ -540,6 +540,86 @@ case ",${SKILLS:-}," in
     ;;
 esac
 
+# --- Research scope guard: research スキルの Write 範囲と Bash の読み取り専用 allowlist
+#     (mission 20261012-research-skill-write-scope-and-bash-guard / t001) ---
+# 背景: research は yaml で Edit/Write/MultiEdit/git push を deny している (lint と add の
+# 判定 = research は deliverable pr/file を作れない、はこの deny に依る。変えない)。
+# しかしそのままでは調査メモすら残せず、Bash の書き込みを止めているのは auto mode の
+# 分類器だけだった (TASKVIA_TOKEN が空だと下の Taskvia 分岐は native に委ねて exit する)。
+# 判定は hooks/lib_research_guard.py の 1 か所 (fail closed)。この塊は native への委譲
+# (下の Taskvia 無効分岐) より前に置く = TASKVIA_TOKEN の有無に関係なく効く。
+#   - Write/Edit/MultiEdit/NotebookEdit: queue/missions/<自分の slug>/notes/<自分の tid>*.md
+#     (と、skill-permissions.yaml の research_write_scope を設定したときだけ obsidian の新規ノート)
+#     なら allow (yaml の deny より優先)、それ以外は deny。
+#   - Bash: 解釈の要らない読み取り専用の形 (lib の SPECS 表) 以外は deny。通った形は下の通常の判定へ進む。
+# 対象外: SKILLS (と task card の skills) に research を含まないセッション。
+# card は env の TASK_ID の有無に関係なく assignment から引く (t005 / Codex P2: 上の _TASK_FILE は
+# TASK_ID が空のときしか埋まらないので、それに頼ると TASK_ID 設定済みの research を見逃す)。
+_RG_SKILLS=",${SKILLS:-},"
+_RG_CARDS="${_TASK_FILE:-}"
+case "${AGENT_NAME:-}" in
+  ""|*/*|.*) ;;
+  *)
+    if [ -f "${_CREWVIA_REPO}/queue/assignments/${AGENT_NAME}" ]; then
+      _RG_ASG="$(tr -d '\n' < "${_CREWVIA_REPO}/queue/assignments/${AGENT_NAME}" 2>/dev/null || true)"
+      case "$_RG_ASG" in
+        *:*) _RG_CARDS="${_RG_CARDS}
+${_CREWVIA_REPO}/queue/missions/${_RG_ASG%%:*}/tasks/${_RG_ASG##*:}.md" ;;
+      esac
+    fi
+    ;;
+esac
+while IFS= read -r _RG_CARD; do
+  if [ -n "$_RG_CARD" ] && [ -f "$_RG_CARD" ]; then
+    _RG_SKILLS="${_RG_SKILLS}$(grep '^skills:' "$_RG_CARD" 2>/dev/null | head -1 | sed 's/^skills:[[:space:]]*//' | tr -d '[]"' | tr -d ' ' || true),"
+  fi
+done <<< "$_RG_CARDS"
+case "$_RG_SKILLS" in
+  *,research,*)
+    _RG_PY="${_CREWVIA_REPO}/hooks/lib_research_guard.py"
+    if { [ "$TOOL_NAME" = "Edit" ] || [ "$TOOL_NAME" = "Write" ] || [ "$TOOL_NAME" = "MultiEdit" ] || [ "$TOOL_NAME" = "NotebookEdit" ]; }; then
+      _RG_RESULT="$(python3 "$_RG_PY" write "$_CREWVIA_REPO" "$AGENT_NAME" "${FILE_PATH:-${NOTEBOOK_PATH:-}}" "$(pwd)" "${_CREWVIA_REPO}/config/skill-permissions.yaml" 2>/dev/null || echo '{"decision":"deny","reason":"research guard crashed"}')"
+      _RG_DECISION="$(echo "$_RG_RESULT" | jq -r '.decision // "deny"' 2>/dev/null || echo deny)"
+      _RG_REASON="$(echo "$_RG_RESULT" | jq -r '.reason // "research guard"' 2>/dev/null || echo "research guard")"
+      if [ "$_RG_DECISION" = "allow" ]; then
+        # 範囲例外が上書きしてよいのは research 自身の deny (Edit/Write/MultiEdit) だけ (Codex 4 巡目 P2 / t011)。
+        # _global.deny と research 以外の skill の deny は、この allow で exit する前に評価する
+        # (_global.deny は「何があっても上書きできない」絶対安全弁。下の通常の判定まで進まないのでここで見る)。
+        # 評価は yaml が正本。lib_skill_perms の deny だけを採用し、none / allow は範囲例外の答えを変えない。
+        # 読めない・落ちた場合は deny (fail closed)。
+        _RG_OTHER_SKILLS="$(printf '%s' "$_RG_SKILLS" | tr ',' '\n' | grep -v -e '^$' -e '^research$' | sort -u | paste -sd, - || true)"
+        _RG_PERM="$(python3 "${_CREWVIA_REPO}/hooks/lib_skill_perms.py" "${_CREWVIA_REPO}/config/skill-permissions.yaml" "$_RG_OTHER_SKILLS" "$TOOL_NAME" 2>/dev/null || echo '{"decision":"deny","source":"lib_skill_perms crashed"}')"
+        # yaml が読めなかった (yaml_not_found / usage_error) 場合は none が返るが、_global / 他 skill の制限を
+        # 見ていないので allow にしない (fail closed。t013 / Codex 5 巡目 P2)。
+        _RG_PERM_DECISION="$(echo "$_RG_PERM" | jq -r '.decision // "deny"' 2>/dev/null || echo deny)"
+        _RG_PERM_SOURCE="$(echo "$_RG_PERM" | jq -r '.source // "unknown"' 2>/dev/null || echo unknown)"
+        case "$_RG_PERM_SOURCE" in
+          yaml_not_found|usage_error|unknown) _RG_PERM_DECISION="deny"; _RG_PERM_SOURCE="skill-permissions.yaml を読めない (${_RG_PERM_SOURCE})" ;;
+        esac
+        if [ "$_RG_PERM_DECISION" = "deny" ]; then
+          echo "[pre-tool-use] 🚫 research write scope overridden by deny: ${TOOL_NAME} (${_RG_PERM_SOURCE})" >&2
+          emit_decision "deny" "Permission denied: ${_RG_PERM_SOURCE}"
+          exit 0
+        fi
+        emit_decision "allow" "Research write scope: ${_RG_REASON}"
+        exit 0
+      fi
+      echo "[pre-tool-use] 🚫 research write scope violation: ${TOOL_NAME}(${FILE_PATH:-${NOTEBOOK_PATH:-unknown}})" >&2
+      emit_decision "deny" "$_RG_REASON"
+      exit 0
+    elif [ "$TOOL_NAME" = "Bash" ]; then
+      _RG_RESULT="$(printf '%s' "$COMMAND" | python3 "$_RG_PY" bash --repo "$_CREWVIA_REPO" --agent "${AGENT_NAME:-}" --cwd "$(pwd)" 2>/dev/null || echo '{"decision":"deny","reason":"research guard crashed"}')"
+      _RG_DECISION="$(echo "$_RG_RESULT" | jq -r '.decision // "deny"' 2>/dev/null || echo deny)"
+      if [ "$_RG_DECISION" != "allow" ]; then
+        _RG_REASON="$(echo "$_RG_RESULT" | jq -r '.reason // "research guard"' 2>/dev/null || echo "research guard")"
+        echo "[pre-tool-use] 🚫 research bash blocked: $(echo "$COMMAND" | head -c 200)" >&2
+        emit_decision "deny" "$_RG_REASON"
+        exit 0
+      fi
+    fi
+    ;;
+esac
+
 # --- Skill-based permission check ---
 _SKILL_PERMS_YAML="${_CREWVIA_REPO}/config/skill-permissions.yaml"
 _SKILL_PERMS_PY="${_CREWVIA_REPO}/hooks/lib_skill_perms.py"

@@ -120,6 +120,15 @@ skills:
   research:
     can_produce_deliverable: false
     allow: []
+    # Edit/Write/MultiEdit の deny は残す (lint と add の「research は deliverable pr/file を
+    # 作れない」判定がこれに依る)。ただし hooks/pre-tool-use.sh の "Research scope guard"
+    # (hooks/lib_research_guard.py) が、この yaml より前に次の 2 つを構造的に判定する:
+    #   - Write 系: queue/missions/<自分の slug>/notes/<自分の tid>*.md だけ allow (上書き可)。
+    #     それ以外は deny。obsidian への新規ノートは下の research_write_scope を設定したときだけ。
+    #   - Bash: 解釈の要らない読み取り専用の形 (コマンドとオプションの allowlist) 以外は deny
+    #     (TASKVIA_TOKEN の有無に関係なく)。$ / ` / # / heredoc / awk / python3 / export 等は通らない。
+    #     done / needs-director の結果は Write で notes/<tid>*.md に書き --result-file で渡す。
+    #     使い方と通る形の一覧: knowledge/research-skill-guards.md
     deny:
       - "Edit"
       - "Write"
@@ -284,3 +293,10 @@ skills:
       - "MultiEdit"
       - "MultiEdit(**)"
       - "Bash(**)"
+
+# research スキルの Write 範囲の追加設定 (hooks/lib_research_guard.py だけが読む)。
+# obsidian_research_dir: research が調査ノートを新規作成してよい dir の絶対パス
+#   (例: "~/obsidian/research")。**既定は空 = 無効** (公開リポジトリなので path を書かない)。
+#   設定すると <dir>/YYYYMMDD_<名前>.md の新規作成だけ許可 (既存ファイルの上書きは拒否)。
+research_write_scope:
+  obsidian_research_dir: ""

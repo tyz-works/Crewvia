@@ -65,6 +65,7 @@ _SCRIPTS_DIR = Path(__file__).resolve().parent
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
+import lib_agent_name as _agent_name  # noqa: E402
 import lib_execution as _ex  # noqa: E402
 import lib_task_cards as _cards  # noqa: E402
 import lib_task_status as _status  # noqa: E402
@@ -625,9 +626,10 @@ def serialize_state(state):
 # 名前・パス
 # ---------------------------------------------------------------------------
 
-IDENTITY_SUFFIX = '.identity'
-#: assignments ディレクトリで別の意味を持つ suffix。Worker 名として使わせない。
-RESERVED_AGENT_SUFFIXES = (IDENTITY_SUFFIX, '.restarting', '.tmp')
+#: Worker 名の規則は lib_agent_name が唯一の定義 (dispatcher と共有。PR #294)。同じ名前で re-export する。
+IDENTITY_SUFFIX = _agent_name.IDENTITY_SUFFIX
+RESERVED_AGENT_SUFFIXES = _agent_name.RESERVED_AGENT_SUFFIXES
+agent_name_problem = _agent_name.agent_name_problem
 
 # classify_assignment() の判定 (plan.sh の ASSIGN_* と同じ語彙)。撤去してよいのは MINE だけ。
 ASSIGN_MINE = 'mine'
@@ -653,17 +655,6 @@ def is_orphan_target(status, worker):
     正当 (「holding でない status すべて」にすると動いている Worker を殺す経路になる)。"""
     return (status in ORPHAN_ASSIGNMENT_FINISHED_STATUSES or status == _NEEDS_DIRECTOR
             or (status == 'pending' and not worker))
-
-
-def agent_name_problem(agent):
-    """Worker 名が assignment ファイル名として使えない理由。使えるなら None。"""
-    if not isinstance(agent, str) or not agent or '/' in agent or '\0' in agent \
-            or agent in ('.', '..') or agent.startswith('.'):
-        return "'/' や先頭の '.' を含まない名前にしてください"
-    for suffix in RESERVED_AGENT_SUFFIXES:
-        if agent.endswith(suffix):
-            return f"'{suffix}' で終わる名前は queue/assignments/ で予約済みです"
-    return None
 
 
 def _check_slug(slug):

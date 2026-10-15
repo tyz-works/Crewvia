@@ -211,7 +211,7 @@ lib ごとの**破ってはいけない契約**の要約。理由・経緯・全
 - **hard_idle が unknown で止まらない・止まっても Director に届く** (t003 / §11): zombie (state=Z) は木から外す。読めない (EACCES)
   ノードでも BFS を続け、job があれば `executing`。見送り (unknown / executing / awaiting_human / mux_pid_unavailable) が
   `daemons.hard_idle_suppressed_notify_seconds` (既定 600・**env なし**) 続いたら `SuppressedIdleNotifier` が Director に (episode の中で理由ごとに 1 回。§11-13)
-  (fp は Execution ID・解けたら台帳キーを消す)。`WARN:` 行は理由が変わった時 + 10 cycle ごと。
+  (fp は `<Execution ID>:<理由>@<無音区間の起点>`・解けたら台帳キーを消す。起点が動いたら別の理由のキーも消す。§11-15)。`WARN:` 行は理由が変わった時 + 10 cycle ごと。
   （`knowledge/watchdog-idle-judgment.md` §11-9）
 - idle Worker の退役 (dispatcher): 残っている task が無い、または skill は合うが TARGET_DIR が合わず取れない
   task しか無い (`takeable_pending` が空) Worker は no-task と同じく退役させる。TARGET_DIR の記録が

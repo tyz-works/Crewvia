@@ -4,7 +4,7 @@
 
 1. 名乗りなし × active な試行 × 報告 (done / fail / needs-director / ready-for-verification / verifying / verify-result)
    → exit 3・`error_code=EXECUTION_REQUIRED`。**何も書かない** (queue 全体のバイト列が不変・監査は `refused:EXECUTION_REQUIRED` の 1 行)
-2. 名乗れば今までどおり通る (flag でも env でも)。警告は無い (PR-1 の警告は PR-2 で拒否に置き換わった)
+2. 名乗れば今までどおり通る (`--execution` だけ。env は名乗りに使わない = t001 / §20.8)。警告は無い (PR-1 の警告は PR-2 で拒否に置き換わった)
 3. 対象外は通る: 試行なしの card・`update --reset` / Director の回復
 4. pull は stderr に「報告には --execution ex-… を付ける」を 1 行足す。stdout の JSON は変えない
 5. dispatcher の割り当て文・start.sh の起動文が `--execution` に触れる
@@ -78,14 +78,6 @@ def test_naming_the_attempt_passes_without_a_warning(box, command):
     assert OLD_WARNING not in p.stderr and "EXECUTION_REQUIRED" not in p.stderr
     assert card_outcome(box) == OUTCOME[command]
     assert [r["caller_check"] for r in audit_rows_for(box, command)] == ["verified"]
-
-
-@pytest.mark.parametrize("command", REPORTS)
-def test_the_environment_variable_counts_as_naming(box, command):
-    xid = take(box)
-    p = run(box, *report_argv(command), env={"CREWVIA_EXECUTION_ID": xid})
-    assert p.returncode == 0, p.stderr
-    assert OLD_WARNING not in p.stderr
 
 
 def test_the_refusal_names_identifiers_only(box):

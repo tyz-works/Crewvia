@@ -78,8 +78,8 @@ _OP_VERIFY_FAIL = 'verify-result:fail'
 #: 実行中 (active) の試行がある card への名乗りなしは `EXECUTION_REQUIRED` (exit 3)。試行なし・DETACHED・TERMINAL は通す
 _REPORT_OPERATIONS = frozenset({_C_DONE, _C_FAIL, _C_NEEDS_DIRECTOR, _OP_VERIFY_PASS, _OP_VERIFY_FAIL})
 
-#: `Caller.source` の語彙 (どこから ID を得たか。拒否の文言で env 由来の直し方を言うのに使う)
-SOURCES = ('flag', 'env', 'none')
+#: `Caller.source` の語彙 (どこから ID を得たか。env は名乗りの出どころにしない = E5 / execution.md §20.11)
+SOURCES = ('flag', 'none')
 
 GIT_KEYS = ('branch', 'base', 'pr_base', 'worktree', 'head_at_start')
 
@@ -93,8 +93,8 @@ class Caller:
     """操作を打った者が**名乗った**試行 (execution.md §5.2)。agent 名は照合の根拠にしない (AC-04)。
 
     `execution_id` が None = 名乗りなし。**空文字は名乗りなしに倒さない** (指定された値が不正 = 照合で不一致)。
-    `source` は `flag` (`--execution`) / `env` (`CREWVIA_EXECUTION_ID`) / `none`。名乗りがあるのに `none`、
-    名乗りがないのに `flag` / `env` は矛盾 (`ValueError`)。`agent` は監査の `actor` を決める側が使う (照合には使わない)。
+    `source` は `flag` (`--execution`) / `none`。名乗りがあるのに `none`、
+    名乗りがないのに `flag` は矛盾 (`ValueError`)。`agent` は監査の `actor` を決める側が使う (照合には使わない)。
     """
     execution_id: str | None = None
     source: str = 'none'
@@ -356,10 +356,8 @@ def _authorize(txn, slug, tid, meta, caller, *, operation, require_name=False):
         if view == ex.NONE:
             _refuse(txn, ex.EXECUTION_NOT_FOUND,
                     f"{slug}/{tid}: この card はその execution id を発行していません", slug, tid, meta, caller)
-        hint = ("" if caller.source != 'env' else
-                " (名乗りは環境変数 CREWVIA_EXECUTION_ID 由来です。`unset CREWVIA_EXECUTION_ID` するか --execution で渡してください)")
         _refuse(txn, ex.EXECUTION_NOT_CURRENT,
-                f"{slug}/{tid}: 名乗った execution は、この task の今の試行ではありません{hint}", slug, tid, meta, caller)
+                f"{slug}/{tid}: 名乗った execution は、この task の今の試行ではありません", slug, tid, meta, caller)
     # 名乗りなし
     if view == ex.ACTIVE:
         if require_name:

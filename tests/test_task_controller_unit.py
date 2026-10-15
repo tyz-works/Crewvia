@@ -358,24 +358,22 @@ def test_10_5_09_another_execution_id_cannot_complete_or_fail(q):
     other_ctx = h.reserve_and_start(q, tid="t002", agent=OTHER, factory=h.ids(10))
     before = h.snapshot(q)
     with h.tx(q) as t:
-        for who in (h.caller(other_ctx.execution_id), h.caller(h.xid(999)), h.caller(other_ctx.execution_id, "env")):
+        for who in (h.caller(other_ctx.execution_id), h.caller(h.xid(999))):
             e = h.raises_code(ex.EXECUTION_NOT_CURRENT, ctl.complete_execution, t, MISSION, "t001", who, to_status="done")
             assert e.exit_code == 3
             h.raises_code(ex.EXECUTION_NOT_CURRENT, ctl.fail_execution, t, MISSION, "t001", who, ex.WORKER_FAILED,
                           to_status="failed")
     assert h.snapshot(q) == before
     rows = [r for r in h.audit_rows(q) if r["result"].startswith("refused:")]
-    assert len(rows) == 6 and all(r["execution_id"] == ctx.execution_id for r in rows)  # card の ID。名乗った値ではない
+    assert len(rows) == 4 and all(r["execution_id"] == ctx.execution_id for r in rows)  # card の ID。名乗った値ではない
     assert not any(other_ctx.execution_id == r["execution_id"] for r in rows)
     assert {r.get("detail") for r in rows} == {f"presented={other_ctx.execution_id}", f"presented={h.xid(999)}"}
 
 
-def test_the_env_origin_is_named_in_the_refusal_with_the_way_out(q):
+def test_env_is_not_a_caller_source(q):
+    with pytest.raises(ValueError):
+        h.caller(h.xid(999), "env")
     h.reserve_and_start(q, factory=h.ids())
-    with h.tx(q) as t:
-        e = h.raises_code(ex.EXECUTION_NOT_CURRENT, ctl.complete_execution, t, MISSION, "t001",
-                          h.caller(h.xid(999), "env"), to_status="done")
-    assert "CREWVIA_EXECUTION_ID" in e.message and "--execution" in e.message
     with h.tx(q) as t:
         e = h.raises_code(ex.EXECUTION_NOT_CURRENT, ctl.complete_execution, t, MISSION, "t001",
                           h.caller(h.xid(999), "flag"), to_status="done")

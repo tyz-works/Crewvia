@@ -35,6 +35,8 @@ import subprocess
 
 import pytest
 
+from e5_autoname import AutoName
+
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 #: 赤の実証が修正前の plan.sh に差し替えるための口。通常は使わない。
 PLAN_SH = pathlib.Path(os.environ.get("PLAN_SH_UNDER_TEST") or REPO_ROOT / "scripts" / "plan.sh")
@@ -58,6 +60,7 @@ class Sandbox:
 
     def __init__(self, root: pathlib.Path):
         self.root = root
+        self.names = AutoName()
         self.queue = root / "queue"
         self.target = root / "work"      # task の target_dir (worktree を作らせないため)
         self.target.mkdir()
@@ -79,10 +82,13 @@ class Sandbox:
         e = self.env(**(env or {}))
         for k in unset:
             e.pop(k, None)
-        return subprocess.run(
+        args = self.names.before(args)                # E5 PR-2: 自分の pull の execution_id を報告で名乗る
+        r = subprocess.run(
             ["bash", str(PLAN_SH), *args], env=e, cwd=str(self.root),
             capture_output=True, text=True, timeout=60,
         )
+        self.names.after(args, r.stdout, r.returncode)
+        return r
 
     def snapshot(self):
         """木全体 (ディレクトリも含む) の (種類, サイズ, mtime_ns)。"""

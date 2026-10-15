@@ -30,6 +30,8 @@ import subprocess
 
 import pytest
 
+from e5_autoname import AutoName
+
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 PLAN_SH = pathlib.Path(os.environ.get("PLAN_SH_UNDER_TEST") or REPO_ROOT / "scripts" / "plan.sh")
 
@@ -54,6 +56,7 @@ class Sandbox:
         self.queue = root / "queue"
         self.target = root / "work"
         self.target.mkdir()
+        self.names = AutoName()                 # E5 PR-2: 自分の pull の execution_id を報告で名乗る
 
     def env(self, **extra):
         env = {
@@ -69,6 +72,7 @@ class Sandbox:
         return env
 
     def plan(self, *args, stdin=None, stdin_bytes=None, **env):
+        args = self.names.before(args)
         kw = {}
         if stdin_bytes is not None:
             kw["input"] = stdin_bytes
@@ -83,12 +87,14 @@ class Sandbox:
         if not text:
             r.stdout = r.stdout.decode("utf-8", "replace")
             r.stderr = r.stderr.decode("utf-8", "replace")
+        self.names.after(args, r.stdout, r.returncode)
         return r
 
     def shell(self, script: str):
         """`bash -c` で、人間 / Worker が実際に打つ形 (二重引用符の位置引数) を再現する。"""
+        extra = {"CREWVIA_EXECUTION_ID": self.names.ids["t001"]} if "t001" in self.names.ids else {}
         return subprocess.run(
-            ["bash", "-c", script], env=self.env(PLAN=str(PLAN_SH)), cwd=str(self.root),
+            ["bash", "-c", script], env=self.env(PLAN=str(PLAN_SH), **extra), cwd=str(self.root),
             capture_output=True, text=True, timeout=60,
         )
 

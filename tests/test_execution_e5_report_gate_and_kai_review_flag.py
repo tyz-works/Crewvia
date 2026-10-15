@@ -1,8 +1,7 @@
-"""E5 PR-1 (t011 / PR #287 Codex 2 巡目): 名乗りなしの警告は**遷移の検査が通った後**にだけ出す (P2)。
-kai-review.sh の空の `--execution` は「省略」ではなく拒否 (P1)。
+"""E5: 報告の関門の順序 (PR-2) と、kai-review.sh の空の `--execution` の拒否 (PR-1 / PR #287 Codex 2 巡目 P1)。
 
-P2: 以前は `_authorize(warn=True)` が `_check_task_status` より前で警告を出していたので、遷移が拒否される名乗りなしの報告
-(例: in_progress でない task への done) でも「名乗りなしで報告しました」が出て、通ったように読めた。
+PR-2: 名乗りなし × active な試行の拒否 (`EXECUTION_REQUIRED`) は**遷移の検査より前**。遷移が不正な状態でも、名乗らない報告は
+先に `EXECUTION_REQUIRED` で止まり (exit 3)、名乗れば遷移の拒否 (exit 2) が出る。どちらも何も書かない。
 P1: `--skip-pull --execution "$X"` の $X が空だと「フラグ省略」と区別がつかず、card の今の試行を採用して名乗ってしまった。
 
 **本番の queue / registry / mux には触れない** (`execution_e3_helpers` の `Box`・偽の plan.sh / gh / codex)。
@@ -21,7 +20,6 @@ from execution_e3_helpers import Box, last_error_code, report_argv, run, set_car
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 KAI_REVIEW = REPO_ROOT / "scripts" / "kai-review.sh"
-MARK = "名乗りなしで報告しました"
 
 
 @pytest.fixture
@@ -29,15 +27,11 @@ def box(tmp_path):
     return Box(tmp_path / "root", tasks=("t001",))
 
 
-def warnings_in(stderr):
-    return [ln for ln in stderr.splitlines() if MARK in ln]
-
-
 def _to_verifying(box, xid):
     assert run(box, *report_argv("ready-for-verification"), "--execution", xid).returncode == 0
 
 
-# 6 コマンド (verify-result は 3 つの verdict) × 「遷移が拒否される」状態を作る関数 × 「通る」状態を作る関数
+# 8 通りの報告 × 「遷移が拒否される」状態を作る関数
 def _refused_in_progress_only(box, xid):          # done / fail / needs-director / ready-for-verification は in_progress だけ (fail は + needs_director)
     set_card(box, status="ready_for_verification")  # 試行は running のまま = ACTIVE (pending だと DETACHED で別の分岐)
 
@@ -46,52 +40,30 @@ def _refused_for_verify(box, xid):                # verifying / verify-result �
     pass                                           # in_progress のまま
 
 
-def _ok_nothing(box, xid):
-    pass
-
-
-def _ok_ready(box, xid):
-    _to_verifying(box, xid)
-
-
 CASES = [
-    ("done", _refused_in_progress_only, _ok_nothing),
-    ("fail", _refused_in_progress_only, _ok_nothing),
-    ("needs-director", _refused_in_progress_only, _ok_nothing),
-    ("ready-for-verification", _refused_in_progress_only, _ok_nothing),
-    ("verifying", _refused_for_verify, _ok_ready),
-    ("verify-pass", _refused_for_verify, _ok_ready),
-    ("verify-fail", _refused_for_verify, _ok_ready),
-    ("verify-nhr", _refused_for_verify, _ok_ready),
+    ("done", _refused_in_progress_only),
+    ("fail", _refused_in_progress_only),
+    ("needs-director", _refused_in_progress_only),
+    ("ready-for-verification", _refused_in_progress_only),
+    ("verifying", _refused_for_verify),
+    ("verify-pass", _refused_for_verify),
+    ("verify-fail", _refused_for_verify),
+    ("verify-nhr", _refused_for_verify),
 ]
 
 
-@pytest.mark.parametrize("command,refuse,ok", CASES, ids=[c[0] for c in CASES])
-def test_an_unnamed_report_refused_on_the_transition_does_not_warn(box, command, refuse, ok):
+@pytest.mark.parametrize("command,refuse", CASES, ids=[c[0] for c in CASES])
+def test_the_claim_gate_comes_before_the_transition_check(box, command, refuse):
     xid = take(box)
     refuse(box, xid)
     before = box.snapshot()
-    p = run(box, *report_argv(command), agent="V1" if command.startswith("verif") else "Ren")
-    assert p.returncode == 2, (p.stdout, p.stderr)                          # 遷移の拒否 (前提の確認)
-    assert last_error_code(p.stderr) == "INVALID_TRANSITION", p.stderr
-    assert warnings_in(p.stderr) == [], p.stderr
-    assert box.snapshot() == before                                         # 拒否は何も書かない
-
-
-@pytest.mark.parametrize("command,refuse,ok", CASES, ids=[c[0] for c in CASES])
-def test_an_unnamed_report_that_passes_the_transition_warns_once(box, command, refuse, ok):
-    xid = take(box)
-    ok(box, xid)
-    p = run(box, *report_argv(command), agent="V1" if command.startswith("verif") else "Ren")
-    assert p.returncode == 0, (p.stdout, p.stderr)
-    assert len(warnings_in(p.stderr)) == 1, p.stderr
-
-
-def test_verify_result_needs_human_review_by_rework_cap_warns_after_the_check(box):
-    """verify-result の mark_task 経路 (needs_human_review) も同じ: 検証待ちでない task では出さない。"""
-    take(box)
-    p = run(box, *report_argv("verify-nhr"), agent="V1")
-    assert p.returncode != 0 and warnings_in(p.stderr) == [], p.stderr
+    agent = "V1" if command.startswith("verif") else "Ren"
+    unnamed = run(box, *report_argv(command), agent=agent)
+    assert unnamed.returncode == 3 and last_error_code(unnamed.stderr) == "EXECUTION_REQUIRED", (unnamed.stdout, unnamed.stderr)
+    assert box.snapshot() == before
+    named = run(box, *report_argv(command), "--execution", xid, agent=agent)
+    assert named.returncode == 2 and last_error_code(named.stderr) == "INVALID_TRANSITION", (named.stdout, named.stderr)
+    assert box.snapshot() == before                                         # どちらの拒否も何も書かない
 
 
 # ---------------------------------------------------------------------------

@@ -82,14 +82,10 @@ def _strip_queue(files):
 
 # --- E5 PR-1 (t005) が足した stderr の 1 行 (plan.sh の判定・stdout・queue は変えない。execution.md §20.4) ---
 #   1. pull: 「報告には --execution ex-… を付ける (…)」
-#   2. 名乗りなしで通った報告: 「名乗りなしで報告しました (…)。将来は拒否されます」
+#   (PR-2 で 2. 名乗りなしの警告は撤去。scenario は報告に `--execution` を足す = Runner.named)
 E5_STDERR_HINT = re.compile(r"^\[plan\.sh\] 報告には --execution ex-[0-9a-f]{32} を付ける \(done / fail / needs-director / ready-for-verification\)\n", re.M)
-E5_STDERR_WARNING = ("[plan.sh] 名乗りなしで報告しました (execution id を --execution で渡してください)。"
-                     "将来は拒否されます\n")
-
-
 def _strip_e5_stderr(text):
-    return E5_STDERR_HINT.sub("", text).replace(E5_STDERR_WARNING, "")
+    return E5_STDERR_HINT.sub("", text)
 
 
 def without_e2_additions(result):
@@ -179,7 +175,8 @@ def test_the_stripped_additions_are_really_there_and_nothing_else_is_stripped(tm
     pulls = [s for s in raw["steps"] if s["cmd"].startswith("pull") and s["rc"] == 0]
     assert pulls and all(any(f'"{k}"' in s["stdout"] for k in E2_JSON_KEYS) for s in pulls)
     assert all(E5_STDERR_HINT.search(s["stderr"]) for s in pulls), "pull の stderr に E5 の 1 行が無い"
-    assert any(E5_STDERR_WARNING in s["stderr"] for s in raw["steps"]), "名乗りなしの警告が 1 度も出ていない"
+    assert not any("名乗りなしで報告しました" in s["stderr"] for s in raw["steps"]), "PR-2 で撤去した警告が出ている"
+    assert not any("EXECUTION_REQUIRED" in s["stderr"] for s in raw["steps"]), "scenario の報告は名乗っている (拒否されていない)"
     final = raw["queue_before_archive"]
     cards = [t for n, t in final.items() if "/tasks/" in n and "current_execution_id:" in t]
     assert len(cards) >= 4, "pull した card に試行の欄が無い"

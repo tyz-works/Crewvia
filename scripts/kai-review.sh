@@ -191,7 +191,8 @@ fi
 # fail_needs_director: エラーログ + needs-director + exit 1。スクリプト自体が
 #   完走できなかった failure path 用。
 # EXEC_ARGS: pull の JSON から取った今の試行の名乗り (`--execution <id>`)。pull しない経路 (--skip-pull・dry-run) と、JSON に
-# execution_id が無い plan.sh (E2 より前) では空 = 名乗らない (E3 は名乗りなしを拒否しない。execution.md §5.2 / §5.4)。
+# execution_id が無い plan.sh (E2 より前) では空 = 名乗らない (試行なしの card は名乗りなしで通る。実行中の試行には E5 PR-2 から
+# EXECUTION_REQUIRED で拒否される。execution.md §5.2 / §5.4 / §20.3)。
 EXEC_ARGS=()
 
 call_needs_director() {
@@ -202,7 +203,8 @@ call_needs_director() {
     _info "[DRY-RUN] would call: plan.sh needs-director ${TASK_ID} ${MISSION_SLUG:+--mission ${MISSION_SLUG} }${1}"
     return 0
   fi
-  "$PLAN_SH" needs-director "$TASK_ID" ${MISSION_SLUG:+--mission "$MISSION_SLUG"} ${EXEC_ARGS[@]+"${EXEC_ARGS[@]}"} "$1"
+  "$PLAN_SH" needs-director "$TASK_ID" ${MISSION_SLUG:+--mission "$MISSION_SLUG"} ${EXEC_ARGS[@]+"${EXEC_ARGS[@]}"} "$1" \
+    || { _rc=$?; report_refused_hint needs-director "$_rc"; exit "$_rc"; }
 }
 
 # call_needs_director_file: 理由が長い (findings の全文を残す) 経路。plan.sh needs-director は位置引数の理由と
@@ -212,13 +214,53 @@ call_needs_director_file() {
     _info "[DRY-RUN] would call: plan.sh needs-director ${TASK_ID} ${MISSION_SLUG:+--mission ${MISSION_SLUG} }--result-file <file>"
     return 0
   fi
-  "$PLAN_SH" needs-director "$TASK_ID" ${MISSION_SLUG:+--mission "$MISSION_SLUG"} ${EXEC_ARGS[@]+"${EXEC_ARGS[@]}"} --result-file "$1"
+  "$PLAN_SH" needs-director "$TASK_ID" ${MISSION_SLUG:+--mission "$MISSION_SLUG"} ${EXEC_ARGS[@]+"${EXEC_ARGS[@]}"} --result-file "$1" \
+    || { _rc=$?; report_refused_hint needs-director "$_rc"; exit "$_rc"; }
 }
 
 fail_needs_director() {
   _error "$1"
   call_needs_director "$1"
   exit 1
+}
+
+# read_card_execution_id: card の今の試行の ID を**1 回だけ**読んで標準出力に出す (読めなければ空)。active
+# (reserved / running) で、card の worker が自分のときだけ。--skip-pull の名乗りと、pull の JSON が読めなかったときの
+# 名乗り (E5 PR-2: 名乗りなしの done / needs-director は EXECUTION_REQUIRED で拒否されるので、読めるなら読む) が使う。
+read_card_execution_id() {
+  python3 - "${CREWVIA_QUEUE:-${CREWVIA_REPO_ROOT:-$REPO_ROOT}/queue}" "$MISSION_SLUG" "$TASK_ID" "$SCRIPT_DIR" "$AGENT" 2>/dev/null <<'PYEOF' || true
+import glob, os, re, sys
+queue, slug, tid, scripts, agent = sys.argv[1:6]
+sys.path.insert(0, scripts)
+import lib_task_cards as cards
+pattern = os.path.join(queue, 'missions', slug or '*', 'tasks', tid + '.md')
+paths = glob.glob(pattern)
+if len(paths) != 1:
+    sys.exit(0)
+meta, _body = cards.read_task_card(paths[0], tid)
+if cards.is_unreadable(meta) or not isinstance(meta, dict):
+    sys.exit(0)
+# card の持ち主が別の Worker なら、その試行は自分のものではない (置き換えの試行を名乗らない)
+holder = meta.get('worker')
+if isinstance(holder, str) and holder and holder != agent:
+    sys.exit(0)
+xid = meta.get('current_execution_id')
+if isinstance(xid, str) and re.fullmatch(r'ex-[0-9a-f]{32}', xid) and meta.get('execution_status') in ('reserved', 'running'):
+    print(xid)
+PYEOF
+}
+
+# report_refused_hint: done / needs-director が拒否された (exit 3 = 名乗りの照合の拒否) ときの後始末の案内。
+# 拒否は何も書かないが、task の今の状態は error_code ごとに違う (別の試行が既に進行中 / 既に終わっている、など) ので、
+# in_progress と断定せず、reset も勧めない。まず status で確かめてから Director が回復の要否を判断する。Result の全文は消さずに残す。
+report_refused_hint() {
+  _error "plan.sh ${1} が拒否されました (exit ${2})。task ${TASK_ID} の今の状態を"\
+" \`plan.sh status${MISSION_SLUG:+ --mission ${MISSION_SLUG}}\` で確かめてから、回復が要るかを判断してください"\
+" (別の試行が進行中・既に終わっている場合があります)"
+  if [[ -n "$RESULT_FILE" && -f "$RESULT_FILE" ]]; then
+    _error "review の Result の全文は ${RESULT_FILE} に残しました"
+    RESULT_FILE=""      # cleanup で消さない
+  fi
 }
 
 # --- 一時リソースの後始末 (F1b/F2/F3, PR#180) ---
@@ -283,7 +325,7 @@ if [[ $SKIP_PULL -eq 0 && $DRY_RUN -eq 0 ]]; then
   fi
   # plan.sh pull は結果を stdout に JSON で吐く。**捨てない**: `execution_id` を取り出して done / needs-director に
   # `--execution` で渡す (今の試行を名乗る。違う試行なら plan.sh が拒否する。execution.md §5.4)。JSON が読めない・欄が
-  # 無い (E2 より前の plan.sh) ときは名乗らない。失敗時は stderr が見える方が良いので tee はしない。
+  # 無い (E2 より前の plan.sh) ときは名乗れないので止まる (下)。失敗時は stderr が見える方が良いので tee はしない。
   # (task がまだ in_progress に遷移できていない = needs-director を打っても plan.sh 側で
   #  弾かれる可能性が高いため、ここは元のまま plain exit とする)
   if ! PULL_JSON="$("$PLAN_SH" "${PULL_ARGS[@]}")"; then
@@ -296,13 +338,16 @@ try:
 except Exception:
     v = None
 print(v if isinstance(v, str) else "")' 2>/dev/null || true)"
-  if [[ -n "$PULL_EXECUTION_ID" ]]; then
-    EXEC_ARGS=(--execution "$PULL_EXECUTION_ID")
-  else
-    # 名乗りなしへ切り替わる。E3 は名乗りなしを拒否しないので動作は変わらないが、E5 の観察で「名乗れなかった実行」を
-    # 数えられるよう 1 行残す (固定の文言。pull の JSON の中身は出さない。execution.md §16.9)。
-    _warn "plan.sh pull の出力から execution_id を読めませんでした — done / needs-director を名乗りなしで報告します (task ${TASK_ID})"
+  if [[ -z "$PULL_EXECUTION_ID" ]]; then
+    # 自分の pull の JSON から ID を読めなかった。**card から取り直さない** (execution.md §20.7 / §20.10 の Codex P1):
+    # pull のロックを放した後に Director が reset → 別の Kai-codex が再 pull すると、worker 名は同じなので card の
+    # current_execution_id は置き換えの試行の ID になり、それを名乗ると古いこのプロセスが置き換えの試行を done / fail
+    # できてしまう。codex も起動せず、done / needs-director も打たずに止まる (固定の文言。pull の JSON の中身は出さない)。
+    # card は in_progress のまま残り、Director が status を見て代理で報告するか `update --status pending --reset` で開ける。
+    _error "plan.sh pull の出力から execution_id を読めませんでした — task ${TASK_ID} は何も報告せずに止まります。in_progress のまま残るので Director が回復してください"
+    exit 1
   fi
+  EXEC_ARGS=(--execution "$PULL_EXECUTION_ID")
 elif [[ $DRY_RUN -eq 1 ]]; then
   _info "DRY_RUN=1: skipping plan.sh pull (no writes to plan.sh in dry-run mode)"
 else
@@ -313,27 +358,7 @@ else
   # (置き換えの試行を名乗って通ることは無い。execution.md §20.4 の P1)。
   SKIP_EXECUTION_ID="$EXPLICIT_EXECUTION_ID"
   if [[ $EXECUTION_FLAG_GIVEN -eq 0 ]]; then
-    SKIP_EXECUTION_ID="$(python3 - "${CREWVIA_QUEUE:-${CREWVIA_REPO_ROOT:-$REPO_ROOT}/queue}" "$MISSION_SLUG" "$TASK_ID" "$SCRIPT_DIR" "$AGENT" 2>/dev/null <<'PYEOF' || true
-import glob, os, re, sys
-queue, slug, tid, scripts, agent = sys.argv[1:6]
-sys.path.insert(0, scripts)
-import lib_task_cards as cards
-pattern = os.path.join(queue, 'missions', slug or '*', 'tasks', tid + '.md')
-paths = glob.glob(pattern)
-if len(paths) != 1:
-    sys.exit(0)
-meta, _body = cards.read_task_card(paths[0], tid)
-if cards.is_unreadable(meta) or not isinstance(meta, dict):
-    sys.exit(0)
-# card の持ち主が別の Worker なら、その試行は自分のものではない (置き換えの試行を名乗らない)
-holder = meta.get('worker')
-if isinstance(holder, str) and holder and holder != agent:
-    sys.exit(0)
-xid = meta.get('current_execution_id')
-if isinstance(xid, str) and re.fullmatch(r'ex-[0-9a-f]{32}', xid) and meta.get('execution_status') in ('reserved', 'running'):
-    print(xid)
-PYEOF
-)"
+    SKIP_EXECUTION_ID="$(read_card_execution_id)"
   fi
   if [[ -n "$SKIP_EXECUTION_ID" ]]; then
     EXEC_ARGS=(--execution "$SKIP_EXECUTION_ID")
@@ -853,7 +878,8 @@ elif [[ $NEEDS_FIX -eq 1 ]]; then
   call_needs_director_file "$RESULT_FILE"
 else
   _info "Review passed (structured signal confirmed safe: no P0-P2 findings)"
-  "$PLAN_SH" done "$TASK_ID" ${MISSION_SLUG:+--mission "$MISSION_SLUG"} ${EXEC_ARGS[@]+"${EXEC_ARGS[@]}"} --result-file "$RESULT_FILE"
+  "$PLAN_SH" done "$TASK_ID" ${MISSION_SLUG:+--mission "$MISSION_SLUG"} ${EXEC_ARGS[@]+"${EXEC_ARGS[@]}"} --result-file "$RESULT_FILE" \
+    || { _rc=$?; report_refused_hint done "$_rc"; exit "$_rc"; }
 fi
 
 _info "Review complete."

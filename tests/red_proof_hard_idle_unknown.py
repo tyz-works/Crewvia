@@ -4,7 +4,8 @@
 欠陥を注入した版に**同じテスト**を走らせる。ファイルは in-place で書き換えて必ず元に戻す
 (finally)。置換元がちょうど 1 回でなければ BROKEN (注入点が消えている = 失効)。
 赤と数えるのは `FAILED <テスト名>` が出たときだけ (collection error は数えない)。
-実行: env -u AGENT_NAME python3 tests/red_proof_hard_idle_unknown.py   (約 2 分)
+実行: env -u AGENT_NAME python3 tests/red_proof_hard_idle_unknown.py   (全部だと網羅テストが長く数時間。
+RED_PROOF_ONLY=<変異名の一部> RED_PROOF_K=<pytest -k の式> で 1 つずつ回す)
 """
 import os
 import subprocess
@@ -34,8 +35,8 @@ MUTATIONS = [
      '                queue.append((child, "unknown"))\n            continue',
      '            return "unknown"',
      ["test_a_job_wins_over_an_unreadable_node_in_either_order"]),
-    ("通知がしきい値で出ない", WD, '    if lasted < threshold:\n        return SuppressionPlan(forget=mine)',
-     '    if True:\n        return SuppressionPlan(forget=mine)', ["test_a_suppressed_hard_idle_notifies_the_director_once_after_the_threshold"]),
+    ("通知がしきい値で出ない", WD, '    if lasted < threshold:\n        return SuppressionPlan(forget=mine + stale)',
+     '    if True:\n        return SuppressionPlan(forget=mine + stale)', ["test_a_suppressed_hard_idle_notifies_the_director_once_after_the_threshold"]),
     ("fp が Execution ID を見ない", WD, '        if self.execution_id:\n            ident = self.execution_id',
      '        if False:\n            ident = self.execution_id', ["test_the_fingerprint_is_the_execution_id_with_a_started_at_fallback"]),
     ("解けても台帳キーを消さない", WD,
@@ -59,7 +60,7 @@ MUTATIONS = [
      [("test_every_sequence_up_to_length_5_keeps_the_invariants", "I1"),
       "test_the_two_sequences_codex_found_are_covered_by_the_model"]),
     ("閉じた episode の古いキーを次の episode の前に消さない", WD,
-     'unsettled=agent in self._unsettled)', 'unsettled=False)',
+     'unsettled=agent in self._unsettled,', 'unsettled=False,',
      ["test_a_pending_deletion_is_done_before_the_suppressed_branch_decides_to_notify",
       ("test_every_sequence_over_a_reduced_alphabet_keeps_the_invariants", "I2")]),
     ("【5 巡目 t017】通知する plan で _unsettled を解かない (連投)", WD,
@@ -67,8 +68,29 @@ MUTATIONS = [
      '        if False:\n            # 通知する plan の forget には',
      [("test_a_deletion_that_recovers_after_a_relapse_does_not_renotify_every_cycle", "I1")]),
     ("古い試行 (別 Execution ID) のキーを消さない", WD,
-     '            and not str(v).startswith(f"{ident}:"))', '            and False)',
-     [("test_every_sequence_up_to_length_5_keeps_the_invariants", "I4")]),
+     '            and (not str(v).startswith(f"{ident}:") or (k in expected and v != expected[k])))',
+     '            and False)',
+     [("test_every_sequence_up_to_length_5_keeps_the_invariants", ("I4", "I6"))]),
+    # --- §11-15 (t019): fp に無音区間の起点を足す ---
+    ("【11-15 t019】fp に起点を足さない", WD,
+     '    return f"{ident}:{kind}" if origin is None else f"{ident}:{kind}@{origin}"',
+     '    return f"{ident}:{kind}"',
+     [("test_every_sequence_over_a_reduced_alphabet_keeps_the_invariants", "I2"),
+      "test_named_sequences_notify_exactly_as_designed[restart-after-failed-cleanup-keeps-notifying]"]),
+    ("【t012】起点の比較を一方向に戻す (記録の起点以上なら黙る)", WD,
+     '    if told is not None and live.get(key) == fp:',
+     '    if told is not None and key in live and str(live[key]).startswith(f"{ident}:{kind}@") '
+     'and int(str(live[key]).rpartition("@")[2]) >= (origin or 0):',
+     ["test_named_sequences_notify_exactly_as_designed[signal-lost-once]"]),
+    ("【t019 決定 1】別の理由のキーを起点が動いても消さない", WD,
+     '            and (not str(v).startswith(f"{ident}:") or (k in expected and v != expected[k])))',
+     '            and not str(v).startswith(f"{ident}:"))',
+     ["test_a_reason_switch_with_the_signal_lost_and_restored_does_not_silence_the_new_interval",
+      ("test_every_sequence_over_a_reduced_alphabet_keeps_the_invariants", ("I2", "I6"))]),
+    ("【t019】起点に毎サイクル変わる値を使う", WD,
+     '        return int(self.idle_since) if self.idle_since is not None else None',
+     '        return int(time.time() * 1000) if self.idle_since is not None else None',
+     ["test_the_fingerprint_carries_the_origin_and_a_changed_origin_notifies"]),
     ("台帳の掃除の例外を外に出す", WD,
      '            except Exception as e:\n                _log(f"hard-idle 通知台帳の掃除に失敗 ({key}): {e}")',
      '            except KeyboardInterrupt as e:\n                _log(f"hard-idle 通知台帳の掃除に失敗 ({key}): {e}")',
@@ -92,7 +114,11 @@ def main() -> int:
     bad = 0
     env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1", COLUMNS="400")  # FAILED 行が端末幅で切れると理由の印が消える
     env.pop("AGENT_NAME", None)
+    only = os.environ.get("RED_PROOF_ONLY")        # 変異名の部分文字列で絞る (網羅テストが長いので 1 つずつ回せるように)
+    extra = ["-k", os.environ["RED_PROOF_K"]] if os.environ.get("RED_PROOF_K") else []
     for name, path, old, new, targets in MUTATIONS:
+        if only and only not in name:
+            continue
         original = path.read_text()
         if original.count(old) != 1:
             print(f"BROKEN  {name}: 注入点が {original.count(old)} 回 (失効)")
@@ -101,7 +127,7 @@ def main() -> int:
         try:
             path.write_text(original.replace(old, new))
             out = subprocess.run(
-                [sys.executable, "-m", "pytest", *TESTS, "-q", "-p", "no:cacheprovider"],
+                [sys.executable, "-m", "pytest", *TESTS, "-q", "-p", "no:cacheprovider", *extra],
                 cwd=ROOT, env=env, capture_output=True, text=True, timeout=900).stdout
         finally:
             path.write_text(original)

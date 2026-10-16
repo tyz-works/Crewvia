@@ -114,6 +114,26 @@ lib ごとの**破ってはいけない契約**の要約。理由・経緯・全
 - `plan.sh update <id> --close-execution` は Director 用の「閉じる手段」: DETACHED で active な試行（E2 の間に終わった task に残った running 等）を task に触れず `ABANDONED_OUTSIDE_CONTROLLER` で閉じる。
 - 戻し方（E3）: PR revert → sync。**revert 先でも `--execution` が通る互換（commit `e3-execution-flag-compat`・別 PR）を先に merge しておく**（起動済みの Worker・走っている kai-review.sh が付け続ける）。`knowledge/execution.md` §16.4。
 - **退役は試行の ID だけで束縛する（E4a で ID を書き始め、E4b で世代を外した）**: `plan.sh retire` は `--execution <ex-…>` 必須（世代 `--started-at` は未知のオプション・空の `--execution ""` は exit 1）。退役 marker / progress の `task_execution_id`（`lib_retirement.read_task_execution_id` が ACTIVE / TERMINAL の試行だけ束縛・legacy / DETACHED は None）が後始末の唯一の証拠で、**ID が無い・`ex-<32hex>` でない・旧形式（`task_started_at` だけ）の marker は kill の前なら `phase=unprovable`、後なら `_cleanup_deferred` で Director へ保留**（世代で後始末しない・queue は何も書かない）。枠の照合（`classify_assignment` / `assignment_execution_verdict`）は identity の `execution_id` だけ: ID の無い identity は「この試行のもの」と言えない（撤去しない）。`identity.started_at` は projection として書き続けるが**比べない**。世代の読み口を戻さない構造ガード: `tests/test_execution_e4b_no_generation_readers.py`・赤の実証 `python3 tests/red_proof_e4b_generation.py`（`knowledge/execution.md` §18）。
+## 試行の台帳（`lib_history.py` + `Txn.write_history` + `_finish`。vNext 02 PR-D / t019。設計 `knowledge/vnext-02-attempt-reopen-checkpoint.md` §3.2）
+
+- `queue/missions/<m>/history/tNNN/<seq4>-<kind>-<execution_id>.md`。**1 遷移 = 1 ファイル・上書きも追記もしない**。kind は `end` / `reset` / `retire`
+  （`retry` / `reopen` は PR-E・F。名前の形は今から受け付ける）。書くのは **Controller の `_finish` の PROCEED の 1 か所**（`_record_ledger`）で、
+  card の書き込みの直前（台帳 → card。card がコミット点）。plan.sh・Controller は直に `open()` せず `Txn.write_history`（既存があれば `AlreadyExists`）。
+  試行の無い card（TASK_ONLY）の遷移・`reserve` の手順 0 の abandon は台帳を書かない（`execution_id` が名前に要る）。
+- **帰属は card の `result_execution_id`**。`result_replaced=True` で呼ばれた `complete_execution` / `fail_execution`（plan.sh の done / fail。`## Result` 節を実際に
+  組み直す呼び出し）だけが更新する。`new_body` の有無から推測しない（verify-result は節を足すだけ）。needs-director は Result 節を置き換えないので渡さない。
+  台帳の本文に Result を入れるのは帰属 == 閉じる試行のときだけ（`result: recorded`）。欄が無い card は `result: unattributed`、別の試行のものは `none`。
+  Result 節の切り出しは `lib_history.result_section`（plan.sh の `parse_task_body` と同じ読み方。一致は `tests/test_history_ledger_plan_sh.py`）。
+- **再送の冪等**: 同定キー (`execution_id`, `kind`, `reopen_count`)。既存を見つけたら `seq4` と `ended_at` を再利用し、card・record の `ended_at` にも同じ値を渡す。
+  比べる欄は `ended_at` 以外全部（`actor` / `worker` / `head` / `pr_number` / 本文を含む）。違えば `HISTORY_MISMATCH`、同じキーが 2 つ以上なら `HISTORY_AMBIGUOUS`
+  （どちらも exit 3・card を書かない・欄の名前だけ・拒否の行は監査ログ）。出口は「同じ報告を送り直す」だけ（孤児を差し替える手段は無い。§8）。
+- 台帳が読めない・書けないと遷移は止まる（`STATE_INVALID` / `StoreWriteError` → exit 1）。**retire だけは閉じる**（食い違いでも。警告 + 監査の `detail=history_unwritten`。
+  「退役が止まると誰も窓を閉じない」`knowledge/daemon-authority.md` §5）。done の D1 / D2（pr_number の伝播）は D3 より前に書くため、D3 で台帳の食い違いに当たっても
+  それらは残る（同じ値の再書き込みなので再送で収束する。dry_run は最終の Result を知らないので台帳の食い違いまでは見ない）。
+- 読み口: `plan.sh history <id> [--mission]`（読み取り専用・壊れたファイルは飛ばさず exit 1）・`pull` の JSON の `previous_attempt`（今の試行以外の最後の台帳の要約。台帳が読めないときは
+  欄を省いて stderr に固定コードを出すだけで pull は止めない）・`store-check`（`history_orphan` / `history_duplicate_key` / `history_unobservable` / `history_without_card`。**報告だけ**）。
+- 戻し方: PR revert → `scripts/sync-main-checkout.sh`。`history/` と card の `result_execution_id` は残ってよい（旧コードは読まない・無視する）。
+
 ## Git Policy（`lib_git_policy.py`。01b G2 / t008 で作成、G3 / t012 で呼び出し元を移した）
 
 - task の branch・worktree path・base・PR base を決める唯一の場所（`knowledge/git-policy.md` §2・§3）。**判断だけ**で

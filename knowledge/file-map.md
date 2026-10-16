@@ -531,6 +531,18 @@ tag は警告して飛ばす）。t017 / PR5a
 S5 / t020）。初期化（`workers: []`）は無く、無いファイルは `parse()` が「Worker がいない」と読み、最初の `write()` が
 ロックの中で dir ごと作る（`assign-name.sh` がロックの外で作っていた穴を塞いだ）。`knowledge/state-store.md` §5.3・§6.1
 
+### `lib_history.py`
+
+試行の台帳 `queue/missions/<m>/history/tNNN/<seq4>-<kind>-<execution_id>.md` の**形と比べ方**（純粋。I/O は `lib_state_store` の
+`list_history` / `read_history` / `Txn.write_history`）。vNext 02 PR-D（設計 `knowledge/vnext-02-attempt-reopen-checkpoint.md` §3.2）。
+**1 遷移 = 1 ファイル、上書きも追記もしない**。書くのは Controller の `_finish` の 1 か所（card の書き込みの**直前**。台帳 → card の順）、
+読むのは `plan.sh history <id>`・`pull` の `previous_attempt`・`store-check`。同定キーは (`execution_id`, `kind`, `reopen_count`)。
+再送は既存ファイルを見つけて `seq4` と `ended_at` を再利用し（card・record にも同じ `ended_at`）、比べる欄（`ended_at` 以外全部）が
+違えば `HISTORY_MISMATCH`（exit 3・card を書かない・欄の名前だけ）、同じキーが 2 つ以上なら `HISTORY_AMBIGUOUS`。
+Result は card の `result_execution_id` == 閉じる試行のときだけ本文に入れる（帰属は `result_replaced=True` で呼ばれた done / fail だけが更新）。
+台帳が書けないと遷移は止まる（exit 1）が、**retire だけは閉じる**（監査ログの `detail=history_unwritten`）。戻し方: PR revert
+（台帳・`result_execution_id` は残ってよい。旧コードは読まない）。
+
 ### `lib_mux.sh`
 
 bash 向け薄いラッパー（mux_spawn / mux_send 等）
@@ -559,6 +571,7 @@ active mission slug + default_mission
 
 - mission.yaml      title / status / next_task_id
 - tasks/tNNN.md     frontmatter + Description / Result
+- history/tNNN/     試行の台帳（`lib_history.py`。1 遷移 1 ファイル。mission の退避で一緒に動く）
 
 ### `archive/`
 

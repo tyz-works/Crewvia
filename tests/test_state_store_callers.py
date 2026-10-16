@@ -26,9 +26,11 @@ NAME = "lib_state_store"
 #: S3: plan.sh (queue の書き手)。S5: lib_registry.py (registry/workers.yaml)・taskvia-sync.sh (queue/.taskvia-map.json)。
 #: 01c E1: lib_task_controller.py (試行の予約・終了。`Txn` を受けて書く lib で、それ自身の呼び出し元はゼロ —
 #: `tests/test_task_controller_has_no_callers_yet.py` が固定する。本番の queue を書く経路はまだ増えていない)。
+#: vNext 02 PR-D: lib_history.py (試行の台帳の形・読み口・store-check の報告。**書き込みは持たない** — 書く入口は
+#: `Txn.write_history` で、呼ぶのは Controller の `_finish` の 1 か所)。
 #: ここに足すのは cutover (= ユーザー承認が要る PR) だけ。
 ALLOWED_CALLERS = {"scripts/lib_state_store.py", "scripts/plan.sh", "scripts/lib_registry.py",
-                   "scripts/taskvia-sync.sh", "scripts/lib_task_controller.py"}
+                   "scripts/taskvia-sync.sh", "scripts/lib_task_controller.py", "scripts/lib_history.py"}
 
 #: 走査する場所。**ディレクトリごと**で列挙しない (新しい書き手が増えても自動で対象になる)。
 SCAN_DIRS = ("scripts", "hooks", "agents", "config")

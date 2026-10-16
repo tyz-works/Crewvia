@@ -128,6 +128,18 @@ root の `CLAUDE.md` から移した、テスト専用の規則。設計と経�
   E3 で報告の 6 コマンドと `--close-execution` を足した。E4 で広げるのは cutover = ユーザー承認の PR）。
 - **長い反復は `timeout` を付け、最初は 2 回で形を確かめてから 20 回**（crash 注入は全体で約 3 分。background で待たない）。
 
+## 試行の台帳（vNext 02 PR-D / t019）のテスト
+
+- `tests/test_history_ledger_controller.py`（lib の API だけ。helper は `task_controller_helpers.py`）: 帰属（`result_replaced` を渡した操作だけが `result_execution_id` を動かす・
+  節を足すだけの呼び出しでは動かない）・kind（end / reset / retire）・再送の冪等（card の書き込みだけを失敗させて孤児を作る → 同じ報告で新ファイルが増えず `ended_at` が台帳・record で一致）・
+  `HISTORY_MISMATCH` / `HISTORY_AMBIGUOUS`・台帳が書けないとき（0o500 の dir。root では skip）・retire だけ閉じる・**書き込みの全点で SIGKILL → 再送で収束**（孤児の点を通ったことも assert）。
+- `tests/test_history_ledger_plan_sh.py`（`pull_execution_helpers.Box`）: done / fail / needs-director と `--result-file`・`plan.sh history`・`pull` の `previous_attempt`・`store-check` の報告・
+  `plan.sh archive` で `history/` が動く・`lib_history.result_section` が plan.sh の `parse_task_body` と一致。
+- 互換 golden（`test_plan_sh_compat_s3.py`）は PR-D が足した出力（`previous_attempt`・`history/`・card の `result_execution_id`）を**取り除いて**比べる。
+- 赤の実証（手で注入して狙ったテストが落ちること）: 帰属を `new_body` の有無で決める / Result を帰属に関係なく台帳へ入れる / 既存の台帳を無視する / `ended_at` を再利用しない /
+  本文の比較を外す / 台帳を card の後に書く / retire の例外を外す / 例外を全操作に広げる。
+  **新しい `plan.sh` のサブコマンドを足したら** `test_registry_isolation.py` の `ISOLATED_INVOCATIONS` も足す（`history` は足した）。
+
 ## 報告の 6 コマンドの Controller 化（01c E3 / t012）のテスト
 
 - `tests/test_execution_e3_caller_table.py`（helper は `tests/execution_e3_helpers.py`。`pull_execution_helpers.Box` の上）: 呼び出し元ごとの表（`knowledge/execution.md` §5.2）を**報告コマンド × 名乗りの形**で 1 行ずつ。

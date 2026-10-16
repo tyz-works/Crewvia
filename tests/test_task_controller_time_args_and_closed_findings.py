@@ -42,9 +42,9 @@ _COVERED = {
     "reserve_task": {"txn", "slug", "tid", "agent", "now", "id_factory", "foreign_slot_checked"},
     "start_execution": {"txn", "slug", "tid", "execution_id", "git_context", "now"},
     "complete_execution": {"txn", "slug", "tid", "caller", "to_status", "meta_updates", "meta_remove", "body", "now",
-                           "dry_run"},
+                           "dry_run", "result_replaced"},     # result_replaced: vNext 02 PR-D (帰属。test_history_ledger_controller.py)
     "fail_execution": {"txn", "slug", "tid", "caller", "failure_code", "to_status", "meta_updates", "meta_remove", "body",
-                       "now", "dry_run"},
+                       "now", "dry_run", "result_replaced"},
     "release_execution": {"txn", "slug", "tid", "caller", "reason_code", "to_status", "now", "meta_updates", "body"},
     "reset_task": {"txn", "slug", "tid", "caller", "now", "meta_updates"},
     "abandon_detached_execution": {"txn", "slug", "tid", "now"},

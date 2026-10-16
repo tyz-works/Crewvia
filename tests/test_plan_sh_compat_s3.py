@@ -38,8 +38,12 @@ REPO = HERE.parent
 #   2. card の frontmatter に試行の欄 (`lib_execution.EXECUTION_FIELDS`。`task_slug` を含む)
 #   3. `queue/missions/<slug>/executions/` (record と準備ロック)
 #   4. `<agent>.identity` の `execution_id`
-E2_JSON_KEYS = ("execution_id", "attempt")
-_FIELD_LINE = re.compile(r"^(?:%s): .*\n" % "|".join(map(re.escape, _ex.EXECUTION_FIELDS)), re.MULTILINE)
+#   (vNext 02 PR-D が足したもの。足すだけ) 5. pull の stdout の JSON に `previous_attempt` (前の試行の台帳がある pull だけ)
+#   6. `queue/missions/<slug>/history/` (試行の台帳。Controller を通った遷移ごとに 1 ファイル)
+E2_JSON_KEYS = ("execution_id", "attempt", "previous_attempt")
+#   7. card の frontmatter に `result_execution_id` (PR-D: Result 節を置き換えた試行。done / fail が足す)
+_FIELD_LINE = re.compile(r"^(?:%s): .*\n" % "|".join(map(re.escape, (*_ex.EXECUTION_FIELDS, "result_execution_id"))),
+                         re.MULTILINE)
 
 
 def _strip_json_line(text):
@@ -67,7 +71,7 @@ _VERIFICATION_EXECUTION_LINE = re.compile(r"^\*\*Execution:\*\* \S+\n", re.M)
 def _strip_queue(files):
     out = {}
     for name, text in files.items():
-        if "/executions/" in name:
+        if "/executions/" in name or "/history/" in name:
             continue
         if name.endswith(".identity"):
             data = json.loads(text)

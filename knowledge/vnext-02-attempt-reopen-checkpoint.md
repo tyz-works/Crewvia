@@ -248,6 +248,9 @@ Codex の往復は 3 巡で打ち切った (PR #301 の t002)。以下は実装 
   - 直し方の方向（未決）: (a) `skipped` も経路上なら無効化の対象にする。(b) 経路上に `skipped` の task がある reopen を拒否する。Director の推奨は (b) 拒否（`skipped` は Director が意図して飛ばした task なので、勝手に開けない）。
   - 解く PR: F。網羅テストに入れるケース: I → A(`skipped`) → R(`done`)、`skipped` が経路の途中・末端・複数本の経路の片方にある形、`--cascade none|reviews|all` それぞれ、拒否の場合は何も書かれない（`reopen_count` も増えない）こと。
 - **Result の帰属を `new_body` の有無で判定すると、古い Result が現在の試行に再帰属される**（Codex 3 巡目 P2。実装 PR D）。
+  - **PR-D（t019）で解いた**: `result_replaced` を Controller の明示の引数にし（plan.sh の done / fail だけが渡す）、`verify-result` は渡さない。needs-director は `## Result` 節を置き換えない
+    （理由は frontmatter と `## Needs-Director 詳細`）ので渡さない — 設計の「done / fail / needs-director の --result-file」のうち、実際に Result 節を組み直すのは done / fail だけ。
+    網羅テスト: `tests/test_history_ledger_controller.py` / `tests/test_history_ledger_plan_sh.py`。以下は解く前の記述。
   - 漏れている状態: `verify-result` は既存の本文に Verification 節を足した `body_new` を渡す。帰属を「`new_body` があるか」で決めると、Result 節を置き換えていないこの呼び出しでも、既存の（古い）Result が現在の試行のものとして台帳に書かれる。
   - 起きる害: 台帳の Result と試行（`execution_id`）の対応が崩れ、前の試行の Result が今の試行の結果として `previous_attempt` や監査に出る。
   - 直し方の方向（未決）: 帰属を更新するのは Result 節を実際に置き換えた呼び出し（`done` / `fail` / `needs-director` の `--result-file`）だけ、と明示の引数で指定する（`new_body` の有無から推測しない）。

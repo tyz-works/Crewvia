@@ -53,6 +53,7 @@ if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
 import lib_execution as ex  # noqa: E402
+import lib_history as hist  # noqa: E402
 import lib_state_store as store  # noqa: E402
 import lib_task_status as _status  # noqa: E402
 
@@ -82,6 +83,14 @@ _REPORT_OPERATIONS = frozenset({_C_DONE, _C_FAIL, _C_NEEDS_DIRECTOR, _OP_VERIFY_
 SOURCES = ('flag', 'none')
 
 GIT_KEYS = ('branch', 'base', 'pr_base', 'worktree', 'head_at_start')
+
+#: card の欄: `## Result` 節を最後に置き換えた試行の ID (台帳の帰属。設計 §3.2)。**Controller だけが書く**
+#: (`_FORBIDDEN_UPDATE_KEYS`)。更新するのは `result_replaced=True` で呼ばれた操作 (plan.sh が Result 節を実際に組み直した
+#: done / fail) だけ。`new_body` の有無から推測しない (verify-result は既存の本文に Verification 節を足すだけ。§8)。
+RESULT_ATTRIBUTION_FIELD = 'result_execution_id'
+
+#: end_code → 台帳の kind (この PR では end / reset / retire。retry / reopen は PR-E・F)。無ければ `end`。
+_HISTORY_KIND_BY_END_CODE = {ex.RESET_BY_DIRECTOR: 'reset', ex.RETIRED: 'retire'}
 
 
 # ---------------------------------------------------------------------------
@@ -269,7 +278,8 @@ def _check_git_context(git_context):
     return dict(git_context)
 
 
-_FORBIDDEN_UPDATE_KEYS = frozenset({'id', 'status', 'worker', 'started_at'} | set(ex.EXECUTION_FIELDS))
+_FORBIDDEN_UPDATE_KEYS = frozenset({'id', 'status', 'worker', 'started_at', RESULT_ATTRIBUTION_FIELD}
+                                   | set(ex.EXECUTION_FIELDS))
 
 
 def _check_updates(meta_updates, meta_remove=()):
@@ -323,6 +333,115 @@ def _execution_of(txn, slug, tid, meta, *, idempotent=False):
     else:
         record = ex.record_from_card(meta, slug, tid)
     return Execution.from_record(record, idempotent=idempotent)
+
+
+# ---------------------------------------------------------------------------
+# 台帳 (history。設計 §3.2。書く場所は `_finish` の 1 か所)
+# ---------------------------------------------------------------------------
+
+class _LedgerProblem(Exception):
+    """台帳を読めない / 書けない / 食い違う。`code` は ControllerError のコード。`fields` は食い違う欄の名前だけ。"""
+
+    def __init__(self, code, message, fields=()):
+        super().__init__(code)
+        self.code = code
+        self.message = message
+        self.fields = tuple(fields)
+
+
+def _reopen_count(meta):
+    value = meta.get('reopen_count', 0)
+    if value is None:
+        return 0
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise _LedgerProblem(ex.STATE_INVALID, "card の reopen_count が壊れています")
+    return value
+
+
+def _result_for_ledger(out, xid, body_out):
+    """`(result の状態, Result 全文)`。Result を入れるのは `result_execution_id` == 閉じる試行のときだけ (§3.2)。"""
+    if RESULT_ATTRIBUTION_FIELD not in out:
+        return hist.RESULT_UNATTRIBUTED, ''                  # 帰属が分からない (この設計より前の card)
+    if out.get(RESULT_ATTRIBUTION_FIELD) == xid:
+        text = hist.result_section(body_out)
+        return (hist.RESULT_RECORDED, text) if text else (hist.RESULT_NONE, '')
+    return hist.RESULT_NONE, ''                              # 別の試行の Result。この試行の履歴には入れない
+
+
+def _ledger_actor(txn):
+    token = store._safe_token(txn.actor)
+    return None if token in (None, 'unknown') else token
+
+
+def _resolve_ledger(txn, slug, tid, meta, out, body_out, *, end_code, ended_at):
+    """台帳に書くべきこと。`(action, name, ended_at, text)`: action は `write` (新しいファイルを足す) / `reuse` (同じ遷移の
+    ファイルが既にあり中身も同じ。何も書かず、その `ended_at` を使う)。何も書かない。食い違い・読めないは `_LedgerProblem`。"""
+    xid = meta['current_execution_id']
+    kind = _HISTORY_KIND_BY_END_CODE.get(end_code, 'end')
+    reopen = _reopen_count(meta)
+    state, result_text = _result_for_ledger(out, xid, body_out)
+    fields, body = hist.build_event(
+        kind=kind, execution_id=xid, attempt=meta['execution_count'], ended_at=ended_at, end_code=end_code,
+        reopen_count=reopen, head=out.get('fail_head'), pr_number=out.get('pr_number'), worker=meta.get('worker'),
+        actor=_ledger_actor(txn), result_state=state, result_text=result_text)
+    listed = txn.list_history(slug, tid)
+    if listed[0] != 'ok':
+        raise _LedgerProblem(ex.STATE_INVALID, f"{slug}/{tid}: 台帳を列挙できません ({listed[1]})")
+    names = listed[1]
+    found = []
+    for name in hist.candidates(names, kind, xid):
+        got = txn.read_history(slug, tid, name)
+        if got[0] != 'ok':
+            raise _LedgerProblem(ex.STATE_INVALID, f"{slug}/{tid}: 台帳 {name} を読めません ({got[0]})")
+        try:
+            old_fields, old_body = hist.parse(got[1], source=name)
+        except hist.HistoryError as e:
+            raise _LedgerProblem(ex.STATE_INVALID, f"{slug}/{tid}: 台帳 {name} が壊れています ({e.code})") from None
+        if hist.reopen_count_of(old_fields) == reopen:       # 同定キー (execution_id, kind, reopen_count)
+            found.append((name, old_fields, old_body))
+    if len(found) > 1:
+        raise _LedgerProblem(ex.HISTORY_AMBIGUOUS,
+                             f"{slug}/{tid}: 同じ遷移の台帳が {len(found)} 個あります (破損。store-check が報告します)")
+    if found:
+        name, old_fields, old_body = found[0]
+        diffs = hist.differing_fields(old_fields, old_body, fields, body)
+        if diffs:
+            raise _LedgerProblem(
+                ex.HISTORY_MISMATCH,
+                f"{slug}/{tid}: 同じ遷移の台帳が既にあり、今回の中身と違います (違う欄: {', '.join(diffs)})。"
+                f"同じ報告を送り直してください。何も書いていません", diffs)
+        return 'reuse', name, old_fields['ended_at'], None
+    name = hist.filename(hist.next_seq(names), kind, xid)
+    return 'write', name, ended_at, hist.render(fields, body)
+
+
+def _record_ledger(txn, slug, tid, meta, out, body_out, caller, *, end_code, now):
+    """終わる試行の台帳を、card の書き込みの**直前**に 1 ファイル足す (台帳 → card の順。card がコミット点)。
+    戻り値: `(ended_at, history_detail)`。`ended_at` は record にも使う値 (再送では台帳のものを再利用)。
+
+    retire だけは台帳が使えなくても閉じる (退役が止まると誰も窓を閉じない。`daemon-authority.md` §5): 警告を出し、
+    監査ログの `detail` に `history_unwritten` を残す。それ以外の台帳の問題は遷移を止める
+    (食い違い・破損は exit 3 で拒否の行つき、読めない / 書けないは exit 1)。"""
+    ended_at = _now_text(now)
+    tolerate = end_code == ex.RETIRED
+    try:
+        action, name, ended_at, text = _resolve_ledger(txn, slug, tid, meta, out, body_out,
+                                                      end_code=end_code, ended_at=ended_at)
+        if action == 'write':
+            txn.write_history(slug, tid, name, text)
+    except (_LedgerProblem, store.StoreError, hist.HistoryError) as e:
+        if isinstance(e, hist.HistoryError):                 # 台帳の形を組めない (欄の型の誤り。値は出さない)
+            e = _LedgerProblem(ex.STATE_INVALID, f"{slug}/{tid}: 台帳を組めません ({e.code})")
+        if not tolerate:
+            if isinstance(e, _LedgerProblem):
+                if e.code in (ex.HISTORY_MISMATCH, ex.HISTORY_AMBIGUOUS):
+                    _refuse(txn, e.code, e.message, slug, tid, meta, caller)
+                raise _err(e.code, e.message, slug, tid, meta.get('current_execution_id')) from None
+            raise
+        print(f"[task-controller warn] {slug}/{tid}: 台帳を書けないまま退役を閉じます "
+              f"({type(e).__name__}。履歴はこの試行の分だけ欠けます)", file=sys.stderr)
+        return _now_text(now), 'history_unwritten'
+    return ended_at, None
 
 
 # ---------------------------------------------------------------------------
@@ -558,8 +677,13 @@ def _apply_updates(out, updates, remove):
 
 def _finish(txn, slug, tid, meta, body, caller, *, new_status, end_code, to_status, command, operation,
             clear_owner, retire_slot, meta_updates, new_body, now, required_exec_status=None,
-            abandon_detached=False, meta_remove=(), dry_run=False):
-    """終わらせる操作の共通の骨 (照合 → 遷移の検査 → card → record → 枠 → 監査)。
+            abandon_detached=False, meta_remove=(), dry_run=False, result_replaced=False):
+    """終わらせる操作の共通の骨 (照合 → 遷移の検査 → 台帳 → card → record → 枠 → 監査)。
+
+    `result_replaced=True` は「この呼び出しの `new_body` が `## Result` 節を実際に置き換えた」と呼び出し側が**明示**する
+    引数 (plan.sh の done / fail)。このときだけ card の `result_execution_id` をこの試行にする。`new_body` があるだけでは
+    変えない (verify-result は既存の本文に節を足すだけ)。台帳 (`history/tNNN/`) は PROCEED の card の書き込みの直前、
+    この 1 か所で書く (`_record_ledger`)。
 
     `dry_run=True` は**照合と遷移の検査だけ**を同じ規則で行い、何も書かずに判定 (`PROCEED` / `IDEMPOTENT` / `TASK_ONLY`)
     を返す (拒否は同じ拒否の行と domain error)。呼び出し側が、コミット点より前に派生値を書く操作 (done の pr_number の
@@ -568,6 +692,8 @@ def _finish(txn, slug, tid, meta, body, caller, *, new_status, end_code, to_stat
     _check_caller(caller)
     _check_now(now)
     _check_body(new_body)
+    if result_replaced and new_body is None:
+        raise _err(ex.INVALID_ARGUMENT, "result_replaced は新しい本文 (Result 節を置き換えたもの) と一緒にだけ指定できます", slug, tid)
     decision, check = _authorize(txn, slug, tid, meta, caller, operation=operation,
                                  require_name=operation in _REPORT_OPERATIONS)
     updates, remove = _check_updates(meta_updates, meta_remove)
@@ -591,6 +717,8 @@ def _finish(txn, slug, tid, meta, body, caller, *, new_status, end_code, to_stat
         out['status'] = to_status
         if clear_owner:
             out.update(worker=None, started_at=None)
+        if result_replaced:
+            out.pop(RESULT_ATTRIBUTION_FIELD, None)      # 試行の無い報告の Result は、どの試行のものでもない
         txn.write_card(slug, tid, out, body_out)
         if retire_slot and owner is not None:
             txn.retire_assignment(owner, slug, tid, None)
@@ -614,23 +742,30 @@ def _finish(txn, slug, tid, meta, body, caller, *, new_status, end_code, to_stat
     out.update(status=to_status, execution_status=new_status, execution_end_code=end_code)
     if clear_owner:
         out.update(worker=None, started_at=None)
+    if result_replaced:
+        out[RESULT_ATTRIBUTION_FIELD] = out['current_execution_id']      # Result 節の帰属は card の同じ書き込みで
+    # 台帳 → card の順 (派生値は正本より前。card がコミット点)。card の書き込みが失敗しても残るのは「まだ起きていない遷移」の
+    # 孤児の 1 ファイルで、同じ報告の再送がそれを再利用して先へ進む (ended_at も台帳のものを card・record に使う)
+    ended_at, history_detail = _record_ledger(txn, slug, tid, meta, out, body_out, caller, end_code=end_code, now=now)
     txn.write_card(slug, tid, out, body_out)                    # 終了コードも status と同じ書き込みに入る (コミット点)
-    _write_record(txn, slug, tid, out, ended_at=_now_text(now))
+    _write_record(txn, slug, tid, out, ended_at=ended_at)
     if retire_slot and owner is not None:
         txn.retire_assignment(owner, slug, tid, None)
-    txn.record(slug, tid, previous, to_status, out.get('started_at'),
+    txn.record(slug, tid, previous, to_status, out.get('started_at'), detail=history_detail,
                execution_id=out['current_execution_id'], caller_check=check, actor_hint=hint)
     return _execution_of(txn, slug, tid, out)
 
 
 def complete_execution(txn, slug, tid, caller=NO_CALLER, *, to_status, meta_updates=None, meta_remove=(), body=None,
-                       now=None, dry_run=False):
+                       now=None, dry_run=False, result_replaced=False):
     """running → completed。`to_status` が `done` (終了コード `DONE`・枠を撤去) か `verified` (`VERIFIED`・枠は残す。
     R-2 が後で消す。state-store.md §7)。task の遷移元は §4.3 の狭めた表 (done は in_progress だけ・verified は検証待ち)。
 
     `meta_updates` / `body` は plan.sh が決めた他の欄 (`completed_at`・`pr_number`・Result 本文) を**同じ card の書き込み**に
     入れるため。status / worker / started_at / 試行の欄は渡せない。同じ ID の同じ操作の再送は冪等 (何も書かない)。
     `dry_run=True` は照合と遷移の検査だけを行い判定 (`PROCEED` / `IDEMPOTENT` / `TASK_ONLY`) を返す (何も書かない)。
+    `result_replaced=True` は `body` が `## Result` 節を置き換えたと**呼び出し側が明示**するとき (done)。verify-result の
+    verified は既存の本文に節を足すだけなので渡さない (帰属を変えない)。
     """
     rules = {_S_DONE: (ex.DONE, _C_DONE, _C_DONE, True),
              _S_VERIFIED: (ex.VERIFIED, _C_VERIFY_RESULT, _OP_VERIFY_PASS, False)}
@@ -641,11 +776,12 @@ def complete_execution(txn, slug, tid, caller=NO_CALLER, *, to_status, meta_upda
     return _finish(txn, slug, tid, meta, card_body, caller, new_status=ex.COMPLETED, end_code=end,
                    to_status=to_status, command=command, operation=operation, clear_owner=False,
                    retire_slot=retire, meta_updates=meta_updates, new_body=body, now=now,
-                   required_exec_status={ex.RUNNING}, meta_remove=meta_remove, dry_run=dry_run)
+                   required_exec_status={ex.RUNNING}, meta_remove=meta_remove, dry_run=dry_run,
+                   result_replaced=result_replaced)
 
 
 def fail_execution(txn, slug, tid, caller=NO_CALLER, failure_code=None, *, to_status, meta_updates=None,
-                   meta_remove=(), body=None, now=None, dry_run=False):
+                   meta_remove=(), body=None, now=None, dry_run=False, result_replaced=False):
     """reserved | running → failed。`failure_code` は終了コード (`_FAIL_RULES` の 6 つ)、`to_status` は task の遷移先で、
     組み合わせは §4.2 の表だけ:
 
@@ -657,6 +793,9 @@ def fail_execution(txn, slug, tid, caller=NO_CALLER, failure_code=None, *, to_st
     | RESET_BY_DIRECTOR (update --reset) | pending | 同上 (試行が無い / DETACHED の扱いは `reset_task`) |
     | RETIRED (retire) | pending / needs_director | pending のときだけ worker・started_at を null。枠撤去 |
     | WORKSPACE_CREATE_FAILED (G1) | needs_director | worker 残す・枠撤去 |
+
+    `result_replaced=True` は `body` が `## Result` 節を置き換えたと**呼び出し側が明示**するとき (fail)。needs-director・
+    verify-result・retire の `body` は節を足すだけなので渡さない。
     """
     rule = _FAIL_RULES.get(failure_code)
     if rule is None:
@@ -671,7 +810,8 @@ def fail_execution(txn, slug, tid, caller=NO_CALLER, failure_code=None, *, to_st
                    to_status=to_status, command=command, operation=operation, clear_owner=clear_owner,
                    retire_slot=retire, meta_updates=meta_updates, new_body=body, now=now,
                    required_exec_status=({ex.RESERVED} if failure_code == ex.WORKSPACE_CREATE_FAILED else None),
-                   abandon_detached=(failure_code == ex.RESET_BY_DIRECTOR), meta_remove=meta_remove, dry_run=dry_run)
+                   abandon_detached=(failure_code == ex.RESET_BY_DIRECTOR), meta_remove=meta_remove, dry_run=dry_run,
+                   result_replaced=result_replaced)
 
 
 def release_execution(txn, slug, tid, caller=NO_CALLER, reason_code=None, *, to_status=_S_PENDING, now=None,

@@ -407,7 +407,7 @@ Watchdog がタイムアウトを通知した場合（「タイムアウトの�
 2. `plan.sh fail <task_id> "$HANDOFF_PATH" --head "$(git rev-parse HEAD)" --execution <ex-…>` を実行
    （`--head` は必須。handoff にその head が書かれていないと拒否される — 古い handoff の再提出を防ぐため。
    git 管理外で head が無いときだけ `--no-head "<理由 1 行>"`。記録に残り Director に見える）
-   `$HANDOFF_PATH` は **絶対パス**（`crewvia_handoff_path "$AGENT_NAME" "$TASK_ID"`、§7 Step 2）。
+   `$HANDOFF_PATH` は **絶対パス**（`crewvia_handoff_path "$AGENT_NAME" "$TASK_MISSION" "$TASK_ID"`、§7 Step 2）。
    相対パスは `plan.sh fail` が拒否する — dispatcher は main repo 基準で読むので、worktree 基準の検証と食い違う
 
 > **優先順位**: 「完璧な HANDOFF.md」より「30 秒以内の終了」を優先する。
@@ -802,13 +802,16 @@ Watchdog が hard timeout 予告を送信した時、Worker はこのプロト�
 **Step 2**: HANDOFF.md を作成する。★相対パス `registry/handoffs/...` は使わないこと
 (worker.md:136 の規約通り絶対パスで呼ぶ — cwd が worktree の場合、相対パスは dispatcher が
 読む main repo 側の `registry/handoffs/` と別ファイルを指してしまい、Director への通知が
-中身なしで飛ぶ。`crewvia_handoff_path` は writer 側の解決関数。dispatcher.sh の読み手側は
+中身なしで飛ぶ。`crewvia_handoff_path` は writer 側の解決関数。path は
+`registry/handoffs/<agent>/<mission>/<task_id>_HANDOFF.md`（mission を含むので別 mission の同じ tNNN と
+衝突しない。旧 path `.../<agent>/<task_id>_HANDOFF.md` の handoff も `plan.sh fail` は絶対パスなら受け付ける）。dispatcher.sh の読み手側は
 embedded Python のためこの bash 関数を直接は呼べず、絶対パスであることを前提に独自実装で
 検査している):
 
 ```bash
 source "$CREWVIA_REPO/scripts/git-helpers.sh"
-HANDOFF_PATH="$(crewvia_handoff_path "$AGENT_NAME" "$TASK_ID")"
+: "${TASK_MISSION:?pull の JSON の .mission を export していない}"   # .crewvia-env 由来の CREWVIA_MISSION_SLUG は使わない（target_dir の task では未設定・前の task の値が残る）
+HANDOFF_PATH="$(crewvia_handoff_path "$AGENT_NAME" "$TASK_MISSION" "$TASK_ID")"
 mkdir -p "$(dirname "$HANDOFF_PATH")"
 ```
 

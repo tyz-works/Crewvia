@@ -75,6 +75,18 @@
 - 上限: `execution_count >= max_attempts` なら exit 3（`ATTEMPT_CAP`）。上書きは `--over-cap "<理由>"` で、台帳の `retry` に残る。**上限の検査は retry / reopen の入口だけ**に置き、`reserve_task` には置かない — 既に `execution_count` が 6 の card がある（元文書 §14.1。20261011-small-backlog… の t005）ので、reserve に置くと今の card が pull できなくなる。
 - 実装は Controller に `reopen_task(kind='retry')` を 1 つ足す。**`update --reset` の代わりに retry を使う運用**に変えるが、`--reset` は消さない（互換。§6 の PR-H で director.md に「理由が要る差し戻しは retry」と書く）。
 
+**PR-E（t031）で実装して決めたこと**（上の本文との差・追加）:
+
+- **拒否は 3 つの新しいコード（どれも exit 3・何も書かない・`refused:` の監査行 1 本）**: `ATTEMPT_ACTIVE`（試行が reserved / running。DETACHED の active も同じ）・`RETRY_NOT_ALLOWED`（遷移元でない status、または試行の記録が無い legacy の card — 台帳に写す試行が無いので `update --reset` に誘導する）・`ATTEMPT_CAP`。判定の順は 試行の記録 → active → status → 上限。`INVALID_TRANSITION`（exit 2）は使わない（「それ以外は exit 3」の指示）。
+- **`needs_human_review` の試行は running のまま**（`verify-result needs_human_review` は試行を変えない。`mark_task`）なので、**その状態の card は active として拒否される**。つまり retry が通る `needs_human_review` は、先に試行を閉じた（`update --close-execution` 等で terminal になった）ものだけ。遷移元の 4 つは語彙として `ACCEPTS_FROM['retry']` に持つが、実運用で最も通るのは failed / needs_director。試行を retry が自分で閉じる（RESET と同じ扱いにする）案は、新しい終了コードと枠の撤去が要るので PR-E では採らなかった。
+- **証拠の写し**: PR-D の `end` の台帳は `head`（= `fail_head`）と `reason`（handoff の有無）を持つが、**`handoff_path` の値は持たない**。そこで retry の台帳に `handoff_path` と `head` を写してから card の `handoff_path` / `fail_head` / `fail_head_waiver` を消す（`update --reset` が消す 3 欄と同じ）。台帳の frontmatter に任意の欄 `handoff_path` / `over_cap` を足した（再送で比べる欄にも入る）。**handoff のファイルは退避しない**（`update --reset` は `.stale-` に改名するが、retry の `previous_attempt.handoff_path` が指すファイルなので置いておく。同じ固定パスに次の Worker が書き直す）。
+- **台帳の retry は `end_code` に終わった試行の `execution_end_code` を写す**（`WORKER_FAILED` 等）。次の `pull` の `previous_attempt` が原因を出せる。`attempt` は終わった試行の `execution_count`。
+- **`previous_attempt`**: 同じ試行の台帳が結果（`end` / `reset` / `retire`）と retry の両方を持つとき、`history_path` は**結果の台帳**（Result 全文がある方）を指し、retry の台帳から `handoff_path`（無ければ `head` も）と **`retry_reason`**（Director の理由）を補う。結果の台帳が無い（PR-D より前に終わった）試行は retry の台帳を指す。
+- **理由の検査**: 空・空白だけ・制御文字（改行・タブを含む）・501 文字以上は拒否（`--reason` / `--over-cap` とも。ロックの前に検査して `UsageExit`）。長さの上限は台帳の frontmatter に 1 行で入れるための実装上の値。
+- **再送の冪等**: 同定キー (execution_id, `retry`, reopen_count)。台帳だけ書けて card が書けなかった孤児のあと同じ retry を送ると、新しいファイルは増えない。理由が違えば `HISTORY_MISMATCH`（出口は同じ理由で送り直す）。**限界（未解決）**: retry が成功した後、pull せずに `update --status failed` で手で戻して再び retry すると、同じ試行・同じ reopen_count の `retry` を「再送」と見なす（同じ中身なら何も書かず通り、理由が違えば `HISTORY_MISMATCH`）。通常の運用（retry → pull → 新しい試行）では起きない。PR-F の `reopen` が `reopen_count` を足すので、同じ試行を何度も開け直す運用は reopen の側で解く。
+- **mission の再活性化**: retry の後に `_reactivate_done_mission` を呼ぶ（`update --reset` と同じ。done の mission の task が pending に戻るので）。
+- **worktree の作り直し（§3.4 の QA 項目）は未確認**。retry は worktree・branch に触れない。`worktree_gc` が隔離した worktree を pull が作り直せるかは QA で確かめる。
+
 ### 3.4 pr_number・branch・worktree
 
 - `pr_number`: 残す。同じ PR に追加 commit を積む運用と一致する。`done --pr <N>` で別の番号を出すと既存の拒否（`plan.sh:4757-4761`）に当たる — retry で新しい PR を作りたいときは Director が `update --pr-number` で明示的に変える（今のまま）。
@@ -98,7 +110,9 @@
 
 ### 3.7 総試行数の上限
 
-`max_attempts` の既定は **5**（元文書 §13 の案）。`config/crewvia.yaml` に `attempts.max_total`、card に `max_attempts`（任意）。差し戻し（verify-result）の上限は今の `max_rework`（既定 3。`plan.sh:528`）のまま、**別の数として並べる**。実測では `execution_count` の最大が 6（元文書 §14.1）なので、既定を 5 にすると今の運用で 1 回は `--over-cap` が要る。値は §7 の判断 2。
+`max_attempts` の既定は **6**（§7 の判断 2。元文書 §13 の案は 5 だったが、実測で `execution_count` の最大が 6 なので、5 にすると今の運用で `--over-cap` を常用させる）。`config/crewvia.yaml` に `attempts.max_total`、card に `max_attempts`（任意）。差し戻し（verify-result）の上限は今の `max_rework`（既定 3。`plan.sh:528`）のまま、**別の数として並べる**。
+
+**PR-E（t031）で実装した**: 検査は `plan.sh retry` の入口（Controller の `reopen_task`）だけ。`execution_count >= 上限` で `ATTEMPT_CAP`（exit 3・何も書かない・監査ログに `refused:ATTEMPT_CAP` の 1 行）、`--over-cap "<理由>"` で通し、理由を台帳の retry の `over_cap` に残す（上限に達していないときの `--over-cap` は記録しない — 越えていない）。上限の読み順は card の `max_attempts` → `config/crewvia.yaml` の `attempts.max_total` → 6。**card の `max_attempts` が正の整数でなければ `STATE_INVALID`（既定値に倒さない — 上限を黙って変えることになる）**、config の値が不正なときは警告して既定値 6（上限は安全弁で、config の壊れで retry を止めない）。
 
 ## 4. P2: reopen
 
@@ -256,6 +270,8 @@ Codex の往復は 3 巡で打ち切った (PR #301 の t002)。以下は実装 
   - 直し方の方向（未決）: 帰属を更新するのは Result 節を実際に置き換えた呼び出し（`done` / `fail` / `needs-director` の `--result-file`）だけ、と明示の引数で指定する（`new_body` の有無から推測しない）。
   - 解く PR: D。網羅テストに入れるケース: `verify-result` だけを呼んだ後の台帳の帰属が変わらないこと、`done` / `fail` / `needs-director` の `--result-file` ありとなし、Result 節を置き換えず本文の別の節だけを足す呼び出し、同じ報告の再送。
 - **別の遷移で閉じた試行の孤児が store-check に報告されない**（Codex 3 巡目 P2。PR-D の `lib_history.py:411-417`。解く PR は E か F、または store-check の単独 PR）。
+  - **PR-E（t031）で解いた**: `lib_history.orphan_reason()`。結果の台帳（`end` / `reset` / `retire`）は、その試行の `execution_status` / `end_code`（今の試行は card、過去の試行は execution record）と突き合わせる。試行がまだ active なら孤児（`<kind>`）、終わっていても **`end_code` が台帳と違えば孤児**（`<kind>:closed_by=<END_CODE>`）。同じ `end_code` で閉じていれば（閉じた kind が done でも）孤児ではない。過去の試行（pull で次の試行に進んだ後）も record で判定するので、reset の後に次の Worker が pull しても報告は残る。record が読めないときは推測で孤児にしない。`retry` の台帳は、今の試行のもので card がまだ retry の遷移元 status のままなら孤児。報告は 1 台帳ファイル 1 件で、読み取りだけ。網羅テスト: `tests/test_retry_plan_sh.py`（done 孤児 × reset / retire / `--close-execution` / 何も閉じない / done で追いついた、2 回報告しない、書かない）。
+    **残る限界**: done の孤児と同じキー (X, `end`, reopen) の別の終わり方（`fail` / `needs-director`）は、再送の比較で `HISTORY_MISMATCH` になり card を書けない（孤児を差し替える手段が無い — 下の QA 項目 (3)）。この PR の範囲は「報告する」まで。以下は解く前の記述。
   - 漏れている状態: 孤児（台帳に DONE があるのに card が追いついていない試行）の検出は、current execution が active の間しか走らない。`done` が台帳だけ書いて card の前に落ち、その後 `reset` / `retire` が同じ試行を別の kind で閉じると、台帳には DONE が残るのに終端の試行は検出の対象外になり、store-check が何も報告しない。
   - 起きる害: 台帳に「起きていない完了」が残り、`previous_attempt` や監査がそれを読む。診断（孤児の報告）は出ない。card と record は正しいので、実行時の動作は壊れず、見えない食い違いだけが残る。
   - 直し方の方向（未決）: active でない（終端の）試行でも、台帳とコミット済みの遷移を突き合わせ、遷移の kind と台帳の DONE が食い違うものを孤児として報告する。

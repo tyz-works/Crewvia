@@ -31,15 +31,16 @@ if str(_SCRIPTS_DIR) not in sys.path:
 import lib_execution as ex  # noqa: E402
 import lib_state_store as store  # noqa: E402
 import lib_task_cards as _cards  # noqa: E402
+import lib_task_status as _status  # noqa: E402
 
-#: kind の語彙。この PR で書くのは end / reset / retire。retry / reopen は PR-E・F が書く (名前の形は今から受け付ける)。
+#: kind の語彙。書くのは end / reset / retire (PR-D)・retry (PR-E)。reopen は PR-F が書く (名前の形は今から受け付ける)。
 KINDS = ('end', 'reset', 'retire', 'retry', 'reopen')
 
 NAME_RE = store.HISTORY_NAME_RE
 
 #: 再送で比べる欄 (`ended_at` は除く。本文は `body` として別に比べる)。
 COMPARED_FIELDS = ('execution_id', 'attempt', 'kind', 'end_code', 'reopen_count', 'head', 'pr_number', 'worker',
-                   'actor', 'reason', 'checkpoint_dir', 'result')
+                   'actor', 'reason', 'handoff_path', 'over_cap', 'checkpoint_dir', 'result')
 
 #: `result` 欄の語彙 (§3.2)。recorded = 本文に Result 全文を入れた / none = その試行は Result を書かずに終わった /
 #: unattributed = 帰属の欄 (`result_execution_id`) が無い card (この設計より前のもの) で、旧本文の Result は入れない。
@@ -130,7 +131,7 @@ def _is_pr_number(value):
 
 
 #: 省略できる (None か str) 欄。型の違う値 (list / dict / bool / int) は `bad_field_type`。
-_OPTIONAL_TEXT_FIELDS = ('end_code', 'head', 'worker', 'actor', 'reason', 'checkpoint_dir')
+_OPTIONAL_TEXT_FIELDS = ('end_code', 'head', 'worker', 'actor', 'reason', 'handoff_path', 'over_cap', 'checkpoint_dir')
 
 
 def fields_problem(meta):
@@ -172,7 +173,7 @@ def same_name_and_fields(name, fields):
     return parsed is not None and parsed[1] == fields.get('kind') and parsed[2] == fields.get('execution_id')
 
 
-#: end_code → 台帳の kind (この PR では end / reset / retire。retry / reopen は PR-E・F)。無ければ `end`。
+#: end_code → 台帳の kind (end / reset / retire。retry は終了コードを持たず `reopen_task` が kind を直に指定する。reopen は PR-F)。無ければ `end`。
 KIND_BY_END_CODE = {ex.RESET_BY_DIRECTOR: 'reset', ex.RETIRED: 'retire'}
 
 
@@ -236,13 +237,14 @@ def result_section(body):
 
 def build_event(*, kind, execution_id, attempt, ended_at, end_code=None, reopen_count=0, head=None,
                 pr_number=None, worker=None, actor=None, reason=None, checkpoint_dir=None,
-                result_state=RESULT_NONE, result_text=''):
+                handoff_path=None, over_cap=None, result_state=RESULT_NONE, result_text=''):
     """`(fields, body)`。`result_state` が recorded のときだけ本文に Result 全文を入れる。"""
     if result_state not in RESULT_STATES:
         raise HistoryError('bad_result')
     fields = dict(execution_id=execution_id, attempt=attempt, kind=kind, end_code=end_code, ended_at=ended_at,
                   reopen_count=reopen_count, head=head, pr_number=pr_number, worker=worker, actor=actor,
-                  reason=reason, checkpoint_dir=checkpoint_dir, result=result_state)
+                  reason=reason, handoff_path=handoff_path, over_cap=over_cap, checkpoint_dir=checkpoint_dir,
+                  result=result_state)
     body = (result_text or '').rstrip() if result_state == RESULT_RECORDED else ''
     return fields, body
 
@@ -278,6 +280,58 @@ def missing_record_ended_at(queue_dir, slug, tid, record, meta):
         return None
     return ledger_ended_at(queue_dir, slug, tid, meta.get('current_execution_id'),
                            meta.get('execution_end_code'), reopen)
+
+
+# ---------------------------------------------------------------------------
+# 総試行数の上限 (設計 §3.7)
+# ---------------------------------------------------------------------------
+
+#: `config/crewvia.yaml` の `attempts.max_total` の既定 (ユーザー判断 2。実測で `execution_count` の最大が 6)。
+DEFAULT_MAX_ATTEMPTS = 6
+
+
+def _positive_int(value):
+    """正の整数 (bool でない) か None。YAML の `6  # コメント` の行末コメントは落とす。"""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 1 else None
+    if isinstance(value, str):
+        text = value.split('#', 1)[0].strip()
+        if re.fullmatch(r'[0-9]{1,6}', text) and int(text) >= 1:
+            return int(text)
+    return None
+
+
+def max_attempts_of(meta, default):
+    """この card の上限: 欄 `max_attempts` (任意) があればそれ、無ければ `default`。欄が正の整数でなければ `ValueError`
+    (壊れた欄を既定値に倒さない — 上限を黙って外す・変えることになる)。"""
+    if meta.get('max_attempts') is None:
+        return default
+    value = _positive_int(meta.get('max_attempts'))
+    if value is None:
+        raise ValueError('bad_max_attempts')
+    return value
+
+
+def load_default_max_attempts(config_path, warn=lambda msg: None):
+    """`config/crewvia.yaml` の `attempts.max_total` (正の整数)。欄が無い・config が読めない・値が正の整数でないときは
+    既定値 (6) — 値が不正なときだけ `warn` で 1 行知らせる (上限は安全弁で、config の壊れで retry を止めない)。"""
+    raw = _cards.read_regular_text_or_unreadable(str(config_path))
+    if _cards.is_unreadable(raw):
+        return DEFAULT_MAX_ATTEMPTS
+    try:
+        data = _cards.parse_yaml(raw, source='crewvia.yaml')
+    except ValueError:
+        return DEFAULT_MAX_ATTEMPTS
+    block = data.get('attempts') if isinstance(data, dict) else None
+    if not isinstance(block, dict) or block.get('max_total') is None:
+        return DEFAULT_MAX_ATTEMPTS
+    value = _positive_int(block.get('max_total'))
+    if value is None:
+        warn(f"attempts.max_total が正の整数ではありません — 既定値 {DEFAULT_MAX_ATTEMPTS} を使います")
+        return DEFAULT_MAX_ATTEMPTS
+    return value
 
 
 # ---------------------------------------------------------------------------
@@ -333,17 +387,38 @@ def load_events(queue_dir, slug, tid):
     return events
 
 
+#: 試行を「開き直した」台帳 (retry / reopen)。試行の結果 (`end`) とは別のファイルで、同じ `execution_id` を持つ。
+REOPEN_KINDS = ('retry', 'reopen')
+
+
 def previous_attempt(events, current_execution_id):
-    """`pull` の JSON に足す `previous_attempt`: 今の試行**以外**の最後の台帳の要約 (無ければ None)。
-    欄は `{execution_id, attempt, end_code, ended_at, head, history_path, checkpoint_dir}`。値の無い欄は省く。"""
+    """`pull` の JSON に足す `previous_attempt`: 今の試行**以外**の最後の試行の要約 (無ければ None)。
+    欄は `{execution_id, attempt, end_code, ended_at, head, history_path, checkpoint_dir}` + 開き直されたときの
+    `handoff_path` / `retry_reason`。値の無い欄は省く。
+
+    `history_path` は**その試行の結果 (`end` / `reset` / `retire`) の台帳**を指す (Result 全文があるのはそこ)。retry / reopen の
+    台帳は結果の後ろに足されるが、本文を持たないので `history_path` にしない。結果の台帳が無い (この設計より前に終わった
+    試行) ときだけ、最後の台帳そのものを指す。retry の台帳が写した `handoff_path` / `head` は結果の台帳に無ければ補い、
+    `retry_reason` に Director の理由を出す (理由は台帳にだけある)。"""
     prior = [e for e in events if e['fields'].get('execution_id') != current_execution_id]
     if not prior:
         return None
     last = prior[-1]
-    f = last['fields']
-    out = {'execution_id': f.get('execution_id'), 'attempt': f.get('attempt'), 'end_code': f.get('end_code'),
-           'ended_at': f.get('ended_at'), 'head': f.get('head'), 'history_path': last['path'],
-           'checkpoint_dir': f.get('checkpoint_dir')}
+    xid = last['fields'].get('execution_id')
+    same = [e for e in prior if e['fields'].get('execution_id') == xid]
+    results = [e for e in same if e['fields'].get('kind') not in REOPEN_KINDS]
+    reopened = [e for e in same if e['fields'].get('kind') in REOPEN_KINDS]
+    base = (results or same)[-1]
+    f = base['fields']
+    out = {'execution_id': xid, 'attempt': f.get('attempt'), 'end_code': f.get('end_code'),
+           'ended_at': f.get('ended_at'), 'head': f.get('head'), 'history_path': base['path'],
+           'checkpoint_dir': f.get('checkpoint_dir'), 'handoff_path': f.get('handoff_path')}
+    if reopened and reopened[-1] is last:
+        r = reopened[-1]['fields']
+        for key in ('end_code', 'head', 'handoff_path', 'checkpoint_dir'):
+            if out.get(key) is None:
+                out[key] = r.get(key)
+        out['retry_reason'] = r.get('reason')
     return {k: v for k, v in out.items() if v is not None}
 
 
@@ -356,6 +431,45 @@ def format_event(event):
 # ---------------------------------------------------------------------------
 # store-check (報告だけ。直さない)
 # ---------------------------------------------------------------------------
+
+#: 結果を書く台帳 (card の遷移 = 試行の終了。`end_code` で card と突き合わせる)
+_ENDING_KINDS = ('end', 'reset', 'retire')
+
+
+def orphan_reason(txn, slug, tid, meta, f):
+    """台帳 1 件 `f` (frontmatter) が、card がコミットしていない遷移の孤児かどうか。孤児なら detail の文字列、そうでなければ None。
+    **読むだけ** (card・record・台帳を書かない)。判定できないもの (record が読めない等) は None (推測で孤児にしない)。
+
+    * 結果の台帳 (`end` / `reset` / `retire`): その試行の終わり方は card (今の試行) か record (過去の試行) の
+      `execution_status` / `end_code` が正本。試行がまだ active なら孤児 (`<kind>`)。**終わっていても `end_code` が台帳と違う
+      なら孤児** (`<kind>:closed_by=<END_CODE>`) — `done` が台帳だけ書いて落ちた後に reset / retire / retry の流れで別の kind で
+      閉じた試行 (設計 §8 の 3 件目)。同じ `end_code` で閉じていれば、閉じた kind が done でも何でも孤児ではない。
+    * `retry` の台帳: 今の試行 (`current_execution_id`) のもので、card がまだ retry の遷移元の status のまま (pending に
+      動いていない) なら孤児。過去の試行のものは card から判定できないので見ない。
+    """
+    xid = f.get('execution_id')
+    kind = f.get('kind')
+    current = meta.get('current_execution_id')
+    if kind in _ENDING_KINDS:
+        if xid == current:
+            if reopen_count_of(f) != (meta.get('reopen_count') or 0):
+                return None                                   # 開き直す前の世代の台帳 (card はもう次へ進んでいる)
+            status, end_code = meta.get('execution_status'), meta.get('execution_end_code')
+        else:
+            got = txn.read_execution_record(slug, xid)
+            if got[0] != 'ok' or not isinstance(got[1], dict):
+                return None
+            status, end_code = got[1].get('status'), got[1].get('end_code')
+        if status in ex.ACTIVE_STATUSES:
+            return kind if xid == current else None           # 過去の試行が active のまま、は record の側の問題 (R-5 が報告)
+        if status in ex.TERMINAL_EXECUTION_STATUSES and f.get('end_code') and end_code and end_code != f.get('end_code'):
+            return f"{kind}:closed_by={end_code}"
+        return None
+    if kind == 'retry' and xid == current and reopen_count_of(f) == (meta.get('reopen_count') or 0):
+        if meta.get('status') in _status.ACCEPTS_FROM['retry'] and meta.get('execution_status') in ex.TERMINAL_EXECUTION_STATUSES:
+            return kind
+    return None
+
 
 def diagnose(queue_dir, mission_slugs):
     """台帳の食い違いを**書かずに**列挙する: `[(kind, mission, task, detail)]`。
@@ -408,11 +522,9 @@ def diagnose(queue_dir, mission_slugs):
             for key, ev_names in sorted(seen.items(), key=lambda kv: kv[1]):
                 if len(ev_names) > 1:
                     out.append(('history_duplicate_key', slug, tid, f"{len(ev_names)} files"))
-            if meta is not None and meta.get('execution_status') in ex.ACTIVE_STATUSES:
-                current = meta.get('current_execution_id')
-                reopen = meta.get('reopen_count') or 0
+            if meta is not None:
                 for e in events:
-                    f = e['fields']
-                    if f.get('execution_id') == current and reopen_count_of(f) == reopen:
-                        out.append(('history_orphan', slug, tid, f.get('kind')))
+                    why = orphan_reason(txn, slug, tid, meta, e['fields'])
+                    if why is not None:
+                        out.append(('history_orphan', slug, tid, why))
     return out

@@ -83,8 +83,8 @@ def test_the_mentions_in_the_allowed_files_are_not_imports():
 #: E4a (t016) で reset / retire が足された (`reset_task` = update --reset・`release_execution` = reserved の retire。running の
 #: retire は `fail_execution`)。足すのは cutover = ユーザー承認の PR)。
 PLAN_SH_ALLOWED_OPERATIONS = {"reserve_task", "start_execution", "fail_execution", "complete_execution", "mark_task",
-                              "abandon_detached_execution", "reset_task", "release_execution",
-                              "Caller", "NO_CALLER", "IDEMPOTENT"}
+                              "abandon_detached_execution", "reset_task", "release_execution", "reopen_task",
+                              "check_reason", "Caller", "NO_CALLER", "IDEMPOTENT"}
 
 
 def test_plan_sh_calls_only_the_allowed_operations_of_the_controller():

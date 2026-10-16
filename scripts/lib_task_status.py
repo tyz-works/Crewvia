@@ -102,6 +102,8 @@ ACCEPTS_FROM = {
     'verify-result': frozenset({'ready_for_verification', 'verifying', 'needs_human_review'}),
     'retire': frozenset({'in_progress'}),
     'verifying': frozenset({'ready_for_verification'}),
+    # vNext 02 PR-E: 理由つきの再試行 (`plan.sh retry`)。遷移先は pending。試行が active のものは別の理由で拒否される
+    'retry': frozenset({'failed', 'needs_director', 'needs_human_review', 'verification_failed'}),
 }
 
 

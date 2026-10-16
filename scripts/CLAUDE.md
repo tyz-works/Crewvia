@@ -117,7 +117,7 @@ lib ごとの**破ってはいけない契約**の要約。理由・経緯・全
 ## 試行の台帳（`lib_history.py` + `Txn.write_history` + `_finish`。vNext 02 PR-D / t019。設計 `knowledge/vnext-02-attempt-reopen-checkpoint.md` §3.2）
 
 - `queue/missions/<m>/history/tNNN/<seq4>-<kind>-<execution_id>.md`。**1 遷移 = 1 ファイル・上書きも追記もしない**。kind は `end` / `reset` / `retire`
-  （`retry` / `reopen` は PR-E・F。名前の形は今から受け付ける）。書くのは **Controller の `_finish` の PROCEED の 1 か所**（`_record_ledger`）で、
+  （`retry` は PR-E、`reopen` は PR-F。名前の形は今から受け付ける）。書くのは **Controller の `_finish` の PROCEED の 1 か所**（`_record_ledger`）で、
   card の書き込みの直前（台帳 → card。card がコミット点）。plan.sh・Controller は直に `open()` せず `Txn.write_history`（既存があれば `AlreadyExists`）。
   試行の無い card（TASK_ONLY）の遷移・`reserve` の手順 0 の abandon は台帳を書かない（`execution_id` が名前に要る）。
 - **帰属は card の `result_execution_id`**。`result_replaced=True` で呼ばれた `complete_execution` / `fail_execution`（plan.sh の done / fail。`## Result` 節を実際に
@@ -136,6 +136,21 @@ lib ごとの**破ってはいけない契約**の要約。理由・経緯・全
 - 読み口: `plan.sh history <id> [--mission]`（読み取り専用・壊れたファイルは飛ばさず exit 1）・`pull` の JSON の `previous_attempt`（今の試行以外の最後の台帳の要約。台帳が読めないときは
   欄を省いて stderr に固定コードを出すだけで pull は止めない）・`store-check`（`history_orphan` / `history_duplicate_key` / `history_unobservable` / `history_without_card`。**報告だけ**）。
 - 戻し方: PR revert → `scripts/sync-main-checkout.sh`。`history/` と card の `result_execution_id` は残ってよい（旧コードは読まない・無視する）。
+
+## retry と総試行数の上限（`plan.sh retry` + `reopen_task`。vNext 02 PR-E / t031。設計 §3.3・§3.7）
+
+- `plan.sh retry <id> --reason "<理由>" [--mission] [--over-cap "<理由>"]` → Controller の `reopen_task(kind='retry')`（PR-F が同じ関数に `reopen` を足す）。
+  遷移元は `lib_task_status.ACCEPTS_FROM['retry']`（failed / needs_director / needs_human_review / verification_failed）→ pending。順序は 台帳（kind=retry）→ card（コミット点）→ 枠の撤去。
+  **試行が active（reserved / running。running のまま残る needs_human_review も）は `ATTEMPT_ACTIVE`**、遷移元でない status と試行の記録が無い card は `RETRY_NOT_ALLOWED`、
+  上限は `ATTEMPT_CAP`。どれも exit 3・何も書かない（`_NO_WRITE_REFUSALS` = `UsageExit`）。理由・`--over-cap` はロックの前に `check_reason` で検査（空・制御文字・501 字以上）。
+- 保つ: pr_number・task_slug・execution_count・rework_count・試行の欄。消す: worker / started_at / completed_at と handoff_path / fail_head / fail_head_waiver（**台帳の retry に写してから**）。
+  理由は台帳にだけ（監査ログに出さない・secret テスト）。handoff の**ファイルは退避しない**（`previous_attempt.handoff_path` が指す）。
+- 上限は card の `max_attempts` → `config/crewvia.yaml` の `attempts.max_total` → 6（`lib_history.max_attempts_of` / `load_default_max_attempts`）。**検査は retry の入口だけ**（`reserve_task` に置かない = execution_count が 6 の card が pull できなくなる）。
+  card の `max_attempts` が壊れていたら `STATE_INVALID`（既定値に倒さない）。`max_rework`（3）は別の数。
+- `pull` の `previous_attempt` は、結果の台帳（Result 全文）を `history_path` に、retry の台帳から `handoff_path` / `head` / `retry_reason` を補う（`lib_history.previous_attempt`）。
+- `store-check` の `history_orphan` は `lib_history.orphan_reason`: 結果の台帳の `end_code` が、その試行の終わり方（今の試行は card・過去は record）と違えば孤児（`<kind>:closed_by=<END_CODE>`）。読み取りだけ。
+- `update --reset` は残してある（理由が要らない差し戻し・壊れた card の出口）。テスト: `tests/test_retry_plan_sh.py`。
+- 戻し方: PR revert → `scripts/sync-main-checkout.sh`。台帳の retry・card の `max_attempts` は残ってよい（旧コードは読まない）。
 
 ## Git Policy（`lib_git_policy.py`。01b G2 / t008 で作成、G3 / t012 で呼び出し元を移した）
 

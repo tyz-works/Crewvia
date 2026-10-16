@@ -526,6 +526,7 @@ TASK_META_KEY_ORDER = [
     'acceptance_criteria', 'verification', 'rework_count', 'max_rework',
     'qa_checkpoints', 'required_evidence', 'needs_director_reason',
     'result_execution_id',                     # vNext 02 PR-D: card の Result 節を最後に置き換えた試行 (台帳の帰属。§3.2)
+    'max_attempts',                            # vNext 02 PR-E: この task だけ総試行数の上限を上書きする (任意。§3.7)
 ]
 
 MISSION_KEY_ORDER = ['title', 'slug', 'status', 'created_at', 'completed_at', 'next_task_id',
@@ -611,7 +612,7 @@ def serialize_card(meta, body):
 HISTORY_NAME_RE = re.compile(r'(\d{4,})-(end|reset|retire|retry|reopen)-(ex-[0-9a-f]{32})\.md')
 HISTORY_DIRNAME = 'history'
 _HISTORY_KEY_ORDER = ['execution_id', 'attempt', 'kind', 'end_code', 'ended_at', 'reopen_count', 'head', 'pr_number',
-                      'worker', 'actor', 'reason', 'checkpoint_dir', 'result']
+                      'worker', 'actor', 'reason', 'handoff_path', 'over_cap', 'checkpoint_dir', 'result']
 
 
 def serialize_history(meta, body):

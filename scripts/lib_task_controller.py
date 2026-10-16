@@ -419,6 +419,12 @@ def _resolve_ledger(txn, slug, tid, meta, out, body_out, *, end_code, ended_at):
         kind=kind, execution_id=xid, attempt=meta['execution_count'], ended_at=ended_at, end_code=end_code,
         reopen_count=reopen, head=out.get('fail_head'), pr_number=out.get('pr_number'), worker=meta.get('worker'),
         actor=_ledger_actor(txn), reason=_ledger_reason(out, end_code), result_state=state, result_text=result_text)
+    return _match_or_plan(txn, slug, tid, kind, xid, reopen, fields, body, ended_at)
+
+
+def _match_or_plan(txn, slug, tid, kind, xid, reopen, fields, body, ended_at):
+    """`_resolve_ledger` の後半 (kind を問わない): 同定キー (`xid`, `kind`, `reopen`) の既存の台帳を探し、あれば中身を比べて
+    再利用 (`reuse`)、無ければ次の `seq4` で新しいファイルの中身を作る (`write`)。"""
     listed = txn.list_history(slug, tid)
     if listed[0] != 'ok':
         raise _LedgerProblem(ex.STATE_INVALID, f"{slug}/{tid}: 台帳を列挙できません ({listed[1]})")
@@ -450,7 +456,7 @@ def _resolve_ledger(txn, slug, tid, meta, out, body_out, *, end_code, ended_at):
     return 'write', name, ended_at, hist.render(fields, body)
 
 
-def _record_ledger(txn, slug, tid, meta, out, body_out, caller, *, end_code, now):
+def _record_ledger(txn, slug, tid, meta, out, body_out, caller, *, end_code, now, resolver=None):
     """終わる試行の台帳を、card の書き込みの**直前**に 1 ファイル足す (台帳 → card の順。card がコミット点)。
     戻り値: `(ended_at, history_detail, reused)`。`ended_at` は record にも使う値 (再送では台帳のものを再利用。そのとき
     `reused=True`)。
@@ -461,8 +467,11 @@ def _record_ledger(txn, slug, tid, meta, out, body_out, caller, *, end_code, now
     ended_at = _now_text(now)
     tolerate = end_code == ex.RETIRED
     try:
-        action, name, ended_at, text = _resolve_ledger(txn, slug, tid, meta, out, body_out,
-                                                      end_code=end_code, ended_at=ended_at)
+        if resolver is None:
+            action, name, ended_at, text = _resolve_ledger(txn, slug, tid, meta, out, body_out,
+                                                          end_code=end_code, ended_at=ended_at)
+        else:                                                # retry / reopen: 呼び出し元が台帳の中身を決める
+            action, name, ended_at, text = resolver(ended_at)
         reused = action == 'reuse'
         if action == 'write':
             txn.write_history(slug, tid, name, text)
@@ -894,6 +903,113 @@ def reset_task(txn, slug, tid, caller=NO_CALLER, *, now=None, meta_updates=None)
     return _finish(txn, slug, tid, meta, body, caller, new_status=ex.FAILED, end_code=ex.RESET_BY_DIRECTOR,
                    to_status=_S_PENDING, command=None, operation=None, clear_owner=True, retire_slot=True,
                    meta_updates=meta_updates, new_body=None, now=now, abandon_detached=True)
+
+
+# ---------------------------------------------------------------------------
+# 理由つきの開き直し (vNext 02 PR-E: retry。PR-F が同じ関数に reopen を足す。設計 §3.3)
+# ---------------------------------------------------------------------------
+
+#: `reopen_task` の kind と、card を受け付ける元の command 名 (`lib_task_status.ACCEPTS_FROM` のキー)。PR-F が `reopen` を足す。
+_REOPEN_KINDS = {'retry': 'retry'}
+
+#: 理由 (`--reason` / `--over-cap`) の長さの上限。台帳の frontmatter に 1 行で入るので、長文はここで断る
+REASON_MAX = 500
+
+#: retry で card から消す欄 (前の試行の証拠。台帳に写した後)。`update --reset` が消すものと同じ 3 つ
+_RETRY_CLEARED_EVIDENCE = ('handoff_path', 'fail_head', 'fail_head_waiver')
+
+
+def check_reason(value, name):
+    """`--reason` / `--over-cap` の検査。空・空白だけ・制御文字 (改行を含む)・長すぎるものは `INVALID_ARGUMENT`
+    (値は例外文に出さない)。戻り値: 前後の空白を除いた文字列。"""
+    if not isinstance(value, str) or not value.strip():
+        raise _err(ex.INVALID_ARGUMENT, f"{name} は空にできません")
+    text = value.strip()
+    if re.search(r'[\x00-\x1f\x7f]', text):
+        raise _err(ex.INVALID_ARGUMENT, f"{name} に制御文字 (改行・タブを含む) は使えません")
+    if len(text) > REASON_MAX:
+        raise _err(ex.INVALID_ARGUMENT, f"{name} は {REASON_MAX} 文字までです")
+    return text
+
+
+def reopen_task(txn, slug, tid, *, kind, reason, over_cap=None, default_max_attempts=hist.DEFAULT_MAX_ATTEMPTS, now=None):
+    """終わった試行の task を、理由つきで pending に戻す (retry。設計 §3.3)。**新しい task を足さない**。
+
+    遷移元: `lib_task_status.ACCEPTS_FROM['retry']` (failed / needs_director / needs_human_review / verification_failed)。
+    **試行が active (reserved / running) なら `ATTEMPT_ACTIVE`** (先に `update --close-execution` か `reset`)、遷移元でない・
+    試行の記録が無い card は `RETRY_NOT_ALLOWED`、`execution_count >= 上限` は `ATTEMPT_CAP` (`over_cap` の理由があれば通し、
+    台帳の retry に残す)。拒否はどれも exit 3・何も書かない (監査ログに拒否の行だけ)。
+
+    保つ欄: pr_number・task_slug・execution_count・rework_count・試行の欄 (終わった試行のまま。次の pull の reserve が新しい
+    試行を発行する)。消す欄: worker / started_at / completed_at と前の試行の証拠 (handoff_path / fail_head / fail_head_waiver)。
+    **証拠は消す前に台帳 (kind=retry) へ写す** (handoff_path は retry のイベントにだけ入る。fail_head は結果の台帳 (end) にも
+    入っているが、retry にも写す) ので、次の pull の `previous_attempt` から辿れる。理由は台帳にだけ書き、監査ログに出さない。
+
+    順序は他の遷移と同じ: 台帳 → card (コミット点) → 枠の撤去。台帳だけ書けて card が書けなかった孤児は、同じ retry の再送が
+    再利用して先へ進む (同定キー (execution_id, retry, reopen_count)。違う中身なら `HISTORY_MISMATCH`)。
+    **上限の検査は入口のここだけ** (`reserve_task` には置かない — 既に上限を超えた card がある)。
+    戻り値: 開き直した (終わっていた) 試行の `Execution`。
+    """
+    if kind not in _REOPEN_KINDS:
+        raise _err(ex.INVALID_ARGUMENT, "reopen_task の kind は retry だけ", slug, tid)
+    command = _REOPEN_KINDS[kind]
+    reason = check_reason(reason, 'reason')
+    if over_cap is not None:
+        over_cap = check_reason(over_cap, 'over_cap')
+    _check_now(now)
+    if isinstance(default_max_attempts, bool) or not isinstance(default_max_attempts, int) or default_max_attempts < 1:
+        raise _err(ex.INVALID_ARGUMENT, "default_max_attempts は正の整数", slug, tid)
+    meta, body = _load(txn, slug, tid)
+    xid = meta.get('current_execution_id')
+    if not ex.has_execution_fields(meta):
+        _refuse(txn, ex.RETRY_NOT_ALLOWED,
+                f"task '{tid}': 試行の記録が無い card は {command} できません (台帳に写す試行が無い)。"
+                f"`update --reset` を使ってください", slug, tid, meta)
+    if meta.get('execution_status') in ex.ACTIVE_STATUSES:
+        _refuse(txn, ex.ATTEMPT_ACTIVE,
+                f"task '{tid}': 試行 ({meta.get('execution_status')}) がまだ active です。先に `plan.sh update {tid} --close-execution`"
+                f" か `--reset` で試行を閉じてください", slug, tid, meta)
+    if meta.get('status') not in _ACCEPTS[command]:
+        allowed = ', '.join(sorted(_ACCEPTS[command]))
+        shown = store._safe_status(meta.get('status')) or '<unknown>'
+        _refuse(txn, ex.RETRY_NOT_ALLOWED,
+                f"task '{tid}': {command} は status={shown!r} の task には使えません (受け付けるのは: {allowed})", slug, tid, meta)
+    try:
+        cap = hist.max_attempts_of(meta, default_max_attempts)
+    except ValueError:
+        raise _err(ex.STATE_INVALID, f"{slug}/{tid}: card の max_attempts が壊れています", slug, tid) from None
+    count = meta['execution_count']
+    over = count >= cap
+    if over and over_cap is None:
+        _refuse(txn, ex.ATTEMPT_CAP,
+                f"task '{tid}': 総試行数 {count} が上限 {cap} に達しています。続けるなら --over-cap \"<理由>\" を付けるか、"
+                f"card の max_attempts を上げてください", slug, tid, meta)
+    previous = meta.get('status')
+    owner = _owner_slot(meta)
+    try:
+        reopen = _reopen_count(meta)
+    except _LedgerProblem as e:
+        raise _err(e.code, e.message, slug, tid, xid) from None
+
+    def resolver(ended_at):
+        fields, text = hist.build_event(
+            kind=kind, execution_id=xid, attempt=count, ended_at=ended_at, end_code=meta.get('execution_end_code'),
+            reopen_count=reopen, head=meta.get('fail_head'), pr_number=meta.get('pr_number'), worker=meta.get('worker'),
+            actor=_ledger_actor(txn), reason=reason, handoff_path=meta.get('handoff_path'),
+            over_cap=over_cap if over else None, result_state=hist.RESULT_NONE)
+        return _match_or_plan(txn, slug, tid, kind, xid, reopen, fields, text, ended_at)
+
+    _ended_at, _detail, _reused = _record_ledger(txn, slug, tid, meta, meta, body, NO_CALLER, end_code=None, now=now,
+                                                 resolver=resolver)
+    out = dict(meta)
+    out.update(status=_S_PENDING, worker=None, started_at=None, completed_at=None)
+    for key in _RETRY_CLEARED_EVIDENCE:
+        out.pop(key, None)
+    txn.write_card(slug, tid, out, body)                         # コミット点
+    if owner is not None:
+        txn.retire_assignment(owner, slug, tid, None)
+    txn.record(slug, tid, previous, _S_PENDING, None, execution_id=xid)
+    return _execution_of(txn, slug, tid, out)
 
 
 #: `mark_task` が扱う (command, to_status)。どれも**試行を変えない** task の遷移。verify-result の `needs_human_review`

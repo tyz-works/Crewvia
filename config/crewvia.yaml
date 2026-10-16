@@ -195,6 +195,16 @@ escalation:
   director_after_seconds: 300
   telegram_after_seconds: 600
 
+# ===== 総試行数の上限（plan.sh retry） =====
+# 1 つの task の試行（execution_count）がこの回数に達していたら、`plan.sh retry` は exit 3（ATTEMPT_CAP）で
+# 断ります。続けるなら `plan.sh retry <id> --reason "<理由>" --over-cap "<理由>"`（理由は台帳に残ります）。
+# task ごとの上書きは card の `max_attempts`。差し戻し（verify-result fail）の上限 `max_rework`（既定 3）とは別の数です。
+# 検査は retry の入口だけで、pull（reserve）には置きません（既に上限を超えた card が pull できなくなるため）。
+# 既定 6 は実測（execution_count の最大が 6）から。値が正の整数でなければ警告して既定値を使います。
+# 設計: knowledge/vnext-02-attempt-reopen-checkpoint.md §3.7
+attempts:
+  max_total: 6
+
 # ===== Telegram（Director の質問・ボタン・受信。任意） =====
 # Director がユーザーに選択肢つきの質問を Telegram で送り、ボタンの答えを Director の画面に届ける
 # （scripts/ask_user.sh。設計: knowledge/director-escalation-telegram.md）。

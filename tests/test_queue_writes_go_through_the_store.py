@@ -181,12 +181,13 @@ ALLOWED_WRITES: dict[tuple[str, str], tuple[int, str]] = {
     ('worktree_gc.py', 'apply_quarantine'): (1, "worktree の隔離先 dir の作成。queue の外 (削除はしない)"),
     ('worktree_gc.py', 'cmd_restore'): (1, "隔離した worktree の復元先 dir の作成。queue の外"),
     # ---- registry/checkpoints (vNext 02 PR-G。退役の直前の worktree の保存。queue の外・queue の状態は 1 バイトも書かない) -----
-    ('lib_checkpoint.py', '_mkdir'): (2, "registry/checkpoints/ の dir (0700)。保存物の置き場。queue の外。書くのは退役の実行者 (watchdog) だけ"),
-    ('lib_checkpoint.py', '_write_file'): (1, "registry/checkpoints/ の保存物 (O_EXCL | O_NOFOLLOW、0600)。新規作成だけ・上書きしない"),
-    ('lib_checkpoint.py', 'remove_tree'): (3, "書きかけ (`.partial`) の掃除。自分が作った dir を symlink を辿らず 1 つずつ unlink / rmdir する (再帰削除コマンドではない)"),
+    ('lib_checkpoint.py', 'open_root'): (1, "registry/ (checkpoints の置き場の基点。設定で決めた場所) が無ければ作る。ここから下は `SafeDir` が symlink を辿らずに開く。queue の外"),
+    ('lib_checkpoint.py', 'child'): (3, "registry/checkpoints/ の dir (0700)。`mkdirat` / `fchmod` で 1 段ずつ・`O_NOFOLLOW` (symlink は辿らず `unsafe_path`)。保存物の置き場。queue の外。書くのは退役の実行者 (watchdog) だけ"),
+    ('lib_checkpoint.py', 'write'): (1, "registry/checkpoints/ の保存物 (dir fd 基点・O_EXCL | O_NOFOLLOW、0600)。新規作成だけ・上書きしない"),
+    ('lib_checkpoint.py', 'remove_tree'): (2, "書きかけ (`.partial`) の掃除。dir fd を基点に、自分が作った dir を symlink を辿らず 1 つずつ unlink / rmdir する (再帰削除コマンドではない)"),
+    ('lib_checkpoint.py', 'rename'): (1, "同じ dir の中の rename (`.partial` → 最終の名前)。dir fd 基点"),
+    ('lib_checkpoint.py', 'move_between'): (1, "checkpoint の隔離・復元の rename (元と先の dir fd を基点)。`checkpoint_gc` が使う唯一の移動。上書きしない (呼び出し側が先に存在を見る)。削除はしない。queue の外"),
     ('lib_checkpoint.py', 'take'): (1, "完成した `.partial` を最終の名前へ rename (途中の dir が本物に見えない)"),
-    ('checkpoint_gc.py', 'apply_quarantine'): (2, "checkpoint の隔離先 dir の作成と rename。削除はしない (worktree_gc と同じ作法)。queue の外"),
-    ('checkpoint_gc.py', 'restore'): (2, "隔離した checkpoint の復元先 dir の作成と rename。既にある場所には戻さない。queue の外"),
 }
 
 #: 検査した書き込みの総数の下限 (S5 着手時に 187 件 = 全体 194 件 - lib 自身 7 件を実測)。検出器が壊れて

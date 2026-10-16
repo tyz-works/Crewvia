@@ -25,6 +25,7 @@ import calendar
 import json
 import os
 import re
+import stat
 import sys
 import time
 from pathlib import Path
@@ -51,6 +52,7 @@ R_CARD_MISSING = 'task-card-missing'
 R_CARD_UNREADABLE = 'task-card-unreadable'
 R_NOT_TERMINAL = 'task-not-terminal'
 R_QUARANTINE_BUSY = 'quarantine-destination-exists'
+R_UNSAFE_PATH = 'unsafe-path'            # checkpoints/ 以下に symlink (または dir でないもの): 辿らず・何も動かさない
 
 _SLUG_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]*')
 _TID_RE = re.compile(r't\d+')
@@ -172,6 +174,37 @@ def scan(registry_dir, queue_dir, now=None, days=DEFAULT_DAYS):
     return out, None
 
 
+def _move(registry_dir, src_parts, src_name, dst_parts, dst_name):
+    """`registry_dir` 以下の `src_parts/src_name` を `dst_parts/dst_name` へ rename する。`'moved'` / `'busy'` (先に在る・上書きしない) /
+    `'missing'` (元が無い)。途中の成分が symlink・dir でないなら `CheckpointError(unsafe_path)` (何も作らず・動かさない)。
+    元の最後の名前が symlink のときも辿らない (隔離は symlink そのものを動かさず断る)。"""
+    root = lib_checkpoint.SafeDir.open_root(registry_dir)
+    if root is None:
+        return 'missing'
+    try:
+        src = root.chain(src_parts)
+        if src is None:
+            return 'missing'
+        try:
+            st = src.lstat(src_name)
+            if st is None:
+                return 'missing'
+            if not stat.S_ISDIR(st.st_mode):
+                raise lib_checkpoint.CheckpointError(lib_checkpoint.E_PATH, 'not_a_dir')
+            dst = root.chain(dst_parts, create=True)
+            try:
+                if dst.exists(dst_name):
+                    return 'busy'
+                lib_checkpoint.move_between(src, src_name, dst, dst_name)
+            finally:
+                dst.close()
+        finally:
+            src.close()
+    finally:
+        root.close()
+    return 'moved'
+
+
 def quarantine_root(registry_dir):
     return os.path.join(registry_dir, 'checkpoints', QUARANTINE_DIRNAME)
 
@@ -189,14 +222,22 @@ def apply_quarantine(registry_dir, queue_dir, verdicts, now=None, days=DEFAULT_D
             results.append({'path': v.path, 'quarantined': False, 'reason': f"rejudged:{again.reason}"})
             continue
         dest = os.path.join(quarantine_root(registry_dir), stamp, v.mission, v.task, v.execution_id)
-        if os.path.lexists(dest):
-            results.append({'path': v.path, 'quarantined': False, 'reason': R_QUARANTINE_BUSY})
-            continue
+        # 元・先とも checkpoints/ 以下の各成分を symlink を辿らずに開き、その dir fd どうしで rename する
+        # (path 文字列の makedirs / rename は、途中の成分が symlink だと外の dir を作る・外から動かす)
         try:
-            os.makedirs(os.path.dirname(dest), mode=0o700, exist_ok=True)
-            os.rename(v.path, dest)
+            outcome = _move(registry_dir, ('checkpoints', v.mission, v.task), v.execution_id,
+                            ('checkpoints', QUARANTINE_DIRNAME, stamp, v.mission, v.task), v.execution_id)
+        except lib_checkpoint.CheckpointError as e:
+            results.append({'path': v.path, 'quarantined': False, 'reason': f"{R_UNSAFE_PATH}:{e.code}"})
+            continue
         except OSError as e:
             results.append({'path': v.path, 'quarantined': False, 'reason': f"rename-failed:{type(e).__name__}"})
+            continue
+        if outcome == 'busy':
+            results.append({'path': v.path, 'quarantined': False, 'reason': R_QUARANTINE_BUSY})
+            continue
+        if outcome == 'missing':
+            results.append({'path': v.path, 'quarantined': False, 'reason': f"{R_UNSAFE_PATH}:missing"})
             continue
         results.append({'path': v.path, 'quarantined': True, 'quarantine': dest})
     return results
@@ -233,13 +274,19 @@ def restore(registry_dir, given):
     if not matches:
         return False, 'no such quarantined checkpoint'
     q, orig = sorted(matches)[-1]          # 同じ元のパスが複数なら新しい隔離
-    if os.path.lexists(orig):
-        return False, 'destination exists (not overwritten)'
+    # 隔離先の 5 段 (checkpoints/.quarantine/<ts>/<m>/<t>) と元の 3 段 (checkpoints/<m>/<t>) を symlink を辿らずに開いて rename する
+    qrel = os.path.relpath(q, os.path.join(registry_dir, 'checkpoints')).split(os.sep)
+    orel = os.path.relpath(orig, os.path.join(registry_dir, 'checkpoints')).split(os.sep)
     try:
-        os.makedirs(os.path.dirname(orig), mode=0o700, exist_ok=True)
-        os.rename(q, orig)
+        outcome = _move(registry_dir, ('checkpoints', *qrel[:-1]), qrel[-1], ('checkpoints', *orel[:-1]), orel[-1])
+    except lib_checkpoint.CheckpointError as e:
+        return False, f"{R_UNSAFE_PATH}:{e.code}"
     except OSError as e:
         return False, f"rename-failed:{type(e).__name__}"
+    if outcome == 'busy':
+        return False, 'destination exists (not overwritten)'
+    if outcome == 'missing':
+        return False, f"{R_UNSAFE_PATH}:missing"
     return True, orig
 
 

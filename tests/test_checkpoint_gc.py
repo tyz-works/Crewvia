@@ -274,4 +274,4 @@ def test_gc_never_calls_a_deleting_function():
     forbidden = {"rmtree", "remove", "unlink", "rmdir", "removedirs", "system", "popen", "run", "Popen", "check_call",
                  "check_output", "call"}
     assert not (called & forbidden), sorted(called & forbidden)
-    assert "rename" in called
+    assert "move_between" in called            # 移動は lib_checkpoint.move_between (dir fd 基点の rename) の 1 か所

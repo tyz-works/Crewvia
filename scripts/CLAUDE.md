@@ -171,6 +171,10 @@ lib ごとの**破ってはいけない契約**の要約。理由・経緯・全
   | `untracked/` | 先頭から 64KB まで | 64KB を超えるファイルは**保存しない**（切り詰めない）ので鍵の途中で切れることが無い。上限以内は全体を redaction |
   | `pane.txt` | 末尾 200 行 | **200 行に切る前の全体**を redaction してから切る。`redact()` は BEGIN より前の END を「鍵の途中から始まる文字列」とみなして先頭から END までを伏せる |
   | `status.txt` / `binary-files.txt` / meta | パス | パスだけ（`path_is_secret`）。複数行の形が無い |
+- **git の env は allowlist**（fix 4 / t056）: `_git_env()` は `PATH` / `HOME` / `TMPDIR` / `TZ` だけ引き継ぎ、`GIT_*` は 1 つも引き継がない（denylist にしない。`GIT_LITERAL_PATHSPECS=1` で `:(exclude,literal)` の除外が外れた）。
+  **除外は二重の網**: git の pathspec + Python 側（`_drop_block_sections`）で patch の節を落とす。HEAD 側の鍵の印は pathspec を使わず全体を grep して突き合わせる。どちらかを変えたら「pathspec 側だけ壊す」「Python 側だけ壊す」の両方のテストが通ること。
+- **checkpoints/ 以下は symlink を辿らない**（fix 4 / t056）: `SafeDir`（dir fd。1 段ずつ `O_DIRECTORY | O_NOFOLLOW`）を基点に mkdir / write / rename / remove_tree する。path 文字列の `makedirs` / `open` / `rename` を足さない
+  （`O_NOFOLLOW` は最後の成分しか守らない）。symlink があれば `unsafe_path`（`E_PATH`。保存しない・退役は止めない）。`checkpoint_gc` の移動は `move_between` の 1 か所。テスト: `tests/test_checkpoint_git_env_allowlist_and_symlinked_ancestors.py`。
 - `take()` は相対の `registry_dir` を絶対パスにしてから作る・返す・再利用する（`verify` は相対を拒否するので、返す path をそのまま `retire --checkpoint` に渡せる）。`checkpoint_gc._taken_at_epoch` は `calendar.timegm`（UTC。`mktime` は夏時間でずれた）。テスト: `tests/test_checkpoint_multiline_secret_abs_path_and_gc_utc.py`。
 - `plan.sh retire --checkpoint <dir|none>` は**ロックの前**に `lib_checkpoint.verify`（meta.json の `execution_id` と dir 名が自分の試行と一致）。違えば exit 3・何も書かない。台帳の retire の `checkpoint_dir` に入り、`pull` の `previous_attempt.checkpoint_dir` に出る。
   **checkpoint の拒否は専用の固定コード `CHECKPOINT_INVALID`**（stderr の最後の行 `[plan.sh] error_code=…`）。watchdog（`lib_retirement._settle_terminated`）は exit 3 を**コードで読み分ける**: `RETIRE_SETTLED_CODES`（この試行はもう今の試行でない・task が別の状態・別の Worker・触れない = Director に報告済み）だけが marker を消し、`CHECKPOINT_INVALID` は同じ試行の照合のまま `--checkpoint none` でやり直し、**コードの無い・未知の exit 3 は消さず**再試行（`_cleanup_failed`）。retire に exit 3 の理由を足したらコードを付け、集合に入れるか決める（`tests/test_checkpoint_retirement_stage.py::test_every_exit_3_code_is_classified_on_purpose`）。

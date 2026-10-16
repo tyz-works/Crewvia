@@ -145,7 +145,8 @@ def test_a_value_over_the_scan_limit_raises_so_the_file_is_not_saved(monkeypatch
 
 def test_the_saved_file_never_holds_the_tail_of_a_long_value(tmp_path):
     v = secret_body(1_000_000)
-    info, count = ck._save_text(str(tmp_path), "f.txt", f'PASSWORD="{v}TAIL_SECRET"\n', limit=ck.PATCH_LIMIT)
+    with ck.SafeDir.open_root(tmp_path) as out:                 # 書き込みは dir fd 基点 (fix 4)
+        info, count = ck._save_text(out, "f.txt", f'PASSWORD="{v}TAIL_SECRET"\n', limit=ck.PATCH_LIMIT)
     saved = (tmp_path / "f.txt").read_text()
     assert info is not None and count == 1
     assert "TAIL_SECRET" not in saved and v[-12:] not in saved

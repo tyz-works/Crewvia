@@ -241,6 +241,16 @@ reopen は依存の辺を足さないので、循環を作らない。下流の�
   **再送の比較（`HISTORY_MISMATCH`）から `checkpoint_dir` は除いた**: 孤児の台帳（retire が card の前に落ちた）の後で、watchdog が取り直した checkpoint が前と違いうる（前は失敗して none、今度は取れた）。違いで退役を割らず、先に書いた台帳の値が残る。
 - **`checkpoint_gc.py`**: `worktree_gc.py` と同じ作法（既定 dry-run・`--apply` は `os.rename` で `registry/checkpoints/.quarantine/<UTC 時刻>/<mission>/<task>/<ID>` へ隔離・`--restore`・`--list-quarantine`・隔離の直前に判定をやり直す・削除を呼ばない = AST テスト）。
   対象は「meta が読める ∧ 保存から 30 日以上（`taken_at`）∧ card が**読めて** done / verified / skipped」。mission dir に無ければ archive の card を見る。card が無い・壊れている・終端でない（reopen された task を含む）・`.partial`・形の違う dir・symlink は残す。
+- **PR #307 の Codex 4 巡目（t056）で直した 2 点**（P1×1・P2×1）:
+  - **git の env は allowlist**（P1）: 旧実装は denylist で `GIT_*` を落としていたため、`GIT_LITERAL_PATHSPECS=1` を継ぐと `:(exclude,literal)<path>` が普通のファイル名になり、
+    鍵を含むファイルの除外が効かず、鍵の途中の変更が BEGIN / END なしで保存された。`_git_env()` は `PATH` / `HOME` / `TMPDIR` / `TZ` だけ引き継ぎ、`GIT_*` は 1 つも引き継がない
+    （`GIT_CONFIG_GLOBAL=/dev/null` 等と pathspec の 4 変数 = 0 を明示で置く）。族: pathspec の解釈・repo の差し替え・config の追加・外部プログラム・trace を 1 つずつ設定して take するテスト。
+    **除外は二重の網**: git の pathspec に加えて、git が返した patch を Python 側（`_drop_block_sections`。見出し・rename / copy 行のパスを引用符つきの形も含めて照合）でも落とす。
+    HEAD 側の鍵の印の検出（`git grep`）は pathspec を使わず HEAD 全体を 1 回 grep して Python で突き合わせる。テストは「pathspec 側だけ壊す」「Python 側だけ壊す」の両方で鍵の行が残らないこと。
+  - **保存先の symlink を辿らない**（P2）: `_mkdir` が既存の dir の symlink を辿り、`O_NOFOLLOW` は最後の成分しか守らなかった。`checkpoints/<mission>/<task>` が外を指すと、外を chmod し・
+    `<ID>.partial` を消し・外に書いた。`SafeDir`（dir fd）が `checkpoints` 以下を 1 段ずつ `O_DIRECTORY | O_NOFOLLOW` で開き、書く・消す・rename は全部その fd を基点にする
+    （基点の registry だけは辿る）。symlink（または dir でないもの）があれば `unsafe_path` で保存しない（外へ 1 バイトも書かず・消さず・chmod しない。退役は止めず、通知は今までどおり 1 回）。
+    `.partial` 自体が symlink のときも辿らず消さない。`checkpoint_gc` の隔離・復元も `lib_checkpoint.move_between`（元と先の dir fd を基点にした rename）を通る。
 - **観察用の手書き marker での確認**（本番、PR の merge 後）: 手書き marker（memory `observe-retirement-with-handwritten-marker-on-nonexistent-window`）で退役を走らせる前に、`python3 scripts/lib_checkpoint.py take --registry-dir registry --queue-dir queue --mission <m> --task <t> --execution <ex-…>` を dirty な worktree の試行に対して打ち、`meta.json` / `dirty.patch` / `untracked/` を見て、
   `grep -r` で生の秘密が無いこと、`python3 scripts/lib_checkpoint.py verify <dir> --execution <ex-…>` が通ることを確かめる。
 

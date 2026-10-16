@@ -73,6 +73,7 @@ E_EXISTS = 'exists_mismatch'
 E_ARGS = 'invalid_argument'
 E_VERIFY = 'verify_failed'
 E_NOTHING = 'nothing_to_save'
+E_PATH = 'unsafe_path'          # checkpoints/ 以下に symlink (または dir でないもの) がある: 外へ書かない・消さない
 
 
 class CheckpointError(Exception):
@@ -329,15 +330,20 @@ def path_is_secret(path):
 # git (読み取りだけ)
 # ---------------------------------------------------------------------------
 
-_GIT_ENV_DROP = ('GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES',
-                 'GIT_COMMON_DIR', 'GIT_NAMESPACE', 'GIT_EXTERNAL_DIFF', 'GIT_PAGER', 'GIT_CONFIG', 'GIT_CONFIG_GLOBAL',
-                 'GIT_CONFIG_SYSTEM', 'GIT_CONFIG_COUNT')
+#: git に引き継ぐ env (最小)。**`GIT_*` は 1 つも引き継がない**: pathspec の解釈を変えるもの (`GIT_LITERAL_PATHSPECS` で
+#: `:(exclude,literal)` が普通のファイル名になり、鍵を含むファイルの除外が効かなくなる)・repo を差し替えるもの
+#: (`GIT_DIR` / `GIT_WORK_TREE` / `GIT_INDEX_FILE` / `GIT_OBJECT_DIRECTORY` / `GIT_COMMON_DIR`)・config を足すもの
+#: (`GIT_CONFIG_COUNT` / `GIT_CONFIG_KEY_*` / `GIT_CONFIG_PARAMETERS`)・外部プログラムを起動するもの
+#: (`GIT_EXTERNAL_DIFF` / `GIT_PAGER` / `GIT_ASKPASS` …) を、列挙して落とす (denylist) と新しい変数が漏れる。
+_GIT_ENV_KEEP = ('PATH', 'HOME', 'TMPDIR', 'TZ')
 
 
 def _git_env():
-    env = {k: v for k, v in os.environ.items() if k not in _GIT_ENV_DROP and not k.startswith('GIT_CONFIG_')}
+    env = {k: os.environ[k] for k in _GIT_ENV_KEEP if k in os.environ}
     # global / system の設定 (LFS 等の filter.*) と属性は読まない。repo ローカルの filter は `_refuse_local_filters` が止める
     env.update(GIT_CONFIG_GLOBAL='/dev/null', GIT_CONFIG_NOSYSTEM='1', GIT_ATTR_NOSYSTEM='1')
+    # pathspec は既定の解釈 (magic が効く) に明示で固定する。`:(exclude,literal)` と `:(literal)` に頼っている
+    env.update(GIT_LITERAL_PATHSPECS='0', GIT_GLOB_PATHSPECS='0', GIT_NOGLOB_PATHSPECS='0', GIT_ICASE_PATHSPECS='0')
     env['GIT_OPTIONAL_LOCKS'] = '0'
     env['GIT_TERMINAL_PROMPT'] = '0'
     env['LC_ALL'] = 'C'
@@ -448,43 +454,169 @@ def _git_text(clock, worktree, *args, limit=GIT_READ_LIMIT):
 # 出力の書き込み (0700 / 0600・symlink を辿らない)
 # ---------------------------------------------------------------------------
 
-def _mkdir(path):
-    os.makedirs(path, mode=DIR_MODE, exist_ok=True)
-    os.chmod(path, DIR_MODE)
+_DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 
 
-def _write_file(path, data):
-    """新規作成だけ (O_EXCL | O_NOFOLLOW)。str は UTF-8。"""
-    if isinstance(data, str):
-        data = data.encode('utf-8')
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, FILE_MODE)
-    try:
-        view = memoryview(data)
-        while view:
-            written = os.write(fd, view)
-            view = view[written:]
-        os.fsync(fd)
-    finally:
-        os.close(fd)
+def _component_ok(name):
+    return isinstance(name, str) and name not in ('', '.', '..') and '/' not in name and '\x00' not in name
 
 
-def remove_tree(path):
-    """自分が作った dir の掃除 (partial 専用)。`rm -rf` ではなく、symlink を辿らず 1 つずつ unlink / rmdir する。"""
-    try:
-        st = os.lstat(path)
-    except FileNotFoundError:
-        return
-    if not stat.S_ISDIR(st.st_mode):
-        os.unlink(path)
-        return
-    for name in os.listdir(path):
-        child = os.path.join(path, name)
-        cst = os.lstat(child)
-        if stat.S_ISDIR(cst.st_mode):
-            remove_tree(child)
-        else:
-            os.unlink(child)
-    os.rmdir(path)
+class SafeDir:
+    """開いた dir の fd。**symlink を 1 つも辿らず**、この fd を基点に (`openat` / `mkdirat` / `unlinkat` / `renameat`) 書く・消す。
+
+    パスの文字列を `makedirs` / `open` / `rename` に渡すと、途中の成分が symlink のとき外を指す (`O_NOFOLLOW` は最後の成分しか
+    守らない)。ここは 1 段ずつ `O_DIRECTORY | O_NOFOLLOW` で開き、symlink (または dir でないもの) があれば `CheckpointError(E_PATH)`。
+    基点 (`open_root`) だけは辿る (設定で決めた registry の場所。別のディスクへの symlink でもよい)。
+    """
+
+    def __init__(self, fd):
+        self.fd = fd
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+    def close(self):
+        if self.fd is not None:
+            try:
+                os.close(self.fd)
+            except OSError:
+                pass
+            self.fd = None
+
+    @classmethod
+    def open_root(cls, path, create=False):
+        path = os.fspath(path)
+        if create:
+            os.makedirs(path, mode=DIR_MODE, exist_ok=True)
+        try:
+            return cls(os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC))
+        except FileNotFoundError:
+            if create:
+                raise
+            return None
+        except OSError as e:
+            raise CheckpointError(E_PATH, type(e).__name__)
+
+    def child(self, name, create=False, chmod=False):
+        """子 dir を開く (`SafeDir`)。無ければ `create` のとき 0700 で作り、`create=False` なら None。symlink は `E_PATH`。"""
+        if not _component_ok(name):
+            raise CheckpointError(E_PATH, 'name')
+        made = False
+        try:
+            fd = os.open(name, _DIR_FLAGS, dir_fd=self.fd)
+        except FileNotFoundError:
+            if not create:
+                return None
+            try:
+                os.mkdir(name, DIR_MODE, dir_fd=self.fd)
+                made = True
+            except FileExistsError:
+                pass
+            except OSError as e:
+                raise CheckpointError(E_WRITE, type(e).__name__)
+            try:
+                fd = os.open(name, _DIR_FLAGS, dir_fd=self.fd)
+            except OSError as e:
+                raise CheckpointError(E_PATH, type(e).__name__)
+        except OSError as e:              # ELOOP (symlink) / ENOTDIR (dir でない)
+            raise CheckpointError(E_PATH, type(e).__name__)
+        if made or chmod:
+            try:
+                os.fchmod(fd, DIR_MODE)
+            except OSError as e:
+                os.close(fd)
+                raise CheckpointError(E_PATH, type(e).__name__)
+        return SafeDir(fd)
+
+    def chain(self, names, create=False, chmod_last=False):
+        """`names` を 1 段ずつ開く。途中が無ければ (create=False) None。開いた中間の fd は閉じる。"""
+        cur = self
+        for i, name in enumerate(names):
+            nxt = cur.child(name, create=create, chmod=chmod_last and i == len(names) - 1)
+            if cur is not self:
+                cur.close()
+            if nxt is None:
+                return None
+            cur = nxt
+        return cur if cur is not self else SafeDir(os.dup(self.fd))
+
+    def lstat(self, name):
+        if not _component_ok(name):
+            raise CheckpointError(E_PATH, 'name')
+        try:
+            return os.stat(name, dir_fd=self.fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+
+    def exists(self, name):
+        return self.lstat(name) is not None
+
+    def is_symlink(self, name):
+        st = self.lstat(name)
+        return st is not None and stat.S_ISLNK(st.st_mode)
+
+    def write(self, name, data):
+        """新規作成だけ (O_EXCL | O_NOFOLLOW)。str は UTF-8。"""
+        if not _component_ok(name):
+            raise CheckpointError(E_PATH, 'name')
+        if isinstance(data, str):
+            data = data.encode('utf-8')
+        fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, FILE_MODE, dir_fd=self.fd)
+        try:
+            view = memoryview(data)
+            while view:
+                written = os.write(fd, view)
+                view = view[written:]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    def write_path(self, parts, data):
+        """`parts` の途中の dir を作りながら (symlink は辿らない) 最後の名前に書く。"""
+        cur = self
+        try:
+            for name in parts[:-1]:
+                nxt = cur.child(name, create=True)
+                if cur is not self:
+                    cur.close()
+                cur = nxt
+            cur.write(parts[-1], data)
+        finally:
+            if cur is not self:
+                cur.close()
+
+    def rename(self, src, dst):
+        if not (_component_ok(src) and _component_ok(dst)):
+            raise CheckpointError(E_PATH, 'name')
+        os.rename(src, dst, src_dir_fd=self.fd, dst_dir_fd=self.fd)
+
+    def remove_tree(self, name):
+        """自分が作った dir の掃除 (partial 専用)。`rm -rf` ではなく、symlink を辿らず 1 つずつ unlink / rmdir する。"""
+        st = self.lstat(name)
+        if st is None:
+            return
+        if not stat.S_ISDIR(st.st_mode):
+            os.unlink(name, dir_fd=self.fd)
+            return
+        sub = self.child(name)
+        if sub is not None:
+            try:
+                for entry in os.listdir(sub.fd):
+                    sub.remove_tree(entry)
+            finally:
+                sub.close()
+        os.rmdir(name, dir_fd=self.fd)
+
+
+def move_between(src, src_name, dst, dst_name):
+    """別々の `SafeDir` の間の rename (`checkpoint_gc` の隔離・復元)。上書きしない (先に `exists` で見る呼び出し元の責任)。"""
+    for name in (src_name, dst_name):
+        if not _component_ok(name):
+            raise CheckpointError(E_PATH, 'name')
+    os.rename(src_name, dst_name, src_dir_fd=src.fd, dst_dir_fd=dst.fd)
 
 
 def _truncate_bytes(text, limit):
@@ -515,6 +647,52 @@ def _drop_secret_sections(patch):
                 names.append(line)
         if any(is_secret_name(s) for h in names for s in re.split(r'[ "]+', h)) \
                 or any(path_is_secret(h) for h in names):
+            dropped += 1
+            continue
+        kept.append(sec)
+    return ''.join(kept), dropped
+
+
+def _git_quote(text):
+    """git の C 引用 (`core.quotePath` 既定): 制御文字・`"`・`\\`・非 ASCII のバイトがあれば `"..."` で囲み 8 進に。無ければそのまま。"""
+    raw = os.fsencode(text)
+    simple = {0x07: '\\a', 0x08: '\\b', 0x09: '\\t', 0x0a: '\\n', 0x0b: '\\v', 0x0c: '\\f', 0x0d: '\\r',
+              0x22: '\\"', 0x5c: '\\\\'}
+    if all(0x20 <= b < 0x7f and b not in (0x22, 0x5c) for b in raw):
+        return text
+    out = []
+    for b in raw:
+        if b in simple:
+            out.append(simple[b])
+        elif b < 0x20 or b >= 0x7f:
+            out.append('\\%03o' % b)
+        else:
+            out.append(chr(b))
+    return '"' + ''.join(out) + '"'
+
+
+def _drop_block_sections(patch, blocked):
+    """`(patch, 落とした件数)`。鍵の印があるファイル (`blocked`) の節を **Python 側でも** 落とす。git の pathspec による除外
+    (`:(exclude,literal)`) とは独立の網: どちらか一方が壊れても (env で pathspec の解釈が変わる・git の版) 鍵の hunk は残らない。
+    節の見出しと rename / copy 行に、`blocked` のパスが (`a/` `b/` 付き・引用符つきの形も) 現れたら落とす。"""
+    if not patch or not blocked:
+        return patch, 0
+    prefixed = re.compile('(?:' + '|'.join(
+        re.escape(' ' + _git_quote(prefix + path)) for path in blocked for prefix in ('a/', 'b/')) + r')(?=[ \t]|$)')
+    bare = {_git_quote(path) for path in blocked}
+    sections = re.split(r'(?m)^(?=diff --git )', patch)
+    kept, dropped = [], 0
+    for sec in sections:
+        if not sec.startswith('diff --git '):
+            kept.append(sec)
+            continue
+        hit = False
+        for ln in sec.split('\n', 12)[:12]:
+            if ln.startswith(('rename from ', 'rename to ', 'copy from ', 'copy to ')):
+                hit = hit or ln.split(' ', 2)[2] in bare
+            elif ln.startswith(('diff --git ', '--- ', '+++ ', 'Binary files ')):
+                hit = hit or bool(prefixed.search(ln))
+        if hit:
             dropped += 1
             continue
         kept.append(sec)
@@ -603,38 +781,64 @@ def take(*, registry_dir, queue_dir, mission, task, execution_id, reason='unknow
     # 相対の registry_dir は返す path・verify (絶対だけを受ける)・再実行の照合で食い違うので、作る前に絶対にする
     registry_dir = os.path.abspath(os.fspath(registry_dir))
     final = checkpoint_dir_of(registry_dir, mission, task, execution_id)
-    if os.path.lexists(final):
+    parts = ('checkpoints', mission, task)
+    # 既にあれば再利用 (ancestors は symlink を辿らずに開く。無ければ作らずに見るだけ)
+    root = SafeDir.open_root(registry_dir)
+    if root is not None:
         try:
-            verify(final, execution_id)
-        except CheckpointError:
-            raise CheckpointError(E_EXISTS)
-        return final
+            parent = root.chain(parts)
+        finally:
+            root.close()
+        if parent is not None:
+            try:
+                exists = parent.exists(execution_id)
+            finally:
+                parent.close()
+            if exists:
+                try:
+                    verify(final, execution_id)
+                except CheckpointError:
+                    raise CheckpointError(E_EXISTS)
+                return final
     if worktree is None:
         worktree = worktree_of_record(queue_dir, mission, execution_id)
     worktree_real = os.path.realpath(worktree)
-    partial = final + PARTIAL_SUFFIX
+    partial_name = execution_id + PARTIAL_SUFFIX
+    root = SafeDir.open_root(registry_dir, create=True)
     try:
-        _mkdir(os.path.dirname(final))
-        if os.path.lexists(partial):
-            remove_tree(partial)
-        _mkdir(partial)
-        meta = _build(clock, partial, worktree_real, mission, task, execution_id, reason, pane_text, now)
-        _write_file(os.path.join(partial, META_NAME), json.dumps(meta, ensure_ascii=False, indent=2, sort_keys=True) + '\n')
-        clock.check()
-        os.rename(partial, final)
-    except CheckpointError:
-        _discard(partial)
-        raise
-    except Exception as e:  # noqa: BLE001 — 退役を止めない側に倒す。型名だけ残す
-        _discard(partial)
-        raise CheckpointError(E_WRITE, type(e).__name__)
+        parent = root.chain(parts, create=True, chmod_last=True)       # mission / task が symlink なら E_PATH (何も書かず・消さない)
+    finally:
+        root.close()
+    try:
+        st = parent.lstat(partial_name)
+        if st is not None:
+            if stat.S_ISLNK(st.st_mode):
+                raise CheckpointError(E_PATH, 'partial_is_symlink')     # 外を指しているかもしれない: 辿らず・消さず・保存しない
+            parent.remove_tree(partial_name)
+        out = parent.child(partial_name, create=True)
+        try:
+            try:
+                meta = _build(clock, out, worktree_real, mission, task, execution_id, reason, pane_text, now)
+                out.write(META_NAME, json.dumps(meta, ensure_ascii=False, indent=2, sort_keys=True) + '\n')
+                clock.check()
+            finally:
+                out.close()
+            parent.rename(partial_name, execution_id)
+        except CheckpointError:
+            _discard(parent, partial_name)
+            raise
+        except Exception as e:  # noqa: BLE001 — 退役を止めない側に倒す。型名だけ残す
+            _discard(parent, partial_name)
+            raise CheckpointError(E_WRITE, type(e).__name__)
+    finally:
+        parent.close()
     return final
 
 
-def _discard(path):
+def _discard(parent, name):
     try:
-        remove_tree(path)
-    except OSError:
+        parent.remove_tree(name)
+    except (OSError, CheckpointError):
         pass
 
 
@@ -683,6 +887,8 @@ def _build(clock, out, worktree, mission, task, execution_id, reason, pane_text,
         patch_raw, patch_trunc = _git_text(clock, worktree, 'diff', 'HEAD', '--no-ext-diff', '--no-textconv', '--no-color',
                                         '--ignore-submodules=all', *pathspec)
         patch_raw, secret_dropped = _drop_secret_sections(patch_raw)
+        patch_raw, _extra = _drop_block_sections(patch_raw, block_paths)      # pathspec とは独立の網 (二重)
+        secret_dropped += _extra
     saved, n = _save_text(out, 'dirty.patch', patch_raw, limit=PATCH_LIMIT) if patch_raw else (False, 0)
     redactions += n
     info = _file_info(saved, patch_trunc)
@@ -698,8 +904,9 @@ def _build(clock, out, worktree, mission, task, execution_id, reason, pane_text,
     numstat, _ = _git_text(clock, worktree, 'diff', 'HEAD', '--numstat', '-z', '--no-ext-diff', '--no-textconv',
                               '--ignore-submodules=all', *pathspec)
     secret_excluded = secret_dropped + status_secret_dropped
+    block_set = set(block_paths or ())
     for path in _numstat_binary_paths(numstat):
-        if path_is_secret(path):
+        if path_is_secret(path) or path in block_set:
             secret_excluded += 1
             continue
         binary_lines.append(_binary_line(clock, worktree, path))
@@ -713,7 +920,7 @@ def _build(clock, out, worktree, mission, task, execution_id, reason, pane_text,
     files['untracked'] = untracked_info
 
     if binary_lines:
-        _write_file(os.path.join(out, 'binary-files.txt'), '\n'.join(binary_lines) + '\n')
+        out.write('binary-files.txt', '\n'.join(binary_lines) + '\n')
 
     # pane.txt: 200 行に切る**前**の全体を redaction に通す (切り口が鍵の途中にかかっても BEGIN が見えなくならない)
     if pane_text:
@@ -783,14 +990,17 @@ def _changed_entries(clock, worktree):
 
 
 def _head_marked(clock, worktree, paths):
-    """HEAD 側で鍵の印を含むファイルの集合。観測できなければ None (全部印ありとして扱う側)。"""
-    spec = [f":(literal){p}" for p in paths] if len(paths) <= 500 else []
+    """HEAD 側で鍵の印を含むファイルの集合 (`paths` との共通部分)。観測できなければ None (全部印ありとして扱う側)。
+
+    pathspec で絞らず HEAD 全体を 1 回 grep し、`paths` との突き合わせは Python でする (pathspec の解釈が env などで変わっても、
+    取りこぼして『印なし』にならない)。出力が上限を超えたら観測できなかった扱い。"""
     rc, out, truncated = _run_git(clock, worktree, 'grep', '-l', '-z', '-a', '-F', '--no-textconv', '-e',
-                                  _KEY_MARK.decode(), 'HEAD', '--', *spec, check=False)
+                                  _KEY_MARK.decode(), 'HEAD', check=False)
     if truncated or rc not in (0, 1):
         return None
     prefix = 'HEAD:'
-    return {n[len(prefix):] for n in os.fsdecode(out).split('\x00') if n.startswith(prefix)}
+    found = {n[len(prefix):] for n in os.fsdecode(out).split('\x00') if n.startswith(prefix)}
+    return found & set(paths)
 
 
 def _worktree_side_blocked(worktree, path):
@@ -862,7 +1072,7 @@ def _save_text(out, name, text, *, limit, redacted=False):
         except Exception:  # noqa: BLE001 — 生のまま残さない側に倒す
             return None, 0
     body, original, truncated = _truncate_bytes(red, limit)
-    _write_file(os.path.join(out, name), body)
+    out.write(name, body)
     return {'truncated': truncated, 'original_size': original, 'saved_size': len(body.encode('utf-8'))}, count
 
 
@@ -923,7 +1133,7 @@ def _save_untracked(clock, out, worktree):
         if path_is_secret(rel):
             secret_excluded += 1
             continue
-        if rel.endswith('/') or os.path.isabs(rel) or '..' in rel.split('/'):
+        if os.path.isabs(rel) or not all(_component_ok(c) for c in rel.split('/')):
             listed.append({'path': rel, 'reason': 'not_a_file'})
             continue
         full = os.path.join(worktree, rel)
@@ -974,9 +1184,7 @@ def _save_untracked(clock, out, worktree):
             redaction_failed += 1
             listed.append({'path': rel, 'reason': 'redaction_failed'})
             continue
-        dest = os.path.join(out, 'untracked', rel)
-        _mkdir(os.path.dirname(dest))
-        _write_file(dest, red)
+        out.write_path(('untracked', *rel.split('/')), red)
         total += len(red.encode('utf-8'))
         redactions += count
         saved_names.append(rel)

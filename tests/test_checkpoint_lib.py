@@ -203,7 +203,8 @@ def test_secret_named_files_are_not_saved_anywhere(wt, tmp_path):
 
 
 def test_secret_contents_are_redacted_in_every_saved_file_and_counted(wt, tmp_path):
-    (wt / "a.txt").write_text(SECRET_TEXT)                              # patch に載る
+    # patch に載る (鍵のブロックを含む tracked ファイルは hunk ごと載せない = t052。そちらは別のテスト)
+    (wt / "a.txt").write_text(SECRET_TEXT.replace(PRIVATE_KEY + "\n", ""))
     (wt / "notes.txt").write_text(SECRET_TEXT)                          # untracked
     d = pathlib.Path(take(wt, tmp_path, pane_text="pane " + SECRET_TEXT))
     blob = all_saved_bytes(d).decode("utf-8", "replace")
@@ -212,7 +213,7 @@ def test_secret_contents_are_redacted_in_every_saved_file_and_counted(wt, tmp_pa
     assert "[REDACTED:" in (d / "dirty.patch").read_text()
     assert "[REDACTED:" in (d / "untracked" / "notes.txt").read_text()
     assert "[REDACTED:" in (d / "pane.txt").read_text()
-    assert meta_of(d)["redactions"] >= 3 * 8
+    assert meta_of(d)["redactions"] >= 3 * 8 - 1                        # patch は鍵のブロックを含まない分 1 つ少ない
 
 
 @pytest.mark.parametrize("raw", [GH, SK, AWS, SLACK, OP_REF, "github" + "_pat_" + "E" * 40, "gh" + "o_" + "F" * 30])

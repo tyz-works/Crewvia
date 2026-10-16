@@ -21,6 +21,7 @@ patch・untracked を含むので溜め続けない。`worktree_gc.py` と同じ
 実際の削除はこのツールの外、人間が手で行う。隔離する直前に判定をやり直す。
 """
 import argparse
+import calendar
 import json
 import os
 import re
@@ -79,7 +80,7 @@ def _listdir(path):
 
 def _taken_at_epoch(value):
     try:
-        return time.mktime(time.strptime(value, '%Y-%m-%dT%H:%M:%SZ')) - time.timezone
+        return calendar.timegm(time.strptime(value, '%Y-%m-%dT%H:%M:%SZ'))
     except (TypeError, ValueError):
         return None
 

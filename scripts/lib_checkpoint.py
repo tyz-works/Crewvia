@@ -281,9 +281,16 @@ def redact(text):
     counter = [0]
     out = []
     pos = 0
-    # 1. 秘密鍵: BEGIN から END まで (END が無ければ末尾まで)。regex の `.*?` を使わず find で線形にする
+    # 1. 秘密鍵: BEGIN から END まで (END が無ければ末尾まで)。regex の `.*?` を使わず find で線形にする。
+    #    BEGIN より前に END が見えたら、鍵の途中から始まる文字列 (切り出した hunk・ペインの上端) なので先頭から END までを伏せる
     while True:
         m = _BEGIN_KEY.search(text, pos)
+        stray = _END_KEY_RE.search(text, pos)
+        if stray and (not m or stray.start() < m.start()):
+            counter[0] += 1
+            out.append(f"[REDACTED:{counter[0]}]")
+            pos = stray.end()
+            continue
         if not m:
             out.append(text[pos:])
             break
@@ -589,6 +596,8 @@ def take(*, registry_dir, queue_dir, mission, task, execution_id, reason='unknow
     `worktree` は試験用 (無ければ record から)。`pane_text` は呼び出し側がペインが生きているときだけ渡す。
     """
     clock = _Clock(seconds, now)
+    # 相対の registry_dir は返す path・verify (絶対だけを受ける)・再実行の照合で食い違うので、作る前に絶対にする
+    registry_dir = os.path.abspath(os.fspath(registry_dir))
     final = checkpoint_dir_of(registry_dir, mission, task, execution_id)
     if os.path.lexists(final):
         try:
@@ -657,14 +666,24 @@ def _build(clock, out, worktree, mission, task, execution_id, reason, pane_text,
     skipped_redaction += 0 if saved else 1
     files['status'] = _file_info(saved, status_trunc)
 
-    # dirty.patch
-    patch_raw, patch_trunc = _git_text(clock, worktree, 'diff', 'HEAD', '--no-ext-diff', '--no-textconv', '--no-color',
-                                    '--ignore-submodules=all')
-    patch_raw, secret_dropped = _drop_secret_sections(patch_raw)
+    # dirty.patch: redaction が見るのは hunk (前後 3 行) だけなので、複数行の秘密 (鍵のブロック) の途中だけが変わると BEGIN が
+    # hunk に入らない。変更のあったファイルは HEAD 側・worktree 側とも全体を見て、鍵の印があるファイル (全体を見られないものも)
+    # の hunk は patch に入れない
+    block_paths = _secret_block_paths(clock, worktree)
+    pathspec = []
+    if block_paths is not None:
+        pathspec = ['--', '.', *(f":(exclude,literal){p}" for p in block_paths)]
+    if block_paths is None:
+        patch_raw, patch_trunc, secret_dropped = '', False, 0
+    else:
+        patch_raw, patch_trunc = _git_text(clock, worktree, 'diff', 'HEAD', '--no-ext-diff', '--no-textconv', '--no-color',
+                                        '--ignore-submodules=all', *pathspec)
+        patch_raw, secret_dropped = _drop_secret_sections(patch_raw)
     saved, n = _save_text(out, 'dirty.patch', patch_raw, limit=PATCH_LIMIT) if patch_raw else (False, 0)
     redactions += n
     info = _file_info(saved, patch_trunc)
-    info.update(secret_files_dropped=secret_dropped)
+    block_dropped = len(block_paths) if block_paths is not None else None
+    info.update(secret_files_dropped=secret_dropped, secret_block_files_dropped=block_dropped, withheld=block_paths is None)
     if patch_raw and not saved:
         skipped_redaction += 1
     files['dirty_patch'] = info
@@ -673,7 +692,7 @@ def _build(clock, out, worktree, mission, task, execution_id, reason, pane_text,
     binary_lines = []
     clock.check()
     numstat, _ = _git_text(clock, worktree, 'diff', 'HEAD', '--numstat', '-z', '--no-ext-diff', '--no-textconv',
-                              '--ignore-submodules=all')
+                              '--ignore-submodules=all', *pathspec)
     secret_excluded = secret_dropped + status_secret_dropped
     for path in _numstat_binary_paths(numstat):
         if path_is_secret(path):
@@ -692,11 +711,18 @@ def _build(clock, out, worktree, mission, task, execution_id, reason, pane_text,
     if binary_lines:
         _write_file(os.path.join(out, 'binary-files.txt'), '\n'.join(binary_lines) + '\n')
 
-    # pane.txt
+    # pane.txt: 200 行に切る**前**の全体を redaction に通す (切り口が鍵の途中にかかっても BEGIN が見えなくならない)
     if pane_text:
         clock.check()
-        tail = '\n'.join(pane_text.splitlines()[-PANE_LINES:])
-        saved, n = _save_text(out, 'pane.txt', tail + '\n', limit=PATCH_LIMIT)
+        saved, n = None, 0
+        if len(pane_text) <= GIT_READ_LIMIT:
+            try:
+                whole, n = redact(pane_text)
+            except Exception:  # noqa: BLE001
+                whole = None
+            if whole is not None:
+                tail = '\n'.join(whole.splitlines()[-PANE_LINES:])
+                saved, _ = _save_text(out, 'pane.txt', tail + '\n', limit=PATCH_LIMIT, redacted=True)
         redactions += n
         skipped_redaction += 0 if saved else 1
         files['pane'] = {'saved': bool(saved), 'lines': min(PANE_LINES, len(pane_text.splitlines()))}
@@ -719,9 +745,99 @@ def _build(clock, out, worktree, mission, task, execution_id, reason, pane_text,
         'binary_files': len(binary_lines),
         'binary_restorable': False,
         'secret_files_excluded': secret_excluded,
+        'secret_block_files_dropped': block_dropped,
         'redactions': redactions,
         'redaction_failed_files': skipped_redaction,
     }
+
+
+#: 変更のあったファイルを全体で調べる上限 (超えたら patch ごと保存しない)
+MAX_SCAN_PATHS = 5000
+#: patch から外すファイルの上限 (pathspec の引数の長さ。超えたら patch ごと保存しない)
+MAX_BLOCK_PATHS = 200
+#: 1 ファイルを全体で読む上限 (超えたら全体を見られないので外す側)
+SCAN_FILE_LIMIT = 8 * 1024 * 1024
+_KEY_MARK = b'PRIVATE KEY-----'
+
+
+def _changed_entries(clock, worktree):
+    """`[(状態1文字, path)]` (rename 検出なし = 旧パスと新パスが別の行)。読み切れなければ None。"""
+    raw, truncated = _git_text(clock, worktree, 'diff', 'HEAD', '--name-status', '-z', '--no-renames', '--no-ext-diff',
+                               '--no-textconv', '--ignore-submodules=all')
+    if truncated:
+        return None
+    parts = raw.split('\x00')
+    entries, i = [], 0
+    while i + 1 < len(parts):
+        status, path = parts[i], parts[i + 1]
+        if not status or not path:
+            return None
+        entries.append((status[0], path))
+        i += 2
+    return entries if parts[i:] in ([], ['']) else None
+
+
+def _head_marked(clock, worktree, paths):
+    """HEAD 側で鍵の印を含むファイルの集合。観測できなければ None (全部印ありとして扱う側)。"""
+    spec = [f":(literal){p}" for p in paths] if len(paths) <= 500 else []
+    rc, out, truncated = _run_git(clock, worktree, 'grep', '-l', '-z', '-a', '-F', '--no-textconv', '-e',
+                                  _KEY_MARK.decode(), 'HEAD', '--', *spec, check=False)
+    if truncated or rc not in (0, 1):
+        return None
+    prefix = 'HEAD:'
+    return {n[len(prefix):] for n in out.decode('utf-8', errors='replace').split('\x00') if n.startswith(prefix)}
+
+
+def _worktree_side_blocked(worktree, path):
+    """worktree 側の全体を見て、鍵の印がある / 全体を見られない (読めない・大きすぎる・通常ファイルでない) なら True。"""
+    if os.path.isabs(path) or '..' in path.split('/'):
+        return True
+    full = os.path.join(worktree, path)
+    try:
+        real_dir = os.path.realpath(os.path.dirname(full))
+        if real_dir != worktree and not real_dir.startswith(worktree.rstrip('/') + '/'):
+            return True
+        st = os.lstat(full)
+        if stat.S_ISLNK(st.st_mode):
+            return _KEY_MARK in os.fsencode(os.readlink(full))
+        if not stat.S_ISREG(st.st_mode):
+            return True
+        fd = os.open(full, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return True
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return True
+        data = os.read(fd, SCAN_FILE_LIMIT + 1)
+        while len(data) <= SCAN_FILE_LIMIT:
+            more = os.read(fd, SCAN_FILE_LIMIT + 1 - len(data))
+            if not more:
+                break
+            data += more
+    except OSError:
+        return True
+    finally:
+        os.close(fd)
+    return len(data) > SCAN_FILE_LIMIT or _KEY_MARK in data
+
+
+def _secret_block_paths(clock, worktree):
+    """patch から hunk を外すファイルの path の一覧。patch ごと保存すべきでないときは None (数が多すぎて全体を見られない等)。"""
+    entries = _changed_entries(clock, worktree)
+    if entries is None or len(entries) > MAX_SCAN_PATHS:
+        return None
+    head_paths = sorted({p for s, p in entries if s != 'A'})
+    marked = set()
+    if head_paths:
+        got = _head_marked(clock, worktree, head_paths)
+        marked = set(head_paths) if got is None else got
+    blocked = []
+    for status, path in entries:
+        clock.check()
+        if path in marked or (status != 'D' and _worktree_side_blocked(worktree, path)):
+            blocked.append(path)
+    blocked = sorted(set(blocked))
+    return blocked if len(blocked) <= MAX_BLOCK_PATHS else None
 
 
 def _file_info(saved, truncated_at_read):
@@ -730,12 +846,16 @@ def _file_info(saved, truncated_at_read):
             'saved_size': saved.get('saved_size') if saved else None}
 
 
-def _save_text(out, name, text, *, limit):
-    """redaction → 切り詰め → 書き込み。`(info | None, 置換の件数)`。redaction が例外なら保存しない (info=None)。"""
-    try:
-        red, count = redact(text)
-    except Exception:  # noqa: BLE001 — 生のまま残さない側に倒す
-        return None, 0
+def _save_text(out, name, text, *, limit, redacted=False):
+    """redaction → 切り詰め → 書き込み。`(info | None, 置換の件数)`。redaction が例外なら保存しない (info=None)。
+    `redacted=True` は呼び出し側が全体を redaction 済み (二重に通さない)。"""
+    if redacted:
+        red, count = text, 0
+    else:
+        try:
+            red, count = redact(text)
+        except Exception:  # noqa: BLE001 — 生のまま残さない側に倒す
+            return None, 0
     body, original, truncated = _truncate_bytes(red, limit)
     _write_file(os.path.join(out, name), body)
     return {'truncated': truncated, 'original_size': original, 'saved_size': len(body.encode('utf-8'))}, count

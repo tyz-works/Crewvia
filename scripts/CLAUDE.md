@@ -164,6 +164,14 @@ lib ごとの**破ってはいけない契約**の要約。理由・経緯・全
   **値の長さに上限を置かない**（fix 1）: 印（キー名・prefix）を regex で見つけ、値は区切り（空白・引用符・行末）まで線形に読み進めて丸ごと置き換える。`VALUE_SCAN_LIMIT`（4MB）を超える値は `RedactionError` = そのファイルを保存しない。
   **出力に出るパスはすべて `path_is_secret`**（名前の規則 + 内容と同じ redaction）を通す: untracked/ の保存名・`listed_only`・`binary-files.txt`・`status.txt`（rename は旧パスごと）・`dirty.patch` のヘッダ・meta の branch / worktree。秘密を含む名前は保存も列挙もせず `secret_files_excluded` に数える。
   バイナリ（tracked の差分・untracked とも）の内容は保存しない（`binary-files.txt` に名前・サイズ・blob sha だけ・`binary_restorable: false`）。パターンは入れ子の量指定子を使わない（1MB の 1 行がテストで線形）。
+- **複数行の秘密は「全体が見えるか」で決める**（fix 3 / t052）。redaction は渡された文字列しか見ないので、一部だけを渡す経路は BEGIN / END が見えなくなる所で漏れる。経路ごとの規則:
+  | 保存物 | 渡すもの | 規則 |
+  |---|---|---|
+  | `dirty.patch` | hunk（前後 3 行） | 変更のあったファイルを **HEAD 側（`git grep` 1 回）と worktree 側（全体を読む）**で調べ、`PRIVATE KEY-----` の印があるファイルは `:(exclude,literal)` で patch から外す。読めない・8MB 超・通常ファイルでない・symlink の dir は外す側。外した数は meta の `secret_block_files_dropped`（名前・中身は出さない）。件数が `MAX_SCAN_PATHS` / `MAX_BLOCK_PATHS` を超えたら patch ごと保存しない（`withheld`） |
+  | `untracked/` | 先頭から 64KB まで | 64KB を超えるファイルは**保存しない**（切り詰めない）ので鍵の途中で切れることが無い。上限以内は全体を redaction |
+  | `pane.txt` | 末尾 200 行 | **200 行に切る前の全体**を redaction してから切る。`redact()` は BEGIN より前の END を「鍵の途中から始まる文字列」とみなして先頭から END までを伏せる |
+  | `status.txt` / `binary-files.txt` / meta | パス | パスだけ（`path_is_secret`）。複数行の形が無い |
+- `take()` は相対の `registry_dir` を絶対パスにしてから作る・返す・再利用する（`verify` は相対を拒否するので、返す path をそのまま `retire --checkpoint` に渡せる）。`checkpoint_gc._taken_at_epoch` は `calendar.timegm`（UTC。`mktime` は夏時間でずれた）。テスト: `tests/test_checkpoint_multiline_secret_abs_path_and_gc_utc.py`。
 - `plan.sh retire --checkpoint <dir|none>` は**ロックの前**に `lib_checkpoint.verify`（meta.json の `execution_id` と dir 名が自分の試行と一致）。違えば exit 3・何も書かない。台帳の retire の `checkpoint_dir` に入り、`pull` の `previous_attempt.checkpoint_dir` に出る。
   **checkpoint の拒否は専用の固定コード `CHECKPOINT_INVALID`**（stderr の最後の行 `[plan.sh] error_code=…`）。watchdog（`lib_retirement._settle_terminated`）は exit 3 を**コードで読み分ける**: `RETIRE_SETTLED_CODES`（この試行はもう今の試行でない・task が別の状態・別の Worker・触れない = Director に報告済み）だけが marker を消し、`CHECKPOINT_INVALID` は同じ試行の照合のまま `--checkpoint none` でやり直し、**コードの無い・未知の exit 3 は消さず**再試行（`_cleanup_failed`）。retire に exit 3 の理由を足したらコードを付け、集合に入れるか決める（`tests/test_checkpoint_retirement_stage.py::test_every_exit_3_code_is_classified_on_purpose`）。
   台帳の再送の比較（`HISTORY_MISMATCH`）から `checkpoint_dir` は除く（取り直した checkpoint が前と違っても退役を割らない）。

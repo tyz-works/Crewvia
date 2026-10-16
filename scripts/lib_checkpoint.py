@@ -283,9 +283,13 @@ def redact(text):
     pos = 0
     # 1. 秘密鍵: BEGIN から END まで (END が無ければ末尾まで)。regex の `.*?` を使わず find で線形にする。
     #    BEGIN より前に END が見えたら、鍵の途中から始まる文字列 (切り出した hunk・ペインの上端) なので先頭から END までを伏せる
+    # 見つけた印は pos を越えるまで持ち回す (毎回先頭から探し直すと END だけが並ぶ入力で二乗になる)。None は「これ以降に無い」
+    m = stray = False
     while True:
-        m = _BEGIN_KEY.search(text, pos)
-        stray = _END_KEY_RE.search(text, pos)
+        if m is False or (m is not None and m.start() < pos):
+            m = _BEGIN_KEY.search(text, pos)
+        if stray is False or (stray is not None and stray.start() < pos):
+            stray = _END_KEY_RE.search(text, pos)
         if stray and (not m or stray.start() < m.start()):
             counter[0] += 1
             out.append(f"[REDACTED:{counter[0]}]")
@@ -762,10 +766,11 @@ _KEY_MARK = b'PRIVATE KEY-----'
 
 def _changed_entries(clock, worktree):
     """`[(状態1文字, path)]` (rename 検出なし = 旧パスと新パスが別の行)。読み切れなければ None。"""
-    raw, truncated = _git_text(clock, worktree, 'diff', 'HEAD', '--name-status', '-z', '--no-renames', '--no-ext-diff',
-                               '--no-textconv', '--ignore-submodules=all')
+    _rc, data, truncated = _run_git(clock, worktree, 'diff', 'HEAD', '--name-status', '-z', '--no-renames', '--no-ext-diff',
+                                    '--no-textconv', '--ignore-submodules=all')
     if truncated:
         return None
+    raw = os.fsdecode(data)         # surrogateescape: UTF-8 でない名前も、argv に戻すと元のバイト列になる (exclude が外れない)
     parts = raw.split('\x00')
     entries, i = [], 0
     while i + 1 < len(parts):
@@ -785,7 +790,7 @@ def _head_marked(clock, worktree, paths):
     if truncated or rc not in (0, 1):
         return None
     prefix = 'HEAD:'
-    return {n[len(prefix):] for n in out.decode('utf-8', errors='replace').split('\x00') if n.startswith(prefix)}
+    return {n[len(prefix):] for n in os.fsdecode(out).split('\x00') if n.startswith(prefix)}
 
 
 def _worktree_side_blocked(worktree, path):

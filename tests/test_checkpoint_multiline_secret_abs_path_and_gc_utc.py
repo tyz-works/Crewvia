@@ -216,6 +216,30 @@ def test_redact_hides_a_stray_end_marker_prefix_and_a_normal_block_as_before():
     assert out2.startswith("a\n[REDACTED:1]") and out2.endswith("b\n") and n2 == 1
 
 
+def test_a_non_utf8_file_name_is_still_excluded_from_the_patch(wt, tmp_path):
+    name = os.fsdecode(b"cfg-\xff\xfe.txt")
+    (wt / name).write_text("h1\nh2\nh3\nh4\n" + key_block() + "f1\nf2\nf3\nf4\n")
+    git(wt, "add", "-A")
+    git(wt, "commit", "-q", "-m", "non-utf8 name")
+    text = (wt / name).read_text().split("\n")
+    text[10] = "CHANGED"
+    (wt / name).write_text("\n".join(text))
+    d = pathlib.Path(take(wt, tmp_path))
+    assert_no_secret(d)
+    assert meta_of(d)["secret_block_files_dropped"] == 1
+
+
+@pytest.mark.parametrize("n", [64 * 1024, 1024 * 1024])
+def test_redact_of_only_end_markers_is_linear(n):
+    text = (END + "\n") * (n // 30)
+    t0 = time.perf_counter()
+    out, count = ck.redact(text)
+    assert count == n // 30 and time.perf_counter() - t0 < 5
+    big = time.perf_counter()
+    ck.redact((END + "\n") * (16 * n // 30))
+    assert time.perf_counter() - big < 20
+
+
 # ---------------------------------------------------------------------------------------------- 相対の registry_dir
 
 def test_relative_registry_dir_is_made_absolute_and_the_result_verifies_and_rerun_is_idempotent(wt, tmp_path, monkeypatch):

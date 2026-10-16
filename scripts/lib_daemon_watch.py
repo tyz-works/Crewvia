@@ -257,6 +257,8 @@ DAEMON_RESTART_FILES = {
         # E4a (01c): lib_retirement が退役 marker に書く試行の ID を読むために import する
         "scripts/lib_execution.py",
         "scripts/lib_task_status.py",
+        # vNext 02 PR-G: lib_retirement が退役の直前の checkpoint に使う (呼ぶ時に import するが、起動後の変更は拾わない)
+        "scripts/lib_checkpoint.py",
     ),
 }
 

@@ -238,18 +238,24 @@ def test_private_key_block_is_replaced_and_unterminated_block_goes_to_the_end():
     assert PRIV_BODY not in out2 and "more" not in out2 and n2 == 1
 
 
-@pytest.mark.parametrize("line", [
-    "A" * (1024 * 1024),
-    "TOKEN" * 200000,
-    "sk-" * 350000,
-    "Bearer " * 150000,
-    "-----BEGIN PRIVATE KEY-----" * 40000,
-    "ghp_" + "a" * 1000000,
-    "PASSWORD=" + "z" * 1000000,
-    "op://" + "q" * 1000000,
-    (" " * 7 + "=") * 100000,
-])
-def test_redaction_is_linear_on_one_megabyte_adversarial_lines(line):
+# 入力は**テストの中で作る**。parametrize の値に 1MB の文字列を置くと pytest の node id になり、CI (`pytest -v`) が
+# 数 MB の 1 行をログに流して Actions のログ処理が詰まる (PR #307 で pytest が 60 分超で終わらなかった)。
+ADVERSARIAL_LINES = {
+    "plain": lambda: "A" * (1024 * 1024),
+    "token_repeat": lambda: "TOKEN" * 200000,
+    "sk_repeat": lambda: "sk-" * 350000,
+    "bearer_repeat": lambda: "Bearer " * 150000,
+    "begin_key_repeat": lambda: "-----BEGIN PRIVATE KEY-----" * 40000,
+    "ghp_long": lambda: "ghp_" + "a" * 1000000,
+    "password_long": lambda: "PASSWORD=" + "z" * 1000000,
+    "op_long": lambda: "op://" + "q" * 1000000,
+    "spaces_equals": lambda: (" " * 7 + "=") * 100000,
+}
+
+
+@pytest.mark.parametrize("name", sorted(ADVERSARIAL_LINES))
+def test_redaction_is_linear_on_one_megabyte_adversarial_lines(name):
+    line = ADVERSARIAL_LINES[name]()
     t0 = time.monotonic()
     ck.redact(line)
     assert time.monotonic() - t0 < 5.0, "バックトラックしている疑い (1MB の 1 行が 5 秒を超えた)"

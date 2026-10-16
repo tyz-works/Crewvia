@@ -3300,6 +3300,14 @@ _PULL_EXECUTION_EXIT_CODES = frozenset({
     _EXEC.EXECUTION_NOT_FOUND, _EXEC.EXECUTION_NOT_CURRENT, _EXEC.EXECUTION_ALREADY_TERMINAL})
 
 
+#: `plan.sh retire` が exit 3 (PRECONDITION_UNMET) で返す理由のうち、Controller のコード (EXECUTION_* / STATE_INVALID) に無いもの。
+#: watchdog (`lib_retirement.RETIRE_SETTLED_CODES` / `RETIRE_CHECKPOINT_CODE`) が stderr の最後の行のこの値で読み分ける。
+RETIRE_CHECKPOINT_INVALID = 'CHECKPOINT_INVALID'
+RETIRE_STATUS_NOT_RETIRABLE = 'RETIRE_STATUS_NOT_RETIRABLE'
+RETIRE_WORKER_MISMATCH = 'RETIRE_WORKER_MISMATCH'
+RETIRE_ASSIGNMENT_UNVERIFIABLE = 'RETIRE_ASSIGNMENT_UNVERIFIABLE'
+
+
 def _error_code_line(code):
     """機械が読む経路: stderr の**最後の行**に固定形式で出す (文言は変えてよいが、この 1 行の形は変えない)。"""
     return f"[plan.sh] error_code={code}"
@@ -7079,8 +7087,9 @@ def cmd_retire(args):
             try:
                 _ck.verify(raw, execution_id)
             except _ck.CheckpointError as e:
+                # 専用の固定コード: watchdog は「後始末は要らない」ではなく「checkpoint だけ捨てて同じ試行の retire をやり直す」と読む
                 die(f"[plan.sh retire] --checkpoint の dir を検証できません ({e})。別の試行の dir・壊れた dir は渡せません。"
-                    f"何も書いていません。", PRECONDITION_UNMET)
+                    f"何も書いていません。\n{_error_code_line(RETIRE_CHECKPOINT_INVALID)}", PRECONDITION_UNMET)
             checkpoint_dir = os.path.normpath(raw)
 
     def _do():
@@ -7123,19 +7132,19 @@ def cmd_retire(args):
         if not _TASK_STATUS.accepts('retire', cur_status):
             die(f"{prefix}status が '{cur_status}' です"
                 f" (終了させられるのは {sorted(_TASK_STATUS.ACCEPTS_FROM['retire'])} の実行だけ —"
-                f" それ以外は実行自身が書いた結末なので、巻き戻しません){suffix}",
+                f" それ以外は実行自身が書いた結末なので、巻き戻しません){suffix}\n{_error_code_line(RETIRE_STATUS_NOT_RETIRABLE)}",
                 PRECONDITION_UNMET)
 
         cur_worker = meta.get('worker')
         if cur_worker != agent:
-            die(f"{prefix}worker は {cur_worker!r} で、{agent!r} ではありません{suffix}",
+            die(f"{prefix}worker は {cur_worker!r} で、{agent!r} ではありません{suffix}\n{_error_code_line(RETIRE_WORKER_MISMATCH)}",
                 PRECONDITION_UNMET)
 
         # 照合の規則は lib_execution.execution_matches の 1 か所 (ID だけ。世代は見ない)。
         matched, _check = _EXEC.execution_matches(view, meta, execution_id=execution_id)
         if matched != _EXEC.MATCH:
             die(f"{prefix}指定された execution はこの task の今の試行ではありません"
-                f" (同じ task の別の実行です){suffix}", PRECONDITION_UNMET)
+                f" (同じ task の別の実行です){suffix}\n{_error_code_line(_EXEC.EXECUTION_NOT_CURRENT)}", PRECONDITION_UNMET)
 
         # assignment は「この実行のもの」と確定したときだけ撤去する。存在しない
         # 場合 (既に片付いた card の取り残し) は撤去すべきものが無いだけなので
@@ -7143,7 +7152,7 @@ def cmd_retire(args):
         # identity の ID と比べる (判定は lib_state_store の 1 か所。identity に ID が無ければ保留)。
         verdict = classify_assignment_for_execution(agent, slug, task_id, execution_id)
         if verdict not in (ASSIGN_MINE, ASSIGN_ABSENT):
-            die(f"{prefix}{describe_assignment_verdict(agent, verdict)}{suffix}",
+            die(f"{prefix}{describe_assignment_verdict(agent, verdict)}{suffix}\n{_error_code_line(RETIRE_ASSIGNMENT_UNVERIFIABLE)}",
                 PRECONDITION_UNMET)
 
         # ── ここから書き込み。前提は全部通っている。 ──────────────────────

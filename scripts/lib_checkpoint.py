@@ -101,28 +101,120 @@ def is_secret_name(path):
     return False
 
 
-# 量指定子を入れ子にしない・上限つき (1MB の 1 行でも線形。tests で通す)。値の側だけを置き換える形は group 2
+# 値の長さに**上限を置かない**: 印 (キー名・prefix) を regex で見つけ、値は「区切り (空白・引用符・行末) まで」を線形に読み進めて
+# 丸ごと置き換える (上限つきの regex は長い値の先頭だけを置き換えて残りを生で残した = PR #307 の Codex 1 巡目 P1)。
+# 量指定子は入れ子にしない・値の読み進めは `\S*` のような 1 文字クラスの run か、引用符つきの値の分割 (backslash の所だけ python の
+# loop) だけなので 1MB の 1 行でも線形 (tests で通す)。値の長さが VALUE_SCAN_LIMIT を超えたら `RedactionError` (呼び出し側は
+# そのファイルを保存しない)。
+VALUE_SCAN_LIMIT = 4 * 1024 * 1024
+
+
+class RedactionError(Exception):
+    """redaction を最後までやり切れなかった (値が扱える上限を超えた)。呼び出し側は生のまま残さず、そのファイルを保存しない。"""
+
+
 _BEGIN_KEY = re.compile(r'-----BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY-----')
 _END_KEY_RE = re.compile(r'-----END [A-Z0-9 ]{0,40}PRIVATE KEY-----')
+#: (印, 印の後ろに最低限必要な長さ)。値は印の直後から区切りまで。`sk-` は直前が英字なら除く (`task-graph-notes` を拾わない)
 _TOKEN_PATTERNS = (
-    re.compile(r'op://[^\s\'"<>)\]]{1,300}'),
-    re.compile(r'(?:ghp|gho|ghs|ghu|ghr)_[A-Za-z0-9]{20,255}'),
-    re.compile(r'github_pat_[A-Za-z0-9_]{20,255}'),
-    re.compile(r'sk-[A-Za-z0-9_-]{16,255}'),
-    re.compile(r'AKIA[0-9A-Z]{16}'),
-    re.compile(r'xox[abprs]-[A-Za-z0-9-]{10,255}'),
+    (re.compile(r'op://'), 1),
+    (re.compile(r'(?:ghp|gho|ghs|ghu|ghr)_'), 20),
+    (re.compile(r'github_pat_'), 20),
+    (re.compile(r'(?<![A-Za-z])sk-'), 16),
+    (re.compile(r'AKIA'), 16),
+    (re.compile(r'xox[abprs]-'), 10),
 )
-_BEARER = re.compile(r'(Bearer[ \t]{1,8})([A-Za-z0-9._~+/=-]{16,512})')
-_ASSIGN = re.compile(
-    r'((?:TOKEN|SECRET|PASSWORD|PASSWD|API_KEY)[A-Za-z0-9_]{0,40}["\']?[ \t]{0,8}[=:][ \t]{0,8})'
-    r'("(?:[^"\\\n]|\\.){0,1000}"|\'(?:[^\'\\\n]|\\.){0,1000}\'|["\'][^\n]{0,1000}|\S{1,1000})',
-    re.IGNORECASE)
+_BEARER = re.compile(r'Bearer[ \t]+', re.IGNORECASE)
+_BEARER_MIN = 8
+_IDENT = re.compile(r'[A-Za-z0-9_]+')
+_ASSIGN_MARK = re.compile(r'TOKEN|SECRET|PASSWORD|PASSWD|API_KEY', re.IGNORECASE)
+_ASSIGN_TAIL = re.compile(r'["\']?[ \t]*[=:][ \t]*')
+_UNQUOTED = re.compile(r'[^\s"\']*')
+_VALUE_RUN = re.compile(r'\S*')
+_QUOTED_RUN = {'"': re.compile(r'[^"\\\n]*'), "'": re.compile(r"[^'\\\n]*")}
+
+
+def _check_len(start, end):
+    if end - start > VALUE_SCAN_LIMIT:
+        raise RedactionError('value_too_long')
+
+
+def _quoted_end(text, start):
+    """`text[start]` が引用符。閉じる引用符の直後 (同じ行に無ければ行末 = 閉じていない値は行の残りを全部) を返す。"""
+    q = text[start]
+    rx = _QUOTED_RUN[q]
+    n = len(text)
+    j = start + 1
+    while True:
+        j = rx.match(text, j).end()
+        if j >= n:
+            return n
+        ch = text[j]
+        if ch == q:
+            return j + 1
+        if ch == '\\':
+            if j + 1 < n and text[j + 1] != '\n':
+                j += 2
+                continue
+            return min(j + 1, n)
+        return j                                   # 改行: 閉じていない値は行末まで
+
+
+def _assign_spans(text):
+    """`KEY=値` / `"password": "値"` の**値の側**の (start, end)。キー名の長さに上限は無い (識別子の run ごとに 1 回だけ見る)。"""
+    pos = 0
+    n = len(text)
+    for m in _IDENT.finditer(text):
+        if m.start() < pos:
+            continue
+        if not _ASSIGN_MARK.search(text, m.start(), m.end()):
+            continue
+        t = _ASSIGN_TAIL.match(text, m.end())
+        if not t:
+            continue
+        vs = t.end()
+        if vs >= n or text[vs] in '\r\n':
+            continue
+        ve = _quoted_end(text, vs) if text[vs] in '"\'' else _VALUE_RUN.match(text, vs).end()
+        _check_len(vs, ve)
+        if ve > vs:
+            yield vs, ve
+            pos = ve
+
+
+def _prefixed_spans(text, pattern, minimum, keep_prefix, run):
+    pos = 0
+    while True:
+        m = pattern.search(text, pos)
+        if not m:
+            return
+        ve = run.match(text, m.end()).end()
+        if ve - m.end() < minimum:
+            pos = m.end()
+            continue
+        _check_len(m.end(), ve)
+        yield (m.end() if keep_prefix else m.start()), ve
+        pos = ve
+
+
+def _replace_spans(text, spans, counter):
+    out = []
+    last = 0
+    for s, e in spans:
+        if s < last:
+            continue
+        counter[0] += 1
+        out.append(text[last:s])
+        out.append(f"[REDACTED:{counter[0]}]")
+        last = e
+    out.append(text[last:])
+    return ''.join(out)
 
 
 def redact(text):
-    """`(redacted, count)`。置き換えは `[REDACTED:<n>]` (n は 1 から。このファイルの中の通し番号)。例外はそのまま出す
-    (呼び出し側が「そのファイルを保存しない」に倒す)。"""
-    n = 0
+    """`(redacted, count)`。置き換えは `[REDACTED:<n>]` (n は 1 から。このファイルの中の通し番号)。例外 (`RedactionError` を含む) は
+    そのまま出す (呼び出し側が「そのファイルを保存しない」に倒す)。"""
+    counter = [0]
     out = []
     pos = 0
     # 1. 秘密鍵: BEGIN から END まで (END が無ければ末尾まで)。regex の `.*?` を使わず find で線形にする
@@ -132,29 +224,29 @@ def redact(text):
             out.append(text[pos:])
             break
         out.append(text[pos:m.start()])
-        n += 1
-        out.append(f"[REDACTED:{n}]")
+        counter[0] += 1
+        out.append(f"[REDACTED:{counter[0]}]")
         e = _END_KEY_RE.search(text, m.end())
         if not e:
             break
         pos = e.end()
     text = ''.join(out)
 
-    def _whole(_m):
-        nonlocal n
-        n += 1
-        return f"[REDACTED:{n}]"
+    for pat, minimum in _TOKEN_PATTERNS:
+        text = _replace_spans(text, _prefixed_spans(text, pat, minimum, False, _VALUE_RUN), counter)
+    text = _replace_spans(text, _prefixed_spans(text, _BEARER, _BEARER_MIN, True, _UNQUOTED), counter)
+    text = _replace_spans(text, _assign_spans(text), counter)
+    return text, counter[0]
 
-    def _value(m):
-        nonlocal n
-        n += 1
-        return f"{m.group(1)}[REDACTED:{n}]"
 
-    for pat in _TOKEN_PATTERNS:
-        text = pat.sub(_whole, text)
-    text = _BEARER.sub(_value, text)
-    text = _ASSIGN.sub(_value, text)
-    return text, n
+def path_is_secret(path):
+    """出力に出るパスに使う検出 (is_secret_name + 内容と同じ redaction)。検出できない・redaction が失敗したときも秘密として扱う (出さない側)。"""
+    if is_secret_name(path):
+        return True
+    try:
+        return redact(str(path))[1] > 0
+    except Exception:  # noqa: BLE001
+        return True
 
 
 # ---------------------------------------------------------------------------
@@ -319,11 +411,42 @@ def _drop_secret_sections(patch):
         for line in sec.split('\n', 12)[1:12]:
             if line.startswith(('--- ', '+++ ', 'rename from ', 'rename to ', 'copy from ', 'copy to ')):
                 names.append(line)
-        if any(is_secret_name(s) for h in names for s in re.split(r'[ "]+', h)):
+        if any(is_secret_name(s) for h in names for s in re.split(r'[ "]+', h)) \
+                or any(path_is_secret(h) for h in names):
             dropped += 1
             continue
         kept.append(sec)
     return ''.join(kept), dropped
+
+
+def _safe_label(value):
+    """meta に出す path / branch 名。秘密を含む名前は伏せる。"""
+    if value and path_is_secret(value):
+        return '[REDACTED]'
+    return value
+
+
+def _filter_status(status_raw):
+    """`git status --porcelain=v1 -z` のうち、パスが秘密のエントリ (rename / copy は旧パスまで) を落とす。`(text, 落とした件数)`。"""
+    parts = status_raw.split('\x00')
+    kept, dropped = [], 0
+    i = 0
+    while i < len(parts):
+        rec = parts[i]
+        i += 1
+        if not rec:
+            continue
+        paths = [rec[3:]]
+        if rec[:1] in 'RC' or rec[1:2] in 'RC':
+            if i < len(parts):
+                paths.append(parts[i])
+                i += 1
+        if any(path_is_secret(p) for p in paths):
+            dropped += 1
+            continue
+        kept.append(rec)
+        kept.extend(paths[1:])
+    return ''.join(f'{r}\x00' for r in kept), dropped
 
 
 # ---------------------------------------------------------------------------
@@ -437,6 +560,7 @@ def _build(clock, out, worktree, mission, task, execution_id, reason, pane_text,
     status_raw, status_trunc = _git_text(clock, worktree, 'status', '--porcelain=v1', '-z', '--untracked-files=all',
                                     '--ignore-submodules=all')
     dirty = bool(status_raw.strip('\x00'))
+    status_raw, status_secret_dropped = _filter_status(status_raw)
     saved, n = _save_text(out, 'status.txt', status_raw, limit=PATCH_LIMIT)
     redactions += n
     skipped_redaction += 0 if saved else 1
@@ -459,9 +583,9 @@ def _build(clock, out, worktree, mission, task, execution_id, reason, pane_text,
     clock.check()
     numstat, _ = _git_text(clock, worktree, 'diff', 'HEAD', '--numstat', '-z', '--no-ext-diff', '--no-textconv',
                               '--ignore-submodules=all')
-    secret_excluded = secret_dropped
+    secret_excluded = secret_dropped + status_secret_dropped
     for path in _numstat_binary_paths(numstat):
-        if is_secret_name(path):
+        if path_is_secret(path):
             secret_excluded += 1
             continue
         binary_lines.append(_binary_line(clock, worktree, path))
@@ -496,8 +620,8 @@ def _build(clock, out, worktree, mission, task, execution_id, reason, pane_text,
         'task': task,
         'taken_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(now() if now else time.time())),
         'reason': reason,
-        'worktree': worktree,
-        'branch': branch,
+        'worktree': _safe_label(worktree),
+        'branch': _safe_label(branch),
         'head': head,
         'dirty': dirty,
         'files': files,
@@ -579,11 +703,12 @@ def _save_untracked(clock, out, worktree):
     omitted = max(0, len(names) - UNTRACKED_LISTING_LIMIT)
     for rel in names[:UNTRACKED_LISTING_LIMIT]:
         clock.check()
+        # 出力に出るパスは全部ここと同じ検出を通す: 秘密を含む名前は保存も列挙もせず件数だけ (meta.secret_files_excluded)
+        if path_is_secret(rel):
+            secret_excluded += 1
+            continue
         if rel.endswith('/') or os.path.isabs(rel) or '..' in rel.split('/'):
             listed.append({'path': rel, 'reason': 'not_a_file'})
-            continue
-        if is_secret_name(rel):
-            secret_excluded += 1
             continue
         full = os.path.join(worktree, rel)
         try:

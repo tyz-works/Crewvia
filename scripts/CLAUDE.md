@@ -161,8 +161,11 @@ lib ごとの**破ってはいけない契約**の要約。理由・経緯・全
 - **失敗しても退役を止めない**: 失敗・期限切れ（`daemons.checkpoint_seconds`、既定 20。env なし。0 以下で取らない）・想定外の例外はすべて `--checkpoint none`。通知は notify-once で 1 回（キー `checkpoint_<mission>_<task>`）。
   保存するものが元から無い（`NothingToSave`: record 無し / `git.worktree` が null）は失敗ではなく通知しない。
 - **秘密**: ファイル名（パスの全成分）で除外・内容は patch / untracked / pane / status の全部を redaction（`[REDACTED:n]`）→ **その後で** 1MB に切る。**redaction が例外なら、そのファイルは保存しない**。
+  **値の長さに上限を置かない**（fix 1）: 印（キー名・prefix）を regex で見つけ、値は区切り（空白・引用符・行末）まで線形に読み進めて丸ごと置き換える。`VALUE_SCAN_LIMIT`（4MB）を超える値は `RedactionError` = そのファイルを保存しない。
+  **出力に出るパスはすべて `path_is_secret`**（名前の規則 + 内容と同じ redaction）を通す: untracked/ の保存名・`listed_only`・`binary-files.txt`・`status.txt`（rename は旧パスごと）・`dirty.patch` のヘッダ・meta の branch / worktree。秘密を含む名前は保存も列挙もせず `secret_files_excluded` に数える。
   バイナリ（tracked の差分・untracked とも）の内容は保存しない（`binary-files.txt` に名前・サイズ・blob sha だけ・`binary_restorable: false`）。パターンは入れ子の量指定子を使わない（1MB の 1 行がテストで線形）。
 - `plan.sh retire --checkpoint <dir|none>` は**ロックの前**に `lib_checkpoint.verify`（meta.json の `execution_id` と dir 名が自分の試行と一致）。違えば exit 3・何も書かない。台帳の retire の `checkpoint_dir` に入り、`pull` の `previous_attempt.checkpoint_dir` に出る。
+  **checkpoint の拒否は専用の固定コード `CHECKPOINT_INVALID`**（stderr の最後の行 `[plan.sh] error_code=…`）。watchdog（`lib_retirement._settle_terminated`）は exit 3 を**コードで読み分ける**: `RETIRE_SETTLED_CODES`（この試行はもう今の試行でない・task が別の状態・別の Worker・触れない = Director に報告済み）だけが marker を消し、`CHECKPOINT_INVALID` は同じ試行の照合のまま `--checkpoint none` でやり直し、**コードの無い・未知の exit 3 は消さず**再試行（`_cleanup_failed`）。retire に exit 3 の理由を足したらコードを付け、集合に入れるか決める（`tests/test_checkpoint_retirement_stage.py::test_every_exit_3_code_is_classified_on_purpose`）。
   台帳の再送の比較（`HISTORY_MISMATCH`）から `checkpoint_dir` は除く（取り直した checkpoint が前と違っても退役を割らない）。
 - `checkpoint_gc.py` は `worktree_gc.py` と同じ作法（既定 dry-run・`--apply` は隔離のみ・`--restore`・削除を呼ばない = AST テスト）。対象は「task の card が読めて終端 ∧ 保存から 30 日以上」だけ。
   card が無い・壊れている・終端でない（reopen 後を含む）・読めない・形の違うものは残す。

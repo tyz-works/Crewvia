@@ -160,6 +160,7 @@ import contextlib
 import fcntl
 import json
 import os
+import re
 import signal
 import sys
 import time
@@ -237,6 +238,28 @@ SIGKILL_REPORT_AFTER = 3
 #: `plan.sh update` exit status for "the precondition did not hold".  Distinct
 #: from 1 (plan.sh is broken → retry) so cleanup can tell the two apart.
 PLAN_PRECONDITION_UNMET = 3
+
+#: `plan.sh retire` が exit 3 の stderr の**最後の行**に出す固定コード (`[plan.sh] error_code=<CODE>`)。exit 3 は理由が複数あるので、
+#: marker を消してよい (= 後始末はもう要らない・または Director に報告済みで再試行しても変わらない) のは下の集合のコードだけ。
+#: **未知のコード・コードの無い exit 3 は消さない** (`_cleanup_failed` = 再試行 + Director に通知)。retire に exit 3 の理由を足したら
+#: ここに足すか足さないかを決める (`tests/test_checkpoint_retirement_stage.py` が plan.sh 側の全コードを列挙して突き合わせる)。
+RETIRE_SETTLED_CODES = frozenset({
+    "EXECUTION_NOT_CURRENT", "EXECUTION_NOT_FOUND", "EXECUTION_ALREADY_TERMINAL",   # この試行はもう今の試行ではない
+    "RETIRE_STATUS_NOT_RETIRABLE", "RETIRE_WORKER_MISMATCH",                         # task が別の状態・別の Worker のもの
+    "RETIRE_ASSIGNMENT_UNVERIFIABLE", "STATE_INVALID",                               # 触れない (Director に other_state で報告して終える)
+})
+#: checkpoint の検証の拒否。試行の照合はまだ終わっていない (検証はロックの前) ので、後始末は**要る**: `--checkpoint none` でやり直す。
+RETIRE_CHECKPOINT_CODE = "CHECKPOINT_INVALID"
+_ERROR_CODE_LINE = re.compile(r"\[plan\.sh\] error_code=([A-Z][A-Z0-9_]*)")
+
+
+def plan_error_code(output: str) -> Optional[str]:
+    """plan.sh の出力 (stdout + stderr) の最後の非空行が `[plan.sh] error_code=<CODE>` ならその CODE。無ければ None。"""
+    lines = [ln for ln in (output or "").splitlines() if ln.strip()]
+    if not lines:
+        return None
+    m = _ERROR_CODE_LINE.fullmatch(lines[-1].strip())
+    return m.group(1) if m else None
 
 #: `plan.sh --no-wait` exit status for "the queue lock was held by somebody
 #: else, so nothing was written".  Kept distinct from 3 on purpose: 3 means
@@ -2070,6 +2093,21 @@ class RetirementExecutor:
                 env["CREWVIA_QUEUE"] = str(self.queue_dir)
             env["CREWVIA_REPO_ROOT"] = str(self.repo_root)
             rc, output = self.run_command(argv, env)
+            code = plan_error_code(output) if rc == PLAN_PRECONDITION_UNMET else None
+            if code == RETIRE_CHECKPOINT_CODE and checkpoint != "none":
+                # capture と retire の間に checkpoint が消えた・読めなくなった。Worker は kill 済みで、task と assignment はまだ
+                # active のまま: ここで marker を消すと後始末が二度と走らない。checkpoint だけ捨て、同じ試行の照合で retire をやり直す。
+                self.log(f"[retire] {agent}: checkpoint for {mission}/{task_id} no longer verifies — retiring without one")
+                self._checkpoint_failed_notice(mission, task_id, execution_id, "verify_failed")
+                self._checkpoint_results[execution_id] = "none"
+                argv[argv.index("--checkpoint") + 1] = "none"
+                rc, output = self.run_command(argv, env)
+                code = plan_error_code(output) if rc == PLAN_PRECONDITION_UNMET else None
+            if rc == PLAN_PRECONDITION_UNMET and code not in RETIRE_SETTLED_CODES:
+                # 理由が分からない exit 3 (コード無し・未知のコード・none でも出る CHECKPOINT_INVALID) を「要らない」と読まない。
+                return self._cleanup_failed(
+                    agent, prog, f"plan.sh retire exited {rc} (error_code={code or 'none'}): {output.strip()[:400]}",
+                    mission, task_id)
             if rc == PLAN_LOCK_BUSY:
                 # Not a failure: nothing was written and the obligation still
                 # stands.  Deliberately *not* routed through _cleanup_failed(),

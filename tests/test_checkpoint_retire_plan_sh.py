@@ -140,3 +140,60 @@ def test_the_checkpoint_does_not_loosen_the_preconditions(box, worktree):
     wrong_worker = retire(box, xid, "--checkpoint", d, agent="Somebody")
     assert wrong_worker.returncode == 3
     assert box.snapshot() == before
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# PR #307 Codex 1 巡目 P1-2: checkpoint の拒否は専用の固定コード (CHECKPOINT_INVALID)。他の exit 3 と区別できる
+# ---------------------------------------------------------------------------------------------------------------------
+
+def last_line(p):
+    return [ln for ln in p.stderr.splitlines() if ln.strip()][-1]
+
+
+def test_checkpoint_rejections_carry_the_dedicated_code_as_the_last_stderr_line(box, worktree, tmp_path):
+    import lib_retirement as lr
+    xid = started(box)
+    d = checkpoint_for(box, xid, worktree)
+    before = box.snapshot()
+
+    import shutil
+    gone = tmp_path / "gone-copy"
+    shutil.copytree(d, gone)
+    # capture と retire の間に消えた / 読めない / 別の試行のもの / 形が違う
+    bad = {}
+    shutil.rmtree(d)
+    bad["removed"] = d
+    foreign = checkpoint_for(box, "ex-" + "7" * 32, worktree)
+    bad["foreign"] = foreign
+    for name, value in bad.items():
+        p = retire(box, xid, "--checkpoint", value)
+        assert p.returncode == 3, (name, p.stderr)
+        assert last_line(p) == "[plan.sh] error_code=CHECKPOINT_INVALID", (name, p.stderr)
+        assert lr.plan_error_code(p.stdout + p.stderr) == lr.RETIRE_CHECKPOINT_CODE
+        assert box.snapshot() == before and box.card()["status"] == "in_progress"
+    # meta.json が壊れた dir
+    shutil.copytree(gone, d)
+    (pathlib.Path(d) / "meta.json").write_text("{ not json")
+    p = retire(box, xid, "--checkpoint", d)
+    assert p.returncode == 3 and last_line(p) == "[plan.sh] error_code=CHECKPOINT_INVALID"
+    # 拒否のあと、同じ試行の照合のまま --checkpoint none で退役が通る (watchdog のやり直しと同じ)
+    q = retire(box, xid, "--checkpoint", "none")
+    assert q.returncode == 0, q.stderr
+    assert box.card()["status"] == "pending"
+    (fields,) = retire_ledger(box)
+    assert fields.get("checkpoint_dir") in (None, "")
+
+
+def test_other_exit_3_reasons_keep_their_own_codes_and_are_not_checkpoint_rejections(box, worktree):
+    import lib_retirement as lr
+    xid = started(box)
+    d = checkpoint_for(box, xid, worktree)
+    stale = retire(box, "ex-" + "8" * 32, "--checkpoint", "none")   # (別の試行の dir を付けると dir の検証が先に拒否する)
+    assert stale.returncode == 3 and lr.plan_error_code(stale.stdout + stale.stderr) == "EXECUTION_NOT_CURRENT"
+    wrong = retire(box, xid, "--checkpoint", d, agent="Somebody")
+    assert wrong.returncode == 3 and lr.plan_error_code(wrong.stdout + wrong.stderr) == "RETIRE_WORKER_MISMATCH"
+    for p in (stale, wrong):
+        assert lr.plan_error_code(p.stdout + p.stderr) in lr.RETIRE_SETTLED_CODES
+    assert retire(box, xid, "--checkpoint", d).returncode == 0
+    again = retire(box, "ex-" + "8" * 32, "--checkpoint", "none")
+    assert again.returncode == 3 and lr.plan_error_code(again.stdout + again.stderr) in lr.RETIRE_SETTLED_CODES

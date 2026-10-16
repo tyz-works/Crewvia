@@ -92,6 +92,7 @@
 - `pr_number`: 残す。同じ PR に追加 commit を積む運用と一致する。`done --pr <N>` で別の番号を出すと既存の拒否（`plan.sh:4757-4761`）に当たる — retry で新しい PR を作りたいときは Director が `update --pr-number` で明示的に変える（今のまま）。
 - branch: `task/{mission_slug}/{task_id}-{task_slug}`（`lib_git_policy.py:44`）。`task_slug` は最初の reserve で card に固定されるので retry でも変わらない。同じ branch を再利用し、開始時の SHA を新しい試行の record に残す（01c で済み。`execution.md:343`・`:371`）。
 - worktree: 登録済みの worktree を中身を確かめず再利用する（W2。`git-policy.md:125`・`:132`）。別の Worker が前の Worker の未 commit の作業の上で始まる。これは retry では**望ましい**（作業の継続）が、`worktree_gc.py` が完了済み task の worktree を隔離している場合は worktree が無い。**retry / reopen の後に pull が worktree を作り直せるか（branch が残っていれば作れるか）は未確認** — PR-E の QA 項目にする。
+  - **PR-E QA（t033）の結果**: `worktree_gc` で隔離済みの task は、retry / reopen の後の pull が W5 で `needs_director` になり**試行を 1 つ消費する**。隔離された worktree を作り直さない。**retry / reopen の前に `worktree_gc --restore` で戻す**（plan.sh は worktree を見ないので、reopen の出力には出ない）。
 
 ### 3.5 下流（codex-review / qa の task）との関係
 
@@ -173,6 +174,18 @@ archive 済み mission の task の reopen は拒否する（exit 3、「新 mis
 ### 4.6 循環
 
 reopen は依存の辺を足さないので、循環を作らない。下流の列挙だけが辺をたどる（§4.3、訪問済みの集合）。`add` / `update --blocked-by` の循環の拒否（`find_dependency_cycle`）は今のまま。
+
+### 4.7 実装で決めたこと（PR-F・t036）
+
+- **`reopen_count` の上限は設けない**。reopen した task が再び reopen できるのは再び done になった後で、そのたびに pull が試行を 1 つ発行する。したがって reopen の回数は `execution_count` の上限（`max_attempts`。入口で検査・`--over-cap` も retry と同じ形）で抑えられる。別の数を足すと、2 つの上限の食い違いが新しい拒否の理由になる。
+- **上限は戻す下流にも適用する**（`ATTEMPT_CAP`・`--over-cap` は全員に効く）。入口だけだと、cascade で戻された下流が上限を黙って超えて pull される。
+- **実行中の下流は選ばれたかに関係なく閉じる**（cascade が none 以外のとき）。I が変わるので、動いている作業は古い土台の上にある。対象の status は in_progress / ready_for_verification / verifying / needs_human_review（`ASSIGNMENT_HOLDING_STATUSES`）。`--cascade none` は `CASCADE_ACTIVE_DOWNSTREAM`（exit 3・該当 task を列挙）。
+- **roll forward の印は台帳**: 再実行で、既に pending の下流が「この reopen で戻した」かは、その task の台帳に `root` = I・`root_reopen_count` = I の `reopen_count` + 1 の `reopen` / `reset` があるかで判る。印のある task は `--cascade` が選ぶなら targets に数える（数えないと、戻した review までの経路の中間 task が done のまま残る）。印の `reason` が今回の `--reason` と違えば `HISTORY_MISMATCH`（書く前に拒否）。
+- **台帳の `reopen_count` は増やす前の値**（同定キー (execution_id, kind, reopen_count) が再送で変わらない）。`store-check` の `cascade-incomplete`（detail に `root=<I>`）は、下流の印の `root_reopen_count` が I の今の `reopen_count` を超えるとき、または I の台帳 `reopen` が残って card がまだ done / verified / skipped のときに出る。報告だけ。
+- 台帳の食い違い（孤児の台帳と違う中身）は、書く前に `_write_reopen(dry_run=True)` で I と戻す下流について見つける。実行中の下流の `reset` の台帳だけは書く側でしか見つからない（食い違えば exit 3 で、すでに書いた分は同じ引数の再実行で続きから完了する）。
+- `released_deps` から I を消すのは、I に直接依存する下流の card（`blocked_by` に I がある task）。pending のままの下流も対象（解除の根拠が消えるため）。消した task は出力に出る。
+- `--branch reuse` は必須で他の値は拒否。mission は `_reactivate_done_mission`（PR-A）で戻す。archive 済み mission は exit 3（`MISSION_ARCHIVED`。`--mission` を省略しても archive 側を探して同じ答え）。
+- 対象の skills の置き場: `lib_dep_rules.CASCADE_REVIEW_SKILLS`（codex-review / review / qa）。
 
 ## 5. P3: checkpoint
 
@@ -257,6 +270,7 @@ reopen は依存の辺を足さないので、循環を作らない。下流の�
 Codex の往復は 3 巡で打ち切った (PR #301 の t002)。以下は実装 PR の網羅テストで解く。残った P2 以下はここに積む（元文書 §15 と同じ方針）。
 
 - **cascade の経路閉包で `skipped` の中間 task が漏れる**（Codex 3 巡目 P2。実装 PR F）。
+  - **PR-F（t036）で解いた（拒否）**: 無効化の経路上に `skipped` の task があれば `plan.sh reopen` は exit 3（`CASCADE_SKIPPED_ON_PATH`・何も書かない・`reopen_count` も増えない・`t001 -> t002` の形で経路を出す）。「経路」= `dep.path_closure(graph, I, targets)` で、`targets` は `--cascade` が選ぶ task（reviews = skills に codex-review / review / qa。all = 全部）のうち done / verified / **skipped** / 実行中 / 前の実行で戻した task。**選ばれた skipped の task 自身（末端）も経路に含む**。`--cascade none` は targets が空なので拒否しない。出口は、skipped の task を先に `plan.sh reopen` で戻す（skipped は reopen の遷移元）か、`--cascade` を見直すこと。網羅テスト: `tests/test_reopen_cascade_plan_sh.py`（途中・末端・複数経路の片方・経路外・3 値）。以下は解く前の記述。
   - 漏れている状態: `lib_task_status.py` の `TERMINAL_STATUSES` に `skipped` がある。I → A(`skipped`) → R(`done`) の形で I を reopen すると、A が終端として扱われ経路が切れ、R が無効化されない。R は I の再完了より前に pull できてしまう。
   - 起きる害: 古い I の結果に依存した R（review / qa 等）が、I の再完了を待たずに走り、無意味な結果を `done` にする。
   - 直し方の方向（未決）: (a) `skipped` も経路上なら無効化の対象にする。(b) 経路上に `skipped` の task がある reopen を拒否する。Director の推奨は (b) 拒否（`skipped` は Director が意図して飛ばした task なので、勝手に開けない）。

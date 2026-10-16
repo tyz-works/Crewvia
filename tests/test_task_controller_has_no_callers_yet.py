@@ -84,7 +84,7 @@ def test_the_mentions_in_the_allowed_files_are_not_imports():
 #: retire は `fail_execution`)。足すのは cutover = ユーザー承認の PR)。
 PLAN_SH_ALLOWED_OPERATIONS = {"reserve_task", "start_execution", "fail_execution", "complete_execution", "mark_task",
                               "abandon_detached_execution", "reset_task", "release_execution", "reopen_task",
-                              "check_reason", "Caller", "NO_CALLER", "IDEMPOTENT"}
+                              "check_reason", "check_cascade", "Caller", "NO_CALLER", "IDEMPOTENT"}
 
 
 def test_plan_sh_calls_only_the_allowed_operations_of_the_controller():

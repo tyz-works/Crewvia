@@ -185,7 +185,93 @@ def find_dependency_cycle(graph):
     return None
 
 
+def _dependents(graph):
+    """`{task_id: [依存 id, ...]}` を逆向きにした `{依存 id: [それに依存する task id, ...]}`。"""
+    out = {}
+    for tid, deps in graph.items():
+        for dep in declared_dependencies(deps):
+            out.setdefault(dep, []).append(tid)
+    return out
+
+
+def downstream_closure(graph, tid):
+    """`tid` に (推移的に) 依存する task の一覧。`tid` 自身は含めない。**遠い順** (その task に依存する task が先)。
+
+    reopen の下流の無効化が使う列挙の唯一の置き場 (plan.sh にコピーしない。設計 §4.3)。**依存判定 `unmet_dependencies` は
+    推移的にしない** — これは reopen が経路を閉じるための列挙で、「依存が満たされた」の定義ではない。
+    並びは I からの最長距離の降順 (同じ距離は task id 順で決定的)。最長距離なので、閉包の中で A が B に依存するなら A は
+    必ず B より前に来る (A を戻した後で B を戻せる)。訪問済みの集合で止まるので、循環があっても終わる
+    (通常は `add` / `update --blocked-by` が循環を拒否しているので無い)。graph に無い id (未定義の依存) は辿らない。
+    """
+    dependents = _dependents(graph)
+    seen = set()
+    queue = [tid]
+    while queue:
+        node = queue.pop()
+        for nxt in dependents.get(node, ()):
+            if nxt != tid and nxt not in seen and nxt in graph:
+                seen.add(nxt)
+                queue.append(nxt)
+    depth = {n: 1 for n in seen}
+    for _ in range(len(seen)):                  # 最長距離への緩和 (循環があっても |閉包| 回で止まる)
+        changed = False
+        for n in seen:
+            for dep in declared_dependencies(graph.get(n)):
+                if dep in seen and depth[n] < depth[dep] + 1 and depth[dep] + 1 <= len(seen):
+                    depth[n] = depth[dep] + 1
+                    changed = True
+        if not changed:
+            break
+    return sorted(seen, key=lambda n: (-depth[n], n))
+
+
+def path_closure(graph, root, targets):
+    """`root` から `targets` のどれかへの依存の経路上にある task の一覧 (遠い順)。= `root` の下流集合 ∩ `targets` の上流集合。
+
+    `targets` 自身 (root の下流にあるもの) も含む。`root` は含めない。reopen の cascade が「対象の review / qa だけ戻すと、
+    経路上の中間 task の done を根拠に、I の修正前の結果をもう一度確定してしまう」穴を、依存判定を推移的にせずに塞ぐ
+    ための閉包 (設計 §4.3)。
+    """
+    targets = set(targets)
+    down = downstream_closure(graph, root)
+    down_set = set(down)
+    # targets の上流 (targets から依存をたどって届く task) を数える
+    upstream = set()
+    queue = [t for t in targets if t in down_set]
+    upstream.update(queue)
+    while queue:
+        node = queue.pop()
+        for dep in declared_dependencies(graph.get(node)):
+            if dep in down_set and dep not in upstream:
+                upstream.add(dep)
+                queue.append(dep)
+    return [n for n in down if n in upstream]
+
+
+def dependency_path(graph, root, node):
+    """`root` から `node` への依存の経路の 1 本 (`[root, ..., node]`。root に近い側から)。無ければ None。
+    拒否の文面に「どの経路か」を出すための道具 (最短の 1 本。幅優先で決定的)。"""
+    dependents = _dependents(graph)
+    prev = {root: None}
+    queue = [root]
+    for cur in queue:
+        for nxt in sorted(dependents.get(cur, ())):
+            if nxt not in prev and nxt in graph:
+                prev[nxt] = cur
+                queue.append(nxt)
+    if node not in prev or node == root:
+        return None
+    path = [node]
+    while prev[path[-1]] is not None:
+        path.append(prev[path[-1]])
+    return list(reversed(path))
+
+
 #: `deliverable: pr` の task の下流に 1 つは要る「review の task」を表す skill 名 (t013 / C4)。
 #: lint (`lint_plan.check_pr_has_review_downstream`) が読む。lint_plan.py にスキル名のリテラルを
 #: 置かない (tests/test_task_deliverable.py が固定) ので、名前はここ 1 か所。
 PR_REVIEW_SKILL = 'review'
+
+#: `plan.sh reopen --cascade reviews` が「古い結果に基づく review / QA」として戻す task の skills (vNext 02 PR-F / 設計 §4.3)。
+#: skills のどれか 1 つでも含めば対象。スキル名の置き場はここ 1 か所 (Controller が読む)。
+CASCADE_REVIEW_SKILLS = ('codex-review', PR_REVIEW_SKILL, 'qa')

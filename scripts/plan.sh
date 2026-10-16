@@ -58,6 +58,12 @@ set -euo pipefail
 #                              総試行数 (execution_count) が上限 (config attempts.max_total、既定 6。card の max_attempts で上書き)
 #                              に達していたら exit 3 (ATTEMPT_CAP)。--over-cap "<理由>" で通し、台帳の retry に残す。
 #                              理由は台帳にだけ書く (監査ログには出さない)。`update --reset` は残してある (理由が要らない差し戻し)
+#   plan.sh reopen <task_id> --reason "<理由>" --branch reuse [--mission <slug>] [--cascade none|reviews|all] [--over-cap "<理由>"]
+#                              確定した結果 (done / verified / skipped) の task を、理由つきで pending に戻し (reopen_count += 1)、
+#                              下流の古い結果を無効化する (vNext 02 PR-F。設計 §4)。--branch reuse は必須 (merge 済みの PR の task は
+#                              扱わない。Director が確認して明示)。既定の --cascade reviews は skills に codex-review / review / qa を
+#                              含む下流と、I からそこへの経路上の中間 task を戻す。実行中の下流は none なら exit 3、それ以外は試行を閉じて戻す。
+#                              経路上に skipped の task があれば exit 3。退避済み mission も exit 3。途中で止まったら同じ引数で再実行
 #   plan.sh release-dep <task_id> [--dep <csv>] [--mission <slug>]
 #                              failed の依存で保留されている task を、Director が明示的に
 #                              進めてよいと決める (省略時は今 failed の依存すべて)。
@@ -116,7 +122,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 QUEUE_DIR="${CREWVIA_QUEUE:-${REPO_ROOT}/queue}"
 
 if [[ $# -eq 0 ]]; then
-  echo "Usage: plan.sh <init|add|pull|done|needs-director|fail|update|retry|release-dep|retire|reap-orphan-assignment|ready-for-verification|verifying|snapshot|verify-result|review|launch|task-graph|lint|status|archive|resync|dashboard|dashboard-data|resolve-mission|store-check|history|pr-base> [args...]" >&2
+  echo "Usage: plan.sh <init|add|pull|done|needs-director|fail|update|retry|reopen|release-dep|retire|reap-orphan-assignment|ready-for-verification|verifying|snapshot|verify-result|review|launch|task-graph|lint|status|archive|resync|dashboard|dashboard-data|resolve-mission|store-check|history|pr-base> [args...]" >&2
   exit 1
 fi
 
@@ -944,7 +950,7 @@ def held_dependency_hint(task_id, held, slug):
 #: queue を書き換えるサブコマンド = 生成を呼ぶ経路。正は冒頭の usage 行と
 #: 末尾の dispatch テーブル (tests/test_task_graph.py が突き合わせる)。
 QUEUE_MUTATING_SUBCOMMANDS = {
-    'init', 'add', 'pull', 'done', 'needs-director', 'fail', 'update', 'retry', 'release-dep',
+    'init', 'add', 'pull', 'done', 'needs-director', 'fail', 'update', 'retry', 'reopen', 'release-dep',
     'retire', 'reap-orphan-assignment',
     'ready-for-verification', 'verifying', 'snapshot', 'verify-result', 'review', 'launch', 'archive',
 }
@@ -2606,6 +2612,8 @@ USAGE = {
                '                       [--deliverable pr|file|none]\n'
                '       plan.sh update <task_id> --close-execution [--mission <slug>]'),
     'retry': 'plan.sh retry <task_id> --reason "<理由>" [--mission <slug>] [--over-cap "<理由>"]',
+    'reopen': ('plan.sh reopen <task_id> --reason "<理由>" --branch reuse [--mission <slug>]\n'
+               '                       [--cascade none|reviews|all] [--over-cap "<理由>"]'),
     'release-dep': 'plan.sh release-dep <task_id> [--dep <csv>] [--mission <slug>]',
     'retire': ('plan.sh retire <task_id> --agent <name> --execution <id>\n'
                '                       [--mission <slug>] [--outcome reset|needs-director]\n'
@@ -2637,7 +2645,7 @@ USAGE = {
 #: dispatch テーブルと同じキーを持つこと (tests/test_plan_strict_args.py が突き合わせる)。
 POSITIONAL_ARITY = {
     'init': (1, 1), 'add': (1, 1), 'pull': (0, 0), 'done': (1, 2),
-    'needs-director': (1, 2), 'fail': (1, 2), 'update': (1, 1), 'retry': (1, 1), 'release-dep': (1, 1),
+    'needs-director': (1, 2), 'fail': (1, 2), 'update': (1, 1), 'retry': (1, 1), 'reopen': (1, 1), 'release-dep': (1, 1),
     'retire': (1, 1), 'reap-orphan-assignment': (1, 1),
     'ready-for-verification': (1, 1), 'verifying': (1, 1), 'snapshot': (0, 1), 'verify-result': (2, 2),
     'review': (1, 1), 'launch': (1, 1), 'task-graph': (0, 0), 'lint': (0, 1),
@@ -3341,7 +3349,9 @@ def _execution_caller(opts):
 _NO_WRITE_REFUSALS = frozenset({
     _EXEC.EXECUTION_NOT_FOUND, _EXEC.EXECUTION_NOT_CURRENT, _EXEC.EXECUTION_ALREADY_TERMINAL, _EXEC.EXECUTION_REQUIRED,
     _EXEC.HISTORY_MISMATCH, _EXEC.HISTORY_AMBIGUOUS,
-    _EXEC.ATTEMPT_ACTIVE, _EXEC.ATTEMPT_CAP, _EXEC.RETRY_NOT_ALLOWED})
+    _EXEC.ATTEMPT_ACTIVE, _EXEC.ATTEMPT_CAP, _EXEC.RETRY_NOT_ALLOWED,
+    _EXEC.NOT_REOPENABLE, _EXEC.CASCADE_ACTIVE_DOWNSTREAM, _EXEC.CASCADE_SKIPPED_ON_PATH, _EXEC.CASCADE_NO_EXECUTION,
+    _EXEC.MISSION_ARCHIVED})
 
 
 def _controller_die(command, e):
@@ -6862,6 +6872,99 @@ def cmd_retry(args):
     with_lock(_do)
 
 
+def _reopen_shelved_hint(task_id, slug_opt):
+    """退避済み (archive 済み) mission の task なら、その mission の slug (見つからなければ None)。reopen は退避の restore を
+    しない (設計 §4.5)。ロックの中で呼ぶ。"""
+    if slug_opt:
+        return slug_opt if (not os.path.exists(mission_dir(slug_opt))
+                            and os.path.isdir(os.path.join(ARCHIVE_DIR, slug_opt))) else None
+    try:
+        names = sorted(os.listdir(ARCHIVE_DIR))
+    except OSError:
+        return None
+    for name in names:
+        if os.path.exists(os.path.join(ARCHIVE_DIR, name, 'tasks', f"{task_id}.md")):
+            return name
+    return None
+
+
+def cmd_reopen(args):
+    """plan.sh reopen <task_id> --reason "<理由>" --branch reuse [--mission <slug>] [--cascade none|reviews|all] [--over-cap "<理由>"]
+
+    確定した結果 (done / verified / skipped) の task を理由つきで pending に戻し、下流の古い結果を無効化する
+    (vNext 02 PR-F。設計 `knowledge/vnext-02-attempt-reopen-checkpoint.md` §4)。実体は Controller の `reopen_task(kind='reopen')`。
+    `--branch reuse` は必須 (merge 済みの PR の task は v1 で扱わない。plan.sh は gh を呼ばない = Director が確認して明示する)。
+    拒否 (遷移元・active・上限・実行中の下流・経路上の skipped・退避済み mission) は exit 3・何も書かない。
+    途中で止まったら同じ引数で再実行すれば続きから完了する (`store-check` の `cascade-incomplete` が印)。
+    """
+    opts, positional = parse_opts(args, {'--mission': 'value', '--reason': 'value', '--over-cap': 'value',
+                                         '--cascade': 'value', '--branch': 'value'})
+    task_id = positional[0]
+    if not re.fullmatch(r't\d+', task_id):
+        _usage_exit(f"invalid task_id '{task_id}': expected format tNNN (e.g. t001, t012)")
+    if '--reason' not in opts:
+        _usage_exit('--reason "<理由>" が必要です (理由は台帳に残ります)')
+    if '--branch' not in opts:
+        _usage_exit('--branch reuse が必要です (merge 済みの PR の task の reopen は扱いません。'
+                    '未 merge の PR の task であることを確認して、同じ branch・同じ PR を使う指定を明示してください)')
+    if opts['--branch'] != 'reuse':
+        _usage_exit("--branch は reuse だけです (merge 済みの PR の task の reopen は扱いません。新しい task を足してください)")
+    try:
+        cascade = _CONTROLLER.check_cascade(opts.get('--cascade'))
+        reason = _CONTROLLER.check_reason(opts['--reason'], '--reason')
+        over_cap = _CONTROLLER.check_reason(opts['--over-cap'], '--over-cap') if '--over-cap' in opts else None
+    except _EXEC.ControllerError as e:
+        _usage_exit(e.message)
+
+    def _do():
+        state = load_state()
+        slug = opts.get('--mission')
+        if not slug:
+            matches = [s for s in (state.get('active_missions') or []) if os.path.exists(task_path(s, task_id))]
+            if not matches:
+                shelved = _reopen_shelved_hint(task_id, None)
+                if shelved:
+                    _controller_die('reopen', _EXEC.ControllerError(
+                        _EXEC.MISSION_ARCHIVED, f"mission '{shelved}' は archive 済みです (task '{task_id}')。"
+                        f"archive 済み mission の task は reopen しません。新しい mission に新しい task を足してください"))
+                die(f"task '{task_id}' not found in any active mission. Pass --mission <slug>.")
+            slug = resolve_ambiguous_mission('reopen', task_id, matches) if len(matches) > 1 else matches[0]
+        if not os.path.exists(mission_dir(slug)):
+            if _reopen_shelved_hint(task_id, slug):
+                _controller_die('reopen', _EXEC.ControllerError(
+                    _EXEC.MISSION_ARCHIVED, f"mission '{slug}' は archive 済みです。archive 済み mission の task は reopen しません。"
+                    f"新しい mission に新しい task を足してください"))
+            die(f"mission '{slug}' not found.")
+        recover_before(cards=[(slug, task_id)])
+        default_cap = _HISTORY.load_default_max_attempts(
+            os.path.join(REPO_ROOT, 'config', 'crewvia.yaml'),
+            warn=lambda msg: print(f"[plan.sh reopen] warn: {msg}", file=sys.stderr))
+        graph = {m['id']: m.get('blocked_by') for m, _b in list_tasks(slug, quiet=True) if m.get('id')}
+        try:
+            res = _CONTROLLER.reopen_task(_txn(), slug, task_id, kind='reopen', reason=reason, over_cap=over_cap,
+                                          default_max_attempts=default_cap, cascade=cascade, graph=graph)
+        except _EXEC.ControllerError as e:
+            _controller_die('reopen', e)
+        prev = res.execution
+        print(f"Reopened: {slug}/{task_id} — pending (attempt {prev.attempt} の結果を見直します。"
+              f"次の pull が attempt {prev.attempt + 1} を発行します)")
+        if res.reopened:
+            print(f"  下流を pending に戻した (cascade={cascade}): {', '.join(res.reopened)}")
+        if res.reset:
+            print(f"  実行中だった下流の試行を閉じて pending に戻した: {', '.join(res.reset)}")
+        if res.unreleased:
+            print(f"  released_deps から {task_id} を外した: {', '.join(res.unreleased)}")
+        if res.already:
+            print(f"  前の実行で既に戻っていた下流: {', '.join(res.already)}")
+        if res.stale:
+            print(f"  古い結果に基づく下流 (戻していません。Director が判断してください): {', '.join(res.stale)}")
+        if res.resumed:
+            print(f"  再実行で完了: 途中で止まっていた reopen を完了しました (既に戻っていた下流 {len(res.already)} 件)")
+        _reactivate_done_mission(slug, via=f'reopen {task_id}')
+
+    with_lock(_do)
+
+
 def cmd_release_dep(args):
     """Director が「failed の依存を持つこの task を進めてよい」と明示的に決める。
 
@@ -7277,6 +7380,7 @@ dispatch = {
     'fail': cmd_fail,
     'update': cmd_update,
     'retry': cmd_retry,
+    'reopen': cmd_reopen,
     'release-dep': cmd_release_dep,
     'retire': cmd_retire,
     'reap-orphan-assignment': cmd_reap_orphan_assignment,

@@ -1,0 +1,571 @@
+"""`plan.sh reopen` と下流の無効化 (vNext 02 PR-F / t036。設計 §4)。
+
+隔離 plan.sh + 隔離 queue (`pull_execution_helpers.Box`)。本番の queue / registry / config には触れない。
+
+* 遷移元・`--branch reuse` 必須・archive 済み mission・上限・理由の検査
+* `--cascade none|reviews|all` の 3 値・経路の閉包 (I → A → R で A も戻る)・対象外の完了済み下流は列挙だけ
+* 実行中 / ready_for_verification / verifying の下流 (cascade なしで拒否・ありで試行を RESET_BY_DIRECTOR で閉じる)
+* 経路上の skipped は拒否 (途中・末端・複数経路の片方 × 3 値)・何も書かない
+* 書き込みの各点で kill → store-check が cascade-incomplete → 同じコマンドの再実行で完了し reopen_count が二重に増えない
+* reopen → pull で previous_attempt・reopen → pull → done が同じ pr_number で閉じる
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import signal
+import subprocess
+
+import pytest
+
+import execution_e3_helpers as e3
+from execution_e3_helpers import MISSION, Box, last_error_code, new_card, run, set_card
+
+import lib_history as hist  # noqa: E402
+import lib_state_store as store  # noqa: E402
+
+SKILLS = "code,review,qa,codex-review"
+REASON = "I の結果を見直す"
+
+
+def finish(box, tid, agent="Ren", **done_extra):
+    """pull → done。戻り値: 試行の ID。"""
+    p = box.pull(agent, tid, skills=SKILLS)
+    assert p.returncode == 0, (tid, p.stdout, p.stderr)
+    xid = json.loads(p.stdout)["execution_id"]
+    args = ["done", tid, "r", "--mission", MISSION, "--execution", xid]
+    for k, v in done_extra.items():
+        args += [k, v]
+    q = run(box, *args, agent=agent)
+    assert q.returncode == 0, (tid, q.stderr)
+    return xid
+
+
+def build(tmp_path, spec, name="root"):
+    """spec: [(tid, blocked_by, skills)]。t001 は Box が作る。全部 done にして返す (依存順)。"""
+    box = Box(tmp_path / name, tasks=("t001",))
+    for tid, blocked, skills in spec:
+        if tid == "t001":
+            set_card(box, "t001", skills=skills, blocked_by=blocked)
+        else:
+            new_card(box, tid, "pending", blocked_by=blocked, skills=skills)
+    return box
+
+
+def finish_all(box, tids):
+    for tid in tids:
+        finish(box, tid)
+
+
+def reopen(box, tid="t001", *extra, reason=REASON, branch="reuse", agent="Director"):
+    args = ["reopen", tid, "--mission", MISSION]
+    if reason is not None:
+        args += ["--reason", reason]
+    if branch is not None:
+        args += ["--branch", branch]
+    return run(box, *args, *extra, agent=agent)
+
+
+def status(box, tid):
+    return box.card(tid)["status"]
+
+
+def count(box, tid):
+    return box.card(tid).get("reopen_count") or 0
+
+
+def ledger_dir(box, tid):
+    return box.queue / "missions" / MISSION / "history" / tid
+
+
+def ledger_files(box, tid, kind=None):
+    d = ledger_dir(box, tid)
+    names = sorted(p.name for p in d.iterdir() if not p.name.startswith(".")) if d.is_dir() else []
+    return [n for n in names if kind is None or f"-{kind}-" in n]
+
+
+def ledger(box, tid, name):
+    return hist.parse((ledger_dir(box, tid) / name).read_text(), source=name)
+
+
+def store_check(box):
+    p = run(box, "store-check", "--mission", MISSION, agent="Director")
+    assert p.returncode == 0, p.stderr
+    return p.stdout
+
+
+CHAIN = [("t001", [], ["code"]), ("t002", ["t001"], ["code"]), ("t003", ["t002"], ["review"])]
+
+
+@pytest.fixture
+def chain(tmp_path):
+    """I(t001) → A(t002, code) → R(t003, review)。全部 done。"""
+    box = build(tmp_path, CHAIN)
+    finish_all(box, ("t001", "t002", "t003"))
+    return box
+
+
+# ---------------------------------------------------------------------------
+# 入口の検査
+# ---------------------------------------------------------------------------
+
+def test_reopen_returns_a_done_task_to_pending_and_records_the_reason(tmp_path):
+    box = build(tmp_path, [("t001", [], ["code"])])
+    xid = finish(box, "t001")
+    p = reopen(box)
+    assert p.returncode == 0, p.stderr
+    card = box.card()
+    assert card["status"] == "pending" and card["worker"] is None and card["started_at"] is None
+    assert card.get("completed_at") is None and card["reopen_count"] == 1
+    assert card["current_execution_id"] == xid and card["execution_status"] == "completed"
+    [name] = ledger_files(box, "t001", "reopen")
+    fields, _ = ledger(box, "t001", name)
+    assert fields["kind"] == "reopen" and fields["execution_id"] == xid and fields["reason"] == REASON
+    assert fields["reopen_count"] in (None, 0) and not fields.get("root")
+    assert REASON not in json.dumps(box.audit_rows(), ensure_ascii=False)       # 理由は台帳にだけ
+
+
+def test_branch_reuse_is_required_and_nothing_is_written_without_it(tmp_path):
+    box = build(tmp_path, [("t001", [], ["code"])])
+    finish(box, "t001")
+    before = box.snapshot()
+    for branch in (None, "new", ""):
+        p = reopen(box, branch=branch)
+        assert p.returncode != 0 and "--branch" in p.stderr, (branch, p.stderr)
+        assert box.snapshot() == before
+    assert reopen(box, "t001", "--cascade", "bogus").returncode != 0
+    assert box.snapshot() == before
+
+
+@pytest.mark.parametrize("src", ["pending", "failed", "needs_director", "in_progress"])
+def test_reopen_from_other_statuses_is_refused_and_writes_nothing(tmp_path, src):
+    box = build(tmp_path, [("t001", [], ["code"])])
+    finish(box, "t001")
+    set_card(box, status=src, worker=None)
+    before = box.snapshot()
+    p = reopen(box)
+    assert p.returncode == 3, p.stderr
+    assert last_error_code(p.stderr) in ("NOT_REOPENABLE", "ATTEMPT_ACTIVE")
+    assert box.snapshot() == before and not ledger_files(box, "t001", "reopen")
+
+
+@pytest.mark.parametrize("src", ["done", "verified", "skipped"])
+def test_reopen_accepts_done_verified_and_skipped(tmp_path, src):
+    box = build(tmp_path, [("t001", [], ["code"])])
+    finish(box, "t001")
+    set_card(box, status=src)
+    p = reopen(box)
+    assert p.returncode == 0, p.stderr
+    assert status(box, "t001") == "pending" and count(box, "t001") == 1
+
+
+def test_reopen_of_a_task_without_attempt_fields_is_refused(tmp_path):
+    box = build(tmp_path, [("t001", [], ["code"])])
+    new_card(box, "t002", "done")                   # 試行の欄なし (この設計より前の card)
+    before = box.snapshot()
+    p = reopen(box, "t002")
+    assert p.returncode == 3 and last_error_code(p.stderr) == "NOT_REOPENABLE"
+    assert box.snapshot() == before
+
+
+def test_reopen_of_an_archived_mission_is_refused_with_exit_3(tmp_path):
+    box = build(tmp_path, [("t001", [], ["code"])])
+    finish(box, "t001")
+    p = run(box, "archive", MISSION, agent="Director")
+    assert p.returncode == 0, p.stderr
+    before = box.snapshot()
+    for extra in ((), ):
+        q = reopen(box)
+        assert q.returncode == 3 and last_error_code(q.stderr) == "MISSION_ARCHIVED", q.stderr
+    q = run(box, "reopen", "t001", "--reason", REASON, "--branch", "reuse", agent="Director")   # --mission なしでも
+    assert q.returncode == 3 and last_error_code(q.stderr) == "MISSION_ARCHIVED", q.stderr
+    assert box.snapshot() == before
+
+
+def test_reason_is_checked_like_retry(tmp_path):
+    box = build(tmp_path, [("t001", [], ["code"])])
+    finish(box, "t001")
+    before = box.snapshot()
+    for bad in ("", "  ", "a\nb", "a b", "x" * 501):
+        p = reopen(box, reason=bad)
+        assert p.returncode != 0, bad
+        assert box.snapshot() == before
+    p = reopen(box, reason=None)
+    assert p.returncode != 0 and box.snapshot() == before
+
+
+def test_attempt_cap_applies_at_the_entrance_and_over_cap_passes(tmp_path):
+    box = build(tmp_path, [("t001", [], ["code"])])
+    finish(box, "t001")
+    set_card(box, max_attempts=1)
+    before = box.snapshot()
+    p = reopen(box)
+    assert p.returncode == 3 and last_error_code(p.stderr) == "ATTEMPT_CAP"
+    assert box.snapshot() == before
+    q = reopen(box, "t001", "--over-cap", "もう一度だけ")
+    assert q.returncode == 0, q.stderr
+    [name] = ledger_files(box, "t001", "reopen")
+    assert ledger(box, "t001", name)[0]["over_cap"] == "もう一度だけ"
+
+
+def test_an_unfinished_reopen_rerun_is_not_reopenable_once_complete(tmp_path):
+    box = build(tmp_path, [("t001", [], ["code"])])
+    finish(box, "t001")
+    assert reopen(box).returncode == 0
+    before = box.snapshot()
+    p = reopen(box)
+    assert p.returncode == 3 and last_error_code(p.stderr) == "NOT_REOPENABLE"
+    assert box.snapshot() == before and count(box, "t001") == 1
+
+
+def test_reopen_reactivates_a_done_mission(tmp_path):
+    box = build(tmp_path, [("t001", [], ["code"])])
+    finish(box, "t001")
+    mfile = box.queue / "missions" / MISSION / "mission.yaml"
+    mfile.write_text(mfile.read_text().replace("status: in_progress", "status: done"))
+    assert "status: done" in mfile.read_text()
+    assert reopen(box).returncode == 0
+    assert "status: in_progress" in mfile.read_text()
+
+
+# ---------------------------------------------------------------------------
+# cascade の 3 値・閉包
+# ---------------------------------------------------------------------------
+
+def test_cascade_reviews_closes_the_path_so_the_intermediate_task_returns_too(chain):
+    p = reopen(chain)
+    assert p.returncode == 0, p.stderr
+    for tid in ("t001", "t002", "t003"):
+        assert status(chain, tid) == "pending" and count(chain, tid) == 1, tid
+    # 下流の台帳: reopen・root と root_reopen_count (= I の reopen_count + 1)
+    for tid in ("t002", "t003"):
+        [name] = ledger_files(chain, tid, "reopen")
+        fields, _ = ledger(chain, tid, name)
+        assert fields["root"] == "t001" and fields["root_reopen_count"] == 1 and fields["reason"] == REASON
+    # I から遠い順 (R → A → I): 台帳の ended_at が I より前
+    ended = {t: ledger(chain, t, ledger_files(chain, t, "reopen")[0])[0]["ended_at"] for t in ("t001", "t002", "t003")}
+    assert ended["t003"] <= ended["t002"] <= ended["t001"]
+    assert "t002" in p.stdout and "t003" in p.stdout
+
+
+def test_cascade_none_changes_only_the_root_and_lists_the_stale_downstream(chain):
+    p = reopen(chain, "t001", "--cascade", "none")
+    assert p.returncode == 0, p.stderr
+    assert status(chain, "t001") == "pending"
+    assert status(chain, "t002") == "done" and status(chain, "t003") == "done"
+    assert count(chain, "t002") == 0 and not ledger_files(chain, "t002", "reopen")
+    assert "古い結果に基づく下流" in p.stdout and "t002" in p.stdout and "t003" in p.stdout
+
+
+def test_cascade_reviews_leaves_a_non_review_branch_alone_and_lists_it(tmp_path):
+    spec = CHAIN + [("t004", ["t001"], ["code"])]            # I → B (非 review・R への経路上にない)
+    box = build(tmp_path, spec)
+    finish_all(box, ("t001", "t002", "t003", "t004"))
+    p = reopen(box)
+    assert p.returncode == 0, p.stderr
+    assert status(box, "t004") == "done" and count(box, "t004") == 0
+    assert "古い結果に基づく下流" in p.stdout and "t004" in p.stdout
+
+
+def test_cascade_all_returns_every_finished_downstream(tmp_path):
+    spec = CHAIN + [("t004", ["t001"], ["code"])]
+    box = build(tmp_path, spec)
+    finish_all(box, ("t001", "t002", "t003", "t004"))
+    p = reopen(box, "t001", "--cascade", "all")
+    assert p.returncode == 0, p.stderr
+    assert all(status(box, t) == "pending" and count(box, t) == 1 for t in ("t001", "t002", "t003", "t004"))
+
+
+def test_downstream_codex_review_skill_is_selected_too(tmp_path):
+    spec = [("t001", [], ["code"]), ("t002", ["t001"], ["codex-review"])]
+    box = build(tmp_path, spec)
+    finish(box, "t001", **{"--no-pr": "n/a"})
+    finish(box, "t002")
+    assert reopen(box).returncode == 0
+    assert status(box, "t002") == "pending" and count(box, "t002") == 1
+
+
+def test_pending_downstream_is_left_alone_and_released_deps_of_the_root_is_removed(tmp_path):
+    spec = [("t001", [], ["code"]), ("t002", ["t001"], ["code"])]
+    box = build(tmp_path, spec)
+    finish(box, "t001")
+    set_card(box, "t002", released_deps=["t001"])
+    p = reopen(box)
+    assert p.returncode == 0, p.stderr
+    c = box.card("t002")
+    assert c["status"] == "pending" and c.get("reopen_count") in (None, 0) and "released_deps" not in c
+    assert not ledger_files(box, "t002")
+
+
+# ---------------------------------------------------------------------------
+# 実行中の下流
+# ---------------------------------------------------------------------------
+
+def running_downstream(box, tid="t003", agent="Mika"):
+    p = box.pull(agent, tid, skills=SKILLS)
+    assert p.returncode == 0, p.stderr
+    return json.loads(p.stdout)["execution_id"]
+
+
+@pytest.fixture
+def chain_with_running_review(tmp_path):
+    box = build(tmp_path, CHAIN)
+    finish_all(box, ("t001", "t002"))
+    xid = running_downstream(box)
+    return box, xid
+
+
+def test_running_downstream_without_cascade_is_refused_and_writes_nothing(chain_with_running_review):
+    box, _xid = chain_with_running_review
+    before = box.snapshot()
+    p = reopen(box, "t001", "--cascade", "none")
+    assert p.returncode == 3 and last_error_code(p.stderr) == "CASCADE_ACTIVE_DOWNSTREAM", p.stderr
+    assert "t003" in p.stderr and box.snapshot() == before and count(box, "t001") == 0
+
+
+@pytest.mark.parametrize("state", ["in_progress", "ready_for_verification", "verifying"])
+def test_running_downstream_is_reset_by_director_and_the_workers_next_report_is_refused(tmp_path, state):
+    box = build(tmp_path, CHAIN)
+    finish_all(box, ("t001", "t002"))
+    xid = running_downstream(box)
+    if state != "in_progress":
+        set_card(box, "t003", status=state)
+    p = reopen(box)
+    assert p.returncode == 0, p.stderr
+    c = box.card("t003")
+    assert c["status"] == "pending" and c["execution_status"] == "failed"
+    assert c["execution_end_code"] == "RESET_BY_DIRECTOR" and c["worker"] is None
+    assert status(box, "t001") == "pending" and status(box, "t002") == "pending"   # A も閉包で戻る
+    q = run(box, "done", "t003", "r", "--mission", MISSION, "--execution", xid, agent="Mika")
+    assert q.returncode == 3 and last_error_code(q.stderr) in ("EXECUTION_NOT_CURRENT", "EXECUTION_ALREADY_TERMINAL")
+    [rname] = ledger_files(box, "t003", "reset")
+    f, _ = ledger(box, "t003", rname)
+    assert f["root"] == "t001" and f["root_reopen_count"] == 1 and f["reason"] == REASON
+
+
+# ---------------------------------------------------------------------------
+# 経路上の skipped は拒否
+# ---------------------------------------------------------------------------
+
+def skipped_box(tmp_path, spec, skipped, name="root"):
+    box = build(tmp_path, spec, name)
+    finish_all(box, [t for t, _b, _s in spec])                 # 依存順に done にしてから skipped に書き換える
+    for tid in skipped:
+        set_card(box, tid, status="skipped")
+    return box
+
+
+@pytest.mark.parametrize("cascade", ["reviews", "all"])
+def test_skipped_in_the_middle_of_the_path_is_refused(tmp_path, cascade):
+    box = skipped_box(tmp_path, CHAIN, {"t002"})               # I → A(skipped) → R(done)
+    before = box.snapshot()
+    p = reopen(box, "t001", "--cascade", cascade)
+    assert p.returncode == 3 and last_error_code(p.stderr) == "CASCADE_SKIPPED_ON_PATH", p.stderr
+    assert "t001 -> t002" in p.stderr
+    assert box.snapshot() == before and count(box, "t001") == 0 and not ledger_files(box, "t001", "reopen")
+
+
+def test_skipped_in_the_middle_is_not_a_problem_with_cascade_none(tmp_path):
+    box = skipped_box(tmp_path, CHAIN, {"t002"})
+    p = reopen(box, "t001", "--cascade", "none")
+    assert p.returncode == 0, p.stderr
+    assert status(box, "t001") == "pending" and status(box, "t003") == "done"
+
+
+def test_skipped_at_the_end_of_the_path_is_refused(tmp_path):
+    spec = [("t001", [], ["code"]), ("t002", ["t001"], ["review"])]
+    box = skipped_box(tmp_path, spec, {"t002"})                # I → R(skipped, review)
+    before = box.snapshot()
+    p = reopen(box)
+    assert p.returncode == 3 and last_error_code(p.stderr) == "CASCADE_SKIPPED_ON_PATH", p.stderr
+    assert box.snapshot() == before
+    assert reopen(box, "t001", "--cascade", "none").returncode == 0
+
+
+def test_skipped_on_one_of_two_paths_is_refused(tmp_path):
+    spec = [("t001", [], ["code"]), ("t002", ["t001"], ["code"]), ("t003", ["t001"], ["code"]),
+            ("t004", ["t002", "t003"], ["review"])]
+    box = skipped_box(tmp_path, spec, {"t003"})                # I → A → R と I → B(skipped) → R
+    before = box.snapshot()
+    p = reopen(box)
+    assert p.returncode == 3 and last_error_code(p.stderr) == "CASCADE_SKIPPED_ON_PATH", p.stderr
+    assert box.snapshot() == before
+
+
+def test_skipped_off_the_path_to_any_selected_task_is_not_a_problem(tmp_path):
+    spec = CHAIN + [("t004", ["t001"], ["code"])]
+    box = skipped_box(tmp_path, spec, {"t004"})                # 非 review の葉が skipped (reviews では選ばれない)
+    assert reopen(box).returncode == 0
+    assert status(box, "t004") == "skipped"
+    box2 = skipped_box(tmp_path, spec, {"t004"}, name="root2")
+    assert reopen(box2, "t001", "--cascade", "all").returncode == 3     # all では選ばれて経路の末端になる
+
+
+# ---------------------------------------------------------------------------
+# 上限・試行の記録のない下流
+# ---------------------------------------------------------------------------
+
+def test_downstream_over_the_attempt_cap_is_refused_unless_over_cap(chain):
+    set_card(chain, "t003", max_attempts=1)
+    before = chain.snapshot()
+    p = reopen(chain)
+    assert p.returncode == 3 and last_error_code(p.stderr) == "ATTEMPT_CAP" and "t003" in p.stderr
+    assert chain.snapshot() == before
+    assert reopen(chain, "t001", "--over-cap", "了解").returncode == 0
+
+
+def test_downstream_without_attempt_fields_cannot_be_written_to_the_ledger(tmp_path):
+    spec = [("t001", [], ["code"])]
+    box = build(tmp_path, spec)
+    new_card(box, "t002", "done", blocked_by=["t001"], skills=["review"])
+    finish(box, "t001")
+    before = box.snapshot()
+    p = reopen(box)
+    assert p.returncode == 3 and last_error_code(p.stderr) == "CASCADE_NO_EXECUTION", p.stderr
+    assert box.snapshot() == before
+
+
+# ---------------------------------------------------------------------------
+# roll forward・kill
+# ---------------------------------------------------------------------------
+
+def rewind(box, tid, orig):
+    """reopen が書き換えた欄を元の card に戻す (= その task の card を書く前に止まった状態。台帳は残る)。"""
+    set_card(box, tid, **{k: orig.get(k) for k in ("status", "worker", "started_at", "completed_at", "reopen_count")})
+
+
+def test_rerun_after_the_downstream_was_written_but_not_the_root_completes_without_double_counting(chain):
+    orig = {t: chain.card(t) for t in ("t001", "t002", "t003")}
+    assert reopen(chain).returncode == 0
+    # I の card だけを元に戻す (= I の card を書く前に止まった状態)。I の台帳 reopen は残る
+    rewind(chain, "t001", orig["t001"])
+    out = store_check(chain)
+    assert "cascade-incomplete" in out
+    files_before = {t: ledger_files(chain, t) for t in ("t001", "t002", "t003")}
+    p = reopen(chain)
+    assert p.returncode == 0, p.stderr
+    assert "再実行で完了" in p.stdout
+    assert [count(chain, t) for t in ("t001", "t002", "t003")] == [1, 1, 1]
+    assert {t: ledger_files(chain, t) for t in ("t001", "t002", "t003")} == files_before
+    assert "cascade-incomplete" not in store_check(chain)
+
+
+def test_rerun_after_only_the_far_end_was_written_reopens_the_intermediate_too(chain):
+    orig = {t: chain.card(t) for t in ("t001", "t002", "t003")}
+    assert reopen(chain).returncode == 0
+    # R だけが戻った状態に巻き戻す (A と I は done・reopen の台帳は R にだけ残る。A の台帳も消す)
+    for tid in ("t001", "t002"):
+        rewind(chain, tid, orig[tid])
+        for n in ledger_files(chain, tid, "reopen"):
+            (ledger_dir(chain, tid) / n).unlink()
+    assert "cascade-incomplete" in store_check(chain)
+    p = reopen(chain)
+    assert p.returncode == 0, p.stderr
+    assert [status(chain, t) for t in ("t001", "t002", "t003")] == ["pending"] * 3
+    assert [count(chain, t) for t in ("t001", "t002", "t003")] == [1, 1, 1]       # R は二重に増えない
+    assert "再実行で完了" in p.stdout
+
+
+def test_rerun_with_a_different_reason_is_refused_as_history_mismatch(chain):
+    orig = chain.card("t001")
+    assert reopen(chain).returncode == 0
+    rewind(chain, "t001", orig)
+    before = chain.snapshot()
+    p = reopen(chain, reason="別の理由")
+    assert p.returncode == 3 and last_error_code(p.stderr) == "HISTORY_MISMATCH", p.stderr
+    assert chain.snapshot() == before
+
+
+def _fork_reopen(box, argv, kill_at):
+    """fork した子で本物の `cmd_reopen(argv)` を走らせ、lib の書き込み点の `kill_at` 番目で SIGKILL。
+    戻り値: (SIGKILL で落ちたか, 書き込み点の数)。"""
+    ns = box.namespace()
+    ns["SUBCOMMAND"] = "reopen"
+    r, w = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        code = 3
+        try:
+            os.environ.update(box.proc_env("Director"))
+            calls = [0]
+
+            def hook(_point, _path):
+                calls[0] += 1
+                if calls[0] == kill_at:
+                    os.kill(os.getpid(), signal.SIGKILL)
+
+            store.FAULT_HOOK = hook
+            try:
+                ns["cmd_reopen"](argv)
+            except SystemExit:
+                pass
+            os.write(w, str(calls[0]).encode())
+            code = 0
+        finally:
+            os._exit(code)
+    os.close(w)
+    _pid, st = os.waitpid(pid, 0)
+    data = os.read(r, 32).decode()
+    os.close(r)
+    return os.WIFSIGNALED(st) and os.WTERMSIG(st) == signal.SIGKILL, int(data or 0)
+
+
+def _restore(box, saved):
+    shutil.rmtree(box.queue)
+    shutil.copytree(saved, box.queue)
+
+
+def test_kill_after_every_write_then_the_same_command_completes_once(tmp_path):
+    box = build(tmp_path, CHAIN)
+    finish_all(box, ("t001", "t002", "t003"))
+    saved = tmp_path / "saved-queue"
+    shutil.copytree(box.queue, saved)
+    argv = ["t001", "--mission", MISSION, "--reason", REASON, "--branch", "reuse"]
+    killed_points = 0
+    incomplete_seen = 0
+    for k in range(1, 400):
+        _restore(box, saved)
+        killed, calls = _fork_reopen(box, argv, k)
+        if not killed:
+            assert calls < k
+            break
+        killed_points += 1
+        # どの時点でも「上流が pending なのに下流が done」を作らない (古い結果が通る側に倒れない)
+        st = {t: status(box, t) for t in ("t001", "t002", "t003")}
+        assert not (st["t001"] == "pending" and st["t002"] == "done"), (k, st)
+        assert not (st["t002"] == "pending" and st["t003"] == "done"), (k, st)
+        if "cascade-incomplete" in store_check(box):
+            incomplete_seen += 1
+        p = reopen(box)
+        if p.returncode == 3:                                  # kill が I の card の後ろ = 既に完了していた
+            assert last_error_code(p.stderr) == "NOT_REOPENABLE", (k, p.stderr)
+        else:
+            assert p.returncode == 0, (k, p.stderr)
+        assert [status(box, t) for t in ("t001", "t002", "t003")] == ["pending"] * 3, k
+        assert [count(box, t) for t in ("t001", "t002", "t003")] == [1, 1, 1], k
+        assert "cascade-incomplete" not in store_check(box), k
+        for t in ("t001", "t002", "t003"):
+            assert len(ledger_files(box, t, "reopen")) == 1, (k, t)
+    assert killed_points >= 12 and incomplete_seen >= 1, (killed_points, incomplete_seen)
+
+
+# ---------------------------------------------------------------------------
+# reopen → pull → done
+# ---------------------------------------------------------------------------
+
+def test_reopen_then_pull_shows_previous_attempt_and_done_closes_with_the_same_pr(tmp_path):
+    box = build(tmp_path, [("t001", [], ["code"])])
+    finish(box, "t001", **{"--pr": "123"})
+    assert box.card()["pr_number"] == 123
+    assert reopen(box).returncode == 0
+    assert box.card()["pr_number"] == 123 and box.card()["task_slug"]
+    p = box.pull("Ren", "t001", skills=SKILLS)
+    assert p.returncode == 0, p.stderr
+    data = json.loads(p.stdout)
+    assert data["attempt"] == 2 and data["previous_attempt"]["attempt"] == 1
+    q = run(box, "done", "t001", "r2", "--pr", "123", "--mission", MISSION, "--execution", data["execution_id"], agent="Ren")
+    assert q.returncode == 0, q.stderr
+    c = box.card()
+    assert c["status"] == "done" and c["pr_number"] == 123 and c["reopen_count"] == 1

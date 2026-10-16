@@ -137,6 +137,16 @@ lib ごとの**破ってはいけない契約**の要約。理由・経緯・全
   欄を省いて stderr に固定コードを出すだけで pull は止めない）・`store-check`（`history_orphan` / `history_duplicate_key` / `history_unobservable` / `history_without_card`。**報告だけ**）。
 - 戻し方: PR revert → `scripts/sync-main-checkout.sh`。`history/` と card の `result_execution_id` は残ってよい（旧コードは読まない・無視する）。
 
+## reopen と下流の無効化（`plan.sh reopen` + `reopen_task(kind='reopen')`。vNext 02 PR-F / t036。設計 §4）
+
+- `plan.sh reopen <id> --reason "<理由>" --branch reuse [--mission] [--cascade none|reviews|all] [--over-cap "<理由>"]`。遷移元は `ACCEPTS_FROM['reopen']`（done / verified / skipped）→ pending、`reopen_count += 1`。`--branch reuse` は必須（省略・他の値は UsageExit）。
+  拒否は全部 exit 3・何も書かない: `NOT_REOPENABLE`（pending = 既に完了 / failed 等は retry へ / 試行の記録なし）・`ATTEMPT_ACTIVE`・`ATTEMPT_CAP`・`CASCADE_ACTIVE_DOWNSTREAM`・`CASCADE_SKIPPED_ON_PATH`・`CASCADE_NO_EXECUTION`・`MISSION_ARCHIVED`（`_NO_WRITE_REFUSALS`）。
+- 下流の列挙は `lib_dep_rules.downstream_closure` / `path_closure` / `dependency_path` の 1 か所。`unmet_dependencies` は推移的にしない（cascade の側で経路を閉じる）。対象の skills の置き場は `CASCADE_REVIEW_SKILLS`。
+- 書く順: 検査を全部先に → 下流を I から遠い順に 1 task ずつ（台帳 → card。実行中は `reset_task(ledger_extra=…)`）→ `released_deps` → **I の card を最後**。途中で止まったら**同じ引数で再実行**（既に pending の下流は `reopen_count` を足さない。印は台帳の `root` / `root_reopen_count`）。`store-check` の `cascade-incomplete` は報告だけ。
+- `reopen_task` の戻り値は kind で違う（retry = `Execution`・reopen = `ReopenResult`）。共通の書き込みは `_write_reopen`。
+- テスト: `tests/test_reopen_cascade_plan_sh.py`（3 値・閉包・実行中の下流・skipped の網羅・書き込みの全点で kill → 再実行）・`tests/test_dep_rules_closure.py`。
+- 戻し方: PR revert → `scripts/sync-main-checkout.sh`。台帳の `reopen` と card の `reopen_count` は残ってよい。
+
 ## retry と総試行数の上限（`plan.sh retry` + `reopen_task`。vNext 02 PR-E / t031。設計 §3.3・§3.7）
 
 - `plan.sh retry <id> --reason "<理由>" [--mission] [--over-cap "<理由>"]` → Controller の `reopen_task(kind='retry')`（PR-F が同じ関数に `reopen` を足す）。

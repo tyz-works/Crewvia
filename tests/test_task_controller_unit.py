@@ -1027,7 +1027,9 @@ def test_domain_error_codes_and_exit_codes_match_the_design_table():
     assert {c for c, n in ex.EXIT_CODES.items() if n == 3} == {
         ex.EXECUTION_NOT_FOUND, ex.EXECUTION_NOT_CURRENT, ex.EXECUTION_ALREADY_TERMINAL, ex.EXECUTION_REQUIRED,
         ex.HISTORY_MISMATCH, ex.HISTORY_AMBIGUOUS,                                           # 台帳 (vNext 02 PR-D)
-        ex.ATTEMPT_ACTIVE, ex.ATTEMPT_CAP, ex.RETRY_NOT_ALLOWED}                             # retry (vNext 02 PR-E)
+        ex.ATTEMPT_ACTIVE, ex.ATTEMPT_CAP, ex.RETRY_NOT_ALLOWED,                            # retry (vNext 02 PR-E)
+        ex.NOT_REOPENABLE, ex.CASCADE_ACTIVE_DOWNSTREAM, ex.CASCADE_SKIPPED_ON_PATH,         # reopen (vNext 02 PR-F)
+        ex.CASCADE_NO_EXECUTION, ex.MISSION_ARCHIVED}
     assert all(ex.EXIT_CODES[c] == 1 for c in (ex.STATE_INVALID, ex.TASK_NOT_FOUND, ex.TASK_NOT_ELIGIBLE,
                                                ex.TASK_ALREADY_RESERVED, ex.GIT_POLICY_INVALID, ex.LOCK_FAILED))
     # pull の idle (exit 2) になりうる domain error は無い (memory: pull-exit-2-is-idle-usage-errors-must-be-1)

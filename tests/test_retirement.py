@@ -1785,8 +1785,10 @@ def test_cleanup_is_bound_to_the_execution_by_a_single_plan_sh_call(sandbox):
     argv = calls[0]
     assert argv[2] == "retire", f"新 API を通っていない: {argv}"
     assert argv[3] == TASK_ID
+    # `--checkpoint none` は PR-G の追加: 保存するものが無い (この sandbox は record を持たない) ときの印。前提を
+    # 緩める種類の引数ではない (台帳の checkpoint_dir に入るだけ)。
     assert argv[4:] == ["--agent", AGENT, "--execution", SANDBOX_XID,
-                        "--mission", SLUG, "--no-wait"], (
+                        "--mission", SLUG, "--no-wait", "--checkpoint", "none"], (
         f"証拠以外のものを渡している: {argv}")
     # --no-wait は「何を主張するか」ではなく「待てるかどうか」の指定なので、
     # 前提を緩める種類のフラグではない (t025 / Codex 4 巡目 P2)。

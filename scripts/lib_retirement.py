@@ -941,7 +941,8 @@ class RetirementExecutor:
                  log=None, notify=None, plan_sh=None, queue_dir=None,
                  grace_period: int = 60, kill_delay: int = 10,
                  run_command=None, kill_process=None, now=None,
-                 notify_once=None) -> None:
+                 notify_once=None, checkpoint_seconds: float = 20,
+                 take_checkpoint=None) -> None:
         self.registry_dir = Path(registry_dir)
         self.repo_root = Path(repo_root)
         self.mux = mux
@@ -970,6 +971,11 @@ class RetirementExecutor:
         # notify-once ledger.  None = no ledger wired (tests, old callers); the
         # plain `notify` is used and there is no once-only guarantee.
         self.notify_once = notify_once
+        # vNext 02 PR-G: the checkpoint stage before `plan.sh retire`.  `checkpoint_seconds <= 0` = do not take one
+        # (`--checkpoint none`).  `take_checkpoint` is the injected seam (tests); the default is `lib_checkpoint.take`.
+        self.checkpoint_seconds = checkpoint_seconds
+        self._take_checkpoint_impl = take_checkpoint
+        self._checkpoint_results: dict = {}      # execution_id -> dir | "none" (this process only)
         # Notices `notify_once` could not deliver: {(key, fp): (mission, task,
         # message, first_attempt_at)}.  In memory on purpose — see
         # `_retry_owed_notices()`.
@@ -2052,9 +2058,11 @@ class RetirementExecutor:
             # the 70s termination stall this module was written to remove
             # (Codex 4 巡目 P2).  Nothing is lost by giving up: the marker stays
             # in flight and the next cycle asks again.
+            checkpoint = self._checkpoint_stage(agent, req, prog, mission, task_id, execution_id)
             argv = ["bash", str(self.plan_sh), "retire", task_id,
                     "--agent", agent, "--execution", execution_id,
-                    "--mission", mission, "--no-wait"]
+                    "--mission", mission, "--no-wait",
+                    "--checkpoint", checkpoint]
             env = dict(os.environ)
             # The audit log's `actor` for the retire row: this daemon, not "unknown" (execution.md §8).
             env["AGENT_NAME"] = "watchdog"
@@ -2121,6 +2129,65 @@ class RetirementExecutor:
         unlink_quiet(progress_path(self.registry_dir, agent))
         unlink_quiet(stall_path(self.registry_dir, agent))
         return "cleaned"
+
+    def _checkpoint_stage(self, agent: str, req: Optional[dict], prog: dict, mission: str,
+                          task_id: str, execution_id: str) -> str:
+        """The `checkpoint` stage (vNext 02 PR-G, design §5.4): save the worktree, then retire.  Returns the dir or `"none"`.
+
+        **Never stops the retirement** — a retirement that waits on a checkpoint is a window nobody closes
+        (`daemon-authority.md` §5).  A failure, a deadline or an exception costs the checkpoint only: whatever was
+        half written is removed by `lib_checkpoint`, the Director hears once (per task + attempt) and the retire goes
+        on with `--checkpoint none`.  A retry of the same retirement (lock busy) finds the finished dir and reuses it.
+        """
+        seconds = self.checkpoint_seconds
+        if not seconds or seconds <= 0:
+            return "none"
+        if execution_id in self._checkpoint_results:      # a retry of the same retirement (lock busy): do not take it again
+            return self._checkpoint_results[execution_id]
+        reason = (req or {}).get("reason") or prog.get("reason") or "unknown"
+        window = (req or {}).get("window_target") or prog.get("window_target")
+        try:
+            pane_text = None
+            if window and self._window_alive(window):
+                try:
+                    pane_text = self.mux.capture(window) or None
+                except Exception:  # noqa: BLE001 — the pane is a bonus; the worktree is the point
+                    pane_text = None
+            take = self._take_checkpoint_impl
+            if take is None:
+                import lib_checkpoint
+                take = lib_checkpoint.take
+            path = take(registry_dir=self.registry_dir, queue_dir=self.queue_dir, mission=mission, task=task_id,
+                        execution_id=execution_id, reason=reason, pane_text=pane_text, seconds=seconds)
+            self.log(f"[retire] {agent}: checkpoint saved for {mission}/{task_id}")
+            self._checkpoint_results[execution_id] = str(path)
+            return str(path)
+        except Exception as e:  # noqa: BLE001 — see the docstring
+            code = getattr(e, "code", None) or type(e).__name__
+            if code == "nothing_to_save":      # no record / no worktree yet: not a failure, nothing to tell anyone
+                self.log(f"[retire] {agent}: no checkpoint for {mission}/{task_id} (nothing to save)")
+                self._checkpoint_results[execution_id] = "none"
+                return "none"
+            self.log(f"[retire] {agent}: checkpoint failed for {mission}/{task_id} ({code}) — retiring without one")
+            self._checkpoint_failed_notice(mission, task_id, execution_id, code)
+            self._checkpoint_results[execution_id] = "none"
+            return "none"
+
+    def _checkpoint_failed_notice(self, mission: str, task_id: str, execution_id: str, code: str) -> None:
+        message = (
+            f"[checkpoint] task {task_id} (mission={mission}) の退役の直前の保存 (checkpoint) に失敗しました ({code})。"
+            f"退役は止めず checkpoint なしで続けます。worktree の未 commit の作業が残っているか、"
+            f"worktree を直接確認してください (record の git.worktree)。"
+        )
+        key, fp = f"checkpoint_{mission}_{task_id}", f"exec:{execution_id}"
+        if self.notify_once is None:
+            try:
+                if self.notify is not None:
+                    self.notify(message)
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        self._deliver_notice(key, fp, mission, task_id, message)
 
     def _cleanup_failed(self, agent: str, prog: dict, why: str,
                         mission: Optional[str], task_id: Optional[str]) -> str:

@@ -64,7 +64,7 @@ set -euo pipefail
 #                              依存の辺は消えず、card に released_deps として残る
 #   plan.sh retire <task_id> --agent <name> --execution <id>
 #                            [--mission <slug>] [--outcome reset|needs-director]
-#                            [--reason "<1 行>"] [--no-wait]
+#                            [--reason "<1 行>"] [--checkpoint <dir|none>] [--no-wait]
 #                              実行アイデンティティで束縛した後始末。前提が外れたら
 #                              1 バイトも書かずに exit 3 (詳細は cmd_retire)。
 #                              --execution: 試行の ID (plan.sh status の ex-…。退役 marker の task_execution_id)。必須
@@ -2609,7 +2609,7 @@ USAGE = {
     'release-dep': 'plan.sh release-dep <task_id> [--dep <csv>] [--mission <slug>]',
     'retire': ('plan.sh retire <task_id> --agent <name> --execution <id>\n'
                '                       [--mission <slug>] [--outcome reset|needs-director]\n'
-               '                       [--reason "<1 行>"] [--no-wait]'),
+               '                       [--reason "<1 行>"] [--checkpoint <dir|none>] [--no-wait]'),
     'reap-orphan-assignment': 'plan.sh reap-orphan-assignment <agent> [--no-wait]',
     'ready-for-verification': 'plan.sh ready-for-verification <task_id> [--mission <slug>] [--execution <id>]',
     'verifying': 'plan.sh verifying <task_id> --verifier <name> [--mission <slug>] [--execution <id>]',
@@ -6978,7 +6978,7 @@ def cmd_release_dep(args):
 def cmd_retire(args):
     """plan.sh retire <task_id> --agent <name> --execution <id>
                                 [--mission <slug>] [--outcome reset|needs-director]
-                                [--reason "<1 行>"] [--no-wait]
+                                [--reason "<1 行>"] [--checkpoint <dir|none>] [--no-wait]
 
     「この実行 (mission, task, worker, 試行の ID) を終了扱いにして後始末する」を
     1 つの操作として提供する。card の status 書き換えと assignment の撤去は
@@ -7028,6 +7028,7 @@ def cmd_retire(args):
         '--execution': 'value',
         '--outcome': 'value',
         '--reason': 'value',
+        '--checkpoint': 'value',
         '--no-wait': 'bool',
     })
 
@@ -7063,6 +7064,24 @@ def cmd_retire(args):
     reason = opts.get('--reason')
     if outcome == 'needs-director' and not (reason or '').strip():
         die("--outcome needs-director requires --reason \"<1 行の理由>\"")
+
+    # --checkpoint <dir|none> (vNext 02 PR-G。設計 §5.5): 退役の直前に保存した worktree の checkpoint。ロックの前・何も書く前に
+    # 検査する (別の試行の dir を指せない: `lib_checkpoint.verify` が meta.json の execution_id と dir 名を照合する)。
+    # 「指定されたか」は presence で見る: `--checkpoint ""` を none に倒さない。無ければ今まで通り (台帳の checkpoint_dir は空)。
+    checkpoint_dir = None
+    if '--checkpoint' in opts:
+        raw = opts['--checkpoint'].strip()
+        if not raw:
+            die("[plan.sh retire] --checkpoint には <dir> か none が必要です。空の値は none として扱いません。何も書いていません。")
+        if raw != 'none':
+            # 退役の直前の worktree の保存 (保存するのは watchdog 側の lib_retirement)。plan.sh が使うのは `verify` だけ
+            _ck = _import_scripts_module('lib_checkpoint')
+            try:
+                _ck.verify(raw, execution_id)
+            except _ck.CheckpointError as e:
+                die(f"[plan.sh retire] --checkpoint の dir を検証できません ({e})。別の試行の dir・壊れた dir は渡せません。"
+                    f"何も書いていません。", PRECONDITION_UNMET)
+            checkpoint_dir = os.path.normpath(raw)
 
     def _do():
         state = load_state()
@@ -7148,10 +7167,12 @@ def cmd_retire(args):
         try:
             if view == _EXEC.ACTIVE and meta.get('execution_status') == _EXEC.RESERVED:
                 _CONTROLLER.release_execution(_txn(), slug, task_id, caller, _EXEC.RETIRED,
-                                              to_status=to_status, meta_updates=updates, body=new_body)
+                                              to_status=to_status, meta_updates=updates, body=new_body,
+                                              checkpoint_dir=checkpoint_dir)
             else:
                 _CONTROLLER.fail_execution(_txn(), slug, task_id, caller, _EXEC.RETIRED,
-                                           to_status=to_status, meta_updates=updates, body=new_body)
+                                           to_status=to_status, meta_updates=updates, body=new_body,
+                                           checkpoint_dir=checkpoint_dir)
         except _EXEC.ControllerError as e:
             _controller_die('retire', e)
 

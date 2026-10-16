@@ -42,6 +42,8 @@ registry/notifications/
 registry/approvals/
 registry/handoffs/
 registry/retirements/
+# 退役の直前の worktree の保存 (vNext 02 PR-G)。patch・untracked を含むのでコミットしない
+registry/checkpoints/
 registry/daemons/
 # herdr-task-graph 連携の生成物。plan.sh の pull / done / update のたびに
 # 書き換わるので、追跡下に置くと全 worktree と主 WT の git status が毎回汚れ、

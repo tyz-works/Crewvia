@@ -913,6 +913,9 @@ class WatchConfig:
     #: 停止スイッチではなく、両デーモンで揃える必要も無い値 (`_CONFIG_KEYS` に入れない)。
     #: 既定値を持つのはここ 1 か所。
     hard_idle_suppressed_notify_seconds: int = 600
+    #: vNext 02 PR-G: 退役の直前に worktree を保存する checkpoint の期限 (秒)。watchdog だけが読む。**env は付けない**。
+    #: 0 以下で checkpoint を取らない (退役は今まで通り `--checkpoint none` で続く)。既定値を持つのはここ 1 か所。
+    checkpoint_seconds: int = 20
     #: How long each side waits for the per-daemon lock (see `daemon_lock`).
     #: The watch side is short on purpose — a watcher that blocks on the lock
     #: is a watcher that is not running its own daemon's cycle, and holding is
@@ -977,6 +980,11 @@ def load_config(config_path=None, env=None) -> WatchConfig:
             value = int(block["hard_idle_suppressed_notify_seconds"])
             if value > 0:
                 cfg.hard_idle_suppressed_notify_seconds = value
+        except (TypeError, ValueError):
+            pass
+    if "checkpoint_seconds" in block:
+        try:
+            cfg.checkpoint_seconds = int(block["checkpoint_seconds"])
         except (TypeError, ValueError):
             pass
 

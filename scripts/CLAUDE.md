@@ -153,6 +153,23 @@ lib ごとの**破ってはいけない契約**の要約。理由・経緯・全
 - **台帳に書く値は読み戻して同じになる**（t034）: 読み手は `splitlines()` で行を割るので、`check_reason` は U+0085 / U+2028 / U+2029 も断り、`lib_history.render` は書く前に `parse` で読み戻して食い違えば `HistoryError('not_roundtrip')`（何も書かない）。理由の畳みは 200 字で切った後に `rstrip`。`orphan_reason` は過去の record を `ex.record_shape_problem` に通し、card の欄は型を見てから集合と照合する（壊れていれば推定を飛ばす）。テスト: `tests/test_ledger_roundtrip_and_broken_records.py`。
 - 戻し方: PR revert → `scripts/sync-main-checkout.sh`。台帳の retry・card の `max_attempts` は残ってよい（旧コードは読まない）。
 
+## checkpoint（`lib_checkpoint.py` + `lib_retirement._checkpoint_stage` + `plan.sh retire --checkpoint` + `checkpoint_gc.py`。vNext 02 PR-G / t039。設計 §5・§5.8）
+
+- 退役の直前（`plan.sh retire` の前）に worktree の状態を `registry/checkpoints/<mission>/<task>/<execution_id>/`（gitignored・0700 / 0600）へ**読むだけ**で保存する。
+  `lib_checkpoint.take()` は worktree にも queue にも書かない（git は `--no-optional-locks -c core.fsmonitor=false`・`GIT_*` を落とす・`diff` は `--no-ext-diff --no-textconv`）。
+  書きかけは `<ID>.partial` に作り最後に rename。dir の置き換え・上書きはしない（完成済みなら `verify` を通れば再利用）。
+- **失敗しても退役を止めない**: 失敗・期限切れ（`daemons.checkpoint_seconds`、既定 20。env なし。0 以下で取らない）・想定外の例外はすべて `--checkpoint none`。通知は notify-once で 1 回（キー `checkpoint_<mission>_<task>`）。
+  保存するものが元から無い（`NothingToSave`: record 無し / `git.worktree` が null）は失敗ではなく通知しない。
+- **秘密**: ファイル名（パスの全成分）で除外・内容は patch / untracked / pane / status の全部を redaction（`[REDACTED:n]`）→ **その後で** 1MB に切る。**redaction が例外なら、そのファイルは保存しない**。
+  バイナリ（tracked の差分・untracked とも）の内容は保存しない（`binary-files.txt` に名前・サイズ・blob sha だけ・`binary_restorable: false`）。パターンは入れ子の量指定子を使わない（1MB の 1 行がテストで線形）。
+- `plan.sh retire --checkpoint <dir|none>` は**ロックの前**に `lib_checkpoint.verify`（meta.json の `execution_id` と dir 名が自分の試行と一致）。違えば exit 3・何も書かない。台帳の retire の `checkpoint_dir` に入り、`pull` の `previous_attempt.checkpoint_dir` に出る。
+  台帳の再送の比較（`HISTORY_MISMATCH`）から `checkpoint_dir` は除く（取り直した checkpoint が前と違っても退役を割らない）。
+- `checkpoint_gc.py` は `worktree_gc.py` と同じ作法（既定 dry-run・`--apply` は隔離のみ・`--restore`・削除を呼ばない = AST テスト）。対象は「task の card が読めて終端 ∧ 保存から 30 日以上」だけ。
+  card が無い・壊れている・終端でない（reopen 後を含む）・読めない・形の違うものは残す。
+- registry 側の書き込みは `tests/test_queue_writes_go_through_the_store.py` の表に理由つきで載せた（queue には 1 バイトも書かない）。record は `lib_daemon_state.load_json_store` で読み、`lib_state_store` を import しない。
+- テスト: `tests/test_checkpoint_lib.py`（本物の git。内容・上限・バイナリ・秘密・textconv・worktree 不変・期限・verify）/ `test_checkpoint_retirement_stage.py`（退役の段）/ `test_checkpoint_retire_plan_sh.py`（`--checkpoint`・台帳・`previous_attempt`）/ `test_checkpoint_gc.py`。
+- 戻し方: PR revert → `scripts/sync-main-checkout.sh`。`--checkpoint` は任意の option なので戻しても `retire` は動く。`registry/checkpoints/` と台帳の `checkpoint_dir` は残ってよい（旧コードは読まない）。
+
 ## Git Policy（`lib_git_policy.py`。01b G2 / t008 で作成、G3 / t012 で呼び出し元を移した）
 
 - task の branch・worktree path・base・PR base を決める唯一の場所（`knowledge/git-policy.md` §2・§3）。**判断だけ**で

@@ -408,7 +408,7 @@ def _ledger_reason(out, end_code):
     return text[:_LEDGER_REASON_MAX].rstrip() or None      # 切り口が空白だと読み戻しで落ちる (frontmatter の値は前後の空白を持てない)
 
 
-def _resolve_ledger(txn, slug, tid, meta, out, body_out, *, end_code, ended_at):
+def _resolve_ledger(txn, slug, tid, meta, out, body_out, *, end_code, ended_at, checkpoint_dir=None):
     """台帳に書くべきこと。`(action, name, ended_at, text)`: action は `write` (新しいファイルを足す) / `reuse` (同じ遷移の
     ファイルが既にあり中身も同じ。何も書かず、その `ended_at` を使う)。何も書かない。食い違い・読めないは `_LedgerProblem`。"""
     xid = meta['current_execution_id']
@@ -418,11 +418,14 @@ def _resolve_ledger(txn, slug, tid, meta, out, body_out, *, end_code, ended_at):
     fields, body = hist.build_event(
         kind=kind, execution_id=xid, attempt=meta['execution_count'], ended_at=ended_at, end_code=end_code,
         reopen_count=reopen, head=out.get('fail_head'), pr_number=out.get('pr_number'), worker=meta.get('worker'),
-        actor=_ledger_actor(txn), reason=_ledger_reason(out, end_code), result_state=state, result_text=result_text)
-    return _match_or_plan(txn, slug, tid, kind, xid, reopen, fields, body, ended_at)
+        actor=_ledger_actor(txn), reason=_ledger_reason(out, end_code), result_state=state, result_text=result_text,
+        checkpoint_dir=checkpoint_dir)
+    # checkpoint_dir は再送の比較に入れない: 孤児の台帳 (retire が card の前に落ちた) の後の再送は、取り直した checkpoint が
+    # 前と違いうる (前は失敗して none・今度は取れた)。中身の食い違いで退役を割らず、先に書いた台帳の値を残す (設計 §5.5)
+    return _match_or_plan(txn, slug, tid, kind, xid, reopen, fields, body, ended_at, ignore=('checkpoint_dir',))
 
 
-def _match_or_plan(txn, slug, tid, kind, xid, reopen, fields, body, ended_at):
+def _match_or_plan(txn, slug, tid, kind, xid, reopen, fields, body, ended_at, ignore=()):
     """`_resolve_ledger` の後半 (kind を問わない): 同定キー (`xid`, `kind`, `reopen`) の既存の台帳を探し、あれば中身を比べて
     再利用 (`reuse`)、無ければ次の `seq4` で新しいファイルの中身を作る (`write`)。"""
     listed = txn.list_history(slug, tid)
@@ -445,7 +448,7 @@ def _match_or_plan(txn, slug, tid, kind, xid, reopen, fields, body, ended_at):
                              f"{slug}/{tid}: 同じ遷移の台帳が {len(found)} 個あります (破損。store-check が報告します)")
     if found:
         name, old_fields, old_body = found[0]
-        diffs = hist.differing_fields(old_fields, old_body, fields, body)
+        diffs = hist.differing_fields(old_fields, old_body, fields, body, ignore=ignore)
         if diffs:
             raise _LedgerProblem(
                 ex.HISTORY_MISMATCH,
@@ -456,7 +459,7 @@ def _match_or_plan(txn, slug, tid, kind, xid, reopen, fields, body, ended_at):
     return 'write', name, ended_at, hist.render(fields, body)
 
 
-def _record_ledger(txn, slug, tid, meta, out, body_out, caller, *, end_code, now, resolver=None):
+def _record_ledger(txn, slug, tid, meta, out, body_out, caller, *, end_code, now, resolver=None, checkpoint_dir=None):
     """終わる試行の台帳を、card の書き込みの**直前**に 1 ファイル足す (台帳 → card の順。card がコミット点)。
     戻り値: `(ended_at, history_detail, reused)`。`ended_at` は record にも使う値 (再送では台帳のものを再利用。そのとき
     `reused=True`)。
@@ -469,7 +472,8 @@ def _record_ledger(txn, slug, tid, meta, out, body_out, caller, *, end_code, now
     try:
         if resolver is None:
             action, name, ended_at, text = _resolve_ledger(txn, slug, tid, meta, out, body_out,
-                                                          end_code=end_code, ended_at=ended_at)
+                                                          end_code=end_code, ended_at=ended_at,
+                                                          checkpoint_dir=checkpoint_dir)
         else:                                                # retry / reopen: 呼び出し元が台帳の中身を決める
             action, name, ended_at, text = resolver(ended_at)
         reused = action == 'reuse'
@@ -723,7 +727,7 @@ def _apply_updates(out, updates, remove):
 
 def _finish(txn, slug, tid, meta, body, caller, *, new_status, end_code, to_status, command, operation,
             clear_owner, retire_slot, meta_updates, new_body, now, required_exec_status=None,
-            abandon_detached=False, meta_remove=(), dry_run=False, result_replaced=False):
+            abandon_detached=False, meta_remove=(), dry_run=False, result_replaced=False, checkpoint_dir=None):
     """終わらせる操作の共通の骨 (照合 → 遷移の検査 → 台帳 → card → record → 枠 → 監査)。
 
     `result_replaced=True` は「この呼び出しの `new_body` が `## Result` 節を実際に置き換えた」と呼び出し側が**明示**する
@@ -796,7 +800,8 @@ def _finish(txn, slug, tid, meta, body, caller, *, new_status, end_code, to_stat
     # 台帳 → card の順 (派生値は正本より前。card がコミット点)。card の書き込みが失敗しても残るのは「まだ起きていない遷移」の
     # 孤児の 1 ファイルで、同じ報告の再送がそれを再利用して先へ進む (ended_at も台帳のものを card・record に使う)
     ended_at, history_detail, ledger_reused = _record_ledger(txn, slug, tid, meta, out, body_out, caller,
-                                                             end_code=end_code, now=now)
+                                                             end_code=end_code, now=now,
+                                                             checkpoint_dir=checkpoint_dir)
     if ledger_reused and out.get('completed_at') is not None and updates.get('completed_at') is not None:
         out['completed_at'] = ended_at      # 孤児の再送: card の完了時刻も台帳・record と同じ値 (設計 §3.2-2。再送の now は使わない)
     txn.write_card(slug, tid, out, body_out)                    # 終了コードも status と同じ書き込みに入る (コミット点)
@@ -833,7 +838,7 @@ def complete_execution(txn, slug, tid, caller=NO_CALLER, *, to_status, meta_upda
 
 
 def fail_execution(txn, slug, tid, caller=NO_CALLER, failure_code=None, *, to_status, meta_updates=None,
-                   meta_remove=(), body=None, now=None, dry_run=False, result_replaced=False):
+                   meta_remove=(), body=None, now=None, dry_run=False, result_replaced=False, checkpoint_dir=None):
     """reserved | running → failed。`failure_code` は終了コード (`_FAIL_RULES` の 6 つ)、`to_status` は task の遷移先で、
     組み合わせは §4.2 の表だけ:
 
@@ -863,11 +868,11 @@ def fail_execution(txn, slug, tid, caller=NO_CALLER, failure_code=None, *, to_st
                    retire_slot=retire, meta_updates=meta_updates, new_body=body, now=now,
                    required_exec_status=({ex.RESERVED} if failure_code == ex.WORKSPACE_CREATE_FAILED else None),
                    abandon_detached=(failure_code == ex.RESET_BY_DIRECTOR), meta_remove=meta_remove, dry_run=dry_run,
-                   result_replaced=result_replaced)
+                   result_replaced=result_replaced, checkpoint_dir=checkpoint_dir)
 
 
 def release_execution(txn, slug, tid, caller=NO_CALLER, reason_code=None, *, to_status=_S_PENDING, now=None,
-                      meta_updates=None, body=None):
+                      meta_updates=None, body=None, checkpoint_dir=None):
     """reserved → released (まだ誰も作業を始めていない試行を手放す)。`reason_code` は `RESET_BY_DIRECTOR` / `RETIRED`。
     running の試行は released にできない (`INVALID_TRANSITION`。結果なしで手放すのは `fail_execution`)。
     `to_status` は pending (worker・started_at を null) か、RETIRED の `needs_director` (worker を残す)。枠は撤去する。
@@ -882,7 +887,8 @@ def release_execution(txn, slug, tid, caller=NO_CALLER, reason_code=None, *, to_
     return _finish(txn, slug, tid, meta, card_body, caller, new_status=ex.RELEASED, end_code=reason_code,
                    to_status=to_status, command=command, operation=command, clear_owner=(to_status == _S_PENDING),
                    retire_slot=True, meta_updates=meta_updates, new_body=body, now=now,
-                   required_exec_status={ex.RESERVED}, abandon_detached=(reason_code == ex.RESET_BY_DIRECTOR))
+                   required_exec_status={ex.RESERVED}, abandon_detached=(reason_code == ex.RESET_BY_DIRECTOR),
+                   checkpoint_dir=checkpoint_dir)
 
 
 def reset_task(txn, slug, tid, caller=NO_CALLER, *, now=None, meta_updates=None):

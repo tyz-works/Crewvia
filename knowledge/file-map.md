@@ -543,6 +543,15 @@ Result は card の `result_execution_id` == 閉じる試行のときだけ本�
 台帳が書けないと遷移は止まる（exit 1）が、**retire だけは閉じる**（監査ログの `detail=history_unwritten`）。戻し方: PR revert
 （台帳・`result_execution_id` は残ってよい。旧コードは読まない）。
 
+### `lib_checkpoint.py` / `checkpoint_gc.py`
+
+退役の直前に worktree の状態を **読むだけ**で `registry/checkpoints/<mission>/<task>/<execution_id>/` に保存する lib と、その片付け（vNext 02 PR-G / t039。
+設計 `knowledge/vnext-02-attempt-reopen-checkpoint.md` §5・§5.8）。呼ぶのは `lib_retirement._checkpoint_stage`（`plan.sh retire` の前・期限 `daemons.checkpoint_seconds`=20 秒・
+**失敗しても退役は止まらず `--checkpoint none`**）。内容は `meta.json` / `dirty.patch`（1MB・textconv なし）/ `binary-files.txt`（名前・サイズ・blob sha だけ）/ `untracked/`（個別 64KB・合計 2MB）/
+`status.txt` / `pane.txt`。秘密はファイル名で除外し、内容は redaction（例外なら保存しない）。`plan.sh retire --checkpoint <dir|none>` が `verify`（meta の ID と dir 名）して台帳の `checkpoint_dir` に入れ、
+`pull` の `previous_attempt.checkpoint_dir` に出る。`checkpoint_gc.py` は `worktree_gc.py` と同じ作法（dry-run・隔離・restore）で、card が終端かつ保存から 30 日のものだけが対象。
+戻し方: PR revert（`--checkpoint` は任意の option。保存物と台帳の欄は残ってよい）。
+
 ### `lib_mux.sh`
 
 bash 向け薄いラッパー（mux_spawn / mux_send 等）

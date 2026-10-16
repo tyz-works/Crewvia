@@ -200,10 +200,12 @@ def _body_norm(body):
     return '\n'.join((body or '').splitlines()).strip('\n')
 
 
-def differing_fields(old_fields, old_body, new_fields, new_body):
-    """再送で食い違う欄の**名前**。除くのは `ended_at` (と名前の `seq4`)。本文は `body`。値は返さない。"""
+def differing_fields(old_fields, old_body, new_fields, new_body, ignore=()):
+    """再送で食い違う欄の**名前**。除くのは `ended_at` (と名前の `seq4`) と `ignore`。本文は `body`。値は返さない。"""
     diffs = []
     for k in COMPARED_FIELDS:
+        if k in ignore:
+            continue
         if k == 'reopen_count':
             differs = reopen_count_of(old_fields) != reopen_count_of(new_fields)     # 欠落は 0
         else:

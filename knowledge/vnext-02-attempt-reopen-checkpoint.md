@@ -221,6 +221,29 @@ reopen は依存の辺を足さないので、循環を作らない。下流の�
 
 `crewvia_handoff_path <agent> <mission> <task_id>` → `registry/handoffs/<agent>/<mission>/<task_id>_HANDOFF.md`（`git-helpers.sh:83`）。**古い path も読む**（`plan.sh fail` の `handoff_path` は絶対パスのみ・存在を検査する、不変条件 6。新旧どちらでも通る）。呼び出し側の `agents/worker.md:410`・`:811` と、読み手の dispatcher の通知（`handoff_path` を card から読む）を揃える。実際に衝突した事例は見つけていない（未確認）ので、緊急ではない — 先頭ではなく PR-B。
 
+### 5.8 実装で決めたこと（PR-G / t039）
+
+設計（§5.1〜§5.5）から実装で足した・選んだ点。食い違いは無い。
+
+- **段の位置**: `lib_retirement._settle_terminated` の `plan.sh retire` を呼ぶ**直前**（`_checkpoint_stage`）。つまり Worker を殺した**後**で、worktree は残っている（retire は card を書くだけで worktree を触らない）。
+  同じ退役の再試行（queue ロックが塞がっていて rc 4 → 次のサイクル）で撮り直さないよう、結果（dir か `none`）を試行の ID ごとにプロセス内に覚える。完成済みの dir がある場合は `take()` が `verify` を通ればそれを返す（watchdog の再起動をまたいでも撮り直さない）。
+- **期限は協調的**（`daemons.checkpoint_seconds`、既定 20。`lib_daemon_watch.WatchConfig`。env は付けない = watchdog だけが読む値。0 以下で取らない）: 別プロセスに切り出さず `take()` の中で各段の前に残り時間を見る。git の subprocess の timeout は「残り時間と 10 秒の小さい方」。redaction は線形（下）なので 1 回の呼び出しは期限を大きくは超えない。
+  失敗・期限切れ・**想定外の例外**はすべて `--checkpoint none` に倒れ、途中の dir（`<execution_id>.partial`）は掃除される。完成は `.partial` → 最終名の rename 1 回（途中の dir が本物に見えない）。
+- **失敗の通知は 1 回**: キー `checkpoint_<mission>_<task>`・fp `exec:<ID>` で notify-once の台帳に載せる（同じ試行の再試行・watchdog の再起動で二重に出さない）。文面に例外の文字列・worktree の内容は入れない（固定コードだけ）。
+  **「保存するものが元から無い」は失敗ではない**（`NothingToSave`: record が無い・`git.worktree` が null = worktree を作る前に終わった試行）。通知せず `none`。record が読めない・記録の dir が実在しないのは失敗（通知する）。
+- **ペイン（`pane.txt`）**: 退役の段は Worker を殺した後なので、`_live_windows` に窓が残っているときだけ取る（ふつうは無い）。取れなくても他は取る。殺す前に撮る案は、殺す順序と権限（`daemon-authority.md`）に触れるので採らなかった（§8 に積む）。
+- **秘密**: ファイル名の除外は**パスの全ての成分**に当てる（`dir.credentials/inner.txt` も除外。取りすぎる側＝安全側）。patch は `diff --git` の節ごと落とす（見出し・rename 行のパスを見る）。redaction は patch / untracked / pane / status の**全部**に通し、
+  **redaction の後で 1MB に切る**（先に切ると秘密を途中で割って半端な値が残る）。`[REDACTED:n]` の n は置換の通し番号（パターンの適用順であり、出現位置の順ではない）。パターンは量指定子を入れ子にせず上限つき（秘密鍵のブロックだけは正規表現でなく `find`）。1MB の 1 行・9 種類の敵対的な入力が 5 秒未満（テスト）。
+- **git は読み取りだけ**: `git --no-optional-locks -c core.fsmonitor=false`、`GIT_*` の環境変数を落とす（`GIT_DIR` 継承・`GIT_EXTERNAL_DIFF` を持ち込まない）、`diff` は `--no-ext-diff --no-textconv`。worktree（`.git/index` を含む）が 1 バイトも変わらないこと・textconv / 外部 diff が起動しないことは本物の git でテスト。
+  `status.txt` は `--porcelain=v1 -z` の生（NUL 区切り）。
+- **record は `lib_daemon_state.load_json_store` で読む**（`lib_state_store` を import しない = 呼び出し元の許可表を広げない）。書き込みは registry の外の queue には 1 つも無い。
+- **plan.sh**: `--checkpoint` は**ロックの前**に検査（`lib_checkpoint.verify`。別の試行の dir・dir 名と meta の ID が食い違うもの・壊れたものは exit 3・何も書かない。`--checkpoint ""` は none に倒さず exit 1）。台帳の retire の `checkpoint_dir` に入り、`pull` の `previous_attempt.checkpoint_dir`（PR-D が既に出していた）にそのまま現れる。
+  **再送の比較（`HISTORY_MISMATCH`）から `checkpoint_dir` は除いた**: 孤児の台帳（retire が card の前に落ちた）の後で、watchdog が取り直した checkpoint が前と違いうる（前は失敗して none、今度は取れた）。違いで退役を割らず、先に書いた台帳の値が残る。
+- **`checkpoint_gc.py`**: `worktree_gc.py` と同じ作法（既定 dry-run・`--apply` は `os.rename` で `registry/checkpoints/.quarantine/<UTC 時刻>/<mission>/<task>/<ID>` へ隔離・`--restore`・`--list-quarantine`・隔離の直前に判定をやり直す・削除を呼ばない = AST テスト）。
+  対象は「meta が読める ∧ 保存から 30 日以上（`taken_at`）∧ card が**読めて** done / verified / skipped」。mission dir に無ければ archive の card を見る。card が無い・壊れている・終端でない（reopen された task を含む）・`.partial`・形の違う dir・symlink は残す。
+- **観察用の手書き marker での確認**（本番、PR の merge 後）: 手書き marker（memory `observe-retirement-with-handwritten-marker-on-nonexistent-window`）で退役を走らせる前に、`python3 scripts/lib_checkpoint.py take --registry-dir registry --queue-dir queue --mission <m> --task <t> --execution <ex-…>` を dirty な worktree の試行に対して打ち、`meta.json` / `dirty.patch` / `untracked/` を見て、
+  `grep -r` で生の秘密が無いこと、`python3 scripts/lib_checkpoint.py verify <dir> --execution <ex-…>` が通ることを確かめる。
+
 ## 6. PR の分割と順序
 
 300KB を超える PR は `kai-review.sh` が fail-closed で拒否する（memory: pr-size-breaks-review-machinery）。どの PR も差分は数十〜百数十 KB の見込み（実装 + テスト）。下の「触る箇所」は `gh pr diff` で確かめた未 merge PR との重なり。
@@ -277,5 +300,7 @@ Codex の往復は 3 巡で打ち切った (PR #301 の t002)。以下は実装 
   - 直し方の方向（未決）: active でない（終端の）試行でも、台帳とコミット済みの遷移を突き合わせ、遷移の kind と台帳の DONE が食い違うものを孤児として報告する。
   - 網羅テストに入れるケース: `done` が台帳だけ書いて落ちた後に `reset` で閉じる / `retire` で閉じる / 何も閉じない（active のまま）、それぞれで store-check が孤児を報告するか。閉じた kind が `done` のときは報告しないこと（偽陽性なし）。同じ試行を 2 回報告しないこと。報告は読み取りだけで台帳・card・record を書かないこと。
 - 実装の PR（D・F）の QA で確かめること: (1) cascade を各書き込みの後で kill して再実行し、`cascade-incomplete` が出て再実行で消えること・`reopen_count` が二重に増えないこと。(2) 孤児の台帳を作ってから同じ報告を送り直すと、新しいファイルが増えず `ended_at` が台帳と card・record で一致すること。(3) 孤児の台帳のあとに違う Result で送ると `HISTORY_MISMATCH` で card が書かれないこと（この拒否のあとの出口が「同じ報告を送り直す」だけでよいかは、運用で足りなければ孤児の差し替えを別に設計する）。
+- **checkpoint のペイン（`pane.txt`）は、退役の段が Worker を殺した後なのでふつう取れない**（PR-G / t039）。worktree の未 commit の作業（本命）は殺した後でも残るので取れる。ペインの末尾まで欲しいなら、殺す**前**（`_start` の送信と SIGTERM の間）に撮る必要があるが、
+  それは退役の順序と権限（`daemon-authority.md`）に触れるので PR-G では採らなかった。必要になったら別 PR で「撮るだけ・失敗しても殺す」の段を `_start` に足す（期限と通知は同じ作り）。
 - 範囲外として残したこと: Verifier の運用と、その verify pass が依存先の変更を見る検査（PR-J）。`update --status` の Controller 化（P0 の残り）。回復を dispatcher が起こす・待つ（P0 の残り）。
 - 確かめていないこと: mission の戻し先 `in_progress` が lint / dispatcher で想定どおりか（PR-A）。retry / reopen の後に `worktree_gc` で隔離済みの worktree を pull が作り直せるか（PR-E の QA）。reopen した codex-review task が、`registry/daemons/review-refusals/` の古い拒否記録で spawn されないことがあるか（記録は消してよい。`scripts/CLAUDE.md` の「通知・記録」）。`done` → `pending` を Taskvia が受け付けるか。

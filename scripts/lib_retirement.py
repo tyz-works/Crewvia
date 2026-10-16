@@ -927,15 +927,31 @@ GUARD_UNPROVABLE = "unprovable"
 
 
 def _default_run_command(argv: list, env: dict) -> Tuple[int, str]:
+    import signal
     import subprocess
+    # Popen + own process group, not subprocess.run(timeout=): run() kills only the direct child on timeout and then
+    # waits on the pipes without a limit, so a grandchild that keeps them open (plan.sh's python/git) would stall
+    # watchdog's whole cycle.  Kill the group and bound the second wait too.
     try:
-        proc = subprocess.run(
-            argv, env=env, capture_output=True, text=True,
-            timeout=CLEANUP_COMMAND_TIMEOUT,
-        )
+        proc = subprocess.Popen(argv, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                start_new_session=True)
     except Exception as e:  # noqa: BLE001 — a failed cleanup must never crash the daemon
         return 1, f"{type(e).__name__}: {e}"
-    return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
+    try:
+        out, err = proc.communicate(timeout=CLEANUP_COMMAND_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            proc.kill()
+        try:
+            proc.communicate(timeout=2)
+        except Exception:  # noqa: BLE001 — give up on the pipes; the deadline matters more
+            pass
+        return 1, f"TimeoutExpired: {argv[0]} exceeded {CLEANUP_COMMAND_TIMEOUT}s"
+    except Exception as e:  # noqa: BLE001
+        return 1, f"{type(e).__name__}: {e}"
+    return proc.returncode, (out or "") + (err or "")
 
 
 def _default_kill_process(pid: int, sig: int) -> bool:

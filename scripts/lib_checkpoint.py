@@ -87,9 +87,12 @@ class CheckpointError(Exception):
 # 秘密 (設計 §5.3)
 # ---------------------------------------------------------------------------
 
-#: ファイル名 (パスの各成分に当てる。大文字小文字は区別しない)。security.md の一覧と同じ
-SECRET_NAME_GLOBS = ('.env', '.env.*', '*.pem', '*.key', '*.p12', '*.pfx', '*_rsa', '*_dsa', '*_ed25519',
-                     '*credentials*', '*.secret', '*.secret.*', '*.secrets', '*.secrets.*')
+#: ファイル名 (パスの各成分に当てる。大文字小文字は区別しない)。設計 §5.3 / security.md と 1 対 1 (狭めない)。
+#:   設計の `.env*`            → `.env*`        (`.envrc` / `.env.local` / `.environment` も。取りすぎる側)
+#:   設計の `*.pem` ... `*_ed25519` / `*credentials*` → そのまま
+#:   設計の `*.secret*`        → `*.secret*`    (`x.secret` / `x.secrets` / `prod.secrets.yaml` / `a.secret.json`)
+SECRET_NAME_GLOBS = ('.env*', '*.pem', '*.key', '*.p12', '*.pfx', '*_rsa', '*_dsa', '*_ed25519',
+                     '*credentials*', '*.secret*')
 
 
 def is_secret_name(path):
@@ -182,19 +185,80 @@ def _assign_spans(text):
             pos = ve
 
 
-def _prefixed_spans(text, pattern, minimum, keep_prefix, run):
+def _is_quote(ch):
+    return ch == '"' or ch == "'"
+
+
+def _prefixed_spans(text, pattern, minimum, keep_prefix, run, quoted_value=False):
+    """印の後ろの値の (start, end)。値が引用符で始まる (`quoted_value`) ときは閉じる引用符まで (閉じなければ行末)。
+    印の**直前**が引用符 (`"ghp_…"` / `"op://My Vault/…"`) なら、閉じる引用符までを値に含める (中に空白があっても残さない)。"""
     pos = 0
+    n = len(text)
     while True:
         m = pattern.search(text, pos)
         if not m:
             return
-        ve = run.match(text, m.end()).end()
-        if ve - m.end() < minimum:
-            pos = m.end()
+        vs = m.end()
+        if quoted_value and vs < n and _is_quote(text[vs]):
+            ve = _quoted_end(text, vs)
+            closed = ve - 1 > vs and text[ve - 1] == text[vs]
+            inner = ve - vs - (2 if closed else 1)
+        else:
+            ve = run.match(text, vs).end()
+            inner = ve - vs
+            if m.start() > 0 and _is_quote(text[m.start() - 1]) and inner >= minimum:
+                ve = max(ve, _quoted_end(text, m.start() - 1))
+        if inner < minimum:
+            pos = vs
             continue
-        _check_len(m.end(), ve)
-        yield (m.end() if keep_prefix else m.start()), ve
+        _check_len(vs, ve)
+        yield (vs if keep_prefix else m.start()), ve
         pos = ve
+
+
+_URL_SCHEME_CHARS = frozenset('ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+.-')
+_URL_BOUND = re.compile(r'[^\s"\']*')
+
+
+def _url_auth_spans(text):
+    """`<scheme>://<user>:<pass>@host` の `<pass>` の (start, end)。`@` は領域の**最後**のものを取る (pass に生の `@` があっても残さない)。
+    領域 = 空白・引用符までの run (URL が引用符の直後なら閉じる引用符まで)。長さで切らない。領域ごとに 1 回だけ見る (線形)。"""
+    pos = 0
+    n = len(text)
+    while True:
+        # `://` を find で探し、scheme は手前へ戻って読む (regex の `[A-Za-z][..]*://` は長い英数字の run の各文字から
+        # 先を読み直して O(n^2) になる)。戻るのは pos まで = 全体で線形
+        sep = text.find('://', pos)
+        if sep < 0:
+            return
+        b = sep
+        while b > pos and text[b - 1] in _URL_SCHEME_CHARS:
+            b -= 1
+        while b < sep and not ('a' <= text[b].lower() <= 'z'):
+            b += 1                                  # scheme は英字で始まる
+        if b >= sep:
+            pos = sep + 3
+            continue
+        start = sep + 3
+        if b > 0 and _is_quote(text[b - 1]):
+            end = _quoted_end(text, b - 1)
+            if end > start and text[end - 1] == text[b - 1]:
+                end -= 1
+        else:
+            end = _URL_BOUND.match(text, start).end()
+        pos = max(end, start)
+        at = text.rfind('@', start, end)
+        if at < 0:
+            continue
+        colon = text.find(':', start, at)
+        if colon < 0 or at - colon <= 1:
+            continue
+        slash = min((i for i in (text.find('/', start, colon), text.find('?', start, colon), text.find('#', start, colon)) if i >= 0),
+                    default=-1)
+        if slash >= 0:                              # `:` の前に path があれば userinfo ではない (`https://host/a:b@c`)
+            continue
+        _check_len(colon + 1, at)
+        yield colon + 1, at
 
 
 def _replace_spans(text, spans, counter):
@@ -234,7 +298,8 @@ def redact(text):
 
     for pat, minimum in _TOKEN_PATTERNS:
         text = _replace_spans(text, _prefixed_spans(text, pat, minimum, False, _VALUE_RUN), counter)
-    text = _replace_spans(text, _prefixed_spans(text, _BEARER, _BEARER_MIN, True, _UNQUOTED), counter)
+    text = _replace_spans(text, _prefixed_spans(text, _BEARER, _BEARER_MIN, True, _UNQUOTED, quoted_value=True), counter)
+    text = _replace_spans(text, _url_auth_spans(text), counter)
     text = _replace_spans(text, _assign_spans(text), counter)
     return text, counter[0]
 
@@ -292,6 +357,32 @@ def _kill_group(proc):
             pass
 
 
+REAP_SECONDS = 2.0
+
+
+def _reap(proc):
+    """子の終了を**有限の時間だけ**待つ。超えたらプロセスグループごと kill してもう一度だけ待つ (それでも死なない子は見捨てる =
+    D 状態など。期限を守ることを優先する)。"""
+    for _ in range(2):
+        try:
+            proc.wait(timeout=REAP_SECONDS)
+            return
+        except subprocess.TimeoutExpired:
+            _kill_group(proc)
+
+
+def _wait_within(clock, proc, hard_stop):
+    """stdout の EOF の後の `wait()` にも同じ期限を当てる (stdout を閉じてから固まる子で 1 サイクルを止めない)。
+    超えたらグループごと kill して `E_DEADLINE` / `E_GIT` (timeout)。"""
+    left = min(clock.remaining(), hard_stop - clock._now())
+    try:
+        proc.wait(timeout=max(0.0, left))
+    except subprocess.TimeoutExpired:
+        _kill_group(proc)
+        _reap(proc)
+        raise CheckpointError(E_DEADLINE if clock.remaining() <= 0 else E_GIT, 'timeout')
+
+
 def _run_git(clock, worktree, *args, limit=GIT_READ_LIMIT, check=True):
     """`(returncode, stdout_bytes, truncated)`。timeout は残り時間 (上限 GIT_TIMEOUT)。失敗は `E_GIT` (check=True のとき)。"""
     clock.check()
@@ -311,7 +402,7 @@ def _run_git(clock, worktree, *args, limit=GIT_READ_LIMIT, check=True):
             left = min(clock.remaining(), hard_stop - clock._now())
             if left <= 0:
                 _kill_group(proc)
-                proc.wait()
+                _reap(proc)
                 raise CheckpointError(E_DEADLINE if clock.remaining() <= 0 else E_GIT, 'timeout')
             ready, _, _ = select.select([fd], [], [], min(0.2, left))
             if not ready:
@@ -325,7 +416,7 @@ def _run_git(clock, worktree, *args, limit=GIT_READ_LIMIT, check=True):
                 truncated = True
                 _kill_group(proc)
                 break
-        proc.wait()
+        _wait_within(clock, proc, hard_stop)
         data = b''.join(chunks)[:limit]
     finally:
         try:

@@ -764,3 +764,203 @@ def test_a_refused_rerun_does_not_touch_a_done_mission_when_the_root_never_reope
     p = reopen(box)
     assert p.returncode == 3 and last_error_code(p.stderr) == "NOT_REOPENABLE", p.stderr
     assert box.snapshot() == before and "status: done" in _mission_file(box).read_text()
+
+
+# ---------------------------------------------------------------------------
+# PR #308 Codex 2 巡目 (t046): 経路上の failed / 語彙の外の status・途中で止まった cascade の収束
+# ---------------------------------------------------------------------------
+
+import lib_task_status as _status  # noqa: E402
+
+#: 中間 A の status の全語彙 (lib_task_status.TASK_STATUSES) + 語彙に無い手書きの値
+ALL_A_STATES = tuple(sorted(_status.TASK_STATUSES)) + ("cancelled",)
+
+
+def _vocab_box(tmp_path, a_state, released):
+    """I(t001, done) → A(t002, code) → R(t003, review, pending)。A を `a_state` に、`released` なら R が A を解除済み。"""
+    box = build(tmp_path, CHAIN)
+    finish_all(box, ("t001", "t002"))
+    if a_state != "done":
+        set_card(box, "t002", status=a_state)
+    if released:
+        set_card(box, "t003", released_deps=["t002"])
+    return box
+
+
+def test_the_vocabulary_list_is_the_whole_vocabulary():
+    assert set(ALL_A_STATES) - {"cancelled"} == set(_status.TASK_STATUSES)
+
+
+@pytest.mark.parametrize("cascade", ["none", "reviews", "all"])
+@pytest.mark.parametrize("released", [False, True])
+@pytest.mark.parametrize("a_state", ALL_A_STATES)
+def test_no_combination_leaves_r_pullable_before_the_root_completes_again(tmp_path, a_state, released, cascade):
+    """中間 A の status (語彙の全部 + 語彙の外) × R が A を released_deps で解除しているか × cascade 3 値。
+    reopen が成功した (none を除く) なら、I が pending の間に R を pull できる組み合わせは残らない。拒否なら何も書かない。
+    none は R を戻さないので pull できてしまいうるが、その場合は出力に必ず「再完了を待たずに」と R を列挙する。
+    例外は A が skipped (終端 = R は reopen の前から I と無関係に pull できた。reopen が変えた窓ではない)。"""
+    box = _vocab_box(tmp_path, a_state, released)
+    before = box.snapshot()
+    p = reopen(box, "t001", "--cascade", cascade)
+    if p.returncode != 0:
+        # 語彙の外の status (cancelled) は store が card を読めず STATE_INVALID (exit 1)。他の拒否は exit 3
+        assert p.returncode == (1 if a_state == "cancelled" else 3), (a_state, released, cascade, p.stderr)
+        assert box.snapshot() == before, "拒否は何も書かない"
+        return
+    assert a_state != "cancelled"
+    assert status(box, "t001") == "pending"
+    pullable = status(box, "t003") == "pending" and box.pull("Mika", "t003", skills=SKILLS).returncode == 0
+    if cascade == "none":
+        if pullable and a_state != "skipped":
+            assert "再完了を待たずに" in p.stdout and "t003" in p.stdout.split("再完了を待たずに", 1)[1], \
+                (a_state, released, p.stdout)
+    else:
+        assert not pullable, ("I が pending なのに R を pull できた", a_state, released, cascade)
+
+
+def test_the_positive_control_r_is_pullable_when_a_failed_and_released_under_a_done_root(tmp_path):
+    """上の表の陽性対照: I が done のまま A が failed で R が A を解除していれば、R は本当に pull できる (= 表の assert は空振りでない)。"""
+    box = _vocab_box(tmp_path, "failed", True)
+    assert box.pull("Mika", "t003", skills=SKILLS).returncode == 0
+
+
+@pytest.mark.parametrize("released", [False, True])
+@pytest.mark.parametrize("cascade", ["reviews", "all"])
+@pytest.mark.parametrize("a_state", ["failed"])
+def test_failed_on_the_path_is_refused_with_the_route(tmp_path, a_state, released, cascade):
+    box = _vocab_box(tmp_path, a_state, released)
+    before = box.snapshot()
+    p = reopen(box, "t001", "--cascade", cascade)
+    assert p.returncode == 3 and last_error_code(p.stderr) == "CASCADE_FAILED_ON_PATH", p.stderr
+    assert "t001 -> t002" in p.stderr and "t002" in p.stderr
+    assert box.snapshot() == before and count(box, "t001") == 0 and not ledger_files(box, "t001", "reopen")
+
+
+def test_a_status_outside_the_vocabulary_is_unreadable_and_nothing_is_written(tmp_path):
+    """語彙に無い status (手書きの cancelled) は store が card を読めない = STATE_INVALID (exit 1)。何も書かず、通らない。"""
+    box = _vocab_box(tmp_path, "cancelled", True)
+    before = box.snapshot()
+    p = reopen(box)
+    assert p.returncode == 1 and last_error_code(p.stderr) == "STATE_INVALID", p.stderr
+    assert box.snapshot() == before
+
+
+def test_failed_at_the_end_of_the_path_is_not_refused(tmp_path):
+    """経路の端の failed (対象の review 自身が failed) は、それに依存する下流が無い = 走る下流が無いので拒否しない。"""
+    box = build(tmp_path, CHAIN)
+    finish_all(box, ("t001", "t002"))
+    set_card(box, "t003", status="failed")
+    p = reopen(box)
+    assert p.returncode == 0, p.stderr
+    assert [status(box, t) for t in ("t001", "t002", "t003")] == ["pending", "pending", "failed"]
+
+
+def test_failed_off_the_path_to_any_selected_task_is_not_a_problem(tmp_path):
+    spec = CHAIN + [("t004", ["t001"], ["code"]), ("t005", ["t004"], ["code"])]
+    box = build(tmp_path, spec)
+    finish_all(box, ("t001", "t002", "t003", "t004"))
+    set_card(box, "t004", status="failed")                    # reviews では t004 も t005 も選ばれない
+    assert reopen(box).returncode == 0
+    assert status(box, "t004") == "failed"
+
+
+def test_released_upstream_other_than_the_root_is_dropped_when_that_upstream_returns_to_pending(tmp_path):
+    """R が (I でなく) 中間 A を解除していて、A が cascade で戻るなら、その解除は根拠が消える。再び failed になっても自動で通さない。"""
+    box = build(tmp_path, CHAIN)
+    finish_all(box, ("t001", "t002", "t003"))
+    set_card(box, "t003", released_deps=["t002"])
+    p = reopen(box)
+    assert p.returncode == 0, p.stderr
+    assert [status(box, t) for t in ("t001", "t002", "t003")] == ["pending"] * 3
+    assert not box.card("t003").get("released_deps")
+    assert "t003" in p.stdout
+
+
+def test_reopen_output_tells_the_director_how_to_recover_from_a_stop(chain):
+    p = reopen(chain)
+    assert p.returncode == 0, p.stderr
+    assert "plan.sh reopen t001" in p.stdout and "同じ引数で再実行" in p.stdout and "cascade-incomplete" in p.stdout
+    # 書き始める前にも stderr に出る (途中で死ぬと成功時の出力は届かない)
+    assert "同じ引数で再実行" in p.stderr
+
+
+def _window_box(tmp_path):
+    """reopen を k 番目の書き込みで kill して、R だけが pending に戻り (A と I は done のまま) の状態の box を返す。
+    これが設計 §4.3.1-4 の中間状態 (R が reopen 前の結果の上で pull されうる窓)。"""
+    box = build(tmp_path, CHAIN)
+    finish_all(box, ("t001", "t002", "t003"))
+    saved = tmp_path / "window-saved"
+    shutil.copytree(box.queue, saved)
+    argv = ["t001", "--mission", MISSION, "--reason", REASON, "--branch", "reuse"]
+    for k in range(1, 400):
+        _restore(box, saved)
+        killed, _calls = _fork_reopen(box, argv, k)
+        assert killed, "窓の状態に届く前に reopen が最後まで走った"
+        st = [status(box, t) for t in ("t001", "t002", "t003")]
+        if st == ["done", "done", "pending"]:
+            return box
+    raise AssertionError("R だけが pending の窓の状態が作れなかった")
+
+
+def _assert_completes_only_in_order(box):
+    """I → A → R の順でしか完了できない (上流が未完了の間は下流を pull できない)。"""
+    assert [status(box, t) for t in ("t001", "t002", "t003")] == ["pending"] * 3
+    assert box.pull("Mika", "t003", skills=SKILLS).returncode != 0
+    finish(box, "t001")
+    assert box.pull("Mika", "t003", skills=SKILLS).returncode != 0            # A がまだ
+    finish(box, "t002")
+    finish(box, "t003")
+    assert [status(box, t) for t in ("t001", "t002", "t003")] == ["done"] * 3
+    assert "cascade-incomplete" not in store_check(box)
+
+
+def test_rerun_converges_after_r_was_pulled_and_finished_with_the_stale_result_in_the_window(tmp_path):
+    """指摘 2: 途中で止まった間に R が古い結果で pull → done された。同じ reopen の再実行は R を再び戻す
+    (前の実行で戻した後にまた完了した = 新しく戻すので reopen_count は 2。二重ではなく、完了のたびに 1)。"""
+    box = _window_box(tmp_path)
+    assert "cascade-incomplete" in store_check(box)
+    finish(box, "t003", agent="Mika")                                   # 窓の中で R が古い結果で完了した
+    assert status(box, "t003") == "done" and count(box, "t003") == 1
+    p = reopen(box)
+    assert p.returncode == 0, p.stderr
+    assert [count(box, t) for t in ("t001", "t002", "t003")] == [1, 1, 2]
+    _assert_completes_only_in_order(box)
+
+
+def test_rerun_converges_after_r_was_pulled_and_is_still_running_in_the_window(tmp_path):
+    """窓の中で R が pull されて実行中のまま再実行 → R の試行は RESET_BY_DIRECTOR で閉じられ pending に戻る。
+    Worker の次の報告は拒否される。reopen_count は増えない (done から戻したのではない)。"""
+    box = _window_box(tmp_path)
+    p = box.pull("Mika", "t003", skills=SKILLS)
+    assert p.returncode == 0, p.stderr
+    xid = json.loads(p.stdout)["execution_id"]
+    q = reopen(box)
+    assert q.returncode == 0, q.stderr
+    assert [count(box, t) for t in ("t001", "t002", "t003")] == [1, 1, 1]
+    late = run(box, "done", "t003", "r", "--mission", MISSION, "--execution", xid, agent="Mika")
+    assert late.returncode != 0, "閉じられた試行の古い完了報告が通った"
+    _assert_completes_only_in_order(box)
+
+
+def test_rerun_converges_when_the_window_r_finished_and_a_was_not_yet_written(tmp_path):
+    """窓がもう 1 つ手前 (R だけ戻った後に A も戻った状態) でも、R の古い完了は再実行で戻る。"""
+    box = build(tmp_path, CHAIN)
+    finish_all(box, ("t001", "t002", "t003"))
+    saved = tmp_path / "window2-saved"
+    shutil.copytree(box.queue, saved)
+    argv = ["t001", "--mission", MISSION, "--reason", REASON, "--branch", "reuse"]
+    seen_a_pending = False
+    for k in range(1, 400):
+        _restore(box, saved)
+        killed, _calls = _fork_reopen(box, argv, k)
+        if not killed:
+            break
+        if [status(box, t) for t in ("t001", "t002", "t003")] != ["done", "pending", "pending"]:
+            continue
+        seen_a_pending = True
+        assert box.pull("Mika", "t003", skills=SKILLS).returncode != 0     # A が pending なので R は pull できない
+        assert reopen(box).returncode == 0
+        assert [count(box, t) for t in ("t001", "t002", "t003")] == [1, 1, 1]
+        _assert_completes_only_in_order(box)
+        break
+    assert seen_a_pending

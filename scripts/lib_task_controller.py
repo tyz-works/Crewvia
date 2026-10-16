@@ -1247,6 +1247,22 @@ def _reopen_cascade(txn, slug, tid, *, reason, over_cap, default_max_attempts, n
                     f"task '{tid}': 無効化の経路上に skipped の task {d} があります ({' -> '.join(route or [tid, d])})。"
                     f"skipped の task は戻せないので reopen しません。先に {d} を `plan.sh reopen` で戻すか、--cascade を見直してください",
                     slug, tid, meta)
+    # 経路上の中間 (= 経路上の別の task の依存になっている task) が failed のままだと、`failed` は「保留」で `released_deps` で
+    # 解除されている下流 (R) は I の再完了を待たずに pull できる (I → A(failed) → R(pending, released_deps=[A]))。戻す手段も無い
+    # (failed は reopen の遷移元でない) ので skipped と同じく拒否する。語彙に無い status は何も言えないので経路のどこでも拒否する。
+    # 経路の**端**にいるだけの failed (対象の review 自身が failed など) は依存元を持たない = 走る下流が無いので拒否しない。
+    # 他の status の扱いは §4.3 の表 (done / verified = 戻す・実行中 = 試行を閉じて戻す・pending / needs_director / blocked /
+    # verification_failed = そのまま。どれも未完了なので、それに依存する下流は I の再完了より前に pull できない)。
+    path_deps = {e: set(dep.declared_dependencies(graph.get(e))) for e in on_path}
+    for d in on_path:
+        st = cards[d][0].get('status')
+        if st not in _status.TASK_STATUSES or (st == _S_FAILED and any(d in deps for e, deps in path_deps.items() if e != d)):
+            route = dep.dependency_path(graph, tid, d)
+            shown = store._safe_status(st) or '<unknown>'
+            _refuse(txn, ex.CASCADE_FAILED_ON_PATH,
+                    f"task '{tid}': 無効化の経路上に status={shown!r} の task {d} があります ({' -> '.join(route or [tid, d])})。"
+                    f"failed は保留のまま残り、`released_deps` で解除された下流が I の再完了を待たずに走れてしまうので reopen しません。"
+                    f"先に {d} を `plan.sh retry` 等で片付けてから reopen してください", slug, tid, meta)
     done_set = {d for d in on_path if cards[d][0].get('status') in (_S_DONE, _S_VERIFIED)}
     reset_set = set(active)
     if cascade != 'none':
@@ -1309,12 +1325,14 @@ def _reopen_cascade(txn, slug, tid, *, reason, over_cap, default_max_attempts, n
             reopened.append(d)
     already = [d for d in closure if marked.get(d) is not None and d not in done_set and d not in reset_set]
     unreleased = []
+    gone = {tid} | set(work)             # pending に戻した task (I と cascade で戻した下流) の解除は根拠が消える (また failed になっても自動で通さない)
     for d in closure:
         card, card_body = _load(txn, slug, d)
         released = card.get('released_deps')
-        if tid in dep.declared_dependencies(graph.get(d)) and isinstance(released, list) and tid in released:
+        declared = set(dep.declared_dependencies(graph.get(d)))
+        if isinstance(released, list) and any(x in gone and x in declared for x in released):
             out = dict(card)
-            kept = [x for x in released if x != tid]
+            kept = [x for x in released if not (x in gone and x in declared)]
             if kept:
                 out['released_deps'] = kept
             else:
@@ -1328,8 +1346,20 @@ def _reopen_cascade(txn, slug, tid, *, reason, over_cap, default_max_attempts, n
     stale = [d for d in closure if cards[d][0].get('status') in (_S_DONE, _S_VERIFIED) and d not in chosen]
     # 戻さなかった pending の下流で、I からの経路に「戻さなかった完了済みの中間」を持つもの = I の再完了を待たずに古い結果で走りうる
     stale_set = set(stale)
+    def _released_failed_on_route(d):
+        # d への経路 (d を含む) のどこかが、failed の中間 m を `released_deps` で解除している
+        route = set(dep.path_closure(graph, tid, [d]))
+        for e in route:
+            released = cards[e][0].get('released_deps')
+            if isinstance(released, list):
+                for m in dep.declared_dependencies(graph.get(e)):
+                    if m in released and m in route and cards[m][0].get('status') == _S_FAILED:
+                        return True
+        return False
+
     stale_runnable = [d for d in closure if cards[d][0].get('status') == _S_PENDING and d not in chosen
-                      and any(m in stale_set for m in dep.path_closure(graph, tid, [d]) if m != d)]
+                      and (any(m in stale_set for m in dep.path_closure(graph, tid, [d]) if m != d)
+                           or _released_failed_on_route(d))]
     return ReopenResult(execution=execution, reopened=tuple(reopened), reset=tuple(reset), already=tuple(already),
                         stale=tuple(stale), unreleased=tuple(unreleased), resumed=bool(already) or reused or root_reuse,
                         stale_runnable=tuple(stale_runnable))

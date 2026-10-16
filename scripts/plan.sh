@@ -3350,8 +3350,8 @@ _NO_WRITE_REFUSALS = frozenset({
     _EXEC.EXECUTION_NOT_FOUND, _EXEC.EXECUTION_NOT_CURRENT, _EXEC.EXECUTION_ALREADY_TERMINAL, _EXEC.EXECUTION_REQUIRED,
     _EXEC.HISTORY_MISMATCH, _EXEC.HISTORY_AMBIGUOUS,
     _EXEC.ATTEMPT_ACTIVE, _EXEC.ATTEMPT_CAP, _EXEC.RETRY_NOT_ALLOWED,
-    _EXEC.NOT_REOPENABLE, _EXEC.CASCADE_ACTIVE_DOWNSTREAM, _EXEC.CASCADE_SKIPPED_ON_PATH, _EXEC.CASCADE_NO_EXECUTION,
-    _EXEC.MISSION_ARCHIVED})
+    _EXEC.NOT_REOPENABLE, _EXEC.CASCADE_ACTIVE_DOWNSTREAM, _EXEC.CASCADE_SKIPPED_ON_PATH, _EXEC.CASCADE_FAILED_ON_PATH,
+    _EXEC.CASCADE_NO_EXECUTION, _EXEC.MISSION_ARCHIVED})
 
 
 def _controller_die(command, e):
@@ -6951,7 +6951,8 @@ def cmd_reopen(args):
             res = _CONTROLLER.reopen_task(
                 _txn(), slug, task_id, kind='reopen', reason=reason, over_cap=over_cap, default_max_attempts=default_cap,
                 cascade=cascade, graph=graph,
-                before_write=lambda: _reactivate_done_mission(slug, via=f'reopen {task_id}'))
+                before_write=lambda: (_reopen_stop_hint(task_id, sys.stderr),
+                                      _reactivate_done_mission(slug, via=f'reopen {task_id}')))
         except _EXEC.ControllerError as e:
             _controller_die('reopen', e)
         prev = res.execution
@@ -6972,8 +6973,18 @@ def cmd_reopen(args):
                   f"{', '.join(res.stale_runnable)} (--cascade reviews|all で中間を戻すか、Director が止めてください)")
         if res.resumed:
             print(f"  再実行で完了: 途中で止まっていた reopen を完了しました (既に戻っていた下流 {len(res.already)} 件)")
+        if res.reopened or res.reset or res.already:
+            _reopen_stop_hint(task_id, sys.stdout)
 
     with_lock(_do)
+
+
+def _reopen_stop_hint(task_id, out):
+    """reopen は原子的でない (下流 → I の順に 1 task ずつ書く。設計 §4.3.1)。途中で止まったときの出口を、書き始める前の stderr と
+    成功時の出力の両方に出す: 止まったら**同じ引数で再実行**する。止まったかは `plan.sh store-check` の cascade-incomplete で分かる。
+    止まっている間は、戻った下流が reopen 前の状態で結果を確定し直すことがある (無駄な作業が増えるだけ。再実行がそれも戻す)。"""
+    print(f"  (途中で止まったら `plan.sh reopen {task_id}` を**同じ引数で再実行**してください。止まったかは "
+          f"`plan.sh store-check` の cascade-incomplete で分かります)", file=out)
 
 
 def cmd_release_dep(args):

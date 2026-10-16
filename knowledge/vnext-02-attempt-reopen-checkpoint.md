@@ -148,6 +148,20 @@
 
 - 既定の `--cascade` は `reviews`（§7 の判断 5）。
 - **経路上の中間 task も無効化の対象に含める（閉包）**。`lib_dep_rules` の「依存が満たされた」は**直接の依存だけ**を見る（`unmet_dependencies`）。I → A（非レビュー）→ R（review）が全部 done のとき、R だけ戻すと R は A の done を根拠にすぐ pull でき、I の修正前の結果をもう一度確定してしまう。したがって対象 R の集合に対し、**I から R への依存の経路上にある task（I の下流かつ R の上流）をすべて対象に足す**。足された中間 task は、skills に関わらず done / verified なら `reopen_count += 1` で pending に戻す（A は I が再完了するまで pending のまま pull されず、R は A の再完了まで待つ）。`downstream_closure` の隣に `path_closure(graph, root, targets)`（root の下流集合 ∩ targets の上流集合）を `lib_dep_rules.py` に足して 1 か所にする。書く順は §4.3.1 のまま（I から遠い順）。
+- **経路上の中間 task の status ごとの扱い（PR-F fix 2・t046。Codex 2 巡目 P1）**。「中間」= 経路上で、別の経路上の task（または選ばれた下流）の依存になっている task。`failed` は依存の判定で「保留」だが、`released_deps` で解除された下流は I の再完了を待たずに pull できる（I(done) → A(failed) → R(pending, `released_deps=[A]`)）。A は戻す手段が無い（failed は reopen の遷移元でない）ので、**戻せない中間は拒否する**。
+
+  | 経路上の中間の status | 扱い | 理由 |
+  |---|---|---|
+  | done / verified | `reopen_count += 1` で pending に戻す | 上の閉包 |
+  | in_progress / ready_for_verification / verifying / needs_human_review | 試行を `RESET_BY_DIRECTOR` で閉じて pending（`--cascade none` は `CASCADE_ACTIVE_DOWNSTREAM`） | §4.3 の表 |
+  | pending / needs_director / blocked / verification_failed | そのまま | 未完了なので、それに依存する下流は I の再完了より前に pull できない |
+  | **skipped** | **拒否** `CASCADE_SKIPPED_ON_PATH` | 終端で、戻せない（PR-F・t036） |
+  | **failed**（他の task の依存になっているもの） | **拒否** `CASCADE_FAILED_ON_PATH`（exit 3・何も書かない・経路と task を出す。Director が `retry` 等で片付けてから reopen） | 保留のまま残り、解除済みの下流が走れる。解除されていなくても、後から `release-dep` された瞬間に同じ害になるので区別しない |
+  | failed（経路の**端**。依存元を持たない） | そのまま | 走る下流が無い |
+  | 語彙の外（手書きの `cancelled` 等） | 何も書かず `STATE_INVALID`（exit 1。store が card を読めない）。lib にも `CASCADE_FAILED_ON_PATH` の保険がある | 知らない status を「通す」側に倒さない |
+
+  `--cascade none` は何も戻さないので上の拒否は `none` には掛けない。代わりに、**経路上の failed の中間を `released_deps` で解除している下流**も `stale_runnable`（出力の「再完了を待たずに走りうる」）に出す。
+- **`released_deps` の扱い**: 解除の根拠が消えるのは I だけでなく、**pending に戻した task 全部**（I と cascade で戻した下流）。下流の card の `released_deps` から、「戻した task で、かつその下流の依存であるもの」を全部消す（消した task は出力に出る）。中間 A が戻った後で再び failed になっても、R の古い解除で自動では通らない。
 - **経路上の中間 task を対象外にする指定は拒否する**。将来 `--keep <id>` のような除外を足しても、`<id>` が対象 R への経路上にあり done / verified なら exit 3（該当する経路を出す）。除外できるのは経路上にない完了済み下流だけで、それは今まで通り「古い結果に基づく下流」として列挙する。
 - **`lib_dep_rules` の依存判定を推移的にする案は採らない**: 判定は dispatcher・`plan.sh pull`・lint が共有する唯一の規則で（不変条件 3）、変えると reopen と無関係な既存の全 task の割り当てが変わり影響が大きい。cascade の側で経路を閉じれば、規則を変えずに同じ保護が得られる。
 - 下流の `released_deps` に I の id があれば消す（`released_deps` は failed の依存を解除する欄。I が戻ったら解除の根拠が無い。`plan.sh:6536` と同じ作法）。
@@ -160,6 +174,8 @@
 3. **I の card を最後に書く**（`reopen_count += 1`・status pending）。I の card が**完了の印**。
 4. **途中で止まったときの状態は、古い結果が通る側には倒れない**。この順で作られる中間状態は「I が done のまま・下流の一部が pending」だけで、危険な逆（**下流が done / verified のまま上流が pending**）は、どの時点でも作られない（各 task は、それに依存する task が全部戻った後に戻る）。中間状態の害は、pending に戻った下流（例: R）が、まだ done の I に対して pull されうること — R が見るのは I の現在の PR head で、reopen の前の状態そのものなので、無駄な作業が増えるだけ。R が走っている間に再実行で I が pending になれば、R の試行は `RESET_BY_DIRECTOR` で閉じられる（§4.3 表の in_progress の行）。
 5. **再実行で完了する（roll forward）**。同じ `plan.sh reopen I --reason … --cascade …` を送り直す。I がまだ done なので入口の検査を通り、処理は前の続きになる: 既に pending の下流は**何もしない**（`reopen_count` を足さない — 足すのは done / verified から戻すときだけ）、まだ戻っていない下流だけを同じ順で処理し、最後に I を書く。I の台帳 `reopen` は §3.2 の同定キーで既存のものを再利用する（`--reason` が違えば `HISTORY_MISMATCH`。同じ `--reason` で再実行する）。**出力に「再実行で完了した」と、何件が既に戻っていたかを出す**。
+   **再実行までの間に下流が動いたとき（t046）**: 止まっている間に R（先に pending に戻った下流）が pull されて、(a) 実行中なら再実行が `RESET_BY_DIRECTOR` で試行を閉じて pending に戻す（`reopen_count` は増えない。Worker の次の報告は `EXECUTION_NOT_CURRENT` / `ALREADY_TERMINAL`）。(b) 古い結果で done になっていたら、**done から戻すので新しく `reopen_count += 1`**（前の実行で 1 回戻し、完了し、今回また戻すので 2。「再実行で二重に数える」のではなく、**完了のたびに 1 回**。印の `root_reopen_count` は I の reopen 1 回につき 1 つなので、台帳には R の reopen が 2 本残る）。どちらも I → A → R の順でしか完了できない状態に収束する（テスト: `test_rerun_converges_after_r_was_pulled_*`）。pull / reserve / `lib_dep_rules` に台帳の印を読ませる案は採らない（依存の唯一の規則に台帳を持ち込むと影響が大きい）。
+   **Director が途中で止まったことに気づく手段**: `plan.sh reopen` は書き始める前（stderr）と成功時（stdout）の両方に「途中で止まったら同じ引数で再実行・止まったかは `plan.sh store-check` の `cascade-incomplete`」と出す。
 6. **途中状態の見つけ方**（`store-check`。**報告だけ・直さない**。直すのは Director が同じコマンドを再実行すること）。下流 T の台帳に `kind: reopen` の イベントがあり、その `root`（= I の id）の `root_reopen_count`（= 始めた時点の I の `reopen_count` + 1）が、I の現在の `reopen_count` より大きいとき、`cascade-incomplete: <I> <T>` を出す。T の台帳 `reopen` の frontmatter に `root` と `root_reopen_count` を足すのは、このため（cascade で戻された task にだけ付ける）。I の台帳 `reopen` が残っていて I がまだ done のとき（I の card 書き込み前に止まった）も、同じ `cascade-incomplete` として I 自身を指して出す。
 7. **journal は使わない**。01a が退けた理由（`state-store.md:212-219`: 回復に要る情報は既に正本にある・ジャーナルと card の食い違いという新しい状態を生む）がそのまま当てはまる。roll forward に要る入力は、Director が再実行で渡す引数（I・`--reason`・`--cascade`）と、下流の card・台帳（どこまで戻ったか）で足りる。見つけるのに要る印（手順 6）は、台帳が既に持つ frontmatter の 2 欄で済む。
 
@@ -275,6 +291,10 @@ Codex の往復は 3 巡で打ち切った (PR #301 の t002)。以下は実装 
   - 起きる害: 古い I の結果に依存した R（review / qa 等）が、I の再完了を待たずに走り、無意味な結果を `done` にする。
   - 直し方の方向（未決）: (a) `skipped` も経路上なら無効化の対象にする。(b) 経路上に `skipped` の task がある reopen を拒否する。Director の推奨は (b) 拒否（`skipped` は Director が意図して飛ばした task なので、勝手に開けない）。
   - 解く PR: F。網羅テストに入れるケース: I → A(`skipped`) → R(`done`)、`skipped` が経路の途中・末端・複数本の経路の片方にある形、`--cascade none|reviews|all` それぞれ、拒否の場合は何も書かれない（`reopen_count` も増えない）こと。
+- **PR-F の Codex 2 巡目（PR #308・t046）で直した 2 点**（P1×2）:
+  - **経路上の failed の中間（P1）**: I(done) → A(failed) → R(pending, `released_deps=[A]`) で reopen が通り、A は failed のまま・R の解除も残るので、R が I の再完了を待たずに走れた。経路上の（他の task の依存になっている）failed は `CASCADE_FAILED_ON_PATH` で拒否（§4.3 の表に status ごとの行を足した）。`released_deps` は I だけでなく pending に戻した task 全部の解除を消す。`--cascade none` では出力の「再完了を待たずに走りうる」に出す。網羅テスト: 中間 A の status（語彙の全部 + 語彙の外）× R が A を解除しているか × cascade 3 値で「reopen が成功したのに I が pending の間に R を pull できる」組み合わせが残らない（`test_no_combination_leaves_r_pullable_before_the_root_completes_again`）。陽性対照（I が done のままなら本当に pull できる）つき。
+  - **下流から先に pending にする書き込みの途中で止まる（P1）**: **§4.3.1-4 の判断を保つ**（途中の状態は reopen 前の状態で結果を確定し直すだけ・無駄な作業が増えるだけ）。台帳の印を pull / reserve / `lib_dep_rules` に読ませる案は採らない。収束のテストを足した: kill の後・再実行の**前**に R を pull して done / 実行中にしてから同じ reopen を再実行し、R が再び pending になり、I → A → R の順でしか完了できないこと。`plan.sh reopen` の出力に再実行の案内を足した。
+  - **残るリスク**: 止まってから再実行までの間に R が古い結果で走る（無駄な作業と、R が done になる間の `reopen_count` の +1）。Director が気づくのは reopen の出力（途中で死ぬと成功時の出力は届かないので、書き始める前の stderr にも出している）と `store-check` の `cascade-incomplete`。dispatcher が自動で再実行・待機する案は範囲外（P0 の残り: 回復を dispatcher が起こす）。
 - **PR-F の Codex 1 巡目（PR #308・t042）で直した 3 点**（P1×1・P2×2）:
   - **pending の review が経路の終点に数えられていなかった**（P1）: I(done) → A(done, code) → R(pending, review) の既定の reopen で A が done のまま残り、R が A の古い結果で I の再完了より前に pull できた。経路閉包の targets は **選ばれた下流を status を問わず**含める（pending / blocked / 実行中 / done / verified / skipped）。`--cascade none` は戻さないが、出力に「I の再完了を待たず、戻していない古い中間の結果で走りうる pending の下流」（`ReopenResult.stale_runnable`）を警告として列挙する（none 以外でも、選ばれなかった pending の下流に同じ形があれば出す）。網羅テスト: 中間 A（done / verified / pending / 実行中）× R（pending / blocked / 実行中 / done / verified）× cascade（reviews / all）で、成功した reopen の後に R を実際に `pull` して通らないこと。
   - **上限の検査が `done_set` だけで `reset_set` を見ていなかった**（P2）: 上限に達した実行中の下流が `--over-cap` なしで戻り、再試行されていた。reopen が pending に戻す全部の集合（I・done_set の中間と末端・reset_set）の検査は `_over_cap()` の 1 関数を通る。拒否は ATTEMPT_CAP（exit 3・何も書かない）。`--over-cap` の理由は reset した下流の台帳（`reset` の `over_cap`）にも残る。

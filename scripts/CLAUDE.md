@@ -248,6 +248,7 @@ lib ごとの**破ってはいけない契約**の要約。理由・経緯・全
 - task の成果物は `deliverable: pr|file|none`（`add` / `update --deliverable`）。`done` は `deliverable: pr` に `--pr` / `--no-pr` を求める。
   lint は `hooks/lib_skill_perms.py` の `check_permission()` を task の skills で直接呼び、Write/Edit/(`pr` なら) `git push` が
   実際に拒否されないかで突き合わせる（`lint_plan.py` にスキル名を書かない。`can_produce_deliverable` は宣言のみで判定には使わない — t088）。
+  `add` / `update --skills|--deliverable` も card を書く前に同じ判定 (`lint_plan.deliverable_refusal()` = `check_deliverable()` への委譲) で、作れない組み合わせを exit 2 で拒否する（t001。規則を plan.sh に書き写さない）。
   必須化は `init` が mission.yaml に書く `deliverable_required: true` の mission だけ（`knowledge/assignment-routing.md` §6）。
 - `init --inactive` は state.yaml を変えない（観察用の使い捨て mission 用。以降は `--mission` 必須）。
   `add` / `update --blocked-by` は循環を exit 2 で拒否して何も書かない — 循環の定義は

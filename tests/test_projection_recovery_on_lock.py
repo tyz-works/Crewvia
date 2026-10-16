@@ -228,7 +228,13 @@ def seed_pr_chain(root, agent="Ren"):
     """t001 (deliverable: pr・agent が pull 済み) → t002 (codex-review) と t003 (review)。"""
     box = Box(root)
     box.run("init", "recover fixture")
-    box.run("add", "T1", "--skills", "bash", "--deliverable", "pr")
+    # この fixture は config/ を持たない。add は deliverable pr|file を config/skill-permissions.yaml で
+    # 確かめる (t001) ので、none で足してから card の宣言だけを pr に書き換える (確かめたいのは done の挙動)
+    box.run("add", "T1", "--skills", "bash", "--deliverable", "none")
+    card = next((box.queue / "missions").glob("*/tasks/t001.md"))
+    text = card.read_text(encoding="utf-8")
+    assert "deliverable: none" in text
+    card.write_text(text.replace("deliverable: none", "deliverable: pr", 1), encoding="utf-8")
     box.run("add", "T2", "--skills", "codex-review", "--blocked-by", "t001", "--deliverable", "none")
     box.run("add", "T3", "--skills", "review", "--blocked-by", "t001", "--deliverable", "none")
     box.run("update", "t002", "--status", "blocked", expect=None)

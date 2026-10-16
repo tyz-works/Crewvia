@@ -122,8 +122,18 @@ def run_scenario(src_root: pathlib.Path, root: pathlib.Path) -> dict:
         ("Held dep child", ["--skills", "bash", "--blocked-by", "t004"]),
         ("Verified path", ["--skills", "bash", "--priority", "high"]),
     ]
+    # add は deliverable pr|file を config/skill-permissions.yaml と hooks/lib_skill_perms.py で確かめる (t001)。この fixture は config/ hooks/ を
+    # 持たず (= 読めなくて拒否される)、golden は add が通る前提で作られているので、add の間だけ置く。
+    # lint 以降は golden を作った時と同じ「config 無し」に戻す (lint の出力を変えない)
+    import shutil
+    cfg, hooks = root / "config", root / "hooks"
+    cfg.mkdir(exist_ok=True)
+    shutil.copy(pathlib.Path(src_root) / "config" / "skill-permissions.yaml", cfg / "skill-permissions.yaml")
+    shutil.copytree(pathlib.Path(src_root) / "hooks", hooks)   # hooks/ を丸ごと (lib を名前で指さない)
     for title, extra in specs:
         r.run("add", title, *extra)
+    shutil.rmtree(cfg)
+    shutil.rmtree(hooks)
     r.run("status")
     r.run("lint", "--mission", r.slug(), label="lint")
 

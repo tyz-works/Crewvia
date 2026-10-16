@@ -2868,6 +2868,25 @@ def _parse_deliverable_opt(opts):
     return value
 
 
+def _reject_unproducible_deliverable(skills, deliverable):
+    """この skills では `deliverable` を作れないなら、exit 2 で拒否する (何も書かない)。
+
+    add / update が card を**書く前**に呼ぶ。判定は lint_plan.deliverable_refusal() 1 か所
+    (= `plan.sh lint` と同じ hook の判定)。ここに規則を書き写さない。
+    deliverable が none / 未宣言なら何もしない。
+    """
+    if deliverable is None:
+        return
+    mod, config_dir = _load_lint_module()
+    reason = mod.deliverable_refusal(skills, deliverable,
+                                     os.path.join(config_dir, 'skill-permissions.yaml'))
+    if reason:
+        print(f"plan.sh {SUBCOMMAND}: skills {skills} では deliverable '{deliverable}' を作れません — "
+              f"{reason} (何も書いていません)。文書を書く task は skills を docs にする、"
+              f"調査だけなら deliverable を none にする", file=sys.stderr)
+        raise UsageExit(USAGE_EXIT)
+
+
 def _reject_dependency_cycle(slug, task_id, new_blocked):
     """`task_id` の blocked_by を `new_blocked` にすると循環ができるなら、exit 2 で拒否する。
 
@@ -3008,6 +3027,7 @@ def cmd_add(args):
                   f"{', '.join(skipped)} は上書きせず {cand} に追加します", file=sys.stderr)
         task_id = f"t{task_num:03d}"
         _reject_dependency_cycle(slug, task_id, blocked_by)
+        _reject_unproducible_deliverable(skills, deliverable)
 
         meta = {
             'id': task_id,
@@ -6562,6 +6582,14 @@ def cmd_update(args):
             raw = opts['--blocked-by'].strip()
             new_blocked = [s.strip() for s in raw.split(',') if s.strip()] if raw else []
             _reject_dependency_cycle(slug, task_id, new_blocked)
+        if opts.get('--skills') is not None or deliverable is not None:
+            # skills か deliverable を動かすときだけ、動かした後の組み合わせで作れるかを確かめる
+            # (card の書き込み・--reset の Controller 呼び出しより前)
+            eff_skills = ([s.strip() for s in opts['--skills'].split(',') if s.strip()]
+                          if opts.get('--skills') is not None else meta.get('skills'))
+            eff_deliverable = deliverable if deliverable is not None else meta.get('deliverable')
+            _reject_unproducible_deliverable(eff_skills if isinstance(eff_skills, list) else [],
+                                             eff_deliverable)
         pr_number_update = _UNSET = object()
         if opts.get('--pr-number') is not None:
             raw_pr = opts['--pr-number'].strip()

@@ -1566,13 +1566,15 @@ class _Recovery:
         if _ex.record_problem(record, meta, slug, tid):
             self._emit('reported:execution_record_identity_mismatch', slug, tid)
             return
-        if _ex.record_follows_card(record, meta):
+        import lib_history as _hist          # 遅延 import (lib_history が lib_state_store を import する)
+        ended_at = _hist.missing_record_ended_at(self.t.queue_dir, slug, tid, record, meta)
+        if _ex.record_follows_card(record, meta) and ended_at is None:
             return
         if not self.apply:
             # store-check: 名指しされない card の record が遅れたまま残る (execution.md §9.5 表外 3)。数えるだけ。
             self._emit('reported:execution_record_stale', slug, tid)
             return
-        updated = _ex.follow_card(record, meta)
+        updated = _ex.follow_card(record, meta, ended_at=ended_at)       # ended_at は台帳にあるときだけ戻す
         files = self._do_writes(lambda: self.t.write_execution_record(slug, xid, updated))
         self._emit('repaired:R-5', slug, tid, files=files,
                    from_status=meta.get('status'), to_status=meta.get('status'), execution_id=xid)

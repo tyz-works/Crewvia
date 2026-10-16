@@ -135,6 +135,9 @@ root の `CLAUDE.md` から移した、テスト専用の規則。設計と経�
   `HISTORY_MISMATCH` / `HISTORY_AMBIGUOUS`・台帳が書けないとき（0o500 の dir。root では skip）・retire だけ閉じる・**書き込みの全点で SIGKILL → 再送で収束**（孤児の点を通ったことも assert）。
 - `tests/test_history_ledger_plan_sh.py`（`pull_execution_helpers.Box`）: done / fail / needs-director と `--result-file`・`plan.sh history`・`pull` の `previous_attempt`・`store-check` の報告・
   `plan.sh archive` で `history/` が動く・`lib_history.result_section` が plan.sh の `parse_task_body` と一致。
+- `tests/test_history_ledger_field_types_and_record_ended_at.py`（t024）: 台帳の欄を**1 つずつ × 型の違う値**（list / dict / bool / int / null）で `fields_problem`・`read_event`・`load_events`・`diagnose` と、plan.sh の pull / store-check / retire で確かめる。
+  **台帳のパーサは `{}` を文字列 `'{}'` として読む**（空の dict は欄の値にならない）ので、ファイル経由では入れ子の dict を使う。`serialize_history` は空の dict を欄ごと null にする。
+  card の後・record の前で落ちた試行は、回復 (R-5) と冪等な再送の両方が台帳の `ended_at` から record を戻す（台帳が無ければ null のまま）。
 - 互換 golden（`test_plan_sh_compat_s3.py`）は PR-D が足した出力（`previous_attempt`・`history/`・card の `result_execution_id`）を**取り除いて**比べる。
 - 赤の実証（手で注入して狙ったテストが落ちること）: 帰属を `new_body` の有無で決める / Result を帰属に関係なく台帳へ入れる / 既存の台帳を無視する / `ended_at` を再利用しない /
   本文の比較を外す / 台帳を card の後に書く / retire の例外を外す / 例外を全操作に広げる。

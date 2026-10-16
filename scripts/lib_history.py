@@ -121,25 +121,48 @@ def parse(text, source='<history>'):
     return meta, body
 
 
+def _is_text(value):
+    return isinstance(value, str)
+
+
+def _is_pr_number(value):
+    return (isinstance(value, int) and not isinstance(value, bool) and value >= 0) or isinstance(value, str)
+
+
+#: 省略できる (None か str) 欄。型の違う値 (list / dict / bool / int) は `bad_field_type`。
+_OPTIONAL_TEXT_FIELDS = ('end_code', 'head', 'worker', 'actor', 'reason', 'checkpoint_dir')
+
+
 def fields_problem(meta):
-    """frontmatter の形の検査。問題なら固定コード、健全なら None (値は出さない)。"""
+    """frontmatter の形の検査。問題なら固定コード、健全なら None (値は出さない)。
+
+    **型を先に確かめる**: 正しい YAML でも `result: []` / `kind: {}` のように型の違う値は集合・タプルとの照合で TypeError に
+    なり、`HistoryUnreadable` の扱いを素通りする。どの欄も、中身を照合する前に型を見る。"""
     if not isinstance(meta, dict):
         return 'not_a_mapping'
     if not ex.is_execution_id(meta.get('execution_id')):
         return 'bad_execution_id'
-    if meta.get('kind') not in KINDS:
+    kind = meta.get('kind')
+    if not _is_text(kind) or kind not in KINDS:
         return 'bad_kind'
     attempt = meta.get('attempt')
     if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 0:
         return 'bad_attempt'
     reopen = meta.get('reopen_count', 0)
-    if isinstance(reopen, bool) or not isinstance(reopen, int) or reopen < 0:
+    if reopen is not None and (isinstance(reopen, bool) or not isinstance(reopen, int) or reopen < 0):
         return 'bad_reopen_count'
     if not isinstance(meta.get('ended_at'), str) or not meta.get('ended_at'):
         return 'bad_ended_at'
     result = meta.get('result')
-    if result is not None and result not in RESULT_STATES:
+    if result is not None and (not _is_text(result) or result not in RESULT_STATES):
         return 'bad_result'
+    for key in _OPTIONAL_TEXT_FIELDS:
+        value = meta.get(key)
+        if value is not None and not _is_text(value):
+            return 'bad_field_type'
+    pr = meta.get('pr_number')
+    if pr is not None and not _is_pr_number(pr):
+        return 'bad_field_type'
     return None
 
 
@@ -147,6 +170,14 @@ def same_name_and_fields(name, fields):
     """名前 (`<seq4>-<kind>-<execution_id>`) と frontmatter の kind / execution_id が一致するか。"""
     parsed = parse_filename(name)
     return parsed is not None and parsed[1] == fields.get('kind') and parsed[2] == fields.get('execution_id')
+
+
+#: end_code → 台帳の kind (この PR では end / reset / retire。retry / reopen は PR-E・F)。無ければ `end`。
+KIND_BY_END_CODE = {ex.RESET_BY_DIRECTOR: 'reset', ex.RETIRED: 'retire'}
+
+
+def kind_for_end_code(end_code):
+    return KIND_BY_END_CODE.get(end_code, 'end')
 
 
 def reopen_count_of(fields):
@@ -214,6 +245,39 @@ def build_event(*, kind, execution_id, attempt, ended_at, end_code=None, reopen_
                   reason=reason, checkpoint_dir=checkpoint_dir, result=result_state)
     body = (result_text or '').rstrip() if result_state == RESULT_RECORDED else ''
     return fields, body
+
+
+def ledger_ended_at(queue_dir, slug, tid, execution_id, end_code, reopen_count):
+    """その遷移の台帳 (同定キー execution_id・kind・reopen_count) の `ended_at`。台帳が無い・読めない・複数あるときは None
+    (回復は推測で時刻を作らない。台帳が無い旧来の card は record の ended_at を null のまま残す)。"""
+    kind = kind_for_end_code(end_code)
+    listed = store.list_history(queue_dir, slug, tid)
+    if listed[0] != 'ok':
+        return None
+    found = []
+    for name in candidates(listed[1], kind, execution_id):
+        got = read_event(queue_dir, slug, tid, name)
+        if got[0] == 'ok' and reopen_count_of(got[1]) == reopen_count:
+            found.append(got[1]['ended_at'])
+    return found[0] if len(found) == 1 else None
+
+
+def missing_record_ended_at(queue_dir, slug, tid, record, meta):
+    """終わった試行の execution record で `ended_at` が欠けているとき、台帳の `ended_at` (無ければ None)。
+
+    card の書き込みの後・record の書き込みの前で落ちた試行の回復 (R-5) と、同じ報告の冪等な再送が使う。台帳が無い
+    (この設計より前の card) ときは None = 時刻を作らず null のまま残す (record の `ended_at` は表示用で、判断に使わない)。"""
+    if record.get('ended_at') is not None:
+        return None
+    if meta.get('execution_status') not in ex.TERMINAL_EXECUTION_STATUSES:
+        return None
+    reopen = meta.get('reopen_count')
+    if isinstance(reopen, bool) or not isinstance(reopen, int) or reopen < 0:
+        reopen = 0 if reopen is None else None
+    if reopen is None:
+        return None
+    return ledger_ended_at(queue_dir, slug, tid, meta.get('current_execution_id'),
+                           meta.get('execution_end_code'), reopen)
 
 
 # ---------------------------------------------------------------------------

@@ -390,7 +390,6 @@ def test_kill_at_every_write_then_resend_converges_to_one_ledger_file(tmp_path):
         fields, _b = ledger(q, names[0])
         assert fields["ended_at"] == expected, (k, fields)
         rec = h.read_record(q, h.xid(1))
-        if rec and rec.get("ended_at"):
-            assert rec["ended_at"] == expected, (k, rec)
+        assert rec is not None and rec["ended_at"] == expected, (k, rec)      # 無条件: 台帳から戻る (card の後の crash でも)
         assert h.read_meta(q)["status"] == "done"
     assert survived_with_orphan >= 1                                      # 孤児の点を 1 つ以上確かめた

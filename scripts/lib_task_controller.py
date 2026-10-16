@@ -90,7 +90,7 @@ GIT_KEYS = ('branch', 'base', 'pr_base', 'worktree', 'head_at_start')
 RESULT_ATTRIBUTION_FIELD = 'result_execution_id'
 
 #: end_code → 台帳の kind (この PR では end / reset / retire。retry / reopen は PR-E・F)。無ければ `end`。
-_HISTORY_KIND_BY_END_CODE = {ex.RESET_BY_DIRECTOR: 'reset', ex.RETIRED: 'retire'}
+_HISTORY_KIND_BY_END_CODE = hist.KIND_BY_END_CODE
 
 
 # ---------------------------------------------------------------------------
@@ -323,6 +323,17 @@ def _write_record(txn, slug, tid, meta, *, ended_at=None, running_at=None, git=N
         return None
     txn.write_execution_record(slug, xid, record)
     return record
+
+
+def _restore_record_ended_at(txn, slug, tid, meta):
+    """冪等な再送で、record の `ended_at` が欠けていれば台帳のものを戻す (card の後・record の前で落ちた試行)。
+    台帳が無ければ何もしない。読めない・identity が食い違う record は触らない (R-5 が報告する)。"""
+    got = txn.read_execution_record(slug, meta['current_execution_id'])
+    if got[0] != 'ok' or ex.record_problem(got[1], meta, slug, tid) is not None:
+        return
+    ended_at = hist.missing_record_ended_at(txn.queue_dir, slug, tid, got[1], meta)
+    if ended_at is not None:
+        txn.write_execution_record(slug, meta['current_execution_id'], ex.follow_card(got[1], meta, ended_at=ended_at))
 
 
 def _execution_of(txn, slug, tid, meta, *, idempotent=False):
@@ -703,7 +714,10 @@ def _finish(txn, slug, tid, meta, body, caller, *, new_status, end_code, to_stat
     hint = owner if check == ex.CHECK_VERIFIED else None        # 監査の actor が unknown のときの補い (§8)
 
     if decision == IDEMPOTENT:
-        return decision if dry_run else _execution_of(txn, slug, tid, meta, idempotent=True)
+        if dry_run:
+            return decision
+        _restore_record_ended_at(txn, slug, tid, meta)
+        return _execution_of(txn, slug, tid, meta, idempotent=True)
 
     if decision == TASK_ONLY:
         _check_task_status(txn, command, slug, tid, meta, caller)               # 書く前に遷移を検査する

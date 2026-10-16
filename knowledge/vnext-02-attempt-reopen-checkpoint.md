@@ -299,6 +299,16 @@ Codex の往復は 3 巡で打ち切った (PR #301 の t002)。以下は実装 
   - **pending の review が経路の終点に数えられていなかった**（P1）: I(done) → A(done, code) → R(pending, review) の既定の reopen で A が done のまま残り、R が A の古い結果で I の再完了より前に pull できた。経路閉包の targets は **選ばれた下流を status を問わず**含める（pending / blocked / 実行中 / done / verified / skipped）。`--cascade none` は戻さないが、出力に「I の再完了を待たず、戻していない古い中間の結果で走りうる pending の下流」（`ReopenResult.stale_runnable`）を警告として列挙する（none 以外でも、選ばれなかった pending の下流に同じ形があれば出す）。網羅テスト: 中間 A（done / verified / pending / 実行中）× R（pending / blocked / 実行中 / done / verified）× cascade（reviews / all）で、成功した reopen の後に R を実際に `pull` して通らないこと。
   - **上限の検査が `done_set` だけで `reset_set` を見ていなかった**（P2）: 上限に達した実行中の下流が `--over-cap` なしで戻り、再試行されていた。reopen が pending に戻す全部の集合（I・done_set の中間と末端・reset_set）の検査は `_over_cap()` の 1 関数を通る。拒否は ATTEMPT_CAP（exit 3・何も書かない）。`--over-cap` の理由は reset した下流の台帳（`reset` の `over_cap`）にも残る。
   - **mission の再活性化が I の card の後ろだった**（P2）: 間で止まると再実行が `NOT_REOPENABLE` で止まり、mission が done のまま dispatcher に Worker を退役させた。再活性化は**検査を全部通った後・最初の書き込み**（`reopen_task(before_write=)`）に移した。加えて、旧い順序で止まった残り（I が reopen 済みで mission が done）の出口として、`plan.sh reopen` は `reopen_is_complete`（I が pending で、今の試行に `reopen_count - 1` の reopen の台帳がある）のときだけ、`NOT_REOPENABLE` の前に mission を戻して exit 0 で終わる。reopen を書き終えた形でないときの拒否は mission を書き換えない。
+- **PR-F の Codex 4 巡目（PR #308・t054）で直した 2 点**（P1×2）。1〜3 巡で「経路の終点」を status ごとの足し算で書いていた族の仕上げ:
+  - **経路の終点（targets）の定義を 1 か所にした**（P1）: `lib_task_controller._reopen_targets` = 「cascade が選ぶ下流（status を問わない）」∪「実行中の下流」∪「前の実行で戻した下流（台帳の印）」。
+    経路の閉包・skipped / failed の拒否・戻す集合（done_set / reset_set）・stale_runnable・released_deps の掃除は全部ここから導く。実行中の B(code) は reset されるが選ばれていないので、
+    I(done) → A(done) → B(in_progress) で A が done のまま残り B がすぐ pull し直せた。前の実行で戻した下流（reset 後に止まった B）も、再実行で数えないと同じ穴になる。
+    総当たり: `tests/test_reopen_targets_matrix.py`（グラフ 3 種 × 各ノードの状態 14 通り（語彙の全部 + 一度も走っていない pending）× skills × cascade 3 値。期待する集合はグラフから独立に導く。
+    拒否なら queue が 1 バイトも変わらない・成功なら経路上に終端が残らず pending は pull できない・書き込みの全点で kill → 再実行でも同じ）。
+  - **壊れた card があれば reopen を拒否する**（P1）: `list_tasks()` は読めない・壊れた card を `blocked_by=[]` の孤立 node に置き換えるので、I → A → R の A が壊れていると I から A・R への辺が消え、R を戻さずに成功した。
+    `CASCADE_UNREADABLE_CARDS`（exit 3・何も書かない・壊れた card の id だけ。plan.sh が `[破損]` の pseudo-task を数えて Controller に渡す）。出口は card を直して同じコマンドを打つこと。
+    **族の洗い出し**: graph を作って経路を辿るのは `cmd_reopen` だけ。`retry` は task 1 枚（graph を作らない）、`store-check` の cascade-incomplete は台帳と card の組から導き graph を使わない
+    （`tests/test_reopen_cascade_plan_sh.py::test_retry_and_store_check_do_not_depend_on_the_whole_mission_graph`）。
 - **Result の帰属を `new_body` の有無で判定すると、古い Result が現在の試行に再帰属される**（Codex 3 巡目 P2。実装 PR D）。
   - **PR-D（t019）で解いた**: `result_replaced` を Controller の明示の引数にし（plan.sh の done / fail だけが渡す）、`verify-result` は渡さない。needs-director は `## Result` 節を置き換えない
     （理由は frontmatter と `## Needs-Director 詳細`）ので渡さない — 設計の「done / fail / needs-director の --result-file」のうち、実際に Result 節を組み直すのは done / fail だけ。

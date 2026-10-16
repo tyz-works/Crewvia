@@ -1061,3 +1061,83 @@ def test_a_stale_release_left_by_a_stop_before_the_cleanup_does_not_run_r_when_a
         assert box.pull("Mika", "t003", skills=SKILLS).returncode != 0, "A の失敗が古い release で素通りした"
         break
     assert tested
+
+
+# ---------------------------------------------------------------------------
+# PR #308 Codex 4 巡目 (t054): targets は 1 か所・壊れた card があれば拒否
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("state", ["in_progress", "ready_for_verification", "verifying"])
+def test_a_running_non_review_downstream_closes_the_done_intermediate_before_it(tmp_path, state):
+    """指摘 1 の再現そのもの: I(done) → A(done, code) → B(running, code)。既定の reviews で B は reset されるが、B 自身は選ばれていない。
+    B を経路の終点に数えないと A が done のまま残り、B が I の再完了より前に pull し直せる。"""
+    box = build(tmp_path, [("t001", [], ["code"]), ("t002", ["t001"], ["code"]), ("t003", ["t002"], ["code"])])
+    finish_all(box, ("t001", "t002"))
+    running_downstream(box, "t003")
+    if state != "in_progress":
+        set_card(box, "t003", status=state)
+    p = reopen(box)
+    assert p.returncode == 0, p.stderr
+    assert [status(box, t) for t in ("t001", "t002", "t003")] == ["pending"] * 3
+    assert box.pull("Mika", "t003", skills=SKILLS).returncode != 0, "I が pending なのに B を pull し直せた"
+
+
+def _corrupt_card(box, tid, secret):
+    """card の `blocked_by` を list でない形にする (読み取りが `[破損]` に隔離する)。値に secret を仕込む。"""
+    import re
+    p = box.queue / "missions" / MISSION / "tasks" / f"{tid}.md"
+    p.write_text(re.sub(r"^blocked_by: .*$", f"blocked_by: {secret}", p.read_text(), count=1, flags=re.M))
+
+
+@pytest.mark.parametrize("cascade", [None, "none", "reviews", "all"])
+def test_reopen_is_refused_when_a_mission_card_is_unreadable_and_writes_nothing(tmp_path, cascade):
+    """指摘 2 の再現そのもの: I → A → R で A が壊れていると、graph から I → A・A → R の辺が消えて R が戻らずに成功していた。
+    mission の card のどれかが読めないなら exit 3・何も書かない・壊れた card の id だけを出す (中身は出さない)。"""
+    box = build(tmp_path, CHAIN)
+    finish_all(box, ("t001", "t002", "t003"))
+    _corrupt_card(box, "t002", "SECRET_BLOCKED_BY_VALUE")
+    before = box.snapshot()
+    extra = ["--cascade", cascade] if cascade else []
+    p = reopen(box, "t001", *extra)
+    assert p.returncode == 3 and last_error_code(p.stderr) == "CASCADE_UNREADABLE_CARDS", (p.returncode, p.stderr)
+    assert "t002" in p.stderr and "SECRET_BLOCKED_BY_VALUE" not in p.stdout + p.stderr
+    assert box.snapshot() == before
+    assert status(box, "t001") == "done" and count(box, "t001") == 0
+
+
+def test_an_unreadable_card_that_is_not_in_the_graph_of_the_root_still_refuses(tmp_path):
+    """壊れた card が I と無関係に見えても拒否する (壊れていると blocked_by も読めない = 無関係かは分からない)。"""
+    box = build(tmp_path, CHAIN + [("t004", [], ["code"])])
+    finish_all(box, ("t001", "t002", "t003"))
+    _corrupt_card(box, "t004", "x")
+    before = box.snapshot()
+    p = reopen(box)
+    assert p.returncode == 3 and last_error_code(p.stderr) == "CASCADE_UNREADABLE_CARDS" and box.snapshot() == before
+
+
+def test_the_same_reopen_succeeds_once_the_card_is_fixed(tmp_path):
+    """拒否の出口は card を直すだけ (拒否は何も書かないので、直した後の同じコマンドが通る)。"""
+    box = build(tmp_path, CHAIN)
+    finish_all(box, ("t001", "t002", "t003"))
+    good = (box.queue / "missions" / MISSION / "tasks" / "t002.md").read_text()
+    _corrupt_card(box, "t002", "x")
+    assert reopen(box).returncode == 3
+    (box.queue / "missions" / MISSION / "tasks" / "t002.md").write_text(good)
+    p = reopen(box)
+    assert p.returncode == 0, p.stderr
+    assert [status(box, t) for t in ("t001", "t002", "t003")] == ["pending"] * 3
+
+
+def test_retry_and_store_check_do_not_depend_on_the_whole_mission_graph(tmp_path):
+    """族の確認: `retry` は task 1 枚だけを見る (graph を作らない) ので、他の card が壊れていても通る。`store-check` の
+    cascade-incomplete も graph を使わず、台帳と card の組から導く (壊れた card は飛ばす)。どちらも `list_tasks()` の置き換えを踏まない。"""
+    box = build(tmp_path, CHAIN)
+    finish(box, "t001")
+    p = box.pull("Ren", "t002", skills=SKILLS)
+    xid = json.loads(p.stdout)["execution_id"]
+    assert run(box, "fail", "t002", "--mission", MISSION, "--no-head", "x", "--execution", xid, agent="Ren").returncode == 0
+    _corrupt_card(box, "t003", "x")
+    q = run(box, "retry", "t002", "--mission", MISSION, "--reason", "やり直す", agent="Director")
+    assert q.returncode == 0, q.stderr
+    assert status(box, "t002") == "pending"
+    run(box, "store-check", "--mission", MISSION, agent="Director")             # 落ちない (終了コードは壊れた card の報告で非 0 もありうる)

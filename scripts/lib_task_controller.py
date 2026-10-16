@@ -948,7 +948,7 @@ def check_reason(value, name):
 
 
 def reopen_task(txn, slug, tid, *, kind, reason, over_cap=None, default_max_attempts=hist.DEFAULT_MAX_ATTEMPTS, now=None,
-                cascade=DEFAULT_CASCADE, graph=None, before_write=None):
+                cascade=DEFAULT_CASCADE, graph=None, unreadable=None, before_write=None):
     """終わった試行の task を、理由つきで pending に戻す (retry。設計 §3.3)。**新しい task を足さない**。
 
     遷移元: `lib_task_status.ACCEPTS_FROM['retry']` (failed / needs_director / needs_human_review / verification_failed)。
@@ -968,13 +968,15 @@ def reopen_task(txn, slug, tid, *, kind, reason, over_cap=None, default_max_atte
 
     `kind='reopen'` (PR-F。設計 §4) は done / verified / skipped の task を `reopen_count += 1` で pending に戻し、`cascade` と
     `graph` (`{task id: blocked_by}`。mission の全 task) に従って下流も戻す (`_reopen_cascade`)。戻り値は `ReopenResult`。
+    `unreadable` (reopen では必須) は mission の読めない・壊れた card の id の並び。1 つでもあれば `CASCADE_UNREADABLE_CARDS`
+    (graph では壊れた card が依存の無い孤立 node になり、そこを通る経路が消える)。
     """
     if kind not in _REOPEN_KINDS:
         raise _err(ex.INVALID_ARGUMENT, "reopen_task の kind は retry / reopen だけ", slug, tid)
     command = _REOPEN_KINDS[kind]
     if kind == 'reopen':
         return _reopen_cascade(txn, slug, tid, reason=reason, over_cap=over_cap, default_max_attempts=default_max_attempts,
-                               now=now, cascade=cascade, graph=graph, before_write=before_write)
+                               now=now, cascade=cascade, graph=graph, unreadable=unreadable, before_write=before_write)
     reason = check_reason(reason, 'reason')
     if over_cap is not None:
         over_cap = check_reason(over_cap, 'over_cap')
@@ -1148,6 +1150,23 @@ def reopen_is_complete(txn, slug, tid):
     return False
 
 
+def _reopen_targets(closure, cards, marked, cascade):
+    """reopen が「I の再完了より前に走らせてはいけない」下流の集合 (= 依存の経路を閉じる終点)。**この集合の定義はここ 1 か所**。
+    経路の閉包・skipped / failed の拒否・戻す集合 (done_set / reset_set)・stale_runnable・released_deps の掃除は全部ここから導く
+    (status ごとに足し算すると、足し忘れた status の下流が経路を閉じずに残る。PR #308 の指摘が 4 巡続いた族)。
+
+    ``cascade`` が none なら空 (何も戻さない)。それ以外は次の和集合 (どれも **status を問わない**):
+
+    * ``cascade`` が選んだ下流 (reviews = skills に review 系を持つ / all = 全部)。pending の review も含める
+    * 実行中の下流 (`_HOLDING`。試行を閉じて pending に戻す。選ばれたかを問わない)
+    * 前の実行で戻した下流 (台帳の印 = ``marked``。戻した時点で pending なので、数えないと再実行で経路が閉じない)
+    """
+    if cascade == 'none':
+        return []
+    return [d for d in closure
+            if _cascade_selects(cascade, cards[d][0]) or cards[d][0].get('status') in _HOLDING or marked.get(d) is not None]
+
+
 def _over_cap(card, cap_of):
     """この card をもう一度 pending に戻すと総試行数の上限を超えるか。**reopen が pending に戻す全部の集合 (I・done_set の
     中間と末端・reset_set) の上限の検査はこの 1 関数を通る** (集合ごとに書き写すと、片方だけ検査から漏れる。PR #308 の指摘)。
@@ -1155,7 +1174,7 @@ def _over_cap(card, cap_of):
     return ex.has_execution_fields(card) and card['execution_count'] >= cap_of(card)
 
 
-def _reopen_cascade(txn, slug, tid, *, reason, over_cap, default_max_attempts, now, cascade, graph, before_write=None):
+def _reopen_cascade(txn, slug, tid, *, reason, over_cap, default_max_attempts, now, cascade, graph, unreadable, before_write=None):
     """`plan.sh reopen`: done / verified / skipped の task I を pending に戻し、`cascade` に従って下流を戻す (設計 §4)。
 
     **検査を全部先に** (何も書かない。拒否は exit 3 + 拒否の行): I の遷移元・試行の記録・active でない・上限、下流の
@@ -1183,8 +1202,16 @@ def _reopen_cascade(txn, slug, tid, *, reason, over_cap, default_max_attempts, n
         raise _err(ex.INVALID_ARGUMENT, "graph は mission の全 task の {id: blocked_by}", slug, tid)
     if isinstance(default_max_attempts, bool) or not isinstance(default_max_attempts, int) or default_max_attempts < 1:
         raise _err(ex.INVALID_ARGUMENT, "default_max_attempts は正の整数", slug, tid)
+    if not isinstance(unreadable, (list, tuple)) or not all(isinstance(x, str) for x in unreadable):
+        raise _err(ex.INVALID_ARGUMENT, "unreadable は読めない card の id の並び", slug, tid)
     meta, body = _load(txn, slug, tid)
     xid = meta.get('current_execution_id')
+    if unreadable:
+        # 読めない・壊れた card は graph で「依存の無い孤立した node」に置き換わる = I からそこ・その先への辺が消える。下流の閉包が
+        # 分からないまま成功させると、消えた辺の先の完了済みの task が I の再完了より前に古い結果を保つ (Unreadable を空に潰さない)
+        _refuse(txn, ex.CASCADE_UNREADABLE_CARDS,
+                f"task '{tid}': mission に読めない・壊れた card があります ({', '.join(unreadable)})。下流の依存の経路が分からないので"
+                f" reopen しません。何も書いていません。先に `plan.sh status` で直し方を見て card を直してください", slug, tid, meta)
     if not ex.has_execution_fields(meta):
         _refuse(txn, ex.NOT_REOPENABLE,
                 f"task '{tid}': 試行の記録が無い card は reopen できません (台帳に写す試行が無い)。"
@@ -1236,9 +1263,10 @@ def _reopen_cascade(txn, slug, tid, *, reason, over_cap, default_max_attempts, n
             _refuse(txn, ex.HISTORY_MISMATCH,
                     f"task '{tid}': 前の実行で戻した下流 {d} の台帳があり、今回の --reason と違います (違う欄: reason)。"
                     f"同じ --reason で再実行してください。何も書いていません", slug, tid, meta)
-    # 選ばれた下流は **status を問わず** 経路の終点に数える。pending の review も含める: I(done) → A(done) → R(pending) で
-    # A を done のまま残すと、R は A の古い結果で I の再完了より前に走る (依存の判定は直接の依存だけ)。
-    targets = [d for d in closure if _cascade_selects(cascade, cards[d][0])]
+    # 経路の終点は `_reopen_targets` の 1 か所 (選ばれた下流・実行中の下流・前の実行で戻した下流。どれも status を問わない)。
+    # I(done) → A(done) → R(pending, review) で A を done のまま残すと、R は A の古い結果で I の再完了より前に走る
+    # (依存の判定は直接の依存だけ)。実行中の B(code) を reset するなら、その手前の A も done のままにできない。
+    targets = _reopen_targets(closure, cards, marked, cascade)
     on_path = dep.path_closure(graph, tid, targets) if targets else []
     for d in on_path:
         if cards[d][0].get('status') == _S_SKIPPED:

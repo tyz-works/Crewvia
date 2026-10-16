@@ -3351,7 +3351,7 @@ _NO_WRITE_REFUSALS = frozenset({
     _EXEC.HISTORY_MISMATCH, _EXEC.HISTORY_AMBIGUOUS,
     _EXEC.ATTEMPT_ACTIVE, _EXEC.ATTEMPT_CAP, _EXEC.RETRY_NOT_ALLOWED,
     _EXEC.NOT_REOPENABLE, _EXEC.CASCADE_ACTIVE_DOWNSTREAM, _EXEC.CASCADE_SKIPPED_ON_PATH, _EXEC.CASCADE_FAILED_ON_PATH,
-    _EXEC.CASCADE_NO_EXECUTION, _EXEC.MISSION_ARCHIVED})
+    _EXEC.CASCADE_NO_EXECUTION, _EXEC.CASCADE_UNREADABLE_CARDS, _EXEC.MISSION_ARCHIVED})
 
 
 def _controller_die(command, e):
@@ -6939,7 +6939,11 @@ def cmd_reopen(args):
         default_cap = _HISTORY.load_default_max_attempts(
             os.path.join(REPO_ROOT, 'config', 'crewvia.yaml'),
             warn=lambda msg: print(f"[plan.sh reopen] warn: {msg}", file=sys.stderr))
-        graph = {m['id']: m.get('blocked_by') for m, _b in list_tasks(slug, quiet=True) if m.get('id')}
+        mission_cards = list_tasks(slug, quiet=True)
+        graph = {m['id']: m.get('blocked_by') for m, _b in mission_cards if m.get('id')}
+        # 読めない・壊れた card (`[破損]` の pseudo-task。走査の失敗も 1 件) は `blocked_by=[]` の孤立 node に置き換わるので、そこを通る
+        # 経路が graph から消える。下流の閉包が分からないまま成功させない (id だけを Controller に渡す = 拒否の文面にも中身を出さない)
+        unreadable = [m.get('id') or '?' for m, _b in mission_cards if m.get('status') == CORRUPT_TASK_STATUS]
         # 回復の出口: I の card が reopen を書き終えているのに mission が done のまま (mission の再活性化を I の card の後ろに
         # 置いていた版で止まった) なら、`NOT_REOPENABLE` で断る前に mission を戻す。mission が done の task に pending があるのは
         # 矛盾した状態なので戻す側に倒れる。reopen を書き終えた形のときだけ (拒否が mission を書き換えない)
@@ -6950,7 +6954,7 @@ def cmd_reopen(args):
                 return
             res = _CONTROLLER.reopen_task(
                 _txn(), slug, task_id, kind='reopen', reason=reason, over_cap=over_cap, default_max_attempts=default_cap,
-                cascade=cascade, graph=graph,
+                cascade=cascade, graph=graph, unreadable=unreadable,
                 before_write=lambda: (_reopen_stop_hint(task_id, sys.stderr),
                                       _reactivate_done_mission(slug, via=f'reopen {task_id}')))
         except _EXEC.ControllerError as e:

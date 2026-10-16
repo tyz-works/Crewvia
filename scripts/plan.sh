@@ -4319,7 +4319,7 @@ def _validate_fail_evidence(meta, report):
         return (f"[plan.sh] handoff_path は絶対パスで渡してください (相対パス: {handoff_path})。\n"
                 "dispatcher は相対パスを worktree ではなく main repo 基準で読むため、"
                 "検証したファイルと通知に使われるファイルが食い違います。\n"
-                "  HANDOFF_PATH=\"$(crewvia_handoff_path \"$AGENT_NAME\" \"$CREWVIA_MISSION_SLUG\" \"$TASK_ID\")\"  # scripts/git-helpers.sh"
+                "  HANDOFF_PATH=\"$(crewvia_handoff_path \"$AGENT_NAME\" \"$TASK_MISSION\" \"$TASK_ID\")\"  # scripts/git-helpers.sh"
                 f"\n{usage}"), {}
     if no_head is not None:
         reason = ' '.join(str(no_head).split())

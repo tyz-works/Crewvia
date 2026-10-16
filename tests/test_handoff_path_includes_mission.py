@@ -121,3 +121,27 @@ def test_worker_md_handoff_stops_when_task_mission_unset():
     r = _run_snippet({"CREWVIA_MISSION_SLUG": "m-stale"})
     assert r.returncode != 0
     assert "m-stale" not in r.stdout
+
+
+def _fail_relative_path_guidance(sb):  # noqa: F811
+    sb.add()
+    r = sb.run("fail", "t001", "rel/t001_HANDOFF.md", "--head", sb.new_head, "--mission", MISSION)
+    assert r.returncode != 0
+    text = r.stdout + r.stderr
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip().startswith("HANDOFF_PATH=")]
+    assert len(lines) == 1, text
+    return lines[0]
+
+
+def test_fail_relative_path_guidance_uses_pull_mission(sb):  # noqa: F811
+    cmd = _fail_relative_path_guidance(sb)
+    assert "CREWVIA_MISSION_SLUG" not in cmd
+    # 案内されたコマンドは、.crewvia-env を source しない target_dir の task (nounset) でも動く
+    env = {"PATH": "/usr/bin:/bin", "CREWVIA_REPO": str(REPO_ROOT),
+           "CREWVIA_REPO_ROOT": str(REPO_ROOT), "AGENT_NAME": "Ingrid",
+           "TASK_ID": "t022", "TASK_MISSION": "m-now", "CREWVIA_MISSION_SLUG": "m-stale"}
+    cmd_clean = cmd.split("  #", 1)[0]
+    r = subprocess.run(["bash", "-c", f"set -u\nsource {REPO_ROOT}/scripts/git-helpers.sh\n" + cmd_clean + '\necho "$HANDOFF_PATH"'],
+                       capture_output=True, text=True, env=env)
+    assert r.returncode == 0, r.stderr
+    assert "/m-now/" in r.stdout and "m-stale" not in r.stdout

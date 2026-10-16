@@ -275,6 +275,10 @@ Codex の往復は 3 巡で打ち切った (PR #301 の t002)。以下は実装 
   - 起きる害: 古い I の結果に依存した R（review / qa 等）が、I の再完了を待たずに走り、無意味な結果を `done` にする。
   - 直し方の方向（未決）: (a) `skipped` も経路上なら無効化の対象にする。(b) 経路上に `skipped` の task がある reopen を拒否する。Director の推奨は (b) 拒否（`skipped` は Director が意図して飛ばした task なので、勝手に開けない）。
   - 解く PR: F。網羅テストに入れるケース: I → A(`skipped`) → R(`done`)、`skipped` が経路の途中・末端・複数本の経路の片方にある形、`--cascade none|reviews|all` それぞれ、拒否の場合は何も書かれない（`reopen_count` も増えない）こと。
+- **PR-F の Codex 1 巡目（PR #308・t042）で直した 3 点**（P1×1・P2×2）:
+  - **pending の review が経路の終点に数えられていなかった**（P1）: I(done) → A(done, code) → R(pending, review) の既定の reopen で A が done のまま残り、R が A の古い結果で I の再完了より前に pull できた。経路閉包の targets は **選ばれた下流を status を問わず**含める（pending / blocked / 実行中 / done / verified / skipped）。`--cascade none` は戻さないが、出力に「I の再完了を待たず、戻していない古い中間の結果で走りうる pending の下流」（`ReopenResult.stale_runnable`）を警告として列挙する（none 以外でも、選ばれなかった pending の下流に同じ形があれば出す）。網羅テスト: 中間 A（done / verified / pending / 実行中）× R（pending / blocked / 実行中 / done / verified）× cascade（reviews / all）で、成功した reopen の後に R を実際に `pull` して通らないこと。
+  - **上限の検査が `done_set` だけで `reset_set` を見ていなかった**（P2）: 上限に達した実行中の下流が `--over-cap` なしで戻り、再試行されていた。reopen が pending に戻す全部の集合（I・done_set の中間と末端・reset_set）の検査は `_over_cap()` の 1 関数を通る。拒否は ATTEMPT_CAP（exit 3・何も書かない）。`--over-cap` の理由は reset した下流の台帳（`reset` の `over_cap`）にも残る。
+  - **mission の再活性化が I の card の後ろだった**（P2）: 間で止まると再実行が `NOT_REOPENABLE` で止まり、mission が done のまま dispatcher に Worker を退役させた。再活性化は**検査を全部通った後・最初の書き込み**（`reopen_task(before_write=)`）に移した。加えて、旧い順序で止まった残り（I が reopen 済みで mission が done）の出口として、`plan.sh reopen` は `reopen_is_complete`（I が pending で、今の試行に `reopen_count - 1` の reopen の台帳がある）のときだけ、`NOT_REOPENABLE` の前に mission を戻して exit 0 で終わる。reopen を書き終えた形でないときの拒否は mission を書き換えない。
 - **Result の帰属を `new_body` の有無で判定すると、古い Result が現在の試行に再帰属される**（Codex 3 巡目 P2。実装 PR D）。
   - **PR-D（t019）で解いた**: `result_replaced` を Controller の明示の引数にし（plan.sh の done / fail だけが渡す）、`verify-result` は渡さない。needs-director は `## Result` 節を置き換えない
     （理由は frontmatter と `## Needs-Director 詳細`）ので渡さない — 設計の「done / fail / needs-director の --result-file」のうち、実際に Result 節を組み直すのは done / fail だけ。

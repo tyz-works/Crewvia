@@ -569,3 +569,198 @@ def test_reopen_then_pull_shows_previous_attempt_and_done_closes_with_the_same_p
     assert q.returncode == 0, q.stderr
     c = box.card()
     assert c["status"] == "done" and c["pr_number"] == 123 and c["reopen_count"] == 1
+
+
+# ---------------------------------------------------------------------------
+# PR #308 Codex 1 巡目 (t042): pending の review・reset_set の上限・mission の再活性化の順
+# ---------------------------------------------------------------------------
+
+TERMINAL = ("done", "verified")
+A_STATES = ("done", "verified", "pending", "in_progress")
+R_STATES = ("pending", "blocked", "in_progress", "done", "verified")
+
+
+def _table_box(tmp_path, a_state, r_state):
+    """I(t001, done) → A(t002, code) → R(t003, review)。全部 done にしてから A / R の status だけを場面に合わせる
+    (試行の欄は終わった試行のまま = 台帳に写せる)。"""
+    box = build(tmp_path, CHAIN)
+    finish_all(box, ("t001", "t002", "t003"))
+    if a_state != "done":
+        set_card(box, "t002", status=a_state)
+    if r_state != "done":
+        set_card(box, "t003", status=r_state)
+    return box
+
+
+@pytest.mark.parametrize("cascade", ["reviews", "all"])
+@pytest.mark.parametrize("r_state", R_STATES)
+@pytest.mark.parametrize("a_state", A_STATES)
+def test_no_review_can_be_pulled_before_the_root_completes_again(tmp_path, a_state, r_state, cascade):
+    """中間 A の status × R の status × cascade。reopen が成功したら、R を I の再完了より前に pull できる組み合わせは残らない
+    (A を done のまま残すと、直接の依存だけを見る pull が R を古い結果で通す)。拒否されるなら何も書かない。"""
+    box = _table_box(tmp_path, a_state, r_state)
+    before = box.snapshot()
+    p = reopen(box, "t001", "--cascade", cascade)
+    if p.returncode != 0:
+        assert p.returncode == 3, (a_state, r_state, p.stderr)
+        assert box.snapshot() == before
+        return
+    assert status(box, "t001") == "pending"
+    assert status(box, "t002") not in TERMINAL, (a_state, r_state, status(box, "t002"))
+    if status(box, "t003") == "pending":
+        q = box.pull("Mika", "t003", skills=SKILLS)
+        assert q.returncode != 0, ("I が pending なのに R を pull できた", a_state, r_state, q.stdout[:200])
+    assert status(box, "t003") not in TERMINAL
+
+
+def test_pending_review_alone_closes_a_done_intermediate(tmp_path):
+    """指摘 1 の再現そのもの: I(done) → A(done, code) → R(pending, review)。既定の reopen で A も戻る。"""
+    box = build(tmp_path, CHAIN)
+    finish_all(box, ("t001", "t002"))
+    assert status(box, "t003") == "pending"
+    p = reopen(box)
+    assert p.returncode == 0, p.stderr
+    assert [status(box, t) for t in ("t001", "t002", "t003")] == ["pending"] * 3
+    assert count(box, "t002") == 1 and count(box, "t003") == 0         # R は pending のまま (reopen_count を足さない)
+    assert box.pull("Mika", "t003", skills=SKILLS).returncode != 0
+
+
+@pytest.mark.parametrize("a_state", ["done", "verified", "pending"])
+def test_cascade_none_lists_a_pending_downstream_that_could_run_on_a_stale_intermediate(tmp_path, a_state):
+    box = build(tmp_path, CHAIN)
+    finish_all(box, ("t001", "t002"))
+    if a_state != "done":
+        set_card(box, "t002", status=a_state)
+    p = reopen(box, "t001", "--cascade", "none")
+    assert p.returncode == 0, p.stderr
+    assert status(box, "t002") == a_state and status(box, "t003") == "pending"      # none は何も戻さない
+    listed = "再完了を待たずに" in p.stdout and "t003" in p.stdout.split("再完了を待たずに", 1)[1]
+    assert listed == (a_state in TERMINAL), p.stdout
+
+
+def test_cascade_none_with_a_running_intermediate_is_still_refused(tmp_path):
+    box = build(tmp_path, CHAIN)
+    finish_all(box, ("t001",))
+    running_downstream(box, "t002")
+    before = box.snapshot()
+    p = reopen(box, "t001", "--cascade", "none")
+    assert p.returncode == 3 and last_error_code(p.stderr) == "CASCADE_ACTIVE_DOWNSTREAM"
+    assert box.snapshot() == before
+
+
+# ---- 上限: reopen が pending に戻す全部の集合が同じ関数を通る ----
+
+def _over_cap_box(tmp_path, which):
+    """`which` の task だけ max_attempts=1 (execution_count=1 で上限)。running の下流 D(t004) を含む。"""
+    spec = CHAIN + [("t004", ["t001"], ["review"])]
+    box = build(tmp_path, spec)
+    finish_all(box, ("t001", "t002"))
+    running_downstream(box, "t004")                       # t004: 実行中の review (reset_set)
+    finish(box, "t003")
+    set_card(box, which, max_attempts=1)
+    return box
+
+
+@pytest.mark.parametrize("which", ["t001", "t002", "t003", "t004"])
+def test_every_set_reopen_returns_to_pending_goes_through_the_same_cap_check(tmp_path, which):
+    """I (t001)・中間 (t002)・末端の done (t003)・実行中の下流 = reset_set (t004) のどれが上限でも、--over-cap なしは
+    ATTEMPT_CAP (exit 3・何も書かない)。--over-cap で通り、理由は戻した全 task の台帳に残る (上限の task のぶん)。"""
+    box = _over_cap_box(tmp_path, which)
+    before = box.snapshot()
+    p = reopen(box)
+    assert p.returncode == 3 and last_error_code(p.stderr) == "ATTEMPT_CAP", (which, p.stderr)
+    assert which in p.stderr and box.snapshot() == before
+    q = reopen(box, "t001", "--over-cap", "了解")
+    assert q.returncode == 0, q.stderr
+    assert [status(box, t) for t in ("t001", "t002", "t003", "t004")] == ["pending"] * 4
+    for kind in ("reopen", "reset"):
+        for name in ledger_files(box, which, kind):
+            fields, _ = ledger(box, which, name)
+            if fields.get("root") == "t001" or which == "t001":
+                assert fields["over_cap"] == "了解", (which, kind, fields)
+    others = [t for t in ("t001", "t002", "t003", "t004") if t != which]
+    for t in others:                                       # 上限に達していない task の台帳には over_cap を書かない
+        for name in ledger_files(box, t):
+            assert ledger(box, t, name)[0].get("over_cap") is None, (which, t, name)
+
+
+def test_reset_downstream_at_the_cap_keeps_the_over_cap_reason_in_its_reset_ledger(tmp_path):
+    box = build(tmp_path, CHAIN)
+    finish_all(box, ("t001", "t002"))
+    running_downstream(box)
+    set_card(box, "t003", max_attempts=1)
+    assert reopen(box).returncode == 3
+    assert reopen(box, "t001", "--over-cap", "了解").returncode == 0
+    [name] = ledger_files(box, "t003", "reset")
+    fields, _ = ledger(box, "t003", name)
+    assert fields["over_cap"] == "了解" and fields["root"] == "t001"
+
+
+# ---- mission の再活性化は I の card より前 ----
+
+def _mission_file(box):
+    return box.queue / "missions" / MISSION / "mission.yaml"
+
+
+def _mark_mission_done(box):
+    f = _mission_file(box)
+    f.write_text(f.read_text().replace("status: in_progress", "status: done"))
+    assert "status: done" in f.read_text()
+
+
+def test_the_mission_is_reactivated_before_the_root_card_is_written(tmp_path):
+    """書き込みの全点で SIGKILL。mission が done のまま pending の task が残る点を作らない (dispatcher が Worker を退役させる)。"""
+    box = build(tmp_path, CHAIN)
+    finish_all(box, ("t001", "t002", "t003"))
+    _mark_mission_done(box)
+    saved = tmp_path / "saved-queue"
+    shutil.copytree(box.queue, saved)
+    argv = ["t001", "--mission", MISSION, "--reason", REASON, "--branch", "reuse"]
+    killed_points = 0
+    mission_written_first = False
+    for k in range(1, 400):
+        _restore(box, saved)
+        killed, calls = _fork_reopen(box, argv, k)
+        if not killed:
+            assert calls < k
+            break
+        killed_points += 1
+        text = _mission_file(box).read_text()
+        pending = [t for t in ("t001", "t002", "t003") if status(box, t) == "pending"]
+        if pending:
+            assert "status: in_progress" in text, (k, pending)          # pending の task があるのに mission が done
+        if "status: in_progress" in text and not pending:
+            mission_written_first = True                                # mission の書き込みの直後 (card はまだ)
+        p = reopen(box)
+        assert p.returncode in (0, 3), (k, p.stderr)
+        assert [status(box, t) for t in ("t001", "t002", "t003")] == ["pending"] * 3, k
+        assert "status: in_progress" in _mission_file(box).read_text(), k
+        assert [count(box, t) for t in ("t001", "t002", "t003")] == [1, 1, 1], k
+    assert killed_points >= 12 and mission_written_first, (killed_points, mission_written_first)
+
+
+def test_a_rerun_recovers_a_done_mission_left_by_the_older_write_order(tmp_path):
+    """I の card を書いた後で止まった旧い順序の残り: root は pending (reopen 済み)・mission は done。同じ引数の再実行は
+    NOT_REOPENABLE で断る前に mission を戻す (exit 0)。台帳も reopen_count も増えない。"""
+    box = build(tmp_path, CHAIN)
+    finish_all(box, ("t001", "t002", "t003"))
+    assert reopen(box).returncode == 0
+    _mark_mission_done(box)
+    files = {t: ledger_files(box, t) for t in ("t001", "t002", "t003")}
+    p = reopen(box)
+    assert p.returncode == 0, p.stderr
+    assert "status: in_progress" in _mission_file(box).read_text() and "Reactivated" in p.stdout
+    assert [count(box, t) for t in ("t001", "t002", "t003")] == [1, 1, 1]
+    assert {t: ledger_files(box, t) for t in ("t001", "t002", "t003")} == files
+    again = reopen(box)                                                # 戻した後は今までどおり (既に完了)
+    assert again.returncode == 3 and last_error_code(again.stderr) == "NOT_REOPENABLE"
+
+
+def test_a_refused_rerun_does_not_touch_a_done_mission_when_the_root_never_reopened(tmp_path):
+    """root が pending でも reopen の台帳が無い (reopen を書き終えた形でない) なら、拒否は mission を書き換えない。"""
+    box = build(tmp_path, [("t001", [], ["code"])])
+    _mark_mission_done(box)
+    before = box.snapshot()
+    p = reopen(box)
+    assert p.returncode == 3 and last_error_code(p.stderr) == "NOT_REOPENABLE", p.stderr
+    assert box.snapshot() == before and "status: done" in _mission_file(box).read_text()

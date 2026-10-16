@@ -143,6 +143,9 @@ lib ごとの**破ってはいけない契約**の要約。理由・経緯・全
   拒否は全部 exit 3・何も書かない: `NOT_REOPENABLE`（pending = 既に完了 / failed 等は retry へ / 試行の記録なし）・`ATTEMPT_ACTIVE`・`ATTEMPT_CAP`・`CASCADE_ACTIVE_DOWNSTREAM`・`CASCADE_SKIPPED_ON_PATH`・`CASCADE_NO_EXECUTION`・`MISSION_ARCHIVED`（`_NO_WRITE_REFUSALS`）。
 - 下流の列挙は `lib_dep_rules.downstream_closure` / `path_closure` / `dependency_path` の 1 か所。`unmet_dependencies` は推移的にしない（cascade の側で経路を閉じる）。対象の skills の置き場は `CASCADE_REVIEW_SKILLS`。
 - 書く順: 検査を全部先に → 下流を I から遠い順に 1 task ずつ（台帳 → card。実行中は `reset_task(ledger_extra=…)`）→ `released_deps` → **I の card を最後**。途中で止まったら**同じ引数で再実行**（既に pending の下流は `reopen_count` を足さない。印は台帳の `root` / `root_reopen_count`）。`store-check` の `cascade-incomplete` は報告だけ。
+- **targets は選ばれた下流を status を問わず含める**（pending の review も。含めないと中間が done のまま残り、R が古い結果で走る）。`--cascade none` と、選ばれなかった pending の下流は、古い中間の結果で走りうるものを `ReopenResult.stale_runnable` に出す（警告のみ）。
+- **上限の検査は `_over_cap()` の 1 関数**: I・done_set・reset_set のどれもここを通る（集合ごとに書き写さない）。`--over-cap` の理由は戻した task の台帳（`reopen` / `reset`）に残る。
+- **mission の再活性化は I の card の前**（`reopen_task(before_write=)` = 検査の後・最初の書き込み）。旧い順序の残り（I が reopen 済み・mission が done）は `reopen_is_complete` が真のときだけ、再実行が `NOT_REOPENABLE` の前に mission を戻す。
 - `reopen_task` の戻り値は kind で違う（retry = `Execution`・reopen = `ReopenResult`）。共通の書き込みは `_write_reopen`。
 - テスト: `tests/test_reopen_cascade_plan_sh.py`（3 値・閉包・実行中の下流・skipped の網羅・書き込みの全点で kill → 再実行）・`tests/test_dep_rules_closure.py`。
 - 戻し方: PR revert → `scripts/sync-main-checkout.sh`。台帳の `reopen` と card の `reopen_count` は残ってよい。

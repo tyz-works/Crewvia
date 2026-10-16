@@ -6940,9 +6940,18 @@ def cmd_reopen(args):
             os.path.join(REPO_ROOT, 'config', 'crewvia.yaml'),
             warn=lambda msg: print(f"[plan.sh reopen] warn: {msg}", file=sys.stderr))
         graph = {m['id']: m.get('blocked_by') for m, _b in list_tasks(slug, quiet=True) if m.get('id')}
+        # 回復の出口: I の card が reopen を書き終えているのに mission が done のまま (mission の再活性化を I の card の後ろに
+        # 置いていた版で止まった) なら、`NOT_REOPENABLE` で断る前に mission を戻す。mission が done の task に pending があるのは
+        # 矛盾した状態なので戻す側に倒れる。reopen を書き終えた形のときだけ (拒否が mission を書き換えない)
         try:
-            res = _CONTROLLER.reopen_task(_txn(), slug, task_id, kind='reopen', reason=reason, over_cap=over_cap,
-                                          default_max_attempts=default_cap, cascade=cascade, graph=graph)
+            if load_mission(slug).get('status') == 'done' and _CONTROLLER.reopen_is_complete(_txn(), slug, task_id):
+                _reactivate_done_mission(slug, via=f'reopen {task_id} (recovery)')
+                print(f"Reopened: {slug}/{task_id} — 既に pending です。止まっていた mission の再活性化を完了しました")
+                return
+            res = _CONTROLLER.reopen_task(
+                _txn(), slug, task_id, kind='reopen', reason=reason, over_cap=over_cap, default_max_attempts=default_cap,
+                cascade=cascade, graph=graph,
+                before_write=lambda: _reactivate_done_mission(slug, via=f'reopen {task_id}'))
         except _EXEC.ControllerError as e:
             _controller_die('reopen', e)
         prev = res.execution
@@ -6958,9 +6967,11 @@ def cmd_reopen(args):
             print(f"  前の実行で既に戻っていた下流: {', '.join(res.already)}")
         if res.stale:
             print(f"  古い結果に基づく下流 (戻していません。Director が判断してください): {', '.join(res.stale)}")
+        if res.stale_runnable:
+            print(f"  警告: {task_id} の再完了を待たずに、戻していない古い中間の結果で走りうる pending の下流: "
+                  f"{', '.join(res.stale_runnable)} (--cascade reviews|all で中間を戻すか、Director が止めてください)")
         if res.resumed:
             print(f"  再実行で完了: 途中で止まっていた reopen を完了しました (既に戻っていた下流 {len(res.already)} 件)")
-        _reactivate_done_mission(slug, via=f'reopen {task_id}')
 
     with_lock(_do)
 

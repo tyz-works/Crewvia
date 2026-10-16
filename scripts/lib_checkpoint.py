@@ -25,6 +25,8 @@ import fnmatch
 import json
 import os
 import re
+import select
+import signal
 import stat
 import subprocess
 import sys
@@ -111,8 +113,10 @@ _TOKEN_PATTERNS = (
     re.compile(r'xox[abprs]-[A-Za-z0-9-]{10,255}'),
 )
 _BEARER = re.compile(r'(Bearer[ \t]{1,8})([A-Za-z0-9._~+/=-]{16,512})')
-_ASSIGN = re.compile(r'((?:TOKEN|SECRET|PASSWORD|PASSWD|API_KEY)[A-Za-z0-9_]{0,40}[ \t]{0,8}[=:][ \t]{0,8})(\S{1,1000})',
-                     re.IGNORECASE)
+_ASSIGN = re.compile(
+    r'((?:TOKEN|SECRET|PASSWORD|PASSWD|API_KEY)[A-Za-z0-9_]{0,40}["\']?[ \t]{0,8}[=:][ \t]{0,8})'
+    r'("[^"\n]{1,1000}"|\'[^\'\n]{1,1000}\'|\S{1,1000})',
+    re.IGNORECASE)
 
 
 def redact(text):
@@ -164,6 +168,8 @@ _GIT_ENV_DROP = ('GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIREC
 
 def _git_env():
     env = {k: v for k, v in os.environ.items() if k not in _GIT_ENV_DROP and not k.startswith('GIT_CONFIG_')}
+    # global / system の設定 (LFS 等の filter.*) と属性は読まない。repo ローカルの filter は `_refuse_local_filters` が止める
+    env.update(GIT_CONFIG_GLOBAL='/dev/null', GIT_CONFIG_NOSYSTEM='1', GIT_ATTR_NOSYSTEM='1')
     env['GIT_OPTIONAL_LOCKS'] = '0'
     env['GIT_TERMINAL_PROMPT'] = '0'
     env['LC_ALL'] = 'C'
@@ -183,28 +189,52 @@ class _Clock:
             raise CheckpointError(E_DEADLINE)
 
 
+def _kill_group(proc):
+    """git を別セッションで起動しているので、子 (filter・ssh 等) ごとプロセスグループで止める。"""
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+
 def _run_git(clock, worktree, *args, limit=GIT_READ_LIMIT, check=True):
     """`(returncode, stdout_bytes, truncated)`。timeout は残り時間 (上限 GIT_TIMEOUT)。失敗は `E_GIT` (check=True のとき)。"""
     clock.check()
     timeout = max(0.1, min(GIT_TIMEOUT, clock.remaining()))
-    argv = ['git', '--no-optional-locks', '-c', 'core.fsmonitor=false', '-C', worktree, *args]
+    argv = ['git', '--no-optional-locks', '-c', 'core.fsmonitor=false', '-c', 'core.attributesFile=/dev/null',
+            '-C', worktree, *args]
     try:
         proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
-                                env=_git_env())
+                                env=_git_env(), start_new_session=True)
     except OSError:
         raise CheckpointError(E_GIT, 'spawn')
+    chunks, size, truncated = [], 0, False
+    fd = proc.stdout.fileno()
+    hard_stop = clock._now() + timeout
     try:
-        data = proc.stdout.read(limit + 1)
-        truncated = len(data) > limit
-        if truncated:
-            data = data[:limit]
-            proc.kill()
-        try:
-            proc.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
-            raise CheckpointError(E_DEADLINE if clock.remaining() <= 0 else E_GIT, 'timeout')
+        while True:
+            left = min(clock.remaining(), hard_stop - clock._now())
+            if left <= 0:
+                _kill_group(proc)
+                proc.wait()
+                raise CheckpointError(E_DEADLINE if clock.remaining() <= 0 else E_GIT, 'timeout')
+            ready, _, _ = select.select([fd], [], [], min(0.2, left))
+            if not ready:
+                continue
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+            if size > limit:
+                truncated = True
+                _kill_group(proc)
+                break
+        proc.wait()
+        data = b''.join(chunks)[:limit]
     finally:
         try:
             proc.stdout.close()
@@ -381,12 +411,24 @@ def _discard(path):
         pass
 
 
+def _refuse_local_filters(clock, worktree):
+    """repo ローカルの設定に `filter.<name>.*` (clean / smudge / process) があれば保存しない。`git diff` / `status` は index と
+    比べるとき clean filter を**起動する**ので、読み取りだけという契約を守れない (`--no-textconv` は filter を止めない)。
+    global / system の設定は環境変数で読まない。設定が読めない・コマンドが失敗しても `check=False` で「無い」と読まず止める。"""
+    rc, out, _ = _run_git(clock, worktree, 'config', '--local', '--get-regexp', r'^filter\.', check=False)
+    if rc == 0 and out.strip():
+        raise CheckpointError(E_GIT, 'local_filters')
+    if rc not in (0, 1):                         # 1 = 該当なし。それ以外は観測できなかった
+        raise CheckpointError(E_GIT, 'config_unreadable')
+
+
 def _build(clock, out, worktree, mission, task, execution_id, reason, pane_text, now):
     """保存物を `out` に書いて meta (dict) を返す。"""
     redactions = 0
     skipped_redaction = 0
     files = {}
 
+    _refuse_local_filters(clock, worktree)
     branch = _git_text(clock, worktree, 'rev-parse', '--abbrev-ref', 'HEAD')[0].strip() or None
     head_rc, head_raw, _ = _run_git(clock, worktree, 'rev-parse', 'HEAD', check=False)
     head = head_raw.decode('ascii', errors='replace').strip() if head_rc == 0 else None

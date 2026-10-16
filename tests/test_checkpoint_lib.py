@@ -432,3 +432,78 @@ def test_cli_take_and_verify(wt, tmp_path):
     bad = subprocess.run([sys.executable, str(script), "verify", d, "--execution", OTHER_XID], capture_output=True,
                          text=True)
     assert bad.returncode == 1 and "verify_failed" in bad.stderr
+
+
+# ---------------------------------------------------------------- セキュリティレビューの指摘 (PR #307)
+
+@pytest.mark.parametrize("text", [
+    '{"password": "hunter2 with spaces"}',
+    "{'api_key': 'hunter2 with spaces'}",
+    'password: "hunter2 with spaces"',
+    "SECRET_KEY = 'hunter2 with spaces'",
+    'config = {"token":"hunter2nospace"}',
+    "PASSWD='hunter2 with spaces'",
+    "export API_KEY=hunter2nospace",
+])
+def test_quoted_json_yaml_and_dict_forms_are_redacted(text):
+    out, n = ck.redact(text)
+    assert "hunter2" not in out and "with spaces" not in out and "[REDACTED:" in out and n >= 1
+
+
+def test_quoted_assignment_is_linear_on_adversarial_input():
+    for line in ('"password":' * 100000, "'token'='" * 100000, 'PASSWORD="' + "a" * 1000000):
+        t0 = time.monotonic()
+        ck.redact(line)
+        assert time.monotonic() - t0 < 5.0
+
+
+def test_a_repo_local_clean_filter_is_never_launched_and_the_checkpoint_is_refused(wt, tmp_path):
+    marker = tmp_path / "filter.marker"
+    script = tmp_path / "clean.sh"
+    script.write_text(f"#!/bin/sh\ntouch '{marker}'\ncat\n")
+    script.chmod(0o755)
+    (wt / ".gitattributes").write_text("*.flt filter=evil\n")
+    (wt / "x.flt").write_text("v1\n")
+    git(wt, "add", "-A")
+    git(wt, "commit", "-q", "-m", "flt")
+    git(wt, "config", "filter.evil.clean", str(script))
+    (wt / "x.flt").write_text("v2\n")
+    # 陽性対照: 素の `git diff HEAD` はこの clean filter を起動する (前提)
+    git(wt, "diff", "HEAD")
+    assert marker.exists(), "前提が成り立たない (clean filter が起動しない設定だった)"
+    marker.unlink()
+    with pytest.raises(ck.CheckpointError) as e:
+        take(wt, tmp_path)
+    assert "local_filters" in str(e.value) and not marker.exists(), "lib_checkpoint が clean filter を起動した"
+    assert not list((tmp_path / "registry").rglob("*.partial")) and not (tmp_path / "registry" / "checkpoints" / MISSION / TASK / XID).exists()
+
+
+def test_global_config_filters_are_not_read(wt, tmp_path, monkeypatch):
+    marker = tmp_path / "global.marker"
+    script = tmp_path / "gclean.sh"
+    script.write_text(f"#!/bin/sh\ntouch '{marker}'\ncat\n")
+    script.chmod(0o755)
+    gcfg = tmp_path / "gitconfig"
+    gcfg.write_text(f"[filter \"evil\"]\n\tclean = {script}\n")
+    (wt / ".gitattributes").write_text("*.flt filter=evil\n")
+    (wt / "x.flt").write_text("v1\n")
+    git(wt, "add", "-A")
+    git(wt, "commit", "-q", "-m", "flt")
+    (wt / "x.flt").write_text("v2\n")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(gcfg))
+    d = take(wt, tmp_path)
+    assert not marker.exists(), "global の filter を起動した"
+    assert "v2" in (pathlib.Path(d) / "dirty.patch").read_text()
+
+
+def test_a_hung_git_is_cut_at_the_deadline_even_while_reading(wt, tmp_path, monkeypatch):
+    fake = tmp_path / "bin"
+    fake.mkdir()
+    (fake / "git").write_text("#!/bin/sh\nsleep 30\n")
+    (fake / "git").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{fake}:{os.environ['PATH']}")
+    t0 = time.monotonic()
+    with pytest.raises(ck.CheckpointError) as e:
+        take(wt, tmp_path, seconds=1)
+    assert e.value.code == ck.E_DEADLINE and time.monotonic() - t0 < 5
+    assert not list((tmp_path / "registry").rglob("*.partial"))

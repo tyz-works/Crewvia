@@ -107,7 +107,16 @@ def render(fields, body):
     problem = fields_problem(meta)
     if problem:
         raise HistoryError(problem)
-    return store.serialize_history(meta, body)
+    text = store.serialize_history(meta, body)
+    # 読み手 (`parse_frontmatter`) は `str.splitlines()` で行を割る。書いた text を読み戻して欄が同じにならなければ
+    # (U+0085 / U+2028 / U+2029 等の行区切りが値に混じる族) 書かない — 読めない台帳を card と一緒にコミットさせない。
+    try:
+        back, _back_body = parse(text)
+    except HistoryError:
+        raise HistoryError('not_roundtrip') from None
+    if any(_norm(back.get(k)) != _norm(v) for k, v in meta.items()) or set(back) - set(meta):
+        raise HistoryError('not_roundtrip')
+    return text
 
 
 def parse(text, source='<history>'):
@@ -185,6 +194,12 @@ def reopen_count_of(fields):
     return fields.get('reopen_count') or 0
 
 
+def _body_norm(body):
+    """本文の比較用の正規形: 読み手と同じ行の割り方 (`splitlines`) で割って `\\n` でつなぐ。書いた Result に U+2028 等が
+    あると読み戻した本文は `\\n` に変わるので、同じ再送が `body` の食い違いにならないようにする。"""
+    return '\n'.join((body or '').splitlines()).strip('\n')
+
+
 def differing_fields(old_fields, old_body, new_fields, new_body):
     """再送で食い違う欄の**名前**。除くのは `ended_at` (と名前の `seq4`)。本文は `body`。値は返さない。"""
     diffs = []
@@ -195,7 +210,7 @@ def differing_fields(old_fields, old_body, new_fields, new_body):
             differs = _norm(old_fields.get(k)) != _norm(new_fields.get(k))
         if differs:
             diffs.append(k)
-    if (old_body or '').strip('\n') != (new_body or '').strip('\n'):
+    if _body_norm(old_body) != _body_norm(new_body):
         diffs.append('body')
     return diffs
 
@@ -457,16 +472,20 @@ def orphan_reason(txn, slug, tid, meta, f):
             status, end_code = meta.get('execution_status'), meta.get('execution_end_code')
         else:
             got = txn.read_execution_record(slug, xid)
-            if got[0] != 'ok' or not isinstance(got[1], dict):
-                return None
+            if got[0] != 'ok' or ex.record_shape_problem(got[1]) is not None:
+                return None                                   # 壊れた record は推定しない (R-5 / store-check の別の報告の側)
             status, end_code = got[1].get('status'), got[1].get('end_code')
+        if not isinstance(status, str):
+            return None                                       # card の欄の型が壊れている (集合との照合は型を見てから)
         if status in ex.ACTIVE_STATUSES:
             return kind if xid == current else None           # 過去の試行が active のまま、は record の側の問題 (R-5 が報告)
         if status in ex.TERMINAL_EXECUTION_STATUSES and f.get('end_code') and end_code and end_code != f.get('end_code'):
             return f"{kind}:closed_by={end_code}"
         return None
     if kind == 'retry' and xid == current and reopen_count_of(f) == (meta.get('reopen_count') or 0):
-        if meta.get('status') in _status.ACCEPTS_FROM['retry'] and meta.get('execution_status') in ex.TERMINAL_EXECUTION_STATUSES:
+        card_status, card_exec = meta.get('status'), meta.get('execution_status')
+        if (isinstance(card_status, str) and isinstance(card_exec, str)
+                and card_status in _status.ACCEPTS_FROM['retry'] and card_exec in ex.TERMINAL_EXECUTION_STATUSES):
             return kind
     return None
 

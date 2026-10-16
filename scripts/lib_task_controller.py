@@ -405,7 +405,7 @@ def _ledger_reason(out, end_code):
     if not isinstance(raw, str):
         return None
     text = ' '.join(raw.split())
-    return text[:_LEDGER_REASON_MAX] or None
+    return text[:_LEDGER_REASON_MAX].rstrip() or None      # 切り口が空白だと読み戻しで落ちる (frontmatter の値は前後の空白を持てない)
 
 
 def _resolve_ledger(txn, slug, tid, meta, out, body_out, *, end_code, ended_at):
@@ -925,8 +925,9 @@ def check_reason(value, name):
     if not isinstance(value, str) or not value.strip():
         raise _err(ex.INVALID_ARGUMENT, f"{name} は空にできません")
     text = value.strip()
-    if re.search(r'[\x00-\x1f\x7f]', text):
-        raise _err(ex.INVALID_ARGUMENT, f"{name} に制御文字 (改行・タブを含む) は使えません")
+    # 制御文字に加え、`str.splitlines()` が行の区切りとみなす U+0085 / U+2028 / U+2029 も断る (台帳の読み手が行を割る)
+    if re.search(r'[\x00-\x1f\x7f\x85\u2028\u2029]', text):
+        raise _err(ex.INVALID_ARGUMENT, f"{name} に制御文字・行区切り (改行・タブを含む) は使えません")
     if len(text) > REASON_MAX:
         raise _err(ex.INVALID_ARGUMENT, f"{name} は {REASON_MAX} 文字までです")
     return text

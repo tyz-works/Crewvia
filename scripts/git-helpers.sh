@@ -58,8 +58,14 @@ _crewvia_resolve_task() {
 }
 
 
-# crewvia_handoff_path <agent_name> <task_id>
+# crewvia_handoff_path <agent_name> <mission_slug> <task_id>
+# crewvia_handoff_path <agent_name> <task_id>            (旧形式・互換。mission を含まない)
 #   Canonical absolute path for a Worker's HANDOFF.md (graceful handoff protocol).
+#   新形式: registry/handoffs/<agent>/<mission>/<task_id>_HANDOFF.md — 別 mission の同じ tNNN が
+#   同じファイルにならない (vNext-02 PR-B)。旧形式 (2 引数) は registry/handoffs/<agent>/<task_id>_HANDOFF.md
+#   を返す。旧 path で書かれた handoff も fail の報告 / dispatcher は絶対パスなら読めるので、
+#   旧呼び出し・rollback 先のコードを壊さないために残す。新規の呼び出しは 3 引数を使うこと。
+#   mission_slug は lib_git_policy.check_mission_slug と同じ規則 (空・"/"・"\\"・"."・".."・制御文字は拒否)。
 #   Used by the writer (agents/worker.md Handoff 手順 Step 2) to produce a single,
 #   worktree-independent path. Always resolves under the MAIN repo root via
 #   _crewvia_repo_root (works from inside a per-task worktree — task_158: a plain
@@ -71,16 +77,38 @@ _crewvia_resolve_task() {
 #   is gitignored, so visibility does not depend on which branch/worktree is
 #   checked out.
 crewvia_handoff_path() {
-  local agent_name="${1:-}" task_id="${2:-}"
+  local agent_name="${1:-}" mission_slug="" task_id=""
+
+  case $# in
+    2) task_id="${2:-}" ;;
+    3) mission_slug="${2:-}"; task_id="${3:-}" ;;
+    *)
+      echo "crewvia_handoff_path: usage: crewvia_handoff_path <agent_name> <mission_slug> <task_id>" >&2
+      return 1
+      ;;
+  esac
 
   if [[ -z "$agent_name" || -z "$task_id" ]]; then
     echo "crewvia_handoff_path: agent_name, task_id are required" >&2
     return 1
   fi
 
+  if [[ $# -eq 3 ]]; then
+    if [[ -z "$mission_slug" || "$mission_slug" == */* || "$mission_slug" == *\\* \
+          || "$mission_slug" == "." || "$mission_slug" == ".." \
+          || "$mission_slug" =~ [[:cntrl:]] ]]; then
+      echo "crewvia_handoff_path: mission_slug として使えない値です: ${mission_slug@Q}" >&2
+      return 1
+    fi
+  fi
+
   local repo_root
   repo_root="$(_crewvia_repo_root)"
-  echo "${repo_root}/registry/handoffs/${agent_name}/${task_id}_HANDOFF.md"
+  if [[ $# -eq 3 ]]; then
+    echo "${repo_root}/registry/handoffs/${agent_name}/${mission_slug}/${task_id}_HANDOFF.md"
+  else
+    echo "${repo_root}/registry/handoffs/${agent_name}/${task_id}_HANDOFF.md"
+  fi
 }
 
 

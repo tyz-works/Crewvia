@@ -4319,7 +4319,7 @@ def _validate_fail_evidence(meta, report):
         return (f"[plan.sh] handoff_path は絶対パスで渡してください (相対パス: {handoff_path})。\n"
                 "dispatcher は相対パスを worktree ではなく main repo 基準で読むため、"
                 "検証したファイルと通知に使われるファイルが食い違います。\n"
-                "  HANDOFF_PATH=\"$(crewvia_handoff_path \"$AGENT_NAME\" \"$TASK_ID\")\"  # scripts/git-helpers.sh"
+                "  HANDOFF_PATH=\"$(crewvia_handoff_path \"$AGENT_NAME\" \"$CREWVIA_MISSION_SLUG\" \"$TASK_ID\")\"  # scripts/git-helpers.sh"
                 f"\n{usage}"), {}
     if no_head is not None:
         reason = ' '.join(str(no_head).split())
@@ -6390,7 +6390,7 @@ def cmd_dashboard_data(args):
 def _set_aside_stale_handoff(handoff_path):
     """`update --reset` で古い handoff ファイルを同じパスから退避する (削除はしない)。
 
-    handoff は `registry/handoffs/<agent>/<task>_HANDOFF.md` の固定パスに書かれるので、
+    handoff は `registry/handoffs/<agent>/<mission>/<task>_HANDOFF.md` (旧: `<agent>/<task>_HANDOFF.md`) の固定パスに書かれるので、
     差し戻した task を同名 Worker がやり直すと、前回のファイルがそのまま残って
     再提出できる。`<path>.stale-<UTC>` に改名して、情報は残しつつ「今回の handoff」
     とは別物にする。card の handoff_path は Worker が書いた値なので、

@@ -67,8 +67,8 @@ def test_pull_issues_one_execution_and_every_place_agrees(box):
     assert box.slot("Ren") == f"{MISSION}:t001"                  # 枠の本文は今までと同じ (dispatcher の busy 判定)
 
     env_lines = box.env_file().splitlines()
-    assert env_lines[-1] == f"export CREWVIA_EXECUTION_ID={xid}"
-    assert [l.split("=")[0] for l in env_lines[:3]] == ["export CREWVIA_MISSION_SLUG", "export CREWVIA_TASK_ID",
+    assert xid not in box.env_file()                               # 試行の ID は書かない (§20.11)
+    assert [l.split("=")[0] for l in env_lines] == ["export CREWVIA_MISSION_SLUG", "export CREWVIA_TASK_ID",
                                                         "export CREWVIA_TASK_SLUG"]
 
     rows = [r for r in box.audit_rows() if r["op"] == "pull"]
@@ -259,7 +259,7 @@ def test_a_pull_killed_before_start_is_resumed_by_the_same_worker_with_the_same_
     meta = box.card()
     assert meta["execution_status"] == "running" and meta["execution_count"] == 1
     assert box.records() == [f"{xid}.json"] and box.record(xid)["status"] == "running"
-    assert box.env_file().splitlines()[-1] == f"export CREWVIA_EXECUTION_ID={xid}"
+    assert "CREWVIA_EXECUTION_ID" not in box.env_file()
     assert "generation_mismatch" not in box.store_check()
 
 
@@ -595,8 +595,8 @@ def test_a_legacy_in_progress_card_is_not_rewritten_and_pull_still_refuses_it(tm
 
 
 def test_a_new_pull_followed_by_the_unchanged_done_still_completes(box):
-    out(box.pull("Ren"))
-    done = box.plan("done", "t001", "finished", "--no-pr", "x", "--mission", MISSION, agent="Ren")
+    xid = out(box.pull("Ren"))["execution_id"]               # E5 PR-2: 自分の pull の execution_id を報告で名乗る
+    done = box.plan("done", "t001", "finished", "--no-pr", "x", "--mission", MISSION, "--execution", xid, agent="Ren")
     assert done.returncode == 0, done.stderr
     assert box.card()["status"] == "done" and box.slot("Ren") is None
 

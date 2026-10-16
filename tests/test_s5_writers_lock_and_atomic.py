@@ -31,6 +31,8 @@ import time
 
 import pytest
 
+from e5_autoname import AutoName
+
 import test_plan_sh_state_store_cutover as cut   # Sandbox / _namespace / _seed_card (モジュールごと import。scripts/ を sys.path に足す)
 import lib_state_store as store
 import task_graph_publisher_harness as harness
@@ -147,6 +149,7 @@ def test_the_old_read_modify_write_really_did_revert_a_concurrent_transition(sb)
 
 def _popen_plan(sb, *args, stdin_text=None):
     env = dict(sb.env, AGENT_NAME="Ren")
+    args = sb.__dict__.setdefault("names", AutoName()).before(args)      # E5 PR-2: 自分の pull の execution_id を報告で名乗る
     p = subprocess.Popen([str(sb.plan), *args], env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                          stderr=subprocess.PIPE, text=True)
     p.pending_input = stdin_text or ""            # communicate(input=) で渡す (先に close すると flush に失敗する)
@@ -223,8 +226,7 @@ def test_the_hook_calls_plan_sh_snapshot_and_falls_back_to_a_log_when_refused(tm
     hooks.mkdir()
     (hooks / "pre-compact.sh").write_bytes((REPO_ROOT / "hooks" / "pre-compact.sh").read_bytes())
     os.chmod(hooks / "pre-compact.sh", 0o755)
-    env = dict(box.env, CREWVIA_TASK_ID="t001", CREWVIA_MISSION_SLUG=MISSION, CREWVIA_AGENT_NAME="Ren",
-               AGENT_NAME="Ren")
+    env = dict(box.env, AGENT_NAME="Ren")
     payload = json.dumps({"trigger": "manual", "custom_instructions": "keep `x` and $(y) > z"})
     p = subprocess.run(["bash", str(hooks / "pre-compact.sh")], input=payload, env=env, text=True,
                        capture_output=True, timeout=120)
@@ -234,12 +236,12 @@ def test_the_hook_calls_plan_sh_snapshot_and_falls_back_to_a_log_when_refused(tm
     assert "keep `x` and $(y) > z" in text                           # 記号がシェルに解釈されず、そのまま入る
     assert any(r["op"] == "snapshot" for r in box.audit_rows())      # 監査ログに乗った = lib を通った
 
-    env["CREWVIA_TASK_ID"] = "t999"
+    env["AGENT_NAME"] = "Nobody"                                    # assignment が無い Worker
     p = subprocess.run(["bash", str(hooks / "pre-compact.sh")], input=payload, env=env, text=True,
                        capture_output=True, timeout=120)
     assert p.returncode == 0                                        # hook は失敗しても compaction を止めない
     log = (box.queue / "pre-compact-fallback.log").read_text()
-    assert "task_id=t999" in log
+    assert "agent=Nobody" in log
 
 
 def _kill_child_at(root, kill_at: int, action) -> tuple[bool, int]:

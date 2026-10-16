@@ -2597,7 +2597,7 @@ USAGE = {
     'reap-orphan-assignment': 'plan.sh reap-orphan-assignment <agent> [--no-wait]',
     'ready-for-verification': 'plan.sh ready-for-verification <task_id> [--mission <slug>] [--execution <id>]',
     'verifying': 'plan.sh verifying <task_id> --verifier <name> [--mission <slug>] [--execution <id>]',
-    'snapshot': 'plan.sh snapshot <task_id> --section-file <path|-> [--mission <slug>]',
+    'snapshot': 'plan.sh snapshot (<task_id> [--mission <slug>] | --self) --section-file <path|->',
     'verify-result': ('plan.sh verify-result <task_id> <pass|fail|needs_human_review>\n'
                       '                            [--mission <slug>] [--notes "<text>" | --notes-file <path|->]\n'
                       '                            [--execution <id>]'),
@@ -2622,7 +2622,7 @@ POSITIONAL_ARITY = {
     'init': (1, 1), 'add': (1, 1), 'pull': (0, 0), 'done': (1, 2),
     'needs-director': (1, 2), 'fail': (1, 2), 'update': (1, 1), 'release-dep': (1, 1),
     'retire': (1, 1), 'reap-orphan-assignment': (1, 1),
-    'ready-for-verification': (1, 1), 'verifying': (1, 1), 'snapshot': (1, 1), 'verify-result': (2, 2),
+    'ready-for-verification': (1, 1), 'verifying': (1, 1), 'snapshot': (0, 1), 'verify-result': (2, 2),
     'review': (1, 1), 'launch': (1, 1), 'task-graph': (0, 0), 'lint': (0, 1),
     'status': (0, 0), 'archive': (1, 1), 'resync': (0, 1), 'dashboard-data': (0, 0),
     'resolve-mission': (1, 1), 'store-check': (0, 0), 'pr-base': (0, 0),
@@ -2909,6 +2909,28 @@ def _reject_dependency_cycle(slug, task_id, new_blocked):
         raise UsageExit(USAGE_EXIT)
 
 
+def _reactivate_done_mission(slug, mission=None, via=''):
+    """done の mission に未完了の task が戻ってきたら、mission を `in_progress` に戻す (vNext 02 PR-A)。
+
+    `with_lock` の中だけで呼ぶ。dispatcher は mission.yaml の `status != done` で「全ミッション完了」を
+    判定する (dispatcher.sh の all_done) ので、done のまま task を足すと idle Worker が退役する。
+    done より前の値は残っていないため戻す値は `in_progress` 固定。`completed_at` は消す。
+    `mission` を渡すと、その dict を書き換えて呼び出し元が保存する (二重書き込みを避ける)。
+    戻したら True。done でなければ何もしない (False)。
+    """
+    own = mission is None
+    if own:
+        mission = load_mission(slug)
+    if mission.get('status') != 'done':
+        return False
+    mission['status'] = 'in_progress'
+    mission['completed_at'] = None
+    if own:
+        save_mission(slug, mission)
+    print(f"Reactivated: mission '{slug}' done -> in_progress ({via})")
+    return True
+
+
 def cmd_add(args):
     opts, positional = parse_opts(args, {
         '--mission': 'value',
@@ -3030,6 +3052,7 @@ def cmd_add(args):
         sync_holder[0] = (slug, task_id, title, skills, priority, blocked_by)
 
         mission['next_task_id'] = task_num + 1
+        _reactivate_done_mission(slug, mission, via=f'add {task_id}')
         save_mission(slug, mission)
         suffix = f" [target: {target_dir}]" if target_dir else ""
         print(f"Added: {slug}/{task_id} — {title}{suffix}")
@@ -3274,10 +3297,12 @@ def _pull_controller_die(e):
 def _execution_caller(opts):
     """done / fail / needs-director / ready-for-verification / verifying / verify-result が名乗る試行 (execution.md §5.2)。
 
-    ID の出どころは **`--execution <id>` (明示) > env `CREWVIA_EXECUTION_ID`**。どちらも無ければ「名乗りなし」
-    (E3 は拒否しない。`.crewvia-env` を必須にしないため。拒否に進むのは E5)。agent 名は照合の根拠にしない (AC-04)。
+    ID の出どころは **`--execution <id>` だけ**。env `CREWVIA_EXECUTION_ID` は読まない (E5 / execution.md §20.11): `.crewvia-env` は
+    Director の reset や別 Worker の再 pull で新しい試行の ID に上書きされうるので、古い Worker が source して付け忘れると
+    置き換えの試行を名乗って照合を通ってしまう。`--execution` が無ければ「名乗りなし」(active の試行があれば
+    EXECUTION_REQUIRED exit 3)。agent 名は照合の根拠にしない (AC-04)。
 
-    **「指定されたか」は presence で見る** (01b G3): `--execution ""` / 空の env を名乗りなしに倒さない
+    **「指定されたか」は presence で見る** (01b G3): `--execution ""` を名乗りなしに倒さない
     (`retire --execution ""` と同じく exit 1・何も書かない)。名乗った値の形が違えば Controller が
     `EXECUTION_NOT_FOUND` (exit 3) で拒否する。**ロックを取る前に呼ぶこと** (拒否は何も書かない)。
     """
@@ -3288,13 +3313,16 @@ def _execution_caller(opts):
             die("[plan.sh] --execution には execution id (ex-…) が必要です。空の値は「名乗りなし」として扱いません"
                 " (名乗らないなら --execution ごと外してください)。何も書いていません。")
         return _CONTROLLER.Caller(value, 'flag', agent)
-    value = os.environ.get('CREWVIA_EXECUTION_ID')
-    if value is not None:
-        if not value.strip():
-            die("[plan.sh] 環境変数 CREWVIA_EXECUTION_ID が空です。空の値は「名乗りなし」として扱いません。"
-                " `unset CREWVIA_EXECUTION_ID` するか、--execution で ID を渡してください。何も書いていません。")
-        return _CONTROLLER.Caller(value, 'env', agent)
+    if os.environ.get('CREWVIA_EXECUTION_ID'):
+        # 値は出さない。env を黙って無視すると「名乗ったはずなのに拒否された」理由が分からない
+        print("[plan.sh] env の CREWVIA_EXECUTION_ID は名乗りに使いません。--execution <ex-…> で渡してください。",
+              file=sys.stderr)
     return _CONTROLLER.NO_CALLER
+
+
+#: 何も書かずに終わる照合の拒否 (E5 PR-2。execution.md §20.5 の 6)。UsageExit で出して task-graph を再生成しない
+_NO_WRITE_REFUSALS = frozenset({
+    _EXEC.EXECUTION_NOT_FOUND, _EXEC.EXECUTION_NOT_CURRENT, _EXEC.EXECUTION_ALREADY_TERMINAL, _EXEC.EXECUTION_REQUIRED})
 
 
 def _controller_die(command, e):
@@ -3302,7 +3330,12 @@ def _controller_die(command, e):
     (遷移の拒否 `INVALID_TRANSITION` は今までの `REFUSED_TRANSITION` と同じ 2。照合の 3 つは 3)。stderr の**最後の行**に
     固定形式の `error_code=<CODE>` を出す。メッセージは固定の文言 + 識別子だけ (card の中身・名乗られた値は出さない)。"""
     prefix = '' if e.message.startswith("task '") else f"[plan.sh {command}] "
-    die(f"{prefix}{e.message}\n{_error_code_line(e.code)}", _EXEC.EXIT_CODES[e.code])
+    text = f"{prefix}{e.message}\n{_error_code_line(e.code)}"
+    if e.code in _NO_WRITE_REFUSALS:
+        # 照合の拒否 4 つは何も書かない: 普通の SystemExit (die) だと末尾の dispatch が task-graph を再生成してしまう
+        print(text, file=sys.stderr)
+        raise UsageExit(_EXEC.EXIT_CODES[e.code])
+    die(text, _EXEC.EXIT_CODES[e.code])
 
 
 def _resend_conflict(command, slug, task_id, fields):
@@ -3611,19 +3644,27 @@ def cmd_pull(args):
               "(agent が空のまま pull すると worker 不明の in_progress card ができるので、何も書かずに断ります。"
               "テスト用の `env -u AGENT_NAME` / `env -i` を pull に持ち込まないでください)", file=sys.stderr)
         raise UsageExit(1)
-    require_valid_agent_name(agent)
+    # ここから下の「ロックの前の拒否」は、何も書かずに断る = UsageExit (die だと末尾の dispatch が task-graph を再生成する)。
+    # exit 1 (exit 2 は idle の意味で Worker が無限に再試行する)。
+    def _refuse_before_writing(message):
+        print(message, file=sys.stderr)
+        raise UsageExit(1)
+
+    name_problem = agent_name_problem(agent)
+    if name_problem:
+        _refuse_before_writing(f"invalid agent name {agent!r}: {name_problem}")
 
     # Director は pull しない。判定は registry 上の role で — **`ROLE` 環境変数は見ない**:
     # dispatcher が spawn する kai-review.sh は Director の env を継承しうるので、env で
     # 判定すると Kai-codex が Director として拒否される (memory: crewvia-director-pull-pitfall)。
     registered = registered_worker(agent)
     if registered and registered.get('role', '').strip('"\' ').lower() == 'director':
-        die(f"{agent!r} は registry/workers.yaml で role: director です。Director は task を pull しません "
+        _refuse_before_writing(f"{agent!r} は registry/workers.yaml で role: director です。Director は task を pull しません "
             f"(Worker に割り当てる側)。`plan.sh status` で状態を見るか、Worker として起動し直してください。")
 
     requested_skills = pull_skills(opts.get('--skills'), registered)
     if not requested_skills:
-        die("pull requires the worker's skills: pass --skills <csv>, set the SKILLS environment "
+        _refuse_before_writing("pull requires the worker's skills: pass --skills <csv>, set the SKILLS environment "
             "variable, or register the agent's skills in registry/workers.yaml. "
             "(skills を空にすると skill の絞り込みが丸ごと無効になるので、黙って進めません)")
 
@@ -4052,8 +4093,8 @@ def cmd_pull(args):
                         f'export CREWVIA_MISSION_SLUG={shlex.quote(mission_slug)}\n'
                         f'export CREWVIA_TASK_ID={shlex.quote(task_id)}\n'
                         f'export CREWVIA_TASK_SLUG={shlex.quote(task_slug)}\n'
-                        # 任意 (必須にしない): 読む側は無くても動く。名乗り (照合の入力) であって card には書かない。
-                        f'export CREWVIA_EXECUTION_ID={shlex.quote(execution_id)}\n'
+                        # 試行の ID はここに書かない: 再 pull で上書きされる古い値を source して名乗る事故の元になる
+                        # (名乗りは pull の JSON の execution_id を `--execution` で渡す。execution.md §20.11)。
                     )
                     try:
                         _STORE.atomic_write_text(env_file, env_text)
@@ -4415,7 +4456,7 @@ def cmd_needs_director(args):
     """plan.sh needs-director <task_id> "<理由>"
 
     in_progress タスクを needs_director 状態に遷移させる (試行は failed / NEEDS_DIRECTOR)。
-    Director の介入を求める。呼び出し元は `--execution <id>` (または env `CREWVIA_EXECUTION_ID`) で今の試行を名乗る
+    Director の介入を求める。呼び出し元は `--execution <id>` で今の試行を名乗る
     (違う試行なら exit 3。名乗らなければ E3 では通す)。
     - TERMINAL_STATUSES に含まれないため、後続 blocked_by は解除されない
     - Dispatcher は pending 以外の非終端ステータスと同じく割り当て対象外
@@ -5440,18 +5481,61 @@ _SNAPSHOT_HEADING = '## Pre-Compact Snapshot'
 _SNAPSHOT_RE = re.compile(r'## Pre-Compact Snapshot\n[\s\S]*?(?=\n## |\Z)')
 
 
+def _snapshot_self_target(agent):
+    """`snapshot --self` の書き込み先 (mission, task_id, execution_id)。ロックの中で呼ぶこと。
+
+    AGENT_NAME の assignment (`mission:task`) が指す card が、(1) in_progress で (2) worker が自分で
+    (3) classify_assignment が現在の試行について ASSIGN_MINE と答えるときだけ。1 つでも欠ければ
+    書かずに拒否する (exit 1。task-graph も再生成しない)。env の task id は使わない — task は 1 セッションの
+    中で変わり、hook の env には届かない (knowledge/vnext-02-attempt-reopen-checkpoint.md §5.6)。
+    """
+    def refuse(why):
+        print(f"plan.sh snapshot --self: {why} (何も書いていません)", file=sys.stderr)
+        raise UsageExit(PULL_USAGE_EXIT)
+
+    problem = agent_name_problem(agent)
+    if problem:
+        refuse(f"AGENT_NAME {agent!r} は使えません ({problem})")
+    published = _TASK_CARDS.read_regular_text_or_unreadable(assignment_path(agent))
+    if _TASK_CARDS.is_unreadable(published):
+        refuse(f"assignment/{agent} を読めない / 存在しません")
+    mission, _, task_id = published.strip().partition(':')
+    if not mission or not task_id or not os.path.exists(task_path(mission, task_id)):
+        refuse(f"assignment/{agent} の指す card がありません")
+    try:
+        meta, _body = load_task(mission, task_id)
+    except (Exception, SystemExit):
+        refuse(f"{mission}/{task_id} の card を読めません")
+    if meta.get('worker') != agent or meta.get('status') != 'in_progress':
+        refuse(f"{mission}/{task_id} は {agent} が in_progress で持つ card ではありません")
+    execution_id = meta.get('current_execution_id')
+    if not isinstance(execution_id, str) or not execution_id:
+        refuse(f"{mission}/{task_id} に現在の試行 (current_execution_id) がありません")
+    verdict = classify_assignment(agent, mission, task_id, execution_id)
+    if verdict != ASSIGN_MINE:
+        refuse(describe_assignment_verdict(agent, verdict))
+    return mission, task_id, execution_id
+
+
 def cmd_snapshot(args):
-    """plan.sh snapshot <task_id> --section-file <path|-> [--mission <slug>]
+    """plan.sh snapshot (<task_id> [--mission <slug>] | --self) --section-file <path|->
 
     card の本文の `## Pre-Compact Snapshot` 節を差し替える (無ければ末尾に足す)。**hooks/pre-compact.sh の
     唯一の書き込み** (S5 / t020)。frontmatter (status / worker / started_at ...) には触れない。
     以前は hook が card 全体をロックなし・in-place で書き戻していたので、hook が in_progress を読んだ後に
     done が完了すると、古い in_progress が復活した (knowledge/state-store.md §2.4-5)。
+
+    `--self`: task を引数でなく `AGENT_NAME` の assignment から決める (hook の env には task が無い)。
+    <task_id> / --mission とは併用できない。節の先頭に mission/task と execution_id の行を足す。
     """
-    opts, positional = parse_opts(args, {'--section-file': 'value', '--mission': 'value'})
-    if not positional:
+    opts, positional = parse_opts(args, {'--section-file': 'value', '--mission': 'value', '--self': 'bool'})
+    use_self = bool(opts.get('--self'))
+    if use_self:
+        if positional or opts.get('--mission'):
+            _usage_exit("--self は <task_id> / --mission と併用できません")
+    elif not positional:
         die("snapshot requires <task_id>")
-    task_id = positional[0]
+    task_id = positional[0] if positional else None
     if opts.get('--section-file') is None:
         _usage_exit("snapshot requires --section-file <path|->")
     section = read_body_arg(opts, '--section-file', None, 'section')
@@ -5459,15 +5543,21 @@ def cmd_snapshot(args):
         _usage_exit(f"--section-file の本文は '{_SNAPSHOT_HEADING}' の行で始まること")
 
     def _do():
-        state = load_state()
-        slug = _resolve_task_mission('snapshot', task_id, state, opts.get('--mission'))
-        meta, body = load_task(slug, task_id)
-        if _SNAPSHOT_RE.search(body):
-            body_new = _SNAPSHOT_RE.sub(lambda _m: section, body, count=1)
+        if use_self:
+            slug, tid, execution_id = _snapshot_self_target(os.environ.get('AGENT_NAME', '').strip())
+            written = (_SNAPSHOT_HEADING + '\n' + f"- mission_task: {slug}/{tid}\n- execution_id: {execution_id}\n"
+                       + section[len(_SNAPSHOT_HEADING) + 1:])
         else:
-            body_new = body.rstrip('\n') + '\n\n' + section + '\n'
-        save_task(slug, task_id, meta, body_new)
-        print(f"Snapshot: {slug}/{task_id}")
+            state = load_state()
+            slug = _resolve_task_mission('snapshot', task_id, state, opts.get('--mission'))
+            tid, written = task_id, section
+        meta, body = load_task(slug, tid)
+        if _SNAPSHOT_RE.search(body):
+            body_new = _SNAPSHOT_RE.sub(lambda _m: written, body, count=1)
+        else:
+            body_new = body.rstrip('\n') + '\n\n' + written + '\n'
+        save_task(slug, tid, meta, body_new)
+        print(f"Snapshot: {slug}/{tid}")
 
     with_lock(_do)
 
@@ -6625,6 +6715,16 @@ def cmd_update(args):
         if not (reset_by_controller and len(changed) == 1):
             save_task(slug, task_id, meta, body)
         print(f"Updated: {slug}/{task_id} — {', '.join(changed)}")
+
+        # task を未完了に戻す経路 (--status pending|in_progress / --reset) では、done の mission も戻す。
+        # 判定は入力の option でなく**書いた後の task の確定 status**で: `--reset --status done` は
+        # reset の pending を明示の status が上書きし、task は終端のまま。それで mission を戻すと
+        # 全 task が終端なのに in_progress が残る (Codex 1 巡目 P2)。
+        # (status の集合リテラルは lib_task_status の外に書かない: tests/test_task_status_single_definition.py)
+        final_status = meta.get('status')
+        if ((opts.get('--reset') or status is not None)
+                and (final_status == 'pending' or final_status == 'in_progress')):
+            _reactivate_done_mission(slug, via=f'update {task_id}')
 
         # Dispatcher Rule 5 の誤報を防ぐため、差し戻した Worker の assignment も
         # 撤去する。以前はこれを with_lock() の *外* で行っていたため、ロックを

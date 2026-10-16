@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import pathlib
@@ -27,6 +28,8 @@ import sys
 import threading
 
 import pytest
+
+from e5_autoname import AutoName
 
 import state_store_scenarios as sc       # scripts/ を sys.path に足す
 import lib_state_store as store
@@ -59,15 +62,20 @@ class Box:
         env = dict(self.env)
         if agent:
             env["AGENT_NAME"] = agent
+        names = self.__dict__.setdefault("names", AutoName())     # E5 PR-2: 自分の pull の execution_id を報告で名乗る
+        args = names.before(args)
         p = subprocess.run([str(self.plan), *args], env=env, capture_output=True, text=True,
                            timeout=120, input=stdin)
+        names.after(args, p.stdout, p.returncode)
         if expect is not None:
             assert p.returncode == expect, f"plan.sh {args}: rc={p.returncode}\n{p.stdout}\n{p.stderr}"
         return p
 
     def clone(self, dest: pathlib.Path) -> "Box":
         shutil.copytree(self.root, dest, symlinks=True)
-        return Box(dest)
+        clone = Box(dest)
+        clone.names = copy.deepcopy(self.__dict__.get("names") or AutoName())     # E5 PR-2: 同じ Worker の pull の execution_id
+        return clone
 
     def namespace(self) -> dict:
         return harness.load_plan_namespace(self.plan, str(self.queue), str(self.root))
@@ -180,6 +188,7 @@ def crash_command(box: Box, k: int, argv: list[str], agent: str | None = None) -
     """`plan.sh <argv>` を `box` の queue に対して走らせ、lib の書き込み点の k 番目で落とす。
     戻り値: (落ちたか, 呼ばれた点の数)。k が点の数を超えれば最後まで走る (= 落ちない)。"""
     ns = box.namespace()
+    argv = box.__dict__.setdefault("names", AutoName()).before(argv)       # E5 PR-2: 自分の pull の execution_id を報告で名乗る
     sub = argv[0]
     ns["SUBCOMMAND"] = sub
 

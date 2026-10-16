@@ -99,6 +99,7 @@ CASES = {
                                                "--execution", "not-an-id"]),
     ("snapshot", "--section-file"): ("Ren", ["snapshot", "t001", "--mission", M, "--section-file", "/no/such/file"]),
     ("snapshot", "--mission"): ("Ren", ["snapshot", "t001", "--section-file", "/dev/null", "--mission", NOPE]),
+    ("snapshot", "--self"): ("Ren", ["snapshot", "t001", "--self", "--section-file", "/dev/null"]),
     ("release-dep", "--mission"): (None, ["release-dep", "t002", "--mission", NOPE]),
     ("release-dep", "--dep"): (None, ["release-dep", "t002", "--mission", M, "--dep", "t999"]),
     ("retire", "--mission"): (None, ["retire", "t001", "--agent", "Ren", "--execution", "{X}", "--mission", NOPE]),

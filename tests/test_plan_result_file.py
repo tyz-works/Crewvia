@@ -30,6 +30,8 @@ import subprocess
 
 import pytest
 
+from e5_autoname import AutoName
+
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 PLAN_SH = pathlib.Path(os.environ.get("PLAN_SH_UNDER_TEST") or REPO_ROOT / "scripts" / "plan.sh")
 
@@ -54,6 +56,7 @@ class Sandbox:
         self.queue = root / "queue"
         self.target = root / "work"
         self.target.mkdir()
+        self.names = AutoName()                 # E5 PR-2: 自分の pull の execution_id を報告で名乗る
 
     def env(self, **extra):
         env = {
@@ -69,6 +72,7 @@ class Sandbox:
         return env
 
     def plan(self, *args, stdin=None, stdin_bytes=None, **env):
+        args = self.names.before(args)
         kw = {}
         if stdin_bytes is not None:
             kw["input"] = stdin_bytes
@@ -83,6 +87,7 @@ class Sandbox:
         if not text:
             r.stdout = r.stdout.decode("utf-8", "replace")
             r.stderr = r.stderr.decode("utf-8", "replace")
+        self.names.after(args, r.stdout, r.returncode)
         return r
 
     def shell(self, script: str):
@@ -149,7 +154,7 @@ def test_control_double_quoted_argument_executes_the_command_substitution(sb):
     in_progress_task(sb)
     sentinel = sb.root / "SENTINEL_POSITIONAL"
     r = sb.shell(f'bash "$PLAN" done t001 "PR #1 `touch {sentinel}` $(touch {sentinel}.b)" '
-                 f'--mission {MISSION} --no-pr "テスト"')
+                 f'--mission {MISSION} --no-pr "テスト" --execution {sb.names.ids["t001"]}')
     _ok(r)
     assert sentinel.exists(), "対照が効いていない: 二重引用符でもコマンド置換されなかった"
     assert pathlib.Path(f"{sentinel}.b").exists()
@@ -189,6 +194,7 @@ def test_stdin_through_a_quoted_heredoc_in_a_real_shell(sb):
     sentinel = sb.root / "SENTINEL_HEREDOC"
     r = sb.shell(
         f'bash "$PLAN" done t001 --result-file - --mission {MISSION} --no-pr "テスト" '
+        f'--execution {sb.names.ids["t001"]} '
         f"<<'RESULT_EOF'\nPR #1\n`touch {sentinel}` $(touch {sentinel})\nRESULT_EOF\n")
     _ok(r)
     assert not sentinel.exists()

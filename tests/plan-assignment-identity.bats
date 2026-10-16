@@ -228,7 +228,7 @@ assert d['started_at'] == '''$started''', d
   run plan pull --agent Ren --skills bash --task t001 --mission "$TEST_MISSION"
   [ "$status" -eq 0 ]
 
-  run plan_as Ren done t001 "result" --mission "$TEST_MISSION"
+  run plan_as Ren done t001 "result" --mission "$TEST_MISSION" --execution "$(card_field t001 current_execution_id)"
   [ "$status" -eq 0 ]
 
   [ ! -e "$ASSIGN_DIR/Ren" ]
@@ -324,7 +324,7 @@ assert d['started_at'] == '''$started''', d
   local gen
   gen="$(card_field t001 current_execution_id)"
 
-  run plan_as Ren done t001 "result" --mission "$TEST_MISSION"
+  run plan_as Ren done t001 "result" --mission "$TEST_MISSION" --execution "$gen"
   [ "$status" -eq 0 ]
 
   run plan retire t001 --agent Ren --execution "$gen" --mission "$TEST_MISSION"
@@ -434,7 +434,7 @@ assert d['started_at'] == '''$started''', d
   local gen
   gen="$(card_field t001 current_execution_id)"
 
-  run plan_as Ren needs-director t001 "人手の判断が要る" --mission "$TEST_MISSION"
+  run plan_as Ren needs-director t001 "人手の判断が要る" --mission "$TEST_MISSION" --execution "$gen"
   [ "$status" -eq 0 ]
   [ "$(card_field t001 status)" = "needs_director" ]
 
@@ -505,7 +505,7 @@ assert d['started_at'] == '''$started''', d
   # 不正な名前から作ったパス (`../../Ren` = queue の外) には触れない (陽性対照: そこに置いた印のファイル)。
   local outside="$ASSIGN_DIR/../../Ren"
   echo sentinel > "$outside"
-  run plan_as "../../Ren" done t001 "result" --mission "$TEST_MISSION"
+  run plan_as "../../Ren" done t001 "result" --mission "$TEST_MISSION" --execution "$(card_field t001 current_execution_id)"
   [ "$status" -eq 0 ]
 
   [ "$(card_field t001 status)" = "done" ]

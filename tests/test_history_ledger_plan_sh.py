@@ -135,6 +135,30 @@ def test_resend_after_an_orphan_ledger_keeps_one_file_and_one_ended_at(box):
     fields, _ = ledger(box, name)
     assert box.record(xid)["ended_at"] == fields["ended_at"]
     assert box.card()["status"] == "done"
+    assert box.card()["completed_at"] == fields["ended_at"]            # t021 F1: card の完了時刻も台帳の時刻 (再送の now ではない)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root は 0o500 の dir にも書ける")
+def test_fail_resend_after_an_orphan_ledger_keeps_completed_at_equal_to_ended_at(box):
+    xid = take(box)
+    tasks = box.queue / "missions" / MISSION / "tasks"
+    tasks.chmod(0o500)
+    try:
+        assert fail(box, xid).returncode != 0
+    finally:
+        tasks.chmod(0o700)
+    [name] = ledger_files(box)
+    time.sleep(1.2)
+    assert fail(box, xid).returncode == 0
+    fields, _ = ledger(box, name)
+    assert box.card()["completed_at"] == fields["ended_at"] == box.record(xid)["ended_at"]
+
+
+def test_needs_director_reason_is_recorded_in_the_ledger(box):
+    xid = take(box)
+    assert run(box, "needs-director", TID, "REASON-ONE", "--mission", MISSION, "--execution", xid).returncode == 0
+    [name] = ledger_files(box)
+    assert ledger(box, name)[0]["reason"] == "REASON-ONE"
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root は 0o500 の dir にも書ける")

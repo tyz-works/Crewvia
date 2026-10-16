@@ -384,6 +384,30 @@ def _ledger_actor(txn):
     return None if token in (None, 'unknown') else token
 
 
+#: 台帳の `reason` の長さの上限 (長文・複数行は 1 行に畳んで切る。比較は書く側と同じ関数を通るので再送は一致する)
+_LEDGER_REASON_MAX = 200
+
+
+def _ledger_reason(out, end_code):
+    """報告の種類ごとの理由の出どころ (出来上がる card `out` から読む)。理由が無い報告は None。
+
+    needs-director = `needs_director_reason` / fail = `--no-head` の理由 + handoff の有無 / retire = needs_director に倒した
+    ときだけ `needs_director_reason` (pending に戻す退役は、前回の理由が card に残っていても使わない) / done・reset・
+    verify-result の差し戻しは理由の欄が無い。値の全文は台帳の本文に入れない (1 行に畳んで上限で切る)。"""
+    if end_code == ex.NEEDS_DIRECTOR or (end_code == ex.RETIRED and out.get('status') == _S_NEEDS_DIRECTOR):
+        raw = out.get('needs_director_reason')
+    elif end_code == ex.WORKER_FAILED:
+        waiver = out.get('fail_head_waiver')
+        raw = (f"no-head: {waiver}; " if isinstance(waiver, str) and waiver.strip() else '') + \
+            f"handoff: {'yes' if out.get('handoff_path') else 'none'}"
+    else:
+        return None
+    if not isinstance(raw, str):
+        return None
+    text = ' '.join(raw.split())
+    return text[:_LEDGER_REASON_MAX] or None
+
+
 def _resolve_ledger(txn, slug, tid, meta, out, body_out, *, end_code, ended_at):
     """台帳に書くべきこと。`(action, name, ended_at, text)`: action は `write` (新しいファイルを足す) / `reuse` (同じ遷移の
     ファイルが既にあり中身も同じ。何も書かず、その `ended_at` を使う)。何も書かない。食い違い・読めないは `_LedgerProblem`。"""
@@ -394,7 +418,7 @@ def _resolve_ledger(txn, slug, tid, meta, out, body_out, *, end_code, ended_at):
     fields, body = hist.build_event(
         kind=kind, execution_id=xid, attempt=meta['execution_count'], ended_at=ended_at, end_code=end_code,
         reopen_count=reopen, head=out.get('fail_head'), pr_number=out.get('pr_number'), worker=meta.get('worker'),
-        actor=_ledger_actor(txn), result_state=state, result_text=result_text)
+        actor=_ledger_actor(txn), reason=_ledger_reason(out, end_code), result_state=state, result_text=result_text)
     listed = txn.list_history(slug, tid)
     if listed[0] != 'ok':
         raise _LedgerProblem(ex.STATE_INVALID, f"{slug}/{tid}: 台帳を列挙できません ({listed[1]})")
@@ -428,7 +452,8 @@ def _resolve_ledger(txn, slug, tid, meta, out, body_out, *, end_code, ended_at):
 
 def _record_ledger(txn, slug, tid, meta, out, body_out, caller, *, end_code, now):
     """終わる試行の台帳を、card の書き込みの**直前**に 1 ファイル足す (台帳 → card の順。card がコミット点)。
-    戻り値: `(ended_at, history_detail)`。`ended_at` は record にも使う値 (再送では台帳のものを再利用)。
+    戻り値: `(ended_at, history_detail, reused)`。`ended_at` は record にも使う値 (再送では台帳のものを再利用。そのとき
+    `reused=True`)。
 
     retire だけは台帳が使えなくても閉じる (退役が止まると誰も窓を閉じない。`daemon-authority.md` §5): 警告を出し、
     監査ログの `detail` に `history_unwritten` を残す。それ以外の台帳の問題は遷移を止める
@@ -438,6 +463,7 @@ def _record_ledger(txn, slug, tid, meta, out, body_out, caller, *, end_code, now
     try:
         action, name, ended_at, text = _resolve_ledger(txn, slug, tid, meta, out, body_out,
                                                       end_code=end_code, ended_at=ended_at)
+        reused = action == 'reuse'
         if action == 'write':
             txn.write_history(slug, tid, name, text)
     except (_LedgerProblem, store.StoreError, hist.HistoryError) as e:
@@ -451,8 +477,8 @@ def _record_ledger(txn, slug, tid, meta, out, body_out, caller, *, end_code, now
             raise
         print(f"[task-controller warn] {slug}/{tid}: 台帳を書けないまま退役を閉じます "
               f"({type(e).__name__}。履歴はこの試行の分だけ欠けます)", file=sys.stderr)
-        return _now_text(now), 'history_unwritten'
-    return ended_at, None
+        return _now_text(now), 'history_unwritten', False
+    return ended_at, None, reused
 
 
 # ---------------------------------------------------------------------------
@@ -760,7 +786,10 @@ def _finish(txn, slug, tid, meta, body, caller, *, new_status, end_code, to_stat
         out[RESULT_ATTRIBUTION_FIELD] = out['current_execution_id']      # Result 節の帰属は card の同じ書き込みで
     # 台帳 → card の順 (派生値は正本より前。card がコミット点)。card の書き込みが失敗しても残るのは「まだ起きていない遷移」の
     # 孤児の 1 ファイルで、同じ報告の再送がそれを再利用して先へ進む (ended_at も台帳のものを card・record に使う)
-    ended_at, history_detail = _record_ledger(txn, slug, tid, meta, out, body_out, caller, end_code=end_code, now=now)
+    ended_at, history_detail, ledger_reused = _record_ledger(txn, slug, tid, meta, out, body_out, caller,
+                                                             end_code=end_code, now=now)
+    if ledger_reused and out.get('completed_at') is not None and updates.get('completed_at') is not None:
+        out['completed_at'] = ended_at      # 孤児の再送: card の完了時刻も台帳・record と同じ値 (設計 §3.2-2。再送の now は使わない)
     txn.write_card(slug, tid, out, body_out)                    # 終了コードも status と同じ書き込みに入る (コミット点)
     _write_record(txn, slug, tid, out, ended_at=ended_at)
     if retire_slot and owner is not None:

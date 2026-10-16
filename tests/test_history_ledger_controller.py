@@ -218,6 +218,23 @@ def test_resend_after_an_orphan_ledger_adds_no_file_and_keeps_ended_at_everywher
     assert pathlib.Path(ledger_dir(q), name).read_bytes() == before       # 書き直さない
     assert h.read_meta(q)["status"] == "done"
     assert h.read_record(q, xid)["ended_at"] == T1                        # record も台帳の ended_at (再送の now ではない)
+    assert h.read_meta(q)["completed_at"] == T1                           # card の完了時刻も同じ (t021 F1。再送の now = T2 ではない)
+
+
+def test_a_first_report_keeps_the_callers_completed_at(q):
+    """孤児が無い通常の報告では、plan.sh が渡した completed_at をそのまま使う (上書きは台帳を再利用したときだけ)。"""
+    xid = h.reserve_and_start(q, factory=h.ids()).execution_id
+    done(q, xid)
+    assert h.read_meta(q)["completed_at"] == "2026-10-16T00:00:00Z"
+
+
+def test_resend_without_completed_at_does_not_invent_one(q):
+    xid = h.reserve_and_start(q, factory=h.ids()).execution_id
+    orphan_by_failing_card_write(q, xid)
+    with h.tx(q, op="done") as t:
+        ctl.complete_execution(t, MISSION, TID, h.caller(xid), to_status="done", body=result_body("RESULT-A"), now=T2,
+                               result_replaced=True)
+    assert h.read_meta(q).get("completed_at") in (None, "")
 
 
 def test_resend_with_a_different_result_is_refused_and_writes_nothing_but_the_audit_row(q):
@@ -393,3 +410,77 @@ def test_kill_at_every_write_then_resend_converges_to_one_ledger_file(tmp_path):
         assert rec is not None and rec["ended_at"] == expected, (k, rec)      # 無条件: 台帳から戻る (card の後の crash でも)
         assert h.read_meta(q)["status"] == "done"
     assert survived_with_orphan >= 1                                      # 孤児の点を 1 つ以上確かめた
+
+
+# ---------------------------------------------------------------------------
+# 台帳の reason (Codex 2 巡目 P2): 報告の種類ごとの出どころ・再送の比較・長文の扱い
+# ---------------------------------------------------------------------------
+
+def test_needs_director_records_its_reason(q):
+    xid = h.reserve_and_start(q, factory=h.ids()).execution_id
+    with h.tx(q, op="nd") as t:
+        ctl.fail_execution(t, MISSION, TID, h.caller(xid), ex.NEEDS_DIRECTOR, to_status="needs_director",
+                           meta_updates={"needs_director_reason": "判断が要る"}, now=T1)
+    assert only_ledger(q)[1]["reason"] == "判断が要る"
+
+
+def test_worker_fail_records_the_waiver_and_handoff_presence(q):
+    xid = h.reserve_and_start(q, factory=h.ids()).execution_id
+    with h.tx(q, op="fail") as t:
+        ctl.fail_execution(t, MISSION, TID, h.caller(xid), ex.WORKER_FAILED, to_status="failed",
+                           meta_updates={"fail_head_waiver": "no commit", "handoff_path": "/tmp/handoff.md"},
+                           body=result_body("FAILED"), now=T1, result_replaced=True)
+    assert only_ledger(q)[1]["reason"] == "no-head: no commit; handoff: yes"
+
+
+def test_done_and_reset_have_no_reason(q):
+    xid = h.reserve_and_start(q, factory=h.ids()).execution_id
+    done(q, xid)
+    assert "reason" not in only_ledger(q)[1]
+
+
+def test_retire_to_pending_ignores_a_stale_needs_director_reason(q):
+    xid = h.reserve_and_start(q, factory=h.ids()).execution_id
+    with h.tx(q, op="seed") as t:
+        meta, body = t.load_card(MISSION, TID)
+        meta["needs_director_reason"] = "OLD-STALE"
+        t.write_card(MISSION, TID, meta, body)
+    with h.tx(q, op="retire") as t:
+        ctl.fail_execution(t, MISSION, TID, h.caller(xid), ex.RETIRED, to_status="pending", now=T1)
+    name = ledger_files(q)[0]
+    assert "OLD-STALE" not in pathlib.Path(ledger_dir(q), name).read_text()
+
+
+def test_retire_to_needs_director_records_the_reason(q):
+    xid = h.reserve_and_start(q, factory=h.ids()).execution_id
+    with h.tx(q, op="retire") as t:
+        ctl.fail_execution(t, MISSION, TID, h.caller(xid), ex.RETIRED, to_status="needs_director",
+                           meta_updates={"needs_director_reason": "退役の理由"}, now=T1)
+    assert only_ledger(q)[1]["reason"] == "退役の理由"
+
+
+def test_resend_with_a_changed_reason_is_a_mismatch_naming_only_the_field(q):
+    xid = h.reserve_and_start(q, factory=h.ids()).execution_id
+    with pytest.raises(RuntimeError, match="boom"):
+        with h.tx(q, op="nd") as t:
+            def boom(*a, **k):
+                raise RuntimeError("boom")
+            t.write_card = boom
+            ctl.fail_execution(t, MISSION, TID, h.caller(xid), ex.NEEDS_DIRECTOR, to_status="needs_director",
+                               meta_updates={"needs_director_reason": "REASON-A"}, now=T1)
+    before = h.snapshot(q)
+    with h.tx(q, op="nd") as t:
+        e = h.raises_code(ex.HISTORY_MISMATCH, ctl.fail_execution, t, MISSION, TID, h.caller(xid), ex.NEEDS_DIRECTOR,
+                          to_status="needs_director", meta_updates={"needs_director_reason": f"REASON-B {SECRET}"},
+                          now=T2)
+    assert "reason" in e.message and SECRET not in e.message and "REASON-A" not in e.message
+    assert h.snapshot(q) == before
+
+
+def test_a_long_multiline_reason_is_folded_and_cut(q):
+    xid = h.reserve_and_start(q, factory=h.ids()).execution_id
+    with h.tx(q, op="nd") as t:
+        ctl.fail_execution(t, MISSION, TID, h.caller(xid), ex.NEEDS_DIRECTOR, to_status="needs_director",
+                           meta_updates={"needs_director_reason": ("あ\n" * 500)}, now=T1)
+    reason = only_ledger(q)[1]["reason"]
+    assert "\n" not in reason and len(reason) <= 200

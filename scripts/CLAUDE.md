@@ -125,7 +125,10 @@ lib ごとの**破ってはいけない契約**の要約。理由・経緯・全
   台帳の本文に Result を入れるのは帰属 == 閉じる試行のときだけ（`result: recorded`）。欄が無い card は `result: unattributed`、別の試行のものは `none`。
   Result 節の切り出しは `lib_history.result_section`（plan.sh の `parse_task_body` と同じ読み方。一致は `tests/test_history_ledger_plan_sh.py`）。
 - **再送の冪等**: 同定キー (`execution_id`, `kind`, `reopen_count`)。既存を見つけたら `seq4` と `ended_at` を再利用し、card・record の `ended_at` にも同じ値を渡す。
-  比べる欄は `ended_at` 以外全部（`actor` / `worker` / `head` / `pr_number` / 本文を含む）。違えば `HISTORY_MISMATCH`、同じキーが 2 つ以上なら `HISTORY_AMBIGUOUS`
+  再利用したときは card の `completed_at`（plan.sh が `now_iso()` で入れた値）も台帳の `ended_at` で上書きする（再送の now を使わない）。
+  `reason` は報告の種類ごと（`_ledger_reason`）: needs-director = `needs_director_reason` / fail = `--no-head` の理由 + handoff の有無 / retire = needs_director に倒したときだけ / それ以外は無し。
+  1 行に畳んで 200 字で切る。
+  比べる欄は `ended_at` 以外全部（`actor` / `worker` / `head` / `pr_number` / `reason` / 本文を含む）。違えば `HISTORY_MISMATCH`、同じキーが 2 つ以上なら `HISTORY_AMBIGUOUS`
   （どちらも exit 3・card を書かない・欄の名前だけ・拒否の行は監査ログ）。出口は「同じ報告を送り直す」だけ（孤児を差し替える手段は無い。§8）。
 - 台帳が読めない・書けないと遷移は止まる（`STATE_INVALID` / `StoreWriteError` → exit 1）。**retire だけは閉じる**（食い違いでも。警告 + 監査の `detail=history_unwritten`。
   「退役が止まると誰も窓を閉じない」`knowledge/daemon-authority.md` §5）。done の D1 / D2（pr_number の伝播）は D3 より前に書くため、D3 で台帳の食い違いに当たっても

@@ -1325,7 +1325,10 @@ def _reopen_cascade(txn, slug, tid, *, reason, over_cap, default_max_attempts, n
             reopened.append(d)
     already = [d for d in closure if marked.get(d) is not None and d not in done_set and d not in reset_set]
     unreleased = []
-    gone = {tid} | set(work)             # pending に戻した task (I と cascade で戻した下流) の解除は根拠が消える (また failed になっても自動で通さない)
+    # pending に戻した task の解除は根拠が消える (また failed になっても自動で通さない)。I・この実行で戻した下流 (work)・**前の実行で
+    # 戻した下流 (already)**。already を入れないと、A を pending に戻した後・R の released_deps から A を消す前に止まった再実行で
+    # R の古い release が残る (A が次の試行で failed になると R が古い release で自動で走る)
+    gone = {tid} | set(work) | set(already)
     for d in closure:
         card, card_body = _load(txn, slug, d)
         released = card.get('released_deps')

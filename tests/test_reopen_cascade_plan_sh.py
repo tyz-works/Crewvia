@@ -964,3 +964,100 @@ def test_rerun_converges_when_the_window_r_finished_and_a_was_not_yet_written(tm
         _assert_completes_only_in_order(box)
         break
     assert seen_a_pending
+
+
+# ---------------------------------------------------------------------------
+# 再実行 (roll forward) の「前の実行で済んだ task (already)」を、後の段が全部正しく扱うか (PR-F fix 3)
+#
+# 書き込みの段ごとの表 (`_reopen_cascade` の「書く」以降):
+#   段                              | already の扱い
+#   下流の台帳 → card (work)        | work に入らない (done_set / reset_set でないので reopen_count を足さない)
+#   released_deps の掃除 (gone)     | **gone に入れる** (入れないと R の古い release が残る = 今回の P1)
+#   I の card (最後・完了の印)      | root の reopen_count は reuse で二重に増えない
+#   mission の再活性化 (before_write)| 検査の後・最初の書き込み。再実行でも同じ点で戻す
+#   出力の件数 (reopened/already)   | already に数える (reopened に数えない)・resumed=True
+#   stale / stale_runnable          | chosen = reopened ∪ reset ∪ already (戻した task を stale に数えない)
+#   上限の検査 (_over_cap)          | done_set・reset_set だけ (already は pending で上限の対象外)
+# ---------------------------------------------------------------------------
+
+def _state(box, tids):
+    mfile = box.queue / "missions" / MISSION / "mission.yaml"
+    m = "done" if "status: done" in mfile.read_text() else "active"
+    out = {"mission": m}
+    for t in tids:
+        c = box.card(t)
+        out[t] = (c["status"], c.get("reopen_count") or 0, tuple(c.get("released_deps") or ()),
+                  tuple(sorted(n.split("-")[1] for n in ledger_files(box, t))))
+    return out
+
+
+def _released_matrix_box(tmp_path, r_state, name):
+    """I(t001, done) → A(t002, code, done) → R(t003, review)。R は A の release を持つ (A がかつて failed で解除された名残)。"""
+    box = build(tmp_path, CHAIN, name=name)
+    finish_all(box, ("t001", "t002"))
+    if r_state == "done":
+        finish(box, "t003")
+    set_card(box, "t003", released_deps=["t002"])
+    mfile = box.queue / "missions" / MISSION / "mission.yaml"
+    mfile.write_text(mfile.read_text().replace("status: in_progress", "status: done"))
+    return box
+
+
+@pytest.mark.parametrize("r_state", ["pending", "done"])
+def test_kill_at_every_write_then_rerun_ends_in_the_same_state_as_one_clean_run(tmp_path, r_state):
+    tids = ("t001", "t002", "t003")
+    argv = ["t001", "--mission", MISSION, "--reason", REASON, "--branch", "reuse"]
+    box = _released_matrix_box(tmp_path, r_state, "golden")
+    saved = tmp_path / "matrix-saved"
+    shutil.copytree(box.queue, saved)
+    assert reopen(box).returncode == 0
+    golden = _state(box, tids)
+    assert golden["t002"][0] == "pending" and "t002" not in golden["t003"][2], golden       # 前提: 1 回の実行で掃除される
+    assert golden["mission"] == "active"
+    killed_points = 0
+    cleanup_window_seen = False
+    for k in range(1, 400):
+        _restore(box, saved)
+        killed, calls = _fork_reopen(box, argv, k)
+        if not killed:
+            break
+        killed_points += 1
+        mid = _state(box, tids)
+        if mid["t002"][0] == "pending" and "t002" in mid["t003"][2]:
+            cleanup_window_seen = True                       # A は戻ったが R の release が残っている窓
+        p = reopen(box)
+        if p.returncode == 3:                                # kill が I の card の後ろ = 既に完了していた
+            assert last_error_code(p.stderr) == "NOT_REOPENABLE", (k, p.stderr)
+        else:
+            assert p.returncode == 0, (k, p.stderr)
+        assert _state(box, tids) == golden, (k, mid)
+    assert killed_points >= 8 and cleanup_window_seen, (killed_points, cleanup_window_seen)
+
+
+def test_a_stale_release_left_by_a_stop_before_the_cleanup_does_not_run_r_when_a_fails_again(tmp_path):
+    argv = ["t001", "--mission", MISSION, "--reason", REASON, "--branch", "reuse"]
+    box = _released_matrix_box(tmp_path, "pending", "failcase")
+    saved = tmp_path / "failcase-saved"
+    shutil.copytree(box.queue, saved)
+    tested = False
+    for k in range(1, 400):
+        _restore(box, saved)
+        killed, _calls = _fork_reopen(box, argv, k)
+        if not killed:
+            break
+        st = _state(box, ("t002", "t003"))
+        if not (st["t002"][0] == "pending" and "t002" in st["t003"][2]):
+            continue
+        tested = True
+        assert reopen(box).returncode == 0                                  # 再実行 (roll forward)
+        assert "released_deps" not in box.card("t003")                      # R の古い release が消えている
+        finish(box, "t001")
+        p = box.pull("Ren", "t002", skills=SKILLS)
+        assert p.returncode == 0, p.stderr
+        xid = json.loads(p.stdout)["execution_id"]
+        f = run(box, "fail", "t002", "--mission", MISSION, "--no-head", "テスト", "--execution", xid, agent="Ren")
+        assert f.returncode == 0, f.stderr
+        assert status(box, "t002") == "failed"
+        assert box.pull("Mika", "t003", skills=SKILLS).returncode != 0, "A の失敗が古い release で素通りした"
+        break
+    assert tested

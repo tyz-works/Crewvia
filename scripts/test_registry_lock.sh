@@ -152,6 +152,11 @@ exclude = {
     # (registry を書く側のテストは lib_registry.write / assign-name.sh を**通して**書き、
     # 通さない書き込みは tests/test_queue_writes_go_through_the_store.py が見る)。
     root / "tests" / "test_s5_writers_lock_and_atomic.py",
+    # PR #292 (t002 項目 5) の pull 早期拒否テスト。`_director_registry` の `write_text` は
+    # `Box(tmp_path / "root")` の `box.root / "registry" / "workers.yaml"` に role: director の
+    # Worker を 1 人書くだけ。書き込み先は pytest の使い捨てツリーに閉じ、repo の
+    # registry/workers.yaml に書く経路は存在しない。
+    root / "tests" / "test_pull_early_refusals_write_nothing.py",
 }
 proximity = 15
 found = []

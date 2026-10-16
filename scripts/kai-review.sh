@@ -95,11 +95,21 @@ DRY_RUN=0    # F6: plan.sh への書き込み (pull/done/needs-director) を一�
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --pr)         PR_NUM="$2";       shift 2 ;;
-    --task)       TASK_ID="$2";      shift 2 ;;
-    --mission)    MISSION_SLUG="$2"; shift 2 ;;
-    --model)      MODEL="$2";        shift 2 ;;
-    --agent)      AGENT="$2";        shift 2 ;;
+    # 値の取る option は、値が無い・次のオプション (`-` 始まり) のときに次の語を値として食わない
+    # (`--task --mission x` で TASK=--mission にならない)。使い方の誤りとして exit 1 (副作用の前。--execution と同じ)
+    --pr|--task|--mission|--model|--agent)
+      if [[ $# -lt 2 || "$2" == -* ]]; then
+        _error "$1 には値が要ります (値が無い、または次のオプション ${2:-} が続いています)"
+        exit 1
+      fi
+      case "$1" in
+        --pr)      PR_NUM="$2" ;;
+        --task)    TASK_ID="$2" ;;
+        --mission) MISSION_SLUG="$2" ;;
+        --model)   MODEL="$2" ;;
+        --agent)   AGENT="$2" ;;
+      esac
+      shift 2 ;;
     --skip-pull)  SKIP_PULL=1;       shift 1 ;;
     # 値が無い・次のオプション (`-` 始まり) のときは値を食わない (`--execution --dry-run` で --dry-run を失わない)。
     # 空のまま下の検査が拒否する

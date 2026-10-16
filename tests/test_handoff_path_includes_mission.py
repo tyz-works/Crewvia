@@ -75,3 +75,49 @@ def test_fail_accepts_new_and_old_path_handoffs(sb):  # noqa: F811
     r = sb.run("fail", "t001", str(old), "--head", sb.new_head, "--mission", MISSION)
     assert r.returncode == 0, r.stderr
     assert f"handoff_path: {old}" in sb.card()
+
+
+def _worker_md_handoff_snippet():
+    """agents/worker.md の Handoff 手順 Step 2 の bash ブロックをそのまま取り出す。"""
+    text = (REPO_ROOT / "agents" / "worker.md").read_text()
+    step = text.split("**Step 2**: HANDOFF.md を作成する", 1)[1]
+    block = step.split("```bash\n", 1)[1].split("\n```", 1)[0]
+    assert "crewvia_handoff_path" in block
+    return block
+
+
+def _run_snippet(env_extra):
+    block = _worker_md_handoff_snippet()
+    env = {
+        "PATH": "/usr/bin:/bin",
+        "CREWVIA_REPO": str(REPO_ROOT),
+        "CREWVIA_REPO_ROOT": str(REPO_ROOT),
+        "AGENT_NAME": "Ingrid",
+        "TASK_ID": "t022",
+        **env_extra,
+    }
+    # nounset: .crewvia-env を source しない target_dir の task と同じ条件
+    return subprocess.run(
+        ["bash", "-c", "set -u\n" + block + '\necho "$HANDOFF_PATH"'],
+        capture_output=True, text=True, env=env,
+    )
+
+
+def test_worker_md_handoff_uses_pull_mission_not_crewvia_env_var():
+    # target_dir の task: CREWVIA_MISSION_SLUG 未設定でも pull 由来の TASK_MISSION で動く
+    r = _run_snippet({"TASK_MISSION": "m-now"})
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip().endswith("/registry/handoffs/Ingrid/m-now/t022_HANDOFF.md")
+
+
+def test_worker_md_handoff_ignores_stale_crewvia_mission_slug():
+    # 前の task の値が残っていても、別 mission の下には書かない
+    r = _run_snippet({"TASK_MISSION": "m-now", "CREWVIA_MISSION_SLUG": "m-stale"})
+    assert r.returncode == 0, r.stderr
+    assert "/m-now/" in r.stdout and "m-stale" not in r.stdout
+
+
+def test_worker_md_handoff_stops_when_task_mission_unset():
+    r = _run_snippet({"CREWVIA_MISSION_SLUG": "m-stale"})
+    assert r.returncode != 0
+    assert "m-stale" not in r.stdout

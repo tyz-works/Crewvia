@@ -525,6 +525,7 @@ TASK_META_KEY_ORDER = [
     'handoff_path', 'fail_head', 'fail_head_waiver', 'pr_number', 'no_pr_waiver', 'deliverable',
     'acceptance_criteria', 'verification', 'rework_count', 'max_rework',
     'qa_checkpoints', 'required_evidence', 'needs_director_reason',
+    'result_execution_id',                     # vNext 02 PR-D: card の Result 節を最後に置き換えた試行 (台帳の帰属。§3.2)
 ]
 
 MISSION_KEY_ORDER = ['title', 'slug', 'status', 'created_at', 'completed_at', 'next_task_id',
@@ -601,6 +602,23 @@ def _dump_inline(val):
 def serialize_card(meta, body):
     yaml_text = dump_yaml(meta, key_order=TASK_META_KEY_ORDER)
     if not body.endswith('\n'):
+        body = body + '\n'
+    return f"---\n{yaml_text}---\n\n{body}"
+
+
+#: 台帳 (`history/tNNN/`) 1 件の名前 `<seq4>-<kind>-<execution_id>.md`。kind の語彙の定義は `lib_history.KINDS`
+#: (lib_history がこの正規表現を import する。書く入口がここなので、名前の形の検査もここ)。
+HISTORY_NAME_RE = re.compile(r'(\d{4,})-(end|reset|retire|retry|reopen)-(ex-[0-9a-f]{32})\.md')
+HISTORY_DIRNAME = 'history'
+_HISTORY_KEY_ORDER = ['execution_id', 'attempt', 'kind', 'end_code', 'ended_at', 'reopen_count', 'head', 'pr_number',
+                      'worker', 'actor', 'reason', 'checkpoint_dir', 'result']
+
+
+def serialize_history(meta, body):
+    """台帳 1 件の text (frontmatter + 本文)。card と同じ直列化 (`dump_yaml`) で、本文の末尾を改行にそろえる。"""
+    yaml_text = dump_yaml(meta, key_order=_HISTORY_KEY_ORDER)
+    body = body or ''
+    if body and not body.endswith('\n'):
         body = body + '\n'
     return f"---\n{yaml_text}---\n\n{body}"
 
@@ -919,6 +937,30 @@ def read_execution_record(queue_dir, slug, execution_id):
     return ('ok', data)
 
 
+def history_dir(queue_dir, slug, tid):
+    """`queue/missions/<slug>/history/<tid>/` (台帳。vNext 02 PR-D)。"""
+    return os.path.join(os.fspath(queue_dir), 'missions', _check_slug(slug), HISTORY_DIRNAME, _check_tid(tid))
+
+
+def list_history(queue_dir, slug, tid):
+    """ロックなしで台帳の名前を列挙する (`('ok', [名前])` / `('unreadable', 固定コード)`)。**ENOENT だけ**「まだ無い」=
+    空。それ以外の失敗は空に潰さない。台帳の名前の形でないもの (tmp の残骸等) も含めて返す (判定は呼び出し側)。"""
+    names, code = _list_dir(history_dir(queue_dir, slug, tid))
+    return ('unreadable', code) if code else ('ok', names)
+
+
+def read_history(queue_dir, slug, tid, name):
+    """台帳 1 件の text。`('absent',)` (ENOENT だけ) / `('unreadable', 固定コード)` / `('ok', text)`。"""
+    if not HISTORY_NAME_RE.fullmatch(name if isinstance(name, str) else ''):
+        raise InvalidName("invalid history file name (値は出さない)")
+    text = _cards.read_regular_text_or_unreadable(os.path.join(history_dir(queue_dir, slug, tid), name))
+    if _cards.is_missing(text):
+        return ('absent',)
+    if _cards.is_unreadable(text):
+        return ('unreadable', _unreadable_code(text))
+    return ('ok', text)
+
+
 class Txn:
     """`transaction()` が渡す。**書き込みはステージしない** — 呼び出し側が書いた順に、その場で
     atomic に書く (設計 §3.2。順序の規則そのものが crash モデルなので、書く順を保つ)。"""
@@ -1103,6 +1145,27 @@ class Txn:
         """record を原子的に書く (card の後・assignment の前。呼び出し側が順序を守る)。"""
         self._write(self.execution_record_path(slug, execution_id),
                     json.dumps(record, ensure_ascii=False, sort_keys=True, indent=2) + '\n')
+
+    # ---- 台帳 (history。vNext 02 PR-D。正本ではない記録 — card がコミット点で、台帳は card より先に書く) ----
+    def history_path(self, slug, tid, name):
+        if not HISTORY_NAME_RE.fullmatch(name if isinstance(name, str) else ''):
+            raise InvalidName("invalid history file name (値は出さない)")
+        return os.path.join(history_dir(self.queue_dir, slug, tid), name)
+
+    def list_history(self, slug, tid):
+        return list_history(self.queue_dir, slug, tid)
+
+    def read_history(self, slug, tid, name):
+        return read_history(self.queue_dir, slug, tid, name)
+
+    def write_history(self, slug, tid, name, text):
+        """台帳に 1 ファイル足す (**既存を上書きも追記もしない**: 在る / 見えないなら `AlreadyExists`)。
+        呼び出し側 (Controller の `_finish`) がロックの中で card の書き込みの**直前**に呼ぶ。"""
+        path = self.history_path(slug, tid, name)
+        state = _path_state(path)
+        if state != 'absent':
+            raise AlreadyExists(self._rel(path), state)
+        self._write(path, text)
 
     # ---- assignment (projection) ------------------------------------------
     def publish_assignment(self, agent, slug, tid, generation, execution_id=None):
@@ -1503,13 +1566,15 @@ class _Recovery:
         if _ex.record_problem(record, meta, slug, tid):
             self._emit('reported:execution_record_identity_mismatch', slug, tid)
             return
-        if _ex.record_follows_card(record, meta):
+        import lib_history as _hist          # 遅延 import (lib_history が lib_state_store を import する)
+        ended_at = _hist.missing_record_ended_at(self.t.queue_dir, slug, tid, record, meta)
+        if _ex.record_follows_card(record, meta) and ended_at is None:
             return
         if not self.apply:
             # store-check: 名指しされない card の record が遅れたまま残る (execution.md §9.5 表外 3)。数えるだけ。
             self._emit('reported:execution_record_stale', slug, tid)
             return
-        updated = _ex.follow_card(record, meta)
+        updated = _ex.follow_card(record, meta, ended_at=ended_at)       # ended_at は台帳にあるときだけ戻す
         files = self._do_writes(lambda: self.t.write_execution_record(slug, xid, updated))
         self._emit('repaired:R-5', slug, tid, files=files,
                    from_status=meta.get('status'), to_status=meta.get('status'), execution_id=xid)

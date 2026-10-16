@@ -248,10 +248,18 @@ Codex の往復は 3 巡で打ち切った (PR #301 の t002)。以下は実装 
   - 直し方の方向（未決）: (a) `skipped` も経路上なら無効化の対象にする。(b) 経路上に `skipped` の task がある reopen を拒否する。Director の推奨は (b) 拒否（`skipped` は Director が意図して飛ばした task なので、勝手に開けない）。
   - 解く PR: F。網羅テストに入れるケース: I → A(`skipped`) → R(`done`)、`skipped` が経路の途中・末端・複数本の経路の片方にある形、`--cascade none|reviews|all` それぞれ、拒否の場合は何も書かれない（`reopen_count` も増えない）こと。
 - **Result の帰属を `new_body` の有無で判定すると、古い Result が現在の試行に再帰属される**（Codex 3 巡目 P2。実装 PR D）。
+  - **PR-D（t019）で解いた**: `result_replaced` を Controller の明示の引数にし（plan.sh の done / fail だけが渡す）、`verify-result` は渡さない。needs-director は `## Result` 節を置き換えない
+    （理由は frontmatter と `## Needs-Director 詳細`）ので渡さない — 設計の「done / fail / needs-director の --result-file」のうち、実際に Result 節を組み直すのは done / fail だけ。
+    網羅テスト: `tests/test_history_ledger_controller.py` / `tests/test_history_ledger_plan_sh.py`。以下は解く前の記述。
   - 漏れている状態: `verify-result` は既存の本文に Verification 節を足した `body_new` を渡す。帰属を「`new_body` があるか」で決めると、Result 節を置き換えていないこの呼び出しでも、既存の（古い）Result が現在の試行のものとして台帳に書かれる。
   - 起きる害: 台帳の Result と試行（`execution_id`）の対応が崩れ、前の試行の Result が今の試行の結果として `previous_attempt` や監査に出る。
   - 直し方の方向（未決）: 帰属を更新するのは Result 節を実際に置き換えた呼び出し（`done` / `fail` / `needs-director` の `--result-file`）だけ、と明示の引数で指定する（`new_body` の有無から推測しない）。
   - 解く PR: D。網羅テストに入れるケース: `verify-result` だけを呼んだ後の台帳の帰属が変わらないこと、`done` / `fail` / `needs-director` の `--result-file` ありとなし、Result 節を置き換えず本文の別の節だけを足す呼び出し、同じ報告の再送。
+- **別の遷移で閉じた試行の孤児が store-check に報告されない**（Codex 3 巡目 P2。PR-D の `lib_history.py:411-417`。解く PR は E か F、または store-check の単独 PR）。
+  - 漏れている状態: 孤児（台帳に DONE があるのに card が追いついていない試行）の検出は、current execution が active の間しか走らない。`done` が台帳だけ書いて card の前に落ち、その後 `reset` / `retire` が同じ試行を別の kind で閉じると、台帳には DONE が残るのに終端の試行は検出の対象外になり、store-check が何も報告しない。
+  - 起きる害: 台帳に「起きていない完了」が残り、`previous_attempt` や監査がそれを読む。診断（孤児の報告）は出ない。card と record は正しいので、実行時の動作は壊れず、見えない食い違いだけが残る。
+  - 直し方の方向（未決）: active でない（終端の）試行でも、台帳とコミット済みの遷移を突き合わせ、遷移の kind と台帳の DONE が食い違うものを孤児として報告する。
+  - 網羅テストに入れるケース: `done` が台帳だけ書いて落ちた後に `reset` で閉じる / `retire` で閉じる / 何も閉じない（active のまま）、それぞれで store-check が孤児を報告するか。閉じた kind が `done` のときは報告しないこと（偽陽性なし）。同じ試行を 2 回報告しないこと。報告は読み取りだけで台帳・card・record を書かないこと。
 - 実装の PR（D・F）の QA で確かめること: (1) cascade を各書き込みの後で kill して再実行し、`cascade-incomplete` が出て再実行で消えること・`reopen_count` が二重に増えないこと。(2) 孤児の台帳を作ってから同じ報告を送り直すと、新しいファイルが増えず `ended_at` が台帳と card・record で一致すること。(3) 孤児の台帳のあとに違う Result で送ると `HISTORY_MISMATCH` で card が書かれないこと（この拒否のあとの出口が「同じ報告を送り直す」だけでよいかは、運用で足りなければ孤児の差し替えを別に設計する）。
 - 範囲外として残したこと: Verifier の運用と、その verify pass が依存先の変更を見る検査（PR-J）。`update --status` の Controller 化（P0 の残り）。回復を dispatcher が起こす・待つ（P0 の残り）。
 - 確かめていないこと: mission の戻し先 `in_progress` が lint / dispatcher で想定どおりか（PR-A）。retry / reopen の後に `worktree_gc` で隔離済みの worktree を pull が作り直せるか（PR-E の QA）。reopen した codex-review task が、`registry/daemons/review-refusals/` の古い拒否記録で spawn されないことがあるか（記録は消してよい。`scripts/CLAUDE.md` の「通知・記録」）。`done` → `pending` を Taskvia が受け付けるか。

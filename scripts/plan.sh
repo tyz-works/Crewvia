@@ -96,6 +96,10 @@ set -euo pipefail
 #                              (読み取り専用・ロックを取らない)。ロックが無いので、途中のトランザクションを
 #                              1 回見うる: 2 回連続で出たものだけが本物。修復は次のロック取得時に
 #                              各コマンドが行う (R-1〜R-4)
+#   plan.sh history <task_id> [--mission <slug>]
+#                              試行の台帳 (queue/missions/<m>/history/<task_id>/) を seq 順に全部出す
+#                              (読み取り専用・ロックを取らない。読めないファイルは飛ばさず exit 1)。
+#                              1 遷移 = 1 ファイル。上書きも追記もしない (設計: knowledge/vnext-02-attempt-reopen-checkpoint.md §3.2)
 #   plan.sh pr-base [--mission <slug> --task <task_id>] [--diff-ref]
 #                              PR の base を 1 行出す (読み取り専用。決められなければ exit 1・stdout 空。詳細は cmd_pr_base)
 
@@ -104,7 +108,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 QUEUE_DIR="${CREWVIA_QUEUE:-${REPO_ROOT}/queue}"
 
 if [[ $# -eq 0 ]]; then
-  echo "Usage: plan.sh <init|add|pull|done|needs-director|fail|update|release-dep|retire|reap-orphan-assignment|ready-for-verification|verifying|snapshot|verify-result|review|launch|task-graph|lint|status|archive|resync|dashboard|dashboard-data|resolve-mission|store-check|pr-base> [args...]" >&2
+  echo "Usage: plan.sh <init|add|pull|done|needs-director|fail|update|release-dep|retire|reap-orphan-assignment|ready-for-verification|verifying|snapshot|verify-result|review|launch|task-graph|lint|status|archive|resync|dashboard|dashboard-data|resolve-mission|store-check|history|pr-base> [args...]" >&2
   exit 1
 fi
 
@@ -452,6 +456,9 @@ _GIT_POLICY = _import_scripts_module('lib_git_policy')
 # 呼び出し元は **pull だけ** (E2)。他のコマンドを移すのは E3 / E4 (どれも cutover = ユーザー承認の PR)。
 _EXEC = _import_scripts_module('lib_execution')
 _CONTROLLER = _import_scripts_module('lib_task_controller')
+# 試行の台帳 (queue/missions/<m>/history/tNNN/) の形と読み口は lib_history.py の 1 か所 (vNext 02 PR-D)。
+# 書くのは Controller の `_finish` だけ。plan.sh は `history` と `pull` の `previous_attempt` で読むだけ。
+_HISTORY = _import_scripts_module('lib_history')
 #: task-graph の生成物 (registry/task-graph/tasks.json。queue の外) を書く関数。plan.sh 自身は
 #: 書き込みの実装を持たない (同じ関数を別名で呼ぶだけ)。tests/task_graph_publisher_harness.py が
 #: この名前を差し替える。
@@ -937,7 +944,7 @@ QUEUE_MUTATING_SUBCOMMANDS = {
 #: queue を読むだけのサブコマンド = 生成を呼ばない経路。
 #: `task-graph` 自身もここ (queue は書き換えず、生成物だけを書く)。
 QUEUE_READONLY_SUBCOMMANDS = {
-    'lint', 'status', 'resync', 'dashboard-data', 'task-graph', 'resolve-mission', 'store-check', 'pr-base',
+    'lint', 'status', 'resync', 'dashboard-data', 'task-graph', 'resolve-mission', 'store-check', 'history', 'pr-base',
 }
 
 #: crewvia の status → (plugin の status, title に付ける印)。
@@ -2611,6 +2618,7 @@ USAGE = {
     'dashboard-data': 'plan.sh dashboard-data [--all]',
     'resolve-mission': 'plan.sh resolve-mission <task_id> [--mission <slug>]',
     'store-check': 'plan.sh store-check [--mission <slug>]',
+    'history': 'plan.sh history <task_id> [--mission <slug>]',
     'pr-base': 'plan.sh pr-base [--mission <slug> --task <task_id>] [--diff-ref]',
 }
 
@@ -2625,7 +2633,7 @@ POSITIONAL_ARITY = {
     'ready-for-verification': (1, 1), 'verifying': (1, 1), 'snapshot': (0, 1), 'verify-result': (2, 2),
     'review': (1, 1), 'launch': (1, 1), 'task-graph': (0, 0), 'lint': (0, 1),
     'status': (0, 0), 'archive': (1, 1), 'resync': (0, 1), 'dashboard-data': (0, 0),
-    'resolve-mission': (1, 1), 'store-check': (0, 0), 'pr-base': (0, 0),
+    'resolve-mission': (1, 1), 'store-check': (0, 0), 'history': (1, 1), 'pr-base': (0, 0),
 }
 
 #: 使い方の誤りの終了コード。`pull` だけは 1 — `pull` の 2 は「タスクなし (idle)」で、
@@ -3322,7 +3330,8 @@ def _execution_caller(opts):
 
 #: 何も書かずに終わる照合の拒否 (E5 PR-2。execution.md §20.5 の 6)。UsageExit で出して task-graph を再生成しない
 _NO_WRITE_REFUSALS = frozenset({
-    _EXEC.EXECUTION_NOT_FOUND, _EXEC.EXECUTION_NOT_CURRENT, _EXEC.EXECUTION_ALREADY_TERMINAL, _EXEC.EXECUTION_REQUIRED})
+    _EXEC.EXECUTION_NOT_FOUND, _EXEC.EXECUTION_NOT_CURRENT, _EXEC.EXECUTION_ALREADY_TERMINAL, _EXEC.EXECUTION_REQUIRED,
+    _EXEC.HISTORY_MISMATCH, _EXEC.HISTORY_AMBIGUOUS})
 
 
 def _controller_die(command, e):
@@ -4126,6 +4135,15 @@ def cmd_pull(args):
     chosen_holder[0]['worktree_path'] = worktree_path
     chosen_holder[0]['execution_id'] = execution_id
     chosen_holder[0]['attempt'] = execution_holder[0]['attempt']
+    # 前の試行の台帳の要約 (無ければ欄ごと省く)。読めない台帳は pull を止めず、黙りもしない (stderr に固定コードだけ)
+    try:
+        previous = _HISTORY.previous_attempt(_HISTORY.load_events(QUEUE_DIR, mission_slug, task_id), execution_id)
+    except (_HISTORY.HistoryUnreadable, _STORE.InvalidName) as e:
+        previous = None
+        print(f"[plan.sh pull] warn: {mission_slug}/{task_id}: 台帳を読めないので previous_attempt を出しません"
+              f" ({getattr(e, 'code', 'invalid_name')})", file=sys.stderr)
+    if previous is not None:
+        chosen_holder[0]['previous_attempt'] = previous
 
     # 名乗りの入手経路を pull の時点で見せる (Bash は呼び出しごとに env が消えるので、報告のたびに貼る形で言う。
     # stdout の JSON は変えない。execution.md §20.2)
@@ -4941,7 +4959,7 @@ def cmd_done(args):
         # 枠の撤去 (D4。card の worker の枠) も Controller の中 (card の後)。
         try:
             _CONTROLLER.complete_execution(_txn(), slug, task_id, caller, to_status='done',
-                                           meta_updates=done_updates, body=new_body)
+                                           meta_updates=done_updates, body=new_body, result_replaced=True)
         except _EXEC.ControllerError as e:
             _controller_die('done', e)
         worker_holder[0] = meta.get('worker') or ''  # capture worker for post-lock bump
@@ -5116,7 +5134,8 @@ def cmd_fail(args):
         )
         try:
             _CONTROLLER.fail_execution(_txn(), slug, task_id, caller, _EXEC.WORKER_FAILED, to_status='failed',
-                                       meta_updates=fail_updates, meta_remove=fail_remove, body=new_body)
+                                       meta_updates=fail_updates, meta_remove=fail_remove, body=new_body,
+                                       result_replaced=True)
         except _EXEC.ControllerError as e:
             _controller_die('fail', e)
         print(f"Failed: {slug}/{task_id}")
@@ -5166,6 +5185,10 @@ def cmd_store_check(args):
             unobservable=scope.unobservable,
         )
     findings = _STORE.diagnose(QUEUE_DIR, scope)
+    # 試行の台帳 (報告だけ。直さない): 孤児・同定キーの重複・読めない・card の無い台帳
+    history_slugs = (only,) if only else tuple(sorted({c[0] for c in scope.cards} | set(scope.add_missions)))
+    for kind, mission, task, detail in _HISTORY.diagnose(QUEUE_DIR, history_slugs):
+        findings.append(_STORE.Finding(kind, mission, task, None, detail))
     for f in findings:
         fields = [f.kind]
         for key in ('mission', 'task', 'agent'):
@@ -5182,6 +5205,35 @@ def cmd_store_check(args):
           + (f" — {', '.join(f'{k}={v}' for k, v in sorted(by_kind.items()))}" if findings else ""))
     print("  (ロックを取らずに読んでいます。途中のトランザクションを 1 回見うるので、"
           "2 回連続で出たものだけが本物です。何も書いていません)")
+
+
+def cmd_history(args):
+    """plan.sh history <task_id> [--mission <slug>]
+
+    試行の台帳 (`queue/missions/<m>/history/<task_id>/`。設計 §3.2) を seq 昇順で全部出す (読み取り専用・ロックなし)。
+    1 件 = `==> <ファイル名>` の行 + frontmatter + 本文 (その試行の Result)。台帳が無ければ何も出さず exit 0。
+    **読めない・解釈できない・名前と中身が食い違うファイルは飛ばさず** exit 1 (空に潰さない。固定コードとファイル名だけを出す)。
+    `--mission` を省略したときの mission は `resolve-mission` と同じ規則 (card を持つ最初の active mission)。
+    """
+    opts, positional = parse_opts(args, {'--mission': 'value'})
+    task_id = positional[0]
+    state = load_state()
+    slugs = mission_search_order(opts.get('--mission'), state)
+    slug = next((s for s in slugs if os.path.exists(task_path(s, task_id))), None)
+    if slug is None:
+        if not opts.get('--mission'):
+            die(f"task '{task_id}' not found in mission(s): {slugs}")
+        slug = opts['--mission']
+    try:
+        events = _HISTORY.load_events(QUEUE_DIR, slug, task_id)
+    except _STORE.InvalidName:
+        die(f"[plan.sh history] mission slug / task id の形が不正です")
+    except _HISTORY.HistoryUnreadable as e:
+        where = f" ({e.name})" if e.name else ''
+        die(f"[plan.sh history] {slug}/{task_id}: 台帳を読めません: {e.code}{where}。飛ばして続けません")
+    for event in events:
+        print(f"==> {event['name']}")
+        print(_HISTORY.format_event(event), end='')
 
 
 def cmd_status(args):
@@ -7184,6 +7236,7 @@ dispatch = {
     'dashboard-data': cmd_dashboard_data,
     'resolve-mission': cmd_resolve_mission,
     'store-check': cmd_store_check,
+    'history': cmd_history,
     'pr-base': cmd_pr_base,
 }
 

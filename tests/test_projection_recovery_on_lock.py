@@ -242,7 +242,7 @@ def seed_pr_chain(root, agent="Ren"):
     return box
 
 
-def sweep(base: pathlib.Path, seed_box: Box, argv, agent=None, max_points=60):
+def sweep(base: pathlib.Path, seed_box: Box, argv, agent=None, max_points=100):
     """k = 1, 2, ... の各点で `argv` を落とした状態の Box を順に返す (落ちなくなったら終わる)。
     戻り値は `[(k, box)]`。呼ばれた点の数の下限は呼び出し側が assert する。"""
     boxes = []

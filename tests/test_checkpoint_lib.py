@@ -507,3 +507,62 @@ def test_a_hung_git_is_cut_at_the_deadline_even_while_reading(wt, tmp_path, monk
         take(wt, tmp_path, seconds=1)
     assert e.value.code == ck.E_DEADLINE and time.monotonic() - t0 < 5
     assert not list((tmp_path / "registry").rglob("*.partial"))
+
+
+# ---------------------------------------------------------------- セキュリティレビュー 2 巡目 (PR #307)
+
+@pytest.mark.parametrize("text", [
+    r'{"password": "ab\"cd hunter2 tail"}',
+    r"{'token': 'ab\'cd hunter2 tail'}",
+    '"password": "hunter2 unterminated and long',
+    "SECRET='hunter2 unterminated",
+])
+def test_escaped_and_unterminated_quotes_do_not_leak_a_tail(text):
+    out, _ = ck.redact(text)
+    assert "hunter2" not in out and "tail" not in out and "unterminated" not in out and "cd" not in out.replace("REDACTED", "")
+
+
+def test_quote_forms_stay_linear_on_adversarial_input():
+    for line in ('PASSWORD="' + '\\"' * 500000, 'token="' * 100000, "secret='" + "\\" * 1000000):
+        t0 = time.monotonic()
+        ck.redact(line)
+        assert time.monotonic() - t0 < 5.0
+
+
+def test_a_filter_defined_through_include_or_worktree_config_is_refused(wt, tmp_path):
+    marker = tmp_path / "inc.marker"
+    script = tmp_path / "c.sh"
+    script.write_text(f"#!/bin/sh\ntouch '{marker}'\ncat\n")
+    script.chmod(0o755)
+    inc = tmp_path / "extra.cfg"
+    inc.write_text(f'[filter "evil"]\n\tclean = {script}\n')
+    (wt / ".gitattributes").write_text("*.flt filter=evil\n")
+    (wt / "x.flt").write_text("v1\n")
+    git(wt, "add", "-A")
+    git(wt, "commit", "-q", "-m", "flt")
+    git(wt, "config", "include.path", str(inc))
+    (wt / "x.flt").write_text("v2\n")
+    with pytest.raises(ck.CheckpointError) as e:
+        take(wt, tmp_path)
+    assert "local_filters" in str(e.value) and not marker.exists()
+    git(wt, "config", "--unset", "include.path")
+    git(wt, "config", "extensions.worktreeConfig", "true")
+    (wt / ".git" / "config.worktree").write_text(f'[filter "evil"]\n\tclean = {script}\n')
+    with pytest.raises(ck.CheckpointError) as e2:
+        take(wt, tmp_path)
+    assert "local_filters" in str(e2.value) and not marker.exists()
+
+
+def test_diff_and_status_do_not_descend_into_submodules(wt, tmp_path, monkeypatch):
+    calls = []
+    real = ck._run_git
+
+    def spy(clock, worktree, *args, **kw):
+        calls.append(args)
+        return real(clock, worktree, *args, **kw)
+
+    monkeypatch.setattr(ck, "_run_git", spy)
+    take(wt, tmp_path)
+    for verb in ("status", "diff"):
+        seen = [a for a in calls if a and a[0] == verb]
+        assert seen and all("--ignore-submodules=all" in a for a in seen), (verb, seen)

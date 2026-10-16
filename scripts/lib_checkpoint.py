@@ -115,7 +115,7 @@ _TOKEN_PATTERNS = (
 _BEARER = re.compile(r'(Bearer[ \t]{1,8})([A-Za-z0-9._~+/=-]{16,512})')
 _ASSIGN = re.compile(
     r'((?:TOKEN|SECRET|PASSWORD|PASSWD|API_KEY)[A-Za-z0-9_]{0,40}["\']?[ \t]{0,8}[=:][ \t]{0,8})'
-    r'("[^"\n]{1,1000}"|\'[^\'\n]{1,1000}\'|\S{1,1000})',
+    r'("(?:[^"\\\n]|\\.){0,1000}"|\'(?:[^\'\\\n]|\\.){0,1000}\'|["\'][^\n]{0,1000}|\S{1,1000})',
     re.IGNORECASE)
 
 
@@ -412,10 +412,10 @@ def _discard(path):
 
 
 def _refuse_local_filters(clock, worktree):
-    """repo ローカルの設定に `filter.<name>.*` (clean / smudge / process) があれば保存しない。`git diff` / `status` は index と
+    """repo の有効な設定 (ローカル・include・config.worktree。global / system は読まない) に `filter.<name>.*` (clean / smudge / process) があれば保存しない。`git diff` / `status` は index と
     比べるとき clean filter を**起動する**ので、読み取りだけという契約を守れない (`--no-textconv` は filter を止めない)。
     global / system の設定は環境変数で読まない。設定が読めない・コマンドが失敗しても `check=False` で「無い」と読まず止める。"""
-    rc, out, _ = _run_git(clock, worktree, 'config', '--local', '--get-regexp', r'^filter\.', check=False)
+    rc, out, _ = _run_git(clock, worktree, 'config', '--includes', '--get-regexp', r'^filter\.', check=False)
     if rc == 0 and out.strip():
         raise CheckpointError(E_GIT, 'local_filters')
     if rc not in (0, 1):                         # 1 = 該当なし。それ以外は観測できなかった
@@ -434,7 +434,8 @@ def _build(clock, out, worktree, mission, task, execution_id, reason, pane_text,
     head = head_raw.decode('ascii', errors='replace').strip() if head_rc == 0 else None
 
     # status.txt
-    status_raw, status_trunc = _git_text(clock, worktree, 'status', '--porcelain=v1', '-z', '--untracked-files=all')
+    status_raw, status_trunc = _git_text(clock, worktree, 'status', '--porcelain=v1', '-z', '--untracked-files=all',
+                                    '--ignore-submodules=all')
     dirty = bool(status_raw.strip('\x00'))
     saved, n = _save_text(out, 'status.txt', status_raw, limit=PATCH_LIMIT)
     redactions += n
@@ -442,7 +443,8 @@ def _build(clock, out, worktree, mission, task, execution_id, reason, pane_text,
     files['status'] = _file_info(saved, status_trunc)
 
     # dirty.patch
-    patch_raw, patch_trunc = _git_text(clock, worktree, 'diff', 'HEAD', '--no-ext-diff', '--no-textconv', '--no-color')
+    patch_raw, patch_trunc = _git_text(clock, worktree, 'diff', 'HEAD', '--no-ext-diff', '--no-textconv', '--no-color',
+                                    '--ignore-submodules=all')
     patch_raw, secret_dropped = _drop_secret_sections(patch_raw)
     saved, n = _save_text(out, 'dirty.patch', patch_raw, limit=PATCH_LIMIT) if patch_raw else (False, 0)
     redactions += n
@@ -455,7 +457,8 @@ def _build(clock, out, worktree, mission, task, execution_id, reason, pane_text,
     # binary-files.txt (tracked の変更 + untracked)
     binary_lines = []
     clock.check()
-    numstat, _ = _git_text(clock, worktree, 'diff', 'HEAD', '--numstat', '-z', '--no-ext-diff', '--no-textconv')
+    numstat, _ = _git_text(clock, worktree, 'diff', 'HEAD', '--numstat', '-z', '--no-ext-diff', '--no-textconv',
+                              '--ignore-submodules=all')
     secret_excluded = secret_dropped
     for path in _numstat_binary_paths(numstat):
         if is_secret_name(path):

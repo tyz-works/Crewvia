@@ -899,6 +899,10 @@ def reset_task(txn, slug, tid, caller=NO_CALLER, *, now=None, meta_updates=None,
     `meta_updates` は同じ card の書き込みに入れる他の欄 (`update --reset` の `completed_at = None`)。
     `ledger_extra` は台帳の reset に足す欄 (reopen の cascade が `reason` / `root` / `root_reopen_count` を渡す。PR-F)。
     """
+    if ledger_extra is not None:
+        ok = (isinstance(ledger_extra, dict) and set(ledger_extra) <= {'reason', 'root', 'root_reopen_count'})
+        if not ok:
+            raise _err(ex.INVALID_ARGUMENT, "ledger_extra は reason / root / root_reopen_count だけの dict", slug, tid)
     meta, body = _load(txn, slug, tid)
     view = _view(meta)
     if view == ex.ACTIVE and meta['execution_status'] == ex.RESERVED:

@@ -17,7 +17,7 @@ Controller の公開関数の全引数 (`inspect.signature` から導く。表�
 | complete_execution | caller / to_status / meta_updates / meta_remove / body / now / dry_run | `_check_caller` / 表 / `_check_updates` / `_check_updates` / `_check_body` / `_check_now` / (真偽。書くかどうかだけ) |
 | fail_execution | caller / failure_code / to_status / meta_updates / meta_remove / body / now / dry_run | 同上 + 表 |
 | release_execution | caller / reason_code / to_status / now / meta_updates / body | `_check_caller` / 表 / 表 / `_check_now` / `_check_updates` / `_check_body` |
-| reset_task | caller / now / meta_updates | `_check_caller` / `_check_now` / `_check_updates` |
+| reset_task | caller / now / meta_updates / ledger_extra | `_check_caller` / `_check_now` / `_check_updates` / 固定の 3 キーだけの dict |
 | abandon_detached_execution | now | `_check_now` |
 | mark_task | caller / command / to_status / meta_updates / meta_remove / body | `_check_caller` / 表 / 表 / `_check_updates` / `_check_updates` / `_check_body` |
 | get_execution | queue_dir / slug / execution_id | 形 (EXECUTION_NOT_FOUND / INVALID_ARGUMENT)。読むだけ |
@@ -46,7 +46,7 @@ _COVERED = {
     "fail_execution": {"txn", "slug", "tid", "caller", "failure_code", "to_status", "meta_updates", "meta_remove", "body",
                        "now", "dry_run", "result_replaced"},
     "release_execution": {"txn", "slug", "tid", "caller", "reason_code", "to_status", "now", "meta_updates", "body"},
-    "reset_task": {"txn", "slug", "tid", "caller", "now", "meta_updates"},
+    "reset_task": {"txn", "slug", "tid", "caller", "now", "meta_updates", "ledger_extra"},
     "abandon_detached_execution": {"txn", "slug", "tid", "now"},
     "mark_task": {"txn", "slug", "tid", "caller", "command", "to_status", "meta_updates", "meta_remove", "body"},
     "get_execution": {"queue_dir", "slug", "execution_id"},

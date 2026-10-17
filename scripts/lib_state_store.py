@@ -1197,6 +1197,19 @@ class Txn:
             raise AlreadyExists(self._rel(path), state)
         self._write(path, text)
 
+    def list_mission_card_ids(self, slug):
+        """mission の card の id を `('ok', ['t001', ...])` / `('unreadable', 固定コード)` で返す (名前の形が `tNNN.md` のものだけ。
+        **ENOENT だけ**「card が無い」= 空)。reopen の打ち直しが「今の mission 全体のグラフ」を作るための入口 (t065)。"""
+        names, code = _list_dir(os.path.dirname(self.card_path(slug, 't1')))
+        if code:
+            return ('unreadable', code)
+        out = []
+        for name in names:
+            m = _cards.TASK_FILENAME_RE.fullmatch(name)
+            if m:
+                out.append(f"t{m.group(1)}")
+        return ('ok', out)
+
     # ---- reopen の intent (決定の記録。vNext 02 PR-F / t059) ----------------------------------------
     def list_reopen_intents(self, slug):
         return list_reopen_intents(self.queue_dir, slug)

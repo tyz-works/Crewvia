@@ -1247,6 +1247,9 @@ def reopen_intent_blockers(txn, slug, intent):
     入口 (`_reopen_cascade`) の経路の拒否を、残りの対象に当て直す。止まっている間に許されている書き込み (retry / update --status /
     release-dep / 報告。§4.3.1 の表) で経路上の中間が変わると、一覧どおりに実行しても I の再完了を待たずに走れる下流が残るため。
     経路 = I から「一覧の task ∪ 今の cascade の終点」への依存の経路 (`_reopen_targets` / `dep.path_closure`。入口と同じ定義)。
+    **グラフは今の mission の全 card から作る** (t065。保存した closure だけだと、止まっている間に依存が付け替えられたとき新しい中間が
+    経路に現れない)。終点と一覧は intent のまま (新しい下流を推測で足さない)。mission の card が 1 枚でも読めなければ `REOPEN_INTENT_INCOMPLETE`
+    (入口の `CASCADE_UNREADABLE_CARDS` と同じ: 読めない card は依存の辺を隠す)。
 
     | 経路上の task の今の status | 打ち直し |
     |---|---|
@@ -1261,7 +1264,13 @@ def reopen_intent_blockers(txn, slug, intent):
     `plan.sh reopen` を再実行する (または他の queue を書くコマンド)。card が読めなければ `REOPEN_INTENT_INCOMPLETE`。
     """
     root = intent['root']
-    ids = list(dict.fromkeys([root, *intent['closure']]))
+    # 二重の網の 2 枚目 (t065): 経路は**今の mission の全 card から作ったグラフ**で調べる。保存した closure だけだと、止まっている間に
+    # 依存が付け替えられた (無関係な done の B を I に依存させ、R を B に依存させる) とき B が経路に現れず、B の古い結果の上で R が走る。
+    # 実行する一覧 (`tasks`) と終点 (`targets`) は intent のまま固定する (新しい下流を推測で足さない)。
+    all_ids = txn.list_mission_card_ids(slug)
+    if all_ids[0] != 'ok':
+        raise _intent_problem(slug, intent_name(root, intent['root_reopen_count']), all_ids[1])
+    ids = list(dict.fromkeys([root, *intent['closure'], *all_ids[1]]))
     cards = {d: _load_for_intent(txn, slug, d, intent) for d in ids}
     graph = {d: cards[d][0].get('blocked_by') for d in ids}
     closure = [d for d in intent['closure'] if d in cards]

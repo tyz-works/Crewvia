@@ -119,6 +119,7 @@ CASCADE_FAILED_ON_PATH = 'CASCADE_FAILED_ON_PATH'         # vNext 02 PR-F fix 2:
 CASCADE_NO_EXECUTION = 'CASCADE_NO_EXECUTION'             # vNext 02 PR-F: 戻す下流に試行の記録が無い card がある (台帳に写せない。exit 3・何も書かない)
 CASCADE_UNREADABLE_CARDS = 'CASCADE_UNREADABLE_CARDS'     # vNext 02 PR-F fix 4: mission に読めない・壊れた card がある (依存の辺が消えて下流の閉包が分からない。exit 3・何も書かない)
 MISSION_ARCHIVED = 'MISSION_ARCHIVED'       # vNext 02 PR-F: archive 済み mission の task は reopen しない (exit 3。新 mission に新 task を)
+REOPEN_INTENT_GRAPH_FROZEN = 'REOPEN_INTENT_GRAPH_FROZEN'  # vNext 02 PR-F intent fix 3 (t065): 未完の reopen の intent がある mission で、依存の形を変える書き込み (add / update --blocked-by / release-dep) を拒否する (exit 3・何も書かない。出口: 同じ reopen を再実行して完了させる)
 REOPEN_INTENT_INCOMPLETE = 'REOPEN_INTENT_INCOMPLETE'     # vNext 02 PR-F t059: 未完の reopen の intent を完了できない (読めない・壊れている・一覧の card が読めない)。その mission の pull を止める (exit 1・何も書かない)
 
 ERROR_CODES = frozenset({
@@ -127,7 +128,7 @@ ERROR_CODES = frozenset({
     GIT_POLICY_INVALID, INVALID_ARGUMENT, HISTORY_MISMATCH, HISTORY_AMBIGUOUS,
     ATTEMPT_ACTIVE, ATTEMPT_CAP, RETRY_NOT_ALLOWED,
     NOT_REOPENABLE, CASCADE_ACTIVE_DOWNSTREAM, CASCADE_SKIPPED_ON_PATH, CASCADE_FAILED_ON_PATH, CASCADE_NO_EXECUTION, CASCADE_UNREADABLE_CARDS, MISSION_ARCHIVED,
-    REOPEN_INTENT_INCOMPLETE,
+    REOPEN_INTENT_INCOMPLETE, REOPEN_INTENT_GRAPH_FROZEN,
 })
 
 #: 他のコマンドの exit code (execution.md §4.4 の表。plan.sh が使う写し。pull の idle の 2 は別)。
@@ -140,7 +141,7 @@ EXIT_CODES = {
     ATTEMPT_ACTIVE: 3, ATTEMPT_CAP: 3, RETRY_NOT_ALLOWED: 3,
     NOT_REOPENABLE: 3, CASCADE_ACTIVE_DOWNSTREAM: 3, CASCADE_SKIPPED_ON_PATH: 3, CASCADE_FAILED_ON_PATH: 3, CASCADE_NO_EXECUTION: 3,
     CASCADE_UNREADABLE_CARDS: 3, MISSION_ARCHIVED: 3,
-    REOPEN_INTENT_INCOMPLETE: 1,
+    REOPEN_INTENT_INCOMPLETE: 1, REOPEN_INTENT_GRAPH_FROZEN: 3,
 }
 
 #: 拒否の行 (監査ログの `result=refused:<CODE>`) にするもの (execution.md §8)。

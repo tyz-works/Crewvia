@@ -3076,6 +3076,7 @@ def cmd_add(args):
         # R-3: 前回の add が card の後・next_task_id の前で落ちていれば採番を進める
         # (今は次の add が同じ tNNN を黙って上書きする)
         recover_before(add_missions=[slug], include_caller=False)
+        _refuse_graph_change_while_intent_pending(slug, 'add')   # --blocked-by の有無を問わない (新しい task は対象の下流になりうる)
         mission = load_mission(slug)
         task_num = int(mission.get('next_task_id') or 1)
         # 回復 (R-3) が失敗しても (警告だけで続行する設計) next_task_id は実在の card より遅れうる。
@@ -3404,7 +3405,32 @@ _NO_WRITE_REFUSALS = frozenset({
     _EXEC.HISTORY_MISMATCH, _EXEC.HISTORY_AMBIGUOUS,
     _EXEC.ATTEMPT_ACTIVE, _EXEC.ATTEMPT_CAP, _EXEC.RETRY_NOT_ALLOWED,
     _EXEC.NOT_REOPENABLE, _EXEC.CASCADE_ACTIVE_DOWNSTREAM, _EXEC.CASCADE_SKIPPED_ON_PATH, _EXEC.CASCADE_FAILED_ON_PATH,
-    _EXEC.CASCADE_NO_EXECUTION, _EXEC.CASCADE_UNREADABLE_CARDS, _EXEC.MISSION_ARCHIVED})
+    _EXEC.CASCADE_NO_EXECUTION, _EXEC.CASCADE_UNREADABLE_CARDS, _EXEC.MISSION_ARCHIVED, _EXEC.REOPEN_INTENT_GRAPH_FROZEN})
+
+
+def _refuse_graph_change_while_intent_pending(slug, command, task_id=None):
+    """未完の reopen の intent がある mission で、**依存の形を変える書き込み**を拒否する (t065。設計 §4.3.1 の表)。
+    `with_lock()` の中で、`recover_before` の後・何かを書く前に呼ぶ。
+
+    intent は保存した `closure` (決定の時点の下流) で実行する。回復が止まっている間に `add` / `update --blocked-by` / `release-dep` で
+    辺や解除を変えると、一覧は変わらないまま経路だけが変わり、新しい下流が I の再完了より前に走れる (PR #308 の指摘)。
+    回復が完了できるなら `recover_before` が先に完了させているので、ここに来るのは**完了できなかった intent が残っているとき**だけ
+    (`_INTENT_BLOCKED` に頼らず intent の dir を直に見る = 回復を省いた呼び出しでも同じ答え)。読めない intent も「ある」側に倒す。
+    exit 3・何も書かない (`UsageExit` = task-graph を再生成しない)・固定コード・出口を出す。"""
+    pending = slug in _INTENT_BLOCKED
+    if not pending:
+        try:
+            pending = bool(_CONTROLLER.list_pending_intents(_txn(), slug))
+        except _EXEC.ControllerError:
+            pending = True
+    if not pending:
+        return
+    where = f"{slug}/{task_id}" if task_id else slug
+    print(f"[plan.sh {command}] {where}: 未完の reopen の intent がある mission では依存の形を変えられません (add / update --blocked-by / "
+          f"release-dep)。何も書いていません。出口: 先に同じ引数の `plan.sh reopen` を再実行して完了させてください "
+          f"(止めている task があれば `plan.sh store-check` の reopen-intent-blocked を見て片付けてから)\n"
+          f"{_error_code_line(_EXEC.REOPEN_INTENT_GRAPH_FROZEN)}", file=sys.stderr)
+    raise UsageExit(_EXEC.EXIT_CODES[_EXEC.REOPEN_INTENT_GRAPH_FROZEN])
 
 
 def _controller_die(command, e):
@@ -6748,6 +6774,7 @@ def cmd_update(args):
         if opts.get('--blocked-by') is not None:
             raw = opts['--blocked-by'].strip()
             new_blocked = [s.strip() for s in raw.split(',') if s.strip()] if raw else []
+            _refuse_graph_change_while_intent_pending(slug, 'update', task_id)
             _reject_dependency_cycle(slug, task_id, new_blocked)
         if opts.get('--skills') is not None or deliverable is not None:
             # skills か deliverable を動かすときだけ、動かした後の組み合わせで作れるかを確かめる
@@ -7138,6 +7165,8 @@ def cmd_release_dep(args):
         if not os.path.exists(mission_dir(slug)):
             die(f"mission '{slug}' not found.")
 
+        recover_before(cards=[(slug, task_id)], include_caller=False)    # 完了できる intent は先に完了する (止まっているときだけ下で拒否)
+        _refuse_graph_change_while_intent_pending(slug, 'release-dep', task_id)
         meta, body = load_task(slug, task_id)
         st = meta.get('status')
         if st != 'pending':

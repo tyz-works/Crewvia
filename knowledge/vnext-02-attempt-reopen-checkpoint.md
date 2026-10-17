@@ -186,12 +186,24 @@
      | pull の 2 回目のロック（start: reserved → running） | **止める**（t061。予約は書き換えない・JSON を出さない・`REOPEN_INTENT_INCOMPLETE`） | 予約と start の間にロックを放す窓がある。start は『この task を走らせる』唯一の点 |
      | pull の worktree 失敗の出口（`needs_director` に倒す） | 通す | 予約を閉じるだけで task を進めない。止めると予約が恒久に残る |
      | done / fail / needs-director / ready-for-verification / verifying / verify-result | 通す | Worker の作業を失わせない。報告は下流を走らせない（走らせる pull が止まっている）。intent は card の今の status で冪等なので、あとで done の下流も一覧にあれば戻る |
-     | retry / update --status・--reset / release-dep / add | 通す | Director の出口を塞がない。task を走らせるのは pull だけ |
+     | **add / update --blocked-by / release-dep（依存の形を変える書き込み）** | **止める**（t065。exit 3・何も書かない・固定コード `REOPEN_INTENT_GRAPH_FROZEN`・出口 =「同じ `plan.sh reopen` を再実行して完了させる」） | intent は保存した `closure` で実行する。止まっている間に辺・解除を変えると一覧は変わらないまま経路だけが変わり、新しい下流が I の再完了より前に走れる（Codex: 無関係な done の B を I に依存させ、R を B に依存させる）。`add` は `--blocked-by` の有無を問わない（新しい task が対象の下流になりうる）。**完了できる intent は書き込みコマンドの回復が先に完了する**ので、止めるのは完了できなかった intent が残っているときだけ |
+     | retry / update（`--blocked-by` 以外）・--reset | 通す | Director の出口を塞がない。task を走らせるのは pull だけ。status を変える書き込みは、打ち直しが下の表で受ける |
      | retire | 通す | 窓を閉じる側。止めると誰も閉じない |
      | reopen（別の root） | 止める（exit 1。Controller も重ねて始めない） | intent の上に重ねない |
      | 退避（その mission） | **止める**（t061） | 半端な cascade（I は done のまま下流が pending）を退避先に固めない。reopen は退避済みを扱わず出口が無くなる |
 
-     つまり『止める』は **task を走らせる点（start）・新しい決定（reopen）・出口を無くす点（退避）** の 3 つだけで、それ以外は通す。判定は `_INTENT_BLOCKED`（`recover_before` が毎回作り直す = 前のロックの失敗を引きずらない）を、止める遷移が自分のロックの中で読む。
+     つまり『止める』は **task を走らせる点（start）・新しい決定（reopen）・出口を無くす点（退避）・依存の形を変える書き込み（t065）** の 4 つだけで、それ以外は通す。判定は `_INTENT_BLOCKED`（`recover_before` が毎回作り直す = 前のロックの失敗を引きずらない）を、止める遷移が自分のロックの中で読む。
+   - **止まっている間に通している書き込みの族（t065。グラフ・targets・status を変えて打ち直しを誤らせうるものを 1 行ずつ）**:
+
+     | 書き込み | 何を変えうるか | 扱い |
+     |---|---|---|
+     | `add` / `update --blocked-by` / `release-dep` | 依存の辺・`released_deps`（経路そのもの） | **止める**（上の表）。さらに下の二重目の網が今のグラフで受ける |
+     | `update --skills` | cascade が選ぶ終点（`reviews` は skills で選ぶ） | 通す。打ち直しの検査が `一覧 ∪ 今の終点` で経路を引くので、増えた終点が done で一覧に無ければ `PATH_CHANGED_WHILE_STALLED` で止まる（古い結果を通さない） |
+     | `update --status` / `--reset`・`retry`・`retire`・報告の 6 コマンド・`verify-result` | 経路上の task の status | 通す。打ち直しの検査が status ごとの表で受ける（skipped / failed の中間・決定の後に完了した中間は止める） |
+     | `update --priority` / `--worker` / `--description` / `--pr-number` / `--deliverable` | グラフ・終点・status のどれにも効かない | 通す |
+     | `reopen`（別の root）・退避（archive）・pull の start | 新しい決定 / 窓を固める / 古い土台で走らせる | 止める（上の表） |
+     | `resync` / `dashboard-data` / `store-check` / `status` / `lint` / `history` / `pr-base` | 読むだけ（`resync` は Taskvia へ送るだけで queue を書かない） | 通す |
+   - **二重の網（t065）**: 打ち直し（`reopen_intent_blockers`）は、保存した `closure` に加えて **今の mission の全 card から作ったグラフ**で I から対象（一覧 ∪ 今の cascade の終点）への経路を調べる（`Txn.list_mission_card_ids`）。書き込みの拒否を通り抜けた付け替え（手編集・旧形式の書き手）でも、新しい経路上の done / skipped / failed の中間があれば intent を残して止める。**実行する一覧と終点は intent のまま**（新しい下流を推測で増やさない。経路上にない新しい下流は止めない）。mission の card が 1 枚でも読めなければ `REOPEN_INTENT_INCOMPLETE`（入口の `CASCADE_UNREADABLE_CARDS` と同じ向き）。テスト: `tests/test_reopen_intent_graph_frozen.py`（網 1 と網 2 を別々に赤にできる）。
    - **回復の出力は stderr（PR-F fix 2・t063）**: pull は本体の前に回復を走らせ、pull の stdout は JSON 1 つだけ。回復の経路が出す文言（`止まっていた reopen を…完了しました`・mission の再活性化の `Reactivated: …`・警告）は全部 stderr。`_reactivate_done_mission(out=)` の回復の callback は `sys.stderr` を渡す（`reopen` / `add` / `update` / `retry` 自身の `Reactivated` は利用者向けの出力として stdout のまま）。pull が本体の前に走らせる処理（`recover_before` の projection の回復・intent の回復・mission の再活性化・task-graph の再生成・警告）を AST で洗い、stdout に出すのは pull の最後の JSON の 1 か所だけであることを確かめた。テスト: `tests/test_reopen_intent_stderr_and_resume_rules.py`（kill 位置ごとに `json.loads(stdout)`）。
    - **打ち直しは入口の拒否規則を当て直す（PR-F fix 2・t063）**: 回復が止まっている間にも、上の表で「通す」にした書き込み（`update --status` / retry / release-dep / 報告）で中間 A の status は変わる。card を直した後の回復が、done / verified / 実行中以外を一律に「済んでいる」とみなすと、A(skipped) を飛ばして I を pending にして intent を消し、I → A(skipped) → R(pending) で R がすぐ pull できる。そこで `resumed=True` の実行は、最初の書き込み（mission の再活性化）の**前**に `reopen_intent_blockers` で、経路（I から「一覧の task ∪ 今の cascade の終点」への依存の経路。入口と同じ `_reopen_targets` / `path_closure`）上の task を次の表で検査する。一覧は作り直さない。
 

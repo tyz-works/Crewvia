@@ -332,7 +332,7 @@ def test_every_exit_3_code_is_classified_on_purpose():
     # `plan.sh reopen` だけが返すコード (vNext 02 PR-F)。retire が呼ぶ fail_execution / release_execution は返さない。万一返っても
     # settle に入れない = 理由の分からない exit 3 と同じく marker を残す (test_unknown_or_missing_exit_3_codes_keep_the_marker)
     reopen_only = {"NOT_REOPENABLE", "CASCADE_ACTIVE_DOWNSTREAM", "CASCADE_SKIPPED_ON_PATH", "CASCADE_FAILED_ON_PATH",
-                   "CASCADE_NO_EXECUTION", "CASCADE_UNREADABLE_CARDS", "MISSION_ARCHIVED"}
+                   "CASCADE_NO_EXECUTION", "CASCADE_UNREADABLE_CARDS", "MISSION_ARCHIVED", "REOPEN_INTENT_GRAPH_FROZEN"}
     assert controller_exit3 - reopen_only == settle | retry, "新しい exit 3 のコード: 「要らない」か「再試行」かを決めて、この表と lib_retirement に足す"
     assert settle <= lib_retirement.RETIRE_SETTLED_CODES and not (retry & lib_retirement.RETIRE_SETTLED_CODES)
 

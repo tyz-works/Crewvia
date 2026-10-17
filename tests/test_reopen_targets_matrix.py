@@ -10,8 +10,8 @@ Controller の API だけで回す速い層 (plan.sh は打たない)。場面�
   グラフから独立に導く
 * `--cascade none` で成功したら I の card だけが変わる
 
-加えて、孤児の読めない card がある mission の reopen は `CASCADE_UNREADABLE_CARDS` で断る (何も書かない)・途中で止まった reopen を
-再実行しても同じ不変条件が成り立つ (前の実行で戻した下流が経路の終点に数えられる)。
+加えて、孤児の読めない card がある mission の reopen は `CASCADE_UNREADABLE_CARDS` で断る (何も書かない)・途中で止まった reopen は、
+次の plan.sh コマンドの回復 (intent の実行) で、決定の時点の一覧どおりに完了して同じ不変条件が成り立つ (t059。台帳の印から推測しない)。
 """
 
 from __future__ import annotations
@@ -194,6 +194,12 @@ def read_cards(queue):
     return {m["id"]: m for m, _b in tasks}
 
 
+def recover_intents(queue):
+    """plan.sh がロックの直後に行う回復 (未完の intent を最後まで実行) と同じ呼び出し。"""
+    with h.tx(queue, op="recover", actor="Director") as txn:
+        return ctl.recover_reopen_intents(txn, MISSION, now=T2)
+
+
 def run_reopen(queue, graph, cascade, *, unreadable=()):
     with h.tx(queue, op="reopen", actor="Director") as txn:
         return ctl.reopen_task(txn, MISSION, "t001", kind="reopen", reason=REASON, cascade=cascade,
@@ -314,12 +320,11 @@ def test_a_rerun_after_a_kill_at_every_write_still_closes_every_path(tmp_path, n
         # 危険な窓: reset された下流は pending なのに、その手前の完了済みの中間はまだ done
         window_seen = window_seen or (mid["t001"] == "done" and any(
             mid[t] == "pending" and assignment[t][0] != "fresh" for t in states) and any(mid[t] == "done" for t in states))
-        if mid["t001"] == "pending":                                 # I の card まで書けていた = 完了済み (再実行は断られる)
-            with pytest.raises(ex.ControllerError) as refused:
-                run_reopen(root, graph, "reviews")
-            assert refused.value.code == ex.NOT_REOPENABLE
-        else:
-            run_reopen(root, graph, "reviews")                       # 同じコマンドの再実行 (roll forward)
+        recover_intents(root)                                        # 次のコマンドの回復: intent があれば決定どおりに最後まで
+        left = root / "missions" / MISSION / "reopen-intents"
+        assert not left.exists() or not [p for p in left.iterdir() if not p.name.startswith(".")], (name, k)   # tmp の残骸は intent でない
+        if read_cards(root)["t001"]["status"] != "pending":          # intent を書く前に止まった: reopen は始まっていない → もう一度
+            run_reopen(root, graph, "reviews")
         problem = check_invariant(root, graph, skills, assignment, "reviews")
         assert problem is None, (name, k, problem)
     if name != "pending-review-leaf":

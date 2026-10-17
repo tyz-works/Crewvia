@@ -519,12 +519,12 @@ def diagnose(queue_dir, mission_slugs):
         if not isinstance(slug, str) or store._safe_token(slug) is None:
             continue
         root = Path(queue_dir) / 'missions' / slug
+        txn = store.Txn(queue_dir, op='diagnose', actor='diagnose')
+        out.extend(reopen_intents_incomplete(slug, txn))      # 台帳の dir が読めなくても報告する
         names, code = store._list_dir(str(root / store.HISTORY_DIRNAME))
         if code:
             out.append(('history_unobservable', slug, None, store._safe_detail(f"history: {code}")))
             continue
-        txn = store.Txn(queue_dir, op='diagnose', actor='diagnose')
-        cascade_events = {}
         for tid in names:
             if not re.fullmatch(r't\d+', tid):
                 out.append(('history_unobservable', slug, None, 'redacted'))
@@ -562,51 +562,25 @@ def diagnose(queue_dir, mission_slugs):
                     why = orphan_reason(txn, slug, tid, meta, e['fields'])
                     if why is not None:
                         out.append(('history_orphan', slug, tid, why))
-            cascade_events[tid] = (meta, [e['fields'] for e in events])
-        def _load_meta(tid, _slug=slug, _txn=txn):
-            try:
-                return _txn.load_card(_slug, tid)[0]
-            except store.StoreError:
-                return None
-        out.extend(cascade_incomplete(slug, cascade_events, _load_meta))
     return out
 
 
-#: store-check の `cascade-incomplete: <I> <T>` の種類名 (設計 §4.3.1-6)
-CASCADE_INCOMPLETE = 'cascade-incomplete'
+#: store-check の `reopen-intent-incomplete: <root>` の種類名 (設計 §4.3.1-6)
+REOPEN_INTENT_INCOMPLETE = 'reopen-intent-incomplete'
 
 
-def cascade_incomplete(slug, tasks, load_meta=None):
-    """reopen の cascade が途中で止まった印を**書かずに**列挙する: `[(kind, mission, task, root)]`。`tasks` は
-    `{tid: (card の meta か None, [台帳の frontmatter, ...])}`。
-
-    * 下流 T の台帳に `kind` が reopen / reset のイベントがあり、その `root` (= I) の `root_reopen_count` が I の card の
-      今の `reopen_count` より大きい → I はまだその reopen を終えていない (I の card が最後に書かれる)。`(…, T, I)`。
-    * I 自身の台帳 `reopen` (root なし) が残っていて、I の card がまだ done / verified / skipped のまま (card を書く前に止まった)
-      → `(…, I, I)`。
-    直すのは Director が**同じ `plan.sh reopen` を再実行**すること (ここでは直さない)。"""
+def reopen_intents_incomplete(slug, txn):
+    """未完の reopen の intent を**書かずに**列挙する: `[(kind, mission, root, 理由)]` (t059)。intent は reopen の決定の記録で、
+    完了すると消える。残っている = 途中で止まった。直すのは次に queue を書く plan.sh コマンド (pull を含む。ロックの直後に
+    intent を最後まで実行する) か、同じ `plan.sh reopen` の再実行。ここでは直さない。
+    読めない・名前の形でないものも「未完」として出す (無いことにしない)。"""
     out = []
-    for tid, (_meta, events) in sorted(tasks.items()):
-        for f in events:
-            root, need = f.get('root'), f.get('root_reopen_count')
-            if f.get('kind') not in ('reopen', 'reset') or not isinstance(root, str) or not isinstance(need, int):
-                continue
-            root_meta = (tasks.get(root) or (None, []))[0]
-            if root_meta is None and load_meta is not None:
-                root_meta = load_meta(root)           # I は台帳の dir を持たないことがある (台帳を書く前に止まった)
-            if not isinstance(root_meta, dict):
-                continue
-            now = root_meta.get('reopen_count') or 0
-            if isinstance(now, int) and not isinstance(now, bool) and need > now:
-                out.append((CASCADE_INCOMPLETE, slug, tid, f'root={root}'))
-                break
-    for tid, (meta, events) in sorted(tasks.items()):
-        if not isinstance(meta, dict):
+    listed = txn.list_reopen_intents(slug)
+    if listed[0] != 'ok':
+        return [(REOPEN_INTENT_INCOMPLETE, slug, None, store._safe_detail(f"unobservable:{listed[1]}"))]
+    for name in sorted(listed[1]):
+        if not store.INTENT_NAME_RE.fullmatch(name):
+            out.append((REOPEN_INTENT_INCOMPLETE, slug, None, 'unexpected_file'))
             continue
-        status, count = meta.get('status'), meta.get('reopen_count') or 0
-        if not (isinstance(status, str) and status in _status.ACCEPTS_FROM['reopen']):
-            continue
-        if any(f.get('kind') == 'reopen' and not f.get('root') and f.get('execution_id') == meta.get('current_execution_id')
-               and reopen_count_of(f) == count for f in events):
-            out.append((CASCADE_INCOMPLETE, slug, tid, f'root={tid}'))
+        out.append((REOPEN_INTENT_INCOMPLETE, slug, name.split('-')[0], f'intent={name}'))
     return out

@@ -6,7 +6,7 @@
 * `--cascade none|reviews|all` の 3 値・経路の閉包 (I → A → R で A も戻る)・対象外の完了済み下流は列挙だけ
 * 実行中 / ready_for_verification / verifying の下流 (cascade なしで拒否・ありで試行を RESET_BY_DIRECTOR で閉じる)
 * 経路上の skipped は拒否 (途中・末端・複数経路の片方 × 3 値)・何も書かない
-* 書き込みの各点で kill → store-check が cascade-incomplete → 同じコマンドの再実行で完了し reopen_count が二重に増えない
+* 書き込みの各点の kill → 次のコマンドの回復 (intent の実行) は `tests/test_reopen_intent_recovery.py`
 * reopen → pull で previous_attempt・reopen → pull → done が同じ pr_number で閉じる
 """
 
@@ -431,53 +431,6 @@ def test_downstream_without_attempt_fields_cannot_be_written_to_the_ledger(tmp_p
 # roll forward・kill
 # ---------------------------------------------------------------------------
 
-def rewind(box, tid, orig):
-    """reopen が書き換えた欄を元の card に戻す (= その task の card を書く前に止まった状態。台帳は残る)。"""
-    set_card(box, tid, **{k: orig.get(k) for k in ("status", "worker", "started_at", "completed_at", "reopen_count")})
-
-
-def test_rerun_after_the_downstream_was_written_but_not_the_root_completes_without_double_counting(chain):
-    orig = {t: chain.card(t) for t in ("t001", "t002", "t003")}
-    assert reopen(chain).returncode == 0
-    # I の card だけを元に戻す (= I の card を書く前に止まった状態)。I の台帳 reopen は残る
-    rewind(chain, "t001", orig["t001"])
-    out = store_check(chain)
-    assert "cascade-incomplete" in out
-    files_before = {t: ledger_files(chain, t) for t in ("t001", "t002", "t003")}
-    p = reopen(chain)
-    assert p.returncode == 0, p.stderr
-    assert "再実行で完了" in p.stdout
-    assert [count(chain, t) for t in ("t001", "t002", "t003")] == [1, 1, 1]
-    assert {t: ledger_files(chain, t) for t in ("t001", "t002", "t003")} == files_before
-    assert "cascade-incomplete" not in store_check(chain)
-
-
-def test_rerun_after_only_the_far_end_was_written_reopens_the_intermediate_too(chain):
-    orig = {t: chain.card(t) for t in ("t001", "t002", "t003")}
-    assert reopen(chain).returncode == 0
-    # R だけが戻った状態に巻き戻す (A と I は done・reopen の台帳は R にだけ残る。A の台帳も消す)
-    for tid in ("t001", "t002"):
-        rewind(chain, tid, orig[tid])
-        for n in ledger_files(chain, tid, "reopen"):
-            (ledger_dir(chain, tid) / n).unlink()
-    assert "cascade-incomplete" in store_check(chain)
-    p = reopen(chain)
-    assert p.returncode == 0, p.stderr
-    assert [status(chain, t) for t in ("t001", "t002", "t003")] == ["pending"] * 3
-    assert [count(chain, t) for t in ("t001", "t002", "t003")] == [1, 1, 1]       # R は二重に増えない
-    assert "再実行で完了" in p.stdout
-
-
-def test_rerun_with_a_different_reason_is_refused_as_history_mismatch(chain):
-    orig = chain.card("t001")
-    assert reopen(chain).returncode == 0
-    rewind(chain, "t001", orig)
-    before = chain.snapshot()
-    p = reopen(chain, reason="別の理由")
-    assert p.returncode == 3 and last_error_code(p.stderr) == "HISTORY_MISMATCH", p.stderr
-    assert chain.snapshot() == before
-
-
 def _fork_reopen(box, argv, kill_at):
     """fork した子で本物の `cmd_reopen(argv)` を走らせ、lib の書き込み点の `kill_at` 番目で SIGKILL。
     戻り値: (SIGKILL で落ちたか, 書き込み点の数)。"""
@@ -515,40 +468,6 @@ def _fork_reopen(box, argv, kill_at):
 def _restore(box, saved):
     shutil.rmtree(box.queue)
     shutil.copytree(saved, box.queue)
-
-
-def test_kill_after_every_write_then_the_same_command_completes_once(tmp_path):
-    box = build(tmp_path, CHAIN)
-    finish_all(box, ("t001", "t002", "t003"))
-    saved = tmp_path / "saved-queue"
-    shutil.copytree(box.queue, saved)
-    argv = ["t001", "--mission", MISSION, "--reason", REASON, "--branch", "reuse"]
-    killed_points = 0
-    incomplete_seen = 0
-    for k in range(1, 400):
-        _restore(box, saved)
-        killed, calls = _fork_reopen(box, argv, k)
-        if not killed:
-            assert calls < k
-            break
-        killed_points += 1
-        # どの時点でも「上流が pending なのに下流が done」を作らない (古い結果が通る側に倒れない)
-        st = {t: status(box, t) for t in ("t001", "t002", "t003")}
-        assert not (st["t001"] == "pending" and st["t002"] == "done"), (k, st)
-        assert not (st["t002"] == "pending" and st["t003"] == "done"), (k, st)
-        if "cascade-incomplete" in store_check(box):
-            incomplete_seen += 1
-        p = reopen(box)
-        if p.returncode == 3:                                  # kill が I の card の後ろ = 既に完了していた
-            assert last_error_code(p.stderr) == "NOT_REOPENABLE", (k, p.stderr)
-        else:
-            assert p.returncode == 0, (k, p.stderr)
-        assert [status(box, t) for t in ("t001", "t002", "t003")] == ["pending"] * 3, k
-        assert [count(box, t) for t in ("t001", "t002", "t003")] == [1, 1, 1], k
-        assert "cascade-incomplete" not in store_check(box), k
-        for t in ("t001", "t002", "t003"):
-            assert len(ledger_files(box, t, "reopen")) == 1, (k, t)
-    assert killed_points >= 12 and incomplete_seen >= 1, (killed_points, incomplete_seen)
 
 
 # ---------------------------------------------------------------------------
@@ -708,54 +627,6 @@ def _mark_mission_done(box):
     assert "status: done" in f.read_text()
 
 
-def test_the_mission_is_reactivated_before_the_root_card_is_written(tmp_path):
-    """書き込みの全点で SIGKILL。mission が done のまま pending の task が残る点を作らない (dispatcher が Worker を退役させる)。"""
-    box = build(tmp_path, CHAIN)
-    finish_all(box, ("t001", "t002", "t003"))
-    _mark_mission_done(box)
-    saved = tmp_path / "saved-queue"
-    shutil.copytree(box.queue, saved)
-    argv = ["t001", "--mission", MISSION, "--reason", REASON, "--branch", "reuse"]
-    killed_points = 0
-    mission_written_first = False
-    for k in range(1, 400):
-        _restore(box, saved)
-        killed, calls = _fork_reopen(box, argv, k)
-        if not killed:
-            assert calls < k
-            break
-        killed_points += 1
-        text = _mission_file(box).read_text()
-        pending = [t for t in ("t001", "t002", "t003") if status(box, t) == "pending"]
-        if pending:
-            assert "status: in_progress" in text, (k, pending)          # pending の task があるのに mission が done
-        if "status: in_progress" in text and not pending:
-            mission_written_first = True                                # mission の書き込みの直後 (card はまだ)
-        p = reopen(box)
-        assert p.returncode in (0, 3), (k, p.stderr)
-        assert [status(box, t) for t in ("t001", "t002", "t003")] == ["pending"] * 3, k
-        assert "status: in_progress" in _mission_file(box).read_text(), k
-        assert [count(box, t) for t in ("t001", "t002", "t003")] == [1, 1, 1], k
-    assert killed_points >= 12 and mission_written_first, (killed_points, mission_written_first)
-
-
-def test_a_rerun_recovers_a_done_mission_left_by_the_older_write_order(tmp_path):
-    """I の card を書いた後で止まった旧い順序の残り: root は pending (reopen 済み)・mission は done。同じ引数の再実行は
-    NOT_REOPENABLE で断る前に mission を戻す (exit 0)。台帳も reopen_count も増えない。"""
-    box = build(tmp_path, CHAIN)
-    finish_all(box, ("t001", "t002", "t003"))
-    assert reopen(box).returncode == 0
-    _mark_mission_done(box)
-    files = {t: ledger_files(box, t) for t in ("t001", "t002", "t003")}
-    p = reopen(box)
-    assert p.returncode == 0, p.stderr
-    assert "status: in_progress" in _mission_file(box).read_text() and "Reactivated" in p.stdout
-    assert [count(box, t) for t in ("t001", "t002", "t003")] == [1, 1, 1]
-    assert {t: ledger_files(box, t) for t in ("t001", "t002", "t003")} == files
-    again = reopen(box)                                                # 戻した後は今までどおり (既に完了)
-    assert again.returncode == 3 and last_error_code(again.stderr) == "NOT_REOPENABLE"
-
-
 def test_a_refused_rerun_does_not_touch_a_done_mission_when_the_root_never_reopened(tmp_path):
     """root が pending でも reopen の台帳が無い (reopen を書き終えた形でない) なら、拒否は mission を書き換えない。"""
     box = build(tmp_path, [("t001", [], ["code"])])
@@ -879,106 +750,11 @@ def test_released_upstream_other_than_the_root_is_dropped_when_that_upstream_ret
 def test_reopen_output_tells_the_director_how_to_recover_from_a_stop(chain):
     p = reopen(chain)
     assert p.returncode == 0, p.stderr
-    assert "plan.sh reopen t001" in p.stdout and "同じ引数で再実行" in p.stdout and "cascade-incomplete" in p.stdout
+    assert "plan.sh reopen t001" in p.stdout and "同じ引数で再実行" in p.stdout and "reopen-intent-incomplete" in p.stdout
+    assert "intent の続きを完了" in p.stdout                  # 次に queue を書くコマンドが完了する
     # 書き始める前にも stderr に出る (途中で死ぬと成功時の出力は届かない)
     assert "同じ引数で再実行" in p.stderr
 
-
-def _window_box(tmp_path):
-    """reopen を k 番目の書き込みで kill して、R だけが pending に戻り (A と I は done のまま) の状態の box を返す。
-    これが設計 §4.3.1-4 の中間状態 (R が reopen 前の結果の上で pull されうる窓)。"""
-    box = build(tmp_path, CHAIN)
-    finish_all(box, ("t001", "t002", "t003"))
-    saved = tmp_path / "window-saved"
-    shutil.copytree(box.queue, saved)
-    argv = ["t001", "--mission", MISSION, "--reason", REASON, "--branch", "reuse"]
-    for k in range(1, 400):
-        _restore(box, saved)
-        killed, _calls = _fork_reopen(box, argv, k)
-        assert killed, "窓の状態に届く前に reopen が最後まで走った"
-        st = [status(box, t) for t in ("t001", "t002", "t003")]
-        if st == ["done", "done", "pending"]:
-            return box
-    raise AssertionError("R だけが pending の窓の状態が作れなかった")
-
-
-def _assert_completes_only_in_order(box):
-    """I → A → R の順でしか完了できない (上流が未完了の間は下流を pull できない)。"""
-    assert [status(box, t) for t in ("t001", "t002", "t003")] == ["pending"] * 3
-    assert box.pull("Mika", "t003", skills=SKILLS).returncode != 0
-    finish(box, "t001")
-    assert box.pull("Mika", "t003", skills=SKILLS).returncode != 0            # A がまだ
-    finish(box, "t002")
-    finish(box, "t003")
-    assert [status(box, t) for t in ("t001", "t002", "t003")] == ["done"] * 3
-    assert "cascade-incomplete" not in store_check(box)
-
-
-def test_rerun_converges_after_r_was_pulled_and_finished_with_the_stale_result_in_the_window(tmp_path):
-    """指摘 2: 途中で止まった間に R が古い結果で pull → done された。同じ reopen の再実行は R を再び戻す
-    (前の実行で戻した後にまた完了した = 新しく戻すので reopen_count は 2。二重ではなく、完了のたびに 1)。"""
-    box = _window_box(tmp_path)
-    assert "cascade-incomplete" in store_check(box)
-    finish(box, "t003", agent="Mika")                                   # 窓の中で R が古い結果で完了した
-    assert status(box, "t003") == "done" and count(box, "t003") == 1
-    p = reopen(box)
-    assert p.returncode == 0, p.stderr
-    assert [count(box, t) for t in ("t001", "t002", "t003")] == [1, 1, 2]
-    _assert_completes_only_in_order(box)
-
-
-def test_rerun_converges_after_r_was_pulled_and_is_still_running_in_the_window(tmp_path):
-    """窓の中で R が pull されて実行中のまま再実行 → R の試行は RESET_BY_DIRECTOR で閉じられ pending に戻る。
-    Worker の次の報告は拒否される。reopen_count は増えない (done から戻したのではない)。"""
-    box = _window_box(tmp_path)
-    p = box.pull("Mika", "t003", skills=SKILLS)
-    assert p.returncode == 0, p.stderr
-    xid = json.loads(p.stdout)["execution_id"]
-    q = reopen(box)
-    assert q.returncode == 0, q.stderr
-    assert [count(box, t) for t in ("t001", "t002", "t003")] == [1, 1, 1]
-    late = run(box, "done", "t003", "r", "--mission", MISSION, "--execution", xid, agent="Mika")
-    assert late.returncode != 0, "閉じられた試行の古い完了報告が通った"
-    _assert_completes_only_in_order(box)
-
-
-def test_rerun_converges_when_the_window_r_finished_and_a_was_not_yet_written(tmp_path):
-    """窓がもう 1 つ手前 (R だけ戻った後に A も戻った状態) でも、R の古い完了は再実行で戻る。"""
-    box = build(tmp_path, CHAIN)
-    finish_all(box, ("t001", "t002", "t003"))
-    saved = tmp_path / "window2-saved"
-    shutil.copytree(box.queue, saved)
-    argv = ["t001", "--mission", MISSION, "--reason", REASON, "--branch", "reuse"]
-    seen_a_pending = False
-    for k in range(1, 400):
-        _restore(box, saved)
-        killed, _calls = _fork_reopen(box, argv, k)
-        if not killed:
-            break
-        if [status(box, t) for t in ("t001", "t002", "t003")] != ["done", "pending", "pending"]:
-            continue
-        seen_a_pending = True
-        assert box.pull("Mika", "t003", skills=SKILLS).returncode != 0     # A が pending なので R は pull できない
-        assert reopen(box).returncode == 0
-        assert [count(box, t) for t in ("t001", "t002", "t003")] == [1, 1, 1]
-        _assert_completes_only_in_order(box)
-        break
-    assert seen_a_pending
-
-
-# ---------------------------------------------------------------------------
-# 再実行 (roll forward) の「前の実行で済んだ task (already)」を、後の段が全部正しく扱うか (PR-F fix 3)
-#
-# 書き込みの段ごとの表 (`_reopen_cascade` の「書く」以降):
-#   段                              | already の扱い
-#   下流の台帳 → card (work)        | work に入らない (done_set / reset_set でないので reopen_count を足さない)
-#   released_deps の掃除 (gone)     | **gone に入れる** (入れないと R の古い release が残る = 今回の P1)
-#   I の card (最後・完了の印)      | root の reopen_count は reuse で二重に増えない
-#   mission の再活性化 (before_write)| 検査の後・最初の書き込み。再実行でも同じ点で戻す
-#   出力の件数 (reopened/already)   | already に数える (reopened に数えない)・resumed=True
-#   stale / stale_runnable          | chosen = reopened ∪ reset ∪ already (戻した task を stale に数えない)
-#   上限の検査 (_over_cap)          | done_set・reset_set だけ (already は pending で上限の対象外)
-# ---------------------------------------------------------------------------
 
 def _state(box, tids):
     mfile = box.queue / "missions" / MISSION / "mission.yaml"
@@ -1001,66 +777,6 @@ def _released_matrix_box(tmp_path, r_state, name):
     mfile = box.queue / "missions" / MISSION / "mission.yaml"
     mfile.write_text(mfile.read_text().replace("status: in_progress", "status: done"))
     return box
-
-
-@pytest.mark.parametrize("r_state", ["pending", "done"])
-def test_kill_at_every_write_then_rerun_ends_in_the_same_state_as_one_clean_run(tmp_path, r_state):
-    tids = ("t001", "t002", "t003")
-    argv = ["t001", "--mission", MISSION, "--reason", REASON, "--branch", "reuse"]
-    box = _released_matrix_box(tmp_path, r_state, "golden")
-    saved = tmp_path / "matrix-saved"
-    shutil.copytree(box.queue, saved)
-    assert reopen(box).returncode == 0
-    golden = _state(box, tids)
-    assert golden["t002"][0] == "pending" and "t002" not in golden["t003"][2], golden       # 前提: 1 回の実行で掃除される
-    assert golden["mission"] == "active"
-    killed_points = 0
-    cleanup_window_seen = False
-    for k in range(1, 400):
-        _restore(box, saved)
-        killed, calls = _fork_reopen(box, argv, k)
-        if not killed:
-            break
-        killed_points += 1
-        mid = _state(box, tids)
-        if mid["t002"][0] == "pending" and "t002" in mid["t003"][2]:
-            cleanup_window_seen = True                       # A は戻ったが R の release が残っている窓
-        p = reopen(box)
-        if p.returncode == 3:                                # kill が I の card の後ろ = 既に完了していた
-            assert last_error_code(p.stderr) == "NOT_REOPENABLE", (k, p.stderr)
-        else:
-            assert p.returncode == 0, (k, p.stderr)
-        assert _state(box, tids) == golden, (k, mid)
-    assert killed_points >= 8 and cleanup_window_seen, (killed_points, cleanup_window_seen)
-
-
-def test_a_stale_release_left_by_a_stop_before_the_cleanup_does_not_run_r_when_a_fails_again(tmp_path):
-    argv = ["t001", "--mission", MISSION, "--reason", REASON, "--branch", "reuse"]
-    box = _released_matrix_box(tmp_path, "pending", "failcase")
-    saved = tmp_path / "failcase-saved"
-    shutil.copytree(box.queue, saved)
-    tested = False
-    for k in range(1, 400):
-        _restore(box, saved)
-        killed, _calls = _fork_reopen(box, argv, k)
-        if not killed:
-            break
-        st = _state(box, ("t002", "t003"))
-        if not (st["t002"][0] == "pending" and "t002" in st["t003"][2]):
-            continue
-        tested = True
-        assert reopen(box).returncode == 0                                  # 再実行 (roll forward)
-        assert "released_deps" not in box.card("t003")                      # R の古い release が消えている
-        finish(box, "t001")
-        p = box.pull("Ren", "t002", skills=SKILLS)
-        assert p.returncode == 0, p.stderr
-        xid = json.loads(p.stdout)["execution_id"]
-        f = run(box, "fail", "t002", "--mission", MISSION, "--no-head", "テスト", "--execution", xid, agent="Ren")
-        assert f.returncode == 0, f.stderr
-        assert status(box, "t002") == "failed"
-        assert box.pull("Mika", "t003", skills=SKILLS).returncode != 0, "A の失敗が古い release で素通りした"
-        break
-    assert tested
 
 
 # ---------------------------------------------------------------------------
@@ -1130,7 +846,7 @@ def test_the_same_reopen_succeeds_once_the_card_is_fixed(tmp_path):
 
 def test_retry_and_store_check_do_not_depend_on_the_whole_mission_graph(tmp_path):
     """族の確認: `retry` は task 1 枚だけを見る (graph を作らない) ので、他の card が壊れていても通る。`store-check` の
-    cascade-incomplete も graph を使わず、台帳と card の組から導く (壊れた card は飛ばす)。どちらも `list_tasks()` の置き換えを踏まない。"""
+    reopen-intent-incomplete も graph を使わない (intent の dir を見るだけ)。どちらも `list_tasks()` の置き換えを踏まない。"""
     box = build(tmp_path, CHAIN)
     finish(box, "t001")
     p = box.pull("Ren", "t002", skills=SKILLS)

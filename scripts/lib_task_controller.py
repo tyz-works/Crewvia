@@ -52,6 +52,7 @@ _SCRIPTS_DIR = Path(__file__).resolve().parent
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
+import lib_dep_rules as dep  # noqa: E402
 import lib_execution as ex  # noqa: E402
 import lib_history as hist  # noqa: E402
 import lib_state_store as store  # noqa: E402
@@ -66,6 +67,7 @@ _S_PENDING = 'pending'
 _S_NEEDS_DIRECTOR = 'needs_director'
 _S_FAILED = 'failed'
 _S_DONE = 'done'
+_S_SKIPPED = 'skipped'
 _S_VERIFIED = 'verified'
 _C_DONE = 'done'
 _C_FAIL = 'fail'
@@ -379,7 +381,15 @@ def _result_for_ledger(out, xid, body_out):
     return hist.RESULT_NONE, ''                              # 別の試行の Result。この試行の履歴には入れない
 
 
+#: reopen の intent を実行している間だけ入る、**intent を書いた人**の台帳上の actor (`(actor,)`。None = 上書きなし)。
+#: 台帳の同定キーが同じ孤児は中身 (actor を含む) が同じでないと再利用できない。回復を別のコマンド (別の人) が走らせても、
+#: 最初の実行が書いた actor で書く (さもないと回復が自分の孤児と `HISTORY_MISMATCH` になる)
+_LEDGER_ACTOR_OVERRIDE = None
+
+
 def _ledger_actor(txn):
+    if _LEDGER_ACTOR_OVERRIDE is not None:
+        return _LEDGER_ACTOR_OVERRIDE[0]
     token = store._safe_token(txn.actor)
     return None if token in (None, 'unknown') else token
 
@@ -408,18 +418,20 @@ def _ledger_reason(out, end_code):
     return text[:_LEDGER_REASON_MAX].rstrip() or None      # 切り口が空白だと読み戻しで落ちる (frontmatter の値は前後の空白を持てない)
 
 
-def _resolve_ledger(txn, slug, tid, meta, out, body_out, *, end_code, ended_at, checkpoint_dir=None):
+def _resolve_ledger(txn, slug, tid, meta, out, body_out, *, end_code, ended_at, ledger_extra=None, checkpoint_dir=None):
     """台帳に書くべきこと。`(action, name, ended_at, text)`: action は `write` (新しいファイルを足す) / `reuse` (同じ遷移の
     ファイルが既にあり中身も同じ。何も書かず、その `ended_at` を使う)。何も書かない。食い違い・読めないは `_LedgerProblem`。"""
     xid = meta['current_execution_id']
     kind = _HISTORY_KIND_BY_END_CODE.get(end_code, 'end')
     reopen = _reopen_count(meta)
     state, result_text = _result_for_ledger(out, xid, body_out)
-    fields, body = hist.build_event(
+    args = dict(
         kind=kind, execution_id=xid, attempt=meta['execution_count'], ended_at=ended_at, end_code=end_code,
         reopen_count=reopen, head=out.get('fail_head'), pr_number=out.get('pr_number'), worker=meta.get('worker'),
         actor=_ledger_actor(txn), reason=_ledger_reason(out, end_code), result_state=state, result_text=result_text,
         checkpoint_dir=checkpoint_dir)
+    args.update(ledger_extra or {})                          # reopen の cascade が reason / root / root_reopen_count を足す
+    fields, body = hist.build_event(**args)
     # checkpoint_dir は再送の比較に入れない: 孤児の台帳 (retire が card の前に落ちた) の後の再送は、取り直した checkpoint が
     # 前と違いうる (前は失敗して none・今度は取れた)。中身の食い違いで退役を割らず、先に書いた台帳の値を残す (設計 §5.5)
     return _match_or_plan(txn, slug, tid, kind, xid, reopen, fields, body, ended_at, ignore=('checkpoint_dir',))
@@ -459,7 +471,8 @@ def _match_or_plan(txn, slug, tid, kind, xid, reopen, fields, body, ended_at, ig
     return 'write', name, ended_at, hist.render(fields, body)
 
 
-def _record_ledger(txn, slug, tid, meta, out, body_out, caller, *, end_code, now, resolver=None, checkpoint_dir=None):
+def _record_ledger(txn, slug, tid, meta, out, body_out, caller, *, end_code, now, resolver=None, ledger_extra=None,
+                   checkpoint_dir=None):
     """終わる試行の台帳を、card の書き込みの**直前**に 1 ファイル足す (台帳 → card の順。card がコミット点)。
     戻り値: `(ended_at, history_detail, reused)`。`ended_at` は record にも使う値 (再送では台帳のものを再利用。そのとき
     `reused=True`)。
@@ -472,7 +485,7 @@ def _record_ledger(txn, slug, tid, meta, out, body_out, caller, *, end_code, now
     try:
         if resolver is None:
             action, name, ended_at, text = _resolve_ledger(txn, slug, tid, meta, out, body_out,
-                                                          end_code=end_code, ended_at=ended_at,
+                                                          end_code=end_code, ended_at=ended_at, ledger_extra=ledger_extra,
                                                           checkpoint_dir=checkpoint_dir)
         else:                                                # retry / reopen: 呼び出し元が台帳の中身を決める
             action, name, ended_at, text = resolver(ended_at)
@@ -727,7 +740,8 @@ def _apply_updates(out, updates, remove):
 
 def _finish(txn, slug, tid, meta, body, caller, *, new_status, end_code, to_status, command, operation,
             clear_owner, retire_slot, meta_updates, new_body, now, required_exec_status=None,
-            abandon_detached=False, meta_remove=(), dry_run=False, result_replaced=False, checkpoint_dir=None):
+            abandon_detached=False, meta_remove=(), dry_run=False, result_replaced=False, ledger_extra=None,
+            checkpoint_dir=None):
     """終わらせる操作の共通の骨 (照合 → 遷移の検査 → 台帳 → card → record → 枠 → 監査)。
 
     `result_replaced=True` は「この呼び出しの `new_body` が `## Result` 節を実際に置き換えた」と呼び出し側が**明示**する
@@ -800,7 +814,7 @@ def _finish(txn, slug, tid, meta, body, caller, *, new_status, end_code, to_stat
     # 台帳 → card の順 (派生値は正本より前。card がコミット点)。card の書き込みが失敗しても残るのは「まだ起きていない遷移」の
     # 孤児の 1 ファイルで、同じ報告の再送がそれを再利用して先へ進む (ended_at も台帳のものを card・record に使う)
     ended_at, history_detail, ledger_reused = _record_ledger(txn, slug, tid, meta, out, body_out, caller,
-                                                             end_code=end_code, now=now,
+                                                             end_code=end_code, now=now, ledger_extra=ledger_extra,
                                                              checkpoint_dir=checkpoint_dir)
     if ledger_reused and out.get('completed_at') is not None and updates.get('completed_at') is not None:
         out['completed_at'] = ended_at      # 孤児の再送: card の完了時刻も台帳・record と同じ値 (設計 §3.2-2。再送の now は使わない)
@@ -891,7 +905,7 @@ def release_execution(txn, slug, tid, caller=NO_CALLER, reason_code=None, *, to_
                    checkpoint_dir=checkpoint_dir)
 
 
-def reset_task(txn, slug, tid, caller=NO_CALLER, *, now=None, meta_updates=None):
+def reset_task(txn, slug, tid, caller=NO_CALLER, *, now=None, meta_updates=None, ledger_extra=None):
     """Director の `update --reset`: task を pending に戻し、試行は次のどれかで閉じる (execution.md §4.2)。
 
     - ACTIVE: reserved → released / running → failed (どちらも `RESET_BY_DIRECTOR`)
@@ -899,24 +913,34 @@ def reset_task(txn, slug, tid, caller=NO_CALLER, *, now=None, meta_updates=None)
     - 試行なし (legacy)・TERMINAL: **task の遷移だけ** (terminal の欄は残す)
     worker・started_at を null にし、枠を撤去する。遷移元は問わない (今の `update` と同じ。any → pending)。
     `meta_updates` は同じ card の書き込みに入れる他の欄 (`update --reset` の `completed_at = None`)。
+    `ledger_extra` は台帳の reset に足す欄 (reopen の cascade が `reason` / `root` / `root_reopen_count` と、上限を超えて戻すときの `over_cap` を渡す。PR-F)。
     """
+    if ledger_extra is not None:
+        ok = (isinstance(ledger_extra, dict) and set(ledger_extra) <= {'reason', 'root', 'root_reopen_count', 'over_cap'})
+        if not ok:
+            raise _err(ex.INVALID_ARGUMENT, "ledger_extra は reason / root / root_reopen_count / over_cap だけの dict", slug, tid)
     meta, body = _load(txn, slug, tid)
     view = _view(meta)
     if view == ex.ACTIVE and meta['execution_status'] == ex.RESERVED:
         return _finish(txn, slug, tid, meta, body, caller, new_status=ex.RELEASED, end_code=ex.RESET_BY_DIRECTOR,
                        to_status=_S_PENDING, command=None, operation=None, clear_owner=True, retire_slot=True,
-                       meta_updates=meta_updates, new_body=None, now=now, required_exec_status={ex.RESERVED})
+                       meta_updates=meta_updates, new_body=None, now=now, required_exec_status={ex.RESERVED},
+                       ledger_extra=ledger_extra)
     return _finish(txn, slug, tid, meta, body, caller, new_status=ex.FAILED, end_code=ex.RESET_BY_DIRECTOR,
                    to_status=_S_PENDING, command=None, operation=None, clear_owner=True, retire_slot=True,
-                   meta_updates=meta_updates, new_body=None, now=now, abandon_detached=True)
+                   meta_updates=meta_updates, new_body=None, now=now, abandon_detached=True, ledger_extra=ledger_extra)
 
 
 # ---------------------------------------------------------------------------
 # 理由つきの開き直し (vNext 02 PR-E: retry。PR-F が同じ関数に reopen を足す。設計 §3.3)
 # ---------------------------------------------------------------------------
 
-#: `reopen_task` の kind と、card を受け付ける元の command 名 (`lib_task_status.ACCEPTS_FROM` のキー)。PR-F が `reopen` を足す。
-_REOPEN_KINDS = {'retry': 'retry'}
+#: `reopen_task` の kind と、card を受け付ける元の command 名 (`lib_task_status.ACCEPTS_FROM` のキー)。
+_REOPEN_KINDS = {'retry': 'retry', 'reopen': 'reopen'}
+
+#: `reopen` の下流の扱い (`plan.sh reopen --cascade`。設計 §4.3)。既定は reviews
+CASCADES = ('none', 'reviews', 'all')
+DEFAULT_CASCADE = 'reviews'
 
 #: 理由 (`--reason` / `--over-cap`) の長さの上限。台帳の frontmatter に 1 行で入るので、長文はここで断る
 REASON_MAX = 500
@@ -939,7 +963,8 @@ def check_reason(value, name):
     return text
 
 
-def reopen_task(txn, slug, tid, *, kind, reason, over_cap=None, default_max_attempts=hist.DEFAULT_MAX_ATTEMPTS, now=None):
+def reopen_task(txn, slug, tid, *, kind, reason, over_cap=None, default_max_attempts=hist.DEFAULT_MAX_ATTEMPTS, now=None,
+                cascade=DEFAULT_CASCADE, graph=None, unreadable=None, before_write=None):
     """終わった試行の task を、理由つきで pending に戻す (retry。設計 §3.3)。**新しい task を足さない**。
 
     遷移元: `lib_task_status.ACCEPTS_FROM['retry']` (failed / needs_director / needs_human_review / verification_failed)。
@@ -956,10 +981,18 @@ def reopen_task(txn, slug, tid, *, kind, reason, over_cap=None, default_max_atte
     再利用して先へ進む (同定キー (execution_id, retry, reopen_count)。違う中身なら `HISTORY_MISMATCH`)。
     **上限の検査は入口のここだけ** (`reserve_task` には置かない — 既に上限を超えた card がある)。
     戻り値: 開き直した (終わっていた) 試行の `Execution`。
+
+    `kind='reopen'` (PR-F。設計 §4) は done / verified / skipped の task を `reopen_count += 1` で pending に戻し、`cascade` と
+    `graph` (`{task id: blocked_by}`。mission の全 task) に従って下流も戻す (`_reopen_cascade`)。戻り値は `ReopenResult`。
+    `unreadable` (reopen では必須) は mission の読めない・壊れた card の id の並び。1 つでもあれば `CASCADE_UNREADABLE_CARDS`
+    (graph では壊れた card が依存の無い孤立 node になり、そこを通る経路が消える)。
     """
     if kind not in _REOPEN_KINDS:
-        raise _err(ex.INVALID_ARGUMENT, "reopen_task の kind は retry だけ", slug, tid)
+        raise _err(ex.INVALID_ARGUMENT, "reopen_task の kind は retry / reopen だけ", slug, tid)
     command = _REOPEN_KINDS[kind]
+    if kind == 'reopen':
+        return _reopen_cascade(txn, slug, tid, reason=reason, over_cap=over_cap, default_max_attempts=default_max_attempts,
+                               now=now, cascade=cascade, graph=graph, unreadable=unreadable, before_write=before_write)
     reason = check_reason(reason, 'reason')
     if over_cap is not None:
         over_cap = check_reason(over_cap, 'over_cap')
@@ -991,6 +1024,19 @@ def reopen_task(txn, slug, tid, *, kind, reason, over_cap=None, default_max_atte
         _refuse(txn, ex.ATTEMPT_CAP,
                 f"task '{tid}': 総試行数 {count} が上限 {cap} に達しています。続けるなら --over-cap \"<理由>\" を付けるか、"
                 f"card の max_attempts を上げてください", slug, tid, meta)
+    return _write_reopen(txn, slug, tid, meta, body, kind=kind, reason=reason, count=count,
+                         over_cap=over_cap if over else None, bump=False, now=now)[0]
+
+
+def _write_reopen(txn, slug, tid, meta, body, *, kind, reason, count, over_cap, bump, now, root=None, root_reopen_count=None,
+                  dry_run=False):
+    """retry / reopen が task 1 枚を pending に戻す共通の書き込み (台帳 → card (コミット点) → 枠の撤去 → record)。
+
+    `bump=True` (reopen) は card の `reopen_count` を 1 増やす。台帳の `reopen_count` は**増やす前**の値 (同定キー
+    (execution_id, kind, reopen_count) が再送で変わらない)。`root` / `root_reopen_count` は cascade で戻される下流にだけ付く。
+    `dry_run=True` は台帳の食い違い (`HISTORY_MISMATCH` 等) を検査するだけで何も書かない。
+    戻り値: `(Execution, 台帳を再利用したか)`。dry_run は `(None, 再利用するか)`。"""
+    xid = meta.get('current_execution_id')
     previous = meta.get('status')
     owner = _owner_slot(meta)
     try:
@@ -1003,20 +1049,511 @@ def reopen_task(txn, slug, tid, *, kind, reason, over_cap=None, default_max_atte
             kind=kind, execution_id=xid, attempt=count, ended_at=ended_at, end_code=meta.get('execution_end_code'),
             reopen_count=reopen, head=meta.get('fail_head'), pr_number=meta.get('pr_number'), worker=meta.get('worker'),
             actor=_ledger_actor(txn), reason=reason, handoff_path=meta.get('handoff_path'),
-            over_cap=over_cap if over else None, result_state=hist.RESULT_NONE)
+            over_cap=over_cap, result_state=hist.RESULT_NONE, root=root, root_reopen_count=root_reopen_count)
         return _match_or_plan(txn, slug, tid, kind, xid, reopen, fields, text, ended_at)
 
-    _ended_at, _detail, _reused = _record_ledger(txn, slug, tid, meta, meta, body, NO_CALLER, end_code=None, now=now,
-                                                 resolver=resolver)
+    if dry_run:
+        try:
+            action = resolver(_now_text(now))[0]
+        except _LedgerProblem as e:
+            raise _err(e.code, e.message, slug, tid, xid) from None
+        return None, action == 'reuse'
+    _ended_at, _detail, reused = _record_ledger(txn, slug, tid, meta, meta, body, NO_CALLER, end_code=None, now=now,
+                                                resolver=resolver)
     out = dict(meta)
     out.update(status=_S_PENDING, worker=None, started_at=None, completed_at=None)
+    if bump:
+        out['reopen_count'] = reopen + 1
     for key in _RETRY_CLEARED_EVIDENCE:
         out.pop(key, None)
     txn.write_card(slug, tid, out, body)                         # コミット点
     if owner is not None:
         txn.retire_assignment(owner, slug, tid, None)
     txn.record(slug, tid, previous, _S_PENDING, None, execution_id=xid)
-    return _execution_of(txn, slug, tid, out)
+    return _execution_of(txn, slug, tid, out), reused
+
+
+# ---------------------------------------------------------------------------
+# reopen (vNext 02 PR-F: 確定した結果の再評価と下流の無効化。設計 §4)
+# ---------------------------------------------------------------------------
+
+@dataclasses.dataclass(frozen=True)
+class ReopenResult:
+    """`reopen_task(kind='reopen')` の戻り値。task id の並びは**書いた順** (I から遠い順)。"""
+    execution: Execution             # I の開き直した試行
+    reopened: tuple                  # cascade で done / verified から pending に戻した下流
+    reset: tuple                     # 実行中だった下流 (試行を RESET_BY_DIRECTOR で閉じて pending に戻した)
+    already: tuple                   # intent の一覧にあるが、実行の時点でもう戻す必要が無かった task (pending 等。回復・再実行で出る)
+    stale: tuple                     # 戻していない完了済みの下流 (古い結果に基づく。Director が判断する)
+    unreleased: tuple                # `released_deps` から I を消した下流
+    resumed: bool                    # 途中で止まった reopen を (回復・再実行で) intent に従って完了させた
+    stale_runnable: tuple = ()       # 戻さなかった pending の下流のうち、I の再完了を待たず古い中間の結果で走りうるもの
+
+
+#: reopen の intent の版 (`queue/missions/<slug>/reopen-intents/<root>-<n>.json`。設計 §4.3.1)
+INTENT_VERSION = 1
+_INTENT_KEYS = {'version', 'actor', 'root', 'root_reopen_count', 'reason', 'cascade', 'over_cap', 'root_capped', 'created_at', 'closure',
+                'tasks'}
+_TID_RE = re.compile(r't\d+')
+
+
+def intent_name(root, root_reopen_count):
+    """intent のファイル名 `<root>-<n>.json` (n = 新しい root の reopen_count。1 つの reopen に 1 ファイル)。"""
+    return f"{root}-{root_reopen_count}.json"
+
+
+def render_intent(intent):
+    return json.dumps(intent, ensure_ascii=False, sort_keys=True, indent=2) + '\n'
+
+
+def _intent_problem(slug, name, why):
+    return _err(ex.REOPEN_INTENT_INCOMPLETE,
+                f"{slug}: 未完の reopen の intent {name} を完了できません ({why})。同じ引数で `plan.sh reopen` を再実行するか、"
+                f"`plan.sh store-check` の reopen-intent-incomplete を見て card を直してください", slug)
+
+
+def parse_reopen_intent(slug, name, text):
+    """intent の text を検査して dict にする。形が違えば `REOPEN_INTENT_INCOMPLETE` (中身は出さない)。
+    推測で補わない: 欄の欠け・型違い・名前と root の食い違いは、完了させずに止める。"""
+    try:
+        data = json.loads(text)
+    except ValueError:
+        raise _intent_problem(slug, name, 'json_parse_error') from None
+    if not isinstance(data, dict) or set(data) != _INTENT_KEYS or data['version'] != INTENT_VERSION:
+        raise _intent_problem(slug, name, 'shape')
+
+    def _int(v):
+        return isinstance(v, int) and not isinstance(v, bool) and v >= 1
+
+    ok = (isinstance(data['root'], str) and _TID_RE.fullmatch(data['root']) and _int(data['root_reopen_count'])
+          and intent_name(data['root'], data['root_reopen_count']) == name
+          and (data['actor'] is None or isinstance(data['actor'], str))
+          and isinstance(data['reason'], str) and data['cascade'] in CASCADES
+          and (data['over_cap'] is None or isinstance(data['over_cap'], str)) and isinstance(data['root_capped'], bool)
+          and isinstance(data['created_at'], str)
+          and isinstance(data['closure'], list) and all(isinstance(x, str) and _TID_RE.fullmatch(x) for x in data['closure'])
+          and isinstance(data['tasks'], list))
+    if ok:
+        for t in data['tasks']:
+            if not (isinstance(t, dict) and set(t) == {'id', 'op', 'capped'} and isinstance(t['id'], str)
+                    and t['id'] in data['closure'] and t['op'] in ('reopen', 'reset') and isinstance(t['capped'], bool)):
+                ok = False
+                break
+    if not ok:
+        raise _intent_problem(slug, name, 'shape')
+    return data
+
+
+def list_pending_intents(txn, slug):
+    """未完の intent を `[(名前, dict)]` で返す (名前順)。**読めない・壊れた・名前の形でないものは `REOPEN_INTENT_INCOMPLETE`**
+    (無いことにしない)。dir が無い (ENOENT) のは未完なし。"""
+    listed = txn.list_reopen_intents(slug)
+    if listed[0] != 'ok':
+        raise _intent_problem(slug, '(dir)', listed[1])
+    out = []
+    for name in sorted(listed[1]):
+        if not store.INTENT_NAME_RE.fullmatch(name):
+            raise _intent_problem(slug, '(name)', 'unexpected_file')
+        got = txn.read_reopen_intent(slug, name)
+        if got[0] != 'ok':
+            raise _intent_problem(slug, name, got[1] if got[0] == 'unreadable' else 'absent')
+        out.append((name, parse_reopen_intent(slug, name, got[1])))
+    return out
+
+
+def execute_reopen_intent(txn, slug, intent, *, now=None, before_write=None, resumed=False):
+    """intent に従って reopen の書き込みを**最後まで**実行する (回復と、最初の実行の共通の道。t059)。**一覧を作り直さない**。
+
+    順序: mission の再活性化 (`before_write`) → 一覧の順 (I から遠い順) に 台帳 → card → `released_deps` の掃除 → **I の card を最後**
+    → intent を消す (= 完了。消す前に止まれば次の回復が同じ一覧で続ける)。各 task は「その操作がもう済んでいるか」を **card の今の
+    status** で確かめる (冪等): done / verified → 戻す (reopen_count + 1)、実行中 → 試行を閉じて pending (止まっている間に pull
+    された下流もここで戻る)、それ以外 (pending 等) → 済んでいる。台帳だけ書けて card が書けなかった孤児は台帳の同定キーで再利用する。
+    読めない card・試行の記録が無い card は `REOPEN_INTENT_INCOMPLETE` (推測で飛ばさない)。"""
+    global _LEDGER_ACTOR_OVERRIDE
+    previous = _LEDGER_ACTOR_OVERRIDE
+    _LEDGER_ACTOR_OVERRIDE = (intent['actor'],)
+    try:
+        return _execute_reopen_intent(txn, slug, intent, now=now, before_write=before_write, resumed=resumed)
+    finally:
+        _LEDGER_ACTOR_OVERRIDE = previous
+
+
+def _execute_reopen_intent(txn, slug, intent, *, now, before_write, resumed):
+    root, need, reason = intent['root'], intent['root_reopen_count'], intent['reason']
+    if resumed:
+        # 打ち直し: 止まっている間に中間の status が変わりうる (update --status skipped 等)。入口の拒否規則を残りの対象に当て直し、
+        # 当てはまれば**何も書かず** (intent も残す) 止まる。最初の実行は同じロックの中で検査したばかりなので省く
+        blockers = reopen_intent_blockers(txn, slug, intent)
+        if blockers:
+            raise _intent_blocked(slug, intent_name(root, need), blockers)
+    if before_write is not None:
+        before_write()
+    reopened, reset, already = [], [], []
+    for entry in intent['tasks']:
+        d = entry['id']
+        card, card_body = _load_for_intent(txn, slug, d, intent)
+        status = card.get('status')
+        over = intent['over_cap'] if entry['capped'] else None
+        if status in (_S_DONE, _S_VERIFIED):
+            if not ex.has_execution_fields(card):
+                raise _intent_problem(slug, intent_name(root, need), f'{d}:no_execution')
+            _write_reopen(txn, slug, d, card, card_body, kind='reopen', reason=reason, count=card['execution_count'],
+                          over_cap=over, bump=True, now=now, root=root, root_reopen_count=need)
+            reopened.append(d)
+        elif status in _HOLDING:
+            extra = dict(reason=reason, root=root, root_reopen_count=need)
+            if over is not None:
+                extra['over_cap'] = over
+            reset_task(txn, slug, d, NO_CALLER, now=now, ledger_extra=extra)
+            reset.append(d)
+        else:
+            already.append(d)
+    gone = {root} | {e['id'] for e in intent['tasks']}
+    unreleased = []
+    for d in intent['closure']:
+        card, card_body = _load_for_intent(txn, slug, d, intent)
+        released = card.get('released_deps')
+        declared = set(dep.declared_dependencies(card.get('blocked_by')))
+        if isinstance(released, list) and any(x in gone and x in declared for x in released):
+            out = dict(card)
+            kept = [x for x in released if not (x in gone and x in declared)]
+            if kept:
+                out['released_deps'] = kept
+            else:
+                out.pop('released_deps', None)
+            txn.write_card(slug, d, out, card_body)
+            txn.record(slug, d, card.get('status'), card.get('status'), None, execution_id=card.get('current_execution_id'))
+            unreleased.append(d)
+    meta, body = _load_for_intent(txn, slug, root, intent)
+    if meta.get('status') in _ACCEPTS['reopen']:
+        if not ex.has_execution_fields(meta):
+            raise _intent_problem(slug, intent_name(root, need), f'{root}:no_execution')
+        execution = _write_reopen(txn, slug, root, meta, body, kind='reopen', reason=reason, count=meta['execution_count'],
+                                  over_cap=intent['over_cap'] if intent['root_capped'] else None, bump=True, now=now)[0]
+    else:
+        execution = _execution_of(txn, slug, root, meta)         # 既に pending (card を書いた後で止まった)
+    txn.remove_reopen_intent(slug, intent_name(root, need))
+    return ReopenResult(execution=execution, reopened=tuple(reopened), reset=tuple(reset), already=tuple(already), stale=(),
+                        unreleased=tuple(unreleased), resumed=resumed)
+
+
+#: 打ち直しで当て直す拒否 (入口の `CASCADE_*` と同じ規則)。intent の `REOPEN_INTENT_INCOMPLETE` の理由に固定コードで出る
+_BLOCKER_PATH_CHANGED = 'PATH_CHANGED_WHILE_STALLED'
+
+
+def reopen_intent_blockers(txn, slug, intent):
+    """未完の intent を**今の card で**打ち直してよいかを書かずに検査する。止める理由の `[(task, 固定コード, status)]` (無ければ空)。
+
+    入口 (`_reopen_cascade`) の経路の拒否を、残りの対象に当て直す。止まっている間に許されている書き込み (retry / update --status /
+    release-dep / 報告。§4.3.1 の表) で経路上の中間が変わると、一覧どおりに実行しても I の再完了を待たずに走れる下流が残るため。
+    経路 = I から「一覧の task ∪ 今の cascade の終点」への依存の経路 (`_reopen_targets` / `dep.path_closure`。入口と同じ定義)。
+    **グラフは今の mission の全 card から作る** (t065。保存した closure だけだと、止まっている間に依存が付け替えられたとき新しい中間が
+    経路に現れない)。終点と一覧は intent のまま (新しい下流を推測で足さない)。mission の card が 1 枚でも読めなければ `REOPEN_INTENT_INCOMPLETE`
+    (入口の `CASCADE_UNREADABLE_CARDS` と同じ: 読めない card は依存の辺を隠す)。
+
+    | 経路上の task の今の status | 打ち直し |
+    |---|---|
+    | done / verified | 一覧にあれば戻す (reopen)。**一覧に無ければ止める** (`PATH_CHANGED_WHILE_STALLED`。決定の後に完了した = 古い結果) |
+    | 実行中 (`_HOLDING`) | 一覧にあれば試行を閉じて戻す。**一覧に無ければ止める** (`PATH_CHANGED_WHILE_STALLED`。t067: 置いたまま報告で done になると R が I より先に走る) |
+    | pending / needs_director / blocked / verification_failed | 通す (未完了。済んでいる) |
+    | skipped | **止める** `CASCADE_SKIPPED_ON_PATH` |
+    | failed (他の経路上の task の依存) | **止める** `CASCADE_FAILED_ON_PATH` (端の failed は通す) |
+    | 語彙の外 | **止める** `CASCADE_FAILED_ON_PATH` |
+
+    出口 (t067: 凍結中は plan.sh の update / retry が使えない): 止めた task の card を Director が直接 pending に戻してから、同じ
+    `plan.sh reopen` を再実行する (または他の queue を書くコマンド)。card が読めなければ `REOPEN_INTENT_INCOMPLETE`。
+    """
+    root = intent['root']
+    # 二重の網の 2 枚目 (t065): 経路は**今の mission の全 card から作ったグラフ**で調べる。保存した closure だけだと、止まっている間に
+    # 依存が付け替えられた (無関係な done の B を I に依存させ、R を B に依存させる) とき B が経路に現れず、B の古い結果の上で R が走る。
+    # 実行する一覧 (`tasks`) と終点 (`targets`) は intent のまま固定する (新しい下流を推測で足さない)。
+    all_ids = txn.list_mission_card_ids(slug)
+    if all_ids[0] != 'ok':
+        raise _intent_problem(slug, intent_name(root, intent['root_reopen_count']), all_ids[1])
+    ids = list(dict.fromkeys([root, *intent['closure'], *all_ids[1]]))
+    cards = {d: _load_for_intent(txn, slug, d, intent) for d in ids}
+    graph = {d: cards[d][0].get('blocked_by') for d in ids}
+    closure = [d for d in intent['closure'] if d in cards]
+    listed = {e['id'] for e in intent['tasks']}
+    targets = list(dict.fromkeys([*_reopen_targets(closure, cards, intent['cascade']), *listed]))
+    on_path = dep.path_closure(graph, root, targets) if targets else []
+    path_deps = {e: set(dep.declared_dependencies(graph.get(e))) for e in on_path}
+    out = []
+    for d in on_path:
+        st = cards[d][0].get('status')
+        if st == _S_SKIPPED:
+            out.append((d, ex.CASCADE_SKIPPED_ON_PATH, st))
+        elif st not in _status.TASK_STATUSES or (st == _S_FAILED and any(d in deps for e, deps in path_deps.items() if e != d)):
+            out.append((d, ex.CASCADE_FAILED_ON_PATH, st))
+        elif st in (_S_DONE, _S_VERIFIED) and d not in listed:
+            out.append((d, _BLOCKER_PATH_CHANGED, st))
+        elif st in _HOLDING and d not in listed:
+            # 二重の網 (t067): 一覧に無い task が実行中。回復は A を置いたまま intent を消すので、A が報告で done になると
+            # R が I より先に pull できる。凍結 (plan.sh) をすり抜けた経路 (直に card を書く等) でもここで止める
+            out.append((d, _BLOCKER_PATH_CHANGED, st))
+    return out
+
+
+def _intent_blocked(slug, name, blockers):
+    shown = ', '.join(f"{d}({code}, status={store._safe_status(st) or '<unknown>'})" for d, code, st in blockers)
+    return _err(ex.REOPEN_INTENT_INCOMPLETE,
+                f"{slug}: 未完の reopen の intent {name} を打ち直せません: 経路上の task が変わっています ({shown})。"
+                f"intent は残してあり、この mission の pull は止まっています。plan.sh の update / retry / add / release-dep は"
+                f" intent が残る間は凍結されている (t067) ので、出口: 止めた task の card を Director が直接 pending に戻してから"
+                f"(`plan.sh store-check` の reopen-intent-blocked が task と理由を示す)、同じ `plan.sh reopen` を再実行する", slug)
+
+
+def _load_for_intent(txn, slug, tid, intent):
+    try:
+        return _load(txn, slug, tid)
+    except ex.ControllerError:
+        raise _intent_problem(slug, intent_name(intent['root'], intent['root_reopen_count']), f'{tid}:card_unreadable') from None
+
+
+def recover_reopen_intents(txn, slug, *, now=None, before_write=None, skip_root=None):
+    """mission の未完の intent を**全部**完了する (名前順)。戻り値: `[(intent, ReopenResult)]`。
+    plan.sh の queue を書くコマンドがロックを取った直後に呼ぶ (設計 §4.3.1-4)。「回復は正本を書かない」の**意図した例外**:
+    intent は Director が決めた操作の続きで、推測による修復ではない。1 つでも完了できなければ `REOPEN_INTENT_INCOMPLETE`
+    (それまでに完了したものは残る)。`before_write(root)` は intent ごとに最初に呼ぶ (mission の再活性化)。`skip_root` の intent は飛ばす (同じ reopen の再実行が自分で扱う)。"""
+    done = []
+    for _name, intent in list_pending_intents(txn, slug):
+        if skip_root is not None and intent['root'] == skip_root:
+            continue
+        hook = (lambda root=intent['root']: before_write(root)) if before_write is not None else None
+        done.append((intent, execute_reopen_intent(txn, slug, intent, now=now, before_write=hook, resumed=True)))
+    return done
+
+
+def check_cascade(value):
+    """`--cascade` の検査 (None は既定の reviews)。不正な値は `INVALID_ARGUMENT`。戻り値: none / reviews / all。"""
+    if value is None:
+        return DEFAULT_CASCADE
+    if value not in CASCADES:
+        raise _err(ex.INVALID_ARGUMENT, f"--cascade は {' / '.join(CASCADES)} のどれかです")
+    return value
+
+
+def _skills_of(meta):
+    skills = meta.get('skills')
+    return [x for x in skills if isinstance(x, str)] if isinstance(skills, list) else []
+
+
+def _cascade_selects(cascade, meta):
+    if cascade == 'all':
+        return True
+    return cascade == 'reviews' and any(x in dep.CASCADE_REVIEW_SKILLS for x in _skills_of(meta))
+
+
+def _reopen_targets(closure, cards, cascade):
+    """reopen が「I の再完了より前に走らせてはいけない」下流の集合 (= 依存の経路を閉じる終点)。**この集合の定義はここ 1 か所**。
+    経路の閉包・skipped / failed の拒否・戻す集合 (done_set / reset_set)・stale_runnable・released_deps の掃除は全部ここから導く
+    (status ごとに足し算すると、足し忘れた status の下流が経路を閉じずに残る。PR #308 の指摘が 4 巡続いた族)。
+
+    ``cascade`` が none なら空 (何も戻さない)。それ以外は次の和集合 (どれも **status を問わない**):
+
+    * ``cascade`` が選んだ下流 (reviews = skills に review 系を持つ / all = 全部)。pending の review も含める
+    * 実行中の下流 (`_HOLDING`。試行を閉じて pending に戻す。選ばれたかを問わない)
+
+    戻す task の一覧は reopen の最初に **intent に 1 度だけ書く** (t059)。再実行・回復は一覧を作り直さない
+    (旧版の「台帳の印から済んだ所を推測し直す」は、止まっている間に下流が動くと取りこぼした)。
+    """
+    if cascade == 'none':
+        return []
+    return [d for d in closure if _cascade_selects(cascade, cards[d][0]) or cards[d][0].get('status') in _HOLDING]
+
+
+def _over_cap(card, cap_of):
+    """この card をもう一度 pending に戻すと総試行数の上限を超えるか。**reopen が pending に戻す全部の集合 (I・done_set の
+    中間と末端・reset_set) の上限の検査はこの 1 関数を通る** (集合ごとに書き写すと、片方だけ検査から漏れる。PR #308 の指摘)。
+    試行の記録が無い card は数えない (戻せるかは別の検査が見る)。"""
+    return ex.has_execution_fields(card) and card['execution_count'] >= cap_of(card)
+
+
+def _reopen_cascade(txn, slug, tid, *, reason, over_cap, default_max_attempts, now, cascade, graph, unreadable, before_write=None):
+    """`plan.sh reopen`: done / verified / skipped の task I を pending に戻し、`cascade` に従って下流を戻す (設計 §4)。
+
+    **検査を全部先に** (何も書かない。拒否は exit 3 + 拒否の行): I の遷移元・試行の記録・active でない・上限、下流の
+    (a) `--cascade none` で実行中 (CASCADE_ACTIVE_DOWNSTREAM) (b) 経路上の skipped (CASCADE_SKIPPED_ON_PATH) / failed
+    (CASCADE_FAILED_ON_PATH) (c) 戻す下流に試行の記録が無い (CASCADE_NO_EXECUTION) / active (ATTEMPT_ACTIVE) / 上限 (ATTEMPT_CAP)
+    (d) 読めない card (CASCADE_UNREADABLE_CARDS)。そのあと **intent に決定 (戻す task の一覧・操作・順序) を書き** (= コミット点。t059)、
+    `execute_reopen_intent` が一覧どおりに 下流 (I から遠い順。台帳 → card) → released_deps → I の card を最後 → intent を消す、と実行する。
+    途中で止まったら、次に queue を書く plan.sh コマンドが intent を最後まで実行する (一覧を作り直さない。`recover_reopen_intents`)。
+
+    * 戻す下流 = `cascade` が選ぶ task (reviews = skills に codex-review / review / qa。all = 全部) と、I からそこへの依存の経路上の
+      done / verified の task (閉包。`dep.path_closure`)。選ばれた task が**実行中**でも対象に数える (試行を閉じた後は経路の
+      中間も古い)。
+    * 実行中 (in_progress / ready_for_verification / verifying / needs_human_review) の下流は `cascade` が none 以外なら
+      選ばれたかを問わず試行を `RESET_BY_DIRECTOR` で閉じて pending に戻す (I が変わるので、動いている作業は古い土台の上にある)。
+    * 戻さなかった完了済みの下流は `stale` に列挙する (拒否も無効化もしない)。
+    * 下流の `released_deps` から、戻した task (I を含む) を消す。
+    """
+    reason = check_reason(reason, 'reason')
+    if over_cap is not None:
+        over_cap = check_reason(over_cap, 'over_cap')
+    _check_now(now)
+    if cascade not in CASCADES:
+        raise _err(ex.INVALID_ARGUMENT, f"cascade は {' / '.join(CASCADES)} のどれか", slug, tid)
+    if not isinstance(graph, dict) or tid not in graph:
+        raise _err(ex.INVALID_ARGUMENT, "graph は mission の全 task の {id: blocked_by}", slug, tid)
+    if isinstance(default_max_attempts, bool) or not isinstance(default_max_attempts, int) or default_max_attempts < 1:
+        raise _err(ex.INVALID_ARGUMENT, "default_max_attempts は正の整数", slug, tid)
+    if not isinstance(unreadable, (list, tuple)) or not all(isinstance(x, str) for x in unreadable):
+        raise _err(ex.INVALID_ARGUMENT, "unreadable は読めない card の id の並び", slug, tid)
+    meta, body = _load(txn, slug, tid)
+    xid = meta.get('current_execution_id')
+    if unreadable:
+        # 読めない・壊れた card は graph で「依存の無い孤立した node」に置き換わる = I からそこ・その先への辺が消える。下流の閉包が
+        # 分からないまま成功させると、消えた辺の先の完了済みの task が I の再完了より前に古い結果を保つ (Unreadable を空に潰さない)
+        _refuse(txn, ex.CASCADE_UNREADABLE_CARDS,
+                f"task '{tid}': mission に読めない・壊れた card があります ({', '.join(unreadable)})。下流の依存の経路が分からないので"
+                f" reopen しません。何も書いていません。先に `plan.sh status` で直し方を見て card を直してください", slug, tid, meta)
+    if not ex.has_execution_fields(meta):
+        _refuse(txn, ex.NOT_REOPENABLE,
+                f"task '{tid}': 試行の記録が無い card は reopen できません (台帳に写す試行が無い)。"
+                f"`update --reset` を使ってください", slug, tid, meta)
+    if meta.get('execution_status') in ex.ACTIVE_STATUSES:
+        _refuse(txn, ex.ATTEMPT_ACTIVE,
+                f"task '{tid}': 試行 ({meta.get('execution_status')}) がまだ active です。先に `plan.sh update {tid} --close-execution`"
+                f" か `--reset` で試行を閉じてください", slug, tid, meta)
+    if meta.get('status') not in _ACCEPTS['reopen']:
+        allowed = ', '.join(sorted(_ACCEPTS['reopen']))
+        shown = store._safe_status(meta.get('status')) or '<unknown>'
+        hint = (' (既に pending に戻っています。reopen は完了済みです)' if meta.get('status') == _S_PENDING
+                else ' (failed / needs_director 等は `plan.sh retry`)')
+        _refuse(txn, ex.NOT_REOPENABLE,
+                f"task '{tid}': reopen は status={shown!r} の task には使えません (受け付けるのは: {allowed}){hint}",
+                slug, tid, meta)
+    try:
+        root_reopen = _reopen_count(meta)
+    except _LedgerProblem as e:
+        raise _err(e.code, e.message, slug, tid, xid) from None
+    need = root_reopen + 1                                   # 下流の台帳の印 `root_reopen_count`
+
+    def cap_of(card):
+        try:
+            return hist.max_attempts_of(card, default_max_attempts)
+        except ValueError:
+            raise _err(ex.STATE_INVALID, f"{slug}/{card.get('id') or '?'}: card の max_attempts が壊れています", slug, tid) from None
+
+    root_over = _over_cap(meta, cap_of)
+    if root_over and over_cap is None:
+        _refuse(txn, ex.ATTEMPT_CAP,
+                f"task '{tid}': 総試行数 {meta['execution_count']} が上限 {cap_of(meta)} に達しています。続けるなら "
+                f"--over-cap \"<理由>\" を付けるか、card の max_attempts を上げてください", slug, tid, meta)
+
+    # 未完の intent がある mission では新しい reopen を始めない (plan.sh が先に完了させる。直に呼ばれたときの保険)
+    listed = txn.list_reopen_intents(slug)
+    if listed[0] != 'ok' or listed[1]:
+        raise _err(ex.REOPEN_INTENT_INCOMPLETE,
+                   f"{slug}: 未完の reopen の intent があります。先にそれを完了してください (同じ reopen の再実行か、"
+                   f"他の queue を書くコマンド)", slug, tid)
+
+    # ---- 下流の列挙と分類 (読むだけ) ----
+    closure = dep.downstream_closure(graph, tid)
+    cards = {d: _load(txn, slug, d) for d in closure}
+    active = [d for d in closure if cards[d][0].get('status') in _HOLDING]
+    if active and cascade == 'none':
+        _refuse(txn, ex.CASCADE_ACTIVE_DOWNSTREAM,
+                f"task '{tid}': 下流に実行中の task があります ({', '.join(active)})。--cascade reviews|all で試行を閉じて戻すか、"
+                f"先にそれらを終わらせてください", slug, tid, meta)
+    # 経路の終点は `_reopen_targets` の 1 か所 (選ばれた下流・実行中の下流。どちらも status を問わない)。
+    # I(done) → A(done) → R(pending, review) で A を done のまま残すと、R は A の古い結果で I の再完了より前に走る
+    # (依存の判定は直接の依存だけ)。実行中の B(code) を reset するなら、その手前の A も done のままにできない。
+    targets = _reopen_targets(closure, cards, cascade)
+    on_path = dep.path_closure(graph, tid, targets) if targets else []
+    for d in on_path:
+        if cards[d][0].get('status') == _S_SKIPPED:
+            route = dep.dependency_path(graph, tid, d)
+            _refuse(txn, ex.CASCADE_SKIPPED_ON_PATH,
+                    f"task '{tid}': 無効化の経路上に skipped の task {d} があります ({' -> '.join(route or [tid, d])})。"
+                    f"skipped の task は戻せないので reopen しません。先に {d} を `plan.sh reopen` で戻すか、--cascade を見直してください",
+                    slug, tid, meta)
+    # 経路上の中間 (= 経路上の別の task の依存になっている task) が failed のままだと、`failed` は「保留」で `released_deps` で
+    # 解除されている下流 (R) は I の再完了を待たずに pull できる (I → A(failed) → R(pending, released_deps=[A]))。戻す手段も無い
+    # (failed は reopen の遷移元でない) ので skipped と同じく拒否する。語彙に無い status は何も言えないので経路のどこでも拒否する。
+    # 経路の**端**にいるだけの failed (対象の review 自身が failed など) は依存元を持たない = 走る下流が無いので拒否しない。
+    # 他の status の扱いは §4.3 の表 (done / verified = 戻す・実行中 = 試行を閉じて戻す・pending / needs_director / blocked /
+    # verification_failed = そのまま。どれも未完了なので、それに依存する下流は I の再完了より前に pull できない)。
+    path_deps = {e: set(dep.declared_dependencies(graph.get(e))) for e in on_path}
+    for d in on_path:
+        st = cards[d][0].get('status')
+        if st not in _status.TASK_STATUSES or (st == _S_FAILED and any(d in deps for e, deps in path_deps.items() if e != d)):
+            route = dep.dependency_path(graph, tid, d)
+            shown = store._safe_status(st) or '<unknown>'
+            _refuse(txn, ex.CASCADE_FAILED_ON_PATH,
+                    f"task '{tid}': 無効化の経路上に status={shown!r} の task {d} があります ({' -> '.join(route or [tid, d])})。"
+                    f"failed は保留のまま残り、`released_deps` で解除された下流が I の再完了を待たずに走れてしまうので reopen しません。"
+                    f"先に {d} を `plan.sh retry` 等で片付けてから reopen してください", slug, tid, meta)
+    done_set = {d for d in on_path if cards[d][0].get('status') in (_S_DONE, _S_VERIFIED)}
+    reset_set = set(active)
+    if cascade != 'none':
+        problems = {ex.NOT_REOPENABLE: [], ex.ATTEMPT_ACTIVE: [], ex.ATTEMPT_CAP: []}
+        for d in closure:
+            if d not in done_set and d not in reset_set:
+                continue
+            card = cards[d][0]
+            if d in reset_set:                                # 実行中の下流: 試行を閉じて pending に戻す (次の pull が新しい試行)
+                if _over_cap(card, cap_of) and over_cap is None:
+                    problems[ex.ATTEMPT_CAP].append(d)
+            elif not ex.has_execution_fields(card):
+                problems[ex.NOT_REOPENABLE].append(d)
+            elif card.get('execution_status') in ex.ACTIVE_STATUSES:
+                problems[ex.ATTEMPT_ACTIVE].append(d)
+            elif _over_cap(card, cap_of) and over_cap is None:
+                problems[ex.ATTEMPT_CAP].append(d)
+        if problems[ex.NOT_REOPENABLE]:
+            _refuse(txn, ex.CASCADE_NO_EXECUTION,
+                    f"task '{tid}': 戻す下流に試行の記録が無い card があります ({', '.join(problems[ex.NOT_REOPENABLE])})。"
+                    f"台帳に写せないので cascade できません", slug, tid, meta)
+        if problems[ex.ATTEMPT_ACTIVE]:
+            _refuse(txn, ex.ATTEMPT_ACTIVE,
+                    f"task '{tid}': 戻す下流に active な試行が残る card があります ({', '.join(problems[ex.ATTEMPT_ACTIVE])})。"
+                    f"先に `plan.sh update <id> --close-execution` で閉じてください", slug, tid, meta)
+        if problems[ex.ATTEMPT_CAP]:
+            _refuse(txn, ex.ATTEMPT_CAP,
+                    f"task '{tid}': 戻す下流が総試行数の上限に達しています ({', '.join(problems[ex.ATTEMPT_CAP])})。"
+                    f"続けるなら --over-cap \"<理由>\" を付けてください", slug, tid, meta)
+    else:
+        done_set = set()
+    # 台帳の食い違い (孤児の台帳と違う中身) は書く前に見つける
+    _write_reopen(txn, slug, tid, meta, body, kind='reopen', reason=reason, count=meta['execution_count'],
+                  over_cap=over_cap if root_over else None, bump=True, now=now, dry_run=True)
+    for d in closure:
+        if d in done_set:
+            card = cards[d][0]
+            _write_reopen(txn, slug, d, card, cards[d][1], kind='reopen', reason=reason, count=card['execution_count'],
+                          over_cap=over_cap if _over_cap(card, cap_of) else None, bump=True, now=now,
+                          root=tid, root_reopen_count=need, dry_run=True)
+
+    # ---- 決定を書く (= コミット点)。戻す task の一覧・操作・順序をここで 1 度だけ決める (I から遠い順。I は最後) ----
+    work = [d for d in closure if d in done_set or d in reset_set]
+    intent = {
+        'version': INTENT_VERSION, 'actor': _ledger_actor(txn), 'root': tid, 'root_reopen_count': need, 'reason': reason, 'cascade': cascade,
+        'over_cap': over_cap, 'root_capped': bool(root_over), 'created_at': _now_text(now), 'closure': list(closure),
+        'tasks': [{'id': d, 'op': 'reset' if d in reset_set else 'reopen', 'capped': bool(_over_cap(cards[d][0], cap_of))}
+                  for d in work],
+    }
+    txn.write_reopen_intent(slug, intent_name(tid, need), render_intent(intent))
+    stale = [d for d in closure if cards[d][0].get('status') in (_S_DONE, _S_VERIFIED) and d not in work]
+    # 戻さなかった pending の下流で、I からの経路に「戻さなかった完了済みの中間」を持つもの = I の再完了を待たずに古い結果で走りうる
+    stale_set = set(stale)
+
+    def _released_failed_on_route(d):
+        # d への経路 (d を含む) のどこかが、failed の中間 m を `released_deps` で解除している
+        route = set(dep.path_closure(graph, tid, [d]))
+        for e in route:
+            released = cards[e][0].get('released_deps')
+            if isinstance(released, list):
+                for m in dep.declared_dependencies(graph.get(e)):
+                    if m in released and m in route and cards[m][0].get('status') == _S_FAILED:
+                        return True
+        return False
+
+    stale_runnable = [d for d in closure if cards[d][0].get('status') == _S_PENDING and d not in work
+                      and (any(m in stale_set for m in dep.path_closure(graph, tid, [d]) if m != d)
+                           or _released_failed_on_route(d))]
+    done = execute_reopen_intent(txn, slug, intent, now=now, before_write=before_write)
+    return dataclasses.replace(done, stale=tuple(stale), stale_runnable=tuple(stale_runnable), resumed=False)
 
 
 #: `mark_task` が扱う (command, to_status)。どれも**試行を変えない** task の遷移。verify-result の `needs_human_review`

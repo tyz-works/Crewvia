@@ -40,7 +40,8 @@ NAME_RE = store.HISTORY_NAME_RE
 
 #: 再送で比べる欄 (`ended_at` は除く。本文は `body` として別に比べる)。
 COMPARED_FIELDS = ('execution_id', 'attempt', 'kind', 'end_code', 'reopen_count', 'head', 'pr_number', 'worker',
-                   'actor', 'reason', 'handoff_path', 'over_cap', 'checkpoint_dir', 'result')
+                   'actor', 'reason', 'handoff_path', 'over_cap', 'checkpoint_dir', 'result',
+                   'root', 'root_reopen_count')
 
 #: `result` 欄の語彙 (§3.2)。recorded = 本文に Result 全文を入れた / none = その試行は Result を書かずに終わった /
 #: unattributed = 帰属の欄 (`result_execution_id`) が無い card (この設計より前のもの) で、旧本文の Result は入れない。
@@ -140,7 +141,8 @@ def _is_pr_number(value):
 
 
 #: 省略できる (None か str) 欄。型の違う値 (list / dict / bool / int) は `bad_field_type`。
-_OPTIONAL_TEXT_FIELDS = ('end_code', 'head', 'worker', 'actor', 'reason', 'handoff_path', 'over_cap', 'checkpoint_dir')
+_OPTIONAL_TEXT_FIELDS = ('end_code', 'head', 'worker', 'actor', 'reason', 'handoff_path', 'over_cap', 'checkpoint_dir',
+                         'root')
 
 
 def fields_problem(meta):
@@ -172,6 +174,9 @@ def fields_problem(meta):
             return 'bad_field_type'
     pr = meta.get('pr_number')
     if pr is not None and not _is_pr_number(pr):
+        return 'bad_field_type'
+    root_count = meta.get('root_reopen_count')
+    if root_count is not None and (isinstance(root_count, bool) or not isinstance(root_count, int) or root_count < 1):
         return 'bad_field_type'
     return None
 
@@ -254,14 +259,19 @@ def result_section(body):
 
 def build_event(*, kind, execution_id, attempt, ended_at, end_code=None, reopen_count=0, head=None,
                 pr_number=None, worker=None, actor=None, reason=None, checkpoint_dir=None,
-                handoff_path=None, over_cap=None, result_state=RESULT_NONE, result_text=''):
-    """`(fields, body)`。`result_state` が recorded のときだけ本文に Result 全文を入れる。"""
+                handoff_path=None, over_cap=None, result_state=RESULT_NONE, result_text='',
+                root=None, root_reopen_count=None):
+    """`(fields, body)`。`result_state` が recorded のときだけ本文に Result 全文を入れる。
+
+    `root` / `root_reopen_count` は reopen の cascade で戻された (閉じられた) 下流の task にだけ付ける (設計 §4.3.1-6):
+    起点 I の id と、その reopen を始めた時点の I の `reopen_count` + 1。`store-check` が「I の card がまだその回数に
+    届いていない」= cascade の途中で止まったことを見つけるための印。"""
     if result_state not in RESULT_STATES:
         raise HistoryError('bad_result')
     fields = dict(execution_id=execution_id, attempt=attempt, kind=kind, end_code=end_code, ended_at=ended_at,
                   reopen_count=reopen_count, head=head, pr_number=pr_number, worker=worker, actor=actor,
                   reason=reason, handoff_path=handoff_path, over_cap=over_cap, checkpoint_dir=checkpoint_dir,
-                  result=result_state)
+                  result=result_state, root=root, root_reopen_count=root_reopen_count)
     body = (result_text or '').rstrip() if result_state == RESULT_RECORDED else ''
     return fields, body
 
@@ -489,6 +499,11 @@ def orphan_reason(txn, slug, tid, meta, f):
         if (isinstance(card_status, str) and isinstance(card_exec, str)
                 and card_status in _status.ACCEPTS_FROM['retry'] and card_exec in ex.TERMINAL_EXECUTION_STATUSES):
             return kind
+    if kind == 'reopen' and xid == current and reopen_count_of(f) == (meta.get('reopen_count') or 0):
+        card_status, card_exec = meta.get('status'), meta.get('execution_status')
+        if (isinstance(card_status, str) and isinstance(card_exec, str)
+                and card_status in _status.ACCEPTS_FROM['reopen'] and card_exec in ex.TERMINAL_EXECUTION_STATUSES):
+            return kind                                      # 台帳だけ書けて card が pending に動いていない (reopen の孤児)
     return None
 
 
@@ -506,11 +521,12 @@ def diagnose(queue_dir, mission_slugs):
         if not isinstance(slug, str) or store._safe_token(slug) is None:
             continue
         root = Path(queue_dir) / 'missions' / slug
+        txn = store.Txn(queue_dir, op='diagnose', actor='diagnose')
+        out.extend(reopen_intents_incomplete(slug, txn))      # 台帳の dir が読めなくても報告する
         names, code = store._list_dir(str(root / store.HISTORY_DIRNAME))
         if code:
             out.append(('history_unobservable', slug, None, store._safe_detail(f"history: {code}")))
             continue
-        txn = store.Txn(queue_dir, op='diagnose', actor='diagnose')
         for tid in names:
             if not re.fullmatch(r't\d+', tid):
                 out.append(('history_unobservable', slug, None, 'redacted'))
@@ -549,3 +565,25 @@ def diagnose(queue_dir, mission_slugs):
                     if why is not None:
                         out.append(('history_orphan', slug, tid, why))
     return out
+
+
+#: store-check の `reopen-intent-incomplete: <root>` の種類名 (設計 §4.3.1-6)
+REOPEN_INTENT_INCOMPLETE = 'reopen-intent-incomplete'
+
+
+def reopen_intents_incomplete(slug, txn):
+    """未完の reopen の intent を**書かずに**列挙する: `[(kind, mission, root, 理由)]` (t059)。intent は reopen の決定の記録で、
+    完了すると消える。残っている = 途中で止まった。直すのは次に queue を書く plan.sh コマンド (pull を含む。ロックの直後に
+    intent を最後まで実行する) か、同じ `plan.sh reopen` の再実行。ここでは直さない。
+    読めない・名前の形でないものも「未完」として出す (無いことにしない)。"""
+    out = []
+    listed = txn.list_reopen_intents(slug)
+    if listed[0] != 'ok':
+        return [(REOPEN_INTENT_INCOMPLETE, slug, None, store._safe_detail(f"unobservable:{listed[1]}"))]
+    for name in sorted(listed[1]):
+        if not store.INTENT_NAME_RE.fullmatch(name):
+            out.append((REOPEN_INTENT_INCOMPLETE, slug, None, 'unexpected_file'))
+            continue
+        out.append((REOPEN_INTENT_INCOMPLETE, slug, name.split('-')[0], f'intent={name}'))
+    return out
+

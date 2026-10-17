@@ -104,6 +104,8 @@ ACCEPTS_FROM = {
     'verifying': frozenset({'ready_for_verification'}),
     # vNext 02 PR-E: 理由つきの再試行 (`plan.sh retry`)。遷移先は pending。試行が active のものは別の理由で拒否される
     'retry': frozenset({'failed', 'needs_director', 'needs_human_review', 'verification_failed'}),
+    # vNext 02 PR-F: 確定した結果の再評価 (`plan.sh reopen`)。遷移先は pending。failed 等は retry (上)
+    'reopen': frozenset({'done', 'verified', 'skipped'}),
 }
 
 

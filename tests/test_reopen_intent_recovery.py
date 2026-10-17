@@ -20,7 +20,7 @@ import shutil
 
 import pytest
 
-from execution_e3_helpers import MISSION, last_error_code, new_card, run, set_card
+from execution_e3_helpers import MISSION, last_error_code, run, set_card
 
 import lib_task_controller as ctl  # noqa: E402
 from test_reopen_cascade_plan_sh import (  # noqa: E402

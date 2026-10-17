@@ -1230,7 +1230,7 @@ def _load_for_intent(txn, slug, tid, intent):
         raise _intent_problem(slug, intent_name(intent['root'], intent['root_reopen_count']), f'{tid}:card_unreadable') from None
 
 
-def recover_reopen_intents(txn, slug, *, now=None, before_write=None, only_root=None, skip_root=None):
+def recover_reopen_intents(txn, slug, *, now=None, before_write=None, skip_root=None):
     """mission の未完の intent を**全部**完了する (名前順)。戻り値: `[(intent, ReopenResult)]`。
     plan.sh の queue を書くコマンドがロックを取った直後に呼ぶ (設計 §4.3.1-4)。「回復は正本を書かない」の**意図した例外**:
     intent は Director が決めた操作の続きで、推測による修復ではない。1 つでも完了できなければ `REOPEN_INTENT_INCOMPLETE`
@@ -1238,8 +1238,6 @@ def recover_reopen_intents(txn, slug, *, now=None, before_write=None, only_root=
     done = []
     for _name, intent in list_pending_intents(txn, slug):
         if skip_root is not None and intent['root'] == skip_root:
-            continue
-        if only_root is not None and intent['root'] != only_root:
             continue
         hook = (lambda root=intent['root']: before_write(root)) if before_write is not None else None
         done.append((intent, execute_reopen_intent(txn, slug, intent, now=now, before_write=hook, resumed=True)))

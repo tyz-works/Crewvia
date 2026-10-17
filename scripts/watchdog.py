@@ -1137,6 +1137,7 @@ def make_retirement_executor(repo_root: Path, *, queue_dir: Optional[Path] = Non
         queue_dir=queue_dir or Path(os.environ.get("CREWVIA_QUEUE", str(repo_root / "queue"))),
         grace_period=TERMINATE_GRACE_PERIOD,
         kill_delay=KILL_DELAY,
+        checkpoint_seconds=lib_daemon_watch.load_config().checkpoint_seconds,
     )
 
 

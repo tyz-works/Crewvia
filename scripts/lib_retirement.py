@@ -160,6 +160,7 @@ import contextlib
 import fcntl
 import json
 import os
+import re
 import signal
 import sys
 import time
@@ -237,6 +238,28 @@ SIGKILL_REPORT_AFTER = 3
 #: `plan.sh update` exit status for "the precondition did not hold".  Distinct
 #: from 1 (plan.sh is broken → retry) so cleanup can tell the two apart.
 PLAN_PRECONDITION_UNMET = 3
+
+#: `plan.sh retire` が exit 3 の stderr の**最後の行**に出す固定コード (`[plan.sh] error_code=<CODE>`)。exit 3 は理由が複数あるので、
+#: marker を消してよい (= 後始末はもう要らない・または Director に報告済みで再試行しても変わらない) のは下の集合のコードだけ。
+#: **未知のコード・コードの無い exit 3 は消さない** (`_cleanup_failed` = 再試行 + Director に通知)。retire に exit 3 の理由を足したら
+#: ここに足すか足さないかを決める (`tests/test_checkpoint_retirement_stage.py` が plan.sh 側の全コードを列挙して突き合わせる)。
+RETIRE_SETTLED_CODES = frozenset({
+    "EXECUTION_NOT_CURRENT", "EXECUTION_NOT_FOUND", "EXECUTION_ALREADY_TERMINAL",   # この試行はもう今の試行ではない
+    "RETIRE_STATUS_NOT_RETIRABLE", "RETIRE_WORKER_MISMATCH",                         # task が別の状態・別の Worker のもの
+    "RETIRE_ASSIGNMENT_UNVERIFIABLE", "STATE_INVALID",                               # 触れない (Director に other_state で報告して終える)
+})
+#: checkpoint の検証の拒否。試行の照合はまだ終わっていない (検証はロックの前) ので、後始末は**要る**: `--checkpoint none` でやり直す。
+RETIRE_CHECKPOINT_CODE = "CHECKPOINT_INVALID"
+_ERROR_CODE_LINE = re.compile(r"\[plan\.sh\] error_code=([A-Z][A-Z0-9_]*)")
+
+
+def plan_error_code(output: str) -> Optional[str]:
+    """plan.sh の出力 (stdout + stderr) の最後の非空行が `[plan.sh] error_code=<CODE>` ならその CODE。無ければ None。"""
+    lines = [ln for ln in (output or "").splitlines() if ln.strip()]
+    if not lines:
+        return None
+    m = _ERROR_CODE_LINE.fullmatch(lines[-1].strip())
+    return m.group(1) if m else None
 
 #: `plan.sh --no-wait` exit status for "the queue lock was held by somebody
 #: else, so nothing was written".  Kept distinct from 3 on purpose: 3 means
@@ -904,15 +927,31 @@ GUARD_UNPROVABLE = "unprovable"
 
 
 def _default_run_command(argv: list, env: dict) -> Tuple[int, str]:
+    import signal
     import subprocess
+    # Popen + own process group, not subprocess.run(timeout=): run() kills only the direct child on timeout and then
+    # waits on the pipes without a limit, so a grandchild that keeps them open (plan.sh's python/git) would stall
+    # watchdog's whole cycle.  Kill the group and bound the second wait too.
     try:
-        proc = subprocess.run(
-            argv, env=env, capture_output=True, text=True,
-            timeout=CLEANUP_COMMAND_TIMEOUT,
-        )
+        proc = subprocess.Popen(argv, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                start_new_session=True)
     except Exception as e:  # noqa: BLE001 — a failed cleanup must never crash the daemon
         return 1, f"{type(e).__name__}: {e}"
-    return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
+    try:
+        out, err = proc.communicate(timeout=CLEANUP_COMMAND_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            proc.kill()
+        try:
+            proc.communicate(timeout=2)
+        except Exception:  # noqa: BLE001 — give up on the pipes; the deadline matters more
+            pass
+        return 1, f"TimeoutExpired: {argv[0]} exceeded {CLEANUP_COMMAND_TIMEOUT}s"
+    except Exception as e:  # noqa: BLE001
+        return 1, f"{type(e).__name__}: {e}"
+    return proc.returncode, (out or "") + (err or "")
 
 
 def _default_kill_process(pid: int, sig: int) -> bool:
@@ -941,7 +980,8 @@ class RetirementExecutor:
                  log=None, notify=None, plan_sh=None, queue_dir=None,
                  grace_period: int = 60, kill_delay: int = 10,
                  run_command=None, kill_process=None, now=None,
-                 notify_once=None) -> None:
+                 notify_once=None, checkpoint_seconds: float = 20,
+                 take_checkpoint=None) -> None:
         self.registry_dir = Path(registry_dir)
         self.repo_root = Path(repo_root)
         self.mux = mux
@@ -970,6 +1010,11 @@ class RetirementExecutor:
         # notify-once ledger.  None = no ledger wired (tests, old callers); the
         # plain `notify` is used and there is no once-only guarantee.
         self.notify_once = notify_once
+        # vNext 02 PR-G: the checkpoint stage before `plan.sh retire`.  `checkpoint_seconds <= 0` = do not take one
+        # (`--checkpoint none`).  `take_checkpoint` is the injected seam (tests); the default is `lib_checkpoint.take`.
+        self.checkpoint_seconds = checkpoint_seconds
+        self._take_checkpoint_impl = take_checkpoint
+        self._checkpoint_results: dict = {}      # execution_id -> dir | "none" (this process only)
         # Notices `notify_once` could not deliver: {(key, fp): (mission, task,
         # message, first_attempt_at)}.  In memory on purpose — see
         # `_retry_owed_notices()`.
@@ -2052,9 +2097,11 @@ class RetirementExecutor:
             # the 70s termination stall this module was written to remove
             # (Codex 4 巡目 P2).  Nothing is lost by giving up: the marker stays
             # in flight and the next cycle asks again.
+            checkpoint = self._checkpoint_stage(agent, req, prog, mission, task_id, execution_id)
             argv = ["bash", str(self.plan_sh), "retire", task_id,
                     "--agent", agent, "--execution", execution_id,
-                    "--mission", mission, "--no-wait"]
+                    "--mission", mission, "--no-wait",
+                    "--checkpoint", checkpoint]
             env = dict(os.environ)
             # The audit log's `actor` for the retire row: this daemon, not "unknown" (execution.md §8).
             env["AGENT_NAME"] = "watchdog"
@@ -2062,6 +2109,21 @@ class RetirementExecutor:
                 env["CREWVIA_QUEUE"] = str(self.queue_dir)
             env["CREWVIA_REPO_ROOT"] = str(self.repo_root)
             rc, output = self.run_command(argv, env)
+            code = plan_error_code(output) if rc == PLAN_PRECONDITION_UNMET else None
+            if code == RETIRE_CHECKPOINT_CODE and checkpoint != "none":
+                # capture と retire の間に checkpoint が消えた・読めなくなった。Worker は kill 済みで、task と assignment はまだ
+                # active のまま: ここで marker を消すと後始末が二度と走らない。checkpoint だけ捨て、同じ試行の照合で retire をやり直す。
+                self.log(f"[retire] {agent}: checkpoint for {mission}/{task_id} no longer verifies — retiring without one")
+                self._checkpoint_failed_notice(mission, task_id, execution_id, "verify_failed")
+                self._checkpoint_results[execution_id] = "none"
+                argv[argv.index("--checkpoint") + 1] = "none"
+                rc, output = self.run_command(argv, env)
+                code = plan_error_code(output) if rc == PLAN_PRECONDITION_UNMET else None
+            if rc == PLAN_PRECONDITION_UNMET and code not in RETIRE_SETTLED_CODES:
+                # 理由が分からない exit 3 (コード無し・未知のコード・none でも出る CHECKPOINT_INVALID) を「要らない」と読まない。
+                return self._cleanup_failed(
+                    agent, prog, f"plan.sh retire exited {rc} (error_code={code or 'none'}): {output.strip()[:400]}",
+                    mission, task_id)
             if rc == PLAN_LOCK_BUSY:
                 # Not a failure: nothing was written and the obligation still
                 # stands.  Deliberately *not* routed through _cleanup_failed(),
@@ -2121,6 +2183,65 @@ class RetirementExecutor:
         unlink_quiet(progress_path(self.registry_dir, agent))
         unlink_quiet(stall_path(self.registry_dir, agent))
         return "cleaned"
+
+    def _checkpoint_stage(self, agent: str, req: Optional[dict], prog: dict, mission: str,
+                          task_id: str, execution_id: str) -> str:
+        """The `checkpoint` stage (vNext 02 PR-G, design §5.4): save the worktree, then retire.  Returns the dir or `"none"`.
+
+        **Never stops the retirement** — a retirement that waits on a checkpoint is a window nobody closes
+        (`daemon-authority.md` §5).  A failure, a deadline or an exception costs the checkpoint only: whatever was
+        half written is removed by `lib_checkpoint`, the Director hears once (per task + attempt) and the retire goes
+        on with `--checkpoint none`.  A retry of the same retirement (lock busy) finds the finished dir and reuses it.
+        """
+        seconds = self.checkpoint_seconds
+        if not seconds or seconds <= 0:
+            return "none"
+        if execution_id in self._checkpoint_results:      # a retry of the same retirement (lock busy): do not take it again
+            return self._checkpoint_results[execution_id]
+        reason = (req or {}).get("reason") or prog.get("reason") or "unknown"
+        window = (req or {}).get("window_target") or prog.get("window_target")
+        try:
+            pane_text = None
+            if window and self._window_alive(window):
+                try:
+                    pane_text = self.mux.capture(window) or None
+                except Exception:  # noqa: BLE001 — the pane is a bonus; the worktree is the point
+                    pane_text = None
+            take = self._take_checkpoint_impl
+            if take is None:
+                import lib_checkpoint
+                take = lib_checkpoint.take
+            path = take(registry_dir=self.registry_dir, queue_dir=self.queue_dir, mission=mission, task=task_id,
+                        execution_id=execution_id, reason=reason, pane_text=pane_text, seconds=seconds)
+            self.log(f"[retire] {agent}: checkpoint saved for {mission}/{task_id}")
+            self._checkpoint_results[execution_id] = str(path)
+            return str(path)
+        except Exception as e:  # noqa: BLE001 — see the docstring
+            code = getattr(e, "code", None) or type(e).__name__
+            if code == "nothing_to_save":      # no record / no worktree yet: not a failure, nothing to tell anyone
+                self.log(f"[retire] {agent}: no checkpoint for {mission}/{task_id} (nothing to save)")
+                self._checkpoint_results[execution_id] = "none"
+                return "none"
+            self.log(f"[retire] {agent}: checkpoint failed for {mission}/{task_id} ({code}) — retiring without one")
+            self._checkpoint_failed_notice(mission, task_id, execution_id, code)
+            self._checkpoint_results[execution_id] = "none"
+            return "none"
+
+    def _checkpoint_failed_notice(self, mission: str, task_id: str, execution_id: str, code: str) -> None:
+        message = (
+            f"[checkpoint] task {task_id} (mission={mission}) の退役の直前の保存 (checkpoint) に失敗しました ({code})。"
+            f"退役は止めず checkpoint なしで続けます。worktree の未 commit の作業が残っているか、"
+            f"worktree を直接確認してください (record の git.worktree)。"
+        )
+        key, fp = f"checkpoint_{mission}_{task_id}", f"exec:{execution_id}"
+        if self.notify_once is None:
+            try:
+                if self.notify is not None:
+                    self.notify(message)
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        self._deliver_notice(key, fp, mission, task_id, message)
 
     def _cleanup_failed(self, agent: str, prog: dict, why: str,
                         mission: Optional[str], task_id: Optional[str]) -> str:

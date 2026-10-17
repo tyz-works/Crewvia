@@ -1,0 +1,1274 @@
+#!/usr/bin/env python3
+"""lib_checkpoint.py — 退役の直前に worktree の状態を保存する (vNext 02 PR-G / P3)。
+
+設計: `knowledge/vnext-02-attempt-reopen-checkpoint.md` §5。Worker が無言で止まって退役させられると、worktree の
+未 commit の作業が失われかける (2026-10-04・10-05・10-11)。退役の実行者 (watchdog 側の `lib_retirement.py`) が
+`plan.sh retire` の**前**にここを呼び、次の試行 (`previous_attempt.checkpoint_dir`)・Director が読めるように残す。
+
+契約
+----
+* **worktree を読むだけ**。worktree・queue のどちらにも書かない (git は `diff` / `status` / `ls-files` / `hash-object` /
+  `rev-parse` だけ。textconv・外部 diff・index の更新 (`--no-optional-locks`) を起動しない)。
+* 置き場は `registry/checkpoints/<mission>/<tid>/<execution_id>/` (gitignored・dir 0700 / file 0600)。書き終えるまでは
+  `<execution_id>.partial` に作り、**最後に rename** する (途中で落ちた dir が本物に見えない)。
+* **秘密を生で残さない**: 秘密らしいファイル名は保存しない。保存する内容 (patch・untracked・pane・status) は全部 redaction
+  を通し、**redaction が例外になったファイルは保存しない**。バイナリの内容は保存しない (圧縮・符号化された中の秘密を検出できない)。
+* 失敗しても呼び出し側を止めない。`take()` は成功なら dir を、失敗なら `CheckpointError` (固定コード) を出し、途中の dir は消す。
+  期限 (`deadline`) は cooperative: 各段の前に確かめ、git の subprocess の timeout は残り時間で切る。
+
+CLI (観察用の手書き marker の手順・手動確認用):
+    lib_checkpoint.py take   --registry-dir R --queue-dir Q --mission M --task tNNN --execution ex-… [--reason R] [--seconds 20]
+    lib_checkpoint.py verify <dir> [--execution ex-…]
+"""
+import argparse
+import fnmatch
+import json
+import os
+import re
+import select
+import signal
+import stat
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from lib_daemon_state import load_json_store  # noqa: E402  (registry / queue の JSON の読み口。形の検証つき)
+from lib_task_cards import Unreadable, is_missing  # noqa: E402
+
+SCHEMA_VERSION = 1
+
+#: dirty.patch の上限 (redaction の後で切る。秘密を途中で割って残さないため)
+PATCH_LIMIT = 1024 * 1024
+#: git の出力を読む上限 (redaction の対象の上限でもある。超えた分は捨てて truncated にする)
+GIT_READ_LIMIT = 8 * 1024 * 1024
+#: untracked の 1 ファイル / 合計の上限
+UNTRACKED_FILE_LIMIT = 64 * 1024
+UNTRACKED_TOTAL_LIMIT = 2 * 1024 * 1024
+#: 列挙する untracked の件数の上限 (超えた分は件数だけ)
+UNTRACKED_LISTING_LIMIT = 2000
+#: バイナリ判定に使う先頭のバイト数
+BINARY_SNIFF = 8 * 1024
+PANE_LINES = 200
+#: 1 回の git に許す時間の上限 (残り時間がこれより短ければ残り時間)
+GIT_TIMEOUT = 10.0
+DEFAULT_SECONDS = 20.0
+
+FILE_MODE = 0o600
+DIR_MODE = 0o700
+PARTIAL_SUFFIX = '.partial'
+META_NAME = 'meta.json'
+
+_EXECUTION_ID_RE = re.compile(r'ex-[0-9a-f]{32}')
+
+# 固定コード (メッセージ・ログにはこれと位置だけを出す。値・内容は出さない)
+E_NO_WORKTREE = 'no_worktree'
+E_RECORD = 'record_unreadable'
+E_DEADLINE = 'deadline'
+E_GIT = 'git_failed'
+E_WRITE = 'write_failed'
+E_EXISTS = 'exists_mismatch'
+E_ARGS = 'invalid_argument'
+E_VERIFY = 'verify_failed'
+E_NOTHING = 'nothing_to_save'
+E_PATH = 'unsafe_path'          # checkpoints/ 以下に symlink (または dir でないもの) がある: 外へ書かない・消さない
+
+
+class CheckpointError(Exception):
+    """固定コード `code` が契約。メッセージに worktree の内容・秘密を入れない。"""
+
+    def __init__(self, code, detail=''):
+        super().__init__(f"{code}: {detail}" if detail else code)
+        self.code = code
+
+
+# ---------------------------------------------------------------------------
+# 秘密 (設計 §5.3)
+# ---------------------------------------------------------------------------
+
+#: ファイル名 (パスの各成分に当てる。大文字小文字は区別しない)。設計 §5.3 / security.md と 1 対 1 (狭めない)。
+#:   設計の `.env*`            → `.env*`        (`.envrc` / `.env.local` / `.environment` も。取りすぎる側)
+#:   設計の `*.pem` ... `*_ed25519` / `*credentials*` → そのまま
+#:   設計の `*.secret*`        → `*.secret*`    (`x.secret` / `x.secrets` / `prod.secrets.yaml` / `a.secret.json`)
+SECRET_NAME_GLOBS = ('.env*', '*.pem', '*.key', '*.p12', '*.pfx', '*_rsa', '*_dsa', '*_ed25519',
+                     '*credentials*', '*.secret*')
+
+
+def is_secret_name(path):
+    """パスのどの成分 (dir 名を含む) が秘密らしいファイル名に当たるか。dir 名まで見るのは安全側 (取りすぎる側) に倒すため。"""
+    for part in re.split(r'[\\/]+', str(path)):
+        low = part.lower()
+        if low and any(fnmatch.fnmatchcase(low, g) for g in SECRET_NAME_GLOBS):
+            return True
+    return False
+
+
+# 値の長さに**上限を置かない**: 印 (キー名・prefix) を regex で見つけ、値は「区切り (空白・引用符・行末) まで」を線形に読み進めて
+# 丸ごと置き換える (上限つきの regex は長い値の先頭だけを置き換えて残りを生で残した = PR #307 の Codex 1 巡目 P1)。
+# 量指定子は入れ子にしない・値の読み進めは `\S*` のような 1 文字クラスの run か、引用符つきの値の分割 (backslash の所だけ python の
+# loop) だけなので 1MB の 1 行でも線形 (tests で通す)。値の長さが VALUE_SCAN_LIMIT を超えたら `RedactionError` (呼び出し側は
+# そのファイルを保存しない)。
+VALUE_SCAN_LIMIT = 4 * 1024 * 1024
+
+
+class RedactionError(Exception):
+    """redaction を最後までやり切れなかった (値が扱える上限を超えた)。呼び出し側は生のまま残さず、そのファイルを保存しない。"""
+
+
+_BEGIN_KEY = re.compile(r'-----BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY-----')
+_END_KEY_RE = re.compile(r'-----END [A-Z0-9 ]{0,40}PRIVATE KEY-----')
+#: (印, 印の後ろに最低限必要な長さ)。値は印の直後から区切りまで。`sk-` は直前が英字なら除く (`task-graph-notes` を拾わない)
+_TOKEN_PATTERNS = (
+    (re.compile(r'op://'), 1),
+    (re.compile(r'(?:ghp|gho|ghs|ghu|ghr)_'), 20),
+    (re.compile(r'github_pat_'), 20),
+    (re.compile(r'(?<![A-Za-z])sk-'), 16),
+    (re.compile(r'AKIA'), 16),
+    (re.compile(r'xox[abprs]-'), 10),
+)
+_BEARER = re.compile(r'Bearer[ \t]+', re.IGNORECASE)
+_BEARER_MIN = 8
+_IDENT = re.compile(r'[A-Za-z0-9_]+')
+_ASSIGN_MARK = re.compile(r'TOKEN|SECRET|PASSWORD|PASSWD|API_KEY', re.IGNORECASE)
+_ASSIGN_TAIL = re.compile(r'["\']?[ \t]*[=:][ \t]*')
+_UNQUOTED = re.compile(r'[^\s"\']*')
+_VALUE_RUN = re.compile(r'\S*')
+_QUOTED_RUN = {'"': re.compile(r'[^"\\\n]*'), "'": re.compile(r"[^'\\\n]*")}
+
+
+def _check_len(start, end):
+    if end - start > VALUE_SCAN_LIMIT:
+        raise RedactionError('value_too_long')
+
+
+def _quoted_end(text, start):
+    """`text[start]` が引用符。閉じる引用符の直後 (同じ行に無ければ行末 = 閉じていない値は行の残りを全部) を返す。"""
+    q = text[start]
+    rx = _QUOTED_RUN[q]
+    n = len(text)
+    j = start + 1
+    while True:
+        j = rx.match(text, j).end()
+        if j >= n:
+            return n
+        ch = text[j]
+        if ch == q:
+            return j + 1
+        if ch == '\\':
+            if j + 1 < n and text[j + 1] != '\n':
+                j += 2
+                continue
+            return min(j + 1, n)
+        return j                                   # 改行: 閉じていない値は行末まで
+
+
+def _assign_spans(text):
+    """`KEY=値` / `"password": "値"` の**値の側**の (start, end)。キー名の長さに上限は無い (識別子の run ごとに 1 回だけ見る)。"""
+    pos = 0
+    n = len(text)
+    for m in _IDENT.finditer(text):
+        if m.start() < pos:
+            continue
+        if not _ASSIGN_MARK.search(text, m.start(), m.end()):
+            continue
+        t = _ASSIGN_TAIL.match(text, m.end())
+        if not t:
+            continue
+        vs = t.end()
+        if vs >= n or text[vs] in '\r\n':
+            continue
+        ve = _quoted_end(text, vs) if text[vs] in '"\'' else _VALUE_RUN.match(text, vs).end()
+        _check_len(vs, ve)
+        if ve > vs:
+            yield vs, ve
+            pos = ve
+
+
+def _is_quote(ch):
+    return ch == '"' or ch == "'"
+
+
+def _prefixed_spans(text, pattern, minimum, keep_prefix, run, quoted_value=False):
+    """印の後ろの値の (start, end)。値が引用符で始まる (`quoted_value`) ときは閉じる引用符まで (閉じなければ行末)。
+    印の**直前**が引用符 (`"ghp_…"` / `"op://My Vault/…"`) なら、閉じる引用符までを値に含める (中に空白があっても残さない)。"""
+    pos = 0
+    n = len(text)
+    while True:
+        m = pattern.search(text, pos)
+        if not m:
+            return
+        vs = m.end()
+        if quoted_value and vs < n and _is_quote(text[vs]):
+            ve = _quoted_end(text, vs)
+            closed = ve - 1 > vs and text[ve - 1] == text[vs]
+            inner = ve - vs - (2 if closed else 1)
+        else:
+            ve = run.match(text, vs).end()
+            inner = ve - vs
+            if m.start() > 0 and _is_quote(text[m.start() - 1]) and inner >= minimum:
+                ve = max(ve, _quoted_end(text, m.start() - 1))
+        if inner < minimum:
+            pos = vs
+            continue
+        _check_len(vs, ve)
+        yield (vs if keep_prefix else m.start()), ve
+        pos = ve
+
+
+_URL_SCHEME_CHARS = frozenset('ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+.-')
+_URL_BOUND = re.compile(r'[^\s"\']*')
+
+
+def _url_auth_spans(text):
+    """`<scheme>://<user>:<pass>@host` の `<pass>` の (start, end)。`@` は領域の**最後**のものを取る (pass に生の `@` があっても残さない)。
+    領域 = 空白・引用符までの run (URL が引用符の直後なら閉じる引用符まで)。長さで切らない。領域ごとに 1 回だけ見る (線形)。"""
+    pos = 0
+    n = len(text)
+    while True:
+        # `://` を find で探し、scheme は手前へ戻って読む (regex の `[A-Za-z][..]*://` は長い英数字の run の各文字から
+        # 先を読み直して O(n^2) になる)。戻るのは pos まで = 全体で線形
+        sep = text.find('://', pos)
+        if sep < 0:
+            return
+        b = sep
+        while b > pos and text[b - 1] in _URL_SCHEME_CHARS:
+            b -= 1
+        while b < sep and not ('a' <= text[b].lower() <= 'z'):
+            b += 1                                  # scheme は英字で始まる
+        if b >= sep:
+            pos = sep + 3
+            continue
+        start = sep + 3
+        if b > 0 and _is_quote(text[b - 1]):
+            end = _quoted_end(text, b - 1)
+            if end > start and text[end - 1] == text[b - 1]:
+                end -= 1
+        else:
+            end = _URL_BOUND.match(text, start).end()
+        pos = max(end, start)
+        at = text.rfind('@', start, end)
+        if at < 0:
+            continue
+        colon = text.find(':', start, at)
+        if colon < 0 or at - colon <= 1:
+            continue
+        slash = min((i for i in (text.find('/', start, colon), text.find('?', start, colon), text.find('#', start, colon)) if i >= 0),
+                    default=-1)
+        if slash >= 0:                              # `:` の前に path があれば userinfo ではない (`https://host/a:b@c`)
+            continue
+        _check_len(colon + 1, at)
+        yield colon + 1, at
+
+
+def _replace_spans(text, spans, counter):
+    out = []
+    last = 0
+    for s, e in spans:
+        if s < last:
+            continue
+        counter[0] += 1
+        out.append(text[last:s])
+        out.append(f"[REDACTED:{counter[0]}]")
+        last = e
+    out.append(text[last:])
+    return ''.join(out)
+
+
+def redact(text):
+    """`(redacted, count)`。置き換えは `[REDACTED:<n>]` (n は 1 から。このファイルの中の通し番号)。例外 (`RedactionError` を含む) は
+    そのまま出す (呼び出し側が「そのファイルを保存しない」に倒す)。"""
+    counter = [0]
+    out = []
+    pos = 0
+    # 1. 秘密鍵: BEGIN から END まで (END が無ければ末尾まで)。regex の `.*?` を使わず find で線形にする。
+    #    BEGIN より前に END が見えたら、鍵の途中から始まる文字列 (切り出した hunk・ペインの上端) なので先頭から END までを伏せる
+    # 見つけた印は pos を越えるまで持ち回す (毎回先頭から探し直すと END だけが並ぶ入力で二乗になる)。None は「これ以降に無い」
+    m = stray = False
+    while True:
+        if m is False or (m is not None and m.start() < pos):
+            m = _BEGIN_KEY.search(text, pos)
+        if stray is False or (stray is not None and stray.start() < pos):
+            stray = _END_KEY_RE.search(text, pos)
+        if stray and (not m or stray.start() < m.start()):
+            counter[0] += 1
+            out.append(f"[REDACTED:{counter[0]}]")
+            pos = stray.end()
+            continue
+        if not m:
+            out.append(text[pos:])
+            break
+        out.append(text[pos:m.start()])
+        counter[0] += 1
+        out.append(f"[REDACTED:{counter[0]}]")
+        e = _END_KEY_RE.search(text, m.end())
+        if not e:
+            break
+        pos = e.end()
+    text = ''.join(out)
+
+    for pat, minimum in _TOKEN_PATTERNS:
+        text = _replace_spans(text, _prefixed_spans(text, pat, minimum, False, _VALUE_RUN), counter)
+    text = _replace_spans(text, _prefixed_spans(text, _BEARER, _BEARER_MIN, True, _UNQUOTED, quoted_value=True), counter)
+    text = _replace_spans(text, _url_auth_spans(text), counter)
+    text = _replace_spans(text, _assign_spans(text), counter)
+    return text, counter[0]
+
+
+def path_is_secret(path):
+    """出力に出るパスに使う検出 (is_secret_name + 内容と同じ redaction)。検出できない・redaction が失敗したときも秘密として扱う (出さない側)。"""
+    if is_secret_name(path):
+        return True
+    try:
+        return redact(str(path))[1] > 0
+    except Exception:  # noqa: BLE001
+        return True
+
+
+# ---------------------------------------------------------------------------
+# git (読み取りだけ)
+# ---------------------------------------------------------------------------
+
+#: git に引き継ぐ env (最小)。**`GIT_*` は 1 つも引き継がない**: pathspec の解釈を変えるもの (`GIT_LITERAL_PATHSPECS` で
+#: `:(exclude,literal)` が普通のファイル名になり、鍵を含むファイルの除外が効かなくなる)・repo を差し替えるもの
+#: (`GIT_DIR` / `GIT_WORK_TREE` / `GIT_INDEX_FILE` / `GIT_OBJECT_DIRECTORY` / `GIT_COMMON_DIR`)・config を足すもの
+#: (`GIT_CONFIG_COUNT` / `GIT_CONFIG_KEY_*` / `GIT_CONFIG_PARAMETERS`)・外部プログラムを起動するもの
+#: (`GIT_EXTERNAL_DIFF` / `GIT_PAGER` / `GIT_ASKPASS` …) を、列挙して落とす (denylist) と新しい変数が漏れる。
+_GIT_ENV_KEEP = ('PATH', 'HOME', 'TMPDIR', 'TZ')
+
+
+def _git_env():
+    env = {k: os.environ[k] for k in _GIT_ENV_KEEP if k in os.environ}
+    # global / system の設定 (LFS 等の filter.*) と属性は読まない。repo ローカルの filter は `_refuse_local_filters` が止める
+    env.update(GIT_CONFIG_GLOBAL='/dev/null', GIT_CONFIG_NOSYSTEM='1', GIT_ATTR_NOSYSTEM='1')
+    # pathspec は既定の解釈 (magic が効く) に明示で固定する。`:(exclude,literal)` と `:(literal)` に頼っている
+    env.update(GIT_LITERAL_PATHSPECS='0', GIT_GLOB_PATHSPECS='0', GIT_NOGLOB_PATHSPECS='0', GIT_ICASE_PATHSPECS='0')
+    env['GIT_OPTIONAL_LOCKS'] = '0'
+    env['GIT_TERMINAL_PROMPT'] = '0'
+    env['LC_ALL'] = 'C'
+    return env
+
+
+class _Clock:
+    def __init__(self, seconds, now=None):
+        self._now = now or time.monotonic
+        self.deadline = self._now() + float(seconds)
+
+    def remaining(self):
+        return self.deadline - self._now()
+
+    def check(self):
+        if self.remaining() <= 0:
+            raise CheckpointError(E_DEADLINE)
+
+
+def _kill_group(proc):
+    """git を別セッションで起動しているので、子 (filter・ssh 等) ごとプロセスグループで止める。"""
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+
+REAP_SECONDS = 2.0
+
+
+def _reap(proc):
+    """子の終了を**有限の時間だけ**待つ。超えたらプロセスグループごと kill してもう一度だけ待つ (それでも死なない子は見捨てる =
+    D 状態など。期限を守ることを優先する)。"""
+    for _ in range(2):
+        try:
+            proc.wait(timeout=REAP_SECONDS)
+            return
+        except subprocess.TimeoutExpired:
+            _kill_group(proc)
+
+
+def _wait_within(clock, proc, hard_stop):
+    """stdout の EOF の後の `wait()` にも同じ期限を当てる (stdout を閉じてから固まる子で 1 サイクルを止めない)。
+    超えたらグループごと kill して `E_DEADLINE` / `E_GIT` (timeout)。"""
+    left = min(clock.remaining(), hard_stop - clock._now())
+    try:
+        proc.wait(timeout=max(0.0, left))
+    except subprocess.TimeoutExpired:
+        _kill_group(proc)
+        _reap(proc)
+        raise CheckpointError(E_DEADLINE if clock.remaining() <= 0 else E_GIT, 'timeout')
+
+
+def _run_git(clock, worktree, *args, limit=GIT_READ_LIMIT, check=True):
+    """`(returncode, stdout_bytes, truncated)`。timeout は残り時間 (上限 GIT_TIMEOUT)。失敗は `E_GIT` (check=True のとき)。"""
+    clock.check()
+    timeout = max(0.1, min(GIT_TIMEOUT, clock.remaining()))
+    argv = ['git', '--no-optional-locks', '-c', 'core.fsmonitor=false', '-c', 'core.attributesFile=/dev/null',
+            '-C', worktree, *args]
+    try:
+        proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+                                env=_git_env(), start_new_session=True)
+    except OSError:
+        raise CheckpointError(E_GIT, 'spawn')
+    chunks, size, truncated = [], 0, False
+    fd = proc.stdout.fileno()
+    hard_stop = clock._now() + timeout
+    try:
+        while True:
+            left = min(clock.remaining(), hard_stop - clock._now())
+            if left <= 0:
+                _kill_group(proc)
+                _reap(proc)
+                raise CheckpointError(E_DEADLINE if clock.remaining() <= 0 else E_GIT, 'timeout')
+            ready, _, _ = select.select([fd], [], [], min(0.2, left))
+            if not ready:
+                continue
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+            if size > limit:
+                truncated = True
+                _kill_group(proc)
+                break
+        _wait_within(clock, proc, hard_stop)
+        data = b''.join(chunks)[:limit]
+    finally:
+        try:
+            proc.stdout.close()
+        except OSError:
+            pass
+    if check and not truncated and proc.returncode != 0:
+        raise CheckpointError(E_GIT, f"exit {proc.returncode}")
+    return proc.returncode, data, truncated
+
+
+def _git_text(clock, worktree, *args, limit=GIT_READ_LIMIT):
+    rc, data, truncated = _run_git(clock, worktree, *args, limit=limit)
+    return data.decode('utf-8', errors='replace'), truncated
+
+
+# ---------------------------------------------------------------------------
+# 出力の書き込み (0700 / 0600・symlink を辿らない)
+# ---------------------------------------------------------------------------
+
+_DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+
+
+def _component_ok(name):
+    return isinstance(name, str) and name not in ('', '.', '..') and '/' not in name and '\x00' not in name
+
+
+class SafeDir:
+    """開いた dir の fd。**symlink を 1 つも辿らず**、この fd を基点に (`openat` / `mkdirat` / `unlinkat` / `renameat`) 書く・消す。
+
+    パスの文字列を `makedirs` / `open` / `rename` に渡すと、途中の成分が symlink のとき外を指す (`O_NOFOLLOW` は最後の成分しか
+    守らない)。ここは 1 段ずつ `O_DIRECTORY | O_NOFOLLOW` で開き、symlink (または dir でないもの) があれば `CheckpointError(E_PATH)`。
+    基点 (`open_root`) だけは辿る (設定で決めた registry の場所。別のディスクへの symlink でもよい)。
+    """
+
+    def __init__(self, fd):
+        self.fd = fd
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+    def close(self):
+        if self.fd is not None:
+            try:
+                os.close(self.fd)
+            except OSError:
+                pass
+            self.fd = None
+
+    @classmethod
+    def open_root(cls, path, create=False):
+        path = os.fspath(path)
+        if create:
+            os.makedirs(path, mode=DIR_MODE, exist_ok=True)
+        try:
+            return cls(os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC))
+        except FileNotFoundError:
+            if create:
+                raise
+            return None
+        except OSError as e:
+            raise CheckpointError(E_PATH, type(e).__name__)
+
+    def child(self, name, create=False, chmod=False):
+        """子 dir を開く (`SafeDir`)。無ければ `create` のとき 0700 で作り、`create=False` なら None。symlink は `E_PATH`。"""
+        if not _component_ok(name):
+            raise CheckpointError(E_PATH, 'name')
+        made = False
+        try:
+            fd = os.open(name, _DIR_FLAGS, dir_fd=self.fd)
+        except FileNotFoundError:
+            if not create:
+                return None
+            try:
+                os.mkdir(name, DIR_MODE, dir_fd=self.fd)
+                made = True
+            except FileExistsError:
+                pass
+            except OSError as e:
+                raise CheckpointError(E_WRITE, type(e).__name__)
+            try:
+                fd = os.open(name, _DIR_FLAGS, dir_fd=self.fd)
+            except OSError as e:
+                raise CheckpointError(E_PATH, type(e).__name__)
+        except OSError as e:              # ELOOP (symlink) / ENOTDIR (dir でない)
+            raise CheckpointError(E_PATH, type(e).__name__)
+        if made or chmod:
+            try:
+                os.fchmod(fd, DIR_MODE)
+            except OSError as e:
+                os.close(fd)
+                raise CheckpointError(E_PATH, type(e).__name__)
+        return SafeDir(fd)
+
+    def chain(self, names, create=False, chmod_last=False):
+        """`names` を 1 段ずつ開く。途中が無ければ (create=False) None。開いた中間の fd は閉じる。"""
+        cur = self
+        try:
+            for i, name in enumerate(names):
+                nxt = cur.child(name, create=create, chmod=chmod_last and i == len(names) - 1)
+                if cur is not self:
+                    cur.close()
+                if nxt is None:
+                    return None
+                cur = nxt
+            return cur if cur is not self else SafeDir(os.dup(self.fd))
+        except BaseException:
+            # child() が途中で例外になると、ここまでに開いた中間の fd (cur) を誰も閉じない = 拒否 1 回につき 1 つ漏れる
+            if cur is not self:
+                cur.close()
+            raise
+
+    def lstat(self, name):
+        if not _component_ok(name):
+            raise CheckpointError(E_PATH, 'name')
+        try:
+            return os.stat(name, dir_fd=self.fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+
+    def exists(self, name):
+        return self.lstat(name) is not None
+
+    def is_symlink(self, name):
+        st = self.lstat(name)
+        return st is not None and stat.S_ISLNK(st.st_mode)
+
+    def write(self, name, data):
+        """新規作成だけ (O_EXCL | O_NOFOLLOW)。str は UTF-8。"""
+        if not _component_ok(name):
+            raise CheckpointError(E_PATH, 'name')
+        if isinstance(data, str):
+            data = data.encode('utf-8')
+        fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, FILE_MODE, dir_fd=self.fd)
+        try:
+            view = memoryview(data)
+            while view:
+                written = os.write(fd, view)
+                view = view[written:]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    def write_path(self, parts, data):
+        """`parts` の途中の dir を作りながら (symlink は辿らない) 最後の名前に書く。"""
+        cur = self
+        try:
+            for name in parts[:-1]:
+                nxt = cur.child(name, create=True)
+                if cur is not self:
+                    cur.close()
+                cur = nxt
+            cur.write(parts[-1], data)
+        finally:
+            if cur is not self:
+                cur.close()
+
+    def rename(self, src, dst):
+        if not (_component_ok(src) and _component_ok(dst)):
+            raise CheckpointError(E_PATH, 'name')
+        os.rename(src, dst, src_dir_fd=self.fd, dst_dir_fd=self.fd)
+
+    def remove_tree(self, name):
+        """自分が作った dir の掃除 (partial 専用)。`rm -rf` ではなく、symlink を辿らず 1 つずつ unlink / rmdir する。"""
+        st = self.lstat(name)
+        if st is None:
+            return
+        if not stat.S_ISDIR(st.st_mode):
+            os.unlink(name, dir_fd=self.fd)
+            return
+        sub = self.child(name)
+        if sub is not None:
+            try:
+                for entry in os.listdir(sub.fd):
+                    sub.remove_tree(entry)
+            finally:
+                sub.close()
+        os.rmdir(name, dir_fd=self.fd)
+
+
+def move_between(src, src_name, dst, dst_name):
+    """別々の `SafeDir` の間の rename (`checkpoint_gc` の隔離・復元)。上書きしない (先に `exists` で見る呼び出し元の責任)。"""
+    for name in (src_name, dst_name):
+        if not _component_ok(name):
+            raise CheckpointError(E_PATH, 'name')
+    os.rename(src_name, dst_name, src_dir_fd=src.fd, dst_dir_fd=dst.fd)
+
+
+def _truncate_bytes(text, limit):
+    raw = text.encode('utf-8')
+    if len(raw) <= limit:
+        return text, len(raw), False
+    return raw[:limit].decode('utf-8', errors='ignore'), len(raw), True
+
+
+# ---------------------------------------------------------------------------
+# patch の秘密ファイルの hunk を落とす
+# ---------------------------------------------------------------------------
+
+def _drop_secret_sections(patch):
+    """`(patch, 落とした件数)`。`diff --git` ごとの節の見出し行 (と rename 行) のパスの成分が秘密らしければ節ごと落とす。"""
+    if not patch:
+        return patch, 0
+    sections = re.split(r'(?m)^(?=diff --git )', patch)
+    kept, dropped = [], 0
+    for sec in sections:
+        if not sec.startswith('diff --git '):
+            kept.append(sec)
+            continue
+        head = sec.split('\n', 1)[0]
+        names = [head]
+        for line in sec.split('\n', 12)[1:12]:
+            if line.startswith(('--- ', '+++ ', 'rename from ', 'rename to ', 'copy from ', 'copy to ')):
+                names.append(line)
+        if any(is_secret_name(s) for h in names for s in re.split(r'[ "]+', h)) \
+                or any(path_is_secret(h) for h in names):
+            dropped += 1
+            continue
+        kept.append(sec)
+    return ''.join(kept), dropped
+
+
+def _git_quote(text):
+    """git の C 引用 (`core.quotePath` 既定): 制御文字・`"`・`\\`・非 ASCII のバイトがあれば `"..."` で囲み 8 進に。無ければそのまま。"""
+    raw = os.fsencode(text)
+    simple = {0x07: '\\a', 0x08: '\\b', 0x09: '\\t', 0x0a: '\\n', 0x0b: '\\v', 0x0c: '\\f', 0x0d: '\\r',
+              0x22: '\\"', 0x5c: '\\\\'}
+    if all(0x20 <= b < 0x7f and b not in (0x22, 0x5c) for b in raw):
+        return text
+    out = []
+    for b in raw:
+        if b in simple:
+            out.append(simple[b])
+        elif b < 0x20 or b >= 0x7f:
+            out.append('\\%03o' % b)
+        else:
+            out.append(chr(b))
+    return '"' + ''.join(out) + '"'
+
+
+def _drop_block_sections(patch, blocked):
+    """`(patch, 落とした件数)`。鍵の印があるファイル (`blocked`) の節を **Python 側でも** 落とす。git の pathspec による除外
+    (`:(exclude,literal)`) とは独立の網: どちらか一方が壊れても (env で pathspec の解釈が変わる・git の版) 鍵の hunk は残らない。
+    節の見出しと rename / copy 行に、`blocked` のパスが (`a/` `b/` 付き・引用符つきの形も) 現れたら落とす。"""
+    if not patch or not blocked:
+        return patch, 0
+    prefixed = re.compile('(?:' + '|'.join(
+        re.escape(' ' + _git_quote(prefix + path)) for path in blocked for prefix in ('a/', 'b/')) + r')(?=[ \t]|$)')
+    bare = {_git_quote(path) for path in blocked}
+    sections = re.split(r'(?m)^(?=diff --git )', patch)
+    kept, dropped = [], 0
+    for sec in sections:
+        if not sec.startswith('diff --git '):
+            kept.append(sec)
+            continue
+        hit = False
+        for ln in sec.split('\n', 12)[:12]:
+            if ln.startswith(('rename from ', 'rename to ', 'copy from ', 'copy to ')):
+                hit = hit or ln.split(' ', 2)[2] in bare
+            elif ln.startswith(('diff --git ', '--- ', '+++ ', 'Binary files ')):
+                hit = hit or bool(prefixed.search(ln))
+        if hit:
+            dropped += 1
+            continue
+        kept.append(sec)
+    return ''.join(kept), dropped
+
+
+def _safe_label(value):
+    """meta に出す path / branch 名。秘密を含む名前は伏せる。"""
+    if value and path_is_secret(value):
+        return '[REDACTED]'
+    return value
+
+
+def _filter_status(status_raw):
+    """`git status --porcelain=v1 -z` のうち、パスが秘密のエントリ (rename / copy は旧パスまで) を落とす。`(text, 落とした件数)`。"""
+    parts = status_raw.split('\x00')
+    kept, dropped = [], 0
+    i = 0
+    while i < len(parts):
+        rec = parts[i]
+        i += 1
+        if not rec:
+            continue
+        paths = [rec[3:]]
+        if rec[:1] in 'RC' or rec[1:2] in 'RC':
+            if i < len(parts):
+                paths.append(parts[i])
+                i += 1
+        if any(path_is_secret(p) for p in paths):
+            dropped += 1
+            continue
+        kept.append(rec)
+        kept.extend(paths[1:])
+    return ''.join(f'{r}\x00' for r in kept), dropped
+
+
+# ---------------------------------------------------------------------------
+# take
+# ---------------------------------------------------------------------------
+
+class NothingToSave(CheckpointError):
+    """保存するものが元から無い (試行の record が無い・まだ worktree を作っていない)。失敗ではない: 呼び出し側は通知しない。"""
+
+    def __init__(self, detail=''):
+        super().__init__(E_NOTHING, detail)
+
+
+def checkpoint_dir_of(registry_dir, mission, tid, execution_id):
+    if not _EXECUTION_ID_RE.fullmatch(execution_id or ''):
+        raise CheckpointError(E_ARGS, 'execution_id')
+    for label, value in (('mission', mission), ('task', tid)):
+        if not isinstance(value, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]*', value) or '..' in value:
+            raise CheckpointError(E_ARGS, label)
+    return os.path.join(os.fspath(registry_dir), 'checkpoints', mission, tid, execution_id)
+
+
+def worktree_of_record(queue_dir, mission, execution_id):
+    """record の `git.worktree` (ペインの有無に依存しない)。読めない / 無い / 実在しない dir は `CheckpointError`。"""
+    checkpoint_dir_of('', mission, 't000', execution_id)        # 名前の検査だけ (パスの部品にしてよい形か)
+    # mission / execution_id の形は `checkpoint_dir_of` が検査済み (パスの部品として安全)
+    record_path = os.path.join(os.fspath(queue_dir), 'missions', mission, 'executions', f"{execution_id}.json")
+    record = load_json_store(record_path)
+    if is_missing(record):
+        raise NothingToSave('record_absent')
+    if isinstance(record, Unreadable):
+        raise CheckpointError(E_RECORD, 'unreadable')
+    git = record.get('git')
+    path = git.get('worktree') if isinstance(git, dict) else None
+    if path is None:
+        raise NothingToSave('worktree_not_recorded')        # まだ worktree を作る前に終わった試行
+    if not isinstance(path, str) or not path or not os.path.isabs(path):
+        raise CheckpointError(E_NO_WORKTREE, 'record')
+    if not os.path.isdir(path):
+        raise CheckpointError(E_NO_WORKTREE, 'missing')
+    return path
+
+
+def take(*, registry_dir, queue_dir, mission, task, execution_id, reason='unknown', pane_text=None,
+         seconds=DEFAULT_SECONDS, now=None, worktree=None):
+    """checkpoint を保存して dir を返す。失敗は `CheckpointError` (途中の dir は消してある)。
+
+    同じ試行の dir が既にあり、`verify` を通れば**それを返す** (退役の再試行が毎サイクル撮り直さない)。
+    `worktree` は試験用 (無ければ record から)。`pane_text` は呼び出し側がペインが生きているときだけ渡す。
+    """
+    clock = _Clock(seconds, now)
+    # 相対の registry_dir は返す path・verify (絶対だけを受ける)・再実行の照合で食い違うので、作る前に絶対にする
+    registry_dir = os.path.abspath(os.fspath(registry_dir))
+    final = checkpoint_dir_of(registry_dir, mission, task, execution_id)
+    parts = ('checkpoints', mission, task)
+    # 既にあれば再利用 (ancestors は symlink を辿らずに開く。無ければ作らずに見るだけ)
+    root = SafeDir.open_root(registry_dir)
+    if root is not None:
+        try:
+            parent = root.chain(parts)
+        finally:
+            root.close()
+        if parent is not None:
+            try:
+                exists = parent.exists(execution_id)
+            finally:
+                parent.close()
+            if exists:
+                try:
+                    verify(final, execution_id)
+                except CheckpointError:
+                    raise CheckpointError(E_EXISTS)
+                return final
+    if worktree is None:
+        worktree = worktree_of_record(queue_dir, mission, execution_id)
+    worktree_real = os.path.realpath(worktree)
+    partial_name = execution_id + PARTIAL_SUFFIX
+    root = SafeDir.open_root(registry_dir, create=True)
+    try:
+        parent = root.chain(parts, create=True, chmod_last=True)       # mission / task が symlink なら E_PATH (何も書かず・消さない)
+    finally:
+        root.close()
+    try:
+        st = parent.lstat(partial_name)
+        if st is not None:
+            if stat.S_ISLNK(st.st_mode):
+                raise CheckpointError(E_PATH, 'partial_is_symlink')     # 外を指しているかもしれない: 辿らず・消さず・保存しない
+            parent.remove_tree(partial_name)
+        out = parent.child(partial_name, create=True)
+        try:
+            try:
+                meta = _build(clock, out, worktree_real, mission, task, execution_id, reason, pane_text, now)
+                out.write(META_NAME, json.dumps(meta, ensure_ascii=False, indent=2, sort_keys=True) + '\n')
+                clock.check()
+            finally:
+                out.close()
+            parent.rename(partial_name, execution_id)
+        except CheckpointError:
+            _discard(parent, partial_name)
+            raise
+        except Exception as e:  # noqa: BLE001 — 退役を止めない側に倒す。型名だけ残す
+            _discard(parent, partial_name)
+            raise CheckpointError(E_WRITE, type(e).__name__)
+    finally:
+        parent.close()
+    return final
+
+
+def _discard(parent, name):
+    try:
+        parent.remove_tree(name)
+    except (OSError, CheckpointError):
+        pass
+
+
+def _refuse_local_filters(clock, worktree):
+    """repo の有効な設定 (ローカル・include・config.worktree。global / system は読まない) に `filter.<name>.*` (clean / smudge / process) があれば保存しない。`git diff` / `status` は index と
+    比べるとき clean filter を**起動する**ので、読み取りだけという契約を守れない (`--no-textconv` は filter を止めない)。
+    global / system の設定は環境変数で読まない。設定が読めない・コマンドが失敗しても `check=False` で「無い」と読まず止める。"""
+    rc, out, _ = _run_git(clock, worktree, 'config', '--includes', '--get-regexp', r'^filter\.', check=False)
+    if rc == 0 and out.strip():
+        raise CheckpointError(E_GIT, 'local_filters')
+    if rc not in (0, 1):                         # 1 = 該当なし。それ以外は観測できなかった
+        raise CheckpointError(E_GIT, 'config_unreadable')
+
+
+def _build(clock, out, worktree, mission, task, execution_id, reason, pane_text, now):
+    """保存物を `out` に書いて meta (dict) を返す。"""
+    redactions = 0
+    skipped_redaction = 0
+    files = {}
+
+    _refuse_local_filters(clock, worktree)
+    branch = _git_text(clock, worktree, 'rev-parse', '--abbrev-ref', 'HEAD')[0].strip() or None
+    head_rc, head_raw, _ = _run_git(clock, worktree, 'rev-parse', 'HEAD', check=False)
+    head = head_raw.decode('ascii', errors='replace').strip() if head_rc == 0 else None
+
+    # status.txt
+    status_raw, status_trunc = _git_text(clock, worktree, 'status', '--porcelain=v1', '-z', '--untracked-files=all',
+                                    '--ignore-submodules=all')
+    dirty = bool(status_raw.strip('\x00'))
+    status_raw, status_secret_dropped = _filter_status(status_raw)
+    saved, n = _save_text(out, 'status.txt', status_raw, limit=PATCH_LIMIT)
+    redactions += n
+    skipped_redaction += 0 if saved else 1
+    files['status'] = _file_info(saved, status_trunc)
+
+    # dirty.patch: redaction が見るのは hunk (前後 3 行) だけなので、複数行の秘密 (鍵のブロック) の途中だけが変わると BEGIN が
+    # hunk に入らない。変更のあったファイルは HEAD 側・worktree 側とも全体を見て、鍵の印があるファイル (全体を見られないものも)
+    # の hunk は patch に入れない
+    block_paths = _secret_block_paths(clock, worktree)
+    pathspec = []
+    if block_paths is not None:
+        pathspec = ['--', '.', *(f":(exclude,literal){p}" for p in block_paths)]
+    if block_paths is None:
+        patch_raw, patch_trunc, secret_dropped = '', False, 0
+    else:
+        patch_raw, patch_trunc = _git_text(clock, worktree, 'diff', 'HEAD', '--no-ext-diff', '--no-textconv', '--no-color',
+                                        '--ignore-submodules=all', *pathspec)
+        patch_raw, secret_dropped = _drop_secret_sections(patch_raw)
+        patch_raw, _extra = _drop_block_sections(patch_raw, block_paths)      # pathspec とは独立の網 (二重)
+        secret_dropped += _extra
+    saved, n = _save_text(out, 'dirty.patch', patch_raw, limit=PATCH_LIMIT) if patch_raw else (False, 0)
+    redactions += n
+    info = _file_info(saved, patch_trunc)
+    block_dropped = len(block_paths) if block_paths is not None else None
+    info.update(secret_files_dropped=secret_dropped, secret_block_files_dropped=block_dropped, withheld=block_paths is None)
+    if patch_raw and not saved:
+        skipped_redaction += 1
+    files['dirty_patch'] = info
+
+    # binary-files.txt (tracked の変更 + untracked)
+    binary_lines = []
+    clock.check()
+    numstat, _ = _git_text(clock, worktree, 'diff', 'HEAD', '--numstat', '-z', '--no-ext-diff', '--no-textconv',
+                              '--ignore-submodules=all', *pathspec)
+    secret_excluded = secret_dropped + status_secret_dropped
+    block_set = set(block_paths or ())
+    for path in _numstat_binary_paths(numstat):
+        if path_is_secret(path) or path in block_set:
+            secret_excluded += 1
+            continue
+        binary_lines.append(_binary_line(clock, worktree, path))
+
+    # untracked
+    untracked_info, ubinary, usecret, uredact, uskip = _save_untracked(clock, out, worktree)
+    redactions += uredact
+    skipped_redaction += uskip
+    secret_excluded += usecret
+    binary_lines.extend(ubinary)
+    files['untracked'] = untracked_info
+
+    if binary_lines:
+        out.write('binary-files.txt', '\n'.join(binary_lines) + '\n')
+
+    # pane.txt: 200 行に切る**前**の全体を redaction に通す (切り口が鍵の途中にかかっても BEGIN が見えなくならない)
+    if pane_text:
+        clock.check()
+        saved, n = None, 0
+        if len(pane_text) <= GIT_READ_LIMIT:
+            try:
+                whole, n = redact(pane_text)
+            except Exception:  # noqa: BLE001
+                whole = None
+            if whole is not None:
+                tail = '\n'.join(whole.splitlines()[-PANE_LINES:])
+                saved, _ = _save_text(out, 'pane.txt', tail + '\n', limit=PATCH_LIMIT, redacted=True)
+        redactions += n
+        skipped_redaction += 0 if saved else 1
+        files['pane'] = {'saved': bool(saved), 'lines': min(PANE_LINES, len(pane_text.splitlines()))}
+    else:
+        files['pane'] = {'saved': False, 'lines': 0}
+
+    clock.check()
+    return {
+        'schema_version': SCHEMA_VERSION,
+        'execution_id': execution_id,
+        'mission': mission,
+        'task': task,
+        'taken_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(now() if now else time.time())),
+        'reason': reason,
+        'worktree': _safe_label(worktree),
+        'branch': _safe_label(branch),
+        'head': head,
+        'dirty': dirty,
+        'files': files,
+        'binary_files': len(binary_lines),
+        'binary_restorable': False,
+        'secret_files_excluded': secret_excluded,
+        'secret_block_files_dropped': block_dropped,
+        'redactions': redactions,
+        'redaction_failed_files': skipped_redaction,
+    }
+
+
+#: 変更のあったファイルを全体で調べる上限 (超えたら patch ごと保存しない)
+MAX_SCAN_PATHS = 5000
+#: patch から外すファイルの上限 (pathspec の引数の長さ。超えたら patch ごと保存しない)
+MAX_BLOCK_PATHS = 200
+#: 1 ファイルを全体で読む上限 (超えたら全体を見られないので外す側)
+SCAN_FILE_LIMIT = 8 * 1024 * 1024
+_KEY_MARK = b'PRIVATE KEY-----'
+
+
+def _changed_entries(clock, worktree):
+    """`[(状態1文字, path)]` (rename 検出なし = 旧パスと新パスが別の行)。読み切れなければ None。"""
+    _rc, data, truncated = _run_git(clock, worktree, 'diff', 'HEAD', '--name-status', '-z', '--no-renames', '--no-ext-diff',
+                                    '--no-textconv', '--ignore-submodules=all')
+    if truncated:
+        return None
+    raw = os.fsdecode(data)         # surrogateescape: UTF-8 でない名前も、argv に戻すと元のバイト列になる (exclude が外れない)
+    parts = raw.split('\x00')
+    entries, i = [], 0
+    while i + 1 < len(parts):
+        status, path = parts[i], parts[i + 1]
+        if not status or not path:
+            return None
+        entries.append((status[0], path))
+        i += 2
+    return entries if parts[i:] in ([], ['']) else None
+
+
+def _head_marked(clock, worktree, paths):
+    """HEAD 側で鍵の印を含むファイルの集合 (`paths` との共通部分)。観測できなければ None (全部印ありとして扱う側)。
+
+    pathspec で絞らず HEAD 全体を 1 回 grep し、`paths` との突き合わせは Python でする (pathspec の解釈が env などで変わっても、
+    取りこぼして『印なし』にならない)。出力が上限を超えたら観測できなかった扱い。"""
+    rc, out, truncated = _run_git(clock, worktree, 'grep', '-l', '-z', '-a', '-F', '--no-textconv', '-e',
+                                  _KEY_MARK.decode(), 'HEAD', check=False)
+    if truncated or rc not in (0, 1):
+        return None
+    prefix = 'HEAD:'
+    found = {n[len(prefix):] for n in os.fsdecode(out).split('\x00') if n.startswith(prefix)}
+    return found & set(paths)
+
+
+def _worktree_side_blocked(worktree, path):
+    """worktree 側の全体を見て、鍵の印がある / 全体を見られない (読めない・大きすぎる・通常ファイルでない) なら True。"""
+    if os.path.isabs(path) or '..' in path.split('/'):
+        return True
+    full = os.path.join(worktree, path)
+    try:
+        real_dir = os.path.realpath(os.path.dirname(full))
+        if real_dir != worktree and not real_dir.startswith(worktree.rstrip('/') + '/'):
+            return True
+        st = os.lstat(full)
+        if stat.S_ISLNK(st.st_mode):
+            return _KEY_MARK in os.fsencode(os.readlink(full))
+        if not stat.S_ISREG(st.st_mode):
+            return True
+        fd = os.open(full, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return True
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return True
+        data = os.read(fd, SCAN_FILE_LIMIT + 1)
+        while len(data) <= SCAN_FILE_LIMIT:
+            more = os.read(fd, SCAN_FILE_LIMIT + 1 - len(data))
+            if not more:
+                break
+            data += more
+    except OSError:
+        return True
+    finally:
+        os.close(fd)
+    return len(data) > SCAN_FILE_LIMIT or _KEY_MARK in data
+
+
+def _secret_block_paths(clock, worktree):
+    """patch から hunk を外すファイルの path の一覧。patch ごと保存すべきでないときは None (数が多すぎて全体を見られない等)。"""
+    entries = _changed_entries(clock, worktree)
+    if entries is None or len(entries) > MAX_SCAN_PATHS:
+        return None
+    head_paths = sorted({p for s, p in entries if s != 'A'})
+    marked = set()
+    if head_paths:
+        got = _head_marked(clock, worktree, head_paths)
+        marked = set(head_paths) if got is None else got
+    blocked = []
+    for status, path in entries:
+        clock.check()
+        if path in marked or (status != 'D' and _worktree_side_blocked(worktree, path)):
+            blocked.append(path)
+    blocked = sorted(set(blocked))
+    return blocked if len(blocked) <= MAX_BLOCK_PATHS else None
+
+
+def _file_info(saved, truncated_at_read):
+    return {'saved': bool(saved), 'truncated': bool(saved and saved.get('truncated')) or bool(truncated_at_read),
+            'original_size': saved.get('original_size') if saved else None,
+            'saved_size': saved.get('saved_size') if saved else None}
+
+
+def _save_text(out, name, text, *, limit, redacted=False):
+    """redaction → 切り詰め → 書き込み。`(info | None, 置換の件数)`。redaction が例外なら保存しない (info=None)。
+    `redacted=True` は呼び出し側が全体を redaction 済み (二重に通さない)。"""
+    if redacted:
+        red, count = text, 0
+    else:
+        try:
+            red, count = redact(text)
+        except Exception:  # noqa: BLE001 — 生のまま残さない側に倒す
+            return None, 0
+    body, original, truncated = _truncate_bytes(red, limit)
+    out.write(name, body)
+    return {'truncated': truncated, 'original_size': original, 'saved_size': len(body.encode('utf-8'))}, count
+
+
+def _numstat_binary_paths(numstat):
+    """`git diff --numstat -z` の `-\t-\t<path>` (rename は `-\t-\t\0old\0new\0`)。"""
+    parts = numstat.split('\x00')
+    i = 0
+    paths = []
+    while i < len(parts):
+        rec = parts[i]
+        i += 1
+        if not rec:
+            continue
+        fields = rec.split('\t', 2)
+        if len(fields) < 3:
+            continue
+        added, deleted, path = fields
+        if path == '' and i + 1 < len(parts):      # rename / copy: 続く 2 つが old / new
+            path = parts[i + 1]
+            i += 2
+        if added == '-' and deleted == '-' and path:
+            paths.append(path)
+    return paths
+
+
+def _blob_sha(clock, worktree, path):
+    try:
+        rc, data, _ = _run_git(clock, worktree, 'hash-object', '--no-filters', '--', path, check=False)
+    except CheckpointError as e:
+        if e.code == E_DEADLINE:
+            raise
+        return '?'
+    return data.decode('ascii', errors='replace').strip() if rc == 0 and data else '?'
+
+
+def _binary_line(clock, worktree, path):
+    full = os.path.join(worktree, path)
+    try:
+        st = os.lstat(full)
+        size = st.st_size if stat.S_ISREG(st.st_mode) else -1
+        sha = _blob_sha(clock, worktree, path) if stat.S_ISREG(st.st_mode) else '?'
+    except OSError:
+        size, sha = -1, '?'
+    return f"{path}\t{size}\t{sha}"
+
+
+def _save_untracked(clock, out, worktree):
+    """`(info, binary_lines, secret_excluded, redactions, redaction_failed)`。"""
+    raw, _ = _git_text(clock, worktree, 'ls-files', '--others', '--exclude-standard', '-z')
+    names = [p for p in raw.split('\x00') if p]
+    saved_names, listed, binary_lines = [], [], []
+    secret_excluded = redactions = redaction_failed = 0
+    total = 0
+    omitted = max(0, len(names) - UNTRACKED_LISTING_LIMIT)
+    for rel in names[:UNTRACKED_LISTING_LIMIT]:
+        clock.check()
+        # 出力に出るパスは全部ここと同じ検出を通す: 秘密を含む名前は保存も列挙もせず件数だけ (meta.secret_files_excluded)
+        if path_is_secret(rel):
+            secret_excluded += 1
+            continue
+        if os.path.isabs(rel) or not all(_component_ok(c) for c in rel.split('/')):
+            listed.append({'path': rel, 'reason': 'not_a_file'})
+            continue
+        full = os.path.join(worktree, rel)
+        try:
+            if not os.path.realpath(os.path.dirname(full)).startswith(worktree.rstrip('/') + '/') \
+                    and os.path.realpath(os.path.dirname(full)) != worktree:
+                listed.append({'path': rel, 'reason': 'outside_worktree'})
+                continue
+            st = os.lstat(full)
+        except OSError:
+            listed.append({'path': rel, 'reason': 'unreadable'})
+            continue
+        if stat.S_ISLNK(st.st_mode):
+            listed.append({'path': rel, 'reason': 'symlink'})
+            continue
+        if not stat.S_ISREG(st.st_mode):
+            listed.append({'path': rel, 'reason': 'not_regular'})
+            continue
+        try:
+            fd = os.open(full, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except OSError:
+            listed.append({'path': rel, 'reason': 'unreadable'})
+            continue
+        try:
+            fst = os.fstat(fd)
+            if not stat.S_ISREG(fst.st_mode):
+                listed.append({'path': rel, 'reason': 'not_regular'})
+                continue
+            head = os.read(fd, BINARY_SNIFF)
+            if b'\x00' in head:
+                binary_lines.append(f"{rel}\t{fst.st_size}\t{_blob_sha(clock, worktree, rel)}")
+                continue
+            if fst.st_size > UNTRACKED_FILE_LIMIT:
+                listed.append({'path': rel, 'reason': 'too_large', 'size': fst.st_size})
+                continue
+            if total + fst.st_size > UNTRACKED_TOTAL_LIMIT:
+                listed.append({'path': rel, 'reason': 'total_limit', 'size': fst.st_size})
+                continue
+            body = head + os.read(fd, UNTRACKED_FILE_LIMIT + 1)
+        finally:
+            os.close(fd)
+        if len(body) > UNTRACKED_FILE_LIMIT:
+            listed.append({'path': rel, 'reason': 'too_large', 'size': len(body)})
+            continue
+        try:
+            red, count = redact(body.decode('utf-8', errors='replace'))
+        except Exception:  # noqa: BLE001
+            redaction_failed += 1
+            listed.append({'path': rel, 'reason': 'redaction_failed'})
+            continue
+        out.write_path(('untracked', *rel.split('/')), red)
+        total += len(red.encode('utf-8'))
+        redactions += count
+        saved_names.append(rel)
+    info = {'saved': len(saved_names), 'listed_only': listed, 'omitted_beyond_listing_limit': omitted,
+            'total_bytes': total}
+    return info, binary_lines, secret_excluded, redactions, redaction_failed
+
+
+# ---------------------------------------------------------------------------
+# verify
+# ---------------------------------------------------------------------------
+
+def verify(path, execution_id=None):
+    """dir が checkpoint として読めて、`meta.json` の `execution_id` が一致するか。通れば meta を返す。
+
+    `execution_id` を渡せば、それと meta の ID・dir 名が全部一致しなければならない (別の試行の dir を指せない)。
+    渡さなければ meta と dir 名の一致だけ。symlink の dir / meta は拒否。
+    """
+    path = os.fspath(path)
+    if not os.path.isabs(path):
+        raise CheckpointError(E_VERIFY, 'not_absolute')
+    try:
+        st = os.lstat(path)
+    except OSError:
+        raise CheckpointError(E_VERIFY, 'missing')
+    if not stat.S_ISDIR(st.st_mode):
+        raise CheckpointError(E_VERIFY, 'not_a_dir')
+    meta_path = os.path.join(path, META_NAME)
+    try:
+        mst = os.lstat(meta_path)
+    except OSError:
+        raise CheckpointError(E_VERIFY, 'meta_unreadable')
+    if not stat.S_ISREG(mst.st_mode):
+        raise CheckpointError(E_VERIFY, 'meta_not_regular')
+    meta = load_json_store(meta_path)
+    if isinstance(meta, Unreadable):
+        raise CheckpointError(E_VERIFY, 'meta_unreadable')
+    if not isinstance(meta, dict) or not _EXECUTION_ID_RE.fullmatch(str(meta.get('execution_id') or '')):
+        raise CheckpointError(E_VERIFY, 'meta_shape')
+    if meta['execution_id'] != os.path.basename(path.rstrip('/')):
+        raise CheckpointError(E_VERIFY, 'dir_name_mismatch')
+    if execution_id is not None and meta['execution_id'] != execution_id:
+        raise CheckpointError(E_VERIFY, 'execution_mismatch')
+    return meta
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
+    sub = ap.add_subparsers(dest='verb', required=True)
+    t = sub.add_parser('take')
+    t.add_argument('--registry-dir', required=True)
+    t.add_argument('--queue-dir', required=True)
+    t.add_argument('--mission', required=True)
+    t.add_argument('--task', required=True)
+    t.add_argument('--execution', required=True)
+    t.add_argument('--reason', default='manual')
+    t.add_argument('--seconds', type=float, default=DEFAULT_SECONDS)
+    v = sub.add_parser('verify')
+    v.add_argument('dir')
+    v.add_argument('--execution', default=None)
+    args = ap.parse_args(argv)
+    try:
+        if args.verb == 'take':
+            d = take(registry_dir=args.registry_dir, queue_dir=args.queue_dir, mission=args.mission, task=args.task,
+                     execution_id=args.execution, reason=args.reason, seconds=args.seconds)
+            print(d)
+        else:
+            verify(args.dir, args.execution)
+            print('ok')
+    except CheckpointError as e:
+        print(f"[lib_checkpoint] {e.code}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

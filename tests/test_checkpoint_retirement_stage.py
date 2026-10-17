@@ -329,7 +329,11 @@ def test_every_exit_3_code_is_classified_on_purpose():
     controller_exit3 = {c for c, e in lib_execution.EXIT_CODES.items() if e == 3}
     settle = {"EXECUTION_NOT_CURRENT", "EXECUTION_NOT_FOUND", "EXECUTION_ALREADY_TERMINAL"}
     retry = {"EXECUTION_REQUIRED", "HISTORY_MISMATCH", "HISTORY_AMBIGUOUS", "ATTEMPT_ACTIVE", "ATTEMPT_CAP", "RETRY_NOT_ALLOWED"}
-    assert controller_exit3 == settle | retry, "新しい exit 3 のコード: 「要らない」か「再試行」かを決めて、この表と lib_retirement に足す"
+    # `plan.sh reopen` だけが返すコード (vNext 02 PR-F)。retire が呼ぶ fail_execution / release_execution は返さない。万一返っても
+    # settle に入れない = 理由の分からない exit 3 と同じく marker を残す (test_unknown_or_missing_exit_3_codes_keep_the_marker)
+    reopen_only = {"NOT_REOPENABLE", "CASCADE_ACTIVE_DOWNSTREAM", "CASCADE_SKIPPED_ON_PATH", "CASCADE_FAILED_ON_PATH",
+                   "CASCADE_NO_EXECUTION", "CASCADE_UNREADABLE_CARDS", "MISSION_ARCHIVED"}
+    assert controller_exit3 - reopen_only == settle | retry, "新しい exit 3 のコード: 「要らない」か「再試行」かを決めて、この表と lib_retirement に足す"
     assert settle <= lib_retirement.RETIRE_SETTLED_CODES and not (retry & lib_retirement.RETIRE_SETTLED_CODES)
 
 

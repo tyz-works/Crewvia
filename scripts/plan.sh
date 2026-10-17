@@ -3593,12 +3593,19 @@ def _pull_result(slug, meta, body):
 def _pull_start(slug, task_id, agent, generation, execution_id, git_context):
     """pull の 2 つ目のロック: reserved → running (start)。card が**この pull の予約のまま** (`_pull_cas_ok`) のときだけ。
     戻り値: `(started, why)`。外れたら何も書かない (JSON を出させない)。"""
-    outcome = {'started': False, 'why': ''}
+    outcome = {'started': False, 'why': '', 'code': _EXEC.TASK_ALREADY_RESERVED}
 
     def _do():
         recover_before(cards=[(slug, task_id)], include_caller=False)
         if agent:
             _txn().actor = agent
+        # 1 回目のロックの後・このロックの前に reopen が intent を書いて途中で止まり、ここでも回復が失敗したとき、
+        # 下流の task を始めてはいけない (I は done のまま = 古い土台)。予約は書き換えない (JSON を出さない。同じ Worker の
+        # 再 pull は 1 回目のロックで同じ検査に当たる)。表: knowledge/vnext-02-attempt-reopen-checkpoint.md §4.3.1-4
+        if slug in _INTENT_BLOCKED:
+            outcome['why'] = '完了できない reopen の intent があります'
+            outcome['code'] = _EXEC.REOPEN_INTENT_INCOMPLETE
+            return
         if not os.path.exists(task_path(slug, task_id)):
             outcome['why'] = 'card が無くなっています'
             return
@@ -3618,7 +3625,7 @@ def _pull_start(slug, task_id, agent, generation, execution_id, git_context):
         outcome['started'] = True
 
     with_lock(_do)
-    return outcome['started'], outcome['why']
+    return outcome['started'], outcome['why'], outcome['code']
 
 
 def _pull_git_context(slug, task_id, task_slug, worktree_path, pass_fds=()):
@@ -4197,11 +4204,11 @@ def cmd_pull(args):
     git_context = (_pull_git_context(mission_slug, task_id, task_slug, worktree_path,
                                       pass_fds=(prepare_lock.fileno(),))
                    if worktree_path is not None else None)
-    started, why = _pull_start(mission_slug, task_id, agent, started_holder[0], execution_id, git_context)
+    started, why, why_code = _pull_start(mission_slug, task_id, agent, started_holder[0], execution_id, git_context)
     if not started:
         die(f"[plan.sh pull] {mission_slug}/{task_id}: 開始 (start) できませんでした: {why}。書き換えていません。"
             f"JSON を出さないので、この pull の結果で作業を始めてはいけません。\n"
-            f"{_error_code_line(_EXEC.TASK_ALREADY_RESERVED)}")
+            f"{_error_code_line(why_code)}")
     prepare_lock.release()
 
     chosen_holder[0]['task_slug'] = task_slug
@@ -6333,6 +6340,9 @@ def cmd_archive(args):
 
     def _do():
         recover_before(archive_slugs=load_state().get('active_missions') or [], include_caller=False)
+        if slug in _INTENT_BLOCKED:      # 止まった reopen を抱えたまま退避すると、半端な状態が固まる (reopen は退避済みを扱わない)
+            die(f"[plan.sh] mission '{slug}' に完了できない reopen の intent があります。何も書いていません。"
+                f"`plan.sh store-check` の reopen-intent-incomplete を見て直してください\n{_error_code_line(_EXEC.REOPEN_INTENT_INCOMPLETE)}", 1)
         state = load_state()
         src = mission_dir(slug)
         if not os.path.exists(src):

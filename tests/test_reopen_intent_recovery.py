@@ -349,3 +349,67 @@ def test_controller_refuses_a_new_reopen_while_an_intent_is_pending(tmp_path):
             ctl.reopen_task(txn, MISSION, "t001", kind="reopen", reason=REASON,
                             graph={"t001": [], "t002": ["t001"], "t003": ["t002"]}, unreadable=[])
     assert e.value.code == "REOPEN_INTENT_INCOMPLETE"
+
+
+# ---------------------------------------------------------------------------
+# t061: pull の 2 回目のロック (start) も、完了できない intent を見て止まる。ロックを取って task を進める遷移の表
+# ---------------------------------------------------------------------------
+#
+#   遷移                                                  | 未完で完了できない intent がある mission で
+#   pull の 1 回目のロック (候補選び・予約)                 | 止める (その mission を選ばない / 名指しなら exit 1)
+#   pull の 2 回目のロック (start: reserved → running)      | 止める (t061。予約は書き換えない・JSON なし・REOPEN_INTENT_INCOMPLETE)
+#   pull の worktree 失敗の出口 (needs_director に倒す)     | 通す (予約を閉じるだけで task を進めない。止めると予約が残る)
+#   done / fail / needs-director / ready-for-verification /
+#   verifying / verify-result (Worker の報告)               | 通す (作業を失わせない。報告は下流を pull 可能にしない = pull が止まっている)
+#   retry / update --status・--reset / release-dep / add    | 通す (Director の出口を塞がない。task を走らせるのは pull だけ)
+#   retire                                                 | 通す (窓を閉じる側。止めると誰も閉じない)
+#   reopen (別の root)                                     | 止める (exit 1。Controller も重ねて始めない)
+#   archive (その mission)                                 | 止める (半端な cascade を退避先に固めない)
+
+def _single_pending_box(tmp_path):
+    return build(tmp_path, [("t001", [], ["code"])])
+
+
+def test_the_start_lock_of_a_pull_refuses_when_an_intent_appears_between_the_two_locks(tmp_path):
+    box = _single_pending_box(tmp_path)
+    box.hold()
+    first = box.popen("pull", "--agent", "Ren", "--skills", SKILLS, "--mission", MISSION, "--task", "t001", agent="Ren")
+    try:
+        box.reached()                                            # 1 回目のロックの後・2 回目のロックの前
+        assert box.card()["execution_status"] == "reserved"
+        intent_dir(box).mkdir()
+        (intent_dir(box) / "t009-1.json").write_text("{")        # この間に reopen が intent を書いて壊れた (回復できない)
+        before = box.snapshot()
+        box.go()
+        stdout, stderr = first.communicate(timeout=60)
+        assert first.returncode == 1 and stdout.strip() == "", (first.returncode, stdout, stderr)
+        assert last_error_code(stderr) == "REOPEN_INTENT_INCOMPLETE", stderr
+        meta = box.card()
+        assert meta["status"] == "in_progress" and meta["execution_status"] == "reserved"       # start していない
+        assert box.snapshot() == before, "start を止めたのに queue が変わった"
+    finally:
+        from pull_execution_helpers import kill_group
+        kill_group(first) if first.poll() is None else None
+
+
+def test_reports_and_the_directors_exits_still_pass_while_an_intent_cannot_be_completed(tmp_path):
+    """表の『通す』行。Worker の done は作業を失わせない・retry / update は出口を塞がない。"""
+    box = _single_pending_box(tmp_path)
+    p = box.pull("Ren", "t001", skills=SKILLS)
+    assert p.returncode == 0, p.stderr
+    xid = json.loads(p.stdout)["execution_id"]
+    intent_dir(box).mkdir()
+    (intent_dir(box) / "t009-1.json").write_text("{")
+    q = run(box, "done", "t001", "r", "--mission", MISSION, "--execution", xid, agent="Ren")
+    assert q.returncode == 0, q.stderr
+    u = run(box, "update", "t001", "--priority", "low", "--mission", MISSION, agent="Director")
+    assert u.returncode == 0, u.stderr
+
+
+def test_a_mission_with_an_unfinished_intent_cannot_be_retired_to_the_shelf(tmp_path):
+    box = _stopped_box(tmp_path)
+    _corrupt_intent(box, "{")
+    before = box.snapshot()
+    p = run(box, "archive", MISSION, agent="Director")
+    assert p.returncode == 1 and last_error_code(p.stderr) == "REOPEN_INTENT_INCOMPLETE", (p.returncode, p.stderr)
+    assert box.snapshot() == before and (box.queue / "missions" / MISSION).is_dir()

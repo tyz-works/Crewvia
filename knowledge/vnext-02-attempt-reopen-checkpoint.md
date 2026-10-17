@@ -312,5 +312,11 @@ Codex の往復は 3 巡で打ち切った (PR #301 の t002)。以下は実装 
 - 実装の PR（D・F）の QA で確かめること: (1) cascade を各書き込みの後で kill して再実行し、`cascade-incomplete` が出て再実行で消えること・`reopen_count` が二重に増えないこと。(2) 孤児の台帳を作ってから同じ報告を送り直すと、新しいファイルが増えず `ended_at` が台帳と card・record で一致すること。(3) 孤児の台帳のあとに違う Result で送ると `HISTORY_MISMATCH` で card が書かれないこと（この拒否のあとの出口が「同じ報告を送り直す」だけでよいかは、運用で足りなければ孤児の差し替えを別に設計する）。
 - **checkpoint のペイン（`pane.txt`）は、退役の段が Worker を殺した後なのでふつう取れない**（PR-G / t039）。worktree の未 commit の作業（本命）は殺した後でも残るので取れる。ペインの末尾まで欲しいなら、殺す**前**（`_start` の送信と SIGTERM の間）に撮る必要があるが、
   それは退役の順序と権限（`daemon-authority.md`）に触れるので PR-G では採らなかった。必要になったら別 PR で「撮るだけ・失敗しても殺す」の段を `_start` に足す（期限と通知は同じ作り）。
+- **同じ試行の take が同時に 2 本走ると、共有の `<execution_id>.partial` を互いに消しあう**（PR-G の Codex 5 巡目 P2-1。直さずここに積む）。
+  - 漏れている状態: `lib_checkpoint.take()` は書きかけを試行ごとに 1 つの `<execution_id>.partial` に作る。後から入った take は先に在る `.partial` を `remove_tree` してから作り直すので、先の take が書いている最中の dir を消す。先の take は書き込みか rename で失敗し、後の take も先の残骸や rename 先の競合で失敗しうる。
+  - 起きる害: 両方失敗して `--checkpoint none` になり、checkpoint なしで退役が進む（退役は止めない設計なので task は壊れないが、保存したかった作業の写しが残らない）。手動の CLI と watchdog が同じ試行で重なった場合に起きる。通常運用では watchdog だけが取るので起きにくい。
+  - 直し方の方向（未決）: (a) 試行ごとのロック（取れなければ待たずに「別の take が走っている」として失敗にし、完成後の再利用に任せる）。(b) take ごとに一意な一時 dir（`.partial-<乱数>`）で作り、完成したものを原子的に公開（rename。先に在れば捨てて `verify` を通る先のものを再利用）。(b) のほうが他の take の dir を消さない分だけ安全。
+  - 網羅テストに入れるケース: 同じ試行の take を 2 本同時に走らせて少なくとも 1 本が成功し、`<execution_id>` が `verify` を通ること。片方が失敗しても相手の書きかけを消さないこと。完成済みがあるところへの 2 本目は再利用すること。`.partial` の残骸が古い（クラッシュ後の）ときは片付けて進めること。
+- PR-G の Codex は 5 巡（P1 は 4 巡目まで）。P1 は打ち切らずに直した。5 巡目の P2×2 のうち、`SafeDir.chain` の記述子の漏れは同じ PR で直し（t058）、上の P2-1 はここに積んだ。
 - 範囲外として残したこと: Verifier の運用と、その verify pass が依存先の変更を見る検査（PR-J）。`update --status` の Controller 化（P0 の残り）。回復を dispatcher が起こす・待つ（P0 の残り）。
 - 確かめていないこと: mission の戻し先 `in_progress` が lint / dispatcher で想定どおりか（PR-A）。retry / reopen の後に `worktree_gc` で隔離済みの worktree を pull が作り直せるか（PR-E の QA）。reopen した codex-review task が、`registry/daemons/review-refusals/` の古い拒否記録で spawn されないことがあるか（記録は消してよい。`scripts/CLAUDE.md` の「通知・記録」）。`done` → `pending` を Taskvia が受け付けるか。

@@ -534,14 +534,20 @@ class SafeDir:
     def chain(self, names, create=False, chmod_last=False):
         """`names` を 1 段ずつ開く。途中が無ければ (create=False) None。開いた中間の fd は閉じる。"""
         cur = self
-        for i, name in enumerate(names):
-            nxt = cur.child(name, create=create, chmod=chmod_last and i == len(names) - 1)
+        try:
+            for i, name in enumerate(names):
+                nxt = cur.child(name, create=create, chmod=chmod_last and i == len(names) - 1)
+                if cur is not self:
+                    cur.close()
+                if nxt is None:
+                    return None
+                cur = nxt
+            return cur if cur is not self else SafeDir(os.dup(self.fd))
+        except BaseException:
+            # child() が途中で例外になると、ここまでに開いた中間の fd (cur) を誰も閉じない = 拒否 1 回につき 1 つ漏れる
             if cur is not self:
                 cur.close()
-            if nxt is None:
-                return None
-            cur = nxt
-        return cur if cur is not self else SafeDir(os.dup(self.fd))
+            raise
 
     def lstat(self, name):
         if not _component_ok(name):

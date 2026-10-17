@@ -178,6 +178,20 @@
    - これは「**回復は正本を書かない**」（`scripts/CLAUDE.md` の回復の節）の**意図した例外**。理由: intent は Director の決定済みの操作の続きで、状態から推測した修復ではない（一覧は決定の時点で固定されている）。
    - dispatcher は queue を読むだけで、割り当ての後に Worker が pull する。**pull 側の回復が先に走る**ので、止まった cascade の窓（I は done のまま下流が pending）で古い結果の下流が pull されることは無い。dispatcher は変えない。pull の入口で窓を作らないテスト: `test_a_pull_that_arrives_before_the_recovery_recovers_first_and_pulls_nothing_stale`。
    - **完了できない intent**（読めない・壊れている・名前の形でない・一覧の card が読めない・試行の記録が無い）は固定コード `REOPEN_INTENT_INCOMPLETE`（exit 1）。**その mission の pull だけ止める**（名指しなら exit 1・何も書かない。名指しでなければその mission を候補から外す）。他の mission と、読み取り専用のコマンド、他の書き込みコマンドは止めない（止めると出口まで塞ぐ）。壊れた intent は消さない・直さない。出口: card を直して次の queue を書くコマンドか、同じ引数の `plan.sh reopen` を再実行する。
+   - **止める遷移の表**（t061。Codex: pull の 1 回目のロックだけ検査し、予約 → ロックを放して worktree の準備 → その間に reopen が intent を書いて途中で失敗 → 2 回目のロックでも回復が失敗、のとき `start_execution` に進んで下流が始まった）。ロックを取って task を進める全部の遷移を、**「task を走らせる（古い土台の上で作業を始めさせる）か」**で分けた:
+
+     | 遷移 | 完了できない intent がある mission で | 理由 |
+     |---|---|---|
+     | pull の 1 回目のロック（候補選び・予約） | 止める | 下の 2 行と同じ（t059） |
+     | pull の 2 回目のロック（start: reserved → running） | **止める**（t061。予約は書き換えない・JSON を出さない・`REOPEN_INTENT_INCOMPLETE`） | 予約と start の間にロックを放す窓がある。start は『この task を走らせる』唯一の点 |
+     | pull の worktree 失敗の出口（`needs_director` に倒す） | 通す | 予約を閉じるだけで task を進めない。止めると予約が恒久に残る |
+     | done / fail / needs-director / ready-for-verification / verifying / verify-result | 通す | Worker の作業を失わせない。報告は下流を走らせない（走らせる pull が止まっている）。intent は card の今の status で冪等なので、あとで done の下流も一覧にあれば戻る |
+     | retry / update --status・--reset / release-dep / add | 通す | Director の出口を塞がない。task を走らせるのは pull だけ |
+     | retire | 通す | 窓を閉じる側。止めると誰も閉じない |
+     | reopen（別の root） | 止める（exit 1。Controller も重ねて始めない） | intent の上に重ねない |
+     | 退避（その mission） | **止める**（t061） | 半端な cascade（I は done のまま下流が pending）を退避先に固めない。reopen は退避済みを扱わず出口が無くなる |
+
+     つまり『止める』は **task を走らせる点（start）・新しい決定（reopen）・出口を無くす点（退避）** の 3 つだけで、それ以外は通す。判定は `_INTENT_BLOCKED`（`recover_before` が毎回作り直す = 前のロックの失敗を引きずらない）を、止める遷移が自分のロックの中で読む。
 5. **同じ reopen の再実行**: 未完の intent があればそれを完了して成功を報告する（`再実行で完了`）。`--reason` / `--cascade` / `--over-cap` が intent と違えば `HISTORY_MISMATCH`（exit 3・何も書かない）。他の root の未完の intent は先に完了する。Controller を直に呼んでも、未完の intent がある mission では新しい reopen を始めない（`REOPEN_INTENT_INCOMPLETE`）。
 6. **途中状態の見つけ方**（`store-check`。**報告だけ・直さない**）: 未完の intent があれば `reopen-intent-incomplete  mission=<m>  task=<root>  (intent=<名前>)`。直すのは次に queue を書く plan.sh コマンド（pull を含む）か、同じ `plan.sh reopen` の再実行。tmp の残骸（置換前に落ちた書き込み）は intent ではない（数えない）。
 7. **前の方式の推測ロジックは消した**: `_cascade_marker`・`reopen_is_complete`・`already` の台帳の印からの導出・台帳の印と `--reason` の食い違いによる `HISTORY_MISMATCH`・`cascade-incomplete`（`lib_history.cascade_incomplete`）。台帳の `root` / `root_reopen_count` の 2 欄は**監査用に残す**（どの reopen で戻したかが読める）。

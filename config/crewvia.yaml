@@ -130,6 +130,13 @@ daemons:
   # 既定値は scripts/lib_daemon_watch.py の WatchConfig で持ちます。
   hard_idle_suppressed_notify_seconds: 600
 
+  # 退役の直前に worktree の状態 (未 commit の差分・untracked・status・ペインの末尾) を
+  # registry/checkpoints/<mission>/<task>/<execution_id>/ に保存する checkpoint の期限 (秒)。
+  # 期限を過ぎる・保存に失敗する場合も**退役は止めません** (止めると誰も窓を閉じない)。
+  # Director に 1 回だけ知らせ、`plan.sh retire --checkpoint none` で続けます。0 以下で取らない。
+  # env での上書きは付けていません (watchdog だけが読む値です)。設計: knowledge/vnext-02-attempt-reopen-checkpoint.md §5
+  checkpoint_seconds: 20
+
 # ===== Taskvia 連携 =====
 # Taskvia 承認フローの使用モードを指定します。
 #

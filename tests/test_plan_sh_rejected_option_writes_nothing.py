@@ -117,6 +117,8 @@ CASES = {
                                      "--outcome", "bogus"]),
     ("retire", "--reason"): (None, ["retire", "t001", "--agent", "Ren", "--execution", "{X}", "--mission", M,
                                     "--outcome", "needs-director", "--reason", ""]),
+    ("retire", "--checkpoint"): (None, ["retire", "t001", "--agent", "Ren", "--execution", "{X}", "--mission", M,
+                                        "--checkpoint", "/no/such/checkpoint-dir"]),
     ("update", "--mission"): ("Director", ["update", "t001", "--reset", "--mission", NOPE]),
     ("update", "--blocked-by"): ("Director", ["update", "t001", "--reset", "--mission", M, "--blocked-by", "t001"]),
     ("update", "--priority"): ("Director", ["update", "t001", "--reset", "--mission", M, "--priority", "urgent"]),

@@ -44,8 +44,9 @@ _COVERED = {
     "complete_execution": {"txn", "slug", "tid", "caller", "to_status", "meta_updates", "meta_remove", "body", "now",
                            "dry_run", "result_replaced"},     # result_replaced: vNext 02 PR-D (帰属。test_history_ledger_controller.py)
     "fail_execution": {"txn", "slug", "tid", "caller", "failure_code", "to_status", "meta_updates", "meta_remove", "body",
-                       "now", "dry_run", "result_replaced"},
-    "release_execution": {"txn", "slug", "tid", "caller", "reason_code", "to_status", "now", "meta_updates", "body"},
+                       "now", "dry_run", "result_replaced", "checkpoint_dir"},     # checkpoint_dir: vNext 02 PR-G (台帳へ。test_checkpoint_retire_plan_sh.py)
+    "release_execution": {"txn", "slug", "tid", "caller", "reason_code", "to_status", "now", "meta_updates", "body",
+                          "checkpoint_dir"},
     "reset_task": {"txn", "slug", "tid", "caller", "now", "meta_updates", "ledger_extra"},
     "abandon_detached_execution": {"txn", "slug", "tid", "now"},
     "mark_task": {"txn", "slug", "tid", "caller", "command", "to_status", "meta_updates", "meta_remove", "body"},

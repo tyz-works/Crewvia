@@ -70,7 +70,7 @@ set -euo pipefail
 #                              依存の辺は消えず、card に released_deps として残る
 #   plan.sh retire <task_id> --agent <name> --execution <id>
 #                            [--mission <slug>] [--outcome reset|needs-director]
-#                            [--reason "<1 行>"] [--no-wait]
+#                            [--reason "<1 行>"] [--checkpoint <dir|none>] [--no-wait]
 #                              実行アイデンティティで束縛した後始末。前提が外れたら
 #                              1 バイトも書かずに exit 3 (詳細は cmd_retire)。
 #                              --execution: 試行の ID (plan.sh status の ex-…。退役 marker の task_execution_id)。必須
@@ -2660,7 +2660,7 @@ USAGE = {
     'release-dep': 'plan.sh release-dep <task_id> [--dep <csv>] [--mission <slug>]',
     'retire': ('plan.sh retire <task_id> --agent <name> --execution <id>\n'
                '                       [--mission <slug>] [--outcome reset|needs-director]\n'
-               '                       [--reason "<1 行>"] [--no-wait]'),
+               '                       [--reason "<1 行>"] [--checkpoint <dir|none>] [--no-wait]'),
     'reap-orphan-assignment': 'plan.sh reap-orphan-assignment <agent> [--no-wait]',
     'ready-for-verification': 'plan.sh ready-for-verification <task_id> [--mission <slug>] [--execution <id>]',
     'verifying': 'plan.sh verifying <task_id> --verifier <name> [--mission <slug>] [--execution <id>]',
@@ -3349,6 +3349,14 @@ def cmd_pr_base(args):
 #: Controller のどのコードも 2 にしない (memory pull-exit-2-is-idle-usage-errors-must-be-1)。照合の 3 つだけ 3。
 _PULL_EXECUTION_EXIT_CODES = frozenset({
     _EXEC.EXECUTION_NOT_FOUND, _EXEC.EXECUTION_NOT_CURRENT, _EXEC.EXECUTION_ALREADY_TERMINAL})
+
+
+#: `plan.sh retire` が exit 3 (PRECONDITION_UNMET) で返す理由のうち、Controller のコード (EXECUTION_* / STATE_INVALID) に無いもの。
+#: watchdog (`lib_retirement.RETIRE_SETTLED_CODES` / `RETIRE_CHECKPOINT_CODE`) が stderr の最後の行のこの値で読み分ける。
+RETIRE_CHECKPOINT_INVALID = 'CHECKPOINT_INVALID'
+RETIRE_STATUS_NOT_RETIRABLE = 'RETIRE_STATUS_NOT_RETIRABLE'
+RETIRE_WORKER_MISMATCH = 'RETIRE_WORKER_MISMATCH'
+RETIRE_ASSIGNMENT_UNVERIFIABLE = 'RETIRE_ASSIGNMENT_UNVERIFIABLE'
 
 
 def _error_code_line(code):
@@ -7188,7 +7196,7 @@ def cmd_release_dep(args):
 def cmd_retire(args):
     """plan.sh retire <task_id> --agent <name> --execution <id>
                                 [--mission <slug>] [--outcome reset|needs-director]
-                                [--reason "<1 行>"] [--no-wait]
+                                [--reason "<1 行>"] [--checkpoint <dir|none>] [--no-wait]
 
     「この実行 (mission, task, worker, 試行の ID) を終了扱いにして後始末する」を
     1 つの操作として提供する。card の status 書き換えと assignment の撤去は
@@ -7238,6 +7246,7 @@ def cmd_retire(args):
         '--execution': 'value',
         '--outcome': 'value',
         '--reason': 'value',
+        '--checkpoint': 'value',
         '--no-wait': 'bool',
     })
 
@@ -7273,6 +7282,25 @@ def cmd_retire(args):
     reason = opts.get('--reason')
     if outcome == 'needs-director' and not (reason or '').strip():
         die("--outcome needs-director requires --reason \"<1 行の理由>\"")
+
+    # --checkpoint <dir|none> (vNext 02 PR-G。設計 §5.5): 退役の直前に保存した worktree の checkpoint。ロックの前・何も書く前に
+    # 検査する (別の試行の dir を指せない: `lib_checkpoint.verify` が meta.json の execution_id と dir 名を照合する)。
+    # 「指定されたか」は presence で見る: `--checkpoint ""` を none に倒さない。無ければ今まで通り (台帳の checkpoint_dir は空)。
+    checkpoint_dir = None
+    if '--checkpoint' in opts:
+        raw = opts['--checkpoint'].strip()
+        if not raw:
+            die("[plan.sh retire] --checkpoint には <dir> か none が必要です。空の値は none として扱いません。何も書いていません。")
+        if raw != 'none':
+            # 退役の直前の worktree の保存 (保存するのは watchdog 側の lib_retirement)。plan.sh が使うのは `verify` だけ
+            _ck = _import_scripts_module('lib_checkpoint')
+            try:
+                _ck.verify(raw, execution_id)
+            except _ck.CheckpointError as e:
+                # 専用の固定コード: watchdog は「後始末は要らない」ではなく「checkpoint だけ捨てて同じ試行の retire をやり直す」と読む
+                die(f"[plan.sh retire] --checkpoint の dir を検証できません ({e})。別の試行の dir・壊れた dir は渡せません。"
+                    f"何も書いていません。\n{_error_code_line(RETIRE_CHECKPOINT_INVALID)}", PRECONDITION_UNMET)
+            checkpoint_dir = os.path.normpath(raw)
 
     def _do():
         state = load_state()
@@ -7314,19 +7342,19 @@ def cmd_retire(args):
         if not _TASK_STATUS.accepts('retire', cur_status):
             die(f"{prefix}status が '{cur_status}' です"
                 f" (終了させられるのは {sorted(_TASK_STATUS.ACCEPTS_FROM['retire'])} の実行だけ —"
-                f" それ以外は実行自身が書いた結末なので、巻き戻しません){suffix}",
+                f" それ以外は実行自身が書いた結末なので、巻き戻しません){suffix}\n{_error_code_line(RETIRE_STATUS_NOT_RETIRABLE)}",
                 PRECONDITION_UNMET)
 
         cur_worker = meta.get('worker')
         if cur_worker != agent:
-            die(f"{prefix}worker は {cur_worker!r} で、{agent!r} ではありません{suffix}",
+            die(f"{prefix}worker は {cur_worker!r} で、{agent!r} ではありません{suffix}\n{_error_code_line(RETIRE_WORKER_MISMATCH)}",
                 PRECONDITION_UNMET)
 
         # 照合の規則は lib_execution.execution_matches の 1 か所 (ID だけ。世代は見ない)。
         matched, _check = _EXEC.execution_matches(view, meta, execution_id=execution_id)
         if matched != _EXEC.MATCH:
             die(f"{prefix}指定された execution はこの task の今の試行ではありません"
-                f" (同じ task の別の実行です){suffix}", PRECONDITION_UNMET)
+                f" (同じ task の別の実行です){suffix}\n{_error_code_line(_EXEC.EXECUTION_NOT_CURRENT)}", PRECONDITION_UNMET)
 
         # assignment は「この実行のもの」と確定したときだけ撤去する。存在しない
         # 場合 (既に片付いた card の取り残し) は撤去すべきものが無いだけなので
@@ -7334,7 +7362,7 @@ def cmd_retire(args):
         # identity の ID と比べる (判定は lib_state_store の 1 か所。identity に ID が無ければ保留)。
         verdict = classify_assignment_for_execution(agent, slug, task_id, execution_id)
         if verdict not in (ASSIGN_MINE, ASSIGN_ABSENT):
-            die(f"{prefix}{describe_assignment_verdict(agent, verdict)}{suffix}",
+            die(f"{prefix}{describe_assignment_verdict(agent, verdict)}{suffix}\n{_error_code_line(RETIRE_ASSIGNMENT_UNVERIFIABLE)}",
                 PRECONDITION_UNMET)
 
         # ── ここから書き込み。前提は全部通っている。 ──────────────────────
@@ -7358,10 +7386,12 @@ def cmd_retire(args):
         try:
             if view == _EXEC.ACTIVE and meta.get('execution_status') == _EXEC.RESERVED:
                 _CONTROLLER.release_execution(_txn(), slug, task_id, caller, _EXEC.RETIRED,
-                                              to_status=to_status, meta_updates=updates, body=new_body)
+                                              to_status=to_status, meta_updates=updates, body=new_body,
+                                              checkpoint_dir=checkpoint_dir)
             else:
                 _CONTROLLER.fail_execution(_txn(), slug, task_id, caller, _EXEC.RETIRED,
-                                           to_status=to_status, meta_updates=updates, body=new_body)
+                                           to_status=to_status, meta_updates=updates, body=new_body,
+                                           checkpoint_dir=checkpoint_dir)
         except _EXEC.ControllerError as e:
             _controller_die('retire', e)
 

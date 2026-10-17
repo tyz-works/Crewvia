@@ -1254,13 +1254,13 @@ def reopen_intent_blockers(txn, slug, intent):
     | 経路上の task の今の status | 打ち直し |
     |---|---|
     | done / verified | 一覧にあれば戻す (reopen)。**一覧に無ければ止める** (`PATH_CHANGED_WHILE_STALLED`。決定の後に完了した = 古い結果) |
-    | 実行中 (`_HOLDING`) | 一覧にあれば試行を閉じて戻す。一覧に無くても、I が done の間は pull できないので通す (走らせる pull が止まっている) |
+    | 実行中 (`_HOLDING`) | 一覧にあれば試行を閉じて戻す。**一覧に無ければ止める** (`PATH_CHANGED_WHILE_STALLED`。t067: 置いたまま報告で done になると R が I より先に走る) |
     | pending / needs_director / blocked / verification_failed | 通す (未完了。済んでいる) |
     | skipped | **止める** `CASCADE_SKIPPED_ON_PATH` |
     | failed (他の経路上の task の依存) | **止める** `CASCADE_FAILED_ON_PATH` (端の failed は通す) |
     | 語彙の外 | **止める** `CASCADE_FAILED_ON_PATH` |
 
-    出口: 止めた task を `plan.sh retry` (failed) / `plan.sh update <id> --status pending` (skipped) 等で片付けてから、同じ
+    出口 (t067: 凍結中は plan.sh の update / retry が使えない): 止めた task の card を Director が直接 pending に戻してから、同じ
     `plan.sh reopen` を再実行する (または他の queue を書くコマンド)。card が読めなければ `REOPEN_INTENT_INCOMPLETE`。
     """
     root = intent['root']
@@ -1287,6 +1287,10 @@ def reopen_intent_blockers(txn, slug, intent):
             out.append((d, ex.CASCADE_FAILED_ON_PATH, st))
         elif st in (_S_DONE, _S_VERIFIED) and d not in listed:
             out.append((d, _BLOCKER_PATH_CHANGED, st))
+        elif st in _HOLDING and d not in listed:
+            # 二重の網 (t067): 一覧に無い task が実行中。回復は A を置いたまま intent を消すので、A が報告で done になると
+            # R が I より先に pull できる。凍結 (plan.sh) をすり抜けた経路 (直に card を書く等) でもここで止める
+            out.append((d, _BLOCKER_PATH_CHANGED, st))
     return out
 
 
@@ -1294,9 +1298,9 @@ def _intent_blocked(slug, name, blockers):
     shown = ', '.join(f"{d}({code}, status={store._safe_status(st) or '<unknown>'})" for d, code, st in blockers)
     return _err(ex.REOPEN_INTENT_INCOMPLETE,
                 f"{slug}: 未完の reopen の intent {name} を打ち直せません: 経路上の task が変わっています ({shown})。"
-                f"intent は残してあり、この mission の pull は止まっています。出口: 止めた task を Director が片付けてから"
-                f"(failed は `plan.sh retry <id>`、skipped・決定の後に完了した task は `plan.sh update <id> --status pending`"
-                f" で pending に戻す)、同じ `plan.sh reopen` を再実行するか他の queue を書くコマンドを打つ", slug)
+                f"intent は残してあり、この mission の pull は止まっています。plan.sh の update / retry / add / release-dep は"
+                f" intent が残る間は凍結されている (t067) ので、出口: 止めた task の card を Director が直接 pending に戻してから"
+                f"(`plan.sh store-check` の reopen-intent-blocked が task と理由を示す)、同じ `plan.sh reopen` を再実行する", slug)
 
 
 def _load_for_intent(txn, slug, tid, intent):

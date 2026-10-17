@@ -3076,7 +3076,7 @@ def cmd_add(args):
         # R-3: 前回の add が card の後・next_task_id の前で落ちていれば採番を進める
         # (今は次の add が同じ tNNN を黙って上書きする)
         recover_before(add_missions=[slug], include_caller=False)
-        _refuse_graph_change_while_intent_pending(slug, 'add')   # --blocked-by の有無を問わない (新しい task は対象の下流になりうる)
+        _refuse_write_while_intent_pending(slug, 'add')   # --blocked-by の有無を問わない (新しい task は対象の下流になりうる)
         mission = load_mission(slug)
         task_num = int(mission.get('next_task_id') or 1)
         # 回復 (R-3) が失敗しても (警告だけで続行する設計) next_task_id は実在の card より遅れうる。
@@ -3408,15 +3408,40 @@ _NO_WRITE_REFUSALS = frozenset({
     _EXEC.CASCADE_NO_EXECUTION, _EXEC.CASCADE_UNREADABLE_CARDS, _EXEC.MISSION_ARCHIVED, _EXEC.REOPEN_INTENT_GRAPH_FROZEN})
 
 
-def _refuse_graph_change_while_intent_pending(slug, command, task_id=None):
-    """未完の reopen の intent がある mission で、**依存の形を変える書き込み**を拒否する (t065。設計 §4.3.1 の表)。
-    `with_lock()` の中で、`recover_before` の後・何かを書く前に呼ぶ。
+#: 未完の reopen の intent がある mission での、plan.sh の全サブコマンドの扱い (t067。設計 §4.3.1)。**この表が唯一の判定**。
+#: `allow` = 通す / `refuse` = 止める (サブコマンドが `_refuse_write_while_intent_pending` を自分のロックの中で呼ぶ) /
+#: `own` = 本体の中に専用の扱いがある (reopen = 同じ root は続きを実行・別の root は拒否 / pull・archive = INCOMPLETE で止める)。
+#: allowlist (通すものだけを列挙し、他は止める): 新しいサブコマンドは表に載せないと構造テストが赤になる。
+_INTENT_FREEZE = {
+    # 回復の出口・Worker の作業を失わせない報告・窓を閉じる側
+    'reopen': 'own', 'retire': 'allow',
+    'done': 'allow', 'fail': 'allow', 'needs-director': 'allow', 'ready-for-verification': 'allow',
+    'verifying': 'allow', 'verify-result': 'allow',
+    # 読み取り専用 (queue の card を書かない)
+    'status': 'allow', 'history': 'allow', 'store-check': 'allow', 'lint': 'allow', 'snapshot': 'allow',
+    'dashboard-data': 'allow', 'resolve-mission': 'allow', 'pr-base': 'allow', 'task-graph': 'allow', 'resync': 'allow',
+    # card・intent に触れない (新しい mission の作成 / 有効化 / mission.yaml の review 状態 / registry の孤児 assignment)
+    'init': 'allow', 'launch': 'allow', 'review': 'allow', 'reap-orphan-assignment': 'allow',
+    # 止める側: update の全部の形・add・release-dep・retry (別の reopen・pull・archive は own)
+    'update': 'refuse', 'add': 'refuse', 'release-dep': 'refuse', 'retry': 'refuse',
+    'pull': 'own', 'archive': 'own',
+}
 
-    intent は保存した `closure` (決定の時点の下流) で実行する。回復が止まっている間に `add` / `update --blocked-by` / `release-dep` で
-    辺や解除を変えると、一覧は変わらないまま経路だけが変わり、新しい下流が I の再完了より前に走れる (PR #308 の指摘)。
+
+def _refuse_write_while_intent_pending(slug, command, task_id=None):
+    """未完の reopen の intent がある mission で、`_INTENT_FREEZE` が `refuse` のコマンドを拒否する (t067。t065 の「依存の形を変える
+    書き込み」だけの拒否を、allowlist に広げた)。`with_lock()` の中で、`recover_before` の後・何かを書く前に呼ぶ。
+
+    intent は保存した一覧で実行する。回復が止まっている間に、辺 (add / update --blocked-by / release-dep)・status (update --status
+    skipped / in_progress)・試行 (retry) が動くと、一覧と経路が食い違い打ち直しを誤らせる (PR #308 の指摘は 4 巡ともこの形)。
     回復が完了できるなら `recover_before` が先に完了させているので、ここに来るのは**完了できなかった intent が残っているとき**だけ
     (`_INTENT_BLOCKED` に頼らず intent の dir を直に見る = 回復を省いた呼び出しでも同じ答え)。読めない intent も「ある」側に倒す。
     exit 3・何も書かない (`UsageExit` = task-graph を再生成しない)・固定コード・出口を出す。"""
+    verdict = _INTENT_FREEZE.get(command)
+    if verdict is None:
+        die(f"[plan.sh {command}] _INTENT_FREEZE にサブコマンドが載っていません (内部エラー。何も書いていません)", 1)
+    if verdict != 'refuse':
+        return
     pending = slug in _INTENT_BLOCKED
     if not pending:
         try:
@@ -3426,9 +3451,9 @@ def _refuse_graph_change_while_intent_pending(slug, command, task_id=None):
     if not pending:
         return
     where = f"{slug}/{task_id}" if task_id else slug
-    print(f"[plan.sh {command}] {where}: 未完の reopen の intent がある mission では依存の形を変えられません (add / update --blocked-by / "
-          f"release-dep)。何も書いていません。出口: 先に同じ引数の `plan.sh reopen` を再実行して完了させてください "
-          f"(止めている task があれば `plan.sh store-check` の reopen-intent-blocked を見て片付けてから)\n"
+    print(f"[plan.sh {command}] {where}: 未完の reopen の intent がある mission では queue を書き換えられません (通すのは同じ reopen の再実行・"
+          f"retire・Worker の報告・読み取りだけ)。何も書いていません。出口: 先に同じ引数の `plan.sh reopen` を再実行して完了させてください "
+          f"(止めている task があれば `plan.sh store-check` の reopen-intent-blocked を見て、Director が card を直接片付けてから)\n"
           f"{_error_code_line(_EXEC.REOPEN_INTENT_GRAPH_FROZEN)}", file=sys.stderr)
     raise UsageExit(_EXEC.EXIT_CODES[_EXEC.REOPEN_INTENT_GRAPH_FROZEN])
 
@@ -6762,6 +6787,7 @@ def cmd_update(args):
 
         # 回復は読み直しより前 (reset の途中で落ちた状態は、旧所有者の枠を逆引きでしか見つけられない)
         recover_before(cards=[(slug, task_id)])
+        _refuse_write_while_intent_pending(slug, 'update', task_id)    # 全部の形 (t067)。以降の検証・書き込みより前
         meta, body = load_task(slug, task_id)
         old_status = meta.get('status')
 
@@ -6774,7 +6800,6 @@ def cmd_update(args):
         if opts.get('--blocked-by') is not None:
             raw = opts['--blocked-by'].strip()
             new_blocked = [s.strip() for s in raw.split(',') if s.strip()] if raw else []
-            _refuse_graph_change_while_intent_pending(slug, 'update', task_id)
             _reject_dependency_cycle(slug, task_id, new_blocked)
         if opts.get('--skills') is not None or deliverable is not None:
             # skills か deliverable を動かすときだけ、動かした後の組み合わせで作れるかを確かめる
@@ -6979,6 +7004,7 @@ def cmd_retry(args):
         if not os.path.exists(mission_dir(slug)):
             die(f"mission '{slug}' not found.")
         recover_before(cards=[(slug, task_id)])
+        _refuse_write_while_intent_pending(slug, 'retry', task_id)
         default_cap = _HISTORY.load_default_max_attempts(
             os.path.join(REPO_ROOT, 'config', 'crewvia.yaml'),
             warn=lambda msg: print(f"[plan.sh retry] warn: {msg}", file=sys.stderr))
@@ -7166,7 +7192,7 @@ def cmd_release_dep(args):
             die(f"mission '{slug}' not found.")
 
         recover_before(cards=[(slug, task_id)], include_caller=False)    # 完了できる intent は先に完了する (止まっているときだけ下で拒否)
-        _refuse_graph_change_while_intent_pending(slug, 'release-dep', task_id)
+        _refuse_write_while_intent_pending(slug, 'release-dep', task_id)
         meta, body = load_task(slug, task_id)
         st = meta.get('status')
         if st != 'pending':

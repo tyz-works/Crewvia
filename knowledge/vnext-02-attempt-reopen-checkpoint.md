@@ -186,13 +186,12 @@
      | pull の 2 回目のロック（start: reserved → running） | **止める**（t061。予約は書き換えない・JSON を出さない・`REOPEN_INTENT_INCOMPLETE`） | 予約と start の間にロックを放す窓がある。start は『この task を走らせる』唯一の点 |
      | pull の worktree 失敗の出口（`needs_director` に倒す） | 通す | 予約を閉じるだけで task を進めない。止めると予約が恒久に残る |
      | done / fail / needs-director / ready-for-verification / verifying / verify-result | 通す | Worker の作業を失わせない。報告は下流を走らせない（走らせる pull が止まっている）。intent は card の今の status で冪等なので、あとで done の下流も一覧にあれば戻る |
-     | **add / update --blocked-by / release-dep（依存の形を変える書き込み）** | **止める**（t065。exit 3・何も書かない・固定コード `REOPEN_INTENT_GRAPH_FROZEN`・出口 =「同じ `plan.sh reopen` を再実行して完了させる」） | intent は保存した `closure` で実行する。止まっている間に辺・解除を変えると一覧は変わらないまま経路だけが変わり、新しい下流が I の再完了より前に走れる（Codex: 無関係な done の B を I に依存させ、R を B に依存させる）。`add` は `--blocked-by` の有無を問わない（新しい task が対象の下流になりうる）。**完了できる intent は書き込みコマンドの回復が先に完了する**ので、止めるのは完了できなかった intent が残っているときだけ |
-     | retry / update（`--blocked-by` 以外）・--reset | 通す | Director の出口を塞がない。task を走らせるのは pull だけ。status を変える書き込みは、打ち直しが下の表で受ける |
+     | **update（全部の形）/ add / release-dep / retry** | **止める**（t067 で allowlist に広げた。t065 は依存の形を変える書き込みだけだった。exit 3・何も書かない・固定コード `REOPEN_INTENT_GRAPH_FROZEN`・出口 =「同じ `plan.sh reopen` を再実行して完了させる」） | intent は保存した一覧で実行する。止まっている間に辺・解除・status・試行が動くと、一覧と経路が食い違う（Codex 4 巡: 付け替え → `update --status skipped` → `--blocked-by` → 一覧に無い task を `update --status in_progress`。1 つずつ塞ぐのをやめた）。判定は `plan.sh` の `_INTENT_FREEZE`（コマンド名 → allow / refuse / own の 1 表。全サブコマンドが載っていることを構造テストで固定）。**完了できる intent は書き込みコマンドの回復が先に完了する**ので、止めるのは完了できなかった intent が残っているときだけ。止めた task を片付ける出口は plan.sh の update / retry ではなく、Director が card を直接直すこと |
      | retire | 通す | 窓を閉じる側。止めると誰も閉じない |
      | reopen（別の root） | 止める（exit 1。Controller も重ねて始めない） | intent の上に重ねない |
      | 退避（その mission） | **止める**（t061） | 半端な cascade（I は done のまま下流が pending）を退避先に固めない。reopen は退避済みを扱わず出口が無くなる |
 
-     つまり『止める』は **task を走らせる点（start）・新しい決定（reopen）・出口を無くす点（退避）・依存の形を変える書き込み（t065）** の 4 つだけで、それ以外は通す。判定は `_INTENT_BLOCKED`（`recover_before` が毎回作り直す = 前のロックの失敗を引きずらない）を、止める遷移が自分のロックの中で読む。
+     つまり『通す』のは **同じ reopen の再実行・retire・Worker の報告・読み取り専用** だけ（t067。allowlist）で、update の全部の形・add・release-dep・retry・別の reopen・退避・pull は止める。判定は `_INTENT_BLOCKED`（`recover_before` が毎回作り直す = 前のロックの失敗を引きずらない）を、止める遷移が自分のロックの中で読む。
    - **止まっている間に通している書き込みの族（t065。グラフ・targets・status を変えて打ち直しを誤らせうるものを 1 行ずつ）**:
 
      | 書き込み | 何を変えうるか | 扱い |

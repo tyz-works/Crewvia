@@ -136,7 +136,7 @@ def test_every_next_command_stops_at_the_same_place(tmp_path, how):
         assert p.returncode == 1
     elif how == "update":
         p = run(box, "update", "t003", "--priority", "low", "--mission", MISSION, agent="Director")
-        assert p.returncode == 0, p.stderr                         # 他の書き込みコマンドは止めない (出口を塞がない)
+        assert p.returncode == 3, p.stderr                         # t067: 完了できない intent の間、update は凍結
     else:
         p = reopen(box)
         assert p.returncode == 1 and last_error_code(p.stderr) == "REOPEN_INTENT_INCOMPLETE", p.stderr
@@ -203,4 +203,4 @@ def test_a_blocked_intent_does_not_stop_other_missions_or_read_only_commands(tmp
     assert run(box, "status", "--mission", MISSION, agent="Director").returncode == 0
     assert run(box, "store-check", "--mission", MISSION, agent="Director").returncode == 0
     u = run(box, "update", "t003", "--priority", "low", "--mission", MISSION, agent="Director")
-    assert u.returncode == 0, u.stderr
+    assert u.returncode == 3, u.stderr                             # t067: 同じ mission の書き込みは凍結 (他 mission は別テスト)

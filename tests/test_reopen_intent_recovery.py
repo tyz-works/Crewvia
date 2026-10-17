@@ -280,8 +280,8 @@ def test_an_unreadable_intent_stops_the_pull_of_that_mission_and_nothing_else(tm
     assert s.returncode == 0, s.stderr
     assert run(box, "store-check", "--mission", MISSION, agent="Director").returncode == 0
     assert "reopen-intent-incomplete" in store_check(box)
-    u = run(box, "update", "t002", "--priority", "low", "--mission", MISSION, agent="Director")   # 他の書き込みコマンドは止まらない
-    assert u.returncode == 0, u.stderr
+    u = run(box, "update", "t002", "--priority", "low", "--mission", MISSION, agent="Director")   # 凍結 (t067): 書き込みは止まる
+    assert u.returncode == 3 and last_error_code(u.stderr) == "REOPEN_INTENT_GRAPH_FROZEN", u.stderr
     assert intents(box) == ["t001-1.json"]                                # 壊れた intent は消さない・直さない
 
 
@@ -393,7 +393,7 @@ def test_the_start_lock_of_a_pull_refuses_when_an_intent_appears_between_the_two
 
 
 def test_reports_and_the_directors_exits_still_pass_while_an_intent_cannot_be_completed(tmp_path):
-    """表の『通す』行。Worker の done は作業を失わせない・retry / update は出口を塞がない。"""
+    """表の『通す』行。Worker の done は作業を失わせない。update は t067 から凍結 (別テストで固定)。"""
     box = _single_pending_box(tmp_path)
     p = box.pull("Ren", "t001", skills=SKILLS)
     assert p.returncode == 0, p.stderr
@@ -403,7 +403,7 @@ def test_reports_and_the_directors_exits_still_pass_while_an_intent_cannot_be_co
     q = run(box, "done", "t001", "r", "--mission", MISSION, "--execution", xid, agent="Ren")
     assert q.returncode == 0, q.stderr
     u = run(box, "update", "t001", "--priority", "low", "--mission", MISSION, agent="Director")
-    assert u.returncode == 0, u.stderr
+    assert u.returncode == 3, u.stderr
 
 
 def test_a_mission_with_an_unfinished_intent_cannot_be_retired_to_the_shelf(tmp_path):

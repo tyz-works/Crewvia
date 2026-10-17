@@ -106,15 +106,12 @@ def test_the_refusal_does_not_leak_card_contents(tmp_path):
     assert p.returncode == 3 and "SECRET-TITLE-65" not in p.stdout + p.stderr
 
 
-def test_the_refusal_is_about_the_stuck_mission_only(tmp_path):
-    """止めるのは依存の形を変える書き込みだけ。他の更新・読み取り・Director の出口 (status を直す update) は通す。"""
+def test_reads_still_work_while_the_intent_is_stuck(tmp_path):
+    """読み取りは通る。update の他の形は t067 で凍結に広げた (`tests/test_reopen_intent_write_freeze.py`)。"""
     box = _stuck_box(tmp_path)
-    for argv in (("update", "t004", "--priority", "low"), ("update", "t004", "--description", "x"),
-                 ("update", "t003", "--skills", "review,qa"), ("status",), ("store-check",)):
+    for argv in (("status",), ("store-check",)):
         p = run(box, *argv, "--mission", MISSION, agent="Director")
         assert p.returncode == 0, (argv, p.stderr)
-    out = run(box, "update", "t002", "--status", "pending", "--mission", MISSION, agent="Director")
-    assert out.returncode == 0, out.stderr                              # 止めている task を片付ける出口は塞がない
 
 
 def test_after_the_director_clears_the_blocker_the_same_reopen_finishes_and_the_writers_work_again(tmp_path):

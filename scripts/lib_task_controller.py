@@ -472,7 +472,7 @@ def _match_or_plan(txn, slug, tid, kind, xid, reopen, fields, body, ended_at, ig
 
 
 def _record_ledger(txn, slug, tid, meta, out, body_out, caller, *, end_code, now, resolver=None, ledger_extra=None,
-                   checkpoint_dir=None):
+                   checkpoint_dir=None, dry_run=False):
     """終わる試行の台帳を、card の書き込みの**直前**に 1 ファイル足す (台帳 → card の順。card がコミット点)。
     戻り値: `(ended_at, history_detail, reused)`。`ended_at` は record にも使う値 (再送では台帳のものを再利用。そのとき
     `reused=True`)。
@@ -490,7 +490,7 @@ def _record_ledger(txn, slug, tid, meta, out, body_out, caller, *, end_code, now
         else:                                                # retry / reopen: 呼び出し元が台帳の中身を決める
             action, name, ended_at, text = resolver(ended_at)
         reused = action == 'reuse'
-        if action == 'write':
+        if action == 'write' and not dry_run:
             txn.write_history(slug, tid, name, text)
     except (_LedgerProblem, store.StoreError, hist.HistoryError) as e:
         if isinstance(e, hist.HistoryError):                 # 台帳の形を組めない (欄の型の誤り。値は出さない)
@@ -741,7 +741,7 @@ def _apply_updates(out, updates, remove):
 def _finish(txn, slug, tid, meta, body, caller, *, new_status, end_code, to_status, command, operation,
             clear_owner, retire_slot, meta_updates, new_body, now, required_exec_status=None,
             abandon_detached=False, meta_remove=(), dry_run=False, result_replaced=False, ledger_extra=None,
-            checkpoint_dir=None):
+            checkpoint_dir=None, check_ledger=False):
     """終わらせる操作の共通の骨 (照合 → 遷移の検査 → 台帳 → card → record → 枠 → 監査)。
 
     `result_replaced=True` は「この呼び出しの `new_body` が `## Result` 節を実際に置き換えた」と呼び出し側が**明示**する
@@ -752,6 +752,8 @@ def _finish(txn, slug, tid, meta, body, caller, *, new_status, end_code, to_stat
     `dry_run=True` は**照合と遷移の検査だけ**を同じ規則で行い、何も書かずに判定 (`PROCEED` / `IDEMPOTENT` / `TASK_ONLY`)
     を返す (拒否は同じ拒否の行と domain error)。呼び出し側が、コミット点より前に派生値を書く操作 (done の pr_number の
     伝播) の**前**に「この操作は通る」を確かめるのに使う — 検査が 2 か所に分かれず、書いた後で拒否になる窓が無い。
+    `check_ledger=True` (dry_run と一緒に) は PROCEED の台帳の判定 (`HISTORY_MISMATCH` / `AMBIGUOUS`) まで実行と同じ関数で行う
+    (書かない)。done / fail は最終の Result を知らないので付けない。reopen の intent が下流の reset を書く前の検査が使う。
     """
     _check_caller(caller)
     _check_now(now)
@@ -802,7 +804,7 @@ def _finish(txn, slug, tid, meta, body, caller, *, new_status, end_code, to_stat
         _refuse(txn, ex.INVALID_TRANSITION,
                 f"{slug}/{tid}: 試行を {current} から {new_status} にはできません", slug, tid, meta, caller)
     _check_task_status(txn, command, slug, tid, meta, caller)
-    if dry_run:
+    if dry_run and not check_ledger:
         return decision
     out = dict(meta)
     _apply_updates(out, updates, remove)
@@ -815,7 +817,9 @@ def _finish(txn, slug, tid, meta, body, caller, *, new_status, end_code, to_stat
     # 孤児の 1 ファイルで、同じ報告の再送がそれを再利用して先へ進む (ended_at も台帳のものを card・record に使う)
     ended_at, history_detail, ledger_reused = _record_ledger(txn, slug, tid, meta, out, body_out, caller,
                                                              end_code=end_code, now=now, ledger_extra=ledger_extra,
-                                                             checkpoint_dir=checkpoint_dir)
+                                                             checkpoint_dir=checkpoint_dir, dry_run=dry_run)
+    if dry_run:
+        return decision
     if ledger_reused and out.get('completed_at') is not None and updates.get('completed_at') is not None:
         out['completed_at'] = ended_at      # 孤児の再送: card の完了時刻も台帳・record と同じ値 (設計 §3.2-2。再送の now は使わない)
     txn.write_card(slug, tid, out, body_out)                    # 終了コードも status と同じ書き込みに入る (コミット点)
@@ -905,7 +909,7 @@ def release_execution(txn, slug, tid, caller=NO_CALLER, reason_code=None, *, to_
                    checkpoint_dir=checkpoint_dir)
 
 
-def reset_task(txn, slug, tid, caller=NO_CALLER, *, now=None, meta_updates=None, ledger_extra=None):
+def reset_task(txn, slug, tid, caller=NO_CALLER, *, now=None, meta_updates=None, ledger_extra=None, dry_run=False):
     """Director の `update --reset`: task を pending に戻し、試行は次のどれかで閉じる (execution.md §4.2)。
 
     - ACTIVE: reserved → released / running → failed (どちらも `RESET_BY_DIRECTOR`)
@@ -914,6 +918,7 @@ def reset_task(txn, slug, tid, caller=NO_CALLER, *, now=None, meta_updates=None,
     worker・started_at を null にし、枠を撤去する。遷移元は問わない (今の `update` と同じ。any → pending)。
     `meta_updates` は同じ card の書き込みに入れる他の欄 (`update --reset` の `completed_at = None`)。
     `ledger_extra` は台帳の reset に足す欄 (reopen の cascade が `reason` / `root` / `root_reopen_count` と、上限を超えて戻すときの `over_cap` を渡す。PR-F)。
+    `dry_run=True` は遷移の検査に加えて台帳の食い違い (`HISTORY_MISMATCH` / `AMBIGUOUS`) まで実行と同じ判定で行い、何も書かない (PR-F: intent を書く前の検査)。
     """
     if ledger_extra is not None:
         ok = (isinstance(ledger_extra, dict) and set(ledger_extra) <= {'reason', 'root', 'root_reopen_count', 'over_cap'})
@@ -925,10 +930,11 @@ def reset_task(txn, slug, tid, caller=NO_CALLER, *, now=None, meta_updates=None,
         return _finish(txn, slug, tid, meta, body, caller, new_status=ex.RELEASED, end_code=ex.RESET_BY_DIRECTOR,
                        to_status=_S_PENDING, command=None, operation=None, clear_owner=True, retire_slot=True,
                        meta_updates=meta_updates, new_body=None, now=now, required_exec_status={ex.RESERVED},
-                       ledger_extra=ledger_extra)
+                       ledger_extra=ledger_extra, dry_run=dry_run, check_ledger=dry_run)
     return _finish(txn, slug, tid, meta, body, caller, new_status=ex.FAILED, end_code=ex.RESET_BY_DIRECTOR,
                    to_status=_S_PENDING, command=None, operation=None, clear_owner=True, retire_slot=True,
-                   meta_updates=meta_updates, new_body=None, now=now, abandon_detached=True, ledger_extra=ledger_extra)
+                   meta_updates=meta_updates, new_body=None, now=now, abandon_detached=True, ledger_extra=ledger_extra,
+                   dry_run=dry_run, check_ledger=dry_run)
 
 
 # ---------------------------------------------------------------------------
@@ -1544,7 +1550,8 @@ def _reopen_cascade(txn, slug, tid, *, reason, over_cap, default_max_attempts, n
                     f"続けるなら --over-cap \"<理由>\" を付けてください", slug, tid, meta)
     else:
         done_set = set()
-    # 台帳の食い違い (孤児の台帳と違う中身) は書く前に見つける
+    # intent が行う書き込みは全部、実行と同じ関数の dry_run で書く前に通す (台帳の食い違い・遷移・上限。書き込みの種類ごとに
+    # 検査を足さない)。戻す task (done_set) も、試行を閉じる task (reset_set) も、I も同じ。1 つでも通らなければ intent を書かない
     _write_reopen(txn, slug, tid, meta, body, kind='reopen', reason=reason, count=meta['execution_count'],
                   over_cap=over_cap if root_over else None, bump=True, now=now, dry_run=True)
     for d in closure:
@@ -1553,6 +1560,12 @@ def _reopen_cascade(txn, slug, tid, *, reason, over_cap, default_max_attempts, n
             _write_reopen(txn, slug, d, card, cards[d][1], kind='reopen', reason=reason, count=card['execution_count'],
                           over_cap=over_cap if _over_cap(card, cap_of) else None, bump=True, now=now,
                           root=tid, root_reopen_count=need, dry_run=True)
+        elif d in reset_set:
+            card = cards[d][0]
+            extra = dict(reason=reason, root=tid, root_reopen_count=need)
+            if _over_cap(card, cap_of):
+                extra['over_cap'] = over_cap
+            reset_task(txn, slug, d, NO_CALLER, now=now, ledger_extra=extra, dry_run=True)
 
     # ---- 決定を書く (= コミット点)。戻す task の一覧・操作・順序をここで 1 度だけ決める (I から遠い順。I は最後) ----
     work = [d for d in closure if d in done_set or d in reset_set]

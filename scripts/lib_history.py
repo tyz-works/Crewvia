@@ -585,19 +585,5 @@ def reopen_intents_incomplete(slug, txn):
             out.append((REOPEN_INTENT_INCOMPLETE, slug, None, 'unexpected_file'))
             continue
         out.append((REOPEN_INTENT_INCOMPLETE, slug, name.split('-')[0], f'intent={name}'))
-        out.extend(_intent_blocker_rows(slug, txn, name))
     return out
 
-
-def _intent_blocker_rows(slug, txn, name):
-    """止まった intent を打ち直せない理由 (どの task がなぜ) を**書かずに**列挙する: `[(kind, mission, task, 理由)]`。
-    入口の拒否規則を今の card に当てた結果 (`lib_task_controller.reopen_intent_blockers`)。読めない intent・card は上の行が既に
-    「未完」と出しているので、ここでは足さない (推測しない)。"""
-    import lib_task_controller as ctl                        # 循環を避けて遅延 import (controller が hist を import する)
-    try:
-        intent = ctl.parse_reopen_intent(slug, name, txn.read_reopen_intent(slug, name)[1])
-        blockers = ctl.reopen_intent_blockers(txn, slug, intent)
-    except (ex.ControllerError, TypeError, IndexError, store.StoreError):
-        return []
-    return [('reopen-intent-blocked', slug, d, f"intent={name} {code} status={store._safe_status(st) or '<unknown>'}")      # code は固定コード・name は検査済みの形
-            for d, code, st in blockers]

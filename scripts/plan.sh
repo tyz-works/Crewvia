@@ -5252,6 +5252,26 @@ def cmd_fail(args):
         _append_knowledge_director(*knowledge_info[0])
 
 
+def _intent_blocker_findings(slug):
+    """止まった reopen の intent を打ち直せない理由 (どの task がなぜ) を**書かずに**列挙する (fix 2 / t063)。入口の拒否規則を今の card に
+    当てた結果 (`reopen_intent_blockers`)。読めない intent・card は `reopen-intent-incomplete` の行が既に出しているので足さない。"""
+    txn = _STORE.Txn(QUEUE_DIR, op='diagnose', actor='diagnose')
+    out = []
+    try:
+        pending = _CONTROLLER.list_pending_intents(txn, slug)
+    except (_EXEC.ControllerError, _STORE.StoreError):
+        return out                                            # 読めない・壊れた intent は incomplete の行が出している
+    for name, intent in pending:
+        try:
+            blockers = _CONTROLLER.reopen_intent_blockers(txn, slug, intent)
+        except (_EXEC.ControllerError, _STORE.StoreError):
+            continue
+        for d, code, st in blockers:                          # code は固定コード・name は検査済みの形・status は語彙の中だけ
+            out.append(_STORE.Finding('reopen-intent-blocked', slug, d, None,
+                                      f"intent={name} {code} status={_STORE._safe_status(st) or '<unknown>'}"))
+    return out
+
+
 def cmd_store_check(args):
     """plan.sh store-check [--mission <slug>]
 
@@ -5279,6 +5299,8 @@ def cmd_store_check(args):
     history_slugs = (only,) if only else tuple(sorted({c[0] for c in scope.cards} | set(scope.add_missions)))
     for kind, mission, task, detail in _HISTORY.diagnose(QUEUE_DIR, history_slugs):
         findings.append(_STORE.Finding(kind, mission, task, None, detail))
+    for slug in history_slugs:
+        findings.extend(_intent_blocker_findings(slug))
     for f in findings:
         fields = [f.kind]
         for key in ('mission', 'task', 'agent'):

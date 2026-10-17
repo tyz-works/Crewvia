@@ -84,6 +84,7 @@ def test_the_mentions_in_the_allowed_files_are_not_imports():
 #: retire は `fail_execution`)。足すのは cutover = ユーザー承認の PR)。
 PLAN_SH_ALLOWED_OPERATIONS = {"reserve_task", "start_execution", "fail_execution", "complete_execution", "mark_task",
                               "abandon_detached_execution", "reset_task", "release_execution", "reopen_task", "execute_reopen_intent", "list_pending_intents", "recover_reopen_intents",
+                              "reopen_intent_blockers",   # PR-F fix 2 (t063): store-check が止めている task を報告だけする (読み取り専用)
                               "check_reason", "check_cascade", "Caller", "NO_CALLER", "IDEMPOTENT"}
 
 

@@ -2250,7 +2250,7 @@ def _complete_reopen_intents(slugs, skip_root=None):
         try:
             done = _CONTROLLER.recover_reopen_intents(
                 _txn(), slug, skip_root=skip_root,
-                before_write=lambda root, _slug=slug: _reactivate_done_mission(_slug, via=f'reopen {root} (recovery)'))
+                before_write=lambda root, _slug=slug: _reactivate_done_mission(_slug, via=f'reopen {root} (recovery)', out=sys.stderr))
         except (_EXEC.ControllerError, _STORE.StoreError) as e:
             code = e.code if isinstance(e, _EXEC.ControllerError) else _EXEC.REOPEN_INTENT_INCOMPLETE
             _INTENT_BLOCKED[slug] = code
@@ -2977,7 +2977,7 @@ def _reject_dependency_cycle(slug, task_id, new_blocked):
         raise UsageExit(USAGE_EXIT)
 
 
-def _reactivate_done_mission(slug, mission=None, via=''):
+def _reactivate_done_mission(slug, mission=None, via='', out=None):
     """done の mission に未完了の task が戻ってきたら、mission を `in_progress` に戻す (vNext 02 PR-A)。
 
     `with_lock` の中だけで呼ぶ。dispatcher は mission.yaml の `status != done` で「全ミッション完了」を
@@ -2985,6 +2985,8 @@ def _reactivate_done_mission(slug, mission=None, via=''):
     done より前の値は残っていないため戻す値は `in_progress` 固定。`completed_at` は消す。
     `mission` を渡すと、その dict を書き換えて呼び出し元が保存する (二重書き込みを避ける)。
     戻したら True。done でなければ何もしない (False)。
+    `out` は「戻した」の 1 行の出し先 (既定 stdout)。**回復の経路 (`_complete_reopen_intents`) は stderr を渡す**: pull は本体の前に
+    回復を走らせ、stdout は JSON 1 つだけ (Worker・テストは stdout を JSON として読む)。
     """
     own = mission is None
     if own:
@@ -2995,7 +2997,7 @@ def _reactivate_done_mission(slug, mission=None, via=''):
     mission['completed_at'] = None
     if own:
         save_mission(slug, mission)
-    print(f"Reactivated: mission '{slug}' done -> in_progress ({via})")
+    print(f"Reactivated: mission '{slug}' done -> in_progress ({via})", file=out if out is not None else sys.stdout)
     return True
 
 

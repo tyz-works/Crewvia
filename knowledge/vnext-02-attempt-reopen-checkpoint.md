@@ -192,6 +192,19 @@
      | 退避（その mission） | **止める**（t061） | 半端な cascade（I は done のまま下流が pending）を退避先に固めない。reopen は退避済みを扱わず出口が無くなる |
 
      つまり『止める』は **task を走らせる点（start）・新しい決定（reopen）・出口を無くす点（退避）** の 3 つだけで、それ以外は通す。判定は `_INTENT_BLOCKED`（`recover_before` が毎回作り直す = 前のロックの失敗を引きずらない）を、止める遷移が自分のロックの中で読む。
+   - **回復の出力は stderr（PR-F fix 2・t063）**: pull は本体の前に回復を走らせ、pull の stdout は JSON 1 つだけ。回復の経路が出す文言（`止まっていた reopen を…完了しました`・mission の再活性化の `Reactivated: …`・警告）は全部 stderr。`_reactivate_done_mission(out=)` の回復の callback は `sys.stderr` を渡す（`reopen` / `add` / `update` / `retry` 自身の `Reactivated` は利用者向けの出力として stdout のまま）。pull が本体の前に走らせる処理（`recover_before` の projection の回復・intent の回復・mission の再活性化・task-graph の再生成・警告）を AST で洗い、stdout に出すのは pull の最後の JSON の 1 か所だけであることを確かめた。テスト: `tests/test_reopen_intent_stderr_and_resume_rules.py`（kill 位置ごとに `json.loads(stdout)`）。
+   - **打ち直しは入口の拒否規則を当て直す（PR-F fix 2・t063）**: 回復が止まっている間にも、上の表で「通す」にした書き込み（`update --status` / retry / release-dep / 報告）で中間 A の status は変わる。card を直した後の回復が、done / verified / 実行中以外を一律に「済んでいる」とみなすと、A(skipped) を飛ばして I を pending にして intent を消し、I → A(skipped) → R(pending) で R がすぐ pull できる。そこで `resumed=True` の実行は、最初の書き込み（mission の再活性化）の**前**に `reopen_intent_blockers` で、経路（I から「一覧の task ∪ 今の cascade の終点」への依存の経路。入口と同じ `_reopen_targets` / `path_closure`）上の task を次の表で検査する。一覧は作り直さない。
+
+     | 経路上の task の今の status | 打ち直し | 
+     |---|---|
+     | done / verified | 一覧にあれば戻す。**一覧に無ければ止める**（`PATH_CHANGED_WHILE_STALLED`。決定の後に完了した = 古い I の結果の上の完了） |
+     | 実行中（in_progress / ready_for_verification / verifying / needs_human_review） | 一覧にあれば試行を閉じて戻す。一覧に無くても通す（I が done の間は pull できない） |
+     | pending / needs_director / blocked / verification_failed | 通す（未完了 = 済んでいる。それに依存する下流は I の再完了より前に pull できない） |
+     | skipped | **止める** `CASCADE_SKIPPED_ON_PATH` |
+     | failed（経路上の別の task の依存になっているもの） | **止める** `CASCADE_FAILED_ON_PATH`（経路の端の failed は通す） |
+     | 語彙の外 | **止める** `CASCADE_FAILED_ON_PATH` |
+
+     止めるとき: **何も書かない（intent も消さない）**・その mission の pull は止めたまま（固定コードは `REOPEN_INTENT_INCOMPLETE`。理由は stderr に「どの task が・どのコードで・どの status か」）・`store-check` に `reopen-intent-blocked  mission=…  task=<止めている task>  (intent=… <コード> status=…)` を出す（報告だけ）。出口（Director）: 止めている task を片付ける（failed は `plan.sh retry <id>`、skipped と決定の後に完了した task は `plan.sh update <id> --status pending`）→ 同じ引数の `plan.sh reopen` を再実行する（または次の queue を書くコマンド）。最初の実行（`resumed=False`）は同じロックの中で入口が検査したばかりなので再検査しない。「止まっている間に許されている書き込み」ごとの確認: retry / `update --status` / `--reset` / release-dep / 報告 / add — 経路上の status を変えうるものは全部上の表で受ける（表は status で引くので、書き込みの種類を足しても漏れない）。テスト: `tests/test_reopen_intent_stderr_and_resume_rules.py`。
 5. **同じ reopen の再実行**: 未完の intent があればそれを完了して成功を報告する（`再実行で完了`）。`--reason` / `--cascade` / `--over-cap` が intent と違えば `HISTORY_MISMATCH`（exit 3・何も書かない）。他の root の未完の intent は先に完了する。Controller を直に呼んでも、未完の intent がある mission では新しい reopen を始めない（`REOPEN_INTENT_INCOMPLETE`）。
 6. **途中状態の見つけ方**（`store-check`。**報告だけ・直さない**）: 未完の intent があれば `reopen-intent-incomplete  mission=<m>  task=<root>  (intent=<名前>)`。直すのは次に queue を書く plan.sh コマンド（pull を含む）か、同じ `plan.sh reopen` の再実行。tmp の残骸（置換前に落ちた書き込み）は intent ではない（数えない）。
 7. **前の方式の推測ロジックは消した**: `_cascade_marker`・`reopen_is_complete`・`already` の台帳の印からの導出・台帳の印と `--reason` の食い違いによる `HISTORY_MISMATCH`・`cascade-incomplete`（`lib_history.cascade_incomplete`）。台帳の `root` / `root_reopen_count` の 2 欄は**監査用に残す**（どの reopen で戻したかが読める）。

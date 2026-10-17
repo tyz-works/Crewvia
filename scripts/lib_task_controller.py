@@ -1180,6 +1180,12 @@ def execute_reopen_intent(txn, slug, intent, *, now=None, before_write=None, res
 
 def _execute_reopen_intent(txn, slug, intent, *, now, before_write, resumed):
     root, need, reason = intent['root'], intent['root_reopen_count'], intent['reason']
+    if resumed:
+        # 打ち直し: 止まっている間に中間の status が変わりうる (update --status skipped 等)。入口の拒否規則を残りの対象に当て直し、
+        # 当てはまれば**何も書かず** (intent も残す) 止まる。最初の実行は同じロックの中で検査したばかりなので省く
+        blockers = reopen_intent_blockers(txn, slug, intent)
+        if blockers:
+            raise _intent_blocked(slug, intent_name(root, need), blockers)
     if before_write is not None:
         before_write()
     reopened, reset, already = [], [], []
@@ -1229,6 +1235,59 @@ def _execute_reopen_intent(txn, slug, intent, *, now, before_write, resumed):
     txn.remove_reopen_intent(slug, intent_name(root, need))
     return ReopenResult(execution=execution, reopened=tuple(reopened), reset=tuple(reset), already=tuple(already), stale=(),
                         unreleased=tuple(unreleased), resumed=resumed)
+
+
+#: 打ち直しで当て直す拒否 (入口の `CASCADE_*` と同じ規則)。intent の `REOPEN_INTENT_INCOMPLETE` の理由に固定コードで出る
+_BLOCKER_PATH_CHANGED = 'PATH_CHANGED_WHILE_STALLED'
+
+
+def reopen_intent_blockers(txn, slug, intent):
+    """未完の intent を**今の card で**打ち直してよいかを書かずに検査する。止める理由の `[(task, 固定コード, status)]` (無ければ空)。
+
+    入口 (`_reopen_cascade`) の経路の拒否を、残りの対象に当て直す。止まっている間に許されている書き込み (retry / update --status /
+    release-dep / 報告。§4.3.1 の表) で経路上の中間が変わると、一覧どおりに実行しても I の再完了を待たずに走れる下流が残るため。
+    経路 = I から「一覧の task ∪ 今の cascade の終点」への依存の経路 (`_reopen_targets` / `dep.path_closure`。入口と同じ定義)。
+
+    | 経路上の task の今の status | 打ち直し |
+    |---|---|
+    | done / verified | 一覧にあれば戻す (reopen)。**一覧に無ければ止める** (`PATH_CHANGED_WHILE_STALLED`。決定の後に完了した = 古い結果) |
+    | 実行中 (`_HOLDING`) | 一覧にあれば試行を閉じて戻す。一覧に無くても、I が done の間は pull できないので通す (走らせる pull が止まっている) |
+    | pending / needs_director / blocked / verification_failed | 通す (未完了。済んでいる) |
+    | skipped | **止める** `CASCADE_SKIPPED_ON_PATH` |
+    | failed (他の経路上の task の依存) | **止める** `CASCADE_FAILED_ON_PATH` (端の failed は通す) |
+    | 語彙の外 | **止める** `CASCADE_FAILED_ON_PATH` |
+
+    出口: 止めた task を `plan.sh retry` (failed) / `plan.sh update <id> --status pending` (skipped) 等で片付けてから、同じ
+    `plan.sh reopen` を再実行する (または他の queue を書くコマンド)。card が読めなければ `REOPEN_INTENT_INCOMPLETE`。
+    """
+    root = intent['root']
+    ids = list(dict.fromkeys([root, *intent['closure']]))
+    cards = {d: _load_for_intent(txn, slug, d, intent) for d in ids}
+    graph = {d: cards[d][0].get('blocked_by') for d in ids}
+    closure = [d for d in intent['closure'] if d in cards]
+    listed = {e['id'] for e in intent['tasks']}
+    targets = list(dict.fromkeys([*_reopen_targets(closure, cards, intent['cascade']), *listed]))
+    on_path = dep.path_closure(graph, root, targets) if targets else []
+    path_deps = {e: set(dep.declared_dependencies(graph.get(e))) for e in on_path}
+    out = []
+    for d in on_path:
+        st = cards[d][0].get('status')
+        if st == _S_SKIPPED:
+            out.append((d, ex.CASCADE_SKIPPED_ON_PATH, st))
+        elif st not in _status.TASK_STATUSES or (st == _S_FAILED and any(d in deps for e, deps in path_deps.items() if e != d)):
+            out.append((d, ex.CASCADE_FAILED_ON_PATH, st))
+        elif st in (_S_DONE, _S_VERIFIED) and d not in listed:
+            out.append((d, _BLOCKER_PATH_CHANGED, st))
+    return out
+
+
+def _intent_blocked(slug, name, blockers):
+    shown = ', '.join(f"{d}({code}, status={store._safe_status(st) or '<unknown>'})" for d, code, st in blockers)
+    return _err(ex.REOPEN_INTENT_INCOMPLETE,
+                f"{slug}: 未完の reopen の intent {name} を打ち直せません: 経路上の task が変わっています ({shown})。"
+                f"intent は残してあり、この mission の pull は止まっています。出口: 止めた task を Director が片付けてから"
+                f"(failed は `plan.sh retry <id>`、skipped・決定の後に完了した task は `plan.sh update <id> --status pending`"
+                f" で pending に戻す)、同じ `plan.sh reopen` を再実行するか他の queue を書くコマンドを打つ", slug)
 
 
 def _load_for_intent(txn, slug, tid, intent):

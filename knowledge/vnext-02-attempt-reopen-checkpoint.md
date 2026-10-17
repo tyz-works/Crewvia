@@ -161,7 +161,18 @@
   | 語彙の外（手書きの `cancelled` 等） | 何も書かず `STATE_INVALID`（exit 1。store が card を読めない）。lib にも `CASCADE_FAILED_ON_PATH` の保険がある | 知らない status を「通す」側に倒さない |
 
   `--cascade none` は何も戻さないので上の拒否は `none` には掛けない。代わりに、**経路上の failed の中間を `released_deps` で解除している下流**も `stale_runnable`（出力の「再完了を待たずに走りうる」）に出す。
-- **`released_deps` の扱い**: 解除の根拠が消えるのは I だけでなく、**pending に戻した task 全部**（I と cascade で戻した下流）。下流の card の `released_deps` から、「戻した task で、かつその下流の依存であるもの」を全部消す（消した task は出力に出る）。中間 A が戻った後で再び failed になっても、R の古い解除で自動では通らない。
+- **`released_deps` の扱い**（PR-F fix 5・t069 で『戻した task』から『経路上の task』に広げた。Codex 5 巡目 P1）: 解除の根拠が消えるのは I と戻した task だけではない。**I から終点への経路上にある task の ID は、その task の status を問わず**、下流の `released_deps` から全部消す（消す集合を status で決めず『経路上か』だけで決める。経路 = `path_closure(graph, I, targets)` ∪ {I}。宣言された依存（`blocked_by`）でない解除は触らない）。I(done) → A(needs_director) → R(pending, `released_deps=[A]`) は、A を戻さず（未完了なので）に reopen が通るが、A の解除が残ると、A が後で `fail` された瞬間に R が I の再完了より前に pull できた。消す **(下流, 上流) の組は入口が決めて intent の `unrelease` に書く**（回復も同じ組を消す。今の card から推測し直さない）。消した下流は出力に出る。中間 A が戻った後・未完了のまま・再び failed になっても、R の古い解除で自動では通らない（通すなら Director が改めて `release-dep`）。
+
+  拒否する status と、拒否せず解除だけ消す status の線引き（経路上の task）:
+
+  | 経路上の task の status | 入口 | `released_deps` |
+  |---|---|---|
+  | skipped / failed（他の task の依存になっているもの）/ 語彙の外 | **拒否**（`CASCADE_SKIPPED_ON_PATH` / `CASCADE_FAILED_ON_PATH`）。戻す手段が無く、走る下流を止められない | （何も書かない） |
+  | done / verified / 実行中 | 戻す（reopen / reset） | 消す |
+  | pending / needs_director / blocked / verification_failed | 拒否しない（未完了。依存する下流は待つ） | **消す**（後で failed になって解除が効く窓を作らない） |
+  | failed（経路の端。依存元を持たない） | 拒否しない | 消す（端への解除は、端が経路上にあるので） |
+
+  テスト: 中間 A の status（語彙の全部）× R の `released_deps` あり / なし × cascade（reviews / all）× reopen の後に A を何もしない / fail / retry（pending）で、`I が pending の間に pull できる下流` が 0 件（`tests/test_reopen_intent_move_paths_and_released_path.py::test_no_downstream_can_run_before_the_root_completes_again_whatever_the_intermediate_does_next`。陽性対照つき）。
 - **経路上の中間 task を対象外にする指定は拒否する**。将来 `--keep <id>` のような除外を足しても、`<id>` が対象 R への経路上にあり done / verified なら exit 3（該当する経路を出す）。除外できるのは経路上にない完了済み下流だけで、それは今まで通り「古い結果に基づく下流」として列挙する。
 - **`lib_dep_rules` の依存判定を推移的にする案は採らない**: 判定は dispatcher・`plan.sh pull`・lint が共有する唯一の規則で（不変条件 3）、変えると reopen と無関係な既存の全 task の割り当てが変わり影響が大きい。cascade の側で経路を閉じれば、規則を変えずに同じ保護が得られる。
 - 下流の `released_deps` に I の id があれば消す（`released_deps` は failed の依存を解除する欄。I が戻ったら解除の根拠が無い。`plan.sh:6536` と同じ作法）。
@@ -172,7 +183,7 @@
 **この節の履歴（前の方式を撤回した理由）**: 初版（PR #308 の t036〜t054）は「journal は使わない」と決め、再実行が各 card・台帳の印（`root` / `root_reopen_count`）から**済んだ所を推測し直す**方式だった。Codex は 5 巡続けて P1 を出し、2・3・5 巡目と 5 巡目の P2 はどれも「止まっている間に下流が動く（pull されて done になる・legacy の実行中 B がいる）と、推測が取りこぼす」系だった。推測は『止まった時点の状態』を再構成しようとするが、止まっている間に状態は動く。01a が journal を退けた理由（`state-store.md:212-219`: 回復に要る情報は既に正本にある）は、**この場面には当てはまらなかった**: 要る情報は『reopen の時点でどの task をどう戻すと Director が決めたか』で、それは正本のどこにも無い。**決定を最初に 1 か所へ書き、それを最後まで実行する**。
 
 1. **検査を全部先に**（§4.1-1 と、下流の列挙・拒否の判定。何も書く前）。拒否されれば何も書かれない。targets は `_reopen_targets` の 1 関数。
-2. **intent を書く（= 決定のコミット点）**: `queue/missions/<m>/reopen-intents/<root>-<n>.json`（n = 新しい root の `reopen_count`。1 つの reopen に 1 ファイル・上書きしない = `Txn.write_reopen_intent` が `AlreadyExists`）。中身: `version` / `actor`（台帳に書く actor。回復が別のコマンドでも同じ actor で書く = 台帳の同定キーの再利用が一致する）/ `root` / `root_reopen_count` / `reason` / `cascade` / `over_cap` / `root_capped` / `created_at` / `closure`（`released_deps` の掃除の範囲）/ `tasks`（**戻す task の一覧**。各 `id`・`op`（`reopen` = done / verified から戻す・`reset` = 実行中の試行を閉じる）・`capped`、**I から遠い順**）。書き込みは `lib_state_store` の `Txn.write_reopen_intent`（`tests/test_queue_writes_go_through_the_store.py` の対象外 = lib の中）。
+2. **intent を書く（= 決定のコミット点）**: `queue/missions/<m>/reopen-intents/<root>-<n>.json`（n = 新しい root の `reopen_count`。1 つの reopen に 1 ファイル・上書きしない = `Txn.write_reopen_intent` が `AlreadyExists`）。中身: `version` / `actor`（台帳に書く actor。回復が別のコマンドでも同じ actor で書く = 台帳の同定キーの再利用が一致する）/ `root` / `root_reopen_count` / `reason` / `cascade` / `over_cap` / `root_capped` / `created_at` / `closure`（`released_deps` の掃除の範囲）/ `unrelease`（**`released_deps` から消す `[下流, 上流]` の組**。経路上の task の解除を status を問わず消す。fix 5）/ `tasks`（**戻す task の一覧**。各 `id`・`op`（`reopen` = done / verified から戻す・`reset` = 実行中の試行を閉じる）・`capped`、**I から遠い順**）。書き込みは `lib_state_store` の `Txn.write_reopen_intent`（`tests/test_queue_writes_go_through_the_store.py` の対象外 = lib の中）。
 3. **intent に従って実行する**（`lib_task_controller.execute_reopen_intent`。最初の実行も回復も同じ道）: mission の再活性化 → 一覧の順に 台帳 `reopen` / `reset`（理由つき）→ card → `released_deps` の掃除 → **I の card を最後** → **intent を消す（= 完了）**。完了の印は『intent が無い』。`completed` に書き換える方式は採らない（消す方が『残っている = 未完』が 1 つの事実になり、store-check・回復・テストが同じ判定を読める）。
 4. **回復は intent を見る**: plan.sh の queue を書くコマンド（`recover_before` を呼ぶもの全部。**pull を含む**）は、ロックを取った直後（projection の回復の後・前提検査より前）に、範囲の mission の未完の intent を**最後まで実行してから**本体に進む（`_complete_reopen_intents`）。**一覧を作り直さない**。一覧の各 task は『その操作がもう済んでいるか』を **card の今の status** で確かめて冪等に行う: done / verified → 戻す（`reopen_count + 1`）、実行中 → 試行を閉じて pending、それ以外（pending 等）→ 済んでいる。台帳だけ書けて card が書けなかった孤児は台帳の同定キー（execution_id, kind, reopen_count）で再利用する。止まっている間に下流が動いた場合（pull されて done になった・古い結果で走っている）も、一覧にある限り戻す（`reopen_count` は『完了のたびに 1 回』で増える）。
    - これは「**回復は正本を書かない**」（`scripts/CLAUDE.md` の回復の節）の**意図した例外**。理由: intent は Director の決定済みの操作の続きで、状態から推測した修復ではない（一覧は決定の時点で固定されている）。
@@ -189,9 +200,23 @@
      | **update（全部の形）/ add / release-dep / retry** | **止める**（t067 で allowlist に広げた。t065 は依存の形を変える書き込みだけだった。exit 3・何も書かない・固定コード `REOPEN_INTENT_GRAPH_FROZEN`・出口 =「同じ `plan.sh reopen` を再実行して完了させる」） | intent は保存した一覧で実行する。止まっている間に辺・解除・status・試行が動くと、一覧と経路が食い違う（Codex 4 巡: 付け替え → `update --status skipped` → `--blocked-by` → 一覧に無い task を `update --status in_progress`。1 つずつ塞ぐのをやめた）。判定は `plan.sh` の `_INTENT_FREEZE`（コマンド名 → allow / refuse / own の 1 表。全サブコマンドが載っていることを構造テストで固定）。**完了できる intent は書き込みコマンドの回復が先に完了する**ので、止めるのは完了できなかった intent が残っているときだけ。止めた task を片付ける出口は plan.sh の update / retry ではなく、Director が card を直接直すこと |
      | retire | 通す | 窓を閉じる側。止めると誰も閉じない |
      | reopen（別の root） | 止める（exit 1。Controller も重ねて始めない） | intent の上に重ねない |
-     | 退避（その mission） | **止める**（t061） | 半端な cascade（I は done のまま下流が pending）を退避先に固めない。reopen は退避済みを扱わず出口が無くなる |
+     | 退避（その mission） | **止める**（t061。fix 5 で**退避の対象 slug を active かどうかに関わらず**回復・確認の対象にした = `recover_before(intent_missions=[slug])`。`--mission` で inactive の mission を reopen して止まった後の退避も止まる） | 半端な cascade（I は done のまま下流が pending）を退避先に固めない。reopen は退避済みを扱わず出口が無くなる。完了できる intent は退避の前に完了する |
+     | `init --force --mission <slug>`（既存の mission がある） | **止める**（fix 5。同じ `_die_if_intent_stuck_before_move`。完了できる intent は置き換えの前に完了する。新しい slug の `init` は通す） | 既存の mission を `archive/<slug>.overwritten-<ts>` へ移す = 未完の intent ごと動いて回復の経路が消える |
 
      つまり『通す』のは **同じ reopen の再実行・retire・Worker の報告・読み取り専用** だけ（t067。allowlist）で、update の全部の形・add・release-dep・retry・別の reopen・退避・pull は止める。判定は `_INTENT_BLOCKED`（`recover_before` が毎回作り直す = 前のロックの失敗を引きずらない）を、止める遷移が自分のロックの中で読む。
+   - **『通す』の各行が mission dir を動かす・置き換える・消す・state.yaml を書き換える経路を内部に持たないかの棚卸し（fix 5・t069。族で洗った）**: 移動・置き換え・削除を起こすのは `_move_mission_dir` の 2 か所（archive・`init --force`）だけ。他の `shutil.rmtree` / rename は queue の mission dir に向かない。
+
+     | 『通す』の行 | mission dir の移動・置き換え・削除 | state.yaml の書き換え | 扱い |
+     |---|---|---|---|
+     | init（新しい slug） | 新しい dir を作るだけ | active_missions に足す | 通す（既存の intent に触れない） |
+     | **init --force（既存の slug）** | **既存を `archive/<slug>.overwritten-<ts>` へ移す** | active から外す | **止める**（本体の中の `_die_if_intent_stuck_before_move`。`_INTENT_FREEZE` の行は `allow` のまま、本体が見る） |
+     | launch / review | しない（mission.yaml の status / review の欄だけ） | しない | 通す |
+     | reap-orphan-assignment / retire | しない（registry の assignment だけ） | しない | 通す |
+     | 報告の 6 コマンド・verify-result | しない（card 1 枚。mission の done 判定は mission.yaml の status） | しない | 通す |
+     | status / history / store-check / lint / snapshot / dashboard-data / resolve-mission / pr-base / task-graph / resync | しない（読むだけ） | しない | 通す |
+     | **archive**（`own`） | **mission dir を `archive/<slug>` へ移す** | active から外す | **止める**（active かを問わず回復 → 残れば止める） |
+
+     inactive の mission（`init --inactive` で作った・`--mission` で reopen した）で各経路を確かめるテスト: `tests/test_reopen_intent_move_paths_and_released_path.py`（archive / `init --force` × active / inactive × 完了できない / できる intent）。
    - **止まっている間に通している書き込みの族（t065。グラフ・targets・status を変えて打ち直しを誤らせうるものを 1 行ずつ）**:
 
      | 書き込み | 何を変えうるか | 扱い |

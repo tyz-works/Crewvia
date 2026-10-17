@@ -2842,15 +2842,18 @@ def cmd_init(args):
     def _do():
         # R-4: 退避 (mission dir の rename) の途中で落ちて active_missions に残った slug を外す
         # (state を読む前)
-        recover_before(archive_slugs=load_state().get('active_missions') or [], include_caller=False)
+        slug = opts.get('--mission')
+        # `--force` は既存の mission を退避してから置き換える = 未完の reopen の intent ごと動く。置き換える mission は回復・確認の対象
+        recover_before(archive_slugs=load_state().get('active_missions') or [], include_caller=False,
+                       intent_missions=[slug] if slug and force else [])
         state = load_state()
         state_before = copy.deepcopy(state)
-        slug = opts.get('--mission')
         if slug:
             existing = os.path.exists(mission_dir(slug))
             if existing and not force:
                 die(f"mission '{slug}' already exists. Use --force to overwrite.")
             if existing:
+                _die_if_intent_stuck_before_move(slug, 'init --force')
                 # Non-destructive overwrite: move the previous mission to
                 # archive/<slug>.overwritten-<timestamp>/ instead of rm -rf,
                 # so worker output is never silently lost.
@@ -3420,12 +3423,32 @@ _INTENT_FREEZE = {
     # 読み取り専用 (queue の card を書かない)
     'status': 'allow', 'history': 'allow', 'store-check': 'allow', 'lint': 'allow', 'snapshot': 'allow',
     'dashboard-data': 'allow', 'resolve-mission': 'allow', 'pr-base': 'allow', 'task-graph': 'allow', 'resync': 'allow',
-    # card・intent に触れない (新しい mission の作成 / 有効化 / mission.yaml の review 状態 / registry の孤児 assignment)
+    # card・intent に触れない (新しい mission の作成 / 有効化 / mission.yaml の review 状態 / registry の孤児 assignment)。
+    # 『通す』の各行が mission dir の移動・置き換え・削除・state.yaml の書き換えを内部で起こさないかの表は設計 §4.3.1 (PR #308 fix 5):
+    # init は `--force` で既存の mission を退避する = 本体の中で `_die_if_intent_stuck_before_move` が止める (他の形は新しい slug を作るだけ)。
+    # archive は移動そのもの (own)。launch / review は mission.yaml の status 1 欄、reap-orphan-assignment は registry だけ
     'init': 'allow', 'launch': 'allow', 'review': 'allow', 'reap-orphan-assignment': 'allow',
     # 止める側: update の全部の形・add・release-dep・retry (別の reopen・pull・archive は own)
     'update': 'refuse', 'add': 'refuse', 'release-dep': 'refuse', 'retry': 'refuse',
     'pull': 'own', 'archive': 'own',
 }
+
+
+def _die_if_intent_stuck_before_move(slug, command):
+    """mission dir を**動かす** (退避 / `init --force` の置き換え) 前に、その mission の未完の reopen の intent が残っていれば止める
+    (PR #308 fix 5)。intent ごと退避先に移ると回復の経路 (`<slug>/reopen-intents/`) が消える。`recover_before(intent_missions=[slug])` の後に
+    呼ぶ: 完了できる intent はそこで完了済みなので、ここに残るのは**完了できなかった intent**だけ。active かどうかを問わない。
+    読めない intent も「ある」側に倒す。何も動かさない・固定コード・出口を出す。"""
+    pending = slug in _INTENT_BLOCKED
+    if not pending:
+        try:
+            pending = bool(_CONTROLLER.list_pending_intents(_txn(), slug))
+        except _EXEC.ControllerError:
+            pending = True
+    if pending:
+        die(f"[plan.sh {command}] mission '{slug}' に完了できない reopen の intent があります。何も動かしていません。"
+            f"`plan.sh store-check` の reopen-intent-incomplete を見て直してから (同じ引数の `plan.sh reopen` を再実行)、やり直してください\n"
+            f"{_error_code_line(_EXEC.REOPEN_INTENT_INCOMPLETE)}", 1)
 
 
 def _refuse_write_while_intent_pending(slug, command, task_id=None):
@@ -6422,10 +6445,9 @@ def cmd_archive(args):
     slug = positional[0]
 
     def _do():
-        recover_before(archive_slugs=load_state().get('active_missions') or [], include_caller=False)
-        if slug in _INTENT_BLOCKED:      # 止まった reopen を抱えたまま退避すると、半端な状態が固まる (reopen は退避済みを扱わない)
-            die(f"[plan.sh] mission '{slug}' に完了できない reopen の intent があります。何も書いていません。"
-                f"`plan.sh store-check` の reopen-intent-incomplete を見て直してください\n{_error_code_line(_EXEC.REOPEN_INTENT_INCOMPLETE)}", 1)
+        # 退避の対象は active かどうかに関わらず回復・確認の対象 (`--mission` で inactive の mission を reopen して止まった場合)
+        recover_before(archive_slugs=load_state().get('active_missions') or [], include_caller=False, intent_missions=[slug])
+        _die_if_intent_stuck_before_move(slug, 'archive')   # 止まった reopen を抱えたまま退避すると、回復の経路が消える
         state = load_state()
         src = mission_dir(slug)
         if not os.path.exists(src):

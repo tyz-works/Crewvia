@@ -1093,7 +1093,7 @@ class ReopenResult:
 #: reopen の intent の版 (`queue/missions/<slug>/reopen-intents/<root>-<n>.json`。設計 §4.3.1)
 INTENT_VERSION = 1
 _INTENT_KEYS = {'version', 'actor', 'root', 'root_reopen_count', 'reason', 'cascade', 'over_cap', 'root_capped', 'created_at', 'closure',
-                'tasks'}
+                'tasks', 'unrelease'}
 _TID_RE = re.compile(r't\d+')
 
 
@@ -1132,7 +1132,13 @@ def parse_reopen_intent(slug, name, text):
           and (data['over_cap'] is None or isinstance(data['over_cap'], str)) and isinstance(data['root_capped'], bool)
           and isinstance(data['created_at'], str)
           and isinstance(data['closure'], list) and all(isinstance(x, str) and _TID_RE.fullmatch(x) for x in data['closure'])
-          and isinstance(data['tasks'], list))
+          and isinstance(data['tasks'], list) and isinstance(data['unrelease'], list))
+    if ok:
+        for pair in data['unrelease']:
+            if not (isinstance(pair, list) and len(pair) == 2 and all(isinstance(x, str) and _TID_RE.fullmatch(x) for x in pair)
+                    and pair[0] in data['closure']):
+                ok = False
+                break
     if ok:
         for t in data['tasks']:
             if not (isinstance(t, dict) and set(t) == {'id', 'op', 'capped'} and isinstance(t['id'], str)
@@ -1208,15 +1214,20 @@ def _execute_reopen_intent(txn, slug, intent, *, now, before_write, resumed):
             reset.append(d)
         else:
             already.append(d)
-    gone = {root} | {e['id'] for e in intent['tasks']}
+    # 解除を消す (下流, 上流) の組は intent に決定として書いてある (入口が I から終点への経路の全 task から導く。回復も同じものを消す)
+    gone_of = {}
+    for d, m in intent['unrelease']:
+        gone_of.setdefault(d, set()).add(m)
     unreleased = []
     for d in intent['closure']:
+        gone = gone_of.get(d)
+        if not gone:
+            continue
         card, card_body = _load_for_intent(txn, slug, d, intent)
         released = card.get('released_deps')
-        declared = set(dep.declared_dependencies(card.get('blocked_by')))
-        if isinstance(released, list) and any(x in gone and x in declared for x in released):
+        if isinstance(released, list) and any(x in gone for x in released):
             out = dict(card)
-            kept = [x for x in released if not (x in gone and x in declared)]
+            kept = [x for x in released if x not in gone]
             if kept:
                 out['released_deps'] = kept
             else:
@@ -1369,6 +1380,23 @@ def _over_cap(card, cap_of):
     return ex.has_execution_fields(card) and card['execution_count'] >= cap_of(card)
 
 
+def _unrelease_pairs(closure, cards, graph, path_set):
+    """下流の `released_deps` から消す (下流, 上流) の組。**上流 = I と I から終点への経路上の task を、その status を問わず**。
+    戻す task (done_set / reset_set) だけだと、I(done) → A(needs_director) → R(pending, released_deps=[A]) で A の解除が残り、
+    A が後で failed になると R が I の再完了より前に pull できる (PR #308 の指摘)。上流の status が何であれ、経路上にあれば
+    解除はもう古い判断 — 消して、通常の依存 (A が done になるまで待つ) に戻す。宣言された依存でない解除は触らない。"""
+    out = []
+    for d in closure:
+        released = cards[d][0].get('released_deps')
+        if not isinstance(released, list):
+            continue
+        declared = set(dep.declared_dependencies(graph.get(d)))
+        for m in dict.fromkeys(released):
+            if m in path_set and m in declared:
+                out.append([d, m])
+    return out
+
+
 def _reopen_cascade(txn, slug, tid, *, reason, over_cap, default_max_attempts, now, cascade, graph, unreadable, before_write=None):
     """`plan.sh reopen`: done / verified / skipped の task I を pending に戻し、`cascade` に従って下流を戻す (設計 §4)。
 
@@ -1385,7 +1413,8 @@ def _reopen_cascade(txn, slug, tid, *, reason, over_cap, default_max_attempts, n
     * 実行中 (in_progress / ready_for_verification / verifying / needs_human_review) の下流は `cascade` が none 以外なら
       選ばれたかを問わず試行を `RESET_BY_DIRECTOR` で閉じて pending に戻す (I が変わるので、動いている作業は古い土台の上にある)。
     * 戻さなかった完了済みの下流は `stale` に列挙する (拒否も無効化もしない)。
-    * 下流の `released_deps` から、戻した task (I を含む) を消す。
+    * 下流の `released_deps` から、**I から終点への経路上の全 task (I を含む。status を問わない)** の ID を消す。消す (下流, 上流) の組は
+      入口で決めて intent の `unrelease` に書く (回復も同じ組を消す。§4.3 の表)。
     """
     reason = check_reason(reason, 'reason')
     if over_cap is not None:
@@ -1530,6 +1559,7 @@ def _reopen_cascade(txn, slug, tid, *, reason, over_cap, default_max_attempts, n
     intent = {
         'version': INTENT_VERSION, 'actor': _ledger_actor(txn), 'root': tid, 'root_reopen_count': need, 'reason': reason, 'cascade': cascade,
         'over_cap': over_cap, 'root_capped': bool(root_over), 'created_at': _now_text(now), 'closure': list(closure),
+        'unrelease': _unrelease_pairs(closure, cards, graph, set(on_path) | {tid}),
         'tasks': [{'id': d, 'op': 'reset' if d in reset_set else 'reopen', 'capped': bool(_over_cap(cards[d][0], cap_of))}
                   for d in work],
     }

@@ -58,6 +58,12 @@ set -euo pipefail
 #                              総試行数 (execution_count) が上限 (config attempts.max_total、既定 6。card の max_attempts で上書き)
 #                              に達していたら exit 3 (ATTEMPT_CAP)。--over-cap "<理由>" で通し、台帳の retry に残す。
 #                              理由は台帳にだけ書く (監査ログには出さない)。`update --reset` は残してある (理由が要らない差し戻し)
+#   plan.sh reopen <task_id> --reason "<理由>" --branch reuse [--mission <slug>] [--cascade none|reviews|all] [--over-cap "<理由>"]
+#                              確定した結果 (done / verified / skipped) の task を、理由つきで pending に戻し (reopen_count += 1)、
+#                              下流の古い結果を無効化する (vNext 02 PR-F。設計 §4)。--branch reuse は必須 (merge 済みの PR の task は
+#                              扱わない。Director が確認して明示)。既定の --cascade reviews は skills に codex-review / review / qa を
+#                              含む下流と、I からそこへの経路上の中間 task を戻す。実行中の下流は none なら exit 3、それ以外は試行を閉じて戻す。
+#                              経路上に skipped の task があれば exit 3。退避済み mission も exit 3。途中で止まったら同じ引数で再実行
 #   plan.sh release-dep <task_id> [--dep <csv>] [--mission <slug>]
 #                              failed の依存で保留されている task を、Director が明示的に
 #                              進めてよいと決める (省略時は今 failed の依存すべて)。
@@ -116,7 +122,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 QUEUE_DIR="${CREWVIA_QUEUE:-${REPO_ROOT}/queue}"
 
 if [[ $# -eq 0 ]]; then
-  echo "Usage: plan.sh <init|add|pull|done|needs-director|fail|update|retry|release-dep|retire|reap-orphan-assignment|ready-for-verification|verifying|snapshot|verify-result|review|launch|task-graph|lint|status|archive|resync|dashboard|dashboard-data|resolve-mission|store-check|history|pr-base> [args...]" >&2
+  echo "Usage: plan.sh <init|add|pull|done|needs-director|fail|update|retry|reopen|release-dep|retire|reap-orphan-assignment|ready-for-verification|verifying|snapshot|verify-result|review|launch|task-graph|lint|status|archive|resync|dashboard|dashboard-data|resolve-mission|store-check|history|pr-base> [args...]" >&2
   exit 1
 fi
 
@@ -944,7 +950,7 @@ def held_dependency_hint(task_id, held, slug):
 #: queue を書き換えるサブコマンド = 生成を呼ぶ経路。正は冒頭の usage 行と
 #: 末尾の dispatch テーブル (tests/test_task_graph.py が突き合わせる)。
 QUEUE_MUTATING_SUBCOMMANDS = {
-    'init', 'add', 'pull', 'done', 'needs-director', 'fail', 'update', 'retry', 'release-dep',
+    'init', 'add', 'pull', 'done', 'needs-director', 'fail', 'update', 'retry', 'reopen', 'release-dep',
     'retire', 'reap-orphan-assignment',
     'ready-for-verification', 'verifying', 'snapshot', 'verify-result', 'review', 'launch', 'archive',
 }
@@ -2225,7 +2231,41 @@ def retire_assignment(agent, mission, task_id, execution_id=None):
     return verdict
 
 
-def recover_before(cards=(), agents=(), add_missions=(), archive_slugs=(), include_caller=True):
+#: 直近の `recover_before` で、未完の reopen の intent を完了できなかった mission → 理由 (固定コード + 識別子だけ)。
+#: pull がこの mission を選ばない / 名指しなら断る (他の mission と読み取り専用のコマンドは止めない)
+_INTENT_BLOCKED = {}
+
+
+def _complete_reopen_intents(slugs, skip_root=None):
+    """各 mission の**未完の reopen の intent を最後まで実行する** (t059。設計 §4.3.1-4)。`with_lock()` の中でだけ呼ぶ。
+
+    「回復は正本を書かない」(scripts/CLAUDE.md の回復の節) の**意図した例外**: intent は Director が決めた操作の続きで、状態から
+    推測した修復ではない (一覧を作り直さない)。完了できない mission (intent が読めない・壊れている・一覧の card が読めない) は
+    `_INTENT_BLOCKED` に理由を残して先へ進む。戻り値: 失敗した最初の `ControllerError` / `StoreError` (無ければ None)。
+    """
+    first = None
+    for slug in dict.fromkeys(slugs):
+        if not os.path.isdir(mission_dir(slug)):
+            continue
+        try:
+            done = _CONTROLLER.recover_reopen_intents(
+                _txn(), slug, skip_root=skip_root,
+                before_write=lambda root, _slug=slug: _reactivate_done_mission(_slug, via=f'reopen {root} (recovery)', out=sys.stderr))
+        except (_EXEC.ControllerError, _STORE.StoreError) as e:
+            code = e.code if isinstance(e, _EXEC.ControllerError) else _EXEC.REOPEN_INTENT_INCOMPLETE
+            _INTENT_BLOCKED[slug] = code
+            print(f"[plan.sh warn] 未完の reopen の intent を完了できませんでした ({slug}): {e} — この mission の pull は止まります",
+                  file=sys.stderr)
+            first = first or e
+            continue
+        for intent, res in done:
+            print(f"[plan.sh] 止まっていた reopen を intent に従って完了しました: {slug}/{intent['root']} "
+                  f"(戻した下流 {len(res.reopened) + len(res.reset)} 件)", file=sys.stderr)
+    return first
+
+
+def recover_before(cards=(), agents=(), add_missions=(), archive_slugs=(), include_caller=True, intents=True,
+                   intent_missions=()):
     """ロックを取った直後・**コマンドの前提検査より前**に、card を正本として projection
     (assignment / .identity) の食い違いを作り直す (vNext 01a S4。設計 §2.3・§2.5)。
 
@@ -2238,6 +2278,9 @@ def recover_before(cards=(), agents=(), add_missions=(), archive_slugs=(), inclu
     コマンド本体は今の前提検査のまま受け付けるか拒否する。回復自体の書き込みが失敗しても
     (disk full・権限) コマンドは止めず警告する — 止めると、その状態から抜ける操作まで拒否して
     復旧の出口を消す。
+
+    その後、範囲の mission の**未完の reopen の intent を最後まで実行する** (`_complete_reopen_intents`。`intents=False` で省く —
+    `reopen` 自身は同じ root の intent を自分で扱う)。
     """
     caller = os.environ.get('AGENT_NAME', '').strip() if include_caller else ''
     scope = _STORE.Scope(
@@ -2246,12 +2289,18 @@ def recover_before(cards=(), agents=(), add_missions=(), archive_slugs=(), inclu
         add_missions=tuple(add_missions),
         archive_slugs=tuple(archive_slugs),
     )
+    _INTENT_BLOCKED.clear()
     try:
-        return _txn().recover(scope)
+        actions = _txn().recover(scope)
     except _STORE.StoreError as e:
         print(f"[plan.sh warn] 回復 (projection の作り直し) を完了できませんでした: {e}"
               f" — コマンド本体は続けます", file=sys.stderr)
-        return []
+        actions = []
+    if intents:
+        # 未完の reopen の intent は、本体の前に最後まで実行する (止まっている間に下流が動いても、一覧にある限り戻す)。
+        # 完了できなくても本体は止めない (読み取り専用・他の mission・出口の操作まで塞がない)。止めるのは pull だけ
+        _complete_reopen_intents([*(s for s, _t in scope.cards), *add_missions, *archive_slugs, *intent_missions])
+    return actions
 
 
 def describe_assignment_verdict(agent, verdict):
@@ -2606,6 +2655,8 @@ USAGE = {
                '                       [--deliverable pr|file|none]\n'
                '       plan.sh update <task_id> --close-execution [--mission <slug>]'),
     'retry': 'plan.sh retry <task_id> --reason "<理由>" [--mission <slug>] [--over-cap "<理由>"]',
+    'reopen': ('plan.sh reopen <task_id> --reason "<理由>" --branch reuse [--mission <slug>]\n'
+               '                       [--cascade none|reviews|all] [--over-cap "<理由>"]'),
     'release-dep': 'plan.sh release-dep <task_id> [--dep <csv>] [--mission <slug>]',
     'retire': ('plan.sh retire <task_id> --agent <name> --execution <id>\n'
                '                       [--mission <slug>] [--outcome reset|needs-director]\n'
@@ -2637,7 +2688,7 @@ USAGE = {
 #: dispatch テーブルと同じキーを持つこと (tests/test_plan_strict_args.py が突き合わせる)。
 POSITIONAL_ARITY = {
     'init': (1, 1), 'add': (1, 1), 'pull': (0, 0), 'done': (1, 2),
-    'needs-director': (1, 2), 'fail': (1, 2), 'update': (1, 1), 'retry': (1, 1), 'release-dep': (1, 1),
+    'needs-director': (1, 2), 'fail': (1, 2), 'update': (1, 1), 'retry': (1, 1), 'reopen': (1, 1), 'release-dep': (1, 1),
     'retire': (1, 1), 'reap-orphan-assignment': (1, 1),
     'ready-for-verification': (1, 1), 'verifying': (1, 1), 'snapshot': (0, 1), 'verify-result': (2, 2),
     'review': (1, 1), 'launch': (1, 1), 'task-graph': (0, 0), 'lint': (0, 1),
@@ -2791,15 +2842,18 @@ def cmd_init(args):
     def _do():
         # R-4: 退避 (mission dir の rename) の途中で落ちて active_missions に残った slug を外す
         # (state を読む前)
-        recover_before(archive_slugs=load_state().get('active_missions') or [], include_caller=False)
+        slug = opts.get('--mission')
+        # `--force` は既存の mission を退避してから置き換える = 未完の reopen の intent ごと動く。置き換える mission は回復・確認の対象
+        recover_before(archive_slugs=load_state().get('active_missions') or [], include_caller=False,
+                       intent_missions=[slug] if slug and force else [])
         state = load_state()
         state_before = copy.deepcopy(state)
-        slug = opts.get('--mission')
         if slug:
             existing = os.path.exists(mission_dir(slug))
             if existing and not force:
                 die(f"mission '{slug}' already exists. Use --force to overwrite.")
             if existing:
+                _die_if_intent_stuck_before_move(slug, 'init --force')
                 # Non-destructive overwrite: move the previous mission to
                 # archive/<slug>.overwritten-<timestamp>/ instead of rm -rf,
                 # so worker output is never silently lost.
@@ -2926,7 +2980,7 @@ def _reject_dependency_cycle(slug, task_id, new_blocked):
         raise UsageExit(USAGE_EXIT)
 
 
-def _reactivate_done_mission(slug, mission=None, via=''):
+def _reactivate_done_mission(slug, mission=None, via='', out=None):
     """done の mission に未完了の task が戻ってきたら、mission を `in_progress` に戻す (vNext 02 PR-A)。
 
     `with_lock` の中だけで呼ぶ。dispatcher は mission.yaml の `status != done` で「全ミッション完了」を
@@ -2934,6 +2988,8 @@ def _reactivate_done_mission(slug, mission=None, via=''):
     done より前の値は残っていないため戻す値は `in_progress` 固定。`completed_at` は消す。
     `mission` を渡すと、その dict を書き換えて呼び出し元が保存する (二重書き込みを避ける)。
     戻したら True。done でなければ何もしない (False)。
+    `out` は「戻した」の 1 行の出し先 (既定 stdout)。**回復の経路 (`_complete_reopen_intents`) は stderr を渡す**: pull は本体の前に
+    回復を走らせ、stdout は JSON 1 つだけ (Worker・テストは stdout を JSON として読む)。
     """
     own = mission is None
     if own:
@@ -2944,7 +3000,7 @@ def _reactivate_done_mission(slug, mission=None, via=''):
     mission['completed_at'] = None
     if own:
         save_mission(slug, mission)
-    print(f"Reactivated: mission '{slug}' done -> in_progress ({via})")
+    print(f"Reactivated: mission '{slug}' done -> in_progress ({via})", file=out if out is not None else sys.stdout)
     return True
 
 
@@ -3023,6 +3079,7 @@ def cmd_add(args):
         # R-3: 前回の add が card の後・next_task_id の前で落ちていれば採番を進める
         # (今は次の add が同じ tNNN を黙って上書きする)
         recover_before(add_missions=[slug], include_caller=False)
+        _refuse_write_while_intent_pending(slug, 'add')   # --blocked-by の有無を問わない (新しい task は対象の下流になりうる)
         mission = load_mission(slug)
         task_num = int(mission.get('next_task_id') or 1)
         # 回復 (R-3) が失敗しても (警告だけで続行する設計) next_task_id は実在の card より遅れうる。
@@ -3349,7 +3406,79 @@ def _execution_caller(opts):
 _NO_WRITE_REFUSALS = frozenset({
     _EXEC.EXECUTION_NOT_FOUND, _EXEC.EXECUTION_NOT_CURRENT, _EXEC.EXECUTION_ALREADY_TERMINAL, _EXEC.EXECUTION_REQUIRED,
     _EXEC.HISTORY_MISMATCH, _EXEC.HISTORY_AMBIGUOUS,
-    _EXEC.ATTEMPT_ACTIVE, _EXEC.ATTEMPT_CAP, _EXEC.RETRY_NOT_ALLOWED})
+    _EXEC.ATTEMPT_ACTIVE, _EXEC.ATTEMPT_CAP, _EXEC.RETRY_NOT_ALLOWED,
+    _EXEC.NOT_REOPENABLE, _EXEC.CASCADE_ACTIVE_DOWNSTREAM, _EXEC.CASCADE_SKIPPED_ON_PATH, _EXEC.CASCADE_FAILED_ON_PATH,
+    _EXEC.CASCADE_NO_EXECUTION, _EXEC.CASCADE_UNREADABLE_CARDS, _EXEC.MISSION_ARCHIVED, _EXEC.REOPEN_INTENT_GRAPH_FROZEN})
+
+
+#: 未完の reopen の intent がある mission での、plan.sh の全サブコマンドの扱い (t067。設計 §4.3.1)。**この表が唯一の判定**。
+#: `allow` = 通す / `refuse` = 止める (サブコマンドが `_refuse_write_while_intent_pending` を自分のロックの中で呼ぶ) /
+#: `own` = 本体の中に専用の扱いがある (reopen = 同じ root は続きを実行・別の root は拒否 / pull・archive = INCOMPLETE で止める)。
+#: allowlist (通すものだけを列挙し、他は止める): 新しいサブコマンドは表に載せないと構造テストが赤になる。
+_INTENT_FREEZE = {
+    # 回復の出口・Worker の作業を失わせない報告・窓を閉じる側
+    'reopen': 'own', 'retire': 'allow',
+    'done': 'allow', 'fail': 'allow', 'needs-director': 'allow', 'ready-for-verification': 'allow',
+    'verifying': 'allow', 'verify-result': 'allow',
+    # 読み取り専用 (queue の card を書かない)
+    'status': 'allow', 'history': 'allow', 'store-check': 'allow', 'lint': 'allow', 'snapshot': 'allow',
+    'dashboard-data': 'allow', 'resolve-mission': 'allow', 'pr-base': 'allow', 'task-graph': 'allow', 'resync': 'allow',
+    # card・intent に触れない (新しい mission の作成 / 有効化 / mission.yaml の review 状態 / registry の孤児 assignment)。
+    # 『通す』の各行が mission dir の移動・置き換え・削除・state.yaml の書き換えを内部で起こさないかの表は設計 §4.3.1 (PR #308 fix 5):
+    # init は `--force` で既存の mission を退避する = 本体の中で `_die_if_intent_stuck_before_move` が止める (他の形は新しい slug を作るだけ)。
+    # archive は移動そのもの (own)。launch / review は mission.yaml の status 1 欄、reap-orphan-assignment は registry だけ
+    'init': 'allow', 'launch': 'allow', 'review': 'allow', 'reap-orphan-assignment': 'allow',
+    # 止める側: update の全部の形・add・release-dep・retry (別の reopen・pull・archive は own)
+    'update': 'refuse', 'add': 'refuse', 'release-dep': 'refuse', 'retry': 'refuse',
+    'pull': 'own', 'archive': 'own',
+}
+
+
+def _die_if_intent_stuck_before_move(slug, command):
+    """mission dir を**動かす** (退避 / `init --force` の置き換え) 前に、その mission の未完の reopen の intent が残っていれば止める
+    (PR #308 fix 5)。intent ごと退避先に移ると回復の経路 (`<slug>/reopen-intents/`) が消える。`recover_before(intent_missions=[slug])` の後に
+    呼ぶ: 完了できる intent はそこで完了済みなので、ここに残るのは**完了できなかった intent**だけ。active かどうかを問わない。
+    読めない intent も「ある」側に倒す。何も動かさない・固定コード・出口を出す。"""
+    pending = slug in _INTENT_BLOCKED
+    if not pending:
+        try:
+            pending = bool(_CONTROLLER.list_pending_intents(_txn(), slug))
+        except _EXEC.ControllerError:
+            pending = True
+    if pending:
+        die(f"[plan.sh {command}] mission '{slug}' に完了できない reopen の intent があります。何も動かしていません。"
+            f"`plan.sh store-check` の reopen-intent-incomplete を見て直してから (同じ引数の `plan.sh reopen` を再実行)、やり直してください\n"
+            f"{_error_code_line(_EXEC.REOPEN_INTENT_INCOMPLETE)}", 1)
+
+
+def _refuse_write_while_intent_pending(slug, command, task_id=None):
+    """未完の reopen の intent がある mission で、`_INTENT_FREEZE` が `refuse` のコマンドを拒否する (t067。t065 の「依存の形を変える
+    書き込み」だけの拒否を、allowlist に広げた)。`with_lock()` の中で、`recover_before` の後・何かを書く前に呼ぶ。
+
+    intent は保存した一覧で実行する。回復が止まっている間に、辺 (add / update --blocked-by / release-dep)・status (update --status
+    skipped / in_progress)・試行 (retry) が動くと、一覧と経路が食い違い打ち直しを誤らせる (PR #308 の指摘は 4 巡ともこの形)。
+    回復が完了できるなら `recover_before` が先に完了させているので、ここに来るのは**完了できなかった intent が残っているとき**だけ
+    (`_INTENT_BLOCKED` に頼らず intent の dir を直に見る = 回復を省いた呼び出しでも同じ答え)。読めない intent も「ある」側に倒す。
+    exit 3・何も書かない (`UsageExit` = task-graph を再生成しない)・固定コード・出口を出す。"""
+    verdict = _INTENT_FREEZE.get(command)
+    if verdict is None:
+        die(f"[plan.sh {command}] _INTENT_FREEZE にサブコマンドが載っていません (内部エラー。何も書いていません)", 1)
+    if verdict != 'refuse':
+        return
+    pending = slug in _INTENT_BLOCKED
+    if not pending:
+        try:
+            pending = bool(_CONTROLLER.list_pending_intents(_txn(), slug))
+        except _EXEC.ControllerError:
+            pending = True
+    if not pending:
+        return
+    where = f"{slug}/{task_id}" if task_id else slug
+    print(f"[plan.sh {command}] {where}: 未完の reopen の intent がある mission では queue を書き換えられません (通すのは同じ reopen の再実行・"
+          f"retire・Worker の報告・読み取りだけ)。何も書いていません。出口: 先に同じ引数の `plan.sh reopen` を再実行して完了させてください "
+          f"(止めている task があれば `plan.sh store-check` の reopen-intent-blocked を見て、Director が card を直接片付けてから)\n"
+          f"{_error_code_line(_EXEC.REOPEN_INTENT_GRAPH_FROZEN)}", file=sys.stderr)
+    raise UsageExit(_EXEC.EXIT_CODES[_EXEC.REOPEN_INTENT_GRAPH_FROZEN])
 
 
 def _controller_die(command, e):
@@ -3548,12 +3677,19 @@ def _pull_result(slug, meta, body):
 def _pull_start(slug, task_id, agent, generation, execution_id, git_context):
     """pull の 2 つ目のロック: reserved → running (start)。card が**この pull の予約のまま** (`_pull_cas_ok`) のときだけ。
     戻り値: `(started, why)`。外れたら何も書かない (JSON を出させない)。"""
-    outcome = {'started': False, 'why': ''}
+    outcome = {'started': False, 'why': '', 'code': _EXEC.TASK_ALREADY_RESERVED}
 
     def _do():
         recover_before(cards=[(slug, task_id)], include_caller=False)
         if agent:
             _txn().actor = agent
+        # 1 回目のロックの後・このロックの前に reopen が intent を書いて途中で止まり、ここでも回復が失敗したとき、
+        # 下流の task を始めてはいけない (I は done のまま = 古い土台)。予約は書き換えない (JSON を出さない。同じ Worker の
+        # 再 pull は 1 回目のロックで同じ検査に当たる)。表: knowledge/vnext-02-attempt-reopen-checkpoint.md §4.3.1-4
+        if slug in _INTENT_BLOCKED:
+            outcome['why'] = '完了できない reopen の intent があります'
+            outcome['code'] = _EXEC.REOPEN_INTENT_INCOMPLETE
+            return
         if not os.path.exists(task_path(slug, task_id)):
             outcome['why'] = 'card が無くなっています'
             return
@@ -3573,7 +3709,7 @@ def _pull_start(slug, task_id, agent, generation, execution_id, git_context):
         outcome['started'] = True
 
     with_lock(_do)
-    return outcome['started'], outcome['why']
+    return outcome['started'], outcome['why'], outcome['code']
 
 
 def _pull_git_context(slug, task_id, task_slug, worktree_path, pass_fds=()):
@@ -3756,7 +3892,17 @@ def cmd_pull(args):
                       and m.get('status') in _TASK_STATUS.ASSIGNMENT_HOLDING_STATUSES]
         if specific_task:
             named += [(s, specific_task) for s in slugs if os.path.exists(task_path(s, specific_task))]
-        recover_before(cards=named, agents=(agent,) if agent else ())
+        recover_before(cards=named, agents=(agent,) if agent else (), intent_missions=slugs)
+        # 未完の reopen の intent を完了できなかった mission は選ばない (名指しなら断る)。完了するまで、止まった cascade の
+        # 途中 (I は done のまま下流が pending) の古い土台で下流を pull させない。他の mission は止めない
+        if _INTENT_BLOCKED:
+            named_blocked = [s for s in slugs if s in _INTENT_BLOCKED
+                             and (opts.get('--mission') or not specific_task or os.path.exists(task_path(s, specific_task)))]
+            slugs = [s for s in slugs if s not in _INTENT_BLOCKED]
+            if named_blocked and (opts.get('--mission') or specific_task or not slugs):
+                die(f"[plan.sh pull] mission {', '.join(named_blocked)} に、完了できない reopen の intent があります。何も書いていません。"
+                    f"出口: 同じ引数で `plan.sh reopen` を再実行するか、`plan.sh store-check` の reopen-intent-incomplete を見て"
+                    f" card / intent を直してください\n{_error_code_line(_EXEC.REOPEN_INTENT_INCOMPLETE)}", 1)
 
         # 再開 (N8。execution.md §6): この Worker が**予約だけして start に進めなかった**試行 (pull が準備中に死んだ)
         # を、新しい試行にせず同じ task・同じ試行のまま続ける。`--task` なしの pull は候補選びの前に探す
@@ -4142,11 +4288,11 @@ def cmd_pull(args):
     git_context = (_pull_git_context(mission_slug, task_id, task_slug, worktree_path,
                                       pass_fds=(prepare_lock.fileno(),))
                    if worktree_path is not None else None)
-    started, why = _pull_start(mission_slug, task_id, agent, started_holder[0], execution_id, git_context)
+    started, why, why_code = _pull_start(mission_slug, task_id, agent, started_holder[0], execution_id, git_context)
     if not started:
         die(f"[plan.sh pull] {mission_slug}/{task_id}: 開始 (start) できませんでした: {why}。書き換えていません。"
             f"JSON を出さないので、この pull の結果で作業を始めてはいけません。\n"
-            f"{_error_code_line(_EXEC.TASK_ALREADY_RESERVED)}")
+            f"{_error_code_line(why_code)}")
     prepare_lock.release()
 
     chosen_holder[0]['task_slug'] = task_slug
@@ -5180,6 +5326,26 @@ def cmd_fail(args):
         _append_knowledge_director(*knowledge_info[0])
 
 
+def _intent_blocker_findings(slug):
+    """止まった reopen の intent を打ち直せない理由 (どの task がなぜ) を**書かずに**列挙する (fix 2 / t063)。入口の拒否規則を今の card に
+    当てた結果 (`reopen_intent_blockers`)。読めない intent・card は `reopen-intent-incomplete` の行が既に出しているので足さない。"""
+    txn = _STORE.Txn(QUEUE_DIR, op='diagnose', actor='diagnose')
+    out = []
+    try:
+        pending = _CONTROLLER.list_pending_intents(txn, slug)
+    except (_EXEC.ControllerError, _STORE.StoreError):
+        return out                                            # 読めない・壊れた intent は incomplete の行が出している
+    for name, intent in pending:
+        try:
+            blockers = _CONTROLLER.reopen_intent_blockers(txn, slug, intent)
+        except (_EXEC.ControllerError, _STORE.StoreError):
+            continue
+        for d, code, st in blockers:                          # code は固定コード・name は検査済みの形・status は語彙の中だけ
+            out.append(_STORE.Finding('reopen-intent-blocked', slug, d, None,
+                                      f"intent={name} {code} status={_STORE._safe_status(st) or '<unknown>'}"))
+    return out
+
+
 def cmd_store_check(args):
     """plan.sh store-check [--mission <slug>]
 
@@ -5207,6 +5373,8 @@ def cmd_store_check(args):
     history_slugs = (only,) if only else tuple(sorted({c[0] for c in scope.cards} | set(scope.add_missions)))
     for kind, mission, task, detail in _HISTORY.diagnose(QUEUE_DIR, history_slugs):
         findings.append(_STORE.Finding(kind, mission, task, None, detail))
+    for slug in history_slugs:
+        findings.extend(_intent_blocker_findings(slug))
     for f in findings:
         fields = [f.kind]
         for key in ('mission', 'task', 'agent'):
@@ -6277,7 +6445,9 @@ def cmd_archive(args):
     slug = positional[0]
 
     def _do():
-        recover_before(archive_slugs=load_state().get('active_missions') or [], include_caller=False)
+        # 退避の対象は active かどうかに関わらず回復・確認の対象 (`--mission` で inactive の mission を reopen して止まった場合)
+        recover_before(archive_slugs=load_state().get('active_missions') or [], include_caller=False, intent_missions=[slug])
+        _die_if_intent_stuck_before_move(slug, 'archive')   # 止まった reopen を抱えたまま退避すると、回復の経路が消える
         state = load_state()
         src = mission_dir(slug)
         if not os.path.exists(src):
@@ -6639,6 +6809,7 @@ def cmd_update(args):
 
         # 回復は読み直しより前 (reset の途中で落ちた状態は、旧所有者の枠を逆引きでしか見つけられない)
         recover_before(cards=[(slug, task_id)])
+        _refuse_write_while_intent_pending(slug, 'update', task_id)    # 全部の形 (t067)。以降の検証・書き込みより前
         meta, body = load_task(slug, task_id)
         old_status = meta.get('status')
 
@@ -6855,6 +7026,7 @@ def cmd_retry(args):
         if not os.path.exists(mission_dir(slug)):
             die(f"mission '{slug}' not found.")
         recover_before(cards=[(slug, task_id)])
+        _refuse_write_while_intent_pending(slug, 'retry', task_id)
         default_cap = _HISTORY.load_default_max_attempts(
             os.path.join(REPO_ROOT, 'config', 'crewvia.yaml'),
             warn=lambda msg: print(f"[plan.sh retry] warn: {msg}", file=sys.stderr))
@@ -6868,6 +7040,143 @@ def cmd_retry(args):
         _reactivate_done_mission(slug, via=f'retry {task_id}')
 
     with_lock(_do)
+
+
+def _reopen_shelved_hint(task_id, slug_opt):
+    """退避済み (archive 済み) mission の task なら、その mission の slug (見つからなければ None)。reopen は退避の restore を
+    しない (設計 §4.5)。ロックの中で呼ぶ。"""
+    if slug_opt:
+        return slug_opt if (not os.path.exists(mission_dir(slug_opt))
+                            and os.path.isdir(os.path.join(ARCHIVE_DIR, slug_opt))) else None
+    try:
+        names = sorted(os.listdir(ARCHIVE_DIR))
+    except OSError:
+        return None
+    for name in names:
+        if os.path.exists(os.path.join(ARCHIVE_DIR, name, 'tasks', f"{task_id}.md")):
+            return name
+    return None
+
+
+def cmd_reopen(args):
+    """plan.sh reopen <task_id> --reason "<理由>" --branch reuse [--mission <slug>] [--cascade none|reviews|all] [--over-cap "<理由>"]
+
+    確定した結果 (done / verified / skipped) の task を理由つきで pending に戻し、下流の古い結果を無効化する
+    (vNext 02 PR-F。設計 `knowledge/vnext-02-attempt-reopen-checkpoint.md` §4)。実体は Controller の `reopen_task(kind='reopen')`。
+    `--branch reuse` は必須 (merge 済みの PR の task は v1 で扱わない。plan.sh は gh を呼ばない = Director が確認して明示する)。
+    拒否 (遷移元・active・上限・実行中の下流・経路上の skipped・退避済み mission) は exit 3・何も書かない。
+    途中で止まったら、次に queue を書くコマンド (pull を含む) が intent の続きを完了する。同じ引数の再実行でも完了する (`store-check` の `reopen-intent-incomplete` が印)。
+    """
+    opts, positional = parse_opts(args, {'--mission': 'value', '--reason': 'value', '--over-cap': 'value',
+                                         '--cascade': 'value', '--branch': 'value'})
+    task_id = positional[0]
+    if not re.fullmatch(r't\d+', task_id):
+        _usage_exit(f"invalid task_id '{task_id}': expected format tNNN (e.g. t001, t012)")
+    if '--reason' not in opts:
+        _usage_exit('--reason "<理由>" が必要です (理由は台帳に残ります)')
+    if '--branch' not in opts:
+        _usage_exit('--branch reuse が必要です (merge 済みの PR の task の reopen は扱いません。'
+                    '未 merge の PR の task であることを確認して、同じ branch・同じ PR を使う指定を明示してください)')
+    if opts['--branch'] != 'reuse':
+        _usage_exit("--branch は reuse だけです (merge 済みの PR の task の reopen は扱いません。新しい task を足してください)")
+    try:
+        cascade = _CONTROLLER.check_cascade(opts.get('--cascade'))
+        reason = _CONTROLLER.check_reason(opts['--reason'], '--reason')
+        over_cap = _CONTROLLER.check_reason(opts['--over-cap'], '--over-cap') if '--over-cap' in opts else None
+    except _EXEC.ControllerError as e:
+        _usage_exit(e.message)
+
+    def _do():
+        state = load_state()
+        slug = opts.get('--mission')
+        if not slug:
+            matches = [s for s in (state.get('active_missions') or []) if os.path.exists(task_path(s, task_id))]
+            if not matches:
+                shelved = _reopen_shelved_hint(task_id, None)
+                if shelved:
+                    _controller_die('reopen', _EXEC.ControllerError(
+                        _EXEC.MISSION_ARCHIVED, f"mission '{shelved}' は archive 済みです (task '{task_id}')。"
+                        f"archive 済み mission の task は reopen しません。新しい mission に新しい task を足してください"))
+                die(f"task '{task_id}' not found in any active mission. Pass --mission <slug>.")
+            slug = resolve_ambiguous_mission('reopen', task_id, matches) if len(matches) > 1 else matches[0]
+        if not os.path.exists(mission_dir(slug)):
+            if _reopen_shelved_hint(task_id, slug):
+                _controller_die('reopen', _EXEC.ControllerError(
+                    _EXEC.MISSION_ARCHIVED, f"mission '{slug}' は archive 済みです。archive 済み mission の task は reopen しません。"
+                    f"新しい mission に新しい task を足してください"))
+            die(f"mission '{slug}' not found.")
+        recover_before(cards=[(slug, task_id)], intents=False)
+        # 未完の intent (t059): 他の root のものは先に完了する。同じ root のものは**この reopen の続き** — 引数が同じなら
+        # 完了して成功を報告し、違う reason / cascade なら拒否する (何も書かない)。一覧を作り直さない
+        failed = _complete_reopen_intents([slug], skip_root=task_id)
+        if failed is not None:
+            die(f"[plan.sh reopen] {slug}: 他の reopen の未完の intent を完了できません ({failed})。何も書いていません。"
+                f"`plan.sh store-check` の reopen-intent-incomplete を見て直してください\n"
+                f"{_error_code_line(_EXEC.REOPEN_INTENT_INCOMPLETE)}", 1)
+        res = None
+        try:
+            mine = [i for _n, i in _CONTROLLER.list_pending_intents(_txn(), slug) if i['root'] == task_id]
+            if mine:
+                intent = mine[0]
+                differs = [name for name, same in (('reason', intent['reason'] == reason), ('cascade', intent['cascade'] == cascade),
+                                                   ('over_cap', intent['over_cap'] == over_cap)) if not same]
+                if differs:
+                    raise _EXEC.ControllerError(
+                        _EXEC.HISTORY_MISMATCH,
+                        f"task '{task_id}': 止まっている reopen の intent があり、今回の指定と違います (違う欄: {', '.join(differs)})。"
+                        f"同じ引数で再実行してください。何も書いていません", mission=slug, task=task_id)
+                res = _CONTROLLER.execute_reopen_intent(
+                    _txn(), slug, intent, resumed=True,
+                    before_write=lambda: _reactivate_done_mission(slug, via=f'reopen {task_id} (resume)'))
+        except _EXEC.ControllerError as e:
+            _controller_die('reopen', e)
+        if res is None:
+            default_cap = _HISTORY.load_default_max_attempts(
+                os.path.join(REPO_ROOT, 'config', 'crewvia.yaml'),
+                warn=lambda msg: print(f"[plan.sh reopen] warn: {msg}", file=sys.stderr))
+            mission_cards = list_tasks(slug, quiet=True)
+            graph = {m['id']: m.get('blocked_by') for m, _b in mission_cards if m.get('id')}
+            # 読めない・壊れた card (`[破損]` の pseudo-task。走査の失敗も 1 件) は `blocked_by=[]` の孤立 node に置き換わるので、そこを通る
+            # 経路が graph から消える。下流の閉包が分からないまま成功させない (id だけを Controller に渡す = 拒否の文面にも中身を出さない)
+            unreadable = [m.get('id') or '?' for m, _b in mission_cards if m.get('status') == CORRUPT_TASK_STATUS]
+            try:
+                res = _CONTROLLER.reopen_task(
+                    _txn(), slug, task_id, kind='reopen', reason=reason, over_cap=over_cap, default_max_attempts=default_cap,
+                    cascade=cascade, graph=graph, unreadable=unreadable,
+                    before_write=lambda: (_reopen_stop_hint(task_id, sys.stderr),
+                                          _reactivate_done_mission(slug, via=f'reopen {task_id}')))
+            except _EXEC.ControllerError as e:
+                _controller_die('reopen', e)
+        prev = res.execution
+        print(f"Reopened: {slug}/{task_id} — pending (attempt {prev.attempt} の結果を見直します。"
+              f"次の pull が attempt {prev.attempt + 1} を発行します)")
+        if res.reopened:
+            print(f"  下流を pending に戻した (cascade={cascade}): {', '.join(res.reopened)}")
+        if res.reset:
+            print(f"  実行中だった下流の試行を閉じて pending に戻した: {', '.join(res.reset)}")
+        if res.unreleased:
+            print(f"  released_deps から {task_id} を外した: {', '.join(res.unreleased)}")
+        if res.already:
+            print(f"  intent の一覧にあるが、実行の時点で戻す必要が無かった task: {', '.join(res.already)}")
+        if res.stale:
+            print(f"  古い結果に基づく下流 (戻していません。Director が判断してください): {', '.join(res.stale)}")
+        if res.stale_runnable:
+            print(f"  警告: {task_id} の再完了を待たずに、戻していない古い中間の結果で走りうる pending の下流: "
+                  f"{', '.join(res.stale_runnable)} (--cascade reviews|all で中間を戻すか、Director が止めてください)")
+        if res.resumed:
+            print("  再実行で完了: 途中で止まっていた reopen を intent に従って完了しました")
+        if res.reopened or res.reset:
+            _reopen_stop_hint(task_id, sys.stdout)
+
+    with_lock(_do)
+
+
+def _reopen_stop_hint(task_id, out):
+    """reopen は原子的でない (戻す task の一覧を intent に書いてから、下流 → I の順に 1 task ずつ書く。設計 §4.3.1)。途中で止まっても、
+    次に queue を書く plan.sh コマンド (pull を含む) がロックの直後に intent を最後まで実行する。Director の出口は同じ引数の
+    再実行 (intent を完了して成功を報告する)。止まったかは `plan.sh store-check` の reopen-intent-incomplete で分かる。"""
+    print(f"  (途中で止まっても、次に queue を書く plan.sh コマンドが intent の続きを完了します。急ぐなら `plan.sh reopen {task_id}` を"
+          f"**同じ引数で再実行**してください。止まったかは `plan.sh store-check` の reopen-intent-incomplete で分かります)", file=out)
 
 
 def cmd_release_dep(args):
@@ -6904,6 +7213,8 @@ def cmd_release_dep(args):
         if not os.path.exists(mission_dir(slug)):
             die(f"mission '{slug}' not found.")
 
+        recover_before(cards=[(slug, task_id)], include_caller=False)    # 完了できる intent は先に完了する (止まっているときだけ下で拒否)
+        _refuse_write_while_intent_pending(slug, 'release-dep', task_id)
         meta, body = load_task(slug, task_id)
         st = meta.get('status')
         if st != 'pending':
@@ -7307,6 +7618,7 @@ dispatch = {
     'fail': cmd_fail,
     'update': cmd_update,
     'retry': cmd_retry,
+    'reopen': cmd_reopen,
     'release-dep': cmd_release_dep,
     'retire': cmd_retire,
     'reap-orphan-assignment': cmd_reap_orphan_assignment,

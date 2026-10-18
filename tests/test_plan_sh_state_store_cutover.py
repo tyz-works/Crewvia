@@ -174,6 +174,10 @@ def _drive_every_mutating_subcommand(sb: Sandbox):
     sb.run("reap-orphan-assignment", "Ren", "--no-wait")
     expected.append(("reap-orphan-assignment", "t004", None, None))
 
+    # vNext 02 PR-F: reopen (理由は台帳にだけ書く)
+    sb.run("reopen", "t004", "--reason", SECRET_REASON, "--branch", "reuse", "--cascade", "none")
+    expected.append(("reopen", "t004", "done", "pending"))
+
     sb.run("update", "t002", "--status", "skipped")
     expected.append(("update", "t002", "pending", "skipped"))
     slug = sb.slug
@@ -185,7 +189,7 @@ def _drive_every_mutating_subcommand(sb: Sandbox):
 #: 試行の ID を持つ行を出す subcommand (01c E2 = pull、E3 = done / fail / needs-director / ready-for-verification /
 #: verifying / verify-result)。E4a の update --reset / retire は試行があった task のときだけ ID が入る (EXECUTION_OPTIONAL_OPS)
 CONTROLLER_OPS = {"pull", "done", "fail", "needs-director", "ready-for-verification", "verifying", "verify-result"}
-EXECUTION_OPTIONAL_OPS = {"update", "retire", "retry"}
+EXECUTION_OPTIONAL_OPS = {"update", "retire", "retry", "reopen"}
 
 
 def test_every_mutating_subcommand_writes_an_audit_row(sb):
@@ -248,7 +252,7 @@ def test_every_mutating_subcommand_goes_through_with_lock():
     for sub in sorted(mutating):
         body = ast.get_source_segment(src, funcs[table[sub]])
         assert "with_lock(" in body, f"{sub} ({table[sub]}) が with_lock を通らない"
-    assert len(mutating) == 18                       # 空虚でない (集合が空になっていない)
+    assert len(mutating) == 19                       # 空虚でない (集合が空になっていない)
 
 
 def test_writes_without_a_transaction_fail_loudly_instead_of_writing_unlocked(tmp_path):

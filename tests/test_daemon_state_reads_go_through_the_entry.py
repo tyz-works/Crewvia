@@ -208,6 +208,11 @@ ALLOWED_JSON_PARSES: dict[tuple[str, str, str], str] = {
         "判定だけで、外側 (dict か) は強制済み・内側は phase の一致と `_recorded_pid()` の検証を通る。"
         "**証明できない形はすべて False = 待たずに従来どおり拒否** (壊れた marker が拒否を緩めない向き)。"
         "入口へ移すなら lib_daemon_state を plan.sh の依存に足すことになり、単体コピーの fixture が壊れる",
+    ("lib_task_controller.py", "parse_reopen_intent", "json.loads(text)"):
+        _QUEUE_SIDE + "queue/missions/<slug>/reopen-intents/<root>-<n>.json (vNext 02 PR-F t059。reopen の決定の記録)。"
+        "読み口は `lib_state_store.read_reopen_intent` (= `lib_task_cards` の入口を通した text) の後の parse だけ。"
+        "**JSON でない・欄が足りない・型違い・名前と root の食い違いはすべて `REOPEN_INTENT_INCOMPLETE` (その mission の pull を止める)**: "
+        "「intent が無い」にも既定値にも倒さない (推測で補わない・壊れた intent は消さない)",
     ("lib_state_store.py", "_read_identity", "json.loads(text)"):
         _QUEUE_SIDE + "queue/assignments の実行アイデンティティ sidecar の読み (S3 で plan.sh の "
         "`_read_assignment_identity` はこちらに一本化された)。外側 (dict か) は強制済みで、読めない・形が違うは None = 世代不明 = "

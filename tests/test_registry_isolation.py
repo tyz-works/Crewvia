@@ -180,6 +180,7 @@ ISOLATED_INVOCATIONS: dict[str, list[list[str]]] = {
         ["update", "t008", "--reset", "--mission", MISSION],
     ],
     "retry": [["retry", "t003", "--reason", "iso", "--mission", MISSION]],
+    "reopen": [["reopen", "t003", "--reason", "iso", "--branch", "reuse", "--mission", MISSION]],
     "release-dep": [["release-dep", "t008", "--mission", MISSION]],
     "retire": [["retire", "t005", "--agent", "Ren", "--execution", "ex-" + "0" * 32,
                 "--mission", MISSION, "--outcome", "reset", "--no-wait"]],

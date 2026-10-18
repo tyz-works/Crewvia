@@ -59,6 +59,7 @@ lib ごとの**破ってはいけない契約**の要約。理由・経緯・全
   R-4 退避済みを `active_missions` から外す）。**正本（status / worker / started_at）は書かない**。範囲は名指しの card・その worker の枠・
   **逆引き**（この card を指す枠）・呼び出し元の枠だけ（queue 全体は走査しない）。呼ぶコマンドは
   `knowledge/state-store.md` §2.7 の表。`reap-orphan-assignment` は自身が R-2 なので呼ばない。
+- **例外: reopen の未完の intent**（t059）。`recover_before` は projection の回復の後に、範囲の mission の未完の `reopen-intents/` を最後まで実行する（下の「reopen と下流の無効化」）。これは正本（card の status 等）を書くが、Director が決めた操作の続きであって推測した修復ではない。
 - **回復は拒否を 1 つも足さない**。表に無い食い違い（`reported:<コード>`）は stderr と監査ログに 1 行出して**書かずに**本体へ進む。
   回復自体の書き込みが失敗しても本体は止めず警告する（止めると出口が消える）。修復・報告の `op=recover` の行は lib が**その場で**
   監査ログに追記する（本体が後で `die` しても残る）。env の停止スイッチは付けない。
@@ -136,6 +137,27 @@ lib ごとの**破ってはいけない契約**の要約。理由・経緯・全
 - 読み口: `plan.sh history <id> [--mission]`（読み取り専用・壊れたファイルは飛ばさず exit 1）・`pull` の JSON の `previous_attempt`（今の試行以外の最後の台帳の要約。台帳が読めないときは
   欄を省いて stderr に固定コードを出すだけで pull は止めない）・`store-check`（`history_orphan` / `history_duplicate_key` / `history_unobservable` / `history_without_card`。**報告だけ**）。
 - 戻し方: PR revert → `scripts/sync-main-checkout.sh`。`history/` と card の `result_execution_id` は残ってよい（旧コードは読まない・無視する）。
+
+## reopen と下流の無効化（`plan.sh reopen` + `reopen_task(kind='reopen')`。vNext 02 PR-F / t036。設計 §4）
+
+- `plan.sh reopen <id> --reason "<理由>" --branch reuse [--mission] [--cascade none|reviews|all] [--over-cap "<理由>"]`。遷移元は `ACCEPTS_FROM['reopen']`（done / verified / skipped）→ pending、`reopen_count += 1`。`--branch reuse` は必須（省略・他の値は UsageExit）。
+  拒否は全部 exit 3・何も書かない: `NOT_REOPENABLE`（pending = 既に完了 / failed 等は retry へ / 試行の記録なし）・`ATTEMPT_ACTIVE`・`ATTEMPT_CAP`・`CASCADE_ACTIVE_DOWNSTREAM`・`CASCADE_SKIPPED_ON_PATH`・`CASCADE_FAILED_ON_PATH`（経路上で他の task の依存になっている failed。t046）・`CASCADE_NO_EXECUTION`・`CASCADE_UNREADABLE_CARDS`（t054）・`MISSION_ARCHIVED`（`_NO_WRITE_REFUSALS`）。未完の intent は `REOPEN_INTENT_INCOMPLETE`（exit 1。下の回復の項）。
+- 下流の列挙は `lib_dep_rules.downstream_closure` / `path_closure` / `dependency_path` の 1 か所。`unmet_dependencies` は推移的にしない（cascade の側で経路を閉じる）。対象の skills の置き場は `CASCADE_REVIEW_SKILLS`。
+- 書く順: 検査を全部先に → **intent を書く（= 決定のコミット点。`queue/missions/<m>/reopen-intents/<root>-<n>.json`。戻す task の一覧・操作・順序・actor を 1 度だけ決める）** → mission の再活性化 → intent の一覧の順（I から遠い順）に 台帳 → card（実行中は `reset_task(ledger_extra=…)`）→ `released_deps` → **I の card を最後** → **intent を消す（完了）**。実行は `execute_reopen_intent` の 1 か所（最初の実行も回復も同じ）。
+- **回復は intent を見る（`recover_before` が呼ぶ `_complete_reopen_intents`。pull を含む queue を書くコマンドがロックの直後に最後まで実行する）**: 『回復は正本を書かない』の**意図した例外**（intent は Director の決定済みの操作の続きで、推測した修復ではない）。**一覧を作り直さない**。各 task は card の今の status で冪等（done / verified → 戻す・実行中 → 試行を閉じる・それ以外 → 済み）。完了できない intent（読めない・壊れている・card が読めない）は `REOPEN_INTENT_INCOMPLETE`（exit 1）で**その mission の pull だけ止める**（`_INTENT_BLOCKED`。他の mission・読み取り専用・他の書き込みコマンドは止めない。壊れた intent は消さない）。同じ `plan.sh reopen` の再実行は intent を完了して成功を報告（違う reason / cascade / over-cap は `HISTORY_MISMATCH`）。`store-check` は未完の intent を `reopen-intent-incomplete` で報告だけ。台帳の `root` / `root_reopen_count` は監査用（回復は読まない）。
+- **targets（経路の終点）の定義は `_reopen_targets` の 1 か所**: cascade が選ぶ下流（status を問わない。pending の review も）∪ 実行中の下流（前の実行の台帳の印から数える分岐は t059 で消した。止まった reopen は intent の一覧で完了する）。経路の閉包・拒否・戻す集合・stale_runnable・released_deps の掃除は全部これから導く（status ごとに足し算しない。含めないと中間が done のまま残り、R が古い結果で走る）。総当たり: `tests/test_reopen_targets_matrix.py`。
+- **mission に読めない・壊れた card があれば `CASCADE_UNREADABLE_CARDS`**（exit 3・何も書かない・id だけ。`list_tasks()` は壊れた card を依存の無い孤立 node にするので経路が消える。plan.sh が `unreadable=` で渡し、`reopen_task(kind='reopen')` では必須）。`retry` / `store-check` は graph を使わないので影響しない。
+- `--cascade none` と、選ばれなかった pending の下流は、古い中間の結果で走りうるものを `ReopenResult.stale_runnable` に出す（警告のみ）。
+- **上限の検査は `_over_cap()` の 1 関数**: I・done_set・reset_set のどれもここを通る（集合ごとに書き写さない）。`--over-cap` の理由は戻した task の台帳（`reopen` / `reset`）に残る。
+- **mission の再活性化は I の card の前**（`execute_reopen_intent(before_write=)` = intent の後・最初の書き込み。回復も同じ点で戻す）。
+- **未完の intent がある mission は書き込みを allowlist で凍結する**（fix 4 / t067。fix 3 / t065 の「依存の形を変える書き込み」を広げた）: `plan.sh` の `_INTENT_FREEZE`（コマンド名 → `allow` / `refuse` / `own`）が唯一の表。`refuse` の `update`（全部の形）/ `add` / `release-dep` / `retry` は `_refuse_write_while_intent_pending`（`recover_before` の後・何かを書く前。exit 3・`UsageExit`・固定コード `REOPEN_INTENT_GRAPH_FROZEN`・出口つき）。通すのは同じ reopen の再実行・retire・Worker の報告・読み取り専用。**サブコマンドを足したら表に載せる**（構造テストが赤）。完了できる intent は回復が先に完了するので、止めるのは完了できなかったものだけ。**二重の網**: `reopen_intent_blockers` は今の mission の全 card のグラフで経路を調べ、一覧に無い done / **実行中**の task が経路にあれば止める。止めた task の出口は Director が card を直接直す。テスト: `tests/test_reopen_intent_graph_frozen.py` / `tests/test_reopen_intent_write_freeze.py`。
+- **intent を書く前に、intent が行う書き込みの全部を実行と同じ関数の `dry_run` で通す**（fix 6 / t072）: I・戻す下流は `_write_reopen(dry_run=True)`、試行を閉じる下流は `reset_task(dry_run=True)`（`_finish(check_ledger=True)` が台帳の `HISTORY_MISMATCH` / `AMBIGUOUS` まで見る）。書き込みの種類ごとに検査を足さない。通らなければ intent を書かず exit 3。`check_ledger` は done / fail に付けない（最終の Result を知らない）。テスト: `tests/test_reopen_intent_dry_run_all_writes.py`（各対象に孤児の台帳）。
+- **`released_deps` を消す組は intent の `unrelease`**（fix 5 / t069）: 入口が「I から終点への経路上の task（I を含む。status を問わない）」を下流の `released_deps` から消す `[下流, 上流]` の組にして intent に書く。実行も回復もその組を消す（推測し直さない）。経路上の中間が needs_director 等のまま残っても、後で failed になった瞬間に解除が効く窓を作らない。
+- **mission dir を動かす経路は退避と `init --force` だけ**（fix 5 / t069）: どちらも `recover_before(intent_missions=[slug])`（active かを問わない）→ `_die_if_intent_stuck_before_move`。`_INTENT_FREEZE` に『通す』行を足すときは、本体が mission dir の移動・置き換え・削除・state.yaml の書き換えを起こさないかを設計 §4.3.1 の棚卸しの表に書く。
+- **回復の出力は stderr・打ち直しは拒否規則を当て直す**（fix 2 / t063）: pull の stdout は JSON 1 つだけなので、回復の callback は `_reactivate_done_mission(out=sys.stderr)`。`execute_reopen_intent(resumed=True)` は書く前に `reopen_intent_blockers`（skipped / failed / 決定の後に完了した中間 → `REOPEN_INTENT_INCOMPLETE`・intent は残す・`store-check` の `reopen-intent-blocked`）で入口の規則を当て直す。表は設計 §4.3.1-4。
+- `reopen_task` の戻り値は kind で違う（retry = `Execution`・reopen = `ReopenResult`）。共通の書き込みは `_write_reopen`。
+- テスト: `tests/test_reopen_targets_matrix.py`（グラフ × 状態 × skills × cascade の総当たり・kill → 回復）・`tests/test_reopen_cascade_plan_sh.py`（3 値・閉包・実行中の下流・skipped の網羅）・`tests/test_reopen_intent_recovery.py`（書き込みの全点で kill → 次のコマンド（reopen / pull / update）の後が kill なしと同じ・pull が先に回復・読めない intent）・`tests/test_dep_rules_closure.py`。
+- 戻し方: PR revert → `scripts/sync-main-checkout.sh`。台帳の `reopen` と card の `reopen_count` は残ってよい。**未完の `reopen-intents/` が残っていれば、revert の前に次の queue を書くコマンドで完了させるか、Director が内容を見て消す**（旧コードは intent を読まない = 止まった cascade が放置される）。
 
 ## retry と総試行数の上限（`plan.sh retry` + `reopen_task`。vNext 02 PR-E / t031。設計 §3.3・§3.7）
 

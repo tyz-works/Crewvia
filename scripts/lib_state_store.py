@@ -607,6 +607,11 @@ def serialize_card(meta, body):
     return f"---\n{yaml_text}---\n\n{body}"
 
 
+#: reopen の cascade の intent (決定の記録。vNext 02 PR-F / t059。設計 §4.3.1)。`queue/missions/<slug>/reopen-intents/<root>-<n>.json`
+INTENT_DIRNAME = 'reopen-intents'
+INTENT_NAME_RE = re.compile(r't\d+-\d+\.json')
+#: `atomic_write_text` の tmp の残骸 (`.<name>.tmp.<random>`)。置換前に落ちた書き込みで、intent ではない (数えない・消さない)
+_TMP_RESIDUE_RE = re.compile(r'\..+\.tmp\..+')
 #: 台帳 (`history/tNNN/`) 1 件の名前 `<seq4>-<kind>-<execution_id>.md`。kind の語彙の定義は `lib_history.KINDS`
 #: (lib_history がこの正規表現を import する。書く入口がここなので、名前の形の検査もここ)。
 HISTORY_NAME_RE = re.compile(r'(\d{4,})-(end|reset|retire|retry|reopen)-(ex-[0-9a-f]{32})\.md')
@@ -962,6 +967,30 @@ def read_history(queue_dir, slug, tid, name):
     return ('ok', text)
 
 
+def intent_dir(queue_dir, slug):
+    """`queue/missions/<slug>/reopen-intents/` (reopen の cascade の intent。未完の intent があるあいだだけ在る)。"""
+    return os.path.join(os.fspath(queue_dir), 'missions', _check_slug(slug), INTENT_DIRNAME)
+
+
+def list_reopen_intents(queue_dir, slug):
+    """ロックなしで intent の名前を列挙する (`('ok', [名前])` / `('unreadable', 固定コード)`)。**ENOENT だけ**「無い」= 空。
+    tmp の残骸 (置換前に落ちた書き込み) は intent ではないので除く。それ以外の名前の形でないものは返す (判定は呼び出し側 — 読めない intent を無いことにしない)。"""
+    names, code = _list_dir(intent_dir(queue_dir, slug))
+    return ('unreadable', code) if code else ('ok', [n for n in names if not _TMP_RESIDUE_RE.fullmatch(n)])
+
+
+def read_reopen_intent(queue_dir, slug, name):
+    """intent 1 件の text。`('absent',)` (ENOENT だけ) / `('unreadable', 固定コード)` / `('ok', text)`。"""
+    if not INTENT_NAME_RE.fullmatch(name if isinstance(name, str) else ''):
+        raise InvalidName("invalid reopen intent file name (値は出さない)")
+    text = _cards.read_regular_text_or_unreadable(os.path.join(intent_dir(queue_dir, slug), name))
+    if _cards.is_missing(text):
+        return ('absent',)
+    if _cards.is_unreadable(text):
+        return ('unreadable', _unreadable_code(text))
+    return ('ok', text)
+
+
 class Txn:
     """`transaction()` が渡す。**書き込みはステージしない** — 呼び出し側が書いた順に、その場で
     atomic に書く (設計 §3.2。順序の規則そのものが crash モデルなので、書く順を保つ)。"""
@@ -1167,6 +1196,42 @@ class Txn:
         if state != 'absent':
             raise AlreadyExists(self._rel(path), state)
         self._write(path, text)
+
+    def list_mission_card_ids(self, slug):
+        """mission の card の id を `('ok', ['t001', ...])` / `('unreadable', 固定コード)` で返す (名前の形が `tNNN.md` のものだけ。
+        **ENOENT だけ**「card が無い」= 空)。reopen の打ち直しが「今の mission 全体のグラフ」を作るための入口 (t065)。"""
+        names, code = _list_dir(os.path.dirname(self.card_path(slug, 't1')))
+        if code:
+            return ('unreadable', code)
+        out = []
+        for name in names:
+            m = _cards.TASK_FILENAME_RE.fullmatch(name)
+            if m:
+                out.append(f"t{m.group(1)}")
+        return ('ok', out)
+
+    # ---- reopen の intent (決定の記録。vNext 02 PR-F / t059) ----------------------------------------
+    def list_reopen_intents(self, slug):
+        return list_reopen_intents(self.queue_dir, slug)
+
+    def read_reopen_intent(self, slug, name):
+        return read_reopen_intent(self.queue_dir, slug, name)
+
+    def write_reopen_intent(self, slug, name, text):
+        """intent を 1 ファイル足す (**既存を上書きしない**: 在る / 見えないなら `AlreadyExists`)。= reopen の決定のコミット点。"""
+        if not INTENT_NAME_RE.fullmatch(name if isinstance(name, str) else ''):
+            raise InvalidName("invalid reopen intent file name (値は出さない)")
+        path = os.path.join(intent_dir(self.queue_dir, slug), name)
+        state = _path_state(path)
+        if state != 'absent':
+            raise AlreadyExists(self._rel(path), state)
+        self._write(path, text)
+
+    def remove_reopen_intent(self, slug, name):
+        """intent を消す (= cascade の完了)。無ければ False。"""
+        if not INTENT_NAME_RE.fullmatch(name if isinstance(name, str) else ''):
+            raise InvalidName("invalid reopen intent file name (値は出さない)")
+        return self._remove(os.path.join(intent_dir(self.queue_dir, slug), name))
 
     # ---- assignment (projection) ------------------------------------------
     def publish_assignment(self, agent, slug, tid, generation, execution_id=None):

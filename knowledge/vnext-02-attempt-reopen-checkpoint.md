@@ -439,4 +439,10 @@ Codex の往復は 3 巡で打ち切った (PR #301 の t002)。以下は実装 
 - 範囲外として残したこと: Verifier の運用と、その verify pass が依存先の変更を見る検査（PR-J）。`update --status` の Controller 化（P0 の残り）。回復を dispatcher が起こす・待つ（P0 の残り）。
 - 確かめていないこと: mission の戻し先 `in_progress` が lint / dispatcher で想定どおりか（PR-A）。retry / reopen の後に `worktree_gc` で隔離済みの worktree を pull が作り直せるか（PR-E の QA）。reopen した codex-review task が、`registry/daemons/review-refusals/` の古い拒否記録で spawn されないことがあるか（記録は消してよい。`scripts/CLAUDE.md` の「通知・記録」）。`done` → `pending` を Taskvia が受け付けるか。
 
+- **構造は正しいが中身が壊れた intent は、保存した closure だけから targets を作るので blocker 無しと判断される**（PR-F の Codex 13 巡目 P2。#308 の t037 の最後の Findings。直さずここに積む）。
+  - 漏れている状態: `cascade='reviews'`・`closure=[]`・`tasks=[]` のような、形は正しいが中身が空・欠けた intent は parse を通る。回復は今の mission のグラフを読むが、targets は**保存した closure だけ**から作る。I(done) → A(done) → R(pending, review) で、closure が空なら targets も空 → 経路上の blocker 無しと判断される。
+  - 起きる害: 回復が I を pending に戻して intent を消し、A は done のまま残る。R は古い I の結果に依存したまま、I の再完了より前に pull できる（§4.3.1 が防ぐはずだった窓が、完了済みの印つきで固まる）。起きるのは手で intent を壊した場合に限る（書き手は `Txn.write_reopen_intent` だけで、壊れた中身は作らない）。
+  - 直し方の方向（未決）: 回復の前に、保存した closure を**今のグラフと照合**する（今の cascade の終点への経路が closure ⊆ 一覧に収まっているか）。食い違えば intent を**消さずに**拒否する（`REOPEN_INTENT_INCOMPLETE` の仲間。完了済みと扱わない）。出口は intent を内容を見て直すか、消してから `plan.sh reopen` を打ち直すこと。t065 の二重の網（今の全 card から作ったグラフで I から対象への経路を調べる）は『一覧 ∪ 今の終点』を使うので、そこを closure の照合に広げるのが最小の変更。
+  - 網羅テストに入れるケース: `closure=[]` / `tasks=[]` / 両方空・closure の一部だけ欠けた intent × cascade `none|reviews|all` × I → A → R（A・R の status は語彙の全部）。拒否のとき intent が残ること・queue が 1 バイトも変わらないこと・A が done のまま R が pull できないこと。正しい intent は従来どおり完了すること。全文: `queue/missions/20261014-vnext-02-attempt-reopen-checkpoint/tasks/t037.md` の最後の Findings。
+- **PR-F の Codex 往復の経緯**（通算 13 巡）: 推測型の回復で 5 巡 P1 → ユーザー判断で intent 方式に作り替え（2026-10-17）→ 回復待ちの書き込みの割り込みで P1 が続き、凍結（allowlist）と全書き込みの dry_run（fix 6・t072）で収束。最後の巡は P2 のみで、上の P2 をここに積んで打ち切った。
 - **PR-F の方式変更（t059・ユーザー判断 2026-10-17 の提案 B）**: PR #308 の Codex 5 巡（t037〜t054）は『再実行が済んだ所を推測し直す』族を 5 回出した。推測をやめ、§4.3.1 の intent 方式にした。上の 2・3・5 巡目の『再実行までの間に下流が動く』『legacy の実行中 B』は、一覧が最初に固定されるので起きない（`tests/test_reopen_intent_recovery.py`）。消したテストと理由は t059 の Result。

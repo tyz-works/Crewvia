@@ -86,12 +86,41 @@ def _worker_md_handoff_snippet():
     return block
 
 
-def _run_snippet(env_extra):
+def _prod_root():
+    """本物の main repo root (linked worktree からでも同じ)。git-helpers の _crewvia_repo_root と同じ解決。"""
+    common = subprocess.run(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+                            capture_output=True, text=True, cwd=REPO_ROOT, check=True).stdout.strip()
+    return pathlib.Path(common).parent
+
+
+# snippet が使う fixture 名。本番の registry/handoffs/ にこれが現れたら、テストが本番に書いている (t078)。
+_FIXTURE_AGENT_DIR = "Ingrid"
+_LEAK_NAMES = ("m-now", "m-stale")
+
+
+@pytest.fixture
+def scratch_repo(tmp_path):
+    """snippet の cwd にする使い捨て git repo。_crewvia_repo_root は cwd の git で root を決めるので、
+    CREWVIA_REPO_ROOT を渡しても効かない — cwd を隔離しないと snippet の mkdir -p が本番の registry を作る。"""
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    return tmp_path
+
+
+@pytest.fixture(autouse=True)
+def _never_write_production_handoffs():
+    base = _prod_root() / "registry" / "handoffs" / _FIXTURE_AGENT_DIR
+    before = {n: (base / n).exists() for n in _LEAK_NAMES}
+    yield
+    leaked = [n for n in _LEAK_NAMES if (base / n).exists() and not before[n]]
+    assert not leaked, f"テストが本番の registry/handoffs/ に書いた: {[str(base / n) for n in leaked]}"
+
+
+def _run_snippet(env_extra, cwd):
     block = _worker_md_handoff_snippet()
     env = {
         "PATH": "/usr/bin:/bin",
         "CREWVIA_REPO": str(REPO_ROOT),
-        "CREWVIA_REPO_ROOT": str(REPO_ROOT),
+        "CREWVIA_REPO_ROOT": str(cwd),
         "AGENT_NAME": "Ingrid",
         "TASK_ID": "t022",
         **env_extra,
@@ -99,26 +128,26 @@ def _run_snippet(env_extra):
     # nounset: .crewvia-env を source しない target_dir の task と同じ条件
     return subprocess.run(
         ["bash", "-c", "set -u\n" + block + '\necho "$HANDOFF_PATH"'],
-        capture_output=True, text=True, env=env,
+        capture_output=True, text=True, env=env, cwd=cwd,
     )
 
 
-def test_worker_md_handoff_uses_pull_mission_not_crewvia_env_var():
+def test_worker_md_handoff_uses_pull_mission_not_crewvia_env_var(scratch_repo):
     # target_dir の task: CREWVIA_MISSION_SLUG 未設定でも pull 由来の TASK_MISSION で動く
-    r = _run_snippet({"TASK_MISSION": "m-now"})
+    r = _run_snippet({"TASK_MISSION": "m-now"}, scratch_repo)
     assert r.returncode == 0, r.stderr
     assert r.stdout.strip().endswith("/registry/handoffs/Ingrid/m-now/t022_HANDOFF.md")
 
 
-def test_worker_md_handoff_ignores_stale_crewvia_mission_slug():
+def test_worker_md_handoff_ignores_stale_crewvia_mission_slug(scratch_repo):
     # 前の task の値が残っていても、別 mission の下には書かない
-    r = _run_snippet({"TASK_MISSION": "m-now", "CREWVIA_MISSION_SLUG": "m-stale"})
+    r = _run_snippet({"TASK_MISSION": "m-now", "CREWVIA_MISSION_SLUG": "m-stale"}, scratch_repo)
     assert r.returncode == 0, r.stderr
     assert "/m-now/" in r.stdout and "m-stale" not in r.stdout
 
 
-def test_worker_md_handoff_stops_when_task_mission_unset():
-    r = _run_snippet({"CREWVIA_MISSION_SLUG": "m-stale"})
+def test_worker_md_handoff_stops_when_task_mission_unset(scratch_repo):
+    r = _run_snippet({"CREWVIA_MISSION_SLUG": "m-stale"}, scratch_repo)
     assert r.returncode != 0
     assert "m-stale" not in r.stdout
 
@@ -133,7 +162,7 @@ def _fail_relative_path_guidance(sb):  # noqa: F811
     return lines[0]
 
 
-def test_fail_relative_path_guidance_uses_pull_mission(sb):  # noqa: F811
+def test_fail_relative_path_guidance_uses_pull_mission(sb, scratch_repo):  # noqa: F811
     cmd = _fail_relative_path_guidance(sb)
     assert "CREWVIA_MISSION_SLUG" not in cmd
     # 案内されたコマンドは、.crewvia-env を source しない target_dir の task (nounset) でも動く
@@ -142,6 +171,6 @@ def test_fail_relative_path_guidance_uses_pull_mission(sb):  # noqa: F811
            "TASK_ID": "t022", "TASK_MISSION": "m-now", "CREWVIA_MISSION_SLUG": "m-stale"}
     cmd_clean = cmd.split("  #", 1)[0]
     r = subprocess.run(["bash", "-c", f"set -u\nsource {REPO_ROOT}/scripts/git-helpers.sh\n" + cmd_clean + '\necho "$HANDOFF_PATH"'],
-                       capture_output=True, text=True, env=env)
+                       capture_output=True, text=True, env=env, cwd=scratch_repo)
     assert r.returncode == 0, r.stderr
     assert "/m-now/" in r.stdout and "m-stale" not in r.stdout

@@ -24,6 +24,7 @@ root の `CLAUDE.md` から移した、テスト専用の規則。設計と経�
 - lib を上書きするスタブは helper の**後**に置く。`copy_plan_tree` は `scripts/git-helpers.sh` として**本物でなく stub**（`tests/fixtures/git-helpers-stub.sh`。git を呼ばず fixture の中に dir を作るだけ）を写す: GIT-05 以降、plan.sh pull は helper が無いと needs_director に倒すため、「不在」を隔離の継ぎ目にできない。本物の git の動作を見るテストは使い捨ての clone に本物を自分で置く（`tests/test_pull_worktree_failure_is_not_success.py`）。`review-plan.sh` は写さない。
 - registry は queue の隣に置く（`registry_dir()` 1 箇所）。実 registry を書くテストは作らない
   （`knowledge/test-isolation.md`）。
+- **`crewvia_handoff_path` / `crewvia_create_worktree` を使うテストは cwd を使い捨ての git repo にする**: `_crewvia_repo_root` は `CREWVIA_REPO_ROOT` でなく cwd の git で root を決める。env だけ隔離しても `registry/handoffs/` は本番に作られる（t078: `agentselftest-*`・`Ingrid/m-now`）。`tests/test_handoff_path_includes_mission.py` の `scratch_repo` と、`scripts/test_handoff_path.sh` の使い捨て clone が型。
 
 ## start.sh を mux モードで走らせるテスト
 

@@ -38,6 +38,10 @@ SCRATCH="$(mktemp -d)"
 SCRATCH_REPO="$SCRATCH/repo"
 git clone -q --local --no-hardlinks "$OWN_CHECKOUT_ROOT" "$SCRATCH_REPO" || { echo "FAIL: scratch clone"; exit 1; }
 cp -R "$OWN_CHECKOUT_ROOT/scripts/." "$SCRATCH_REPO/scripts/"
+# CI は detached HEAD の浅い checkout なので、clone に origin/main も local main も無い。worktree の起点 (Resolver が選ぶ
+# base) をこの clone の HEAD に置く (HEAD の commit は何でもよい: 検証するのは path の解決で、branch の中身ではない)。
+git -C "$SCRATCH_REPO" update-ref refs/remotes/origin/main HEAD
+git -C "$SCRATCH_REPO" update-ref refs/heads/main HEAD
 cd "$SCRATCH_REPO" || exit 1
 # shellcheck disable=SC1091
 source "$SCRATCH_REPO/scripts/git-helpers.sh"
@@ -75,9 +79,9 @@ trap cleanup EXIT
 
 echo "== test_handoff_path.sh (task_158 regression test) =="
 
-WT="$(crewvia_create_worktree "$MISSION_SLUG" "$TASK_ID" "selftest" 2>/dev/null)"
+WT="$(crewvia_create_worktree "$MISSION_SLUG" "$TASK_ID" "selftest" 2>"$SCRATCH/create.err")"
 if [[ -z "$WT" || ! -d "$WT" ]]; then
-  fail "crewvia_create_worktree did not produce a usable worktree"
+  fail "crewvia_create_worktree did not produce a usable worktree: $(head -c 400 "$SCRATCH/create.err")"
   echo ""
   echo "test_handoff_path.sh: PASS=$PASS_COUNT FAIL=$FAIL_COUNT"
   exit 1

@@ -20,8 +20,8 @@
 # 実機で確認する (dispatcher.sh の hp.exists() 相当のチェック)。
 #
 # 実行: bash scripts/test_handoff_path.sh
-# 副作用: 一時的な worktree/branch/HANDOFF ファイルを作成し、終了時に必ず削除する
-#         (crewvia の実データ = queue/ missions・main の状態には触れない)。
+# 副作用: 使い捨ての clone (mktemp) の中だけで worktree/branch/HANDOFF を作り、終了時に clone ごと削除する
+#         (本番の registry/・queue/・main の状態には触れない)。
 
 set -uo pipefail
 
@@ -30,14 +30,26 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # running from) — used for the .gitignore check, since .gitignore is a tracked,
 # branch-dependent file and we want to validate the branch actually under test.
 OWN_CHECKOUT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# t078: このテストは worktree を作り handoff を書く。以前は本物の main repo root (= 本番の registry/) に
+# 書いて、後始末がファイルしか消さず registry/handoffs/agentselftest-<pid>/ が残り続けた。
+# 使い捨ての clone を repo root として使う (helper はこの checkout の scripts/ を写す = 検証対象はそのまま)。
+# _crewvia_repo_root は cwd の git で決まるので、以降の処理は全部この clone の中で行う。
+SCRATCH="$(mktemp -d)"
+SCRATCH_REPO="$SCRATCH/repo"
+git clone -q --local --no-hardlinks "$OWN_CHECKOUT_ROOT" "$SCRATCH_REPO" || { echo "FAIL: scratch clone"; exit 1; }
+cp -R "$OWN_CHECKOUT_ROOT/scripts/." "$SCRATCH_REPO/scripts/"
+# CI は detached HEAD の浅い checkout なので、clone に origin/main も local main も無い。worktree の起点 (Resolver が選ぶ
+# base) をこの clone の HEAD に置く (HEAD の commit は何でもよい: 検証するのは path の解決で、branch の中身ではない)。
+git -C "$SCRATCH_REPO" update-ref refs/remotes/origin/main HEAD
+git -C "$SCRATCH_REPO" update-ref refs/heads/main HEAD
+cd "$SCRATCH_REPO" || exit 1
 # shellcheck disable=SC1091
-source "$SCRIPT_DIR/git-helpers.sh"
-# _crewvia_repo_root (not OWN_CHECKOUT_ROOT): this script may itself be invoked
-# from inside a worktree (e.g. a Worker running its own test suite), and must
-# still validate against the one true main repo root — the same resolution the
-# fix (crewvia_handoff_path) uses. This is a physical-location invariant, not a
-# branch-content one, so it deliberately differs from OWN_CHECKOUT_ROOT above.
+source "$SCRATCH_REPO/scripts/git-helpers.sh"
 REPO_ROOT="$(_crewvia_repo_root)"
+if [[ "$REPO_ROOT" != "$SCRATCH_REPO" ]]; then
+  echo "FAIL: repo root が使い捨て clone ではない ($REPO_ROOT)。本番を書く前に止める"
+  exit 1
+fi
 
 PASS_COUNT=0
 FAIL_COUNT=0
@@ -60,22 +72,16 @@ echo "mission: ${MISSION_SLUG}" > "${TMP_QUEUE}/missions/${MISSION_SLUG}/mission
 export CREWVIA_QUEUE="$TMP_QUEUE"
 
 cleanup() {
-  rm -rf "${TMP_QUEUE:-}"
-  if [[ -n "$WRITTEN_PATH" && -f "$WRITTEN_PATH" ]]; then
-    rm -f "$WRITTEN_PATH"
-  fi
-  if [[ -n "$WT" ]]; then
-    git -C "$REPO_ROOT" worktree remove --force "$WT" >/dev/null 2>&1 || true
-  fi
-  git -C "$REPO_ROOT" branch -D "task/${MISSION_SLUG}/${TASK_ID}-selftest" >/dev/null 2>&1 || true
+  cd / || true
+  rm -rf "${TMP_QUEUE:-}" "${SCRATCH:-}"
 }
 trap cleanup EXIT
 
 echo "== test_handoff_path.sh (task_158 regression test) =="
 
-WT="$(crewvia_create_worktree "$MISSION_SLUG" "$TASK_ID" "selftest" 2>/dev/null)"
+WT="$(crewvia_create_worktree "$MISSION_SLUG" "$TASK_ID" "selftest" 2>"$SCRATCH/create.err")"
 if [[ -z "$WT" || ! -d "$WT" ]]; then
-  fail "crewvia_create_worktree did not produce a usable worktree"
+  fail "crewvia_create_worktree did not produce a usable worktree: $(head -c 400 "$SCRATCH/create.err")"
   echo ""
   echo "test_handoff_path.sh: PASS=$PASS_COUNT FAIL=$FAIL_COUNT"
   exit 1
@@ -86,14 +92,13 @@ pass "created a per-task worktree (mimics a real Worker's default cwd): $WT"
 (
   cd "$WT" || exit 1
   # shellcheck disable=SC1091
-  source "$REPO_ROOT/scripts/git-helpers.sh"
+  source "$SCRATCH_REPO/scripts/git-helpers.sh"
   HANDOFF_PATH="$(crewvia_handoff_path "$AGENT_NAME" "$TASK_ID")"
   mkdir -p "$(dirname "$HANDOFF_PATH")"
   echo "task_158 regression test content" > "$HANDOFF_PATH"
   echo "$HANDOFF_PATH"
-) > "/tmp/test_handoff_path.$$.out"
-WRITTEN_PATH="$(cat "/tmp/test_handoff_path.$$.out")"
-rm -f "/tmp/test_handoff_path.$$.out"
+) > "$SCRATCH/handoff.out"
+WRITTEN_PATH="$(cat "$SCRATCH/handoff.out")"
 
 if [[ "$WRITTEN_PATH" == /* ]]; then
   pass "crewvia_handoff_path returned an absolute path from inside a worktree: $WRITTEN_PATH"

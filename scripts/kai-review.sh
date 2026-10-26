@@ -388,10 +388,7 @@ if ! command -v gh &>/dev/null; then
   fail_needs_director "NEEDS FIX: gh command not found on this machine"
 fi
 
-# --- codex コマンド確認 ---
-if ! command -v codex &>/dev/null; then
-  fail_needs_director "NEEDS FIX: codex command not found on this machine"
-fi
+# --- codex コマンド確認は engine の解決の後 (codex / both のときだけ要求する。下記) ---
 
 # --- PR の head branch 取得 ---
 _info "Fetching PR#${PR_NUM} head branch..."
@@ -558,6 +555,9 @@ if ! REVIEW_CFG="$(python3 "${SCRIPT_DIR}/lib_review_engine.py" get \
 fi
 { IFS= read -r REVIEW_ENGINE; IFS= read -r AGY_MODEL; IFS= read -r AGY_TIMEOUT; } <<<"$REVIEW_CFG"
 _info "Review engine: ${REVIEW_ENGINE}"
+if [[ "$REVIEW_ENGINE" != agy ]] && ! command -v codex &>/dev/null; then
+  fail_needs_director "NEEDS FIX: codex command not found on this machine"
+fi
 
 # --- codex exec 実行 (t006: review サブコマンドではなく exec 本体 + --output-schema) ---
 # -C "$REVIEW_WT" で作業ディレクトリを指定する (codex が周辺コードを読む際の cwd)。

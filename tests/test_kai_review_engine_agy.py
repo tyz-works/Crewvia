@@ -38,7 +38,7 @@ esac
 
 
 def run(tmp_path, monkeypatch, *, engine=None, agy_mode="ok", agy_findings=CLEAN, codex_out=CLEAN, config_text=None,
-        env_engine=None, extra_args=()):
+        env_engine=None, extra_args=(), with_codex=True):
     monkeypatch.setenv("AGY_MODE", agy_mode)
     monkeypatch.setenv("AGY_FINDINGS", agy_findings)
     monkeypatch.setenv("AGY_ARGV_FILE", str(tmp_path / "agy_argv.txt"))
@@ -50,7 +50,7 @@ def run(tmp_path, monkeypatch, *, engine=None, agy_mode="ok", agy_findings=CLEAN
     if config_text is None and engine is not None:
         config_text = f"review:\n  engine: {engine}\n  agy_model: gemini-4-argon-high\n  agy_timeout_seconds: 90\n"
     return run_kai_review(tmp_path, codex_out, extra_args=extra_args, config_text=config_text,
-                          extra_exes={"agy": AGY_STUB})
+                          extra_exes={"agy": AGY_STUB}, with_codex=with_codex)
 
 
 def _calls(tmp_path):
@@ -68,6 +68,43 @@ def _result(capture, kind):
 
 
 # --- 設定の読み口 ---
+
+@pytest.mark.parametrize("text,expected", [
+    ("review:\n  # comment\n  engine: agy\n", "agy"),
+    ("review:\n  engine: agy\n  # comment\n  agy_timeout_seconds: 30\n", "agy"),
+    ("review:\n\n  engine: both\n\n  agy_model: gemini-4-argon-high\n", "both"),
+    ("review:\n    engine: agy\n    agy_timeout_seconds: 30\n", "agy"),
+    ("review:\n  engine: agy\n  unknown_key: 1\n", "agy"),
+    ("review:\n  engine: 'agy'  # trailing\n", "agy"),
+    ("attempts:\n  max_total: 6\nreview:\n  # c\n  engine: both\nescalation:\n  x: 1\n", "both"),
+])
+def test_valid_yaml_shapes_are_read_not_silently_defaulted(tmp_path, text, expected):
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text(text)
+    assert lre.load(cfg, environ={})[0] == expected
+
+
+@pytest.mark.parametrize("text", [
+    "review:\n  engine: 1\n", "review:\n  engine: [agy]\n", "review:\n  engine: true\n",
+    "review:\n  agy_model: 5\n", "review: [a]\n", "review:\n  engine: agy\n bad: [\n", "- a\n- b\n",
+    "review:\n  engine: agy\n  agy_timeout_seconds: 1.5\n",
+])
+def test_wrong_types_and_broken_yaml_are_errors_never_codex(tmp_path, text):
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text(text)
+    with pytest.raises(lre.ReviewConfigError):
+        lre.load(cfg, environ={})
+
+
+def test_without_pyyaml_a_review_block_is_an_error_not_a_default(tmp_path, monkeypatch):
+    monkeypatch.setattr(lre, "yaml", None)
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text("review:\n  engine: agy\n")
+    with pytest.raises(lre.ReviewConfigError):
+        lre.load(cfg, environ={})
+    cfg.write_text("attempts:\n  max_total: 6\n")
+    assert lre.load(cfg, environ={})[0] == "codex"
+
 
 def test_default_engine_is_codex_without_a_review_block(tmp_path):
     cfg = tmp_path / "c.yaml"
@@ -165,6 +202,19 @@ def test_env_selects_agy_over_config_codex(tmp_path, monkeypatch):
     p, capture = run(tmp_path, monkeypatch, engine="codex", env_engine="agy", agy_findings=P1)
     assert _verdict(tmp_path) == "needs-director"
     assert (tmp_path / "agy_argv.txt").exists()
+
+
+def test_agy_engine_does_not_require_codex_to_be_installed(tmp_path, monkeypatch):
+    p, capture = run(tmp_path, monkeypatch, engine="agy", with_codex=False)
+    assert _verdict(tmp_path) == "done", (p.stdout, p.stderr)
+    assert (tmp_path / "agy_argv.txt").exists()
+
+
+@pytest.mark.parametrize("engine", ["codex", "both"])
+def test_codex_and_both_still_require_codex(tmp_path, monkeypatch, engine):
+    p, capture = run(tmp_path, monkeypatch, engine=engine, with_codex=False)
+    assert _verdict(tmp_path) == "needs-director", (p.stdout, p.stderr)
+    assert any("codex command not found" in c for c in _calls(tmp_path)), _calls(tmp_path)
 
 
 # --- both: 判定は codex・agy は併記 ---

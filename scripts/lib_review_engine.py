@@ -24,6 +24,11 @@ if str(_SCRIPTS_DIR) not in sys.path:
 
 import lib_task_cards as _cards  # noqa: E402
 
+try:
+    import yaml
+except ImportError:  # pragma: no cover — PyYAML が無いとき review: があれば止める (下記)
+    yaml = None
+
 ENGINES = ('codex', 'agy', 'both')
 DEFAULT_ENGINE = 'codex'
 DEFAULT_AGY_MODEL = 'gemini-4-argon-high'
@@ -57,10 +62,21 @@ def load(config_path, environ=None):
     elif _cards.is_unreadable(raw):
         raise ReviewConfigError('config_unreadable')
     else:
-        try:
-            data = _cards.parse_yaml(raw, source='crewvia.yaml')
-        except ValueError:
-            raise ReviewConfigError('config_malformed')
+        # 共有の parse_yaml は入れ子の途中のコメント行・空行で読むのをやめ、字下げは 2 空白しか認めない。
+        # 正しい `review:` を「無い」と読んで codex に倒さないよう、このブロックは PyYAML で読む。
+        if yaml is None:
+            if re.search(r'^review\s*:', raw, re.M):
+                raise ReviewConfigError('yaml_unavailable')   # 読めないものを「無い」にしない
+            data = {}
+        else:
+            try:
+                data = yaml.safe_load(raw)
+            except yaml.YAMLError:
+                raise ReviewConfigError('config_malformed')
+            if data is None:
+                data = {}
+            if not isinstance(data, dict):
+                raise ReviewConfigError('config_malformed')
         found = data.get('review') if isinstance(data, dict) else None
         if isinstance(found, dict):
             block = found

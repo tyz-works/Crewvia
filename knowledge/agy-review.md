@@ -13,7 +13,8 @@ needs-director / done の報告）は codex と共通。設定の読み口は `s
 | `agy_model` | `gemini-4-argon-high` | `agy models` に出る名前（`gemini-4-argon-{low,medium,high}`） |
 | `agy_timeout_seconds` | `600` | `--print-timeout` に渡す |
 
-- ブロックが無い・config ファイルが無い = 既定。**読めない・値が不正（env の空も）= 止める**（`needs-director`・固定コード）。codex に倒さない。
+- **キー（`review:` / `engine` 等）が無い・config ファイルが無い = 既定**。**キーがあって値が null（`review:` / `review: null` / `engine:`）は不正**。**読めない・値が不正（env の空も）= 止める**（`needs-director`・固定コード）。codex に倒さない。
+- 読み口は PyYAML。**PyYAML が無く config ファイルがあれば止める**（`yaml_unavailable`。regex で「review: が無い」と決めると `"review":` や flow 形式を見落として黙って codex になる）。CI は `pip install pytest pyyaml`（`.github/workflows/ci.yml`）、本番の `python3` は PyYAML 6.0.1 が入っていることを確認済み（t084）。
 - `both`: 両方走らせ、**判定は codex のまま**。agy の findings は Result に「agy (比較用)」として併記する（agy が失敗しても判定は変えず、失敗の理由を併記）。
 
 ## agy の呼び方（実測: agy 1.4.7）
@@ -27,7 +28,7 @@ cd $REVIEW_WT && agy --mode plan --model <agy_model> --output-format json \
 - **`-p` は最後**（前に置くと次の option を prompt として読み exit 2）。
 - diff は argv に載せない（引数 1 個 128KB 上限・PR は 300KB まで通る）。worktree の外の `mktemp -d` に `review.diff` を書き、prompt でパスを読ませる。
   **`--add-dir` で足せば worktree 外のファイルを読める**（実機で確認）。prompt は「コマンドは実行せず、ファイルを読むだけ」と書く（`-p` は許可の無いコマンドを自動で拒否する）。
-- 1 回 約 30〜60 秒・約 1.2 万 token。
+- 実測（t084 / #309 / #305）: kai-review 経由で 1 回 約 170 秒、直接実行で 70〜124 秒・2.0〜2.4 万 token。
 
 ## fail-closed（findings 無しの LGTM に倒さない）
 
@@ -47,7 +48,14 @@ cd $REVIEW_WT && agy --mode plan --model <agy_model> --output-format json \
 ## 残るもの
 
 `--mode plan` でも、agy は計画のメモを `~/.gemini/antigravity-cli/brain/<id>/` に置く（worktree には書かない）。レビューのたびに溜まるので、
-増えすぎたら人が掃除する（crewvia は消さない）。
+増えすぎたら人が掃除する（crewvia は消さない）。1 run で +1 dir。
+
+## 既知: `read_file` 拒否で `structured_output` が null になる run（t084 で調査・再現せず）
+
+QA t082 で、通常の prompt でも 1 回だけ `read_file` が拒否され `structured_output` が null になった run があった。fail-closed なので安全側（`denied_actions` → `needs-director`）だが、agy を既定にすると誤爆になる。
+t084 で同じ形（worktree を cwd・一時 dir を `--add-dir`・5KB と 200KB の diff）を 5 回走らせたが **0/5 で再現せず**（全部 `SUCCESS`・`denied_actions` なし）。原因は特定できていない。
+`permissions.allow` で読み取りだけ許可する設定は、再現しないものを検証できないので足していない（書き込み・コマンドは許可しない方針は変えない）。
+再発したら needs-director の `denied_actions` の中身（拒否された path）を見る: 一時 dir 側ならタイミング（`--add-dir` の効き）、worktree 側なら cwd の読み。当面は再実行で通る見込み。
 
 ## 戻し方
 

@@ -4,7 +4,8 @@
 `config/crewvia.yaml` の `review:` ブロック（`engine` / `agy_model` / `agy_timeout_seconds`）を、
 `lib_task_cards` の入口で読む。env `CREWVIA_REVIEW_ENGINE` は engine だけを上書きする。
 
-- **ブロックが無い・config ファイルが無い = 既定**（engine=codex。今までと同じ挙動）。
+- **キー（`review:` / `engine` 等）が無い・config ファイルが無い = 既定**（engine=codex。今までと同じ挙動）。**キーがあって値が null は不正**。
+- **PyYAML が無く config ファイルがあれば止める**（regex で「review: が無い」と決めない）。
 - **config が読めない・値が不正 = 既定に倒さず止める**（exit 1・stderr に固定コード）。
   engine を黙って codex に戻すと、agy を選んだつもりのレビューが別物になる。
 - CLI: `lib_review_engine.py get --config <path>` が 3 行（engine / agy_model / agy_timeout_seconds）を stdout に出す。
@@ -64,40 +65,39 @@ def load(config_path, environ=None):
     else:
         # 共有の parse_yaml は入れ子の途中のコメント行・空行で読むのをやめ、字下げは 2 空白しか認めない。
         # 正しい `review:` を「無い」と読んで codex に倒さないよう、このブロックは PyYAML で読む。
+        # PyYAML が無いときは regex で「review: が無い」と決めない (`"review":` や flow 形式を見落とす)。
+        # config ファイルがある限り読めないものとして止める。
         if yaml is None:
-            if re.search(r'^review\s*:', raw, re.M):
-                raise ReviewConfigError('yaml_unavailable')   # 読めないものを「無い」にしない
+            raise ReviewConfigError('yaml_unavailable')
+        try:
+            data = yaml.safe_load(raw)
+        except yaml.YAMLError:
+            raise ReviewConfigError('config_malformed')
+        if data is None:
             data = {}
-        else:
-            try:
-                data = yaml.safe_load(raw)
-            except yaml.YAMLError:
-                raise ReviewConfigError('config_malformed')
-            if data is None:
-                data = {}
-            if not isinstance(data, dict):
-                raise ReviewConfigError('config_malformed')
-        found = data.get('review') if isinstance(data, dict) else None
-        if isinstance(found, dict):
-            block = found
-        elif found is not None:
-            raise ReviewConfigError('review_block_malformed')
+        if not isinstance(data, dict):
+            raise ReviewConfigError('config_malformed')
+        # キーが「無い」ときだけ既定。キーがあって値が null (`review:` / `review: null`) は拒否する。
+        if 'review' in data:
+            if not isinstance(data['review'], dict):
+                raise ReviewConfigError('review_block_malformed')
+            block = data['review']
 
     engine = DEFAULT_ENGINE
-    if block.get('engine') is not None:
-        engine = _engine(block.get('engine'), 'bad_engine')
+    if 'engine' in block:
+        engine = _engine(block['engine'], 'bad_engine')
     if ENV_ENGINE in environ:
         engine = _engine(environ[ENV_ENGINE], 'bad_engine_env')   # 空も不正 (既定に倒さない)
 
     model = DEFAULT_AGY_MODEL
-    if block.get('agy_model') is not None:
-        model = block.get('agy_model')
+    if 'agy_model' in block:
+        model = block['agy_model']
         if not isinstance(model, str) or not _MODEL_RE.fullmatch(model):
             raise ReviewConfigError('bad_agy_model')
 
     timeout = DEFAULT_AGY_TIMEOUT_SECONDS
-    if block.get('agy_timeout_seconds') is not None:
-        t = block.get('agy_timeout_seconds')
+    if 'agy_timeout_seconds' in block:
+        t = block['agy_timeout_seconds']
         if isinstance(t, str) and t.isdigit():
             t = int(t)
         if isinstance(t, bool) or not isinstance(t, int) or t <= 0:

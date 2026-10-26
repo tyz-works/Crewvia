@@ -88,6 +88,9 @@ def test_valid_yaml_shapes_are_read_not_silently_defaulted(tmp_path, text, expec
     "review:\n  engine: 1\n", "review:\n  engine: [agy]\n", "review:\n  engine: true\n",
     "review:\n  agy_model: 5\n", "review: [a]\n", "review:\n  engine: agy\n bad: [\n", "- a\n- b\n",
     "review:\n  engine: agy\n  agy_timeout_seconds: 1.5\n",
+    "review:\n  engine:\n", "review: null\n", "review:\n", "review: ~\n",
+    "review:\n  engine: agy\n  agy_model:\n", "review:\n  engine: agy\n  agy_timeout_seconds:\n",
+    "review:\n  engine: null\n",
 ])
 def test_wrong_types_and_broken_yaml_are_errors_never_codex(tmp_path, text):
     cfg = tmp_path / "c.yaml"
@@ -96,14 +99,18 @@ def test_wrong_types_and_broken_yaml_are_errors_never_codex(tmp_path, text):
         lre.load(cfg, environ={})
 
 
-def test_without_pyyaml_a_review_block_is_an_error_not_a_default(tmp_path, monkeypatch):
+@pytest.mark.parametrize("text", [
+    "review:\n  engine: agy\n", '"review":\n  engine: agy\n', "{review: {engine: agy}}\n",
+    "attempts:\n  max_total: 6\n", "# nothing\n",
+])
+def test_without_pyyaml_an_existing_config_is_an_error_never_codex(tmp_path, monkeypatch, text):
     monkeypatch.setattr(lre, "yaml", None)
     cfg = tmp_path / "c.yaml"
-    cfg.write_text("review:\n  engine: agy\n")
-    with pytest.raises(lre.ReviewConfigError):
+    cfg.write_text(text)
+    with pytest.raises(lre.ReviewConfigError) as e:
         lre.load(cfg, environ={})
-    cfg.write_text("attempts:\n  max_total: 6\n")
-    assert lre.load(cfg, environ={})[0] == "codex"
+    assert e.value.code == "yaml_unavailable"
+    assert lre.load(tmp_path / "missing.yaml", environ={})[0] == "codex"   # 無い file は既定
 
 
 def test_default_engine_is_codex_without_a_review_block(tmp_path):
@@ -118,7 +125,7 @@ def test_the_shipped_config_defaults_to_codex():
 
 
 @pytest.mark.parametrize("text", [
-    "review:\n  engine: gemini\n", "review:\n  engine: \n  agy_model: 'a b'\n", "review:\n  agy_model: 'a b'\n",
+    "review:\n  engine: gemini\n", "review:\n  agy_model: 'a b'\n",
     "review:\n  agy_timeout_seconds: 0\n", "review:\n  agy_timeout_seconds: abc\n", "review: nope\n",
 ])
 def test_bad_values_are_errors_not_defaults(tmp_path, text):
@@ -170,7 +177,7 @@ def test_agy_clean_review_is_done_and_uses_plan_mode_without_skip_permissions(tm
     assert "-p" not in argv[pi + 1:] and not any(a.startswith("--") and a in ("--mode", "--model") for a in argv[pi + 1:])
     assert "review.diff" in "\n".join(argv[pi + 1:])               # prompt が diff のファイルを指す
     assert argv.index("--add-dir") < pi                            # -p は最後の option (prompt が続く)
-    assert "agy raw output" in _result(capture, "done")
+    assert "### agy raw output" in _result(capture, "done")
     assert not list(tmp_path.glob("kai-review-agy*"))
 
 
@@ -223,7 +230,7 @@ def test_both_verdict_follows_codex_and_agy_is_appended(tmp_path, monkeypatch):
     p, capture = run(tmp_path, monkeypatch, engine="both", codex_out=CLEAN, agy_findings=P1)
     assert _verdict(tmp_path) == "done", (p.stdout, p.stderr)            # agy が P1 でも判定は codex
     text = _result(capture, "done")
-    assert "### agy (比較用" in text and "agy-found" in text
+    assert "### agy (比較用" in text and "agy-found" in text and "### Codex raw output" in text
 
 
 def test_both_codex_findings_still_need_director_even_if_agy_is_clean(tmp_path, monkeypatch):

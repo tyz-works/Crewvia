@@ -941,7 +941,8 @@ RESULT_FILE="$(mktemp "${TMPDIR:-/tmp}/kai-review-result.XXXXXX")"
       || echo "(findings could not be formatted — see the raw output below)"
     echo ""
   fi
-  echo "### ${REVIEW_ENGINE/#agy/agy}$([[ "$REVIEW_ENGINE" == agy ]] && echo "" || echo "") raw output"
+  # 見出しは旧 (codex のみ) と揃える: codex / both = "Codex raw output"、agy = "agy raw output"
+  if [[ "$REVIEW_ENGINE" == agy ]]; then echo "### agy raw output"; else echo "### Codex raw output"; fi
   echo ""
   printf '%s\n' "$REVIEW_CONTENT"
   if [[ "$REVIEW_ENGINE" == "both" ]]; then

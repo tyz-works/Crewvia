@@ -46,7 +46,7 @@ def _git(cwd, *args):
                         "GIT_COMMITTER_EMAIL": "t@e"})
 
 
-def run_kai_review(tmp_path, codex_output, extra_args=()):
+def run_kai_review(tmp_path, codex_output, extra_args=(), config_text=None, extra_exes=None):
     origin = tmp_path / "origin.git"
     subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(origin)], check=True)
     root = tmp_path / "root"
@@ -57,6 +57,8 @@ def run_kai_review(tmp_path, codex_output, extra_args=()):
     (root / "config" / "kai-review-findings.schema.json").write_text(
         (REPO_ROOT / "config" / "kai-review-findings.schema.json").read_text())
     _exe(root / "scripts" / "plan.sh", PLAN_STUB)
+    if config_text is not None:
+        (root / "config" / "crewvia.yaml").write_text(config_text)
     (root / "README").write_text("base\n")
     _git(root, "add", "-A")
     _git(root, "commit", "-q", "-m", "base")
@@ -71,6 +73,8 @@ def run_kai_review(tmp_path, codex_output, extra_args=()):
     bindir = tmp_path / "bin"
     bindir.mkdir()
     _exe(bindir / "gh", "#!/bin/bash\necho feat\n")
+    for name, text in (extra_exes or {}).items():
+        _exe(bindir / name, text)
     (tmp_path / "codex_out.txt").write_text(codex_output)
     _exe(bindir / "codex", '#!/bin/bash\nwhile [[ $# -gt 0 ]]; do [[ "$1" == "-o" ]] && out="$2"; shift; done\n'
                            f'cp {tmp_path}/codex_out.txt "$out"\n')

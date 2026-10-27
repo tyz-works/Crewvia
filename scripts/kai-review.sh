@@ -668,7 +668,11 @@ run_cursor_review() {
   if grep -qE '(^|/)(\.(claude|codex|vscode)(/|$)|\.mcp\.json$|AGENTS\.md$)' <<<"$changed"; then
     CURSOR_FAIL="pr_changes_agent_config"; return 1
   fi
-  if git -C "$REVIEW_WT" diff --raw "${DIFF_BASE}...HEAD" 2>/dev/null | grep -qE '^:[0-7]+ 120000 '; then
+  local raw
+  if ! raw="$(git -C "$REVIEW_WT" diff --raw "${DIFF_BASE}...HEAD" 2>/dev/null)"; then
+    CURSOR_FAIL="worktree_status_failed"; return 1    # 取れないなら素通りさせない
+  fi
+  if grep -qE '^:[0-7]+ 120000 ' <<<"$raw"; then
     CURSOR_FAIL="pr_changes_agent_config"; return 1
   fi
   [[ -n "$CURSOR_DIFF_DIR" ]] || CURSOR_DIFF_DIR="$(mktemp -d "${TMPDIR:-/tmp}/kai-review-cursor.XXXXXX")"

@@ -782,7 +782,19 @@ class WorkerMonitor:
             f"task {self.task_id}) は無音 "
             f"{detail.idle_seconds:.0f}s (hard_idle しきい値 {self.idle_threshold * 2}s 超) ですが、"
             f"終了を見送っています。理由: {why}。見送りは {lasted:.0f}s 続いています。"
-            f"止まっていないか確認してください (max {self.max_threshold}s で終了します)。")
+            f"止まっていないか確認してください (max {self.max_threshold}s で終了します)。"
+            f"{self._ci_note()}")
+
+    def _ci_note(self) -> str:
+        """dispatcher が記録した PR の CI の 1 行 (lib_ci_status)。無い・読めない・PR 無しは ''。
+        **添えるだけ**で、見送り・終了の判定には使わない。"""
+        try:
+            import lib_ci_status
+            rec = lib_ci_status.read_record(self.repo_root / "registry", self.mission_slug, self.task_id)
+            line = lib_ci_status.format_line(rec, time.time())
+            return f" CI 待ちの状況: {line}" if line else ""
+        except Exception:
+            return ""
 
     # ------------------------------------------------------------------
     # Core check

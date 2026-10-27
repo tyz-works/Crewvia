@@ -2168,6 +2168,7 @@ def check_rule5(name: str, target: str, assignment_file: Path, task_statuses_by_
     msg = (
         f'[Rule 5] Worker {name} が {condition} です '
         f'(task {task_id}, mission={mission_slug}, {elapsed:.0f}秒継続)。'
+        f'{ci_line_for(mission_slug, task_id)}'
         f'画面末尾:\n{screen_tail}'
     )
 
@@ -3372,6 +3373,64 @@ def run_telegram_cycle():
         log(f'[telegram] cycle failed: {type(e).__name__}')
 
 
+# --- PR の CI の見える化 (lib_ci_status。knowledge/ci-status.md) ---
+# 取得はここ 1 か所。結果は registry/ci/<mission>__<task>.json。plan.sh status・tasks.json・通知は記録を読むだけ。
+# **判定には使わない**。gh の失敗・timeout は unknown にして先へ進む (1 サイクルの上限は lib_ci_status の定数)。
+import lib_ci_status  # noqa: E402
+
+
+def _ci_branch_of(task):
+    """Git Policy Resolver から task の branch を得る (式をコピーしない)。決められなければ None。"""
+    try:
+        import lib_git_policy
+        policy = lib_git_policy.load_git_policy(task['mission'], queue_dir=str(QUEUE_DIR))
+        slug = task.get('task_slug')
+        if not isinstance(slug, str) or not slug:
+            return None
+        return lib_git_policy.task_branch(policy, mission_slug=task['mission'], task_id=task['id'], task_slug=slug)
+    except Exception:
+        return None
+
+
+def ci_line_for(slug, task_id):
+    """通知 (Rule 5) に添える 1 行 / ''。読めない・無い・PR 無しは ''。"""
+    try:
+        rec = lib_ci_status.read_record(REGISTRY_DIR, slug, task_id)
+        line = lib_ci_status.format_line(rec, time.time())
+        return f' {line}' if line else ''
+    except Exception:
+        return ''
+
+
+def run_ci_poll():
+    try:
+        import lib_daemon_watch
+        state = load_state()
+        if is_unreadable(state) or not isinstance(state, dict):
+            return
+        tasks = []
+        for slug in (state.get('active_missions') or []):
+            for meta, _ in list_tasks_for_mission(slug):
+                if meta.get('status') in lib_ci_status.POLL_STATUSES:
+                    tasks.append({'mission': slug, 'id': meta['id'], 'status': meta.get('status'),
+                                  'pr_number': meta.get('pr_number'), 'target_dir': meta.get('target_dir') or None,
+                                  'task_slug': meta.get('task_slug')})
+        if not tasks:
+            return
+        changed = lib_ci_status.poll_cycle(
+            tasks, registry_dir=REGISTRY_DIR, repo_root=str(REPO_ROOT), branch_of=_ci_branch_of,
+            poll_seconds=lib_daemon_watch.load_config().ci_poll_seconds,
+            warn=lambda msg: log(f"WARNING: {msg}"))
+        if changed:
+            # tasks.json の `ci` 欄を新しくする (plan.sh の生成器 1 か所。CREWVIA_TASK_GRAPH=0 なら何もしない)
+            p = subprocess.run([str(PLAN_SH), 'task-graph'], capture_output=True, text=True, timeout=20,
+                               stdin=subprocess.DEVNULL)
+            if p.returncode != 0:
+                log(f"WARNING: ci: plan.sh task-graph exit {p.returncode}")
+    except Exception as e:
+        log(f"WARNING: ci poll failed: {type(e).__name__}")
+
+
 # --- CYCLE ENTRY POINT ---
 # Everything below this marker runs a full dispatch cycle.  Tests that want to
 # exercise a single helper (tests/test_orphan_daemon_guard.py) exec() the code
@@ -3387,6 +3446,8 @@ check_main_checkout_drift()
 run_telegram_cycle()
 publish_agents()
 dispatch()
+# CI の見える化は dispatch() の成否から独立させる (early return のサイクルでも回す)
+run_ci_poll()
 # t002: both are queue/registry bookkeeping, not dispatch decisions, and both
 # must run on every cycle — including the early-return cycles dispatch() takes
 # when there are no active missions.

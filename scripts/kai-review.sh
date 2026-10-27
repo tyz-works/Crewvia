@@ -280,6 +280,9 @@ report_refused_hint() {
 REVIEW_WT=""
 OUTPUT_FILE=""
 STDERR_FILE=""
+AGY_DIFF_DIR=""          # agy に読ませる diff を置く一時 dir (worktree の外。argv に diff を載せない)
+AGY_OUT_FILE=""
+AGY_ERR_FILE=""
 RESULT_FILE=""           # card に全文を残す Result / 理由のファイル (plan.sh が読んだ後に消す)
 FETCH_LOCAL_REF=""
 BASE_FETCH_LOCAL_REF=""  # t006: origin/main を都度 fetch する一時 ref (下記参照)
@@ -294,6 +297,9 @@ cleanup() {
   if [[ -n "$RESULT_FILE" ]]; then
     rm -f "$RESULT_FILE"
   fi
+  [[ -n "$AGY_OUT_FILE" ]] && rm -f "$AGY_OUT_FILE"
+  [[ -n "$AGY_ERR_FILE" ]] && rm -f "$AGY_ERR_FILE"
+  [[ -n "$AGY_DIFF_DIR" ]] && rm -rf "$AGY_DIFF_DIR"
   if [[ -n "$REVIEW_WT" && -d "$REVIEW_WT" ]]; then
     git -C "${WORK_DIR:-$REPO_ROOT}" worktree remove --force "$REVIEW_WT" 2>/dev/null \
       || rm -rf "$REVIEW_WT"
@@ -382,10 +388,7 @@ if ! command -v gh &>/dev/null; then
   fail_needs_director "NEEDS FIX: gh command not found on this machine"
 fi
 
-# --- codex コマンド確認 ---
-if ! command -v codex &>/dev/null; then
-  fail_needs_director "NEEDS FIX: codex command not found on this machine"
-fi
+# --- codex コマンド確認は engine の解決の後 (codex / both のときだけ要求する。下記) ---
 
 # --- PR の head branch 取得 ---
 _info "Fetching PR#${PR_NUM} head branch..."
@@ -543,24 +546,112 @@ rather than omitting it.
 PROMPT_EOF
 )"
 
+# --- レビュー先の解決 (t080) ---
+# `config/crewvia.yaml` の review.engine (codex|agy|both。既定 codex = 今までと同じ) と env CREWVIA_REVIEW_ENGINE。
+# 読めない・値が不正なら既定に倒さず止める (agy を選んだつもりが codex になるのを防ぐ)。読み口は lib_review_engine.py の 1 か所。
+if ! REVIEW_CFG="$(python3 "${SCRIPT_DIR}/lib_review_engine.py" get \
+      --config "${CREWVIA_REPO_ROOT:-$REPO_ROOT}/config/crewvia.yaml" 2>&1)"; then
+  fail_needs_director "NEEDS FIX: review engine config is invalid — ${REVIEW_CFG} (fail-closed, no fallback to codex)"
+fi
+{ IFS= read -r REVIEW_ENGINE; IFS= read -r AGY_MODEL; IFS= read -r AGY_TIMEOUT; } <<<"$REVIEW_CFG"
+_info "Review engine: ${REVIEW_ENGINE}"
+if [[ "$REVIEW_ENGINE" != agy ]] && ! command -v codex &>/dev/null; then
+  fail_needs_director "NEEDS FIX: codex command not found on this machine"
+fi
+
 # --- codex exec 実行 (t006: review サブコマンドではなく exec 本体 + --output-schema) ---
 # -C "$REVIEW_WT" で作業ディレクトリを指定する (codex が周辺コードを読む際の cwd)。
 # --sandbox read-only: レビューは書き込みを必要としないため、誤って
 # ファイルを変更されるリスクを構造的に無くす。
-_info "Running codex exec -C ${REVIEW_WT} --output-schema ... ${MODEL:+-m $MODEL} (diff=${DIFF_BYTES} bytes) ..."
-CODEX_EXIT=0
-printf '%s' "$DIFF_CONTENT" | codex exec -C "$REVIEW_WT" \
-  --sandbox read-only \
-  --output-schema "$SCHEMA_FILE" \
-  ${MODEL:+-m "$MODEL"} \
-  --ephemeral \
-  -o "$OUTPUT_FILE" \
-  "$REVIEW_PROMPT" \
-  2>&1 | tee "$STDERR_FILE" || CODEX_EXIT=$?
+run_codex_review() {
+  _info "Running codex exec -C ${REVIEW_WT} --output-schema ... ${MODEL:+-m $MODEL} (diff=${DIFF_BYTES} bytes) ..."
+  CODEX_EXIT=0
+  printf '%s' "$DIFF_CONTENT" | codex exec -C "$REVIEW_WT" \
+    --sandbox read-only \
+    --output-schema "$SCHEMA_FILE" \
+    ${MODEL:+-m "$MODEL"} \
+    --ephemeral \
+    -o "$OUTPUT_FILE" \
+    "$REVIEW_PROMPT" \
+    2>&1 | tee "$STDERR_FILE" || CODEX_EXIT=$?
+  if [[ $CODEX_EXIT -ne 0 ]]; then
+    fail_needs_director "CODEX FAILURE: exit=${CODEX_EXIT} — review not completed reliably"
+  fi
+}
 
-if [[ $CODEX_EXIT -ne 0 ]]; then
-  fail_needs_director "CODEX FAILURE: exit=${CODEX_EXIT} — review not completed reliably"
-fi
+# --- agy (Antigravity CLI + Gemini) 実行 (t080) ---
+# サブスクのログインのまま呼ぶ (API キーは使わない)。--mode plan・**--dangerously-skip-permissions は使わない**・
+# cwd はレビュー用 worktree。diff は argv に載せない (引数 1 個 128KB 上限) — worktree の外の一時 dir に書き、
+# prompt でそのパスを読ませる (--add-dir で読める範囲に足す)。`-p` は最後に置く (前に置くと次の option を prompt と読む)。
+# **fail-closed**: 次のどれかなら成功を返さない (findings 無しの LGTM に倒さない)。理由は AGY_FAIL (固定語彙 + 数字) に入る:
+#   exit != 0 / status != SUCCESS / structured_output が null か欠け / denied_actions が空でない / 実行後に worktree が汚れた。
+# 成功なら structured_output (schema 準拠の {"findings":[...]}) を $1 に書く。
+AGY_FAIL=""
+AGY_DIAG=""   # 失敗時の診断 (伏せ字済み・上限つき。後片付けで一時ファイルが消える前に Result へ入れる)
+agy_collect_diag() {
+  AGY_DIAG="$(python3 "${SCRIPT_DIR}/lib_review_engine.py" diagnose --out "$AGY_OUT_FILE" --err "$AGY_ERR_FILE" 2>/dev/null)" \
+    || AGY_DIAG="(diagnostics unavailable)"
+}
+run_agy_review() {
+  local out_to="$1" rc=0 st dirty
+  AGY_FAIL=""
+  [[ -n "$AGY_DIFF_DIR" ]] || AGY_DIFF_DIR="$(mktemp -d "${TMPDIR:-/tmp}/kai-review-agy.XXXXXX")"
+  [[ -n "$AGY_OUT_FILE" ]] || AGY_OUT_FILE="$(mktemp "${TMPDIR:-/tmp}/kai-review-agy-out.XXXXXX")"
+  [[ -n "$AGY_ERR_FILE" ]] || AGY_ERR_FILE="$(mktemp "${TMPDIR:-/tmp}/kai-review-agy-err.XXXXXX")"
+  printf '%s' "$DIFF_CONTENT" > "${AGY_DIFF_DIR}/review.diff" || { AGY_FAIL="diff_write_failed"; return 1; }
+  : > "$AGY_OUT_FILE"
+  local prompt
+  prompt="${REVIEW_PROMPT//the <stdin> block below/the file ${AGY_DIFF_DIR}/review.diff}"
+  prompt="${prompt}
+
+Read the unified diff from the file ${AGY_DIFF_DIR}/review.diff (it is outside this checkout; read it as a file).
+Do NOT run any command (no git, no shell): only read files. Do not create or modify any file.
+Return only the JSON object required by the schema."
+  _info "Running agy --mode plan --model ${AGY_MODEL} (diff=${DIFF_BYTES} bytes, timeout=${AGY_TIMEOUT}s) ..."
+  ( cd "$REVIEW_WT" && agy --mode plan --model "$AGY_MODEL" --output-format json \
+      --json-schema "$SCHEMA_FILE" --add-dir "$AGY_DIFF_DIR" --print-timeout "${AGY_TIMEOUT}s" \
+      -p "$prompt" ) >"$AGY_OUT_FILE" 2>"$AGY_ERR_FILE" || rc=$?
+  if [[ $rc -ne 0 ]]; then AGY_FAIL="exit_${rc}"; return 1; fi
+  # 判定は 1 つの JSON ドキュメントだけから (複数・壊れた出力は失敗)
+  if ! st="$(jq -e -s 'if length == 1 then .[0] else error("docs") end
+        | if (.status // "") != "SUCCESS" then "status"
+          elif ((.denied_actions // []) | length) > 0 then "denied_actions"
+          elif (.structured_output | type) != "object" then "no_structured_output"
+          else "ok" end' -r "$AGY_OUT_FILE" 2>/dev/null)"; then
+    AGY_FAIL="unparseable_output"; return 1
+  fi
+  if [[ "$st" != "ok" ]]; then AGY_FAIL="$st"; return 1; fi
+  # 書き換えていないこと (読み取りだけのはずの worktree が汚れていれば、その結果は信用しない)
+  if ! dirty="$(git -C "$REVIEW_WT" status --porcelain 2>&1)"; then AGY_FAIL="worktree_status_failed"; return 1; fi
+  if [[ -n "$dirty" ]]; then AGY_FAIL="worktree_modified"; return 1; fi
+  jq -c '.structured_output' "$AGY_OUT_FILE" > "$out_to" 2>/dev/null || { AGY_FAIL="unparseable_output"; return 1; }
+  return 0
+}
+
+AGY_COMPARE_NOTE=""   # both: Result に併記する agy (比較用) の節 (判定には使わない)
+case "$REVIEW_ENGINE" in
+  codex) run_codex_review ;;
+  agy)
+    if ! run_agy_review "$OUTPUT_FILE"; then
+      agy_collect_diag
+      fail_needs_director "AGY FAILURE: ${AGY_FAIL} — review not completed reliably (fail-closed; engine=agy model=${AGY_MODEL})${AGY_DIAG:+
+### agy diagnostics (redacted)
+${AGY_DIAG}}"
+    fi
+    ;;
+  both)
+    run_codex_review
+    AGY_CMP_FILE="$(mktemp "${TMPDIR:-/tmp}/kai-review-agy-cmp.XXXXXX")"
+    if run_agy_review "$AGY_CMP_FILE"; then
+      AGY_COMPARE_NOTE="$(cat "$AGY_CMP_FILE")"
+    else
+      agy_collect_diag
+      AGY_COMPARE_NOTE="(agy failed: ${AGY_FAIL} — not used for the verdict)${AGY_DIAG:+
+${AGY_DIAG}}"
+    fi
+    rm -f "$AGY_CMP_FILE"
+    ;;
+esac
 
 # --- 出力ファイル確認 (P2 fix, PR#180 Seo review) ---
 # OUTPUT_FILE は F3 で mktemp 導入済みのため、`-f` (存在するか) だけでは
@@ -860,9 +951,16 @@ RESULT_FILE="$(mktemp "${TMPDIR:-/tmp}/kai-review-result.XXXXXX")"
       || echo "(findings could not be formatted — see the raw output below)"
     echo ""
   fi
-  echo "### Codex raw output"
+  # 見出しは旧 (codex のみ) と揃える: codex / both = "Codex raw output"、agy = "agy raw output"
+  if [[ "$REVIEW_ENGINE" == agy ]]; then echo "### agy raw output"; else echo "### Codex raw output"; fi
   echo ""
   printf '%s\n' "$REVIEW_CONTENT"
+  if [[ "$REVIEW_ENGINE" == "both" ]]; then
+    echo ""
+    echo "### agy (比較用 — 判定は Codex。model=${AGY_MODEL})"
+    echo ""
+    printf '%s\n' "$AGY_COMPARE_NOTE"
+  fi
 } > "$RESULT_FILE"
 
 if [[ $DRY_RUN -eq 1 ]]; then

@@ -169,6 +169,9 @@ _QUEUE_SIDE = "(Q) queue 側 (registry/daemons の外)。t026 では移してい
 
 ALLOWED_JSON_PARSES: dict[tuple[str, str, str], str] = {
     # -- (E) herdr の応答 -----------------------------------------------------
+    ("lib_review_engine.py", "diagnose", "json.loads(raw_out)"):
+        _EXTERNAL_RESPONSE + "失敗した agy の stdout (診断用に status / denied_actions を読むだけ)。"
+        "デーモン側状態ストア (registry/daemons) のファイルではない。壊れていれば診断に出さないだけ (ValueError を捕まえる)",
     ("lib_mux.py", "_herdr_ping", "json.loads(data.decode().strip())"):
         _EXTERNAL_RESPONSE + "herdr socket の ping 応答。壊れていれば「応答なし」と読む",
     ("lib_mux.py", "_herdr_run", "json.loads(r.stdout)"):

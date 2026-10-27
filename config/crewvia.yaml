@@ -212,6 +212,17 @@ escalation:
 attempts:
   max_total: 6
 
+# ===== レビュー先（scripts/kai-review.sh） =====
+# engine: codex（既定。今までと同じ）/ agy（Antigravity CLI + Gemini。サブスクのログインのまま・API キーなし）/
+#         both（判定は codex。agy の findings は Result に「agy (比較用)」として併記）。
+# env CREWVIA_REVIEW_ENGINE が engine だけを上書きする。値が不正・config が読めないときは codex に倒さず needs-director。
+# agy は fail-closed: exit 非 0 / status が SUCCESS 以外 / structured_output が無い / denied_actions がある / worktree が汚れた → needs-director。
+# 設計・実測: knowledge/agy-review.md
+review:
+  engine: codex
+  agy_model: gemini-4-argon-high
+  agy_timeout_seconds: 600
+
 # ===== Telegram（Director の質問・ボタン・受信。任意） =====
 # Director がユーザーに選択肢つきの質問を Telegram で送り、ボタンの答えを Director の画面に届ける
 # （scripts/ask_user.sh。設計: knowledge/director-escalation-telegram.md）。

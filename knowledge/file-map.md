@@ -295,7 +295,9 @@ Codex reviewer (Kai-codex) 起動ラッパー。詳細は `knowledge/codex-revie
 差分が 300KB 超なら拒否記録を書いてから `needs-director`（上の dispatcher.sh）。
 `--mission` を省略した呼び出しは、**pull の前に** `plan.sh resolve-mission` で
 実効 mission を 1 度だけ解決して全部に使う（記録名に mission が要るので、
-空だと記録が書かれず再 spawn ループが戻る）
+空だと記録が書かれず再 spawn ループが戻る）。
+レビュー先は `config/crewvia.yaml` の `review.engine`（codex / agy / both。既定 codex）。agy は fail-closed。
+読み口は `lib_review_engine.py`。詳細は `knowledge/agy-review.md`
 
 ### `taskvia-sync.sh`
 

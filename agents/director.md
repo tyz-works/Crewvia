@@ -222,7 +222,7 @@ Dispatcher から通知を受け取る:
 ./scripts/plan.sh archive 20260411-auth-refactor
 ```
 
-**Director が直接使うサブコマンド**: `init` / `add` / `update` / `release-dep` / `retire` / `status` / `archive` / `lint`。
+**Director が直接使うサブコマンド**: `init` / `add` / `update` / `release-dep` / `retire` / `retry` / `reopen` / `history` / `status` / `archive` / `lint`。
 全サブコマンド一覧は `./scripts/plan.sh` を引数無しで実行すると出る（増減したら都度そちらが正）。
 `pull` / `done` / `needs-director` / `fail` は Worker が使うもので、Director が直接呼ぶことはない。
 `reap-orphan-assignment` は dispatcher が Kai-codex 専用に自動で呼ぶ（B3。§12「codex-review skill task の積み方」参照）。
@@ -306,13 +306,37 @@ required_evidence:
 
 - Worker が `plan.sh needs-director <task_id> "<理由>" --execution <ex-…>` を呼ぶと、タスクは `needs_director` 状態になる
 - `plan.sh status` で 🆘 アイコンとともに表示される
-- Director は reason を読んで対処方針を決定し、`plan.sh update <task_id> --status pending --reset` で差し戻す
+- Director は reason を読んで対処方針を決定し、理由を次の試行に渡したいなら `plan.sh retry`（下の「差し戻しと指摘の修正」）、理由が要らないなら `plan.sh update <task_id> --status pending --reset` で差し戻す
   （`--status in_progress --reset` は罠 — `--reset` の適用後に `--status` が上書きするため、最終状態が `status=in_progress / worker=null` になり dispatch 不能・pull 拒否のまま静かに全停止する。`--status pending` にすること）
 - 後続タスクの `blocked_by` は **解除されない**（needs_director は TERMINAL_STATUSES に含まれない）
 - `plan.sh needs-director` は呼んだ Worker の `queue/assignments/<name>` を撤去する（`done` / `fail` と同じ）。
   **手で `rm queue/assignments/Kai-codex` する必要は無い** — 以前は残って以後の codex-review を止めていた。
   判断待ちの Worker は card の `worker` で「仕事あり」と読まれるので、dispatcher に退役されず、新しい task も
   渡されない（`knowledge/daemon-authority.md` §7-16）
+
+### 差し戻しと指摘の修正: `retry` / `reopen`（vNext 02。設計 `knowledge/vnext-02-attempt-reopen-checkpoint.md`）
+
+**先に考えるのは新 task ではなく retry / reopen**。同じ task の次の試行として開けば、前の Result・理由・checkpoint が次の Worker の `pull` に `previous_attempt` で渡る（Worker は作業前にそれを読む。`agents/worker.md`）。新 task にすると渡らない。
+
+| 場面 | 使うもの |
+|---|---|
+| failed / needs_director / needs_human_review / verification_failed の task に**理由つき**で再挑戦させる | `plan.sh retry <id> --reason "<理由>" --mission <slug>`（理由は台帳 `plan.sh history <id>` に残り、次の pull の `previous_attempt.retry_reason`） |
+| 理由が要らない差し戻し・壊れた card の出口・pull 前に落ちた予約 | `plan.sh update <id> --status pending --reset`（従来どおり。台帳に理由が残らない） |
+| done / verified の**実装 task**に Codex・QA の指摘を直させる | `plan.sh reopen <impl> --reason "<指摘の要約>" --branch reuse --cascade reviews --mission <slug>` |
+
+`reopen` の挙動（実装 `lib_task_controller.py` / `scripts/CLAUDE.md`「reopen と下流の無効化」で確認）:
+- 実装 task が pending に戻り、`blocked_by` が付いたままの review / QA は**依存で待つ**。fix task を足して `blocked_by` を後から付け替える必要は無い（再確認が fix より先に pull される事故も起きない）。実装が再び done になれば、同じ PR 番号のまま review・QA が pull できる。
+- `--cascade reviews`（既定）は、下流のうち skills に `codex-review` / `review` / `qa` を持つ done / verified の task を pending に戻す。経路の中間 task（実装 → 非レビュー → review）も一緒に戻る。`all` は全部、`none` は何も戻さない。対象外の完了済み下流は出力に「古い結果に基づく下流」として並ぶので、要るかどうか判断する。
+- **needs_director の codex-review task は戻らない**（戻るのは done / verified と、実行中の下流だけ）。pending のまま待つ扱いなので、実装が再 done になる前後に Director が `plan.sh retry <review-id> --reason "…"` で開ける。reopen の前に片付ける必要は無いが、忘れると mission が止まる。
+- **実行中の QA / review が下流にいる**（in_progress / 検証待ち / 検証中）: `--cascade none` は `CASCADE_ACTIVE_DOWNSTREAM` で拒否（exit 3・何も書かない）。`reviews` / `all` では、その試行を `RESET_BY_DIRECTOR` で閉じて pending に戻す（古い実装の上の作業だから）。Worker の次の報告は `EXECUTION_NOT_CURRENT` / `ALREADY_TERMINAL` で断られるので、止まっている Worker を待たない。
+- 実装 task 自身の試行が実行中なら `ATTEMPT_ACTIVE`。経路上に skipped / failed があれば `CASCADE_SKIPPED_ON_PATH` / `CASCADE_FAILED_ON_PATH`（先に `retry` 等で片付ける）。archive 済み mission は `MISSION_ARCHIVED`。拒否は全部 exit 3 で何も書かない。
+- **PR が merge 済みの task は reopen しない**。`--branch reuse` は未 merge の同じ branch・PR を使う前提で、merge 済みかを plan.sh は調べない（Director が `gh pr view` で確かめてから打つ。`--branch reuse` は必須）。merge 済みなら新 task を足す。
+- **総試行数の上限**: `execution_count` が `attempts.max_total`（`config/crewvia.yaml`。既定 6。card の `max_attempts` が優先）に達していると `retry` / `reopen` は `ATTEMPT_CAP`（下流を戻すときは戻される各 task にも効く）。本当に続けたいときだけ `--over-cap "<理由>"`（理由は台帳に残る）。Codex の巡が 6 を超えそうなら、先に指摘の系統を塞ぐ（巡を重ねる前に設計を見直す）か、`--over-cap` を理由つきで使う。
+- 途中で止まった reopen は同じコマンドの再実行で完了する（未完の間は `update` / `add` / `retry` / `release-dep` が `REOPEN_INTENT_GRAPH_FROZEN` で拒否される）。
+
+**新 task を足すほうがよい場面**: 修正が**別の PR** になる（merge 済みの PR への追従を含む）／元の task と範囲が違う（別の deliverable・別の skills・別のファイル群）／元の task の Result を書き換えたくない（監査上、完了した作業の記録を残したい）／上限に達していて続ける理由が無い。
+
+> 現状の `[needs_director]` / 段階上げの通知文は `update --reset` だけを案内する。通知を見ても、理由を渡したいなら上の表で `retry` を先に考える（通知文の更新は未対応）。
 
 ### ⚠️ Worker への指示で「task ファイルの直接編集」を促さないこと (t015)
 

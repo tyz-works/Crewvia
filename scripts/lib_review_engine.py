@@ -129,8 +129,10 @@ def load_full(config_path, environ=None):
     compare = list(DEFAULT_COMPARE)
     if 'compare' in block:
         c = block['compare']
-        if (not isinstance(c, list) or not c or len(set(c)) != len(c)
-                or any(not isinstance(x, str) or x not in COMPARE_ENGINES for x in c)):
+        # 要素の型を先に見る (`[[agy]]` 等の unhashable を set() に渡すと TypeError で落ちる)
+        if (not isinstance(c, list) or not c
+                or any(not isinstance(x, str) or x not in COMPARE_ENGINES for x in c)
+                or len(set(c)) != len(c)):
             raise ReviewConfigError('bad_compare')
         compare = c
 
@@ -181,6 +183,9 @@ class CursorOutputError(Exception):
         self.code = code
 
 
+_FINDINGS_START_RE = re.compile(r'\{\s*"findings"\s*:')
+
+
 def extract_cursor_findings(out_text, schema):
     """cursor-agent の stdout 全文 → schema 準拠の findings dict。だめなら `CursorOutputError(固定コード)`。"""
     try:
@@ -197,19 +202,17 @@ def extract_cursor_findings(out_text, schema):
     if not isinstance(result, str):
         raise CursorOutputError('no_findings_json')
     dec = json.JSONDecoder()
-    marker = '{"findings"'
-    pos = result.find(marker)
     schema_failed = False
-    while pos != -1:
+    # 整形された JSON (`{\n  "findings": [...]}`) も拾う: `{` 空白 `"findings"` 空白 `:` の位置から読む
+    for m in _FINDINGS_START_RE.finditer(result):
         try:
-            obj, end = dec.raw_decode(result, pos)
+            obj, end = dec.raw_decode(result, m.start())
         except ValueError:
-            obj = None
-        if obj is not None and result[end:].strip().strip('`').strip() == '':
+            continue
+        if result[end:].strip().strip('`').strip() == '':
             if _schema_ok(obj, schema):
                 return obj
             schema_failed = True
-        pos = result.find(marker, pos + 1)
     raise CursorOutputError('schema_invalid' if schema_failed else 'no_findings_json')
 
 

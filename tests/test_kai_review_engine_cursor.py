@@ -47,6 +47,9 @@ case "$CURSOR_MODE" in
   extra)     envelope '{"findings":[],"verdict":"ok"}' ;;
   garbage)   echo 'not json' ;;
   dirty)     echo x > injected.txt; envelope "$CURSOR_FINDINGS" ;;
+  dirty_fail) echo x > injected.txt; exit 3 ;;
+  escape)    for d in "$TMPDIR"/kai-review-wt.*; do echo x > "$d/escaped.txt"; done; envelope "$CURSOR_FINDINGS" ;;
+  pretty)    envelope "結果です。"$'\n'"$(printf '%s' "$CURSOR_FINDINGS" | python3 -m json.tool --indent 2)" ;;
 esac
 '''
 
@@ -111,7 +114,8 @@ def test_compare_lists_are_read(tmp_path, value, expected):
     assert lre.load_full(cfg, environ={})["compare"] == expected
 
 
-@pytest.mark.parametrize("value", ["[]", "[codex]", "[both]", "[agy, agy]", "agy", "[1]", "", "null", "[agy, gemini]"])
+@pytest.mark.parametrize("value", ["[]", "[codex]", "[both]", "[agy, agy]", "agy", "[1]", "", "null", "[agy, gemini]",
+                                   "[[agy]]", "[{a: 1}]", "[[agy], agy]"])
 def test_bad_compare_is_an_error(tmp_path, value):
     cfg = tmp_path / "c.yaml"
     cfg.write_text(f"review:\n  engine: both\n  compare: {value}\n")
@@ -162,6 +166,15 @@ def test_extract_takes_the_trailing_findings_json(result):
     assert lre.extract_cursor_findings(_envelope(result), SCHEMA) == {"findings": []}
 
 
+@pytest.mark.parametrize("result", [
+    '前置き\n{\n  "findings": []\n}', '{ "findings" : [] }', 'x\n```json\n{\n\t"findings": []\n}\n```\n',
+    '{"findings" ...} は最後に出します。\n{\n  "findings": []\n}',
+])
+def test_extract_accepts_pretty_printed_json(result):
+    """整形された JSON (`{` の後に改行・空白) も取り出す (Codex #313 r1 P2)。"""
+    assert lre.extract_cursor_findings(_envelope(result), SCHEMA) == {"findings": []}
+
+
 @pytest.mark.parametrize("out,code", [
     ("not json", "unparseable_output"), ("[1]", "unparseable_output"),
     (_envelope('{"findings":[]}', is_error=True), "is_error"),
@@ -198,12 +211,12 @@ def test_cursor_clean_review_is_done_with_read_only_flags(tmp_path, monkeypatch)
     assert "review.diff" in "\n".join(prompt) and not any(a.startswith("--") for a in prompt[:1])
     assert "Do not run commands" in "\n".join(prompt)
     assert "+change" not in "\n".join(argv)                          # diff は argv に載せない
-    assert "kai-review-wt." in (tmp_path / "cursor_cwd.txt").read_text()
+    assert "kai-review-cursor-wt." in (tmp_path / "cursor_cwd.txt").read_text()   # REVIEW_WT ではない専用の worktree
     assert "### cursor raw output" in _result(capture, "done")
-    assert not list(tmp_path.glob("kai-review-cursor*"))              # 一時物は後片付けで消える
+    assert not list(tmp_path.glob("kai-review-cursor*"))              # 一時物 (専用 worktree を含む) は後片付けで消える
 
 
-@pytest.mark.parametrize("mode", ["ok", "fenced", "bare"])
+@pytest.mark.parametrize("mode", ["ok", "fenced", "bare", "pretty"])
 def test_cursor_findings_need_director(tmp_path, monkeypatch, mode):
     p, capture = run(tmp_path, monkeypatch, cursor_mode=mode, cursor_findings=CURSOR_P1)
     assert _verdict(tmp_path) == "needs-director", (p.stdout, p.stderr)
@@ -399,3 +412,33 @@ def test_cursor_does_not_run_when_the_pr_adds_a_symlink(tmp_path, monkeypatch, n
     assert _verdict(tmp_path) == "needs-director", (p.stdout, p.stderr)
     assert any("CURSOR FAILURE: pr_changes_agent_config" in c for c in _calls(tmp_path)), _calls(tmp_path)
     assert not (tmp_path / "cursor_argv.txt").exists()
+
+
+# --- cursor は専用の使い捨て worktree で走る (Codex #313 r1 P1) ---
+
+@pytest.mark.parametrize("mode", ["dirty", "dirty_fail"])
+def test_both_cursor_dirtying_its_worktree_does_not_reach_codex(tmp_path, monkeypatch, mode):
+    """cursor が自分の checkout を書き換えても (成功・途中失敗とも)、codex / agy の REVIEW_WT は汚れない。"""
+    p, capture = run(tmp_path, monkeypatch, engine="both", extra_config="  compare: [agy, cursor]\n", cursor_mode=mode)
+    assert _verdict(tmp_path) == "done", (p.stdout, p.stderr)               # 判定は codex のまま
+    text = _result(capture, "done")
+    assert "cursor failed: " in text
+    agy_cwd = (tmp_path / "agy_cwd.txt").read_text().strip()
+    cursor_cwd = (tmp_path / "cursor_cwd.txt").read_text().strip()
+    assert "kai-review-wt." in agy_cwd and "kai-review-cursor-wt." in cursor_cwd and agy_cwd != cursor_cwd
+    assert not list(tmp_path.glob("kai-review-cursor*"))                      # 専用 worktree は消えている
+
+
+def test_both_cursor_writing_into_the_review_worktree_stops_the_review(tmp_path, monkeypatch):
+    """専用 worktree の外 (REVIEW_WT) を書き換えられたら、codex に汚れた木を読ませず needs-director。"""
+    p, capture = run(tmp_path, monkeypatch, engine="both", extra_config="  compare: [cursor]\n", cursor_mode="escape")
+    assert _verdict(tmp_path) == "needs-director", (p.stdout, p.stderr)
+    assert any("REVIEW WORKTREE MODIFIED" in c for c in _calls(tmp_path)), _calls(tmp_path)
+    assert not (capture / "done.txt").exists()
+
+
+def test_cursor_engine_dirty_worktree_is_removed_after_failure(tmp_path, monkeypatch):
+    p, capture = run(tmp_path, monkeypatch, cursor_mode="dirty_fail")
+    assert _verdict(tmp_path) == "needs-director", (p.stdout, p.stderr)
+    assert any("CURSOR FAILURE: exit_3" in c for c in _calls(tmp_path)), _calls(tmp_path)
+    assert not list(tmp_path.glob("kai-review-cursor*"))

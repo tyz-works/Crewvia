@@ -286,9 +286,17 @@ AGY_ERR_FILE=""
 CURSOR_DIFF_DIR=""       # cursor-agent に読ませる diff の一時 dir (agy と同じく worktree の外)
 CURSOR_OUT_FILE=""
 CURSOR_ERR_FILE=""
+CURSOR_WT=""             # cursor-agent 専用の使い捨て worktree (REVIEW_WT は codex / agy が読むので cursor に触らせない)
 RESULT_FILE=""           # card に全文を残す Result / 理由のファイル (plan.sh が読んだ後に消す)
 FETCH_LOCAL_REF=""
 BASE_FETCH_LOCAL_REF=""  # t006: origin/main を都度 fetch する一時 ref (下記参照)
+
+cursor_drop_wt() {
+  if [[ -n "$CURSOR_WT" && -d "$CURSOR_WT" ]]; then
+    git -C "${WORK_DIR:-$REPO_ROOT}" worktree remove --force "$CURSOR_WT" 2>/dev/null || rm -rf "$CURSOR_WT"
+  fi
+  CURSOR_WT=""
+}
 
 cleanup() {
   if [[ -n "$OUTPUT_FILE" ]]; then
@@ -306,6 +314,7 @@ cleanup() {
   [[ -n "$CURSOR_OUT_FILE" ]] && rm -f "$CURSOR_OUT_FILE"
   [[ -n "$CURSOR_ERR_FILE" ]] && rm -f "$CURSOR_ERR_FILE"
   [[ -n "$CURSOR_DIFF_DIR" ]] && rm -rf "$CURSOR_DIFF_DIR"
+  cursor_drop_wt
   if [[ -n "$REVIEW_WT" && -d "$REVIEW_WT" ]]; then
     git -C "${WORK_DIR:-$REPO_ROOT}" worktree remove --force "$REVIEW_WT" 2>/dev/null \
       || rm -rf "$REVIEW_WT"
@@ -647,9 +656,17 @@ cursor_collect_diag() {
   CURSOR_DIAG="$(python3 "${SCRIPT_DIR}/lib_review_engine.py" diagnose --engine cursor --out "$CURSOR_OUT_FILE" --err "$CURSOR_ERR_FILE" 2>/dev/null)" \
     || CURSOR_DIAG="(diagnostics unavailable)"
 }
+# cursor は専用の使い捨て worktree (PR head と同じ commit) で走らせ、終わったら成否を問わず消す。
+# REVIEW_WT で走らせると、書き換え・途中失敗の汚れを both の codex / agy がそのまま読む (Codex #313 r1 P1)。
 run_cursor_review() {
-  local out_to="$1" rc=0 findings
+  local rc=0
   CURSOR_FAIL=""
+  _run_cursor_review "$@" || rc=1
+  cursor_drop_wt
+  return $rc
+}
+_run_cursor_review() {
+  local out_to="$1" rc=0 findings
   if ! command -v cursor-agent &>/dev/null; then CURSOR_FAIL="cursor_agent_not_found"; return 1; fi
   # --trust はレビュー用 worktree (PR の中身) を信頼する。
   # (1) Cursor の設定 (.cursor/ = MCP・権限・hook・rules、.cursorrules) が木のどこかにあれば走らせない (symlink も ls-files に出る)
@@ -680,6 +697,10 @@ run_cursor_review() {
   [[ -n "$CURSOR_ERR_FILE" ]] || CURSOR_ERR_FILE="$(mktemp "${TMPDIR:-/tmp}/kai-review-cursor-err.XXXXXX")"
   printf '%s' "$DIFF_CONTENT" > "${CURSOR_DIFF_DIR}/review.diff" || { CURSOR_FAIL="diff_write_failed"; return 1; }
   : > "$CURSOR_OUT_FILE"; : > "$CURSOR_ERR_FILE"
+  CURSOR_WT="$(mktemp -d "${TMPDIR:-/tmp}/kai-review-cursor-wt.XXXXXX")"
+  if ! git -C "$WORK_DIR" worktree add --detach "$CURSOR_WT" "$FETCH_LOCAL_REF" >/dev/null 2>&1; then
+    CURSOR_FAIL="worktree_create_failed"; return 1
+  fi
   local prompt
   prompt="${REVIEW_PROMPT//the <stdin> block below/the file ${CURSOR_DIFF_DIR}/review.diff}"
   prompt="${prompt}
@@ -688,7 +709,7 @@ Read the unified diff from the file ${CURSOR_DIFF_DIR}/review.diff (it is outsid
 You may read files in this checkout to verify the code. Do not run commands. Do not create or modify any file.
 Your final message must END with the JSON object required by the schema (starting with {\"findings\"), with nothing after it."
   _info "Running cursor-agent --mode plan --model ${CURSOR_MODEL} (diff=${DIFF_BYTES} bytes, timeout=${CURSOR_TIMEOUT}s) ..."
-  ( cd "$REVIEW_WT" && timeout "${CURSOR_TIMEOUT}s" cursor-agent -p --model "$CURSOR_MODEL" --mode plan --trust \
+  ( cd "$CURSOR_WT" && timeout "${CURSOR_TIMEOUT}s" cursor-agent -p --model "$CURSOR_MODEL" --mode plan --trust \
       --output-format json --add-dir "$CURSOR_DIFF_DIR" "$prompt" ) >"$CURSOR_OUT_FILE" 2>"$CURSOR_ERR_FILE" || rc=$?
   if [[ $rc -eq 124 ]]; then CURSOR_FAIL="timeout"; return 1; fi
   if [[ $rc -ne 0 ]]; then CURSOR_FAIL="exit_${rc}"; return 1; fi
@@ -697,7 +718,7 @@ Your final message must END with the JSON object required by the schema (startin
     CURSOR_FAIL="${findings:-unparseable_output}"; CURSOR_FAIL="${CURSOR_FAIL%%$'\n'*}"; return 1
   fi
   local dirty
-  if ! dirty="$(git -C "$REVIEW_WT" status --porcelain 2>&1)"; then CURSOR_FAIL="worktree_status_failed"; return 1; fi
+  if ! dirty="$(git -C "$CURSOR_WT" status --porcelain 2>&1)"; then CURSOR_FAIL="worktree_status_failed"; return 1; fi
   if [[ -n "$dirty" ]]; then CURSOR_FAIL="worktree_modified"; return 1; fi
   printf '%s\n' "$findings" > "$out_to" || { CURSOR_FAIL="unparseable_output"; return 1; }
   return 0
@@ -758,7 +779,13 @@ ${CURSOR_DIAG}}"
     fi
     ;;
   both)
-    compare_has cursor && run_compare_engine cursor   # 先に (他 engine の出力がまだ無いうちに)
+    if compare_has cursor; then
+      run_compare_engine cursor   # 先に (他 engine の出力がまだ無いうちに)
+      # cursor は worktree の外も書けうる。codex / agy が読む REVIEW_WT が汚れていたら判定しない
+      if ! _rw_dirty="$(git -C "$REVIEW_WT" status --porcelain 2>&1)" || [[ -n "$_rw_dirty" ]]; then
+        fail_needs_director "REVIEW WORKTREE MODIFIED: the codex review worktree was not clean after the cursor comparison run — review not completed reliably (fail-closed; engine=both)"
+      fi
+    fi
     run_codex_review
     compare_has agy && run_compare_engine agy
     ;;

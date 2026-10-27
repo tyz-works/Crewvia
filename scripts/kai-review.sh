@@ -562,7 +562,8 @@ PROMPT_EOF
 )"
 
 # --- レビュー先の解決 (t080) ---
-# `config/crewvia.yaml` の review.engine (codex|agy|cursor|both。既定 codex = 今までと同じ) と env CREWVIA_REVIEW_ENGINE。
+# `config/crewvia.yaml` の review.engine (codex|agy|both。既定 codex = 今までと同じ) と env CREWVIA_REVIEW_ENGINE。
+# cursor は判定に使わない (engine: cursor は lib が bad_engine で拒否)。both の review.compare にだけ置ける (knowledge/cursor-review.md)。
 # 読めない・値が不正なら既定に倒さず止める (agy を選んだつもりが codex になるのを防ぐ)。読み口は lib_review_engine.py の 1 か所。
 if ! REVIEW_CFG="$(python3 "${SCRIPT_DIR}/lib_review_engine.py" get \
       --config "${CREWVIA_REPO_ROOT:-$REPO_ROOT}/config/crewvia.yaml" 2>&1)"; then
@@ -571,7 +572,7 @@ fi
 { IFS= read -r REVIEW_ENGINE; IFS= read -r AGY_MODEL; IFS= read -r AGY_TIMEOUT
   IFS= read -r CURSOR_MODEL; IFS= read -r CURSOR_TIMEOUT; IFS= read -r REVIEW_COMPARE; } <<<"$REVIEW_CFG"
 _info "Review engine: ${REVIEW_ENGINE}"
-if [[ "$REVIEW_ENGINE" != agy && "$REVIEW_ENGINE" != cursor ]] && ! command -v codex &>/dev/null; then
+if [[ "$REVIEW_ENGINE" != agy ]] && ! command -v codex &>/dev/null; then
   fail_needs_director "NEEDS FIX: codex command not found on this machine"
 fi
 
@@ -645,6 +646,7 @@ Return only the JSON object required by the schema."
 }
 
 # --- cursor (Cursor CLI: cursor-agent) 実行 ---
+# **比較専用** (both の compare からだけ呼ぶ。判定には使わない: 外を読む・出力の schema を強制できない。knowledge/cursor-review.md)。
 # Cursor のサブスクのログインのまま (API キーなし)。--mode plan (読み取り専用)・**--force / --yolo / --approve-mcps / --sandbox disabled は使わない**。
 # `--json-schema` が無いので、result の自由文の末尾の JSON を lib_review_engine.py extract-cursor が取り出して schema で検証する。
 # タイムアウトのフラグが無いので timeout で包む。prompt は位置引数で最後。diff は argv に載せず worktree の外の一時 dir (--add-dir)。
@@ -788,14 +790,6 @@ case "$REVIEW_ENGINE" in
       fail_needs_director "AGY FAILURE: ${AGY_FAIL} — review not completed reliably (fail-closed; engine=agy model=${AGY_MODEL})${AGY_DIAG:+
 ### agy diagnostics (redacted)
 ${AGY_DIAG}}"
-    fi
-    ;;
-  cursor)
-    if ! run_cursor_review "$OUTPUT_FILE"; then
-      cursor_collect_diag
-      fail_needs_director "CURSOR FAILURE: ${CURSOR_FAIL} — review not completed reliably (fail-closed; engine=cursor model=${CURSOR_MODEL})${CURSOR_DIAG:+
-### cursor diagnostics (redacted)
-${CURSOR_DIAG}}"
     fi
     ;;
   both)
@@ -1112,10 +1106,6 @@ RESULT_FILE="$(mktemp "${TMPDIR:-/tmp}/kai-review-result.XXXXXX")"
   fi
   # 見出しは旧 (codex のみ) と揃える: codex / both = "Codex raw output"、agy = "agy raw output"
   if [[ "$REVIEW_ENGINE" == agy ]]; then echo "### agy raw output"
-  elif [[ "$REVIEW_ENGINE" == cursor ]]; then
-    echo "### cursor raw output"
-    echo ""
-    echo "> 注意: cursor-agent は --mode plan / --sandbox でも worktree の外のファイルを読める (knowledge/cursor-review.md)。"
   else echo "### Codex raw output"; fi
   echo ""
   printf '%s\n' "$REVIEW_CONTENT"

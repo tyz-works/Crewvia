@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""scripts/lib_review_engine.py — kai-review.sh のレビュー先 (codex / agy / cursor / both) の設定の読み口。
+"""scripts/lib_review_engine.py — kai-review.sh のレビュー先 (codex / agy / both + 比較用の cursor) の設定の読み口。
 
 `config/crewvia.yaml` の `review:` ブロック（`engine` / `agy_model` / `agy_timeout_seconds` /
 `cursor_model` / `cursor_timeout_seconds` / `compare`）を、
@@ -10,6 +10,9 @@
 - **config が読めない・値が不正 = 既定に倒さず止める**（exit 1・stderr に固定コード）。
   engine を黙って codex に戻すと、agy を選んだつもりのレビューが別物になる。
 - `compare` は `both` のときに判定（Codex）の横に併記するエンジンの一覧（agy / cursor の部分集合・空と重複は不正）。既定 `[agy]` = 従来の `both` と同じ。
+- **cursor は比較専用**（Codex #313 r5 の後の Director の方針）。`engine: cursor`（config・env とも）は `bad_engine` / `bad_engine_env` で拒否する。
+  cursor-agent は worktree の外を読み（`--sandbox` でも止まらない）、出力の schema を強制できない（自由文から JSON を拾う）ので、
+  判定に使うと誤読が LGTM になりうる。`compare` に置くだけなら誤読しても併記が狂うだけ。
 - cursor_model は `claude-fable-*`（Cursor の一覧で NO ZDR = データ保持の契約外）を拒否する。括弧付きパラメータ `[a=b,c=d]` は許す。
 - CLI: `lib_review_engine.py get --config <path>` が 6 行（engine / agy_model / agy_timeout_seconds /
   cursor_model / cursor_timeout_seconds / compare をカンマ区切り）を stdout に出す。
@@ -37,7 +40,7 @@ try:
 except ImportError:  # pragma: no cover — PyYAML が無いとき review: があれば止める (下記)
     yaml = None
 
-ENGINES = ('codex', 'agy', 'cursor', 'both')
+ENGINES = ('codex', 'agy', 'both')     # cursor は判定に使わない (COMPARE_ENGINES にだけ置ける)
 COMPARE_ENGINES = ('agy', 'cursor')
 DEFAULT_COMPARE = ('agy',)
 DEFAULT_ENGINE = 'codex'
@@ -157,6 +160,7 @@ def load(config_path, environ=None):
 # --- cursor-agent の出力から findings を取り出す (fail-closed) ---
 # stdout は JSON 1 個 {"type":"result","subtype":"success","is_error":false,"result":"<自由文>",...}。
 # `--json-schema` が無いので result は前置きの文 + JSON。末尾の JSON (後ろが空白か ``` だけ) を findings として読み、schema で検証する。
+# 抽出は best effort (cursor は比較専用で判定に使わないので、誤読しても併記が狂うだけ)。重複キーだけは安いので拒否する。
 
 def _schema_ok(value, schema):
     t = schema.get('type')
@@ -182,6 +186,15 @@ class CursorOutputError(Exception):
     def __init__(self, code):
         super().__init__(code)
         self.code = code
+
+
+def _no_duplicate_keys(pairs):
+    # 同じキーが 2 回あると json は後勝ちで黙って読む (`{"findings":[P1],"findings":[]}` が空になる)。読まずに止める。
+    # ValueError ではない例外にする: raw_decode の「読めない候補」として飛ばされて後ろの候補を採らないように
+    keys = [k for k, _ in pairs]
+    if len(set(keys)) != len(keys):
+        raise CursorOutputError('duplicate_key')
+    return dict(pairs)
 
 
 _FINDINGS_START_RE = re.compile(r'\{\s*"findings"\s*:')
@@ -217,7 +230,7 @@ def _brace_span_end(text, start):
 def extract_cursor_findings(out_text, schema):
     """cursor-agent の stdout 全文 → schema 準拠の findings dict。だめなら `CursorOutputError(固定コード)`。"""
     try:
-        doc = json.loads(out_text)
+        doc = json.loads(out_text, object_pairs_hook=_no_duplicate_keys)
     except ValueError:
         raise CursorOutputError('unparseable_output')
     if not isinstance(doc, dict):
@@ -229,7 +242,7 @@ def extract_cursor_findings(out_text, schema):
     result = doc.get('result')
     if not isinstance(result, str):
         raise CursorOutputError('no_findings_json')
-    dec = json.JSONDecoder()
+    dec = json.JSONDecoder(object_pairs_hook=_no_duplicate_keys)
     # 整形された JSON (`{\n  "findings": [...]}`) も拾う: `{` 空白 `"findings"` 空白 `:` の位置から読む。
     # 採るのは単独の末尾の JSON だけ (Codex #313 r4): 候補の内側の候補は試さない。読めない候補は括弧の
     # 対応で範囲を決めて飛ばし、閉じなければ止める (壊れた外側の中の `{"findings":[]}` を拾うと P1 が空 findings になる)

@@ -239,12 +239,21 @@ def record_problem(data):
     return None
 
 
+def _unknown_without_breakdown(record):
+    """内訳を出せない unknown (gh の失敗・timeout・形の違い = `reason` つき、または PR / head が無い)。
+    gh が成功して check の一部が未知の状態だっただけの unknown は内訳を出す (#314 r3: 「(unknown)」だけにすると
+    ✓5 ⏳1 のような分かっている内訳まで捨てる)。"""
+    if record.get('state') != 'unknown':
+        return False
+    return bool(record.get('reason')) or not record.get('pr') or not record.get('head')
+
+
 def format_line(record, now):
     """表示用の 1 行 (plan.sh status・通知)。`no_pr` は None (出さない)。古ければ「(n 分前)」。"""
     if record is None or record.get('state') == 'no_pr':
         return None
     age = now - record['observed_at']
-    if record['state'] == 'unknown':
+    if _unknown_without_breakdown(record):
         pr = f"PR #{record['pr']} " if record.get('pr') else ''
         reason = record.get('reason') or 'unknown'
         line = f"CI {pr}unknown ({reason})"
@@ -261,7 +270,7 @@ def task_graph_ci(record):
     if record is None or record.get('state') == 'no_pr':
         return None
     state = record['state']
-    if state == 'unknown':
+    if _unknown_without_breakdown(record):
         return {'state': 'unknown', 'summary': f"CI {('PR #%d ' % record['pr']) if record.get('pr') else ''}unknown"}
     return {'state': 'unknown' if state == 'none' else state,
             'summary': summarize(record['pr'], record['head'], record['checks'])}
@@ -404,7 +413,8 @@ def observe_task(task, *, repo_root, branch_of, now, timeout, runner=subprocess.
 
     cwd = task.get('target_dir') or repo_root
     if task.get('target_dir') and not os.path.isdir(cwd):
-        return _unknown(None, 'target_dir_missing', now)
+        # card の PR を入れる (#314 r3: None で書くと読み手の照合で隠れ、poll_cycle も毎サイクル取り直す)
+        return _unknown(card_pr(task.get('pr_number')), 'target_dir_missing', now)
     pr = card_pr(task.get('pr_number'))
     if pr is None:
         branch = branch_of(task)
@@ -481,7 +491,7 @@ def poll_cycle(tasks, *, registry_dir, repo_root, branch_of, poll_seconds=DEFAUL
         except Exception as e:  # noqa: BLE001 — 1 つの task の想定外で他の task を止めない
             if warn:
                 warn(f"ci: observe {t['mission']}/{t['id']} failed: {type(e).__name__}")
-            rec = _unknown(None, 'internal_error', now)
+            rec = _unknown(card_pr(t.get('pr_number')), 'internal_error', now)
         if not write_record(registry_dir, t['mission'], t['id'], rec):
             if warn:
                 warn(f"ci: cannot write {record_path(registry_dir, t['mission'], t['id'])}")

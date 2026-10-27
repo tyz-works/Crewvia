@@ -787,6 +787,11 @@ class WorkerMonitor:
             f"止まっていないか確認してください (max {self.max_threshold}s で終了します)。"
             f"{self._ci_note()}")
 
+    def refresh_card_pr_number(self, task_card: dict) -> None:
+        """毎サイクルの card から `_card_pr_number` を更新する (#314 r3)。作った時点の値のままだと、監視中に
+        done --pr 等で card の pr_number が付いた・変わったとき、別の PR の記録を添えてしまう。"""
+        self._card_pr_number = task_card.get("pr_number")
+
     def _ci_note(self) -> str:
         """dispatcher が記録した PR の CI の 1 行 (lib_ci_status)。無い・読めない・PR 無しは ''。
         **添えるだけ**で、見送り・終了の判定には使わない。"""
@@ -1773,6 +1778,8 @@ def run(repo_root: Path, interval: int) -> None:
             for slug, task_id, meta in active_tasks:
                 key = (slug, task_id)
                 if key in monitors:
+                    # CI の 1 行の照合は今の card の pr_number で (#314 r3。監視の途中で PR が付く・変わる)
+                    monitors[key].refresh_card_pr_number(meta)
                     continue
                 if not should_monitor(meta, retirement, authority):
                     continue

@@ -778,3 +778,98 @@ def test_watchdog_suppression_message_carries_the_ci_line(tmp_path):
     mon3 = watchdog.WorkerMonitor("t001", {"worker": "Ren", "pr_number": 400}, watchdog.PROFILES,
                                   tmp_path, mission_slug="m")
     assert mon3._ci_note() == ""                               # #314 r2: card と違う PR の記録は添えない
+
+
+# ---------------------------------------------------------------------------
+# #314 r3: PR の照合の全読み手・unknown の内訳・unknown の記録の PR
+# ---------------------------------------------------------------------------
+
+#: card の pr_number → 記録 (PR 313) を出すか。読み手 5 者 (status の要約・詳細・tasks.json・watchdog・Rule 5) が同じ答え
+PR_MATCH_TABLE = [(None, True), (313, True), (400, False)]
+
+
+def _set_card_pr(card, pr):
+    text = card.read_text()
+    text = re.sub(r"pr_number: \d+\n", "", text)
+    if pr is not None:
+        text = text.replace("worker: Ren\n", f"worker: Ren\npr_number: {pr}\n")
+    card.write_text(text)
+
+
+@pytest.mark.parametrize("card_pr,shown", PR_MATCH_TABLE)
+def test_every_plan_sh_reader_matches_the_card_pr(plan_tree, card_pr, shown):
+    root, env, tmp = plan_tree
+    _set_card_pr(root / "queue" / "missions" / "m" / "tasks" / "t001.md", card_pr)
+    p = _plan(root, env, "status")                                  # 要約 (_print_mission_summary)
+    assert p.returncode == 0, p.stderr
+    assert bool(re.search(r"🔄 t001 task t001 \(Ren\)\n\s+CI PR #313 ", p.stdout)) is shown, p.stdout
+    d = _plan(root, env, "status", "--mission", "m")                # 詳細 (_print_mission_detail)
+    assert d.returncode == 0, d.stderr
+    lines = d.stdout.splitlines()
+    i = next(n for n, ln in enumerate(lines) if " t001 " in ln)
+    assert lines[i + 1].strip().startswith("CI PR #313 ") is shown
+    g = _plan(root, env, "task-graph")                              # tasks.json
+    assert g.returncode == 0, g.stderr
+    by_id = {t["id"]: t for t in json.loads((tmp / "tasks.json").read_text())["tasks"]}
+    assert ("ci" in by_id["m:t001"]) is shown
+
+
+@pytest.mark.parametrize("card_pr,shown", PR_MATCH_TABLE)
+def test_watchdog_reader_matches_the_card_pr_of_the_current_cycle(tmp_path, card_pr, shown):
+    """#314 r3: monitor を作った時点の card ではなく、毎サイクルの card の pr_number で照合する。"""
+    import watchdog
+    ci.write_record(tmp_path / "registry", "m", "t001", _record(observed=time.time()))
+    mon = watchdog.WorkerMonitor("t001", {"worker": "Ren", "pr_number": 999}, watchdog.PROFILES,
+                                 tmp_path, mission_slug="m")
+    assert mon._ci_note() == ""                                    # 作った時点は別の PR
+    mon.refresh_card_pr_number({"worker": "Ren", "pr_number": card_pr})
+    assert bool(mon._ci_note()) is shown
+
+
+def test_watchdog_main_loop_refreshes_existing_monitors():
+    src = (Path(__file__).resolve().parent.parent / "scripts" / "watchdog.py").read_text()
+    assert ("                if key in monitors:\n"
+            "                    # CI の 1 行の照合は今の card の pr_number で (#314 r3。監視の途中で PR が付く・変わる)\n"
+            "                    monitors[key].refresh_card_pr_number(meta)\n"
+            "                    continue\n") in src
+
+
+@pytest.mark.parametrize("card_pr,shown", PR_MATCH_TABLE)
+def test_rule5_reader_matches_the_card_pr(disp, card_pr, shown):
+    disp["run_ci_poll"]()                                           # card の 313 で記録
+    _set_card_pr(disp["_root"] / "queue" / "missions" / "m" / "tasks" / "t001.md", card_pr)
+    assert bool(disp["ci_line_for"]("m", "t001")) is shown
+
+
+def test_unknown_records_from_a_missing_target_dir_carry_the_card_pr(tmp_path):
+    """#314 r3 [agy]: pr=None で書くと照合で隠れ、poll_cycle も間隔を待たず毎サイクル取り直していた。"""
+    gh = FakeGh()
+    t = task(pr=313, target_dir=str(tmp_path / "gone"))
+    poll(tmp_path, [t], gh, poll_seconds=60)
+    r = ci.read_record(tmp_path, "m", "t001", pr_number=313)
+    assert r is not None and r["pr"] == 313 and r["reason"] == "target_dir_missing"
+    assert ci.format_line(r, NOW) == "CI PR #313 unknown (target_dir_missing)"
+    assert poll(tmp_path, [t], gh, now=NOW + 5, poll_seconds=60) == 0
+    assert ci.read_record(tmp_path, "m", "t001")["observed_at"] == NOW     # 間隔どおり (取り直していない)
+
+
+def test_unknown_records_from_an_internal_error_carry_the_card_pr(tmp_path):
+    def runner(argv, **kw):                       # card に PR があると branch_of は呼ばれないので gh で例外
+        raise RuntimeError("boom")
+    poll(tmp_path, [task(pr=313)], runner, poll_seconds=60)
+    gh = FakeGh()
+    r = ci.read_record(tmp_path, "m", "t001", pr_number=313)
+    assert r is not None and r["pr"] == 313 and r["reason"] == "internal_error"
+    assert poll(tmp_path, [task(pr=313)], gh, now=NOW + 5, poll_seconds=60) == 0 and gh.calls == []
+
+
+def test_unknown_from_unrecognised_check_states_keeps_the_breakdown():
+    """#314 r3 [agy]: gh は成功したが知らない状態の check がある unknown は、分かっている内訳を捨てない。"""
+    rollup = ROLLUP_RUNNING + [run_("odd", status="WEIRD", conclusion=None)]
+    r = _record(rollup=rollup)
+    assert r["state"] == "unknown" and "reason" not in r
+    assert ci.format_line(r, NOW) == "CI PR #313 @086c9f5: ✓5 ⏳1 (pytest 12m) ✗0 ?1"
+    assert ci.task_graph_ci(r) == {"state": "unknown", "summary": "CI PR #313 @086c9f5: ✓5 ⏳1 (pytest) ✗0 ?1"}
+    # gh の失敗の unknown は今までどおり内訳なし
+    assert ci.format_line(_record("unknown"), NOW) == "CI PR #313 unknown (gh_timeout)"
+    assert ci.task_graph_ci(_record("unknown")) == {"state": "unknown", "summary": "CI PR #313 unknown"}

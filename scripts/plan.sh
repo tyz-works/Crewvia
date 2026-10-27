@@ -5531,7 +5531,7 @@ def _print_mission_summary(slug, archived=False):
     for (m, _) in in_prog:
         worker = m.get('worker') or '?'
         print(f"    🔄 {m['id']} {m['title']} ({worker})")
-        ci = ci_status_line(slug, m['id'])
+        ci = ci_status_line(slug, m['id'], m.get('pr_number'))
         if ci:
             print(f"       {ci}")
     for (m, _) in needs_dir:

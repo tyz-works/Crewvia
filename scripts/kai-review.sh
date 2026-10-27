@@ -658,13 +658,16 @@ cursor_collect_diag() {
 }
 # 木の指紋 (追跡・未追跡・ignored の全パス + 各パスの lstat。lib_review_engine.py fingerprint)。
 # `status --porcelain` だけだと ignored (.claude/settings.local.json 等) の書き換えを見ない (Codex #313 r2 P2)。
+# HEAD (rev-parse) も足す (commit・reset で status が空のまま中身が変わる形。Codex #313 r3)。
+# 全 tracked ファイルの走査はしない: cursor は判定の後に走るので、書き換えは比較側の失敗として報告するだけ (knowledge/cursor-review.md)。
 # 実行の前後で比べる。git / python が失敗したら失敗を返す (素通りさせない)
 wt_fingerprint() {
-  local fp
+  local fp head
+  head="$(git -C "$1" rev-parse --verify HEAD 2>/dev/null)" || return 1
   fp="$(set -o pipefail; git -C "$1" status --porcelain=v1 -z --ignored=matching --untracked-files=all 2>/dev/null \
       | python3 "${SCRIPT_DIR}/lib_review_engine.py" fingerprint --root "$1" 2>/dev/null)" || return 1
-  [[ -n "$fp" ]] || return 1
-  printf '%s\n' "$fp"
+  [[ -n "$head" && -n "$fp" ]] || return 1
+  printf '%s %s\n' "$head" "$fp"
 }
 # timeout の SIGTERM を cursor-agent が無視しても待ち続けないよう、この秒数の後に SIGKILL (--kill-after)。
 # 強制終了 (timeout の exit 137) も失敗 (timeout_killed)
@@ -691,15 +694,16 @@ _run_cursor_review() {
       || grep -qE '(^|/)(\.cursor(/|$)|\.cursorrules$|\.cursorignore$)' <<<"$cfg"; then
     CURSOR_FAIL="workspace_has_cursor_config"; return 1
   fi
-  if ! changed="$(git -C "$REVIEW_WT" diff --name-only -z "${DIFF_BASE}...HEAD" 2>/dev/null | tr '\0' '\n')"; then
+  if ! changed="$(git -C "$REVIEW_WT" diff --no-renames --name-only -z "${DIFF_BASE}...HEAD" 2>/dev/null | tr '\0' '\n')"; then
     CURSOR_FAIL="worktree_status_failed"; return 1
   fi
+  # --no-renames: rename 検出だと .claude/ から外へ出した (= base の設定を消した) 元のパスが出ない (agy #313 r3)。
   # 名前が .claude 等で終わる symlink も拾う。PR が足した・変えた symlink は行き先を問わず拒否 (設定の場所へ向けられる)
   if grep -qE '(^|/)(\.(claude|codex|vscode)(/|$)|\.mcp\.json$|AGENTS\.md$)' <<<"$changed"; then
     CURSOR_FAIL="pr_changes_agent_config"; return 1
   fi
   local raw
-  if ! raw="$(git -C "$REVIEW_WT" diff --raw "${DIFF_BASE}...HEAD" 2>/dev/null)"; then
+  if ! raw="$(git -C "$REVIEW_WT" diff --no-renames --raw "${DIFF_BASE}...HEAD" 2>/dev/null)"; then
     CURSOR_FAIL="worktree_status_failed"; return 1    # 取れないなら素通りさせない
   fi
   if grep -qE '^:[0-7]+ 120000 ' <<<"$raw"; then
@@ -740,8 +744,9 @@ Your final message must END with the JSON object required by the schema (startin
 }
 
 # both: Result に併記する比較用エンジンの節 (判定には使わない)。REVIEW_COMPARE は "agy,cursor" 形式。
-# cursor-agent は --mode plan / --sandbox でも worktree の外を読める (実測。knowledge/cursor-review.md)。
-# 他 engine の出力を読ませないよう、cursor は codex・agy より**先に**走らせ (まだ誰の出力も無い)、
+# cursor-agent は --mode plan / --sandbox でも worktree の外を読み書きできうる (実測。knowledge/cursor-review.md)。
+# だから cursor は**判定の後**に走らせる: codex (と agy) を先に走らせて判定に要る結果をシェル変数に取り、
+# それらの一時ファイルを消してから最後に cursor (専用 worktree)。cursor が何をしても判定は汚れない。
 # agy の一時物は走り終えたらすぐ消す。併記の順は compare に書いた順のまま。
 declare -A COMPARE_NOTE=()
 run_compare_engine() {
@@ -794,17 +799,9 @@ ${CURSOR_DIAG}}"
     fi
     ;;
   both)
-    if compare_has cursor; then
-      # cursor は worktree の外も書けうる。codex / agy が読む REVIEW_WT が前後で変わったら (ignored を含む) 判定しない
-      _rw_fp_before="$(wt_fingerprint "$REVIEW_WT")" || _rw_fp_before=""
-      run_compare_engine cursor   # 先に (他 engine の出力がまだ無いうちに)
-      if [[ -z "$_rw_fp_before" ]] || ! _rw_fp_after="$(wt_fingerprint "$REVIEW_WT")" \
-          || [[ "$_rw_fp_after" != "$_rw_fp_before" ]]; then
-        fail_needs_director "REVIEW WORKTREE MODIFIED: the codex review worktree was not clean after the cursor comparison run — review not completed reliably (fail-closed; engine=both)"
-      fi
-    fi
     run_codex_review
     compare_has agy && run_compare_engine agy
+    # cursor は下で、判定に要る結果をシェル変数に取ってから走らせる
     ;;
 esac
 
@@ -820,6 +817,13 @@ fi
 
 REVIEW_CONTENT="$(cat "$OUTPUT_FILE")"
 _info "Review output length: ${#REVIEW_CONTENT} chars"
+
+# both の cursor は最後 (判定に要る結果は REVIEW_CONTENT / COMPARE_NOTE に取った)。codex の一時ファイルは先に消し、
+# cursor に読ませない・書き換えさせない。この後 REVIEW_WT・OUTPUT_FILE は読まない (cursor が触っても判定は変わらない)
+if [[ "$REVIEW_ENGINE" == both ]] && compare_has cursor; then
+  rm -f "$OUTPUT_FILE" "$STDERR_FILE"; OUTPUT_FILE=""; STDERR_FILE=""
+  run_compare_engine cursor
+fi
 
 # --- findings 判定 (F2, PR#180 / F-1, F-3, PR#180 QA fix) ---
 # 判定方針 (2026-09-08 現物確認: codex-cli 0.144.5 の `codex exec review`):

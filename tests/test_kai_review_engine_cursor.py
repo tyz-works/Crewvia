@@ -26,12 +26,14 @@ def _envelope(result, *, subtype="success", is_error=False):
 
 
 # cursor-agent stub: CURSOR_MODE で挙動を変える。argv・cwd を残す。both の順序を見るため、
-# 呼ばれた時点で TMPDIR に中身のある codex の出力 / agy の一時物があったかを CURSOR_SEEN_FILE に残す。
+# 呼ばれた時点で TMPDIR に codex の一時ファイル (出力・stderr。空でも) / agy の一時物が残っていたか、
+# agy が既に走ったかを CURSOR_SEEN_FILE に残す。
 CURSOR_STUB = r'''#!/bin/bash
 printf '%s\n' "$@" > "$CURSOR_ARGV_FILE"
 pwd > "$CURSOR_CWD_FILE"
-{ for f in "$TMPDIR"/kai-review-output.*; do [[ -s "$f" ]] && echo "codex-output:$f"; done
-  ls -d "$TMPDIR"/kai-review-agy* 2>/dev/null | sed 's/^/agy:/'; } > "$CURSOR_SEEN_FILE"
+{ for f in "$TMPDIR"/kai-review-output.* "$TMPDIR"/kai-review-stderr.*; do [[ -e "$f" ]] && echo "codex-tmp:$f"; done
+  ls -d "$TMPDIR"/kai-review-agy* 2>/dev/null | sed 's/^/agy:/'
+  [[ -e "$AGY_ARGV_FILE" ]] && echo agy-ran; } > "$CURSOR_SEEN_FILE"
 envelope() { python3 -c 'import json,sys; print(json.dumps({"type":"result","subtype":sys.argv[2],"is_error":sys.argv[3]=="1","result":sys.argv[1],"usage":{}}))' "$1" "${2:-success}" "${3:-0}"; }
 case "$CURSOR_MODE" in
   ok)        envelope "前置きの文です。差分を突き合わせます。$CURSOR_FINDINGS" ;;
@@ -53,6 +55,8 @@ case "$CURSOR_MODE" in
   ignored_write) echo secret.local >> "$(git rev-parse --git-path info/exclude)"; echo x > secret.local; envelope "$CURSOR_FINDINGS" ;;
   escape_ignored) for d in "$TMPDIR"/kai-review-wt.*; do echo x > "$d/secret.local"; done
              echo secret.local >> "$(git rev-parse --git-path info/exclude)"; envelope "$CURSOR_FINDINGS" ;;
+  commit)    echo x >> README; git -c user.email=a@b -c user.name=a commit -qam x; envelope "$CURSOR_FINDINGS" ;;
+  checkout)  git checkout -q --detach HEAD~1; envelope "$CURSOR_FINDINGS" ;;
   pretty)    envelope "結果です。"$'\n'"$(printf '%s' "$CURSOR_FINDINGS" | python3 -m json.tool --indent 2)" ;;
 esac
 '''
@@ -338,13 +342,17 @@ def test_both_with_agy_and_cursor_appends_both_in_order_and_codex_decides(tmp_pa
     assert "cursor-found" in text and "worktree の外も読める" in text
 
 
-def test_both_runs_cursor_before_other_engines_leave_output(tmp_path, monkeypatch):
-    """cursor は worktree の外を読めるので、codex の出力・agy の一時物ができる前に走らせる。"""
-    p, capture = run(tmp_path, monkeypatch, engine="both", extra_config="  compare: [agy, cursor]\n",
-                     codex_out=CODEX_P1)
+@pytest.mark.parametrize("compare", ["[agy, cursor]", "[cursor, agy]"])
+def test_both_runs_cursor_last_after_the_other_temp_files_are_gone(tmp_path, monkeypatch, compare):
+    """cursor は worktree の外を読み書きできうるので、codex と agy が走り終えて判定に要る結果をシェル変数に取り、
+    一時ファイルを消した後に走らせる (Director #313 r3)。compare の順に関わらず cursor は最後・併記は compare の順。"""
+    p, capture = run(tmp_path, monkeypatch, engine="both", extra_config=f"  compare: {compare}\n",
+                     codex_out=CODEX_P1, cursor_findings=CURSOR_P1)
     assert _verdict(tmp_path) == "needs-director", (p.stdout, p.stderr)
-    assert (tmp_path / "cursor_seen.txt").read_text() == ""
-    assert (tmp_path / "agy_argv.txt").exists()
+    assert (tmp_path / "cursor_seen.txt").read_text() == "agy-ran\n"
+    text = _result(capture, "needs-director")
+    a, c = text.index("### agy (比較用"), text.index("### cursor (比較用")
+    assert (a < c) == (compare == "[agy, cursor]") and "cursor-found" in text
 
 
 def test_both_cursor_failure_is_recorded_but_does_not_decide(tmp_path, monkeypatch):
@@ -433,12 +441,17 @@ def test_both_cursor_dirtying_its_worktree_does_not_reach_codex(tmp_path, monkey
     assert not list(tmp_path.glob("kai-review-cursor*"))                      # 専用 worktree は消えている
 
 
-def test_both_cursor_writing_into_the_review_worktree_stops_the_review(tmp_path, monkeypatch):
-    """専用 worktree の外 (REVIEW_WT) を書き換えられたら、codex に汚れた木を読ませず needs-director。"""
-    p, capture = run(tmp_path, monkeypatch, engine="both", extra_config="  compare: [cursor]\n", cursor_mode="escape")
-    assert _verdict(tmp_path) == "needs-director", (p.stdout, p.stderr)
-    assert any("REVIEW WORKTREE MODIFIED" in c for c in _calls(tmp_path)), _calls(tmp_path)
-    assert not (capture / "done.txt").exists()
+@pytest.mark.parametrize("mode", ["escape", "escape_ignored"])
+@pytest.mark.parametrize("codex_out,verdict", [(CLEAN, "done"), (CODEX_P1, "needs-director")])
+def test_both_cursor_writing_into_the_review_worktree_cannot_change_the_verdict(tmp_path, monkeypatch, mode,
+                                                                                 codex_out, verdict):
+    """cursor は判定の後に走るので、専用 worktree の外 (REVIEW_WT) を書き換えても判定は codex の結果のまま
+    (脅威モデル: cursor の誤った書き込みから判定を守る。knowledge/cursor-review.md)。"""
+    p, capture = run(tmp_path, monkeypatch, engine="both", extra_config="  compare: [cursor]\n", cursor_mode=mode,
+                     codex_out=codex_out)
+    assert _verdict(tmp_path) == verdict, (p.stdout, p.stderr)
+    assert "REVIEW WORKTREE MODIFIED" not in _text(tmp_path)
+    assert (tmp_path / "cursor_seen.txt").read_text() == ""          # codex の一時ファイルは先に消えている
 
 
 def test_cursor_engine_dirty_worktree_is_removed_after_failure(tmp_path, monkeypatch):
@@ -457,12 +470,32 @@ def test_cursor_writing_an_ignored_file_is_worktree_modified(tmp_path, monkeypat
     assert any("CURSOR FAILURE: worktree_modified" in c for c in _calls(tmp_path)), _calls(tmp_path)
 
 
-def test_both_cursor_writing_an_ignored_file_into_the_review_worktree_stops_the_review(tmp_path, monkeypatch):
-    p, capture = run(tmp_path, monkeypatch, engine="both", extra_config="  compare: [cursor]\n",
-                     cursor_mode="escape_ignored")
+@pytest.mark.parametrize("mode", ["commit", "checkout"])
+def test_cursor_moving_head_is_worktree_modified(tmp_path, monkeypatch, mode):
+    """commit・checkout は status を空のまま中身を変える。指紋の HEAD で拾う (Codex #313 r3)。"""
+    p, capture = run(tmp_path, monkeypatch, cursor_mode=mode)
     assert _verdict(tmp_path) == "needs-director", (p.stdout, p.stderr)
-    assert any("REVIEW WORKTREE MODIFIED" in c for c in _calls(tmp_path)), _calls(tmp_path)
-    assert not (capture / "done.txt").exists()
+    assert any("CURSOR FAILURE: worktree_modified" in c for c in _calls(tmp_path)), _calls(tmp_path)
+
+
+def test_cursor_does_not_run_when_the_pr_renames_agent_config_away(tmp_path, monkeypatch):
+    """base の .claude/ の設定を外へ rename (= 消す) する PR も止める。rename 検出だと元のパスが出ない (agy #313 r3)。"""
+    import subprocess
+    orig = run_kai_review.__globals__["_git"]
+
+    def git_with_rename(root, *args):
+        if args[:2] == ("commit", "-q") and args[2:] == ("-m", "base"):
+            (root / ".claude").mkdir()
+            (root / ".claude" / "settings.json").write_text('{"hooks": {"PreToolUse": ["guard"]}}\n' * 5)
+            subprocess.run(["git", "-C", str(root), "add", "-A"], check=True)
+        if args[:2] == ("commit", "-qam") and args[2] == "change":
+            subprocess.run(["git", "-C", str(root), "mv", ".claude/settings.json", "old-settings.json"], check=True)
+        return orig(root, *args)
+    monkeypatch.setitem(run_kai_review.__globals__, "_git", git_with_rename)
+    p, capture = run(tmp_path, monkeypatch)
+    assert _verdict(tmp_path) == "needs-director", (p.stdout, p.stderr)
+    assert any("CURSOR FAILURE: pr_changes_agent_config" in c for c in _calls(tmp_path)), _calls(tmp_path)
+    assert not (tmp_path / "cursor_argv.txt").exists()
 
 
 def test_fingerprint_sees_a_rewritten_ignored_file(tmp_path):

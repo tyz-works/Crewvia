@@ -58,7 +58,7 @@ cd $CURSOR_WT && timeout --kill-after=10s <N>s cursor-agent -p --model <cursor_m
 | `no_findings_json` | `result` の末尾に findings の JSON が無い（後ろに文が続く場合も） |
 | `schema_invalid` | 末尾の JSON が schema に通らない |
 | `redaction_failed` | findings の伏せ字が失敗した（中身を出さない） |
-| `worktree_modified` / `worktree_status_failed` | cursor 専用 worktree（`kai-review-cursor-wt.*`）の**指紋**が実行の前後で違う / 取れない。指紋 = `git status --porcelain=v1 -z --ignored=matching --untracked-files=all` + 出た各パスの lstat（mtime と **ctime**・symlink は行き先も。git が `!! cache/` の 1 行に畳む ignored の dir は中を全部たどる。`lib_review_engine.py fingerprint`）。`--porcelain` だけだと ignored のファイル（`.claude/settings.local.json` 等。PR が ignore を足すことも可）の追加・書き換えを見ない（Codex #313 r2 P2） |
+| `worktree_modified` / `worktree_status_failed` | cursor 専用 worktree（`kai-review-cursor-wt.*`）の**指紋**が実行の前後で違う / 取れない。指紋 = **HEAD**（`git rev-parse`。commit・reset・checkout は status を空のまま中身を変える。Codex #313 r3）+ `git status --porcelain=v1 -z --ignored=matching --untracked-files=all` + 出た各パスの lstat（mtime と **ctime**・symlink は行き先も。git が `!! cache/` の 1 行に畳む ignored の dir は中を全部たどる。`lib_review_engine.py fingerprint`）。`--porcelain` だけだと ignored のファイル（`.claude/settings.local.json` 等。PR が ignore を足すことも可）の追加・書き換えを見ない（Codex #313 r2 P2） |
 | `worktree_create_failed` | cursor 専用 worktree を作れなかった |
 
 失敗の診断（`### cursor diagnostics (redacted)`）は `lib_review_engine.diagnose --engine cursor`: stdout の `type` / `subtype` / `is_error` だけ（**`result` 本文は出さない**）と stderr の末尾。lib_checkpoint の伏せ字を通してから切る。
@@ -70,14 +70,22 @@ cd $CURSOR_WT && timeout --kill-after=10s <N>s cursor-agent -p --model <cursor_m
 - **`--sandbox enabled` でも止まらない**（attempt 2 の実測: `enabled` / `disabled` のどちらでも、worktree の外に置いた目印ファイルを読んで返した）。
 - したがって: 秘密（HOME 配下の設定・鍵）や、他 engine の出力・同時に走る別のレビューの一時物が**読まれうる**。判定に使う既定にしない。
 - kai-review.sh 側の手当て:
-  - cursor は **専用の使い捨て worktree**（PR head と同じ commit。`mktemp -d kai-review-cursor-wt.*` に `git worktree add --detach`）で走らせ、成否を問わず終わったら消す。Codex・agy が読む REVIEW_WT では走らせない（書き換え・途中失敗の汚れを他 engine が読む。Codex #313 r1 P1）。`both` では cursor の前後で REVIEW_WT の指紋（ignored を含む。上の表）を比べ、違えば・取れなければ（cursor が外を書いた）`REVIEW WORKTREE MODIFIED` で needs-director。
-  - `both` では cursor を **Codex・agy より先に**走らせる（その時点で他 engine の出力はまだ無い）。agy・cursor の一時物は走り終えたらすぐ消す。併記の順は `compare` の順のまま。
+  - cursor は **専用の使い捨て worktree**（PR head と同じ commit。`mktemp -d kai-review-cursor-wt.*` に `git worktree add --detach`）で走らせ、成否を問わず終わったら消す。Codex・agy が読む REVIEW_WT では走らせない（Codex #313 r1 P1）。
+  - **`both` では cursor を最後に走らせる（順序で塞ぐ。Director #313 r3）**: Codex（と `compare` の agy）を先に走らせ、判定に要る結果をシェル変数（`REVIEW_CONTENT` / 比較の併記）に取り、Codex の出力・stderr と agy の一時物を**消してから** cursor。この後 kai-review.sh は REVIEW_WT も一時ファイルも読まないので、cursor が外を読んでも書いても判定は変わらない。`compare` の順に関わらず cursor は最後・併記の順は `compare` の順のまま。
+    - r1〜r2 では「cursor を先に走らせ、REVIEW_WT の指紋を前後で比べる」監視で塞いでいたが、指紋の穴（ignored・畳まれた dir・HEAD・index のフラグ…）を Codex が巡ごとに 1 つずつ見つけた。監視の穴埋めをやめ、cursor を判定の後に置いた。
+    - 専用 worktree の指紋は HEAD + status + lstat まで（全 tracked ファイルの走査はしない）。書き換えを見つけたら `worktree_modified` で cursor の結果を捨てる（`both` では比較側の失敗として併記するだけ）。
+
+### 脅威モデル
+
+- **守るもの: cursor の誤った書き込みから判定を守る。** `--mode plan` でも書き込みが無いとは確かめられないので、cursor が何を書いても Codex の判定（と agy の併記）に届かない順序にする。cursor 自身の結果は、自分の worktree の指紋が変わっていたら捨てる。
+- **守らないもの: 悪意ある cursor（PR の中身に誘導されたものを含む）の検出はしない。** worktree の外（HOME・主 repo・別 task の worktree・queue）を読む・書くことは止められない（上の実測）。だから `engine: cursor` を判定の既定にしない・`.cursor/` や agent の設定を変える PR では走らせない（上の拒否）・findings は伏せ字を通す、までに留める。
   - 取り出した findings は Result に入る前に lib_checkpoint の伏せ字を通す（外で読んだ秘密を Result に写さない）。直列化した JSON でなく**値ごと**（title / body / file）に通す（`\"` のエスケープで伏せ字の規則が外れない）。
   - Result の cursor の節に「worktree の外も読める」の注意を付ける。
+- `pr_changes_agent_config` の `git diff --name-only` / `--raw` は `--no-renames`。rename 検出だと `.claude/settings.json` を外へ rename（= base の設定を消す）した PR で元のパスが出ず素通りする（agy #313 r3）。
 - 実行後に transcript の path を検査して「汚染の可能性」を出す案は入れていない（transcript の形は版で変わりうる・実測 1 版だけで検査器を作ると黙って外れる）。疑わしいときは上の transcript を人が見る。
 
 ## 戻し方
 
 `review.engine` を `codex` に、`compare` を `[agy]` に戻す（または env を外す）。コードを戻すなら PR revert → `scripts/sync-main-checkout.sh`。
 
-テスト: `tests/test_kai_review_engine_cursor.py`（cursor-agent は stub。設定・取り出し・各 fail-closed・枠外の `ActionRequiredError`・伏せ字・`.cursor/` の拒否・`both` + `compare` の順序と併記・既定の `compare`）。
+テスト: `tests/test_kai_review_engine_cursor.py`（cursor-agent は stub。設定・取り出し・各 fail-closed・枠外の `ActionRequiredError`・伏せ字・`.cursor/` の拒否・`both` + `compare` の順序（cursor は最後・codex / agy の一時物が消えた後）と併記・既定の `compare`・HEAD を動かす書き換え・外への rename）。

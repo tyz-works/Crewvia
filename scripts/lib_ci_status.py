@@ -85,6 +85,15 @@ def _epoch(iso):
         return None
 
 
+def _clean_name(name):
+    """check 名は外 (PR の workflow) から来て、Director の画面への送信文に入る。制御文字・改行・空白の連続を
+    1 つの空白にし、長さを切る。空になれば '?'。"""
+    if not isinstance(name, str):
+        return '?'
+    name = ' '.join(''.join(ch if ch.isprintable() else ' ' for ch in name).split())
+    return name[:_NAME_MAX] or '?'
+
+
 def classify_check(item):
     """statusCheckRollup の 1 要素 → `{name, state, conclusion, started_at, completed_at}`。
     state は running / passed / neutral / failed / unknown (知らない値・形は unknown)。"""
@@ -107,8 +116,8 @@ def classify_check(item):
         conclusion = conclusion if isinstance(conclusion, str) and conclusion else None
     else:
         name, state, conclusion = item.get('name') or item.get('context'), 'unknown', None
-    name = name if isinstance(name, str) and name.strip() else '?'
-    return {'name': name.strip()[:_NAME_MAX], 'state': state, 'conclusion': conclusion,
+    name = _clean_name(name)
+    return {'name': name, 'state': state, 'conclusion': conclusion,
             'started_at': _iso(item.get('startedAt')), 'completed_at': _iso(item.get('completedAt'))}
 
 
@@ -165,7 +174,9 @@ def parse_view(text):
     if not isinstance(doc, dict):
         raise ValueError('not_object')
     head = doc.get('headRefOid')
-    rollup = doc.get('statusCheckRollup')
+    if 'statusCheckRollup' not in doc:       # 頼んだ欄が無い = 形が違う (「CI なし」に倒さない)
+        raise ValueError('no_rollup')
+    rollup = doc['statusCheckRollup']
     if not isinstance(head, str) or not _SHA_RE.fullmatch(head):
         raise ValueError('bad_head')
     if rollup is None:
@@ -176,13 +187,16 @@ def parse_view(text):
 
 
 def parse_pr_list(text):
-    """`gh pr list --head <b> --state open --json number` の stdout → PR 番号 / None (無い)。
-    2 つ以上・形の違いは ValueError (どれか決められない = unknown)。"""
+    """`gh pr list --head <b> --state open --json number,isCrossRepository` の stdout → PR 番号 / None (無い)。
+    fork から来た同名 branch の PR (`isCrossRepository: true`) は数えない。2 つ以上・形の違いは ValueError
+    (どれか決められない = unknown)。"""
     doc = json.loads(text)
     if not isinstance(doc, list):
         raise ValueError('not_list')
-    nums = [d.get('number') for d in doc if isinstance(d, dict)]
-    if len(nums) != len(doc) or any(isinstance(n, bool) or not isinstance(n, int) or n <= 0 for n in nums):
+    if any(not isinstance(d, dict) or not isinstance(d.get('isCrossRepository'), bool) for d in doc):
+        raise ValueError('bad_entry')
+    nums = [d.get('number') for d in doc if d['isCrossRepository'] is False]
+    if any(isinstance(n, bool) or not isinstance(n, int) or n <= 0 for n in nums):
         raise ValueError('bad_entry')
     if not nums:
         return None
@@ -314,7 +328,7 @@ def observe_task(task, *, repo_root, branch_of, now, timeout, runner=subprocess.
         branch = branch_of(task)
         if not branch:
             return _unknown(None, 'no_branch', now)
-        out, err = run_gh(['pr', 'list', '--head', branch, '--state', 'open', '--json', 'number'],
+        out, err = run_gh(['pr', 'list', '--head', branch, '--state', 'open', '--json', 'number,isCrossRepository'],
                           cwd=cwd, timeout=timeout, runner=runner)
         if err:
             return _unknown(None, err, now)

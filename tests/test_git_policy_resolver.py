@@ -930,6 +930,7 @@ ALLOWED_CALLERS = {
     "scripts/kai-review.sh",       # diff base (pr-base)
     "scripts/worktree_gc.py",      # 片付けの根 (DEFAULT_WORKTREE_ROOT)
     "scripts/lint_plan.py",        # mission.yaml の git: の検査
+    "scripts/dispatcher.sh",       # PR の CI の見える化: pr_number の無い task の branch (task_branch。式をコピーしない)
 }
 SCAN_DIRS = ("scripts", "hooks", "agents", "config", "skills")
 SCAN_FILES = ("crewvia", "crewvia-stop")

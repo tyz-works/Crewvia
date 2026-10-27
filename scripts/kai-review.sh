@@ -649,13 +649,26 @@ Return only the JSON object required by the schema."
 # `--json-schema` が無いので、result の自由文の末尾の JSON を lib_review_engine.py extract-cursor が取り出して schema で検証する。
 # タイムアウトのフラグが無いので timeout で包む。prompt は位置引数で最後。diff は argv に載せず worktree の外の一時 dir (--add-dir)。
 # **fail-closed**: exit != 0 (timeout は 124) / JSON が読めない / is_error / subtype != success / findings の JSON が無い・schema 不適合 /
-#   実行後に worktree が汚れた → 成功を返さない。理由は CURSOR_FAIL (固定語彙)。成功なら findings の JSON を $1 に書く。
+#   実行の前後で worktree の指紋 (ignored を含む) が変わった / SIGTERM を無視して --kill-after で落とした → 成功を返さない。理由は CURSOR_FAIL (固定語彙)。成功なら findings の JSON を $1 に書く。
 CURSOR_FAIL=""
 CURSOR_DIAG=""
 cursor_collect_diag() {
   CURSOR_DIAG="$(python3 "${SCRIPT_DIR}/lib_review_engine.py" diagnose --engine cursor --out "$CURSOR_OUT_FILE" --err "$CURSOR_ERR_FILE" 2>/dev/null)" \
     || CURSOR_DIAG="(diagnostics unavailable)"
 }
+# 木の指紋 (追跡・未追跡・ignored の全パス + 各パスの lstat。lib_review_engine.py fingerprint)。
+# `status --porcelain` だけだと ignored (.claude/settings.local.json 等) の書き換えを見ない (Codex #313 r2 P2)。
+# 実行の前後で比べる。git / python が失敗したら失敗を返す (素通りさせない)
+wt_fingerprint() {
+  local fp
+  fp="$(set -o pipefail; git -C "$1" status --porcelain=v1 -z --ignored=matching --untracked-files=all 2>/dev/null \
+      | python3 "${SCRIPT_DIR}/lib_review_engine.py" fingerprint --root "$1" 2>/dev/null)" || return 1
+  [[ -n "$fp" ]] || return 1
+  printf '%s\n' "$fp"
+}
+# timeout の SIGTERM を cursor-agent が無視しても待ち続けないよう、この秒数の後に SIGKILL (--kill-after)。
+# 強制終了 (timeout の exit 137) も失敗 (timeout_killed)
+CURSOR_KILL_AFTER_SECONDS=10
 # cursor は専用の使い捨て worktree (PR head と同じ commit) で走らせ、終わったら成否を問わず消す。
 # REVIEW_WT で走らせると、書き換え・途中失敗の汚れを both の codex / agy がそのまま読む (Codex #313 r1 P1)。
 run_cursor_review() {
@@ -701,6 +714,8 @@ _run_cursor_review() {
   if ! git -C "$WORK_DIR" worktree add --detach "$CURSOR_WT" "$FETCH_LOCAL_REF" >/dev/null 2>&1; then
     CURSOR_FAIL="worktree_create_failed"; return 1
   fi
+  local fp_before fp_after
+  if ! fp_before="$(wt_fingerprint "$CURSOR_WT")"; then CURSOR_FAIL="worktree_status_failed"; return 1; fi
   local prompt
   prompt="${REVIEW_PROMPT//the <stdin> block below/the file ${CURSOR_DIFF_DIR}/review.diff}"
   prompt="${prompt}
@@ -709,17 +724,17 @@ Read the unified diff from the file ${CURSOR_DIFF_DIR}/review.diff (it is outsid
 You may read files in this checkout to verify the code. Do not run commands. Do not create or modify any file.
 Your final message must END with the JSON object required by the schema (starting with {\"findings\"), with nothing after it."
   _info "Running cursor-agent --mode plan --model ${CURSOR_MODEL} (diff=${DIFF_BYTES} bytes, timeout=${CURSOR_TIMEOUT}s) ..."
-  ( cd "$CURSOR_WT" && timeout "${CURSOR_TIMEOUT}s" cursor-agent -p --model "$CURSOR_MODEL" --mode plan --trust \
+  ( cd "$CURSOR_WT" && timeout --kill-after="${CURSOR_KILL_AFTER_SECONDS}s" "${CURSOR_TIMEOUT}s" cursor-agent -p --model "$CURSOR_MODEL" --mode plan --trust \
       --output-format json --add-dir "$CURSOR_DIFF_DIR" "$prompt" ) >"$CURSOR_OUT_FILE" 2>"$CURSOR_ERR_FILE" || rc=$?
   if [[ $rc -eq 124 ]]; then CURSOR_FAIL="timeout"; return 1; fi
+  if [[ $rc -eq 137 ]]; then CURSOR_FAIL="timeout_killed"; return 1; fi   # SIGTERM を無視して --kill-after で落とした
   if [[ $rc -ne 0 ]]; then CURSOR_FAIL="exit_${rc}"; return 1; fi
   if ! findings="$(python3 "${SCRIPT_DIR}/lib_review_engine.py" extract-cursor --out "$CURSOR_OUT_FILE" \
         --schema "$SCHEMA_FILE" 2>&1)"; then
     CURSOR_FAIL="${findings:-unparseable_output}"; CURSOR_FAIL="${CURSOR_FAIL%%$'\n'*}"; return 1
   fi
-  local dirty
-  if ! dirty="$(git -C "$CURSOR_WT" status --porcelain 2>&1)"; then CURSOR_FAIL="worktree_status_failed"; return 1; fi
-  if [[ -n "$dirty" ]]; then CURSOR_FAIL="worktree_modified"; return 1; fi
+  if ! fp_after="$(wt_fingerprint "$CURSOR_WT")"; then CURSOR_FAIL="worktree_status_failed"; return 1; fi
+  if [[ "$fp_after" != "$fp_before" ]]; then CURSOR_FAIL="worktree_modified"; return 1; fi
   printf '%s\n' "$findings" > "$out_to" || { CURSOR_FAIL="unparseable_output"; return 1; }
   return 0
 }
@@ -780,9 +795,11 @@ ${CURSOR_DIAG}}"
     ;;
   both)
     if compare_has cursor; then
+      # cursor は worktree の外も書けうる。codex / agy が読む REVIEW_WT が前後で変わったら (ignored を含む) 判定しない
+      _rw_fp_before="$(wt_fingerprint "$REVIEW_WT")" || _rw_fp_before=""
       run_compare_engine cursor   # 先に (他 engine の出力がまだ無いうちに)
-      # cursor は worktree の外も書けうる。codex / agy が読む REVIEW_WT が汚れていたら判定しない
-      if ! _rw_dirty="$(git -C "$REVIEW_WT" status --porcelain 2>&1)" || [[ -n "$_rw_dirty" ]]; then
+      if [[ -z "$_rw_fp_before" ]] || ! _rw_fp_after="$(wt_fingerprint "$REVIEW_WT")" \
+          || [[ "$_rw_fp_after" != "$_rw_fp_before" ]]; then
         fail_needs_director "REVIEW WORKTREE MODIFIED: the codex review worktree was not clean after the cursor comparison run — review not completed reliably (fail-closed; engine=both)"
       fi
     fi

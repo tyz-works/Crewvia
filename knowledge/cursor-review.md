@@ -30,7 +30,7 @@
 ## 呼び方（cursor-agent 2026.10.22）
 
 ```
-cd $REVIEW_WT && timeout <N>s cursor-agent -p --model <cursor_model> --mode plan --trust \
+cd $CURSOR_WT && timeout --kill-after=10s <N>s cursor-agent -p --model <cursor_model> --mode plan --trust \
     --output-format json --add-dir <diff の dir> "<prompt>"
 ```
 
@@ -50,6 +50,7 @@ cd $REVIEW_WT && timeout <N>s cursor-agent -p --model <cursor_model> --mode plan
 | `workspace_has_cursor_config` | レビュー用 worktree の木に `.cursor` / `.cursorrules` / `.cursorignore` がある（PR が持ち込んだ設定を `--trust` で読ませない） |
 | `pr_changes_agent_config` | PR が `.claude` / `.mcp.json` / `.codex` / `.vscode` / `AGENTS.md` を変えている、または symlink を足した・変えた |
 | `timeout` | `cursor_timeout_seconds` を超えた（exit 124） |
+| `timeout_killed` | 超えた後の SIGTERM を無視し、10 秒後の SIGKILL（`--kill-after`）で落とした（exit 137）。`--kill-after` が無いと SIGTERM を無視する cursor-agent を永遠に待ち、needs-director も後始末も走らず `both` で Codex も始まらない（Codex #313 r2 P2） |
 | `exit_<N>` | exit が 0 以外（枠外のモデルは `exit_1` + `ActionRequiredError`） |
 | `unparseable_output` | stdout が JSON 1 個でない |
 | `is_error` | `is_error` が `false` でない（欠けも含む） |
@@ -57,7 +58,7 @@ cd $REVIEW_WT && timeout <N>s cursor-agent -p --model <cursor_model> --mode plan
 | `no_findings_json` | `result` の末尾に findings の JSON が無い（後ろに文が続く場合も） |
 | `schema_invalid` | 末尾の JSON が schema に通らない |
 | `redaction_failed` | findings の伏せ字が失敗した（中身を出さない） |
-| `worktree_modified` / `worktree_status_failed` | 実行後の cursor 専用 worktree（`kai-review-cursor-wt.*`）の `git status --porcelain` が空でない / 取れない |
+| `worktree_modified` / `worktree_status_failed` | cursor 専用 worktree（`kai-review-cursor-wt.*`）の**指紋**が実行の前後で違う / 取れない。指紋 = `git status --porcelain=v1 -z --ignored=matching --untracked-files=all` + 出た各パスの lstat（`lib_review_engine.py fingerprint`）。`--porcelain` だけだと ignored のファイル（`.claude/settings.local.json` 等。PR が ignore を足すことも可）の追加・書き換えを見ない（Codex #313 r2 P2） |
 | `worktree_create_failed` | cursor 専用 worktree を作れなかった |
 
 失敗の診断（`### cursor diagnostics (redacted)`）は `lib_review_engine.diagnose --engine cursor`: stdout の `type` / `subtype` / `is_error` だけ（**`result` 本文は出さない**）と stderr の末尾。lib_checkpoint の伏せ字を通してから切る。
@@ -69,7 +70,7 @@ cd $REVIEW_WT && timeout <N>s cursor-agent -p --model <cursor_model> --mode plan
 - **`--sandbox enabled` でも止まらない**（attempt 2 の実測: `enabled` / `disabled` のどちらでも、worktree の外に置いた目印ファイルを読んで返した）。
 - したがって: 秘密（HOME 配下の設定・鍵）や、他 engine の出力・同時に走る別のレビューの一時物が**読まれうる**。判定に使う既定にしない。
 - kai-review.sh 側の手当て:
-  - cursor は **専用の使い捨て worktree**（PR head と同じ commit。`mktemp -d kai-review-cursor-wt.*` に `git worktree add --detach`）で走らせ、成否を問わず終わったら消す。Codex・agy が読む REVIEW_WT では走らせない（書き換え・途中失敗の汚れを他 engine が読む。Codex #313 r1 P1）。`both` では cursor の後に REVIEW_WT の `git status --porcelain` を確かめ、汚れていれば（cursor が外を書いた）`REVIEW WORKTREE MODIFIED` で needs-director。
+  - cursor は **専用の使い捨て worktree**（PR head と同じ commit。`mktemp -d kai-review-cursor-wt.*` に `git worktree add --detach`）で走らせ、成否を問わず終わったら消す。Codex・agy が読む REVIEW_WT では走らせない（書き換え・途中失敗の汚れを他 engine が読む。Codex #313 r1 P1）。`both` では cursor の前後で REVIEW_WT の指紋（ignored を含む。上の表）を比べ、違えば・取れなければ（cursor が外を書いた）`REVIEW WORKTREE MODIFIED` で needs-director。
   - `both` では cursor を **Codex・agy より先に**走らせる（その時点で他 engine の出力はまだ無い）。agy・cursor の一時物は走り終えたらすぐ消す。併記の順は `compare` の順のまま。
   - 取り出した findings は Result に入る前に lib_checkpoint の伏せ字を通す（外で読んだ秘密を Result に写さない）。直列化した JSON でなく**値ごと**（title / body / file）に通す（`\"` のエスケープで伏せ字の規則が外れない）。
   - Result の cursor の節に「worktree の外も読める」の注意を付ける。

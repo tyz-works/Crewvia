@@ -49,6 +49,10 @@ case "$CURSOR_MODE" in
   dirty)     echo x > injected.txt; envelope "$CURSOR_FINDINGS" ;;
   dirty_fail) echo x > injected.txt; exit 3 ;;
   escape)    for d in "$TMPDIR"/kai-review-wt.*; do echo x > "$d/escaped.txt"; done; envelope "$CURSOR_FINDINGS" ;;
+  ignore_term) trap '' TERM; sleep 300 ;;
+  ignored_write) echo secret.local >> "$(git rev-parse --git-path info/exclude)"; echo x > secret.local; envelope "$CURSOR_FINDINGS" ;;
+  escape_ignored) for d in "$TMPDIR"/kai-review-wt.*; do echo x > "$d/secret.local"; done
+             echo secret.local >> "$(git rev-parse --git-path info/exclude)"; envelope "$CURSOR_FINDINGS" ;;
   pretty)    envelope "結果です。"$'\n'"$(printf '%s' "$CURSOR_FINDINGS" | python3 -m json.tool --indent 2)" ;;
 esac
 '''
@@ -442,3 +446,56 @@ def test_cursor_engine_dirty_worktree_is_removed_after_failure(tmp_path, monkeyp
     assert _verdict(tmp_path) == "needs-director", (p.stdout, p.stderr)
     assert any("CURSOR FAILURE: exit_3" in c for c in _calls(tmp_path)), _calls(tmp_path)
     assert not list(tmp_path.glob("kai-review-cursor*"))
+
+
+# --- ignored のファイルも検査する・SIGTERM を無視しても止める (Codex #313 r2 P2x2) ---
+
+def test_cursor_writing_an_ignored_file_is_worktree_modified(tmp_path, monkeypatch):
+    """`status --porcelain` には出ない ignored のファイルを足しても、前後の指紋で拾う。"""
+    p, capture = run(tmp_path, monkeypatch, cursor_mode="ignored_write")
+    assert _verdict(tmp_path) == "needs-director", (p.stdout, p.stderr)
+    assert any("CURSOR FAILURE: worktree_modified" in c for c in _calls(tmp_path)), _calls(tmp_path)
+
+
+def test_both_cursor_writing_an_ignored_file_into_the_review_worktree_stops_the_review(tmp_path, monkeypatch):
+    p, capture = run(tmp_path, monkeypatch, engine="both", extra_config="  compare: [cursor]\n",
+                     cursor_mode="escape_ignored")
+    assert _verdict(tmp_path) == "needs-director", (p.stdout, p.stderr)
+    assert any("REVIEW WORKTREE MODIFIED" in c for c in _calls(tmp_path)), _calls(tmp_path)
+    assert not (capture / "done.txt").exists()
+
+
+def test_fingerprint_sees_a_rewritten_ignored_file(tmp_path):
+    """既にある ignored のファイルの中身の書き換え (status の出力は前後で同じ) も指紋が変わる。"""
+    import subprocess
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    (tmp_path / ".gitignore").write_text("local.json\n")
+    (tmp_path / "local.json").write_text("{}\n")
+
+    def fp():
+        st = subprocess.run(["git", "-C", str(tmp_path), "status", "--porcelain=v1", "-z", "--ignored=matching",
+                             "--untracked-files=all"], check=True, capture_output=True).stdout
+        return st, lre.tree_fingerprint(st, str(tmp_path))
+    st1, before = fp()
+    (tmp_path / "local.json").write_text('{"hooks": "evil"}\n')
+    st2, after = fp()
+    assert st1 == st2 and b"local.json" in st1            # status だけでは区別できない
+    assert before != after
+
+
+def test_cursor_ignoring_sigterm_is_killed_and_fail_closed(tmp_path, monkeypatch):
+    """SIGTERM を無視する cursor-agent でも --kill-after で止まり、needs-director (LGTM に倒さない)。"""
+    import time
+    t0 = time.monotonic()
+    p, capture = run(tmp_path, monkeypatch, cursor_mode="ignore_term", timeout=1)
+    assert time.monotonic() - t0 < 60, "timeout が SIGKILL に進まず待ち続けた"
+    assert _verdict(tmp_path) == "needs-director", (p.stdout, p.stderr)
+    assert any("CURSOR FAILURE: timeout_killed" in c for c in _calls(tmp_path)), _calls(tmp_path)
+    assert not list(tmp_path.glob("kai-review-cursor*"))
+
+
+def test_both_cursor_ignoring_sigterm_still_lets_codex_decide(tmp_path, monkeypatch):
+    p, capture = run(tmp_path, monkeypatch, engine="both", extra_config="  compare: [cursor]\n",
+                     cursor_mode="ignore_term", timeout=1)
+    assert _verdict(tmp_path) == "done", (p.stdout, p.stderr)
+    assert "cursor failed: timeout_killed" in _result(capture, "done")

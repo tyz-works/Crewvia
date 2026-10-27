@@ -13,6 +13,7 @@
 - cursor_model は `claude-fable-*`（Cursor の一覧で NO ZDR = データ保持の契約外）を拒否する。括弧付きパラメータ `[a=b,c=d]` は許す。
 - CLI: `lib_review_engine.py get --config <path>` が 6 行（engine / agy_model / agy_timeout_seconds /
   cursor_model / cursor_timeout_seconds / compare をカンマ区切り）を stdout に出す。
+  `fingerprint --root <dir>` は stdin の `git status -z` から木の指紋 (ignored を含む) を出す。
   `extract-cursor` は cursor-agent の JSON 出力から findings を取り出して schema で検証する（fail-closed）。
 """
 
@@ -305,6 +306,35 @@ def diagnose(out_path, err_path, engine='agy'):
         return _WITHHELD
 
 
+def tree_fingerprint(status_z, root):
+    """読み取り専用のはずの木の指紋。`git status --porcelain=v1 -z --ignored=matching --untracked-files=all`
+    の出力 (bytes) と、そこに出た各パスの lstat (種類・大きさ・mtime_ns・inode) を 1 つの sha256 にする。
+    ignored のファイル (.claude/settings.local.json 等) も載るので、cursor の前後で比べれば書き換え・追加・削除を拾う
+    (`status --porcelain` だけでは ignored を見ない。Codex #313 r2 P2)。lstat できないパスはその事実を混ぜる。"""
+    import hashlib
+    h = hashlib.sha256()
+    h.update(status_z)
+    h.update(b'\0--stat--\0')
+    entries = status_z.split(b'\0')
+    i = 0
+    while i < len(entries):
+        ent = entries[i]
+        i += 1
+        if len(ent) < 4:
+            continue
+        paths = [ent[3:]]
+        if ent[:1] in (b'R', b'C') and i < len(entries):   # rename / copy は次の要素が元のパス
+            paths.append(entries[i])
+            i += 1
+        for rel in paths:
+            try:
+                st = os.lstat(os.path.join(os.fsencode(root), rel))
+                h.update(rel + b'\0%o %d %d %d\0' % (st.st_mode, st.st_size, st.st_mtime_ns, st.st_ino))
+            except OSError as e:
+                h.update(rel + b'\0err %d\0' % (e.errno or 0))
+    return h.hexdigest()
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog='lib_review_engine.py')
     sub = ap.add_subparsers(dest='cmd', required=True)
@@ -317,7 +347,12 @@ def main(argv=None):
     x = sub.add_parser('extract-cursor')
     x.add_argument('--out', required=True)
     x.add_argument('--schema', required=True)
+    fp = sub.add_parser('fingerprint')
+    fp.add_argument('--root', required=True)
     args = ap.parse_args(argv)
+    if args.cmd == 'fingerprint':
+        print(tree_fingerprint(sys.stdin.buffer.read(), args.root))
+        return 0
     if args.cmd == 'diagnose':
         print(diagnose(args.out, args.err, args.engine))
         return 0

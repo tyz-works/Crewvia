@@ -1,0 +1,102 @@
+# cursor (Cursor CLI: cursor-agent) を比較用のレビューに足す
+
+`scripts/kai-review.sh` の `both` で、Codex の判定の横に Cursor CLI の findings を併記できる（`compare: [cursor]` / `[agy, cursor]`）。
+設定の読み口は `scripts/lib_review_engine.py` の 1 か所。
+
+**cursor は比較専用。判定には使えない**（Codex #313 r5 の後の Director の方針）。`engine: cursor`（config・env `CREWVIA_REVIEW_ENGINE` とも）は
+`bad_engine` / `bad_engine_env` で拒否し、needs-director で止まる（codex に倒さない）。理由は 2 つ:
+
+1. **worktree の外を読む**（`--mode plan` でも `--sandbox enabled` でも止まらない。下の「worktree の外を読む」）。秘密・他 engine の出力を読んで写しうる。
+2. **出力の schema を強制できない**（`--json-schema` が無い）。findings は自由文の末尾から JSON を拾うしかなく、拾い方の穴を Codex が r1〜r5 で巡ごとに見つけた
+   （整形された JSON・壊れた外側の中の空 findings・括弧の種類・重複キー…）。判定に使うと、誤読 1 つが P1 を空 findings = LGTM に変える。
+
+比較専用なら、誤読しても併記が狂うだけで LGTM にはならない。だから抽出は best effort に留め、穴埋めを打ち切った（重複キーの拒否だけは安いので入れた）。
+
+## 設定
+
+`config/crewvia.yaml` の `review:`（既定は今までと同じ。merge しても挙動は変わらない）:
+
+| 欄 | 既定 | 意味 |
+|---|---|---|
+| `engine` | `codex` | `codex` / `agy` / `both`。**`cursor` は拒否**（`bad_engine` / env は `bad_engine_env`）。env `CREWVIA_REVIEW_ENGINE` が上書き（engine だけ） |
+| `compare` | `[agy]` | `both` のときに Codex の横に併記するエンジンの一覧（`agy` / `cursor` の部分集合。空・重複・他の値は不正）。既定 = 従来の `both` と同じ |
+| `cursor_model` | `grok-4.7-high` | `cursor-agent models` に出る名前。括弧付きパラメータ（`name[effort=high]`）も通す。`claude-fable-*` は拒否（下記） |
+| `cursor_timeout_seconds` | `900` | `timeout` で包む秒数（cursor-agent にタイムアウトのフラグが無い） |
+
+- 不正値・読めない config は codex に倒さず `needs-director`（固定コード `bad_compare` / `bad_cursor_model` / `bad_cursor_timeout`）。他は `knowledge/agy-review.md`「設定」と同じ。
+- `compare: [agy, cursor]` の併記は Result に `### <engine> (比較用 — 判定は Codex。model=…)`。比較側の失敗は判定に使わず、失敗の理由と診断を併記する。
+- 判定は Codex なので、`compare` に cursor があっても codex が無ければ止める（cursor だけで LGTM にしない）。
+
+## 利用枠（2026-10-27 実測・このアカウント）
+
+- サブスクのログインのまま（`agent login`）。API キーは使わない。**on-demand（従量課金）は Cursor の設定で切っておく**（切っていないと枠を超えた分が課金されうる）。
+- **週の枠で使えるのは Grok 系だけ**。`gpt-5.6-sol-high` / `gemini-4-argon-high` は約 9 秒で exit 1・stdout 空・stderr
+  `ActionRequiredError: <model> is not included in your weekly usage ...`（課金されず止まる）→ 併記に `cursor failed: exit_1` と、伏せ字後の stderr の行が出る。
+- 1 回 3〜10 分（Grok 4.7 high で約 10.5 分の実測あり）。レビューのたびに枠を使う。
+- **「NO ZDR」と付くモデル（`claude-fable-*`）はデータ保持の契約外なので使わない**。config の検証で拒否する（大文字小文字を問わず前方一致）。他に NO ZDR が増えたら `_CURSOR_DENIED_PREFIXES` に足す。
+
+## 呼び方（cursor-agent 2026.10.22）
+
+```
+cd $CURSOR_WT && timeout --kill-after=10s <N>s cursor-agent -p --model <cursor_model> --mode plan --trust \
+    --output-format json --add-dir <diff の dir> "<prompt>"
+```
+
+- `--mode plan` = 読み取り専用（ファイルを書かない）。**`--force` / `--yolo` / `--approve-mcps` / `--sandbox disabled` は使わない**（テストが argv で確かめる）。
+- `--trust` はヘッドレスで worktree を信頼するため（Director の実測の形。無しの挙動は利用枠を使うので確かめていない）。PR の中身を信頼することになるので、**レビュー用 worktree の木のどこかに `.cursor/`（MCP・権限・hook・rules）か `.cursorrules` があれば走らせない**（`workspace_has_cursor_config`。`git ls-files` で見る = symlink も含む）。crewvia には無い。さらに **PR が agent の設定（`.claude/` の settings・hooks・skills、`.mcp.json`、`.codex/`、`.vscode/`、`AGENTS.md`）を変えていたら走らせない**（`pr_changes_agent_config`。base…HEAD の変更ファイル名で見る）。crewvia 自身が `.claude/` を持つので「ある」では拒否できない — base（main = レビュー済み）の中身は信頼し、PR の変更だけを信頼しない。PR が足した・変えた **symlink は行き先を問わず拒否**（名前が `.claude` で終わる link・設定の場所へ向ける link）。`.cursorignore`（レビュー対象を隠せる）も木にあれば拒否。**`CLAUDE.md` の変更は拒否しない**: crewvia の PR はよく `CLAUDE.md` を変えるので拒否すると cursor がほぼ走らない。効くのは prompt への影響だけで、diff 本文からの prompt injection と同じ種類（cursor は `--mode plan` で書かず、判定にも使わない）。MCP は `--approve-mcps` を付けないので承認されない。
+- prompt は位置引数で最後。diff は argv に載せず、worktree の外の `mktemp -d` に `review.diff` を書いて prompt でパスを示す（`--add-dir` で足す）。prompt は「ファイルを読むだけ・コマンドは実行しない・書かない」。
+- `--json-schema` は無い。stdout は JSON 1 個 `{"type":"result","subtype":"success","is_error":false,"result":"<自由文>",...}` で、`result` は**前置きの文の後ろに JSON**（` ```json ` の囲みのこともある）。
+  `lib_review_engine.py extract-cursor` が「末尾の `{` 空白 `"findings"` 空白 `:` から始まる JSON（後ろは空白か ``` だけ。整形された `{\n  "findings": …}` も拾う）」を取り出し、`config/kai-review-findings.schema.json` で検証する（additionalProperties・enum・required・型）。
+  抽出は best effort（比較専用なので、誤読しても併記が狂うだけ）。**重複キー**（`{"findings":[P1],"findings":[]}` は json が後勝ちで黙って空にする）は envelope・findings とも `duplicate_key` で読まない（Director #313 r5）。
+  **採るのは単独の末尾の JSON だけ**（Codex #313 r4）: 読めた候補・読めない候補とも、その範囲の内側の候補は試さない（読めない候補の範囲は文字列を除いた括弧の対応 (種類まで) で決め、閉じない・種類が対応しないなら `no_findings_json`）。壊れた外側 `{"findings":[P1…],"extra":{"findings":[]}` の中の空 findings を拾って done に倒さないため。前置きの文の中の `{"findings" …}` は閉じていれば飛ばす。
+
+## 失敗の扱い（読めない出力を「指摘なし」として併記しない）
+
+次のどれかなら cursor の結果を捨て、併記に `(cursor failed: <理由> — not used for the verdict)` と診断を出す（判定は Codex のまま）:
+
+| 理由 | 条件 |
+|---|---|
+| `cursor_agent_not_found` | `cursor-agent` が PATH に無い |
+| `workspace_has_cursor_config` | レビュー用 worktree の木に `.cursor` / `.cursorrules` / `.cursorignore` がある（PR が持ち込んだ設定を `--trust` で読ませない） |
+| `pr_changes_agent_config` | PR が `.claude` / `.mcp.json` / `.codex` / `.vscode` / `AGENTS.md` を変えている、または symlink を足した・変えた |
+| `timeout` | `cursor_timeout_seconds` を超えた（exit 124） |
+| `timeout_killed` | 超えた後の SIGTERM を無視し、10 秒後の SIGKILL（`--kill-after`）で落とした（exit 137）。`--kill-after` が無いと SIGTERM を無視する cursor-agent を永遠に待ち、needs-director も後始末も走らず `both` で Codex も始まらない（Codex #313 r2 P2） |
+| `exit_<N>` | exit が 0 以外（枠外のモデルは `exit_1` + `ActionRequiredError`） |
+| `unparseable_output` | stdout が JSON 1 個でない |
+| `is_error` | `is_error` が `false` でない（欠けも含む） |
+| `subtype` | `type` が `result` でない / `subtype` が `success` でない |
+| `no_findings_json` | `result` の末尾に findings の JSON が無い（後ろに文が続く場合も） |
+| `schema_invalid` | 末尾の JSON が schema に通らない |
+| `duplicate_key` | envelope か findings の JSON に同じキーが 2 回ある |
+| `redaction_failed` | findings の伏せ字が失敗した（中身を出さない） |
+| `worktree_modified` / `worktree_status_failed` | cursor 専用 worktree（`kai-review-cursor-wt.*`）の**指紋**が実行の前後で違う / 取れない。指紋 = **HEAD**（`git rev-parse`。commit・reset・checkout は status を空のまま中身を変える。Codex #313 r3）+ `git status --porcelain=v1 -z --ignored=matching --untracked-files=all` + 出た各パスの lstat（mtime と **ctime**・symlink は行き先も。git が `!! cache/` の 1 行に畳む ignored の dir は中を全部たどる。`lib_review_engine.py fingerprint`）。`--porcelain` だけだと ignored のファイル（`.claude/settings.local.json` 等。PR が ignore を足すことも可）の追加・書き換えを見ない（Codex #313 r2 P2） |
+| `worktree_create_failed` | cursor 専用 worktree を作れなかった |
+
+失敗の診断（`### cursor diagnostics (redacted)`）は `lib_review_engine.diagnose --engine cursor`: stdout の `type` / `subtype` / `is_error` だけ（**`result` 本文は出さない**）と stderr の末尾。lib_checkpoint の伏せ字を通してから切る。
+
+## worktree の外を読む（重要）
+
+- cursor-agent は **`--mode plan` でも worktree の外を読む**。実測で Grok は主 repo の `.git`・別 task の worktree を、Composer は Director の scratchpad にあった前回の Grok の出力を Read して丸写しした
+  （証拠: `~/.cursor/projects/<ws>/agent-transcripts/*.jsonl` の Read / Glob / Grep の path）。
+- **`--sandbox enabled` でも止まらない**（attempt 2 の実測: `enabled` / `disabled` のどちらでも、worktree の外に置いた目印ファイルを読んで返した）。
+- したがって: 秘密（HOME 配下の設定・鍵）や、他 engine の出力・同時に走る別のレビューの一時物が**読まれうる**。判定には使わない（`engine: cursor` は拒否）。
+- kai-review.sh 側の手当て:
+  - cursor は **専用の使い捨て worktree**（PR head と同じ commit。`mktemp -d kai-review-cursor-wt.*` に `git worktree add --detach`）で走らせ、成否を問わず終わったら消す。Codex・agy が読む REVIEW_WT では走らせない（Codex #313 r1 P1）。
+  - **`both` では cursor を最後に走らせる（順序で塞ぐ。Director #313 r3）**: Codex（と `compare` の agy）を先に走らせ、判定に要る結果をシェル変数（`REVIEW_CONTENT` / 比較の併記）に取り、Codex の出力・stderr と agy の一時物を**消してから** cursor。この後 kai-review.sh は REVIEW_WT も一時ファイルも読まないので、cursor が外を読んでも書いても判定は変わらない。`compare` の順に関わらず cursor は最後・併記の順は `compare` の順のまま。
+    - r1〜r2 では「cursor を先に走らせ、REVIEW_WT の指紋を前後で比べる」監視で塞いでいたが、指紋の穴（ignored・畳まれた dir・HEAD・index のフラグ…）を Codex が巡ごとに 1 つずつ見つけた。監視の穴埋めをやめ、cursor を判定の後に置いた。
+    - 専用 worktree の指紋は HEAD + status + lstat まで（全 tracked ファイルの走査はしない）。書き換えを見つけたら `worktree_modified` で cursor の結果を捨てる（`both` では比較側の失敗として併記するだけ）。
+
+### 脅威モデル
+
+- **守るもの: cursor の誤った書き込みから判定を守る。** `--mode plan` でも書き込みが無いとは確かめられないので、cursor が何を書いても Codex の判定（と agy の併記）に届かない順序にする。cursor 自身の結果は、自分の worktree の指紋が変わっていたら捨てる。
+- **守らないもの: 悪意ある cursor（PR の中身に誘導されたものを含む）の検出はしない。** worktree の外（HOME・主 repo・別 task の worktree・queue）を読む・書くことは止められない（上の実測）。だから `engine: cursor` は拒否し比較にだけ使う・`.cursor/` や agent の設定を変える PR では走らせない（上の拒否）・findings は伏せ字を通す、までに留める。
+  - 取り出した findings は Result に入る前に lib_checkpoint の伏せ字を通す（外で読んだ秘密を Result に写さない）。直列化した JSON でなく**値ごと**（title / body / file）に通す（`\"` のエスケープで伏せ字の規則が外れない）。
+  - Result の cursor の節に「worktree の外も読める」の注意を付ける。
+- `pr_changes_agent_config` の `git diff --name-only` / `--raw` は `--no-renames`。rename 検出だと `.claude/settings.json` を外へ rename（= base の設定を消す）した PR で元のパスが出ず素通りする（agy #313 r3）。
+- 実行後に transcript の path を検査して「汚染の可能性」を出す案は入れていない（transcript の形は版で変わりうる・実測 1 版だけで検査器を作ると黙って外れる）。疑わしいときは上の transcript を人が見る。
+
+## 戻し方
+
+`compare` を `[agy]` に戻す（cursor を外す）。コードを戻すなら PR revert → `scripts/sync-main-checkout.sh`。
+
+テスト: `tests/test_kai_review_engine_cursor.py`（cursor-agent は stub。設定・`engine: cursor` の拒否（config・env）・取り出し・重複キー・各失敗が併記だけになる・枠外の `ActionRequiredError`・伏せ字・`.cursor/` の拒否・`both` + `compare` の順序（cursor は最後・codex / agy の一時物が消えた後）と併記・既定の `compare`・HEAD を動かす書き換え・外への rename）。

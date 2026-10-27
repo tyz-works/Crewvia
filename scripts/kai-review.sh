@@ -283,9 +283,20 @@ STDERR_FILE=""
 AGY_DIFF_DIR=""          # agy に読ませる diff を置く一時 dir (worktree の外。argv に diff を載せない)
 AGY_OUT_FILE=""
 AGY_ERR_FILE=""
+CURSOR_DIFF_DIR=""       # cursor-agent に読ませる diff の一時 dir (agy と同じく worktree の外)
+CURSOR_OUT_FILE=""
+CURSOR_ERR_FILE=""
+CURSOR_WT=""             # cursor-agent 専用の使い捨て worktree (REVIEW_WT は codex / agy が読むので cursor に触らせない)
 RESULT_FILE=""           # card に全文を残す Result / 理由のファイル (plan.sh が読んだ後に消す)
 FETCH_LOCAL_REF=""
 BASE_FETCH_LOCAL_REF=""  # t006: origin/main を都度 fetch する一時 ref (下記参照)
+
+cursor_drop_wt() {
+  if [[ -n "$CURSOR_WT" && -d "$CURSOR_WT" ]]; then
+    git -C "${WORK_DIR:-$REPO_ROOT}" worktree remove --force "$CURSOR_WT" 2>/dev/null || rm -rf "$CURSOR_WT"
+  fi
+  CURSOR_WT=""
+}
 
 cleanup() {
   if [[ -n "$OUTPUT_FILE" ]]; then
@@ -300,6 +311,10 @@ cleanup() {
   [[ -n "$AGY_OUT_FILE" ]] && rm -f "$AGY_OUT_FILE"
   [[ -n "$AGY_ERR_FILE" ]] && rm -f "$AGY_ERR_FILE"
   [[ -n "$AGY_DIFF_DIR" ]] && rm -rf "$AGY_DIFF_DIR"
+  [[ -n "$CURSOR_OUT_FILE" ]] && rm -f "$CURSOR_OUT_FILE"
+  [[ -n "$CURSOR_ERR_FILE" ]] && rm -f "$CURSOR_ERR_FILE"
+  [[ -n "$CURSOR_DIFF_DIR" ]] && rm -rf "$CURSOR_DIFF_DIR"
+  cursor_drop_wt
   if [[ -n "$REVIEW_WT" && -d "$REVIEW_WT" ]]; then
     git -C "${WORK_DIR:-$REPO_ROOT}" worktree remove --force "$REVIEW_WT" 2>/dev/null \
       || rm -rf "$REVIEW_WT"
@@ -548,12 +563,14 @@ PROMPT_EOF
 
 # --- レビュー先の解決 (t080) ---
 # `config/crewvia.yaml` の review.engine (codex|agy|both。既定 codex = 今までと同じ) と env CREWVIA_REVIEW_ENGINE。
+# cursor は判定に使わない (engine: cursor は lib が bad_engine で拒否)。both の review.compare にだけ置ける (knowledge/cursor-review.md)。
 # 読めない・値が不正なら既定に倒さず止める (agy を選んだつもりが codex になるのを防ぐ)。読み口は lib_review_engine.py の 1 か所。
 if ! REVIEW_CFG="$(python3 "${SCRIPT_DIR}/lib_review_engine.py" get \
       --config "${CREWVIA_REPO_ROOT:-$REPO_ROOT}/config/crewvia.yaml" 2>&1)"; then
   fail_needs_director "NEEDS FIX: review engine config is invalid — ${REVIEW_CFG} (fail-closed, no fallback to codex)"
 fi
-{ IFS= read -r REVIEW_ENGINE; IFS= read -r AGY_MODEL; IFS= read -r AGY_TIMEOUT; } <<<"$REVIEW_CFG"
+{ IFS= read -r REVIEW_ENGINE; IFS= read -r AGY_MODEL; IFS= read -r AGY_TIMEOUT
+  IFS= read -r CURSOR_MODEL; IFS= read -r CURSOR_TIMEOUT; IFS= read -r REVIEW_COMPARE; } <<<"$REVIEW_CFG"
 _info "Review engine: ${REVIEW_ENGINE}"
 if [[ "$REVIEW_ENGINE" != agy ]] && ! command -v codex &>/dev/null; then
   fail_needs_director "NEEDS FIX: codex command not found on this machine"
@@ -628,7 +645,143 @@ Return only the JSON object required by the schema."
   return 0
 }
 
-AGY_COMPARE_NOTE=""   # both: Result に併記する agy (比較用) の節 (判定には使わない)
+# --- cursor (Cursor CLI: cursor-agent) 実行 ---
+# **比較専用** (both の compare からだけ呼ぶ。判定には使わない: 外を読む・出力の schema を強制できない。knowledge/cursor-review.md)。
+# Cursor のサブスクのログインのまま (API キーなし)。--mode plan (読み取り専用)・**--force / --yolo / --approve-mcps / --sandbox disabled は使わない**。
+# `--json-schema` が無いので、result の自由文の末尾の JSON を lib_review_engine.py extract-cursor が取り出して schema で検証する。
+# タイムアウトのフラグが無いので timeout で包む。prompt は位置引数で最後。diff は argv に載せず worktree の外の一時 dir (--add-dir)。
+# **fail-closed**: exit != 0 (timeout は 124) / JSON が読めない / is_error / subtype != success / findings の JSON が無い・schema 不適合 /
+#   実行の前後で worktree の指紋 (ignored を含む) が変わった / SIGTERM を無視して --kill-after で落とした → 成功を返さない。理由は CURSOR_FAIL (固定語彙)。成功なら findings の JSON を $1 に書く。
+CURSOR_FAIL=""
+CURSOR_DIAG=""
+cursor_collect_diag() {
+  CURSOR_DIAG="$(python3 "${SCRIPT_DIR}/lib_review_engine.py" diagnose --engine cursor --out "$CURSOR_OUT_FILE" --err "$CURSOR_ERR_FILE" 2>/dev/null)" \
+    || CURSOR_DIAG="(diagnostics unavailable)"
+}
+# 木の指紋 (追跡・未追跡・ignored の全パス + 各パスの lstat。lib_review_engine.py fingerprint)。
+# `status --porcelain` だけだと ignored (.claude/settings.local.json 等) の書き換えを見ない (Codex #313 r2 P2)。
+# HEAD (rev-parse) も足す (commit・reset で status が空のまま中身が変わる形。Codex #313 r3)。
+# 全 tracked ファイルの走査はしない: cursor は判定の後に走るので、書き換えは比較側の失敗として報告するだけ (knowledge/cursor-review.md)。
+# 実行の前後で比べる。git / python が失敗したら失敗を返す (素通りさせない)
+wt_fingerprint() {
+  local fp head
+  head="$(git -C "$1" rev-parse --verify HEAD 2>/dev/null)" || return 1
+  fp="$(set -o pipefail; git -C "$1" status --porcelain=v1 -z --ignored=matching --untracked-files=all 2>/dev/null \
+      | python3 "${SCRIPT_DIR}/lib_review_engine.py" fingerprint --root "$1" 2>/dev/null)" || return 1
+  [[ -n "$head" && -n "$fp" ]] || return 1
+  printf '%s %s\n' "$head" "$fp"
+}
+# timeout の SIGTERM を cursor-agent が無視しても待ち続けないよう、この秒数の後に SIGKILL (--kill-after)。
+# 強制終了 (timeout の exit 137) も失敗 (timeout_killed)
+CURSOR_KILL_AFTER_SECONDS=10
+# cursor は専用の使い捨て worktree (PR head と同じ commit) で走らせ、終わったら成否を問わず消す。
+# REVIEW_WT で走らせると、書き換え・途中失敗の汚れを both の codex / agy がそのまま読む (Codex #313 r1 P1)。
+run_cursor_review() {
+  local rc=0
+  CURSOR_FAIL=""
+  _run_cursor_review "$@" || rc=1
+  cursor_drop_wt
+  return $rc
+}
+_run_cursor_review() {
+  local out_to="$1" rc=0 findings
+  if ! command -v cursor-agent &>/dev/null; then CURSOR_FAIL="cursor_agent_not_found"; return 1; fi
+  # --trust はレビュー用 worktree (PR の中身) を信頼する。
+  # (1) Cursor の設定 (.cursor/ = MCP・権限・hook・rules、.cursorrules) が木のどこかにあれば走らせない (symlink も ls-files に出る)
+  # (2) PR が agent の設定 (.claude/ の settings・hooks・skills、.mcp.json、.codex/、.vscode/、AGENTS.md) を**変えて**いたら走らせない。
+  #     crewvia 自身が .claude/ を持つので「ある」では拒否できない。base (main = レビュー済み) の中身は信頼し、PR の変更だけを信頼しない
+  local cfg changed
+  if ! cfg="$(git -C "$REVIEW_WT" ls-files -z 2>/dev/null | tr '\0' '\n')"; then CURSOR_FAIL="worktree_status_failed"; return 1; fi
+  if [[ -e "${REVIEW_WT}/.cursor" || -L "${REVIEW_WT}/.cursor" ]] \
+      || grep -qE '(^|/)(\.cursor(/|$)|\.cursorrules$|\.cursorignore$)' <<<"$cfg"; then
+    CURSOR_FAIL="workspace_has_cursor_config"; return 1
+  fi
+  if ! changed="$(git -C "$REVIEW_WT" diff --no-renames --name-only -z "${DIFF_BASE}...HEAD" 2>/dev/null | tr '\0' '\n')"; then
+    CURSOR_FAIL="worktree_status_failed"; return 1
+  fi
+  # --no-renames: rename 検出だと .claude/ から外へ出した (= base の設定を消した) 元のパスが出ない (agy #313 r3)。
+  # 名前が .claude 等で終わる symlink も拾う。PR が足した・変えた symlink は行き先を問わず拒否 (設定の場所へ向けられる)
+  if grep -qE '(^|/)(\.(claude|codex|vscode)(/|$)|\.mcp\.json$|AGENTS\.md$)' <<<"$changed"; then
+    CURSOR_FAIL="pr_changes_agent_config"; return 1
+  fi
+  local raw
+  if ! raw="$(git -C "$REVIEW_WT" diff --no-renames --raw "${DIFF_BASE}...HEAD" 2>/dev/null)"; then
+    CURSOR_FAIL="worktree_status_failed"; return 1    # 取れないなら素通りさせない
+  fi
+  if grep -qE '^:[0-7]+ 120000 ' <<<"$raw"; then
+    CURSOR_FAIL="pr_changes_agent_config"; return 1
+  fi
+  [[ -n "$CURSOR_DIFF_DIR" ]] || CURSOR_DIFF_DIR="$(mktemp -d "${TMPDIR:-/tmp}/kai-review-cursor.XXXXXX")"
+  [[ -n "$CURSOR_OUT_FILE" ]] || CURSOR_OUT_FILE="$(mktemp "${TMPDIR:-/tmp}/kai-review-cursor-out.XXXXXX")"
+  [[ -n "$CURSOR_ERR_FILE" ]] || CURSOR_ERR_FILE="$(mktemp "${TMPDIR:-/tmp}/kai-review-cursor-err.XXXXXX")"
+  printf '%s' "$DIFF_CONTENT" > "${CURSOR_DIFF_DIR}/review.diff" || { CURSOR_FAIL="diff_write_failed"; return 1; }
+  : > "$CURSOR_OUT_FILE"; : > "$CURSOR_ERR_FILE"
+  CURSOR_WT="$(mktemp -d "${TMPDIR:-/tmp}/kai-review-cursor-wt.XXXXXX")"
+  if ! git -C "$WORK_DIR" worktree add --detach "$CURSOR_WT" "$FETCH_LOCAL_REF" >/dev/null 2>&1; then
+    CURSOR_FAIL="worktree_create_failed"; return 1
+  fi
+  local fp_before fp_after
+  if ! fp_before="$(wt_fingerprint "$CURSOR_WT")"; then CURSOR_FAIL="worktree_status_failed"; return 1; fi
+  local prompt
+  prompt="${REVIEW_PROMPT//the <stdin> block below/the file ${CURSOR_DIFF_DIR}/review.diff}"
+  prompt="${prompt}
+
+Read the unified diff from the file ${CURSOR_DIFF_DIR}/review.diff (it is outside this checkout; read it as a file).
+You may read files in this checkout to verify the code. Do not run commands. Do not create or modify any file.
+Your final message must END with the JSON object required by the schema (starting with {\"findings\"), with nothing after it."
+  _info "Running cursor-agent --mode plan --model ${CURSOR_MODEL} (diff=${DIFF_BYTES} bytes, timeout=${CURSOR_TIMEOUT}s) ..."
+  ( cd "$CURSOR_WT" && timeout --kill-after="${CURSOR_KILL_AFTER_SECONDS}s" "${CURSOR_TIMEOUT}s" cursor-agent -p --model "$CURSOR_MODEL" --mode plan --trust \
+      --output-format json --add-dir "$CURSOR_DIFF_DIR" "$prompt" ) >"$CURSOR_OUT_FILE" 2>"$CURSOR_ERR_FILE" || rc=$?
+  if [[ $rc -eq 124 ]]; then CURSOR_FAIL="timeout"; return 1; fi
+  if [[ $rc -eq 137 ]]; then CURSOR_FAIL="timeout_killed"; return 1; fi   # SIGTERM を無視して --kill-after で落とした
+  if [[ $rc -ne 0 ]]; then CURSOR_FAIL="exit_${rc}"; return 1; fi
+  if ! findings="$(python3 "${SCRIPT_DIR}/lib_review_engine.py" extract-cursor --out "$CURSOR_OUT_FILE" \
+        --schema "$SCHEMA_FILE" 2>&1)"; then
+    CURSOR_FAIL="${findings:-unparseable_output}"; CURSOR_FAIL="${CURSOR_FAIL%%$'\n'*}"; return 1
+  fi
+  if ! fp_after="$(wt_fingerprint "$CURSOR_WT")"; then CURSOR_FAIL="worktree_status_failed"; return 1; fi
+  if [[ "$fp_after" != "$fp_before" ]]; then CURSOR_FAIL="worktree_modified"; return 1; fi
+  printf '%s\n' "$findings" > "$out_to" || { CURSOR_FAIL="unparseable_output"; return 1; }
+  return 0
+}
+
+# both: Result に併記する比較用エンジンの節 (判定には使わない)。REVIEW_COMPARE は "agy,cursor" 形式。
+# cursor-agent は --mode plan / --sandbox でも worktree の外を読み書きできうる (実測。knowledge/cursor-review.md)。
+# だから cursor は**判定の後**に走らせる: codex (と agy) を先に走らせて判定に要る結果をシェル変数に取り、
+# それらの一時ファイルを消してから最後に cursor (専用 worktree)。cursor が何をしても判定は汚れない。
+# agy の一時物は走り終えたらすぐ消す。併記の順は compare に書いた順のまま。
+declare -A COMPARE_NOTE=()
+run_compare_engine() {
+  local eng="$1" cmp
+  cmp="$(mktemp "${TMPDIR:-/tmp}/kai-review-cmp.XXXXXX")"
+  case "$eng" in
+    agy)
+      if run_agy_review "$cmp"; then
+        COMPARE_NOTE[agy]="$(cat "$cmp")"
+      else
+        agy_collect_diag
+        COMPARE_NOTE[agy]="(agy failed: ${AGY_FAIL} — not used for the verdict)${AGY_DIAG:+
+${AGY_DIAG}}"
+      fi
+      rm -f "$AGY_OUT_FILE" "$AGY_ERR_FILE"; rm -rf "$AGY_DIFF_DIR"
+      AGY_OUT_FILE=""; AGY_ERR_FILE=""; AGY_DIFF_DIR="" ;;
+    cursor)
+      if run_cursor_review "$cmp"; then
+        COMPARE_NOTE[cursor]="$(cat "$cmp")"
+      else
+        cursor_collect_diag
+        COMPARE_NOTE[cursor]="(cursor failed: ${CURSOR_FAIL} — not used for the verdict)${CURSOR_DIAG:+
+${CURSOR_DIAG}}"
+      fi
+      rm -f "$CURSOR_OUT_FILE" "$CURSOR_ERR_FILE"; rm -rf "$CURSOR_DIFF_DIR"
+      CURSOR_OUT_FILE=""; CURSOR_ERR_FILE=""; CURSOR_DIFF_DIR="" ;;
+  esac
+  rm -f "$cmp"
+}
+IFS=, read -r -a COMPARE_LIST <<<"$REVIEW_COMPARE"
+compare_has() { local e; for e in "${COMPARE_LIST[@]}"; do [[ "$e" == "$1" ]] && return 0; done; return 1; }
+compare_model() { case "$1" in agy) echo "$AGY_MODEL" ;; cursor) echo "$CURSOR_MODEL" ;; esac; }
+
 case "$REVIEW_ENGINE" in
   codex) run_codex_review ;;
   agy)
@@ -641,15 +794,8 @@ ${AGY_DIAG}}"
     ;;
   both)
     run_codex_review
-    AGY_CMP_FILE="$(mktemp "${TMPDIR:-/tmp}/kai-review-agy-cmp.XXXXXX")"
-    if run_agy_review "$AGY_CMP_FILE"; then
-      AGY_COMPARE_NOTE="$(cat "$AGY_CMP_FILE")"
-    else
-      agy_collect_diag
-      AGY_COMPARE_NOTE="(agy failed: ${AGY_FAIL} — not used for the verdict)${AGY_DIAG:+
-${AGY_DIAG}}"
-    fi
-    rm -f "$AGY_CMP_FILE"
+    compare_has agy && run_compare_engine agy
+    # cursor は下で、判定に要る結果をシェル変数に取ってから走らせる
     ;;
 esac
 
@@ -665,6 +811,13 @@ fi
 
 REVIEW_CONTENT="$(cat "$OUTPUT_FILE")"
 _info "Review output length: ${#REVIEW_CONTENT} chars"
+
+# both の cursor は最後 (判定に要る結果は REVIEW_CONTENT / COMPARE_NOTE に取った)。codex の一時ファイルは先に消し、
+# cursor に読ませない・書き換えさせない。この後 REVIEW_WT・OUTPUT_FILE は読まない (cursor が触っても判定は変わらない)
+if [[ "$REVIEW_ENGINE" == both ]] && compare_has cursor; then
+  rm -f "$OUTPUT_FILE" "$STDERR_FILE"; OUTPUT_FILE=""; STDERR_FILE=""
+  run_compare_engine cursor
+fi
 
 # --- findings 判定 (F2, PR#180 / F-1, F-3, PR#180 QA fix) ---
 # 判定方針 (2026-09-08 現物確認: codex-cli 0.144.5 の `codex exec review`):
@@ -952,14 +1105,18 @@ RESULT_FILE="$(mktemp "${TMPDIR:-/tmp}/kai-review-result.XXXXXX")"
     echo ""
   fi
   # 見出しは旧 (codex のみ) と揃える: codex / both = "Codex raw output"、agy = "agy raw output"
-  if [[ "$REVIEW_ENGINE" == agy ]]; then echo "### agy raw output"; else echo "### Codex raw output"; fi
+  if [[ "$REVIEW_ENGINE" == agy ]]; then echo "### agy raw output"
+  else echo "### Codex raw output"; fi
   echo ""
   printf '%s\n' "$REVIEW_CONTENT"
   if [[ "$REVIEW_ENGINE" == "both" ]]; then
-    echo ""
-    echo "### agy (比較用 — 判定は Codex。model=${AGY_MODEL})"
-    echo ""
-    printf '%s\n' "$AGY_COMPARE_NOTE"
+    for _eng in "${COMPARE_LIST[@]}"; do
+      echo ""
+      echo "### ${_eng} (比較用 — 判定は Codex。model=$(compare_model "$_eng"))"
+      echo ""
+      [[ "$_eng" == cursor ]] && { echo "> 注意: cursor-agent は worktree の外も読める (秘密・同時に走る別のレビューの一時物が読まれうる。knowledge/cursor-review.md)。"; echo ""; }
+      printf '%s\n' "${COMPARE_NOTE[$_eng]}"
+    done
   fi
 } > "$RESULT_FILE"
 

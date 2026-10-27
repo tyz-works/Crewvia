@@ -296,8 +296,8 @@ Codex reviewer (Kai-codex) 起動ラッパー。詳細は `knowledge/codex-revie
 `--mission` を省略した呼び出しは、**pull の前に** `plan.sh resolve-mission` で
 実効 mission を 1 度だけ解決して全部に使う（記録名に mission が要るので、
 空だと記録が書かれず再 spawn ループが戻る）。
-レビュー先は `config/crewvia.yaml` の `review.engine`（codex / agy / both。既定 codex）。agy は fail-closed。
-読み口は `lib_review_engine.py`。詳細は `knowledge/agy-review.md`
+レビュー先は `config/crewvia.yaml` の `review.engine`（codex / agy / both。既定 codex）と `review.compare`（both で併記する一覧。既定 [agy]）。cursor は比較専用（compare にだけ置ける）。agy は fail-closed、比較側の失敗は併記だけ。
+読み口は `lib_review_engine.py`。詳細は `knowledge/agy-review.md` / `knowledge/cursor-review.md`
 
 ### `taskvia-sync.sh`
 

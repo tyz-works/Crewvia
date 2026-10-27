@@ -172,12 +172,12 @@ ALLOWED_JSON_PARSES: dict[tuple[str, str, str], str] = {
     ("lib_review_engine.py", "diagnose", "json.loads(raw_out)"):
         _EXTERNAL_RESPONSE + "失敗した agy の stdout (診断用に status / denied_actions を読むだけ)。"
         "デーモン側状態ストア (registry/daemons) のファイルではない。壊れていれば診断に出さないだけ (ValueError を捕まえる)",
-    ("lib_review_engine.py", "extract_cursor_findings", "json.loads(out_text)"):
+    ("lib_review_engine.py", "extract_cursor_findings", "json.loads(out_text, object_pairs_hook=_no_duplicate_keys)"):
         _EXTERNAL_RESPONSE + "cursor-agent の stdout (JSON 1 個)。デーモン側状態ストアではない。"
-        "読めない・形が違えば固定コードで fail-closed (needs-director)",
-    ("lib_review_engine.py", "extract_cursor_findings", "json.JSONDecoder()"):
-        _EXTERNAL_RESPONSE + "cursor-agent の result (自由文) の末尾の findings JSON を取り出す decoder。"
-        "取り出した値は findings の schema で検証し、通らなければ fail-closed",
+        "読めない・形が違う・重複キーなら固定コードで失敗 (cursor は比較専用。失敗は併記だけ)",
+    ("lib_review_engine.py", "extract_cursor_findings", "json.JSONDecoder(object_pairs_hook=_no_duplicate_keys)"):
+        _EXTERNAL_RESPONSE + "cursor-agent の result (自由文) の末尾の findings JSON を取り出す decoder (重複キーは拒否)。"
+        "取り出した値は findings の schema で検証し、通らなければ失敗 (cursor は比較専用。失敗は併記だけ)",
     ("lib_review_engine.py", "main", "json.load(f)"):
         _EXTERNAL_RESPONSE + "extract-cursor に渡された findings の JSON schema "
         "(config/kai-review-findings.schema.json。codex / agy にも渡す同じファイル)。読めなければ fail-closed",

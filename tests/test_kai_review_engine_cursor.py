@@ -1,5 +1,6 @@
-"""kai-review.sh のレビュー先 cursor (Cursor CLI: cursor-agent) と compare の一覧。cursor-agent は stub。
-判定は codex と同じ経路 (findings の JSON) を通る。設計・実測: knowledge/cursor-review.md"""
+"""kai-review.sh の比較用エンジン cursor (Cursor CLI: cursor-agent) と compare の一覧。cursor-agent は stub。
+cursor は比較専用 (both の compare にだけ置ける。engine: cursor は拒否。Codex #313 r5 の後の Director の方針)。
+判定は常に Codex。設計・実測: knowledge/cursor-review.md"""
 
 from __future__ import annotations
 
@@ -62,8 +63,9 @@ esac
 '''
 
 
-def run(tmp_path, monkeypatch, *, engine="cursor", cursor_mode="ok", cursor_findings=CLEAN, codex_out=CLEAN,
-        agy_mode="ok", agy_findings=CLEAN, config_text=None, extra_config="", with_codex=True, timeout=60):
+def run(tmp_path, monkeypatch, *, engine="both", compare="[cursor]", cursor_mode="ok", cursor_findings=CLEAN, codex_out=CLEAN,
+        agy_mode="ok", agy_findings=CLEAN, config_text=None, extra_config="", with_codex=True, timeout=60,
+        env_engine=None):
     for k, v in {"CURSOR_MODE": cursor_mode, "CURSOR_FINDINGS": cursor_findings, "CURSOR_FAKE_SECRET": FAKE_SECRET,
                  "CURSOR_ARGV_FILE": str(tmp_path / "cursor_argv.txt"),
                  "CURSOR_CWD_FILE": str(tmp_path / "cursor_cwd.txt"),
@@ -72,9 +74,12 @@ def run(tmp_path, monkeypatch, *, engine="cursor", cursor_mode="ok", cursor_find
                  "AGY_ARGV_FILE": str(tmp_path / "agy_argv.txt"), "AGY_CWD_FILE": str(tmp_path / "agy_cwd.txt")}.items():
         monkeypatch.setenv(k, v)
     monkeypatch.delenv("CREWVIA_REVIEW_ENGINE", raising=False)
+    if env_engine is not None:
+        monkeypatch.setenv("CREWVIA_REVIEW_ENGINE", env_engine)
     if config_text is None:
         config_text = (f"review:\n  engine: {engine}\n  cursor_model: grok-4.7-high\n"
-                       f"  cursor_timeout_seconds: {timeout}\n  agy_timeout_seconds: 90\n{extra_config}")
+                       f"  cursor_timeout_seconds: {timeout}\n  agy_timeout_seconds: 90\n"
+                       + (f"  compare: {compare}\n" if compare is not None else "") + extra_config)
     return run_kai_review(tmp_path, codex_out, config_text=config_text,
                           extra_exes={"cursor-agent": CURSOR_STUB, "agy": AGY_STUB}, with_codex=with_codex)
 
@@ -157,10 +162,32 @@ def test_bad_cursor_timeout_is_an_error(tmp_path, value):
     assert e.value.code == "bad_cursor_timeout"
 
 
-def test_env_selects_cursor(tmp_path):
+def test_engine_cursor_is_rejected_in_config(tmp_path):
+    """cursor は判定に使わない (外を読む・出力の schema を強制できない)。engine: cursor は既定に倒さず止める。"""
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text("review:\n  engine: cursor\n")
+    with pytest.raises(lre.ReviewConfigError) as e:
+        lre.load_full(cfg, environ={})
+    assert e.value.code == "bad_engine"
+
+
+def test_engine_cursor_is_rejected_in_env(tmp_path):
     cfg = tmp_path / "c.yaml"
     cfg.write_text("review:\n  engine: codex\n")
-    assert lre.load_full(cfg, environ={"CREWVIA_REVIEW_ENGINE": "cursor"})["engine"] == "cursor"
+    with pytest.raises(lre.ReviewConfigError) as e:
+        lre.load_full(cfg, environ={"CREWVIA_REVIEW_ENGINE": "cursor"})
+    assert e.value.code == "bad_engine_env"
+
+
+@pytest.mark.parametrize("via", ["config", "env"])
+def test_engine_cursor_stops_kai_review_without_running_anything(tmp_path, monkeypatch, via):
+    if via == "config":
+        p, capture = run(tmp_path, monkeypatch, engine="cursor", compare=None)
+    else:
+        p, capture = run(tmp_path, monkeypatch, engine="codex", compare=None, env_engine="cursor")
+    assert _verdict(tmp_path) == "needs-director", (p.stdout, p.stderr)
+    assert "bad_engine" in _text(tmp_path)
+    assert not (tmp_path / "cursor_argv.txt").exists()
 
 
 # --- findings の取り出し (lib) ---
@@ -224,6 +251,26 @@ def test_extract_does_not_recover_a_nested_object_from_malformed_output(result):
     assert e.value.code == "no_findings_json"
 
 
+@pytest.mark.parametrize("out", [
+    # json は後勝ちで黙って読む: P1 の後ろの "findings":[] が空 findings になる形
+    _envelope('{"findings":[' + _P1 + '],"findings":[]}'),
+    _envelope('前置き。{"findings":[{"priority":"P1","priority":"P3","title":"t","body":null,"file":null}]}'),
+    # 外側 (cursor-agent の envelope) の重複も読まない
+    '{"type":"result","subtype":"success","is_error":true,"is_error":false,"result":"{\\"findings\\":[]}"}',
+])
+def test_extract_rejects_duplicate_keys(out):
+    """重複キーは後勝ちで読まずに止める (cursor は比較専用だが、安い穴は塞ぐ。Director #313 r5)。"""
+    with pytest.raises(lre.CursorOutputError) as e:
+        lre.extract_cursor_findings(out, SCHEMA)
+    assert e.value.code == "duplicate_key"
+
+
+def test_duplicate_key_in_compare_output_is_recorded_as_a_failure(tmp_path, monkeypatch):
+    p, capture = run(tmp_path, monkeypatch, cursor_findings='{"findings":[' + _P1 + '],"findings":[]}')
+    assert _verdict(tmp_path) == "done", (p.stdout, p.stderr)
+    assert "cursor failed: duplicate_key" in _result(capture, "done")
+
+
 def test_extract_takes_the_whole_trailing_object_not_its_nested_findings():
     found = lre.extract_cursor_findings(_envelope('x {"findings":[' + _P1 + ']}'), SCHEMA)
     assert [f["priority"] for f in found["findings"]] == ["P1"]
@@ -233,10 +280,10 @@ def test_extract_takes_the_whole_trailing_object_not_its_nested_findings():
     assert e.value.code == "schema_invalid"
 
 
-# --- cursor 単独 ---
+# --- cursor は both の compare で走る (判定は Codex) ---
 
 def test_cursor_clean_review_is_done_with_read_only_flags(tmp_path, monkeypatch):
-    p, capture = run(tmp_path, monkeypatch, codex_out="NOT USED")
+    p, capture = run(tmp_path, monkeypatch)
     assert _verdict(tmp_path) == "done", (p.stdout, p.stderr)
     argv = (tmp_path / "cursor_argv.txt").read_text().splitlines()
     assert argv[0] == "-p"
@@ -251,15 +298,15 @@ def test_cursor_clean_review_is_done_with_read_only_flags(tmp_path, monkeypatch)
     assert "Do not run commands" in "\n".join(prompt)
     assert "+change" not in "\n".join(argv)                          # diff は argv に載せない
     assert "kai-review-cursor-wt." in (tmp_path / "cursor_cwd.txt").read_text()   # REVIEW_WT ではない専用の worktree
-    assert "### cursor raw output" in _result(capture, "done")
+    assert "### cursor (比較用 — 判定は Codex。model=grok-4.7-high)" in _result(capture, "done")
     assert not list(tmp_path.glob("kai-review-cursor*"))              # 一時物 (専用 worktree を含む) は後片付けで消える
 
 
 @pytest.mark.parametrize("mode", ["ok", "fenced", "bare", "pretty"])
-def test_cursor_findings_need_director(tmp_path, monkeypatch, mode):
+def test_cursor_findings_are_shown_but_codex_decides(tmp_path, monkeypatch, mode):
     p, capture = run(tmp_path, monkeypatch, cursor_mode=mode, cursor_findings=CURSOR_P1)
-    assert _verdict(tmp_path) == "needs-director", (p.stdout, p.stderr)
-    assert "cursor-found" in _result(capture, "needs-director")
+    assert _verdict(tmp_path) == "done", (p.stdout, p.stderr)              # cursor の P1 は判定に使わない
+    assert "cursor-found" in _result(capture, "done")
 
 
 @pytest.mark.parametrize("mode,reason", [
@@ -267,24 +314,24 @@ def test_cursor_findings_need_director(tmp_path, monkeypatch, mode):
     ("trailing", "no_findings_json"), ("schema", "schema_invalid"), ("extra", "schema_invalid"),
     ("garbage", "unparseable_output"), ("dirty", "worktree_modified"),
 ])
-def test_cursor_fail_closed_never_lgtm(tmp_path, monkeypatch, mode, reason):
-    p, capture = run(tmp_path, monkeypatch, cursor_mode=mode)          # findings は空 = 通せば LGTM になる形
-    assert _verdict(tmp_path) == "needs-director", (mode, p.stdout, p.stderr)
-    assert not (capture / "done.txt").exists()
-    assert any(f"CURSOR FAILURE: {reason}" in c for c in _calls(tmp_path)), (_calls(tmp_path), p.stderr)
+def test_cursor_failure_is_recorded_not_read_as_a_clean_review(tmp_path, monkeypatch, mode, reason):
+    """読めない・失敗した cursor の出力を「空の findings」として併記しない。失敗の理由だけを併記し、判定は Codex。"""
+    p, capture = run(tmp_path, monkeypatch, cursor_mode=mode)          # findings は空 = 誤読すれば「指摘なし」の形
+    assert _verdict(tmp_path) == "done", (mode, p.stdout, p.stderr)
+    assert f"cursor failed: {reason}" in _result(capture, "done"), _result(capture, "done")
 
 
 def test_cursor_timeout_is_fail_closed(tmp_path, monkeypatch):
     p, capture = run(tmp_path, monkeypatch, cursor_mode="sleep", timeout=1)
-    assert _verdict(tmp_path) == "needs-director", (p.stdout, p.stderr)
-    assert any("CURSOR FAILURE: timeout" in c for c in _calls(tmp_path)), _calls(tmp_path)
+    assert _verdict(tmp_path) == "done", (p.stdout, p.stderr)
+    assert "cursor failed: timeout" in _result(capture, "done")
 
 
 def test_weekly_quota_refusal_keeps_one_redacted_line(tmp_path, monkeypatch):
     """枠外のモデル: 約 9 秒で exit 1・stdout 空・stderr に ActionRequiredError (2026-10-27 実測の形)。"""
     p, capture = run(tmp_path, monkeypatch, cursor_mode="action")
-    text = _text(tmp_path)
-    assert "CURSOR FAILURE: exit_1" in text and "cursor diagnostics" in text
+    text = _result(capture, "done")
+    assert "cursor failed: exit_1" in text
     assert "ActionRequiredError: gpt-5.6-sol-high is not included in your weekly usage" in text
     assert FAKE_SECRET not in text and "REDACTED" in text
 
@@ -293,7 +340,7 @@ def test_failure_diagnostics_do_not_echo_the_result_text(tmp_path, monkeypatch):
     """is_error の stdout の result (レビュー本文・コード片) は診断に出さない。型・subtype・is_error だけ。"""
     p, capture = run(tmp_path, monkeypatch, cursor_mode="is_error",
                      cursor_findings=json.dumps({"findings": [], "note": "SECRET-BODY-TEXT"}))
-    text = _text(tmp_path)
+    text = _result(capture, "done")
     assert "stdout is_error: True" in text and "stdout subtype: success" in text
     assert "SECRET-BODY-TEXT" not in text
 
@@ -302,7 +349,7 @@ def test_failure_diagnostics_do_not_echo_the_result_text(tmp_path, monkeypatch):
 def test_findings_are_redacted_before_the_result(tmp_path, monkeypatch, body):
     leak = json.dumps({"findings": [{"priority": "P2", "title": f"t {FAKE_SECRET}", "body": body, "file": None}]})
     p, capture = run(tmp_path, monkeypatch, cursor_findings=leak)
-    text = _result(capture, "needs-director")
+    text = _result(capture, "done")
     assert FAKE_SECRET not in text and "REDACTED" in text
 
 
@@ -332,29 +379,32 @@ def test_cursor_does_not_run_when_the_checkout_carries_cursor_config(tmp_path, m
         return orig(root, *args)
     monkeypatch.setitem(run_kai_review.__globals__, "_git", git_with_cursor_dir)
     p, capture = run(tmp_path, monkeypatch)
-    assert _verdict(tmp_path) == "needs-director", (p.stdout, p.stderr)
-    assert any("CURSOR FAILURE: workspace_has_cursor_config" in c for c in _calls(tmp_path)), _calls(tmp_path)
+    assert _verdict(tmp_path) == "done", (p.stdout, p.stderr)
+    assert "cursor failed: workspace_has_cursor_config" in _result(capture, "done")
     assert not (tmp_path / "cursor_argv.txt").exists()
 
 
-def test_cursor_engine_does_not_require_codex(tmp_path, monkeypatch):
+def test_compare_cursor_still_requires_codex(tmp_path, monkeypatch):
+    """判定は Codex なので、compare に cursor があっても codex が無ければ止める (cursor だけで LGTM にしない)。"""
     p, capture = run(tmp_path, monkeypatch, with_codex=False)
-    assert _verdict(tmp_path) == "done", (p.stdout, p.stderr)
+    assert _verdict(tmp_path) == "needs-director", (p.stdout, p.stderr)
+    assert "codex command not found" in _text(tmp_path)
+    assert not (tmp_path / "cursor_argv.txt").exists()
 
 
 def test_cursor_missing_is_fail_closed(tmp_path, monkeypatch):
     import os
     monkeypatch.setenv("PATH", ":".join(d for d in os.environ["PATH"].split(":")
                                         if not os.access(os.path.join(d, "cursor-agent"), os.X_OK)))
-    p, capture = run_kai_review(tmp_path, CLEAN, config_text="review:\n  engine: cursor\n")
-    assert _verdict(tmp_path) == "needs-director", (p.stdout, p.stderr)
-    assert any("CURSOR FAILURE: cursor_agent_not_found" in c for c in _calls(tmp_path)), _calls(tmp_path)
+    p, capture = run_kai_review(tmp_path, CLEAN, config_text="review:\n  engine: both\n  compare: [cursor]\n")
+    assert _verdict(tmp_path) == "done", (p.stdout, p.stderr)
+    assert "cursor failed: cursor_agent_not_found" in _result(capture, "done")
 
 
 # --- both + compare ---
 
 def test_both_default_compare_is_agy_only(tmp_path, monkeypatch):
-    p, capture = run(tmp_path, monkeypatch, engine="both", agy_findings=CURSOR_P1.replace("cursor", "agy"))
+    p, capture = run(tmp_path, monkeypatch, compare=None, agy_findings=CURSOR_P1.replace("cursor", "agy"))
     assert _verdict(tmp_path) == "done", (p.stdout, p.stderr)
     text = _result(capture, "done")
     assert "### agy (比較用 — 判定は Codex。model=gemini-4-argon-high)" in text and "agy-found" in text
@@ -363,8 +413,7 @@ def test_both_default_compare_is_agy_only(tmp_path, monkeypatch):
 
 
 def test_both_with_agy_and_cursor_appends_both_in_order_and_codex_decides(tmp_path, monkeypatch):
-    p, capture = run(tmp_path, monkeypatch, engine="both", extra_config="  compare: [agy, cursor]\n",
-                     cursor_findings=CURSOR_P1)
+    p, capture = run(tmp_path, monkeypatch, compare="[agy, cursor]", cursor_findings=CURSOR_P1)
     assert _verdict(tmp_path) == "done", (p.stdout, p.stderr)            # cursor が P1 でも判定は codex
     text = _result(capture, "done")
     a = text.index("### agy (比較用 — 判定は Codex。model=gemini-4-argon-high)")
@@ -377,8 +426,7 @@ def test_both_with_agy_and_cursor_appends_both_in_order_and_codex_decides(tmp_pa
 def test_both_runs_cursor_last_after_the_other_temp_files_are_gone(tmp_path, monkeypatch, compare):
     """cursor は worktree の外を読み書きできうるので、codex と agy が走り終えて判定に要る結果をシェル変数に取り、
     一時ファイルを消した後に走らせる (Director #313 r3)。compare の順に関わらず cursor は最後・併記は compare の順。"""
-    p, capture = run(tmp_path, monkeypatch, engine="both", extra_config=f"  compare: {compare}\n",
-                     codex_out=CODEX_P1, cursor_findings=CURSOR_P1)
+    p, capture = run(tmp_path, monkeypatch, compare=compare, codex_out=CODEX_P1, cursor_findings=CURSOR_P1)
     assert _verdict(tmp_path) == "needs-director", (p.stdout, p.stderr)
     assert (tmp_path / "cursor_seen.txt").read_text() == "agy-ran\n"
     text = _result(capture, "needs-director")
@@ -387,7 +435,7 @@ def test_both_runs_cursor_last_after_the_other_temp_files_are_gone(tmp_path, mon
 
 
 def test_both_cursor_failure_is_recorded_but_does_not_decide(tmp_path, monkeypatch):
-    p, capture = run(tmp_path, monkeypatch, engine="both", extra_config="  compare: [cursor]\n", cursor_mode="action")
+    p, capture = run(tmp_path, monkeypatch, cursor_mode="action")
     assert _verdict(tmp_path) == "done", (p.stdout, p.stderr)
     text = _result(capture, "done")
     assert "cursor failed: exit_1" in text and "ActionRequiredError" in text and FAKE_SECRET not in text
@@ -395,7 +443,7 @@ def test_both_cursor_failure_is_recorded_but_does_not_decide(tmp_path, monkeypat
 
 
 def test_bad_compare_in_config_stops_the_review(tmp_path, monkeypatch):
-    p, capture = run(tmp_path, monkeypatch, engine="both", extra_config="  compare: [codex]\n")
+    p, capture = run(tmp_path, monkeypatch, compare="[codex]")
     assert _verdict(tmp_path) == "needs-director", (p.stdout, p.stderr)
     assert "bad_compare" in _text(tmp_path)
 
@@ -415,8 +463,8 @@ def test_cursor_does_not_run_when_the_pr_changes_agent_config(tmp_path, monkeypa
         return orig(root, *args)
     monkeypatch.setitem(run_kai_review.__globals__, "_git", git_with_change)
     p, capture = run(tmp_path, monkeypatch)
-    assert _verdict(tmp_path) == "needs-director", (p.stdout, p.stderr)
-    assert any("CURSOR FAILURE: pr_changes_agent_config" in c for c in _calls(tmp_path)), _calls(tmp_path)
+    assert _verdict(tmp_path) == "done", (p.stdout, p.stderr)
+    assert "cursor failed: pr_changes_agent_config" in _result(capture, "done")
     assert not (tmp_path / "cursor_argv.txt").exists()
 
 
@@ -452,8 +500,8 @@ def test_cursor_does_not_run_when_the_pr_adds_a_symlink(tmp_path, monkeypatch, n
         return orig(root, *args)
     monkeypatch.setitem(run_kai_review.__globals__, "_git", git_with_link)
     p, capture = run(tmp_path, monkeypatch)
-    assert _verdict(tmp_path) == "needs-director", (p.stdout, p.stderr)
-    assert any("CURSOR FAILURE: pr_changes_agent_config" in c for c in _calls(tmp_path)), _calls(tmp_path)
+    assert _verdict(tmp_path) == "done", (p.stdout, p.stderr)
+    assert "cursor failed: pr_changes_agent_config" in _result(capture, "done")
     assert not (tmp_path / "cursor_argv.txt").exists()
 
 
@@ -462,7 +510,7 @@ def test_cursor_does_not_run_when_the_pr_adds_a_symlink(tmp_path, monkeypatch, n
 @pytest.mark.parametrize("mode", ["dirty", "dirty_fail"])
 def test_both_cursor_dirtying_its_worktree_does_not_reach_codex(tmp_path, monkeypatch, mode):
     """cursor が自分の checkout を書き換えても (成功・途中失敗とも)、codex / agy の REVIEW_WT は汚れない。"""
-    p, capture = run(tmp_path, monkeypatch, engine="both", extra_config="  compare: [agy, cursor]\n", cursor_mode=mode)
+    p, capture = run(tmp_path, monkeypatch, compare="[agy, cursor]", cursor_mode=mode)
     assert _verdict(tmp_path) == "done", (p.stdout, p.stderr)               # 判定は codex のまま
     text = _result(capture, "done")
     assert "cursor failed: " in text
@@ -478,17 +526,16 @@ def test_both_cursor_writing_into_the_review_worktree_cannot_change_the_verdict(
                                                                                  codex_out, verdict):
     """cursor は判定の後に走るので、専用 worktree の外 (REVIEW_WT) を書き換えても判定は codex の結果のまま
     (脅威モデル: cursor の誤った書き込みから判定を守る。knowledge/cursor-review.md)。"""
-    p, capture = run(tmp_path, monkeypatch, engine="both", extra_config="  compare: [cursor]\n", cursor_mode=mode,
-                     codex_out=codex_out)
+    p, capture = run(tmp_path, monkeypatch, cursor_mode=mode, codex_out=codex_out)
     assert _verdict(tmp_path) == verdict, (p.stdout, p.stderr)
     assert "REVIEW WORKTREE MODIFIED" not in _text(tmp_path)
     assert (tmp_path / "cursor_seen.txt").read_text() == ""          # codex の一時ファイルは先に消えている
 
 
-def test_cursor_engine_dirty_worktree_is_removed_after_failure(tmp_path, monkeypatch):
+def test_cursor_dirty_worktree_is_removed_after_failure(tmp_path, monkeypatch):
     p, capture = run(tmp_path, monkeypatch, cursor_mode="dirty_fail")
-    assert _verdict(tmp_path) == "needs-director", (p.stdout, p.stderr)
-    assert any("CURSOR FAILURE: exit_3" in c for c in _calls(tmp_path)), _calls(tmp_path)
+    assert _verdict(tmp_path) == "done", (p.stdout, p.stderr)
+    assert "cursor failed: exit_3" in _result(capture, "done")
     assert not list(tmp_path.glob("kai-review-cursor*"))
 
 
@@ -497,16 +544,16 @@ def test_cursor_engine_dirty_worktree_is_removed_after_failure(tmp_path, monkeyp
 def test_cursor_writing_an_ignored_file_is_worktree_modified(tmp_path, monkeypatch):
     """`status --porcelain` には出ない ignored のファイルを足しても、前後の指紋で拾う。"""
     p, capture = run(tmp_path, monkeypatch, cursor_mode="ignored_write")
-    assert _verdict(tmp_path) == "needs-director", (p.stdout, p.stderr)
-    assert any("CURSOR FAILURE: worktree_modified" in c for c in _calls(tmp_path)), _calls(tmp_path)
+    assert _verdict(tmp_path) == "done", (p.stdout, p.stderr)
+    assert "cursor failed: worktree_modified" in _result(capture, "done")
 
 
 @pytest.mark.parametrize("mode", ["commit", "checkout"])
 def test_cursor_moving_head_is_worktree_modified(tmp_path, monkeypatch, mode):
     """commit・checkout は status を空のまま中身を変える。指紋の HEAD で拾う (Codex #313 r3)。"""
     p, capture = run(tmp_path, monkeypatch, cursor_mode=mode)
-    assert _verdict(tmp_path) == "needs-director", (p.stdout, p.stderr)
-    assert any("CURSOR FAILURE: worktree_modified" in c for c in _calls(tmp_path)), _calls(tmp_path)
+    assert _verdict(tmp_path) == "done", (p.stdout, p.stderr)
+    assert "cursor failed: worktree_modified" in _result(capture, "done")
 
 
 def test_cursor_does_not_run_when_the_pr_renames_agent_config_away(tmp_path, monkeypatch):
@@ -524,8 +571,8 @@ def test_cursor_does_not_run_when_the_pr_renames_agent_config_away(tmp_path, mon
         return orig(root, *args)
     monkeypatch.setitem(run_kai_review.__globals__, "_git", git_with_rename)
     p, capture = run(tmp_path, monkeypatch)
-    assert _verdict(tmp_path) == "needs-director", (p.stdout, p.stderr)
-    assert any("CURSOR FAILURE: pr_changes_agent_config" in c for c in _calls(tmp_path)), _calls(tmp_path)
+    assert _verdict(tmp_path) == "done", (p.stdout, p.stderr)
+    assert "cursor failed: pr_changes_agent_config" in _result(capture, "done")
     assert not (tmp_path / "cursor_argv.txt").exists()
 
 
@@ -553,16 +600,9 @@ def test_cursor_ignoring_sigterm_is_killed_and_fail_closed(tmp_path, monkeypatch
     t0 = time.monotonic()
     p, capture = run(tmp_path, monkeypatch, cursor_mode="ignore_term", timeout=1)
     assert time.monotonic() - t0 < 60, "timeout が SIGKILL に進まず待ち続けた"
-    assert _verdict(tmp_path) == "needs-director", (p.stdout, p.stderr)
-    assert any("CURSOR FAILURE: timeout_killed" in c for c in _calls(tmp_path)), _calls(tmp_path)
-    assert not list(tmp_path.glob("kai-review-cursor*"))
-
-
-def test_both_cursor_ignoring_sigterm_still_lets_codex_decide(tmp_path, monkeypatch):
-    p, capture = run(tmp_path, monkeypatch, engine="both", extra_config="  compare: [cursor]\n",
-                     cursor_mode="ignore_term", timeout=1)
     assert _verdict(tmp_path) == "done", (p.stdout, p.stderr)
     assert "cursor failed: timeout_killed" in _result(capture, "done")
+    assert not list(tmp_path.glob("kai-review-cursor*"))
 
 
 def test_fingerprint_sees_inside_a_collapsed_ignored_dir_even_with_mtime_restored(tmp_path):

@@ -122,8 +122,13 @@ def _tail_text(path):
         with open(path, 'rb') as f:
             f.seek(0, os.SEEK_END)
             size = f.tell()
-            f.seek(max(0, size - _DIAG_READ_BYTES))
-            return f.read().decode('utf-8', 'replace')
+            start = max(0, size - _DIAG_READ_BYTES)
+            f.seek(start)
+            text = f.read().decode('utf-8', 'replace')
+        if start > 0:
+            # 窓の先頭は途中から始まる (token を割っている) ので、最初の行は捨てる
+            text = text.partition('\n')[2]
+        return text
     except OSError:
         return ''
 

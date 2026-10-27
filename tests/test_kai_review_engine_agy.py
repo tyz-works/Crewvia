@@ -299,3 +299,12 @@ def test_diagnose_is_bounded_and_withholds_when_redaction_fails(tmp_path, monkey
         raise lib_checkpoint.RedactionError("x")
     monkeypatch.setattr(lib_checkpoint, "redact", boom)
     assert lre.diagnose(str(out), str(err)) == lre._WITHHELD
+
+
+def test_diagnose_drops_the_partial_first_line_of_a_truncated_window(tmp_path):
+    err, out = tmp_path / "e", tmp_path / "o"
+    out.write_text("")
+    cut = FAKE_SECRET[8:]   # 窓の先頭で token が割れた残り
+    err.write_text(cut + "x" * lre._DIAG_READ_BYTES + "\nlast line\n")
+    text = lre.diagnose(str(out), str(err))
+    assert cut not in text and "last line" in text

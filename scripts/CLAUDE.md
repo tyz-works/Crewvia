@@ -163,7 +163,7 @@ lib ごとの**破ってはいけない契約**の要約。理由・経緯・全
 
 - `plan.sh retry <id> --reason "<理由>" [--mission] [--over-cap "<理由>"]` → Controller の `reopen_task(kind='retry')`（PR-F が同じ関数に `reopen` を足す）。
   遷移元は `lib_task_status.ACCEPTS_FROM['retry']`（failed / needs_director / needs_human_review / verification_failed）→ pending。順序は 台帳（kind=retry）→ card（コミット点）→ 枠の撤去。
-  **試行が active（reserved / running。running のまま残る needs_human_review も）は `ATTEMPT_ACTIVE`**、遷移元でない status と試行の記録が無い card は `RETRY_NOT_ALLOWED`、
+  **試行が active（reserved / running。running のまま残る needs_human_review も。`update --close-execution` は DETACHED しか閉じないのでここでは使えず、出口は `update --status pending --reset` だけ）は `ATTEMPT_ACTIVE`**、遷移元でない status と試行の記録が無い card は `RETRY_NOT_ALLOWED`、
   上限は `ATTEMPT_CAP`。どれも exit 3・何も書かない（`_NO_WRITE_REFUSALS` = `UsageExit`）。理由・`--over-cap` はロックの前に `check_reason` で検査（空・制御文字・501 字以上）。
 - 保つ: pr_number・task_slug・execution_count・rework_count・試行の欄。消す: worker / started_at / completed_at と handoff_path / fail_head / fail_head_waiver（**台帳の retry に写してから**）。
   理由は台帳にだけ（監査ログに出さない・secret テスト）。handoff の**ファイルは退避しない**（`previous_attempt.handoff_path` が指す）。
@@ -172,6 +172,7 @@ lib ごとの**破ってはいけない契約**の要約。理由・経緯・全
 - `pull` の `previous_attempt` は、結果の台帳（Result 全文）を `history_path` に、retry の台帳から `handoff_path` / `head` / `retry_reason` を補う（`lib_history.previous_attempt`）。
 - `store-check` の `history_orphan` は `lib_history.orphan_reason`: 結果の台帳の `end_code` が、その試行の終わり方（今の試行は card・過去は record）と違えば孤児（`<kind>:closed_by=<END_CODE>`）。読み取りだけ。
 - `update --reset` は残してある（理由が要らない差し戻し・壊れた card の出口）。テスト: `tests/test_retry_plan_sh.py`。
+- **運用規則（誰が何を打つか）は文書側**: 理由が要る差し戻しは Director の `retry`、Codex / QA の指摘の修正は実装 task の `reopen --cascade reviews`、Worker は pull の `previous_attempt` を作業前に読む（`agents/director.md`「差し戻しと指摘の修正」・`agents/worker.md`）。台帳（`history/`）を書くのは Controller の `_finish` / `reopen_task` だけで、Director も Worker もファイルを直接編集しない。`pull` の JSON に `reopen_count` は出ない（Worker は `retry_reason` の有無で見る）。dispatcher の `[needs_director]` / 段階上げの通知文は今も `update --reset` だけを案内している（未更新）。
 - **台帳に書く値は読み戻して同じになる**（t034）: 読み手は `splitlines()` で行を割るので、`check_reason` は U+0085 / U+2028 / U+2029 も断り、`lib_history.render` は書く前に `parse` で読み戻して食い違えば `HistoryError('not_roundtrip')`（何も書かない）。理由の畳みは 200 字で切った後に `rstrip`。`orphan_reason` は過去の record を `ex.record_shape_problem` に通し、card の欄は型を見てから集合と照合する（壊れていれば推定を飛ばす）。テスト: `tests/test_ledger_roundtrip_and_broken_records.py`。
 - 戻し方: PR revert → `scripts/sync-main-checkout.sh`。台帳の retry・card の `max_attempts` は残ってよい（旧コードは読まない）。
 

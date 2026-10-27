@@ -259,6 +259,8 @@ DAEMON_RESTART_FILES = {
         "scripts/lib_task_status.py",
         # vNext 02 PR-G: lib_retirement が退役の直前の checkpoint に使う (呼ぶ時に import するが、起動後の変更は拾わない)
         "scripts/lib_checkpoint.py",
+        # 2026-10-27: 見送り通知に PR の CI の 1 行を添える (呼ぶ時に import するが、起動後の変更は拾わない)
+        "scripts/lib_ci_status.py",
     ),
 }
 

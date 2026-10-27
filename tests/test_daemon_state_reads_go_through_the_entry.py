@@ -172,6 +172,11 @@ ALLOWED_JSON_PARSES: dict[tuple[str, str, str], str] = {
     ("lib_review_engine.py", "diagnose", "json.loads(raw_out)"):
         _EXTERNAL_RESPONSE + "失敗した agy の stdout (診断用に status / denied_actions を読むだけ)。"
         "デーモン側状態ストア (registry/daemons) のファイルではない。壊れていれば診断に出さないだけ (ValueError を捕まえる)",
+    ("lib_ci_status.py", "parse_view", "json.loads(text)"):
+        _EXTERNAL_RESPONSE + "`gh pr view --json headRefOid,statusCheckRollup` の stdout。形の検証はこの関数の中 "
+        "(head は 40 hex・rollup は list・頼んだ欄が無ければ ValueError → 呼び出し元が unknown にする)",
+    ("lib_ci_status.py", "parse_pr_list", "json.loads(text)"):
+        _EXTERNAL_RESPONSE + "`gh pr list --json number,isCrossRepository` の stdout。形が違えば ValueError → unknown",
     ("lib_mux.py", "_herdr_ping", "json.loads(data.decode().strip())"):
         _EXTERNAL_RESPONSE + "herdr socket の ping 応答。壊れていれば「応答なし」と読む",
     ("lib_mux.py", "_herdr_run", "json.loads(r.stdout)"):

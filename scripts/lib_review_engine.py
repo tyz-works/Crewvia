@@ -317,7 +317,15 @@ def main(argv=None):
                 schema = json.load(f)
             with open(args.out, encoding='utf-8', errors='replace') as f:
                 text = f.read()
-            print(json.dumps(extract_cursor_findings(text, schema), ensure_ascii=False, separators=(',', ':')))
+            found = json.dumps(extract_cursor_findings(text, schema), ensure_ascii=False, separators=(',', ':'))
+            # cursor は worktree の外 (秘密を含みうる) も読める。Result に入る前に伏せ字を通す。伏せ字が失敗したら出さない
+            import lib_checkpoint
+            try:
+                found = lib_checkpoint.redact(found)[0]
+            except Exception:
+                print('redaction_failed', file=sys.stderr)
+                return 1
+            print(found)
         except CursorOutputError as e:
             print(e.code, file=sys.stderr)
             return 1

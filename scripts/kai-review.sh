@@ -651,6 +651,8 @@ run_cursor_review() {
   local out_to="$1" rc=0 findings
   CURSOR_FAIL=""
   if ! command -v cursor-agent &>/dev/null; then CURSOR_FAIL="cursor_agent_not_found"; return 1; fi
+  # --trust はレビュー用 worktree (PR の中身) を信頼する。PR が .cursor/ (MCP・権限・hook の設定) を持ち込んだら走らせない
+  if [[ -e "${REVIEW_WT}/.cursor" ]]; then CURSOR_FAIL="workspace_has_cursor_config"; return 1; fi
   [[ -n "$CURSOR_DIFF_DIR" ]] || CURSOR_DIFF_DIR="$(mktemp -d "${TMPDIR:-/tmp}/kai-review-cursor.XXXXXX")"
   [[ -n "$CURSOR_OUT_FILE" ]] || CURSOR_OUT_FILE="$(mktemp "${TMPDIR:-/tmp}/kai-review-cursor-out.XXXXXX")"
   [[ -n "$CURSOR_ERR_FILE" ]] || CURSOR_ERR_FILE="$(mktemp "${TMPDIR:-/tmp}/kai-review-cursor-err.XXXXXX")"
@@ -661,7 +663,7 @@ run_cursor_review() {
   prompt="${prompt}
 
 Read the unified diff from the file ${CURSOR_DIFF_DIR}/review.diff (it is outside this checkout; read it as a file).
-You may read files and run read-only commands to verify the code. Do not create or modify any file.
+You may read files in this checkout to verify the code. Do not run commands. Do not create or modify any file.
 Your final message must END with the JSON object required by the schema (starting with {\"findings\"), with nothing after it."
   _info "Running cursor-agent --mode plan --model ${CURSOR_MODEL} (diff=${DIFF_BYTES} bytes, timeout=${CURSOR_TIMEOUT}s) ..."
   ( cd "$REVIEW_WT" && timeout "${CURSOR_TIMEOUT}s" cursor-agent -p --model "$CURSOR_MODEL" --mode plan --trust \
@@ -679,38 +681,41 @@ Your final message must END with the JSON object required by the schema (startin
   return 0
 }
 
-# both: Result に併記する比較用エンジンの節 (判定には使わない)。REVIEW_COMPARE は "agy,cursor" 形式
-COMPARE_NOTES=()
-run_compare_engines() {
-  local eng cmp
-  COMPARE_NOTES=()
-  IFS=, read -r -a _cmp_list <<<"$REVIEW_COMPARE"
-  for eng in "${_cmp_list[@]}"; do
-    cmp="$(mktemp "${TMPDIR:-/tmp}/kai-review-cmp.XXXXXX")"
-    case "$eng" in
-      agy)
-        if run_agy_review "$cmp"; then
-          COMPARE_NOTES+=("agy|${AGY_MODEL}|$(cat "$cmp")")
-        else
-          agy_collect_diag
-          COMPARE_NOTES+=("agy|${AGY_MODEL}|(agy failed: ${AGY_FAIL} — not used for the verdict)${AGY_DIAG:+
-${AGY_DIAG}}")
-        fi
-        # cursor は --mode plan / --sandbox でも worktree の外を読める (実測)。次の engine が読めないよう agy の一時物を先に消す
-        rm -f "$AGY_OUT_FILE" "$AGY_ERR_FILE"; rm -rf "$AGY_DIFF_DIR"
-        AGY_OUT_FILE=""; AGY_ERR_FILE=""; AGY_DIFF_DIR="" ;;
-      cursor)
-        if run_cursor_review "$cmp"; then
-          COMPARE_NOTES+=("cursor|${CURSOR_MODEL}|$(cat "$cmp")")
-        else
-          cursor_collect_diag
-          COMPARE_NOTES+=("cursor|${CURSOR_MODEL}|(cursor failed: ${CURSOR_FAIL} — not used for the verdict)${CURSOR_DIAG:+
-${CURSOR_DIAG}}")
-        fi ;;
-    esac
-    rm -f "$cmp"
-  done
+# both: Result に併記する比較用エンジンの節 (判定には使わない)。REVIEW_COMPARE は "agy,cursor" 形式。
+# cursor-agent は --mode plan / --sandbox でも worktree の外を読める (実測。knowledge/cursor-review.md)。
+# 他 engine の出力を読ませないよう、cursor は codex・agy より**先に**走らせ (まだ誰の出力も無い)、
+# agy の一時物は走り終えたらすぐ消す。併記の順は compare に書いた順のまま。
+declare -A COMPARE_NOTE=()
+run_compare_engine() {
+  local eng="$1" cmp
+  cmp="$(mktemp "${TMPDIR:-/tmp}/kai-review-cmp.XXXXXX")"
+  case "$eng" in
+    agy)
+      if run_agy_review "$cmp"; then
+        COMPARE_NOTE[agy]="$(cat "$cmp")"
+      else
+        agy_collect_diag
+        COMPARE_NOTE[agy]="(agy failed: ${AGY_FAIL} — not used for the verdict)${AGY_DIAG:+
+${AGY_DIAG}}"
+      fi
+      rm -f "$AGY_OUT_FILE" "$AGY_ERR_FILE"; rm -rf "$AGY_DIFF_DIR"
+      AGY_OUT_FILE=""; AGY_ERR_FILE=""; AGY_DIFF_DIR="" ;;
+    cursor)
+      if run_cursor_review "$cmp"; then
+        COMPARE_NOTE[cursor]="$(cat "$cmp")"
+      else
+        cursor_collect_diag
+        COMPARE_NOTE[cursor]="(cursor failed: ${CURSOR_FAIL} — not used for the verdict)${CURSOR_DIAG:+
+${CURSOR_DIAG}}"
+      fi
+      rm -f "$CURSOR_OUT_FILE" "$CURSOR_ERR_FILE"; rm -rf "$CURSOR_DIFF_DIR"
+      CURSOR_OUT_FILE=""; CURSOR_ERR_FILE=""; CURSOR_DIFF_DIR="" ;;
+  esac
+  rm -f "$cmp"
 }
+IFS=, read -r -a COMPARE_LIST <<<"$REVIEW_COMPARE"
+compare_has() { local e; for e in "${COMPARE_LIST[@]}"; do [[ "$e" == "$1" ]] && return 0; done; return 1; }
+compare_model() { case "$1" in agy) echo "$AGY_MODEL" ;; cursor) echo "$CURSOR_MODEL" ;; esac; }
 
 case "$REVIEW_ENGINE" in
   codex) run_codex_review ;;
@@ -731,8 +736,9 @@ ${CURSOR_DIAG}}"
     fi
     ;;
   both)
+    compare_has cursor && run_compare_engine cursor   # 先に (他 engine の出力がまだ無いうちに)
     run_codex_review
-    run_compare_engines
+    compare_has agy && run_compare_engine agy
     ;;
 esac
 
@@ -1044,13 +1050,12 @@ RESULT_FILE="$(mktemp "${TMPDIR:-/tmp}/kai-review-result.XXXXXX")"
   echo ""
   printf '%s\n' "$REVIEW_CONTENT"
   if [[ "$REVIEW_ENGINE" == "both" ]]; then
-    for _note in "${COMPARE_NOTES[@]}"; do
-      _eng="${_note%%|*}"; _rest="${_note#*|}"; _mdl="${_rest%%|*}"
+    for _eng in "${COMPARE_LIST[@]}"; do
       echo ""
-      echo "### ${_eng} (比較用 — 判定は Codex。model=${_mdl})"
+      echo "### ${_eng} (比較用 — 判定は Codex。model=$(compare_model "$_eng"))"
       echo ""
-      [[ "$_eng" == cursor ]] && { echo "> 注意: cursor-agent は worktree の外も読める (他 engine の出力を読んだ可能性は排除できない)。"; echo ""; }
-      printf '%s\n' "${_rest#*|}"
+      [[ "$_eng" == cursor ]] && { echo "> 注意: cursor-agent は worktree の外も読める (秘密・同時に走る別のレビューの一時物が読まれうる。knowledge/cursor-review.md)。"; echo ""; }
+      printf '%s\n' "${COMPARE_NOTE[$_eng]}"
     done
   fi
 } > "$RESULT_FILE"

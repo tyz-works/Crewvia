@@ -428,6 +428,58 @@ def test_broken_record_is_retaken_and_not_shown(tmp_path):
     assert len(gh.calls) == 1 and rec(tmp_path)["state"] == "running"
 
 
+def _drop_variants():
+    """記録の 4 形 × 欄を 1 つずつ落とした記録 (トップの欄・check の欄)。"""
+    for state in ("running", "unknown", "no_pr", "none"):
+        base = _record("passed", rollup=[]) if state == "none" else _record(state)
+        for k in list(base):
+            r = json.loads(json.dumps(base))
+            del r[k]
+            yield f"{state}-{k}", r
+        for c in base["checks"][:1] + [c for c in base["checks"] if c["state"] == "running"][:1]:
+            for k in list(c):
+                r = json.loads(json.dumps(base))
+                idx = base["checks"].index(c)
+                del r["checks"][idx][k]
+                yield f"{state}-checks[{idx}].{k}", r
+
+
+@pytest.mark.parametrize("r", [pytest.param(r, id=label) for label, r in _drop_variants()])
+def test_records_that_pass_the_check_do_not_crash_the_readers(r):
+    """#314 r4: 検査を通る記録は、読み手 (`[]` で読む) が落ちない。必須の欄は RECORD_FIELDS / CHECK_FIELDS の 1 定義。"""
+    if ci.record_problem(r) is not None:
+        return
+    ci.format_line(r, NOW + 400)
+    ci.task_graph_ci(r)
+    ci.record_fingerprint(r)
+
+
+def test_required_fields_are_the_ones_writers_write():
+    assert set(ci.RECORD_FIELDS) <= set(_record()) and set(ci.CHECK_FIELDS) == set(_record()["checks"][0])
+    for k in ci.RECORD_FIELDS:
+        r = _record()
+        del r[k]
+        assert ci.record_problem(r) is not None, k
+    for k in ci.CHECK_FIELDS:
+        r = _record()
+        del r["checks"][-1][k]
+        assert ci.record_problem(r) is not None, k
+
+
+def test_a_running_check_without_started_at_on_disk_is_retaken_not_a_crash(tmp_path):
+    """#314 r4: 前の記録 (prev) の running check に `started_at` が無い。検査が通すと poll_cycle は新しい記録を
+    書いた後の fingerprint の比較で KeyError (例外は poll_cycle の外へ出て、task-graph の公開待ちも付かない)。
+    壊れた prev は「無い」として扱い、取り直して changed に数える。kill せず例外だけで再現する。"""
+    old = _record(observed=NOW - 1)          # 間隔の内 = 壊れていなければ取り直さない
+    del old["checks"][-1]["started_at"]
+    (tmp_path / "ci").mkdir()
+    (tmp_path / "ci" / "m__t001.json").write_text(json.dumps(old))
+    assert rec(tmp_path) is None
+    gh = FakeGh()
+    assert poll(tmp_path, [task()], gh) == 1
+    assert len(gh.calls) == 1 and rec(tmp_path)["state"] == "running"
+
+
 def test_malformed_check_types_in_gh_output_are_unknown_not_a_crash(tmp_path):
     bad = [{"__typename": "CheckRun", "name": "x", "status": "COMPLETED", "conclusion": ["SUCCESS"]}]
     poll(tmp_path, [task()], FakeGh(view=view_json(bad)))

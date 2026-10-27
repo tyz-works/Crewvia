@@ -53,6 +53,13 @@ STALE_AFTER_SECONDS = 300
 #: 記録の state。`none` = gh は答えたが check が 1 つも無い (CI 未登録)。`no_pr` = PR が見つからない (表示しない)。
 STATES = ('running', 'passed', 'failed', 'unknown', 'none', 'no_pr')
 
+#: 記録と check の欄。**検査 (`record_problem`) が必須にする欄 = 読み手 (`summarize` / `format_line` / `task_graph_ci` /
+#: `poll_cycle`) が `[]` で読む欄**の 1 定義 (#314 r4: 検査が `name` と `state` だけの check を通し、summarize が
+#: `c['started_at']` で KeyError)。書き手 (`classify_check` / `_view` / `_unknown` / `observe_task`) は全部の欄を書く。
+#: 欄を読み手に足したらここに足す (`reason` は get で読む任意の欄)。
+RECORD_FIELDS = ('pr', 'head', 'state', 'checks', 'observed_at', 'summary')
+CHECK_FIELDS = ('name', 'state', 'conclusion', 'started_at', 'completed_at')
+
 # 1 つの check の分類 (GitHub の CheckRun.status / conclusion と StatusContext.state)。
 _RUN_PASSED = {'SUCCESS'}
 _RUN_NEUTRAL = {'NEUTRAL', 'SKIPPED'}
@@ -211,7 +218,13 @@ def parse_pr_list(text):
 
 
 def record_problem(data):
-    """`load_json_store` の check。書き手も同じ形で書く。"""
+    """`load_json_store` の check。書き手も同じ形で書く。欄の有無は `RECORD_FIELDS` / `CHECK_FIELDS` (値が None の欄も
+    「有る」こと。無い欄を None とみなして通すと、読み手の `[]` が KeyError になる)。"""
+    if not isinstance(data, dict):
+        return 'not an object'
+    missing = [k for k in RECORD_FIELDS if k not in data]
+    if missing:
+        return f"missing {missing[0]!r}"
     state = data.get('state')
     if state not in STATES:
         return f"'state' is {state!r}"
@@ -228,7 +241,7 @@ def record_problem(data):
     if not isinstance(checks, list):
         return "'checks' is not a list"
     for c in checks:
-        if (not isinstance(c, dict) or not isinstance(c.get('name'), str)
+        if (not isinstance(c, dict) or any(k not in c for k in CHECK_FIELDS) or not isinstance(c.get('name'), str)
                 or c.get('state') not in ('running', 'passed', 'neutral', 'failed', 'unknown')):
             return "'checks' has a malformed entry"
         for k in ('started_at', 'completed_at', 'conclusion'):

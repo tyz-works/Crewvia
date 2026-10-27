@@ -42,6 +42,7 @@ Worker が PR の CI を待っている間、その進み具合を Director と�
   status / conclusion / state が文字列（conclusion は null も可）でなければ集合と照合せず unknown。
 - check 名は PR の workflow から来て Director への送信文に入るので、制御文字・改行を空白にして 80 字で切る。
 - 読みは `lib_daemon_state.load_json_store`（形の検証 `record_problem`）。書き手は dispatcher だけ（`write_told_atomic` = tmp + replace）。
+  `record_problem` が必須にする欄は `RECORD_FIELDS` / `CHECK_FIELDS` の 1 定義 = 読み手（`summarize` / `format_line` / `task_graph_ci` / `poll_cycle` の fingerprint）が `[]` で読む欄（値が null でも欄は有ること）。読み手に欄を足したらここに足す（#314 r4: `name` と `state` だけの running check が検査を通り、`summarize` が `started_at` で KeyError → 新しい記録を書いた後に `poll_cycle` が落ちた）。検査を通らない前の記録は「無い」と同じで、間隔を待たずに取り直す。
 - **消してよい**（無ければ次のサイクルで取り直す。壊れていれば表示しないだけで、次の poll で上書きされる）。
 - `registry/ci/.task-graph-pending.json`: tasks.json にまだ載せていない変化がある印（#314 r2）。記録は poll が先に書くので、`plan.sh task-graph` が
   失敗すると次のサイクルでは表示の変化が 0 になり、印が無いと tasks.json が古いまま残る。変化があれば印を置き、印がある間は（監視対象の task が

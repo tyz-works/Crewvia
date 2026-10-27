@@ -261,6 +261,8 @@ DAEMON_RESTART_FILES = {
         "scripts/lib_checkpoint.py",
         # 2026-10-27: 見送り通知に PR の CI の 1 行を添える (呼ぶ時に import するが、起動後の変更は拾わない)
         "scripts/lib_ci_status.py",
+        # #314 r1: lib_ci_status が記録の名前の検査 (check_mission_slug / check_task_id) に import する
+        "scripts/lib_git_policy.py",
     ),
 }
 

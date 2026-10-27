@@ -310,7 +310,7 @@ done の結果が分からないときは打ち直してよい。**`--execution 
 1. `retry_reason` — Director が差し戻した理由。**最優先で読む**。Codex・QA の指摘の修正で開け直された（reopen）ときも、この欄に指摘の要約が入る。あなたの今回の仕事は task の description に加えて、この理由に答えること
 2. `history_path` の台帳 — 前の試行の Result 全文と終わり方。何をやり、どこまで確定し、何が足りなかったかを読む。reopen された task（前の `end_code` が完了で `retry_reason` がある）は、**前の結果を見直す回**: 前の Result の主張をそのまま信じず、指摘された点を現物（コード・テスト・PR の差分）で確かめ直し、直したら Result に「前回からの変更点」を書く
 3. `handoff_path` — 前の Worker の HANDOFF.md（絶対パス）。残作業と注意点を読む
-4. `checkpoint_dir` — 前の試行が退役したときに保存された作業ツリーの控え。`meta.json`（`execution_id` が前の試行と一致すること）・`status.txt`・dirty な差分の patch がある。**worktree はもう新しい**ので、patch を読んで必要な部分だけ自分の判断で当て直す（機械的に `git apply` しない）。**pane の内容は保存されない**（退役が Worker を止めた後に撮るため）。`checkpoint_dir` が無ければ、前の作業は branch に push 済みの分しか残っていない（`git log` で確かめる）
+4. `checkpoint_dir` — 前の試行が退役したときに保存された作業ツリーの控え。`meta.json`（`execution_id` が前の試行と一致すること）・`status.txt`・dirty な差分の patch がある。**worktree は新しいとは限らない**（`crewvia_create_worktree` は同じ task の既存 worktree を再利用し、退役も worktree を消さない）。まず `git status` / `git diff` / `git log` で今の worktree の中身を見て、`status.txt` と patch に比べる。すでに worktree にある変更は戻さず、**欠けている変更だけ**を自分の判断で戻す（機械的に `git apply` しない。二重に当てると衝突する）。**pane の内容は保存されない**（退役が Worker を止めた後に撮るため）。`checkpoint_dir` が無ければ、前の作業は branch に push 済みの分しか残っていない（`git log` で確かめる）
 
 `attempt` が 2 以上なのに `previous_attempt` が無いときは、台帳が読めない（pull の stderr に warn が出る）か、台帳より前の旧形式の task。`plan.sh history "$TASK_ID" --mission "$TASK_MISSION"` で台帳を直接見て、読めなければ Director に知らせてから進める。
 

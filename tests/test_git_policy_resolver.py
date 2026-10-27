@@ -932,6 +932,7 @@ ALLOWED_CALLERS = {
     "scripts/lint_plan.py",        # mission.yaml の git: の検査
     "scripts/dispatcher.sh",       # PR の CI の見える化: pr_number の無い task の branch (task_branch。式をコピーしない)
     "scripts/lib_ci_status.py",    # CI の記録のパスにする前の名前の検査 (check_mission_slug / check_task_id。#314 r1)
+    "scripts/lib_daemon_watch.py", # 呼び出し元ではない: watchdog の再起動対象の表 (DAEMON_RESTART_FILES) に名前があるだけ (lib_ci_status 経由で import される)
 }
 SCAN_DIRS = ("scripts", "hooks", "agents", "config", "skills")
 SCAN_FILES = ("crewvia", "crewvia-stop")

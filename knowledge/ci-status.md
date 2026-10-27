@@ -15,7 +15,9 @@ Worker が PR の CI を待っている間、その進み具合を Director と�
   dispatcher と plan.sh が答えを揃える共有規則でも停止スイッチでもない。止めたいときは記録を消しても次で取り直すので、止める手段は PR revert）。
 - 1 サイクルの上限: 問い合わせる task は 4 件まで（記録の古い順）・gh を呼ぶ時間の合計 20 秒（残りが 1 秒を切ったら次を始めない）・gh 1 回 15 秒（残り時間で切る）。
   締切はサイクルに 1 つで、**gh の 1 回ごとに**残りを計り直す（`pr_number` の無い task は list と view の 2 回。2 回目は 1 回目の後の残りで切り、残りが 1 秒未満なら呼ばず `unknown (cycle_budget)`）。
-  dispatcher の stale しきい値（既定 60 秒）より十分小さい。同じ PR（実装 task と review task）は 1 サイクル 1 回だけ引く。
+  dispatcher の stale しきい値（既定 60 秒）より十分小さい。同じ PR（実装 task と review task）は 1 サイクル 1 回だけ引く
+  （PR が決まった時点で引く = card の `pr_number` でも、branch から解決した PR でも。#314 r2）。
+- card の `pr_number` と記録の `pr` が違う（PR を作り直した・後から `pr_number` が付いた）記録は、間隔を待たずに取り直す（#314 r2）。
 - `gh` は subprocess + timeout。**失敗（exit≠0）・timeout・gh が無い・JSON が読めない・頼んだ欄が無い・形が違う → `unknown`**（理由の固定語を `reason` に）。
   緑にも「CI なし」にも倒さない。サイクルは止めない（例外は 1 行ログに出して次へ）。1 つの task の想定外の例外は
   その task を `unknown (internal_error)` にして閉じ込め、他の task の観測は続ける。
@@ -39,6 +41,10 @@ Worker が PR の CI を待っている間、その進み具合を Director と�
 - check 名は PR の workflow から来て Director への送信文に入るので、制御文字・改行を空白にして 80 字で切る。
 - 読みは `lib_daemon_state.load_json_store`（形の検証 `record_problem`）。書き手は dispatcher だけ（`write_told_atomic` = tmp + replace）。
 - **消してよい**（無ければ次のサイクルで取り直す。壊れていれば表示しないだけで、次の poll で上書きされる）。
+- `registry/ci/.task-graph-pending.json`: tasks.json にまだ載せていない変化がある印（#314 r2）。記録は poll が先に書くので、`plan.sh task-graph` が
+  失敗すると次のサイクルでは表示の変化が 0 になり、印が無いと tasks.json が古いまま残る。変化があれば印を置き、印がある間は（監視対象の task が
+  無いサイクルでも）毎サイクル再生成を試み、**成功（exit 0）した後だけ**消す。壊れた印は「ある」扱い（再生成は何度走っても害が無い側）。
+  消してよい（次に記録が変わるまで再生成しないだけ）。名前は `<mission>__<task>` の検査を通らない形なので記録と衝突しない。
 
 ## 表示（読むだけ・gh を呼ばない）
 
@@ -49,6 +55,9 @@ Worker が PR の CI を待っている間、その進み具合を Director と�
   summary は経過分を含まない（分が進むたびに書き直さない）。**既存の欄・形は変えない**。plugin 0.3.0（d2b8195）と 0.5.0 が未知の欄 `ci` を拒否せず読むことを実物で確認した（2026-10-27）。
   plugin 側の表示対応は別 repo。記録の表示が変わったサイクルだけ dispatcher が `plan.sh task-graph` を呼んで作り直す（`CREWVIA_TASK_GRAPH=0` なら何もしない）。
 - 通知: watchdog の hard_idle 見送り通知（`suppression_message`）と Rule 5 の通知に、記録があれば同じ 1 行を添える（「CI 待ちの状況: …」）。**判定には使わない**。
+  Rule 5 では 1 行の後に改行を入れ、続く「画面末尾:」とくっつけない（#314 r2）。
+- どの表示も、card が `pr_number` を持っていて記録の `pr` と違えば出さない（`read_record(..., pr_number=)`。別の PR の CI を今の PR の状況として
+  見せない。#314 r2）。watchdog は監視開始時の card の値、Rule 5 は通知のときに card を読み直す。
 
 ## テスト
 

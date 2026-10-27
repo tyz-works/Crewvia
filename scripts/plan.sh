@@ -898,18 +898,19 @@ _DEP_RULES = _load_scripts_module('lib_dep_rules')
 _CI_STATUS = _load_scripts_module('lib_ci_status')
 
 
-def ci_status_line(slug, task_id):
-    """status に出す CI の 1 行 / None (記録が無い・読めない・PR 無し)。表示だけなので失敗は出さないだけ。"""
+def ci_status_line(slug, task_id, pr_number=None):
+    """status に出す CI の 1 行 / None (記録が無い・読めない・PR 無し・card の pr_number と違う PR)。
+    表示だけなので失敗は出さないだけ。"""
     try:
-        rec = _CI_STATUS.read_record(registry_dir(), slug, task_id)
+        rec = _CI_STATUS.read_record(registry_dir(), slug, task_id, pr_number=pr_number)
         return _CI_STATUS.format_line(rec, time.time())
     except Exception:
         return None
 
 
-def ci_task_graph_field(slug, task_id):
+def ci_task_graph_field(slug, task_id, pr_number=None):
     try:
-        return _CI_STATUS.task_graph_ci(_CI_STATUS.read_record(registry_dir(), slug, task_id))
+        return _CI_STATUS.task_graph_ci(_CI_STATUS.read_record(registry_dir(), slug, task_id, pr_number=pr_number))
     except Exception:
         return None
 
@@ -1535,7 +1536,7 @@ def build_task_graph(state):
                     node['pane_id'] = pane_id
             if raw_status in _CI_STATUS.POLL_STATUSES:
                 # PR の CI (dispatcher の記録)。plugin 0.3.0 は未知の欄を無視する。既存の欄は変えない
-                ci = ci_task_graph_field(slug, task_id)
+                ci = ci_task_graph_field(slug, task_id, meta.get('pr_number'))
                 if ci:
                     node['ci'] = ci
             mission_nodes.append(node)
@@ -5639,7 +5640,7 @@ def _print_mission_detail(slug):
             exec_suffix = f" [{xid} attempt {m.get('execution_count')}]"
         print(f"[{icon}] {tid} {title} {suffix}{timeout_suffix}{exec_suffix}")
         if st in _CI_STATUS.POLL_STATUSES:
-            ci = ci_status_line(slug, tid)
+            ci = ci_status_line(slug, tid, m.get('pr_number'))
             if ci:
                 print(f"      {ci}")
 

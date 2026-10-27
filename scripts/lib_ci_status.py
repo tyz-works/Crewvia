@@ -291,8 +291,23 @@ def record_path(registry_dir, mission, task_id):
     return ci_dir(registry_dir) / f'{mission}__{task_id}.json'
 
 
-def read_record(registry_dir, mission, task_id, warn=None):
-    """記録 / None (無い・読めない・壊れている・名前が不正。表示は出さないだけ)。"""
+def card_pr(value):
+    """card の `pr_number` を PR 番号 (正の int) / None に。bool・0 以下・int 以外は None (= card は PR を名指ししていない)。"""
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return None
+    return value
+
+
+def record_matches_card(record, pr_number):
+    """card が PR を名指ししていて、記録がそれと違う PR (PR 無し・不明を含む) を指していれば False。
+    #314 r2: 別の PR の CI を、今の PR の状況として出さない (PR を作り直した・card の pr_number が後から付いた)。"""
+    want = card_pr(pr_number)
+    return want is None or record.get('pr') == want
+
+
+def read_record(registry_dir, mission, task_id, warn=None, pr_number=None):
+    """記録 / None (無い・読めない・壊れている・名前が不正・card の `pr_number` と違う PR。表示は出さないだけ)。
+    `pr_number` は読み手が持っている card の値 (無ければ照合しない)。"""
     try:
         path = record_path(registry_dir, mission, task_id)
     except ValueError:
@@ -300,7 +315,41 @@ def read_record(registry_dir, mission, task_id, warn=None):
     data = load_json_store(path, check=record_problem, warn=warn)
     if is_missing(data) or is_unreadable(data):
         return None
+    if not record_matches_card(data, pr_number):
+        return None
     return data
+
+
+#: tasks.json にまだ載せていない記録の変化がある印 (#314 r2)。task-graph の再生成に失敗しても、成功するまで毎サイクル
+#: 再生成を試みる (記録は先に書かれるので、次のサイクルの `changed` は 0 になり、印が無いと tasks.json が古いまま残る)。
+#: 消してよい (消すと、次に記録が変わるまで再生成しないだけ)。名前は `record_path` の検査を通らない形なので記録と衝突しない。
+PENDING_NAME = '.task-graph-pending.json'
+
+
+def _pending_path(registry_dir):
+    return ci_dir(registry_dir) / PENDING_NAME
+
+
+def mark_task_graph_pending(registry_dir, now):
+    """書けなければ False (呼び出し元はそのサイクルの再生成をそのまま試みる)。"""
+    return write_told_atomic(_pending_path(registry_dir), {'since': now})
+
+
+def task_graph_pending(registry_dir):
+    """印があれば True。読めない・壊れている印も True (再生成は何度走っても害が無い側)。"""
+    data = load_json_store(_pending_path(registry_dir))
+    return not is_missing(data)
+
+
+def clear_task_graph_pending(registry_dir):
+    """再生成に成功した後だけ呼ぶ。消せなければ False (次のサイクルでもう一度再生成するだけ)。"""
+    try:
+        _pending_path(registry_dir).unlink()
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return True
 
 
 def write_record(registry_dir, mission, task_id, record):
@@ -335,12 +384,16 @@ def _unknown(pr, reason, now):
 
 
 def observe_task(task, *, repo_root, branch_of, now, timeout, runner=subprocess.run, deadline=None,
-                 clock=time.monotonic):
+                 clock=time.monotonic, by_pr=None):
     """1 つの task を観測して記録 (dict) を返す。gh を最大 2 回呼ぶ。
 
     `task` は `{'mission','id','pr_number','target_dir'}`。`branch_of(task)` は branch 名 / None (決められない)。
     `deadline` (`clock()` の値) を渡すと、gh の**それぞれの**前に残りを計り直し、timeout をそれで切る
-    (list と view に同じ timeout を渡すと 1 task で予算の 2 倍まで延びる)。残りが 1 秒未満なら呼ばず unknown。"""
+    (list と view に同じ timeout を渡すと 1 task で予算の 2 倍まで延びる)。残りが 1 秒未満なら呼ばず unknown。
+
+    `by_pr` (`{(target_dir, pr): 記録}`) を渡すと、PR が決まった時点 (card の `pr_number`、または branch から解決した後)
+    でこのサイクルに観測済みの PR なら view を呼ばずにそれを使い、新しく観測した記録はそこに足す
+    (実装 task と review task が同じ PR を指す。#314 r2: branch から解決した PR も引く)。"""
     def gh(args):
         t = timeout
         if deadline is not None:
@@ -352,9 +405,7 @@ def observe_task(task, *, repo_root, branch_of, now, timeout, runner=subprocess.
     cwd = task.get('target_dir') or repo_root
     if task.get('target_dir') and not os.path.isdir(cwd):
         return _unknown(None, 'target_dir_missing', now)
-    pr = task.get('pr_number')
-    if isinstance(pr, bool) or not isinstance(pr, int) or pr <= 0:
-        pr = None
+    pr = card_pr(task.get('pr_number'))
     if pr is None:
         branch = branch_of(task)
         if not branch:
@@ -369,6 +420,16 @@ def observe_task(task, *, repo_root, branch_of, now, timeout, runner=subprocess.
         if pr is None:
             return {'pr': None, 'head': None, 'state': 'no_pr', 'checks': [], 'observed_at': now,
                     'summary': 'no PR'}
+    key = (task.get('target_dir') or '', pr)
+    if by_pr is not None and key in by_pr:
+        return dict(by_pr[key], observed_at=now)
+    rec = _view(pr, gh, now)
+    if by_pr is not None:
+        by_pr[key] = rec
+    return rec
+
+
+def _view(pr, gh, now):
     out, err = gh(['pr', 'view', str(pr), '--json', 'headRefOid,statusCheckRollup'])
     if err:
         return _unknown(pr, err, now)
@@ -378,19 +439,6 @@ def observe_task(task, *, repo_root, branch_of, now, timeout, runner=subprocess.
         return _unknown(pr, 'bad_json', now)
     return {'pr': pr, 'head': head, 'state': overall_state(checks), 'checks': checks, 'observed_at': now,
             'summary': summarize(pr, head, checks)}
-
-
-def _observe_or_reuse(t, by_pr, *, repo_root, branch_of, now, runner, deadline, clock):
-    """同じ PR を同じサイクルで 2 度引かない (実装 task と review task)。"""
-    pr = t.get('pr_number')
-    key = (t.get('target_dir') or '', pr)
-    if isinstance(pr, int) and not isinstance(pr, bool) and key in by_pr:
-        return dict(by_pr[key], observed_at=now)
-    rec = observe_task(t, repo_root=repo_root, branch_of=branch_of, now=now, timeout=GH_TIMEOUT_SECONDS,
-                       runner=runner, deadline=deadline, clock=clock)
-    if rec.get('pr'):
-        by_pr[(t.get('target_dir') or '', rec['pr'])] = rec
-    return rec
 
 
 def poll_cycle(tasks, *, registry_dir, repo_root, branch_of, poll_seconds=DEFAULT_POLL_SECONDS,
@@ -413,7 +461,9 @@ def poll_cycle(tasks, *, registry_dir, repo_root, branch_of, poll_seconds=DEFAUL
                 warn(f'ci: skip task with a bad name ({e})')
             continue
         prev = read_record(registry_dir, t['mission'], t['id'], warn=warn)
-        if prev is not None and now - prev['observed_at'] < poll_seconds:
+        # card の PR と違う PR の記録は間隔を待たずに取り直す (#314 r2。読み手もその記録は出さない)
+        if (prev is not None and now - prev['observed_at'] < poll_seconds
+                and record_matches_card(prev, t.get('pr_number'))):
             continue
         due.append((prev['observed_at'] if prev else -math.inf, t, prev))
     due.sort(key=lambda x: x[0])
@@ -426,8 +476,8 @@ def poll_cycle(tasks, *, registry_dir, repo_root, branch_of, poll_seconds=DEFAUL
         if remaining < 1:
             break
         try:
-            rec = _observe_or_reuse(t, by_pr, repo_root=repo_root, branch_of=branch_of, now=now, runner=runner,
-                                    deadline=deadline, clock=clock)
+            rec = observe_task(t, repo_root=repo_root, branch_of=branch_of, now=now, timeout=GH_TIMEOUT_SECONDS,
+                               runner=runner, deadline=deadline, clock=clock, by_pr=by_pr)
         except Exception as e:  # noqa: BLE001 — 1 つの task の想定外で他の task を止めない
             if warn:
                 warn(f"ci: observe {t['mission']}/{t['id']} failed: {type(e).__name__}")

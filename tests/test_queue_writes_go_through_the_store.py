@@ -96,6 +96,7 @@ ALLOWED_WRITES: dict[tuple[str, str], tuple[int, str]] = {
                                           "壊れても次の周期で直る)"),
     ('lib_review_refusal.py', 'record'): (4, R_DAEMON_JSON + "。codex-review の拒否記録 (tmp+replace)"),
     ('lib_review_refusal.py', 'clear'): (1, R_DAEMON_JSON + "。拒否記録の撤去 (消してよい = 復旧手順)"),
+    ('lib_ci_status.py', 'clear_task_graph_pending'): (1, "registry/ci/.task-graph-pending.json (tasks.json の再生成待ちの印) の撤去。書き手は dispatcher だけで、再生成に成功した後だけ消す。消してよい印 (消えると次に記録が変わるまで再生成しないだけ。knowledge/ci-status.md)"),
     ('dispatcher.sh', '_mark_drift_checked'): (3, R_DAEMON_JSON + "。main checkout ずれ確認の周期印 (tmp+replace)"),
     ('dispatcher.sh', 'save_told'): (3, R_DAEMON_JSON + "。「伝えた」台帳 (tmp+replace)"),
     ('dispatcher.sh', '_save_state_entry'): (2, R_DAEMON_JSON + "。Worker 状態の遷移記録"),

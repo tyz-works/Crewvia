@@ -3393,11 +3393,17 @@ def _ci_branch_of(task):
 
 
 def ci_line_for(slug, task_id):
-    """通知 (Rule 5) に添える 1 行 / ''。読めない・無い・PR 無しは ''。"""
+    """通知 (Rule 5) に添える 1 行 (末尾に改行。後ろの「画面末尾:」とくっつけない) / ''。
+    読めない・無い・PR 無し・card の pr_number と違う PR の記録は ''。card は通知のときだけ読む (通知はまれ)。"""
     try:
-        rec = lib_ci_status.read_record(REGISTRY_DIR, slug, task_id)
+        pr_number = None
+        for meta, _ in list_tasks_for_mission(slug):
+            if meta.get('id') == task_id:
+                pr_number = meta.get('pr_number')
+                break
+        rec = lib_ci_status.read_record(REGISTRY_DIR, slug, task_id, pr_number=pr_number)
         line = lib_ci_status.format_line(rec, time.time())
-        return f' {line}' if line else ''
+        return f' {line}\n' if line else ''
     except Exception:
         return ''
 
@@ -3415,13 +3421,17 @@ def run_ci_poll():
                     tasks.append({'mission': slug, 'id': meta['id'], 'status': meta.get('status'),
                                   'pr_number': meta.get('pr_number'), 'target_dir': meta.get('target_dir') or None,
                                   'task_slug': meta.get('task_slug')})
-        if not tasks:
-            return
-        changed = lib_ci_status.poll_cycle(
-            tasks, registry_dir=REGISTRY_DIR, repo_root=str(REPO_ROOT), branch_of=_ci_branch_of,
-            poll_seconds=lib_daemon_watch.load_config().ci_poll_seconds,
-            warn=lambda msg: log(f"WARNING: {msg}"))
+        changed = 0
+        if tasks:
+            changed = lib_ci_status.poll_cycle(
+                tasks, registry_dir=REGISTRY_DIR, repo_root=str(REPO_ROOT), branch_of=_ci_branch_of,
+                poll_seconds=lib_daemon_watch.load_config().ci_poll_seconds,
+                warn=lambda msg: log(f"WARNING: {msg}"))
         if changed:
+            # 記録は poll_cycle が先に書いている。再生成に失敗すると次のサイクルの changed は 0 になるので、
+            # 成功するまで印を残して毎サイクル試みる (#314 r2)
+            lib_ci_status.mark_task_graph_pending(REGISTRY_DIR, time.time())
+        if changed or lib_ci_status.task_graph_pending(REGISTRY_DIR):
             # tasks.json の `ci` 欄を新しくする (plan.sh の生成器 1 か所。CREWVIA_TASK_GRAPH=0 なら何もしない)。
             # queue / registry は env で明示する (reap_kai_codex_orphan_assignment と同じ理由: ambient の
             # CREWVIA_QUEUE / CREWVIA_REPO_ROOT が本番を指していると、隔離 dispatcher が本番の tasks.json を書く)
@@ -3432,6 +3442,8 @@ def run_ci_poll():
                                stdin=subprocess.DEVNULL, env=env, cwd=str(REGISTRY_DIR.parent))
             if p.returncode != 0:
                 log(f"WARNING: ci: plan.sh task-graph exit {p.returncode}")
+            else:
+                lib_ci_status.clear_task_graph_pending(REGISTRY_DIR)
     except Exception as e:
         log(f"WARNING: ci poll failed: {type(e).__name__}")
 

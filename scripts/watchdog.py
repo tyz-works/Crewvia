@@ -265,6 +265,8 @@ class WorkerMonitor:
         self.max_threshold: int = int(timeout.get("max") or base["max"])
         self.started_at: float = time.time()
         self.repo_root = repo_root
+        #: CI の 1 行 (`_ci_note`) の照合用。card が名指しする PR と違う PR の記録は添えない (#314 r2)
+        self._card_pr_number = task_card.get("pr_number")
 
         #: §11 (t003): 「見送り」通知の fingerprint 用。試行の識別は Execution ID
         #: (`current_execution_id`)。ID の無い旧形式 card だけ card の `started_at` (pull の
@@ -790,7 +792,8 @@ class WorkerMonitor:
         **添えるだけ**で、見送り・終了の判定には使わない。"""
         try:
             import lib_ci_status
-            rec = lib_ci_status.read_record(self.repo_root / "registry", self.mission_slug, self.task_id)
+            rec = lib_ci_status.read_record(self.repo_root / "registry", self.mission_slug, self.task_id,
+                                            pr_number=self._card_pr_number)
             line = lib_ci_status.format_line(rec, time.time())
             return f" CI 待ちの状況: {line}" if line else ""
         except Exception:

@@ -364,6 +364,39 @@ def test_same_pr_is_queried_once_per_cycle(tmp_path):
     assert len(gh.calls) == 1 and rec(tmp_path, "t002")["pr"] == 313
 
 
+def test_pr_resolved_from_the_branch_is_viewed_once_per_cycle(tmp_path):
+    """#314 r2: card に pr_number が無く branch から PR を解決した task も、このサイクルで観測済みの PR を引く。"""
+    gh = FakeGh(prs='[{"number": 42, "isCrossRepository": false}]')
+    poll(tmp_path, [task(id_="t001", pr=None), task(id_="t002", pr=None, status="verifying")], gh,
+         branch_of=lambda t: "task/m/shared")
+    views = [c for c in gh.calls if c[2] == "view"]
+    assert views == [["gh", "pr", "view", "42", "--json", "headRefOid,statusCheckRollup"]]
+    assert rec(tmp_path, "t002")["pr"] == 42
+    gh2 = FakeGh(prs='[{"number": 42, "isCrossRepository": false}]')
+    poll(tmp_path / "b", [task(id_="t001", pr=42), task(id_="t002", pr=None)], gh2, branch_of=lambda t: "x")
+    assert [c[2] for c in gh2.calls] == ["view", "list"]          # card の 42 を見た後、解決した 42 は引くだけ
+
+
+def test_record_for_another_pr_than_the_card_is_retaken_and_hidden(tmp_path):
+    """#314 r2: card の pr_number と違う PR の記録は、間隔を待たずに取り直し、読み手も出さない。"""
+    gh = FakeGh()
+    poll(tmp_path, [task(pr=313)], gh, poll_seconds=60)
+    assert ci.read_record(tmp_path, "m", "t001", pr_number=313)["pr"] == 313
+    assert ci.read_record(tmp_path, "m", "t001", pr_number=314) is None
+    assert ci.read_record(tmp_path, "m", "t001", pr_number=None)["pr"] == 313      # card が名指ししなければ照合しない
+    poll(tmp_path, [task(pr=314)], gh, now=NOW + 5, poll_seconds=60)
+    assert gh.calls[-1][:4] == ["gh", "pr", "view", "314"] and rec(tmp_path)["pr"] == 314
+    poll(tmp_path, [task(pr=314)], gh, now=NOW + 10, poll_seconds=60)
+    assert len(gh.calls) == 2                                      # 合っていれば間隔どおり
+
+
+@pytest.mark.parametrize("record_pr", [None, 313])
+def test_card_pr_hides_no_pr_and_unknown_records_without_a_matching_pr(tmp_path, record_pr):
+    r = ci._unknown(record_pr, "gh_timeout", NOW)
+    assert ci.record_matches_card(r, 314) is False
+    assert ci.record_matches_card(r, None) is True and ci.record_matches_card(r, True) is True
+
+
 def test_changed_counts_only_display_changes(tmp_path):
     gh = FakeGh()
     assert poll(tmp_path, [task()], gh) == 1
@@ -512,7 +545,8 @@ def disp(tmp_path, monkeypatch):
     (root / "scripts").mkdir()
     plan = root / "scripts" / "plan.sh"
     plan.write_text(f'#!/bin/bash\necho "$@" >> {tmp_path}/plan_calls.txt\n'
-                    f'echo "$CREWVIA_QUEUE|$CREWVIA_REPO_ROOT|$PWD" >> {tmp_path}/plan_env.txt\n')
+                    f'echo "$CREWVIA_QUEUE|$CREWVIA_REPO_ROOT|$PWD" >> {tmp_path}/plan_env.txt\n'
+                    'exit "${PLAN_RC:-0}"\n')
     plan.chmod(0o755)
     bindir = tmp_path / "bin"
     bindir.mkdir()
@@ -551,6 +585,41 @@ def test_dispatcher_cycle_records_ci_and_refreshes_the_task_graph(disp):
     disp["run_ci_poll"]()                                   # 間隔の内: gh も task-graph も呼ばない
     assert len((disp["_tmp"] / "gh_calls.txt").read_text().splitlines()) == 1
     assert (disp["_tmp"] / "plan_calls.txt").read_text().count("task-graph") == 1
+
+
+def test_dispatcher_retries_the_task_graph_until_it_is_published(disp, monkeypatch):
+    """#314 r2: 記録は先に書かれるので、再生成に失敗したサイクルの後は changed が 0。印を残して成功するまで試みる。"""
+    monkeypatch.setenv("PLAN_RC", "1")
+    disp["run_ci_poll"]()
+    calls = lambda: (disp["_tmp"] / "plan_calls.txt").read_text().count("task-graph")
+    assert calls() == 1 and ci.task_graph_pending(disp["_root"] / "registry")
+    disp["run_ci_poll"]()                                   # 間隔の内 (gh は呼ばない) でも再生成を試みる
+    assert len((disp["_tmp"] / "gh_calls.txt").read_text().splitlines()) == 1
+    assert calls() == 2 and ci.task_graph_pending(disp["_root"] / "registry")
+    monkeypatch.setenv("PLAN_RC", "0")
+    disp["run_ci_poll"]()
+    assert calls() == 3 and not ci.task_graph_pending(disp["_root"] / "registry")
+    disp["run_ci_poll"]()                                   # 公開できた後は、変化が無ければ呼ばない
+    assert calls() == 3
+
+
+def test_dispatcher_retries_a_pending_task_graph_even_with_no_watched_task(disp):
+    ci.mark_task_graph_pending(disp["_root"] / "registry", NOW)
+    card = disp["_root"] / "queue" / "missions" / "m" / "tasks" / "t001.md"
+    card.write_text(card.read_text().replace("status: in_progress", "status: done"))
+    disp["run_ci_poll"]()
+    assert (disp["_tmp"] / "plan_calls.txt").read_text().strip() == "task-graph"
+    assert not ci.task_graph_pending(disp["_root"] / "registry")
+
+
+def test_pending_marker_is_not_a_record_name(tmp_path):
+    with pytest.raises(ValueError):
+        ci.record_path(tmp_path, ".task-graph-pending", "json")
+    ci.mark_task_graph_pending(tmp_path, NOW)
+    (tmp_path / "ci" / ci.PENDING_NAME).write_text("{broken")
+    assert ci.task_graph_pending(tmp_path)                  # 壊れた印も「再生成する」側
+    assert ci.clear_task_graph_pending(tmp_path) and not ci.task_graph_pending(tmp_path)
+    assert ci.clear_task_graph_pending(tmp_path)            # 無くても True
 
 
 def test_dispatcher_task_graph_refresh_names_its_own_queue_not_the_ambient_one(disp, monkeypatch):
@@ -593,7 +662,19 @@ def test_rule5_line_helper(disp):
     disp["run_ci_poll"]()
     line = disp["ci_line_for"]("m", "t001")
     assert line.startswith(" CI PR #313 @086c9f5: ✓5 ⏳1 (pytest ")
+    assert line.endswith("\n") and line.count("\n") == 1        # #314 r2 [agy]: 「画面末尾:」とくっつけない
     assert disp["ci_line_for"]("m", "t999") == ""
+    card = disp["_root"] / "queue" / "missions" / "m" / "tasks" / "t001.md"
+    card.write_text(card.read_text().replace("pr_number: 313", "pr_number: 400"))
+    assert disp["ci_line_for"]("m", "t001") == ""                 # card と違う PR の記録は添えない
+
+
+def test_rule5_message_puts_the_ci_line_on_its_own_line(disp, monkeypatch):
+    disp["run_ci_poll"]()
+    msg = "x" + disp["ci_line_for"]("m", "t001") + "画面末尾:\nline5"
+    assert "\n画面末尾:" in msg and re.search(r"\(pytest \d+m\) ✗0\n画面末尾:", msg)
+    src = DISPATCHER_SH.read_text()
+    assert "f'{ci_line_for(mission_slug, task_id)}'\n        f'画面末尾:\\n{screen_tail}'" in src
 
 
 # ---------------------------------------------------------------------------
@@ -647,6 +728,22 @@ def test_plan_status_shows_the_ci_line(plan_tree):
     assert "CI" not in lines[k + 1]
 
 
+def test_plan_status_and_tasks_json_hide_a_record_for_another_pr(plan_tree):
+    """#314 r2: card の pr_number (400) と記録の PR (313) が違えば status にも tasks.json にも出さない。"""
+    root, env, tmp = plan_tree
+    card = root / "queue" / "missions" / "m" / "tasks" / "t001.md"
+    card.write_text(card.read_text().replace("worker: Ren\n", "worker: Ren\npr_number: 400\n"))
+    p = _plan(root, env, "status", "--mission", "m")
+    assert p.returncode == 0, p.stderr
+    lines = p.stdout.splitlines()
+    i = next(n for n, ln in enumerate(lines) if " t001 " in ln)
+    assert "CI" not in lines[i + 1]
+    p = _plan(root, env, "task-graph")
+    assert p.returncode == 0, p.stderr
+    by_id = {t["id"]: t for t in json.loads((tmp / "tasks.json").read_text())["tasks"]}
+    assert "ci" not in by_id["m:t001"] and "ci" in by_id["m:t003"]
+
+
 def test_tasks_json_gets_a_ci_field_without_changing_others(plan_tree):
     root, env, tmp = plan_tree
     env_off = dict(env)
@@ -678,3 +775,6 @@ def test_watchdog_suppression_message_carries_the_ci_line(tmp_path):
     mon2 = watchdog.WorkerMonitor("t009", {"worker": "Ren"}, watchdog.PROFILES,
                                   tmp_path, mission_slug="m")
     assert mon2._ci_note() == ""
+    mon3 = watchdog.WorkerMonitor("t001", {"worker": "Ren", "pr_number": 400}, watchdog.PROFILES,
+                                  tmp_path, mission_slug="m")
+    assert mon3._ci_note() == ""                               # #314 r2: card と違う PR の記録は添えない

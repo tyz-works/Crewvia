@@ -35,7 +35,7 @@ cd $REVIEW_WT && timeout <N>s cursor-agent -p --model <cursor_model> --mode plan
 ```
 
 - `--mode plan` = 読み取り専用（ファイルを書かない）。**`--force` / `--yolo` / `--approve-mcps` / `--sandbox disabled` は使わない**（テストが argv で確かめる）。
-- `--trust` はヘッドレスで worktree を信頼するため（Director の実測の形。無しの挙動は利用枠を使うので確かめていない）。PR の中身を信頼することになるので、**レビュー用 worktree の木のどこかに `.cursor/`（MCP・権限・hook・rules）か `.cursorrules` があれば走らせない**（`workspace_has_cursor_config`。`git ls-files` で見る = symlink も含む）。crewvia には無い。さらに **PR が agent の設定（`.claude/` の settings・hooks・skills、`.mcp.json`、`.codex/`、`.vscode/`、`AGENTS.md`）を変えていたら走らせない**（`pr_changes_agent_config`。base…HEAD の変更ファイル名で見る）。crewvia 自身が `.claude/` を持つので「ある」では拒否できない — base（main = レビュー済み）の中身は信頼し、PR の変更だけを信頼しない。`CLAUDE.md` の変更は prompt への影響だけなので対象にしない。MCP は `--approve-mcps` を付けないので承認されない。
+- `--trust` はヘッドレスで worktree を信頼するため（Director の実測の形。無しの挙動は利用枠を使うので確かめていない）。PR の中身を信頼することになるので、**レビュー用 worktree の木のどこかに `.cursor/`（MCP・権限・hook・rules）か `.cursorrules` があれば走らせない**（`workspace_has_cursor_config`。`git ls-files` で見る = symlink も含む）。crewvia には無い。さらに **PR が agent の設定（`.claude/` の settings・hooks・skills、`.mcp.json`、`.codex/`、`.vscode/`、`AGENTS.md`）を変えていたら走らせない**（`pr_changes_agent_config`。base…HEAD の変更ファイル名で見る）。crewvia 自身が `.claude/` を持つので「ある」では拒否できない — base（main = レビュー済み）の中身は信頼し、PR の変更だけを信頼しない。PR が足した・変えた **symlink は行き先を問わず拒否**（名前が `.claude` で終わる link・設定の場所へ向ける link）。`.cursorignore`（レビュー対象を隠せる）も木にあれば拒否。**`CLAUDE.md` の変更は拒否しない**: crewvia の PR はよく `CLAUDE.md` を変えるので拒否すると cursor がほぼ走らない。効くのは prompt への影響だけで、diff 本文からの prompt injection と同じ種類（cursor は `--mode plan` で書かず、判定の既定にもしない）。MCP は `--approve-mcps` を付けないので承認されない。
 - prompt は位置引数で最後。diff は argv に載せず、worktree の外の `mktemp -d` に `review.diff` を書いて prompt でパスを示す（`--add-dir` で足す）。prompt は「ファイルを読むだけ・コマンドは実行しない・書かない」。
 - `--json-schema` は無い。stdout は JSON 1 個 `{"type":"result","subtype":"success","is_error":false,"result":"<自由文>",...}` で、`result` は**前置きの文の後ろに JSON**（` ```json ` の囲みのこともある）。
   `lib_review_engine.py extract-cursor` が「末尾の `{"findings"` から始まる JSON（後ろは空白か ``` だけ）」を取り出し、`config/kai-review-findings.schema.json` で検証する（additionalProperties・enum・required・型）。
@@ -47,8 +47,8 @@ cd $REVIEW_WT && timeout <N>s cursor-agent -p --model <cursor_model> --mode plan
 | 理由 | 条件 |
 |---|---|
 | `cursor_agent_not_found` | `cursor-agent` が PATH に無い |
-| `workspace_has_cursor_config` | レビュー用 worktree の木に `.cursor` / `.cursorrules` がある（PR が持ち込んだ設定を `--trust` で読ませない） |
-| `pr_changes_agent_config` | PR が `.claude/` / `.mcp.json` / `.codex/` / `.vscode/` / `AGENTS.md` を変えている |
+| `workspace_has_cursor_config` | レビュー用 worktree の木に `.cursor` / `.cursorrules` / `.cursorignore` がある（PR が持ち込んだ設定を `--trust` で読ませない） |
+| `pr_changes_agent_config` | PR が `.claude` / `.mcp.json` / `.codex` / `.vscode` / `AGENTS.md` を変えている、または symlink を足した・変えた |
 | `timeout` | `cursor_timeout_seconds` を超えた（exit 124） |
 | `exit_<N>` | exit が 0 以外（枠外のモデルは `exit_1` + `ActionRequiredError`） |
 | `unparseable_output` | stdout が JSON 1 個でない |

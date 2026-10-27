@@ -264,7 +264,8 @@ def test_redaction_failure_withholds_the_findings(monkeypatch):
         lre.redact_findings({"findings": [{"priority": "P1", "title": "t", "body": None, "file": None}]})
 
 
-@pytest.mark.parametrize("rel", [".cursor/mcp.json", "sub/dir/.cursor/rules/x.mdc", ".cursorrules", "pkg/.cursorrules"])
+@pytest.mark.parametrize("rel", [".cursor/mcp.json", "sub/dir/.cursor/rules/x.mdc", ".cursorrules", "pkg/.cursorrules",
+                                 ".cursorignore"])
 def test_cursor_does_not_run_when_the_checkout_carries_cursor_config(tmp_path, monkeypatch, rel):
     """--trust で PR の中身を信頼するので、Cursor の設定 (.cursor/ = MCP・権限・hook・rules、.cursorrules) を
     木のどこかに持ち込んだ PR では走らせない。"""
@@ -378,3 +379,23 @@ def test_agent_config_already_on_base_does_not_block(tmp_path, monkeypatch):
     p, capture = run(tmp_path, monkeypatch)
     assert _verdict(tmp_path) == "done", (p.stdout, p.stderr)
     assert (tmp_path / "cursor_argv.txt").exists()
+
+
+@pytest.mark.parametrize("name,target", [(".claude", "/tmp"), ("docs/link", "../.claude"), ("innocent", "README")])
+def test_cursor_does_not_run_when_the_pr_adds_a_symlink(tmp_path, monkeypatch, name, target):
+    """symlink は行き先を問わず拒否 (名前が .claude で終わる / 設定の場所へ向ける)。"""
+    import os
+    import subprocess
+    orig = run_kai_review.__globals__["_git"]
+
+    def git_with_link(root, *args):
+        if args[:2] == ("commit", "-qam") and args[2] == "change":
+            (root / name).parent.mkdir(parents=True, exist_ok=True)
+            os.symlink(target, root / name)
+            subprocess.run(["git", "-C", str(root), "add", "-A"], check=True)
+        return orig(root, *args)
+    monkeypatch.setitem(run_kai_review.__globals__, "_git", git_with_link)
+    p, capture = run(tmp_path, monkeypatch)
+    assert _verdict(tmp_path) == "needs-director", (p.stdout, p.stderr)
+    assert any("CURSOR FAILURE: pr_changes_agent_config" in c for c in _calls(tmp_path)), _calls(tmp_path)
+    assert not (tmp_path / "cursor_argv.txt").exists()

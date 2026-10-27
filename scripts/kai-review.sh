@@ -658,13 +658,17 @@ run_cursor_review() {
   local cfg changed
   if ! cfg="$(git -C "$REVIEW_WT" ls-files -z 2>/dev/null | tr '\0' '\n')"; then CURSOR_FAIL="worktree_status_failed"; return 1; fi
   if [[ -e "${REVIEW_WT}/.cursor" || -L "${REVIEW_WT}/.cursor" ]] \
-      || grep -qE '(^|/)(\.cursor(/|$)|\.cursorrules$)' <<<"$cfg"; then
+      || grep -qE '(^|/)(\.cursor(/|$)|\.cursorrules$|\.cursorignore$)' <<<"$cfg"; then
     CURSOR_FAIL="workspace_has_cursor_config"; return 1
   fi
   if ! changed="$(git -C "$REVIEW_WT" diff --name-only -z "${DIFF_BASE}...HEAD" 2>/dev/null | tr '\0' '\n')"; then
     CURSOR_FAIL="worktree_status_failed"; return 1
   fi
-  if grep -qE '(^|/)(\.claude/|\.mcp\.json$|\.codex/|\.vscode/|AGENTS\.md$)' <<<"$changed"; then
+  # 名前が .claude 等で終わる symlink も拾う。PR が足した・変えた symlink は行き先を問わず拒否 (設定の場所へ向けられる)
+  if grep -qE '(^|/)(\.(claude|codex|vscode)(/|$)|\.mcp\.json$|AGENTS\.md$)' <<<"$changed"; then
+    CURSOR_FAIL="pr_changes_agent_config"; return 1
+  fi
+  if git -C "$REVIEW_WT" diff --raw "${DIFF_BASE}...HEAD" 2>/dev/null | grep -qE '^:[0-7]+ 120000 '; then
     CURSOR_FAIL="pr_changes_agent_config"; return 1
   fi
   [[ -n "$CURSOR_DIFF_DIR" ]] || CURSOR_DIFF_DIR="$(mktemp -d "${TMPDIR:-/tmp}/kai-review-cursor.XXXXXX")"

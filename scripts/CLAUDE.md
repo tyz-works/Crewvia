@@ -315,6 +315,13 @@ lib ごとの**破ってはいけない契約**の要約。理由・経緯・全
 - 台帳・拒否記録は**消してよい**（無い = 再通知 / 拒否されていない）。通知が届かない・review が動かないときの
   手当てはそのファイルを消すこと（dispatcher の再起動は不要。`knowledge/notify-once.md`「戻し方」）。
 
+## CI の見える化（`lib_ci_status.py`。設計 `knowledge/ci-status.md`）
+
+- gh を呼ぶのは dispatcher の `run_ci_poll()` → `poll_cycle()` だけ。plan.sh・watchdog は `registry/ci/` の記録を `read_record()` で読むだけ（gh を呼ばない・書かない）。
+- gh の失敗・timeout・形の違いは `unknown`（緑にも「CI なし」にも倒さない）。1 サイクルの件数・時間に上限（dispatcher の stale より十分小さく）。
+- **判定（Rule 5 を黙らせる・watchdog の見送り）に使わない**。使うなら別 PR で設計する。
+- テスト中は `CREWVIA_CI_ALLOW_GH_IN_TESTS=1` が無ければ gh を呼ばない（`_env_test_isolation_blocks_gh`）。
+
 ## Telegram（`lib_telegram.py` / `ask_user.sh`。PR-A / 設計 `knowledge/director-escalation-telegram.md`）
 
 - **token は argv・ログ・例外文・状態ファイルに出さない。** Bot API は `urllib` をプロセス内で呼び、失敗は例外でなく固定コードの値

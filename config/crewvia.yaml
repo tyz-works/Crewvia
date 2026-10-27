@@ -137,6 +137,10 @@ daemons:
   # env での上書きは付けていません (watchdog だけが読む値です)。設計: knowledge/vnext-02-attempt-reopen-checkpoint.md §5
   checkpoint_seconds: 20
 
+  # PR の CI を問い合わせる最短の間隔（秒。task ごと）。dispatcher だけが読む（見える化だけ。判定には使わない）。
+  # 記録は registry/ci/（消してよい）。env での上書きは無い。設計: knowledge/ci-status.md
+  ci_poll_seconds: 60
+
 # ===== Taskvia 連携 =====
 # Taskvia 承認フローの使用モードを指定します。
 #

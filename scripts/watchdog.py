@@ -265,6 +265,8 @@ class WorkerMonitor:
         self.max_threshold: int = int(timeout.get("max") or base["max"])
         self.started_at: float = time.time()
         self.repo_root = repo_root
+        #: CI の 1 行 (`_ci_note`) の照合用。card が名指しする PR と違う PR の記録は添えない (#314 r2)
+        self._card_pr_number = task_card.get("pr_number")
 
         #: §11 (t003): 「見送り」通知の fingerprint 用。試行の識別は Execution ID
         #: (`current_execution_id`)。ID の無い旧形式 card だけ card の `started_at` (pull の
@@ -782,7 +784,25 @@ class WorkerMonitor:
             f"task {self.task_id}) は無音 "
             f"{detail.idle_seconds:.0f}s (hard_idle しきい値 {self.idle_threshold * 2}s 超) ですが、"
             f"終了を見送っています。理由: {why}。見送りは {lasted:.0f}s 続いています。"
-            f"止まっていないか確認してください (max {self.max_threshold}s で終了します)。")
+            f"止まっていないか確認してください (max {self.max_threshold}s で終了します)。"
+            f"{self._ci_note()}")
+
+    def refresh_card_pr_number(self, task_card: dict) -> None:
+        """毎サイクルの card から `_card_pr_number` を更新する (#314 r3)。作った時点の値のままだと、監視中に
+        done --pr 等で card の pr_number が付いた・変わったとき、別の PR の記録を添えてしまう。"""
+        self._card_pr_number = task_card.get("pr_number")
+
+    def _ci_note(self) -> str:
+        """dispatcher が記録した PR の CI の 1 行 (lib_ci_status)。無い・読めない・PR 無しは ''。
+        **添えるだけ**で、見送り・終了の判定には使わない。"""
+        try:
+            import lib_ci_status
+            rec = lib_ci_status.read_record(self.repo_root / "registry", self.mission_slug, self.task_id,
+                                            pr_number=self._card_pr_number)
+            line = lib_ci_status.format_line(rec, time.time())
+            return f" CI 待ちの状況: {line}" if line else ""
+        except Exception:
+            return ""
 
     # ------------------------------------------------------------------
     # Core check
@@ -1758,6 +1778,8 @@ def run(repo_root: Path, interval: int) -> None:
             for slug, task_id, meta in active_tasks:
                 key = (slug, task_id)
                 if key in monitors:
+                    # CI の 1 行の照合は今の card の pr_number で (#314 r3。監視の途中で PR が付く・変わる)
+                    monitors[key].refresh_card_pr_number(meta)
                     continue
                 if not should_monitor(meta, retirement, authority):
                     continue

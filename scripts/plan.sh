@@ -894,6 +894,26 @@ def _warn_task_card(msg):
 # かは、その定義の上のコメントにまとめてある)。
 
 _DEP_RULES = _load_scripts_module('lib_dep_rules')
+# PR の CI の記録 (dispatcher が registry/ci/ に書く) を読む口。plan.sh は gh を呼ばない・記録を書かない (knowledge/ci-status.md)。
+_CI_STATUS = _load_scripts_module('lib_ci_status')
+
+
+def ci_status_line(slug, task_id, pr_number=None):
+    """status に出す CI の 1 行 / None (記録が無い・読めない・PR 無し・card の pr_number と違う PR)。
+    表示だけなので失敗は出さないだけ。"""
+    try:
+        rec = _CI_STATUS.read_record(registry_dir(), slug, task_id, pr_number=pr_number)
+        return _CI_STATUS.format_line(rec, time.time())
+    except Exception:
+        return None
+
+
+def ci_task_graph_field(slug, task_id, pr_number=None):
+    try:
+        return _CI_STATUS.task_graph_ci(_CI_STATUS.read_record(registry_dir(), slug, task_id, pr_number=pr_number))
+    except Exception:
+        return None
+
 HELD_DEP_STATUSES = _DEP_RULES.HELD_DEP_STATUSES
 unmet_dependencies = _DEP_RULES.unmet_dependencies
 find_dependency_cycle = _DEP_RULES.find_dependency_cycle
@@ -1514,6 +1534,11 @@ def build_task_graph(state):
                 pane_id = task_graph_pane_id(worker)
                 if pane_id:
                     node['pane_id'] = pane_id
+            if raw_status in _CI_STATUS.POLL_STATUSES:
+                # PR の CI (dispatcher の記録)。plugin 0.3.0 は未知の欄を無視する。既存の欄は変えない
+                ci = ci_task_graph_field(slug, task_id, meta.get('pr_number'))
+                if ci:
+                    node['ci'] = ci
             mission_nodes.append(node)
 
         if mission_nodes:
@@ -5506,6 +5531,9 @@ def _print_mission_summary(slug, archived=False):
     for (m, _) in in_prog:
         worker = m.get('worker') or '?'
         print(f"    🔄 {m['id']} {m['title']} ({worker})")
+        ci = ci_status_line(slug, m['id'], m.get('pr_number'))
+        if ci:
+            print(f"       {ci}")
     for (m, _) in needs_dir:
         worker = m.get('worker') or '?'
         reason = m.get('needs_director_reason', '')
@@ -5611,6 +5639,10 @@ def _print_mission_detail(slug):
                 and m.get('execution_status') in _EXEC.ACTIVE_STATUSES):
             exec_suffix = f" [{xid} attempt {m.get('execution_count')}]"
         print(f"[{icon}] {tid} {title} {suffix}{timeout_suffix}{exec_suffix}")
+        if st in _CI_STATUS.POLL_STATUSES:
+            ci = ci_status_line(slug, tid, m.get('pr_number'))
+            if ci:
+                print(f"      {ci}")
 
     total = len(tasks)
     done_count = sum(1 for (m, _) in tasks if m.get('status') == 'done')

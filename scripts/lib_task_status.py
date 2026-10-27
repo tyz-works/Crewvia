@@ -73,6 +73,9 @@ WAITS_ON_DIRECTOR_STATUSES = frozenset({'needs_director'})
 #: 使われ、`needs_human_review` は assignment を撤去しない。
 AWAITING_DECISION_STATUSES = frozenset(WAITS_ON_DIRECTOR_STATUSES | {'needs_human_review'})
 
+#: PR の CI を見る status (Worker が PR の CI を待ちうる間。`lib_ci_status` の取得と表示。knowledge/ci-status.md)。
+CI_WATCH_STATUSES = frozenset({'in_progress', 'ready_for_verification', 'verifying'})
+
 #: もう PR 番号を待っていない status (`codex_reviews_awaiting_pr` が数えない)。
 PR_NOT_AWAITED_STATUSES = frozenset({
     'done', 'verified', 'failed', 'skipped', 'verification_failed',

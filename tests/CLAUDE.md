@@ -10,6 +10,7 @@ root の `CLAUDE.md` から移した、テスト専用の規則。設計と経�
 | `CREWVIA_HERDR_SOCK` | lib_mux が ping する herdr API socket のパスを上書きする（デフォルト: `~/.config/herdr/herdr.sock`）。実 herdr はこの変数を読まないため、本番で設定すると ping 先と server の bind 先が食い違う |
 | `CREWVIA_MUX_TEST_ISOLATION` | テスト中であることの印。`tests/conftest.py` が `os.environ` に置くので subprocess にも継承される。これが立っている間、既定の宛先 (`crewvia`) や接頭辞なしのペイン名を名指しする mux verb は `MuxTestIsolationError` で拒否される (2026-09-23 の本番 dispatcher 乗っ取り事故の再発防止。`knowledge/daemon-authority.md` §7-11)。**セッションが作った宛先 (`crewvia-pytest-<pid>-<hex>`) は pytest の終了時に片付けられる**（`tests/pytest_workspace_sweep.py`。以前は herdr に空の workspace が 1 回ごとに溜まっていた） |
 | `CREWVIA_PYTEST_WORKSPACE_SWEEP` | pytest 終了時の**残骸掃除**の停止スイッチ。`0` のときだけ、死んだ pid の `crewvia-pytest-<pid>-<hex>` を何も見ず何も消さない（既定は有効）。**止まるのは残骸掃除だけ**で、セッション自身の宛先の後始末は止まらない（自分の label だけを消すので危険が無く、止めると元の漏れに戻る）。消すのは「形が合う・pid が `ESRCH`・live な pane が無い」の AND を満たす宛先だけ。pytest を起動するシェルの env に足すだけで効く（デーモンの再起動は不要）。`knowledge/daemon-authority.md` §7-15 |
+| `CREWVIA_CI_ALLOW_GH_IN_TESTS` | テスト中（`CREWVIA_MUX_TEST_ISOLATION`）は、これが `1` のときだけ `lib_ci_status` が gh を呼ぶ。立てるのは gh を stub にしたテストだけ（`tests/test_ci_status.py`）。無ければ dispatcher のサイクルを回す既存テストが本物の GitHub に問い合わせない |
 | `CREWVIA_MUX_PANE_PREFIX` | ペイン名の名前空間。**本番は空 (no-op)**。設定すると `spawn("dispatcher")` が `<prefix>dispatcher` に解決され、本番のペイン名そのものが到達不能になる |
 
 - 本番宛先名（`Sora-director` 等）の拒否は `CREWVIA_MUX_TEST_ISOLATION=1` のときだけ働く

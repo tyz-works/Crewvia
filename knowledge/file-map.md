@@ -310,6 +310,13 @@ dispatcher。CLI: `record` / `show` / `clear`）。`load()` は欄の値まで�
 不正なら `Unreadable`（`diff_bytes: null` が通知の組み立てを落として全 mission の
 dispatch が止まる、を防ぐ）
 
+### `lib_ci_status.py`
+
+PR の CI の見える化（2026-10-27）。取得は dispatcher の `run_ci_poll()` の 1 か所（in_progress / ready_for_verification / verifying の task。
+`pr_number` か、無ければ Resolver の branch から `gh pr list`。fork の PR は除く）。`registry/ci/<mission>__<task>.json` に書き、
+`plan.sh status`・`tasks.json` の `ci` 欄・watchdog / Rule 5 の通知は読むだけ。gh の失敗・timeout・形の違いは `unknown`。
+**判定には使わない**。記録は消してよい。詳細は `knowledge/ci-status.md`
+
 ### `lib_git_policy.py`
 
 **Git Policy Resolver**（vNext 01b G2 / t008。設計 `knowledge/git-policy.md` §2・§3）。task の branch 名・worktree path・

@@ -76,10 +76,11 @@ scripts/
   lib_worker_target.py  Worker の TARGET_DIR 記録
   lib_registry.py       workers.yaml を書く入口
   lib_review_refusal.py codex-review の拒否記録
+  lib_ci_status.py      PR の CI の見える化（取得は dispatcher の 1 か所・registry/ci/・status / tasks.json / 通知に 1 行。判定には使わない）
   lib_telegram.py       Telegram の経路（質問台帳・受信・認証情報の解決）/ ask_user.sh  Director の質問の入口
   kai-review.sh         reviewer 起動ラッパー（codex / agy / both + 比較用の cursor。設定の読み口は lib_review_engine.py）/ taskvia-sync.sh  queue → Taskvia 同期
 queue/    state.yaml / missions/<slug>/{mission.yaml,tasks/tNNN.md} / archive/
-registry/ workers.yaml / workers/ / heartbeats/ / mux/ / retirements/ / task-graph/ / daemons/
+registry/ workers.yaml / workers/ / heartbeats/ / mux/ / retirements/ / task-graph/ / daemons/ / ci/（PR の CI の記録。dispatcher が書く・消してよい）
 ```
 
 ### 不変条件（推測できず、破ると事故になるもの）
@@ -134,6 +135,7 @@ registry/ workers.yaml / workers/ / heartbeats/ / mux/ / retirements/ / task-gra
 | `CREWVIA_MUX_RECORD_SWEEP` | 失効した mux spawn 記録（`registry/mux/*.json`）の掃除の停止スイッチ。`0` で掃除が何も見ず何も消さない（既定は有効）。**止まるのは掃除だけ**で、記録の書き込みロックは常に働く。dispatcher は cycle ごとに新しい python なので dispatcher の env に足して再起動すれば効く。`start.sh` は env をそのまま読む。掃除は消す側の 1 者なので食い違っても危険な側には倒れない（規則を共有する `lib_dep_rules` 等に env スイッチを付けない理由と逆）。`knowledge/daemon-authority.md` §7-14 |
 | `CREWVIA_MUX_TEST_ISOLATION` | **テスト専用**。テスト中の印（`tests/conftest.py` が置く）。立っている間、本番の宛先名を指す mux verb は拒否される。**本番で設定するな**。詳細: `tests/CLAUDE.md` |
 | `CREWVIA_PYTEST_WORKSPACE_SWEEP` | **テスト専用**。pytest 終了時の残骸掃除の停止スイッチ（`0` で止まる）。**本番で設定するな**。詳細: `tests/CLAUDE.md` |
+| `CREWVIA_CI_ALLOW_GH_IN_TESTS` | **テスト専用**。テスト中（`CREWVIA_MUX_TEST_ISOLATION`）に CI の取得が gh を呼んでよい印（stub を置いたテストだけが立てる）。**本番で設定するな**（本番では読まれない）。`knowledge/ci-status.md` |
 | `CREWVIA_MUX_PANE_PREFIX` | **テスト専用**。ペイン名の名前空間。**本番は空**（設定すると本番のペイン名が到達不能になる）。詳細: `tests/CLAUDE.md` |
 | `NTFY_URL` | ntfy サーバーの URL。`approval_channel.ntfy.url` より優先 |
 | `NTFY_TOPIC` | ntfy 通知トピック名。**必須** — 空のまま運用すると通知が silent skip される |

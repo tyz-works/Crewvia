@@ -912,6 +912,10 @@ ALLOWED_SUBPROCESS_CALLS = {
         "lib_registry.py bump-task-count のサブコマンド。registry の読み書きは "
         "向こうの with_lock() + read_regular_text() の中",
 
+    ("dispatcher.sh", "run_ci_poll", "str(PLAN_SH)"):
+        "`plan.sh task-graph` で tasks.json の `ci` 欄を新しくする (PR の CI の記録が変わったときだけ)。"
+        "queue / registry のファイルは渡していない。plan.sh は lib_task_cards / lib_ci_status 経由で読む",
+
     # -- verifier-dispatcher.sh -------------------------------------------
     ("verifier-dispatcher.sh", "mark_verifying", "bash"):
         "plan.sh verifying <task_id> --verifier <name> --mission <slug> を起こすだけ (S5 / t020)。"

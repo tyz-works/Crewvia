@@ -259,6 +259,10 @@ DAEMON_RESTART_FILES = {
         "scripts/lib_task_status.py",
         # vNext 02 PR-G: lib_retirement が退役の直前の checkpoint に使う (呼ぶ時に import するが、起動後の変更は拾わない)
         "scripts/lib_checkpoint.py",
+        # 2026-10-27: 見送り通知に PR の CI の 1 行を添える (呼ぶ時に import するが、起動後の変更は拾わない)
+        "scripts/lib_ci_status.py",
+        # #314 r1: lib_ci_status が記録の名前の検査 (check_mission_slug / check_task_id) に import する
+        "scripts/lib_git_policy.py",
     ),
 }
 
@@ -918,6 +922,9 @@ class WatchConfig:
     #: vNext 02 PR-G: 退役の直前に worktree を保存する checkpoint の期限 (秒)。watchdog だけが読む。**env は付けない**。
     #: 0 以下で checkpoint を取らない (退役は今まで通り `--checkpoint none` で続く)。既定値を持つのはここ 1 か所。
     checkpoint_seconds: int = 20
+    #: PR の CI を問い合わせる最短の間隔 (秒。task ごと)。dispatcher だけが読む (`lib_ci_status.poll_cycle`)。
+    #: **env は付けない** — 見える化の周期であって共有規則でも停止スイッチでもない。正の整数だけ受け入れる。
+    ci_poll_seconds: int = 60
     #: How long each side waits for the per-daemon lock (see `daemon_lock`).
     #: The watch side is short on purpose — a watcher that blocks on the lock
     #: is a watcher that is not running its own daemon's cycle, and holding is
@@ -982,6 +989,13 @@ def load_config(config_path=None, env=None) -> WatchConfig:
             value = int(block["hard_idle_suppressed_notify_seconds"])
             if value > 0:
                 cfg.hard_idle_suppressed_notify_seconds = value
+        except (TypeError, ValueError):
+            pass
+    if "ci_poll_seconds" in block:
+        try:
+            value = int(block["ci_poll_seconds"])
+            if value > 0:
+                cfg.ci_poll_seconds = value
         except (TypeError, ValueError):
             pass
     if "checkpoint_seconds" in block:

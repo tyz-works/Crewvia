@@ -341,3 +341,40 @@ def test_bad_compare_in_config_stops_the_review(tmp_path, monkeypatch):
     p, capture = run(tmp_path, monkeypatch, engine="both", extra_config="  compare: [codex]\n")
     assert _verdict(tmp_path) == "needs-director", (p.stdout, p.stderr)
     assert "bad_compare" in _text(tmp_path)
+
+
+@pytest.mark.parametrize("rel", [".claude/settings.json", "sub/.claude/hooks/x.sh", ".mcp.json", ".codex/config.toml",
+                                 ".vscode/settings.json", "AGENTS.md", "pkg/AGENTS.md"])
+def test_cursor_does_not_run_when_the_pr_changes_agent_config(tmp_path, monkeypatch, rel):
+    """crewvia 自身が .claude/ を持つので「ある」では拒否しない。PR が agent の設定を変えたら --trust で読ませない。"""
+    import subprocess
+    orig = run_kai_review.__globals__["_git"]
+
+    def git_with_change(root, *args):
+        if args[:2] == ("commit", "-qam") and args[2] == "change":
+            (root / rel).parent.mkdir(parents=True, exist_ok=True)
+            (root / rel).write_text("x")
+            subprocess.run(["git", "-C", str(root), "add", "-A"], check=True)
+        return orig(root, *args)
+    monkeypatch.setitem(run_kai_review.__globals__, "_git", git_with_change)
+    p, capture = run(tmp_path, monkeypatch)
+    assert _verdict(tmp_path) == "needs-director", (p.stdout, p.stderr)
+    assert any("CURSOR FAILURE: pr_changes_agent_config" in c for c in _calls(tmp_path)), _calls(tmp_path)
+    assert not (tmp_path / "cursor_argv.txt").exists()
+
+
+def test_agent_config_already_on_base_does_not_block(tmp_path, monkeypatch):
+    """base にある .claude/ (crewvia 自身の設定) は PR の変更ではないので走らせる。"""
+    import subprocess
+    orig = run_kai_review.__globals__["_git"]
+
+    def git_with_base_config(root, *args):
+        if args[:2] == ("commit", "-q") and args[2:] == ("-m", "base"):
+            (root / ".claude").mkdir()
+            (root / ".claude" / "settings.json").write_text("{}")
+            subprocess.run(["git", "-C", str(root), "add", "-A"], check=True)
+        return orig(root, *args)
+    monkeypatch.setitem(run_kai_review.__globals__, "_git", git_with_base_config)
+    p, capture = run(tmp_path, monkeypatch)
+    assert _verdict(tmp_path) == "done", (p.stdout, p.stderr)
+    assert (tmp_path / "cursor_argv.txt").exists()

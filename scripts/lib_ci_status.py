@@ -33,9 +33,10 @@ if str(_SCRIPTS_DIR) not in sys.path:
 
 from lib_daemon_state import load_json_store, write_told_atomic  # noqa: E402
 from lib_task_cards import is_missing, is_unreadable  # noqa: E402
+from lib_task_status import CI_WATCH_STATUSES  # noqa: E402
 
-#: CI を見る task の status (Worker が PR の CI を待ちうる状態)。
-POLL_STATUSES = ('in_progress', 'ready_for_verification', 'verifying')
+#: CI を見る task の status (Worker が PR の CI を待ちうる状態)。定義は lib_task_status の 1 か所。
+POLL_STATUSES = CI_WATCH_STATUSES
 
 #: 1 つの task (PR) を問い合わせる最短の間隔 (秒) の既定値。値を持つのは `lib_daemon_watch.WatchConfig.ci_poll_seconds`。
 DEFAULT_POLL_SECONDS = 60

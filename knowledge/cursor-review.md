@@ -39,6 +39,7 @@ cd $CURSOR_WT && timeout --kill-after=10s <N>s cursor-agent -p --model <cursor_m
 - prompt は位置引数で最後。diff は argv に載せず、worktree の外の `mktemp -d` に `review.diff` を書いて prompt でパスを示す（`--add-dir` で足す）。prompt は「ファイルを読むだけ・コマンドは実行しない・書かない」。
 - `--json-schema` は無い。stdout は JSON 1 個 `{"type":"result","subtype":"success","is_error":false,"result":"<自由文>",...}` で、`result` は**前置きの文の後ろに JSON**（` ```json ` の囲みのこともある）。
   `lib_review_engine.py extract-cursor` が「末尾の `{` 空白 `"findings"` 空白 `:` から始まる JSON（後ろは空白か ``` だけ。整形された `{\n  "findings": …}` も拾う）」を取り出し、`config/kai-review-findings.schema.json` で検証する（additionalProperties・enum・required・型）。
+  **採るのは単独の末尾の JSON だけ**（Codex #313 r4）: 読めた候補・読めない候補とも、その範囲の内側の候補は試さない（読めない候補の範囲は文字列を除いた括弧の対応で決め、閉じなければ `no_findings_json`）。壊れた外側 `{"findings":[P1…],"extra":{"findings":[]}` の中の空 findings を拾って done に倒さないため。前置きの文の中の `{"findings" …}` は閉じていれば飛ばす。
 
 ## fail-closed（findings 無しの LGTM に倒さない）
 

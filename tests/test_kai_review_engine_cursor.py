@@ -202,6 +202,34 @@ def test_extract_is_fail_closed(out, code):
     assert e.value.code == code
 
 
+_P1 = '{"priority":"P1","title":"bug","body":null,"file":null}'
+
+
+@pytest.mark.parametrize("result", [
+    # Codex #313 r4 の例そのまま: 外側が閉じていない → 内側の空 findings を拾わない
+    '{"findings":[' + _P1 + '],"extra":{"findings":[]}',
+    '前置き。\n```json\n{"findings":[' + _P1 + '],"extra":{"findings":[]}\n```',
+    # 外側は閉じているが JSON として壊れている (末尾の , ) → 範囲の中の候補は試さない
+    '{"findings":[' + _P1 + ',],"extra":{"findings":[]}}',
+    # 文字列の中の括弧で範囲を早く閉じない
+    '{"findings":[{"priority":"P1","title":"} {","body":null,"file":null},],"x":{"findings":[]}}',
+])
+def test_extract_does_not_recover_a_nested_object_from_malformed_output(result):
+    """壊れた外側の JSON の中の `{"findings":[]}` を拾って P1 を空 findings にしない (Codex #313 r4 P2)。"""
+    with pytest.raises(lre.CursorOutputError) as e:
+        lre.extract_cursor_findings(_envelope(result), SCHEMA)
+    assert e.value.code == "no_findings_json"
+
+
+def test_extract_takes_the_whole_trailing_object_not_its_nested_findings():
+    found = lre.extract_cursor_findings(_envelope('x {"findings":[' + _P1 + ']}'), SCHEMA)
+    assert [f["priority"] for f in found["findings"]] == ["P1"]
+    # 末尾の JSON が schema に通らない (余分な欄に入れ子の findings) → 内側に逃げず schema_invalid
+    with pytest.raises(lre.CursorOutputError) as e:
+        lre.extract_cursor_findings(_envelope('{"findings":[' + _P1 + '],"extra":{"findings":[]}}'), SCHEMA)
+    assert e.value.code == "schema_invalid"
+
+
 # --- cursor 単独 ---
 
 def test_cursor_clean_review_is_done_with_read_only_flags(tmp_path, monkeypatch):

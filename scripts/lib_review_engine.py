@@ -187,6 +187,31 @@ class CursorOutputError(Exception):
 _FINDINGS_START_RE = re.compile(r'\{\s*"findings"\s*:')
 
 
+def _brace_span_end(text, start):
+    """text[start] の `{` に対応する `}` の次の位置 (JSON の文字列の中の括弧は数えない)。閉じなければ None。"""
+    depth = 0
+    in_str = False
+    i = start
+    n = len(text)
+    while i < n:
+        c = text[i]
+        if in_str:
+            if c == '\\':
+                i += 1
+            elif c == '"':
+                in_str = False
+        elif c == '"':
+            in_str = True
+        elif c in '{[':
+            depth += 1
+        elif c in '}]':
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return None
+
+
 def extract_cursor_findings(out_text, schema):
     """cursor-agent の stdout 全文 → schema 準拠の findings dict。だめなら `CursorOutputError(固定コード)`。"""
     try:
@@ -203,18 +228,27 @@ def extract_cursor_findings(out_text, schema):
     if not isinstance(result, str):
         raise CursorOutputError('no_findings_json')
     dec = json.JSONDecoder()
-    schema_failed = False
-    # 整形された JSON (`{\n  "findings": [...]}`) も拾う: `{` 空白 `"findings"` 空白 `:` の位置から読む
+    # 整形された JSON (`{\n  "findings": [...]}`) も拾う: `{` 空白 `"findings"` 空白 `:` の位置から読む。
+    # 採るのは単独の末尾の JSON だけ (Codex #313 r4): 候補の内側の候補は試さない。読めない候補は括弧の
+    # 対応で範囲を決めて飛ばし、閉じなければ止める (壊れた外側の中の `{"findings":[]}` を拾うと P1 が空 findings になる)
+    covered = 0
     for m in _FINDINGS_START_RE.finditer(result):
+        if m.start() < covered:
+            continue
         try:
             obj, end = dec.raw_decode(result, m.start())
         except ValueError:
+            end = _brace_span_end(result, m.start())
+            if end is None:
+                raise CursorOutputError('no_findings_json')
+            covered = end
             continue
+        covered = end
         if result[end:].strip().strip('`').strip() == '':
             if _schema_ok(obj, schema):
                 return obj
-            schema_failed = True
-    raise CursorOutputError('schema_invalid' if schema_failed else 'no_findings_json')
+            raise CursorOutputError('schema_invalid')
+    raise CursorOutputError('no_findings_json')
 
 
 def redact_findings(found):

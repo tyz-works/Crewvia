@@ -32,6 +32,7 @@ if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
 from lib_daemon_state import load_json_store, write_told_atomic  # noqa: E402
+from lib_git_policy import GitPolicyError, check_mission_slug, check_task_id  # noqa: E402
 from lib_task_cards import is_missing, is_unreadable  # noqa: E402
 from lib_task_status import CI_WATCH_STATUSES  # noqa: E402
 
@@ -107,6 +108,9 @@ def classify_check(item):
         conclusion = raw if isinstance(raw, str) else None
     elif kind == 'CheckRun':
         name, status, conclusion = item.get('name'), item.get('status'), item.get('conclusion')
+        # 外から来る値。文字列でなければ (配列・dict 等) 集合と照合しない = unknown (照合すると TypeError)
+        if not isinstance(status, str) or (conclusion is not None and not isinstance(conclusion, str)):
+            status, conclusion = None, None
         if status == 'COMPLETED':
             state = ('passed' if conclusion in _RUN_PASSED else 'neutral' if conclusion in _RUN_NEUTRAL
                      else 'failed' if conclusion in _RUN_FAILED else 'unknown')
@@ -277,21 +281,36 @@ def ci_dir(registry_dir):
 
 
 def record_path(registry_dir, mission, task_id):
+    """記録のパス。mission / task id は card 由来 (外から来る) なので、パスにする前に Git Policy と同じ検査を通す
+    (`../x` で registry/ci の外を指させない)。通らなければ ValueError。"""
+    try:
+        check_mission_slug(mission)
+        check_task_id(task_id)
+    except GitPolicyError as e:
+        raise ValueError(f'bad_record_name:{e.code}') from None
     return ci_dir(registry_dir) / f'{mission}__{task_id}.json'
 
 
 def read_record(registry_dir, mission, task_id, warn=None):
-    """記録 / None (無い・読めない・壊れている。表示は出さないだけ)。"""
-    data = load_json_store(record_path(registry_dir, mission, task_id), check=record_problem, warn=warn)
+    """記録 / None (無い・読めない・壊れている・名前が不正。表示は出さないだけ)。"""
+    try:
+        path = record_path(registry_dir, mission, task_id)
+    except ValueError:
+        return None
+    data = load_json_store(path, check=record_problem, warn=warn)
     if is_missing(data) or is_unreadable(data):
         return None
     return data
 
 
 def write_record(registry_dir, mission, task_id, record):
-    """書き手は dispatcher だけ (同時に書く者が居ないので told_lock は要らない)。書けなければ False。"""
+    """書き手は dispatcher だけ (同時に書く者が居ないので told_lock は要らない)。書けない・名前が不正なら False。"""
     assert record_problem(record) is None, record_problem(record)
-    return write_told_atomic(record_path(registry_dir, mission, task_id), record)
+    try:
+        path = record_path(registry_dir, mission, task_id)
+    except ValueError:
+        return False
+    return write_told_atomic(path, record)
 
 
 def run_gh(args, *, cwd, timeout, runner=subprocess.run, gh='gh'):
@@ -315,10 +334,21 @@ def _unknown(pr, reason, now):
             'summary': f"CI {('PR #%d ' % pr) if pr else ''}unknown", 'reason': reason}
 
 
-def observe_task(task, *, repo_root, branch_of, now, timeout, runner=subprocess.run):
+def observe_task(task, *, repo_root, branch_of, now, timeout, runner=subprocess.run, deadline=None,
+                 clock=time.monotonic):
     """1 つの task を観測して記録 (dict) を返す。gh を最大 2 回呼ぶ。
 
-    `task` は `{'mission','id','pr_number','target_dir'}`。`branch_of(task)` は branch 名 / None (決められない)。"""
+    `task` は `{'mission','id','pr_number','target_dir'}`。`branch_of(task)` は branch 名 / None (決められない)。
+    `deadline` (`clock()` の値) を渡すと、gh の**それぞれの**前に残りを計り直し、timeout をそれで切る
+    (list と view に同じ timeout を渡すと 1 task で予算の 2 倍まで延びる)。残りが 1 秒未満なら呼ばず unknown。"""
+    def gh(args):
+        t = timeout
+        if deadline is not None:
+            t = min(t, deadline - clock())
+            if t < 1:
+                return None, 'cycle_budget'
+        return run_gh(args, cwd=cwd, timeout=t, runner=runner)
+
     cwd = task.get('target_dir') or repo_root
     if task.get('target_dir') and not os.path.isdir(cwd):
         return _unknown(None, 'target_dir_missing', now)
@@ -329,8 +359,7 @@ def observe_task(task, *, repo_root, branch_of, now, timeout, runner=subprocess.
         branch = branch_of(task)
         if not branch:
             return _unknown(None, 'no_branch', now)
-        out, err = run_gh(['pr', 'list', '--head', branch, '--state', 'open', '--json', 'number,isCrossRepository'],
-                          cwd=cwd, timeout=timeout, runner=runner)
+        out, err = gh(['pr', 'list', '--head', branch, '--state', 'open', '--json', 'number,isCrossRepository'])
         if err:
             return _unknown(None, err, now)
         try:
@@ -340,8 +369,7 @@ def observe_task(task, *, repo_root, branch_of, now, timeout, runner=subprocess.
         if pr is None:
             return {'pr': None, 'head': None, 'state': 'no_pr', 'checks': [], 'observed_at': now,
                     'summary': 'no PR'}
-    out, err = run_gh(['pr', 'view', str(pr), '--json', 'headRefOid,statusCheckRollup'],
-                      cwd=cwd, timeout=timeout, runner=runner)
+    out, err = gh(['pr', 'view', str(pr), '--json', 'headRefOid,statusCheckRollup'])
     if err:
         return _unknown(pr, err, now)
     try:
@@ -352,17 +380,37 @@ def observe_task(task, *, repo_root, branch_of, now, timeout, runner=subprocess.
             'summary': summarize(pr, head, checks)}
 
 
+def _observe_or_reuse(t, by_pr, *, repo_root, branch_of, now, runner, deadline, clock):
+    """同じ PR を同じサイクルで 2 度引かない (実装 task と review task)。"""
+    pr = t.get('pr_number')
+    key = (t.get('target_dir') or '', pr)
+    if isinstance(pr, int) and not isinstance(pr, bool) and key in by_pr:
+        return dict(by_pr[key], observed_at=now)
+    rec = observe_task(t, repo_root=repo_root, branch_of=branch_of, now=now, timeout=GH_TIMEOUT_SECONDS,
+                       runner=runner, deadline=deadline, clock=clock)
+    if rec.get('pr'):
+        by_pr[(t.get('target_dir') or '', rec['pr'])] = rec
+    return rec
+
+
 def poll_cycle(tasks, *, registry_dir, repo_root, branch_of, poll_seconds=DEFAULT_POLL_SECONDS,
                now=None, clock=time.monotonic, runner=subprocess.run, warn=None,
                budget=CYCLE_BUDGET_SECONDS, max_tasks=MAX_TASKS_PER_CYCLE):
     """dispatcher の 1 サイクル分。間隔が来た task を古い順に、件数と時間の上限まで観測して書く。
 
     戻り値: tasks.json の `ci` 欄が変わった task の数 (呼び出し元が 0 でなければ task-graph を作り直す)。
-    gh の失敗・timeout はその task を unknown にして次へ進む (サイクルを止めない)。"""
+    gh の失敗・timeout はその task を unknown にして次へ進む (サイクルを止めない)。想定外の例外も task ごとに
+    閉じ込め (warn して次の task へ)、他の task の観測を止めない。"""
     now = time.time() if now is None else now
     due = []
     for t in tasks:
         if t.get('status') not in POLL_STATUSES:
+            continue
+        try:
+            record_path(registry_dir, t.get('mission'), t.get('id'))
+        except ValueError as e:
+            if warn:
+                warn(f'ci: skip task with a bad name ({e})')
             continue
         prev = read_record(registry_dir, t['mission'], t['id'], warn=warn)
         if prev is not None and now - prev['observed_at'] < poll_seconds:
@@ -371,21 +419,19 @@ def poll_cycle(tasks, *, registry_dir, repo_root, branch_of, poll_seconds=DEFAUL
     due.sort(key=lambda x: x[0])
     start = clock()
     changed = 0
-    by_pr = {}       # 同じ PR を同じサイクルで 2 度引かない (実装 task と review task)
+    by_pr = {}
+    deadline = start + budget
     for _age, t, prev in due[:max_tasks]:
-        remaining = budget - (clock() - start)
+        remaining = deadline - clock()
         if remaining < 1:
             break
-        timeout = min(GH_TIMEOUT_SECONDS, remaining)
-        pr = t.get('pr_number')
-        key = (t.get('target_dir') or '', pr)
-        if isinstance(pr, int) and not isinstance(pr, bool) and key in by_pr:
-            rec = dict(by_pr[key], observed_at=now)
-        else:
-            rec = observe_task(t, repo_root=repo_root, branch_of=branch_of, now=now, timeout=timeout,
-                               runner=runner)
-            if rec.get('pr'):
-                by_pr[(t.get('target_dir') or '', rec['pr'])] = rec
+        try:
+            rec = _observe_or_reuse(t, by_pr, repo_root=repo_root, branch_of=branch_of, now=now, runner=runner,
+                                    deadline=deadline, clock=clock)
+        except Exception as e:  # noqa: BLE001 — 1 つの task の想定外で他の task を止めない
+            if warn:
+                warn(f"ci: observe {t['mission']}/{t['id']} failed: {type(e).__name__}")
+            rec = _unknown(None, 'internal_error', now)
         if not write_record(registry_dir, t['mission'], t['id'], rec):
             if warn:
                 warn(f"ci: cannot write {record_path(registry_dir, t['mission'], t['id'])}")

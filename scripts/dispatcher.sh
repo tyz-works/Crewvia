@@ -3422,9 +3422,14 @@ def run_ci_poll():
             poll_seconds=lib_daemon_watch.load_config().ci_poll_seconds,
             warn=lambda msg: log(f"WARNING: {msg}"))
         if changed:
-            # tasks.json の `ci` 欄を新しくする (plan.sh の生成器 1 か所。CREWVIA_TASK_GRAPH=0 なら何もしない)
+            # tasks.json の `ci` 欄を新しくする (plan.sh の生成器 1 か所。CREWVIA_TASK_GRAPH=0 なら何もしない)。
+            # queue / registry は env で明示する (reap_kai_codex_orphan_assignment と同じ理由: ambient の
+            # CREWVIA_QUEUE / CREWVIA_REPO_ROOT が本番を指していると、隔離 dispatcher が本番の tasks.json を書く)
+            env = dict(os.environ)
+            env['CREWVIA_QUEUE'] = str(QUEUE_DIR)
+            env['CREWVIA_REPO_ROOT'] = str(REGISTRY_DIR.parent)
             p = subprocess.run([str(PLAN_SH), 'task-graph'], capture_output=True, text=True, timeout=20,
-                               stdin=subprocess.DEVNULL)
+                               stdin=subprocess.DEVNULL, env=env, cwd=str(REGISTRY_DIR.parent))
             if p.returncode != 0:
                 log(f"WARNING: ci: plan.sh task-graph exit {p.returncode}")
     except Exception as e:

@@ -14,9 +14,15 @@ Worker が PR の CI を待っている間、その進み具合を Director と�
 - 間隔: task ごとに `daemons.ci_poll_seconds`（既定 60 秒。`config/crewvia.yaml`。正の整数だけ）。**env は付けない**（見える化の周期であって、
   dispatcher と plan.sh が答えを揃える共有規則でも停止スイッチでもない。止めたいときは記録を消しても次で取り直すので、止める手段は PR revert）。
 - 1 サイクルの上限: 問い合わせる task は 4 件まで（記録の古い順）・gh を呼ぶ時間の合計 20 秒（残りが 1 秒を切ったら次を始めない）・gh 1 回 15 秒（残り時間で切る）。
+  締切はサイクルに 1 つで、**gh の 1 回ごとに**残りを計り直す（`pr_number` の無い task は list と view の 2 回。2 回目は 1 回目の後の残りで切り、残りが 1 秒未満なら呼ばず `unknown (cycle_budget)`）。
   dispatcher の stale しきい値（既定 60 秒）より十分小さい。同じ PR（実装 task と review task）は 1 サイクル 1 回だけ引く。
 - `gh` は subprocess + timeout。**失敗（exit≠0）・timeout・gh が無い・JSON が読めない・頼んだ欄が無い・形が違う → `unknown`**（理由の固定語を `reason` に）。
-  緑にも「CI なし」にも倒さない。サイクルは止めない（例外は 1 行ログに出して次へ）。
+  緑にも「CI なし」にも倒さない。サイクルは止めない（例外は 1 行ログに出して次へ）。1 つの task の想定外の例外は
+  その task を `unknown (internal_error)` にして閉じ込め、他の task の観測は続ける。
+- 記録の名前（mission slug・task id）は card 由来なので、パスにする前に `lib_git_policy.check_mission_slug` / `check_task_id` を通す。
+  通らない task は飛ばして warn（`registry/ci/` の外を指すパスを作らない）。
+- tasks.json を作り直す `plan.sh task-graph` には、dispatcher 自身の `CREWVIA_QUEUE` / `CREWVIA_REPO_ROOT` を env で渡す
+  （`reap_kai_codex_orphan_assignment` と同じ。ambient の env が本番を指していても隔離 dispatcher が本番の tasks.json を書かない）。
 
 ## 記録（`registry/ci/<mission>__<task>.json`）
 
@@ -29,6 +35,7 @@ Worker が PR の CI を待っている間、その進み具合を Director と�
   全体は failed > unknown > running > passed（check の 1 つでも知らない値なら unknown）。
 - check の state: CheckRun の `COMPLETED` + `SUCCESS` = passed / `NEUTRAL`・`SKIPPED` = neutral / `FAILURE`・`TIMED_OUT`・`CANCELLED`・`ACTION_REQUIRED`・`STARTUP_FAILURE`・`STALE` = failed /
   `QUEUED`・`IN_PROGRESS`・`WAITING`・`PENDING`・`REQUESTED` = running / それ以外 = unknown。StatusContext は `SUCCESS` / `FAILURE`・`ERROR` / `PENDING`・`EXPECTED`。
+  status / conclusion / state が文字列（conclusion は null も可）でなければ集合と照合せず unknown。
 - check 名は PR の workflow から来て Director への送信文に入るので、制御文字・改行を空白にして 80 字で切る。
 - 読みは `lib_daemon_state.load_json_store`（形の検証 `record_problem`）。書き手は dispatcher だけ（`write_told_atomic` = tmp + replace）。
 - **消してよい**（無ければ次のサイクルで取り直す。壊れていれば表示しないだけで、次の poll で上書きされる）。

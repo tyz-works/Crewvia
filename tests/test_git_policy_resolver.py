@@ -931,6 +931,7 @@ ALLOWED_CALLERS = {
     "scripts/worktree_gc.py",      # 片付けの根 (DEFAULT_WORKTREE_ROOT)
     "scripts/lint_plan.py",        # mission.yaml の git: の検査
     "scripts/dispatcher.sh",       # PR の CI の見える化: pr_number の無い task の branch (task_branch。式をコピーしない)
+    "scripts/lib_ci_status.py",    # CI の記録のパスにする前の名前の検査 (check_mission_slug / check_task_id。#314 r1)
 }
 SCAN_DIRS = ("scripts", "hooks", "agents", "config", "skills")
 SCAN_FILES = ("crewvia", "crewvia-stop")

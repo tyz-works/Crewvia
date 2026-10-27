@@ -61,6 +61,13 @@ ROLLUP_RUNNING = [run_(f"job{i}") for i in range(5)] + [
     ({"__typename": "StatusContext", "context": "ci/x", "state": "ERROR"}, "failed"),
     ({"__typename": "Other", "name": "x"}, "unknown"),
     ("not a dict", "unknown"),
+    # #314 r1: 外から来る値の型が違う (配列・dict・数) — TypeError にせず unknown
+    ({"__typename": "CheckRun", "name": "a", "status": ["COMPLETED"], "conclusion": "SUCCESS"}, "unknown"),
+    ({"__typename": "CheckRun", "name": "a", "status": "COMPLETED", "conclusion": ["SUCCESS"]}, "unknown"),
+    ({"__typename": "CheckRun", "name": "a", "status": "COMPLETED", "conclusion": {"x": 1}}, "unknown"),
+    ({"__typename": "CheckRun", "name": "a", "status": {"x": 1}, "conclusion": None}, "unknown"),
+    ({"__typename": "CheckRun", "name": "a", "status": 3, "conclusion": 1}, "unknown"),
+    ({"__typename": "StatusContext", "context": "ci/x", "state": ["SUCCESS"]}, "unknown"),
 ])
 def test_classify_check(item, state):
     assert ci.classify_check(item)["state"] == state
@@ -298,22 +305,57 @@ def test_per_cycle_task_limit_and_oldest_first(tmp_path):
     assert [c[3] for c in gh.calls[:2]] == ["105", "106"]
 
 
+class Clock:
+    """gh を 1 回呼ぶたびに `cost[i]` 秒進む時計 (呼び出しの回数に依らない)。"""
+
+    def __init__(self, costs):
+        self.t, self.costs = 0.0, list(costs)
+
+    def __call__(self):
+        return self.t
+
+    def gh(self, view=None, prs="[]"):
+        seen = []
+
+        def run(argv, **kw):
+            seen.append((argv[2], kw["timeout"]))
+            self.t += self.costs.pop(0) if self.costs else 0
+            return subprocess.CompletedProcess(argv, 0, prs if argv[2] == "list" else (view or view_json([])), "")
+        run.seen = seen
+        return run
+
+
 def test_time_budget_stops_starting_new_queries(tmp_path):
-    clock = iter([0, 0, 5, 19.5, 30, 40]).__next__
-    gh = FakeGh()
+    clock = Clock([5, 14.5, 10, 10])
+    gh = clock.gh()
     poll(tmp_path, [task(id_=f"t00{i}", pr=i) for i in range(1, 5)], gh, clock=clock, budget=20)
-    assert len(gh.calls) == 2           # 残り 0.5 秒 (< 1) で次を始めない
+    assert len(gh.seen) == 2           # 残り 0.5 秒 (< 1) で次を始めない
 
 
 def test_timeout_is_capped_by_the_remaining_budget(tmp_path):
-    seen = []
-
-    def gh(argv, **kw):
-        seen.append(kw["timeout"])
-        return subprocess.CompletedProcess(argv, 0, view_json([]), "")
-    clock = iter([0, 0, 12, 12]).__next__
+    clock = Clock([12, 0])
+    gh = clock.gh()
     poll(tmp_path, [task(id_="t001", pr=1), task(id_="t002", pr=2)], gh, clock=clock, budget=20)
-    assert seen == [15, 8]
+    assert [t for _, t in gh.seen] == [15, 8]
+
+
+def test_list_and_view_share_one_deadline(tmp_path):
+    """#314 r1: pr_number の無い task は list と view の 2 回。2 回目の timeout は 1 回目の後の残りで切る
+    (同じ timeout を 2 回渡すと 1 task で予算の倍まで延びる)。"""
+    clock = Clock([14, 0])
+    gh = clock.gh(prs='[{"number": 7, "isCrossRepository": false}]')
+    poll(tmp_path, [task(pr=None)], gh, clock=clock, budget=20)
+    assert gh.seen == [("list", 15), ("view", 6)]
+    assert rec(tmp_path)["pr"] == 7
+
+
+def test_view_is_not_started_when_list_used_up_the_budget(tmp_path):
+    clock = Clock([19.5])
+    gh = clock.gh(prs='[{"number": 7, "isCrossRepository": false}]')
+    poll(tmp_path, [task(pr=None)], gh, clock=clock, budget=20)
+    assert [k for k, _ in gh.seen] == ["list"]
+    r = rec(tmp_path)
+    assert r["state"] == "unknown" and r["reason"] == "cycle_budget" and r["pr"] == 7
 
 
 def test_same_pr_is_queried_once_per_cycle(tmp_path):
@@ -351,6 +393,46 @@ def test_broken_record_is_retaken_and_not_shown(tmp_path):
     gh = FakeGh()
     poll(tmp_path, [task()], gh)
     assert len(gh.calls) == 1 and rec(tmp_path)["state"] == "running"
+
+
+def test_malformed_check_types_in_gh_output_are_unknown_not_a_crash(tmp_path):
+    bad = [{"__typename": "CheckRun", "name": "x", "status": "COMPLETED", "conclusion": ["SUCCESS"]}]
+    poll(tmp_path, [task()], FakeGh(view=view_json(bad)))
+    r = rec(tmp_path)
+    assert r["state"] == "unknown" and r["checks"][0]["conclusion"] is None
+
+
+def test_an_unexpected_exception_is_confined_to_its_task(tmp_path):
+    """#314 r1: 1 つの task の想定外の例外で他の task の観測を止めない。"""
+    def branch_of(t):
+        if t["id"] == "t001":
+            raise RuntimeError("boom")
+        return "task/m/t002-do-it"
+    warned = []
+    gh = FakeGh(prs='[{"number": 9, "isCrossRepository": false}]')
+    poll(tmp_path, [task(id_="t001", pr=None), task(id_="t002", pr=None)], gh, branch_of=branch_of,
+         warn=warned.append)
+    assert rec(tmp_path, "t001")["reason"] == "internal_error"
+    assert rec(tmp_path, "t002")["state"] == "running"
+    assert any("t001 failed: RuntimeError" in w for w in warned)
+
+
+@pytest.mark.parametrize("mission,task_id", [
+    ("../x", "t001"), ("a/b", "t001"), ("", "t001"), (".", "t001"), ("m\n", "t001"),
+    ("m", "../t001"), ("m", "x001"), ("m", ""), ("m", None), (None, "t001"),
+])
+def test_record_names_are_checked_before_they_become_paths(tmp_path, mission, task_id):
+    """#314 r1: mission / task id は card 由来。registry/ci の外を指すパスを作らない。"""
+    with pytest.raises(ValueError):
+        ci.record_path(tmp_path, mission, task_id)
+    assert ci.read_record(tmp_path, mission, task_id) is None
+    good = {"pr": None, "head": None, "state": "no_pr", "checks": [], "observed_at": NOW, "summary": "no PR"}
+    assert ci.write_record(tmp_path, mission, task_id, good) is False
+    gh, warned = FakeGh(), []
+    poll(tmp_path, [task(id_=task_id, mission=mission), task(id_="t002")], gh, warn=warned.append)
+    assert len(gh.calls) == 1 and rec(tmp_path, "t002")["state"] == "running"   # 不正な方は飛ばし、他は進む
+    assert any("bad name" in w for w in warned)
+    assert sorted(p.name for p in tmp_path.rglob("*") if p.is_file()) == ["m__t002.json"]
 
 
 def test_gh_is_not_called_in_tests_without_the_stub_marker(tmp_path, monkeypatch):
@@ -429,7 +511,8 @@ def disp(tmp_path, monkeypatch):
         "task_slug: do-it\n---\n\nbody\n")
     (root / "scripts").mkdir()
     plan = root / "scripts" / "plan.sh"
-    plan.write_text(f'#!/bin/bash\necho "$@" >> {tmp_path}/plan_calls.txt\n')
+    plan.write_text(f'#!/bin/bash\necho "$@" >> {tmp_path}/plan_calls.txt\n'
+                    f'echo "$CREWVIA_QUEUE|$CREWVIA_REPO_ROOT|$PWD" >> {tmp_path}/plan_env.txt\n')
     plan.chmod(0o755)
     bindir = tmp_path / "bin"
     bindir.mkdir()
@@ -468,6 +551,16 @@ def test_dispatcher_cycle_records_ci_and_refreshes_the_task_graph(disp):
     disp["run_ci_poll"]()                                   # 間隔の内: gh も task-graph も呼ばない
     assert len((disp["_tmp"] / "gh_calls.txt").read_text().splitlines()) == 1
     assert (disp["_tmp"] / "plan_calls.txt").read_text().count("task-graph") == 1
+
+
+def test_dispatcher_task_graph_refresh_names_its_own_queue_not_the_ambient_one(disp, monkeypatch):
+    """#314 r1 [agy]: ambient の CREWVIA_QUEUE / CREWVIA_REPO_ROOT が本番を指していても、plan.sh task-graph は
+    dispatcher 自身の queue / repo を env で受け取る (隔離 dispatcher が本番の tasks.json を書かない)。"""
+    monkeypatch.setenv("CREWVIA_QUEUE", "/nonexistent/production/queue")
+    monkeypatch.setenv("CREWVIA_REPO_ROOT", "/nonexistent/production")
+    disp["run_ci_poll"]()
+    root = disp["_root"]
+    assert (disp["_tmp"] / "plan_env.txt").read_text().splitlines() == [f"{root / 'queue'}|{root}|{root}"]
 
 
 def test_dispatcher_cycle_moves_on_when_gh_hangs(disp, monkeypatch):

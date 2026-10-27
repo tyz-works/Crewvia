@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import sys
@@ -106,12 +107,86 @@ def load(config_path, environ=None):
     return engine, model, timeout
 
 
+# --- agy 失敗の診断 (Result に残す。後片付けで一時ファイルが消える前に) ---
+_DIAG_READ_BYTES = 65536     # 各ファイルの末尾からこれだけ読む (redaction の対象の上限でもある)
+_DIAG_LINE_MAX = 300
+_DIAG_TAIL_LINES = 8
+_DIAG_ERROR_LINES = 3
+_DIAG_DENIED_MAX = 5
+_DIAG_TOTAL_MAX = 2000
+_WITHHELD = '(diagnostics withheld: redaction failed)'
+
+
+def _tail_text(path):
+    try:
+        with open(path, 'rb') as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - _DIAG_READ_BYTES))
+            return f.read().decode('utf-8', 'replace')
+    except OSError:
+        return ''
+
+
+def _cut(text, n=_DIAG_LINE_MAX):
+    text = text.replace('\r', ' ').strip()
+    return text if len(text) <= n else text[:n] + '…'
+
+
+def diagnose(out_path, err_path):
+    """失敗した agy の診断 (AGY_ERROR 行・stdout JSON の status・denied_actions・stderr の末尾) を短い文字列にする。
+    **伏せ字 (lib_checkpoint.redact) を通してから**切る (切ってから伏せると秘密を途中で割って残す)。
+    伏せ字が失敗したら中身を出さない。"""
+    try:
+        import lib_checkpoint
+        err = lib_checkpoint.redact(_tail_text(err_path))[0]
+        raw_out = _tail_text(out_path)
+        status, denied = None, []
+        try:
+            doc = json.loads(raw_out)
+            if isinstance(doc, dict):
+                if isinstance(doc.get('status'), str):
+                    status = doc['status']
+                d = doc.get('denied_actions')
+                if isinstance(d, list):
+                    denied = d
+        except ValueError:
+            pass
+        lines = []
+        err_lines = [ln for ln in err.splitlines() if ln.strip()]
+        for ln in [ln for ln in err_lines if ln.lstrip().startswith('AGY_ERROR:')][:_DIAG_ERROR_LINES]:
+            lines.append('AGY_ERROR line: ' + _cut(ln))
+        if status is not None:
+            lines.append('stdout status: ' + _cut(lib_checkpoint.redact(status)[0], 80))
+        for item in denied[:_DIAG_DENIED_MAX]:
+            if isinstance(item, dict):
+                parts = [f'{k}={v}' for k, v in item.items() if isinstance(v, (str, int, float, bool))]
+                text = ', '.join(parts)
+            else:
+                text = str(item)
+            lines.append('denied: ' + _cut(lib_checkpoint.redact(text)[0]))
+        if len(denied) > _DIAG_DENIED_MAX:
+            lines.append(f'denied: ... (+{len(denied) - _DIAG_DENIED_MAX} more)')
+        for ln in err_lines[-_DIAG_TAIL_LINES:]:
+            lines.append('stderr tail: ' + _cut(ln))
+        text = '\n'.join(lines)
+        return text if len(text) <= _DIAG_TOTAL_MAX else text[:_DIAG_TOTAL_MAX] + '…'
+    except Exception:  # noqa: BLE001 — 伏せ字が通らないものは出さない側に倒す
+        return _WITHHELD
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog='lib_review_engine.py')
     sub = ap.add_subparsers(dest='cmd', required=True)
     g = sub.add_parser('get')
     g.add_argument('--config', required=True)
+    d = sub.add_parser('diagnose')
+    d.add_argument('--out', required=True)
+    d.add_argument('--err', required=True)
     args = ap.parse_args(argv)
+    if args.cmd == 'diagnose':
+        print(diagnose(args.out, args.err))
+        return 0
     try:
         engine, model, timeout = load(args.config)
     except ReviewConfigError as e:

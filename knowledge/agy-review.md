@@ -55,7 +55,7 @@ cd $REVIEW_WT && agy --mode plan --model <agy_model> --output-format json \
 QA t082 で、通常の prompt でも 1 回だけ `read_file` が拒否され `structured_output` が null になった run があった。fail-closed なので安全側（`denied_actions` → `needs-director`）だが、agy を既定にすると誤爆になる。
 t084 で同じ形（worktree を cwd・一時 dir を `--add-dir`・5KB と 200KB の diff）を 5 回走らせたが **0/5 で再現せず**（全部 `SUCCESS`・`denied_actions` なし）。原因は特定できていない。
 `permissions.allow` で読み取りだけ許可する設定は、再現しないものを検証できないので足していない（書き込み・コマンドは許可しない方針は変えない）。
-再発したら needs-director の `denied_actions` の中身（拒否された path）を見る: 一時 dir 側ならタイミング（`--add-dir` の効き）、worktree 側なら cwd の読み。当面は再実行で通る見込み。
+再発したら needs-director の Result 末尾の `### agy diagnostics (redacted)` を見る（失敗のときだけ入る。`AGY_ERROR line:`＝stderr の API エラー、`stdout status:`、`denied: action=… path=…`＝拒否された action と path、`stderr tail:`＝末尾 8 行。lib_checkpoint の伏せ字を通し、全体 2000 字・各行 300 字で切る。伏せ字が失敗したら中身は出ない。`both` では Result の agy 比較の節に同じ内容が付く）。denied の path を見る: 一時 dir 側ならタイミング（`--add-dir` の効き）、worktree 側なら cwd の読み。当面は再実行で通る見込み。
 
 ## 戻し方
 

@@ -587,6 +587,11 @@ run_codex_review() {
 #   exit != 0 / status != SUCCESS / structured_output が null か欠け / denied_actions が空でない / 実行後に worktree が汚れた。
 # 成功なら structured_output (schema 準拠の {"findings":[...]}) を $1 に書く。
 AGY_FAIL=""
+AGY_DIAG=""   # 失敗時の診断 (伏せ字済み・上限つき。後片付けで一時ファイルが消える前に Result へ入れる)
+agy_collect_diag() {
+  AGY_DIAG="$(python3 "${SCRIPT_DIR}/lib_review_engine.py" diagnose --out "$AGY_OUT_FILE" --err "$AGY_ERR_FILE" 2>/dev/null)" \
+    || AGY_DIAG="(diagnostics unavailable)"
+}
 run_agy_review() {
   local out_to="$1" rc=0 st dirty
   AGY_FAIL=""
@@ -628,7 +633,10 @@ case "$REVIEW_ENGINE" in
   codex) run_codex_review ;;
   agy)
     if ! run_agy_review "$OUTPUT_FILE"; then
-      fail_needs_director "AGY FAILURE: ${AGY_FAIL} — review not completed reliably (fail-closed; engine=agy model=${AGY_MODEL})"
+      agy_collect_diag
+      fail_needs_director "AGY FAILURE: ${AGY_FAIL} — review not completed reliably (fail-closed; engine=agy model=${AGY_MODEL})${AGY_DIAG:+
+### agy diagnostics (redacted)
+${AGY_DIAG}}"
     fi
     ;;
   both)
@@ -637,7 +645,9 @@ case "$REVIEW_ENGINE" in
     if run_agy_review "$AGY_CMP_FILE"; then
       AGY_COMPARE_NOTE="$(cat "$AGY_CMP_FILE")"
     else
-      AGY_COMPARE_NOTE="(agy failed: ${AGY_FAIL} — not used for the verdict)"
+      agy_collect_diag
+      AGY_COMPARE_NOTE="(agy failed: ${AGY_FAIL} — not used for the verdict)${AGY_DIAG:+
+${AGY_DIAG}}"
     fi
     rm -f "$AGY_CMP_FILE"
     ;;

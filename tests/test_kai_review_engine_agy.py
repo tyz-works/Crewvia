@@ -16,6 +16,7 @@ from test_kai_review_keeps_full_codex_findings_in_the_card import REPO_ROOT, run
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 import lib_review_engine as lre  # noqa: E402
 
+FAKE_SECRET = "sk-" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6"
 CLEAN = json.dumps({"findings": []})
 P1 = json.dumps({"findings": [{"priority": "P1", "title": "agy-found", "body": "B", "file": "README"}]})
 CODEX_P1 = json.dumps({"findings": [{"priority": "P1", "title": "codex-found", "body": "B", "file": "README"}]})
@@ -26,11 +27,11 @@ printf '%s\n' "$@" > "$AGY_ARGV_FILE"
 pwd > "$AGY_CWD_FILE"
 case "$AGY_MODE" in
   ok)        printf '{"status":"SUCCESS","denied_actions":null,"structured_output":%s}' "$AGY_FINDINGS" ;;
-  exit3)     echo 'AGY_ERROR: {}' >&2; exit 3 ;;
+  exit3)     echo 'some preamble' >&2; echo "AGY_ERROR: {\"code\":429,\"message\":\"quota exceeded\",\"api_key\":\"$AGY_FAKE_SECRET\"}" >&2; echo "tail line key=$AGY_FAKE_SECRET" >&2; exit 3 ;;
   status)    printf '{"status":"ERROR","structured_output":%s}' "$AGY_FINDINGS" ;;
   null)      printf '{"status":"SUCCESS","denied_actions":null,"structured_output":null}' ;;
   missing)   printf '{"status":"SUCCESS"}' ;;
-  denied)    printf '{"status":"SUCCESS","denied_actions":[{"command":"git diff"}],"structured_output":%s}' "$AGY_FINDINGS" ;;
+  denied)    printf '{"status":"SUCCESS","denied_actions":[{"action":"read_file","path":"/tmp/x/review.diff?token=%s"}],"structured_output":%s}' "$AGY_FAKE_SECRET" "$AGY_FINDINGS" ;;
   dirty)     echo x > injected.txt; printf '{"status":"SUCCESS","denied_actions":[],"structured_output":%s}' "$AGY_FINDINGS" ;;
   garbage)   echo 'not json' ;;
 esac
@@ -40,6 +41,7 @@ esac
 def run(tmp_path, monkeypatch, *, engine=None, agy_mode="ok", agy_findings=CLEAN, codex_out=CLEAN, config_text=None,
         env_engine=None, extra_args=(), with_codex=True):
     monkeypatch.setenv("AGY_MODE", agy_mode)
+    monkeypatch.setenv("AGY_FAKE_SECRET", FAKE_SECRET)
     monkeypatch.setenv("AGY_FINDINGS", agy_findings)
     monkeypatch.setenv("AGY_ARGV_FILE", str(tmp_path / "agy_argv.txt"))
     monkeypatch.setenv("AGY_CWD_FILE", str(tmp_path / "agy_cwd.txt"))
@@ -243,3 +245,57 @@ def test_both_agy_failure_is_recorded_but_does_not_decide(tmp_path, monkeypatch)
     p, capture = run(tmp_path, monkeypatch, engine="both", agy_mode="exit3")
     assert _verdict(tmp_path) == "done", (p.stdout, p.stderr)
     assert "agy failed: exit_3" in _result(capture, "done")
+
+
+# --- 失敗の診断は伏せ字を通して Result に残る (一時ファイルは後片付けで消える) ---
+
+def _fail_text(tmp_path):
+    return "\n".join(_calls(tmp_path))
+
+
+def test_exit3_keeps_agy_error_and_stderr_tail_with_secrets_redacted(tmp_path, monkeypatch):
+    p, capture = run(tmp_path, monkeypatch, engine="agy", agy_mode="exit3")
+    text = _fail_text(tmp_path)
+    assert "AGY FAILURE: exit_3" in text and "agy diagnostics" in text
+    assert "AGY_ERROR line:" in text and "quota exceeded" in text
+    assert "stderr tail:" in text and "tail line" in text
+    assert FAKE_SECRET not in text and "REDACTED" in text
+    assert not list(tmp_path.glob("kai-review-agy*"))
+
+
+def test_denied_actions_keep_action_and_path_with_secrets_redacted(tmp_path, monkeypatch):
+    p, capture = run(tmp_path, monkeypatch, engine="agy", agy_mode="denied")
+    text = _fail_text(tmp_path)
+    assert "stdout status: SUCCESS" in text
+    assert "denied: action=read_file" in text and "review.diff" in text
+    assert FAKE_SECRET not in text
+
+
+def test_structured_output_null_keeps_status(tmp_path, monkeypatch):
+    p, capture = run(tmp_path, monkeypatch, engine="agy", agy_mode="null")
+    text = _fail_text(tmp_path)
+    assert "AGY FAILURE: no_structured_output" in text and "stdout status: SUCCESS" in text
+
+
+def test_success_has_no_diagnostics(tmp_path, monkeypatch):
+    run(tmp_path, monkeypatch, engine="agy")
+    assert "agy diagnostics" not in _fail_text(tmp_path)
+
+
+def test_both_agy_failure_note_carries_redacted_diagnostics(tmp_path, monkeypatch):
+    p, capture = run(tmp_path, monkeypatch, engine="both", agy_mode="exit3")
+    text = _result(capture, "done")
+    assert "quota exceeded" in text and FAKE_SECRET not in text
+
+
+def test_diagnose_is_bounded_and_withholds_when_redaction_fails(tmp_path, monkeypatch):
+    out, err = tmp_path / "o", tmp_path / "e"
+    out.write_text("not json")
+    err.write_text("\n".join("line %d %s" % (i, "x" * 1000) for i in range(500)))
+    text = lre.diagnose(str(out), str(err))
+    assert len(text) <= lre._DIAG_TOTAL_MAX + 1 and text.count("stderr tail:") <= lre._DIAG_TAIL_LINES and "line 499" not in text
+    import lib_checkpoint
+    def boom(_t):
+        raise lib_checkpoint.RedactionError("x")
+    monkeypatch.setattr(lib_checkpoint, "redact", boom)
+    assert lre.diagnose(str(out), str(err)) == lre._WITHHELD

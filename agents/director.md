@@ -320,7 +320,7 @@ required_evidence:
 
 | 場面 | 使うもの |
 |---|---|
-| failed / needs_director / needs_human_review / verification_failed の task に**理由つき**で再挑戦させる | `plan.sh retry <id> --reason "<理由>" --mission <slug>`（理由は台帳 `plan.sh history <id>` に残り、次の pull の `previous_attempt.retry_reason`） |
+| failed / needs_director / needs_human_review / verification_failed の task に**理由つき**で再挑戦させる | `plan.sh retry <id> --reason "<理由>" --mission <slug>`（理由は台帳 `plan.sh history <id>` に残り、次の pull の `previous_attempt.retry_reason`）。**試行が active（reserved / running）なら `ATTEMPT_ACTIVE` で拒否される**: verify-result 由来の needs_human_review は `execution_status=running` のまま残るので、先に `plan.sh update <id> --close-execution --mission <slug>`（持ち主のいない active な試行だけを task に触れず閉じる）で試行を閉じてから retry する。試行の記録が無い card と上の 4 status 以外は `RETRY_NOT_ALLOWED`（`update --reset` を使う） |
 | 理由が要らない差し戻し・壊れた card の出口・pull 前に落ちた予約 | `plan.sh update <id> --status pending --reset`（従来どおり。台帳に理由が残らない） |
 | done / verified の**実装 task**に Codex・QA の指摘を直させる | `plan.sh reopen <impl> --reason "<指摘の要約>" --branch reuse --cascade reviews --mission <slug>` |
 

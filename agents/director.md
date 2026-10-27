@@ -320,7 +320,7 @@ required_evidence:
 
 | 場面 | 使うもの |
 |---|---|
-| failed / needs_director / needs_human_review / verification_failed の task に**理由つき**で再挑戦させる | `plan.sh retry <id> --reason "<理由>" --mission <slug>`（理由は台帳 `plan.sh history <id>` に残り、次の pull の `previous_attempt.retry_reason`）。**試行が active（reserved / running）なら `ATTEMPT_ACTIVE` で拒否される**: verify-result 由来の needs_human_review は `execution_status=running` のまま残るので、先に `plan.sh update <id> --close-execution --mission <slug>`（持ち主のいない active な試行だけを task に触れず閉じる）で試行を閉じてから retry する。試行の記録が無い card と上の 4 status 以外は `RETRY_NOT_ALLOWED`（`update --reset` を使う） |
+| failed / needs_director / verification_failed の task に**理由つき**で再挑戦させる | `plan.sh retry <id> --reason "<理由>" --mission <slug>`（理由は台帳 `plan.sh history <id>` に残り、次の pull の `previous_attempt.retry_reason`）。試行が active（reserved / running）なら `ATTEMPT_ACTIVE`、試行の記録が無い card と retry の遷移元でない status は `RETRY_NOT_ALLOWED`（どちらも `update --reset` を使う）。**`needs_human_review`（verify-result 由来）は retry できない**: 試行が `running` のまま残り `ATTEMPT_ACTIVE` になる。しかも `update --close-execution` は DETACHED の試行しか閉じないので `INVALID_TRANSITION` で拒否される（sandbox で確認済み）。出口は `update --status pending --reset` だけ（台帳には `reset` / `RESET_BY_DIRECTOR` が残り、理由は残らない。理由は次の Worker への指示か card の Result に書く） |
 | 理由が要らない差し戻し・壊れた card の出口・pull 前に落ちた予約 | `plan.sh update <id> --status pending --reset`（従来どおり。台帳に理由が残らない） |
 | done / verified の**実装 task**に Codex・QA の指摘を直させる | `plan.sh reopen <impl> --reason "<指摘の要約>" --branch reuse --cascade reviews --mission <slug>` |
 

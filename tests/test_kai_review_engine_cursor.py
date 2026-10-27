@@ -246,22 +246,35 @@ def test_failure_diagnostics_do_not_echo_the_result_text(tmp_path, monkeypatch):
     assert "SECRET-BODY-TEXT" not in text
 
 
-def test_findings_are_redacted_before_the_result(tmp_path, monkeypatch):
-    leak = json.dumps({"findings": [{"priority": "P2", "title": "t", "body": f"key {FAKE_SECRET}", "file": None}]})
+@pytest.mark.parametrize("body", [f"key {FAKE_SECRET}", f'"api_key": "{FAKE_SECRET}"', f'password="{FAKE_SECRET} x"'])
+def test_findings_are_redacted_before_the_result(tmp_path, monkeypatch, body):
+    leak = json.dumps({"findings": [{"priority": "P2", "title": f"t {FAKE_SECRET}", "body": body, "file": None}]})
     p, capture = run(tmp_path, monkeypatch, cursor_findings=leak)
     text = _result(capture, "needs-director")
     assert FAKE_SECRET not in text and "REDACTED" in text
 
 
-def test_cursor_does_not_run_when_the_checkout_carries_cursor_config(tmp_path, monkeypatch):
-    """--trust で PR の中身を信頼するので、.cursor/ (MCP・権限・hook) を持ち込んだ PR では走らせない。"""
+def test_redaction_failure_withholds_the_findings(monkeypatch):
+    import lib_checkpoint
+
+    def boom(_t):
+        raise lib_checkpoint.RedactionError("x")
+    monkeypatch.setattr(lib_checkpoint, "redact", boom)
+    with pytest.raises(lib_checkpoint.RedactionError):
+        lre.redact_findings({"findings": [{"priority": "P1", "title": "t", "body": None, "file": None}]})
+
+
+@pytest.mark.parametrize("rel", [".cursor/mcp.json", "sub/dir/.cursor/rules/x.mdc", ".cursorrules", "pkg/.cursorrules"])
+def test_cursor_does_not_run_when_the_checkout_carries_cursor_config(tmp_path, monkeypatch, rel):
+    """--trust で PR の中身を信頼するので、Cursor の設定 (.cursor/ = MCP・権限・hook・rules、.cursorrules) を
+    木のどこかに持ち込んだ PR では走らせない。"""
     import subprocess
     orig = run_kai_review.__globals__["_git"]
 
     def git_with_cursor_dir(root, *args):
         if args[:2] == ("commit", "-qam") and args[2] == "change":
-            (root / ".cursor").mkdir()
-            (root / ".cursor" / "mcp.json").write_text("{}")
+            (root / rel).parent.mkdir(parents=True, exist_ok=True)
+            (root / rel).write_text("{}")
             subprocess.run(["git", "-C", str(root), "add", "-A"], check=True)
         return orig(root, *args)
     monkeypatch.setitem(run_kai_review.__globals__, "_git", git_with_cursor_dir)

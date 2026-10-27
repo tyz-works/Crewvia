@@ -651,8 +651,14 @@ run_cursor_review() {
   local out_to="$1" rc=0 findings
   CURSOR_FAIL=""
   if ! command -v cursor-agent &>/dev/null; then CURSOR_FAIL="cursor_agent_not_found"; return 1; fi
-  # --trust はレビュー用 worktree (PR の中身) を信頼する。PR が .cursor/ (MCP・権限・hook の設定) を持ち込んだら走らせない
-  if [[ -e "${REVIEW_WT}/.cursor" ]]; then CURSOR_FAIL="workspace_has_cursor_config"; return 1; fi
+  # --trust はレビュー用 worktree (PR の中身) を信頼する。PR が Cursor の設定 (.cursor/ = MCP・権限・hook・rules、.cursorrules)
+  # を木のどこかに持ち込んでいたら走らせない (symlink も ls-files に出る)。CLAUDE.md / AGENTS.md は crewvia 自身が持つ指示文なので対象外
+  local cfg
+  if ! cfg="$(git -C "$REVIEW_WT" ls-files -z 2>/dev/null | tr '\0' '\n')"; then CURSOR_FAIL="worktree_status_failed"; return 1; fi
+  if [[ -e "${REVIEW_WT}/.cursor" || -L "${REVIEW_WT}/.cursor" ]] \
+      || grep -qE '(^|/)(\.cursor(/|$)|\.cursorrules$)' <<<"$cfg"; then
+    CURSOR_FAIL="workspace_has_cursor_config"; return 1
+  fi
   [[ -n "$CURSOR_DIFF_DIR" ]] || CURSOR_DIFF_DIR="$(mktemp -d "${TMPDIR:-/tmp}/kai-review-cursor.XXXXXX")"
   [[ -n "$CURSOR_OUT_FILE" ]] || CURSOR_OUT_FILE="$(mktemp "${TMPDIR:-/tmp}/kai-review-cursor-out.XXXXXX")"
   [[ -n "$CURSOR_ERR_FILE" ]] || CURSOR_ERR_FILE="$(mktemp "${TMPDIR:-/tmp}/kai-review-cursor-err.XXXXXX")"

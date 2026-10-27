@@ -35,7 +35,7 @@ cd $REVIEW_WT && timeout <N>s cursor-agent -p --model <cursor_model> --mode plan
 ```
 
 - `--mode plan` = 読み取り専用（ファイルを書かない）。**`--force` / `--yolo` / `--approve-mcps` / `--sandbox disabled` は使わない**（テストが argv で確かめる）。
-- `--trust` はヘッドレスで worktree を信頼するため（Director の実測の形。無しの挙動は利用枠を使うので確かめていない）。PR の中身を信頼することになるので、**レビュー用 worktree に `.cursor/`（MCP・権限・hook の設定）があれば走らせない**（`workspace_has_cursor_config`）。crewvia には `.cursor/` が無い。
+- `--trust` はヘッドレスで worktree を信頼するため（Director の実測の形。無しの挙動は利用枠を使うので確かめていない）。PR の中身を信頼することになるので、**レビュー用 worktree の木のどこかに `.cursor/`（MCP・権限・hook・rules）か `.cursorrules` があれば走らせない**（`workspace_has_cursor_config`。`git ls-files` で見る = symlink も含む）。crewvia には無い。`CLAUDE.md` / `AGENTS.md` は crewvia 自身が持つ指示文なので対象にしない（diff と同じく prompt への影響だけ）。MCP は `--approve-mcps` を付けないので承認されない。
 - prompt は位置引数で最後。diff は argv に載せず、worktree の外の `mktemp -d` に `review.diff` を書いて prompt でパスを示す（`--add-dir` で足す）。prompt は「ファイルを読むだけ・コマンドは実行しない・書かない」。
 - `--json-schema` は無い。stdout は JSON 1 個 `{"type":"result","subtype":"success","is_error":false,"result":"<自由文>",...}` で、`result` は**前置きの文の後ろに JSON**（` ```json ` の囲みのこともある）。
   `lib_review_engine.py extract-cursor` が「末尾の `{"findings"` から始まる JSON（後ろは空白か ``` だけ）」を取り出し、`config/kai-review-findings.schema.json` で検証する（additionalProperties・enum・required・型）。
@@ -47,7 +47,7 @@ cd $REVIEW_WT && timeout <N>s cursor-agent -p --model <cursor_model> --mode plan
 | 理由 | 条件 |
 |---|---|
 | `cursor_agent_not_found` | `cursor-agent` が PATH に無い |
-| `workspace_has_cursor_config` | レビュー用 worktree に `.cursor` がある（PR が持ち込んだ設定を `--trust` で読ませない） |
+| `workspace_has_cursor_config` | レビュー用 worktree の木に `.cursor` / `.cursorrules` がある（PR が持ち込んだ設定を `--trust` で読ませない） |
 | `timeout` | `cursor_timeout_seconds` を超えた（exit 124） |
 | `exit_<N>` | exit が 0 以外（枠外のモデルは `exit_1` + `ActionRequiredError`） |
 | `unparseable_output` | stdout が JSON 1 個でない |
@@ -68,7 +68,7 @@ cd $REVIEW_WT && timeout <N>s cursor-agent -p --model <cursor_model> --mode plan
 - したがって: 秘密（HOME 配下の設定・鍵）や、他 engine の出力・同時に走る別のレビューの一時物が**読まれうる**。判定に使う既定にしない。
 - kai-review.sh 側の手当て:
   - `both` では cursor を **Codex・agy より先に**走らせる（その時点で他 engine の出力はまだ無い）。agy・cursor の一時物は走り終えたらすぐ消す。併記の順は `compare` の順のまま。
-  - 取り出した findings は Result に入る前に lib_checkpoint の伏せ字を通す（外で読んだ秘密を Result に写さない）。
+  - 取り出した findings は Result に入る前に lib_checkpoint の伏せ字を通す（外で読んだ秘密を Result に写さない）。直列化した JSON でなく**値ごと**（title / body / file）に通す（`\"` のエスケープで伏せ字の規則が外れない）。
   - Result の cursor の節に「worktree の外も読める」の注意を付ける。
 - 実行後に transcript の path を検査して「汚染の可能性」を出す案は入れていない（transcript の形は版で変わりうる・実測 1 版だけで検査器を作ると黙って外れる）。疑わしいときは上の transcript を人が見る。
 

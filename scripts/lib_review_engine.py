@@ -213,6 +213,13 @@ def extract_cursor_findings(out_text, schema):
     raise CursorOutputError('schema_invalid' if schema_failed else 'no_findings_json')
 
 
+def redact_findings(found):
+    """findings の各文字列 (title / body / file) を lib_checkpoint の伏せ字に通した複製。例外はそのまま出す (呼び出し側が fail-closed)。"""
+    import lib_checkpoint
+    return {'findings': [{k: (lib_checkpoint.redact(v)[0] if isinstance(v, str) else v) for k, v in f.items()}
+                         for f in found['findings']]}
+
+
 # --- agy 失敗の診断 (Result に残す。後片付けで一時ファイルが消える前に) ---
 _DIAG_READ_BYTES = 65536     # 各ファイルの末尾からこれだけ読む (redaction の対象の上限でもある)
 _DIAG_LINE_MAX = 300
@@ -317,15 +324,15 @@ def main(argv=None):
                 schema = json.load(f)
             with open(args.out, encoding='utf-8', errors='replace') as f:
                 text = f.read()
-            found = json.dumps(extract_cursor_findings(text, schema), ensure_ascii=False, separators=(',', ':'))
-            # cursor は worktree の外 (秘密を含みうる) も読める。Result に入る前に伏せ字を通す。伏せ字が失敗したら出さない
-            import lib_checkpoint
+            found = extract_cursor_findings(text, schema)
+            # cursor は worktree の外 (秘密を含みうる) も読める。Result に入る前に伏せ字を通す。
+            # 直列化した JSON ではなく値ごとに (エスケープされた引用符・空白入りの秘密を伏せ字が見落とさない)。失敗したら出さない
             try:
-                found = lib_checkpoint.redact(found)[0]
+                found = redact_findings(found)
             except Exception:
                 print('redaction_failed', file=sys.stderr)
                 return 1
-            print(found)
+            print(json.dumps(found, ensure_ascii=False, separators=(',', ':')))
         except CursorOutputError as e:
             print(e.code, file=sys.stderr)
             return 1

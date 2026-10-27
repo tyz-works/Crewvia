@@ -188,8 +188,9 @@ _FINDINGS_START_RE = re.compile(r'\{\s*"findings"\s*:')
 
 
 def _brace_span_end(text, start):
-    """text[start] の `{` に対応する `}` の次の位置 (JSON の文字列の中の括弧は数えない)。閉じなければ None。"""
-    depth = 0
+    """text[start] の `{` に対応する `}` の次の位置 (JSON の文字列の中の括弧は数えない)。
+    閉じない・括弧の種類が対応しない (`{[}` / `{]]`) なら None (範囲を早く閉じて後ろの候補を採らない)。"""
+    stack = []
     in_str = False
     i = start
     n = len(text)
@@ -203,10 +204,11 @@ def _brace_span_end(text, start):
         elif c == '"':
             in_str = True
         elif c in '{[':
-            depth += 1
+            stack.append('}' if c == '{' else ']')
         elif c in '}]':
-            depth -= 1
-            if depth == 0:
+            if not stack or stack.pop() != c:
+                return None
+            if not stack:
                 return i + 1
         i += 1
     return None

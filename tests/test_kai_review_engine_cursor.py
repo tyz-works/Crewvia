@@ -213,6 +213,9 @@ _P1 = '{"priority":"P1","title":"bug","body":null,"file":null}'
     '{"findings":[' + _P1 + ',],"extra":{"findings":[]}}',
     # 文字列の中の括弧で範囲を早く閉じない
     '{"findings":[{"priority":"P1","title":"} {","body":null,"file":null},],"x":{"findings":[]}}',
+    # 括弧の種類が対応しない閉じで範囲を早く閉じない (閉じたことにすると後ろの空 findings が末尾の JSON になる)
+    '{"findings":[' + _P1 + ']] {"findings":[]}',
+    '{"findings":[' + _P1 + '}] {"findings":[]}',
 ])
 def test_extract_does_not_recover_a_nested_object_from_malformed_output(result):
     """壊れた外側の JSON の中の `{"findings":[]}` を拾って P1 を空 findings にしない (Codex #313 r4 P2)。"""

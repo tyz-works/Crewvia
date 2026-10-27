@@ -308,13 +308,39 @@ def diagnose(out_path, err_path, engine='agy'):
 
 def tree_fingerprint(status_z, root):
     """読み取り専用のはずの木の指紋。`git status --porcelain=v1 -z --ignored=matching --untracked-files=all`
-    の出力 (bytes) と、そこに出た各パスの lstat (種類・大きさ・mtime_ns・inode) を 1 つの sha256 にする。
-    ignored のファイル (.claude/settings.local.json 等) も載るので、cursor の前後で比べれば書き換え・追加・削除を拾う
-    (`status --porcelain` だけでは ignored を見ない。Codex #313 r2 P2)。lstat できないパスはその事実を混ぜる。"""
+    の出力 (bytes) と、そこに出た各パスの lstat (種類・大きさ・mtime_ns・**ctime_ns**・inode。symlink は行き先も) を
+    1 つの sha256 にする。ignored のファイル (.claude/settings.local.json 等) も載るので、cursor の前後で比べれば
+    書き換え・追加・削除を拾う (`status --porcelain` だけでは ignored を見ない。Codex #313 r2 P2)。
+    - git は ignored の dir を 1 行 (`!! cache/`) に畳むので、`/` で終わる項は symlink を辿らずに中を全部たどる。
+    - mtime は `touch -d` で戻せるが ctime は戻せない (書き換えれば必ず進む)。
+    - lstat できないパスはその事実 (errno) を混ぜる。"""
     import hashlib
     h = hashlib.sha256()
     h.update(status_z)
     h.update(b'\0--stat--\0')
+    broot = os.fsencode(root)
+
+    def put(rel):
+        full = os.path.join(broot, rel)
+        try:
+            st = os.lstat(full)
+            h.update(rel + b'\0%o %d %d %d %d\0' % (st.st_mode, st.st_size, st.st_mtime_ns, st.st_ctime_ns,
+                                                    st.st_ino))
+            if os.path.islink(full):
+                h.update(b'-> ' + os.readlink(full) + b'\0')
+        except OSError as e:
+            h.update(rel + b'\0err %d\0' % (e.errno or 0))
+
+    def walk(rel_dir):
+        errs = []
+        for top, dirs, files in os.walk(os.path.join(broot, rel_dir), followlinks=False,
+                                        onerror=lambda e: errs.append(e.errno or 0)):
+            dirs.sort()
+            for name in sorted(dirs) + sorted(files):
+                put(os.path.relpath(os.path.join(top, name), broot))
+        for code in errs:
+            h.update(rel_dir + b'\0walk-err %d\0' % code)
+
     entries = status_z.split(b'\0')
     i = 0
     while i < len(entries):
@@ -327,11 +353,9 @@ def tree_fingerprint(status_z, root):
             paths.append(entries[i])
             i += 1
         for rel in paths:
-            try:
-                st = os.lstat(os.path.join(os.fsencode(root), rel))
-                h.update(rel + b'\0%o %d %d %d\0' % (st.st_mode, st.st_size, st.st_mtime_ns, st.st_ino))
-            except OSError as e:
-                h.update(rel + b'\0err %d\0' % (e.errno or 0))
+            put(rel.rstrip(b'/'))
+            if rel.endswith(b'/') and not os.path.islink(os.path.join(broot, rel.rstrip(b'/'))):
+                walk(rel.rstrip(b'/'))
     return h.hexdigest()
 
 

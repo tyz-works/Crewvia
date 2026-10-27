@@ -58,7 +58,7 @@ cd $CURSOR_WT && timeout --kill-after=10s <N>s cursor-agent -p --model <cursor_m
 | `no_findings_json` | `result` の末尾に findings の JSON が無い（後ろに文が続く場合も） |
 | `schema_invalid` | 末尾の JSON が schema に通らない |
 | `redaction_failed` | findings の伏せ字が失敗した（中身を出さない） |
-| `worktree_modified` / `worktree_status_failed` | cursor 専用 worktree（`kai-review-cursor-wt.*`）の**指紋**が実行の前後で違う / 取れない。指紋 = `git status --porcelain=v1 -z --ignored=matching --untracked-files=all` + 出た各パスの lstat（`lib_review_engine.py fingerprint`）。`--porcelain` だけだと ignored のファイル（`.claude/settings.local.json` 等。PR が ignore を足すことも可）の追加・書き換えを見ない（Codex #313 r2 P2） |
+| `worktree_modified` / `worktree_status_failed` | cursor 専用 worktree（`kai-review-cursor-wt.*`）の**指紋**が実行の前後で違う / 取れない。指紋 = `git status --porcelain=v1 -z --ignored=matching --untracked-files=all` + 出た各パスの lstat（mtime と **ctime**・symlink は行き先も。git が `!! cache/` の 1 行に畳む ignored の dir は中を全部たどる。`lib_review_engine.py fingerprint`）。`--porcelain` だけだと ignored のファイル（`.claude/settings.local.json` 等。PR が ignore を足すことも可）の追加・書き換えを見ない（Codex #313 r2 P2） |
 | `worktree_create_failed` | cursor 専用 worktree を作れなかった |
 
 失敗の診断（`### cursor diagnostics (redacted)`）は `lib_review_engine.diagnose --engine cursor`: stdout の `type` / `subtype` / `is_error` だけ（**`result` 本文は出さない**）と stderr の末尾。lib_checkpoint の伏せ字を通してから切る。

@@ -499,3 +499,27 @@ def test_both_cursor_ignoring_sigterm_still_lets_codex_decide(tmp_path, monkeypa
                      cursor_mode="ignore_term", timeout=1)
     assert _verdict(tmp_path) == "done", (p.stdout, p.stderr)
     assert "cursor failed: timeout_killed" in _result(capture, "done")
+
+
+def test_fingerprint_sees_inside_a_collapsed_ignored_dir_even_with_mtime_restored(tmp_path):
+    """git は ignored の dir を `!! cache/` 1 行に畳む。中のファイルを書き換えて mtime を戻しても指紋が変わる。"""
+    import os
+    import subprocess
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    (tmp_path / ".gitignore").write_text("cache/\n")
+    (tmp_path / "cache" / "sub").mkdir(parents=True)
+    f = tmp_path / "cache" / "sub" / "hook.json"
+    f.write_text("{}\n")
+
+    def fp():
+        st = subprocess.run(["git", "-C", str(tmp_path), "status", "--porcelain=v1", "-z", "--ignored=matching",
+                             "--untracked-files=all"], check=True, capture_output=True).stdout
+        return st, lre.tree_fingerprint(st, str(tmp_path))
+    st1, before = fp()
+    assert b"!! cache/" in st1 and b"hook.json" not in st1          # 畳まれている
+    old = f.stat()
+    f.write_text("{1}\n")                                            # 同じ大きさ
+    os.utime(f, ns=(old.st_atime_ns, old.st_mtime_ns))
+    os.utime(f.parent, ns=(f.parent.stat().st_atime_ns, f.parent.stat().st_mtime_ns))
+    st2, after = fp()
+    assert st1 == st2 and before != after

@@ -78,7 +78,7 @@ scripts/
   lib_review_refusal.py codex-review の拒否記録
   lib_ci_status.py      PR の CI の見える化（取得は dispatcher の 1 か所・registry/ci/・status / tasks.json / 通知に 1 行。判定には使わない）
   lib_telegram.py       Telegram の経路（質問台帳・受信・認証情報の解決）/ ask_user.sh  Director の質問の入口
-  kai-review.sh         reviewer 起動ラッパー（codex / agy / both。設定の読み口は lib_review_engine.py）/ taskvia-sync.sh  queue → Taskvia 同期
+  kai-review.sh         reviewer 起動ラッパー（codex / agy / both + 比較用の cursor。設定の読み口は lib_review_engine.py）/ taskvia-sync.sh  queue → Taskvia 同期
 queue/    state.yaml / missions/<slug>/{mission.yaml,tasks/tNNN.md} / archive/
 registry/ workers.yaml / workers/ / heartbeats/ / mux/ / retirements/ / task-graph/ / daemons/ / ci/（PR の CI の記録。dispatcher が書く・消してよい）
 ```
@@ -124,7 +124,7 @@ registry/ workers.yaml / workers/ / heartbeats/ / mux/ / retirements/ / task-gra
 | `CREWVIA_RULE5_BACKGROUND_JOB_MAX_SECONDS` | Rule 5（`agents/director.md` §17）が「裏で `run_in_background` / Monitor が生きている」を理由に通知を黙らせる上限（既定 1800 秒 = 30 分）。この秒数を超えて job が見え続けたら、生きていても通常の idle-with-task 判定に戻す（B1 / t074。`knowledge/watchdog-idle-judgment.md` §8） |
 | `CREWVIA_MAIN_CHECKOUT_DRIFT_INTERVAL` | dispatcher が主 checkout と `origin/main` のずれ（`main-checkout-drift`）を確認する周期（既定 180 秒）。ずれを見つけると Director に 1 回だけ通知し、`scripts/sync-main-checkout.sh` を実行すれば ff とデーモン restart まで完結する（B2 / t114。`knowledge/dispatcher-restart-after-merge.md`） |
 | `CREWVIA_ESCALATION_DIRECTOR_AFTER_SECONDS` / `CREWVIA_ESCALATION_TELEGRAM_AFTER_SECONDS` | Director の判断待ちの段階上げ（段階 1 = Director に再通知 / 段階 2 = Telegram）の経過秒（既定 300 / 600）。`config/crewvia.yaml` の `escalation:` より優先。0 以下でその段階を使わない。dispatcher だけが読むしきい値（共有規則ではない）。`knowledge/director-escalation-telegram.md` §5 |
-| `CREWVIA_REVIEW_ENGINE` | kai-review.sh のレビュー先: `codex`（既定）/ `agy` / `both`。`config/crewvia.yaml` の `review.engine` より優先（engine だけ。`agy_model` / `agy_timeout_seconds` は config のみ）。不正な値は codex に倒さず needs-director。`knowledge/agy-review.md` |
+| `CREWVIA_REVIEW_ENGINE` | kai-review.sh のレビュー先: `codex`（既定）/ `agy` / `both`（`cursor` は比較専用で `review.compare` にだけ置ける。env・config の `cursor` は拒否）。`config/crewvia.yaml` の `review.engine` より優先（engine だけ。`agy_model` / `agy_timeout_seconds` / `cursor_model` / `cursor_timeout_seconds` / `compare` は config のみ）。不正な値は codex に倒さず needs-director。`knowledge/agy-review.md` / `knowledge/cursor-review.md` |
 | `CREWVIA_TASK_GRAPH` | herdr-task-graph 用 `tasks.json` の生成 ON/OFF。既定は有効、`0` で完全に無効（1 バイトも書かず、ログも出さない）。生成は queue を書き換える plan.sh サブコマンドすべてに乗るので、重い・壊れたときの退避路として残してある |
 | `CREWVIA_TASK_GRAPH_FILE` | 生成物の書き先。既定は `$CREWVIA_REPO_ROOT/registry/task-graph/tasks.json`（未設定時のみ plan.sh の位置基準にフォールバック）。plugin にはこのパスを **plugin の config dir への symlink** で参照させる（`HERDR_TASKS_FILE` は稼働中の herdr のペインに届かないので使わない。`knowledge/task-graph.md`） |
 | `CREWVIA_MUX` | mux バックエンド選択: `tmux` / `herdr`。config `mode:` より優先 |

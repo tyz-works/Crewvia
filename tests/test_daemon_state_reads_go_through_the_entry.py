@@ -177,6 +177,15 @@ ALLOWED_JSON_PARSES: dict[tuple[str, str, str], str] = {
         "(head は 40 hex・rollup は list・頼んだ欄が無ければ ValueError → 呼び出し元が unknown にする)",
     ("lib_ci_status.py", "parse_pr_list", "json.loads(text)"):
         _EXTERNAL_RESPONSE + "`gh pr list --json number,isCrossRepository` の stdout。形が違えば ValueError → unknown",
+    ("lib_review_engine.py", "extract_cursor_findings", "json.loads(out_text, object_pairs_hook=_no_duplicate_keys)"):
+        _EXTERNAL_RESPONSE + "cursor-agent の stdout (JSON 1 個)。デーモン側状態ストアではない。"
+        "読めない・形が違う・重複キーなら固定コードで失敗 (cursor は比較専用。失敗は併記だけ)",
+    ("lib_review_engine.py", "extract_cursor_findings", "json.JSONDecoder(object_pairs_hook=_no_duplicate_keys)"):
+        _EXTERNAL_RESPONSE + "cursor-agent の result (自由文) の末尾の findings JSON を取り出す decoder (重複キーは拒否)。"
+        "取り出した値は findings の schema で検証し、通らなければ失敗 (cursor は比較専用。失敗は併記だけ)",
+    ("lib_review_engine.py", "main", "json.load(f)"):
+        _EXTERNAL_RESPONSE + "extract-cursor に渡された findings の JSON schema "
+        "(config/kai-review-findings.schema.json。codex / agy にも渡す同じファイル)。読めなければ fail-closed",
     ("lib_mux.py", "_herdr_ping", "json.loads(data.decode().strip())"):
         _EXTERNAL_RESPONSE + "herdr socket の ping 応答。壊れていれば「応答なし」と読む",
     ("lib_mux.py", "_herdr_run", "json.loads(r.stdout)"):

@@ -77,7 +77,8 @@ def run_kai_review(tmp_path, codex_output, extra_args=(), config_text=None, extr
         _exe(bindir / name, text)
     (tmp_path / "codex_out.txt").write_text(codex_output)
     if with_codex:
-        _exe(bindir / "codex", '#!/bin/bash\nwhile [[ $# -gt 0 ]]; do [[ "$1" == "-o" ]] && out="$2"; shift; done\n'
+        # stdin (diff) を読み切る: 読まずに終わると kai-review.sh の printf が SIGPIPE で exit 141 になりうる (flake)
+        _exe(bindir / "codex", '#!/bin/bash\ncat >/dev/null\nwhile [[ $# -gt 0 ]]; do [[ "$1" == "-o" ]] && out="$2"; shift; done\n'
                                f'cp {tmp_path}/codex_out.txt "$out"\n')
     mdir = tmp_path / "queue" / "missions" / "m-test"
     mdir.mkdir(parents=True)

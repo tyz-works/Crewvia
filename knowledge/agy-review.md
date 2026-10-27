@@ -9,13 +9,13 @@ needs-director / done の報告）は codex と共通。設定の読み口は `s
 
 | 欄 | 既定 | 意味 |
 |---|---|---|
-| `engine` | `codex` | `codex` / `agy` / `both`。env `CREWVIA_REVIEW_ENGINE` が上書き（engine だけ） |
+| `engine` | `codex` | `codex` / `agy` / `both`。env `CREWVIA_REVIEW_ENGINE` が上書き（engine だけ）。`cursor` は比較専用で `compare` にだけ置ける（`knowledge/cursor-review.md`） |
 | `agy_model` | `gemini-4-argon-high` | `agy models` に出る名前（`gemini-4-argon-{low,medium,high}`） |
 | `agy_timeout_seconds` | `600` | `--print-timeout` に渡す |
 
 - **キー（`review:` / `engine` 等）が無い・config ファイルが無い = 既定**。**キーがあって値が null（`review:` / `review: null` / `engine:`）は不正**。**読めない・値が不正（env の空も）= 止める**（`needs-director`・固定コード）。codex に倒さない。
 - 読み口は PyYAML。**PyYAML が無く config ファイルがあれば止める**（`yaml_unavailable`。regex で「review: が無い」と決めると `"review":` や flow 形式を見落として黙って codex になる）。CI は `pip install pytest pyyaml`（`.github/workflows/ci.yml`）、本番の `python3` は PyYAML 6.0.1 が入っていることを確認済み（t084）。
-- `both`: 両方走らせ、**判定は codex のまま**。agy の findings は Result に「agy (比較用)」として併記する（agy が失敗しても判定は変えず、失敗の理由を併記）。
+- `both`: codex と `compare`（既定 `[agy]`）の各エンジンを走らせ、**判定は codex のまま**。agy の findings は Result に「agy (比較用)」として併記する（agy が失敗しても判定は変えず、失敗の理由を併記）。`compare: [agy, cursor]` で cursor も併記できる（`knowledge/cursor-review.md`）。
 
 ## agy の呼び方（実測: agy 1.4.7）
 

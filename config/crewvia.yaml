@@ -218,14 +218,21 @@ attempts:
 
 # ===== レビュー先（scripts/kai-review.sh） =====
 # engine: codex（既定。今までと同じ）/ agy（Antigravity CLI + Gemini。サブスクのログインのまま・API キーなし）/
-#         both（判定は codex。agy の findings は Result に「agy (比較用)」として併記）。
+#         both（判定は codex。compare の各エンジンの findings は Result に「<engine> (比較用)」として併記）。
+# compare: both のときに併記するエンジンの一覧（agy / cursor の部分集合。既定 [agy] = 今の both と同じ）。
+# cursor（Cursor CLI）は比較専用: compare にだけ置ける。engine: cursor は拒否（worktree の外を読む・出力の schema を強制できない）。
 # env CREWVIA_REVIEW_ENGINE が engine だけを上書きする。値が不正・config が読めないときは codex に倒さず needs-director。
-# agy は fail-closed: exit 非 0 / status が SUCCESS 以外 / structured_output が無い / denied_actions がある / worktree が汚れた → needs-director。
-# 設計・実測: knowledge/agy-review.md
+# agy は fail-closed: exit 非 0・timeout・出力が読めない・指摘の JSON が無い/schema 不適合・worktree が汚れた → needs-director。
+# 比較側（compare）の失敗は判定に使わず、失敗の理由を併記するだけ。
+# cursor_model: Cursor のサブスクの枠で使えるのは Grok 系だけ（2026-10-27 実測。他は ActionRequiredError で止まる）。claude-fable-* は NO ZDR のため拒否。
+# 設計・実測: knowledge/agy-review.md / knowledge/cursor-review.md
 review:
   engine: codex
   agy_model: gemini-4-argon-high
   agy_timeout_seconds: 600
+  cursor_model: grok-4.7-high
+  cursor_timeout_seconds: 900
+  compare: [agy]
 
 # ===== Telegram（Director の質問・ボタン・受信。任意） =====
 # Director がユーザーに選択肢つきの質問を Telegram で送り、ボタンの答えを Director の画面に届ける

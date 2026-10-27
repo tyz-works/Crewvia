@@ -9,7 +9,7 @@ needs-director / done の報告）は codex と共通。設定の読み口は `s
 
 | 欄 | 既定 | 意味 |
 |---|---|---|
-| `engine` | `codex` | `codex` / `agy` / `cursor` / `both`。env `CREWVIA_REVIEW_ENGINE` が上書き（engine だけ）。cursor は `knowledge/cursor-review.md` |
+| `engine` | `codex` | `codex` / `agy` / `both`。env `CREWVIA_REVIEW_ENGINE` が上書き（engine だけ）。`cursor` は比較専用で `compare` にだけ置ける（`knowledge/cursor-review.md`） |
 | `agy_model` | `gemini-4-argon-high` | `agy models` に出る名前（`gemini-4-argon-{low,medium,high}`） |
 | `agy_timeout_seconds` | `600` | `--print-timeout` に渡す |
 

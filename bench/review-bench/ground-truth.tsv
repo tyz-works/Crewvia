@@ -1,0 +1,19 @@
+# Codex の P1/P2 (全て次の commit で fix 済み)。列: round<TAB>summary<TAB>fix_commit (= 同じ PR の次の巡の head)
+pr312-r1	worktree は新しいとは限らない	7dcf0d8e8df82f05e8c05141f35eac087cafe905
+pr312-r2	checkpoint 無しでも既存 worktree を確認する	ce1463fa289e405ffb2527441563bf22990eaa8b
+pr312-r3	needs_human_review の retry	bf493f44ac1307fe87d1b3816e3d3ca9e819c425
+pr313-r1	P1: cursor の worktree を隔離する	66dd18563748891f7e34ed909b122ab15358683b
+pr313-r1	P2: 整形 JSON の扱い	66dd18563748891f7e34ed909b122ab15358683b
+pr313-r1	P2: compare 欄の型検証	66dd18563748891f7e34ed909b122ab15358683b
+pr313-r2	P2: ignored ファイルを検査に含める	e8aed50b501222710886b3e034cfe4856a56e0bd
+pr313-r2	P2: kill-after	e8aed50b501222710886b3e034cfe4856a56e0bd
+pr313-r3	指紋に clean な tracked ファイルと HEAD を含める	d9229b0baa96abe352de50d27b7d72573711fc54
+pr313-r4	入れ子の findings (壊れた外側の中の空 findings) を拾う	14a37c9bad9a483e7b9cce0177fa541bcd55eaa8
+pr313-r5	外側が別キーで始まる入れ子の findings	ba4fd9d1397cd66edecc8cff18c315672a5b3084
+pr313-r5	重複キー	ba4fd9d1397cd66edecc8cff18c315672a5b3084
+pr314-r1	gh 呼び出しごとに残り時間を見る	121dee53b4e87172996714a229f33ddd896f4aa4
+pr314-r1	check 欄の型 (malformed)	121dee53b4e87172996714a229f33ddd896f4aa4
+pr314-r2	task-graph 再生成の失敗を再試行する	322b25e32cdc46871d60869aa1da81bec7b5972d
+pr314-r3	summary の PR 照合	95ecef92e72461780795c7fce14d80f540f05d23
+pr314-r3	watchdog の PR 番号更新	95ecef92e72461780795c7fce14d80f540f05d23
+pr314-r4	不完全な check record	288036baff16673988253d1545f8607ba674659c

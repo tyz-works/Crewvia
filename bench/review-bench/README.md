@@ -42,14 +42,15 @@ Director が手で回す計測道具。入力（`rounds.tsv`・正本の checkli
 守るのは **黙った誤採点だけ**（正解を読んだ巡・clone が汚れた巡・検証できなかった巡を、採点に混ぜない）。悪意ある入力や回避は対象外。
 そのため runner は、diff/log/checklist の生成と setup の失敗で巡を止め（rc 94-96）、engine の前後で clone が `HEAD = head sha` かつ clean かを検査する
 （前でずれ = 95 で走らせない・後でずれ = 97 で `.json` を捨て `.rc` に `tainted_clone`）。汚染検査は判定できないとき exit 3（採点しない）。
+**engine 出力の検証は本番 lib（`scripts/lib_review_engine.py` の extract-claude / extract-agy）に一本化。bench 側で再実装しない**（基準が本番とずれて黙った誤採点になるため）。clone の `git status` 自体が失敗したときも汚れ扱い。
 
 ## 汚染検査
 
-claude の session jsonl (`~/.claude/projects/<clone の / . _ を - に置換>/*.jsonl`) の Read / Grep / Glob の path が
+claude の session jsonl (`~/.claude/projects/<clone の / . _ を - に置換>/<UUID>.jsonl`。UUID は runner が `--session-id` で渡し `out/<label>.claude.session` に記録した、その実行の 1 ファイルだけ。dir の他の session は見ない) の Read / Grep / Glob の path が
 clone と diff dir の下かを調べる。**採点の前に必ず回す**（外を読んだ巡は採点から外す）。
 
 ```bash
-python3 check_contamination.py --clone out/rounds/pr314-r2 --diff-dir out/diffs/pr314-r2.claude   # 0 = 外を読んだ記録なし
+python3 check_contamination.py --clone out/rounds/pr314-r2 --diff-dir out/diffs/pr314-r2.claude --session-id "$(cat out/pr314-r2.claude.session)"   # 0 = 外を読んだ記録なし
 ```
 
 exit 1 = 外を読んだ疑い (`OUTSIDE <tool> <path>` を出す) / exit 2 = jsonl が無く検査できない（その巡は採点しない）/ exit 3 = 壊れた JSON 行・path が無い／文字列でない Read・検査した tool_use が 0 件（inconclusive。汚染なしとは言えないので採点しない）。
@@ -68,7 +69,7 @@ Codex の P1/P2 は全て fix 済みなので妥当とみなす。巡ごとに�
 
 ## agy の枠切れの見分け方
 
-agy の出力は `validate_agy.py`（status SUCCESS・denied_actions 空・schema 適合。本番の kai-review.sh と同じ基準）を通ったときだけ `.agy.json` になる（通らなければ `.agy.rc` に `agy_invalid`）。`out/<label>.agy.rc` が `rc=3` で、`.err` に `Individual quota reached` / `RESOURCE_EXHAUSTED 429` /
+agy の出力は本番 lib の `lib_review_engine.py extract-agy`（status SUCCESS・denied_actions 空・重複キー拒否・schema 適合）を通ったときだけ `.agy.json` になる（通らなければ `.agy.rc` に `agy_invalid`）。`out/<label>.agy.rc` が `rc=3` で、`.err` に `Individual quota reached` / `RESOURCE_EXHAUSTED 429` /
 `Resets in 127h…` が出ていれば枠切れ。**未採点**にする（0 件の指摘として数えない）。枠が戻ってから同じコマンドで再実行すればよい
 （`.json` が無い巡だけ走る）。
 

@@ -308,3 +308,35 @@ def test_diagnose_drops_the_partial_first_line_of_a_truncated_window(tmp_path):
     err.write_text(cut + "x" * lre._DIAG_READ_BYTES + "\nlast line\n")
     text = lre.diagnose(str(out), str(err))
     assert cut not in text and "last line" in text
+
+
+# --- extract-agy (bench/review-bench が本番と同じ検証を呼ぶための入口) ---
+
+def _agy_doc(**over):
+    d = {"status": "SUCCESS", "denied_actions": None, "structured_output": {"findings": []}}
+    d.update(over)
+    return json.dumps(d)
+
+
+@pytest.mark.parametrize("text,code", [
+    ("not json", "unparseable_output"),
+    ("[]", "unparseable_output"),
+    (_agy_doc() + _agy_doc(), "unparseable_output"),
+    ('{"status":"SUCCESS","status":"SUCCESS","structured_output":{"findings":[]}}', "duplicate_key"),
+    (_agy_doc(status="ERROR"), "status"),
+    (_agy_doc(denied_actions=[{"tool": "Bash"}]), "denied_actions"),
+    (_agy_doc(denied_actions="x"), "unparseable_output"),
+    (_agy_doc(structured_output=None), "no_structured_output"),
+    (_agy_doc(structured_output={"findings": [{"priority": "P1"}]}), "schema_invalid"),
+])
+def test_extract_agy_fails_closed(text, code):
+    schema = json.loads((REPO_ROOT / "config" / "kai-review-findings.schema.json").read_text())
+    with pytest.raises(lre.CursorOutputError) as e:
+        lre.extract_agy_findings(text, schema)
+    assert e.value.code == code
+
+
+def test_extract_agy_accepts_null_and_empty_denied_actions():
+    schema = json.loads((REPO_ROOT / "config" / "kai-review-findings.schema.json").read_text())
+    for d in (None, []):
+        assert lre.extract_agy_findings(_agy_doc(denied_actions=d), schema) == {"findings": []}

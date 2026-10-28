@@ -60,7 +60,9 @@ UP='git -c uploadpack.allowAnySHA1InWant=true upload-pack'
 # clone が head sha にあり、変更・未追跡・ignored が無いこと
 clone_ok() {
   [[ "$(git -C "$1" rev-parse HEAD 2>/dev/null)" == "$2" ]] || return 1
-  [[ -z "$(git -C "$1" status --porcelain --ignored 2>/dev/null)" ]] || return 1
+  local st
+  st="$(git -C "$1" status --porcelain --ignored 2>/dev/null)" || return 1   # status 自体の失敗は汚れ扱い
+  [[ -z "$st" ]] || return 1
 }
 
 run_round() {
@@ -101,9 +103,12 @@ Shell commands are not available. Do not create, modify or delete any file. Retu
   local rc
   if [[ $engine == claude ]]; then
     local schema; schema="$(cat "$KIT/schema.json")"
+    # 汚染検査をこの実行の session 1 ファイルに縛るため、UUID を渡して記録する
+    local sid; sid="$(python3 -c 'import uuid; print(uuid.uuid4())')" || return 98
+    echo "$sid" > "$out/$label.claude.session"
     # prompt は stdin で渡す (可変長 option が prompt を食う / diff を argv に載せない)
     printf '%s' "$prompt$extra" | ( cd "$R" && env -i PATH="$PATH" HOME="$HOME" LANG="${LANG:-C.UTF-8}" TERM=dumb \
-      timeout --kill-after=10s 900s claude -p --output-format json --json-schema "$schema" --permission-mode plan \
+      timeout --kill-after=10s 900s claude -p --session-id "$sid" --output-format json --json-schema "$schema" --permission-mode plan \
       --model claude-opus-5-5 --setting-sources user --strict-mcp-config \
       --add-dir "$DD" --allowedTools "Read($R/**)" "Read($DD/**)" "Grep" "Glob" \
       --disallowedTools Bash Write Edit MultiEdit NotebookEdit WebFetch WebSearch Task Agent ExitPlanMode ) \
@@ -120,9 +125,10 @@ Shell commands are not available. Do not create, modify or delete any file. Retu
         --add-dir "$DD" --print-timeout 600s -p "$prompt$extra" ) > "$out/$label.agy.raw" 2> "$out/$label.agy.err"
     rc=$?; echo "rc=$rc" > "$out/$label.agy.rc"
     if [[ $rc -eq 0 ]]; then
-      # 本番の collector (kai-review.sh) と同じ検証: status SUCCESS・denied_actions 空・structured_output が schema 準拠。
+      # 検証は本番 lib (extract-agy: status SUCCESS・denied_actions 空・重複キー拒否・schema) に一本化。bench で再実装しない。
       # 通ったときだけ完了 JSON を置く (置くと次回から「済み」で飛ばされる)
-      if python3 "$KIT/validate_agy.py" --raw "$out/$label.agy.raw" --schema "$KIT/schema.json" --scripts "$src/scripts" \
+      if PYTHONPATH="$src/scripts" python3 "$src/scripts/lib_review_engine.py" extract-agy \
+          --out "$out/$label.agy.raw" --schema "$KIT/schema.json" \
           > "$out/$label.agy.json.tmp" 2>> "$out/$label.agy.err"; then
         mv -f "$out/$label.agy.json.tmp" "$out/$label.agy.json"
       else

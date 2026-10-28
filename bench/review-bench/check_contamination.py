@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """汚染検査: claude の session jsonl の Read / Grep / Glob の path が、巡の clone と diff dir の下に収まるか。
 
-usage: check_contamination.py --clone <dir> --diff-dir <dir> [--projects-dir ~/.claude/projects]
+usage: check_contamination.py --clone <dir> --diff-dir <dir> --session-id <uuid> [--projects-dir ~/.claude/projects]
+--session-id は runner が `<out>/<label>.claude.session` に記録した UUID。その 1 ファイル (<uuid>.jsonl) だけを見る
+(clone の dir にある他の session を混ぜない。再実行や別の実行の記録で誤って陽性/陰性にならない)。
 exit 0 = 外を読んだ記録 0 件 / 1 = 外を読んだ疑い (path を stdout に出す) / 2 = jsonl が無い (検査不能)
 / 3 = 壊れた JSON 行がある・検査した tool_use が 0 件 (inconclusive。汚染なしとは言えない)
 path 無しの Grep / Glob は cwd (= clone) なので許容。Read の path が無い・非文字列は inconclusive (3)。StructuredOutput 等の入力は見ない。
@@ -9,6 +11,7 @@ path 無しの Grep / Glob は cwd (= clone) なので許容。Read の path が
 import argparse
 import json
 import os
+import re
 import sys
 
 TOOLS = {'Read': ('file_path',), 'Grep': ('path',), 'Glob': ('path',)}
@@ -19,13 +22,14 @@ def under(path, roots):
     return any(p == r or p.startswith(r + os.sep) for r in roots)
 
 
-def session_files(projects_dir, clone):
+def session_files(projects_dir, clone, session_id):
     # claude は cwd の / . _ を - に置換した名前の dir に jsonl を置く
     key = ''.join('-' if c in '/._' else c for c in os.path.realpath(clone))
     d = os.path.join(projects_dir, key)
     if not os.path.isdir(d):
         return []
-    return sorted(os.path.join(d, n) for n in os.listdir(d) if n.endswith('.jsonl'))
+    fp = os.path.join(d, session_id + '.jsonl')
+    return [fp] if os.path.isfile(fp) else []
 
 
 def outside_reads(files, roots, cwd):
@@ -72,11 +76,15 @@ def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument('--clone', required=True)
     ap.add_argument('--diff-dir', required=True)
+    ap.add_argument('--session-id', required=True)
     ap.add_argument('--projects-dir', default=os.path.expanduser('~/.claude/projects'))
     a = ap.parse_args(argv)
-    files = session_files(a.projects_dir, a.clone)
+    if not re.fullmatch(r'[0-9a-fA-F-]{36}', a.session_id):
+        print('bad --session-id', file=sys.stderr)
+        return 2
+    files = session_files(a.projects_dir, a.clone, a.session_id)
     if not files:
-        print('no session jsonl for', a.clone, file=sys.stderr)
+        print('no session jsonl for', a.clone, a.session_id, file=sys.stderr)
         return 2
     roots = [os.path.realpath(a.clone), os.path.realpath(a.diff_dir)]
     total, bad, malformed = outside_reads(files, roots, os.path.realpath(a.clone))

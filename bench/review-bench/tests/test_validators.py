@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""validate_agy.py と check_contamination.py の判定 (claude / agy は呼ばない)。
+"""本番 lib の extract-agy (bench が呼ぶ検証) と check_contamination.py の判定 (claude / agy は呼ばない)。
 
 実行: python3 bench/review-bench/tests/test_validators.py
 """
@@ -14,19 +14,22 @@ KIT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPTS = os.path.join(os.path.dirname(os.path.dirname(KIT)), 'scripts')
 SCHEMA = os.path.join(KIT, 'schema.json')
 GOOD = {'findings': []}
+SID = '11111111-2222-3333-4444-555555555555'
 
 
 def run(script, *args):
     return subprocess.run([sys.executable, os.path.join(KIT, script), *args], capture_output=True, text=True)
 
 
-class ValidateAgy(unittest.TestCase):
+class ExtractAgy(unittest.TestCase):
+    """bench は agy 出力の検証を再実装せず、本番 lib の extract-agy を呼ぶ。その呼び口が bench の schema で働くこと。"""
     def check(self, text):
         with tempfile.TemporaryDirectory() as d:
             raw = os.path.join(d, 'raw')
             with open(raw, 'w') as f:
                 f.write(text)
-            return run('validate_agy.py', '--raw', raw, '--schema', SCHEMA, '--scripts', SCRIPTS)
+            return subprocess.run([sys.executable, os.path.join(SCRIPTS, 'lib_review_engine.py'), 'extract-agy',
+                                   '--out', raw, '--schema', SCHEMA], capture_output=True, text=True)
 
     def test_ok(self):
         r = self.check(json.dumps({'status': 'SUCCESS', 'denied_actions': [], 'structured_output': GOOD}))
@@ -34,24 +37,17 @@ class ValidateAgy(unittest.TestCase):
         self.assertEqual(json.loads(r.stdout), GOOD)
 
     def test_rejects(self):
-        cases = {
-            'status': {'status': 'ERROR', 'structured_output': GOOD},
-            'denied_actions': {'status': 'SUCCESS', 'denied_actions': [{'x': 1}], 'structured_output': GOOD},
-            'no_structured_output': {'status': 'SUCCESS'},
-            'schema_invalid': {'status': 'SUCCESS', 'structured_output': {'findings': 'x'}},
-        }
-        for code, doc in cases.items():
-            r = self.check(json.dumps(doc))
-            self.assertEqual(r.returncode, 1, code)
-            self.assertEqual(r.stdout, '', code)
-            self.assertIn(code, r.stderr)
-
-    def test_rejects_garbage_and_multiple_docs(self):
-        ok = json.dumps({'status': 'SUCCESS', 'structured_output': GOOD})
-        for text in ('', 'not json', ok + ok):
+        for text in ('', 'not json', json.dumps({'status': 'ERROR', 'structured_output': GOOD}),
+                     json.dumps({'status': 'SUCCESS', 'denied_actions': [1], 'structured_output': GOOD}),
+                     json.dumps({'status': 'SUCCESS', 'structured_output': {'findings': 'x'}})):
             r = self.check(text)
             self.assertEqual(r.returncode, 1, text)
             self.assertEqual(r.stdout, '', text)
+
+    def test_bench_has_no_validator_of_its_own(self):
+        self.assertFalse(os.path.exists(os.path.join(KIT, 'validate_agy.py')))
+        with open(os.path.join(KIT, 'run.sh'), encoding='utf-8') as f:
+            self.assertIn('extract-agy', f.read())
 
 
 class Contamination(unittest.TestCase):
@@ -71,9 +67,10 @@ class Contamination(unittest.TestCase):
         return json.dumps({'message': {'content': [{'type': 'tool_use', 'name': 'Read', 'input': {'file_path': path}}]}})
 
     def check(self, *lines):
-        with open(os.path.join(self.sess, 's.jsonl'), 'w') as f:
+        with open(os.path.join(self.sess, SID + '.jsonl'), 'w') as f:
             f.write('\n'.join(lines) + '\n')
-        return run('check_contamination.py', '--clone', self.clone, '--diff-dir', self.diff, '--projects-dir', self.projects)
+        return run('check_contamination.py', '--clone', self.clone, '--diff-dir', self.diff, '--session-id', SID,
+                   '--projects-dir', self.projects)
 
     def test_clean(self):
         self.assertEqual(self.check(self.read(os.path.join(self.clone, 'a'))).returncode, 0)
@@ -112,8 +109,20 @@ class Contamination(unittest.TestCase):
         self.assertEqual(self.check(self.tool('Grep', {'pattern': 'x'})).returncode, 0)
 
     def test_no_session_file(self):
-        os.remove(os.path.join(self.sess, 's.jsonl')) if os.path.exists(os.path.join(self.sess, 's.jsonl')) else None
-        r = run('check_contamination.py', '--clone', self.clone, '--diff-dir', self.diff, '--projects-dir', self.projects)
+        r = run('check_contamination.py', '--clone', self.clone, '--diff-dir', self.diff, '--session-id', SID,
+                '--projects-dir', self.projects)
+        self.assertEqual(r.returncode, 2)
+
+    def test_only_the_named_session_is_read(self):
+        # 別の session (外を読んでいる) が同じ dir にあっても、指定した UUID の 1 ファイルだけを見る
+        other = os.path.join(self.sess, '99999999-2222-3333-4444-555555555555.jsonl')
+        with open(other, 'w') as f:
+            f.write(self.read('/etc/passwd') + '\n')
+        self.assertEqual(self.check(self.read(os.path.join(self.clone, 'a'))).returncode, 0)
+
+    def test_bad_session_id(self):
+        r = run('check_contamination.py', '--clone', self.clone, '--diff-dir', self.diff, '--session-id', '../x',
+                '--projects-dir', self.projects)
         self.assertEqual(r.returncode, 2)
 
 

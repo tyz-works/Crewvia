@@ -186,8 +186,11 @@ ALLOWED_JSON_PARSES: dict[tuple[str, str, str], str] = {
     ("lib_review_engine.py", "extract_claude_findings", "json.loads(out_text, object_pairs_hook=_no_duplicate_keys)"):
         _EXTERNAL_RESPONSE + "`claude -p --output-format json` の stdout (JSON 1 個)。デーモン側状態ストアではない。"
         "読めない・is_error・subtype・permission_denials・structured_output が無い・schema 不適合・重複キーなら固定コードで失敗 (fail-closed)",
+    ("lib_review_engine.py", "extract_agy_findings", "json.loads(out_text, object_pairs_hook=_no_duplicate_keys)"):
+        _EXTERNAL_RESPONSE + "`agy --output-format json` の stdout (JSON 1 個)。デーモン側状態ストアではない。"
+        "読めない・status・denied_actions・structured_output が無い・schema 不適合・重複キーなら固定コードで失敗 (fail-closed。bench が呼ぶ)",
     ("lib_review_engine.py", "main", "json.load(f)"):
-        _EXTERNAL_RESPONSE + "extract-cursor / extract-claude に渡された findings の JSON schema "
+        _EXTERNAL_RESPONSE + "extract-cursor / extract-claude / extract-agy に渡された findings の JSON schema "
         "(config/kai-review-findings.schema.json。codex / agy にも渡す同じファイル)。読めなければ fail-closed",
     ("lib_mux.py", "_herdr_ping", "json.loads(data.decode().strip())"):
         _EXTERNAL_RESPONSE + "herdr socket の ping 応答。壊れていれば「応答なし」と読む",

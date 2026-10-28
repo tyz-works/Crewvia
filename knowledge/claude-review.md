@@ -104,6 +104,10 @@ stderr の末尾を伏せ字（`lib_checkpoint.redact`）に通して Result に
 
 判定は codex のまま。claude は**判定の結果をシェル変数に取り、codex の一時ファイルを消した後に**走らせる（cursor と同じ位置）。失敗は併記だけ。
 
+## prompt の強化（mission `20261028-claude-reviewer-hardening` t002）
+
+採点で claude は Codex の P1/P2 の 39% しか P1/P2 で拾えず、P3 に下げたものを足して 61% だった。見逃しの型（文書の断定と現状の食い違い・入力の網羅検証・指紋に入るもの/入らないもの・別プロセスの読み手の追従）を `knowledge/review-attack-checklist.md` の型 9〜12 に一般化して足し、重要度の基準（到達できる入力で判定の誤り・データの消失・黙った誤動作が起きるなら P2 以上）を同ファイルに書いた。`run_claude_review` の prompt にも「入力を 1 つずつ網羅する」「その基準で P3 に下げない」を 2 行足した。codex / agy / cursor の prompt と判定の経路は変えていない。
+
 ## 枠（利用量）は Worker と共有する
 
 - 子の `claude` は Worker と**同じアカウントのサブスクの枠**を使う（ログインは HOME 下の Claude Code の認証。API キーは渡さない）。

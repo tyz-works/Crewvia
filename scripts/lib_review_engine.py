@@ -493,6 +493,12 @@ def main(argv=None):
         except (OSError, ValueError):
             print('unparseable_output', file=sys.stderr)
             return 1
+        # claude も読んだファイルの中身 (秘密を含みうる) を body に写しうる。cursor と同じく値ごとに伏せ字を通す。失敗したら出さない
+        try:
+            found = redact_findings(found)
+        except Exception:  # noqa: BLE001 — 伏せ字が通らないものは出さない側に倒す
+            print('redaction_failed', file=sys.stderr)
+            return 1
         print(json.dumps(found, ensure_ascii=False, separators=(',', ':')))
         return 0
     if args.cmd == 'extract-cursor':

@@ -72,6 +72,8 @@ OS の sandbox ではない）。外への書き込みは道具が無いので�
 失敗の診断（`lib_review_engine.py diagnose --engine claude`）は stdout の `type` / `subtype` / `is_error` と拒否された道具の名前（`denied tool: Bash`）、
 stderr の末尾を伏せ字（`lib_checkpoint.redact`）に通して Result に残す。`result`（レビュー本文・コード片）と道具の入力（コマンド・パス）は出さない。
 
+通った findings も、Result に入る前に title / body / file の**値ごと**に伏せ字を通す（`redact_findings`。cursor と同じ）。claude は読んだファイルの中身（`API_KEY=…` 等）を body に写しうる。伏せ字が例外なら `redaction_failed` で fail-closed（findings を出さない）。Codex #316 r1 P2。
+
 ## prompt の方針
 
 - 共通の prompt（codex / agy と同じ: 正しさ・安全・人が見るべきもの、P0〜P3、空の findings は読んだうえでだけ）に足す:

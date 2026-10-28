@@ -13,7 +13,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_kai_review_keeps_full_codex_findings_in_the_card import REPO_ROOT, run_kai_review  # noqa: E402
-from test_kai_review_engine_agy import AGY_STUB  # noqa: E402
+from test_kai_review_engine_agy import AGY_STUB, FAKE_SECRET  # noqa: E402
 
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 import lib_review_engine as lre  # noqa: E402
@@ -257,6 +257,37 @@ def test_claude_not_installed_is_fail_closed(tmp_path, monkeypatch):
     p, capture = run(tmp_path, monkeypatch, with_claude=False)
     assert _verdict(tmp_path) == "needs-director"
     assert any("CLAUDE FAILURE: claude_not_found" in c for c in _calls(tmp_path))
+
+
+@pytest.mark.parametrize("body", [f"key {FAKE_SECRET}", f'"api_key": "{FAKE_SECRET}"', f'password="{FAKE_SECRET} x"',
+                                  f"API_KEY={FAKE_SECRET}"])
+@pytest.mark.parametrize("engine,priority,verdict", [
+    ("claude", "P2", "needs-director"), ("claude", "P3", "done"), ("ensemble", "P2", "needs-director"),
+])
+def test_claude_findings_are_redacted_before_the_result(tmp_path, monkeypatch, body, engine, priority, verdict):
+    # claude は読んだファイルの中身を body に写しうる。title / body / file の値ごとに伏せ字を通す (Codex #316 r1 P2)
+    leak = json.dumps({"findings": [{"priority": priority, "title": f"t {FAKE_SECRET}", "body": body,
+                                     "file": f"x/{FAKE_SECRET}"}]})
+    p, capture = run(tmp_path, monkeypatch, engine=engine, claude_findings=leak)
+    assert _verdict(tmp_path) == verdict, (p.stdout, p.stderr)
+    text = _result(capture, verdict)
+    assert FAKE_SECRET not in text and "REDACTED" in text
+    assert FAKE_SECRET not in "\n".join(_calls(tmp_path))
+
+
+def test_claude_redaction_failure_withholds_the_findings(tmp_path, monkeypatch, capsys):
+    import lib_checkpoint
+
+    def boom(_t):
+        raise lib_checkpoint.RedactionError("x")
+    monkeypatch.setattr(lib_checkpoint, "redact", boom)
+    out = tmp_path / "out.json"
+    out.write_text(_doc(structured_output={"findings": [
+        {"priority": "P2", "title": f"t {FAKE_SECRET}", "body": None, "file": None}]}))
+    rc = lre.main(["extract-claude", "--out", str(out),
+                   "--schema", str(REPO_ROOT / "config" / "kai-review-findings.schema.json")])
+    cap = capsys.readouterr()
+    assert rc == 1 and cap.out == "" and "redaction_failed" in cap.err and FAKE_SECRET not in cap.err
 
 
 def test_claude_failure_diagnostics_name_the_denied_tool_not_its_input(tmp_path, monkeypatch):

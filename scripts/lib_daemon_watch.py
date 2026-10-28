@@ -877,6 +877,15 @@ def spawn_command(name: str, repo_root, *, env=None) -> str:
     values = {var: str(env.get(var, "") or "") for var in _SPAWN_ENV_VARS}
     prefix = "".join(f"export {var}={_sh_single_quote(value)}; "
                      for var, value in values.items() if value)
+    # scripts/bin on PATH, same as start.sh's LAUNCH_CMD: a freshly spawned pane
+    # does not inherit this process's PATH (same reason _SPAWN_ENV_VARS exists
+    # above), so without this prefix the bare `python3` below — and every
+    # `python3` dispatcher.sh/watchdog.py later shell out to — resolves to
+    # whatever /usr/bin/python3 is, not the scripts/bin/python3 shim that
+    # redirects to python3.12 (t004 / 20261028-python312-runtime).
+    path_prefix = (
+        f"export PATH={_sh_single_quote(str(scripts / 'bin') + ':')}\"$PATH\"; "
+    )
     if name == DAEMON_DISPATCHER:
         body = f"bash {_sh_single_quote(scripts / 'dispatcher.sh')}"
     elif name == DAEMON_WATCHDOG:
@@ -888,7 +897,7 @@ def spawn_command(name: str, repo_root, *, env=None) -> str:
     # apostrophe is then command, not path.  Quoting the env values but not
     # the paths is the shape where the *unremarkable* input is the dangerous
     # one, so every interpolation goes through the same function.
-    return f"cd {_sh_single_quote(repo_root)} && {prefix}{body}"
+    return f"cd {_sh_single_quote(repo_root)} && {path_prefix}{prefix}{body}"
 
 
 # ---------------------------------------------------------------------------

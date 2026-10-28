@@ -1,0 +1,20 @@
+#!/bin/sh
+# scripts/bin/python3 — PATH shim that redirects bare `python3` / `#!/usr/bin/env python3`
+# call sites to python3.12, without touching /usr/bin/python3 (t004 / 20261028-python312-runtime).
+#
+# Why a shim instead of editing call sites: every call site in this repo already says
+# bare `python3` (subprocess argv or shebang), so putting this directory first on PATH
+# redirects all of them at once. t002 confirmed `python3.12` (the PATH-resolved deadsnakes
+# binary, with pyyaml/pytest installed into its user site-packages) is what to exec here —
+# no venv to activate.
+#
+# Looked up by name, not a hardcoded /usr/bin/python3.12: this file sits in scripts/bin,
+# which is itself prepended to PATH ahead of /usr/bin, so the lookup below skips straight
+# past this script (no "python3.12" shim exists to recurse into) to the real interpreter.
+#
+# argv[0] becomes "python3.12" after exec, not "python3" — this is already accounted for
+# by lib_mux.py's _INTERPRETER_BASE_NAMES / _VERSIONED_NAME_RE (pane provenance/identity
+# guards already treat "python3.12 watchdog.py" as the daemon, Codex 5巡目 P1-2).
+#
+# 戻し方: このファイルを消す（scripts/bin には他に plan wrapper しか残らない）。
+exec python3.12 "$@"

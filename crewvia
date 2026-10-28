@@ -12,6 +12,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_FILE="${SCRIPT_DIR}/config/crewvia.yaml"
 TOKEN_FILE="${SCRIPT_DIR}/config/.taskvia-token"
 
+# scripts/bin を早期に PATH の先頭へ: start.sh への exec より前にある下の herdr
+# preflight (`python3 lib_mux.py ...`) も bare `python3` を使うため、ここで
+# 差さないとこの launcher の生存中だけ scripts/bin/python3 シムの外に出る
+# (t004 / 20261028-python312-runtime)。start.sh 自身も同じことを行うが、
+# exec の前にこのプロセスが python3 を呼ぶ窓がある。
+export PATH="${SCRIPT_DIR}/scripts/bin:${PATH}"
+
 # --- config から設定を読み込む ---
 read_config() {
   local key="$1" default="${2:-}"

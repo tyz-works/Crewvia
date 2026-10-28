@@ -755,23 +755,27 @@ Your final message must END with the JSON object required by the schema (startin
 
 # --- claude (Claude Code CLI: claude -p) 実行 ---
 # Worker と同じアカウントのサブスクの枠を使う (API キーは使わない)。**読み取り専用**: --permission-mode plan +
-# --allowedTools を Read / Grep / Glob と読み取り系 Bash に絞り、書き込み系は --disallowedTools。--json-schema で
+# --allowedTools を Read / Grep / Glob だけに絞り、Bash と書き込み系は --disallowedTools。--json-schema で
 # structured_output を schema に合わせる (lib_review_engine.py extract-claude が同じ schema でもう一度検証する)。
 # --setting-sources user: レビューする PR の .claude/ (settings・hooks) を読まない (PR が足した hook を走らせない)。
 #   秘密ファイルの読み取り禁止 (Read の deny) は user の settings にあるのでそのまま効く。--bare は hooks を飛ばすので使わない。
 # --strict-mcp-config (--mcp-config なし) で MCP を 1 つも起動しない。--no-session-persistence で会話を残さない。
+# **Bash は許さない**: 読み取り系の prefix (git diff / sed -n / cat …) でも `git diff --output=` / `--ext-diff`・`sed -n 'w f'`
+#   で書け・外部コマンドを起動でき、`cat` は Read の deny (秘密ファイル) を迂回する。git の文脈は diff と同じ一時 dir に
+#   `git log` を書いて渡す (review.log)。
 # prompt は stdin で渡す (--add-dir / --allowedTools は可変長で、後ろの位置引数を食う)。diff は argv に載せない (一時 dir)。
-# 子の claude に crewvia の env (AGENT_NAME・TASK_ID・CREWVIA_*・TASKVIA_*) を渡さない: Worker と誤認されない
-# (hook の承認・ログ投稿・assignment の補完が走らない)。
+# 子の claude の env は allowlist (CLAUDE_ENV_KEEP) だけ: crewvia の env (AGENT_NAME・TASK_ID・CREWVIA_*・TASKVIA_* の token) を
+# 渡さない = Worker と誤認されない (hook の承認・ログ投稿・assignment の補完が走らない)・秘密の env を読ませない。
 # **fail-closed**: exit != 0 (timeout は 124 / --kill-after は 137) / JSON が読めない / is_error / subtype != success /
 #   permission_denials が空でない / structured_output が無い・schema 不適合 / 実行の前後で REVIEW_WT の指紋 (HEAD +
 #   status --ignored + lstat) が変わった → 成功を返さない。理由は CLAUDE_FAIL (固定語彙)。成功なら findings の JSON を $1 に書く。
 CLAUDE_FAIL=""
 CLAUDE_DIAG=""
 CLAUDE_KILL_AFTER_SECONDS=10
-CLAUDE_ALLOWED_TOOLS=(Read Grep Glob 'Bash(git diff:*)' 'Bash(git show:*)' 'Bash(git log:*)'
-                      'Bash(cat:*)' 'Bash(sed -n:*)' 'Bash(grep:*)')
-CLAUDE_DISALLOWED_TOOLS=(Write Edit MultiEdit NotebookEdit WebFetch WebSearch Task Agent ExitPlanMode)
+CLAUDE_ALLOWED_TOOLS=(Read Grep Glob)
+CLAUDE_DISALLOWED_TOOLS=(Bash Write Edit MultiEdit NotebookEdit WebFetch WebSearch Task Agent ExitPlanMode)
+# 子に残す env (名前の allowlist。値は argv に載せない = subshell の中で残り全部を unset)。claude の認証は HOME 下のログイン
+CLAUDE_ENV_KEEP=' PATH HOME USER LOGNAME SHELL LANG LC_ALL LC_CTYPE TERM TMPDIR TZ CLAUDE_CONFIG_DIR XDG_CONFIG_HOME XDG_DATA_HOME XDG_CACHE_HOME XDG_RUNTIME_DIR '
 claude_collect_diag() {
   CLAUDE_DIAG="$(python3 "${SCRIPT_DIR}/lib_review_engine.py" diagnose --engine claude --out "$CLAUDE_OUT_FILE" --err "$CLAUDE_ERR_FILE" 2>/dev/null)" \
     || CLAUDE_DIAG="(diagnostics unavailable)"
@@ -784,6 +788,8 @@ run_claude_review() {
   [[ -n "$CLAUDE_OUT_FILE" ]] || CLAUDE_OUT_FILE="$(mktemp "${TMPDIR:-/tmp}/kai-review-claude-out.XXXXXX")"
   [[ -n "$CLAUDE_ERR_FILE" ]] || CLAUDE_ERR_FILE="$(mktemp "${TMPDIR:-/tmp}/kai-review-claude-err.XXXXXX")"
   printf '%s' "$DIFF_CONTENT" > "${CLAUDE_DIFF_DIR}/review.diff" || { CLAUDE_FAIL="diff_write_failed"; return 1; }
+  git -C "$REVIEW_WT" log --no-color --format='%h %s' "${DIFF_BASE}..HEAD" > "${CLAUDE_DIFF_DIR}/review.log" 2>/dev/null \
+    || { CLAUDE_FAIL="diff_write_failed"; return 1; }
   : > "$CLAUDE_OUT_FILE"; : > "$CLAUDE_ERR_FILE"
   if ! fp_before="$(wt_fingerprint "$REVIEW_WT")"; then CLAUDE_FAIL="worktree_status_failed"; return 1; fi
   local schema prompt
@@ -799,13 +805,16 @@ Every finding's \"body\" MUST include either concrete reproduction steps or the 
 (inputs, the command or call, the expected vs. the actual result). If you cannot write one, do not report it.
 
 Read the unified diff from the file ${CLAUDE_DIFF_DIR}/review.diff (it is outside this checkout; read it as a file).
-You may read files in this checkout and run read-only git commands (git diff / git show / git log) to verify the code.
+The commits of this change (git log, base..HEAD) are in ${CLAUDE_DIFF_DIR}/review.log.
+Read files in this checkout (Read / Grep / Glob) to verify the code. Shell commands are not available.
 Do not create, modify or delete any file. Return only the JSON object required by the schema."
   _info "Running claude -p --permission-mode plan --model ${CLAUDE_MODEL} (diff=${DIFF_BYTES} bytes, timeout=${CLAUDE_TIMEOUT}s) ..."
   printf '%s' "$prompt" | (
     cd "$REVIEW_WT" || exit 1
-    # crewvia の env を子に渡さない (名前の一覧を取ってから unset。値は argv に出ない)
-    while IFS= read -r _v; do unset "$_v"; done < <(compgen -e | grep -E '^(CREWVIA_|TASKVIA_|AGENT_NAME$|TASK_ID$|TASK_TITLE$)')
+    # allowlist に無い env を全部外す (名前の一覧を取ってから unset。値は argv に出ない。readonly は外せないので無視)
+    while IFS= read -r _v; do
+      [[ "$CLAUDE_ENV_KEEP" == *" $_v "* ]] || unset "$_v" 2>/dev/null || true
+    done < <(compgen -e)
     exec timeout --kill-after="${CLAUDE_KILL_AFTER_SECONDS}s" "${CLAUDE_TIMEOUT}s" claude -p \
       --output-format json --json-schema "$schema" --permission-mode plan --model "$CLAUDE_MODEL" \
       --setting-sources user --strict-mcp-config --no-session-persistence \
@@ -887,14 +896,18 @@ run_ensemble_review() {
   claude_out="$(mktemp "${TMPDIR:-/tmp}/kai-review-ens-claude.XXXXXX")"
   run_agy_review "$agy_out" || { agy_ok=0; agy_collect_diag; }
   rm -f "$AGY_OUT_FILE" "$AGY_ERR_FILE"; rm -rf "$AGY_DIFF_DIR"; AGY_OUT_FILE=""; AGY_ERR_FILE=""; AGY_DIFF_DIR=""
+  # agy の結果は claude を走らせる前にシェル変数に取り、ファイルを消す (claude に読ませ・書き換えさせる余地を作らない)
+  if [[ $agy_ok -eq 1 ]]; then ENSEMBLE_RAW_AGY="$(cat "$agy_out")"; fi
+  rm -f "$agy_out"
   # agy が失敗しても claude は走らせる (Result に両方の状態を残す)。判定は失敗のまま
   run_claude_review "$claude_out" || { claude_ok=0; claude_collect_diag; }
   claude_drop_tmp
   if [[ $agy_ok -eq 1 && $claude_ok -eq 1 ]]; then
-    ENSEMBLE_RAW_AGY="$(cat "$agy_out")"; ENSEMBLE_RAW_CLAUDE="$(cat "$claude_out")"
-    if jq -c -n --slurpfile a "$agy_out" --slurpfile c "$claude_out"         'if ($a | length) == 1 and ($c | length) == 1
-            and (($a[0].findings | type) == "array") and (($c[0].findings | type) == "array")
-         then {findings: (($a[0].findings | map(. + {engine: "agy"})) + ($c[0].findings | map(. + {engine: "claude"})))}
+    ENSEMBLE_RAW_CLAUDE="$(cat "$claude_out")"
+    if printf '%s' "$ENSEMBLE_RAW_AGY" | jq -c -s --slurpfile c "$claude_out" \
+        'if length == 1 and ($c | length) == 1
+            and ((.[0].findings | type) == "array") and (($c[0].findings | type) == "array")
+         then {findings: ((.[0].findings | map(. + {engine: "agy"})) + ($c[0].findings | map(. + {engine: "claude"})))}
          else error("shape") end' > "$OUTPUT_FILE" 2>/dev/null; then
       rm -f "$agy_out" "$claude_out"
       return 0
@@ -937,8 +950,7 @@ ${CLAUDE_DIAG}}"
   both)
     run_codex_review
     compare_has agy && run_compare_engine agy
-    compare_has claude && run_compare_engine claude
-    # cursor は下で、判定に要る結果をシェル変数に取ってから走らせる
+    # claude・cursor は下で、判定に要る結果をシェル変数に取ってから走らせる
     ;;
 esac
 
@@ -957,9 +969,11 @@ _info "Review output length: ${#REVIEW_CONTENT} chars"
 
 # both の cursor は最後 (判定に要る結果は REVIEW_CONTENT / COMPARE_NOTE に取った)。codex の一時ファイルは先に消し、
 # cursor に読ませない・書き換えさせない。この後 REVIEW_WT・OUTPUT_FILE は読まない (cursor が触っても判定は変わらない)
-if [[ "$REVIEW_ENGINE" == both ]] && compare_has cursor; then
+# claude (compare) も同じ: 判定の結果を取った後に走らせる (読み取り専用だが、判定の入力を読ませ・書かせる余地を作らない)
+if [[ "$REVIEW_ENGINE" == both ]] && { compare_has claude || compare_has cursor; }; then
   rm -f "$OUTPUT_FILE" "$STDERR_FILE"; OUTPUT_FILE=""; STDERR_FILE=""
-  run_compare_engine cursor
+  if compare_has claude; then run_compare_engine claude; fi
+  if compare_has cursor; then run_compare_engine cursor; fi
 fi
 
 # --- findings 判定 (F2, PR#180 / F-1, F-3, PR#180 QA fix) ---

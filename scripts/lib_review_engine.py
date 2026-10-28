@@ -309,6 +309,34 @@ def extract_claude_findings(out_text, schema):
     return found
 
 
+def extract_agy_findings(out_text, schema):
+    """agy --output-format json の stdout 全文 (1 ドキュメント) → schema 準拠の findings dict。だめなら `CursorOutputError(固定コード)`。
+    kai-review.sh の run_agy_review (jq) と同じ基準 (status SUCCESS・denied_actions 空・structured_output が object) に、
+    重複キーと schema 検査を足したもの。bench (bench/review-bench) はこれを呼ぶ (検証を再実装しない)。"""
+    try:
+        doc = json.loads(out_text, object_pairs_hook=_no_duplicate_keys)
+    except ValueError:
+        raise CursorOutputError('unparseable_output')
+    if not isinstance(doc, dict):
+        raise CursorOutputError('unparseable_output')
+    if doc.get('status') != 'SUCCESS':
+        raise CursorOutputError('status')
+    # 欠け・null だけを空とみなす。それ以外の非 list (0・空文字・{}・false) は読めないので拒否 (fail-closed)
+    denied = doc.get('denied_actions')
+    if denied is None:
+        denied = []
+    if not isinstance(denied, list):
+        raise CursorOutputError('unparseable_output')
+    if denied:
+        raise CursorOutputError('denied_actions')
+    found = doc.get('structured_output')
+    if not isinstance(found, dict):
+        raise CursorOutputError('no_structured_output')
+    if not _schema_ok(found, schema):
+        raise CursorOutputError('schema_invalid')
+    return found
+
+
 def redact_findings(found):
     """findings の各文字列 (title / body / file) を lib_checkpoint の伏せ字に通した複製。例外はそのまま出す (呼び出し側が fail-closed)。"""
     import lib_checkpoint
@@ -471,6 +499,9 @@ def main(argv=None):
     xc = sub.add_parser('extract-claude')
     xc.add_argument('--out', required=True)
     xc.add_argument('--schema', required=True)
+    xa = sub.add_parser('extract-agy')
+    xa.add_argument('--out', required=True)
+    xa.add_argument('--schema', required=True)
     fp = sub.add_parser('fingerprint')
     fp.add_argument('--root', required=True)
     args = ap.parse_args(argv)
@@ -480,13 +511,14 @@ def main(argv=None):
     if args.cmd == 'diagnose':
         print(diagnose(args.out, args.err, args.engine))
         return 0
-    if args.cmd == 'extract-claude':
+    if args.cmd in ('extract-claude', 'extract-agy'):
+        extract = extract_claude_findings if args.cmd == 'extract-claude' else extract_agy_findings
         try:
             with open(args.schema, encoding='utf-8') as f:
                 schema = json.load(f)
             with open(args.out, encoding='utf-8', errors='replace') as f:
                 text = f.read()
-            found = extract_claude_findings(text, schema)
+            found = extract(text, schema)
         except CursorOutputError as e:
             print(e.code, file=sys.stderr)
             return 1

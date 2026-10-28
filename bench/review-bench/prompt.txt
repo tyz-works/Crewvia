@@ -1,0 +1,23 @@
+Review the diff provided in the <stdin> block below (a unified git diff, base
+against HEAD, in this checkout's working directory). Read any files referenced
+by the diff in this working directory as needed to understand the surrounding
+context before judging correctness — do not judge from the diff hunks alone.
+
+Focus on:
+  - correctness bugs (crashes, wrong output, logic errors, off-by-one, race
+    conditions, fail-open defaults where fail-closed is required)
+  - security issues (injection, unsafe shell quoting/expansion, path
+    traversal, secrets)
+  - other issues worth a human's attention before merge
+
+For every issue found, add an entry to the JSON `findings` array with:
+  - "priority": "P0" (release-blocking: crash / data loss / security) through
+    "P3" (minor nit)
+  - "title": a short one-line summary
+  - "body": more detail, including why it matters (or null if not needed)
+  - "file": the path most relevant to the finding (or null if not applicable)
+
+Only return an empty `findings` array after you have actually read and
+reasoned about the diff and found nothing worth flagging. Do not guess; if you
+are unsure whether something is a real bug, report it at a lower priority
+rather than omitting it.

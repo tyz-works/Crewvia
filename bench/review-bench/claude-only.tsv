@@ -1,0 +1,5 @@
+# claude だけが挙げた妥当な指摘 (Codex は同じ巡で未指摘)。列: round<TAB>summary<TAB>根拠
+pr312-r4	--close-execution は running の needs_human_review を必ず拒否する	fix b8d9e7d で確認。agy も同じ指摘
+pr313-r1	壊れた外側の findings の中の空 findings を採る (P1)	Codex は r4 で初めて指摘
+pr313-r2	同上の nested findings (P1)	同上
+pr313-r3	同上の nested findings	同上

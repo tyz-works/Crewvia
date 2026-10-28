@@ -29,6 +29,9 @@ done
 case "$engine" in claude|agy) ;; *) usage; die "--engine must be claude or agy" ;; esac
 [[ -n "$src" ]] || src="$(git -C "$KIT" rev-parse --show-toplevel)" || die "cannot find repo"
 [[ -n "$out" ]] || out="$KIT/out"
+# 相対指定は clone への cd の前に絶対パスにする (cd 後は基準の dir が変わる)
+src="$(realpath -m -- "$src")" || die "cannot resolve --src"
+out="$(realpath -m -- "$out")" || die "cannot resolve --out"
 
 # 巡の一覧 (rounds.tsv: label<TAB>head_sha)
 mapfile -t all_lines < <(grep -v '^#' "$KIT/rounds.tsv" | grep -v '^$')
@@ -102,10 +105,20 @@ Shell commands are not available. Do not create, modify or delete any file. Retu
         || echo extract_failed >> "$out/$label.claude.rc"
     fi
   else
+    rm -f "$out/$label.agy.json"
     ( cd "$R" && agy --mode plan --model gemini-4-argon-high --output-format json --json-schema "$KIT/schema.json" \
         --add-dir "$DD" --print-timeout 600s -p "$prompt$extra" ) > "$out/$label.agy.raw" 2> "$out/$label.agy.err"
     rc=$?; echo "rc=$rc" > "$out/$label.agy.rc"
-    [[ $rc -eq 0 ]] && jq -c '.structured_output' "$out/$label.agy.raw" > "$out/$label.agy.json" 2>> "$out/$label.agy.err"
+    if [[ $rc -eq 0 ]]; then
+      # 本番の collector (kai-review.sh) と同じ検証: status SUCCESS・denied_actions 空・structured_output が schema 準拠。
+      # 通ったときだけ完了 JSON を置く (置くと次回から「済み」で飛ばされる)
+      if python3 "$KIT/validate_agy.py" --raw "$out/$label.agy.raw" --schema "$KIT/schema.json" --scripts "$src/scripts" \
+          > "$out/$label.agy.json.tmp" 2>> "$out/$label.agy.err"; then
+        mv -f "$out/$label.agy.json.tmp" "$out/$label.agy.json"
+      else
+        echo agy_invalid >> "$out/$label.agy.rc"; rm -f "$out/$label.agy.json.tmp"
+      fi
+    fi
   fi
   # 読み取り専用のはずなので、clone に変更が無いこと
   git -C "$R" status --porcelain --ignored | head -3 > "$out/$label.$engine.dirty"

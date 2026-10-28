@@ -44,7 +44,7 @@ clone と diff dir の下かを調べる。**採点の前に必ず回す**（外
 python3 check_contamination.py --clone out/rounds/pr314-r2 --diff-dir out/diffs/pr314-r2.claude   # 0 = 外を読んだ記録なし
 ```
 
-exit 1 = 外を読んだ疑い (`OUTSIDE <tool> <path>` を出す) / exit 2 = jsonl が無く検査できない（その巡は採点しない）。
+exit 1 = 外を読んだ疑い (`OUTSIDE <tool> <path>` を出す) / exit 2 = jsonl が無く検査できない（その巡は採点しない）/ exit 3 = 壊れた JSON 行がある・検査した tool_use が 0 件（inconclusive。汚染なしとは言えないので採点しない）。
 `--no-session-persistence` を付けて実行すると記録が残らず検査できない（前回の 1 回目はそれで採点に使えなかった）。
 agy は jsonl が無いので、この検査は claude だけ。
 
@@ -60,7 +60,7 @@ Codex の P1/P2 は全て fix 済みなので妥当とみなす。巡ごとに�
 
 ## agy の枠切れの見分け方
 
-`out/<label>.agy.rc` が `rc=3` で、`.err` に `Individual quota reached` / `RESOURCE_EXHAUSTED 429` /
+agy の出力は `validate_agy.py`（status SUCCESS・denied_actions 空・schema 適合。本番の kai-review.sh と同じ基準）を通ったときだけ `.agy.json` になる（通らなければ `.agy.rc` に `agy_invalid`）。`out/<label>.agy.rc` が `rc=3` で、`.err` に `Individual quota reached` / `RESOURCE_EXHAUSTED 429` /
 `Resets in 127h…` が出ていれば枠切れ。**未採点**にする（0 件の指摘として数えない）。枠が戻ってから同じコマンドで再実行すればよい
 （`.json` が無い巡だけ走る）。
 

@@ -3,6 +3,7 @@
 
 usage: check_contamination.py --clone <dir> --diff-dir <dir> [--projects-dir ~/.claude/projects]
 exit 0 = 外を読んだ記録 0 件 / 1 = 外を読んだ疑い (path を stdout に出す) / 2 = jsonl が無い (検査不能)
+/ 3 = 壊れた JSON 行がある・検査した tool_use が 0 件 (inconclusive。汚染なしとは言えない)
 path 無しの Grep / Glob は cwd (= clone) なので許容。StructuredOutput 等の入力は見ない。
 """
 import argparse
@@ -28,14 +29,21 @@ def session_files(projects_dir, clone):
 
 
 def outside_reads(files, roots, cwd):
-    bad, total = [], 0
+    bad, total, malformed = [], 0, 0
     for fp in files:
         with open(fp, encoding='utf-8', errors='replace') as f:
             for line in f:
-                try:
-                    msg = json.loads(line).get('message') or {}
-                except (ValueError, AttributeError):
+                if not line.strip():
                     continue
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    malformed += 1
+                    continue
+                if not isinstance(rec, dict):
+                    malformed += 1
+                    continue
+                msg = rec.get('message') or {}
                 content = msg.get('content') if isinstance(msg, dict) else None
                 if not isinstance(content, list):
                     continue
@@ -51,7 +59,7 @@ def outside_reads(files, roots, cwd):
                         full = v if os.path.isabs(v) else os.path.join(cwd, v)
                         if not under(full, roots):
                             bad.append((c['name'], v))
-    return total, bad
+    return total, bad, malformed
 
 
 def main(argv=None):
@@ -65,11 +73,16 @@ def main(argv=None):
         print('no session jsonl for', a.clone, file=sys.stderr)
         return 2
     roots = [os.path.realpath(a.clone), os.path.realpath(a.diff_dir)]
-    total, bad = outside_reads(files, roots, os.path.realpath(a.clone))
+    total, bad, malformed = outside_reads(files, roots, os.path.realpath(a.clone))
     for name, v in bad:
         print(f'OUTSIDE {name} {v}')
-    print(f'checked={total} outside={len(bad)}', file=sys.stderr)
-    return 1 if bad else 0
+    print(f'checked={total} outside={len(bad)} malformed={malformed}', file=sys.stderr)
+    if bad:
+        return 1
+    if malformed or total == 0:
+        print('inconclusive: malformed log lines or no tool_use audited', file=sys.stderr)
+        return 3
+    return 0
 
 
 if __name__ == '__main__':

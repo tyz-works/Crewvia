@@ -1,23 +1,25 @@
 #!/usr/bin/env python3
-"""scripts/lib_review_engine.py — kai-review.sh のレビュー先 (codex / agy / both + 比較用の cursor) の設定の読み口。
+"""scripts/lib_review_engine.py — kai-review.sh のレビュー先 (codex / agy / claude / both / ensemble + 比較用の cursor) の設定の読み口。
 
 `config/crewvia.yaml` の `review:` ブロック（`engine` / `agy_model` / `agy_timeout_seconds` /
-`cursor_model` / `cursor_timeout_seconds` / `compare`）を、
+`cursor_model` / `cursor_timeout_seconds` / `claude_model` / `claude_timeout_seconds` / `compare`）を、
 `lib_task_cards` の入口で読む。env `CREWVIA_REVIEW_ENGINE` は engine だけを上書きする。
 
 - **キー（`review:` / `engine` 等）が無い・config ファイルが無い = 既定**（engine=codex。今までと同じ挙動）。**キーがあって値が null は不正**。
 - **PyYAML が無く config ファイルがあれば止める**（regex で「review: が無い」と決めない）。
 - **config が読めない・値が不正 = 既定に倒さず止める**（exit 1・stderr に固定コード）。
   engine を黙って codex に戻すと、agy を選んだつもりのレビューが別物になる。
-- `compare` は `both` のときに判定（Codex）の横に併記するエンジンの一覧（agy / cursor の部分集合・空と重複は不正）。既定 `[agy]` = 従来の `both` と同じ。
+- `compare` は `both` のときに判定（Codex）の横に併記するエンジンの一覧（agy / cursor / claude の部分集合・空と重複は不正）。既定 `[agy]` = 従来の `both` と同じ。
+- `ensemble` は agy と claude の合議（両方の findings を合わせて判定。片方でも失敗したら needs-director）。`compare` は使わない。
 - **cursor は比較専用**（Codex #313 r5 の後の Director の方針）。`engine: cursor`（config・env とも）は `bad_engine` / `bad_engine_env` で拒否する。
   cursor-agent は worktree の外を読み（`--sandbox` でも止まらない）、出力の schema を強制できない（自由文から JSON を拾う）ので、
   判定に使うと誤読が LGTM になりうる。`compare` に置くだけなら誤読しても併記が狂うだけ。
 - cursor_model は `claude-fable-*`（Cursor の一覧で NO ZDR = データ保持の契約外）を拒否する。括弧付きパラメータ `[a=b,c=d]` は許す。
-- CLI: `lib_review_engine.py get --config <path>` が 6 行（engine / agy_model / agy_timeout_seconds /
-  cursor_model / cursor_timeout_seconds / compare をカンマ区切り）を stdout に出す。
+- CLI: `lib_review_engine.py get --config <path>` が 8 行（engine / agy_model / agy_timeout_seconds /
+  cursor_model / cursor_timeout_seconds / compare をカンマ区切り / claude_model / claude_timeout_seconds）を stdout に出す。
   `fingerprint --root <dir>` は stdin の `git status -z` から木の指紋 (ignored を含む) を出す。
   `extract-cursor` は cursor-agent の JSON 出力から findings を取り出して schema で検証する（fail-closed）。
+  `extract-claude` は `claude -p --output-format json --json-schema` の出力から structured_output を取り出して検証する（fail-closed）。
 """
 
 from __future__ import annotations
@@ -40,14 +42,16 @@ try:
 except ImportError:  # pragma: no cover — PyYAML が無いとき review: があれば止める (下記)
     yaml = None
 
-ENGINES = ('codex', 'agy', 'both')     # cursor は判定に使わない (COMPARE_ENGINES にだけ置ける)
-COMPARE_ENGINES = ('agy', 'cursor')
+ENGINES = ('codex', 'agy', 'claude', 'both', 'ensemble')   # cursor は判定に使わない (COMPARE_ENGINES にだけ置ける)
+COMPARE_ENGINES = ('agy', 'cursor', 'claude')
 DEFAULT_COMPARE = ('agy',)
 DEFAULT_ENGINE = 'codex'
 DEFAULT_AGY_MODEL = 'gemini-4-argon-high'
 DEFAULT_AGY_TIMEOUT_SECONDS = 600
 DEFAULT_CURSOR_MODEL = 'grok-4.7-high'
 DEFAULT_CURSOR_TIMEOUT_SECONDS = 900
+DEFAULT_CLAUDE_MODEL = 'claude-opus-5-5'
+DEFAULT_CLAUDE_TIMEOUT_SECONDS = 900
 ENV_ENGINE = 'CREWVIA_REVIEW_ENGINE'
 
 _MODEL_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}')
@@ -82,7 +86,7 @@ def _timeout(block, key, default, code):
 
 
 def load_full(config_path, environ=None):
-    """dict (engine / agy_model / agy_timeout / cursor_model / cursor_timeout / compare)。読み口はここ 1 か所。"""
+    """dict (engine / agy_model / agy_timeout / cursor_model / cursor_timeout / claude_model / claude_timeout / compare)。読み口はここ 1 か所。"""
     environ = os.environ if environ is None else environ
     block = {}
     raw = _cards.read_regular_text_or_unreadable(str(config_path))
@@ -130,6 +134,12 @@ def load_full(config_path, environ=None):
                 or cursor_model.lower().startswith(_CURSOR_DENIED_PREFIXES)):
             raise ReviewConfigError('bad_cursor_model')
 
+    claude_model = DEFAULT_CLAUDE_MODEL
+    if 'claude_model' in block:
+        claude_model = block['claude_model']
+        if not isinstance(claude_model, str) or not _MODEL_RE.fullmatch(claude_model):
+            raise ReviewConfigError('bad_claude_model')
+
     compare = list(DEFAULT_COMPARE)
     if 'compare' in block:
         c = block['compare']
@@ -147,6 +157,9 @@ def load_full(config_path, environ=None):
         'cursor_model': cursor_model,
         'cursor_timeout': _timeout(block, 'cursor_timeout_seconds', DEFAULT_CURSOR_TIMEOUT_SECONDS,
                                    'bad_cursor_timeout'),
+        'claude_model': claude_model,
+        'claude_timeout': _timeout(block, 'claude_timeout_seconds', DEFAULT_CLAUDE_TIMEOUT_SECONDS,
+                                   'bad_claude_timeout'),
         'compare': compare,
     }
 
@@ -266,6 +279,36 @@ def extract_cursor_findings(out_text, schema):
     raise CursorOutputError('no_findings_json')
 
 
+# --- claude -p の出力から findings を取り出す (fail-closed。判定に使う) ---
+# stdout は JSON 1 個 {"type":"result","subtype":"success","is_error":false,"structured_output":{...},
+# "permission_denials":[...],...} (claude CLI 2.1.312 の実測)。`--json-schema` が structured_output を schema に合わせるが、
+# ここでも同じ schema で検証する (CLI の検証に頼り切らない)。自由文の result は読まない。
+
+def extract_claude_findings(out_text, schema):
+    """claude -p の stdout 全文 → schema 準拠の findings dict。だめなら `CursorOutputError(固定コード)`。"""
+    try:
+        doc = json.loads(out_text, object_pairs_hook=_no_duplicate_keys)
+    except ValueError:
+        raise CursorOutputError('unparseable_output')
+    if not isinstance(doc, dict):
+        raise CursorOutputError('unparseable_output')
+    if doc.get('is_error') is not False:
+        raise CursorOutputError('is_error')
+    if doc.get('type') != 'result' or doc.get('subtype') != 'success':
+        raise CursorOutputError('subtype')
+    denials = doc.get('permission_denials', [])
+    if not isinstance(denials, list):
+        raise CursorOutputError('unparseable_output')
+    if denials:
+        raise CursorOutputError('permission_denials')
+    found = doc.get('structured_output')
+    if not isinstance(found, dict):
+        raise CursorOutputError('no_structured_output')
+    if not _schema_ok(found, schema):
+        raise CursorOutputError('schema_invalid')
+    return found
+
+
 def redact_findings(found):
     """findings の各文字列 (title / body / file) を lib_checkpoint の伏せ字に通した複製。例外はそのまま出す (呼び出し側が fail-closed)。"""
     import lib_checkpoint
@@ -305,7 +348,7 @@ def _cut(text, n=_DIAG_LINE_MAX):
 
 
 def diagnose(out_path, err_path, engine='agy'):
-    """失敗した agy / cursor の診断 (AGY_ERROR 行・stdout JSON の status・denied_actions・stderr の末尾) を短い文字列にする。
+    """失敗した agy / cursor / claude の診断 (AGY_ERROR 行・stdout JSON の status・denied_actions・stderr の末尾) を短い文字列にする。
     **伏せ字 (lib_checkpoint.redact) を通してから**切る (切ってから伏せると秘密を途中で割って残す)。
     伏せ字が失敗したら中身を出さない。"""
     try:
@@ -321,7 +364,12 @@ def diagnose(out_path, err_path, engine='agy'):
                 d = doc.get('denied_actions')
                 if isinstance(d, list):
                     denied = d
-                # cursor: result (レビュー本文・コード片が入りうる) は出さない。型・subtype・is_error だけ
+                # cursor / claude: result (レビュー本文・コード片が入りうる) は出さない。型・subtype・is_error だけ
+                # (claude は permission_denials の道具の名前も。入力 (コマンド・パス) は出さない)
+                if engine == 'claude' and isinstance(doc.get('permission_denials'), list):
+                    for item in doc['permission_denials'][:_DIAG_DENIED_MAX]:
+                        if isinstance(item, dict) and isinstance(item.get('tool_name'), str):
+                            cursor_info.append('denied tool: ' + _cut(lib_checkpoint.redact(item['tool_name'])[0], 80))
                 for k in ('type', 'subtype'):
                     if isinstance(doc.get(k), str):
                         cursor_info.append(f'stdout {k}: ' + _cut(lib_checkpoint.redact(doc[k])[0], 80))
@@ -330,7 +378,7 @@ def diagnose(out_path, err_path, engine='agy'):
         except ValueError:
             pass
         lines = []
-        if engine == 'cursor':
+        if engine in ('cursor', 'claude'):
             lines.extend(cursor_info)
             status, denied = None, []
         err_lines = [ln for ln in err.splitlines() if ln.strip()]
@@ -416,10 +464,13 @@ def main(argv=None):
     d = sub.add_parser('diagnose')
     d.add_argument('--out', required=True)
     d.add_argument('--err', required=True)
-    d.add_argument('--engine', choices=('agy', 'cursor'), default='agy')
+    d.add_argument('--engine', choices=('agy', 'cursor', 'claude'), default='agy')
     x = sub.add_parser('extract-cursor')
     x.add_argument('--out', required=True)
     x.add_argument('--schema', required=True)
+    xc = sub.add_parser('extract-claude')
+    xc.add_argument('--out', required=True)
+    xc.add_argument('--schema', required=True)
     fp = sub.add_parser('fingerprint')
     fp.add_argument('--root', required=True)
     args = ap.parse_args(argv)
@@ -428,6 +479,27 @@ def main(argv=None):
         return 0
     if args.cmd == 'diagnose':
         print(diagnose(args.out, args.err, args.engine))
+        return 0
+    if args.cmd == 'extract-claude':
+        try:
+            with open(args.schema, encoding='utf-8') as f:
+                schema = json.load(f)
+            with open(args.out, encoding='utf-8', errors='replace') as f:
+                text = f.read()
+            found = extract_claude_findings(text, schema)
+        except CursorOutputError as e:
+            print(e.code, file=sys.stderr)
+            return 1
+        except (OSError, ValueError):
+            print('unparseable_output', file=sys.stderr)
+            return 1
+        # claude も読んだファイルの中身 (秘密を含みうる) を body に写しうる。cursor と同じく値ごとに伏せ字を通す。失敗したら出さない
+        try:
+            found = redact_findings(found)
+        except Exception:  # noqa: BLE001 — 伏せ字が通らないものは出さない側に倒す
+            print('redaction_failed', file=sys.stderr)
+            return 1
+        print(json.dumps(found, ensure_ascii=False, separators=(',', ':')))
         return 0
     if args.cmd == 'extract-cursor':
         try:
@@ -459,6 +531,8 @@ def main(argv=None):
     for k in ('engine', 'agy_model', 'agy_timeout', 'cursor_model', 'cursor_timeout'):
         print(c[k])
     print(','.join(c['compare']))
+    print(c['claude_model'])
+    print(c['claude_timeout'])
     return 0
 
 

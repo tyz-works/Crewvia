@@ -287,6 +287,9 @@ CURSOR_DIFF_DIR=""       # cursor-agent に読ませる diff の一時 dir (agy 
 CURSOR_OUT_FILE=""
 CURSOR_ERR_FILE=""
 CURSOR_WT=""             # cursor-agent 専用の使い捨て worktree (REVIEW_WT は codex / agy が読むので cursor に触らせない)
+CLAUDE_DIFF_DIR=""       # claude -p に読ませる diff の一時 dir (agy と同じく worktree の外・argv に載せない)
+CLAUDE_OUT_FILE=""
+CLAUDE_ERR_FILE=""
 RESULT_FILE=""           # card に全文を残す Result / 理由のファイル (plan.sh が読んだ後に消す)
 FETCH_LOCAL_REF=""
 BASE_FETCH_LOCAL_REF=""  # t006: origin/main を都度 fetch する一時 ref (下記参照)
@@ -314,6 +317,9 @@ cleanup() {
   [[ -n "$CURSOR_OUT_FILE" ]] && rm -f "$CURSOR_OUT_FILE"
   [[ -n "$CURSOR_ERR_FILE" ]] && rm -f "$CURSOR_ERR_FILE"
   [[ -n "$CURSOR_DIFF_DIR" ]] && rm -rf "$CURSOR_DIFF_DIR"
+  [[ -n "$CLAUDE_OUT_FILE" ]] && rm -f "$CLAUDE_OUT_FILE"
+  [[ -n "$CLAUDE_ERR_FILE" ]] && rm -f "$CLAUDE_ERR_FILE"
+  [[ -n "$CLAUDE_DIFF_DIR" ]] && rm -rf "$CLAUDE_DIFF_DIR"
   cursor_drop_wt
   if [[ -n "$REVIEW_WT" && -d "$REVIEW_WT" ]]; then
     git -C "${WORK_DIR:-$REPO_ROOT}" worktree remove --force "$REVIEW_WT" 2>/dev/null \
@@ -562,7 +568,8 @@ PROMPT_EOF
 )"
 
 # --- レビュー先の解決 (t080) ---
-# `config/crewvia.yaml` の review.engine (codex|agy|both。既定 codex = 今までと同じ) と env CREWVIA_REVIEW_ENGINE。
+# `config/crewvia.yaml` の review.engine (codex|agy|claude|both|ensemble。既定 codex = 今までと同じ) と env CREWVIA_REVIEW_ENGINE。
+# ensemble = agy と claude の合議 (両方の findings を合わせて判定・片方でも失敗なら needs-director。knowledge/claude-review.md)。
 # cursor は判定に使わない (engine: cursor は lib が bad_engine で拒否)。both の review.compare にだけ置ける (knowledge/cursor-review.md)。
 # 読めない・値が不正なら既定に倒さず止める (agy を選んだつもりが codex になるのを防ぐ)。読み口は lib_review_engine.py の 1 か所。
 if ! REVIEW_CFG="$(python3 "${SCRIPT_DIR}/lib_review_engine.py" get \
@@ -570,9 +577,10 @@ if ! REVIEW_CFG="$(python3 "${SCRIPT_DIR}/lib_review_engine.py" get \
   fail_needs_director "NEEDS FIX: review engine config is invalid — ${REVIEW_CFG} (fail-closed, no fallback to codex)"
 fi
 { IFS= read -r REVIEW_ENGINE; IFS= read -r AGY_MODEL; IFS= read -r AGY_TIMEOUT
-  IFS= read -r CURSOR_MODEL; IFS= read -r CURSOR_TIMEOUT; IFS= read -r REVIEW_COMPARE; } <<<"$REVIEW_CFG"
+  IFS= read -r CURSOR_MODEL; IFS= read -r CURSOR_TIMEOUT; IFS= read -r REVIEW_COMPARE
+  IFS= read -r CLAUDE_MODEL; IFS= read -r CLAUDE_TIMEOUT; } <<<"$REVIEW_CFG"
 _info "Review engine: ${REVIEW_ENGINE}"
-if [[ "$REVIEW_ENGINE" != agy ]] && ! command -v codex &>/dev/null; then
+if [[ "$REVIEW_ENGINE" == codex || "$REVIEW_ENGINE" == both ]] && ! command -v codex &>/dev/null; then
   fail_needs_director "NEEDS FIX: codex command not found on this machine"
 fi
 
@@ -745,6 +753,92 @@ Your final message must END with the JSON object required by the schema (startin
   return 0
 }
 
+# --- claude (Claude Code CLI: claude -p) 実行 ---
+# Worker と同じアカウントのサブスクの枠を使う (API キーは使わない)。**読み取り専用**: --permission-mode plan +
+# --allowedTools を Read / Grep / Glob だけに絞り、Bash と書き込み系は --disallowedTools。--json-schema で
+# structured_output を schema に合わせる (lib_review_engine.py extract-claude が同じ schema でもう一度検証する)。
+# --setting-sources user: レビューする PR の .claude/ (settings・hooks) を読まない (PR が足した hook を走らせない)。
+#   秘密ファイルの読み取り禁止 (Read の deny) は user の settings にあるのでそのまま効く。--bare は hooks を飛ばすので使わない。
+# --strict-mcp-config (--mcp-config なし) で MCP を 1 つも起動しない。--no-session-persistence で会話を残さない。
+# **Bash は許さない**: 読み取り系の prefix (git diff / sed -n / cat …) でも `git diff --output=` / `--ext-diff`・`sed -n 'w f'`
+#   で書け・外部コマンドを起動でき、`cat` は Read の deny (秘密ファイル) を迂回する。git の文脈は diff と同じ一時 dir に
+#   `git log` を書いて渡す (review.log)。
+# prompt は stdin で渡す (--add-dir / --allowedTools は可変長で、後ろの位置引数を食う)。diff は argv に載せない (一時 dir)。
+# 子の claude の env は allowlist (CLAUDE_ENV_KEEP) だけ: crewvia の env (AGENT_NAME・TASK_ID・CREWVIA_*・TASKVIA_* の token) を
+# 渡さない = Worker と誤認されない (hook の承認・ログ投稿・assignment の補完が走らない)・秘密の env を読ませない。
+# **fail-closed**: exit != 0 (timeout は 124 / --kill-after は 137) / JSON が読めない / is_error / subtype != success /
+#   permission_denials が空でない / structured_output が無い・schema 不適合 / 実行の前後で REVIEW_WT の指紋 (HEAD +
+#   status --ignored + lstat) が変わった → 成功を返さない。理由は CLAUDE_FAIL (固定語彙)。成功なら findings の JSON を $1 に書く。
+CLAUDE_FAIL=""
+CLAUDE_DIAG=""
+CLAUDE_KILL_AFTER_SECONDS=10
+CLAUDE_ALLOWED_TOOLS=(Read Grep Glob)
+CLAUDE_DISALLOWED_TOOLS=(Bash Write Edit MultiEdit NotebookEdit WebFetch WebSearch Task Agent ExitPlanMode)
+# 子に残す env (名前の allowlist。値は argv に載せない = subshell の中で残り全部を unset)。claude の認証は HOME 下のログイン
+CLAUDE_ENV_KEEP=' PATH HOME USER LOGNAME SHELL LANG LC_ALL LC_CTYPE TERM TMPDIR TZ CLAUDE_CONFIG_DIR XDG_CONFIG_HOME XDG_DATA_HOME XDG_CACHE_HOME XDG_RUNTIME_DIR '
+claude_collect_diag() {
+  CLAUDE_DIAG="$(python3 "${SCRIPT_DIR}/lib_review_engine.py" diagnose --engine claude --out "$CLAUDE_OUT_FILE" --err "$CLAUDE_ERR_FILE" 2>/dev/null)" \
+    || CLAUDE_DIAG="(diagnostics unavailable)"
+}
+run_claude_review() {
+  local out_to="$1" rc=0 findings fp_before fp_after
+  CLAUDE_FAIL=""
+  if ! command -v claude &>/dev/null; then CLAUDE_FAIL="claude_not_found"; return 1; fi
+  [[ -n "$CLAUDE_DIFF_DIR" ]] || CLAUDE_DIFF_DIR="$(mktemp -d "${TMPDIR:-/tmp}/kai-review-claude.XXXXXX")"
+  [[ -n "$CLAUDE_OUT_FILE" ]] || CLAUDE_OUT_FILE="$(mktemp "${TMPDIR:-/tmp}/kai-review-claude-out.XXXXXX")"
+  [[ -n "$CLAUDE_ERR_FILE" ]] || CLAUDE_ERR_FILE="$(mktemp "${TMPDIR:-/tmp}/kai-review-claude-err.XXXXXX")"
+  printf '%s' "$DIFF_CONTENT" > "${CLAUDE_DIFF_DIR}/review.diff" || { CLAUDE_FAIL="diff_write_failed"; return 1; }
+  git -C "$REVIEW_WT" log --no-color --format='%h %s' "${DIFF_BASE}..HEAD" > "${CLAUDE_DIFF_DIR}/review.log" 2>/dev/null \
+    || { CLAUDE_FAIL="diff_write_failed"; return 1; }
+  : > "$CLAUDE_OUT_FILE"; : > "$CLAUDE_ERR_FILE"
+  if ! fp_before="$(wt_fingerprint "$REVIEW_WT")"; then CLAUDE_FAIL="worktree_status_failed"; return 1; fi
+  local schema prompt
+  schema="$(cat "$SCHEMA_FILE")" || { CLAUDE_FAIL="schema_read_failed"; return 1; }
+  prompt="${REVIEW_PROMPT//the <stdin> block below/the file ${CLAUDE_DIFF_DIR}/review.diff}"
+  prompt="${prompt}
+
+You are an independent, adversarial reviewer — not the author of this change (a different agent wrote it).
+Your job is to find what breaks. Try to construct concrete failing inputs, states and command sequences.
+If the file knowledge/review-attack-checklist.md exists in this checkout, read it first and apply it.
+
+Every finding's \"body\" MUST include either concrete reproduction steps or the shape of a failing test
+(inputs, the command or call, the expected vs. the actual result). If you cannot write one, do not report it.
+
+Read the unified diff from the file ${CLAUDE_DIFF_DIR}/review.diff (it is outside this checkout; read it as a file).
+The commits of this change (git log from the base to HEAD) are in ${CLAUDE_DIFF_DIR}/review.log.
+Read files in this checkout (Read / Grep / Glob) to verify the code. Shell commands are not available.
+Do not create, modify or delete any file. Return only the JSON object required by the schema."
+  _info "Running claude -p --permission-mode plan --model ${CLAUDE_MODEL} (diff=${DIFF_BYTES} bytes, timeout=${CLAUDE_TIMEOUT}s) ..."
+  printf '%s' "$prompt" | (
+    cd "$REVIEW_WT" || exit 1
+    # allowlist に無い env を全部外す (名前の一覧を取ってから unset。値は argv に出ない。readonly は外せないので無視)
+    while IFS= read -r _v; do
+      [[ "$CLAUDE_ENV_KEEP" == *" $_v "* ]] || unset "$_v" 2>/dev/null || true
+    done < <(compgen -e)
+    exec timeout --kill-after="${CLAUDE_KILL_AFTER_SECONDS}s" "${CLAUDE_TIMEOUT}s" claude -p \
+      --output-format json --json-schema "$schema" --permission-mode plan --model "$CLAUDE_MODEL" \
+      --setting-sources user --strict-mcp-config --no-session-persistence \
+      --add-dir "$CLAUDE_DIFF_DIR" \
+      --allowedTools "${CLAUDE_ALLOWED_TOOLS[@]}" \
+      --disallowedTools "${CLAUDE_DISALLOWED_TOOLS[@]}"
+  ) >"$CLAUDE_OUT_FILE" 2>"$CLAUDE_ERR_FILE" || rc=$?
+  if [[ $rc -eq 124 ]]; then CLAUDE_FAIL="timeout"; return 1; fi
+  if [[ $rc -eq 137 ]]; then CLAUDE_FAIL="timeout_killed"; return 1; fi
+  if [[ $rc -ne 0 ]]; then CLAUDE_FAIL="exit_${rc}"; return 1; fi
+  if ! findings="$(python3 "${SCRIPT_DIR}/lib_review_engine.py" extract-claude --out "$CLAUDE_OUT_FILE" \
+        --schema "$SCHEMA_FILE" 2>&1)"; then
+    CLAUDE_FAIL="${findings:-unparseable_output}"; CLAUDE_FAIL="${CLAUDE_FAIL%%$'\n'*}"; return 1
+  fi
+  if ! fp_after="$(wt_fingerprint "$REVIEW_WT")"; then CLAUDE_FAIL="worktree_status_failed"; return 1; fi
+  if [[ "$fp_after" != "$fp_before" ]]; then CLAUDE_FAIL="worktree_modified"; return 1; fi
+  printf '%s\n' "$findings" > "$out_to" || { CLAUDE_FAIL="unparseable_output"; return 1; }
+  return 0
+}
+claude_drop_tmp() {
+  rm -f "$CLAUDE_OUT_FILE" "$CLAUDE_ERR_FILE"; rm -rf "$CLAUDE_DIFF_DIR"
+  CLAUDE_OUT_FILE=""; CLAUDE_ERR_FILE=""; CLAUDE_DIFF_DIR=""
+}
+
 # both: Result に併記する比較用エンジンの節 (判定には使わない)。REVIEW_COMPARE は "agy,cursor" 形式。
 # cursor-agent は --mode plan / --sandbox でも worktree の外を読み書きできうる (実測。knowledge/cursor-review.md)。
 # だから cursor は**判定の後**に走らせる: codex (と agy) を先に走らせて判定に要る結果をシェル変数に取り、
@@ -775,12 +869,62 @@ ${CURSOR_DIAG}}"
       fi
       rm -f "$CURSOR_OUT_FILE" "$CURSOR_ERR_FILE"; rm -rf "$CURSOR_DIFF_DIR"
       CURSOR_OUT_FILE=""; CURSOR_ERR_FILE=""; CURSOR_DIFF_DIR="" ;;
+    claude)
+      if run_claude_review "$cmp"; then
+        COMPARE_NOTE[claude]="$(cat "$cmp")"
+      else
+        claude_collect_diag
+        COMPARE_NOTE[claude]="(claude failed: ${CLAUDE_FAIL} — not used for the verdict)${CLAUDE_DIAG:+
+${CLAUDE_DIAG}}"
+      fi
+      claude_drop_tmp ;;
   esac
   rm -f "$cmp"
 }
 IFS=, read -r -a COMPARE_LIST <<<"$REVIEW_COMPARE"
 compare_has() { local e; for e in "${COMPARE_LIST[@]}"; do [[ "$e" == "$1" ]] && return 0; done; return 1; }
-compare_model() { case "$1" in agy) echo "$AGY_MODEL" ;; cursor) echo "$CURSOR_MODEL" ;; esac; }
+compare_model() { case "$1" in agy) echo "$AGY_MODEL" ;; cursor) echo "$CURSOR_MODEL" ;; claude) echo "$CLAUDE_MODEL" ;; esac; }
+
+# ensemble: agy と claude の両方を走らせ、両方が成功したときだけ findings を合わせて 1 つの JSON にする
+# (各 finding に "engine" を足す。重複はそのまま)。判定は下の共通の経路 (P0-P2 が 1 つでもあれば NEEDS FIX・
+# P3 だけ / 空なら LGTM)。**片方でも失敗したら needs-director** (もう片方だけで LGTM にしない)。
+ENSEMBLE_RAW_AGY=""
+ENSEMBLE_RAW_CLAUDE=""
+run_ensemble_review() {
+  local agy_out claude_out agy_ok=1 claude_ok=1 msg=""
+  agy_out="$(mktemp "${TMPDIR:-/tmp}/kai-review-ens-agy.XXXXXX")"
+  claude_out="$(mktemp "${TMPDIR:-/tmp}/kai-review-ens-claude.XXXXXX")"
+  run_agy_review "$agy_out" || { agy_ok=0; agy_collect_diag; }
+  rm -f "$AGY_OUT_FILE" "$AGY_ERR_FILE"; rm -rf "$AGY_DIFF_DIR"; AGY_OUT_FILE=""; AGY_ERR_FILE=""; AGY_DIFF_DIR=""
+  # agy の結果は claude を走らせる前にシェル変数に取り、ファイルを消す (claude に読ませ・書き換えさせる余地を作らない)
+  if [[ $agy_ok -eq 1 ]]; then ENSEMBLE_RAW_AGY="$(cat "$agy_out")"; fi
+  rm -f "$agy_out"
+  # agy が失敗しても claude は走らせる (Result に両方の状態を残す)。判定は失敗のまま
+  run_claude_review "$claude_out" || { claude_ok=0; claude_collect_diag; }
+  claude_drop_tmp
+  if [[ $agy_ok -eq 1 && $claude_ok -eq 1 ]]; then
+    ENSEMBLE_RAW_CLAUDE="$(cat "$claude_out")"
+    if printf '%s' "$ENSEMBLE_RAW_AGY" | jq -c -s --slurpfile c "$claude_out" \
+        'if length == 1 and ($c | length) == 1
+            and ((.[0].findings | type) == "array") and (($c[0].findings | type) == "array")
+         then {findings: ((.[0].findings | map(. + {engine: "agy"})) + ($c[0].findings | map(. + {engine: "claude"})))}
+         else error("shape") end' > "$OUTPUT_FILE" 2>/dev/null; then
+      rm -f "$agy_out" "$claude_out"
+      return 0
+    fi
+    msg="ENSEMBLE FAILURE: could not merge the findings of agy and claude (fail-closed)"
+  else
+    msg="ENSEMBLE FAILURE: agy=$([[ $agy_ok -eq 1 ]] && echo ok || echo "failed:${AGY_FAIL}") claude=$([[ $claude_ok -eq 1 ]] && echo ok || echo "failed:${CLAUDE_FAIL}") — review not completed reliably (fail-closed; one engine alone never gives LGTM; agy model=${AGY_MODEL} claude model=${CLAUDE_MODEL})"
+    [[ $agy_ok -eq 0 && -n "$AGY_DIAG" ]] && msg="${msg}
+### agy diagnostics (redacted)
+${AGY_DIAG}"
+    [[ $claude_ok -eq 0 && -n "$CLAUDE_DIAG" ]] && msg="${msg}
+### claude diagnostics (redacted)
+${CLAUDE_DIAG}"
+  fi
+  rm -f "$agy_out" "$claude_out"
+  fail_needs_director "$msg"
+}
 
 case "$REVIEW_ENGINE" in
   codex) run_codex_review ;;
@@ -792,10 +936,21 @@ case "$REVIEW_ENGINE" in
 ${AGY_DIAG}}"
     fi
     ;;
+  claude)
+    if ! run_claude_review "$OUTPUT_FILE"; then
+      claude_collect_diag
+      claude_drop_tmp
+      fail_needs_director "CLAUDE FAILURE: ${CLAUDE_FAIL} — review not completed reliably (fail-closed; engine=claude model=${CLAUDE_MODEL})${CLAUDE_DIAG:+
+### claude diagnostics (redacted)
+${CLAUDE_DIAG}}"
+    fi
+    claude_drop_tmp
+    ;;
+  ensemble) run_ensemble_review ;;
   both)
     run_codex_review
     compare_has agy && run_compare_engine agy
-    # cursor は下で、判定に要る結果をシェル変数に取ってから走らせる
+    # claude・cursor は下で、判定に要る結果をシェル変数に取ってから走らせる
     ;;
 esac
 
@@ -806,7 +961,7 @@ esac
 # 「codex が exit 0 で終わったのにファイルが空/未書き込みのまま」という
 # 実際に起こり得るケースを検出できるようにする。
 if [[ ! -s "$OUTPUT_FILE" ]]; then
-  fail_needs_director "NEEDS FIX: codex review produced no output (file missing or empty, exit=${CODEX_EXIT})"
+  fail_needs_director "NEEDS FIX: codex review produced no output (file missing or empty, exit=${CODEX_EXIT:-})"
 fi
 
 REVIEW_CONTENT="$(cat "$OUTPUT_FILE")"
@@ -814,9 +969,11 @@ _info "Review output length: ${#REVIEW_CONTENT} chars"
 
 # both の cursor は最後 (判定に要る結果は REVIEW_CONTENT / COMPARE_NOTE に取った)。codex の一時ファイルは先に消し、
 # cursor に読ませない・書き換えさせない。この後 REVIEW_WT・OUTPUT_FILE は読まない (cursor が触っても判定は変わらない)
-if [[ "$REVIEW_ENGINE" == both ]] && compare_has cursor; then
+# claude (compare) も同じ: 判定の結果を取った後に走らせる (読み取り専用だが、判定の入力を読ませ・書かせる余地を作らない)
+if [[ "$REVIEW_ENGINE" == both ]] && { compare_has claude || compare_has cursor; }; then
   rm -f "$OUTPUT_FILE" "$STDERR_FILE"; OUTPUT_FILE=""; STDERR_FILE=""
-  run_compare_engine cursor
+  if compare_has claude; then run_compare_engine claude; fi
+  if compare_has cursor; then run_compare_engine cursor; fi
 fi
 
 # --- findings 判定 (F2, PR#180 / F-1, F-3, PR#180 QA fix) ---
@@ -1081,7 +1238,13 @@ if [[ -z "$FINDINGS_SUMMARY" ]]; then
   FINDINGS_SUMMARY="${FINDINGS_SUMMARY//$'\n'/ }"
 fi
 
-DONE_MSG="LGTM: PR#${PR_NUM} ${HEAD_BRANCH} reviewed by Kai (model=${MODEL}) — ${FINDINGS_SUMMARY}"
+case "$REVIEW_ENGINE" in
+  agy)      REVIEWED_BY="model=${AGY_MODEL}" ;;
+  claude)   REVIEWED_BY="model=${CLAUDE_MODEL}" ;;
+  ensemble) REVIEWED_BY="ensemble agy=${AGY_MODEL} claude=${CLAUDE_MODEL}" ;;
+  *)        REVIEWED_BY="model=${MODEL}" ;;
+esac
+DONE_MSG="LGTM: PR#${PR_NUM} ${HEAD_BRANCH} reviewed by Kai (${REVIEWED_BY}) — ${FINDINGS_SUMMARY}"
 NEEDS_FIX_MSG="NEEDS FIX: PR#${PR_NUM} ${HEAD_BRANCH} — ${FINDINGS_SUMMARY}"
 if [[ $NEEDS_FIX -eq 1 ]]; then
   RESULT_FIRST_LINE="$NEEDS_FIX_MSG"
@@ -1099,16 +1262,31 @@ RESULT_FILE="$(mktemp "${TMPDIR:-/tmp}/kai-review-result.XXXXXX")"
       (.findings // []) | if length == 0 then "(none)" else
         to_entries[] | .key as $i | .value
         | "#### \($i + 1). [\((.priority // "?") | tostring)] \(.title // "(no title)")\n"
+          + (if .engine != null then "- engine: \(.engine)\n" else "" end)
           + "- file: \(.file // "-")" + (if .line != null then "\n- line: \(.line)" else "" end)
           + "\n\n\(.body // "")\n" end' 2>/dev/null \
       || echo "(findings could not be formatted — see the raw output below)"
     echo ""
   fi
-  # 見出しは旧 (codex のみ) と揃える: codex / both = "Codex raw output"、agy = "agy raw output"
-  if [[ "$REVIEW_ENGINE" == agy ]]; then echo "### agy raw output"
-  else echo "### Codex raw output"; fi
-  echo ""
-  printf '%s\n' "$REVIEW_CONTENT"
+  # 見出しは旧 (codex のみ) と揃える: codex / both = "Codex raw output"、agy = "agy raw output"、claude = "claude raw output"。
+  # ensemble は engine ごとの節 (合わせた findings は上の Findings)
+  if [[ "$REVIEW_ENGINE" == ensemble ]]; then
+    echo "### agy raw output (model=${AGY_MODEL})"
+    echo ""
+    printf '%s\n' "$ENSEMBLE_RAW_AGY"
+    echo ""
+    echo "### claude raw output (model=${CLAUDE_MODEL})"
+    echo ""
+    printf '%s\n' "$ENSEMBLE_RAW_CLAUDE"
+  else
+    case "$REVIEW_ENGINE" in
+      agy)    echo "### agy raw output" ;;
+      claude) echo "### claude raw output" ;;
+      *)      echo "### Codex raw output" ;;
+    esac
+    echo ""
+    printf '%s\n' "$REVIEW_CONTENT"
+  fi
   if [[ "$REVIEW_ENGINE" == "both" ]]; then
     for _eng in "${COMPARE_LIST[@]}"; do
       echo ""

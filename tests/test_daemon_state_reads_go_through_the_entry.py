@@ -183,8 +183,11 @@ ALLOWED_JSON_PARSES: dict[tuple[str, str, str], str] = {
     ("lib_review_engine.py", "extract_cursor_findings", "json.JSONDecoder(object_pairs_hook=_no_duplicate_keys)"):
         _EXTERNAL_RESPONSE + "cursor-agent の result (自由文) の末尾の findings JSON を取り出す decoder (重複キーは拒否)。"
         "取り出した値は findings の schema で検証し、通らなければ失敗 (cursor は比較専用。失敗は併記だけ)",
+    ("lib_review_engine.py", "extract_claude_findings", "json.loads(out_text, object_pairs_hook=_no_duplicate_keys)"):
+        _EXTERNAL_RESPONSE + "`claude -p --output-format json` の stdout (JSON 1 個)。デーモン側状態ストアではない。"
+        "読めない・is_error・subtype・permission_denials・structured_output が無い・schema 不適合・重複キーなら固定コードで失敗 (fail-closed)",
     ("lib_review_engine.py", "main", "json.load(f)"):
-        _EXTERNAL_RESPONSE + "extract-cursor に渡された findings の JSON schema "
+        _EXTERNAL_RESPONSE + "extract-cursor / extract-claude に渡された findings の JSON schema "
         "(config/kai-review-findings.schema.json。codex / agy にも渡す同じファイル)。読めなければ fail-closed",
     ("lib_mux.py", "_herdr_ping", "json.loads(data.decode().strip())"):
         _EXTERNAL_RESPONSE + "herdr socket の ping 応答。壊れていれば「応答なし」と読む",

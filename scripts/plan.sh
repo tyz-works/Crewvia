@@ -3936,8 +3936,9 @@ def cmd_pull(args):
         if agent and not specific_task:
             mine = _reserved_cards_of(agent, slugs)
             if len(mine) > 1:
+                mine_ids = [f"{s}/{m.get('id')}" for s, m, _b in mine]
                 die(f"{agent} は予約済みの task を複数持っています: "
-                    f"{[f"{s}/{m.get('id')}" for s, m, _b in mine]}。"
+                    f"{mine_ids}。"
                     f"どれを再開するか決められません (何も書いていません)。Director が `update --reset` で整理してください。",
                     PRECONDITION_UNMET)
             if mine and (mine[0][1].get('target_dir') or None) == effective_target:

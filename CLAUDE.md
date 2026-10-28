@@ -92,6 +92,7 @@ registry/ workers.yaml / workers/ / heartbeats/ / mux/ / retirements/ / task-gra
 5. 共有規則に env 停止スイッチを付けない（dispatcher と plan.sh で答えが割れる）
 6. `handoff_path` は絶対パスのみ
 7. `registry/daemons/*` の通知台帳（`notified-state.json`）・拒否記録（`review-refusals/`）・Telegram の状態（`telegram-questions.json` / `telegram-offset.json` / `telegram-send.json` / `telegram-receiver.json`）・段階上げの台帳（`escalation-state.json`。消すと時計が最初からになる = 通知が遅れる側）は消してよい。それが復旧手順（質問台帳を消すと古いボタンが「不明」で断られるだけ）
+8. 本番機の `/usr/bin/python3` は触らない（apt が依存するため、常に OS 既定のバージョンのまま）。crewvia の文脈（`start.sh` 経由で起動したセッション）でだけ、`scripts/bin` が PATH の先頭にあることで `scripts/bin/python3` という shim が `python3.12` に解決し、bare `python3` / `#!/usr/bin/env python3` の呼び出し（全 call site がこの形）を 3.12 へ振り向ける。デーモン起動・respawn は `lib_daemon_watch.py spawn_command()` が同じ PATH export を埋め込む。経緯・実測・戻し方: `knowledge/python312-runtime-migration.md`
 
 ---
 

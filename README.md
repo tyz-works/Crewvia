@@ -46,8 +46,34 @@ Make sure the following are installed before setting up Crewvia:
 | Tool | Purpose | Install |
 |------|---------|---------|
 | **Claude Code CLI** | Runs the AI agents | [docs.anthropic.com](https://docs.anthropic.com/en/docs/claude-code) |
+| **Python 3.12+** | Runs `scripts/*.py` (queue/registry I/O, dispatcher, watchdog, tests) | See below |
+| **git 2.36+** | `scripts/git-helpers.sh` uses `git worktree list --porcelain -z`, a 2.36+ flag | See below |
 | **jq** | JSON parsing in hooks/scripts | `brew install jq` / `apt install jq` |
 | **curl** | HTTP requests to Taskvia API | Usually pre-installed |
+
+**Ubuntu 22.04** ships Python 3.10 and git 2.34 by default, both below the minimums above. Add the
+upstream PPAs before installing:
+
+```bash
+# Python 3.12 (deadsnakes)
+sudo add-apt-repository ppa:deadsnakes/ppa
+sudo apt update
+sudo apt install python3.12 python3.12-venv python3.12-dev
+python3.12 -m ensurepip --upgrade
+# dist-packages for the system python3 (3.10) can shadow 3.12's site-packages and make
+# `pip install` falsely report "already satisfied" — use --ignore-installed --user:
+python3.12 -m pip install --user --ignore-installed pyyaml pytest
+
+# git (git-core PPA)
+sudo add-apt-repository ppa:git-core/ppa
+sudo apt update
+sudo apt install git
+```
+
+This does **not** touch `/usr/bin/python3` (stays on the OS-default 3.10 that `apt` depends on) —
+crewvia resolves `python3` to 3.12 only inside its own process tree via a PATH shim
+(`scripts/bin/python3`). See `knowledge/python312-runtime-migration.md` for the full story
+(what broke running crewvia on a pre-3.12/pre-2.36 host, and how to revert).
 
 Optional but recommended (one of the following for parallel agent execution):
 

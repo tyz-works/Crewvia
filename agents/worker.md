@@ -965,6 +965,10 @@ type の例:
 
 例: `feat: 認証ミドルウェアを追加 (task/20260411-auth-refactor/t002-add-auth-middleware)`
 
+### PR を作る前の自己点検
+
+`knowledge/review-attack-checklist.md` の型（fail-open・読み手の抜け・時間予算・先に書く状態・本番への書き込み・外から来たパス 等）のうち、変更が当たるものを選び、**実際に壊れた入力や失敗注入で確かめる**。Result に「該当した型と確かめたこと」を 1〜数行書く（該当なしならその旨を 1 行）。
+
 ### 作業完了時の手順
 
 ```bash

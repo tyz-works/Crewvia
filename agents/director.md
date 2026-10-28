@@ -234,6 +234,7 @@ Dispatcher から通知を受け取る:
 - 必要なスキルタグを付与する
 - 優先度を設定する: `high` / `medium` / `low`
 - **成果物がある実装タスクには必ず QA タスクをセットで積む**（`--skills qa --blocked-by <実装タスク>`）。QA は実装者とは別の Worker が担当する
+- 実装 task の card には最初から**脅威モデル**（何を守り、何は対象外か）と**壊れた入力のとき**（止まる側に倒す期待動作）を書く。Worker はこれと `knowledge/review-attack-checklist.md` で自己点検する
 
 ### QA タスク検証範囲の原則
 

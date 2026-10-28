@@ -326,6 +326,10 @@ def _agy_doc(**over):
     (_agy_doc(status="ERROR"), "status"),
     (_agy_doc(denied_actions=[{"tool": "Bash"}]), "denied_actions"),
     (_agy_doc(denied_actions="x"), "unparseable_output"),
+    (_agy_doc(denied_actions=0), "unparseable_output"),
+    (_agy_doc(denied_actions=""), "unparseable_output"),
+    (_agy_doc(denied_actions={}), "unparseable_output"),
+    (_agy_doc(denied_actions=False), "unparseable_output"),
     (_agy_doc(structured_output=None), "no_structured_output"),
     (_agy_doc(structured_output={"findings": [{"priority": "P1"}]}), "schema_invalid"),
 ])
@@ -340,3 +344,10 @@ def test_extract_agy_accepts_null_and_empty_denied_actions():
     schema = json.loads((REPO_ROOT / "config" / "kai-review-findings.schema.json").read_text())
     for d in (None, []):
         assert lre.extract_agy_findings(_agy_doc(denied_actions=d), schema) == {"findings": []}
+
+
+def test_extract_agy_accepts_missing_denied_actions():
+    schema = json.loads((REPO_ROOT / "config" / "kai-review-findings.schema.json").read_text())
+    doc = json.loads(_agy_doc())
+    del doc["denied_actions"]
+    assert lre.extract_agy_findings(json.dumps(doc), schema) == {"findings": []}

@@ -101,6 +101,7 @@ The commits of this change (git log from the base to HEAD) are in $DD/review.log
 Read files in this checkout (Read / Grep / Glob) to verify the code. Read ONLY files inside this checkout ($R) and $DD; do not look anywhere else on the filesystem.
 Shell commands are not available. Do not create, modify or delete any file. Return only the JSON object required by the schema."
   local rc
+  rm -f "$out/$label.$engine.json.tmp"   # 前回の途中の残り
   if [[ $engine == claude ]]; then
     local schema; schema="$(cat "$KIT/schema.json")"
     # 汚染検査をこの実行の session 1 ファイルに縛るため、UUID を渡して記録する
@@ -116,21 +117,21 @@ Shell commands are not available. Do not create, modify or delete any file. Retu
     rc=$?; echo "rc=$rc" > "$out/$label.claude.rc"
     if [[ $rc -eq 0 ]]; then
       PYTHONPATH="$src/scripts" python3 "$src/scripts/lib_review_engine.py" extract-claude \
-        --out "$out/$label.claude.raw" --schema "$KIT/schema.json" > "$out/$label.claude.json" 2>> "$out/$label.claude.err" \
-        || echo extract_failed >> "$out/$label.claude.rc"
+        --out "$out/$label.claude.raw" --schema "$KIT/schema.json" > "$out/$label.claude.json.tmp" 2>> "$out/$label.claude.err" \
+        || { echo extract_failed >> "$out/$label.claude.rc"; rm -f "$out/$label.claude.json.tmp"; }
     fi
   else
-    rm -f "$out/$label.agy.json"
+    rm -f "$out/$label.agy.json" "$out/$label.agy.json.tmp"
     ( cd "$R" && agy --mode plan --model gemini-4-argon-high --output-format json --json-schema "$KIT/schema.json" \
         --add-dir "$DD" --print-timeout 600s -p "$prompt$extra" ) > "$out/$label.agy.raw" 2> "$out/$label.agy.err"
     rc=$?; echo "rc=$rc" > "$out/$label.agy.rc"
     if [[ $rc -eq 0 ]]; then
       # 検証は本番 lib (extract-agy: status SUCCESS・denied_actions 空・重複キー拒否・schema) に一本化。bench で再実装しない。
-      # 通ったときだけ完了 JSON を置く (置くと次回から「済み」で飛ばされる)
+      # 通っても一時名のまま。clone の事後検査が通ってから公開する (公開 = 次回から「済み」で飛ばされる)
       if PYTHONPATH="$src/scripts" python3 "$src/scripts/lib_review_engine.py" extract-agy \
           --out "$out/$label.agy.raw" --schema "$KIT/schema.json" \
           > "$out/$label.agy.json.tmp" 2>> "$out/$label.agy.err"; then
-        mv -f "$out/$label.agy.json.tmp" "$out/$label.agy.json"
+        :
       else
         echo agy_invalid >> "$out/$label.agy.rc"; rm -f "$out/$label.agy.json.tmp"
       fi
@@ -139,8 +140,12 @@ Shell commands are not available. Do not create, modify or delete any file. Retu
   # 読み取り専用のはずなので、engine の後も HEAD=head sha かつ clean。ずれたら結果を捨てる (採点しない)
   git -C "$R" status --porcelain --ignored | head -3 > "$out/$label.$engine.dirty"
   if ! clone_ok "$R" "$head"; then
-    rm -f "$out/$label.$engine.json"; echo tainted_clone >> "$out/$label.$engine.rc"
+    rm -f "$out/$label.$engine.json" "$out/$label.$engine.json.tmp"; echo tainted_clone >> "$out/$label.$engine.rc"
     return 97
+  fi
+  # 検査が通った結果だけを公開する (resume は公開済みの .json だけを done とみなす)
+  if [[ -s "$out/$label.$engine.json.tmp" ]]; then
+    mv -f "$out/$label.$engine.json.tmp" "$out/$label.$engine.json" || return 99
   fi
   return 0
 }

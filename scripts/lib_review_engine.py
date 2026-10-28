@@ -321,7 +321,10 @@ def extract_agy_findings(out_text, schema):
         raise CursorOutputError('unparseable_output')
     if doc.get('status') != 'SUCCESS':
         raise CursorOutputError('status')
-    denied = doc.get('denied_actions') or []  # kai-review.sh の jq (`// []`) と同じ: null・欠けは空
+    # 欠け・null だけを空とみなす。それ以外の非 list (0・空文字・{}・false) は読めないので拒否 (fail-closed)
+    denied = doc.get('denied_actions')
+    if denied is None:
+        denied = []
     if not isinstance(denied, list):
         raise CursorOutputError('unparseable_output')
     if denied:

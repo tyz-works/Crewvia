@@ -31,6 +31,9 @@ case "$engine" in claude|agy) ;; *) usage; die "--engine must be claude or agy" 
 [[ -n "$out" ]] || out="$KIT/out"
 # 相対指定は clone への cd の前に絶対パスにする (cd 後は基準の dir が変わる)
 src="$(realpath -m -- "$src")" || die "cannot resolve --src"
+# 検証 lib は --src ではなく、この run.sh のある checkout のものを使う (--src は git オブジェクトの取得元にだけ使う)
+LIB="$(realpath -- "$KIT/../../scripts")" || die "cannot resolve scripts dir"
+[[ -f $LIB/lib_review_engine.py ]] || die "lib_review_engine.py not found in $LIB"
 out="$(realpath -m -- "$out")" || die "cannot resolve --out"
 
 # 巡の一覧 (rounds.tsv: label<TAB>head_sha)
@@ -116,7 +119,7 @@ Shell commands are not available. Do not create, modify or delete any file. Retu
       > "$out/$label.claude.raw" 2> "$out/$label.claude.err"
     rc=$?; echo "rc=$rc" > "$out/$label.claude.rc"
     if [[ $rc -eq 0 ]]; then
-      PYTHONPATH="$src/scripts" python3 "$src/scripts/lib_review_engine.py" extract-claude \
+      PYTHONPATH="$LIB" python3 "$LIB/lib_review_engine.py" extract-claude \
         --out "$out/$label.claude.raw" --schema "$KIT/schema.json" > "$out/$label.claude.json.tmp" 2>> "$out/$label.claude.err" \
         || { echo extract_failed >> "$out/$label.claude.rc"; rm -f "$out/$label.claude.json.tmp"; }
     fi
@@ -128,7 +131,7 @@ Shell commands are not available. Do not create, modify or delete any file. Retu
     if [[ $rc -eq 0 ]]; then
       # 検証は本番 lib (extract-agy: status SUCCESS・denied_actions 空・重複キー拒否・schema) に一本化。bench で再実装しない。
       # 通っても一時名のまま。clone の事後検査が通ってから公開する (公開 = 次回から「済み」で飛ばされる)
-      if PYTHONPATH="$src/scripts" python3 "$src/scripts/lib_review_engine.py" extract-agy \
+      if PYTHONPATH="$LIB" python3 "$LIB/lib_review_engine.py" extract-agy \
           --out "$out/$label.agy.raw" --schema "$KIT/schema.json" \
           > "$out/$label.agy.json.tmp" 2>> "$out/$label.agy.err"; then
         :

@@ -108,6 +108,18 @@ class Contamination(unittest.TestCase):
     def test_grep_without_path_is_cwd(self):
         self.assertEqual(self.check(self.tool('Grep', {'pattern': 'x'})).returncode, 0)
 
+    def test_escaping_patterns_are_outside(self):
+        for name, inp in (('Glob', {'pattern': '/etc/*'}), ('Glob', {'pattern': '../x/**'}), ('Glob', {'pattern': 'a/../../b'}),
+                          ('Glob', {'pattern': '~/.ssh/*'}), ('Grep', {'pattern': 'x', 'glob': '/etc/**'}),
+                          ('Grep', {'pattern': '/etc/passwd'}), ('Grep', {'pattern': 'x', 'glob': '../*'})):
+            r = self.check(self.tool(name, inp))
+            self.assertEqual(r.returncode, 1, (name, inp))
+
+    def test_inside_patterns_are_fine(self):
+        for name, inp in (('Glob', {'pattern': '**/*.py'}), ('Grep', {'pattern': 'foo\\.\\.bar', 'glob': '*.sh'}),
+                          ('Glob', {'pattern': 'scripts/lib_*.py'})):
+            self.assertEqual(self.check(self.tool(name, inp)).returncode, 0, (name, inp))
+
     def test_no_session_file(self):
         r = run('check_contamination.py', '--clone', self.clone, '--diff-dir', self.diff, '--session-id', SID,
                 '--projects-dir', self.projects)

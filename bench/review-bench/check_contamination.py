@@ -6,7 +6,7 @@ usage: check_contamination.py --clone <dir> --diff-dir <dir> --session-id <uuid>
 (clone の dir にある他の session を混ぜない。再実行や別の実行の記録で誤って陽性/陰性にならない)。
 exit 0 = 外を読んだ記録 0 件 / 1 = 外を読んだ疑い (path を stdout に出す) / 2 = jsonl が無い (検査不能)
 / 3 = 壊れた JSON 行がある・検査した tool_use が 0 件 (inconclusive。汚染なしとは言えない)
-path 無しの Grep / Glob は cwd (= clone) なので許容。Read の path が無い・非文字列は inconclusive (3)。StructuredOutput 等の入力は見ない。
+Glob の pattern・Grep の glob / pattern が絶対パス・~・`..` 区間を含めば外とみなす (1)。path 無しの Grep / Glob は cwd (= clone) なので許容。Read の path が無い・非文字列は inconclusive (3)。StructuredOutput 等の入力は見ない。
 """
 import argparse
 import json
@@ -15,6 +15,15 @@ import re
 import sys
 
 TOOLS = {'Read': ('file_path',), 'Grep': ('path',), 'Glob': ('path',)}
+# path の他に、パターンの形で root の外に出られる欄 (Glob の pattern・Grep の glob / pattern)
+PATTERN_FIELDS = {'Glob': ('pattern',), 'Grep': ('glob', 'pattern')}
+
+
+def pattern_escapes(v):
+    """絶対パス・~ 始まり・`..` の区間を含むパターンは root の外を指しうる → 外とみなす"""
+    v = v.strip()
+    return v.startswith(('/', '~')) or re.search(r'(^|/)\.\.(/|$)', v) is not None
+
 
 
 def under(path, roots):
@@ -59,6 +68,10 @@ def outside_reads(files, roots, cwd):
                     if not isinstance(inp, dict):
                         unauditable += 1
                         continue
+                    for k in PATTERN_FIELDS.get(c['name'], ()):
+                        pv = inp.get(k)
+                        if isinstance(pv, str) and pattern_escapes(pv):
+                            bad.append((c['name'] + '.' + k, pv))
                     for k in TOOLS[c['name']]:
                         v = inp.get(k)
                         if v is None and c['name'] != 'Read':

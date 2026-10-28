@@ -8,7 +8,7 @@
 #   --dry-run  実行せず、走らせる巡と出力先だけ表示する
 # 出力: <out>/<label>.<engine>.{raw,json,err,rc,dirty}。既に <label>.<engine>.json があれば飛ばす (再開できる)
 # diff は argv に載せない (ファイルで渡す)。ここは claude / agy のログインが要る → CI では回さない
-set -u
+set -uo pipefail
 
 KIT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 engine="" rounds="all" src="" out="" dry=0
@@ -57,6 +57,12 @@ command -v "$engine" >/dev/null || die "$engine not found in PATH"
 mkdir -p "$out/rounds" "$out/diffs" || die "cannot create $out"
 UP='git -c uploadpack.allowAnySHA1InWant=true upload-pack'
 
+# clone が head sha にあり、変更・未追跡・ignored が無いこと
+clone_ok() {
+  [[ "$(git -C "$1" rev-parse HEAD 2>/dev/null)" == "$2" ]] || return 1
+  [[ -z "$(git -C "$1" status --porcelain --ignored 2>/dev/null)" ]] || return 1
+}
+
 run_round() {
   local label=$1 head=${head_of[$1]}
   local R="$out/rounds/$label" DD="$out/diffs/$label.$engine" base
@@ -70,9 +76,13 @@ run_round() {
   fi
   base=$(cat "$R/.git/base_sha")
   mkdir -p "$DD"
-  git -C "$R" diff --no-color "$base...HEAD" > "$DD/review.diff"
-  git -C "$R" log --no-color --format='%h %s' "$base..HEAD" > "$DD/review.log"
-  cp "$KIT/checklist.md" "$DD/review-attack-checklist.md"
+  git -C "$R" diff --no-color "$base...HEAD" > "$DD/review.diff" || return 94
+  git -C "$R" log --no-color --format='%h %s' "$base..HEAD" > "$DD/review.log" || return 94
+  [[ -s $DD/review.diff ]] || return 94
+  # 採点対象 PR (#312-#314) の事例を除いた版を正本から生成する
+  bash "$KIT/gen_checklist.sh" > "$DD/review-attack-checklist.md" || return 96
+  # engine の前に、clone が HEAD=head sha かつ clean であること
+  clone_ok "$R" "$head" || return 95
   local prompt extra
   prompt="$(sed "s#the <stdin> block below#the file $DD/review.diff#" "$KIT/prompt.txt")"
   extra="
@@ -120,8 +130,12 @@ Shell commands are not available. Do not create, modify or delete any file. Retu
       fi
     fi
   fi
-  # 読み取り専用のはずなので、clone に変更が無いこと
+  # 読み取り専用のはずなので、engine の後も HEAD=head sha かつ clean。ずれたら結果を捨てる (採点しない)
   git -C "$R" status --porcelain --ignored | head -3 > "$out/$label.$engine.dirty"
+  if ! clone_ok "$R" "$head"; then
+    rm -f "$out/$label.$engine.json"; echo tainted_clone >> "$out/$label.$engine.rc"
+    return 97
+  fi
   return 0
 }
 

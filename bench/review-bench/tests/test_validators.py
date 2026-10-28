@@ -96,10 +96,59 @@ class Contamination(unittest.TestCase):
     def test_outside_read_wins_over_malformed(self):
         self.assertEqual(self.check(self.read('/etc/passwd'), '{"broken').returncode, 1)
 
+    def tool(self, name, inp):
+        return json.dumps({'message': {'content': [{'type': 'tool_use', 'name': name, 'input': inp}]}})
+
+    def test_read_without_path_is_inconclusive(self):
+        self.assertEqual(self.check(self.read(os.path.join(self.clone, 'a')), self.tool('Read', {})).returncode, 3)
+
+    def test_read_non_string_path_is_inconclusive(self):
+        self.assertEqual(self.check(self.read(os.path.join(self.clone, 'a')), self.tool('Read', {'file_path': 5})).returncode, 3)
+
+    def test_read_non_dict_input_is_inconclusive(self):
+        self.assertEqual(self.check(self.read(os.path.join(self.clone, 'a')), self.tool('Read', 'x')).returncode, 3)
+
+    def test_grep_without_path_is_cwd(self):
+        self.assertEqual(self.check(self.tool('Grep', {'pattern': 'x'})).returncode, 0)
+
     def test_no_session_file(self):
         os.remove(os.path.join(self.sess, 's.jsonl')) if os.path.exists(os.path.join(self.sess, 's.jsonl')) else None
         r = run('check_contamination.py', '--clone', self.clone, '--diff-dir', self.diff, '--projects-dir', self.projects)
         self.assertEqual(r.returncode, 2)
+
+
+# 型の一般論として残してよい語 (事例ではなく、どのレビューでも言える一般的な確認項目)
+GENERIC = {'重複キー', 'kill-after'}
+
+
+class GenChecklist(unittest.TestCase):
+    def gen(self, *args):
+        return subprocess.run(['bash', os.path.join(KIT, 'gen_checklist.sh'), *args], capture_output=True, text=True)
+
+    def test_no_graded_pr_or_ground_truth_text(self):
+        r = self.gen()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        for n in ('312', '313', '314'):
+            self.assertNotIn('#' + n, r.stdout)
+        with open(os.path.join(KIT, 'ground-truth.tsv'), encoding='utf-8') as f:
+            for line in f:
+                if line.startswith('#') or not line.strip():
+                    continue
+                summary = line.split('\t')[1].strip()
+                if summary in GENERIC:
+                    continue
+                self.assertNotIn(summary, r.stdout)
+        self.assertIn('型 1', r.stdout)  # 型の一般論は残る
+
+    def test_unreadable_source_fails(self):
+        self.assertNotEqual(self.gen('/nonexistent/x.md').returncode, 0)
+
+    def test_empty_output_fails(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, 'c.md')
+            with open(p, 'w') as f:
+                f.write('see #313\n')
+            self.assertNotEqual(self.gen(p).returncode, 0)
 
 
 if __name__ == '__main__':

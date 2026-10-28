@@ -12,7 +12,8 @@ Codex をやめる判断の材料。過去に Codex がレビューした 15 巡
 | `rounds.tsv` | 15 巡 (label・head sha)。base は `git merge-base <head> origin/main` |
 | `ground-truth.tsv` | 正解表: Codex の P1/P2 18 件 (巡・1 行要約・fix commit) |
 | `claude-only.tsv` | claude だけが挙げた妥当な指摘 4 件 |
-| `prompt.txt` / `schema.json` / `checklist.md` | 前回と同じ prompt・出力 schema・攻めのチェックリスト（比較のため固定。`knowledge/review-attack-checklist.md` が変わってもここは変えない） |
+| `prompt.txt` / `schema.json` | 前回と同じ prompt・出力 schema（比較のため固定） |
+| `gen_checklist.sh` | 攻めのチェックリストを正本 `knowledge/review-attack-checklist.md` から生成する。採点対象 PR (#312-#314) の事例の行は除く（reviewer が正解表の答えを読めないように）。型の一般論は残る |
 | `check_contamination.py` | 汚染検査 |
 | `tests/test_run_args.sh` | runner の引数解析だけの軽いテスト (`bash tests/test_run_args.sh`) |
 
@@ -35,6 +36,13 @@ bash run.sh --engine agy                              # 枠が戻ってから (�
 - `*.dirty` は読み取り専用のはずの clone に変更が出ていないかの記録 (空が正常)。
 - `--src` で commit の持ち主の repo を、`--out` で出力先を変えられる。
 
+## 脅威モデル
+
+Director が手で回す計測道具。入力（`rounds.tsv`・正本の checklist・`--src` の repo・claude/agy 自体）は信頼する。
+守るのは **黙った誤採点だけ**（正解を読んだ巡・clone が汚れた巡・検証できなかった巡を、採点に混ぜない）。悪意ある入力や回避は対象外。
+そのため runner は、diff/log/checklist の生成と setup の失敗で巡を止め（rc 94-96）、engine の前後で clone が `HEAD = head sha` かつ clean かを検査する
+（前でずれ = 95 で走らせない・後でずれ = 97 で `.json` を捨て `.rc` に `tainted_clone`）。汚染検査は判定できないとき exit 3（採点しない）。
+
 ## 汚染検査
 
 claude の session jsonl (`~/.claude/projects/<clone の / . _ を - に置換>/*.jsonl`) の Read / Grep / Glob の path が
@@ -44,7 +52,7 @@ clone と diff dir の下かを調べる。**採点の前に必ず回す**（外
 python3 check_contamination.py --clone out/rounds/pr314-r2 --diff-dir out/diffs/pr314-r2.claude   # 0 = 外を読んだ記録なし
 ```
 
-exit 1 = 外を読んだ疑い (`OUTSIDE <tool> <path>` を出す) / exit 2 = jsonl が無く検査できない（その巡は採点しない）/ exit 3 = 壊れた JSON 行がある・検査した tool_use が 0 件（inconclusive。汚染なしとは言えないので採点しない）。
+exit 1 = 外を読んだ疑い (`OUTSIDE <tool> <path>` を出す) / exit 2 = jsonl が無く検査できない（その巡は採点しない）/ exit 3 = 壊れた JSON 行・path が無い／文字列でない Read・検査した tool_use が 0 件（inconclusive。汚染なしとは言えないので採点しない）。
 `--no-session-persistence` を付けて実行すると記録が残らず検査できない（前回の 1 回目はそれで採点に使えなかった）。
 agy は jsonl が無いので、この検査は claude だけ。
 

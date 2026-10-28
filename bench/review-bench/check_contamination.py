@@ -4,7 +4,7 @@
 usage: check_contamination.py --clone <dir> --diff-dir <dir> [--projects-dir ~/.claude/projects]
 exit 0 = 外を読んだ記録 0 件 / 1 = 外を読んだ疑い (path を stdout に出す) / 2 = jsonl が無い (検査不能)
 / 3 = 壊れた JSON 行がある・検査した tool_use が 0 件 (inconclusive。汚染なしとは言えない)
-path 無しの Grep / Glob は cwd (= clone) なので許容。StructuredOutput 等の入力は見ない。
+path 無しの Grep / Glob は cwd (= clone) なので許容。Read の path が無い・非文字列は inconclusive (3)。StructuredOutput 等の入力は見ない。
 """
 import argparse
 import json
@@ -29,7 +29,7 @@ def session_files(projects_dir, clone):
 
 
 def outside_reads(files, roots, cwd):
-    bad, total, malformed = [], 0, 0
+    bad, total, malformed, unauditable = [], 0, 0, 0
     for fp in files:
         with open(fp, encoding='utf-8', errors='replace') as f:
             for line in f:
@@ -51,15 +51,21 @@ def outside_reads(files, roots, cwd):
                     if not isinstance(c, dict) or c.get('type') != 'tool_use' or c.get('name') not in TOOLS:
                         continue
                     total += 1
-                    inp = c.get('input') or {}
+                    inp = c.get('input')
+                    if not isinstance(inp, dict):
+                        unauditable += 1
+                        continue
                     for k in TOOLS[c['name']]:
                         v = inp.get(k)
-                        if not isinstance(v, str):
+                        if v is None and c['name'] != 'Read':
+                            continue  # path 無しの Grep / Glob は cwd (= clone)
+                        if not isinstance(v, str) or not v:
+                            unauditable += 1  # Read の path が無い・文字列でない → 何を読んだか分からない
                             continue
                         full = v if os.path.isabs(v) else os.path.join(cwd, v)
                         if not under(full, roots):
                             bad.append((c['name'], v))
-    return total, bad, malformed
+    return total, bad, malformed + unauditable
 
 
 def main(argv=None):
@@ -80,7 +86,7 @@ def main(argv=None):
     if bad:
         return 1
     if malformed or total == 0:
-        print('inconclusive: malformed log lines or no tool_use audited', file=sys.stderr)
+        print('inconclusive: malformed log lines, unauditable path or no tool_use audited', file=sys.stderr)
         return 3
     return 0
 

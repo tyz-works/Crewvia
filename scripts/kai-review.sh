@@ -805,7 +805,7 @@ Every finding's \"body\" MUST include either concrete reproduction steps or the 
 (inputs, the command or call, the expected vs. the actual result). If you cannot write one, do not report it.
 
 Read the unified diff from the file ${CLAUDE_DIFF_DIR}/review.diff (it is outside this checkout; read it as a file).
-The commits of this change (git log, base..HEAD) are in ${CLAUDE_DIFF_DIR}/review.log.
+The commits of this change (git log from the base to HEAD) are in ${CLAUDE_DIFF_DIR}/review.log.
 Read files in this checkout (Read / Grep / Glob) to verify the code. Shell commands are not available.
 Do not create, modify or delete any file. Return only the JSON object required by the schema."
   _info "Running claude -p --permission-mode plan --model ${CLAUDE_MODEL} (diff=${DIFF_BYTES} bytes, timeout=${CLAUDE_TIMEOUT}s) ..."

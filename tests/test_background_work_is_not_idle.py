@@ -490,6 +490,19 @@ def test_a_job_younger_than_the_ceiling_still_suppresses_rule5(r5, panes):
     assert r5.run() == []
 
 
+def test_default_ceiling_covers_a_one_hour_ci_wait(r5, panes):
+    """CI 待ち (pytest 約 1 時間の `while …; do sleep 20; done`) が正常に進んでいる
+    あいだは黙る。既定を 30 分にしていた頃は 30 分で idle-with-task が最大 7 回出た。
+    環境変数を明示しない既定値そのものを固定する (上限は残す = 黙る方向の安全弁)。
+    """
+    assert r5.ns["BACKGROUND_JOB_MAX_SECONDS"] >= 65 * 60
+    assert r5.ns["BACKGROUND_JOB_MAX_SECONDS"] <= 2 * 3600
+    PaneMux.pane_state, PaneMux.pane_pid = "idle", panes["busy"]
+    r5.seed_job_since(55 * 60)
+    r5.age_state()
+    assert r5.run() == []
+
+
 def test_a_job_older_than_the_ceiling_no_longer_suppresses_rule5(r5, panes):
     """赤の実証: 裏の job (本物のシェル、`executing`) が生きたままでも、
     連続して見え続けている時間が上限を超えたら通常の idle-with-task 判定に

@@ -378,3 +378,103 @@ def test_real_lib_a_checkpoint_removed_after_capture_still_retires(sandbox, work
     drive_to_cleanup(sandbox, ex, mux, pane_pid)
     assert [checkpoint_arg(c) for c in calls][1:] == ["none"] and checkpoint_arg(calls[0]) != "none"
     assert not ex.has_marker(AGENT)
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# pane は kill の前に撮る (checkpoint の段は殺した後で画面が無い)
+# ---------------------------------------------------------------------------------------------------------------------
+
+def _git_wt(tmp_path):
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    env.update(GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@e.com", GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@e.com")
+    for args in (["init", "-q"], ["commit", "-q", "--allow-empty", "-m", "i"]):
+        subprocess.run(["git", "-C", str(wt), *args], check=True, capture_output=True, env=env)
+    return wt
+
+
+def _write_record(sandbox, wt):
+    rec_dir = sandbox.queue / "missions" / SLUG / "executions"
+    rec_dir.mkdir(parents=True, exist_ok=True)
+    (rec_dir / f"{SANDBOX_XID}.json").write_text(json.dumps({"execution_id": SANDBOX_XID, "git": {"worktree": str(wt)}}))
+
+
+def _screen_mux(pane_pid, screen, events):
+    """Worker プロセスが生きている間だけ画面を返す mux (殺した後は本物の mux 同様に空)。"""
+    from test_retirement import _pid_alive
+
+    class ScreenMux(FakeMux):
+        def capture(self, name):
+            events.append("capture")
+            return screen if _pid_alive(pane_pid) else ""
+
+        def send(self, name, text):
+            events.append("send")
+            return super().send(name, text)
+
+    return ScreenMux({WINDOW: pane_pid})
+
+
+def test_the_pane_is_captured_before_the_shutdown_message_and_the_kill(sandbox, worker):
+    pane_pid, _ = worker
+    events, seen, calls = [], [], []
+    mux = _screen_mux(pane_pid, "last screen of the stalled worker", events)
+
+    def take(**kw):
+        seen.append((kw["pane_text"], kw["pane_source"], _alive(pane_pid)))
+        return "/saved/dir"
+
+    from test_retirement import _pid_alive as _alive
+    ex = make_executor(sandbox, mux, run_command=lambda argv, env: (calls.append(list(argv)), (0, ""))[1], take_checkpoint=take)
+    drive_to_cleanup(sandbox, ex, mux, pane_pid)
+    assert events[:2] == ["capture", "send"], events           # 通知より前
+    assert seen == [("last screen of the stalled worker", "before_kill", False)]   # take の時点で Worker は死んでいる
+    assert checkpoint_arg(calls[0]) == "/saved/dir"
+
+
+def test_a_pane_capture_failure_before_the_kill_neither_stops_the_kill_nor_the_checkpoint(sandbox, worker):
+    pane_pid, _ = worker
+    seen, calls = [], []
+
+    class BadMux(FakeMux):
+        def capture(self, name):
+            raise RuntimeError("mux down")
+
+    mux = BadMux({WINDOW: pane_pid})
+    ex = make_executor(sandbox, mux, run_command=lambda argv, env: (calls.append(list(argv)), (0, ""))[1],
+                       take_checkpoint=lambda **kw: (seen.append((kw["pane_text"], kw["pane_source"])), "/d")[1])
+    drive_to_cleanup(sandbox, ex, mux, pane_pid)
+    assert seen == [(None, "capture_error")]
+    assert checkpoint_arg(calls[0]) == "/d" and not ex.has_marker(AGENT)
+    assert any(m == WINDOW for m, _ in mux.sent)                 # 退役の通知は出ている (退役は止まっていない)
+
+
+def test_the_pre_kill_pane_is_redacted_and_the_reason_goes_to_meta(sandbox, worker, tmp_path):
+    pane_pid, _ = worker
+    _write_record(sandbox, _git_wt(tmp_path))
+    token = "gh" + "p_" + "A1b2C3d4" * 5          # 偽の秘密 (実在しない値)
+    calls = []
+    mux = _screen_mux(pane_pid, f"$ export GH={token}\nwaiting for api", [])
+    ex = make_executor(sandbox, mux, run_command=lambda argv, env: (calls.append(list(argv)), (0, ""))[1])
+    drive_to_cleanup(sandbox, ex, mux, pane_pid)
+    d = Path(checkpoint_arg(calls[0]))
+    pane = (d / "pane.txt").read_text()
+    assert token not in pane and "[REDACTED:" in pane and "waiting for api" in pane
+    assert token not in "".join(p.read_text(errors="replace") for p in d.rglob("*") if p.is_file())
+    meta = json.loads((d / "meta.json").read_text())
+    assert meta["files"]["pane"]["saved"] is True and meta["files"]["pane"]["source"] == "before_kill"
+
+
+def test_without_a_mux_window_the_stage_records_the_reason_and_takes_the_rest(sandbox, tmp_path):
+    """mux なし (インライン) / 窓が元から無い: capture は呼ばれず、meta に理由だけ。"""
+    _write_record(sandbox, _git_wt(tmp_path))
+
+    class NoCapture(FakeMux):
+        def capture(self, name):
+            raise AssertionError("capture must not be called")
+
+    ex = make_executor(sandbox, NoCapture({}, available=False))
+    d = Path(ex._checkpoint_stage(AGENT, {"window_target": WINDOW, "reason": "timeout"}, {}, SLUG, TASK_ID, SANDBOX_XID))
+    meta = json.loads((d / "meta.json").read_text())
+    assert meta["files"]["pane"] == {"saved": False, "lines": 0, "source": "window_gone"}

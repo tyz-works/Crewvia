@@ -1015,6 +1015,10 @@ class RetirementExecutor:
         self.checkpoint_seconds = checkpoint_seconds
         self._take_checkpoint_impl = take_checkpoint
         self._checkpoint_results: dict = {}      # execution_id -> dir | "none" (this process only)
+        # execution_id -> (text | None, source).  The pane as seen in `_start`, *before* anything is sent or killed (the
+        # checkpoint stage runs after the kill, when the screen is gone).  Raw text: memory only, never written here —
+        # `lib_checkpoint` redacts it.  Lost on a watchdog restart; the stage then falls back to a live capture.
+        self._prekill_panes: dict = {}
         # Notices `notify_once` could not deliver: {(key, fp): (mission, task,
         # message, first_attempt_at)}.  In memory on purpose — see
         # `_retry_owed_notices()`.
@@ -1772,6 +1776,7 @@ class RetirementExecutor:
         # later phases signal, and re-resolving the window name here is how a
         # same-named successor's pid used to get persisted (Codex P1-3).
         pane_pid = self._verified_pid(req, identity)
+        self._capture_pane_before_kill(req, target)
         # R1: the intent is durable before the act.  If the write fails we
         # have not sent anything, and next cycle starts over cleanly.
         #
@@ -1794,6 +1799,30 @@ class RetirementExecutor:
                 f"{self.grace_period}s to exit on its own"
             )
         return "notified"
+
+    def _capture_pane_before_kill(self, req: dict, target: str) -> None:
+        """Remember the pane before the shutdown message / SIGTERM (a read; never stops or delays the retirement).
+
+        Only for a retirement that will take a checkpoint (task + mission + bound Execution ID + a deadline).  A failure
+        or an exception is recorded as a reason code only: the kill goes on.  The mux read goes through `lib_mux`
+        (`capture`; tmux and herdr both have a timeout).  Kill authority is untouched — this sends nothing.
+        """
+        try:
+            if not (req.get("task_id") and req.get("mission")) or not self.checkpoint_seconds or self.checkpoint_seconds <= 0:
+                return
+            execution_id = self._bound_execution(req, None)
+            if execution_id is None or execution_id in self._prekill_panes:
+                return
+            try:
+                text = self.mux.capture(target) or None
+            except Exception:  # noqa: BLE001 — the pane is a bonus
+                self._prekill_panes[execution_id] = (None, "capture_error")
+                return
+            while len(self._prekill_panes) >= 64:      # a retirement that was discarded never pops its entry
+                self._prekill_panes.pop(next(iter(self._prekill_panes)))
+            self._prekill_panes[execution_id] = (text, "before_kill") if text else (None, "capture_empty")
+        except Exception:  # noqa: BLE001 — never let a bonus stop the retirement
+            return
 
     def _step_notified(self, agent: str, req: Optional[dict], prog: dict) -> Optional[str]:
         if req is None:
@@ -2201,18 +2230,23 @@ class RetirementExecutor:
         reason = (req or {}).get("reason") or prog.get("reason") or "unknown"
         window = (req or {}).get("window_target") or prog.get("window_target")
         try:
-            pane_text = None
-            if window and self._window_alive(window):
+            pane_text, pane_source = self._prekill_panes.pop(execution_id, (None, None))
+            if pane_text is None and window and self._window_alive(window):     # nothing taken before the kill: the window is still there
                 try:
                     pane_text = self.mux.capture(window) or None
+                    pane_source = "live" if pane_text else (pane_source or "capture_empty")
                 except Exception:  # noqa: BLE001 — the pane is a bonus; the worktree is the point
                     pane_text = None
+                    pane_source = "capture_error"
+            if pane_text is None and pane_source is None:
+                pane_source = "window_gone"
             take = self._take_checkpoint_impl
             if take is None:
                 import lib_checkpoint
                 take = lib_checkpoint.take
             path = take(registry_dir=self.registry_dir, queue_dir=self.queue_dir, mission=mission, task=task_id,
-                        execution_id=execution_id, reason=reason, pane_text=pane_text, seconds=seconds)
+                        execution_id=execution_id, reason=reason, pane_text=pane_text, pane_source=pane_source,
+                        seconds=seconds)
             self.log(f"[retire] {agent}: checkpoint saved for {mission}/{task_id}")
             self._checkpoint_results[execution_id] = str(path)
             return str(path)

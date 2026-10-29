@@ -330,7 +330,8 @@ reopen は依存の辺を足さないので、循環を作らない。下流の�
   失敗・期限切れ・**想定外の例外**はすべて `--checkpoint none` に倒れ、途中の dir（`<execution_id>.partial`）は掃除される。完成は `.partial` → 最終名の rename 1 回（途中の dir が本物に見えない）。
 - **失敗の通知は 1 回**: キー `checkpoint_<mission>_<task>`・fp `exec:<ID>` で notify-once の台帳に載せる（同じ試行の再試行・watchdog の再起動で二重に出さない）。文面に例外の文字列・worktree の内容は入れない（固定コードだけ）。
   **「保存するものが元から無い」は失敗ではない**（`NothingToSave`: record が無い・`git.worktree` が null = worktree を作る前に終わった試行）。通知せず `none`。record が読めない・記録の dir が実在しないのは失敗（通知する）。
-- **ペイン（`pane.txt`）**: 退役の段は Worker を殺した後なので、`_live_windows` に窓が残っているときだけ取る（ふつうは無い）。取れなくても他は取る。殺す前に撮る案は、殺す順序と権限（`daemon-authority.md`）に触れるので採らなかった（§8 に積む）。
+- **ペイン（`pane.txt`）**: **殺す前に撮る**（ops-small-four t003）。`lib_retirement._start` が、identity の guard を通った後・シャットダウン通知を送る**前**に `_capture_pane_before_kill`（`mux.capture` = `lib_mux` の入口。tmux / herdr とも timeout つき）で画面を撮り、試行の ID をキーにプロセス内に持つ（生の文字列は registry に書かない）。checkpoint の段（殺した後）がそれを `take(pane_text=…)` に渡し、`lib_checkpoint` が従来どおり redaction（200 行に切る前の全体）を通して `pane.txt` にする。
+  撮れなくても（例外・空）退役は止まらない・待たない: 理由だけを `meta.json` の `files.pane.source` に固定コードで残す（`before_kill` / `live`〔撮り損ねたが窓がまだ在った〕/ `capture_error` / `capture_empty` / `window_gone`）。mux なし（インライン）・窓が無いときは何も呼ばず `window_gone`。watchdog の再起動で持ち越しは消える（その場合は窓が残っていれば従来の live 撮り、無ければ `window_gone`）。kill の権限（watchdog が唯一の実行者・`daemon-authority.md`）は変えない: 撮るのは読み取りだけで、順序（通知 → SIGTERM → SIGKILL）にも触れない。
 - **秘密**: ファイル名の除外は**パスの全ての成分**に当てる（`dir.credentials/inner.txt` も除外。取りすぎる側＝安全側）。patch は `diff --git` の節ごと落とす（見出し・rename 行のパスを見る）。redaction は patch / untracked / pane / status の**全部**に通し、
   **redaction の後で 1MB に切る**（先に切ると秘密を途中で割って半端な値が残る）。`[REDACTED:n]` の n は置換の通し番号（パターンの適用順であり、出現位置の順ではない）。パターンは量指定子を入れ子にせず上限つき（秘密鍵のブロックだけは正規表現でなく `find`）。1MB の 1 行・9 種類の敵対的な入力が 5 秒未満（テスト）。
 - **git は読み取りだけ**: `git --no-optional-locks -c core.fsmonitor=false`、`GIT_*` の環境変数を落とす（`GIT_DIR` 継承・`GIT_EXTERNAL_DIFF` を持ち込まない）、`diff` は `--no-ext-diff --no-textconv`。worktree（`.git/index` を含む）が 1 バイトも変わらないこと・textconv / 外部 diff が起動しないことは本物の git でテスト。
@@ -428,8 +429,7 @@ Codex の往復は 3 巡で打ち切った (PR #301 の t002)。以下は実装 
   - 直し方の方向（未決）: active でない（終端の）試行でも、台帳とコミット済みの遷移を突き合わせ、遷移の kind と台帳の DONE が食い違うものを孤児として報告する。
   - 網羅テストに入れるケース: `done` が台帳だけ書いて落ちた後に `reset` で閉じる / `retire` で閉じる / 何も閉じない（active のまま）、それぞれで store-check が孤児を報告するか。閉じた kind が `done` のときは報告しないこと（偽陽性なし）。同じ試行を 2 回報告しないこと。報告は読み取りだけで台帳・card・record を書かないこと。
 - 実装の PR（D・F）の QA で確かめること: (1) cascade を各書き込みの後で kill して再実行し、`cascade-incomplete` が出て再実行で消えること・`reopen_count` が二重に増えないこと。(2) 孤児の台帳を作ってから同じ報告を送り直すと、新しいファイルが増えず `ended_at` が台帳と card・record で一致すること。(3) 孤児の台帳のあとに違う Result で送ると `HISTORY_MISMATCH` で card が書かれないこと（この拒否のあとの出口が「同じ報告を送り直す」だけでよいかは、運用で足りなければ孤児の差し替えを別に設計する）。
-- **checkpoint のペイン（`pane.txt`）は、退役の段が Worker を殺した後なのでふつう取れない**（PR-G / t039）。worktree の未 commit の作業（本命）は殺した後でも残るので取れる。ペインの末尾まで欲しいなら、殺す**前**（`_start` の送信と SIGTERM の間）に撮る必要があるが、
-  それは退役の順序と権限（`daemon-authority.md`）に触れるので PR-G では採らなかった。必要になったら別 PR で「撮るだけ・失敗しても殺す」の段を `_start` に足す（期限と通知は同じ作り）。
+- **checkpoint のペイン（`pane.txt`）**: PR-G では殺した後なのでふつう取れなかったが、ops-small-four t003 で殺す**前**（`_start`、通知の送信前）に撮るようにした（§5.4 のペインの項）。取れたかどうかは `meta.json` の `files.pane.source`。
 - **同じ試行の take が同時に 2 本走ると、共有の `<execution_id>.partial` を互いに消しあう**（PR-G の Codex 5 巡目 P2-1。直さずここに積む）。
   - 漏れている状態: `lib_checkpoint.take()` は書きかけを試行ごとに 1 つの `<execution_id>.partial` に作る。後から入った take は先に在る `.partial` を `remove_tree` してから作り直すので、先の take が書いている最中の dir を消す。先の take は書き込みか rename で失敗し、後の take も先の残骸や rename 先の競合で失敗しうる。
   - 起きる害: 両方失敗して `--checkpoint none` になり、checkpoint なしで退役が進む（退役は止めない設計なので task は壊れないが、保存したかった作業の写しが残らない）。手動の CLI と watchdog が同じ試行で重なった場合に起きる。通常運用では watchdog だけが取るので起きにくい。

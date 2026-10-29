@@ -777,7 +777,7 @@ def worktree_of_record(queue_dir, mission, execution_id):
 
 
 def take(*, registry_dir, queue_dir, mission, task, execution_id, reason='unknown', pane_text=None,
-         seconds=DEFAULT_SECONDS, now=None, worktree=None):
+         seconds=DEFAULT_SECONDS, now=None, worktree=None, pane_source=None):
     """checkpoint を保存して dir を返す。失敗は `CheckpointError` (途中の dir は消してある)。
 
     同じ試行の dir が既にあり、`verify` を通れば**それを返す** (退役の再試行が毎サイクル撮り直さない)。
@@ -824,7 +824,7 @@ def take(*, registry_dir, queue_dir, mission, task, execution_id, reason='unknow
         out = parent.child(partial_name, create=True)
         try:
             try:
-                meta = _build(clock, out, worktree_real, mission, task, execution_id, reason, pane_text, now)
+                meta = _build(clock, out, worktree_real, mission, task, execution_id, reason, pane_text, now, pane_source)
                 out.write(META_NAME, json.dumps(meta, ensure_ascii=False, indent=2, sort_keys=True) + '\n')
                 clock.check()
             finally:
@@ -859,7 +859,7 @@ def _refuse_local_filters(clock, worktree):
         raise CheckpointError(E_GIT, 'config_unreadable')
 
 
-def _build(clock, out, worktree, mission, task, execution_id, reason, pane_text, now):
+def _build(clock, out, worktree, mission, task, execution_id, reason, pane_text, now, pane_source=None):
     """保存物を `out` に書いて meta (dict) を返す。"""
     redactions = 0
     skipped_redaction = 0
@@ -947,7 +947,9 @@ def _build(clock, out, worktree, mission, task, execution_id, reason, pane_text,
         files['pane'] = {'saved': False, 'lines': 0}
 
     clock.check()
-    return {
+    if pane_source is not None:       # どこで撮ったか / 撮れなかった理由 (固定コードだけ。画面の中身は入れない)
+        files['pane']['source'] = pane_source
+    meta = {
         'schema_version': SCHEMA_VERSION,
         'execution_id': execution_id,
         'mission': mission,
@@ -966,6 +968,7 @@ def _build(clock, out, worktree, mission, task, execution_id, reason, pane_text,
         'redactions': redactions,
         'redaction_failed_files': skipped_redaction,
     }
+    return meta
 
 
 #: 変更のあったファイルを全体で調べる上限 (超えたら patch ごと保存しない)

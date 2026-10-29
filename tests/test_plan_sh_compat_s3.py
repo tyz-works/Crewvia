@@ -40,7 +40,8 @@ REPO = HERE.parent
 #   4. `<agent>.identity` の `execution_id`
 #   (vNext 02 PR-D が足したもの。足すだけ) 5. pull の stdout の JSON に `previous_attempt` (前の試行の台帳がある pull だけ)
 #   6. `queue/missions/<slug>/history/` (試行の台帳。Controller を通った遷移ごとに 1 ファイル)
-E2_JSON_KEYS = ("execution_id", "attempt", "previous_attempt")
+#   (ops-small-four t002 が足したもの。足すだけ) 8. pull の stdout の JSON に `reopen_count` / `pr_number` (card の値の写し)
+E2_JSON_KEYS = ("execution_id", "attempt", "previous_attempt", "reopen_count", "pr_number")
 #   7. card の frontmatter に `result_execution_id` (PR-D: Result 節を置き換えた試行。done / fail が足す)
 _FIELD_LINE = re.compile(r"^(?:%s): .*\n" % "|".join(map(re.escape, (*_ex.EXECUTION_FIELDS, "result_execution_id"))),
                          re.MULTILINE)

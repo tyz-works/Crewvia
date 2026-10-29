@@ -273,6 +273,8 @@ worktree は再利用される（`.crewvia-env` は書き直される）。
   "skills": ["code", "typescript"],
   "priority": "high",
   "blocked_by": ["t001"],
+  "reopen_count": 0,
+  "pr_number": null,
   "task_slug": "new-auth-middleware",
   "worktree_path": "/abs/path/.claude/worktrees/20260411-auth-refactor/t002-new-auth-middleware",
   "execution_id": "ex-0123456789abcdef0123456789abcdef",
@@ -282,6 +284,7 @@ worktree は再利用される（`.crewvia-env` は書き直される）。
 
 `execution_id` / `attempt` は今の試行の ID と、その task で何回目の試行か（1 から）。**pull の直後にこの `execution_id` を控える**（以後の報告で使う唯一の入手元）。
 `task_slug` は最初の予約で card に固定された値（title を後から変えても branch / worktree は変わらない）。
+`reopen_count` は card の値（reopen されていない・欄の無い古い card は 0。1 以上なら前の結果を見直す回）。`pr_number` も card の値（PR が紐づいていなければ `null`。card を読み直さなくてよい）。
 
 **Bash は呼び出しごとに env が消える。** 報告（done / fail / needs-director / ready-for-verification）には、**自分の pull の JSON の `execution_id` を、`--execution ex-…` にリテラルで書く**（pull の直後に控えた値を、会話の中で持ち越す）:
 

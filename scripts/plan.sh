@@ -3696,6 +3696,9 @@ def _pull_result(slug, meta, body):
         'priority': meta.get('priority', 'medium'),
         'blocked_by': meta.get('blocked_by') or [],
         'target_dir': meta.get('target_dir'),  # None for crewvia-local tasks
+        # card の値をそのまま写す。reopen_count: 欄の無い古い card は 0 / pr_number: 未設定は None (欄は常に出す)
+        'reopen_count': meta.get('reopen_count') or 0,
+        'pr_number': meta.get('pr_number') or None,
     }
 
 

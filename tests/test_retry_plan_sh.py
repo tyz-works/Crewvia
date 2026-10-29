@@ -123,6 +123,11 @@ def test_needs_human_review_with_a_running_attempt_is_refused_as_active(box):
     assert last_error_code(p.stderr) == "ATTEMPT_ACTIVE"
     assert box.snapshot() == before and not ledger_files(box)
     assert box.card()["current_execution_id"] == xid
+    # 持ち主のいる active (running) は close-execution では閉じられない (INVALID_TRANSITION)。出口は reset だけ
+    assert f"plan.sh update {TID} --status pending --reset" in p.stderr
+    assert f"先に `plan.sh update {TID} --close-execution`" not in p.stderr
+    c = run(box, "update", TID, "--close-execution", "--mission", MISSION, agent="Director")
+    assert c.returncode == 2 and last_error_code(c.stderr) == "INVALID_TRANSITION"
 
 
 @pytest.mark.parametrize("status", ["pending", "in_progress", "done", "verified", "skipped", "blocked",
@@ -146,6 +151,7 @@ def test_retry_refuses_an_active_attempt_whatever_the_task_status(box, execution
     assert p.returncode == 3
     assert last_error_code(p.stderr) == "ATTEMPT_ACTIVE"
     assert "close-execution" in p.stderr and "--reset" in p.stderr
+    assert "持ち主がいる" not in p.stderr                  # DETACHED (手放された card) は close-execution が正しい出口
     assert not retry_files(box) and box.card()["status"] == "failed"      # (record の追従は回復の仕事で retry は書かない)
 
 

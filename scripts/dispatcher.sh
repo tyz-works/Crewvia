@@ -2952,7 +2952,10 @@ def dispatch():
                 f'理由: {reason_line}'
                 + ('…' if len(reason) > len(reason_line) else '')
                 + f' (全文: {task_file})。'
-                f'reason を読んで方針を決め、plan.sh update {task_id} --status pending --reset '
+                f'reason を読んで方針を決めてください。理由を渡して再挑戦させるなら '
+                f'plan.sh retry {task_id} --reason "<理由>" --mission {slug}、'
+                f'Codex / QA の指摘の修正は実装 task を plan.sh reopen <実装 task> --reason "<指摘>" --branch reuse --mission {slug}、'
+                f'理由の要らない差し戻しは plan.sh update {task_id} --status pending --reset '
                 f'--mission {slug} で差し戻してください。'
                 + note
             )

@@ -376,7 +376,8 @@ else
 
   # Test 3: 単一行 reason はそのまま全文が入り、省略記号は付かない
   if [[ "$MSG_T010" == *"$T346_SLUG"* && "$MSG_T010" == *"Codex review NEEDS FIX: race in assign loop"* \
-        && "$MSG_T010" == *"plan.sh update t010 --status pending --reset --mission $T346_SLUG"* ]]; then
+        && "$MSG_T010" == *"plan.sh update t010 --status pending --reset --mission $T346_SLUG"* \
+        && "$MSG_T010" == *"plan.sh retry t010 --reason"* && "$MSG_T010" == *"plan.sh reopen <実装 task>"* ]]; then
     pass "メッセージ構築: 単一行 reason は全文がそのまま入り、復旧コマンドも組み立てられる"
   else
     fail "メッセージ構築: 単一行 reason (t010) の内容が期待と異なる: $MSG_T010"

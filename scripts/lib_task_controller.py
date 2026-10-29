@@ -205,6 +205,16 @@ def _view(meta):
     return ex.attempt_view(meta, _HOLDING)
 
 
+def _active_attempt_exit(tid, meta):
+    """ATTEMPT_ACTIVE の拒否文に添える出口。`update --close-execution` が閉じるのは **DETACHED の active** だけ
+    (`abandon_detached_execution`)。持ち主のいる active (needs_human_review 等で試行が running のまま) に打つと
+    INVALID_TRANSITION になるので、その場面の出口は `update --status pending --reset` (試行ごと閉じる) だけ。"""
+    if _view(meta) == ex.DETACHED:
+        return f"先に `plan.sh update {tid} --close-execution` か `--reset` で試行を閉じてください"
+    return (f"この試行は持ち主がいる状態なので `--close-execution` では閉じられません (INVALID_TRANSITION)。"
+            f"`plan.sh update {tid} --status pending --reset` で試行ごと閉じてください")
+
+
 def _refuse(txn, code, message, slug, tid, meta, caller=None):
     """拒否の行 (監査ログ。ロックの中で即時) を残して domain error を投げる。**card・record・枠は 1 バイトも書かない**。"""
     presented = caller.execution_id if caller is not None else None
@@ -1013,8 +1023,7 @@ def reopen_task(txn, slug, tid, *, kind, reason, over_cap=None, default_max_atte
                 f"`update --reset` を使ってください", slug, tid, meta)
     if meta.get('execution_status') in ex.ACTIVE_STATUSES:
         _refuse(txn, ex.ATTEMPT_ACTIVE,
-                f"task '{tid}': 試行 ({meta.get('execution_status')}) がまだ active です。先に `plan.sh update {tid} --close-execution`"
-                f" か `--reset` で試行を閉じてください", slug, tid, meta)
+                f"task '{tid}': 試行 ({meta.get('execution_status')}) がまだ active です。{_active_attempt_exit(tid, meta)}", slug, tid, meta)
     if meta.get('status') not in _ACCEPTS[command]:
         allowed = ', '.join(sorted(_ACCEPTS[command]))
         shown = store._safe_status(meta.get('status')) or '<unknown>'
@@ -1448,8 +1457,7 @@ def _reopen_cascade(txn, slug, tid, *, reason, over_cap, default_max_attempts, n
                 f"`update --reset` を使ってください", slug, tid, meta)
     if meta.get('execution_status') in ex.ACTIVE_STATUSES:
         _refuse(txn, ex.ATTEMPT_ACTIVE,
-                f"task '{tid}': 試行 ({meta.get('execution_status')}) がまだ active です。先に `plan.sh update {tid} --close-execution`"
-                f" か `--reset` で試行を閉じてください", slug, tid, meta)
+                f"task '{tid}': 試行 ({meta.get('execution_status')}) がまだ active です。{_active_attempt_exit(tid, meta)}", slug, tid, meta)
     if meta.get('status') not in _ACCEPTS['reopen']:
         allowed = ', '.join(sorted(_ACCEPTS['reopen']))
         shown = store._safe_status(meta.get('status')) or '<unknown>'
@@ -1541,9 +1549,10 @@ def _reopen_cascade(txn, slug, tid, *, reason, over_cap, default_max_attempts, n
                     f"task '{tid}': 戻す下流に試行の記録が無い card があります ({', '.join(problems[ex.NOT_REOPENABLE])})。"
                     f"台帳に写せないので cascade できません", slug, tid, meta)
         if problems[ex.ATTEMPT_ACTIVE]:
+            _cascade_exit_hint = '; '.join(f"{d}: {_active_attempt_exit(d, cards[d][0])}" for d in problems[ex.ATTEMPT_ACTIVE])
             _refuse(txn, ex.ATTEMPT_ACTIVE,
                     f"task '{tid}': 戻す下流に active な試行が残る card があります ({', '.join(problems[ex.ATTEMPT_ACTIVE])})。"
-                    f"先に `plan.sh update <id> --close-execution` で閉じてください", slug, tid, meta)
+                    f"{_cascade_exit_hint}", slug, tid, meta)
         if problems[ex.ATTEMPT_CAP]:
             _refuse(txn, ex.ATTEMPT_CAP,
                     f"task '{tid}': 戻す下流が総試行数の上限に達しています ({', '.join(problems[ex.ATTEMPT_CAP])})。"

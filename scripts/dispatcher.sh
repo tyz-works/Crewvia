@@ -353,15 +353,20 @@ except ValueError:
 # デフォルト 1800 秒 (30 分): 本番で観測されている正当な長時間実行 (pytest 一式
 # が約 25 分。tests/CLAUDE.md) より長く、watchdog の絶対上限 (既定 3600 秒) より
 # 十分短い — Director が watchdog の kill を待たずに気付けるようにする。
+# t004: 既定を 1800 → 4500 秒 (75 分) に延ばした。PR の CI 待ち (pytest 約 1 時間) の
+# `while …; do sleep 20; done` は正当な job だが、30 分で上限に当たり、CI が正常に
+# 進んでいるのに 5 分ごとに idle-with-task が最大 7 回出ていた (2026-10-27/28 の 19 件の
+# 連なり)。knowledge/watchdog-idle-judgment.md の t004 追補。上限そのものは残す (黙る方向の
+# 安全弁。pgrep 自己一致ループが黙らせ続ける窓は 30 → 75 分に広がる)。
 # Override via CREWVIA_RULE5_BACKGROUND_JOB_MAX_SECONDS for tests / tuning.
 try:
     BACKGROUND_JOB_MAX_SECONDS = int(
-        os.environ.get('CREWVIA_RULE5_BACKGROUND_JOB_MAX_SECONDS', '1800'))
+        os.environ.get('CREWVIA_RULE5_BACKGROUND_JOB_MAX_SECONDS', '4500'))
 except ValueError:
     _bad = os.environ.get('CREWVIA_RULE5_BACKGROUND_JOB_MAX_SECONDS')
     print(f"[dispatcher] WARNING: invalid CREWVIA_RULE5_BACKGROUND_JOB_MAX_SECONDS={_bad!r} "
-          "— using default 1800", file=sys.stderr)
-    BACKGROUND_JOB_MAX_SECONDS = 1800
+          "— using default 4500", file=sys.stderr)
+    BACKGROUND_JOB_MAX_SECONDS = 4500
 
 # Circuit breaker for Taskvia API calls
 TASKVIA_CB_FAILURES = 0

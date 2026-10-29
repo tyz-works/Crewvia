@@ -139,6 +139,27 @@ def test_branch_reuse_is_required_and_nothing_is_written_without_it(tmp_path):
     assert box.snapshot() == before
 
 
+def test_reopen_active_attempt_with_an_owner_points_at_reset_not_close_execution(tmp_path):
+    box = build(tmp_path, [("t001", [], ["code"])])
+    finish(box, "t001")
+    set_card(box, status="in_progress", worker="Ren", execution_status="running", execution_end_code=None)
+    p = reopen(box)                                  # (record の追従は回復の仕事なので snapshot は比べない)
+    assert p.returncode == 3, p.stderr
+    assert last_error_code(p.stderr) == "ATTEMPT_ACTIVE"
+    assert "plan.sh update t001 --status pending --reset" in p.stderr
+    assert "先に `plan.sh update t001 --close-execution`" not in p.stderr
+
+
+def test_reopen_active_attempt_without_an_owner_points_at_close_execution(tmp_path):
+    box = build(tmp_path, [("t001", [], ["code"])])
+    finish(box, "t001")
+    set_card(box, execution_status="running", execution_end_code=None)       # done のまま試行が running = DETACHED
+    p = reopen(box)
+    assert p.returncode == 3, p.stderr
+    assert last_error_code(p.stderr) == "ATTEMPT_ACTIVE"
+    assert "plan.sh update t001 --close-execution" in p.stderr
+
+
 @pytest.mark.parametrize("src", ["pending", "failed", "needs_director", "in_progress"])
 def test_reopen_from_other_statuses_is_refused_and_writes_nothing(tmp_path, src):
     box = build(tmp_path, [("t001", [], ["code"])])

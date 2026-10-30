@@ -227,11 +227,13 @@ attempts:
 # agy は fail-closed: exit 非 0・timeout・出力が読めない・指摘の JSON が無い/schema 不適合・worktree が汚れた → needs-director。
 # 比較側（compare）の失敗は判定に使わず、失敗の理由を併記するだけ。
 # cursor_model: Cursor のサブスクの枠で使えるのは Grok 系だけ（2026-10-27 実測。他は ActionRequiredError で止まる）。claude-fable-* は NO ZDR のため拒否。
+# agy_model: `agy models` が返すのは gemini-3.8-flash-{high,medium,low} / claude-sonnet-4-6 / claude-opus-4-6-thinking / gpt-oss-120b-medium だけ（2026-10-29 実測）。
+# ensemble は agy と claude の合議なので、agy 側は claude と別系統（Gemini）にする。ここに無いモデル名を書くと agy が起動直後に落ちて needs-director になる。
 # claude も fail-closed（exit 非 0・timeout・is_error・permission_denials・structured_output が無い/schema 不適合・worktree が変わった）。
 # 設計・実測: knowledge/agy-review.md / knowledge/cursor-review.md / knowledge/claude-review.md
 review:
   engine: codex
-  agy_model: gemini-4-argon-high
+  agy_model: gemini-3.8-flash-high
   agy_timeout_seconds: 600
   cursor_model: grok-4.7-high
   cursor_timeout_seconds: 900

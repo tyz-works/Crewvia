@@ -66,8 +66,8 @@ $RX server status --json
 
 Rex が label の重複を防がないので、`RexBackend` が次を守る（herdr の `_label_lookup` / `_resolve_ids` と同じ位置づけ）:
 
-1. **spawn は `registry/mux/.records.lock`（`_pane_record_lock`）の中で「同名の記録 + 同名 label の block が session に無い」を確かめてから作る**。ロックを取れなければ spawn しない（重複を作るより失敗を選ぶ）。ロックは `write_pane_record` と同じ区間に伸ばす
-2. **解決は記録の `block_id` を正本にする**。`send` / `capture` / `pid` / `kill` は名前 → 記録 → `block_id` で引き、label は「記録の block の label が名前と一致するか」の照合にだけ使う（一致しなければ `pane not found` 側。他人が同じ名前を付けた別 block に送らない）
+1. **spawn は `registry/mux/.records.lock`（`_pane_record_lock`）の中で「同名の記録 + 同名 label の生きた block が session に無い」を確かめてから作る**。**数えるのは生きた block（`process` の `child` がある）だけ**。殻（`child` が無く `last_exit` がある block。§5.3）は label が同じでも数えず無視する（殻は消さない方針なので、数えると同名の spawn が永久に拒否される）。ロックを取れなければ spawn しない（重複を作るより失敗を選ぶ）。ロックは `write_pane_record` と同じ区間に伸ばす
+2. **解決は記録の `block_id` を正本にする**（label は正本でなく照合用。殻と同じ label の新しい block があっても、記録の `block_id` が新しい block を指す限り殻には届かない）。`send` / `capture` / `pid` / `kill` は名前 → 記録 → `block_id` で引き、label は「記録の block の label が名前と一致するか」の照合にだけ使う（一致しなければ `pane not found` 側。他人が同じ名前を付けた別 block に送らない）
 3. **label で引いた結果が 2 つ以上なら「曖昧」**: `list()` は重複を 1 つに潰さず警告つきで返す・`spawn` は拒否（`SPAWN_UNREADABLE` 側）・`kill` は拒否（`--force` だけが出口）。重複を片方に倒さない
 4. 記録が無い（`./crewvia` が作っていない）block は、名前が一致しても kill の対象にしない（`DAEMON_PANE_NAMES` = dispatcher / watchdog は既存の `may_destroy_pane` が止める。Worker 窓は §5 の本人確認）
 
@@ -82,7 +82,7 @@ spawn は記録（`write_pane_record`）を server の `(endpoint, generation)` 
 | `server_identity()` | 接続の `SO_PEERCRED` で server pid → `(sock, "<pid>:<starttime>")` | `rex server status --json` の `endpoint` と **`instance_id`**（server の生成ごとに変わる UUID。**実測**: 再起動で `c7b02a5c…` → `23fc24c8…` → `cd9abb25…`）。generation は `"<instance_id>:<pid>"`（pid も `status` が返す）。`SO_PEERCRED` は CLI が自前の接続を開くので使えない（§5） | 満たせる。ただし「同じ接続で束縛」は弱い（§5） |
 | `_inspect_pane` / `_inspect_pane_full` | tab_id と shell pid を 1 query で | `rex block call process '{}' -b <block>` → `child.pid` / `foreground.pid` / `cwd` / `last_exit`。window_id は記録から。server は直前に `server status` | 満たせる（query は 2 本になる。§5） |
 | `may_destroy(name)` | `may_destroy_pane(...)` | **daemon 窓（dispatcher / watchdog）だけ**既存の `may_destroy_pane` を通す（`BACKEND_NAME = "rex"`・handle は記録の `window_id`）。**Worker 窓は `may_destroy_pane` が守らない**: 関数は `DAEMON_PANE_NAMES` 以外の名前に**即 `True`**（`scripts/lib_mux.py` の `if name not in DAEMON_PANE_NAMES`）を返すので、Worker の本人確認は **RexBackend 側に `rex_worker_provenance()` として足す**（§5.2。記録との照合） | 満たせる（Worker 側は新規に書く） |
-| `record_existence(name, record, timeout)` | `pane.get` を**記録の server の世代と同じ接続**で流し、`pane_not_found` だけ `PANE_GONE` | `rex block inspect <block_id>` 相当。**実測**: 存在しない block は `Error: block target "…" not found`・**exit 3**。server が居ない（socket 無し）は **exit 4**（`no Rex server is running …`）。→ exit 3 かつ stderr が `not found` のときだけ `PANE_GONE`、他は `PANE_UNOBSERVED`。server の世代が記録と違えば（`instance_id` 不一致）問い合わせず `PANE_UNOBSERVED` | 満たせる。**exit code と文言の両方を見る**（exit 3 は「target が見つからない」全般に使われている可能性があり、server 自体の `not found` と区別できるかは未確認） |
+| `record_existence(name, record, timeout)` | `pane.get` を**記録の server の世代と同じ接続**で流し、`pane_not_found` だけ `PANE_GONE` | `rex block inspect <block_id>` 相当。**問い合わせの前後で `server status` の `instance_id` を読み、記録の世代と同じことを確認する**（Codex r3 P2-3。間で server が入れ替わると、復元された同じ `block_id` の「居る / 居ない」が別の server の答えになる）。前後どちらかが記録と違う・前後で違う・読めない（exit 非 0）は、block の結果に関わらず `PANE_UNOBSERVED`。**実測**: 存在しない block は `Error: block target "…" not found`・**exit 3**。server が居ない（socket 無し）は **exit 4**（`no Rex server is running …`）。→ exit 3 かつ stderr が `not found` のときだけ `PANE_GONE`、他は `PANE_UNOBSERVED`。server の世代が記録と違えば（`instance_id` 不一致）問い合わせず `PANE_UNOBSERVED` | 満たせる。**exit code と文言の両方を見る**（exit 3 は「target が見つからない」全般に使われている可能性があり、server 自体の `not found` と区別できるかは未確認） |
 | `spawn(name, cmd, cwd)` | tab create → rename → `pane run` → 記録 | §3.3 の確認 → `rex run -s <session> --label <name> --cwd <cwd> --focus=false --json -- <cmd>` → `window rename` → 記録（`window_id` / `block_id` / `instance_id` / `child.pid` と `/proc` の starttime）。**cmd は shell 経由か直か**: `rex run` は既定で login shell の環境を通す（`--shell=none` で直接）。crewvia の LAUNCH_CMD は `export …; cd … && claude …` の**シェル文字列**なので `--shell` の既定を使い、`-- bash -c '<LAUNCH_CMD>'`（または start.sh が既に作る形）にする | 満たせる |
 | `last_spawn_refusal`（`SPAWN_OCCUPIED` / `SPAWN_UNREADABLE`） | 同名 pane が居て idle shell でなければ OCCUPIED | 同名の記録 + block が居て `process` の child が idle shell でなければ OCCUPIED。**block は command が終わると消える**（実測、§4.1）ので、「idle shell の husk」は `--keep-open` で作った block か、server 復元後の block（§4.2）にしか生じない | 満たせる（husk の経路は herdr と違う形で残る） |
 | `send(name, text)` | `❯` を待つ → ctrl+u → `pane run` → capture で Enter 保険 | §6 | **弱い**: ctrl+u が複数行を消さない |
@@ -110,7 +110,7 @@ spawn は記録（`write_pane_record`）を server の `(endpoint, generation)` 
 - `instance_id` と `pid` と `started_at` は**変わる**
 - session / block の **ID と label は同じまま復元**される（`block:01a18fa8-2f47-7375-…` が再起動前後で同一）
 - 復元された block の中身は**元の command ではなく login shell**（`capture` が `Welcome to Ubuntu …` を表示・`process` の `child.script` は無い）。元のプロセスは `got 1`（SIGHUP）で終わっていた
-- → herdr の husk pane と同じ形が server 再起動で生じる。`spawn()` の「同名の記録 + idle shell なら中で再実行」は Rex でも要る（再実行は `rex send` で command を打つ形になる＝**Rex には `pane run` 相当の「既存 block で command を走らせる」API があるか未確認**。無ければ block を閉じて作り直す）
+- → herdr の husk pane と同じ形が server 再起動で生じる。`spawn()` の「同名の記録 + idle shell なら中で再実行」は Rex でも要る（再実行は `rex send` で command を打つ形になる＝**Rex には `pane run` 相当の「既存 block で command を走らせる」API があるか未確認**。無ければ**その名前では再利用せず、`SPAWN_OCCUPIED` として Director に返す**。`block close` で作り直さない（§5.1）。husk は §5.3 の SIGHUP で終わらせ、新しい spawn は別の block + 別の記録になる）
 - **ID が復元で保たれる**ので、record の `block_id` は再起動後も有効。herdr は ID が振り直されるので「古い ID が別の pane を指す」危険があったが、Rex は**古い ID が別 block を指すことは無い**（UUIDv7。見込み。再利用の可能性は未確認）。代わりに「同じ ID の中身が別物（login shell）になった」が来るので、**認可は daemon 窓なら既存の `may_destroy_pane`・Worker 窓は §5.2 の `rex_worker_provenance()`**（世代が違えば記録は不一致 → 通常の kill は拒否・空の husk は §5.3 の条件で pidfd の SIGHUP だけ）。ID が保たれるので、**認可の後に `block close` を ID へ送ると復元された別の中身に当たる**（§5.1）。破壊は pidfd にし、`block close` は使わない
 - `--restore=false`（Director の隔離）は「保存した session を使わず、何も保存しない」。本番で `--restore` をどうするかは決めること（§10）
 
@@ -132,8 +132,9 @@ spawn は記録（`write_pane_record`）を server の `(endpoint, generation)` 
 2. **`pidfd_open(pid)` を先に開き**、その後で `/proc/<pid>/stat` の starttime（22 番目）を読んで記録と比べる（開く前に pid が再利用されていたら starttime が違うので拒否。開いた後は pidfd がその実体に固定される）
 3. ppid が `server status` の `pid` と同じ（server の直下の子）
 4. **本人確認**（下の「Worker の本人確認」）。daemon 窓（`DAEMON_PANE_NAMES`）だけ既存の `may_destroy_pane(name, "rex", <記録の window_id>, pid, server=(endpoint, generation))` も通す。**handle は記録の `handle` = `window_id`**（§3.2）。`pane_record_status` は渡された handle を `record["handle"]` と**そのまま比べる**ので、`block_id` を渡すと正しい server でも MISMATCH になり通常の kill が全部拒否される
-5. 全部通ったら pidfd にシグナル: SIGHUP → 待つ → SIGTERM → 待つ → SIGKILL。待つのは pidfd の読み取り可能（終了）か、`pidfd_send_signal(fd, 0)` の ESRCH
-6. block はプロセスの終了で消える（§4.1）ので **`block close` を呼ばない**。消えずに殻が残ってもそのまま残す（§5.3）
+5. **信号の前に子孫を列挙して固定する**（Codex r3 P2-1。`child.pid` だけを終わらせると、Claude Code が起こした MCP server・tool の子プロセス・`bash -c` の背景 job が孤児として残る。親が先に死ぬと ppid が 1 に付け替わり、後から木をたどれない）。手順: 親の pidfd を開いた**直後・信号の前**に `/proc/*/stat` を 1 回走査し、`child.pid` を根に ppid で推移的に集める（`child.pid` は session leader なので、同じ `sid` のプロセスも加える。`setsid` で外れた子は sid では拾えないが ppid の鎖では拾える）。見つけた各プロセスについて **pidfd_open → その後に starttime を読み直して列挙時の値と比べる**（違えば pid が再利用されたので対象から外す）。以後の信号はこの pidfd 群にだけ送る。列挙は 1 回では取りこぼす（走査中の fork）ので、**各段階（HUP / TERM / KILL）の前に、まだ生きている pidfd の子孫を同じ手順で再走査して足す**。KILL の後、親と全子孫の pidfd が終了するまで待ち、残れば kill は**失敗として返す**（成功にしない）
+6. 全部通ったら pidfd 群にシグナル（葉 → 根の順）: SIGHUP → 待つ → SIGTERM → 待つ → SIGKILL。待つのは pidfd の読み取り可能（終了）か、`pidfd_send_signal(fd, 0)` の ESRCH
+7. block はプロセスの終了で消える（§4.1）ので **`block close` を呼ばない**。消えずに殻が残ってもそのまま残す（§5.3）
 
 **Worker の本人確認 `rex_worker_provenance()`（RexBackend 側・新規。`may_destroy_pane` の代わりではなく、それが Worker に何も言わないのを補う）**。比べるのは**2 回の生の読みどうしではなく、spawn 時に書いた記録との一致**:
 
@@ -166,7 +167,7 @@ spawn は記録（`write_pane_record`）を server の `(endpoint, generation)` 
 - **`block close` は破壊の経路から外す**（Codex r2 P1。穴埋めでなく設計で閉じる）。『プロセスが無い殻』と観測してから close するまでの間に server が再起動すると、復元された同じ `block_id` は**生きた login shell**になっている（§4.2）。close は「検査した世代のときだけ」の条件を渡せない（§5.1）ので、この窓は close を使う限り塞げない。**殻（`child` が無く `last_exit` がある block）は消さずに残す**。残っても害は無い（プロセスが無く、次の spawn は別の block）。掃除は crewvia では行わず、利用者が手で `rex block close` / `rex kill` する（§10.2 に決めることとして残す）。window が残るので `list` は殻を『居る』と数えうる点は PR-2 で棚卸し（`worker-vanish` の判定は block の `child` の有無も見る）
 - 退役 checkpoint では pane の capture は kill の**前**（下）
 
-**未確認**: 復元された shell への SIGHUP で block が消えるか残るか。観察では `rex run -- sleep` を KILL した block が `last_exit: signal: killed` で**残った**例（`rex run -s <既存 session>` の直接 command）と、`bash -c` / `exit 0` / `exit 7` では**消えた**例の両方があり、条件を特定していない（§4.1 の『消える』は後者）。どちらでも手順は成り立つ（残れば殻なので close）。
+**未確認**: 復元された shell への SIGHUP で block が消えるか残るか。観察では `rex run -- sleep` を KILL した block が `last_exit: signal: killed` で**残った**例（`rex run -s <既存 session>` の直接 command）と、`bash -c` / `exit 0` / `exit 7` では**消えた**例の両方があり、条件を特定していない（§4.1 の『消える』は後者）。どちらでも手順は成り立つ（残れば殻として残す。close しない）。
 
 ### 5.4 server の世代の扱い
 
@@ -289,7 +290,9 @@ spawn は記録（`write_pane_record`）を server の `(endpoint, generation)` 
   2. 空の block_id で `rex send` を呼ばない（stdin を読んで止まらない）・全呼び出しに timeout
   3. `kill`（通常）: 記録の `child.pid` / starttime / ppid の不一致で拒否。pid の再利用（同じ pid で starttime 違い）の模擬。**`block close` を破壊にも husk の殻の掃除にも使っていないこと**（`rex` stub に block close が来たら失敗する）。Worker の記録の世代違いで拒否・handle に `block_id` を渡すと赤。ctypes の pidfd（uv 版 python で `os.pidfd_open` 無し）で動く・pidfd が使えないと拒否。TERM と HUP を無視するプロセスが KILL まで届く
   3b. `kill`（再起動後）: `--restore` ありの隔離 server を再起動し、①世代不一致の記録で通常の kill が拒否される ②空の husk は許可され SIGHUP で終わる ③**復元された shell に子（`sleep`）を起動させてから kill を呼ぶと拒否される** ④検査と SIGHUP の間に子を起動させる競合を注入して届く先がその shell に限られること
-  4. `record_existence`: exit 3 + `not found` だけが `PANE_GONE`。server が居ない（exit 4）は `PANE_UNOBSERVED`
+  3c. 子孫: Worker の block で `bash -c 'sleep 600 & sleep 600 & wait'` と `setsid sleep 600` を起こし、**親（`child.pid`）を先に SIGKILL した状態**と通常の kill の両方で、kill 後に子孫が 1 つも残らないこと（`/proc` で starttime つきに確認）。列挙と信号の間に fork する競合を注入して、再走査で拾えること。pid の再利用（starttime 違い）の子孫には信号が届かないこと。残った場合 kill が成功を返さないこと
+  3d. 殻: `child` の無い殻と同名 label の新しい生きた block が並ぶとき、spawn が拒否されず、`send` / `kill` が記録の `block_id` の側（新しい block）にだけ届き、殻には届かないこと。生きた同名 block が 2 つなら曖昧として拒否
+  4. `record_existence`: exit 3 + `not found` だけが `PANE_GONE`。server が居ない（exit 4）は `PANE_UNOBSERVED`。**競合**: 問い合わせの間に server を再起動（`instance_id` が前後で変わる）する注入で、block が復元されていても居なくても `PANE_UNOBSERVED` になること。記録の世代と違う server に問い合わせない
   5. server 再起動後（§4.2）に husk の再利用が動くこと（`--restore` ありの隔離 server で）
   6. `send` の複数行・日本語・長文・65536 超（`False`）・paste イベント。**Claude Code の入力欄に残った複数行を掃除する方法を実測で決める**（§6.3）。決まるまで「空でなければ Enter を打たない」
   7. `api_revision` が想定外・`server status` が読めない → `available()` False（§7）

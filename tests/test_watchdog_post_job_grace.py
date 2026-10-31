@@ -80,7 +80,7 @@ def test_activity_after_the_job_resets_the_clock_as_usual(tmp_path, monkeypatch)
     m.check_detail()
     m.box["signal"] = "idle_process"
     clock.advance(IDLE * 2 + 100)
-    _write_activity(tmp_path, age_seconds=-clock.offset + 1)   # Worker が動き出した
+    _write_activity(tmp_path, age_seconds=1)   # Worker が動き出した
     assert m.check_detail().verdict == "alive"
 
 

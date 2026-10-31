@@ -1043,3 +1043,38 @@ Codex の指摘は 4 巡続き、どれも「episode を watchdog が回復を�
 ### 検証
 
 `tests/test_background_work_is_not_idle.py::test_default_ceiling_covers_a_one_hour_ci_wait` (既定 ≥ 65 分・≤ 2 時間、55 分見えている job は黙る)。既存の「上限前は黙る / 上限超えは通知」は定数基準なので既定が変わっても同じ意味で通る (41 件 pass)。赤の実証: 既定を 1800 に戻すと新テスト 1 件が赤 (1 failed, 40 passed)。
+
+## 13. job が終わった直後の hard_idle: 無音の起点を「executing を最後に見た時刻」にする (t001, 2026-10-31)
+
+### 起きたこと (2026-10-30, mission 20261030-ops-small-four)
+
+t004 の Astrid の CI 待ち (`run_in_background`) が終わった最初のサイクルで `idle observed_seconds=3854 > limit 600` → 退役 marker → TERMINATE_MESSAGE → SIGTERM。done の直前だった (Director の send で間に合った)。t003 の Sofia も同じ。
+
+原因: `check_detail()` の無音 (`now - _last_activity_mtime()`) は job を見送っている (`executing`) 間も進む。job が消えて process_signal が executing でなくなった最初のサイクルで、待った時間ぜんぶが無音として `idle_threshold * 2` を超え、即 `terminate`。Worker が job の完了を受けて動き出す前に判定されていた。
+
+### 直し方
+
+- `WorkerMonitor._executing_seen_at` (メモリだけ): `process_signal == "executing"` を観測したサイクルの時刻。
+- **executing でも unknown でもない** (`idle_process` / `no_process`) サイクルだけ、`silence = min(生の無音, now - _executing_seen_at)` を soft / hard の判定に使う。job が消えた後も Worker が本当に動かなければ、その時間が `idle_threshold * 2` を超えた時点で今までどおり terminate (worker-silent-stall が job の後に起きても届く)。
+- 生の無音なら hard_idle だが猶予で救われているサイクルは `alive` / reason `post_job_grace` (新しい値。grep 用)。soft_idle の範囲に入れば従来どおり `warn soft_idle`。
+- `max_threshold` (絶対上限) は判定の前段にあり変えない。猶予は黙る方向の延長にならない。
+
+### `unknown` / `awaiting_human` は同じ穴か
+
+- **`unknown` は変えない**。活動扱いにすると §11 の 10.5h 停止に戻る。unknown の間は起点を動かさず、無音は生の値のまま (`hard_idle_but_process_unknown`)。unknown → job 消滅の場合は、それ以前に executing を観測していれば猶予が効く (executing の観測は本物の job を見た証拠)。
+- `awaiting_human` は通知 (mtime) 自体が `_last_activity_mtime()` の候補なので、無音の時計がその時点から数え直される。穴はない。
+
+### 起点の持ち方と失われたとき
+
+- 持ち主は `WorkerMonitor` (mission, task) 単位。task が in_progress でなくなる・terminate で捨てられると消え、同じ Worker 名の次の試行は新しい monitor で `None` から始まる (持ち越さない。`suppression_ident` / Execution ID の単位と同じ寿命)。
+- watchdog の再起動 (`lib_daemon_watch.py restart`) で失われる → `None` = 今までと同じ判定。再起動の間に job が消えていたら従来どおり即 terminate になりうる (悪化はしないが直らない)。job がまだ走っていれば次のサイクルで再び executing を記録するので猶予は復活する。永続化はしない (読めない・古い値を信じる経路を増やさないため)。
+
+### 通知・observations の値の意味
+
+- 見送り通知 (`hard-idle-suppressed`): 対象は warn の executing / unknown / awaiting_human で、executing の間の `idle_seconds` は生の値のまま。台帳の fp の起点 (`suppression_origin` = `idle_since`) も生の activity の mtime のまま。変わらない。
+- 通知文の `無音 Ns` と判定の値: 通知の `無音` は `detail.idle_seconds` = **生の無音** (最後の活動から)。猶予の判定に使うのは job 消滅後の無音で、こちらはどこにも出さない。したがって `idle_seconds` が 3854 で verdict が `alive` (reason `post_job_grace`) という行が observations に出うる。
+- 新しい reason は `post_job_grace` だけ。
+
+### 検証
+
+`tests/test_watchdog_post_job_grace.py` (9 件): executing → 消滅の直後は terminate しない / 消滅後しきい値超過で terminate / job なしの無音は従来どおり / max は猶予の外 / 再起動後 / 次の試行に持ち越さない / unknown は活動扱いにならず起点を動かさない / 見送り通知の起点は生のまま。赤の実証: 猶予を無効化 (`if post_job < silence:` → `if False:`) で 2 件赤、unknown を猶予に含める変異で 1 件赤。

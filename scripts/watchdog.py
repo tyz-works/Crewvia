@@ -332,6 +332,14 @@ class WorkerMonitor:
         #: 上限を過ぎてもなお利用枠切れの表示が続いている (通常の判定に戻した) ときの通知用 fp
         self._limit_overdue_fp: Optional[str] = None
 
+        #: t001 (§13): `process=executing` を最後に観測した時刻。**メモリだけ**に持つ (monitor は
+        #: (mission, task) ごとに作られ、task が in_progress でなくなる / terminate で捨てられる
+        #: ので、次の試行・同名の別 Worker には持ち越されない。watchdog の再起動で失われるが、
+        #: そのときは None = 今までと同じ判定 = 殺す側 (安全側ではなく従来どおり) に戻るだけ)。
+        #: job が消えた最初のサイクルで、待っていた時間ぜんぶを無音と数えて即 hard_idle に
+        #: ならないよう、job 消滅後の無音だけを hard_idle / soft_idle の判定に使う起点。
+        self._executing_seen_at: Optional[float] = None
+
     # ------------------------------------------------------------------
     # Signal detection helpers
     # ------------------------------------------------------------------
@@ -860,7 +868,21 @@ class WorkerMonitor:
             # 利用枠切れ: 止まっているのは Worker の不調ではない。idle では終了しない。
             return CheckResult("alive", "usage_limit", idle_seconds, process_signal, awaiting_human)
 
-        if idle_seconds > self.idle_threshold * 2:
+        # t001 (§13): job (executing) を見送っていた間も無音の時計は進む。job が消えた最初の
+        # サイクルでそれを丸ごと無音と数えると、Worker が job の完了を受けて動き出す前に
+        # terminate する。job が消えた後 (executing でも unknown でもない) の判定だけ、
+        # 最後に executing を観測した時刻からの無音を使う。`unknown` は活動扱いにしない
+        # (§11: 10.5h 停止に戻る) ので起点を動かさず、unknown の間は従来どおり生の idle。
+        if process_signal == "executing":
+            self._executing_seen_at = now
+        silence = idle_seconds
+        grace = False
+        if process_signal not in ("executing", "unknown") and self._executing_seen_at is not None:
+            post_job = max(now - self._executing_seen_at, 0.0)
+            if post_job < silence:
+                silence, grace = post_job, True
+
+        if silence > self.idle_threshold * 2:
             # プロセス層が terminate を抑制するケース。理由をログで区別できるよう
             # 別々の reason にする ("実行中だから見送った" と "見えないから見送った"
             # は運用上まったく別の話なので、まとめると原因調査ができない)。
@@ -879,8 +901,12 @@ class WorkerMonitor:
                 )
             return CheckResult("terminate", "hard_idle", idle_seconds, process_signal, awaiting_human)
 
-        if idle_seconds > self.idle_threshold:
+        if silence > self.idle_threshold:
             return CheckResult("warn", "soft_idle", idle_seconds, process_signal, awaiting_human)
+
+        if grace and idle_seconds > self.idle_threshold * 2:
+            # 生の無音なら hard_idle だが、job が消えて間もない。猶予の間は殺さない。
+            return CheckResult("alive", "post_job_grace", idle_seconds, process_signal, awaiting_human)
 
         return CheckResult("alive", "active", idle_seconds, process_signal, awaiting_human)
 

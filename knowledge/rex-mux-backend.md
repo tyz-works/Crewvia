@@ -9,7 +9,7 @@ herdr に代わる mux として Rex（https://www.superlogical.com/rex/docs/）
 
 ## 1. 結論（先に）
 
-1. Rex で `_Backend` の全メソッドを満たせる。**満たせない・弱くなるのは 3 点**: ① label が一意でない（§3）② kill を「検査した server に束縛」する手段が herdr の `SO_PEERCRED` 接続ほど強くない（§5）③ `state()`（agent の working / idle）に当たる情報が無い（§4）
+1. Rex で `_Backend` の全メソッドを満たせる。**満たせない・弱くなるのは 3 点**: ① label が一意でない（§3）② `block close` には「検査した世代・プロセスのときだけ」の条件が渡せない（§5.1）。**破壊は block でなく検査済みプロセスへの pidfd シグナルにする**（§5.2）③ `state()`（agent の working / idle）に当たる情報が無い（§4）
 2. 最大の設計判断は **label の一意性を Rex が保証しない**こと。名前 ↔ block_id の正本は **crewvia 側の spawn 記録（`registry/mux/<name>.json`）** にし、label は人間向けの表示 + 補助の照合に下げる（§3）
 3. send は herdr と**使い分けが違う**。`rex send` は生のテキスト（`\n` はそのまま改行）、Enter は `send-key enter`（`\r`）。複数行は paste イベント（`block.event`）で bracketed paste にできる。**ctrl+u は複数行の入力欄を 1 行ずつしか消さない**（実測。herdr の「送信前に ctrl+u」はそのまま移せない。§6）
 4. Rex の pane は **server の env を継承する**（実測）。herdr と同じ「server 起動時の env 掃除」が要る（§8）
@@ -89,7 +89,7 @@ spawn は記録（`write_pane_record`）を server の `(endpoint, generation)` 
 | `keys(name, keys)` | `pane send-keys`（`translate_keys` の herdr 列） | `rex send-key -b <block> <KEY>…`。`_KEY_NAMES` に Rex の列を足す: `up` / `down` / `left` / `right` / `enter` / `escape` / `tab`（Rex の key 構文。**実測**: `enter` → `\r`・`ctrl+c` → `\x03`・`escape` → `\x1b`・`up` → `\x1b[A`・`ctrl+u` → `\x15`） | 満たせる |
 | `capture(name)` | `pane read --source visible` | `rex capture -b <block> --trim`。**実測**: 画面 + scrollback（Director の測定では約 64MiB。自分では再現していない）。生きている間と `--keep-open` の終了後は読める。**block が閉じた後は読めない**（exit 3） | 満たせる |
 | `list(suffix)` | `pane list` を live で | `rex block ls -s <session> --json` の `label`（`_caller_name` で prefix を外す）。重複は §3.3-3 | 満たせる |
-| `kill(name, allow_foreign)` | `may_destroy_pane` → `tab.close` を検査した接続に束縛 | §5 | 満たせる（束縛は弱い） |
+| `kill(name, allow_foreign)` | `may_destroy_pane` → `tab.close` を検査した接続に束縛 | §5（通常の kill = pidfd で検査済みプロセスへ・husk は別の経路。`block close` は殻だけ） | 満たせる（破壊は pidfd シグナル。§5.2） |
 | `pid(name)` | shell pid（`process-info`） | `process` の **`child.pid`**（block の子プロセス。**実測**: `ppid` = server の pid・自身が session leader） | 満たせる |
 | `attach(name)` / `attach_cmd(name)` | `tab focus` / `["herdr"]` | `rex window focus <window>`（**未確認**: 実行していない）/ `["rex", "-S", <endpoint>]`（引数なしの `rex` が TUI client を開くかは**未確認**） | 未確認 |
 | `available()` | herdr の CLI と socket の ping | `rex` が PATH にある ∧ `rex -S <endpoint> --autostart=false server status --json` が exit 0 ∧ `api_revision` が想定内（§7） | 満たせる |
@@ -111,34 +111,66 @@ spawn は記録（`write_pane_record`）を server の `(endpoint, generation)` 
 - session / block の **ID と label は同じまま復元**される（`block:01a18fa8-2f47-7375-…` が再起動前後で同一）
 - 復元された block の中身は**元の command ではなく login shell**（`capture` が `Welcome to Ubuntu …` を表示・`process` の `child.script` は無い）。元のプロセスは `got 1`（SIGHUP）で終わっていた
 - → herdr の husk pane と同じ形が server 再起動で生じる。`spawn()` の「同名の記録 + idle shell なら中で再実行」は Rex でも要る（再実行は `rex send` で command を打つ形になる＝**Rex には `pane run` 相当の「既存 block で command を走らせる」API があるか未確認**。無ければ block を閉じて作り直す）
-- **ID が復元で保たれる**ので、record の `block_id` は再起動後も有効。herdr は ID が振り直されるので「古い ID が別の pane を指す」危険があったが、Rex は**古い ID が別 block を指すことは無い**（UUIDv7。見込み。再利用の可能性は未確認）。代わりに「同じ ID の中身が別物（login shell）になった」が来るので、**kill の認可は「記録 AND 占有者」の二重の証明のまま**（`may_destroy_pane` が既にそうしている）で足りる
+- **ID が復元で保たれる**ので、record の `block_id` は再起動後も有効。herdr は ID が振り直されるので「古い ID が別の pane を指す」危険があったが、Rex は**古い ID が別 block を指すことは無い**（UUIDv7。見込み。再利用の可能性は未確認）。代わりに「同じ ID の中身が別物（login shell）になった」が来るので、**認可は既存の `may_destroy_pane` のまま**（世代が違えば記録は MISMATCH → 通常の kill は拒否・空の husk だけ「空であること」で許可。§5.3）。ただし ID が保たれるので、**認可の後に `block close` を ID へ送ると復元された別の中身に当たる**（§5.1）。破壊は pidfd にする
 - `--restore=false`（Director の隔離）は「保存した session を使わず、何も保存しない」。本番で `--restore` をどうするかは決めること（§10）
 
 ## 5. kill の本人確認（watchdog が唯一の実行者）
 
-`knowledge/daemon-authority.md`: Worker の終了は watchdog だけが実行する。Rex でもこの前提は変えない。`RexBackend.kill()` が通す関門:
+`knowledge/daemon-authority.md`: Worker の終了は watchdog だけが実行する。Rex でもこの前提は変えない。
 
-1. **記録の `block_id` / `window_id`** を正本にする（名前で再解決しない。label は誰でも付けられる＝§3.1）
-2. **server の世代**: `server status --json` の `instance_id` が記録のそれと一致（§4.2 の通り ID は保たれるので「世代が違う」だけでは拒否にしないが、**一致しない場合は占有者の証明を必須にする**）
-3. **プロセスの本人確認**: `process` の `child.pid` が (a) 記録した `child.pid` と同じ ∧ (b) `/proc/<pid>/stat` の starttime（22 番目の欄）が記録と同じ ∧ (c) ppid が `server status` の `pid` と同じ。
-   **実測**: `child.pid 1453685` の `ppid` = server pid `1447392`・starttime は `14963234`。pid の再利用は starttime で弾ける（herdr の `<pid>:<starttime>` と同じ考え）
-4. **占有者**: `pid()` の結果を `daemon_pane_owner` / `may_destroy_pane` にそのまま渡す（dispatcher / watchdog の foreign 判定は `/proc` 側の仕事で backend 非依存）
-5. 全部通ったら `rex block close <block>`（block を閉じると window も閉じる。window に他の block を足さない設計なので 1 block = 1 window）
+### 5.1 `block close` は検査に束縛できない（実測・第 1 版の K1 を撤回）
 
-**kill の挙動（実測）**: SIGHUP を無視する python（`sigrec.py`。SIGHUP / SIGTERM のハンドラで `sig.txt` に書く）を block で動かして `block close` した。
-`block close` は約 1.0 秒で返り、プロセスは **SIGHUP を 1 回受け**（`got 1`。SIGTERM は受けていない）、**3 秒後には居なかった**。つまり HUP を握りつぶしても消える（強制終了に切り替わる。正確な猶予と最終シグナルは**未確認**だが SIGKILL と見込む）。
-herdr の「tab close で子が SIGHUP を受けて 2 秒以内に終わる」より強い（無視しても残らない）。ただし claude が自分の子を残す場合は `/proc` の後始末（`lib_daemon_watch` の descendants）が要る点は herdr と同じ。
+第 1 版は「CLI 2 本（`process` → `block close`）で、前後に `instance_id` を読む」を推奨していた。**これは成り立たない**（Codex r1 P1）。確認と close の間に server が再起動すると、**復元された同じ `block_id`**（§4.2 で ID は保たれる）に close が届く。復元された login shell が空だったことは、その後も空である保証にならない（別の spawn や利用者が処理を始めうる）。close の後に世代を読んでも取り消せない。第 1 版の「残る窓は空の login shell に限られる」という根拠は**撤回する**。
 
-**束縛の弱さ（満たせない点の②）**: herdr は `tab.close` を、**検査したのと同じ接続**（kernel が `SO_PEERCRED` で名指した peer）に流す。`rex` の CLI は 1 コマンド = 1 接続で、検査（`process`）と破壊（`block close`）が別の接続になる。
-Rex の制御 API は unix socket 上の WebSocket（`/api/control`。エラー文に `failed to WebSocket dial … Get "http://rex/api/control"` と出る）なので、herdr と同じ作りに**できなくはない**が、WebSocket の握手を python で実装する必要があり、API revision への依存も増える。選択肢:
+`rex api describe block.close`（API revision 9）の入力は `session_id`（必須）・`block_id` または `window_id`・`keep_last`（window の最後の block を閉じない）**だけ**。「この instance_id / この pid のときだけ」という条件は渡せない。つまり **`block.close` を破壊の手段にする限り、検査と破壊は束縛できない**（WebSocket で 1 接続にしても、条件の引数が無いので同じ。K2 も『検査した接続への束縛』にはなるが、server が入れ替わった接続を弾くだけで、復元された block の中身は区別できない）。
 
-| 案 | 内容 | 評価 |
+### 5.2 束縛するのは block でなくプロセス（pidfd）
+
+破壊を「**検査したプロセスそのもの**へのシグナル」にする。Linux の pidfd は pid の再利用に影響されない。
+
+1. `process` → `child.pid`（pid を得る）
+2. **`pidfd_open(pid)` を先に開き**、その後で `/proc/<pid>/stat` の starttime（22 番目）を読んで記録と比べる（開く前に pid が再利用されていたら starttime が違うので拒否。開いた後は pidfd がその実体に固定される）
+3. ppid が `server status` の `pid` と同じ（server の直下の子）
+4. `may_destroy_pane(name, "rex", block_id, pid, server=(endpoint, generation))`（**既存のまま**。§4 の表）
+5. 全部通ったら pidfd にシグナル: SIGHUP → 待つ → SIGTERM → 待つ → SIGKILL。待つのは pidfd の読み取り可能（終了）か、`pidfd_send_signal(fd, 0)` の ESRCH
+6. block はプロセスの終了で消える（§4.1）ので **`block close` を呼ばない**
+
+**実測（隔離 server・API revision 9）**:
+- SIGHUP と SIGTERM を両方無視する python の block: pidfd で SIGTERM → 1.5 秒後も**生存**・続けて SIGKILL → 1 秒後に消滅。ESRCH（errno 3）は死んだ後の pidfd への送信で返る。直後の `capture -b` は exit 3（block target not found）
+- starttime は記録時と一致（`15419839`）
+- **python の版に注意**: `/usr/bin/python3.12`（3.12.3）は `os.pidfd_open` / `signal.pidfd_send_signal` を持つが、crewvia の shim が解決する uv 版 3.12.13 は**持たない**（`hasattr` が両方 False）。`scripts/lib_mux.py` は shim の python で動くので、**`ctypes` の `syscall(434, pid, 0)`（pidfd_open）/ `syscall(424, fd, sig, None, 0)`（pidfd_send_signal）を使う**。この番号は x86_64 と aarch64 で共通（実測は x86_64 のみ）。ctypes でも pidfd を開けて、TERM→KILL が通った（上記）
+- pidfd が使えない（kernel < 5.3・syscall の失敗）は **kill を拒否**する（fail-closed。シグナルの pid 指定へ倒さない）。WSL2 6.18 では動いた
+
+### 5.3 通常の kill と、再起動後の husk（分けて書く・Codex r1 P2）
+
+既存の `may_destroy_pane`（`scripts/lib_mux.py`）は変えない。その挙動をそのまま使うと次の 2 つに分かれる。
+
+| | 通常の kill | 再起動後の husk |
 |---|---|---|
-| K1（**推奨・PR-1**） | CLI 2 本（`process` → `block close`）。直前と直後に `instance_id` を読み、**一致しなければ close しない/結果を信用しない**。close は block_id 指定なので、server が入れ替わっても UUID は別 block に当たらない（§4.2） | herdr の「ID が振り直されて別 pane に当たる」穴は Rex では ID の性質で塞がる（見込み）。残る窓は「検査した後に同じ ID の中身が入れ替わる」だけで、それは再起動直後の login shell（空）に限られる |
-| K2（後続） | WebSocket 制御 API を直接叩き、検査と close を 1 接続に束縛 | 強い。ただし実装・テストが大きい（herdr の束縛は Codex 6〜8 巡目の産物）。PR-1 では入れない |
+| 状況 | server の `instance_id` が記録と同じ | server が再起動した（`instance_id` / pid が違う）。block は復元された login shell |
+| `pane_record_status` | MATCH（`_server_binding_problem` が通る） | **MISMATCH**（世代不一致。第 1 版の『一致しなければ占有者の証明で許可』は**削除**。既存ガードはそう動かない） |
+| 許可の根拠 | 記録 AND 占有者（`_OWNERS_THAT_CONFIRM_A_RECORD`） | **空であること**（`_OWNERS_THAT_PROVE_EMPTY`。記録なしで立つ、herdr の再起動 husk と同じ経路） |
+| 記録の `child.pid` / starttime との一致 | **必須**（§5.2 の 2） | **要求しない**（復元された shell は別の pid。記録は古い）。代わりに「今の pid は server の直下の子・shell である・子孫が居ない」を pidfd を開いた**後**に確認 |
+| 破壊 | pidfd で TERM/KILL | pidfd で **SIGHUP**（shell は hangup で終わる）。block が残れば（プロセスが無い殻）`block close` |
 
-**退役の checkpoint（PR #323）との関係**: `lib_retirement._start` が通知の前に `mux.capture` で pane を撮る手順はそのまま使える（`capture` は生きている間だけ読める＝§4.1 なので **kill の前に撮る順序は Rex でも必須**。`--keep-open` にすれば死後も撮れるが、既定は使わない）。
+- 第 1 版の §5-3『記録済み child.pid / starttime との必須一致』は復元 shell で成立しない。**通常の kill にだけ課し、husk には課さない**
+- husk は『何も持たない shell』にだけ向ける。判定（子孫が居ない）は pidfd を開いた後に行い、シグナルも同じ pidfd に送るので、**検査した実体と違うものには届かない**。残る窓は「検査から SIGHUP までの間に、利用者がその shell で処理を始める」ことだけで、届く先はその shell（と、その間に起こした子）。crewvia 自身は spawn 記録のロックの中で動くので、この窓を作るのは外の利用者の手入力に限られる。**これは完全には塞げない**として §10 に残す
+- `block close` を最後に呼べるのは『プロセスが無い殻』だけ（`process` に `child` が無く `last_exit` がある）。殻には処理が始まりようが無い（新しい処理は新しい spawn で、別の block になる）
+- 退役 checkpoint では pane の capture は kill の**前**（下）
+
+**未確認**: 復元された shell への SIGHUP で block が消えるか残るか。観察では `rex run -- sleep` を KILL した block が `last_exit: signal: killed` で**残った**例（`rex run -s <既存 session>` の直接 command）と、`bash -c` / `exit 0` / `exit 7` では**消えた**例の両方があり、条件を特定していない（§4.1 の『消える』は後者）。どちらでも手順は成り立つ（残れば殻なので close）。
+
+### 5.4 server の世代の扱い
+
+- spawn 記録の `server.generation` は `"<instance_id>:<pid>"`（§4）。**世代が違う記録で通常の kill はしない**（`may_destroy_pane` が拒否する。再起動後は husk の経路か `--force`）
+- `kill` の直前に `server status` で世代を読み、pidfd を開いた後にもう一度読む。違えば何も送らない（pidfd が固定した実体は変わらないが、世代が変わったなら記録の意味が変わったので Director に返す）
+
+### 5.5 退役の checkpoint（PR #323）との関係
+
+`lib_retirement._start` が通知の前に `mux.capture` で pane を撮る手順はそのまま使える（`capture` は生きている間だけ読める＝§4.1 なので **kill の前に撮る順序は Rex でも必須**。`--keep-open` にすれば死後も撮れるが、既定は使わない）。
 `meta.json` の `files.pane.source` の固定コード（`before_kill` / `live` / `capture_error` / `capture_empty` / `window_gone`）は変えない。`window_gone` は Rex では「block が消えた（exit 3）」で出る。
+
+**同じ window に block を足さない設計**（1 block = 1 window）なので、プロセスが死んで block が消えたとき window も消える（観察: 直前の 3 例）。session だけが残る例があった（`rex new` で作った単独の session は `ls` に残った）ので、`crewvia` session 1 本 + window 方式（§3.2）なら session は残ってよい。
 
 ## 6. send の実測
 
@@ -235,7 +267,7 @@ Rex の制御 API は unix socket 上の WebSocket（`/api/control`。エラー�
 2. **`--restore` の既定**（server 再起動で session / block を復元する。復元された block は login shell の husk になる＝§4.2。推奨: 既定のまま `true`＋spawn が husk を再利用。`false` だと再起動で window が全部消え、ユーザーの目には「何も無い」）
 3. **上限**（`--max-sessions` / `--max-blocks` / `--max-windows` / `--max-panes`）を明示するか（既定: 64 / 1024 / 64 / 64。Worker 数の想定では既定で足りる。推奨: 既定のまま）
 4. **PR-2 で `state()` が unknown 固定でよいか**（Rule 5 / hard_idle の入力に `state` を使っている箇所を棚卸しして、使っていなければ問題なし。使っていれば capture ベースの代替を設計する）
-5. **K2（束縛を WebSocket API で強化）を後続にするか**（§5。推奨: K1 で出して様子を見る）
+5. **husk の kill の残る窓**（§5.3: 検査から SIGHUP の間に利用者がその shell で処理を始める）を受け入れるか。許容できないなら『restore を使わない（`--restore=false`）』と組み合わせて husk を作らない（推奨: server を落としたら session ごと作り直す）。K2（WebSocket 束縛）は `block.close` に条件が無いので、この窓は塞がない
 
 ## 11. 実装の PR 分割案と各 PR の QA 項目
 
@@ -246,7 +278,8 @@ Rex の制御 API は unix socket 上の WebSocket（`/api/control`。エラー�
 - QA 項目:
   1. label の重複（同名 block を 2 つ作った状態）で `spawn` / `kill` / `list` が曖昧として拒否すること（§3.3）
   2. 空の block_id で `rex send` を呼ばない（stdin を読んで止まらない）・全呼び出しに timeout
-  3. `kill`: 記録の `child.pid` / starttime / ppid の不一致で拒否。pid の再利用（同じ pid で starttime 違い）の模擬
+  3. `kill`（通常）: 記録の `child.pid` / starttime / ppid の不一致で拒否。pid の再利用（同じ pid で starttime 違い）の模擬。**`block close` を破壊に使っていないこと**（`rex` stub に block close が来たら失敗する）。ctypes の pidfd（uv 版 python で `os.pidfd_open` 無し）で動く・pidfd が使えないと拒否。TERM と HUP を無視するプロセスが KILL まで届く
+  3b. `kill`（再起動後）: `--restore` ありの隔離 server を再起動し、①世代不一致の記録で通常の kill が拒否される ②空の husk は許可され SIGHUP で終わる ③**復元された shell に子（`sleep`）を起動させてから kill を呼ぶと拒否される** ④検査と SIGHUP の間に子を起動させる競合を注入して届く先がその shell に限られること
   4. `record_existence`: exit 3 + `not found` だけが `PANE_GONE`。server が居ない（exit 4）は `PANE_UNOBSERVED`
   5. server 再起動後（§4.2）に husk の再利用が動くこと（`--restore` ありの隔離 server で）
   6. `send` の複数行・日本語・長文・65536 超（`False`）・paste イベント。**Claude Code の入力欄に残った複数行を掃除する方法を実測で決める**（§6.3）。決まるまで「空でなければ Enter を打たない」
@@ -270,7 +303,7 @@ Rex の制御 API は unix socket 上の WebSocket（`/api/control`。エラー�
 1. 重複した label を `-b <label>` で引いたときの挙動（§3.1）
 2. 複数行の入力欄を空にするキー（§6.3）・paste の直後の Enter・起動直後（`❯` 前）の Enter（§6.4）・長文の paste の畳み（§6.2）
 3. `rex window focus` / 引数なしの `rex` の attach（§4）
-4. `block close` の SIGHUP から強制終了までの猶予と最終シグナル（§5）
+4. `block close` の SIGHUP から強制終了までの猶予と最終シグナル（§5.2 は pidfd で自前に TERM→KILL するので不要になったが、herdr 比較として残す）・復元された shell への SIGHUP で block が消えるか（§5.3）・pidfd の poll による終了待ち（実測は `/proc` と ESRCH のみ）・aarch64 での syscall 番号
 5. 既存 block で command を走らせる API（`pane run` 相当）の有無（§4.2）
 6. exit 3 が「target が見つからない」以外にも使われるか（§4 の `record_existence`）
 7. scrollback の上限（Director の測定 64MiB を自分では再現していない）
@@ -293,3 +326,8 @@ Rex の制御 API は unix socket 上の WebSocket（`/api/control`。エラー�
 | 再起動（`--restore`） | `instance_id` / pid 変更・ID と label は保持・中身は login shell |
 | pane の env | server の env を継承（`CLAUDECODE=1` も）・client の env は渡らない |
 | 後始末 | 隔離 server 3 本（初回・restore 用・env 用）をすべて `server stop` / `kill`・`pgrep` で残り 0・symlink 2 本を `unlink` |
+| `block.close` の引数（r2 で実測） | `session_id`（必須）・`block_id` / `window_id`・`keep_last` のみ。世代・pid の条件は無い |
+| pidfd（r2） | uv 版 python 3.12.13 は `os.pidfd_open` 無し・`/usr/bin/python3.12` は有り。ctypes `syscall(434/424)` で動作。TERM/HUP 無視のプロセスは KILL で消え、死後の pidfd 送信は ESRCH |
+| `block ls --json` | `-A` と併用不可（`requires one session. Pass -s SESSION`） |
+| block の消え方 | `bash -c 'exit 0'` / `exit 7` / KILL した `bash -c sleep` は block ごと消えた。`rex run -- sleep` を KILL した block は `last_exit: signal: killed` で残った（条件は未特定） |
+| 後始末（r2） | 隔離 server を `server stop`、`/tmp/rxq-*` の socket と state dir は `unlink`/`rmdir` |

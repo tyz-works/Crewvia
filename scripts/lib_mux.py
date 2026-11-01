@@ -4826,6 +4826,16 @@ class RexBackend(_Backend):
         return PANE_LIVE if kids else PANE_IDLE
 
     def _record_spawn(self, name, sid, block_id, window_id, status, child) -> bool:
+        # The record binds the block to the server generation read *before*
+        # `rex run`.  Re-read it now: if the server restarted in between, the
+        # block belongs to another generation and must not be called managed.
+        now = _rex_status()
+        if now is None or _rex_generation(now) != _rex_generation(status):
+            self._warn(f"spawn {name!r}: the rex server changed while the "
+                       f"block was being created; no record is written and "
+                       f"the block is unmanaged (block_id={block_id}, "
+                       f"window_id={window_id}) — close it by hand")
+            return False
         start = _rex_start_time(child["pid"]) if child else None
         extra = {"block_id": block_id, "window_id": window_id,
                  "session_id": sid, "instance_id": status["instance_id"]}
@@ -5035,7 +5045,11 @@ class RexBackend(_Backend):
             if box is not None and len(box) == 1 and box[0][1:].strip() == "":
                 return True
             if box is not None:
-                res = _rex_run(["send-key", "-b", block_id, "ctrl+u"])
+                # ctrl+e first: with the cursor at line start ctrl+u deletes
+                # nothing (real text would then look like a suggestion).  If
+                # ctrl+e accepted the suggestion, ctrl+u clears it -> empty.
+                res = _rex_run(["send-key", "-b", block_id, "ctrl+e",
+                                "ctrl+u"])
                 if res is not None and res.rc == 0:
                     time.sleep(0.15)
                     after = _rex_input_box(self._capture_block(block_id))

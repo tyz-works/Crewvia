@@ -1095,6 +1095,46 @@ def test_spawn_that_cannot_write_its_record_is_not_a_success(fake, monkeypatch, 
         child.wait()
 
 
+def test_spawn_is_not_managed_when_the_server_generation_changed_during_run(fake, capsys, monkeypatch):
+    """r4 F2: `rex run` の間に server が入れ替わった (世代が違う) block は管理された spawn と報告しない。"""
+    child = subprocess.Popen(["sleep", "600"])
+    try:
+        label = lib_mux._rex_session_label()
+        fake.set(_spawn_rules(sessions=[{"session_id": "session:S1", "label": label}], blocks=[],
+                              procs={"block:NEW": _proc(child.pid)}))
+        real = lib_mux._rex_status
+
+        def status_after_run():
+            st = real()
+            if st is not None and any(c[0] == "run" for c in fake.calls()):
+                st = dict(st, instance_id="inst-B")      # run の後は別の世代
+            return st
+
+        monkeypatch.setattr(lib_mux, "_rex_status", status_after_run)
+        assert lib_mux._rex_generation(real()) != lib_mux._rex_generation(
+            dict(real(), instance_id="inst-B"))
+        assert not lib_mux.RexBackend().spawn("Zed-worker", "exec sleep 600")
+        err = capsys.readouterr().err
+        assert "block:NEW" in err and "window:NEW" in err
+        assert not (fake.checkout / "registry" / "mux" /
+                    f"{lib_mux._pane_name('Zed-worker')}.json").exists()
+    finally:
+        child.kill()
+        child.wait()
+
+
+def test_clear_input_sends_ctrl_e_before_ctrl_u_in_one_call(fake):
+    """r4 F1: カーソルが行頭だと ctrl+u は何も消さない。行末へ送ってから消す。"""
+    rule = _rule()
+    cand = f"{rule}\n❯ Fix the failing test in foo.py\n{rule}\n"
+    _worker_record(fake)
+    fake.set(_base_rules() + [_blocks_rule(), {"match": ["capture"], "out": cand},
+                              {"match": ["send-key"], "out": ""}, {"match": ["send"], "out": ""}])
+    assert lib_mux.RexBackend().send("Zed-worker", "hello")
+    first = [c for c in fake.calls() if c[0] == "send-key"][0]
+    assert first[-2:] == ["ctrl+e", "ctrl+u"]
+
+
 # ---------------------------------------------------------------------------
 # Codex r2 の指摘の回帰 (F1 走査 / F3 process の正の証拠)
 # ---------------------------------------------------------------------------

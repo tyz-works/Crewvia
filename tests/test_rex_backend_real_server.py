@@ -256,7 +256,15 @@ def test_send_clears_multiline_leftover_and_never_enters_unclean_box(tmp_path, m
 def _send_clears_body(server, b, checkout):
     assert b.spawn("Ivy-worker", "exec claude", cwd=str(REPO_ROOT))
     # 入力欄が出るまで (候補文が出ていれば _rex_input_is_empty は False になる)
-    assert _wait(lambda: lib_mux._rex_input_box(b.capture("Ivy-worker")) is not None, 60)
+    # 入力欄 か 起動時の信頼確認 (未信頼の cwd = QA の隔離 clone で出る。claude 2.1.316 で実測:
+    # `Quick safety check: Is this a project you created or one you trust?` + `❯ No, exit` の選択肢。
+    # 製品側は `❯ No, exit` を入力欄と誤認しない (罫線の間ではない) ので、待ち方の問題)
+    assert _wait(lambda: (lib_mux._rex_input_box(b.capture("Ivy-worker")) is not None
+                          or "Quick safety check" in b.capture("Ivy-worker")), 60)
+    if lib_mux._rex_input_box(b.capture("Ivy-worker")) is None:
+        b.kill("Ivy-worker")
+        pytest.skip("claude shows its trust dialog for this cwd (untrusted checkout); "
+                    "open claude in the checkout once and accept, then re-run")
     rec = _record(checkout, "Ivy-worker")
     bid = rec["block_id"]
     server.rex("send", "-b", bid, "--", "行1 日本語\n行2\n行3", check=True)
@@ -265,6 +273,41 @@ def _send_clears_body(server, b, checkout):
     box = lib_mux._rex_input_box(b.capture("Ivy-worker"))
     assert box is not None and len(box) == 1       # 複数行の残りは無い (空か候補文)
     assert b.kill("Ivy-worker")
+
+
+def test_clear_input_removes_real_text_when_the_cursor_is_at_line_start(tmp_path, monkeypatch):
+    """r4 F1: 行頭カーソル + 入力あり (ctrl+a の後) でも _clear_input は入力を消して空にする
+    (ctrl+u だけだと何も消えず、候補文と見分けがつかない)。本物の claude で実測。"""
+    import shutil
+    if shutil.which("claude") is None:
+        pytest.skip("claude is not installed")
+    server = RealRexServer(real_home=True).start()
+    checkout = make_checkout(tmp_path)
+    monkeypatch.setenv("CREWVIA_REX_SOCK", str(server.sock))
+    monkeypatch.setattr(lib_mux, "_own_repo_root", lambda: checkout)
+    monkeypatch.setenv("CREWVIA_REPO_ROOT", str(checkout))
+    b = lib_mux.RexBackend()
+    try:
+        assert b.spawn("Kit-worker", "exec claude", cwd=str(REPO_ROOT))
+        assert _wait(lambda: (lib_mux._rex_input_box(b.capture("Kit-worker")) is not None
+                              or "Quick safety check" in b.capture("Kit-worker")), 60)
+        if lib_mux._rex_input_box(b.capture("Kit-worker")) is None:
+            b.kill("Kit-worker")
+            pytest.skip("claude shows its trust dialog for this cwd (untrusted checkout)")
+        bid = _record(checkout, "Kit-worker")["block_id"]
+        server.rex("send", "-b", bid, "--", "typed by a human", check=True)
+        server.rex("send-key", "-b", bid, "ctrl+a", check=True)       # カーソルを行頭へ
+        assert _wait(lambda: "typed by a human" in b.capture("Kit-worker"), 5)
+        # ctrl+u だけでは消えない (この実測が ctrl+e を前置する理由)
+        server.rex("send-key", "-b", bid, "ctrl+u", check=True)
+        time.sleep(0.3)
+        assert "typed by a human" in b.capture("Kit-worker")
+        assert b._clear_input(bid) is True
+        box = lib_mux._rex_input_box(b.capture("Kit-worker"))
+        assert box is not None and "typed by a human" not in "".join(box)
+        assert b.kill("Kit-worker")
+    finally:
+        server.stop()
 
 
 def test_husk_after_server_restart_is_rebuilt_and_killed_with_sighup(tmp_path, monkeypatch):

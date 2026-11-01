@@ -226,6 +226,10 @@ spawn は記録（`write_pane_record`）を server の `(endpoint, generation)` 
 
 1. 送る**前**に入力欄が空であることを `capture` で確かめる（`❯` の行が 1 行で、後ろにユーザー文字が無い）。空でなければ **Enter を送らず** `False` を返す（残りの種類によっては ctrl+u を繰り返す「掃除」を試してよいが、**掃除の完了は capture で確認**する）
 2. **複数行の掃除（実測 2026-11-01）**: `send-key ctrl+u` は**1 回で今の行の文字だけ消し、次の 1 回でその行の改行を消す**（3 行 → 6 回で空。`行1 日本語\n行2\n行3` を 4 回打つと 1 行目の文字だけが残り、5 回目で消えて placeholder `❯ Try "…"` が戻った）。`escape` 2 連打（paste した 3 行）も 1 回で全部消えた（1 回目は何も起きない）が、**空の入力欄で Esc Esc を打つと Claude Code の rewind が開きうる**ので使わない。`RexBackend._clear_input()` は「**capture で入力欄が空と確かめるまで ctrl+u を繰り返す**（最大 16 回）」で、空と確かめられなければ **Enter を打たず False**。空の判定は罫線 2 本の間が `❯` 1 行だけで後ろが空、**または**「後ろに文字がある 1 行が ctrl+u を押しても一字も変わらない」（= 候補文）。**候補文の前方一致（`Try "` 等）は使わない**: 候補文は `Try "` で始まるとは限らず、本物の入力も `Try "` で始まりうる。`rex capture` は text では色・dim を出さず（html / vt なら出せるが Claude Code の dim を実機で判定する根拠は未確認）、属性には頼らない。消えたものは入力なので、空になるまで繰り返す。複数行は候補文ではない（ctrl+u で変わらなくても送らない）。
+   **行頭カーソル（r4 F1・実測 2026-11-01、claude 2.1.316）**: `ctrl+a` でカーソルを行頭に置いた状態で `ctrl+u` を押しても、`typed by a human` は一字も変わらず残った（行頭では「カーソルより前」を消すので何も消えない）。これだと本物の入力が「変わらない = 候補文」に見える。そこで `_clear_input` は毎回 `send-key ctrl+e ctrl+u` を **1 回の呼び出し**で送り、行末へ移してから消す。同じ状態で `_clear_input` は入力を消して空にした（`tests/test_rex_backend_real_server.py::test_clear_input_removes_real_text_when_the_cursor_is_at_line_start`）。候補文が `ctrl+e` で確定した場合も次の `ctrl+u` で消えて空になるので結論は同じ。
+
+   **起動直後の画面（r4 F3・実測 2026-11-01、claude 2.1.316）**: 信頼済みの cwd では `▐▛███▛█   Claude Code v2.1.316` のロゴ、罫線、`❯\xa0Try "edit …"`（`❯` の後ろは **NBSP**）、罫線、ステータス行の順で、`_rex_input_box` は 3 秒後から検出できる（版差なし）。**未信頼の cwd（QA の隔離 clone など）では** `Accessing workspace:` + `Quick safety check: Is this a project you created or one you trust?` と選択肢 `❯ No, exit` / `  Yes, I trust this folder` が出て、入力欄の罫線は出ない。`❯ No, exit` は罫線の間にないので入力欄とは認識されない（製品側は正しい）。実 server のテストが 60 秒入力欄を見つけられなかった原因はこのダイアログで、**PR の変更でも版差でもなく待ち方**だった。テストはダイアログを検出したら理由つきで skip する。
+
    **残る窓（r3 F2）**: UI が固まっていて ctrl+u を受け付けない場合、本物の 1 行の入力が「変わらない = 候補文」に見え、送信が走って入力に追記される。ctrl+u が効いているかを capture だけでは確かめられない（確かめる手段は無い）。この窓は受け入れ、`send` の送信後 capture（prefix が入力行に残っていれば Enter を足す）に任せる。
 
 ### 6.4 Enter の別送は要るか

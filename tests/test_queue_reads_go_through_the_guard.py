@@ -196,6 +196,7 @@ GUARDED_READS = [
     # --- lib_mux.py / lib_model.py (t018) --------------------------------
     ("lib_mux.py", "read_pane_record", {"load_json_store"}),
     ("lib_mux.py", "_config_mode", {"read_regular_text_or_unreadable"}),
+    ("lib_mux.py", "_config_rex_endpoint", {"read_regular_text_or_unreadable"}),
     ("lib_model.py", "_parse_yaml_fallback",
      {"read_regular_text_or_unreadable"}),
     # t019: PyYAML がある **通常の** 経路。t018 は fallback 側にだけガードを
@@ -961,6 +962,9 @@ ALLOWED_SUBPROCESS_CALLS = {
     ("lib_mux.py", "_herdr_run_raw", "cmd"): "同上 (JSON に包まない版)",
     ("lib_mux.py", "_herdr_start_server", "_HERDR_CLI['server_start']"):
         "herdr サーバーを起こす",
+    ("lib_mux.py", "_rex_start_server", "_rex_server_command(endpoint)"):
+        "rex server を起こす (`rex server start` / `rex server run --listen`)。argv は固定語彙 + endpoint。"
+        "ファイルを渡さない。env は _rex_server_env() で掃除済み。呼ぶのは rex_ensure_server だけ",
     ("lib_mux.py", "_rex_run", "rex"):
         "`rex [-S <endpoint>] --autostart=false <args>`。rex に block / session を操作させるだけで、"
         "queue / registry のファイルは渡さない。全 rex 呼び出しの唯一の入口 (空の宛先は拒否・timeout・stdin=DEVNULL。"

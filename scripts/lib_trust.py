@@ -281,12 +281,24 @@ _TRUST_DECLINE_WITH_FOOTER_RE = re.compile(
 )
 
 
+# 実物 (Rex 上の claude で capture) の信頼確認ダイアログは選択肢に番号が付かない:
+#   `❯ No, exit` / `  Yes, I trust this folder` / `Enter to confirm · Esc to cancel`
+# 番号なしでも「承認の選択肢 (Yes, I trust this folder / Yes, proceed) と No, exit が
+# 隣り合う 1 組」であることを要求する (どちらが先でも・カーソルはどちらでも)。
+# 無関係な 2 箇所の偶然の一致を避けるため、間の距離を 20 文字以内に絞る。
+_TRUST_UNNUMBERED_PAIR_RE = re.compile(
+    r'(?:[❯›>]\s*)?no,\s*exit\b.{0,20}?(?:[❯›>]\s*)?yes,?\s*(?:i\s*)?(?:trust\s*this\s*folder|proceed)\b'
+    r'|(?:[❯›>]\s*)?yes,?\s*(?:i\s*)?(?:trust\s*this\s*folder|proceed)\b.{0,20}?(?:[❯›>]\s*)?no,\s*exit\b'
+)
+
+
 def screen_shows_trust_dialog(screen):
     flat = ' '.join(str(screen).lower().split())
     return bool(
         _TRUST_ACCEPT_OPTION_RE.search(flat)
         or _TRUST_OPTION_PAIR_RE.search(flat)
         or _TRUST_DECLINE_WITH_FOOTER_RE.search(flat)
+        or _TRUST_UNNUMBERED_PAIR_RE.search(flat)
     )
 
 

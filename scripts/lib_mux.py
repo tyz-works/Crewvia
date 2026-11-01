@@ -4133,7 +4133,7 @@ def _rex_endpoint():
             return False, None, (
                 "CREWVIA_REX_SOCK is set outside a test run — it is a "
                 "test-only override and is not honoured in production")
-        return True, None, ""
+        return _rex_config_endpoint()
     if not sock:
         return False, None, (
             "under test isolation CREWVIA_REX_SOCK must name the test's own "
@@ -4143,6 +4143,72 @@ def _rex_endpoint():
             f"the socket path is longer than {_REX_SOCK_MAX_BYTES} bytes "
             f"(sun_path), so a server could not bind it")
     return True, f"unix://{sock}", ""
+
+
+def _config_rex_endpoint(config_path: Optional[Path] = None):
+    """`(found, value_or_None)` — `rex: endpoint:` from config/crewvia.yaml.
+
+    `(True, None)` is "the file could not be read or parsed" (never "not
+    configured": an unreadable config must not silently send crewvia to Rex's
+    default socket).  `(False, None)` is "no `rex.endpoint` configured".
+    The value is parsed with PyYAML (flow mappings, quoted `#`); a value that
+    is not a string is returned as-is for `_rex_config_endpoint` to refuse.
+    `config_path` is only ever passed by tests.
+    """
+    if config_path is None:
+        config_path = Path(__file__).parent.parent / "config" / "crewvia.yaml"
+    text = read_regular_text_or_unreadable(config_path)
+    if is_missing(text):
+        return False, None
+    if is_unreadable(text):
+        return True, None
+    try:
+        import yaml  # PyYAML — flow 形式・引用符の中の `#` を行ベースでは読めない
+        data = yaml.safe_load(text)
+    except Exception:
+        return True, None       # 読めない = 読めなかった。「未設定」に倒さない
+    if data is None:
+        return False, None
+    if not isinstance(data, dict):
+        return True, None
+    rex = data.get("rex")
+    if rex is None:
+        return False, None
+    if not isinstance(rex, dict):
+        return True, _BAD_ENDPOINT
+    if "endpoint" not in rex or rex["endpoint"] is None:
+        return False, None
+    return True, rex["endpoint"]
+
+
+#: `rex.endpoint` が文字列でなかったときの目印 (読めたが使えない値)。
+_BAD_ENDPOINT = object()
+
+
+def _rex_config_endpoint(config_path: Optional[Path] = None):
+    """`_rex_endpoint()`'s production branch: config `rex.endpoint` or default.
+
+    Only `unix:///absolute/path` is accepted (a server crewvia starts itself
+    must be one it can bind), and the socket path must fit in sun_path
+    (design doc §8) — a longer one would make `rex server run` fail to bind.
+    """
+    found, value = _config_rex_endpoint(config_path)
+    if not found:
+        return True, None, ""
+    if value is None:
+        return False, None, "config/crewvia.yaml could not be read (rex.endpoint)"
+    if not isinstance(value, str) or not value.strip():
+        return False, None, "config rex.endpoint must be a non-empty string (unix:///absolute/path)"
+    value = value.strip()
+    if not value.startswith("unix:///"):
+        return False, None, ("config rex.endpoint must be unix:///absolute/path "
+                             "(other endpoint kinds are not started by crewvia)")
+    path = value[len("unix://"):]
+    if len(path.encode("utf-8")) > _REX_SOCK_MAX_BYTES:
+        return False, None, (f"config rex.endpoint is longer than "
+                             f"{_REX_SOCK_MAX_BYTES} bytes (sun_path), so a "
+                             f"server could not bind it")
+    return True, value, ""
 
 
 def _rex_session_label() -> str:
@@ -4600,6 +4666,117 @@ def rex_worker_provenance(record, *, window_id, server_before, server_after,
     return True, "the spawn record matches the process"
 
 
+#: Variables a Rex server must not be born with *in addition to* herdr's list.
+#: Measured on this machine (PR-2, design doc §10.2-7): `~/.bashrc` runs
+#: `tmux attach` for an interactive shell when `SSH_CONNECTION` is set, no
+#: `$TMUX` and no `$HERDR_ENV`.  The herdr deny list removes `HERDR_ENV`, so a
+#: server started from an SSH session would hand every restored login shell a
+#: `tmux -u attach -t main` child — the shell is then not an "empty husk" and
+#: `spawn` is refused as OCCUPIED (the dispatcher / watchdog respawn with it).
+#: Dropping the SSH variables from the *server's* env removes the trigger; the
+#: panes themselves need none of them.  (A server that is already running
+#: keeps whatever it was born with — see `rex_ensure_server`'s warning.)
+_REX_SERVER_ENV_DENY_EXTRA = frozenset({
+    "SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY",
+})
+#: Every `HERDR_*` variable (HERDR_PANE_ID / HERDR_TAB_ID / HERDR_WORKSPACE_ID /
+#: HERDR_BIN_PATH / HERDR_SOCKET_PATH ...) names the herdr session that started
+#: `./crewvia`.  A Rex server that inherits them hands them to every pane, so a
+#: Worker believes it is inside herdr.  Prefix match: no list to fall behind.
+_REX_SERVER_ENV_DENY_PREFIXES = ("HERDR_",)
+
+
+def _rex_server_env() -> dict:
+    """os.environ without the session-scoped variables (herdr's list + SSH_*).
+
+    A Rex server hands its own environment to every pane (design doc §6.5),
+    so it is started with the agent-session variables removed.
+    """
+    return {
+        k: v for k, v in os.environ.items()
+        if k not in _HERDR_SERVER_ENV_DENY_EXACT
+        and k not in _REX_SERVER_ENV_DENY_EXTRA
+        and not k.startswith(_HERDR_SERVER_ENV_DENY_PREFIXES)
+        and not k.startswith(_REX_SERVER_ENV_DENY_PREFIXES)
+    }
+
+
+def _rex_server_command(endpoint: Optional[str]):
+    """argv that starts a persistent server on `endpoint` (None = Rex's default).
+
+    The default endpoint uses `rex server start` (idempotent, detaches itself).
+    An explicit endpoint cannot (`start` has no `--listen`), so it is a
+    foreground `rex server run` that `_rex_start_server` detaches.  Under test
+    isolation the state dir sits beside the socket and nothing is restored.
+    """
+    if endpoint is None:
+        return ["rex", "server", "start"]
+    cmd = ["rex", "server", "run", "--listen", endpoint]
+    if _test_isolation_active():
+        sock_dir = os.path.dirname(endpoint[len("unix://"):])
+        cmd += ["--state-dir", os.path.join(sock_dir, "state"), "--restore=false"]
+    return cmd
+
+
+def _rex_start_server() -> Optional[str]:
+    """Start a server; None on success of the *launch*, else the reason.
+
+    Never starts anything when the endpoint is refused.  The caller verifies
+    with `_rex_status()`; this only launches (detached, `/dev/null` streams,
+    cleaned env, own session — the same shape as `_herdr_start_server`).
+    """
+    ok, endpoint, problem = _rex_endpoint()
+    if not ok:
+        return problem
+    if shutil.which("rex") is None:
+        return "the rex binary was not found on PATH"
+    try:
+        subprocess.Popen(_rex_server_command(endpoint),
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True,
+                         env=_rex_server_env())
+    except Exception as exc:  # noqa: BLE001
+        return f"rex server could not be launched: {exc}"
+    return None
+
+
+def rex_ensure_server(wait_seconds: float = 10.0):
+    """`(ok, message)` — use the server that is there, or start one and verify it.
+
+    * A server is already running: use it.  Its environment cannot be read
+      back (and was not made by us), so the message is only a warning that it
+      is used as it is.
+    * None running: start one with a cleaned env and wait for it to answer.
+    * Either way `api_revision` must be one this code was measured against;
+      otherwise `(False, reason)` — nothing else is substituted.
+    """
+    status = _rex_status()
+    started = False
+    if status is None:
+        problem = _rex_start_server()
+        if problem is not None:
+            return False, problem
+        started = True
+        deadline = time.time() + wait_seconds
+        while time.time() < deadline:
+            time.sleep(0.2)
+            status = _rex_status()
+            if status is not None:
+                break
+        if status is None:
+            return False, (f"rex server did not answer within "
+                           f"{wait_seconds:.0f}s after it was started")
+    if status["api_revision"] not in _REX_API_REVISIONS:
+        return False, (f"rex api_revision {status['api_revision']} is not one "
+                       f"this code was measured against "
+                       f"{sorted(_REX_API_REVISIONS)}")
+    if started:
+        return True, "rex server started"
+    return True, ("WARNING: a rex server was already running; using it as it "
+                  "is (its environment cannot be verified — agent-session "
+                  "variables may be inherited by every pane)")
+
+
 def _rex_input_box(screen: str):
     """The lines of Claude Code's input box (between the two rules), or None."""
     lines = screen.splitlines()
@@ -4622,6 +4799,48 @@ def _rex_input_is_empty(screen: str) -> Optional[bool]:
     if len(box) != 1:
         return False
     return box[0][1:].strip() == ""
+
+
+#: A permission / choice dialog: the cursor on a numbered option (any number —
+#: the cursor may sit on the 2nd choice) plus the
+#: dialog's own footer or question.  Both must be present in the screen tail —
+#: a bare `❯ 1.` line in task output is not a dialog.
+_REX_DIALOG_OPTION_RE = re.compile(r"[❯›]\s*\d{1,2}[.)]\s*\S")
+_REX_DIALOG_FOOTER_RE = re.compile(
+    r"(enter to confirm|esc to cancel|do you want to|would you like to)",
+    re.IGNORECASE)
+_REX_TRUST_UNNUMBERED_RE = re.compile(
+    r"(?:[❯›]\s*)?no,\s*exit\b[\s\S]{0,60}?yes,?\s*(?:i\s*)?(?:trust\s*this\s*folder|proceed)\b"
+    r"|yes,?\s*(?:i\s*)?(?:trust\s*this\s*folder|proceed)\b[\s\S]{0,60}?no,\s*exit\b",
+    re.IGNORECASE)
+_REX_WORKING_RE = re.compile(r"esc to interrupt", re.IGNORECASE)
+_REX_STATE_TAIL_LINES = 30
+
+
+def rex_screen_state(screen: str) -> str:
+    """`blocked` / `working` / `idle` / `unknown` for a captured Claude Code screen.
+
+    Pure.  Order matters: a dialog wins over the spinner line (the spinner can
+    stay on screen under a dialog); `working` needs the spinner hint in the
+    last lines; `idle` needs the input box and no spinner.  Anything else —
+    including an empty or unreadable capture — is `unknown` so the caller
+    skips the notification instead of acting on a guess.
+    """
+    if not isinstance(screen, str) or not screen.strip():
+        return "unknown"
+    tail = screen.splitlines()[-_REX_STATE_TAIL_LINES:]
+    text = "\n".join(tail)
+    if _REX_DIALOG_OPTION_RE.search(text) and _REX_DIALOG_FOOTER_RE.search(text):
+        return "blocked"
+    # 番号なしの信頼確認ダイアログ (`❯ No, exit` / `Yes, I trust this folder` /
+    # `Enter to confirm`)。実物の capture で確認した形。
+    if _REX_DIALOG_FOOTER_RE.search(text) and _REX_TRUST_UNNUMBERED_RE.search(text):
+        return "blocked"
+    if _REX_WORKING_RE.search("\n".join(tail[-8:])):
+        return "working"
+    if _rex_input_box(screen) is not None:
+        return "idle"
+    return "unknown"
 
 
 #: Serialises `RexBackend.spawn` (uniqueness check + creation), which calls
@@ -4712,7 +4931,18 @@ class RexBackend(_Backend):
         return _rex_status() is not None
 
     def state(self, name: str) -> str:
-        return "unknown"        # Rex has no agent-status API (design doc §4)
+        """Agent state read from the screen (Rex has no agent-status API).
+
+        PR-2 (design doc §10.2-4): Rule 5 in dispatcher.sh is the only reader
+        of `state()` and it fails safe on `unknown`, but that would leave a
+        Worker stuck on an approval dialog, or idle with a task, undetected on
+        Rex.  So the answer is derived from `capture` by the pure function
+        `rex_screen_state()`, which only says `blocked` / `working` / `idle`
+        for shapes it recognises and `unknown` for everything else (an empty
+        capture included: "could not read" is not "idle").
+        """
+        screen = self.capture(name)
+        return rex_screen_state(screen)
 
     # -- ids ---------------------------------------------------------------
 
@@ -5187,6 +5417,26 @@ class RexBackend(_Backend):
             return False
         return True
 
+    def verify_sent(self, name: str, text: str) -> bool:
+        """True when `text` is no longer sitting in Claude's *input box*.
+
+        The base heuristic accepts any `❯` line in the screen tail as "the
+        input line".  Claude Code echoes a submitted message in the transcript
+        as `❯ <message>` too, so a kickoff that was delivered (and is short
+        enough to fit in the 30-char prefix, i.e. the Director's) was reported
+        as "not confirmed" x3 + ERROR.  Rex has the real input box (the lines
+        between the two rules), so look only there.  No input box on screen
+        (a dialog, a spinner redraw) -> fall back to the base judgement.
+        """
+        screen = self.capture(name)
+        if not screen:
+            return False
+        box = _rex_input_box(screen)
+        if box is None:
+            return not _text_in_input_line(
+                screen, text, tail_lines=_VERIFY_SENT_TAIL_LINES)
+        return text[:30] not in "\n".join(box)
+
     def capture(self, name: str) -> str:
         self._guard("capture", name)
         ids = self._resolve(name)
@@ -5344,7 +5594,11 @@ class RexBackend(_Backend):
         child = facts["child"]
         if child is None:
             self._warn(f"kill {name!r}: nothing runs in the block; it is left "
-                       f"as it is (crewvia never closes a block)")
+                       f"as it is (crewvia never closes a block). Processes "
+                       f"the vanished root left behind are not tracked "
+                       f"(design doc §5.2 — nothing binds them to this block); "
+                       f"check for stragglers by hand if the Worker ran "
+                       f"background jobs")
             if forget:
                 self._forget_record(name, judged)
             return not require_husk
@@ -5409,7 +5663,11 @@ class RexBackend(_Backend):
         return res is not None and res.rc == 0
 
     def attach_cmd(self, name: str) -> Optional[List[str]]:
-        return None         # entering Rex from outside is PR-2's (unmeasured)
+        # Measured (PR-2, rex 0.0.1793390926): the `rex` CLI has no terminal
+        # client — bare `rex` prints help and there is no `attach`.  A person
+        # enters a session with Rex.app, so there is nothing to `exec` into.
+        # `attach()` focuses the window for a connected Rex app instead.
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -5513,6 +5771,10 @@ class Mux:
         all, and there is no way to tell those apart here — so an empty
         capture is treated as "cannot confirm delivery", not as "landed".
         """
+        # Rex has the real input box on screen; its own judgement (not the
+        # `❯`-line heuristic below) is the one the production path must use.
+        if isinstance(self._backend, RexBackend):
+            return self._backend.verify_sent(name, text)
         screen = self.capture(name)
         if not screen:
             return False
@@ -5537,6 +5799,15 @@ def _cli_main(args: List[str]) -> int:
 
     elif verb == "server-running":
         return 0 if m.server_running() else 1
+
+    elif verb == "ensure-server":
+        # Rex only: start.sh / ./crewvia start the server explicitly (design
+        # doc §10.1 案 2).  Other backends start theirs inside available().
+        if not isinstance(m._backend, RexBackend):
+            return 0 if m.available() else 1
+        ok, msg = rex_ensure_server()
+        print(f"[crewvia] {msg}", file=sys.stderr)
+        return 0 if ok else 1
 
     elif verb == "spawn":
         if len(rest) < 2:

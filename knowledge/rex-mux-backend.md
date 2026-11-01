@@ -338,7 +338,7 @@ PR-1 で実測したものは「**実測済み**」、残りは「**未確認**�
 
 1. **実測済み**: 重複した label を `-b <label>` で引くと `block target "…" is ambiguous`・**exit 3**（§3.1）
 2. 複数行の入力欄を空にするキー — **実測済み**（`ctrl+u` を行ごとに 2 回。§6.3）。**未確認のまま**: paste の直後の Enter が Claude Code に食われないか（モデルに送ってしまうので、隔離 server でも測っていない。`RexBackend.send()` は paste を使わず `send` の生テキスト + `send-key enter`）・起動直後（`❯` 前）の Enter・長文の paste の畳み（§6.2）
-3. `rex window focus` / 引数なしの `rex` の attach — **未確認**（TTY が要る。`RexBackend.attach()` は `rex focus <window_id>` を呼ぶが未測定。`attach_cmd()` は None を返し、PR-2 が決める）
+3. `rex window focus` / 引数なしの `rex` の attach — **実測済み（PR-2）**: `rex` の CLI に端末で入る client は無い（引数なしは help・`attach` サブコマンド無し・pty でも同じ）。`attach_cmd()` は None のまま。`rex focus <window_id>` は **Rex.app が接続していなくても exit 0**（隔離 server・client は cli だけ）なので、成否は「利用者に見えた」ことの証拠にならない。→ `start.sh` は focus の成否に関係なく利用者への案内を出す。**Rex.app から crewvia の session が見えること自体は、このマシンの app に触れていないので未確認**（見込み: app は接続先 server の全 session を一覧する。利用者の手順は §14）
 4. 復元された shell への SIGHUP で block が消えるか — **実測済み**（消える。§5.3）。pidfd の poll による終了待ち — **実測済み**（全 kill がこれで待つ）。**aarch64 での syscall 番号 — 未確認**（`pidfd_open` = 434 / `pidfd_send_signal` = 424 は x86_64 でだけ測った。**`platform.machine()` が `x86_64` 以外なら pidfd を使わず kill を拒否する**＝ fail-closed。aarch64 で使うときは番号を再測してから表に足す）
 5. **実測済み**: 既存 block で command を走らせる API は無い。husk へ打ち込む案は入力欄が空と確かめられないので廃止し、SIGHUP で終えて新規 `rex run` する（§4.2）
 6. **実測済み**: exit 3 は `not found` だけでなく `is ambiguous` にも使われる。→ 文言も見る（§4）
@@ -373,3 +373,37 @@ PR-1 で実測したものは「**実測済み**」、残りは「**未確認**�
 | 復元 shell への SIGHUP（PR-1） | shell が終わり block も消えた。pidfd の poll で終了を待てた |
 | 本機の login shell（PR-1） | profile が `tmux attach` を起こすので、復元された husk は空にならない（空の `HOME` で測った） |
 | 実測の後始末（PR-1） | 隔離 server はすべて `server stop`・`/tmp/rxp-ren1` / `/tmp/rxt-*` は unlink/rmdir。既定 socket の server（本番）は起動も停止もしていない |
+
+## 14. PR-2 の実装と実測（2026-11-01）
+
+**入口**: `CREWVIA_MUX=rex` または config `mode: rex`。`./crewvia`・`scripts/start.sh` は `lib_mux.py ensure-server` で server を確かめる。**既定 socket の server（利用者の Rex.app のものの可能性が高い）は、起動も停止もしない**: 居れば使い、`api_revision` が 9 でなければ exit 1（tmux に落とさない）。居なければ掃除した env で `rex server start`（config `rex.endpoint: unix:///…` を置くと `rex server run --listen` で、その socket に起動。108 バイト超・unix 以外は拒否）。`crewvia-stop.sh --full` は rex server を止めない。
+
+**既存 server を使うときの警告**（`ensure-server` の stderr）: 「その env は確認できない・掃除されていない。agent-session の変数が全 pane に継承されうる」。気になるなら、利用者が `rex server stop` → `./crewvia` で crewvia に起動させる（Rex.app の他の session も止まる点に注意）。
+
+**利用者が Rex.app で見る手順**: ① `./crewvia`（Director の窓が Rex の `crewvia` session に出る）② Rex.app を開く（同じ server に接続していること）③ session `crewvia` → 窓 `<Name>-director` / `<Name>-worker`・`dispatcher`・`watchdog`。端末だけなら `rex ls` / `rex block ls -s crewvia` / `rex capture -b <block_id>`。**app 側の見え方は未確認**（上 §12-3）。
+
+**`state()`（§10.2-4）**: 読み手は dispatcher の Rule 5 だけ（`check_rule5`。watchdog / `lib_retirement` / `lib_pane_process` は `state()` を呼ばない: watchdog の idle は活動時計 + `/proc` + `capture`）。unknown 固定だと承認待ち・idle-with-task の通知が出ないので、`rex_screen_state(capture)`（承認ダイアログ = 選択肢 + `Enter to confirm` 等 → blocked／`esc to interrupt` → working／入力欄あり → idle／それ以外・空 → unknown）にした。tmux は元から unknown（Rule 5 は効かない）。**できない範囲**: 画面の文言に依存するので Claude Code の UI が変わると unknown に落ちる（通知が出ない側）。watchdog の hard_idle は state に依らず動く。
+
+**持ち越し①（root が終わり子だけ残る block の kill）**: 決定 = 現状維持（受け入れる）。root の pidfd が無く、子を『この block のもの』と束縛する証拠が無い。代わりに警告文に「追わない・手で確認」を明記した。
+
+**持ち越し②（未信頼 cwd の確認ダイアログ）**: `start.sh` の `lib_trust.py check` は mux の種類に依らず spawn の前に走る（backend 非依存）。止まった block は `state()` が `blocked` と答える（`Enter to confirm` 付きの選択肢）ので Rule 5 が拾う。
+
+**このマシン固有の穴（§10.2-7）— 再現して塞いだ**: `~/.bashrc` は `SSH_CONNECTION` が有り `$TMUX` / `$HERDR_ENV` が無い対話シェルで `tmux -u attach -t main` する。herdr の掃除表は `HERDR_ENV` を落とすため、SSH 経由で起動した Rex server は、再起動後に復元した login shell すべてに tmux の子を持たせた（隔離 tmux dir で再現: 復元 shell の子が `tmux -u attach -t main`。= 「空の husk」にならず spawn が OCCUPIED で拒否され、dispatcher / watchdog の respawn も止まる）。server の env から `SSH_CONNECTION` / `SSH_CLIENT` / `SSH_TTY` も落とすと子は付かない（同じ手順で確認）。**crewvia が起動した server にだけ効く**。既に居る server（SSH 経由で起動済み）には効かないので、そのときの復旧は `lib_daemon_watch.py restart <dispatcher|watchdog> --force`（占有者を確認した上で Director が判断）。
+
+
+### 14.1 r1（QA FAIL + Codex r1、head 5f51277）で直したこと
+
+- **backend の解決は 1 回（A）**: `start.sh` は `CREWVIA_MUX`（env）> config `mode:` > auto を最初に 1 回だけ解決し、server の検査（rex の `ensure-server` / herdr の `available`）・`export CREWVIA_MUX`・案内文はその値だけを使う。config が別の backend（tmux / herdr / rex）を指すときだけ env 側に揃える。config が空（→ 確認プロンプト）・`inline`（→ inline）・env と同じ値のときは従来のまま。`CREWVIA_MUX=rex` + `mode: herdr`（本番の現状）で config の herdr 分岐に入って env を上書きし、本番 herdr を見に行く穴だった。3 通り（rex+herdr / tmux+rex / herdr+rex）を `tests/test_rex_pr2_wiring.py` が本物の `start.sh` のブロックを切り出して実行する。
+- **番号なしの信頼確認ダイアログ（B）**: 実 Claude 2.1.316 が未信頼 cwd で出す画面は `❯ No, exit` / `Yes, I trust this folder` / `Enter to confirm · Esc to cancel`（選択肢に番号なし）。`lib_trust.py dialog` と `rex_screen_state` は番号つきの形しか見ていなかったので、`state()` は unknown・`start.sh` は検出できなかった。両方を「承認の選択肢と `No, exit` が隣り合う 1 組」（番号なし・どちらが先でもカーソルはどちらでも）にも対応させた（数字ありの形は残す。文言が単独でパスや出力に出ただけでは検出しない）。
+- **kickoff の誤報告（B）**: `start.sh` は `mux_send` の失敗を `|| true` で捨て、`verify-sent`（「入力行に残っていない」だけで True）だけで「verified」と出していた。Rex の `send` は入力欄が空と示せないと何も送らず False を返す。送信が False の試行は着弾と数えず、3 回とも駄目なら既存の ERROR に落ちる。
+- **未解決（B）**: `lib_trust.py check` は親 dir（`.claude/worktrees`）の信頼で rc=0 を返すのに、claude が cwd 自身の `.claude/settings.json`（権限 44 件）を理由に確認ダイアログを出した。claude 側の規則は読んでいないので、`check` の側では直していない。**事前検査をすり抜けた場合の網は、上の番号なしダイアログの検出（kickoff の前後の `_require_no_trust_dialog` と Rule 5 の `blocked`）**。cwd に `.claude/settings.json` がある task の worktree は、利用者がその cwd を一度 `claude` で信頼してから使う。
+- **server env（C）**: `_rex_server_env()` は `HERDR_*` を前方一致で落とす（`HERDR_PANE_ID` / `HERDR_TAB_ID` / `HERDR_WORKSPACE_ID` / `HERDR_BIN_PATH` / `HERDR_SOCKET_PATH` …）。herdr の pane 内から `./crewvia` を打つと、Rex の Worker が herdr の本番 socket を持っていた。
+- **`crewvia-stop.sh`（D）**: backend 判定の python に path を埋め込まず argv で渡す（`'` を含む path でソースが壊れる）。判定に失敗したら `--full` でも server を止めない（herdr に倒さない）。
+- **E（実 Claude での一周）**: この attempt では**実施していない**（本番の既定 socket の server に触れない・`~/.claude.json` を書かない制約のもと、信頼済みの隔離 cwd と実 Claude を用意できなかった）。残: `mode: rex` の Worker 自動起動と kickoff の到達。上の B で、止まる原因だった確認ダイアログは検出できるようになった。
+
+### 14.2 r2（Codex r2、head 2f27a0f）で直したこと
+
+- **`rex.endpoint` は YAML パーサで読む**（`lib_mux._config_rex_endpoint`）。行ベースの解析は flow 形式 `rex: {endpoint: ...}` と引用符の中の `#` を誤読した。入口は従来どおり `read_regular_text_or_unreadable` を通し、その text を PyYAML で解く。解析できない・`rex` が mapping でない・`endpoint` が文字列でない・`unix:///` でない・108 バイト超はすべて `available()` が False（理由つき）。別の宛先へ黙って倒さない。
+- **信頼確認 / 権限ダイアログの検出は、カーソルが選択肢 1 以外でも一致**する（`❯ 2. ...`）。フッターの検査は残す（タスク出力の `❯ 2.` はダイアログではない）。
+- **Director の kickoff が「未確認」になる件**: 真因は `verify_sent` が「画面末尾 30 行のどこかの `❯` 行」を入力行とみなすこと。Claude Code は送信済みメッセージを transcript に `❯ <本文>` として描き直すので、先頭 30 字に収まる短い kickoff（Director の文）は届いていても「入力行に残っている」と判定された（Worker の文は transcript 側で折り返し/スクロールするため出なかった）。`RexBackend.verify_sent` は本物の入力欄（2 本の罫線の間）だけを見る。入力欄が画面に無いときは従来の判定に倒す。
+- **`lib_daemon_watch restart` と `CREWVIA_KILL_AUTHORITY`**（確認のみ・既存の仕様で herdr と同じ）: 引き継ぎは許可リスト `_SPAWN_ENV_OPERATIONAL` に載っており、**restart を実行したプロセスの env** から運ぶ（死んだデーモンの env は読まない）。実行側の env に無ければ既定（watchdog）に戻る。backend には依存しない。両デーモンの値を揃えて同時に restart する運用（CLAUDE.md の表）は変わらない。

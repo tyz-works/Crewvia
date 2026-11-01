@@ -794,6 +794,8 @@ _SPAWN_ENV_MUX = (
     "CREWVIA_TMUX_SESSION",
     "CREWVIA_HERDR_WORKSPACE",
     "CREWVIA_HERDR_SOCK",
+    "CREWVIA_REX_SESSION",
+    "CREWVIA_REX_SOCK",
 )
 
 #: What the daemon *does*, and to whose files.  A respawn that drops these

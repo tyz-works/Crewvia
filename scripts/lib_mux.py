@@ -4098,7 +4098,6 @@ _REX_TIMEOUT = 10.0
 _REX_MAX_SEND_BYTES = 32768
 
 #: Claude Code's empty input line carries a placeholder hint.
-_REX_PLACEHOLDER_PREFIX = 'Try "'
 
 #: pidfd_open / pidfd_send_signal — measured on x86_64 only; aarch64 is unmeasured.
 #: Any other machine: no pidfd -> kill is refused.
@@ -4305,7 +4304,7 @@ def _pidfd_exited(fd: int, timeout: float = 0.0) -> bool:
         return False
 
 
-def _rex_scan_tree(root_pid: int, root_sid: Optional[str], known=()):
+def _rex_scan_tree(root_pid: int, root_sid: Optional[str], known=None):
     """`{pid: (ppid, starttime)}` for `root_pid`'s live descendants and its
     session members, from one pass over `/proc` (the root itself included).
 
@@ -4313,8 +4312,9 @@ def _rex_scan_tree(root_pid: int, root_sid: Optional[str], known=()):
     not be *read* or parsed makes the whole scan `None` (unobserved) — it might
     have been a member, and the caller then refuses to claim anything.
 
-    A descendant is anything reachable by ppid from the root **or** from
-    `known` (pids already held); a session member is anything whose session id
+    A descendant is anything reachable by ppid from the seeds — the root when
+    `known` is None, otherwise exactly `known` (callers pass only pids they
+    verified are still the process they hold; a recycled pid must not seed); a session member is anything whose session id
     equals the root's (`setsid`-detached children are caught by ppid chains,
     session-mates by sid).  `None` when `/proc` cannot be listed.
     """
@@ -4335,7 +4335,7 @@ def _rex_scan_tree(root_pid: int, root_sid: Optional[str], known=()):
             table[int(n)] = (int(f[1]), f[19], f[3])
         except ValueError:
             return None
-    seeds = {root_pid, *known}
+    seeds = {root_pid} if known is None else set(known)
     found = {p for p in seeds if p in table}
     changed = True
     while changed:
@@ -4409,13 +4409,43 @@ def _rex_destroy_tree(root_pid: int, root_start: str, *, signals, grace,
         if root_sid != str(root_pid):
             root_sid = None
 
+        def live_seeds():
+            """Held pids whose pidfd has not terminated *and* whose /proc
+            starttime still equals the recorded one.  A pid that ended and was
+            recycled by an unrelated process is not a seed — its children are
+            not ours."""
+            out = set()
+            for pid, (hfd, st) in held.items():
+                if _pidfd_exited(hfd):
+                    continue
+                if _rex_start_time(pid) != st:
+                    continue
+                out.add(pid)
+            return out
+
+        def live_root_sid():
+            """The session id to match members by — unless the root pid now
+            belongs to a different process (then its sid is not ours)."""
+            if root_sid is None:
+                return None
+            now = _rex_start_time(root_pid)
+            if now is not None and now != root_start:
+                return None
+            return root_sid
+
         def enumerate_more() -> bool:
-            tree = _rex_scan_tree(root_pid, root_sid, known=held.keys())
+            tree = _rex_scan_tree(root_pid, live_root_sid(),
+                                  known=live_seeds())
             if tree is None:
                 return False
             for pid, (_ppid, st) in tree.items():
                 if pid in held:
-                    continue
+                    if held[pid][1] == st:
+                        continue
+                    # same pid, different process: the held one ended and the
+                    # pid was recycled by something that is in our range.  We
+                    # cannot hold both under one key — unobserved: refuse.
+                    return False
                 cfd = _pidfd_open(pid)
                 if cfd is None:
                     err = _PIDFD_OPEN_ERRNO
@@ -4451,14 +4481,16 @@ def _rex_destroy_tree(root_pid: int, root_start: str, *, signals, grace,
             if all(_pidfd_exited(fd) for fd, _ in held.values()):
                 # One last look: a child forked while we waited, and still
                 # alive, means the tree is not gone yet.
-                late = _rex_scan_tree(root_pid, root_sid, known=held.keys())
+                late = _rex_scan_tree(root_pid, live_root_sid(),
+                                      known=live_seeds())
                 if late is None:
                     warn("kill: the final /proc scan failed; the tree is "
                          "not known to be gone.")
                     return False
                 # Session members that lost their ancestry chain (re-parented
                 # when their parent died) are stragglers too.
-                stragglers = [p for p in late if p not in held]
+                stragglers = [p for p, (_pp, st) in late.items()
+                              if p not in held or held[p][1] != st]
                 if not stragglers:
                     return True
                 if sig == signals[-1]:
@@ -4563,15 +4595,16 @@ def _rex_input_box(screen: str):
 
 
 def _rex_input_is_empty(screen: str) -> Optional[bool]:
-    """True: the box shows only `❯` (or its placeholder).  False: there is
-    text.  None: no input box on screen."""
+    """True: the box shows only `❯`.  False: there is anything after it (real
+    text *or* the dimmed suggestion — they cannot be told apart from one
+    screen; `RexBackend._clear_input` tells them apart by pressing ctrl+u).
+    None: no input box on screen."""
     box = _rex_input_box(screen)
     if box is None:
         return None
     if len(box) != 1:
         return False
-    rest = box[0][1:].strip()
-    return rest == "" or rest.startswith(_REX_PLACEHOLDER_PREFIX)
+    return box[0][1:].strip() == ""
 
 
 class RexBackend(_Backend):
@@ -4988,15 +5021,30 @@ class RexBackend(_Backend):
     def _clear_input(self, block_id: str) -> bool:
         """True only once an input box was *seen* empty.  An unreadable
         capture or a screen with no recognisable box is not permission to
-        send (it may be a restored shell or leftover text)."""
+        send (it may be a restored shell or leftover text).
+
+        A one-line box with something after `❯` is either typed text or
+        Claude Code's suggestion (any wording — no prefix is assumed).  ctrl+u
+        tells them apart: typed text changes (is removed), the suggestion does
+        not.  A one-line box that stays *identical* after ctrl+u is therefore
+        the suggestion = empty.  A multi-line box is never a suggestion.
+        Residual window (design doc §6): a UI that ignores ctrl+u (frozen) and
+        holds real one-line text would be read as a suggestion."""
         for _ in range(16):
-            empty = _rex_input_is_empty(self._capture_block(block_id))
-            if empty is True:
+            box = _rex_input_box(self._capture_block(block_id))
+            if box is not None and len(box) == 1 and box[0][1:].strip() == "":
                 return True
-            if empty is False:
-                _rex_run(["send-key", "-b", block_id, "ctrl+u"])
+            if box is not None:
+                res = _rex_run(["send-key", "-b", block_id, "ctrl+u"])
+                if res is not None and res.rc == 0:
+                    time.sleep(0.15)
+                    after = _rex_input_box(self._capture_block(block_id))
+                    if after is not None and len(box) == 1 and after == box:
+                        return True       # ctrl+u changed nothing: suggestion
+                    continue
             time.sleep(0.15)
-        return _rex_input_is_empty(self._capture_block(block_id)) is True
+        box = _rex_input_box(self._capture_block(block_id))
+        return box is not None and len(box) == 1 and box[0][1:].strip() == ""
 
     def keys(self, name: str, keys: List[str]) -> bool:
         self._guard("keys", name)

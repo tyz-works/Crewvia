@@ -243,9 +243,12 @@ def test_the_kills_and_the_resolution_path_use_forget_record_with_what_they_judg
             f"{fn}: _forget_record は判定した記録を渡す形でしか呼べない"
         callers.setdefault(fn, 0)
         callers[fn] += 1
-    assert set(callers) == {"kill", "_resolve_ids"}, sorted(callers)
-    # kill の呼び出し: 従来 4 (tmux/herdr) + rex 2 (何も走っていない block / 破壊後)
-    assert callers["kill"] == 6 and callers["_resolve_ids"] == 1
+    # rex の kill 本体は `_kill_impl` (kill と husk の作り直しが共有する)。
+    assert set(callers) == {"kill", "_kill_impl", "_resolve_ids"}, sorted(callers)
+    # kill の呼び出し: tmux/herdr の 4 + rex の `_kill_impl` 2 (何も走っていない
+    # block / 破壊後)。`_resolve_ids` は 1。
+    assert callers["kill"] == 4 and callers["_kill_impl"] == 2
+    assert callers["_resolve_ids"] == 1
     source = (SCRIPTS / "lib_mux.py").read_text(encoding="utf-8")
     assert "_delete_cache" not in source, \
         "名前だけで記録を消す入口 (_delete_cache) が残っている"

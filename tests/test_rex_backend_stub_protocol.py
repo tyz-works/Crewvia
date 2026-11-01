@@ -277,7 +277,8 @@ def test_input_box_reading():
     plain = f"{rule}\n❯ \n{rule}\n"
     one = f"{rule}\n❯ hello\n{rule}\n"
     multi = f"{rule}\n❯ 行1\n  行2\n{rule}\n"
-    assert lib_mux._rex_input_is_empty(empty) is True
+    # 候補文は 1 画面からは入力と区別できない (False)。区別は _clear_input の ctrl+u。
+    assert lib_mux._rex_input_is_empty(empty) is False
     assert lib_mux._rex_input_is_empty(plain) is True
     assert lib_mux._rex_input_is_empty(one) is False
     assert lib_mux._rex_input_is_empty(multi) is False
@@ -324,7 +325,8 @@ def test_send_to_a_clean_box_types_then_presses_enter_once(fake):
                               {"match": ["send-key"], "out": ""}, {"match": ["send"], "out": ""}])
     assert lib_mux.RexBackend().send("Zed-worker", "hello")
     kinds = [c[0] for c in fake.calls() if c[0] in ("send", "send-key")]
-    assert kinds == ["send", "send-key"]
+    # 候補文は ctrl+u で変わらない = 空。その確認の ctrl+u が先頭に 1 回入る。
+    assert kinds == ["send-key", "send", "send-key"]
 
 
 def test_send_over_the_limit_or_empty_is_false_and_sends_nothing(fake):
@@ -1201,3 +1203,96 @@ def test_process_answer_without_positive_evidence_is_unreadable_and_kill_keeps_t
     assert b._process("block:AAA")[0] == "unreadable"
     assert not b.kill("Zed-worker")
     assert path.exists()
+
+
+# ---------------------------------------------------------------------------
+# Codex r3 の指摘の回帰 (F1 走査の種 / F2 候補文の判定)
+# ---------------------------------------------------------------------------
+
+def _rule(label="x"):
+    return "─" * 40
+
+
+def test_clear_input_treats_a_suggestion_of_any_wording_as_empty(fake):
+    """F2: 候補文は `Try "` で始まるとは限らない。ctrl+u で変わらない 1 行 = 候補文。"""
+    rule = _rule()
+    cand = f"{rule}\n❯ Fix the failing test in foo.py\n{rule}\n"
+    _worker_record(fake)
+    fake.set(_base_rules() + [_blocks_rule(), {"match": ["capture"], "out": cand},
+                              {"match": ["send-key"], "out": ""}, {"match": ["send"], "out": ""}])
+    assert lib_mux.RexBackend().send("Zed-worker", "hello")
+    kinds = [c[0] for c in fake.calls() if c[0] in ("send", "send-key")]
+    assert kinds == ["send-key", "send", "send-key"]
+
+
+def test_clear_input_does_not_mistake_real_text_starting_with_try_for_a_suggestion(fake):
+    """F2: 本物の入力が `Try "` で始まっても、ctrl+u で消える → 入力。空になるまで送らない。"""
+    rule = _rule()
+    typed = f"{rule}\n❯ Try \"my own text\"\n{rule}\n"
+    empty = f"{rule}\n❯ \n{rule}\n"
+    _worker_record(fake)
+    fake.set(_base_rules() + [_blocks_rule(),
+                              {"match": ["capture"], "seq": [{"out": typed}, {"out": typed}, {"out": empty}]},  # 1 本目は ❯ 待ち
+                              {"match": ["send-key"], "out": ""}, {"match": ["send"], "out": ""}])
+    assert lib_mux.RexBackend().send("Zed-worker", "hello")
+    seq = [(c[0], "ctrl+u" in c) for c in fake.calls() if c[0] in ("send", "send-key")]
+    # ctrl+u で消えたことを確かめてから send。候補文として素通しにしない。
+    assert seq[0] == ("send-key", True)
+    assert [k for k, _ in seq].index("send") > 0
+
+
+def test_clear_input_refuses_when_one_line_text_is_unchanged_only_if_multiline(fake):
+    """複数行は候補文ではない: ctrl+u で変わらなくても送らない。"""
+    rule = _rule()
+    multi = f"{rule}\n❯ line1\n  line2\n{rule}\n"
+    _worker_record(fake)
+    fake.set(_base_rules() + [_blocks_rule(), {"match": ["capture"], "out": multi},
+                              {"match": ["send-key"], "out": ""}, {"match": ["send"], "out": ""}])
+    assert not lib_mux.RexBackend().send("Zed-worker", "hello")
+    assert not any(c[0] == "send" for c in fake.calls())
+
+
+def test_scan_with_no_live_seed_does_not_pull_in_a_recycled_pids_children():
+    """F1: 種が空 (終わった pid は種にしない) なら、その pid の子は巻き込まない。"""
+    parent = subprocess.Popen(["sh", "-c", "sleep 662 & wait"], start_new_session=True)
+    try:
+        time.sleep(0.3)
+        assert lib_mux._rex_scan_tree(parent.pid, None, known=set()) == {}
+        assert parent.pid in lib_mux._rex_scan_tree(parent.pid, None)
+    finally:
+        os.killpg(parent.pid, signal.SIGKILL)
+        parent.wait()
+
+
+def test_destroy_does_not_seed_the_scan_with_a_recycled_root_pid(monkeypatch):
+    """F1: root が終わって pid が別のプロセスに回収されたら (starttime が変わる)、
+    以降の走査の種に root を入れない。"""
+    root = subprocess.Popen(["sleep", "663"], start_new_session=True)
+    try:
+        st = lib_mux._rex_start_time(root.pid)
+        seen = []
+        real_scan = lib_mux._rex_scan_tree
+        real_st = lib_mux._rex_start_time
+        recycled = {"on": False}
+
+        def spy(rp, sid, known=None):
+            seen.append((recycled["on"], None if known is None else set(known)))
+            return real_scan(rp, sid, known=known)
+
+        def fake_start(pid):
+            if recycled["on"] and pid == root.pid:
+                return "recycled"
+            return real_st(pid)
+
+        monkeypatch.setattr(lib_mux, "_rex_scan_tree", spy)
+        monkeypatch.setattr(lib_mux, "_rex_start_time", fake_start)
+        monkeypatch.setattr(lib_mux, "_rex_after_enumerate",
+                            lambda: recycled.__setitem__("on", True))
+        lib_mux._rex_destroy_tree(root.pid, st, signals=[signal.SIGKILL],
+                                  grace=lambda s: 2.0, warn=lambda m: None)
+        after = [k for flag, k in seen if flag]
+        assert after, "the post-signal scan was not reached"
+        assert all(k is not None and root.pid not in k for k in after), after
+    finally:
+        root.kill()
+        root.wait()

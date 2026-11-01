@@ -255,13 +255,15 @@ def test_send_clears_multiline_leftover_and_never_enters_unclean_box(tmp_path, m
 
 def _send_clears_body(server, b, checkout):
     assert b.spawn("Ivy-worker", "exec claude", cwd=str(REPO_ROOT))
-    assert _wait(lambda: lib_mux._rex_input_is_empty(b.capture("Ivy-worker")) is True, 60)
+    # 入力欄が出るまで (候補文が出ていれば _rex_input_is_empty は False になる)
+    assert _wait(lambda: lib_mux._rex_input_box(b.capture("Ivy-worker")) is not None, 60)
     rec = _record(checkout, "Ivy-worker")
     bid = rec["block_id"]
     server.rex("send", "-b", bid, "--", "行1 日本語\n行2\n行3", check=True)
     assert _wait(lambda: lib_mux._rex_input_is_empty(b.capture("Ivy-worker")) is False, 5)
     assert b._clear_input(bid) is True
-    assert lib_mux._rex_input_is_empty(b.capture("Ivy-worker")) is True
+    box = lib_mux._rex_input_box(b.capture("Ivy-worker"))
+    assert box is not None and len(box) == 1       # 複数行の残りは無い (空か候補文)
     assert b.kill("Ivy-worker")
 
 

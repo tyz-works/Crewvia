@@ -490,3 +490,45 @@ def test_husk_state_requires_a_bare_shell_cmdline():
             p.wait()
     # 読めない cmdline (消えた pid) は idle にしない
     assert b._husk_state({"child": {"pid": login.pid, "name": "bash"}}) != lib_mux.PANE_IDLE
+
+
+def test_send_into_a_bare_shell_with_a_stale_input_box_types_nothing(tmp_path, monkeypatch):
+    """r8 F1: 画面に古い (空の) 入力欄が残っていても、前景が素の shell の block には
+    send は何も打たない。画面の解析ではなく process の確認で止める。"""
+    server = RealRexServer(restore=True).start()
+    checkout = make_checkout(tmp_path)
+    monkeypatch.setenv("CREWVIA_REX_SOCK", str(server.sock))
+    monkeypatch.setattr(lib_mux, "_own_repo_root", lambda: checkout)
+    monkeypatch.setenv("CREWVIA_REPO_ROOT", str(checkout))
+    b = lib_mux.RexBackend()
+    try:
+        rule = "─" * 40
+        assert b.spawn("Nia-worker",
+                       f"printf '%s\\n❯ \\n%s\\n' '{rule}' '{rule}'; exec sleep 600")
+        time.sleep(1.5)
+        server.kill_hard()
+        server.start()
+        assert _wait(lambda: b._resolve("Nia-worker") is not None, 10)
+        facts, why = b._facts("Nia-worker")
+        assert facts is not None and facts["child"] is not None, why
+        assert not b.send("Nia-worker", "SHOULD-NOT-APPEAR")
+        assert "SHOULD-NOT-APPEAR" not in b.capture("Nia-worker")
+    finally:
+        server.stop()
+
+
+def test_spawn_refuses_when_the_record_is_unreadable_but_not_when_absent(world):
+    """r8 F2: 「記録が無い」は新規、「読めない・壊れている」は何も作らない。"""
+    server, b, checkout = world
+    assert b.spawn("Oak-worker", "exec sleep 600")
+    path = checkout / "registry" / "mux" / f"{lib_mux._pane_name('Oak-worker')}.json"
+    rec_bid = _record(checkout, "Oak-worker")["block_id"]
+    path.write_text("{ not json")
+    before = server.rex("block", "ls", "--json").stdout
+    assert not b.spawn("Oak-worker", "exec sleep 601")
+    assert b.last_spawn_refusal == lib_mux.SPAWN_UNREADABLE
+    assert server.rex("block", "ls", "--json").stdout == before
+    assert path.read_text() == "{ not json"
+    server.rex("block", "close", rec_bid)
+    path.unlink()
+    assert b.spawn("Oak-worker", "exec sleep 602")          # absent: ordinary spawn

@@ -69,7 +69,7 @@ $RX server status --json
 
 Rex が label の重複を防がないので、`RexBackend` が次を守る（herdr の `_label_lookup` / `_resolve_ids` と同じ位置づけ）:
 
-0. **記録が label より先（r7 F1）**: spawn は lock の中で先に spawn 記録を読む。記録に `block_id` があれば、session を問わずその block を `process` で確かめる。gone / 殻（`child` 無し・`last_exit` 有り）なら従来どおり新規。生きている → `SPAWN_OCCUPIED`、読めない → `SPAWN_UNREADABLE`（記録が他 session や label 違いの block を指したままでは上書きしない。block の改名・`CREWVIA_REX_SESSION` 変更の 2 通りをテスト）
+0. **記録が label より先（r7 F1）**: spawn は lock の中で先に spawn 記録を読む。記録に `block_id` があれば、session を問わずその block を `process` で確かめる。gone / 殻（`child` 無し・`last_exit` 有り）なら従来どおり新規。生きている → `SPAWN_OCCUPIED`、読めない → `SPAWN_UNREADABLE`（記録が他 session や label 違いの block を指したままでは上書きしない。block の改名・`CREWVIA_REX_SESSION` 変更の 2 通りをテスト）。**記録の読み取りは「無い」と「読めない・壊れている」を分ける**（r8 F2）: 無ければ従来どおり新規、読めない・JSON として壊れている・object でないは `SPAWN_UNREADABLE` で何も作らない（生きた block の記録かもしれない。`load_json_store` の `is_missing` だけを『無い』とする）
 1. **spawn は名前ごとの直列化 lock `registry/mux/.rex-spawn.lock`（`_rex_spawn_lock`・待ち 120 秒。取れなければ spawn しない）の中で「同名の記録 + 同名 label の生きた block が session に無い」を確かめてから作る**。**数えるのは生きた block（`process` の `child` がある）だけ**。殻（`child` が無く `last_exit` がある block。§5.3）は label が同じでも数えず無視する（殻は消さない方針なので、数えると同名の spawn が永久に拒否される）。ロックを取れなければ spawn しない（重複を作るより失敗を選ぶ）。`_pane_record_lock`（`.records.lock`）は記録を書く瞬間（`write_pane_record`）だけで、**rex を呼ぶ区間では握らない**（r6 F2。lock の docstring が禁じていた）。child を確認できない・starttime が読めない spawn は記録を書かず、block_id / window_id を警告に出して失敗を返す（husk の作り直しも同じ）
 2. **解決は記録の `block_id` を正本にする**（label は正本でなく照合用。殻と同じ label の新しい block があっても、記録の `block_id` が新しい block を指す限り殻には届かない）。`send` / `capture` / `pid` / `kill` は名前 → 記録 → `block_id` で引き、label は「記録の block の label が名前と一致するか」の照合にだけ使う（一致しなければ `pane not found` 側。他人が同じ名前を付けた別 block に送らない）
 3. **label で引いた結果が 2 つ以上なら「曖昧」**: `list()` は重複を 1 つに潰さず警告つきで返す・`spawn` は拒否（`SPAWN_UNREADABLE` 側）・`kill` は拒否（`--force` だけが出口）。重複を片方に倒さない
@@ -145,7 +145,7 @@ spawn は記録（`write_pane_record`）を server の `(endpoint, generation)` 
 7. block はプロセスの終了で消える（§4.1）ので **`block close` を呼ばない**。消えずに殻が残ってもそのまま残す（§5.3）
 8. **走査の読み方**: `/proc` の entry が列挙と読み取りの間に消えた（`ENOENT` / `ESRCH`）なら対象外として飛ばす。**読めない・壊れた entry は未観測**で、走査全体を失敗（`None`）にして kill を拒否する（メンバーだったかもしれないものを黙って落とさない）。子孫の `pidfd_open` が失敗したときも同じで、プロセスが消えた（`ESRCH`）なら飛ばし、それ以外（`EPERM` 等）は拒否する。`process` の応答も同じ向き: 『child 無し + 実在する `last_exit`』という正の証拠だけを『終わった』と扱い、`{}` や不正な child は unreadable（kill は記録を消さない）
 
-**脅威モデル（守るもの・追わないもの）**: 守るのは ①検査していないものを殺さない（pidfd + starttime）②kill 成功の報告は、親子関係と session の範囲で確かめた結果であること（最終走査に生存者が残れば失敗）。**追わないのは、自分で `setsid` して親から離れた（親は終了した）プロセス**——最終列挙と信号の間にそのような fork が起きても走査では閉じない。意図的に daemon 化したプロセスは crewvia が追わない（tmux / herdr の backend も子孫を追わず SIGHUP だけ）。freeze 等の仕組みは足さない。列挙は信号の直前に 1 回、各段階の前と最終に再走査する（列挙直後に session 内で生まれた子は、その段では信号を受けず、次の段の列挙か最終走査で捕まる／最終段なら最終走査が失敗として報告する）
+**脅威モデル（守るもの・追わないもの）**: 守るのは ①検査していないものを殺さない（pidfd + starttime）②kill 成功の報告は、親子関係と session の範囲で確かめた結果であること（最終走査に生存者が残れば失敗）。**追わないのは、自分で `setsid` して親から離れた（親は終了した）プロセス**——最終列挙と信号の間にそのような fork が起きても走査では閉じない。意図的に daemon 化したプロセスは crewvia が追わない（tmux / herdr の backend も子孫を追わず SIGHUP だけ）。freeze 等の仕組みは足さない。**既知の限界（r8 F3・修正しない）**: 『root（`child.pid`）が既に終わり、session の子だけが残った block』の kill は、その子の生存を確かめずに成功する（root が居なければ pidfd を束縛できる対象が無く、子は列挙の根にならない）。pidfd で束縛できるのは root だけで、root の死後に残った子を『この block のもの』と言い切る証拠が無いため。意図的な取りこぼしで、PR-2 で扱いを決める（§11 PR-2）。列挙は信号の直前に 1 回、各段階の前と最終に再走査する（列挙直後に session 内で生まれた子は、その段では信号を受けず、次の段の列挙か最終走査で捕まる／最終段なら最終走査が失敗として報告する）
 
 **Worker の本人確認 `rex_worker_provenance()`（RexBackend 側・新規。`may_destroy_pane` の代わりではなく、それが Worker に何も言わないのを補う）**。比べるのは**2 回の生の読みどうしではなく、spawn 時に書いた記録との一致**:
 
@@ -196,6 +196,8 @@ spawn は記録（`write_pane_record`）を server の `(endpoint, generation)` 
 **同じ window に block を足さない設計**（1 block = 1 window）なので、プロセスが死んで block が消えたとき window も消える（観察: 直前の 3 例）。session だけが残る例があった（`rex new` で作った単独の session は `ls` に残った）ので、`crewvia` session 1 本 + window 方式（§3.2）なら session は残ってよい。
 
 ## 6. send の実測
+
+**send の前提確認（r8 F1）**: `send` は打つ前に `process` を読み、前景が**生きた非 shell プログラム（`PANE_LIVE`）のときだけ**進む。素の shell（`PANE_IDLE`）・`process` が読めない・child 無しは何も打たず False（画面に古い入力欄が残った復元 shell でも打たない。画面の解析は足していない）。`keys` は同じ確認を**通さない**: 名前付きキー（`up` / `enter` / `escape` 等）だけで文字列を組み立てられず、信頼ダイアログの選択など生きたプログラム相手の用途が主で、素の shell に Enter が届いても空行になるだけ（打ち込まれる文字が無い）。文字列を送る経路だけを塞ぐ判断。
 
 `rex send -b <block> '<text>'` は**生のテキスト**。Enter は付かない。`rex send-key -b <block> enter` が `\r`。
 
@@ -322,6 +324,7 @@ spawn は記録（`write_pane_record`）を server の `(endpoint, generation)` 
 
 - 範囲: `start.sh` の server 起動（§10.1 の決定どおり）・env 掃除・`lib_daemon_watch.py` の `spawn_command()` / restart が Rex でも通ること・dispatcher / watchdog の `mux_list` / `capture` / `kill` の経路・退役の checkpoint の pane capture（§5）・`state()` が unknown の場合の棚卸し
 - QA 項目: 隔離 server で `./crewvia` 相当を一周（Director 窓 + Worker 窓 + dispatcher + watchdog）・Worker の退役（watchdog が kill し、checkpoint に pane が入る）・server を落として respawn・二重 kill（同名の別 Worker を殺さない）・`CREWVIA_KILL_AUTHORITY` の切り替え・**本番の既定 socket に触っていないこと**を QA 自身が確認
+- **PR-2 に持ち越す項目（r8）**: ①『root が終わり session の子だけ残った block』の kill が子の生存を確かめずに成功する（§5.2 の既知の限界）の扱い ②**未信頼 cwd の信頼確認ダイアログで spawn した Claude Code が止まる**（`start.sh` の `lib_trust.py check` が spawn の前に未信頼を止めること、止まった block を Worker が見つけられること）
 - 戻し方: `CREWVIA_MUX` / `mode:` を戻す
 
 ### PR-3: docs / README

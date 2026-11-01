@@ -299,6 +299,10 @@ def _worker_record(fake, *, block_id="block:AAA", child=None, generation=f"inst-
     return path, rec
 
 
+_LIVE = {"match": ["process", "block:AAA"], "out": json.dumps(
+    {"last_exit": None, "child": {"pid": 4242, "name": "claude"}})}
+
+
 def _blocks_rule(label="Zed-worker", block_id="block:AAA"):
     return {"match": ["block", "ls"], "out": json.dumps({"blocks": [
         {"block_id": block_id, "label": lib_mux._pane_name(label), "window_id": "window:W1"}]})}
@@ -308,7 +312,7 @@ def test_send_without_a_clean_input_box_sends_no_enter(fake):
     rule = "─" * 40
     dirty = f"{rule}\n❯ leftover\n  more\n{rule}\n"
     _worker_record(fake)
-    fake.set(_base_rules() + [_blocks_rule(), {"match": ["capture"], "out": dirty},
+    fake.set(_base_rules() + [_blocks_rule(), _LIVE, {"match": ["capture"], "out": dirty},
                               {"match": ["send-key"], "out": ""}, {"match": ["send"], "out": ""}])
     assert not lib_mux.RexBackend().send("Zed-worker", "hello")
     calls = fake.calls()
@@ -321,7 +325,7 @@ def test_send_to_a_clean_box_types_then_presses_enter_once(fake):
     rule = "─" * 40
     clean = f"{rule}\n❯ Try \"x\"\n{rule}\n"
     _worker_record(fake)
-    fake.set(_base_rules() + [_blocks_rule(), {"match": ["capture"], "out": clean},
+    fake.set(_base_rules() + [_blocks_rule(), _LIVE, {"match": ["capture"], "out": clean},
                               {"match": ["send-key"], "out": ""}, {"match": ["send"], "out": ""}])
     assert lib_mux.RexBackend().send("Zed-worker", "hello")
     kinds = [c[0] for c in fake.calls() if c[0] in ("send", "send-key")]
@@ -982,7 +986,7 @@ def test_send_refuses_when_the_capture_is_unreadable_or_has_no_input_box(fake):
     """読めない / 入力欄が見えない画面は『空』ではない: 何も送らない。"""
     _worker_record(fake)
     for out, rc in (("", 1), ("", 0), ("$ \n", 0)):
-        fake.set(_base_rules() + [_blocks_rule(), {"match": ["capture"], "out": out, "rc": rc},
+        fake.set(_base_rules() + [_blocks_rule(), _LIVE, {"match": ["capture"], "out": out, "rc": rc},
                                   {"match": ["send-key"], "out": ""}, {"match": ["send"], "out": ""}])
         assert not lib_mux.RexBackend().send("Zed-worker", "hello")
         calls = fake.calls()
@@ -1158,7 +1162,7 @@ def test_clear_input_sends_ctrl_e_before_ctrl_u_in_one_call(fake):
     rule = _rule()
     cand = f"{rule}\n❯ Fix the failing test in foo.py\n{rule}\n"
     _worker_record(fake)
-    fake.set(_base_rules() + [_blocks_rule(), {"match": ["capture"], "out": cand},
+    fake.set(_base_rules() + [_blocks_rule(), _LIVE, {"match": ["capture"], "out": cand},
                               {"match": ["send-key"], "out": ""}, {"match": ["send"], "out": ""}])
     assert lib_mux.RexBackend().send("Zed-worker", "hello")
     first = [c for c in fake.calls() if c[0] == "send-key"][0]
@@ -1288,7 +1292,7 @@ def test_clear_input_treats_a_suggestion_of_any_wording_as_empty(fake):
     rule = _rule()
     cand = f"{rule}\n❯ Fix the failing test in foo.py\n{rule}\n"
     _worker_record(fake)
-    fake.set(_base_rules() + [_blocks_rule(), {"match": ["capture"], "out": cand},
+    fake.set(_base_rules() + [_blocks_rule(), _LIVE, {"match": ["capture"], "out": cand},
                               {"match": ["send-key"], "out": ""}, {"match": ["send"], "out": ""}])
     assert lib_mux.RexBackend().send("Zed-worker", "hello")
     kinds = [c[0] for c in fake.calls() if c[0] in ("send", "send-key")]
@@ -1301,7 +1305,7 @@ def test_clear_input_does_not_mistake_real_text_starting_with_try_for_a_suggesti
     typed = f"{rule}\n❯ Try \"my own text\"\n{rule}\n"
     empty = f"{rule}\n❯ \n{rule}\n"
     _worker_record(fake)
-    fake.set(_base_rules() + [_blocks_rule(),
+    fake.set(_base_rules() + [_blocks_rule(), _LIVE,
                               {"match": ["capture"], "seq": [{"out": typed}, {"out": typed}, {"out": empty}]},  # 1 本目は ❯ 待ち
                               {"match": ["send-key"], "out": ""}, {"match": ["send"], "out": ""}])
     assert lib_mux.RexBackend().send("Zed-worker", "hello")
@@ -1316,7 +1320,7 @@ def test_clear_input_refuses_when_one_line_text_is_unchanged_only_if_multiline(f
     rule = _rule()
     multi = f"{rule}\n❯ line1\n  line2\n{rule}\n"
     _worker_record(fake)
-    fake.set(_base_rules() + [_blocks_rule(), {"match": ["capture"], "out": multi},
+    fake.set(_base_rules() + [_blocks_rule(), _LIVE, {"match": ["capture"], "out": multi},
                               {"match": ["send-key"], "out": ""}, {"match": ["send"], "out": ""}])
     assert not lib_mux.RexBackend().send("Zed-worker", "hello")
     assert not any(c[0] == "send" for c in fake.calls())
@@ -1433,3 +1437,28 @@ def test_spawn_with_unreadable_starttime_writes_no_record(fake, monkeypatch, cap
     finally:
         child.kill()
         child.wait()
+
+
+def test_send_types_nothing_into_a_bare_shell_even_when_a_clean_box_is_on_screen(fake):
+    """r8 F1: 画面に空の入力欄が残っていても、前景が素の shell / 不明 / child 無しなら送らない。"""
+    rule = _rule()
+    clean = f"{rule}\n❯ \n{rule}\n"
+    _worker_record(fake)
+    shell_child = subprocess.Popen(["sleep", "600"])      # comm=sleep; name is what rex reports
+    try:
+        for out in (
+            {"last_exit": {"exit_code": 0}},                                     # no child
+            {"last_exit": None, "child": {"pid": shell_child.pid, "name": "bash"}},   # bare shell name, cmdline sleep -> LIVE? see below
+            {},                                                                  # unreadable
+        ):
+            if out.get("child"):
+                continue          # bare-shell cmdline form is covered by test_husk_state_requires_a_bare_shell_cmdline
+            fake.set(_base_rules() + [_blocks_rule(),
+                                      {"match": ["process", "block:AAA"], "out": json.dumps(out)},
+                                      {"match": ["capture"], "out": clean},
+                                      {"match": ["send-key"], "out": ""}, {"match": ["send"], "out": ""}])
+            assert not lib_mux.RexBackend().send("Zed-worker", "hello")
+            assert not any(c[0] in ("send", "send-key") for c in fake.calls())
+    finally:
+        shell_child.kill()
+        shell_child.wait()

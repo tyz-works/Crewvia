@@ -75,7 +75,7 @@ if str(_SCRIPTS_DIR) not in sys.path:
 
 # queue / registry / config を読むガードは crewvia に 1 つしかない (t017/t018)。
 from lib_task_cards import (  # noqa: E402
-    is_unreadable, read_regular_text_or_unreadable,
+    is_unreadable, is_missing, read_regular_text_or_unreadable,
 )
 # JSON の状態ストアを読む入口も 1 つ (t026)。
 from lib_daemon_state import load_json_store  # noqa: E402
@@ -4971,7 +4971,15 @@ class RexBackend(_Backend):
             # The record comes before the label (design doc §3.3): a block the
             # record names that is still alive must not be left behind by a
             # rename or a changed CREWVIA_REX_SESSION, whatever its session.
-            record = read_pane_record(name)
+            raw = load_json_store(pane_record_path(name))
+            if is_unreadable(raw) and not is_missing(raw):
+                # "absent" and "cannot be read / broken" are different: the
+                # latter may be the record of a live block (r8 F2).
+                self._warn(f"spawn {name!r}: the spawn record could not be "
+                           f"read; not spawning")
+                self.last_spawn_refusal = SPAWN_UNREADABLE
+                return False
+            record = None if is_unreadable(raw) else raw
             rec_bid = (record.get("block_id")
                        if isinstance(record, dict)
                        and record.get("backend") == "rex" else None)
@@ -5093,6 +5101,16 @@ class RexBackend(_Backend):
             self._warn(f"send {name!r}: pane not found")
             return False
         bid = ids["block_id"]
+        # Only a block whose foreground is a live program gets keystrokes: a
+        # bare shell (PANE_IDLE, e.g. after a rex restart with the old input
+        # box still on screen), an unreadable process or a missing child is
+        # refused (r8 F1).  No screen parsing is involved.
+        pstate, proc = self._process(bid)
+        if pstate != "ok" or self._husk_state(proc) != PANE_LIVE:
+            self._warn(f"send {name!r}: the block's foreground is not a "
+                       f"verifiably live program (idle shell / unreadable); "
+                       f"nothing was sent")
+            return False
         deadline = time.time() + 5.0
         while True:
             screen = self._capture_block(bid)

@@ -165,8 +165,12 @@ fi
 # ---------------------------------------------------------------------------
 # 4) --full: herdr server 自体を停止
 # ---------------------------------------------------------------------------
-_STOP_BACKEND="$(python3 -c "import sys; sys.path.insert(0, '${REPO_ROOT}/scripts'); import lib_mux; print(lib_mux._select_backend().BACKEND_NAME)" 2>/dev/null || true)"
-if [[ $FULL -eq 1 ]] && [[ "$_STOP_BACKEND" == "rex" ]]; then
+# path は python のソースに埋め込まず argv で渡す (' を含む path でソースが壊れる / 注入される)。
+_STOP_BACKEND="$(python3 -c "import sys; sys.path.insert(0, sys.argv[1] + '/scripts'); import lib_mux; print(lib_mux._select_backend().BACKEND_NAME)" "${REPO_ROOT}" 2>/dev/null || true)"
+if [[ $FULL -eq 1 ]] && [[ -z "$_STOP_BACKEND" ]]; then
+  # 判定に失敗したら herdr に倒さない: どの server を止めるべきか分からないので何も止めない。
+  echo "→ backend を判定できなかったため server は停止しません (--full)。止めるなら手動で: herdr server stop / rex server stop"
+elif [[ $FULL -eq 1 ]] && [[ "$_STOP_BACKEND" == "rex" ]]; then
   # Rex の server は利用者の Rex 全体 (crewvia 以外の session も持つ)。crewvia が
   # 起動した場合でも、止めるかどうかは利用者が決める (rex-mux-backend.md §10.1)。
   echo "→ rex server は停止しません (--full は herdr 専用)。止めるなら: rex server stop"

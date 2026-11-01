@@ -289,3 +289,183 @@ def test_entry_scripts_know_rex(path, needles):
 def test_edited_shell_scripts_parse(path):
     r = subprocess.run(["bash", "-n", str(REPO / path)], capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
+
+
+# ---------------------------------------------------------------------------
+# r1 A: start.sh は実効 backend を最初に 1 回だけ解決する (env > config mode: > auto)
+# ---------------------------------------------------------------------------
+#
+# start.sh 本体は claude の起動まで進むので、「並列モード選択」のブロック (本物の
+# start.sh から切り出す) だけを、偽の lib_mux.py / rex / herdr と一緒に bash で走らせる。
+# lib_mux の単体では、export と検査が env と config で割れる事故 (QA F1) を捕まえられない。
+
+def _mode_block():
+    text = (SCRIPTS / "start.sh").read_text(encoding="utf-8")
+    a = text.index('if [[ "${ROLE}" == "director" ]] && [[ -z "${CREWVIA_MUX_ENABLED:-}" ]]; then')
+    b = text.index("export AGENT_NAME\nexport ROLE", a)
+    return text[a:b]
+
+
+def _run_mode_block(tmp_path, *, env_mux, config_mode, have=("rex", "herdr"), ensure_rc=0):
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    log = tmp_path / "calls.log"
+    (scripts / "lib_mux.py").write_text(
+        "import os, sys\n"
+        f"open({str(log)!r}, 'a').write(' '.join(sys.argv[1:]) + ' MUX=' + os.environ.get('CREWVIA_MUX', '') + '\\n')\n"
+        f"sys.exit({ensure_rc} if sys.argv[1] == 'ensure-server' else 0)\n")
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    for b in have:
+        f = bindir / b
+        f.write_text("#!/bin/sh\nexit 0\n")
+        f.chmod(0o755)
+    cfg = tmp_path / "crewvia.yaml"
+    cfg.write_text((f"mode: {config_mode}\n" if config_mode else "") + "other: 1\n")
+    script = tmp_path / "block.sh"
+    script.write_text(
+        "set -euo pipefail\n"
+        f"SCRIPT_DIR={scripts}\nCONFIG_FILE={cfg}\nROLE=director\n"
+        + _mode_block() +
+        'echo "RESULT MUX=${CREWVIA_MUX:-} ENABLED=${CREWVIA_MUX_ENABLED:-}"\n')
+    env = {"PATH": f"{bindir}{os.pathsep}/usr/bin:/bin", "HOME": str(tmp_path)}
+    if env_mux:
+        env["CREWVIA_MUX"] = env_mux
+    r = subprocess.run(["bash", str(script)], capture_output=True, text=True,
+                       env=env, stdin=subprocess.DEVNULL)
+    calls = log.read_text().splitlines() if log.exists() else []
+    return r, calls
+
+
+@pytest.mark.parametrize("env_mux,config_mode,want_mux,want_calls", [
+    # 本番の現状 (mode: herdr) でも env だけで rex に切り替わる。herdr の検査はしない
+    ("rex", "herdr", "rex", ["ensure-server MUX=rex"]),
+    # config が rex でも env=tmux なら tmux。rex の server は起動しない
+    ("tmux", "rex", "tmux", []),
+    # config が rex でも env=herdr なら herdr。rex の server は起動しない
+    ("herdr", "rex", "herdr", ["available MUX=herdr", "available MUX=herdr"]),
+    # env == config の既存の動作は変えない
+    ("tmux", "tmux", "tmux", []),
+    ("herdr", "herdr", "herdr", ["available MUX=herdr", "available MUX=herdr"]),
+    # env 無しなら config
+    (None, "rex", "rex", ["ensure-server MUX=rex"]),
+])
+def test_start_sh_resolves_the_effective_backend_once(tmp_path, env_mux, config_mode,
+                                                      want_mux, want_calls):
+    r, calls = _run_mode_block(tmp_path, env_mux=env_mux, config_mode=config_mode)
+    assert r.returncode == 0, r.stderr
+    assert f"RESULT MUX={want_mux} ENABLED=1" in r.stdout, r.stdout
+    assert calls == want_calls
+    # 実効でない backend の案内を出さない
+    other = "herdr" if want_mux == "rex" else "rex"
+    assert f"{other} 並列モード" not in r.stdout
+
+
+def test_start_sh_rex_server_failure_exits_1_without_falling_back(tmp_path):
+    r, calls = _run_mode_block(tmp_path, env_mux="rex", config_mode="herdr", ensure_rc=1)
+    assert r.returncode == 1
+    assert "rex server を使えません" in r.stderr
+    assert "RESULT" not in r.stdout
+    assert not [c for c in calls if c.startswith("available")]   # herdr に落ちない
+
+
+# ---------------------------------------------------------------------------
+# r1 B: 番号なしの信頼確認ダイアログ (実物の capture の形) と kickoff の誤報告
+# ---------------------------------------------------------------------------
+
+import lib_trust  # noqa: E402
+
+#: 実 Claude (2.1.316) が未信頼 cwd で出した画面 (QA t002 F2 の capture)。選択肢に番号が無い。
+REAL_TRUST_SCREEN = (
+    " Accessing workspace:\n\n /tmp/qa/checkout/.claude/worktrees/x\n\n"
+    " Quick safety check: Is this a project you created or one you trust? (Like your own\n"
+    " code, a well-known open source project, or work from your team). If not, take a\n"
+    " moment to review what's in this folder first.\n\n"
+    " ❯ No, exit\n   Yes, I trust this folder\n\n"
+    " Enter to confirm · Esc to cancel\n"
+)
+
+
+def test_unnumbered_trust_dialog_is_detected_by_both_detectors():
+    assert lib_trust.screen_shows_trust_dialog(REAL_TRUST_SCREEN)
+    assert lib_mux.rex_screen_state(REAL_TRUST_SCREEN) == "blocked"
+    # カーソルが Yes 側でも同じ
+    flipped = REAL_TRUST_SCREEN.replace("❯ No, exit\n   Yes", "  No, exit\n ❯ Yes")
+    assert lib_trust.screen_shows_trust_dialog(flipped)
+    assert lib_mux.rex_screen_state(flipped) == "blocked"
+
+
+def test_numbered_trust_dialog_is_still_detected():
+    assert lib_trust.screen_shows_trust_dialog(TRUST_SCREEN)
+    assert lib_mux.rex_screen_state(TRUST_SCREEN) == "blocked"
+
+
+@pytest.mark.parametrize("screen", [
+    # 文言がパスにあるだけ・隣に権限確認メニュー (メニュー自体は blocked だが trust ではない)
+    "Working directory: /tmp/No, exit\n" + PERMISSION_SCREEN,
+    "cwd: /tmp/Yes, I trust this folder\n" + IDLE_SCREEN,
+    "No, exit\n" + "x" * 200 + "\nYes, I trust this folder\n",
+])
+def test_trust_words_alone_are_not_a_trust_dialog(screen):
+    assert not lib_trust.screen_shows_trust_dialog(screen)
+
+
+@pytest.mark.parametrize("screen", [
+    "cwd: /tmp/Yes, I trust this folder\n" + IDLE_SCREEN,
+    "No, exit\nYes, I trust this folder\n" + IDLE_SCREEN,   # フッタ (Enter to confirm) が無い
+])
+def test_trust_words_alone_do_not_make_a_pane_blocked(screen):
+    assert lib_mux.rex_screen_state(screen) != "blocked"
+
+
+def test_start_sh_does_not_call_a_failed_send_verified():
+    text = (SCRIPTS / "start.sh").read_text(encoding="utf-8")
+    assert '[[ "$_SEND_OK" -eq 1 ]] && mux_verify_sent' in text
+    assert "mux_send \"$WINDOW_NAME\" \"$KICKOFF_MSG\" >/dev/null || true" not in text
+
+
+# ---------------------------------------------------------------------------
+# r1 C / D
+# ---------------------------------------------------------------------------
+
+def test_rex_server_env_drops_every_herdr_variable(monkeypatch):
+    for k in ("HERDR_PANE_ID", "HERDR_TAB_ID", "HERDR_WORKSPACE_ID",
+              "HERDR_BIN_PATH", "HERDR_SOCKET_PATH", "HERDR_FUTURE_VAR"):
+        monkeypatch.setenv(k, "x")
+    monkeypatch.setenv("KEEP_ME", "1")
+    env = lib_mux._rex_server_env()
+    assert not [k for k in env if k.startswith("HERDR_")]
+    assert env.get("KEEP_ME") == "1"
+
+
+def _stop_script_in(tmp_path, repo_dir_name):
+    """crewvia-stop.sh を、' を含む path の偽 checkout で --full --dry-run する。"""
+    root = tmp_path / repo_dir_name
+    (root / "scripts").mkdir(parents=True)
+    (root / "config").mkdir()
+    (root / "config" / "crewvia.yaml").write_text("other: 1\n")
+    # import できない lib_mux = backend を判定できない
+    (root / "scripts" / "lib_mux.py").write_text("raise RuntimeError('boom')\n")
+    (root / "scripts" / "crewvia-stop.sh").write_text(
+        (SCRIPTS / "crewvia-stop.sh").read_text(encoding="utf-8"))
+    return root
+
+
+def test_stop_script_passes_the_path_by_argv_and_never_falls_back_to_herdr():
+    text = (SCRIPTS / "crewvia-stop.sh").read_text(encoding="utf-8")
+    assert "sys.path.insert(0, '${REPO_ROOT}" not in text
+    assert 'sys.argv[1]' in text
+    assert '-z "$_STOP_BACKEND"' in text
+
+
+def test_stop_full_with_unresolvable_backend_stops_no_server(tmp_path):
+    # 判定の python が失敗する (lib_mux が import できない) 偽 checkout。herdr は PATH に無くても
+    # 「止めない」旨のメッセージで分かる。path に ' を含めても壊れない。
+    root = _stop_script_in(tmp_path, "it's a checkout")
+    r = subprocess.run(["bash", str(root / "scripts" / "crewvia-stop.sh"), "--full", "--dry-run"],
+                       capture_output=True, text=True, stdin=subprocess.DEVNULL,
+                       env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path)})
+    out = r.stdout + r.stderr
+    assert "server は停止しません" in out, out
+    assert "herdr server stop..." not in out
+    assert "[dry-run] herdr server stop" not in out

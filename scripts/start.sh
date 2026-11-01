@@ -230,28 +230,52 @@ fi
 # （server 未起動なら lib_mux.py available が detached で起動する）
 # tmux にフォールバックしない（異なる mux に分散する事故防止）。
 if [[ "${ROLE}" == "director" ]] && [[ -z "${CREWVIA_MUX_ENABLED:-}" ]]; then
-  # CREWVIA_MUX=rex: server を (無ければ) 掃除した env で起動し api_revision を検査する。
+  # --- 実効 backend を最初に 1 回だけ解決する (env CREWVIA_MUX > config mode: > auto) ---
+  # server の検査・export・案内文はこの値だけを使う。env と config の mode: が別の
+  # backend を指すとき (例: CREWVIA_MUX=rex + mode: herdr) に、config 側の backend の
+  # 検査や export が env を上書きして食い違う事故を防ぐ (QA F1 / Codex F1)。
+  # env も config も tmux / herdr / rex でなければ _EFFECTIVE_BACKEND は空 (auto / inline)。
+  _ENV_MUX="$(printf '%s' "${CREWVIA_MUX:-}" | tr '[:upper:]' '[:lower:]')"
+  MODE_FROM_CONFIG=$(grep -E '^mode:[[:space:]]*\S' "$CONFIG_FILE" 2>/dev/null | awk '{print $2}' | tr -d '"' | head -1)
+  _EFFECTIVE_BACKEND=""
+  case "$_ENV_MUX" in
+    tmux|herdr|rex) _EFFECTIVE_BACKEND="$_ENV_MUX" ;;
+  esac
+  if [[ -n "$_EFFECTIVE_BACKEND" ]]; then
+    # env が config の mode: より優先。config が別の backend (tmux / herdr / rex) を
+    # 指すときだけ env 側に揃える。config が空 (→ 従来どおり確認プロンプト) や inline
+    # (→ 従来どおり inline) のときと、env == config のときの既存の動作は変えない。
+    case "$MODE_FROM_CONFIG" in
+      tmux|herdr|rex) MODE_FROM_CONFIG="$_EFFECTIVE_BACKEND" ;;
+    esac
+    export CREWVIA_MUX="$_EFFECTIVE_BACKEND"
+  fi
+
+  # rex: server を (無ければ) 掃除した env で起動し api_revision を検査する。
   # herdr と違い lib_mux.py available は server を起動しないので、ここで明示的に行う
   # (rex-mux-backend.md §10.1 案 2)。起動できなければ tmux に落とさず exit 1。
+  _REX_CHECKED=0
   _require_rex() {
     local why="$1"
+    [[ "$_REX_CHECKED" == "1" ]] && return 0
     if ! command -v rex >/dev/null 2>&1; then
       echo "[crewvia] ERROR: ${why} が設定されていますが rex バイナリが見つかりません。" >&2
       echo "          rex をインストールするか CREWVIA_MUX=tmux に変更してください。" >&2
       exit 1
     fi
-    if ! python3 "${SCRIPT_DIR}/lib_mux.py" ensure-server; then
+    if ! CREWVIA_MUX=rex python3 "${SCRIPT_DIR}/lib_mux.py" ensure-server; then
       echo "[crewvia] ERROR: ${why} が設定されていますが rex server を使えません（理由は上）。" >&2
       echo "          'rex server status' / 'rex server logs' を確認してください。" >&2
       exit 1
     fi
+    _REX_CHECKED=1
   }
-  if [[ "${CREWVIA_MUX:-}" == "rex" ]]; then
+  if [[ "$_EFFECTIVE_BACKEND" == "rex" ]]; then
     _require_rex "CREWVIA_MUX=rex"
   fi
 
-  # CREWVIA_MUX が明示指定されている場合は herdr 不在チェックを先に行う
-  if [[ "${CREWVIA_MUX:-}" == "herdr" ]]; then
+  # herdr が実効 backend のときだけ herdr の不在チェックを先に行う
+  if [[ "$_EFFECTIVE_BACKEND" == "herdr" ]]; then
     if ! command -v herdr >/dev/null 2>&1; then
       echo "[crewvia] ERROR: CREWVIA_MUX=herdr が設定されていますが herdr バイナリが見つかりません。" >&2
       echo "          herdr をインストールするか CREWVIA_MUX=tmux に変更してください。" >&2
@@ -264,12 +288,10 @@ if [[ "${ROLE}" == "director" ]] && [[ -z "${CREWVIA_MUX_ENABLED:-}" ]]; then
     fi
   fi
 
-  # config/crewvia.yaml の mode 設定を読む
-  MODE_FROM_CONFIG=$(grep -E '^mode:[[:space:]]*\S' "$CONFIG_FILE" 2>/dev/null | awk '{print $2}' | tr -d '"' | head -1)
   if [[ "$MODE_FROM_CONFIG" == "herdr" ]]; then
     # herdr backend を config で指定している場合も不在チェック
     if ! command -v herdr >/dev/null 2>&1 || ! python3 "${SCRIPT_DIR}/lib_mux.py" available >/dev/null 2>&1; then
-      echo "[crewvia] ERROR: config に mode: herdr が設定されていますが herdr が利用できません。" >&2
+      echo "[crewvia] ERROR: ${_EFFECTIVE_BACKEND:+CREWVIA_MUX=herdr / }mode: herdr が設定されていますが herdr が利用できません。" >&2
       exit 1
     fi
     export CREWVIA_MUX=herdr
@@ -994,12 +1016,17 @@ PYEOF
       # 送る直前にもう一度: `❯` を見つけた後にダイアログが出た場合の窓 (t021)。送信直前は
       # 厳格な網 (_require_no_trust_dialog) を使う — 観測できないまま Enter を送らない (t051 P2)。
       _require_no_trust_dialog "kickoff 送信前 (${_kickoff_attempt}/3)"
-      mux_send "$WINDOW_NAME" "$KICKOFF_MSG" >/dev/null || true
+      # send が False (Rex: 入力欄が空と確認できない・pane の前面がシェル等) のとき、
+      # verify_sent は「入力行に残っていない」だけで True を返す (そもそも打っていない
+      # だけでも)。send の戻り値を無視して「verified」と言わない。
+      _SEND_OK=0
+      mux_send "$WINDOW_NAME" "$KICKOFF_MSG" >/dev/null && _SEND_OK=1
       sleep 1.5
-      if mux_verify_sent "$WINDOW_NAME" "$KICKOFF_MSG"; then
+      if [[ "$_SEND_OK" -eq 1 ]] && mux_verify_sent "$WINDOW_NAME" "$KICKOFF_MSG"; then
         _KICKOFF_LANDED=1
         break
       fi
+      [[ "$_SEND_OK" -eq 1 ]] || echo "[crewvia] WARNING: mux_send が失敗しました (${_kickoff_attempt}/3)" >&2
       echo "[crewvia] WARNING: kickoff message not confirmed in $WINDOW_NAME (attempt ${_kickoff_attempt}/3)" >&2
       sleep 2
     done

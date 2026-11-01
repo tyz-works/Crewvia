@@ -4667,6 +4667,11 @@ def rex_worker_provenance(record, *, window_id, server_before, server_after,
 _REX_SERVER_ENV_DENY_EXTRA = frozenset({
     "SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY",
 })
+#: Every `HERDR_*` variable (HERDR_PANE_ID / HERDR_TAB_ID / HERDR_WORKSPACE_ID /
+#: HERDR_BIN_PATH / HERDR_SOCKET_PATH ...) names the herdr session that started
+#: `./crewvia`.  A Rex server that inherits them hands them to every pane, so a
+#: Worker believes it is inside herdr.  Prefix match: no list to fall behind.
+_REX_SERVER_ENV_DENY_PREFIXES = ("HERDR_",)
 
 
 def _rex_server_env() -> dict:
@@ -4680,6 +4685,7 @@ def _rex_server_env() -> dict:
         if k not in _HERDR_SERVER_ENV_DENY_EXACT
         and k not in _REX_SERVER_ENV_DENY_EXTRA
         and not k.startswith(_HERDR_SERVER_ENV_DENY_PREFIXES)
+        and not k.startswith(_REX_SERVER_ENV_DENY_PREFIXES)
     }
 
 
@@ -4790,6 +4796,10 @@ _REX_DIALOG_OPTION_RE = re.compile(r"[❯›]\s*1[.)]\s*\S")
 _REX_DIALOG_FOOTER_RE = re.compile(
     r"(enter to confirm|esc to cancel|do you want to|would you like to)",
     re.IGNORECASE)
+_REX_TRUST_UNNUMBERED_RE = re.compile(
+    r"(?:[❯›]\s*)?no,\s*exit\b[\s\S]{0,60}?yes,?\s*(?:i\s*)?(?:trust\s*this\s*folder|proceed)\b"
+    r"|yes,?\s*(?:i\s*)?(?:trust\s*this\s*folder|proceed)\b[\s\S]{0,60}?no,\s*exit\b",
+    re.IGNORECASE)
 _REX_WORKING_RE = re.compile(r"esc to interrupt", re.IGNORECASE)
 _REX_STATE_TAIL_LINES = 30
 
@@ -4808,6 +4818,10 @@ def rex_screen_state(screen: str) -> str:
     tail = screen.splitlines()[-_REX_STATE_TAIL_LINES:]
     text = "\n".join(tail)
     if _REX_DIALOG_OPTION_RE.search(text) and _REX_DIALOG_FOOTER_RE.search(text):
+        return "blocked"
+    # 番号なしの信頼確認ダイアログ (`❯ No, exit` / `Yes, I trust this folder` /
+    # `Enter to confirm`)。実物の capture で確認した形。
+    if _REX_DIALOG_FOOTER_RE.search(text) and _REX_TRUST_UNNUMBERED_RE.search(text):
         return "blocked"
     if _REX_WORKING_RE.search("\n".join(tail[-8:])):
         return "working"

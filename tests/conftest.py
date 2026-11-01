@@ -67,6 +67,11 @@ def pytest_configure(config):
     os.environ["CREWVIA_MUX_TEST_ISOLATION"] = "1"
     os.environ["CREWVIA_TMUX_SESSION"] = TEST_DESTINATION
     os.environ["CREWVIA_HERDR_WORKSPACE"] = TEST_DESTINATION
+    # Rex: 宛先 (session) だけを隔離する。socket (CREWVIA_REX_SOCK) は**ここでは置かない**:
+    # 置かないと lib_mux は rex を一切実行しない (既定の socket = 本番の server を指さない)。
+    # 本物 / 偽の rex を使うテストだけが自分の socket を置く (tests/rex_harness.py)。
+    os.environ["CREWVIA_REX_SESSION"] = TEST_DESTINATION
+    os.environ.pop("CREWVIA_REX_SOCK", None)
     os.environ["CREWVIA_MUX_PANE_PREFIX"] = TEST_PANE_PREFIX
 
     # テストが起こした子孫プロセスを、テストの終わりまでに残させない (t029 / backlog #32)。

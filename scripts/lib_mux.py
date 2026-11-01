@@ -4,10 +4,11 @@
 Backends:
   TmuxBackend  — wraps current tmux CLI calls verbatim (Phase 1)
   HerdrBackend — herdr terminal workspace manager (Phase 2)
+  RexBackend   — Rex (knowledge/rex-mux-backend.md; opt-in with CREWVIA_MUX=rex)
 
 Backend selection (highest priority first):
-  1. CREWVIA_MUX env  ("tmux" | "herdr")
-  2. config/crewvia.yaml  `mode: tmux|herdr|inline`
+  1. CREWVIA_MUX env  ("tmux" | "herdr" | "rex")
+  2. config/crewvia.yaml  `mode: tmux|herdr|rex|inline`
   3. Auto: use tmux if `tmux` is in PATH
 
 Usage as module:
@@ -47,18 +48,23 @@ CLI usage (for bash callers):
 
 import calendar
 import contextlib
+import ctypes
 import errno
 import fcntl
 import json
 import os
+import platform
 import re
+import select
 import shutil
+import signal
 import socket
 import struct
 import subprocess
 import sys
 import threading
 import time
+from collections import namedtuple
 from pathlib import Path
 from typing import List, Optional
 
@@ -218,17 +224,19 @@ def _guard_test_isolation(backend: str, verb: str, name: str,
 # sent: tmux would type an unknown word literally, and a half-delivered key
 # sequence in front of a dialog is worse than none.
 
-#: caller's key name (lower-case) -> (tmux name, herdr name)
+#: caller's key name (lower-case) -> (tmux name, herdr name, rex name)
 _KEY_NAMES = {
-    "up":     ("Up",     "up"),
-    "down":   ("Down",   "down"),
-    "left":   ("Left",   "left"),
-    "right":  ("Right",  "right"),
-    "enter":  ("Enter",  "enter"),
-    "escape": ("Escape", "esc"),
-    "esc":    ("Escape", "esc"),
-    "tab":    ("Tab",    "tab"),
+    "up":     ("Up",     "up",    "up"),
+    "down":   ("Down",   "down",  "down"),
+    "left":   ("Left",   "left",  "left"),
+    "right":  ("Right",  "right", "right"),
+    "enter":  ("Enter",  "enter", "enter"),
+    "escape": ("Escape", "esc",   "escape"),
+    "esc":    ("Escape", "esc",   "escape"),
+    "tab":    ("Tab",    "tab",   "tab"),
 }
+
+_KEY_COLUMNS = {"tmux": 0, "herdr": 1, "rex": 2}
 
 
 def translate_keys(keys, backend: str):
@@ -242,7 +250,7 @@ def translate_keys(keys, backend: str):
     keys = list(keys)
     if not keys:
         return [], ["<none>"]
-    column = 0 if backend == "tmux" else 1
+    column = _KEY_COLUMNS.get(backend, 1)
     unknown = [k for k in keys if str(k).lower() not in _KEY_NAMES]
     if unknown:
         return [], unknown
@@ -287,7 +295,7 @@ def _config_mode(config_path: Optional[Path] = None) -> Optional[str]:
     `config_path` overrides the file read — only ever passed by tests; every
     real caller uses the default (this script's own repo root).
 
-    Returns "tmux", "herdr", "inline", or None if not found / unreadable.
+    Returns "tmux", "herdr", "rex", "inline", or None if not found / unreadable.
     """
     if config_path is None:
         script_dir = Path(__file__).parent
@@ -309,7 +317,7 @@ def _config_mode(config_path: Optional[Path] = None) -> Optional[str]:
                 # watchdog blind — mux.list() came back empty against a dead
                 # tmux session, so every live Worker looked "window gone").
                 value = value.split("#", 1)[0].strip().strip('"').strip("'")
-                if value in ("tmux", "herdr", "inline"):
+                if value in ("tmux", "herdr", "rex", "inline"):
                     return value
     except Exception:
         pass
@@ -323,10 +331,14 @@ def _select_backend() -> "type":
         return HerdrBackend
     if env_mux == "tmux":
         return TmuxBackend
+    if env_mux == "rex":
+        return RexBackend
 
     config = _config_mode()
     if config == "herdr":
         return HerdrBackend
+    if config == "rex":
+        return RexBackend
     if config == "tmux":
         return TmuxBackend
     # config == "inline" or unknown → auto
@@ -1589,7 +1601,8 @@ def _pane_record_lock(repo_root=None, *, create: bool = False,
 
 
 def write_pane_record(name: str, backend: str, handle: str, *,
-                      pane_id: str = "", server=None, repo_root=None) -> bool:
+                      pane_id: str = "", server=None, repo_root=None,
+                      extra: Optional[dict] = None) -> bool:
     """Note that *this* checkout created `name`'s pane, as `handle`.
 
     `server` is `(endpoint, generation)` for the mux server the pane was
@@ -1637,6 +1650,12 @@ def write_pane_record(name: str, backend: str, handle: str, *,
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "server": {"endpoint": endpoint, "generation": generation},
     }
+    if extra:
+        # Backend-specific facts (Rex: block / window / session ids and the
+        # child process with its start time).  Never overrides the fields the
+        # guard reads.
+        for key, value in extra.items():
+            record.setdefault(key, value)
     try:
         # The lock covers the write so the sweep's compare-and-drop cannot
         # land between "judged the old record" and "unlinked": either it sees
@@ -4040,6 +4059,1098 @@ class HerdrBackend(_Backend):
         except (KeyError, TypeError):
             # agent_status field absent (older herdr or non-Claude pane) → unknown.
             return "unknown"
+
+
+# ---------------------------------------------------------------------------
+# Rex backend (knowledge/rex-mux-backend.md)
+# ---------------------------------------------------------------------------
+#
+# Rex (https://www.superlogical.com/rex/docs/) as a third mux.  Nothing here
+# runs unless `CREWVIA_MUX=rex` / `mode: rex` selects it.
+#
+# The four things that make it unlike herdr (design doc §1):
+#
+#   * A Rex **label is not unique**.  The name <-> block_id truth is the spawn
+#     record (`registry/mux/<name>.json`); a label only cross-checks it.
+#   * `block close` cannot be conditioned on "the process I inspected", so it
+#     is never used to destroy or to tidy up.  Destruction is a signal on a
+#     **pidfd** of an inspected process (and of its descendants, enumerated
+#     before the first signal).  No pidfd -> no kill (fail-closed).
+#   * `may_destroy_pane()` says "yes" to every name that is not a daemon, so
+#     Workers are judged by `rex_worker_provenance()` against the record.
+#   * Every call goes through `_rex_run()`: `-S`, `--autostart=false`, a
+#     timeout, `stdin=DEVNULL`, and never an empty block id.
+
+#: The only `server status` api_revision this code was measured against.  Any
+#: other value (or none) -> `available()` is False; no silent fall-back to
+#: another backend (design doc §7).
+_REX_API_REVISIONS = frozenset({9})
+
+#: sun_path is 108 bytes on Linux; a longer endpoint cannot be bound.
+_REX_SOCK_MAX_BYTES = 108
+
+_REX_TIMEOUT = 10.0
+
+#: `rex send` refuses a request over 65536 encoded bytes (measured: 180223 ->
+#: "control message too large", exit 1).  Stay well under; a longer text is
+#: refused as a whole, never cut.
+_REX_MAX_SEND_BYTES = 32768
+
+#: Claude Code's empty input line carries a placeholder hint.
+_REX_PLACEHOLDER_PREFIX = 'Try "'
+
+#: pidfd_open / pidfd_send_signal — measured on x86_64 only; aarch64 is unmeasured.
+#: Any other machine: no pidfd -> kill is refused.
+_REX_SYS_PIDFD = {"x86_64": (434, 424)}
+
+RexResult = namedtuple("RexResult", "rc out err timed_out")
+
+
+def _rex_sock() -> Optional[str]:
+    """The socket the test run pointed Rex at, or None.
+
+    `CREWVIA_REX_SOCK` is **test-only**: it is read only while the test
+    isolation marker is set.  In production it is not read at all (and its
+    presence makes Rex unavailable, see `_rex_endpoint()`), so ping target and
+    server bind target cannot drift apart the way `CREWVIA_HERDR_SOCK` could.
+    """
+    return os.environ.get("CREWVIA_REX_SOCK") or None
+
+
+def _rex_endpoint():
+    """`(ok, endpoint_or_None, problem)` for the server every call talks to.
+
+    * production, `CREWVIA_REX_SOCK` unset -> `(True, None, "")`: Rex's own
+      default endpoint (no `-S`).
+    * production, `CREWVIA_REX_SOCK` set -> refused (a test knob in production).
+    * test run, `CREWVIA_REX_SOCK` unset -> refused: that would be the
+      production server.
+    * test run, set -> `unix://<sock>`, which must fit in sun_path.
+    """
+    sock = _rex_sock()
+    if not _test_isolation_active():
+        if sock:
+            return False, None, (
+                "CREWVIA_REX_SOCK is set outside a test run — it is a "
+                "test-only override and is not honoured in production")
+        return True, None, ""
+    if not sock:
+        return False, None, (
+            "under test isolation CREWVIA_REX_SOCK must name the test's own "
+            "server; the default socket is production's")
+    if len(sock.encode("utf-8")) > _REX_SOCK_MAX_BYTES:
+        return False, None, (
+            f"the socket path is longer than {_REX_SOCK_MAX_BYTES} bytes "
+            f"(sun_path), so a server could not bind it")
+    return True, f"unix://{sock}", ""
+
+
+def _rex_session_label() -> str:
+    return os.environ.get("CREWVIA_REX_SESSION") or _DEFAULT_SESSION
+
+
+def _rex_run(args: List[str], timeout: float = _REX_TIMEOUT):
+    """Run `rex ... <args>`; a `RexResult`, or None when nothing was run.
+
+    The single place `rex` is executed.  Every call gets the endpoint,
+    `--autostart=false` (a missing server must never be started by a probe),
+    a timeout and `stdin=DEVNULL` (a `rex send` with no target reads stdin and
+    waits forever — measured).  A selector flag (`-b` / `-s` / `-w`) with an
+    empty or missing value is refused before anything runs, and so is an empty
+    argument: that is how a block id that failed to resolve would otherwise
+    become "send to whatever the CLI picks".
+    """
+    ok, endpoint, problem = _rex_endpoint()
+    if not ok:
+        print(f"[mux:rex] WARNING: not running rex: {problem}", file=sys.stderr)
+        return None
+    args = [str(a) for a in args]
+    for i, a in enumerate(args):
+        if a == "":
+            print("[mux:rex] WARNING: refusing a rex call with an empty "
+                  "argument", file=sys.stderr)
+            return None
+        if a in ("-b", "-s", "-w") and (i + 1 >= len(args) or not args[i + 1]):
+            print(f"[mux:rex] WARNING: refusing a rex call with {a} and no "
+                  f"value", file=sys.stderr)
+            return None
+    scope = ["-S", endpoint] if endpoint else []
+    try:
+        r = subprocess.run(["rex", *scope, "--autostart=false", *args],
+                           stdin=subprocess.DEVNULL, capture_output=True,
+                           text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return RexResult(None, "", "", True)
+    except Exception as exc:  # FileNotFoundError, PermissionError, ...
+        print(f"[mux:rex] WARNING: rex could not be run: {exc}",
+              file=sys.stderr)
+        return None
+    return RexResult(r.returncode, r.stdout, r.stderr, False)
+
+
+def _rex_json(res):
+    """The JSON object `res` carries on a clean exit, or None.
+
+    `None` is "could not read" — never `{}`.  Duplicate-free parsing is not
+    needed (the output is Rex's own), but anything that is not a JSON object is
+    unreadable.
+    """
+    if res is None or res.rc != 0:
+        return None
+    try:
+        data = json.loads(res.out)
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _rex_not_found(res) -> bool:
+    """True only for a definite "that target does not exist".
+
+    Measured: a missing block is exit 3 + `block target "…" not found`; but an
+    **ambiguous** label is also exit 3 (`… is ambiguous`), and a stopped
+    server is exit 4.  So the exit code alone proves nothing.
+    """
+    return (res is not None and res.rc == 3
+            and "not found" in res.err and "ambiguous" not in res.err)
+
+
+def _rex_status_from(res):
+    """The validated object of a `rex server status --json` result, or None."""
+    data = _rex_json(res)
+    if data is None:
+        return None
+    endpoint, pid, iid, rev = (data.get("endpoint"), data.get("pid"),
+                               data.get("instance_id"),
+                               data.get("api_revision"))
+    if (not isinstance(endpoint, str) or not endpoint
+            or isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0
+            or not isinstance(iid, str) or not iid
+            or isinstance(rev, bool) or not isinstance(rev, int)):
+        return None
+    return data
+
+
+def _rex_status(timeout: float = 5.0):
+    """The validated `rex server status --json` object, or None."""
+    return _rex_status_from(
+        _rex_run(["server", "status", "--json"], timeout=timeout))
+
+
+def _rex_generation(status: dict) -> str:
+    return f"{status['instance_id']}:{status['pid']}"
+
+
+def _rex_start_time(pid) -> Optional[str]:
+    """Field 22 of `/proc/<pid>/stat`, or None when it cannot be read."""
+    status, fields = _proc_stat_fields(pid)
+    if status != _PROC_OK or len(fields) < 20:
+        return None
+    return fields[19]
+
+
+# -- pidfd (ctypes: the uv build of python 3.12 has no os.pidfd_open) --------
+
+def _rex_pidfd_numbers():
+    return _REX_SYS_PIDFD.get(platform.machine())
+
+
+def _pidfd_open(pid: int) -> Optional[int]:
+    nums = _rex_pidfd_numbers()
+    if nums is None:
+        return None
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        fd = libc.syscall(ctypes.c_long(nums[0]), ctypes.c_int(int(pid)),
+                          ctypes.c_uint(0))
+    except Exception:
+        return None
+    return fd if fd >= 0 else None
+
+
+def _pidfd_signal(fd: int, sig: int) -> str:
+    """`"ok"` / `"gone"` (ESRCH) / `"error"`."""
+    nums = _rex_pidfd_numbers()
+    if nums is None:
+        return "error"
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        rc = libc.syscall(ctypes.c_long(nums[1]), ctypes.c_int(fd),
+                          ctypes.c_int(sig), None, ctypes.c_uint(0))
+        if rc == 0:
+            return "ok"
+        return "gone" if ctypes.get_errno() == errno.ESRCH else "error"
+    except Exception:
+        return "error"
+
+
+def _pidfd_exited(fd: int, timeout: float = 0.0) -> bool:
+    """True once the process behind `fd` has terminated (fd readable)."""
+    try:
+        poller = select.poll()
+        poller.register(fd, select.POLLIN)
+        return bool(poller.poll(int(timeout * 1000)))
+    except Exception:
+        return False
+
+
+def _rex_scan_tree(root_pid: int, root_sid: Optional[str], known=()):
+    """`{pid: (ppid, starttime)}` for `root_pid`'s live descendants and its
+    session members, from one pass over `/proc` (the root itself included).
+
+    A descendant is anything reachable by ppid from the root **or** from
+    `known` (pids already held); a session member is anything whose session id
+    equals the root's (`setsid`-detached children are caught by ppid chains,
+    session-mates by sid).  `None` when `/proc` cannot be listed.
+    """
+    try:
+        names = [e.name for e in Path("/proc").iterdir() if e.name.isdigit()]
+    except OSError:
+        return None
+    table = {}
+    for n in names:
+        status, f = _proc_stat_fields(n)
+        if status != _PROC_OK or len(f) < 20 or f[0] in ("Z", "X"):
+            continue
+        try:
+            table[int(n)] = (int(f[1]), f[19], f[3])
+        except ValueError:
+            continue
+    seeds = {root_pid, *known}
+    found = {p for p in seeds if p in table}
+    changed = True
+    while changed:
+        changed = False
+        for pid, (ppid, _st, sid) in table.items():
+            if pid in found:
+                continue
+            if ppid in found or (root_sid is not None and sid == root_sid
+                                 and pid != 0):
+                found.add(pid)
+                changed = True
+    return {p: (table[p][0], table[p][1]) for p in found}
+
+
+def _rex_grace(sig) -> float:
+    """How long to wait for the processes to go after `sig`."""
+    return 2.0 if sig == signal.SIGKILL else 1.5
+
+
+#: Test seam: called after the descendants were enumerated and before a signal
+#: is sent, so a race ("a child forks right here") can be injected.
+_rex_after_enumerate = None
+
+
+def _rex_destroy_tree(root_pid: int, root_start: str, *, signals, grace,
+                      warn) -> bool:
+    """Signal `root_pid` and its descendants through pidfds; True only when
+    every one of them has terminated.
+
+    Order of operations (design doc §5.2): the root pidfd is opened first and
+    its starttime re-read *after* that, so a recycled pid is refused; the
+    descendants are enumerated **before** the first signal (killing the parent
+    first re-parents them to pid 1 and the tree is gone), each one pidfd-opened
+    and starttime-checked against the enumeration; the enumeration is repeated
+    before every later stage to catch a fork that raced the previous one.
+    """
+    held = {}      # pid -> (pidfd, starttime)
+
+    def close_all():
+        for fd, _ in held.values():
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    fd = _pidfd_open(root_pid)
+    if fd is None:
+        warn(f"kill: pidfd_open({root_pid}) is not available here — refusing "
+             f"to signal by pid (a pid can be recycled). Nothing was killed.")
+        return False
+    held[root_pid] = (fd, root_start)
+    if _rex_start_time(root_pid) != root_start:
+        warn(f"kill: pid {root_pid} is not the process that was inspected "
+             f"(start time changed). Nothing was killed.")
+        close_all()
+        return False
+    try:
+        sid_status, f = _proc_stat_fields(root_pid)
+        root_sid = f[3] if sid_status == _PROC_OK and len(f) > 3 else None
+        # Only a session leader's session id names a group that is ours.
+        if root_sid != str(root_pid):
+            root_sid = None
+
+        def enumerate_more() -> bool:
+            tree = _rex_scan_tree(root_pid, root_sid, known=held.keys())
+            if tree is None:
+                return False
+            for pid, (_ppid, st) in tree.items():
+                if pid in held:
+                    continue
+                cfd = _pidfd_open(pid)
+                if cfd is None:
+                    continue
+                # open first, then read: if the pid was recycled between the
+                # scan and the open, the start time differs.
+                if _rex_start_time(pid) != st:
+                    os.close(cfd)
+                    continue
+                held[pid] = (cfd, st)
+            return True
+
+        for sig in signals:
+            if not enumerate_more():
+                warn("kill: /proc could not be scanned for descendants; "
+                     "refusing to go on.")
+                return False
+            if _rex_after_enumerate is not None:
+                _rex_after_enumerate()
+                enumerate_more()
+            ppids = {p: _rex_scan_ppid(p) for p in held}
+            order = sorted(held, key=lambda p: -_depth(p, ppids))
+            for pid in order:
+                _pidfd_signal(held[pid][0], sig)
+            deadline = time.monotonic() + grace(sig)
+            while time.monotonic() < deadline:
+                if all(_pidfd_exited(fd) for fd, _ in held.values()):
+                    break
+                time.sleep(0.05)
+            if all(_pidfd_exited(fd) for fd, _ in held.values()):
+                # One last look: a child forked while we waited, and still
+                # alive, means the tree is not gone yet.
+                late = _rex_scan_tree(root_pid, root_sid, known=held.keys())
+                stragglers = [] if late is None else [
+                    p for p in late
+                    if p not in held and _is_descendant_of(p, held)]
+                if not stragglers:
+                    return True
+                if sig == signals[-1]:
+                    warn(f"kill: process(es) {sorted(stragglers)} appeared "
+                         f"during the last stage and are still alive.")
+                    return False
+        alive = [p for p, (fd, _) in held.items() if not _pidfd_exited(fd)]
+        if alive:
+            warn(f"kill: process(es) {sorted(alive)} did not terminate.")
+            return False
+        return True
+    finally:
+        close_all()
+
+
+def _rex_scan_ppid(pid: int) -> Optional[int]:
+    status, f = _proc_stat_fields(pid)
+    if status != _PROC_OK or len(f) < 2:
+        return None
+    try:
+        return int(f[1])
+    except ValueError:
+        return None
+
+
+def _depth(pid, ppids) -> int:
+    d, seen = 0, set()
+    while pid in ppids and pid not in seen:
+        seen.add(pid)
+        pid = ppids[pid]
+        d += 1
+    return d
+
+
+def _is_descendant_of(pid: int, held) -> bool:
+    seen = set()
+    while pid and pid not in seen:
+        seen.add(pid)
+        if pid in held:
+            return True
+        pid = _rex_scan_ppid(pid) or 0
+    return False
+
+
+def rex_worker_provenance(record, *, window_id, server_before, server_after,
+                          pid, starttime, ppid, server_pid, repo_root=None):
+    """`(ok, reason)` — does the spawn record vouch for this process?
+
+    `may_destroy_pane()` answers "yes" to every name that is not a daemon, so a
+    Worker's kill would otherwise be judged by nothing at all.  This compares
+    the **record written at spawn time** with what is observed now (not two raw
+    observations with each other).  Anything missing is a refusal.
+
+    `server_before` / `server_after` are `(endpoint, generation)` read before
+    and after the process pidfd was opened; both must equal the recorded
+    binding.  The handle compared is the record's `window_id` — never the
+    block id (that mismatch refuses every legitimate kill).
+    """
+    if not isinstance(record, dict):
+        return False, "there is no spawn record"
+    if record.get("backend") != "rex":
+        return False, (f"the spawn record was written by the "
+                       f"{record.get('backend')!r} backend")
+    written_by = record.get("checkout")
+    if not written_by or str(written_by) != _record_checkout_identity(repo_root):
+        return False, "the spawn record was not written by this checkout"
+    handle = str(record.get("handle") or "")
+    if not handle or not window_id or handle != str(window_id):
+        return False, (f"the record's handle {handle!r} is not the window "
+                       f"{window_id!r} the block is in now")
+    bound = record.get("server")
+    if not isinstance(bound, dict):
+        return False, "the spawn record names no server"
+    want = (str(bound.get("endpoint") or ""), str(bound.get("generation") or ""))
+    if not all(want):
+        return False, "the spawn record binds to an incomplete server"
+    for label, seen in (("before", server_before), ("after", server_after)):
+        if not seen or (str(seen[0]), str(seen[1])) != want:
+            return False, (f"the server {label} the process was pinned is "
+                           f"{seen!r}, the record is bound to {want!r}")
+    child = record.get("child")
+    if not isinstance(child, dict):
+        return False, "the spawn record carries no child process"
+    if child.get("pid") != pid or str(child.get("starttime") or "") != str(starttime):
+        return False, (f"the recorded child {child!r} is not pid {pid} "
+                       f"(start time {starttime!r})")
+    if ppid != server_pid:
+        return False, (f"pid {pid} is not a direct child of the server "
+                       f"(ppid {ppid}, server {server_pid})")
+    return True, "the spawn record matches the process"
+
+
+def _rex_input_box(screen: str):
+    """The lines of Claude Code's input box (between the two rules), or None."""
+    lines = screen.splitlines()
+    rules = [i for i, l in enumerate(lines)
+             if len(l) >= 20 and set(l.strip()) == {"─"}]
+    for a, b in zip(rules, rules[1:]):
+        if b > a + 1 and lines[a + 1].startswith("❯"):
+            return lines[a + 1:b]
+    return None
+
+
+def _rex_input_is_empty(screen: str) -> Optional[bool]:
+    """True: the box shows only `❯` (or its placeholder).  False: there is
+    text.  None: no input box on screen."""
+    box = _rex_input_box(screen)
+    if box is None:
+        return None
+    if len(box) != 1:
+        return False
+    rest = box[0][1:].strip()
+    return rest == "" or rest.startswith(_REX_PLACEHOLDER_PREFIX)
+
+
+class RexBackend(_Backend):
+    """Rex backend — see knowledge/rex-mux-backend.md.
+
+    session `CREWVIA_REX_SESSION` (default `crewvia`) holds one window per
+    name; the **block id in the spawn record** is the identity, the label is a
+    cross-check.  State (`state()`) is always `unknown`.
+    """
+
+    BACKEND_NAME = "rex"
+
+    # -- plumbing ----------------------------------------------------------
+
+    def _guard(self, verb: str, name: str) -> None:
+        _guard_test_isolation(self.BACKEND_NAME, verb, name,
+                              _rex_session_label())
+        ok, _ep, problem = _rex_endpoint()
+        if not ok and _test_isolation_active():
+            raise MuxTestIsolationError(
+                f"[mux:rex] refusing {verb}({name!r}) under test isolation: "
+                f"{problem}. Nothing was executed.")
+
+    def server_identity(self):
+        status = _rex_status()
+        if status is None:
+            return None
+        return status["endpoint"], _rex_generation(status)
+
+    def available(self) -> bool:
+        if shutil.which("rex") is None:
+            return False
+        ok, _ep, problem = _rex_endpoint()
+        if not ok:
+            self._warn(problem)
+            return False
+        status = _rex_status()
+        if status is None:
+            return False
+        if status["api_revision"] not in _REX_API_REVISIONS:
+            self._warn(
+                f"rex api_revision {status['api_revision']} is not one this "
+                f"code was measured against {sorted(_REX_API_REVISIONS)}; "
+                f"not using it (no other backend is substituted)")
+            return False
+        return True
+
+    def server_running(self) -> bool:
+        return _rex_status() is not None
+
+    def state(self, name: str) -> str:
+        return "unknown"        # Rex has no agent-status API (design doc §4)
+
+    # -- ids ---------------------------------------------------------------
+
+    def _session_ids(self):
+        """`(ids, error)` — session ids whose label is the configured one."""
+        data = _rex_json(_rex_run(["ls", "--json"]))
+        sessions = data.get("sessions") if data else None
+        if not isinstance(sessions, list):
+            return [], "sessions could not be listed"
+        label = _rex_session_label()
+        ids = []
+        for s in sessions:
+            if not isinstance(s, dict) or not isinstance(s.get("session_id"), str):
+                return [], "a session entry was unreadable"
+            if s.get("label") == label:
+                ids.append(s["session_id"])
+        return ids, None
+
+    def _blocks(self, session_id: str):
+        """The session's block entries, or None when unreadable."""
+        data = _rex_json(_rex_run(["block", "ls", "-s", session_id, "--json"]))
+        blocks = data.get("blocks") if data else None
+        if not isinstance(blocks, list):
+            return None
+        out = []
+        for b in blocks:
+            if not isinstance(b, dict) or not isinstance(b.get("block_id"), str):
+                return None
+            out.append({"block_id": b["block_id"],
+                        "label": b.get("label") if isinstance(b.get("label"), str) else "",
+                        "window_id": b.get("window_id") if isinstance(b.get("window_id"), str) else ""})
+        return out
+
+    def _process(self, block_id: str):
+        """`("ok", obj)` / `("gone", None)` / `("unreadable", None)`."""
+        res = _rex_run(["block", "call", "process", "{}", "-b", block_id])
+        if _rex_not_found(res):
+            return "gone", None
+        data = _rex_json(res)
+        return ("ok", data) if data is not None else ("unreadable", None)
+
+    @staticmethod
+    def _child_of(proc):
+        """The `child` object with an int pid, or None."""
+        child = proc.get("child") if isinstance(proc, dict) else None
+        if isinstance(child, dict):
+            pid = child.get("pid")
+            if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0:
+                return child
+        return None
+
+    def _resolve(self, name: str):
+        """`{record, block_id, window_id, session_id}` for `name`, or None.
+
+        Name -> **record** -> block id.  The label is only checked: the block
+        the record names must still carry this name's label, so a block
+        somebody else created under the same label is never reached, and a
+        renamed one is not mistaken for ours.
+        """
+        record = read_pane_record(name)
+        if not isinstance(record, dict) or record.get("backend") != "rex":
+            return None
+        block_id = record.get("block_id")
+        session_id = record.get("session_id")
+        if not isinstance(block_id, str) or not block_id \
+                or not isinstance(session_id, str) or not session_id:
+            return None
+        blocks = self._blocks(session_id)
+        if blocks is None:
+            return None
+        for b in blocks:
+            if b["block_id"] == block_id:
+                if b["label"] != _pane_name(name):
+                    self._warn(f"{name!r}: the recorded block now has label "
+                               f"{b['label']!r}; not treating it as ours")
+                    return None
+                return {"record": record, "block_id": block_id,
+                        "window_id": b["window_id"], "session_id": session_id}
+        return None
+
+    def record_existence(self, name: str, record: dict,
+                         timeout: Optional[float] = None) -> str:
+        """Asked by the id in the record, on the generation the record names.
+
+        The server's `instance_id` is read before **and** after the question;
+        a server that changed (or cannot be read) in between makes any answer —
+        including "not found" — worthless, because a restored server hands the
+        same block id back (design doc §4).
+        """
+        bound = record.get("server") if isinstance(record, dict) else None
+        block_id = record.get("block_id") if isinstance(record, dict) else None
+        if not isinstance(bound, dict) or not isinstance(block_id, str) or not block_id:
+            return PANE_UNOBSERVED
+        want = str(bound.get("generation") or "")
+        t = 5.0 if timeout is None else max(timeout, 0.1)
+        before = _rex_run(["server", "status", "--json"], timeout=t)
+        if before is not None and before.timed_out:
+            return PANE_UNANSWERED
+        b = _rex_status_from(before)
+        if b is None or _rex_generation(b) != want:
+            return PANE_UNOBSERVED
+        res = _rex_run(["block", "inspect", block_id, "--json"], timeout=t)
+        if res is not None and res.timed_out:
+            return PANE_UNANSWERED
+        after = _rex_run(["server", "status", "--json"], timeout=t)
+        a = _rex_status_from(after)
+        if a is None or _rex_generation(a) != want:
+            return PANE_UNOBSERVED
+        if res is not None and res.rc == 0:
+            return PANE_EXISTS
+        if _rex_not_found(res):
+            return PANE_GONE
+        return PANE_UNOBSERVED
+
+    # -- spawn -------------------------------------------------------------
+
+    def _ensure_session(self):
+        """The one session id, creating it if there is none.  None on doubt
+        (unreadable, or more than one session with the label)."""
+        ids, err = self._session_ids()
+        if err:
+            self._warn(err)
+            return None
+        if len(ids) > 1:
+            self._warn(f"{len(ids)} sessions are labelled "
+                       f"{_rex_session_label()!r}; refusing to pick one")
+            return None
+        if ids:
+            return ids[0]
+        data = _rex_json(_rex_run(
+            ["new", _rex_session_label(), "--cwd",
+             os.environ.get("CREWVIA_REPO_ROOT") or str(_SCRIPTS_DIR.parent),
+             "--json"]))
+        sid = data.get("session_id") if data else None
+        if not isinstance(sid, str) or not sid:
+            self._warn("creating the session failed")
+            return None
+        return sid
+
+    def _husk_state(self, proc) -> str:
+        """`PANE_IDLE` / `PANE_LIVE` / `PANE_UNKNOWN` for a `process` answer."""
+        if not isinstance(proc, dict):
+            return PANE_UNKNOWN
+        child = self._child_of(proc)
+        if child is None:
+            return PANE_IDLE if proc.get("last_exit") is not None else PANE_UNKNOWN
+        name = child.get("name")
+        if not isinstance(name, str) or not name:
+            return PANE_UNKNOWN
+        if name.lstrip("-") not in _SHELL_PROCESS_NAMES:
+            return PANE_LIVE
+        kids = _live_children(child["pid"])
+        if kids is None:
+            return PANE_UNKNOWN
+        return PANE_LIVE if kids else PANE_IDLE
+
+    def _record_spawn(self, name, sid, block_id, window_id, status, child):
+        start = _rex_start_time(child["pid"]) if child else None
+        extra = {"block_id": block_id, "window_id": window_id,
+                 "session_id": sid, "instance_id": status["instance_id"]}
+        if child and start:
+            extra["child"] = {"pid": child["pid"], "starttime": start}
+        write_pane_record(name, self.BACKEND_NAME, window_id,
+                          pane_id=block_id,
+                          server=(status["endpoint"], _rex_generation(status)),
+                          extra=extra)
+
+    def _wait_for_child(self, block_id: str, seconds: float = 5.0):
+        deadline = time.monotonic() + seconds
+        while True:
+            state, proc = self._process(block_id)
+            child = self._child_of(proc) if state == "ok" else None
+            if child is not None or time.monotonic() >= deadline:
+                return child
+            time.sleep(0.1)
+
+    def spawn(self, name: str, cmd: str, cwd: Optional[str] = None) -> bool:
+        self._guard("spawn", name)
+        self.last_spawn_refusal = None
+        status = _rex_status()
+        if status is None or status["api_revision"] not in _REX_API_REVISIONS:
+            self._warn(f"spawn {name!r}: the rex server is not readable or "
+                       f"its api_revision is not a measured one")
+            self.last_spawn_refusal = SPAWN_UNREADABLE
+            return False
+        pname = _pane_name(name)
+        # The uniqueness check and the creation are one stretch under the
+        # record lock; not being able to take it means no spawn (a duplicate
+        # is worse than a failure).  Other lock waiters can wait this long.
+        with _pane_record_lock(create=True) as locked:
+            if not locked:
+                self._warn(f"spawn {name!r}: the record lock could not be taken")
+                return False
+            sid = self._ensure_session()
+            if sid is None:
+                self.last_spawn_refusal = SPAWN_UNREADABLE
+                return False
+            blocks = self._blocks(sid)
+            if blocks is None:
+                self.last_spawn_refusal = SPAWN_UNREADABLE
+                return False
+            live = []     # same label, and something (or unknown) in it
+            for b in (x for x in blocks if x["label"] == pname):
+                state, proc = self._process(b["block_id"])
+                if state == "gone":
+                    continue
+                if state == "ok" and self._child_of(proc) is None \
+                        and proc.get("last_exit") is not None:
+                    continue          # a shell: not counted (design doc §3.3)
+                live.append((b, state, proc))
+            if len(live) > 1:
+                self._warn(f"spawn {name!r}: {len(live)} live blocks carry "
+                           f"the label {pname!r} — ambiguous, refusing")
+                self.last_spawn_refusal = SPAWN_UNREADABLE
+                return False
+            if live:
+                return self._respawn_in_husk(name, cmd, sid, status, *live[0])
+            run = ["run", "-s", sid, "--label", pname, "--focus=false",
+                   "--json"]
+            if cwd:
+                run += ["--cwd", cwd]
+            data = _rex_json(_rex_run(run + ["--", "bash", "-c", cmd]))
+            ids = data.get("block_ids") if data else None
+            window_id = data.get("window_id") if data else None
+            if not (isinstance(ids, list) and ids and isinstance(ids[0], str)
+                    and isinstance(window_id, str) and window_id):
+                self._warn(f"spawn {name!r}: rex run failed")
+                return False
+            _rex_run(["window", "rename", window_id, pname, "-s", sid])
+            child = self._wait_for_child(ids[0])
+            if child is None:
+                self._warn(f"spawn {name!r}: no child process was seen in the "
+                           f"new block; the record will not carry one")
+            self._record_spawn(name, sid, ids[0], window_id, status, child)
+            return True
+
+    def _respawn_in_husk(self, name, cmd, sid, status, block, state, proc) -> bool:
+        record = read_pane_record(name)
+        if state != "ok":
+            self.last_spawn_refusal = SPAWN_UNREADABLE
+            return False
+        occupant = self._husk_state(proc)
+        if occupant != PANE_IDLE:
+            self.last_spawn_refusal = (SPAWN_OCCUPIED if occupant == PANE_LIVE
+                                       else SPAWN_UNREADABLE)
+            return False
+        if not (isinstance(record, dict) and record.get("backend") == "rex"
+                and record.get("block_id") == block["block_id"]):
+            self._warn(f"spawn {name!r}: an idle shell carries the label but "
+                       f"this checkout did not create it; not reusing it")
+            self.last_spawn_refusal = SPAWN_UNREADABLE
+            return False
+        self._warn(f"spawn {name!r}: block {block['block_id']} is an idle "
+                   f"shell (rex restart?) — relaunching in place")
+        bid = block["block_id"]
+        if not self._type_and_enter(bid, cmd):
+            return False
+        if not _wait_until_launched(
+                lambda: self._husk_state(self._process(bid)[1]),
+                warn=self._warn, name=name):
+            return False
+        child = self._wait_for_child(bid)
+        self._record_spawn(name, sid, bid, block["window_id"], status, child)
+        return True
+
+    def _type_and_enter(self, block_id: str, text: str) -> bool:
+        if len(text.encode("utf-8")) > _REX_MAX_SEND_BYTES:
+            self._warn("text is longer than the send limit; not sending")
+            return False
+        res = _rex_run(["send", "-b", block_id, "--", text])
+        if res is None or res.rc != 0:
+            return False
+        res = _rex_run(["send-key", "-b", block_id, "enter"])
+        return res is not None and res.rc == 0
+
+    # -- send / keys / capture / list -------------------------------------
+
+    def _capture_block(self, block_id: str) -> str:
+        res = _rex_run(["capture", "-b", block_id, "--trim"])
+        return res.out if res is not None and res.rc == 0 else ""
+
+    def send(self, name: str, text: str) -> bool:
+        """Type `text` and press Enter — only into a verifiably empty input.
+
+        Rex has no "run" for an existing block: text and Enter are separate
+        calls.  Order: wait for `❯` -> make sure the input box is empty
+        (repeating ctrl+u, which removes one line per press and the line break
+        with the next one — measured: 2 presses per extra line) -> `send` ->
+        `enter` -> if the text is still in the input line, one more Enter.
+        If the box cannot be shown empty, **no Enter is sent** (a leftover
+        merged with new text is submitted as one message — design doc §6.3).
+        """
+        self._guard("send", name)
+        if not text:
+            self._warn(f"send {name!r}: empty text")
+            return False
+        if len(text.encode("utf-8")) > _REX_MAX_SEND_BYTES:
+            self._warn(f"send {name!r}: text is {len(text.encode('utf-8'))} "
+                       f"bytes (limit {_REX_MAX_SEND_BYTES}); not sent")
+            return False
+        ids = self._resolve(name)
+        if ids is None:
+            self._warn(f"send {name!r}: pane not found")
+            return False
+        bid = ids["block_id"]
+        deadline = time.time() + 5.0
+        while True:
+            screen = self._capture_block(bid)
+            if any(l.startswith("❯") for l in screen.splitlines()[-12:]):
+                break
+            if time.time() >= deadline:
+                self._warn(f"send {name!r}: '❯' not found after 5s (pane "
+                           f"busy) — sending best-effort")
+                break
+            time.sleep(0.5)
+        if not self._clear_input(bid):
+            self._warn(f"send {name!r}: the input box could not be shown "
+                       f"empty; nothing was sent")
+            return False
+        res = _rex_run(["send", "-b", bid, "--", text])
+        if res is None or res.rc != 0:
+            self._warn(f"send {name!r}: rex send failed")
+            return False
+        time.sleep(0.1)
+        res = _rex_run(["send-key", "-b", bid, "enter"])
+        if res is None or res.rc != 0:
+            self._warn(f"send {name!r}: Enter failed")
+            return False
+        time.sleep(0.1)
+        if _text_in_input_line(self._capture_block(bid), text):
+            _rex_run(["send-key", "-b", bid, "enter"])
+        return True
+
+    def _clear_input(self, block_id: str) -> bool:
+        """True once the input box is empty (or there is no Claude input box,
+        e.g. a plain shell, where there is nothing to clear)."""
+        for _ in range(16):
+            empty = _rex_input_is_empty(self._capture_block(block_id))
+            if empty is None or empty:
+                return True
+            _rex_run(["send-key", "-b", block_id, "ctrl+u"])
+            time.sleep(0.15)
+        return bool(_rex_input_is_empty(self._capture_block(block_id)) in (None, True))
+
+    def keys(self, name: str, keys: List[str]) -> bool:
+        self._guard("keys", name)
+        translated, unknown = translate_keys(keys, self.BACKEND_NAME)
+        if unknown:
+            self._warn(f"keys {name!r}: refusing unknown key name(s) {unknown!r}")
+            return False
+        ids = self._resolve(name)
+        if ids is None:
+            self._warn(f"keys {name!r}: pane not found")
+            return False
+        res = _rex_run(["send-key", "-b", ids["block_id"], *translated])
+        if res is None or res.rc != 0:
+            self._warn(f"keys {name!r}: send-key failed")
+            return False
+        return True
+
+    def capture(self, name: str) -> str:
+        self._guard("capture", name)
+        ids = self._resolve(name)
+        if ids is None:
+            self._warn(f"capture {name!r}: pane not found")
+            return ""
+        return self._capture_block(ids["block_id"])
+
+    def list(self, suffix: Optional[str] = None) -> List[str]:
+        ids, err = self._session_ids()
+        if err or len(ids) != 1:
+            if not err and len(ids) > 1:
+                self._warn("more than one session carries the label; list is empty")
+            return []
+        blocks = self._blocks(ids[0])
+        if blocks is None:
+            return []
+        prefix = _pane_prefix()
+        labels = [b["label"] for b in blocks
+                  if b["label"] and b["label"] != "shell"
+                  and b["label"].startswith(prefix)]
+        seen, dup = set(), set()
+        for l in labels:
+            (dup if l in seen else seen).add(l)
+        for l in sorted(dup):
+            self._warn(f"list: the label {l!r} is carried by more than one "
+                       f"block — ambiguous (both are listed)")
+        names = [_caller_name(l) for l in labels]
+        if suffix:
+            names = [n for n in names if n.endswith(suffix)]
+        return names
+
+    # -- pid / inspect / kill ---------------------------------------------
+
+    def _facts(self, name: str):
+        """`(facts, reason)`; facts = resolve() + process + child + server."""
+        ids = self._resolve(name)
+        if ids is None:
+            return None, "pane not found"
+        state, proc = self._process(ids["block_id"])
+        if state == "gone":
+            return None, "block is gone"
+        if state != "ok":
+            return None, "process info is unreadable"
+        ids["proc"] = proc
+        ids["child"] = self._child_of(proc)
+        return ids, None
+
+    def _inspect_pane_full(self, name: str):
+        self._guard("pid", name)
+        facts, why = self._facts(name)
+        if facts is None:
+            self._warn(f"pid {name!r}: {why}")
+            return None, None, self.server_identity()
+        child = facts["child"]
+        return (facts["window_id"] or None,
+                child["pid"] if child else None, self.server_identity())
+
+    def _inspect_pane(self, name: str):
+        handle, pid, _server = self._inspect_pane_full(name)
+        return handle, pid
+
+    def pid(self, name: str) -> Optional[int]:
+        return self._inspect_pane(name)[1]
+
+    def _judge(self, name, facts, status0, status1, st, *, advisory=False):
+        """`(mode, reason)`; mode is "normal" / "husk" / None (refused)."""
+        child = facts["child"]
+        pid = child["pid"]
+        record = facts["record"]
+        server0 = (status0["endpoint"], _rex_generation(status0))
+        server1 = (status1["endpoint"], _rex_generation(status1)) if status1 else None
+        ppid = _rex_scan_ppid(pid)
+        if ppid is None or st is None:
+            return None, f"pid {pid} could not be read from /proc"
+        if ppid != status0["pid"]:
+            return None, (f"pid {pid} is not a direct child of the server "
+                          f"(ppid {ppid}, server {status0['pid']})")
+        bound = record.get("server") if isinstance(record, dict) else None
+        same_generation = (isinstance(bound, dict)
+                           and (str(bound.get("endpoint") or ""),
+                                str(bound.get("generation") or "")) == server0)
+        if same_generation:
+            ok, why = rex_worker_provenance(
+                record, window_id=facts["window_id"], server_before=server0,
+                server_after=server1 if not advisory else server0,
+                pid=pid, starttime=st, ppid=ppid, server_pid=status0["pid"])
+            if not ok:
+                return None, why
+            if name in DAEMON_PANE_NAMES:
+                ok, why = may_destroy_pane(name, self.BACKEND_NAME,
+                                           facts["window_id"], pid,
+                                           server=server0)
+                if not ok:
+                    return None, why
+            return "normal", why
+        # --- the server restarted since the record was written -----------
+        if self._husk_state(facts["proc"]) != PANE_IDLE:
+            return None, ("the server has restarted since this block was "
+                          "spawned and what runs in it is not a bare shell "
+                          "with no children — refusing (use --force)")
+        if name in DAEMON_PANE_NAMES:
+            ok, why = may_destroy_pane(name, self.BACKEND_NAME,
+                                       facts["window_id"], pid,
+                                       server=server0)
+            if not ok:
+                return None, why
+        return "husk", "an empty shell restored by a server restart"
+
+    def may_destroy(self, name: str):
+        self._guard("pid", name)
+        facts, why = self._facts(name)
+        if facts is None:
+            return False, why
+        if facts["child"] is None:
+            return True, "nothing runs in the block"
+        status0 = _rex_status()
+        if status0 is None:
+            return False, "the rex server could not be read"
+        mode, why = self._judge(name, facts, status0, status0,
+                                _rex_start_time(facts["child"]["pid"]),
+                                advisory=True)
+        return mode is not None, why
+
+    def kill(self, name: str, *, allow_foreign: bool = False) -> bool:
+        """End what runs in `name`'s block by signalling its processes.
+
+        **Never `block close`.**  A restored block keeps its id, and `close`
+        cannot be told "only if it is the process I inspected" (design doc
+        §5.1), so the destruction is a pidfd signal on the inspected process
+        and its descendants.  No pidfd -> refused.  The block (a shell, if one
+        is left) is not touched.
+        """
+        self._guard("kill", name)
+        judged = read_pane_record(name)
+        if allow_foreign:
+            self._warn_forced_bypass(name)
+        facts, why = self._facts(name)
+        if facts is None:
+            self._warn(f"kill {name!r}: {why}")
+            return False
+        child = facts["child"]
+        if child is None:
+            self._warn(f"kill {name!r}: nothing runs in the block; it is left "
+                       f"as it is (crewvia never closes a block)")
+            self._forget_record(name, judged)
+            return True
+        pid = child["pid"]
+        status0 = _rex_status()
+        if status0 is None:
+            self._warn(f"kill {name!r}: refused — the rex server could not be "
+                       f"read. Nothing was killed.")
+            return False
+        fd = _pidfd_open(pid)
+        if fd is None:
+            self._warn(f"kill {name!r}: refused — no pidfd for pid {pid} "
+                       f"(unsupported here); a pid-addressed signal could hit "
+                       f"a recycled pid. Nothing was killed.")
+            return False
+        try:
+            st = _rex_start_time(pid)       # read AFTER the pidfd is held
+            status1 = _rex_status()
+            if status1 is None or _rex_generation(status1) != _rex_generation(status0):
+                self._warn(f"kill {name!r}: refused — the server changed while "
+                           f"the process was being pinned. Nothing was killed.")
+                return False
+            if allow_foreign:
+                mode = "normal"
+                ppid = _rex_scan_ppid(pid)
+                if st is None or ppid != status0["pid"]:
+                    self._warn(f"kill {name!r}: refused even with --force — "
+                               f"pid {pid} is not a direct child of the server.")
+                    return False
+            else:
+                mode, why = self._judge(name, facts, status0, status1, st)
+                if mode is None:
+                    self._warn(f"kill {name!r}: refused — {why}. Nothing was "
+                               f"killed. Use `lib_daemon_watch.py restart "
+                               f"{name} --force` when you mean to take it over.")
+                    return False
+        finally:
+            os.close(fd)      # _rex_destroy_tree opens its own, verified one
+        signals = ((signal.SIGHUP,) if mode == "husk"
+                   else (signal.SIGHUP, signal.SIGTERM, signal.SIGKILL))
+        ok = _rex_destroy_tree(
+            pid, st, signals=signals,
+            grace=_rex_grace,
+            warn=lambda m: self._warn(f"{name!r}: {m}"))
+        if not ok:
+            return False
+        self._forget_record(name, judged)
+        return True
+
+    # -- attach ------------------------------------------------------------
+
+    def attach(self, name: str) -> bool:
+        ids = self._resolve(name)
+        if ids is None or not ids["window_id"]:
+            return False
+        res = _rex_run(["focus", ids["window_id"]])
+        return res is not None and res.rc == 0
+
+    def attach_cmd(self, name: str) -> Optional[List[str]]:
+        return None         # entering Rex from outside is PR-2's (unmeasured)
 
 
 # ---------------------------------------------------------------------------

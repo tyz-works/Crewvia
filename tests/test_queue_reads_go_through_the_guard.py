@@ -961,6 +961,10 @@ ALLOWED_SUBPROCESS_CALLS = {
     ("lib_mux.py", "_herdr_run_raw", "cmd"): "同上 (JSON に包まない版)",
     ("lib_mux.py", "_herdr_start_server", "_HERDR_CLI['server_start']"):
         "herdr サーバーを起こす",
+    ("lib_mux.py", "_rex_run", "rex"):
+        "`rex [-S <endpoint>] --autostart=false <args>`。rex に block / session を操作させるだけで、"
+        "queue / registry のファイルは渡さない。全 rex 呼び出しの唯一の入口 (空の宛先は拒否・timeout・stdin=DEVNULL。"
+        "knowledge/rex-mux-backend.md §11)",
 
     # -- lib_daemon_watch.py: 主 checkout の版ずれ検知 (B2 / #26) -----------
     # どれも `git` に repo の HEAD / 履歴 / 差分ファイル名を訊くだけで、

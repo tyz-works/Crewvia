@@ -244,7 +244,8 @@ def test_the_kills_and_the_resolution_path_use_forget_record_with_what_they_judg
         callers.setdefault(fn, 0)
         callers[fn] += 1
     assert set(callers) == {"kill", "_resolve_ids"}, sorted(callers)
-    assert callers["kill"] == 4 and callers["_resolve_ids"] == 1
+    # kill の呼び出し: 従来 4 (tmux/herdr) + rex 2 (何も走っていない block / 破壊後)
+    assert callers["kill"] == 6 and callers["_resolve_ids"] == 1
     source = (SCRIPTS / "lib_mux.py").read_text(encoding="utf-8")
     assert "_delete_cache" not in source, \
         "名前だけで記録を消す入口 (_delete_cache) が残っている"

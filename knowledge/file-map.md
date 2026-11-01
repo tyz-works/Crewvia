@@ -345,7 +345,15 @@ branch 名の許可集合は git の `check-ref-format` より狭く、**部分�
 
 ### `lib_mux.py`
 
-mux 抽象化モジュール（TmuxBackend / HerdrBackend）
+mux 抽象化モジュール（TmuxBackend / HerdrBackend / RexBackend）
+`RexBackend`（`CREWVIA_MUX=rex` / `mode: rex`。PR #331・#332）: 設計・実測・持ち越しは
+`knowledge/rex-mux-backend.md`。名前 ↔ block_id の正本は spawn 記録（label は一意でない）。
+`rex` は全呼び出しに `-S unix://… --autostart=false` と timeout を付ける。`api_revision` が 9
+以外・読めないときは `available()` False（他 backend に倒さない）。kill は block close でなく
+検査済みプロセスへの pidfd シグナル。`ensure-server`（`lib_mux.py` の verb）は start.sh /
+`./crewvia` が呼び、既定 socket の server は起動も停止もしない。`state()` は
+`rex_screen_state(capture)`。端末 client は無く `attach_cmd()` は None（窓を見るには Rex アプリ）。
+`CREWVIA_REX_SOCK` はテスト専用（本番で立つと Rex は使用不可）。切り替え時は先に crewvia を止める
 `recorded_herdr_pane_id()`: spawn 記録の `pane_id` を、記録の server がまだ生きているとき
 だけ返す（記録と `/proc` のみ。herdr にもロックにも触れない。task-graph 生成器が使う）
 **`registry/mux/<name>.json`（spawn 記録）は kill の認可の唯一の証拠**

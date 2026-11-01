@@ -3,7 +3,7 @@
 **Crewvia** is a portable, task-driven multi-agent system built on top of Claude Code CLI.
 Agents are dynamically assigned names, collaborate on kanban-style task cards, and integrate
 with [Taskvia](https://taskvia.vercel.app) for approval flows and knowledge logging.
-No mux required — it works standalone or with any terminal multiplexer (tmux or herdr).
+No mux required — it works standalone or with any terminal multiplexer (tmux, herdr or Rex).
 
 ---
 
@@ -35,7 +35,7 @@ Key design principles:
 - **Task-first** — Agents are card executors; the task card is the unit of work
 - **Name continuity** — Workers with the same skill set inherit the same name across sessions (e.g., all `[ops, bash]` Workers are called "Kai"), enabling knowledge accumulation
 - **Taskvia-optional** — The system runs in standalone mode when `TASKVIA_TOKEN` is not set
-- **mux-optional** — tmux/herdr is supported but not required; any terminal works
+- **mux-optional** — tmux/herdr/Rex is supported but not required; any terminal works
 
 ---
 
@@ -80,6 +80,7 @@ Optional but recommended (one of the following for parallel agent execution):
 - **tmux** — for running multiple agents in split panes
 - **herdr** — agent-oriented terminal multiplexer (alternative to tmux)
   - Install: `curl -fsSL https://herdr.dev/install.sh | sh` / `brew install herdr` / `mise use herdr`
+- **Rex** — [Rex](https://www.superlogical.com/rex/docs/) terminal workspace (alternative to tmux / herdr). Needs the `rex` CLI on `PATH`; only `rex` with API revision 9 is accepted (`rex version` prints `api: revision 9 (supports 0 to 9)`; verified with `0.0.1793390926-g3b2dce`). See [Running with Rex](#running-with-rex-alternative-to-tmux--herdr)
 
 Optional, only if you use the `codex-review` skill (automated PR review via Codex CLI, see
 [Skills reference](#skills-reference)):
@@ -121,7 +122,8 @@ Crewvia uses the following environment variables. Add them to your shell profile
 | `NTFY_PASS` | Required for ntfy | ntfy Basic auth password |
 | `APPROVAL_TOKEN_TTL_SECONDS` | Optional | One-time token TTL in seconds (default: `900`) |
 | `CREWVIA_VERIFICATION_UI` | Optional | Set in **Taskvia's** Vercel env (not crewvia). `disabled` hides all verification UI and redirects `/verification-queue` to `/` |
-| `CREWVIA_MUX` | Optional | Mux backend override: `tmux` or `herdr`. Overrides `mode:` in `config/crewvia.yaml` |
+| `CREWVIA_MUX` | Optional | Mux backend override: `tmux`, `herdr` or `rex`. Overrides `mode:` in `config/crewvia.yaml` |
+| `CREWVIA_REX_SESSION` | Optional | Rex session name used by the Rex backend (default: `crewvia`) |
 | `CREWVIA_MUX_RECORD_SWEEP` | Optional | Set `0` to stop the cleanup of stale mux spawn records (`registry/mux/*.json`, left behind when a pane vanished without going through `kill`). Enabled by default; only the cleanup stops, nothing else. See `knowledge/daemon-authority.md` §7-14 |
 | `CREWVIA_WORKER_PERMISSION_MODE` | Optional | `claude --permission-mode` value for Worker sessions (default: `auto`). Set empty to fall back to the CLI's own default/manual mode |
 | `CREWVIA_DIRECTOR_PERMISSION_MODE` | Optional | `claude --permission-mode` value for the Director session (default: unset — CLI's own default/manual mode, since the Director bypasses the Taskvia approval hook entirely and relies on this as its only gate) |
@@ -336,6 +338,42 @@ For a per-session override without editing the config:
 ```bash
 CREWVIA_MUX=herdr ./crewvia
 ```
+
+### Running with Rex (alternative to tmux / herdr)
+
+[Rex](https://www.superlogical.com/rex/docs/) can be the parallel execution backend too.
+Install the `rex` CLI (`which rex`; `rex version` must say `api: revision 9`), then select it with
+`mode: rex` in `config/crewvia.yaml` or per launch:
+
+```bash
+CREWVIA_MUX=rex ./crewvia
+```
+
+- `./crewvia` checks the server with `scripts/lib_mux.py ensure-server`. If a server already
+  answers on the default socket (probably your Rex app's), it is **used as is**; crewvia never
+  starts or stops the default-socket server on its own. If none runs, crewvia starts one with a
+  cleaned environment. To use another socket, set `rex: {endpoint: unix:///abs/path.sock}` in
+  `config/crewvia.yaml` (absolute `unix://` path, at most 108 bytes).
+- Director and Workers appear as windows (`<Name>-director`, `<Name>-worker`, `dispatcher`,
+  `watchdog`) in the Rex session `crewvia` (`CREWVIA_REX_SESSION` to rename).
+- **The `rex` CLI has no terminal client to attach to.** To watch the windows you need the Rex
+  app connected to the same server. Terminal-only: `rex ls`, `rex block ls -s crewvia`,
+  `rex capture -b <block_id>`. How the session looks in the app is **not yet verified**.
+- A `rex` with another API revision, or an unreadable server, makes `./crewvia` fail; it does not
+  fall back to tmux/herdr.
+- `herdr-task-graph` is herdr-only and does not run under Rex (`tasks.json` is still generated).
+- **Switching backends on a machine in use: stop crewvia first** (`scripts/crewvia-stop.sh`).
+  The spawn records in `registry/mux/` are one per name, so herdr and Rex must not run at the
+  same time. `crewvia-stop.sh --full` does not stop a Rex server (`rex server stop` does, and also
+  stops your app's other sessions).
+- An already running server's environment is not cleaned (crewvia cannot read it), so variables
+  from an agent session can leak into every pane; `ensure-server` warns about it. For a clean
+  environment: `rex server stop`, then `./crewvia`.
+- After a Rex server restart, restored windows are shells whose previous generation crewvia
+  refuses to kill normally. Recover with `python3 scripts/lib_daemon_watch.py restart <name> --force`
+  (details: `knowledge/rex-mux-backend.md` §14).
+- To go back: set `mode:` back to `tmux`/`herdr` (or unset `CREWVIA_MUX`) after stopping crewvia.
+  `CREWVIA_REX_SOCK` is test-only; if set in production, Rex is treated as unavailable.
 
 ### Task graph view with herdr-task-graph (optional)
 

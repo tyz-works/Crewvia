@@ -160,6 +160,27 @@ def test_config_endpoint_over_108_bytes_or_not_unix_is_refused(tmp_path):
     assert not ok and "unix://" in why
 
 
+def test_config_endpoint_flow_form_and_quoted_hash(tmp_path):
+    ok, ep, why = lib_mux._rex_config_endpoint(
+        _cfg(tmp_path, "rex: {endpoint: unix:///tmp/flow.sock}\n"))
+    assert (ok, ep) == (True, "unix:///tmp/flow.sock")
+    ok, ep, why = lib_mux._rex_config_endpoint(
+        _cfg(tmp_path, 'rex:\n  endpoint: "unix:///tmp/a#b.sock"  # c\n'))
+    assert (ok, ep) == (True, "unix:///tmp/a#b.sock")
+
+
+def test_config_endpoint_non_string_is_refused_not_defaulted(tmp_path):
+    for body in ("rex:\n  endpoint: 123\n", "rex:\n  endpoint: [a]\n",
+                 "rex: 5\n", "rex:\n  endpoint: {a: b}\n"):
+        ok, ep, why = lib_mux._rex_config_endpoint(_cfg(tmp_path, body))
+        assert not ok and ep is None and why, body
+
+
+def test_config_unparsable_yaml_is_refused_not_defaulted(tmp_path):
+    ok, ep, why = lib_mux._rex_config_endpoint(_cfg(tmp_path, "rex: [unclosed\n"))
+    assert not ok and "could not be read" in why
+
+
 def test_unreadable_config_is_refused_not_defaulted(tmp_path):
     d = tmp_path / "crewvia.yaml"
     d.mkdir()                                   # 通常ファイルでない = 読めない
@@ -469,3 +490,36 @@ def test_stop_full_with_unresolvable_backend_stops_no_server(tmp_path):
     assert "server は停止しません" in out, out
     assert "herdr server stop..." not in out
     assert "[dry-run] herdr server stop" not in out
+
+
+def test_numbered_dialog_with_cursor_on_second_option_is_blocked():
+    screen = ("Do you want to proceed?\n"
+              "  1. Yes\n"
+              "❯ 2. Yes, and don't ask again\n"
+              "  3. No\n"
+              "Esc to cancel\n")
+    assert lib_mux.rex_screen_state(screen) == "blocked"
+    # フッターが無ければ (ただのタスク出力) dialog ではない
+    assert lib_mux.rex_screen_state("❯ 2. foo\n") != "blocked"
+
+
+_RULE = "─" * 40
+
+
+def _verify_backend(screen):
+    b = lib_mux.RexBackend.__new__(lib_mux.RexBackend)
+    b.capture = lambda name: screen
+    return b
+
+
+def test_verify_sent_ignores_the_transcript_echo_of_a_delivered_message():
+    msg = "ミッション開始。plan status で状態を確認し、タスク分解を開始してください。"
+    screen = f"❯ {msg}\n\n● 了解\n\n{_RULE}\n❯ \n{_RULE}\n  ? for shortcuts\n"
+    assert _verify_backend(screen).verify_sent("w", msg) is True
+
+
+def test_verify_sent_false_while_text_is_still_in_the_input_box():
+    msg = "ミッション開始。plan status で状態を確認し、タスク分解を開始してください。"
+    screen = f"{_RULE}\n❯ {msg}\n{_RULE}\n"
+    assert _verify_backend(screen).verify_sent("w", msg) is False
+    assert _verify_backend("").verify_sent("w", msg) is False

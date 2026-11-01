@@ -400,3 +400,10 @@ PR-1 で実測したものは「**実測済み**」、残りは「**未確認**�
 - **server env（C）**: `_rex_server_env()` は `HERDR_*` を前方一致で落とす（`HERDR_PANE_ID` / `HERDR_TAB_ID` / `HERDR_WORKSPACE_ID` / `HERDR_BIN_PATH` / `HERDR_SOCKET_PATH` …）。herdr の pane 内から `./crewvia` を打つと、Rex の Worker が herdr の本番 socket を持っていた。
 - **`crewvia-stop.sh`（D）**: backend 判定の python に path を埋め込まず argv で渡す（`'` を含む path でソースが壊れる）。判定に失敗したら `--full` でも server を止めない（herdr に倒さない）。
 - **E（実 Claude での一周）**: この attempt では**実施していない**（本番の既定 socket の server に触れない・`~/.claude.json` を書かない制約のもと、信頼済みの隔離 cwd と実 Claude を用意できなかった）。残: `mode: rex` の Worker 自動起動と kickoff の到達。上の B で、止まる原因だった確認ダイアログは検出できるようになった。
+
+### 14.2 r2（Codex r2、head 2f27a0f）で直したこと
+
+- **`rex.endpoint` は YAML パーサで読む**（`lib_mux._config_rex_endpoint`）。行ベースの解析は flow 形式 `rex: {endpoint: ...}` と引用符の中の `#` を誤読した。入口は従来どおり `read_regular_text_or_unreadable` を通し、その text を PyYAML で解く。解析できない・`rex` が mapping でない・`endpoint` が文字列でない・`unix:///` でない・108 バイト超はすべて `available()` が False（理由つき）。別の宛先へ黙って倒さない。
+- **信頼確認 / 権限ダイアログの検出は、カーソルが選択肢 1 以外でも一致**する（`❯ 2. ...`）。フッターの検査は残す（タスク出力の `❯ 2.` はダイアログではない）。
+- **Director の kickoff が「未確認」になる件**: 真因は `verify_sent` が「画面末尾 30 行のどこかの `❯` 行」を入力行とみなすこと。Claude Code は送信済みメッセージを transcript に `❯ <本文>` として描き直すので、先頭 30 字に収まる短い kickoff（Director の文）は届いていても「入力行に残っている」と判定された（Worker の文は transcript 側で折り返し/スクロールするため出なかった）。`RexBackend.verify_sent` は本物の入力欄（2 本の罫線の間）だけを見る。入力欄が画面に無いときは従来の判定に倒す。
+- **`lib_daemon_watch restart` と `CREWVIA_KILL_AUTHORITY`**（確認のみ・既存の仕様で herdr と同じ）: 引き継ぎは許可リスト `_SPAWN_ENV_OPERATIONAL` に載っており、**restart を実行したプロセスの env** から運ぶ（死んだデーモンの env は読まない）。実行側の env に無ければ既定（watchdog）に戻る。backend には依存しない。両デーモンの値を揃えて同時に restart する運用（CLAUDE.md の表）は変わらない。

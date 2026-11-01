@@ -4148,9 +4148,11 @@ def _rex_endpoint():
 def _config_rex_endpoint(config_path: Optional[Path] = None):
     """`(found, value_or_None)` — `rex: endpoint:` from config/crewvia.yaml.
 
-    `(True, None)` is "the file could not be read" (never "not configured":
-    an unreadable config must not silently send crewvia to Rex's default
-    socket).  `(False, None)` is "no `rex.endpoint` configured".
+    `(True, None)` is "the file could not be read or parsed" (never "not
+    configured": an unreadable config must not silently send crewvia to Rex's
+    default socket).  `(False, None)` is "no `rex.endpoint` configured".
+    The value is parsed with PyYAML (flow mappings, quoted `#`); a value that
+    is not a string is returned as-is for `_rex_config_endpoint` to refuse.
     `config_path` is only ever passed by tests.
     """
     if config_path is None:
@@ -4160,20 +4162,27 @@ def _config_rex_endpoint(config_path: Optional[Path] = None):
         return False, None
     if is_unreadable(text):
         return True, None
-    in_rex = False
-    for line in text.splitlines():
-        if not line.strip() or line.lstrip().startswith("#"):
-            continue
-        indented = line[:1] in (" ", "\t")
-        if not indented:
-            in_rex = line.split("#", 1)[0].strip() == "rex:"
-            continue
-        if in_rex:
-            body = line.split("#", 1)[0].strip()
-            if body.startswith("endpoint:"):
-                value = body.split(":", 1)[1].strip().strip('"').strip("'")
-                return (True, value) if value else (False, None)
-    return False, None
+    try:
+        import yaml  # PyYAML — flow 形式・引用符の中の `#` を行ベースでは読めない
+        data = yaml.safe_load(text)
+    except Exception:
+        return True, None       # 読めない = 読めなかった。「未設定」に倒さない
+    if data is None:
+        return False, None
+    if not isinstance(data, dict):
+        return True, None
+    rex = data.get("rex")
+    if rex is None:
+        return False, None
+    if not isinstance(rex, dict):
+        return True, _BAD_ENDPOINT
+    if "endpoint" not in rex or rex["endpoint"] is None:
+        return False, None
+    return True, rex["endpoint"]
+
+
+#: `rex.endpoint` が文字列でなかったときの目印 (読めたが使えない値)。
+_BAD_ENDPOINT = object()
 
 
 def _rex_config_endpoint(config_path: Optional[Path] = None):
@@ -4188,6 +4197,9 @@ def _rex_config_endpoint(config_path: Optional[Path] = None):
         return True, None, ""
     if value is None:
         return False, None, "config/crewvia.yaml could not be read (rex.endpoint)"
+    if not isinstance(value, str) or not value.strip():
+        return False, None, "config rex.endpoint must be a non-empty string (unix:///absolute/path)"
+    value = value.strip()
     if not value.startswith("unix:///"):
         return False, None, ("config rex.endpoint must be unix:///absolute/path "
                              "(other endpoint kinds are not started by crewvia)")
@@ -4789,10 +4801,11 @@ def _rex_input_is_empty(screen: str) -> Optional[bool]:
     return box[0][1:].strip() == ""
 
 
-#: A permission / choice dialog: the cursor on a numbered option plus the
+#: A permission / choice dialog: the cursor on a numbered option (any number —
+#: the cursor may sit on the 2nd choice) plus the
 #: dialog's own footer or question.  Both must be present in the screen tail —
 #: a bare `❯ 1.` line in task output is not a dialog.
-_REX_DIALOG_OPTION_RE = re.compile(r"[❯›]\s*1[.)]\s*\S")
+_REX_DIALOG_OPTION_RE = re.compile(r"[❯›]\s*\d{1,2}[.)]\s*\S")
 _REX_DIALOG_FOOTER_RE = re.compile(
     r"(enter to confirm|esc to cancel|do you want to|would you like to)",
     re.IGNORECASE)
@@ -5403,6 +5416,26 @@ class RexBackend(_Backend):
             self._warn(f"keys {name!r}: send-key failed")
             return False
         return True
+
+    def verify_sent(self, name: str, text: str) -> bool:
+        """True when `text` is no longer sitting in Claude's *input box*.
+
+        The base heuristic accepts any `❯` line in the screen tail as "the
+        input line".  Claude Code echoes a submitted message in the transcript
+        as `❯ <message>` too, so a kickoff that was delivered (and is short
+        enough to fit in the 30-char prefix, i.e. the Director's) was reported
+        as "not confirmed" x3 + ERROR.  Rex has the real input box (the lines
+        between the two rules), so look only there.  No input box on screen
+        (a dialog, a spinner redraw) -> fall back to the base judgement.
+        """
+        screen = self.capture(name)
+        if not screen:
+            return False
+        box = _rex_input_box(screen)
+        if box is None:
+            return not _text_in_input_line(
+                screen, text, tail_lines=_VERIFY_SENT_TAIL_LINES)
+        return text[:30] not in "\n".join(box)
 
     def capture(self, name: str) -> str:
         self._guard("capture", name)

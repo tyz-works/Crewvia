@@ -260,7 +260,7 @@ def test_daemon_respawn_command_carries_the_rex_destination(tmp_path):
 def test_dispatcher_does_not_default_the_worker_start_command_to_herdr():
     text = (SCRIPTS / "dispatcher.sh").read_text(encoding="utf-8")
     assert "os.environ.get('CREWVIA_MUX') or 'herdr'" not in text
-    assert "_mux._backend.BACKEND_NAME" in text
+    assert "_lib_mux._select_backend().BACKEND_NAME" in text
 
 
 def test_rex_server_env_denies_ssh_triggers_for_the_tmux_attach_husk():

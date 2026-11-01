@@ -928,7 +928,15 @@ def worker_start_command(task_skills, target_dir, *, fresh):
     skills = ' '.join(shlex.quote(s) for s in sorted(task_skills))
     # 既定は『選ばれている backend』(env > config > auto)。リテラルの herdr だと、
     # mode: rex / tmux の利用者に herdr 用の起動コマンドを案内してしまう。
-    backend = os.environ.get('CREWVIA_MUX') or _mux._backend.BACKEND_NAME
+    backend = os.environ.get('CREWVIA_MUX')
+    if not backend:
+        # 『選ばれている backend』(env > config > auto)。_mux のテスト用 double には依らず
+        # lib_mux の選択関数を直接引く。引けなければ従来どおり herdr。
+        try:
+            import lib_mux as _lib_mux
+            backend = _lib_mux._select_backend().BACKEND_NAME
+        except Exception:
+            backend = 'herdr'
     target = f"TARGET_DIR={shlex.quote(str(target_dir))} " if target_dir else ''
     return (
         f"cd {shlex.quote(str(REPO_ROOT))} && "

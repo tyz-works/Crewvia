@@ -140,7 +140,9 @@ teardown() {
     # 'mux_send ... >/dev/null 2>&1' が復活していないことを直接確認する
     # (herdr 環境を組み立てずに検証できる、安価で確実な回帰ガード)。
     ! grep -qE 'mux_send "\$WINDOW_NAME" "\$KICKOFF_MSG" >/dev/null 2>&1' "$START_SH"
-    grep -qE 'mux_send "\$WINDOW_NAME" "\$KICKOFF_MSG" >/dev/null \|\| true' "$START_SH"
+    # r1: send の戻り値を捨てない形 (`>/dev/null && _SEND_OK=1`)。stdout だけ捨てる点は同じ。
+    grep -qE 'mux_send "\$WINDOW_NAME" "\$KICKOFF_MSG" >/dev/null && _SEND_OK=1' "$START_SH"
+    ! grep -qE 'mux_send "\$WINDOW_NAME" "\$KICKOFF_MSG" >/dev/null \|\| true' "$START_SH"
 }
 
 @test "mux_send idiom used by start.sh's kickoff retry surfaces herdr's 'pane not found' warning (t007 F2)" {

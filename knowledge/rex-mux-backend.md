@@ -390,3 +390,13 @@ PR-1 で実測したものは「**実測済み**」、残りは「**未確認**�
 
 **このマシン固有の穴（§10.2-7）— 再現して塞いだ**: `~/.bashrc` は `SSH_CONNECTION` が有り `$TMUX` / `$HERDR_ENV` が無い対話シェルで `tmux -u attach -t main` する。herdr の掃除表は `HERDR_ENV` を落とすため、SSH 経由で起動した Rex server は、再起動後に復元した login shell すべてに tmux の子を持たせた（隔離 tmux dir で再現: 復元 shell の子が `tmux -u attach -t main`。= 「空の husk」にならず spawn が OCCUPIED で拒否され、dispatcher / watchdog の respawn も止まる）。server の env から `SSH_CONNECTION` / `SSH_CLIENT` / `SSH_TTY` も落とすと子は付かない（同じ手順で確認）。**crewvia が起動した server にだけ効く**。既に居る server（SSH 経由で起動済み）には効かないので、そのときの復旧は `lib_daemon_watch.py restart <dispatcher|watchdog> --force`（占有者を確認した上で Director が判断）。
 
+
+### 14.1 r1（QA FAIL + Codex r1、head 5f51277）で直したこと
+
+- **backend の解決は 1 回（A）**: `start.sh` は `CREWVIA_MUX`（env）> config `mode:` > auto を最初に 1 回だけ解決し、server の検査（rex の `ensure-server` / herdr の `available`）・`export CREWVIA_MUX`・案内文はその値だけを使う。config が別の backend（tmux / herdr / rex）を指すときだけ env 側に揃える。config が空（→ 確認プロンプト）・`inline`（→ inline）・env と同じ値のときは従来のまま。`CREWVIA_MUX=rex` + `mode: herdr`（本番の現状）で config の herdr 分岐に入って env を上書きし、本番 herdr を見に行く穴だった。3 通り（rex+herdr / tmux+rex / herdr+rex）を `tests/test_rex_pr2_wiring.py` が本物の `start.sh` のブロックを切り出して実行する。
+- **番号なしの信頼確認ダイアログ（B）**: 実 Claude 2.1.316 が未信頼 cwd で出す画面は `❯ No, exit` / `Yes, I trust this folder` / `Enter to confirm · Esc to cancel`（選択肢に番号なし）。`lib_trust.py dialog` と `rex_screen_state` は番号つきの形しか見ていなかったので、`state()` は unknown・`start.sh` は検出できなかった。両方を「承認の選択肢と `No, exit` が隣り合う 1 組」（番号なし・どちらが先でもカーソルはどちらでも）にも対応させた（数字ありの形は残す。文言が単独でパスや出力に出ただけでは検出しない）。
+- **kickoff の誤報告（B）**: `start.sh` は `mux_send` の失敗を `|| true` で捨て、`verify-sent`（「入力行に残っていない」だけで True）だけで「verified」と出していた。Rex の `send` は入力欄が空と示せないと何も送らず False を返す。送信が False の試行は着弾と数えず、3 回とも駄目なら既存の ERROR に落ちる。
+- **未解決（B）**: `lib_trust.py check` は親 dir（`.claude/worktrees`）の信頼で rc=0 を返すのに、claude が cwd 自身の `.claude/settings.json`（権限 44 件）を理由に確認ダイアログを出した。claude 側の規則は読んでいないので、`check` の側では直していない。**事前検査をすり抜けた場合の網は、上の番号なしダイアログの検出（kickoff の前後の `_require_no_trust_dialog` と Rule 5 の `blocked`）**。cwd に `.claude/settings.json` がある task の worktree は、利用者がその cwd を一度 `claude` で信頼してから使う。
+- **server env（C）**: `_rex_server_env()` は `HERDR_*` を前方一致で落とす（`HERDR_PANE_ID` / `HERDR_TAB_ID` / `HERDR_WORKSPACE_ID` / `HERDR_BIN_PATH` / `HERDR_SOCKET_PATH` …）。herdr の pane 内から `./crewvia` を打つと、Rex の Worker が herdr の本番 socket を持っていた。
+- **`crewvia-stop.sh`（D）**: backend 判定の python に path を埋め込まず argv で渡す（`'` を含む path でソースが壊れる）。判定に失敗したら `--full` でも server を止めない（herdr に倒さない）。
+- **E（実 Claude での一周）**: この attempt では**実施していない**（本番の既定 socket の server に触れない・`~/.claude.json` を書かない制約のもと、信頼済みの隔離 cwd と実 Claude を用意できなかった）。残: `mode: rex` の Worker 自動起動と kickoff の到達。上の B で、止まる原因だった確認ダイアログは検出できるようになった。

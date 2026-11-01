@@ -786,23 +786,50 @@ def test_destroy_tree_takes_every_descendant_even_when_the_parent_dies_first():
                 os.kill(k, signal.SIGKILL)
 
 
-def test_a_child_forked_between_enumeration_and_signal_is_caught_by_the_rescan(monkeypatch):
-    root, kids = _start_tree()
-    spawned = []
+def _fork_once_seam(root, kids, spawned):
+    done = []
 
     def inject():
+        if done:
+            return
+        done.append(1)
         os.kill(root.pid, signal.SIGUSR1)
         assert _wait(lambda: len(lib_mux._live_children(root.pid) or []) >= 2, 3)
-        # 3 本目 (sleep 622) の pid を控える
         spawned.extend(c for c in lib_mux._live_children(root.pid) if c not in kids)
+    return inject
 
-    monkeypatch.setattr(lib_mux, "_rex_after_enumerate", inject)
+
+def test_a_child_forked_between_enumeration_and_signal_is_caught_by_the_next_stage(monkeypatch):
+    """本番の順序 (列挙 -> 信号) のまま: 列挙の直後に生まれた子は、その段では信号を受けないが、
+    最終走査で残党として見つかり、次の段の列挙で捕まる。"""
+    root, kids = _start_tree()
+    spawned = []
+    monkeypatch.setattr(lib_mux, "_rex_after_enumerate", _fork_once_seam(root, kids, spawned))
     try:
         assert lib_mux._rex_destroy_tree(
             root.pid, lib_mux._rex_start_time(root.pid),
-            signals=(signal.SIGKILL,), grace=lambda s: 3.0, warn=lambda m: None)
+            signals=(signal.SIGTERM, signal.SIGKILL), grace=lambda s: 3.0, warn=lambda m: None)
         assert spawned
         assert _wait(lambda: not any(_alive(k) for k in kids + spawned))
+    finally:
+        root.kill()
+        root.wait()
+        for k in kids + spawned:
+            if _alive(k):
+                os.kill(k, signal.SIGKILL)
+
+
+def test_a_child_forked_during_the_last_stage_is_caught_by_the_final_scan_and_fails_the_kill(monkeypatch):
+    """最終段で生まれた子は信号を受けていない。最終走査が見つけ、成功を名乗らない。"""
+    root, kids = _start_tree()
+    spawned = []
+    monkeypatch.setattr(lib_mux, "_rex_after_enumerate", _fork_once_seam(root, kids, spawned))
+    msgs = []
+    try:
+        assert not lib_mux._rex_destroy_tree(
+            root.pid, lib_mux._rex_start_time(root.pid),
+            signals=(signal.SIGKILL,), grace=lambda s: 3.0, warn=msgs.append)
+        assert spawned and msgs
     finally:
         root.kill()
         root.wait()
@@ -984,24 +1011,28 @@ def test_a_failed_final_scan_is_unobserved_not_empty():
 @pytest.fixture
 def husk_proc():
     """子を持たない `bash` のふりをする実プロセス (復元された殻)。"""
-    p = subprocess.Popen(["sleep", "650"])
+    p = subprocess.Popen(["sleep", "650"], start_new_session=True)
     yield p
     p.kill()
     p.wait()
 
 
-def _husk_rules(fake, husk, *, record_patch=None):
-    path, rec = _worker_record(fake, block_id="block:X")
+def _husk_rules(fake, husk, *, record_patch=None, after_hup=True, generation="inst-OLD:1"):
+    """世代違いの記録 + 子の居ない shell。SIGHUP 後は殻が終わった (last_exit) と答える。"""
+    path, rec = _worker_record(fake, block_id="block:X", generation=generation)
     if record_patch:
         rec.update(record_patch)
         path.write_text(json.dumps(rec))
     label, pname = lib_mux._rex_session_label(), lib_mux._pane_name("Zed-worker")
     shell = _proc(husk.pid, name="bash")
-    fake.set(_spawn_rules(sessions=[{"session_id": "session:S1", "label": label}],
-                          blocks=[{"block_id": "block:X", "label": pname, "window_id": "window:W1"}],
-                          procs={"block:X": shell}) + [{"match": ["capture"], "out": ""},
-                                                       {"match": ["send-key"], "out": ""},
-                                                       {"match": ["send"], "out": ""}])
+    ended = {"out": json.dumps({"last_exit": {"exit_code": 129}})}
+    seq = [shell, shell, ended] if after_hup else [shell]
+    rules = _spawn_rules(sessions=[{"session_id": "session:S1", "label": label}],
+                         blocks=[{"block_id": "block:X", "label": pname, "window_id": "window:W1"}],
+                         procs={"block:NEW": _proc(husk.pid)})
+    rules.insert(0, {"match": ["process", "block:X"], "seq": seq})
+    fake.set(rules + [{"match": ["capture"], "out": ""},
+                      {"match": ["send-key"], "out": ""}, {"match": ["send"], "out": ""}])
 
 
 @pytest.mark.parametrize("patch", [{"checkout": "/somewhere/else"}, {"handle": "window:OTHER"}])
@@ -1011,15 +1042,40 @@ def test_husk_is_not_reused_for_a_foreign_checkout_or_another_window(fake, husk_
     assert not b.spawn("Zed-worker", "true")
     assert b.last_spawn_refusal == lib_mux.SPAWN_UNREADABLE
     assert not any(c[0] in ("send", "send-key", "run") for c in fake.calls())
+    assert _alive(husk_proc.pid)
 
 
-def test_husk_respawn_establishes_the_requested_cwd_with_safe_quoting(fake, husk_proc):
+def test_husk_is_rebuilt_not_typed_into(fake, husk_proc):
+    """F2: 殻へは 1 文字も打たない。SIGHUP で終え、通常の rex run で新しい block を作り、
+    記録の block_id を新しいものに書き換える。block close はしない。"""
     _husk_rules(fake, husk_proc)
-    lib_mux.RexBackend().spawn("Zed-worker", "exec claude", cwd="/tmp/it's a dir")
-    sent = [c for c in fake.calls() if c[0] == "send"]
-    assert sent, "the husk relaunch must type the command"
-    text = sent[0][sent[0].index("--") + 1]
-    assert text == "cd '/tmp/it'\"'\"'s a dir' && exec claude"
+    assert lib_mux.RexBackend().spawn("Zed-worker", "exec claude", cwd="/tmp/it's a dir")
+    calls = fake.calls()
+    assert not any(c[0] in ("send", "send-key", "capture") for c in calls)
+    assert not any(c[:2] == ["block", "close"] for c in calls)
+    run = [c for c in calls if c[0] == "run"]
+    assert len(run) == 1
+    assert run[0][run[0].index("--cwd") + 1] == "/tmp/it's a dir"
+    assert run[0][run[0].index("--") + 1:] == ["bash", "-c", "exec claude"]
+    assert husk_proc.wait(timeout=5) == -signal.SIGHUP
+    rec = json.loads((fake.checkout / "registry" / "mux" /
+                      f"{lib_mux._pane_name('Zed-worker')}.json").read_text())
+    assert rec["block_id"] == "block:NEW" and rec["window_id"] == "window:NEW"
+
+
+def test_husk_that_does_not_end_after_sighup_is_not_relaunched(fake, husk_proc):
+    _husk_rules(fake, husk_proc, after_hup=False)    # 終わったと言わない
+    b = lib_mux.RexBackend()
+    assert not b.spawn("Zed-worker", "exec claude")
+    assert b.last_spawn_refusal == lib_mux.SPAWN_UNREADABLE
+    assert not any(c[0] == "run" for c in fake.calls())
+
+
+def test_husk_with_the_same_generation_record_is_refused_without_a_signal(fake, husk_proc):
+    _husk_rules(fake, husk_proc, generation=f"inst-A:{SERVER_PID}")
+    assert not lib_mux.RexBackend().spawn("Zed-worker", "exec claude")
+    assert _alive(husk_proc.pid)
+    assert not any(c[0] == "run" for c in fake.calls())
 
 
 def test_spawn_that_cannot_write_its_record_is_not_a_success(fake, monkeypatch, capsys):
@@ -1035,3 +1091,113 @@ def test_spawn_that_cannot_write_its_record_is_not_a_success(fake, monkeypatch, 
     finally:
         child.kill()
         child.wait()
+
+
+# ---------------------------------------------------------------------------
+# Codex r2 の指摘の回帰 (F1 走査 / F3 process の正の証拠)
+# ---------------------------------------------------------------------------
+
+def test_scan_tree_treats_an_unreadable_entry_as_unobserved_but_skips_a_vanished_one(monkeypatch):
+    """F1: 消えた entry (GONE) は飛ばす。読めない entry は None (未観測) で返す。"""
+    root = subprocess.Popen(["sleep", "660"], start_new_session=True)
+    other = subprocess.Popen(["sleep", "661"], start_new_session=True)
+    try:
+        real = lib_mux._proc_stat_fields
+        mode = {}
+
+        def fake_stat(n, *a, **k):
+            if str(n) == str(other.pid) and mode:
+                return mode["status"], ""
+            return real(n, *a, **k)
+
+        monkeypatch.setattr(lib_mux, "_proc_stat_fields", fake_stat)
+        mode["status"] = lib_mux._PROC_GONE
+        tree = lib_mux._rex_scan_tree(root.pid, str(root.pid))
+        assert tree is not None and root.pid in tree and other.pid not in tree
+        mode["status"] = lib_mux._PROC_UNREADABLE
+        assert lib_mux._rex_scan_tree(root.pid, str(root.pid)) is None
+    finally:
+        for p in (root, other):
+            p.kill()
+            p.wait()
+
+
+def test_destroy_refuses_when_a_scanned_entry_is_unreadable(monkeypatch):
+    """F1: 走査が読めない entry を見つけたら、信号は 1 つも送らず失敗。"""
+    root = subprocess.Popen(["sleep", "662"], start_new_session=True)
+    other = subprocess.Popen(["sleep", "663"], start_new_session=True)
+    try:
+        real = lib_mux._proc_stat_fields
+        monkeypatch.setattr(lib_mux, "_proc_stat_fields",
+                            lambda n, *a, **k: (lib_mux._PROC_UNREADABLE, "")
+                            if str(n) == str(other.pid) else real(n, *a, **k))
+        msgs = []
+        assert not lib_mux._rex_destroy_tree(
+            root.pid, lib_mux._rex_start_time(root.pid),
+            signals=(signal.SIGKILL,), grace=lambda s: 1.0, warn=msgs.append)
+        assert msgs and _alive(root.pid)
+    finally:
+        for p in (root, other):
+            p.kill()
+            p.wait()
+
+
+def _destroy_with_failing_child_pidfd(err, gone):
+    root, kids = _start_tree()
+    real_open = lib_mux._pidfd_open
+    real_stat = lib_mux._proc_stat_fields
+    victim_pid = kids[0]
+
+    def open_(pid):
+        if pid == victim_pid:
+            lib_mux._PIDFD_OPEN_ERRNO = err
+            return None
+        return real_open(pid)
+
+    lib_mux._pidfd_open = open_
+    if gone:      # 開けない理由が『もう居ない』のとき /proc も居ないと答える
+        lib_mux._proc_stat_fields = lambda n, *a, **k: (
+            (lib_mux._PROC_GONE, "") if str(n) == str(victim_pid) else real_stat(n, *a, **k))
+    try:
+        msgs = []
+        ok = lib_mux._rex_destroy_tree(
+            root.pid, lib_mux._rex_start_time(root.pid),
+            signals=(signal.SIGKILL,), grace=lambda s: 3.0, warn=msgs.append)
+        return ok, msgs, root
+    finally:
+        lib_mux._pidfd_open = real_open
+        lib_mux._proc_stat_fields = real_stat
+        for k in kids:
+            if _alive(k):
+                os.kill(k, signal.SIGKILL)
+
+
+def test_a_child_pidfd_that_cannot_be_opened_refuses_but_one_that_vanished_does_not():
+    import errno as _errno
+    ok, msgs, root = _destroy_with_failing_child_pidfd(_errno.EPERM, gone=False)
+    try:
+        assert not ok and _alive(root.pid)          # 開けない = 未観測 -> 何も殺さない
+    finally:
+        root.kill()
+        root.wait()
+    ok, msgs, root = _destroy_with_failing_child_pidfd(_errno.ESRCH, gone=True)
+    try:
+        assert ok                                    # 消えた子は対象外
+    finally:
+        root.kill()
+        root.wait()
+
+
+@pytest.mark.parametrize("answer", [
+    {}, {"child": {}}, {"child": {"pid": "x", "name": "sleep"}}, {"child": {"pid": 0}},
+    {"last_exit": None}, {"last_exit": {}}, {"last_exit": 0}, [], "x",
+])
+def test_process_answer_without_positive_evidence_is_unreadable_and_kill_keeps_the_record(fake, answer):
+    """F3: `{}` や不正な child は『終わった』の証拠ではない。kill は記録を消さない。"""
+    path, _rec = _worker_record(fake)
+    fake.set(_base_rules() + [_blocks_rule(),
+                              {"match": ["process", "block:AAA"], "out": json.dumps(answer)}])
+    b = lib_mux.RexBackend()
+    assert b._process("block:AAA")[0] == "unreadable"
+    assert not b.kill("Zed-worker")
+    assert path.exists()

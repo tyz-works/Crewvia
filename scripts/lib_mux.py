@@ -4256,7 +4256,15 @@ def _rex_pidfd_numbers():
     return _REX_SYS_PIDFD.get(platform.machine())
 
 
+#: errno of the last failed `_pidfd_open` (None after a success / when the
+#: syscall is unavailable).  Callers that must tell "the process is gone"
+#: (ESRCH) from "could not open it" read it right after a None return.
+_PIDFD_OPEN_ERRNO: Optional[int] = None
+
+
 def _pidfd_open(pid: int) -> Optional[int]:
+    global _PIDFD_OPEN_ERRNO
+    _PIDFD_OPEN_ERRNO = None
     nums = _rex_pidfd_numbers()
     if nums is None:
         return None
@@ -4264,6 +4272,8 @@ def _pidfd_open(pid: int) -> Optional[int]:
         libc = ctypes.CDLL(None, use_errno=True)
         fd = libc.syscall(ctypes.c_long(nums[0]), ctypes.c_int(int(pid)),
                           ctypes.c_uint(0))
+        if fd < 0:
+            _PIDFD_OPEN_ERRNO = ctypes.get_errno()
     except Exception:
         return None
     return fd if fd >= 0 else None
@@ -4299,6 +4309,10 @@ def _rex_scan_tree(root_pid: int, root_sid: Optional[str], known=()):
     """`{pid: (ppid, starttime)}` for `root_pid`'s live descendants and its
     session members, from one pass over `/proc` (the root itself included).
 
+    An entry that vanished mid-scan is skipped (`_PROC_GONE`); one that could
+    not be *read* or parsed makes the whole scan `None` (unobserved) — it might
+    have been a member, and the caller then refuses to claim anything.
+
     A descendant is anything reachable by ppid from the root **or** from
     `known` (pids already held); a session member is anything whose session id
     equals the root's (`setsid`-detached children are caught by ppid chains,
@@ -4311,12 +4325,16 @@ def _rex_scan_tree(root_pid: int, root_sid: Optional[str], known=()):
     table = {}
     for n in names:
         status, f = _proc_stat_fields(n)
-        if status != _PROC_OK or len(f) < 20 or f[0] in ("Z", "X"):
+        if status == _PROC_GONE:
+            continue          # exited between listing and read: not a member
+        if status != _PROC_OK or len(f) < 20:
+            return None       # could not read it: it might be one of ours
+        if f[0] in ("Z", "X"):
             continue
         try:
             table[int(n)] = (int(f[1]), f[19], f[3])
         except ValueError:
-            continue
+            return None
     seeds = {root_pid, *known}
     found = {p for p in seeds if p in table}
     changed = True
@@ -4353,6 +4371,16 @@ def _rex_destroy_tree(root_pid: int, root_start: str, *, signals, grace,
     first re-parents them to pid 1 and the tree is gone), each one pidfd-opened
     and starttime-checked against the enumeration; the enumeration is repeated
     before every later stage to catch a fork that raced the previous one.
+
+    Threat model (design doc §5.2).  Protected: nothing that was not inspected
+    is signalled, and a reported success was checked over the parent/child
+    and session range (the final scan finds no survivor).  **Not followed**:
+    a process that did its own `setsid` and whose parent is gone — forked
+    between the last enumeration and the signal, it leaves the range the scan
+    can see.  A deliberately daemonised process is not crewvia's to chase (the
+    tmux / herdr backends do not follow descendants either); no freezing is
+    added.  An unreadable `/proc` entry or a failed pidfd_open (other than
+    "the process is gone") is *unobserved* and refuses the kill.
     """
     held = {}      # pid -> (pidfd, starttime)
 
@@ -4390,7 +4418,12 @@ def _rex_destroy_tree(root_pid: int, root_start: str, *, signals, grace,
                     continue
                 cfd = _pidfd_open(pid)
                 if cfd is None:
-                    continue
+                    err = _PIDFD_OPEN_ERRNO
+                    gone_now = (err == errno.ESRCH
+                                or _proc_stat_fields(pid)[0] == _PROC_GONE)
+                    if gone_now:
+                        continue      # it exited: nothing left to signal
+                    return False      # could not open it: unobserved
                 # open first, then read: if the pid was recycled between the
                 # scan and the open, the start time differs.
                 if _rex_start_time(pid) != st:
@@ -4406,7 +4439,6 @@ def _rex_destroy_tree(root_pid: int, root_start: str, *, signals, grace,
                 return False
             if _rex_after_enumerate is not None:
                 _rex_after_enumerate()
-                enumerate_more()
             ppids = {p: _rex_scan_ppid(p) for p in held}
             order = sorted(held, key=lambda p: -_depth(p, ppids))
             for pid in order:
@@ -4631,7 +4663,19 @@ class RexBackend(_Backend):
         if _rex_not_found(res):
             return "gone", None
         data = _rex_json(res)
-        return ("ok", data) if data is not None else ("unreadable", None)
+        if not isinstance(data, dict):
+            return "unreadable", None
+        child = data.get("child")
+        if child is not None:
+            # a child must be well formed; a malformed one is not "no child"
+            return (("ok", data) if self._child_of(data) is not None
+                    else ("unreadable", None))
+        # No child: only a positive "the shell exited" (a real last_exit)
+        # counts as ended.  `{}` / null / wrong types prove nothing.
+        last = data.get("last_exit")
+        if isinstance(last, dict) and last:
+            return "ok", data
+        return "unreadable", None
 
     @staticmethod
     def _child_of(proc):
@@ -4817,24 +4861,28 @@ class RexBackend(_Backend):
             if live:
                 return self._respawn_in_husk(name, cmd, sid, status, *live[0],
                                              cwd=cwd)
-            run = ["run", "-s", sid, "--label", pname, "--focus=false",
-                   "--json"]
-            if cwd:
-                run += ["--cwd", cwd]
-            data = _rex_json(_rex_run(run + ["--", "bash", "-c", cmd]))
-            ids = data.get("block_ids") if data else None
-            window_id = data.get("window_id") if data else None
-            if not (isinstance(ids, list) and ids and isinstance(ids[0], str)
-                    and isinstance(window_id, str) and window_id):
-                self._warn(f"spawn {name!r}: rex run failed")
-                return False
-            _rex_run(["window", "rename", window_id, pname, "-s", sid])
-            child = self._wait_for_child(ids[0])
-            if child is None:
-                self._warn(f"spawn {name!r}: no child process was seen in the "
-                           f"new block; the record will not carry one")
-            return self._record_spawn(name, sid, ids[0], window_id, status,
-                                      child)
+            return self._run_new_block(name, cmd, sid, status, cwd)
+
+    def _run_new_block(self, name, cmd, sid, status, cwd=None) -> bool:
+        pname = _pane_name(name)
+        run = ["run", "-s", sid, "--label", pname, "--focus=false",
+               "--json"]
+        if cwd:
+            run += ["--cwd", cwd]
+        data = _rex_json(_rex_run(run + ["--", "bash", "-c", cmd]))
+        ids = data.get("block_ids") if data else None
+        window_id = data.get("window_id") if data else None
+        if not (isinstance(ids, list) and ids and isinstance(ids[0], str)
+                and isinstance(window_id, str) and window_id):
+            self._warn(f"spawn {name!r}: rex run failed")
+            return False
+        _rex_run(["window", "rename", window_id, pname, "-s", sid])
+        child = self._wait_for_child(ids[0])
+        if child is None:
+            self._warn(f"spawn {name!r}: no child process was seen in the "
+                       f"new block; the record will not carry one")
+        return self._record_spawn(name, sid, ids[0], window_id, status,
+                                  child)
 
     def _respawn_in_husk(self, name, cmd, sid, status, block, state, proc,
                          cwd=None) -> bool:
@@ -4860,30 +4908,24 @@ class RexBackend(_Backend):
                        f"checkout, or names another window; not reusing")
             self.last_spawn_refusal = SPAWN_UNREADABLE
             return False
-        if cwd:
-            cmd = f"cd {shlex.quote(cwd)} && {cmd}"
         self._warn(f"spawn {name!r}: block {block['block_id']} is an idle "
-                   f"shell (rex restart?) — relaunching in place")
-        bid = block["block_id"]
-        if not self._type_and_enter(bid, cmd):
+                   f"shell (rex restart?) — ending it and launching a new one")
+        # Nothing is typed into the shell (its input box cannot be shown
+        # empty).  The shell is ended through the ordinary husk kill path
+        # (pidfd SIGHUP, record + server generation checked), the end is
+        # confirmed, and a normal `rex run` makes a new block.  The old block
+        # is never `block close`d; the record is rewritten with the new id.
+        if not self._kill_impl(name, forget=False, require_husk=True):
+            self.last_spawn_refusal = SPAWN_UNREADABLE
             return False
-        if not _wait_until_launched(
-                lambda: self._husk_state(self._process(bid)[1]),
-                warn=self._warn, name=name):
+        state, after = self._process(block["block_id"])
+        if state == "unreadable" or (
+                state == "ok" and self._child_of(after) is not None):
+            self._warn(f"spawn {name!r}: could not confirm the old shell "
+                       f"ended; not launching")
+            self.last_spawn_refusal = SPAWN_UNREADABLE
             return False
-        child = self._wait_for_child(bid)
-        return self._record_spawn(name, sid, bid, block["window_id"], status,
-                                  child)
-
-    def _type_and_enter(self, block_id: str, text: str) -> bool:
-        if len(text.encode("utf-8")) > _REX_MAX_SEND_BYTES:
-            self._warn("text is longer than the send limit; not sending")
-            return False
-        res = _rex_run(["send", "-b", block_id, "--", text])
-        if res is None or res.rc != 0:
-            return False
-        res = _rex_run(["send-key", "-b", block_id, "enter"])
-        return res is not None and res.rc == 0
+        return self._run_new_block(name, cmd, sid, status, cwd)
 
     # -- send / keys / capture / list -------------------------------------
 
@@ -5097,7 +5139,15 @@ class RexBackend(_Backend):
         return mode is not None, why
 
     def kill(self, name: str, *, allow_foreign: bool = False) -> bool:
+        return self._kill_impl(name, allow_foreign=allow_foreign)
+
+    def _kill_impl(self, name: str, *, allow_foreign: bool = False,
+                   forget: bool = True, require_husk: bool = False) -> bool:
         """End what runs in `name`'s block by signalling its processes.
+
+        `forget=False` leaves the record on disk (the husk rebuild in `spawn`
+        rewrites it with the new block id); `require_husk=True` refuses
+        anything but the "empty shell restored by a server restart" mode.
 
         **Never `block close`.**  A restored block keeps its id, and `close`
         cannot be told "only if it is the process I inspected" (design doc
@@ -5117,8 +5167,9 @@ class RexBackend(_Backend):
         if child is None:
             self._warn(f"kill {name!r}: nothing runs in the block; it is left "
                        f"as it is (crewvia never closes a block)")
-            self._forget_record(name, judged)
-            return True
+            if forget:
+                self._forget_record(name, judged)
+            return not require_husk
         pid = child["pid"]
         status0 = _rex_status()
         if status0 is None:
@@ -5152,6 +5203,10 @@ class RexBackend(_Backend):
                                f"killed. Use `lib_daemon_watch.py restart "
                                f"{name} --force` when you mean to take it over.")
                     return False
+            if require_husk and mode != "husk":
+                self._warn(f"kill {name!r}: refused — not an empty restored "
+                           f"shell. Nothing was killed.")
+                return False
         finally:
             os.close(fd)      # _rex_destroy_tree opens its own, verified one
         signals = ((signal.SIGHUP,) if mode == "husk"
@@ -5162,7 +5217,8 @@ class RexBackend(_Backend):
             warn=lambda m: self._warn(f"{name!r}: {m}"))
         if not ok:
             return False
-        self._forget_record(name, judged)
+        if forget:
+            self._forget_record(name, judged)
         return True
 
     # -- attach ------------------------------------------------------------

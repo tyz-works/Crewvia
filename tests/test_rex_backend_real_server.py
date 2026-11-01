@@ -265,9 +265,9 @@ def _send_clears_body(server, b, checkout):
     assert b.kill("Ivy-worker")
 
 
-def test_husk_after_server_restart_is_reused_and_killed_with_sighup(tmp_path, monkeypatch):
+def test_husk_after_server_restart_is_rebuilt_and_killed_with_sighup(tmp_path, monkeypatch):
     """§11 QA 3b / 5 / §12-4: --restore の server を再起動すると block は login shell の husk。
-    ① 世代違いの記録で通常の kill は拒否される ② 空の husk は spawn が再利用する
+    ① 世代違いの記録で通常の kill は拒否される ② 空の husk は spawn が SIGHUP で終えて作り直す (打ち込まない)
     ③ 復元された shell に子を起動させると husk の kill は拒否される ④ 空の husk は SIGHUP で終わる。"""
     server = RealRexServer(restore=True).start()
     checkout = make_checkout(tmp_path)
@@ -303,13 +303,13 @@ def test_husk_after_server_restart_is_reused_and_killed_with_sighup(tmp_path, mo
         for child in lib_mux._live_children(husk_pid) or []:
             os.kill(child, signal.SIGKILL)
         assert _wait(lambda: lib_mux._live_children(husk_pid) == [], 6)
-        # ② spawn は空の husk を再利用 (別の block は作らない)
+        # ② spawn は空の husk を SIGHUP で終え、新しい block を作る (記録の block_id が新しくなる)
         assert b.spawn("Jo-worker", "exec sleep 603")
         rec2 = _record(checkout, "Jo-worker")
-        assert rec2["block_id"] == rec["block_id"]
+        assert rec2["block_id"] != rec["block_id"]
+        assert not _alive(husk_pid)
         assert rec2["server"]["generation"] != rec["server"]["generation"]
-        assert b.list().count("Jo-worker") == 1
-        # 再利用した後は通常の kill (新しい世代の記録)
+        # 作り直した後は通常の kill (新しい世代の記録)
         assert b.kill("Jo-worker")
     finally:
         server.stop()

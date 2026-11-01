@@ -485,6 +485,9 @@ OBSERVATION_SITES: dict[tuple[str, str, str], tuple[str, str]] = {
     ("lib_mux.py", "_live_children", "Path(proc_root).iterdir()"):
         (SAFE, "OSError で None (docstring: \"could not look\" is not "
                "\"nothing there\")。空リストと未観測を区別する呼び出し契約"),
+    ("lib_mux.py", "_rex_scan_tree", 'Path("/proc").iterdir()'):
+        (SAFE, "OSError で None (『走査できなかった』)。呼び出し側 _rex_destroy_tree は None を "
+               "『子孫は居ない』と読まず kill を失敗として返す (信号を打つ前の列挙で None なら何も送らない)"),
     ("lib_mux.py", "proc_table", "Path(proc_root).iterdir()"):
         (SAFE, "同上 (proc_table も None/空を区別する契約)"),
     ("lib_mux.py", "proc_table",

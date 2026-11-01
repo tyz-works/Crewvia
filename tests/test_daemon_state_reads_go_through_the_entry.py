@@ -198,6 +198,10 @@ ALLOWED_JSON_PARSES: dict[tuple[str, str, str], str] = {
         _EXTERNAL_RESPONSE + "herdr CLI の stdout。`JSONDecodeError` を捕まえて次の経路へ",
     ("lib_mux.py", "_herdr_run", "json.loads(r.stderr)"):
         _EXTERNAL_RESPONSE + "同上 (エラー本文が stderr の JSON で来る版)",
+    ("lib_mux.py", "_rex_json", "json.loads(res.out)"):
+        _EXTERNAL_RESPONSE + "`rex ... --json` / `rex block call` の stdout (JSON オブジェクト 1 個)。デーモン側状態ストア "
+        "(registry/daemons) のファイルではない。読めない・オブジェクトでない・exit 非 0 は None = 「読めなかった」"
+        "(空の dict / list に潰さない)",
     ("lib_mux.py", "_herdr_close_tab_bound", "json.loads(data.split(b\"\\n\")[0].decode())"):
         _EXTERNAL_RESPONSE + "herdr socket の応答。壊れていれば「閉じられなかった」と読む",
     ("lib_mux.py", "_herdr_pane_get_bound", "json.loads(data.split(b\"\\n\")[0].decode())"):

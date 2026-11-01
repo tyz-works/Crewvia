@@ -107,7 +107,7 @@ fi
 # スキップしており、旧変数が残っているだけで mode: の変更が無視される事故が
 # あった)。存在すれば無視される旨だけ警告する。
 if [[ -n "${CREWVIA_TMUX:-}" ]]; then
-  echo "[crewvia] WARNING: CREWVIA_TMUX は廃止されました（無視されます）。CREWVIA_MUX=tmux|herdr を使用してください。" >&2
+  echo "[crewvia] WARNING: CREWVIA_TMUX は廃止されました（無視されます）。CREWVIA_MUX=tmux|herdr|rex を使用してください。" >&2
 fi
 
 if [[ -z "${CREWVIA_MUX:-}" ]]; then
@@ -118,6 +118,9 @@ if [[ -z "${CREWVIA_MUX:-}" ]]; then
       ;;
     herdr)
       export CREWVIA_MUX=herdr
+      ;;
+    rex)
+      export CREWVIA_MUX=rex
       ;;
     inline)
       : # CREWVIA_MUX は export しない → start.sh 側がインラインモードにフォールバックする
@@ -165,6 +168,23 @@ if [[ "$NEEDS_MUX" == "1" ]] && [[ "${CREWVIA_MUX:-}" == "herdr" ]]; then
   fi
 fi
 
+# --- rex 到達チェック / 起動（rex モード時） ---
+# herdr の server は lib_mux.py available が起動するが、Rex は『起動は明示的に』
+# (rex-mux-backend.md §8・§10.1 案 2): ここで ensure-server が、無ければ掃除した env で
+# server を起動し api_revision を検査する。既に居れば使い、警告だけ出す。
+if [[ "$NEEDS_MUX" == "1" ]] && [[ "${CREWVIA_MUX:-}" == "rex" ]]; then
+  if ! command -v rex >/dev/null 2>&1; then
+    echo "[crewvia] ERROR: CREWVIA_MUX=rex が設定されていますが rex バイナリが見つかりません。" >&2
+    echo "          rex をインストールするか CREWVIA_MUX=tmux に変更してください。" >&2
+    exit 1
+  fi
+  if ! python3 "${SCRIPT_DIR}/scripts/lib_mux.py" ensure-server; then
+    echo "[crewvia] ERROR: rex server を使えません（理由は上）。" >&2
+    echo "          'rex server status' と 'rex server logs' を確認してください。" >&2
+    exit 1
+  fi
+fi
+
 case "$SUBCMD" in
   status)
     exec bash "${SCRIPT_DIR}/scripts/plan.sh" status "${@:2}"
@@ -202,7 +222,7 @@ Token:   config/.taskvia-token  (1行にトークンを書く、gitignore 済み
 
 Environment variables (config より優先):
   CREWVIA_TASKVIA=enabled|disabled|ask  Taskvia 連携モード（最優先）
-  CREWVIA_MUX=tmux|herdr                mux バックエンド（config の mode: より優先）
+  CREWVIA_MUX=tmux|herdr|rex            mux バックエンド（config の mode: より優先）
   TASKVIA_TOKEN=sk-...                  API トークン
   TASKVIA_URL=https://...               Taskvia URL
 
@@ -214,6 +234,9 @@ Behavior:
   herdr モード: 普通のターミナルから ./crewvia を実行してください。
     herdr server が起動していなければ ./crewvia が自動で起動し、その後 'herdr' へ exec します。
     herdr の pane 内から実行した場合は tab focus のみ（自動 attach なし）。
+  rex モード: rex server が無ければ ./crewvia が掃除した env で起動します（既に居れば使うだけ）。
+    rex の CLI には端末で入る client が無いので、窓は Rex.app で開いてください
+    （Rex.app が接続していれば Director の窓へ focus します）。
 HELP
     ;;
   *)

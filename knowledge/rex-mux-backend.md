@@ -338,7 +338,7 @@ PR-1 で実測したものは「**実測済み**」、残りは「**未確認**�
 
 1. **実測済み**: 重複した label を `-b <label>` で引くと `block target "…" is ambiguous`・**exit 3**（§3.1）
 2. 複数行の入力欄を空にするキー — **実測済み**（`ctrl+u` を行ごとに 2 回。§6.3）。**未確認のまま**: paste の直後の Enter が Claude Code に食われないか（モデルに送ってしまうので、隔離 server でも測っていない。`RexBackend.send()` は paste を使わず `send` の生テキスト + `send-key enter`）・起動直後（`❯` 前）の Enter・長文の paste の畳み（§6.2）
-3. `rex window focus` / 引数なしの `rex` の attach — **未確認**（TTY が要る。`RexBackend.attach()` は `rex focus <window_id>` を呼ぶが未測定。`attach_cmd()` は None を返し、PR-2 が決める）
+3. `rex window focus` / 引数なしの `rex` の attach — **実測済み（PR-2）**: `rex` の CLI に端末で入る client は無い（引数なしは help・`attach` サブコマンド無し・pty でも同じ）。`attach_cmd()` は None のまま。`rex focus <window_id>` は **Rex.app が接続していなくても exit 0**（隔離 server・client は cli だけ）なので、成否は「利用者に見えた」ことの証拠にならない。→ `start.sh` は focus の成否に関係なく利用者への案内を出す。**Rex.app から crewvia の session が見えること自体は、このマシンの app に触れていないので未確認**（見込み: app は接続先 server の全 session を一覧する。利用者の手順は §14）
 4. 復元された shell への SIGHUP で block が消えるか — **実測済み**（消える。§5.3）。pidfd の poll による終了待ち — **実測済み**（全 kill がこれで待つ）。**aarch64 での syscall 番号 — 未確認**（`pidfd_open` = 434 / `pidfd_send_signal` = 424 は x86_64 でだけ測った。**`platform.machine()` が `x86_64` 以外なら pidfd を使わず kill を拒否する**＝ fail-closed。aarch64 で使うときは番号を再測してから表に足す）
 5. **実測済み**: 既存 block で command を走らせる API は無い。husk へ打ち込む案は入力欄が空と確かめられないので廃止し、SIGHUP で終えて新規 `rex run` する（§4.2）
 6. **実測済み**: exit 3 は `not found` だけでなく `is ambiguous` にも使われる。→ 文言も見る（§4）
@@ -373,3 +373,20 @@ PR-1 で実測したものは「**実測済み**」、残りは「**未確認**�
 | 復元 shell への SIGHUP（PR-1） | shell が終わり block も消えた。pidfd の poll で終了を待てた |
 | 本機の login shell（PR-1） | profile が `tmux attach` を起こすので、復元された husk は空にならない（空の `HOME` で測った） |
 | 実測の後始末（PR-1） | 隔離 server はすべて `server stop`・`/tmp/rxp-ren1` / `/tmp/rxt-*` は unlink/rmdir。既定 socket の server（本番）は起動も停止もしていない |
+
+## 14. PR-2 の実装と実測（2026-11-01）
+
+**入口**: `CREWVIA_MUX=rex` または config `mode: rex`。`./crewvia`・`scripts/start.sh` は `lib_mux.py ensure-server` で server を確かめる。**既定 socket の server（利用者の Rex.app のものの可能性が高い）は、起動も停止もしない**: 居れば使い、`api_revision` が 9 でなければ exit 1（tmux に落とさない）。居なければ掃除した env で `rex server start`（config `rex.endpoint: unix:///…` を置くと `rex server run --listen` で、その socket に起動。108 バイト超・unix 以外は拒否）。`crewvia-stop.sh --full` は rex server を止めない。
+
+**既存 server を使うときの警告**（`ensure-server` の stderr）: 「その env は確認できない・掃除されていない。agent-session の変数が全 pane に継承されうる」。気になるなら、利用者が `rex server stop` → `./crewvia` で crewvia に起動させる（Rex.app の他の session も止まる点に注意）。
+
+**利用者が Rex.app で見る手順**: ① `./crewvia`（Director の窓が Rex の `crewvia` session に出る）② Rex.app を開く（同じ server に接続していること）③ session `crewvia` → 窓 `<Name>-director` / `<Name>-worker`・`dispatcher`・`watchdog`。端末だけなら `rex ls` / `rex block ls -s crewvia` / `rex capture -b <block_id>`。**app 側の見え方は未確認**（上 §12-3）。
+
+**`state()`（§10.2-4）**: 読み手は dispatcher の Rule 5 だけ（`check_rule5`。watchdog / `lib_retirement` / `lib_pane_process` は `state()` を呼ばない: watchdog の idle は活動時計 + `/proc` + `capture`）。unknown 固定だと承認待ち・idle-with-task の通知が出ないので、`rex_screen_state(capture)`（承認ダイアログ = 選択肢 + `Enter to confirm` 等 → blocked／`esc to interrupt` → working／入力欄あり → idle／それ以外・空 → unknown）にした。tmux は元から unknown（Rule 5 は効かない）。**できない範囲**: 画面の文言に依存するので Claude Code の UI が変わると unknown に落ちる（通知が出ない側）。watchdog の hard_idle は state に依らず動く。
+
+**持ち越し①（root が終わり子だけ残る block の kill）**: 決定 = 現状維持（受け入れる）。root の pidfd が無く、子を『この block のもの』と束縛する証拠が無い。代わりに警告文に「追わない・手で確認」を明記した。
+
+**持ち越し②（未信頼 cwd の確認ダイアログ）**: `start.sh` の `lib_trust.py check` は mux の種類に依らず spawn の前に走る（backend 非依存）。止まった block は `state()` が `blocked` と答える（`Enter to confirm` 付きの選択肢）ので Rule 5 が拾う。
+
+**このマシン固有の穴（§10.2-7）— 再現して塞いだ**: `~/.bashrc` は `SSH_CONNECTION` が有り `$TMUX` / `$HERDR_ENV` が無い対話シェルで `tmux -u attach -t main` する。herdr の掃除表は `HERDR_ENV` を落とすため、SSH 経由で起動した Rex server は、再起動後に復元した login shell すべてに tmux の子を持たせた（隔離 tmux dir で再現: 復元 shell の子が `tmux -u attach -t main`。= 「空の husk」にならず spawn が OCCUPIED で拒否され、dispatcher / watchdog の respawn も止まる）。server の env から `SSH_CONNECTION` / `SSH_CLIENT` / `SSH_TTY` も落とすと子は付かない（同じ手順で確認）。**crewvia が起動した server にだけ効く**。既に居る server（SSH 経由で起動済み）には効かないので、そのときの復旧は `lib_daemon_watch.py restart <dispatcher|watchdog> --force`（占有者を確認した上で Director が判断）。
+

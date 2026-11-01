@@ -73,13 +73,15 @@ for tool in bash git curl jq python3 gh claude; do
     missing+=("$tool")
   fi
 done
-# mux: tmux か herdr のどちらか一方あれば OK (Phase 2 で herdr が正式サポートされる)
+# mux: tmux / herdr / rex のどれか 1 つあれば OK
 if command -v tmux >/dev/null 2>&1; then
   printf "  [ok]   %-10s %s (mux backend)\n" "tmux" "$(command -v tmux)"
 elif command -v herdr >/dev/null 2>&1; then
   printf "  [ok]   %-10s %s (mux backend)\n" "herdr" "$(command -v herdr)"
+elif command -v rex >/dev/null 2>&1; then
+  printf "  [ok]   %-10s %s (mux backend)\n" "rex" "$(command -v rex)"
 else
-  printf "  [MISS] %-10s (tmux または herdr が必要)\n" "tmux/herdr"
+  printf "  [MISS] %-10s (tmux / herdr / rex のどれかが必要)\n" "tmux/herdr/rex"
   missing+=("tmux")
 fi
 # dashboard を使うなら追加
@@ -128,7 +130,7 @@ if [ ${#missing[@]} -gt 0 ]; then
   echo "[要インストール] ${missing[*]}"
   echo
   echo "Ubuntu/Debian の例:"
-  echo "  sudo apt install -y jq tmux curl python3   # tmux の代わりに herdr も可"
+  echo "  sudo apt install -y jq tmux curl python3   # tmux の代わりに herdr / rex も可"
   echo "  # gh: https://github.com/cli/cli/blob/trunk/docs/install_linux.md"
   echo "  # claude: https://docs.claude.com/claude-code"
   exit 1

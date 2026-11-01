@@ -926,7 +926,9 @@ def worker_start_command(task_skills, target_dir, *, fresh):
     名前は貼った時点で `assign-name.sh` が決める (dispatcher が registry を書き換えない)。
     """
     skills = ' '.join(shlex.quote(s) for s in sorted(task_skills))
-    backend = os.environ.get('CREWVIA_MUX') or 'herdr'
+    # 既定は『選ばれている backend』(env > config > auto)。リテラルの herdr だと、
+    # mode: rex / tmux の利用者に herdr 用の起動コマンドを案内してしまう。
+    backend = os.environ.get('CREWVIA_MUX') or _mux._backend.BACKEND_NAME
     target = f"TARGET_DIR={shlex.quote(str(target_dir))} " if target_dir else ''
     return (
         f"cd {shlex.quote(str(REPO_ROOT))} && "

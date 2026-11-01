@@ -230,6 +230,26 @@ fi
 # （server 未起動なら lib_mux.py available が detached で起動する）
 # tmux にフォールバックしない（異なる mux に分散する事故防止）。
 if [[ "${ROLE}" == "director" ]] && [[ -z "${CREWVIA_MUX_ENABLED:-}" ]]; then
+  # CREWVIA_MUX=rex: server を (無ければ) 掃除した env で起動し api_revision を検査する。
+  # herdr と違い lib_mux.py available は server を起動しないので、ここで明示的に行う
+  # (rex-mux-backend.md §10.1 案 2)。起動できなければ tmux に落とさず exit 1。
+  _require_rex() {
+    local why="$1"
+    if ! command -v rex >/dev/null 2>&1; then
+      echo "[crewvia] ERROR: ${why} が設定されていますが rex バイナリが見つかりません。" >&2
+      echo "          rex をインストールするか CREWVIA_MUX=tmux に変更してください。" >&2
+      exit 1
+    fi
+    if ! python3 "${SCRIPT_DIR}/lib_mux.py" ensure-server; then
+      echo "[crewvia] ERROR: ${why} が設定されていますが rex server を使えません（理由は上）。" >&2
+      echo "          'rex server status' / 'rex server logs' を確認してください。" >&2
+      exit 1
+    fi
+  }
+  if [[ "${CREWVIA_MUX:-}" == "rex" ]]; then
+    _require_rex "CREWVIA_MUX=rex"
+  fi
+
   # CREWVIA_MUX が明示指定されている場合は herdr 不在チェックを先に行う
   if [[ "${CREWVIA_MUX:-}" == "herdr" ]]; then
     if ! command -v herdr >/dev/null 2>&1; then
@@ -255,6 +275,11 @@ if [[ "${ROLE}" == "director" ]] && [[ -z "${CREWVIA_MUX_ENABLED:-}" ]]; then
     export CREWVIA_MUX=herdr
     export CREWVIA_MUX_ENABLED=1
     echo "[crewvia] herdr 並列モードで起動します（config 設定）。"
+  elif [[ "$MODE_FROM_CONFIG" == "rex" ]]; then
+    _require_rex "config に mode: rex"
+    export CREWVIA_MUX=rex
+    export CREWVIA_MUX_ENABLED=1
+    echo "[crewvia] rex 並列モードで起動します（config 設定）。"
   elif [[ "$MODE_FROM_CONFIG" == "tmux" ]]; then
     export CREWVIA_MUX=tmux
     export CREWVIA_MUX_ENABLED=1
@@ -263,7 +288,7 @@ if [[ "${ROLE}" == "director" ]] && [[ -z "${CREWVIA_MUX_ENABLED:-}" ]]; then
     export CREWVIA_MUX_ENABLED=0
     echo "[crewvia] インラインモードで起動します（config 設定）。"
   elif ! python3 "${SCRIPT_DIR}/lib_mux.py" available >/dev/null 2>&1; then
-    echo "[crewvia] mux backend (tmux / herdr) 未検出 → インラインモードで起動します。" >&2
+    echo "[crewvia] mux backend (tmux / herdr / rex) 未検出 → インラインモードで起動します。" >&2
     echo "          （並列 Worker 起動には 'brew install tmux' を推奨）" >&2
     export CREWVIA_MUX_ENABLED=0
   elif [[ ! -e /dev/tty ]]; then
@@ -783,7 +808,7 @@ if [[ "${_EFFECTIVE_MUX_ENABLED:-0}" == "1" ]]; then
   # family D: 生の '$VAR' 埋め込みは、AGENT_NAME・TARGET_DIR・WORK_DIR のような外部由来の値
   # (Worker 名・プロジェクトパス・env var) に ' が含まれるだけで起動が壊れ、`'; cmd; #` の
   # ような値ならペインでコマンドが追加実行される)。
-  ENV_EXPORTS="export AGENT_NAME=$(_shq "$AGENT_NAME") TASKVIA_URL=$(_shq "$TASKVIA_URL") TASKVIA_TOKEN=$(_shq "${TASKVIA_TOKEN:-}") CREWVIA_TASKVIA=$(_shq "${CREWVIA_TASKVIA:-enabled}") ROLE=$(_shq "$ROLE") SKILLS=$(_shq "${SKILLS:-}") CREWVIA_REPO=$(_shq "$CREWVIA_REPO") CREWVIA_REPO_ROOT=$(_shq "$CREWVIA_REPO_ROOT") CREWVIA_QUEUE=$(_shq "$CREWVIA_QUEUE") CREWVIA_APPROVAL_CHANNEL=$(_shq "${CREWVIA_APPROVAL_CHANNEL:-taskvia}") NTFY_URL=$(_shq "${NTFY_URL:-}") NTFY_TOPIC=$(_shq "${NTFY_TOPIC:-}") NTFY_USER=$(_shq "${NTFY_USER:-}") NTFY_PASS=$(_shq "${NTFY_PASS:-}") APPROVAL_TOKEN_TTL_SECONDS=$(_shq "${APPROVAL_TOKEN_TTL_SECONDS:-900}") CREWVIA_MUX=$(_shq "${CREWVIA_MUX:-}") CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1"
+  ENV_EXPORTS="export AGENT_NAME=$(_shq "$AGENT_NAME") TASKVIA_URL=$(_shq "$TASKVIA_URL") TASKVIA_TOKEN=$(_shq "${TASKVIA_TOKEN:-}") CREWVIA_TASKVIA=$(_shq "${CREWVIA_TASKVIA:-enabled}") ROLE=$(_shq "$ROLE") SKILLS=$(_shq "${SKILLS:-}") CREWVIA_REPO=$(_shq "$CREWVIA_REPO") CREWVIA_REPO_ROOT=$(_shq "$CREWVIA_REPO_ROOT") CREWVIA_QUEUE=$(_shq "$CREWVIA_QUEUE") CREWVIA_APPROVAL_CHANNEL=$(_shq "${CREWVIA_APPROVAL_CHANNEL:-taskvia}") NTFY_URL=$(_shq "${NTFY_URL:-}") NTFY_TOPIC=$(_shq "${NTFY_TOPIC:-}") NTFY_USER=$(_shq "${NTFY_USER:-}") NTFY_PASS=$(_shq "${NTFY_PASS:-}") APPROVAL_TOKEN_TTL_SECONDS=$(_shq "${APPROVAL_TOKEN_TTL_SECONDS:-900}") CREWVIA_MUX=$(_shq "${CREWVIA_MUX:-}") CREWVIA_REX_SESSION=$(_shq "${CREWVIA_REX_SESSION:-}") CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1"
   [[ "${ROLE}" == "worker" ]] && [[ "$WORK_DIR" != "$REPO_ROOT" ]] && ENV_EXPORTS+=" TARGET_DIR=$(_shq "$WORK_DIR")"
 
   # --- CLAUDE_CONFIG_DIR: precheck が読んだ設定と、実際に起動する claude が読む設定を同一にする (t051 P1) ---
@@ -1040,7 +1065,15 @@ PYEOF
 
     # Auto-attach to Director window after kickoff + dispatcher launch.
     echo "[crewvia] Attaching to $WINDOW_NAME ..."
-    mux_attach "$WINDOW_NAME"
+    if [[ "${CREWVIA_MUX:-}" == "rex" ]]; then
+      # Rex の CLI には端末で入る client が無い (実測。rex-mux-backend.md §10.2)。focus は
+      # Rex.app が接続しているときだけ効くので、失敗しても起動は成功として扱う。
+      # `rex focus` は app が接続していなくても成功する (実測) ので、成否に関係なく案内を出す。
+      mux_attach "$WINDOW_NAME" || true
+      echo "[crewvia] Director は Rex の中で動いています。Rex.app の session '${CREWVIA_REX_SESSION:-crewvia}' → 窓 '$WINDOW_NAME' を開いてください（CLI: rex ls / rex capture -b <block>）。"
+    else
+      mux_attach "$WINDOW_NAME"
+    fi
   fi
 else
   # Default: run inline (no tmux)

@@ -52,9 +52,15 @@ model_per_skill:
 # tmux   — Director + Worker を tmux セッション "crewvia" 内に展開（並列 Worker 可）
 # herdr  — Director + Worker を herdr workspace "crewvia" 内に展開（並列 Worker 可）
 #          herdr モードでは先に herdr を起動し、その中で bash scripts/start.sh director を実行すること
+# rex    — Director + Worker を Rex の session "crewvia"（CREWVIA_REX_SESSION）内に展開（並列 Worker 可）
+#          rex CLI（API revision 9）が要る。./crewvia が server を確かめ、居なければ起動する
+#          既定 socket に既に居る server は使うだけで、起動も停止もしない。別 socket にするなら
+#          rex: { endpoint: unix:///絶対パス }（108 バイト以内）を足す。窓を見るには Rex アプリが要る
+#          （CLI に端末 client は無い。アプリでの見え方は未確認）。herdr-task-graph は使えない
+#          mux を切り替えるときは先に crewvia を止める（registry/mux/ の記録は名前ごとに 1 つ）
 # inline — 単独プロセスで起動（Worker 並列不可、デバッグ向き）
 #
-# 環境変数での上書き: CREWVIA_MUX=tmux|herdr (最優先) / CREWVIA_MUX_ENABLED=1 (並列 ON) / CREWVIA_MUX_ENABLED=0 (inline)
+# 環境変数での上書き: CREWVIA_MUX=tmux|herdr|rex (最優先) / CREWVIA_MUX_ENABLED=1 (並列 ON) / CREWVIA_MUX_ENABLED=0 (inline)
 # CREWVIA_MUX が設定されていれば CREWVIA_MUX_ENABLED より優先される。
 mode: herdr  # 戻す時は tmux。切替日: 2026-09-04
 

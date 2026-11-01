@@ -72,7 +72,7 @@ scripts/
   lib_task_cards.py     queue / registry / config を読む唯一の入口
   lib_dep_rules.py      「依存が満たされた」の唯一の定義
   lib_daemon_state.py   デーモン側 JSON 状態ストアの入口
-  lib_mux.py / .sh      mux 抽象化（tmux / herdr）
+  lib_mux.py / .sh      mux 抽象化（tmux / herdr / rex。Rex は RexBackend・ensure-server・kill は pidfd。設計: knowledge/rex-mux-backend.md）
   lib_worker_target.py  Worker の TARGET_DIR 記録
   lib_registry.py       workers.yaml を書く入口
   lib_review_refusal.py codex-review の拒否記録
@@ -128,11 +128,13 @@ registry/ workers.yaml / workers/ / heartbeats/ / mux/ / retirements/ / task-gra
 | `CREWVIA_REVIEW_ENGINE` | kai-review.sh のレビュー先: `codex`（既定）/ `agy` / `claude` / `both` / `ensemble`（agy + claude の合議。片方でも失敗なら needs-director）（`cursor` は比較専用で `review.compare` にだけ置ける。env・config の `cursor` は拒否）。`config/crewvia.yaml` の `review.engine` より優先（engine だけ。`agy_model` / `agy_timeout_seconds` / `cursor_model` / `cursor_timeout_seconds` / `claude_model` / `claude_timeout_seconds` / `compare` は config のみ）。不正な値は codex に倒さず needs-director。`knowledge/agy-review.md` / `knowledge/cursor-review.md` / `knowledge/claude-review.md` |
 | `CREWVIA_TASK_GRAPH` | herdr-task-graph 用 `tasks.json` の生成 ON/OFF。既定は有効、`0` で完全に無効（1 バイトも書かず、ログも出さない）。生成は queue を書き換える plan.sh サブコマンドすべてに乗るので、重い・壊れたときの退避路として残してある |
 | `CREWVIA_TASK_GRAPH_FILE` | 生成物の書き先。既定は `$CREWVIA_REPO_ROOT/registry/task-graph/tasks.json`（未設定時のみ plan.sh の位置基準にフォールバック）。plugin にはこのパスを **plugin の config dir への symlink** で参照させる（`HERDR_TASKS_FILE` は稼働中の herdr のペインに届かないので使わない。`knowledge/task-graph.md`） |
-| `CREWVIA_MUX` | mux バックエンド選択: `tmux` / `herdr`。config `mode:` より優先 |
+| `CREWVIA_MUX` | mux バックエンド選択: `tmux` / `herdr` / `rex`。config `mode:` より優先。**本番で切り替えるときは先に crewvia を止める**（`registry/mux/` の記録は名前ごとに 1 つ。herdr と Rex を同時に動かさない）。Rex は `rex` の API revision 9 だけ受け付け、不一致・読めないときは他の backend に落とさず失敗する。`knowledge/rex-mux-backend.md` |
+| `CREWVIA_REX_SESSION` | Rex backend が使う session 名（既定 `crewvia`）。endpoint は config `rex.endpoint`（`unix:///絶対パス`・108 バイト以内。未設定 = Rex の既定 socket。既定 socket の server は crewvia が起動も停止もしない） |
 | `CREWVIA_MUX_ENABLED` | 並列モード有効化: `1` で並列 ON（`CREWVIA_MUX` 未設定時の tmux fallback）/ `0` でインラインモード強制。`CREWVIA_MUX` が設定済みなら不要 |
 | `CREWVIA_TMUX_SESSION` | tmux backend が使うセッション名（デフォルト: `crewvia`） |
 | `CREWVIA_HERDR_WORKSPACE` | herdr backend が使うワークスペース名（デフォルト: `crewvia`） |
 | `CREWVIA_HERDR_SOCK` | **テスト専用**。lib_mux が ping する herdr socket の上書き。**本番で設定するな**（ping 先と server の bind 先が食い違う）。詳細: `tests/CLAUDE.md` |
+| `CREWVIA_REX_SOCK` | **テスト専用**。隔離 Rex server の socket（`CREWVIA_MUX_TEST_ISOLATION` 下でだけ読む）。**本番で設定するな**（本番で立っていると Rex は使用不可になる）。詳細: `knowledge/rex-mux-backend.md` §8 |
 | `CREWVIA_MUX_RECORD_SWEEP` | 失効した mux spawn 記録（`registry/mux/*.json`）の掃除の停止スイッチ。`0` で掃除が何も見ず何も消さない（既定は有効）。**止まるのは掃除だけ**で、記録の書き込みロックは常に働く。dispatcher は cycle ごとに新しい python なので dispatcher の env に足して再起動すれば効く。`start.sh` は env をそのまま読む。掃除は消す側の 1 者なので食い違っても危険な側には倒れない（規則を共有する `lib_dep_rules` 等に env スイッチを付けない理由と逆）。`knowledge/daemon-authority.md` §7-14 |
 | `CREWVIA_MUX_TEST_ISOLATION` | **テスト専用**。テスト中の印（`tests/conftest.py` が置く）。立っている間、本番の宛先名を指す mux verb は拒否される。**本番で設定するな**。詳細: `tests/CLAUDE.md` |
 | `CREWVIA_PYTEST_WORKSPACE_SWEEP` | **テスト専用**。pytest 終了時の残骸掃除の停止スイッチ（`0` で止まる）。**本番で設定するな**。詳細: `tests/CLAUDE.md` |
@@ -150,7 +152,7 @@ registry/ workers.yaml / workers/ / heartbeats/ / mux/ / retirements/ / task-gra
 
 ## 設計原則
 
-1. **mux 非依存** - mux（tmux / herdr）がなくても動く。どちらもオプション（並列モード用）
+1. **mux 非依存** - mux（tmux / herdr / Rex）がなくても動く。いずれもオプション（並列モード用）。Rex は herdr-task-graph が使えず、端末 client が無いので窓を見るには Rex アプリが要る
 2. **Taskvia非依存** - Taskvia未接続でもスタンドアロンで動作可能
 3. **名前はポジション** - 同スキルWorkerは同名前を引き継ぐ
 4. **公開前提** - ドメイン固有設定を外に出し、設定ファイルで全カスタマイズ可能

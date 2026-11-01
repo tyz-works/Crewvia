@@ -3,8 +3,14 @@
 herdr に代わる mux として Rex（https://www.superlogical.com/rex/docs/）を crewvia で使えるようにするための**設計文書**
 （2026-10-31 ユーザー判断: 設計だけ先に。設計の PR #329 はコードを 1 行も変えていない）。
 
-**実装の状況（2026-11-01）**: PR-1（`RexBackend` + 隔離テスト。§11）を `scripts/lib_mux.py` に入れた。`CREWVIA_MUX=rex` / `mode: rex` を選ばなければ動作は変わらない。
-start.sh / dispatcher / watchdog の配線は PR-2。§12 の未確認のうち PR-1 で実測した 5 件の結果は §12 に「**実測済み**」として書いた（§4・§5.3・§6 の「未確認」の文言も事実に直してある）。
+**実装の状況（2026-11-02）**: PR-1（`RexBackend` + 隔離テスト。#331）と PR-2（start.sh / dispatcher / watchdog の配線。#332）は main に入っている。`CREWVIA_MUX=rex` / `mode: rex` を選ばなければ動作は変わらない。PR-3（この docs の更新。README・CLAUDE.md・config のコメント・file-map）で利用者向けの手順を書いた。§12 の未確認の結果は PR-1・PR-2 で実測した分を「**実測済み**」として書き、残りは §12 末尾の「PR-3 時点の残り」にまとめた。**本番の既定 socket の server・Rex アプリでの見え方は一度も確かめていない**（未確認）。
+
+**本番で mux を切り替えるときの注意（PR-3）**:
+1. **先に crewvia を止める**（`scripts/crewvia-stop.sh`）。`registry/mux/<name>.json` は名前ごとに 1 つで kill の認可の証拠なので、herdr と Rex を同時に動かさない
+2. 既に居る Rex server の env は掃除されない（crewvia は読めない）。`ensure-server` が警告を出す。掃除したいなら `rex server stop` → `./crewvia`（アプリの他 session も止まる）
+3. server 再起動後に復元された shell は世代が違うので通常の kill は拒否される。デーモン窓は `python3 scripts/lib_daemon_watch.py restart <name> --force`（§5.3・§14）
+4. Rex の CLI に端末 client は無い。窓を見るには Rex アプリが同じ server に接続している必要がある。**アプリでの見え方は未確認**
+5. 戻し方: crewvia を止めて `mode:` / `CREWVIA_MUX` を戻す
 
 - 対象の版: `rex 0.0.1793390926-g3b2dce`（commit `3b2dce8`・built 2026-10-30T20:08:46Z）・**API revision 9（supports 0 to 9）**・`/usr/bin/rex`
 - 書いた人: Worker Mateo（mission `20261031-rex-mux-design` t001）。Director の事前実測を**自分でも隔離サーバーで再現**し、足りない所（label の一意性・send の中身・kill の挙動・再起動・env）を足した
@@ -345,6 +351,8 @@ PR-1 で実測したものは「**実測済み**」、残りは「**未確認**�
 7. scrollback の上限（Director の測定 64MiB を自分では再現していない）— 未確認
 8. UUID の再利用が無いこと（§4.2。見込み）— 未確認
 9. `rex events` の `child_exited` を使った死活の検知 — 未確認
+
+**PR-3 時点の残り**（実物では未確認）: ① Rex アプリでの crewvia session の見え方（項目 3）② paste 直後の Enter・起動直後の Enter・長文の paste の畳み（項目 2）③ aarch64 の syscall 番号（項目 4）④ scrollback の上限・UUID の再利用・`child_exited`（項目 7〜9）⑤ 実 Claude での `mode: rex` の Worker 自動起動と kickoff の一周（§14.1 E）⑥ 本番の既定 socket の server との組み合わせ。①⑤⑥ は本番機でユーザーが最初に切り替えたときに確かめる
 
 ## 13. 実測の記録（要点）
 

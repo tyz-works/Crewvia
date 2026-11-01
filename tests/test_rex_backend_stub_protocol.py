@@ -477,6 +477,7 @@ def test_spawn_does_not_count_a_dead_shell_but_counts_a_live_block(fake):
     assert lib_mux.RexBackend().spawn("Zed-worker", "true")
     # 殻 + 生きた sleep -> OCCUPIED
     live = subprocess.Popen(["sleep", "600"])
+    (fake.checkout / "registry" / "mux" / f"{pname}.json").unlink()   # 1 回目の記録
     try:
         fake.set(_spawn_rules(sessions=[{"session_id": "s1", "label": label}], blocks=blocks,
                               procs={"block:X": shell, "block:Y": _proc(live.pid)}))
@@ -535,7 +536,8 @@ def victim(fake):
     procs = []
 
     def make(argv=("sleep", "600")):
-        p = subprocess.Popen(list(argv), start_new_session=True)
+        p = subprocess.Popen(list(argv), start_new_session=True,
+                             stdin=subprocess.PIPE)
         procs.append(p)
         return p
 
@@ -728,8 +730,10 @@ def test_nothing_running_in_the_block_is_left_alone_and_the_record_ends(fake):
 
 def test_restored_empty_shell_is_taken_with_sighup_only(fake, victim):
     """世代違いの記録 + 子の居ない shell -> SIGHUP だけで終わる (TERM/KILL は打たない)。"""
-    p = victim(("sleep", "600"))
-    # 偽の rex は『これは bash だ』と言う。実体の sleep は子を持たない = 空。
+    # 復元された shell の実測した cmdline `-bash` (引数なし)。子は持たない = 空。
+    p = victim(("bash", "-c", "exec -a -bash bash"))
+    time.sleep(0.4)
+    assert lib_mux._process_argv(p.pid) == ["-bash"]
     _arm(fake, p, generation="inst-OLD:1", child_name="bash")
     seen = []
     real = lib_mux._pidfd_signal
@@ -1036,8 +1040,10 @@ def test_a_failed_final_scan_is_unobserved_not_empty():
 
 @pytest.fixture
 def husk_proc():
-    """子を持たない `bash` のふりをする実プロセス (復元された殻)。"""
-    p = subprocess.Popen(["sleep", "650"], start_new_session=True)
+    """子を持たない `-bash` (復元された login shell と同じ cmdline) の実プロセス。"""
+    p = subprocess.Popen(["bash", "-c", "exec -a -bash bash"], start_new_session=True,
+                         stdin=subprocess.PIPE)
+    time.sleep(0.4)
     yield p
     p.kill()
     p.wait()

@@ -430,3 +430,63 @@ def test_concurrent_spawns_of_the_same_name_make_exactly_one_block(world):
     assert results.count(True) >= 1
     assert _record(checkout, "Con-worker")["block_id"] == blocks[0]["block_id"]
     assert b.kill("Con-worker")
+
+
+def test_spawn_checks_the_recorded_block_before_the_label_rename(world):
+    """r7 F1: block の改名後も、記録が指す生きた block は上書きされない (OCCUPIED)。"""
+    server, b, checkout = world
+    assert b.spawn("Ren-worker", "exec sleep 600")
+    rec = _record(checkout, "Ren-worker")
+    server.rex("block", "rename", rec["block_id"], "somebody-renamed", check=True)
+    assert not b.spawn("Ren-worker", "exec sleep 601")
+    assert b.last_spawn_refusal == lib_mux.SPAWN_OCCUPIED
+    assert _record(checkout, "Ren-worker")["block_id"] == rec["block_id"]
+    server.rex("block", "close", rec["block_id"])
+
+
+def test_spawn_checks_the_recorded_block_when_the_session_label_changes(world, monkeypatch):
+    """r7 F1: CREWVIA_REX_SESSION を変えても、前の session の生きた block を残したまま二重に作らない。"""
+    server, b, checkout = world
+    assert b.spawn("Ses-worker", "exec sleep 600")
+    rec = _record(checkout, "Ses-worker")
+    original = os.environ.get("CREWVIA_REX_SESSION")
+    monkeypatch.setenv("CREWVIA_REX_SESSION", "another-session")
+    b2 = lib_mux.RexBackend()
+    assert not b2.spawn("Ses-worker", "exec sleep 601")
+    assert b2.last_spawn_refusal == lib_mux.SPAWN_OCCUPIED
+    assert _record(checkout, "Ses-worker")["block_id"] == rec["block_id"]
+    if original is None:
+        monkeypatch.delenv("CREWVIA_REX_SESSION")
+    else:
+        monkeypatch.setenv("CREWVIA_REX_SESSION", original)
+    assert b.kill("Ses-worker")
+
+
+def _spawn_bare(script, stdin_pipe=True):
+    import subprocess as sp
+    p = sp.Popen(["bash", "-c", script], stdin=sp.PIPE, stdout=sp.DEVNULL,
+                 stderr=sp.DEVNULL)
+    return p
+
+
+def test_husk_state_requires_a_bare_shell_cmdline():
+    """r7 F2: comm が bash でも `exec bash -c '...'` は idle の husk ではない。
+    実測した復元 shell の形 `-bash\\0` (引数なし) だけが idle。"""
+    b = lib_mux.RexBackend()
+    login = _spawn_bare("exec -a -bash bash")           # argv == ['-bash']
+    prog = _spawn_bare("exec bash -c 'read x'")         # argv == ['bash','-c','read x']
+    try:
+        time.sleep(0.5)
+        assert lib_mux._process_argv(login.pid) == ["-bash"]
+        assert lib_mux._process_argv(prog.pid) == ["bash", "-c", "read x"]
+
+        def proc(p):
+            return {"child": {"pid": p.pid, "name": "bash"}}
+        assert b._husk_state(proc(login)) == lib_mux.PANE_IDLE
+        assert b._husk_state(proc(prog)) == lib_mux.PANE_LIVE
+    finally:
+        for p in (login, prog):
+            p.kill()
+            p.wait()
+    # 読めない cmdline (消えた pid) は idle にしない
+    assert b._husk_state({"child": {"pid": login.pid, "name": "bash"}}) != lib_mux.PANE_IDLE

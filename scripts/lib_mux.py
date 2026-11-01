@@ -4876,6 +4876,16 @@ class RexBackend(_Backend):
             return PANE_UNKNOWN
         if name.lstrip("-") not in _SHELL_PROCESS_NAMES:
             return PANE_LIVE
+        # A bare shell only: a restored login shell's cmdline is exactly
+        # `-bash\0` (measured, design doc §5.3).  `exec bash -c '...'` or a
+        # script keeps the comm "bash" but is a program, not an idle shell;
+        # an unreadable cmdline proves nothing.
+        argv = _process_argv(child["pid"])
+        if argv is None:
+            return PANE_UNKNOWN
+        if len(argv) != 1 or os.path.basename(argv[0]).lstrip("-") \
+                not in _SHELL_PROCESS_NAMES:
+            return PANE_LIVE
         kids = _live_children(child["pid"])
         if kids is None:
             return PANE_UNKNOWN
@@ -4958,6 +4968,29 @@ class RexBackend(_Backend):
                         and proc.get("last_exit") is not None:
                     continue          # a shell: not counted (design doc §3.3)
                 live.append((b, state, proc))
+            # The record comes before the label (design doc §3.3): a block the
+            # record names that is still alive must not be left behind by a
+            # rename or a changed CREWVIA_REX_SESSION, whatever its session.
+            record = read_pane_record(name)
+            rec_bid = (record.get("block_id")
+                       if isinstance(record, dict)
+                       and record.get("backend") == "rex" else None)
+            if isinstance(rec_bid, str) and rec_bid \
+                    and rec_bid not in [b["block_id"] for b, _s, _p in live]:
+                rstate, rproc = self._process(rec_bid)
+                if rstate == "unreadable":
+                    self._warn(f"spawn {name!r}: the recorded block "
+                               f"{rec_bid} could not be read; not spawning")
+                    self.last_spawn_refusal = SPAWN_UNREADABLE
+                    return False
+                if rstate == "ok" and not (
+                        self._child_of(rproc) is None
+                        and rproc.get("last_exit") is not None):
+                    self._warn(f"spawn {name!r}: the recorded block "
+                               f"{rec_bid} is alive (renamed or in another "
+                               f"session); not overwriting its record")
+                    self.last_spawn_refusal = SPAWN_OCCUPIED
+                    return False
             if len(live) > 1:
                 self._warn(f"spawn {name!r}: {len(live)} live blocks carry "
                            f"the label {pname!r} — ambiguous, refusing")

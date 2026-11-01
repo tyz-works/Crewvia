@@ -818,9 +818,13 @@ def test_a_recycled_pid_in_the_tree_gets_no_signal(monkeypatch):
     try:
         real = lib_mux._rex_scan_tree
 
+        calls = []
+
         def lying(root_pid, root_sid, known=()):
             tree = real(root_pid, root_sid, known)
-            tree[bystander.pid] = (root_pid, "1")        # 偽の starttime = 列挙後に pid が再利用された
+            if not calls:       # 列挙の 1 回目だけ嘘をつく (最終走査は本物)
+                tree[bystander.pid] = (root_pid, "1")    # 偽の starttime = 列挙後に pid が再利用された
+            calls.append(1)
             return tree
 
         monkeypatch.setattr(lib_mux, "_rex_scan_tree", lying)
@@ -911,3 +915,123 @@ def test_state_is_unknown_and_attach_cmd_is_not_claimed(fake):
     b = lib_mux.RexBackend()
     assert b.state("Zed-worker") == "unknown"
     assert b.attach_cmd("Zed-worker") is None
+
+
+# ---------------------------------------------------------------------------
+# Codex r1 の指摘の回帰 (P1×4 / P2×1)
+# ---------------------------------------------------------------------------
+
+def test_send_refuses_when_the_capture_is_unreadable_or_has_no_input_box(fake):
+    """読めない / 入力欄が見えない画面は『空』ではない: 何も送らない。"""
+    _worker_record(fake)
+    for out, rc in (("", 1), ("", 0), ("$ \n", 0)):
+        fake.set(_base_rules() + [_blocks_rule(), {"match": ["capture"], "out": out, "rc": rc},
+                                  {"match": ["send-key"], "out": ""}, {"match": ["send"], "out": ""}])
+        assert not lib_mux.RexBackend().send("Zed-worker", "hello")
+        calls = fake.calls()
+        assert not any(c[0] == "send" for c in calls)
+        assert not any(c[0] == "send-key" and "enter" in c for c in calls)
+
+
+def _destroy_with_final_scan(final):
+    """最終走査 (2 回目の scan) だけ `final(tree)` で差し替えて破壊を走らせる。"""
+    root = subprocess.Popen(["sleep", "640"], start_new_session=True)
+    real = lib_mux._rex_scan_tree
+    calls = []
+
+    def scan(root_pid, root_sid, known=()):
+        calls.append(1)
+        tree = real(root_pid, root_sid, known)
+        return tree if len(calls) < 2 else final(tree)
+
+    orig = lib_mux._rex_scan_tree
+    lib_mux._rex_scan_tree = scan
+    try:
+        msgs = []
+        ok = lib_mux._rex_destroy_tree(
+            root.pid, lib_mux._rex_start_time(root.pid),
+            signals=(signal.SIGKILL,), grace=lambda s: 3.0, warn=msgs.append)
+        return ok, msgs
+    finally:
+        lib_mux._rex_scan_tree = orig
+        root.kill()
+        root.wait()
+
+
+def test_a_surviving_session_member_without_ancestry_makes_the_kill_fail():
+    """親の死で再親子化された生存者 (held への祖先鎖が無い) も残党: 成功と言わない。"""
+    orphan = subprocess.Popen(["sleep", "641"], start_new_session=True)
+    try:
+        st = lib_mux._rex_start_time(orphan.pid)
+
+        def final(tree):
+            tree[orphan.pid] = (1, st)
+            return tree
+
+        ok, msgs = _destroy_with_final_scan(final)
+        assert not ok and msgs
+        assert _alive(orphan.pid)
+    finally:
+        orphan.kill()
+        orphan.wait()
+
+
+def test_a_failed_final_scan_is_unobserved_not_empty():
+    ok, msgs = _destroy_with_final_scan(lambda tree: None)
+    assert not ok and msgs
+
+
+@pytest.fixture
+def husk_proc():
+    """子を持たない `bash` のふりをする実プロセス (復元された殻)。"""
+    p = subprocess.Popen(["sleep", "650"])
+    yield p
+    p.kill()
+    p.wait()
+
+
+def _husk_rules(fake, husk, *, record_patch=None):
+    path, rec = _worker_record(fake, block_id="block:X")
+    if record_patch:
+        rec.update(record_patch)
+        path.write_text(json.dumps(rec))
+    label, pname = lib_mux._rex_session_label(), lib_mux._pane_name("Zed-worker")
+    shell = _proc(husk.pid, name="bash")
+    fake.set(_spawn_rules(sessions=[{"session_id": "session:S1", "label": label}],
+                          blocks=[{"block_id": "block:X", "label": pname, "window_id": "window:W1"}],
+                          procs={"block:X": shell}) + [{"match": ["capture"], "out": ""},
+                                                       {"match": ["send-key"], "out": ""},
+                                                       {"match": ["send"], "out": ""}])
+
+
+@pytest.mark.parametrize("patch", [{"checkout": "/somewhere/else"}, {"handle": "window:OTHER"}])
+def test_husk_is_not_reused_for_a_foreign_checkout_or_another_window(fake, husk_proc, patch):
+    _husk_rules(fake, husk_proc, record_patch=patch)
+    b = lib_mux.RexBackend()
+    assert not b.spawn("Zed-worker", "true")
+    assert b.last_spawn_refusal == lib_mux.SPAWN_UNREADABLE
+    assert not any(c[0] in ("send", "send-key", "run") for c in fake.calls())
+
+
+def test_husk_respawn_establishes_the_requested_cwd_with_safe_quoting(fake, husk_proc):
+    _husk_rules(fake, husk_proc)
+    lib_mux.RexBackend().spawn("Zed-worker", "exec claude", cwd="/tmp/it's a dir")
+    sent = [c for c in fake.calls() if c[0] == "send"]
+    assert sent, "the husk relaunch must type the command"
+    text = sent[0][sent[0].index("--") + 1]
+    assert text == "cd '/tmp/it'\"'\"'s a dir' && exec claude"
+
+
+def test_spawn_that_cannot_write_its_record_is_not_a_success(fake, monkeypatch, capsys):
+    child = subprocess.Popen(["sleep", "600"])
+    try:
+        label = lib_mux._rex_session_label()
+        fake.set(_spawn_rules(sessions=[{"session_id": "session:S1", "label": label}], blocks=[],
+                              procs={"block:NEW": _proc(child.pid)}))
+        monkeypatch.setattr(lib_mux, "write_pane_record", lambda *a, **k: False)
+        assert not lib_mux.RexBackend().spawn("Zed-worker", "exec sleep 600")
+        err = capsys.readouterr().err
+        assert "block:NEW" in err and "window:NEW" in err
+    finally:
+        child.kill()
+        child.wait()

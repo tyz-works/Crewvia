@@ -56,6 +56,7 @@ import os
 import platform
 import re
 import select
+import shlex
 import shutil
 import signal
 import socket
@@ -4419,9 +4420,13 @@ def _rex_destroy_tree(root_pid: int, root_start: str, *, signals, grace,
                 # One last look: a child forked while we waited, and still
                 # alive, means the tree is not gone yet.
                 late = _rex_scan_tree(root_pid, root_sid, known=held.keys())
-                stragglers = [] if late is None else [
-                    p for p in late
-                    if p not in held and _is_descendant_of(p, held)]
+                if late is None:
+                    warn("kill: the final /proc scan failed; the tree is "
+                         "not known to be gone.")
+                    return False
+                # Session members that lost their ancestry chain (re-parented
+                # when their parent died) are stragglers too.
+                stragglers = [p for p in late if p not in held]
                 if not stragglers:
                     return True
                 if sig == signals[-1]:
@@ -4743,16 +4748,23 @@ class RexBackend(_Backend):
             return PANE_UNKNOWN
         return PANE_LIVE if kids else PANE_IDLE
 
-    def _record_spawn(self, name, sid, block_id, window_id, status, child):
+    def _record_spawn(self, name, sid, block_id, window_id, status, child) -> bool:
         start = _rex_start_time(child["pid"]) if child else None
         extra = {"block_id": block_id, "window_id": window_id,
                  "session_id": sid, "instance_id": status["instance_id"]}
         if child and start:
             extra["child"] = {"pid": child["pid"], "starttime": start}
-        write_pane_record(name, self.BACKEND_NAME, window_id,
-                          pane_id=block_id,
-                          server=(status["endpoint"], _rex_generation(status)),
-                          extra=extra)
+        ok = write_pane_record(name, self.BACKEND_NAME, window_id,
+                               pane_id=block_id,
+                               server=(status["endpoint"],
+                                       _rex_generation(status)),
+                               extra=extra)
+        if not ok:
+            self._warn(f"spawn {name!r}: the spawn record could not be "
+                       f"written; the block is running but unmanaged "
+                       f"(block_id={block_id}, window_id={window_id}) — "
+                       f"close it by hand")
+        return bool(ok)
 
     def _wait_for_child(self, block_id: str, seconds: float = 5.0):
         deadline = time.monotonic() + seconds
@@ -4803,7 +4815,8 @@ class RexBackend(_Backend):
                 self.last_spawn_refusal = SPAWN_UNREADABLE
                 return False
             if live:
-                return self._respawn_in_husk(name, cmd, sid, status, *live[0])
+                return self._respawn_in_husk(name, cmd, sid, status, *live[0],
+                                             cwd=cwd)
             run = ["run", "-s", sid, "--label", pname, "--focus=false",
                    "--json"]
             if cwd:
@@ -4820,10 +4833,11 @@ class RexBackend(_Backend):
             if child is None:
                 self._warn(f"spawn {name!r}: no child process was seen in the "
                            f"new block; the record will not carry one")
-            self._record_spawn(name, sid, ids[0], window_id, status, child)
-            return True
+            return self._record_spawn(name, sid, ids[0], window_id, status,
+                                      child)
 
-    def _respawn_in_husk(self, name, cmd, sid, status, block, state, proc) -> bool:
+    def _respawn_in_husk(self, name, cmd, sid, status, block, state, proc,
+                         cwd=None) -> bool:
         record = read_pane_record(name)
         if state != "ok":
             self.last_spawn_refusal = SPAWN_UNREADABLE
@@ -4839,6 +4853,15 @@ class RexBackend(_Backend):
                        f"this checkout did not create it; not reusing it")
             self.last_spawn_refusal = SPAWN_UNREADABLE
             return False
+        wid = str(block.get("window_id") or "")
+        if str(record.get("checkout") or "") != _record_checkout_identity() \
+                or not wid or str(record.get("handle") or "") != wid:
+            self._warn(f"spawn {name!r}: the record was not written by this "
+                       f"checkout, or names another window; not reusing")
+            self.last_spawn_refusal = SPAWN_UNREADABLE
+            return False
+        if cwd:
+            cmd = f"cd {shlex.quote(cwd)} && {cmd}"
         self._warn(f"spawn {name!r}: block {block['block_id']} is an idle "
                    f"shell (rex restart?) — relaunching in place")
         bid = block["block_id"]
@@ -4849,8 +4872,8 @@ class RexBackend(_Backend):
                 warn=self._warn, name=name):
             return False
         child = self._wait_for_child(bid)
-        self._record_spawn(name, sid, bid, block["window_id"], status, child)
-        return True
+        return self._record_spawn(name, sid, bid, block["window_id"], status,
+                                  child)
 
     def _type_and_enter(self, block_id: str, text: str) -> bool:
         if len(text.encode("utf-8")) > _REX_MAX_SEND_BYTES:
@@ -4921,15 +4944,17 @@ class RexBackend(_Backend):
         return True
 
     def _clear_input(self, block_id: str) -> bool:
-        """True once the input box is empty (or there is no Claude input box,
-        e.g. a plain shell, where there is nothing to clear)."""
+        """True only once an input box was *seen* empty.  An unreadable
+        capture or a screen with no recognisable box is not permission to
+        send (it may be a restored shell or leftover text)."""
         for _ in range(16):
             empty = _rex_input_is_empty(self._capture_block(block_id))
-            if empty is None or empty:
+            if empty is True:
                 return True
-            _rex_run(["send-key", "-b", block_id, "ctrl+u"])
+            if empty is False:
+                _rex_run(["send-key", "-b", block_id, "ctrl+u"])
             time.sleep(0.15)
-        return bool(_rex_input_is_empty(self._capture_block(block_id)) in (None, True))
+        return _rex_input_is_empty(self._capture_block(block_id)) is True
 
     def keys(self, name: str, keys: List[str]) -> bool:
         self._guard("keys", name)

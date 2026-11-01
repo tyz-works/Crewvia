@@ -5771,6 +5771,10 @@ class Mux:
         all, and there is no way to tell those apart here — so an empty
         capture is treated as "cannot confirm delivery", not as "landed".
         """
+        # Rex has the real input box on screen; its own judgement (not the
+        # `❯`-line heuristic below) is the one the production path must use.
+        if isinstance(self._backend, RexBackend):
+            return self._backend.verify_sent(name, text)
         screen = self.capture(name)
         if not screen:
             return False

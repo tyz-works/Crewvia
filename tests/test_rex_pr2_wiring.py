@@ -523,3 +523,15 @@ def test_verify_sent_false_while_text_is_still_in_the_input_box():
     screen = f"{_RULE}\n❯ {msg}\n{_RULE}\n"
     assert _verify_backend(screen).verify_sent("w", msg) is False
     assert _verify_backend("").verify_sent("w", msg) is False
+
+
+def test_mux_verify_sent_delegates_to_rex_backend_on_the_production_path():
+    """CLI は Mux().verify_sent を呼ぶ。Rex の入力欄判定に委譲されること。"""
+    msg = "ミッション開始。plan status で状態を確認し、タスク分解を開始してください。"
+    echoed = f"❯ {msg}\n\n● 了解\n\n{_RULE}\n❯ \n{_RULE}\n  ? for shortcuts\n"
+    stuck = f"{_RULE}\n❯ {msg}\n{_RULE}\n"
+    m = lib_mux.Mux.__new__(lib_mux.Mux)
+    m._backend = _verify_backend(echoed)
+    assert m.verify_sent("w", msg) is True
+    m._backend = _verify_backend(stuck)
+    assert m.verify_sent("w", msg) is False

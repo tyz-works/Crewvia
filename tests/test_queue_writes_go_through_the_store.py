@@ -125,6 +125,7 @@ ALLOWED_WRITES: dict[tuple[str, str], tuple[int, str]] = {
     ('watchdog.py', '_leave_legacy_log_pointer'): (1, R_LOG + "。旧 logs/ に 1 行ポインタを残すだけの移行コード"),
     # ---- registry/mux ・ retirements ・ workers ------------------------------------------------------
     ('lib_mux.py', '_pane_record_lock'): (2, R_LOCK + "。registry/mux/.records.lock (mux 抽象の spawn 記録の専用ロック)"),
+    ('lib_mux.py', '_rex_spawn_lock'): (2, R_LOCK + "。registry/mux/.rex-spawn.lock (RexBackend.spawn の名前ごとの直列化。rex を呼ぶ区間を握るので記録の lock と別)"),
     ('lib_mux.py', 'write_pane_record'): (2, "registry/mux/<name>.json (spawn 記録)。mux 抽象が sweep の規則ごと唯一の定義を持つ。"
                                              "専用ロックの中で書く (§5.3 の「寄せない」)"),
     ('lib_mux.py', 'drop_pane_record'): (1, "registry/mux/<name>.json の撤去。`expect=` で判定した記録だけを、同じロックの区間で消す"

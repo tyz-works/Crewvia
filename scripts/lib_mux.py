@@ -4535,6 +4535,35 @@ def _is_descendant_of(pid: int, held) -> bool:
     return False
 
 
+def rex_record_ownership(record, *, window_id, block_id=None, repo_root=None):
+    """`(ok, reason)` — is this record one *this checkout* wrote for this
+    window?  Independent of the server generation, so it stands in front of
+    both the normal path and the restarted-server (husk) path: a missing
+    record, another checkout's record, another window's handle or a record
+    bound to no server vouches for nothing, whatever the generation says.
+    """
+    if not isinstance(record, dict):
+        return False, "there is no spawn record"
+    if record.get("backend") != "rex":
+        return False, (f"the spawn record was written by the "
+                       f"{record.get('backend')!r} backend")
+    if block_id is not None and record.get("block_id") != block_id:
+        return False, "the spawn record names another block"
+    written_by = record.get("checkout")
+    if not written_by or str(written_by) != _record_checkout_identity(repo_root):
+        return False, "the spawn record was not written by this checkout"
+    handle = str(record.get("handle") or "")
+    if not handle or not window_id or handle != str(window_id):
+        return False, (f"the record's handle {handle!r} is not the window "
+                       f"{window_id!r} the block is in now")
+    bound = record.get("server")
+    if not isinstance(bound, dict):
+        return False, "the spawn record names no server"
+    if not (str(bound.get("endpoint") or "") and str(bound.get("generation") or "")):
+        return False, "the spawn record binds to an incomplete server"
+    return True, "the spawn record is this checkout's, for this window"
+
+
 def rex_worker_provenance(record, *, window_id, server_before, server_after,
                           pid, starttime, ppid, server_pid, repo_root=None):
     """`(ok, reason)` — does the spawn record vouch for this process?
@@ -4549,24 +4578,12 @@ def rex_worker_provenance(record, *, window_id, server_before, server_after,
     binding.  The handle compared is the record's `window_id` — never the
     block id (that mismatch refuses every legitimate kill).
     """
-    if not isinstance(record, dict):
-        return False, "there is no spawn record"
-    if record.get("backend") != "rex":
-        return False, (f"the spawn record was written by the "
-                       f"{record.get('backend')!r} backend")
-    written_by = record.get("checkout")
-    if not written_by or str(written_by) != _record_checkout_identity(repo_root):
-        return False, "the spawn record was not written by this checkout"
-    handle = str(record.get("handle") or "")
-    if not handle or not window_id or handle != str(window_id):
-        return False, (f"the record's handle {handle!r} is not the window "
-                       f"{window_id!r} the block is in now")
+    ok, why = rex_record_ownership(record, window_id=window_id,
+                                   repo_root=repo_root)
+    if not ok:
+        return False, why
     bound = record.get("server")
-    if not isinstance(bound, dict):
-        return False, "the spawn record names no server"
     want = (str(bound.get("endpoint") or ""), str(bound.get("generation") or ""))
-    if not all(want):
-        return False, "the spawn record binds to an incomplete server"
     for label, seen in (("before", server_before), ("after", server_after)):
         if not seen or (str(seen[0]), str(seen[1])) != want:
             return False, (f"the server {label} the process was pinned is "
@@ -4605,6 +4622,45 @@ def _rex_input_is_empty(screen: str) -> Optional[bool]:
     if len(box) != 1:
         return False
     return box[0][1:].strip() == ""
+
+
+#: Serialises `RexBackend.spawn` (uniqueness check + creation), which calls
+#: rex and so must NOT run under `_pane_record_lock` (that one is for the
+#: instant of a record write).  A separate file in the record directory; a
+#: dot-file, so the record sweep never sees it.  Longer than any rex call.
+_REX_SPAWN_LOCK_NAME = ".rex-spawn.lock"
+_REX_SPAWN_LOCK_TIMEOUT_SECONDS = 120.0
+
+
+@contextlib.contextmanager
+def _rex_spawn_lock(repo_root=None, *, timeout: float):
+    """Yield whether the spawn lock was taken (False = do not spawn)."""
+    path = pane_record_dir(repo_root) / _REX_SPAWN_LOCK_NAME
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fh = open(path, "a+")
+    except OSError as exc:
+        print(f"[mux] WARNING: cannot open the spawn lock {path}: {exc}",
+              file=sys.stderr)
+        yield False
+        return
+    try:
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    yield False
+                    return
+                time.sleep(0.05)
+        try:
+            yield True
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+    finally:
+        fh.close()
 
 
 class RexBackend(_Backend):
@@ -4837,10 +4893,15 @@ class RexBackend(_Backend):
                        f"window_id={window_id}) — close it by hand")
             return False
         start = _rex_start_time(child["pid"]) if child else None
+        if not (child and start):
+            self._warn(f"spawn {name!r}: the child's start time could not be "
+                       f"read; no record is written and the block is "
+                       f"unmanaged (block_id={block_id}, "
+                       f"window_id={window_id}) — close it by hand")
+            return False
         extra = {"block_id": block_id, "window_id": window_id,
-                 "session_id": sid, "instance_id": status["instance_id"]}
-        if child and start:
-            extra["child"] = {"pid": child["pid"], "starttime": start}
+                 "session_id": sid, "instance_id": status["instance_id"],
+                 "child": {"pid": child["pid"], "starttime": start}}
         ok = write_pane_record(name, self.BACKEND_NAME, window_id,
                                pane_id=block_id,
                                server=(status["endpoint"],
@@ -4875,9 +4936,10 @@ class RexBackend(_Backend):
         # The uniqueness check and the creation are one stretch under the
         # record lock; not being able to take it means no spawn (a duplicate
         # is worse than a failure).  Other lock waiters can wait this long.
-        with _pane_record_lock(create=True) as locked:
+        with _rex_spawn_lock(timeout=_REX_SPAWN_LOCK_TIMEOUT_SECONDS) as locked:
             if not locked:
-                self._warn(f"spawn {name!r}: the record lock could not be taken")
+                self._warn(f"spawn {name!r}: the spawn lock could not be "
+                           f"taken (another spawn is running?); not spawning")
                 return False
             sid = self._ensure_session()
             if sid is None:
@@ -4923,7 +4985,10 @@ class RexBackend(_Backend):
         child = self._wait_for_child(ids[0])
         if child is None:
             self._warn(f"spawn {name!r}: no child process was seen in the "
-                       f"new block; the record will not carry one")
+                       f"new block; no record is written and the block is "
+                       f"unmanaged (block_id={ids[0]}, window_id={window_id})"
+                       f" — close it by hand")
+            return False
         return self._record_spawn(name, sid, ids[0], window_id, status,
                                   child)
 
@@ -4938,17 +5003,12 @@ class RexBackend(_Backend):
             self.last_spawn_refusal = (SPAWN_OCCUPIED if occupant == PANE_LIVE
                                        else SPAWN_UNREADABLE)
             return False
-        if not (isinstance(record, dict) and record.get("backend") == "rex"
-                and record.get("block_id") == block["block_id"]):
+        ok, why = rex_record_ownership(
+            record, window_id=str(block.get("window_id") or ""),
+            block_id=block["block_id"])
+        if not ok:
             self._warn(f"spawn {name!r}: an idle shell carries the label but "
-                       f"this checkout did not create it; not reusing it")
-            self.last_spawn_refusal = SPAWN_UNREADABLE
-            return False
-        wid = str(block.get("window_id") or "")
-        if str(record.get("checkout") or "") != _record_checkout_identity() \
-                or not wid or str(record.get("handle") or "") != wid:
-            self._warn(f"spawn {name!r}: the record was not written by this "
-                       f"checkout, or names another window; not reusing")
+                       f"{why}; not reusing it")
             self.last_spawn_refusal = SPAWN_UNREADABLE
             return False
         self._warn(f"spawn {name!r}: block {block['block_id']} is an idle "
@@ -5154,10 +5214,15 @@ class RexBackend(_Backend):
         if ppid != status0["pid"]:
             return None, (f"pid {pid} is not a direct child of the server "
                           f"(ppid {ppid}, server {status0['pid']})")
-        bound = record.get("server") if isinstance(record, dict) else None
-        same_generation = (isinstance(bound, dict)
-                           and (str(bound.get("endpoint") or ""),
-                                str(bound.get("generation") or "")) == server0)
+        # Ownership first, for both paths: no record / another checkout's
+        # record / another window / no bound server is never a husk.
+        ok, why = rex_record_ownership(record, window_id=facts["window_id"],
+                                       block_id=facts.get("block_id"))
+        if not ok:
+            return None, why
+        bound = record["server"]
+        same_generation = (str(bound.get("endpoint") or ""),
+                           str(bound.get("generation") or "")) == server0
         if same_generation:
             ok, why = rex_worker_provenance(
                 record, window_id=facts["window_id"], server_before=server0,

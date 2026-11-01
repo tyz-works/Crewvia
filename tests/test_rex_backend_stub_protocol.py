@@ -488,17 +488,41 @@ def test_spawn_does_not_count_a_dead_shell_but_counts_a_live_block(fake):
         live.wait()
 
 
-def test_spawn_cannot_take_the_record_lock_means_no_spawn(fake, monkeypatch):
+def test_spawn_cannot_take_the_spawn_lock_means_no_spawn(fake, monkeypatch):
     import contextlib
 
     @contextlib.contextmanager
     def no_lock(*a, **k):
         yield False
 
-    monkeypatch.setattr(lib_mux, "_pane_record_lock", no_lock)
+    monkeypatch.setattr(lib_mux, "_rex_spawn_lock", no_lock)
     fake.set(_spawn_rules(sessions=[], blocks=[]))
     assert not lib_mux.RexBackend().spawn("Zed-worker", "true")
     assert not any(c[0] in ("run", "new") for c in fake.calls())
+
+
+def test_spawn_does_not_call_rex_under_the_record_lock(fake, monkeypatch):
+    import contextlib
+    held = []
+
+    @contextlib.contextmanager
+    def watch(*a, **k):
+        held.append(1)
+        try:
+            yield True
+        finally:
+            held.pop()
+
+    real = lib_mux._rex_run
+
+    def spy(*a, **k):
+        assert not held, "rex was called while the record lock was held"
+        return real(*a, **k)
+
+    monkeypatch.setattr(lib_mux, "_pane_record_lock", watch)
+    monkeypatch.setattr(lib_mux, "_rex_run", spy)
+    fake.set(_spawn_rules(sessions=[], blocks=[]))
+    lib_mux.RexBackend().spawn("Zed-worker", "true")
 
 
 # ---------------------------------------------------------------------------
@@ -1336,3 +1360,70 @@ def test_destroy_does_not_seed_the_scan_with_a_recycled_root_pid(monkeypatch):
     finally:
         root.kill()
         root.wait()
+
+
+# ---------------------------------------------------------------------------
+# r6: 所有の検査は世代に依らず、通常 / husk の両方の前に置く (F1)
+# ---------------------------------------------------------------------------
+
+_NOT_OURS = [
+    ("no record", None),
+    ("another checkout", {"checkout": "/somewhere/else"}),
+    ("another window handle", {"handle": "window:OTHER"}),
+    ("no server bound", {"server": None}),
+]
+
+
+@pytest.mark.parametrize("label,patch", _NOT_OURS)
+def test_kill_of_a_restarted_server_block_needs_ownership(fake, victim, label, patch):
+    p = victim(("sleep", "600"))
+    path = fake.checkout / "registry" / "mux" / f"{lib_mux._pane_name('Zed-worker')}.json"
+    _arm(fake, p, generation="inst-OLD:1", child_name="bash")
+    if patch is None:
+        path.unlink()
+    else:
+        rec = json.loads(path.read_text())
+        rec.update(patch)
+        path.write_text(json.dumps(rec))
+    b = lib_mux.RexBackend()
+    assert not b.may_destroy("Zed-worker")[0]
+    assert not b.kill("Zed-worker")
+    assert p.poll() is None
+
+
+@pytest.mark.parametrize("label,patch", _NOT_OURS)
+def test_spawn_into_a_restarted_server_husk_needs_ownership(fake, husk_proc, label, patch):
+    _husk_rules(fake, husk_proc, record_patch=patch if patch else None)
+    path = fake.checkout / "registry" / "mux" / f"{lib_mux._pane_name('Zed-worker')}.json"
+    if patch is None:
+        path.unlink()
+    assert not lib_mux.RexBackend().spawn("Zed-worker", "true")
+    assert _alive(husk_proc.pid)
+    assert not any(c[0] == "run" for c in fake.calls())
+
+
+def test_spawn_without_a_child_writes_no_record(fake, capsys):
+    label = lib_mux._rex_session_label()
+    fake.set(_spawn_rules(sessions=[{"session_id": "session:S1", "label": label}], blocks=[],
+                          procs={"block:NEW": {"out": json.dumps({"last_exit": None})}}))
+    assert not lib_mux.RexBackend().spawn("Zed-worker", "true")
+    err = capsys.readouterr().err
+    assert "block:NEW" in err and "window:NEW" in err
+    assert not (fake.checkout / "registry" / "mux" /
+                f"{lib_mux._pane_name('Zed-worker')}.json").exists()
+
+
+def test_spawn_with_unreadable_starttime_writes_no_record(fake, monkeypatch, capsys):
+    child = subprocess.Popen(["sleep", "600"])
+    try:
+        label = lib_mux._rex_session_label()
+        fake.set(_spawn_rules(sessions=[{"session_id": "session:S1", "label": label}], blocks=[],
+                              procs={"block:NEW": _proc(child.pid)}))
+        monkeypatch.setattr(lib_mux, "_rex_start_time", lambda pid: None)
+        assert not lib_mux.RexBackend().spawn("Zed-worker", "true")
+        assert "block:NEW" in capsys.readouterr().err
+        assert not (fake.checkout / "registry" / "mux" /
+                    f"{lib_mux._pane_name('Zed-worker')}.json").exists()
+    finally:
+        child.kill()
+        child.wait()

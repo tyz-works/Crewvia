@@ -69,7 +69,7 @@ $RX server status --json
 
 Rex が label の重複を防がないので、`RexBackend` が次を守る（herdr の `_label_lookup` / `_resolve_ids` と同じ位置づけ）:
 
-1. **spawn は `registry/mux/.records.lock`（`_pane_record_lock`）の中で「同名の記録 + 同名 label の生きた block が session に無い」を確かめてから作る**。**数えるのは生きた block（`process` の `child` がある）だけ**。殻（`child` が無く `last_exit` がある block。§5.3）は label が同じでも数えず無視する（殻は消さない方針なので、数えると同名の spawn が永久に拒否される）。ロックを取れなければ spawn しない（重複を作るより失敗を選ぶ）。ロックは `write_pane_record` と同じ区間に伸ばす
+1. **spawn は名前ごとの直列化 lock `registry/mux/.rex-spawn.lock`（`_rex_spawn_lock`・待ち 120 秒。取れなければ spawn しない）の中で「同名の記録 + 同名 label の生きた block が session に無い」を確かめてから作る**。**数えるのは生きた block（`process` の `child` がある）だけ**。殻（`child` が無く `last_exit` がある block。§5.3）は label が同じでも数えず無視する（殻は消さない方針なので、数えると同名の spawn が永久に拒否される）。ロックを取れなければ spawn しない（重複を作るより失敗を選ぶ）。`_pane_record_lock`（`.records.lock`）は記録を書く瞬間（`write_pane_record`）だけで、**rex を呼ぶ区間では握らない**（r6 F2。lock の docstring が禁じていた）。child を確認できない・starttime が読めない spawn は記録を書かず、block_id / window_id を警告に出して失敗を返す（husk の作り直しも同じ）
 2. **解決は記録の `block_id` を正本にする**（label は正本でなく照合用。殻と同じ label の新しい block があっても、記録の `block_id` が新しい block を指す限り殻には届かない）。`send` / `capture` / `pid` / `kill` は名前 → 記録 → `block_id` で引き、label は「記録の block の label が名前と一致するか」の照合にだけ使う（一致しなければ `pane not found` 側。他人が同じ名前を付けた別 block に送らない）
 3. **label で引いた結果が 2 つ以上なら「曖昧」**: `list()` は重複を 1 つに潰さず警告つきで返す・`spawn` は拒否（`SPAWN_UNREADABLE` 側）・`kill` は拒否（`--force` だけが出口）。重複を片方に倒さない
 4. 記録が無い（`./crewvia` が作っていない）block は、名前が一致しても kill の対象にしない（`DAEMON_PANE_NAMES` = dispatcher / watchdog は既存の `may_destroy_pane` が止める。Worker 窓は §5 の本人確認）
@@ -177,6 +177,8 @@ spawn は記録（`write_pane_record`）を server の `(endpoint, generation)` 
 
 **実測（2026-11-01）**: 復元された空の shell への SIGHUP（pidfd）で、shell は終わり、**block も消えた**（`block ls` から居なくなる。`tests/test_rex_backend_real_server.py::test_empty_restored_husk_is_ended_by_sighup_and_the_block_is_not_closed`）。終了待ちは pidfd の `poll`（POLLIN）で動く。\
 **以前の観察**（条件は未特定のまま）: 観察では `rex run -- sleep` を KILL した block が `last_exit: signal: killed` で**残った**例（`rex run -s <既存 session>` の直接 command）と、`bash -c` / `exit 0` / `exit 7` では**消えた**例の両方があり、条件を特定していない（§4.1 の『消える』は後者）。どちらでも手順は成り立つ（残れば殻として残す。close しない）。
+
+**所有の検査は世代に依らず、通常 / husk の両方の前に置く（r6 F1）**: `rex_record_ownership()`（記録が dict・backend rex・block_id 一致・checkout 一致・handle == window_id・server が完全に束縛）が `_judge` の最初と `_respawn_in_husk` にある。husk は『所有が通り、束縛された世代と現在の世代がどちらも読めて違う』ときだけ。記録なし・他 checkout・handle 違い・server 束縛なしは kill も spawn も拒否。
 
 ### 5.4 server の世代の扱い
 

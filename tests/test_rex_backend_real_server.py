@@ -295,13 +295,24 @@ def test_clear_input_removes_real_text_when_the_cursor_is_at_line_start(tmp_path
             b.kill("Kit-worker")
             pytest.skip("claude shows its trust dialog for this cwd (untrusted checkout)")
         bid = _record(checkout, "Kit-worker")["block_id"]
-        server.rex("send", "-b", bid, "--", "typed by a human", check=True)
-        server.rex("send-key", "-b", bid, "ctrl+a", check=True)       # カーソルを行頭へ
-        assert _wait(lambda: "typed by a human" in b.capture("Kit-worker"), 5)
-        # ctrl+u だけでは消えない (この実測が ctrl+e を前置する理由)
-        server.rex("send-key", "-b", bid, "ctrl+u", check=True)
-        time.sleep(0.3)
-        assert "typed by a human" in b.capture("Kit-worker")
+        # 前提: 「行頭カーソル + ctrl+u だけでは消えない」状態を作る。claude の描画の
+        # 競合で ctrl+a が効く前に ctrl+u が届くと消えてしまう (版・タイミング依存) ので、
+        # 消えたら入れ直して 4 回まで試す。作れなければ skip (製品の判定の失敗ではない)。
+        premise = False
+        for _ in range(4):
+            assert b._clear_input(bid) is True       # まず空に戻す
+            server.rex("send", "-b", bid, "--", "typed by a human", check=True)
+            assert _wait(lambda: "typed by a human" in b.capture("Kit-worker"), 5)
+            server.rex("send-key", "-b", bid, "ctrl+a", check=True)   # カーソルを行頭へ
+            time.sleep(1.0)
+            server.rex("send-key", "-b", bid, "ctrl+u", check=True)
+            time.sleep(0.5)
+            if "typed by a human" in b.capture("Kit-worker"):
+                premise = True
+                break
+        if not premise:
+            b.kill("Kit-worker")
+            pytest.skip("could not build the 'cursor at line start, ctrl+u alone keeps the text' state")
         assert b._clear_input(bid) is True
         box = lib_mux._rex_input_box(b.capture("Kit-worker"))
         assert box is not None and "typed by a human" not in "".join(box)
@@ -396,3 +407,26 @@ def test_empty_restored_husk_is_ended_by_sighup_and_the_block_is_not_closed(tmp_
               "still listed" if rec["block_id"] in observed else "gone")
     finally:
         server.stop()
+
+
+def test_concurrent_spawns_of_the_same_name_make_exactly_one_block(world):
+    """F2: 同名の並行 spawn は名前ごとの lock で直列化され、block は 1 つだけできる。"""
+    import threading
+    server, b, checkout = world
+    results = []
+
+    def go():
+        results.append(lib_mux.RexBackend().spawn("Con-worker", "exec sleep 600", cwd="/tmp"))
+
+    ts = [threading.Thread(target=go) for _ in range(2)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join(timeout=60)
+    label = lib_mux._pane_name("Con-worker")
+    sid = b._session_ids()[0][0]
+    blocks = [x for x in b._blocks(sid) if x["label"] == label]
+    assert len(blocks) == 1, blocks
+    assert results.count(True) >= 1
+    assert _record(checkout, "Con-worker")["block_id"] == blocks[0]["block_id"]
+    assert b.kill("Con-worker")

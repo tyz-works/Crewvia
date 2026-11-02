@@ -964,16 +964,23 @@ Director が代わりに PR を作成する必要はない。
 
 1. **子 PR の base を PR base に変更してから親を merge する（推奨）**
    PR base は `main` と決め打たず、**子 PR の task** の値を**名指しの形**で `plan pr-base` に聞く（Director は `AGENT_NAME` も
-   assignment も持たないので引数なしの形は使えない）。`<mission>/<tid>` は**子 PR の本文**の `task: <mission>/<tid>` 行から取る。
+   assignment も持たないので引数なしの形は使えない）。`<mission>/<tid>` は `plan resolve-pr <子PR番号>` で**子 PR 番号から直接**
+   引く（PR 本文は解析しない。review task の stacked PR 判定と同じ経路 — `task:` 行は人が PR を見て分かる表示として PR 本文に
+   残っているだけで、判定の根拠にはしない）。
    ```bash
-   # 子PRのbaseを、子PRのtaskのPR baseに切り替える
-   PR_BASE="$(plan pr-base --mission {子PRのmission} --task {子PRのtask_id})" || { echo "PR base を決められない。ユーザーに判断を仰ぐ" >&2; exit 1; }
-   gh pr edit {子PR番号} --base "$PR_BASE"
+   # 子PRのtaskを PR 番号から引き、そのtaskのPR baseに子PRのbaseを切り替える
+   CHILD_PR={子PR番号}
+   MISSION_TASK="$(plan resolve-pr "$CHILD_PR")" || { echo "PR base を決められない。ユーザーに判断を仰ぐ" >&2; exit 1; }
+   CHILD_MISSION="${MISSION_TASK%%/*}"; CHILD_TASK="${MISSION_TASK#*/}"
+   PR_BASE="$(plan pr-base --mission "$CHILD_MISSION" --task "$CHILD_TASK")" || { echo "PR base を決められない。ユーザーに判断を仰ぐ" >&2; exit 1; }
+   gh pr edit "$CHILD_PR" --base "$PR_BASE"
    # その後、親PRをsquash merge
    gh pr merge {親PR番号} --squash
    ```
-   `plan pr-base` が exit 1 のとき（`task:` 行が無い・card が読めない・mission が退避済み・`git:` が壊れている）は
+   `plan resolve-pr` / `plan pr-base` が exit 1 のとき（card が無い・人が作った PR・退避済み mission・曖昧・`git:` が壊れている 等）は
    `gh pr edit` を実行せず、**親の merge も保留する**（付け替えずに親を merge すると子が自動 close される）。base は手で決めず、ユーザーに判断を仰ぐ。
+   子 PR が別 repo（TARGET_DIR）の task なら `plan resolve-pr "$CHILD_PR" --target-dir <その target_dir>` を明示する
+   （`agents/worker.md` の stacked PR 判定と同じ絞り込み規則）。
 
 2. **stacked 構造を避け、機能ごとに独立したブランチを PR base から切る**
 

@@ -33,11 +33,13 @@ TEST = "tests/test_resolve_pr.py"
 
 # (id, 説明, 置換元, 置換先, 赤になるべきテストの名前 (部分一致のどれか 1 つ以上が FAILED))
 MUTATIONS = [
-    ("M01", "deliverable: pr の絞り込みを外す (伝播した codex-review/review の card も候補にする)",
-     "            if meta.get('pr_number') != pr_number or meta.get('deliverable') != 'pr':\n",
-     "            if meta.get('pr_number') != pr_number:\n",
+    ("M01", "PR_PROPAGATION_SKILLS の除外を外す (伝播した codex-review/review の card も候補にする)",
+     "            if set(meta.get('skills') or []) & set(PR_PROPAGATION_SKILLS):\n"
+     "                continue\n",
+     "",
      ["test_a_downstream_review_task_that_got_the_same_pr_number_by_propagation_is_not_a_candidate",
-      "test_a_downstream_codex_review_task_is_also_not_a_candidate"]),
+      "test_a_downstream_codex_review_task_is_also_not_a_candidate",
+      "test_a_downstream_review_task_without_deliverable_declared_upstream_is_still_not_a_candidate"]),
     ("M02", "2 件以上 (本物の曖昧) を拒否せず先頭を返す (fail-open)",
      "    if len(candidates) != 1:\n"
      "        die(f\"resolve-pr: PR #{pr_number} の task を一意に決められません ({len(candidates)} 件: {candidates})\")\n",
@@ -57,6 +59,19 @@ MUTATIONS = [
      "        die(f\"resolve-pr: PR 番号は正の整数にしてください: {pr_number}\")\n",
      "",
      ["test_rejects_a_non_positive_or_non_integer_pr_number"]),
+    ("M05", "target_dir の絞り込みを外す (別 repo の同番号 PR を取り違える。review P2)",
+     "            if (meta.get('target_dir') or None) != effective_target:\n"
+     "                continue\n",
+     "",
+     ["test_a_same_numbered_pr_in_a_different_target_dir_repo_is_not_a_candidate",
+      "test_target_dir_env_var_scopes_like_the_flag"]),
+    ("M06", "deliverable: pr の宣言を再び要求する (deliverable_required の無い古い mission の退行を再発させる。review P3-1)",
+     "            if meta.get('pr_number') != pr_number:\n"
+     "                continue\n",
+     "            if meta.get('pr_number') != pr_number or meta.get('deliverable') != 'pr':\n"
+     "                continue\n",
+     ["test_resolves_without_a_deliverable_declaration_on_a_mission_without_deliverable_required",
+      "test_a_downstream_review_task_without_deliverable_declared_upstream_is_still_not_a_candidate"]),
 ]
 
 

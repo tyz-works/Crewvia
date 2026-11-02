@@ -9,14 +9,21 @@ review task が走る時点 (実装 task が done 済み) ではキューに聞�
 
 ## このファイルが固定すること
 
-1. `pr_number` と `deliverable: pr` の両方を持つ card が 1 件だけなら `<mission>/<task_id>` を返す。
+1. `pr_number` を持ち skills が `PR_PROPAGATION_SKILLS` (codex-review / review) と重ならない card が
+   1 件だけなら `<mission>/<task_id>` を返す。`deliverable: pr` の宣言は要らない (t006 retry / review P3-1。下の「古い
+   mission」節)。
 2. `propagate_pr_number()` が下流の codex-review / review の task にも同じ `pr_number` を書く (#29) が、
-   それらは `deliverable: pr` を宣言できない (`can_produce_deliverable: false`) ので候補に入らない —
-   候補が複数枚あっても一意に決まる (課題 3 の規則)。
+   それらは `PR_PROPAGATION_SKILLS` そのものなので候補に入らない — 候補が複数枚あっても一意に決まる
+   (課題 3 の規則)。
 3. 見つからない・2 件以上 (本物の曖昧) はどちらも exit 1・stdout 空 (`main` に倒さない pr-base と同じ思想)。
 4. 退避済み (archive) の mission は見ない (`pr-base` と同じ規則)。
-5. 読み取り専用 (queue に 1 バイトも書かない)。
-6. 引数の検証 (整数でない・0 以下は usage エラーとして exit 1 — `pr-base` と同じ `PULL_USAGE_EXIT_SUBCOMMANDS`)。
+5. **repo で絞る** (t006 retry / review P2): `target_dir` が一致しない card は候補にならない。既定は `pull` と
+   同じ規則 (`--target-dir` flag > `TARGET_DIR` env var > None = crewvia 本体)。
+6. **`deliverable_required` の無い古い mission でも解決できる** (t006 retry / review P3-1): `deliverable` を
+   宣言しないまま `done --pr` した card も候補になる (`PR_PROPAGATION_SKILLS` による除外は `deliverable` の
+   有無に依存しない)。
+7. 読み取り専用 (queue に 1 バイトも書かない)。
+8. 引数の検証 (整数でない・0 以下は usage エラーとして exit 1 — `pr-base` と同じ `PULL_USAGE_EXIT_SUBCOMMANDS`)。
 
 欠陥注入による red proof は `tests/red_proof_resolve_pr.py` (別パッチの赤を実証)。
 """
@@ -80,6 +87,22 @@ def _pull_and_done(repo, pr_number, mission=MISSION, task_id="t001"):
     return done
 
 
+def _pull_and_done_without_deliverable(repo, pr_number, mission=MISSION, task_id="t001"):
+    """`deliverable` を**宣言しないまま** pull → done --pr (`deliverable_required` の無い古い mission の形。
+    t006 retry / review P3-1)。fixture の seed は mission.yaml に `deliverable_required` を書かないので、
+    これが素の挙動 (`_pull_and_done` は明示的に `--deliverable pr` を足している側)。
+    """
+    p = repo.plan("pull", "--agent", AGENT, "--skills", "code", "--task", task_id,
+                 "--mission", mission)
+    assert p.returncode == 0, p.stderr
+    assert "deliverable" not in repo.card_path(task_id).read_text()
+    execution_id = json.loads(p.stdout)["execution_id"]
+    done = repo.plan("done", task_id, "finished", "--mission", mission, "--pr", str(pr_number),
+                     "--execution", execution_id)
+    assert done.returncode == 0, done.stderr
+    return done
+
+
 # ---------------------------------------------------------------------------
 # 1 件だけ: その task を返す
 # ---------------------------------------------------------------------------
@@ -117,6 +140,76 @@ def test_a_downstream_codex_review_task_is_also_not_a_candidate(repo):
     assert "pr_number: 909" in repo.card_path(review_id).read_text()
     out = repo.plan("resolve-pr", "909", agent=None)
     assert (out.returncode, out.stdout) == (0, f"{MISSION}/t001\n")
+
+
+# ---------------------------------------------------------------------------
+# 古い mission (deliverable_required が無い。deliverable を宣言しないまま done --pr)
+# ---------------------------------------------------------------------------
+
+def test_resolves_without_a_deliverable_declaration_on_a_mission_without_deliverable_required(repo):
+    """t006 retry / review P3-1: `deliverable == 'pr'` で絞っていた旧実装は、`deliverable_required` の無い
+    mission (このテストの fixture がまさにそれ) の card を 0 件に見せ、review を全部 Director に上げる
+    退行を起こしていた。`PR_PROPAGATION_SKILLS` による除外は `deliverable` の有無を見ないので解決できる。
+    """
+    assert "deliverable_required" not in repo.mission_yaml.read_text()
+    _pull_and_done_without_deliverable(repo, 606)
+    out = repo.plan("resolve-pr", "606", agent=None)
+    assert (out.returncode, out.stdout) == (0, f"{MISSION}/t001\n"), out.stderr
+
+
+def test_a_downstream_review_task_without_deliverable_declared_upstream_is_still_not_a_candidate(repo):
+    """旧実装 (`deliverable == 'pr'`) はこの場合もたまたま正しかった (review 自身も deliverable を宣言しない
+    ので最初から候補にならない) が、除外の理由が `PR_PROPAGATION_SKILLS` に変わっても壊れないことを固定する。"""
+    review_id = _add_review_task(repo)
+    _pull_and_done_without_deliverable(repo, 616)
+    assert "pr_number: 616" in repo.card_path(review_id).read_text()
+    out = repo.plan("resolve-pr", "616", agent=None)
+    assert (out.returncode, out.stdout) == (0, f"{MISSION}/t001\n"), out.stderr
+
+
+# ---------------------------------------------------------------------------
+# repo で絞る (target_dir。t006 retry / review P2)
+# ---------------------------------------------------------------------------
+
+def test_a_same_numbered_pr_in_a_different_target_dir_repo_is_not_a_candidate(repo, tmp_path):
+    """PR 番号は repo ごとに独立に採番されるので、crewvia 本体の #42 と TARGET_DIR の別 repo の #42 が
+    衝突しうる。絞らなければ別の repo の task を間違って返す (t006 retry / review P2)。"""
+    other_repo = tmp_path / "other-repo"
+    other_repo.mkdir()
+    p = repo.plan("add", "cross-repo impl", "--mission", MISSION, "--skills", "code",
+                  "--deliverable", "pr", "--target-dir", str(other_repo), agent="Director")
+    assert p.returncode == 0, p.stderr
+    t002 = [line.split()[1].split("/")[1] for line in p.stdout.splitlines() if line.startswith("Added:")][0]
+    assert repo.plan("update", t002, "--pr-number", "42", "--mission", MISSION,
+                     agent="Director").returncode == 0
+    _pull_and_done(repo, 42)   # t001 (crewvia 本体。target_dir なし) も #42 を持つ
+    # 既定 (TARGET_DIR 無し) は crewvia 本体の task だけを見る。
+    out = repo.plan("resolve-pr", "42", agent=None)
+    assert (out.returncode, out.stdout) == (0, f"{MISSION}/t001\n"), out.stderr
+    # --target-dir で絞ると、別 repo の task が返る。
+    out = repo.plan("resolve-pr", "42", "--target-dir", str(other_repo), agent=None)
+    assert (out.returncode, out.stdout) == (0, f"{MISSION}/{t002}\n"), out.stderr
+
+
+def test_target_dir_env_var_scopes_like_the_flag(repo, tmp_path):
+    """`--target-dir` が無ければ `TARGET_DIR` env を見る (`pull` と同じ規則)。"""
+    other_repo = tmp_path / "other-repo"
+    other_repo.mkdir()
+    p = repo.plan("add", "cross-repo impl", "--mission", MISSION, "--skills", "code",
+                  "--deliverable", "pr", "--target-dir", str(other_repo), agent="Director")
+    assert p.returncode == 0, p.stderr
+    t002 = [line.split()[1].split("/")[1] for line in p.stdout.splitlines() if line.startswith("Added:")][0]
+    p = repo.plan("pull", "--agent", AGENT, "--skills", "code", "--task", t002, "--mission", MISSION,
+                  extra_env={"TARGET_DIR": str(other_repo)})
+    assert p.returncode == 0, p.stderr
+    execution_id = json.loads(p.stdout)["execution_id"]
+    done = repo.plan("done", t002, "finished", "--mission", MISSION, "--pr", "55",
+                     "--execution", execution_id, extra_env={"TARGET_DIR": str(other_repo)})
+    assert done.returncode == 0, done.stderr
+    out = repo.plan("resolve-pr", "55", agent=None)
+    assert_refused(out, "一意に決められません")   # TARGET_DIR なし (crewvia 本体) では見えない
+    out = repo.plan("resolve-pr", "55", agent=None, extra_env={"TARGET_DIR": str(other_repo)})
+    assert (out.returncode, out.stdout) == (0, f"{MISSION}/{t002}\n"), out.stderr
 
 
 # ---------------------------------------------------------------------------

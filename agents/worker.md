@@ -1026,6 +1026,10 @@ ACTUAL_BASE="$(gh pr view "$PR_NUM" --json baseRefName -q .baseRefName)"
 
 - `plan resolve-pr` が task を一意に決められない（card が無い・人が作った PR・退避済み mission・曖昧 等）ときは、
   **main と比べて stacked かどうかを決めない**。「PR base を決められない」を Director に報告し、merge の提案を保留する。
+- `plan resolve-pr` は PR 番号を repo で絞る（`pull` と同じ規則: 自分の `TARGET_DIR` があればそれ、無ければ
+  crewvia 本体）。review task の `target_dir` は対象 task と同じ値が付いているはずなので、ふだんは何もしなくてよい。
+  crewvia 本体のレビューで対象 PR が別 repo（TARGET_DIR）の場合など、`TARGET_DIR` だけでは絞り込めないときは
+  `plan resolve-pr "$PR_NUM" --target-dir <対象 task の target_dir>` を明示する。
 - stacked PR だったら Director に以下を提案する（`{EXPECTED_BASE}` は上で取った値）:
 
 > 「この PR は stacked 構造です。親 PR を squash merge すると子 PR が自動クローズされるリスクがあります。

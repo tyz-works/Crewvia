@@ -121,8 +121,9 @@ set -euo pipefail
 #                              1 遷移 = 1 ファイル。上書きも追記もしない (設計: knowledge/vnext-02-attempt-reopen-checkpoint.md §3.2)
 #   plan.sh pr-base [--mission <slug> --task <task_id>] [--diff-ref]
 #                              PR の base を 1 行出す (読み取り専用。決められなければ exit 1・stdout 空。詳細は cmd_pr_base)
-#   plan.sh resolve-pr <pr_number>
+#   plan.sh resolve-pr <pr_number> [--target-dir <dir>]
 #                              PR 番号から、その PR を作った task を <mission_slug>/<task_id> で 1 行出す
+#                              (repo の絞り込みは pull と同じ規則: --target-dir flag > TARGET_DIR env > crewvia 本体)
 #                              (読み取り専用。pr-base と同じく決められなければ exit 1・stdout 空。詳細は cmd_resolve_pr)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -2714,7 +2715,7 @@ USAGE = {
     'store-check': 'plan.sh store-check [--mission <slug>]',
     'history': 'plan.sh history <task_id> [--mission <slug>]',
     'pr-base': 'plan.sh pr-base [--mission <slug> --task <task_id>] [--diff-ref]',
-    'resolve-pr': 'plan.sh resolve-pr <pr_number>',
+    'resolve-pr': 'plan.sh resolve-pr <pr_number> [--target-dir <dir>]',
 }
 
 #: サブコマンドごとに受け付ける positional の数 (最小, 最大)。余剰は黙って捨てず拒否する
@@ -3448,17 +3449,31 @@ def cmd_resolve_pr(args):
     無い mission は見ない。**決められなければ `main` に倒す pr-base と同じ思想**で exit 1・stdout 空にする
     (既定の task に倒すと、別の task の stacked PR 判定を間違った task に対して行う事故になる)。
 
-    候補は、この mission 群の全 task card のうち `pr_number == N` **かつ `deliverable == 'pr'`** のものだけ。
-    `deliverable: pr` を宣言できるのは `can_produce_deliverable: true` (または未宣言) の skill だけで、
-    `review` / `codex-review` は `config/skill-permissions.yaml` で `can_produce_deliverable: false` と
-    明示されており宣言できない (lint が落とす)。だから `propagate_pr_number()` がこの番号を書き込んだ下流の
-    codex-review / review の task (実装 task と同じ pr_number を持つ) は、skill 名を複製せずとも自然に除外
-    される — これが課題 3「同じ pr_number を持つ card が複数ある場合にどれを返すか」の規則。
+    候補は、この mission 群の全 task card のうち `pr_number == N` **かつ skills が `PR_PROPAGATION_SKILLS`
+    (codex-review / review) と重ならない**ものだけ。`propagate_pr_number()` が実際に pr_number を書き込む
+    下流の定義そのもの (`PR_PROPAGATION_SKILLS`) を再利用するので、伝播で同じ番号を持っただけの下流の
+    codex-review / review の task は自然に除外される — これが課題 3「同じ pr_number を持つ card が複数ある
+    場合にどれを返すか」の規則 (t006 retry / review P3-1)。
+
+    **前は `deliverable == 'pr'` で絞っていたが、この欄は `deliverable_required` (t013) 印の付いた
+    (= それより後に init された) mission にしか強制されない。** 古い mission の card は `deliverable` を
+    宣言しないまま `done --pr` できる (done は `deliverable` が無ければ `--pr` を要求するだけで、
+    フィールド自体は書かない宣言なしの経路がある) ので、その絞り込みでは候補が 0 件になり、古い mission の
+    review が resolve-pr を使った途端に全部 Director へ上がる退行を起こしていた。`PR_PROPAGATION_SKILLS`
+    による除外は `deliverable` の有無に関係なく働くのでこの退行が無い。
+
+    候補はさらに `target_dir` で絞る (t006 retry / review P2)。PR 番号は 1 つの GitHub repo の中でしか
+    一意でないが、card は repo を直接持たず `target_dir` が唯一の手がかり — 絞らずに全 active mission を
+    見ると、crewvia 本体の task と TARGET_DIR の別 repo の task がたまたま同じ番号を持つ事故 (番号は repo
+    ごとに独立に採番されるので珍しくない) で違う task を返しうる。既定は `pull` と同じ規則 (`--target-dir`
+    flag > `TARGET_DIR` env var > None = crewvia 本体)。呼び出し元は `gh pr view <N>` を打った cwd と同じ
+    repo の文脈でこのコマンドを呼ぶので、Worker の `TARGET_DIR` がそのまま正しい絞り込みになる (review task
+    自身の `target_dir` は、対象 task と同じ値を Director が `add` 時に明示する運用)。
 
     候補が 1 件なら `<mission>/<task_id>` を出す。0 件・2 件以上はどちらも一意に決められないので exit 1・
     stdout 空 (`[破損]` の card は pr_number を持たないので候補にならない)。
     """
-    opts, positional = parse_opts(args, {})
+    opts, positional = parse_opts(args, {'--target-dir': 'value'})
     raw = positional[0]
     try:
         pr_number = int(raw)
@@ -3467,11 +3482,23 @@ def cmd_resolve_pr(args):
     if pr_number <= 0:
         die(f"resolve-pr: PR 番号は正の整数にしてください: {pr_number}")
 
+    # --target-dir flag > TARGET_DIR env var > None (crewvia 本体)。`pull` と同じ規則 (t006 retry / P2)。
+    explicit_td = opts.get('--target-dir')
+    if explicit_td:
+        effective_target = os.path.abspath(os.path.expanduser(explicit_td))
+    else:
+        env_td = os.environ.get('TARGET_DIR', '').strip()
+        effective_target = os.path.abspath(env_td) if env_td else None
+
     state = load_state()
     candidates = []
     for slug in list(state.get('active_missions') or []):
         for meta, _body in list_tasks(slug, quiet=True):
-            if meta.get('pr_number') != pr_number or meta.get('deliverable') != 'pr':
+            if meta.get('pr_number') != pr_number:
+                continue
+            if set(meta.get('skills') or []) & set(PR_PROPAGATION_SKILLS):
+                continue
+            if (meta.get('target_dir') or None) != effective_target:
                 continue
             candidates.append((slug, meta['id']))
     if len(candidates) != 1:

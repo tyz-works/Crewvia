@@ -199,9 +199,8 @@ def stacked_check_script() -> str:
 
 
 def director_edit_script() -> str:
-    s = snippet("agents/director.md", r'^\s*PR_BASE=', r"gh pr edit .*--base")
-    return (s.replace("{子PRのmission}", "$CHILD_MISSION").replace("{子PRのtask_id}", "$CHILD_TASK")
-             .replace("{子PR番号}", "88"))
+    s = snippet("agents/director.md", r'^\s*CHILD_PR=', r"gh pr edit .*--base")
+    return s.replace("{子PR番号}", "88")
 
 
 def test_worker_stacked_check_compares_with_the_target_prs_task_not_its_own(repo, docs):
@@ -234,33 +233,42 @@ def test_worker_stacked_check_stops_when_resolve_pr_cannot_decide_the_task(repo,
     assert "stacked PR" not in out.stdout, "main と比べて stacked かどうかを決めない"
 
 
+def _pull_and_done_t001(repo, pr_number):
+    """`deliverable: pr` の t001 を pull → done --pr <pr_number>。自分の試行の execution id を名乗る (E3)。"""
+    p = repo.pull()
+    assert p.returncode == 0, p.stderr
+    execution_id = json.loads(p.stdout)["execution_id"]
+    assert repo.plan("update", "t001", "--deliverable", "pr", "--mission", MISSION, agent="Director").returncode == 0
+    done = repo.plan("done", "t001", "finished", "--mission", MISSION, "--pr", str(pr_number), "--execution", execution_id)
+    assert done.returncode == 0, done.stderr
+
+
 def test_director_reparent_uses_the_child_prs_task_from_a_shell_without_agent_or_assignment(repo, docs):
+    """`plan resolve-pr` が子 PR 番号から task を直接引く (t006。PR 本文の `task:` 行はもう読まない)。"""
     repo.set_git(pr_base="develop")
-    assert repo.pull().returncode == 0          # card は in_progress。Director は assignment も AGENT_NAME も持たない
-    p = docs.run(director_edit_script(), repo.root, agent=None,
-                 extra_env={"CHILD_MISSION": MISSION, "CHILD_TASK": "t001"})
+    _pull_and_done_t001(repo, 88)          # card は done。Director は assignment も AGENT_NAME も持たない
+    p = docs.run(director_edit_script(), repo.root, agent=None)
     assert p.returncode == 0, p.stderr
     assert base_passed(docs.gh_calls(), "edit") == "develop"
     # 対照: 引数なしの形は同じ shell で決められない (名指しが要ることの確認)
     assert repo.plan("pr-base", agent=None, cwd=repo.root).returncode == 1
 
 
-@pytest.mark.parametrize("mission,task", [("", ""), (MISSION, ""), ("no-such-mission", "t001"), (MISSION, "t099"),
-                                          ("../archive/x", "t001")])
-def test_director_reparent_stops_without_calling_gh_pr_edit_when_the_task_is_unknown(repo, docs, mission, task):
-    p = docs.run(director_edit_script(), repo.root, agent=None,
-                 extra_env={"CHILD_MISSION": mission, "CHILD_TASK": task})
+def test_director_reparent_stops_without_calling_gh_pr_edit_when_the_task_is_unknown(repo, docs):
+    """`plan resolve-pr` が子 PR 番号の task を決められない (pr_number を持つ card が無い) ときは gh pr edit を呼ばない。"""
+    assert repo.pull().returncode == 0   # t001 はあるが pr_number: 88 を持つ card はまだ無い
+    p = docs.run(director_edit_script(), repo.root, agent=None)
     assert p.returncode == 1, (p.stdout, p.stderr)
     assert not [c for c in docs.gh_calls() if c.startswith("gh pr edit")], docs.gh_calls()
 
 
 def test_director_reparent_stops_for_a_retired_mission(repo, docs):
     """退避済み (archive) の mission の task は exit 1。base は手で決めずユーザーに判断を仰ぐ (文書にそう書いてある)。"""
-    assert repo.pull().returncode == 0
+    _pull_and_done_t001(repo, 88)
     dest = repo.queue / "archive"
     dest.mkdir(exist_ok=True)
     shutil.move(str(repo.queue / "missions" / MISSION), str(dest / MISSION))
-    p = docs.run(director_edit_script(), repo.root, agent=None, extra_env={"CHILD_MISSION": MISSION, "CHILD_TASK": "t001"})
+    p = docs.run(director_edit_script(), repo.root, agent=None)
     assert p.returncode == 1
     assert not [c for c in docs.gh_calls() if c.startswith("gh pr edit")]
     assert "ユーザーに判断を仰ぐ" in p.stderr

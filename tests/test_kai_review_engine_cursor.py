@@ -113,11 +113,9 @@ def test_defaults_keep_the_current_behaviour(tmp_path):
     assert lre.load(cfg, environ={}) == ("both", lre.DEFAULT_AGY_MODEL, lre.DEFAULT_AGY_TIMEOUT_SECONDS)
 
 
-def test_shipped_config_is_claude_with_compare_agy():
-    # t001 (mission 20261102-review-engine-config): engine は codex → claude に
-    # 切り替え済み (codex 不在)。compare / cursor_model は不変。
+def test_shipped_config_is_codex_with_compare_agy():
     c = lre.load_full(REPO_ROOT / "config" / "crewvia.yaml", environ={})
-    assert c["engine"] == "claude" and c["compare"] == ["agy"] and c["cursor_model"] == "grok-4.7-high"
+    assert c["engine"] == "codex" and c["compare"] == ["agy"] and c["cursor_model"] == "grok-4.7-high"
 
 
 @pytest.mark.parametrize("value,expected", [

@@ -122,11 +122,8 @@ def test_default_engine_is_codex_without_a_review_block(tmp_path):
     assert lre.load(tmp_path / "missing.yaml", environ={})[0] == "codex"
 
 
-def test_the_shipped_config_is_claude():
-    # t001 (mission 20261102-review-engine-config): codex はこのマシンに入っておらず
-    # codex-review が全滅していたため、engine を claude に切り替えた
-    # (agy は 2026-11-02 時点でクォータ枯渇のため ensemble は当面不成立)。
-    assert lre.load(REPO_ROOT / "config" / "crewvia.yaml", environ={})[0] == "claude"
+def test_the_shipped_config_defaults_to_codex():
+    assert lre.load(REPO_ROOT / "config" / "crewvia.yaml", environ={})[0] == "codex"
 
 
 @pytest.mark.parametrize("text", [

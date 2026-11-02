@@ -262,8 +262,18 @@ attempts:
 # claude も fail-closed（exit 非 0・timeout・is_error・permission_denials・structured_output が無い/schema 不適合・worktree が変わった）。
 # 設計・実測: knowledge/agy-review.md / knowledge/cursor-review.md / knowledge/claude-review.md
 review:
-  engine: codex
-  agy_model: gemini-4-argon-high
+  # codex はこのマシンに入っていない (t005 / 20261102-pr-task-line で
+  # "codex command not found" により codex-review が全て失敗した)。
+  # 残るのは agy と claude だが、agy は 2026-11-02 時点でクォータ枯渇
+  # (429 RESOURCE_EXHAUSTED / リセットまで約 72 時間) のため ensemble が成立しない。
+  # 当面 claude 単体にしている。**agy のクォータが戻ったら ensemble に戻すこと**
+  # (合議のほうが強い。特に承認ゲートのような影響範囲の大きい変更では)。
+  engine: claude
+  # 旧値 gemini-4-argon-high は agy に存在せず ensemble が fail-closed していた
+  # (t005 / 20261102-pr-task-line)。`agy models` の実在 ID に合わせてある。
+  # ensemble の相方が claude なので、合議の多様性のため Gemini 系を維持している
+  # (claude-opus-4-6-thinking を選ぶと両方 Claude 系になる)。
+  agy_model: gemini-3.8-flash-high
   agy_timeout_seconds: 600
   cursor_model: grok-4.7-high
   cursor_timeout_seconds: 900

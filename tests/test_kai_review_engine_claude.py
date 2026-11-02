@@ -94,9 +94,11 @@ def _argv(tmp_path):
 
 # --- 設定の読み口 ---
 
-def test_get_prints_eight_lines_and_the_shipped_config_is_unchanged():
+def test_get_prints_eight_lines_and_the_shipped_config_is_claude():
+    # t001 (mission 20261102-review-engine-config): engine は codex → claude に
+    # 切り替え済み (codex 不在)。compare / claude_model / claude_timeout は不変。
     c = lre.load_full(REPO_ROOT / "config" / "crewvia.yaml", environ={})
-    assert c["engine"] == "codex" and c["compare"] == ["agy"]
+    assert c["engine"] == "claude" and c["compare"] == ["agy"]
     assert c["claude_model"] == "claude-opus-5-5" and c["claude_timeout"] == 900
 
 

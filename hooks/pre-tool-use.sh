@@ -503,10 +503,17 @@ fi
 #
 # 対象: TOOL_NAME=Bash の COMMAND が実際に `gh pr create` を呼び出している場合のみ。
 # 「実際に呼び出している」の判定は t015/t019 の task file guard と同じクォート除去方式を
-# 使う: シングル/ダブルクォートで囲まれた区間を丸ごと除去した文字列に対して
-# `gh pr create` を探す。これにより `plan.sh done t001 "report: gh pr create was run"` の
-# ような、報告のために文字列として言及しただけのコマンドを誤って deny しない
-# (t019 と同型の誤検知を避ける)。
+# 使う: シングル/ダブルクォートと二重クォートの区間を**1 回の交替パターンで左から順に**
+# 除去した文字列に対して `gh pr create` を探す。これにより
+# `plan.sh done t001 "report: gh pr create was run"` のような、報告のために文字列として
+# 言及しただけのコマンドを誤って deny しない (t019 と同型の誤検知を避ける)。
+# ★ シングル/ダブルを**別々の 2 パスで** sed することはしない (claude review t005 P2-1):
+#   二重引用符内にアポストロフィ (don't 等) があると、1 パス目 (シングルクォート除去) が
+#   その「'」を開始とみなし、後方にある無関係な「'」(例: echo 'done') と対で中身を
+#   丸ごと消してしまい、間にある実物の `gh pr create` ごと消える → ガードが黙って
+#   発火しなくなる (検出漏れが最悪の形で起きる)。1 回の交替 (`'[^']*'|"[^"]*"`) なら、
+#   左から見て最初に現れたクォート文字の種類で区間を閉じるため、二重引用符の中の
+#   アポストロフィを誤って区切りとして使わない。
 # ★ 既知の残存リスク: `bash -c "gh pr create ..."` のようにネストしたインタプリタに
 #   クォートごと丸投げする形は、クォート除去で中身ごと消えるため検出できない
 #   (= 見逃し方向のリスクで、誤検知方向のリスクより安全側に倒す判断。Director の
@@ -525,13 +532,19 @@ fi
 #
 # 対象外 (スコープ外。t001 Result の「未確認」に対応。Result に明記する既知の穴):
 #   - --body-file / ヒアドキュメント / 標準入力で本文を渡す形 (--body の引数として
-#     文字列を直接書く形だけを検出する。実測では Worker は常にこの形を使っている)
+#     文字列を直接書く形だけを検出する。実測では Worker は常にこの形を使っている)。
+#     **コードもこの通りに動く**: クォート除去後の文字列に `--body` (`--body-file` は
+#     除く。`-file` が続く場合は対象にしない) が見当たらなければ、task: 行の有無を
+#     一切判定せず素通りする (claude review t005 P2-2 の修正。以前は --body-file /
+#     --fill / --web / --help まで「task: 行が無い」として deny しており、knowledge の
+#     この既知の穴の記述と実装が食い違っていた)
 #   - gh pr edit --body で後から行を消すケース (生成時点のガードのみ。Director の
 #     設計制約 4 への回答: 対象にしない。gh pr edit は PR 本文以外の目的でも
 #     頻繁に使われ、対象に含めると誤検知面が大きく広がるため)
 if [ "$TOOL_NAME" = "Bash" ] && [ -n "$COMMAND" ]; then
-  _PRLINE_NO_QUOTES="$(printf '%s' "$COMMAND" | sed "s/'[^']*'//g; s/\"[^\"]*\"//g")"
-  if printf '%s' "$_PRLINE_NO_QUOTES" | grep -qE '\bgh[[:space:]]+pr[[:space:]]+create\b'; then
+  _PRLINE_NO_QUOTES="$(printf '%s' "$COMMAND" | sed -E "s/'[^']*'|\"[^\"]*\"//g")"
+  if printf '%s' "$_PRLINE_NO_QUOTES" | grep -qE '\bgh[[:space:]]+pr[[:space:]]+create\b' \
+     && printf '%s' "$_PRLINE_NO_QUOTES" | grep -qE -- '(^|[[:space:]])--body([[:space:]=]|$)'; then
     _PRLINE_MISSION=""
     _PRLINE_TASK=""
     if [ -n "${AGENT_NAME:-}" ]; then
@@ -549,7 +562,13 @@ if [ "$TOOL_NAME" = "Bash" ] && [ -n "$COMMAND" ]; then
       fi
     fi
     if [ -n "$_PRLINE_MISSION" ] && [ -n "$_PRLINE_TASK" ]; then
-      if ! printf '%s' "$COMMAND" | grep -qF "task: ${_PRLINE_MISSION}/${_PRLINE_TASK}"; then
+      # task id の末尾が別の task id の接頭辞になるケース (例: t1 と t10) で
+      # grep -qF の無アンカー一致が誤って「ある」と判定しないよう、ERE メタ文字を
+      # エスケープした上で、一致の直後が英数字でないこと (または行末) を要求する
+      # (claude review t005 P3 の修正)。
+      _PRLINE_ESC_MISSION="$(printf '%s' "$_PRLINE_MISSION" | sed 's/\\/\\\\/g; s/[].[*^$(){}+?|]/\\&/g')"
+      _PRLINE_ESC_TASK="$(printf '%s' "$_PRLINE_TASK" | sed 's/\\/\\\\/g; s/[].[*^$(){}+?|]/\\&/g')"
+      if ! printf '%s' "$COMMAND" | grep -qE "task: ${_PRLINE_ESC_MISSION}/${_PRLINE_ESC_TASK}([^0-9A-Za-z]|\$)"; then
         echo "[pre-tool-use] 🚫 gh pr create missing task: line: $(echo "$COMMAND" | head -c 200)" >&2
         emit_decision "deny" "gh pr create の --body に 'task: ${_PRLINE_MISSION}/${_PRLINE_TASK}' 行がありません。review Worker が stacked PR を検出できなくなるため、--body にこの行 (と可能なら 'branch: <branch名>' 行) を足して再実行してください。"
         exit 0

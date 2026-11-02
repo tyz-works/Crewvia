@@ -118,3 +118,47 @@ def test_gh_pr_edit_is_not_in_scope(fake_repo):
     # Director の設計制約 4 への回答: gh pr edit は対象にしない (Result に理由を明記)。
     cmd = "gh pr edit 123 --body 'no task line'"
     assert _bash(fake_repo, cmd) != "deny"
+
+
+# --- claude review (t005) P2-1/P2-2/P3 の回帰テスト ---
+
+
+def test_apostrophe_in_double_quotes_does_not_hide_the_real_call(fake_repo):
+    # P2-1: クォート除去をシングル/ダブルの 2 パスに分けると、二重引用符内の
+    # アポストロフィ (don't) が後方の無関係な「'」(echo 'done') と対になり、
+    # 間にある実物の gh pr create ごと消えてしまう (ガードが黙って発火しなくなる
+    # = 検出漏れが最悪の形で起きる)。task: 行が無いのでここは deny されるべき。
+    # (sed は行単位で処理するため、埋め込みの改行があると同一行内でしかペアに
+    # ならない。この欠陥を同一行で再現するため、わざと 1 行のコマンドにする。)
+    cmd = (
+        'echo "don\'t forget" && gh pr create --title "x" '
+        '--body "no task line here" && echo \'done\''
+    )
+    assert _bash(fake_repo, cmd) == "deny"
+
+
+def test_body_file_is_not_denied(fake_repo):
+    # P2-2: --body-file は knowledge の「既知の穴」どおり検出できない対象外の形。
+    # 以前は task: 行が無いとして誤って deny していた。
+    assert _bash(fake_repo, "gh pr create --title x --body-file notes.txt") != "deny"
+
+
+def test_fill_is_not_denied(fake_repo):
+    assert _bash(fake_repo, "gh pr create --fill") != "deny"
+
+
+def test_web_is_not_denied(fake_repo):
+    assert _bash(fake_repo, "gh pr create --web") != "deny"
+
+
+def test_help_is_not_denied(fake_repo):
+    assert _bash(fake_repo, "gh pr create --help") != "deny"
+
+
+def test_task_id_prefix_collision_is_not_treated_as_present(fake_repo):
+    # P3: grep -qF の無アンカー一致だと、割り当てられた task が t1 のとき、
+    # 本文にある別 task の行 "task: <mission>/t10" を部分一致で「ある」と
+    # 誤判定してしまう。アンカーで防ぎ、t1 自身の行が無ければ deny すること。
+    (fake_repo / "queue" / "assignments" / "Ingrid").write_text(f"{MISSION}:t1\n")
+    cmd = f'gh pr create --title "x" --body "task: {MISSION}/t10\nbranch: foo"'
+    assert _bash(fake_repo, cmd) == "deny"

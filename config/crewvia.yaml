@@ -263,7 +263,12 @@ attempts:
 # 設計・実測: knowledge/agy-review.md / knowledge/cursor-review.md / knowledge/claude-review.md
 review:
   engine: codex
-  agy_model: gemini-4-argon-high
+  # 旧値 gemini-4-argon-high は agy に存在せず ensemble が fail-closed していた
+  # (t005 / 20261102-pr-task-line)。`agy models` の実在 ID に合わせてある。
+  # agy は ensemble / compare でだけ使われる (本番のレビュー先は codex)。
+  # ensemble の相方が claude なので、合議の多様性のため Gemini 系を選んでいる
+  # (claude-opus-4-6-thinking を選ぶと両方 Claude 系になる)。
+  agy_model: gemini-3.8-flash-high
   agy_timeout_seconds: 600
   cursor_model: grok-4.7-high
   cursor_timeout_seconds: 900

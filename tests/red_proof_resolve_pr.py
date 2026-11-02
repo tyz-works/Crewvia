@@ -72,6 +72,17 @@ MUTATIONS = [
      "                continue\n",
      ["test_resolves_without_a_deliverable_declaration_on_a_mission_without_deliverable_required",
       "test_a_downstream_review_task_without_deliverable_declared_upstream_is_still_not_a_candidate"]),
+    ("M07", "--target-dir が渡されて空のとき省略扱いに戻す (別 repo の同番号 PR の task を成功で返す。#339 の Codex P2)",
+     "    if '--target-dir' in opts:\n"
+     "        explicit_td = opts['--target-dir']\n"
+     "        if not explicit_td.strip():\n"
+     "            _usage_exit(\"resolve-pr: --target-dir に空の値は渡せません \"\n"
+     "                        \"(省略すれば TARGET_DIR / crewvia 本体を見ます)\")\n"
+     "        effective_target",
+     "    explicit_td = opts.get('--target-dir')\n"
+     "    if explicit_td:\n"
+     "        effective_target",
+     ["test_an_empty_target_dir_flag_is_refused_not_treated_as_omitted"]),
 ]
 
 

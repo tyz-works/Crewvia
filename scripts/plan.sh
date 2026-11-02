@@ -3483,8 +3483,14 @@ def cmd_resolve_pr(args):
         die(f"resolve-pr: PR 番号は正の整数にしてください: {pr_number}")
 
     # --target-dir flag > TARGET_DIR env var > None (crewvia 本体)。`pull` と同じ規則 (t006 retry / P2)。
-    explicit_td = opts.get('--target-dir')
-    if explicit_td:
+    # 「渡されたか」と「値」を分けて見る: 渡されたのに空 (空白のみ含む) を省略扱いにすると、TARGET_DIR /
+    # crewvia 本体に落ちて別 repo の同番号 PR の task を成功として返す (#339 の Codex P2)。
+    # 呼び出し側の `--target-dir "$var"` で var が想定外に空のときは、答えを決められないので拒否 (何も書かない)。
+    if '--target-dir' in opts:
+        explicit_td = opts['--target-dir']
+        if not explicit_td.strip():
+            _usage_exit("resolve-pr: --target-dir に空の値は渡せません "
+                        "(省略すれば TARGET_DIR / crewvia 本体を見ます)")
         effective_target = os.path.abspath(os.path.expanduser(explicit_td))
     else:
         env_td = os.environ.get('TARGET_DIR', '').strip()

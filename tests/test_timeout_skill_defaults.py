@@ -218,6 +218,36 @@ def test_missing_config_file_does_not_block_add(sb):
 
 
 # ---------------------------------------------------------------------------
+# 9: --idle-timeout / --max-timeout は正の整数しか受け付けない (add / update 共通)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("flag", ["--idle-timeout", "--max-timeout"])
+@pytest.mark.parametrize("value", ["0", "-1", "-7200"])
+def test_add_rejects_non_positive_timeout(sb, flag, value):
+    """0 以下の --idle-timeout / --max-timeout は add を拒否する (card は作られない)。
+
+    負値がそのまま通ると card の timeout.max がマイナスになり、watchdog の
+    `now - started_at - excluded > max_threshold` が常に真になって pull 直後に
+    terminate される即死スイッチになる (P3)。"""
+    r = sb.plan("add", "review this", "--mission", MISSION, "--skills", "review",
+                "--deliverable", "none", flag, value)
+    assert r.returncode != 0, r.stdout
+    assert not sb.card_path("t001").exists()
+
+
+@pytest.mark.parametrize("flag", ["--idle-timeout", "--max-timeout"])
+@pytest.mark.parametrize("value", ["0", "-1", "-7200"])
+def test_update_rejects_non_positive_timeout(sb, flag, value):
+    """0 以下の --idle-timeout / --max-timeout は update を拒否し、既存の timeout を
+    書き換えない (P3)。"""
+    sb.add("review this", "review", "--idle-timeout", "600", "--max-timeout", "1800")
+    before = sb.meta("t001").get("timeout")
+    r = sb.plan("update", "t001", "--mission", MISSION, flag, value)
+    assert r.returncode != 0, r.stdout
+    assert sb.meta("t001").get("timeout") == before
+
+
+# ---------------------------------------------------------------------------
 # 6〜7: plan.sh update --idle-timeout / --max-timeout
 # ---------------------------------------------------------------------------
 

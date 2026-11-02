@@ -5,12 +5,16 @@
 # 使い方:  bash tests/red_proof_t002_review_ci_timeout.sh
 #
 #   baseline — いまの木では全テストが緑
-#   case A   — plan.sh add の既定付与ロジックを削除 (скill 一致で timeout.max を書く分岐を消す)
+#   case A   — plan.sh add の既定付与ロジックを削除 (skill 一致で timeout.max を書く分岐を消す)
 #              → review skill の card に既定が付かなくなる → 1, 4 系のテストが赤
 #   case B   — 複数 skill の解決を「最初に見つかった値」に戻す (最も緩い方を採らない)
 #              → test_multiple_matching_skills_pick_the_more_lenient_value が赤
 #   case C   — plan.sh update から --max-timeout / --idle-timeout を削除
 #              → update 系のテストが collect で失敗 (未知の option)
+#   case D   — plan.sh add の 0 以下チェックを外す (即死スイッチの re-open。P3)
+#              → test_add_rejects_non_positive_timeout が赤
+#   case E   — plan.sh update の 0 以下チェックを外す (P3)
+#              → test_update_rejects_non_positive_timeout が赤
 #
 # 隔離: 使い捨ての複製で欠陥を注入する。本番の worktree のファイルには触らない。
 set -uo pipefail
@@ -123,6 +127,55 @@ if inject scripts/plan.sh \
     fi
 else
     ng "case C → 注入点が見つからない"
+fi
+
+echo "== case D: plan.sh add の 0 以下チェックを外す (即死スイッチの re-open)"
+fresh_copy
+if inject scripts/plan.sh \
+    "        except ValueError:
+            die(\"--idle-timeout must be an integer number of seconds\")
+        if timeout['idle'] <= 0:
+            die(\"--idle-timeout must be a positive integer number of seconds\")" \
+    "        except ValueError:
+            die(\"--idle-timeout must be an integer number of seconds\")
+        pass  # red-proof: 0 以下チェックを外した"; then
+    expect_red "case D" "test_add_rejects_non_positive_timeout"
+else
+    ng "case D → 注入点が見つからない"
+fi
+
+echo "== case E: plan.sh update の 0 以下チェックを外す"
+fresh_copy
+if inject scripts/plan.sh \
+    "    idle_timeout_opt = opts.get('--idle-timeout')
+    if idle_timeout_opt:
+        try:
+            if int(idle_timeout_opt) <= 0:
+                die(\"--idle-timeout must be a positive integer number of seconds\")
+        except ValueError:
+            die(\"--idle-timeout must be an integer number of seconds\")
+    max_timeout_opt = opts.get('--max-timeout')
+    if max_timeout_opt:
+        try:
+            if int(max_timeout_opt) <= 0:
+                die(\"--max-timeout must be a positive integer number of seconds\")
+        except ValueError:
+            die(\"--max-timeout must be an integer number of seconds\")" \
+    "    idle_timeout_opt = opts.get('--idle-timeout')
+    if idle_timeout_opt:
+        try:
+            int(idle_timeout_opt)
+        except ValueError:
+            die(\"--idle-timeout must be an integer number of seconds\")
+    max_timeout_opt = opts.get('--max-timeout')
+    if max_timeout_opt:
+        try:
+            int(max_timeout_opt)
+        except ValueError:
+            die(\"--max-timeout must be an integer number of seconds\")"; then
+    expect_red "case E" "test_update_rejects_non_positive_timeout"
+else
+    ng "case E → 注入点が見つからない"
 fi
 
 echo

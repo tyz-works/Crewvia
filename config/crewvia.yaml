@@ -62,7 +62,10 @@ model_per_skill:
 #      境界チェック専用 (watchdog は読まない)
 #   3. ここ (timeout_max_per_skill)  — plan.sh add が card の timeout.max を自動で
 #      埋める既定値 (card に書き込まれた後は普通の card.timeout として #1 が解決する。
-#      daemon restart は不要 — card は watchdog が毎 cycle 読む)
+#      daemon restart は不要 — watchdog は card の timeout を監視を始める時に読むので、
+#      ここを変えても watchdog プロセス自体の再起動は要らない。ただし**既に監視中の
+#      task には効かない** — WorkerMonitor は監視開始時に 1 回だけ束縛する
+#      (scripts/watchdog.py の WorkerMonitor.__init__。knowledge/review-ci-wait-timeout.md)
 #
 # review は CI 完走待ち (pytest 実測 3975s) を含むため、既定の feature_impl (3600s) では
 # 短すぎて待機中の Worker が殺される事故が起きた (2026-09-13 / 2026-11-02 再発。

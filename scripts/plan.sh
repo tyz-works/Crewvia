@@ -50,6 +50,8 @@ set -euo pipefail
 #                            [--idle-timeout <s>] [--max-timeout <s>]
 #                              既存 card の timeout.idle / timeout.max を書き換える唯一の非手編集の経路 (t002)。
 #                              既存の timeout dict は片方だけ渡した方だけ上書きしてマージする。
+#                              監視中 (in_progress) の task には即効かない — WorkerMonitor は監視開始時に
+#                              1 回だけ card を読むので、次に新しく pull されて監視が作り直されるまで反映されない。
 #   plan.sh update <task_id> --close-execution [--mission <slug>]
 #                              task に触れず、Controller の外で手放されて active のまま残った試行 (終わった task に残った
 #                              running 等。store-check の execution_active_on_finished_task) を failed / ABANDONED_OUTSIDE_CONTROLLER で閉じる
@@ -3125,12 +3127,16 @@ def cmd_add(args):
             timeout['idle'] = int(opts['--idle-timeout'])
         except ValueError:
             die("--idle-timeout must be an integer number of seconds")
+        if timeout['idle'] <= 0:
+            die("--idle-timeout must be a positive integer number of seconds")
     explicit_max_timeout = opts.get('--max-timeout')
     if explicit_max_timeout:
         try:
             timeout['max'] = int(explicit_max_timeout)
         except ValueError:
             die("--max-timeout must be an integer number of seconds")
+        if timeout['max'] <= 0:
+            die("--max-timeout must be a positive integer number of seconds")
     else:
         # --max-timeout が明示されなければ skill 別既定で埋める (t002 / 20261102-review-ci-timeout)。
         # 明示値がある card には絶対に触らない (上の分岐が先に timeout['max'] を確定させているので
@@ -6820,6 +6826,15 @@ def cmd_update(args):
     1 本の文字列として読み、watchdog.py の `timeout.get("max")` が `AttributeError` になる
     罠があった。
 
+    **既に watchdog が監視中 (in_progress) の task には効かない**: `WorkerMonitor.__init__`
+    (scripts/watchdog.py) は `max_threshold` / `idle_threshold` を監視開始時に 1 回だけ
+    card から読んで束縛し、以降の cycle では pr_number の照合 (`refresh_card_pr_number`)
+    しか card を読み直さない。この update は card の `timeout:` を書き換えるので、Worker が
+    `pending` に戻り再度 pull されて監視が新しく始まったとき (= 新しい `WorkerMonitor` が
+    作られたとき) から効く。今まさに動いている Worker の上限をその場で引き上げたいときは
+    効果が無い (`--reset` で status を pending に戻すと監視が作り直されるが、Worker 自身も
+    作業を中断して再 pull することになる)。
+
     --reset sets: status=pending, worker=null, started_at=null, completed_at=null
     --reset と、status を動かす更新 (failed からの --status 等) は前回の FAIL の証拠
     (handoff_path / fail_head / fail_head_waiver) を card から消し、古い handoff ファイルを
@@ -6880,13 +6895,15 @@ def cmd_update(args):
     idle_timeout_opt = opts.get('--idle-timeout')
     if idle_timeout_opt:
         try:
-            int(idle_timeout_opt)
+            if int(idle_timeout_opt) <= 0:
+                die("--idle-timeout must be a positive integer number of seconds")
         except ValueError:
             die("--idle-timeout must be an integer number of seconds")
     max_timeout_opt = opts.get('--max-timeout')
     if max_timeout_opt:
         try:
-            int(max_timeout_opt)
+            if int(max_timeout_opt) <= 0:
+                die("--max-timeout must be a positive integer number of seconds")
         except ValueError:
             die("--max-timeout must be an integer number of seconds")
 

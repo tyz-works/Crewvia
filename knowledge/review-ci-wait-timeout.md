@@ -50,8 +50,11 @@ skill 一致で既定値を書き込む。明示値は上書きしない。
   Rule 5 §12/§13 の「review Worker は CI 待ちの間 in_progress のまま」という前提全体の作り直しに
   なり、本 mission のスコープを超える。今回は却下（必要なら別 mission）。
 
-**B を選んだ決め手**: card の `timeout:` は watchdog が毎 cycle 読むので、この既定値の変更は
-**daemon restart が不要**（A/C は `PROFILES` というモジュール定数に触れるため restart が要る）。
+**B を選んだ決め手**: card の `timeout:` は watchdog が監視を始める時 (新しく pull された task を
+`WorkerMonitor` が作られるとき) に読むので、この既定値の変更は **watchdog プロセスの daemon
+restart が不要**（A/C は `PROFILES` というモジュール定数に触れるため restart が要る）。
+ただし「既に監視中の task に即反映される」という意味ではない — 下の「`plan.sh update
+--idle-timeout <s> --max-timeout <s>`」節を参照。
 
 ## 実装 (t002)
 
@@ -65,6 +68,13 @@ skill 一致で既定値を書き込む。明示値は上書きしない。
 
 今回の変更は #3 だけを足した。#1 (`PROFILES`) には一切触れていない — 触ると「restart 不要」という
 B の利点が消える。#2 は review の既存コメントの意味(単体作業時間の実測)が誤解されないよう追記しただけ。
+
+**#3 の既定値 7200 が #2 の lint 集計境界に収まることを確認済み**: `lint_plan.py` の
+`check_timeout_validity()` は `config/timeout-profiles.yaml` の全 profile の idle/max から
+`[min, max]` の集計境界を作り (:292-299)、card の `timeout.max` がその外なら WARN を出す
+(FAIL にはしない。`--strict` のときだけ FAIL に昇格)。現行の profile 群は `max` が
+600〜14400 の範囲 (`ops_long` が最大)。7200 はこの範囲内なので、新しい既定値付きで作られた
+card を lint が落とすことはない。
 
 ### 解決ロジック (`scripts/plan.sh` の `_default_timeout_max_for_skills()`)
 
@@ -88,6 +98,16 @@ B の利点が消える。#2 は review の既存コメントの意味(単体作
 既存の timeout dict とマージ (片方だけ渡せばもう片方は保たれる)。壊れた値 (flow 形式が文字列として
 読まれた等) を持つ card でも、指定した方は正しい block 形式で書き直される
 (`lib_state_store.dump_yaml` は dict を常に block 形式でしか出力しない)。
+
+**監視中 (in_progress) の task には即効かない。** `scripts/watchdog.py` の `WorkerMonitor.__init__`
+は `max_threshold` / `idle_threshold` を監視を始めた時点で card から 1 回だけ読んで束縛する
+(watchdog.py:264-265)。既存の monitor がある task は、以後の cycle で card を読み直すのは
+`refresh_card_pr_number()` (PR 番号の照合) だけで、timeout は読み直さない (watchdog.py:1812)。
+「card の timeout は毎 cycle 読まれる」が成り立つのは **新しく監視が始まる瞬間** (`pull` で
+再度 in_progress になり新しい `WorkerMonitor` が作られたとき) だけで、今まさに動いている Worker
+の上限をこの update でその場で引き上げることはできない。daemon restart が要らないのは
+別の話 (`PROFILES` というモジュール定数を触っていないので watchdog プロセス自体の再起動は
+不要という意味) で、「今動いている監視に即反映される」という意味ではない。混同しないこと。
 
 ## 本 mission 自身の t003 (この変更の review task) について
 

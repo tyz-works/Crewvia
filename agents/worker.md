@@ -631,6 +631,8 @@ PR の base は**自分で決めない**。`plan pr-base` が mission の policy
 `AGENT_NAME` と自分の assignment から task を決めるので、cwd が主 checkout に戻っていても同じ値が出る。
 取れなければ exit 1 になる — **`main` に倒して PR を作らない**。PR を作らず `plan needs-director <id> "<stderr>" --execution <ex-…>` で Director に渡す。
 
+**`task:` 行は、pull した JSON の `mission` / `id` の値をそのまま文字どおり書くこと（`${TASK_MISSION}` のようなシェル変数展開に頼らない）。** Bash ツールは呼び出しごとに env がリセットされるため、`export TASK_MISSION=...` した呼び出しと `gh pr create` を呼ぶ呼び出しが別であれば変数は空になる。`hooks/pre-tool-use.sh` の「PR task-line guard」（t002）が `gh pr create` の `--body` にこの行（`task: <mission>/<task>` の文字どおりの値）が無いと deny する。deny されたら壊れたのではなく、本文にこの行を足して同じコマンドを再実行すればよい。
+
 ```bash
 PR_BASE="$(plan pr-base)" || { echo "PR base を決められない。Director に報告して待つ" >&2; exit 1; }
 gh pr create \
@@ -642,7 +644,7 @@ gh pr create \
 - [変更点1]
 - [変更点2]
 
-task: ${TASK_MISSION}/${TASK_ID}
+task: {pull した mission}/{pull した task id}
 branch: $(git branch --show-current)" \
   --base "$PR_BASE"
 
@@ -980,6 +982,9 @@ git commit -m "{type}: {内容} (task/{task_id})"
 git push origin {branch}
 
 # PR を作成する（Worker-driven PR モデル）。base は上の「PR 作成」と同じく plan pr-base から取る
+# task: 行は pull した JSON の mission / id をそのまま文字どおり書く（シェル変数展開に頼らない。
+# hooks/pre-tool-use.sh の PR task-line guard (t002) がこの行の有無を強制する。deny されたら
+# 行を足して同じコマンドを再実行すればよい）
 PR_BASE="$(plan pr-base)" || { echo "PR base を決められない。Director に報告して待つ" >&2; exit 1; }
 gh pr create \
   --title "{type}: {内容}" \
@@ -990,7 +995,7 @@ gh pr create \
 - [変更点1]
 - [変更点2]
 
-task: ${TASK_MISSION}/${TASK_ID}
+task: {pull した mission}/{pull した task id}
 branch: $(git branch --show-current)" \
   --base "$PR_BASE"
 
@@ -1024,8 +1029,11 @@ ACTUAL_BASE="$(gh pr view "$PR_NUM" --json baseRefName -q .baseRefName)"
 [ "$ACTUAL_BASE" = "$EXPECTED_BASE" ] || echo "stacked PR: base=$ACTUAL_BASE (期待 $EXPECTED_BASE)"
 ```
 
-- `task:` 行が無い PR（人が作った PR など）・card が読めない・exit 1 のときは、**main と比べて stacked かどうかを決めない**。
-  「PR base を決められない」を Director に報告し、merge の提案を保留する。
+- `task:` 行が無い PR（人が作った PR・`hooks/pre-tool-use.sh` の PR task-line guard (t002) 導入前に作られた PR・
+  assignment を解決できず fail-open で通った PR など）・card が読めない・exit 1 のときは、**main と比べて
+  stacked かどうかを決めない**。「PR base を決められない」を Director に報告し、merge の提案を保留する。
+  guard 導入後は Worker-driven な PR では行が揃っているはずなので、行が無いこと自体が「人・古い PR・
+  fail-open のいずれか」を示す手がかりになる。
 - stacked PR だったら Director に以下を提案する（`{EXPECTED_BASE}` は上で取った値）:
 
 > 「この PR は stacked 構造です。親 PR を squash merge すると子 PR が自動クローズされるリスクがあります。

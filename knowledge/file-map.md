@@ -23,7 +23,9 @@
 
 ### `pre-tool-use.sh`
 
-PreToolUse hook（Taskvia承認）
+PreToolUse hook（Taskvia承認）。構造的ガードの 1 つに「PR task-line guard」（t002）がある:
+`gh pr create` の `--body` に `task: <mission>/<task>` 行が無ければ deny する（assignment を
+解決できなければ fail-open）。設計・既知の穴・戻し方: `knowledge/pr-task-line-guard.md`
 
 ### `post-tool-use.sh`
 

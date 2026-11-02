@@ -490,6 +490,74 @@ if [ "$TOOL_NAME" = "Bash" ] && [ -n "$COMMAND" ]; then
   fi
 fi
 
+# --- PR task-line guard: gh pr create に task: <mission>/<task> 行を強制する
+#     (t002, mission 20261102-pr-task-line) ---
+# 背景 (t001 の調査): agents/worker.md の PR 本文テンプレートは `task: ${TASK_MISSION}/${TASK_ID}`
+# 行を含むが、生の散文テンプレートでしかなく強制力が無い。実測で #327〜#336 の 10 本全てに
+# この行が無かった (未展開のリテラルすら残っていない = Worker はテンプレートをそもそも
+# 参照していない)。消費側 (worker.md:1015-1027 の review Worker 向け stacked PR 判定手順) も
+# 同じく散文で、10/10 とも手順どおりには発火しなかった。生産側・消費側どちらも「散文は
+# LLM である Worker に毎回守られるとは限らない」という同じ弱点を持つため、一次防御を
+# ツールゲート側 (本ガード) に置く。crewvia_create_pr (scripts/git-helpers.sh) は実測で
+# 呼び出し元ゼロなので、そちらに注入しても効果が無い (t001 Result 参照)。
+#
+# 対象: TOOL_NAME=Bash の COMMAND が実際に `gh pr create` を呼び出している場合のみ。
+# 「実際に呼び出している」の判定は t015/t019 の task file guard と同じクォート除去方式を
+# 使う: シングル/ダブルクォートで囲まれた区間を丸ごと除去した文字列に対して
+# `gh pr create` を探す。これにより `plan.sh done t001 "report: gh pr create was run"` の
+# ような、報告のために文字列として言及しただけのコマンドを誤って deny しない
+# (t019 と同型の誤検知を避ける)。
+# ★ 既知の残存リスク: `bash -c "gh pr create ..."` のようにネストしたインタプリタに
+#   クォートごと丸投げする形は、クォート除去で中身ごと消えるため検出できない
+#   (= 見逃し方向のリスクで、誤検知方向のリスクより安全側に倒す判断。Director の
+#   設計制約 2「誤検知を防ぐこと」を優先した)。
+#
+# mission_slug / task_id の解決は env の TASK_ID / CREWVIA_TASK_ID を直読みしない
+# (t014 の P1 インシデントと同じ理由: `.crewvia-env` の source や worker.md の
+# `export TASK_MISSION=...` は Bash tool の subshell 内に閉じており、hook プロセスには
+# 届かない)。既存の assignments ファイル (`queue/assignments/<AGENT_NAME>`、
+# 上の :128-139 の fallback と同じ仕組み) を直接読んで解決する。
+#
+# Director の設計制約 1 (fail-open): assignments から mission/task を解決できない
+# 場合 (AGENT_NAME 未設定・assignment ファイルが無い・形式が壊れている) は、
+# deny せずそのまま通す。Director 自身の PR・手動の PR・assignment を持たない
+# セッションまで deny すると「誰も PR を出せなくなる」事故になるため。
+#
+# 対象外 (スコープ外。t001 Result の「未確認」に対応。Result に明記する既知の穴):
+#   - --body-file / ヒアドキュメント / 標準入力で本文を渡す形 (--body の引数として
+#     文字列を直接書く形だけを検出する。実測では Worker は常にこの形を使っている)
+#   - gh pr edit --body で後から行を消すケース (生成時点のガードのみ。Director の
+#     設計制約 4 への回答: 対象にしない。gh pr edit は PR 本文以外の目的でも
+#     頻繁に使われ、対象に含めると誤検知面が大きく広がるため)
+if [ "$TOOL_NAME" = "Bash" ] && [ -n "$COMMAND" ]; then
+  _PRLINE_NO_QUOTES="$(printf '%s' "$COMMAND" | sed "s/'[^']*'//g; s/\"[^\"]*\"//g")"
+  if printf '%s' "$_PRLINE_NO_QUOTES" | grep -qE '\bgh[[:space:]]+pr[[:space:]]+create\b'; then
+    _PRLINE_MISSION=""
+    _PRLINE_TASK=""
+    if [ -n "${AGENT_NAME:-}" ]; then
+      _PRLINE_ASSIGN_FILE="${_CREWVIA_REPO}/queue/assignments/${AGENT_NAME}"
+      if [ -f "$_PRLINE_ASSIGN_FILE" ]; then
+        _PRLINE_ASSIGN="$(cat "$_PRLINE_ASSIGN_FILE" | tr -d '\n')"
+        # ':' が無い (壊れた assignment ファイル) 場合は解決できなかった扱いにする
+        # (fail-open。mission/task が空のまま残る)
+        case "$_PRLINE_ASSIGN" in
+          *:*)
+            _PRLINE_MISSION="${_PRLINE_ASSIGN%%:*}"
+            _PRLINE_TASK="${_PRLINE_ASSIGN##*:}"
+            ;;
+        esac
+      fi
+    fi
+    if [ -n "$_PRLINE_MISSION" ] && [ -n "$_PRLINE_TASK" ]; then
+      if ! printf '%s' "$COMMAND" | grep -qF "task: ${_PRLINE_MISSION}/${_PRLINE_TASK}"; then
+        echo "[pre-tool-use] 🚫 gh pr create missing task: line: $(echo "$COMMAND" | head -c 200)" >&2
+        emit_decision "deny" "gh pr create の --body に 'task: ${_PRLINE_MISSION}/${_PRLINE_TASK}' 行がありません。review Worker が stacked PR を検出できなくなるため、--body にこの行 (と可能なら 'branch: <branch名>' 行) を足して再実行してください。"
+        exit 0
+      fi
+    fi
+  fi
+fi
+
 # --- Plan-review write scope guard: plan_review スキルは plan_review.md 以外への
 #     書き込みを一切許可しない (t002, mission 20260908-launch-reliability) ---
 # 背景: plan-reviewer (scripts/review-plan.sh が起動する Opus セッション) は

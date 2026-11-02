@@ -61,8 +61,13 @@ logs/
 
 # Claude Code local state
 .claude/settings.local.json
-# 人手の settings.json バックアップ（hook が作る settings.json.bak.hook.PID とは別物）
-.claude/settings.json.bak
+# .claude/ 配下の .bak を一般化 (t011)。t001 で .claude/settings.json.bak を
+# ファイル名ピンポイントで追加したが、直後に .claude/settings.local.json.pre-automode.bak
+# が untracked で現れ同じ取りこぼしが即座に再現した。人手のバックアップ・ツール/hook が
+# 作る .bak のどちらも、ファイル名を問わず拾う一般パターンに統合する
+# (末尾が .bak のものだけが対象。sh_perm_manager.sh の一時バックアップは
+# *.bak.hook.$$ という別の命名のため対象外のままだが、通常終了時は自己削除される)
+.claude/*.bak
 .claude/scheduled_tasks.lock
 # crewvia TARGET_DIR mode: Worker 専用 settings ファイル（start.sh が起動時に生成 / plan.sh done で削除）
 # worktree 汚染防止のため gitignore 対象とする

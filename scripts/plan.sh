@@ -121,13 +121,16 @@ set -euo pipefail
 #                              1 遷移 = 1 ファイル。上書きも追記もしない (設計: knowledge/vnext-02-attempt-reopen-checkpoint.md §3.2)
 #   plan.sh pr-base [--mission <slug> --task <task_id>] [--diff-ref]
 #                              PR の base を 1 行出す (読み取り専用。決められなければ exit 1・stdout 空。詳細は cmd_pr_base)
+#   plan.sh resolve-pr <pr_number>
+#                              PR 番号から、その PR を作った task を <mission_slug>/<task_id> で 1 行出す
+#                              (読み取り専用。pr-base と同じく決められなければ exit 1・stdout 空。詳細は cmd_resolve_pr)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 QUEUE_DIR="${CREWVIA_QUEUE:-${REPO_ROOT}/queue}"
 
 if [[ $# -eq 0 ]]; then
-  echo "Usage: plan.sh <init|add|pull|done|needs-director|fail|update|retry|reopen|release-dep|retire|reap-orphan-assignment|ready-for-verification|verifying|snapshot|verify-result|review|launch|task-graph|lint|status|archive|resync|dashboard|dashboard-data|resolve-mission|store-check|history|pr-base> [args...]" >&2
+  echo "Usage: plan.sh <init|add|pull|done|needs-director|fail|update|retry|reopen|release-dep|retire|reap-orphan-assignment|ready-for-verification|verifying|snapshot|verify-result|review|launch|task-graph|lint|status|archive|resync|dashboard|dashboard-data|resolve-mission|store-check|history|pr-base|resolve-pr> [args...]" >&2
   exit 1
 fi
 
@@ -2711,6 +2714,7 @@ USAGE = {
     'store-check': 'plan.sh store-check [--mission <slug>]',
     'history': 'plan.sh history <task_id> [--mission <slug>]',
     'pr-base': 'plan.sh pr-base [--mission <slug> --task <task_id>] [--diff-ref]',
+    'resolve-pr': 'plan.sh resolve-pr <pr_number>',
 }
 
 #: サブコマンドごとに受け付ける positional の数 (最小, 最大)。余剰は黙って捨てず拒否する
@@ -2725,6 +2729,7 @@ POSITIONAL_ARITY = {
     'review': (1, 1), 'launch': (1, 1), 'task-graph': (0, 0), 'lint': (0, 1),
     'status': (0, 0), 'archive': (1, 1), 'resync': (0, 1), 'dashboard-data': (0, 0),
     'resolve-mission': (1, 1), 'store-check': (0, 0), 'history': (1, 1), 'pr-base': (0, 0),
+    'resolve-pr': (1, 1),
 }
 
 #: 使い方の誤りの終了コード。`pull` だけは 1 — `pull` の 2 は「タスクなし (idle)」で、
@@ -2736,7 +2741,7 @@ PULL_USAGE_EXIT = 1
 #: 使い方の誤りを exit 1 で返すサブコマンド。`pull` は 2 = idle のため。`pr-base` は呼び出し元が
 #: `PR_BASE="$(plan pr-base)" || exit 1` と書き、「決められない」は全部 exit 1 (exit 2 は idle の意味。
 #: knowledge/git-policy.md §3)。
-PULL_USAGE_EXIT_SUBCOMMANDS = ('pull', 'pr-base')
+PULL_USAGE_EXIT_SUBCOMMANDS = ('pull', 'pr-base', 'resolve-pr')
 
 
 class UsageExit(SystemExit):
@@ -3429,6 +3434,52 @@ def cmd_pr_base(args):
     print(f"{_GIT_POLICY.REMOTE}/{value}" if opts.get('--diff-ref') else value)
 
 
+def cmd_resolve_pr(args):
+    """PR 番号から、その PR を作った task を `<mission_slug>/<task_id>` で 1 行だけ出す (読み取り専用。
+    ロックも取らない・queue を書かない)。
+
+    方針転換 (t006): PR 本文の `task:` 行を解析する方式は 3 巡のレビューで fail-open の抜けを出し続けた
+    (shlex / クォート除去の穴)。`pr_number` は `plan.sh done --pr` で card の frontmatter に既に書かれて
+    いるので、review task が走る時点 (実装 task が done 済み) ではキューに聞けば済む。`task:` 行そのものは
+    人が PR を見て分かる表示として worker.md のテンプレートに残すが、判定の根拠にはしない。
+
+    探す範囲は **active mission だけ** (`pr-base` と同じ規則。`knowledge/git-policy.md` §3)。`pr_number` が
+    付く時点で実装 task は done 済みのはずで、mission はまだ active のはず — 退避済み (archive) にしか
+    無い mission は見ない。**決められなければ `main` に倒す pr-base と同じ思想**で exit 1・stdout 空にする
+    (既定の task に倒すと、別の task の stacked PR 判定を間違った task に対して行う事故になる)。
+
+    候補は、この mission 群の全 task card のうち `pr_number == N` **かつ `deliverable == 'pr'`** のものだけ。
+    `deliverable: pr` を宣言できるのは `can_produce_deliverable: true` (または未宣言) の skill だけで、
+    `review` / `codex-review` は `config/skill-permissions.yaml` で `can_produce_deliverable: false` と
+    明示されており宣言できない (lint が落とす)。だから `propagate_pr_number()` がこの番号を書き込んだ下流の
+    codex-review / review の task (実装 task と同じ pr_number を持つ) は、skill 名を複製せずとも自然に除外
+    される — これが課題 3「同じ pr_number を持つ card が複数ある場合にどれを返すか」の規則。
+
+    候補が 1 件なら `<mission>/<task_id>` を出す。0 件・2 件以上はどちらも一意に決められないので exit 1・
+    stdout 空 (`[破損]` の card は pr_number を持たないので候補にならない)。
+    """
+    opts, positional = parse_opts(args, {})
+    raw = positional[0]
+    try:
+        pr_number = int(raw)
+    except ValueError:
+        die(f"resolve-pr: PR 番号は整数で指定してください: {raw!r}")
+    if pr_number <= 0:
+        die(f"resolve-pr: PR 番号は正の整数にしてください: {pr_number}")
+
+    state = load_state()
+    candidates = []
+    for slug in list(state.get('active_missions') or []):
+        for meta, _body in list_tasks(slug, quiet=True):
+            if meta.get('pr_number') != pr_number or meta.get('deliverable') != 'pr':
+                continue
+            candidates.append((slug, meta['id']))
+    if len(candidates) != 1:
+        die(f"resolve-pr: PR #{pr_number} の task を一意に決められません ({len(candidates)} 件: {candidates})")
+    slug, task_id = candidates[0]
+    print(f"{slug}/{task_id}")
+
+
 #: pull の domain error → exit code (execution.md §4.4)。exit 2 は pull では「タスクなし (idle)」の意味なので、
 #: Controller のどのコードも 2 にしない (memory pull-exit-2-is-idle-usage-errors-must-be-1)。照合の 3 つだけ 3。
 _PULL_EXECUTION_EXIT_CODES = frozenset({
@@ -3500,7 +3551,8 @@ _INTENT_FREEZE = {
     'verifying': 'allow', 'verify-result': 'allow',
     # 読み取り専用 (queue の card を書かない)
     'status': 'allow', 'history': 'allow', 'store-check': 'allow', 'lint': 'allow', 'snapshot': 'allow',
-    'dashboard-data': 'allow', 'resolve-mission': 'allow', 'pr-base': 'allow', 'task-graph': 'allow', 'resync': 'allow',
+    'dashboard-data': 'allow', 'resolve-mission': 'allow', 'pr-base': 'allow', 'resolve-pr': 'allow',
+    'task-graph': 'allow', 'resync': 'allow',
     # card・intent に触れない (新しい mission の作成 / 有効化 / mission.yaml の review 状態 / registry の孤児 assignment)。
     # 『通す』の各行が mission dir の移動・置き換え・削除・state.yaml の書き換えを内部で起こさないかの表は設計 §4.3.1 (PR #308 fix 5):
     # init は `--force` で既存の mission を退避する = 本体の中で `_die_if_intent_stuck_before_move` が止める (他の形は新しい slug を作るだけ)。
@@ -7777,6 +7829,7 @@ dispatch = {
     'store-check': cmd_store_check,
     'history': cmd_history,
     'pr-base': cmd_pr_base,
+    'resolve-pr': cmd_resolve_pr,
 }
 
 if SUBCOMMAND not in dispatch:

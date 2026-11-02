@@ -98,7 +98,13 @@ class Docs:
 
 @pytest.fixture
 def repo(tmp_path):
-    return Repo(tmp_path)
+    r = Repo(tmp_path)
+    # `update --deliverable pr` の検査は `config/skill-permissions.yaml` と `hooks/lib_skill_perms.py` を読む。
+    # `copy_plan_tree` は scripts/ しか写さないので、この本物の 2 つだけここで足す (t006)。
+    shutil.copytree(REPO_ROOT / "config", r.root / "config")
+    (r.root / "hooks").mkdir()
+    shutil.copy2(REPO_ROOT / "hooks" / "lib_skill_perms.py", r.root / "hooks" / "lib_skill_perms.py")
+    return r
 
 
 @pytest.fixture
@@ -199,26 +205,33 @@ def director_edit_script() -> str:
 
 
 def test_worker_stacked_check_compares_with_the_target_prs_task_not_its_own(repo, docs):
-    """review の Worker は自分の task (別の mission でもよい) ではなく、対象 PR の本文の `task:` 行の task の値と比べる。"""
+    """review の Worker は自分の task (別の mission でもよい) ではなく、`plan resolve-pr` が指す対象 PR の task の値と比べる。
+
+    方針転換 (t006): 以前は PR 本文の `task:` 行を解析していたが、`pr_number` を持つキューの card から
+    直接引く方式に変えた (PR 本文はもう読まない)。
+    """
     repo.set_git(pr_base="develop")
-    assert repo.pull().returncode == 0
-    body = f"概要\\n\\ntask: {MISSION}/t001\\nbranch: x\\n"
+    p = repo.pull()
+    assert p.returncode == 0, p.stderr
+    execution_id = json.loads(p.stdout)["execution_id"]
+    assert repo.plan("update", "t001", "--deliverable", "pr", "--mission", MISSION, agent="Director").returncode == 0
+    done = repo.plan("done", "t001", "finished", "--mission", MISSION, "--pr", "77", "--execution", execution_id)
+    assert done.returncode == 0, done.stderr
     # base が develop (期待どおり) → stacked ではない
-    p = docs.run(stacked_check_script(), repo.root, agent="Seo", extra_env={"STUB_PR_BODY": body, "STUB_BASE_REF": "develop"})
-    assert (p.returncode, p.stdout.strip()) == (0, ""), p.stderr
+    out = docs.run(stacked_check_script(), repo.root, agent="Seo", extra_env={"STUB_BASE_REF": "develop"})
+    assert (out.returncode, out.stdout.strip()) == (0, ""), out.stderr
     # base が main → develop が期待なので stacked と言う (main と比べて決めない)
-    p = docs.run(stacked_check_script(), repo.root, agent="Seo", extra_env={"STUB_PR_BODY": body, "STUB_BASE_REF": "main"})
-    assert p.returncode == 0 and "stacked PR: base=main (期待 develop)" in p.stdout, (p.stdout, p.stderr)
+    out = docs.run(stacked_check_script(), repo.root, agent="Seo", extra_env={"STUB_BASE_REF": "main"})
+    assert out.returncode == 0 and "stacked PR: base=main (期待 develop)" in out.stdout, (out.stdout, out.stderr)
 
 
-@pytest.mark.parametrize("body", ["task 行の無い PR (人が作った)\\n", "task: ../etc/x\\n", f"task: no-such-mission/t001\\n",
-                                  f"task: {MISSION}\\n"])
-def test_worker_stacked_check_stops_when_the_task_line_does_not_name_a_task(repo, docs, body):
-    assert repo.pull().returncode == 0
-    p = docs.run(stacked_check_script(), repo.root, agent="Seo", extra_env={"STUB_PR_BODY": body, "STUB_BASE_REF": "main"})
-    assert p.returncode == 1, (p.stdout, p.stderr)
-    assert "PR base を決められない" in p.stderr
-    assert "stacked PR" not in p.stdout, "main と比べて stacked かどうかを決めない"
+def test_worker_stacked_check_stops_when_resolve_pr_cannot_decide_the_task(repo, docs):
+    """`plan resolve-pr` が決められない (card が無い・人が作った PR・曖昧 等) ときは main と比べて決めない。"""
+    assert repo.pull().returncode == 0   # t001 はあるが pr_number: 77 を持つ card はまだ無い
+    out = docs.run(stacked_check_script(), repo.root, agent="Seo", extra_env={"STUB_BASE_REF": "main"})
+    assert out.returncode == 1, (out.stdout, out.stderr)
+    assert "PR base を決められない" in out.stderr
+    assert "stacked PR" not in out.stdout, "main と比べて stacked かどうかを決めない"
 
 
 def test_director_reparent_uses_the_child_prs_task_from_a_shell_without_agent_or_assignment(repo, docs):

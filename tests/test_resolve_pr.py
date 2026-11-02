@@ -211,6 +211,37 @@ def test_target_dir_env_var_scopes_like_the_flag(repo, tmp_path):
     assert (out.returncode, out.stdout) == (0, f"{MISSION}/{t002}\n"), out.stderr
 
 
+@pytest.mark.parametrize("empty", ["", "   ", "\t"])
+def test_an_empty_target_dir_flag_is_refused_not_treated_as_omitted(repo, tmp_path, empty):
+    """`--target-dir "$var"` で var が想定外に空のとき、フラグ省略と同じに扱うと TARGET_DIR / crewvia 本体に
+    落ちて別 repo の同番号 PR の task を成功として返す (#339 の Codex P2)。exit 1・stdout 空・何も書かない。"""
+    _pull_and_done(repo, 77)
+    # env の TARGET_DIR が正しくても、渡されて空の flag は拒否 (env に落とさない)。
+    other = tmp_path / "other"
+    other.mkdir()
+    for env in (None, {"TARGET_DIR": str(other)}):
+        out = repo.plan("resolve-pr", "77", "--target-dir", empty, agent=None, extra_env=env)
+        assert_refused(out, "--target-dir")
+
+
+def test_an_empty_target_dir_flag_writes_nothing(repo):
+    _pull_and_done(repo, 78)
+
+    def snap():
+        return {str(p.relative_to(repo.queue)): p.read_bytes()
+                for p in sorted(repo.queue.rglob("*")) if p.is_file() and "audit" not in p.parts}
+    before = snap()
+    repo.plan("resolve-pr", "78", "--target-dir", "", agent=None)
+    repo.plan("resolve-pr", "78", "--target-dir", "   ", agent=None)
+    assert snap() == before
+
+
+def test_an_omitted_target_dir_flag_keeps_the_old_behaviour(repo):
+    _pull_and_done(repo, 79)
+    out = repo.plan("resolve-pr", "79", agent=None)
+    assert (out.returncode, out.stdout) == (0, f"{MISSION}/t001\n"), out.stderr
+
+
 # ---------------------------------------------------------------------------
 # 決められない: 0 件・2 件以上
 # ---------------------------------------------------------------------------

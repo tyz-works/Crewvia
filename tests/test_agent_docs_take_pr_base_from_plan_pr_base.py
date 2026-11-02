@@ -102,8 +102,7 @@ def repo(tmp_path):
     # `update --deliverable pr` の検査は `config/skill-permissions.yaml` と `hooks/lib_skill_perms.py` を読む。
     # `copy_plan_tree` は scripts/ しか写さないので、この本物の 2 つだけここで足す (t006)。
     shutil.copytree(REPO_ROOT / "config", r.root / "config")
-    (r.root / "hooks").mkdir()
-    shutil.copy2(REPO_ROOT / "hooks" / "lib_skill_perms.py", r.root / "hooks" / "lib_skill_perms.py")
+    shutil.copytree(REPO_ROOT / "hooks", r.root / "hooks")
     return r
 
 

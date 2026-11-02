@@ -987,7 +987,7 @@ QUEUE_MUTATING_SUBCOMMANDS = {
 #: queue を読むだけのサブコマンド = 生成を呼ばない経路。
 #: `task-graph` 自身もここ (queue は書き換えず、生成物だけを書く)。
 QUEUE_READONLY_SUBCOMMANDS = {
-    'lint', 'status', 'resync', 'dashboard-data', 'task-graph', 'resolve-mission', 'store-check', 'history', 'pr-base',
+    'lint', 'status', 'resync', 'dashboard-data', 'task-graph', 'resolve-mission', 'store-check', 'history', 'pr-base', 'resolve-pr',
 }
 
 #: crewvia の status → (plugin の status, title に付ける印)。

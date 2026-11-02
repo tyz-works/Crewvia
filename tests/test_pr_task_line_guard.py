@@ -162,3 +162,57 @@ def test_task_id_prefix_collision_is_not_treated_as_present(fake_repo):
     (fake_repo / "queue" / "assignments" / "Ingrid").write_text(f"{MISSION}:t1\n")
     cmd = f'gh pr create --title "x" --body "task: {MISSION}/t10\nbranch: foo"'
     assert _bash(fake_repo, cmd) == "deny"
+
+
+# --- 4 巡目 (Python ヘルパーへの移行) の回帰テスト ---
+# bash の sed/grep によるシェル構文解析をやめ、hooks/lib_pr_task_line_guard.py
+# (mask_quotes() の再利用 + shlex での argv トークナイズ) に移した。1〜3 巡目で
+# 指摘された「sed/grep でシェルを解析しようとして穴が出る」系統の欠陥がすべて
+# 解消していることを、本物の hook を subprocess で走らせて確かめる。
+
+
+def test_multiline_quoted_mention_is_not_a_false_positive(fake_repo):
+    # (a) 複数行の引用符内に "gh pr create --body" という文字列が (報告のための
+    # 言及として) 含まれるだけのケース。sed は行単位で正規表現を評価するため、
+    # 開きクォートと閉じクォートが別の物理行にまたがると、sed 版の実装は
+    # クォート区間だと認識できず、中の文字列 "gh pr create --body" が masked
+    # 文字列上に露出してしまい、誤って deny していた (2 巡目で直した穴)。
+    # mask_quotes() は文字単位でスキャンするため、改行をまたぐクォート区間でも
+    # 正しくマスクできることを確かめる。
+    cmd = (
+        './scripts/plan.sh done t001 "report:\n'
+        "gh pr create --body 'no task line here'\n"
+        'done" --execution ex-1'
+    )
+    assert _bash(fake_repo, cmd) != "deny"
+
+
+def test_apostrophe_in_double_quotes_in_compound_command_still_denies(fake_repo):
+    # (b) 二重引用符内のアポストロフィ (don't) を含む複合コマンド (&& でつながれた
+    # 複数の単純コマンド) の中に実物の gh pr create --body (task: 行無し) がある
+    # ケース。1 巡目の 2 パス sed はこのアポストロフィを誤ってクォート開始とみなし、
+    # 間にある実物の gh pr create ごと消してしまい、ガードが黙って発火しなくなって
+    # いた (P2-1)。新しい断片分割 (制御演算子でクォート外のみ分割) + shlex の下でも
+    # denyされ続けることを確かめる。
+    cmd = (
+        'echo "don\'t forget" && gh pr create --title "x" '
+        '--body "no task line here" && echo \'done\''
+    )
+    assert _bash(fake_repo, cmd) == "deny"
+
+
+def test_short_flag_b_and_pr_new_are_handled_like_body_and_create(fake_repo):
+    # (c) 短縮フラグ -b / エイリアス gh pr new。3 巡目まで文字列マッチ実装はどちらも
+    # 素通りしていた (検出漏れ)。shlex トークン化なら --body と同じ位置の引数として
+    # 扱える。
+    assert _bash(fake_repo, 'gh pr create --title x -b "no task line"') == "deny"
+    assert _bash(fake_repo, f'gh pr create --title x -b "task: {MISSION}/{TASK}"') != "deny"
+    assert _bash(fake_repo, 'gh pr new --title x --body "no task line"') == "deny"
+    assert _bash(fake_repo, f'gh pr new --title x --body "task: {MISSION}/{TASK}"') != "deny"
+
+
+def test_unparseable_command_fails_open(fake_repo):
+    # shlex.split が ValueError を投げる形 (閉じていない引用符) は deny しない
+    # (fail-open。Director の設計制約と同型)。
+    cmd = 'gh pr create --title x --body "unterminated'
+    assert _bash(fake_repo, cmd) != "deny"

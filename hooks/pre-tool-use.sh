@@ -490,7 +490,7 @@ if [ "$TOOL_NAME" = "Bash" ] && [ -n "$COMMAND" ]; then
   fi
 fi
 
-# --- PR task-line guard: gh pr create に task: <mission>/<task> 行を強制する
+# --- PR task-line guard: gh pr create/new に task: <mission>/<task> 行を強制する
 #     (t002, mission 20261102-pr-task-line) ---
 # 背景 (t001 の調査): agents/worker.md の PR 本文テンプレートは `task: ${TASK_MISSION}/${TASK_ID}`
 # 行を含むが、生の散文テンプレートでしかなく強制力が無い。実測で #327〜#336 の 10 本全てに
@@ -501,78 +501,56 @@ fi
 # ツールゲート側 (本ガード) に置く。crewvia_create_pr (scripts/git-helpers.sh) は実測で
 # 呼び出し元ゼロなので、そちらに注入しても効果が無い (t001 Result 参照)。
 #
-# 対象: TOOL_NAME=Bash の COMMAND が実際に `gh pr create` を呼び出している場合のみ。
-# 「実際に呼び出している」の判定は t015/t019 の task file guard と同じクォート除去方式を
-# 使う: シングル/ダブルクォートと二重クォートの区間を**1 回の交替パターンで左から順に**
-# 除去した文字列に対して `gh pr create` を探す。これにより
-# `plan.sh done t001 "report: gh pr create was run"` のような、報告のために文字列として
-# 言及しただけのコマンドを誤って deny しない (t019 と同型の誤検知を避ける)。
-# ★ シングル/ダブルを**別々の 2 パスで** sed することはしない (claude review t005 P2-1):
-#   二重引用符内にアポストロフィ (don't 等) があると、1 パス目 (シングルクォート除去) が
-#   その「'」を開始とみなし、後方にある無関係な「'」(例: echo 'done') と対で中身を
-#   丸ごと消してしまい、間にある実物の `gh pr create` ごと消える → ガードが黙って
-#   発火しなくなる (検出漏れが最悪の形で起きる)。1 回の交替 (`'[^']*'|"[^"]*"`) なら、
-#   左から見て最初に現れたクォート文字の種類で区間を閉じるため、二重引用符の中の
-#   アポストロフィを誤って区切りとして使わない。
-# ★ 既知の残存リスク: `bash -c "gh pr create ..."` のようにネストしたインタプリタに
-#   クォートごと丸投げする形は、クォート除去で中身ごと消えるため検出できない
-#   (= 見逃し方向のリスクで、誤検知方向のリスクより安全側に倒す判断。Director の
-#   設計制約 2「誤検知を防ぐこと」を優先した)。
+# 4 巡目 (このブロック): 1〜3 巡目はいずれも bash の sed/grep でシェル構文 (クォート・
+# `--body` の引数・compound command) を解析しようとして、潰すたびに新しい穴が出ていた
+# (1 巡目: 2 パス sed のクォート対応違い。2 巡目: 1 パスにしたが sed は行単位評価なので
+# 複数行の `--body` 値を正しく扱えない。加えて短縮フラグ `-b` / エイリアル `gh pr new` を
+# 素通りし、`grep -qF` の無アンカー一致で task id の接頭辞衝突 (`t1`/`t10`) も誤判定)。
+# 判定を hooks/lib_pr_task_line_guard.py に移した — hooks/lib_main_repo_git_guard.py +
+# 上の main repo git guard (:311-325) と同じ「bash はプレコンディションの確認と
+# assignments の解決だけ、構文解析は python に丸ごと委譲 + fail-open」という型。
+# クォートマスクは lib_main_repo_git_guard.mask_quotes() を import して再利用し (複数行の
+# クォート区間を正しく扱うことを Director が実測確認済み。独自に書き直さない)、
+# shlex で実際の argv にトークナイズしてから `--body` / `-b` の値だけを見る。詳細・既知の
+# 穴は hooks/lib_pr_task_line_guard.py のモジュール docstring と knowledge/pr-task-line-guard.md
+# を参照。
 #
 # mission_slug / task_id の解決は env の TASK_ID / CREWVIA_TASK_ID を直読みしない
 # (t014 の P1 インシデントと同じ理由: `.crewvia-env` の source や worker.md の
 # `export TASK_MISSION=...` は Bash tool の subshell 内に閉じており、hook プロセスには
 # 届かない)。既存の assignments ファイル (`queue/assignments/<AGENT_NAME>`、
-# 上の :128-139 の fallback と同じ仕組み) を直接読んで解決する。
+# 上の :128-139 の fallback と同じ仕組み) を直接読んで解決する — これは単純な
+# `mission:task` 形式のファイル読み取りであり、シェル構文の解析ではないため bash に残す。
 #
 # Director の設計制約 1 (fail-open): assignments から mission/task を解決できない
 # 場合 (AGENT_NAME 未設定・assignment ファイルが無い・形式が壊れている) は、
-# deny せずそのまま通す。Director 自身の PR・手動の PR・assignment を持たない
+# 空文字列のまま python へ渡す。lib_pr_task_line_guard.decide() はどちらかが空なら
+# 無条件に "OK" を返す。Director 自身の PR・手動の PR・assignment を持たない
 # セッションまで deny すると「誰も PR を出せなくなる」事故になるため。
-#
-# 対象外 (スコープ外。t001 Result の「未確認」に対応。Result に明記する既知の穴):
-#   - --body-file / ヒアドキュメント / 標準入力で本文を渡す形 (--body の引数として
-#     文字列を直接書く形だけを検出する。実測では Worker は常にこの形を使っている)。
-#     **コードもこの通りに動く**: クォート除去後の文字列に `--body` (`--body-file` は
-#     除く。`-file` が続く場合は対象にしない) が見当たらなければ、task: 行の有無を
-#     一切判定せず素通りする (claude review t005 P2-2 の修正。以前は --body-file /
-#     --fill / --web / --help まで「task: 行が無い」として deny しており、knowledge の
-#     この既知の穴の記述と実装が食い違っていた)
-#   - gh pr edit --body で後から行を消すケース (生成時点のガードのみ。Director の
-#     設計制約 4 への回答: 対象にしない。gh pr edit は PR 本文以外の目的でも
-#     頻繁に使われ、対象に含めると誤検知面が大きく広がるため)
 if [ "$TOOL_NAME" = "Bash" ] && [ -n "$COMMAND" ]; then
-  _PRLINE_NO_QUOTES="$(printf '%s' "$COMMAND" | sed -E "s/'[^']*'|\"[^\"]*\"//g")"
-  if printf '%s' "$_PRLINE_NO_QUOTES" | grep -qE '\bgh[[:space:]]+pr[[:space:]]+create\b' \
-     && printf '%s' "$_PRLINE_NO_QUOTES" | grep -qE -- '(^|[[:space:]])--body([[:space:]=]|$)'; then
-    _PRLINE_MISSION=""
-    _PRLINE_TASK=""
-    if [ -n "${AGENT_NAME:-}" ]; then
-      _PRLINE_ASSIGN_FILE="${_CREWVIA_REPO}/queue/assignments/${AGENT_NAME}"
-      if [ -f "$_PRLINE_ASSIGN_FILE" ]; then
-        _PRLINE_ASSIGN="$(cat "$_PRLINE_ASSIGN_FILE" | tr -d '\n')"
-        # ':' が無い (壊れた assignment ファイル) 場合は解決できなかった扱いにする
-        # (fail-open。mission/task が空のまま残る)
-        case "$_PRLINE_ASSIGN" in
-          *:*)
-            _PRLINE_MISSION="${_PRLINE_ASSIGN%%:*}"
-            _PRLINE_TASK="${_PRLINE_ASSIGN##*:}"
-            ;;
-        esac
-      fi
+  _PRLINE_MISSION=""
+  _PRLINE_TASK=""
+  if [ -n "${AGENT_NAME:-}" ]; then
+    _PRLINE_ASSIGN_FILE="${_CREWVIA_REPO}/queue/assignments/${AGENT_NAME}"
+    if [ -f "$_PRLINE_ASSIGN_FILE" ]; then
+      _PRLINE_ASSIGN="$(cat "$_PRLINE_ASSIGN_FILE" | tr -d '\n')"
+      # ':' が無い (壊れた assignment ファイル) 場合は解決できなかった扱いにする
+      # (fail-open。mission/task が空のまま残る)
+      case "$_PRLINE_ASSIGN" in
+        *:*)
+          _PRLINE_MISSION="${_PRLINE_ASSIGN%%:*}"
+          _PRLINE_TASK="${_PRLINE_ASSIGN##*:}"
+          ;;
+      esac
     fi
-    if [ -n "$_PRLINE_MISSION" ] && [ -n "$_PRLINE_TASK" ]; then
-      # task id の末尾が別の task id の接頭辞になるケース (例: t1 と t10) で
-      # grep -qF の無アンカー一致が誤って「ある」と判定しないよう、ERE メタ文字を
-      # エスケープした上で、一致の直後が英数字でないこと (または行末) を要求する
-      # (claude review t005 P3 の修正)。
-      _PRLINE_ESC_MISSION="$(printf '%s' "$_PRLINE_MISSION" | sed 's/\\/\\\\/g; s/[].[*^$(){}+?|]/\\&/g')"
-      _PRLINE_ESC_TASK="$(printf '%s' "$_PRLINE_TASK" | sed 's/\\/\\\\/g; s/[].[*^$(){}+?|]/\\&/g')"
-      if ! printf '%s' "$COMMAND" | grep -qE "task: ${_PRLINE_ESC_MISSION}/${_PRLINE_ESC_TASK}([^0-9A-Za-z]|\$)"; then
-        echo "[pre-tool-use] 🚫 gh pr create missing task: line: $(echo "$COMMAND" | head -c 200)" >&2
-        emit_decision "deny" "gh pr create の --body に 'task: ${_PRLINE_MISSION}/${_PRLINE_TASK}' 行がありません。review Worker が stacked PR を検出できなくなるため、--body にこの行 (と可能なら 'branch: <branch名>' 行) を足して再実行してください。"
-        exit 0
-      fi
+  fi
+  _PRLINE_GUARD_PY="${_CREWVIA_REPO}/hooks/lib_pr_task_line_guard.py"
+  if [ -f "$_PRLINE_GUARD_PY" ]; then
+    _PRLINE_RESULT="$(python3 "$_PRLINE_GUARD_PY" "$COMMAND" "$_PRLINE_MISSION" "$_PRLINE_TASK" 2>/dev/null || echo OK)"
+    if [ "$_PRLINE_RESULT" = "DENY" ]; then
+      echo "[pre-tool-use] 🚫 gh pr create missing task: line: $(echo "$COMMAND" | head -c 200)" >&2
+      emit_decision "deny" "gh pr create/new の --body (または -b) に 'task: ${_PRLINE_MISSION}/${_PRLINE_TASK}' 行がありません。review Worker が stacked PR を検出できなくなるため、--body にこの行 (と可能なら 'branch: <branch名>' 行) を足して再実行してください。"
+      exit 0
     fi
   fi
 fi

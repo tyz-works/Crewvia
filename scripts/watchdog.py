@@ -851,7 +851,11 @@ class WorkerMonitor:
         #    idle とは独立した天井。プロセス層では抑制しない — 長時間 task は
         #    task frontmatter の timeout.max で明示的に引き上げる運用のままにする
         #    (knowledge/daemon-authority.md §4-3 で started_at の起点見直しは
-        #    backlog 送りと決まっている)。
+        #    backlog 送りと決まっている)。この方針は変えていない — t002 (20261102-review-ci-timeout)
+        #    で足したのは「review skill の card には plan.sh add が timeout.max を自動で
+        #    書き込む」という card 生成時点の既定値の話で (config/crewvia.yaml の
+        #    timeout_max_per_skill)、この if 文が読むのは結局いつも通り card の timeout dict
+        #    (ここの判定ロジック・PROFILES には一切触れていない。knowledge/review-ci-wait-timeout.md)。
         #    C2 (t005): 利用枠切れで止まっていた時間 (免除して観測した分) は数えない。
         if now - self.started_at - self._limit_excluded > self.max_threshold:
             return CheckResult("terminate", "max_exceeded", idle_seconds, "not_probed", False)

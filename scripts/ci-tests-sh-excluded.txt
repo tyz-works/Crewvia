@@ -53,3 +53,4 @@ tests/red_proof_t055.sh | 1 回限りの historical red proof（CI 化しない�
 tests/red_proof_t110.sh | 1 回限りの historical red proof（CI 化しない）
 tests/red_proof_t113.sh | 1 回限りの historical red proof（CI 化しない）
 tests/red_proof_unobservable.sh | 1 回限りの historical red proof（CI 化しない）
+tests/red_proof_t002_review_ci_timeout.sh | 1 回限りの historical red proof（CI 化しない）

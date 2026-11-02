@@ -12,6 +12,16 @@
 #   ops_long     実測: 633–21701s → idle 3600s / max 14400s
 #   review       実測: 55–6590s   → feature_impl 相当 (review は code タスクと同等視)
 #
+# !! 2026-11-02 追記 (t002 / 20261102-review-ci-timeout) !!
+#
+# 上の review の行は「review 単体の作業時間」の実測であって、CI 完走待ち (pytest 実測 3975s)
+# を含まない。review skill の card が feature_impl の max 既定 (3600s) で CI 待ち中に
+# terminate される事故が 2 回起きたため (2026-09-13 / 2026-11-02)、**plan.sh add は
+# review skill の card に timeout.max=7200 を自動で書き込むようになった**
+# (`config/crewvia.yaml` の `timeout_max_per_skill`)。この既定は watchdog.py の
+# PROFILES にもこの yaml にも触れず、card の `timeout:` に直接書く (次の add から有効。
+# daemon restart 不要)。詳細: knowledge/review-ci-wait-timeout.md。
+#
 # !! 実装状況 (2026-09-21, t016 で確認) !!
 #
 # **scripts/watchdog.py はこのファイルを読んでいない。** 以前ここには

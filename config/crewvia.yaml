@@ -48,6 +48,32 @@ model_per_skill:
   # 未定義の skill (bash / code / typescript / python / database / cloud / ops)
   # は worker_model にフォールバックする
 
+# ===== skill 別 timeout.max 既定 (plan.sh add) =====
+# model_per_skill と同じパターン: plan.sh add は --max-timeout が明示されない card に、
+# ここから skill 一致で timeout.max の既定値を書き込む。**明示した値は上書きしない**
+# (起動のたびに手で覚える必要が無い)。複数 skill が異なる値にマッチしたら最も緩い
+# (max が大きい) 方を採る (config/timeout-profiles.yaml 末尾の既存の解決規則を踏襲)。
+# ここに列挙されていない skill は何もしない (feature_impl の既定 3600s のまま)。
+#
+# **timeout の正本は 3 か所に分かれている (混同しないこと。knowledge/review-ci-wait-timeout.md)**:
+#   1. scripts/watchdog.py の PROFILES — 実際に terminate を判定する値
+#      (モジュール定数。変更には daemon restart が要る)
+#   2. config/timeout-profiles.yaml  — plan.sh lint / run_verification_checks が読む
+#      境界チェック専用 (watchdog は読まない)
+#   3. ここ (timeout_max_per_skill)  — plan.sh add が card の timeout.max を自動で
+#      埋める既定値 (card に書き込まれた後は普通の card.timeout として #1 が解決する。
+#      daemon restart は不要 — watchdog は card の timeout を監視を始める時に読むので、
+#      ここを変えても watchdog プロセス自体の再起動は要らない。ただし**既に監視中の
+#      task には効かない** — WorkerMonitor は監視開始時に 1 回だけ束縛する
+#      (scripts/watchdog.py の WorkerMonitor.__init__。knowledge/review-ci-wait-timeout.md)
+#
+# review は CI 完走待ち (pytest 実測 3975s) を含むため、既定の feature_impl (3600s) では
+# 短すぎて待機中の Worker が殺される事故が起きた (2026-09-13 / 2026-11-02 再発。
+# 20261102-review-ci-timeout)。7200s (実測への安全率 約1.8) を既定にする。
+# CI がさらに長くなったら再検討すること。
+timeout_max_per_skill:
+  review: 7200
+
 # ===== 起動モード =====
 # tmux   — Director + Worker を tmux セッション "crewvia" 内に展開（並列 Worker 可）
 # herdr  — Director + Worker を herdr workspace "crewvia" 内に展開（並列 Worker 可）

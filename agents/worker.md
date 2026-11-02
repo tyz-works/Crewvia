@@ -1012,20 +1012,24 @@ gh pr view {PR番号} --json baseRefName -q .baseRefName
 ```
 
 その base を、**対象 PR の task の PR base**（mission の policy が決める値）と比べる。一致しなければ stacked PR。
-対象 PR の task は PR 本文の `task: <mission>/<tid>` 行から取り、**名指しの形**で `plan pr-base` に聞く
-（自分の review task ではなく対象 PR の task の値。所有者は見ない）:
+対象 PR の task は `plan resolve-pr <PR番号>` で **PR 番号から直接** 引く（PR 本文は解析しない。`task:` 行は
+人が PR を見て分かる表示として PR 本文に残っているだけで、判定の根拠にはしない）:
 
 ```bash
 PR_NUM={PR番号}
-TASK_LINE="$(gh pr view "$PR_NUM" --json body -q .body | sed -n 's/^task: //p' | head -1)"
-MISSION="${TASK_LINE%%/*}"; TID="${TASK_LINE#*/}"
+MISSION_TASK="$(plan resolve-pr "$PR_NUM")" || { echo "PR base を決められない。Director に報告して待つ" >&2; exit 1; }
+MISSION="${MISSION_TASK%%/*}"; TID="${MISSION_TASK#*/}"
 EXPECTED_BASE="$(plan pr-base --mission "$MISSION" --task "$TID")" || { echo "PR base を決められない。Director に報告して待つ" >&2; exit 1; }
 ACTUAL_BASE="$(gh pr view "$PR_NUM" --json baseRefName -q .baseRefName)"
 [ "$ACTUAL_BASE" = "$EXPECTED_BASE" ] || echo "stacked PR: base=$ACTUAL_BASE (期待 $EXPECTED_BASE)"
 ```
 
-- `task:` 行が無い PR（人が作った PR など）・card が読めない・exit 1 のときは、**main と比べて stacked かどうかを決めない**。
-  「PR base を決められない」を Director に報告し、merge の提案を保留する。
+- `plan resolve-pr` が task を一意に決められない（card が無い・人が作った PR・退避済み mission・曖昧 等）ときは、
+  **main と比べて stacked かどうかを決めない**。「PR base を決められない」を Director に報告し、merge の提案を保留する。
+- `plan resolve-pr` は PR 番号を repo で絞る（`pull` と同じ規則: 自分の `TARGET_DIR` があればそれ、無ければ
+  crewvia 本体）。review task の `target_dir` は対象 task と同じ値が付いているはずなので、ふだんは何もしなくてよい。
+  crewvia 本体のレビューで対象 PR が別 repo（TARGET_DIR）の場合など、`TARGET_DIR` だけでは絞り込めないときは
+  `plan resolve-pr "$PR_NUM" --target-dir <対象 task の target_dir>` を明示する。
 - stacked PR だったら Director に以下を提案する（`{EXPECTED_BASE}` は上で取った値）:
 
 > 「この PR は stacked 構造です。親 PR を squash merge すると子 PR が自動クローズされるリスクがあります。

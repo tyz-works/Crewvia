@@ -47,6 +47,9 @@ set -euo pipefail
 #   plan.sh update <task_id> [--mission <slug>] [--skills <csv>] [--blocked-by <csv>]
 #                            [--priority high|medium|low] [--worker <name>] [--status <status>]
 #                            [--description <text>] [--reset] [--deliverable pr|file|none]
+#                            [--idle-timeout <s>] [--max-timeout <s>]
+#                              既存 card の timeout.idle / timeout.max を書き換える唯一の非手編集の経路 (t002)。
+#                              既存の timeout dict は片方だけ渡した方だけ上書きしてマージする。
 #   plan.sh update <task_id> --close-execution [--mission <slug>]
 #                              task に触れず、Controller の外で手放されて active のまま残った試行 (終わった task に残った
 #                              running 等。store-check の execution_active_on_finished_task) を failed / ABANDONED_OUTSIDE_CONTROLLER で閉じる
@@ -2678,6 +2681,7 @@ USAGE = {
                '                       [--priority high|medium|low] [--worker <name>] [--status <status>]\n'
                '                       [--description <text>] [--reset] [--pr-number <N>]\n'
                '                       [--deliverable pr|file|none]\n'
+               '                       [--idle-timeout <s>] [--max-timeout <s>]\n'
                '       plan.sh update <task_id> --close-execution [--mission <slug>]'),
     'retry': 'plan.sh retry <task_id> --reason "<理由>" [--mission <slug>] [--over-cap "<理由>"]',
     'reopen': ('plan.sh reopen <task_id> --reason "<理由>" --branch reuse [--mission <slug>]\n'
@@ -3029,6 +3033,41 @@ def _reactivate_done_mission(slug, mission=None, via='', out=None):
     return True
 
 
+def _default_timeout_max_for_skills(skills):
+    """`config/crewvia.yaml` の `timeout_max_per_skill:` から、この card の skills に合う
+    timeout.max の既定値を解決する (t002 / 20261102-review-ci-timeout)。
+
+    review skill の card が CI 完走待ち (pytest 実測 3975s) で feature_impl の既定 3600s に
+    殺される事故 (2026-09-13 / 2026-11-02 再発) の恒久対応。`plan.sh add` が --max-timeout を
+    明示しない card に自動で書き込む (呼び出し元が「明示値があれば上書きしない」を保証する)。
+
+    複数 skill が異なる値にマッチしたら最も緩い (大きい) 方を採る
+    (config/timeout-profiles.yaml 末尾の既存の解決規則を踏襲。新しい規則を増やさない)。
+    config が読めない・`timeout_max_per_skill` が無い・型が壊れている・一致する skill が
+    無ければ None (Worker 起動を止めない。既定は従来どおり feature_impl の 3600s のまま)。
+
+    card の frontmatter と違う独自形式ではなく `lib_task_cards.parse_yaml` (の narrow subset)
+    を使う — **1 段の flat map に留めているのはこの制約のため**: この parser は 2 段ネストした
+    block map (`skill:\n    max: N`) の内側を黙って読み飛ばす (top レベルの正規表現が行頭の
+    インデント無ししか拾わない)。`timeout_max_per_skill: {review: 7200}` のような flat scalar
+    map だけがここで安全に読める (`attempts.max_total` と同じ深さ・同じパターン)。
+    """
+    config_path = os.path.join(REPO_ROOT, 'config', 'crewvia.yaml')
+    raw = _TASK_CARDS.read_regular_text_or_unreadable(config_path)
+    if _TASK_CARDS.is_unreadable(raw):
+        return None
+    try:
+        data = _TASK_CARDS.parse_yaml(raw, source='crewvia.yaml')
+    except ValueError:
+        return None
+    mapping = data.get('timeout_max_per_skill') if isinstance(data, dict) else None
+    if not isinstance(mapping, dict):
+        return None
+    candidates = [v for s, v in mapping.items() if s in skills
+                  and isinstance(v, int) and not isinstance(v, bool) and v > 0]
+    return max(candidates) if candidates else None
+
+
 def cmd_add(args):
     opts, positional = parse_opts(args, {
         '--mission': 'value',
@@ -3086,11 +3125,19 @@ def cmd_add(args):
             timeout['idle'] = int(opts['--idle-timeout'])
         except ValueError:
             die("--idle-timeout must be an integer number of seconds")
-    if opts.get('--max-timeout'):
+    explicit_max_timeout = opts.get('--max-timeout')
+    if explicit_max_timeout:
         try:
-            timeout['max'] = int(opts['--max-timeout'])
+            timeout['max'] = int(explicit_max_timeout)
         except ValueError:
             die("--max-timeout must be an integer number of seconds")
+    else:
+        # --max-timeout が明示されなければ skill 別既定で埋める (t002 / 20261102-review-ci-timeout)。
+        # 明示値がある card には絶対に触らない (上の分岐が先に timeout['max'] を確定させているので
+        # ここには来ない)。
+        default_max = _default_timeout_max_for_skills(skills)
+        if default_max is not None:
+            timeout['max'] = default_max
     timeout = timeout if timeout else None
 
     def _do():
@@ -6763,6 +6810,15 @@ def cmd_update(args):
                                [--status <status>]
                                [--description <text>]
                                [--reset]
+                               [--idle-timeout <s>] [--max-timeout <s>]
+
+    --idle-timeout / --max-timeout: 既存 card の timeout.idle / timeout.max を書き換える
+    (t002 / 20261102-review-ci-timeout)。既存の timeout dict の片方だけを持つ値はもう片方を
+    保つ (マージ)。壊れた値 (flow 形式の文字列等) を持つ card に対しても、指定した方は
+    正しい block 形式で書き直される。これが無かった頃は frontmatter 直編集が唯一の手段で、
+    `timeout: {max: 7200}` のような flow 形式を書くと `lib_task_cards.parse_yaml` が丸ごと
+    1 本の文字列として読み、watchdog.py の `timeout.get("max")` が `AttributeError` になる
+    罠があった。
 
     --reset sets: status=pending, worker=null, started_at=null, completed_at=null
     --reset と、status を動かす更新 (failed からの --status 等) は前回の FAIL の証拠
@@ -6793,6 +6849,8 @@ def cmd_update(args):
         '--pr-number': 'value',
         '--deliverable': 'value',
         '--close-execution': 'bool',
+        '--idle-timeout': 'value',
+        '--max-timeout': 'value',
     })
 
     if not positional:
@@ -6817,6 +6875,20 @@ def cmd_update(args):
     valid_statuses = TASK_STATUSES
     if status and status not in valid_statuses:
         die(f"invalid status '{status}'. Valid statuses: {', '.join(sorted(valid_statuses))}")
+
+    # Validate --idle-timeout / --max-timeout if given (add と同じ検証。t002)
+    idle_timeout_opt = opts.get('--idle-timeout')
+    if idle_timeout_opt:
+        try:
+            int(idle_timeout_opt)
+        except ValueError:
+            die("--idle-timeout must be an integer number of seconds")
+    max_timeout_opt = opts.get('--max-timeout')
+    if max_timeout_opt:
+        try:
+            int(max_timeout_opt)
+        except ValueError:
+            die("--max-timeout must be an integer number of seconds")
 
     # Holder for reset worker info (populated inside _do, used after with_lock)
     # [0] = old worker name, [1] = slug (for assignment content verification)
@@ -6983,6 +7055,20 @@ def cmd_update(args):
         if deliverable is not None:
             meta['deliverable'] = deliverable
             changed.append(f"deliverable={deliverable}")
+
+        if idle_timeout_opt or max_timeout_opt:
+            # 既存の timeout dict とマージする (--max-timeout だけ渡したら idle は保つ)。
+            # 既存値が壊れている (flow 形式が str として読まれた等) ときは dict でないので
+            # 捨てて新しく作る — これが plan.sh update で壊れた timeout を直す唯一の経路 (t002)。
+            existing_timeout = meta.get('timeout')
+            new_timeout = dict(existing_timeout) if isinstance(existing_timeout, dict) else {}
+            if idle_timeout_opt:
+                new_timeout['idle'] = int(idle_timeout_opt)
+                changed.append(f"timeout.idle={new_timeout['idle']}")
+            if max_timeout_opt:
+                new_timeout['max'] = int(max_timeout_opt)
+                changed.append(f"timeout.max={new_timeout['max']}")
+            meta['timeout'] = new_timeout
 
         if not changed:
             print(f"update {slug}/{task_id}: nothing to do (no fields specified)", file=sys.stderr)

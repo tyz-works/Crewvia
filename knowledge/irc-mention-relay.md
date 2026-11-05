@@ -118,7 +118,7 @@ Authorization: Bearer …
 ### 2-3. `GET /v1/health`
 
 認証つき (§2-1)。`{"api":1,"epoch":"7f3a9c21","bot":"irc-relay 0.1.0","irc":"connected","persist":"ok","now":1762300100,"head_id":44}`
-(付録 A-9)。`irc` は `connected` / `disconnected`、`persist` は `ok` / `failing` (§4-4)。crewvia の dispatcher は使わない
+(付録 A-9)。`irc` は `connected` / `disconnected`、`persist` は `ok` / `failing` (§3-6。`failing` の間も応答は committed だけ)。crewvia の dispatcher は使わない
 (ユーザーが tailnet から `curl` で疎通を見るため)。
 
 ### 2-4. 期限切れ・古い id・世代の扱い
@@ -253,6 +253,13 @@ Authorization: Bearer …
 
 - **書き込みは原子的**: 同じディレクトリの一時ファイルに書く → `fsync` → `rename` → ディレクトリを `fsync`。変更ごとに書く (同じイベントループの 1 周の中の変更は 1 回にまとめてよい)。
 - `next_id` は `entries` と**同じファイルに同時に**書く (採番が永続化より先に進まない = 再起動で id が戻らない)。
+- **公開は永続化の後だけ (commit-before-publish)**: bot は状態を 2 つ持つ。
+  **committed** = 最後に `rename` + `fsync` まで成功した `inbox.json` の中身。**staged** = 受信したがまだ書けていない発言・掃除の結果。
+  `GET /v1/mentions` の `mentions` / `head_id` / `cursor` / `gap` / `lost_up_to` は**すべて committed だけから**作る (staged は 1 件も見せない)。
+  staged の発言には採番もしない: id は**書き込みの直前に `next_id` から割り当て、その書き込みが成功した後で初めて committed になる**。
+  よって「HTTP で配った id が再起動後に別の発言で再利用される」ことは起きない (配った id は必ずディスクに在る)。
+  書き込みが失敗した間、staged に溜められる発言は 200 件まで (超えたら新しい方を捨て、成功後の最初の発言の `suppressed_before` に数える)。
+- **登録の変更 (`!watch` / `!unwatch`) も同じ**: `registry.json` の書き込みが成功してから成功の返事をする (失敗なら `保存できなかったため変更していません` を返し、メモリ上の登録も変えない)。
 - **上限**: 本文 400 文字 (超えたら切って `truncated=true`)、名前ごと 100 件 (超えたら**古い方から捨てる**)、全体 2000 件。
   捨てた分は `lost_up_to[instance]` を更新し、その名前の次の発言の `suppressed_before` に件数を足す。
 - **レート制限** (非オペでも `@Sora` は誰でも打てる): 名前ごとに 1 分 20 件、(発言者 nick, 名前) ごとに 1 分 5 件。超えた分は**保存せず**、`suppressed_before` に数える (次に保存される発言に載る)。
@@ -265,7 +272,8 @@ Authorization: Bearer …
 |---|---|
 | `registry.json` / `inbox.json` が無い | 新規作成 (`inbox.json` は新しい `epoch`)。 |
 | 読めない・JSON として壊れている・`version` が違う・欄の型が違う | **起動しない** (終了コード 78・ログに `state_corrupt:<ファイル名>` だけ。内容は出さない)。静かに空にして続けない (登録が消える・id が戻る)。復旧はユーザーが手で退避・削除 |
-| 書き込みに失敗 (ディスク満杯など) | メモリ上の状態を正として動き続け、`/v1/health` の `persist` を `failing` に。1 分に 1 回ログ。次の変更で再試行。落ちると失われる |
+| `inbox.json` の書き込みに失敗 (ディスク満杯など) | **committed を正として動き続け、staged は公開しない** (§3-5)。`/v1/health` の `persist` を `failing` に。1 分に 1 回ログ (`persist_failed`)・10 秒ごとに再試行。成功したら staged を採番して committed にし `ok` に戻る。再試行の間に落ちると staged の発言は失われる (**id は配っていないので単調性は壊れない**。失うのは未公開の発言だけ) |
+| `registry.json` の書き込みに失敗 | 変更を取り消し (メモリ上の登録は元のまま)、コマンドの返事で失敗を伝える (§3-5)。`persist` は `failing` |
 | 設定が不正 (`http.bind` が許可外・token ファイルが 0600 でない・32 バイト未満) | 起動しない (終了コード 78) |
 
 ## 4. crewvia 側の約束事
@@ -296,9 +304,13 @@ irc:
   **`CREWVIA_IRC_*` の env は読まない** (Telegram と同じ。`knowledge/director-escalation-telegram.md` §1-1)。
 - `source` 未設定または `enabled: false` → **何も読まず・書かず・送らない** (`registry/daemons/irc-*.json` を作らない)。
   例外は `irc-receiver.json` が既にあるときの `enabled: false` への書き換えだけ (Telegram の受信側と同じ)。
-- 取り出し: **`lib_telegram` の低レベル関数を再利用する** (0600・所有者・symlink の検査 `_read_file_credentials`、`op` の呼び出し `_read_op`)。コピーしない。
-  公開名に直す必要があれば t007 の中で名前だけ変える (Telegram の挙動とテストは変えない)。`resolve_credentials` に相当する `lib_irc_relay.resolve_token(config, environ, carried=False)` が**唯一の解決口**。
-  トークンは 1 つ (chat_id の相当物は無い)。
+- 取り出し: **`lib_telegram` の `_read_file_credentials` はそのままでは使えない** (中で `bot_token=` / `chat_id=` を解析し、Telegram 固有の `_validated` で**両方**を検査して返すため、IRC の単一トークンのファイルは `credential_invalid` になる)。
+  そこで t007 で **「安全に開く」部分と「解析・検証」部分を分ける**:
+  - 共通関数 `read_secret_file_text(path, euid) -> (text | None, reason)` を `lib_telegram` に切り出す (中身は今の `_read_file_credentials` の前半そのまま: `lstat` → 通常ファイル・所有者・group/other ビット 0 → `O_NOFOLLOW|O_NONBLOCK` で開く → `fstat` で inode 照合 → 64KB まで読む。権限が合わなければ**中身を開かない**。理由コードは `credential_file_missing` / `credential_file_permissions` のまま)。
+  - `lib_telegram._read_file_credentials` は `read_secret_file_text` + 既存の `bot_token=` / `chat_id=` 解析 + `_validated` に**書き換えるだけ** (挙動・理由コード・既存テストは変えない。t007 の PR で既存の Telegram テストが無変更で通ることを確かめる)。
+  - IRC 側 `lib_irc_relay` は `read_secret_file_text` + 自前の解析・検証: 前後の空白を除いた中身が**1 行**で、`^[A-Za-z0-9._~+/=-]{32,256}$` に一致すること (複数行・空・形違いは `credential_invalid`。bot の `token` ファイルと同じ形式)。値は理由コードにもログにも出さない。
+  - `op` の呼び出し `_read_op` は解析を持たない汎用関数なので、そのまま共有してよい (戻りを IRC 側で同じ正規表現にかける)。コピーしない。
+  `resolve_credentials` に相当する `lib_irc_relay.resolve_token(config, environ, carried=False)` が**唯一の解決口**。トークンは 1 つ (chat_id の相当物は無い)。
 
 ### 4-2. dispatcher のサイクルへの差し込み
 
@@ -324,7 +336,7 @@ irc:
 
 ```json
 {"version":1,"epoch":"7f3a9c21","cursor":43,"skew":-1.5,"last_poll_at":1762300100.0,
- "pending":[{"id":41,"ts":1762300000,"name":"sora","kind":"channel","channel":"#crewvia","sender":"tyz","account":"tyz",
+ "pending":[{"epoch":"7f3a9c21","id":41,"ts":1762300000,"name":"sora","kind":"channel","channel":"#crewvia","sender":"tyz","account":"tyz",
              "text":"@Sora PR 340 を見てくれる?","truncated":false,"suppressed_before":0,"attempts":0,"last_attempt_at":null}]}
 ```
 
@@ -335,7 +347,10 @@ irc:
 - **配達は at-least-once**: 送ってから `pending` から外す。送った直後に落ちると次のサイクルで同じ発言がもう一度出る。
   行に `id=<epoch>:<id>` が出るので、エージェントは重複に気付ける。重複を許す理由: 「届かない」の方が「2 回出る」より悪い通知だから。
 - `pending` が 200 件に達したら**取りに行かない** (`cursor` を進めない = bot が 24 時間預かる)。ログに `pending_full`。配達が進めば再開する。
-- `epoch` が前回と違えば `cursor` を 0 にして新しい `epoch` を記録する。`pending` は残す (`id` は epoch と対で扱う)。
+- **`pending` の各要素は受信した時点の `epoch` を持つ** (トップレベルの `epoch` は「`cursor` が属する世代」で、要素の世代ではない)。
+  要素の同一性・重複排除・画面の `id=<epoch>:<id>` は**必ず要素の `epoch` と `id` の対**で扱う。
+- `epoch` が前回と違えば `cursor` を 0 にして**トップレベルの** `epoch` を新しくする。`pending` は残し、**要素の `epoch` は書き換えない** (古い世代の `41` と新しい世代の `41` は別の発言)。
+  取得した発言を `pending` に足すときは、応答の `epoch` を各要素に写す。`irc_state_problem()` は要素に `epoch` (8 桁 hex) が無い状態ファイルを不正とする。
 
 ### 4-4. 宛先の解決 (名前 → 生きている窓)
 
@@ -351,7 +366,7 @@ irc:
 
 1. 期限切れを捨てる。
 2. `pending` を古い順に走査し、**名前ごとに窓を解決**する。窓が無い名前は飛ばす。
-3. **画面が受け取れる状態か**を確かめる (§6-1)。受け取れない・確認できない窓は**この周期は送らない**。
+3. **画面が受け取れる状態か**を確かめる (§6-1。確認ダイアログが無く、かつ**入力欄が空**であること)。受け取れない・下書きがある・確認できない窓は**この周期は送らない**。
 4. 上限を守って送る: 1 サイクルに合計 `max_deliver_per_cycle` 行、名前あたり `max_deliver_per_name_per_cycle` 行まで。
    名前ごとの未配達が上限を超えるときは、**最も古い 1 件を普通の行で送り、残りは省略行 1 行にまとめる**(§6-3)。省略した分は `pending` から外し、ログに id の範囲と件数を出す。
    サイクルの合計上限で送れなかった名前は次のサイクルに回す (省略ではない)。
@@ -403,10 +418,15 @@ irc:
 1. **接頭辞は数字で始めない** (§6-2)。ダイアログの数字選択に本文が食われない。ただし Enter は別なので 1 だけでは足りない。
 2. **送る前に `mux.capture(<窓>)` で画面を読み**、次を**全部**満たすときだけ送る:
    (a) 末尾の数行に Claude の入力欄 (`❯` で始まる行) があり、その行が選択肢でない (`❯ 1.` のように `❯` の直後が数字+`.` でない)、
-   (b) 末尾の 30 行に確認ダイアログの印 (`Do you want to` / `Esc to cancel` / `[y/N]` / 番号つき選択肢の行) が**無い**。
+   (b) 末尾の 30 行に確認ダイアログの印 (`Do you want to` / `Esc to cancel` / `[y/N]` / 番号つき選択肢の行) が**無い**、
+   (c) **入力欄が空**: (a) の `❯` の行で、`❯` と空白を除いた残りが空 (人が打ちかけの文章・貼り付けた下書きが無い)。
+       `lib_mux.send` は送信前に `C-u` で入力欄を消す (再送で文が連結しないため) ので、**空でない欄に送ると下書きが失われる**。
+   **入力欄が空でない → `draft`: 送らず次のサイクルへ延期**する (`attempts` は増やさない・ログに `deferred_draft`。24 時間のうちに空けば届く)。
    **読めない・空・判定できない → 送らない** (次のサイクルへ回す。24 時間のうちに空けば届く)。
-   `lib_mux` の `_text_in_input_line` と同じ「末尾の窓で `❯` を探す」作りにする (全画面を探さない = スクロールバックの古い `❯` を拾わない)。判定は**純粋関数** (画面の文字列 → `ready` / `dialog` / `unknown`) にして、固定の画面サンプルで網羅テストする。
-3. 残る隙間 (確認と送信の間の数百 ms に画面が変わる) は**対象外**と明記する。画面を読んでも完全には塞げない。
+   `lib_mux` の `_text_in_input_line` と同じ「末尾の窓で `❯` を探す」作りにする (全画面を探さない = スクロールバックの古い `❯` を拾わない)。判定は**純粋関数** (画面の文字列 → `ready` / `dialog` / `draft` / `unknown`。`ready` は (a)(b)(c) すべてを満たすときだけ) にして、固定の画面サンプルで網羅テストする。
+   (c) の既知の弱点: `capture` は文字だけで見た目 (色・薄字) が無いので、Claude Code が入力欄に出す**薄字の入力候補**と人が打った文字を区別できない。
+   候補が出ている画面も `draft` として延期する (安全側。下書きを消す側には倒さない)。候補が出たままだと届かないので §11-11 に残す。
+3. 残る隙間 (確認と送信の間の数百 ms に画面が変わる・確認の後に人が打ち始める) は**対象外**と明記する。画面を読んでも完全には塞げない。
    Worker は既定が `auto` (対話プロンプトなし) なので影響は主に Director。**Director にだけダイアログ待ちが続くと、IRC の通知は届かない側に倒れる** (危険な側に倒れない)。
 
 ### 6-2. 画面に出す 1 行の形と無害化
@@ -546,6 +566,8 @@ crewvia 側の追記 (t007 で行う): CLAUDE.md の「不変条件 7」に `irc
 8. **bot の HTTPS 化** (tailnet の証明書 `tailscale cert`): v1 は WireGuard の上の平文 HTTP。
 9. 複数トークン (consumer ごと)・トークンのローテーション手順。
 10. 本物の Ergo の `CASEMAPPING` が `precis` だった場合の nick / チャンネル比較 (§3-1 は `ascii` に倒す)。実機で ISUPPORT を確かめる (t004 の結合確認)。
+11. **入力候補で `draft` が続く**: 薄字の入力候補と下書きを `capture` で区別できないので、候補が出たままの Worker/Director には届かない側に倒れる (§6-1)。
+    対策案: (a) `lib_mux` に「欄を消さずに送る」「欄の色付き capture を返す」口を足す、(b) 延期が一定時間続いたらユーザーに通知だけする。v1 は延期のみ。
 
 ---
 

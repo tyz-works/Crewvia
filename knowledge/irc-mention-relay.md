@@ -331,16 +331,18 @@ irc:
 |---|---|---|---|
 | `irc-state.json` | dispatcher (poll と配達) | `identity` / `epoch` / `cursor` / `skew` / `last_poll_at` / `pending[]` | 受信箱に残っている最大 24 時間分が**もう一度届く** (重複はあるが失われない)。未配達の `pending` は bot から取り直される |
 | `irc-quarantine.json` | dispatcher (identity が変わったときだけ) | 旧 identity の `pending[]` の退避 (配達しない。件数と退避した時刻・旧 identity の指紋だけを `irc-receiver.json` に出す) | 退避された未配達が**永久に失われる** (24 時間で価値が無くなる通知なので許容。復旧手順の 1 つ) |
-| `irc-receiver.json` | dispatcher | `enabled` / `checked_at` / `reason` / `api` / `last_ok_at` / `pending_count` (固定コードと数だけ。トークン・URL の中身は書かない) | 次のサイクルで書き直される |
+| `irc-receiver.json` | dispatcher | `enabled` / `checked_at` / `reason` / `api` / `last_ok_at` / `pending_count` と、退避したときだけ `quarantine` = `{count, at, from}` (`from` は旧 identity の指紋 16 桁。固定コードと数だけ。トークン・URL の中身は書かない。心拍は 60 秒) | 次のサイクルで書き直される |
 
 `irc-state.json`:
 
 ```json
 {"version":1,"identity":{"instance":"wsl","endpoint":"c0ffee1234abcd56"},"epoch":"7f3a9c21","cursor":43,"skew":-1.5,"last_poll_at":1762300100.0,
+ "fail_streak":0,"bad_streak":0,
  "pending":[{"epoch":"7f3a9c21","id":41,"ts":1762300000,"name":"sora","kind":"channel","channel":"#crewvia","sender":"tyz","account":"tyz",
              "text":"@Sora PR 340 を見てくれる?","truncated":false,"suppressed_before":0,"attempts":0,"last_attempt_at":null}]}
 ```
 
+- `fail_streak` = 取得に失敗した連続回数（間隔を倍にする根拠・成功で 0。401 / 404 / 版違いは 12 に固定して間隔を最大にする）、`bad_streak` = 応答が不正だった連続回数（成功で 0）。通知の判定（§5-1）はこの 2 つ。
 - 読み書きは **`lib_daemon_state.load_json_store` の入口**と `told_lock` + `write_told_atomic`。形の検証は `irc_state_problem()` (書き手も同じ関数)。
   **`Unreadable` を `{}` / `[]` に潰さない**。`pending` の `text` は**無害化済み** (§6-2) の文字列だけを持つ。
 - **`identity` = 「この `cursor` と `pending` が誰のものか」**。`instance` は config の `irc.instance` を §3-1 の `fold` にかけた値、
@@ -356,7 +358,8 @@ irc:
   書く前に落ちたら次の周期で同じ範囲を取り直す (失われない・重複しない)。
 - **配達は at-least-once**: 送ってから `pending` から外す。送った直後に落ちると次のサイクルで同じ発言がもう一度出る。
   行に `id=<epoch>:<id>` が出るので、エージェントは重複に気付ける。重複を許す理由: 「届かない」の方が「2 回出る」より悪い通知だから。
-- `pending` が 200 件に達したら**取りに行かない** (`cursor` を進めない = bot が 24 時間預かる)。ログに `pending_full`。配達が進めば再開する。
+- **取得件数は空きに合わせる** (t003 の Codex 3 巡目 P2-2): 各取得の前に `limit = min(50, 200 − len(pending))`。空きが 0 (`pending` が 200 件) なら**取りに行かない** (`cursor` を進めない = bot が 24 時間預かる)。ログに `pending_full`。配達が進めば再開する。
+  応答の `mentions` の件数が `limit` を超えていたら応答全体を捨てる (`bad_shape`)。これで「保持しなかった entry より先へ cursor を進める」ことが起きない (`has_more` なら `cursor` は返した最後の `id`、そうでなければ `head_id` = 他の instance の id を飛び越えるだけ)。
 - **`pending` の各要素は受信した時点の `epoch` を持つ** (トップレベルの `epoch` は「`cursor` が属する世代」で、要素の世代ではない)。
   要素の同一性・重複排除・画面の `id=<epoch>:<id>` は**必ず要素の `epoch` と `id` の対**で扱う。
 - `epoch` が前回と違えば `cursor` を 0 にして**トップレベルの** `epoch` を新しくする。`pending` は残し、**要素の `epoch` は書き換えない** (古い世代の `41` と新しい世代の `41` は別の発言)。
@@ -380,7 +383,9 @@ irc:
 4. 上限を守って送る: 1 サイクルに合計 `max_deliver_per_cycle` 行、名前あたり `max_deliver_per_name_per_cycle` 行まで。
    名前ごとの未配達が上限を超えるときは、**最も古い 1 件を普通の行で送り、残りは省略行 1 行にまとめる**(§6-3)。省略した分は `pending` から外し、ログに id の範囲と件数を出す。
    サイクルの合計上限で送れなかった名前は次のサイクルに回す (省略ではない)。
-5. 送れたら `attempts` を進めて `pending` から外す (送信失敗は `attempts`・`last_attempt_at` を更新して残す)。
+5. **送ったら `mux.verify_sent()` で、文が入力欄に残っていないことを確かめる** (t003 の Codex 3 巡目 P2-1。`lib_mux.send()` の成功は配達を意味しない: tmux は戻り値を見ず、herdr は入力欄に残っても True)。確かめられたものだけを `pending` から外す。
+   `send` が False・`verify_sent` が False か例外 (画面を読めない・入力欄に残っている) は **`pending` から消さずに残し**、`attempts` と `last_attempt_at` を更新して、その窓にはこのサイクルはもう送らない (at-least-once)。0.5 秒あけて 1 回だけ確かめ直す。
+   省略行 (§6-3) も同じで、確かめられなければ省略した**全件**を残す (送れていない件数を黙って捨てない)。
 
 ## 5. 壊れた入力・落ちたとき (止まる側に倒す)
 

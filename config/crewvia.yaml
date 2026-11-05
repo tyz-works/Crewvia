@@ -299,3 +299,34 @@ telegram:
     chat_id_ref: ""               # source: op のとき。例 op://<vault>/<item>/chat_id
     file: ""                      # source: file のとき。例 ~/.local/share/crewvia/telegram.env
     op_command: op                # 1Password CLI のコマンド名（PATH に無い場合は絶対パス）
+
+# ---------------------------------------------------------------------------
+# IRC 呼びかけ中継（常駐 bot `tyz-works/irc-relay` の受信箱を取りに行き、エージェントの画面へ届ける）
+# 設計: knowledge/irc-mention-relay.md
+# **enabled が true でなければ何も起きない**（何も読まず・書かず・送らない）。url / instance / 認証情報は
+# 運用の値なので**コミットに入れない**（空のまま。ローカルでだけ設定する）。
+#
+# url        bot の HTTP。`http://` は tailnet（100.64.0.0/10）か loopback の IP リテラルだけ。名前解決が要る host は `https://`。
+# instance   bot の `!watch <Name> <instance>` と同じ環境名（例 wsl）。自分の instance 宛だけ取る。
+# 認証情報   token の値を書かない。取り出し方を 1 つだけ選ぶ（Telegram と同じ）:
+#   source: op    1Password CLI。token_ref に op://… の参照だけを書く。dispatcher が起動時（respawn のたび）に 1 回取り出す。
+#   source: file  リポジトリ外の権限 0600 の 1 ファイル。中身は token 1 行（32〜256 文字の [A-Za-z0-9._~+/=-]）。
+# `CREWVIA_IRC_*` の env は読まない。
+# allowed_targets  届けてよい窓の種類。Worker は既定が auto（対話プロンプトなし）で、画面に入った文を実行に移しやすい。
+#                  最初の運用は [director] だけに絞るのを推奨（設計 §11-2）。
+# ---------------------------------------------------------------------------
+irc:
+  enabled: false
+  url: ""                         # 例 http://100.103.92.67:8765
+  instance: ""                    # 例 wsl
+  poll_interval_seconds: 10       # 下限 5。失敗が続くと倍々（最大 300 秒）
+  request_timeout_seconds: 5      # 1〜6
+  max_deliver_per_cycle: 3        # 1 サイクルに画面へ送る行の合計の上限
+  max_deliver_per_name_per_cycle: 2
+  max_text_chars: 300             # 画面に出す本文の長さ（上限 500）
+  allowed_targets: [director, worker]
+  credentials:
+    source: ""                    # "" = 未設定 / op / file
+    token_ref: ""                 # source: op のとき。例 op://<vault>/<item>/token
+    file: ""                      # source: file のとき。例 ~/.local/share/crewvia/irc-relay.token
+    op_command: op                # 1Password CLI のコマンド名（PATH に無い場合は絶対パス）

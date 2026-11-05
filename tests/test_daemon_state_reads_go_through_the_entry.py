@@ -214,6 +214,16 @@ ALLOWED_JSON_PARSES: dict[tuple[str, str, str], str] = {
     ("lib_telegram.py", "run_cycle", "json.loads(proc.stdout)"):
         _EXTERNAL_RESPONSE + "dispatcher が起動した `poll` サブプロセスの標準出力 (要約 JSON)。壊れていれば `poll_failed` = "
         "「今回は何も受けなかった」で次のサイクルへ。要約はログ用で、判断 (転送・答えの確定) は台帳 (入口を通る) だけが根拠",
+    # -- (E) IRC relay bot の HTTP 応答 / poll サブプロセスの標準出力 (t007) --------------
+    ("lib_irc_relay.py", "parse_response", "json.loads(bytes(body).decode('utf-8'))"):
+        _EXTERNAL_RESPONSE + "relay bot の `GET /v1/mentions` の 200 の本文 (1MiB 以内)。壊れていれば `bad_json`、形が違えば `bad_shape` = "
+        "**応答の全体を捨てる** (一部だけ採用しない・状態を変えない)。外側 (dict か) の直後に `api` / `epoch` / `instance` / `cursor` / "
+        "`mentions[]` の各要素を欄ごとに検証してから pending に写す (形の検証はこの関数の中。`_parse_mention`)",
+    ("lib_irc_relay.py", "parse_conflict", "json.loads(bytes(body or b'').decode('utf-8'))"):
+        _EXTERNAL_RESPONSE + "relay bot の 409 `after_ahead` の本文。`error` と `epoch` (8 桁 hex) を検証し、合わなければ None = `bad_shape` として捨てる",
+    ("lib_irc_relay.py", "_run_poll", "json.loads(proc.stdout)"):
+        _EXTERNAL_RESPONSE + "dispatcher が起動した `poll` サブプロセスの標準出力 (要約 JSON)。壊れていれば `poll_failed` = 「今回は何も受けなかった」で次のサイクルへ。"
+        "要約は通知の材料 (固定コードと数だけ) で、判断 (配達・cursor) は状態ファイル (入口を通る) だけが根拠",
     # -- (E) Taskvia の HTTP 応答 --------------------------------------------
     ("plan.sh", "_taskvia_request", "json.loads(resp.read().decode())"):
         _EXTERNAL_RESPONSE + "Taskvia の HTTP 応答。同期は best-effort (Taskvia 非依存)",

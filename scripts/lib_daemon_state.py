@@ -536,3 +536,180 @@ def telegram_receiver_problem(data):
     if extra:
         return f'unexpected fields {sorted(extra)!r}'
     return None
+
+
+# ---------------------------------------------------------------------------
+# IRC 呼びかけ中継 (knowledge/irc-mention-relay.md §4-3)。書き手 (lib_irc_relay) も同じ関数で検証する。
+# ---------------------------------------------------------------------------
+
+#: `irc-state.json` の `pending` の上限 (§4-3)。lib_irc_relay.PENDING_MAX と同じ値 (そちらはここを import する)。
+IRC_PENDING_MAX = 200
+IRC_NAME_MAX = 32
+IRC_ID_MAX = 2 ** 53          # JSON の整数として安全な範囲
+
+
+def _irc_is_int(value, minimum=0):
+    return isinstance(value, int) and not isinstance(value, bool) and minimum <= value <= IRC_ID_MAX
+
+
+def _irc_is_name(value):
+    """bot が返す `name` (= `fold` 済み。ASCII の英数字・_・- の 1〜32 文字、先頭は英数字、大文字を含まない)。"""
+    if not (isinstance(value, str) and 1 <= len(value) <= IRC_NAME_MAX):
+        return False
+    if not (value[0].isascii() and value[0].isalnum()):
+        return False
+    return all(c.isascii() and (c.isalnum() or c in '_-') and not c.isupper() for c in value)
+
+
+def irc_pending_entry_problem(entry):
+    """`irc-state.json` の `pending[]` の 1 要素が使えない理由 (使えれば `None`)。読み手が `[]` で読む欄は全部必須。"""
+    if not isinstance(entry, dict):
+        return 'a pending entry is not an object'
+    if not _is_hex(entry.get('epoch'), 8):
+        return "pending 'epoch' is not 8 hex"
+    if not _irc_is_int(entry.get('id'), 1):
+        return "pending 'id' is not a positive integer"
+    if not _irc_is_int(entry.get('ts'), 0):
+        return "pending 'ts' is not a non-negative integer"
+    if not _irc_is_name(entry.get('name')):
+        return "pending 'name' is not a folded name"
+    if entry.get('kind') not in ('channel', 'dm'):
+        return "pending 'kind' is not channel|dm"
+    channel = entry.get('channel')
+    if (entry['kind'] == 'dm') != (channel is None) or not (channel is None or isinstance(channel, str)):
+        return "pending 'channel' does not match 'kind'"
+    if not isinstance(entry.get('sender'), str):
+        return "pending 'sender' is not a string"
+    account = entry.get('account')
+    if account is not None and not isinstance(account, str):
+        return "pending 'account' is not a string or null"
+    if not isinstance(entry.get('text'), str):
+        return "pending 'text' is not a string"
+    if not isinstance(entry.get('truncated'), bool):
+        return "pending 'truncated' is not a boolean"
+    if not _irc_is_int(entry.get('suppressed_before'), 0):
+        return "pending 'suppressed_before' is not a non-negative integer"
+    if not _irc_is_int(entry.get('attempts'), 0):
+        return "pending 'attempts' is not a non-negative integer"
+    last = entry.get('last_attempt_at')
+    if last is not None and not is_finite_number(last):
+        return "pending 'last_attempt_at' is not a timestamp or null"
+    extra = set(entry) - IRC_PENDING_FIELDS
+    if extra:
+        return f'unexpected pending fields {sorted(extra)!r}'
+    return None
+
+
+IRC_PENDING_FIELDS = frozenset({
+    'epoch', 'id', 'ts', 'name', 'kind', 'channel', 'sender', 'account', 'text', 'truncated',
+    'suppressed_before', 'attempts', 'last_attempt_at',
+})
+
+
+def _irc_identity_problem(identity):
+    if not isinstance(identity, dict) or set(identity) != {'instance', 'endpoint'}:
+        return "'identity' must be {instance, endpoint}"
+    instance = identity['instance']
+    if not (isinstance(instance, str) and 1 <= len(instance) <= IRC_NAME_MAX
+            and all(c.isascii() and (c.isdigit() or c.islower() or c in '_-') for c in instance)
+            and (instance[0].isdigit() or instance[0].islower())):
+        return "identity 'instance' is not a folded instance name"
+    if not _is_hex(identity['endpoint'], 16):
+        return "identity 'endpoint' is not 16 hex"
+    return None
+
+
+def _irc_pending_list_problem(pending):
+    if not isinstance(pending, list):
+        return "'pending' is not a list"
+    if len(pending) > IRC_PENDING_MAX:
+        return f"'pending' has more than {IRC_PENDING_MAX} entries"
+    for entry in pending:
+        problem = irc_pending_entry_problem(entry)
+        if problem:
+            return problem
+    return None
+
+
+def irc_state_problem(data):
+    """`irc-state.json` (dispatcher だけが書く cursor と未配達)。使えない理由 (使えれば `None`)。"""
+    if data.get('version') != 1:
+        return "'version' is not 1"
+    problem = _irc_identity_problem(data.get('identity'))
+    if problem:
+        return problem
+    epoch = data.get('epoch')
+    if epoch is not None and not _is_hex(epoch, 8):
+        return "'epoch' is not 8 hex or null"
+    if not _irc_is_int(data.get('cursor'), 0):
+        return "'cursor' is not a non-negative integer"
+    if not is_finite_number(data.get('skew')):
+        return "'skew' is not a finite number"
+    last = data.get('last_poll_at')
+    if last is not None and not is_finite_number(last):
+        return "'last_poll_at' is not a timestamp or null"
+    for field in ('fail_streak', 'bad_streak'):
+        if not _irc_is_int(data.get(field), 0):
+            return f'{field!r} is not a non-negative integer'
+    problem = _irc_pending_list_problem(data.get('pending'))
+    if problem:
+        return problem
+    extra = set(data) - {'version', 'identity', 'epoch', 'cursor', 'skew', 'last_poll_at',
+                         'fail_streak', 'bad_streak', 'pending'}
+    if extra:
+        return f'unexpected fields {sorted(extra)!r}'
+    return None
+
+
+IRC_QUARANTINE_MAX_BATCHES = 5
+
+
+def irc_quarantine_problem(data):
+    """`irc-quarantine.json` = identity が変わったときに退避した旧 `pending` (配達しない)。"""
+    if data.get('version') != 1:
+        return "'version' is not 1"
+    batches = data.get('batches')
+    if not isinstance(batches, list) or len(batches) > IRC_QUARANTINE_MAX_BATCHES:
+        return "'batches' is not a short list"
+    for batch in batches:
+        if not isinstance(batch, dict) or set(batch) != {'at', 'identity', 'pending'}:
+            return 'a quarantine batch must be {at, identity, pending}'
+        if not is_finite_number(batch['at']):
+            return "quarantine 'at' is not a timestamp"
+        problem = _irc_identity_problem(batch['identity']) or _irc_pending_list_problem(batch['pending'])
+        if problem:
+            return problem
+    extra = set(data) - {'version', 'batches'}
+    if extra:
+        return f'unexpected fields {sorted(extra)!r}'
+    return None
+
+
+def irc_receiver_problem(data):
+    """`irc-receiver.json` (dispatcher だけが書く受信側の状態。固定コードと数だけ。token・URL は入れない)。"""
+    if not isinstance(data.get('enabled'), bool):
+        return f"'enabled' is {data.get('enabled')!r}, expected a boolean"
+    if not is_finite_number(data.get('checked_at')):
+        return "'checked_at' is not a finite timestamp"
+    reason = data.get('reason')
+    if not (isinstance(reason, str) and reason and all(c.isalnum() or c == '_' for c in reason)):
+        return "'reason' is not a fixed code"
+    api = data.get('api')
+    if api is not None and not _irc_is_int(api, 0):
+        return "'api' is not an integer or null"
+    last_ok = data.get('last_ok_at')
+    if last_ok is not None and not is_finite_number(last_ok):
+        return "'last_ok_at' is not a timestamp or null"
+    if not _irc_is_int(data.get('pending_count'), 0):
+        return "'pending_count' is not a non-negative integer"
+    quarantine = data.get('quarantine')
+    if quarantine is not None:
+        if not isinstance(quarantine, dict) or set(quarantine) != {'count', 'at', 'from'}:
+            return "'quarantine' must be {count, at, from}"
+        if not _irc_is_int(quarantine['count'], 0) or not is_finite_number(quarantine['at']) \
+                or not _is_hex(quarantine['from'], 16):
+            return "'quarantine' has a bad value"
+    extra = set(data) - {'enabled', 'checked_at', 'reason', 'api', 'last_ok_at', 'pending_count', 'quarantine'}
+    if extra:
+        return f'unexpected fields {sorted(extra)!r}'
+    return None

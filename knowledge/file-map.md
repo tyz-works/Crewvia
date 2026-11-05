@@ -310,6 +310,14 @@ dispatcher。CLI: `record` / `show` / `clear`）。`load()` は欄の値まで�
 不正なら `Unreadable`（`diff_bytes: null` が通知の組み立てを落として全 mission の
 dispatch が止まる、を防ぐ）
 
+### `lib_irc_relay.py`
+
+IRC の呼びかけを crewvia のエージェントの画面へ届ける（t007。設計 `irc-mention-relay.md`）。dispatcher の `run_irc_cycle()` が
+`run_cycle()` を 1 回呼ぶ。取得は `poll` のサブプロセス（`timeout 8`）、配達は dispatcher の中（`_mux` の `capture` → `send` →
+`verify_sent`）。状態は `registry/daemons/irc-state.json`（cursor・未配達。消すと最大 24 時間分がもう一度届く）・`irc-quarantine.json`
+（identity が変わったときの旧い未配達の退避。消すとそれが失われる）・`irc-receiver.json`（心拍。固定コードと数だけ）。
+認証情報は `lib_telegram` と同じ型（起動時に 1 回・前置代入で運ぶ）。
+
 ### `lib_ci_status.py`
 
 PR の CI の見える化（2026-10-27）。取得は dispatcher の `run_ci_poll()` の 1 か所（in_progress / ready_for_verification / verifying の task。

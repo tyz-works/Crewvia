@@ -144,12 +144,50 @@ if [[ "$tg_reason" != "no_credentials" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
+# IRC 呼びかけ中継の認証情報 (t007 / knowledge/irc-mention-relay.md §4-2)。Telegram と同じ型:
+# **起動時に 1 回** (respawn のたびにここを通る) 取り出し、この bash プロセスの**シェル変数**に持つ。export しない。
+# サイクルごとの python へは run_dispatch の前置代入で渡す (`env VAR=… cmd` は argv に載るので使わない)。
+# 取り出せなかった間は IRC_RESOLVE_RETRY_SECONDS (600 秒) 間隔でだけ取り直す。未設定
+# (config の irc.enabled が true でない / irc.credentials.source が無い) なら何も読まない (no_credentials)。
+# ---------------------------------------------------------------------------
+IRC_RESOLVE_RETRY_SECONDS=600
+irc_token=""
+irc_reason="no_credentials"
+irc_resolved_at=0
+
+_irc_resolve() {
+  local out
+  irc_token=""
+  out="$(python3 "${SCRIPT_DIR}/lib_irc_relay.py" resolve 2>/dev/null)" || out="credential_command_failed"
+  irc_reason="$(printf '%s\n' "$out" | sed -n 1p)"
+  [[ -n "$irc_reason" ]] || irc_reason="credential_command_failed"
+  if [[ "$irc_reason" == "ok" ]]; then
+    irc_token="$(printf '%s\n' "$out" | sed -n 2p)"
+  fi
+  irc_resolved_at="$(date +%s)"
+}
+
+_irc_maybe_retry() {
+  if [[ "$irc_reason" != "ok" && "$irc_reason" != "no_credentials" ]] \
+     && (( $(date +%s) - irc_resolved_at >= IRC_RESOLVE_RETRY_SECONDS )); then
+    _irc_resolve
+    log "irc credentials retry: ${irc_reason}"
+  fi
+}
+
+_irc_resolve
+if [[ "$irc_reason" != "no_credentials" ]]; then
+  log "irc credentials: ${irc_reason}"
+fi
+
+# ---------------------------------------------------------------------------
 # One dispatch cycle — implemented in Python for YAML / file parsing
 # ---------------------------------------------------------------------------
 run_dispatch() {
   # 認証情報は前置代入で python にだけ渡す (`env VAR=… python3` は env の argv に token が載るので使わない)。
   _CREWVIA_TG_RESOLVED_TOKEN="$tg_token" _CREWVIA_TG_RESOLVED_CHAT_ID="$tg_chat" \
   _CREWVIA_TG_RESOLVE_REASON="$tg_reason" \
+  _CREWVIA_IRC_RESOLVED_TOKEN="$irc_token" _CREWVIA_IRC_RESOLVE_REASON="$irc_reason" \
   python3 - "$QUEUE_DIR" "$REGISTRY_DIR" "$NOTIFY_CACHE" "$NOTIFY_TTL" "$STATE_GRACE" "$LOG_FILE" <<'PYEOF'
 import sys
 import os
@@ -185,6 +223,9 @@ sys.path.insert(0, str(_SCRIPTS_DIR))
 # lib_telegram.run_cycle が `poll` のサブプロセスにだけ env で渡す。token をログ・例外文に出さない。
 _TG_CARRIED = {k: os.environ.pop(k, '') for k in ('_CREWVIA_TG_RESOLVED_TOKEN', '_CREWVIA_TG_RESOLVED_CHAT_ID')}
 _TG_RESOLVE_REASON = os.environ.pop('_CREWVIA_TG_RESOLVE_REASON', '') or 'no_credentials'
+# IRC 呼びかけ中継 (t007): 同じ型。token は os.environ から外し、`lib_irc_relay.run_cycle` が `poll` のサブプロセスにだけ env で渡す。
+_IRC_CARRIED = {'_CREWVIA_IRC_RESOLVED_TOKEN': os.environ.pop('_CREWVIA_IRC_RESOLVED_TOKEN', '')}
+_IRC_RESOLVE_REASON = os.environ.pop('_CREWVIA_IRC_RESOLVE_REASON', '') or 'no_credentials'
 
 from lib_mux import Mux, repo_identity_ok  # noqa: E402
 import lib_retirement  # noqa: E402
@@ -3467,6 +3508,83 @@ def run_ci_poll():
 
 
 # --- CYCLE ENTRY POINT ---
+# ---------------------------------------------------------------------------
+# IRC 呼びかけ中継 (t007 / knowledge/irc-mention-relay.md §4・§5)
+# ---------------------------------------------------------------------------
+#
+# 1 サイクルに足すのは `lib_irc_relay.run_cycle()` の 1 呼び出しと、その要約を Director への通知
+# (状態ベース・1 回だけ・回復で clear) に写すことだけ。ネットワークは `poll` のサブプロセス (timeout 8) の中。
+# `irc.enabled` が true でなければ何も読まず何も書かない。全体を try/except で包む理由は run_telegram_cycle() と同じ。
+
+IRC_NOTIFY_KEYS = ('irc_relay_unreachable', 'irc_relay_unauthorized', 'irc_relay_api_unsupported',
+                   'irc_relay_bad_request', 'irc_relay_bad_response', 'irc_receiver_disabled', 'irc_relay_gap')
+
+
+def _irc_notices(summary):
+    """要約 → `[(key, fingerprint, メッセージ)]`。メッセージは固定コードと数だけ (token・URL・本文は入れない)。"""
+    poll = summary.get('poll') or {}
+    code = poll.get('code') or ''
+    reason = summary.get('reason') or ''
+    out = []
+    if not summary.get('enabled') and reason not in ('disabled', 'no_credentials', 'ok', ''):
+        out.append(('irc_receiver_disabled', fingerprint(reason),
+                    '[irc] IRC 呼びかけ中継が無効です (理由コード: ' + reason + ')。config の irc: を見直す'
+                    ' (url は tailnet / loopback の IP リテラルの http か https)・認証情報 (irc.credentials) を直す・'
+                    '壊れた registry/daemons/irc-state.json は消す (復旧手順)。直したら lib_daemon_watch.py restart。'))
+    if code == 'unauthorized':
+        out.append(('irc_relay_unauthorized', fingerprint(code),
+                    '[irc] relay bot が 401 を返しました (unauthorized)。bot 側の token と irc.credentials が食い違っています。'))
+    elif code == 'api_unsupported':
+        out.append(('irc_relay_api_unsupported', fingerprint(code),
+                    '[irc] relay bot が /v1 を話しません (api_unsupported)。bot を /v1 を持つ版に上げてください。'))
+    elif code == 'bad_request':
+        out.append(('irc_relay_bad_request', fingerprint(code),
+                    '[irc] relay bot が 400 を返しました (bad_request)。crewvia 側のバグの可能性があります。dispatcher のログを見てください。'))
+    elif code in ('http_unreachable', 'http_5xx', 'http_redirect', 'http_error', 'poll_timeout', 'poll_failed') and poll.get('fail_streak', 0) >= 6:
+        out.append(('irc_relay_unreachable', fingerprint('unreachable'),
+                    '[irc] relay bot に ' + str(poll.get('fail_streak')) + ' 回連続でつながりません (' + code +
+                    ')。bot (a1-free) の状態と tailnet を確認してください。エージェントの作業は止まりません (通知が届かないだけ)。'))
+    elif code in ('bad_json', 'bad_shape') and poll.get('bad_streak', 0) >= 3:
+        out.append(('irc_relay_bad_response', fingerprint('bad_response'),
+                    '[irc] relay bot の応答が ' + str(poll.get('bad_streak')) + ' 回連続で不正です (' + code +
+                    ')。bot の版を確認してください。受信箱は bot が 24 時間預かります。'))
+    if poll.get('gap'):
+        out.append(('irc_relay_gap', fingerprint('gap'),
+                    '[irc] relay bot の受信箱で期限切れ・溢れにより一部の呼びかけが失われました (gap)。残っている分は届けています。'))
+    if poll.get('quarantined'):
+        out.append(('irc_identity_changed', fingerprint(poll.get('quarantined_from'), poll.get('quarantined')),
+                    '[irc] irc.url / irc.instance が変わったため、前の bot / instance の未配達 ' + str(poll.get('quarantined')) +
+                    ' 件を退避しました (配達しません。registry/daemons/irc-quarantine.json)。'))
+    return out
+
+
+def run_irc_cycle():
+    try:
+        import lib_irc_relay
+        config = lib_irc_relay.load_irc_config()
+        token, reason = lib_irc_relay.resolve_token(
+            config, environ={'_CREWVIA_IRC_RESOLVED_TOKEN': _IRC_CARRIED['_CREWVIA_IRC_RESOLVED_TOKEN']}, carried=True)
+        if token is None and reason == 'no_credentials' and _IRC_RESOLVE_REASON != 'ok':
+            reason = _IRC_RESOLVE_REASON         # 起動時に取り出せなかった理由 (固定コード) を心拍に残す
+        summary = lib_irc_relay.run_cycle(
+            REGISTRY_DIR / 'daemons', config, token, reason, _mux, log=log)
+        notices = _irc_notices(summary)
+        for key, fp, message in notices:
+            notify_state_once(key, fp, 'irc-relay', '_daemon', 'irc', lambda m=message: m,
+                              director_live=director_live_for_state_notices)
+        if summary.get('polled') and summary.get('reason') == 'ok':
+            told = load_told()
+            if not is_unreadable(told):
+                still = {k for k, _fp, _m in notices}        # 今回も出ている通知は消さない (gap は gap=false の成功で消える)
+                for key in IRC_NOTIFY_KEYS:
+                    if key in told and key not in still:
+                        clear_told_key(key)          # 回復 (次に同じ障害が起きたら再通知される)
+        if summary.get('delivered'):
+            log(f"[irc] delivered {summary['delivered']} line(s)")
+    except Exception as e:  # noqa: BLE001 — 安全網が dispatch サイクルを落とさない。型名だけ
+        log(f'[irc] cycle failed: {type(e).__name__}')
+
+
 # Everything below this marker runs a full dispatch cycle.  Tests that want to
 # exercise a single helper (tests/test_orphan_daemon_guard.py) exec() the code
 # above it and stop here, so keep the marker even if the calls change.
@@ -3479,6 +3597,8 @@ run_daemon_watch()
 check_main_checkout_drift()
 # Telegram は dispatch() の成否から独立させる (心拍 = `ask` が見る受信側の生存表明。dispatch が毎回落ちても止めない)
 run_telegram_cycle()
+# IRC 呼びかけ中継 (t007)。未設定 (irc.enabled が true でない) なら何も読まない
+run_irc_cycle()
 publish_agents()
 dispatch()
 # CI の見える化は dispatch() の成否から独立させる (early return のサイクルでも回す)
@@ -3507,6 +3627,7 @@ while true; do
   # そのため無条件・先頭で書く。
   daemon_beat dispatcher "$REPO_ROOT" "$REGISTRY_DIR"
   _tg_maybe_retry
+  _irc_maybe_retry
   run_dispatch || log "dispatch cycle error (exit $?)"
   sleep 5
 done

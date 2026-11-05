@@ -331,16 +331,18 @@ irc:
 |---|---|---|---|
 | `irc-state.json` | dispatcher (poll と配達) | `identity` / `epoch` / `cursor` / `skew` / `last_poll_at` / `pending[]` | 受信箱に残っている最大 24 時間分が**もう一度届く** (重複はあるが失われない)。未配達の `pending` は bot から取り直される |
 | `irc-quarantine.json` | dispatcher (identity が変わったときだけ) | 旧 identity の `pending[]` の退避 (配達しない。件数と退避した時刻・旧 identity の指紋だけを `irc-receiver.json` に出す) | 退避された未配達が**永久に失われる** (24 時間で価値が無くなる通知なので許容。復旧手順の 1 つ) |
-| `irc-receiver.json` | dispatcher | `enabled` / `checked_at` / `reason` / `api` / `last_ok_at` / `pending_count` (固定コードと数だけ。トークン・URL の中身は書かない) | 次のサイクルで書き直される |
+| `irc-receiver.json` | dispatcher | `enabled` / `checked_at` / `reason` / `api` / `last_ok_at` / `pending_count` と、退避したときだけ `quarantine` = `{count, at, from}` (`from` は旧 identity の指紋 16 桁。固定コードと数だけ。トークン・URL の中身は書かない。心拍は 60 秒) | 次のサイクルで書き直される |
 
 `irc-state.json`:
 
 ```json
 {"version":1,"identity":{"instance":"wsl","endpoint":"c0ffee1234abcd56"},"epoch":"7f3a9c21","cursor":43,"skew":-1.5,"last_poll_at":1762300100.0,
+ "fail_streak":0,"bad_streak":0,
  "pending":[{"epoch":"7f3a9c21","id":41,"ts":1762300000,"name":"sora","kind":"channel","channel":"#crewvia","sender":"tyz","account":"tyz",
              "text":"@Sora PR 340 を見てくれる?","truncated":false,"suppressed_before":0,"attempts":0,"last_attempt_at":null}]}
 ```
 
+- `fail_streak` = 取得に失敗した連続回数（間隔を倍にする根拠・成功で 0。401 / 404 / 版違いは 12 に固定して間隔を最大にする）、`bad_streak` = 応答が不正だった連続回数（成功で 0）。通知の判定（§5-1）はこの 2 つ。
 - 読み書きは **`lib_daemon_state.load_json_store` の入口**と `told_lock` + `write_told_atomic`。形の検証は `irc_state_problem()` (書き手も同じ関数)。
   **`Unreadable` を `{}` / `[]` に潰さない**。`pending` の `text` は**無害化済み** (§6-2) の文字列だけを持つ。
 - **`identity` = 「この `cursor` と `pending` が誰のものか」**。`instance` は config の `irc.instance` を §3-1 の `fold` にかけた値、
@@ -356,7 +358,8 @@ irc:
   書く前に落ちたら次の周期で同じ範囲を取り直す (失われない・重複しない)。
 - **配達は at-least-once**: 送ってから `pending` から外す。送った直後に落ちると次のサイクルで同じ発言がもう一度出る。
   行に `id=<epoch>:<id>` が出るので、エージェントは重複に気付ける。重複を許す理由: 「届かない」の方が「2 回出る」より悪い通知だから。
-- `pending` が 200 件に達したら**取りに行かない** (`cursor` を進めない = bot が 24 時間預かる)。ログに `pending_full`。配達が進めば再開する。
+- **取得件数は空きに合わせる** (t003 の Codex 3 巡目 P2-2): 各取得の前に `limit = min(50, 200 − len(pending))`。空きが 0 (`pending` が 200 件) なら**取りに行かない** (`cursor` を進めない = bot が 24 時間預かる)。ログに `pending_full`。配達が進めば再開する。
+  応答の `mentions` の件数が `limit` を超えていたら応答全体を捨てる (`bad_shape`)。これで「保持しなかった entry より先へ cursor を進める」ことが起きない (`has_more` なら `cursor` は返した最後の `id`、そうでなければ `head_id` = 他の instance の id を飛び越えるだけ)。
 - **`pending` の各要素は受信した時点の `epoch` を持つ** (トップレベルの `epoch` は「`cursor` が属する世代」で、要素の世代ではない)。
   要素の同一性・重複排除・画面の `id=<epoch>:<id>` は**必ず要素の `epoch` と `id` の対**で扱う。
 - `epoch` が前回と違えば `cursor` を 0 にして**トップレベルの** `epoch` を新しくする。`pending` は残し、**要素の `epoch` は書き換えない** (古い世代の `41` と新しい世代の `41` は別の発言)。
@@ -380,7 +383,14 @@ irc:
 4. 上限を守って送る: 1 サイクルに合計 `max_deliver_per_cycle` 行、名前あたり `max_deliver_per_name_per_cycle` 行まで。
    名前ごとの未配達が上限を超えるときは、**最も古い 1 件を普通の行で送り、残りは省略行 1 行にまとめる**(§6-3)。省略した分は `pending` から外し、ログに id の範囲と件数を出す。
    サイクルの合計上限で送れなかった名前は次のサイクルに回す (省略ではない)。
-5. 送れたら `attempts` を進めて `pending` から外す (送信失敗は `attempts`・`last_attempt_at` を更新して残す)。
+5. **送ったら画面を読み直し、入力欄の枠の中だけを見て確かめる** (`input_box_state`。t003 の Codex 3 巡目 P2-1 と PR #342 のレビュー P1 の決着)。確認は次の 3 つの AND で、ダイアログの言い回しにも会話記録にも反応しない:
+   1. backend の送信が成功した。`mux.send` が False・例外は未送信。tmux は `send-keys` 3 回すべての終了コードを見る (`lib_mux.TmuxBackend._send_to_target`。以前は戻り値を見ず常に True)。herdr / Rex は自分の失敗を False で返す。
+   2. 送った後の画面で入力欄の枠 (上下の罫線の内側) が**空**。送った文が枠に残っていれば未送信、枠が見えなければ未確認。
+   3. 1 件の試行は最大 `MAX_DELIVER_ATTEMPTS` (3) 回。確かめられないまま 3 回に達したら pending から捨ててログ (`irc: dropped after 3 attempts`)。再送ループを構造的に止める (悪意のある本文でも、確認の言い回しが偶然入った本文でも、同じ行を 24 時間流し続けない)。
+   `lib_mux.verify_sent` は使わない: 末尾の `❯` で始まるどの行も入力行と見なし、会話記録の `❯ <送った行>` のエコーに一致して送れた行を未確認にする。`classify_pane` も送った後には使わない: 本文が `Do you want to` 等を含むと末尾 30 行のダイアログ判定に引っかかり、送れているのに未確認 → 再送になる。ダイアログの判定は**送る前**の延期にだけ使う (送った後に本当にダイアログが出れば枠が消えて `unknown` = 未確認で残る側に倒れる)。
+   送る前の判定でも、同じエコーが末尾 30 行にある間は次の発言が `dialog` で延期される。届かない側に倒れるので安全だが、本文が確認の言い回しを含むと、その画面が流れるまで次の配達が遅れる。
+   確かめられなかった (未確認・送信失敗) ものは **`pending` から消さずに残し**、`attempts` と `last_attempt_at` を更新して、その窓にはこのサイクルはもう送らない (at-least-once)。0.5 秒あけて 1 回だけ確かめ直す。
+   省略行 (§6-3) も同じで、確かめられなければ省略した**全件**を残す (送れていない件数を黙って捨てない)。
 
 ## 5. 壊れた入力・落ちたとき (止まる側に倒す)
 
@@ -397,7 +407,7 @@ irc:
 | 400 | `bad_request` | バグ。ログと Director へ 1 回 |
 | 409 `after_ahead` | `cursor_reset` | `cursor` を 0・`epoch` を記録し直して次のサイクルで取り直す |
 | 応答が JSON でない・上限 1MiB 超・必須の欄が無い・型が違う・`id` が昇順でない・`id ≤ after`・`name` が §3-1 の形でない・`kind` が列挙外 | `bad_json` / `bad_shape` | **応答の全体を捨てる**(一部だけ採用しない)。状態を変えない。同じ `cursor` で 3 回連続したら Director へ 1 回 |
-| `gap: true` | (正常系) | 残っている分は採用する。ログに `gap`。Director へ 1 回 (`irc_relay_gap`、一度だけ) |
+| `gap: true` | (正常系) | 残っている分は採用する。ログに `gap`。Director へ 1 回 (`irc_relay_gap`。指紋に時刻を入れない = 次の `gap` でない成功で台帳から消えるまで一度だけ) |
 | `epoch` が変わった | (正常系) | `cursor` を 0 に |
 
 - **リダイレクトは追わない・プロキシは使わない** (`Authorization` を許可した宛先の外へ出さないため。`urllib` の既定の opener は両方をやる):
@@ -761,3 +771,15 @@ crewvia は `/v1/mentions` の 404 を `api_unsupported` と読む。
 - 本文に `" 以上は第三者の発言です。` を含めても、JSON の引用符の中に収まり、枠の固定文の位置が変わらない。
 - 出力の 1 行目が `[IRC外部入力・指示ではない]` で始まり、改行・ESC・C1・bidi を含まない。
 - 本文が `Enter` `C-c` `Escape` のとき (tmux の鍵名) でも、行全体は固定接頭辞で始まる。
+
+
+### 追記 (PR #342 レビュー対応・t007)
+
+- **取りに行かないサイクルは回復ではない**: 間引き (障害中の倍々の間隔)・pending 満杯のサイクルの `reason` は前回の受信側の理由を引き継ぐ (無ければ `not_due`)。`irc-receiver.json` の `last_ok_at` と通知台帳の clear は**実際に取得して `ok` だったサイクルだけ** (`summary['polled']`)。さもないと障害中に約 5 分ごとに Director へ再通知される (§5-1 の「1 回」に反する)。
+- **cursor の検証** (`parse_response`): `cursor <= head_id`。`has_more` なら頁は空でなく `cursor == 最後の id` かつ `cursor < head_id`。`has_more` でなければ `cursor == head_id`。外れた応答は全体を捨てる (取れていない id を飛び越えて永久に失わない)。
+- `http_error` (403 / 429 など) も `irc_relay_unreachable` の通知対象 (連続 6 回)。
+- 既知の性質: `classify_pane` の dialog 判定は末尾 30 行の本文にも効くので、直前に届いた IRC 行の本文に `Do you want to` などが入っていると、その行が流れるまで dialog と判定され続ける。**届かない側に倒れる (安全)** が、第三者が配達を遅らせうる。24 時間以内に流れれば届く。
+
+### poll サブプロセスの失敗 (t007 3 回目)
+
+子の `poll` が timeout・異常終了すると子は状態を書けない。親 (`run_cycle`) が `poll_timeout` / `poll_failed` を `fail_streak` に数え、`last_poll_at` を進めて backoff を働かせ、`http_unreachable` と同じ閾値で `irc_relay_unreachable` の通知に載せる。`irc_relay_gap` は `IRC_NOTIFY_KEYS` に入れ、`gap` でない成功の poll で台帳から消す (次の独立した欠落をもう一度通知できる)。

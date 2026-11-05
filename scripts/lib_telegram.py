@@ -208,8 +208,12 @@ def _validated(token, chat_id):
     return Credentials(token, chat_id), 'ok'
 
 
-def _read_file_credentials(path, euid):
-    """0600 のファイル (`bot_token=…` / `chat_id=…`)。権限が合わなければ**中身を開かない**。"""
+def read_secret_file_text(path, euid):
+    """0600 のファイルを**安全に開いて**テキストを返す。→ `(text | None, reason)`。解析・検証はしない (呼び出し側の仕事)。
+
+    権限が合わなければ**中身を開かない**。理由コードは `credential_file_missing` / `credential_file_permissions`。
+    Telegram (`bot_token=` / `chat_id=`) と IRC (単一のトークン) が共有する (コピーしない。`lib_irc_relay` が使う)。
+    """
     try:
         st = os.lstat(path)
     except OSError:
@@ -233,6 +237,14 @@ def _read_file_credentials(path, euid):
     finally:
         if fd is not None:
             os.close(fd)
+    return text, 'ok'
+
+
+def _read_file_credentials(path, euid):
+    """0600 のファイル (`bot_token=…` / `chat_id=…`)。権限が合わなければ**中身を開かない**。"""
+    text, reason = read_secret_file_text(path, euid)
+    if text is None:
+        return None, reason
     values = {}
     for line in text.splitlines():
         line = line.strip()

@@ -316,3 +316,13 @@ def test_cycle_failure_is_swallowed_with_type_name_only(tmp_path, monkeypatch):
     monkeypatch.setattr(real, "run_cycle", boom)
     ns.cycle()
     assert any("irc] cycle failed: RuntimeError" in m for m in ns.logs) and TOKEN not in json.dumps(ns.logs)
+
+
+def test_gap_notice_is_cleared_by_a_later_successful_poll_without_gap(tmp_path, monkeypatch, relay):
+    """Codex P2: gap の台帳は gap でない成功で消える (消えないと次の独立した欠落が黙る)。"""
+    ns = Ns(tmp_path, monkeypatch)
+    ns.config(cfg_text(relay.url))
+    ns.told["irc_relay_gap"] = {"fp": "x"}
+    relay.gap = False
+    ns.cycle()
+    assert "irc_relay_gap" not in ns.told

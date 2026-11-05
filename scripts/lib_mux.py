@@ -2454,20 +2454,19 @@ class TmuxBackend(_Backend):
         another checkout is moving names around.
         """
         try:
-            subprocess.run(
-                ["tmux", "send-keys", "-t", target, "C-u"],
-                capture_output=True, timeout=5,
-            )
-            subprocess.run(
-                ["tmux", "send-keys", "-t", target, text],
-                capture_output=True, timeout=5,
-            )
-            time.sleep(0.1)
-            subprocess.run(
-                ["tmux", "send-keys", "-t", target, "Enter"],
-                capture_output=True, timeout=5,
-            )
-            return True
+            ok = True
+            for step, argv in enumerate((["C-u"], [text], ["Enter"])):
+                r = subprocess.run(
+                    ["tmux", "send-keys", "-t", target, *argv],
+                    capture_output=True, timeout=5,
+                )
+                if r.returncode != 0:
+                    ok = False        # 終了コードを見る: 失敗したのに True を返すと、呼び出し側が配達済みと誤認する
+                if step == 1:
+                    time.sleep(0.1)
+            if not ok:
+                self._warn(f"send to {what!r} failed: tmux send-keys returned non-zero")
+            return ok
         except Exception as e:
             self._warn(f"send to {what!r} failed: {e}")
             return False

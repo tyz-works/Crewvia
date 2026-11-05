@@ -3517,7 +3517,7 @@ def run_ci_poll():
 # `irc.enabled` が true でなければ何も読まず何も書かない。全体を try/except で包む理由は run_telegram_cycle() と同じ。
 
 IRC_NOTIFY_KEYS = ('irc_relay_unreachable', 'irc_relay_unauthorized', 'irc_relay_api_unsupported',
-                   'irc_relay_bad_request', 'irc_relay_bad_response', 'irc_receiver_disabled')
+                   'irc_relay_bad_request', 'irc_relay_bad_response', 'irc_receiver_disabled', 'irc_relay_gap')
 
 
 def _irc_notices(summary):
@@ -3540,7 +3540,7 @@ def _irc_notices(summary):
     elif code == 'bad_request':
         out.append(('irc_relay_bad_request', fingerprint(code),
                     '[irc] relay bot が 400 を返しました (bad_request)。crewvia 側のバグの可能性があります。dispatcher のログを見てください。'))
-    elif code in ('http_unreachable', 'http_5xx', 'http_redirect', 'http_error') and poll.get('fail_streak', 0) >= 6:
+    elif code in ('http_unreachable', 'http_5xx', 'http_redirect', 'http_error', 'poll_timeout', 'poll_failed') and poll.get('fail_streak', 0) >= 6:
         out.append(('irc_relay_unreachable', fingerprint('unreachable'),
                     '[irc] relay bot に ' + str(poll.get('fail_streak')) + ' 回連続でつながりません (' + code +
                     ')。bot (a1-free) の状態と tailnet を確認してください。エージェントの作業は止まりません (通知が届かないだけ)。'))
@@ -3572,11 +3572,12 @@ def run_irc_cycle():
         for key, fp, message in notices:
             notify_state_once(key, fp, 'irc-relay', '_daemon', 'irc', lambda m=message: m,
                               director_live=director_live_for_state_notices)
-        if summary.get('polled') and summary.get('reason') == 'ok' and not notices:
+        if summary.get('polled') and summary.get('reason') == 'ok':
             told = load_told()
             if not is_unreadable(told):
+                still = {k for k, _fp, _m in notices}        # 今回も出ている通知は消さない (gap は gap=false の成功で消える)
                 for key in IRC_NOTIFY_KEYS:
-                    if key in told:
+                    if key in told and key not in still:
                         clear_told_key(key)          # 回復 (次に同じ障害が起きたら再通知される)
         if summary.get('delivered'):
             log(f"[irc] delivered {summary['delivered']} line(s)")

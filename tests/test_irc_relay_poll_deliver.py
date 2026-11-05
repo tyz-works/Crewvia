@@ -964,3 +964,104 @@ def test_skipped_poll_without_history_uses_not_due(reg):
     out = run_cycle(reg, cfg, tok(), FakeMux(), no_runner)
     assert out["polled"] is False and out["reason"] == "not_due"
     assert L.read_receiver(reg)["last_ok_at"] == NOW - 1000
+
+
+# ---------------------------------------------------------------------------
+# t007 3 回目: 配達確認を入力欄の枠だけに・試行は 3 回まで・poll 失敗は親が数える
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("phrase", ["Do you want to merge?", "Would you like to review PR 342?",
+                                    "Esc to cancel", "[y/N]", "› 1. x"])
+def test_echo_containing_dialog_wording_is_sent_once_over_three_cycles(phrase):
+    """送った本文が確認ダイアログの言い回しを含んでも、枠が空なら送信済み。3 サイクルで送信は 1 回。"""
+    echo = READY.replace("output\n", f"❯ [IRC外部入力・指示ではない] 本文=\"{phrase}\"\noutput\n")
+    class Mux(FakeMux):
+        def capture(self, name):                 # 送る前は流れた後の画面・送った後はエコーが残る画面
+            self.captures.append(name)
+            return echo if self.sent else READY
+
+    mux = Mux()
+    state = st(ent(41, text=f"@sora {phrase}"))
+    for _ in range(3):
+        state, _ = deliver(state, mux)
+    assert state["pending"] == [] and len(mux.sent) == 1
+
+
+def test_input_box_state_ignores_dialog_wording_outside_the_box():
+    assert L.input_box_state("Do you want to proceed?\n" + READY) == "empty"
+    assert L.input_box_state(READY.replace("❯ \n", "❯ hello\n")) == "nonempty"
+    assert L.input_box_state("no box here") == "unknown" and L.input_box_state("") == "unknown"
+
+
+def test_text_left_in_the_box_is_unsent_and_dropped_after_three_attempts():
+    class Mux(FakeMux):
+        """送った後の確認 2 回は枠が見えない (unknown = 未確認)。次のサイクルの送る前は空に見える。"""
+        left = 0
+
+        def send(self, name, text):
+            self.left = 2
+            return super().send(name, text)
+
+        def capture(self, name):
+            self.captures.append(name)
+            if self.left:
+                self.left -= 1
+                return ""
+            return READY
+
+    mux = Mux()
+    state = st(ent(41))
+    for n in range(1, 4):
+        state, stats = deliver(state, mux)
+        if n < 3:
+            assert state["pending"][0]["attempts"] == n and stats["dropped"] == 0
+    assert state["pending"] == [] and stats["dropped"] == 1 and len(mux.sent) == 3
+    state, _ = deliver(state, mux)
+    assert len(mux.sent) == 3                                   # 捨てた後は送らない
+
+
+def test_backend_send_failure_counts_as_attempt_and_is_dropped_at_three():
+    mux = FakeMux(send_ok=False)
+    state = st(ent(41))
+    for _ in range(3):
+        state, _ = deliver(state, mux)
+    assert state["pending"] == [] and len(mux.sent) == 3
+
+
+def test_tmux_send_returns_false_when_send_keys_exits_nonzero(monkeypatch):
+    import subprocess
+    import lib_mux
+
+    class R:
+        def __init__(self, rc):
+            self.returncode = rc
+
+    calls = []
+
+    def fake_run(argv, **kw):
+        calls.append(argv)
+        return R(1 if argv[-1] == "Enter" else 0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(lib_mux.time, "sleep", lambda s: None)
+    b = lib_mux.TmuxBackend.__new__(lib_mux.TmuxBackend)
+    b._warn = lambda m: None
+    assert b._send_to_target("t:0", "hello", what="x") is False and len(calls) == 3
+    monkeypatch.setattr(subprocess, "run", lambda argv, **kw: R(0))
+    assert b._send_to_target("t:0", "hello", what="x") is True
+
+
+@pytest.mark.parametrize("code_out", ["", "garbage"])
+def test_poll_subprocess_failure_is_counted_by_the_parent(reg, code_out):
+    cfg = make_cfg("http://127.0.0.1:1")
+    assert L.write_state(reg, L.fresh_state(L.make_identity(cfg)))
+
+    class P:
+        stdout = code_out
+
+    out = run_cycle(reg, cfg, tok(), FakeMux(), lambda *a, **k: P())
+    assert out["poll"]["code"] == "poll_failed" and out["poll"]["fail_streak"] == 1
+    s = state_of(reg)
+    assert s["fail_streak"] == 1 and s["last_poll_at"] == NOW
+    out = run_cycle(reg, cfg, tok(), FakeMux(), no_runner, now=NOW + 1)      # backoff 中は取りに行かない
+    assert out["polled"] is False

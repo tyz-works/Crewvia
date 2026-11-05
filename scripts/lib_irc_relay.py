@@ -64,6 +64,7 @@ RECEIVER_HEARTBEAT_SECONDS = 60
 OP_TIMEOUT_SECONDS = 15
 POLL_SUBPROCESS_TIMEOUT = 8
 VERIFY_RETRY_SLEEP_SECONDS = 0.5
+MAX_DELIVER_ATTEMPTS = 3                       # 1 件の試行の上限。超えたら捨ててログ (再送ループを構造的に止める)
 
 STATE_FILE = 'irc-state.json'
 QUARANTINE_FILE = 'irc-quarantine.json'
@@ -799,6 +800,19 @@ def classify_pane(screen):
     for line in lines[-_DIALOG_WINDOW:]:
         if _DIALOG_FOOTER_RE.search(line) or _DIALOG_OPTION_RE.search(line):
             return 'dialog'
+    box = input_box_state(screen)
+    return {'empty': 'ready', 'nonempty': 'draft'}.get(box, 'unknown')
+
+
+def input_box_state(screen):
+    """画面の**入力欄の枠の中だけ**を見る → `empty` / `nonempty` / `unknown`。
+
+    会話記録・ダイアログの言い回しには反応しない (送った本文が `Do you want to` を含んでも結果は変わらない)。
+    送信後の確認はこれだけを使う。枠 (上下の罫線) が見つからない・大きすぎる → `unknown` (空と判定しない)。
+    """
+    if not isinstance(screen, str) or not screen.strip():
+        return 'unknown'
+    lines = screen.splitlines()
     tail_start = max(0, len(lines) - _PROMPT_WINDOW)
     prompt = None
     for i in range(len(lines) - 1, tail_start - 1, -1):
@@ -816,8 +830,8 @@ def classify_pane(screen):
         return 'unknown'
     for line in lines[prompt:lower]:
         if line.replace('❯', '').replace('│', '').strip():
-            return 'draft'
-    return 'ready'
+            return 'nonempty'
+    return 'empty'
 
 
 # ---------------------------------------------------------------------------
@@ -855,12 +869,19 @@ def _pane_state(mux, window):
         return 'unknown'
 
 
-def _send_and_verify(mux, window, line, sleep):
-    """送って、入力欄が空に戻ったことを確かめる。→ `'sent'` / `'send_failed'` / `'unverified'`。
+def _box_state(mux, window):
+    try:
+        return input_box_state(mux.capture(window))
+    except Exception:  # noqa: BLE001
+        return 'unknown'
 
-    確認は `lib_mux.verify_sent` ではなく **入力欄の枠の中だけ** (`classify_pane` が `ready`) で見る。tmux / herdr の
-    `verify_sent` は末尾の `❯` で始まるどの行も入力行と見なし、Claude Code が会話記録に残す `❯ <送った行>` のエコー
-    (行の先頭 30 文字は固定の枠で毎回同じ) に一致して、送れた行を未確認にして毎サイクル再送してしまう。
+
+def _send_and_verify(mux, window, line, sleep):
+    """送って、入力欄の枠の中が空になったことを確かめる。→ `'sent'` / `'send_failed'` / `'unverified'`。
+
+    * backend の送信が失敗 (`mux.send` が False・例外。tmux は `send-keys` の終了コードも見る) = 未送信。
+    * 確認は **入力欄の枠の中だけ** (`input_box_state`)。空 = 送信済み、中身が残る = 未送信、枠が見えない = 未確認。
+      会話記録の `❯` エコーも確認ダイアログの言い回しも見ない (本文は IRC の第三者が書ける)。
     """
     try:
         if not mux.send(window, line):
@@ -868,7 +889,7 @@ def _send_and_verify(mux, window, line, sleep):
     except Exception:  # noqa: BLE001
         return 'send_failed'
     for attempt in range(2):
-        if _pane_state(mux, window) == 'ready':
+        if _box_state(mux, window) == 'empty':
             return 'sent'
         if attempt == 0:
             sleep(VERIFY_RETRY_SLEEP_SECONDS)
@@ -880,11 +901,12 @@ def deliver_pending(state, mux, config, now, *, log=lambda msg: None, sleep=time
 
     * 名前ごとに窓を解決する (0 → 保持、2 つ以上 → 配達せず保持 `ambiguous_target`)。`mux.list()` は最大 1 回。
     * 送る前に `capture` で画面を読み、`ready` のときだけ送る (下書き `draft` は `attempts` を増やさず延期)。
-    * 送った行は `verify_sent` で確かめてから pending から外す。確かめられなければ残す (`attempts` を進める)。
+    * 送った行は入力欄の枠が空になったことで確かめてから pending から外す。確かめられなければ残す (`attempts` を進める。
+      `MAX_DELIVER_ATTEMPTS` に達したら捨ててログ)。
     * 1 サイクルの合計 `max_deliver_per_cycle` 行・名前あたり `max_deliver_per_name_per_cycle` 行。名前の未配達が
       名前あたりの上限を超えるなら、最も古い 1 件を普通の行で送り、残りは省略行 1 行にまとめる (省略した分は外す)。
     """
-    stats = {'delivered': 0, 'expired': 0, 'omitted': 0, 'deferred': {}, 'failed': 0, 'ambiguous': 0, 'sent_lines': 0}
+    stats = {'delivered': 0, 'expired': 0, 'omitted': 0, 'deferred': {}, 'failed': 0, 'ambiguous': 0, 'sent_lines': 0, 'dropped': 0}
     pending = [dict(e) for e in state['pending']]
     kept = [e for e in pending if not is_expired(e, state['skew'], now)]
     stats['expired'] = len(pending) - len(kept)
@@ -942,6 +964,10 @@ def deliver_pending(state, mux, config, now, *, log=lambda msg: None, sleep=time
                 for entry in entries:
                     entry['attempts'] += 1
                     entry['last_attempt_at'] = now
+                    if entry['attempts'] >= MAX_DELIVER_ATTEMPTS:
+                        removed.add(id(entry))          # 3 回試して確かめられなかった: 捨ててログ (再送ループを止める)
+                        stats['dropped'] += 1
+                        log(f"irc: dropped after {entry['attempts']} attempts ({entry['epoch']}:{entry['id']})")
                 break
             for entry in entries:
                 removed.add(id(entry))
@@ -1036,6 +1062,14 @@ def run_cycle(registry_dir, config, token, token_reason, mux, *, now=None, confi
             summary['polled'] = True
             summary['poll'] = poll
             state = read_state(registry_dir, warn=log)
+            if (poll.get('code') in ('poll_timeout', 'poll_failed') and not is_broken(state)
+                    and not is_missing(state) and state['identity'] == identity):
+                # 子が何も書けずに死んだ: 親が backoff (last_poll_at・fail_streak) を進め、通知の数にも載せる
+                state = dict(state, last_poll_at=now, fail_streak=state['fail_streak'] + 1)
+                if not write_state(registry_dir, state):
+                    log('WARNING: irc-state: poll 失敗の backoff を書けない')
+                poll = dict(poll, fail_streak=state['fail_streak'])
+                summary['poll'] = poll
             if is_broken(state):
                 summary.update(reason='state_unreadable', state_unreadable=True)
                 write_receiver_state(registry_dir, config, False, 'state_unreadable', now)

@@ -832,8 +832,8 @@ def input_box_state(screen):
         body = line.strip()
         if k == 0 and body.startswith('❯'):
             body = body[1:].strip()                  # 特定したプロンプト記号 1 つだけ (下書きの中の ❯ は残す)
-        if len(body) >= 2 and body[0] == '│' and body[-1] == '│':
-            body = body[1:-1].strip()                # 実際の罫線 = 行の両端の対だけ (下書きの中の │ は残す)
+        # 左右の罫線 │ は除かない: 今の入力欄は上下の ─ 線だけで側面が無い。角つきの枠 (╭╮╰╯) は
+        # _is_rule が通さず unknown (延期)。│ はすべて下書きの文字 = nonempty (││ / │   │ も)。
         if body:
             return 'nonempty'
     return 'empty'

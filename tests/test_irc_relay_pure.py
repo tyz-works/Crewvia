@@ -211,6 +211,7 @@ def test_classify_pane(scr, expect):
 
 @pytest.mark.parametrize("box", [
     ("❯ ❯",), ("❯ │",), ("❯ ", "│"), ("❯ ", "  │  "), ("❯ ❯❯❯",), ("❯ │x",),
+    ("❯ ││",), ("❯ │   │",), ("❯ ", "│   │"), ("❯ ", "││"), ("❯ a", "│   │"),
 ])
 def test_draft_made_of_prompt_or_border_chars_is_nonempty(box):
     assert L.input_box_state(screen(*box)) == "nonempty"
@@ -222,8 +223,15 @@ def test_empty_box_stays_empty(box):
     assert L.input_box_state(screen(*box)) == "empty"
 
 
-def test_border_pair_around_empty_content_is_still_empty():
-    assert L.input_box_state(screen("❯ │   │", "│   │")) == "empty"
+def test_border_pair_is_draft_not_frame():
+    assert L.input_box_state(screen("❯ │   │", "│   │")) == "nonempty"
+
+
+def test_cornered_frame_is_unknown():
+    top = "╭" + "─" * 30 + "╮"
+    bot = "╰" + "─" * 30 + "╯"
+    scr = "x\n" + top + "\n│ ❯            │\n" + bot + "\n"
+    assert L.input_box_state(scr) == "unknown"
 
 
 def test_classify_pane_prompt_far_above_tail_is_unknown():

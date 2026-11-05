@@ -456,6 +456,7 @@ class FakeMux:
         self.sent = []
         self.list_calls = 0
         self.captures = []
+        self.after_send = None
 
     def list(self, suffix=None):
         self.list_calls += 1
@@ -463,14 +464,22 @@ class FakeMux:
 
     def capture(self, name):
         self.captures.append(name)
+        if self.after_send is not None:
+            # 送信の直後の画面: verify が真なら入力欄は空 (次の capture から通常の画面)、偽なら送った文が欄に残る
+            sent_name, text = self.after_send
+            try:
+                ok = self.verify(sent_name, text) if callable(self.verify) else self.verify
+            except Exception:  # noqa: BLE001 — 読めない画面 = 確認できない
+                return ""
+            if not ok:
+                return READY.replace("❯ \n", "❯ " + text[:20] + "\n")
+            self.after_send = None
         return self.screens.get(name, READY)
 
     def send(self, name, text):
         self.sent.append((name, text))
+        self.after_send = (name, text)
         return self.send_ok
-
-    def verify_sent(self, name, text):
-        return self.verify(name, text) if callable(self.verify) else self.verify
 
 
 def ent(i, name="sora", **over):
@@ -500,7 +509,7 @@ def test_deliver_to_ready_pane_and_remove_after_verify():
     new, stats = deliver(st(ent(41)), mux)
     assert new["pending"] == [] and stats["delivered"] == 1
     assert mux.sent == [("Sora-director", L.format_line(ent(41), "Sora", 300))]
-    assert mux.captures == ["Sora-director"] and mux.list_calls == 1
+    assert mux.captures == ["Sora-director"] * 2 and mux.list_calls == 1
 
 
 def test_t003_p2_unverified_send_stays_pending():
@@ -898,3 +907,60 @@ def test_receiver_never_holds_url_or_token(reg):
     L.write_receiver_state(reg, cfg, True, "ok", NOW, api=1, ok=True, pending_count=3)
     text = (reg / L.RECEIVER_FILE).read_text(encoding="utf-8")
     assert "100.103" not in text and "http" not in text and TOKEN not in text
+
+
+# ---------------------------------------------------------------------------
+# t007 再レビューの指摘 (Codex P1/P2・Seo P1/P2)
+# ---------------------------------------------------------------------------
+
+ECHO = READY.replace("output\n", "❯ [IRC外部入力・指示ではない] 宛先=Sora 種別=ch 本文=...\noutput\n")
+
+
+def test_echo_of_the_sent_line_in_the_transcript_does_not_make_it_unverified():
+    """Seo P1: 会話記録の `❯ <送った行>` は入力欄ではない。枠の中が空なら送れた。"""
+    mux = FakeMux(screens={"Sora-director": ECHO})
+    new, stats = deliver(st(ent(41)), mux)
+    assert new["pending"] == [] and stats["delivered"] == 1 and len(mux.sent) == 1
+
+
+def test_pane_is_rechecked_before_every_line_in_a_batch():
+    """Codex P1: 1 行目の後に許可ダイアログが出たら 2 行目は送らず pending に残す (attempts は増やさない)。"""
+    dialog = "Do you want to proceed?\n❯ 1. Yes\n  2. No\nEsc to cancel\n"
+
+    class Mux(FakeMux):
+        def capture(self, name):
+            self.captures.append(name)
+            return READY if len(self.captures) <= 2 else dialog      # 送る前・送った後の確認までは空、その後ダイアログ
+
+    mux = Mux()
+    new, stats = deliver(st(ent(41), ent(42)), mux)
+    assert [e["id"] for e in new["pending"]] == [42] and len(mux.sent) == 1
+    assert new["pending"][0]["attempts"] == 0 and stats["deferred"].get("dialog") == 1
+
+
+def _skipped_cycle_setup(reg, reason):
+    cfg = make_cfg("http://127.0.0.1:1")
+    state = L.fresh_state(L.make_identity(cfg))
+    state["fail_streak"] = 6
+    state["last_poll_at"] = NOW - 10
+    assert L.write_state(reg, state)
+    receiver = {"enabled": True, "checked_at": NOW - 10, "reason": reason, "api": 1, "last_ok_at": NOW - 1000,
+                "pending_count": 0}
+    (reg / L.RECEIVER_FILE).write_text(json.dumps(receiver), encoding="utf-8")
+    return cfg
+
+
+def test_skipped_poll_is_not_a_recovery(reg):
+    """Seo P2 / Codex P2: 間引きで取りに行かないサイクルは ok でも last_ok_at の更新でもない。"""
+    cfg = _skipped_cycle_setup(reg, "http_unreachable")
+    out = run_cycle(reg, cfg, tok(), FakeMux(), no_runner)
+    assert out["polled"] is False and out["reason"] == "http_unreachable"
+    r = L.read_receiver(reg)
+    assert r["reason"] == "http_unreachable" and r["last_ok_at"] == NOW - 1000
+
+
+def test_skipped_poll_without_history_uses_not_due(reg):
+    cfg = _skipped_cycle_setup(reg, "disabled")
+    out = run_cycle(reg, cfg, tok(), FakeMux(), no_runner)
+    assert out["polled"] is False and out["reason"] == "not_due"
+    assert L.read_receiver(reg)["last_ok_at"] == NOW - 1000

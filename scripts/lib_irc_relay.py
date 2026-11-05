@@ -528,6 +528,15 @@ def parse_response(body, after, limit, instance):
         clean.append(item)
     if clean and data['cursor'] < clean[-1]['id']:
         return 'bad_shape', None
+    # cursor の関係 (§2-3): 次の取得の起点なので、取れていない id を飛び越える値を採用しない。
+    if data['cursor'] > data['head_id']:
+        return 'bad_shape', None
+    if data['has_more']:
+        # 続きがある = 空でない頁で、cursor は返した最後の id (その先は head_id より手前)
+        if not clean or data['cursor'] != clean[-1]['id'] or data['cursor'] >= data['head_id']:
+            return 'bad_shape', None
+    elif data['cursor'] != data['head_id']:
+        return 'bad_shape', None             # 続きが無いなら cursor は head_id
     return 'ok', {'epoch': epoch, 'now': data['now'], 'head_id': data['head_id'], 'cursor': data['cursor'],
                   'has_more': data['has_more'], 'gap': data['gap'], 'mentions': clean}
 
@@ -838,19 +847,29 @@ def resolve_target(name, windows, allowed):
 # 配達 (§4-5) — at-least-once
 # ---------------------------------------------------------------------------
 
+def _pane_state(mux, window):
+    """画面を読んで `classify_pane` する。読めなければ `unknown` (送らない側)。"""
+    try:
+        return classify_pane(mux.capture(window))
+    except Exception:  # noqa: BLE001
+        return 'unknown'
+
+
 def _send_and_verify(mux, window, line, sleep):
-    """送って、入力欄から消えたことを確かめる。→ `'sent'` / `'send_failed'` / `'unverified'`。"""
+    """送って、入力欄が空に戻ったことを確かめる。→ `'sent'` / `'send_failed'` / `'unverified'`。
+
+    確認は `lib_mux.verify_sent` ではなく **入力欄の枠の中だけ** (`classify_pane` が `ready`) で見る。tmux / herdr の
+    `verify_sent` は末尾の `❯` で始まるどの行も入力行と見なし、Claude Code が会話記録に残す `❯ <送った行>` のエコー
+    (行の先頭 30 文字は固定の枠で毎回同じ) に一致して、送れた行を未確認にして毎サイクル再送してしまう。
+    """
     try:
         if not mux.send(window, line):
             return 'send_failed'
     except Exception:  # noqa: BLE001
         return 'send_failed'
     for attempt in range(2):
-        try:
-            if mux.verify_sent(window, line):
-                return 'sent'
-        except Exception:  # noqa: BLE001
-            return 'unverified'
+        if _pane_state(mux, window) == 'ready':
+            return 'sent'
         if attempt == 0:
             sleep(VERIFY_RETRY_SLEEP_SECONDS)
     return 'unverified'
@@ -898,20 +917,18 @@ def deliver_pending(state, mux, config, now, *, log=lambda msg: None, sleep=time
             log(f'irc: ambiguous_target ({len(windows)} windows)')
             continue
         _, window, base = target
-        try:
-            screen = mux.capture(window)
-        except Exception:  # noqa: BLE001
-            screen = ''
-        pane = classify_pane(screen)
-        if pane != 'ready':
-            stats['deferred'][pane] = stats['deferred'].get(pane, 0) + 1
-            if pane == 'draft':
-                log('irc: deferred_draft')
-            continue
         mine = [e for e in pending if e['name'] == name]
         lines_left = min(budget, per_name_cap)
         plan = _plan_lines(mine, lines_left, per_name_cap)
         for kind, entries in plan:
+            # 送る直前に毎回、画面を読み直す (1 つ前の送信の後に許可ダイアログが出た・人が打ち始めた、を拾う)。
+            # 最初の 1 行の確認は直前の _send_and_verify の確認と同じ判定なので、2 行目以降は読み直しで足りる。
+            pane = _pane_state(mux, window)
+            if pane != 'ready':
+                stats['deferred'][pane] = stats['deferred'].get(pane, 0) + 1
+                if pane == 'draft':
+                    log('irc: deferred_draft')
+                break
             if kind == 'one':
                 entry = entries[0]
                 line = format_line(entry, _display_name(base, entry), max_chars)
@@ -1023,7 +1040,14 @@ def run_cycle(registry_dir, config, token, token_reason, mux, *, now=None, confi
                 summary.update(reason='state_unreadable', state_unreadable=True)
                 write_receiver_state(registry_dir, config, False, 'state_unreadable', now)
                 return summary
-        code = (summary['poll'] or {}).get('code') or 'ok'
+        if summary['polled']:
+            code = (summary['poll'] or {}).get('code') or 'ok'
+        else:
+            # 取りに行かなかった (間引き・pending 満杯) サイクルは回復ではない: 前回の理由を引き継ぎ、
+            # ok / last_ok_at / 通知台帳の clear には使わない。
+            prev = read_receiver(registry_dir)
+            prev_reason = None if (is_missing(prev) or is_unreadable(prev)) else prev.get('reason')
+            code = prev_reason if isinstance(prev_reason, str) and prev_reason != 'disabled' else 'not_due'
         summary['reason'] = code
         if not is_missing(state) and mux is not None and state['identity'] == identity:
             new_state, stats = deliver_pending(state, mux, config, now, log=log, sleep=sleep)
@@ -1042,7 +1066,7 @@ def run_cycle(registry_dir, config, token, token_reason, mux, *, now=None, confi
         enabled = code not in ('url_not_allowed', 'config_invalid', 'state_unreadable', 'state_unwritable',
                                'identity_changed_failed')
         summary['enabled'] = enabled
-        write_receiver_state(registry_dir, config, enabled, code, now, api=poll.get('api'), ok=(code == 'ok'),
+        write_receiver_state(registry_dir, config, enabled, code, now, api=poll.get('api'), ok=(summary['polled'] and code == 'ok'),
                              pending_count=summary['pending_count'], quarantine=quarantine)
     except Exception as e:  # noqa: BLE001 — dispatcher のサイクルを落とさない。型名だけ
         log(f'WARNING: irc cycle failed ({type(e).__name__})')

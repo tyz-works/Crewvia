@@ -3540,7 +3540,7 @@ def _irc_notices(summary):
     elif code == 'bad_request':
         out.append(('irc_relay_bad_request', fingerprint(code),
                     '[irc] relay bot が 400 を返しました (bad_request)。crewvia 側のバグの可能性があります。dispatcher のログを見てください。'))
-    elif code in ('http_unreachable', 'http_5xx', 'http_redirect') and poll.get('fail_streak', 0) >= 6:
+    elif code in ('http_unreachable', 'http_5xx', 'http_redirect', 'http_error') and poll.get('fail_streak', 0) >= 6:
         out.append(('irc_relay_unreachable', fingerprint('unreachable'),
                     '[irc] relay bot に ' + str(poll.get('fail_streak')) + ' 回連続でつながりません (' + code +
                     ')。bot (a1-free) の状態と tailnet を確認してください。エージェントの作業は止まりません (通知が届かないだけ)。'))
@@ -3549,7 +3549,7 @@ def _irc_notices(summary):
                     '[irc] relay bot の応答が ' + str(poll.get('bad_streak')) + ' 回連続で不正です (' + code +
                     ')。bot の版を確認してください。受信箱は bot が 24 時間預かります。'))
     if poll.get('gap'):
-        out.append(('irc_relay_gap', fingerprint('gap', int(time.time()) // 3600),
+        out.append(('irc_relay_gap', fingerprint('gap'),
                     '[irc] relay bot の受信箱で期限切れ・溢れにより一部の呼びかけが失われました (gap)。残っている分は届けています。'))
     if poll.get('quarantined'):
         out.append(('irc_identity_changed', fingerprint(poll.get('quarantined_from'), poll.get('quarantined')),
@@ -3572,7 +3572,7 @@ def run_irc_cycle():
         for key, fp, message in notices:
             notify_state_once(key, fp, 'irc-relay', '_daemon', 'irc', lambda m=message: m,
                               director_live=director_live_for_state_notices)
-        if summary.get('reason') == 'ok' and not notices:
+        if summary.get('polled') and summary.get('reason') == 'ok' and not notices:
             told = load_told()
             if not is_unreadable(told):
                 for key in IRC_NOTIFY_KEYS:

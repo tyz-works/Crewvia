@@ -530,3 +530,21 @@ def test_resolve_token_carried(monkeypatch):
     assert L.resolve_token(cfg, runner=lambda *a, **k: (_ for _ in ()).throw(OSError()))[1] == "credential_command_failed"
     # source が無ければ運搬された値があっても使わない
     assert L.resolve_token(enabled_cfg(source=""), environ={L.CARRIED_TOKEN_VAR: GOOD_TOKEN}, carried=True)[1] == "no_credentials"
+
+
+def test_parse_cursor_relationships_are_validated():
+    """t007 再レビュー (Codex P2): cursor が取れていない id を飛び越える応答は全体を捨てる。"""
+    ok = valid_body()
+    assert ok["has_more"] is False and ok["cursor"] == ok["head_id"]
+    bad = []
+    bad.append(valid_body(cursor=ok["head_id"] + 1))                                    # cursor > head_id
+    bad.append(valid_body(cursor=ok["head_id"] - 1, head_id=ok["head_id"]))             # 続き無しなのに cursor != head_id
+    d = valid_body(has_more=True, cursor=100, head_id=100)                              # has_more で cursor が最後の id でない
+    bad.append(d)
+    d = valid_body(has_more=True, mentions=[], cursor=41, head_id=100)                  # has_more で空の頁
+    bad.append(d)
+    d = valid_body(has_more=True); bad.append(d)                                        # cursor == head_id (続きが無い)
+    for data in bad:
+        assert parse(data) == ("bad_shape", None), data
+    last = ok["mentions"][-1]["id"]
+    assert parse(valid_body(has_more=True, cursor=last, head_id=last + 5))[0] == "ok"

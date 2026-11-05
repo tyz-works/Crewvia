@@ -774,13 +774,13 @@ def test_poll_subprocess_failure_is_not_fatal(reg, relay):
         returncode = 1
 
     out = run_cycle(reg, make_cfg(relay.url), tok(), FakeMux(), lambda *a, **k: Dead())
-    assert out["poll"] == {"code": "poll_failed"} and out["reason"] == "poll_failed"
+    assert out["poll"] == {"code": "poll_failed", "fail_streak": 1} and out["reason"] == "poll_failed"
 
     def timeout(*a, **k):
         import subprocess
         raise subprocess.TimeoutExpired("x", 1)
 
-    assert run_cycle(reg, make_cfg(relay.url), tok(), FakeMux(), timeout, now=NOW + 1)["poll"] == {"code": "poll_timeout"}
+    assert run_cycle(reg, make_cfg(relay.url), tok(), FakeMux(), timeout, now=NOW + 1000)["poll"] == {"code": "poll_timeout", "fail_streak": 2}
 
 
 def test_cycle_never_raises(reg, relay):
@@ -1065,3 +1065,30 @@ def test_poll_subprocess_failure_is_counted_by_the_parent(reg, code_out):
     assert s["fail_streak"] == 1 and s["last_poll_at"] == NOW
     out = run_cycle(reg, cfg, tok(), FakeMux(), no_runner, now=NOW + 1)      # backoff 中は取りに行かない
     assert out["polled"] is False
+
+
+def test_first_poll_failures_without_state_still_back_off_and_notify_once(reg):
+    """状態ファイルが無いまま最初の poll が timeout し続けても、backoff が効き、閾値で通知用の fail_streak が育つ。"""
+    import subprocess
+    cfg = make_cfg("http://127.0.0.1:1")
+    assert not (reg / "irc-state.json").exists()
+    calls = []
+
+    def timeout(*a, **k):
+        calls.append(1)
+        raise subprocess.TimeoutExpired("x", 1)
+
+    out = run_cycle(reg, cfg, tok(), FakeMux(), timeout)
+    assert out["polled"] is True and out["poll"]["code"] == "poll_timeout" and out["poll"]["fail_streak"] == 1
+    s = state_of(reg)
+    assert s["fail_streak"] == 1 and s["last_poll_at"] == NOW
+    out = run_cycle(reg, cfg, tok(), FakeMux(), timeout, now=NOW + 1)           # backoff 中は取りに行かない
+    assert out["polled"] is False and len(calls) == 1
+    t, streaks = NOW, [1]
+    for _ in range(6):
+        t += 400                                                                # 最大間隔を超えて due にする
+        out = run_cycle(reg, cfg, tok(), FakeMux(), timeout, now=t)
+        assert out["polled"] is True
+        streaks.append(out["poll"]["fail_streak"])
+    assert streaks == [1, 2, 3, 4, 5, 6, 7]
+    assert len(calls) == 7

@@ -329,19 +329,29 @@ irc:
 
 | ファイル | 書き手 | 中身 | 消すと |
 |---|---|---|---|
-| `irc-state.json` | dispatcher (poll と配達) | `epoch` / `cursor` / `skew` / `last_poll_at` / `pending[]` | 受信箱に残っている最大 24 時間分が**もう一度届く** (重複はあるが失われない)。未配達の `pending` は bot から取り直される |
+| `irc-state.json` | dispatcher (poll と配達) | `identity` / `epoch` / `cursor` / `skew` / `last_poll_at` / `pending[]` | 受信箱に残っている最大 24 時間分が**もう一度届く** (重複はあるが失われない)。未配達の `pending` は bot から取り直される |
+| `irc-quarantine.json` | dispatcher (identity が変わったときだけ) | 旧 identity の `pending[]` の退避 (配達しない。件数と退避した時刻・旧 identity の指紋だけを `irc-receiver.json` に出す) | 退避された未配達が**永久に失われる** (24 時間で価値が無くなる通知なので許容。復旧手順の 1 つ) |
 | `irc-receiver.json` | dispatcher | `enabled` / `checked_at` / `reason` / `api` / `last_ok_at` / `pending_count` (固定コードと数だけ。トークン・URL の中身は書かない) | 次のサイクルで書き直される |
 
 `irc-state.json`:
 
 ```json
-{"version":1,"epoch":"7f3a9c21","cursor":43,"skew":-1.5,"last_poll_at":1762300100.0,
+{"version":1,"identity":{"instance":"wsl","endpoint":"c0ffee1234abcd56"},"epoch":"7f3a9c21","cursor":43,"skew":-1.5,"last_poll_at":1762300100.0,
  "pending":[{"epoch":"7f3a9c21","id":41,"ts":1762300000,"name":"sora","kind":"channel","channel":"#crewvia","sender":"tyz","account":"tyz",
              "text":"@Sora PR 340 を見てくれる?","truncated":false,"suppressed_before":0,"attempts":0,"last_attempt_at":null}]}
 ```
 
 - 読み書きは **`lib_daemon_state.load_json_store` の入口**と `told_lock` + `write_told_atomic`。形の検証は `irc_state_problem()` (書き手も同じ関数)。
   **`Unreadable` を `{}` / `[]` に潰さない**。`pending` の `text` は**無害化済み** (§6-2) の文字列だけを持つ。
+- **`identity` = 「この `cursor` と `pending` が誰のものか」**。`instance` は config の `irc.instance` を §3-1 の `fold` にかけた値、
+  `endpoint` は config の `irc.url` を正規化した文字列 (スキーム・host を小文字・既定ポートを落とす・末尾の `/` を落とす) の SHA-256 の先頭 16 桁 hex
+  (URL そのものは状態に書かない。トークンは identity に含めない = トークンのローテーションでは cursor を捨てない)。
+  **取得の前に毎サイクル**、今の config から作った identity と状態の `identity` を比べる。違えば (config を変えた・別の bot に向けた):
+  1. 旧 `pending` を `irc-quarantine.json` へ**退避**する (配達しない。新しい identity の宛先として届けない = 別の instance・別の bot の発言を今の窓へ出さない)。
+     退避と状態の書き直しは**この順で**行う (退避の書き込みに失敗したら状態を変えず `identity_changed_failed` で取りに行かない。退避を先に書いてから状態を書くので、間で落ちても旧 `pending` は失われない)。
+  2. 状態を `identity` = 新しい値・`cursor` = 0・`epoch` = 次の応答で記録・`pending` = `[]` に書き直す。ログと `irc-receiver.json` に固定コード `identity_changed` と退避した件数だけ (中身は書かない)。Director へ 1 回。
+  3. その同じサイクルの取得から新しい identity で始める (旧 `cursor` を新しい bot / instance に当てて**未読を飛ばす**ことが無い)。
+  `identity` の無い・形が違う状態ファイルは不正 (`irc_state_problem()`。§5-2 の扱い)。
 - **記録してから進める**: 1 回の取得で、取った発言を `pending` に追加することと `cursor` を進めることを **1 回の原子的な書き込み**で行う。
   書く前に落ちたら次の周期で同じ範囲を取り直す (失われない・重複しない)。
 - **配達は at-least-once**: 送ってから `pending` から外す。送った直後に落ちると次のサイクルで同じ発言がもう一度出る。
@@ -379,6 +389,7 @@ irc:
 | 観測 | 固定コード | 動き |
 |---|---|---|
 | `url` が不正 (スキーム・IP の範囲。`http://` は tailnet / loopback の **IP リテラル**のみ。名前解決が要る host は `https://` だけ) | `url_not_allowed` | **取りに行かない**。`irc-receiver.json` を `enabled: false` に。Director へ 1 回 |
+| 3xx (リダイレクト) | `http_redirect` | 追わない。ネットワーク不達と同じ扱い (下の注) |
 | ネットワーク不達・timeout | `http_unreachable` | 状態を変えない。間隔を倍に。**6 回連続**したら Director へ 1 回 (`irc_relay_unreachable`、回復したら台帳から捨てる) |
 | 5xx | `http_5xx` | 同上 |
 | 401 | `unauthorized` | 状態を変えない。**すぐ** Director へ 1 回 (認証情報の取り違え。`irc_relay_unauthorized`)。間隔は最大に |
@@ -389,6 +400,10 @@ irc:
 | `gap: true` | (正常系) | 残っている分は採用する。ログに `gap`。Director へ 1 回 (`irc_relay_gap`、一度だけ) |
 | `epoch` が変わった | (正常系) | `cursor` を 0 に |
 
+- **リダイレクトは追わない・プロキシは使わない** (`Authorization` を許可した宛先の外へ出さないため。`urllib` の既定の opener は両方をやる):
+  3xx は**常に失敗**(`http_redirect`。`Location` は読まない・辿らない・ログに書かない。状態を変えない・`http_unreachable` と同じ数え方)。
+  実装は `urllib.request.build_opener(ProxyHandler({}), <リダイレクトを拒否する HTTPRedirectHandler>)` のように、**プロキシの環境変数 (`http_proxy` / `HTTPS_PROXY` / `ALL_PROXY` 等) を無視**し、リダイレクトを辿らない opener を使う。
+  Python 3.12 の既定 opener に任せない。テスト: 3xx を返す偽サーバーに接続が 1 回だけで第 2 の宛先が受けないこと・プロキシ env を立てても直接つなぐこと。
 - どの失敗も**ログ・例外文・状態にトークン・応答の本文を出さない** (固定コードと数だけ)。例外は文字列化しない。
 - トークンが解決できない (`no_credentials` 以外) → `irc-receiver.json` を `enabled: false` (理由は固定コード)。Director へ 1 回。取り直しは 600 秒間隔。
 
@@ -419,8 +434,11 @@ irc:
 2. **送る前に `mux.capture(<窓>)` で画面を読み**、次を**全部**満たすときだけ送る:
    (a) 末尾の数行に Claude の入力欄 (`❯` で始まる行) があり、その行が選択肢でない (`❯ 1.` のように `❯` の直後が数字+`.` でない)、
    (b) 末尾の 30 行に確認ダイアログの印 (`Do you want to` / `Esc to cancel` / `[y/N]` / 番号つき選択肢の行) が**無い**、
-   (c) **入力欄が空**: (a) の `❯` の行で、`❯` と空白を除いた残りが空 (人が打ちかけの文章・貼り付けた下書きが無い)。
-       `lib_mux.send` は送信前に `C-u` で入力欄を消す (再送で文が連結しないため) ので、**空でない欄に送ると下書きが失われる**。
+   (c) **入力欄の全体が空**: 入力欄は枠 (上下の罫線 `─` だけの行) で囲まれ、複数行の下書きは 2 行目以降が `❯` を持たない。
+       そこで **(a) の `❯` の行を含む枠の内側のすべての行**(上の罫線の次の行から下の罫線の前の行まで)を読み、
+       各行から `❯`・枠の縦線 `│`・空白を除いた残りが**すべて空**のときだけ空と見なす (1 行目が空で 2 行目以降に文字がある下書きは `draft`)。
+       **上下どちらかの罫線が末尾の窓に見つからない・枠の中が 8 行を超える・行の形が想定外 → `unknown`** (空と判定しない)。
+       `lib_mux.send` は送信前に `C-u` で入力欄を消す (再送で文が連結しないため) ので、**空でない欄に送ると下書きが失われる** (消えなかった行は通知と一緒に送信されうる)。
    **入力欄が空でない → `draft`: 送らず次のサイクルへ延期**する (`attempts` は増やさない・ログに `deferred_draft`。24 時間のうちに空けば届く)。
    **読めない・空・判定できない → 送らない** (次のサイクルへ回す。24 時間のうちに空けば届く)。
    `lib_mux` の `_text_in_input_line` と同じ「末尾の窓で `❯` を探す」作りにする (全画面を探さない = スクロールバックの古い `❯` を拾わない)。判定は**純粋関数** (画面の文字列 → `ready` / `dialog` / `draft` / `unknown`。`ready` は (a)(b)(c) すべてを満たすときだけ) にして、固定の画面サンプルで網羅テストする。
@@ -533,7 +551,7 @@ tmux / herdr の `send` は断らない。そこで:
 | bot (`tyz-works/irc-relay`) | IRC 接続・呼びかけの判定・コマンド・登録/受信箱・HTTP `/v1`・systemd unit の雛形 | §2・§3・付録 A/B |
 | crewvia t007 | `lib_irc_relay.py`・dispatcher 差し込み・config の `irc:`・`agents/*.md` の節・不変条件 7 の追記・CLAUDE.md の更新 | §4〜§6・付録 A/B/C |
 
-crewvia 側の追記 (t007 で行う): CLAUDE.md の「不変条件 7」に `irc-state.json` / `irc-receiver.json` を足す、
+crewvia 側の追記 (t007 で行う): CLAUDE.md の「不変条件 7」に `irc-state.json` / `irc-quarantine.json` / `irc-receiver.json` を足す、
 `scripts/CLAUDE.md` に `lib_irc_relay.py` の契約、`knowledge/file-map.md` に 1 項、`config/crewvia.yaml` に `irc:`。
 **bot の URL・トークンの値・instance の実運用値を config のコミットに入れない** (空のまま)。
 

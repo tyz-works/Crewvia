@@ -209,6 +209,23 @@ def test_classify_pane(scr, expect):
     assert L.classify_pane(scr) == expect
 
 
+@pytest.mark.parametrize("box", [
+    ("❯ ❯",), ("❯ │",), ("❯ ", "│"), ("❯ ", "  │  "), ("❯ ❯❯❯",), ("❯ │x",),
+])
+def test_draft_made_of_prompt_or_border_chars_is_nonempty(box):
+    assert L.input_box_state(screen(*box)) == "nonempty"
+    assert L.classify_pane(screen(*box)) == "draft"
+
+
+@pytest.mark.parametrize("box", [("❯ ",), ("❯",), ("❯ ", "   ")])
+def test_empty_box_stays_empty(box):
+    assert L.input_box_state(screen(*box)) == "empty"
+
+
+def test_border_pair_around_empty_content_is_still_empty():
+    assert L.input_box_state(screen("❯ │   │", "│   │")) == "empty"
+
+
 def test_classify_pane_prompt_far_above_tail_is_unknown():
     scr = screen("❯ ", below=tuple(f"footer {i}" for i in range(20)))
     assert L.classify_pane(scr) == "unknown"

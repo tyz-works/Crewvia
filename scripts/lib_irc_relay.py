@@ -828,8 +828,13 @@ def input_box_state(screen):
             break
     if lower is None:
         return 'unknown'
-    for line in lines[prompt:lower]:
-        if line.replace('❯', '').replace('│', '').strip():
+    for k, line in enumerate(lines[prompt:lower]):
+        body = line.strip()
+        if k == 0 and body.startswith('❯'):
+            body = body[1:].strip()                  # 特定したプロンプト記号 1 つだけ (下書きの中の ❯ は残す)
+        if len(body) >= 2 and body[0] == '│' and body[-1] == '│':
+            body = body[1:-1].strip()                # 実際の罫線 = 行の両端の対だけ (下書きの中の │ は残す)
+        if body:
             return 'nonempty'
     return 'empty'
 
@@ -1069,6 +1074,14 @@ def run_cycle(registry_dir, config, token, token_reason, mux, *, now=None, confi
                 if not write_state(registry_dir, state):
                     log('WARNING: irc-state: poll 失敗の backoff を書けない')
                 poll = dict(poll, fail_streak=state['fail_streak'])
+                summary['poll'] = poll
+            if (poll.get('code') in ('poll_timeout', 'poll_failed') and is_missing(state)):
+                # 状態がまだ無いまま最初の poll が失敗: 新しい状態を作って backoff を永続化する (毎サイクル即再試行しない)
+                state = dict(fresh_state(identity), last_poll_at=now, fail_streak=1)
+                if not write_state(registry_dir, state):
+                    log('WARNING: irc-state: poll 失敗の backoff を書けない')
+                    state = read_state(registry_dir, warn=log)
+                poll = dict(poll, fail_streak=1)
                 summary['poll'] = poll
             if is_broken(state):
                 summary.update(reason='state_unreadable', state_unreadable=True)

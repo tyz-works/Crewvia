@@ -378,7 +378,7 @@ CREWVIA_MUX=rex ./crewvia
 
 ### Running with hc (herdr-core, alternative to tmux / herdr / Rex)
 
-[herdr-core](https://herdr.dev) (`hc`) is a newer, lighter terminal manager than can also be the
+[herdr-core](https://herdr.dev) (`hc`) is a newer, lighter terminal manager that can also be the
 parallel execution backend. Install the `hc` CLI, then select it with `mode: hc` in
 `config/crewvia.yaml` or per launch:
 

@@ -278,11 +278,31 @@ def test_spawn_wraps_cmd_with_path_export_including_local_bin(fake):
     [call] = [c for c in fake.raw_calls() if c[0] == "run"]
     assert "--" in call
     script = call[-1]
-    assert script.startswith('export PATH="')
+    assert script.startswith("export PATH='")
     assert "scripts/bin" in script
     assert "$HOME/.local/bin" in script
     assert script.endswith("echo hi")
     assert call[-3:-1] == ["bash", "-lc"]
+
+
+def test_spawn_single_quotes_the_scripts_bin_literal(fake, monkeypatch):
+    """RED proof target: embedding `scripts/bin` raw (no quoting) inside the
+    `export PATH=...` prefix (t070 P1) must turn this red — a checkout path
+    containing a shell metacharacter would otherwise break out of the
+    surrounding string, or worse, inject a command into the spawned pane."""
+    monkeypatch.setattr(lib_mux, "_SCRIPTS_DIR",
+                         lib_mux.Path("/tmp/weird'; echo pwned #/scripts"))
+    fake.set([
+        _status_rule(),
+        {"match": ["run"], **ok(out=json.dumps({"address": "t1", "state": "live"}))},
+    ])
+    assert backend().spawn("Omar-worker", "echo hi", cwd="/tmp") is True
+    [call] = [c for c in fake.raw_calls() if c[0] == "run"]
+    script = call[-1]
+    # the literal is single-quoted with embedded `'` escaped — the metacharacters
+    # never leave that quoting, so bash sees one opaque PATH component, not an
+    # injected `echo pwned`.
+    assert "export PATH='/tmp/weird'\\''; echo pwned #/scripts/bin:'" in script
 
 
 def test_spawn_lowercases_the_hc_name_and_keeps_the_label(fake):

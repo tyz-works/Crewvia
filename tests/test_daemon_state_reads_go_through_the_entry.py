@@ -207,6 +207,15 @@ ALLOWED_JSON_PARSES: dict[tuple[str, str, str], str] = {
     ("lib_mux.py", "_herdr_pane_get_bound", "json.loads(data.split(b\"\\n\")[0].decode())"):
         _EXTERNAL_RESPONSE + "herdr socket の `pane.get` 応答 (束縛済み接続)。デーモン側状態ストア "
         "(registry/daemons) のファイルではない。壊れていれば None = 「観測できなかった」と読む",
+    ("lib_mux.py", "_hc_data", "json.loads(res.out)"):
+        _EXTERNAL_RESPONSE + "`hc <cmd> --json` の stdout (JSON オブジェクト 1 個。design doc §5)。デーモン側状態ストア "
+        "(registry/daemons) のファイルではない。読めない・オブジェクトでないは None = 「読めなかった」(空の dict に潰さない)",
+    ("lib_mux.py", "_hc_error_kind", "json.loads(res.err)"):
+        _EXTERNAL_RESPONSE + "`hc <cmd> --json` が失敗したときの stderr のエラー封筒 (design doc §5)。"
+        "壊れていれば None = 「kind 不明」として呼び出し側の catch-all に委ねる",
+    ("lib_mux.py", "_hc_connect", "json.loads(line)"):
+        _EXTERNAL_RESPONSE + "`hc connect` の line-delimited JSON-RPC 応答 1 行 (design doc §3.5)。"
+        "壊れていれば (None, 'unparseable hc connect response') = 「読めなかった」",
     # -- (E) Telegram Bot API の応答 / poll サブプロセスの標準出力 (PR-A) -----------------
     ("lib_telegram.py", "api_call", "json.loads(raw.decode('utf-8', errors='replace'))"):
         _EXTERNAL_RESPONSE + "Telegram Bot API の HTTP 応答。壊れていれば `ApiResult(error='bad_json')` = 何も受けなかった扱い "

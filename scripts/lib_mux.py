@@ -5727,6 +5727,15 @@ _HC_GENERATIONS = frozenset({1})
 #: pane to read the TUI footer and whatever led up to it".
 _HC_CAPTURE_LINES = 200
 
+
+def _hc_sh_single_quote(value: str) -> str:
+    """`'...'` with embedded quotes escaped (t070 P1 — same formula as
+    start.sh's `_shq` / `lib_daemon_watch._sh_single_quote`).  Duplicated
+    here rather than imported: `lib_daemon_watch` imports from this module,
+    so the reverse import would be circular."""
+    return "'" + str(value).replace("'", "'\\''") + "'"
+
+
 HcResult = namedtuple("HcResult", "rc out err timed_out")
 
 
@@ -6025,17 +6034,21 @@ class HcBackend(_Backend):
         §6): hc's `terminal.run` execs `argv` directly, with none of the
         login-shell PATH (`~/.local/bin`, `scripts/bin`) a tmux/herdr pane's
         shell already has — confirmed by the measured `spawn_failed` on a
-        bare `claude` argv.  `cmd` itself may carry its own `export PATH=...`
-        (`lib_daemon_watch.spawn_command()`, start.sh's ENV_EXPORTS) for
-        other reasons; this prefix only guarantees a sane baseline exists
-        before that runs, it does not replace it.
+        bare `claude` argv.  The `scripts/bin` literal is single-quoted
+        (`_hc_sh_single_quote`, t070 P1) before being embedded — the same
+        formula start.sh's `_shq` uses for the same reason: a raw embed
+        breaks (or, worse, lets a crafted checkout path inject) the moment
+        the path contains a shell metacharacter.  `cmd` itself may carry its
+        own `export PATH=...` (`lib_daemon_watch.spawn_command()`, start.sh's
+        ENV_EXPORTS) for other reasons; this prefix only guarantees a sane
+        baseline exists before that runs, it does not replace it.
         """
         self._guard("spawn", name)
         self.last_spawn_refusal = None
         hc_name = _pane_name(name).lower()
         label = f"crewvia_name={_pane_name(name)}"
-        path_prefix = (f'export PATH="{_SCRIPTS_DIR / "bin"}:'
-                       f'$HOME/.local/bin:$PATH"; ')
+        scripts_bin = _hc_sh_single_quote(str(_SCRIPTS_DIR / "bin") + ":")
+        path_prefix = f'export PATH={scripts_bin}"$HOME/.local/bin:$PATH"; '
         args = ["run", "--bg", "--name", hc_name, "--label", label]
         if cwd:
             args += ["--cwd", cwd]

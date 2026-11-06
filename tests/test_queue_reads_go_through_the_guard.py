@@ -969,6 +969,11 @@ ALLOWED_SUBPROCESS_CALLS = {
         "`rex [-S <endpoint>] --autostart=false <args>`。rex に block / session を操作させるだけで、"
         "queue / registry のファイルは渡さない。全 rex 呼び出しの唯一の入口 (空の宛先は拒否・timeout・stdin=DEVNULL。"
         "knowledge/rex-mux-backend.md §11)",
+    ("lib_mux.py", "_hc_run", "hc"):
+        "`hc <args> --json`。hc に terminal を操作させるだけで、queue / registry のファイルは渡さない "
+        "(knowledge/herdr-core-mux-backend.md §5)",
+    ("lib_mux.py", "_hc_connect", "hc"):
+        "`hc connect` に 1 行の JSON-RPC リクエストを渡すだけ (design doc §3.5)。queue / registry のファイルは渡さない",
 
     # -- lib_daemon_watch.py: 主 checkout の版ずれ検知 (B2 / #26) -----------
     # どれも `git` に repo の HEAD / 履歴 / 差分ファイル名を訊くだけで、

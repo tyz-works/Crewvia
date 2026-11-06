@@ -789,15 +789,38 @@ def _is_rule(line):
 
 # 作業中 (busy) の印。`lib_mux.rex_screen_state` の working は「esc to interrupt」だけを見るが、狭い窓では出ないことがある。
 # 実物の busy 画面 (tests/fixtures/irc/busy-screen-sora.txt) は入力欄の上に `✻ Discombobulating… (thought for 5s)` だけが出る。
-# スピナー行 = 行頭の記号 + 単語 + `…`。完了後の行 (`✻ Cooked for 5s`) には `…` が無いので busy にならない。
+# スピナー行 = **字下げなしの行頭 (列 0)** の記号 + 単語 + `…` + (行末 か ` (`)。完了後の行 (`✻ Cooked for 5s`) には `…` が無い。
+# さらに**入力欄の上の罫線の直上の数行以内**にあるときだけ数える (idle の画面の本文・箇条書きの `* Next steps…` を拾わない)。
+# 記号 (`·` `*` を含む) は外さない: スピナーはこれらをアニメーションで回すので、外すとその瞬間の busy を見逃す。
 _BUSY_HINT_RE = re.compile(r'esc to interrupt', re.IGNORECASE)
-_BUSY_SPINNER_RE = re.compile(r'^\s*[✻✽✶✳✢✦·*]\s+[^\W\d_][\w-]*…')
+_BUSY_SPINNER_RE = re.compile(r'[✻✽✶✳✢✦·*] [^\W\d_][\w-]*…(?: \(|$)')
 _BUSY_WINDOW = 12               # 末尾この行数だけ見る (スクロールバックの古いスピナー行を拾わない)
+_BUSY_SPINNER_ABOVE_BOX = 4     # 入力欄の上罫線からこの行数以内 (間に `✔ Update installed` 等の状態行が挟まる)
+
+
+def _prompt_index(lines):
+    """入力欄の `❯` の行番号 (上に罫線がある場合だけ)。無ければ None。`input_box_state` と同じ特定。"""
+    tail_start = max(0, len(lines) - _PROMPT_WINDOW)
+    for i in range(len(lines) - 1, tail_start - 1, -1):
+        if lines[i].startswith('❯'):
+            if i == 0 or not _is_rule(lines[i - 1]):
+                return None
+            return i
+    return None
 
 
 def _is_busy(lines):
     tail = lines[-_BUSY_WINDOW:]
-    return any(_BUSY_HINT_RE.search(line) or _BUSY_SPINNER_RE.match(line) for line in tail)
+    if any(_BUSY_HINT_RE.search(line) for line in tail):
+        return True
+    prompt = _prompt_index(lines)
+    if prompt is None:
+        return False                     # 位置を特定できない → busy と断定しない (呼び出し側で unknown = 送らない)
+    rule = prompt - 1
+    for line in lines[max(0, rule - _BUSY_SPINNER_ABOVE_BOX):rule]:
+        if _BUSY_SPINNER_RE.match(line.rstrip()):
+            return True
+    return False
 
 
 def classify_pane(screen):

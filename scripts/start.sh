@@ -234,19 +234,19 @@ if [[ "${ROLE}" == "director" ]] && [[ -z "${CREWVIA_MUX_ENABLED:-}" ]]; then
   # server の検査・export・案内文はこの値だけを使う。env と config の mode: が別の
   # backend を指すとき (例: CREWVIA_MUX=rex + mode: herdr) に、config 側の backend の
   # 検査や export が env を上書きして食い違う事故を防ぐ (QA F1 / Codex F1)。
-  # env も config も tmux / herdr / rex でなければ _EFFECTIVE_BACKEND は空 (auto / inline)。
+  # env も config も tmux / herdr / rex / hc でなければ _EFFECTIVE_BACKEND は空 (auto / inline)。
   _ENV_MUX="$(printf '%s' "${CREWVIA_MUX:-}" | tr '[:upper:]' '[:lower:]')"
   MODE_FROM_CONFIG=$(grep -E '^mode:[[:space:]]*\S' "$CONFIG_FILE" 2>/dev/null | awk '{print $2}' | tr -d '"' | head -1)
   _EFFECTIVE_BACKEND=""
   case "$_ENV_MUX" in
-    tmux|herdr|rex) _EFFECTIVE_BACKEND="$_ENV_MUX" ;;
+    tmux|herdr|rex|hc) _EFFECTIVE_BACKEND="$_ENV_MUX" ;;
   esac
   if [[ -n "$_EFFECTIVE_BACKEND" ]]; then
-    # env が config の mode: より優先。config が別の backend (tmux / herdr / rex) を
+    # env が config の mode: より優先。config が別の backend (tmux / herdr / rex / hc) を
     # 指すときだけ env 側に揃える。config が空 (→ 従来どおり確認プロンプト) や inline
     # (→ 従来どおり inline) のときと、env == config のときの既存の動作は変えない。
     case "$MODE_FROM_CONFIG" in
-      tmux|herdr|rex) MODE_FROM_CONFIG="$_EFFECTIVE_BACKEND" ;;
+      tmux|herdr|rex|hc) MODE_FROM_CONFIG="$_EFFECTIVE_BACKEND" ;;
     esac
     export CREWVIA_MUX="$_EFFECTIVE_BACKEND"
   fi
@@ -288,6 +288,20 @@ if [[ "${ROLE}" == "director" ]] && [[ -z "${CREWVIA_MUX_ENABLED:-}" ]]; then
     fi
   fi
 
+  # hc (herdr-core) が実効 backend のときだけ hc の不在チェックを先に行う
+  if [[ "$_EFFECTIVE_BACKEND" == "hc" ]]; then
+    if ! command -v hc >/dev/null 2>&1; then
+      echo "[crewvia] ERROR: CREWVIA_MUX=hc が設定されていますが hc バイナリが見つかりません。" >&2
+      echo "          hc (herdr-core) をインストールするか CREWVIA_MUX=tmux に変更してください。" >&2
+      exit 1
+    fi
+    if ! python3 "${SCRIPT_DIR}/lib_mux.py" available >/dev/null 2>&1; then
+      echo "[crewvia] ERROR: CREWVIA_MUX=hc が設定されていますが hc server を使えません。" >&2
+      echo "          'hc server status' を確認してください。" >&2
+      exit 1
+    fi
+  fi
+
   if [[ "$MODE_FROM_CONFIG" == "herdr" ]]; then
     # herdr backend を config で指定している場合も不在チェック
     if ! command -v herdr >/dev/null 2>&1 || ! python3 "${SCRIPT_DIR}/lib_mux.py" available >/dev/null 2>&1; then
@@ -302,6 +316,14 @@ if [[ "${ROLE}" == "director" ]] && [[ -z "${CREWVIA_MUX_ENABLED:-}" ]]; then
     export CREWVIA_MUX=rex
     export CREWVIA_MUX_ENABLED=1
     echo "[crewvia] rex 並列モードで起動します（config 設定）。"
+  elif [[ "$MODE_FROM_CONFIG" == "hc" ]]; then
+    if ! command -v hc >/dev/null 2>&1 || ! python3 "${SCRIPT_DIR}/lib_mux.py" available >/dev/null 2>&1; then
+      echo "[crewvia] ERROR: ${_EFFECTIVE_BACKEND:+CREWVIA_MUX=hc / }mode: hc が設定されていますが hc が利用できません。" >&2
+      exit 1
+    fi
+    export CREWVIA_MUX=hc
+    export CREWVIA_MUX_ENABLED=1
+    echo "[crewvia] hc 並列モードで起動します（config 設定）。"
   elif [[ "$MODE_FROM_CONFIG" == "tmux" ]]; then
     export CREWVIA_MUX=tmux
     export CREWVIA_MUX_ENABLED=1
@@ -310,7 +332,7 @@ if [[ "${ROLE}" == "director" ]] && [[ -z "${CREWVIA_MUX_ENABLED:-}" ]]; then
     export CREWVIA_MUX_ENABLED=0
     echo "[crewvia] インラインモードで起動します（config 設定）。"
   elif ! python3 "${SCRIPT_DIR}/lib_mux.py" available >/dev/null 2>&1; then
-    echo "[crewvia] mux backend (tmux / herdr / rex) 未検出 → インラインモードで起動します。" >&2
+    echo "[crewvia] mux backend (tmux / herdr / rex / hc) 未検出 → インラインモードで起動します。" >&2
     echo "          （並列 Worker 起動には 'brew install tmux' を推奨）" >&2
     export CREWVIA_MUX_ENABLED=0
   elif [[ ! -e /dev/tty ]]; then

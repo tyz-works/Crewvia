@@ -353,7 +353,43 @@ branch 名の許可集合は git の `check-ref-format` より狭く、**部分�
 
 ### `lib_mux.py`
 
-mux 抽象化モジュール（TmuxBackend / HerdrBackend / RexBackend）
+mux 抽象化モジュール（TmuxBackend / HerdrBackend / RexBackend / HcBackend）
+`HcBackend`（`CREWVIA_MUX=hc` / `mode: hc`。20261106-herdr-core-backend t002）: 設計・実測は
+`knowledge/herdr-core-mux-backend.md`。名前 ↔ terminal の正本は spawn 記録（`handle` = hc の
+`address`。`t7` 等、spawn ごとに不変）——hc の `name` は「終わった（finished）」terminal を
+`hc rm` するまで残し、同じ `name` の新しい spawn も拒否しないため、`name` ベースの単体
+問い合わせ（`get`/`kill`等）は常に作成時刻が最新の terminal に解決する（設計 §3.0）。
+識別が要る動詞（`pid`/`state`/`record_existence`/daemon pane の `kill`）は記録済みの
+`address` を使い、初回解決だけ `name`（小文字化。hc の `--name` は `a-z 0-9 - _ .` のみ
+受け付けるため crewvia の大文字始まりペイン名は小文字化して渡す。`--label
+crewvia_name=<原綴り>` で原綴りを残す）。`list()` だけ `hc connect`（stdin/stdout の
+JSON-RPC）で `terminal.list({"all": false})` を 1 回呼ぶ（CLI `hc ls` は `labels` を
+返さない）。版固定は Rex と同じ fail-closed——`hc connect` の `hello.generation` が `1`
+以外・読めないときは `available()` False。エラーは `hc <cmd> --json` の**stderr**に出る
+（stdout は失敗時空）。`record_existence()` は `not_found` だけ `PANE_GONE`、`finished`含む
+それ以外は `PANE_UNOBSERVED`（hc の `kill` は finished terminal にもエラーにならず成功を
+返す = 冪等。`kill()` 自体は成功と見なし記録だけ畳むが `hc rm` は呼ばない）。`state()` は
+`reported: false` を `"unknown"` に倒す（`idle` にしない。起動未完了の Worker を手が空いて
+いると誤認しないため）——hc 固有の `status.state == "error"` はそのまま通す
+（dispatcher の Rule 5 にはまだ分岐が無く、追加は別タスク）。`spawn()` の argv は
+`bash -lc "export PATH=\"$CREWVIA_REPO_ROOT/scripts/bin:$HOME/.local/bin:$PATH\"; " + cmd`
+（hc の `terminal.run` は argv を直接 exec するため、hc server 自身の素の PATH には
+`~/.local/bin`（`claude`/`hc` の実体）が無い）。`Mux.verify_sent()` の `isinstance` 分岐に
+`HcBackend` も足した（`HcBackend.verify_sent()` は今のところ screen-scraping のみ。
+`SendResult.started` ベースの経路は同一プロセスで `send()` の結果を読み戻す手段が無いため
+未実装——設計 §8.3 参照）。`attach()` は常に False（tty が要る。自動化からは呼べない）、
+`attach_cmd()` は `["hc", "attach", <target>]`（Rex と違い本物の端末 client がある）。
+dispatcher/watchdog 自身の hc pane が finished のときの `kill()`/`may_destroy()` は共有の
+fail-closed のまま（`--force` 無しでは拒否）——実害は小さい（finished と分かった時点で
+`kill()` を呼ばず `record_existence` 経由で記録を畳む経路に進む）ので、Rex 相当の
+`may_destroy()` 上書きはこの task ではやらない。入口スクリプト 3 つ（`scripts/start.sh` の director 専用 backend 解決・トップレベルの
+`./crewvia` 自身の `mode:` 読み取り・`scripts/crewvia-stop.sh --full` の backend 別分岐）にも
+`hc` を足した——いずれも足し忘れると事故になる（`CREWVIA_MUX=hc` が `mode: herdr` の config に
+黙って上書きされる／`mode: hc` が「不明な mode」で `tmux` に倒される／`--full` が無関係な
+herdr server を止める）。`scripts/setup-new-env.sh` の mux 検出表示にも `hc` を足した。
+テスト: `tests/test_hc_backend.py`（偽の `hc` を PATH に置く。`tests/hc_harness.py`）・
+`tests/test_rex_pr2_wiring.py`（start.sh の分岐に `hc` のケースを追加）・
+`tests/test_hc_crewvia_launcher_wiring.py`（`./crewvia` と `crewvia-stop.sh` の分岐）。
 `RexBackend`（`CREWVIA_MUX=rex` / `mode: rex`。PR #331・#332）: 設計・実測・持ち越しは
 `knowledge/rex-mux-backend.md`。名前 ↔ block_id の正本は spawn 記録（label は一意でない）。
 `rex` は全呼び出しに `-S unix://… --autostart=false` と timeout を付ける。`api_revision` が 9

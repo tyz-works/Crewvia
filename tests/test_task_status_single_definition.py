@@ -65,6 +65,8 @@ ALLOWLIST = {
         "herdr の**ペイン**の agent status (idle / done / blocked)。task の status ではない",
     ("lib_mux.py", '("blocked", "working", "idle", "done", "unknown")'):
         "herdr の**ペイン**の agent status。task の status ではない",
+    ("lib_mux.py", '("idle", "working", "done", "blocked", "error")'):
+        "hc (herdr-core) の**ペイン**の agent status。task の status ではない (HerdrBackend の行と同じ理由)",
     ("plan.sh", "('drafting', 'ready')"):
         "**mission** の status (drafting / ready)。mission の語彙は S1 の範囲外 (state-store.md §0)",
     ("plan.sh", "('done', 'verified')"):

@@ -107,7 +107,7 @@ fi
 # スキップしており、旧変数が残っているだけで mode: の変更が無視される事故が
 # あった)。存在すれば無視される旨だけ警告する。
 if [[ -n "${CREWVIA_TMUX:-}" ]]; then
-  echo "[crewvia] WARNING: CREWVIA_TMUX は廃止されました（無視されます）。CREWVIA_MUX=tmux|herdr|rex を使用してください。" >&2
+  echo "[crewvia] WARNING: CREWVIA_TMUX は廃止されました（無視されます）。CREWVIA_MUX=tmux|herdr|rex|hc を使用してください。" >&2
 fi
 
 if [[ -z "${CREWVIA_MUX:-}" ]]; then
@@ -121,6 +121,9 @@ if [[ -z "${CREWVIA_MUX:-}" ]]; then
       ;;
     rex)
       export CREWVIA_MUX=rex
+      ;;
+    hc)
+      export CREWVIA_MUX=hc
       ;;
     inline)
       : # CREWVIA_MUX は export しない → start.sh 側がインラインモードにフォールバックする
@@ -185,6 +188,22 @@ if [[ "$NEEDS_MUX" == "1" ]] && [[ "${CREWVIA_MUX:-}" == "rex" ]]; then
   fi
 fi
 
+# --- hc (herdr-core) 到達チェック / 自動起動（hc モード時） ---
+# herdr と同じく lib_mux.py available() が server 起動（冪等）と版（protocol generation）の
+# 確認を両方行う。hc は非 Rex backend なので ensure-server 相当は available() そのもの。
+if [[ "$NEEDS_MUX" == "1" ]] && [[ "${CREWVIA_MUX:-}" == "hc" ]]; then
+  if ! command -v hc >/dev/null 2>&1; then
+    echo "[crewvia] ERROR: CREWVIA_MUX=hc が設定されていますが hc バイナリが見つかりません。" >&2
+    echo "          hc (herdr-core) をインストールするか CREWVIA_MUX=tmux に変更してください。" >&2
+    exit 1
+  fi
+  if ! python3 "${SCRIPT_DIR}/scripts/lib_mux.py" available >/dev/null 2>&1; then
+    echo "[crewvia] ERROR: hc server を使えません。" >&2
+    echo "          'hc server status' を確認してください。" >&2
+    exit 1
+  fi
+fi
+
 case "$SUBCMD" in
   status)
     exec bash "${SCRIPT_DIR}/scripts/plan.sh" status "${@:2}"
@@ -222,7 +241,7 @@ Token:   config/.taskvia-token  (1行にトークンを書く、gitignore 済み
 
 Environment variables (config より優先):
   CREWVIA_TASKVIA=enabled|disabled|ask  Taskvia 連携モード（最優先）
-  CREWVIA_MUX=tmux|herdr|rex            mux バックエンド（config の mode: より優先）
+  CREWVIA_MUX=tmux|herdr|rex|hc         mux バックエンド（config の mode: より優先）
   TASKVIA_TOKEN=sk-...                  API トークン
   TASKVIA_URL=https://...               Taskvia URL
 
@@ -237,6 +256,8 @@ Behavior:
   rex モード: rex server が無ければ ./crewvia が掃除した env で起動します（既に居れば使うだけ）。
     rex の CLI には端末で入る client が無いので、窓は Rex.app で開いてください
     （Rex.app が接続していれば Director の窓へ focus します）。
+  hc モード: hc server が起動していなければ ./crewvia が自動で起動します（既に居れば使うだけ）。
+    hc には本物の端末 client があります: 'hc attach <name>'（tty が必要。自動 attach はしません）。
 HELP
     ;;
   *)

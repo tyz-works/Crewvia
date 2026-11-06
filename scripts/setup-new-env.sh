@@ -73,15 +73,17 @@ for tool in bash git curl jq python3 gh claude; do
     missing+=("$tool")
   fi
 done
-# mux: tmux / herdr / rex のどれか 1 つあれば OK
+# mux: tmux / herdr / rex / hc のどれか 1 つあれば OK
 if command -v tmux >/dev/null 2>&1; then
   printf "  [ok]   %-10s %s (mux backend)\n" "tmux" "$(command -v tmux)"
 elif command -v herdr >/dev/null 2>&1; then
   printf "  [ok]   %-10s %s (mux backend)\n" "herdr" "$(command -v herdr)"
 elif command -v rex >/dev/null 2>&1; then
   printf "  [ok]   %-10s %s (mux backend)\n" "rex" "$(command -v rex)"
+elif command -v hc >/dev/null 2>&1; then
+  printf "  [ok]   %-10s %s (mux backend)\n" "hc" "$(command -v hc)"
 else
-  printf "  [MISS] %-10s (tmux / herdr / rex のどれかが必要)\n" "tmux/herdr/rex"
+  printf "  [MISS] %-10s (tmux / herdr / rex / hc のどれかが必要)\n" "tmux/herdr/rex/hc"
   missing+=("tmux")
 fi
 # dashboard を使うなら追加

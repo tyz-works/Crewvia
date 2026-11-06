@@ -6,6 +6,7 @@
 - 書いた人: Worker Minjun（mission `20261106-herdr-core-backend` t001）。Director の事前メモ（card 本文）の実測を自分でも本機（本番の hc server、desktop-l8nqlib、holder pid 1246708 時点）で再現し、JSON Schema（`hc schema`）とライブコマンドの両方で裏を取った
 - **改訂（attempt 2）**: Worker Mateo。PR #344 の review task（t006）が P1 1件・P2 2件・P3 2件を指摘して差し戻した（`queue/missions/20261106-herdr-core-backend/history/t006/0001-end-ex-90c5aef661cb4762a10585a1e01aa51d.md`）。全指摘を自分で実機再現してから反映した——P1: 名前の写像（新設 §3.2）。P2: エラー JSON は stderr（§5 冒頭に明記）・`kind` 一覧に `needs_update` が抜けていた（§5 の表を25件に修正）。P3: `hc schema` の schemas 数は34ではなく35（実測で訂正）・`openrpc` のバージョン文字列の意味を訂正・`state`（terminal 生死）と`status.state`（agent status）が同名の別概念である注記を追加（§3 冒頭・§7.1）。「裏が取れた主張」（review 本文に列挙）は取り直していない
 - **改訂（attempt 3）**: Worker Mateo。review t006 の新 P1（`hc ls --json` は `--label` 併用でも `labels` 欄を返さず、attempt 2 の §3.2-2「往復する」は `ListResult.terminals[]` の `$ref` だけを根拠にした未実測の推測だった）を自分で再現して訂正した。出口は Director が提示し自分でも再現した `hc connect`（JSON-RPC API）の `terminal.list`——CLI の `ls` と違いフルの `Terminal`（`labels`/`pid`/`reported`/`status`/`argv`）を返す。`list()` だけこの API 経由にし、他の動詞は CLI のままにする理由を新設 §3.3 に書いた。§3.2-3・§9 をこれに合わせて書き直した
+- **改訂（attempt 4）**: Worker Mateo。review t006（attempt 3 完了後）の新 P1（`terminal.list` を `{"all": true}` で呼ぶ設計は `_Backend.list()` の契約——live のみ、`lib_mux.py:2516` Tmux / `:3891` Herdr の docstring——に反する。hc は `finished` を `hc rm` まで残すので、死んだ Worker が `list()` に居座り `dispatcher.sh:2018` の `director_live` 等の生存判定が黙って壊れる）を自分で再現して訂正した。§3（表の list 行）・§3.2-3・§2（再現コマンド）の 3 箇所を `{"all": false}` に直し、`all:false` でも live terminal のフルオブジェクト（`labels`/`pid` 込み）は間引かれないことを実測で確認した。§3.3 の該当箇所も `all:false` に揃えた
 - 凡例: 「**実測**」= 自分がこの作業中に確かめた出力。「**Director 実測**」= card に書かれていて自分では別の形で確かめた（同じプロセスは再現していない）事実。「**未確認**」= 確かめていない。「見込み」は推測
 - 比較対象は既存の `RexBackend`（`scripts/lib_mux.py:4884-5675`、`knowledge/rex-mux-backend.md`）と `HerdrBackend`（`scripts/lib_mux.py:3352-4883`）。**この文書は両方の既存 backend の挙動を変える提案を 1 点含む（§4）。tmux / herdr / rex は本番で使われているので、その影響範囲を §4.4 に明記した**
 
@@ -42,6 +43,16 @@ printf '{"jsonrpc":"2.0","id":1,"method":"terminal.list","params":{"all":true}}\
 printf '{"jsonrpc":"2.0","id":1,"method":"hello","params":{}}\n' | hc connect                       # generation:1（§10-1）
 printf '{"jsonrpc":"2.0","id":1,"method":"terminal.get","params":{"terminal":"tXYZDOESNOTEXIST"}}\n' | hc connect   # API のエラー封筒は error.data.kind（§3.3）
 hc rm cvprobet001b --json
+
+# attempt 4（review t006 attempt 3 の新 P1）: terminal.list は {"all": false} で呼ぶこと（list() の契約は live のみ）の再現
+hc run --bg --name cvprobet001c --label crewvia_name=Cvprobet001c-worker --json /home/tkadmin/.local/bin/hc --version
+printf '{"jsonrpc":"2.0","id":1,"method":"terminal.list","params":{"all":false}}\n' | hc connect   # 即終了済み → hidden_finished:1, terminals:[]（finished は出ない）
+printf '{"jsonrpc":"2.0","id":1,"method":"terminal.list","params":{"all":true}}\n' | hc connect    # 同じ terminal が finished のまま出る（labels/pid/reported 込みのフル Terminal）
+hc rm cvprobet001c --json
+hc run --bg --name cvprobet001d --label crewvia_name=Cvprobet001d-worker --json /bin/sh -c 'sleep 5'
+printf '{"jsonrpc":"2.0","id":1,"method":"terminal.list","params":{"all":false}}\n' | hc connect   # still live → terminals に 1 件（labels/pid 込みのフル Terminal。all:false でも間引かれない）
+hc kill cvprobet001d --json
+hc rm cvprobet001d --json
 ```
 
 `/proc/<hc server pid>/environ` を読んで、hc server が実際にどの PATH で子プロセスを起動するかを確認した（§6）。`hc server start --json` を 1 回呼び、既に生きている server に対して**冪等**（pid・uptime が変わらない。再起動しない）であることも確認した——`ensure-server` の候補として安全に呼べる。
@@ -62,7 +73,7 @@ hc は JSON-RPC 2.0 の methods（`hc schema` の `methods[]`）を CLI がラ�
 | `send(name, text)` | `hc send <t> <text> --json`（3 秒の入力休止待ちの後に paste + Enter。`--force` は blocked 相手への強制、crewvia は使わない） | 実測・`hc send --help` | 満たせる |
 | `keys(name, keys)` | `hc keys <t> <keys...> --json`。名前は `enter` / `esc` / `tab` / `up` / `down` / `ctrl+c` / `alt+x` / `f5` など——`translate_keys()` の hc 列を足す。choice dialog のカーソル移動に使う想定は herdr/tmux と同じ | 実測・`hc keys --help` | 満たせる |
 | `capture(name)` | `hc read <t> --lines N --json`。画面 + history。**作業中/blocked/error の間は history 読み出しでスクロールしない**（画面だけ・`why` に理由) という制約が `hc --skill` にある | `hc --skill`（未実行で検証、文面のみ） | 満たせる |
-| `list(suffix)` | **CLI の `hc ls` は使わない**（`labels` 欄を返さないため。§3.2-2 で実測・訂正）。`hc connect` の `terminal.list`（`{"all": true}`）を 1 回呼び、各要素の `labels.crewvia_name` を crewvia の `name` として返す（§3.2-3・§3.3）。`suffix` 絞り込みは `crewvia_name` に対して行う | 実測（§3.2-2・§3.2-3） | 満たせる |
+| `list(suffix)` | **CLI の `hc ls` は使わない**（`labels` 欄を返さないため。§3.2-2 で実測・訂正）。`hc connect` の `terminal.list`（**`{"all": false}`**。`list()` の契約は live のみ——`lib_mux.py:2516`（Tmux）/ `:3891`（Herdr）の docstring 「Return names of live windows/panes」。hc は `finished` を `hc rm` まで残す（§5）ので `all: true` だと死んだ Worker が居座り、`dispatcher.sh:2018` の `director_live` 等の生存判定が黙って壊れる。attempt 3 まではここが `{"all": true}` になっていた誤り——review t006 の新 P1）を 1 回呼び、各要素の `labels.crewvia_name` を crewvia の `name` として返す（§3.2-3・§3.3）。`suffix` 絞り込みは `crewvia_name` に対して行う | 実測（§3.2-2・§3.2-3・attempt 4 で `all:false`/`all:true` の差を取り直し） | 満たせる |
 | `kill(name, allow_foreign)` | `name`（crewvia 名）を §3.2 で小文字化した `<t>` に変換してから `hc kill <t> --json`。**`may_destroy_pane` を先に通す**のは herdr/tmux と同じ（§4.3 の identity で束縛）。**実測: 既に finished な terminal への kill はエラーにならず Terminal を返す**（冪等。herdr/tmux の「無いものを kill した」との扱いの違いに注意——hc は「もう死んでいる」を失敗にしない） | 実測 | 満たせる |
 | `pid(name)` | `name` を §3.2 で変換した `<t>` で `hc get <t> --json` の `pid`（Director 実測値 1257222 を確認済みの前提どおり、`hc get` は `pid` を持つ。実測では `exit_code:0` の `hc --version` 実行でも `pid: 1283891` が入っていた） | 実測 | 満たせる |
 | `attach(name)` | 常に `False`（tmux の「$TMUX が無いときは attach_cmd を使う」側と同じ扱い。hc には「中に居る」状態からの `switch-client` に当たる概念が無い見込み） | 見込み（未確認） | 満たせる（見込み） |
@@ -114,7 +125,29 @@ exit=6
    {"id":1,"jsonrpc":"2.0","result":{"hidden_finished":0,"terminals":[{"address":"t14","argv":["/home/tkadmin/.local/bin/hc","--version"],"cols":200,"created_ms":1793952220052,"cwd":"...","die_with_parent":false,"exit_code":0,"finished_ms":1793952220054,"identity":"ghostty","keep":false,"labels":{"crewvia_name":"Cvprobet001b-worker"},"name":"cvprobet001b","notify":true,"parent":null,"pid":1297336,"reason":"exited","reported":false,"rm":false,"rows":120,"screen":"exact","signal":null,"state":"finished","status":null,"status_ms":null,"template":null,"title":"","turn":0}]}}
    ```
 
-   `labels` / `pid` / `reported` / `status` / `argv` が `list` 1 回で全部そろう。**決定: `list(suffix)` は CLI の `hc ls` を使わず、`hc connect` 経由で `terminal.list`（`{"all": true}`）を 1 回呼ぶ**。各要素の `labels.crewvia_name` を crewvia の `name` として返し、`suffix`（`"-worker"` 等）の絞り込みは `crewvia_name` に対して行う。hc 自身の `name` 欄は内部実装の詳細として呼び出し元には見せない。実装は「`hc connect` を subprocess で起動 → 1 行の JSON-RPC リクエストを書く → 1 行読んで `json.loads` → stdin を閉じてプロセスを終了させる」という**呼び出しごとに使い捨てる**形にする（他の動詞と同じ「1 回の呼び出しに 1 回の subprocess」という既存の形を崩さない。常駐接続にして複数リクエストを使い回す案は §3.3 で退ける）
+   `labels` / `pid` / `reported` / `status` / `argv` が `list` 1 回で全部そろう。
+
+   **訂正（attempt 4。review t006 attempt 3 の新 P1）**: 上の実測は `{"all": true}` で呼んだものだが、attempt 3 の§3.2-3・§3.3・§2 はこれをそのまま `list()` の実装方式として採用していた。これは `_Backend.list()` の既存の契約（`lib_mux.py:2516` Tmux「Return names of live windows」・`:3891` Herdr「Return names of live panes…Always queries herdr live」）に反する——**`list()` は live のみを返す**契約で、hc は `finished` な terminal を `hc rm` で明示的に消すまで残し続ける（§5 の `finished` kind と同じ現象）。`{"all": true}` のままだと、終了した Worker の terminal が `list()` に居座り続け、`dispatcher.sh:2018` の `director_live = bool(_mux.list(suffix='-director'))` のような生存判定が「もう死んでいる Worker をまだ生きている」と黙って誤認する——`not_found` を見逃す §5 の事故と同じ形（「動くが黙って誤る穴」）。正しくは `{"all": false}` で呼ぶこと。実測で両方の挙動を取り直した:
+
+   ```
+   $ hc run --bg --name cvprobet001c --label crewvia_name=Cvprobet001c-worker --json /home/tkadmin/.local/bin/hc --version
+   {"address":"t18","agent":"hc","cwd":"/home/tkadmin/workspace/crewvia/.claude/worktrees/20261106-herdr-core-backend/t001-herdr-core-backend","name":"cvprobet001c","state":"live","turn":0}
+   $ printf '{"jsonrpc":"2.0","id":1,"method":"terminal.list","params":{"all":false}}\n' | hc connect
+   {"id":1,"jsonrpc":"2.0","result":{"hidden_finished":1,"terminals":[]}}
+   $ printf '{"jsonrpc":"2.0","id":1,"method":"terminal.list","params":{"all":true}}\n' | hc connect
+   {"id":1,"jsonrpc":"2.0","result":{"hidden_finished":0,"terminals":[{"address":"t18","argv":["/home/tkadmin/.local/bin/hc","--version"],"cols":200,"created_ms":1793953199876,"cwd":"/home/tkadmin/workspace/crewvia/.claude/worktrees/20261106-herdr-core-backend/t001-herdr-core-backend","die_with_parent":false,"exit_code":0,"finished_ms":1793953199878,"identity":"ghostty","keep":false,"labels":{"crewvia_name":"Cvprobet001c-worker"},"name":"cvprobet001c","notify":true,"parent":null,"pid":1312180,"reason":"exited","reported":false,"rm":false,"rows":120,"screen":"exact","signal":null,"state":"finished","status":null,"status_ms":null,"template":null,"title":"","turn":0}]}}
+   ```
+
+   （`--version` は一瞬で終わるので `terminal.run` が返った時点で既に `finished`。`all:false` はこれを `hidden_finished` に数えて隠し、`all:true` だけが同じ terminal を `labels`/`pid` 込みのフルオブジェクトで返す。）続けて、まだ生きている terminal では `all:false` でも間引かれないことも確認した:
+
+   ```
+   $ hc run --bg --name cvprobet001d --label crewvia_name=Cvprobet001d-worker --json /bin/sh -c 'sleep 5'
+   {"address":"t19","agent":"sh","cwd":"/home/tkadmin/workspace/crewvia/.claude/worktrees/20261106-herdr-core-backend/t001-herdr-core-backend","name":"cvprobet001d","state":"live","turn":0}
+   $ printf '{"jsonrpc":"2.0","id":1,"method":"terminal.list","params":{"all":false}}\n' | hc connect
+   {"id":1,"jsonrpc":"2.0","result":{"hidden_finished":0,"terminals":[{"address":"t19","argv":["/bin/sh","-c","sleep 5"],"cols":200,"created_ms":1793953206375,"cwd":"/home/tkadmin/workspace/crewvia/.claude/worktrees/20261106-herdr-core-backend/t001-herdr-core-backend","die_with_parent":false,"exit_code":null,"finished_ms":null,"identity":"ghostty","keep":false,"labels":{"crewvia_name":"Cvprobet001d-worker"},"name":"cvprobet001d","notify":true,"parent":null,"pid":1312429,"reason":null,"reported":false,"rm":false,"rows":120,"screen":"exact","signal":null,"state":"live","status":null,"status_ms":null,"template":null,"title":"","turn":0}]}}
+   ```
+
+   **決定: `list(suffix)` は CLI の `hc ls` を使わず、`hc connect` 経由で `terminal.list`（**`{"all": false}`**）を 1 回呼ぶ**。live の terminal だけが返り、`labels`/`pid` 等のフルオブジェクトは `all:false` でも間引かれない（間引かれるのは表示用の CLI `ls` の方——§3.2-2）ので、「live のみ」の契約と「フルオブジェクトが要る」の両方を同時に満たせる。各要素の `labels.crewvia_name` を crewvia の `name` として返し、`suffix`（`"-worker"` 等）の絞り込みは `crewvia_name` に対して行う。hc 自身の `name` 欄は内部実装の詳細として呼び出し元には見せない。実装は「`hc connect` を subprocess で起動 → 1 行の JSON-RPC リクエストを書く → 1 行読んで `json.loads` → stdin を閉じてプロセスを終了させる」という**呼び出しごとに使い捨てる**形にする（他の動詞と同じ「1 回の呼び出しに 1 回の subprocess」という既存の形を崩さない。常駐接続にして複数リクエストを使い回す案は §3.3 で退ける）
 4. `kill` / `pid` / `record_existence` / identity-ok など、crewvia 側が `name` を渡してくる動詞は全部「§3.2-1 と同じ小文字化を通してから hc を呼ぶ」。これらは `hc get` が既に `labels` を含むフルオブジェクトを返す（§3.2-2 で確認済み）ので、`list` のように API へ逃がす必要はなく CLI の `hc get <t> --json` のままでよい。hc からの戻り（`list` や `get` の結果）を crewvia 側に見せるときは必ず `labels.crewvia_name` 経由で原綴りに戻す
 5. `registry/mux/<name>.json` のファイル名・記録 id は**従来どおり crewvia の原綴り**（`Seo-worker.json`）のまま変えない。`may_destroy_pane` の照合（CLAUDE.md 不変条件外だが `scripts/CLAUDE.md` の mux 契約）は、記録の id と `hc get` が返す `labels.crewvia_name` を比較する——hc 自身の小文字 `name` 欄とは比較しない（大文字小文字変換は非可逆な情報ではないが、変換ロジックを 2 箇所に書くと食い違いの元になるため、原綴りを持ち回る label を正とする）
 
@@ -124,7 +157,7 @@ exit=6
 
 **決定: 全体を API 化しない。`list()` だけ API（`hc connect`）に逃がし、残り 14 動詞は CLI のままにする。**
 
-API 化の動機は「list / pid / state が 1 回で揃う」こと——`terminal.list` の 1 呼び出しで `labels`・`pid`・`status.state`（agent status）・`argv` が全terminal 分まとめて返る（§3.2-3 で実測）。これは**`list()` にだけ当てはまる利得**であって、他の動詞には当てはまらない:
+API 化の動機は「list / pid / state が 1 回で揃う」こと——`terminal.list`（`{"all": false}`。§3.2-3 で `all:false` に訂正済み）の 1 呼び出しで、live な terminal の `labels`・`pid`・`status.state`（agent status）・`argv` が全terminal 分まとめて返る（§3.2-3 で実測）。これは**`list()` にだけ当てはまる利得**であって、他の動詞には当てはまらない:
 
 1. **`pid(name)` / `state(name)` は単体 lookup**（crewvia 側が `name` を 1 件指定してくる）なので「1 回で揃う」の利得が無い。CLI `hc get <t> --json` が既に §3.2-2 の実測どおり `labels` / `pid` / `status` を**フルオブジェクトで 1 回**返している——API に切り替えても往復回数は 1→1 のままで、得られる情報も変わらない。変わるのは JSON-RPC の封筒を自分で組み立てる・剥がすコストが増えるだけ
 2. **`kill` / `rm` / `send` / `keys` のような単発アクション動詞**は、CLI がすでに「1 回の subprocess 起動で `--json` の結果（または stderr のエラー）を返して終了する」という crewvia の他 3 backend と同じ形を提供している。API 経由にしても呼び出し形は変わらない（`hc connect` を起動して 1 行書いて 1 行読んで閉じる、という骨格は CLI サブコマンドの subprocess 起動と同じ）のに、**CLI が無料でやってくれているリクエスト ID の発行・相関・JSON-RPC envelope の組み立てを自前でやる義務だけが増える**

@@ -790,12 +790,11 @@ def _is_rule(line):
 # 作業中 (busy) の印。`lib_mux.rex_screen_state` の working は「esc to interrupt」だけを見るが、狭い窓では出ないことがある。
 # 実物の busy 画面 (tests/fixtures/irc/busy-screen-sora.txt) は入力欄の上に `✻ Discombobulating… (thought for 5s)` だけが出る。
 # スピナー行 = **字下げなしの行頭 (列 0)** の記号 + 単語 + `…` + (行末 か ` (`)。完了後の行 (`✻ Cooked for 5s`) には `…` が無い。
-# さらに**入力欄の上の罫線の直上の数行以内**にあるときだけ数える (idle の画面の本文・箇条書きの `* Next steps…` を拾わない)。
+# さらに**入力欄の上の罫線から上へ、空行・字下げ行・`⎿` 行を読み飛ばして最初に出る字下げなしの行**がそれのときだけ数える (探す範囲は末尾 _BUSY_WINDOW 行) (idle の画面の本文・箇条書きの `* Next steps…` を拾わない)。
 # 記号 (`·` `*` を含む) は外さない: スピナーはこれらをアニメーションで回すので、外すとその瞬間の busy を見逃す。
 _BUSY_HINT_RE = re.compile(r'esc to interrupt', re.IGNORECASE)
 _BUSY_SPINNER_RE = re.compile(r'[✻✽✶✳✢✦·*] [^\W\d_][\w-]*…(?: \(|$)')
 _BUSY_WINDOW = 12               # 末尾この行数だけ見る (スクロールバックの古いスピナー行を拾わない)
-_BUSY_SPINNER_ABOVE_BOX = 4     # 入力欄の上罫線からこの行数以内 (間に `✔ Update installed` 等の状態行が挟まる)
 
 
 def _prompt_index(lines):
@@ -817,9 +816,13 @@ def _is_busy(lines):
     if prompt is None:
         return False                     # 位置を特定できない → busy と断定しない (呼び出し側で unknown = 送らない)
     rule = prompt - 1
-    for line in lines[max(0, rule - _BUSY_SPINNER_ABOVE_BOX):rule]:
-        if _BUSY_SPINNER_RE.match(line.rstrip()):
-            return True
+    # 罫線から上へ、空行・字下げした行 (todo の `  ⎿ ☐`・`  ✔ Update installed` 等) を読み飛ばし、
+    # 最初に出る字下げなしの行がスピナーの形なら busy。探す範囲は _BUSY_WINDOW の中。
+    for i in range(rule - 1, max(0, len(lines) - _BUSY_WINDOW) - 1, -1):
+        line = lines[i].rstrip()
+        if not line or line[0].isspace() or line.startswith('⎿'):
+            continue
+        return bool(_BUSY_SPINNER_RE.match(line))
     return False
 
 

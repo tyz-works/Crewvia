@@ -1133,6 +1133,17 @@ def test_every_spinner_frame_just_above_box_is_busy(mark, tail):
     assert L.classify_pane(f"out\n{mark} Working…{tail}\n  ✔ Update installed\n{RULE}\n❯ \n{RULE}\n") == "busy"
 
 
+@pytest.mark.parametrize("n", [1, 3, 5])
+def test_spinner_above_todo_list_and_status_line_is_busy(n):
+    todo = "".join(f"  ⎿  ☐ item {k}\n" for k in range(n))
+    assert L.classify_pane(f"out\n✻ Working… (thought for 5s)\n{todo}\n  ✔ Update installed\n{RULE}\n❯ \n{RULE}\n") == "busy"
+
+
+def test_bullet_above_todo_list_is_ready_when_text_between():
+    screen = f"* Next steps…\nplain body\n  ⎿  ☐ a\n  ⎿  ☐ b\n{RULE}\n❯ \n{RULE}\n"
+    assert L.classify_pane(screen) == "ready"
+
+
 def test_indented_spinner_shape_is_not_busy():
     assert L.classify_pane(f"out\n  ✻ Working…\n{RULE}\n❯ \n{RULE}\n") == "ready"
     assert L.classify_pane(f"out\n✻ Working… and more text\n{RULE}\n❯ \n{RULE}\n") == "ready"

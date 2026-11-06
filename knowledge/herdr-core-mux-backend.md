@@ -4,6 +4,7 @@
 
 - 対象の版: `hc 0.1.18`（`/home/tkadmin/.local/bin/hc`）。upstream `herdrdev/herdr-core`（公開）。OpenRPC schema `info.version` も `0.1.18`、**protocol generation 1**（`hc schema` の `info.description`）
 - 書いた人: Worker Minjun（mission `20261106-herdr-core-backend` t001）。Director の事前メモ（card 本文）の実測を自分でも本機（本番の hc server、desktop-l8nqlib、holder pid 1246708 時点）で再現し、JSON Schema（`hc schema`）とライブコマンドの両方で裏を取った
+- **改訂（attempt 2）**: Worker Mateo。PR #344 の review task（t006）が P1 1件・P2 2件・P3 2件を指摘して差し戻した（`queue/missions/20261106-herdr-core-backend/history/t006/0001-end-ex-90c5aef661cb4762a10585a1e01aa51d.md`）。全指摘を自分で実機再現してから反映した——P1: 名前の写像（新設 §3.2）。P2: エラー JSON は stderr（§5 冒頭に明記）・`kind` 一覧に `needs_update` が抜けていた（§5 の表を25件に修正）。P3: `hc schema` の schemas 数は34ではなく35（実測で訂正）・`openrpc` のバージョン文字列の意味を訂正・`state`（terminal 生死）と`status.state`（agent status）が同名の別概念である注記を追加（§3 冒頭・§7.1）。「裏が取れた主張」（review 本文に列挙）は取り直していない
 - 凡例: 「**実測**」= 自分がこの作業中に確かめた出力。「**Director 実測**」= card に書かれていて自分では別の形で確かめた（同じプロセスは再現していない）事実。「**未確認**」= 確かめていない。「見込み」は推測
 - 比較対象は既存の `RexBackend`（`scripts/lib_mux.py:4884-5675`、`knowledge/rex-mux-backend.md`）と `HerdrBackend`（`scripts/lib_mux.py:3352-4883`）。**この文書は両方の既存 backend の挙動を変える提案を 1 点含む（§4）。tmux / herdr / rex は本番で使われているので、その影響範囲を §4.4 に明記した**
 
@@ -21,7 +22,7 @@
 本番の desktop server（`hc server status --json` の `core.id = 972c9056285907f04dfc72170c12ac7b`）に対して、使い捨ての terminal を `--name` 付きで spawn し、動作確認後に `hc kill` → `hc rm` で後始末した。**`hc server stop` / `restart` は一度も呼んでいない**（CLAUDE.md 不変条件と `hc --skill` の「Never `hc server stop` or restart the user's core unless asked」を守った。本機は人間が普段使う hc server で、止めると無関係な terminal も道連れになる）。
 
 ```bash
-hc schema > hc-schema.json                 # OpenRPC + JSON Schema 1.3.2、32 methods、34 schemas
+hc schema > hc-schema.json                 # OpenRPC 1.3.2 形式、32 methods、35 schemas（P3 対応: attempt 1 は 34 と誤記。`1.3.2` は openrpc フィールドの版であって JSON Schema の版ではない——`info.description` に「Protocol generation 1」とは別の数字として出る）
 hc run --bg --name t001probe-bad --json claude        # PATH 依存の名前 → spawn_failed（§6）
 hc run --bg --name t001probe-sleep --json /home/tkadmin/.local/bin/hc --version
 hc get t001probe-sleep --json              # pid / status / reported / reason を確認
@@ -37,30 +38,57 @@ hc rm t001probe-sleep --json
 
 hc は JSON-RPC 2.0 の methods（`hc schema` の `methods[]`）を CLI がラップしたもの。32 methods のうち使うのは `terminal.*` と `server.status` だけで、`machine.*` / `file.*` / `doc.*` / `events.subscribe` は対象外（§10 で扱う）。
 
+**注記（同名の別概念、P3 対応）**: `hc get` の出力にはトップレベルの `state`（`live`/`finished`。terminal プロセスそのものの生死）と、ネストした `status.state`（`idle`/`working`/`done`/`blocked`/`error`。agent status、§7 の対象）という**同名だが別物の 2 つの欄がある**。下表の `kill` 行・§5 の kill 前チェックは前者、§3 の `state(name)` 行・§7 は後者を指す。実装時に変数名で区別すること（実測: `hc get` の生出力で両方の欄を確認。§2 の後続コマンドで裏取り済み）。
+
 | `_Backend` のメソッド | hc での満たし方 | 根拠 | 満たせるか |
 |---|---|---|---|
 | `available()` | `shutil.which("hc")` ∧ `hc server start --json`（冪等。§2）が成功 ∧ `hello`/`server.status` の版が許容範囲（§4） | 実測 | 満たせる |
 | `server_running()` | `hc server status --json` が exit 0 で返る（起動はしない） | 実測 | 満たせる |
 | `ensure-server`（`available()` の一部） | `hc server start --json`。既に生きている server には**冪等**（pid・uptime 不変。実測） | 実測 | 満たせる |
 | `server_identity()` | `(core.id, holder.instance)`。`core.id` は desktop の識別子（再起動をまたいで同じ見込み・未確認）、`holder.instance` は **holder（実行プロセス）が変わるたびに別の UUID**（`server.status` の `holder.instance`。アップデート後は旧 holder が `holders[]` に残り、新しい terminal は新しい holder に行く——RexBackend の `instance_id` と同じ役割） | 実測（`server.status` の形。再起動そのものは未確認 — §11） | 満たせる（§4.3） |
-| `spawn(name, cmd, cwd)` | `hc run --bg --name <name> --cwd <cwd> --json <argv...>` → `RunResult.address` を記録。**`argv` は配列**なので、herdr/tmux のような「1 本の shell 文字列を pane に type する」のではなく argv をそのまま渡せる。ただし crewvia の LAUNCH_CMD は `export ...; cd ... && claude ...` という**shell 文字列**なので、`bash -c '<LAUNCH_CMD>'` 経由にする（§6 で PATH を埋めた後の文字列） | 実測（`terminal.run` の params） | 満たせる |
+| `spawn(name, cmd, cwd)` | `hc run --bg --name <hc名> --label crewvia_name=<name> --cwd <cwd> --json <argv...>` → `RunResult.address` を記録。`<hc名>` は crewvia の `name` を小文字化したもの（**§3.2、P1 対応**）。**`argv` は配列**なので、herdr/tmux のような「1 本の shell 文字列を pane に type する」のではなく argv をそのまま渡せる。ただし crewvia の LAUNCH_CMD は `export ...; cd ... && claude ...` という**shell 文字列**なので、`bash -c '<LAUNCH_CMD>'` 経由にする（§6 で PATH を埋めた後の文字列） | 実測（`terminal.run` の params・§3.2 の名前変換） | 満たせる |
 | `send(name, text)` | `hc send <t> <text> --json`（3 秒の入力休止待ちの後に paste + Enter。`--force` は blocked 相手への強制、crewvia は使わない） | 実測・`hc send --help` | 満たせる |
 | `keys(name, keys)` | `hc keys <t> <keys...> --json`。名前は `enter` / `esc` / `tab` / `up` / `down` / `ctrl+c` / `alt+x` / `f5` など——`translate_keys()` の hc 列を足す。choice dialog のカーソル移動に使う想定は herdr/tmux と同じ | 実測・`hc keys --help` | 満たせる |
 | `capture(name)` | `hc read <t> --lines N --json`。画面 + history。**作業中/blocked/error の間は history 読み出しでスクロールしない**（画面だけ・`why` に理由) という制約が `hc --skill` にある | `hc --skill`（未実行で検証、文面のみ） | 満たせる |
-| `list(suffix)` | `hc ls --json`（live のみ）/ `--all`（finished 含む）。`name` でフィルタはできないので crewvia 側で絞る | 実測 | 満たせる |
-| `kill(name, allow_foreign)` | `hc kill <t> --json`。**`may_destroy_pane` を先に通す**のは herdr/tmux と同じ（§4.3 の identity で束縛）。**実測: 既に finished な terminal への kill はエラーにならず Terminal を返す**（冪等。herdr/tmux の「無いものを kill した」との扱いの違いに注意——hc は「もう死んでいる」を失敗にしない） | 実測 | 満たせる |
-| `pid(name)` | `hc get <t> --json` の `pid`（Director 実測値 1257222 を確認済みの前提どおり、`hc get` は `pid` を持つ。実測では `exit_code:0` の `hc --version` 実行でも `pid: 1262511` が入っていた） | 実測 | 満たせる |
+| `list(suffix)` | `hc ls --json`（live のみ）/ `--all`（finished 含む）。hc の `name` でなく **`labels.crewvia_name` を読み、それを crewvia の `name` として返す**（§3.2）。`suffix` 絞り込みは `crewvia_name` に対して行う（hc 側は `--label` でも絞れるが、crewvia 名は label 値に入っているため `--label` の値一致では使えず、`ls --all --json` を全件取ってから crewvia 側で `crewvia_name` を見てフィルタする） | 実測（§3.2） | 満たせる |
+| `kill(name, allow_foreign)` | `name`（crewvia 名）を §3.2 で小文字化した `<t>` に変換してから `hc kill <t> --json`。**`may_destroy_pane` を先に通す**のは herdr/tmux と同じ（§4.3 の identity で束縛）。**実測: 既に finished な terminal への kill はエラーにならず Terminal を返す**（冪等。herdr/tmux の「無いものを kill した」との扱いの違いに注意——hc は「もう死んでいる」を失敗にしない） | 実測 | 満たせる |
+| `pid(name)` | `name` を §3.2 で変換した `<t>` で `hc get <t> --json` の `pid`（Director 実測値 1257222 を確認済みの前提どおり、`hc get` は `pid` を持つ。実測では `exit_code:0` の `hc --version` 実行でも `pid: 1283891` が入っていた） | 実測 | 満たせる |
 | `attach(name)` | 常に `False`（tmux の「$TMUX が無いときは attach_cmd を使う」側と同じ扱い。hc には「中に居る」状態からの `switch-client` に当たる概念が無い見込み） | 見込み（未確認） | 満たせる（見込み） |
 | `attach_cmd(name)` | `["hc", "attach", name]`（Rex と違い hc には本物の CLI client がある。`hc attach [t]` で ctrl+\ 離脱）| `hc attach --help` | 満たせる（exec の実地検証は未確認） |
 | `state(name)` | `hc get <t> --json` の `status.state`（`idle`/`working`/`done`/`blocked`/`error`）を Rule 5 の語彙に写す。`reported: false` は `"unknown"` に倒す（§7） | 実測 + Director 実測 | 満たせる |
-| `record_existence` / reap-records | `hc get <t> --json` の `error.kind == "not_found"` だけ `PANE_GONE`。他の kind・例外・非 JSON は `PANE_UNOBSERVED`（§5） | 実測（`kill`/`get` の `not_found` 文言と `hint: "see \`hc ls --all\`"` を確認） | 満たせる |
-| `may_destroy` / identity-ok | `server_identity()`（`core.id` + `holder.instance`）を記録に書き、`pane_record_status()` の `_server_binding_problem` にそのまま載せる。herdr/Rex と同じ 2 軸（endpoint, generation）の型にはまる | 実測（`server.status` の形から設計。実際の record 書き込みは未実装） | 満たせる |
+| `record_existence` / reap-records | `hc get <t> --json`（`<t>` は §3.2 で変換した hc 名）の `error.kind == "not_found"` だけ `PANE_GONE`。他の kind・例外・非 JSON は `PANE_UNOBSERVED`（§5） | 実測（`kill`/`get` の `not_found` 文言と `hint: "see \`hc ls --all\`"` を確認） | 満たせる |
+| `may_destroy` / identity-ok | `server_identity()`（`core.id` + `holder.instance`）に加えて、**`hc get` が返す `labels.crewvia_name` が `registry/mux/<name>.json` の記録名（crewvia 名、原綴り）と一致することを確認**してから destroy を許可する（§3.2）。`core.id`/`holder.instance` は `pane_record_status()` の `_server_binding_problem` にそのまま載せ、herdr/Rex と同じ 2 軸（endpoint, generation）の型にはまる | 実測（`server.status` の形・`labels` の往復を確認。実際の record 書き込みは未実装） | 満たせる |
 | `verify_sent(name, text)` | `SendResult.started`（bool\|null）と `status`（送信時点の word）を読む。`reported:false` の相手（`started` が常に `null`）は既存の `_text_in_input_line` 風のフォールバックへ（§8） | 実測（`SendResult` スキーマ）。実機の claude-code 相手での確認は Director 実測を根拠にし自分では再現していない | 満たせる（フォールバック込み） |
 
 ### 3.1 `_Backend` インタフェースに対応が無い動詞
 
 - タスク本文が明記した 15 動詞（available / server-running / ensure-server / spawn / send / keys / capture / list / kill / pid / attach / attach-cmd / state / verify-sent / reap-records / identity-ok）は**全部対応がある**（上表）。「対応するものが無い」はゼロ件——hc が RexBackend より API が広い（`terminal.get` が構造化 JSON を返すため、herdr の「pane_list を舐めて label で探す」のような間接参照が要らない）ためで、無理にこじつけた対応は無い
 - 逆に hc にあって `_Backend` に無いもの: `hc put`（ファイル転送）・`hc interrupt`（stop key。kill とは別）・`hc wait --children`（複数 terminal の待ち合わせ）・`doc.get/set`（共有ドキュメント）。これらは crewvia の既存動詞に出番が無いので**対象外**（§10）
+- **ただし §3.2 の前提条件が 1 つ抜けていた（attempt 1 時点。review t006 の P1）**: 「対応がある」は hc の `--name` が crewvia のペイン名（`Seo-worker` / `Sora-director` のような大文字始まり）をそのまま受け付けることを**暗黙の前提**にしていたが、この前提が成り立たない（§3.2）。動詞の対応自体は変わらないが、`spawn`/`list`/`kill`/`pid`/identity-ok の実装は名前の変換を経由する必要がある——この節を書いた時点では見落としていた
+
+### 3.2 名前の写像（P1 対応。review t006 で指摘・自分で再現して確定）
+
+**事実（実測）**: `hc run --help` の `--name` は「1-32 of a-z 0-9 - _ . starting with a letter or digit」。実際に使い捨て名で確認した:
+
+```
+$ hc run --bg --name Cvprobet001-worker --json /home/tkadmin/.local/bin/hc --version
+{"error":{"hint":"see `hc schema`","kind":"invalid_params",
+  "message":"bad name \"Cvprobet001-worker\": use 1-32 of a-z 0-9 - _ . starting with a letter or digit,
+  not shaped like an id (t7)"}}
+exit=6
+```
+
+一方 crewvia のペイン名は `config/worker-names.yaml` の名前プール（`Hana` / `Seo` / `Minjun` …、全50件とも大文字始まりの ASCII のみ、小文字化しても衝突する組は無いことを確認済み）+ `-worker` / `-director` のロール接尾辞で構成され、**全部大文字始まり**（`lib_mux.py:17-27` のdocstring・`lib_daemon_watch.py` の director 既定値 `"Sora-director"`・稼働中の `registry/mux/Seo-worker.json` 等）。この構成のまま `hc run --name` に渡すと `HcBackend.spawn()` は**1 本目の Worker を起動した瞬間に `invalid_params` で落ちる**。
+
+**決定（採用する方式）**: hc 側には `--label K=V`（`run`/`ls` 双方にあることを実測）がある。
+
+1. `spawn(name, cmd, cwd)`: crewvia の `name`（原綴り、例 `Seo-worker`）を**小文字化しただけ**（例 `seo-worker`）の文字列を hc の `--name` に渡す。ロール接尾辞 `-worker`/`-director` はそのまま hc の許容文字集合（`a-z 0-9 - _ .`）に収まるので、小文字化だけで制約を満たす。**名前プールに大小文字違いの衝突が無いこと（確認済み）と、最長の名前（`Haruto`/`Mathis` 等 6-7 文字）+ 接尾辞でも 32 文字上限に収まること（最長でも `Astrid-director` で 15 文字）から、小文字化は一意性を壊さない**。同時に `--label crewvia_name=<原綴りの name>` を付け、原綴りを hc 側にも残す
+2. 実測で裏取り: `hc run --bg --name cvprobet001-worker --label crewvia_name=Cvprobet001-worker --json ...` は成功（`state:"live"`）。続く `hc get` / `hc ls --all --label crewvia_name=...` の両方で `labels.crewvia_name` が原綴りのまま往復することを確認した
+3. `list(suffix)` は `hc ls --all --json` の全件を取り、各要素の `labels.crewvia_name` を読んで crewvia の `name` として返す（hc 自身の `name` 欄は内部実装の詳細として扱い、呼び出し元には見せない）。`suffix`（`"-worker"` 等）での絞り込みは `crewvia_name` に対して行う
+4. `kill` / `pid` / `record_existence` / identity-ok など、crewvia 側が `name` を渡してくる動詞は全部「§3.2-1 と同じ小文字化を通してから hc を呼ぶ」。逆に hc からの戻り（`list` や `get` の結果）を crewvia 側に見せるときは必ず `labels.crewvia_name` 経由で原綴りに戻す
+5. `registry/mux/<name>.json` のファイル名・記録 id は**従来どおり crewvia の原綴り**（`Seo-worker.json`）のまま変えない。`may_destroy_pane` の照合（CLAUDE.md 不変条件外だが `scripts/CLAUDE.md` の mux 契約）は、記録の id と `hc get` が返す `labels.crewvia_name` を比較する——hc 自身の小文字 `name` 欄とは比較しない（大文字小文字変換は非可逆な情報ではないが、変換ロジックを 2 箇所に書くと食い違いの元になるため、原綴りを持ち回る label を正とする）
+
+**この方式を採らなかった代替案**: crewvia 側の名前プール自体を小文字に変える案は、`registry/mux/*.json` の既存ファイル名・`config/worker-names.yaml`・ドキュメント中の表記（`Omar-worker` 等）を全部変更する必要があり、既存 backend（tmux/herdr/Rex）の挙動には影響しないが crewvia 全体の表記を変える大きい変更になるため**対象外**（CLAUDE.md 設計原則3「名前はポジション」の表記を崩さない）。
 
 ## 4. 版の固定
 
@@ -100,14 +128,25 @@ hc は JSON-RPC 2.0 の methods（`hc schema` の `methods[]`）を CLI がラ�
 
 ## 5. エラーの写像（`record_existence` / reap-records）
 
-`hc schema` の 32 methods の `errors[]` を全部書き出した（§2 の `hc-schema.json`）。`kind` の全語彙（実測、schema から抽出）:
+**読み口（P2 対応。review t006 で指摘・自分で再現して確定）**: `hc <cmd> --json` のエラー JSON は**stderr に出る。stdout は空**。実測:
+
+```
+$ hc kill cvprobet001nope --json 2>/dev/null   # stdout のみ → 空
+$ hc kill cvprobet001nope --json 2>&1 1>/dev/null  # stderr のみ → {"error":{"hint":"see `hc ls --all`","kind":"not_found","message":"no terminal \"cvprobet001nope\""}}
+```
+
+`hc --skill` にも「Errors are `{error: {kind, message, hint}}` on stderr.」と明記されている。**stdout だけ読む実装にすると、エラー時の stdout は常に空なので全エラーが「JSON でない応答」＝`PANE_UNOBSERVED` に落ち、`record_existence` が `PANE_GONE` を一度も返せなくなる**（`registry/mux/<name>.json` が永久に畳まれない）。`HcBackend` の JSON パース共通ヘルパーは、**exit code が非 0 のときは stderr を、0 のときは stdout を読む**設計にすること。
+
+`hc schema` の 32 methods の `errors[]` を全部書き出した（§2 の `hc-schema.json`）。`kind` の語彙（実測、`components` 配下の `data.kind` の `const` を機械的に抽出。**attempt 1 は `needs_update` を見落として 24 個と書いていたが、正しくは 25 個**）:
 
 ```
 already_added, blocked, config, conflict, edit_failed, finished, hc_missing,
 incompatible, internal, invalid_params, invalid_template, io, live,
-machine_unknown, name_taken, needs_framed, needs_target, not_found, not_text,
-spawn_failed, status_mismatch, unavailable, unreachable, unsupported_generation
+machine_unknown, name_taken, needs_framed, needs_target, needs_update, not_found,
+not_text, spawn_failed, status_mismatch, unavailable, unreachable, unsupported_generation
 ```
+
+`needs_update` は設計上の結論には影響しない——下表の「それ以外すべて」の catch-all に含まれ、`PANE_UNOBSERVED` に落ちる（`not_found` 以外という条件に変わりはない）。
 
 `terminal.get` / `terminal.kill` の `errors[]` は `not_found` と `machine_unknown` の 2 つだけ（実測、schema より）。
 
@@ -115,7 +154,7 @@ spawn_failed, status_mismatch, unavailable, unreachable, unsupported_generation
 |---|---|---|
 | `not_found`（`terminal.get`/`kill`/`send`/`keys`等） | **実測**: `hc kill tXYZDOESNOTEXIST --json` → `{"error":{"hint":"see \`hc ls --all\`","kind":"not_found","message":"no terminal \"tXYZDOESNOTEXIST\""}}`。exit code は `hc --skill` の一覧で **3** | **`PANE_GONE`**（CLAUDE.md の規則どおり「その id は無い」と明確に答えた唯一のケース） |
 | `machine_unknown` | 未実測（`--on <machine>` を使っていないため）。意味は「リモート機の指定が存在しない」で、pane の有無とは無関係 | `PANE_UNOBSERVED`（この terminal について何も言っていない） |
-| それ以外すべて（`finished` / `unavailable` / `blocked` / `status_mismatch` / `config` / `invalid_params` / `spawn_failed` / `name_taken` / `invalid_template` / `needs_target` / `needs_framed` / `io` / `not_text` / `edit_failed` / `conflict` / `internal` / `unreachable` / `hc_missing` / `incompatible` / `already_added` / `live` / `unsupported_generation`） | `finished` は**実測**（§2 の send テスト。「存在するが終わっている」——これは `PANE_GONE` ではない。herdr/tmux に無い状態で、hc 独自の「死んではいるが record は消していい」にはまだ当たらない） | **`PANE_UNOBSERVED`**（CLAUDE.md の規則: `not_found` 以外は「観測できなかった」側に倒す。`finished` も同様——終わった terminal は `hc rm` で明示的に消すまで `ls --all` / `get` に残り続けるので、「消えた」と「終わった」は別の事実） |
+| それ以外すべて（`finished` / `unavailable` / `blocked` / `status_mismatch` / `config` / `invalid_params` / `spawn_failed` / `name_taken` / `invalid_template` / `needs_target` / `needs_framed` / `needs_update` / `io` / `not_text` / `edit_failed` / `conflict` / `internal` / `unreachable` / `hc_missing` / `incompatible` / `already_added` / `live` / `unsupported_generation`） | `finished` は**実測**（§2 の send テスト。「存在するが終わっている」——これは `PANE_GONE` ではない。herdr/tmux に無い状態で、hc 独自の「死んではいるが record は消していい」にはまだ当たらない） | **`PANE_UNOBSERVED`**（CLAUDE.md の規則: `not_found` 以外は「観測できなかった」側に倒す。`finished` も同様——終わった terminal は `hc rm` で明示的に消すまで `ls --all` / `get` に残り続けるので、「消えた」と「終わった」は別の事実） |
 | JSON でない応答・subprocess 失敗・timeout | — | `PANE_UNOBSERVED` |
 
 **hc の `kill` は herdr/tmux と違う挙動がある（実測、§2）**: 既に `finished` な terminal に `kill` しても**エラーにならず Terminal オブジェクトを返す**（冪等）。これは `record_existence` の話ではなく `kill()` 本体の話だが、`may_destroy_pane` の判定後に hc の `kill` を呼ぶ設計では「`kill` が失敗しなかった」を「生きていたものを殺せた」の意味に使わないよう注意が要る——`kill()` の前に `hc get` で `state` を見て、`finished` ならそもそも kill を呼ばず `record_existence` 経由で記録を畳む経路にする。
@@ -212,6 +251,8 @@ argv = ["bash", "-lc", "export PATH=\"$CREWVIA_REPO_ROOT/scripts/bin:$HOME/.loca
 - **1 task（t002）に収まる見込み**。分割するとすれば「`HcBackend` 本体 + 隔離テスト」と「start.sh / dispatcher / watchdog の配線」の 2 PR（Rex の PR-1 / PR-2 と同じ割り方）だが、Rex はこれを 1 つの mission の 2 task で収めているので、t002 を同様に 2 分割するかは実装 task 側の判断に委ねる
 
 ## 10. 決めること（ユーザー判断 / 実装 task 側で詰める点）
+
+**attempt 1 からの差分**: 名前の写像（hc の `--name` が crewvia の大文字始まりペイン名を受け付けない問題）は review t006 の P1 指摘を受けて §3.2 で決定済みにしたので、この節からは除外した（attempt 1 の時点でこの節にも §11 にも載っておらず、それ自体が review の指摘事項だった）。
 
 1. **generation の取得経路**（§4.2-4.4）: CLI に `hello`相当のサブコマンドが無い。`hc connect`（stdin/stdout で API を直接叩く）を使うか、`hc schema` の `info.version` の文字列比較で代用するかは t002 で決める
 2. **`error` state の Rule 5 対応**（§7.2）: A/B のどちらにも無い新しい値。Director への別枠通知にするか B に含めるか

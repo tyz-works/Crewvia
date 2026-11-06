@@ -227,7 +227,7 @@ def test_every_path_that_drops_a_record_goes_through_expect():
 
 
 def test_the_kills_and_the_resolution_path_use_forget_record_with_what_they_judged():
-    """`_forget_record` を呼ぶ場所は 3 か所: 両 backend の kill と `_resolve_ids`。
+    """`_forget_record` を呼ぶ場所は 3 か所: tmux/herdr/hc の kill と `_resolve_ids`。
 
     どれも第 2 引数 (判定した記録) を渡す。`_delete_cache(name)` のような
     「名前だけで消す」入口は残っていない。
@@ -245,9 +245,10 @@ def test_the_kills_and_the_resolution_path_use_forget_record_with_what_they_judg
         callers[fn] += 1
     # rex の kill 本体は `_kill_impl` (kill と husk の作り直しが共有する)。
     assert set(callers) == {"kill", "_kill_impl", "_resolve_ids"}, sorted(callers)
-    # kill の呼び出し: tmux/herdr の 4 + rex の `_kill_impl` 2 (何も走っていない
-    # block / 破壊後)。`_resolve_ids` は 1。
-    assert callers["kill"] == 4 and callers["_kill_impl"] == 2
+    # kill の呼び出し: tmux/herdr の 4 (daemon 分岐・非 daemon 分岐で 1 回ずつ) +
+    # hc の 1 (daemon/非 daemon の両分岐が同じ呼び出しに収束する) + rex の
+    # `_kill_impl` 2 (何も走っていない block / 破壊後)。`_resolve_ids` は 1。
+    assert callers["kill"] == 5 and callers["_kill_impl"] == 2
     assert callers["_resolve_ids"] == 1
     source = (SCRIPTS / "lib_mux.py").read_text(encoding="utf-8")
     assert "_delete_cache" not in source, \

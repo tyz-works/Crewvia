@@ -5,10 +5,11 @@ Backends:
   TmuxBackend  — wraps current tmux CLI calls verbatim (Phase 1)
   HerdrBackend — herdr terminal workspace manager (Phase 2)
   RexBackend   — Rex (knowledge/rex-mux-backend.md; opt-in with CREWVIA_MUX=rex)
+  HcBackend    — herdr-core (knowledge/herdr-core-mux-backend.md; opt-in with CREWVIA_MUX=hc)
 
 Backend selection (highest priority first):
-  1. CREWVIA_MUX env  ("tmux" | "herdr" | "rex")
-  2. config/crewvia.yaml  `mode: tmux|herdr|rex|inline`
+  1. CREWVIA_MUX env  ("tmux" | "herdr" | "rex" | "hc")
+  2. config/crewvia.yaml  `mode: tmux|herdr|rex|hc|inline`
   3. Auto: use tmux if `tmux` is in PATH
 
 Usage as module:
@@ -226,6 +227,8 @@ def _guard_test_isolation(backend: str, verb: str, name: str,
 # sequence in front of a dialog is worse than none.
 
 #: caller's key name (lower-case) -> (tmux name, herdr name, rex name)
+#: hc reuses the herdr column (`hc keys <t> enter --json` — measured,
+#: knowledge/herdr-core-mux-backend.md §2 — is the same lower-case spelling).
 _KEY_NAMES = {
     "up":     ("Up",     "up",    "up"),
     "down":   ("Down",   "down",  "down"),
@@ -237,7 +240,7 @@ _KEY_NAMES = {
     "tab":    ("Tab",    "tab",   "tab"),
 }
 
-_KEY_COLUMNS = {"tmux": 0, "herdr": 1, "rex": 2}
+_KEY_COLUMNS = {"tmux": 0, "herdr": 1, "rex": 2, "hc": 1}
 
 
 def translate_keys(keys, backend: str):
@@ -318,7 +321,7 @@ def _config_mode(config_path: Optional[Path] = None) -> Optional[str]:
                 # watchdog blind — mux.list() came back empty against a dead
                 # tmux session, so every live Worker looked "window gone").
                 value = value.split("#", 1)[0].strip().strip('"').strip("'")
-                if value in ("tmux", "herdr", "rex", "inline"):
+                if value in ("tmux", "herdr", "rex", "hc", "inline"):
                     return value
     except Exception:
         pass
@@ -334,12 +337,16 @@ def _select_backend() -> "type":
         return TmuxBackend
     if env_mux == "rex":
         return RexBackend
+    if env_mux == "hc":
+        return HcBackend
 
     config = _config_mode()
     if config == "herdr":
         return HerdrBackend
     if config == "rex":
         return RexBackend
+    if config == "hc":
+        return HcBackend
     if config == "tmux":
         return TmuxBackend
     # config == "inline" or unknown → auto
@@ -5670,6 +5677,546 @@ class RexBackend(_Backend):
 
 
 # ---------------------------------------------------------------------------
+# hc (herdr-core) backend — knowledge/herdr-core-mux-backend.md
+# ---------------------------------------------------------------------------
+#
+# Opt-in with CREWVIA_MUX=hc / config mode: hc.  Does not change TmuxBackend /
+# HerdrBackend / RexBackend behaviour at all (design doc §4.4) — this is a
+# fourth, independent backend class plus one shared-code change elsewhere
+# (`Mux.verify_sent()`'s isinstance check, §10-5).
+#
+# hc's one load-bearing fact (design doc §3.0): a "finished" terminal is kept
+# until `hc rm`, and its `name` can be reused by a new spawn **while the old,
+# finished one is still sitting there** — `name`-based lookups always resolve
+# to the most recently created terminal.  So every verb that identifies a
+# *specific* terminal (kill / pid / state / record_existence / may_destroy)
+# addresses it by hc's `address` (`t7`, …) — spawn-stable, never reused until
+# `hc rm` — recorded as `handle` in the spawn record exactly like a tmux
+# `@window_id` or a herdr `tab_id` (§3.4).  `send` / `keys` / `capture` /
+# `attach_cmd` use whichever target `_target()` already has (record's handle,
+# or the lower-cased pane name for a first resolution) — hc accepts either
+# in the same argument position (§3.4 point 5) and the cost of being wrong
+# there is small (a `name_taken` collision cannot happen while the old
+# terminal is live, and a stale answer is not destructive).
+#
+# Two decisions this file does **not** implement, left to a later PR per the
+# design doc's own "決めること" (§10):
+#   - `state()`'s "error" value (hc-only; no existing backend has it) is
+#     returned as-is.  dispatcher.sh's Rule 5 has no branch for it yet, so it
+#     is silently treated as not-A/not-B (no notification) until a follow-up
+#     task wires it in — additive, and does not touch the other backends.
+#   - `may_destroy()` / `kill()` for dispatcher/watchdog's own hc pane is left
+#     on the shared, fail-closed `_Backend.may_destroy()` path (§10-6): a
+#     *finished* dispatcher/watchdog terminal cannot be killed without
+#     `--force`.  Safe (fail-closed, not fail-open) and cheap: nothing in the
+#     restart path needs to `kill()` a terminal `state()`/`pid()` have already
+#     shown is not live.
+
+#: `hello`'s `generation` (design doc §4.2): the JSON-RPC protocol's own
+#: version number, not `server.status`'s per-holder `instance` (identity,
+#: below) and not agent `status.state` (§3 heading note — same word, three
+#: different things).  Measured: `1`.  A generation this was not measured
+#: against makes `available()` False — fail-closed, like Rex's
+#: `_REX_API_REVISIONS` (§4.2 point 3: hc is pre-1.0, no back-compat promise).
+_HC_GENERATIONS = frozenset({1})
+
+#: `capture()`'s window, in lines.  hc's `read` always takes `--lines`
+#: (unlike herdr's `pane read --source visible`, there is no "whatever is on
+#: screen" mode) — 200 matches the pane-dump convention already used
+#: elsewhere in this repo (checkpoint's `pane.txt`) for "enough of a crewvia
+#: pane to read the TUI footer and whatever led up to it".
+_HC_CAPTURE_LINES = 200
+
+HcResult = namedtuple("HcResult", "rc out err timed_out")
+
+
+def _hc_run(args: List[str], timeout: float = 10.0):
+    """Run `hc <args>`; an `HcResult`, or None when nothing ran.
+
+    Every call site adds `--json` itself, at the right place, rather than
+    having it appended here: `run`'s argv ends with the launched program's
+    own positional arguments (after `--`), and `--json` has to come before
+    those, not after them.
+    """
+    try:
+        r = subprocess.run(["hc", *[str(a) for a in args]],
+                           stdin=subprocess.DEVNULL, capture_output=True,
+                           text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return HcResult(None, "", "", True)
+    except Exception as exc:       # FileNotFoundError, PermissionError, ...
+        print(f"[mux:hc] WARNING: hc could not be run: {exc}", file=sys.stderr)
+        return None
+    return HcResult(r.returncode, r.stdout, r.stderr, False)
+
+
+def _hc_data(res) -> Optional[dict]:
+    """The JSON object `res` carries on a clean exit, or None.
+
+    Design doc §5: hc's `--json` writes its result to **stdout on success**
+    and its error envelope to **stderr on failure** — never the other way
+    around.  Reading stdout unconditionally would see an empty string on
+    every failure and read every error as "not JSON", i.e. `PANE_UNOBSERVED`
+    for everything including a clean `not_found` (`record_existence()` could
+    then never return `PANE_GONE`).
+    """
+    if res is None or res.timed_out or res.rc != 0:
+        return None
+    try:
+        data = json.loads(res.out)
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _hc_error_kind(res) -> Optional[str]:
+    """The failed call's `error.kind`, read from **stderr** (design doc §5).
+
+    None on success, a timeout, or a stderr that is not the `{"error": {...}}`
+    envelope hc documents — never guessed from the exit code alone (measured,
+    §5: `hc schema`'s 25-entry `kind` vocabulary is not the CLI's whole
+    vocabulary either — `usage` is a measured 26th — so an unlisted string is
+    still passed through here and left to the caller's own catch-all).
+    """
+    if res is None or res.timed_out or res.rc == 0:
+        return None
+    try:
+        data = json.loads(res.err)
+    except ValueError:
+        return None
+    err = data.get("error") if isinstance(data, dict) else None
+    kind = err.get("kind") if isinstance(err, dict) else None
+    return kind if isinstance(kind, str) else None
+
+
+def _hc_connect(method: str, params: dict, timeout: float = 10.0):
+    """One line-delimited JSON-RPC 2.0 round trip over `hc connect`.
+
+    `(result, None)` on success, `(None, reason)` otherwise.  Deliberately a
+    **separate, small parser** from `_hc_error_kind()` (design doc §3.5 point
+    3): `hc connect`'s error envelope nests `kind` one level deeper than the
+    CLI's (`error.data.kind`, not `error.kind`), so reusing the CLI parser
+    here would read the wrong field and turn every API error into the same
+    "could not parse" catch-all the CLI parser falls back to for its own
+    unrelated failures — never noticing the difference.
+
+    One subprocess per call (design doc §3.5 point 4): nothing in this file
+    keeps a `hc connect` process alive across two verb calls, since a verb
+    call is itself a fresh `python3 lib_mux.py` invocation as often as not
+    (CLAUDE.md 不変条件 8) — there is no object whose lifetime a persistent
+    connection could ride along with.
+    """
+    request = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method,
+                          "params": params})
+    try:
+        r = subprocess.run(["hc", "connect"], input=request + "\n",
+                           capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return None, "timeout"
+    except Exception as exc:
+        return None, str(exc)
+    line = r.stdout.splitlines()[0] if r.stdout.strip() else ""
+    try:
+        data = json.loads(line)
+    except ValueError:
+        return None, "unparseable hc connect response"
+    if not isinstance(data, dict):
+        return None, "unparseable hc connect response"
+    if isinstance(data.get("result"), dict):
+        return data["result"], None
+    err = data.get("error")
+    kind = None
+    if isinstance(err, dict):
+        edata = err.get("data")
+        kind = edata.get("kind") if isinstance(edata, dict) else None
+    return None, (kind if isinstance(kind, str) else "error")
+
+
+class HcBackend(_Backend):
+    """herdr-core (`hc`) backend — see knowledge/herdr-core-mux-backend.md.
+
+    One hc server, one flat namespace of terminals (no session / workspace
+    concept to scope to, unlike tmux / herdr / Rex).  The spawn record's
+    `handle` is hc's `address` (§3.4); `server_identity()` is
+    `(core.id, holder.instance)` from `hc server status` (§4.3).
+    """
+
+    BACKEND_NAME = "hc"
+
+    # -- plumbing ------------------------------------------------------
+
+    def _guard(self, verb: str, name: str) -> None:
+        # hc has no session/workspace to compare against `_DEFAULT_SESSION`
+        # (tmux/herdr/rex's "is this the production destination" half of the
+        # check) — the pane-prefix half still applies, and it is the one that
+        # matters here: every hc call below is addressed by `_target()`,
+        # which is built from `_pane_name(name)`, so an empty test prefix
+        # means a test call would otherwise address the bare, production name.
+        _guard_test_isolation(self.BACKEND_NAME, verb, name, "")
+
+    def _target(self, name: str) -> str:
+        """What to pass hc as `<terminal>` for `name` — see class docstring.
+
+        The record's `handle` (an hc `address`) when this checkout spawned
+        one, so a later caller is never misled by `name` resolving to a
+        newer terminal with the same label (§3.0).  Only a name that was
+        never spawned here (or whose record this backend does not own) falls
+        back to the lower-cased pane name — the one spelling hc's `--name`
+        ever accepted for it (§3.3).
+        """
+        record = read_pane_record(name)
+        handle = (record.get("handle") if isinstance(record, dict)
+                  and record.get("backend") == self.BACKEND_NAME else None)
+        if isinstance(handle, str) and handle:
+            return handle
+        return _pane_name(name).lower()
+
+    def _get(self, target: str, *, timeout: float = 10.0):
+        """`(data, kind)` for `hc get <target> --json` — data on success."""
+        res = _hc_run(["get", target, "--json"], timeout=timeout)
+        return _hc_data(res), _hc_error_kind(res)
+
+    def server_identity(self):
+        """`(core.id, holder.instance)` — see _Backend and design doc §4.3."""
+        data = _hc_data(_hc_run(["server", "status", "--json"], timeout=5))
+        if data is None:
+            return None
+        core = data.get("core")
+        holder = data.get("holder")
+        core_id = core.get("id") if isinstance(core, dict) else None
+        instance = holder.get("instance") if isinstance(holder, dict) else None
+        if not isinstance(core_id, str) or not core_id \
+                or not isinstance(instance, str) or not instance:
+            return None
+        return core_id, instance
+
+    def available(self) -> bool:
+        """`hc` binary present, server reachable (started if needed, and that
+        start is measured idempotent — design doc §2), and its JSON-RPC
+        protocol generation one this code was measured against.
+
+        Fail-closed like Rex, not warn-and-continue like herdr (design doc
+        §4.2): hc is pre-1.0 and documents "Protocol generation" as a
+        first-class, intentionally-bumpable number, so a mismatch here is not
+        treated as "probably still fine".
+        """
+        if shutil.which("hc") is None:
+            return False
+        start = _hc_run(["server", "start", "--json"], timeout=10)
+        if start is None or start.timed_out or start.rc != 0:
+            self._warn("hc server could not be started")
+            return False
+        result, reason = _hc_connect("hello", {}, timeout=5)
+        if result is None:
+            self._warn(f"hc hello failed: {reason}")
+            return False
+        generation = result.get("generation")
+        if generation not in _HC_GENERATIONS:
+            self._warn(
+                f"hc protocol generation {generation!r} is not one this code "
+                f"was measured against {sorted(_HC_GENERATIONS)}; not using "
+                f"it (no other backend is substituted)")
+            return False
+        return True
+
+    def server_running(self) -> bool:
+        """True if `hc server status` answers right now — never starts it."""
+        res = _hc_run(["server", "status", "--json"], timeout=5)
+        return res is not None and not res.timed_out and res.rc == 0
+
+    def state(self, name: str) -> str:
+        """Agent state from `hc get`'s `status` — design doc §7.
+
+        `reported: false` means the program has never reported a status at
+        all — not "idle" (§7.3): a Worker mid-launch is `reported: false`
+        indistinguishably from one that will never report, and calling that
+        idle is how an unfinished launch gets handed a second task.  Only
+        `reported: true` lets `status.state` through, and only a value this
+        file recognises — see the class docstring for why `"error"` is
+        passed through rather than mapped to one of the other four.
+        """
+        target = self._target(name)
+        data, kind = self._get(target)
+        if data is None:
+            self._warn(f"state {name!r}: hc get {target!r} failed"
+                       + (f" ({kind})" if kind else ""))
+            return "unknown"
+        if data.get("reported") is not True:
+            return "unknown"
+        status = data.get("status")
+        s = status.get("state") if isinstance(status, dict) else None
+        if s in ("idle", "working", "done", "blocked", "error"):
+            return s
+        return "unknown"
+
+    # -- ids / existence -------------------------------------------------
+
+    def _inspect_pane(self, name: str):
+        """`(address, pane_pid)` — see _Backend.  `pane_pid` is None unless
+        the terminal is `live` (§3.4): a `finished` terminal's `pid` is a
+        dead process's number, and handing that to watchdog's fail-closed
+        `/proc` check is the exact bug this design doc exists to avoid."""
+        self._guard("pid", name)
+        target = self._target(name)
+        data, kind = self._get(target)
+        if data is None:
+            self._warn(f"pid {name!r}: hc get {target!r} failed"
+                       + (f" ({kind})" if kind else ""))
+            return None, None
+        address = data.get("address")
+        if not isinstance(address, str) or not address:
+            self._warn(f"pid {name!r}: hc get {target!r} returned no address")
+            return None, None
+        pid = data.get("pid")
+        pane_pid = (pid if data.get("state") == "live"
+                   and isinstance(pid, int) and not isinstance(pid, bool)
+                   else None)
+        return address, pane_pid
+
+    def pid(self, name: str) -> Optional[int]:
+        return self._inspect_pane(name)[1]
+
+    def record_existence(self, name: str, record: dict,
+                         timeout: Optional[float] = None) -> str:
+        """Asked by the record's `handle`, bound to the generation it names.
+
+        Design doc §3.1 (`record_existence` row) / §5: only `not_found` is a
+        definite "that address was `hc rm`-ed" — a `finished` terminal still
+        answers `hc get` successfully and is `PANE_EXISTS`, same as `live`
+        (both are "not gone yet"; the sweep only ever acts on `PANE_GONE`).
+        `holder.instance` is read before **and** after the question, as Rex
+        does for `instance_id` (§4.3: whether hc's `address` numbering
+        resets across a holder restart is unconfirmed, so a holder that
+        changed in between makes any answer — "not found" included —
+        worthless, because a new holder could hand the same address string
+        to an unrelated terminal).
+        """
+        bound = record.get("server") if isinstance(record, dict) else None
+        handle = record.get("handle") if isinstance(record, dict) else None
+        if not isinstance(bound, dict) or not isinstance(handle, str) or not handle:
+            return PANE_UNOBSERVED
+        want = (str(bound.get("endpoint") or ""), str(bound.get("generation") or ""))
+        t = 5.0 if timeout is None else max(timeout, 0.1)
+        before = self.server_identity()
+        if before is None or (str(before[0]), str(before[1])) != want:
+            return PANE_UNOBSERVED
+        res = _hc_run(["get", handle, "--json"], timeout=t)
+        if res is not None and res.timed_out:
+            return PANE_UNANSWERED
+        after = self.server_identity()
+        if after is None or (str(after[0]), str(after[1])) != want:
+            return PANE_UNOBSERVED
+        if _hc_data(res) is not None:
+            return PANE_EXISTS
+        return PANE_GONE if _hc_error_kind(res) == "not_found" else PANE_UNOBSERVED
+
+    # -- spawn -------------------------------------------------------------
+
+    def spawn(self, name: str, cmd: str, cwd: Optional[str] = None) -> bool:
+        """`hc run --bg` a new terminal and record its `address`.
+
+        No husk-reuse dance (unlike herdr/Rex): hc never blocks a spawn on an
+        old, finished terminal under the same `name` (§3.0 — `name_taken`
+        only fires while a *live* terminal holds it), so there is nothing to
+        detect or relaunch into — every call either gets a fresh `address` or
+        is refused outright.
+
+        `cmd` is wrapped in `bash -lc "export PATH=...; " + cmd` (design doc
+        §6): hc's `terminal.run` execs `argv` directly, with none of the
+        login-shell PATH (`~/.local/bin`, `scripts/bin`) a tmux/herdr pane's
+        shell already has — confirmed by the measured `spawn_failed` on a
+        bare `claude` argv.  `cmd` itself may carry its own `export PATH=...`
+        (`lib_daemon_watch.spawn_command()`, start.sh's ENV_EXPORTS) for
+        other reasons; this prefix only guarantees a sane baseline exists
+        before that runs, it does not replace it.
+        """
+        self._guard("spawn", name)
+        self.last_spawn_refusal = None
+        hc_name = _pane_name(name).lower()
+        label = f"crewvia_name={_pane_name(name)}"
+        path_prefix = (f'export PATH="{_SCRIPTS_DIR / "bin"}:'
+                       f'$HOME/.local/bin:$PATH"; ')
+        args = ["run", "--bg", "--name", hc_name, "--label", label]
+        if cwd:
+            args += ["--cwd", cwd]
+        args += ["--json", "--", "bash", "-lc", path_prefix + cmd]
+        res = _hc_run(args, timeout=15)
+        data = _hc_data(res)
+        if data is None:
+            kind = _hc_error_kind(res)
+            if kind == "name_taken":
+                self.last_spawn_refusal = SPAWN_OCCUPIED
+            else:
+                self.last_spawn_refusal = SPAWN_UNREADABLE
+                self._warn(f"spawn {name!r}: hc run failed"
+                          + (f" ({kind})" if kind else ""))
+            return False
+        address = data.get("address")
+        if not isinstance(address, str) or not address:
+            self._warn(f"spawn {name!r}: hc run returned no address")
+            self.last_spawn_refusal = SPAWN_UNREADABLE
+            return False
+        server = self.server_identity()
+        if server is None:
+            self._warn(
+                f"spawn {name!r}: the hc server identity could not be "
+                f"established; no record is written and the terminal is "
+                f"unmanaged (address={address}) — close it by hand "
+                f"(`hc kill {address}; hc rm {address}`)")
+            return False
+        ok = write_pane_record(name, self.BACKEND_NAME, address, server=server)
+        if not ok:
+            self._warn(
+                f"spawn {name!r}: the spawn record could not be written; "
+                f"the terminal is running but unmanaged (address={address}) "
+                f"— close it by hand")
+        return bool(ok)
+
+    # -- send / keys / capture / list ---------------------------------------
+
+    def send(self, name: str, text: str) -> bool:
+        self._guard("send", name)
+        target = self._target(name)
+        res = _hc_run(["send", target, "--json", "--", text], timeout=10)
+        if _hc_data(res) is None:
+            kind = _hc_error_kind(res)
+            self._warn(f"send {name!r}: hc send failed"
+                      + (f" ({kind})" if kind else ""))
+            return False
+        return True
+
+    def keys(self, name: str, keys: List[str]) -> bool:
+        self._guard("keys", name)
+        translated, unknown = translate_keys(keys, self.BACKEND_NAME)
+        if unknown:
+            self._warn(f"keys {name!r}: refusing unknown key name(s) {unknown!r}")
+            return False
+        target = self._target(name)
+        res = _hc_run(["keys", target, "--json", "--", *translated], timeout=10)
+        if _hc_data(res) is None:
+            kind = _hc_error_kind(res)
+            self._warn(f"keys {name!r}: hc keys failed"
+                      + (f" ({kind})" if kind else ""))
+            return False
+        return True
+
+    def capture(self, name: str) -> str:
+        self._guard("capture", name)
+        target = self._target(name)
+        res = _hc_run(["read", target, "--lines", str(_HC_CAPTURE_LINES),
+                      "--json"], timeout=10)
+        data = _hc_data(res)
+        if data is None:
+            kind = _hc_error_kind(res)
+            self._warn(f"capture {name!r}: hc read failed"
+                      + (f" ({kind})" if kind else ""))
+            return ""
+        text = data.get("text")
+        return text if isinstance(text, str) else ""
+
+    def list(self, suffix: Optional[str] = None) -> List[str]:
+        """Live terminals only (design doc §3.3-3 / §3.5): `terminal.list`
+        with `all: false` over `hc connect`, never the CLI `hc ls` (which
+        drops `labels` from every entry — the only place crewvia's name is
+        recoverable from hc's own, lower-cased `name`)."""
+        result, reason = _hc_connect("terminal.list", {"all": False}, timeout=10)
+        if result is None:
+            self._warn(f"list: hc connect terminal.list failed ({reason})")
+            return []
+        terminals = result.get("terminals")
+        if not isinstance(terminals, list):
+            return []
+        prefix = _pane_prefix()
+        names = []
+        for t in terminals:
+            if not isinstance(t, dict):
+                continue
+            labels = t.get("labels")
+            label = labels.get("crewvia_name") if isinstance(labels, dict) else None
+            if isinstance(label, str) and label.startswith(prefix):
+                names.append(_caller_name(label))
+        if suffix:
+            names = [n for n in names if n.endswith(suffix)]
+        return names
+
+    # -- kill ----------------------------------------------------------
+
+    def kill(self, name: str, *, allow_foreign: bool = False) -> bool:
+        """End `name`'s terminal — `hc kill <address>`.
+
+        A `finished` terminal is **not** `hc rm`-ed here (§3.0: hc already
+        tolerates the old, unremoved terminal sitting around under a reused
+        `name`, and nothing downstream of this file depends on prompt
+        removal) — only the record is dropped, same as every other backend's
+        `kill()` ending its own bookkeeping, not necessarily the OS-level
+        artifact.
+        """
+        self._guard("kill", name)
+        judged = read_pane_record(name)
+        if allow_foreign:
+            self._warn_forced_bypass(name)
+        if not allow_foreign and name in DAEMON_PANE_NAMES:
+            address, pane_pid, server = self._inspect_pane_full(name)
+            if self._refuses_foreign_daemon(name, address, pane_pid, server):
+                return False
+            if not address:
+                self._warn(
+                    f"kill {name!r}: refused — the terminal that was "
+                    f"inspected could not be identified. Nothing was killed.")
+                return False
+            target = address
+        else:
+            target = self._target(name)
+        res = _hc_run(["kill", target, "--json"], timeout=10)
+        if _hc_data(res) is None:
+            kind = _hc_error_kind(res)
+            if kind != "not_found":
+                self._warn(f"kill {name!r}: hc kill failed"
+                          + (f" ({kind})" if kind else ""))
+                return False
+            # Already `hc rm`-ed: nothing to kill, but also nothing left for
+            # the record to name — fall through and drop it.
+        self._forget_record(name, judged)
+        return True
+
+    # -- attach --------------------------------------------------------
+
+    def attach(self, name: str) -> bool:
+        # Measured (design doc §3.1 / §2): `hc attach` needs a real tty
+        # ("attach needs a terminal" / "use --observe to watch from a pipe"
+        # over a pipe).  crewvia's automation (dispatcher/watchdog) never has
+        # one, so this always returns False — attach_cmd()'s `exec` is the
+        # only path in.
+        return False
+
+    def attach_cmd(self, name: str) -> Optional[List[str]]:
+        # Unlike Rex (no terminal client at all), hc ships a real one and
+        # accepts either an address or a name in the same slot (measured,
+        # §3.4 point 5), so there is nothing to pre-focus — just exec it.
+        return ["hc", "attach", self._target(name)]
+
+    def verify_sent(self, name: str, text: str) -> bool:
+        """Screen-scrape fallback only (design doc §8.3 path 2).
+
+        §8.3 path 1 (`reported: true` → trust `SendResult.started`) is not
+        implemented: `started` is only available from the **same** `hc send`
+        call that already produced `send()`'s own return value, and
+        `verify_sent()` is always a separate call — frequently a separate
+        `python3 lib_mux.py verify-sent` process entirely (CLAUDE.md 不変条件
+        8), with no object or file either call is specified to leave behind
+        for the other to read.  Implementing path 1 for real would mean
+        inventing a side-channel this design does not define, which is out
+        of scope here; the design doc itself marks path 1 "未検証" (§11), so
+        the behaviour below — identical to `Mux.verify_sent()`'s own default
+        — is a documented no-op fast path, not a silent gap.
+        """
+        screen = self.capture(name)
+        if not screen:
+            return False
+        return not _text_in_input_line(screen, text, tail_lines=_VERIFY_SENT_TAIL_LINES)
+
+
+# ---------------------------------------------------------------------------
 # Public Mux facade
 # ---------------------------------------------------------------------------
 
@@ -5772,7 +6319,11 @@ class Mux:
         """
         # Rex has the real input box on screen; its own judgement (not the
         # `❯`-line heuristic below) is the one the production path must use.
-        if isinstance(self._backend, RexBackend):
+        # HcBackend's own verify_sent() is, today, the same heuristic (see
+        # its docstring for why) — routed through it anyway so a backend-
+        # specific improvement has a place to land without touching this
+        # isinstance check again (design doc §10-5).
+        if isinstance(self._backend, (RexBackend, HcBackend)):
             return self._backend.verify_sent(name, text)
         screen = self.capture(name)
         if not screen:

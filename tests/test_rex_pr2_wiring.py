@@ -327,7 +327,7 @@ def _mode_block():
     return text[a:b]
 
 
-def _run_mode_block(tmp_path, *, env_mux, config_mode, have=("rex", "herdr"), ensure_rc=0):
+def _run_mode_block(tmp_path, *, env_mux, config_mode, have=("rex", "herdr", "hc"), ensure_rc=0):
     scripts = tmp_path / "scripts"
     scripts.mkdir()
     log = tmp_path / "calls.log"
@@ -370,6 +370,17 @@ def _run_mode_block(tmp_path, *, env_mux, config_mode, have=("rex", "herdr"), en
     ("herdr", "herdr", "herdr", ["available MUX=herdr", "available MUX=herdr"]),
     # env 無しなら config
     (None, "rex", "rex", ["ensure-server MUX=rex"]),
+    # t002: hc も env が勝つ。config が herdr (本番の既定) でも herdr の検査はしない
+    # — これが抜けていたときの事故そのもの（env=hc が config=herdr に黙って上書きされる）。
+    # herdr と同じ構造 (mode: herdr/rex/hc を自分に揃えてから、揃えた値の elif 分岐でも
+    # もう一度確かめる) なので available() は 2 回呼ばれる — herdr-herdr / rex-herdr と同じ形
+    ("hc", "herdr", "hc", ["available MUX=hc", "available MUX=hc"]),
+    # config が hc でも env=tmux なら tmux。hc の server チェックはしない
+    ("tmux", "hc", "tmux", []),
+    # env 無しなら config の elif 分岐だけが available() を呼ぶ。_EFFECTIVE_BACKEND が
+    # 空のままなのでこの呼び出しの前に CREWVIA_MUX は export されていない (herdr と同形)
+    (None, "hc", "hc", ["available MUX="]),
+    ("hc", "hc", "hc", ["available MUX=hc", "available MUX=hc"]),
 ])
 def test_start_sh_resolves_the_effective_backend_once(tmp_path, env_mux, config_mode,
                                                       want_mux, want_calls):
@@ -378,8 +389,9 @@ def test_start_sh_resolves_the_effective_backend_once(tmp_path, env_mux, config_
     assert f"RESULT MUX={want_mux} ENABLED=1" in r.stdout, r.stdout
     assert calls == want_calls
     # 実効でない backend の案内を出さない
-    other = "herdr" if want_mux == "rex" else "rex"
-    assert f"{other} 並列モード" not in r.stdout
+    others = {"herdr", "rex", "hc"} - {want_mux}
+    for other in others:
+        assert f"{other} 並列モード" not in r.stdout
 
 
 def test_start_sh_rex_server_failure_exits_1_without_falling_back(tmp_path):
@@ -388,6 +400,17 @@ def test_start_sh_rex_server_failure_exits_1_without_falling_back(tmp_path):
     assert "rex server を使えません" in r.stderr
     assert "RESULT" not in r.stdout
     assert not [c for c in calls if c.startswith("available")]   # herdr に落ちない
+
+
+def test_start_sh_env_hc_is_not_silently_overridden_by_config_mode_herdr(tmp_path):
+    """t002 で見つけた事故の再現: `CREWVIA_MUX=hc` の case 文に `hc` が無いと、
+    `_EFFECTIVE_BACKEND` が空のまま `MODE_FROM_CONFIG` (本番の既定 `herdr`) 側の
+    分岐に流れ、最終的に `export CREWVIA_MUX=herdr` でユーザーの指定を踏みつぶす。"""
+    r, calls = _run_mode_block(tmp_path, env_mux="hc", config_mode="herdr")
+    assert r.returncode == 0, r.stderr
+    assert "RESULT MUX=hc ENABLED=1" in r.stdout, r.stdout
+    assert "herdr 並列モード" not in r.stdout
+    assert not [c for c in calls if "MUX=herdr" in c]
 
 
 # ---------------------------------------------------------------------------

@@ -174,6 +174,11 @@ elif [[ $FULL -eq 1 ]] && [[ "$_STOP_BACKEND" == "rex" ]]; then
   # Rex の server は利用者の Rex 全体 (crewvia 以外の session も持つ)。crewvia が
   # 起動した場合でも、止めるかどうかは利用者が決める (rex-mux-backend.md §10.1)。
   echo "→ rex server は停止しません (--full は herdr 専用)。止めるなら: rex server stop"
+elif [[ $FULL -eq 1 ]] && [[ "$_STOP_BACKEND" == "hc" ]]; then
+  # hc の server も利用者のデスクトップ全体の server (crewvia 以外の terminal も持つ)。
+  # rex と同じ理由で、止めるかどうかは利用者が決める。足さないと下の herdr 専用の
+  # 分岐に落ちて、hc を使っているのに無関係な herdr server を止めにいってしまう。
+  echo "→ hc server は停止しません (--full は herdr 専用)。止めるなら: hc server stop"
 elif [[ $FULL -eq 1 ]]; then
   echo "→ herdr server を停止..."
   if [[ $DRY_RUN -eq 1 ]]; then

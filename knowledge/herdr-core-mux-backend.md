@@ -1,6 +1,9 @@
-# herdr-core (`hc`) を mux バックエンドにする設計（`scripts/lib_mux.py` の `HcBackend`、仮称）
+# herdr-core (`hc`) を mux バックエンドにする設計（`scripts/lib_mux.py` の `HcBackend`）
 
-**実装はしない。これは設計メモの草案**（mission `20261106-herdr-core-backend` t001）。t002 で `HcBackend` を実装する前提の決めごとをまとめる。
+設計メモ（mission `20261106-herdr-core-backend` t001、attempt 1-6）+ 実装時の追記（t002）。`HcBackend` は
+`scripts/lib_mux.py` に実装済み（`CREWVIA_MUX=hc` / `mode: hc`）。実装で変わった点・t001 が未決のまま残した
+点への答えは一番下の「**改訂（t002 実装）**」にまとめた——本文（§1〜§11）は t001 時点の設計のままなので、
+実装の最終形との食い違いがあれば最新の記述はそちらを優先すること。
 
 - 対象の版: `hc 0.1.18`（`/home/tkadmin/.local/bin/hc`）。upstream `herdrdev/herdr-core`（公開）。OpenRPC schema `info.version` も `0.1.18`、**protocol generation 1**（`hc schema` の `info.description`）
 - 書いた人: Worker Minjun（mission `20261106-herdr-core-backend` t001）。Director の事前メモ（card 本文）の実測を自分でも本機（本番の hc server、desktop-l8nqlib、holder pid 1246708 時点）で再現し、JSON Schema（`hc schema`）とライブコマンドの両方で裏を取った
@@ -464,7 +467,88 @@ argv = ["bash", "-lc", "export PATH=\"$CREWVIA_REPO_ROOT/scripts/bin:$HOME/.loca
 
 - `claude`（claude-code）を hc の terminal で実際に起動し、`reported: true` / `status.state` の遷移を自分で観測する（Director 実測の再現。コストと本機への影響を考え本 task では見送った——claude-code のネストしたセッションを本番 hc server 上に作ることになるため）
 - `hc server` の再起動（`hc update` の `restarted: true` を含む）で terminal の ID・holder.instance がどう変わるか、**特に `address`（`t7` 等）の採番が holder をまたいで連続するか**（§4.3・§3.4・§10-3）。本番の hc server を止める操作はこの task の方針（CLAUDE.md・`hc --skill` 共通の「頼まれていないのに止めるな」）に反するため未実施
-- `hc attach <t>` を実際に exec して人間が操作できるかの実地検証（tty 制約自体は実測済み。§3.1・§10-4）
+- `hc attach <t>` を実際に exec して人間が操作できるかの実地検証（tty 制約自体は実測済み。§3.1・§10-4）。t002 でも対話的な tty が無く未実施のまま
 - `machine_unknown` kind の実測（`--on` を使うリモート機能は対象外のため）
 - `server` が無い状態での `hc server status --json` の挙動（起動するのか、エラーになるのか）。本番 server を落として試すのは禁止事項に反するため未実施（§3.1 の `server_running()` 行）
 - `finished` になった後も `status`（agent status）欄が保持されるかどうか（§3.1 の `state(name)` 行）。`reported:true` の相手を finished にしてから `status` を読む実験は本 task では見送った
+
+## 12. 改訂（t002 実装）
+
+Worker Ingrid（mission `20261106-herdr-core-backend` t002）。`HcBackend` を `scripts/lib_mux.py` に実装した。
+本機（§2 と同じ本番 desktop server、hc 0.1.18）で使い捨て terminal（`Cvt002probe*-worker`、後始末済み）を実際に
+spawn/state/pid/capture/list/attach/kill/record_existence/`hc rm` の順で叩き、下の各点を**実測**で裏取りした
+うえで実装した。設計 §10 の未決事項への答えもここにまとめる。
+
+1. **§10-1（generation の取得経路）**: 設計どおり `hc connect` の `hello` を使った。`available()` は
+   `hc server start --json`（冪等。実測: 既に生きている server に対して pid/uptime 不変）→ `hello.generation`
+   が `_HC_GENERATIONS = frozenset({1})` に無ければ False。**実測**: 本機で `available()` → `True`、
+   `server_identity()` → `("972c9056285907f04dfc72170c12ac7b", "63f6d40f57ba43dd39e40066789098d2")`
+   （`core.id` / `holder.instance`、§4.3 のとおり）。
+2. **§10-2（`error` state の Rule 5 対応）**: この task では決めなかった。`state()` は `status.state == "error"` を
+   そのまま返す（他の4値と同じ関数内で、idle/working/done/blocked と並べて許可）。dispatcher.sh の Rule 5 には
+   まだ `"error"` の分岐が無いので、今のところ A（blocked）にも B（idle/done）にも当たらず**通知されない**
+   （危険側ではない——Rule 5 が無視するだけで、watchdog の max 等の既存の安全弁は別に効く）。dispatcher.sh 側の
+   配線は別タスクにした（lib_mux.py の外に出る変更で、今回の実装スコープ外と判断した）。
+3. **§10-3（holder 切り替わり時の `address` 再利用）**: 本番 server を再起動する検証はこの task でも実施して
+   いない（禁止事項どおり）。設計の決定（`record_existence()` が `server_identity()` を前後で読み直す。Rex と
+   同じ防御）をそのまま実装した——未確認のリスクは据え置きだが、保険は入っている。
+4. **§10-4（`attach()` / `attach_cmd()` の実地検証）**: `attach_cmd()` が返す `["hc", "attach", <target>]` の
+   `hc attach` 自体が tty を要求すること（`usage` kind）は t001 時点で実測済み（§3.1 を再確認し、本 task でも
+   変更していない）。**ただし「exec 後に人間が実際に操作できるか」は、このセッションにも対話的な tty が無く
+   本 task でも検証できていない**——§11 の該当項目は未確認のまま残す。
+5. **§10-5（`Mux.verify_sent()` の isinstance 分岐）**: 設計どおり `isinstance(self._backend, (RexBackend,
+   HcBackend))` に変更した（`lib_mux.py` の `Mux.verify_sent()`）。ただし `HcBackend.verify_sent()` 自体は
+   §8.3 の案 1（`reported: true` の相手に `SendResult.started` を使う）を実装していない——`started` は
+   `send()` のその場の呼び出しでしか手に入らず、`verify_sent()` は（`send()` と同じ python プロセスとは
+   限らない）**別の呼び出し**なので、読み戻す手段が無い（CLAUDE.md 不変条件 8: dispatcher はサイクルごとに
+   新しい python）。設計が想定していた「同一プロセス内で送信直後に確認する」経路はこの構造と噛み合わない
+   ため、この task では screen-scraping（§8.3 案 2）だけを実装し、`Mux.verify_sent()` の既定経路と同じ挙動に
+   した（isinstance への追加自体は、将来 backend 固有の改善を入れる置き場として残す）。§11 の「`started` が
+   実際に使えるか」の検証は、この構造上の制約が先に解消されないと意味を持たない。
+6. **§10-6（`may_destroy()`/`kill()` の finished terminal 判定）**: Rex 相当の上書きはせず、共有の
+   `_Backend.may_destroy()` に素通りさせた（fail-closed のまま。`dispatcher`/`watchdog` 自身の hc pane が
+   finished のときの `kill()`/`may_destroy()` は `--force` 無しでは常に拒否）。理由は設計の見立てどおり実害が
+   小さいこと——finished と `state()`/`pid()` で分かった時点で `kill()` を呼ばず `record_existence` 経由で
+   記録を畳む経路に進めば、この拒否には当たらない。
+7. **（実装時に判明。設計書には無い）入口スクリプト 3 つが `hc` を知らないと事故る**:
+   - `scripts/start.sh` の director 専用 backend 解決の「env (`CREWVIA_MUX`) と config (`mode:`) の食い違いを
+     揃える」ロジック（`case "$_ENV_MUX" in tmux|herdr|rex)`）は `hc` を含んでいなかった。`CREWVIA_MUX=hc` を
+     env で指定しても、config の `mode: herdr`（本番の既定）がそのまま `herdr` の不在チェック・
+     `export CREWVIA_MUX=herdr` に流れ、**env の `hc` 指定を黙って上書きする**——ちょうどこのコメントが警告
+     している事故そのもの。`hc` をケース文に足し、herdr と対称な不在チェック・`available()` チェック・
+     `mode: hc` の分岐を追加した（実測で再現・修正の両方を確認。テスト:
+     `tests/test_rex_pr2_wiring.py::test_start_sh_env_hc_is_not_silently_overridden_by_config_mode_herdr`）。
+   - トップレベルの `./crewvia` 自身の `mode:` 読み取り（`case "$MODE" in tmux|herdr|rex|inline|*)`）にも
+     `hc)` が無く、`mode: hc` は `*)` の catch-all に落ちて「不明な mode」警告つきで `tmux` に強制される
+     ——これは env での上書きが無い、**config だけで `mode: hc` を選ぶ一番普通の経路**で踏む。`hc)` の分岐と、
+     herdr/rex と対称な不在チェック・`available()` チェックのブロックを追加した（実測で再現・修正を確認。
+     テスト: `tests/test_hc_crewvia_launcher_wiring.py`）。
+   - `scripts/crewvia-stop.sh --full` の backend 判定（`lib_mux._select_backend().BACKEND_NAME`。これ自体は
+     汎用なので `hc` も正しく返る）の後の分岐は `rex` だけ専用メッセージを持ち、それ以外は無条件に
+     `herdr server stop` を実行する——`hc` を選んでいても、インストールされていれば**無関係な herdr server
+     を止めてしまう**。rex と同じ理由（利用者のデスクトップ全体の server で、crewvia 以外の terminal も
+     持つ）で `hc` 専用の「止めません」分岐を足した。
+   - `scripts/setup-new-env.sh` の mux 検出（情報表示のみ、分岐の事故ではない）にも `hc` を足した。
+   いずれも `lib_mux.py` 自体の変更ではなく、入口スクリプト側が新しい backend 名を知らないことによる
+   脱落——`_select_backend()` のような汎用の判定を通さない箇所ほど、同じクラスの事故を踏みやすいことが
+   分かった（3 箇所とも「文字列リテラルの一覧に `hc` を足し忘れる」という同型のミス）。
+8. **（実装時に判明）`kill()` は `hc rm` を呼ばない**: finished terminal を `hc rm` するのは運用（手動確認の
+   後始末・将来の gc task）の仕事のままにし、`kill()` は crewvia 側の記録を畳むところまで。**実測で確認**:
+   `kill()` 後も `hc ls --all` に `state:"finished"` として残り続け、`record_existence()` はその record に対して
+   引き続き `PANE_EXISTS` を返す（設計 §3.1 の決定どおり。「消えた」と「終わった」が別概念であることと整合）。
+9. **（実装時に判明。実測で確認）`spawn()` の PATH 補完が実際に効くことを確認した**: `hc run` に生の
+   `claude`/`hc` を argv で渡すと `spawn_failed`（§6 のとおり、再現済み）になるのに対し、`HcBackend.spawn()`
+   が組み立てる `bash -lc "export PATH=...; " + cmd` 経由で bare `hc --version` を実行すると成功する
+   （本機での実測。`$HOME/.local/bin` が無いと即死する再現と、有ると直ることの両方を確認した）。
+10. **（実装時に判明。実測で確認）`name_taken` の挙動**: 同じ名前へ live な terminal がある間の 2 回目の
+    `spawn()` は `last_spawn_refusal == SPAWN_OCCUPIED` で False になることを実機で確認した（§3.0 の記述と
+    一致）。
+11. テスト: `tests/test_hc_backend.py`（偽の `hc` を PATH に置く。`hc` が本物の CLI/`hc connect` の両方の形で
+    応答できるよう `tests/hc_harness.py` の `FakeHc` を新設——`tests/rex_harness.py` の `FakeRex` と同じ立て付け）。
+    CI で常に走る（本物の hc は入っていない環境を想定）。mutation 観点で特に厚くしたのは、設計のここまでの
+    attempt が繰り返し壊した 4 点——① kill の認可（`not_found` 以外は `PANE_GONE` にしない。`finished` /
+    `name_taken` / `usage` / `needs_update` をパラメタ化してテスト）② 版の固定（`hello.generation` 不一致で
+    `available()` False）③ `reported: false` を `idle` に倒さない④ `spawn()` の argv に PATH export
+    （`scripts/bin` と `$HOME/.local/bin`）が入っていること。Rex 自身のテスト（`test_rex_backend_stub_protocol.py`）
+    にも独立した `red_proof_*` スクリプトは無く、偽の CLI に対する直接的な assertion がその役を果たしている
+    ——`HcBackend` も同じ作法に揃えた（別立ての mutation-injection スクリプトは作っていない）。

@@ -3,7 +3,7 @@
 **Crewvia** is a portable, task-driven multi-agent system built on top of Claude Code CLI.
 Agents are dynamically assigned names, collaborate on kanban-style task cards, and integrate
 with [Taskvia](https://taskvia.vercel.app) for approval flows and knowledge logging.
-No mux required — it works standalone or with any terminal multiplexer (tmux, herdr or Rex).
+No mux required — it works standalone or with any terminal multiplexer (tmux, herdr, Rex or herdr-core).
 
 ---
 
@@ -35,7 +35,7 @@ Key design principles:
 - **Task-first** — Agents are card executors; the task card is the unit of work
 - **Name continuity** — Workers with the same skill set inherit the same name across sessions (e.g., all `[ops, bash]` Workers are called "Kai"), enabling knowledge accumulation
 - **Taskvia-optional** — The system runs in standalone mode when `TASKVIA_TOKEN` is not set
-- **mux-optional** — tmux/herdr/Rex is supported but not required; any terminal works
+- **mux-optional** — tmux/herdr/Rex/herdr-core is supported but not required; any terminal works
 
 ---
 
@@ -81,6 +81,7 @@ Optional but recommended (one of the following for parallel agent execution):
 - **herdr** — agent-oriented terminal multiplexer (alternative to tmux)
   - Install: `curl -fsSL https://herdr.dev/install.sh | sh` / `brew install herdr` / `mise use herdr`
 - **Rex** — [Rex](https://www.superlogical.com/rex/docs/) terminal workspace (alternative to tmux / herdr). Needs the `rex` CLI on `PATH`; only `rex` with API revision 9 is accepted (`rex version` prints `api: revision 9 (supports 0 to 9)`; verified with `0.0.1793390926-g3b2dce`). See [Running with Rex](#running-with-rex-alternative-to-tmux--herdr)
+- **herdr-core (`hc`)** — [herdr-core](https://herdr.dev) terminal manager, a newer/lighter alternative to tmux / herdr / Rex. Needs the `hc` CLI on `PATH`; only protocol generation `1` is accepted (verified with `hc 0.1.18`). See [Running with hc](#running-with-hc-herdr-core-alternative-to-tmux--herdr--rex)
 
 Optional, only if you use the `codex-review` skill (automated PR review via Codex CLI, see
 [Skills reference](#skills-reference)):
@@ -122,7 +123,7 @@ Crewvia uses the following environment variables. Add them to your shell profile
 | `NTFY_PASS` | Required for ntfy | ntfy Basic auth password |
 | `APPROVAL_TOKEN_TTL_SECONDS` | Optional | One-time token TTL in seconds (default: `900`) |
 | `CREWVIA_VERIFICATION_UI` | Optional | Set in **Taskvia's** Vercel env (not crewvia). `disabled` hides all verification UI and redirects `/verification-queue` to `/` |
-| `CREWVIA_MUX` | Optional | Mux backend override: `tmux`, `herdr` or `rex`. Overrides `mode:` in `config/crewvia.yaml` |
+| `CREWVIA_MUX` | Optional | Mux backend override: `tmux`, `herdr`, `rex` or `hc`. Overrides `mode:` in `config/crewvia.yaml` |
 | `CREWVIA_REX_SESSION` | Optional | Rex session name used by the Rex backend (default: `crewvia`) |
 | `CREWVIA_MUX_RECORD_SWEEP` | Optional | Set `0` to stop the cleanup of stale mux spawn records (`registry/mux/*.json`, left behind when a pane vanished without going through `kill`). Enabled by default; only the cleanup stops, nothing else. See `knowledge/daemon-authority.md` §7-14 |
 | `CREWVIA_WORKER_PERMISSION_MODE` | Optional | `claude --permission-mode` value for Worker sessions (default: `auto`). Set empty to fall back to the CLI's own default/manual mode |
@@ -374,6 +375,38 @@ CREWVIA_MUX=rex ./crewvia
   (details: `knowledge/rex-mux-backend.md` §14).
 - To go back: set `mode:` back to `tmux`/`herdr` (or unset `CREWVIA_MUX`) after stopping crewvia.
   `CREWVIA_REX_SOCK` is test-only; if set in production, Rex is treated as unavailable.
+
+### Running with hc (herdr-core, alternative to tmux / herdr / Rex)
+
+[herdr-core](https://herdr.dev) (`hc`) is a newer, lighter terminal manager than can also be the
+parallel execution backend. Install the `hc` CLI, then select it with `mode: hc` in
+`config/crewvia.yaml` or per launch:
+
+```bash
+CREWVIA_MUX=hc ./crewvia
+```
+
+- `./crewvia` starts the `hc` server if it is not already running (`hc server start` is
+  idempotent — a running server is left untouched); the default socket is used as is.
+- Only `hc`'s JSON-RPC protocol generation `1` is accepted (checked via `hc connect`'s `hello`
+  method); any other generation, or an unreadable server, makes `./crewvia` fail — it does not
+  fall back to tmux/herdr/Rex.
+- Director and Workers appear as terminals (`<name>-director`, `<name>-worker`, `dispatcher`,
+  `watchdog`, lower-cased — `hc`'s own naming rules do not accept the upper-case names crewvia
+  uses internally; the original spelling is kept in each terminal's `crewvia_name` label).
+- `hc` ships a real terminal client: `hc attach <name>` (needs a real tty — it cannot be driven
+  from a script or a cron job). `hc ls --all`, `hc get <name>` and `hc read <name> --lines N`
+  work non-interactively.
+- `hc` keeps a finished terminal around until `hc rm` removes it — crewvia's own `kill()` ends
+  the running program but does not `hc rm` the terminal, so `hc ls --all` may show old, finished
+  crewvia terminals; this is expected and harmless (`hc rm <address>` cleans them up by hand if
+  you want to).
+- `herdr-task-graph` is herdr-only and does not run under hc (`tasks.json` is still generated).
+- **Switching backends on a machine in use: stop crewvia first** (`scripts/crewvia-stop.sh`).
+  The spawn records in `registry/mux/` are one per name, so only one mux backend should be
+  driving a given checkout at a time.
+- To go back: set `mode:` back to `tmux`/`herdr`/`rex` (or unset `CREWVIA_MUX`) after stopping
+  crewvia.
 
 ### Task graph view with herdr-task-graph (optional)
 

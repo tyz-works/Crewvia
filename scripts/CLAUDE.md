@@ -265,6 +265,13 @@ lib ごとの**破ってはいけない契約**の要約。理由・経緯・全
 - `registry/mux/<name>.json`（spawn 記録）は **kill の認可の唯一の証拠**。消してよいのは mux が
   「その id は無い」と明確に答えた（`error.code == "pane_not_found"`）ときだけ。herdr は失敗を全部
   `{"error"}` で返し server 不達も同じ形なので、それ以外は「観測できなかった」で記録を残す。
+  hc（HcBackend）も同じ規則で、`hc <cmd> --json` の `error.kind == "not_found"` だけが消してよい根拠。
+  `finished`（終わっているがまだ `hc rm` されていない）・`name_taken`・`usage` 等はどれも「観測できな
+  かった」側（`PANE_UNOBSERVED`）——`finished` を `not_found` と同じに読むと、hc は `hc rm` するまで
+  terminal を残す（`knowledge/herdr-core-mux-backend.md` §3.0）ため、まだ存在する terminal の記録を
+  消してしまう。識別は hc の `address`（spawn 記録の `handle`）で行い、`name` では行わない——hc の
+  `name` は同じ文字列の finished terminal が残っている間も次の spawn を拒否しないので、`name` ベース
+  の問い合わせは常に最新の（別の）terminal に化けうる。
 - 記録を書く `write_pane_record()` と消す `drop_pane_record(expect=<判定した記録>)` は
   `registry/mux/.records.lock` の同じ区間で直列化する。問い合わせは名前でなく**記録の id**を、
   記録の server の世代と同じ接続の上で流す（検証と破壊が別の接続なら別の server でありうる）。

@@ -84,9 +84,14 @@ timeout_max_per_skill:
 #          rex: { endpoint: unix:///絶対パス }（108 バイト以内）を足す。窓を見るには Rex アプリが要る
 #          （CLI に端末 client は無い。アプリでの見え方は未確認）。herdr-task-graph は使えない
 #          mux を切り替えるときは先に crewvia を止める（registry/mux/ の記録は名前ごとに 1 つ）
+# hc     — Director + Worker を herdr-core（`hc`）の terminal として展開（並列 Worker 可）
+#          hc CLI が要る。./crewvia が server を確かめ、居なければ起動する（既定 socket。冪等）
+#          `hc connect` の hello.generation が 1 でなければ fail-closed で使わない（rex と同じ厳格さ）
+#          窓を見るには `hc attach <name>` を使う（CLI に本物の端末 client がある。tty が要る）
+#          herdr-task-graph は使えない。mux を切り替えるときは先に crewvia を止める
 # inline — 単独プロセスで起動（Worker 並列不可、デバッグ向き）
 #
-# 環境変数での上書き: CREWVIA_MUX=tmux|herdr|rex (最優先) / CREWVIA_MUX_ENABLED=1 (並列 ON) / CREWVIA_MUX_ENABLED=0 (inline)
+# 環境変数での上書き: CREWVIA_MUX=tmux|herdr|rex|hc (最優先) / CREWVIA_MUX_ENABLED=1 (並列 ON) / CREWVIA_MUX_ENABLED=0 (inline)
 # CREWVIA_MUX が設定されていれば CREWVIA_MUX_ENABLED より優先される。
 mode: herdr  # 戻す時は tmux。切替日: 2026-09-04
 

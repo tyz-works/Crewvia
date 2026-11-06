@@ -380,6 +380,7 @@ irc:
 1. 期限切れを捨てる。
 2. `pending` を古い順に走査し、**名前ごとに窓を解決**する。窓が無い名前は飛ばす。
 3. **画面が受け取れる状態か**を確かめる (§6-1。確認ダイアログが無く、かつ**入力欄が空**であること)。受け取れない・下書きがある・確認できない窓は**この周期は送らない**。
+   **作業中 (busy) の窓にも送らない** (11-06 の本番通し確認で判明・ユーザー決定 A): busy の窓に送ると Claude Code が文を queue に積み、入力欄の空を確かめられず `unverified` → `attempts` が進んで再送され、3 回とも画面に届いたうえで `dropped after 3 attempts` になった (idle の窓では 1 回で `sent`)。1 回の送信でも busy 中は mid-turn と turn 後の 2 回表示される。そこで `classify_pane` に `busy` を足し、`draft` と同じく**送らず延期**する (`attempts` を増やさない。`stats['deferred']['busy']`・ログ `irc: deferred_busy`)。Director が idle に戻れば次のサイクルで 1 回だけ送られる。24 時間の期限切れは従来どおり。判定は末尾 12 行に、スピナー行 (行頭の記号 + 単語 + `…`。例 `✻ Discombobulating… (thought for 5s)`。完了後の `✻ Cooked for 5s` は `…` が無いので busy にしない) または `esc to interrupt` があること。`lib_mux.rex_screen_state` の working は後者だけを見ていて狭い窓では出ないため、前者を足した (実物の画面を `tests/fixtures/irc/busy-screen-sora.txt` に固定)。ダイアログは busy より先に判定する。判定できない画面は従来どおり `unknown` (送らない側)。
 4. 上限を守って送る: 1 サイクルに合計 `max_deliver_per_cycle` 行、名前あたり `max_deliver_per_name_per_cycle` 行まで。
    名前ごとの未配達が上限を超えるときは、**最も古い 1 件を普通の行で送り、残りは省略行 1 行にまとめる**(§6-3)。省略した分は `pending` から外し、ログに id の範囲と件数を出す。
    サイクルの合計上限で送れなかった名前は次のサイクルに回す (省略ではない)。

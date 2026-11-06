@@ -787,8 +787,24 @@ def _is_rule(line):
     return len(line) >= 20 and set(line.strip()) == {'─'}
 
 
+# 作業中 (busy) の印。`lib_mux.rex_screen_state` の working は「esc to interrupt」だけを見るが、狭い窓では出ないことがある。
+# 実物の busy 画面 (tests/fixtures/irc/busy-screen-sora.txt) は入力欄の上に `✻ Discombobulating… (thought for 5s)` だけが出る。
+# スピナー行 = 行頭の記号 + 単語 + `…`。完了後の行 (`✻ Cooked for 5s`) には `…` が無いので busy にならない。
+_BUSY_HINT_RE = re.compile(r'esc to interrupt', re.IGNORECASE)
+_BUSY_SPINNER_RE = re.compile(r'^\s*[✻✽✶✳✢✦·*]\s+[^\W\d_][\w-]*…')
+_BUSY_WINDOW = 12               # 末尾この行数だけ見る (スクロールバックの古いスピナー行を拾わない)
+
+
+def _is_busy(lines):
+    tail = lines[-_BUSY_WINDOW:]
+    return any(_BUSY_HINT_RE.search(line) or _BUSY_SPINNER_RE.match(line) for line in tail)
+
+
 def classify_pane(screen):
-    """画面の文字列 → `ready` / `dialog` / `draft` / `unknown`。**`ready` は (a)(b)(c) すべてを満たすときだけ**。
+    """画面の文字列 → `ready` / `dialog` / `busy` / `draft` / `unknown`。**`ready` は (a)(b)(c) すべてを満たすときだけ**。
+
+    ダイアログが無く、末尾に作業中の印 (`_is_busy`) があれば `busy` (送らず延期。busy 中に送ると Claude Code が
+    文を queue に積み、mid-turn と turn 後の 2 回表示し、入力欄の確認もできず再送で重複する)。
 
     (a) 末尾の数行に `❯` の入力欄があり、選択肢でない / (b) 末尾 30 行に確認ダイアログの印が無い /
     (c) 入力欄 (上下の罫線の内側のすべての行) から `❯`・縦線・空白を除いた残りが空。
@@ -800,6 +816,8 @@ def classify_pane(screen):
     for line in lines[-_DIALOG_WINDOW:]:
         if _DIALOG_FOOTER_RE.search(line) or _DIALOG_OPTION_RE.search(line):
             return 'dialog'
+    if _is_busy(lines):
+        return 'busy'
     box = input_box_state(screen)
     return {'empty': 'ready', 'nonempty': 'draft'}.get(box, 'unknown')
 
@@ -955,6 +973,8 @@ def deliver_pending(state, mux, config, now, *, log=lambda msg: None, sleep=time
                 stats['deferred'][pane] = stats['deferred'].get(pane, 0) + 1
                 if pane == 'draft':
                     log('irc: deferred_draft')
+                elif pane == 'busy':
+                    log('irc: deferred_busy')
                 break
             if kind == 'one':
                 entry = entries[0]

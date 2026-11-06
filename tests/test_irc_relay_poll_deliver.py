@@ -1092,3 +1092,44 @@ def test_first_poll_failures_without_state_still_back_off_and_notify_once(reg):
         streaks.append(out["poll"]["fail_streak"])
     assert streaks == [1, 2, 3, 4, 5, 6, 7]
     assert len(calls) == 7
+
+
+# --- busy (作業中) の窓には送らず延期する (t001 / 20261106-irc-busy-defer) ---------------------------------
+
+BUSY_SCREEN = (THIS_DIR / "fixtures" / "irc" / "busy-screen-sora.txt").read_text(encoding="utf-8")
+
+
+def test_busy_fixture_is_busy_without_esc_to_interrupt():
+    assert "esc to interrupt" not in BUSY_SCREEN.lower()      # 狭い窓の実物: rex_screen_state の working では拾えない形
+    assert L.classify_pane(BUSY_SCREEN) == "busy"
+
+
+@pytest.mark.parametrize("screen", [
+    f"out\n✻ Cooked for 5s\n{RULE}\n❯ \n{RULE}\n",            # 完了後の行 (… が無い) は busy でない
+    f"✻ Spinning…\n" + "x\n" * 20 + f"{RULE}\n❯ \n{RULE}\n",   # スクロールバックの古いスピナー行
+])
+def test_finished_or_stale_spinner_is_not_busy(screen):
+    assert L.classify_pane(screen) == "ready"
+
+
+def test_esc_to_interrupt_is_busy():
+    assert L.classify_pane(f"✻ Working (esc to interrupt)\n{RULE}\n❯ \n{RULE}\n") == "busy"
+
+
+def test_busy_pane_defers_without_sending_or_counting_attempts():
+    mux = FakeMux(screens={"Sora-director": BUSY_SCREEN})
+    for _ in range(3):                                         # 何サイクル busy でも attempts は 0 のまま・捨てない
+        new, stats = deliver(st(ent(41)), mux)
+        assert mux.sent == [] and new["pending"][0]["attempts"] == 0
+        assert stats["deferred"] == {"busy": 1} and stats["failed"] == 0 and stats["dropped"] == 0
+
+
+def test_busy_then_idle_sends_exactly_once():
+    mux = FakeMux(screens={"Sora-director": BUSY_SCREEN})
+    state, stats = deliver(st(ent(41)), mux)
+    assert mux.sent == [] and len(state["pending"]) == 1
+    mux.screens["Sora-director"] = READY                       # Director が idle に戻った
+    state, stats = deliver(state, mux)
+    assert len(mux.sent) == 1 and state["pending"] == [] and stats["delivered"] == 1
+    state, _ = deliver(state, mux)
+    assert len(mux.sent) == 1

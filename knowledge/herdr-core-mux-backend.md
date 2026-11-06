@@ -5,6 +5,7 @@
 - 対象の版: `hc 0.1.18`（`/home/tkadmin/.local/bin/hc`）。upstream `herdrdev/herdr-core`（公開）。OpenRPC schema `info.version` も `0.1.18`、**protocol generation 1**（`hc schema` の `info.description`）
 - 書いた人: Worker Minjun（mission `20261106-herdr-core-backend` t001）。Director の事前メモ（card 本文）の実測を自分でも本機（本番の hc server、desktop-l8nqlib、holder pid 1246708 時点）で再現し、JSON Schema（`hc schema`）とライブコマンドの両方で裏を取った
 - **改訂（attempt 2）**: Worker Mateo。PR #344 の review task（t006）が P1 1件・P2 2件・P3 2件を指摘して差し戻した（`queue/missions/20261106-herdr-core-backend/history/t006/0001-end-ex-90c5aef661cb4762a10585a1e01aa51d.md`）。全指摘を自分で実機再現してから反映した——P1: 名前の写像（新設 §3.2）。P2: エラー JSON は stderr（§5 冒頭に明記）・`kind` 一覧に `needs_update` が抜けていた（§5 の表を25件に修正）。P3: `hc schema` の schemas 数は34ではなく35（実測で訂正）・`openrpc` のバージョン文字列の意味を訂正・`state`（terminal 生死）と`status.state`（agent status）が同名の別概念である注記を追加（§3 冒頭・§7.1）。「裏が取れた主張」（review 本文に列挙）は取り直していない
+- **改訂（attempt 3）**: Worker Mateo。review t006 の新 P1（`hc ls --json` は `--label` 併用でも `labels` 欄を返さず、attempt 2 の §3.2-2「往復する」は `ListResult.terminals[]` の `$ref` だけを根拠にした未実測の推測だった）を自分で再現して訂正した。出口は Director が提示し自分でも再現した `hc connect`（JSON-RPC API）の `terminal.list`——CLI の `ls` と違いフルの `Terminal`（`labels`/`pid`/`reported`/`status`/`argv`）を返す。`list()` だけこの API 経由にし、他の動詞は CLI のままにする理由を新設 §3.3 に書いた。§3.2-3・§9 をこれに合わせて書き直した
 - 凡例: 「**実測**」= 自分がこの作業中に確かめた出力。「**Director 実測**」= card に書かれていて自分では別の形で確かめた（同じプロセスは再現していない）事実。「**未確認**」= 確かめていない。「見込み」は推測
 - 比較対象は既存の `RexBackend`（`scripts/lib_mux.py:4884-5675`、`knowledge/rex-mux-backend.md`）と `HerdrBackend`（`scripts/lib_mux.py:3352-4883`）。**この文書は両方の既存 backend の挙動を変える提案を 1 点含む（§4）。tmux / herdr / rex は本番で使われているので、その影響範囲を §4.4 に明記した**
 
@@ -30,13 +31,24 @@ hc send t001probe-sleep "hello" --json     # finished な terminal への send �
 hc kill tXYZDOESNOTEXIST --json            # 存在しない id → kind:not_found
 hc kill t001probe-sleep --json             # 既に finished な terminal への kill → エラーにならず Terminal を返す（冪等）
 hc rm t001probe-sleep --json
+
+# attempt 3（§3.2-2・§3.2-3・§3.3）: hc ls --json が labels を返さないこと・hc connect の terminal.list が返すことの再現
+hc run --bg --name cvprobet001b --label crewvia_name=Cvprobet001b-worker --json /home/tkadmin/.local/bin/hc --version
+hc ls --json                                # live 無し（終了済み）→ terminals:[]
+hc ls --all --json                          # labels 欄が無い（間引かれた表示用の形）
+hc ls --all --label crewvia_name=Cvprobet001b-worker --json   # --label で絞り込みは効くが labels は返らない
+hc get cvprobet001b --json                  # labels.crewvia_name を含むフル Terminal
+printf '{"jsonrpc":"2.0","id":1,"method":"terminal.list","params":{"all":true}}\n' | hc connect
+printf '{"jsonrpc":"2.0","id":1,"method":"hello","params":{}}\n' | hc connect                       # generation:1（§10-1）
+printf '{"jsonrpc":"2.0","id":1,"method":"terminal.get","params":{"terminal":"tXYZDOESNOTEXIST"}}\n' | hc connect   # API のエラー封筒は error.data.kind（§3.3）
+hc rm cvprobet001b --json
 ```
 
 `/proc/<hc server pid>/environ` を読んで、hc server が実際にどの PATH で子プロセスを起動するかを確認した（§6）。`hc server start --json` を 1 回呼び、既に生きている server に対して**冪等**（pid・uptime が変わらない。再起動しない）であることも確認した——`ensure-server` の候補として安全に呼べる。
 
 ## 3. `_Backend` の全メソッドの対応表
 
-hc は JSON-RPC 2.0 の methods（`hc schema` の `methods[]`）を CLI がラップしたもの。32 methods のうち使うのは `terminal.*` と `server.status` だけで、`machine.*` / `file.*` / `doc.*` / `events.subscribe` は対象外（§10 で扱う）。
+hc は JSON-RPC 2.0 の methods（`hc schema` の `methods[]`）を CLI がラップしたもの。32 methods のうち使うのは `terminal.*` と `server.status` が CLI 経由、`list()` と `available()` の版確認だけ `hc connect` 経由で `terminal.list` / `hello` を直接呼ぶ（§3.3・§4.2-4）。`machine.*` / `file.*` / `doc.*` / `events.subscribe` は対象外（§10 で扱う）。
 
 **注記（同名の別概念、P3 対応）**: `hc get` の出力にはトップレベルの `state`（`live`/`finished`。terminal プロセスそのものの生死）と、ネストした `status.state`（`idle`/`working`/`done`/`blocked`/`error`。agent status、§7 の対象）という**同名だが別物の 2 つの欄がある**。下表の `kill` 行・§5 の kill 前チェックは前者、§3 の `state(name)` 行・§7 は後者を指す。実装時に変数名で区別すること（実測: `hc get` の生出力で両方の欄を確認。§2 の後続コマンドで裏取り済み）。
 
@@ -50,7 +62,7 @@ hc は JSON-RPC 2.0 の methods（`hc schema` の `methods[]`）を CLI がラ�
 | `send(name, text)` | `hc send <t> <text> --json`（3 秒の入力休止待ちの後に paste + Enter。`--force` は blocked 相手への強制、crewvia は使わない） | 実測・`hc send --help` | 満たせる |
 | `keys(name, keys)` | `hc keys <t> <keys...> --json`。名前は `enter` / `esc` / `tab` / `up` / `down` / `ctrl+c` / `alt+x` / `f5` など——`translate_keys()` の hc 列を足す。choice dialog のカーソル移動に使う想定は herdr/tmux と同じ | 実測・`hc keys --help` | 満たせる |
 | `capture(name)` | `hc read <t> --lines N --json`。画面 + history。**作業中/blocked/error の間は history 読み出しでスクロールしない**（画面だけ・`why` に理由) という制約が `hc --skill` にある | `hc --skill`（未実行で検証、文面のみ） | 満たせる |
-| `list(suffix)` | `hc ls --json`（live のみ）/ `--all`（finished 含む）。hc の `name` でなく **`labels.crewvia_name` を読み、それを crewvia の `name` として返す**（§3.2）。`suffix` 絞り込みは `crewvia_name` に対して行う（hc 側は `--label` でも絞れるが、crewvia 名は label 値に入っているため `--label` の値一致では使えず、`ls --all --json` を全件取ってから crewvia 側で `crewvia_name` を見てフィルタする） | 実測（§3.2） | 満たせる |
+| `list(suffix)` | **CLI の `hc ls` は使わない**（`labels` 欄を返さないため。§3.2-2 で実測・訂正）。`hc connect` の `terminal.list`（`{"all": true}`）を 1 回呼び、各要素の `labels.crewvia_name` を crewvia の `name` として返す（§3.2-3・§3.3）。`suffix` 絞り込みは `crewvia_name` に対して行う | 実測（§3.2-2・§3.2-3） | 満たせる |
 | `kill(name, allow_foreign)` | `name`（crewvia 名）を §3.2 で小文字化した `<t>` に変換してから `hc kill <t> --json`。**`may_destroy_pane` を先に通す**のは herdr/tmux と同じ（§4.3 の identity で束縛）。**実測: 既に finished な terminal への kill はエラーにならず Terminal を返す**（冪等。herdr/tmux の「無いものを kill した」との扱いの違いに注意——hc は「もう死んでいる」を失敗にしない） | 実測 | 満たせる |
 | `pid(name)` | `name` を §3.2 で変換した `<t>` で `hc get <t> --json` の `pid`（Director 実測値 1257222 を確認済みの前提どおり、`hc get` は `pid` を持つ。実測では `exit_code:0` の `hc --version` 実行でも `pid: 1283891` が入っていた） | 実測 | 満たせる |
 | `attach(name)` | 常に `False`（tmux の「$TMUX が無いときは attach_cmd を使う」側と同じ扱い。hc には「中に居る」状態からの `switch-client` に当たる概念が無い見込み） | 見込み（未確認） | 満たせる（見込み） |
@@ -83,12 +95,50 @@ exit=6
 **決定（採用する方式）**: hc 側には `--label K=V`（`run`/`ls` 双方にあることを実測）がある。
 
 1. `spawn(name, cmd, cwd)`: crewvia の `name`（原綴り、例 `Seo-worker`）を**小文字化しただけ**（例 `seo-worker`）の文字列を hc の `--name` に渡す。ロール接尾辞 `-worker`/`-director` はそのまま hc の許容文字集合（`a-z 0-9 - _ .`）に収まるので、小文字化だけで制約を満たす。**名前プールに大小文字違いの衝突が無いこと（確認済み）と、最長の名前（`Haruto`/`Mathis` 等 6-7 文字）+ 接尾辞でも 32 文字上限に収まること（最長でも `Astrid-director` で 15 文字）から、小文字化は一意性を壊さない**。同時に `--label crewvia_name=<原綴りの name>` を付け、原綴りを hc 側にも残す
-2. 実測で裏取り: `hc run --bg --name cvprobet001-worker --label crewvia_name=Cvprobet001-worker --json ...` は成功（`state:"live"`）。続く `hc get` / `hc ls --all --label crewvia_name=...` の両方で `labels.crewvia_name` が原綴りのまま往復することを確認した
-3. `list(suffix)` は `hc ls --all --json` の全件を取り、各要素の `labels.crewvia_name` を読んで crewvia の `name` として返す（hc 自身の `name` 欄は内部実装の詳細として扱い、呼び出し元には見せない）。`suffix`（`"-worker"` 等）での絞り込みは `crewvia_name` に対して行う
-4. `kill` / `pid` / `record_existence` / identity-ok など、crewvia 側が `name` を渡してくる動詞は全部「§3.2-1 と同じ小文字化を通してから hc を呼ぶ」。逆に hc からの戻り（`list` や `get` の結果）を crewvia 側に見せるときは必ず `labels.crewvia_name` 経由で原綴りに戻す
+2. 実測で裏取り: `hc run --bg --name cvprobet001b --label crewvia_name=Cvprobet001b-worker --json ...` は成功（`state:"live"`）。**訂正（attempt 3。review t006 の新 P1）**: attempt 2 は「続く `hc get` / `hc ls --all --label crewvia_name=...` の両方で `labels.crewvia_name` が往復する」と書いたが、これは誤りだった——`hc schema` の `ListResult.terminals[]` が `Terminal` への `$ref` であることだけを根拠に「`ls` も `get` と同じ形で返るはず」と推測し、それを実測と書いてしまった（attempt 2 で `needs_update` を見落としたのと同じ系統のミス: schema の $ref は「あり得る形」であって「実際にこのコマンドが返す形」ではない）。本当に `hc ls` を叩いて確かめ直すと:
+
+   ```
+   $ hc ls --json
+   {"hidden_finished":1,"terminals":[]}
+   $ hc ls --all --json
+   {"hidden_finished":0,"terminals":[{"address":"t14","agent":"hc","cwd":"/home/tkadmin/workspace/crewvia/.claude/worktrees/20261106-herdr-core-backend/t001-herdr-core-backend","exit_code":0,"name":"cvprobet001b","reason":"exited","state":"finished","turn":0}]}
+   $ hc ls --all --label crewvia_name=Cvprobet001b-worker --json
+   {"hidden_finished":0,"terminals":[{"address":"t14","agent":"hc","cwd":"/home/tkadmin/workspace/crewvia/.claude/worktrees/20261106-herdr-core-backend/t001-herdr-core-backend","exit_code":0,"name":"cvprobet001b","reason":"exited","state":"finished","turn":0}]}
+   ```
+
+   `--label` による絞り込みは効く（指定した label を持たない terminal は出てこない）が、**返ってくる `terminals[]` の各要素に `labels` 欄そのものが無い**。つまり `hc ls`（`--all`・`--label` の有無を問わず）では `labels.crewvia_name` を読み戻せない——CLI の `ls` が `Terminal` を間引いた表示用の形に落としているため（`hc get` は同じ terminal に対して `labels` を含むフル `Terminal` を返す。実測: 同じ `t14` に対する `hc get cvprobet001b --json` は `"labels":{"crewvia_name":"Cvprobet001b-worker"}` を含む）
+3. **出口は `hc get` の N+1 呼び出しでも、hc 名からの逆変換でもない**（Director が本番で再現・提示した経路を自分でも再現して採用）: `hc connect`（stdin/stdout で JSON-RPC 2.0 を話す。`hc schema` の `info.description` が明記する唯一のプロトコル窓口）の `terminal.list` メソッドは、CLI の `ls` と同じ `ListResult` を返すが、**各 `terminals[]` 要素が `Terminal` を間引かないフルオブジェクト**になる。実測:
+
+   ```
+   $ printf '{"jsonrpc":"2.0","id":1,"method":"terminal.list","params":{"all":true}}\n' | hc connect
+   {"id":1,"jsonrpc":"2.0","result":{"hidden_finished":0,"terminals":[{"address":"t14","argv":["/home/tkadmin/.local/bin/hc","--version"],"cols":200,"created_ms":1793952220052,"cwd":"...","die_with_parent":false,"exit_code":0,"finished_ms":1793952220054,"identity":"ghostty","keep":false,"labels":{"crewvia_name":"Cvprobet001b-worker"},"name":"cvprobet001b","notify":true,"parent":null,"pid":1297336,"reason":"exited","reported":false,"rm":false,"rows":120,"screen":"exact","signal":null,"state":"finished","status":null,"status_ms":null,"template":null,"title":"","turn":0}]}}
+   ```
+
+   `labels` / `pid` / `reported` / `status` / `argv` が `list` 1 回で全部そろう。**決定: `list(suffix)` は CLI の `hc ls` を使わず、`hc connect` 経由で `terminal.list`（`{"all": true}`）を 1 回呼ぶ**。各要素の `labels.crewvia_name` を crewvia の `name` として返し、`suffix`（`"-worker"` 等）の絞り込みは `crewvia_name` に対して行う。hc 自身の `name` 欄は内部実装の詳細として呼び出し元には見せない。実装は「`hc connect` を subprocess で起動 → 1 行の JSON-RPC リクエストを書く → 1 行読んで `json.loads` → stdin を閉じてプロセスを終了させる」という**呼び出しごとに使い捨てる**形にする（他の動詞と同じ「1 回の呼び出しに 1 回の subprocess」という既存の形を崩さない。常駐接続にして複数リクエストを使い回す案は §3.3 で退ける）
+4. `kill` / `pid` / `record_existence` / identity-ok など、crewvia 側が `name` を渡してくる動詞は全部「§3.2-1 と同じ小文字化を通してから hc を呼ぶ」。これらは `hc get` が既に `labels` を含むフルオブジェクトを返す（§3.2-2 で確認済み）ので、`list` のように API へ逃がす必要はなく CLI の `hc get <t> --json` のままでよい。hc からの戻り（`list` や `get` の結果）を crewvia 側に見せるときは必ず `labels.crewvia_name` 経由で原綴りに戻す
 5. `registry/mux/<name>.json` のファイル名・記録 id は**従来どおり crewvia の原綴り**（`Seo-worker.json`）のまま変えない。`may_destroy_pane` の照合（CLAUDE.md 不変条件外だが `scripts/CLAUDE.md` の mux 契約）は、記録の id と `hc get` が返す `labels.crewvia_name` を比較する——hc 自身の小文字 `name` 欄とは比較しない（大文字小文字変換は非可逆な情報ではないが、変換ロジックを 2 箇所に書くと食い違いの元になるため、原綴りを持ち回る label を正とする）
 
 **この方式を採らなかった代替案**: crewvia 側の名前プール自体を小文字に変える案は、`registry/mux/*.json` の既存ファイル名・`config/worker-names.yaml`・ドキュメント中の表記（`Omar-worker` 等）を全部変更する必要があり、既存 backend（tmux/herdr/Rex）の挙動には影響しないが crewvia 全体の表記を変える大きい変更になるため**対象外**（CLAUDE.md 設計原則3「名前はポジション」の表記を崩さない）。
+
+### 3.3 `HcBackend` 全体を CLI でなく `hc connect` の API で話すべきか（review t006 の新 P1、§3.2-3 の論点）
+
+**決定: 全体を API 化しない。`list()` だけ API（`hc connect`）に逃がし、残り 14 動詞は CLI のままにする。**
+
+API 化の動機は「list / pid / state が 1 回で揃う」こと——`terminal.list` の 1 呼び出しで `labels`・`pid`・`status.state`（agent status）・`argv` が全terminal 分まとめて返る（§3.2-3 で実測）。これは**`list()` にだけ当てはまる利得**であって、他の動詞には当てはまらない:
+
+1. **`pid(name)` / `state(name)` は単体 lookup**（crewvia 側が `name` を 1 件指定してくる）なので「1 回で揃う」の利得が無い。CLI `hc get <t> --json` が既に §3.2-2 の実測どおり `labels` / `pid` / `status` を**フルオブジェクトで 1 回**返している——API に切り替えても往復回数は 1→1 のままで、得られる情報も変わらない。変わるのは JSON-RPC の封筒を自分で組み立てる・剥がすコストが増えるだけ
+2. **`kill` / `rm` / `send` / `keys` のような単発アクション動詞**は、CLI がすでに「1 回の subprocess 起動で `--json` の結果（または stderr のエラー）を返して終了する」という crewvia の他 3 backend と同じ形を提供している。API 経由にしても呼び出し形は変わらない（`hc connect` を起動して 1 行書いて 1 行読んで閉じる、という骨格は CLI サブコマンドの subprocess 起動と同じ）のに、**CLI が無料でやってくれているリクエスト ID の発行・相関・JSON-RPC envelope の組み立てを自前でやる義務だけが増える**
+3. **エラーの形が CLI と API で違う**（実測）。CLI の `hc <cmd> --json` は stderr に `{"error":{"kind":...,"hint":...,"message":...}}` を直接返す（§5）。`hc connect` 経由だと JSON-RPC 2.0 の封筒に包まれ、`kind` は 1 段深い `error.data.kind` に入る。実測（存在しない terminal への `terminal.get`）:
+
+   ```
+   $ printf '{"jsonrpc":"2.0","id":1,"method":"terminal.get","params":{"terminal":"tXYZDOESNOTEXIST"}}\n' | hc connect
+   {"error":{"code":-32000,"data":{"hint":"see `hc ls --all`","kind":"not_found"},"message":"no terminal \"tXYZDOESNOTEXIST\""},"id":1,"jsonrpc":"2.0"}
+   ```
+
+   `kind` の語彙（§5 の 25 件）自体は同じだが、**CLI 用の「エラーかどうかは exit code、kind は `error.kind`」という §5 のパース規約を API 経路にそのまま使い回すと `data.kind` を見落として全部 catch-all（`PANE_UNOBSERVED`）に落ちる**——これは attempt 1〜2 で踏んだのと同じ「2 つの違う形を 1 つのつもりでパースする」事故の形なので、`list()` 用の JSON-RPC ヘルパーは**独立した小さいパーサ**（`error.data.kind` を読む）にし、CLI 用のエラーパーサ（§5）と混在させない設計にする
+4. **常駐接続（`hc connect` を 1 プロセス起動したまま複数リクエストを使い回す）にする案**は、1 回の `hc connect` 呼び出しの中で複数行の JSON-RPC リクエストを送って複数行の応答を読めること自体は実測で確認した（2 リクエストを同じ stdin に書いて 2 応答を得た）が、**採らない**。理由: (a) dispatcher / watchdog / start.sh など複数のプロセスが同じ `HcBackend` インスタンスを跨いで動詞を呼ぶわけではなく、**動詞呼び出しごとに新しい python プロセスが `lib_mux.py` を import する**（dispatcher はサイクルごとに新しい python。CLAUDE.md 不変条件 8 と同じ前提）ので、常駐接続を維持する主体が無い。(b) 常駐接続を維持するには「接続が死んでいたら再接続する」「複数スレッド/呼び出し元からの同時リクエストをどう直列化するか」という、tmux/herdr/Rex のどの backend にも無い新しいライフサイクル管理が要る。**1 task（t002）に収めるにはこの複雑さは釣り合わない**——`list()` の低頻度な呼び出し（dispatcher の 1 サイクルに 1 回程度）に対して、呼び出しごとに `hc connect` を起動して 1 往復だけして閉じる（他の CLI 動詞と同じ「使い捨て subprocess」の形）で十分
+
+結論として、`HcBackend` は「14 動詞は CLI サブコマンドの subprocess 呼び出し、`list()` だけ `hc connect` への JSON-RPC 1 往復」という**混在**になる。これは既存 backend のどれとも違う形だが、`list()` という 1 箇所に閉じているので実装の見通しは悪化しない（§9）。
 
 ## 4. 版の固定
 
@@ -108,7 +158,7 @@ exit=6
 1. **hc は 0.1.x**（`hc --version` → `hc 0.1.18`）。`herdr` の 0.9.0 → 0.9.5 のような「マイナーパッチ内でも CLI の挙動が変わった」事例が既に本番で実際に起きている一方、0.1.x は 0.9.x よりさらに若く、**後方互換の建前が無い**（1.0 未満は破壊的変更があり得るのが一般的な版付け規約で、hc 自身も `hc schema` に `"Protocol generation"` という明示のプロトコル世代番号を持つ——これは「黙って変わりうる」ことを作者自身が前提にしている設計の表れ）
 2. **herdr の「警告だけで続行」は、実際に CLI の出力形が変わったときに検出できない**。`_warn()` は stderr に 1 行出すだけで、呼び出し元の `available()` の戻り値には影響しない——つまり `herdr 0.9.5` で `pane_list` の JSON の欄が増減していても、HerdrBackend は気づかずに動き続け、パースが通れば偶然動き、通らなければ `None` 扱いで「observed できなかった」側に静かに倒れる（警告は出るが、動作は変わらない）。これは「気づける」設計ではなく「気づいても何もしない」設計で、CLAUDE.md の `CREWVIA_MUX` の項が Rex について明記する「不一致・読めないときは他の backend に落とさず失敗する」という方針と矛盾している
 3. **hc には generation という一次概念がある**ので、Rex のような「数値 1 個を集合と比較する」方式がそのまま使える。`hello` の `generation`（uint32）または `server.status` の `version`（semver 文字列）のどちらで固定するか: **`hello.generation`（protocol generation。実測で `1`）を主、`version` の major（`0`）を補助**にする。generation は JSON-RPC の形そのものの互換性を表す値で、`hc schema` の `info.description` が「Errors carry a stable `data.kind`」と明記するような contract の単位。`version` は実装のビルド番号で、同じ generation の中でコマンドの細部（新しい option の追加等）が変わりうる——Rex の `api_revision` と同じ位置づけなのは `generation` の方
-4. `_HC_GENERATIONS = frozenset({1})` のような定数にし、`available()` で `hello`（または `server.status` が generation を持たないので `hc --version` 経由でなく **JSON-RPC の `hello` を呼ぶ経路が要る**——CLI には `hello` 相当のサブコマンドが無いため、`hc schema` から `info.version` の major（`0.1.x` → major 0 は 1.0 未満なので毎回 minor も見る）を見るか、`hc connect`（API を stdin/stdout に出す）を使って `hello` を 1 回叩くかのどちらかになる。**これは決めること**（§10）——CLI 経由でどう generation を取るかが未確定なので、同じ frozenset パターンに落とし込めることは確認済みだが取得コマンドは次の task で決める
+4. `_HC_GENERATIONS = frozenset({1})` のような定数にし、`available()` で `hello` を叩いて `generation` を確かめる。**決定（attempt 3。§10-1 で解消）**: `server.status` は generation を持たず、CLI にも `hello` 相当のサブコマンドが無いので、`hc connect`（API を stdin/stdout に出す）経由で `hello` を 1 回叩く。これは `list()`（§3.2-3・§3.3）のために用意する JSON-RPC ヘルパー（subprocess 起動 → 1 行書く → 1 行読む → 閉じる）をそのまま使い回せる——`hc schema` の `info.version` 文字列比較で代用する必要は無い（実測: `hello` の戻りに `generation:1` がトップレベルで入っている。§2 の再現コマンド）
 
 ### 4.3 identity（世代）の対応
 
@@ -246,15 +296,22 @@ argv = ["bash", "-lc", "export PATH=\"$CREWVIA_REPO_ROOT/scripts/bin:$HOME/.loca
 ## 9. 実装規模の見積もり
 
 - `RexBackend` は `lib_mux.py:4884-5675`（約 790 行）。`HerdrBackend` は `3352-4883`（約 1530 行）。`TmuxBackend` は `2204-3351`（約 1150 行）
-- hc 版は Rex 規模に近いと見積もる。**増える要因**: JSON-RPC 的な構造化パース（`hc <cmd> --json` の出力を dataclass 的に正規化するヘルパーが要る——ただし herdr/Rex も同種のラッパー（`_herdr_run` / `_rex_run`）を既に持っているので新規パターンではない）。**減る要因**: `state()` と `verify_sent()` の主経路が screen-scraping を使わない分、Rex の `rex_screen_state()` / `_rex_input_box()` / `_rex_dialog` 系の正規表現群（`lib_mux.py:4779-4843` 相当、60行強）が要らない
-- 版固定（§4）・identity（§4.3）・エラー写像（§5）・PATH 埋め込み（§6）は RexBackend で確立済みのパターンをなぞるだけで、設計判断としての新規性は低い（コード量としては通常の backend 1 つ分）
+- hc 版は Rex 規模に近いと見積もる。**増える要因**: ① JSON-RPC 的な構造化パース（`hc <cmd> --json` の出力を dataclass 的に正規化するヘルパーが要る——ただし herdr/Rex も同種のラッパー（`_herdr_run` / `_rex_run`）を既に持っているので新規パターンではない）。② **（attempt 3 で確定）`list()` 用の小さい JSON-RPC ヘルパーが別途要る**（§3.2-3・§3.3）: `hc connect` を subprocess で起動 → 1 行の JSON-RPC リクエストを書く → 1 行読んで `json.loads` → 閉じる、という往復と、`error.data.kind`（§3.3 で実測した API 固有のエラー封筒）を読む専用の小さいパーサ。CLI 用のパーサ（`error.kind` を直接読む、§5）とは意図的に共有しない設計なので、**パーサが 1 つでなく 2 つ**になる。ただし呼び出し箇所は `list()` の 1 箇所（と §10-1 の `hello` も同じヘルパーに相乗りできる見込み）に閉じるので、合わせても 30-50 行程度と見積もる（Rex の `rex_screen_state()` 系正規表現 1 個分より小さい）。**減る要因**: `state()` と `verify_sent()` の主経路が screen-scraping を使わない分、Rex の `rex_screen_state()` / `_rex_input_box()` / `_rex_dialog` 系の正規表現群（`lib_mux.py:4779-4843` 相当、60行強）が要らない
+- 版固定（§4）・identity（§4.3）・エラー写像（§5）・PATH 埋め込み（§6）は RexBackend で確立済みのパターンをなぞるだけで、設計判断としての新規性は低い（コード量としては通常の backend 1 つ分）。`list()` の API 化（§3.3）で増える分は上の見積もりに織り込み済みで、全体の規模感（Rex 並み）を変えるほどではない
 - **1 task（t002）に収まる見込み**。分割するとすれば「`HcBackend` 本体 + 隔離テスト」と「start.sh / dispatcher / watchdog の配線」の 2 PR（Rex の PR-1 / PR-2 と同じ割り方）だが、Rex はこれを 1 つの mission の 2 task で収めているので、t002 を同様に 2 分割するかは実装 task 側の判断に委ねる
 
 ## 10. 決めること（ユーザー判断 / 実装 task 側で詰める点）
 
 **attempt 1 からの差分**: 名前の写像（hc の `--name` が crewvia の大文字始まりペイン名を受け付けない問題）は review t006 の P1 指摘を受けて §3.2 で決定済みにしたので、この節からは除外した（attempt 1 の時点でこの節にも §11 にも載っておらず、それ自体が review の指摘事項だった）。
 
-1. **generation の取得経路**（§4.2-4.4）: CLI に `hello`相当のサブコマンドが無い。`hc connect`（stdin/stdout で API を直接叩く）を使うか、`hc schema` の `info.version` の文字列比較で代用するかは t002 で決める
+1. **generation の取得経路**（§4.2-4.4）: **attempt 3 で解消**。CLI に `hello` 相当のサブコマンドは無いが、`list()`（§3.2-3・§3.3）で導入する `hc connect` の JSON-RPC ヘルパーに相乗りして `hello` メソッドを呼べばよい。実測:
+
+   ```
+   $ printf '{"jsonrpc":"2.0","id":1,"method":"hello","params":{}}\n' | hc connect
+   {"id":1,"jsonrpc":"2.0","result":{"core":{...},"features":[...],"framed":false,"generation":1,"methods":[...],"version":"0.1.18"}}
+   ```
+
+   トップレベルに `generation`（実測で `1`）がそのまま入っている。`hc schema` の `info.version` 文字列比較で代用する案は不要——`list()` 用に用意する JSON-RPC ヘルパーをそのまま使い回せるので、実装側で新しい経路を増やす必要もない
 2. **`error` state の Rule 5 対応**（§7.2）: A/B のどちらにも無い新しい値。Director への別枠通知にするか B に含めるか
 3. **holder 切り替わり時の挙動**（§4.3）: `hc update` 後に「terminals keep running」が実際にどう見えるか（旧 holder の記録をどう `PANE_UNOBSERVED` に倒すか）は、本番の hc を実際にアップデートする機会がないと検証できない——未検証のまま「Rex と同じ設計で安全側に倒す」ことにして進めるか、検証を待つか
 4. **`attach()` / `attach_cmd()` の実地検証**（§3 の「見込み」2件）: 実際に `hc attach` を exec してみる確認は t002 で行う
@@ -265,4 +322,3 @@ argv = ["bash", "-lc", "export PATH=\"$CREWVIA_REPO_ROOT/scripts/bin:$HOME/.loca
 - `hc server` の再起動（`hc update` の `restarted: true` を含む）で terminal の ID・holder.instance がどう変わるか（§4.3・§10-3）。本番の hc server を止める操作はこの task の方針（CLAUDE.md・`hc --skill` 共通の「頼まれていないのに止めるな」）に反するため未実施
 - `hc attach <t>` / `attach_cmd` の実地検証（§3・§10-4）
 - `machine_unknown` kind の実測（`--on` を使うリモート機能は対象外のため）
-- generation の取得経路（`hello` を CLI からどう叩くか。§10-1）

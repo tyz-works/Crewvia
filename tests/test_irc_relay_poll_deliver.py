@@ -1112,6 +1112,43 @@ def test_finished_or_stale_spinner_is_not_busy(screen):
     assert L.classify_pane(screen) == "ready"
 
 
+@pytest.mark.parametrize("bullet", ["* Next steps…", "· Loading…", "  * Next steps…", "  · Loading…", "⏺ * Next steps…"])
+@pytest.mark.parametrize("far", [True, False])
+def test_bullet_output_in_idle_screen_is_not_busy(bullet, far):
+    # idle の画面の本文に箇条書きの「…」があっても ready (字下げあり・なし・入力欄から遠い/近い)
+    gap = "x\n" * 6 if far else ""
+    screen = f"{bullet}\n{gap}{RULE}\n❯ \n{RULE}\n"
+    if not far and bullet == "· Loading…":
+        # 列 0 の「記号 単語…」が入力欄の直上にある形はスピナーと区別できない → 従来どおり busy (送らない側)
+        assert L.classify_pane(screen) == "busy"
+        return
+    assert L.classify_pane(screen) == "ready"
+
+
+@pytest.mark.parametrize("mark", list("·✢✳✶✻✽*"))
+@pytest.mark.parametrize("tail", ["", " (thought for 5s)"])
+def test_every_spinner_frame_just_above_box_is_busy(mark, tail):
+    assert L.classify_pane(f"out\n{mark} Working…{tail}\n{RULE}\n❯ \n{RULE}\n") == "busy"
+    # 間に状態行が挟まっても busy
+    assert L.classify_pane(f"out\n{mark} Working…{tail}\n  ✔ Update installed\n{RULE}\n❯ \n{RULE}\n") == "busy"
+
+
+@pytest.mark.parametrize("n", [1, 3, 5])
+def test_spinner_above_todo_list_and_status_line_is_busy(n):
+    todo = "".join(f"  ⎿  ☐ item {k}\n" for k in range(n))
+    assert L.classify_pane(f"out\n✻ Working… (thought for 5s)\n{todo}\n  ✔ Update installed\n{RULE}\n❯ \n{RULE}\n") == "busy"
+
+
+def test_bullet_above_todo_list_is_ready_when_text_between():
+    screen = f"* Next steps…\nplain body\n  ⎿  ☐ a\n  ⎿  ☐ b\n{RULE}\n❯ \n{RULE}\n"
+    assert L.classify_pane(screen) == "ready"
+
+
+def test_indented_spinner_shape_is_not_busy():
+    assert L.classify_pane(f"out\n  ✻ Working…\n{RULE}\n❯ \n{RULE}\n") == "ready"
+    assert L.classify_pane(f"out\n✻ Working… and more text\n{RULE}\n❯ \n{RULE}\n") == "ready"
+
+
 def test_esc_to_interrupt_is_busy():
     assert L.classify_pane(f"✻ Working (esc to interrupt)\n{RULE}\n❯ \n{RULE}\n") == "busy"
 

@@ -1,4 +1,4 @@
-# agy (Antigravity CLI + Gemini 4 Argon) をレビュー先にする (t080)
+# agy (Antigravity CLI + Gemini) をレビュー先にする (t080)
 
 `scripts/kai-review.sh` の「codex exec を走らせる段」だけを差し替えられる。前後（pull・Execution ID の照合・findings の判定・
 needs-director / done の報告）は codex と共通。設定の読み口は `scripts/lib_review_engine.py` の 1 か所。
@@ -10,21 +10,23 @@ needs-director / done の報告）は codex と共通。設定の読み口は `s
 | 欄 | 既定 | 意味 |
 |---|---|---|
 | `engine` | `codex` | `codex` / `agy` / `claude` / `both` / `ensemble`。env `CREWVIA_REVIEW_ENGINE` が上書き（engine だけ）。`cursor` は比較専用で `compare` にだけ置ける（`knowledge/cursor-review.md`）。`claude` と `ensemble`（agy + claude の合議）は `knowledge/claude-review.md` |
-| `agy_model` | `gemini-4-argon-high` | `agy models` に出る名前（`gemini-4-argon-{low,medium,high}`） |
+| `agy_model` | `gemini-3.8-flash-high` | `agy models` に出る名前。agy 1.4.10 の 6 モデル: `gemini-3.8-flash-{high,medium,low}` / `claude-sonnet-4-6` / `claude-opus-4-6-thinking` / `gpt-oss-120b-medium` |
 | `agy_timeout_seconds` | `600` | `--print-timeout` に渡す |
 
 - **キー（`review:` / `engine` 等）が無い・config ファイルが無い = 既定**。**キーがあって値が null（`review:` / `review: null` / `engine:`）は不正**。**読めない・値が不正（env の空も）= 止める**（`needs-director`・固定コード）。codex に倒さない。
 - 読み口は PyYAML。**PyYAML が無く config ファイルがあれば止める**（`yaml_unavailable`。regex で「review: が無い」と決めると `"review":` や flow 形式を見落として黙って codex になる）。CI は `pip install pytest pyyaml`（`.github/workflows/ci.yml`）、本番の `python3` は PyYAML 6.0.1 が入っていることを確認済み（t084）。
 - `both`: codex と `compare`（既定 `[agy]`）の各エンジンを走らせ、**判定は codex のまま**。agy の findings は Result に「agy (比較用)」として併記する（agy が失敗しても判定は変えず、失敗の理由を併記）。`compare: [agy, cursor]` で cursor も併記できる（`knowledge/cursor-review.md`）。
 
-## agy の呼び方（実測: agy 1.4.7）
+## agy の呼び方（実測: agy 1.4.10）
 
 ```
 cd $REVIEW_WT && agy --mode plan --model <agy_model> --output-format json \
-    --json-schema config/kai-review-findings.schema.json --add-dir <diff の dir> --print-timeout <N>s -p "<prompt>"
+    --json-schema config/kai-review-findings.schema.json --add-dir <diff の dir> --print-timeout <N>s \
+    --settings '{"permissions":{"allow":["read_file(<diff の dir>/*)","read_file(<REVIEW_WT>/**)"]}}' -p "<prompt>"
 ```
 
 - サブスクのログインのまま。API キーは使わない。**`--dangerously-skip-permissions` は使わない**。
+- **`--add-dir` だけでは headless (`-p`) で `read_file` が自動拒否される**（確認プロンプトを出せない）。`status:SUCCESS` のまま `denied_actions` だけが載った空応答になり、kai-review.sh は fail-closed で needs-director に倒れる。だから `--settings` で `read_file` の allow-rule を 2 本（diff の dir と review worktree）だけ明示する。`command` は許さない（read-only review の前提）。組み立てに失敗したら `AGY_FAIL=settings_build_failed`。
 - **`-p` は最後**（前に置くと次の option を prompt として読み exit 2）。
 - diff は argv に載せない（引数 1 個 128KB 上限・PR は 300KB まで通る）。worktree の外の `mktemp -d` に `review.diff` を書き、prompt でパスを読ませる。
   **`--add-dir` で足せば worktree 外のファイルを読める**（実機で確認）。prompt は「コマンドは実行せず、ファイルを読むだけ」と書く（`-p` は許可の無いコマンドを自動で拒否する）。

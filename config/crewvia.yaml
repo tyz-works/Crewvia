@@ -270,7 +270,7 @@ review:
   engine: codex
   # 旧値 gemini-4-argon-high は agy に存在せず ensemble が fail-closed していた
   # (t005 / 20261102-pr-task-line)。`agy models` の実在 ID に合わせてある。
-  # agy は ensemble / compare でだけ使われる (本番のレビュー先は codex)。
+  # 既定の本番のレビュー先は codex。agy は engine: agy / ensemble / compare で使われる。
   # ensemble の相方が claude なので、合議の多様性のため Gemini 系を選んでいる
   # (claude-opus-4-6-thinking を選ぶと両方 Claude 系になる)。
   agy_model: gemini-3.8-flash-high

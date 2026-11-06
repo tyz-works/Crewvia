@@ -1118,7 +1118,7 @@ def test_bullet_output_in_idle_screen_is_not_busy(bullet, far):
     # idle の画面の本文に箇条書きの「…」があっても ready (字下げあり・なし・入力欄から遠い/近い)
     gap = "x\n" * 6 if far else ""
     screen = f"{bullet}\n{gap}{RULE}\n❯ \n{RULE}\n"
-    if not far and bullet[0] not in " ⏺":
+    if not far and bullet == "· Loading…":
         # 列 0 の「記号 単語…」が入力欄の直上にある形はスピナーと区別できない → 従来どおり busy (送らない側)
         assert L.classify_pane(screen) == "busy"
         return

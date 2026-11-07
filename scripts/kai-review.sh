@@ -632,9 +632,23 @@ run_agy_review() {
 Read the unified diff from the file ${AGY_DIFF_DIR}/review.diff (it is outside this checkout; read it as a file).
 Do NOT run any command (no git, no shell): only read files. Do not create or modify any file.
 Return only the JSON object required by the schema."
+  # --add-dir は workspace に足すだけで読み取り許可にはならない。agy 1.4.10 の headless (-p) は
+  # 確認プロンプトを出せないので、許可の無い read_file を自動で拒否し、status:SUCCESS のまま
+  # denied_actions だけが載った空応答を返す (= fail-closed で needs-director。2026-10-29 実測)。
+  # だから読んでよい範囲を allow-rule で明示する。許す tool は read_file だけ:
+  # command を許すと「コマンドを実行しない read-only review」という前提が崩れる
+  # (--dangerously-skip-permissions も同じ理由で使わない)。
+  local agy_settings
+  agy_settings="$(AGY_DIFF_DIR="$AGY_DIFF_DIR" REVIEW_WT="$REVIEW_WT" python3 -c '
+import json, os
+print(json.dumps({"permissions": {"allow": [
+    "read_file(%s/*)" % os.environ["AGY_DIFF_DIR"],
+    "read_file(%s/**)" % os.environ["REVIEW_WT"],
+]}}))')" || { AGY_FAIL="settings_build_failed"; return 1; }
   _info "Running agy --mode plan --model ${AGY_MODEL} (diff=${DIFF_BYTES} bytes, timeout=${AGY_TIMEOUT}s) ..."
   ( cd "$REVIEW_WT" && agy --mode plan --model "$AGY_MODEL" --output-format json \
       --json-schema "$SCHEMA_FILE" --add-dir "$AGY_DIFF_DIR" --print-timeout "${AGY_TIMEOUT}s" \
+      --settings "$agy_settings" \
       -p "$prompt" ) >"$AGY_OUT_FILE" 2>"$AGY_ERR_FILE" || rc=$?
   if [[ $rc -ne 0 ]]; then AGY_FAIL="exit_${rc}"; return 1; fi
   # 判定は 1 つの JSON ドキュメントだけから (複数・壊れた出力は失敗)

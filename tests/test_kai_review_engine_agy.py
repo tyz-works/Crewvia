@@ -179,6 +179,14 @@ def test_agy_clean_review_is_done_and_uses_plan_mode_without_skip_permissions(tm
     assert "-p" not in argv[pi + 1:] and not any(a.startswith("--") and a in ("--mode", "--model") for a in argv[pi + 1:])
     assert "review.diff" in "\n".join(argv[pi + 1:])               # prompt が diff のファイルを指す
     assert argv.index("--add-dir") < pi                            # -p は最後の option (prompt が続く)
+    # --settings: read_file の allow-rule 2 本 (diff dir と review worktree) だけ・command は許さない
+    assert argv.index("--settings") < pi
+    settings = json.loads(argv[argv.index("--settings") + 1])
+    allow = settings["permissions"]["allow"]
+    assert set(settings) == {"permissions"} and set(settings["permissions"]) == {"allow"}
+    assert len(allow) == 2 and all(a.startswith("read_file(") and a.endswith(")") for a in allow)
+    assert allow[0].endswith("/*)") and allow[1].endswith("/**)")
+    assert not any("command" in a for a in allow)
     assert "### agy raw output" in _result(capture, "done")
     assert not list(tmp_path.glob("kai-review-agy*"))
 

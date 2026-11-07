@@ -76,7 +76,7 @@ MUTATIONS = [
      "    if '--target-dir' in opts:\n"
      "        explicit_td = opts['--target-dir']\n"
      "        if not explicit_td.strip():\n"
-     "            _usage_exit(\"resolve-pr: --target-dir に空の値は渡せません \"\n"
+     "            _usage_exit(\"--target-dir に空の値は渡せません \"\n"
      "                        \"(省略すれば TARGET_DIR / crewvia 本体を見ます)\")\n"
      "        effective_target",
      "    explicit_td = opts.get('--target-dir')\n"

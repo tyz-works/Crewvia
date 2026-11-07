@@ -125,8 +125,17 @@ Shell commands are not available. Do not create, modify or delete any file. Retu
     fi
   else
     rm -f "$out/$label.agy.json" "$out/$label.agy.json.tmp"
-    ( cd "$R" && agy --mode plan --model gemini-4-argon-high --output-format json --json-schema "$KIT/schema.json" \
-        --add-dir "$DD" --print-timeout 600s -p "$prompt$extra" ) > "$out/$label.agy.raw" 2> "$out/$label.agy.err"
+    # 本番 (kai-review.sh run_agy_review) と同じ --settings: headless の agy は --add-dir だけでは read_file が
+    # 自動拒否されるので、読める範囲を read_file の allow-rule で明示する (command は許さない)。
+    local agy_settings
+    agy_settings="$(DD="$DD" R="$R" python3 -c '
+import json, os
+print(json.dumps({"permissions": {"allow": [
+    "read_file(%s/*)" % os.environ["DD"],
+    "read_file(%s/**)" % os.environ["R"],
+]}}))')" || return 97
+    ( cd "$R" && agy --mode plan --model gemini-3.8-flash-high --output-format json --json-schema "$KIT/schema.json" \
+        --add-dir "$DD" --print-timeout 600s --settings "$agy_settings" -p "$prompt$extra" ) > "$out/$label.agy.raw" 2> "$out/$label.agy.err"
     rc=$?; echo "rc=$rc" > "$out/$label.agy.rc"
     if [[ $rc -eq 0 ]]; then
       # 検証は本番 lib (extract-agy: status SUCCESS・denied_actions 空・重複キー拒否・schema) に一本化。bench で再実装しない。

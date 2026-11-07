@@ -3489,7 +3489,7 @@ def cmd_resolve_pr(args):
     if '--target-dir' in opts:
         explicit_td = opts['--target-dir']
         if not explicit_td.strip():
-            _usage_exit("resolve-pr: --target-dir に空の値は渡せません "
+            _usage_exit("--target-dir に空の値は渡せません "
                         "(省略すれば TARGET_DIR / crewvia 本体を見ます)")
         effective_target = os.path.abspath(os.path.expanduser(explicit_td))
     else:

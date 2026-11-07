@@ -407,7 +407,7 @@ def test_both_default_compare_is_agy_only(tmp_path, monkeypatch):
     p, capture = run(tmp_path, monkeypatch, compare=None, agy_findings=CURSOR_P1.replace("cursor", "agy"))
     assert _verdict(tmp_path) == "done", (p.stdout, p.stderr)
     text = _result(capture, "done")
-    assert "### agy (比較用 — 判定は Codex。model=gemini-4-argon-high)" in text and "agy-found" in text
+    assert "### agy (比較用 — 判定は Codex。model=gemini-3.8-flash-high)" in text and "agy-found" in text
     assert "### cursor" not in text
     assert not (tmp_path / "cursor_argv.txt").exists()
 
@@ -416,7 +416,7 @@ def test_both_with_agy_and_cursor_appends_both_in_order_and_codex_decides(tmp_pa
     p, capture = run(tmp_path, monkeypatch, compare="[agy, cursor]", cursor_findings=CURSOR_P1)
     assert _verdict(tmp_path) == "done", (p.stdout, p.stderr)            # cursor が P1 でも判定は codex
     text = _result(capture, "done")
-    a = text.index("### agy (比較用 — 判定は Codex。model=gemini-4-argon-high)")
+    a = text.index("### agy (比較用 — 判定は Codex。model=gemini-3.8-flash-high)")
     c = text.index("### cursor (比較用 — 判定は Codex。model=grok-4.7-high)")
     assert text.index("### Codex raw output") < a < c                  # 併記は compare の順
     assert "cursor-found" in text and "worktree の外も読める" in text

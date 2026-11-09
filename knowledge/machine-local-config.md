@@ -100,8 +100,13 @@ grep) し、§2-A も「読めない → 既定値」に潰す読み口が多い
 方針 (推奨):
 
 1. `lib_config.load_effective()` の local の読み先は、**主 checkout の `config/crewvia.local.yaml`** と定義する。
-   主 checkout は `git rev-parse --git-common-dir` の親で求める (worktree でも同じ答えになる)。git が使えない
-   場所 (git 管理外の配置) では `CREWVIA_REPO_ROOT` → スクリプトの位置の順に落とす。
+   主 checkout は `git rev-parse --path-format=absolute --git-common-dir` (git 2.31+) の親で求める
+   (worktree でも同じ答えになる)。`--path-format=absolute` が要る理由: 付けないと主 checkout の root では
+   相対パス `.git` が返り (worktree では絶対パス)、「親」を取る結果が cwd に依存してしまう。
+   git が使えない場所 (git 管理外の配置) では**スクリプトの位置だけ**に落とす。`CREWVIA_REPO_ROOT` は
+   落とし先に使わない: Worker のセッションでは `.crewvia-env` が `CREWVIA_REPO_ROOT` = 主 checkout を入れるので、
+   git 管理外にコピーしたテスト (script test / bats) がそこから実機の local を読んでしまう (CI には env が無い
+   ので手元でしか起きず気づきにくい)。本番の主 checkout は常に git 管理下なので、この落とし先で困ることはない。
 2. **共通 yaml は従来どおり呼び出し側の位置から読む** (worktree の `config/crewvia.yaml` は Worker のブランチの版。
    既存の挙動を変えない)。local だけ主 checkout から読む。
 3. QA の隔離 clone は別 repo (`git-common-dir` が clone 自身) なので local は見えない。ここは意図どおり
@@ -232,9 +237,11 @@ PR を 3 本に分ける (積み上げは merge commit — stacked-pr-squash の
 - `lib_config` は **`CREWVIA_MUX_TEST_ISOLATION` が立っている間は local を読まない** (共通だけ)。この印は
   `tests/conftest.py` が置く既存のもので、本番では立たない (CLAUDE.md の env 表)。local を読む挙動を
   検査するテストだけが、明示的に `local_path=` を `lib_config` に渡す (env では上書きしない)。
-- bats / `scripts/test_*.sh` は env に印が無いので、コピー先の repo_root (§2-E の 1 で
-  `git-common-dir` が主 checkout を指さない一時 repo) に local を置かない限り読まない。主 checkout を
-  指す形のテストは作らない。
+- bats / `scripts/test_*.sh` は env に印が無い。コピー先 (`tests/fixture_tree.py` は repo を初期化せず、
+  `scripts/test_*.sh` 26 本のうち repo を初期化するのは 2 本だけ。つまりふつう git 管理外) では、§2-E の 1 により
+  読み先が**スクリプトの位置 (コピー先自身)** に落ちる。`CREWVIA_REPO_ROOT` には落とさないので、Worker の
+  セッションで直接走らせても実機の local は読まない。コピー先に local を置いたテストだけが読む。
+  主 checkout を指す形のテストは作らない。
 - 保険として conftest が「実機の local が存在する」ことを検知しても**失敗はさせず**、印の効きを
   確かめるテスト 1 本 (印あり = 実機に local があっても共通値) を PR-1 に入れる。
 
@@ -247,7 +254,7 @@ PR を 3 本に分ける (積み上げは merge commit — stacked-pr-squash の
 
 - **(a) 追跡解除 + `.gitignore` (推奨)** — `registry/workers/`・`registry/heartbeats/` と同じ扱いにする。
   `git rm --cached registry/workers.yaml`。ファイルが無い場合は `lib_registry.py` が空の名簿から作る
-  (`FileNotFoundError` 経路が既にある。:107)。ヘッダコメント (各欄の説明) は
+  (`FileNotFoundError` 経路が既にある。:108)。ヘッダコメント (各欄の説明) は
   `registry/workers.yaml.example` か knowledge に移す。
   **注意**: 「名前はポジション・歴代継承」(設計原則 3) があるので、名簿が消えると名前の継承が切れる。
   `.gitignore` には既に `registry/workers.yaml` の行がある (追跡中なので効いていないだけ)。必要なのは
@@ -257,7 +264,10 @@ PR を 3 本に分ける (積み上げは merge commit — stacked-pr-squash の
   - 追跡解除を**実行する機**: `git rm --cached` はファイルを消さない (index のみ)。
   - 追跡解除のコミットを **pull で受け取る機**: `git pull` が**ワーキングツリーのファイルを削除する**
     (手元に未コミット変更があれば衝突して pull が止まる)。放っておくと名簿が消え、名前の継承が切れる。
-  - 手順 (受け取る機): **退避 → pull → 退避から戻す**。
+  - 手順 (受け取る機): **退避 → pull → 退避から戻す**。**前提: crewvia を止めて (Worker なしで) 行う。**
+    手順 3 と 4 の間に plan.sh / lib_registry が名簿を書くと、空の名簿から新しく作られ、そこで振られた名前が
+    4 の上書きで消える (または退避と食い違う)。`sync-main-checkout.sh` はデーモンを restart するので、
+    止めずに使わない。
     1. `cp registry/workers.yaml "$(mktemp -d)/workers.yaml"` で退避先を決めて退避する (退避先のパスを控える)。
     2. 手元変更を `git checkout registry/workers.yaml` で捨てる (追跡中の最後の 1 回。退避済みなので失われない)。
     3. `git pull` (または `sync-main-checkout.sh`)。ファイルが消える。

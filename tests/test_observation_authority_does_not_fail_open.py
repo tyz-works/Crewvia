@@ -405,6 +405,12 @@ OBSERVATION_SITES: dict[tuple[str, str, str], tuple[str, str]] = {
      'Path(f"/proc/{pid}/stat").read_text(errors="replace")'):
         (SAFE, "呼び出しは try 節の外で FileNotFoundError/ProcessLookupError を "
                "個別に捕まえ、それ以外は re-raise (呼び出し側で fail-closed)"),
+    ("lib_retirement.py", "proc_group_members", 'Path("/proc").iterdir()'):
+        (SAFE, "列挙の失敗は except OSError で None (= 観測できない) を返す。呼び出し側は None を "
+               "『group が空』に読まず、終了の証明にも SIGKILL の根拠にもしない (保留)"),
+    ("lib_retirement.py", "proc_group_members", '(entry / "stat").read_text(errors="replace")'):
+        (SAFE, "ENOENT/ESRCH (走査中に終了) だけ飛ばし、それ以外の OSError と解釈できない stat は None "
+               "(観測できない)。空リストは『全 entry を読めて pgrp が一致する生きたプロセスが無い』ときだけ"),
     ("lib_retirement.py", "has_marker",
      'request_path(self.registry_dir, agent).exists()'):
         (SAFE, "pathlib.Path.exists() は EACCES を False に潰さず raise する "

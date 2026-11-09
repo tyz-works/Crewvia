@@ -343,3 +343,42 @@ plugin 自体（`herdr plugin action invoke open-task-graph ...`）は herdr ser
 hc への切り替え後も「herdr server が生きていれば」そのまま使える（6.4 のとおり、本書は herdr server を
 一度も落とさない設計にしている）。plugin の config dir への symlink（`knowledge/task-graph.md` §1）も
 `registry/task-graph/tasks.json` という同じパスを指し続けるので、張り直す必要は無い。
+
+## 8. 実行結果（2026-11-09）
+
+- **実行日**: 2026-11-09。herdr → hc への本番切り替えを実施した（mission
+  `20261109-hc-production-switch`）。
+- **切り替え後に backend を確認する正しい手順**（4節の手順1をそのまま使った）:
+  `config/crewvia.yaml` の `mode:` の値では判断しない——**`registry/mux/*.json` の
+  `"backend"` を実際に読む**。本書作成時点と同じ 1 行の python で、pane record（`handle`/
+  `backend`/`server` を持つ形）全件を確認する:
+  ```bash
+  for f in registry/mux/*.json; do
+    python3 -c "
+  import json,sys
+  d=json.load(open(sys.argv[1]))
+  if 'backend' in d: print(sys.argv[1], '->', d.get('backend'), d.get('handle'))
+  " "$f" 2>/dev/null
+  done
+  ```
+  実測（本 task 実行時点）: `dispatcher.json` / `watchdog.json` / `Sora-director.json` /
+  各 `*-worker.json`（例 `Mateo-worker.json`、`Hana-worker.json`）、すべて `"backend": "hc"`。
+  `"backend": "herdr"` の record は 0 件——3.2 の全停止が正しく完了し、§3.2 末尾が警告する
+  「herdr record が残り続ける」症状は今回は起きていない。
+- **手順書が想定していた挙動との差分**:
+  - **mux backend の切り替え自体（3〜4節の手順）は差分なし**。4節の確認はそのまま通った。
+  - **ただし 3.3「config を切り替える」の実務（PR → review → merge → 本番 checkout 同期）が
+    手順どおりに完結していなかった**: 切り替え後、`config/crewvia.yaml` の `mode: hc` と
+    `registry/workers.yaml` の通常更新が、本番 checkout の working tree に**未コミットのまま**
+    残っていた（本 task=t003 の発端）。本書の 3.3 は「PR を作り…」とだけ書いており、
+    「コミットし忘れると config は hc のままでも次に `git checkout` / `reset` が走ったときに
+    herdr へ巻き戻るリスクがある」という後片付けの注意までは書いていなかった——運用上の
+    ギャップとして本節に記録する（本書の手順自体を書き直す必要があるほどではない。やること
+    リストの最後に「commit → push → PR → merge」まで明示的に含めるべき、という教訓）。
+  - **`.claude/settings.json` の失効 worktree permission 行**: t003 の発端になった Director の
+    一次確認では「既に消えた worktree への permission 行」とされていたが、実行時点
+    （2026-11-09）で該当する全ディレクトリ（`.claude/worktrees/20261102-pr-task-line/t002-t001`
+    ほか計 5 件）を `git worktree list` と `[ -d ...]` で 1 件ずつ確認したところ、**全て実在して
+    いた**（他 task が継続使用中）。そのため本 task では該当行を削除していない——
+    「消す前に実在しないことを確認する」が実際に差分を防いだ例として記録する。stale 行の
+    削除は、該当 worktree が実際に `git worktree remove` された後の別 task に委ねる。

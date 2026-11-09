@@ -27,8 +27,31 @@
 # /usr/bin/node resolves first until nvm-exec rewrites PATH — i.e. the daemon's actual
 # condition, not just an interactive shell that sourced ~/.bashrc.
 #
+# Self-recursion guard (t007/Seo review of PR #352, attempt 2): `nvm-exec` does not replace
+# PATH — it prepends the resolved node version's bin dir to the *inherited* PATH and then
+# execs `codex` by bare name (confirmed by reading nvm-exec's source and by running it with
+# a sentinel name standing in for `codex`: the sentinel's own directory stays in the PATH
+# nvm-exec hands to the final exec). In the crewvia context scripts/bin is always on the
+# inherited PATH, so if the resolved nvm version's bin has no `codex` (e.g. right after
+# `nvm install` bumps alias/default to a version npm hasn't installed codex into yet), bare
+# `codex` resolves back to this file — shim -> nvm-exec -> shim -> ... Every level is `exec`
+# (no fork bomb; process count stays flat) but the chain never returns: reproduced with a
+# depth-bounded copy of this script standing in for the real one, then with the unbounded
+# original under `timeout 10` — exit=124, 0 bytes of output, no error. To keep the failure
+# fail-closed instead, strip this file's own directory from PATH before handing off, so a
+# missing `codex` resolves to nothing (`codex: not found`, exit 127) rather than back here;
+# kai-review.sh's `set -euo pipefail` carries that 127 through its `| tee` pipeline to
+# `CODEX FAILURE: exit=127` -> fail_needs_director, same as any other codex failure.
+#
+# NVM_DIR (t007/Seo, P3): nvm's own convention is $NVM_DIR, not a hardcoded ~/.nvm — Docker
+# images and shared installs commonly use another path (e.g. /usr/local/nvm). Reproduced
+# nvm *present* but this shim still exiting 127 when NVM_DIR pointed elsewhere.
+#
 # 戻し方: このファイルを消す（nvm 本体・codex の npm install には触れていない）。
-NVM_EXEC="$HOME/.nvm/nvm-exec"
+SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd) || exit 127
+PATH=$(printf '%s' "$PATH" | tr ':' '\n' | grep -vxF "$SELF_DIR" | paste -sd: -)
+export PATH
+NVM_EXEC="${NVM_DIR:-$HOME/.nvm}/nvm-exec"
 if [ ! -x "$NVM_EXEC" ]; then
   echo "scripts/bin/codex: $NVM_EXEC not found or not executable" >&2
   exit 127

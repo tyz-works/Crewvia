@@ -144,7 +144,7 @@ registry/ workers.yaml / workers/ / heartbeats/ / mux/ / retirements/ / task-gra
 | `CREWVIA_HERDR_WORKSPACE` | herdr backend が使うワークスペース名（デフォルト: `crewvia`） |
 | `CREWVIA_HERDR_SOCK` | **テスト専用**。lib_mux が ping する herdr socket の上書き。**本番で設定するな**（ping 先と server の bind 先が食い違う）。詳細: `tests/CLAUDE.md` |
 | `CREWVIA_REX_SOCK` | **テスト専用**。隔離 Rex server の socket（`CREWVIA_MUX_TEST_ISOLATION` 下でだけ読む）。**本番で設定するな**（本番で立っていると Rex は使用不可になる）。詳細: `knowledge/rex-mux-backend.md` §8 |
-| `CREWVIA_MUX_RECORD_SWEEP` | 失効した mux spawn 記録（`registry/mux/*.json`）の掃除の停止スイッチ。`0` で掃除が何も見ず何も消さない（既定は有効）。**止まるのは掃除だけ**で、記録の書き込みロックは常に働く。dispatcher は cycle ごとに新しい python なので dispatcher の env に足して再起動すれば効く。`start.sh` は env をそのまま読む。掃除は消す側の 1 者なので食い違っても危険な側には倒れない（規則を共有する `lib_dep_rules` 等に env スイッチを付けない理由と逆）。`knowledge/daemon-authority.md` §7-14 |
+| `CREWVIA_MUX_RECORD_SWEEP` | 失効した mux spawn 記録（`registry/mux/*.json`）**と** Rule 5 のマーカー（`*.state.json` / `*.job-since.json` / `*.usage-limit.json`）の掃除の停止スイッチ。`0` でどちらの掃除も何も見ず何も消さない（既定は有効）。**止まるのは掃除だけ**で、記録の書き込みロックは常に働く。dispatcher は cycle ごとに新しい python なので dispatcher の env に足して再起動すれば効く。`start.sh` は env をそのまま読む。掃除は消す側の 1 者なので食い違っても危険な側には倒れない（規則を共有する `lib_dep_rules` 等に env スイッチを付けない理由と逆）。`knowledge/daemon-authority.md` §7-14 / `knowledge/rule5-state-marker-sweep.md` |
 | `CREWVIA_MUX_TEST_ISOLATION` | **テスト専用**。テスト中の印（`tests/conftest.py` が置く）。立っている間、本番の宛先名を指す mux verb は拒否される。**本番で設定するな**。詳細: `tests/CLAUDE.md` |
 | `CREWVIA_PYTEST_WORKSPACE_SWEEP` | **テスト専用**。pytest 終了時の残骸掃除の停止スイッチ（`0` で止まる）。**本番で設定するな**。詳細: `tests/CLAUDE.md` |
 | `CREWVIA_CI_ALLOW_GH_IN_TESTS` | **テスト専用**。テスト中（`CREWVIA_MUX_TEST_ISOLATION`）に CI の取得が gh を呼んでよい印（stub を置いたテストだけが立てる）。**本番で設定するな**（本番では読まれない）。`knowledge/ci-status.md` |

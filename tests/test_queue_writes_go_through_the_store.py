@@ -108,6 +108,8 @@ ALLOWED_WRITES: dict[tuple[str, str], tuple[int, str]] = {
     ('dispatcher.sh', 'check_rule5'): (1, R_DAEMON_JSON + "。通知スロットルの cache (/tmp)"),
     ('dispatcher.sh', 'set_all_done_state'): (2, R_MARK + "。all-done の印 (touch / unlink)"),
     ('dispatcher.sh', 'sweep_spawn_grace_markers'): (1, R_MARK + "。spawn 猶予マーカーの掃除"),
+    ('dispatcher.sh', 'sweep_rule5_state_markers'): (1, R_DAEMON_JSON + "。Rule 5 grace 追跡マーカー "
+        "(`.state.json` / `.job-since.json` / `.usage-limit.json`) のうち、窓が消えた名前の分の掃除 (t020)"),
     ('dispatcher.sh', 'tmux_kill_window'): (1, R_MARK + "。first-seen 印の撤去"),
     ('dispatcher.sh', 'spawn_kai_review'): (2, R_LOG + "。codex-review の spawn ログ"),
     ('dispatcher.sh', 'log'): (1, R_LOG),

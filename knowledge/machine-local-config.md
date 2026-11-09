@@ -33,21 +33,26 @@
 | `lib_history.py` (`load_default_max_attempts`) | `attempts.max_total` | 既定 6 |
 | `lib_daemon_watch.py` (`WatchConfig` ローダ) | `daemons:` | 既定値 |
 | `lib_model.py resolve` | `worker_model` / `model_per_skill` | 空文字 (呼び側が worker_model → CLI 既定へ) |
-| `plan.sh` (3045–3068, 7255, 7359) | `timeout_max_per_skill` ほか | 既定 |
+| `plan.sh` (3045–3068) | `timeout_max_per_skill` ほか | 既定 |
+| `plan.sh` の `load_default_max_attempts` 経由 (7255 / 7359) | `attempts.max_total` | 既定 6 (`lib_history.py` と同じ値を 2 経路で読む。移行は両方) |
 
 ### B. Python: 自前の行走査 (yaml を使わない)
 
 | 読み口 | 取るキー | 注意 |
 |---|---|---|
-| `lib_mux._config_mode()` (:297) | `mode:` | 行頭 `mode:` を探すだけ。インラインコメント除去 (t016) を含め、yaml 構造を知らない。**全 mux 判定の根**。`hooks/post-tool-use.sh` と `watchdog.py` もこれ経由 |
-| `lib_mux.py` rex endpoint (:4155–4205) | `rex.endpoint` | 読めなければ rex を `unavailable` に倒す (fail-closed) |
+| `lib_mux._config_mode()` (:297) | `mode:` | 行頭 `mode:` を探すだけ。インラインコメント除去 (t016) を含め、yaml 構造を知らない。**Python 側の mux 判定の根** (`hooks/post-tool-use.sh` と `watchdog.py` もこれ経由)。ただし起動側の `scripts/start.sh` は別に `mode:` を読む (§2-C)。根は 2 つある |
+| `lib_mux.py` rex endpoint (:4155–4205) | `rex.endpoint` | **PyYAML を遅延 import している** (:4172。`import yaml` → `safe_load`)。読めなければ rex を `unavailable` に倒す (fail-closed)。lib_mux は PyYAML に依存済み |
 
 ### C. shell: `grep` / `awk` / `sed` で自前に切り出す
 
 | 読み口 | 取るキー |
 |---|---|
-| `crewvia` の `read_config` (:23) | `mode` / `taskvia` / `taskvia_url` ほか (行頭の top-level scalar) |
+| `crewvia` の `read_config` (:23) | `mode` / `taskvia` / `taskvia_url` ほか (行頭の top-level scalar)。**`mode` の既定 `"tmux"` を持つ** (:114。D1 (c) を選ぶならここも変える) |
 | `scripts/start.sh` (:34 付近) | `wip_limit` / `director_model` / `worker_model` |
+| `scripts/start.sh` (:239) | **`mode:`** (`grep '^mode:'`)。Director 起動時の backend (`_EFFECTIVE_BACKEND`・rex / herdr の事前検査) を決める。lib_mux の `_config_mode` とは別の読み口 |
+| `scripts/start.sh` (:390–402) | `approval_channel.mode` / `ntfy.*` (`_read_approval_channel_yaml`)。`lib_approval_channel.sh` と同じ 2 段入れ子を別実装で持つ |
+| `scripts/start.sh` (:415) | `taskvia` (`grep '^taskvia:'`) |
+| `scripts/start.sh` (:102) | `lib_model.py resolve --config` を呼ぶ (A 経由。config のパスを渡す) |
 | `scripts/dispatcher.sh` `_read_state_grace` (:55) | `mux.state_grace_seconds` (awk) |
 | `hooks/lib_approval_channel.sh` `_read_approval_yaml` (:21) | `approval_channel.mode` / `.ntfy.*` (awk の 2 段入れ子) |
 | `scripts/review-plan.sh` (:43) | `worker_model` (grep) + `lib_model.py` |
@@ -69,9 +74,47 @@ grep) し、§2-A も「読めない → 既定値」に潰す読み口が多い
   共通 + local の読みと検査をここに集約し、読み口はすべてここを呼ぶ。
 - shell 向けに CLI を付ける: `python3 lib_config.py get <dotted.key> [--default X]` と `dump --json`。
   §2-C の grep/awk/sed はすべて `get` に置き換える (awk の 2 段入れ子や行頭 scalar 限定の癖が消える)。
-- **例外: `lib_mux._config_mode()`**。lib_mux は PyYAML 無しでも動く前提 (§2-B) で import 依存を増やしたくない。
-  `lib_config` を import してよいか (`lib_mux` は restart 対象の根なので `DAEMON_RESTART_FILES` が増える)、
-  それとも `mode` だけ「local の行走査 → 共通の行走査」の 2 段にするかは §9 で選ぶ。
+- **`lib_mux._config_mode()`**。lib_mux は rex endpoint の読みで既に PyYAML を遅延 import している (§2-B) ので、
+  「PyYAML 無しで動かすため import を増やさない」は理由にならない。`lib_config` を import してよいか
+  (`lib_mux` は restart 対象の根なので `DAEMON_RESTART_FILES` が増える)、それとも `mode` だけ
+  「local の行走査 → 共通の行走査」の 2 段にするかは §9 (D3) で選ぶ。
+- **mux の判定の根は 2 つ**: `lib_mux._config_mode()` と `start.sh:239`。PR-2 は両方を同じコミットで
+  `lib_config` 経由にする (片方だけだと、start.sh は共通の mode で backend を選び、lib_mux は local の
+  mode を使う = 本件の「別の mux で起動する」事故が残る)。
+
+### E. local の読み先 (repo_root の決め方) — 今は 3 通りある
+
+現状、repo root の決め方が読み口でばらばらである。
+
+| 方式 | 読み口 |
+|---|---|
+| スクリプトの位置 (`SCRIPT_DIR/..`) | plan.sh / dispatcher.sh / start.sh / kai-review.sh / lib_mux / lib_daemon_watch |
+| `CREWVIA_REPO_ROOT` | `lib_telegram.py` (:117) / `lib_irc_relay.py` (:215) |
+| `CREWVIA_REPO` | `hooks/lib_approval_channel.sh` (:16) |
+
+`crewvia.local.yaml` は git 管理外なので**主 checkout にしか存在しない**。Worker の hook は
+`${CLAUDE_PROJECT_DIR}/hooks/...` (= Worker の worktree)、QA の隔離 clone、worktree 内の kai-review から
+動くと、位置基準の読み口は worktree / clone 側の `config/` を見る。そこには local が無く、§3-6
+(「local なし = 共通だけ」でエラーにしない) により **mode・approval_channel が黙って共通値になる**。
+
+方針 (推奨):
+
+1. `lib_config.load_effective()` の local の読み先は、**主 checkout の `config/crewvia.local.yaml`** と定義する。
+   主 checkout は `git rev-parse --git-common-dir` の親で求める (worktree でも同じ答えになる)。git が使えない
+   場所 (git 管理外の配置) では `CREWVIA_REPO_ROOT` → スクリプトの位置の順に落とす。
+2. **共通 yaml は従来どおり呼び出し側の位置から読む** (worktree の `config/crewvia.yaml` は Worker のブランチの版。
+   既存の挙動を変えない)。local だけ主 checkout から読む。
+3. QA の隔離 clone は別 repo (`git-common-dir` が clone 自身) なので local は見えない。ここは意図どおり
+   (隔離のため)。ただし §6 のとおり、隔離 clone で「local なし」を黙って通す経路を、テストでは
+   固定の挙動として検査する。
+4. **黙って共通値になる経路を塞ぐ**: (a) 主 checkout に local があるのに worktree / hook から読めなかった
+   場合を検知できるよう、`lib_config` は `effective mode=… (source: local|common)` を返し、start.sh と
+   dispatcher の初回ログに出す。(b) `mode` と `approval_channel` は、`registry/mux/` の記録や稼働中のデーモンと
+   食い違う source=common のときに警告する (§5 の緩和と同じ仕組み)。(c) 読み口が env で repo root を
+   上書きできる形 (`CREWVIA_REPO` / `CREWVIA_REPO_ROOT`) は、`lib_config` に統一して**読み先の決め方を 1 か所**にする
+   (新しい config 位置 env は作らない — §8-5)。
+5. hook (`lib_approval_channel.sh`) は shell なので `lib_config.py get` を呼ぶ。読めないとき (§3 の表) は
+   承認できない側に倒す。worktree から呼んでも 1 の定義で主 checkout の local を見る。
 
 ## 3. 重ね方の仕様
 
@@ -105,14 +148,17 @@ grep) し、§2-A も「読めない → 既定値」に潰す読み口が多い
 
 ## 4. 上書きを許すキー: 全キー vs allowlist
 
-**推奨: allowlist (トップキー + 一部のサブキー単位)。許可外のキーは local にあると `Unreadable`。**
+**推奨: allowlist (トップキー単位)。許可外のキーは local にあると `Unreadable`。**
+
+サブキー単位の許可・除外は初期案では持たない (表はトップキーだけ)。`daemons` や `review` の中を細かく塞ぎたくなったら、
+表に `daemons.mutual_watch` のような行を足す形で後から広げる (広げる側は安全、狭める側は local を壊す)。
 
 理由:
 
 - typo (`mdoe:`) が黙って無視されるのが最も悪い失敗。allowlist なら「知らないキー」としてエラーにできる。
 - 「共有規則」(不変条件 5): dispatcher と plan.sh で答えが割れてはいけない値は機ごとに変えてはいけない。
   `attempts.*` (総試行数の上限) と `timeout_max_per_skill` (card 生成時に値が焼かれる) は機でずれると
-  同じ mission で挙動が割れる。**除外**する。
+  同じ mission で挙動が割れる。**除外**する (`attempts.max_total` は `lib_history.py` と plan.sh の 2 経路が読む — §2-A)。
 - 公開リポジトリとしては「local に何を書いてよいか」が文書化される。
 
 初期の allowlist (案):
@@ -178,8 +224,19 @@ PR を 3 本に分ける (積み上げは merge commit — stacked-pr-squash の
 | デーモン | 既存 | 値が反映 | スキップ + 一度だけ通知 + 回復で clear |
 
 既存テストが config をコピーする箇所 (`test_review_plan_*.sh` ほか 6 件) は、コピー先に local を置かない限り
-挙動不変。**テスト中は実機の local を読まない**ことを保証する: `lib_config` は repo_root 基準で読み、
-テストの隔離 repo には local が無い (実 repo の local を `CREWVIA_REPO_ROOT` 経由で拾わない)。
+挙動不変。**テスト中は実機の local を読まない**ことを保証する。「隔離 repo には local が無い」はスクリプトを
+コピーするテストにしか当てはまらない。主 checkout で実リポジトリの scripts を直接走らせるテスト
+(lib_mux の既定 config_path・plan.sh の REPO_ROOT など) は、何もしないと実機の local を読み、手元の pytest
+だけ結果が変わる。仕組み:
+
+- `lib_config` は **`CREWVIA_MUX_TEST_ISOLATION` が立っている間は local を読まない** (共通だけ)。この印は
+  `tests/conftest.py` が置く既存のもので、本番では立たない (CLAUDE.md の env 表)。local を読む挙動を
+  検査するテストだけが、明示的に `local_path=` を `lib_config` に渡す (env では上書きしない)。
+- bats / `scripts/test_*.sh` は env に印が無いので、コピー先の repo_root (§2-E の 1 で
+  `git-common-dir` が主 checkout を指さない一時 repo) に local を置かない限り読まない。主 checkout を
+  指す形のテストは作らない。
+- 保険として conftest が「実機の local が存在する」ことを検知しても**失敗はさせず**、印の効きを
+  確かめるテスト 1 本 (印あり = 実機に local があっても共通値) を PR-1 に入れる。
 
 ## 7. `registry/workers.yaml` の扱い
 
@@ -190,12 +247,22 @@ PR を 3 本に分ける (積み上げは merge commit — stacked-pr-squash の
 
 - **(a) 追跡解除 + `.gitignore` (推奨)** — `registry/workers/`・`registry/heartbeats/` と同じ扱いにする。
   `git rm --cached registry/workers.yaml`。ファイルが無い場合は `lib_registry.py` が空の名簿から作る
-  (`FileNotFoundError` 経路が既にある。:108)。ヘッダコメント (各欄の説明) は
+  (`FileNotFoundError` 経路が既にある。:107)。ヘッダコメント (各欄の説明) は
   `registry/workers.yaml.example` か knowledge に移す。
   **注意**: 「名前はポジション・歴代継承」(設計原則 3) があるので、名簿が消えると名前の継承が切れる。
-  移行時は**現在の内容を各機でそのまま残す** (`git rm --cached` はファイルを消さない)。
-  `git pull` で追跡解除コミットが来ると、ローカルの未コミット変更は残る (解除は index のみ)。ただし
-  merge 時に「追跡解除 vs 手元変更」で衝突することがあるので、先に `cp` で退避してから pull する。
+  `.gitignore` には既に `registry/workers.yaml` の行がある (追跡中なので効いていないだけ)。必要なのは
+  `git rm --cached registry/workers.yaml` のコミット 1 つ。
+
+  **機ごとに挙動が違う**:
+  - 追跡解除を**実行する機**: `git rm --cached` はファイルを消さない (index のみ)。
+  - 追跡解除のコミットを **pull で受け取る機**: `git pull` が**ワーキングツリーのファイルを削除する**
+    (手元に未コミット変更があれば衝突して pull が止まる)。放っておくと名簿が消え、名前の継承が切れる。
+  - 手順 (受け取る機): **退避 → pull → 退避から戻す**。
+    1. `cp registry/workers.yaml "$(mktemp -d)/workers.yaml"` で退避先を決めて退避する (退避先のパスを控える)。
+    2. 手元変更を `git checkout registry/workers.yaml` で捨てる (追跡中の最後の 1 回。退避済みなので失われない)。
+    3. `git pull` (または `sync-main-checkout.sh`)。ファイルが消える。
+    4. 退避から `registry/workers.yaml` に戻す。以後は `.gitignore` で無視される。
+  - この手順は `sync-main-checkout.sh` の移行メモにも入れる (PR-3)。
 - (b) 追跡のまま `skip-worktree` — 機ごとの設定で脆い (pull で外れる)。非推奨。
 - (c) 追跡のまま・共通は雛形だけ (名簿を空にして commit) — 機ごとの差は消えるが、今度は
   稼働のたびに diff が出る。解決していない。
@@ -234,7 +301,7 @@ telegram/IRC の認証情報の取り出し) が混在している。
 |---|---|---|---|
 | D1 | 共通 `mode:` の既定 | (a) hc のまま / (b) tmux に戻す / (c) キー無し = 起動拒否 | **(b)**。local 配布が揃ってから最後の PR で変更 |
 | D2 | 上書きキーの範囲 | 全キー / allowlist | **allowlist** (`attempts` / `timeout_max_per_skill` を除外、許可外キーはエラー) |
-| D3 | local が壊れたときの `lib_mux._config_mode()` | `lib_config` を import (restart 対象が増える) / mode だけ行走査 2 段 | **`lib_config` を import**。2 段にすると「壊れた local を共通に戻す」穴を 2 か所で守ることになる |
+| D3 | local が壊れたときの `lib_mux._config_mode()` | `lib_config` を import (restart 対象が増える) / mode だけ行走査 2 段 | **`lib_config` を import**。lib_mux は rex endpoint の読みで PyYAML を既に遅延 import している (:4172) ので依存は増えない。2 段にすると「壊れた local を共通に戻す」穴を 2 か所で守ることになる |
 | D4 | `registry/workers.yaml` | (a) 追跡解除 / (b) skip-worktree / (c) 雛形のみ | **(a)**。移行時は各機のファイルを退避してから pull |
 | D5 | local 変更の restart | digest 対象に含める / 含めず手動 + 検知(advisory) | **含めず手動**、検知は PR-3 以降の任意 |
 | D6 | PR 分割 | 1 本 / 3 本 | **3 本** (PR-1 lib、PR-2 移行、PR-3 運用)。積み上げは merge commit |
@@ -249,4 +316,4 @@ telegram/IRC の認証情報の取り出し) が混在している。
 - シェルの `awk '/^mux:/…'` は 2 段入れ子しか見られず、`mux:` の次の top-level キーでも止まらない読み口があった。
   `get` に置き換えたら該当テストを `get` 経由に書き直す。
 - 秘密は local にも**値を書かない** (`op://` 参照・ファイルパスだけ。既存の規則どおり)。`.example` にも値は入れない。
-- `.gitignore` の追加は `config/crewvia.local.yaml` の 1 行 (パターンで広げない — `config/*.yaml` を巻き込むと共通も外れる)。
+- `.gitignore` の追加は `config/crewvia.local.yaml` の 1 行 (`registry/workers.yaml` は既に載っている — §7) (パターンで広げない — `config/*.yaml` を巻き込むと共通も外れる)。

@@ -225,6 +225,9 @@ _IRC_CARRIED = {'_CREWVIA_IRC_RESOLVED_TOKEN': os.environ.pop('_CREWVIA_IRC_RESO
 _IRC_RESOLVE_REASON = os.environ.pop('_CREWVIA_IRC_RESOLVE_REASON', '') or 'no_credentials'
 
 from lib_mux import Mux, repo_identity_ok  # noqa: E402
+import lib_mux as _lib_mux_mod  # noqa: E402
+# テストが lib_mux を差し替えたフェイクにはこの名前が無い: 無ければ何も拾わない (空 tuple)
+_MuxConfigUnreadable = getattr(_lib_mux_mod, 'MuxConfigUnreadable', ())
 import lib_retirement  # noqa: E402
 # 「依存が満たされた」の定義は crewvia の中で 1 箇所しかない (t010 / QA t002 の
 # 指摘 F-2b)。ここに同じ規則のコピーを書き戻さないこと — plan.sh pull が割り当て
@@ -271,7 +274,31 @@ from lib_agent_name import shell_pasteable_agent_name_problem as _shell_pasteabl
 # 「ペインの裏で何かが走っているか」の定義 (watchdog の idle 判定と共有、B1 / #27)。
 # ここで /proc を読む分類を書き足さないこと — 2 か所に置くと答えが割れる。
 from lib_pane_process import classify_process_tree  # noqa: E402
-_mux = Mux()
+class _NoMux:
+    """config が読めず backend を選べないサイクル用の空の mux (PR-2 レビュー P2-1)。
+
+    `Mux()` が `MuxConfigUnreadable` を投げても、このサイクルは traceback で終わらず
+    `effective_config_readable()` の「見送り + 一度だけ通知」に届かせる。何も観測せず何も
+    しない: list は空・send / kill は失敗。割り当て・退役・kill には使わない (下の
+    サイクル本体は `_MUX_CONFIG_PROBLEM` があれば gate だけ走らせて終わる)。
+    通知は CREWVIA_MUX が env にあるときだけ Director に届く (無ければ Director 不在として見送る)。"""
+
+    def list(self, *a, **k):
+        return []
+
+    def send(self, *a, **k):
+        return False
+
+    def __getattr__(self, name):
+        raise RuntimeError('mux_unavailable: config unreadable')
+
+
+try:
+    _mux = Mux()
+    _MUX_CONFIG_PROBLEM = None
+except _MuxConfigUnreadable as _e:
+    _mux = _NoMux()
+    _MUX_CONFIG_PROBLEM = _e.code
 
 # t002: who may end a Worker process.  'watchdog' (default) = this daemon only
 # writes retirement markers and watchdog executes them; 'dispatcher' = the
@@ -3646,6 +3673,12 @@ def run_irc_cycle():
 # would otherwise take the observer down with it — at exactly the moment the
 # system is least healthy and most in need of it.
 run_daemon_watch()
+if _MUX_CONFIG_PROBLEM is not None:
+    # backend を選べない (config 壊れ・env に CREWVIA_MUX 無し)。割り当ても退役も kill もせず、
+    # 「見送り + 一度だけ通知」(effective_config_readable) だけ行って終わる。直れば次のサイクルで再開。
+    log(f'WARNING: mux backend を選べない (config unreadable: {_MUX_CONFIG_PROBLEM}) — このサイクルは見送る')
+    effective_config_readable()
+    sys.exit(0)
 check_main_checkout_drift()
 # Telegram は dispatch() の成否から独立させる (心拍 = `ask` が見る受信側の生存表明。dispatch が毎回落ちても止めない)
 run_telegram_cycle()

@@ -43,7 +43,13 @@ fi
 CONFIG_FILE="${CREWVIA_DIR}/config/crewvia.yaml"
 WORKER_MODEL_FROM_CONFIG=""
 # 共通 + マシン固有の local は lib_config が重ねて読む (壊れ・無しは空 = --model を付けない側)
-WORKER_MODEL_FROM_CONFIG="$(python3 "${SCRIPT_DIR}/lib_config.py" --root "${CREWVIA_DIR}" get worker_model 2>/dev/null || true)"
+# 壊れた local / 共通は止める (PR-2 レビュー P3-2。黙って --model なしで進めない)。key 無し (exit 2) は空のまま。
+_wm_rc=0
+WORKER_MODEL_FROM_CONFIG="$(python3 "${SCRIPT_DIR}/lib_config.py" --root "${CREWVIA_DIR}" get worker_model 2>/dev/null)" || _wm_rc=$?
+if [[ "$_wm_rc" -eq 1 ]]; then
+    echo "[review-plan.sh] ERROR: config/crewvia.local.yaml (または共通の config/crewvia.yaml) を読めません。直してから再実行してください" >&2
+    exit 1
+fi
 SELECTED_MODEL="$(python3 "${SCRIPT_DIR}/lib_model.py" resolve --config "$CONFIG_FILE" --skills plan_review)"
 if [[ -z "$SELECTED_MODEL" ]]; then
     SELECTED_MODEL="$WORKER_MODEL_FROM_CONFIG"

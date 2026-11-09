@@ -43,6 +43,8 @@ from typing import Literal, NamedTuple, Optional
 _SCRIPTS_DIR = Path(__file__).parent
 sys.path.insert(0, str(_SCRIPTS_DIR))
 from lib_mux import Mux, repo_identity_ok  # noqa: E402
+import lib_mux as _lib_mux_mod  # noqa: E402
+_MuxConfigUnreadable = getattr(_lib_mux_mod, 'MuxConfigUnreadable', ())   # フェイクの lib_mux には無い
 import lib_retirement  # noqa: E402
 import lib_daemon_watch  # noqa: E402
 # 「利用枠切れ」の画面の同定 (C2 / t005)。dispatcher の Rule 5 と共有する 1 か所の定義。
@@ -62,7 +64,14 @@ from lib_task_cards import (  # noqa: E402
     NotARegularFile, is_unreadable, list_task_cards, read_regular_text,
     read_regular_text_or_unreadable,
 )
-_mux = Mux()
+# PR-2 レビュー P2-1: config (local を含む) が壊れていて CREWVIA_MUX も無いと Mux() が
+# MuxConfigUnreadable を投げる。import で死なず、`run()` が「何も終了させずに待つ」。
+try:
+    _mux = Mux()
+    _MUX_CONFIG_PROBLEM = None
+except _MuxConfigUnreadable as _e:
+    _mux = None
+    _MUX_CONFIG_PROBLEM = _e.code
 
 __version__ = "2.1.0"
 
@@ -1668,6 +1677,27 @@ def _assert_repo_identity_or_exit(repo_root: Path) -> None:
     sys.exit(1)
 
 
+def _wait_for_readable_mux_config(interval: int) -> None:
+    """config が読めるまで待つ (Worker は 1 つも終了させない・監視もしない)。
+
+    読めるようになったら `_mux` を作って返る (D5: local の変更は restart 前提だが、
+    起動時に壊れていた場合の出口はファイルを直すだけにする)。
+    """
+    global _mux, _MUX_CONFIG_PROBLEM
+    last = None
+    while _MUX_CONFIG_PROBLEM is not None:
+        if _MUX_CONFIG_PROBLEM != last:
+            _log(f"WARNING: mux backend を選べない (config unreadable: {_MUX_CONFIG_PROBLEM}) — "
+                 f"何も終了させずに待つ。config/crewvia.local.yaml (または共通の config) を直すと再開する")
+            last = _MUX_CONFIG_PROBLEM
+        time.sleep(max(1, interval))
+        try:
+            _mux = Mux()
+            _MUX_CONFIG_PROBLEM = None
+        except _MuxConfigUnreadable as e:
+            _MUX_CONFIG_PROBLEM = e.code
+
+
 def run(repo_root: Path, interval: int) -> None:
     global _LOG_DIR, _OBSERVATION_LOG_FILE
     registry_dir = repo_root / "registry"
@@ -1679,6 +1709,8 @@ def run(repo_root: Path, interval: int) -> None:
     taskvia_url = os.environ.get("TASKVIA_URL", "https://taskvia.vercel.app")
     taskvia_token = os.environ.get("TASKVIA_TOKEN", "")
     queue_dir = Path(os.environ.get("CREWVIA_QUEUE", str(repo_root / "queue")))
+
+    _wait_for_readable_mux_config(interval)
 
     # Track active monitors: (slug, task_id) → WorkerMonitor
     monitors: dict[tuple[str, str], WorkerMonitor] = {}

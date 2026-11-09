@@ -247,13 +247,35 @@ spawn する）。待つべき操作は無く、`./crewvia` の 1 コマンド�
 
 ## 4. 切り替え後の確認（本書を実際に使う時に行うこと）
 
-1. **config の値ではなく、実際に書かれた record を見る**（3.3 の罠の裏取り）:
+1. **config の値ではなく、実際に書かれた record を見る**（3.3 の罠の裏取り）。`dispatcher.json` /
+   `watchdog.json` / `*-director.json` の 3 つだけでは `*-worker.json` を見落とす——**`registry/mux/*.json`
+   全件**を対象に、pane record の形（`backend` キーを持つもの。`*.state.json` / `*.job-since.json` は
+   持たないので自然に除外される）だけを拾い、**読めなかった record は黙って捨てず明示する**
+   （CLAUDE.md 不変条件 1 と同じ理由——`2>/dev/null` で揃って 0 件になる画と「herdr は 0 件」の画を
+   区別できないと、後者を前者と誤読しうる）:
    ```bash
-   for f in registry/mux/dispatcher.json registry/mux/watchdog.json registry/mux/*-director.json; do
-     python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(sys.argv[1], d.get('backend'), d.get('handle'))" "$f"
+   total=0; unreadable=0
+   for f in registry/mux/*.json; do
+     out=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(sys.argv[1],'->',d.get('backend'),d.get('handle')) if 'backend' in d else None" "$f" 2>&1)
+     rc=$?
+     if [ $rc -ne 0 ]; then
+       unreadable=$((unreadable+1))
+       echo "UNREADABLE: $f" >&2
+       echo "$out" >&2
+     elif [ -n "$out" ]; then
+       total=$((total+1))
+       echo "$out"
+     fi
    done
+   echo "pane records: $total, unreadable: $unreadable"
    ```
-   全部 `hc` と出ること。`herdr` のままなら 3.1 の罠（Phase 1 を飛ばした・Phase 2 だけで止めた）を疑う。
+   全部 `hc` と出て `unreadable: 0` であること。`herdr` の record が混じっていれば 3.1 の罠（Phase 1 を
+   飛ばした・Phase 2 だけで止めた）を疑う。`unreadable` が 0 でなければ、その record 自体が壊れている
+   か読めない——件数が合っているからといって「herdr record が無い」と即断しない。
+   （python を 1 行に収めているのは意図的——この手順は list の継続インデント付きの fenced code block の
+   中にあるため、複数行の python ソースを埋め込むと、インデントを保ったまま生テキストをコピーした場合に
+   `IndentationError` で壊れる。実測済み: 複数行版を書いて試したところ実際にこの壊れ方をした。1 行に
+   畳めば list のインデントは shell の行頭の空白として無害化される）
 2. `hc ls --all --json` で `dispatcher` / `watchdog` / `<director 名>-director` / 必要なら
    `<worker 名>-worker` の `name`（小文字化形。設計書 §3.3）が `state:"live"` で見えること。
 3. Worker を 1 人 `start.sh` で起動し、`CREWVIA_MUX=hc python3 scripts/lib_mux.py list -worker` に
@@ -348,9 +370,11 @@ hc への切り替え後も「herdr server が生きていれば」そのまま�
 
 - **実行日**: 2026-11-09。herdr → hc への本番切り替えを実施した（mission
   `20261109-hc-production-switch`）。
-- **切り替え後に backend を確認する正しい手順**（4節の手順1をそのまま使った）:
+- **切り替え後に backend を確認する正しい手順**（4節の手順1を改変して使った——当時の4節は
+  `dispatcher.json`/`watchdog.json`/`*-director.json` の3件だけを見る形で、`*-worker.json` を
+  含む全件確認ではなかった。この差分は後に4節側へ反映した）:
   `config/crewvia.yaml` の `mode:` の値では判断しない——**`registry/mux/*.json` の
-  `"backend"` を実際に読む**。本書作成時点と同じ 1 行の python で、pane record（`handle`/
+  `"backend"` を実際に読む**。本書作成時点と同じ複数行の python で、pane record（`handle`/
   `backend`/`server` を持つ形）全件を確認する:
   ```bash
   for f in registry/mux/*.json; do

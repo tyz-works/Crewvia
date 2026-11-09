@@ -1458,6 +1458,63 @@ def sweep_spawn_grace_markers():
             log(f"WARNING: failed to sweep spawn-grace marker {marker}: {e}")
 
 
+def sweep_rule5_state_markers():
+    """Drop Rule 5 grace-tracking markers for agent names whose Worker window
+    is gone (t020).
+
+    `check_rule5()` / `handle_usage_limit()` write `.state.json` /
+    `.job-since.json` / `.usage-limit.json` under `STATE_JSON_DIR`, keyed by
+    bare agent name — but both only run for names `tmux_list_worker_windows()`
+    returns in the *current* dispatch() cycle. Unlike `.firstseen` (cleaned by
+    `tmux_kill_window()` on every dispatcher-initiated kill, and by
+    `sweep_spawn_grace_markers()` here for every other case), nothing ever
+    unlinks these once a name's window is gone for good — watchdog killed it,
+    it crashed, `benchmark-ctx.sh` killed it directly, or the name is simply
+    not reused. The entry is then frozen forever. Observed in production:
+    `registry/mux/Hugo.state.json` / `Chiara.state.json` still read
+    `{"state": "working", "since": <a week-old epoch>}` with no such pane
+    (mission 20261109-codex-hc, t020).
+
+    This is cosmetic bookkeeping cleanup, not a safety-relevant decision:
+    `check_rule5()`'s own `st = _mux.state(target)` always asks the mux live,
+    and dispatch()'s task-assignment loop keys off
+    `tmux_list_worker_windows()` / `registry/workers.yaml` / live heartbeats —
+    none of them read these files (confirmed: grep shows `_load_state_entry` /
+    `_load_job_since` / `_load_usage_limit` have exactly one reader each, all
+    inside Rule 5's own notify-debounce logic). Dropping a stale marker only
+    means the grace timer restarts from scratch if that name's window ever
+    reappears — the same safe direction `sweep_spawn_grace_markers()` leans.
+
+    Keyed on the window being absent, not on any one kill path succeeding —
+    same shape as `sweep_spawn_grace_markers()`, living beside it for the same
+    reason: this daemon owns `registry/mux/`.  Never raises; a failure here is
+    a log line, never a failed cycle.
+    """
+    try:
+        markers = (list(STATE_JSON_DIR.glob('*.state.json'))
+                   + list(STATE_JSON_DIR.glob('*.job-since.json'))
+                   + list(STATE_JSON_DIR.glob('*.usage-limit.json')))
+    except OSError:
+        return
+    if not markers:
+        return
+    live = {w['agent_name'] for w in tmux_list_worker_windows()}
+    for marker in markers:
+        fname = marker.name
+        name = None
+        for suffix in ('.state.json', '.job-since.json', '.usage-limit.json'):
+            if fname.endswith(suffix):
+                name = fname[:-len(suffix)]
+                break
+        if name is None or name in live:
+            continue
+        try:
+            marker.unlink(missing_ok=True)
+            log(f"[rule5] swept stale marker for vanished worker {name!r}: {marker.name}")
+        except OSError as e:
+            log(f"WARNING: failed to sweep rule5 state marker {marker}: {e}")
+
+
 def sweep_stale_pane_records():
     """Drop `registry/mux/<name>.json` records whose pane no longer exists (t001).
 
@@ -3625,11 +3682,12 @@ publish_agents()
 dispatch()
 # CI の見える化は dispatch() の成否から独立させる (early return のサイクルでも回す)
 run_ci_poll()
-# t002: both are queue/registry bookkeeping, not dispatch decisions, and both
-# must run on every cycle — including the early-return cycles dispatch() takes
-# when there are no active missions.
+# t002 (t020 added the third): all three are queue/registry bookkeeping, not
+# dispatch decisions, and all three must run on every cycle — including the
+# early-return cycles dispatch() takes when there are no active missions.
 sweep_spawn_grace_markers()
 sweep_stale_pane_records()
+sweep_rule5_state_markers()
 if KILL_AUTHORITY != 'dispatcher':
     warn_on_unconsumed_retirements()
 PYEOF

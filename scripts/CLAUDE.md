@@ -322,6 +322,11 @@ lib ごとの**破ってはいけない契約**の要約。理由・経緯・全
   上限までに記録されなければ失敗として積む（`lib_daemon_watch.py wait-heartbeat`）。
 - 台帳・拒否記録は**消してよい**（無い = 再通知 / 拒否されていない）。通知が届かない・review が動かないときの
   手当てはそのファイルを消すこと（dispatcher の再起動は不要。`knowledge/notify-once.md`「戻し方」）。
+- Rule 5 の grace マーカー（`registry/mux/<name>.state.json` / `.job-since.json` / `.usage-limit.json`）は、
+  名前の窓が消えて二度と現れなくなると、`.firstseen` と違って誰も消さず永久に凍結されていた
+  （割り当て判断には使われない表示専用の値だが、観測事実としては事故の土台だった）。
+  `sweep_rule5_state_markers()`（`sweep_spawn_grace_markers()` と同じ「窓の不在」判定・dispatcher 専任・毎 cycle）
+  で掃除する（t020。`knowledge/rule5-state-marker-sweep.md`）。
 
 ## CI の見える化（`lib_ci_status.py`。設計 `knowledge/ci-status.md`）
 

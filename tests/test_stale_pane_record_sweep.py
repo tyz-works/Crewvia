@@ -589,6 +589,10 @@ ALLOWED_DELETIONS = {
     ("dispatcher.sh", "_save_usage_limit", "path.unlink(missing_ok=True)"):
         "Rule 5 の利用枠切れの記録 (`<name>.usage-limit.json`、C2 / t005)。kill の認可の証拠"
         "(`<name>.json` / `<name>-worker.json`) ではなく、利用枠切れが解消したときの自己クリアのみ",
+    ("dispatcher.sh", "sweep_rule5_state_markers", "marker.unlink(missing_ok=True)"):
+        "Rule 5 の grace 追跡マーカー (`<name>.state.json` / `.job-since.json` / "
+        "`.usage-limit.json`、t020) のうち、窓が消えた名前の分。kill の認可の証拠 "
+        "(`<name>.json` / `<name>-worker.json`) ではなく、通知の debounce 用タイマーのみ",
     ("dispatcher.sh", "save_told", "os.replace(tmp, TOLD_FILE)"):
         "notified-state 台帳 (`registry/daemons/notified-state.json`) の temp + os.replace による"
         "原子的な書き込み。置換先は `TOLD_FILE` の 1 つに固定で、registry/mux の記録ではない",
@@ -940,3 +944,94 @@ def test_the_dispatcher_sweep_can_never_fail_a_cycle():
             raise RuntimeError("mux exploded")
     _sweep_function(Broken(), lines.append)()   # 例外を出さない
     assert any("sweep failed" in l for l in lines)
+
+
+# ---------------------------------------------------------------------------
+# Rule 5 grace マーカー (`.state.json` / `.job-since.json` / `.usage-limit.json`)
+# の掃除 (t020) — registry/mux/Hugo.state.json が窓の無いまま working で固まって
+# いた事故 (mission 20261109-codex-hc) の再発防止。Rule 5 自体は `check_rule5()`
+# の `_mux.state(target)` を毎回ライブに読むので割り当て判断には効かないが、
+# 窓が消えた名前の掃除者が居なかった (`.firstseen` と違い `tmux_kill_window()` も
+# 消さない) ため、消えた Worker のマーカーが永久に残っていた。
+# ---------------------------------------------------------------------------
+
+def _rule5_sweep_function(state_dir, live_names, log):
+    src, tree = _dispatcher_embedded()
+    fn = next(n for n in tree.body
+              if isinstance(n, ast.FunctionDef) and n.name == "sweep_rule5_state_markers")
+    ns = {
+        "STATE_JSON_DIR": state_dir,
+        "tmux_list_worker_windows": lambda: [
+            {"agent_name": n, "window_target": f"{n}-worker"} for n in live_names
+        ],
+        "log": log,
+    }
+    exec(compile(ast.Module(body=[fn], type_ignores=[]), "dispatcher-rule5-sweep", "exec"), ns)
+    return ns["sweep_rule5_state_markers"]
+
+
+def test_the_dispatcher_cycle_calls_the_rule5_sweep():
+    src, tree = _dispatcher_embedded()
+    top_calls = [n.value.func.id for n in tree.body
+                 if isinstance(n, ast.Expr) and isinstance(n.value, ast.Call)
+                 and isinstance(n.value.func, ast.Name)]
+    assert "sweep_rule5_state_markers" in top_calls, \
+        "dispatcher の cycle が Rule 5 state マーカーの掃除を呼んでいない"
+    # dispatch() の後ろ (早期 return する cycle でも走る)。他の 2 つの掃除と同じ隣
+    assert top_calls.index("sweep_rule5_state_markers") > top_calls.index("dispatch")
+
+
+def test_rule5_sweep_drops_state_marker_for_a_vanished_worker(tmp_path):
+    """事故の再現: 窓の無い名前の `.state.json` は掃除で消える。"""
+    (tmp_path / "Hugo.state.json").write_text(
+        json.dumps({"state": "working", "since": 1793590252}), encoding="utf-8")
+    sweep = _rule5_sweep_function(tmp_path, live_names=[], log=lambda *_: None)
+    sweep()
+    assert not (tmp_path / "Hugo.state.json").exists()
+
+
+def test_rule5_sweep_keeps_the_marker_for_a_live_worker(tmp_path):
+    """同じ名前でも窓が生きていれば消さない (安全側)。"""
+    (tmp_path / "Seo.state.json").write_text(
+        json.dumps({"state": "working", "since": time.time()}), encoding="utf-8")
+    sweep = _rule5_sweep_function(tmp_path, live_names=["Seo"], log=lambda *_: None)
+    sweep()
+    assert (tmp_path / "Seo.state.json").exists()
+
+
+def test_rule5_sweep_drops_job_since_and_usage_limit_markers_too(tmp_path):
+    (tmp_path / "Hugo.job-since.json").write_text(
+        json.dumps({"job_since": 1.0}), encoding="utf-8")
+    (tmp_path / "Hugo.usage-limit.json").write_text(
+        json.dumps({"first_seen": 1.0}), encoding="utf-8")
+    sweep = _rule5_sweep_function(tmp_path, live_names=[], log=lambda *_: None)
+    sweep()
+    assert not (tmp_path / "Hugo.job-since.json").exists()
+    assert not (tmp_path / "Hugo.usage-limit.json").exists()
+
+
+def test_rule5_sweep_leaves_unrelated_registry_files_alone(tmp_path):
+    """`.firstseen` / spawn 記録 (`<name>-worker.json`) は別の掃除者の持ち物 —
+    ここでは触らない (glob は 3 つの拡張子だけ)。"""
+    (tmp_path / "Hugo.firstseen").write_text("", encoding="utf-8")
+    (tmp_path / "Hugo-worker.json").write_text("{}", encoding="utf-8")
+    sweep = _rule5_sweep_function(tmp_path, live_names=[], log=lambda *_: None)
+    sweep()
+    assert (tmp_path / "Hugo.firstseen").exists()
+    assert (tmp_path / "Hugo-worker.json").exists()
+
+
+def test_rule5_sweep_logs_what_it_dropped(tmp_path):
+    (tmp_path / "Hugo.state.json").write_text("{}", encoding="utf-8")
+    lines = []
+    sweep = _rule5_sweep_function(tmp_path, live_names=[], log=lines.append)
+    sweep()
+    assert len(lines) == 1 and "Hugo" in lines[0]
+
+
+def test_rule5_sweep_can_never_fail_a_cycle():
+    class Broken:
+        def glob(self, pattern):
+            raise OSError("boom")
+    sweep = _rule5_sweep_function(Broken(), live_names=[], log=lambda *_: None)
+    sweep()  # 例外を出さない

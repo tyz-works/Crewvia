@@ -91,3 +91,6 @@ registry/benchmarks/**/*.json
 
 # Worker per-task worktrees (gitignored, managed by scripts/git-helpers.sh)
 .claude/worktrees/
+
+# マシン固有の設定の上書き (git 管理外。設計: knowledge/machine-local-config.md)
+config/crewvia.local.yaml

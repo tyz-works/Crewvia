@@ -1,0 +1,18 @@
+# config/crewvia.local.yaml.example — マシン固有の上書きの例。
+# cp config/crewvia.local.yaml.example config/crewvia.local.yaml して、このマシンの値だけを残す。
+# crewvia.local.yaml は git 管理外。共通の config/crewvia.yaml に重ねて読まれる。
+#
+# - 書いてよいトップキーは scripts/lib_config.py の ALLOWED_KEYS だけ。
+#   attempts / timeout_max_per_skill と知らないキーは、あると読み込みが失敗する (fail-closed)。
+# - dict は深くマージ、list / scalar は置換、`key: null` で共通の値を消す。
+# - 秘密の値は書かない。op:// 参照・リポジトリ外のファイルパスだけ。
+
+# mode: rex
+
+# telegram:
+#   credentials:
+#     source: op
+#     ref: op://<vault>/<item>/<field>
+
+# irc:
+#   enabled: false

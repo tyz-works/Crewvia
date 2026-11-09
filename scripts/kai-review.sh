@@ -578,7 +578,7 @@ if ! REVIEW_CFG="$(python3 "${SCRIPT_DIR}/lib_review_engine.py" get \
 fi
 { IFS= read -r REVIEW_ENGINE; IFS= read -r AGY_MODEL; IFS= read -r AGY_TIMEOUT
   IFS= read -r CURSOR_MODEL; IFS= read -r CURSOR_TIMEOUT; IFS= read -r REVIEW_COMPARE
-  IFS= read -r CLAUDE_MODEL; IFS= read -r CLAUDE_TIMEOUT; } <<<"$REVIEW_CFG"
+  IFS= read -r CLAUDE_MODEL; IFS= read -r CLAUDE_TIMEOUT; IFS= read -r CODEX_TIMEOUT; } <<<"$REVIEW_CFG"
 _info "Review engine: ${REVIEW_ENGINE}"
 if [[ "$REVIEW_ENGINE" == codex || "$REVIEW_ENGINE" == both ]] && ! command -v codex &>/dev/null; then
   fail_needs_director "NEEDS FIX: codex command not found on this machine"
@@ -588,10 +588,18 @@ fi
 # -C "$REVIEW_WT" で作業ディレクトリを指定する (codex が周辺コードを読む際の cwd)。
 # --sandbox read-only: レビューは書き込みを必要としないため、誤って
 # ファイルを変更されるリスクを構造的に無くす。
+# timeout (t009): codex 本体が応答しない・無言で座り込む場合、他の 3 エンジン (agy / cursor / claude)
+# と違って上限が無く、watchdog の timeout.max (review card は 7200 秒) まで無言で座り続けていた
+# (t007/Seo が PR #352 レビューで発見)。cursor / claude と同じ書き方 (timeout --kill-after) で揃える:
+# SIGTERM を codex が無視しても、この秒数の後に SIGKILL (--kill-after)。パイプライン
+# (`| tee`) の下で timeout を使うので、set -o pipefail (冒頭) で exit code がそのまま伝わる
+# (timeout 自体は 124 / --kill-after で落ちたときは 137。どちらも非ゼロは CODEX FAILURE に
+# 倒れて fail_needs_director = fail-closed。LGTM には絶対に倒れない)。
+CODEX_KILL_AFTER_SECONDS=10
 run_codex_review() {
-  _info "Running codex exec -C ${REVIEW_WT} --output-schema ... ${MODEL:+-m $MODEL} (diff=${DIFF_BYTES} bytes) ..."
+  _info "Running codex exec -C ${REVIEW_WT} --output-schema ... ${MODEL:+-m $MODEL} (diff=${DIFF_BYTES} bytes, timeout=${CODEX_TIMEOUT}s) ..."
   CODEX_EXIT=0
-  printf '%s' "$DIFF_CONTENT" | codex exec -C "$REVIEW_WT" \
+  printf '%s' "$DIFF_CONTENT" | timeout --kill-after="${CODEX_KILL_AFTER_SECONDS}s" "${CODEX_TIMEOUT}s" codex exec -C "$REVIEW_WT" \
     --sandbox read-only \
     --output-schema "$SCHEMA_FILE" \
     ${MODEL:+-m "$MODEL"} \

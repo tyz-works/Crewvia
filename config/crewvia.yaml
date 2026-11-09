@@ -268,6 +268,10 @@ attempts:
 # 設計・実測: knowledge/agy-review.md / knowledge/cursor-review.md / knowledge/claude-review.md
 review:
   engine: codex
+  # codex exec は他の 3 エンジン (agy / cursor / claude) と違い、t009 までは timeout に
+  # 包まれていなかった (t007/Seo が PR #352 レビューで発見)。cursor / claude と同じ水準
+  # (900 秒) に揃える。
+  codex_timeout_seconds: 900
   # 旧値 gemini-4-argon-high は agy に存在せず ensemble が fail-closed していた
   # (t005 / 20261102-pr-task-line)。`agy models` の実在 ID に合わせてある。
   # 既定の本番のレビュー先は codex。agy は engine: agy / ensemble / compare で使われる。

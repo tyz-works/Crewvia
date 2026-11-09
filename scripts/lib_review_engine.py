@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """scripts/lib_review_engine.py — kai-review.sh のレビュー先 (codex / agy / claude / both / ensemble + 比較用の cursor) の設定の読み口。
 
-`config/crewvia.yaml` の `review:` ブロック（`engine` / `agy_model` / `agy_timeout_seconds` /
+`config/crewvia.yaml` の `review:` ブロック（`engine` / `codex_timeout_seconds` / `agy_model` / `agy_timeout_seconds` /
 `cursor_model` / `cursor_timeout_seconds` / `claude_model` / `claude_timeout_seconds` / `compare`）を、
 `lib_task_cards` の入口で読む。env `CREWVIA_REVIEW_ENGINE` は engine だけを上書きする。
 
@@ -15,8 +15,9 @@
   cursor-agent は worktree の外を読み（`--sandbox` でも止まらない）、出力の schema を強制できない（自由文から JSON を拾う）ので、
   判定に使うと誤読が LGTM になりうる。`compare` に置くだけなら誤読しても併記が狂うだけ。
 - cursor_model は `claude-fable-*`（Cursor の一覧で NO ZDR = データ保持の契約外）を拒否する。括弧付きパラメータ `[a=b,c=d]` は許す。
-- CLI: `lib_review_engine.py get --config <path>` が 8 行（engine / agy_model / agy_timeout_seconds /
-  cursor_model / cursor_timeout_seconds / compare をカンマ区切り / claude_model / claude_timeout_seconds）を stdout に出す。
+- CLI: `lib_review_engine.py get --config <path>` が 9 行（engine / agy_model / agy_timeout_seconds /
+  cursor_model / cursor_timeout_seconds / compare をカンマ区切り / claude_model / claude_timeout_seconds /
+  codex_timeout_seconds）を stdout に出す。
   `fingerprint --root <dir>` は stdin の `git status -z` から木の指紋 (ignored を含む) を出す。
   `extract-cursor` は cursor-agent の JSON 出力から findings を取り出して schema で検証する（fail-closed）。
   `extract-claude` は `claude -p --output-format json --json-schema` の出力から structured_output を取り出して検証する（fail-closed）。
@@ -46,6 +47,7 @@ ENGINES = ('codex', 'agy', 'claude', 'both', 'ensemble')   # cursor は判定に
 COMPARE_ENGINES = ('agy', 'cursor', 'claude')
 DEFAULT_COMPARE = ('agy',)
 DEFAULT_ENGINE = 'codex'
+DEFAULT_CODEX_TIMEOUT_SECONDS = 900
 DEFAULT_AGY_MODEL = 'gemini-3.8-flash-high'
 DEFAULT_AGY_TIMEOUT_SECONDS = 600
 DEFAULT_CURSOR_MODEL = 'grok-4.7-high'
@@ -152,6 +154,8 @@ def load_full(config_path, environ=None):
 
     return {
         'engine': engine,
+        'codex_timeout': _timeout(block, 'codex_timeout_seconds', DEFAULT_CODEX_TIMEOUT_SECONDS,
+                                   'bad_codex_timeout'),
         'agy_model': model,
         'agy_timeout': _timeout(block, 'agy_timeout_seconds', DEFAULT_AGY_TIMEOUT_SECONDS, 'bad_agy_timeout'),
         'cursor_model': cursor_model,
@@ -565,6 +569,7 @@ def main(argv=None):
     print(','.join(c['compare']))
     print(c['claude_model'])
     print(c['claude_timeout'])
+    print(c['codex_timeout'])
     return 0
 
 

@@ -66,6 +66,9 @@ setup_fake_env() {
   cp "$CREWVIA_LAUNCHER" "${FAKE_DIR}/crewvia"
   chmod +x "${FAKE_DIR}/crewvia"
 
+  # config の読み口 (lib_config.py と、その依存の lib_task_cards.py) は本物を置く (crewvia は python3 lib_config.py を呼ぶ)
+  cp "${REPO_ROOT}/scripts/lib_config.py" "${REPO_ROOT}/scripts/lib_task_cards.py" "${FAKE_DIR}/scripts/"
+
   # scripts/start.sh をスタブに置換: 受け取った env と引数をログに書くだけ。
   # 実際の Worker/Director 起動は一切行わない。
   cat > "${FAKE_DIR}/scripts/start.sh" <<'FAKESCRIPT'

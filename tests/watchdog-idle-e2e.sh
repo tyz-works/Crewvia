@@ -87,6 +87,8 @@ cp "$SRC_DIR/scripts/lib_usage_limit.py" "$ROOT/scripts/lib_usage_limit.py"
 # E4a (01c): lib_retirement は退役 marker に書く試行の ID を lib_execution.attempt_view で読む。
 cp "$SRC_DIR/scripts/lib_execution.py" "$ROOT/scripts/lib_execution.py"
 cp "$SRC_DIR/scripts/lib_task_status.py" "$ROOT/scripts/lib_task_status.py"
+# PR-2 (machine-local-config): lib_daemon_watch.load_config は lib_config 経由で config を読む。
+cp "$SRC_DIR/scripts/lib_config.py" "$ROOT/scripts/lib_config.py"
 
 # claude 本体 / MCP サーバー相当を模す偽バイナリ (中身は sh / sleep のまま
 # 機能する)。t074 以降、分類は comm を見ないのでこの名前自体は判定に効かない

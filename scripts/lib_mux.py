@@ -4783,14 +4783,36 @@ def rex_ensure_server(wait_seconds: float = 10.0):
                   "variables may be inherited by every pane)")
 
 
+#: Tail window to search for the live `❯` prompt, and the max span of the box
+#: below it — mirrors `lib_irc_relay._PROMPT_WINDOW` / `_BOX_MAX_LINES` (same
+#: window, same direction). t015 P2: scanning the *whole* screen for the
+#: first rule pair from the top picked up a stale, empty box still sitting
+#: higher in the scrollback (e.g. a previous redraw) whenever one was on
+#: screen above the live box — reporting "empty" (sent) while the live box
+#: further down still held unsent text. Searching the tail for the *last*
+#: `❯` finds the one live box instead.
+_REX_PROMPT_WINDOW = 12
+_REX_BOX_MAX_LINES = 8
+
+
 def _rex_input_box(screen: str):
     """The lines of Claude Code's input box (between the two rules), or None."""
     lines = screen.splitlines()
-    rules = [i for i, l in enumerate(lines)
-             if len(l) >= 20 and set(l.strip()) == {"─"}]
-    for a, b in zip(rules, rules[1:]):
-        if b > a + 1 and lines[a + 1].startswith("❯"):
-            return lines[a + 1:b]
+    tail_start = max(0, len(lines) - _REX_PROMPT_WINDOW)
+    prompt = None
+    for i in range(len(lines) - 1, tail_start - 1, -1):
+        if lines[i].startswith("❯"):
+            prompt = i
+            break
+    if prompt is None or prompt == 0:
+        return None
+    rule_above = lines[prompt - 1]
+    if not (len(rule_above) >= 20 and set(rule_above.strip()) == {"─"}):
+        return None
+    for j in range(prompt + 1, min(len(lines), prompt + 1 + _REX_BOX_MAX_LINES + 1)):
+        line = lines[j]
+        if len(line) >= 20 and set(line.strip()) == {"─"}:
+            return lines[prompt:j]
     return None
 
 

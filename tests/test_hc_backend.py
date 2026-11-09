@@ -544,6 +544,20 @@ def test_verify_sent_false_while_text_is_still_in_the_hc_input_box(fake):
     assert lib_mux.Mux(backend=backend()).verify_sent("Omar-worker", msg) is False
 
 
+# t015 P2 (PR #359 の差し戻し): _rex_input_box() は画面の先頭から最初の罫線ペアを採っていたため、
+# 画面の上の方に古い空の枠 (前の再描画の残骸) が残っていると、それを「入力欄」と誤認し、下の生きた
+# 枠にまだ残っている本文を見落として「届いた」と誤判定していた (Seo が実装を動かして確認した真理値
+# 表)。末尾の窓から最後の `❯` を探す向きに直し、生きた枠だけを見るようにした。
+def test_verify_sent_false_when_a_stale_empty_box_sits_above_the_live_hc_box(fake):
+    msg = "ミッション開始。plan status で状態を確認し、タスク分解を開始してください。"
+    screen = (f"{_HC_RULE}\n❯ \n{_HC_RULE}\n"
+              "some task output\nmore output\n"
+              f"{_HC_RULE}\n❯ {msg}\n{_HC_RULE}\n")
+    fake.set([{"match": ["read"], **ok(out=json.dumps(
+        {"complete": True, "how": "history", "text": screen}))}])
+    assert lib_mux.Mux(backend=backend()).verify_sent("Omar-worker", msg) is False
+
+
 def test_hc_key_names_and_the_other_backends_are_unchanged():
     assert lib_mux._KEY_COLUMNS["hc"] == lib_mux._KEY_COLUMNS["herdr"]
     assert lib_mux._KEY_COLUMNS["tmux"] == 0

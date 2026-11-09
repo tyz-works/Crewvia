@@ -548,6 +548,19 @@ def test_verify_sent_false_while_text_is_still_in_the_input_box():
     assert _verify_backend("").verify_sent("w", msg) is False
 
 
+# t015 P2 (PR #359 の差し戻し): _rex_input_box() が画面の先頭から最初の罫線ペアを採っていたため、
+# 画面の上の方に残った古い空の枠を「入力欄」と誤認し、下の生きた枠にまだ残っている本文を見落として
+# いた (Seo の真理値表)。末尾の窓から最後の `❯` を探す (lib_irc_relay.input_box_state() と同じ窓・
+# 同じ向き) ことで、生きた枠だけを見るようにした。
+def test_verify_sent_false_when_a_stale_empty_box_sits_above_the_live_one():
+    msg = "ミッション開始。plan status で状態を確認し、タスク分解を開始してください。"
+    stale_empty_box = f"{_RULE}\n❯ \n{_RULE}\n"
+    filler = "some task output\nmore output\n"
+    live_box_with_text = f"{_RULE}\n❯ {msg}\n{_RULE}\n"
+    screen = stale_empty_box + filler + live_box_with_text
+    assert _verify_backend(screen).verify_sent("w", msg) is False
+
+
 def test_mux_verify_sent_delegates_to_rex_backend_on_the_production_path():
     """CLI は Mux().verify_sent を呼ぶ。Rex の入力欄判定に委譲されること。"""
     msg = "ミッション開始。plan status で状態を確認し、タスク分解を開始してください。"

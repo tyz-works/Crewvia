@@ -97,10 +97,13 @@ mode: hc  # 戻す時は herdr。切替日: 2026-11-09
 
 # ===== mux 設定 =====
 mux:
-  # Rule 5 (herdr モードのみ): Worker の agent_status が blocked または
+  # Rule 5 (mux backend 非依存): Worker の agent_status が blocked または
   # idle-with-task (idle/done かつ assignment ファイルあり) の状態が
   # この秒数連続して続いたとき、Director に通知する。
-  # tmux モードでは agent_status が取得できないため、この設定は使用されない。
+  # agent_status は mux の state() 経由で取る。herdr / rex / hc は実装を持つ
+  # (HcBackend.state() あり。PR #350 は hc の error 状態を Rule 5 に扱わせた変更)。
+  # tmux の state() は常に "unknown" を返す (画面越しの状態取得手段が無い) ため、
+  # tmux モードではこの設定は使用されない。
   #
   # 環境変数での上書き: CREWVIA_STATE_GRACE=<秒数>
   state_grace_seconds: 60

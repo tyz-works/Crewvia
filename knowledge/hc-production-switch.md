@@ -166,10 +166,12 @@ grep -l '"backend"' registry/mux/*.json 2>/dev/null   # 何も出なければ OK
 （`crewvia-stop.sh` の出力に理由が出る——大抵は「foreign だと判定された」か「herdr に到達できなかった」。
 決着のつけ方は 2 つ: ① `scripts/crewvia-stop.sh --force` をもう一度実行する（上で既に打ったのと同じ
 コマンド——べき等で、まだ残っている名前だけが対象になる）。② 個別に
-`python3 scripts/lib_mux.py kill <name> --force` を打つ（`--force` は `lib_mux.py` 自身のオプション
-——`crewvia-stop.sh:32` が内部で呼んでいるのと同じ形。実測（`CREWVIA_MUX_TEST_ISOLATION=1 python3
-scripts/lib_mux.py kill`）: `Usage: lib_mux.py kill <name> [--force]`（`scripts/lib_mux.py:6436`）、
-exit 2）。
+`python3 scripts/lib_mux.py kill <name> --force` を打つ（`--force` は `lib_mux.py` 自身のオプションで、
+`m.kill(..., allow_foreign=True)` になる——`scripts/lib_mux.py:6433`/`:6438`。実測
+（`CREWVIA_MUX_TEST_ISOLATION=1 python3 scripts/lib_mux.py kill`）: `Usage: lib_mux.py kill <name> [--force]`
+（`scripts/lib_mux.py:6436`）、exit 2）。`crewvia-stop.sh` が内部で呼ぶ `kill_tab()`（`scripts/crewvia-stop.sh:116`）
+は `--force` を**付けない**ので、①と②は非対称——**foreign と判定されて残った pane は①を何度打っても
+決着しない（②を使うこと）。①が効くのは「一時的に herdr に到達できなかった」側だけ**。
 **`lib_daemon_watch.py restart` はここでは使わない**——理由は 2 つ。(a) `restart` の CLI は
 `name` の `choices=DAEMONS`（`dispatcher`/`watchdog` だけ、`:1846`）で、`*-director` / `*-worker` の
 名前はそもそも受け付けられず弾かれる。(b) `dispatcher` / `watchdog` 自身に対してでも、この時点では

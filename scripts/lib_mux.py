@@ -79,6 +79,7 @@ from lib_task_cards import (  # noqa: E402
     is_unreadable, is_missing, read_regular_text_or_unreadable,
 )
 # JSON の状態ストアを読む入口も 1 つ (t026)。
+import lib_config  # noqa: E402
 from lib_daemon_state import load_json_store  # noqa: E402
 
 # ---------------------------------------------------------------------------
@@ -293,38 +294,33 @@ def repo_identity_ok(repo_root) -> bool:
         return False
 
 
+class MuxConfigUnreadable(RuntimeError):
+    """共通 / local の config が読めない (壊れた local を共通の値に黙って戻さない = lib_config)。
+    `code` は固定コード + 位置だけ。`_config_mode()` が投げる (`None` = tmux に落ちる、にはしない)。"""
+
+    def __init__(self, code):
+        super().__init__(code)
+        self.code = code
+
+
 def _config_mode(config_path: Optional[Path] = None) -> Optional[str]:
-    """Read `mode:` key from config/crewvia.yaml relative to this script's repo root.
+    """`mode:` of the effective config (config/crewvia.yaml + the machine-local override).
 
-    `config_path` overrides the file read — only ever passed by tests; every
-    real caller uses the default (this script's own repo root).
+    `config_path` overrides the file read — only ever passed by tests (that
+    file alone, no local overlay); every real caller uses the default.
 
-    Returns "tmux", "herdr", "rex", "inline", or None if not found / unreadable.
+    Returns "tmux", "herdr", "rex", "hc", "inline", or None if `mode:` is
+    absent / not an allowed value.  An unreadable config (including a broken
+    local override) raises `MuxConfigUnreadable` — never None, which would
+    silently fall to TmuxBackend (t016's accident shape).  The parsing (inline
+    comments, quotes) is PyYAML's, via lib_config.
     """
-    if config_path is None:
-        script_dir = Path(__file__).parent
-        config_path = script_dir.parent / "config" / "crewvia.yaml"
-    try:
-        text = read_regular_text_or_unreadable(config_path)
-        if is_unreadable(text):
-            return None
-        for line in text.splitlines():
-            stripped = line.strip()
-            if stripped.startswith("mode:") and not stripped.startswith("#"):
-                value = stripped.split(":", 1)[1]
-                # Drop a trailing inline comment (`mode: herdr  # switched back
-                # on 2026-09-04`) before matching against the allowed values.
-                # Without this, a value like "herdr  # ..." never equals
-                # "herdr", _config_mode() silently returns None, and every
-                # process with no CREWVIA_MUX env falls back to TmuxBackend
-                # even though config says herdr (t016: this is what made the
-                # watchdog blind — mux.list() came back empty against a dead
-                # tmux session, so every live Worker looked "window gone").
-                value = value.split("#", 1)[0].strip().strip('"').strip("'")
-                if value in ("tmux", "herdr", "rex", "hc", "inline"):
-                    return value
-    except Exception:
-        pass
+    cfg = lib_config.load_for_path(config_path)
+    if is_unreadable(cfg):
+        raise MuxConfigUnreadable(cfg.reason)
+    value = cfg.get("mode")
+    if isinstance(value, str) and value.strip() in ("tmux", "herdr", "rex", "hc", "inline"):
+        return value.strip()
     return None
 
 
@@ -4161,22 +4157,11 @@ def _config_rex_endpoint(config_path: Optional[Path] = None):
     is not a string is returned as-is for `_rex_config_endpoint` to refuse.
     `config_path` is only ever passed by tests.
     """
-    if config_path is None:
-        config_path = Path(__file__).parent.parent / "config" / "crewvia.yaml"
-    text = read_regular_text_or_unreadable(config_path)
-    if is_missing(text):
-        return False, None
-    if is_unreadable(text):
-        return True, None
-    try:
-        import yaml  # PyYAML — flow 形式・引用符の中の `#` を行ベースでは読めない
-        data = yaml.safe_load(text)
-    except Exception:
+    data = lib_config.load_for_path(config_path)
+    if is_unreadable(data):
         return True, None       # 読めない = 読めなかった。「未設定」に倒さない
-    if data is None:
+    if not data:
         return False, None
-    if not isinstance(data, dict):
-        return True, None
     rex = data.get("rex")
     if rex is None:
         return False, None
@@ -6355,7 +6340,12 @@ def _cli_main(args: List[str]) -> int:
 
     verb = args[0]
     rest = args[1:]
-    m = Mux()
+    try:
+        m = Mux()
+    except MuxConfigUnreadable as e:
+        print(f"[mux] ERROR: config unreadable ({e.code}) — fix config/crewvia.local.yaml or config/crewvia.yaml",
+              file=sys.stderr)
+        return 1
 
     if verb == "available":
         return 0 if m.available() else 1

@@ -36,6 +36,7 @@ _SCRIPTS_DIR = Path(__file__).resolve().parent
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
+import lib_config  # noqa: E402
 import lib_task_cards as _cards  # noqa: E402
 
 try:
@@ -91,31 +92,22 @@ def load_full(config_path, environ=None):
     """dict (engine / agy_model / agy_timeout / cursor_model / cursor_timeout / claude_model / claude_timeout / compare)。読み口はここ 1 か所。"""
     environ = os.environ if environ is None else environ
     block = {}
-    raw = _cards.read_regular_text_or_unreadable(str(config_path))
-    if _cards.is_missing(raw):
-        pass
-    elif _cards.is_unreadable(raw):
-        raise ReviewConfigError('config_unreadable')
-    else:
-        # 共有の parse_yaml は入れ子の途中のコメント行・空行で読むのをやめ、字下げは 2 空白しか認めない。
-        # 正しい `review:` を「無い」と読んで codex に倒さないよう、このブロックは PyYAML で読む。
-        # PyYAML が無いときは regex で「review: が無い」と決めない (`"review":` や flow 形式を見落とす)。
-        # config ファイルがある限り読めないものとして止める。
-        if yaml is None:
+    # 共通 + マシン固有の local を重ねて読む (lib_config)。壊れ (local を含む) は codex に倒さず止める。
+    data = lib_config.load_for_path(config_path)
+    if _cards.is_unreadable(data):
+        code = data.reason.split(' ', 1)[0]
+        if code == 'yaml_unavailable':
             raise ReviewConfigError('yaml_unavailable')
-        try:
-            data = yaml.safe_load(raw)
-        except yaml.YAMLError:
+        if code.startswith('common_unreadable') or code == 'common_unreadable':
+            raise ReviewConfigError('config_unreadable')
+        if code.startswith('common_'):
             raise ReviewConfigError('config_malformed')
-        if data is None:
-            data = {}
-        if not isinstance(data, dict):
-            raise ReviewConfigError('config_malformed')
-        # キーが「無い」ときだけ既定。キーがあって値が null (`review:` / `review: null`) は拒否する。
-        if 'review' in data:
-            if not isinstance(data['review'], dict):
-                raise ReviewConfigError('review_block_malformed')
-            block = data['review']
+        raise ReviewConfigError('local_' + code if not code.startswith('local_') else code)
+    # キーが「無い」ときだけ既定。キーがあって値が null (`review:` / `review: null`) は拒否する。
+    if 'review' in data:
+        if not isinstance(data['review'], dict):
+            raise ReviewConfigError('review_block_malformed')
+        block = data['review']
 
     engine = DEFAULT_ENGINE
     if 'engine' in block:

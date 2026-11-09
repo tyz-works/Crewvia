@@ -28,6 +28,7 @@ _SCRIPTS_DIR = Path(__file__).resolve().parent
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
+import lib_config  # noqa: E402
 import lib_execution as ex  # noqa: E402
 import lib_state_store as store  # noqa: E402
 import lib_task_cards as _cards  # noqa: E402
@@ -341,17 +342,21 @@ def max_attempts_of(meta, default):
     return value
 
 
+class ConfigUnreadable(Exception):
+    """共通 / local の config が読めない (固定コード + 位置だけ)。既定値に倒さず呼び出し側が拒否する。"""
+
+    def __init__(self, code):
+        super().__init__(code)
+        self.code = code
+
+
 def load_default_max_attempts(config_path, warn=lambda msg: None):
     """`config/crewvia.yaml` の `attempts.max_total` (正の整数)。欄が無い・config が読めない・値が正の整数でないときは
-    既定値 (6) — 値が不正なときだけ `warn` で 1 行知らせる (上限は安全弁で、config の壊れで retry を止めない)。"""
-    raw = _cards.read_regular_text_or_unreadable(str(config_path))
-    if _cards.is_unreadable(raw):
-        return DEFAULT_MAX_ATTEMPTS
-    try:
-        data = _cards.parse_yaml(raw, source='crewvia.yaml')
-    except ValueError:
-        return DEFAULT_MAX_ATTEMPTS
-    block = data.get('attempts') if isinstance(data, dict) else None
+    既定値 (6)。config が読めない (壊れた local を含む) ときは `ConfigUnreadable` — 値が不正なときだけ `warn` で 1 行知らせる (上限は安全弁で、config の壊れで retry を止めない)。"""
+    data = lib_config.load_for_path(config_path)
+    if _cards.is_unreadable(data):
+        raise ConfigUnreadable(data.reason)
+    block = data.get('attempts')
     if not isinstance(block, dict) or block.get('max_total') is None:
         return DEFAULT_MAX_ATTEMPTS
     value = _positive_int(block.get('max_total'))

@@ -51,17 +51,14 @@ NOTIFY_CACHE="${CREWVIA_NOTIFY_CACHE:-/tmp/dispatcher-notify-cache.json}"
 NOTIFY_TTL=300  # seconds before repeating the same notification (5 min)
 
 # Rule 5: state grace period in seconds (env > config > default 60).
-# Read from config/crewvia.yaml mux.state_grace_seconds if env is absent.
+# Read mux.state_grace_seconds from the effective config (lib_config) if env is absent.
 _read_state_grace() {
-  local cfg="${REPO_ROOT}/config/crewvia.yaml"
   if [[ -n "${CREWVIA_STATE_GRACE:-}" ]]; then
     echo "${CREWVIA_STATE_GRACE}"
     return
   fi
-  if [[ -f "$cfg" ]]; then
-    # Look for "  state_grace_seconds: <n>" under "mux:" section.
-    awk '/^mux:/{in_mux=1} in_mux && /state_grace_seconds:/{print $2; exit}' "$cfg"
-  fi
+  # 共通 + マシン固有の local を lib_config が重ねて読む (mux.state_grace_seconds)。壊れ・無しは空 (= 既定 60)。
+  python3 "${SCRIPT_DIR}/lib_config.py" --root "${REPO_ROOT}" get mux.state_grace_seconds 2>/dev/null || true
 }
 STATE_GRACE="$(_read_state_grace)"
 STATE_GRACE="${STATE_GRACE:-60}"  # default 60 seconds
@@ -2481,9 +2478,42 @@ def shutdown_idle_workers():
                     record_notify(notify_key)
 
 
+CONFIG_UNREADABLE_KEY = 'config_unreadable'
+
+
+def effective_config_readable():
+    """共通 config + マシン固有の local (lib_config) が読めるか。読めなければ False (このサイクルは見送る)。
+
+    壊れた local を共通の値に黙って戻して割り当て・退役を判定しない (knowledge/machine-local-config.md §3)。
+    Director への通知は状態が変わるまで 1 回だけ (`notify_state_once`)。読めるようになったら台帳を畳む
+    (`_daemon` slug は prune_told の対象外なので、畳まないと同じ障害の 2 回目が永久に黙る)。Worker は殺さない・起こさない。
+    通知は固定コード + 位置だけ (値・元の行は載せない)。
+    """
+    try:
+        import lib_config
+        problem = lib_config.config_problem(REPO_ROOT / 'config' / 'crewvia.yaml')
+    except Exception as e:  # noqa: BLE001 — 検査自体の失敗でサイクルを止めない (他の読み口が個別に止める)
+        log(f'[config] effective-config check failed: {e!r}')
+        return True
+    if problem is None:
+        told = load_told()
+        if not is_unreadable(told) and CONFIG_UNREADABLE_KEY in told:
+            clear_told_key(CONFIG_UNREADABLE_KEY)
+        return True
+    log(f'WARNING: config を読めない ({problem}) — このサイクルは割り当ても退役も通知判定も行わない')
+    notify_state_once(
+        CONFIG_UNREADABLE_KEY, fingerprint(problem), 'config-unreadable', '_daemon', 'config',
+        lambda: (f'[config] config/crewvia.local.yaml (または共通の config/crewvia.yaml) を読めません: {problem}。'
+                 '割り当て・退役・通知判定を見送っています (Worker は殺しません)。ファイルを直すと自動で再開します。'),
+        director_live=director_live_for_state_notices)
+    return False
+
+
 def dispatch():
     _director_live_memo.clear()
     _target_record_memo.clear()
+    if not effective_config_readable():
+        return
     state = load_state()
     if is_unreadable(state):
         # Codex 9 巡目 P1。`{}` に潰すと下の `if not active_missions` に落ちて
@@ -3326,7 +3356,7 @@ def run_escalation_cycle(all_tasks, done_ids_by_mission, task_statuses_by_missio
         import lib_escalation
         import lib_telegram
         now = time.time()
-        cfg = lib_escalation.load_cfg(REPO_ROOT / 'config' / 'crewvia.yaml', warn=_escalation_warn)
+        cfg = lib_escalation.load_cfg(REPO_ROOT / 'config' / 'crewvia.yaml', warn=_escalation_warn)  # lib_config 経由 (local を重ねる)
         creds = _TG_RUNTIME['creds']
         registry_dir = REGISTRY_DIR / 'daemons'
         tg_config = lib_telegram.load_telegram_config()

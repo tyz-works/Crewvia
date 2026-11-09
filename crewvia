@@ -20,15 +20,20 @@ TOKEN_FILE="${SCRIPT_DIR}/config/.taskvia-token"
 export PATH="${SCRIPT_DIR}/scripts/bin:${PATH}"
 
 # --- config から設定を読み込む ---
+# 共通 config/crewvia.yaml + マシン固有の config/crewvia.local.yaml は scripts/lib_config.py が重ねて読む唯一の入口
+# (knowledge/machine-local-config.md)。壊れた local は共通の値に黙って戻さず、ここで起動を止める。
+if ! _cfg_err="$(python3 "${SCRIPT_DIR}/scripts/lib_config.py" --root "${SCRIPT_DIR}" dump --json 2>&1 >/dev/null)"; then
+  echo "[crewvia] ERROR: config を読めません — ${_cfg_err}" >&2
+  echo "[crewvia]   config/crewvia.local.yaml を直すか、一時的に退避してください (共通の値には黙って戻しません)。" >&2
+  exit 1
+fi
+
 read_config() {
-  local key="$1" default="${2:-}"
-  if [[ -f "$CONFIG_FILE" ]]; then
-    local val
-    val=$(grep -E "^${key}:" "$CONFIG_FILE" 2>/dev/null | head -1 | sed 's/^[^:]*:[[:space:]]*//' | sed 's/[[:space:]]*#.*//' | tr -d '"' | tr -d "'")
-    if [[ -n "$val" ]]; then
-      echo "$val"
-      return
-    fi
+  local key="$1" default="${2:-}" val
+  val="$(python3 "${SCRIPT_DIR}/scripts/lib_config.py" --root "${SCRIPT_DIR}" get "$key" 2>/dev/null)" || val=""
+  if [[ -n "$val" ]]; then
+    echo "$val"
+    return
   fi
   echo "$default"
 }

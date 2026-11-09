@@ -120,7 +120,7 @@ cases = [
     ("mode: tmux  # trailing comment\n", "tmux"),
     ("mode: inline  #comment-no-space\n", "inline"),
     ("mode: bogus-value\n", None),
-    ("no mode key here\n", None),
+    ("other_key: 1\n", None),
 ]
 for content, expected in cases:
     fd, path = tempfile.mkstemp(suffix=".yaml")
@@ -205,8 +205,11 @@ fi
 # ---------------------------------------------------------------------------
 echo ""
 echo "--- Test 11: lib_approval_channel.sh _read_approval_yaml handles inline comment on mode ---"
-TMP_APPROVAL_CFG="$(mktemp)"
-cat > "$TMP_APPROVAL_CFG" << 'EOF'
+# 読み口は lib_config 経由 (scripts/ を symlink した使い捨ての repo 木。git 管理外なので local は主 checkout を見ない)
+TMP_APPROVAL_REPO="$(mktemp -d)"
+mkdir -p "$TMP_APPROVAL_REPO/config"
+ln -s "$OWN_CHECKOUT_ROOT/scripts" "$TMP_APPROVAL_REPO/scripts"
+cat > "$TMP_APPROVAL_REPO/config/crewvia.yaml" << 'EOF'
 approval_channel:
   mode: ntfy  # switched for testing, revert later
   ntfy:
@@ -214,14 +217,14 @@ approval_channel:
     topic: crewvia-test
 EOF
 MODE_OUT=$(
-  CREWVIA_REPO="$OWN_CHECKOUT_ROOT" \
+  env -u CREWVIA_APPROVAL_CHANNEL CREWVIA_REPO="$TMP_APPROVAL_REPO" \
   bash -c '
     source "'"$OWN_CHECKOUT_ROOT"'/hooks/lib_approval_channel.sh"
-    _APPROVAL_CONFIG_FILE="'"$TMP_APPROVAL_CFG"'"
     _read_approval_yaml "mode"
   '
 )
-rm -f "$TMP_APPROVAL_CFG"
+rm -f "$TMP_APPROVAL_REPO/config/crewvia.yaml" "$TMP_APPROVAL_REPO/scripts"
+rmdir "$TMP_APPROVAL_REPO/config" "$TMP_APPROVAL_REPO"
 if [[ "$MODE_OUT" == "ntfy" ]]; then
   pass "_read_approval_yaml mode with inline comment -> clean 'ntfy' (got: '$MODE_OUT')"
 else

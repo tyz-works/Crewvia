@@ -32,28 +32,36 @@ WORKER_MODEL_EXPLICIT=0
 # 環境変数が既に設定されていれば config より優先される。
 # 設定を追加する場合はここにロード処理を足す。
 CONFIG_FILE="${REPO_ROOT}/config/crewvia.yaml"
-if [[ -f "$CONFIG_FILE" ]]; then
-  if [[ -z "${CREWVIA_WIP_LIMIT:-}" ]]; then
-    WIP_FROM_CONFIG=$(grep -E '^wip_limit:[[:space:]]*[0-9]+' "$CONFIG_FILE" | awk '{print $2}' | tr -d '"' | head -1)
-    if [[ -n "$WIP_FROM_CONFIG" ]]; then
-      export CREWVIA_WIP_LIMIT="$WIP_FROM_CONFIG"
-    fi
+# 共通 + マシン固有の local は scripts/lib_config.py が重ねて読む唯一の入口 (knowledge/machine-local-config.md)。
+# 壊れた local は共通の値に黙って戻さず、起動を止める (mode / approval_channel を取り違えない)。
+_crewvia_config_get() {
+  python3 "${SCRIPT_DIR}/lib_config.py" --root "${REPO_ROOT}" get "$@" 2>/dev/null || true
+}
+if ! _CFG_ERR="$(python3 "${SCRIPT_DIR}/lib_config.py" --root "${REPO_ROOT}" dump --json 2>&1 >/dev/null)"; then
+  echo "[crewvia] ERROR: config を読めません — ${_CFG_ERR}" >&2
+  echo "[crewvia]   config/crewvia.local.yaml を直すか、一時的に退避してください (共通の値には黙って戻しません)。" >&2
+  exit 1
+fi
+if [[ -z "${CREWVIA_WIP_LIMIT:-}" ]]; then
+  WIP_FROM_CONFIG="$(_crewvia_config_get wip_limit)"
+  if [[ "$WIP_FROM_CONFIG" =~ ^[0-9]+$ ]]; then
+    export CREWVIA_WIP_LIMIT="$WIP_FROM_CONFIG"
   fi
-  if [[ -z "${CREWVIA_DIRECTOR_MODEL:-}" ]]; then
-    ORCH_MODEL_FROM_CONFIG=$(grep -E '^director_model:[[:space:]]*\S' "$CONFIG_FILE" | awk '{print $2}' | tr -d '"' | head -1)
-    if [[ -n "$ORCH_MODEL_FROM_CONFIG" ]]; then
-      export CREWVIA_DIRECTOR_MODEL="$ORCH_MODEL_FROM_CONFIG"
-    fi
+fi
+if [[ -z "${CREWVIA_DIRECTOR_MODEL:-}" ]]; then
+  ORCH_MODEL_FROM_CONFIG="$(_crewvia_config_get director_model)"
+  if [[ -n "$ORCH_MODEL_FROM_CONFIG" ]]; then
+    export CREWVIA_DIRECTOR_MODEL="$ORCH_MODEL_FROM_CONFIG"
   fi
-  # WORKER_MODEL_FROM_CONFIG はローカル変数のみ (export しない)。
-  # export すると tmux server env に継承され、Director tab や他 Worker tab が
-  # WORKER_MODEL_EXPLICIT=1 として誤検知し、model_per_skill が silent 無効化される。
-  # herdr は _HERDR_SERVER_ENV_DENY_PREFIXES で保護済みだが、tmux / inline は
-  # この export だけで守る必要があるため、ここではローカル保持に留める。
-  WORKER_MODEL_FROM_CONFIG=""
-  if [[ -z "${CREWVIA_WORKER_MODEL:-}" ]]; then
-    WORKER_MODEL_FROM_CONFIG=$(grep -E '^worker_model:[[:space:]]*\S' "$CONFIG_FILE" | awk '{print $2}' | tr -d '"' | head -1)
-  fi
+fi
+# WORKER_MODEL_FROM_CONFIG はローカル変数のみ (export しない)。
+# export すると tmux server env に継承され、Director tab や他 Worker tab が
+# WORKER_MODEL_EXPLICIT=1 として誤検知し、model_per_skill が silent 無効化される。
+# herdr は _HERDR_SERVER_ENV_DENY_PREFIXES で保護済みだが、tmux / inline は
+# この export だけで守る必要があるため、ここではローカル保持に留める。
+WORKER_MODEL_FROM_CONFIG=""
+if [[ -z "${CREWVIA_WORKER_MODEL:-}" ]]; then
+  WORKER_MODEL_FROM_CONFIG="$(_crewvia_config_get worker_model)"
 fi
 # Default fallback（config ファイル無しでも必ず値が入る）
 export CREWVIA_WIP_LIMIT="${CREWVIA_WIP_LIMIT:-8}"
@@ -236,7 +244,7 @@ if [[ "${ROLE}" == "director" ]] && [[ -z "${CREWVIA_MUX_ENABLED:-}" ]]; then
   # 検査や export が env を上書きして食い違う事故を防ぐ (QA F1 / Codex F1)。
   # env も config も tmux / herdr / rex / hc でなければ _EFFECTIVE_BACKEND は空 (auto / inline)。
   _ENV_MUX="$(printf '%s' "${CREWVIA_MUX:-}" | tr '[:upper:]' '[:lower:]')"
-  MODE_FROM_CONFIG=$(grep -E '^mode:[[:space:]]*\S' "$CONFIG_FILE" 2>/dev/null | awk '{print $2}' | tr -d '"' | head -1)
+  MODE_FROM_CONFIG="$(_crewvia_config_get mode)"
   _EFFECTIVE_BACKEND=""
   case "$_ENV_MUX" in
     tmux|herdr|rex|hc) _EFFECTIVE_BACKEND="$_ENV_MUX" ;;
@@ -361,46 +369,19 @@ fi
 export AGENT_NAME
 export ROLE
 
-# --- 承認チャネル設定を config から読み込む ---
-# CREWVIA_APPROVAL_CHANNEL が未設定の場合は config を読む
-_read_approval_channel_yaml() {
-  local cfg="$1" key_path="$2"
-  [[ ! -f "$cfg" ]] && return
-  awk -v kp="$key_path" '
-    BEGIN { in_ac=0; in_ntfy=0; n=split(kp,a,"."); tk=a[1]; sk=( n>1 ? a[2] : "" ) }
-    /^approval_channel:/ { in_ac=1; next }
-    in_ac && /^[a-zA-Z_]/ { in_ac=0; in_ntfy=0 }
-    in_ac {
-      if (/^  ntfy:/) { in_ntfy=1; next }
-      if (in_ntfy && /^  [a-zA-Z_]/ && !/^    /) { in_ntfy=0 }
-      if (tk=="mode" && sk=="" && /^  mode:/) {
-        v=$0; gsub(/^  mode:[[:space:]]*/,"",v); gsub(/^['"'"'"]|['"'"'"]$/,"",v); print v; exit
-      }
-      if (tk=="ntfy" && in_ntfy) {
-        pfx="    " sk ":"
-        if (index($0,pfx)==1) {
-          v=substr($0,length(pfx)+1); gsub(/^[[:space:]]*/,"",v)
-          gsub(/^['"'"'"]|['"'"'"]$/,"",v); print v; exit
-        }
-      }
-    }
-  ' "$cfg"
-}
-
-if [[ -z "${CREWVIA_APPROVAL_CHANNEL:-}" ]] && [[ -f "$CONFIG_FILE" ]]; then
-  _AC_MODE=$(_read_approval_channel_yaml "$CONFIG_FILE" "mode")
+# --- 承認チャネル設定を config から読み込む (lib_config 経由。CREWVIA_APPROVAL_CHANNEL が未設定の場合) ---
+if [[ -z "${CREWVIA_APPROVAL_CHANNEL:-}" ]]; then
+  _AC_MODE="$(_crewvia_config_get approval_channel.mode)"
   [[ -n "$_AC_MODE" ]] && export CREWVIA_APPROVAL_CHANNEL="$_AC_MODE"
 fi
 export CREWVIA_APPROVAL_CHANNEL="${CREWVIA_APPROVAL_CHANNEL:-taskvia}"
 
 # ntfy 設定を config から読み込む（env var 優先）
-if [[ -f "$CONFIG_FILE" ]]; then
-  [[ -z "${NTFY_URL:-}" ]]                   && export NTFY_URL="$(_read_approval_channel_yaml "$CONFIG_FILE" "ntfy.url")"
-  [[ -z "${NTFY_TOPIC:-}" ]]                 && export NTFY_TOPIC="$(_read_approval_channel_yaml "$CONFIG_FILE" "ntfy.topic")"
-  [[ -z "${NTFY_USER:-}" ]]                  && export NTFY_USER="$(_read_approval_channel_yaml "$CONFIG_FILE" "ntfy.user")"
-  [[ -z "${NTFY_PASS:-}" ]]                  && export NTFY_PASS="$(_read_approval_channel_yaml "$CONFIG_FILE" "ntfy.pass")"
-  [[ -z "${APPROVAL_TOKEN_TTL_SECONDS:-}" ]] && export APPROVAL_TOKEN_TTL_SECONDS="$(_read_approval_channel_yaml "$CONFIG_FILE" "ntfy.token_ttl_seconds")"
-fi
+[[ -z "${NTFY_URL:-}" ]]                   && export NTFY_URL="$(_crewvia_config_get approval_channel.ntfy.url)"
+[[ -z "${NTFY_TOPIC:-}" ]]                 && export NTFY_TOPIC="$(_crewvia_config_get approval_channel.ntfy.topic)"
+[[ -z "${NTFY_USER:-}" ]]                  && export NTFY_USER="$(_crewvia_config_get approval_channel.ntfy.user)"
+[[ -z "${NTFY_PASS:-}" ]]                  && export NTFY_PASS="$(_crewvia_config_get approval_channel.ntfy.pass)"
+[[ -z "${APPROVAL_TOKEN_TTL_SECONDS:-}" ]] && export APPROVAL_TOKEN_TTL_SECONDS="$(_crewvia_config_get approval_channel.ntfy.token_ttl_seconds)"
 export NTFY_URL="${NTFY_URL:-}"
 export NTFY_TOPIC="${NTFY_TOPIC:-}"
 export NTFY_USER="${NTFY_USER:-}"
@@ -411,15 +392,11 @@ export APPROVAL_TOKEN_TTL_SECONDS="${APPROVAL_TOKEN_TTL_SECONDS:-900}"
 # crewvia ランチャー経由なら ask は既に resolved 済み。直接 start.sh を呼んだ場合は
 # ここで config を読み、ask なら非対話フォールバック（enabled）を使う。
 if [[ -z "${CREWVIA_TASKVIA:-}" ]]; then
-  if [[ -f "$CONFIG_FILE" ]]; then
-    TASKVIA_MODE_FROM_CONFIG=$(grep -E '^taskvia:[[:space:]]*\S' "$CONFIG_FILE" 2>/dev/null | awk '{print $2}' | tr -d '"' | head -1)
-    case "${TASKVIA_MODE_FROM_CONFIG:-ask}" in
-      enabled|disabled|ask) export CREWVIA_TASKVIA="${TASKVIA_MODE_FROM_CONFIG:-ask}" ;;
-      *) export CREWVIA_TASKVIA="ask" ;;
-    esac
-  else
-    export CREWVIA_TASKVIA="ask"
-  fi
+  TASKVIA_MODE_FROM_CONFIG="$(_crewvia_config_get taskvia)"
+  case "${TASKVIA_MODE_FROM_CONFIG:-ask}" in
+    enabled|disabled|ask) export CREWVIA_TASKVIA="${TASKVIA_MODE_FROM_CONFIG:-ask}" ;;
+    *) export CREWVIA_TASKVIA="ask" ;;
+  esac
   # ask が残っている場合は enabled にフォールバック（start.sh 直呼び = 非対話前提）
   if [[ "${CREWVIA_TASKVIA}" == "ask" ]]; then
     export CREWVIA_TASKVIA="enabled"

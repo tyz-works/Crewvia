@@ -776,6 +776,12 @@ fi
 PRIORITY="medium"
 case "$TOOL_NAME" in Bash|Write|Edit) PRIORITY="high" ;; esac
 
+# config (共通 / local) が読めない → 承認の経路を決められない。承認を黙って通さず、既定の taskvia に倒さず拒否する
+if [ "${_APPROVAL_CHANNEL_MODE:-}" = "config-unreadable" ]; then
+  emit_decision "deny" "config/crewvia.yaml or crewvia.local.yaml is unreadable (config-unreadable); cannot choose the approval channel"
+  exit 0
+fi
+
 AUTH_HEADER="Authorization: Bearer ${TASKVIA_TOKEN}"
 
 # ntfy/both モードでは Taskvia に notify:true を渡し Taskvia 側で ntfy publish させる (α方針)

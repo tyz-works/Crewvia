@@ -18,47 +18,23 @@ _APPROVAL_CONFIG_FILE="${_CREWVIA_REPO}/config/crewvia.yaml"
 
 # ---------------------------------------------------------------------------
 # _read_approval_yaml <key_path>
-#   config/crewvia.yaml の approval_channel セクションから値を読み出す。
+#   effective config (config/crewvia.yaml + config/crewvia.local.yaml。lib_config) の approval_channel セクションから値を読み出す。
 #   key_path: "mode" | "ntfy.url" | "ntfy.topic" | "ntfy.user" | "ntfy.pass" | "ntfy.token_ttl_seconds"
 #   stdout に値を出力。見つからなければ空出力。
 # ---------------------------------------------------------------------------
 _read_approval_yaml() {
-  local key_path="$1"
-  [[ ! -f "$_APPROVAL_CONFIG_FILE" ]] && return
-
-  awk -v key_path="$key_path" '
-    BEGIN {
-      in_ac=0; in_ntfy=0
-      n = split(key_path, kp, ".")
-      tk = kp[1]
-      sk = (n > 1) ? kp[2] : ""
-    }
-    /^approval_channel:/ { in_ac=1; next }
-    in_ac && /^[a-zA-Z_]/ { in_ac=0; in_ntfy=0 }
-    in_ac {
-      if (/^  ntfy:/) { in_ntfy=1; next }
-      if (in_ntfy && /^  [a-zA-Z_]/ && !/^    /) { in_ntfy=0 }
-
-      if (tk == "mode" && sk == "" && /^  mode:/) {
-        val = $0; gsub(/^  mode:[[:space:]]*/, "", val)
-        # Drop a trailing inline comment (`mode: taskvia  # comment`) before
-        # quote-stripping — same defect class as t016 (lib_mux.py
-        # _config_mode()): without this, a commented mode/value line never
-        # matches its expected value and silently falls back to the default.
-        sub(/[[:space:]]*#.*$/, "", val)
-        gsub(/^['"'"'"]|['"'"'"]$/, "", val); print val; exit
-      }
-      if (tk == "ntfy" && in_ntfy) {
-        pfx = "    " sk ":"
-        if (index($0, pfx) == 1) {
-          val = substr($0, length(pfx) + 1)
-          gsub(/^[[:space:]]+/, "", val)
-          sub(/[[:space:]]*#.*$/, "", val)
-          gsub(/^['"'"'"]|['"'"'"]$/, "", val); print val; exit
-        }
-      }
-    }
-  ' "$_APPROVAL_CONFIG_FILE"
+  local key_path="$1" out rc
+  # 共通 + マシン固有の local は scripts/lib_config.py が重ねて読む唯一の入口。worktree の hook から呼んでも
+  # local は主 checkout のものを見る (lib_config.find_main_checkout)。
+  out="$(python3 "${_CREWVIA_REPO}/scripts/lib_config.py" --root "${_CREWVIA_REPO}" get "approval_channel.${key_path}" 2>/dev/null)"
+  rc=$?
+  if [[ $rc -eq 1 ]]; then
+    # 壊れた local / 共通。承認を黙って通さない・共通の値に黙って戻さない: 呼び出し側 (get_approval_channel_mode) が
+    # "config-unreadable" を返し、hook は承認を拒否する。
+    return 0
+  fi
+  [[ $rc -eq 0 ]] && printf '%s\n' "$out"
+  return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -74,7 +50,11 @@ get_approval_channel_mode() {
 
   local mode
   mode=$(_read_approval_yaml "mode")
-  echo "${mode:-taskvia}"
+  if python3 "${_CREWVIA_REPO}/scripts/lib_config.py" --root "${_CREWVIA_REPO}" dump --json >/dev/null 2>&1; then
+    echo "${mode:-taskvia}"
+  else
+    echo "config-unreadable"
+  fi
 }
 
 # ---------------------------------------------------------------------------

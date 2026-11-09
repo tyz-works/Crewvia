@@ -93,7 +93,7 @@ timeout_max_per_skill:
 #
 # 環境変数での上書き: CREWVIA_MUX=tmux|herdr|rex|hc (最優先) / CREWVIA_MUX_ENABLED=1 (並列 ON) / CREWVIA_MUX_ENABLED=0 (inline)
 # CREWVIA_MUX が設定されていれば CREWVIA_MUX_ENABLED より優先される。
-mode: herdr  # 戻す時は tmux。切替日: 2026-09-04
+mode: hc  # 戻す時は herdr。切替日: 2026-11-09
 
 # ===== mux 設定 =====
 mux:

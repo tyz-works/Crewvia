@@ -1904,6 +1904,79 @@ run_fake_crewvia() {
     [ "$status" -eq 0 ]
 }
 
+# ===========================================================================
+# t019: base 経路 (Tmux / Herdr backend — どちらも verify_sent() を override
+# していないので Mux.verify_sent() の素の判定に落ちる) にも、Rex / hc が
+# t015 で得た入力欄の枠判定 (_rex_input_box()) を適用する。真理値表のうち
+# この 3 ケース (echo → True / 本当に枠の中 → False / 古い空の枠が上・生きた
+# 枠に本文が残る → False — 危険な反転の箇所) を固定する。4 ケース目 (枠が
+# 無い → 従来の tail-scan にフォールバック) は、上の既存テスト (1853 行〜) と
+# F1 regression テストがすでに固定している。fixture は
+# tests/test_rex_pr2_wiring.py / tests/test_hc_backend.py と同じ形
+# (knowledge/start-sh-verify-sent-echo.md)。
+# ===========================================================================
+
+_T019_RULE="────────────────────────────────────────"
+_T019_MSG="ミッション開始。plan status で状態を確認し、タスク分解を開始してください。"
+
+@test "tmux verify-sent: t019 — ignores the transcript echo of a delivered message" {
+    setup_fake_tmux
+    FAKE_TMUX_SCREEN="${FAKE_TMUX_DIR}/screen"
+    printf '❯ %s\n\n● 了解\n\n%s\n❯ \n%s\n  ? for shortcuts\n' \
+        "$_T019_MSG" "$_T019_RULE" "$_T019_RULE" > "$FAKE_TMUX_SCREEN"
+    export FAKE_TMUX_SCREEN
+
+    run python3 "$LIB_MUX_PY" verify-sent "Omar-worker" "$_T019_MSG"
+    [ "$status" -eq 0 ]
+}
+
+@test "tmux verify-sent: t019 — still False while text is really in the input box" {
+    setup_fake_tmux
+    FAKE_TMUX_SCREEN="${FAKE_TMUX_DIR}/screen"
+    printf '%s\n❯ %s\n%s\n' "$_T019_RULE" "$_T019_MSG" "$_T019_RULE" > "$FAKE_TMUX_SCREEN"
+    export FAKE_TMUX_SCREEN
+
+    run python3 "$LIB_MUX_PY" verify-sent "Omar-worker" "$_T019_MSG"
+    [ "$status" -eq 1 ]
+}
+
+@test "tmux verify-sent: t019 — False when a stale empty box sits above the live box (dangerous inversion)" {
+    setup_fake_tmux
+    FAKE_TMUX_SCREEN="${FAKE_TMUX_DIR}/screen"
+    printf '%s\n❯ \n%s\nsome task output\nmore output\n%s\n❯ %s\n%s\n' \
+        "$_T019_RULE" "$_T019_RULE" "$_T019_RULE" "$_T019_MSG" "$_T019_RULE" > "$FAKE_TMUX_SCREEN"
+    export FAKE_TMUX_SCREEN
+
+    run python3 "$LIB_MUX_PY" verify-sent "Omar-worker" "$_T019_MSG"
+    [ "$status" -eq 1 ]
+}
+
+@test "herdr verify-sent: t019 — ignores the transcript echo of a delivered message" {
+    setup_fake_herdr
+    printf '❯ %s\n\n● 了解\n\n%s\n❯ \n%s\n  ? for shortcuts\n' \
+        "$_T019_MSG" "$_T019_RULE" "$_T019_RULE" > "$FAKE_PANE_SCREEN"
+
+    run python3 "$LIB_MUX_PY" verify-sent "Omar-worker" "$_T019_MSG"
+    [ "$status" -eq 0 ]
+}
+
+@test "herdr verify-sent: t019 — still False while text is really in the input box" {
+    setup_fake_herdr
+    printf '%s\n❯ %s\n%s\n' "$_T019_RULE" "$_T019_MSG" "$_T019_RULE" > "$FAKE_PANE_SCREEN"
+
+    run python3 "$LIB_MUX_PY" verify-sent "Omar-worker" "$_T019_MSG"
+    [ "$status" -eq 1 ]
+}
+
+@test "herdr verify-sent: t019 — False when a stale empty box sits above the live box (dangerous inversion)" {
+    setup_fake_herdr
+    printf '%s\n❯ \n%s\nsome task output\nmore output\n%s\n❯ %s\n%s\n' \
+        "$_T019_RULE" "$_T019_RULE" "$_T019_RULE" "$_T019_MSG" "$_T019_RULE" > "$FAKE_PANE_SCREEN"
+
+    run python3 "$LIB_MUX_PY" verify-sent "Omar-worker" "$_T019_MSG"
+    [ "$status" -eq 1 ]
+}
+
 @test "mux_verify_sent shell wrapper: delegates to lib_mux.py verify-sent" {
     setup_fake_herdr
     echo "❯ " > "$FAKE_PANE_SCREEN"

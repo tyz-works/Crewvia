@@ -230,6 +230,26 @@ def test_worktree_reads_local_from_main_checkout(tmp_path):
     assert lc.load_effective(wt, environ={})["mode"] == "rex"
 
 
+def test_dangling_local_symlink_is_unreadable_not_silently_common(tree):
+    root, common, local = tree
+    local.symlink_to(root / "does-not-exist.yaml")
+    out = load(tree)
+    assert cards.is_unreadable(out)
+    assert "local_unreadable" in str(getattr(out, "reason", out))
+
+
+def test_untracked_dir_inside_main_checkout_does_not_read_parent_local(tmp_path):
+    main = tmp_path / "main"
+    main.mkdir()
+    g = ["git", "-c", "user.email=t@t", "-c", "user.name=t"]
+    subprocess.run(g + ["init", "-q", str(main)], check=True)
+    _write(main / "config" / "crewvia.local.yaml", "mode: rex\n")
+    copy = main / "tmp" / "copy"
+    _write(copy / "config" / "crewvia.yaml", COMMON)
+    assert lc.find_main_checkout(copy).resolve() == copy.resolve()
+    assert lc.load_effective(copy, environ={})["mode"] == "tmux"
+
+
 def test_non_git_dir_falls_back_to_script_location_not_env(tmp_path, monkeypatch):
     other = tmp_path / "other"
     _write(other / "config" / "crewvia.local.yaml", "mode: rex\n")

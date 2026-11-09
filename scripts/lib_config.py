@@ -115,6 +115,17 @@ def find_main_checkout(repo_root):
     common = Path(r.stdout.strip())
     if not common.is_absolute() or common.name != '.git':
         return root
+    # repo_root が git 管理外で、親 repo の中に居るだけのときは親の local を読まない
+    # (worktree では show-toplevel = worktree 自身なので一致する)
+    try:
+        t = subprocess.run(
+            ['git', 'rev-parse', '--show-toplevel'],
+            cwd=str(root), capture_output=True, text=True, timeout=10,
+            stdin=subprocess.DEVNULL, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return root
+    if t.returncode != 0 or os.path.realpath(t.stdout.strip()) != os.path.realpath(str(root)):
+        return root
     return common.parent
 
 
@@ -126,6 +137,9 @@ def _parse(path, kind):
     """path の yaml を dict で返す。無い → None。壊れ → ConfigError (固定コード)。"""
     raw = _cards.read_regular_text_or_unreadable(str(path))
     if _cards.is_missing(raw):
+        # 先の消えた symlink は「local 無し」ではない (黙って共通値に戻さない)
+        if kind == 'local' and os.path.lexists(str(path)):
+            raise ConfigError('local_unreadable')
         return None
     if _cards.is_unreadable(raw):
         raise ConfigError(f'{kind}_unreadable')

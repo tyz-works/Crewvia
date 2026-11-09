@@ -63,12 +63,8 @@ kill 直後）と `sweep_spawn_grace_markers()`（窓が消えたかどうかで
 
 - 掃除する側は **1 者（dispatcher）に限定**（CLAUDE.md 不変条件 4 / 7）。watchdog 側には何も
   足していない
-- 本番は hc で稼働中。生きている Worker の記録を誤って消さない方向に倒した: 判定は
-  「`tmux_list_worker_windows()` に名前が無い」ことだけを根拠にし（`sweep_spawn_grace_markers()`
-  と同じ判定関数を再利用）、観測できない（mux が答えない等）ケースは `_mux.list()` 自体が
-  空配列を返す実装（各 backend の `list()` は例外を内部で握り潰して `[]` を返す）なので、
-  「安全側」（= 掃除しない方向ではなく掃除を先送りするだけ。次の cycle で mux が答えれば
-  正しく再評価される）に自然と倒れる
+- 判定は「`tmux_list_worker_windows()` に名前が無い」ことを根拠にする（`sweep_spawn_grace_markers()`
+  と同じ判定関数を再利用）
 - 消してよい根拠: これらのマーカーは Rule 5 の通知 debounce 用タイマーに過ぎず、
   `may_destroy_pane()`（kill の認可）の証拠である `registry/mux/<name>.json` /
   `<name>-worker.json` とは別物（`_save_job_since` / `_save_usage_limit` が既に同じ理由で
@@ -77,7 +73,50 @@ kill 直後）と `sweep_spawn_grace_markers()`（窓が消えたかどうかで
 - 呼び出し位置は `sweep_spawn_grace_markers()` / `sweep_stale_pane_records()` の隣
   （`dispatch()` の早期 return する cycle でも毎 cycle 走る）
 
-## 検討して見送ったもの（card 要求 #4・任意）
+## 訂正（PR #362 レビュー / t026 attempt 2・P2）: 「観測できないケースは安全側」は誤りだった
+
+attempt 1 はここに次のように書いていた:
+
+> 観測できない（mux が答えない等）ケースは `_mux.list()` 自体が空配列を返す実装（各 backend の
+> `list()` は例外を内部で握り潰して `[]` を返す）なので、「安全側」（= 掃除しない方向ではなく
+> 掃除を先送りするだけ。次の cycle で mux が答えれば正しく再評価される）に自然と倒れる
+
+**これは逆だった。** 判定は「`live` に名前が**無い**」ことを根拠にするので、`live` が空になると
+**全マーカーに一致してしまう**。実測（生きている Seo-worker のマーカーを置き、`list()` の戻り値
+だけを変えた）:
+
+| 観測 | 残ったマーカー |
+|---|---|
+| mux が正常に答える（Seo が一覧に出る） | `Seo.job-since.json` / `Seo.state.json` |
+| mux が観測できない（`list()` == `[]`） | **（全部消えた）** |
+
+「先送り」ではなく最も破壊的な方向。`.job-since.json` が消えると `_load_job_since` が「初めて見た
+job」と読んで `job_since = now` で計り直し、`BACKGROUND_JOB_MAX_SECONDS`（既定 4500 秒）の上限が
+最初から数え直しになる — これは `_load_job_since` の docstring が t082 P2 で名指しで塞いだ事故その
+ものに、「ファイルを消す経路」という t082 の時点では存在しなかった道から再び到達する。
+
+`sweep_spawn_grace_markers()`（`.firstseen`）が同じ曖昧さを受け入れられるのは、消えても
+「次の spawn が猶予を多くもらうだけ」（= 殺さない側）だから。ここのマーカーは逆に
+**Director に知らせる時計**なので、消すと「遅れる・黙る」側に倒れる。`.firstseen` の理由づけを
+そのままは移せなかった。
+
+**直した**: `live = {...}` を取った直後に `if not live: return`。観測できない（または本当に
+Worker が 1 人も居ない）サイクルは何もしない（`sweep_stale_pane_records()` の「mux に聞けなければ
+記録はそのまま残す」と同じ立場）。代償は「Worker が 1 人も居ない間は掃除が進まない」だけ。
+回帰テスト: `tests/test_stale_pane_record_sweep.py::test_rule5_sweep_does_nothing_when_live_is_empty`
+（赤の実証: ガードを外すと落ちることを手元で確認済み — 生きている `Seo.job-since.json` が消える）。
+
+## card 要求 #4（停止スイッチ）の回答
+
+新しい掃除にも `CREWVIA_MUX_RECORD_SWEEP=0` を効かせた（`sweep_rule5_state_markers()` の先頭で
+同じ env を読む）。これは CLAUDE.md 不変条件 5「共有規則に env 停止スイッチを付けない」には
+当たらない — この掃除は dispatcher 1 者だけの持ち物で、plan.sh や他のデーモンと答えが割れる
+共有規則ではない。`knowledge/daemon-authority.md` §7-14 の「掃除は消す側の 1 者なので食い違っても
+危険な側に倒れない」の整理に当たる。既存の `CREWVIA_MUX_RECORD_SWEEP` は意味
+（registry/mux の記録の掃除を止める）が一致するので、専用の新しいスイッチを作らずそのまま
+相乗りした。
+
+## 検討して見送ったもの（card 要求 #4・任意の別件: Director への可視化）
 
 Director が「同じスキルで空いている Worker」を知る手段を足すかどうかを検討した。
 `plan.sh status` は `in_progress` の task に `worker` 名を出すので、「この review task は
@@ -89,6 +128,14 @@ review スキルで**他に誰が登録されているか**」で、これは `r
 **今回は見送った**。今回の誤認の直接の原因は `.state.json` ではなく
 `assign-name.sh`（`--fresh` 無しでは最初に登録された同スキル名を常に返す）の設計そのものに
 あり、別 card として Director に報告する方が筋が良いと判断した。
+
+## 検討して見送ったもの（任意・コスト削減）
+
+`sweep_rule5_state_markers()` のために `tmux_list_worker_windows()` をもう 1 回呼んでいる
+（`dispatch()` が 1 回・`sweep_spawn_grace_markers()` の `_mux.list()` が 1 回・これで 3 回目）。
+1 サイクル 1 回の一覧を使い回せばコストが減るだけでなく「空を観測してしまう機会」も減るが、
+3 関数のシグネチャを跨ぐ変更になるため、今回の P2 修正（`if not live: return` の 1 行）とは
+切り離し、別 card での検討に見送った。
 
 ## 回帰テスト（card 要求 #5）
 

@@ -1483,13 +1483,48 @@ def sweep_rule5_state_markers():
     `_load_job_since` / `_load_usage_limit` have exactly one reader each, all
     inside Rule 5's own notify-debounce logic). Dropping a stale marker only
     means the grace timer restarts from scratch if that name's window ever
-    reappears — the same safe direction `sweep_spawn_grace_markers()` leans.
+    reappears.
+
+    Unlike `sweep_spawn_grace_markers()`, that "restarts from scratch" cost is
+    *not* uniformly safe here (PR #362 review / t020 attempt 2). Every
+    backend's `list()` swallows its own failures into `[]`
+    (`HerdrBackend`: `ws_id is None` or `data is None` both become `[]`), so a
+    cycle where the mux simply cannot be asked is indistinguishable from "no
+    Worker is alive" — and this sweep is keyed on a name being *absent* from
+    `live`, so an empty `live` matches every marker on disk, including live
+    Workers'. `.job-since.json` is the costly one: `_load_job_since` reads
+    "missing" as "first time seeing this job" (`reliable=True, None`), so
+    deleting a live Worker's copy makes `check_rule5()` restart `job_since` at
+    `now` — exactly the failure mode `_load_job_since`'s own docstring named
+    in t082 (BACKGROUND_JOB_MAX_SECONDS never trips, the safety valve itself
+    breaks quiet), reached here through a delete path that did not exist when
+    t082 closed it. `sweep_spawn_grace_markers()` can accept "lists nothing ->
+    unlinks everything" because `.firstseen` only ever costs the *next* spawn
+    its grace window again; these markers instead reset the clock the
+    Director is notified by, so the same direction costs silence, not just
+    margin.
+
+    Guarded against that below (`if not live: return`): an observably-empty
+    cycle — mux down, a transient failure, or genuinely zero Worker windows —
+    sweeps nothing rather than guessing which case it is, the same stance
+    `sweep_stale_pane_records()` takes ("a mux that cannot be asked leaves
+    every record where it is"). The cost is that this sweep makes no progress
+    while no Worker window exists at all; that is strictly better than
+    occasionally deleting a live Worker's timer.
 
     Keyed on the window being absent, not on any one kill path succeeding —
     same shape as `sweep_spawn_grace_markers()`, living beside it for the same
     reason: this daemon owns `registry/mux/`.  Never raises; a failure here is
     a log line, never a failed cycle.
+
+    `CREWVIA_MUX_RECORD_SWEEP=0` also stops this sweep (not just
+    `reap_stale_pane_records()`): it is the existing escape hatch for "stop
+    touching registry/mux records", and this sweep's meaning fits that one
+    switch rather than earning its own (this is a single-owner cleanup, not
+    one of the shared rules CLAUDE.md's invariant 5 keeps env-switch-free).
     """
+    if os.environ.get("CREWVIA_MUX_RECORD_SWEEP") == "0":
+        return
     try:
         markers = (list(STATE_JSON_DIR.glob('*.state.json'))
                    + list(STATE_JSON_DIR.glob('*.job-since.json'))
@@ -1499,6 +1534,8 @@ def sweep_rule5_state_markers():
     if not markers:
         return
     live = {w['agent_name'] for w in tmux_list_worker_windows()}
+    if not live:
+        return
     for marker in markers:
         fname = marker.name
         name = None

@@ -38,6 +38,7 @@
 
 import ast
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -960,6 +961,7 @@ def _rule5_sweep_function(state_dir, live_names, log):
     fn = next(n for n in tree.body
               if isinstance(n, ast.FunctionDef) and n.name == "sweep_rule5_state_markers")
     ns = {
+        "os": os,
         "STATE_JSON_DIR": state_dir,
         "tmux_list_worker_windows": lambda: [
             {"agent_name": n, "window_target": f"{n}-worker"} for n in live_names
@@ -982,10 +984,11 @@ def test_the_dispatcher_cycle_calls_the_rule5_sweep():
 
 
 def test_rule5_sweep_drops_state_marker_for_a_vanished_worker(tmp_path):
-    """事故の再現: 窓の無い名前の `.state.json` は掃除で消える。"""
+    """事故の再現: 他の Worker (Seo) が生きている横で、窓の無い名前 (Hugo) の
+    `.state.json` だけが掃除で消える。"""
     (tmp_path / "Hugo.state.json").write_text(
         json.dumps({"state": "working", "since": 1793590252}), encoding="utf-8")
-    sweep = _rule5_sweep_function(tmp_path, live_names=[], log=lambda *_: None)
+    sweep = _rule5_sweep_function(tmp_path, live_names=["Seo"], log=lambda *_: None)
     sweep()
     assert not (tmp_path / "Hugo.state.json").exists()
 
@@ -999,12 +1002,32 @@ def test_rule5_sweep_keeps_the_marker_for_a_live_worker(tmp_path):
     assert (tmp_path / "Seo.state.json").exists()
 
 
+def test_rule5_sweep_does_nothing_when_live_is_empty(tmp_path):
+    """PR #362 レビュー (t026 attempt 2) P2 の再現と回帰防止。
+
+    `_mux.list()` は各 backend とも失敗を内部で握り潰して `[]` を返すので、
+    `live` が空になるサイクルは「mux が観測できない」ことと「Worker が 1 人も
+    居ない」ことを区別できない。ここで `live` を名前の不在の根拠にすると、
+    観測できない 1 サイクルで **生きている Seo の `.job-since.json` まで**
+    消えてしまい、`check_rule5()` が BACKGROUND_JOB_MAX_SECONDS の計測を
+    `job_since = now` で数え直す (t082 が名指しで塞いだ事故そのもの)。
+    `live_names=[]` のときは何も消さないこと。"""
+    (tmp_path / "Seo.job-since.json").write_text(
+        json.dumps({"job_since": 1.0}), encoding="utf-8")
+    (tmp_path / "Hugo.state.json").write_text(
+        json.dumps({"state": "working", "since": 1793590252}), encoding="utf-8")
+    sweep = _rule5_sweep_function(tmp_path, live_names=[], log=lambda *_: None)
+    sweep()
+    assert (tmp_path / "Seo.job-since.json").exists()
+    assert (tmp_path / "Hugo.state.json").exists()
+
+
 def test_rule5_sweep_drops_job_since_and_usage_limit_markers_too(tmp_path):
     (tmp_path / "Hugo.job-since.json").write_text(
         json.dumps({"job_since": 1.0}), encoding="utf-8")
     (tmp_path / "Hugo.usage-limit.json").write_text(
         json.dumps({"first_seen": 1.0}), encoding="utf-8")
-    sweep = _rule5_sweep_function(tmp_path, live_names=[], log=lambda *_: None)
+    sweep = _rule5_sweep_function(tmp_path, live_names=["Seo"], log=lambda *_: None)
     sweep()
     assert not (tmp_path / "Hugo.job-since.json").exists()
     assert not (tmp_path / "Hugo.usage-limit.json").exists()
@@ -1015,7 +1038,7 @@ def test_rule5_sweep_leaves_unrelated_registry_files_alone(tmp_path):
     ここでは触らない (glob は 3 つの拡張子だけ)。"""
     (tmp_path / "Hugo.firstseen").write_text("", encoding="utf-8")
     (tmp_path / "Hugo-worker.json").write_text("{}", encoding="utf-8")
-    sweep = _rule5_sweep_function(tmp_path, live_names=[], log=lambda *_: None)
+    sweep = _rule5_sweep_function(tmp_path, live_names=["Seo"], log=lambda *_: None)
     sweep()
     assert (tmp_path / "Hugo.firstseen").exists()
     assert (tmp_path / "Hugo-worker.json").exists()
@@ -1024,7 +1047,7 @@ def test_rule5_sweep_leaves_unrelated_registry_files_alone(tmp_path):
 def test_rule5_sweep_logs_what_it_dropped(tmp_path):
     (tmp_path / "Hugo.state.json").write_text("{}", encoding="utf-8")
     lines = []
-    sweep = _rule5_sweep_function(tmp_path, live_names=[], log=lines.append)
+    sweep = _rule5_sweep_function(tmp_path, live_names=["Seo"], log=lines.append)
     sweep()
     assert len(lines) == 1 and "Hugo" in lines[0]
 
@@ -1033,5 +1056,15 @@ def test_rule5_sweep_can_never_fail_a_cycle():
     class Broken:
         def glob(self, pattern):
             raise OSError("boom")
-    sweep = _rule5_sweep_function(Broken(), live_names=[], log=lambda *_: None)
+    sweep = _rule5_sweep_function(Broken(), live_names=["Seo"], log=lambda *_: None)
     sweep()  # 例外を出さない
+
+
+def test_rule5_sweep_respects_the_record_sweep_switch(tmp_path, monkeypatch):
+    """`CREWVIA_MUX_RECORD_SWEEP=0` は `reap_stale_pane_records()` だけでなく
+    この掃除も止める (card 要求 #4)。"""
+    (tmp_path / "Hugo.state.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("CREWVIA_MUX_RECORD_SWEEP", "0")
+    sweep = _rule5_sweep_function(tmp_path, live_names=["Seo"], log=lambda *_: None)
+    sweep()
+    assert (tmp_path / "Hugo.state.json").exists()

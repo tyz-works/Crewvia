@@ -107,6 +107,7 @@ def test_wrong_types_and_broken_yaml_are_errors_never_codex(tmp_path, text):
 ])
 def test_without_pyyaml_an_existing_config_is_an_error_never_codex(tmp_path, monkeypatch, text):
     monkeypatch.setattr(lre, "yaml", None)
+    monkeypatch.setattr(lre.lib_config, "yaml", None)   # 読み口は lib_config
     cfg = tmp_path / "c.yaml"
     cfg.write_text(text)
     with pytest.raises(lre.ReviewConfigError) as e:

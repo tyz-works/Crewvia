@@ -4816,6 +4816,28 @@ def _rex_input_box(screen: str):
     return None
 
 
+def _verify_sent_via_box(screen: str, text: str) -> bool:
+    """Shared ``verify_sent()`` judgement (t019): look only inside Claude
+    Code's input box (``_rex_input_box()``) when one is on screen — the
+    conversation transcript echoes a submitted message as `❯ <message>` too,
+    which the plain `_text_in_input_line()` tail-scan cannot tell apart from
+    an unsent one still sitting in the box. Falls back to that tail-scan only
+    when no box can be found at all (dialog, spinner redraw).
+
+    Every caller captures a plain-text rendering of the same Claude Code TUI
+    (``tmux capture-pane -p`` / ``herdr pane read --source visible`` / Rex
+    ``capture --trim`` / hc ``read``), so the box's structure — a `❯` line
+    between two horizontal rules — is identical regardless of backend; this
+    is the one definition (previously copied between ``RexBackend.
+    verify_sent`` and ``HcBackend.verify_sent``, with the base path used by
+    Tmux / Herdr left on the tail-scan alone — see ``Mux.verify_sent()``)."""
+    box = _rex_input_box(screen)
+    if box is None:
+        return not _text_in_input_line(
+            screen, text, tail_lines=_VERIFY_SENT_TAIL_LINES)
+    return text[:30] not in "\n".join(box)
+
+
 def _rex_input_is_empty(screen: str) -> Optional[bool]:
     """True: the box shows only `❯`.  False: there is anything after it (real
     text *or* the dimmed suggestion — they cannot be told apart from one
@@ -5459,11 +5481,7 @@ class RexBackend(_Backend):
         screen = self.capture(name)
         if not screen:
             return False
-        box = _rex_input_box(screen)
-        if box is None:
-            return not _text_in_input_line(
-                screen, text, tail_lines=_VERIFY_SENT_TAIL_LINES)
-        return text[:30] not in "\n".join(box)
+        return _verify_sent_via_box(screen, text)
 
     def capture(self, name: str) -> str:
         self._guard("capture", name)
@@ -6267,11 +6285,7 @@ class HcBackend(_Backend):
         screen = self.capture(name)
         if not screen:
             return False
-        box = _rex_input_box(screen)
-        if box is None:
-            return not _text_in_input_line(
-                screen, text, tail_lines=_VERIFY_SENT_TAIL_LINES)
-        return text[:30] not in "\n".join(box)
+        return _verify_sent_via_box(screen, text)
 
 
 # ---------------------------------------------------------------------------
@@ -6350,20 +6364,24 @@ class Mux:
     def verify_sent(self, name: str, text: str) -> bool:
         """Return True if `text` has left the pane's active input line.
 
-        `send()` on both backends is best-effort: TmuxBackend.send() never
-        confirms delivery at all, and HerdrBackend.send() only patches a
-        dropped Enter — neither actually proves the caller's message reached
-        Claude.  This re-captures the pane and re-runs the same
-        `_text_in_input_line()` heuristic `send()` uses internally for its
-        Enter insurance, so callers (start.sh kickoff) can detect a message
-        that never left the input line and retry instead of trusting the
-        `True` that `send()` already returned.
+        `send()` is best-effort on every backend: TmuxBackend.send() never
+        confirms delivery at all, HerdrBackend.send() only patches a dropped
+        Enter, and neither actually proves the caller's message reached
+        Claude. This re-captures the pane and checks whether `text` is still
+        sitting in the input box (`_verify_sent_via_box()`), so callers
+        (start.sh kickoff) can detect a message that never left the input
+        line and retry instead of trusting the `True` that `send()` already
+        returned.
 
-        Uses a wider ``tail_lines`` window than send()'s own Enter insurance
-        (see ``_VERIFY_SENT_TAIL_LINES`` / t007 F1) since a real pane has a
-        multi-line TUI footer below the input line and a long kickoff message
-        may wrap across several lines above it, both of which can push the
-        ``❯`` prompt line out of a narrow tail window on smaller terminals.
+        t019: this base path (used by Tmux / Herdr, which do not override
+        `verify_sent()`) used to be the plain `_text_in_input_line()`
+        tail-scan, which treats *any* `❯` line in the screen tail as "the
+        input line" — including Claude Code's own transcript echo of an
+        already-submitted message. `RexBackend` / `HcBackend` fixed this for
+        themselves (t015) by looking only inside the real input box; this
+        applies the same fix here, since every backend captures a plain-text
+        rendering of the same Claude Code TUI (same `❯` / rule structure
+        regardless of how the backend gets the screen).
 
         Returns True when `text` is NOT sitting unsent in the input line
         (i.e. it was submitted, or the pane never had it to begin with).
@@ -6375,18 +6393,17 @@ class Mux:
         all, and there is no way to tell those apart here — so an empty
         capture is treated as "cannot confirm delivery", not as "landed".
         """
-        # Rex has the real input box on screen; its own judgement (not the
-        # `❯`-line heuristic below) is the one the production path must use.
-        # HcBackend's own verify_sent() is, today, the same heuristic (see
-        # its docstring for why) — routed through it anyway so a backend-
-        # specific improvement has a place to land without touching this
-        # isinstance check again (design doc §10-5).
+        # Rex / hc have their own verify_sent() (identical judgement, called
+        # through the isinstance check so a backend-specific improvement has
+        # a place to land without touching this check again — design doc
+        # §10-5). Every other backend (Tmux, Herdr) falls through to the same
+        # judgement here.
         if isinstance(self._backend, (RexBackend, HcBackend)):
             return self._backend.verify_sent(name, text)
         screen = self.capture(name)
         if not screen:
             return False
-        return not _text_in_input_line(screen, text, tail_lines=_VERIFY_SENT_TAIL_LINES)
+        return _verify_sent_via_box(screen, text)
 
 
 # ---------------------------------------------------------------------------

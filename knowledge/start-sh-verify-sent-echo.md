@@ -162,11 +162,44 @@ attempt 1 の `_rex_input_box()` は画面の**先頭から最初の**罫線ペ�
   （「今の本番 backend ではなく、この事故に紐づいていない」という t015 初回の判断は誤りだった）。
   この PR では直していない。`mode: hc  # 戻す時は herdr` で戻した先にこの欠陥が残ることは
   上の「運用上の帰結」に明記した。base 経路自体を直すかどうかは Director が別 card として
-  判断する。
+  判断する。**→ t019 で解消（下の節）**。
 - `lib_irc_relay.py` の `input_box_state()` 自体を `lib_mux.py` に寄せて単一実装にする統合 —
   スコープが異なる（ダイアログ / busy 判定を含む）ので、このミッションでは行っていない。
   「判定ロジックが 2 箇所にある」の解消は `_rex_input_box()` を hc に広げたことで、
-  **start.sh の kickoff 確認経路については**解消済み。
+  **start.sh の kickoff 確認経路については**解消済み。**→ t019 で再検討（下の節。結論は変わらず）**。
+
+## t019: base 経路 (Tmux / Herdr) にも適用した (20261109-codex-hc)
+
+上の「対象外にしたもの」1 点目を解消した。`Mux.verify_sent()` の `isinstance(self._backend,
+(RexBackend, HcBackend))` の分岐自体は変えていない（Rex / hc の本番経路は無改修）。変えたのは
+その else（Tmux / Herdr が落ちる base path）で、旧 `_text_in_input_line()` 単独の判定を
+`_rex_input_box()` 経由の box 判定に差し替えた。
+
+- **capture の出力形式の前提**: tmux `capture-pane -p` と herdr `pane read --source visible`
+  は、どちらも Rex `capture --trim` / hc `read` と同じく、同じ Claude Code TUI の画面を
+  プレーンテキストでレンダリングしたもの（ANSI を含まない・`❯` / `─` の文字がそのまま出る）。
+  既存の fixture（`tests/lib-mux.bats` の `_write_wrapped_pane_fixture`。tmux と herdr の両方の
+  F1 回帰テストが同じ画面文字列を共有）がこの前提にすでに依存しており、今回追加した box 判定の
+  回帰テストも tmux / herdr の両方で同じ fixture 文字列で緑になることを確認した。したがって
+  **tmux / herdr にも Rex / hc と同じ box 判定をそのまま適用してよい**（形式の違いを理由に
+  適用を見送る必要は無かった）。
+- **重複の一本化（card 要求 #3 の再検討）**: この変更で `lib_mux.py` 内に 3 回コピーされていた
+  「box が見つかれば中だけ見る、無ければ `_text_in_input_line()` にフォールバック」という同じ
+  4 行（`RexBackend.verify_sent` / `HcBackend.verify_sent` / `Mux.verify_sent` の base path）を
+  `_verify_sent_via_box(screen, text)` の 1 関数にまとめた。`RexBackend.verify_sent` /
+  `HcBackend.verify_sent` はこの関数を呼ぶだけになったが、渡す `screen` の取得元（各 backend 自身の
+  `capture()`）も計算結果もまったく変わらない（挙動を変えない純粋なリファクタ）。
+  `lib_irc_relay.py` の `input_box_state()` との統合は、上の「対象外にしたもの」2 点目の判断
+  （スコープが異なる・`lib_irc_relay.py` は `lib_mux.py` を import しない独立したモジュールで、
+  duck-typed な `mux` オブジェクト経由でしか mux を知らない設計）を再確認した上で、今回も見送った
+  — 理由は変わっていない。
+- **回帰テスト**: `tests/lib-mux.bats` に tmux / herdr それぞれ 3 本（echo のみ → True / 本当に
+  枠の中 → False / 古い空の枠が上・生きた枠に本文が残る → False）を追加（P2 の真理値表のうち
+  box 判定に関わる 3 行。4 行目「枠が無い → フォールバック」は既存の `exit 1 when text is still
+  stuck` / F1 regression テストがすでに固定していたので重複させていない）。赤の実証:
+  `scripts/lib_mux.py` だけを変更前に戻して同じテストを走らせ、echo の 2 本が落ちることを確認済み
+  （他の 2 本は旧 `_text_in_input_line()` の `any()` が既にこの fixture を正しく判定できていたため
+  変更前後で緑のまま — box 判定が無くても誤検知しない組み合わせだった）。
 
 ## 戻し方
 
@@ -175,3 +208,10 @@ PR revert → `scripts/sync-main-checkout.sh`。`HcBackend.verify_sent()` は PR
 の末尾窓・下向き探索（P2 の修正）も一緒に戻るため、`RexBackend.verify_sent()` も attempt 1 の
 「先頭から最初の枠」の危険な挙動に戻る** — hc だけでなく Rex にも影響する revert である点に注意。
 他のファイルは一切変更していない。
+
+**t019 の revert**: `_verify_sent_via_box()`（`RexBackend.verify_sent` / `HcBackend.verify_sent` /
+`Mux.verify_sent` の base path が共有する 1 関数）と、base path（Tmux / Herdr）の box 判定が
+元の `_text_in_input_line()` 単独の実装に戻る。Rex / hc 側は revert で元の（t019 以前の）
+3 つの inline 実装に分かれるだけで、判定結果は変わらない（t019 はリファクタのみでこの 2 つの
+挙動を変えていない）。`tests/lib-mux.bats` の t019 回帰テストのうち echo の 2 本（tmux / herdr）
+が赤になる。

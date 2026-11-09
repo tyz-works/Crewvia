@@ -164,8 +164,22 @@ grep -l '"backend"' registry/mux/*.json 2>/dev/null   # 何も出なければ OK
 ```
 もし `"backend":"herdr"` の record がまだ残っていれば、その名前の pane が kill に失敗している
 （`crewvia-stop.sh` の出力に理由が出る——大抵は「foreign だと判定された」か「herdr に到達できなかった」。
-`--force` オプションは `crewvia-stop.sh` 自体には無いので、個別に `lib_daemon_watch.py restart <name>
---force` で決着をつけてから次に進む）。
+決着のつけ方は 2 つ: ① `scripts/crewvia-stop.sh --force` をもう一度実行する（上で既に打ったのと同じ
+コマンド——べき等で、まだ残っている名前だけが対象になる）。② 個別に
+`python3 scripts/lib_mux.py kill <name> --force` を打つ（`--force` は `lib_mux.py` 自身のオプション
+——`crewvia-stop.sh:32` が内部で呼んでいるのと同じ形。実測（`CREWVIA_MUX_TEST_ISOLATION=1 python3
+scripts/lib_mux.py kill`）: `Usage: lib_mux.py kill <name> [--force]`（`scripts/lib_mux.py:6436`）、
+exit 2）。
+**`lib_daemon_watch.py restart` はここでは使わない**——理由は 2 つ。(a) `restart` の CLI は
+`name` の `choices=DAEMONS`（`dispatcher`/`watchdog` だけ、`:1846`）で、`*-director` / `*-worker` の
+名前はそもそも受け付けられず弾かれる。(b) `dispatcher` / `watchdog` 自身に対してでも、この時点では
+config がまだ `mode: herdr` のまま（3.3 はまだ先）なので、`restart` を打つと kill の直後に
+**同じ `Mux()` インスタンス（= 同じ herdr backend、3.1 のとおり kill と spawn は同じインスタンスを
+使う）で spawn し直してしまう**（`:1816`、`spawn_daemon()` は `restart()` が渡した同じ `mux` を使う）。
+消したかったはずの herdr の dispatcher/watchdog を自分の手で生き返らせることになり、これは
+「全停止したつもりが実は何も消えていない」という、§5 が最も警戒する症状をこの手順自身が作る
+——だからこの決着は常に① `crewvia-stop.sh --force` か② `lib_mux.py kill <name> --force` の
+どちらかで行い、`restart` には進まない。
 
 **もし herdr の record を残したまま 3.3〜3.4 に進んでしまったら（コードを読んで確認した挙動）**:
 危険側には倒れない。`reap_stale_pane_records()`（`scripts/lib_mux.py:1862-`）——dispatcher が毎サイクル

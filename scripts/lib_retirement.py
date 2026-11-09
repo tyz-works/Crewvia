@@ -902,6 +902,7 @@ def build_progress(previous: Optional[dict], phase: str, **fields) -> dict:
         ("pending_report", None),
         ("sigkill_attempts", 0),
         ("sigkill_report_sent", False),
+        ("pgid", None),
     ):
         doc.setdefault(key, default)
     return doc
@@ -954,6 +955,65 @@ def _default_run_command(argv: list, env: dict) -> Tuple[int, str]:
     return proc.returncode, (out or "") + (err or "")
 
 
+def proc_group_leader(pid: int) -> Optional[int]:
+    """`pid` if it is alive and the leader of its own process group, else None.
+
+    start.sh runs `exec claude` in a window whose shell is the session/group leader, so the recorded
+    pane_pid names a group that holds claude and everything claude started (MCP servers, Bash tool
+    shells).  Anything that cannot be shown (dead pid, not a leader, our own group) answers None, and
+    the retirement then behaves exactly as it did before groups existed (pane_pid only).
+    """
+    try:
+        pid = int(pid)
+        if pid <= 1 or os.getpgid(pid) != pid or pid == os.getpgrp():
+            return None
+    except (TypeError, ValueError, OSError):
+        return None
+    return pid if process_alive(pid) else None
+
+
+def proc_group_members(pgid: int) -> Optional[list]:
+    """Live (non-zombie) pids whose process group is `pgid`; None = could not be observed.
+
+    The kernel never reuses a pid while a group still carries it as pgid, so a non-empty answer is
+    necessarily the group that was recorded — not a stranger that inherited the number.
+    """
+    members = []
+    try:
+        entries = list(Path("/proc").iterdir())
+    except OSError:
+        return None
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            stat = (entry / "stat").read_text(errors="replace")
+        except (FileNotFoundError, ProcessLookupError):
+            continue            # exited while we scanned
+        except OSError:
+            return None         # cannot read it: do not call the group empty
+        try:
+            fields = stat[stat.rindex(")") + 2:].split()
+            state, pgrp = fields[0], int(fields[2])
+        except (ValueError, IndexError):
+            return None
+        if pgrp == pgid and state != "Z":
+            members.append(int(entry.name))
+    return members
+
+
+def _default_kill_group(pgid: int, sig: int) -> bool:
+    if pgid <= 1 or pgid == os.getpgrp():
+        return False
+    try:
+        os.killpg(pgid, sig)
+        return True
+    except ProcessLookupError:
+        return True      # empty already — the outcome we wanted
+    except OSError:
+        return False
+
+
 def _default_kill_process(pid: int, sig: int) -> bool:
     try:
         os.kill(pid, sig)
@@ -980,6 +1040,7 @@ class RetirementExecutor:
                  log=None, notify=None, plan_sh=None, queue_dir=None,
                  grace_period: int = 60, kill_delay: int = 10,
                  run_command=None, kill_process=None, now=None,
+                 group_leader=None, group_members=None, kill_group=None,
                  notify_once=None, checkpoint_seconds: float = 20,
                  take_checkpoint=None) -> None:
         self.registry_dir = Path(registry_dir)
@@ -994,6 +1055,10 @@ class RetirementExecutor:
         self.kill_delay = kill_delay
         self.run_command = run_command or _default_run_command
         self.kill_process = kill_process or _default_kill_process
+        # Process-group seams (knowledge/retirement-process-group.md).
+        self.group_leader = group_leader or proc_group_leader
+        self.group_members = group_members or proc_group_members
+        self.kill_group = kill_group or _default_kill_group
         self.now = now or time.time
         self._live_windows: set = set()
         self._listing_authority: Optional[bool] = None
@@ -1388,6 +1453,18 @@ class RetirementExecutor:
         if recorded is not None:
             if process_alive(recorded):
                 return False, f"recorded pane_pid {recorded} is still running"
+            # The shell dying is not the Worker dying: claude is a child in the same group and
+            # outlives a shell that took SIGTERM.  Only when `_start` recorded the group (it proved
+            # pane_pid led it) is the group asked; no record = the old pane_pid-only answer.
+            pgid = recorded_pid((prog or {}).get("pgid"))
+            if pgid is not None:
+                members = self.group_members(pgid)
+                if members is None:
+                    return False, f"process group {pgid} could not be observed"
+                if members:
+                    return False, (f"recorded pane_pid {recorded} is gone but process group "
+                                   f"{pgid} still has {len(members)} live process(es)")
+                return True, f"recorded pane_pid {recorded} is gone and process group {pgid} is empty"
             return True, f"recorded pane_pid {recorded} is gone"
         if self._window_alive(target):
             return False, f"window {target!r} is still listed"
@@ -1857,12 +1934,20 @@ class RetirementExecutor:
         if pane_pid is None:
             self.log(f"[retire] {agent}: window {target!r} alive but pane pid unreadable — waiting")
             return "skipped"
+        # pane_pid vouched for by the guard; the group is only used if it is led by exactly that pid.
+        pgid = self.group_leader(int(pane_pid))
         if not self._write_progress(agent, prog, PHASE_SIGTERM_SENT,
                                     deadline=self.now() + self.kill_delay,
-                                    pane_pid=int(pane_pid)):
+                                    pane_pid=int(pane_pid), pgid=pgid):
             return "blocked"
-        if self.kill_process(int(pane_pid), signal.SIGTERM):
-            self.log(f"[retire] {agent}: SIGTERM → pid {pane_pid}")
+        if pgid is not None:
+            sent = self.kill_group(pgid, signal.SIGTERM)
+            target_desc = f"process group {pgid} (pane_pid {pane_pid})"
+        else:
+            sent = self.kill_process(int(pane_pid), signal.SIGTERM)
+            target_desc = f"pid {pane_pid}"
+        if sent:
+            self.log(f"[retire] {agent}: SIGTERM → {target_desc}")
         else:
             # Not fatal to the machine — the SIGKILL step re-signals after
             # kill_delay and, unlike here, refuses to conclude anything from a
@@ -1885,6 +1970,18 @@ class RetirementExecutor:
         if self.now() < (prog.get("deadline") or 0):
             return None
 
+        # The shell we SIGTERMed is gone but the group it led is not (claude ignoring SIGTERM).  The
+        # identity guard cannot run any more — it compares against a pane_pid that no longer exists and
+        # would read that as "a successor owns this window" — so this step is bound by what `_start`
+        # proved and recorded instead: the pgid.  A pid is never reused while a group carries it, so a
+        # non-empty group is the instance we signalled, and a successor would have a different pgid.
+        orphan_pgid = self._orphaned_group(prog)
+        if orphan_pgid == -1:
+            self.log(f"[retire] {agent}: process group could not be observed — holding (nothing killed)")
+            return "skipped"
+        if orphan_pgid is not None:
+            return self._sigkill_orphaned_group(agent, prog, orphan_pgid)
+
         verdict, why, identity = self._guard(agent, req, target)
         if verdict == GUARD_SKIP:
             self.log(f"[retire] {agent}: REFUSING SIGKILL — {why}")
@@ -1906,13 +2003,51 @@ class RetirementExecutor:
             return "skipped"
 
         pid = int(pane_pid)
+        pgid = recorded_pid(prog.get("pgid"))
         attempts = int(prog.get("sigkill_attempts") or 0) + 1
-        delivered = self.kill_process(pid, signal.SIGKILL)
-        if delivered:
-            self.log(f"[retire] {agent}: SIGKILL → pid {pid}")
+        if pgid is not None:
+            delivered = self.kill_group(pgid, signal.SIGKILL)
         else:
-            self.log(f"[retire] {agent}: WARNING SIGKILL to pid {pid} was not delivered "
+            delivered = self.kill_process(pid, signal.SIGKILL)
+        what = f"process group {pgid}" if pgid is not None else f"pid {pid}"
+        if delivered:
+            self.log(f"[retire] {agent}: SIGKILL → {what}")
+        else:
+            self.log(f"[retire] {agent}: WARNING SIGKILL to {what} was not delivered "
                      f"(attempt {attempts})")
+        return self._settle_sigkill(agent, prog, pid, pgid, delivered, attempts)
+
+    def _orphaned_group(self, prog: dict) -> Optional[int]:
+        """pgid when the recorded shell is dead but its recorded group still has live processes; -1 = unobservable."""
+        pgid = recorded_pid(prog.get("pgid"))
+        pane_pid = recorded_pid(prog.get("pane_pid"))
+        if pgid is None or pane_pid is None or process_alive(pane_pid):
+            return None
+        members = self.group_members(pgid)
+        if members is None:
+            # Cannot tell whether the group is empty: neither kill nor discard (the guard below would
+            # read the dead shell as a successor and drop the marker).  Hold; the next cycle re-asks.
+            return -1
+        return pgid if members else None
+
+    def _sigkill_orphaned_group(self, agent: str, prog: dict, pgid: int) -> Optional[str]:
+        if not self.repo_identity_check():
+            self.log(f"[retire] {agent}: REFUSING SIGKILL of process group {pgid} — "
+                     f"self-identity check failed for repo_root={self.repo_root}")
+            return "skipped"
+        pid = recorded_pid(prog.get("pane_pid")) or pgid
+        attempts = int(prog.get("sigkill_attempts") or 0) + 1
+        delivered = self.kill_group(pgid, signal.SIGKILL)
+        if delivered:
+            self.log(f"[retire] {agent}: SIGKILL → process group {pgid} "
+                     f"(shell {pid} already gone, group still alive)")
+        else:
+            self.log(f"[retire] {agent}: WARNING SIGKILL to process group {pgid} was not "
+                     f"delivered (attempt {attempts})")
+        return self._settle_sigkill(agent, prog, pid, pgid, delivered, attempts)
+
+    def _settle_sigkill(self, agent: str, prog: dict, pid: int, pgid: Optional[int],
+                        delivered: bool, attempts: int) -> Optional[str]:
 
         # A delivered signal is not a death.  `os.kill` returns once the
         # signal is queued, and the phase we are about to write is the one
@@ -1921,7 +2056,7 @@ class RetirementExecutor:
         # merely succeeded.  Confirmation is bounded (R2): what cannot be
         # shown this cycle is re-checked next cycle, with the marker still in
         # flight, rather than blocking the daemon.
-        if self._await_exit(pid, KILL_CONFIRM_WINDOW if delivered else 0.0):
+        if self._await_exit(pid, KILL_CONFIRM_WINDOW if delivered else 0.0, pgid):
             # Written after the signal deliberately: the intent to SIGKILL was
             # already durable as "sigterm_sent with an expired deadline" (R1),
             # and a crash between the two leaves that same state, which this
@@ -1945,7 +2080,13 @@ class RetirementExecutor:
                              sigkill_report_sent=reported)
         return "sigkill_unconfirmed"
 
-    def _await_exit(self, pid: int, window: float) -> bool:
+    def _group_empty(self, pgid: Optional[int]) -> bool:
+        """True when there is no group to wait for, or it is proven empty (unobservable = not empty)."""
+        if pgid is None:
+            return True
+        return self.group_members(pgid) == []
+
+    def _await_exit(self, pid: int, window: float, pgid: Optional[int] = None) -> bool:
         """True once `pid` is gone; polls for at most `window` seconds.
 
         Real time on purpose — `self.now` is the injectable clock the phase
@@ -1954,14 +2095,14 @@ class RetirementExecutor:
         fake clock cannot shorten.  The window is small and only ever paid on
         a cycle that just killed something.
         """
-        if not process_alive(pid):
+        if not process_alive(pid) and self._group_empty(pgid):
             return True
         deadline = time.monotonic() + max(0.0, window)
         while time.monotonic() < deadline:
             time.sleep(0.05)
-            if not process_alive(pid):
+            if not process_alive(pid) and self._group_empty(pgid):
                 return True
-        return not process_alive(pid)
+        return not process_alive(pid) and self._group_empty(pgid)
 
     def _orphaned(self, agent: str, prog: dict) -> str:
         """Progress with no request: the request was deleted mid-flight.

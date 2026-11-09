@@ -380,6 +380,10 @@ ALLOWED_DIRECT_READS = {
     ("lib_retirement.py", "process_alive",
      'Path(f"/proc/{pid}/stat").read_text(errors="replace")'):
         "同上 (t101: 同じ理由で errors=\"replace\" を追加)",
+    ("lib_retirement.py", "proc_group_members",
+     '(entry / "stat").read_text(errors="replace")'):
+        "同上 (/proc の procfs。退役が process group の生き残りを数える。errors=\"replace\" は process_alive と同じ理由。"
+        "読めない entry は group を空と見なさず None = 観測できない)",
     ("lib_daemon_watch.py", "process_generation",
      'Path(proc_root, str(pid), "stat").read_text(encoding="utf-8", errors="replace")'):
         "同上 (t101: 同じ理由で errors=\"replace\" を追加)",

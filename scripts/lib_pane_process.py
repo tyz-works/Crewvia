@@ -612,6 +612,18 @@ def _classify(root_pid: int, notes: Optional[list[str]]) -> ProcessSignal:
 
     direct = children.get(root_pid, [])
     if not direct:
+        # start.sh は `exec claude` で起動するので、pane root (記録される pane_pid) 自身が
+        # セッション本体のことがある (退役が process group ごと止められるようにするため。
+        # knowledge/retirement-process-group.md)。その root に子が無いのは「claude が落ちた」では
+        # なく「claude だけが居て job も MCP も無い」= idle_process。exe が読めない (消滅以外) ときは
+        # 従来どおり no_process に潰さず unknown。
+        try:
+            if _is_session_body(root_pid):
+                return "idle_process"
+        except OSError as exc:
+            if notes is not None:
+                notes.append(f"pane root pid={root_pid} exe unreadable errno={_errno_name(exc)}")
+            return "unknown"
         return "no_process"
 
     # root 配下を幅優先で走査 (root 自身は含めない)。親の分類を子に伝播するので

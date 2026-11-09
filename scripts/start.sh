@@ -934,7 +934,7 @@ PYEOF
   # 起動する**（直接確認済み）。ここだけ `&&` にし、`cd` の失敗を後続に伝播させる。
   # それより前の export / unset は代入・変数削除であり、失敗しても後続の意味が変わらない
   # (族A の棚卸し: LAUNCH_CMD 内で「前のコマンドの失敗を握り潰すと危険」なのはこの 1 箇所だけ)。
-  LAUNCH_CMD="$ENV_EXPORTS; export PATH=$(_shq "${REPO_ROOT}/scripts/bin:")\"\$PATH\"; unset CLAUDE_CODE_CHILD_SESSION; ${_TRUST_UNSET_STALE_CONFIG_DIR}cd $(_shq "$WORK_DIR") && claude${MODEL_CLI_ARG}${SETTINGS_CLI_ARG}${PERMISSION_MODE_CLI_ARG}"
+  LAUNCH_CMD="$ENV_EXPORTS; export PATH=$(_shq "${REPO_ROOT}/scripts/bin:")\"\$PATH\"; unset CLAUDE_CODE_CHILD_SESSION; ${_TRUST_UNSET_STALE_CONFIG_DIR}cd $(_shq "$WORK_DIR") && exec claude${MODEL_CLI_ARG}${SETTINGS_CLI_ARG}${PERMISSION_MODE_CLI_ARG}"
 
   # Drop spawn records whose pane is gone (a retired Worker's pane closes without
   # `kill()`, so its record outlives it).  Housekeeping only: the answer never

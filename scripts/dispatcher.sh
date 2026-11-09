@@ -293,12 +293,15 @@ class _NoMux:
         raise RuntimeError('mux_unavailable: config unreadable')
 
 
-try:
-    _mux = Mux()
-    _MUX_CONFIG_PROBLEM = None
-except _MuxConfigUnreadable as _e:
-    _mux = _NoMux()
-    _MUX_CONFIG_PROBLEM = _e.code
+def _build_mux():
+    """(mux, config の問題コード)。`Mux()` が config 壊れで投げたら空の mux + 固定コード。"""
+    try:
+        return Mux(), None
+    except _MuxConfigUnreadable as _e:
+        return _NoMux(), _e.code
+
+
+_mux, _MUX_CONFIG_PROBLEM = _build_mux()
 
 # t002: who may end a Worker process.  'watchdog' (default) = this daemon only
 # writes retirement markers and watchdog executes them; 'dispatcher' = the
@@ -3673,13 +3676,13 @@ def run_irc_cycle():
 # would otherwise take the observer down with it — at exactly the moment the
 # system is least healthy and most in need of it.
 run_daemon_watch()
+check_main_checkout_drift()
 if _MUX_CONFIG_PROBLEM is not None:
     # backend を選べない (config 壊れ・env に CREWVIA_MUX 無し)。割り当ても退役も kill もせず、
     # 「見送り + 一度だけ通知」(effective_config_readable) だけ行って終わる。直れば次のサイクルで再開。
     log(f'WARNING: mux backend を選べない (config unreadable: {_MUX_CONFIG_PROBLEM}) — このサイクルは見送る')
     effective_config_readable()
     sys.exit(0)
-check_main_checkout_drift()
 # Telegram は dispatch() の成否から独立させる (心拍 = `ask` が見る受信側の生存表明。dispatch が毎回落ちても止めない)
 run_telegram_cycle()
 # IRC 呼びかけ中継 (t007)。未設定 (irc.enabled が true でない) なら何も読まない

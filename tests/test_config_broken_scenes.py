@@ -31,6 +31,7 @@ sys.path.insert(0, str(TESTS))
 
 import lib_config  # noqa: E402
 import lib_mux  # noqa: E402
+from fixture_tree import copy_plan_tree  # noqa: E402
 from test_dispatcher_notify_once import FakeMux, Harness  # noqa: E402
 
 GOOD = "mode: tmux\napproval_channel:\n  mode: ntfy\n  ntfy:\n    url: http://ntfy.invalid\n    topic: tp\n"
@@ -122,7 +123,7 @@ def test_dispatcher_module_survives_mux_config_unreadable(h, monkeypatch):
 def test_dispatcher_whole_cycle_has_no_traceback_when_mux_config_unreadable(tmp_path):
     root = tmp_path / "repo"
     # lib_mux の Mux() は自分の scripts/ の親の config を読む: scripts を repo に写して同じ root にする
-    shutil.copytree(SCRIPTS, root / "scripts", ignore=shutil.ignore_patterns("__pycache__"))
+    copy_plan_tree(root)
     for d in ("registry", "queue/missions", "queue/archive"):
         (root / d).mkdir(parents=True)
     subprocess.run(["git", "init", "-q", str(root)], check=True)
@@ -144,7 +145,8 @@ def test_dispatcher_whole_cycle_has_no_traceback_when_mux_config_unreadable(tmp_
 
 def test_watchdog_imports_and_waits_when_mux_config_unreadable(tmp_path):
     root = tmp_path / "repo"
-    shutil.copytree(SCRIPTS, root / "scripts", ignore=shutil.ignore_patterns("__pycache__", "tests"))
+    copy_plan_tree(root)
+    (root / "scripts" / "watchdog.py").write_bytes((SCRIPTS / "watchdog.py").read_bytes())
     (root / "registry").mkdir()
     subprocess.run(["git", "init", "-q", str(root)], check=True)
     _write_config(root, local=BROKEN)
@@ -168,10 +170,8 @@ def test_watchdog_imports_and_waits_when_mux_config_unreadable(tmp_path):
 
 def _hook_tree(tmp_path: Path, local: str | None) -> Path:
     root = tmp_path / "repo"
-    (root / "scripts").mkdir(parents=True)
+    copy_plan_tree(root)
     (root / "hooks").mkdir()
-    for f in ("lib_config.py", "lib_task_cards.py"):
-        shutil.copy(SCRIPTS / f, root / "scripts" / f)
     for f in (REPO / "hooks").iterdir():
         if f.is_file():
             shutil.copy(f, root / "hooks" / f.name)
@@ -221,11 +221,9 @@ def test_approval_channel_reads_config_with_one_python_start(tmp_path):
 
 def test_review_plan_stops_on_unreadable_config(tmp_path):
     root = tmp_path / "repo"
-    (root / "scripts").mkdir(parents=True)
-    shutil.copy(SCRIPTS / "review-plan.sh", root / "scripts" / "review-plan.sh")
-    for f in ("lib_config.py", "lib_task_cards.py", "lib_model.py"):
-        if (SCRIPTS / f).exists():
-            shutil.copy(SCRIPTS / f, root / "scripts" / f)
+    copy_plan_tree(root)
+    (root / "scripts" / "review-plan.sh").write_bytes((SCRIPTS / "review-plan.sh").read_bytes())
+    (root / "scripts" / "review-plan.sh").chmod(0o755)
     subprocess.run(["git", "init", "-q", str(root)], check=True)
     _write_config(root, local=BROKEN)
     (root / "queue" / "missions" / "m1").mkdir(parents=True)

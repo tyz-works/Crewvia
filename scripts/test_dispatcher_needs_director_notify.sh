@@ -32,7 +32,7 @@
 # 対応: dispatcher.sh の埋め込み Python サイクル本体 (`<<'PYEOF'` ... `PYEOF` の間 —
 # 実際の daemon ループが 5 秒毎に実行しているのと同じ `publish_agents()` +
 # `dispatch()`) を抽出し、tmux/herdr と通信する唯一の I/O 境界 (`_mux.send` /
-# `_mux.list`、`_mux = Mux()` の直後) だけをスタブして送信メッセージをキャプチャする
+# `_mux.list`、`_build_mux()` の直後) だけをスタブして送信メッセージをキャプチャする
 # harness (run_dispatcher_cycle) に作り替えた。検知・dedup・メッセージ文言・復旧コマンド
 # の組み立てはすべて dispatcher.sh の無改造コードが担うので、そこに regression が入れば
 # キャプチャされるメッセージ自体が壊れ、以下の assertion が落ちる。
@@ -85,16 +85,16 @@ extract_dispatcher_cycle() {
 
 # inject_mux_stub <extracted.py> <capture.json> — replace the mux transport
 # (the only place the cycle talks to tmux/herdr) with an in-memory capture,
-# right after `_mux = Mux()`. Everything above that line — detection, dedup,
+# right after `_mux, _MUX_CONFIG_PROBLEM = _build_mux()`. Everything above that line — detection, dedup,
 # message text, recovery-command construction — stays dispatcher.sh's own code.
 inject_mux_stub() {
   python3 - "$1" "$2" <<'INJECT'
 import sys
 path, capture_file = sys.argv[1], sys.argv[2]
 src = open(path).read()
-marker = "_mux = Mux()"
+marker = "_mux, _MUX_CONFIG_PROBLEM = _build_mux()"
 if marker not in src:
-    print("ERROR: injection point '_mux = Mux()' not found in dispatcher.sh — harness needs updating", file=sys.stderr)
+    print("ERROR: injection point '_build_mux()' not found in dispatcher.sh — harness needs updating", file=sys.stderr)
     sys.exit(1)
 stub = (
     marker + "\n"
@@ -127,9 +127,9 @@ inject_mux_stub_ext() {
 import sys
 path, capture_file, worker_csv, director_csv, state_value = sys.argv[1:6]
 src = open(path).read()
-marker = "_mux = Mux()"
+marker = "_mux, _MUX_CONFIG_PROBLEM = _build_mux()"
 if marker not in src:
-    print("ERROR: injection point '_mux = Mux()' not found in dispatcher.sh — harness needs updating", file=sys.stderr)
+    print("ERROR: injection point '_build_mux()' not found in dispatcher.sh — harness needs updating", file=sys.stderr)
     sys.exit(1)
 worker_names = [n for n in worker_csv.split(',') if n]
 director_names = [n for n in director_csv.split(',') if n]

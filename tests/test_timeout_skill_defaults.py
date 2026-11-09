@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """review skill の card が CI 完走待ちで watchdog の max に殺される事故の恒久対応 (t002 / 20261102-review-ci-timeout)。
+実装系 skill (bash / code / typescript / python / database / cloud / ops) に既定を広げた対応 (t013 / 20261109-codex-hc)。
 
 ## 背景
 
@@ -8,6 +9,12 @@ review Worker が PR の CI 完走を待っている間に watchdog の絶対上
 `scripts/watchdog.py:850-857` の絶対上限は idle/executing 判定から独立した「最後の安全弁」で
 あり続ける設計 (PR #204 / t016) — グローバル既定を上げる案はこの安全弁を review 以外の全 task
 についても弱めるため却下した (t001 の Result / knowledge/review-ci-wait-timeout.md)。
+
+**t013 (2026-11-09)**: 同じ事故が実装系 skill の card でも起きた (mission 20261109-codex-hc の
+t002 / Ingrid がローカル full pytest 約1時間の完走を待っていた)。review skill だけを守っていた
+既定を、model_per_skill にフォールバック先が無い実装系 skill (bash / code / typescript /
+python / database / cloud / ops) にも同じ値 (7200s) で広げた。解決ロジック (`_default_timeout_max_for_skills`)
+自体は変えていない — `config/crewvia.yaml` の `timeout_max_per_skill:` に行を足しただけ。
 
 ## 選んだ対応 (案B)
 
@@ -21,13 +28,15 @@ review Worker が PR の CI 完走を待っている間に watchdog の絶対上
 
 1. review skill の card は既定で timeout.max=7200 を持つ (add)
 2. 明示した --max-timeout は既定で上書きされない (add)
-3. review を含まない card は何も変わらない — 回帰が無い (add)
+3. どの timeout_max_per_skill にも無い skill の card は何も変わらない — 回帰が無い (add)
 4. 複数 skill が異なる既定値にマッチしたら最も緩い (大きい) 方を採る (add, カスタム config)
 5. config が壊れている / 読めないときは既定を適用せず、Worker 起動を止めない (add)
 6. plan.sh update は既存の timeout dict とマージする。片方だけ渡せばもう片方は保つ
 7. plan.sh update は壊れた timeout (flow 形式が str として読まれた状態) を正しい block 形式で直す
 8. 境界: 解決された timeout.max の手前と先で WorkerMonitor.check() の判定が変わる
    (review 既定 7200s と、既定が適用されない場合の feature_impl 既定 3600s の両方で)
+9. 実装系 skill (bash / code / typescript / python / database / cloud / ops) も既定で
+   timeout.max=7200 を持つ (t013。本番の config/crewvia.yaml を読む — カスタム config ではない)
 
 赤の実証は tests/red_proof_t002_review_ci_timeout.sh (add の既定付与を取り除くと 1, 4 が落ちる)。
 """
@@ -153,11 +162,25 @@ def test_explicit_max_timeout_is_not_overridden(sb):
     assert meta.get("timeout") == {"max": 1800}, meta
 
 
-def test_non_review_skills_are_unaffected(sb):
-    """review を含まない card には何も書かれない (回帰が無いことの陽性対照)。"""
-    sb.add("implement this", "bash,code")
+def test_skills_outside_the_map_are_unaffected(sb):
+    """timeout_max_per_skill のどの行にも無い skill の card には何も書かれない (回帰が無いことの陽性対照)。
+    (t013 で bash/code/typescript/python/database/cloud/ops を既定に加えたため、
+    ここで使う対照は docs/qa のようにどの行にも無い skill に差し替えてある)。"""
+    sb.add("write docs for this", "docs")
     meta = sb.meta("t001")
     assert meta.get("timeout") is None, meta
+
+
+@pytest.mark.parametrize("skill", [
+    "bash", "code", "typescript", "python", "database", "cloud", "ops",
+])
+def test_implementation_skills_get_default_timeout_max(sb, skill):
+    """実装系 skill (bash / code / typescript / python / database / cloud / ops) も
+    review と同じ既定 timeout.max=7200 を持つ (t013。CI 完走待ち・ローカル full pytest
+    約1時間が review と同じ理由で起きうるため)。本番の config/crewvia.yaml を読む。"""
+    sb.add("implement this", skill)
+    meta = sb.meta("t001")
+    assert meta.get("timeout") == {"max": 7200}, meta
 
 
 def test_review_mixed_with_other_skills_still_gets_default(sb):

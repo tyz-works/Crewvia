@@ -47,6 +47,18 @@
 > PATH 先頭が apt 版 `/usr/bin/node` (v12.22.9) だと `SyntaxError` で落ちる**、の 2 重の穴を
 > `scripts/bin/codex` shim (`scripts/bin/python3` と同じ PATH shim 方式) で恒久化した。詳細は
 > 下記「t002: codex がどの文脈でも解決・実行できるようにする」を参照。
+> **t005 (2026-11-09, mission: 20261109-codex-hc)**: 下記「前提確認」節が、t001 (Hana) が
+> 一時的に実在させた絶対パス (`/home/tkadmin/.nvm/versions/node/v24.18.0/bin/codex`) を
+> 書いたままだった。nvm の既定バージョンが上がるたびにこの絶対パスは変わるので、確認コマンド
+> に具体的なバージョン番号を書かない方針に直した (`command -v codex` を使う)。
+> あわせて記録: 2026-11-02 commit `48461e73`（「review.engine を codex に戻し、agy_model の
+> 修正だけに絞る」）は「codex は上記パス（v24.18.0）にあり不在ではない」を根拠に
+> review.engine の変更取り消しを行ったが、**そのパスも `~/.nvm` 自体もその時点では存在しな
+> かった**（nvm の導入は 1 週間後の t001, 2026-11-09）。根拠が成立していない取り消しだった。
+> 皮肉な点として、今回 t001 で nvm を実際に導入した結果、よく似たパス（v26.13.0）が実在する
+> ようになった — 「パスが書いてあること」と「そこに実在すること」は別だと分かる一例として
+> 残す。codex CLI を本番機で恒久的に解決・実行させる仕組み自体（`scripts/bin/codex` shim）は
+> 別タスク t002 (PR #352) の範囲であり、本 t005 時点では未 merge（レビューは t007）。
 
 ---
 
@@ -91,11 +103,23 @@ bash scripts/kai-review.sh \
 
 ### 前提確認
 
+codex CLI は本番機に nvm 経由で導入されている（t001, 2026-11-09）が、インストール先は
+`~/.nvm/versions/node/<version>/bin/codex` で、nvm の既定バージョンが上がるとこの絶対パスは
+変わる。**確認コマンドにバージョン番号・絶対パスを書き取って決め打ちしないこと**
+（過去に一度、既に古くなった決め打ちパスを「存在する」根拠に使って判断を誤った前例がある。
+上記「t005」節を参照）。
+
 ```bash
-# codex CLI が解決できるか確認 (crewvia の文脈では scripts/bin/codex shim が答える。下記「t002」参照)
+# codex CLI が解決できるか確認（絶対パスではなく command -v で — 上記の理由。
+# crewvia の文脈では scripts/bin/codex shim が答える。下記「t002」参照）
 command -v codex   # → scripts/bin/codex (PATH 先頭が scripts/bin のとき)
 codex --version
 ```
+
+Worker の対話シェル（`~/.bashrc` 経由で nvm を source している）ではこれで通る。
+dispatcher が spawn する経路（`kai-review.sh` など、ログインシェルを経由しない）では
+同じ確認が通らないことがあり、その文脈でも恒久的に解決させる仕組み（`scripts/bin/codex`
+shim）は別タスクの範囲（t002, PR #352。2026-11-09 時点未 merge、レビューは t007）。
 
 ---
 

@@ -94,10 +94,11 @@ def _argv(tmp_path):
 
 # --- 設定の読み口 ---
 
-def test_get_prints_eight_lines_and_the_shipped_config_is_unchanged():
+def test_get_prints_nine_lines_and_the_shipped_config_is_unchanged():
     c = lre.load_full(REPO_ROOT / "config" / "crewvia.yaml", environ={})
     assert c["engine"] == "codex" and c["compare"] == ["agy"]
     assert c["claude_model"] == "claude-opus-5-5" and c["claude_timeout"] == 900
+    assert c["codex_timeout"] == 900
 
 
 @pytest.mark.parametrize("engine", ["claude", "ensemble"])
@@ -124,6 +125,25 @@ def test_bad_claude_values_are_errors_not_defaults(tmp_path, text, code):
     with pytest.raises(lre.ReviewConfigError) as e:
         lre.load_full(cfg, environ={})
     assert e.value.code == code
+
+
+@pytest.mark.parametrize("text,code", [
+    ("review:\n  codex_timeout_seconds: 0\n", "bad_codex_timeout"),
+    ("review:\n  codex_timeout_seconds: 1.5\n", "bad_codex_timeout"),
+    ("review:\n  codex_timeout_seconds: -1\n", "bad_codex_timeout"),
+])
+def test_bad_codex_timeout_values_are_errors_not_defaults(tmp_path, text, code):
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text(text)
+    with pytest.raises(lre.ReviewConfigError) as e:
+        lre.load_full(cfg, environ={})
+    assert e.value.code == code
+
+
+def test_codex_timeout_seconds_is_configurable(tmp_path):
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text("review:\n  codex_timeout_seconds: 120\n")
+    assert lre.load_full(cfg, environ={})["codex_timeout"] == 120
 
 
 def test_compare_accepts_claude(tmp_path):

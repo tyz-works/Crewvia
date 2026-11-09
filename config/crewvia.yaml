@@ -93,7 +93,7 @@ timeout_max_per_skill:
 #
 # 環境変数での上書き: CREWVIA_MUX=tmux|herdr|rex|hc (最優先) / CREWVIA_MUX_ENABLED=1 (並列 ON) / CREWVIA_MUX_ENABLED=0 (inline)
 # CREWVIA_MUX が設定されていれば CREWVIA_MUX_ENABLED より優先される。
-mode: herdr  # 戻す時は tmux。切替日: 2026-09-04
+mode: hc  # 戻す時は herdr。切替日: 2026-11-09
 
 # ===== mux 設定 =====
 mux:
@@ -268,6 +268,10 @@ attempts:
 # 設計・実測: knowledge/agy-review.md / knowledge/cursor-review.md / knowledge/claude-review.md
 review:
   engine: codex
+  # codex exec は他の 3 エンジン (agy / cursor / claude) と違い、t009 までは timeout に
+  # 包まれていなかった (t007/Seo が PR #352 レビューで発見)。cursor / claude と同じ水準
+  # (900 秒) に揃える。
+  codex_timeout_seconds: 900
   # 旧値 gemini-4-argon-high は agy に存在せず ensemble が fail-closed していた
   # (t005 / 20261102-pr-task-line)。`agy models` の実在 ID に合わせてある。
   # 既定の本番のレビュー先は codex。agy は engine: agy / ensemble / compare で使われる。

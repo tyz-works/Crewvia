@@ -337,6 +337,11 @@ def _load_dispatcher_namespace(repo_root: Path) -> dict:
     fake_lib_mux = types.ModuleType("lib_mux")
     fake_lib_mux.Mux = FakeDispatcherMux
     fake_lib_mux.repo_identity_ok = lib_mux.repo_identity_ok  # real function under test
+    # 退避してから差し替える: del だけで畳むと、他のテストがこの後 `import lib_mux` /
+    # `sys.modules["lib_mux"]` を読んだときに新しいモジュールオブジェクトが作られ、
+    # ファイル先頭で import 済みの (= monkeypatch が当たる) オブジェクトと別物になる
+    # (t001 retry: tests/test_usage_limit.py の Rule5 harness がこれで KeyError / 二重化)。
+    real_lib_mux = sys.modules.get("lib_mux")
     sys.modules["lib_mux"] = fake_lib_mux
 
     queue_dir = repo_root / "queue"
@@ -361,7 +366,10 @@ def _load_dispatcher_namespace(repo_root: Path) -> dict:
         return ns
     finally:
         sys.argv = old_argv
-        del sys.modules["lib_mux"]
+        if real_lib_mux is not None:
+            sys.modules["lib_mux"] = real_lib_mux
+        else:
+            del sys.modules["lib_mux"]
 
 
 class TestDispatcherKillWindowGuard:

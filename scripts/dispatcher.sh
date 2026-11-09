@@ -2061,6 +2061,17 @@ def check_rule5(name: str, target: str, assignment_file: Path, task_statuses_by_
        'working': dedup keys cleared, grace timer restarted, so once the job ends the
        grace period counts from then.  A job that never ends is bounded by
        watchdog's absolute max, not by this rule.
+    E: anything else — i.e. not "blocked", not idle/done-with-assignment, and not
+       one of the known-quiet values ("unknown" / "working", handled earlier, or
+       idle/done-without-assignment, which legitimately means nothing is assigned).
+       Named after the actual state string (e.g. hc's "error") rather than a fixed
+       label.  Added because this function used to decide purely by testing
+       membership in the "loud" sets above, so a `state()` value it didn't
+       enumerate fell through to neither A nor B and was silently dropped — the
+       bug fixed here (t001 / mission 20261109-hc-production-switch #1).  `is_E`
+       is the deliberate flip: unrecognised is loud, not silent, so a future
+       backend value nobody has taught this function about yet still reaches
+       Director instead of vanishing the same way.
 
     State is persisted to registry/mux/<name>.state.json for grace tracking.
     Notifications are deduped via the standard NOTIFY_TTL cache.
@@ -2132,7 +2143,12 @@ def check_rule5(name: str, target: str, assignment_file: Path, task_statuses_by_
         # fires when the worker gets stuck again later.
         if st == 'working':
             cache = load_notify_cache()
-            for key in (f'blocked_{name}', f'idle_with_task_{name}'):
+            # 'error' is the one E-condition value known to exist today (hc
+            # only); its notify_key follows the same f'{st}_{name}' shape as
+            # any future E value (see is_E below), but a truly novel future
+            # value can't be named here in advance — it clears on its own via
+            # NOTIFY_TTL instead (see Result for why that bound is accepted).
+            for key in (f'blocked_{name}', f'idle_with_task_{name}', f'error_{name}'):
                 cache.pop(key, None)
             try:
                 NOTIFY_CACHE.write_text(json.dumps(cache), encoding='utf-8')
@@ -2145,11 +2161,15 @@ def check_rule5(name: str, target: str, assignment_file: Path, task_statuses_by_
     # Determine which condition applies.
     is_A = (st == 'blocked')
     is_B = (st in ('idle', 'done')) and assignment_file.exists()
+    # E: see the class docstring.  idle/done-without-assignment is the one
+    # legitimately-quiet case left once A and B are ruled out, so it's named
+    # explicitly rather than swept into "unrecognised".
+    is_E = not is_A and not is_B and st not in ('idle', 'done')
 
     # t032 F4: if the assignment points at a task that already escalated to
     # needs_director, the needs_director block owns notifying Director for
     # it — suppress Rule 5 entirely for this worker/task pair.
-    if is_A or is_B:
+    if is_A or is_B or is_E:
         assigned_task_status = None
         raw = read_assignment(name)
         if not is_unreadable(raw):
@@ -2165,8 +2185,9 @@ def check_rule5(name: str, target: str, assignment_file: Path, task_statuses_by_
         if assigned_task_status in WAITS_ON_DIRECTOR_STATUSES or waits_on_director:
             is_A = False
             is_B = False
+            is_E = False
 
-    if not is_A and not is_B:
+    if not is_A and not is_B and not is_E:
         # idle/done without assignment → not B.  Reset state entry.
         _save_state_entry(name, st, time.time())
         return
@@ -2177,8 +2198,9 @@ def check_rule5(name: str, target: str, assignment_file: Path, task_statuses_by_
     since = entry.get('since', 0.0)
     now = time.time()
 
-    # Normalize condition key to distinguish A vs B.
-    condition = 'blocked' if is_A else 'idle-with-task'
+    # Normalize condition key to distinguish A vs B vs E.  E uses the raw
+    # state string itself (e.g. 'error') rather than a fixed label — see is_E.
+    condition = 'blocked' if is_A else (st if is_E else 'idle-with-task')
 
     # If the condition changed (or is fresh), reset the timer.
     if prev_state != condition:
@@ -2190,7 +2212,7 @@ def check_rule5(name: str, target: str, assignment_file: Path, task_statuses_by_
         return  # grace period not yet exceeded
 
     # Grace exceeded — notify Director if not already notified recently.
-    notify_key = f'blocked_{name}' if is_A else f'idle_with_task_{name}'
+    notify_key = f'blocked_{name}' if is_A else (f'{st}_{name}' if is_E else f'idle_with_task_{name}')
     if not should_notify(notify_key):
         return
 

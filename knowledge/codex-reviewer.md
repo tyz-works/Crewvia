@@ -40,6 +40,13 @@
 > 無ければファイルは恒久的に残っていた。`plan.sh reap-orphan-assignment` (dispatcher が
 > 毎サイクル安く判定して呼ぶ) が掃除するようにした。詳細は下記「t009: 孤児 assignment の
 > 掃除」を参照。
+> **t002 (2026-11-09, mission: 20261109-codex-hc)**: `command -v codex` は本番機で
+> **Worker のシェルでは通るが dispatcher が spawn した `kai-review.sh` では通らない**
+> (daemon はログインシェルを経由しないため `~/.bashrc` の nvm 初期化が届かない)、かつ
+> **通った場合でも codex.js のシェバン `#!/usr/bin/env node` が PATH の `node` を解決し直すため、
+> PATH 先頭が apt 版 `/usr/bin/node` (v12.22.9) だと `SyntaxError` で落ちる**、の 2 重の穴を
+> `scripts/bin/codex` shim (`scripts/bin/python3` と同じ PATH shim 方式) で恒久化した。詳細は
+> 下記「t002: codex がどの文脈でも解決・実行できるようにする」を参照。
 > **t005 (2026-11-09, mission: 20261109-codex-hc)**: 下記「前提確認」節が、t001 (Hana) が
 > 一時的に実在させた絶対パス (`/home/tkadmin/.nvm/versions/node/v24.18.0/bin/codex`) を
 > 書いたままだった。nvm の既定バージョンが上がるたびにこの絶対パスは変わるので、確認コマンド
@@ -103,8 +110,9 @@ codex CLI は本番機に nvm 経由で導入されている（t001, 2026-11-09�
 上記「t005」節を参照）。
 
 ```bash
-# codex CLI が解決できるか確認（絶対パスではなく command -v で — 上記の理由）
-command -v codex
+# codex CLI が解決できるか確認（絶対パスではなく command -v で — 上記の理由。
+# crewvia の文脈では scripts/bin/codex shim が答える。下記「t002」参照）
+command -v codex   # → scripts/bin/codex (PATH 先頭が scripts/bin のとき)
 codex --version
 ```
 
@@ -613,6 +621,106 @@ PR revert → 主 checkout を `git merge --ff-only origin/main` → `lib_daemon
 `plan.sh reap-orphan-assignment` は新規サブコマンドの追加のみで、既存サブコマンドの挙動は
 変えていないため、revert 後に残る影響は無い (孤児ファイルは再び溜まるだけで、
 `codex_review_slot_busy()` が引き続き read-only に塞がないので機能的な退行はない)。
+
+---
+
+## t002: codex がどの文脈でも解決・実行できるようにする (2026-11-09, mission: 20261109-codex-hc)
+
+### 何が起きていたか (t001 / Hana の実測の延長)
+
+`scripts/kai-review.sh:583` は `review.engine` が `codex` / `both` のとき `command -v codex` を要求し、
+無ければ `fail_needs_director` で止まる。t001 で codex CLI 自体は本番機に入った
+(`/home/tkadmin/.nvm/versions/node/v26.13.0/bin/codex`、codex-cli 0.167.0) が、2 つの理由で
+**dispatcher が spawn する経路（daemon はログインシェルを経由しない）**では通らなかった:
+
+1. **PATH に nvm の bin が無い**。nvm インストーラは `~/.bashrc` 末尾に `NVM_DIR` export と
+   `nvm.sh` の source を追記するが、daemon の起動・respawn はログインシェルを経由しないので
+   これが届かない。Worker のインタラクティブシェル（bashrc を読む）でだけ `command -v codex` が通り、
+   dispatcher 配下では `command -v codex` 自体が失敗する。
+2. **絶対パスで起動しても落ちる**。`@openai/codex/bin/codex.js` の 1 行目は
+   `#!/usr/bin/env node` — つまり codex を絶対パスで起動しても、実行する `node` は**その時点の
+   PATH から解決される**。crewvia の文脈（daemon はもちろん、素の非ログインシェルも）では
+   PATH の `node` は apt 版 `/usr/bin/node`（v12.22.9）で、codex.js の構文（top-level await 等）を
+   パースできず `SyntaxError: Unexpected reserved word` で落ちる。
+   ```
+   $ /home/tkadmin/.nvm/versions/node/v26.13.0/bin/codex --version   # PATH の node が v12.22.9 のとき
+   SyntaxError: Unexpected reserved word
+       at Loader.moduleStrategy (internal/modules/esm/translators.js:133:18)
+   ```
+   つまり `scripts/bin` に codex への単純な symlink や `exec` を置くだけでは不十分
+   （`command -v codex` は通っても実行すると落ちる）。
+
+### 先行事例との違い
+
+`knowledge/python312-runtime-migration.md`（t004 / PR#318）は同じ形の問題を
+`scripts/bin/python3` shim（`exec python3.12 "$@"`）で解いた。python3.12 は deadsnakes PPA で
+システムに直接入れたので、実行バイナリのパスが安定している。codex は **nvm 配下の特定バージョン
+ディレクトリ**（`~/.nvm/versions/node/v26.13.0/...`）に npm global install されているため、
+同じ形で `exec /home/tkadmin/.nvm/versions/node/v26.13.0/bin/node .../codex.js "$@"` のように
+バージョン番号を 2 箇所（node 本体・`@openai/codex` の lib パス）に直書きすると、将来
+`nvm install` で既定バージョンが上がった瞬間にその 2 箇所が揃って無効な絶対パスになり、
+無言で壊れる（t002 の指示が警告していた「パスの脆さ」そのもの）。
+
+### 採った設計: `scripts/bin/codex` が nvm 自身の解決に委譲する
+
+```sh
+NVM_EXEC="$HOME/.nvm/nvm-exec"
+exec env NODE_VERSION=default "$NVM_EXEC" codex "$@"
+```
+
+`nvm-exec`（nvm 本体に同梱）は自分のスクリプト位置から `nvm.sh` を source し、`nvm use` で
+PATH の先頭を解決したバージョンの bin dir に書き換えてから `exec "$@"` する。つまり
+**バージョン番号をどこにも書かずに**、「apt 版 node が先頭にある PATH」を「nvm の node が
+先頭にある PATH」へその場で作り直してから `codex`（bare name）を探させる方式。
+`nvm install` で既定バージョンが上がっても shim は無修正で動き続ける。
+
+`NODE_VERSION=default` を明示するのは、素の `nvm use`（引数なし）が `.nvmrc` を
+カレントディレクトリから上に辿って探す仕様のため — 将来 worktree の上位のどこかに
+無関係な `.nvmrc` が置かれると、codex の実行バージョンがそれに引っ張られて crewvia の
+制御が及ばなくなる。`NODE_VERSION=default` は nvm の `alias/default`（本番機では
+`lts/*` → 実測 v26.13.0）に固定し、cwd に依存させない。
+
+`nvm-exec` 自体が無い環境では `command -v codex` を結局失敗させる（`exec codex "$@"` に
+フォールバックしない — shim 自身の名前と同じ `codex` を bare name で呼ぶと、PATH の
+解決順位が変わらない限り自分自身を再度呼び出す無限再帰になるため、フォールバックは
+作らず明示的に exit 127 する）。
+
+### 実機確認（dispatcher が spawn する条件を再現）
+
+Worker のインタラクティブシェル（`~/.bashrc` を読み nvm が PATH に入っている）で通る
+だけでは `kai-review.sh` が実際に動く証跡にならない。**PATH に nvm の欠片が一切無い**
+（`scripts/bin` + システムの標準パスだけ、`node` は apt 版 v12.22.9 が先頭）状態を
+`env -i` で作って確認した:
+
+```bash
+$ env -i HOME="$HOME" PATH="<repo>/scripts/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" bash -c '
+    command -v node          # → /usr/bin/node (v12.22.9) ... apt 版のまま
+    command -v codex         # → <repo>/scripts/bin/codex  (shim)
+    codex --version          # → codex-cli 0.167.0 (正しく実行できる)
+'
+```
+
+さらに `kai-review.sh` が実際に呼ぶ形（`codex exec -C <worktree> --sandbox read-only
+--ephemeral -o <file> "<prompt>"`）を同じ clean PATH の下で実行し、**codex 本体が起動して
+バナー・model・session id まで出力する**ことを確認した（この環境には API 認証情報が
+無いため最終的に 401 Unauthorized で失敗するが、これは shim と無関係な認証の問題 —
+`SyntaxError` は一切発生しない。認証が通った本番の daemon 環境では exec が完走する）。
+
+### バージョン直書きの脆さへの回答
+
+本設計には node / codex のバージョン番号・絶対パスがどこにも無い（`scripts/bin/codex`
+自体にも、PATH export を行う 3 箇所 — `crewvia` launcher / `scripts/start.sh` の
+LAUNCH_CMD / `lib_daemon_watch.py` の `spawn_command()` — のいずれにも手を入れていない。
+いずれも既存の `scripts/bin` prepend がそのまま効く）。`nvm install` で既定バージョンが
+上がったときに壊れるとすれば、それは nvm 自身の `alias/default` の解決か `@openai/codex`
+の互換性の問題であり、shim 側の修正は不要。
+
+### 戻し方
+
+`scripts/bin/codex` を消すだけ（nvm 本体・`~/.nvm/nvm-exec`・`@openai/codex` の
+npm install には一切触れていない）。PATH export の 3 箇所は python3.12 のときから
+既存のものを流用しているため、revert してもそれらは残って構わない（`scripts/bin` に
+`python3` / `plan` の shim が引き続きあるため）。
 
 ---
 

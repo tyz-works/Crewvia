@@ -1,0 +1,59 @@
+#!/bin/sh
+# scripts/bin/codex — PATH shim so `codex` resolves, and runs under a node new enough for
+# it, in every crewvia context (Worker shell / dispatcher spawn_command() respawn / daemon
+# restart) — not just a login shell that happened to source nvm into PATH. t001's Hana had
+# nvm's node first in PATH because her shell sourced ~/.bashrc; daemons don't go through a
+# login shell, so `command -v codex` in scripts/kai-review.sh:583 fails there even though
+# it succeeds in a Director/Worker pane (t002).
+#
+# Why not a plain symlink/exec to codex's absolute path: codex's entry point
+# (@openai/codex/bin/codex.js) starts with `#!/usr/bin/env node`, so even invoking it by
+# absolute path still resolves `node` via PATH. In the crewvia context PATH's `node` is
+# /usr/bin/node (apt, v12.22.9), which can't parse codex.js's syntax (confirmed: running
+# the absolute codex path with only /usr/bin/node on PATH reproduces
+# `SyntaxError: Unexpected reserved word`; running it with nvm's node explicitly works).
+#
+# Why nvm-exec + NODE_VERSION=default, not a hardcoded node/codex.js absolute path either:
+# `nvm-exec` sources nvm.sh itself and runs `nvm use`, which rewrites PATH to put the
+# resolved node version's bin dir first and then execs `codex` — so the shebang resolves
+# to the right node without us hardcoding any version number. `NODE_VERSION=default` pins
+# that resolution to nvm's alias/default (currently `lts/*` -> v26.13.0) instead of letting
+# plain `nvm use`'s .nvmrc directory-walk pick up an unrelated .nvmrc if one is ever added
+# above a worktree's path. If `nvm install` later bumps the default node version, this shim
+# keeps working with zero edits — the brittleness the task asked to avoid (baking
+# v26.13.0 into this file, or into a second hardcoded codex.js path) never gets introduced.
+#
+# Verified under a PATH with no nvm entry at all — only scripts/bin + the system dirs, so
+# /usr/bin/node resolves first until nvm-exec rewrites PATH — i.e. the daemon's actual
+# condition, not just an interactive shell that sourced ~/.bashrc.
+#
+# Self-recursion guard (t007/Seo review of PR #352, attempt 2): `nvm-exec` does not replace
+# PATH — it prepends the resolved node version's bin dir to the *inherited* PATH and then
+# execs `codex` by bare name (confirmed by reading nvm-exec's source and by running it with
+# a sentinel name standing in for `codex`: the sentinel's own directory stays in the PATH
+# nvm-exec hands to the final exec). In the crewvia context scripts/bin is always on the
+# inherited PATH, so if the resolved nvm version's bin has no `codex` (e.g. right after
+# `nvm install` bumps alias/default to a version npm hasn't installed codex into yet), bare
+# `codex` resolves back to this file — shim -> nvm-exec -> shim -> ... Every level is `exec`
+# (no fork bomb; process count stays flat) but the chain never returns: reproduced with a
+# depth-bounded copy of this script standing in for the real one, then with the unbounded
+# original under `timeout 10` — exit=124, 0 bytes of output, no error. To keep the failure
+# fail-closed instead, strip this file's own directory from PATH before handing off, so a
+# missing `codex` resolves to nothing (`codex: not found`, exit 127) rather than back here;
+# kai-review.sh's `set -euo pipefail` carries that 127 through its `| tee` pipeline to
+# `CODEX FAILURE: exit=127` -> fail_needs_director, same as any other codex failure.
+#
+# NVM_DIR (t007/Seo, P3): nvm's own convention is $NVM_DIR, not a hardcoded ~/.nvm — Docker
+# images and shared installs commonly use another path (e.g. /usr/local/nvm). Reproduced
+# nvm *present* but this shim still exiting 127 when NVM_DIR pointed elsewhere.
+#
+# 戻し方: このファイルを消す（nvm 本体・codex の npm install には触れていない）。
+SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd) || exit 127
+PATH=$(printf '%s' "$PATH" | tr ':' '\n' | grep -vxF "$SELF_DIR" | paste -sd: -)
+export PATH
+NVM_EXEC="${NVM_DIR:-$HOME/.nvm}/nvm-exec"
+if [ ! -x "$NVM_EXEC" ]; then
+  echo "scripts/bin/codex: $NVM_EXEC not found or not executable" >&2
+  exit 127
+fi
+exec env NODE_VERSION=default "$NVM_EXEC" codex "$@"

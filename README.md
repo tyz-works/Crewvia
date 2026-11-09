@@ -88,8 +88,14 @@ Optional, only if you use the `codex-review` skill (automated PR review via Code
 
 - **codex** — OpenAI Codex CLI, invoked by `scripts/kai-review.sh` as
   `codex exec --output-schema ...` (diff piped via stdin; see `knowledge/codex-reviewer.md`).
-  Without it, `codex-review` tasks fail with `codex command not found` and fall back to
-  `needs-director`. See `knowledge/codex-reviewer.md` for setup and usage.
+  In the crewvia context, `codex` resolves through a PATH shim (`scripts/bin/codex`, same
+  mechanism as `scripts/bin/python3` above) that requires **nvm** (`$NVM_DIR`, default
+  `~/.nvm`) with `codex` installed into the Node version `nvm alias default` points at — a
+  login shell's own `~/.bashrc`-sourced nvm init never reaches daemon-spawned processes.
+  Without a working nvm + codex, `codex-review` tasks fail with `CODEX FAILURE: exit=127`
+  and fall back to `needs-director` (not `codex command not found` — `scripts/bin` being on
+  `PATH` makes that check always succeed in this context). See `knowledge/codex-reviewer.md`
+  for setup and usage.
 
 ---
 

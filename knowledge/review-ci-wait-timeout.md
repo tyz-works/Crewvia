@@ -137,3 +137,18 @@ PR revert → `scripts/sync-main-checkout.sh`。`config/crewvia.yaml` の `timeo
 `plan.sh update` の `--idle-timeout` / `--max-timeout` は revert で消える。revert 後に作られた card は
 再び既定 (feature_impl 3600s) に戻る。revert 前に自動付与された `timeout.max: 7200` を持つ既存 card は
 そのまま残ってよい (旧コードもこの欄を普通に読む。card が壊れるわけではない)。
+
+## 2026-11-09 追記: 実装系 skill (bash / code / typescript / python / database / cloud / ops) にも拡張 (t013)
+
+同じ事故が review 以外でも再発した: mission 20261109-codex-hc の t002 (Ingrid) が shim 実装後に
+ローカル full pytest (9000件超・約1時間) の完走を待っていて、Director が手で `timeout.max: 7200` を
+入れなければ feature_impl 既定 (3600s) で完走前に terminate されていた。「実装 Worker が CI 完走 /
+ローカル full test の完走を待つ」という状況自体は review に限らないため、`timeout_max_per_skill:`
+に `model_per_skill` でフォールバックする実装系 skill (bash / code / typescript / python / database /
+cloud / ops) を同じ値 (7200s) で足した (`_default_timeout_max_for_skills` のロジックは無変更。
+`config/crewvia.yaml` に行を足しただけ)。**既存 card には遡及しない** — `plan.sh add` 時点の 1 回だけ
+なので、この変更より前に作られた card (t002 を含む) は既定のまま 3600s で、Director が気づいたときは
+`plan.sh update --max-timeout <秒>` で個別に上げること。
+
+テスト: `tests/test_timeout_skill_defaults.py::test_implementation_skills_get_default_timeout_max`
+(7 skill すべてをパラメータ化。本番の `config/crewvia.yaml` を読む)。

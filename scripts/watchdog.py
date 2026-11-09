@@ -1677,15 +1677,34 @@ def _assert_repo_identity_or_exit(repo_root: Path) -> None:
     sys.exit(1)
 
 
-def _wait_for_readable_mux_config(interval: int) -> None:
+def _wait_for_readable_mux_config(interval: int, registry_dir: Optional[Path] = None,
+                                  repo_root: Optional[Path] = None) -> None:
     """config が読めるまで待つ (Worker は 1 つも終了させない・監視もしない)。
 
     読めるようになったら `_mux` を作って返る (D5: local の変更は restart 前提だが、
     起動時に壊れていた場合の出口はファイルを直すだけにする)。
+
+    待つ間も心拍は書く (t017 / PR-2 レビュー P3): 書かないと、待ちが stale しきい値を超えた時点で
+    dispatcher の相互監視が「watchdog が死んだ」と見て restart し、直したはずの config を
+    読み直す前に作り直される。心拍は file を書くだけで mux を使わないので、`_mux` が無くても書ける
+    (`mux=` にはダミーを渡す — `DaemonWatch` は None だと `Mux()` を作って同じ config で落ちる)。
     """
     global _mux, _MUX_CONFIG_PROBLEM
+    beater = None
+    if registry_dir is not None and repo_root is not None:
+        try:
+            beater = lib_daemon_watch.DaemonWatch(
+                registry_dir=registry_dir, repo_root=repo_root,
+                self_name=lib_daemon_watch.DAEMON_WATCHDOG, mux=object(), log=_log)
+        except Exception as exc:  # noqa: BLE001 — 心拍が作れなくても待ちは続ける
+            _log(f"[daemon-watch] heartbeat while waiting unavailable: {exc!r}")
     last = None
     while _MUX_CONFIG_PROBLEM is not None:
+        if beater is not None:
+            try:
+                beater.beat()
+            except Exception as exc:  # noqa: BLE001
+                _log(f"[daemon-watch] heartbeat failed: {exc!r}")
         if _MUX_CONFIG_PROBLEM != last:
             _log(f"WARNING: mux backend を選べない (config unreadable: {_MUX_CONFIG_PROBLEM}) — "
                  f"何も終了させずに待つ。config/crewvia.local.yaml (または共通の config) を直すと再開する")
@@ -1710,7 +1729,7 @@ def run(repo_root: Path, interval: int) -> None:
     taskvia_token = os.environ.get("TASKVIA_TOKEN", "")
     queue_dir = Path(os.environ.get("CREWVIA_QUEUE", str(repo_root / "queue")))
 
-    _wait_for_readable_mux_config(interval)
+    _wait_for_readable_mux_config(interval, registry_dir, repo_root)
 
     # Track active monitors: (slug, task_id) → WorkerMonitor
     monitors: dict[tuple[str, str], WorkerMonitor] = {}

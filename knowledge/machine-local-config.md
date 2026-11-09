@@ -143,8 +143,8 @@ grep) し、§2-A も「読めない → 既定値」に潰す読み口が多い
 |---|---|
 | `start.sh` / `crewvia` (起動) | **起動しない**。固定コードと対処 (local を直す / 一時的に退避) を出して exit 1 |
 | `plan.sh` | config を読む subcommand は `UsageExit` で何も書かず拒否 (task-graph も再生成しない)。読まない subcommand は影響なし |
-| dispatcher | そのサイクルは割り当て・通知判定を**スキップ**し、「local config unreadable」を Director に**一度だけ**通知 (回復時に clear — `_daemon の一度だけ通知には回復時の clear が要る`)。Worker は殺さない・起こさない |
-| watchdog | **何も終了させない** (判定材料が壊れているので retire / kill をしない) |
+| dispatcher | そのサイクルは割り当て・通知判定を**スキップ**し、「local config unreadable」を Director に**一度だけ**通知 (回復時に clear — `_daemon の一度だけ通知には回復時の clear が要る`)。Worker は殺さない・起こさない。**制限 (t017 / PR-2 P2-1)**: `CREWVIA_MUX` が env に無い起動で local が壊れると、dispatcher は mux を選べず (`_NoMux`) Director の有無を問い合わせる先が無いので、この通知は**届かずログだけ**になる (コードで通知経路は足さない — ユーザー決定 2026-11-10)。本番は `start.sh` が `CREWVIA_MUX` を export し、`lib_daemon_watch` の spawn の env allowlist (`CREWVIA_MUX`) が respawn でも運ぶので通常は起きない。起きるのは inline 起動や手で起動したデーモン。気づき方: `logs/dispatcher` の `WARNING: config-unreadable — mux を選べないため通知できない (CREWVIA_MUX が env に無く config が読めない: <コード>)` の行 (Director が本当に居ない場面の `Director 不在のため通知スキップ` とは文言が違う)。 |
+| watchdog | **何も終了させない** (判定材料が壊れているので retire / kill をしない)。待つ間も**心拍は書く** (t017: 書かないと待ちが stale しきい値を超えた時点で相互監視が restart する) |
 | `lib_daemon_watch` (相互監視・respawn) | respawn **しない** (保留。flap ガードと同じ「確証が無いときは動かない」) |
 | `lib_mux._config_mode()` | `None` を返すと `TmuxBackend` に落ちる (t016 の事故の形)。local が壊れているときは **None ではなく例外/unavailable** にする。mux verb は拒否 |
 | `hooks/pre-tool-use.sh` (承認) | 承認経路の `approval_channel` が読めない → 既存の「承認できない」側 (拒否または ask) に倒す。承認を黙って通さない |

@@ -1287,7 +1287,14 @@ def notify_state_once(key, fp, kind, slug, task_id, build_msg, *, director_live=
     if not should_notify(throttle_key):
         return False
     if not director_live():
-        log(f'WARNING: {kind} — Director 不在のため通知スキップ: {slug}/{task_id}')
+        if _MUX_CONFIG_PROBLEM is not None:
+            # mux を選べない場面 (CREWVIA_MUX が env に無く config が読めない = _NoMux)。
+            # Director が居ないのではなく、居るかどうかを問い合わせる先が無い。通知は届かない
+            # (制限。knowledge/machine-local-config.md §3)。ログのこの行が唯一の手がかり。
+            log(f'WARNING: {kind} — mux を選べないため通知できない '
+                f'(CREWVIA_MUX が env に無く config が読めない: {_MUX_CONFIG_PROBLEM}): {slug}/{task_id}')
+        else:
+            log(f'WARNING: {kind} — Director 不在のため通知スキップ: {slug}/{task_id}')
         return False
     if tmux_send(_director_name(), build_msg()):
         record_notify(throttle_key)

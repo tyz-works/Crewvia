@@ -118,6 +118,21 @@ def test_dispatcher_module_survives_mux_config_unreadable(h, monkeypatch):
     assert ns["_MUX_CONFIG_PROBLEM"] == "local_malformed (line 1)"
     assert ns["_mux"].list(suffix="-director") == []
     ns["dispatch"]()                                                    # gate が見送って静かに戻る
+    # t017: この場面の見送りログは「Director 不在」ではなく「mux を選べないため通知できない」
+    log_text = h.log_text()
+    assert "mux を選べないため通知できない" in log_text
+    assert "local_malformed (line 1)" in log_text
+    assert "Director 不在" not in log_text
+
+
+def test_director_really_absent_keeps_the_absent_wording(h):
+    """mux は選べている (FakeMux) が Director 窓が無い場面の文言は変えない (t017: 場面を分ける)。"""
+    FakeMux.directors = []
+    _write_config(h.root, local=BROKEN)
+    h.cycle()
+    text = h.log_text()
+    assert "Director 不在のため通知スキップ" in text
+    assert "mux を選べないため通知できない" not in text
 
 
 def test_dispatcher_whole_cycle_has_no_traceback_when_mux_config_unreadable(tmp_path):
@@ -164,6 +179,29 @@ def test_watchdog_imports_and_waits_when_mux_config_unreadable(tmp_path):
     r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env,
                        cwd=str(root), timeout=60)
     assert "PROBLEM None" in r.stdout
+
+
+def test_watchdog_beats_heartbeat_while_waiting_for_mux_config(tmp_path):
+    """待つ間も心拍を書く (t017 / t016 の P3)。書かないと相互監視が stale と見て restart する。"""
+    root = tmp_path / "repo"
+    copy_plan_tree(root)
+    (root / "scripts" / "watchdog.py").write_bytes((SCRIPTS / "watchdog.py").read_bytes())
+    (root / "registry").mkdir()
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    _write_config(root, local=BROKEN)
+    env = _env_without_overrides()
+    code = (
+        "import sys, json, threading, time; sys.path.insert(0, 'scripts'); import watchdog as w;"
+        "from pathlib import Path; reg = Path('registry');"
+        "t = threading.Thread(target=w._wait_for_readable_mux_config, args=(1, reg, Path('.').resolve()), daemon=True);"
+        "t.start(); time.sleep(2.5);"
+        "hb = list((reg / 'daemons').glob('*watchdog*'));"
+        "print('BEAT', bool(hb), t.is_alive())"
+    )
+    r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env,
+                       cwd=str(root), timeout=60)
+    assert r.returncode == 0, r.stderr[-2000:]
+    assert "BEAT True True" in r.stdout, (r.stdout, r.stderr[-1000:])
 
 
 # --- hooks/pre-tool-use.sh -------------------------------------------------------

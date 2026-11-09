@@ -245,6 +245,8 @@ DAEMON_RESTART_FILES = {
         "scripts/lib_mux.py",
         "scripts/lib_daemon_watch.py",
         "scripts/lib_retirement.py",
+        # machine-local-config PR-2: lib_mux / lib_daemon_watch が config の読み口として import する
+        "scripts/lib_config.py",
     ),
     DAEMON_WATCHDOG: (
         "scripts/watchdog.py",
@@ -264,6 +266,8 @@ DAEMON_RESTART_FILES = {
         "scripts/lib_ci_status.py",
         # #314 r1: lib_ci_status が記録の名前の検査 (check_mission_slug / check_task_id) に import する
         "scripts/lib_git_policy.py",
+        # machine-local-config PR-2: lib_mux / lib_daemon_watch が config の読み口として import する
+        "scripts/lib_config.py",
     ),
 }
 

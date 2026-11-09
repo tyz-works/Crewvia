@@ -517,6 +517,47 @@ def test_verify_sent_true_when_text_left_the_input_line(fake):
     assert lib_mux.Mux(backend=backend()).verify_sent("Omar-worker", "still here") is True
 
 
+# t015: HcBackend.verify_sent() 自身が旧ヒューリスティック (_text_in_input_line) の
+# ままだった穴 (RexBackend は PR #342/#343 で box 判定に直っていたが hc は直っていなかった)。
+# fixture は tests/test_rex_pr2_wiring.py の box 付きケースと同じ形
+# (knowledge/start-sh-verify-sent-echo.md)。
+_HC_RULE = "─" * 40
+
+
+def test_verify_sent_ignores_the_transcript_echo_of_a_delivered_message(fake):
+    """会話記録に残ったエコー (`❯ <msg>` が入力欄の外に出た後の行) を
+    「まだ入力欄にある」と誤認しない。これが t015 の実際の事故の再現形。"""
+    msg = "ミッション開始。plan status で状態を確認し、タスク分解を開始してください。"
+    screen = f"❯ {msg}\n\n● 了解\n\n{_HC_RULE}\n❯ \n{_HC_RULE}\n  ? for shortcuts\n"
+    fake.set([{"match": ["read"], **ok(out=json.dumps(
+        {"complete": True, "how": "history", "text": screen}))}])
+    assert lib_mux.Mux(backend=backend()).verify_sent("Omar-worker", msg) is True
+
+
+def test_verify_sent_false_while_text_is_still_in_the_hc_input_box(fake):
+    """入力欄の枠の中に本当にまだ残っていれば、従来どおり未確認 (False) のまま
+    (「届いていないのに届いたと言う」側には倒れていないことの対照)。"""
+    msg = "ミッション開始。plan status で状態を確認し、タスク分解を開始してください。"
+    screen = f"{_HC_RULE}\n❯ {msg}\n{_HC_RULE}\n"
+    fake.set([{"match": ["read"], **ok(out=json.dumps(
+        {"complete": True, "how": "history", "text": screen}))}])
+    assert lib_mux.Mux(backend=backend()).verify_sent("Omar-worker", msg) is False
+
+
+# t015 P2 (PR #359 の差し戻し): _rex_input_box() は画面の先頭から最初の罫線ペアを採っていたため、
+# 画面の上の方に古い空の枠 (前の再描画の残骸) が残っていると、それを「入力欄」と誤認し、下の生きた
+# 枠にまだ残っている本文を見落として「届いた」と誤判定していた (Seo が実装を動かして確認した真理値
+# 表)。末尾の窓から最後の `❯` を探す向きに直し、生きた枠だけを見るようにした。
+def test_verify_sent_false_when_a_stale_empty_box_sits_above_the_live_hc_box(fake):
+    msg = "ミッション開始。plan status で状態を確認し、タスク分解を開始してください。"
+    screen = (f"{_HC_RULE}\n❯ \n{_HC_RULE}\n"
+              "some task output\nmore output\n"
+              f"{_HC_RULE}\n❯ {msg}\n{_HC_RULE}\n")
+    fake.set([{"match": ["read"], **ok(out=json.dumps(
+        {"complete": True, "how": "history", "text": screen}))}])
+    assert lib_mux.Mux(backend=backend()).verify_sent("Omar-worker", msg) is False
+
+
 def test_hc_key_names_and_the_other_backends_are_unchanged():
     assert lib_mux._KEY_COLUMNS["hc"] == lib_mux._KEY_COLUMNS["herdr"]
     assert lib_mux._KEY_COLUMNS["tmux"] == 0

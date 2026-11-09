@@ -4768,14 +4768,36 @@ def rex_ensure_server(wait_seconds: float = 10.0):
                   "variables may be inherited by every pane)")
 
 
+#: Tail window to search for the live `❯` prompt, and the max span of the box
+#: below it — mirrors `lib_irc_relay._PROMPT_WINDOW` / `_BOX_MAX_LINES` (same
+#: window, same direction). t015 P2: scanning the *whole* screen for the
+#: first rule pair from the top picked up a stale, empty box still sitting
+#: higher in the scrollback (e.g. a previous redraw) whenever one was on
+#: screen above the live box — reporting "empty" (sent) while the live box
+#: further down still held unsent text. Searching the tail for the *last*
+#: `❯` finds the one live box instead.
+_REX_PROMPT_WINDOW = 12
+_REX_BOX_MAX_LINES = 8
+
+
 def _rex_input_box(screen: str):
     """The lines of Claude Code's input box (between the two rules), or None."""
     lines = screen.splitlines()
-    rules = [i for i, l in enumerate(lines)
-             if len(l) >= 20 and set(l.strip()) == {"─"}]
-    for a, b in zip(rules, rules[1:]):
-        if b > a + 1 and lines[a + 1].startswith("❯"):
-            return lines[a + 1:b]
+    tail_start = max(0, len(lines) - _REX_PROMPT_WINDOW)
+    prompt = None
+    for i in range(len(lines) - 1, tail_start - 1, -1):
+        if lines[i].startswith("❯"):
+            prompt = i
+            break
+    if prompt is None or prompt == 0:
+        return None
+    rule_above = lines[prompt - 1]
+    if not (len(rule_above) >= 20 and set(rule_above.strip()) == {"─"}):
+        return None
+    for j in range(prompt + 1, min(len(lines), prompt + 1 + _REX_BOX_MAX_LINES + 1)):
+        line = lines[j]
+        if len(line) >= 20 and set(line.strip()) == {"─"}:
+            return lines[prompt:j]
     return None
 
 
@@ -6204,14 +6226,37 @@ class HcBackend(_Backend):
         8), with no object or file either call is specified to leave behind
         for the other to read.  Implementing path 1 for real would mean
         inventing a side-channel this design does not define, which is out
-        of scope here; the design doc itself marks path 1 "未検証" (§11), so
-        the behaviour below — identical to `Mux.verify_sent()`'s own default
-        — is a documented no-op fast path, not a silent gap.
+        of scope here; the design doc itself marks path 1 "未検証" (§11).
+
+        t015: this used to be the plain `_text_in_input_line()` tail-scan
+        (identical to `Mux.verify_sent()`'s own default), which treats *any*
+        line starting with `❯` in the last `_VERIFY_SENT_TAIL_LINES` lines as
+        "the input line" — including Claude Code's own transcript echo of an
+        already-submitted message (`❯ <message>` reappears above the prompt
+        once Claude accepts it).  A short-enough kickoff (its first 30 chars
+        fit on the echoed line) was then reported as "still stuck in the
+        input line" even though it had already landed, causing start.sh to
+        resend it (observed repeatedly during mission
+        20261109-hc-production-switch; see
+        `knowledge/start-sh-verify-sent-echo.md`). `RexBackend.verify_sent()`
+        already fixed this for Rex by looking only inside the real input box
+        (`_rex_input_box()`: the lines between the two horizontal rules
+        around the `❯` prompt) — the same structure the IRC relay's
+        `input_box_state()` reads (`lib_irc_relay.py`). hc's `capture()` is a
+        screen-scrape of the same Claude Code TUI, so the identical box
+        detection applies here: look only inside the box when one is on
+        screen, and fall back to the old tail-scan only when no box can be
+        found at all (dialog, spinner redraw) — exactly `RexBackend`'s own
+        fallback, so an unconfirmable screen is no worse off than before.
         """
         screen = self.capture(name)
         if not screen:
             return False
-        return not _text_in_input_line(screen, text, tail_lines=_VERIFY_SENT_TAIL_LINES)
+        box = _rex_input_box(screen)
+        if box is None:
+            return not _text_in_input_line(
+                screen, text, tail_lines=_VERIFY_SENT_TAIL_LINES)
+        return text[:30] not in "\n".join(box)
 
 
 # ---------------------------------------------------------------------------

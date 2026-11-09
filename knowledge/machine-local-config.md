@@ -266,11 +266,11 @@ PR を 3 本に分ける (積み上げは merge commit — stacked-pr-squash の
     (手元に未コミット変更があれば衝突して pull が止まる)。放っておくと名簿が消え、名前の継承が切れる。
   - 手順 (受け取る機): **退避 → pull → 退避から戻す**。**前提: crewvia を止めて (Worker なしで) 行う。**
     手順 3 と 4 の間に plan.sh / lib_registry が名簿を書くと、空の名簿から新しく作られ、そこで振られた名前が
-    4 の上書きで消える (または退避と食い違う)。`sync-main-checkout.sh` はデーモンを restart するので、
-    止めずに使わない。
+    4 の上書きで消える (または退避と食い違う)。`sync-main-checkout.sh` は止めたデーモンも restart で起動しうる
+    (`lib_daemon_watch.py:386-399` の `restart_needed` と kill→spawn) ので、この手順では使わない。
     1. `cp registry/workers.yaml "$(mktemp -d)/workers.yaml"` で退避先を決めて退避する (退避先のパスを控える)。
     2. 手元変更を `git checkout registry/workers.yaml` で捨てる (追跡中の最後の 1 回。退避済みなので失われない)。
-    3. `git pull` (または `sync-main-checkout.sh`)。ファイルが消える。
+    3. `git pull`。ファイルが消える。
     4. 退避から `registry/workers.yaml` に戻す。以後は `.gitignore` で無視される。
   - この手順は `sync-main-checkout.sh` の移行メモにも入れる (PR-3)。
 - (b) 追跡のまま `skip-worktree` — 機ごとの設定で脆い (pull で外れる)。非推奨。

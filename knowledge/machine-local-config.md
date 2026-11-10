@@ -307,8 +307,28 @@ cp "$D/workers.yaml" registry/workers.yaml                                 # 4. 
 
 `sync-main-checkout.sh` は使わない (止めたデーモンも restart で起動しうる)。手順 3 と 4 の間に名簿が書かれると空から作られ、振られた名前が戻しで消える。
 
-台帳をコードが読む箇所 (`scripts/dispatcher.sh`・`plan.sh`・`kai-review.sh` ほか) は
-ファイル欠如を `Unreadable` ではなく「空」で扱ってよいか (初回起動で必ず起きる) を PR-3 の最初に洗う。
+**追跡解除より前へ戻る操作は、名簿を警告なしで古い版に置き換える (PR #365 レビュー P2-2)**: `registry/workers.yaml` は
+ignored になったので、git は「捨ててよいファイル」として扱う。使い捨て repo で確かめた挙動:
+
+- 追跡解除の commit の上で名簿を書き換えたあと、**追跡解除より前の commit / ブランチへ `git checkout` する**と、ファイルが
+  **警告なしで古い追跡版に置き換わる**。main に戻ると**ファイルごと消える**。
+- この PR を **revert** して pull したとき、`git reset --hard <PR より前>` をしたときも同じ形になる。
+
+どれも名前の継承 (設計原則 3) が手順書の外で切れる経路。**これらの操作の前に必ず `registry/workers.yaml` を退避し、終わったら戻す**
+(上の手順 1 と 4 と同じ。crewvia を止め、Worker なしで行う)。戻し方 (PR revert) も同じ: revert を pull する前に退避する。
+
+**台帳をコードが読む箇所の洗い出し結果 (PR-3a・t020 Seo の確認)**: ファイル欠如は、どの読み口でも「無い = 空」で扱われ、問題ない。
+
+| 読み口 | 欠如のときの挙動 |
+|---|---|
+| `scripts/dispatcher.sh` `load_workers` | `is_missing` → `{}` |
+| `scripts/verifier-dispatcher.sh` | 同上 |
+| `scripts/plan.sh` `_load_workers_from_registry` | `[]` (`registered_worker` は無いときに警告しない) |
+| `hooks/post-tool-use.sh` | `-f` を見て worker 扱いにするだけ |
+| `scripts/start.sh` / `assign-name.sh` | `lib_registry` 経由 (空の名簿から作る) |
+
+**注意**: 名簿が無い間は `plan.sh pull` の「`role: director` は pull しない」拒否が**効かない** (新規インストールと同じ挙動)。
+名簿を戻すまでの間は、この拒否に頼れない。
 
 ## 8. デーモンの respawn・`sync-main-checkout.sh` の restart 判定
 

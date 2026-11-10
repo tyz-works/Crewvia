@@ -178,7 +178,7 @@ python3 scripts/lib_config.py get mode                           # one key
 **Migrating (one-time).** Move this machine's hand-edited differences from `config/crewvia.yaml` into the local file, then discard them
 (`git checkout config/crewvia.yaml`). `registry/workers.yaml` is no longer tracked: on a machine that already has it, **stop crewvia
 (no Workers running) and** back it up, `git checkout registry/workers.yaml`, `git pull`, then copy it back — do not use
-`sync-main-checkout.sh` for that pull. Details: `knowledge/machine-local-config.md` §7.
+`sync-main-checkout.sh` for that pull. Also back it up **before** checking out a commit/branch from before the untracking, reverting this change, or `git reset --hard` to before it — git replaces an ignored file silently and then deletes it when you come back. Details: `knowledge/machine-local-config.md` §7.
 
 ### 3. Grant execute permissions
 

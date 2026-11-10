@@ -152,6 +152,34 @@ def test_terminated_is_not_declared_while_the_group_is_alive(sandbox, spawned, t
     assert not _alive(child)
 
 
+def test_shell_dying_right_after_the_orphan_check_does_not_discard_a_live_group(sandbox, spawned, tmp_path):
+    """_orphaned_group が shell 生存と読んだ直後に shell が死ぬ窓: group が残るのに discard してはいけない (t007)。
+
+    窓は決定的に開く: 最初の観測 (shell 生存) を「死ぬ前」の答えに差し替え、その直後の _guard は
+    実際に死んだ shell を見る。
+    """
+    child_file = tmp_path / "child.pid"
+    shell = spawned(["bash", "-c", SHELL_THEN_STUCK, "bash", str(child_file)])
+    child = _wait_file(child_file)
+    sandbox.record_identity(WINDOW, shell.pid)
+    mux = FakeMux({WINDOW: shell.pid})
+    ex = make_executor(sandbox, mux)
+
+    real = ex._orphaned_group
+    calls = {"n": 0}
+
+    def racy(prog):
+        calls["n"] += 1
+        if calls["n"] == 1 and not lr.process_alive(shell.pid):
+            return None                      # 観測の瞬間は shell が生きていた
+        return real(prog)
+
+    ex._orphaned_group = racy
+    assert _drive(ex, sandbox), "退役が終わらない"
+    assert not _alive(child), "group (固まった claude) が残ったまま discard された"
+    assert not any("NOT sending SIGKILL" in m for m in sandbox.logs), sandbox.logs
+
+
 def task_still_held(sandbox) -> bool:
     return sandbox.task_status() == "in_progress" and sandbox.task_worker() == AGENT
 

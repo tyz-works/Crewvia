@@ -620,7 +620,7 @@ class LeakGuard:
 
     def export_to_workeroutput(self, config) -> None:
         """xdist の worker なら、集計を controller へ渡す (`workeroutput` があるのは worker だけ。直列では何もしない)。"""
-        out = getattr(config, "workeroutput", None)
+        out = getattr(config, "workeroutput", None)  # config が None でも None になる
         if out is not None:
             out[self.WORKEROUTPUT_KEY] = {
                 "checked_tests": self.checked_tests,
@@ -639,7 +639,7 @@ class LeakGuard:
         try:
             self._sessionfinish(session)
         finally:
-            self.export_to_workeroutput(session.config)
+            self.export_to_workeroutput(getattr(session, "config", None))
 
     def _sessionfinish(self, session):
         """module / session スコープの fixture が残したもののための最後の網。

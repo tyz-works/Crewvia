@@ -89,10 +89,19 @@ log "Starting dispatcher (PID $$, queue=$QUEUE_DIR)"
 
 # 効いている mode とその出所 (起動・respawn のたびに 1 行。local の作り忘れに気づく用。
 # knowledge/machine-local-config.md §5)。読めなくても dispatcher の起動は止めない。
+# env の CREWVIA_MUX は本番では必ず立っている (./crewvia と start.sh が export し、spawn コマンドにも埋まる) ので、
+# env の有無にかかわらず config 側の mode と出所も出す (local の作り忘れが "env" に隠れないように)。
+_cfg_mode="$(python3 "${SCRIPT_DIR}/lib_config.py" --root "${REPO_ROOT}" get mode --default tmux 2>/dev/null)" || _cfg_mode="unknown"
+_cfg_source="$(python3 "${SCRIPT_DIR}/lib_config.py" --root "${REPO_ROOT}" source mode 2>/dev/null)" || _cfg_source="unknown"
+[[ -n "$_cfg_mode" ]] || _cfg_mode="unknown"
+[[ -n "$_cfg_source" ]] || _cfg_source="unknown"
 if [[ -n "${CREWVIA_MUX:-}" ]]; then
-  log "effective mode=${CREWVIA_MUX} (source: env CREWVIA_MUX)"
+  log "effective mode=${CREWVIA_MUX} (env); config mode=${_cfg_mode} (source: ${_cfg_source})"
 else
-  log "effective mode=$(python3 "${SCRIPT_DIR}/lib_config.py" --root "${REPO_ROOT}" get mode --default unknown 2>/dev/null || echo unknown) (source: $(python3 "${SCRIPT_DIR}/lib_config.py" --root "${REPO_ROOT}" source mode 2>/dev/null || echo unknown))"
+  log "effective mode=${_cfg_mode} (config; source: ${_cfg_source})"
+fi
+if [[ "$_cfg_source" == "unknown" ]]; then
+  log "WARNING: config を読めません (local が壊れている可能性)。mode の出所が不明です。lib_config.py get mode で原因を確認してください"
 fi
 
 # B2 / #26: この bash プロセスが起動した時点で、実際に読み込まれたコードの版

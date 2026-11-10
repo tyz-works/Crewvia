@@ -242,14 +242,14 @@ def get_dotted(cfg, dotted):
 
 
 def key_source(key, repo_root=None):
-    """トップキー key の実効値がどこから来たか: 'local' (local が key を持つ) / 'common'。"""
+    """トップキー key の実効値がどこから来たか: 'local' (local が key を持つ) / 'common' / 'unknown' (local が壊れている)。"""
     if os.environ.get(ENV_TEST_ISOLATION):
         return 'common'
     root = Path(repo_root) if repo_root is not None else _default_repo_root()
     try:
         local = _parse(find_main_checkout(root) / LOCAL_RELPATH, 'local')
     except ConfigError:
-        return 'common'
+        return 'unknown'   # local が壊れている: 出所は断定できない (呼び側が WARNING を出す)
     return 'local' if isinstance(local, dict) and key in local else 'common'
 
 

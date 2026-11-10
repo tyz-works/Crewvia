@@ -279,3 +279,47 @@ def test_cli_get_and_dump(tmp_path):
     assert r.returncode == 2 and "key_not_found" in r.stderr
     d = _cli(tmp_path, "dump", "--json")
     assert json.loads(d.stdout)["wip_limit"] == 8
+
+
+# --- key_source / source (t027 P3-3) -----------------------------------------
+
+def _src_root(tmp_path, local=None):
+    _write(tmp_path / "config" / "crewvia.yaml", COMMON)
+    if local is not None:
+        _write(tmp_path / "config" / "crewvia.local.yaml", local)
+    return tmp_path
+
+
+def test_key_source_common_when_no_local(tmp_path, monkeypatch):
+    monkeypatch.delenv("CREWVIA_MUX_TEST_ISOLATION", raising=False)
+    root = _src_root(tmp_path)
+    assert lc.key_source("mode", root) == "common"
+
+
+def test_key_source_local_only_for_keys_local_has(tmp_path, monkeypatch):
+    monkeypatch.delenv("CREWVIA_MUX_TEST_ISOLATION", raising=False)
+    root = _src_root(tmp_path, "mode: rex\n")
+    assert lc.key_source("mode", root) == "local"
+    assert lc.key_source("wip_limit", root) == "common"
+
+
+def test_key_source_common_under_test_isolation(tmp_path, monkeypatch):
+    root = _src_root(tmp_path, "mode: rex\n")
+    monkeypatch.setenv("CREWVIA_MUX_TEST_ISOLATION", "1")
+    assert lc.key_source("mode", root) == "common"
+
+
+def test_key_source_unknown_when_local_malformed(tmp_path, monkeypatch):
+    monkeypatch.delenv("CREWVIA_MUX_TEST_ISOLATION", raising=False)
+    root = _src_root(tmp_path, "mode: [unclosed\n")
+    assert lc.key_source("mode", root) == "unknown"
+
+
+def test_cli_source_cases(tmp_path):
+    root = _src_root(tmp_path)
+    assert _cli(root, "source", "mode").stdout.strip() == "common"
+    (root / "config" / "crewvia.local.yaml").write_text("mode: hc\n")
+    assert _cli(root, "source", "mode").stdout.strip() == "local"
+    (root / "config" / "crewvia.local.yaml").write_text("mode: [unclosed\n")
+    r = _cli(root, "source", "mode")
+    assert r.returncode == 1 and r.stdout.strip() == "" and "local_malformed" in r.stderr

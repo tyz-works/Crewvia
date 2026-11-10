@@ -353,7 +353,7 @@ tmux send-keys "cd /path/to/crewvia && ./scripts/start.sh worker docs research" 
 ### Running with herdr (alternative to tmux)
 
 [herdr](https://herdr.dev) is an agent-oriented terminal multiplexer and an alternative
-parallel execution backend. Set `mode: herdr` in `config/crewvia.yaml` (or use
+parallel execution backend. Set `mode: herdr` in `config/crewvia.local.yaml` (machine-local; or use
 `CREWVIA_MUX=herdr`) to select it, then launch with `./crewvia` from a plain terminal:
 
 ```bash
@@ -376,7 +376,7 @@ CREWVIA_MUX=herdr ./crewvia
 
 [Rex](https://www.superlogical.com/rex/docs/) can be the parallel execution backend too.
 Install the `rex` CLI (`which rex`; `rex version` must say `api: revision 9`), then select it with
-`mode: rex` in `config/crewvia.yaml` or per launch:
+`mode: rex` in `config/crewvia.local.yaml` (machine-local) or per launch:
 
 ```bash
 CREWVIA_MUX=rex ./crewvia

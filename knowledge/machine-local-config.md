@@ -229,6 +229,14 @@ local の `mode:` を置いた後で変更した。緩和策として `./crewvia
 `effective mode=<値> (source: common|local|env CREWVIA_MUX)` を 1 行出す (`lib_config.py source mode`)。
 移行スクリプトは主 checkout 以外 (worktree) からは exit 1 で止まる。
 
+**t027 (PR #368 レビュー対応)**: (1) env の `CREWVIA_MUX` は本番では `./crewvia` / start.sh / spawn コマンドが必ず立てるので、
+dispatcher の起動ログは env の有無にかかわらず config 側も出す: `effective mode=<値> (env); config mode=<値> (source: common|local|unknown)`
+(env が無いときは `effective mode=<値> (config; source: …)`)。local の作り忘れが "env" に隠れない。
+(2) local が壊れているとき: **`./crewvia` は ERROR で起動を止める** (共通に黙って戻さない)。**dispatcher は止めない**
+(稼働中のデーモンを落とすより、通知で気づける方が安全。respawn のたびに落ちて flap ガードに入るのも避ける) が、
+`source` が `unknown` になるので `WARNING: config を読めません` をログに出す。`lib_config.py source` は壊れた local では
+`common` と断定せず `unknown` (CLI は rc=1)。(3) 不明な mode のときは `./crewvia` のログに実際に使う `CREWVIA_MUX` (tmux) を出す。
+
 (b) を選ぶ場合、共通の `mode:` を tmux にする変更は**実装 PR とは別の最後の PR**にする
 (local が各機に揃ったことを確かめてから。揃う前に merge すると proserpina が tmux で起動する)。
 

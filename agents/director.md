@@ -1044,6 +1044,11 @@ Codex 1 巡目 P2 — 旧文面は `restart-needed(...)` の行だけを根拠�
 まず `--dry-run` の `restart 対象:` 行で予告を確認し、本実行後は `lib_daemon_watch.py status`
 で結果を確認すること。
 
+**`config/crewvia.local.yaml`（マシン固有の上書き・git 管理外）を変えたら、dispatcher を手で restart する**:
+`python3 scripts/lib_daemon_watch.py restart dispatcher`。local はデーモンの restart 判定（digest）の対象外なので
+`sync-main-checkout.sh` は拾わない。起動時に 1 回だけ読む値（Telegram / IRC の認証情報、`mux.state_grace_seconds`）は restart するまで古いまま。
+壊れた local はデーモンが割り当て・退役を見送り、Director に `[config]` で 1 回通知する（直すと自動で再開）。設計: `knowledge/machine-local-config.md` §3・§8。
+
 **dispatcher / watchdog に `scripts/lib_mux.py kill` を直接使わないこと。** 両者は相互監視
 (`scripts/lib_daemon_watch.py`、`knowledge/daemon-authority.md` §7) をしており、素朴に kill する
 と、kill してから自分で新コードを spawn するまでの隙間をピア側が「死んだ」と誤認し、**旧コード

@@ -49,7 +49,11 @@ def _pull_args(name):
 
 def _production_names():
     pool = yaml.safe_load((REPO / "config" / "worker-names.yaml").read_text())["names"]
-    reg = yaml.safe_load((REPO / "registry" / "workers.yaml").read_text()) or {}
+    # registry/workers.yaml は git 管理外 (machine-local-config §7)。CI の checkout には無い = 登録名なし
+    # 注意: CI では登録名が検査されず、プール (config/worker-names.yaml) と Kai-codex だけになる。
+    # 登録名の検査はこのファイルを持つ機 (本番機) でだけ効く (PR #365 レビュー P3-2)。
+    reg_path = REPO / "registry" / "workers.yaml"
+    reg = (yaml.safe_load(reg_path.read_text()) or {}) if reg_path.is_file() else {}
     registered = [w["name"] for w in reg.get("workers", [])]
     return [str(n) for n in pool + registered + ["Kai-codex"]]
 

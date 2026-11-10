@@ -16,8 +16,8 @@
 # ⚠️ 重要: このテストは「Director セッションから plan.sh review を起動した
 # 実運用と同じ経路」を再現する。具体的には:
 #   - AGENT_NAME を明示的に外した env は使わない。むしろ逆に、テストの
-#     出発点として AGENT_NAME を registry 上の実在する role: director の
-#     名前 (例: Sora) に明示的にセットし、「Director セッションの子プロセス
+#     出発点として AGENT_NAME を fixture 名簿上の role: director の
+#     名前 (一時 dir に置いた fixture の名簿の Fixture-Director) に明示的にセットし、「Director セッションの子プロセス
 #     として起動された」状態を模す。
 #   - scripts/review-plan.sh 本体 (コピーではなく実ファイルをそのまま
 #     scratch CREWVIA_DIR にコピーして) を実際に実行し、mux 分岐だけを
@@ -56,24 +56,36 @@ fail() { FAIL_COUNT=$((FAIL_COUNT + 1)); echo "  FAIL: $1"; }
 
 echo "== test_review_plan_director_identity.sh (t008) =="
 
-# registry/workers.yaml から実在する role: director の名前を取得する
-# (ハードコードせず、実データに追従する)。
-DIRECTOR_NAME="$(awk '
-  /^  - name:/ { name = $3 }
-  /role: director/ { print name; exit }
-' "$REAL_REPO/registry/workers.yaml")"
-
-if [[ -z "$DIRECTOR_NAME" ]]; then
-  echo "SKIP: registry/workers.yaml に role: director の worker が見つかりません" >&2
-  exit 0
+# registry/workers.yaml は git 管理外 (machine-local-config §7) で、CI の checkout には無い。
+# 本物の名簿を読むと CI では SKIP→PASS に倒れ、Director の hook bypass が reviewer に
+# 継承される穴の回帰ガードが消える (PR #365 レビュー P2-1)。そのため一時 dir に
+# role: director の名簿を自前で置き、hook (CREWVIA_REPO) をそこへ向ける。
+# 本物の名簿の有無・中身に依存しないので、このテストは SKIP しない。
+DIRECTOR_NAME="Fixture-Director"
+HOOK_REPO="$(mktemp -d /tmp/crewvia-test-review-plan-hookrepo-XXXXXX)"
+mkdir -p "$HOOK_REPO/registry"
+cat > "$HOOK_REPO/registry/workers.yaml" << YAML
+workers:
+  - name: $DIRECTOR_NAME
+    role: director
+  - name: Fixture-Worker
+    role: worker
+YAML
+# hook が CREWVIA_REPO 配下から読むコード・設定は本物を指す (registry だけ差し替える)
+for _d in hooks config scripts; do
+  ln -s "$REAL_REPO/$_d" "$HOOK_REPO/$_d"
+done
+if [[ "$(awk '/role: director/ { print "ok"; exit }' "$HOOK_REPO/registry/workers.yaml")" != "ok" ]]; then
+  echo "FAIL: fixture の名簿に role: director が無い" >&2
+  exit 1
 fi
-echo "(registry 上の director 名: $DIRECTOR_NAME)"
+echo "(fixture の director 名: $DIRECTOR_NAME)"
 
 BASH_TOOL_JSON='{"tool_name":"Bash","tool_input":{"command":"echo hi"}}'
 
 echo ""
 echo "--- Test 1 (前提の再現): AGENT_NAME=<director名> のまま SKILLS=plan_review で hook を呼ぶと Bash が bypass (allow) される ---"
-OUT1="$(echo "$BASH_TOOL_JSON" | AGENT_NAME="$DIRECTOR_NAME" SKILLS=plan_review CREWVIA_REPO="$REAL_REPO" bash "$REAL_REPO/hooks/pre-tool-use.sh" 2>/dev/null)"
+OUT1="$(echo "$BASH_TOOL_JSON" | AGENT_NAME="$DIRECTOR_NAME" SKILLS=plan_review CREWVIA_REPO="$HOOK_REPO" bash "$REAL_REPO/hooks/pre-tool-use.sh" 2>/dev/null)"
 if [[ -z "$OUT1" ]]; then
   pass "AGENT_NAME=$DIRECTOR_NAME (上書きなし) では Bash が無言で bypass される — 修正前の事故を再現できた"
 else
@@ -84,7 +96,7 @@ echo ""
 echo "--- Test 2 (本修正・実運用経路): review-plan.sh を Director セッション相当の env から実行し、reviewer 子プロセスの AGENT_NAME が上書きされることを確認 ---"
 
 SCRATCH_DIR="$(mktemp -d /tmp/crewvia-test-review-plan-XXXXXX)"
-trap 'rm -rf "$SCRATCH_DIR"' EXIT
+trap 'rm -rf "$SCRATCH_DIR" "$HOOK_REPO"' EXIT
 
 mkdir -p "$SCRATCH_DIR/scripts"
 mkdir -p "$SCRATCH_DIR/queue/missions/test-mission"
@@ -112,7 +124,7 @@ cat > "$FAKE_BIN_DIR/claude" << FAKESCRIPT
 #!/usr/bin/env bash
 echo "\${AGENT_NAME:-}" > "$RESULT_DIR/captured_agent_name.txt"
 echo '$BASH_TOOL_JSON' \\
-  | AGENT_NAME="\${AGENT_NAME:-}" SKILLS="\${SKILLS:-}" CREWVIA_REPO="$REAL_REPO" \\
+  | AGENT_NAME="\${AGENT_NAME:-}" SKILLS="\${SKILLS:-}" CREWVIA_REPO="$HOOK_REPO" \\
     bash "$REAL_REPO/hooks/pre-tool-use.sh" \\
   > "$RESULT_DIR/hook_decision.json" 2>"$RESULT_DIR/hook_decision.stderr"
 cat > "queue/missions/test-mission/plan_review.md" << 'EOF'

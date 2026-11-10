@@ -23,6 +23,10 @@
 #   - HEAD が origin/main の祖先でない (diverged — 手で解決すること)
 #   - merge --ff-only 自体が失敗した (通常は起きないが、報告してそこで止まる)
 #
+# **registry/workers.yaml の追跡解除を受け取る機ではこのスクリプトを使わない**
+# (knowledge/machine-local-config.md §7。crewvia を止め Worker なしで 退避 → 手元変更を捨てる → git pull → 戻す。
+# このスクリプトは止めたデーモンも restart で起動しうるので、手順 3〜4 の間に名簿が空から作られる)。
+#
 # 主 checkout の未コミット変更 (registry/workers.yaml 等) があっても、それらと
 # 衝突しない限り ff は進む — `git merge --ff-only` は素の git の判断に任せ、
 # ここで追加のガードは入れない。

@@ -281,7 +281,9 @@ class _NoMux:
     `effective_config_readable()` の「見送り + 一度だけ通知」に届かせる。何も観測せず何も
     しない: list は空・send / kill は失敗。割り当て・退役・kill には使わない (下の
     サイクル本体は `_MUX_CONFIG_PROBLEM` があれば gate だけ走らせて終わる)。
-    通知は CREWVIA_MUX が env にあるときだけ Director に届く (無ければ Director 不在として見送る)。"""
+    通知は CREWVIA_MUX が env にあるときだけ Director に届く。env に無いと問い合わせる先が無く、通知は届かずログだけ
+    (`WARNING: <kind> — mux を選べないため通知できない (CREWVIA_MUX が env に無く config が読めない: <コード>)`。
+    『Director 不在のため通知スキップ』とは文言が違う。knowledge/machine-local-config.md §3)。"""
 
     def list(self, *a, **k):
         return []

@@ -582,6 +582,17 @@ trust は利用者の判断で、迂回口を作ると「信頼していない d
 デーモンの再起動（`lib_daemon_watch.py restart`）は要らない。既に走っている Worker には影響しない。
 拒否の記録は `logs/start-sh/refusals.log`（消してよい）
 
+### `lib_config.py`
+
+共通 `config/crewvia.yaml` にマシン固有の `config/crewvia.local.yaml`（git 管理外・主 checkout の分）を重ねて読む**唯一の入口**
+（PR-1 #356 が lib、PR-2 #360 が読み口の移行、PR-3a / t019 が docs。設計 `knowledge/machine-local-config.md`）。
+重ね方は dict = 深いマージ・list / scalar = 置換・`null` = 共通の値を消す・local なし = 共通だけ。local が**ある**のに読めない / 許可外キー
+（`ALLOWED_KEYS` の外。`attempts` / `timeout_max_per_skill` は共有規則なので除外）/ 型違いは `Unreadable`（共通に黙って戻さない・エラーは固定コード + 位置だけ）。
+CLI: `lib_config.py [--root R] get <dotted.key> [--default X]` / `dump --json`（shell の読み口はこの 2 つを呼ぶ）。
+`CREWVIA_MUX_TEST_ISOLATION` が立つ間は local を読まない。local の読み先は `find_main_checkout()`（`git --git-common-dir` の親・git 管理外ではスクリプトの位置だけ。
+`CREWVIA_REPO_ROOT` / `CREWVIA_REPO` は local の読み先に使わない）。consumer ごとの壊れ方は設計 §3 の表。`DAEMON_RESTART_FILES` に入っている
+（local の値そのものは digest 対象外。変えたら `lib_daemon_watch.py restart dispatcher` を手で）。戻し方: PR revert（local ファイルは残ってよい）。
+
 ### `lib_registry.py`
 
 `registry/workers.yaml` を書く入口（`registry/.workers.lock` の中で parse → 変更 → write）。
@@ -590,7 +601,8 @@ tag は警告して飛ばす）。t017 / PR5a
 
 **書き込みは `lib_state_store.atomic_write_text`**（tmp → fsync → replace → 親 dir の fsync。途中で落ちても元の名簿が残る。
 S5 / t020）。初期化（`workers: []`）は無く、無いファイルは `parse()` が「Worker がいない」と読み、最初の `write()` が
-ロックの中で dir ごと作る（`assign-name.sh` がロックの外で作っていた穴を塞いだ）。`knowledge/state-store.md` §5.3・§6.1
+ロックの中で dir ごと作る（`assign-name.sh` がロックの外で作っていた穴を塞いだ）。
+**`registry/workers.yaml` は追跡しない**（PR-3a / t019。`.gitignore` 済み・無いのが初回の通常状態。雛形 `.example` は作らない理由と、受け取る機の手順は `knowledge/machine-local-config.md` §7。`tests/test_workers_yaml_untracked.py`）。`knowledge/state-store.md` §5.3・§6.1
 
 ### `lib_history.py`
 

@@ -94,3 +94,6 @@ registry/benchmarks/**/*.json
 
 # マシン固有の設定の上書き (git 管理外。設計: knowledge/machine-local-config.md)
 config/crewvia.local.yaml
+# Worker の名簿 (実行時の台帳。機ごとの稼働で必ずずれる)。追跡下に置くと全 PR・全 worktree に混入する。
+# 追跡解除: knowledge/machine-local-config.md §7。無ければ lib_registry が空の名簿から作る
+registry/workers.yaml

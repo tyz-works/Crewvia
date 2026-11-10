@@ -67,7 +67,7 @@
 `scripts/` と `tests/` で作業するときは、それぞれの `CLAUDE.md`（入れ子。そこで作業するときだけ読み込まれる）に lib ごとの契約とテストの作法がある。
 
 ```
-config/   worker-names.yaml（名前プール）/ crewvia.yaml（承認チャネル・WIP・model_per_skill）
+config/   worker-names.yaml（名前プール）/ crewvia.yaml（承認チャネル・WIP・model_per_skill）/ crewvia.local.yaml（マシン固有の上書き・git 管理外。読み口は scripts/lib_config.py）
 hooks/    pre-tool-use.sh（Taskvia 承認）/ post-tool-use.sh（ログ投稿・デーモン同時死の backstop）
 agents/   director.md / worker.md（システムプロンプト）
 scripts/
@@ -78,6 +78,7 @@ scripts/
   lib_daemon_watch.py   dispatcher / watchdog の相互監視・restart
   lib_retirement.py     retirement marker（dispatcher が判定 → watchdog が実行）
   lib_task_cards.py     queue / registry / config を読む唯一の入口
+  lib_config.py         共通 crewvia.yaml + crewvia.local.yaml を重ねて読む config の唯一の入口（設計: knowledge/machine-local-config.md）
   lib_dep_rules.py      「依存が満たされた」の唯一の定義
   lib_daemon_state.py   デーモン側 JSON 状態ストアの入口
   lib_mux.py / .sh      mux 抽象化（tmux / herdr / rex / hc。Rex は RexBackend・ensure-server・kill は pidfd・設計: knowledge/rex-mux-backend.md。hc は HcBackend・handle は address・設計: knowledge/herdr-core-mux-backend.md）
@@ -89,12 +90,12 @@ scripts/
   lib_telegram.py       Telegram の経路（質問台帳・受信・認証情報の解決）/ ask_user.sh  Director の質問の入口
   kai-review.sh         reviewer 起動ラッパー（codex / agy / claude / both / ensemble = agy + claude の合議 + 比較用の cursor。設定の読み口は lib_review_engine.py）/ taskvia-sync.sh  queue → Taskvia 同期
 queue/    state.yaml / missions/<slug>/{mission.yaml,tasks/tNNN.md} / archive/
-registry/ workers.yaml / workers/ / heartbeats/ / mux/ / retirements/ / task-graph/ / daemons/ / ci/（PR の CI の記録。dispatcher が書く・消してよい）
+registry/ workers.yaml（git 管理外・無ければ lib_registry が空から作る）/ workers/ / heartbeats/ / mux/ / retirements/ / task-graph/ / daemons/ / ci/（PR の CI の記録。dispatcher が書く・消してよい）
 ```
 
 ### 不変条件（推測できず、破ると事故になるもの）
 
-1. queue / registry / config のファイルを開くコードは、必ず `scripts/lib_task_cards.py` の入口を通す（読めない = `Unreadable`。`None` / `{}` / `[]` に潰さない）
+1. queue / registry / config のファイルを開くコードは、必ず `scripts/lib_task_cards.py` の入口を通す（読めない = `Unreadable`。`None` / `{}` / `[]` に潰さない）。**`config/crewvia.yaml` は `scripts/lib_config.py` 経由で読む**（local を重ねる唯一の入口。自前で `crewvia.yaml` を開かない。local が壊れていれば `Unreadable` で、共通の値に黙って戻さない。local を変えたら `python3 scripts/lib_daemon_watch.py restart dispatcher` を手で）
 2. task の識別子は**ファイル名**（`tNNN.md`）。frontmatter の `id` 欄ではない
 3. 依存の判定は `lib_dep_rules.py` だけ。コピーしない（`failed` の依存は保留で、出口は `plan.sh release-dep`）
 4. デーモンの再起動は `lib_daemon_watch.py restart`。`lib_mux.py kill` / `spawn` を素で叩かない

@@ -118,6 +118,14 @@ grep) し、§2-A も「読めない → 既定値」に潰す読み口が多い
    食い違う source=common のときに警告する (§5 の緩和と同じ仕組み)。(c) 読み口が env で repo root を
    上書きできる形 (`CREWVIA_REPO` / `CREWVIA_REPO_ROOT`) は、`lib_config` に統一して**読み先の決め方を 1 か所**にする
    (新しい config 位置 env は作らない — §8-5)。
+**実装後の整理 (PR-3a / t019。t014 P3-3)**: 読み先は 2 つの別の問いに分かれ、どちらも `lib_config` の決め方に揃っている。
+   - **local の置き場所** = 主 checkout の `config/crewvia.local.yaml`。`lib_telegram.py` / `lib_irc_relay.py` / `hooks/lib_approval_channel.sh` は
+     いずれも `lib_config.load_for_path()` / `lib_config.py --root … dump` を通すので、`CREWVIA_REPO_ROOT` / `CREWVIA_REPO` が何を指しても
+     local は `find_main_checkout()` で決まる (env は local の読み先に効かない)。
+   - **共通 yaml の置き場所** = 呼び出し側の root (§2-E 2)。`CREWVIA_REPO_ROOT` / `CREWVIA_REPO` はここと、`registry/daemons/`・`queue/` など
+     **状態の置き場所**を決める既存の env で、同じ env を共通 yaml にも使うのは意図どおり (状態と設定が別々の repo を指さない)。
+     これを `lib_config._default_repo_root()` (スクリプトの位置) に寄せると、`CREWVIA_REPO_ROOT` で隔離ツリーを指す既存テストと
+     worktree の hook で共通 yaml の読み先が変わる = **挙動が変わる**ので、この PR では寄せない。新しい config 位置 env は作らない (§8-5)。
 5. hook (`lib_approval_channel.sh`) は shell なので `lib_config.py get` を呼ぶ。読めないとき (§3 の表) は
    承認できない側に倒す。worktree から呼んでも 1 の定義で主 checkout の local を見る。
 
@@ -144,7 +152,7 @@ grep) し、§2-A も「読めない → 既定値」に潰す読み口が多い
 | `start.sh` / `crewvia` (起動) | **起動しない**。固定コードと対処 (local を直す / 一時的に退避) を出して exit 1 |
 | `plan.sh` | config を読む subcommand は `UsageExit` で何も書かず拒否 (task-graph も再生成しない)。読まない subcommand は影響なし |
 | dispatcher | そのサイクルは割り当て・通知判定を**スキップ**し、「local config unreadable」を Director に**一度だけ**通知 (回復時に clear — `_daemon の一度だけ通知には回復時の clear が要る`)。Worker は殺さない・起こさない。**制限 (t017 / PR-2 P2-1)**: `CREWVIA_MUX` が env に無い起動で local が壊れると、dispatcher は mux を選べず (`_NoMux`) Director の有無を問い合わせる先が無いので、この通知は**届かずログだけ**になる (コードで通知経路は足さない — ユーザー決定 2026-11-10)。本番は `start.sh` が `CREWVIA_MUX` を export し、`lib_daemon_watch` の spawn の env allowlist (`CREWVIA_MUX`) が respawn でも運ぶので通常は起きない。起きるのは inline 起動や手で起動したデーモン。気づき方: `logs/dispatcher` の `WARNING: config-unreadable — mux を選べないため通知できない (CREWVIA_MUX が env に無く config が読めない: <コード>)` の行 (Director が本当に居ない場面の `Director 不在のため通知スキップ` とは文言が違う)。 |
-| watchdog | **何も終了させない** (判定材料が壊れているので retire / kill をしない)。待つ間も**心拍は書く** (t017: 書かないと待ちが stale しきい値を超えた時点で相互監視が restart する) |
+| watchdog | **待つのは mux を選べないときだけ** (`Mux()` が config の `mode:` を読めず投げる = `CREWVIA_MUX` が env に無く config が壊れている場面。`watchdog.py` の `_MUX_CONFIG_PROBLEM` の待ちループ)。待つ間は**何も終了させず** (判定材料が壊れているので retire / kill をしない)、**心拍は書く** (t017: 書かないと待ちが stale しきい値を超えた時点で相互監視が restart する)。`WARNING: mux backend を選べない (config unreadable: <コード>)` を 1 回ログに出し、直ると自動で再開する。**`CREWVIA_MUX` が env にあるとき watchdog は mode を config から読まないので待たない** (dispatcher のように「config 全体が読めるか」を毎サイクル見る gate は watchdog には無い。t014 P3-4 の差の解消 = 文書を実装に合わせた) |
 | `lib_daemon_watch` (相互監視・respawn) | respawn **しない** (保留。flap ガードと同じ「確証が無いときは動かない」) |
 | `lib_mux._config_mode()` | `None` を返すと `TmuxBackend` に落ちる (t016 の事故の形)。local が壊れているときは **None ではなく例外/unavailable** にする。mux verb は拒否 |
 | `hooks/pre-tool-use.sh` (承認) | 承認経路の `approval_channel` が読めない → 既存の「承認できない」側 (拒否または ask) に倒す。承認を黙って通さない |
@@ -277,7 +285,29 @@ PR を 3 本に分ける (積み上げは merge commit — stacked-pr-squash の
 - (c) 追跡のまま・共通は雛形だけ (名簿を空にして commit) — 機ごとの差は消えるが、今度は
   稼働のたびに diff が出る。解決していない。
 
-(a) は PR-3 で。台帳をコードが読む箇所 (`scripts/dispatcher.sh`・`plan.sh`・`kai-review.sh` ほか) は
+**PR-3a (t019) で実施した内容**:
+
+- `git rm --cached registry/workers.yaml` + `.gitignore` に `registry/workers.yaml` の行を足した (`.gitignore` に行は**まだ無かった**ので足した)。
+- **`registry/workers.yaml.example` は作らない**。理由: (1) 無いファイルは `lib_registry.parse()` が `('', [], {})` を返し、最初の `write()` が
+  `workers: []` から作る (`assign-name.sh` も `start.sh` も同じ入口)。(2) 雛形に名前の行を入れると、その機の名簿と食い違う別の正本ができる。
+  (3) ヘッダコメント (各欄の説明) はこの節の下の表に移した。
+- 各欄の意味 (旧ヘッダコメント): `name` = `assign-name.sh` が `config/worker-names.yaml` のプールから決めた名前 / `role` = director 指定時のみ /
+  `skills` = 担当スキルのリスト / `task_count` = 完了タスク数 (自動加算) / `last_active` = 最終稼働日 (`YYYY-MM-DD`、自動更新)。
+  スキルタグ一覧は `agents/director.md` §5。手編集してよいが、書くのは `lib_registry.py` の入口 (ロックの中) に限る。
+
+**受け取る機の手順 (PR 本文の先頭にも書く)** — crewvia を止め、Worker なしで行う:
+
+```bash
+cd <crewvia の主 checkout>
+D="$(mktemp -d)"; cp registry/workers.yaml "$D/workers.yaml"; echo "$D"   # 1. 退避 (退避先を控える)
+git checkout registry/workers.yaml                                         # 2. 手元変更を捨てる (退避済み)
+git pull                                                                   # 3. ファイルが消える
+cp "$D/workers.yaml" registry/workers.yaml                                 # 4. 退避から戻す (以後は .gitignore が無視する)
+```
+
+`sync-main-checkout.sh` は使わない (止めたデーモンも restart で起動しうる)。手順 3 と 4 の間に名簿が書かれると空から作られ、振られた名前が戻しで消える。
+
+台帳をコードが読む箇所 (`scripts/dispatcher.sh`・`plan.sh`・`kai-review.sh` ほか) は
 ファイル欠如を `Unreadable` ではなく「空」で扱ってよいか (初回起動で必ず起きる) を PR-3 の最初に洗う。
 
 ## 8. デーモンの respawn・`sync-main-checkout.sh` の restart 判定
@@ -297,6 +327,9 @@ telegram/IRC の認証情報の取り出し) が混在している。
 2. 代わりに、**起動時 1 回読みの値だけ**が問題になる。dispatcher は respawn のたびに認証情報を取り出す
    (CLAUDE.md の Telegram/IRC の項) ので、local を直したら `lib_daemon_watch.py restart dispatcher` を
    手で実行すれば反映される。これを手順書に 1 行書く。
+   **起動時 1 回読みの例 (t014 P3-5)**: dispatcher の `STATE_GRACE` (`mux.state_grace_seconds`) は `dispatcher.sh` の先頭で
+   `lib_config.py get` を **起動時に 1 回** 読んで変数に持つ (サイクルごとには読み直さない)。local の `mux.state_grace_seconds` を
+   変えたら dispatcher の restart が要る (D5 と一貫。env `CREWVIA_STATE_GRACE` があればそれが優先)。読めない・無いときは既定 60 秒。
 3. 「local の内容が変わったのに restart していない」を**検知だけ**する案 (任意・PR-3 以降):
    record_own_version に `local_config_digest` を足し、`restart-needed` が `true` ではなく
    別の値 `config-changed` (advisory) を返す。自動 restart はしない。

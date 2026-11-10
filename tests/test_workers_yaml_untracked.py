@@ -18,6 +18,7 @@ SCRIPTS = REPO_ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 import lib_registry  # noqa: E402
+from fixture_tree import copy_plan_tree  # noqa: E402
 
 
 def _run(args, **kw):
@@ -56,12 +57,9 @@ def test_register_director_creates_the_roster_from_nothing(tmp_path):
 
 
 def test_assign_name_creates_the_roster_when_the_file_is_absent(tmp_path):
-    (tmp_path / "scripts").mkdir()
+    copy_plan_tree(tmp_path)   # lib_* はこの helper だけが写す (test_fixture_tree_is_the_only_copier)
     (tmp_path / "config").mkdir()
-    shutil.copy2(SCRIPTS / "assign-name.sh", tmp_path / "scripts" / "assign-name.sh")
-    shutil.copy2(SCRIPTS / "lib_registry.py", tmp_path / "scripts" / "lib_registry.py")
-    for lib in SCRIPTS.glob("lib_*.py"):
-        shutil.copy2(lib, tmp_path / "scripts" / lib.name)
+    (tmp_path / "scripts" / "assign-name.sh").write_bytes((SCRIPTS / "assign-name.sh").read_bytes())
     shutil.copy2(REPO_ROOT / "config" / "worker-names.yaml", tmp_path / "config" / "worker-names.yaml")
     assert not (tmp_path / "registry" / "workers.yaml").exists()
     r = _run(["bash", str(tmp_path / "scripts" / "assign-name.sh"), "code"], cwd=tmp_path)

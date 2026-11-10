@@ -124,6 +124,8 @@ jobs:
   pytest:
     name: Python Unit Tests (pytest)
     runs-on: ubuntu-latest
+    # fork() とスレッドの組み合わせ（execnet の worker）で止まると、既定では 6 時間まで終わらない。
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 

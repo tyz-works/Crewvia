@@ -412,7 +412,7 @@ CREWVIA_MUX=rex ./crewvia
 
 [herdr-core](https://herdr.dev) (`hc`) is a newer, lighter terminal manager that can also be the
 parallel execution backend. Install the `hc` CLI, then select it with `mode: hc` in
-`config/crewvia.yaml` or per launch:
+`config/crewvia.local.yaml` (machine-local; the committed default in `config/crewvia.yaml` is `mode: tmux`) or per launch:
 
 ```bash
 CREWVIA_MUX=hc ./crewvia

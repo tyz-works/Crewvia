@@ -140,6 +140,14 @@ if [[ -z "${CREWVIA_MUX:-}" ]]; then
   esac
 fi
 
+# 効いている mode とその出所を 1 行出す (local を作り忘れた機が黙って共通の既定で起動するのに気づけるように。
+# knowledge/machine-local-config.md §5)。CREWVIA_MUX が env にあればそれが最優先。
+if [[ -n "${MODE:-}" ]]; then
+  echo "[crewvia] effective mode=${MODE} (source: $(python3 "${SCRIPT_DIR}/scripts/lib_config.py" --root "${SCRIPT_DIR}" source mode 2>/dev/null || echo unknown))" >&2
+else
+  echo "[crewvia] effective mode=${CREWVIA_MUX:-inline} (source: env CREWVIA_MUX)" >&2
+fi
+
 # --- サブコマンド ---
 SUBCMD="${1:-director}"
 

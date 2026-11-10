@@ -87,6 +87,14 @@ log() {
 
 log "Starting dispatcher (PID $$, queue=$QUEUE_DIR)"
 
+# 効いている mode とその出所 (起動・respawn のたびに 1 行。local の作り忘れに気づく用。
+# knowledge/machine-local-config.md §5)。読めなくても dispatcher の起動は止めない。
+if [[ -n "${CREWVIA_MUX:-}" ]]; then
+  log "effective mode=${CREWVIA_MUX} (source: env CREWVIA_MUX)"
+else
+  log "effective mode=$(python3 "${SCRIPT_DIR}/lib_config.py" --root "${REPO_ROOT}" get mode --default unknown 2>/dev/null || echo unknown) (source: $(python3 "${SCRIPT_DIR}/lib_config.py" --root "${REPO_ROOT}" source mode 2>/dev/null || echo unknown))"
+fi
+
 # B2 / #26: この bash プロセスが起動した時点で、実際に読み込まれたコードの版
 # (HEAD sha + 対象ファイルの digest) を 1 回だけ記録する。以降 disk が
 # `git merge` で変わっても、この記録はこのプロセスが実際に持っているものを

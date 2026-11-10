@@ -219,10 +219,15 @@ allowlist は `lib_config.py` に定数で持ち、テストが共通 yaml の t
 `config/crewvia.yaml` の HEAD との差を `config/crewvia.local.yaml` (0600) に移し、**`mode` は差に出なくても必ず明示**し
 (共通が HEAD の `mode:` を持つ機は差に出ないため)、`lib_config.load_effective` で移行前後の実効 config が一致することを
 確かめてから共通を HEAD に戻す。不一致なら元に戻して止める (exit 3 = 何も変えていない / exit 4 = 適用後に不一致で戻した)。
-既に local がある・キーを消した手元変更がある・許可外キー (`attempts` 等) の手元変更がある場合は何も変えずに止まる
+主 checkout でない (worktree)・既に local がある・キーを消した手元変更がある・許可外キー (`attempts` 等) の手元変更がある場合は何も変えずに止まる
 (exit 1 / 2)。退避は `~/crewvia-local-migrate-<時刻>/` (700。手元版・差分・移行前後の dump。値はここにだけ残り、標準出力には
 キー名と `SAME` しか出ない)。戻し方: `cp <退避先>/crewvia.yaml.local-edited config/crewvia.yaml && rm config/crewvia.local.yaml`。
 テスト: `scripts/test_migrate_local_config.sh` (使い捨ての git repo と HOME)。
+
+**実施済み (t025 / PR-3b, 2026-11-10)**: D1 = (b)。共通 `config/crewvia.yaml` の `mode:` は `tmux`。両機 (WSL = rex / もう一台 = hc) に
+local の `mode:` を置いた後で変更した。緩和策として `./crewvia` と dispatcher の起動 (respawn のたび) が
+`effective mode=<値> (source: common|local|env CREWVIA_MUX)` を 1 行出す (`lib_config.py source mode`)。
+移行スクリプトは主 checkout 以外 (worktree) からは exit 1 で止まる。
 
 (b) を選ぶ場合、共通の `mode:` を tmux にする変更は**実装 PR とは別の最後の PR**にする
 (local が各機に揃ったことを確かめてから。揃う前に merge すると proserpina が tmux で起動する)。

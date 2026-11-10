@@ -241,6 +241,18 @@ def get_dotted(cfg, dotted):
     return True, cur
 
 
+def key_source(key, repo_root=None):
+    """トップキー key の実効値がどこから来たか: 'local' (local が key を持つ) / 'common'。"""
+    if os.environ.get(ENV_TEST_ISOLATION):
+        return 'common'
+    root = Path(repo_root) if repo_root is not None else _default_repo_root()
+    try:
+        local = _parse(find_main_checkout(root) / LOCAL_RELPATH, 'local')
+    except ConfigError:
+        return 'common'
+    return 'local' if isinstance(local, dict) and key in local else 'common'
+
+
 def _render(value):
     if isinstance(value, bool):
         return 'true' if value else 'false'
@@ -256,6 +268,8 @@ def main(argv=None):
     g = sub.add_parser('get')
     g.add_argument('key')
     g.add_argument('--default')
+    sc = sub.add_parser('source')
+    sc.add_argument('key')
     d = sub.add_parser('dump')
     d.add_argument('--json', action='store_true', required=True)
     args = ap.parse_args(argv)
@@ -266,6 +280,9 @@ def main(argv=None):
         return 1
     if args.cmd == 'dump':
         print(json.dumps(cfg, ensure_ascii=False, sort_keys=True))
+        return 0
+    if args.cmd == 'source':
+        print(key_source(args.key, args.root))
         return 0
     found, value = get_dotted(cfg, args.key)
     if found:

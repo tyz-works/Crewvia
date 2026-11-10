@@ -171,6 +171,11 @@ ALLOWED_WRITES: dict[tuple[str, str], tuple[int, str]] = {
     ('start.sh', '<bash>'): (7, "Worker の settings / prompt の一時ファイルと refusals.log (registry/start-sh)。queue の状態を書かない。"
                                 "起動時の 1 者"),
     ('start.sh', '<module>'): (4, "Worker の `.claude/settings` (target_dir 側) を書く。queue / registry の外"),
+    ('migrate-local-config.sh', '<bash>'): (9, "config/ の移行スクリプト (手動で 1 回走らせる)。書き先は config/crewvia.local.yaml・共通 config の復元・"
+                                               "退避先 ~/crewvia-local-migrate-<時刻>/ (手元版・差分・dump) と stdout/stderr の捨て先だけで、"
+                                               "queue / registry の状態は書かない。失敗時は退避から元に戻せる (machine-local-config §5)"),
+    ('migrate-local-config.sh', '<module>'): (1, "config/crewvia.local.yaml の元になる退避先 (~/crewvia-local-migrate-<時刻>/) へ local の下書きを書く python ヒアドキュメント。"
+                                                 "queue / registry の外"),
     ('benchmark-ctx.sh', '<bash>'): (11, "ベンチマーク専用 (CREWVIA_BENCH_MODE)。`assignments/<agent>.restarting` は中身のない存在だけの印"
                                           " (§5.1 の「寄せない」)"),
     ('benchmark-ctx.sh', '<module>'): (2, "ベンチマーク専用。Worker の settings を書く (queue の外)"),

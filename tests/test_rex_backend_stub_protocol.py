@@ -59,6 +59,26 @@ def _wait(cond, seconds=6.0):
     return cond()
 
 
+def _wait_idle_login_shell(p, seconds=20.0):
+    """`exec -a -bash bash` が login shell の起動 (profile / bashrc) を終え、stdin を待つまで待つ。
+
+    以前は `time.sleep(0.4)` だった。login shell は起動中に profile / bashrc が子プロセス
+    (`node -v` など) を作るので、CPU が混むと 0.4 秒では終わらず、本体は『子のいる shell』と
+    正しく拒否する (xdist 下の CI で落ちた。負荷だけで再現する)。『子が居らず、2 回続けて
+    同じ』を確かめてから進む。時間では待たない。
+    """
+    deadline = time.time() + seconds
+    stable = 0
+    while time.time() < deadline:
+        idle = (lib_mux._process_argv(p.pid) == ["-bash"]
+                and lib_mux._live_children(p.pid) == [])
+        stable = stable + 1 if idle else 0
+        if stable >= 6:          # 0.05s 間隔で 0.3 秒続けて子が居ない
+            return
+        time.sleep(0.05)
+    raise AssertionError("the login shell never settled into an idle state")
+
+
 @pytest.fixture
 def fake(tmp_path, monkeypatch):
     f = FakeRex(tmp_path, monkeypatch)
@@ -736,7 +756,7 @@ def test_restored_empty_shell_is_taken_with_sighup_only(fake, victim):
     """世代違いの記録 + 子の居ない shell -> SIGHUP だけで終わる (TERM/KILL は打たない)。"""
     # 復元された shell の実測した cmdline `-bash` (引数なし)。子は持たない = 空。
     p = victim(("bash", "-c", "exec -a -bash bash"))
-    time.sleep(0.4)
+    _wait_idle_login_shell(p)
     assert lib_mux._process_argv(p.pid) == ["-bash"]
     _arm(fake, p, generation="inst-OLD:1", child_name="bash")
     seen = []
@@ -745,7 +765,8 @@ def test_restored_empty_shell_is_taken_with_sighup_only(fake, victim):
     try:
         lib_mux._pidfd_signal = lambda fd, sig: seen.append(sig) or real(fd, sig)
         b = lib_mux.RexBackend()
-        assert b.may_destroy("Zed-worker")[0]
+        ok, why = b.may_destroy("Zed-worker")
+        assert ok, why
         assert b.kill("Zed-worker")
     finally:
         lib_mux._pidfd_signal = lib_mux_orig
@@ -1047,7 +1068,7 @@ def husk_proc():
     """子を持たない `-bash` (復元された login shell と同じ cmdline) の実プロセス。"""
     p = subprocess.Popen(["bash", "-c", "exec -a -bash bash"], start_new_session=True,
                          stdin=subprocess.PIPE)
-    time.sleep(0.4)
+    _wait_idle_login_shell(p)
     yield p
     p.kill()
     p.wait()

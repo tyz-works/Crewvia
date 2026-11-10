@@ -51,17 +51,14 @@ NOTIFY_CACHE="${CREWVIA_NOTIFY_CACHE:-/tmp/dispatcher-notify-cache.json}"
 NOTIFY_TTL=300  # seconds before repeating the same notification (5 min)
 
 # Rule 5: state grace period in seconds (env > config > default 60).
-# Read from config/crewvia.yaml mux.state_grace_seconds if env is absent.
+# Read mux.state_grace_seconds from the effective config (lib_config) if env is absent.
 _read_state_grace() {
-  local cfg="${REPO_ROOT}/config/crewvia.yaml"
   if [[ -n "${CREWVIA_STATE_GRACE:-}" ]]; then
     echo "${CREWVIA_STATE_GRACE}"
     return
   fi
-  if [[ -f "$cfg" ]]; then
-    # Look for "  state_grace_seconds: <n>" under "mux:" section.
-    awk '/^mux:/{in_mux=1} in_mux && /state_grace_seconds:/{print $2; exit}' "$cfg"
-  fi
+  # 共通 + マシン固有の local を lib_config が重ねて読む (mux.state_grace_seconds)。壊れ・無しは空 (= 既定 60)。
+  python3 "${SCRIPT_DIR}/lib_config.py" --root "${REPO_ROOT}" get mux.state_grace_seconds 2>/dev/null || true
 }
 STATE_GRACE="$(_read_state_grace)"
 STATE_GRACE="${STATE_GRACE:-60}"  # default 60 seconds
@@ -228,6 +225,9 @@ _IRC_CARRIED = {'_CREWVIA_IRC_RESOLVED_TOKEN': os.environ.pop('_CREWVIA_IRC_RESO
 _IRC_RESOLVE_REASON = os.environ.pop('_CREWVIA_IRC_RESOLVE_REASON', '') or 'no_credentials'
 
 from lib_mux import Mux, repo_identity_ok  # noqa: E402
+import lib_mux as _lib_mux_mod  # noqa: E402
+# テストが lib_mux を差し替えたフェイクにはこの名前が無い: 無ければ何も拾わない (空 tuple)
+_MuxConfigUnreadable = getattr(_lib_mux_mod, 'MuxConfigUnreadable', ())
 import lib_retirement  # noqa: E402
 # 「依存が満たされた」の定義は crewvia の中で 1 箇所しかない (t010 / QA t002 の
 # 指摘 F-2b)。ここに同じ規則のコピーを書き戻さないこと — plan.sh pull が割り当て
@@ -274,7 +274,34 @@ from lib_agent_name import shell_pasteable_agent_name_problem as _shell_pasteabl
 # 「ペインの裏で何かが走っているか」の定義 (watchdog の idle 判定と共有、B1 / #27)。
 # ここで /proc を読む分類を書き足さないこと — 2 か所に置くと答えが割れる。
 from lib_pane_process import classify_process_tree  # noqa: E402
-_mux = Mux()
+class _NoMux:
+    """config が読めず backend を選べないサイクル用の空の mux (PR-2 レビュー P2-1)。
+
+    `Mux()` が `MuxConfigUnreadable` を投げても、このサイクルは traceback で終わらず
+    `effective_config_readable()` の「見送り + 一度だけ通知」に届かせる。何も観測せず何も
+    しない: list は空・send / kill は失敗。割り当て・退役・kill には使わない (下の
+    サイクル本体は `_MUX_CONFIG_PROBLEM` があれば gate だけ走らせて終わる)。
+    通知は CREWVIA_MUX が env にあるときだけ Director に届く (無ければ Director 不在として見送る)。"""
+
+    def list(self, *a, **k):
+        return []
+
+    def send(self, *a, **k):
+        return False
+
+    def __getattr__(self, name):
+        raise RuntimeError('mux_unavailable: config unreadable')
+
+
+def _build_mux():
+    """(mux, config の問題コード)。`Mux()` が config 壊れで投げたら空の mux + 固定コード。"""
+    try:
+        return Mux(), None
+    except _MuxConfigUnreadable as _e:
+        return _NoMux(), _e.code
+
+
+_mux, _MUX_CONFIG_PROBLEM = _build_mux()
 
 # t002: who may end a Worker process.  'watchdog' (default) = this daemon only
 # writes retirement markers and watchdog executes them; 'dispatcher' = the
@@ -1260,7 +1287,14 @@ def notify_state_once(key, fp, kind, slug, task_id, build_msg, *, director_live=
     if not should_notify(throttle_key):
         return False
     if not director_live():
-        log(f'WARNING: {kind} — Director 不在のため通知スキップ: {slug}/{task_id}')
+        if _MUX_CONFIG_PROBLEM is not None:
+            # mux を選べない場面 (CREWVIA_MUX が env に無く config が読めない = _NoMux)。
+            # Director が居ないのではなく、居るかどうかを問い合わせる先が無い。通知は届かない
+            # (制限。knowledge/machine-local-config.md §3)。ログのこの行が唯一の手がかり。
+            log(f'WARNING: {kind} — mux を選べないため通知できない '
+                f'(CREWVIA_MUX が env に無く config が読めない: {_MUX_CONFIG_PROBLEM}): {slug}/{task_id}')
+        else:
+            log(f'WARNING: {kind} — Director 不在のため通知スキップ: {slug}/{task_id}')
         return False
     if tmux_send(_director_name(), build_msg()):
         record_notify(throttle_key)
@@ -2575,9 +2609,42 @@ def shutdown_idle_workers():
                     record_notify(notify_key)
 
 
+CONFIG_UNREADABLE_KEY = 'config_unreadable'
+
+
+def effective_config_readable():
+    """共通 config + マシン固有の local (lib_config) が読めるか。読めなければ False (このサイクルは見送る)。
+
+    壊れた local を共通の値に黙って戻して割り当て・退役を判定しない (knowledge/machine-local-config.md §3)。
+    Director への通知は状態が変わるまで 1 回だけ (`notify_state_once`)。読めるようになったら台帳を畳む
+    (`_daemon` slug は prune_told の対象外なので、畳まないと同じ障害の 2 回目が永久に黙る)。Worker は殺さない・起こさない。
+    通知は固定コード + 位置だけ (値・元の行は載せない)。
+    """
+    try:
+        import lib_config
+        problem = lib_config.config_problem(REPO_ROOT / 'config' / 'crewvia.yaml')
+    except Exception as e:  # noqa: BLE001 — 検査自体の失敗でサイクルを止めない (他の読み口が個別に止める)
+        log(f'[config] effective-config check failed: {e!r}')
+        return True
+    if problem is None:
+        told = load_told()
+        if not is_unreadable(told) and CONFIG_UNREADABLE_KEY in told:
+            clear_told_key(CONFIG_UNREADABLE_KEY)
+        return True
+    log(f'WARNING: config を読めない ({problem}) — このサイクルは割り当ても退役も通知判定も行わない')
+    notify_state_once(
+        CONFIG_UNREADABLE_KEY, fingerprint(problem), 'config-unreadable', '_daemon', 'config',
+        lambda: (f'[config] config/crewvia.local.yaml (または共通の config/crewvia.yaml) を読めません: {problem}。'
+                 '割り当て・退役・通知判定を見送っています (Worker は殺しません)。ファイルを直すと自動で再開します。'),
+        director_live=director_live_for_state_notices)
+    return False
+
+
 def dispatch():
     _director_live_memo.clear()
     _target_record_memo.clear()
+    if not effective_config_readable():
+        return
     state = load_state()
     if is_unreadable(state):
         # Codex 9 巡目 P1。`{}` に潰すと下の `if not active_missions` に落ちて
@@ -3420,7 +3487,7 @@ def run_escalation_cycle(all_tasks, done_ids_by_mission, task_statuses_by_missio
         import lib_escalation
         import lib_telegram
         now = time.time()
-        cfg = lib_escalation.load_cfg(REPO_ROOT / 'config' / 'crewvia.yaml', warn=_escalation_warn)
+        cfg = lib_escalation.load_cfg(REPO_ROOT / 'config' / 'crewvia.yaml', warn=_escalation_warn)  # lib_config 経由 (local を重ねる)
         creds = _TG_RUNTIME['creds']
         registry_dir = REGISTRY_DIR / 'daemons'
         tg_config = lib_telegram.load_telegram_config()
@@ -3711,6 +3778,12 @@ def run_irc_cycle():
 # system is least healthy and most in need of it.
 run_daemon_watch()
 check_main_checkout_drift()
+if _MUX_CONFIG_PROBLEM is not None:
+    # backend を選べない (config 壊れ・env に CREWVIA_MUX 無し)。割り当ても退役も kill もせず、
+    # 「見送り + 一度だけ通知」(effective_config_readable) だけ行って終わる。直れば次のサイクルで再開。
+    log(f'WARNING: mux backend を選べない (config unreadable: {_MUX_CONFIG_PROBLEM}) — このサイクルは見送る')
+    effective_config_readable()
+    sys.exit(0)
 # Telegram は dispatch() の成否から独立させる (心拍 = `ask` が見る受信側の生存表明。dispatch が毎回落ちても止めない)
 run_telegram_cycle()
 # IRC 呼びかけ中継 (t007)。未設定 (irc.enabled が true でない) なら何も読まない

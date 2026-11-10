@@ -38,6 +38,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import lib_config  # noqa: E402
 from lib_task_cards import is_missing, is_unreadable, read_regular_text_or_unreadable  # noqa: E402
 from lib_daemon_state import (  # noqa: E402
     IRC_PENDING_MAX, irc_quarantine_problem, irc_receiver_problem, irc_state_problem,
@@ -252,17 +253,12 @@ def load_irc_config(config_path=None):
     `allowed_targets` は**書いてあるのに不正**なら空 (何にも届けない側。既定に倒さない)。
     """
     cfg = default_config()
-    if yaml is None:
-        return cfg
     path = default_config_path() if config_path is None else config_path
-    raw = read_regular_text_or_unreadable(path)
-    if is_unreadable(raw):
+    loaded = lib_config.load_for_path(path)
+    if is_unreadable(loaded):
+        # 壊れた local / 共通 → 未設定 (何も送らない側)。dispatcher が lib_config.config_problem で一度だけ通知する
         return cfg
-    try:
-        loaded = yaml.safe_load(raw) or {}
-    except Exception:  # noqa: BLE001 — config の壊れは「無効」に倒す (何も送らない側)
-        return cfg
-    block = loaded.get('irc') if isinstance(loaded, dict) else None
+    block = loaded.get('irc')
     if not isinstance(block, dict):
         return cfg
     cfg['enabled'] = block.get('enabled') is True

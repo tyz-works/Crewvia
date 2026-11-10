@@ -40,6 +40,7 @@
 
 REPO_ROOT="$(cd "$(dirname "$BATS_TEST_FILENAME")/.." && pwd)"
 CREWVIA_LAUNCHER="${REPO_ROOT}/crewvia"
+source "${REPO_ROOT}/tests/fixture_tree.sh"
 
 # env -u で確実に落とす変数一覧 (herdr server pane からの継承汚染を模した実行環境を再現)
 ISOLATE_ENV=(
@@ -65,6 +66,9 @@ setup_fake_env() {
   # crewvia 本体: cp で複製、無改変 (テスト対象そのもの)
   cp "$CREWVIA_LAUNCHER" "${FAKE_DIR}/crewvia"
   chmod +x "${FAKE_DIR}/crewvia"
+
+  # config の読み口 (lib_config.py と、その依存の lib_task_cards.py) は本物を置く (crewvia は python3 lib_config.py を呼ぶ)
+  copy_scripts_libs "${REPO_ROOT}" "${FAKE_DIR}"   # 後で lib_mux.py だけスタブに差し替える
 
   # scripts/start.sh をスタブに置換: 受け取った env と引数をログに書くだけ。
   # 実際の Worker/Director 起動は一切行わない。

@@ -24,6 +24,7 @@ _SCRIPTS_DIR = Path(__file__).resolve().parent
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
+import lib_config  # noqa: E402
 from lib_task_cards import (  # noqa: E402
     is_unreadable, read_regular_text_or_unreadable,
 )
@@ -129,22 +130,15 @@ def resolve(config_path: str, skills_str: str) -> str:
 
     try:
         if yaml is not None:
-            # 通常 (PyYAML) 経路も固定パスのガードを通す (t019)。
-            # t018 でガードを足したのは fallback 側だけで、**PyYAML が入って
-            # いる本番の経路は素の `p.open()` のまま**だった。置き違えた
-            # FIFO 1 枚で、Worker 起動も plan review もモデル解決の途中から
-            # 先へ進まなくなる。属性形式の open だったため、
-            # tests/test_queue_reads_go_through_the_guard.py の機械検出から
-            # も見えていなかった (Codex 10 巡目 P2-1)。
-            text = read_regular_text_or_unreadable(str(p))
-            if is_unreadable(text):
+            # 通常 (PyYAML) 経路: 共通 + マシン固有の local を重ねて読む (lib_config。固定パスのガードは
+            # lib_task_cards 経由)。壊れ (local を含む) は空 (= --model を付けない) に倒し、固定コードを出す。
+            config = lib_config.load_for_path(str(p))
+            if is_unreadable(config):
                 print(
-                    f"[lib_model] WARNING: could not read config "
-                    f"{text.path}: {text.reason}",
+                    f"[lib_model] WARNING: could not read config: {config.reason}",
                     file=sys.stderr,
                 )
                 return ""
-            config = yaml.safe_load(text) or {}
         else:
             # PyYAML 未導入時は簡易 fallback パーサーを使う
             print(

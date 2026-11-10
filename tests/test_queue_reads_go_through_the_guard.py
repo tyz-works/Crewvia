@@ -190,18 +190,18 @@ GUARDED_READS = [
      {"read_regular_text_or_unreadable"}),
 
     # --- lib_daemon_watch.py (t018) --------------------------------------
-    ("lib_daemon_watch.py", "load_config", {"read_regular_text_or_unreadable"}),
+    ("lib_daemon_watch.py", "load_config", {"load_for_path"}),  # PR-2: 読みは lib_config が持つ(入口は lib_task_cards)
     ("lib_daemon_watch.py", "read_pause_state", {"load_json_store"}),
 
     # --- lib_mux.py / lib_model.py (t018) --------------------------------
     ("lib_mux.py", "read_pane_record", {"load_json_store"}),
-    ("lib_mux.py", "_config_mode", {"read_regular_text_or_unreadable"}),
-    ("lib_mux.py", "_config_rex_endpoint", {"read_regular_text_or_unreadable"}),
+    ("lib_mux.py", "_config_mode", {"load_for_path"}),
+    ("lib_mux.py", "_config_rex_endpoint", {"load_for_path"}),
     ("lib_model.py", "_parse_yaml_fallback",
      {"read_regular_text_or_unreadable"}),
     # t019: PyYAML がある **通常の** 経路。t018 は fallback 側にだけガードを
     # 足しており、本番で実際に走るほうが素の `p.open()` のまま残っていた。
-    ("lib_model.py", "resolve", {"read_regular_text_or_unreadable"}),
+    ("lib_model.py", "resolve", {"load_for_path"}),
 ]
 
 

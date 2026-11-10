@@ -127,6 +127,7 @@ from lib_mux import (  # noqa: E402
     pane_script_owner,
     repo_identity_ok,
 )
+import lib_config  # noqa: E402
 from lib_retirement import (  # noqa: E402
     process_alive,
     read_json,
@@ -244,6 +245,8 @@ DAEMON_RESTART_FILES = {
         "scripts/lib_mux.py",
         "scripts/lib_daemon_watch.py",
         "scripts/lib_retirement.py",
+        # machine-local-config PR-2: lib_mux / lib_daemon_watch が config の読み口として import する
+        "scripts/lib_config.py",
     ),
     DAEMON_WATCHDOG: (
         "scripts/watchdog.py",
@@ -263,6 +266,8 @@ DAEMON_RESTART_FILES = {
         "scripts/lib_ci_status.py",
         # #314 r1: lib_ci_status が記録の名前の検査 (check_mission_slug / check_task_id) に import する
         "scripts/lib_git_policy.py",
+        # machine-local-config PR-2: lib_mux / lib_daemon_watch が config の読み口として import する
+        "scripts/lib_config.py",
     ),
 }
 
@@ -942,6 +947,8 @@ class WatchConfig:
     #: free: it looks again next cycle.
     watch_lock_timeout_seconds: int = 2
     maintenance_lock_timeout_seconds: int = 60
+    #: config (共通 / local) が読めなかったときの固定コード。None = 読めた。立っている間は respawn を保留する。
+    config_problem: Optional[str] = None
 
     def stale_seconds_for(self, name: str) -> int:
         return (self.dispatcher_stale_seconds if name == DAEMON_DISPATCHER
@@ -968,22 +975,17 @@ def load_config(config_path=None, env=None) -> WatchConfig:
     missing.
     """
     env = os.environ if env is None else env
-    if config_path is None:
-        config_path = _SCRIPTS_DIR.parent / "config" / "crewvia.yaml"
     cfg = WatchConfig()
 
     block = {}
-    if yaml is not None:
-        try:
-            # config も固定パスのガードを通す (t018)。置き違えた FIFO 1 枚で
-            # 相互監視が無期限に座り込むのを避ける。読めなければ既定値のまま。
-            raw_cfg = read_regular_text_or_unreadable(config_path)
-            if not is_unreadable(raw_cfg):
-                loaded = yaml.safe_load(raw_cfg) or {}
-                if isinstance(loaded, dict) and isinstance(loaded.get("daemons"), dict):
-                    block = loaded["daemons"]
-        except Exception:
-            block = {}
+    # 共通 + マシン固有の local を重ねて読む (lib_config。固定パスのガードは lib_task_cards 経由)。
+    # 壊れ (local を含む) は既定値のまま `config_problem` に固定コードを残す: 相互監視は respawn を保留する
+    # (確証が無いときは動かない)。
+    loaded = lib_config.load_for_path(config_path)
+    if is_unreadable(loaded):
+        cfg.config_problem = loaded.reason
+    elif isinstance(loaded.get("daemons"), dict):
+        block = loaded["daemons"]
 
     if "mutual_watch" in block:
         cfg.enabled = bool(block["mutual_watch"])
@@ -1504,6 +1506,10 @@ class DaemonWatch:
 
         if not self.config.enabled:
             return Verdict(ACTION_DISABLED, "daemons.mutual_watch is off")
+
+        # config (共通 / local) が読めない = 判定材料が壊れている。respawn しない (保留。確証が無いときは動かない)。
+        if self.config.config_problem:
+            return Verdict(ACTION_HOLD, f"config unreadable ({self.config.config_problem}); not respawning")
 
         # t003, extended from "may not kill" to "may not start".  A daemon
         # whose own checkout is gone can still be holding a production mux

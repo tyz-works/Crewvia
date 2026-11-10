@@ -63,6 +63,8 @@ NOTIFY_TTL     = int(sys.argv[4])
 _SCRIPTS_DIR = REGISTRY_DIR.parent / 'scripts'
 sys.path.insert(0, str(_SCRIPTS_DIR))
 from lib_mux import Mux  # noqa: E402
+import lib_mux as _lib_mux_mod  # noqa: E402
+_MuxConfigUnreadable = getattr(_lib_mux_mod, 'MuxConfigUnreadable', ())   # フェイクの lib_mux には無い
 # デーモン側 JSON 状態ストアを読む入口は 1 つ (t026)。ここで `json.loads` を書き足さない。
 from lib_daemon_state import load_json_store, notify_cache_problem  # noqa: E402
 from lib_task_status import accepts as status_accepts  # noqa: E402  (語彙・許可遷移は 1 か所。vNext 01a S1)
@@ -72,7 +74,12 @@ from lib_task_status import accepts as status_accepts  # noqa: E402  (語彙・�
 from lib_task_cards import (  # noqa: E402
     is_missing, is_unreadable, list_task_cards, read_regular_text_or_unreadable,
 )
-_mux = Mux()
+try:
+    _mux = Mux()
+except _MuxConfigUnreadable as _e:
+    # config (local を含む) が読めない: traceback で終わらず、このサイクルは何もせず見送る (PR-2 P2-1)。
+    print(f"[verifier-dispatcher] config unreadable ({_e.code}) — このサイクルは見送る", file=sys.stderr)
+    sys.exit(0)
 
 MISSIONS_DIR    = QUEUE_DIR / 'missions'
 STATE_FILE      = QUEUE_DIR / 'state.yaml'

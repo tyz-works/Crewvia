@@ -38,6 +38,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import lib_config  # noqa: E402
 from lib_task_cards import (  # noqa: E402
     CORRUPT_TASK_STATUS, is_missing, is_unreadable, read_regular_text_or_unreadable, read_task_card,
 )
@@ -148,17 +149,12 @@ def load_telegram_config(config_path=None):
         'session_link': '',
         'credentials': {'source': '', 'token_ref': '', 'chat_id_ref': '', 'file': '', 'op_command': 'op'},
     }
-    if yaml is None:
-        return cfg
     path = default_config_path() if config_path is None else config_path
-    raw = read_regular_text_or_unreadable(path)
-    if is_unreadable(raw):
+    loaded = lib_config.load_for_path(path)
+    if is_unreadable(loaded):
+        # 壊れた local / 共通 → 未設定 (何も送らない側)。dispatcher が lib_config.config_problem で一度だけ通知する
         return cfg
-    try:
-        loaded = yaml.safe_load(raw) or {}
-    except Exception:  # noqa: BLE001 — config の壊れは「未設定」に倒す (何も送らない側)
-        return cfg
-    block = loaded.get('telegram') if isinstance(loaded, dict) else None
+    block = loaded.get('telegram')
     if not isinstance(block, dict):
         return cfg
     cfg['poll_interval_seconds'] = _positive_number(block.get('poll_interval_seconds'), cfg['poll_interval_seconds'])

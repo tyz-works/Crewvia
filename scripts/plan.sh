@@ -482,6 +482,9 @@ _CONTROLLER = _import_scripts_module('lib_task_controller')
 # 試行の台帳 (queue/missions/<m>/history/tNNN/) の形と読み口は lib_history.py の 1 か所 (vNext 02 PR-D)。
 # 書くのは Controller の `_finish` だけ。plan.sh は `history` と `pull` の `previous_attempt` で読むだけ。
 _HISTORY = _import_scripts_module('lib_history')
+# 共通 config/crewvia.yaml + マシン固有の config/crewvia.local.yaml を重ねて読むのは lib_config.py の 1 か所
+# (knowledge/machine-local-config.md)。config を読む subcommand は壊れた local を拒否する (UsageExit・何も書かない)。
+_CONFIG = _import_scripts_module('lib_config')
 #: task-graph の生成物 (registry/task-graph/tasks.json。queue の外) を書く関数。plan.sh 自身は
 #: 書き込みの実装を持たない (同じ関数を別名で呼ぶだけ)。tests/task_graph_publisher_harness.py が
 #: この名前を差し替える。
@@ -3041,6 +3044,17 @@ def _reactivate_done_mission(slug, mission=None, via='', out=None):
     return True
 
 
+def _default_cap_or_refuse(command):
+    """`attempts.max_total` (既定の総試行数の上限)。壊れた config は既定値に倒さず拒否 (何も書かない)。"""
+    try:
+        return _HISTORY.load_default_max_attempts(
+            os.path.join(REPO_ROOT, 'config', 'crewvia.yaml'),
+            warn=lambda msg: print(f"[plan.sh {command}] warn: {msg}", file=sys.stderr))
+    except _HISTORY.ConfigUnreadable as e:
+        raise UsageExit(f"config が読めません ({e.code})。config/crewvia.local.yaml を直すか一時的に退避してください。"
+                        "何も書いていません")
+
+
 def _default_timeout_max_for_skills(skills):
     """`config/crewvia.yaml` の `timeout_max_per_skill:` から、この card の skills に合う
     timeout.max の既定値を解決する (t002 / 20261102-review-ci-timeout)。
@@ -3060,15 +3074,11 @@ def _default_timeout_max_for_skills(skills):
     インデント無ししか拾わない)。`timeout_max_per_skill: {review: 7200}` のような flat scalar
     map だけがここで安全に読める (`attempts.max_total` と同じ深さ・同じパターン)。
     """
-    config_path = os.path.join(REPO_ROOT, 'config', 'crewvia.yaml')
-    raw = _TASK_CARDS.read_regular_text_or_unreadable(config_path)
-    if _TASK_CARDS.is_unreadable(raw):
-        return None
-    try:
-        data = _TASK_CARDS.parse_yaml(raw, source='crewvia.yaml')
-    except ValueError:
-        return None
-    mapping = data.get('timeout_max_per_skill') if isinstance(data, dict) else None
+    data = _CONFIG.load_effective(REPO_ROOT)
+    if _TASK_CARDS.is_unreadable(data):
+        raise UsageExit(f"config が読めません ({data.reason})。config/crewvia.local.yaml を直すか一時的に退避してください。"
+                        "何も書いていません")
+    mapping = data.get('timeout_max_per_skill')
     if not isinstance(mapping, dict):
         return None
     candidates = [v for s, v in mapping.items() if s in skills
@@ -7251,9 +7261,7 @@ def cmd_retry(args):
             die(f"mission '{slug}' not found.")
         recover_before(cards=[(slug, task_id)])
         _refuse_write_while_intent_pending(slug, 'retry', task_id)
-        default_cap = _HISTORY.load_default_max_attempts(
-            os.path.join(REPO_ROOT, 'config', 'crewvia.yaml'),
-            warn=lambda msg: print(f"[plan.sh retry] warn: {msg}", file=sys.stderr))
+        default_cap = _default_cap_or_refuse('retry')
         try:
             previous = _CONTROLLER.reopen_task(_txn(), slug, task_id, kind='retry', reason=reason, over_cap=over_cap,
                                                default_max_attempts=default_cap)
@@ -7355,9 +7363,7 @@ def cmd_reopen(args):
         except _EXEC.ControllerError as e:
             _controller_die('reopen', e)
         if res is None:
-            default_cap = _HISTORY.load_default_max_attempts(
-                os.path.join(REPO_ROOT, 'config', 'crewvia.yaml'),
-                warn=lambda msg: print(f"[plan.sh reopen] warn: {msg}", file=sys.stderr))
+            default_cap = _default_cap_or_refuse('reopen')
             mission_cards = list_tasks(slug, quiet=True)
             graph = {m['id']: m.get('blocked_by') for m, _b in mission_cards if m.get('id')}
             # 読めない・壊れた card (`[破損]` の pseudo-task。走査の失敗も 1 件) は `blocked_by=[]` の孤立 node に置き換わるので、そこを通る

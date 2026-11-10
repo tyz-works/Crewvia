@@ -170,7 +170,7 @@ def _check_allowlist(local):
             raise ConfigError(code, _safe_key(key))
 
 
-def load_effective(repo_root=None, *, common_path=None, local_path=None, environ=None):
+def load_effective(repo_root=None, *, common_path=None, local_path=None, environ=None, use_local=True):
     """共通 + local を重ねた dict。読めなければ `Unreadable` (例外は投げない)。
 
     repo_root: 共通の置き場所 (既定 = このスクリプトの親)。local はその主 checkout から探す。
@@ -185,6 +185,8 @@ def load_effective(repo_root=None, *, common_path=None, local_path=None, environ
         common = _parse(cpath, 'common')
         if common is None:
             common = {}
+        if not use_local:
+            return common
         if local_path is not None:
             lpath = Path(local_path)
         elif environ.get(ENV_TEST_ISOLATION):
@@ -200,6 +202,27 @@ def load_effective(repo_root=None, *, common_path=None, local_path=None, environ
         where = f' ({e.where})' if e.where else ''
         path = cpath if (e.code.startswith('common') or lpath is None) else lpath
         return _cards.Unreadable(path, e.code + where)
+
+
+def load_for_path(config_path=None, *, local=True):
+    """読み口向けの入口。`config_path` 無し = 既定 (このリポジトリの共通 + local)。
+
+    `<root>/config/crewvia.yaml` の形のパスならその `<root>` を共通の置き場所にして local を重ねる
+    (dispatcher が REPO_ROOT を渡す場合など)。それ以外の名前 (テストの一時ファイル) はそのファイルだけ
+    (local は重ねない)。`local=False` でも共通だけ。
+    """
+    if config_path is None:
+        return load_effective(use_local=local)
+    p = Path(config_path)
+    if local and p.name == COMMON_RELPATH.name and p.parent.name == COMMON_RELPATH.parent.name:
+        return load_effective(p.parent.parent)
+    return load_effective(common_path=p, use_local=False)
+
+
+def config_problem(config_path=None):
+    """local / 共通が壊れているときの固定コード (位置つき)。読めれば None。デーモンの一度だけ通知用。"""
+    cfg = load_for_path(config_path)
+    return cfg.reason if _cards.is_unreadable(cfg) else None
 
 
 def _unreadable_code(u):

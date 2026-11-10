@@ -341,12 +341,16 @@ def _run_mode_block(tmp_path, *, env_mux, config_mode, have=("rex", "herdr", "hc
         f = bindir / b
         f.write_text("#!/bin/sh\nexit 0\n")
         f.chmod(0o755)
-    cfg = tmp_path / "crewvia.yaml"
+    (tmp_path / "config").mkdir()
+    cfg = tmp_path / "config" / "crewvia.yaml"
     cfg.write_text((f"mode: {config_mode}\n" if config_mode else "") + "other: 1\n")
+    lib_config_py = Path(__file__).resolve().parent.parent / "scripts" / "lib_config.py"
     script = tmp_path / "block.sh"
     script.write_text(
         "set -euo pipefail\n"
         f"SCRIPT_DIR={scripts}\nCONFIG_FILE={cfg}\nROLE=director\n"
+        # start.sh の _crewvia_config_get と同じ形 (config の読み口は lib_config)
+        f"_crewvia_config_get() {{ {sys.executable} {lib_config_py} --root {tmp_path} get \"$@\" 2>/dev/null || true; }}\n"
         + _mode_block() +
         'echo "RESULT MUX=${CREWVIA_MUX:-} ENABLED=${CREWVIA_MUX_ENABLED:-}"\n')
     env = {"PATH": f"{bindir}{os.pathsep}/usr/bin:/bin", "HOME": str(tmp_path)}

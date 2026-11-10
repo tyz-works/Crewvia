@@ -23,6 +23,7 @@ from lib_daemon_state import (  # noqa: E402
     is_finite_number, load_json_store, told_lock, write_told_atomic,
 )
 from lib_dep_rules import card_dependencies  # noqa: E402
+import lib_config  # noqa: E402
 from lib_task_cards import is_missing, is_unreadable, read_regular_text_or_unreadable  # noqa: E402
 from lib_task_status import AWAITING_DECISION_STATUSES  # noqa: E402
 
@@ -230,15 +231,10 @@ def load_cfg(config_path, environ=None, warn=lambda msg: None):
     """`config/crewvia.yaml` の `escalation:` + env (env 優先)。読めない・欠けは既定値。"""
     environ = os.environ if environ is None else environ
     block = {}
-    if yaml is not None:
-        raw = read_regular_text_or_unreadable(config_path)
-        if not is_unreadable(raw):
-            try:
-                loaded = yaml.safe_load(raw) or {}
-                got = loaded.get('escalation') if isinstance(loaded, dict) else None
-                block = got if isinstance(got, dict) else {}
-            except Exception:  # noqa: BLE001 — config の壊れは既定値
-                block = {}
+    loaded = lib_config.load_for_path(config_path)
+    if not is_unreadable(loaded):                       # 壊れ → 既定値 (dispatcher が config_problem で一度だけ通知)
+        got = loaded.get('escalation')
+        block = got if isinstance(got, dict) else {}
     d_raw = environ.get(ENV_DIRECTOR_AFTER, block.get('director_after_seconds'))
     t_raw = environ.get(ENV_TELEGRAM_AFTER, block.get('telegram_after_seconds'))
     return parse_cfg(d_raw if d_raw != '' else None, t_raw if t_raw != '' else None, warn)

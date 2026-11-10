@@ -90,6 +90,9 @@ MIN_CODE_BLOCKS = 100
 MIN_HITS = 12
 
 
+pytestmark = pytest.mark.structural  # 構造ガード (pytest -m structural。tests/conftest.py に登録)
+
+
 def _excluded(rel: str) -> bool:
     return rel in EXCLUDED or any(rel.startswith(prefix) for prefix, _why in EXCLUDED_PREFIXES)
 

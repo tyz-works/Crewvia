@@ -27,6 +27,8 @@ dispatcher で restart が要るのは、この bash プロセス自身が**起�
 
 from __future__ import annotations
 
+import pytest
+
 import ast
 import re
 import sys
@@ -42,6 +44,9 @@ import lib_daemon_watch as w  # noqa: E402
 # ---------------------------------------------------------------------------
 # python 側: 直接 + 推移的な `lib_*` import を AST で拾う
 # ---------------------------------------------------------------------------
+
+pytestmark = pytest.mark.structural  # 構造ガード (pytest -m structural。tests/conftest.py に登録)
+
 
 def _lib_imports(py_path: Path) -> set[str]:
     """`py_path` が直接 `import` する `lib_*` モジュール名 (拡張子なし) の集合。

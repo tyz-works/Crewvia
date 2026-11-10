@@ -69,6 +69,9 @@ SCRIPTS_DIR = REPO_ROOT / "scripts"
 # bash に埋め込まれた python を取り出す
 # ---------------------------------------------------------------------------
 
+pytestmark = pytest.mark.structural  # 構造ガード (pytest -m structural。tests/conftest.py に登録)
+
+
 def _python_source(script: str) -> str:
     """`.py` はそのまま、`.sh` は `<<'PYEOF'` ブロックを返す。"""
     path = SCRIPTS_DIR / script

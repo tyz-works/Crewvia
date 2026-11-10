@@ -1989,6 +1989,16 @@ class RetirementExecutor:
         if verdict == GUARD_UNPROVABLE:
             return self._unprovable(agent, req, prog, why, target)
         if verdict == GUARD_DISCARD:
+            # Race: `_orphaned_group` saw the shell alive, then the shell died before the guard
+            # looked.  The guard reads the now-missing pane_pid as "a successor owns this window"
+            # and would discard, leaving the group (the stuck claude) behind.  Look at the group
+            # once more: a dead recorded shell with a live recorded group is the orphan case.
+            orphan_pgid = self._orphaned_group(prog)
+            if orphan_pgid == -1:
+                self.log(f"[retire] {agent}: process group could not be observed — holding (nothing killed)")
+                return "skipped"
+            if orphan_pgid is not None:
+                return self._sigkill_orphaned_group(agent, prog, orphan_pgid)
             self.log(f"[retire] {agent}: NOT sending SIGKILL — {why}")
             self._write_progress(agent, prog, PHASE_DISCARDED, discard_reason=why)
             return "discarded"

@@ -206,6 +206,16 @@ allowlist は `lib_config.py` に定数で持ち、テストが共通 yaml の t
 3. 実装 PR を merge → `sync-main-checkout.sh`。restart は §8 の判定で走る。
 4. `./crewvia status` 相当で effective mode と source を確認する。
 
+**移行スクリプト `scripts/migrate-local-config.sh`** (手順 1・2 を自動でやる。`git pull` で届く): 主 checkout で
+`scripts/migrate-local-config.sh` を実行する (main が PR-2 以降であること。crewvia は止めなくてよい)。
+`config/crewvia.yaml` の HEAD との差を `config/crewvia.local.yaml` (0600) に移し、**`mode` は差に出なくても必ず明示**し
+(共通が HEAD の `mode:` を持つ機は差に出ないため)、`lib_config.load_effective` で移行前後の実効 config が一致することを
+確かめてから共通を HEAD に戻す。不一致なら元に戻して止める (exit 3 = 何も変えていない / exit 4 = 適用後に不一致で戻した)。
+既に local がある・キーを消した手元変更がある・許可外キー (`attempts` 等) の手元変更がある場合は何も変えずに止まる
+(exit 1 / 2)。退避は `~/crewvia-local-migrate-<時刻>/` (700。手元版・差分・移行前後の dump。値はここにだけ残り、標準出力には
+キー名と `SAME` しか出ない)。戻し方: `cp <退避先>/crewvia.yaml.local-edited config/crewvia.yaml && rm config/crewvia.local.yaml`。
+テスト: `scripts/test_migrate_local_config.sh` (使い捨ての git repo と HOME)。
+
 (b) を選ぶ場合、共通の `mode:` を tmux にする変更は**実装 PR とは別の最後の PR**にする
 (local が各機に揃ったことを確かめてから。揃う前に merge すると proserpina が tmux で起動する)。
 

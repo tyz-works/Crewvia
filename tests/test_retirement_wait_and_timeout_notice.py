@@ -330,7 +330,7 @@ def test_timeout_termination_tells_the_director_once_with_what_it_needs(sandbox)
     ex, _mux = _timeout_executor(sandbox, director)
     _run_timeout_retirement(sandbox, ex, MAX_DETAIL)
 
-    assert len(director.inbox) == 1, director.inbox
+    assert len(director.inbox) == 1, (director.inbox, "\n".join(sandbox.logs))
     msg = director.inbox[0]
     assert TASK_ID in msg and SLUG in msg, "task id / mission が無い"
     assert "max=3600s" in msg and "3604s" in msg, f"どの上限か・経過時間が無い: {msg}"

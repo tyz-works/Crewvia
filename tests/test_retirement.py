@@ -383,6 +383,20 @@ def make_idle(sandbox):
     sandbox.assignment_file.unlink(missing_ok=True)
 
 
+def _why(sandbox):
+    """失敗時の診断: executor のログ・retirement の記録・窓の外から見た task の状態 (並列 CI で落ちた回の手がかり)。"""
+    parts = ["--- executor log ---", *sandbox.logs, "--- registry/retirements ---"]
+    d = sandbox.registry / "retirements"
+    if d.is_dir():
+        for f in sorted(d.iterdir()):
+            try:
+                parts.append(f"{f.name}: {f.read_text()[:600]}")
+            except OSError as e:
+                parts.append(f"{f.name}: <{type(e).__name__}>")
+    parts.append(f"task_status={sandbox.task_status()}")
+    return "\n".join(parts)
+
+
 def make_executor(sandbox, mux, **kwargs):
     """本番の組み立て (`watchdog.make_retirement_executor`) と同じ形の executor。
 
@@ -521,7 +535,7 @@ def test_red_terminated_worker_leaves_no_ghost_task(sandbox):
 
     assert not _pid_alive(pane_pid), "Worker プロセスが終了していない"
     assert sandbox.task_status() == "pending", (
-        f"task が {sandbox.task_status()} のまま — 幽霊 task が残っている"
+        f"task が {sandbox.task_status()} のまま — 幽霊 task が残っている\n" + _why(sandbox)
     )
     assert sandbox.task_worker() == "null"
     assert not sandbox.assignment_file.exists(), (
@@ -556,7 +570,7 @@ def test_red_interrupted_termination_is_resumable(sandbox):
         "再起動後も Worker が生き残っている — 中断した終了処理を誰も引き取れていない"
     )
     assert sandbox.task_status() == "pending", (
-        f"task が {sandbox.task_status()} のまま宙に浮いている"
+        f"task が {sandbox.task_status()} のまま宙に浮いている\n" + _why(sandbox)
     )
     assert not sandbox.assignment_file.exists()
 
@@ -2296,7 +2310,7 @@ def test_red_cleanup_does_not_block_the_cycle_on_the_queue_lock(sandbox):
             if not ex.has_marker(AGENT):
                 settled = True
                 break
-        assert not settled, "ロックを取れていないのに後始末を完了扱いにした"
+        assert not settled, "ロックを取れていないのに後始末を完了扱いにした\n" + _why(sandbox)
         prog = read_json_file(sandbox, AGENT)
         assert prog.get("phase") == "terminated", (
             f"ロック待ちを後始末の失敗として扱っている: {prog.get('phase')}")
@@ -2308,6 +2322,79 @@ def test_red_cleanup_does_not_block_the_cycle_on_the_queue_lock(sandbox):
             break
     assert not ex.has_marker(AGENT), "ロックが空いても後始末が再開されない"
     assert sandbox.task_status() == "pending"
+
+
+class _DiesWhileTheGuardLooks(FakeMux):
+    """`_instance_gone` が「まだ生きている」と答えた**直後**、`_guard` が pid を読み直すまでの間に Worker が死ぬ競合を、
+    決定的に作る。`pid()` が呼ばれた瞬間に Worker を殺して回収し、(本物の mux と同じく) 読めない = None を返す。
+
+    並列 CI (xdist) では SIGTERM を受けた Worker が確認と読み直しの間に死ぬ回が実際に出た (t019)。この時間差は負荷が
+    高いほど長くなる。`armed` になるまでは普通の FakeMux (phase を進める途中の guard では殺さない)。
+    """
+
+    def __init__(self, windows, proc):
+        super().__init__(windows)
+        self.proc = proc
+        self.armed = False
+        self.fired = False
+
+    def pid(self, name):
+        if self.armed and not self.fired:
+            self.fired = True
+            self.proc.kill()
+            self.proc.wait(timeout=10)
+            return None
+        return super().pid(name)
+
+
+def _progress_phase(sandbox):
+    return read_json_file(sandbox, AGENT).get("phase")
+
+
+@pytest.mark.parametrize("phase", ["notified", "sigterm_sent"])
+def test_red_worker_that_dies_while_the_guard_looks_is_cleaned_up_not_discarded(sandbox, phase):
+    """Worker が `_instance_gone` の確認と `_guard` の読み直しの間に死んでも、marker を discard せず後始末まで進む。
+
+    discard すると「記録した pid が読めない」を「同名の別 Worker が窓を持っている」と誤読し、task が in_progress のまま
+    宙に浮く (幽霊 task)。死んだのが**記録した pid そのもの**なら、それは殺し終えた (あるいは自力で終わった) 証拠であって、
+    別物の証拠ではない。時計は差し替え (猶予・kill_delay を実時間で待たない)。
+    """
+    # SIGTERM を無視して生き残る Worker 役。ハンドラを入れ終えてから "ready" を出す (入れる前の SIGTERM で死ぬ競合をテスト自身が作らない)。
+    script = ("import signal,sys,time\n"
+              "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+              "sys.stdout.write('ready\\n'); sys.stdout.flush()\n"
+              "time.sleep(300)\n")
+    proc = subprocess.Popen([sys.executable, "-c", script], stdout=subprocess.PIPE, text=True)
+    sandbox._procs.append(proc)
+    assert proc.stdout.readline().strip() == "ready"
+    sandbox.record_identity(WINDOW, proc.pid)
+    mux = _DiesWhileTheGuardLooks({WINDOW: proc.pid}, proc)
+
+    clock = [time.time()]
+    ex = make_executor(sandbox, mux, now=lambda: clock[0], grace_period=100, kill_delay=100)
+    assert ex.request(AGENT, WINDOW, "timeout", mission=SLUG, task_id=TASK_ID)
+
+    ex.process_all()                                   # requested → notified (猶予 100s)
+    assert _progress_phase(sandbox) == "notified", _why(sandbox)
+    if phase == "sigterm_sent":
+        clock[0] += 101
+        ex.process_all()                               # 猶予切れ → SIGTERM (Worker は無視して生き残る)
+        assert _progress_phase(sandbox) == "sigterm_sent", _why(sandbox)
+    assert _pid_alive(proc.pid), "前提が崩れた: この時点では Worker はまだ生きているはず\n" + _why(sandbox)
+
+    mux.armed = True            # 次の cycle の guard が pid を読む瞬間に Worker が死ぬ
+    clock[0] += 101
+    for _ in range(20):
+        ex.process_all()
+        if not ex.has_marker(AGENT):
+            break
+
+    assert mux.fired, "前提が崩れた: guard が pid を読んでいない\n" + _why(sandbox)
+    assert not ex.has_marker(AGENT), _why(sandbox)
+    assert sandbox.task_status() == "pending", (
+        f"task が {sandbox.task_status()} のまま — Worker が死んだのに discard して後始末を飛ばした\n" + _why(sandbox))
+    assert not sandbox.assignment_file.exists()
+    assert not any("discarding marker" in line for line in sandbox.logs), _why(sandbox)
 
 
 def read_json_file(sandbox, agent):

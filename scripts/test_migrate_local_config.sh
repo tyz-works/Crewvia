@@ -9,6 +9,10 @@
 #   (b) 手元変更なし → mode だけの local
 #   (c) 既に local がある → 何も変えず exit 1
 #   (d) 許可外キー (attempts) の手元変更 → 止めて何も変えない (exit 2)
+#   (e) キーを消した手元変更 → exit 2 で何も変えない
+#   (f) 型違いの手元変更 (telegram: dict → scalar) → exit 3 で何も変えない
+#   (g) 適用後に不一致 (post-checkout hook で共通を書き換える) → exit 4 で手元版に戻る
+#   (h) 主 checkout でない (git worktree) → exit 1 で何も変えない
 #
 # 実行: bash scripts/test_migrate_local_config.sh
 
@@ -135,6 +139,57 @@ run_migrate "$REPO_D"
 [[ ! -e "$REPO_D/config/crewvia.local.yaml" ]] && pass "local を作っていない" || fail "local ができた"
 cmp -s "$WORK/d.common.before" "$REPO_D/config/crewvia.yaml" && pass "共通は手元版のまま" || fail "共通が変わった"
 grep -q 'attempts' "$WORK/out.txt" && pass "止めた理由にキー名が出る" || fail "キー名が出ていない"
+
+echo ""
+echo "--- (e) キーを消した手元変更 → exit 2 ---"
+make_repo e
+REPO_E="$MADE"
+sed -i '/^wip_limit:/d' "$REPO_E/config/crewvia.yaml"
+cp "$REPO_E/config/crewvia.yaml" "$WORK/e.common.before"
+run_migrate "$REPO_E"
+[[ "$RC" -eq 2 ]] && pass "exit 2" || fail "exit $RC (期待 2)"
+[[ ! -e "$REPO_E/config/crewvia.local.yaml" ]] && pass "local を作っていない" || fail "local ができた"
+cmp -s "$WORK/e.common.before" "$REPO_E/config/crewvia.yaml" && pass "共通は手元版のまま" || fail "共通が変わった"
+grep -q 'wip_limit' "$WORK/out.txt" && pass "消したキー名が出る" || fail "キー名が出ていない"
+
+echo ""
+echo "--- (f) 型違いの手元変更 → exit 3 ---"
+make_repo f
+REPO_F="$MADE"
+printf '%s\n' 'mode: hc  # fixture' 'wip_limit: 8' 'attempts:' '  max_total: 6' 'telegram: true' > "$REPO_F/config/crewvia.yaml"
+cp "$REPO_F/config/crewvia.yaml" "$WORK/f.common.before"
+run_migrate "$REPO_F"
+[[ "$RC" -eq 3 ]] && pass "exit 3" || { fail "exit $RC (期待 3)"; cat "$WORK/out.txt"; }
+[[ ! -e "$REPO_F/config/crewvia.local.yaml" ]] && pass "local を作っていない" || fail "local ができた"
+cmp -s "$WORK/f.common.before" "$REPO_F/config/crewvia.yaml" && pass "共通は手元版のまま" || fail "共通が変わった"
+
+echo ""
+echo "--- (g) 適用後に不一致 → exit 4 で手元版に戻る ---"
+make_repo g
+REPO_G="$MADE"
+sed -i 's/^wip_limit: 8$/wip_limit: 3/' "$REPO_G/config/crewvia.yaml"
+cp "$REPO_G/config/crewvia.yaml" "$WORK/g.common.before"
+# checkout の直後に共通を書き換える hook → 適用後の dump が移行前と食い違う
+printf '%s\n' '#!/bin/sh' "printf 'extra_key: 1\\n' >> config/crewvia.yaml" > "$REPO_G/.git/hooks/post-checkout"
+chmod +x "$REPO_G/.git/hooks/post-checkout"
+run_migrate "$REPO_G"
+[[ "$RC" -eq 4 ]] && pass "exit 4" || { fail "exit $RC (期待 4)"; cat "$WORK/out.txt"; }
+[[ ! -e "$REPO_G/config/crewvia.local.yaml" ]] && pass "local を消した" || fail "local が残った"
+cmp -s "$WORK/g.common.before" "$REPO_G/config/crewvia.yaml" && pass "共通は手元版に戻った" || fail "共通が手元版と違う"
+
+echo ""
+echo "--- (h) worktree から実行 → exit 1 ---"
+make_repo h
+REPO_H="$MADE"
+WT_H="$WORK/h.wt"
+(cd "$REPO_H" && git worktree add -q "$WT_H" -b wt-h) || { echo "git worktree add failed" >&2; exit 1; }
+mkdir -p "$WT_H/scripts"
+cp "$REPO_H/scripts/"*.py "$REPO_H/scripts/migrate-local-config.sh" "$WT_H/scripts/" 2>/dev/null
+run_migrate "$WT_H"
+[[ "$RC" -eq 1 ]] && pass "exit 1" || { fail "exit $RC (期待 1)"; cat "$WORK/out.txt"; }
+grep -q '主 checkout' "$WORK/out.txt" && pass "理由に主 checkout が出る" || fail "理由が出ていない"
+[[ ! -e "$WT_H/config/crewvia.local.yaml" ]] && pass "worktree に local を作っていない" || fail "local ができた"
+ls "$WT_H".home/crewvia-local-migrate-* > /dev/null 2>&1 && fail "退避先が作られた" || pass "退避先を作っていない"
 
 echo ""
 echo "== Results: $PASS_COUNT passed, $FAIL_COUNT failed =="

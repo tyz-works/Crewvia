@@ -213,3 +213,31 @@ run_crewvia_worker() {
   [ "$status" -eq 0 ]
   grep -q "^CREWVIA_TMUX=<unset>$" "$FAKE_LOG"
 }
+
+# --- t027: effective mode ログ (出所と実際に使う値) ---
+
+@test "effective mode log: unknown mode prints the CREWVIA_MUX actually used (tmux), not the bogus value" {
+  setup_fake_env "totally-bogus-mode"
+  run_crewvia_worker
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"effective mode=tmux (source: common)"* ]]
+  [[ "$output" != *"effective mode=totally-bogus-mode"* ]]
+}
+
+@test "effective mode log: local file gives source: local" {
+  setup_fake_env "tmux"
+  printf 'mode: herdr\n' > "${FAKE_DIR}/config/crewvia.local.yaml"
+  run_crewvia_worker
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"effective mode=herdr (source: local)"* ]]
+}
+
+@test "malformed local: launcher stops with ERROR before any effective mode line (never silently common)" {
+  setup_fake_env "tmux"
+  printf 'mode: [unclosed\n' > "${FAKE_DIR}/config/crewvia.local.yaml"
+  run_crewvia_worker
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"ERROR: config を読めません"* ]]
+  [[ "$output" == *"local_malformed"* ]]
+  [[ "$output" != *"effective mode="* ]]
+}

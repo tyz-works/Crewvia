@@ -140,6 +140,20 @@ if [[ -z "${CREWVIA_MUX:-}" ]]; then
   esac
 fi
 
+# 効いている mode とその出所を 1 行出す (local を作り忘れた機が黙って共通の既定で起動するのに気づけるように。
+# knowledge/machine-local-config.md §5)。CREWVIA_MUX が env にあればそれが最優先。
+# 不明な mode のときは MODE ではなく実際に使う CREWVIA_MUX を出す。
+_mode_source="$(python3 "${SCRIPT_DIR}/scripts/lib_config.py" --root "${SCRIPT_DIR}" source mode 2>/dev/null)" || _mode_source="unknown"
+[[ -n "$_mode_source" ]] || _mode_source="unknown"
+if [[ -n "${MODE:-}" ]]; then
+  echo "[crewvia] effective mode=${CREWVIA_MUX:-inline} (source: ${_mode_source})" >&2
+else
+  echo "[crewvia] effective mode=${CREWVIA_MUX:-inline} (source: env CREWVIA_MUX)" >&2
+fi
+if [[ "$_mode_source" == "unknown" ]]; then
+  echo "[crewvia] WARNING: config を読めません (local が壊れている可能性)。mode の出所が不明です。python3 scripts/lib_config.py get mode で原因を確認してください" >&2
+fi
+
 # --- サブコマンド ---
 SUBCMD="${1:-director}"
 

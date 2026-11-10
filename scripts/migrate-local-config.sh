@@ -29,6 +29,12 @@ cd "$ROOT"
 unset CREWVIA_MUX_TEST_ISOLATION
 
 [ -f scripts/lib_config.py ] || { echo "scripts/lib_config.py が無い (主 checkout で・main を最新に)"; exit 1; }
+# local は lib_config が主 checkout から読む。worktree 等で実行すると比べる相手がずれる (exit 4 になる) ので先に止める。
+MAIN_CHECKOUT="$(python3 -c 'import sys; sys.path.insert(0, "scripts"); import lib_config; print(lib_config.find_main_checkout(sys.argv[1]))' "$ROOT" 2>/dev/null || true)"
+if [ "$MAIN_CHECKOUT" != "$ROOT" ]; then
+  echo "ここは主 checkout ではない (主 checkout: ${MAIN_CHECKOUT:-不明} / ここ: $ROOT)。主 checkout で実行する。中止 (何も変えていない)"
+  exit 1
+fi
 [ -e config/crewvia.local.yaml ] && { echo "config/crewvia.local.yaml が既にある。中止 (何も変えていない)"; exit 1; }
 git show HEAD:config/crewvia.yaml > /dev/null 2>&1 || { echo "config/crewvia.yaml が HEAD に無い。中止 (何も変えていない)"; exit 1; }
 

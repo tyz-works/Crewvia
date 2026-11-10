@@ -108,7 +108,10 @@ timeout_max_per_skill:
 #
 # 環境変数での上書き: CREWVIA_MUX=tmux|herdr|rex|hc (最優先) / CREWVIA_MUX_ENABLED=1 (並列 ON) / CREWVIA_MUX_ENABLED=0 (inline)
 # CREWVIA_MUX が設定されていれば CREWVIA_MUX_ENABLED より優先される。
-mode: hc  # 戻す時は herdr。切替日: 2026-11-09
+# 公開前提の既定は tmux。機ごとの値 (hc / rex など) は config/crewvia.local.yaml の mode: に置く
+# (knowledge/machine-local-config.md §5)。local を作り忘れると黙って tmux で起動するので、
+# 起動時に `effective mode=… (source: common|local)` を 1 行出す。
+mode: tmux
 
 # ===== mux 設定 =====
 mux:

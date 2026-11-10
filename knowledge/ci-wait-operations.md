@@ -7,34 +7,44 @@
 
 | 論点 | 結論 |
 |---|---|
-| 持ち主 | CI を**見る**のは dispatcher（既にやっている）。**待つ**人はいなくする。Worker は push + PR + ローカル確認で done。CI の結果は dispatcher が Director に通知する（`ci-failed` / `merge-ready`）。 |
-| merge の門 | `lib_ci_status.gate_verdict()` を新設し `plan.sh ci-gate` で引く。**緑と言えるのは「head が PR の現 head と一致・必須 check が全部 passed・記録が新しい」ときだけ**。それ以外（running / failed / unknown / none / 古い）は全部「通さない」。merge は `--match-head-commit`。 |
+| 持ち主 | CI を**見る**のは dispatcher。**待つ**人はいなくする。Worker は push + PR + ローカル確認で done。CI の結果は dispatcher が Director に通知する（`ci-failed` / `ci-green` / 承認 head が揃ったら `merge-ready`）。**ただし今の取得は in_progress 等の task にしか効かず、done の後は誰も見ない**ので、「見る対象」を PR 単位に広げる（§2.0。PR-C に含める）。 |
+| merge の門 | `lib_ci_status.gate_verdict()` を新設し `plan.sh ci-gate` で引く。**緑と言えるのは「head が PR の現 head と一致・必須 check が全部 passed・記録が新しい」ときだけ**。「review が承認した head」と比べる規則（§2.5）が入るまで、通知の名前は承認を含意しない `ci-green`。それ以外（running / failed / unknown / none / 古い）は全部「通さない」。merge は `--match-head-commit`。 |
 | 「判定に使わない」の改め方 | 禁止を **表示用の読み口（今のまま）と門用の読み口（新設）の 2 つに割る**。門は「通さない」「通知を出す」にだけ使い、**待ちを解く・done にする・Rule 5 を黙らせる**ことには使わない。 |
 | Worker の done 条件 | 触ったファイルに対応するテスト + 構造ガードをローカルで通す。**full pytest は流さない**（約 1 時間）。CI は待たない。 |
-| 変更範囲で CI を絞る | **効果が小さい**。`knowledge/` `agents/` `config/` `skills/` はテストが読む（§5）。当面やらず、nightly の全件 + `ci-ok` 集約 job を先に入れる。 |
+| 変更範囲で CI を絞る | **効果が小さい**。`knowledge/` `agents/` `config/` `skills/` `scripts/` `hooks/` はテストが読む（§5）。当面やらず、nightly の全件 + `ci-ok` 集約 job を先に入れる。 |
 | 並列化 | **手元で 1 回試した: `-n 4` で 24 分 17 秒（CI の直列は約 71 分）**。並列で新たに落ちたテストは 0（§6）。最初に入れる価値が一番大きい。 |
-| Rule 5 / watchdog | CI 待ち由来の誤報は、実装・review の Worker が待たなくなれば出なくなる。上限（75 分 / 7200 秒）は**しばらく残す**。 |
+| Rule 5 / watchdog | CI 待ち由来の誤報は、実装・review の Worker が待たなくなれば出なくなる。上限（75 分 / 7200 秒。7200 は review だけでなく実装系 skill にも入っている）は**しばらく残す**。 |
 
 ## 1. 現状（実測と、読んで分かったこと）
 
 - `.github/workflows/ci.yml` の `pytest` job は PR と main への push のたびに `tests/` を**全件直列**で流す（198 ファイル相当・10,278 件）。main の直近 run は 4272 秒。変更範囲には関係ない。
 - Worker は「CI 全緑で done」で動き、push 後に `gh run watch` / `gh pr checks` で約 1 時間待つ。修正 push を挟むと 2 時間以上。
 - 待ち中の Worker に対し Rule 5 の idle-with-task 誤報（約 5 分ごと）と watchdog の見送り通知が出る（1 日で十数通）。
-- dispatcher は PR の CI を既に毎サイクル取得して `registry/ci/` に記録している（`knowledge/ci-status.md`）。ただし「判定に使わない。使うなら別 PR で設計する」と決めてある。**本書がその設計。**
+- dispatcher は PR の CI を毎サイクル取得して `registry/ci/` に記録している（`knowledge/ci-status.md`）。ただし「判定に使わない。使うなら別 PR で設計する」と決めてある。**本書がその設計。**
+- **取得の対象は狭い**: `lib_ci_status.poll_cycle` は `POLL_STATUSES = lib_task_status.CI_WATCH_STATUSES = {in_progress, ready_for_verification, verifying}`（`scripts/lib_task_status.py:77`）の task だけを見る。Worker が待たずに done する運用では、**done になった瞬間に取得が止まる**（§2.0 で直す）。
 - main に branch protection は無い（`gh api …/branches/main/protection` は 404）。merge 前の CI 確認は crewvia の運用（Director / review Worker）だけが担っている。
 - **「CI を待ってから done」は文書にほとんど書かれていない。** `agents/worker.md` に CI 待ちの記述は無く、`agents/director.md` も Rule 5 の通知表と §17 くらい。規則は慣習 + Director の指示 + timeout 設定のコメント（`config/crewvia.yaml` の `timeout_max_per_skill` 付近）+ `knowledge/watchdog-idle-judgment.md` §12 + `knowledge/review-ci-wait-timeout.md` に散らばっている。`skills/crewvia-qa/SKILL.md` にも CI 待ちの記述は見つからなかった（QA は隔離 clone で走らせる）。→ §4 の「書き換え」は、実際には**「書く」が多い**。
 
 ## 2. 設計 1: CI 待ちの持ち主を dispatcher へ
+
+### 2.0 CI を「見る対象」（取得を止めない）
+
+現状の取得対象（`CI_WATCH_STATUSES`）のままでは、実装 Worker が push 後すぐ done し、review も CI と並行して done すると、その PR の task はどれも done になり**誰も CI を取得しなくなる**。`ci-failed` も `ci-green` / `merge-ready` も `ci-unknown` も出ず、門の条件 4（`observed_at` が 10 分以内）は done の後に引くと必ず `stale` になる（fail-closed の向きには倒れるが、「Worker は待たず、知らせは dispatcher が出す」という設計の要が黙って欠ける）。したがって**見る対象を設計に入れる**。
+
+- **対象の定義**: `pr_number` を持ち、PR が **open で未 merge** の task（status は問わない。done を含む）。`lib_task_status` に `CI_WATCH_STATUSES` とは**別の集合**（例: `CI_FOLLOW_PR_STATES`）として 1 か所に定義する。`CI_WATCH_STATUSES` は他の読み手（`codex_reviews_awaiting_pr` など）と共有の定義なので変えない。PR 番号ごとの重複は `by_pr` で既に畳まれる（同じ PR を指す task が何本あっても 1 回）。
+- **やめる条件**: 取得のたびに PR の `state` / `mergedAt` を同じ `gh` 呼び出しで取り、`MERGED` / `CLOSED` なら記録に終端を書いて対象から外す。task が終端（mission の後始末で queue から消える）になった場合も外れる。`pr_number` を持たない task は対象外。
+- **負荷**: 既存の上限（`MAX_TASKS_PER_CYCLE=4`・サイクル予算・60 秒間隔）は**PR 単位**で数え直す。open な PR は同時に数本なので、done の task が増え続けても対象は増えない（merged / closed で外れるため）。上限を超える場合は `observed_at` の古い順に回す。結論が出た PR（passed / failed で head が変わらない）は取得の間隔を延ばす（既定 5 分）。head が変わったら 60 秒に戻す。
+- **置き場所**: PR-C に含める（通知より先に対象を直す。対象だけ直す PR を B と C の間に置いてもよいが、挙動が変わるのは通知が入るときなので 1 本にまとめる）。表示用の読み口（status / tasks.json）には、done の task の CI 行が出るようになるだけで、判定には使わない（§2.3）。
 
 ### 2.1 流れ
 
 ```
 実装 Worker:  ローカル確認 → push → gh pr create → plan done      （CI は待たない）
 review Worker: diff を読む（CI と並行）→ 所見を Result に残して done （merge しない）
-dispatcher:   毎サイクル PR の CI を取得（今のまま）
+dispatcher:   毎サイクル「open な PR」の CI を取得（task が done でも続ける。§2.0）
               → CI が failed になったら Director に 1 回通知（ci-failed）
-              → review が done かつ gate_verdict が通る → Director に 1 回通知（merge-ready）
-Director:     merge-ready を受けたら plan.sh ci-gate <task> を引き直し、
+              → gate_verdict が通ったら Director に 1 回通知（ci-green。§2.5 の承認 head が揃っていれば merge-ready）
+Director:     通知を受けたら review の所見と承認 head を読み、plan.sh ci-gate <task> を引き直し、
               gh pr merge --squash --match-head-commit <gate が見た head>
 ```
 
@@ -53,14 +63,15 @@ Director:     merge-ready を受けたら plan.sh ci-gate <task> を引き直し
 2. 記録の `head` が **PR の現 head と一致**。現 head は門を引く瞬間に `gh pr view --json headRefOid` で取り直す（記録の head と突き合わせる。取り直せなければ通さない）。
 3. check が 1 件以上あり、**必須 check（§5 の `ci-ok`）が `passed`**。`none`（CI 未登録）は通さない。
 4. 記録の `observed_at` が新しい（既定 10 分以内）。古ければ「通さない」と理由 `stale`。
-5. `neutral`（skipped 等）は passed とは数えないが、`ci-ok` が passed なら妨げない。
+5. `neutral`（skipped 等）は passed とは数えないが、`ci-ok` が passed なら妨げない。ただし **`ci-ok` 自体は「needs が全部 success」のときだけ緑**にする（§5.2-1。skipped を許すのは paths の絞りを入れる PR になってから）。
+6. （`merge-ready` にだけ要る条件。`ci-green` には要らない）承認した head が現 head と一致する（§2.5）。`gate_verdict` は CI の緑だけを見る関数のまま保ち、承認 head との比較は通知・`plan.sh ci-gate` の外側の層で行う。
 
 通さない理由は固定語で返す（`running` / `failed` / `unknown:<reason>` / `none` / `head_mismatch` / `stale` / `no_required_check`）。**疑わしきは通さない**＝ fail-closed。`gh` の失敗・timeout・形の違いは既存どおり `unknown` で、緑にも「CI なし」にも倒さない。
 
 使う場所は 2 つだけ:
 
 - `plan.sh ci-gate <task>`（CLI。exit 0 = 通す / 非 0 = 通さない + 理由 1 行）。Director が merge の直前に引く。
-- dispatcher の `merge-ready` 通知を出す条件。
+- dispatcher の `ci-green` / `merge-ready` 通知を出す条件（`merge-ready` は条件 6 も要る）。
 
 **使わない場所**（不変）: 待ちを解く・card を done にする・Rule 5 / watchdog の通知を黙らせる・タスクの割り当て。門は「止める」と「知らせる」にしか効かない。これで「CI の記録が壊れたら全部動かなくなる」ことはなく、壊れたときは**知らせが出ないだけ**（Director が `plan.sh ci-gate` を手で引けば分かる）。
 
@@ -75,6 +86,15 @@ Director:     merge-ready を受けたら plan.sh ci-gate <task> を引き直し
 ### 2.4 gh が使えないとき
 
 `unknown` が **3 サイクル（既定 180 秒）以上続いたら** Director に `ci-unknown` を 1 回通知（理由つき）。それまでは何も出さない（一過性の timeout で騒がない）。門は常に「通さない」側。
+
+### 2.5 `merge-ready` の承認 head（review の done は承認ではない）
+
+review task の done は「所見を書き終えた」であって承認ではない。今の運用では「要修正」の所見でも done する（例: 要修正の review t020 が done → 修正 t021 → 確認 t022）。また門は「CI の head == PR の現 head」しか見ず、「review が読んだ head == 現 head」を見ない。review の後に修正が push されると、新しい head の CI が緑になった時点で、未レビューの head に `merge-ready` が出てしまう（memory「Director の直しは merge 前にレビュー」と同種の事故）。
+
+- **規則（PR-D で worker.md / review の手順に入れる）**: PR に紐づく review 系 task（review / codex-review / qa。mission ごとに Director が PR に紐づけた task が対象）が**全部終端**で、**最後のもの**の Result が承認を明示する。承認するときだけ Result の末尾に 1 行 `approved_head: <40 桁の sha>` を残す（要修正・条件付きのときは書かない）。
+- **比較**: `merge-ready` の通知条件と `plan.sh ci-gate` の出力で、最後の review の `approved_head` と PR の現 head（門が取り直したもの）を比べる。一致しなければ `ci-green` のまま（`merge-ready` を出さない）。理由は固定語 `approved_head_mismatch` / `no_approval`。
+- **移行中の名前**: この規則と比較が入る（PR-D）まで、dispatcher が出す通知の名前は **`ci-green`**（CI が緑になった事実だけ。承認を含意しない）。`merge-ready` は PR-D の後。Director は `ci-green` を受けたら review の所見を自分で読んで merge 判断する（今と同じ）。
+- 下流の review が複数ある mission（codex-review → qa → 確認）では「最後に終端したもの」を見る。順序は card の依存で決まるので、PR 番号に紐づく review 系 task の `done` 時刻の最大を取る。
 
 ## 3. 設計 2: Worker の done 条件
 
@@ -93,15 +113,15 @@ done の報告に「CI は未完了。結果は dispatcher が通知する」と
 | ファイル | 内容 | 種類 |
 |---|---|---|
 | `agents/worker.md` §5 Pre-Done（約 623 行〜）と「作業完了時の手順」（約 983 行〜） | 上の 1〜5。**CI を待たない**を明記 | 追記 + 一部書き換え |
-| `agents/worker.md` review 関連（約 662・1009 行の「merge は review Worker」） | merge は Director に変更。review は所見まで | 書き換え |
-| `agents/director.md` | merge-ready / ci-failed / ci-unknown の通知表への追加、merge 手順（`ci-gate` → `--match-head-commit`）、§17 Rule 5 の CI 待ち言及 | 追記 + 書き換え |
+| `agents/worker.md` review 関連（約 662・1009 行の「merge は review Worker」） | merge は Director に変更。review は所見まで。承認するときだけ Result に `approved_head: <sha>` を残す（§2.5） | 書き換え |
+| `agents/director.md` | ci-green / merge-ready / ci-failed / ci-unknown の通知表への追加、merge 手順（`ci-gate` → `--match-head-commit`）、§17 Rule 5 の CI 待ち言及 | 追記 + 書き換え |
 | `knowledge/review.md` プロトコル 3〜5・「承認・merge の経路」 | merge を試みる手順を外し、所見 → done に | 書き換え |
 | `knowledge/review-ci-wait-timeout.md` | 「選んだ対応」に**後継**の注記（§7） | 注記 |
 | `knowledge/watchdog-idle-judgment.md` §12 | CI 待ち由来の上限の位置づけを更新 | 注記 |
 | `knowledge/ci-status.md` | 「見える化だけ」→ 表示と門の 2 本立て（§2.3） | 書き換え |
 | `CLAUDE.md` / `scripts/CLAUDE.md` | 「判定に使わない」の文言（§2.3）。`CREWVIA_RULE5_BACKGROUND_JOB_MAX_SECONDS` の記述は据え置き | 書き換え |
 | `skills/crewvia-qa/SKILL.md` | CI 待ちの記述なし。QA の対象 head を `ci-gate` が見た head と揃える 1 行だけ検討 | 任意 |
-| `config/crewvia.yaml` コメント | ローカル full pytest の記述 | 書き換え |
+| `config/crewvia.yaml` コメント | ローカル full pytest の記述。`timeout_max_per_skill` の 7200 は review だけでなく実装系 skill（bash / code / typescript / python / database / cloud / ops）にも入っている（§7） | 書き換え |
 
 ## 4. 移行の注意（文書を先に直さない）
 
@@ -111,15 +131,19 @@ done の報告に「CI は未完了。結果は dispatcher が通知する」と
 
 ### 5.1 飛ばしてよい範囲は狭い
 
-テストが読むファイルを調べた（`tests/*.py` を文字列で走査。実際に読むかではなく**パスを参照しているファイル数**）:
+テストが読むファイルを調べた。**数え方**: `grep -l -F "<dir>/" tests/*.py | wc -l`（`tests/` 直下の `*.py` だけ。下位ディレクトリは含めず、裸の語は数えない。実際に読むかではなく**パスの文字列を含むファイル数**。2026-11-10 の main で、レビュー担当が同じ式で再現した）:
 
 | ディレクトリ | 参照するテストファイル数 |
 |---|---|
-| `knowledge/` | 60 |
-| `config/` | 39 |
-| `skills/` | 27 |
-| `agents/` | 18 |
-| `docs/` | 16（多くは別の意味の `docs/`。実際に `docs/` を読むのは少ない） |
+| `scripts/` | 84 |
+| `knowledge/` | 59 |
+| `hooks/` | 23 |
+| `config/` | 15 |
+| `agents/` | 13 |
+| `skills/` | 7 |
+| `docs/` | 3 |
+
+`scripts/`（84）と `hooks/`（23）まで入れると、絞れる余地はさらに小さい。
 
 文書をテストが抽出する例（`tests/test_irc_relay_pure.py` は文書の付録を読む、`test_agent_docs_take_pr_base_from_plan_pr_base.py` は `agents/*.md` を検査する）が示すとおり、**「md だから飛ばせる」は成り立たない**。本書自身（`knowledge/*.md`）を足す PR も、`knowledge/` を読む 60 ファイルの対象になりうる。
 
@@ -127,9 +151,9 @@ done の報告に「CI は未完了。結果は dispatcher が通知する」と
 
 ### 5.2 推奨: 絞る前に「穴を作らない」土台を入れる
 
-1. **`ci-ok` 集約 job**: 全 job を `needs` にし `if: always()` で、needs のどれかが `failure` / `cancelled` なら落ちる。以後、門（§2.2）と将来の branch protection は `ci-ok` だけを見ればよい。job が paths で飛んでも `skipped` として扱えるので、絞る場合も check 名が消えない（「CI 未登録 = none」と区別できる）。
+1. **`ci-ok` 集約 job**: 全 job を `needs` にし `if: always()` で、**needs が全部 `success` のときだけ緑**にする（`failure` / `cancelled` / `skipped` のどれかがあれば落ちる）。`if:` の書き間違いなどで job が skipped になっても緑にならない＝ fail-closed。以後、門（§2.2）と将来の branch protection は `ci-ok` だけを見ればよい。**skipped を許す（paths で飛んだ job を無視する）のは、絞りを入れる PR（Q4 の b）で、その PR が許可する job を明示して緩める**。それまでは緩めない。
 2. **main への push は常に全件**（今のまま）。
-3. **nightly の全件**（`schedule:` + `workflow_dispatch:`）を追加。絞った PR で見逃したものを翌朝までに拾う。落ちたら Director に通知（dispatcher が main の CI を見るか、GitHub の通知）。
+3. **nightly の全件**（`schedule:` + `workflow_dispatch:`）を追加。絞った PR で見逃したものを翌朝までに拾う。落ちたときの通知の出し方は**未決**（今は dispatcher が main の CI を見ていない。§9 Q8）。
 4. 絞るのは**テストの入力でないと確かめられた path だけ**。確かめ方: 手元で一度、テスト実行中に開かれたリポジトリ内ファイルを記録して（`builtins.open` / `pathlib.Path.read_*` / `subprocess` の引数を差し込む使い捨ての conftest。リポジトリには入れない）、**一度も開かれなかった path 群**を許可リストの候補にする。許可リストはファイルにして理由を 1 行ずつ書く（`scripts/ci-script-tests-excluded.txt` と同じ作法）。
 5. 穴が開いたときの保証: 絞った PR が main に入ると全件が走る。そこで赤になれば Director への通知（§2.1）で拾う。**PR 時点で絞ったことによる見逃しは、main の全件 + nightly で必ず検出される**（遅れるだけで消えない）。
 
@@ -179,7 +203,7 @@ GitHub の `ubuntu-latest` は 2〜4 vCPU（public repo は 4、private は 2）
 | Rule 5 idle-with-task（ローカルテスト待ち由来） | 残る。ただし full pytest をやめる（§3）ので短くなる。 |
 | watchdog の見送り通知（hard_idle） | CI 待ち由来は消える。`ci-status` の 1 行を通知に添える表示は**そのまま**（判定には使わない）。 |
 | `CREWVIA_RULE5_BACKGROUND_JOB_MAX_SECONDS`（既定 4500 秒） | **触らない**。CI 以外の背景 job にも効く。CI 待ちが無くなれば上限に届かなくなるだけ。 |
-| review task の `timeout.max=7200`（`plan.sh add` の既定。`knowledge/review-ci-wait-timeout.md`） | 根拠（review が CI 完走を待つ）が消える。**PR-D の後、2 週間は残して**CI 待ちの timeout が出ないことを確かめてから、既定を外す（PR-F）。`watchdog.py` の `PROFILES` には触らない（restart が要るため）。 |
+| `timeout.max=7200`（`config/crewvia.yaml` の `timeout_max_per_skill` を `plan.sh add` が card に写す。`knowledge/review-ci-wait-timeout.md`） | **review だけでなく実装系 skill（bash / code / typescript / python / database / cloud / ops）にも入っている**。根拠は「push 後の CI 完走待ちとローカル full pytest」で、review も実装系も、待たなくなれば（§3）消える。**PR-D の後、2 週間は残して**CI 待ちの timeout が出ないことを確かめてから、**両方の既定を外す**（PR-F）。`watchdog.py` の `PROFILES` には触らない（restart が要るため）。 |
 
 ## 8. 実装 PR の分け方と順序
 
@@ -187,17 +211,17 @@ GitHub の `ubuntu-latest` は 2〜4 vCPU（public repo は 4、private は 2）
 |---|---|---|---|
 | **A** | ci.yml の pytest を xdist 化（`pip install pytest-xdist`・`-n auto --dist loadfile`・`--durations=30`）。並列で落ちるテストの洗い出し | なし | **先に入れる**。CI で 3 回以上緑を確認。最も短縮が大きい。 |
 | **B** | `lib_ci_status.gate_verdict()` + `plan.sh ci-gate` + テスト（赤の実証つき）。`pytest -m structural` の印付け（B'） | なし（A と並行可） | 挙動は変わらない（誰も呼ばない）。 |
-| **C** | dispatcher の `ci-failed` / `merge-ready` / `ci-unknown` 通知、台帳、テスト | B | 本番では dispatcher restart が要る（`scripts/sync-main-checkout.sh`）。 |
-| **D** | 文書: worker.md / director.md / review.md / ci-status.md / CLAUDE.md の書き換え（§3 の表） | **C が本番に入ってから** | 「待つな」と書くのはここ。 |
-| **E** | ci.yml に `ci-ok` 集約 job と nightly の全件 | A | paths 絞りは含めない。 |
-| **F** | review の `timeout.max=7200` 既定を外す。Rule 5 文言の整理 | D から 2 週間後 | |
+| **C** | CI を見る対象の拡張（§2.0。done の task の PR も、open な間は取得する）+ dispatcher の `ci-failed` / `ci-green` / `ci-unknown` 通知、台帳、テスト | B、**E** | 本番では dispatcher restart が要る（`scripts/sync-main-checkout.sh`）。E が先でないと門が `no_required_check` のままで `ci-green` が出ない。 |
+| **D** | 文書: worker.md / director.md / review.md / ci-status.md / CLAUDE.md の書き換え（§3 の表）+ 承認 head の規則（§2.5）と `merge-ready` の比較 | **C が本番に入ってから**（C ← E ← A） | 「待つ」をやめると書くのはここ。`ci-ok` が無いまま「待つな」を入れない。 |
+| **E** | ci.yml に `ci-ok` 集約 job（needs が全部 success のときだけ緑）と nightly の全件 | A | paths 絞りは含めない。**C・D より先**。 |
+| **F** | `timeout.max=7200` の既定（review と実装系の両方）を外す。Rule 5 文言の整理 | D から 2 週間後 | |
 
-並列に進められるのは A と B、C と E。各 PR の前に base の CI が緑かを確認する（`git.md` のルール）。壊れた CI の上に積まない。
+順序の依存は **A → E → C → D → F**、B は A と並行して C の前に。並列に進められるのは A と B だけ（E は A の後、C は B と E の後）。各 PR の前に base の CI が緑かを確認する（`git.md` のルール）。壊れた CI の上に積まない。
 
 ## 9. Director に決めてほしいこと
 
 **Q1. merge の持ち主**
-- (a) **Director が `merge-ready` を受けて `ci-gate` → `--match-head-commit` で merge（推奨）**: 経路が 1 本。classifier の拒否が来ても Director が自分で対応できる。
+- (a) **Director が `merge-ready`（PR-D の前は `ci-green` + 所見の確認）を受けて `ci-gate` → `--match-head-commit` で merge（推奨）**: 経路が 1 本。classifier の拒否が来ても Director が自分で対応できる。
 - (b) review Worker が merge を続け、CI が緑になるまで再 pull で待つ: 待ち主が dispatcher に変わるだけで、Worker が再割当てされる仕組みが要る（`review-ci-wait-timeout.md` の案 D を却下した理由と同じ）。
 - (c) dispatcher が自動 merge: 外向きの変更を無人で行うため非推奨。
 
@@ -223,9 +247,17 @@ GitHub の `ubuntu-latest` は 2〜4 vCPU（public repo は 4、private は 2）
 **Q7. 稼働中の Worker の扱い**
 - PR-D の merge 後に起動する Worker から新運用。稼働中の Worker は古い手順のまま完走させる（**推奨**。途中で手順を変えると done 条件が食い違う）。
 
+**Q8. nightly の全件が落ちたときの通知（§5.2-3）**
+- (a) **dispatcher が main の CI も見て `ci-failed` と同じ経路で通知（推奨）**: 通知の経路が 1 本。取得の対象（§2.0）に「main の最新 run」を足す小さな拡張になる。
+- (b) GitHub の標準通知（メール）に任せる: 実装は無いが Director の画面には出ない。
+
+**Q9. 承認 head の規則（§2.5）**
+- (a) **review の Result に `approved_head: <sha>` を残し、`merge-ready` はそれと現 head を比べる（推奨）**。PR-D までは通知名を `ci-green` にする。
+- (b) 規則を入れず `ci-green` のまま、Director が毎回所見を読んで判断する（今と同じ。機械的な保証は無い）。
+
 ## 10. 戻し方
 
-- A: ci.yml を revert（直列に戻る）。B: 呼び手がいないので放置でよい。C: PR revert + dispatcher restart（通知が止まるだけ）。D: 文書の revert。E/F: ci.yml / 既定値の revert。
+- A: ci.yml を revert（直列に戻る）。B: 呼び手がいないので放置でよい。C: PR revert + dispatcher restart（通知が止まるだけ）。D: 文書の revert。E/F: ci.yml / 既定値の revert（F は review と実装系の両方）。C を revert すると取得の対象が元に戻る（done の task の PR は見なくなる）が、通知も同時に止まるので整合する。
 - 台帳（`notified-state.json`）は消してよい（同じ通知が 1 回ずつ再送される）。`registry/ci/` も消してよい（次のサイクルで取り直す）。
 
 ## 付録: 今回確かめていないこと

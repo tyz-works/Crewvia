@@ -97,6 +97,31 @@ def pytest_unconfigure(config):
     pytest_workspace_sweep.run_cleanup(TEST_DESTINATION, PRODUCTION_DESTINATION)
 
 
+def pytest_sessionfinish(session, exitstatus):
+    """xdist の worker なら、構造ガードの件数を controller へ渡す。
+
+    `pytest_terminal_summary` は controller でしか走らないが、`guard_report.record()` は worker のプロセスに
+    残る。渡さないと並列にした回の CI ログから `[structural-guard]` の行が消える。直列では `workeroutput` が
+    無いので何もしない。"""
+    out = getattr(session.config, "workeroutput", None)
+    if out is not None:
+        import guard_report
+        out["crewvia_structural_guard"] = guard_report.snapshot()
+
+
+@pytest.hookimpl(optionalhook=True)
+def pytest_testnodedown(node, error):
+    """xdist の controller: worker が終わるたびに、その件数を集める (xdist が無ければ呼ばれない)。"""
+    out = getattr(node, "workeroutput", None) or {}
+    if "crewvia_structural_guard" in out:
+        import guard_report
+        guard_report.merge(out["crewvia_structural_guard"])
+    guard = node.config.pluginmanager.get_plugin("crewvia-leak-guard")
+    data = out.get("crewvia_leak_guard")
+    if guard is not None and data is not None:
+        guard.absorb(data)
+
+
 def pytest_terminal_summary(terminalreporter):
     """構造ガードが検査した件数を、成功しても最後に出す (`tests/guard_report.py`。01a backlog 2)。
     ガードのテストが走らなかった回 (一部だけ選んだ回) は何も出さない。"""

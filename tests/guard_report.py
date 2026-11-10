@@ -21,3 +21,14 @@ def record(guard: str, **counts) -> None:
 def lines() -> list[str]:
     return [f"[structural-guard] {name}: " + " ".join(f"{k}={v}" for k, v in counts.items())
             for name, counts in sorted(_REPORTS.items())]
+
+
+def snapshot() -> dict[str, dict]:
+    """xdist の worker が controller へ渡すための写し (`config.workeroutput` に載せる JSON 互換の dict)。"""
+    return {name: dict(counts) for name, counts in _REPORTS.items()}
+
+
+def merge(other: dict[str, dict]) -> None:
+    """worker から届いた記録を controller 側へ重ねる (`--dist loadfile` ではガードごとに 1 worker なので上書きで足りる)。"""
+    for name, counts in other.items():
+        record(name, **counts)

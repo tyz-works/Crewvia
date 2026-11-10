@@ -615,8 +615,33 @@ class LeakGuard:
             f"残された子孫を検出したテスト: {len(self.leaks)} 件 / "
             f"観測できず不確かなまま終えたテスト: {self.unobservable_only} 件")
 
+    #: xdist の worker が controller へ渡す集計の名前 (`config.workeroutput[WORKEROUTPUT_KEY]`)。
+    WORKEROUTPUT_KEY = "crewvia_leak_guard"
+
+    def export_to_workeroutput(self, config) -> None:
+        """xdist の worker なら、集計を controller へ渡す (`workeroutput` があるのは worker だけ。直列では何もしない)。"""
+        out = getattr(config, "workeroutput", None)  # config が None でも None になる
+        if out is not None:
+            out[self.WORKEROUTPUT_KEY] = {
+                "checked_tests": self.checked_tests,
+                "leaks": list(self.leaks),
+                "unobservable_only": self.unobservable_only,
+            }
+
+    def absorb(self, data: dict) -> None:
+        """controller 側で worker の集計を足す (`pytest_testnodedown` から)。"""
+        self.checked_tests += int(data.get("checked_tests", 0))
+        self.leaks.extend(data.get("leaks", []))
+        self.unobservable_only += int(data.get("unobservable_only", 0))
+
     @pytest.hookimpl(trylast=True)
     def pytest_sessionfinish(self, session, exitstatus):
+        try:
+            self._sessionfinish(session)
+        finally:
+            self.export_to_workeroutput(getattr(session, "config", None))
+
+    def _sessionfinish(self, session):
         """module / session スコープの fixture が残したもののための最後の網。
 
         fixture の `_crewvia_no_leaked_descendants` と同じ扱い (`settle` で再試行し、

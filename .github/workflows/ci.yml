@@ -124,6 +124,8 @@ jobs:
   pytest:
     name: Python Unit Tests (pytest)
     runs-on: ubuntu-latest
+    # fork() とスレッドの組み合わせ（execnet の worker）で止まると、既定では 6 時間まで終わらない。
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
@@ -133,7 +135,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: pip install pytest pyyaml
+        run: pip install pytest pytest-xdist pyyaml
 
       # tests/test_daemon_husk_respawn.py はデーモンが死んでも pane が残る形
       # (husk) を実 tmux 窓で再現する。偽 tmux では作れない状態なので、tmux が
@@ -144,5 +146,8 @@ jobs:
           sudo apt-get install -y tmux
           tmux -V
 
+      # xdist で並列化（knowledge/ci-wait-operations.md §6・Q6 = -n auto）。--dist loadfile は
+      # 同じファイルを同じ worker に寄せる（ファイル内の順序依存・共有 fixture を壊さない）。
+      # --durations=30 で重い上位を出し、worker 配分の調整材料にする。
       - name: Run pytest
-        run: python3 -m pytest tests/ -v
+        run: python3 -m pytest tests/ -v -n auto --dist loadfile --durations=30

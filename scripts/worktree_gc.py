@@ -381,6 +381,10 @@ def load_target_dirs(registry: str) -> tuple[list, str]:
 #: **allowlist** — 未知の名前で読めないものは「取れなかった」に倒す (足したいときはここに理由付きで足す)。
 UNOBSERVABLE_BUT_NOT_A_WORKER = frozenset({
     'ssh-agent', 'sshd', 'sshd-session', 'systemd', '(sd-pam)', 'gpg-agent',
+    # `--fork` で daemon 化するとき chdir("/") するので worktree を掴まない。読めないのは、setgid の
+    # `op` (1Password CLI) が session bus 無しで autolaunch した子が dumpable でなくなるため。
+    # `op` を呼ぶたびに 1 つ増え、終わらない (t021 / knowledge に経緯)。
+    'dbus-daemon',
 })
 
 
@@ -397,14 +401,21 @@ def _cwd_unreadable_but_harmless(pid: str) -> Optional[str]:
         state = stat[stat.rindex(')') + 2:].split(' ', 1)[0]
         if state in ('Z', 'X'):
             return f'state {state}'
-        if not (base / 'cmdline').read_bytes():
+        cmdline = (base / 'cmdline').read_bytes()
+        if not cmdline:
             return 'cmdline が空 (終了処理中)'
         comm = (base / 'comm').read_text().strip()
     except FileNotFoundError:
         return '消えた'
     except (OSError, ValueError):
         return None
-    return f'comm {comm}' if comm in UNOBSERVABLE_BUT_NOT_A_WORKER else None
+    if comm in UNOBSERVABLE_BUT_NOT_A_WORKER:
+        return f'comm {comm}'
+    # `op daemon` (1Password CLI の常駐。setgid なので dumpable でない)。comm だけでは `op run -- <何でも>`
+    # と区別できないので、argv が正確に ['op', 'daemon'] のものだけ許す (`op run` は Worker の子になりうる)。
+    if comm == 'op' and cmdline.rstrip(b'\0').split(b'\0') == [b'op', b'daemon']:
+        return 'op daemon'
+    return None
 
 
 def scan_process_cwds() -> tuple[list, str]:

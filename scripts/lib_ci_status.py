@@ -9,7 +9,8 @@
 - **失敗・timeout・形の違う JSON は `unknown`**。緑にも「CI なし」にも倒さない。
 - 表示 (plan.sh status・tasks.json・watchdog / Rule 5 の通知) は**記録を読むだけ**で gh を呼ばない。
 - 記録は消してよい (無ければ次の poll で取り直す)。書き手は dispatcher だけ。
-- **判定 (黙る・殺す) には使わない**。
+- **判定 (黙る・殺す) には使わない**。例外は門 (`gate_verdict`) 1 つだけ: 「通さない」「知らせる」にだけ使い、
+  待ちを解く・done にする・Rule 5 / watchdog を黙らせることには使わない (設計 `knowledge/ci-wait-operations.md` §2.2・§2.3)。
 
 純粋関数 (`classify_check` / `summarize` / `format_line` / `record_problem` / `parse_view` / `parse_pr_list`) と
 I/O (`run_gh` / `read_record` / `write_record` / `poll_cycle`) を分けてある。
@@ -49,6 +50,10 @@ CYCLE_BUDGET_SECONDS = 20
 MAX_TASKS_PER_CYCLE = 4
 #: 記録がこの秒数より古ければ表示に「(n 分前)」を付ける。
 STALE_AFTER_SECONDS = 300
+#: 門 (`gate_verdict`) が記録を「新しい」と認める最大の経過秒 (設計 §2.2 条件 4。10 分)。表示用の STALE とは別の定義。
+GATE_MAX_AGE_SECONDS = 600
+#: 門が緑の根拠にする必須 check の名前 (設計 §2.2 条件 3・§5。ci.yml の集約 job)。
+REQUIRED_CHECK = 'ci-ok'
 
 #: 記録の state。`none` = gh は答えたが check が 1 つも無い (CI 未登録)。`no_pr` = PR が見つからない (表示しない)。
 STATES = ('running', 'passed', 'failed', 'unknown', 'none', 'no_pr')
@@ -289,6 +294,41 @@ def task_graph_ci(record):
             'summary': summarize(record['pr'], record['head'], record['checks'])}
 
 
+def gate_verdict(record, *, pr_head, now, max_age=GATE_MAX_AGE_SECONDS):
+    """門 (設計 §2.2)。`(True, 'ok')` か `(False, 理由の固定語)`。**疑わしきは通さない** (fail-closed)。
+
+    通す条件は全部 AND: ①記録が形として読める ②記録の `head` == PR の現 head (`pr_head`。呼び出し元が門を引く瞬間に
+    取り直した値) ③`observed_at` が新しい ④全体の state が passed ⑤必須 check (`ci-ok`) が 1 件以上あり全部 passed。
+    承認 head との比較 (§2.5) はここに入れない (CI の緑だけを見る関数のまま)。
+
+    理由の固定語: `unknown:<reason>` / `head_mismatch` / `stale` / `running` / `failed` / `none` / `no_required_check`。
+    使ってよい場所は「通さない」と「知らせる」だけ。待ちを解く・done にする・Rule 5 / watchdog を黙らせることには使わない。
+    共有規則なので env の停止スイッチは付けない (不変条件 5)。"""
+    if record is None or record_problem(record) is not None:
+        return False, 'unknown:unreadable'
+    if not isinstance(pr_head, str) or not _SHA_RE.fullmatch(pr_head):
+        return False, 'unknown:no_pr_head'
+    if isinstance(now, bool) or not isinstance(now, (int, float)) or not math.isfinite(now):
+        return False, 'unknown:bad_clock'
+    state = record['state']
+    if state == 'no_pr':
+        return False, 'unknown:no_pr'
+    if state == 'unknown':
+        reason = record.get('reason')
+        return False, 'unknown:' + (_clean_name(reason) if isinstance(reason, str) and reason else 'check')
+    if record['head'] != pr_head:
+        return False, 'head_mismatch'
+    age = now - record['observed_at']
+    if age < 0 or age > max_age:        # 未来の時刻 (時計のずれ・壊れた記録) も新しいとは言えない
+        return False, 'stale'
+    if state != 'passed':               # running / failed / none
+        return False, state
+    required = [c for c in record['checks'] if c['name'] == REQUIRED_CHECK]
+    if not required or any(c['state'] != 'passed' for c in required):
+        return False, 'no_required_check'
+    return True, 'ok'
+
+
 def record_fingerprint(record):
     """tasks.json の再生成が要るかの比較に使う (経過分は含まない)。"""
     return json.dumps(task_graph_ci(record), ensure_ascii=False, sort_keys=True)
@@ -398,6 +438,21 @@ def run_gh(args, *, cwd, timeout, runner=subprocess.run, gh='gh'):
     if p.returncode != 0:
         return None, f'gh_exit_{p.returncode}'
     return p.stdout, None
+
+
+def fetch_pr_head(pr, *, cwd, timeout=GH_TIMEOUT_SECONDS, runner=subprocess.run):
+    """門を引く瞬間の PR の現 head。`(sha, None)` か `(None, 理由の固定語)` (取り直せなければ門は通さない)。"""
+    out, err = run_gh(['pr', 'view', str(pr), '--json', 'headRefOid'], cwd=cwd, timeout=timeout, runner=runner)
+    if err:
+        return None, err
+    try:
+        doc = json.loads(out)
+    except ValueError:
+        return None, 'bad_json'
+    head = doc.get('headRefOid') if isinstance(doc, dict) else None
+    if not isinstance(head, str) or not _SHA_RE.fullmatch(head):
+        return None, 'bad_head'
+    return head, None
 
 
 def _unknown(pr, reason, now):

@@ -54,6 +54,9 @@ DEFINITION = SCRIPTS_DIR / "lib_task_status.py"
 _EXTRA_NAMES = frozenset({"cancelled", "corrupted", "drafting", "reviewing", "ready"})
 
 
+pytestmark = pytest.mark.structural  # 構造ガード (pytest -m structural。tests/conftest.py に登録)
+
+
 def _status_names() -> frozenset[str]:
     return frozenset(lib_task_status.TASK_STATUSES) | _EXTRA_NAMES
 

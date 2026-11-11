@@ -125,13 +125,15 @@ set -euo pipefail
 #                              PR 番号から、その PR を作った task を <mission_slug>/<task_id> で 1 行出す
 #                              (repo の絞り込みは pull と同じ規則: --target-dir flag > TARGET_DIR env > crewvia 本体)
 #                              (読み取り専用。pr-base と同じく決められなければ exit 1・stdout 空。詳細は cmd_resolve_pr)
+#   plan.sh ci-gate <pr_number> [--target-dir <dir>]
+#                              PR の CI の門 (読み取り専用。通すとき exit 0、通さないとき exit 1 + 理由 1 行。設計: knowledge/ci-wait-operations.md §2.2)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 QUEUE_DIR="${CREWVIA_QUEUE:-${REPO_ROOT}/queue}"
 
 if [[ $# -eq 0 ]]; then
-  echo "Usage: plan.sh <init|add|pull|done|needs-director|fail|update|retry|reopen|release-dep|retire|reap-orphan-assignment|ready-for-verification|verifying|snapshot|verify-result|review|launch|task-graph|lint|status|archive|resync|dashboard|dashboard-data|resolve-mission|store-check|history|pr-base|resolve-pr> [args...]" >&2
+  echo "Usage: plan.sh <init|add|pull|done|needs-director|fail|update|retry|reopen|release-dep|retire|reap-orphan-assignment|ready-for-verification|verifying|snapshot|verify-result|review|launch|task-graph|lint|status|archive|resync|dashboard|dashboard-data|resolve-mission|store-check|history|pr-base|resolve-pr|ci-gate> [args...]" >&2
   exit 1
 fi
 
@@ -990,7 +992,7 @@ QUEUE_MUTATING_SUBCOMMANDS = {
 #: queue を読むだけのサブコマンド = 生成を呼ばない経路。
 #: `task-graph` 自身もここ (queue は書き換えず、生成物だけを書く)。
 QUEUE_READONLY_SUBCOMMANDS = {
-    'lint', 'status', 'resync', 'dashboard-data', 'task-graph', 'resolve-mission', 'store-check', 'history', 'pr-base', 'resolve-pr',
+    'lint', 'status', 'resync', 'dashboard-data', 'task-graph', 'resolve-mission', 'store-check', 'history', 'pr-base', 'resolve-pr', 'ci-gate',
 }
 
 #: crewvia の status → (plugin の status, title に付ける印)。
@@ -2719,6 +2721,7 @@ USAGE = {
     'history': 'plan.sh history <task_id> [--mission <slug>]',
     'pr-base': 'plan.sh pr-base [--mission <slug> --task <task_id>] [--diff-ref]',
     'resolve-pr': 'plan.sh resolve-pr <pr_number> [--target-dir <dir>]',
+    'ci-gate': 'plan.sh ci-gate <pr_number> [--target-dir <dir>]',
 }
 
 #: サブコマンドごとに受け付ける positional の数 (最小, 最大)。余剰は黙って捨てず拒否する
@@ -2733,7 +2736,7 @@ POSITIONAL_ARITY = {
     'review': (1, 1), 'launch': (1, 1), 'task-graph': (0, 0), 'lint': (0, 1),
     'status': (0, 0), 'archive': (1, 1), 'resync': (0, 1), 'dashboard-data': (0, 0),
     'resolve-mission': (1, 1), 'store-check': (0, 0), 'history': (1, 1), 'pr-base': (0, 0),
-    'resolve-pr': (1, 1),
+    'resolve-pr': (1, 1), 'ci-gate': (1, 1),
 }
 
 #: 使い方の誤りの終了コード。`pull` だけは 1 — `pull` の 2 は「タスクなし (idle)」で、
@@ -2745,7 +2748,7 @@ PULL_USAGE_EXIT = 1
 #: 使い方の誤りを exit 1 で返すサブコマンド。`pull` は 2 = idle のため。`pr-base` は呼び出し元が
 #: `PR_BASE="$(plan pr-base)" || exit 1` と書き、「決められない」は全部 exit 1 (exit 2 は idle の意味。
 #: knowledge/git-policy.md §3)。
-PULL_USAGE_EXIT_SUBCOMMANDS = ('pull', 'pr-base', 'resolve-pr')
+PULL_USAGE_EXIT_SUBCOMMANDS = ('pull', 'pr-base', 'resolve-pr', 'ci-gate')
 
 
 class UsageExit(SystemExit):
@@ -3523,6 +3526,60 @@ def cmd_resolve_pr(args):
     print(f"{slug}/{task_id}")
 
 
+def cmd_ci_gate(args):
+    """PR の CI の門 (読み取り専用。ロックも取らない・queue も registry も書かない・誰もまだ呼ばない)。
+
+    設計: `knowledge/ci-wait-operations.md` §2.2。通すとき exit 0 で `ci-gate: PASS PR #N head=<40 桁>` を 1 行、
+    通さないとき **exit 1** で `ci-gate: DENY PR #N <理由の固定語>` を 1 行 (stdout)。使い方の誤り・記録が無い・
+    gh が使えない・読めない、はすべて「通さない」(exit 1)。判定は `lib_ci_status.gate_verdict` の 1 か所
+    (ここに条件を書き写さない)。待ちを解く・done にする・Rule 5 / watchdog を黙らせることには使わない。
+
+    記録は card の `pr_number` == N の task (active mission。`--target-dir` / `TARGET_DIR` / 無ければ crewvia 本体で
+    絞る = `resolve-pr` と同じ規則) の `registry/ci/` の記録のうち `observed_at` が最も新しいもの。PR の現 head は
+    門を引く瞬間に gh で取り直す。
+    """
+    opts, positional = parse_opts(args, {'--target-dir': 'value'})
+    try:
+        pr_number = int(positional[0])
+    except ValueError:
+        die(f"ci-gate: PR 番号は整数で指定してください: {positional[0]!r}")
+    if pr_number <= 0:
+        die(f"ci-gate: PR 番号は正の整数にしてください: {pr_number}")
+    if '--target-dir' in opts:
+        if not opts['--target-dir'].strip():
+            _usage_exit("--target-dir に空の値は渡せません (省略すれば TARGET_DIR / crewvia 本体を見ます)")
+        effective_target = os.path.abspath(os.path.expanduser(opts['--target-dir']))
+    else:
+        env_td = os.environ.get('TARGET_DIR', '').strip()
+        effective_target = os.path.abspath(env_td) if env_td else None
+
+    def deny(reason):
+        print(f"ci-gate: DENY PR #{pr_number} {reason}")
+        sys.exit(1)
+
+    try:
+        state = load_state()
+    except SystemExit:
+        deny('unknown:state_unreadable')
+    newest = None
+    for slug in list(state.get('active_missions') or []):
+        for meta, _body in list_tasks(slug, quiet=True):
+            if meta.get('pr_number') != pr_number or (meta.get('target_dir') or None) != effective_target:
+                continue
+            rec = _CI_STATUS.read_record(registry_dir(), slug, meta['id'], pr_number=pr_number)
+            if rec is not None and (newest is None or rec['observed_at'] > newest['observed_at']):
+                newest = rec
+    if newest is None:
+        deny('unknown:no_record')
+    head, err = _CI_STATUS.fetch_pr_head(pr_number, cwd=effective_target or REPO_ROOT)
+    ok, reason = _CI_STATUS.gate_verdict(newest, pr_head=head if err is None else None, now=time.time())
+    if err is not None and not ok:
+        reason = f'unknown:{err}'
+    if not ok:
+        deny(reason)
+    print(f"ci-gate: PASS PR #{pr_number} head={head}")
+
+
 #: pull の domain error → exit code (execution.md §4.4)。exit 2 は pull では「タスクなし (idle)」の意味なので、
 #: Controller のどのコードも 2 にしない (memory pull-exit-2-is-idle-usage-errors-must-be-1)。照合の 3 つだけ 3。
 _PULL_EXECUTION_EXIT_CODES = frozenset({
@@ -3594,7 +3651,7 @@ _INTENT_FREEZE = {
     'verifying': 'allow', 'verify-result': 'allow',
     # 読み取り専用 (queue の card を書かない)
     'status': 'allow', 'history': 'allow', 'store-check': 'allow', 'lint': 'allow', 'snapshot': 'allow',
-    'dashboard-data': 'allow', 'resolve-mission': 'allow', 'pr-base': 'allow', 'resolve-pr': 'allow',
+    'dashboard-data': 'allow', 'resolve-mission': 'allow', 'pr-base': 'allow', 'resolve-pr': 'allow', 'ci-gate': 'allow',
     'task-graph': 'allow', 'resync': 'allow',
     # card・intent に触れない (新しい mission の作成 / 有効化 / mission.yaml の review 状態 / registry の孤児 assignment)。
     # 『通す』の各行が mission dir の移動・置き換え・削除・state.yaml の書き換えを内部で起こさないかの表は設計 §4.3.1 (PR #308 fix 5):
@@ -7869,6 +7926,7 @@ dispatch = {
     'history': cmd_history,
     'pr-base': cmd_pr_base,
     'resolve-pr': cmd_resolve_pr,
+    'ci-gate': cmd_ci_gate,
 }
 
 if SUBCOMMAND not in dispatch:

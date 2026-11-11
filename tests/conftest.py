@@ -64,6 +64,10 @@ TEST_PANE_PREFIX = f"pytest-{_NONCE}-"
 
 def pytest_configure(config):
     """Runs before collection, so even module-import-time mux calls are covered."""
+    # 構造ガード (全ファイルを走査する単一定義・呼び出し元の許可表・読み書きの入口の検査)。
+    # `python3 -m pytest tests/ -m structural` が push 前の 1 コマンド (knowledge/ci-wait-operations.md §3)。
+    # 新しいガードは module の `pytestmark = pytest.mark.structural` (または関数に @pytest.mark.structural) で足す。
+    config.addinivalue_line("markers", "structural: 全ファイルを走査する構造ガード (push 前に -m structural で回す)")
     os.environ["CREWVIA_MUX_TEST_ISOLATION"] = "1"
     os.environ["CREWVIA_TMUX_SESSION"] = TEST_DESTINATION
     os.environ["CREWVIA_HERDR_WORKSPACE"] = TEST_DESTINATION

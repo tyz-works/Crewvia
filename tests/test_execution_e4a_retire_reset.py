@@ -602,7 +602,7 @@ def test_the_marker_and_the_cleanup_are_bound_to_the_execution(rig):
     assert rig.request()
     assert rig.marker().get("task_execution_id") == xid
     assert rig.drive(), rig.logs
-    assert state(box) == ("pending", None, None, "failed", "RETIRED")
+    assert state(box) == ("pending", None, None, "failed", "RETIRED"), "\n".join(rig.logs)
     assert box.slot(AGENT) is None
     (argv, env), = _retire_calls(rig)
     assert argv[3] == TID and "--execution" in argv and xid in argv

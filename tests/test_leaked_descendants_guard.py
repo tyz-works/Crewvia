@@ -86,7 +86,29 @@ def _spawn_orphan(env=None, cwd=None) -> int:
     proc.stdout.close()
     os.kill(proc.pid, signal.SIGKILL)
     proc.wait()
+    _wait_exec_done(child, "sleep")
     return child
+
+
+def _wait_exec_done(pid: int, comm: str, seconds: float = 10.0) -> None:
+    """子が fork 直後の sh の複製でなく、exec を終えた `comm` になるまで待つ。
+
+    `_wait_observable` (environ が空でない) だけでは足りない: fork 直後の子は親 sh の environ の
+    複製を持つので、exec の前でも『読める』。その後の走査が exec の窓 (environ が空) に当たると
+    観測できず survivor に入らない。CPU が混むと窓が伸びる (負荷下の実測: 『読めた』瞬間に
+    まだ comm が `sh` だったのが 300 回中 104 回)。comm が変わるのは exec の途中 (mm の入れ替え後)
+    なので、comm が変わり **かつ** environ が読める = exec が終わった、で判定する。
+    """
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        try:
+            if (pathlib.Path(f"/proc/{pid}/comm").read_text().strip() == comm
+                    and pathlib.Path(f"/proc/{pid}/environ").read_bytes()):
+                return
+        except OSError:
+            pass
+        time.sleep(0.002)
+    raise AssertionError(f"pid {pid} が exec を終えない (comm={comm!r} にならない)")
 
 
 @pytest.fixture

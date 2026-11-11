@@ -5,6 +5,11 @@ on:
     branches: [main]
   push:
     branches: [main]
+  # nightly の全件（knowledge/ci-wait-operations.md §5.2-3）。paths の絞りは入れていないので
+  # PR・push・nightly はどれも全件を走らせる。落ちたときの通知は dispatcher 側（PR-C）。
+  schedule:
+    - cron: "17 18 * * *"   # 毎日 18:17 UTC（03:17 JST）
+  workflow_dispatch:
 
 jobs:
   shell-validate:
@@ -151,3 +156,27 @@ jobs:
       # --durations=30 で重い上位を出し、worker 配分の調整材料にする。
       - name: Run pytest
         run: python3 -m pytest tests/ -v -n auto --dist loadfile --durations=30
+
+  # 集約 job（§5.2-1）。needs が全部 success のときだけ緑。failure / cancelled / skipped の
+  # どれかがあれば落ちる（fail-closed）。always() が無いと needs が落ちたとき skipped になり、
+  # 「落ちた」ではなく「走らなかった」になってしまう。skipped を許すのは paths の絞りを入れる PR で、
+  # その PR が許可する job を明示して緩める。それまでは緩めない。
+  ci-ok:
+    name: ci-ok
+    if: always()
+    needs: [shell-validate, yaml-validate, script-tests, tests-sh-tests, bats, pytest]
+    runs-on: ubuntu-latest
+    steps:
+      - name: every needed job must be success
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          echo "$NEEDS" | python3 -c '
+          import json, sys
+          needs = json.load(sys.stdin)
+          bad = {k: v.get("result") for k, v in needs.items() if v.get("result") != "success"}
+          print({k: v.get("result") for k, v in needs.items()})
+          if not needs or bad:
+              print("NOT OK:", bad or "no needs")
+              sys.exit(1)
+          '

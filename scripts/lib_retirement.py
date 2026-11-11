@@ -1480,6 +1480,28 @@ class RetirementExecutor:
         gone, _why = self._exit_evidence(req, prog, target)
         return gone
 
+    def _recorded_instance_gone(self, req: Optional[dict], prog: Optional[dict], target: str) -> Optional[str]:
+        """The guard is about to discard because it could not match the window to the request: has the **recorded**
+        instance meanwhile been proven gone?  Returns the evidence (str) if so, else None.
+
+        `_instance_gone()` is asked at the top of a step, the guard reads the window's identity a moment later, and
+        a Worker that dies in between (SIGTERM did its job; under load the gap is long enough to hit) makes the
+        guard read "the pid we recorded is unreadable" as "a successor owns this window" and discard.  Discarding
+        skips the queue cleanup, and the task stays `in_progress` with nobody to run it: the ghost this module
+        exists to remove (t019).  A recorded pid that is dead — and whose recorded group is empty — is evidence
+        that the instance we were retiring is over, **not** that another one exists.
+
+        Only the recorded pid answers.  With no pid recorded, "gone" would come from a window listing, and the guard's
+        "unavailable / mismatch" is exactly the reading that listing cannot settle; those stay discards.
+        """
+        recorded = recorded_pid((prog or {}).get("pane_pid"))
+        if recorded is None:
+            recorded = recorded_pid(((req or {}).get("spawn_identity") or {}).get("pane_pid"))
+        if recorded is None:
+            return None
+        gone, evidence = self._exit_evidence(req, prog, target)
+        return evidence if gone else None
+
     def _check_stall(self, agent: str) -> bool:
         """Escalate a retirement that has been unable to move for too long.
 
@@ -1921,6 +1943,12 @@ class RetirementExecutor:
         if verdict == GUARD_UNPROVABLE:
             return self._unprovable(agent, req, prog, why, target)
         if verdict == GUARD_DISCARD:
+            evidence = self._recorded_instance_gone(req, prog, target)
+            if evidence is not None:
+                self.log(f"[retire] {agent}: exited while the guard was looking ({evidence}) — "
+                         f"cleaning up instead of discarding")
+                self._write_progress(agent, prog, PHASE_TERMINATED, window_gone=True)
+                return "terminated"
             self.log(f"[retire] {agent}: NOT sending SIGTERM — {why}")
             self._write_progress(agent, prog, PHASE_DISCARDED, discard_reason=why)
             return "discarded"
@@ -1999,6 +2027,13 @@ class RetirementExecutor:
                 return "skipped"
             if orphan_pgid is not None:
                 return self._sigkill_orphaned_group(agent, prog, orphan_pgid)
+            # The same race one level up (t019): the recorded pid itself died after `_instance_gone()` looked.
+            evidence = self._recorded_instance_gone(req, prog, target)
+            if evidence is not None:
+                self.log(f"[retire] {agent}: exited while the guard was looking ({evidence}) — "
+                         f"cleaning up instead of discarding")
+                self._write_progress(agent, prog, PHASE_TERMINATED, window_gone=True)
+                return "terminated"
             self.log(f"[retire] {agent}: NOT sending SIGKILL — {why}")
             self._write_progress(agent, prog, PHASE_DISCARDED, discard_reason=why)
             return "discarded"

@@ -476,7 +476,15 @@ def test_husk_state_requires_a_bare_shell_cmdline():
     login = _spawn_bare("exec -a -bash bash")           # argv == ['-bash']
     prog = _spawn_bare("exec bash -c 'read x'")         # argv == ['bash','-c','read x']
     try:
-        time.sleep(0.5)
+        # login shell は起動中に profile/bashrc が子を作る。時間でなく状態で待つ
+        # (test_rex_backend_stub_protocol._wait_idle_login_shell と同じ理由)。
+        deadline, stable = time.time() + 20, 0
+        while time.time() < deadline and stable < 6:
+            quiet = (lib_mux._process_argv(login.pid) == ["-bash"]
+                     and lib_mux._live_children(login.pid) == [])
+            stable = stable + 1 if quiet else 0
+            time.sleep(0.05)
+        assert stable >= 6, "the login shell never settled"
         assert lib_mux._process_argv(login.pid) == ["-bash"]
         assert lib_mux._process_argv(prog.pid) == ["bash", "-c", "read x"]
 

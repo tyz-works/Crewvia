@@ -61,6 +61,9 @@ from test_unobservable_is_not_empty import MISSION, Sandbox  # noqa: E402
 # in-process の呼び出しには `SIGALRM` で締切を置き、subprocess には
 # `subprocess.run(timeout=)` を置く。どちらも **落ちたら赤** になる。
 
+pytestmark = pytest.mark.structural  # 構造ガード (pytest -m structural。tests/conftest.py に登録)
+
+
 class _Blocked(BaseException):
     """締切までに返らなかった = ブロックした。`Exception` を継承しない
     (本番コードの広い `except Exception` に飲まれないため)。"""

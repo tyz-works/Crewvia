@@ -71,6 +71,9 @@ from lib_task_cards import Unreadable, is_missing, is_unreadable  # noqa: E402
 # 対象のソースを取り出す
 # ---------------------------------------------------------------------------
 
+pytestmark = pytest.mark.structural  # 構造ガード (pytest -m structural。tests/conftest.py に登録)
+
+
 def _scanned_modules() -> list[str]:
     modules = set(AUDITED_MODULES) | {"lib_review_refusal.py", "lib_daemon_state.py"}
     modules |= {p.name for p in SCRIPTS_DIR.glob("lib_*.py")}
@@ -175,6 +178,9 @@ ALLOWED_JSON_PARSES: dict[tuple[str, str, str], str] = {
     ("lib_ci_status.py", "parse_view", "json.loads(text)"):
         _EXTERNAL_RESPONSE + "`gh pr view --json headRefOid,statusCheckRollup` の stdout。形の検証はこの関数の中 "
         "(head は 40 hex・rollup は list・頼んだ欄が無ければ ValueError → 呼び出し元が unknown にする)",
+    ("lib_ci_status.py", "fetch_pr_head", "json.loads(out)"):
+        _EXTERNAL_RESPONSE + "`gh pr view --json headRefOid` の stdout (門が PR の現 head を取り直す)。形が違えば "
+        "(JSON でない・dict でない・head が 40 hex でない) 理由コードを返し、門は通さない",
     ("lib_ci_status.py", "parse_pr_list", "json.loads(text)"):
         _EXTERNAL_RESPONSE + "`gh pr list --json number,isCrossRepository` の stdout。形が違えば ValueError → unknown",
     ("lib_review_engine.py", "extract_cursor_findings", "json.loads(out_text, object_pairs_hook=_no_duplicate_keys)"):

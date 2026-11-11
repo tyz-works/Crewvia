@@ -43,6 +43,9 @@ FORBIDDEN = {
 }
 
 
+pytestmark = pytest.mark.structural  # 構造ガード (pytest -m structural。tests/conftest.py に登録)
+
+
 def test_the_scan_sees_the_real_files():
     names = {p.name for p in CODE_FILES}
     assert {"plan.sh", "lib_retirement.py", "lib_execution.py", "lib_state_store.py", "dispatcher.sh"} <= names

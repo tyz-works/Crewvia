@@ -17,6 +17,8 @@ R2 (ユーザー決定): 呼び出し側を移す PR は merge 前にユーザ�
 
 from __future__ import annotations
 
+import pytest
+
 import pathlib
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
@@ -35,6 +37,9 @@ ALLOWED_CALLERS = {"scripts/lib_state_store.py", "scripts/plan.sh", "scripts/lib
 #: 走査する場所。**ディレクトリごと**で列挙しない (新しい書き手が増えても自動で対象になる)。
 SCAN_DIRS = ("scripts", "hooks", "agents", "config")
 SCAN_FILES = ("crewvia",)
+
+
+pytestmark = pytest.mark.structural  # 構造ガード (pytest -m structural。tests/conftest.py に登録)
 
 
 def _candidates():

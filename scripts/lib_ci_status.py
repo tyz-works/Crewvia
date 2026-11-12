@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""scripts/lib_ci_status.py — PR の CI の進み具合を取って記録し、1 行にする (見える化だけ)。
+"""scripts/lib_ci_status.py — PR の CI の進み具合を取って記録し、1 行にする (見える化 + Director への知らせ)。
 
 設計: `knowledge/ci-status.md`。
 
-- **取得は dispatcher の 1 か所** (`poll_cycle`)。in_progress / ready_for_verification / verifying の task のうち
-  PR があるもの (card の `pr_number`、無ければ Git Policy Resolver の branch から `gh pr list --head`) について
-  `gh pr view <N> --json headRefOid,statusCheckRollup` を呼び、`registry/ci/<mission>__<task>.json` に書く。
+- **取得は dispatcher の 1 か所** (`poll_cycle`)。`card_is_watched` の task (card に `pr_number` があれば status 不問・無ければ
+  in_progress / ready_for_verification / verifying で、Git Policy Resolver の branch から `gh pr list --head`) について
+  `gh pr view <N> --json headRefOid,statusCheckRollup,state` を呼び、`registry/ci/<mission>__<task>.json` に書く。
 - **失敗・timeout・形の違う JSON は `unknown`**。緑にも「CI なし」にも倒さない。
 - 表示 (plan.sh status・tasks.json・watchdog / Rule 5 の通知) は**記録を読むだけ**で gh を呼ばない。
 - 記録は消してよい (無ければ次の poll で取り直す)。書き手は dispatcher だけ。
@@ -33,12 +33,14 @@ if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
 from lib_daemon_state import load_json_store, write_told_atomic  # noqa: E402
-from lib_git_policy import GitPolicyError, check_mission_slug, check_task_id  # noqa: E402
+from lib_git_policy import DEFAULT_BASE_BRANCH, GitPolicyError, check_mission_slug, check_task_id  # noqa: E402
 from lib_task_cards import is_missing, is_unreadable  # noqa: E402
-from lib_task_status import CI_WATCH_STATUSES  # noqa: E402
+from lib_task_status import CI_FOLLOW_PR_STATUSES, CI_WATCH_STATUSES  # noqa: E402
 
 #: CI を見る task の status (Worker が PR の CI を待ちうる状態)。定義は lib_task_status の 1 か所。
 POLL_STATUSES = CI_WATCH_STATUSES
+#: card に `pr_number` がある task は、status を問わず PR が open な間は見続ける (done を含む。定義は lib_task_status の 1 か所)。
+FOLLOW_STATUSES = CI_FOLLOW_PR_STATUSES
 
 #: 1 つの task (PR) を問い合わせる最短の間隔 (秒) の既定値。値を持つのは `lib_daemon_watch.WatchConfig.ci_poll_seconds`。
 DEFAULT_POLL_SECONDS = 60
@@ -48,6 +50,12 @@ GH_TIMEOUT_SECONDS = 15
 CYCLE_BUDGET_SECONDS = 20
 #: 1 サイクルで問い合わせる task の上限。
 MAX_TASKS_PER_CYCLE = 4
+#: 結論が出た PR (state が passed / failed。head が変われば次の取得で running に戻り DEFAULT_POLL_SECONDS に戻る) の間隔 (秒)。
+CONCLUDED_POLL_SECONDS = 300
+#: `ci-unknown` を出す、unknown が続いた取得の回数 (設計 §2.4。既定の間隔 60 秒で約 180 秒)。
+UNKNOWN_NOTIFY_STREAK = 3
+#: main の最新 run を問い合わせる最短の間隔 (秒)。
+MAIN_POLL_SECONDS = 300
 #: 記録がこの秒数より古ければ表示に「(n 分前)」を付ける。
 STALE_AFTER_SECONDS = 300
 #: 門 (`gate_verdict`) が記録を「新しい」と認める最大の経過秒 (設計 §2.2 条件 4。10 分)。表示用の STALE とは別の定義。
@@ -57,6 +65,10 @@ REQUIRED_CHECK = 'ci-ok'
 
 #: 記録の state。`none` = gh は答えたが check が 1 つも無い (CI 未登録)。`no_pr` = PR が見つからない (表示しない)。
 STATES = ('running', 'passed', 'failed', 'unknown', 'none', 'no_pr')
+#: 記録の任意の欄 `pr_state` (gh の PR の state)。MERGED / CLOSED は終端 = 取得の対象から外れる。
+#: 欄が無い記録 (古い版が書いた) は OPEN 扱いで、次の取得で書き直される。
+PR_STATES = ('OPEN', 'MERGED', 'CLOSED')
+PR_TERMINAL_STATES = ('MERGED', 'CLOSED')
 
 #: 記録と check の欄。**検査 (`record_problem`) が必須にする欄 = 読み手 (`summarize` / `format_line` / `task_graph_ci` /
 #: `poll_cycle`) が `[]` で読む欄**の 1 定義 (#314 r4: 検査が `name` と `state` だけの check を通し、summarize が
@@ -203,6 +215,18 @@ def parse_view(text):
     return head, [classify_check(i) for i in rollup]
 
 
+def parse_pr_state(text):
+    """`gh pr view --json ...,state` の stdout → `OPEN` / `MERGED` / `CLOSED` / None (`state` の欄が無い = 古い stub・版)。
+    欄があって知らない値・文字列でない値は ValueError (終端と取り違えない = unknown 側)。`parse_view` と同じ stdout を読む。"""
+    doc = json.loads(text)
+    if not isinstance(doc, dict) or 'state' not in doc:
+        return None
+    state = doc['state']
+    if not isinstance(state, str) or state not in PR_STATES:
+        raise ValueError('bad_pr_state')
+    return state
+
+
 def parse_pr_list(text):
     """`gh pr list --head <b> --state open --json number,isCrossRepository` の stdout → PR 番号 / None (無い)。
     fork から来た同名 branch の PR (`isCrossRepository: true`) は数えない。2 つ以上・形の違いは ValueError
@@ -254,6 +278,12 @@ def record_problem(data):
                 return f"'checks[].{k}' is not a string"
     if not isinstance(data.get('summary'), str):
         return "'summary' is not a string"
+    if 'pr_state' in data and data['pr_state'] not in PR_STATES:
+        return f"'pr_state' is {data['pr_state']!r}"
+    if 'unknown_streak' in data:
+        streak = data['unknown_streak']
+        if isinstance(streak, bool) or not isinstance(streak, int) or streak < 0:
+            return "'unknown_streak' is not a non-negative integer"
     return None
 
 
@@ -508,21 +538,53 @@ def observe_task(task, *, repo_root, branch_of, now, timeout, runner=subprocess.
 
 
 def _view(pr, gh, now):
-    out, err = gh(['pr', 'view', str(pr), '--json', 'headRefOid,statusCheckRollup'])
+    out, err = gh(['pr', 'view', str(pr), '--json', 'headRefOid,statusCheckRollup,state'])
     if err:
         return _unknown(pr, err, now)
     try:
         head, checks = parse_view(out)
+        pr_state = parse_pr_state(out)
     except ValueError:
         return _unknown(pr, 'bad_json', now)
-    return {'pr': pr, 'head': head, 'state': overall_state(checks), 'checks': checks, 'observed_at': now,
-            'summary': summarize(pr, head, checks)}
+    rec = {'pr': pr, 'head': head, 'state': overall_state(checks), 'checks': checks, 'observed_at': now,
+           'summary': summarize(pr, head, checks)}
+    if pr_state is not None:        # 同じ呼び出しで取る (MERGED / CLOSED は poll_cycle が終端として扱う)
+        rec['pr_state'] = pr_state
+    return rec
+
+
+def card_is_watched(task):
+    """この task の PR を取得の対象にするか。①`CI_WATCH_STATUSES` (PR が card に無くても branch から解決する) か、
+    ②`pr_number` を持つ task (status 不問 = done を含む。`CI_FOLLOW_PR_STATUSES`)。PR が MERGED / CLOSED になれば
+    記録の `pr_state` で `poll_cycle` が外す (設計 §2.0)。"""
+    status = task.get('status')
+    if status in POLL_STATUSES:
+        return True
+    return status in FOLLOW_STATUSES and card_pr(task.get('pr_number')) is not None
+
+
+def pr_closed(record, pr_number):
+    """card が PR を名指ししていて、その PR の記録が MERGED / CLOSED を言っている (= 取得の対象から外す)。"""
+    return (record is not None and card_pr(pr_number) is not None and record_matches_card(record, pr_number)
+            and record.get('pr_state') in PR_TERMINAL_STATES)
+
+
+def poll_interval(prev, poll_seconds, concluded_seconds):
+    """前の記録から次の取得までの最短の間隔。結論が出た (passed / failed) 記録は長く、それ以外 (running / unknown /
+    none / 記録なし) は `poll_seconds`。head が変われば取得の結果が running に戻るので、そこから `poll_seconds`。"""
+    if prev is not None and prev.get('state') in ('passed', 'failed'):
+        return max(poll_seconds, concluded_seconds)
+    return poll_seconds
 
 
 def poll_cycle(tasks, *, registry_dir, repo_root, branch_of, poll_seconds=DEFAULT_POLL_SECONDS,
                now=None, clock=time.monotonic, runner=subprocess.run, warn=None,
-               budget=CYCLE_BUDGET_SECONDS, max_tasks=MAX_TASKS_PER_CYCLE):
+               budget=CYCLE_BUDGET_SECONDS, max_tasks=MAX_TASKS_PER_CYCLE,
+               concluded_seconds=CONCLUDED_POLL_SECONDS):
     """dispatcher の 1 サイクル分。間隔が来た task を古い順に、件数と時間の上限まで観測して書く。
+
+    対象は `card_is_watched`。PR が MERGED / CLOSED と記録された task は外す。上限 `max_tasks` は **PR 単位**で数える
+    (このサイクルで観測済みの PR を指す task は gh を呼ばないので数えない)。
 
     戻り値: tasks.json の `ci` 欄が変わった task の数 (呼び出し元が 0 でなければ task-graph を作り直す)。
     gh の失敗・timeout はその task を unknown にして次へ進む (サイクルを止めない)。想定外の例外も task ごとに
@@ -530,7 +592,7 @@ def poll_cycle(tasks, *, registry_dir, repo_root, branch_of, poll_seconds=DEFAUL
     now = time.time() if now is None else now
     due = []
     for t in tasks:
-        if t.get('status') not in POLL_STATUSES:
+        if not card_is_watched(t):
             continue
         try:
             record_path(registry_dir, t.get('mission'), t.get('id'))
@@ -539,9 +601,11 @@ def poll_cycle(tasks, *, registry_dir, repo_root, branch_of, poll_seconds=DEFAUL
                 warn(f'ci: skip task with a bad name ({e})')
             continue
         prev = read_record(registry_dir, t['mission'], t['id'], warn=warn)
+        if pr_closed(prev, t.get('pr_number')):
+            continue        # 終端 (MERGED / CLOSED): もう取りに行かない。card の pr_number が変われば pr_closed が False になる
         # card の PR と違う PR の記録は間隔を待たずに取り直す (#314 r2。読み手もその記録は出さない)
-        if (prev is not None and now - prev['observed_at'] < poll_seconds
-                and record_matches_card(prev, t.get('pr_number'))):
+        if (prev is not None and record_matches_card(prev, t.get('pr_number'))
+                and now - prev['observed_at'] < poll_interval(prev, poll_seconds, concluded_seconds)):
             continue
         due.append((prev['observed_at'] if prev else -math.inf, t, prev))
     due.sort(key=lambda x: x[0])
@@ -549,10 +613,17 @@ def poll_cycle(tasks, *, registry_dir, repo_root, branch_of, poll_seconds=DEFAUL
     changed = 0
     by_pr = {}
     deadline = start + budget
-    for _age, t, prev in due[:max_tasks]:
+    spent = 0
+    for _age, t, prev in due:
         remaining = deadline - clock()
         if remaining < 1:
             break
+        pr_key = card_pr(t.get('pr_number'))
+        free = pr_key is not None and (t.get('target_dir') or '', pr_key) in by_pr
+        if not free:
+            if spent >= max_tasks:
+                continue        # 件数は PR 単位。この task は次のサイクルへ (同じ PR を観測済みの task はまだ入る)
+            spent += 1
         try:
             rec = observe_task(t, repo_root=repo_root, branch_of=branch_of, now=now, timeout=GH_TIMEOUT_SECONDS,
                                runner=runner, deadline=deadline, clock=clock, by_pr=by_pr)
@@ -560,6 +631,11 @@ def poll_cycle(tasks, *, registry_dir, repo_root, branch_of, poll_seconds=DEFAUL
             if warn:
                 warn(f"ci: observe {t['mission']}/{t['id']} failed: {type(e).__name__}")
             rec = _unknown(card_pr(t.get('pr_number')), 'internal_error', now)
+        rec = dict(rec)
+        rec.pop('unknown_streak', None)
+        if rec['state'] == 'unknown':       # 連続した回数 (ci-unknown の条件。一過性の失敗で騒がない)
+            was = prev is not None and prev.get('state') == 'unknown' and record_matches_card(prev, t.get('pr_number'))
+            rec['unknown_streak'] = (prev.get('unknown_streak', 1) if was else 0) + 1
         if not write_record(registry_dir, t['mission'], t['id'], rec):
             if warn:
                 warn(f"ci: cannot write {record_path(registry_dir, t['mission'], t['id'])}")
@@ -567,3 +643,165 @@ def poll_cycle(tasks, *, registry_dir, repo_root, branch_of, poll_seconds=DEFAUL
         if record_fingerprint(prev) != record_fingerprint(rec):
             changed += 1
     return changed
+
+
+# ---------------------------------------------------------------------------
+# 通知の元になる事実 (dispatcher が Director に 1 回だけ送る。設計 §2.1・§2.4・§2.5 の移行中の名前)
+# ---------------------------------------------------------------------------
+
+#: 通知の種類 (固定語)。`ci-green` は CI が緑になった事実だけで承認を含意しない (承認 head の比較は PR-D)。
+EVENT_KINDS = ('ci-failed', 'ci-green', 'ci-unknown')
+#: 通知に入れる check 名の最大件数。
+EVENT_MAX_CHECKS = 5
+
+
+def pr_events(tasks, *, registry_dir, now, warn=None):
+    """PR ごとの通知の候補 `(events, closed_prs)`。**gh を呼ばない** (記録を読むだけ)。
+
+    `events`: `{'kind','pr','head','checks','reason'}` の一覧。1 つの PR を指す task が何本あっても 1 つの記録
+    (`observed_at` が最も新しいもの) だけを見る。`closed_prs`: MERGED / CLOSED と記録された PR 番号 (台帳の掃除用)。
+    `ci-green` の条件は門 (`gate_verdict`) が通ること。ここは**知らせる**ためだけに使い、待ちを解く・done にする・
+    Rule 5 / watchdog を黙らせる・割り当てることには使わない (設計 §2.2)。"""
+    newest = {}
+    closed = set()
+    for t in tasks:
+        pr_number = card_pr(t.get('pr_number'))
+        if pr_number is None or t.get('status') not in FOLLOW_STATUSES:
+            continue
+        try:
+            rec = read_record(registry_dir, t['mission'], t['id'], warn=warn, pr_number=pr_number)
+        except Exception:  # noqa: BLE001 — 通知の元の読み取りが想定外でも他の PR を止めない
+            continue
+        if rec is None or rec.get('pr') != pr_number:
+            continue
+        if rec.get('pr_state') in PR_TERMINAL_STATES:
+            closed.add(pr_number)
+            continue
+        if rec['state'] == 'no_pr':
+            continue
+        cur = newest.get(pr_number)
+        if cur is None or rec['observed_at'] > cur['observed_at']:
+            newest[pr_number] = rec
+    events = []
+    for pr_number in sorted(newest):
+        rec = newest[pr_number]
+        head, state = rec['head'], rec['state']
+        if state == 'failed':
+            names = [c['name'] for c in rec['checks'] if c['state'] == 'failed'][:EVENT_MAX_CHECKS]
+            events.append({'kind': 'ci-failed', 'pr': pr_number, 'head': head, 'checks': names, 'reason': None})
+        elif state == 'unknown':
+            if rec.get('unknown_streak', 0) >= UNKNOWN_NOTIFY_STREAK:
+                reason = _clean_name(rec['reason']) if isinstance(rec.get('reason'), str) and rec['reason'] else 'check'
+                events.append({'kind': 'ci-unknown', 'pr': pr_number, 'head': head, 'checks': [], 'reason': reason})
+        elif state == 'passed' and head is not None:
+            ok, _why = gate_verdict(rec, pr_head=head, now=now)
+            if ok:
+                events.append({'kind': 'ci-green', 'pr': pr_number, 'head': head, 'checks': [], 'reason': None})
+    return events, sorted(closed)
+
+
+def event_key(event):
+    """通知台帳のキー `(pr, head, 種類)`。head が変われば (修正 push) 別の通知。unknown は head が無いことがある。"""
+    head = (event.get('head') or 'nohead')[:12]
+    return f"ci-{event['kind']}-pr{event['pr']}-{head}"
+
+
+def event_message(event):
+    """Director への 1 通。PR・head・落ちた check 名 (80 字に切って無害化済み) だけを入れる。"""
+    pr, head = event['pr'], (event.get('head') or '?')[:12]
+    if event['kind'] == 'ci-failed':
+        return (f"[ci-failed] PR #{pr} @{head}: CI が失敗しました。落ちた check: " + (', '.join(event['checks']) or '?')
+                + "。(通知だけです。修正 task の起票は Director の判断)")
+    if event['kind'] == 'ci-green':
+        return (f"[ci-green] PR #{pr} @{head}: CI が全部緑です (承認ではありません)。"
+                "merge は review の所見を読み、plan.sh ci-gate で確かめてから Director が判断してください。")
+    return (f"[ci-unknown] PR #{pr} @{head}: CI の状態を {UNKNOWN_NOTIFY_STREAK} 回続けて確かめられません"
+            f" (理由: {event.get('reason') or 'check'})。gh の認証・ネットワークを確認してください。")
+
+
+# --- main の最新 run (nightly / push) ---
+
+MAIN_RUNS_NAME = '.main-runs.json'
+#: 結論が「落ちた」と言える run の conclusion。
+_RUN_BAD = {'failure', 'timed_out', 'startup_failure', 'cancelled', 'action_required', 'stale'}
+#: 見る event (schedule = nightly の全件・push = main への merge)。
+MAIN_EVENTS = ('schedule', 'push')
+MAIN_RUN_LIMIT = 20
+
+
+def main_runs_path(registry_dir):
+    return ci_dir(registry_dir) / MAIN_RUNS_NAME
+
+
+def parse_main_runs(text):
+    """`gh run list --branch main --json databaseId,headSha,status,conclusion,event,workflowName,createdAt` →
+    `{event: {'id','head','conclusion','workflow'}}` (event ごとに**完了済みの最新**1 件)。形が違えば ValueError
+    (「落ちていない」に倒さない = 呼び出し元は何も言わない)。進行中 (completed でない) の run は飛ばす。"""
+    doc = json.loads(text)
+    if not isinstance(doc, list):
+        raise ValueError('not_list')
+    best = {}
+    for d in doc:
+        if not isinstance(d, dict):
+            raise ValueError('bad_entry')
+        event, status, conclusion = d.get('event'), d.get('status'), d.get('conclusion')
+        head, rid, created = d.get('headSha'), d.get('databaseId'), d.get('createdAt')
+        if not isinstance(event, str) or not isinstance(status, str):
+            raise ValueError('bad_entry')
+        if event not in MAIN_EVENTS or status != 'completed':
+            continue
+        if (not isinstance(head, str) or not _SHA_RE.fullmatch(head) or isinstance(rid, bool)
+                or not isinstance(rid, int) or not isinstance(conclusion, str) or not _iso(created)):
+            raise ValueError('bad_entry')
+        cur = best.get(event)
+        if cur is None or created > cur['created']:
+            best[event] = {'id': rid, 'head': head, 'conclusion': conclusion.lower(), 'created': created,
+                           'workflow': _clean_name(d.get('workflowName'))}
+    return best
+
+
+def main_events(runs):
+    """`parse_main_runs` の結果 → 通知の候補。落ちた run だけ (`kind='ci-failed'`、PR は無い)。"""
+    events = []
+    for event in MAIN_EVENTS:
+        r = runs.get(event)
+        if r is not None and r['conclusion'] in _RUN_BAD:
+            events.append({'kind': 'ci-failed', 'pr': None, 'head': r['head'], 'checks': [r['workflow']],
+                           'reason': event, 'run': r['id']})
+    return events
+
+
+def main_event_key(event):
+    return f"ci-main-{event['reason']}-{event['head'][:12]}"
+
+
+def main_event_message(event):
+    return (f"[ci-failed] main の {event['reason']} run が失敗しました @{event['head'][:12]}"
+            f" (workflow: {event['checks'][0]}, run {event.get('run')})。"
+            "(通知だけです。原因の調査・修正 task の起票は Director の判断)")
+
+
+def fetch_main_runs(*, cwd, timeout=GH_TIMEOUT_SECONDS, runner=subprocess.run):
+    """main の最新の run。`(runs, None)` か `(None, 理由の固定語)`。"""
+    out, err = run_gh(['run', 'list', '--branch', DEFAULT_BASE_BRANCH, '--workflow', 'ci.yml', '--limit', str(MAIN_RUN_LIMIT),
+                       '--json', 'databaseId,headSha,status,conclusion,event,workflowName,createdAt'],
+                      cwd=cwd, timeout=timeout, runner=runner)
+    if err:
+        return None, err
+    try:
+        return parse_main_runs(out), None
+    except ValueError:
+        return None, 'bad_json'
+
+
+def main_poll_due(registry_dir, now, interval=MAIN_POLL_SECONDS):
+    """前回の問い合わせから `interval` 経っていれば True。印が無い・読めないは True (取りに行く側)。"""
+    data = load_json_store(main_runs_path(registry_dir))
+    if is_missing(data) or is_unreadable(data) or not isinstance(data, dict):
+        return True
+    at = data.get('at')
+    return isinstance(at, bool) or not isinstance(at, (int, float)) or not (0 <= now - at < interval)
+
+
+def mark_main_polled(registry_dir, now):
+    return write_told_atomic(main_runs_path(registry_dir), {'at': now})

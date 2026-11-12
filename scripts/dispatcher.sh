@@ -3678,7 +3678,7 @@ def run_ci_poll():
         tasks = []
         for slug in (state.get('active_missions') or []):
             for meta, _ in list_tasks_for_mission(slug):
-                if meta.get('status') in lib_ci_status.POLL_STATUSES:
+                if lib_ci_status.card_is_watched(meta):
                     tasks.append({'mission': slug, 'id': meta['id'], 'status': meta.get('status'),
                                   'pr_number': meta.get('pr_number'), 'target_dir': meta.get('target_dir') or None,
                                   'task_slug': meta.get('task_slug')})
@@ -3707,6 +3707,77 @@ def run_ci_poll():
                 lib_ci_status.clear_task_graph_pending(REGISTRY_DIR)
     except Exception as e:
         log(f"WARNING: ci poll failed: {type(e).__name__}")
+
+
+def _ci_notify_one(key, fp, slug, task_id, message):
+    """ci-failed / ci-green / ci-unknown を 1 通。台帳のキーは (pr, head, 種類)。送れなければ次のサイクルで再送。"""
+    return notify_state_once(key, fp, 'ci-notice', slug, task_id, lambda: message,
+                             director_live=director_live_for_state_notices)
+
+
+def run_ci_notify():
+    """CI の知らせを Director に 1 回だけ送る (設計 knowledge/ci-wait-operations.md §2.1・§2.4。PR-C)。
+
+    元は ①`run_ci_poll` が書いた `registry/ci/` の記録 (PR 単位。gh は呼ばない) ②main の最新の run
+    (nightly / push。`gh run list` を MAIN_POLL_SECONDS ごとに 1 回)。**通知だけ**: 待ちを解く・done にする・
+    Rule 5 / watchdog を黙らせる・割り当てることには使わない (門は `ci-green` を出す条件に lib_ci_status.pr_events の中で使うだけ)。
+    台帳 (notified-state.json) は消してよい (同じ通知が 1 回ずつ再送されるだけ)。PR が MERGED / CLOSED になれば
+    その PR のキーを畳む。想定外の例外は握ってサイクルを止めない。"""
+    try:
+        state = load_state()
+        if is_unreadable(state) or not isinstance(state, dict):
+            return
+        tasks = []
+        for slug in (state.get('active_missions') or []):
+            for meta, _ in list_tasks_for_mission(slug):
+                if lib_ci_status.card_is_watched(meta):
+                    tasks.append({'mission': slug, 'id': meta['id'], 'status': meta.get('status'),
+                                  'pr_number': meta.get('pr_number')})
+        now = time.time()
+        events, closed = lib_ci_status.pr_events(tasks, registry_dir=REGISTRY_DIR, now=now,
+                                                 warn=lambda msg: log(f"WARNING: {msg}"))
+        live_unknown = {e['pr'] for e in events if e['kind'] == 'ci-unknown'}
+        for ev in events:
+            key = lib_ci_status.event_key(ev)
+            fp = fingerprint(ev['pr'], ev.get('head'), ev['kind'])
+            if _ci_notify_one(key, fp, '_ci', f"pr{ev['pr']}", lib_ci_status.event_message(ev)):
+                log(f"{ev['kind']} PR #{ev['pr']} @{(ev.get('head') or '?')[:12]} -> notified director")
+        told = load_told()
+        if not is_unreadable(told):
+            # 解消・終端で台帳のキーを畳む: unknown が解けた PR の ci-unknown / MERGED・CLOSED の PR の全部
+            prefixes = [f'ci-{kind}-pr{pr}-' for pr in closed for kind in lib_ci_status.EVENT_KINDS]
+            stale = [k for k in told if any(k.startswith(p) for p in prefixes)]
+            for k in told:
+                if k.startswith('ci-ci-unknown-pr'):
+                    num = k[len('ci-ci-unknown-pr'):].split('-', 1)[0]
+                    if not num.isdigit() or int(num) not in live_unknown:
+                        stale.append(k)
+            for k in stale:
+                clear_told_key(k)
+        # main の最新 run (Q8): 落ちていれば ci-failed と同じ経路で。完了済みの最新が緑なら古い失敗の台帳を畳む
+        if lib_ci_status.main_poll_due(REGISTRY_DIR, now):
+            lib_ci_status.mark_main_polled(REGISTRY_DIR, now)
+            runs, err = lib_ci_status.fetch_main_runs(cwd=str(REPO_ROOT))
+            if err:
+                if should_notify('ci_main_poll_warn'):
+                    log(f'WARNING: ci: main runs unavailable ({err})')
+                    record_notify('ci_main_poll_warn')
+            else:
+                bad = lib_ci_status.main_events(runs)
+                for ev in bad:
+                    fp = fingerprint(ev['reason'], ev['head'], 'ci-failed')
+                    if _ci_notify_one(lib_ci_status.main_event_key(ev), fp, '_ci', 'ci-main',
+                                      lib_ci_status.main_event_message(ev)):
+                        log(f"ci-failed main {ev['reason']} @{ev['head'][:12]} -> notified director")
+                told = load_told()
+                if not is_unreadable(told):
+                    bad_events = {e['reason'] for e in bad}
+                    for event in lib_ci_status.MAIN_EVENTS:
+                        if event in runs and event not in bad_events:
+                            for k in [k for k in told if k.startswith(f'ci-main-{event}-')]:
+                                clear_told_key(k)
+    except Exception as e:
+        log(f"WARNING: ci notify failed: {type(e).__name__}")
 
 
 # --- CYCLE ENTRY POINT ---
@@ -3811,6 +3882,8 @@ publish_agents()
 dispatch()
 # CI の見える化は dispatch() の成否から独立させる (early return のサイクルでも回す)
 run_ci_poll()
+# CI の知らせ (ci-failed / ci-green / ci-unknown。PR-C)。記録を読むだけ + main の run を 5 分に 1 回
+run_ci_notify()
 # t002 (t020 added the third): all three are queue/registry bookkeeping, not
 # dispatch decisions, and all three must run on every cycle — including the
 # early-return cycles dispatch() takes when there are no active missions.

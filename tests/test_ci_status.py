@@ -216,7 +216,7 @@ def rec(tmp_path, id_="t001", mission="m"):
 def test_pr_number_on_the_card_is_viewed_and_recorded(tmp_path):
     gh = FakeGh()
     assert poll(tmp_path, [task()], gh) == 1
-    assert gh.calls == [["gh", "pr", "view", "313", "--json", "headRefOid,statusCheckRollup"]]
+    assert gh.calls == [["gh", "pr", "view", "313", "--json", "headRefOid,statusCheckRollup,state"]]
     r = rec(tmp_path)
     assert r["state"] == "running" and r["pr"] == 313 and r["head"] == HEAD and r["observed_at"] == NOW
     assert (tmp_path / "ci" / "m__t001.json").exists()
@@ -289,10 +289,12 @@ def test_interval_suppresses_repeat_queries(tmp_path):
 
 
 def test_only_watched_statuses_are_polled(tmp_path):
+    """PR が card に無い task は、Worker が CI を待ちうる 3 つの status だけ (branch から PR を探す)。
+    card に pr_number があれば status 不問 (done を含む。PR-C。tests/test_ci_follow_and_notify.py)。"""
     gh = FakeGh()
-    poll(tmp_path, [task(status=s, id_=f"t00{i}", pr=10 + i) for i, s in enumerate(
+    poll(tmp_path, [task(status=s, id_=f"t00{i}", pr=None) for i, s in enumerate(
         ("pending", "done", "needs_director", "in_progress", "ready_for_verification", "verifying"))], gh)
-    assert len(gh.calls) == 3
+    assert len([c for c in gh.calls if c[2] == "list"]) == 3
 
 
 def test_per_cycle_task_limit_and_oldest_first(tmp_path):
@@ -370,7 +372,7 @@ def test_pr_resolved_from_the_branch_is_viewed_once_per_cycle(tmp_path):
     poll(tmp_path, [task(id_="t001", pr=None), task(id_="t002", pr=None, status="verifying")], gh,
          branch_of=lambda t: "task/m/shared")
     views = [c for c in gh.calls if c[2] == "view"]
-    assert views == [["gh", "pr", "view", "42", "--json", "headRefOid,statusCheckRollup"]]
+    assert views == [["gh", "pr", "view", "42", "--json", "headRefOid,statusCheckRollup,state"]]
     assert rec(tmp_path, "t002")["pr"] == 42
     gh2 = FakeGh(prs='[{"number": 42, "isCrossRepository": false}]')
     poll(tmp_path / "b", [task(id_="t001", pr=42), task(id_="t002", pr=None)], gh2, branch_of=lambda t: "x")
@@ -630,7 +632,7 @@ def disp(tmp_path, monkeypatch):
 def test_dispatcher_cycle_records_ci_and_refreshes_the_task_graph(disp):
     disp["run_ci_poll"]()
     calls = (disp["_tmp"] / "gh_calls.txt").read_text().splitlines()
-    assert calls == ["pr view 313 --json headRefOid,statusCheckRollup"]
+    assert calls == ["pr view 313 --json headRefOid,statusCheckRollup,state"]
     r = ci.read_record(disp["_root"] / "registry", "m", "t001")
     assert r["state"] == "running"
     assert (disp["_tmp"] / "plan_calls.txt").read_text().strip() == "task-graph"

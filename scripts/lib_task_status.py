@@ -76,6 +76,12 @@ AWAITING_DECISION_STATUSES = frozenset(WAITS_ON_DIRECTOR_STATUSES | {'needs_huma
 #: PR の CI を見る status (Worker が PR の CI を待ちうる間。`lib_ci_status` の取得と表示。knowledge/ci-status.md)。
 CI_WATCH_STATUSES = frozenset({'in_progress', 'ready_for_verification', 'verifying'})
 
+#: PR が open な間 CI を見続ける task の status (status 不問 = 語彙の全部。done を含む)。`CI_WATCH_STATUSES` は
+#: 「Worker が CI を待ちうる間」で他の読み手と共有の定義なので変えず、別の集合として 1 か所に置く
+#: (設計 knowledge/ci-wait-operations.md §2.0)。やめる条件は status ではなく PR の state (MERGED / CLOSED)。
+#: 対象は `pr_number` を持つ task だけ (持たない task は `CI_WATCH_STATUSES` の branch 解決の経路)。
+CI_FOLLOW_PR_STATUSES = frozenset(TASK_STATUSES)
+
 #: もう PR 番号を待っていない status (`codex_reviews_awaiting_pr` が数えない)。
 PR_NOT_AWAITED_STATUSES = frozenset({
     'done', 'verified', 'failed', 'skipped', 'verification_failed',

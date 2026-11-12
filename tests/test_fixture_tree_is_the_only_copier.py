@@ -66,6 +66,9 @@ ALLOWED: dict[str, str] = {
 }
 
 
+pytestmark = pytest.mark.structural  # 構造ガード (pytest -m structural。tests/conftest.py に登録)
+
+
 def _candidate_files() -> list[pathlib.Path]:
     files = []
     for pattern in ("tests/*.py", "tests/*.sh", "tests/*.bats", "scripts/test_*.sh"):

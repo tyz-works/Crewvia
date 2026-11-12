@@ -13,6 +13,8 @@ E2 で最初の呼び出し元 (plan.sh の pull) を足すときは `ALLOWED_ME
 
 from __future__ import annotations
 
+import pytest
+
 import pathlib
 import re
 
@@ -28,6 +30,9 @@ ALLOWED_MENTIONS = {"scripts/lib_task_controller.py", "scripts/lib_execution.py"
 
 SCAN_DIRS = ("scripts", "hooks", "agents", "config")
 SCAN_FILES = ("crewvia",)
+
+
+pytestmark = pytest.mark.structural  # 構造ガード (pytest -m structural。tests/conftest.py に登録)
 
 
 def _candidates():

@@ -263,7 +263,7 @@ def test_help_harness_would_notice_a_write(sb):
 
 def _usage_rc(sub):
     # pull (2 = idle) と pr-base / resolve-pr (呼び出し元が `|| exit 1`。2 は idle の意味) は使い方の誤りも exit 1
-    return 1 if sub in ("pull", "pr-base", "resolve-pr") else 2
+    return 1 if sub in ("pull", "pr-base", "resolve-pr", "ci-gate") else 2
 
 
 @pytest.mark.parametrize("sub", SUBCOMMANDS)

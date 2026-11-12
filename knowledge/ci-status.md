@@ -73,3 +73,9 @@ Worker が PR の CI を待っている間、その進み具合を Director と�
 ## 戻し方
 
 PR revert → `scripts/sync-main-checkout.sh`。`registry/ci/` は残ってよい（消してもよい）。tasks.json の `ci` 欄は次の再生成で消える。
+
+## 門（`gate_verdict` / `plan.sh ci-gate`。ci-wait-operations PR-B）
+
+- `lib_ci_status.gate_verdict(record, *, pr_head, now)` は「通す / 通さない + 固定語の理由」を返す**門用の読み口**（表示用の `read_record` / `format_line` とは別）。通すのは記録の head == PR の現 head ∧ 全体 passed ∧ 必須 check `ci-ok` が passed ∧ `observed_at` が 10 分以内のときだけ。それ以外・読めない・取り直せないは全部通さない。設計: `knowledge/ci-wait-operations.md` §2.2。
+- `plan.sh ci-gate <PR> [--target-dir]`: 通せば exit 0 + `ci-gate: PASS PR #N head=<sha>`、通さなければ exit 1 + `ci-gate: DENY PR #N <理由>`。読み取り専用。**この PR では誰も呼ばない**（呼び出し元の追加は PR-C。`tests/test_ci_gate.py::test_nobody_calls_the_gate_yet`）。
+- 「判定に使わない」の文言の改訂（表示用 / 門用の 2 つに割る）は PR-D。それまでは待ちを解く・done にする・Rule 5 / watchdog を黙らせることに使わない。

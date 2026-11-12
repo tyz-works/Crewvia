@@ -203,6 +203,7 @@ ISOLATED_INVOCATIONS: dict[str, list[list[str]]] = {
     "history": [["history", "t001", "--mission", MISSION]],
     "pr-base": [["pr-base", "--mission", MISSION, "--task", "t001"]],
     "resolve-pr": [["resolve-pr", "123"]],
+    "ci-gate": [["ci-gate", "123"]],
 }
 
 

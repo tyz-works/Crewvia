@@ -51,6 +51,9 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 STORE_LIB = 'lib_state_store.py'
 
 
+pytestmark = pytest.mark.structural  # 構造ガード (pytest -m structural。tests/conftest.py に登録)
+
+
 def scan_targets() -> list[pathlib.Path]:
     """検査するファイル。**ディレクトリの glob** で決める (列挙した一覧は、足されたファイルを見落とす)。
     テスト (`test_*` / `tests/`) は対象外 —— 本番の queue / registry を書くコードではない。"""

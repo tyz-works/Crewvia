@@ -183,6 +183,12 @@ ALLOWED_JSON_PARSES: dict[tuple[str, str, str], str] = {
         "(JSON でない・dict でない・head が 40 hex でない) 理由コードを返し、門は通さない",
     ("lib_ci_status.py", "parse_pr_list", "json.loads(text)"):
         _EXTERNAL_RESPONSE + "`gh pr list --json number,isCrossRepository` の stdout。形が違えば ValueError → unknown",
+    ("lib_ci_status.py", "parse_pr_state", "json.loads(text)"):
+        _EXTERNAL_RESPONSE + "`gh pr view --json ...,state` の stdout (parse_view と同じ出力から PR の state を読む)。"
+        "欄が無ければ None (OPEN 扱い)・知らない値は ValueError → unknown (MERGED / CLOSED と取り違えない)",
+    ("lib_ci_status.py", "parse_main_runs", "json.loads(text)"):
+        _EXTERNAL_RESPONSE + "`gh run list --branch main --json ...` の stdout (main の最新 run)。形の検証はこの関数の中 "
+        "(list・各要素の欄の型・sha は 40 hex)。違えば ValueError → 呼び出し元は何も通知しない (落ちていないとも言わない)",
     ("lib_review_engine.py", "extract_cursor_findings", "json.loads(out_text, object_pairs_hook=_no_duplicate_keys)"):
         _EXTERNAL_RESPONSE + "cursor-agent の stdout (JSON 1 個)。デーモン側状態ストアではない。"
         "読めない・形が違う・重複キーなら固定コードで失敗 (cursor は比較専用。失敗は併記だけ)",

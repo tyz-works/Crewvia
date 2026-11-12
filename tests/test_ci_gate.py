@@ -186,7 +186,8 @@ def test_cli_passes_with_the_current_head_in_the_line(repo):
     write_rec(repo, rec(observed=time.time() - 5))
     before = snapshot(repo.root / "queue"), snapshot(repo.root / "registry")
     p = gate(repo, "313")
-    assert (p.returncode, p.stdout) == (0, f"ci-gate: PASS PR #313 head={HEAD}\n"), p.stderr
+    assert (p.returncode, p.stdout) == (
+        0, f"ci-gate: PASS PR #313 head={HEAD}\nci-gate: approved_head no_approval\n"), p.stderr
     assert (snapshot(repo.root / "queue"), snapshot(repo.root / "registry")) == before    # 読み取り専用
 
 

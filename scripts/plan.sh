@@ -3532,7 +3532,8 @@ def cmd_ci_gate(args):
     設計: `knowledge/ci-wait-operations.md` §2.2。通すとき exit 0 で `ci-gate: PASS PR #N head=<40 桁>` を 1 行、
     通さないとき **exit 1** で `ci-gate: DENY PR #N <理由の固定語>` を 1 行 (stdout)。使い方の誤り・記録が無い・
     gh が使えない・読めない、はすべて「通さない」(exit 1)。判定は `lib_ci_status.gate_verdict` の 1 か所
-    (ここに条件を書き写さない)。待ちを解く・done にする・Rule 5 / watchdog を黙らせることには使わない。
+    (ここに条件を書き写さない)。PASS のときだけ 2 行目に承認 head の判定 `ci-gate: approved_head ok|no_approval|
+    approved_head_mismatch` (`lib_ci_status.approval_verdict`。exit コードには効かない)。待ちを解く・done にする・Rule 5 / watchdog を黙らせることには使わない。
 
     記録は card の `pr_number` == N の task (active mission。`--target-dir` / `TARGET_DIR` / 無ければ crewvia 本体で
     絞る = `resolve-pr` と同じ規則) の `registry/ci/` の記録のうち `observed_at` が最も新しいもの。PR の現 head は
@@ -3562,10 +3563,14 @@ def cmd_ci_gate(args):
     except SystemExit:
         deny('unknown:state_unreadable')
     newest = None
+    reviews = []
     for slug in list(state.get('active_missions') or []):
         for meta, _body in list_tasks(slug, quiet=True):
             if meta.get('pr_number') != pr_number or (meta.get('target_dir') or None) != effective_target:
                 continue
+            if set(meta.get('skills') or ()) & set(_CI_STATUS.APPROVAL_SKILLS):
+                reviews.append({'status': meta.get('status'), 'completed_at': meta.get('completed_at'),
+                                'result': parse_task_body(_body)[1]})
             rec = _CI_STATUS.read_record(registry_dir(), slug, meta['id'], pr_number=pr_number)
             if rec is not None and (newest is None or rec['observed_at'] > newest['observed_at']):
                 newest = rec
@@ -3578,6 +3583,9 @@ def cmd_ci_gate(args):
     if not ok:
         deny(reason)
     print(f"ci-gate: PASS PR #{pr_number} head={head}")
+    # 承認 head の判定 (設計 §2.5)。exit コードは CI の門のまま (PASS = 0)。承認が無い・違うことは 2 行目の固定語で知らせる
+    approved, why = _CI_STATUS.approval_verdict(reviews, pr_head=head)
+    print("ci-gate: approved_head " + ('ok' if approved else why))
 
 
 #: pull の domain error → exit code (execution.md §4.4)。exit 2 は pull では「タスクなし (idle)」の意味なので、

@@ -3638,6 +3638,7 @@ def run_telegram_cycle():
 # 取得はここ 1 か所。結果は registry/ci/<mission>__<task>.json。plan.sh status・tasks.json・通知は記録を読むだけ。
 # **判定には使わない**。gh の失敗・timeout は unknown にして先へ進む (1 サイクルの上限は lib_ci_status の定数)。
 import lib_ci_status  # noqa: E402
+import lib_history  # noqa: E402
 
 
 def _ci_branch_of(task):
@@ -3710,7 +3711,7 @@ def run_ci_poll():
 
 
 def _ci_notify_one(key, fp, slug, task_id, message):
-    """ci-failed / ci-green / ci-unknown を 1 通。台帳のキーは (pr, head, 種類)。送れなければ次のサイクルで再送。"""
+    """ci-failed / ci-green / merge-ready / ci-unknown を 1 通。台帳のキーは (pr, head, 種類)。送れなければ次のサイクルで再送。"""
     return notify_state_once(key, fp, 'ci-notice', slug, task_id, lambda: message,
                              director_live=director_live_for_state_notices)
 
@@ -3729,13 +3730,29 @@ def run_ci_notify():
             return
         tasks = []
         for slug in (state.get('active_missions') or []):
-            for meta, _ in list_tasks_for_mission(slug):
+            for meta, body in list_tasks_for_mission(slug):
                 if lib_ci_status.card_is_watched(meta):
-                    tasks.append({'mission': slug, 'id': meta['id'], 'status': meta.get('status'),
-                                  'pr_number': meta.get('pr_number')})
+                    item = {'mission': slug, 'id': meta['id'], 'status': meta.get('status'),
+                            'pr_number': meta.get('pr_number')}
+                    skills = set(meta.get('skills') or ()) & set(lib_ci_status.APPROVAL_SKILLS)
+                    if skills:      # 承認 head の元 (review 系の task だけ。Result を読む)
+                        item.update(skills=sorted(skills), completed_at=meta.get('completed_at'),
+                                    result=lib_history.result_section(body))
+                    tasks.append(item)
         now = time.time()
+        # 緑を知らせる直前に PR の現 head を取り直す (#377 レビュー P3-1)。gh の予算は 1 サイクル MAX_TASKS_PER_CYCLE 回、
+        # 同じ PR は 1 回 (キャッシュ)。予算切れ・失敗は理由つきのエラー = その PR は今回は出さず次のサイクルで再試行。
+        head_cache = {}
+
+        def head_of(pr):
+            if pr not in head_cache:
+                if len(head_cache) >= lib_ci_status.MAX_TASKS_PER_CYCLE:
+                    return None, 'gh_budget'
+                head_cache[pr] = lib_ci_status.fetch_pr_head(pr, cwd=str(REPO_ROOT))
+            return head_cache[pr]
+
         events, closed = lib_ci_status.pr_events(tasks, registry_dir=REGISTRY_DIR, now=now,
-                                                 warn=lambda msg: log(f"WARNING: {msg}"))
+                                                 warn=lambda msg: log(f"WARNING: {msg}"), head_of=head_of)
         live_unknown = {e['pr'] for e in events if e['kind'] == 'ci-unknown'}
         for ev in events:
             key = lib_ci_status.event_key(ev)

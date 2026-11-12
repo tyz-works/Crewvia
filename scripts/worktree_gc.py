@@ -381,10 +381,6 @@ def load_target_dirs(registry: str) -> tuple[list, str]:
 #: **allowlist** — 未知の名前で読めないものは「取れなかった」に倒す (足したいときはここに理由付きで足す)。
 UNOBSERVABLE_BUT_NOT_A_WORKER = frozenset({
     'ssh-agent', 'sshd', 'sshd-session', 'systemd', '(sd-pam)', 'gpg-agent',
-    # `--fork` で daemon 化するとき chdir("/") するので worktree を掴まない。読めないのは、setgid の
-    # `op` (1Password CLI) が session bus 無しで autolaunch した子が dumpable でなくなるため。
-    # `op` を呼ぶたびに 1 つ増え、終わらない (t021 / knowledge に経緯)。
-    'dbus-daemon',
 })
 
 
@@ -394,6 +390,8 @@ def _cwd_unreadable_but_harmless(pid: str) -> Optional[str]:
     * 消えた (`/proc/<pid>` が無い) / zombie・終了処理中 (state Z / X、または cmdline が空 = mm が無い):
       もう cwd を持たない
     * allowlist の常駐プロセス (`UNOBSERVABLE_BUT_NOT_A_WORKER`)
+    * argv まで見て許すもの: `dbus-daemon --fork` (chdir "/" する) と `op daemon` (掴んでいないとは確かめていない。
+      Worker ではない、まで)
     """
     base = PROC_ROOT / pid
     try:
@@ -413,8 +411,18 @@ def _cwd_unreadable_but_harmless(pid: str) -> Optional[str]:
         return f'comm {comm}'
     # `op daemon` (1Password CLI の常駐。setgid なので dumpable でない)。comm だけでは `op run -- <何でも>`
     # と区別できないので、argv が正確に ['op', 'daemon'] のものだけ許す (`op run` は Worker の子になりうる)。
+    # 注意: ここで言えるのは「Worker ではない」まで。op daemon が worktree を cwd に掴んでいないことは
+    # 確かめていない (cwd は読めない)。Worker ではないので、在圏の証拠にならない = 取れなかった扱いにしない。
     if comm == 'op' and cmdline.rstrip(b'\0').split(b'\0') == [b'op', b'daemon']:
-        return 'op daemon'
+        return 'op daemon (Worker ではない)'
+    # dbus-daemon は `--fork` のときだけ。`--fork` は daemon 化で chdir("/") するので worktree を掴まない。
+    # 読めないのは、setgid の `op` (1Password CLI) が session bus 無しで autolaunch した子が dumpable でなく
+    # なるため (`op` を呼ぶたびに 1 つ増え終わらない。knowledge/worktree-gc.md「dbus-daemon と op daemon」)。
+    # `--nofork` は起動時の cwd を持ち続けるので、comm だけで許さず、読めなければ「取れなかった」に倒す。
+    if comm == 'dbus-daemon':
+        argv = cmdline.rstrip(b'\0').split(b'\0')
+        if b'--fork' in argv and b'--nofork' not in argv:
+            return 'dbus-daemon --fork'
     return None
 
 

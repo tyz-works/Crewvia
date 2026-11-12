@@ -448,10 +448,20 @@ class TestProcessScan:
         monkeypatch.setattr(gc.os, "readlink", deny)
         assert gc.scan_process_cwds() == ([], "")
 
-    def test_an_unreadable_dbus_daemon_does_not_fail_the_scan(self, tmp_path, monkeypatch):
-        """op が autolaunch した dbus-daemon は dumpable でなく cwd を読めない (t021)。"""
+    @pytest.mark.parametrize("cmdline,ok", [
+        (b"dbus-daemon\0--fork\0--session\0", True),
+        (b"dbus-daemon\0--session\0--fork\0--print-address\0", True),
+        (b"dbus-daemon\0--nofork\0--session\0", False),          # 起動時の cwd を持ち続ける
+        (b"dbus-daemon\0--session\0", False),                      # --fork が無い
+        (b"dbus-daemon\0--fork\0--nofork\0", False),
+        (b"dbus-daemon\0--forking\0", False),                      # 前方一致で許さない
+        (b"dbus-daemon\0", False),
+    ])
+    def test_an_unreadable_dbus_daemon_is_harmless_only_with_fork(self, tmp_path, monkeypatch, cmdline, ok):
+        """op が autolaunch した dbus-daemon は dumpable でなく cwd を読めない (t021)。許すのは `--fork` (chdir "/") だけ。
+        `--nofork` は cwd を持ち続けるので、読めなければ『取れなかった』(fail-closed を弱めない。#376 のレビュー P3)。"""
         root = self._proc(tmp_path, monkeypatch)
-        self._entry(root, 500, comm="dbus-daemon")
+        self._entry(root, 500, comm="dbus-daemon", cmdline=cmdline)
         real_readlink = os.readlink
 
         def deny(path, *a, **kw):
@@ -459,7 +469,29 @@ class TestProcessScan:
                 raise PermissionError(13, "denied", str(path))
             return real_readlink(path, *a, **kw)
         monkeypatch.setattr(gc.os, "readlink", deny)
-        assert gc.scan_process_cwds() == ([], "")
+        found, problem = gc.scan_process_cwds()
+        assert (problem == "") is ok
+        if not ok:
+            assert "500" in problem
+
+    def test_a_readable_nofork_dbus_daemon_is_still_collected(self, tmp_path, monkeypatch):
+        """読めるなら allowlist に関係なく cwd を集める (--nofork が worktree を掴んでいれば在圏として数える)。"""
+        root = self._proc(tmp_path, monkeypatch)
+        target = tmp_path / "wt"
+        target.mkdir()
+        d = self._entry(root, 501, comm="dbus-daemon", cmdline=b"dbus-daemon\0--nofork\0")
+        (d / "cwd").symlink_to(target)
+        found, problem = gc.scan_process_cwds()
+        assert problem == "" and found == [(501, os.path.realpath(target))]
+
+    def test_op_daemon_is_documented_as_not_a_worker_and_the_referenced_doc_exists(self):
+        """(2)(3) op daemon は『掴んでいない』ではなく『Worker ではない』と書く・コードが指す knowledge の節が実在する。"""
+        root = pathlib.Path(gc.__file__).resolve().parent.parent
+        src = (root / "scripts" / "worktree_gc.py").read_text(encoding="utf-8")
+        doc = (root / "knowledge" / "worktree-gc.md").read_text(encoding="utf-8")
+        assert "Worker ではない" in src and "確かめていない" in src
+        assert "knowledge/worktree-gc.md" in src and "dbus-daemon と op daemon" in src
+        assert "--nofork" in doc and "Worker ではない" in doc and "argv まで見て許すもの" in doc
 
     def test_an_unreadable_unknown_process_still_fails_the_scan(self, tmp_path, monkeypatch):
         root = self._proc(tmp_path, monkeypatch)

@@ -73,6 +73,15 @@ memory `fail-closed-discard-vs-hold` / `evidence-for-destructive-decisions` の�
   シェル) は dumpable なので読める。**未知の名前で読めないものは「取れなかった」に倒す** (denylist にしない —
   memory `approve-judgment-needs-allowlist-and-scope`)。足したいときはコードの allowlist に理由付きで足す。
 
+- **argv まで見て許すもの** (comm だけでは区別できない。どちらも 1Password CLI `op` が session bus 無しで autolaunch した子で、
+  setgid の親から来るため dumpable でなく、同じ uid でも cwd を読めない。`op` を呼ぶたびに 1 つ増え、終わらない — 2026-11-12 の実機で
+  自分の uid の dbus-daemon が 135 個。これを飛ばさないと `process-scan-failed` で全 worktree が keep になる):
+  - **dbus-daemon**: argv に `--fork` があり `--nofork` が無いものだけ。`--fork` は daemon 化で `chdir("/")` するので worktree を掴まない
+    (自前で起動した `dbus-daemon --fork` の cwd が `/` であることを実機で確認)。`--nofork` は起動時の cwd を持ち続けるので許さない
+    (読めなければ「取れなかった」)。
+  - **op daemon**: argv が正確に `['op', 'daemon']` のものだけ (`op run -- <何でも>` は Worker の子になりうるので許さない)。
+    ここで言えるのは「**Worker ではない**」まで。worktree を掴んでいないこと自体は cwd が読めないので確かめていない。
+
 `/proc` が無い環境 (macOS) は `lsof -a -d cwd -Fpn`。出力が空なら「見えなかった」であって「無い」ではない。
 **lsof の終了コードが 0 以外なら、stdout に何か出ていても不完全なスキャンとして拒否する** (PR#239 F3、
 2026-09-27)。lsof は一部のプロセスの検査に失敗しても集められた分の部分出力を出しつつ非 0 を返すことが

@@ -448,6 +448,50 @@ class TestProcessScan:
         monkeypatch.setattr(gc.os, "readlink", deny)
         assert gc.scan_process_cwds() == ([], "")
 
+    def test_an_unreadable_dbus_daemon_does_not_fail_the_scan(self, tmp_path, monkeypatch):
+        """op が autolaunch した dbus-daemon は dumpable でなく cwd を読めない (t021)。"""
+        root = self._proc(tmp_path, monkeypatch)
+        self._entry(root, 500, comm="dbus-daemon")
+        real_readlink = os.readlink
+
+        def deny(path, *a, **kw):
+            if str(path).endswith("/500/cwd"):
+                raise PermissionError(13, "denied", str(path))
+            return real_readlink(path, *a, **kw)
+        monkeypatch.setattr(gc.os, "readlink", deny)
+        assert gc.scan_process_cwds() == ([], "")
+
+    def test_an_unreadable_unknown_process_still_fails_the_scan(self, tmp_path, monkeypatch):
+        root = self._proc(tmp_path, monkeypatch)
+        self._entry(root, 500, comm="dbus-daemon-lookalike")
+        real_readlink = os.readlink
+
+        def deny(path, *a, **kw):
+            if str(path).endswith("/500/cwd"):
+                raise PermissionError(13, "denied", str(path))
+            return real_readlink(path, *a, **kw)
+        monkeypatch.setattr(gc.os, "readlink", deny)
+        found, problem = gc.scan_process_cwds()
+        assert found == [] and "500" in problem
+
+    @pytest.mark.parametrize("cmdline,ok", [
+        (b"op\0daemon\0", True),
+        (b"op\0run\0--\0bash\0", False),
+        (b"op\0daemon\0--x\0", False),
+    ])
+    def test_only_op_daemon_is_allowed_among_op_processes(self, tmp_path, monkeypatch, cmdline, ok):
+        root = self._proc(tmp_path, monkeypatch)
+        self._entry(root, 500, comm="op", cmdline=cmdline)
+        real_readlink = os.readlink
+
+        def deny(path, *a, **kw):
+            if str(path).endswith("/500/cwd"):
+                raise PermissionError(13, "denied", str(path))
+            return real_readlink(path, *a, **kw)
+        monkeypatch.setattr(gc.os, "readlink", deny)
+        found, problem = gc.scan_process_cwds()
+        assert (problem == "") is ok
+
     def test_without_proc_and_lsof_the_scan_fails_rather_than_finding_nothing(self, tmp_path, monkeypatch):
         monkeypatch.setattr(gc, "PROC_ROOT", tmp_path / "no-such-proc")
 

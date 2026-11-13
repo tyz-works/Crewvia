@@ -161,6 +161,33 @@ unobservable フラグで返す、(b) fail-closed な向き (行動しない側�
 の見直しは reason の**論法**を読む (「〜だから安全」という結論だけでなく、その結論が
 このガードの基準のどれに当たるかを名指しできるか)。
 
+## 2026-11-13 Rohan発見: `is_missing` は `is_unreadable` の部分集合。if/elif の順を逆にすると elif が死ぬ
+
+crewvia の `lib_task_cards.Unreadable` は「読めなかった」を表す値で、`is_unreadable(x)` は
+`Unreadable` 全般（権限・I/O・型違い・ENOENT すべて）に True、`is_missing(x)` はそのうち
+**ENOENT だけ**に True（`is_missing` ⇒ `is_unreadable` は常に真、逆は成り立たない）。
+
+```python
+if is_unreadable(ledger):   # ENOENT もここで全部捕まる
+    ...
+elif is_missing(ledger):    # 絶対に実行されない（上の if が真でないと elif に来ない）
+    ...
+```
+
+`scripts/lib_stall.py` の `run_cycle` がこの順で書かれていて、「台帳がまだ存在しない（普通の
+運用）」が「台帳が壊れている」と誤報され続けた（t006。dispatcher の 5 秒サイクルで永久に出る
+WARNING）。正しい順は `lib_escalation.py` の同じ形の分岐（`if is_missing: {} / elif
+is_unreadable: WARNING + {}`）。**`is_missing` を先に判定する**（部分集合を先に剥がしてから、
+残りを広い集合で受ける）。逆に、`if is_unreadable: のブロックの中で if is_missing:` とネストする
+形（`lint_plan.py` / `worktree_gc.py` / `lib_git_policy.py`）や `is_unreadable(x) and not
+is_missing(x)` で明示的に除外する形（`lib_mux.py` / `lib_telegram.py`）はどちらも安全 —
+危ないのは「`is_unreadable` が先に来る if/elif チェーンに `is_missing` を後から足す」形だけ。
+
+同じ「部分集合の述語 2 つを if/elif で順序違いに書く」バグ形は、他に自前で作った述語の組
+（例: 「全体の失敗」と「その中の特定ケース」）でも起きうる。if/elif を書くときは、先に来る
+条件が後の条件を**包含していないか**を確認する癖をつけること（包含していれば、後の条件は
+狭める側を先に置く）。
+
 ## よく使うパターン
 
 <!-- 再利用できるコード・コマンド・手順 -->

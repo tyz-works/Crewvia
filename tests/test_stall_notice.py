@@ -17,7 +17,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
 import lib_stall as S  # noqa: E402
-from lib_task_cards import is_unreadable  # noqa: E402
+from lib_task_cards import is_missing, is_unreadable  # noqa: E402
 from lib_task_status import TASK_STATUSES  # noqa: E402
 
 SLUG = "m1"
@@ -217,6 +217,22 @@ def test_notify_failure_is_retried_next_cycle(tmp_path):
     assert env.run(2000) == []
     env.notify_ok = True
     assert env.run(2005) == [SLUG]
+
+
+def test_missing_ledger_is_not_treated_as_corrupt(tmp_path):
+    """台帳が ENOENT (まだ書かれていない。通常運用) で「台帳が壊れている」と誤報しない (t006。
+    実害: is_unreadable を is_missing より先に判定すると、is_missing は is_unreadable の厳密な
+    部分集合 (ENOENT だけ) なので elif は絶対に実行されない死んだ枝になり、停滞 mission が
+    無い間は台帳が一度も作られないため警告が永久に続いていた)。"""
+    env = Env(tmp_path)
+    assert not env.ledger_path().exists()
+    assert is_missing(S.read_ledger(env.reg))
+    logs = []
+    all_tasks = [(SLUG, c) for c in env.cards]
+    S.run_cycle(env.reg, all_tasks, {SLUG: {"t001"}}, {SLUG: {"t001": "done", "t002": "blocked"}}, [SLUG], {SLUG},
+                1000, 900, notify=env.notify, live_keys=env.live, log=logs.append)
+    assert logs == []
+    assert not any("壊れている" in m for m in logs)
 
 
 def test_corrupt_ledger_is_rebuilt_not_trusted(tmp_path):

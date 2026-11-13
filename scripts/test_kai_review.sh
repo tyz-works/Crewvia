@@ -994,11 +994,11 @@ fi
 # t002 (差し戻し): fetch / update-ref -d も worktree add / remove と同じロックを通す。
 # fetch は全 worktree の HEAD を読むので、ロックの外だと並行する add と commondir で競合する。
 echo ""
-echo "--- F3c: fetch / update-ref -d が wt_git (repo 単位ロック) を通る ---"
-f3c_bare="$(grep -nE '^[^#]*git -C [^ ]+ (fetch|update-ref|worktree (add|remove))' "$KAI_REVIEW_SH" | grep -v 'wt_git' | grep -vE 'git -C "\$gcd|rev-parse' || true)"
-# wt_git の本体 (git -C "$repo" "$@") は上の正規表現に当たらない。残りは 0 件のはず
+echo "--- F3c: fetch / update-ref -d が crewvia_wt_git (repo 単位ロック) を通る ---"
+f3c_bare="$(grep -nE '^[^#]*git -C [^ ]+ (fetch|update-ref|worktree (add|remove))' "$KAI_REVIEW_SH" | grep -v 'crewvia_wt_git' | grep -vE 'git -C "\$gcd|rev-parse' || true)"
+# crewvia_wt_git の本体 (git -C "$repo" "$@") は上の正規表現に当たらない。残りは 0 件のはず
 if [[ -z "$f3c_bare" ]]; then
-  pass "kai-review.sh の fetch / update-ref / worktree add・remove はすべて wt_git 経由"
+  pass "kai-review.sh の fetch / update-ref / worktree add・remove はすべて crewvia_wt_git 経由"
 else
   fail "ロックの外の git 呼び出しが残っている: $f3c_bare"
 fi

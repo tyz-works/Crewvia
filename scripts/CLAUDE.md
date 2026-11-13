@@ -249,6 +249,12 @@ lib ごとの**破ってはいけない契約**の要約。理由・経緯・全
   `tests/test_git_decisions_go_through_policy.py` が (ファイル, 関数) の allowlist で赤にする（寄せない箇所は理由つき。
   文書は agents/*.md・skills/*/SKILL.md の fenced code block だけ）。**task id は `tNNN` の形**（Resolver はそれ以外を拒否する）。
 
+## worktree ロック（`lib_worktree_lock.sh`。t001）
+
+- repo 単位の flock の**唯一の定義**（`crewvia_wt_git <repo> <git args>`）。`kai-review.sh`（review の spawn）と `git-helpers.sh`（Worker の pull）が source し、worktree add / remove・fetch・update-ref -d・`worktree list` は全部これを通す（ロックの外に素の git を残さない: `tests/test_worktree_lock_shared.py`）。
+- ロックは `<git common dir>/crewvia-worktree.lock`（`flock -w 120`）。取れなければ git を実行せず exit 99（fail-closed。git-helpers.sh は W5、kai-review.sh は needs-director）。flock が無い環境は素通り。
+- 旧名 `kai-review-worktree.lock` も旧 → 新の固定順で取る（旧コードで起動済みの review と排他するため）。旧コードの review が全部入れ替わったら lib の `LEGACY` の行ごと消してよい。
+
 ## status の語彙（`lib_task_status.py`）
 
 - task の status の語彙・終端 / 手放した / 判断待ちの集合・コマンドごとの「受け付ける元の status」

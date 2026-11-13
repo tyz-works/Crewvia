@@ -294,30 +294,15 @@ RESULT_FILE=""           # card に全文を残す Result / 理由のファイ�
 FETCH_LOCAL_REF=""
 BASE_FETCH_LOCAL_REF=""  # t006: origin/main を都度 fetch する一時 ref (下記参照)
 
-# --- worktree add / remove の repo 単位ロック (t002 / F3) ---
-# 同じ repo への `git worktree add` / `remove` を同時に走らせると .git/worktrees/ の作成・削除が
-# 競合し「failed to read .git/worktrees/<name>/commondir」で落ちる (CI で実測)。dispatcher が
-# review を 2 本同時に spawn する本番でも同じ形で誤って needs-director になるので、
-# git common dir 配下のロックファイルで直列化する。fetch / update-ref -d も同じロックを通す
-# (fetch は全 worktree の HEAD を読むので、並行する add / remove と同じ commondir の競合で落ちうる)。flock が無い環境ではロックなしで素通り。
-wt_git() {
-  local repo="$1"; shift
-  local gcd lock
-  gcd="$(git -C "$repo" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || gcd=""
-  if [[ -n "$gcd" && -d "$gcd" ]] && command -v flock >/dev/null 2>&1; then
-    lock="${gcd}/kai-review-worktree.lock"
-    (
-      flock -w 120 9 || exit 99
-      git -C "$repo" "$@"
-    ) 9>>"$lock"
-  else
-    git -C "$repo" "$@"
-  fi
-}
+# --- worktree add / remove の repo 単位ロック (t002 / F3, t001 で git-helpers.sh と共有に) ---
+# 定義は scripts/lib_worktree_lock.sh の crewvia_wt_git 1 か所 (Worker の plan.sh pull = git-helpers.sh も同じロックを通す)。
+# fetch / update-ref -d / worktree add・remove はすべて crewvia_wt_git 経由で呼ぶ。
+# shellcheck source=lib_worktree_lock.sh
+source "${SCRIPT_DIR}/lib_worktree_lock.sh" || { echo "kai-review.sh: scripts/lib_worktree_lock.sh を読めません" >&2; exit 1; }
 
 cursor_drop_wt() {
   if [[ -n "$CURSOR_WT" && -d "$CURSOR_WT" ]]; then
-    wt_git "${WORK_DIR:-$REPO_ROOT}" worktree remove --force "$CURSOR_WT" 2>/dev/null || rm -rf "$CURSOR_WT"
+    crewvia_wt_git "${WORK_DIR:-$REPO_ROOT}" worktree remove --force "$CURSOR_WT" 2>/dev/null || rm -rf "$CURSOR_WT"
   fi
   CURSOR_WT=""
 }
@@ -343,14 +328,14 @@ cleanup() {
   [[ -n "$CLAUDE_DIFF_DIR" ]] && rm -rf "$CLAUDE_DIFF_DIR"
   cursor_drop_wt
   if [[ -n "$REVIEW_WT" && -d "$REVIEW_WT" ]]; then
-    wt_git "${WORK_DIR:-$REPO_ROOT}" worktree remove --force "$REVIEW_WT" 2>/dev/null \
+    crewvia_wt_git "${WORK_DIR:-$REPO_ROOT}" worktree remove --force "$REVIEW_WT" 2>/dev/null \
       || rm -rf "$REVIEW_WT"
   fi
   if [[ -n "$FETCH_LOCAL_REF" ]]; then
-    wt_git "${WORK_DIR:-$REPO_ROOT}" update-ref -d "$FETCH_LOCAL_REF" 2>/dev/null || true
+    crewvia_wt_git "${WORK_DIR:-$REPO_ROOT}" update-ref -d "$FETCH_LOCAL_REF" 2>/dev/null || true
   fi
   if [[ -n "$BASE_FETCH_LOCAL_REF" ]]; then
-    wt_git "${WORK_DIR:-$REPO_ROOT}" update-ref -d "$BASE_FETCH_LOCAL_REF" 2>/dev/null || true
+    crewvia_wt_git "${WORK_DIR:-$REPO_ROOT}" update-ref -d "$BASE_FETCH_LOCAL_REF" 2>/dev/null || true
   fi
 }
 trap cleanup EXIT
@@ -463,14 +448,14 @@ _info "Repo root (unaffected by review): ${WORK_DIR}"
 #   - PR番号を含む固定名だと同一 PR の同時 review で衝突し得るため $$ (PID) で一意化する。
 FETCH_LOCAL_REF="refs/kai-review-fetch/pr-${PR_NUM}-$$"
 _info "Fetching refs/pull/${PR_NUM}/head → ${FETCH_LOCAL_REF} ..."
-if ! wt_git "$WORK_DIR" fetch --force origin "refs/pull/${PR_NUM}/head:${FETCH_LOCAL_REF}" 2>&1; then
+if ! crewvia_wt_git "$WORK_DIR" fetch --force origin "refs/pull/${PR_NUM}/head:${FETCH_LOCAL_REF}" 2>&1; then
   fail_needs_director "NEEDS FIX: git fetch origin refs/pull/${PR_NUM}/head failed for PR#${PR_NUM}"
 fi
 
 # --- 専用 review worktree を作成 (F1/F1b, PR#180) ---
 REVIEW_WT="$(mktemp -d "${TMPDIR:-/tmp}/kai-review-wt.XXXXXX")"
 _info "Creating isolated review worktree at ${REVIEW_WT} (detached at ${FETCH_LOCAL_REF})..."
-if ! wt_git "$WORK_DIR" worktree add --detach "$REVIEW_WT" "$FETCH_LOCAL_REF" 2>&1; then
+if ! crewvia_wt_git "$WORK_DIR" worktree add --detach "$REVIEW_WT" "$FETCH_LOCAL_REF" 2>&1; then
   fail_needs_director "NEEDS FIX: git worktree add failed for PR#${PR_NUM} (${FETCH_LOCAL_REF})"
 fi
 
@@ -510,7 +495,7 @@ if ! PR_BASE_BRANCH="$(python3 "${SCRIPT_DIR}/lib_git_policy.py" pr-base --lines
   fail_needs_director "NEEDS FIX: cannot resolve the PR base for ${MISSION_SLUG}/${TASK_ID} — ${PR_BASE_BRANCH:-no output} (fail-closed, no fallback to main)"
 fi
 BASE_FETCH_LOCAL_REF="refs/kai-review-fetch/base-${PR_BASE_BRANCH//\//_}-$$"
-if ! wt_git "$WORK_DIR" fetch --force origin "${PR_BASE_BRANCH}:${BASE_FETCH_LOCAL_REF}" 2>&1; then
+if ! crewvia_wt_git "$WORK_DIR" fetch --force origin "${PR_BASE_BRANCH}:${BASE_FETCH_LOCAL_REF}" 2>&1; then
   fail_needs_director "NEEDS FIX: git fetch origin ${PR_BASE_BRANCH} failed while resolving diff base"
 fi
 DIFF_BASE="$BASE_FETCH_LOCAL_REF"
@@ -779,7 +764,7 @@ _run_cursor_review() {
   printf '%s' "$DIFF_CONTENT" > "${CURSOR_DIFF_DIR}/review.diff" || { CURSOR_FAIL="diff_write_failed"; return 1; }
   : > "$CURSOR_OUT_FILE"; : > "$CURSOR_ERR_FILE"
   CURSOR_WT="$(mktemp -d "${TMPDIR:-/tmp}/kai-review-cursor-wt.XXXXXX")"
-  if ! wt_git "$WORK_DIR" worktree add --detach "$CURSOR_WT" "$FETCH_LOCAL_REF" >/dev/null 2>&1; then
+  if ! crewvia_wt_git "$WORK_DIR" worktree add --detach "$CURSOR_WT" "$FETCH_LOCAL_REF" >/dev/null 2>&1; then
     CURSOR_FAIL="worktree_create_failed"; return 1
   fi
   local fp_before fp_after

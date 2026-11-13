@@ -165,7 +165,8 @@ ALLOWED_WRITES: dict[tuple[str, str], tuple[int, str]] = {
     # ---- 入口のスクリプト・hooks ---------------------------------------------------------------------
     ('git-helpers.sh', '<bash>'): (1, R_DIR + "。git worktree の親 dir (`mkdir -p \"$(dirname \"$worktree_path\")\"`)。queue の外。"
                                       "コメント中の `<<X` が走査を打ち切っていたときは見えなかった (t035)"),
-    ('kai-review.sh', '<bash>'): (50, R_MARK + "。reviewer の heartbeat と、review の一時ファイル / worktree (" + R_TMP + ")。"
+    ('lib_worktree_lock.sh', '<bash>'): (2, R_LOCK + "。t001: worktree add / remove・fetch を repo 単位で直列化する flock のロックファイル (.git 配下の空ファイル `8>>` / `9>>`。新名 crewvia-worktree.lock と移行用の旧名 kai-review-worktree.lock)。状態を持たない・queue / registry ではない。"),
+    ('kai-review.sh', '<bash>'): (49, R_MARK + "。reviewer の heartbeat と、review の一時ファイル / worktree (" + R_TMP + ")。"
                                  "card に残す Result の一時ファイル (mktemp。queue / registry ではない)。"
                                  "t002: git worktree add / remove を直列化する flock のロックファイル (.git 配下の空ファイル `9>>`。状態を持たない・queue / registry ではない)。"
                                  "t080: agy の diff / 出力 / stderr の一時 dir・ファイル (mktemp。worktree の外・queue / registry ではない)。"

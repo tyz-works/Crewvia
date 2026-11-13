@@ -13,6 +13,16 @@ set -euo pipefail
 # 等) 失敗する (既定値に倒さない)。queue の場所は CREWVIA_QUEUE (無ければ <repo root>/queue)。
 
 
+# repo 単位の worktree ロック (crewvia_wt_git)。kai-review.sh と共有の唯一の定義。
+# worktree add / remove・fetch・worktree list は全部 crewvia_wt_git 経由 (ロックの外で呼ばない)。
+_crewvia_here="$(cd -P -- "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd -P)"
+# shellcheck source=lib_worktree_lock.sh
+source "${_crewvia_here}/lib_worktree_lock.sh" || {
+  echo "git-helpers.sh: scripts/lib_worktree_lock.sh を読めません" >&2
+  return 1 2>/dev/null || exit 1
+}
+
+
 # _crewvia_repo_root — main repo root (works in linked worktrees too)
 _crewvia_repo_root() {
   local git_common_dir
@@ -128,7 +138,7 @@ _crewvia_worktree_lookup() {
   local want="${1:-}" want_real result
   want_real="$(_crewvia_physical_dir "$want")" || { echo none; return 0; }
   # git の出力を NUL のままパイプで読む (一時ファイルを使わない)。git が失敗したら pipefail で関数が失敗する。
-  result="$(git worktree list --porcelain -z | {
+  result="$(crewvia_wt_git . worktree list --porcelain -z | {
     local field cur_path="" cur_ref="detached" cur_prun=0 found="" real
     while IFS= read -r -d '' field; do
       case "$field" in
@@ -202,7 +212,7 @@ crewvia_create_worktree() {
     return 1
   fi
 
-  git fetch origin 2>/dev/null || echo "warning: git fetch origin failed, using local state" >&2
+  crewvia_wt_git . fetch origin 2>/dev/null || echo "warning: git fetch origin failed, using local state" >&2
 
   # base を選ぶ 1 行 (規則: remote-tracking があれば remote、無ければ local に倒して警告。lib_git_policy.task_base と同じ。
   # 観測は git に任せる)。候補の名前は Resolver が決める。
@@ -218,12 +228,12 @@ crewvia_create_worktree() {
   }
 
   if git show-ref --verify --quiet "refs/heads/${branch}"; then
-    git worktree add "$worktree_path" "$branch" >&2 || {
+    crewvia_wt_git . worktree add "$worktree_path" "$branch" >&2 || {
       echo "crewvia_create_worktree: W5: git worktree add failed for existing branch ${branch}" >&2
       return 1
     }
   else
-    git worktree add -b "$branch" "$worktree_path" "$base" >&2 || {
+    crewvia_wt_git . worktree add -b "$branch" "$worktree_path" "$base" >&2 || {
       echo "crewvia_create_worktree: W5: git worktree add -b failed for ${branch} from ${base}" >&2
       return 1
     }
@@ -250,12 +260,12 @@ crewvia_remove_worktree() {
   resolved="$(_crewvia_resolve_task "$mission_slug" "$task_id" "$task_slug" "$repo_root")" || return 1
   { IFS= read -r _b; IFS= read -r worktree_path; } <<<"$resolved"
 
-  if ! git worktree list --porcelain | grep -qF "worktree ${worktree_path}"; then
+  if ! crewvia_wt_git . worktree list --porcelain | grep -qF "worktree ${worktree_path}"; then
     echo "crewvia_remove_worktree: worktree not found, skipping: $worktree_path" >&2
     return 0
   fi
 
-  git worktree remove --force "$worktree_path"
+  crewvia_wt_git . worktree remove --force "$worktree_path"
 }
 
 

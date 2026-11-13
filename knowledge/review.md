@@ -175,6 +175,16 @@ PR の diff に次のどれかが現れたら、**queue / registry / config の�
 
 <!-- Worker が発見したノウハウをここに追記 -->
 
+- **kai-review.sh 自身の `approved_head:` 実装 (t001, mission 20261113-approval-gate-holes, PR #389)**:
+  `HEAD_BEFORE` は review worktree を作った直後（`git worktree add` の後・`DIFF_CONTENT` を読む前）に
+  `git rev-parse --verify "$FETCH_LOCAL_REF"` で控える（`gh pr view --json headRefOid` ではなく、既に
+  fetch 済みのローカル ref から取る —— 追加の gh 呼び出しを避けつつ、fetch した実体と確実に一致する）。
+  再確認は Result 全文を組み立て終えた直後・`plan.sh done` を呼ぶ `if/elif/else` 分岐の直前
+  （LGTM = `NEEDS_FIX -eq 0` のときだけ）で `gh pr view --json headRefOid` を呼び直す。一致すれば
+  `approved_head: <sha>` を、食い違う・確認できない（gh 失敗・形が 40 桁小文字 sha でない）場合は
+  再レビューが要る旨の日本語 1 文を、どちらも `>> "$RESULT_FILE"` で**末尾に追記**する
+  （approved_head: 行が Result の最後の非空行、という不変条件を保つため、構築済みの全文の後に足す）。
+
 ## 注意事項
 
 <!-- 失敗パターン・ハマりやすい落とし穴 -->

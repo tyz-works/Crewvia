@@ -161,6 +161,24 @@ unobservable フラグで返す、(b) fail-closed な向き (行動しない側�
 の見直しは reason の**論法**を読む (「〜だから安全」という結論だけでなく、その結論が
 このガードの基準のどれに当たるかを名指しできるか)。
 
+## 2026-11-13 Rohan発見: 「active mission だけを見る」ループは、完了条件が merge を含まない運用で必ず穴になる
+
+crewvia の mission 完了条件 (`agents/director.md` §11) は「全 task が done」だけで、PR の merge は
+含まない。つまり Director は「archive → 個々の PR を merge」の順で動ける。`plan.sh ci-gate` と
+dispatcher の `run_ci_poll` / `run_ci_notify` はどれも `state.get('active_missions')` だけを
+走査していたので、archive した瞬間に CI の記録・承認 head・通知が全部引けなくなっていた
+(実例: 2026-11-13 PR #385)。
+
+教訓: 「active mission の task を処理する」ループを書くときは、**その mission が archive された後も
+処理対象が存在しうるか** (今回は『完了していない PR』) を先に確認すること。存在しうるなら、
+`active_missions` だけを見るループは全部同じ穴を持つ — 1 箇所直して終わりにしない。
+
+コストを抑える手筋: 毎サイクル走る側 (dispatcher) は archive 配下を総なめにせず、**既に記録がある
+対象だけ逆引きする** (`registry/ci/<mission>__<task>.json` のファイル名を `rpartition('__')` で
+分解し、mission が active でなければ archive 側のパスを直接開く)。手動・まれな操作側 (`plan.sh
+ci-gate`) は全走査でよい (13 mission / 90 task の実測で約 65ms)。どちらも一見似た「もっと広く見る」
+直しに見えるが、呼ばれる頻度で許容コストが 2 桁以上違うので、同じ直し方を両方に使い回さないこと。
+
 ## よく使うパターン
 
 <!-- 再利用できるコード・コマンド・手順 -->

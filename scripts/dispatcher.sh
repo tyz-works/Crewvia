@@ -3696,6 +3696,8 @@ def ci_line_for(slug, task_id):
 
 
 _CI_DEADLINE = [None]    # この dispatcher サイクルの CI 全体の締め切り (monotonic)。poll と head の取り直しで共有
+_CI_ARCHIVED_MISSIONS = [None]    # このサイクルの archive discovery の結果。poll が計算し、notify が使い回す (下の
+                                   # `_archived_ci_tasks` の docstring。`run_ci_poll` の先頭で None に戻す = サイクルごとに 1 回)
 
 
 def _ci_base_item(slug, meta):
@@ -3793,9 +3795,21 @@ def _archived_ci_missions(active_missions):
 
 def _archived_ci_tasks(active_missions):
     """`(slug, meta, body)` の一覧。`_archived_ci_missions` が選んだ mission を丸ごと開き、`card_is_watched`
-    の card を全部拾う (individual card の registry/ci 記録の有無は見ない。上の docstring 参照)。"""
+    の card を全部拾う (individual card の registry/ci 記録の有無は見ない。上の docstring 参照)。
+
+    discovery (`_archived_ci_missions`) はこのサイクルに 1 回だけ計算し (`_CI_ARCHIVED_MISSIONS`)、`run_ci_poll` の
+    呼び出しと `run_ci_notify` の呼び出しの両方がそれを使い回す (codex-review t002 3 周目 P2: poll が、ある mission の
+    最後の watched card を終端 (MERGED/CLOSED) として書いた直後に、notify が独立に discovery をやり直すと、その
+    書き込みだけでその mission が『記録が全部終端』になって除外され、notify がこの終端記録を一度も受け取れない =
+    `pr_events` の `closed` に入らず、通知台帳の該当 PR のキーが畳まれないまま残り続ける。poll の書き込み**前**の
+    discovery を notify にも渡せば、終端になった直後のこの 1 サイクルだけ notify もまだ mission を見られ、
+    `closed` 経由で畳める。次のサイクルの poll は書き込み後の状態から discovery をやり直すので、正しく除外される)。
+    `_CI_ARCHIVED_MISSIONS[0]` は `run_ci_poll` の先頭で毎サイクル None に戻す。None のまま呼ばれたら
+    (`run_ci_poll` を経ない単体呼び出し等) ここで計算して埋める。"""
+    if _CI_ARCHIVED_MISSIONS[0] is None:
+        _CI_ARCHIVED_MISSIONS[0] = _archived_ci_missions(active_missions)
     out = []
-    for mission in _archived_ci_missions(active_missions):
+    for mission in _CI_ARCHIVED_MISSIONS[0]:
         tasks_dir = ARCHIVE_DIR / mission / 'tasks'
         for meta, body in list_task_cards(tasks_dir, warn=lambda msg: log(f"WARNING: {msg}")):
             if lib_ci_status.card_is_watched(meta):
@@ -3805,6 +3819,7 @@ def _archived_ci_tasks(active_missions):
 
 def run_ci_poll():
     _CI_DEADLINE[0] = time.monotonic() + 2 * lib_ci_status.CYCLE_BUDGET_SECONDS
+    _CI_ARCHIVED_MISSIONS[0] = None    # このサイクルの discovery をやり直す (notify が書き込み前の結果を使い回す前に)
     try:
         import lib_daemon_watch
         state = load_state()

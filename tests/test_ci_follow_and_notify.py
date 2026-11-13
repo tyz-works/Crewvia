@@ -420,6 +420,26 @@ def test_periodic_sweep_does_not_reopen_a_mission_whose_watched_cards_all_have_r
     assert disp["_archived_ci_missions"]([]) == set()
 
 
+def test_notify_still_sees_a_record_poll_just_turned_terminal_in_the_same_cycle(d):
+    """codex-review (t002) 3 周目 P2: poll がこのサイクルで mission の最後の watched card を終端 (MERGED) と
+    記録した直後、notify が独立に discovery をやり直すと、その書き込みだけで mission が『記録が全部終端』に
+    なって除外され、notify はこの終端記録を一度も受け取れない (`pr_events` の `closed` に入らず、通知台帳の
+    その PR のキーが畳まれないまま残り続ける)。poll と notify が同じサイクルの discovery (書き込み**前**の
+    結果) を共有していれば、終端になった直後のこの 1 サイクルで畳めること。"""
+    cycle(d, view_state(GREEN, "OPEN"))        # active な間に ci-green を 1 回送る (通知台帳にキーができる)
+    assert [m[:10] for m in sent()] == ["[ci-green]"]
+    told = json.loads((d["_root"] / "registry" / "daemons" / "notified-state.json").read_text())
+    assert any("pr313" in k for k in told)
+
+    (d["_root"] / "queue" / "missions" / "m").rename(d["_root"] / "queue" / "archive" / "m")
+    (d["_root"] / "queue" / "state.yaml").write_text("active_missions: []\ndefault_mission: null\n")
+
+    cycle(d, view_state(GREEN, "MERGED"))      # 同じサイクル呼び出しの中で poll が MERGED を書き、notify が追う
+    assert ci.read_record(d["_root"] / "registry", "m", "t001")["pr_state"] == "MERGED"
+    told = json.loads((d["_root"] / "registry" / "daemons" / "notified-state.json").read_text())
+    assert not any("pr313" in k for k in told), "終端になった PR の通知台帳のキーが畳まれていない"
+
+
 def test_running_sends_nothing_and_merged_pr_stops_everything(d):
     cycle(d, view_state(ROLLUP_RUNNING, "OPEN"))
     assert sent() == []

@@ -105,7 +105,7 @@ def review_task(id_="t002", status="done", at="2026-11-13T10:00:00Z", result=Non
 
 def write_green(tmp_path, id_="t001", pr=313, head=HEAD):
     r = {"pr": pr, "head": head, "state": "passed", "checks": [chk("pytest"), chk("ci-ok")], "observed_at": NOW,
-         "summary": "s", "pr_state": "OPEN"}
+         "summary": "s", "pr_state": "OPEN", "scope": ""}
     assert ci.write_record(tmp_path, "m", id_, r)
 
 
@@ -159,7 +159,7 @@ def test_approval_is_compared_with_the_refetched_head_not_the_record(tmp_path):
 
 def test_fetch_is_not_made_for_prs_that_are_not_green(tmp_path):
     ci.write_record(tmp_path, "m", "t001", {"pr": 313, "head": HEAD, "state": "failed", "checks": [chk("ci-ok", "failed")],
-                                            "observed_at": NOW, "summary": "s", "pr_state": "OPEN"})
+                                            "observed_at": NOW, "summary": "s", "pr_state": "OPEN", "scope": ""})
     calls = []
     events(tmp_path, [task(status="done")], head_of=lambda pr: calls.append(pr) or (HEAD, None))
     assert calls == []
@@ -305,7 +305,7 @@ def test_no_refetch_for_candidates_already_in_the_ledger(tmp_path):
 def test_rotate_changes_which_pr_is_refetched_first(tmp_path):
     for i, pr in enumerate((1, 2, 3)):
         ci.write_record(tmp_path, "m", f"t00{i + 1}", {"pr": pr, "head": HEAD, "state": "passed", "checks": [chk("ci-ok")],
-                                                       "observed_at": NOW, "summary": "s", "pr_state": "OPEN"})
+                                                       "observed_at": NOW, "summary": "s", "pr_state": "OPEN", "scope": ""})
     tasks = [task(id_=f"t00{i + 1}", status="done", pr=pr) for i, pr in enumerate((1, 2, 3))]
     order = {}
     for rot in (0, 1):

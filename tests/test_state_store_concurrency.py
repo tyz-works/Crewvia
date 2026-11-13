@@ -59,7 +59,10 @@ def test_concurrent_claims_never_double_the_projection(tmp_path):
     res = _run(q, "claim", names, ITER)
     claimed = sum(r["claimed"] for r in res)
     released = sum(r["released"] for r in res)
-    assert claimed >= PROCS                                            # 空虚でない: 実際に取り合った
+    # 空虚でない: 取る → 手放す → 取り直す、が実際に起きた。決定的な下限: transaction は flock で待つだけで
+    # 諦めない・最初の 1 回は必ず pending を見て取り・持ち主は次の自分の回で必ず手放す・ITER >= 3 なので、
+    # 負荷がどうでも claimed >= 2 / released >= 1。取った総数が PROCS 以上、は負荷で割れる (CI で 5 < 6)
+    assert claimed >= 2 and released >= 1
     assert claimed - released in (0, 1)                                # 取った数 - 手放した数 = いま持っている数
     meta = sc.read_meta(q, MISSION, "t001")
     slots = [p.name for p in (q / "assignments").iterdir()

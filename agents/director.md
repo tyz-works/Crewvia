@@ -1020,8 +1020,12 @@ printf '%s\n' "$GATE"   # 2 行目の approved_head の判定も必ず読む
 #    gh pr view で取り直すと、門を引いた後に入った push を拾って「誰も通していない head」を merge しうる
 HEAD_SHA="$(printf '%s\n' "$GATE" | sed -n 's/^ci-gate: PASS PR #[0-9][0-9]* head=\([0-9a-f]\{40\}\)$/\1/p')"
 [ -n "$HEAD_SHA" ] || { echo "門の出力から head を読めない。merge しない" >&2; exit 1; }
+# 3. 承認 head を**検査する**。ci-gate は no_approval / approved_head_mismatch でも exit 0 + PASS を返す
+#    （門は CI の緑しか見ない）。ここで止めないと、承認の後に push された head を merge しうる
+printf '%s\n' "$GATE" | grep -qx 'ci-gate: approved_head ok' \
+  || { echo "承認 head が揃っていない。merge しない（下の『承認が無いまま merge する場合』を読む）" >&2; exit 1; }
 gh pr merge "$PR" --squash --match-head-commit "$HEAD_SHA"
-# 3. merge 後は主 checkout を同期（ff + 必要な daemon の restart まで 1 本）
+# 4. merge 後は主 checkout を同期（ff + 必要な daemon の restart まで 1 本）
 scripts/sync-main-checkout.sh
 ```
 
@@ -1033,6 +1037,12 @@ scripts/sync-main-checkout.sh
 - `ci-gate` が通さないときは merge しない。理由は固定語: `running`（CI 実行中。待つ）/ `failed`（修正 task）/ `unknown:<理由>`（gh を確認）/ `none` / `no_required_check` / `head_mismatch`（push 後の古い記録。次のサイクルを待つ）/ `stale`（記録が古い。再度引く）、承認側は `no_approval` / `approved_head_mismatch`
 - 承認 head は review 系 task（review / codex-review / qa）の最後の Result の末尾行 `approved_head: <sha>`。review の後に修正が push されたら承認は無効（`approved_head_mismatch`）— **Director が自分で直したものも merge 前に review に回す**
 - **「要修正」の review は done でも承認ではない**（`approved_head:` 行が無い → `no_approval`）。所見を読んで修正 task を足す
+- **承認が無いまま merge する場合**（手順 3 で止まったとき）: `ci-gate` は CI の緑しか見ないので
+  `no_approval` / `approved_head_mismatch` でも exit 0 + PASS を返す。**だから手順 3 で明示的に止めている**。
+  それでも merge すると決めたなら、①review の所見を自分で読み ②なぜ機械的な承認が無くてよいのかを
+  判断した上で、手順 3 を飛ばして手順 2 の `HEAD_SHA` を指して merge する。
+  **「ci-gate が exit 0 だったから」は理由にならない**（門は承認を見ていない）。
+  `approved_head_mismatch`（承認の後に push があった）で飛ばすのは特に危ない — その head は誰も読んでいない
 - 緑でも merge 前に review の所見は自分で読む（`[ci-green]` を受けたとき・承認行が無いときは特に）
 - merge が分類器に拒否されたら迂回せず、ユーザーに確認する（§16）
 

@@ -256,29 +256,54 @@ QA が最後に done する mission は多いので、**承認するつもりな
 **merge はしない。CI の完走も待たない。** CI を見るのは dispatcher で、結果は Director に通知される
 （`ci-failed` / `ci-green` / `merge-ready` / `ci-unknown`）。QA の責務は確かめて所見を残すところまで。
 
-**head はテストを始める前に控える。** テスト後に `headRefOid` を取り直すと、
-**試していない head を承認する**ことになる（PR #383 codex-review P1 と同型）:
+### 置き場所: `## QA Gate` の**直前**（後ろに置くと読まれない）
+
+`lib_history.result_section()` は `## Result` の次に現れた**行頭 `## ` の見出しで Result 節を切る**。
+`## QA Gate` はその見出しなので、**`## QA Gate` から後ろは Result 節の外**になる。
+`approved_head:` をそこに置くと `lib_ci_status.approved_head()` に届かず、必ず `no_approval` になる。
+
+`## QA Gate` の見出し自体は `###` に変えられない — `plan.sh done` の検証（`_validate_qa_gate`）が
+`^##\s+QA\s+Gate\s*$` を必須にしているので、変えると done が FAIL する。
+**両方を満たす置き方は 1 つだけ: `approved_head:` 行を `## QA Gate` の直前（Result 節の最後の行）に置く。**
+
+```
+QA結果: [対象: <タスクタイトル>]
+...（所見）...
+
+approved_head: <40 桁の小文字 sha>
+
+## QA Gate
+
+checkpoint: <名前> | required: yes | result: observed
+```
+
+- `qa_checkpoints` が宣言されていない task（`## QA Gate` を書かない）では、Result の**最後の行**に置く
+- 所見の本文でも行頭 `## ` を使わない（`###` 以下にする）。使うとそこで Result 節が切れる
+
+### sha: **自分がテストした commit**（リモートの head ではない）
+
+QA は**ローカルの checkout** の差分とコードを検証する（Step 1 の `DIFF_REF`）。
+リモートの PR head をテスト前後で比べても、**ローカルが古い A のままで PR が既に B なら前後とも B** になり、
+A をテストして B を承認してしまう（PR #385 codex-review P1）。**ローカルの HEAD と照合する**:
 
 ```bash
 PR=<PR番号>
-HEAD_BEFORE="$(gh pr view "$PR" --json headRefOid -q .headRefOid)"   # Step 1 の時点で控える
+HEAD_BEFORE="$(gh pr view "$PR" --json headRefOid -q .headRefOid)"
+LOCAL="$(git rev-parse HEAD)"
+[ "$LOCAL" = "$HEAD_BEFORE" ] || echo "テスト対象がPRのheadと違う。先に $HEAD_BEFORE を checkout するか、承認しない"
+
 # ── ここでテストする ──
-HEAD_AFTER="$(gh pr view "$PR" --json headRefOid -q .headRefOid)"    # 承認の直前に確かめる
-[ "$HEAD_AFTER" = "$HEAD_BEFORE" ] || echo "テスト中に push された。承認しない"
+
+[ "$(git rev-parse HEAD)" = "$LOCAL" ] || echo "テスト中にローカルが動いた。承認しない"
+[ "$(gh pr view "$PR" --json headRefOid -q .headRefOid)" = "$LOCAL" ] || echo "テスト中に push された。承認しない"
 ```
 
-一致し、かつ承認するときだけ、Result の**最後の行**に次の 1 行を置く（`## QA Gate` セクションより**後**）:
+3 つとも一致したときだけ `approved_head: $LOCAL` を書く。**書くのは「自分が実際に動かした commit」**で、
+`gh pr view` で取り直した値ではない。
 
-```
-approved_head: <HEAD_BEFORE の 40 桁の小文字 sha>
-```
-
-- **Result 本文では行頭 `## ` の見出しを使わない**（`###` 以下を使う）。`lib_history.result_section` は
-  最初の行頭 `## ` で Result 節を切るため、`approved_head:` 行が節の外に出て `no_approval` になる。
-  `## QA Gate` を書く task では、**`approved_head:` 行を `## QA Gate` と同じ節の中（＝ Result の最後の行）**に置く
 - 問題あり・未実施の必須チェックポイントが残る・判断を Director に委ねるときは**書かない**
-- 省略形・大文字は読まれない。本文の途中に書いた sha も読まれない（最終行の完全一致だけ）
-- 一致しなかった・承認の後に修正が push された場合は `approved_head_mismatch` になり、
-  未検証の head は merge されない（fail-closed）
+- 省略形・大文字は読まれない。本文の途中に書いた sha も読まれない（Result 節の最終行の完全一致だけ）
+- 食い違ったら承認せず、所見は残して done し、再テストが要ることを Director に伝える
+- 承認の後に修正が push されれば `approved_head_mismatch` になり、未検証の head は merge されない（fail-closed）
 
 設計: `knowledge/ci-wait-operations.md` §2.5 / `knowledge/ci-status.md` / `agents/worker.md`「review の手順」。

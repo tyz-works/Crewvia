@@ -619,15 +619,12 @@ def extract_trailing_body_section(body):
     lines = body.splitlines()
     result_seen = False
     trailing_start = None
-    fenced = []
     for i, line in enumerate(lines):
         if re.match(r'^##\s+(Description|Result)\s*$', line, re.IGNORECASE):
-            if not result_seen and re.match(r'^##\s+Result\s*$', line, re.IGNORECASE):
+            if re.match(r'^##\s+Result\s*$', line, re.IGNORECASE):
                 result_seen = True
-                fenced = _HISTORY.fence_mask(lines[i + 1:])   # Result の中身から数える (result_section と同じ)
-                fence_base = i + 1
             continue
-        if result_seen and not fenced[i - fence_base] and re.match(r'^##\s+\S', line):
+        if result_seen and re.match(r'^##\s+\S', line):
             trailing_start = i
             break
     if trailing_start is None:
@@ -639,7 +636,7 @@ _SECTION_LINE_RE = re.compile(r'^##\s+\S')
 _BODY_HEADER_RE = re.compile(r'^##\s+(Description|Result)\s*$', re.IGNORECASE)
 #: card の本文の末尾に残してよい節の見出し (`## ` の後ろがこれで始まるもの)。それ以外の `## ` 節は、前の Result の本文の
 #: 一部 (Worker が Result の中に書いた見出し) の残骸なので、done / fail が本文を組み直すときに持ち越さない (t005)。
-KNOWN_APPENDIX_HEADINGS = _HISTORY.KNOWN_APPENDIX_HEADINGS
+KNOWN_APPENDIX_HEADINGS = ('Needs-Director 詳細', 'Verification', 'Pre-Compact Snapshot')
 
 
 def demote_section_headings(text):
@@ -650,10 +647,8 @@ def demote_section_headings(text):
     報告 (`## QA Gate` など) を書いた Worker の done を止めない・中身は失われない・読み口を 1 か所のまま保てる。
     検証 (QA Gate / required_evidence) は下げる前の本文で行う。"""
     out = []
-    lines = (text or '').split('\n')
-    fenced = _HISTORY.fence_mask(lines)      # 閉じたコードフェンスの中は触らない (閉じないものはフェンスと数えない)
-    for line, in_fence in zip(lines, fenced):
-        if not in_fence and _SECTION_LINE_RE.match(line) and not _BODY_HEADER_RE.match(line):
+    for line in (text or '').split('\n'):
+        if _SECTION_LINE_RE.match(line) and not _BODY_HEADER_RE.match(line):
             line = '#' + line
         out.append(line)
     return '\n'.join(out)
@@ -667,9 +662,8 @@ def keep_known_appendices(trailing):
     if not trailing:
         return ''
     sections, cur = [], None
-    tlines = trailing.split('\n')
-    for line, in_fence in zip(tlines, _HISTORY.fence_mask(tlines)):
-        if not in_fence and _SECTION_LINE_RE.match(line) and not _BODY_HEADER_RE.match(line):
+    for line in trailing.split('\n'):
+        if _SECTION_LINE_RE.match(line) and not _BODY_HEADER_RE.match(line):
             cur = [line]
             sections.append(cur)
         elif cur is not None:

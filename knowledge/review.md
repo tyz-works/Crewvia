@@ -35,10 +35,16 @@ HEAD_AFTER="$(gh pr view "$PR" --json headRefOid -q .headRefOid)"    # ④ 承�
    `BASE_REF` は `gh pr view "$PR" --json baseRefName -q .baseRefName`。base を決め打たない）
 5. **`approved_head:` 行は Result の最後の非空行にする。** 後ろに所見・ログを足さない。
    行頭 `## ` の見出しは `plan.sh done` が保存時に `### ` へ自動で下げる（#382 の
-   `demote_section_headings`）ので、本文に見出しを書いても Result 節は途中で切れない。
+   `demote_section_headings`）ので、本文に見出しを書いても Result 節は途中で切れない
+   （ただし見出しは `### ` 以下を使うのが推奨）。
    自動で下がる前は `lib_history.result_section` が最初の行頭 `## ` で節を切っていて、
    `approved_head:` 行が節の外に出て `no_approval` になっていた
    （実例: mission 20261113-ci-wait-ops-3 t002 の再レビュー）
+6. **worktree の branch を切り替えない**（`git checkout` / `gh pr checkout` をしない）。PR は
+   `gh pr diff` か `git fetch origin pull/N/head:refs/remotes/origin/prN` で読み、手元に branch を作らない。
+   detach して試すなら一時 worktree を作り、終わったら消す。理由: 2026-11-13 に review が worktree を
+   pr388 / pr387 に切り替えたまま終え、次の pull が W3（`path is a worktree of refs/heads/pr388`）で
+   止まり needs_director になった
 
 > 旧手順（`gh pr merge --squash --delete-branch` を review Worker が試み、拒否されたら `needs-director`）は廃止。
 > 「CI が緑になるまで Worker が待つ」形をやめたので、merge できる瞬間に Worker がいない。

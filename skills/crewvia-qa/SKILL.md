@@ -273,7 +273,7 @@ approved_head: <40 桁の小文字 sha>
 ```
 
 - 本文の行頭 `## ` は `plan.sh done` が保存時に `### ` へ自動で下げる（#382 の `demote_section_headings`）。
-  `## QA Gate` もそうなるので Result 節は途中で切れない。**QA Gate の検証は下げる前の本文で行われる**ので、
+  `## QA Gate` もそうなるので Result 節は途中で切れない（それ以外の見出しは `### ` 以下を使うのが推奨）。**QA Gate の検証は下げる前の本文で行われる**ので、
   見出しは `## QA Gate` のまま書いてよい（`_validate_qa_gate` が `^##\s+QA\s+Gate\s*$` を必須にしている）
 - **守るべき不変条件は 1 つだけ: `approved_head:` 行が Result の最後の非空行であること。**
   後ろに所見・ログ・チェックポイント行を足さない

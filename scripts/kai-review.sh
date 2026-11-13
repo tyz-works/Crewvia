@@ -453,6 +453,17 @@ if ! git -C "$WORK_DIR" worktree add --detach "$REVIEW_WT" "$FETCH_LOCAL_REF" 2>
   fail_needs_director "NEEDS FIX: git worktree add failed for PR#${PR_NUM} (${FETCH_LOCAL_REF})"
 fi
 
+# --- 承認 head を控える (knowledge/review.md 手順①。diff を読む前に控える) ---
+# approved_head に書く sha はこの時点の値。done を呼ぶ直前にもう一度取り直して
+# 一致を確かめる (下の「承認 head の再確認」)。
+HEAD_BEFORE="$(git -C "$WORK_DIR" rev-parse --verify "$FETCH_LOCAL_REF" 2>&1)" || {
+  fail_needs_director "NEEDS FIX: git rev-parse ${FETCH_LOCAL_REF} failed for PR#${PR_NUM} — ${HEAD_BEFORE}"
+}
+if [[ ! "$HEAD_BEFORE" =~ ^[0-9a-f]{40}$ ]]; then
+  fail_needs_director "NEEDS FIX: unexpected head sha for PR#${PR_NUM}: ${HEAD_BEFORE}"
+fi
+_info "PR#${PR_NUM} head before review: ${HEAD_BEFORE}"
+
 # --- diff base の取得 (t006) ---
 # 旧実装 (`codex exec review --base main`) はローカルの `main` ブランチを直接
 # 参照していた。実機確認 (t006, 2026-09-09): 本番の主リポジトリで local main
@@ -1321,6 +1332,27 @@ RESULT_FILE="$(mktemp "${TMPDIR:-/tmp}/kai-review-result.XXXXXX")"
     done
   fi
 } > "$RESULT_FILE"
+
+# --- 承認 head の再確認 (knowledge/review.md 手順④。LGTM 経路でだけ) ---
+# done を呼ぶ直前にもう一度 PR の現在の head を取り、レビュー開始時に控えた HEAD_BEFORE と
+# 一致するときだけ approved_head を書く。approved_head: 行は Result の最後の非空行でなければ
+# ならない (唯一の不変条件) ので、全文を組み立てた後に追記する。要修正の経路では書かない。
+if [[ $NEEDS_FIX -eq 0 ]]; then
+  if CURRENT_HEAD="$(gh pr view "$PR_NUM" --json headRefOid --jq '.headRefOid' 2>&1)" \
+     && [[ "$CURRENT_HEAD" =~ ^[0-9a-f]{40}$ ]]; then
+    if [[ "$CURRENT_HEAD" == "$HEAD_BEFORE" ]]; then
+      printf '\napproved_head: %s\n' "$HEAD_BEFORE" >> "$RESULT_FILE"
+    else
+      _warn "PR#${PR_NUM} head changed during review (reviewed ${HEAD_BEFORE}, now ${CURRENT_HEAD}) — not approving"
+      printf '\nレビュー中に push があったため承認しません（再レビューが必要です。レビューした head: %s / 現在の head: %s）。\n' \
+        "$HEAD_BEFORE" "$CURRENT_HEAD" >> "$RESULT_FILE"
+    fi
+  else
+    _warn "could not re-confirm PR#${PR_NUM} head before approving — not approving"
+    printf '\nレビュー中に push があったか確認できなかったため承認しません（再レビューが必要です。レビューした head: %s）。\n' \
+      "$HEAD_BEFORE" >> "$RESULT_FILE"
+  fi
+fi
 
 if [[ $DRY_RUN -eq 1 ]]; then
   # F6, PR#180: plan.sh には一切書き込まず、判定結果を人が読める形で表示するだけ。

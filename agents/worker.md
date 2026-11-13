@@ -618,7 +618,7 @@ requires_approval に該当 → type: improvement でTaskvia /api/log に投稿�
 **`queue/missions/**/tasks/tNNN.md` を自分で直接編集してはいけない。** 特に `cat >> ... <<'EOF'` のような heredoc での追記は、**過去に 2 回、実際に Worker をハングさせている**（review skill の Worker が 42 分間、research skill の Worker が 9 分以上、CPU は回ったまま無応答になった）。この禁止は `hooks/pre-tool-use.sh` の構造的ガードでも強制されており（`queue/missions/**/tasks/*.md` への `>` / `>>` / heredoc / `sed -i` / `tee` は deny され、`plan.sh done` を使うよう促すメッセージが返る）、Bash しか使えない skill（次項）にとっては唯一の正規記録手段でもある。このガードは `plan.sh done` / `gh pr comment` の引数として該当パスを引用しただけの報告コマンドまで deny しないよう、クォート内の引用テキストを判定対象から除外している（t019）。ただし変数展開（`F=queue/missions/.../t001.md; cat >> "$F"`）、`dd of=...`、`python3 -c "open(...).write(...)"`、相対パスの先頭に `queue/missions/` が現れない `cd` 併用形は捕捉できない既知の残存リスク — このガードは最終防波堤であり、`plan.sh done` 経由での記録が一次防御である前提は変わらない。
 
 - **`review` / `research` / `verify` / `planning` skill は要注意**: `config/skill-permissions.yaml` でこれらの skill は `Edit` / `Write` / `MultiEdit` を deny されており、**ファイルを書く手段が Bash しかない**。だからといって heredoc で task ファイルに直接書き込もうとせず、`plan.sh done --result-file - --execution <ex-…>`（クォート付きヒアドキュメント）で結果を渡すこと。他のファイル（レポート・knowledge 追記等、書き込みが許可された対象）には通常通り Bash 経由での作成も選択肢になるが、task ファイルだけは例外なく `plan.sh` 経由にすること。
-- **1 行制約があるのは `plan.sh needs-director` の reason だけ**（frontmatter の `needs_director_reason` フィールドに直接書かれるため、改行を含めると task ファイルの frontmatter が壊れミッション全体が停止する）。`plan.sh done` の result にはこの制約は無い。長い説明・複数の見出し・箇条書きを含む Result 全文をそのまま `plan.sh done` に渡してよい（見出しは `###` 以下にする。行頭の `##` は task ファイルの Result 節を切ってしまう）。
+- **1 行制約があるのは `plan.sh needs-director` の reason だけ**（frontmatter の `needs_director_reason` フィールドに直接書かれるため、改行を含めると task ファイルの frontmatter が壊れミッション全体が停止する）。`plan.sh done` の result にはこの制約は無い。長い説明・複数の見出し・箇条書きを含む Result 全文をそのまま `plan.sh done` に渡してよい（本文の行頭 `## ` は `plan.sh done` が保存時に `### ` へ自動で下げるので、見出しを書いても Result 節は切れない。#382 の `demote_section_headings`）。
 
 ### 🚨 新しいファイル・大きな内容は Write ツールで書く（heredoc で書かない）
 
@@ -1040,8 +1040,9 @@ PR の merge は Director が行う（CI の結果は dispatcher が通知する
 
 `review` / `codex-review` / `qa` の task は **diff を読んで所見を Result に残して done する**ところまで。**merge しない**（merge は Director。`plan.sh ci-gate` で CI の緑と承認 head を確かめてから行う）。CI の完了も待たない（CI と並行して読む。`timeout.max=7200` の根拠だった CI 待ちはここに含めない）。
 
-- **承認するときだけ**、Result の **最後の行** に `approved_head: <40 桁の sha>`（レビューした PR の head。`gh pr view <N> --json headRefOid -q .headRefOid`）を 1 行書く。要修正・条件付きのときは書かない。dispatcher の `merge-ready` 通知と `plan.sh ci-gate` は、この head が PR の現 head と一致するときだけ承認とみなす（一致しなければ `approved_head_mismatch`、行が無ければ `no_approval`）
-- **Result 本文では行頭 `## ` の見出しを使わない**（`###` 以下を使う）。`lib_history.result_section` は最初の行頭 `## ` で Result 節を切るため、`## ` が途中に入ると末尾の `approved_head:` 行が節の外に出て、`merge-ready` が出ず `ci-gate` も `no_approval` になる（実例: mission 20261113-ci-wait-ops-3 の t002 の再レビュー）。`approved_head:` 行は必ず Result の最後の行にする
+- **head は読む前に控える。** `gh pr diff` は常に「今の」head を見せるので、読み終えてから `headRefOid` を取ると **A を読んで B を承認する**ことが起こりうる（PR #383 codex-review P1）。読む前に `HEAD_BEFORE="$(gh pr view <N> --json headRefOid -q .headRefOid)"` で控え、**承認の直前にもう一度取って一致を確かめる**。食い違ったら承認しない（所見は残して done し、再レビューが要ると Director に伝える）
+- **承認するときだけ**、Result の **最後の行** に `approved_head: <40 桁の sha>`（上で控えた `HEAD_BEFORE`）を 1 行書く。要修正・条件付きのときは書かない。dispatcher の `merge-ready` 通知と `plan.sh ci-gate` は、この head が PR の現 head と一致するときだけ承認とみなす（一致しなければ `approved_head_mismatch`、行が無ければ `no_approval`）
+- **`approved_head:` 行は必ず Result の最後の非空行にする**（後ろに所見・ログ・チェックポイント行を足さない）。行頭 `## ` の見出しは `plan.sh done` が保存時に `### ` へ自動で下げる（#382 の `demote_section_headings`）ので、本文に見出しを書いても Result 節は途中で切れない。自動で下がる前は `lib_history.result_section` が最初の行頭 `## ` で Result 節を切っていて、`approved_head:` 行が節の外に出て `merge-ready` が出ず `ci-gate` も `no_approval` になっていた（実例: mission 20261113-ci-wait-ops-3 の t002 の再レビュー）
 - review の後に修正が push されたら、その新しい head は未レビュー。承認は取り直す（古い `approved_head` は一致せず無効になる）
 
 ### ⚠️ Stacked PR (依存PR) の squash merge に関する注意

@@ -320,10 +320,15 @@ IRC の呼びかけを crewvia のエージェントの画面へ届ける（t007
 
 ### `lib_ci_status.py`
 
-PR の CI の見える化（2026-10-27）。取得は dispatcher の `run_ci_poll()` の 1 か所（in_progress / ready_for_verification / verifying の task。
-`pr_number` か、無ければ Resolver の branch から `gh pr list`。fork の PR は除く）。`registry/ci/<mission>__<task>.json` に書き、
-`plan.sh status`・`tasks.json` の `ci` 欄・watchdog / Rule 5 の通知は読むだけ。gh の失敗・timeout・形の違いは `unknown`。
-**判定には使わない**。記録は消してよい。詳細は `knowledge/ci-status.md`
+PR の CI の見える化（2026-10-27）と **merge の門**（2026-11-13 / ci-wait-operations PR-B〜D）。取得は dispatcher の `run_ci_poll()` の 1 か所
+（`pr_number` のある task は status 不問で open な PR を追う。無ければ Resolver の branch から `gh pr list`。fork の PR は除く）。
+`registry/ci/<mission>__<task>.json` に書く。gh の失敗・timeout・形の違いは `unknown`（緑にも「CI なし」にも倒さない）。
+
+**読み口は 2 本**: 表示用（`read_record` / `format_line` / `summarize` / `task_graph_ci` → `plan.sh status`・`tasks.json` の `ci` 欄・
+watchdog / Rule 5 の通知）は**今までどおり判定に使わない**。門用（`gate_verdict` + `approval_verdict` / `approved_head`）は
+`plan.sh ci-gate` と `pr_events`（dispatcher の `ci-green` / `merge-ready` 通知の条件）の **2 か所だけ**で、
+**「止める」と「知らせる」にしか使わない**（待ちを解く・done にする・Rule 5 / watchdog を黙らせる・割り当てる、には使わない）。
+記録は消してよい。詳細は `knowledge/ci-status.md`・`knowledge/ci-wait-operations.md` §2.2・§2.3・§2.5
 
 ### `lib_git_policy.py`
 

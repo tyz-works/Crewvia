@@ -243,3 +243,79 @@ RESULT_EOF
 ```
 
 これは「代替検証して done を無理やり呼ぶ」よりも **常に正しく、安い選択肢** である。
+
+---
+
+## Step 8b: 承認する場合の `approved_head`（PR に紐づく QA task）
+
+`qa` は `review` / `codex-review` と並ぶ**承認 head を残す skill** である（`lib_ci_status.APPROVAL_SKILLS`）。
+PR に紐づく review 系 task が全部終端になったとき、**`completed_at` が最後のもの**の Result が照合される。
+QA が最後に done する mission は多いので、**承認するつもりなら書かないと `merge-ready` は出ない**
+（`no_approval` になり、Director には `ci-green` が届く）。
+
+**merge はしない。CI の完走も待たない。** CI を見るのは dispatcher で、結果は Director に通知される
+（`ci-failed` / `ci-green` / `merge-ready` / `ci-unknown`）。QA の責務は確かめて所見を残すところまで。
+
+### 置き場所: Result の**最後の行**
+
+`lib_ci_status.approved_head()` は Result 節の**最後の非空行**だけを見る。だから `approved_head:` は
+**Result の一番最後**に置く。`## QA Gate` セクションを書く task でも、その**後ろ**に置く。
+
+```
+QA結果: [対象: <タスクタイトル>]
+...（所見）...
+
+## QA Gate
+
+checkpoint: <名前> | required: yes | result: observed
+
+approved_head: <40 桁の小文字 sha>
+```
+
+- 本文の行頭 `## ` は `plan.sh done` が保存時に `### ` へ自動で下げる（#382 の `demote_section_headings`）。
+  `## QA Gate` もそうなるので Result 節は途中で切れない。**QA Gate の検証は下げる前の本文で行われる**ので、
+  見出しは `## QA Gate` のまま書いてよい（`_validate_qa_gate` が `^##\s+QA\s+Gate\s*$` を必須にしている）
+- **守るべき不変条件は 1 つだけ: `approved_head:` 行が Result の最後の非空行であること。**
+  後ろに所見・ログ・チェックポイント行を足さない
+
+### sha: **自分がテストした commit**（リモートの head ではない）
+
+QA は**ローカルの checkout** の差分とコードを検証する（Step 1 の `DIFF_REF`）。
+リモートの PR head をテスト前後で比べても、**ローカルが古い A のままで PR が既に B なら前後とも B** になり、
+A をテストして B を承認してしまう（PR #385 codex-review P1）。**ローカルの HEAD と照合する**:
+
+**さらに、`git rev-parse HEAD` は未コミットの変更では動かない。** 作業ツリーが汚れていれば、
+sha が 3 つとも一致したまま**「手元で直したから通った」コードを承認できる**（PR #385 codex-review P2）。
+sha の照合に加えて**作業ツリーが clean であること**を、テストの前と承認の前の両方で確かめる:
+
+```bash
+PR=<PR番号>
+HEAD_BEFORE="$(gh pr view "$PR" --json headRefOid -q .headRefOid)"
+LOCAL="$(git rev-parse HEAD)"
+[ "$LOCAL" = "$HEAD_BEFORE" ] || echo "テスト対象がPRのheadと違う。先に $HEAD_BEFORE を checkout するか、承認しない"
+[ -z "$(git status --porcelain)" ] || echo "作業ツリーが汚れている。テストする前に clean にする"
+
+# ── ここでテストする（スクラッチのファイルはリポジトリの外に置く）──
+
+[ "$(git rev-parse HEAD)" = "$LOCAL" ] || echo "テスト中にローカルが動いた。承認しない"
+[ -z "$(git status --porcelain)" ] || echo "テスト中にツリーが汚れた。承認しない"
+[ "$(gh pr view "$PR" --json headRefOid -q .headRefOid)" = "$LOCAL" ] || echo "テスト中に push された。承認しない"
+```
+
+4 つとも通ったときだけ `approved_head: $LOCAL` を書く。**書くのは「自分が実際に動かした commit」**で、
+`gh pr view` で取り直した値ではない。
+
+- **テスト中に手元を直して通ったなら、それは承認ではなく所見**。直した内容を Result に書いて
+  Director に渡す（`approved_head` は書かない）。承認してしまうと、**バグを含んだままの commit**に
+  `merge-ready` が出る
+- テストデータ・ログ・一時ファイルは**リポジトリの外**（scratchpad）に置く。リポジトリの中に置くと
+  untracked として `git status --porcelain` に出るので、そこで止まる（止まるのは正しい側 —
+  untracked のファイルが挙動を変えることは実際にある）
+- clean にできない事情があるなら承認せず、何が汚れているかを Result に書いて Director に判断を渡す
+
+- 問題あり・未実施の必須チェックポイントが残る・判断を Director に委ねるときは**書かない**
+- 省略形・大文字は読まれない。本文の途中に書いた sha も読まれない（Result 節の最終行の完全一致だけ）
+- 食い違ったら承認せず、所見は残して done し、再テストが要ることを Director に伝える
+- 承認の後に修正が push されれば `approved_head_mismatch` になり、未検証の head は merge されない（fail-closed）
+
+設計: `knowledge/ci-wait-operations.md` §2.5 / `knowledge/ci-status.md` / `agents/worker.md`「review の手順」。

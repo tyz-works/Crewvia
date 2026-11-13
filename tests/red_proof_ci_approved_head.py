@@ -27,6 +27,10 @@ DEFECTS = {
     "現 head を取り直さない": ("            current = head\n            if head_of is not None:", "            current = head\n            if False:"),
     "取り直しの失敗で記録の head に倒す": ("                if err is not None:\n                    continue\n", "                if err is not None:\n                    current = head\n"),
     "承認が無くても merge-ready": ("            if approved:\n                events.append({'kind': 'merge-ready'", "            if True:\n                events.append({'kind': 'merge-ready'"),
+    "台帳にあっても取り直す": ("                    if is_sent(event_key(pre)):\n                        continue\n", ""),
+    "候補を回さない": ("        keys = keys[k:] + keys[:k]", "        keys = keys"),
+    "target_dir を無視して review を束ねる": ("            reviews.setdefault((t.get('target_dir') or None, pr_number), []).append(\n                {'status'", "            reviews.setdefault((None, pr_number), []).append(\n                {'status'"),
+    "review の収集を read_record の後ろに置く": ("            reviews.setdefault((t.get('target_dir') or None, pr_number), []).append(", "            (reviews.setdefault((t.get('target_dir') or None, pr_number), []) if False else []).append("),
     "review 系でない skill を数える": ("if set(t.get('skills') or ()) & set(APPROVAL_SKILLS):", "if True:"),
 }
 

@@ -270,3 +270,71 @@ def test_cli_deny_has_no_approval_line(repo):
     add_review_card(repo, f"ok\napproved_head: {HEAD}")
     p = gate(repo, "313")
     assert (p.returncode, p.stdout) == (1, "ci-gate: DENY PR #313 head_mismatch\n")
+
+
+# ---------------------------------------------------------------------------
+# #379 レビュー対応 (P2-1 / P2-2 / P3-1 / P3-2)
+# ---------------------------------------------------------------------------
+
+def test_cli_reads_the_result_section_like_the_dispatcher_with_a_trailing_section(repo):
+    """P2-1: Result の後ろに `## Needs-Director 詳細` が付いた card でも ci-gate は承認 head を読む (dispatcher と同じ答え)。"""
+    import lib_history
+    passing_gate(repo)
+    add_review_card(repo, f"ok\napproved_head: {HEAD}\n\n## Needs-Director 詳細\nreason: x")
+    body = repo.card_path("t002").read_text().split("---\n", 2)[2]
+    assert ci.approved_head(lib_history.result_section(body)) == HEAD
+    assert gate(repo, "313").stdout.endswith("approved_head ok\n")
+
+
+def test_no_refetch_for_candidates_already_in_the_ledger(tmp_path):
+    """P2-2: 記録の head で出すはずの通知が台帳にあれば head_of を呼ばない。台帳に無ければ呼ぶ。"""
+    write_green(tmp_path)
+    tasks = [task(status="done"), review_task()]
+    calls = []
+
+    def head_of(pr):
+        calls.append(pr)
+        return HEAD, None
+    key = ci.event_key({"kind": "merge-ready", "pr": 313, "head": HEAD})
+    ci.pr_events(tasks, registry_dir=tmp_path, now=NOW + 5, head_of=head_of, is_sent={key}.__contains__)
+    assert calls == []
+    evs = ci.pr_events(tasks, registry_dir=tmp_path, now=NOW + 5, head_of=head_of, is_sent=set().__contains__)[0]
+    assert calls == [313] and [e["kind"] for e in evs] == ["merge-ready"]
+
+
+def test_rotate_changes_which_pr_is_refetched_first(tmp_path):
+    for i, pr in enumerate((1, 2, 3)):
+        ci.write_record(tmp_path, "m", f"t00{i + 1}", {"pr": pr, "head": HEAD, "state": "passed", "checks": [chk("ci-ok")],
+                                                       "observed_at": NOW, "summary": "s", "pr_state": "OPEN"})
+    tasks = [task(id_=f"t00{i + 1}", status="done", pr=pr) for i, pr in enumerate((1, 2, 3))]
+    order = {}
+    for rot in (0, 1):
+        seen = []
+        ci.pr_events(tasks, registry_dir=tmp_path, now=NOW + 5, head_of=lambda pr: seen.append(pr) or (HEAD, None), rotate=rot)
+        order[rot] = seen
+    assert order[0] == [1, 2, 3] and order[1] == [2, 3, 1]
+
+
+def test_reviews_of_another_target_dir_are_not_counted(tmp_path):
+    """P3-1: target_dir が違う task の review は同じ PR 番号でも数えない (ci-gate と同じ束ね方)。"""
+    write_green(tmp_path)
+    other = review_task()
+    other["target_dir"] = "/elsewhere"
+    evs = events(tmp_path, [task(status="done"), other])
+    assert [(e["kind"], e["reason"]) for e in evs] == [("ci-green", "no_approval")]
+
+
+def test_review_is_collected_even_when_its_record_cannot_be_read(tmp_path, monkeypatch):
+    """P3-2: 記録の読み取りが例外でも、その review を数える (古い承認で ok に倒れない)。"""
+    write_green(tmp_path)
+    real = ci.read_record
+
+    def boom(registry_dir, mission, task_id, **kw):
+        if task_id == "t003":
+            raise RuntimeError("x")
+        return real(registry_dir, mission, task_id, **kw)
+    monkeypatch.setattr(ci, "read_record", boom)
+    old = review_task(id_="t002", at="2026-11-13T10:00:00Z")
+    newest = review_task(id_="t003", status="in_progress", at="2026-11-13T11:00:00Z")
+    evs = events(tmp_path, [task(status="done"), old, newest])
+    assert [(e["kind"], e["reason"]) for e in evs] == [("ci-green", "no_approval")]

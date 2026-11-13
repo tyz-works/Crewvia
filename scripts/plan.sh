@@ -3570,7 +3570,7 @@ def cmd_ci_gate(args):
                 continue
             if set(meta.get('skills') or ()) & set(_CI_STATUS.APPROVAL_SKILLS):
                 reviews.append({'status': meta.get('status'), 'completed_at': meta.get('completed_at'),
-                                'result': parse_task_body(_body)[1]})
+                                'result': _HISTORY.result_section(_body)})
             rec = _CI_STATUS.read_record(registry_dir(), slug, meta['id'], pr_number=pr_number)
             if rec is not None and (newest is None or rec['observed_at'] > newest['observed_at']):
                 newest = rec

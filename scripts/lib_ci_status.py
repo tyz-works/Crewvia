@@ -703,7 +703,7 @@ EVENT_KINDS = ('ci-failed', 'ci-green', 'ci-unknown', 'merge-ready')
 EVENT_MAX_CHECKS = 5
 
 
-def pr_events(tasks, *, registry_dir, now, warn=None, head_of=None):
+def pr_events(tasks, *, registry_dir, now, warn=None, head_of=None, is_sent=None, rotate=0):
     """PR ごとの通知の候補 `(events, closed_prs)`。**gh を呼ばない** (記録を読むだけ)。
 
     `events`: `{'kind','pr','head','checks','reason'}` の一覧。1 つの PR を指す task が何本あっても 1 つの記録
@@ -715,21 +715,28 @@ def pr_events(tasks, *, registry_dir, now, warn=None, head_of=None):
     予算の中で用意する。#377 レビュー P3-1)。取り直せなければその PR は今回は何も出さない (次のサイクルで再試行 =
     fail-closed)。省略したときだけ記録自身の head を現 head とみなす (gh を呼ばない単体テスト用)。
     緑のとき、PR に紐づく review 系 task (task の `skills` / `completed_at` / `result`) の承認 head が現 head と
-    一致すれば `merge-ready`、しなければ理由 (`no_approval` / `approved_head_mismatch`) つきの `ci-green`。"""
+    一致すれば `merge-ready`、しなければ理由 (`no_approval` / `approved_head_mismatch`) つきの `ci-green`。
+
+    `is_sent(key) -> bool` (台帳に既にあるか): 取り直し (gh) は**まだ送っていない候補だけ**にする。記録の head で出すはずの
+    通知が既に台帳にあれば head_of を呼ばない (通知済みの PR で毎サイクル gh を呼ばない。#379 レビュー P2-2)。
+    `rotate`: 緑の候補を回す開始位置 (呼び出し元が時刻から決める)。head_of の予算が切れる PR がいつも同じにならないように
+    する (飢餓を避ける)。review 系 task は `target_dir` が同じものだけを同じ PR の review に数える (ci-gate と同じ束ね方)。"""
     newest = {}
+    rec_td = {}
     reviews = {}
     closed = set()
     for t in tasks:
         pr_number = card_pr(t.get('pr_number'))
         if pr_number is None or t.get('status') not in FOLLOW_STATUSES:
             continue
+        if set(t.get('skills') or ()) & set(APPROVAL_SKILLS):
+            # 収集は read_record より前 (記録の読み取りが落ちた review を数えないと、古い承認で ok に倒れうる。fail-open)
+            reviews.setdefault((t.get('target_dir') or None, pr_number), []).append(
+                {'status': t.get('status'), 'completed_at': t.get('completed_at'), 'result': t.get('result')})
         try:
             rec = read_record(registry_dir, t['mission'], t['id'], warn=warn, pr_number=pr_number)
         except Exception:  # noqa: BLE001 — 通知の元の読み取りが想定外でも他の PR を止めない
             continue
-        if set(t.get('skills') or ()) & set(APPROVAL_SKILLS):
-            reviews.setdefault(pr_number, []).append(
-                {'status': t.get('status'), 'completed_at': t.get('completed_at'), 'result': t.get('result')})
         if rec is None or rec.get('pr') != pr_number:
             continue
         if rec.get('pr_state') in PR_TERMINAL_STATES:
@@ -740,8 +747,13 @@ def pr_events(tasks, *, registry_dir, now, warn=None, head_of=None):
         cur = newest.get(pr_number)
         if cur is None or rec['observed_at'] > cur['observed_at']:
             newest[pr_number] = rec
+            rec_td[pr_number] = t.get('target_dir') or None
     events = []
-    for pr_number in sorted(newest):
+    keys = sorted(newest)
+    if keys and rotate:
+        k = rotate % len(keys)
+        keys = keys[k:] + keys[:k]      # 緑の候補の取り直しの順を回す (予算切れがいつも同じ PR にならない)
+    for pr_number in keys:
         rec = newest[pr_number]
         head, state = rec['head'], rec['state']
         if state == 'failed':
@@ -752,15 +764,22 @@ def pr_events(tasks, *, registry_dir, now, warn=None, head_of=None):
                 reason = _clean_name(rec['reason']) if isinstance(rec.get('reason'), str) and rec['reason'] else 'check'
                 events.append({'kind': 'ci-unknown', 'pr': pr_number, 'head': head, 'checks': [], 'reason': reason})
         elif state == 'passed' and head is not None:
+            pr_reviews = reviews.get((rec_td.get(pr_number), pr_number))
             current = head
             if head_of is not None:
+                if is_sent is not None:
+                    # 記録の head で出すはずの通知が台帳にあれば gh を呼ばない (通知済みの PR で毎サイクル取り直さない)
+                    pre_ok, _ = approval_verdict(pr_reviews, pr_head=head)
+                    pre = {'kind': 'merge-ready' if pre_ok else 'ci-green', 'pr': pr_number, 'head': head}
+                    if is_sent(event_key(pre)):
+                        continue
                 current, err = head_of(pr_number)
                 if err is not None:
                     continue
             ok, _why = gate_verdict(rec, pr_head=current, now=now)
             if not ok:
                 continue
-            approved, why = approval_verdict(reviews.get(pr_number), pr_head=current)
+            approved, why = approval_verdict(pr_reviews, pr_head=current)
             if approved:
                 events.append({'kind': 'merge-ready', 'pr': pr_number, 'head': current, 'checks': [], 'reason': None})
             else:

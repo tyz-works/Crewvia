@@ -1,12 +1,17 @@
 # PR の CI の見える化（`lib_ci_status.py`）
 
 Worker が PR の CI を待っている間、その進み具合を Director とユーザーが crewvia の画面から見られるようにする（2026-10-27 ユーザー要望）。
-**見える化だけ**。Rule 5 を黙らせる・watchdog の見送りを CI の状態で変える、といった判定には使わない（別の PR で扱う）。
+**読み口は 2 本立て**（`knowledge/ci-wait-operations.md` §2.3。2026-11-13 PR-D2）:
+
+- **表示用**（`read_record` / `format_line` / `summarize`。下の「表示」）: 見える化だけ。Rule 5 を黙らせる・watchdog の見送りを CI の状態で変える、といった判定には使わない。
+- **門用**（`gate_verdict` / `plan.sh ci-gate`。末尾の「門」）: Director の merge の「通さない」と、dispatcher の `ci-failed` / `ci-green` / `merge-ready` / `ci-unknown` 通知にだけ使う。待ちを解く・done にする・Rule 5 / watchdog を黙らせる・割り当てには使わない。共有規則なので env の停止スイッチは無い（止めるなら PR revert）。
+
+運用: Worker・review は CI を待たず done し、結果は dispatcher が Director に通知、merge は Director（`agents/director.md` §12「merge 手順」）。
 
 ## 取得（dispatcher の 1 か所）
 
 - dispatcher のサイクルの `run_ci_poll()`（`dispatch()` の後・成否から独立）→ `lib_ci_status.poll_cycle()`。
-- 対象: active mission の task のうち status が `in_progress` / `ready_for_verification` / `verifying`（`lib_ci_status.POLL_STATUSES`）。
+- 対象: active mission の task のうち、`pr_number` を持つものは status 不問（done を含む。`lib_task_status.CI_FOLLOW_PR_STATUSES`。PR が MERGED / CLOSED になれば外れる）、持たないものは `in_progress` / `ready_for_verification` / `verifying`（`lib_ci_status.POLL_STATUSES`）。
 - PR の見つけ方: card の `pr_number`。無ければ **Git Policy Resolver**（`lib_git_policy.task_branch`。card の `task_slug` から。式をコピーしない）の branch で
   `gh pr list --head <branch> --state open --json number,isCrossRepository`。**fork から来た同名 branch の PR は数えない**。2 つ以上なら決められない = `unknown`。
   branch に PR が無ければ `no_pr`（表示しない）。`target_dir` の task は gh を target_dir の中で呼ぶ（PR はその repo のもの）。
@@ -78,4 +83,4 @@ PR revert → `scripts/sync-main-checkout.sh`。`registry/ci/` は残ってよ�
 
 - `lib_ci_status.gate_verdict(record, *, pr_head, now)` は「通す / 通さない + 固定語の理由」を返す**門用の読み口**（表示用の `read_record` / `format_line` とは別）。通すのは記録の head == PR の現 head ∧ 全体 passed ∧ 必須 check `ci-ok` が passed ∧ `observed_at` が 10 分以内のときだけ。それ以外・読めない・取り直せないは全部通さない。設計: `knowledge/ci-wait-operations.md` §2.2。
 - `plan.sh ci-gate <PR> [--target-dir]`: 通せば exit 0 + `ci-gate: PASS PR #N head=<sha>`、通さなければ exit 1 + `ci-gate: DENY PR #N <理由>`。読み取り専用。**この PR では誰も呼ばない**（呼び出し元の追加は PR-C。`tests/test_ci_gate.py::test_nobody_calls_the_gate_yet`）。
-- 「判定に使わない」の文言の改訂（表示用 / 門用の 2 つに割る）は PR-D。それまでは待ちを解く・done にする・Rule 5 / watchdog を黙らせることに使わない。
+- 「判定に使わない」の文言の改訂（表示用 / 門用の 2 つに割る）は PR-D2 で済み（冒頭）。門は待ちを解く・done にする・Rule 5 / watchdog を黙らせることには使わない。

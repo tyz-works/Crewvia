@@ -441,6 +441,60 @@ def card_pr(value):
     return value
 
 
+#: card の `pr_repo` (PR の持ち主の repo) の形。`owner/name` だけ (gh の `--repo` にそのまま渡す)。
+_PR_REPO_RE = re.compile(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+')
+
+
+def pr_repo_of(task):
+    """card の `pr_repo` を `owner/name` (小文字化) / None (欄が無い・空) に。あって形が違えば `ValueError`
+    (呼び出し側は「repo が決められない」= 取得しない・通知しない・門を通さない)。"""
+    raw = task.get('pr_repo')
+    if raw is None or raw == '':
+        return None
+    if not isinstance(raw, str) or not _PR_REPO_RE.fullmatch(raw) or raw.startswith(('.', '-')):
+        raise ValueError('bad_pr_repo')
+    return raw.lower()
+
+
+def pr_scope(task):
+    """PR 番号が通用する範囲 (どの repo の #N か) を決める **1 か所の関数**。戻り値は文字列 / None (決められない)。
+
+    ①card の `pr_repo` があればそれ (`repo:owner/name`)。②無ければ従来どおり `target_dir` (`dir:<abs path>`)。
+    ③どちらも無ければ crewvia の repo (`''`)。`pr_repo` があって形が違うときは None = fail-closed。
+    取得 (`observe_task` の cwd / `--repo`)・記録の束ね (`by_pr` / closed / newest / reviews)・ci-gate はすべてこの値と PR 番号の組で揃える。"""
+    try:
+        repo = pr_repo_of(task)
+    except ValueError:
+        return None
+    if repo:
+        return f'repo:{repo}'
+    td = task.get('target_dir')
+    return f'dir:{td}' if td else ''
+
+
+def scope_repo_args(task):
+    """gh に足す `--repo owner/name` / `[]`。"""
+    try:
+        repo = pr_repo_of(task)
+    except ValueError:
+        return []
+    return ['--repo', repo] if repo else []
+
+
+def scope_tag(scope):
+    """通知台帳のキーに入れる短い印。crewvia の repo (`''`) は空 (従来のキーのまま)。"""
+    if not scope:
+        return ''
+    import hashlib
+    return hashlib.sha1(scope.encode('utf-8')).hexdigest()[:6]
+
+
+def pr_tag(pr, scope=''):
+    """台帳のキーの PR 部分。crewvia の repo は `pr12`、他は `pr12x<6 桁>`。"""
+    t = scope_tag(scope)
+    return f'pr{pr}x{t}' if t else f'pr{pr}'
+
+
 def record_matches_card(record, pr_number):
     """card が PR を名指ししていて、記録がそれと違う PR (PR 無し・不明を含む) を指していれば False。
     #314 r2: 別の PR の CI を、今の PR の状況として出さない (PR を作り直した・card の pr_number が後から付いた)。"""
@@ -524,9 +578,9 @@ def run_gh(args, *, cwd, timeout, runner=subprocess.run, gh='gh'):
     return p.stdout, None
 
 
-def fetch_pr_head(pr, *, cwd, timeout=GH_TIMEOUT_SECONDS, runner=subprocess.run):
+def fetch_pr_head(pr, *, cwd, timeout=GH_TIMEOUT_SECONDS, runner=subprocess.run, repo_args=()):
     """門を引く瞬間の PR の現 head。`(sha, None)` か `(None, 理由の固定語)` (取り直せなければ門は通さない)。"""
-    out, err = run_gh(['pr', 'view', str(pr), '--json', 'headRefOid'], cwd=cwd, timeout=timeout, runner=runner)
+    out, err = run_gh(['pr', 'view', str(pr), '--json', 'headRefOid', *repo_args], cwd=cwd, timeout=timeout, runner=runner)
     if err:
         return None, err
     try:
@@ -563,8 +617,17 @@ def observe_task(task, *, repo_root, branch_of, now, timeout, runner=subprocess.
                 return None, 'cycle_budget'
         return run_gh(args, cwd=cwd, timeout=t, runner=runner)
 
+    scope = pr_scope(task)
+    if scope is None:
+        # repo が決められない (pr_repo の形が違う): gh を呼ばない。PR を card の値で記録し、毎サイクルは取り直さない終端にする
+        return {'pr': card_pr(task.get('pr_number')), 'head': None, 'state': 'no_pr', 'checks': [], 'observed_at': now,
+                'summary': 'no PR', 'reason': 'bad_pr_repo', 'pr_state': 'NOT_FOUND'}
+    repo_args = scope_repo_args(task)
     cwd = task.get('target_dir') or repo_root
-    if task.get('target_dir') and not os.path.isdir(cwd):
+    if scope.startswith('repo:'):
+        # pr_repo があれば --repo で repo が決まる。cwd は gh を動かす場所でしかないので target_dir に依らない
+        cwd = repo_root
+    elif task.get('target_dir') and not os.path.isdir(cwd):
         # card の PR を入れる (#314 r3: None で書くと読み手の照合で隠れ、poll_cycle も毎サイクル取り直す)
         return _unknown(card_pr(task.get('pr_number')), 'target_dir_missing', now)
     pr = card_pr(task.get('pr_number'))
@@ -572,7 +635,7 @@ def observe_task(task, *, repo_root, branch_of, now, timeout, runner=subprocess.
         branch = branch_of(task)
         if not branch:
             return _unknown(None, 'no_branch', now)
-        out, err = gh(['pr', 'list', '--head', branch, '--state', 'open', '--json', 'number,isCrossRepository'])
+        out, err = gh(['pr', 'list', '--head', branch, '--state', 'open', '--json', 'number,isCrossRepository', *repo_args])
         if err:
             return _unknown(None, err, now)
         try:
@@ -582,17 +645,17 @@ def observe_task(task, *, repo_root, branch_of, now, timeout, runner=subprocess.
         if pr is None:
             return {'pr': None, 'head': None, 'state': 'no_pr', 'checks': [], 'observed_at': now,
                     'summary': 'no PR'}
-    key = (task.get('target_dir') or '', pr)
+    key = (scope, pr)
     if by_pr is not None and key in by_pr:
         return dict(by_pr[key], observed_at=now)
-    rec = _view(pr, gh, now)
+    rec = _view(pr, gh, now, repo_args)
     if by_pr is not None:
         by_pr[key] = rec
     return rec
 
 
-def _view(pr, gh, now):
-    out, err = gh(['pr', 'view', str(pr), '--json', 'headRefOid,statusCheckRollup,state'])
+def _view(pr, gh, now, repo_args=()):
+    out, err = gh(['pr', 'view', str(pr), '--json', 'headRefOid,statusCheckRollup,state', *repo_args])
     if err == 'gh_pr_not_found':
         # card の持ち主の repo を判別できない (別 repo の PR 番号) か、本当に無い PR。誤った PR の CI を通知しない側に倒し、
         # 終端として記録する (unknown にすると毎サイクル取り直し、3 回で ci-unknown を出す)
@@ -678,7 +741,7 @@ def poll_cycle(tasks, *, registry_dir, repo_root, branch_of, poll_seconds=DEFAUL
         if remaining < 1:
             break
         pr_key = card_pr(t.get('pr_number'))
-        free = pr_key is not None and (t.get('target_dir') or '', pr_key) in by_pr
+        free = pr_key is not None and (pr_scope(t), pr_key) in by_pr
         if not free:
             if spent >= max_tasks:
                 continue        # 件数は PR 単位。この task は次のサイクルへ (同じ PR を観測済みの task はまだ入る)
@@ -733,16 +796,19 @@ def pr_events(tasks, *, registry_dir, now, warn=None, head_of=None, is_sent=None
     `rotate`: 緑の候補を回す開始位置 (呼び出し元が時刻から決める)。head_of の予算が切れる PR がいつも同じにならないように
     する (飢餓を避ける)。review 系 task は `target_dir` が同じものだけを同じ PR の review に数える (ci-gate と同じ束ね方)。"""
     newest = {}
-    rec_td = {}
     reviews = {}
     closed = set()
     for t in tasks:
         pr_number = card_pr(t.get('pr_number'))
         if pr_number is None or t.get('status') not in FOLLOW_STATUSES:
             continue
+        scope = pr_scope(t)
+        if scope is None:
+            continue        # repo が決められない card は何も通知しない (fail-closed)
+        k = (scope, pr_number)
         if set(t.get('skills') or ()) & set(APPROVAL_SKILLS):
             # 収集は read_record より前 (記録の読み取りが落ちた review を数えないと、古い承認で ok に倒れうる。fail-open)
-            reviews.setdefault((t.get('target_dir') or None, pr_number), []).append(
+            reviews.setdefault(k, []).append(
                 {'status': t.get('status'), 'completed_at': t.get('completed_at'), 'result': t.get('result')})
         try:
             rec = read_record(registry_dir, t['mission'], t['id'], warn=warn, pr_number=pr_number)
@@ -751,44 +817,44 @@ def pr_events(tasks, *, registry_dir, now, warn=None, head_of=None, is_sent=None
         if rec is None or rec.get('pr') != pr_number:
             continue
         if rec.get('pr_state') in PR_TERMINAL_STATES:
-            closed.add(pr_number)
+            closed.add(k)
             continue
         if rec['state'] == 'no_pr':
             continue
-        cur = newest.get(pr_number)
+        cur = newest.get(k)
         if cur is None or rec['observed_at'] > cur['observed_at']:
-            newest[pr_number] = rec
-            rec_td[pr_number] = t.get('target_dir') or None
-    # 終端 (MERGED / CLOSED / NOT_FOUND) は PR 単位 (t011)。同じ PR を指す別 task の記録が OPEN・passed のまま古く残っていても、
-    # どれか 1 つが終端を言ったら通知しない。畳んだ台帳のキーを古い記録で復活させない (merge 直後の ci-green / merge-ready の再送)。
-    for pr_number in closed:
-        newest.pop(pr_number, None)
+            newest[k] = rec
+    # 終端 (MERGED / CLOSED / NOT_FOUND) は (repo, PR) 単位 (t011 + t001)。同じ repo の同じ PR を指す別 task の記録が OPEN・passed のまま
+    # 古く残っていても、どれか 1 つが終端を言ったら通知しない。別 repo の同じ番号の終端は巻き込まない。
+    for k in closed:
+        newest.pop(k, None)
     events = []
     keys = sorted(newest)
     if keys and rotate:
-        k = rotate % len(keys)
-        keys = keys[k:] + keys[:k]      # 緑の候補の取り直しの順を回す (予算切れがいつも同じ PR にならない)
-    for pr_number in keys:
-        rec = newest[pr_number]
+        n = rotate % len(keys)
+        keys = keys[n:] + keys[:n]      # 緑の候補の取り直しの順を回す (予算切れがいつも同じ PR にならない)
+    for k in keys:
+        scope, pr_number = k
+        rec = newest[k]
         head, state = rec['head'], rec['state']
         if state == 'failed':
             names = [c['name'] for c in rec['checks'] if c['state'] == 'failed'][:EVENT_MAX_CHECKS]
-            events.append({'kind': 'ci-failed', 'pr': pr_number, 'head': head, 'checks': names, 'reason': None})
+            events.append({'kind': 'ci-failed', 'pr': pr_number, 'scope': scope, 'head': head, 'checks': names, 'reason': None})
         elif state == 'unknown':
             if rec.get('unknown_streak', 0) >= UNKNOWN_NOTIFY_STREAK:
                 reason = _clean_name(rec['reason']) if isinstance(rec.get('reason'), str) and rec['reason'] else 'check'
-                events.append({'kind': 'ci-unknown', 'pr': pr_number, 'head': head, 'checks': [], 'reason': reason})
+                events.append({'kind': 'ci-unknown', 'pr': pr_number, 'scope': scope, 'head': head, 'checks': [], 'reason': reason})
         elif state == 'passed' and head is not None:
-            pr_reviews = reviews.get((rec_td.get(pr_number), pr_number))
+            pr_reviews = reviews.get(k)
             current = head
             if head_of is not None:
                 if is_sent is not None:
                     # 記録の head で出すはずの通知が台帳にあれば gh を呼ばない (通知済みの PR で毎サイクル取り直さない)
                     pre_ok, _ = approval_verdict(pr_reviews, pr_head=head)
-                    pre = {'kind': 'merge-ready' if pre_ok else 'ci-green', 'pr': pr_number, 'head': head}
+                    pre = {'kind': 'merge-ready' if pre_ok else 'ci-green', 'pr': pr_number, 'scope': scope, 'head': head}
                     if is_sent(event_key(pre)):
                         continue
-                current, err = head_of(pr_number)
+                current, err = _head_of_scoped(head_of, pr_number, scope)
                 if err is not None:
                     continue
             ok, _why = gate_verdict(rec, pr_head=current, now=now)
@@ -796,16 +862,28 @@ def pr_events(tasks, *, registry_dir, now, warn=None, head_of=None, is_sent=None
                 continue
             approved, why = approval_verdict(pr_reviews, pr_head=current)
             if approved:
-                events.append({'kind': 'merge-ready', 'pr': pr_number, 'head': current, 'checks': [], 'reason': None})
+                events.append({'kind': 'merge-ready', 'pr': pr_number, 'scope': scope, 'head': current, 'checks': [], 'reason': None})
             else:
-                events.append({'kind': 'ci-green', 'pr': pr_number, 'head': current, 'checks': [], 'reason': why})
-    return events, sorted(closed)
+                events.append({'kind': 'ci-green', 'pr': pr_number, 'scope': scope, 'head': current, 'checks': [], 'reason': why})
+    # 台帳の掃除用: crewvia の repo の PR は番号 (int・従来どおり)、他は `pr12x<6 桁>` の印 (`closed_prefix` で台帳のキーの前置きにする)
+    return events, sorted((pr if not scope else pr_tag(pr, scope)) for scope, pr in closed)
+
+
+def closed_prefix(kind, closed_item):
+    """`pr_events` の closed の 1 要素 → 台帳のキーの前置き。"""
+    tag = f'pr{closed_item}' if isinstance(closed_item, int) else closed_item
+    return f'ci-{kind}-{tag}-'
+
+
+def _head_of_scoped(head_of, pr, scope):
+    """`head_of` は (pr) か (pr, scope) を取れる。crewvia の repo (scope '') は従来どおり (pr) だけで呼ぶ。"""
+    return head_of(pr) if not scope else head_of(pr, scope)
 
 
 def event_key(event):
     """通知台帳のキー `(pr, head, 種類)`。head が変われば (修正 push) 別の通知。unknown は head が無いことがある。"""
     head = (event.get('head') or 'nohead')[:12]
-    return f"ci-{event['kind']}-pr{event['pr']}-{head}"
+    return f"ci-{event['kind']}-{pr_tag(event['pr'], event.get('scope') or '')}-{head}"
 
 
 def event_message(event):

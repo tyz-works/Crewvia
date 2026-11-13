@@ -3711,7 +3711,7 @@ def run_ci_poll():
                 if lib_ci_status.card_is_watched(meta):
                     tasks.append({'mission': slug, 'id': meta['id'], 'status': meta.get('status'),
                                   'pr_number': meta.get('pr_number'), 'target_dir': meta.get('target_dir') or None,
-                                  'task_slug': meta.get('task_slug')})
+                                  'pr_repo': meta.get('pr_repo'), 'task_slug': meta.get('task_slug')})
         changed = 0
         if tasks:
             changed = lib_ci_status.poll_cycle(
@@ -3762,7 +3762,8 @@ def run_ci_notify():
             for meta, body in list_tasks_for_mission(slug):
                 if lib_ci_status.card_is_watched(meta):
                     item = {'mission': slug, 'id': meta['id'], 'status': meta.get('status'),
-                            'pr_number': meta.get('pr_number'), 'target_dir': meta.get('target_dir') or None}
+                            'pr_number': meta.get('pr_number'), 'target_dir': meta.get('target_dir') or None,
+                            'pr_repo': meta.get('pr_repo')}
                     skills = set(meta.get('skills') or ()) & set(lib_ci_status.APPROVAL_SKILLS)
                     if skills:      # 承認 head の元 (review 系の task だけ。Result を読む)
                         item.update(skills=sorted(skills), completed_at=meta.get('completed_at'),
@@ -3773,24 +3774,34 @@ def run_ci_notify():
         # 同じ PR は 1 回 (キャッシュ)・件数は MAX_TASKS_PER_CYCLE・時間は poll と共通の deadline (run_ci_poll が置く) の残りで
         # timeout を切る。予算切れ・失敗は理由つきのエラー = その PR は今回は出さず次のサイクルで再試行 (候補の順は毎サイクル回す)。
         head_cache = {}
+        scope_where = {}
+        for it in tasks:
+            sc = lib_ci_status.pr_scope(it)
+            if sc:
+                scope_where.setdefault(sc, it)
         told_now = load_told()
         sent = set() if is_unreadable(told_now) else set(told_now)
 
-        def head_of(pr):
-            if pr not in head_cache:
+        def head_of(pr, scope=''):
+            # 鍵は (repo, PR)。crewvia の repo 以外 (pr_repo / target_dir の card) は gh の cwd と --repo をその card から決める
+            ckey = (scope, pr)
+            if ckey not in head_cache:
                 if len(head_cache) >= lib_ci_status.MAX_TASKS_PER_CYCLE:
                     return None, 'gh_budget'
                 left = (_CI_DEADLINE[0] or (time.monotonic() + lib_ci_status.CYCLE_BUDGET_SECONDS)) - time.monotonic()
                 if left < 1:
                     return None, 'gh_budget'
-                head_cache[pr] = lib_ci_status.fetch_pr_head(
-                    pr, cwd=str(REPO_ROOT), timeout=min(lib_ci_status.GH_TIMEOUT_SECONDS, left))
-            return head_cache[pr]
+                where = scope_where.get(scope) or {'target_dir': None, 'pr_repo': None}
+                cwd = where['target_dir'] if where['target_dir'] and os.path.isdir(where['target_dir']) else str(REPO_ROOT)
+                head_cache[ckey] = lib_ci_status.fetch_pr_head(
+                    pr, cwd=cwd, timeout=min(lib_ci_status.GH_TIMEOUT_SECONDS, left),
+                    repo_args=lib_ci_status.scope_repo_args(where))
+            return head_cache[ckey]
 
         events, closed = lib_ci_status.pr_events(tasks, registry_dir=REGISTRY_DIR, now=now,
                                                  warn=lambda msg: log(f"WARNING: {msg}"), head_of=head_of,
                                                  is_sent=sent.__contains__, rotate=int(now // 5))
-        live_unknown = {e['pr'] for e in events if e['kind'] == 'ci-unknown'}
+        live_unknown = {lib_ci_status.pr_tag(e['pr'], e.get('scope') or '') for e in events if e['kind'] == 'ci-unknown'}
         for ev in events:
             key = lib_ci_status.event_key(ev)
             fp = fingerprint(ev['pr'], ev.get('head'), ev['kind'])
@@ -3799,12 +3810,12 @@ def run_ci_notify():
         told = load_told()
         if not is_unreadable(told):
             # 解消・終端で台帳のキーを畳む: unknown が解けた PR の ci-unknown / MERGED・CLOSED の PR の全部
-            prefixes = [f'ci-{kind}-pr{pr}-' for pr in closed for kind in lib_ci_status.EVENT_KINDS]
+            prefixes = [lib_ci_status.closed_prefix(kind, pr) for pr in closed for kind in lib_ci_status.EVENT_KINDS]
             stale = [k for k in told if any(k.startswith(p) for p in prefixes)]
             for k in told:
                 if k.startswith('ci-ci-unknown-pr'):
-                    num = k[len('ci-ci-unknown-pr'):].split('-', 1)[0]
-                    if not num.isdigit() or int(num) not in live_unknown:
+                    tag = k[len('ci-ci-unknown-'):].split('-', 1)[0]
+                    if tag not in live_unknown:
                         stale.append(k)
             for k in stale:
                 clear_told_key(k)

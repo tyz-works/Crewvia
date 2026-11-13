@@ -65,6 +65,7 @@ CASES = {
     ("add", "--idle-timeout"): (None, ["add", "new", "--skills", "code", "--mission", M, "--idle-timeout", "abc"]),
     ("add", "--max-timeout"): (None, ["add", "new", "--skills", "code", "--mission", M, "--max-timeout", "abc"]),
     ("add", "--pr-number"): (None, ["add", "new", "--skills", "code", "--mission", M, "--pr-number", "abc"]),
+    ("add", "--pr-repo"): (None, ["add", "new", "--skills", "code", "--mission", M, "--pr-repo", "not a repo"]),
     ("add", "--deliverable"): (None, ["add", "new", "--skills", "code", "--mission", M, "--deliverable", "bogus"]),
     ("pull", "--mission"): ("Sora", ["pull", "--agent", "Sora", "--skills", "code", "--task", "t002", "--mission", NOPE]),
     ("pull", "--skills"): ("Sora", ["pull", "--agent", "Sora", "--task", "t002", "--mission", M, "--skills", ""]),
@@ -124,6 +125,7 @@ CASES = {
     ("update", "--priority"): ("Director", ["update", "t001", "--reset", "--mission", M, "--priority", "urgent"]),
     ("update", "--status"): ("Director", ["update", "t001", "--reset", "--mission", M, "--status", "bogus"]),
     ("update", "--pr-number"): ("Director", ["update", "t001", "--reset", "--mission", M, "--pr-number", "invalid"]),
+    ("update", "--pr-repo"): ("Director", ["update", "t001", "--reset", "--mission", M, "--pr-repo", "not a repo"]),
     ("update", "--deliverable"): ("Director", ["update", "t001", "--reset", "--mission", M, "--deliverable", "bogus"]),
     ("update", "--idle-timeout"): ("Director", ["update", "t001", "--reset", "--mission", M, "--idle-timeout", "abc"]),
     ("update", "--max-timeout"): ("Director", ["update", "t001", "--reset", "--mission", M, "--max-timeout", "abc"]),
@@ -148,6 +150,7 @@ EXEMPT = {
 NO_OPTION_SUBCOMMANDS = {"archive", "review", "launch"}
 
 
+@pytest.mark.structural
 def test_every_option_of_every_mutating_subcommand_is_in_the_table():
     found = _mutating_options()
     assert found, "queue を書くサブコマンドを 1 つも導けなかった"

@@ -125,7 +125,7 @@ set -euo pipefail
 #                              PR 番号から、その PR を作った task を <mission_slug>/<task_id> で 1 行出す
 #                              (repo の絞り込みは pull と同じ規則: --target-dir flag > TARGET_DIR env > crewvia 本体)
 #                              (読み取り専用。pr-base と同じく決められなければ exit 1・stdout 空。詳細は cmd_resolve_pr)
-#   plan.sh ci-gate <pr_number> [--target-dir <dir>]
+#   plan.sh ci-gate <pr_number> [--target-dir <dir> | --repo <owner/name>]
 #                              PR の CI の門 (読み取り専用。通すとき exit 0、通さないとき exit 1 + 理由 1 行。設計: knowledge/ci-wait-operations.md §2.2)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -2720,7 +2720,7 @@ USAGE = {
     'add': ('plan.sh add "<title>" [--mission <slug>] --skills <csv> [--blocked-by <csv>]\n'
             '                     [--priority high|medium|low] [--description <text>]\n'
             '                     [--target-dir <path>] [--idle-timeout <s>] [--max-timeout <s>]\n'
-            '                     [--pr-number <N>] [--deliverable pr|file|none]'),
+            '                     [--pr-number <N>] [--pr-repo <owner/name>] [--deliverable pr|file|none]'),
     'pull': ('plan.sh pull [--mission <slug>] [--skills <csv>] [--agent <name>]\n'
              '                    [--target-dir <path>] [--task <task_id>]\n'
              '                    (--agent も AGENT_NAME も空なら exit 1 で拒否)'),
@@ -2731,7 +2731,7 @@ USAGE = {
              '                     [--mission <slug>] [--execution <id>]'),
     'update': ('plan.sh update <task_id> [--mission <slug>] [--skills <csv>] [--blocked-by <csv>]\n'
                '                       [--priority high|medium|low] [--worker <name>] [--status <status>]\n'
-               '                       [--description <text>] [--reset] [--pr-number <N>]\n'
+               '                       [--description <text>] [--reset] [--pr-number <N>] [--pr-repo <owner/name|null>]\n'
                '                       [--deliverable pr|file|none]\n'
                '                       [--idle-timeout <s>] [--max-timeout <s>]\n'
                '       plan.sh update <task_id> --close-execution [--mission <slug>]'),
@@ -2762,7 +2762,7 @@ USAGE = {
     'history': 'plan.sh history <task_id> [--mission <slug>]',
     'pr-base': 'plan.sh pr-base [--mission <slug> --task <task_id>] [--diff-ref]',
     'resolve-pr': 'plan.sh resolve-pr <pr_number> [--target-dir <dir>]',
-    'ci-gate': 'plan.sh ci-gate <pr_number> [--target-dir <dir>]',
+    'ci-gate': 'plan.sh ci-gate <pr_number> [--target-dir <dir> | --repo <owner/name>]',
 }
 
 #: サブコマンドごとに受け付ける positional の数 (最小, 最大)。余剰は黙って捨てず拒否する
@@ -3130,6 +3130,24 @@ def _default_timeout_max_for_skills(skills):
     return max(candidates) if candidates else None
 
 
+def _parse_pr_repo_opt(opts, allow_clear):
+    """`--pr-repo owner/name` → 小文字化した文字列 / None (指定なし) / '' (消す。update の null だけ)。
+    形の検査は `lib_ci_status.pr_repo_of` の 1 か所 (取得側と同じ定義)。"""
+    raw = opts.get('--pr-repo')
+    if raw is None:
+        return None
+    raw = raw.strip()
+    if allow_clear and raw.lower() in ('null', 'none', ''):
+        return ''
+    try:
+        repo = _CI_STATUS.pr_repo_of({'pr_repo': raw})
+    except ValueError:
+        repo = None
+    if not repo:
+        die("--pr-repo must be owner/name" + (" (or 'null' to clear)" if allow_clear else ""))
+    return repo
+
+
 def cmd_add(args):
     opts, positional = parse_opts(args, {
         '--mission': 'value',
@@ -3141,10 +3159,12 @@ def cmd_add(args):
         '--idle-timeout': 'value',
         '--max-timeout': 'value',
         '--pr-number': 'value',
+        '--pr-repo': 'value',
         '--deliverable': 'value',
     })
     if not positional:
         die("add requires a task title")
+    pr_repo = _parse_pr_repo_opt(opts, allow_clear=False)
     deliverable = _parse_deliverable_opt(opts)
     title = positional[0]
     sync_holder = [None]  # (slug, task_id, title, skills, priority, blocked_by)
@@ -3257,6 +3277,8 @@ def cmd_add(args):
             meta['timeout'] = timeout
         if pr_number is not None:
             meta['pr_number'] = pr_number
+        if pr_repo:
+            meta['pr_repo'] = pr_repo
         if deliverable is not None:
             meta['deliverable'] = deliverable
         body = build_task_body(description, '')
@@ -3584,7 +3606,7 @@ def cmd_ci_gate(args):
     絞る = `resolve-pr` と同じ規則) の `registry/ci/` の記録のうち `observed_at` が最も新しいもの。PR の現 head は
     門を引く瞬間に gh で取り直す。
     """
-    opts, positional = parse_opts(args, {'--target-dir': 'value'})
+    opts, positional = parse_opts(args, {'--target-dir': 'value', '--repo': 'value'})
     try:
         pr_number = int(positional[0])
     except ValueError:
@@ -3598,6 +3620,19 @@ def cmd_ci_gate(args):
     else:
         env_td = os.environ.get('TARGET_DIR', '').strip()
         effective_target = os.path.abspath(env_td) if env_td else None
+    # 束ねる範囲 (repo, PR) は lib_ci_status.pr_scope の 1 か所。--repo owner/name があれば pr_repo の card だけを見る
+    if '--repo' in opts:
+        try:
+            gate_probe = {'pr_repo': opts['--repo'] or None, 'target_dir': None}
+            if not _CI_STATUS.pr_repo_of(gate_probe):
+                raise ValueError('empty')
+        except ValueError:
+            _usage_exit("--repo は owner/name の形で指定してください")
+        gate_scope = _CI_STATUS.pr_scope(gate_probe)
+        effective_target = None
+    else:
+        gate_scope = _CI_STATUS.pr_scope({'target_dir': effective_target})
+        gate_probe = {'target_dir': effective_target}
 
     def deny(reason):
         print(f"ci-gate: DENY PR #{pr_number} {reason}")
@@ -3611,7 +3646,7 @@ def cmd_ci_gate(args):
     reviews = []
     for slug in list(state.get('active_missions') or []):
         for meta, _body in list_tasks(slug, quiet=True):
-            if meta.get('pr_number') != pr_number or (meta.get('target_dir') or None) != effective_target:
+            if meta.get('pr_number') != pr_number or _CI_STATUS.pr_scope(meta) != gate_scope:
                 continue
             if set(meta.get('skills') or ()) & set(_CI_STATUS.APPROVAL_SKILLS):
                 reviews.append({'status': meta.get('status'), 'completed_at': meta.get('completed_at'),
@@ -3621,7 +3656,8 @@ def cmd_ci_gate(args):
                 newest = rec
     if newest is None:
         deny('unknown:no_record')
-    head, err = _CI_STATUS.fetch_pr_head(pr_number, cwd=effective_target or REPO_ROOT)
+    head, err = _CI_STATUS.fetch_pr_head(pr_number, cwd=effective_target or REPO_ROOT,
+                                         repo_args=_CI_STATUS.scope_repo_args(gate_probe))
     ok, reason = _CI_STATUS.gate_verdict(newest, pr_head=head if err is None else None, now=time.time())
     if err is not None and not ok:
         reason = f'unknown:{err}'
@@ -5119,7 +5155,24 @@ def propagate_pr_number(slug, task_id, pr_number):
                   f" — {', '.join(sorted(ancestors))} — どの PR か一意でないため)",
                   file=sys.stderr)
             continue
+        # 上流が pr_repo (別 repo の PR) を持つなら、下流にも同じ pr_repo を伝える。
+        # 伝えないと review / codex-review が crewvia の同じ番号の PR を見る (t001 / PR #388 の P2)。
+        try:
+            up_repo = _CI_STATUS.pr_repo_of(tasks_by_id.get(task_id) or {})
+            down_repo = _CI_STATUS.pr_repo_of(meta)
+        except ValueError:
+            print(f"[plan.sh] PR #{pr_number} を {slug}/{tid} には書きませんでした"
+                  f" (pr_repo の形が正しくない card があり repo を決められない)", file=sys.stderr)
+            continue
+        if up_repo and down_repo and down_repo != up_repo:
+            print(f"[plan.sh] PR #{pr_number} を {slug}/{tid} には書きませんでした"
+                  f" (pr_repo が食い違う: 上流 {up_repo} / この task {down_repo}"
+                  f" — どちらが正しいか決められないため。直してから update --pr-number で)",
+                  file=sys.stderr)
+            continue
         meta['pr_number'] = pr_number
+        if up_repo:
+            meta['pr_repo'] = up_repo
         how = 'pr_number'
         if 'codex-review' in skills and meta.get('status') == 'blocked':
             meta['status'] = 'pending'
@@ -7067,6 +7120,7 @@ def cmd_update(args):
         '--description': 'value',
         '--reset': 'bool',
         '--pr-number': 'value',
+        '--pr-repo': 'value',
         '--deliverable': 'value',
         '--close-execution': 'bool',
         '--idle-timeout': 'value',
@@ -7174,6 +7228,8 @@ def cmd_update(args):
                 if pr_number_update <= 0:
                     die("--pr-number must be a positive integer (or 'null' to clear)")
 
+        pr_repo_update = _parse_pr_repo_opt(opts, allow_clear=True)
+
         reset_by_controller = False
         if opts.get('--reset'):
             # Capture old worker BEFORE nulling it (needed to clean up assignment file)
@@ -7273,6 +7329,14 @@ def cmd_update(args):
             else:
                 meta['pr_number'] = pr_number_update
                 changed.append(f"pr_number={pr_number_update}")
+
+        if pr_repo_update is not None:
+            if pr_repo_update == '':
+                meta.pop('pr_repo', None)
+                changed.append('pr_repo=null')
+            else:
+                meta['pr_repo'] = pr_repo_update
+                changed.append(f"pr_repo={pr_repo_update}")
 
         if deliverable is not None:
             meta['deliverable'] = deliverable

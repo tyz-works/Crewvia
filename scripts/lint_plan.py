@@ -156,6 +156,14 @@ def check_frontmatter(tasks: list[dict]) -> list[tuple[str, str, str]]:
                 results.append(('FAIL', 'frontmatter',
                                 f"{prefix}: status 'needs_director' requires a non-empty 'needs_director_reason'"))
 
+        # `pr_repo` (PR の持ち主の repo。t001): 形が違う card は CI の取得も通知も門もしない (fail-closed) ので、先に FAIL にする。
+        # 形の定義は lib_ci_status.pr_repo_of の 1 か所 (複製しない)。
+        if meta.get('pr_repo') is not None:
+            try:
+                _import_scripts_module('lib_ci_status').pr_repo_of(meta)
+            except ValueError:
+                results.append(('FAIL', 'frontmatter', f"{prefix}: 'pr_repo' must be owner/name"))
+
         if not results or all(level != 'FAIL' for level, *_ in results):
             pass  # OK entries added by caller
 

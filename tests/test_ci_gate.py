@@ -240,3 +240,34 @@ def test_cli_ignores_a_record_of_another_pr_and_another_repo(repo):
 def test_cli_usage_errors_are_exit_1_and_stdout_empty(repo, args):
     p = gate(repo, *args)
     assert p.returncode == 1 and not p.stdout.startswith("ci-gate: PASS")
+
+
+# --- t001: card の pr_repo で (repo, PR) を束ねる ---
+
+def test_cli_gate_binds_records_by_pr_repo(repo):
+    import time
+    done_with_pr(repo)
+    u = repo.plan("update", "t001", "--pr-repo", "Tyz-Works/Irc-Relay", "--mission", MISSION)
+    assert u.returncode == 0, u.stderr
+    put_gh(repo)
+    write_rec(repo, rec(observed=time.time() - 5))
+    # crewvia の repo の #313 としては記録が無い (別 repo の PR の記録を使わない)
+    assert gate(repo, "313").stdout == "ci-gate: DENY PR #313 unknown:no_record\n"
+    assert gate(repo, "313", "--repo", "other/repo").stdout == "ci-gate: DENY PR #313 unknown:no_record\n"
+    p = gate(repo, "313", "--repo", "tyz-works/irc-relay")
+    assert p.returncode == 0 and f"PASS PR #313 head={HEAD}" in p.stdout, p.stderr
+
+
+@pytest.mark.parametrize("bad", ["nope", "a/b/c", ""])
+def test_cli_gate_rejects_a_bad_repo_and_update_rejects_a_bad_pr_repo(repo, bad):
+    done_with_pr(repo)
+    assert gate(repo, "313", "--repo", bad).returncode == 1
+    assert repo.plan("update", "t001", "--pr-repo", bad if bad else "x", "--mission", MISSION).returncode != 0 or bad == ""
+
+
+def test_update_pr_repo_can_be_cleared(repo):
+    done_with_pr(repo)
+    assert repo.plan("update", "t001", "--pr-repo", "a/b", "--mission", MISSION).returncode == 0
+    assert repo.plan("update", "t001", "--pr-repo", "null", "--mission", MISSION).returncode == 0
+    card = next((repo.root / "queue" / "missions" / MISSION / "tasks").glob("t001.md")).read_text()
+    assert "pr_repo" not in card

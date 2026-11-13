@@ -287,6 +287,8 @@ def record_problem(data):
         streak = data['unknown_streak']
         if isinstance(streak, bool) or not isinstance(streak, int) or streak < 0:
             return "'unknown_streak' is not a non-negative integer"
+    if 'scope' in data and data['scope'] is not None and not isinstance(data['scope'], str):
+        return "'scope' is not a string or None"
     return None
 
 
@@ -495,16 +497,30 @@ def pr_tag(pr, scope=''):
     return f'pr{pr}x{t}' if t else f'pr{pr}'
 
 
-def record_matches_card(record, pr_number):
+#: `record_matches_card` / `read_record` の `scope` 引数の既定値 (「呼び出し元が scope を検査しない」の印。
+#: `None` は「repo を決められない」という有効な scope の値 (`pr_scope` が返す) なので既定値に使えない)。
+SCOPE_UNCHECKED = object()
+
+
+def record_matches_card(record, pr_number, scope=SCOPE_UNCHECKED):
     """card が PR を名指ししていて、記録がそれと違う PR (PR 無し・不明を含む) を指していれば False。
-    #314 r2: 別の PR の CI を、今の PR の状況として出さない (PR を作り直した・card の pr_number が後から付いた)。"""
+    #314 r2: 別の PR の CI を、今の PR の状況として出さない (PR を作り直した・card の pr_number が後から付いた)。
+
+    `scope` (`pr_scope(task)` の値) を渡すと、記録の `scope` 欄と食い違う記録も False にする (t013 / PR #388 P1:
+    pr_number を変えずに `pr_repo` を変えた・消した card が、別 repo の古い記録をそのまま再利用しない)。
+    記録に `scope` 欄が無い (この検査より前に書かれた記録) ときは検査しない (無い欄を不一致にすると、既存の
+    記録が一律取り直しになる)。"""
     want = card_pr(pr_number)
-    return want is None or record.get('pr') == want
+    if want is not None and record.get('pr') != want:
+        return False
+    if scope is not SCOPE_UNCHECKED and 'scope' in record and record.get('scope') != scope:
+        return False
+    return True
 
 
-def read_record(registry_dir, mission, task_id, warn=None, pr_number=None):
-    """記録 / None (無い・読めない・壊れている・名前が不正・card の `pr_number` と違う PR。表示は出さないだけ)。
-    `pr_number` は読み手が持っている card の値 (無ければ照合しない)。"""
+def read_record(registry_dir, mission, task_id, warn=None, pr_number=None, scope=SCOPE_UNCHECKED):
+    """記録 / None (無い・読めない・壊れている・名前が不正・card の `pr_number` と違う PR・`scope` が違う。表示は出さないだけ)。
+    `pr_number` / `scope` は読み手が持っている card の今の値 (無ければ照合しない)。"""
     try:
         path = record_path(registry_dir, mission, task_id)
     except ValueError:
@@ -512,7 +528,7 @@ def read_record(registry_dir, mission, task_id, warn=None, pr_number=None):
     data = load_json_store(path, check=record_problem, warn=warn)
     if is_missing(data) or is_unreadable(data):
         return None
-    if not record_matches_card(data, pr_number):
+    if not record_matches_card(data, pr_number, scope=scope):
         return None
     return data
 
@@ -593,9 +609,14 @@ def fetch_pr_head(pr, *, cwd, timeout=GH_TIMEOUT_SECONDS, runner=subprocess.run,
     return head, None
 
 
-def _unknown(pr, reason, now):
-    return {'pr': pr, 'head': None, 'state': 'unknown', 'checks': [], 'observed_at': now,
-            'summary': f"CI {('PR #%d ' % pr) if pr else ''}unknown", 'reason': reason}
+def _unknown(pr, reason, now, scope=SCOPE_UNCHECKED):
+    """`scope` を省略した記録には `scope` 欄を持たせない (`record_matches_card` が「旧版が書いた」として検査を
+    スキップする側。`observe_task` は必ず実際に決めた scope を渡す — 省略は直接呼ぶテストだけの経路)。"""
+    rec = {'pr': pr, 'head': None, 'state': 'unknown', 'checks': [], 'observed_at': now,
+           'summary': f"CI {('PR #%d ' % pr) if pr else ''}unknown", 'reason': reason}
+    if scope is not SCOPE_UNCHECKED:
+        rec['scope'] = scope
+    return rec
 
 
 def observe_task(task, *, repo_root, branch_of, now, timeout, runner=subprocess.run, deadline=None,
@@ -621,7 +642,7 @@ def observe_task(task, *, repo_root, branch_of, now, timeout, runner=subprocess.
     if scope is None:
         # repo が決められない (pr_repo の形が違う): gh を呼ばない。PR を card の値で記録し、毎サイクルは取り直さない終端にする
         return {'pr': card_pr(task.get('pr_number')), 'head': None, 'state': 'no_pr', 'checks': [], 'observed_at': now,
-                'summary': 'no PR', 'reason': 'bad_pr_repo', 'pr_state': 'NOT_FOUND'}
+                'summary': 'no PR', 'reason': 'bad_pr_repo', 'pr_state': 'NOT_FOUND', 'scope': None}
     repo_args = scope_repo_args(task)
     cwd = task.get('target_dir') or repo_root
     if scope.startswith('repo:'):
@@ -629,47 +650,53 @@ def observe_task(task, *, repo_root, branch_of, now, timeout, runner=subprocess.
         cwd = repo_root
     elif task.get('target_dir') and not os.path.isdir(cwd):
         # card の PR を入れる (#314 r3: None で書くと読み手の照合で隠れ、poll_cycle も毎サイクル取り直す)
-        return _unknown(card_pr(task.get('pr_number')), 'target_dir_missing', now)
+        return _unknown(card_pr(task.get('pr_number')), 'target_dir_missing', now, scope=scope)
     pr = card_pr(task.get('pr_number'))
     if pr is None:
         branch = branch_of(task)
         if not branch:
-            return _unknown(None, 'no_branch', now)
+            return _unknown(None, 'no_branch', now, scope=scope)
         out, err = gh(['pr', 'list', '--head', branch, '--state', 'open', '--json', 'number,isCrossRepository', *repo_args])
         if err:
-            return _unknown(None, err, now)
+            return _unknown(None, err, now, scope=scope)
         try:
             pr = parse_pr_list(out)
         except ValueError:
-            return _unknown(None, 'bad_pr_list', now)
+            return _unknown(None, 'bad_pr_list', now, scope=scope)
         if pr is None:
             return {'pr': None, 'head': None, 'state': 'no_pr', 'checks': [], 'observed_at': now,
-                    'summary': 'no PR'}
+                    'summary': 'no PR', 'scope': scope}
     key = (scope, pr)
     if by_pr is not None and key in by_pr:
         return dict(by_pr[key], observed_at=now)
-    rec = _view(pr, gh, now, repo_args)
+    rec = _view(pr, gh, now, repo_args, scope=scope)
     if by_pr is not None:
         by_pr[key] = rec
     return rec
 
 
-def _view(pr, gh, now, repo_args=()):
+def _view(pr, gh, now, repo_args=(), scope=SCOPE_UNCHECKED):
+    """`scope` を省略すると記録に `scope` 欄を持たせない (`_unknown` と同じ省略の扱い。`observe_task` は常に渡す)。"""
     out, err = gh(['pr', 'view', str(pr), '--json', 'headRefOid,statusCheckRollup,state', *repo_args])
     if err == 'gh_pr_not_found':
         # card の持ち主の repo を判別できない (別 repo の PR 番号) か、本当に無い PR。誤った PR の CI を通知しない側に倒し、
         # 終端として記録する (unknown にすると毎サイクル取り直し、3 回で ci-unknown を出す)
-        return {'pr': pr, 'head': None, 'state': 'no_pr', 'checks': [], 'observed_at': now,
-                'summary': 'no PR', 'reason': err, 'pr_state': 'NOT_FOUND'}
+        rec = {'pr': pr, 'head': None, 'state': 'no_pr', 'checks': [], 'observed_at': now,
+               'summary': 'no PR', 'reason': err, 'pr_state': 'NOT_FOUND'}
+        if scope is not SCOPE_UNCHECKED:
+            rec['scope'] = scope
+        return rec
     if err:
-        return _unknown(pr, err, now)
+        return _unknown(pr, err, now, scope=scope)
     try:
         head, checks = parse_view(out)
         pr_state = parse_pr_state(out)
     except ValueError:
-        return _unknown(pr, 'bad_json', now)
+        return _unknown(pr, 'bad_json', now, scope=scope)
     rec = {'pr': pr, 'head': head, 'state': overall_state(checks), 'checks': checks, 'observed_at': now,
            'summary': summarize(pr, head, checks)}
+    if scope is not SCOPE_UNCHECKED:
+        rec['scope'] = scope
     if pr_state is not None:        # 同じ呼び出しで取る (MERGED / CLOSED は poll_cycle が終端として扱う)
         rec['pr_state'] = pr_state
     return rec
@@ -685,9 +712,13 @@ def card_is_watched(task):
     return status in FOLLOW_STATUSES and card_pr(task.get('pr_number')) is not None
 
 
-def pr_closed(record, pr_number):
-    """card が PR を名指ししていて、その PR の記録が MERGED / CLOSED を言っている (= 取得の対象から外す)。"""
-    return (record is not None and card_pr(pr_number) is not None and record_matches_card(record, pr_number)
+def pr_closed(record, pr_number, scope=SCOPE_UNCHECKED):
+    """card が PR を名指ししていて、その PR の記録が MERGED / CLOSED を言っている (= 取得の対象から外す)。
+
+    `scope` を渡すと、記録の scope が card の今の scope と食い違う記録は終端として扱わない (t013 / PR #388 P1:
+    pr_repo を変えて別 repo を指すようになった card が、古い repo の NOT_FOUND / MERGED / CLOSED の記録に
+    永久に塞がれて取り直さない、を防ぐ)。"""
+    return (record is not None and card_pr(pr_number) is not None and record_matches_card(record, pr_number, scope=scope)
             and record.get('pr_state') in PR_TERMINAL_STATES)
 
 
@@ -722,11 +753,12 @@ def poll_cycle(tasks, *, registry_dir, repo_root, branch_of, poll_seconds=DEFAUL
             if warn:
                 warn(f'ci: skip task with a bad name ({e})')
             continue
+        scope = pr_scope(t)
         prev = read_record(registry_dir, t['mission'], t['id'], warn=warn)
-        if pr_closed(prev, t.get('pr_number')):
-            continue        # 終端 (MERGED / CLOSED): もう取りに行かない。card の pr_number が変われば pr_closed が False になる
-        # card の PR と違う PR の記録は間隔を待たずに取り直す (#314 r2。読み手もその記録は出さない)
-        if (prev is not None and record_matches_card(prev, t.get('pr_number'))
+        if pr_closed(prev, t.get('pr_number'), scope=scope):
+            continue        # 終端 (MERGED / CLOSED): もう取りに行かない。card の pr_number / scope が変われば pr_closed が False になる
+        # card の PR・scope と違う記録は間隔を待たずに取り直す (#314 r2 / t013: pr_repo を変えた・消した card も)
+        if (prev is not None and record_matches_card(prev, t.get('pr_number'), scope=scope)
                 and now - prev['observed_at'] < poll_interval(prev, poll_seconds, concluded_seconds)):
             continue
         due.append((prev['observed_at'] if prev else -math.inf, t, prev))
@@ -752,11 +784,12 @@ def poll_cycle(tasks, *, registry_dir, repo_root, branch_of, poll_seconds=DEFAUL
         except Exception as e:  # noqa: BLE001 — 1 つの task の想定外で他の task を止めない
             if warn:
                 warn(f"ci: observe {t['mission']}/{t['id']} failed: {type(e).__name__}")
-            rec = _unknown(card_pr(t.get('pr_number')), 'internal_error', now)
+            rec = _unknown(card_pr(t.get('pr_number')), 'internal_error', now, scope=pr_scope(t))
         rec = dict(rec)
         rec.pop('unknown_streak', None)
         if rec['state'] == 'unknown':       # 連続した回数 (ci-unknown の条件。一過性の失敗で騒がない)
-            was = prev is not None and prev.get('state') == 'unknown' and record_matches_card(prev, t.get('pr_number'))
+            was = (prev is not None and prev.get('state') == 'unknown'
+                   and record_matches_card(prev, t.get('pr_number'), scope=rec.get('scope')))
             rec['unknown_streak'] = (prev.get('unknown_streak', 1) if was else 0) + 1
         if not write_record(registry_dir, t['mission'], t['id'], rec):
             if warn:
@@ -811,7 +844,7 @@ def pr_events(tasks, *, registry_dir, now, warn=None, head_of=None, is_sent=None
             reviews.setdefault(k, []).append(
                 {'status': t.get('status'), 'completed_at': t.get('completed_at'), 'result': t.get('result')})
         try:
-            rec = read_record(registry_dir, t['mission'], t['id'], warn=warn, pr_number=pr_number)
+            rec = read_record(registry_dir, t['mission'], t['id'], warn=warn, pr_number=pr_number, scope=scope)
         except Exception:  # noqa: BLE001 — 通知の元の読み取りが想定外でも他の PR を止めない
             continue
         if rec is None or rec.get('pr') != pr_number:
@@ -865,14 +898,14 @@ def pr_events(tasks, *, registry_dir, now, warn=None, head_of=None, is_sent=None
                 events.append({'kind': 'merge-ready', 'pr': pr_number, 'scope': scope, 'head': current, 'checks': [], 'reason': None})
             else:
                 events.append({'kind': 'ci-green', 'pr': pr_number, 'scope': scope, 'head': current, 'checks': [], 'reason': why})
-    # 台帳の掃除用: crewvia の repo の PR は番号 (int・従来どおり)、他は `pr12x<6 桁>` の印 (`closed_prefix` で台帳のキーの前置きにする)
-    return events, sorted((pr if not scope else pr_tag(pr, scope)) for scope, pr in closed)
+    # 台帳の掃除用: 鍵は常に `pr_tag` の文字列 (t013 / PR #388 の P1: 既定 repo は int・他は str という 2 つの型が
+    # 同じ sort() に混ざると比較できず TypeError になる。型を 1 つに揃える — `closed_prefix` で台帳のキーの前置きにする)
+    return events, sorted(pr_tag(pr, scope) for scope, pr in closed)
 
 
 def closed_prefix(kind, closed_item):
-    """`pr_events` の closed の 1 要素 → 台帳のキーの前置き。"""
-    tag = f'pr{closed_item}' if isinstance(closed_item, int) else closed_item
-    return f'ci-{kind}-{tag}-'
+    """`pr_events` の closed の 1 要素 (`pr_tag` の文字列) → 台帳のキーの前置き。"""
+    return f'ci-{kind}-{closed_item}-'
 
 
 def _head_of_scoped(head_of, pr, scope):

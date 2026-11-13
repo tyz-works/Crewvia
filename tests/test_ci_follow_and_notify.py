@@ -203,7 +203,7 @@ def test_unknown_gives_an_event_only_after_three_polls(tmp_path):
 def test_terminal_prs_give_no_event_and_are_reported_as_closed(tmp_path):
     _write(tmp_path, "t001", 313, RED, pr_state="MERGED")
     evs, closed = events(tmp_path, [task(status="done", pr=313)])
-    assert evs == [] and closed == [313]
+    assert evs == [] and closed == [ci.pr_tag(313, "")]
 
 
 def test_several_tasks_on_one_pr_give_one_event_from_the_newest_record(tmp_path):
@@ -399,11 +399,11 @@ def test_a_terminal_record_on_one_task_silences_the_other_tasks_of_the_same_pr(t
     _write(tmp_path, "t006", 382, GREEN, observed=NOW + (3 if terminal_is_newer else 0), pr_state=pr_state)
     tasks = [task(id_="t005", status="done", pr=382), task(id_="t006", status="done", pr=382)]
     evs, closed = events(tmp_path, tasks)
-    assert evs == [] and closed == [382]
+    assert evs == [] and closed == [ci.pr_tag(382, "")]
 
 
 def test_a_terminal_pr_does_not_silence_another_pr(tmp_path):
     _write(tmp_path, "t005", 382, GREEN, pr_state="MERGED")
     _write(tmp_path, "t006", 383, GREEN)
     evs, closed = events(tmp_path, [task(id_="t005", status="done", pr=382), task(id_="t006", status="done", pr=383)])
-    assert [e["pr"] for e in evs] == [383] and closed == [382]
+    assert [e["pr"] for e in evs] == [383] and closed == [ci.pr_tag(382, "")]

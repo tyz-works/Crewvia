@@ -3275,6 +3275,9 @@ def dispatch():
     # PR-B: 判断待ちが続いたら 5 分で Director に再通知・10 分で Telegram (設計 §5)。all_tasks を使い回す。
     run_escalation_cycle(all_tasks, done_ids_by_mission, task_statuses_by_mission, active_missions)
 
+    # mission の停滞 (進行中も割り当てられる task も 0 件が続く) を Director に 1 回 (scripts/lib_stall.py)
+    run_stall_cycle(all_tasks, done_ids_by_mission, task_statuses_by_mission, active_missions, live_state_keys)
+
     # t010: 状態を離れた task の「伝えた」記録を捨てる (Director が pending に戻し、
     # 同じ理由でまた落ちたのは新しい事象なので、届かなければならない)。
     prune_told(live_state_keys, observed_missions(all_tasks, active_missions))
@@ -3535,6 +3538,28 @@ def run_escalation_cycle(all_tasks, done_ids_by_mission, task_statuses_by_missio
             trouble=_escalation_trouble)
     except Exception as e:
         log(f'[escalation] cycle failed: {type(e).__name__}')
+
+
+def run_stall_cycle(all_tasks, done_ids_by_mission, task_statuses_by_mission, active_missions, live_state_keys):
+    """mission の停滞検知 (lib_stall)。判定は純粋関数・ここは入力を集めて既存の通知台帳越しに送るだけ。
+    停滞が続く間の通知台帳のキーは live_state_keys に足し、解けたら prune_told が畳む (解けた後の同じ停滞は新しい事象)。"""
+    try:
+        import lib_daemon_watch
+        import lib_stall
+        threshold = lib_daemon_watch.load_config().stall_notify_seconds
+
+        def notify(key, fp, slug, text):
+            return notify_state_once(key, fp, 'stall', slug, 'stall', lambda: text,
+                                     director_live=director_live_for_state_notices)
+
+        sent = lib_stall.run_cycle(
+            REGISTRY_DIR, all_tasks, done_ids_by_mission, task_statuses_by_mission, list(active_missions),
+            observed_missions(all_tasks, active_missions), time.time(), threshold,
+            notify=notify, live_keys=live_state_keys, log=log)
+        for slug in sent:
+            log(f"[stall] mission {slug} -> notified director")
+    except Exception as e:
+        log(f'[stall] cycle failed: {type(e).__name__}')
 
 
 # ---------------------------------------------------------------------------

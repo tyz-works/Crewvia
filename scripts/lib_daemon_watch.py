@@ -247,6 +247,8 @@ DAEMON_RESTART_FILES = {
         "scripts/lib_retirement.py",
         # machine-local-config PR-2: lib_mux / lib_daemon_watch が config の読み口として import する
         "scripts/lib_config.py",
+        # mission の停滞検知 (dispatcher の run_stall_cycle が呼ぶ。呼ぶ時に import するが、起動後の変更は拾わない)
+        "scripts/lib_stall.py",
     ),
     DAEMON_WATCHDOG: (
         "scripts/watchdog.py",
@@ -941,6 +943,9 @@ class WatchConfig:
     #: PR の CI を問い合わせる最短の間隔 (秒。task ごと)。dispatcher だけが読む (`lib_ci_status.poll_cycle`)。
     #: **env は付けない** — 見える化の周期であって共有規則でも停止スイッチでもない。正の整数だけ受け入れる。
     ci_poll_seconds: int = 60
+    #: mission の停滞 (進行中も割り当てられる task も 0 件) がこの秒数続いたら Director に 1 回知らせる。dispatcher だけが読む
+    #: (`lib_stall`)。**env は付けない** — 共有規則でも停止スイッチでもない (0 以下 = 無効)。既定値を持つのはここ 1 か所。
+    stall_notify_seconds: int = 900
     #: How long each side waits for the per-daemon lock (see `daemon_lock`).
     #: The watch side is short on purpose — a watcher that blocks on the lock
     #: is a watcher that is not running its own daemon's cycle, and holding is
@@ -1009,6 +1014,11 @@ def load_config(config_path=None, env=None) -> WatchConfig:
             value = int(block["ci_poll_seconds"])
             if value > 0:
                 cfg.ci_poll_seconds = value
+        except (TypeError, ValueError):
+            pass
+    if "stall_notify_seconds" in block:         # 0 以下は「無効」の意味なので、型だけ見て受け入れる
+        try:
+            cfg.stall_notify_seconds = int(block["stall_notify_seconds"])
         except (TypeError, ValueError):
             pass
     if "checkpoint_seconds" in block:

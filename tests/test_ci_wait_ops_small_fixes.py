@@ -80,3 +80,19 @@ def test_reopen_drops_leftover_sections_but_keeps_known_appendices(tmp_path):
     assert "前回の P2" not in kept and "本文" not in kept
     assert "## Needs-Director 詳細\n詳細" in kept and "## Verification\nv" in kept
     assert ns["keep_known_appendices"]("") == ""
+
+
+# -- フェンスは数えない: 行頭 `## ` は全部 `### ` に下げる (t003 方針変更。#382 P3-1 は許容として扱う) ----------
+
+FENCE = "`" * 3
+
+
+def test_headings_inside_fence_are_demoted_too_and_approved_head_stays_readable(tmp_path):
+    ns = _ns(tmp_path)
+    stored = ns["demote_section_headings"](f"LGTM\n{FENCE}\n## note\napproved_head: {SHA}")
+    assert "\n### note" in stored                      # フェンスの中も下がる (許容)
+    body = ns["build_task_body"]("d", stored)
+    body += f"\n## Needs-Director 詳細\nlog:\n{FENCE}\nx\n{FENCE}\n## Verification\nv\n{FENCE}\ny\n{FENCE}\n"
+    assert ci.approved_head(lib_history.result_section(body)) == SHA
+    trailing = ns["extract_trailing_body_section"](body)
+    assert trailing.startswith("## Needs-Director 詳細") and "## Verification" in trailing

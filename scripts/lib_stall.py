@@ -105,14 +105,18 @@ def fingerprint(slug, stall):
 
 
 def message(slug, stall, elapsed_seconds):
-    """Director への 1 通 (1 行。card 由来の語は `_one_line` で無害化済み)。"""
+    """Director への 1 通 (1 行。card 由来の語は `_one_line` で無害化済み)。`elapsed_seconds=None` は「測れない」。"""
     shown = stall.stuck[:MAX_LISTED]
     items = ', '.join(f'{tid} ({status}: {why})' for tid, status, why in shown)
     if len(stall.stuck) > len(shown):
         items += f' ほか {len(stall.stuck) - len(shown)} 件'
     last = f'直前に done になった task: {stall.last_done}。' if stall.last_done else ''
-    minutes = max(0, int(elapsed_seconds // 60))
-    return (f'[stall] mission {slug} が {minutes} 分止まっています (進行中の task も、割り当てられる pending も 0 件)。'
+    if elapsed_seconds is None:      # 台帳に書けず経過時間を測れない
+        how_long = ('止まっている可能性があります (registry/daemons/stall-state.json に書けず経過時間を測れないため、'
+                    '時間の確認なしの通知です)')
+    else:
+        how_long = f'{max(0, int(elapsed_seconds // 60))} 分止まっています'
+    return (f'[stall] mission {slug} が{how_long} (進行中の task も、割り当てられる pending も 0 件)。'
             f'止まっている task: {items}。{last}'
             f'出口: `plan.sh status --mission {slug}` で確認し、`plan.sh update <id> --status pending` で戻す / '
             f'`plan.sh reopen <id> --reason ... --branch reuse` で直す / 不要なら skipped にしてください。')
@@ -158,6 +162,10 @@ def told_key(slug):
     return f'stall-{slug}'
 
 
+def unwritable_told_key(slug):
+    return f'stall-unwritable-{slug}'
+
+
 # ---------------------------------------------------------------------------
 # 1 サイクル
 # ---------------------------------------------------------------------------
@@ -183,6 +191,8 @@ def run_cycle(registry_dir, all_tasks, done_ids_by_mission, statuses_by_mission,
         by_mission.setdefault(slug, []).append(meta)
     new_ledger = {}
     sent = []
+    fresh = set()
+    stalled_now = []          # (slug, stall, fp): 今サイクルで停滞と判定した mission (台帳に書けなかったときの代替通知用)
     for slug in active_missions:
         if slug not in observed_slugs:
             if slug in ledger:
@@ -195,11 +205,26 @@ def run_cycle(registry_dir, all_tasks, done_ids_by_mission, statuses_by_mission,
         entry = ledger.get(slug)
         if entry is None or entry['fp'] != fp or entry['first_seen'] > now:
             entry = {'fp': fp, 'first_seen': now}
+            fresh.add(slug)       # 時計を今作った mission (台帳から時計を読めた mission は含めない)
         new_ledger[slug] = entry
         live_keys.add(told_key(slug))
+        stalled_now.append((slug, stall, fp))
         elapsed = now - entry['first_seen']
         if elapsed >= threshold and notify(told_key(slug), fp, slug, message(slug, stall, elapsed)):
             sent.append(slug)
     if new_ledger != ledger and not write_ledger(registry_dir, new_ledger):
-        log('WARNING: stall-state に書けない — 次のサイクルでやり直します')
+        log('WARNING: stall-state に書けない — 経過時間を測れないので、停滞中の mission は注記つきで 1 回知らせます')
+        # 書けない状態が続くと毎サイクル first_seen=now になり、しきい値に一度も届かない (= 出ない側に倒れる)。
+        # dispatcher は毎サイクル新しい python なのでプロセス内に時計を持てない。代わりに、停滞と判定した mission を
+        # 「経過時間は測れない」と注記して通知台帳越しに知らせる。書けない原因が registry/daemons/ 自体だと通知台帳にも
+        # 書けず、再送の間隔は notify_state_once の /tmp のスロットル (5 分ごと) になる (出ない側ではなく再送する側。許容)。
+        # 対象は今サイクルで時計を作り直した mission だけ (台帳から時計を読めて通知済みの mission に 2 通目を送らない)。
+        # 時計の通知とは別の key。台帳が書けるようになれば live_keys から外れ、prune_told が畳む。
+        for slug, stall, fp in stalled_now:
+            if slug in sent or slug not in fresh:
+                continue
+            key = unwritable_told_key(slug)
+            live_keys.add(key)
+            if notify(key, fp, slug, message(slug, stall, None)):
+                sent.append(slug)
     return sent

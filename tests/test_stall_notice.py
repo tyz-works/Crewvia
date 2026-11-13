@@ -242,3 +242,31 @@ def test_future_first_seen_is_reset(tmp_path):
     env.run(1000)
     assert env.run(500) == []                        # 時計が戻った → 新しい時計
     assert json.loads(env.ledger_path().read_text())[SLUG]["first_seen"] == 500
+
+
+def test_unwritable_ledger_still_notifies_once_with_a_caveat(tmp_path):
+    """台帳に書けない状態が続くと毎サイクル first_seen=now でしきい値に届かない (= 出ない側)。
+    書けないときは「経過時間を測れない」と注記して 1 回だけ知らせる (t003 / #380 P3-1)。"""
+    env = Env(tmp_path)
+    (env.reg / "daemons").rmdir()
+    (env.reg / "daemons").write_text("file")         # daemons/ がファイル = 台帳を書けない
+    logs = []
+    all_tasks = [(SLUG, c) for c in env.cards]
+    for now in (1000, 1005, 1010):
+        env.sent.clear()
+        S.run_cycle(env.reg, all_tasks, {SLUG: {"t001"}}, {SLUG: {"t001": "done", "t002": "blocked"}}, [SLUG],
+                    {SLUG}, now, 900, notify=env.notify, live_keys=env.live, log=logs.append)
+        assert len(env.sent) == 1                    # notify 側の重複防止が 1 回に畳む (ここでは毎回呼ばれる)
+        key, _fp, slug, text = env.sent[0]
+        assert key == S.unwritable_told_key(SLUG) and slug == SLUG
+        assert "測れない" in text and "分止まっています" not in text
+        assert S.unwritable_told_key(SLUG) in env.live
+    assert any("書けない" in m for m in logs)
+
+
+def test_writable_ledger_never_uses_the_unwritable_key(tmp_path):
+    env = Env(tmp_path)
+    env.run(1000)
+    env.run(1900)
+    assert [k for k, *_ in env.sent] == [S.told_key(SLUG)]
+    assert S.unwritable_told_key(SLUG) not in env.live

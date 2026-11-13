@@ -67,8 +67,10 @@ REQUIRED_CHECK = 'ci-ok'
 STATES = ('running', 'passed', 'failed', 'unknown', 'none', 'no_pr')
 #: 記録の任意の欄 `pr_state` (gh の PR の state)。MERGED / CLOSED は終端 = 取得の対象から外れる。
 #: 欄が無い記録 (古い版が書いた) は OPEN 扱いで、次の取得で書き直される。
-PR_STATES = ('OPEN', 'MERGED', 'CLOSED')
-PR_TERMINAL_STATES = ('MERGED', 'CLOSED')
+#: `NOT_FOUND` は gh が「その番号の PR は無い」と答えた印 (gh の state ではない。#377 P3-2: 別 repo の PR 番号を持つ card が
+#: crewvia の repo に `gh pr view N` を打ち続けない)。終端として扱う (card の `pr_number` が変われば取り直す)。
+PR_STATES = ('OPEN', 'MERGED', 'CLOSED', 'NOT_FOUND')
+PR_TERMINAL_STATES = ('MERGED', 'CLOSED', 'NOT_FOUND')
 
 #: 記録と check の欄。**検査 (`record_problem`) が必須にする欄 = 読み手 (`summarize` / `format_line` / `task_graph_ci` /
 #: `poll_cycle`) が `[]` で読む欄**の 1 定義 (#314 r4: 検査が `name` と `state` だけの check を通し、summarize が
@@ -85,6 +87,7 @@ _RUN_ACTIVE = {'QUEUED', 'IN_PROGRESS', 'WAITING', 'PENDING', 'REQUESTED'}
 _CTX = {'SUCCESS': 'passed', 'FAILURE': 'failed', 'ERROR': 'failed', 'PENDING': 'running', 'EXPECTED': 'running'}
 
 _SHA_RE = re.compile(r'[0-9a-f]{40}')
+_PR_NOT_FOUND_RE = re.compile(r'Could not resolve to a PullRequest|no pull requests? found', re.IGNORECASE)
 _ISO_RE = re.compile(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z')
 _NAME_MAX = 80
 
@@ -514,6 +517,9 @@ def run_gh(args, *, cwd, timeout, runner=subprocess.run, gh='gh'):
     except (OSError, ValueError):
         return None, 'gh_unavailable'
     if p.returncode != 0:
+        # gh の stderr は出さない。「その番号の PR が無い」だけを固定語にする (一過性の失敗と区別して終端にするため)
+        if _PR_NOT_FOUND_RE.search(getattr(p, 'stderr', None) or ''):
+            return None, 'gh_pr_not_found'
         return None, f'gh_exit_{p.returncode}'
     return p.stdout, None
 
@@ -587,6 +593,11 @@ def observe_task(task, *, repo_root, branch_of, now, timeout, runner=subprocess.
 
 def _view(pr, gh, now):
     out, err = gh(['pr', 'view', str(pr), '--json', 'headRefOid,statusCheckRollup,state'])
+    if err == 'gh_pr_not_found':
+        # card の持ち主の repo を判別できない (別 repo の PR 番号) か、本当に無い PR。誤った PR の CI を通知しない側に倒し、
+        # 終端として記録する (unknown にすると毎サイクル取り直し、3 回で ci-unknown を出す)
+        return {'pr': pr, 'head': None, 'state': 'no_pr', 'checks': [], 'observed_at': now,
+                'summary': 'no PR', 'reason': err, 'pr_state': 'NOT_FOUND'}
     if err:
         return _unknown(pr, err, now)
     try:

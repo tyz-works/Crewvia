@@ -73,6 +73,8 @@ memory `fail-closed-discard-vs-hold` / `evidence-for-destructive-decisions` の�
   シェル) は dumpable なので読める。**未知の名前で読めないものは「取れなかった」に倒す** (denylist にしない —
   memory `approve-judgment-needs-allowlist-and-scope`)。足したいときはコードの allowlist に理由付きで足す。
 
+#### dbus-daemon と op daemon
+
 - **argv まで見て許すもの** (comm だけでは区別できない。どちらも 1Password CLI `op` が session bus 無しで autolaunch した子で、
   setgid の親から来るため dumpable でなく、同じ uid でも cwd を読めない。`op` を呼ぶたびに 1 つ増え、終わらない — 2026-11-12 の実機で
   自分の uid の dbus-daemon が 135 個。これを飛ばさないと `process-scan-failed` で全 worktree が keep になる):

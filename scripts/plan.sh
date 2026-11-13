@@ -632,6 +632,47 @@ def extract_trailing_body_section(body):
     return '\n'.join(lines[trailing_start:]).strip()
 
 
+_SECTION_LINE_RE = re.compile(r'^##\s+\S')
+_BODY_HEADER_RE = re.compile(r'^##\s+(Description|Result)\s*$', re.IGNORECASE)
+#: card の本文の末尾に残してよい節の見出し (`## ` の後ろがこれで始まるもの)。それ以外の `## ` 節は、前の Result の本文の
+#: 一部 (Worker が Result の中に書いた見出し) の残骸なので、done / fail が本文を組み直すときに持ち越さない (t005)。
+KNOWN_APPENDIX_HEADINGS = ('Needs-Director 詳細', 'Verification', 'Pre-Compact Snapshot')
+
+
+def demote_section_headings(text):
+    """Result / 理由の本文の行頭 `## <語>` を `### <語>` に下げる (Description / Result の見出しは対象外)。
+
+    `lib_history.result_section` (dispatcher と ci-gate の読み口) は最初の別名の `## ` 節で Result を切る。本文に `## ` が
+    あると、末尾の `approved_head:` 行が節の外に出て承認 head が None になる。拒否ではなく下げる理由: 見出しつきの
+    報告 (`## QA Gate` など) を書いた Worker の done を止めない・中身は失われない・読み口を 1 か所のまま保てる。
+    検証 (QA Gate / required_evidence) は下げる前の本文で行う。"""
+    out = []
+    for line in (text or '').split('\n'):
+        if _SECTION_LINE_RE.match(line) and not _BODY_HEADER_RE.match(line):
+            line = '#' + line
+        out.append(line)
+    return '\n'.join(out)
+
+
+def keep_known_appendices(trailing):
+    """`extract_trailing_body_section` の結果から、`KNOWN_APPENDIX_HEADINGS` の節だけを残す ('' なら無し)。
+
+    reopen / retry の後の done は前の本文を組み直す。以前の Result が `## ` を含んでいた card には、その後ろの節が
+    「末尾の節」として残っており、新しい Result の後ろに前回の本文が居座った (t002 の card)。"""
+    if not trailing:
+        return ''
+    sections, cur = [], None
+    for line in trailing.split('\n'):
+        if _SECTION_LINE_RE.match(line) and not _BODY_HEADER_RE.match(line):
+            cur = [line]
+            sections.append(cur)
+        elif cur is not None:
+            cur.append(line)
+    kept = ['\n'.join(sec).strip() for sec in sections
+            if sec[0].split(None, 1)[1].startswith(KNOWN_APPENDIX_HEADINGS)]
+    return '\n\n'.join(kept)
+
+
 def append_trailing_body_section(body, trailing):
     """Re-append a trailing appendix (from extract_trailing_body_section)
     onto a freshly rebuilt body, if there is one."""
@@ -3758,7 +3799,7 @@ def _result_section_matches(body, result):
     `## ` で始まる節のときだけ同じとみなす (前方一致だけだと、記録より短い Result の再送が通る)。
     """
     stored = parse_task_body(body)[1]
-    wanted = result.strip()
+    wanted = demote_section_headings(result).strip()     # 書き込みと同じ正規化 (行頭 `## ` は `###` で保存される)
     if not stored.startswith(wanted):
         return False
     rest = stored[len(wanted):]
@@ -4009,7 +4050,7 @@ def _pull_worktree_failed(slug, task_id, agent, generation, execution_id, catego
         # 同じ card の書き込みに入れる: needs_director_reason と長文の詳細は同じ card に、枠の撤去は Controller が行う。
         summary, full_text = split_long_freeform(reason)
         new_body = (body if full_text is None
-                    else body.rstrip() + '\n\n## Needs-Director 詳細\n' + full_text.strip() + '\n')
+                    else body.rstrip() + '\n\n## Needs-Director 詳細\n' + demote_section_headings(full_text.strip()) + '\n')
         if agent:
             _txn().actor = agent
         try:
@@ -4870,7 +4911,7 @@ def transition_to_needs_director(slug, task_id, meta, body, reason, caller, spli
     """
     summary, full_text = (splitter or split_long_freeform)(reason)
     if full_text is not None:
-        body = body.rstrip() + '\n\n## Needs-Director 詳細\n' + full_text.strip() + '\n'
+        body = body.rstrip() + '\n\n## Needs-Director 詳細\n' + demote_section_headings(full_text.strip()) + '\n'
     # 順序は card (正本) が先・assignment (projection) が後 (Controller の中の順序)。逆にすると「in_progress なのに枠が無い」が
     # 生まれ、S4 の R-1 が枠を作り直す。撤去しないと、codex-review の Kai-codex のように「同時 1 実行」を assignment の
     # 有無で判定する側が、終わった run の assignment に恒久的に塞がれる (backlog #13)。判断待ちの Worker が
@@ -4927,7 +4968,7 @@ def cmd_needs_director(args):
         if idempotent:
             # 理由が card と違う再送は成功にしない (exit 3・何も書かない。§16.10)。長い理由は先頭だけが frontmatter に入り、
             # 全文は本文の節にあるので、frontmatter の要約と全文の両方を比べる。
-            if meta.get('needs_director_reason') != summary or (full_text is not None and full_text.strip() not in body):
+            if meta.get('needs_director_reason') != summary or (full_text is not None and demote_section_headings(full_text.strip()) not in body):
                 _resend_conflict('needs-director', slug, task_id, ['reason'])
             print(f"[plan.sh] Task {task_id} → needs_director — already recorded (idempotent)")
             return
@@ -5362,9 +5403,9 @@ def cmd_done(args):
         if no_pr_reason is not None:
             done_updates['no_pr_waiver'] = no_pr_reason
         done_updates['completed_at'] = now_iso()
-        trailing = extract_trailing_body_section(body)
+        trailing = keep_known_appendices(extract_trailing_body_section(body))
         desc, _ = parse_task_body(body)
-        new_body = append_trailing_body_section(build_task_body(desc, result), trailing)
+        new_body = append_trailing_body_section(build_task_body(desc, demote_section_headings(result)), trailing)
         # D3 (コミット点): status・試行の終了コード (`DONE`)・completed_at / pr_number / Result を**同じ card の書き込み**で。
         # 枠の撤去 (D4。card の worker の枠) も Controller の中 (card の後)。
         try:
@@ -5535,7 +5576,7 @@ def cmd_fail(args):
             evidence = f"head: {fields['fail_head']}"
         else:
             evidence = f"head: none (--no-head: {fields['fail_head_waiver']})"
-        trailing = extract_trailing_body_section(body)
+        trailing = keep_known_appendices(extract_trailing_body_section(body))
         desc, _ = parse_task_body(body)
         new_body = append_trailing_body_section(
             build_task_body(
@@ -7781,7 +7822,7 @@ def cmd_retire(args):
             to_status = 'needs_director'
             updates = {'needs_director_reason': summary}
             if full_text is not None:
-                new_body = body.rstrip() + '\n\n## Needs-Director 詳細\n' + full_text.strip() + '\n'
+                new_body = body.rstrip() + '\n\n## Needs-Director 詳細\n' + demote_section_headings(full_text.strip()) + '\n'
             applied = f'status=needs_director, needs_director_reason={summary}'
         try:
             if view == _EXEC.ACTIVE and meta.get('execution_status') == _EXEC.RESERVED:

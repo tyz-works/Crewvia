@@ -910,3 +910,29 @@ def main_poll_due(registry_dir, now, interval=MAIN_POLL_SECONDS):
 
 def mark_main_polled(registry_dir, now):
     return write_told_atomic(main_runs_path(registry_dir), {'at': now})
+
+
+# --- archive 済み mission の発見 (t002 / t004 codex-review P2) ---
+
+#: archive された直後 (done → archive の間に poll_cycle が 1 度も挟まらない窓) の PR は `registry/ci/` に
+#: 記録を 1 つも持たないので、記録のファイル名からの逆引きでは永久に見つからない。`ARCHIVE_DIR` の全走査は
+#: 重いので毎サイクルはやらず、この間隔でだけ行う (既定 5 分。`main_poll_due` と同じ形)。
+ARCHIVE_DISCOVERY_NAME = '.archive-discovery.json'
+ARCHIVE_DISCOVERY_POLL_SECONDS = 300
+
+
+def archive_discovery_path(registry_dir):
+    return ci_dir(registry_dir) / ARCHIVE_DISCOVERY_NAME
+
+
+def archive_discovery_due(registry_dir, now, interval=ARCHIVE_DISCOVERY_POLL_SECONDS):
+    """前回の全走査から `interval` 経っていれば True。印が無い・読めないは True (取りに行く側)。"""
+    data = load_json_store(archive_discovery_path(registry_dir))
+    if is_missing(data) or is_unreadable(data) or not isinstance(data, dict):
+        return True
+    at = data.get('at')
+    return isinstance(at, bool) or not isinstance(at, (int, float)) or not (0 <= now - at < interval)
+
+
+def mark_archive_discovery(registry_dir, now):
+    return write_told_atomic(archive_discovery_path(registry_dir), {'at': now})

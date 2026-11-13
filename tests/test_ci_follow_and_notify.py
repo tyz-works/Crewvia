@@ -332,6 +332,55 @@ def test_ci_follow_continues_after_the_mission_is_archived(d):
     assert [m[:10] for m in sent()] == ["[ci-green]"]
 
 
+def test_archived_reviews_are_discovered_independently_of_their_own_ci_record(d):
+    """codex-review (t004) P1: archive 済み mission の review card を、その card 自身の registry/ci 記録の
+    有無で絞ってはいけない。記録の無い新しい (未承認の) review を落とし、記録の残る古い (承認済みの) review
+    だけが残ると、誤った merge-ready が出る。"""
+    tasks_dir = d["_root"] / "queue" / "missions" / "m" / "tasks"
+    (tasks_dir / "t002.md").write_text(
+        "---\nid: t002\ntitle: old review (approved)\nstatus: done\nskills: [codex-review]\n"
+        f"pr_number: 313\ncompleted_at: '2026-01-01T00:00:00Z'\n---\n\n## Result\n所見: 問題なし\n"
+        f"approved_head: {HEAD}\n")
+    (tasks_dir / "t003.md").write_text(
+        "---\nid: t003\ntitle: new review (in progress)\nstatus: pending\nskills: [codex-review]\n"
+        "pr_number: 313\n---\n\n## Description\nx\n")
+
+    cycle(d, view_state(GREEN, "OPEN"))        # active な間に t001/t002/t003 の記録を作る
+    assert ci.read_record(d["_root"] / "registry", "m", "t003") is not None
+
+    (d["_root"] / "queue" / "missions" / "m").rename(d["_root"] / "queue" / "archive" / "m")
+    (d["_root"] / "queue" / "state.yaml").write_text("active_missions: []\ndefault_mission: null\n")
+    (d["_root"] / "registry" / "ci" / "m__t003.json").unlink()    # t003 だけ記録が無い状態を作る
+    FakeMux.sent.clear()
+    (d["_root"] / "registry" / "daemons" / "notified-state.json").unlink()   # 同じ (pr, head, kind) の重複防止を外す
+    (d["_tmp"] / "nc.json").unlink(missing_ok=True)
+
+    cycle(d, view_state(GREEN, "OPEN"))
+    # `sent()` (このファイル) は "[ci-" だけを拾うので、"[merge-ready]" を見逃さないよう FakeMux.sent を直接見る
+    kinds = [m.split("]")[0] + "]" for m in FakeMux.sent]
+    assert kinds == ["[ci-green]"], kinds   # merge-ready ではない (t003 が未承認・非終端で拾われている)
+    assert "no_approval" in FakeMux.sent[0]
+
+
+def test_archived_pr_with_no_ci_record_is_discovered_by_the_periodic_sweep(disp):
+    """codex-review (t004) P2: done と archive の間に poll が 1 度も挟まらず registry/ci に記録が
+    1 つも無い PR は、記録のファイル名の逆引きだけでは永久に見つからない。定期の全走査
+    (既定 5 分に 1 回。印が無い最初の呼び出しは即 due) が拾って最初の記録を作ること。"""
+    import time
+    card = disp["_root"] / "queue" / "missions" / "m" / "tasks" / "t001.md"
+    card.write_text(card.read_text().replace("status: in_progress", "status: done"))
+    ci_dir = disp["_root"] / "registry" / "ci"
+    assert not ci_dir.exists() or not list(ci_dir.glob("m__*"))
+
+    (disp["_root"] / "queue" / "missions" / "m").rename(disp["_root"] / "queue" / "archive" / "m")
+    (disp["_root"] / "queue" / "state.yaml").write_text("active_missions: []\ndefault_mission: null\n")
+
+    assert ci.archive_discovery_due(disp["_root"] / "registry", time.time())
+    disp["run_ci_poll"]()
+    assert ci.read_record(disp["_root"] / "registry", "m", "t001") is not None
+    assert not ci.archive_discovery_due(disp["_root"] / "registry", time.time())
+
+
 def test_running_sends_nothing_and_merged_pr_stops_everything(d):
     cycle(d, view_state(ROLLUP_RUNNING, "OPEN"))
     assert sent() == []

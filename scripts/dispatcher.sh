@@ -3703,29 +3703,37 @@ def _ci_base_item(slug, meta):
             'pr_number': meta.get('pr_number'), 'target_dir': meta.get('target_dir') or None}
 
 
-def _archived_ci_tasks(active_missions):
-    """`(slug, meta, body)` の一覧。CI を追い続けるべき **archive 済み** mission の task だけ。
+def _archived_ci_missions(active_missions):
+    """CI を追い続けるべき **archive 済み** mission の slug の集合。
 
     mission 完了の条件 (`agents/director.md` §11) は『全 task が done』だけで PR の merge を含まないので、
     Director が mission を archive してから個々の PR を merge する順序が普通にある。`active_missions` だけを
     見ていると、archive した瞬間に CI の記録も `ci-green` / `merge-ready` の通知も止まる (plan.sh の PR merge
     の門 — Director が merge 直前に引くコマンド — が踏んだ同じ穴の実例: 2026-11-13 PR #385。t002)。
 
-    archive 配下は総なめにしない: 既に `registry/ci/` に記録がある task だけを対象にする (mission が active な
-    間に少なくとも 1 回 `poll_cycle` が観測していれば記録ができている — done と archive の間に dispatcher の
-    サイクルが 1 回も挟まらない極小の窓だけが取りこぼる。それでも上記の門は active ∪ archive の全走査なので、
-    merge の直前には必ず引ける)。記録が MERGED / CLOSED / NOT_FOUND を既に言っているものは card を開かずに
-    捨てる (もう動かない PR の archive の card を毎サイクル開く理由が無い)。
+    **mission の発見 ("どの archive を開くか") だけをここで決める** — 個々の card を拾う (gather) のは
+    `_archived_ci_tasks` の役目で分けてある (codex-review t004 P1: 個々の card の記録の有無で review を
+    絞ると、記録の無い新しい review が落ち、記録の残る古い review だけが残って誤った `merge-ready` が出る)。
+
+    発見は 2 段:
+    1. 安い方 — `registry/ci/` の記録のファイル名 (`<mission>__<task>.json`) を逆引きする。mission が
+       active でなく、かつその mission の記録のうち **1 つでも非終端** (MERGED/CLOSED/NOT_FOUND でない。
+       読めない記録も非終端側 = 疑わしきは開く) のものがあれば、その mission を対象にする。
+    2. 重い方 — `ARCHIVE_DIR` の全走査。`lib_ci_status.archive_discovery_due()` が真のとき (既定 5 分に
+       1 回) だけ行う。1 で**記録を 1 つも持たない** mission (= done と archive の間に `poll_cycle` が
+       1 度も挟まらなかった極小の窓。codex-review t004 P2) を、card を開いて `card_is_watched` で拾う。
+       **1 で記録を持つが全部終端の mission はここでは拾い直さない** (もう動かない PR を毎回開き直さない)。
     """
     import lib_git_policy
     active = set(active_missions)
+    seen, interesting = set(), set()
     try:
         names = os.listdir(lib_ci_status.ci_dir(REGISTRY_DIR))
     except OSError:
-        return []
-    out = []
+        names = []
     for name in names:
-        if not name.endswith('.json') or name in (lib_ci_status.PENDING_NAME, lib_ci_status.MAIN_RUNS_NAME):
+        if not name.endswith('.json') or name in (lib_ci_status.PENDING_NAME, lib_ci_status.MAIN_RUNS_NAME,
+                                                   lib_ci_status.ARCHIVE_DISCOVERY_NAME):
             continue
         mission, sep, task_id = name[:-len('.json')].rpartition('__')
         if not sep or mission in active:
@@ -3735,16 +3743,45 @@ def _archived_ci_tasks(active_missions):
             lib_git_policy.check_task_id(task_id)
         except lib_git_policy.GitPolicyError:
             continue        # record_path() が書くときに検査済みのはずの名前。壊れていれば触らない
+        seen.add(mission)
         record = lib_ci_status.read_record(REGISTRY_DIR, mission, task_id)
-        if record is None or record.get('pr_state') in lib_ci_status.PR_TERMINAL_STATES:
-            continue
-        task_file = ARCHIVE_DIR / mission / 'tasks' / f'{task_id}.md'
-        if not task_file.exists():
-            continue
-        meta, body = read_task_card(task_file, task_id)
-        if meta.get('status') == CORRUPT_TASK_STATUS or not lib_ci_status.card_is_watched(meta):
-            continue
-        out.append((mission, meta, body))
+        if record is None or record.get('pr_state') not in lib_ci_status.PR_TERMINAL_STATES:
+            interesting.add(mission)
+
+    now = time.time()
+    if lib_ci_status.archive_discovery_due(REGISTRY_DIR, now):
+        if os.path.isdir(ARCHIVE_DIR):
+            try:
+                entries = sorted(os.listdir(ARCHIVE_DIR))
+            except OSError:
+                entries = []
+            for entry in entries:
+                if entry in active or entry in seen:
+                    continue    # active、または既に記録がある (= 既に発見済み。終端のみなら拾い直さない)
+                try:
+                    lib_git_policy.check_mission_slug(entry)
+                except lib_git_policy.GitPolicyError:
+                    continue
+                tasks_dir = ARCHIVE_DIR / entry / 'tasks'
+                if not tasks_dir.is_dir():
+                    continue
+                for meta, _body in list_task_cards(tasks_dir, warn=lambda msg: log(f"WARNING: {msg}")):
+                    if lib_ci_status.card_is_watched(meta):
+                        interesting.add(entry)
+                        break
+        lib_ci_status.mark_archive_discovery(REGISTRY_DIR, now)
+    return interesting
+
+
+def _archived_ci_tasks(active_missions):
+    """`(slug, meta, body)` の一覧。`_archived_ci_missions` が選んだ mission を丸ごと開き、`card_is_watched`
+    の card を全部拾う (individual card の registry/ci 記録の有無は見ない。上の docstring 参照)。"""
+    out = []
+    for mission in _archived_ci_missions(active_missions):
+        tasks_dir = ARCHIVE_DIR / mission / 'tasks'
+        for meta, body in list_task_cards(tasks_dir, warn=lambda msg: log(f"WARNING: {msg}")):
+            if lib_ci_status.card_is_watched(meta):
+                out.append((mission, meta, body))
     return out
 
 

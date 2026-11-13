@@ -286,20 +286,34 @@ QA は**ローカルの checkout** の差分とコードを検証する（Step 1
 リモートの PR head をテスト前後で比べても、**ローカルが古い A のままで PR が既に B なら前後とも B** になり、
 A をテストして B を承認してしまう（PR #385 codex-review P1）。**ローカルの HEAD と照合する**:
 
+**さらに、`git rev-parse HEAD` は未コミットの変更では動かない。** 作業ツリーが汚れていれば、
+sha が 3 つとも一致したまま**「手元で直したから通った」コードを承認できる**（PR #385 codex-review P2）。
+sha の照合に加えて**作業ツリーが clean であること**を、テストの前と承認の前の両方で確かめる:
+
 ```bash
 PR=<PR番号>
 HEAD_BEFORE="$(gh pr view "$PR" --json headRefOid -q .headRefOid)"
 LOCAL="$(git rev-parse HEAD)"
 [ "$LOCAL" = "$HEAD_BEFORE" ] || echo "テスト対象がPRのheadと違う。先に $HEAD_BEFORE を checkout するか、承認しない"
+[ -z "$(git status --porcelain)" ] || echo "作業ツリーが汚れている。テストする前に clean にする"
 
-# ── ここでテストする ──
+# ── ここでテストする（スクラッチのファイルはリポジトリの外に置く）──
 
 [ "$(git rev-parse HEAD)" = "$LOCAL" ] || echo "テスト中にローカルが動いた。承認しない"
+[ -z "$(git status --porcelain)" ] || echo "テスト中にツリーが汚れた。承認しない"
 [ "$(gh pr view "$PR" --json headRefOid -q .headRefOid)" = "$LOCAL" ] || echo "テスト中に push された。承認しない"
 ```
 
-3 つとも一致したときだけ `approved_head: $LOCAL` を書く。**書くのは「自分が実際に動かした commit」**で、
+4 つとも通ったときだけ `approved_head: $LOCAL` を書く。**書くのは「自分が実際に動かした commit」**で、
 `gh pr view` で取り直した値ではない。
+
+- **テスト中に手元を直して通ったなら、それは承認ではなく所見**。直した内容を Result に書いて
+  Director に渡す（`approved_head` は書かない）。承認してしまうと、**バグを含んだままの commit**に
+  `merge-ready` が出る
+- テストデータ・ログ・一時ファイルは**リポジトリの外**（scratchpad）に置く。リポジトリの中に置くと
+  untracked として `git status --porcelain` に出るので、そこで止まる（止まるのは正しい側 —
+  untracked のファイルが挙動を変えることは実際にある）
+- clean にできない事情があるなら承認せず、何が汚れているかを Result に書いて Director に判断を渡す
 
 - 問題あり・未実施の必須チェックポイントが残る・判断を Director に委ねるときは**書かない**
 - 省略形・大文字は読まれない。本文の途中に書いた sha も読まれない（Result 節の最終行の完全一致だけ）

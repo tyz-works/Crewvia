@@ -308,6 +308,46 @@ def test_downstream_codex_review_skill_is_selected_too(tmp_path):
     assert status(box, "t002") == "pending" and count(box, "t002") == 1
 
 
+def test_cascade_reviews_reopens_a_selected_review_stuck_in_needs_director(tmp_path):
+    """codex-review (t008): codex-review が要修正を出して needs_director で止まった状態で実装 task (t002) を
+    reopen --cascade reviews すると、下流の review (t003) が needs_director のまま残っていた (done / verified /
+    実行中しか戻す対象に入っていなかった)。needs_director の review も cascade が選べば done と同じく戻ること。"""
+    box = build(tmp_path, CHAIN)
+    finish(box, "t001")
+    finish(box, "t002")
+    p = box.pull("Kai-codex", "t003", skills="review")
+    assert p.returncode == 0, p.stderr
+    xid = json.loads(p.stdout)["execution_id"]
+    q = run(box, *e3.report_argv("needs-director", "t003"), "--execution", xid, agent="Kai-codex")
+    assert q.returncode == 0, q.stderr
+    assert status(box, "t003") == "needs_director"
+    r = reopen(box)
+    assert r.returncode == 0, r.stderr
+    assert status(box, "t002") == "pending" and count(box, "t002") == 1       # 経路上の中間も戻る
+    assert status(box, "t003") == "pending" and count(box, "t003") == 1
+    [name] = ledger_files(box, "t003", "reopen")
+    fields, _ = ledger(box, "t003", name)
+    assert fields["root"] == "t001" and fields["root_reopen_count"] == 1 and fields["reason"] == REASON
+    assert "t003" in r.stdout
+
+
+def test_cascade_reviews_leaves_an_unselected_needs_director_downstream_alone(tmp_path):
+    """上のテストの裏側 (codex-review t008 §3): needs_director の下流でも、cascade が選ばなかった (review 系の
+    skill を持たない) ものは、実装 task と無関係にそのまま残す (巻き込まない)。"""
+    spec = [("t001", [], ["code"]), ("t002", ["t001"], ["code"])]
+    box = build(tmp_path, spec)
+    finish(box, "t001")
+    p = box.pull("Ren", "t002", skills="code")
+    assert p.returncode == 0, p.stderr
+    xid = json.loads(p.stdout)["execution_id"]
+    q = run(box, *e3.report_argv("needs-director", "t002"), "--execution", xid, agent="Ren")
+    assert q.returncode == 0, q.stderr
+    r = reopen(box)
+    assert r.returncode == 0, r.stderr
+    assert status(box, "t002") == "needs_director" and count(box, "t002") == 0
+    assert not ledger_files(box, "t002", "reopen")
+
+
 def test_pending_downstream_is_left_alone_and_released_deps_of_the_root_is_removed(tmp_path):
     spec = [("t001", [], ["code"]), ("t002", ["t001"], ["code"])]
     box = build(tmp_path, spec)

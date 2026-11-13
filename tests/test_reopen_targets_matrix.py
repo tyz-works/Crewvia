@@ -223,6 +223,12 @@ def check_invariant(queue, graph, skills, assignment, cascade):
         if statuses[t] in TERMINAL:
             return f"{t} が経路上なのに終端 ({statuses[t]}) のまま残った"
     for t in targets:
+        # needs_director (t008): cascade が選んだ (= targets の要素) task が needs_director (終わった試行が
+        # Director の判断待ちのまま止まっている) だったら、done / verified と同じく戻っていること。選ばれなかった
+        # (path_nodes にはいるが targets には入らない) needs_director はそのままでよい (上のループの対象外)。
+        if assignment[t][1] == "needs_director" and statuses[t] != "pending":
+            return f"{t} (needs_director, 選ばれた target) が pending に戻っていない ({statuses[t]})"
+    for t in targets:
         if statuses[t] != "pending":
             continue
         unmet = dep.unmet_dependencies(graph[t], done_ids, statuses, metas[t].get("released_deps") or ())

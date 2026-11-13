@@ -1215,7 +1215,10 @@ def _execute_reopen_intent(txn, slug, intent, *, now, before_write, resumed):
         card, card_body = _load_for_intent(txn, slug, d, intent)
         status = card.get('status')
         over = intent['over_cap'] if entry['capped'] else None
-        if status in (_S_DONE, _S_VERIFIED):
+        # needs_director (t008): この一覧 (`intent['tasks']`) に入るのは決定時点で done_set / reset_set に選ばれた task だけなので、
+        # needs_director で入っているなら cascade が選んだ review 等 (決定時に done_set へ足された)。まだ戻していなければ status は
+        # needs_director のまま (凍結中は update 等で変わらない)。戻した後は pending になり else (already) に落ちる (冪等)。
+        if status in (_S_DONE, _S_VERIFIED, _S_NEEDS_DIRECTOR):
             if not ex.has_execution_fields(card):
                 raise _intent_problem(slug, intent_name(root, need), f'{d}:no_execution')
             _write_reopen(txn, slug, d, card, card_body, kind='reopen', reason=reason, count=card['execution_count'],
@@ -1503,6 +1506,7 @@ def _reopen_cascade(txn, slug, tid, *, reason, over_cap, default_max_attempts, n
     # I(done) → A(done) → R(pending, review) で A を done のまま残すと、R は A の古い結果で I の再完了より前に走る
     # (依存の判定は直接の依存だけ)。実行中の B(code) を reset するなら、その手前の A も done のままにできない。
     targets = _reopen_targets(closure, cards, cascade)
+    target_set = set(targets)
     on_path = dep.path_closure(graph, tid, targets) if targets else []
     for d in on_path:
         if cards[d][0].get('status') == _S_SKIPPED:
@@ -1515,8 +1519,11 @@ def _reopen_cascade(txn, slug, tid, *, reason, over_cap, default_max_attempts, n
     # 解除されている下流 (R) は I の再完了を待たずに pull できる (I → A(failed) → R(pending, released_deps=[A]))。戻す手段も無い
     # (failed は reopen の遷移元でない) ので skipped と同じく拒否する。語彙に無い status は何も言えないので経路のどこでも拒否する。
     # 経路の**端**にいるだけの failed (対象の review 自身が failed など) は依存元を持たない = 走る下流が無いので拒否しない。
-    # 他の status の扱いは §4.3 の表 (done / verified = 戻す・実行中 = 試行を閉じて戻す・pending / needs_director / blocked /
+    # 他の status の扱いは §4.3 の表 (done / verified = 戻す・実行中 = 試行を閉じて戻す・pending / blocked /
     # verification_failed = そのまま。どれも未完了なので、それに依存する下流は I の再完了より前に pull できない)。
+    # needs_director (t008): 終わった試行が Director の判断待ちのまま止まっている (codex-review が要修正を出した後等)。
+    # cascade が選んだ (`_cascade_selects`。= targets の要素) ものは done / verified と同じく戻す — 下の done_set に足す。
+    # 選ばれなかった (経路上にたまたまいるだけの) needs_director はそのまま (pending と同じく未完了側)。
     path_deps = {e: set(dep.declared_dependencies(graph.get(e))) for e in on_path}
     for d in on_path:
         st = cards[d][0].get('status')
@@ -1527,7 +1534,8 @@ def _reopen_cascade(txn, slug, tid, *, reason, over_cap, default_max_attempts, n
                     f"task '{tid}': 無効化の経路上に status={shown!r} の task {d} があります ({' -> '.join(route or [tid, d])})。"
                     f"failed は保留のまま残り、`released_deps` で解除された下流が I の再完了を待たずに走れてしまうので reopen しません。"
                     f"先に {d} を `plan.sh retry` 等で片付けてから reopen してください", slug, tid, meta)
-    done_set = {d for d in on_path if cards[d][0].get('status') in (_S_DONE, _S_VERIFIED)}
+    done_set = {d for d in on_path if cards[d][0].get('status') in (_S_DONE, _S_VERIFIED)
+                or (d in target_set and cards[d][0].get('status') == _S_NEEDS_DIRECTOR)}
     reset_set = set(active)
     if cascade != 'none':
         problems = {ex.NOT_REOPENABLE: [], ex.ATTEMPT_ACTIVE: [], ex.ATTEMPT_CAP: []}

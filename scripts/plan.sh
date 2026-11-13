@@ -953,19 +953,22 @@ _DEP_RULES = _load_scripts_module('lib_dep_rules')
 _CI_STATUS = _load_scripts_module('lib_ci_status')
 
 
-def ci_status_line(slug, task_id, pr_number=None):
-    """status に出す CI の 1 行 / None (記録が無い・読めない・PR 無し・card の pr_number と違う PR)。
-    表示だけなので失敗は出さないだけ。"""
+def ci_status_line(slug, task_id, task):
+    """status に出す CI の 1 行 / None (記録が無い・読めない・PR 無し・card の pr_number / scope と違う記録)。
+    `task` は card の meta (pr_number / pr_repo / target_dir)。表示だけなので失敗は出さないだけ。"""
     try:
-        rec = _CI_STATUS.read_record(registry_dir(), slug, task_id, pr_number=pr_number)
+        rec = _CI_STATUS.read_record(registry_dir(), slug, task_id, pr_number=task.get('pr_number'),
+                                     scope=_CI_STATUS.pr_scope(task))
         return _CI_STATUS.format_line(rec, time.time())
     except Exception:
         return None
 
 
-def ci_task_graph_field(slug, task_id, pr_number=None):
+def ci_task_graph_field(slug, task_id, task):
     try:
-        return _CI_STATUS.task_graph_ci(_CI_STATUS.read_record(registry_dir(), slug, task_id, pr_number=pr_number))
+        rec = _CI_STATUS.read_record(registry_dir(), slug, task_id, pr_number=task.get('pr_number'),
+                                     scope=_CI_STATUS.pr_scope(task))
+        return _CI_STATUS.task_graph_ci(rec)
     except Exception:
         return None
 
@@ -1591,7 +1594,7 @@ def build_task_graph(state):
                     node['pane_id'] = pane_id
             if raw_status in _CI_STATUS.POLL_STATUSES:
                 # PR の CI (dispatcher の記録)。plugin 0.3.0 は未知の欄を無視する。既存の欄は変えない
-                ci = ci_task_graph_field(slug, task_id, meta.get('pr_number'))
+                ci = ci_task_graph_field(slug, task_id, meta)
                 if ci:
                     node['ci'] = ci
             mission_nodes.append(node)
@@ -3651,7 +3654,7 @@ def cmd_ci_gate(args):
             if set(meta.get('skills') or ()) & set(_CI_STATUS.APPROVAL_SKILLS):
                 reviews.append({'status': meta.get('status'), 'completed_at': meta.get('completed_at'),
                                 'result': _HISTORY.result_section(_body)})
-            rec = _CI_STATUS.read_record(registry_dir(), slug, meta['id'], pr_number=pr_number)
+            rec = _CI_STATUS.read_record(registry_dir(), slug, meta['id'], pr_number=pr_number, scope=gate_scope)
             if rec is not None and (newest is None or rec['observed_at'] > newest['observed_at']):
                 newest = rec
     if newest is None:
@@ -5164,9 +5167,12 @@ def propagate_pr_number(slug, task_id, pr_number):
             print(f"[plan.sh] PR #{pr_number} を {slug}/{tid} には書きませんでした"
                   f" (pr_repo の形が正しくない card があり repo を決められない)", file=sys.stderr)
             continue
-        if up_repo and down_repo and down_repo != up_repo:
+        # 非対称 (上流が既定 repo = up_repo が無い・下流だけ pr_repo を明示) も衝突として拒否する
+        # (t013 / PR #388 の P2): up_repo が無いからと素通りさせると、下流の無関係な pr_repo を
+        # 残したまま上流の pr_number だけを書き、codex-review が別 repo の PR を見ることになる。
+        if down_repo and down_repo != up_repo:
             print(f"[plan.sh] PR #{pr_number} を {slug}/{tid} には書きませんでした"
-                  f" (pr_repo が食い違う: 上流 {up_repo} / この task {down_repo}"
+                  f" (pr_repo が食い違う: 上流 {up_repo or '(既定 repo)'} / この task {down_repo}"
                   f" — どちらが正しいか決められないため。直してから update --pr-number で)",
                   file=sys.stderr)
             continue
@@ -5846,7 +5852,7 @@ def _print_mission_summary(slug, archived=False):
     for (m, _) in in_prog:
         worker = m.get('worker') or '?'
         print(f"    🔄 {m['id']} {m['title']} ({worker})")
-        ci = ci_status_line(slug, m['id'], m.get('pr_number'))
+        ci = ci_status_line(slug, m['id'], m)
         if ci:
             print(f"       {ci}")
     for (m, _) in needs_dir:
@@ -5955,7 +5961,7 @@ def _print_mission_detail(slug):
             exec_suffix = f" [{xid} attempt {m.get('execution_count')}]"
         print(f"[{icon}] {tid} {title} {suffix}{timeout_suffix}{exec_suffix}")
         if st in _CI_STATUS.POLL_STATUSES:
-            ci = ci_status_line(slug, tid, m.get('pr_number'))
+            ci = ci_status_line(slug, tid, m)
             if ci:
                 print(f"      {ci}")
 

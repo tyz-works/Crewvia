@@ -274,8 +274,11 @@ class WorkerMonitor:
         self.max_threshold: int = int(timeout.get("max") or base["max"])
         self.started_at: float = time.time()
         self.repo_root = repo_root
-        #: CI の 1 行 (`_ci_note`) の照合用。card が名指しする PR と違う PR の記録は添えない (#314 r2)
+        #: CI の 1 行 (`_ci_note`) の照合用。card が名指しする PR と違う PR の記録は添えない (#314 r2)。
+        #: `_card_scope` は card の pr_repo / target_dir から決まる scope (t013 / PR #388 P1): pr_number を
+        #: 変えずに pr_repo を変えた card が、別 repo の古い記録をそのまま添えない。
         self._card_pr_number = task_card.get("pr_number")
+        self._card_scope = self._ci_scope_of(task_card)
 
         #: §11 (t003): 「見送り」通知の fingerprint 用。試行の識別は Execution ID
         #: (`current_execution_id`)。ID の無い旧形式 card だけ card の `started_at` (pull の
@@ -804,18 +807,30 @@ class WorkerMonitor:
             f"止まっていないか確認してください (max {self.max_threshold}s で終了します)。"
             f"{self._ci_note()}")
 
+    @staticmethod
+    def _ci_scope_of(task_card: dict):
+        """card の pr_repo / target_dir から決まる scope (`lib_ci_status.pr_scope`)。import が失敗すれば
+        None (`_ci_note` 側は `pr_scope` が決められないときと同じ fail-open — 判定には使わない表示専用の値)。"""
+        try:
+            import lib_ci_status
+            return lib_ci_status.pr_scope(task_card)
+        except Exception:
+            return None
+
     def refresh_card_pr_number(self, task_card: dict) -> None:
-        """毎サイクルの card から `_card_pr_number` を更新する (#314 r3)。作った時点の値のままだと、監視中に
-        done --pr 等で card の pr_number が付いた・変わったとき、別の PR の記録を添えてしまう。"""
+        """毎サイクルの card から `_card_pr_number` / `_card_scope` を更新する (#314 r3 / t013)。作った時点の
+        値のままだと、監視中に done --pr 等で card の pr_number が付いた・変わった、pr_repo が変わった/消えた
+        とき、別の PR (別 repo) の記録を添えてしまう。"""
         self._card_pr_number = task_card.get("pr_number")
+        self._card_scope = self._ci_scope_of(task_card)
 
     def _ci_note(self) -> str:
-        """dispatcher が記録した PR の CI の 1 行 (lib_ci_status)。無い・読めない・PR 無しは ''。
+        """dispatcher が記録した PR の CI の 1 行 (lib_ci_status)。無い・読めない・PR 無し・scope が食い違う記録は ''。
         **添えるだけ**で、見送り・終了の判定には使わない。"""
         try:
             import lib_ci_status
             rec = lib_ci_status.read_record(self.repo_root / "registry", self.mission_slug, self.task_id,
-                                            pr_number=self._card_pr_number)
+                                            pr_number=self._card_pr_number, scope=self._card_scope)
             line = lib_ci_status.format_line(rec, time.time())
             return f" CI 待ちの状況: {line}" if line else ""
         except Exception:

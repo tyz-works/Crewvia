@@ -129,15 +129,22 @@ def test_parse_pr_list():
             ci.parse_pr_list(bad)
 
 
-def _record(state="running", pr=313, observed=NOW, rollup=ROLLUP_RUNNING, reason=None):
+def _record(state="running", pr=313, observed=NOW, rollup=ROLLUP_RUNNING, reason=None, scope=""):
+    """既定の `scope=""` は card に pr_repo の無い (crewvia 本体の) scope。この検査より前に書かれた記録を
+    模すときだけ `scope=ci.SCOPE_UNCHECKED` を明示で渡す (`record_matches_card` が scope 欄の無さを不一致に
+    する側になった後も、通常の fixture は「観測済み」の記録として扱われること)。"""
     if state == "unknown":
-        rec = ci._unknown(pr, reason or "gh_timeout", observed)
+        rec = ci._unknown(pr, reason or "gh_timeout", observed, scope=scope)
     elif state == "no_pr":
         rec = {"pr": None, "head": None, "state": "no_pr", "checks": [], "observed_at": observed, "summary": "no PR"}
+        if scope is not ci.SCOPE_UNCHECKED:
+            rec["scope"] = scope
     else:
         head, checks = ci.parse_view(view_json(rollup))
         rec = {"pr": pr, "head": head, "state": ci.overall_state(checks), "checks": checks,
                "observed_at": observed, "summary": ci.summarize(pr, head, checks)}
+        if scope is not ci.SCOPE_UNCHECKED:
+            rec["scope"] = scope
     assert ci.record_problem(rec) is None
     return rec
 

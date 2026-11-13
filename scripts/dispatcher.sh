@@ -3683,12 +3683,14 @@ def ci_line_for(slug, task_id):
     """通知 (Rule 5) に添える 1 行 (末尾に改行。後ろの「画面末尾:」とくっつけない) / ''。
     読めない・無い・PR 無し・card の pr_number と違う PR の記録は ''。card は通知のときだけ読む (通知はまれ)。"""
     try:
-        pr_number = None
+        task_meta = None
         for meta, _ in list_tasks_for_mission(slug):
             if meta.get('id') == task_id:
-                pr_number = meta.get('pr_number')
+                task_meta = meta
                 break
-        rec = lib_ci_status.read_record(REGISTRY_DIR, slug, task_id, pr_number=pr_number)
+        pr_number = task_meta.get('pr_number') if task_meta is not None else None
+        scope = lib_ci_status.pr_scope(task_meta) if task_meta is not None else lib_ci_status.SCOPE_UNCHECKED
+        rec = lib_ci_status.read_record(REGISTRY_DIR, slug, task_id, pr_number=pr_number, scope=scope)
         line = lib_ci_status.format_line(rec, time.time())
         return f' {line}\n' if line else ''
     except Exception:

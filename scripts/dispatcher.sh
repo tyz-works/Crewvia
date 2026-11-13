@@ -3785,8 +3785,13 @@ def run_ci_notify():
                 clear_told_key(k)
         # main の最新 run (Q8): 落ちていれば ci-failed と同じ経路で。完了済みの最新が緑なら古い失敗の台帳を畳む
         if (_CI_DEADLINE[0] is None or _CI_DEADLINE[0] - time.monotonic() >= 1) and lib_ci_status.main_poll_due(REGISTRY_DIR, now):
-            lib_ci_status.mark_main_polled(REGISTRY_DIR, now)
-            runs, err = lib_ci_status.fetch_main_runs(cwd=str(REPO_ROOT))
+            # 印を書けないときは取りに行かない (毎サイクル gh を打たない。#377 P3-3)。timeout は deadline の残りで切る (#379 P3)
+            if not lib_ci_status.mark_main_polled(REGISTRY_DIR, now):
+                runs, err = None, 'poll_mark_unwritable'
+            else:
+                left = (_CI_DEADLINE[0] - time.monotonic()) if _CI_DEADLINE[0] is not None else lib_ci_status.GH_TIMEOUT_SECONDS
+                runs, err = lib_ci_status.fetch_main_runs(cwd=str(REPO_ROOT),
+                                                          timeout=min(lib_ci_status.GH_TIMEOUT_SECONDS, left))
             if err:
                 if should_notify('ci_main_poll_warn'):
                     log(f'WARNING: ci: main runs unavailable ({err})')

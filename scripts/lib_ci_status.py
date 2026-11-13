@@ -35,7 +35,7 @@ if str(_SCRIPTS_DIR) not in sys.path:
 from lib_daemon_state import load_json_store, write_told_atomic  # noqa: E402
 from lib_git_policy import DEFAULT_BASE_BRANCH, GitPolicyError, check_mission_slug, check_task_id  # noqa: E402
 from lib_task_cards import is_missing, is_unreadable  # noqa: E402
-from lib_task_status import CI_FOLLOW_PR_STATUSES, CI_WATCH_STATUSES  # noqa: E402
+from lib_task_status import CI_FOLLOW_PR_STATUSES, CI_WATCH_STATUSES, TERMINAL_STATUSES  # noqa: E402
 
 #: CI を見る task の status (Worker が PR の CI を待ちうる状態)。定義は lib_task_status の 1 か所。
 POLL_STATUSES = CI_WATCH_STATUSES
@@ -359,6 +359,54 @@ def gate_verdict(record, *, pr_head, now, max_age=GATE_MAX_AGE_SECONDS):
     return True, 'ok'
 
 
+#: 承認 head を残す review 系 task の skill (設計 §2.5)。PR に紐づく (card の `pr_number` が同じ) これらが比較の対象。
+APPROVAL_SKILLS = ('review', 'codex-review', 'qa')
+#: 承認 head の理由の固定語 (`gate_verdict` の理由とは別の欄。`plan.sh ci-gate` の 2 行目と `merge-ready` の条件に使う)。
+APPROVAL_REASONS = ('ok', 'no_approval', 'approved_head_mismatch')
+_APPROVED_HEAD_RE = re.compile(r'approved_head: ([0-9a-f]{40})')
+
+
+def approved_head(result):
+    """review の Result から承認 head を読む**唯一の関数**。末尾の非空行が `approved_head: <40 桁の小文字 sha>` に
+    fullmatch するときだけその sha、それ以外は None (本文のどこかにある sha を推測しない・大文字や短縮形は読まない)。"""
+    if not isinstance(result, str):
+        return None
+    lines = [ln.rstrip() for ln in result.splitlines()]
+    while lines and not lines[-1]:
+        lines.pop()
+    if not lines:
+        return None
+    m = _APPROVED_HEAD_RE.fullmatch(lines[-1])
+    return m.group(1) if m else None
+
+
+def approval_verdict(reviews, *, pr_head):
+    """承認 head の比較 (設計 §2.5。`gate_verdict` とは別の層)。`(True, 'ok')` か `(False, 理由の固定語)`。
+
+    `reviews`: PR に紐づく review 系 task (`APPROVAL_SKILLS`) の `{'status','completed_at','result'}` の一覧
+    (呼び出し元が集める)。①1 本も無い・1 本でも終端 (`TERMINAL_STATUSES`) でない → `no_approval`。②`completed_at` が
+    最大のもの (同時刻が複数なら全部) の Result の末尾行が承認 head でない → `no_approval`。③現 head と違う →
+    `approved_head_mismatch`。疑わしきは通さない。使ってよい場所は「知らせる」と「ci-gate の出力」だけ。"""
+    if not isinstance(pr_head, str) or not _SHA_RE.fullmatch(pr_head):
+        return False, 'unknown:no_pr_head'
+    reviews = list(reviews or [])
+    if not reviews:
+        return False, 'no_approval'
+    if any(r.get('status') not in TERMINAL_STATUSES for r in reviews):
+        return False, 'no_approval'
+
+    def stamp(r):
+        v = r.get('completed_at')
+        return v if isinstance(v, str) else ''
+    newest = max(stamp(r) for r in reviews)
+    heads = {approved_head(r.get('result')) for r in reviews if stamp(r) == newest}
+    if None in heads:
+        return False, 'no_approval'
+    if heads != {pr_head}:
+        return False, 'approved_head_mismatch'
+    return True, 'ok'
+
+
 def record_fingerprint(record):
     """tasks.json の再生成が要るかの比較に使う (経過分は含まない)。"""
     return json.dumps(task_graph_ci(record), ensure_ascii=False, sort_keys=True)
@@ -649,25 +697,42 @@ def poll_cycle(tasks, *, registry_dir, repo_root, branch_of, poll_seconds=DEFAUL
 # 通知の元になる事実 (dispatcher が Director に 1 回だけ送る。設計 §2.1・§2.4・§2.5 の移行中の名前)
 # ---------------------------------------------------------------------------
 
-#: 通知の種類 (固定語)。`ci-green` は CI が緑になった事実だけで承認を含意しない (承認 head の比較は PR-D)。
-EVENT_KINDS = ('ci-failed', 'ci-green', 'ci-unknown')
+#: 通知の種類 (固定語)。`ci-green` は CI が緑になった事実だけで承認を含意しない。`merge-ready` は緑 + 承認 head == 現 head (§2.5)。
+EVENT_KINDS = ('ci-failed', 'ci-green', 'ci-unknown', 'merge-ready')
 #: 通知に入れる check 名の最大件数。
 EVENT_MAX_CHECKS = 5
 
 
-def pr_events(tasks, *, registry_dir, now, warn=None):
+def pr_events(tasks, *, registry_dir, now, warn=None, head_of=None, is_sent=None, rotate=0):
     """PR ごとの通知の候補 `(events, closed_prs)`。**gh を呼ばない** (記録を読むだけ)。
 
     `events`: `{'kind','pr','head','checks','reason'}` の一覧。1 つの PR を指す task が何本あっても 1 つの記録
     (`observed_at` が最も新しいもの) だけを見る。`closed_prs`: MERGED / CLOSED と記録された PR 番号 (台帳の掃除用)。
     `ci-green` の条件は門 (`gate_verdict`) が通ること。ここは**知らせる**ためだけに使い、待ちを解く・done にする・
-    Rule 5 / watchdog を黙らせる・割り当てることには使わない (設計 §2.2)。"""
+    Rule 5 / watchdog を黙らせる・割り当てることには使わない (設計 §2.2)。
+
+    `head_of(pr) -> (sha, None) | (None, 理由)`: 緑を知らせる直前に PR の現 head を取り直す関数 (呼び出し元が gh の
+    予算の中で用意する。#377 レビュー P3-1)。取り直せなければその PR は今回は何も出さない (次のサイクルで再試行 =
+    fail-closed)。省略したときだけ記録自身の head を現 head とみなす (gh を呼ばない単体テスト用)。
+    緑のとき、PR に紐づく review 系 task (task の `skills` / `completed_at` / `result`) の承認 head が現 head と
+    一致すれば `merge-ready`、しなければ理由 (`no_approval` / `approved_head_mismatch`) つきの `ci-green`。
+
+    `is_sent(key) -> bool` (台帳に既にあるか): 取り直し (gh) は**まだ送っていない候補だけ**にする。記録の head で出すはずの
+    通知が既に台帳にあれば head_of を呼ばない (通知済みの PR で毎サイクル gh を呼ばない。#379 レビュー P2-2)。
+    `rotate`: 緑の候補を回す開始位置 (呼び出し元が時刻から決める)。head_of の予算が切れる PR がいつも同じにならないように
+    する (飢餓を避ける)。review 系 task は `target_dir` が同じものだけを同じ PR の review に数える (ci-gate と同じ束ね方)。"""
     newest = {}
+    rec_td = {}
+    reviews = {}
     closed = set()
     for t in tasks:
         pr_number = card_pr(t.get('pr_number'))
         if pr_number is None or t.get('status') not in FOLLOW_STATUSES:
             continue
+        if set(t.get('skills') or ()) & set(APPROVAL_SKILLS):
+            # 収集は read_record より前 (記録の読み取りが落ちた review を数えないと、古い承認で ok に倒れうる。fail-open)
+            reviews.setdefault((t.get('target_dir') or None, pr_number), []).append(
+                {'status': t.get('status'), 'completed_at': t.get('completed_at'), 'result': t.get('result')})
         try:
             rec = read_record(registry_dir, t['mission'], t['id'], warn=warn, pr_number=pr_number)
         except Exception:  # noqa: BLE001 — 通知の元の読み取りが想定外でも他の PR を止めない
@@ -682,8 +747,13 @@ def pr_events(tasks, *, registry_dir, now, warn=None):
         cur = newest.get(pr_number)
         if cur is None or rec['observed_at'] > cur['observed_at']:
             newest[pr_number] = rec
+            rec_td[pr_number] = t.get('target_dir') or None
     events = []
-    for pr_number in sorted(newest):
+    keys = sorted(newest)
+    if keys and rotate:
+        k = rotate % len(keys)
+        keys = keys[k:] + keys[:k]      # 緑の候補の取り直しの順を回す (予算切れがいつも同じ PR にならない)
+    for pr_number in keys:
         rec = newest[pr_number]
         head, state = rec['head'], rec['state']
         if state == 'failed':
@@ -694,9 +764,26 @@ def pr_events(tasks, *, registry_dir, now, warn=None):
                 reason = _clean_name(rec['reason']) if isinstance(rec.get('reason'), str) and rec['reason'] else 'check'
                 events.append({'kind': 'ci-unknown', 'pr': pr_number, 'head': head, 'checks': [], 'reason': reason})
         elif state == 'passed' and head is not None:
-            ok, _why = gate_verdict(rec, pr_head=head, now=now)
-            if ok:
-                events.append({'kind': 'ci-green', 'pr': pr_number, 'head': head, 'checks': [], 'reason': None})
+            pr_reviews = reviews.get((rec_td.get(pr_number), pr_number))
+            current = head
+            if head_of is not None:
+                if is_sent is not None:
+                    # 記録の head で出すはずの通知が台帳にあれば gh を呼ばない (通知済みの PR で毎サイクル取り直さない)
+                    pre_ok, _ = approval_verdict(pr_reviews, pr_head=head)
+                    pre = {'kind': 'merge-ready' if pre_ok else 'ci-green', 'pr': pr_number, 'head': head}
+                    if is_sent(event_key(pre)):
+                        continue
+                current, err = head_of(pr_number)
+                if err is not None:
+                    continue
+            ok, _why = gate_verdict(rec, pr_head=current, now=now)
+            if not ok:
+                continue
+            approved, why = approval_verdict(pr_reviews, pr_head=current)
+            if approved:
+                events.append({'kind': 'merge-ready', 'pr': pr_number, 'head': current, 'checks': [], 'reason': None})
+            else:
+                events.append({'kind': 'ci-green', 'pr': pr_number, 'head': current, 'checks': [], 'reason': why})
     return events, sorted(closed)
 
 
@@ -713,8 +800,11 @@ def event_message(event):
         return (f"[ci-failed] PR #{pr} @{head}: CI が失敗しました。落ちた check: " + (', '.join(event['checks']) or '?')
                 + "。(通知だけです。修正 task の起票は Director の判断)")
     if event['kind'] == 'ci-green':
-        return (f"[ci-green] PR #{pr} @{head}: CI が全部緑です (承認ではありません)。"
+        return (f"[ci-green] PR #{pr} @{head}: CI が全部緑です (承認ではありません。理由: {event.get('reason') or 'no_approval'})。"
                 "merge は review の所見を読み、plan.sh ci-gate で確かめてから Director が判断してください。")
+    if event['kind'] == 'merge-ready':
+        return (f"[merge-ready] PR #{pr} @{head}: CI が全部緑で、review の承認 head がこの head と一致しています。"
+                "merge は plan.sh ci-gate で確かめてから --match-head-commit で Director が行ってください。")
     return (f"[ci-unknown] PR #{pr} @{head}: CI の状態を {UNKNOWN_NOTIFY_STREAK} 回続けて確かめられません"
             f" (理由: {event.get('reason') or 'check'})。gh の認証・ネットワークを確認してください。")
 

@@ -191,6 +191,62 @@ def test_cli_passes_with_the_current_head_in_the_line(repo):
     assert (snapshot(repo.root / "queue"), snapshot(repo.root / "registry")) == before    # 読み取り専用
 
 
+def test_cli_passes_with_a_card_in_an_archived_mission(repo):
+    """archive 済み mission の card でも記録と承認 head が引ける (t002 / 実例: 2026-11-13 PR #385)。
+
+    mission 完了の条件 (`agents/director.md` §11) は『全 task が done』だけで PR の merge を含まないので、
+    Director が archive してから merge するのが普通の順序。card が active mission 側に無くなっても
+    門の記録・承認 head の両方を読めること。"""
+    import time
+    done_with_pr(repo)
+    put_gh(repo)
+    write_rec(repo, rec(observed=time.time() - 5))
+    a = repo.plan("archive", MISSION)
+    assert a.returncode == 0, a.stderr
+    assert not (repo.queue / "missions" / MISSION).exists()
+    assert (repo.queue / "archive" / MISSION / "tasks" / "t001.md").exists()
+    p = gate(repo, "313")
+    assert (p.returncode, p.stdout) == (
+        0, f"ci-gate: PASS PR #313 head={HEAD}\nci-gate: approved_head no_approval\n"), p.stderr
+
+
+def test_cli_prefers_the_newest_record_across_active_and_archive(repo):
+    """同じ PR 番号の card が active mission と archive mission の両方にあっても、
+    `observed_at` が最も新しい記録で判定する (active が優先でも archive が優先でもない)。"""
+    import time
+    done_with_pr(repo)                                           # active mission の t001 → PR #313
+    put_gh(repo)
+    write_rec(repo, rec(observed=time.time() - 500, state="failed",
+                         checks=[chk("pytest"), chk("ci-ok", "failed")]))   # 古い記録: 赤
+
+    # 2 つ目の mission を直接 archive に置く (同じ PR 番号。mission.yaml は gate に要らない)
+    archived_tasks = repo.queue / "archive" / "mission2" / "tasks"
+    archived_tasks.mkdir(parents=True)
+    (archived_tasks / "t001.md").write_text(
+        "---\nid: t001\ntitle: other mission, same PR\nstatus: done\npr_number: 313\n---\n\nbody\n")
+    assert ci.write_record(repo.root / "registry", "mission2", "t001", rec(observed=time.time() - 5))  # 新しい記録: 緑
+
+    p = gate(repo, "313")
+    assert (p.returncode, p.stdout) == (
+        0, f"ci-gate: PASS PR #313 head={HEAD}\nci-gate: approved_head no_approval\n"), p.stderr
+
+
+def test_cli_is_not_fooled_by_an_unreadable_card_in_the_archived_mission(repo):
+    """archive の別 mission に読めない card があっても、緑へは倒れない (正しい記録のまま判定する)。"""
+    import time
+    done_with_pr(repo)
+    put_gh(repo)
+    write_rec(repo, rec(observed=time.time() - 500, state="failed",
+                         checks=[chk("pytest"), chk("ci-ok", "failed")]))
+
+    broken_tasks = repo.queue / "archive" / "broken-mission" / "tasks"
+    broken_tasks.mkdir(parents=True)
+    (broken_tasks / "t001.md").write_text("not frontmatter at all")      # 壊れた card ([破損] に隔離される)
+
+    p = gate(repo, "313")
+    assert (p.returncode, p.stdout) == (1, "ci-gate: DENY PR #313 failed\n")
+
+
 @pytest.mark.parametrize("gh_head,reason", [(OTHER, "head_mismatch")])
 def test_cli_refuses_when_the_pr_moved_on(repo, gh_head, reason):
     import time

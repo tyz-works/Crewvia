@@ -318,6 +318,20 @@ def test_green_is_notified_once_and_clearing_the_ledger_resends_once(d):
     assert len(sent()) == 2
 
 
+def test_ci_follow_continues_after_the_mission_is_archived(d):
+    """mission 完了 (card が done) は PR の merge を含まない (`agents/director.md` §11) ので、Director が
+    mission を archive してから個々の PR を merge する順序が普通にある。archive した瞬間に CI の記録・
+    通知が止まらないこと (t002。`plan.sh ci-gate` の同じ穴の実例: 2026-11-13 PR #385)。"""
+    cycle(d, view_state(ROLLUP_RUNNING, "OPEN"))       # active な間に記録を 1 つ作ってから archive する
+    assert (d["_root"] / "registry" / "ci" / "m__t001.json").exists()
+    (d["_root"] / "queue" / "missions" / "m").rename(d["_root"] / "queue" / "archive" / "m")
+    (d["_root"] / "queue" / "state.yaml").write_text("active_missions: []\ndefault_mission: null\n")
+
+    cycle(d, view_state(GREEN, "OPEN"))
+    assert ci.read_record(d["_root"] / "registry", "m", "t001")["state"] == "passed"
+    assert [m[:10] for m in sent()] == ["[ci-green]"]
+
+
 def test_running_sends_nothing_and_merged_pr_stops_everything(d):
     cycle(d, view_state(ROLLUP_RUNNING, "OPEN"))
     assert sent() == []

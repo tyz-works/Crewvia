@@ -3580,9 +3580,15 @@ def cmd_ci_gate(args):
     (ここに条件を書き写さない)。PASS のときだけ 2 行目に承認 head の判定 `ci-gate: approved_head ok|no_approval|
     approved_head_mismatch` (`lib_ci_status.approval_verdict`。exit コードには効かない)。待ちを解く・done にする・Rule 5 / watchdog を黙らせることには使わない。
 
-    記録は card の `pr_number` == N の task (active mission。`--target-dir` / `TARGET_DIR` / 無ければ crewvia 本体で
-    絞る = `resolve-pr` と同じ規則) の `registry/ci/` の記録のうち `observed_at` が最も新しいもの。PR の現 head は
+    記録は card の `pr_number` == N の task (**active ∪ archive**。`--target-dir` / `TARGET_DIR` / 無ければ crewvia
+    本体で絞る = `resolve-pr` と同じ規則) の `registry/ci/` の記録のうち `observed_at` が最も新しいもの。PR の現 head は
     門を引く瞬間に gh で取り直す。
+
+    **archive も見る理由**: mission 完了の条件 (`agents/director.md` §11) は「全 task が done」だけで PR の merge を
+    含まない。Director は mission を archive してから個々の PR を merge する運用があるので、active mission だけを
+    見ると archive した瞬間に (1) CI の記録 (2) 承認 head の両方が引けなくなり no_record / no_approval に落ちる
+    (実例: 2026-11-13 PR #385。全 CI 緑なのに門が引けなかった)。手動・rare な操作なので全走査でよい —
+    実測 (本番 13 mission archive / 90 task) で約 65ms。PR 番号で早期に絞る最適化は今は入れない (この秒数なら不要)。
     """
     opts, positional = parse_opts(args, {'--target-dir': 'value'})
     try:
@@ -3609,8 +3615,17 @@ def cmd_ci_gate(args):
         deny('unknown:state_unreadable')
     newest = None
     reviews = []
-    for slug in list(state.get('active_missions') or []):
-        for meta, _body in list_tasks(slug, quiet=True):
+    # active ∪ archive (上の docstring「archive も見る理由」)。archive 側は tasks_dir() の既定を使えないので
+    # base_dir で明示する (`_mission_data` / cmd_dashboard_data と同じ組み立て方)。
+    mission_dirs = [(slug, tasks_dir(slug)) for slug in list(state.get('active_missions') or [])]
+    if os.path.isdir(ARCHIVE_DIR):
+        mission_dirs += [
+            (entry, os.path.join(ARCHIVE_DIR, entry, 'tasks'))
+            for entry in sorted(os.listdir(ARCHIVE_DIR))
+            if os.path.isdir(os.path.join(ARCHIVE_DIR, entry, 'tasks'))
+        ]
+    for slug, tdir in mission_dirs:
+        for meta, _body in list_tasks(slug, base_dir=tdir, quiet=True):
             if meta.get('pr_number') != pr_number or (meta.get('target_dir') or None) != effective_target:
                 continue
             if set(meta.get('skills') or ()) & set(_CI_STATUS.APPROVAL_SKILLS):

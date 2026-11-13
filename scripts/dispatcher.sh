@@ -3698,6 +3698,56 @@ def ci_line_for(slug, task_id):
 _CI_DEADLINE = [None]    # この dispatcher サイクルの CI 全体の締め切り (monotonic)。poll と head の取り直しで共有
 
 
+def _ci_base_item(slug, meta):
+    return {'mission': slug, 'id': meta['id'], 'status': meta.get('status'),
+            'pr_number': meta.get('pr_number'), 'target_dir': meta.get('target_dir') or None}
+
+
+def _archived_ci_tasks(active_missions):
+    """`(slug, meta, body)` の一覧。CI を追い続けるべき **archive 済み** mission の task だけ。
+
+    mission 完了の条件 (`agents/director.md` §11) は『全 task が done』だけで PR の merge を含まないので、
+    Director が mission を archive してから個々の PR を merge する順序が普通にある。`active_missions` だけを
+    見ていると、archive した瞬間に CI の記録も `ci-green` / `merge-ready` の通知も止まる (plan.sh の PR merge
+    の門 — Director が merge 直前に引くコマンド — が踏んだ同じ穴の実例: 2026-11-13 PR #385。t002)。
+
+    archive 配下は総なめにしない: 既に `registry/ci/` に記録がある task だけを対象にする (mission が active な
+    間に少なくとも 1 回 `poll_cycle` が観測していれば記録ができている — done と archive の間に dispatcher の
+    サイクルが 1 回も挟まらない極小の窓だけが取りこぼる。それでも上記の門は active ∪ archive の全走査なので、
+    merge の直前には必ず引ける)。記録が MERGED / CLOSED / NOT_FOUND を既に言っているものは card を開かずに
+    捨てる (もう動かない PR の archive の card を毎サイクル開く理由が無い)。
+    """
+    import lib_git_policy
+    active = set(active_missions)
+    try:
+        names = os.listdir(lib_ci_status.ci_dir(REGISTRY_DIR))
+    except OSError:
+        return []
+    out = []
+    for name in names:
+        if not name.endswith('.json') or name in (lib_ci_status.PENDING_NAME, lib_ci_status.MAIN_RUNS_NAME):
+            continue
+        mission, sep, task_id = name[:-len('.json')].rpartition('__')
+        if not sep or mission in active:
+            continue
+        try:
+            lib_git_policy.check_mission_slug(mission)
+            lib_git_policy.check_task_id(task_id)
+        except lib_git_policy.GitPolicyError:
+            continue        # record_path() が書くときに検査済みのはずの名前。壊れていれば触らない
+        record = lib_ci_status.read_record(REGISTRY_DIR, mission, task_id)
+        if record is None or record.get('pr_state') in lib_ci_status.PR_TERMINAL_STATES:
+            continue
+        task_file = ARCHIVE_DIR / mission / 'tasks' / f'{task_id}.md'
+        if not task_file.exists():
+            continue
+        meta, body = read_task_card(task_file, task_id)
+        if meta.get('status') == CORRUPT_TASK_STATUS or not lib_ci_status.card_is_watched(meta):
+            continue
+        out.append((mission, meta, body))
+    return out
+
+
 def run_ci_poll():
     _CI_DEADLINE[0] = time.monotonic() + 2 * lib_ci_status.CYCLE_BUDGET_SECONDS
     try:
@@ -3705,13 +3755,18 @@ def run_ci_poll():
         state = load_state()
         if is_unreadable(state) or not isinstance(state, dict):
             return
+        active_missions = state.get('active_missions') or []
         tasks = []
-        for slug in (state.get('active_missions') or []):
+        for slug in active_missions:
             for meta, _ in list_tasks_for_mission(slug):
                 if lib_ci_status.card_is_watched(meta):
-                    tasks.append({'mission': slug, 'id': meta['id'], 'status': meta.get('status'),
-                                  'pr_number': meta.get('pr_number'), 'target_dir': meta.get('target_dir') or None,
-                                  'task_slug': meta.get('task_slug')})
+                    item = _ci_base_item(slug, meta)
+                    item['task_slug'] = meta.get('task_slug')
+                    tasks.append(item)
+        for slug, meta, _body in _archived_ci_tasks(active_missions):
+            item = _ci_base_item(slug, meta)
+            item['task_slug'] = meta.get('task_slug')
+            tasks.append(item)
         changed = 0
         if tasks:
             changed = lib_ci_status.poll_cycle(
@@ -3757,17 +3812,23 @@ def run_ci_notify():
         state = load_state()
         if is_unreadable(state) or not isinstance(state, dict):
             return
+        active_missions = state.get('active_missions') or []
+
+        def _notify_item(slug, meta, body):
+            item = _ci_base_item(slug, meta)
+            skills = set(meta.get('skills') or ()) & set(lib_ci_status.APPROVAL_SKILLS)
+            if skills:      # 承認 head の元 (review 系の task だけ。Result を読む)
+                item.update(skills=sorted(skills), completed_at=meta.get('completed_at'),
+                            result=lib_history.result_section(body))
+            return item
+
         tasks = []
-        for slug in (state.get('active_missions') or []):
+        for slug in active_missions:
             for meta, body in list_tasks_for_mission(slug):
                 if lib_ci_status.card_is_watched(meta):
-                    item = {'mission': slug, 'id': meta['id'], 'status': meta.get('status'),
-                            'pr_number': meta.get('pr_number'), 'target_dir': meta.get('target_dir') or None}
-                    skills = set(meta.get('skills') or ()) & set(lib_ci_status.APPROVAL_SKILLS)
-                    if skills:      # 承認 head の元 (review 系の task だけ。Result を読む)
-                        item.update(skills=sorted(skills), completed_at=meta.get('completed_at'),
-                                    result=lib_history.result_section(body))
-                    tasks.append(item)
+                    tasks.append(_notify_item(slug, meta, body))
+        # archive 済み mission でも PR が未 merge なら知らせ続ける (`_archived_ci_tasks` の docstring)
+        tasks.extend(_notify_item(slug, meta, body) for slug, meta, body in _archived_ci_tasks(active_missions))
         now = time.time()
         # 緑を知らせる直前に PR の現 head を取り直す (#377 レビュー P3-1)。取り直しは台帳に無い候補だけ (pr_events の is_sent)・
         # 同じ PR は 1 回 (キャッシュ)・件数は MAX_TASKS_PER_CYCLE・時間は poll と共通の deadline (run_ci_poll が置く) の残りで

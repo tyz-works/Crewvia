@@ -619,12 +619,15 @@ def extract_trailing_body_section(body):
     lines = body.splitlines()
     result_seen = False
     trailing_start = None
+    fenced = []
     for i, line in enumerate(lines):
         if re.match(r'^##\s+(Description|Result)\s*$', line, re.IGNORECASE):
-            if re.match(r'^##\s+Result\s*$', line, re.IGNORECASE):
+            if not result_seen and re.match(r'^##\s+Result\s*$', line, re.IGNORECASE):
                 result_seen = True
+                fenced = _HISTORY.fence_mask(lines[i + 1:])   # Result の中身から数える (result_section と同じ)
+                fence_base = i + 1
             continue
-        if result_seen and re.match(r'^##\s+\S', line):
+        if result_seen and not fenced[i - fence_base] and re.match(r'^##\s+\S', line):
             trailing_start = i
             break
     if trailing_start is None:
@@ -647,8 +650,10 @@ def demote_section_headings(text):
     報告 (`## QA Gate` など) を書いた Worker の done を止めない・中身は失われない・読み口を 1 か所のまま保てる。
     検証 (QA Gate / required_evidence) は下げる前の本文で行う。"""
     out = []
-    for line in (text or '').split('\n'):
-        if _SECTION_LINE_RE.match(line) and not _BODY_HEADER_RE.match(line):
+    lines = (text or '').split('\n')
+    fenced = _HISTORY.fence_mask(lines)      # 閉じたコードフェンスの中は触らない (閉じないものはフェンスと数えない)
+    for line, in_fence in zip(lines, fenced):
+        if not in_fence and _SECTION_LINE_RE.match(line) and not _BODY_HEADER_RE.match(line):
             line = '#' + line
         out.append(line)
     return '\n'.join(out)
@@ -662,8 +667,9 @@ def keep_known_appendices(trailing):
     if not trailing:
         return ''
     sections, cur = [], None
-    for line in trailing.split('\n'):
-        if _SECTION_LINE_RE.match(line) and not _BODY_HEADER_RE.match(line):
+    tlines = trailing.split('\n')
+    for line, in_fence in zip(tlines, _HISTORY.fence_mask(tlines)):
+        if not in_fence and _SECTION_LINE_RE.match(line) and not _BODY_HEADER_RE.match(line):
             cur = [line]
             sections.append(cur)
         elif cur is not None:

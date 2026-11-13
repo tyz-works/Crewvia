@@ -230,6 +230,35 @@ def differing_fields(old_fields, old_body, new_fields, new_body, ignore=()):
 _HEADER_RE = re.compile(r'^##\s+(Description|Result)\s*$', re.IGNORECASE)
 _RESULT_RE = re.compile(r'^##\s+Result\s*$', re.IGNORECASE)
 _SECTION_RE = re.compile(r'^##\s+\S')
+_FENCE_OPEN_RE = re.compile(r'^ {0,3}(`{3,}|~{3,})(.*)$')
+
+
+def fence_mask(lines):
+    """各行が「閉じたコードフェンス (``` または ~~~) の中 (フェンス行を含む)」かどうかの list[bool]。
+
+    Result の本文の `## ` 見出しを下げる処理 (plan.sh `demote_section_headings`) と、節を切る読み手
+    (`result_section` / plan.sh `extract_trailing_body_section` / `keep_known_appendices`) が**同じ定義**を使う
+    (片方だけがフェンスを見ると、フェンスの中の `## ` で Result が切れて `approved_head:` が節の外に出る)。
+    **閉じないフェンスはフェンスとして数えない**: 開きだけの行から末尾までを「中」にすると、その後ろの本物の
+    `## ` 節 (Needs-Director 詳細など) が Result に吸われ、`## ` の見出しが下げられず `approved_head:` も節の外に
+    出る。閉じないものは普通の行として扱う (従来と同じ挙動)。"""
+    mask = [False] * len(lines)
+    i = 0
+    while i < len(lines):
+        m = _FENCE_OPEN_RE.match(lines[i])
+        if m and not (m.group(1)[0] == '`' and '`' in m.group(2)):
+            ch, n = m.group(1)[0], len(m.group(1))
+            close = re.compile(r'^ {0,3}' + re.escape(ch) + '{' + str(n) + r',}\s*$')
+            j = i + 1
+            while j < len(lines) and not close.match(lines[j]):
+                j += 1
+            if j < len(lines):
+                for k in range(i, j + 1):
+                    mask[k] = True
+                i = j + 1
+                continue
+        i += 1
+    return mask
 
 
 def result_section(body):
@@ -248,8 +277,11 @@ def result_section(body):
     if start is None:
         return ''
     end = len(lines)
+    fenced = fence_mask(lines[start:])
     for j in range(start, len(lines)):
         line = lines[j]
+        if fenced[j - start]:
+            continue
         if _HEADER_RE.match(line):
             continue
         if _SECTION_RE.match(line):

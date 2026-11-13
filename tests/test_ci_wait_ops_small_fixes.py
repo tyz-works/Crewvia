@@ -80,3 +80,49 @@ def test_reopen_drops_leftover_sections_but_keeps_known_appendices(tmp_path):
     assert "前回の P2" not in kept and "本文" not in kept
     assert "## Needs-Director 詳細\n詳細" in kept and "## Verification\nv" in kept
     assert ns["keep_known_appendices"]("") == ""
+
+
+# -- コードフェンスの中の `## ` は触らない (t003 / #382 P3-1) ---------------------------------------------
+
+FENCE = "`" * 3
+
+
+def test_headings_inside_a_closed_fence_are_left_alone_and_approved_head_stays_inside(tmp_path):
+    ns = _ns(tmp_path)
+    result = f"## QA Gate\n{FENCE}md\n## 例\nx\n{FENCE}\n## 所見\ny\n\napproved_head: {SHA}"
+    stored = ns["demote_section_headings"](result)
+    assert f"{FENCE}md\n## 例\nx\n{FENCE}" in stored          # フェンスの中は元のまま
+    assert "### QA Gate" in stored and "### 所見" in stored    # 外は下げる
+    body = ns["build_task_body"]("d", stored)
+    assert ci.approved_head(lib_history.result_section(body)) == SHA   # フェンスの中の ## で切れない
+    # 対照: 読み手がフェンスを見ないと Result が切れて approved_head が外に出る (フェンスの中を下げない場合)
+    lines = body.splitlines()
+    start = next(i for i, ln in enumerate(lines) if ln == "## Result") + 1
+    naive_end = next(j for j in range(start, len(lines)) if lines[j].startswith("## "))
+    assert "approved_head" not in "\n".join(lines[start:naive_end])
+
+
+def test_unclosed_fence_is_not_a_fence_so_headings_after_it_are_still_demoted(tmp_path):
+    ns = _ns(tmp_path)
+    result = f"{FENCE}\n## 閉じ忘れの後ろ\nx\n\napproved_head: {SHA}"
+    stored = ns["demote_section_headings"](result)
+    assert "\n### 閉じ忘れの後ろ" in stored
+    body = ns["build_task_body"]("d", stored)
+    assert ci.approved_head(lib_history.result_section(body)) == SHA
+
+
+def test_tilde_fence_and_longer_closer(tmp_path):
+    ns = _ns(tmp_path)
+    assert ns["demote_section_headings"]("~~~\n## a\n~~~\n## b") == "~~~\n## a\n~~~\n### b"
+    four = "`" * 4
+    text = f"{four}\n{FENCE}\n## a\n{four}\n## b"      # 4 本で開いたら 3 本では閉じない
+    assert ns["demote_section_headings"](text) == f"{four}\n{FENCE}\n## a\n{four}\n### b"
+
+
+def test_trailing_appendix_readers_skip_fenced_headings(tmp_path):
+    ns = _ns(tmp_path)
+    body = f"## Description\nd\n\n## Result\nr\n{FENCE}\n## 例\n{FENCE}\n\n## Needs-Director 詳細\n詳細\n"
+    trailing = ns["extract_trailing_body_section"](body)
+    assert trailing.startswith("## Needs-Director 詳細")
+    kept = ns["keep_known_appendices"](f"## Verification\nv\n{FENCE}\n## 例\n{FENCE}\n")
+    assert "## 例" in kept and kept.startswith("## Verification")

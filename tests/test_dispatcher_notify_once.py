@@ -760,3 +760,52 @@ def test_refusal_load_accepts_valid_int_and_str_pr(tmp_path):
 def test_refusal_path_rejects_unsafe_names(tmp_path, bad):
     with pytest.raises(ValueError):
         lib_review_refusal.refusal_path(tmp_path, bad, "t1")
+
+
+# -- mission の停滞通知 (lib_stall) を本物の notify_state_once / prune_told 越しに (t003 / #380 P3-3) ------
+#
+# tests/test_stall_notice.py は notify を差し替えて run_cycle を見る。ここは dispatcher の run_stall_cycle を通し、
+# 「1 回だけ → 解けたら台帳のキーが畳まれる → 同じ停滞でまた 1 回」を本物の通知台帳で確かめる。
+
+def _stall_clock(h, monkeypatch, threshold=60):
+    import time as _time
+    import lib_daemon_watch
+    clock = {"now": 1_000_000.0}
+    monkeypatch.setattr(_time, "time", lambda: clock["now"])
+    real = lib_daemon_watch.load_config
+
+    def cfg():
+        c = real()
+        c.stall_notify_seconds = threshold
+        return c
+    monkeypatch.setattr(lib_daemon_watch, "load_config", cfg)
+    return clock
+
+
+def stall_msgs(msgs):
+    return [m for m in msgs if m.startswith("[stall]")]
+
+
+def test_stall_is_told_once_then_cleared_then_told_once_again(h, monkeypatch):
+    clock = _stall_clock(h, monkeypatch)
+    h.card("t001", "done")
+    h.card("t002", "blocked", blocked_reason="要修正")
+    assert stall_msgs(h.cycle()) == []                       # 時計の開始
+    clock["now"] += 60
+    first = stall_msgs(h.cycle())
+    assert len(first) == 1 and SLUG in first[0]
+    assert "stall-" + SLUG in told_keys(h)
+    for _ in range(3):                                       # 続く間は黙る (スロットルが切れても)
+        clock["now"] += 400
+        assert stall_msgs(h.cycle(ttl_expired=True)) == []
+
+    h.card("t002", "in_progress")                            # 解けた → 台帳のキーが畳まれる
+    clock["now"] += 5
+    assert stall_msgs(h.cycle()) == []
+    assert "stall-" + SLUG not in told_keys(h)
+
+    h.card("t002", "blocked", blocked_reason="要修正")       # 同じ停滞がまた起きた = 新しい事象
+    clock["now"] += 5
+    assert stall_msgs(h.cycle()) == []                       # 時計は最初から
+    clock["now"] += 60
+    assert len(stall_msgs(h.cycle())) == 1

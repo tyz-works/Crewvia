@@ -639,7 +639,7 @@ _SECTION_LINE_RE = re.compile(r'^##\s+\S')
 _BODY_HEADER_RE = re.compile(r'^##\s+(Description|Result)\s*$', re.IGNORECASE)
 #: card の本文の末尾に残してよい節の見出し (`## ` の後ろがこれで始まるもの)。それ以外の `## ` 節は、前の Result の本文の
 #: 一部 (Worker が Result の中に書いた見出し) の残骸なので、done / fail が本文を組み直すときに持ち越さない (t005)。
-KNOWN_APPENDIX_HEADINGS = ('Needs-Director 詳細', 'Verification', 'Pre-Compact Snapshot')
+KNOWN_APPENDIX_HEADINGS = _HISTORY.KNOWN_APPENDIX_HEADINGS
 
 
 def demote_section_headings(text):

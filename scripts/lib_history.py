@@ -231,6 +231,10 @@ _HEADER_RE = re.compile(r'^##\s+(Description|Result)\s*$', re.IGNORECASE)
 _RESULT_RE = re.compile(r'^##\s+Result\s*$', re.IGNORECASE)
 _SECTION_RE = re.compile(r'^##\s+\S')
 _FENCE_OPEN_RE = re.compile(r'^ {0,3}(`{3,}|~{3,})(.*)$')
+#: card の本文の末尾に残してよい節の見出し。フェンスの閉じはこの見出しの行より先では探さない (書き手は Result の本文だけ、
+#: 読み手は後ろの節も含めて数えるので、範囲がずれると後ろの節のフェンスを閉じと誤読する)。plan.sh も同じ値を使う。
+KNOWN_APPENDIX_HEADINGS = ('Needs-Director 詳細', 'Verification', 'Pre-Compact Snapshot')
+_APPENDIX_LINE_RE = re.compile(r'^##\s+(?:' + '|'.join(re.escape(h) for h in KNOWN_APPENDIX_HEADINGS) + ')')
 
 
 def fence_mask(lines):
@@ -250,9 +254,9 @@ def fence_mask(lines):
             ch, n = m.group(1)[0], len(m.group(1))
             close = re.compile(r'^ {0,3}' + re.escape(ch) + '{' + str(n) + r',}\s*$')
             j = i + 1
-            while j < len(lines) and not close.match(lines[j]):
+            while j < len(lines) and not close.match(lines[j]) and not _APPENDIX_LINE_RE.match(lines[j]):
                 j += 1
-            if j < len(lines):
+            if j < len(lines) and close.match(lines[j]):
                 for k in range(i, j + 1):
                     mask[k] = True
                 i = j + 1

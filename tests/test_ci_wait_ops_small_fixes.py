@@ -126,3 +126,14 @@ def test_trailing_appendix_readers_skip_fenced_headings(tmp_path):
     assert trailing.startswith("## Needs-Director 詳細")
     kept = ns["keep_known_appendices"](f"## Verification\nv\n{FENCE}\n## 例\n{FENCE}\n")
     assert "## 例" in kept and kept.startswith("## Verification")
+
+
+def test_unclosed_fence_with_fenced_appendix_keeps_approved_head_and_appendix(tmp_path):
+    ns = _ns(tmp_path)
+    stored = ns["demote_section_headings"](f"LGTM\n{FENCE}\n## note\napproved_head: {SHA}")
+    body = ns["build_task_body"]("d", stored)
+    body += f"\n## Needs-Director 詳細\nlog:\n{FENCE}\nx\n{FENCE}\n## Verification\nv\n{FENCE}\ny\n{FENCE}\n"
+    assert ci.approved_head(lib_history.result_section(body)) == SHA
+    trailing = ns["extract_trailing_body_section"](body)
+    assert trailing.startswith("## Needs-Director 詳細") and "## Verification" in trailing
+    assert ns["keep_known_appendices"](trailing).startswith("## Needs-Director 詳細")

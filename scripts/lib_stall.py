@@ -191,6 +191,7 @@ def run_cycle(registry_dir, all_tasks, done_ids_by_mission, statuses_by_mission,
         by_mission.setdefault(slug, []).append(meta)
     new_ledger = {}
     sent = []
+    fresh = set()
     stalled_now = []          # (slug, stall, fp): 今サイクルで停滞と判定した mission (台帳に書けなかったときの代替通知用)
     for slug in active_missions:
         if slug not in observed_slugs:
@@ -204,6 +205,7 @@ def run_cycle(registry_dir, all_tasks, done_ids_by_mission, statuses_by_mission,
         entry = ledger.get(slug)
         if entry is None or entry['fp'] != fp or entry['first_seen'] > now:
             entry = {'fp': fp, 'first_seen': now}
+            fresh.add(slug)       # 時計を今作った mission (台帳から時計を読めた mission は含めない)
         new_ledger[slug] = entry
         live_keys.add(told_key(slug))
         stalled_now.append((slug, stall, fp))
@@ -214,10 +216,12 @@ def run_cycle(registry_dir, all_tasks, done_ids_by_mission, statuses_by_mission,
         log('WARNING: stall-state に書けない — 経過時間を測れないので、停滞中の mission は注記つきで 1 回知らせます')
         # 書けない状態が続くと毎サイクル first_seen=now になり、しきい値に一度も届かない (= 出ない側に倒れる)。
         # dispatcher は毎サイクル新しい python なのでプロセス内に時計を持てない。代わりに、停滞と判定した mission を
-        # 「経過時間は測れない」と注記して通知台帳越しに 1 回だけ知らせる (同じ fp の間は notify_state_once が再送しない)。
+        # 「経過時間は測れない」と注記して通知台帳越しに知らせる。書けない原因が registry/daemons/ 自体だと通知台帳にも
+        # 書けず、再送の間隔は notify_state_once の /tmp のスロットル (5 分ごと) になる (出ない側ではなく再送する側。許容)。
+        # 対象は今サイクルで時計を作り直した mission だけ (台帳から時計を読めて通知済みの mission に 2 通目を送らない)。
         # 時計の通知とは別の key。台帳が書けるようになれば live_keys から外れ、prune_told が畳む。
         for slug, stall, fp in stalled_now:
-            if slug in sent:
+            if slug in sent or slug not in fresh:
                 continue
             key = unwritable_told_key(slug)
             live_keys.add(key)

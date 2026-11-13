@@ -298,7 +298,8 @@ BASE_FETCH_LOCAL_REF=""  # t006: origin/main を都度 fetch する一時 ref (�
 # 同じ repo への `git worktree add` / `remove` を同時に走らせると .git/worktrees/ の作成・削除が
 # 競合し「failed to read .git/worktrees/<name>/commondir」で落ちる (CI で実測)。dispatcher が
 # review を 2 本同時に spawn する本番でも同じ形で誤って needs-director になるので、
-# git common dir 配下のロックファイルで直列化する。flock が無い環境ではロックなしで素通り。
+# git common dir 配下のロックファイルで直列化する。fetch / update-ref -d も同じロックを通す
+# (fetch は全 worktree の HEAD を読むので、並行する add / remove と同じ commondir の競合で落ちうる)。flock が無い環境ではロックなしで素通り。
 wt_git() {
   local repo="$1"; shift
   local gcd lock
@@ -346,10 +347,10 @@ cleanup() {
       || rm -rf "$REVIEW_WT"
   fi
   if [[ -n "$FETCH_LOCAL_REF" ]]; then
-    git -C "${WORK_DIR:-$REPO_ROOT}" update-ref -d "$FETCH_LOCAL_REF" 2>/dev/null || true
+    wt_git "${WORK_DIR:-$REPO_ROOT}" update-ref -d "$FETCH_LOCAL_REF" 2>/dev/null || true
   fi
   if [[ -n "$BASE_FETCH_LOCAL_REF" ]]; then
-    git -C "${WORK_DIR:-$REPO_ROOT}" update-ref -d "$BASE_FETCH_LOCAL_REF" 2>/dev/null || true
+    wt_git "${WORK_DIR:-$REPO_ROOT}" update-ref -d "$BASE_FETCH_LOCAL_REF" 2>/dev/null || true
   fi
 }
 trap cleanup EXIT
@@ -462,7 +463,7 @@ _info "Repo root (unaffected by review): ${WORK_DIR}"
 #   - PR番号を含む固定名だと同一 PR の同時 review で衝突し得るため $$ (PID) で一意化する。
 FETCH_LOCAL_REF="refs/kai-review-fetch/pr-${PR_NUM}-$$"
 _info "Fetching refs/pull/${PR_NUM}/head → ${FETCH_LOCAL_REF} ..."
-if ! git -C "$WORK_DIR" fetch --force origin "refs/pull/${PR_NUM}/head:${FETCH_LOCAL_REF}" 2>&1; then
+if ! wt_git "$WORK_DIR" fetch --force origin "refs/pull/${PR_NUM}/head:${FETCH_LOCAL_REF}" 2>&1; then
   fail_needs_director "NEEDS FIX: git fetch origin refs/pull/${PR_NUM}/head failed for PR#${PR_NUM}"
 fi
 
@@ -509,7 +510,7 @@ if ! PR_BASE_BRANCH="$(python3 "${SCRIPT_DIR}/lib_git_policy.py" pr-base --lines
   fail_needs_director "NEEDS FIX: cannot resolve the PR base for ${MISSION_SLUG}/${TASK_ID} — ${PR_BASE_BRANCH:-no output} (fail-closed, no fallback to main)"
 fi
 BASE_FETCH_LOCAL_REF="refs/kai-review-fetch/base-${PR_BASE_BRANCH//\//_}-$$"
-if ! git -C "$WORK_DIR" fetch --force origin "${PR_BASE_BRANCH}:${BASE_FETCH_LOCAL_REF}" 2>&1; then
+if ! wt_git "$WORK_DIR" fetch --force origin "${PR_BASE_BRANCH}:${BASE_FETCH_LOCAL_REF}" 2>&1; then
   fail_needs_director "NEEDS FIX: git fetch origin ${PR_BASE_BRANCH} failed while resolving diff base"
 fi
 DIFF_BASE="$BASE_FETCH_LOCAL_REF"

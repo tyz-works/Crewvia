@@ -522,7 +522,7 @@ TASK_META_KEY_ORDER = [
     'blocked_by', 'released_deps', 'timeout', 'target_dir', 'worker', 'started_at',
     *_ex.EXECUTION_FIELDS,                     # 01c: 試行の欄は `started_at` の直後 (execution.md §1.2)
     'completed_at',
-    'handoff_path', 'fail_head', 'fail_head_waiver', 'pr_number', 'no_pr_waiver', 'deliverable',
+    'handoff_path', 'fail_head', 'fail_head_waiver', 'pr_number', 'pr_repo', 'no_pr_waiver', 'deliverable',
     'acceptance_criteria', 'verification', 'rework_count', 'max_rework',
     'qa_checkpoints', 'required_evidence', 'needs_director_reason',
     'result_execution_id',                     # vNext 02 PR-D: card の Result 節を最後に置き換えた試行 (台帳の帰属。§3.2)

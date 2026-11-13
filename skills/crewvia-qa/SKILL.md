@@ -256,29 +256,27 @@ QA が最後に done する mission は多いので、**承認するつもりな
 **merge はしない。CI の完走も待たない。** CI を見るのは dispatcher で、結果は Director に通知される
 （`ci-failed` / `ci-green` / `merge-ready` / `ci-unknown`）。QA の責務は確かめて所見を残すところまで。
 
-### 置き場所: `## QA Gate` の**直前**（後ろに置くと読まれない）
+### 置き場所: Result の**最後の行**
 
-`lib_history.result_section()` は `## Result` の次に現れた**行頭 `## ` の見出しで Result 節を切る**。
-`## QA Gate` はその見出しなので、**`## QA Gate` から後ろは Result 節の外**になる。
-`approved_head:` をそこに置くと `lib_ci_status.approved_head()` に届かず、必ず `no_approval` になる。
-
-`## QA Gate` の見出し自体は `###` に変えられない — `plan.sh done` の検証（`_validate_qa_gate`）が
-`^##\s+QA\s+Gate\s*$` を必須にしているので、変えると done が FAIL する。
-**両方を満たす置き方は 1 つだけ: `approved_head:` 行を `## QA Gate` の直前（Result 節の最後の行）に置く。**
+`lib_ci_status.approved_head()` は Result 節の**最後の非空行**だけを見る。だから `approved_head:` は
+**Result の一番最後**に置く。`## QA Gate` セクションを書く task でも、その**後ろ**に置く。
 
 ```
 QA結果: [対象: <タスクタイトル>]
 ...（所見）...
 
-approved_head: <40 桁の小文字 sha>
-
 ## QA Gate
 
 checkpoint: <名前> | required: yes | result: observed
+
+approved_head: <40 桁の小文字 sha>
 ```
 
-- `qa_checkpoints` が宣言されていない task（`## QA Gate` を書かない）では、Result の**最後の行**に置く
-- 所見の本文でも行頭 `## ` を使わない（`###` 以下にする）。使うとそこで Result 節が切れる
+- 本文の行頭 `## ` は `plan.sh done` が保存時に `### ` へ自動で下げる（#382 の `demote_section_headings`）。
+  `## QA Gate` もそうなるので Result 節は途中で切れない。**QA Gate の検証は下げる前の本文で行われる**ので、
+  見出しは `## QA Gate` のまま書いてよい（`_validate_qa_gate` が `^##\s+QA\s+Gate\s*$` を必須にしている）
+- **守るべき不変条件は 1 つだけ: `approved_head:` 行が Result の最後の非空行であること。**
+  後ろに所見・ログ・チェックポイント行を足さない
 
 ### sha: **自分がテストした commit**（リモートの head ではない）
 

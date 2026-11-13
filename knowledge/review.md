@@ -33,8 +33,11 @@ HEAD_AFTER="$(gh pr view "$PR" --json headRefOid -q .headRefOid)"    # ④ 承�
    `git fetch origin "+refs/pull/${PR}/head:refs/crewvia/pr-${PR}"` で取って
    `git diff "$(git merge-base "origin/$BASE_REF" "$HEAD_BEFORE")" "$HEAD_BEFORE"` を読む方が確実。
    `BASE_REF` は `gh pr view "$PR" --json baseRefName -q .baseRefName`。base を決め打たない）
-5. **Result 本文では行頭 `## ` の見出しを使わない**（`###` 以下を使う）。`lib_history.result_section` は最初の
-   行頭 `## ` で Result 節を切るので、`approved_head:` 行が節の外に出て `no_approval` になる
+5. **`approved_head:` 行は Result の最後の非空行にする。** 後ろに所見・ログを足さない。
+   行頭 `## ` の見出しは `plan.sh done` が保存時に `### ` へ自動で下げる（#382 の
+   `demote_section_headings`）ので、本文に見出しを書いても Result 節は途中で切れない。
+   自動で下がる前は `lib_history.result_section` が最初の行頭 `## ` で節を切っていて、
+   `approved_head:` 行が節の外に出て `no_approval` になっていた
    （実例: mission 20261113-ci-wait-ops-3 t002 の再レビュー）
 
 > 旧手順（`gh pr merge --squash --delete-branch` を review Worker が試み、拒否されたら `needs-director`）は廃止。

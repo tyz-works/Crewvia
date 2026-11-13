@@ -873,13 +873,11 @@ def test_run_in_own_group_reports_when_a_descendant_outside_the_group_holds_the_
             "上限時間内に ProcGroupCleanupError で報告されず、外側のハード打ち切りに頼った "
             "(= 欠陥が直っていない)")
     finally:
-        deadline = time.monotonic() + 3
-        while not marker_file.exists() and time.monotonic() < deadline:
-            time.sleep(0.02)
-        if marker_file.exists():
+        pid = _read_pid_when_written(marker_file, timeout=3)
+        if pid is not None:
             try:
-                os.kill(int(marker_file.read_text().strip()), signal.SIGKILL)
-            except (ValueError, ProcessLookupError):
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
                 pass
 
 
@@ -903,13 +901,11 @@ def test_run_in_own_group_reports_when_kill_group_swallows_a_permission_error(mo
             "kill_group が PermissionError を握り潰したのに、上限時間内に報告されなかった "
             "(= 欠陥が直っていない)")
     finally:
-        deadline = time.monotonic() + 3
-        while not marker_file.exists() and time.monotonic() < deadline:
-            time.sleep(0.02)
-        if marker_file.exists():
+        pid = _read_pid_when_written(marker_file, timeout=3)
+        if pid is not None:
             try:
-                os.kill(int(marker_file.read_text().strip()), signal.SIGKILL)
-            except (ValueError, ProcessLookupError):
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
                 pass
 
 
@@ -940,16 +936,34 @@ def test_run_in_own_group_reports_when_the_wait_after_an_unexpected_exception_do
         proc_group.run_in_own_group(["true"], timeout=5)
 
 
+def _read_pid_when_written(marker_file, timeout=5.0):
+    """シェルのリダイレクトは先に空のファイルを作ってから pid を書く。存在だけで読むと負荷下で空を読むので、
+    改行で終わる (= 書き終わった) まで待つ。上限内に書かれなければ None。"""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            text = marker_file.read_text()
+        except FileNotFoundError:
+            text = ""
+        if text.endswith("\n") and text.strip().isdigit():
+            return int(text.strip())
+        time.sleep(0.02)
+    return None
+
+
 def _spawn_shell_with_background_job(tmp_path, name):
     """`set -m` (job control) の bash が裏の仕事を **別のプロセスグループ** に置く形。(shell, 裏の仕事の pid)。"""
     marker_file = tmp_path / name
     proc = subprocess.Popen(
         ["bash", "-c", f"set -m; sleep 60 >/dev/null 2>&1 & echo $! > {marker_file}; wait"],
         start_new_session=True)
-    deadline = time.monotonic() + 5
-    while not marker_file.exists() and time.monotonic() < deadline:
-        time.sleep(0.02)
-    child = int(marker_file.read_text().strip())
+    child = _read_pid_when_written(marker_file)
+    if child is None:
+        # 子を漏らさない: shell ごと (別グループの sleep も含め) 木で殺してから失敗する
+        kill_tree(proc.pid)
+        kill_group(proc)
+        proc.wait()
+        pytest.fail("前提: 裏の仕事の pid が上限時間内に書かれなかった")
     assert os.getpgid(child) != os.getpgid(proc.pid), "前提: 子が別グループに居ない"
     return proc, child
 

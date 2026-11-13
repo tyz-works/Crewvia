@@ -5,13 +5,34 @@
 
 ## レビュープロトコル
 
-1. `gh pr view {PR_URL}` で概要確認
-2. `gh pr diff {PR_URL}` でコード変更を精査する（CI の完了は待たない。CI は dispatcher が見る）
+**読む前に head を控える。** `gh pr diff` は常に「今の」head を見せるので、読み終えてから
+`headRefOid` を取ると **A を読んで B を承認する**ことが起こりうる（PR #383 codex-review P1）。
+
+```bash
+PR={PR番号}
+HEAD_BEFORE="$(gh pr view "$PR" --json headRefOid -q .headRefOid)"   # ① 読む前に控える
+gh pr view "$PR" --json title,body,files                             # ② 概要
+gh pr diff "$PR"                                                     # ③ この head の diff
+
+# ── ここでレビューする ──
+
+HEAD_AFTER="$(gh pr view "$PR" --json headRefOid -q .headRefOid)"    # ④ 承認の直前に確かめる
+[ "$HEAD_AFTER" = "$HEAD_BEFORE" ] || echo "レビュー中に push された。承認しない"
+```
+
+1. ① で head を控える。**承認に書く sha はこの値**（`HEAD_BEFORE`）
+2. ③ でコード変更を精査する（CI の完了は待たない。CI は dispatcher が見る）
 3. 所見を Result に残して `plan.sh done`。**merge しない**（merge は Director。2026-11-13 の
    「Worker は CI を待たない・merge は Director」への変更。設計: `knowledge/ci-wait-operations.md` §2）
-4. **承認するときだけ** Result の**最後の行**に `approved_head: <40 桁の sha>`（レビューした head。
-   `gh pr view {PR番号} --json headRefOid -q .headRefOid`）を 1 行書く。要修正・条件付きのときは書かない。
-   dispatcher の `merge-ready` 通知と `plan.sh ci-gate` はこの head が PR の現 head と一致するときだけ承認とみなす
+4. ④ が一致し、かつ**承認するときだけ** Result の**最後の行**に
+   `approved_head: <HEAD_BEFORE の 40 桁の sha>` を 1 行書く。要修正・条件付きのときは書かない。
+   dispatcher の `merge-ready` 通知と `plan.sh ci-gate` はこの head が PR の現 head と一致するときだけ承認とみなす。
+   **④ が食い違ったら承認しない** — 読んでいない head を承認したことになる。所見は残して done し、
+   「レビュー中に push があったので再レビューが要る」と Director に伝える
+   （diff を commit に固定できるなら、③ の代わりに
+   `git fetch origin "+refs/pull/${PR}/head:refs/crewvia/pr-${PR}"` で取って
+   `git diff "$(git merge-base "origin/$BASE_REF" "$HEAD_BEFORE")" "$HEAD_BEFORE"` を読む方が確実。
+   `BASE_REF` は `gh pr view "$PR" --json baseRefName -q .baseRefName`。base を決め打たない）
 5. **Result 本文では行頭 `## ` の見出しを使わない**（`###` 以下を使う）。`lib_history.result_section` は最初の
    行頭 `## ` で Result 節を切るので、`approved_head:` 行が節の外に出て `no_approval` になる
    （実例: mission 20261113-ci-wait-ops-3 t002 の再レビュー）

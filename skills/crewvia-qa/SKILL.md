@@ -243,3 +243,42 @@ RESULT_EOF
 ```
 
 これは「代替検証して done を無理やり呼ぶ」よりも **常に正しく、安い選択肢** である。
+
+---
+
+## Step 8b: 承認する場合の `approved_head`（PR に紐づく QA task）
+
+`qa` は `review` / `codex-review` と並ぶ**承認 head を残す skill** である（`lib_ci_status.APPROVAL_SKILLS`）。
+PR に紐づく review 系 task が全部終端になったとき、**`completed_at` が最後のもの**の Result が照合される。
+QA が最後に done する mission は多いので、**承認するつもりなら書かないと `merge-ready` は出ない**
+（`no_approval` になり、Director には `ci-green` が届く）。
+
+**merge はしない。CI の完走も待たない。** CI を見るのは dispatcher で、結果は Director に通知される
+（`ci-failed` / `ci-green` / `merge-ready` / `ci-unknown`）。QA の責務は確かめて所見を残すところまで。
+
+**head はテストを始める前に控える。** テスト後に `headRefOid` を取り直すと、
+**試していない head を承認する**ことになる（PR #383 codex-review P1 と同型）:
+
+```bash
+PR=<PR番号>
+HEAD_BEFORE="$(gh pr view "$PR" --json headRefOid -q .headRefOid)"   # Step 1 の時点で控える
+# ── ここでテストする ──
+HEAD_AFTER="$(gh pr view "$PR" --json headRefOid -q .headRefOid)"    # 承認の直前に確かめる
+[ "$HEAD_AFTER" = "$HEAD_BEFORE" ] || echo "テスト中に push された。承認しない"
+```
+
+一致し、かつ承認するときだけ、Result の**最後の行**に次の 1 行を置く（`## QA Gate` セクションより**後**）:
+
+```
+approved_head: <HEAD_BEFORE の 40 桁の小文字 sha>
+```
+
+- **Result 本文では行頭 `## ` の見出しを使わない**（`###` 以下を使う）。`lib_history.result_section` は
+  最初の行頭 `## ` で Result 節を切るため、`approved_head:` 行が節の外に出て `no_approval` になる。
+  `## QA Gate` を書く task では、**`approved_head:` 行を `## QA Gate` と同じ節の中（＝ Result の最後の行）**に置く
+- 問題あり・未実施の必須チェックポイントが残る・判断を Director に委ねるときは**書かない**
+- 省略形・大文字は読まれない。本文の途中に書いた sha も読まれない（最終行の完全一致だけ）
+- 一致しなかった・承認の後に修正が push された場合は `approved_head_mismatch` になり、
+  未検証の head は merge されない（fail-closed）
+
+設計: `knowledge/ci-wait-operations.md` §2.5 / `knowledge/ci-status.md` / `agents/worker.md`「review の手順」。

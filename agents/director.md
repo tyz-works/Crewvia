@@ -1011,14 +1011,24 @@ AGENT_NAME=$REVIEWER bash scripts/start.sh worker review
 設計: `knowledge/ci-wait-operations.md` §2。**`[merge-ready]` が出た PR だけ**が対象（`[ci-green]` は CI が緑なだけで承認ではない。下の表）。
 
 ```bash
+PR=<PR番号>
 # 1. 門を引き直す（読み取り専用）。通すとき exit 0 で `ci-gate: PASS PR #N head=<40 桁>` + 2 行目 `ci-gate: approved_head ok|no_approval|approved_head_mismatch`。
-#    通さないとき exit 1 で `ci-gate: DENY PR #N <理由>`。head= の値を控える。2 行目が ok でなければ承認ではない（exit コードには出ない）
-./scripts/plan.sh ci-gate <PR番号>
-# 2. 通ったら、門が見た head を固定して squash merge（push が割り込んだら失敗して止まる）
-gh pr merge <PR番号> --squash --match-head-commit <gate が見た head>
+#    通さないとき exit 1 で `ci-gate: DENY PR #N <理由>`。2 行目が ok でなければ承認ではない（exit コードには出ない）
+GATE="$(./scripts/plan.sh ci-gate "$PR")" || { printf '%s\n' "$GATE"; echo "門が通らない。merge しない" >&2; exit 1; }
+printf '%s\n' "$GATE"   # 2 行目の approved_head の判定も必ず読む
+# 2. **門が通した head そのもの**を門の出力から取り出して squash merge する。
+#    gh pr view で取り直すと、門を引いた後に入った push を拾って「誰も通していない head」を merge しうる
+HEAD_SHA="$(printf '%s\n' "$GATE" | sed -n 's/^ci-gate: PASS PR #[0-9][0-9]* head=\([0-9a-f]\{40\}\)$/\1/p')"
+[ -n "$HEAD_SHA" ] || { echo "門の出力から head を読めない。merge しない" >&2; exit 1; }
+gh pr merge "$PR" --squash --match-head-commit "$HEAD_SHA"
 # 3. merge 後は主 checkout を同期（ff + 必要な daemon の restart まで 1 本）
 scripts/sync-main-checkout.sh
 ```
+
+- **head は門の出力から取る。`gh pr view` で取り直さない**（PR #383 codex-review P1）。
+  門が head A を通した直後に B が push されると、取り直した値は B になり、`--match-head-commit B` は
+  **通ってしまう** — B の CI も承認も門を通っていないのに。門が通した A を指していれば、
+  PR が B に動いた時点で GitHub が merge を弾く（fail-closed）
 
 - `ci-gate` が通さないときは merge しない。理由は固定語: `running`（CI 実行中。待つ）/ `failed`（修正 task）/ `unknown:<理由>`（gh を確認）/ `none` / `no_required_check` / `head_mismatch`（push 後の古い記録。次のサイクルを待つ）/ `stale`（記録が古い。再度引く）、承認側は `no_approval` / `approved_head_mismatch`
 - 承認 head は review 系 task（review / codex-review / qa）の最後の Result の末尾行 `approved_head: <sha>`。review の後に修正が push されたら承認は無効（`approved_head_mismatch`）— **Director が自分で直したものも merge 前に review に回す**

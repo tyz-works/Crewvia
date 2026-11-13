@@ -3527,7 +3527,11 @@ def cmd_resolve_pr(args):
 
 
 def cmd_ci_gate(args):
-    """PR の CI の門 (読み取り専用。ロックも取らない・queue も registry も書かない・誰もまだ呼ばない)。
+    """PR の CI の門 (読み取り専用。ロックも取らない・queue も registry も書かない)。
+
+    **Director が merge の直前に引く** (`agents/director.md` §12「merge 手順」)。通知 (`merge-ready` / `ci-green`) は
+    「そのとき緑だった」という知らせで merge の瞬間の保証ではないので、引き直して **PASS 行の head をそのまま**
+    `gh pr merge --match-head-commit` に渡す (gh で取り直すと門を通っていない head を merge しうる)。
 
     設計: `knowledge/ci-wait-operations.md` §2.2。通すとき exit 0 で `ci-gate: PASS PR #N head=<40 桁>` を 1 行、
     通さないとき **exit 1** で `ci-gate: DENY PR #N <理由の固定語>` を 1 行 (stdout)。使い方の誤り・記録が無い・

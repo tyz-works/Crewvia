@@ -41,7 +41,7 @@ HEAD_AFTER="$(gh pr view "$PR" --json headRefOid -q .headRefOid)"    # ④ 承�
    `approved_head:` 行が節の外に出て `no_approval` になっていた
    （実例: mission 20261113-ci-wait-ops-3 t002 の再レビュー）
 6. **worktree の branch を切り替えない**（`git checkout` / `gh pr checkout` をしない）。PR は
-   `gh pr diff` か `git fetch origin pull/N/head:refs/remotes/origin/prN` で読み、手元に branch を作らない。
+   `gh pr diff` か `git fetch origin +pull/N/head:refs/remotes/origin/prN` で読み、手元に branch を作らない。
    detach して試すなら一時 worktree を作り、終わったら消す。理由: 2026-11-13 に review が worktree を
    pr388 / pr387 に切り替えたまま終え、次の pull が W3（`path is a worktree of refs/heads/pr388`）で
    止まり needs_director になった

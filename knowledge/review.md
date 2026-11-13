@@ -5,18 +5,35 @@
 
 ## レビュープロトコル（2026-11-13 改訂 — merge を含まない）
 
-1. `gh pr view {PR_URL}` で概要確認
-2. `gh pr diff {PR_URL}` でコード変更を精査する
+**読む前に head を固定する。** `gh pr diff` は常に「今の」head を見せるので、先に head を控えてから読み、
+承認の直前にもう一度確かめる。これをしないと、**A を読んで B を承認する**ことが起こりうる（#383 codex-review P1-2）。
+
+```bash
+PR={PR番号}
+HEAD_BEFORE="$(gh pr view "$PR" --json headRefOid -q .headRefOid)"   # ① 読む前に固定
+gh pr view "$PR" --json title,body,files                             # ② 概要
+gh pr diff "$PR"                                                     # ③ この head の diff
+
+# ── ここでレビューする ──
+
+HEAD_AFTER="$(gh pr view "$PR" --json headRefOid -q .headRefOid)"    # ④ 承認の直前に確かめる
+[ "$HEAD_AFTER" = "$HEAD_BEFORE" ] || echo "レビュー中に push された。承認しない"
+```
+
+1. ① で head を控える。**承認に書く sha はこの値**（④ で一致を確かめた後）
+2. ③ でコード変更を精査する
 3. **CI の完走を待たない。** CI を見るのは dispatcher で、結果は Director に通知される
    （`ci-failed` / `ci-green` / `merge-ready`）。diff は CI と並行して読んでよい
 4. 所見を Result に書いて `plan.sh done` で完了する。**merge は試みない**
-5. 承認するときだけ、Result の**最後の非空行**に `approved_head: <40 桁の小文字 sha>` を 1 行置く
+5. ④ が一致し、かつ承認するときだけ、Result の**最後の非空行**に
+   `approved_head: <40 桁の小文字 sha>`（= `HEAD_BEFORE`）を 1 行置く
 
-```bash
-# 自分がレビューした head。これが承認の対象になる
-gh pr view {PR番号} --json headRefOid -q .headRefOid
-```
-
+- **④ が食い違ったら承認しない。** 読んでいない head を承認したことになる。所見は残して done し、
+  「レビュー中に push があったので再レビューが要る」と Director に伝える（新しい review task を切ってもらう）
+- diff を commit に固定できる環境（worktree を持つ reviewer）なら、③ の代わりに
+  `git fetch origin "+refs/pull/${PR}/head:refs/crewvia/pr-${PR}"` で取ってから
+  `git diff "$(git merge-base "origin/$BASE_REF" "$HEAD_BEFORE")" "$HEAD_BEFORE"` を読む方が確実
+  （`BASE_REF` は `gh pr view "$PR" --json baseRefName -q .baseRefName`。base を決め打たない）
 - 要修正・条件付き・判断を Director に委ねるときは**書かない**。書かなければ `no_approval` として
   扱われ、Director には `merge-ready` ではなく `ci-green` が届く（Director が所見を読んで判断する）
 - 行は末尾に置く。本文の途中に書いた sha は読まれない（`lib_ci_status.approved_head` は最終行の

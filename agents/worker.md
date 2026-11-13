@@ -690,7 +690,10 @@ done の報告に **「CI は未完了。結果は dispatcher が通知する」
 approved_head: <40 桁の小文字 sha>
 ```
 
-- sha は**自分がレビューした head**（`gh pr view <N> --json headRefOid -q .headRefOid`）。省略形・大文字は読まれない
+- sha は**自分が実際に読んだ / 試した head**。`gh pr diff` は常に「今の」head を見せるので、
+  **読む前に `gh pr view <N> --json headRefOid -q .headRefOid` で控え、承認の直前にもう一度取って
+  一致を確かめる**。食い違ったらレビュー中に push があったということなので**承認しない**
+  （所見は残して done し、再レビューが要ると Director に伝える）。省略形・大文字は読まれない
 - 要修正・条件付き・判断を Director に委ねるときは**書かない**。書かなければ `no_approval` として扱われ、
   Director には `merge-ready` ではなく `ci-green` が届く（Director が所見を読んで判断する）
 - 行は Result の**末尾**に置く。本文の途中に書いた sha は読まれない（推測しない作りになっている）

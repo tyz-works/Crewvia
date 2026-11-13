@@ -1019,13 +1019,20 @@ merge するのは Director だけで、**必ず次の 2 段を踏む**（設計
 ```bash
 # 1. 門を引き直す。exit 0 = 通す / exit 1 = 通さない（理由の固定語が 1 行出る）
 #    PASS のときだけ 2 行目に承認 head の判定が出る: approved_head ok|no_approval|approved_head_mismatch
-./scripts/plan.sh ci-gate {PR番号}
+GATE="$(./scripts/plan.sh ci-gate {PR番号})" || { printf '%s\n' "$GATE"; echo "門が通らない。merge しない" >&2; exit 1; }
+printf '%s\n' "$GATE"   # 2 行目の approved_head の判定も必ず読む
 
-# 2. 門が見た head を指して merge する（引いた後に push が入ったら GitHub 側で弾かれる）
-HEAD_SHA="$(gh pr view {PR番号} --json headRefOid -q .headRefOid)"
+# 2. **門が通した head そのもの**を門の出力から取り出して merge する。
+#    gh で取り直すと、門を引いた後に入った push を拾って「誰も通していない head」を merge しうる
+HEAD_SHA="$(printf '%s\n' "$GATE" | sed -n 's/^ci-gate: PASS PR #[0-9][0-9]* head=\([0-9a-f]\{40\}\)$/\1/p')"
+[ -n "$HEAD_SHA" ] || { echo "門の出力から head を読めない。merge しない" >&2; exit 1; }
 gh pr merge {PR番号} --squash --delete-branch --match-head-commit "$HEAD_SHA"
 ```
 
+- **head は門の出力から取る。`gh pr view` で取り直さない**（#383 codex-review P1-1）。
+  門が head A を通した直後に B が push されると、取り直した値は B になり、
+  `--match-head-commit B` は**通ってしまう** — B の CI も承認も門を通っていないのに。
+  門が通した A を指していれば、PR が B に動いた時点で GitHub が merge を弾く（fail-closed）
 - **通知を根拠に merge しない。** `[merge-ready]` は「そのとき緑で承認が揃っていた」という知らせで、
   merge の瞬間の保証ではない。`ci-gate` を引き直すのは、その間に入った push を捕まえるため
 - `ci-gate` が DENY なら理由の固定語で切り分ける: `running`（まだ走っている）/ `failed`（赤）/

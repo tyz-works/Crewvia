@@ -261,9 +261,19 @@ QA が最後になる mission は多いので、**承認するつもりなら書
 approved_head: <40 桁の小文字 sha>
 ```
 
-- sha は**自分がテストした head**: `gh pr view <PR番号> --json headRefOid -q .headRefOid`。
-  Step 1 で取った `DIFF_REF` の対象と同じ head であることを確かめてから書く（別の head をテストして
-  承認すると、未検証の head に `merge-ready` が出る）
+- sha は**自分が実際にテストした commit**。`gh pr view` で「今の」head を取り直して書かないこと —
+  テスト中に push が入ると、**試していない head を承認する**ことになる（#383 codex-review P1-2 と同型）:
+
+```bash
+PR=<PR番号>
+HEAD_BEFORE="$(gh pr view "$PR" --json headRefOid -q .headRefOid)"   # Step 1 の時点で控える
+# ── ここでテストする（worktree で試したなら git rev-parse HEAD がその commit）──
+HEAD_AFTER="$(gh pr view "$PR" --json headRefOid -q .headRefOid)"    # 承認の直前
+[ "$HEAD_AFTER" = "$HEAD_BEFORE" ] || echo "テスト中に push された。承認しない"
+```
+
+  一致したときだけ `HEAD_BEFORE` を書く。食い違ったら承認せず、所見は残して done し、
+  再テストが要ることを Director に伝える
 - 問題あり・未実施のチェックポイントが残る・判断を Director に委ねるときは**書かない**。
   書かなければ Director には `ci-green` が届き、Director が所見を読んで判断する
 - 省略形・大文字は読まれない。本文の途中に書いた sha も読まれない（最終行の完全一致だけ）

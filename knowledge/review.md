@@ -6,16 +6,23 @@
 ## レビュープロトコル
 
 1. `gh pr view {PR_URL}` で概要確認
-2. `gh pr diff {PR_URL}` でコード変更を精査する
-3. 問題なければ `gh pr merge {PR番号} --squash --delete-branch` を試す（承認なしでそのまま
-   merge を試みる — 理由は下記「承認・merge の経路」）
-4. merge できたら Director に報告して完了
-5. merge が拒否されたら（Claude Code の classifier 等）、レビューの所見は Result に残した
-   上で `plan.sh needs-director` で Director に委ねる。**これは失敗ではなく正常系**。
-   review Worker の責務は「レビューを最後までやり切ること」であり、merge の成否そのもの
-   ではない
+2. `gh pr diff {PR_URL}` でコード変更を精査する（CI の完了は待たない。CI は dispatcher が見る）
+3. 所見を Result に残して `plan.sh done`。**merge しない**（merge は Director。2026-11-13 の
+   「Worker は CI を待たない・merge は Director」への変更。設計: `knowledge/ci-wait-operations.md` §2）
+4. **承認するときだけ** Result の**最後の行**に `approved_head: <40 桁の sha>`（レビューした head。
+   `gh pr view {PR番号} --json headRefOid -q .headRefOid`）を 1 行書く。要修正・条件付きのときは書かない。
+   dispatcher の `merge-ready` 通知と `plan.sh ci-gate` はこの head が PR の現 head と一致するときだけ承認とみなす
+5. **Result 本文では行頭 `## ` の見出しを使わない**（`###` 以下を使う）。`lib_history.result_section` は最初の
+   行頭 `## ` で Result 節を切るので、`approved_head:` 行が節の外に出て `no_approval` になる
+   （実例: mission 20261113-ci-wait-ops-3 t002 の再レビュー）
+
+> 旧手順（`gh pr merge --squash --delete-branch` を review Worker が試み、拒否されたら `needs-director`）は廃止。
+> 「CI が緑になるまで Worker が待つ」形をやめたので、merge できる瞬間に Worker がいない。
+> 稼働中の古いプロンプトの Worker は旧手順のまま完走する（拒否されたら `needs-director` に行くだけ）。
 
 ## 承認・merge の経路
+
+> **2026-11-13 以降は merge するのは Director**（下は経緯と、classifier が一貫しない事実の記録。review Worker は merge しない）。
 
 **この手順書はかつて `gh-app-review approve` による Bot 承認を前提としていたが、現状と
 合わない**（2026-11-02 に Director と QA Worker Finn が独立に確認。2026-11-09 時点も未解消）:

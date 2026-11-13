@@ -620,6 +620,15 @@ requires_approval に該当 → type: improvement でTaskvia /api/log に投稿�
 - **`review` / `research` / `verify` / `planning` skill は要注意**: `config/skill-permissions.yaml` でこれらの skill は `Edit` / `Write` / `MultiEdit` を deny されており、**ファイルを書く手段が Bash しかない**。だからといって heredoc で task ファイルに直接書き込もうとせず、`plan.sh done --result-file - --execution <ex-…>`（クォート付きヒアドキュメント）で結果を渡すこと。他のファイル（レポート・knowledge 追記等、書き込みが許可された対象）には通常通り Bash 経由での作成も選択肢になるが、task ファイルだけは例外なく `plan.sh` 経由にすること。
 - **1 行制約があるのは `plan.sh needs-director` の reason だけ**（frontmatter の `needs_director_reason` フィールドに直接書かれるため、改行を含めると task ファイルの frontmatter が壊れミッション全体が停止する）。`plan.sh done` の result にはこの制約は無い。長い説明・複数の見出し・箇条書きを含む Result 全文をそのまま `plan.sh done` に渡してよい。
 
+### 🚨 新しいファイル・大きな内容は Write ツールで書く（heredoc で書かない）
+
+**新しいファイルを作る・数十行以上の内容を書くときは、Bash の heredoc（`cat > file <<EOF` / `cat >> file <<'EOF'` / `tee file <<EOF`）を使わず、Write ツール（既存ファイルの一部変更は Edit）で書くこと。**
+
+- 理由: 大きな heredoc を含む Bash を打つと、claude が PreToolUse hooks 3/4 の段階のまま CPU 100% で固まり、応答しなくなる事故が 2 回起きている（2026-11-09 Haruto t013・2026-11-13 Ingrid t007）。固まった claude は `lib_mux kill` も SIGTERM も効かず、SIGKILL まで要る。task ファイルへの heredoc でハングした過去の事故（上の「Result の記録方法」）と同じ型
+- 目安: 数十行以上、または中に `$(...)`・バッククォート・長いコード / 文書を含む内容は Write。数行の `echo` やワンライナーはそのままでよい
+- Result の本文も同じ: Write ツールで scratchpad に書いて `plan done "$TASK_ID" --result-file <path> --mission "$TASK_MISSION" --execution ex-…` で渡す。**Write が deny されている skill（`review` / `research` / `verify` / `planning`）だけは例外**で、`--result-file -` のクォート付きヒアドキュメント（上の「Result の記録方法」）を使う。その場合も Result は必要な分だけに絞り、長大な本文にしない
+- 長い内容を Bash で書くしかない skill でも、1 回の Bash に詰め込まず、何回かに分けて追記する（それでも固まるなら `plan.sh needs-director` で Director に渡す）
+
 ### Pre-Done チェックリスト
 
 **この順序を守ること。done は Step 5 の最後。**
@@ -659,10 +668,27 @@ PR_URL=$(gh pr view --json url -q .url)
 echo "[worker] PR created: $PR_URL"
 ```
 
-- PR merge は `review` スキルの Worker (Seo) の責務。自分でマージしないこと
+- PR の merge は **Director** の責務（CI の結果と review の所見を見て `plan.sh ci-gate` → `gh pr merge --squash --match-head-commit` で行う）。自分でマージしないこと
 - PR URL は必ず完了報告フォーマットに含めること
 
 成果物がリポジトリ外（Obsidian 等）の場合でも、何を作成・変更したかを後で報告できるようメモしておくこと。
+
+#### Step 1b: ローカル確認（CI は待たない）
+
+**CI を待たない。** push した PR の CI は dispatcher が毎サイクル見ており、結果（`ci-failed` / `ci-green` / `merge-ready` / `ci-unknown`）は dispatcher が Director に通知する。Worker は **CI より速く確かめられるものだけ** 確かめて done する（設計: `knowledge/ci-wait-operations.md` §3）:
+
+1. 触ったファイルに対応する pytest（`tests/test_<module>*.py` と、触った module を import するテスト）を流す
+2. 構造ガードを流す: `python3 -m pytest -m structural`（全ファイルを走査するテスト群。単一定義ガード・import 追加の検査など。1 コマンドで足りる。一覧を覚えない）
+3. shell を触ったら `bash -n <file>`、yaml を触ったら構文確認（`python3 -c 'import yaml,sys; yaml.safe_load(open(sys.argv[1]))' <file>`）
+4. `git push` の後、PR の head がローカルの HEAD と一致することを確認する（push 漏れで古い head を見せない）:
+
+   ```bash
+   [ "$(gh pr view --json headRefOid -q .headRefOid)" = "$(git rev-parse HEAD)" ] || echo "head 不一致: push を確認"
+   ```
+
+5. **full pytest は流さない**（約 1 時間かかる。CI がやる）。`gh run watch` / `gh pr checks --watch` で CI の完了を待たない
+
+文書だけの変更でも 4 は確認する（2・3 は触ったものだけでよい）。
 
 #### Step 2: ナレッジの記録
 
@@ -700,6 +726,8 @@ plan done "$TASK_ID" --result-file "$RESULT_FILE" --mission "$TASK_MISSION" --ex
 ```bash
 plan done "$TASK_ID" --result-file "$RESULT_FILE" --mission "$TASK_MISSION" --pr 123 --execution ex-…   # Result の 1 行目: PR #123 ...
 ```
+
+**PR を作った task の Result には 1 行入れる: 「CI は未完了。結果は dispatcher が通知する」**（CI が緑になるまで待って done にしない）。
 
 `--pr` は、この task を `blocked_by` に持つ `codex-review` / `review` の task に `pr_number` を書き、
 `blocked` の codex-review を `pending` に戻す（Director が手で入れる必要は無い）。**明示フラグだけ**
@@ -772,7 +800,7 @@ Director への報告フォーマット:
 ```
 タスク {TASK_MISSION}/{TASK_ID}（{TASK_TITLE}）完了。
 ブランチ: task/{CREWVIA_MISSION_SLUG}/{CREWVIA_TASK_ID}-{CREWVIA_TASK_SLUG}
-PR: {PR URL}（review Worker (Seo) による merge 待ち）
+PR: {PR URL}（CI は未完了。結果は dispatcher が通知する。merge は Director）
 worktree: {WORKTREE_PATH}
 結果: [実行した内容と結果の要約]
 気づき: [あれば記載、なければ「なし」]
@@ -1006,7 +1034,15 @@ branch: $(git branch --show-current)" \
 gh pr view --json url -q .url
 ```
 
-PR merge は `review` スキルの Worker (Seo) が行う。**自分でマージしないこと。**
+PR の merge は Director が行う（CI の結果は dispatcher が通知する）。**自分でマージしないこと。** push 後に CI を待たず done する（Step 1b）。
+
+### review の手順（所見まで・merge しない）
+
+`review` / `codex-review` / `qa` の task は **diff を読んで所見を Result に残して done する**ところまで。**merge しない**（merge は Director。`plan.sh ci-gate` で CI の緑と承認 head を確かめてから行う）。CI の完了も待たない（CI と並行して読む。`timeout.max=7200` の根拠だった CI 待ちはここに含めない）。
+
+- **承認するときだけ**、Result の **最後の行** に `approved_head: <40 桁の sha>`（レビューした PR の head。`gh pr view <N> --json headRefOid -q .headRefOid`）を 1 行書く。要修正・条件付きのときは書かない。dispatcher の `merge-ready` 通知と `plan.sh ci-gate` は、この head が PR の現 head と一致するときだけ承認とみなす（一致しなければ `approved_head_mismatch`、行が無ければ `no_approval`）
+- **Result 本文では行頭 `## ` の見出しを使わない**（`###` 以下を使う）。`lib_history.result_section` は最初の行頭 `## ` で Result 節を切るため、`## ` が途中に入ると末尾の `approved_head:` 行が節の外に出て、`merge-ready` が出ず `ci-gate` も `no_approval` になる（実例: mission 20261113-ci-wait-ops-3 の t002 の再レビュー）。`approved_head:` 行は必ず Result の最後の行にする
+- review の後に修正が push されたら、その新しい head は未レビュー。承認は取り直す（古い `approved_head` は一致せず無効になる）
 
 ### ⚠️ Stacked PR (依存PR) の squash merge に関する注意
 
@@ -1055,7 +1091,7 @@ branch 名と PR URL を含めて報告すること:
 ```
 タスク {task_id} 完了。
 ブランチ: task/{mission_slug}/{task_id}-{task_slug}
-PR: {PR URL}（review Worker (Seo) による merge 待ち）
+PR: {PR URL}（CI は未完了。結果は dispatcher が通知する。merge は Director）
 結果: [実行した内容と結果の要約]
 気づき: [あれば記載、なければ「なし」]
 改善提案: [あれば記載、なければ「なし」]

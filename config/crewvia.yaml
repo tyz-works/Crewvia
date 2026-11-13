@@ -71,6 +71,9 @@ model_per_skill:
 # 短すぎて待機中の Worker が殺される事故が起きた (2026-09-13 / 2026-11-02 再発。
 # 20261102-review-ci-timeout)。7200s (実測への安全率 約1.8) を既定にする。
 # CI がさらに長くなったら再検討すること。
+# 【2026-11-13 注記】Worker / review は CI を待たない運用になった (CI は dispatcher が見て
+# 通知し、merge は Director。knowledge/ci-wait-operations.md)。7200 は稼働中の旧手順の
+# Worker のために残している。値の見直しは別 PR (PR-F)。
 #
 # 実装系 skill (bash / code / typescript / python / database / cloud / ops —
 # model_per_skill に列挙が無く worker_model にフォールバックする skill と同じ集合) も、
@@ -78,7 +81,10 @@ model_per_skill:
 # 同じ事故に遭いうる。2026-11-09、mission 20261109-codex-hc の t002 (Ingrid) が shim 実装後に
 # ローカル full pytest (9000件超・約1時間) の完走を待っていて、timeout.max=7200 を手で入れずに
 # いたら feature_impl 既定 (3600s) で完走前に terminate されていた (t013)。review と同じ安全率で
-# 既定を揃える。**既存 card には遡及しない** (plan.sh add 時点の 1 回だけ。下の「解決ロジック」参照)。
+# 既定を揃える。
+# 【2026-11-13 注記】新しい運用では Worker はローカル full pytest も CI も待たない (対応テスト +
+# `pytest -m structural` + bash -n / yaml 確認 + push 後の head 一致だけ。agents/worker.md Step 1b)。
+# よってここで想定した待ちは新規には発生しない。7200 は旧手順の Worker のために残す (PR-F で見直し)。**既存 card には遡及しない** (plan.sh add 時点の 1 回だけ。下の「解決ロジック」参照)。
 timeout_max_per_skill:
   review: 7200
   bash: 7200

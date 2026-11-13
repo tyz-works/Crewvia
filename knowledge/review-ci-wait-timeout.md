@@ -1,5 +1,7 @@
 # review skill の card が CI 完走待ちで watchdog の max に殺される事故 (t002 / 20261102-review-ci-timeout)
 
+> **後継の注記（2026-11-13, ci-wait-operations PR-D2）**: Worker・review は CI の完了を待たない運用に変わった（CI は dispatcher が見て通知し、merge は Director。`knowledge/ci-wait-operations.md` §2・§7、`agents/worker.md` Step 1b）。下の「選んだ対応」（`timeout.max=7200` を CI 完走待ちのために付ける）の**根拠は新しいプロンプトの Worker からは消えた**。ただし 7200 の値は稼働中の Worker（旧手順で CI を待つ）のためにしばらく残す。値の見直しは別 PR（PR-F）。案 D（CI 待ちを Worker の中でやめる）は、dispatcher の通知で別の形で実現した。
+
 ## 事故
 
 review Worker が PR の CI 完走を待っている最中に、watchdog の絶対上限 (`max_threshold`) で

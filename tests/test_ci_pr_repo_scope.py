@@ -83,7 +83,7 @@ def test_bad_pr_repo_is_never_fetched(tmp_path):
 def test_merged_pr_in_another_repo_does_not_silence_this_repos_pr(tmp_path):
     """#386 P3-1: 別 repo の同番号が MERGED でも、crewvia の open PR の通知は止まらない。"""
     _write(tmp_path, "t001", 5, GREEN)                               # crewvia #5 は open・緑
-    _write(tmp_path, "t002", 5, GREEN, pr_state="MERGED")            # irc-relay #5 は MERGED
+    _write(tmp_path, "t002", 5, GREEN, pr_state="MERGED", scope="repo:tyz-works/irc-relay")  # irc-relay #5 は MERGED
     evs, closed = events(tmp_path, [task(id_="t001", status="done", pr=5), t_repo(id_="t002", status="done")])
     assert [(e["kind"], e["pr"]) for e in evs] == [("ci-green", 5)]
     assert evs[0]["scope"] == "" and len(closed) == 1 and closed[0] == ci.pr_tag(5, "repo:tyz-works/irc-relay")
@@ -91,14 +91,14 @@ def test_merged_pr_in_another_repo_does_not_silence_this_repos_pr(tmp_path):
 
 def test_merged_crewvia_pr_does_not_silence_other_repos_same_number(tmp_path):
     _write(tmp_path, "t001", 5, GREEN, pr_state="MERGED")
-    _write(tmp_path, "t002", 5, GREEN)
+    _write(tmp_path, "t002", 5, GREEN, scope="repo:tyz-works/irc-relay")
     evs, closed = events(tmp_path, [task(id_="t001", status="done", pr=5), t_repo(id_="t002", status="done")])
-    assert [e["scope"] for e in evs] == ["repo:tyz-works/irc-relay"] and closed == [5]
+    assert [e["scope"] for e in evs] == ["repo:tyz-works/irc-relay"] and closed == [ci.pr_tag(5, "")]
 
 
 def test_events_of_two_repos_with_the_same_number_have_distinct_ledger_keys(tmp_path):
     _write(tmp_path, "t001", 5, GREEN)
-    _write(tmp_path, "t002", 5, GREEN)
+    _write(tmp_path, "t002", 5, GREEN, scope="repo:tyz-works/irc-relay")
     evs, _ = events(tmp_path, [task(id_="t001", status="done", pr=5), t_repo(id_="t002", status="done")])
     keys = {ci.event_key(e) for e in evs}
     assert len(evs) == 2 and len(keys) == 2
@@ -109,7 +109,20 @@ def test_closed_prefix_matches_event_keys():
     ev = {"kind": "ci-green", "pr": 5, "scope": "repo:a/b", "head": HEAD}
     tag = ci.pr_tag(5, "repo:a/b")
     assert ci.event_key(ev).startswith(ci.closed_prefix("ci-green", tag))
-    assert ci.event_key({"kind": "ci-green", "pr": 5, "head": HEAD}).startswith(ci.closed_prefix("ci-green", 5))
+    assert ci.event_key({"kind": "ci-green", "pr": 5, "head": HEAD}).startswith(
+        ci.closed_prefix("ci-green", ci.pr_tag(5, "")))
+
+
+def test_closed_identifiers_are_a_single_type_even_when_both_scopes_are_closed(tmp_path):
+    """t013 / PR #388 の P1: 既定 repo の closed (旧: int) と他 repo の closed (str) が同じサイクルに混ざると、
+    `sorted()` が `int < str` を比べて TypeError になっていた (レビューで再現済み)。鍵の型を 1 つ (pr_tag の文字列)
+    に揃えて落ちないようにする。"""
+    _write(tmp_path, "t001", 5, GREEN, pr_state="MERGED")                       # crewvia #5 (既定 scope)
+    _write(tmp_path, "t002", 5, GREEN, pr_state="CLOSED", scope="repo:tyz-works/irc-relay")  # irc-relay #5 (別 scope)
+    evs, closed = events(tmp_path, [task(id_="t001", status="done", pr=5), t_repo(id_="t002", status="done")])
+    assert evs == []
+    assert sorted(closed) == sorted([ci.pr_tag(5, ""), ci.pr_tag(5, "repo:tyz-works/irc-relay")])
+    assert all(isinstance(c, str) for c in closed)
 
 
 def test_reviews_are_bound_per_repo(tmp_path):
@@ -129,7 +142,7 @@ def test_bad_pr_repo_card_gives_no_event(tmp_path):
 
 def test_head_of_gets_the_scope_for_non_crewvia_repos(tmp_path):
     _write(tmp_path, "t001", 5, GREEN)
-    _write(tmp_path, "t002", 6, GREEN)
+    _write(tmp_path, "t002", 6, GREEN, scope="repo:tyz-works/irc-relay")
     seen = []
 
     def head_of(pr, scope=""):
@@ -155,3 +168,80 @@ def test_pr_repo_card_with_missing_target_dir_is_still_fetched(tmp_path):
     gh = FakeGh(view=view_state(GREEN, "OPEN"))
     poll(tmp_path, [t_repo(target_dir=str(tmp_path / "gone"))], gh)
     assert gh.calls and gh.calls[0][-2:] == ["--repo", "tyz-works/irc-relay"]
+
+
+# --- 記録は観測した scope を持ち、読むときに今の scope と照合する (t013 / PR #388 の P1) ---
+
+def test_record_carries_the_scope_it_was_observed_under(tmp_path):
+    poll(tmp_path, [t_repo(repo="a/one")], FakeGh(view=view_state(GREEN, "OPEN")))
+    assert rec(tmp_path)["scope"] == "repo:a/one"
+    poll(tmp_path, [task(id_="t002", pr=6)], FakeGh(view=view_state(GREEN, "OPEN")))
+    assert rec(tmp_path, "t002")["scope"] == ""
+
+
+def test_read_record_hides_a_record_observed_under_a_different_scope():
+    r = ci._view(5, lambda a: (view_state(GREEN, "OPEN"), None), NOW, scope="repo:a/b")
+    assert ci.record_matches_card(r, 5, scope="repo:a/b") is True
+    assert ci.record_matches_card(r, 5, scope="repo:a/c") is False
+    assert ci.record_matches_card(r, 5) is True                      # scope を渡さなければ検査しない (後方互換)
+
+
+def test_a_record_without_a_scope_field_is_rejected_when_scope_is_checked():
+    """欄が無い記録 (この検査より前に書かれた・観測していない) は、scope を検査されれば不一致として
+    弾かれる (PR #395 の codex-review P2: 「検査しない」に倒すと、導入直後は scope 付きの記録が 0 件
+    なので検証が実質 no-op になる — 欄が無いのは「観測し直しが必要」であって「合っている」ではない)。
+    scope を渡さなければ従来どおり検査しない (呼び出し元が明示的に検証を求めない経路)。"""
+    legacy = ci._unknown(5, "gh_timeout", NOW)                        # scope を渡さない = 欄を持たない
+    assert "scope" not in legacy
+    assert ci.record_matches_card(legacy, 5, scope="repo:a/c") is False
+    assert ci.record_matches_card(legacy, 5) is True
+
+
+def test_pr_repo_change_is_retaken_without_waiting_for_the_poll_interval(tmp_path):
+    """pr_number を変えずに pr_repo だけ変えた card は、間隔を待たずに取り直す (古い repo の CI をそのまま
+    この repo の状況として出さない)。"""
+    gh = FakeGh(view=view_state(GREEN, "OPEN"))
+    poll(tmp_path, [t_repo(repo="a/one")], gh, poll_seconds=60)
+    assert len(gh.calls) == 1
+    poll(tmp_path, [t_repo(repo="a/two")], gh, now=NOW + 1, poll_seconds=60)    # 間隔内 (1 秒後)
+    assert len(gh.calls) == 2 and gh.calls[-1][-2:] == ["--repo", "a/two"]
+    assert rec(tmp_path)["scope"] == "repo:a/two"
+
+
+def test_pr_repo_cleared_is_retaken_without_waiting_for_the_poll_interval(tmp_path):
+    gh = FakeGh(view=view_state(GREEN, "OPEN"))
+    poll(tmp_path, [t_repo(repo="a/one", pr=5)], gh, poll_seconds=60)
+    assert len(gh.calls) == 1
+    poll(tmp_path, [task(pr=5)], gh, now=NOW + 1, poll_seconds=60)             # pr_repo を消した
+    assert len(gh.calls) == 2 and rec(tmp_path)["scope"] == ""
+
+
+def test_a_terminal_record_in_the_old_repo_does_not_block_the_new_scope(tmp_path):
+    """NOT_FOUND / MERGED / CLOSED の記録があっても、card の pr_repo が変われば取り直す — `pr_closed` が
+    scope の食い違う終端記録を終端として扱わない。"""
+    _write(tmp_path, "t001", 5, GREEN, pr_state="MERGED", scope="repo:a/old")
+    gh = FakeGh(view=view_state(GREEN, "OPEN"))
+    poll(tmp_path, [t_repo(repo="a/new")], gh, poll_seconds=60)
+    assert len(gh.calls) == 1
+    r = rec(tmp_path)
+    assert r["scope"] == "repo:a/new" and r["pr_state"] == "OPEN"
+
+
+def test_bad_pr_repo_terminal_record_recovers_once_pr_repo_is_fixed(tmp_path):
+    """bad_pr_repo は NOT_FOUND (終端) として記録される。pr_repo を直せば、終端のまま固まらず取り直す。"""
+    poll(tmp_path, [t_repo(repo="nope")], FakeGh(view=view_state(GREEN, "OPEN")), poll_seconds=60)
+    r = rec(tmp_path)
+    assert r["reason"] == "bad_pr_repo" and r["pr_state"] == "NOT_FOUND" and r["scope"] is None
+    gh = FakeGh(view=view_state(GREEN, "OPEN"))
+    poll(tmp_path, [t_repo(repo="a/fixed")], gh, now=NOW + 1, poll_seconds=60)
+    assert len(gh.calls) == 1
+    r = rec(tmp_path)
+    assert r["scope"] == "repo:a/fixed" and r["state"] == "passed"
+
+
+def test_pr_closed_does_not_treat_a_different_scopes_terminal_record_as_closed():
+    terminal = {"pr": 5, "head": None, "state": "no_pr", "checks": [], "observed_at": NOW,
+                "summary": "no PR", "pr_state": "MERGED", "scope": "repo:a/old"}
+    assert ci.pr_closed(terminal, 5, scope="repo:a/old") is True
+    assert ci.pr_closed(terminal, 5, scope="repo:a/new") is False
+    assert ci.pr_closed(terminal, 5) is True                          # scope を渡さなければ従来どおり

@@ -1042,7 +1042,8 @@ PR の merge は Director が行う（CI の結果は dispatcher が通知する
 
 - **head は読む前に控える。** `gh pr diff` は常に「今の」head を見せるので、読み終えてから `headRefOid` を取ると **A を読んで B を承認する**ことが起こりうる（PR #383 codex-review P1）。読む前に `HEAD_BEFORE="$(gh pr view <N> --json headRefOid -q .headRefOid)"` で控え、**承認の直前にもう一度取って一致を確かめる**。食い違ったら承認しない（所見は残して done し、再レビューが要ると Director に伝える）
 - **承認するときだけ**、Result の **最後の行** に `approved_head: <40 桁の sha>`（上で控えた `HEAD_BEFORE`）を 1 行書く。要修正・条件付きのときは書かない。dispatcher の `merge-ready` 通知と `plan.sh ci-gate` は、この head が PR の現 head と一致するときだけ承認とみなす（一致しなければ `approved_head_mismatch`、行が無ければ `no_approval`）
-- **`approved_head:` 行は必ず Result の最後の非空行にする**（後ろに所見・ログ・チェックポイント行を足さない）。行頭 `## ` の見出しは `plan.sh done` が保存時に `### ` へ自動で下げる（#382 の `demote_section_headings`）ので、本文に見出しを書いても Result 節は途中で切れない。自動で下がる前は `lib_history.result_section` が最初の行頭 `## ` で Result 節を切っていて、`approved_head:` 行が節の外に出て `merge-ready` が出ず `ci-gate` も `no_approval` になっていた（実例: mission 20261113-ci-wait-ops-3 の t002 の再レビュー）
+- **`approved_head:` 行は必ず Result の最後の非空行にする**（後ろに所見・ログ・チェックポイント行を足さない）。行頭 `## ` の見出しは `plan.sh done` が保存時に `### ` へ自動で下げる（#382 の `demote_section_headings`）ので、本文に見出しを書いても Result 節は途中で切れない（ただし見出しは `### ` 以下を使うのが推奨。`## QA Gate` だけは検証が下げる前に行うので `## ` のまま）。自動で下がる前は `lib_history.result_section` が最初の行頭 `## ` で Result 節を切っていて、`approved_head:` 行が節の外に出て `merge-ready` が出ず `ci-gate` も `no_approval` になっていた（実例: mission 20261113-ci-wait-ops-3 の t002 の再レビュー）
+- **worktree の branch を切り替えない**（`git checkout` / `gh pr checkout` をしない）。PR は `gh pr diff` か `git fetch origin pull/N/head:refs/remotes/origin/prN` で読み、手元に branch を作らない。detach して試すなら一時 worktree を作り、終わったら消す。理由: 2026-11-13 に review が worktree を pr388 / pr387 に切り替えたまま終え、次の pull が W3（`path is a worktree of refs/heads/pr388`）で止まり needs_director になった
 - review の後に修正が push されたら、その新しい head は未レビュー。承認は取り直す（古い `approved_head` は一致せず無効になる）
 
 ### ⚠️ Stacked PR (依存PR) の squash merge に関する注意

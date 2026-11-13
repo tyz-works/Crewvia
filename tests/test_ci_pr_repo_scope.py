@@ -149,3 +149,9 @@ def test_fetch_pr_head_passes_repo_args():
         return subprocess.CompletedProcess(argv, 0, json.dumps({"headRefOid": HEAD}), "")
     assert ci.fetch_pr_head(5, cwd="/", runner=runner, repo_args=["--repo", "a/b"]) == (HEAD, None)
     assert calls[0][-2:] == ["--repo", "a/b"]
+
+
+def test_pr_repo_card_with_missing_target_dir_is_still_fetched(tmp_path):
+    gh = FakeGh(view=view_state(GREEN, "OPEN"))
+    poll(tmp_path, [t_repo(target_dir=str(tmp_path / "gone"))], gh)
+    assert gh.calls and gh.calls[0][-2:] == ["--repo", "tyz-works/irc-relay"]

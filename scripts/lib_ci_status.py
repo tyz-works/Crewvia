@@ -624,7 +624,10 @@ def observe_task(task, *, repo_root, branch_of, now, timeout, runner=subprocess.
                 'summary': 'no PR', 'reason': 'bad_pr_repo', 'pr_state': 'NOT_FOUND'}
     repo_args = scope_repo_args(task)
     cwd = task.get('target_dir') or repo_root
-    if task.get('target_dir') and not os.path.isdir(cwd):
+    if scope.startswith('repo:'):
+        # pr_repo があれば --repo で repo が決まる。cwd は gh を動かす場所でしかないので target_dir に依らない
+        cwd = repo_root
+    elif task.get('target_dir') and not os.path.isdir(cwd):
         # card の PR を入れる (#314 r3: None で書くと読み手の照合で隠れ、poll_cycle も毎サイクル取り直す)
         return _unknown(card_pr(task.get('pr_number')), 'target_dir_missing', now)
     pr = card_pr(task.get('pr_number'))

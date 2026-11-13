@@ -5151,7 +5151,24 @@ def propagate_pr_number(slug, task_id, pr_number):
                   f" — {', '.join(sorted(ancestors))} — どの PR か一意でないため)",
                   file=sys.stderr)
             continue
+        # 上流が pr_repo (別 repo の PR) を持つなら、下流にも同じ pr_repo を伝える。
+        # 伝えないと review / codex-review が crewvia の同じ番号の PR を見る (t001 / PR #388 の P2)。
+        try:
+            up_repo = _CI_STATUS.pr_repo_of(tasks_by_id.get(task_id) or {})
+            down_repo = _CI_STATUS.pr_repo_of(meta)
+        except ValueError:
+            print(f"[plan.sh] PR #{pr_number} を {slug}/{tid} には書きませんでした"
+                  f" (pr_repo の形が正しくない card があり repo を決められない)", file=sys.stderr)
+            continue
+        if up_repo and down_repo and down_repo != up_repo:
+            print(f"[plan.sh] PR #{pr_number} を {slug}/{tid} には書きませんでした"
+                  f" (pr_repo が食い違う: 上流 {up_repo} / この task {down_repo}"
+                  f" — どちらが正しいか決められないため。直してから update --pr-number で)",
+                  file=sys.stderr)
+            continue
         meta['pr_number'] = pr_number
+        if up_repo:
+            meta['pr_repo'] = up_repo
         how = 'pr_number'
         if 'codex-review' in skills and meta.get('status') == 'blocked':
             meta['status'] = 'pending'

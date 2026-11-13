@@ -84,3 +84,9 @@ PR revert → `scripts/sync-main-checkout.sh`。`registry/ci/` は残ってよ�
 - `lib_ci_status.gate_verdict(record, *, pr_head, now)` は「通す / 通さない + 固定語の理由」を返す**門用の読み口**（表示用の `read_record` / `format_line` とは別）。通すのは記録の head == PR の現 head ∧ 全体 passed ∧ 必須 check `ci-ok` が passed ∧ `observed_at` が 10 分以内のときだけ。それ以外・読めない・取り直せないは全部通さない。設計: `knowledge/ci-wait-operations.md` §2.2。
 - `plan.sh ci-gate <PR> [--target-dir]`: 通せば exit 0 + `ci-gate: PASS PR #N head=<sha>`、通さなければ exit 1 + `ci-gate: DENY PR #N <理由>`。PASS のときは 2 行目に `ci-gate: approved_head ok|no_approval|approved_head_mismatch`（review の承認 head と現 head の比較。PR-D1）が出る。読み取り専用。呼び出し元は dispatcher の `pr_events`（`ci-green` / `merge-ready` を出す条件）と人の手だけ（`tests/test_ci_gate.py::test_nobody_calls_the_gate_yet`）。
 - 「判定に使わない」の文言の改訂（表示用 / 門用の 2 つに割る）は PR-D2 で済み（冒頭）。門は待ちを解く・done にする・Rule 5 / watchdog を黙らせることには使わない。
+
+## PR の持ち主の repo（`pr_repo`。t001）
+
+- 範囲は `lib_ci_status.pr_scope(task)` の 1 か所（`pr_repo` → `target_dir` → crewvia の repo）。`plan.sh done --pr` は pr_number と一緒に、上流の `pr_repo` も下流の review / codex-review に伝える（下流に別の `pr_repo` があれば pr_number も書かず stderr に出す）。
+- `pr_repo` のある card は `--repo` で repo が決まるので、`target_dir` が実在しなくても cwd は repo_root で取得する（`target_dir_missing` にしない）。
+- **台帳キーの形式が変わった**: `target_dir` の card は `pr<N>` から `pr<N>x<6 桁>` へ。デプロイ直後に、伝え済みの通知が 1 回ずつ再送される。旧形式のキーは畳まれずに残る（台帳は消してよい）。

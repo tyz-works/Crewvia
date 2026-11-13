@@ -180,11 +180,11 @@ def run_cycle(registry_dir, all_tasks, done_ids_by_mission, statuses_by_mission,
     if not is_finite_number(threshold) or threshold <= 0:
         return []
     ledger = read_ledger(registry_dir)
-    if is_unreadable(ledger):
+    if is_missing(ledger):
+        ledger = {}         # 本当に無い (ENOENT) = まだ書かれていない。これが通常運用 — 警告しない
+    elif is_unreadable(ledger):
         log(f'WARNING: stall-state: 台帳が壊れている ({ledger.reason}) — 作り直します '
             f'(停滞の時計が最初からになる = 通知が遅れる側。registry/daemons/{LEDGER_NAME})')
-        ledger = {}
-    elif is_missing(ledger):
         ledger = {}
     by_mission = {}
     for slug, meta in all_tasks:

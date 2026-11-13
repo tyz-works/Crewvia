@@ -19,6 +19,9 @@ LIB = REPO / "scripts" / "lib_ci_status.py"
 PLAN = REPO / "scripts" / "plan.sh"
 T1 = REPO / "tests" / "test_ci_pr_repo_scope.py"
 T2 = REPO / "tests" / "test_ci_gate.py::test_cli_gate_binds_records_by_pr_repo"
+# t013 / PR #395 P2 以降、記録自身の scope 照合 (lib 側) も強くなったので、plan.sh の pre-filter だけを
+# 狙って落とすには「card の今の scope が決められない」場面の専用テストが要る (T2 だけでは discriminate しない)。
+T3 = REPO / "tests" / "test_ci_gate.py::test_cli_gate_excludes_a_card_whose_current_scope_no_longer_resolves"
 
 DEFECTS = [
     ("scope が pr_repo を見ない", LIB, "    if repo:\n        return f'repo:{repo}'\n    td =", "    if False:\n        return f'repo:{repo}'\n    td =", T1),
@@ -31,7 +34,7 @@ DEFECTS = [
     ("bad pr_repo の card も取得する", LIB, "    if scope is None:\n        # repo が決められない", "    if False:\n        # repo が決められない", T1),
     ("bad pr_repo の card も通知する", LIB, "        if scope is None:\n            continue        # repo が決められない card は何も通知しない", "        if False:\n            continue", T1),
     ("head_of に scope を渡さない", LIB, "    return head_of(pr) if not scope else head_of(pr, scope)", "    return head_of(pr)", T1),
-    ("ci-gate が repo で絞らない", PLAN, "or _CI_STATUS.pr_scope(meta) != gate_scope:", "or False:", T2),
+    ("ci-gate が repo で絞らない", PLAN, "or _CI_STATUS.pr_scope(meta) != gate_scope:", "or False:", T3),
 ]
 
 

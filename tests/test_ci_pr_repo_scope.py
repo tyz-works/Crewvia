@@ -83,7 +83,7 @@ def test_bad_pr_repo_is_never_fetched(tmp_path):
 def test_merged_pr_in_another_repo_does_not_silence_this_repos_pr(tmp_path):
     """#386 P3-1: 別 repo の同番号が MERGED でも、crewvia の open PR の通知は止まらない。"""
     _write(tmp_path, "t001", 5, GREEN)                               # crewvia #5 は open・緑
-    _write(tmp_path, "t002", 5, GREEN, pr_state="MERGED")            # irc-relay #5 は MERGED
+    _write(tmp_path, "t002", 5, GREEN, pr_state="MERGED", scope="repo:tyz-works/irc-relay")  # irc-relay #5 は MERGED
     evs, closed = events(tmp_path, [task(id_="t001", status="done", pr=5), t_repo(id_="t002", status="done")])
     assert [(e["kind"], e["pr"]) for e in evs] == [("ci-green", 5)]
     assert evs[0]["scope"] == "" and len(closed) == 1 and closed[0] == ci.pr_tag(5, "repo:tyz-works/irc-relay")
@@ -91,14 +91,14 @@ def test_merged_pr_in_another_repo_does_not_silence_this_repos_pr(tmp_path):
 
 def test_merged_crewvia_pr_does_not_silence_other_repos_same_number(tmp_path):
     _write(tmp_path, "t001", 5, GREEN, pr_state="MERGED")
-    _write(tmp_path, "t002", 5, GREEN)
+    _write(tmp_path, "t002", 5, GREEN, scope="repo:tyz-works/irc-relay")
     evs, closed = events(tmp_path, [task(id_="t001", status="done", pr=5), t_repo(id_="t002", status="done")])
     assert [e["scope"] for e in evs] == ["repo:tyz-works/irc-relay"] and closed == [ci.pr_tag(5, "")]
 
 
 def test_events_of_two_repos_with_the_same_number_have_distinct_ledger_keys(tmp_path):
     _write(tmp_path, "t001", 5, GREEN)
-    _write(tmp_path, "t002", 5, GREEN)
+    _write(tmp_path, "t002", 5, GREEN, scope="repo:tyz-works/irc-relay")
     evs, _ = events(tmp_path, [task(id_="t001", status="done", pr=5), t_repo(id_="t002", status="done")])
     keys = {ci.event_key(e) for e in evs}
     assert len(evs) == 2 and len(keys) == 2
@@ -118,7 +118,7 @@ def test_closed_identifiers_are_a_single_type_even_when_both_scopes_are_closed(t
     `sorted()` が `int < str` を比べて TypeError になっていた (レビューで再現済み)。鍵の型を 1 つ (pr_tag の文字列)
     に揃えて落ちないようにする。"""
     _write(tmp_path, "t001", 5, GREEN, pr_state="MERGED")                       # crewvia #5 (既定 scope)
-    _write(tmp_path, "t002", 5, GREEN, pr_state="CLOSED")                       # irc-relay #5 (別 scope)
+    _write(tmp_path, "t002", 5, GREEN, pr_state="CLOSED", scope="repo:tyz-works/irc-relay")  # irc-relay #5 (別 scope)
     evs, closed = events(tmp_path, [task(id_="t001", status="done", pr=5), t_repo(id_="t002", status="done")])
     assert evs == []
     assert sorted(closed) == sorted([ci.pr_tag(5, ""), ci.pr_tag(5, "repo:tyz-works/irc-relay")])
@@ -142,7 +142,7 @@ def test_bad_pr_repo_card_gives_no_event(tmp_path):
 
 def test_head_of_gets_the_scope_for_non_crewvia_repos(tmp_path):
     _write(tmp_path, "t001", 5, GREEN)
-    _write(tmp_path, "t002", 6, GREEN)
+    _write(tmp_path, "t002", 6, GREEN, scope="repo:tyz-works/irc-relay")
     seen = []
 
     def head_of(pr, scope=""):
@@ -186,11 +186,15 @@ def test_read_record_hides_a_record_observed_under_a_different_scope():
     assert ci.record_matches_card(r, 5) is True                      # scope を渡さなければ検査しない (後方互換)
 
 
-def test_a_record_without_a_scope_field_is_not_rejected_by_scope():
-    """欄が無い記録 (この検査より前に書かれたもの) は scope で弾かない — 一律取り直しにしない。"""
+def test_a_record_without_a_scope_field_is_rejected_when_scope_is_checked():
+    """欄が無い記録 (この検査より前に書かれた・観測していない) は、scope を検査されれば不一致として
+    弾かれる (PR #395 の codex-review P2: 「検査しない」に倒すと、導入直後は scope 付きの記録が 0 件
+    なので検証が実質 no-op になる — 欄が無いのは「観測し直しが必要」であって「合っている」ではない)。
+    scope を渡さなければ従来どおり検査しない (呼び出し元が明示的に検証を求めない経路)。"""
     legacy = ci._unknown(5, "gh_timeout", NOW)                        # scope を渡さない = 欄を持たない
     assert "scope" not in legacy
-    assert ci.record_matches_card(legacy, 5, scope="repo:a/c") is True
+    assert ci.record_matches_card(legacy, 5, scope="repo:a/c") is False
+    assert ci.record_matches_card(legacy, 5) is True
 
 
 def test_pr_repo_change_is_retaken_without_waiting_for_the_poll_interval(tmp_path):

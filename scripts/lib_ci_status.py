@@ -506,14 +506,16 @@ def record_matches_card(record, pr_number, scope=SCOPE_UNCHECKED):
     """card が PR を名指ししていて、記録がそれと違う PR (PR 無し・不明を含む) を指していれば False。
     #314 r2: 別の PR の CI を、今の PR の状況として出さない (PR を作り直した・card の pr_number が後から付いた)。
 
-    `scope` (`pr_scope(task)` の値) を渡すと、記録の `scope` 欄と食い違う記録も False にする (t013 / PR #388 P1:
+    `scope` (`pr_scope(task)` の値) を渡すと、記録の `scope` 欄と食い違う記録も False にする (t013 / PR #395 P1:
     pr_number を変えずに `pr_repo` を変えた・消した card が、別 repo の古い記録をそのまま再利用しない)。
-    記録に `scope` 欄が無い (この検査より前に書かれた記録) ときは検査しない (無い欄を不一致にすると、既存の
-    記録が一律取り直しになる)。"""
+    `scope` 欄が無い記録 (この検査より前に書かれた・観測していない) も False にする — 欄が無いことを
+    「検査しない」に倒すと、導入直後の既存の記録が全部無条件に一致し続け、検証そのものが実質 no-op になる
+    (PR #395 の codex-review P2: 現時点で scope 付きの記録は 0 件なので、無い欄は「観測し直しが必要」であって
+    「合っている」ではない)。"""
     want = card_pr(pr_number)
     if want is not None and record.get('pr') != want:
         return False
-    if scope is not SCOPE_UNCHECKED and 'scope' in record and record.get('scope') != scope:
+    if scope is not SCOPE_UNCHECKED and record.get('scope', SCOPE_UNCHECKED) != scope:
         return False
     return True
 
@@ -610,8 +612,9 @@ def fetch_pr_head(pr, *, cwd, timeout=GH_TIMEOUT_SECONDS, runner=subprocess.run,
 
 
 def _unknown(pr, reason, now, scope=SCOPE_UNCHECKED):
-    """`scope` を省略した記録には `scope` 欄を持たせない (`record_matches_card` が「旧版が書いた」として検査を
-    スキップする側。`observe_task` は必ず実際に決めた scope を渡す — 省略は直接呼ぶテストだけの経路)。"""
+    """`scope` を省略した記録には `scope` 欄を持たせない (`record_matches_card` が scope 検査つきで読めば
+    欄が無いことを不一致として扱う側。`observe_task` は必ず実際に決めた scope を渡す — 省略は直接呼ぶ
+    テストだけの経路)。"""
     rec = {'pr': pr, 'head': None, 'state': 'unknown', 'checks': [], 'observed_at': now,
            'summary': f"CI {('PR #%d ' % pr) if pr else ''}unknown", 'reason': reason}
     if scope is not SCOPE_UNCHECKED:

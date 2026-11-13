@@ -155,10 +155,13 @@ def test_unknown_streak_counts_consecutive_unknowns_and_resets(tmp_path):
 # 通知の元 (pr_events)
 # ---------------------------------------------------------------------------
 
-def _write(tmp_path, id_, pr, checks, *, state=None, head=HEAD, observed=NOW, pr_state="OPEN", **extra):
+def _write(tmp_path, id_, pr, checks, *, state=None, head=HEAD, observed=NOW, pr_state="OPEN", scope="", **extra):
+    """既定の `scope=""` は card に pr_repo の無い (crewvia 本体の) scope。別 repo の PR を書くときは
+    呼び出し元が `scope="repo:..."` を渡す (`record_matches_card` が scope 欄の無さを不一致にする側に
+    なった後も、通常の fixture は「観測済み」の記録として扱われること)。"""
     state = state or ci.overall_state([ci.classify_check(c) for c in checks])
     r = {"pr": pr, "head": head, "state": state, "checks": [ci.classify_check(c) for c in checks],
-         "observed_at": observed, "summary": "s", "pr_state": pr_state, **extra}
+         "observed_at": observed, "summary": "s", "pr_state": pr_state, "scope": scope, **extra}
     assert ci.write_record(tmp_path, "m", id_, r)
 
 

@@ -34,11 +34,14 @@ def chk(name, state="passed"):
     return {"name": name, "state": state, "conclusion": None, "started_at": None, "completed_at": None}
 
 
-def rec(checks=None, *, state=None, head=HEAD, observed=NOW - 30, **extra):
+def rec(checks=None, *, state=None, head=HEAD, observed=NOW - 30, scope="", **extra):
+    """既定の `scope=""` は card に pr_repo の無い (crewvia 本体の) scope。別 repo の PR を模すときは
+    呼び出し元が `scope="repo:..."` を渡す (`record_matches_card` が scope 欄の無さを不一致にする側に
+    なった後も、通常の fixture は「観測済み」の記録として扱われること)。"""
     checks = [chk("pytest"), chk("ci-ok")] if checks is None else checks
     state = ci.overall_state(checks) if state is None else state
     return {"pr": 313, "head": head, "state": state, "checks": checks, "observed_at": observed,
-            "summary": "s", **extra}
+            "summary": "s", "scope": scope, **extra}
 
 
 def verdict(record, pr_head=HEAD, now=NOW, **kw):
@@ -250,12 +253,30 @@ def test_cli_gate_binds_records_by_pr_repo(repo):
     u = repo.plan("update", "t001", "--pr-repo", "Tyz-Works/Irc-Relay", "--mission", MISSION)
     assert u.returncode == 0, u.stderr
     put_gh(repo)
-    write_rec(repo, rec(observed=time.time() - 5))
+    write_rec(repo, rec(observed=time.time() - 5, scope="repo:tyz-works/irc-relay"))
     # crewvia の repo の #313 としては記録が無い (別 repo の PR の記録を使わない)
     assert gate(repo, "313").stdout == "ci-gate: DENY PR #313 unknown:no_record\n"
     assert gate(repo, "313", "--repo", "other/repo").stdout == "ci-gate: DENY PR #313 unknown:no_record\n"
     p = gate(repo, "313", "--repo", "tyz-works/irc-relay")
     assert p.returncode == 0 and f"PASS PR #313 head={HEAD}" in p.stdout, p.stderr
+
+
+def test_cli_gate_excludes_a_card_whose_current_scope_no_longer_resolves(repo):
+    """card の **今の** pr_repo が決められない (手編集などで不正な形になった) ときは、記録の `scope` 欄が
+    たまたま要求 scope と同じ値でも、その card の候補ごと外す (`_CI_STATUS.pr_scope(meta) != gate_scope`)。
+    lib 側の記録単体の scope 照合だけに頼ると、「card は今 scope を決められない」という事実そのものは
+    記録に現れないので穴になる (plan.sh の cmd_ci_gate の pre-filter の役目。read_record の scope 照合とは
+    独立の不変条件 — どちらか片方を抜いても他方が discriminate できるよう、この 1 本で両方を固定する)。"""
+    import time
+    done_with_pr(repo)
+    put_gh(repo)
+    write_rec(repo, rec(observed=time.time() - 5, scope=""))      # pr_repo が無かった頃の正しい観測
+    card = repo.card_path()
+    text = card.read_text()
+    assert "pr_repo" not in text
+    card.write_text(text.replace("pr_number: 313\n", "pr_number: 313\npr_repo: nope\n"))   # 手編集: 形が不正
+    p = gate(repo, "313")
+    assert p.returncode == 1 and p.stdout == "ci-gate: DENY PR #313 unknown:no_record\n", p.stdout
 
 
 @pytest.mark.parametrize("bad", ["nope", "a/b/c", ""])

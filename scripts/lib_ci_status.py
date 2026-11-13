@@ -759,6 +759,10 @@ def pr_events(tasks, *, registry_dir, now, warn=None, head_of=None, is_sent=None
         if cur is None or rec['observed_at'] > cur['observed_at']:
             newest[pr_number] = rec
             rec_td[pr_number] = t.get('target_dir') or None
+    # 終端 (MERGED / CLOSED / NOT_FOUND) は PR 単位 (t011)。同じ PR を指す別 task の記録が OPEN・passed のまま古く残っていても、
+    # どれか 1 つが終端を言ったら通知しない。畳んだ台帳のキーを古い記録で復活させない (merge 直後の ci-green / merge-ready の再送)。
+    for pr_number in closed:
+        newest.pop(pr_number, None)
     events = []
     keys = sorted(newest)
     if keys and rotate:

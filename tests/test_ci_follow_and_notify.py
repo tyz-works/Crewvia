@@ -386,3 +386,24 @@ def test_the_dispatcher_cycle_runs_the_notifier_after_the_poll():
     text = (REPO / "scripts" / "dispatcher.sh").read_text()
     entry = text[text.index("# --- CYCLE ENTRY POINT ---"):]
     assert entry.index("run_ci_poll()") < entry.index("run_ci_notify()") < entry.index("sweep_spawn_grace_markers()")
+
+
+# ---------------------------------------------------------------------------
+# t011: 終端 (MERGED / CLOSED / NOT_FOUND) は PR 単位。同じ PR を指す別 task の古い OPEN の記録から通知を出さない
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("pr_state", ["MERGED", "CLOSED", "NOT_FOUND"])
+@pytest.mark.parametrize("terminal_is_newer", [True, False])
+def test_a_terminal_record_on_one_task_silences_the_other_tasks_of_the_same_pr(tmp_path, pr_state, terminal_is_newer):
+    _write(tmp_path, "t005", 382, GREEN, observed=NOW + (3 if not terminal_is_newer else 0))     # 古い OPEN・passed
+    _write(tmp_path, "t006", 382, GREEN, observed=NOW + (3 if terminal_is_newer else 0), pr_state=pr_state)
+    tasks = [task(id_="t005", status="done", pr=382), task(id_="t006", status="done", pr=382)]
+    evs, closed = events(tmp_path, tasks)
+    assert evs == [] and closed == [382]
+
+
+def test_a_terminal_pr_does_not_silence_another_pr(tmp_path):
+    _write(tmp_path, "t005", 382, GREEN, pr_state="MERGED")
+    _write(tmp_path, "t006", 383, GREEN)
+    evs, closed = events(tmp_path, [task(id_="t005", status="done", pr=382), task(id_="t006", status="done", pr=383)])
+    assert [e["pr"] for e in evs] == [383] and closed == [382]

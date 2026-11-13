@@ -3663,6 +3663,7 @@ def run_telegram_cycle():
 # 取得はここ 1 か所。結果は registry/ci/<mission>__<task>.json。plan.sh status・tasks.json・通知は記録を読むだけ。
 # **判定には使わない**。gh の失敗・timeout は unknown にして先へ進む (1 サイクルの上限は lib_ci_status の定数)。
 import lib_ci_status  # noqa: E402
+import lib_history  # noqa: E402
 
 
 def _ci_branch_of(task):
@@ -3694,7 +3695,11 @@ def ci_line_for(slug, task_id):
         return ''
 
 
+_CI_DEADLINE = [None]    # この dispatcher サイクルの CI 全体の締め切り (monotonic)。poll と head の取り直しで共有
+
+
 def run_ci_poll():
+    _CI_DEADLINE[0] = time.monotonic() + 2 * lib_ci_status.CYCLE_BUDGET_SECONDS
     try:
         import lib_daemon_watch
         state = load_state()
@@ -3735,7 +3740,7 @@ def run_ci_poll():
 
 
 def _ci_notify_one(key, fp, slug, task_id, message):
-    """ci-failed / ci-green / ci-unknown を 1 通。台帳のキーは (pr, head, 種類)。送れなければ次のサイクルで再送。"""
+    """ci-failed / ci-green / merge-ready / ci-unknown を 1 通。台帳のキーは (pr, head, 種類)。送れなければ次のサイクルで再送。"""
     return notify_state_once(key, fp, 'ci-notice', slug, task_id, lambda: message,
                              director_live=director_live_for_state_notices)
 
@@ -3754,13 +3759,37 @@ def run_ci_notify():
             return
         tasks = []
         for slug in (state.get('active_missions') or []):
-            for meta, _ in list_tasks_for_mission(slug):
+            for meta, body in list_tasks_for_mission(slug):
                 if lib_ci_status.card_is_watched(meta):
-                    tasks.append({'mission': slug, 'id': meta['id'], 'status': meta.get('status'),
-                                  'pr_number': meta.get('pr_number')})
+                    item = {'mission': slug, 'id': meta['id'], 'status': meta.get('status'),
+                            'pr_number': meta.get('pr_number'), 'target_dir': meta.get('target_dir') or None}
+                    skills = set(meta.get('skills') or ()) & set(lib_ci_status.APPROVAL_SKILLS)
+                    if skills:      # 承認 head の元 (review 系の task だけ。Result を読む)
+                        item.update(skills=sorted(skills), completed_at=meta.get('completed_at'),
+                                    result=lib_history.result_section(body))
+                    tasks.append(item)
         now = time.time()
+        # 緑を知らせる直前に PR の現 head を取り直す (#377 レビュー P3-1)。取り直しは台帳に無い候補だけ (pr_events の is_sent)・
+        # 同じ PR は 1 回 (キャッシュ)・件数は MAX_TASKS_PER_CYCLE・時間は poll と共通の deadline (run_ci_poll が置く) の残りで
+        # timeout を切る。予算切れ・失敗は理由つきのエラー = その PR は今回は出さず次のサイクルで再試行 (候補の順は毎サイクル回す)。
+        head_cache = {}
+        told_now = load_told()
+        sent = set() if is_unreadable(told_now) else set(told_now)
+
+        def head_of(pr):
+            if pr not in head_cache:
+                if len(head_cache) >= lib_ci_status.MAX_TASKS_PER_CYCLE:
+                    return None, 'gh_budget'
+                left = (_CI_DEADLINE[0] or (time.monotonic() + lib_ci_status.CYCLE_BUDGET_SECONDS)) - time.monotonic()
+                if left < 1:
+                    return None, 'gh_budget'
+                head_cache[pr] = lib_ci_status.fetch_pr_head(
+                    pr, cwd=str(REPO_ROOT), timeout=min(lib_ci_status.GH_TIMEOUT_SECONDS, left))
+            return head_cache[pr]
+
         events, closed = lib_ci_status.pr_events(tasks, registry_dir=REGISTRY_DIR, now=now,
-                                                 warn=lambda msg: log(f"WARNING: {msg}"))
+                                                 warn=lambda msg: log(f"WARNING: {msg}"), head_of=head_of,
+                                                 is_sent=sent.__contains__, rotate=int(now // 5))
         live_unknown = {e['pr'] for e in events if e['kind'] == 'ci-unknown'}
         for ev in events:
             key = lib_ci_status.event_key(ev)
@@ -3780,7 +3809,7 @@ def run_ci_notify():
             for k in stale:
                 clear_told_key(k)
         # main の最新 run (Q8): 落ちていれば ci-failed と同じ経路で。完了済みの最新が緑なら古い失敗の台帳を畳む
-        if lib_ci_status.main_poll_due(REGISTRY_DIR, now):
+        if (_CI_DEADLINE[0] is None or _CI_DEADLINE[0] - time.monotonic() >= 1) and lib_ci_status.main_poll_due(REGISTRY_DIR, now):
             lib_ci_status.mark_main_polled(REGISTRY_DIR, now)
             runs, err = lib_ci_status.fetch_main_runs(cwd=str(REPO_ROOT))
             if err:

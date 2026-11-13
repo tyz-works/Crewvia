@@ -266,6 +266,8 @@ DAEMON_RESTART_FILES = {
         "scripts/lib_checkpoint.py",
         # 2026-10-27: 見送り通知に PR の CI の 1 行を添える (呼ぶ時に import するが、起動後の変更は拾わない)
         "scripts/lib_ci_status.py",
+        # PR-D1: dispatcher が review の Result 節を読んで承認 head を取り出す (run_ci_notify。起動時に import する)
+        "scripts/lib_history.py",
         # #314 r1: lib_ci_status が記録の名前の検査 (check_mission_slug / check_task_id) に import する
         "scripts/lib_git_policy.py",
         # machine-local-config PR-2: lib_mux / lib_daemon_watch が config の読み口として import する

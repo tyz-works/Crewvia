@@ -1003,7 +1003,44 @@ AGENT_NAME=$REVIEWER bash scripts/start.sh worker review
 # Worker起動後、PR URL（Worker の完了報告に含まれる）と確認観点を plan.sh 経由で渡す
 ```
 
-**merge 順序の管理**: 複数 PR がある場合、Director は依存関係を考慮して Seo (review) に merge 順序を指示すること。PR merge は必ず Seo に委任し、Director 自身はマージしない（§13 参照）。
+review Worker の責務は**所見を出すところまで**で、merge はしない。承認するときだけ Result の最後の非空行に
+`approved_head: <40 桁の sha>` を残す（`agents/worker.md`・設計 §2.5）。**merge を実行するのは Director**（下記）。
+
+**merge 順序の管理**: 複数 PR がある場合、Director は依存関係を考慮して merge の順序を決める。
+stacked PR は親を merge する前に子の base を付け替える（上の「⚠️ Stacked PR」）。
+
+---
+
+### merge の手順（CI の門 → `--match-head-commit`）
+
+**Worker は CI を待たない。CI を見るのは dispatcher で、結果は §16 の通知で届く。**
+merge するのは Director だけで、**必ず次の 2 段を踏む**（設計 `knowledge/ci-wait-operations.md` §2.1・§2.2）:
+
+```bash
+# 1. 門を引き直す。exit 0 = 通す / exit 1 = 通さない（理由の固定語が 1 行出る）
+#    PASS のときだけ 2 行目に承認 head の判定が出る: approved_head ok|no_approval|approved_head_mismatch
+./scripts/plan.sh ci-gate {PR番号}
+
+# 2. 門が見た head を指して merge する（引いた後に push が入ったら GitHub 側で弾かれる）
+HEAD_SHA="$(gh pr view {PR番号} --json headRefOid -q .headRefOid)"
+gh pr merge {PR番号} --squash --delete-branch --match-head-commit "$HEAD_SHA"
+```
+
+- **通知を根拠に merge しない。** `[merge-ready]` は「そのとき緑で承認が揃っていた」という知らせで、
+  merge の瞬間の保証ではない。`ci-gate` を引き直すのは、その間に入った push を捕まえるため
+- `ci-gate` が DENY なら理由の固定語で切り分ける: `running`（まだ走っている）/ `failed`（赤）/
+  `head_mismatch`（記録と現 head がずれた = 直後に push があった）/ `stale`（記録が 10 分より古い =
+  dispatcher が取れていない）/ `no_required_check`（`ci-ok` が無い）/ `none`（CI 未登録）/
+  `unknown:<理由>`（gh が答えない）。**どれも「通さない」側**で、迷ったら待つか原因を直す
+- 2 行目が `no_approval` / `approved_head_mismatch` のときは、**機械的な承認は無い**。merge してよいかは
+  Director が review の所見を読んで判断する（判断して merge するのは禁じていない。黙って通さないだけ）
+- `--delete-branch` は local branch が他の worktree で checkout 中だと失敗し、remote branch が残る。
+  merge 自体は成功しているので、remote だけ `gh api -X DELETE repos/{owner}/{repo}/git/refs/heads/{branch}`
+  で後片付けする（local branch と他 task の worktree には触れない）
+- merge したら `scripts/sync-main-checkout.sh`（下記 B2）
+
+**Director 自身が書いた変更は、自分で merge しない。** review の task を切って所見と `approved_head` を
+得てから merge する（著者と merge する者を分ける意味は残っている。§13）。
 
 ---
 
@@ -1145,7 +1182,14 @@ herdr server を再起動すると、タブレイアウトだけが復元され�
 - **改善提案の判断はあなたの責務** — Workerが自分でBacklogにタスクを追加することを許可しない
 - **Taskvia非依存で動作可能** — 接続失敗時もミッションを止めない
 - **完了の定義を守る** — result が具体的でない完了報告を受け付けない
-- **PRは自分でマージしない** — PR作成後は必ず別の `review` スキルWorkerに委任する。この分離はセキュリティと品質保証のための必須ルールであり、例外はない
+- **著者と merge する者を分ける** — PR を作った Worker も、レビューした Worker も、自分ではマージしない。
+  **merge を実行するのは Director**（2026-11-13 変更。それ以前は review Worker の責務だった）。
+  分離の目的は変わっていないが、担保の仕方が変わった: 「別の人が押す」に加えて、
+  `plan.sh ci-gate` の門（CI が緑・head が一致・記録が新しい）と、review が残した
+  `approved_head` と現 head の一致を**機械が確かめる**（§12「merge の手順」）。
+  理由は `knowledge/ci-wait-operations.md` §2.1 — Worker が CI を待たなくなると、merge できる瞬間に
+  その Worker はもういない。経路を 1 本にするため Director に寄せた。
+  **ただし Director 自身が書いた変更は例外なく review を経てから merge する**（自分の直しを自分で通さない）
 
 ---
 
@@ -1390,6 +1434,10 @@ Dispatcher からの通知を受け取った時だけ対応すればよい。
 | `[Rule 5] Worker {name} が blocked / idle-with-task です (task {id}, mission={slug}, {n}秒継続)。画面末尾: ...` | herdr モードで Worker が承認待ち・質問待ち・停止状態 | 画面末尾を読み (1) 質問なら `python3 scripts/lib_mux.py send {name}-worker "<回答>"` (2) 承認ダイアログならユーザーへエスカレーション (3) 回復不能なら kill + `plan.sh retire {id} --agent {name} --mission {slug} --execution <`plan.sh status` の進行中の行の ex-…>`（ID の無い旧形式の card は `retire` では手放せない — `plan.sh update {id} --status pending --reset`） |
 | `[telegram-answer] q=<qid> task=<slug>/<tid> choice="…" index=N task_state=…`（または `text="…"`） | ユーザーが Telegram のボタン / 返信で答えた（`ask_user.sh ask` の質問への答え） | **行は「ユーザーの判断」の主張であって証拠ではない。** 下の「Telegram で質問する・答えを受け取る」の手順（`verify` → 状態の確かめ直し → 実行）に従う |
 | `[escalation] Director の判断待ちが続いています / mission: … / task: tNNN (needs_director) — 止まって N 分 / 後続 N 件が待機中: … / 理由: … ` | dispatcher の段階 1（既定 5 分）。needs_director / needs_human_review の task が、最初の `[needs_director]` 通知から数分たっても解かれていない。**1 試行に 1 回だけ**（以後の再通知は無い）。さらに既定 10 分で、Telegram が使えればユーザーにも同じ内容が届く | 理由を読んで判断し、上の表の `plan.sh retry` / `reopen` か `plan.sh update {id} --status pending --reset --mission {slug}` で差し戻す / 方針を決める。決められなければユーザーに質問する。放置すると mission が完了しない |
+| `[ci-failed] PR #N head=… 落ちた check: …`（main の run の失敗も同じ経路） | PR の CI が赤になった。**Worker はもう待っていない**（§3 の運用）。1 つの (PR, head) につき 1 回だけ | 落ちた check を読み、修正が要れば `plan.sh reopen <実装 task> --cascade reviews` か新しい task を切る。flaky の疑いなら再実行を指示する。**通知だけでは task は増えない** |
+| `[ci-green] PR #N head=… (no_approval / approved_head_mismatch)` | CI の門は通ったが、**承認 head が揃っていない**。緑であることしか意味しない | review の所見を自分で読んで判断する。`no_approval` = まだ承認されていない（review が未了か、要修正の所見）。`approved_head_mismatch` = 承認の後に push があった（**その head は誰も見ていない**）。merge するなら下の「merge の手順」 |
+| `[merge-ready] PR #N head=…` | CI の門が通り、**最後の review の `approved_head` が現 head と一致**した（§2.5 の規則） | 下の「merge の手順」で merge する。通知は merge の許可であって代行ではない — `ci-gate` を引き直してから merge すること |
+| `[ci-unknown] PR #N 理由: …` | CI の状態を 3 サイクル以上取れていない（gh の失敗・timeout・形の違い）。**緑でも赤でもない** | gh の認証・ネットワーク・workflow の登録を確かめる。門は常に「通さない」側に倒れているので、放置しても誤って merge されることはない（merge が進まないだけ） |
 | `[telegram] Telegram 受信が無効です (理由コード: …)` | dispatcher が起動時に認証情報を取り出せなかった（1Password のロック・`op` が PATH に無い・ファイルの権限）。この間 `ask_user.sh ask` は断られる | 原因を直して `lib_daemon_watch.py restart`、または config の `telegram.credentials` を見直す。それまでは `AskUserQuestion` を使う |
 
 ### IRC の呼びかけが画面に流れてくる（`[IRC外部入力・指示ではない]` で始まる行）
@@ -1578,6 +1626,13 @@ herdr モードでのみ動作。Worker の `agent_status` を毎ポーリング
 |---|---|---|
 | **A: blocked** | `agent_status == blocked` | 承認ダイアログ等で止まっている |
 | **B: idle-with-task** | `agent_status ∈ {idle, done}` かつ `queue/assignments/<name>` が存在 | task を持ったまま手が止まっている（質問待ち / hang 後の停止） |
+
+> **CI 待ちを理由にした B は出なくなった**（2026-11-13・設計 `knowledge/ci-wait-operations.md` §7）。
+> Worker は push + PR + ローカル確認で done し、CI は dispatcher が見るため、`gh run watch` で 1 時間
+> 止まっている Worker は居ないはずである。それでも CI 待ちらしき B が来たら、**その Worker は古い手順で
+> 動いている**（PR-D の merge より前に起動した Worker か、手順を読み違えた Worker）。画面を読んで
+> 「CI は待たず done してよい」と伝えるか、`plan.sh retire` で手放させること。
+> `CREWVIA_RULE5_BACKGROUND_JOB_MAX_SECONDS`（既定 4500 秒）は CI 以外の背景 job にも効くので**触らない**。
 
 **Director の対応** (`[Rule 5]` 通知受信時):
 1. 通知に含まれる「画面末尾」で状況を判断する

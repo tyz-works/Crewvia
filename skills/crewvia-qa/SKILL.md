@@ -199,6 +199,9 @@ QA結果: [対象: <タスクタイトル>]
 
 問題が見つかった場合は実装担当 Worker に差し戻し、Orchestrator に報告する。
 
+**merge はしない。CI の完走も待たない。** CI を見るのは dispatcher で、結果は Director に通知される
+（`ci-failed` / `ci-green` / `merge-ready`）。QA の責務は確かめて所見を残すところまで。
+
 ---
 
 ## Step 8a: QA Gate セクションの記述（`qa_checkpoints` 宣言タスクの場合）
@@ -243,3 +246,27 @@ RESULT_EOF
 ```
 
 これは「代替検証して done を無理やり呼ぶ」よりも **常に正しく、安い選択肢** である。
+
+---
+
+## Step 8b: 承認する場合の `approved_head`（PR に紐づく QA task）
+
+`qa` は `review` / `codex-review` と並ぶ**承認 head を残す skill**（`lib_ci_status.APPROVAL_SKILLS`）。
+PR に紐づく review 系 task が全部終端になったとき、**`completed_at` が最後のもの**の Result が照合される。
+QA が最後になる mission は多いので、**承認するつもりなら書かないと `merge-ready` は出ない**（`no_approval` になる）。
+
+承認するときだけ、Result の**最後の非空行**に次の 1 行を置く（`## QA Gate` セクションより**後**）:
+
+```
+approved_head: <40 桁の小文字 sha>
+```
+
+- sha は**自分がテストした head**: `gh pr view <PR番号> --json headRefOid -q .headRefOid`。
+  Step 1 で取った `DIFF_REF` の対象と同じ head であることを確かめてから書く（別の head をテストして
+  承認すると、未検証の head に `merge-ready` が出る）
+- 問題あり・未実施のチェックポイントが残る・判断を Director に委ねるときは**書かない**。
+  書かなければ Director には `ci-green` が届き、Director が所見を読んで判断する
+- 省略形・大文字は読まれない。本文の途中に書いた sha も読まれない（最終行の完全一致だけ）
+- 承認の後に修正が push されれば `approved_head_mismatch` になり、未検証の head は merge されない
+
+設計: `knowledge/ci-wait-operations.md` §2.5 / `knowledge/ci-status.md`「承認 head」。

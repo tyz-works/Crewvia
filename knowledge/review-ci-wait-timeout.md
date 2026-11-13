@@ -33,6 +33,17 @@ terminate される。レビュー作業自体は完遂していても merge 直
   が丸ごと 1 本の文字列として読むため、watchdog.py の `timeout.get("max")` が `AttributeError` に
   なる罠がある (block 形式・2 スペースのみ有効)。
 
+> **後継（2026-11-13・ci-wait-operations PR-D）**: ここで前提にしている「review Worker が CI の完走を待つ」運用は**やめた**。
+> CI を見るのは dispatcher で、Worker は push + PR + ローカル確認で done する（設計 `knowledge/ci-wait-operations.md` §2.1・§3）。
+> 待たなくなれば `timeout.max=7200` の根拠（CI 完走待ち + ローカル full pytest）は review も実装系も消えるが、
+> **既定値はすぐには外さない**。PR-D の merge から 2 週間、CI 待ち由来の timeout が出ないことを確かめてから
+> review と実装系の両方の既定を外す（PR-F。同設計 §7・§8）。`watchdog.py` の `PROFILES` には触らない。
+>
+> なお下の却下案 D（「CI 待ちを Worker の中でやめる」）は、却下の理由だった 2 つが両方とも解消されたので実質的に採用された:
+> 「`knowledge/ci-status.md` の判定に使わない原則と衝突する」は表示用 / 門用の 2 本立てに改めたことで（同 §2.3）、
+> 「dispatcher に新しい再割当て経路が要る」は**再割当てそのものをやめ、merge を Director に寄せた**ことで消えた（同 §2.1）。
+> 2026-11-02 時点では、どちらも設計なしに踏み込める話ではなかった。
+
 ## 選んだ対応 (案B。Director 承認 2026-11-02)
 
 **review skill の card に、既定で `timeout.max` を自動付与する。** `config/crewvia.yaml` の

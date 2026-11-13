@@ -1024,6 +1024,15 @@ Codex の指摘は 4 巡続き、どれも「episode を watchdog が回復を�
 
 ## 12. CI 待ちの Rule 5 騒音: 既定の上限を 30 分 → 75 分に (t004, 2026-10-30)
 
+> **位置づけの更新（2026-11-13・ci-wait-operations PR-D）**: ここで対処した騒音の**発生源そのものが無くなった**。
+> Worker は CI を待たず push + PR + ローカル確認で done し、CI を見るのは dispatcher になった
+> （設計 `knowledge/ci-wait-operations.md` §2.1・§3・§7）。したがって下の実測（19 の連なり・約 1 時間 20 分周期）は
+> **今は再現しないはず**で、CI 待ちらしき Rule 5 が来たら「古い手順で動いている Worker」を疑う。
+>
+> **`CREWVIA_RULE5_BACKGROUND_JOB_MAX_SECONDS` の既定 4500 秒は変えない。** この値は CI 以外の背景 job にも効く
+> 安全弁で、CI 待ちが無くなれば上限に届かなくなるだけである。下の「残る穴」（中身が進んでいない job を 75 分黙らせる窓）は
+> CI とは独立に残るので、ここを縮める判断は別の実測に基づいて行うこと。本節の実測と結論はそのまま残す。
+
 ### 実測 (dispatcher ログ 2026-10-26〜28)
 
 - Rule 5 の idle-with-task 通知は 19 の連なり (同じ Worker・task で 15 分以内の間隔)。どれも impl mission の PR を持つ task (Ren / Haruto / Minjun)。連なりごとに 2〜7 回 (5 分間隔の再通知)。

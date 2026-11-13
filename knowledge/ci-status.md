@@ -1,7 +1,18 @@
 # PR の CI の見える化（`lib_ci_status.py`）
 
-Worker が PR の CI を待っている間、その進み具合を Director とユーザーが crewvia の画面から見られるようにする（2026-10-27 ユーザー要望）。
-**見える化だけ**。Rule 5 を黙らせる・watchdog の見送りを CI の状態で変える、といった判定には使わない（別の PR で扱う）。
+PR の CI の進み具合を Director とユーザーが crewvia の画面から見られるようにする（2026-10-27 ユーザー要望）。
+
+**読み口は 2 本ある**（2026-11-13 / ci-wait-operations PR-D で文言を改めた）:
+
+| 読み口 | 関数 | 使ってよい場所 |
+|---|---|---|
+| **表示用** | `read_record` / `format_line` / `summarize` / `task_graph_ci` | `plan.sh status`・tasks.json・watchdog の見送り通知・Rule 5 の添え書き。**判定には使わない**（今までどおり） |
+| **門用** | `gate_verdict` / `approval_verdict` | `plan.sh ci-gate` と dispatcher の `ci-green` / `merge-ready` 通知の**条件**。この 2 か所だけ |
+
+**門用でも、使ってよいのは「止める」と「知らせる」だけ**。待ちを解く・card を done にする・Rule 5 / watchdog を黙らせる・
+タスクを割り当てる、には今も使わない（設計 `knowledge/ci-wait-operations.md` §2.2・§2.3）。
+この区別のおかげで、CI の記録が壊れても**知らせが出なくなるだけ**で、crewvia が止まることはない。
+門は共有規則なので env の停止スイッチを付けない（dispatcher と `plan.sh ci-gate` で答えが割れる）。止めたいときは PR revert。
 
 ## 取得（dispatcher の 1 か所）
 
@@ -77,5 +88,19 @@ PR revert → `scripts/sync-main-checkout.sh`。`registry/ci/` は残ってよ�
 ## 門（`gate_verdict` / `plan.sh ci-gate`。ci-wait-operations PR-B）
 
 - `lib_ci_status.gate_verdict(record, *, pr_head, now)` は「通す / 通さない + 固定語の理由」を返す**門用の読み口**（表示用の `read_record` / `format_line` とは別）。通すのは記録の head == PR の現 head ∧ 全体 passed ∧ 必須 check `ci-ok` が passed ∧ `observed_at` が 10 分以内のときだけ。それ以外・読めない・取り直せないは全部通さない。設計: `knowledge/ci-wait-operations.md` §2.2。
-- `plan.sh ci-gate <PR> [--target-dir]`: 通せば exit 0 + `ci-gate: PASS PR #N head=<sha>`、通さなければ exit 1 + `ci-gate: DENY PR #N <理由>`。読み取り専用。**この PR では誰も呼ばない**（呼び出し元の追加は PR-C。`tests/test_ci_gate.py::test_nobody_calls_the_gate_yet`）。
-- 「判定に使わない」の文言の改訂（表示用 / 門用の 2 つに割る）は PR-D。それまでは待ちを解く・done にする・Rule 5 / watchdog を黙らせることに使わない。
+- `plan.sh ci-gate <PR> [--target-dir]`: 通せば exit 0 + `ci-gate: PASS PR #N head=<sha>`、通さなければ exit 1 + `ci-gate: DENY PR #N <理由>`。読み取り専用。
+  **Director が merge の直前に引く**（`agents/director.md` §12「merge の手順」）。PASS のときだけ 2 行目に承認 head の判定が出る（下記）。
+- 呼び出し元は `lib_ci_status.pr_events`（dispatcher の通知）と `plan.sh ci-gate` の 2 つだけ。増やすのは許可表を意図して広げる PR
+  （`tests/test_ci_gate.py::test_nobody_calls_the_gate_yet` が `scripts/` と `hooks/` を走査して固定する）。
+
+## 承認 head（`approved_head` / `approval_verdict`。ci-wait-operations PR-D1 / §2.5）
+
+- review 系 task（`APPROVAL_SKILLS` = review / codex-review / qa）の **done は承認ではない**。承認するときだけ Result の
+  **最後の非空行**に `approved_head: <40 桁の小文字 sha>` を置く（`agents/worker.md`・`knowledge/review.md`）。
+- `lib_ci_status.approved_head(result)` が読む**唯一の関数**。最終行の `fullmatch` だけを見る（本文のどこかにある sha を推測しない・
+  大文字 / 短縮形は読まない）。`approval_verdict(reviews, pr_head=)` が `(True, 'ok')` か理由の固定語
+  （`no_approval` / `approved_head_mismatch`）を返す。
+- 条件: PR に紐づく review 系 task が **1 本以上あり・全部終端**で、`completed_at` が最大のもの（同時刻が複数なら全部）の
+  承認 head が**現 head と一致**すること。1 つでも欠ければ `no_approval`、違えば `approved_head_mismatch`。**疑わしきは通さない**。
+- これは `gate_verdict` の**外側の層**で、`gate_verdict` は CI の緑だけを見る関数のまま保つ。`ci-gate` の exit コードにも効かない
+  （PASS のまま 2 行目に出るだけ）。dispatcher は緑 + 承認一致のときだけ `merge-ready`、それ以外は理由つきの `ci-green` を出す。

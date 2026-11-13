@@ -85,7 +85,7 @@ scripts/
   lib_worker_target.py  Worker の TARGET_DIR 記録
   lib_registry.py       workers.yaml を書く入口
   lib_review_refusal.py codex-review の拒否記録
-  lib_ci_status.py      PR の CI の見える化（取得は dispatcher の 1 か所・registry/ci/・status / tasks.json / 通知に 1 行。判定には使わない）
+  lib_ci_status.py      PR の CI の見える化と merge の門（取得は dispatcher の 1 か所・registry/ci/）。読み口は 2 本: 表示用（status / tasks.json / 通知の 1 行。判定に使わない）と門用（gate_verdict + approved_head。plan.sh ci-gate と dispatcher の ci-green / merge-ready の条件だけ。止めると知らせるにしか使わない）
   lib_irc_relay.py      IRC 呼びかけ中継（relay bot の受信箱を取得 → 無害化 → 窓へ配達。registry/daemons/irc-*.json。設計: knowledge/irc-mention-relay.md）
   lib_telegram.py       Telegram の経路（質問台帳・受信・認証情報の解決）/ ask_user.sh  Director の質問の入口
   kai-review.sh         reviewer 起動ラッパー（codex / agy / claude / both / ensemble = agy + claude の合議 + 比較用の cursor。設定の読み口は lib_review_engine.py）/ taskvia-sync.sh  queue → Taskvia 同期

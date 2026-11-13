@@ -67,6 +67,12 @@ model_per_skill:
 #      task には効かない** — WorkerMonitor は監視開始時に 1 回だけ束縛する
 #      (scripts/watchdog.py の WorkerMonitor.__init__。knowledge/review-ci-wait-timeout.md)
 #
+# ⚠️ 2026-11-13 (ci-wait-operations PR-D) に、下の根拠である「Worker が CI の完走を待つ」「ローカル
+# full pytest を流す」運用は**やめた**。CI を見るのは dispatcher で、Worker は push + PR + 触った
+# 範囲のテスト + `pytest -m structural` で done する (knowledge/ci-wait-operations.md §2.1・§3)。
+# それでも 7200 を**すぐには外さない**: PR-D の merge から 2 週間、CI 待ち由来の timeout が出ないことを
+# 確かめてから review と実装系の両方の既定を外す (PR-F。同 §7・§8)。外すまでは下の記述を歴史として残す。
+#
 # review は CI 完走待ち (pytest 実測 3975s) を含むため、既定の feature_impl (3600s) では
 # 短すぎて待機中の Worker が殺される事故が起きた (2026-09-13 / 2026-11-02 再発。
 # 20261102-review-ci-timeout)。7200s (実測への安全率 約1.8) を既定にする。

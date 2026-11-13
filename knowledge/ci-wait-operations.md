@@ -94,6 +94,7 @@ review task の done は「所見を書き終えた」であって承認では�
 - **規則（PR-D で worker.md / review の手順に入れる）**: PR に紐づく review 系 task（review / codex-review / qa。mission ごとに Director が PR に紐づけた task が対象）が**全部終端**で、**最後のもの**の Result が承認を明示する。承認するときだけ Result の末尾に 1 行 `approved_head: <40 桁の sha>` を残す（要修正・条件付きのときは書かない）。
 - **比較**: `merge-ready` の通知条件と `plan.sh ci-gate` の出力で、最後の review の `approved_head` と PR の現 head（門が取り直したもの）を比べる。一致しなければ `ci-green` のまま（`merge-ready` を出さない）。理由は固定語 `approved_head_mismatch` / `no_approval`。
 - **移行中の名前**: この規則と比較が入る（PR-D）まで、dispatcher が出す通知の名前は **`ci-green`**（CI が緑になった事実だけ。承認を含意しない）。`merge-ready` は PR-D の後。Director は `ci-green` を受けたら review の所見を自分で読んで merge 判断する（今と同じ）。
+  **→ 移行は完了した（2026-11-13）**: 比較は PR-D1（#379。`approved_head` / `approval_verdict`）、規則の文書化は PR-D2（`agents/worker.md`・`knowledge/review.md`・`agents/director.md` §12）。`merge-ready` と理由つきの `ci-green` が両方出る。
 - 下流の review が複数ある mission（codex-review → qa → 確認）では「最後に終端したもの」を見る。順序は card の依存で決まるので、PR 番号に紐づく review 系 task の `done` 時刻の最大を取る。
 
 ## 3. 設計 2: Worker の done 条件
@@ -126,6 +127,10 @@ done の報告に「CI は未完了。結果は dispatcher が通知する」と
 ## 4. 移行の注意（文書を先に直さない）
 
 文書だけ先に直すと「待たなくてよい」と書いたのに通知が出ない期間ができる。**PR-C（通知）が merge・dispatcher restart されるまで PR-D（Worker への「待つな」）を入れない**（§8）。稼働中の Worker は起動時のプロンプトで動くので、PR-D の後に起動した Worker から新運用になる。
+
+**実施（2026-11-13）**: PR-C（#377）merge + dispatcher restart 済み → PR-D1（#379）merge + restart 済み → PR-D2（本文書の §3 の表）。
+この順序で、文書が「待つな」と言う時点では通知の経路も比較の実装も本番で動いている。**稼働中の Worker は古い手順のまま完走させる**（Q7 の推奨）。
+D2 の後に起動した Worker から新運用になるので、切り替わりの日は両方の手順の Worker が混在しうる — 古い手順の Worker が CI を待っていても異常ではない。
 
 ## 5. 設計 3: 変更範囲で CI を絞る
 
@@ -212,7 +217,7 @@ GitHub の `ubuntu-latest` は 2〜4 vCPU（public repo は 4、private は 2）
 | **A** | ci.yml の pytest を xdist 化（`pip install pytest-xdist`・`-n auto --dist loadfile`・`--durations=30`）。並列で落ちるテストの洗い出し | なし | **先に入れる**。CI で 3 回以上緑を確認。最も短縮が大きい。 |
 | **B** | `lib_ci_status.gate_verdict()` + `plan.sh ci-gate` + テスト（赤の実証つき）。`pytest -m structural` の印付け（B'） | なし（A と並行可） | 挙動は変わらない（誰も呼ばない）。 |
 | **C** | CI を見る対象の拡張（§2.0。done の task の PR も、open な間は取得する）+ dispatcher の `ci-failed` / `ci-green` / `ci-unknown` 通知、台帳、テスト | B、**E** | 本番では dispatcher restart が要る（`scripts/sync-main-checkout.sh`）。E が先でないと門が `no_required_check` のままで `ci-green` が出ない。 |
-| **D** | 文書: worker.md / director.md / review.md / ci-status.md / CLAUDE.md の書き換え（§3 の表）+ 承認 head の規則（§2.5）と `merge-ready` の比較 | **C が本番に入ってから**（C ← E ← A） | 「待つ」をやめると書くのはここ。`ci-ok` が無いまま「待つな」を入れない。 |
+| **D** | 文書: worker.md / director.md / review.md / ci-status.md / CLAUDE.md の書き換え（§3 の表）+ 承認 head の規則（§2.5）と `merge-ready` の比較 | **C が本番に入ってから**（C ← E ← A） | 「待つ」をやめると書くのはここ。`ci-ok` が無いまま「待つな」を入れない。**2 本に割れた**: **D1**（#379・2026-11-13 merge）= 比較の実装（`approved_head` / `approval_verdict` / `merge-ready` 通知 / `ci-gate` の 2 行目）、**D2** = §3 の表の文書。D1 だけでは誰も `approved_head` を書かないので比較は常に `no_approval` に落ち、仕組みは眠ったままだった（安全側）。 |
 | **E** | ci.yml に `ci-ok` 集約 job（needs が全部 success のときだけ緑）と nightly の全件 | A | paths 絞りは含めない。**C・D より先**。 |
 | **F** | `timeout.max=7200` の既定（review と実装系の両方）を外す。Rule 5 文言の整理 | D から 2 週間後 | |
 

@@ -659,8 +659,43 @@ PR_URL=$(gh pr view --json url -q .url)
 echo "[worker] PR created: $PR_URL"
 ```
 
-- PR merge は `review` スキルの Worker (Seo) の責務。自分でマージしないこと
+- **merge は Director が行う。実装でも review でも、Worker は自分でマージしない**（設計 `knowledge/ci-wait-operations.md` §2.1）
 - PR URL は必ず完了報告フォーマットに含めること
+
+**🚨 CI は待たない（2026-11-13 から）**
+
+PR を作ったら `gh run watch` / `gh pr checks` で CI の完走を待たないこと。**CI を見るのは dispatcher** で、
+結果は Director に通知される（`ci-failed` / `ci-green` / `merge-ready`）。Worker は push + PR + 下の
+ローカル確認で done してよい。待っている間の Worker は Rule 5 の idle-with-task と watchdog の上限に
+当たるだけで、誰の役にも立たない（設計 `knowledge/ci-wait-operations.md` §2.1・§3）。
+
+**ローカル確認（CI より速く確かめられるものだけ）**
+
+1. 触ったファイルに対応する pytest を流す（`tests/test_<module>*.py` と、触った module を import するテスト）
+2. **構造ガードを流す**: `python3 -m pytest -m structural`（全ファイルを走査するテスト群。
+   一覧を人が覚えるのではなくこの 1 コマンドで回す。新しい lib・import・語彙リテラルを足したときは必須）
+3. shell を触ったら `bash -n`、yaml を触ったら構文確認
+4. push の後、`gh pr view --json headRefOid -q .headRefOid` が**ローカルの HEAD と一致**することを確認する
+   （push 漏れで古い head を Director に見せない）
+5. **full pytest は流さない**（約 1 時間かかる。CI が全件を見る）
+
+done の報告に **「CI は未完了。結果は dispatcher が通知する」** を 1 行入れること。
+
+**review / codex-review / qa の task: 承認は Result の最終行で示す**
+
+これらの task の done は「所見を書き終えた」であって**承認ではない**（要修正の所見でも done する）。
+承認するときだけ、Result の**最後の非空行**に次の 1 行だけを置く:
+
+```
+approved_head: <40 桁の小文字 sha>
+```
+
+- sha は**自分がレビューした head**（`gh pr view <N> --json headRefOid -q .headRefOid`）。省略形・大文字は読まれない
+- 要修正・条件付き・判断を Director に委ねるときは**書かない**。書かなければ `no_approval` として扱われ、
+  Director には `merge-ready` ではなく `ci-green` が届く（Director が所見を読んで判断する）
+- 行は Result の**末尾**に置く。本文の途中に書いた sha は読まれない（推測しない作りになっている）
+- 判定は `lib_ci_status.approved_head` / `approval_verdict` の 1 か所。承認した head の後に修正が push
+  されれば `approved_head_mismatch` になり、未レビューの head が merge されることはない（設計 §2.5）
 
 成果物がリポジトリ外（Obsidian 等）の場合でも、何を作成・変更したかを後で報告できるようメモしておくこと。
 
@@ -772,8 +807,9 @@ Director への報告フォーマット:
 ```
 タスク {TASK_MISSION}/{TASK_ID}（{TASK_TITLE}）完了。
 ブランチ: task/{CREWVIA_MISSION_SLUG}/{CREWVIA_TASK_ID}-{CREWVIA_TASK_SLUG}
-PR: {PR URL}（review Worker (Seo) による merge 待ち）
+PR: {PR URL}（CI は未完了。結果は dispatcher が通知する。merge は Director）
 worktree: {WORKTREE_PATH}
+ローカル確認: [流したテストと結果。構造ガード (-m structural) の結果を含む]
 結果: [実行した内容と結果の要約]
 気づき: [あれば記載、なければ「なし」]
 改善提案: [あれば記載、なければ「なし」]
@@ -1006,7 +1042,7 @@ branch: $(git branch --show-current)" \
 gh pr view --json url -q .url
 ```
 
-PR merge は `review` スキルの Worker (Seo) が行う。**自分でマージしないこと。**
+**merge は Director が行う。自分でマージしないこと。** CI の完走も待たない（上の「🚨 CI は待たない」）。
 
 ### ⚠️ Stacked PR (依存PR) の squash merge に関する注意
 
@@ -1055,7 +1091,8 @@ branch 名と PR URL を含めて報告すること:
 ```
 タスク {task_id} 完了。
 ブランチ: task/{mission_slug}/{task_id}-{task_slug}
-PR: {PR URL}（review Worker (Seo) による merge 待ち）
+PR: {PR URL}（CI は未完了。結果は dispatcher が通知する。merge は Director）
+ローカル確認: [流したテストと結果。構造ガード (-m structural) の結果を含む]
 結果: [実行した内容と結果の要約]
 気づき: [あれば記載、なければ「なし」]
 改善提案: [あれば記載、なければ「なし」]

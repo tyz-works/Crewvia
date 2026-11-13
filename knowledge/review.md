@@ -3,17 +3,30 @@
 > このファイルは review を担当した Worker が自動更新する。
 > 起動時にシステムプロンプトへ注入され、次の Worker に引き継がれる。
 
-## レビュープロトコル
+## レビュープロトコル（2026-11-13 改訂 — merge を含まない）
 
 1. `gh pr view {PR_URL}` で概要確認
 2. `gh pr diff {PR_URL}` でコード変更を精査する
-3. 問題なければ `gh pr merge {PR番号} --squash --delete-branch` を試す（承認なしでそのまま
-   merge を試みる — 理由は下記「承認・merge の経路」）
-4. merge できたら Director に報告して完了
-5. merge が拒否されたら（Claude Code の classifier 等）、レビューの所見は Result に残した
-   上で `plan.sh needs-director` で Director に委ねる。**これは失敗ではなく正常系**。
-   review Worker の責務は「レビューを最後までやり切ること」であり、merge の成否そのもの
-   ではない
+3. **CI の完走を待たない。** CI を見るのは dispatcher で、結果は Director に通知される
+   （`ci-failed` / `ci-green` / `merge-ready`）。diff は CI と並行して読んでよい
+4. 所見を Result に書いて `plan.sh done` で完了する。**merge は試みない**
+5. 承認するときだけ、Result の**最後の非空行**に `approved_head: <40 桁の小文字 sha>` を 1 行置く
+
+```bash
+# 自分がレビューした head。これが承認の対象になる
+gh pr view {PR番号} --json headRefOid -q .headRefOid
+```
+
+- 要修正・条件付き・判断を Director に委ねるときは**書かない**。書かなければ `no_approval` として
+  扱われ、Director には `merge-ready` ではなく `ci-green` が届く（Director が所見を読んで判断する）
+- 行は末尾に置く。本文の途中に書いた sha は読まれない（`lib_ci_status.approved_head` は最終行の
+  `fullmatch` だけを見る。推測しない作り）
+- 承認した head の後に修正が push されると `approved_head_mismatch` になり、**未レビューの head が
+  merge されることはない**。修正があれば再レビューの task を切る
+- merge できないことは失敗ではない。review Worker の責務は「レビューを最後までやり切ること」であり、
+  merge の実行は Director の責務になった（`agents/director.md` §12「merge の手順」）
+
+設計: `knowledge/ci-wait-operations.md` §2.1（待ちの持ち主）・§2.5（承認 head）。
 
 ## 承認・merge の経路
 
@@ -28,12 +41,23 @@
 **迂回しないこと**（同一アカウントでの強制承認・権限昇格など）。承認経路が無い状態は
 意図的な安全弁であり、崩す対象ではない。
 
+**2026-11-13 以降、crewvia 側の承認は GitHub の承認レコードではなく Result の `approved_head` で表す**
+（上のプロトコル 5）。GitHub にセルフ承認を通す話ではない — crewvia の中で「誰がどの head を読んだか」を
+機械が照合できるようにしただけで、GitHub 側の経路は今も無いまま。`merge-ready` が出るのは
+CI の門が通り、かつ最後の review の `approved_head` が現 head と一致したときだけ（設計 §2.5）。
+
 一方で `main` に branch protection は掛かっていない（`gh api repos/.../branches/main/protection`
 が 404）ため、承認レコードが無くても GitHub 側は merge を許可する。止まるとすれば
 **Claude Code の classifier** だけで、しかも**一貫しない**（2026-11-02 PR #338 は拒否、
 2026-11-03 PR #339・2026-11-06 PR #345・2026-11-09 PR #351 は通過。#345 は merge 自体は
 通ったが merge 後の remote branch 削除だけ別途拒否された）。「前回通ったから今回も通る」を
 当てにせず、止まる前提で見積もり、通ったら儲けものとして扱うこと。
+
+**この拒否の不安定さが、merge を Director に寄せた理由のひとつである**（2026-11-13 / 設計
+`knowledge/ci-wait-operations.md` §2.1）。review Worker が拒否されると `needs-director` で
+Director に渡るしかなく、しかも「CI が緑になる瞬間まで Worker が生きている」ことが前提だった。
+Worker が CI を待たなくなった今、merge できる瞬間に Worker はいない。最初から Director が
+merge すれば経路は 1 本で、拒否されても Director がその場で対応できる。
 
 `--delete-branch` は local branch が他の worktree で checkout 中だと失敗し、gh はそこで
 中断して remote branch を削除せずに終わる。merge 自体は成功しているので、その場合は

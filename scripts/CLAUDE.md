@@ -332,13 +332,15 @@ lib ごとの**破ってはいけない契約**の要約。理由・経緯・全
 
 - gh を呼ぶのは dispatcher の `run_ci_poll()` → `poll_cycle()` だけ。plan.sh・watchdog は `registry/ci/` の記録を `read_record()` で読むだけ（gh を呼ばない・書かない）。
 - gh の失敗・timeout・形の違いは `unknown`（緑にも「CI なし」にも倒さない）。1 サイクルの件数・時間に上限（dispatcher の stale より十分小さく）。
-- **判定（Rule 5 を黙らせる・watchdog の見送り）に使わない**。使うなら別 PR で設計する。
+- **読み口は 2 本**（PR-D で文言を改めた。設計 `knowledge/ci-wait-operations.md` §2.3）: 表示用（`read_record` / `format_line` / `summarize` / `task_graph_ci`）は**今までどおり判定に使わない**。門用（`gate_verdict` / `approval_verdict`）は `plan.sh ci-gate` と `pr_events`（`ci-green` / `merge-ready` の条件）の 2 か所だけ。
+- **門用でも「止める」と「知らせる」にしか使わない**: 待ちを解く・card を done にする・Rule 5 / watchdog を黙らせる・割り当てる、には使わない。記録が壊れたら知らせが出なくなるだけで crewvia は止まらない。共有規則なので env の停止スイッチを付けない（不変条件 5）。止めるなら PR revert。
 - テスト中は `CREWVIA_CI_ALLOW_GH_IN_TESTS=1` が無ければ gh を呼ばない（`_env_test_isolation_blocks_gh`）。
-- **PR-C（`knowledge/ci-wait-operations.md` §2.0・§2.1・§2.4）で通知が増えた**（判定の文言は据え置き。書き換えは PR-D）:
+- **PR-C（`knowledge/ci-wait-operations.md` §2.0・§2.1・§2.4）で通知が増えた**（判定の文言は PR-D で上の 2 本立てに改めた）:
   - 見る対象: card に `pr_number` がある task は status 不問（done を含む。集合は `lib_task_status.CI_FOLLOW_PR_STATUSES` の 1 か所。`CI_WATCH_STATUSES` は他の読み手と共有なので変えない）。`pr_number` が無い task は従来どおり `CI_WATCH_STATUSES` だけ（branch から PR を探す）。判定は `lib_ci_status.card_is_watched`。
   - gh の `pr view` に `state` を足し、記録の任意の欄 `pr_state`（OPEN / MERGED / CLOSED）に書く。MERGED / CLOSED の PR は `poll_cycle` が外す（card の `pr_number` が変われば取り直す）。結論が出た（passed / failed）記録の間隔は 5 分、それ以外は 60 秒。上限（`MAX_TASKS_PER_CYCLE`）は PR 単位で数え、同じ PR を指す task は gh を呼ばない。
-  - 通知は dispatcher の `run_ci_notify()`（`run_ci_poll()` の次）が `ci-failed`（PR・head・落ちた check 名だけ）/ `ci-green`（`gate_verdict` が通ったとき。承認を含意しない）/ `ci-unknown`（記録の `unknown_streak` が 3 以上）を、通知台帳のキー `ci-<種類>-pr<N>-<head 12 桁>` で 1 回送る。PR が MERGED / CLOSED になれば台帳のキーを畳む。main の最新 run（`gh run list --branch main --workflow ci.yml`。schedule と push の完了済みの最新）の失敗も `ci-failed` の経路で（5 分に 1 回・印 `registry/ci/.main-runs.json`）。
-  - **`gate_verdict` を呼んでよいのは `lib_ci_status.pr_events`（`ci-green` を出す条件）と `plan.sh ci-gate` だけ**。待ちを解く・done にする・Rule 5 / watchdog を黙らせる・割り当てには使わない（`tests/test_ci_gate.py::test_nobody_calls_the_gate_yet`・`tests/test_ci_follow_and_notify.py`）。
+  - 通知は dispatcher の `run_ci_notify()`（`run_ci_poll()` の次）が `ci-failed`（PR・head・落ちた check 名だけ）/ `ci-green`（`gate_verdict` が通ったが承認 head が揃っていない。理由 `no_approval` / `approved_head_mismatch` つき）/ `merge-ready`（緑 + 承認 head == 現 head）/ `ci-unknown`（記録の `unknown_streak` が 3 以上）を、通知台帳のキー `ci-<種類>-pr<N>-<head 12 桁>` で 1 回送る。PR が MERGED / CLOSED になれば台帳のキーを畳む。main の最新 run（`gh run list --branch main --workflow ci.yml`。schedule と push の完了済みの最新）の失敗も `ci-failed` の経路で（5 分に 1 回・印 `registry/ci/.main-runs.json`）。
+  - **`gate_verdict` を呼んでよいのは `lib_ci_status.pr_events`（`ci-green` / `merge-ready` を出す条件）と `plan.sh ci-gate` だけ**。待ちを解く・done にする・Rule 5 / watchdog を黙らせる・割り当てには使わない（`tests/test_ci_gate.py::test_nobody_calls_the_gate_yet`・`tests/test_ci_follow_and_notify.py`）。
+- **承認 head（PR-D1。設計 §2.5）**: `approved_head(result)` は review 系 task の Result の**最後の非空行**が `approved_head: <40 桁の小文字 sha>` に fullmatch するときだけその sha を返す（本文の途中の sha を推測しない）。`approval_verdict(reviews, pr_head=)` は PR に紐づく review 系 task（`APPROVAL_SKILLS`）が 1 本以上あり・全部終端・`completed_at` が最大のものの承認 head が現 head と一致するときだけ `ok`、それ以外は `no_approval` / `approved_head_mismatch`。`gate_verdict` は CI の緑だけを見る関数のまま保ち、承認の比較は**外側の層**（`pr_events` と `plan.sh ci-gate` の 2 行目）で行う。`ci-gate` の exit コードには効かない。**運用規則（誰が `approved_head` を書くか）は文書側**: `agents/worker.md`・`knowledge/review.md`・`agents/director.md` §12「merge の手順」。
   - 本番では merge 後に dispatcher の restart が要る（`scripts/sync-main-checkout.sh`）。戻し方: PR revert → sync。`registry/ci/` の記録・台帳のキーは残ってよい。
 
 ## Telegram（`lib_telegram.py` / `ask_user.sh`。PR-A / 設計 `knowledge/director-escalation-telegram.md`）

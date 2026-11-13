@@ -57,7 +57,7 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OWN_CHECKOUT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-KAI_REVIEW_SH="$OWN_CHECKOUT_ROOT/scripts/kai-review.sh"
+KAI_REVIEW_SH="${KAI_REVIEW_SH_OVERRIDE:-$OWN_CHECKOUT_ROOT/scripts/kai-review.sh}"
 REAL_PLAN_SH="$OWN_CHECKOUT_ROOT/scripts/plan.sh"
 
 PASS_COUNT=0
@@ -956,6 +956,51 @@ if [[ -n "$outfile_a" && -n "$outfile_b" && "$outfile_a" != "$outfile_b" ]]; the
   pass "並列 2 プロセスの出力ファイルパスが異なる (mktemp による衝突回避を確認): $outfile_a != $outfile_b"
 else
   fail "output files should differ between parallel runs — a=$outfile_a b=$outfile_b"
+fi
+
+# t002: 同じ repo への git worktree add / remove の同時実行 (repo 単位の flock で直列化)。
+# ロックが無いと .git/worktrees/ の作成が競合し「git worktree add failed」で
+# needs-director になる。1 回の同時実行では当たらないことがあるので複数ラウンド回す。
+echo ""
+echo "--- F3b: 同時に worktree を作っても git worktree add が競合しない (複数ラウンド) ---"
+f3b_bad=0
+f3b_total=0
+for round in 1 2 3 4 5 6; do
+  f3b_pids=()
+  for n in 1 2 3 4; do
+    (
+      FAKE_GH_HEAD_BRANCH="feature-branch" FAKE_CODEX_FIXTURE="$FIXTURES_DIR/json_empty.txt" \
+        FAKE_CODEX_LOG="$TMPDIR_TEST/f3b_${round}_${n}.log" \
+        run_kai --pr 1 --task t140 --mission "$MISSION_SLUG" --dry-run > "$TMPDIR_TEST/f3b_${round}_${n}.out" 2>&1
+      echo $? > "$TMPDIR_TEST/f3b_${round}_${n}.rc"
+    ) &
+    f3b_pids+=("$!")
+  done
+  wait "${f3b_pids[@]}"
+  for n in 1 2 3 4; do
+    f3b_total=$((f3b_total + 1))
+    if [[ "$(cat "$TMPDIR_TEST/f3b_${round}_${n}.rc" 2>/dev/null)" != "0" ]] \
+       || grep -q "worktree add failed" "$TMPDIR_TEST/f3b_${round}_${n}.out"; then
+      f3b_bad=$((f3b_bad + 1))
+    fi
+  done
+done
+if [[ $f3b_bad -eq 0 ]]; then
+  pass "同時 4 本 × 6 ラウンド ($f3b_total 実行) で git worktree add の競合による失敗が 0 件"
+else
+  fail "concurrent runs hit worktree add race — $f3b_bad / $f3b_total failed"
+fi
+
+# t002 (差し戻し): fetch / update-ref -d も worktree add / remove と同じロックを通す。
+# fetch は全 worktree の HEAD を読むので、ロックの外だと並行する add と commondir で競合する。
+echo ""
+echo "--- F3c: fetch / update-ref -d が wt_git (repo 単位ロック) を通る ---"
+f3c_bare="$(grep -nE '^[^#]*git -C [^ ]+ (fetch|update-ref|worktree (add|remove))' "$KAI_REVIEW_SH" | grep -v 'wt_git' | grep -vE 'git -C "\$gcd|rev-parse' || true)"
+# wt_git の本体 (git -C "$repo" "$@") は上の正規表現に当たらない。残りは 0 件のはず
+if [[ -z "$f3c_bare" ]]; then
+  pass "kai-review.sh の fetch / update-ref / worktree add・remove はすべて wt_git 経由"
+else
+  fail "ロックの外の git 呼び出しが残っている: $f3c_bare"
 fi
 
 # ---------------------------------------------------------------------------

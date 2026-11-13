@@ -205,6 +205,12 @@ daemons:
   # 記録は registry/ci/（消してよい）。env での上書きは無い。設計: knowledge/ci-status.md
   ci_poll_seconds: 60
 
+  # mission の停滞（完了していない task があるのに、進行中の task も、割り当てられる pending も 0 件）がこの秒数続いたら、
+  # Director に 1 回だけ知らせます（[stall]。止まっている task の一覧・直前に done の task・出口つき）。
+  # 判断待ち（needs_director / needs_human_review）しか残っていない mission は段階上げ（escalation）の担当なので対象外です。
+  # 0 以下で無効。dispatcher だけが読む値で、env での上書きは付けていません。設計: scripts/lib_stall.py
+  stall_notify_seconds: 900
+
 # ===== Taskvia 連携 =====
 # Taskvia 承認フローの使用モードを指定します。
 #

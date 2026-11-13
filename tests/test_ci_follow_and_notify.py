@@ -381,6 +381,45 @@ def test_archived_pr_with_no_ci_record_is_discovered_by_the_periodic_sweep(disp)
     assert not ci.archive_discovery_due(disp["_root"] / "registry", time.time())
 
 
+def test_periodic_sweep_rechecks_a_mission_whose_known_records_are_all_terminal(disp):
+    """codex-review (t004) P2 2 周目: `_archived_ci_missions` が、記録が 1 つでもある mission を `seen` と
+    して扱い、その記録が全部終端なら定期の全走査でも拾い直さなかった。あるミッションで t001 が MERGED
+    (終端) 済みでも、同じミッションの t002 の open PR が archive 前に一度も poll されていなければ、逆引き
+    は (全部終端なので) 対象にせず、定期の全走査も (`seen` なので) 素通りし、t002 は永久に観測されない。
+    記録の無い watched card が 1 枚でも残っていれば、定期の全走査が拾い直すこと。"""
+    (disp["_tmp"] / "view.json").write_text(view_state(GREEN, "MERGED"))
+    disp["run_ci_poll"]()      # active な間に t001 を MERGED (終端) で記録する
+    assert ci.read_record(disp["_root"] / "registry", "m", "t001")["pr_state"] == "MERGED"
+
+    (disp["_root"] / "queue" / "missions" / "m").rename(disp["_root"] / "queue" / "archive" / "m")
+    (disp["_root"] / "queue" / "state.yaml").write_text("active_missions: []\ndefault_mission: null\n")
+    # t002 の open PR は poll の予算・タイミングの窓に落ち、archive までに一度も poll されていない
+    (disp["_root"] / "queue" / "archive" / "m" / "tasks" / "t002.md").write_text(
+        "---\nid: t002\ntitle: new pr\nstatus: done\nskills: [code]\npr_number: 400\n"
+        "task_slug: new-pr\n---\n\nbody\n")
+    assert ci.read_record(disp["_root"] / "registry", "m", "t002") is None
+    # 1 回目の run_ci_poll() が (active な間は何も archive が無くても) 定期の全走査の due を消費済みなので、
+    # 強制的に due へ戻す (本番では 5 分待てば同じ)
+    ci.mark_archive_discovery(disp["_root"] / "registry", 0)
+
+    (disp["_tmp"] / "view.json").write_text(view_json(GREEN))     # t002 を取りに行ったとき: OPEN
+    disp["run_ci_poll"]()
+    assert ci.read_record(disp["_root"] / "registry", "m", "t002") is not None
+
+
+def test_periodic_sweep_does_not_reopen_a_mission_whose_watched_cards_all_have_records(disp):
+    """上のテストの裏側: 全部の watched card に記録がある (終端含む) mission は、定期の全走査でも拾い直さない
+    (もう動かない PR を毎回開き直さない、という既存の最適化を壊さないこと)。"""
+    (disp["_tmp"] / "view.json").write_text(view_state(GREEN, "MERGED"))
+    disp["run_ci_poll"]()
+    assert ci.read_record(disp["_root"] / "registry", "m", "t001")["pr_state"] == "MERGED"
+
+    (disp["_root"] / "queue" / "missions" / "m").rename(disp["_root"] / "queue" / "archive" / "m")
+    (disp["_root"] / "queue" / "state.yaml").write_text("active_missions: []\ndefault_mission: null\n")
+
+    assert disp["_archived_ci_missions"]([]) == set()
+
+
 def test_running_sends_nothing_and_merged_pr_stops_everything(d):
     cycle(d, view_state(ROLLUP_RUNNING, "OPEN"))
     assert sent() == []

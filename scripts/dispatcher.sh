@@ -3720,13 +3720,22 @@ def _archived_ci_missions(active_missions):
        active でなく、かつその mission の記録のうち **1 つでも非終端** (MERGED/CLOSED/NOT_FOUND でない。
        読めない記録も非終端側 = 疑わしきは開く) のものがあれば、その mission を対象にする。
     2. 重い方 — `ARCHIVE_DIR` の全走査。`lib_ci_status.archive_discovery_due()` が真のとき (既定 5 分に
-       1 回) だけ行う。1 で**記録を 1 つも持たない** mission (= done と archive の間に `poll_cycle` が
-       1 度も挟まらなかった極小の窓。codex-review t004 P2) を、card を開いて `card_is_watched` で拾う。
-       **1 で記録を持つが全部終端の mission はここでは拾い直さない** (もう動かない PR を毎回開き直さない)。
+       1 回) だけ行う。
+       a. 1 で**記録を 1 つも持たない** mission (= done と archive の間に `poll_cycle` が 1 度も挟まら
+          なかった極小の窓。codex-review t004 P2) を、card を開いて `card_is_watched` で拾う。
+       b. 1 で記録を持つが全部終端の mission も、`card_is_watched` の card を 1 の逆引きで集めた
+          task_id の集合と突き合わせ、**記録を 1 つも持たない watched card が残っていれば**拾う
+          (codex-review t004 P2-2 2 周目: poll の 1 サイクル 4 PR の上限や archive 直前のタイミングで、
+          ある card だけ記録が無いまま mission が全部終端に見えることがある。例: t001 は MERGED 済みで
+          t002 の open PR は一度も poll されていない — 逆引きは全部終端なので対象にせず、全走査も
+          「記録がある」で素通りし、t002 は永久に観測されない)。全部の watched card に記録がある
+          mission はここでも拾い直さない (もう動かない PR を毎回開き直さない)。
     """
+    import collections
     import lib_git_policy
     active = set(active_missions)
     seen, interesting = set(), set()
+    seen_task_ids = collections.defaultdict(set)
     try:
         names = os.listdir(lib_ci_status.ci_dir(REGISTRY_DIR))
     except OSError:
@@ -3744,12 +3753,21 @@ def _archived_ci_missions(active_missions):
         except lib_git_policy.GitPolicyError:
             continue        # record_path() が書くときに検査済みのはずの名前。壊れていれば触らない
         seen.add(mission)
+        seen_task_ids[mission].add(task_id)
         record = lib_ci_status.read_record(REGISTRY_DIR, mission, task_id)
         if record is None or record.get('pr_state') not in lib_ci_status.PR_TERMINAL_STATES:
             interesting.add(mission)
 
     now = time.time()
     if lib_ci_status.archive_discovery_due(REGISTRY_DIR, now):
+        for mission in seen - interesting:
+            tasks_dir = ARCHIVE_DIR / mission / 'tasks'
+            if not tasks_dir.is_dir():
+                continue
+            for meta, _body in list_task_cards(tasks_dir, warn=lambda msg: log(f"WARNING: {msg}")):
+                if lib_ci_status.card_is_watched(meta) and meta.get('id') not in seen_task_ids[mission]:
+                    interesting.add(mission)
+                    break
         if os.path.isdir(ARCHIVE_DIR):
             try:
                 entries = sorted(os.listdir(ARCHIVE_DIR))
@@ -3757,7 +3775,7 @@ def _archived_ci_missions(active_missions):
                 entries = []
             for entry in entries:
                 if entry in active or entry in seen:
-                    continue    # active、または既に記録がある (= 既に発見済み。終端のみなら拾い直さない)
+                    continue    # active、または既に上で判定済み (記録を 1 つも持たない mission はここだけ)
                 try:
                     lib_git_policy.check_mission_slug(entry)
                 except lib_git_policy.GitPolicyError:

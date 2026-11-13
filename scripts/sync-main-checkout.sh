@@ -88,6 +88,8 @@ if [[ -z "$REPO_ROOT" ]]; then
 fi
 REGISTRY_DIR="${REPO_ROOT}/registry"
 LIB_DAEMON_WATCH="${SCRIPT_DIR}/lib_daemon_watch.py"
+# shellcheck source=lib_worktree_lock.sh
+source "${SCRIPT_DIR}/lib_worktree_lock.sh"
 
 say() { echo "[sync-main-checkout] $*"; }
 fail() { echo "[sync-main-checkout] $*" >&2; exit 1; }
@@ -101,7 +103,7 @@ cd "$REPO_ROOT" || fail "cannot cd to repo root: $REPO_ROOT"
 
 # --- 1. fetch (dry-run でも行う — 差分を知るには要る。working tree には触れない) ---
 say "git fetch origin main ..."
-if ! FETCH_OUT="$(git fetch origin main 2>&1)"; then
+if ! FETCH_OUT="$(crewvia_wt_git . fetch origin main 2>&1)"; then
   echo "$FETCH_OUT" >&2
   fail "git fetch origin main failed — network か remote の設定を確認してください。何もしていません。"
 fi
@@ -155,7 +157,7 @@ fi
 # --- 2. merge --ff-only (pull すべきものが無ければ no-op) ---
 if [[ "$LOCAL_HEAD" != "$REMOTE_HEAD" ]]; then
   say "git merge --ff-only origin/main ..."
-  if ! git merge --ff-only origin/main; then
+  if ! crewvia_wt_git . merge --ff-only origin/main; then
     fail "git merge --ff-only failed — 上のエラーを確認してください。何も restart していません。"
   fi
 fi

@@ -128,6 +128,10 @@ from lib_mux import (  # noqa: E402
     repo_identity_ok,
 )
 import lib_config  # noqa: E402
+import lib_worktree_lock  # noqa: E402
+
+#: fetch_origin がロックを待つ上限 (秒)。周期処理を止めないよう短くし、取れなければ次のサイクルに回す。
+_FETCH_LOCK_WAIT_SECONDS = 5
 from lib_retirement import (  # noqa: E402
     process_alive,
     read_json,
@@ -249,6 +253,9 @@ DAEMON_RESTART_FILES = {
         "scripts/lib_config.py",
         # mission の停滞検知 (dispatcher の run_stall_cycle が呼ぶ。呼ぶ時に import するが、起動後の変更は拾わない)
         "scripts/lib_stall.py",
+        # fetch_origin が worktree ロックを通す (呼ぶ時に import するが、起動後の変更は拾わない)
+        "scripts/lib_worktree_lock.py",
+        "scripts/lib_worktree_lock.sh",
     ),
     DAEMON_WATCHDOG: (
         "scripts/watchdog.py",
@@ -272,6 +279,9 @@ DAEMON_RESTART_FILES = {
         "scripts/lib_git_policy.py",
         # machine-local-config PR-2: lib_mux / lib_daemon_watch が config の読み口として import する
         "scripts/lib_config.py",
+        # lib_daemon_watch が worktree ロックの入口として import する
+        "scripts/lib_worktree_lock.py",
+        "scripts/lib_worktree_lock.sh",
     ),
 }
 
@@ -414,15 +424,18 @@ def fetch_origin(repo_root, *, remote: str = "origin", branch: str = "main",
 
     A hung or unreachable remote must not be able to stall the caller's
     cycle, so this always runs under a timeout.
+
+    Runs under the repo-wide worktree lock (`lib_worktree_lock`): a fetch that
+    overlaps a worktree add / remove can fail with "failed to read
+    .git/worktrees/<name>/commondir".  The lock wait is short — if it is held
+    (a review spawn / Worker pull is in progress) this returns False and the
+    caller's periodic cycle simply tries again next time (fail-closed, never blocks).
     """
-    try:
-        out = subprocess.run(
-            ["git", "-C", str(repo_root), "fetch", remote, branch],
-            capture_output=True, timeout=timeout, check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-    return out.returncode == 0
+    rc, _out, _err = lib_worktree_lock.wt_git(
+        repo_root, "fetch", remote, branch,
+        timeout=timeout + _FETCH_LOCK_WAIT_SECONDS, lock_wait=_FETCH_LOCK_WAIT_SECONDS,
+    )
+    return rc == 0
 
 
 def commits_behind(repo_root, ref: str = "origin/main") -> Optional[int]:

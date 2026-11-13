@@ -119,6 +119,7 @@ from lib_task_cards import (  # noqa: E402
     is_missing, is_unreadable, parse_yaml, read_regular_text_or_unreadable,
 )
 import lib_worker_target  # noqa: E402
+import lib_worktree_lock  # noqa: E402
 # worktree の根は Git Policy の 1 か所 (worktree_root は既定値に固定。knowledge/git-policy.md §2.1・§4.1)。
 from lib_git_policy import DEFAULT_WORKTREE_ROOT  # noqa: E402
 
@@ -242,6 +243,16 @@ def _git_env() -> dict:
     return env
 
 
+#: repo 全体の worktree 登録を列挙・変更する git 操作。kai-review / Worker の worktree add と重なると
+#: 「failed to read .git/worktrees/<name>/commondir」で落ちるので、repo 単位のロック (lib_worktree_lock) を通す。
+_LOCKED_GIT_VERBS = {('worktree', 'list'), ('worktree', 'move'), ('worktree', 'lock'), ('worktree', 'unlock'),
+                     ('fetch',)}
+
+
+def _needs_wt_lock(args) -> bool:
+    return tuple(args[:2]) in _LOCKED_GIT_VERBS or tuple(args[:1]) in _LOCKED_GIT_VERBS
+
+
 def run_git(cwd, *args) -> tuple[Optional[int], str, str]:
     """`(returncode, stdout, stderr)`。起動できない・時間切れは returncode=None (= 判定不能)。
 
@@ -252,6 +263,13 @@ def run_git(cwd, *args) -> tuple[Optional[int], str, str]:
     返すので、登録パスに含まれる本物の CR・CRLF がデコードの過程で LF に化ける (元のバイト列を
     `bytes.decode()` で直接デコードすれば、改行変換は起きない)。
     """
+    if _needs_wt_lock(args):
+        # 取れなければ git は実行されず rc=99 (= 失敗扱い。呼び側は中止・failed に進む。fail-closed)
+        rc, out_b, err_b = lib_worktree_lock.wt_git(cwd, *args, timeout=GIT_TIMEOUT_SECONDS + 130,
+                                                    env=_git_env())
+        if rc is None:
+            return None, '', err_b.decode('utf-8', errors='replace')
+        return rc, out_b.decode('utf-8', errors='surrogateescape'), err_b.decode('utf-8', errors='surrogateescape')
     try:
         proc = subprocess.run(['git', '-C', str(cwd), *args], capture_output=True,
                               env=_git_env(), timeout=GIT_TIMEOUT_SECONDS)

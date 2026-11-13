@@ -260,7 +260,14 @@ crewvia_remove_worktree() {
   resolved="$(_crewvia_resolve_task "$mission_slug" "$task_id" "$task_slug" "$repo_root")" || return 1
   { IFS= read -r _b; IFS= read -r worktree_path; } <<<"$resolved"
 
-  if ! crewvia_wt_git . worktree list --porcelain | grep -qF "worktree ${worktree_path}"; then
+  # list を先に変数へ取ってから判定する。パイプの左が失敗 (ロックが取れず 99 など) すると grep -q は「無い」と
+  # 読んで黙って rc=0 で skip してしまう。取れなければ失敗を返す。
+  local wt_list
+  wt_list="$(crewvia_wt_git . worktree list --porcelain)" || {
+    echo "crewvia_remove_worktree: worktree list を取れません (ロック待ちの時間切れか git の失敗): $worktree_path" >&2
+    return 1
+  }
+  if ! grep -qF "worktree ${worktree_path}" <<<"$wt_list"; then
     echo "crewvia_remove_worktree: worktree not found, skipping: $worktree_path" >&2
     return 0
   fi

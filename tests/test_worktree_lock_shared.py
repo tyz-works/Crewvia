@@ -23,7 +23,7 @@ LIB = SCRIPTS / "lib_worktree_lock.sh"
 pytestmark = pytest.mark.skipif(shutil.which("flock") is None, reason="flock が無い環境")
 
 # ロックの外に残してはいけない git 呼び出し
-BARE_GIT = re.compile(r"^[^#]*\bgit\s+(-C\s+\S+\s+)?(fetch|update-ref|worktree\s+(add|remove|list))\b")
+BARE_GIT = re.compile(r"^[^#]*\bgit\s+(-C\s+\S+\s+)?(fetch|update-ref|merge --ff-only|worktree\s+(add|remove|list))\b")
 
 
 def _code_lines(path: Path):
@@ -167,3 +167,102 @@ def test_concurrent_add_remove_and_fetch_loops_do_not_fail_with_the_lock(tmp_pat
         assert r.returncode == 0, r.stderr
         fails = (out / "fails").read_text().split()
         assert fails == [], (fails, (out / "err").read_text()[:500])
+
+
+# ---- t001 (mission 20261113-wt-lock-rest): python 側 (デーモン・worktree_gc) と sync-main-checkout.sh ----
+import sys  # noqa: E402
+
+sys.path.insert(0, str(SCRIPTS))
+import lib_worktree_lock as pylock  # noqa: E402
+
+
+def _hold(path, secs=30):
+    h = subprocess.Popen(["bash", "-c", f'exec 9>>"{path}"; flock 9; echo held; sleep {secs}'],
+                         stdout=subprocess.PIPE, text=True, start_new_session=True)
+    assert h.stdout.readline().strip() == "held"
+    return h
+
+
+@pytest.mark.structural
+def test_python_side_has_no_flock_of_its_own():
+    """python の入口はロックを自前で定義しない (bash の crewvia_wt_git を呼ぶだけ)。"""
+    for name in ("lib_worktree_lock.py", "lib_daemon_watch.py", "worktree_gc.py"):
+        code = [l for l in (SCRIPTS / name).read_text().splitlines() if not l.lstrip().startswith("#")]
+        assert not [l for l in code if re.search(r"fcntl\.flock|flock\s+-", l)] or name == "lib_daemon_watch.py", name
+    assert "crewvia_wt_git" in (SCRIPTS / "lib_worktree_lock.py").read_text()
+
+
+@pytest.mark.structural
+def test_bare_git_fetch_and_worktree_ops_are_gone_from_daemons_and_sync():
+    w = (SCRIPTS / "lib_daemon_watch.py").read_text()
+    assert '"fetch", remote, branch],\n            capture_output' not in w
+    assert "wt_git(" in w
+    sync = [(n, l.strip()) for n, l in _code_lines(SCRIPTS / "sync-main-checkout.sh") if BARE_GIT.search(l)]
+    assert sync == [], sync
+    assert "merge --ff-only origin/main" in (SCRIPTS / "sync-main-checkout.sh").read_text()
+    assert "crewvia_wt_git . merge --ff-only origin/main" in (SCRIPTS / "sync-main-checkout.sh").read_text()
+
+
+def test_wt_git_fail_closed_when_lock_held(tmp_path):
+    c = _clone(tmp_path)
+    h = _hold(f"{c}/.git/crewvia-worktree.lock")
+    try:
+        rc, out, err = pylock.wt_git(c, "worktree", "list", lock_wait=1, timeout=30)
+        assert rc == pylock.LOCK_UNAVAILABLE
+    finally:
+        os.killpg(h.pid, 9)
+        h.wait()
+    rc, out, err = pylock.wt_git(c, "worktree", "list", lock_wait=1, timeout=30)
+    assert rc == 0 and str(c).encode() in out
+
+
+def test_fetch_origin_returns_false_without_running_git_when_lock_held(tmp_path):
+    import lib_daemon_watch as w
+    c = _clone(tmp_path)
+    assert w.fetch_origin(c) is True
+    h = _hold(f"{c}/.git/kai-review-worktree.lock")
+    try:
+        assert w.fetch_origin(c) is False
+    finally:
+        os.killpg(h.pid, 9)
+        h.wait()
+
+
+def test_worktree_gc_run_git_fails_closed_when_lock_held(tmp_path):
+    import worktree_gc as gc
+    c = _clone(tmp_path)
+    h = _hold(f"{c}/.git/crewvia-worktree.lock")
+    old = os.environ.get("CREWVIA_WT_LOCK_WAIT_SECONDS")
+    os.environ["CREWVIA_WT_LOCK_WAIT_SECONDS"] = "1"
+    try:
+        rc, _o, _e = gc.run_git(str(c), "worktree", "list", "--porcelain", "-z")
+        assert rc == 99
+        rc2, _o, _e = gc.run_git(str(c), "rev-parse", "HEAD")   # repo を列挙しない読み取りはロック不要
+        assert rc2 == 0
+    finally:
+        os.killpg(h.pid, 9)
+        h.wait()
+        if old is None:
+            os.environ.pop("CREWVIA_WT_LOCK_WAIT_SECONDS")
+        else:
+            os.environ["CREWVIA_WT_LOCK_WAIT_SECONDS"] = old
+
+
+def test_remove_worktree_fails_when_list_cannot_be_taken(tmp_path):
+    """ロックが取れないとき crewvia_remove_worktree は「無い」と読んで rc=0 で skip せず、失敗を返す。"""
+    c = _clone(tmp_path)
+    copy_plan_tree(c)
+    (c / "scripts" / "git-helpers.sh").write_text((SCRIPTS / "git-helpers.sh").read_text())
+    q = tmp_path / "queue" / "missions" / "m-lock" / "tasks"
+    q.mkdir(parents=True)
+    (q.parent / "mission.yaml").write_text("slug: m-lock\n")
+    h = _hold(f"{c}/.git/crewvia-worktree.lock", 60)
+    try:
+        env = {**os.environ, "CREWVIA_QUEUE": str(tmp_path / "queue"), "CREWVIA_WT_LOCK_WAIT_SECONDS": "1"}
+        r = subprocess.run(["bash", "-c", f'cd "{c}" && source scripts/git-helpers.sh && crewvia_remove_worktree m-lock t001 slug'],
+                           capture_output=True, text=True, timeout=120, env=env)
+        assert r.returncode != 0, r.stderr
+        assert "skipping" not in r.stderr
+    finally:
+        os.killpg(h.pid, 9)
+        h.wait()

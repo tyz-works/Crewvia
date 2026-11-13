@@ -989,8 +989,6 @@ ALLOWED_SUBPROCESS_CALLS = {
     # (changed_files_vs)。
     ("lib_daemon_watch.py", "_git_head", "git"):
         "`git rev-parse HEAD`。queue / registry のファイルは渡していない",
-    ("lib_daemon_watch.py", "fetch_origin", "git"):
-        "`git fetch origin main`。同上",
     ("lib_daemon_watch.py", "commits_behind", "git"):
         "`git rev-list --count`。同上",
     ("lib_daemon_watch.py", "changed_files_vs", "git"):

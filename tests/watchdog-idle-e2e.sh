@@ -89,6 +89,11 @@ cp "$SRC_DIR/scripts/lib_execution.py" "$ROOT/scripts/lib_execution.py"
 cp "$SRC_DIR/scripts/lib_task_status.py" "$ROOT/scripts/lib_task_status.py"
 # PR-2 (machine-local-config): lib_daemon_watch.load_config は lib_config 経由で config を読む。
 cp "$SRC_DIR/scripts/lib_config.py" "$ROOT/scripts/lib_config.py"
+# t001 (wt-lock-rest): lib_daemon_watch は import 時に lib_worktree_lock.py を読み、
+# それは同じ場所の lib_worktree_lock.sh (ロックの唯一の定義) を呼ぶ。写し忘れると
+# watchdog が ModuleNotFoundError で起動直後に落ちる (CI で 7 FAIL した原因)。
+cp "$SRC_DIR/scripts/lib_worktree_lock.py" "$ROOT/scripts/lib_worktree_lock.py"
+cp "$SRC_DIR/scripts/lib_worktree_lock.sh" "$ROOT/scripts/lib_worktree_lock.sh"
 
 # claude 本体 / MCP サーバー相当を模す偽バイナリ (中身は sh / sleep のまま
 # 機能する)。t074 以降、分類は comm を見ないのでこの名前自体は判定に効かない

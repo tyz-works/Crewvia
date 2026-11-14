@@ -129,6 +129,7 @@ CASES = {
     ("update", "--deliverable"): ("Director", ["update", "t001", "--reset", "--mission", M, "--deliverable", "bogus"]),
     ("update", "--idle-timeout"): ("Director", ["update", "t001", "--reset", "--mission", M, "--idle-timeout", "abc"]),
     ("update", "--max-timeout"): ("Director", ["update", "t001", "--reset", "--mission", M, "--max-timeout", "abc"]),
+    ("update", "--blocked-reason"): ("Director", ["update", "t001", "--reset", "--mission", M, "--blocked-reason", "   "]),
 }
 
 #: 不正な値が無い option (理由つき)。理由を空にすると赤

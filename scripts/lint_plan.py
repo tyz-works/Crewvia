@@ -146,7 +146,8 @@ def check_frontmatter(tasks: list[dict]) -> list[tuple[str, str, str]]:
             reason = meta.get('blocked_reason')
             if not isinstance(reason, str) or not reason.strip():
                 results.append(('FAIL', 'frontmatter',
-                                f"{prefix}: status 'blocked' requires a non-empty 'blocked_reason'"))
+                                f"{prefix}: status 'blocked' requires a non-empty 'blocked_reason'"
+                                f" (plan.sh update {meta.get('id') or '<id>'} --status blocked --blocked-reason \"...\")"))
 
         # `needs_director` も同じ作法: 理由の無い判断待ちは、Director が何を判断するのか
         # 分からない。`plan.sh needs-director` は必ず書くが、`update --status` は書けてしまう。

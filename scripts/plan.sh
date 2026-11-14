@@ -47,7 +47,10 @@ set -euo pipefail
 #   plan.sh update <task_id> [--mission <slug>] [--skills <csv>] [--blocked-by <csv>]
 #                            [--priority high|medium|low] [--worker <name>] [--status <status>]
 #                            [--description <text>] [--reset] [--deliverable pr|file|none]
-#                            [--idle-timeout <s>] [--max-timeout <s>]
+#                            [--blocked-reason "<理由>"] [--idle-timeout <s>] [--max-timeout <s>]
+#                              --blocked-reason: blocked の理由 (1 行・500 字まで)。--status blocked と一緒に渡す
+#                              (card が既に blocked なら単独でも可 = 理由の書き換え)。blocked にならない card への指定は拒否。
+#                              blocked から別の status に戻す (--status / --reset) と blocked_reason は消える。
 #                              既存 card の timeout.idle / timeout.max を書き換える唯一の非手編集の経路 (t002)。
 #                              既存の timeout dict は片方だけ渡した方だけ上書きしてマージする。
 #                              監視中 (in_progress) の task には即効かない — WorkerMonitor は監視開始時に
@@ -2735,7 +2738,7 @@ USAGE = {
     'update': ('plan.sh update <task_id> [--mission <slug>] [--skills <csv>] [--blocked-by <csv>]\n'
                '                       [--priority high|medium|low] [--worker <name>] [--status <status>]\n'
                '                       [--description <text>] [--reset] [--pr-number <N>] [--pr-repo <owner/name|null>]\n'
-               '                       [--deliverable pr|file|none]\n'
+               '                       [--deliverable pr|file|none] [--blocked-reason "<理由>"]\n'
                '                       [--idle-timeout <s>] [--max-timeout <s>]\n'
                '       plan.sh update <task_id> --close-execution [--mission <slug>]'),
     'retry': 'plan.sh retry <task_id> --reason "<理由>" [--mission <slug>] [--over-cap "<理由>"]',
@@ -7079,8 +7082,17 @@ def cmd_update(args):
                                [--worker <name>]
                                [--status <status>]
                                [--description <text>]
-                               [--reset]
+                               [--reset] [--blocked-reason "<理由>"]
                                [--idle-timeout <s>] [--max-timeout <s>]
+
+    --blocked-reason: blocked の理由を card の `blocked_reason` に書く (CI 待ちの P3 12)。
+    `--status blocked --blocked-reason "..."` の形が基本 (lint は blocked に理由を要求する)。
+    検証は何かを書く前: 空・空白だけ・制御文字 (改行を含む)・501 字以上は拒否 (reopen / retry の理由と同じ
+    `check_reason`。exit 2・何も書かない)。**更新後の status が blocked でない card への指定も拒否**
+    (理由だけが残ると lint / task-graph / status が「止まっている」と誤読する)。既に blocked の card には
+    単独で渡せる (理由の書き換え)。blocked でなくなる更新 (`--status pending` 等・`--reset`) は blocked_reason を消す。
+    `--status blocked` に理由が無い (指定も既存も無い) と stderr に警告 (lint が FAIL にするので案内)。
+    `add` には足さない: 作った瞬間に止めたい task は無く (止めるのは動いている mission の途中)、drafting では card を手書きできる。
 
     --idle-timeout / --max-timeout: 既存 card の timeout.idle / timeout.max を書き換える
     (t002 / 20261102-review-ci-timeout)。既存の timeout dict の片方だけを持つ値はもう片方を
@@ -7131,6 +7143,7 @@ def cmd_update(args):
         '--close-execution': 'bool',
         '--idle-timeout': 'value',
         '--max-timeout': 'value',
+        '--blocked-reason': 'value',
     })
 
     if not positional:
@@ -7171,6 +7184,14 @@ def cmd_update(args):
                 die("--max-timeout must be a positive integer number of seconds")
         except ValueError:
             die("--max-timeout must be an integer number of seconds")
+
+    # --blocked-reason の値の検査はロックの前 (拒否は何も書かない。UsageExit は task-graph も再生成しない)
+    blocked_reason_opt = None
+    if '--blocked-reason' in opts:
+        try:
+            blocked_reason_opt = _CONTROLLER.check_reason(opts['--blocked-reason'], '--blocked-reason')
+        except _EXEC.ControllerError as e:
+            _usage_exit(e.message)
 
     # Holder for reset worker info (populated inside _do, used after with_lock)
     # [0] = old worker name, [1] = slug (for assignment content verification)
@@ -7235,6 +7256,13 @@ def cmd_update(args):
                     die("--pr-number must be a positive integer (or 'null' to clear)")
 
         pr_repo_update = _parse_pr_repo_opt(opts, allow_clear=True)
+
+        # 更新後の status (--reset は pending、次に --status が上書き)。blocked でない card に理由だけ付けない
+        final_status_plan = status if status else ('pending' if opts.get('--reset') else old_status)
+        if blocked_reason_opt is not None and final_status_plan != 'blocked':
+            _usage_exit(f"--blocked-reason は status が blocked になる更新にだけ付けられます"
+                        f" (更新後の status: {final_status_plan})。"
+                        f" `plan.sh update {task_id} --status blocked --blocked-reason \"...\"` の形で")
 
         reset_by_controller = False
         if opts.get('--reset'):
@@ -7302,6 +7330,19 @@ def cmd_update(args):
         if status:
             meta['status'] = status
             changed.append(f"status={status}")
+
+        # blocked_reason: 理由の書き込み / blocked でなくなったら消す (propagate_pr_number の unblock と同じ規則)
+        if blocked_reason_opt is not None:
+            meta['blocked_reason'] = blocked_reason_opt
+            changed.append(f"blocked_reason={blocked_reason_opt}")
+        elif meta.get('status') != 'blocked' and 'blocked_reason' in meta:
+            del meta['blocked_reason']
+            changed.append('blocked_reason=cleared')
+        elif meta.get('status') == 'blocked' and not (
+                isinstance(meta.get('blocked_reason'), str) and meta['blocked_reason'].strip()):
+            print(f"[plan.sh warn] {slug}/{task_id}: status blocked に blocked_reason が無い — lint が FAIL にします。"
+                  f" `plan.sh update {task_id} --mission {slug} --blocked-reason \"...\"` で理由を足してください",
+                  file=sys.stderr)
 
         # 前回の FAIL の証拠 (handoff / head) を持ち越さない。古い handoff が同じ固定パスに
         # 残ると、やり直しの FAIL としてそのまま再提出できてしまう (backlog #8 の誘因)。

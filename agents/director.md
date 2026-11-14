@@ -1016,7 +1016,7 @@ PR=<PR番号>
 #    通さないとき exit 1 で `ci-gate: DENY PR #N <理由>`。2 行目が ok でなければ承認ではない（exit コードには出ない）
 GATE="$(./scripts/plan.sh ci-gate "$PR")" || { printf '%s\n' "$GATE"; echo "門が通らない。merge しない" >&2; exit 1; }
 printf '%s\n' "$GATE"   # 2 行目の approved_head の判定も必ず読む
-# 2. **門が通した head そのもの**を門の出力から取り出して squash merge する。
+# 2. **門が通した head そのもの**を門の出力から取り出す（merge は手順 4）。
 #    gh pr view で取り直すと、門を引いた後に入った push を拾って「誰も通していない head」を merge しうる
 HEAD_SHA="$(printf '%s\n' "$GATE" | sed -n 's/^ci-gate: PASS PR #[0-9][0-9]* head=\([0-9a-f]\{40\}\)$/\1/p')"
 [ -n "$HEAD_SHA" ] || { echo "門の出力から head を読めない。merge しない" >&2; exit 1; }
@@ -1024,8 +1024,9 @@ HEAD_SHA="$(printf '%s\n' "$GATE" | sed -n 's/^ci-gate: PASS PR #[0-9][0-9]* hea
 #    （門は CI の緑しか見ない）。ここで止めないと、承認の後に push された head を merge しうる
 printf '%s\n' "$GATE" | grep -qx 'ci-gate: approved_head ok' \
   || { echo "承認 head が揃っていない。merge しない（下の『承認が無いまま merge する場合』を読む）" >&2; exit 1; }
+# 4. 門が通した head を指して squash merge する（push が入っていれば GitHub が弾く）
 gh pr merge "$PR" --squash --match-head-commit "$HEAD_SHA"
-# 4. merge 後は主 checkout を同期（ff + 必要な daemon の restart まで 1 本）
+# 5. merge 後は主 checkout を同期（ff + 必要な daemon の restart まで 1 本）
 scripts/sync-main-checkout.sh
 ```
 

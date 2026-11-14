@@ -36,7 +36,9 @@ HEAD_AFTER="$(gh pr view "$PR" --json headRefOid -q .headRefOid)"    # ④ 承�
 5. **`approved_head:` 行は Result の最後の非空行にする。** 後ろに所見・ログを足さない。
    行頭 `## ` の見出しは `plan.sh done` が保存時に `### ` へ自動で下げる（#382 の
    `demote_section_headings`）ので、本文に見出しを書いても Result 節は途中で切れない
-   （ただし見出しは `### ` 以下を使うのが推奨）。
+   （見出しは `### ` 以下を使うのが推奨）。`## QA Gate` も保存後は `### QA Gate` に下がるが、
+   QA Gate の検証 (`_validate_qa_gate`) は下げる前の本文で行われるので、書くときは `## QA Gate` と書く
+   （`plan.sh` の `done` は検証 → `demote_section_headings` → 保存の順）。
    自動で下がる前は `lib_history.result_section` が最初の行頭 `## ` で節を切っていて、
    `approved_head:` 行が節の外に出て `no_approval` になっていた
    （実例: mission 20261113-ci-wait-ops-3 t002 の再レビュー）

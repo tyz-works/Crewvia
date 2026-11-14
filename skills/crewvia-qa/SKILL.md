@@ -273,8 +273,9 @@ approved_head: <40 桁の小文字 sha>
 ```
 
 - 本文の行頭 `## ` は `plan.sh done` が保存時に `### ` へ自動で下げる（#382 の `demote_section_headings`）。
-  `## QA Gate` もそうなるので Result 節は途中で切れない（それ以外の見出しは `### ` 以下を使うのが推奨）。**QA Gate の検証は下げる前の本文で行われる**ので、
-  見出しは `## QA Gate` のまま書いてよい（`_validate_qa_gate` が `^##\s+QA\s+Gate\s*$` を必須にしている）
+  `## QA Gate` も保存後は `### QA Gate` になるので Result 節は途中で切れない（それ以外の見出しは `### ` 以下を使うのが推奨）。
+  **QA Gate の検証 (`_validate_qa_gate`) は下げる前の本文で行われる**ので、見出しは `## QA Gate` と書く
+  （`^##\s+QA\s+Gate\s*$` を必須にしている）。詳細: `knowledge/review.md` 5.
 - **守るべき不変条件は 1 つだけ: `approved_head:` 行が Result の最後の非空行であること。**
   後ろに所見・ログ・チェックポイント行を足さない
 
@@ -302,7 +303,7 @@ LOCAL="$(git rev-parse HEAD)"
 [ "$(gh pr view "$PR" --json headRefOid -q .headRefOid)" = "$LOCAL" ] || echo "テスト中に push された。承認しない"
 ```
 
-4 つとも通ったときだけ `approved_head: $LOCAL` を書く。**書くのは「自分が実際に動かした commit」**で、
+5 つとも通ったときだけ `approved_head: $LOCAL` を書く。**書くのは「自分が実際に動かした commit」**で、
 `gh pr view` で取り直した値ではない。
 
 - **テスト中に手元を直して通ったなら、それは承認ではなく所見**。直した内容を Result に書いて

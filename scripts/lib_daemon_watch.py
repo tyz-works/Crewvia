@@ -986,24 +986,28 @@ _CONFIG_KEYS = (
 _WARNED_CONFIG = set()
 
 
+def _warn_config_once(key, value, want, *, source="daemons."):
+    token = (source, key, repr(value))
+    if token not in _WARNED_CONFIG:
+        _WARNED_CONFIG.add(token)
+        print(f"[lib_daemon_watch] WARNING: {source}{key}={value!r} is not {want}; using the default",
+              file=sys.stderr)
+
+
 def _config_int(block, key, *, positive=False):
     """`daemons:` ブロックのしきい値の検査の 1 か所。整数 (yaml の int) だけ受け入れる。
 
     bool (`yes` / `true` が `int(True)` = 1 秒になる) と文字列 (`"900"`) と小数は拒否する。`positive=True` は 0 以下も拒否
     (無効の意味を持たない欄)。拒否したら None (= 呼び出し側は既定値のまま) を返し、同じ欄・同じ値の WARNING は
-    プロセスごとに 1 回だけ stderr に出す (黙って既定に戻さない。dispatcher は毎サイクル読むので繰り返さない)。
+    プロセスごとに 1 回だけ stderr に出す (黙って既定に戻さない)。dispatcher は 5 秒ごとに新しい python を起動するので
+    プロセスをまたいだ重複抑止は無く、設定が間違っている間は毎サイクル出る (うるさい側。黙るよりよい)。
     欄が無いときは黙って None。"""
     if key not in block:
         return None
     value = block[key]
     if isinstance(value, int) and not isinstance(value, bool) and (not positive or value > 0):
         return value
-    token = (key, repr(value))
-    if token not in _WARNED_CONFIG:
-        _WARNED_CONFIG.add(token)
-        want = "a positive integer" if positive else "an integer"
-        print(f"[lib_daemon_watch] WARNING: daemons.{key}={value!r} is not {want}; using the default",
-              file=sys.stderr)
+    _warn_config_once(key, value, "a positive integer" if positive else "an integer")
     return None
 
 
@@ -1032,7 +1036,11 @@ def load_config(config_path=None, env=None) -> WatchConfig:
         block = loaded["daemons"]
 
     if "mutual_watch" in block:
-        cfg.enabled = bool(block["mutual_watch"])
+        mw = block["mutual_watch"]
+        if isinstance(mw, bool):
+            cfg.enabled = mw
+        else:       # "false" 文字列が bool() で True になるのを防ぐ。拒否 = 既定のまま + WARNING
+            _warn_config_once("mutual_watch", mw, "a boolean")
     for key in _CONFIG_KEYS:
         value = _config_int(block, key)
         if value is not None:
@@ -1057,7 +1065,7 @@ def load_config(config_path=None, env=None) -> WatchConfig:
             try:
                 setattr(cfg, key, int(str(env[var]).strip()))
             except (TypeError, ValueError):
-                pass
+                _warn_config_once(var, env[var], "an integer", source="")
     return cfg
 
 

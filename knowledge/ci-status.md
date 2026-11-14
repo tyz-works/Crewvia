@@ -11,7 +11,7 @@ Worker が PR の CI を待っている間、その進み具合を Director と�
 ## 取得（dispatcher の 1 か所）
 
 - dispatcher のサイクルの `run_ci_poll()`（`dispatch()` の後・成否から独立）→ `lib_ci_status.poll_cycle()`。
-- 対象: active mission の task のうち、`pr_number` を持つものは status 不問（done を含む。`lib_task_status.CI_FOLLOW_PR_STATUSES`。PR が MERGED / CLOSED になれば外れる）、持たないものは `in_progress` / `ready_for_verification` / `verifying`（`lib_ci_status.POLL_STATUSES`）。
+- 対象: active mission の task のうち、`pr_number` を持つものは status 不問（done を含む。`lib_task_status.CI_FOLLOW_PR_STATUSES`。PR が MERGED / NOT_FOUND になれば外れる。CLOSED は 900 秒ごとに取り直す）、持たないものは `in_progress` / `ready_for_verification` / `verifying`（`lib_ci_status.POLL_STATUSES`）。
 - PR の見つけ方: card の `pr_number`。無ければ **Git Policy Resolver**（`lib_git_policy.task_branch`。card の `task_slug` から。式をコピーしない）の branch で
   `gh pr list --head <branch> --state open --json number,isCrossRepository`。**fork から来た同名 branch の PR は数えない**。2 つ以上なら決められない = `unknown`。
   branch に PR が無ければ `no_pr`（表示しない）。`target_dir` の task は gh を target_dir の中で呼ぶ（PR はその repo のもの）。

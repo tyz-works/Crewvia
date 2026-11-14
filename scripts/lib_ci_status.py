@@ -68,7 +68,7 @@ REQUIRED_CHECK = 'ci-ok'
 
 #: 記録の state。`none` = gh は答えたが check が 1 つも無い (CI 未登録)。`no_pr` = PR が見つからない (表示しない)。
 STATES = ('running', 'passed', 'failed', 'unknown', 'none', 'no_pr')
-#: 記録の任意の欄 `pr_state` (gh の PR の state)。MERGED / CLOSED は終端 = 取得の対象から外れる。
+#: 記録の任意の欄 `pr_state` (gh の PR の state)。MERGED / NOT_FOUND は終端 = 取得の対象から外れる。CLOSED は reopen されうるので `CLOSED_RECHECK_SECONDS` ごとに取り直す。
 #: 欄が無い記録 (古い版が書いた) は OPEN 扱いで、次の取得で書き直される。
 #: `NOT_FOUND` は gh が「その番号の PR は無い」と答えた印 (gh の state ではない。#377 P3-2: 別 repo の PR 番号を持つ card が
 #: crewvia の repo に `gh pr view N` を打ち続けない)。終端として扱う (card の `pr_number` が変われば取り直す)。
@@ -703,15 +703,15 @@ def _view(pr, gh, now, repo_args=(), scope=SCOPE_UNCHECKED):
            'summary': summarize(pr, head, checks)}
     if scope is not SCOPE_UNCHECKED:
         rec['scope'] = scope
-    if pr_state is not None:        # 同じ呼び出しで取る (MERGED / CLOSED は poll_cycle が終端として扱う)
+    if pr_state is not None:        # 同じ呼び出しで取る (MERGED は poll_cycle が終端として扱う。CLOSED は低頻度で取り直す)
         rec['pr_state'] = pr_state
     return rec
 
 
 def card_is_watched(task):
     """この task の PR を取得の対象にするか。①`CI_WATCH_STATUSES` (PR が card に無くても branch から解決する) か、
-    ②`pr_number` を持つ task (status 不問 = done を含む。`CI_FOLLOW_PR_STATUSES`)。PR が MERGED / CLOSED になれば
-    記録の `pr_state` で `poll_cycle` が外す (設計 §2.0)。"""
+    ②`pr_number` を持つ task (status 不問 = done を含む。`CI_FOLLOW_PR_STATUSES`)。PR が MERGED / NOT_FOUND になれば
+    記録の `pr_state` で `poll_cycle` が外す (CLOSED は reopen されうるので外さず低頻度で取り直す。設計 §2.0)。"""
     status = task.get('status')
     if status in POLL_STATUSES:
         return True
@@ -719,7 +719,8 @@ def card_is_watched(task):
 
 
 def pr_closed(record, pr_number, scope=SCOPE_UNCHECKED):
-    """card が PR を名指ししていて、その PR の記録が MERGED / CLOSED を言っている (= 取得の対象から外す)。
+    """card が PR を名指ししていて、その PR の記録が MERGED / CLOSED / NOT_FOUND を言っている。
+    CLOSED は `poll_cycle` が終端にせず低頻度で取り直す (MERGED / NOT_FOUND だけ取得の対象から外す)。
 
     `scope` を渡すと、記録の scope が card の今の scope と食い違う記録は終端として扱わない (t013 / PR #388 P1:
     pr_repo を変えて別 repo を指すようになった card が、古い repo の NOT_FOUND / MERGED / CLOSED の記録に
@@ -744,7 +745,7 @@ def poll_cycle(tasks, *, registry_dir, repo_root, branch_of, poll_seconds=DEFAUL
                concluded_seconds=CONCLUDED_POLL_SECONDS):
     """dispatcher の 1 サイクル分。間隔が来た task を古い順に、件数と時間の上限まで観測して書く。
 
-    対象は `card_is_watched`。PR が MERGED / CLOSED と記録された task は外す。上限 `max_tasks` は **PR 単位**で数える
+    対象は `card_is_watched`。PR が MERGED / NOT_FOUND と記録された task は外す (CLOSED は reopen されうるので 900 秒ごとに取り直す)。上限 `max_tasks` は **PR 単位**で数える
     (このサイクルで観測済みの PR を指す task は gh を呼ばないので数えない)。
 
     戻り値: tasks.json の `ci` 欄が変わった task の数 (呼び出し元が 0 でなければ task-graph を作り直す)。
@@ -796,6 +797,10 @@ def poll_cycle(tasks, *, registry_dir, repo_root, branch_of, poll_seconds=DEFAUL
             rec = _unknown(card_pr(t.get('pr_number')), 'internal_error', now, scope=pr_scope(t))
         rec = dict(rec)
         rec.pop('unknown_streak', None)
+        if (rec['state'] == 'unknown' and 'pr_state' not in rec and prev is not None
+                and prev.get('pr_state') == 'CLOSED'
+                and record_matches_card(prev, t.get('pr_number'), scope=rec.get('scope'))):
+            rec['pr_state'] = 'CLOSED'      # gh の失敗で閉じた PR の印を消さない (60 秒ごとの取り直しと ci-unknown の雑音を防ぐ)
         if rec['state'] == 'unknown':       # 連続した回数 (ci-unknown の条件。一過性の失敗で騒がない)
             was = (prev is not None and prev.get('state') == 'unknown'
                    and record_matches_card(prev, t.get('pr_number'), scope=rec.get('scope')))

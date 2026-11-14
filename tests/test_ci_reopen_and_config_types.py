@@ -110,3 +110,47 @@ def test_warning_is_emitted_once_across_repeated_loads(tmp_path, capsys):
     for _ in range(3):
         lib_daemon_watch.load_config(cfg, env={})
     assert capsys.readouterr().err.count("stall_notify_seconds") == 1
+
+
+# ---- t004 レビューの P3 --------------------------------------------------------
+
+def test_gh_failure_keeps_the_closed_mark_and_does_not_raise_ci_unknown(tmp_path):
+    poll(tmp_path, [task()], FakeGh(view=view("CLOSED")))
+    for i in range(1, 5):
+        gh = FakeGh(view=view("CLOSED"), rc=1)
+        poll(tmp_path, [task()], gh, now=NOW + ci.CLOSED_RECHECK_SECONDS * i + 1)
+        r = rec(tmp_path)
+        assert r["state"] == "unknown" and r.get("pr_state") == "CLOSED"
+    # 60 秒後には取り直さない (CLOSED の間隔が保たれる)
+    gh = FakeGh(view=view("CLOSED"))
+    poll(tmp_path, [task()], gh, now=NOW + ci.CLOSED_RECHECK_SECONDS * 4 + 61)
+    assert gh.calls == []
+
+
+@pytest.mark.parametrize("raw", ['"false"', '"true"', "yes", "0"])
+def test_mutual_watch_non_bool_is_rejected_with_warning(tmp_path, capsys, raw):
+    lib_daemon_watch._WARNED_CONFIG.clear()
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text(f"daemons:\n  mutual_watch: {raw}\n")
+    got = lib_daemon_watch.load_config(cfg, env={})
+    # yaml の yes は bool True として通る。文字列と 0 は拒否 → 既定のまま
+    if raw == "yes":
+        assert got.enabled is True
+    else:
+        assert got.enabled == lib_daemon_watch.WatchConfig().enabled
+        assert "daemons.mutual_watch" in capsys.readouterr().err
+
+
+def test_mutual_watch_bool_false_disables(tmp_path):
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text("daemons:\n  mutual_watch: false\n")
+    assert lib_daemon_watch.load_config(cfg, env={}).enabled is False
+
+
+def test_non_numeric_env_is_warned_not_silent(tmp_path, capsys):
+    lib_daemon_watch._WARNED_CONFIG.clear()
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text("daemons: {}\n")
+    got = lib_daemon_watch.load_config(cfg, env={"CREWVIA_DAEMON_FLAP_THRESHOLD": "abc"})
+    assert got.flap_threshold == lib_daemon_watch.WatchConfig().flap_threshold
+    assert "CREWVIA_DAEMON_FLAP_THRESHOLD" in capsys.readouterr().err

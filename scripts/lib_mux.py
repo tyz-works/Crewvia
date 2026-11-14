@@ -552,6 +552,16 @@ class _Backend:
     def state(self, name: str) -> str:
         raise NotImplementedError
 
+    def agent_status(self, name: str) -> Optional[str]:
+        """Claude Code's self-reported state (`working` / `blocked` / `idle`) or None.
+
+        None = "not known" for any reason (backend has no such report, error,
+        unknown value, unreadable, owner mismatch, timeout, window not found).
+        **Never falls back to the screen** — that is the caller's job (IRC's
+        `classify_pane`).  Default: None (tmux / herdr / hc do not report).
+        """
+        return None
+
 
 # ---------------------------------------------------------------------------
 # Pane liveness — is anything actually running in there?
@@ -5108,6 +5118,21 @@ class RexBackend(_Backend):
             return None, "timeout"
         return program_status_state(status, _rex_json(res))
 
+    def agent_status(self, name: str) -> Optional[str]:
+        """`program_status` の写像 (`working` / `blocked` / `idle`)。使えなければ None。
+
+        画面には落とさない (`state()` との違い)。`_program_status` の写像と owner 照合を
+        そのまま使う。例外・timeout・pane_not_found はすべて None。
+        """
+        try:
+            ids = self._resolve(name)
+            if ids is None:
+                return None
+            state, _reason = self._program_status(name, ids["block_id"])
+        except Exception:  # noqa: BLE001 — 読めない = 知らない
+            return None
+        return state if state in ("working", "blocked", "idle") else None
+
     def state(self, name: str) -> str:
         """Agent state: `program_status` (OSC 7501) first, else the screen.
 
@@ -6503,6 +6528,9 @@ class Mux:
 
     def state(self, name: str) -> str:
         return self._backend.state(name)
+
+    def agent_status(self, name: str) -> Optional[str]:
+        return self._backend.agent_status(name)
 
     def verify_sent(self, name: str, text: str) -> bool:
         """Return True if `text` has left the pane's active input line.

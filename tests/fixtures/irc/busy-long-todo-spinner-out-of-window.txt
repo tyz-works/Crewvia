@@ -1,0 +1,42 @@
+● 作業します
+
+✻ Discombobulating… (thought for 5s)
+  ⎿  ☐ todo item 0
+  ⎿  ☐ todo item 1
+  ⎿  ☐ todo item 2
+  ⎿  ☐ todo item 3
+  ⎿  ☐ todo item 4
+  ⎿  ☐ todo item 5
+  ⎿  ☐ todo item 6
+  ⎿  ☐ todo item 7
+  ⎿  ☐ todo item 8
+  ⎿  ☐ todo item 9
+  ⎿  ☐ todo item 10
+  ⎿  ☐ todo item 11
+  ⎿  ☐ todo item 12
+  ⎿  ☐ todo item 13
+  ⎿  ☐ todo item 14
+  ⎿  ☐ todo item 15
+  ⎿  ☐ todo item 16
+  ⎿  ☐ todo item 17
+  ⎿  ☐ todo item 18
+  ⎿  ☐ todo item 19
+  ⎿  ☐ todo item 20
+  ⎿  ☐ todo item 21
+  ⎿  ☐ todo item 22
+  ⎿  ☐ todo item 23
+  ⎿  ☐ todo item 24
+  ⎿  ☐ todo item 25
+  ⎿  ☐ todo item 26
+  ⎿  ☐ todo item 27
+  ⎿  ☐ todo item 28
+  ⎿  ☐ todo item 29
+  ⎿  ☐ todo item 30
+  ⎿  ☐ todo item 31
+  ⎿  ☐ todo item 32
+  ⎿  ☐ todo item 33
+
+────────────────────────────────────────
+❯ 
+────────────────────────────────────────
+  ⏵⏵ auto mode

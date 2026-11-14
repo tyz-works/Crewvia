@@ -784,7 +784,8 @@ def _is_rule(line):
     return len(line) >= 20 and set(line.strip()) == {'─'}
 
 
-# 作業中 (busy) の印。`lib_mux.rex_screen_state` の working は「esc to interrupt」だけを見るが、狭い窓では出ないことがある。
+# 作業中 (busy) の印。`lib_mux.rex_screen_state` (Rule 5 の画面判定) の working も「esc to interrupt」(末尾 8 行) と入力欄の上のスピナー
+# (`lib_mux.spinner_above_input_box`) の両方を見る。IRC 側は末尾 12 行の「esc to interrupt」とそのスピナー判定の組。狭い窓では esc to interrupt が出ないことがある。
 # 実物の busy 画面 (tests/fixtures/irc/busy-screen-sora.txt) は入力欄の上に `✻ Discombobulating… (thought for 5s)` だけが出る。
 # スピナー行 = **字下げなしの行頭 (列 0)** の記号 + 単語 + `…` + (行末 か ` (`)。完了後の行 (`✻ Cooked for 5s`) には `…` が無い。
 # さらに**入力欄の上の罫線から上へ、空行・字下げ行・`⎿` 行を読み飛ばして最初に出る字下げなしの行**がそれのときだけ数える (判定の定義と窓は `lib_mux.spinner_above_input_box` / `SPINNER_WINDOW` の 1 か所) (idle の画面の本文・箇条書きの `* Next steps…` を拾わない)。

@@ -4968,12 +4968,89 @@ def _rex_spawn_lock(repo_root=None, *, timeout: float):
         fh.close()
 
 
+#: `program_status` (Claude Code が OSC 7501 で報告する状態) の読み方。
+#: Rex の block method `com.superlogical.terminal.program_status`。写像は 1 か所:
+#: working→working / blocked→blocked / idle・done→idle。
+#: **error と知らない値は写さず画面判定に落とす** (state None + reason `status_error` /
+#: `status_unknown_value`)。unknown (通知しない側) に倒すと Rule 5 の E 条件 (知らない値は
+#: うるさく) と逆で無音になり、利用枠切れ (error で出る) の handle_usage_limit も Rex で
+#: 走らなくなる (#406 レビュー)。画面なら入力欄 idle は通知・利用枠切れは同定される。
+_PROGRAM_STATUS_MAP = {"working": "working", "blocked": "blocked",
+                       "idle": "idle", "done": "idle"}
+_PROGRAM_STATUS_APP = "claude-code"
+#: 窓ごとに 2 呼び出し (program_status + process)。dispatcher のサイクルを遅くしない短さ。
+_PROGRAM_STATUS_TIMEOUT = 3.0
+
+
+def _is_pos_int(v) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool) and v > 0
+
+
+def program_status_state(status, proc):
+    """`(state, reason)`。Pure。state が None のときは使えない (reason = 理由コード)。
+
+    status = `program_status` の応答 (dict)、proc = `process` の応答 (dict)。
+    採用するのは root record (id 無し) で effective_app (無ければ app) が claude-code の
+    ちょうど 1 件だけ。owner の pid と name が窓の今の前景プロセスと両方一致しなければ
+    古い record として使わない (pid は再利用されるので name も比べる)。
+    updated_at は見ない: idle の Claude Code は報告をし直さない (実測) ので古さで捨てると
+    idle の窓がいつも画面判定に落ちる。
+    """
+    if not isinstance(status, dict):
+        return None, "unreadable"
+    records = status.get("records")
+    if not isinstance(records, list):
+        return None, "bad_shape"
+    mine = []
+    for r in records:
+        if not isinstance(r, dict):
+            return None, "bad_shape"
+        app = r.get("effective_app", r.get("app"))
+        if not isinstance(app, str):
+            if app is None:
+                continue
+            return None, "bad_shape"
+        rid = r.get("id")
+        if rid is not None and not isinstance(rid, str):
+            return None, "bad_shape"
+        if app == _PROGRAM_STATUS_APP and not rid:
+            mine.append(r)
+    if not mine:
+        return None, "no_record"
+    if len(mine) > 1:
+        return None, "ambiguous"
+    rec = mine[0]
+    state = rec.get("state")
+    if not isinstance(state, str) or not state:
+        return None, "bad_shape"
+    owner = rec.get("owner")
+    if not isinstance(owner, dict) or not _is_pos_int(owner.get("pid")) \
+            or not isinstance(owner.get("name"), str) or not owner["name"]:
+        return None, "no_owner"
+    fg = proc.get("foreground") if isinstance(proc, dict) else None
+    if not isinstance(fg, dict) or not _is_pos_int(fg.get("pid")) \
+            or not isinstance(fg.get("name"), str) or not fg["name"]:
+        return None, "no_foreground"
+    if owner["pid"] != fg["pid"] or owner["name"] != fg["name"]:
+        return None, "owner_mismatch"
+    if state == "error":
+        return None, "status_error"
+    mapped = _PROGRAM_STATUS_MAP.get(state)
+    if mapped is None:
+        return None, "status_unknown_value"
+    return mapped, "ok"
+
+
+_PROGRAM_STATUS_LOGGED = set()
+
+
 class RexBackend(_Backend):
     """Rex backend — see knowledge/rex-mux-backend.md.
 
     session `CREWVIA_REX_SESSION` (default `crewvia`) holds one window per
     name; the **block id in the spawn record** is the identity, the label is a
-    cross-check.  State (`state()`) is always `unknown`.
+    cross-check.  `state()` reads Claude Code's `program_status` first and falls
+    back to the screen (`rex_screen_state`).
     """
 
     BACKEND_NAME = "rex"
@@ -5016,19 +5093,49 @@ class RexBackend(_Backend):
     def server_running(self) -> bool:
         return _rex_status() is not None
 
-    def state(self, name: str) -> str:
-        """Agent state read from the screen (Rex has no agent-status API).
+    def _program_status(self, name: str, block_id: str):
+        """`(state, reason)` from `program_status`; state None = use the screen."""
+        res = _rex_run(["block", "call", "program_status", "{}", "-b", block_id],
+                       timeout=_PROGRAM_STATUS_TIMEOUT)
+        if res is not None and res.timed_out:
+            return None, "timeout"
+        status = _rex_json(res)
+        if status is None:
+            return None, "unavailable"
+        res = _rex_run(["block", "call", "process", "{}", "-b", block_id],
+                       timeout=_PROGRAM_STATUS_TIMEOUT)
+        if res is not None and res.timed_out:
+            return None, "timeout"
+        return program_status_state(status, _rex_json(res))
 
-        PR-2 (design doc §10.2-4): Rule 5 in dispatcher.sh is the only reader
-        of `state()` and it fails safe on `unknown`, but that would leave a
-        Worker stuck on an approval dialog, or idle with a task, undetected on
-        Rex.  So the answer is derived from `capture` by the pure function
-        `rex_screen_state()`, which only says `blocked` / `working` / `idle`
-        for shapes it recognises and `unknown` for everything else (an empty
-        capture included: "could not read" is not "idle").
+    def state(self, name: str) -> str:
+        """Agent state: `program_status` (OSC 7501) first, else the screen.
+
+        Rule 5 in dispatcher.sh is the only reader (the watchdog never calls
+        it).  `program_status_state` maps the Claude Code record; when there is
+        no usable record (empty / unreadable / timeout / wrong shape / owner
+        does not match the foreground process) the answer comes from `capture`
+        via `rex_screen_state()`.  The fallback is logged once per reason per
+        process.  A window's own program can write OSC 7501, so an agent can
+        claim `working` falsely; the Worker is inside the trust boundary and
+        the watchdog max is the last net.
         """
-        screen = self.capture(name)
-        return rex_screen_state(screen)
+        ids = self._resolve(name)
+        if ids is None:
+            state, reason = None, "pane_not_found"
+        else:
+            state, reason = self._program_status(name, ids["block_id"])
+        if state is not None:
+            return state
+        if reason not in _PROGRAM_STATUS_LOGGED:
+            _PROGRAM_STATUS_LOGGED.add(reason)
+            self._warn(f"state({name!r}): program_status not used ({reason}); "
+                       f"reading the screen instead")
+        if ids is None:
+            return rex_screen_state(self.capture(name))
+        # 解決済みの block id をそのまま使う (capture(name) は _resolve をやり直す)
+        self._guard("capture", name)
+        return rex_screen_state(self._capture_block(ids["block_id"]))
 
     # -- ids ---------------------------------------------------------------
 

@@ -128,11 +128,15 @@ Shell commands are not available. Do not create, modify or delete any file. Retu
     # 本番 (kai-review.sh run_agy_review) と同じ --settings: headless の agy は --add-dir だけでは read_file が
     # 自動拒否されるので、読める範囲を read_file の allow-rule で明示する (command は許さない)。
     local agy_settings
-    agy_settings="$(DD="$DD" R="$R" python3 -c '
+    # allow は kai-review.sh と同じ 3 本 (diff dir / worktree / worktree の gitdir。すべて /**。経緯: knowledge/agy-review.md)
+    local review_gitdir
+    review_gitdir="$(git -C "$R" rev-parse --absolute-git-dir 2>/dev/null)" && [[ "$review_gitdir" == /* ]] || return 97
+    agy_settings="$(DD="$DD" R="$R" GD="$review_gitdir" python3 -c '
 import json, os
 print(json.dumps({"permissions": {"allow": [
-    "read_file(%s/*)" % os.environ["DD"],
+    "read_file(%s/**)" % os.environ["DD"],
     "read_file(%s/**)" % os.environ["R"],
+    "read_file(%s/**)" % os.environ["GD"],
 ]}}))')" || return 97
     ( cd "$R" && agy --mode plan --model gemini-3.8-flash-high --output-format json --json-schema "$KIT/schema.json" \
         --add-dir "$DD" --print-timeout 600s --settings "$agy_settings" -p "$prompt$extra" ) > "$out/$label.agy.raw" 2> "$out/$label.agy.err"

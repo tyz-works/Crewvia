@@ -22,7 +22,7 @@ needs-director / done の報告）は codex と共通。設定の読み口は `s
 ```
 cd $REVIEW_WT && agy --mode plan --model <agy_model> --output-format json \
     --json-schema config/kai-review-findings.schema.json --add-dir <diff の dir> --print-timeout <N>s \
-    --settings '{"permissions":{"allow":["read_file(<diff の dir>/*)","read_file(<REVIEW_WT>/**)"]}}' -p "<prompt>"
+    --settings '{"permissions":{"allow":["read_file(<diff の dir>/**)","read_file(<REVIEW_WT>/**)","read_file(<REVIEW_WT の gitdir>/**)"]}}' -p "<prompt>"
 ```
 
 - サブスクのログインのまま。API キーは使わない。**`--dangerously-skip-permissions` は使わない**。
@@ -52,21 +52,55 @@ cd $REVIEW_WT && agy --mode plan --model <agy_model> --output-format json \
 `--mode plan` でも、agy は計画のメモを `~/.gemini/antigravity-cli/brain/<id>/` に置く（worktree には書かない）。レビューのたびに溜まるので、
 増えすぎたら人が掃除する（crewvia は消さない）。1 run で +1 dir。
 
-## 既知: `--settings` があっても `read_file` が拒否される run がある（2026-11-07 QA・原因調査中）
+## `--settings` があっても `read_file` が拒否される run があった（2026-11-14 に原因を特定・修正）
 
-mission 20261107-agy-review-followups の QA t002（agy 1.4.12・`gemini-3.8-flash-high`・PR #348 の `--settings` 付き・diff はファイル渡し）:
+**原因: モデルが allow の外のパスを読もうとしていた。** allow-rule の書き方（`/*` と `/**` の違い・worktree の `.git` の指す先）の問題で、agy の不具合ではない。
 
-| diff | `--settings` | 結果 |
+### 再現と切り分け（2026-11-14・`gemini-3.8-flash-high`・合計 10 run・版は 1.5.3 が 2 run / 1.5.9 が 8 run）
+
+**版について:** agy は 2026-11-14 18:23:39 に 1.5.3 → 1.5.9 へ自動更新された（`ls -l --time-style=full-iso ~/.local/bin/agy`・log の `Language server version`）。1.5.3 で走ったのは最初の 2 run（旧 allow・簡略 prompt）だけで、どちらも成功。拒否の run も新 allow の 4 run も **1.5.9**。つまり「1.5.3 で拒否が再現した」ではなく、**1.5.3 では再現せず、1.5.9 の旧 allow・本番 prompt で 1 回拒否が出た**。
+
+| 条件 | diff | 結果 |
 |---|---|---|
-| #317（0.8KB）×2 | あり | 2/2 成功 |
-| #340（5.6KB）×2 | あり | 2/2 `read_file` 拒否（`structured_output` null） |
-| #340（5.6KB）×1 | なし | 拒否（#322 当時の症状） |
-| #347（10KB）×1 | あり | 成功・595 秒（timeout 600 秒すれすれ） |
+| 旧 allow（`<diff dir>/*` + `<wt>/**`）・簡略 prompt | #340 ×2 / #317 ×2 | 4/4 成功 |
+| 旧 allow・本番の REVIEW_PROMPT（kai-review.sh と同じ文面） | #340 ×1 | 成功 |
+| 旧 allow・本番の REVIEW_PROMPT | #317 ×1 | **拒否**（`denied_actions` に `read_file`・`structured_output` null） |
+| 新 allow（3 本とも `/**`）・本番の REVIEW_PROMPT | #340 ×2 / #317 ×2 | 4/4 成功 |
 
-- 拒否は diff の中身に依存して出るように見える（#340 では毎回・#317 では 0 回）。#340 が触るファイルは全部 review worktree にあるので、拒否されたのは allow の外のパス（worktree 外・symlink 先・相対パスの解決違い）と推測するが未確認。
-- **拒否されたパスは agy の出力に出ない**（`denied_actions` は `{"action":"read_file","display_name":"ReadFile"}` だけ・stderr は「allow-rule を足せ」の汎用文）。下の診断の `denied: … path=…` も空になりうる。特定には agy 側のログか、allow を一時的に広げた切り分けが要る（読み取りだけ・`command` は許さない）。
-- **「再実行で通る」とは限らない**（同じ diff で 2 回とも拒否）。fail-closed なので安全側（`denied_actions` → `needs-director`、`compare` なら判定に影響しない）だが、**agy を `engine` にすると誤爆する**。昇格は原因を潰してから。
-- 再発したら needs-director の Result 末尾の `### agy diagnostics (redacted)` を見る（失敗のときだけ入る。`AGY_ERROR line:`＝stderr の API エラー、`stdout status:`、`denied: action=… path=…`、`stderr tail:`＝末尾 8 行。lib_checkpoint の伏せ字を通し、全体 2000 字・各行 300 字で切る。伏せ字が失敗したら中身は出ない。`both` では Result の agy 比較の節に同じ内容が付く）。
+- **拒否は確率的**（同じ形で成功も拒否も出る）。簡略 prompt では 0/4、本番 prompt では #317 で 1/2。「diff の中身に依存」ではなく、**モデルがたまたま allow の外を読みに行くか**で決まる。前回の「#340 は毎回拒否・#317 は 0 回」は標本が小さかった。
+- 版ごとの実測: 1.4.12（11-07 の QA）で #340 が 2/2 拒否、1.4.10（10-29）で 3/4 拒否、1.5.9 の旧 allow・本番 prompt で #317 が 1/2 拒否。拒否は版をまたいで出ており、特定の版の不具合とは言えない（1.5.3 は 2 run だけで標本が小さすぎ、判断できない）。
+- 新 allow の 4/4 成功は、拒否率が 1/2 より十分低いことの示唆であって、ゼロの証明ではない（標本 4）。
+
+### 拒否されたパスの特定
+
+拒否された run（会話記録 dc2a8916・1.5.9）と、拒否で終わらなかった別の run（2b5f2ccd）の会話記録（`~/.gemini/antigravity-cli/conversations/<id>.db` を `strings` して `Path` の行だけ抽出。認証情報のファイルは開いていない）に、allow の外のパスへの `read_file` が 2 種類見つかった:
+
+| 読みに行ったパス | 旧 allow で外れる理由 |
+|---|---|
+| `<diff dir>/scripts/plan.sh`（diff に出てくる相対パスを diff dir 基準で解決した。**拒否の run dc2a8916 で見つかったのはこれだけ**） | `<diff dir>/*` は直下 1 階層だけ。2 階層目は外 |
+| `<主 repo>/.git/worktrees/<wt 名>/HEAD`（**別の run 2b5f2ccd** で読みに行っていた。この run は拒否で終わっていない） | review worktree の `.git` は `gitdir: <主 repo>/.git/worktrees/<名>` を指すファイル。worktree の外 |
+
+log（`~/.gemini/antigravity-cli/log/cli-*.log`）には `soft-denying tool confirmation "ReadFile" at step N` としか出ず、パスは出ない。会話記録で見るしかない。
+**拒否の直接の原因として裏付けがあるのは diff dir の 2 階層目だけ**（dc2a8916 の会話記録に `.git/worktrees/` の文字列は 1 回も無い）。gitdir の allow は、別の run が読みに行っていたことへの**予防**として足した（read-only・その worktree の分だけで範囲は狭い）。2b5f2ccd が旧 allow で gitdir の HEAD を読みに行ったのに拒否されなかった理由は**不明**（log にパスは出ず、旧 allow の run だったというのも会話記録に新 allow の文字列が無いことからの推定）。
+
+### 直し（kai-review.sh の `run_agy_review`・bench/review-bench/run.sh も同じ）
+
+allow は 3 本、すべて `/**`、**読み取り（`read_file`）だけ**:
+
+```
+read_file(<AGY_DIFF_DIR>/**)
+read_file(<REVIEW_WT>/**)
+read_file(<REVIEW_WT の gitdir（git rev-parse --absolute-git-dir）>/**)
+```
+
+- `command` は許さない・`--dangerously-skip-permissions` は使わない（read-only review の前提は同じ）。
+- gitdir は **その worktree の分だけ**（主 repo の `.git` 全体は許さない）。`rev-parse` が失敗したら `settings_build_failed` で fail-closed。
+- テスト: `tests/test_kai_review_engine_agy.py` が 3 本・すべて `/**`・gitdir が `worktrees/` を含むことを検査する。
+
+### 診断のコツ
+
+- `denied_actions` にパスは出ない。再発したら Result 末尾の `### agy diagnostics (redacted)` の `denied:` が空でも、**会話記録を `strings` して `"Path":"…"` を見る**と、読みに行ったパスが分かる。
+- allow に無いパスを読もうとするのはモデルの癖（diff の相対パスを別の基準で解決する等）で、版が変わっても出うる。新しい種類のパスが出たら、allow を `**` に広げるのではなく、そのパスだけ足す。
 
 ### 当時の記録（t082 / t084・`--settings` を足す前）
 

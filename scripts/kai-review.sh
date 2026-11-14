@@ -663,12 +663,21 @@ Return only the JSON object required by the schema."
   # だから読んでよい範囲を allow-rule で明示する。許す tool は read_file だけ:
   # command を許すと「コマンドを実行しない read-only review」という前提が崩れる
   # (--dangerously-skip-permissions も同じ理由で使わない)。
-  local agy_settings
-  agy_settings="$(AGY_DIFF_DIR="$AGY_DIFF_DIR" REVIEW_WT="$REVIEW_WT" python3 -c '
+  # allow の形 (2026-11-14 実測・agy 1.5.9。1.5.3 は 2 run だけで再現せず): 拒否の run は allow の外を読もうとしていた。
+  #  - diff dir は `/*` だと直下 1 階層だけ。モデルが diff dir の下の `scripts/plan.sh` (2 階層) を読みに行って拒否された (拒否の直接の原因) → `/**`
+  #  - review worktree は `.git` が「gitdir: <主 repo>/.git/worktrees/<名>」を指すファイルで、別の run ではモデルが
+  #    その HEAD を読みに行っていた (worktree の外。その run は拒否されず、理由は不明)。予防として
+  #    その gitdir だけ `/**` で足す (主 repo 全体は許さない)
+  # どちらも読み取りだけ (command は許さない・read-only review の前提は変わらない)。knowledge/agy-review.md
+  local agy_settings review_gitdir
+  review_gitdir="$(git -C "$REVIEW_WT" rev-parse --absolute-git-dir 2>/dev/null)" \
+    && [[ "$review_gitdir" == /* ]] || { AGY_FAIL="settings_build_failed"; return 1; }
+  agy_settings="$(AGY_DIFF_DIR="$AGY_DIFF_DIR" REVIEW_WT="$REVIEW_WT" REVIEW_GITDIR="$review_gitdir" python3 -c '
 import json, os
 print(json.dumps({"permissions": {"allow": [
-    "read_file(%s/*)" % os.environ["AGY_DIFF_DIR"],
+    "read_file(%s/**)" % os.environ["AGY_DIFF_DIR"],
     "read_file(%s/**)" % os.environ["REVIEW_WT"],
+    "read_file(%s/**)" % os.environ["REVIEW_GITDIR"],
 ]}}))')" || { AGY_FAIL="settings_build_failed"; return 1; }
   _info "Running agy --mode plan --model ${AGY_MODEL} (diff=${DIFF_BYTES} bytes, timeout=${AGY_TIMEOUT}s) ..."
   ( cd "$REVIEW_WT" && agy --mode plan --model "$AGY_MODEL" --output-format json \

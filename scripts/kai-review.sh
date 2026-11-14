@@ -663,10 +663,11 @@ Return only the JSON object required by the schema."
   # だから読んでよい範囲を allow-rule で明示する。許す tool は read_file だけ:
   # command を許すと「コマンドを実行しない read-only review」という前提が崩れる
   # (--dangerously-skip-permissions も同じ理由で使わない)。
-  # allow の形 (2026-11-14 実測・agy 1.5.3): 拒否されたのは allow の外を読もうとした run だった。
-  #  - diff dir は `/*` だと直下 1 階層だけ。モデルが diff dir の下の `scripts/plan.sh` (2 階層) を読みに行って拒否された → `/**`
-  #  - review worktree は `.git` が「gitdir: <主 repo>/.git/worktrees/<名>」を指すファイルで、モデルが
-  #    その HEAD を読みに行く。worktree の外なので拒否された → その gitdir だけ `/**` で足す (主 repo 全体は許さない)
+  # allow の形 (2026-11-14 実測・agy 1.5.9。1.5.3 は 2 run だけで再現せず): 拒否の run は allow の外を読もうとしていた。
+  #  - diff dir は `/*` だと直下 1 階層だけ。モデルが diff dir の下の `scripts/plan.sh` (2 階層) を読みに行って拒否された (拒否の直接の原因) → `/**`
+  #  - review worktree は `.git` が「gitdir: <主 repo>/.git/worktrees/<名>」を指すファイルで、別の run ではモデルが
+  #    その HEAD を読みに行っていた (worktree の外。その run は拒否されず、理由は不明)。予防として
+  #    その gitdir だけ `/**` で足す (主 repo 全体は許さない)
   # どちらも読み取りだけ (command は許さない・read-only review の前提は変わらない)。knowledge/agy-review.md
   local agy_settings review_gitdir
   review_gitdir="$(git -C "$REVIEW_WT" rev-parse --absolute-git-dir 2>/dev/null)" \

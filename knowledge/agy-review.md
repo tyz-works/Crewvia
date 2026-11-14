@@ -56,7 +56,9 @@ cd $REVIEW_WT && agy --mode plan --model <agy_model> --output-format json \
 
 **原因: モデルが allow の外のパスを読もうとしていた。** allow-rule の書き方（`/*` と `/**` の違い・worktree の `.git` の指す先）の問題で、agy の不具合ではない。
 
-### 1.5.3 での再現と切り分け（2026-11-14・`gemini-3.8-flash-high`・合計 10 run）
+### 再現と切り分け（2026-11-14・`gemini-3.8-flash-high`・合計 10 run・版は 1.5.3 が 2 run / 1.5.9 が 8 run）
+
+**版について:** agy は 2026-11-14 18:23:39 に 1.5.3 → 1.5.9 へ自動更新された（`ls -l --time-style=full-iso ~/.local/bin/agy`・log の `Language server version`）。1.5.3 で走ったのは最初の 2 run（旧 allow・簡略 prompt）だけで、どちらも成功。拒否の run も新 allow の 4 run も **1.5.9**。つまり「1.5.3 で拒否が再現した」ではなく、**1.5.3 では再現せず、1.5.9 の旧 allow・本番 prompt で 1 回拒否が出た**。
 
 | 条件 | diff | 結果 |
 |---|---|---|
@@ -66,20 +68,20 @@ cd $REVIEW_WT && agy --mode plan --model <agy_model> --output-format json \
 | 新 allow（3 本とも `/**`）・本番の REVIEW_PROMPT | #340 ×2 / #317 ×2 | 4/4 成功 |
 
 - **拒否は確率的**（同じ形で成功も拒否も出る）。簡略 prompt では 0/4、本番 prompt では #317 で 1/2。「diff の中身に依存」ではなく、**モデルがたまたま allow の外を読みに行くか**で決まる。前回の「#340 は毎回拒否・#317 は 0 回」は標本が小さかった。
-- 1.4.12 のときと違い、1.5.3 の旧 allow でも拒否は起きる（版は無関係）。
+- 版ごとの実測: 1.4.12（11-07 の QA）で #340 が 2/2 拒否、1.4.10（10-29）で 3/4 拒否、1.5.9 の旧 allow・本番 prompt で #317 が 1/2 拒否。拒否は版をまたいで出ており、特定の版の不具合とは言えない（1.5.3 は 2 run だけで標本が小さすぎ、判断できない）。
 - 新 allow の 4/4 成功は、拒否率が 1/2 より十分低いことの示唆であって、ゼロの証明ではない（標本 4）。
 
 ### 拒否されたパスの特定
 
-拒否された run の会話記録（`~/.gemini/antigravity-cli/conversations/<id>.db` を `strings` して `Path` の行だけ抽出。認証情報のファイルは開いていない）に、allow の外のパスへの `read_file` が 2 種類あった:
+拒否された run（会話記録 dc2a8916・1.5.9）と、拒否で終わらなかった別の run（2b5f2ccd）の会話記録（`~/.gemini/antigravity-cli/conversations/<id>.db` を `strings` して `Path` の行だけ抽出。認証情報のファイルは開いていない）に、allow の外のパスへの `read_file` が 2 種類見つかった:
 
 | 読みに行ったパス | 旧 allow で外れる理由 |
 |---|---|
-| `<diff dir>/scripts/plan.sh`（diff に出てくる相対パスを diff dir 基準で解決した） | `<diff dir>/*` は直下 1 階層だけ。2 階層目は外 |
-| `<主 repo>/.git/worktrees/<wt 名>/HEAD` | review worktree の `.git` は `gitdir: <主 repo>/.git/worktrees/<名>` を指すファイル。worktree の外 |
+| `<diff dir>/scripts/plan.sh`（diff に出てくる相対パスを diff dir 基準で解決した。**拒否の run dc2a8916 で見つかったのはこれだけ**） | `<diff dir>/*` は直下 1 階層だけ。2 階層目は外 |
+| `<主 repo>/.git/worktrees/<wt 名>/HEAD`（**別の run 2b5f2ccd** で読みに行っていた。この run は拒否で終わっていない） | review worktree の `.git` は `gitdir: <主 repo>/.git/worktrees/<名>` を指すファイル。worktree の外 |
 
 log（`~/.gemini/antigravity-cli/log/cli-*.log`）には `soft-denying tool confirmation "ReadFile" at step N` としか出ず、パスは出ない。会話記録で見るしかない。
-どちらが拒否の直接の原因かは 1 run では分けていない（両方を塞いだ）。
+**拒否の直接の原因として裏付けがあるのは diff dir の 2 階層目だけ**（dc2a8916 の会話記録に `.git/worktrees/` の文字列は 1 回も無い）。gitdir の allow は、別の run が読みに行っていたことへの**予防**として足した（read-only・その worktree の分だけで範囲は狭い）。2b5f2ccd が旧 allow で gitdir の HEAD を読みに行ったのに拒否されなかった理由は**不明**（log にパスは出ず、旧 allow の run だったというのも会話記録に新 allow の文字列が無いことからの推定）。
 
 ### 直し（kai-review.sh の `run_agy_review`・bench/review-bench/run.sh も同じ）
 

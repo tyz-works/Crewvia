@@ -186,10 +186,9 @@ def test_agy_clean_review_is_done_and_uses_plan_mode_without_skip_permissions(tm
     allow = settings["permissions"]["allow"]
     assert set(settings) == {"permissions"} and set(settings["permissions"]) == {"allow"}
     assert len(allow) == 3 and all(a.startswith("read_file(") and a.endswith("/**)") for a in allow)
-    # 1.5.3 の実測: diff dir の下の 2 階層目 (/*) と worktree の gitdir (worktree の外) を読みに行って拒否された
+    # 実測 (1.5.9): diff dir の下の 2 階層目 (/*) を読みに行って拒否された。worktree の gitdir (worktree の外) は予防
     assert "kai-review-agy." in allow[0] and "kai-review-wt." in allow[1]
     assert "/worktrees/" in allow[2] and "kai-review-wt." in allow[2]
-    assert not any(a.endswith("/*)") and not a.endswith("/**)") for a in allow)
     assert not any("command" in a for a in allow)
     assert "### agy raw output" in _result(capture, "done")
     assert not list(tmp_path.glob("kai-review-agy*"))

@@ -32,7 +32,7 @@
 現状の取得対象（`CI_WATCH_STATUSES`）のままでは、実装 Worker が push 後すぐ done し、review も CI と並行して done すると、その PR の task はどれも done になり**誰も CI を取得しなくなる**。`ci-failed` も `ci-green` / `merge-ready` も `ci-unknown` も出ず、門の条件 4（`observed_at` が 10 分以内）は done の後に引くと必ず `stale` になる（fail-closed の向きには倒れるが、「Worker は待たず、知らせは dispatcher が出す」という設計の要が黙って欠ける）。したがって**見る対象を設計に入れる**。
 
 - **対象の定義**: `pr_number` を持ち、PR が **open で未 merge** の task（status は問わない。done を含む）。`lib_task_status` に `CI_WATCH_STATUSES` とは**別の集合**（例: `CI_FOLLOW_PR_STATES`）として 1 か所に定義する。`CI_WATCH_STATUSES` は他の読み手（`codex_reviews_awaiting_pr` など）と共有の定義なので変えない。PR 番号ごとの重複は `by_pr` で既に畳まれる（同じ PR を指す task が何本あっても 1 回）。
-- **やめる条件**: 取得のたびに PR の `state` / `mergedAt` を同じ `gh` 呼び出しで取り、`MERGED` / `CLOSED` なら記録に終端を書いて対象から外す。task が終端（mission の後始末で queue から消える）になった場合も外れる。`pr_number` を持たない task は対象外。
+- **やめる条件**: 取得のたびに PR の `state` / `mergedAt` を同じ `gh` 呼び出しで取り、`MERGED` なら記録に終端を書いて対象から外す（`CLOSED` は reopen されうるので 900 秒ごとに取り直す。t003 / 11-14）。task が終端（mission の後始末で queue から消える）になった場合も外れる。`pr_number` を持たない task は対象外。
 - **負荷**: 既存の上限（`MAX_TASKS_PER_CYCLE=4`・サイクル予算・60 秒間隔）は**PR 単位**で数え直す。open な PR は同時に数本なので、done の task が増え続けても対象は増えない（merged / closed で外れるため）。上限を超える場合は `observed_at` の古い順に回す。結論が出た PR（passed / failed で head が変わらない）は取得の間隔を延ばす（既定 5 分）。head が変わったら 60 秒に戻す。
 - **置き場所**: PR-C に含める（通知より先に対象を直す。対象だけ直す PR を B と C の間に置いてもよいが、挙動が変わるのは通知が入るときなので 1 本にまとめる）。表示用の読み口（status / tasks.json）には、done の task の CI 行が出るようになるだけで、判定には使わない（§2.3）。
 

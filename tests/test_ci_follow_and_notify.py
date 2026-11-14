@@ -63,13 +63,22 @@ def test_done_task_without_a_pr_number_is_not_followed(tmp_path):
     assert gh.calls == []
 
 
-@pytest.mark.parametrize("pr_state", ["MERGED", "CLOSED"])
-def test_merged_or_closed_pr_is_recorded_as_terminal_and_not_polled_again(tmp_path, pr_state):
-    gh = FakeGh(view=view_state(GREEN, pr_state))
+def test_merged_pr_is_recorded_as_terminal_and_not_polled_again(tmp_path):
+    gh = FakeGh(view=view_state(GREEN, "MERGED"))
     poll(tmp_path, [task(status="done", pr=313)], gh)
-    assert rec(tmp_path)["pr_state"] == pr_state
+    assert rec(tmp_path)["pr_state"] == "MERGED"
     poll(tmp_path, [task(status="done", pr=313)], gh, now=NOW + 10_000)
-    assert len(gh.calls) == 1, "終端の PR は間隔が過ぎても取りに行かない"
+    assert len(gh.calls) == 1, "MERGED は間隔が過ぎても取りに行かない"
+
+
+def test_closed_pr_is_recorded_and_rechecked_only_after_the_closed_interval(tmp_path):
+    gh = FakeGh(view=view_state(GREEN, "CLOSED"))
+    poll(tmp_path, [task(status="done", pr=313)], gh)
+    assert rec(tmp_path)["pr_state"] == "CLOSED"
+    poll(tmp_path, [task(status="done", pr=313)], gh, now=NOW + 899)
+    assert len(gh.calls) == 1, "CLOSED は 900 秒未満では取りに行かない"
+    poll(tmp_path, [task(status="done", pr=313)], gh, now=NOW + 901)
+    assert len(gh.calls) == 2, "CLOSED は 900 秒を過ぎたら取り直す (reopen されうる)"
 
 
 def test_terminal_record_does_not_hide_a_new_pr_on_the_card(tmp_path):

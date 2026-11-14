@@ -180,13 +180,16 @@ def test_agy_clean_review_is_done_and_uses_plan_mode_without_skip_permissions(tm
     assert "-p" not in argv[pi + 1:] and not any(a.startswith("--") and a in ("--mode", "--model") for a in argv[pi + 1:])
     assert "review.diff" in "\n".join(argv[pi + 1:])               # prompt が diff のファイルを指す
     assert argv.index("--add-dir") < pi                            # -p は最後の option (prompt が続く)
-    # --settings: read_file の allow-rule 2 本 (diff dir と review worktree) だけ・command は許さない
+    # --settings: read_file の allow-rule 3 本 (diff dir・review worktree・その gitdir。すべて /**) だけ・command は許さない
     assert argv.index("--settings") < pi
     settings = json.loads(argv[argv.index("--settings") + 1])
     allow = settings["permissions"]["allow"]
     assert set(settings) == {"permissions"} and set(settings["permissions"]) == {"allow"}
-    assert len(allow) == 2 and all(a.startswith("read_file(") and a.endswith(")") for a in allow)
-    assert allow[0].endswith("/*)") and allow[1].endswith("/**)")
+    assert len(allow) == 3 and all(a.startswith("read_file(") and a.endswith("/**)") for a in allow)
+    # 1.5.3 の実測: diff dir の下の 2 階層目 (/*) と worktree の gitdir (worktree の外) を読みに行って拒否された
+    assert "kai-review-agy." in allow[0] and "kai-review-wt." in allow[1]
+    assert "/worktrees/" in allow[2] and "kai-review-wt." in allow[2]
+    assert not any(a.endswith("/*)") and not a.endswith("/**)") for a in allow)
     assert not any("command" in a for a in allow)
     assert "### agy raw output" in _result(capture, "done")
     assert not list(tmp_path.glob("kai-review-agy*"))

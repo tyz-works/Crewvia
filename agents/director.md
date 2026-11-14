@@ -1035,7 +1035,7 @@ scripts/sync-main-checkout.sh
   **通ってしまう** — B の CI も承認も門を通っていないのに。門が通した A を指していれば、
   PR が B に動いた時点で GitHub が merge を弾く（fail-closed）
 
-- `ci-gate` が通さないときは merge しない。理由は固定語: `running`（CI 実行中。待つ）/ `failed`（修正 task）/ `unknown:<理由>`（gh を確認）/ `none` / `no_required_check` / `head_mismatch`（push 後の古い記録。次のサイクルを待つ）/ `stale`（記録が古い。再度引く）、承認側は `no_approval` / `approved_head_mismatch`
+- `ci-gate` が通さないときは merge しない。理由は固定語: `running`（CI 実行中。待つ）/ `failed`（修正 task）/ `unknown:<理由>`（gh を確認）/ `none` / `no_required_check`（必須 check が記録に無い / 緑でない）/ `no_required_check_config`（crewvia 以外の repo の必須 check が未設定。主 checkout の `config/crewvia.local.yaml` の `ci.required_checks` に repo と check 名を足し、`python3 scripts/lib_daemon_watch.py restart dispatcher`。足すまで門は通らない）/ `unknown:config_invalid` / `unknown:config_unreadable` / `unknown:repo_unresolved`（config か origin を直す）/ `head_mismatch`（push 後の古い記録。次のサイクルを待つ）/ `stale`（記録が古い。再度引く）、承認側は `no_approval` / `approved_head_mismatch`
 - 承認 head は review 系 task（review / codex-review / qa）の最後の Result の末尾行 `approved_head: <sha>`。review の後に修正が push されたら承認は無効（`approved_head_mismatch`）— **Director が自分で直したものも merge 前に review に回す**
 - **「要修正」の review は done でも承認ではない**（`approved_head:` 行が無い → `no_approval`）。所見を読んで修正 task を足す
 - **承認が無いまま merge する場合**（手順 3 で止まったとき）: `ci-gate` は CI の緑しか見ないので

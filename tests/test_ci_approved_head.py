@@ -90,7 +90,7 @@ def test_a_bad_current_head_is_never_approved():
 def test_gate_verdict_still_ignores_approval():
     """gate_verdict は CI の緑だけを見る関数のまま (承認の語を受け取らない)。"""
     import inspect
-    assert list(inspect.signature(ci.gate_verdict).parameters) == ["record", "pr_head", "now", "max_age"]
+    assert list(inspect.signature(ci.gate_verdict).parameters) == ["record", "pr_head", "now", "scope", "config", "max_age"]
 
 
 # ---------------------------------------------------------------------------

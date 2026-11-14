@@ -24,6 +24,14 @@ def _allow_stub_gh(monkeypatch):
     monkeypatch.setenv("CREWVIA_CI_ALLOW_GH_IN_TESTS", "1")
 
 
+@pytest.fixture(autouse=True)
+def _irc_relay_required_checks(monkeypatch):
+    """他 repo の門は config の `ci.required_checks` に載った repo だけが通る (t001 / 20261114)。このファイルの別 repo は irc-relay。"""
+    import lib_config
+    cfg = {"ci": {"required_checks": {"tyz-works/irc-relay": ["pytest", "ci-ok"]}}}
+    monkeypatch.setattr(lib_config, "load_effective", lambda *a, **k: cfg)
+
+
 def t_repo(id_="t001", pr=5, repo="tyz-works/irc-relay", **kw):
     d = task(id_=id_, pr=pr, **kw)
     d["pr_repo"] = repo

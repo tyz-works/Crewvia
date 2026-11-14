@@ -16,3 +16,7 @@
 
 # irc:
 #   enabled: false
+
+# ci:
+#   required_checks:               # crewvia 本体以外の repo の PR の門 (plan.sh ci-gate / merge-ready) が要求する check
+#     "owner/name": [test-ubuntu, test-windows]   # repo 名は大文字小文字を区別しない。載っていない repo は通らない

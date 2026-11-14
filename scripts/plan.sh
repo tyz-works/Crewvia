@@ -3664,7 +3664,7 @@ def cmd_ci_gate(args):
         deny('unknown:no_record')
     head, err = _CI_STATUS.fetch_pr_head(pr_number, cwd=effective_target or REPO_ROOT,
                                          repo_args=_CI_STATUS.scope_repo_args(gate_probe))
-    ok, reason = _CI_STATUS.gate_verdict(newest, pr_head=head if err is None else None, now=time.time())
+    ok, reason = _CI_STATUS.gate_verdict(newest, pr_head=head if err is None else None, now=time.time(), scope=gate_scope)
     if err is not None and not ok:
         reason = f'unknown:{err}'
     if not ok:

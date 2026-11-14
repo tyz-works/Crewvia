@@ -790,6 +790,10 @@ def _is_rule(line):
 # スピナー行 = **字下げなしの行頭 (列 0)** の記号 + 単語 + `…` + (行末 か ` (`)。完了後の行 (`✻ Cooked for 5s`) には `…` が無い。
 # さらに**入力欄の上の罫線から上へ、空行・字下げ行・`⎿` 行を読み飛ばして最初に出る字下げなしの行**がそれのときだけ数える (判定の定義と窓は `lib_mux.spinner_above_input_box` / `SPINNER_WINDOW` の 1 か所) (idle の画面の本文・箇条書きの `* Next steps…` を拾わない)。
 # 記号 (`·` `*` を含む) は外さない: スピナーはこれらをアニメーションで回すので、外すとその瞬間の busy を見逃す。
+# 配達前の判定 (`_pane_state`) は、画面より先に Rex の Claude Code が報告する program_status (OSC 7501。
+# `lib_mux.Mux.agent_status`) を見る: working → busy・blocked → dialog で延期。todo リストが長く
+# スピナーが窓 (`SPINNER_WINDOW`) から押し出されても作業中を見逃さないための補強。idle・不明は画面判定のまま
+# (program_status が画面の busy / dialog / draft を覆して送らせることは無い。IRC の安全側は「送らない」)。
 _BUSY_HINT_RE = re.compile(r'esc to interrupt', re.IGNORECASE)
 _BUSY_WINDOW = 12               # esc to interrupt を探す末尾の行数
 
@@ -897,8 +901,28 @@ def resolve_target(name, windows, allowed):
 # 配達 (§4-5) — at-least-once
 # ---------------------------------------------------------------------------
 
+def _agent_status(mux, window):
+    """Claude Code の program_status (`working` / `blocked` / `idle`)。知らなければ None。例外も None。"""
+    try:
+        status = mux.agent_status(window)
+    except Exception:  # noqa: BLE001 — AttributeError (入口の無い mux) を含む
+        return None
+    return status if status in ('working', 'blocked', 'idle') else None
+
+
 def _pane_state(mux, window):
-    """画面を読んで `classify_pane` する。読めなければ `unknown` (送らない側)。"""
+    """配達前の窓の状態。**program_status は延期の理由を足すだけ**で、送らせる方向には働かない。
+
+    program_status が working → `busy`、blocked → `dialog` (どちらも延期)。idle・None (知らない・
+    Rex 以外・読めない) は今までの画面判定 (`classify_pane`) のまま。画面が busy / dialog /
+    draft / unknown と言うのを program_status が覆して `ready` にすることは無い。
+    読めなければ `unknown` (送らない側)。
+    """
+    status = _agent_status(mux, window)
+    if status == 'working':
+        return 'busy'
+    if status == 'blocked':
+        return 'dialog'
     try:
         return classify_pane(mux.capture(window))
     except Exception:  # noqa: BLE001

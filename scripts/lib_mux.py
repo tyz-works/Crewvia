@@ -4851,13 +4851,62 @@ _REX_TRUST_UNNUMBERED_RE = re.compile(
 _REX_WORKING_RE = re.compile(r"esc to interrupt", re.IGNORECASE)
 _REX_STATE_TAIL_LINES = 30
 
+#: 「入力欄の上のスピナー」= Claude Code が作業中に出す行の唯一の定義 (Rule 5 の
+#: `rex_screen_state` と IRC 中継の `lib_irc_relay._is_busy` の両方がこれを呼ぶ。
+#: import の向きは lib_irc_relay -> lib_mux。lib_mux は lib_irc_relay を import しない)。
+#: 今の Claude Code は作業中でも「esc to interrupt」を出さず、入力欄の罫線より上に
+#: スピナー行だけを出すことがある (長い Write の間は罫線との間に空行が 5〜8 行入る)。
+#: スピナー行 = 字下げなし (列 0) の記号 + 単語 + `…` + (行末 / ` (` / ` 6m` のような経過時間)。
+#: 完了後の `✻ Cooked for 5s` には `…` が無いので形で外れる。記号 (`·` `*` を含む) は
+#: アニメーションで回るので外さない。hooks 実行中の `running PostToolUse hooks… (5/6)` も
+#: 作業中の印 (字下げ付きで出る場合はスピナー行が上にあるので読み飛ばしで足りる)。
+_SPINNER_LINE_RE = re.compile(
+    r"(?:[✻✽✶✳✢✦·*] [^\W\d_][\w-]*…(?: \(| \d+[smh]\b|$)"
+    r"|running [\w:-]+ hooks…(?: |$))",
+    re.IGNORECASE)
+#: 末尾この行数だけ見る。空行 8 行 + todo 数行 + 罫線・入力欄・状態行が収まる幅。
+#: 古いスクロールバックのスピナー行を拾わないための上限でもある。
+SPINNER_WINDOW = 30
+_SPINNER_PROMPT_WINDOW = 12
+
+
+def _is_rule_line(line: str) -> bool:
+    return len(line) >= 20 and set(line.strip()) == {"─"}
+
+
+def spinner_above_input_box(lines) -> bool:
+    """True when the live input box has a spinner line right above it.
+
+    Pure.  The input box = the last `❯` line within the tail that has a rule
+    above it; no box → False (the caller must not read that as "idle" either).
+    From the rule upward, skip blank / indented / `⎿` lines (todo lists, status
+    rows) and judge the first column-0 line: only a spinner shape counts, so
+    idle-screen prose and `* Next steps…` bullets are not picked up.
+    """
+    lines = list(lines)
+    start = max(0, len(lines) - _SPINNER_PROMPT_WINDOW)
+    prompt = None
+    for i in range(len(lines) - 1, start - 1, -1):
+        if lines[i].startswith("❯"):
+            prompt = i
+            break
+    if prompt is None or prompt == 0 or not _is_rule_line(lines[prompt - 1]):
+        return False
+    floor = max(0, len(lines) - SPINNER_WINDOW)
+    for i in range(prompt - 2, floor - 1, -1):
+        line = lines[i].rstrip()
+        if not line or line[0].isspace() or line.startswith("⎿"):
+            continue
+        return bool(_SPINNER_LINE_RE.match(line))
+    return False
+
 
 def rex_screen_state(screen: str) -> str:
     """`blocked` / `working` / `idle` / `unknown` for a captured Claude Code screen.
 
     Pure.  Order matters: a dialog wins over the spinner line (the spinner can
-    stay on screen under a dialog); `working` needs the spinner hint in the
-    last lines; `idle` needs the input box and no spinner.  Anything else —
+    stay on screen under a dialog); `working` needs `esc to interrupt` in the
+    last lines or a spinner line above the input box (`spinner_above_input_box`); `idle` needs the input box and no spinner.  Anything else —
     including an empty or unreadable capture — is `unknown` so the caller
     skips the notification instead of acting on a guess.
     """
@@ -4872,6 +4921,8 @@ def rex_screen_state(screen: str) -> str:
     if _REX_DIALOG_FOOTER_RE.search(text) and _REX_TRUST_UNNUMBERED_RE.search(text):
         return "blocked"
     if _REX_WORKING_RE.search("\n".join(tail[-8:])):
+        return "working"
+    if spinner_above_input_box(screen.splitlines()):
         return "working"
     if _rex_input_box(screen) is not None:
         return "idle"

@@ -1080,3 +1080,22 @@ t004 の Astrid の CI 待ち (`run_in_background`) が終わった最初のサ�
 ### 検証
 
 `tests/test_watchdog_post_job_grace.py` (9 件): executing → 消滅の直後は terminate しない / 消滅後しきい値超過で terminate / job なしの無音は従来どおり / max は猶予の外 / 再起動後 / 次の試行に持ち越さない / unknown は活動扱いにならず起点を動かさない / 見送り通知の起点は生のまま。赤の実証: 猶予を無効化 (`if post_job < silence:` → `if False:`) で 2 件赤、unknown を猶予に含める変異で 1 件赤。
+
+## 入力欄の上のスピナーを working と読む (Rex backend の state, 11-14)
+
+Rule 5 は dispatcher の `check_rule5` が `_mux.state(target)` を見る。Rex backend の
+`rex_screen_state` は working の根拠が末尾 8 行の `esc to interrupt` だけだったが、今の Claude Code は
+作業中でもこれを出さず、入力欄の罫線の上にスピナー行 (`✽ Catapulting… (1m 24s · …)` /
+`✻ Precipitating… 6m`) だけを出す (長い Write の間は罫線との間に空行が 5〜8 行入る)。
+入力欄があるので idle と読まれ、作業中の Worker に誤報が出ていた (11-08 ×4, 11-14)。
+`lib_mux.spinner_above_input_box(lines)` が**唯一の定義**で、`rex_screen_state` (ダイアログ → blocked の
+優先順位は維持) と IRC 中継の `lib_irc_relay._is_busy` の両方が呼ぶ (import の向きは
+`lib_irc_relay → lib_mux`。lib_mux は lib_irc_relay を import しない)。判定は「罫線から上へ空行・字下げ行・
+`⎿` 行を読み飛ばして最初の列 0 の行がスピナーの形」で、窓は末尾 `SPINNER_WINDOW` = 30 行 (空行 8 行 + todo が
+入る)。`running <名前> hooks…` の列 0 の行も作業中。完了後の `✻ Cooked for 5s` は `…` が無いので外れ、
+idle の本文・`* Next steps…` も拾わない。入力欄が無い・空の capture は今どおり `unknown`。
+tmux / herdr / hc の `state()` は変えない。**影響範囲**: watchdog の idle 判定も `RexBackend.state` を使うなら
+working が増えるだけ (殺さない側)。スピナーは API 待ちで固まっても出続けるが、それは `esc to interrupt` と
+同じ扱いで、watchdog の max (既定 3600 秒) が拾う。lib_mux は dispatcher / watchdog の再起動対象
+(`DAEMON_RESTART_FILES`) に既にあるので、merge 後は `sync-main-checkout.sh` で restart する。
+テスト: `tests/test_rex_screen_state_spinner.py`。

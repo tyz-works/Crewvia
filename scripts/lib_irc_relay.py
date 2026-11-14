@@ -39,6 +39,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import lib_config  # noqa: E402
+import lib_mux  # noqa: E402  スピナー判定の唯一の定義 (lib_mux -> lib_irc_relay の import は無い)
 from lib_task_cards import is_missing, is_unreadable, read_regular_text_or_unreadable  # noqa: E402
 from lib_daemon_state import (  # noqa: E402
     IRC_PENDING_MAX, irc_quarantine_problem, irc_receiver_problem, irc_state_problem,
@@ -786,11 +787,10 @@ def _is_rule(line):
 # 作業中 (busy) の印。`lib_mux.rex_screen_state` の working は「esc to interrupt」だけを見るが、狭い窓では出ないことがある。
 # 実物の busy 画面 (tests/fixtures/irc/busy-screen-sora.txt) は入力欄の上に `✻ Discombobulating… (thought for 5s)` だけが出る。
 # スピナー行 = **字下げなしの行頭 (列 0)** の記号 + 単語 + `…` + (行末 か ` (`)。完了後の行 (`✻ Cooked for 5s`) には `…` が無い。
-# さらに**入力欄の上の罫線から上へ、空行・字下げ行・`⎿` 行を読み飛ばして最初に出る字下げなしの行**がそれのときだけ数える (探す範囲は末尾 _BUSY_WINDOW 行) (idle の画面の本文・箇条書きの `* Next steps…` を拾わない)。
+# さらに**入力欄の上の罫線から上へ、空行・字下げ行・`⎿` 行を読み飛ばして最初に出る字下げなしの行**がそれのときだけ数える (判定の定義と窓は `lib_mux.spinner_above_input_box` / `SPINNER_WINDOW` の 1 か所) (idle の画面の本文・箇条書きの `* Next steps…` を拾わない)。
 # 記号 (`·` `*` を含む) は外さない: スピナーはこれらをアニメーションで回すので、外すとその瞬間の busy を見逃す。
 _BUSY_HINT_RE = re.compile(r'esc to interrupt', re.IGNORECASE)
-_BUSY_SPINNER_RE = re.compile(r'[✻✽✶✳✢✦·*] [^\W\d_][\w-]*…(?: \(|$)')
-_BUSY_WINDOW = 12               # 末尾この行数だけ見る (スクロールバックの古いスピナー行を拾わない)
+_BUSY_WINDOW = 12               # esc to interrupt を探す末尾の行数
 
 
 def _prompt_index(lines):
@@ -808,18 +808,8 @@ def _is_busy(lines):
     tail = lines[-_BUSY_WINDOW:]
     if any(_BUSY_HINT_RE.search(line) for line in tail):
         return True
-    prompt = _prompt_index(lines)
-    if prompt is None:
-        return False                     # 位置を特定できない → busy と断定しない (呼び出し側で unknown = 送らない)
-    rule = prompt - 1
-    # 罫線から上へ、空行・字下げした行 (todo の `  ⎿ ☐`・`  ✔ Update installed` 等) を読み飛ばし、
-    # 最初に出る字下げなしの行がスピナーの形なら busy。探す範囲は _BUSY_WINDOW の中。
-    for i in range(rule - 1, max(0, len(lines) - _BUSY_WINDOW) - 1, -1):
-        line = lines[i].rstrip()
-        if not line or line[0].isspace() or line.startswith('⎿'):
-            continue
-        return bool(_BUSY_SPINNER_RE.match(line))
-    return False
+    # スピナーの判定は lib_mux の 1 か所 (Rule 5 の rex_screen_state と共有)。
+    return lib_mux.spinner_above_input_box(lines)
 
 
 def classify_pane(screen):

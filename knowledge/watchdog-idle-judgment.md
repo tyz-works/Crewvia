@@ -1094,8 +1094,13 @@ Rule 5 は dispatcher の `check_rule5` が `_mux.state(target)` を見る。Rex
 `⎿` 行を読み飛ばして最初の列 0 の行がスピナーの形」で、窓は末尾 `SPINNER_WINDOW` = 30 行 (空行 8 行 + todo が
 入る)。`running <名前> hooks…` の列 0 の行も作業中。完了後の `✻ Cooked for 5s` は `…` が無いので外れ、
 idle の本文・`* Next steps…` も拾わない。入力欄が無い・空の capture は今どおり `unknown`。
-tmux / herdr / hc の `state()` は変えない。**影響範囲**: watchdog の idle 判定も `RexBackend.state` を使うなら
-working が増えるだけ (殺さない側)。スピナーは API 待ちで固まっても出続けるが、それは `esc to interrupt` と
-同じ扱いで、watchdog の max (既定 3600 秒) が拾う。lib_mux は dispatcher / watchdog の再起動対象
+tmux / herdr / hc の `state()` は変えない。**影響範囲**: `RexBackend.state()` を呼ぶのは dispatcher の
+`check_rule5` だけで、watchdog は `state()` を呼ばない (活動時計 + `/proc` + `capture`)。だから working が増えて
+黙るのは Rule 5 だけ。**トレードオフ**: API 待ちでスピナー (または program_status の working) のまま固まった
+Worker は Rule 5 では見つからず、watchdog の max (既定 3600 秒) / hard_idle まで通知が出ない
+(`esc to interrupt` のときと同じ)。
+t003 (11-14): Rex では `state()` はまず `program_status` (OSC 7501) を読み、使えなければ上の画面判定に落ちる
+(`knowledge/rex-mux-backend.md` §4)。`blocked` は画面のダイアログ判定と同じく Rule 5 の条件 A (通知する側)、
+`error` は unknown (通知しない側) で、Rule 5 / watchdog の扱いは画面判定と変わらない。lib_mux は dispatcher / watchdog の再起動対象
 (`DAEMON_RESTART_FILES`) に既にあるので、merge 後は `sync-main-checkout.sh` で restart する。
 テスト: `tests/test_rex_screen_state_spinner.py`。

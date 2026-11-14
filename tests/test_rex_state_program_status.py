@@ -45,6 +45,7 @@ def _reset_log():
 def backend(monkeypatch):
     b = lib_mux.RexBackend()
     monkeypatch.setattr(b, "_resolve", lambda name: {"block_id": BLOCK})
+    monkeypatch.setattr(b, "_guard", lambda verb, name: None)   # 隔離の関門は別テスト
     return b
 
 
@@ -63,11 +64,12 @@ def fake_rex(monkeypatch, status, proc=ok(FG), calls=None):
 
 def screen(monkeypatch, b, text):
     monkeypatch.setattr(b, "capture", lambda name: text)
+    monkeypatch.setattr(b, "_capture_block", lambda block_id: text)
 
 
 @pytest.mark.parametrize("state,expected", [
     ("working", "working"), ("blocked", "blocked"), ("idle", "idle"),
-    ("done", "idle"), ("error", "unknown"), ("sleeping", "unknown"),
+    ("done", "idle"),
 ])
 def test_mapping(backend, monkeypatch, state, expected):
     fake_rex(monkeypatch, ok({"records": [rec(state)]}))
@@ -96,6 +98,8 @@ def test_two_calls_with_short_timeout(backend, monkeypatch):
 
 FALLBACK_CASES = {
     "records empty": (ok({"records": []}), ok(FG)),
+    "state error": (ok({"records": [rec("error")]}), ok(FG)),
+    "state unknown value": (ok({"records": [rec("sleeping")]}), ok(FG)),
     "other app only": (ok({"records": [rec(app="cargo")]}), ok(FG)),
     "child record only": (ok({"records": [rec(id="build/test")]}), ok(FG)),
     "two claude records": (ok({"records": [rec(), rec("idle")]}), ok(FG)),
@@ -133,6 +137,7 @@ def test_unusable_program_status_falls_back_to_the_screen(backend, monkeypatch, 
 
 def test_pane_not_found_falls_back(monkeypatch):
     b = lib_mux.RexBackend()
+    monkeypatch.setattr(b, "_guard", lambda verb, name: None)
     monkeypatch.setattr(b, "_resolve", lambda name: None)
     monkeypatch.setattr(b, "capture", lambda name: SPINNER_SCREEN)
     assert b.state("Zed-worker") == "working"
@@ -159,3 +164,48 @@ def test_idle_record_is_not_discarded_for_age(backend, monkeypatch):
     # idle の Claude Code は報告をし直さない (実測)。古い updated_at でも採用する。
     fake_rex(monkeypatch, ok({"records": [rec("done", updated_at="2020-01-01T00:00:00+09:00")]}))
     assert backend.state("Zed-worker") == "idle"
+
+
+USAGE_SCREEN = (f"⚠ Usage limit reached · continuing automatically at 6pm\n"
+                f"{RULE}\n❯ \n{RULE}\n  status\n")
+
+
+@pytest.mark.parametrize("state,reason", [("error", "status_error"),
+                                          ("sleeping", "status_unknown_value")])
+def test_error_and_unknown_value_read_the_screen_not_silence(
+        backend, monkeypatch, capsys, state, reason):
+    fake_rex(monkeypatch, ok({"records": [rec(state)]}))
+    # 入力欄が空 = idle (Rule 5 が通知する側)。unknown (無音) に倒さない。
+    screen(monkeypatch, backend, IDLE_SCREEN)
+    assert backend.state("Zed-worker") == "idle"
+    assert reason in capsys.readouterr().err
+
+
+def test_error_with_usage_limit_screen_reaches_usage_limit_path(backend, monkeypatch):
+    import lib_usage_limit
+    fake_rex(monkeypatch, ok({"records": [rec("error")]}))
+    screen(monkeypatch, backend, USAGE_SCREEN)
+    assert backend.state("Zed-worker") == "idle"
+    assert lib_usage_limit.detect(USAGE_SCREEN)
+
+
+def test_fallback_reuses_the_resolved_block(monkeypatch):
+    b = lib_mux.RexBackend()
+    monkeypatch.setattr(b, "_guard", lambda verb, name: None)
+    n = []
+    monkeypatch.setattr(b, "_resolve", lambda name: n.append(name) or {"block_id": BLOCK})
+    seen = []
+    monkeypatch.setattr(b, "_capture_block", lambda bid: seen.append(bid) or IDLE_SCREEN)
+    fake_rex(monkeypatch, ok({"records": []}))
+    assert b.state("Zed-worker") == "idle"
+    assert len(n) == 1 and seen == [BLOCK]
+
+
+def test_fallback_keeps_the_test_isolation_guard(monkeypatch):
+    # 解決済みの block id を直に使っても、capture と同じ関門を通る
+    b = lib_mux.RexBackend()
+    monkeypatch.setattr(b, "_resolve", lambda name: {"block_id": BLOCK})
+    monkeypatch.setattr(b, "_capture_block", lambda bid: IDLE_SCREEN)
+    fake_rex(monkeypatch, ok({"records": []}))
+    with pytest.raises(lib_mux.MuxTestIsolationError):
+        b.state("Zed-worker")

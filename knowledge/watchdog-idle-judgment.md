@@ -1101,6 +1101,6 @@ Worker は Rule 5 では見つからず、watchdog の max (既定 3600 秒) / h
 (`esc to interrupt` のときと同じ)。
 t003 (11-14): Rex では `state()` はまず `program_status` (OSC 7501) を読み、使えなければ上の画面判定に落ちる
 (`knowledge/rex-mux-backend.md` §4)。`blocked` は画面のダイアログ判定と同じく Rule 5 の条件 A (通知する側)、
-`error` は unknown (通知しない側) で、Rule 5 / watchdog の扱いは画面判定と変わらない。lib_mux は dispatcher / watchdog の再起動対象
+`error` と知らない値は画面判定に落ちる (unknown = 無音にはしない。E 条件・利用枠切れの経路を保つ)。Rule 5 / watchdog の扱いは画面判定と変わらない。lib_mux は dispatcher / watchdog の再起動対象
 (`DAEMON_RESTART_FILES`) に既にあるので、merge 後は `sync-main-checkout.sh` で restart する。
 テスト: `tests/test_rex_screen_state_spinner.py`。

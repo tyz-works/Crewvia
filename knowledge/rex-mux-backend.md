@@ -104,7 +104,7 @@ spawn は記録（`write_pane_record`）を server の `(endpoint, generation)` 
 | `attach(name)` / `attach_cmd(name)` | `tab focus` / `["herdr"]` | `rex window focus <window>`（**未確認**: 実行していない）/ `["rex", "-S", <endpoint>]`（引数なしの `rex` が TUI client を開くかは**未確認**） | 未確認 |
 | `available()` | herdr の CLI と socket の ping | `rex` が PATH にある ∧ `rex -S <endpoint> --autostart=false server status --json` が exit 0 ∧ `api_revision` が想定内（§7） | 満たせる |
 | `server_running()` | socket の ping | 同上（exit 0）。**server が居ない = exit 4 / `server status` は exit 1**（実測。どちらも非 0 = 居ない） | 満たせる |
-| `state(name)` | `pane get` の `agent_status`（working / idle …） | **`program_status` を第一に読む**（t003, 11-14）。block の method `com.superlogical.terminal.program_status`（Claude Code が OSC 7501 で報告）。root record（id 無し）で `effective_app` が `claude-code` の 1 件だけを採用し、`owner` の pid と name を `process` の `foreground` と**両方**照合（不一致・owner 無し = 使わない）。写像: working→working / blocked→blocked / idle・done→idle / error→unknown / 知らない値→unknown。records 空・読めない・timeout・形違い・API 無しは `rex_screen_state(capture)` に落ちる（落ちた理由はプロセスごと 1 回ログ）。窓ごと 2 呼び出し・timeout 3 秒。`updated_at` では捨てない（実測: idle の Claude Code は報告をし直さない）。**偽装**: 窓の中のプログラムは OSC 7501 を書ける。Worker 自身の偽装は対象外（信頼境界の内側。watchdog の max が最後の網） | 満たせる |
+| `state(name)` | `pane get` の `agent_status`（working / idle …） | **`program_status` を第一に読む**（t003, 11-14）。block の method `com.superlogical.terminal.program_status`（Claude Code が OSC 7501 で報告）。root record（id 無し）で `effective_app` が `claude-code` の 1 件だけを採用し、`owner` の pid と name を `process` の `foreground` と**両方**照合（不一致・owner 無し = 使わない）。写像: working→working / blocked→blocked / idle・done→idle。**error と知らない値は写さず画面判定へ落とす**（`status_error` / `status_unknown_value`。unknown にすると Rule 5 の E 条件「知らない値はうるさく」と逆で無音になり、利用枠切れの経路も消える）。records 空・読めない・timeout・形違い・API 無しは `rex_screen_state(capture)` に落ちる（落ちた理由はプロセスごと 1 回ログ）。窓ごと 2 呼び出し・timeout 3 秒。`updated_at` では捨てない（実測: idle の Claude Code は報告をし直さない）。**偽装**: 窓の中のプログラムは OSC 7501 を書ける。Worker 自身の偽装は対象外（信頼境界の内側。watchdog の max が最後の網） | 満たせる |
 
 ### 4.1 block は command の終了で消える（実測）
 
@@ -390,7 +390,7 @@ PR-1 で実測したものは「**実測済み**」、残りは「**未確認**�
 
 **利用者が Rex.app で見る手順**: ① `./crewvia`（Director の窓が Rex の `crewvia` session に出る）② Rex.app を開く（同じ server に接続していること）③ session `crewvia` → 窓 `<Name>-director` / `<Name>-worker`・`dispatcher`・`watchdog`。端末だけなら `rex ls` / `rex block ls -s crewvia` / `rex capture -b <block_id>`。**app 側の見え方は未確認**（上 §12-3）。
 
-**t003（11-14）の更新: 第一の根拠は画面でなく `program_status`（OSC 7501）になった**（§4 の表の `state(name)` の行。旧「Rex に agent の状態の API は見つけていない」は誤りだった）。以下の画面判定は、program_status が使えないときの fallback として残る。error は unknown（通知しない側）に写す: 画面判定では入力欄があれば idle と読まれ Rule 5 が出ていた場面でも、Claude Code が自分で error と言っているときは通知しない。
+**t003（11-14）の更新: 第一の根拠は画面でなく `program_status`（OSC 7501）になった**（§4 の表の `state(name)` の行。旧「Rex に agent の状態の API は見つけていない」は誤りだった）。以下の画面判定は、program_status が使えないときの fallback として残る。error と知らない値は画面判定に落とす（#406 レビューで訂正）: unknown（無音）に写すと、入力欄 idle で本来通知すべき場面が黙り、利用枠切れ (`handle_usage_limit`) も Rex で走らなくなる。画面なら idle は通知・利用枠切れは同定される。
 
 **`state()`（§10.2-4）**: 読み手は dispatcher の Rule 5 だけ（`check_rule5`。watchdog / `lib_retirement` / `lib_pane_process` は `state()` を呼ばない: watchdog の idle は活動時計 + `/proc` + `capture`）。unknown 固定だと承認待ち・idle-with-task の通知が出ないので、`rex_screen_state(capture)`（承認ダイアログ = 選択肢 + `Enter to confirm` 等 → blocked／`esc to interrupt` → working／入力欄あり → idle／それ以外・空 → unknown）にした。tmux は元から unknown（Rule 5 は効かない）。**できない範囲**: 画面の文言に依存するので Claude Code の UI が変わると unknown に落ちる（通知が出ない側）。watchdog の hard_idle は state に依らず動く。
 

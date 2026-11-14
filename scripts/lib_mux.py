@@ -4970,12 +4970,13 @@ def _rex_spawn_lock(repo_root=None, *, timeout: float):
 
 #: `program_status` (Claude Code が OSC 7501 で報告する状態) の読み方。
 #: Rex の block method `com.superlogical.terminal.program_status`。写像は 1 か所:
-#: working→working / blocked→blocked / idle・done→idle / error→unknown /
-#: 知らない値→unknown。API の説明は「知らない値は idle とみなせ」だが、crewvia では
-#: idle は Rule 5 が通知を出す側なので、知らない値は通知しない側 (unknown) に倒す。
-#: error を unknown にするのも同じ理由 (利用枠切れ等の error で idle-with-task を出さない)。
+#: working→working / blocked→blocked / idle・done→idle。
+#: **error と知らない値は写さず画面判定に落とす** (state None + reason `status_error` /
+#: `status_unknown_value`)。unknown (通知しない側) に倒すと Rule 5 の E 条件 (知らない値は
+#: うるさく) と逆で無音になり、利用枠切れ (error で出る) の handle_usage_limit も Rex で
+#: 走らなくなる (#406 レビュー)。画面なら入力欄 idle は通知・利用枠切れは同定される。
 _PROGRAM_STATUS_MAP = {"working": "working", "blocked": "blocked",
-                       "idle": "idle", "done": "idle", "error": "unknown"}
+                       "idle": "idle", "done": "idle"}
 _PROGRAM_STATUS_APP = "claude-code"
 #: 窓ごとに 2 呼び出し (program_status + process)。dispatcher のサイクルを遅くしない短さ。
 _PROGRAM_STATUS_TIMEOUT = 3.0
@@ -5032,7 +5033,12 @@ def program_status_state(status, proc):
         return None, "no_foreground"
     if owner["pid"] != fg["pid"] or owner["name"] != fg["name"]:
         return None, "owner_mismatch"
-    return _PROGRAM_STATUS_MAP.get(state, "unknown"), "ok"
+    if state == "error":
+        return None, "status_error"
+    mapped = _PROGRAM_STATUS_MAP.get(state)
+    if mapped is None:
+        return None, "status_unknown_value"
+    return mapped, "ok"
 
 
 _PROGRAM_STATUS_LOGGED = set()
@@ -5087,12 +5093,8 @@ class RexBackend(_Backend):
     def server_running(self) -> bool:
         return _rex_status() is not None
 
-    def _program_status(self, name: str):
+    def _program_status(self, name: str, block_id: str):
         """`(state, reason)` from `program_status`; state None = use the screen."""
-        ids = self._resolve(name)
-        if ids is None:
-            return None, "pane_not_found"
-        block_id = ids["block_id"]
         res = _rex_run(["block", "call", "program_status", "{}", "-b", block_id],
                        timeout=_PROGRAM_STATUS_TIMEOUT)
         if res is not None and res.timed_out:
@@ -5118,14 +5120,22 @@ class RexBackend(_Backend):
         claim `working` falsely; the Worker is inside the trust boundary and
         the watchdog max is the last net.
         """
-        state, reason = self._program_status(name)
+        ids = self._resolve(name)
+        if ids is None:
+            state, reason = None, "pane_not_found"
+        else:
+            state, reason = self._program_status(name, ids["block_id"])
         if state is not None:
             return state
         if reason not in _PROGRAM_STATUS_LOGGED:
             _PROGRAM_STATUS_LOGGED.add(reason)
             self._warn(f"state({name!r}): program_status not used ({reason}); "
                        f"reading the screen instead")
-        return rex_screen_state(self.capture(name))
+        if ids is None:
+            return rex_screen_state(self.capture(name))
+        # 解決済みの block id をそのまま使う (capture(name) は _resolve をやり直す)
+        self._guard("capture", name)
+        return rex_screen_state(self._capture_block(ids["block_id"]))
 
     # -- ids ---------------------------------------------------------------
 

@@ -83,6 +83,7 @@ PR revert → `scripts/sync-main-checkout.sh`。`registry/ci/` は残ってよ�
 
 - `lib_ci_status.gate_verdict(record, *, pr_head, now)` は「通す / 通さない + 固定語の理由」を返す**門用の読み口**（表示用の `read_record` / `format_line` とは別）。通すのは記録の head == PR の現 head ∧ 全体 passed ∧ 必須 check `ci-ok` が passed ∧ `observed_at` が 10 分以内のときだけ。それ以外・読めない・取り直せないは全部通さない。設計: `knowledge/ci-wait-operations.md` §2.2。
 - `plan.sh ci-gate <PR> [--target-dir]`: 通せば exit 0 + `ci-gate: PASS PR #N head=<sha>`、通さなければ exit 1 + `ci-gate: DENY PR #N <理由>`。PASS のときは 2 行目に `ci-gate: approved_head ok|no_approval|approved_head_mismatch`（review の承認 head と現 head の比較。PR-D1）が出る。読み取り専用。`gate_verdict` を呼ぶのは dispatcher の `pr_events`（`ci-green` / `merge-ready` を出す条件）と `plan.sh ci-gate` だけ。`plan.sh ci-gate` を引くのは Director の手だけ（`tests/test_ci_gate.py::test_nobody_calls_the_gate_yet`）。
+- 固定語の理由 `gh_pr_not_found` (PR が見つからない) は gh の全呼び出しに効くので、`ci-gate` の DENY の理由にも `unknown:gh_pr_not_found` として出る。害はなく挙動は変えない (P3-5)。
 - 「判定に使わない」の文言の改訂（表示用 / 門用の 2 つに割る）は PR-D2 で済み（冒頭）。門は待ちを解く・done にする・Rule 5 / watchdog を黙らせることには使わない。
 
 ## PR の持ち主の repo（`pr_repo`。t001）
@@ -90,3 +91,11 @@ PR revert → `scripts/sync-main-checkout.sh`。`registry/ci/` は残ってよ�
 - 範囲は `lib_ci_status.pr_scope(task)` の 1 か所（`pr_repo` → `target_dir` → crewvia の repo）。`plan.sh done --pr` は pr_number と一緒に、上流の `pr_repo` も下流の review / codex-review に伝える（下流に別の `pr_repo` があれば pr_number も書かず stderr に出す）。
 - `pr_repo` のある card は `--repo` で repo が決まるので、`target_dir` が実在しなくても cwd は repo_root で取得する（`target_dir_missing` にしない）。
 - **台帳キーの形式が変わった**: `target_dir` の card は `pr<N>` から `pr<N>x<6 桁>` へ。デプロイ直後に、伝え済みの通知が 1 回ずつ再送される。旧形式のキーは畳まれずに残る（台帳は消してよい）。
+
+## CLOSED の PR の取り直し (P3-10)
+
+- `pr_state` が `CLOSED` の記録は終端にせず、`CLOSED_RECHECK_SECONDS` (900 秒) ごとに取り直す。reopen された PR の `ci-green` / `merge-ready` / `ci-failed` が出なくなるのを防ぐ。`MERGED` / `NOT_FOUND` は従来どおり終端。gh の呼び出しは通常の取得と同じ `max_tasks` / `budget` に数える。
+
+## daemons: しきい値の型検査 (P3-2)
+
+- `lib_daemon_watch._config_int` の 1 か所で検査する。整数だけ受け入れ、bool (`yes` / `true`)・文字列 (`"900"`)・小数は拒否して既定値に戻し、同じ欄・同じ値の WARNING を stderr に 1 回出す。0 以下は欄ごとの既存の規則のまま (`ci_poll_seconds` / `hard_idle_suppressed_notify_seconds` は正のみ、他は 0 以下 = 無効を許す)。変えたら dispatcher / watchdog の restart が要る。

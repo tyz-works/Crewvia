@@ -52,6 +52,9 @@ CYCLE_BUDGET_SECONDS = 20
 MAX_TASKS_PER_CYCLE = 4
 #: 結論が出た PR (state が passed / failed。head が変われば次の取得で running に戻り DEFAULT_POLL_SECONDS に戻る) の間隔 (秒)。
 CONCLUDED_POLL_SECONDS = 300
+#: CLOSED と記録された PR を取り直す間隔 (秒)。CLOSED は reopen されうる (MERGED は戻らない・NOT_FOUND は card の pr_number が
+#: 変われば取り直す) ので、終端のままにせず低頻度で見る。gh の呼び出しは通常の取得と同じ `max_tasks` / `budget` に数える。
+CLOSED_RECHECK_SECONDS = 900
 #: `ci-unknown` を出す、unknown が続いた取得の回数 (設計 §2.4。既定の間隔 60 秒で約 180 秒)。
 UNKNOWN_NOTIFY_STREAK = 3
 #: main の最新 run を問い合わせる最短の間隔 (秒)。
@@ -728,6 +731,8 @@ def pr_closed(record, pr_number, scope=SCOPE_UNCHECKED):
 def poll_interval(prev, poll_seconds, concluded_seconds):
     """前の記録から次の取得までの最短の間隔。結論が出た (passed / failed) 記録は長く、それ以外 (running / unknown /
     none / 記録なし) は `poll_seconds`。head が変われば取得の結果が running に戻るので、そこから `poll_seconds`。"""
+    if prev is not None and prev.get('pr_state') == 'CLOSED':
+        return max(poll_seconds, CLOSED_RECHECK_SECONDS)
     if prev is not None and prev.get('state') in ('passed', 'failed'):
         return max(poll_seconds, concluded_seconds)
     return poll_seconds
@@ -758,8 +763,9 @@ def poll_cycle(tasks, *, registry_dir, repo_root, branch_of, poll_seconds=DEFAUL
             continue
         scope = pr_scope(t)
         prev = read_record(registry_dir, t['mission'], t['id'], warn=warn)
-        if pr_closed(prev, t.get('pr_number'), scope=scope):
-            continue        # 終端 (MERGED / CLOSED): もう取りに行かない。card の pr_number / scope が変われば pr_closed が False になる
+        if pr_closed(prev, t.get('pr_number'), scope=scope) and prev.get('pr_state') != 'CLOSED':
+            continue        # 終端 (MERGED / NOT_FOUND): もう取りに行かない。card の pr_number / scope が変われば pr_closed が False になる
+        # CLOSED だけは reopen されうるので終端にせず、下の間隔 (`CLOSED_RECHECK_SECONDS`) で取り直す
         # card の PR・scope と違う記録は間隔を待たずに取り直す (#314 r2 / t013: pr_repo を変えた・消した card も)
         if (prev is not None and record_matches_card(prev, t.get('pr_number'), scope=scope)
                 and now - prev['observed_at'] < poll_interval(prev, poll_seconds, concluded_seconds)):

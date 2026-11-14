@@ -983,6 +983,30 @@ _CONFIG_KEYS = (
 )
 
 
+_WARNED_CONFIG = set()
+
+
+def _config_int(block, key, *, positive=False):
+    """`daemons:` ブロックのしきい値の検査の 1 か所。整数 (yaml の int) だけ受け入れる。
+
+    bool (`yes` / `true` が `int(True)` = 1 秒になる) と文字列 (`"900"`) と小数は拒否する。`positive=True` は 0 以下も拒否
+    (無効の意味を持たない欄)。拒否したら None (= 呼び出し側は既定値のまま) を返し、同じ欄・同じ値の WARNING は
+    プロセスごとに 1 回だけ stderr に出す (黙って既定に戻さない。dispatcher は毎サイクル読むので繰り返さない)。
+    欄が無いときは黙って None。"""
+    if key not in block:
+        return None
+    value = block[key]
+    if isinstance(value, int) and not isinstance(value, bool) and (not positive or value > 0):
+        return value
+    token = (key, repr(value))
+    if token not in _WARNED_CONFIG:
+        _WARNED_CONFIG.add(token)
+        want = "a positive integer" if positive else "an integer"
+        print(f"[lib_daemon_watch] WARNING: daemons.{key}={value!r} is not {want}; using the default",
+              file=sys.stderr)
+    return None
+
+
 def _truthy(value: str) -> bool:
     return value.strip().lower() not in ("0", "false", "no", "off", "")
 
@@ -1010,37 +1034,20 @@ def load_config(config_path=None, env=None) -> WatchConfig:
     if "mutual_watch" in block:
         cfg.enabled = bool(block["mutual_watch"])
     for key in _CONFIG_KEYS:
-        if key in block:
-            try:
-                setattr(cfg, key, int(block[key]))
-            except (TypeError, ValueError):
-                pass
+        value = _config_int(block, key)
+        if value is not None:
+            setattr(cfg, key, value)
 
     # env を読まない値 (上の `hard_idle_suppressed_notify_seconds` の注記)。正の整数だけ受け入れる。
-    if "hard_idle_suppressed_notify_seconds" in block:
-        try:
-            value = int(block["hard_idle_suppressed_notify_seconds"])
-            if value > 0:
-                cfg.hard_idle_suppressed_notify_seconds = value
-        except (TypeError, ValueError):
-            pass
-    if "ci_poll_seconds" in block:
-        try:
-            value = int(block["ci_poll_seconds"])
-            if value > 0:
-                cfg.ci_poll_seconds = value
-        except (TypeError, ValueError):
-            pass
-    if "stall_notify_seconds" in block:         # 0 以下は「無効」の意味なので、型だけ見て受け入れる
-        try:
-            cfg.stall_notify_seconds = int(block["stall_notify_seconds"])
-        except (TypeError, ValueError):
-            pass
-    if "checkpoint_seconds" in block:
-        try:
-            cfg.checkpoint_seconds = int(block["checkpoint_seconds"])
-        except (TypeError, ValueError):
-            pass
+    for key in ("hard_idle_suppressed_notify_seconds", "ci_poll_seconds"):
+        value = _config_int(block, key, positive=True)
+        if value is not None:
+            setattr(cfg, key, value)
+    # 0 以下は「無効」の意味なので、型だけ見て受け入れる
+    for key in ("stall_notify_seconds", "checkpoint_seconds"):
+        value = _config_int(block, key)
+        if value is not None:
+            setattr(cfg, key, value)
 
     if "CREWVIA_DAEMON_MUTUAL_WATCH" in env:
         cfg.enabled = _truthy(str(env["CREWVIA_DAEMON_MUTUAL_WATCH"]))

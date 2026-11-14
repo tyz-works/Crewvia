@@ -44,8 +44,8 @@ def rec(checks=None, *, state=None, head=HEAD, observed=NOW - 30, scope="", **ex
             "summary": "s", "scope": scope, **extra}
 
 
-def verdict(record, pr_head=HEAD, now=NOW, **kw):
-    return ci.gate_verdict(record, pr_head=pr_head, now=now, **kw)
+def verdict(record, pr_head=HEAD, now=NOW, scope="", **kw):
+    return ci.gate_verdict(record, pr_head=pr_head, now=now, scope=scope, **kw)
 
 
 # ---------------------------------------------------------------------------
@@ -253,6 +253,8 @@ def test_cli_gate_binds_records_by_pr_repo(repo):
     u = repo.plan("update", "t001", "--pr-repo", "Tyz-Works/Irc-Relay", "--mission", MISSION)
     assert u.returncode == 0, u.stderr
     put_gh(repo)
+    cfg = repo.root / "config" / "crewvia.yaml"       # 他 repo の門は config に載った repo だけ (t001 / 20261114)
+    cfg.write_text(cfg.read_text().replace("required_checks: {}", 'required_checks: {"tyz-works/irc-relay": [pytest, ci-ok]}'))
     write_rec(repo, rec(observed=time.time() - 5, scope="repo:tyz-works/irc-relay"))
     # crewvia の repo の #313 としては記録が無い (別 repo の PR の記録を使わない)
     assert gate(repo, "313").stdout == "ci-gate: DENY PR #313 unknown:no_record\n"

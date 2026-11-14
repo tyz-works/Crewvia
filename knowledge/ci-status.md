@@ -81,10 +81,19 @@ PR revert → `scripts/sync-main-checkout.sh`。`registry/ci/` は残ってよ�
 
 ## 門（`gate_verdict` / `plan.sh ci-gate`。ci-wait-operations PR-B）
 
-- `lib_ci_status.gate_verdict(record, *, pr_head, now)` は「通す / 通さない + 固定語の理由」を返す**門用の読み口**（表示用の `read_record` / `format_line` とは別）。通すのは記録の head == PR の現 head ∧ 全体 passed ∧ 必須 check `ci-ok` が passed ∧ `observed_at` が 10 分以内のときだけ。それ以外・読めない・取り直せないは全部通さない。設計: `knowledge/ci-wait-operations.md` §2.2。
+- `lib_ci_status.gate_verdict(record, *, pr_head, now, scope, config=None)` は「通す / 通さない + 固定語の理由」を返す**門用の読み口**（表示用の `read_record` / `format_line` とは別）。通すのは記録の head == PR の現 head ∧ 全体 passed ∧ scope の必須 check が**全部** passed（下の「repo ごとの必須 check」）∧ `observed_at` が 10 分以内のときだけ。それ以外・読めない・取り直せないは全部通さない。設計: `knowledge/ci-wait-operations.md` §2.2。
 - `plan.sh ci-gate <PR> [--target-dir]`: 通せば exit 0 + `ci-gate: PASS PR #N head=<sha>`、通さなければ exit 1 + `ci-gate: DENY PR #N <理由>`。PASS のときは 2 行目に `ci-gate: approved_head ok|no_approval|approved_head_mismatch`（review の承認 head と現 head の比較。PR-D1）が出る。読み取り専用。`gate_verdict` を呼ぶのは dispatcher の `pr_events`（`ci-green` / `merge-ready` を出す条件）と `plan.sh ci-gate` だけ。`plan.sh ci-gate` を引くのは Director の手だけ（`tests/test_ci_gate.py::test_nobody_calls_the_gate_yet`）。
 - 固定語の理由 `gh_pr_not_found` (PR が見つからない) は gh の全呼び出しに効くので、`ci-gate` の DENY の理由にも `unknown:gh_pr_not_found` として出る。害はなく挙動は変えない (P3-5)。
 - 「判定に使わない」の文言の改訂（表示用 / 門用の 2 つに割る）は PR-D2 で済み（冒頭）。門は待ちを解く・done にする・Rule 5 / watchdog を黙らせることには使わない。
+
+## repo ごとの必須 check（`ci.required_checks`。20261114-ci-gate-required-checks-per-repo t001）
+
+- 必須 check の集合は `lib_ci_status.required_checks_for(scope, config)` の 1 か所。**crewvia 本体（scope `''`）は常に `ci-ok`**（config を読まない = 無くても・壊れていても変わらない）。他の repo は `ci.required_checks`（`owner/name` → check 名の list。repo 名は大文字小文字を畳んで照合）に載っている repo だけ、載せた check が**全部**記録にあり passed のとき通る。
+- repo 名はユーザー固有の値なので、共通の `config/crewvia.yaml` には空の既定（`required_checks: {}`）と説明だけ。値は **`config/crewvia.local.yaml`** に書く（`lib_config.ALLOWED_KEYS` に `ci`。例は `crewvia.local.yaml.example`）。読むのは `lib_config` 経由（`gate_verdict` の `config=` で差し込める）。
+- 理由の固定語: `no_required_check` = 必須 check が記録に無い / 緑でない。**`no_required_check_config` = その repo の必須 check が config に無い**（未設定の repo は通さない = fail-closed）。`unknown:config_unreadable`（local が壊れている）/ `unknown:config_invalid`（`required_checks` の形が違う: dict でない・repo 名の形・畳むと重複・値が空 / list でない / 空や前後に空白のある check 名。**mapping 全体**を見て、一部の壊れた値だけ飛ばして通すことはしない）/ `unknown:repo_unresolved`（`dir:<path>` の origin が github.com の owner/name に解けない）/ `unknown:bad_scope`。いずれも通さない。
+- `dir:<path>` の scope は、その dir の `git remote get-url origin`（github.com のみ）で owner/name に解く（gh は呼ばない）。解けなければ通さない。
+- **出口（`no_required_check_config`）**: 主 checkout の `config/crewvia.local.yaml` の `ci.required_checks` に repo と check 名を足し、`python3 scripts/lib_daemon_watch.py restart dispatcher`（dispatcher の通知が反映される。`plan.sh ci-gate` は次の呼び出しから効く）。例: `ci: {required_checks: {"tyz-works/Minerva": [test-ubuntu, test-windows]}}`。
+- 戻し方: PR revert → sync。config の `ci:` は残ってよい（旧コードは読まない。ただし local の許可キーから外れるので旧コードでは local の `ci:` が `local_key_not_allowed` になる = 戻す前に local から `ci:` を消す）。
 
 ## PR の持ち主の repo（`pr_repo`。t001）
 

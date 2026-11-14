@@ -63,7 +63,8 @@ MAIN_POLL_SECONDS = 300
 STALE_AFTER_SECONDS = 300
 #: 門 (`gate_verdict`) が記録を「新しい」と認める最大の経過秒 (設計 §2.2 条件 4。10 分)。表示用の STALE とは別の定義。
 GATE_MAX_AGE_SECONDS = 600
-#: 門が緑の根拠にする必須 check の名前 (設計 §2.2 条件 3・§5。ci.yml の集約 job)。
+#: 門が緑の根拠にする必須 check の名前 (設計 §2.2 条件 3・§5。ci.yml の集約 job)。**crewvia 本体の repo (scope `''`) の既定**で、
+#: config が無くても変わらない。他の repo は config の `ci.required_checks` (`required_checks_for`)。
 REQUIRED_CHECK = 'ci-ok'
 
 #: 記録の state。`none` = gh は答えたが check が 1 つも無い (CI 未登録)。`no_pr` = PR が見つからない (表示しない)。
@@ -332,14 +333,91 @@ def task_graph_ci(record):
             'summary': summarize(record['pr'], record['head'], record['checks'])}
 
 
-def gate_verdict(record, *, pr_head, now, max_age=GATE_MAX_AGE_SECONDS):
+#: `required_checks` の repo 名・check 名の形。repo 名は `pr_repo` と同じ形 (`owner/name`)。
+_CHECK_NAME_RE = re.compile(r'[^\x00-\x1f\x7f\u0085\u2028\u2029]{1,200}')
+#: `dir:` scope を owner/name に解く: origin の URL が github.com の `owner/name` (https / ssh / scp 形)。
+_GITHUB_REMOTE_RE = re.compile(
+    r'(?:https?://(?:[^/@]+@)?github\.com/|ssh://git@github\.com/|git@github\.com:)([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:\.git)?/?')
+
+
+def resolve_dir_repo(path):
+    """`dir:<path>` の scope を `owner/name` (小文字) に解く。**解けなければ None** (呼び出し側は通さない)。
+    その dir の `origin` の URL だけを見る (git を呼ぶ。gh は呼ばない)。"""
+    if not isinstance(path, str) or not os.path.isabs(path):
+        return None
+    try:
+        r = subprocess.run(['git', '-C', path, 'remote', 'get-url', 'origin'], capture_output=True, text=True,
+                           timeout=10, stdin=subprocess.DEVNULL, check=False,
+                           env={**os.environ, 'GIT_TERMINAL_PROMPT': '0'})
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if r.returncode != 0:
+        return None
+    m = _GITHUB_REMOTE_RE.fullmatch(r.stdout.strip())
+    if not m or m.group(1).startswith(('.', '-')):
+        return None
+    return m.group(1).lower()
+
+
+def required_checks_for(scope, config=None):
+    """scope に応じた必須 check の名前の tuple と理由: `(tuple, None)` か `(None, 理由の固定語)`。**1 か所の定義**。
+
+    - `''` (crewvia 本体) = `('ci-ok',)`。config は見ない (無くても・壊れていても変わらない)。
+    - `repo:owner/name` / `dir:<path>` (owner/name に解く。解けなければ `unknown:repo_unresolved`) = config の
+      `ci.required_checks[owner/name]` (大文字小文字は畳んで照合)。repo が載っていなければ `no_required_check_config`。
+    - config が読めない = `unknown:config_unreadable`。`ci.required_checks` の形が違う (dict でない・repo 名の形が違う・
+      畳むと重複する・値が空 / list でない / 空の check 名) = `unknown:config_invalid` (**mapping 全体**を見る。
+      一部の壊れた値を飛ばして通さない)。いずれも通さない (fail-closed)。"""
+    if scope == '':
+        return (REQUIRED_CHECK,), None
+    if not isinstance(scope, str):
+        return None, 'unknown:bad_scope'
+    if scope.startswith('repo:'):
+        repo = scope[len('repo:'):].lower()
+        if not _PR_REPO_RE.fullmatch(repo) or repo.startswith(('.', '-')):
+            return None, 'unknown:bad_scope'
+    elif scope.startswith('dir:'):
+        repo = resolve_dir_repo(scope[len('dir:'):])
+        if repo is None:
+            return None, 'unknown:repo_unresolved'
+    else:
+        return None, 'unknown:bad_scope'
+    if config is None:
+        import lib_config
+        config = lib_config.load_effective()
+    if is_unreadable(config):
+        return None, 'unknown:config_unreadable'
+    ci_cfg = config.get('ci') if isinstance(config, dict) else None
+    mapping = ci_cfg.get('required_checks') if isinstance(ci_cfg, dict) else None
+    if mapping is None:
+        return None, 'no_required_check_config'
+    if not isinstance(mapping, dict):
+        return None, 'unknown:config_invalid'
+    folded = {}
+    for key, names in mapping.items():
+        if (not isinstance(key, str) or not _PR_REPO_RE.fullmatch(key) or key.startswith(('.', '-'))
+                or key.lower() in folded):
+            return None, 'unknown:config_invalid'
+        if (not isinstance(names, list) or not names
+                or any(not isinstance(n, str) or n != n.strip() or not _CHECK_NAME_RE.fullmatch(n) for n in names)):
+            return None, 'unknown:config_invalid'
+        folded[key.lower()] = tuple(dict.fromkeys(names))
+    if repo not in folded:
+        return None, 'no_required_check_config'
+    return folded[repo], None
+
+
+def gate_verdict(record, *, pr_head, now, scope, config=None, max_age=GATE_MAX_AGE_SECONDS):
     """門 (設計 §2.2)。`(True, 'ok')` か `(False, 理由の固定語)`。**疑わしきは通さない** (fail-closed)。
 
     通す条件は全部 AND: ①記録が形として読める ②記録の `head` == PR の現 head (`pr_head`。呼び出し元が門を引く瞬間に
-    取り直した値) ③`observed_at` が新しい ④全体の state が passed ⑤必須 check (`ci-ok`) が 1 件以上あり全部 passed。
-    承認 head との比較 (§2.5) はここに入れない (CI の緑だけを見る関数のまま)。
+    取り直した値) ③`observed_at` が新しい ④全体の state が passed ⑤scope の必須 check (`required_checks_for(scope)`。
+    crewvia 本体は `ci-ok`、他の repo は config の `ci.required_checks`) が**全部** 1 件以上あり全部 passed。
+    承認 head との比較 (§2.5) はここに入れない (CI の緑だけを見る関数のまま)。`scope` は `pr_scope` の値 (必須。省略で
+    crewvia 本体に倒さない)。`config` は省略すれば `lib_config` で読む (テスト用に差し込める)。
 
-    理由の固定語: `unknown:<reason>` / `head_mismatch` / `stale` / `running` / `failed` / `none` / `no_required_check`。
+    理由の固定語: `unknown:<reason>` / `head_mismatch` / `stale` / `running` / `failed` / `none` / `no_required_check` (必須 check が
+    記録に無い / 緑でない) / `no_required_check_config` (その repo の必須 check が config に無い)。
     使ってよい場所は「通さない」と「知らせる」だけ。待ちを解く・done にする・Rule 5 / watchdog を黙らせることには使わない。
     共有規則なので env の停止スイッチは付けない (不変条件 5)。"""
     if record is None or record_problem(record) is not None:
@@ -361,9 +439,13 @@ def gate_verdict(record, *, pr_head, now, max_age=GATE_MAX_AGE_SECONDS):
         return False, 'stale'
     if state != 'passed':               # running / failed / none
         return False, state
-    required = [c for c in record['checks'] if c['name'] == REQUIRED_CHECK]
-    if not required or any(c['state'] != 'passed' for c in required):
-        return False, 'no_required_check'
+    required, why = required_checks_for(scope, config)
+    if required is None:
+        return False, why
+    for name in required:
+        found = [c for c in record['checks'] if c['name'] == name]
+        if not found or any(c['state'] != 'passed' for c in found):
+            return False, 'no_required_check'
     return True, 'ok'
 
 
@@ -904,7 +986,7 @@ def pr_events(tasks, *, registry_dir, now, warn=None, head_of=None, is_sent=None
                 current, err = _head_of_scoped(head_of, pr_number, scope)
                 if err is not None:
                     continue
-            ok, _why = gate_verdict(rec, pr_head=current, now=now)
+            ok, _why = gate_verdict(rec, pr_head=current, now=now, scope=scope)
             if not ok:
                 continue
             approved, why = approval_verdict(pr_reviews, pr_head=current)

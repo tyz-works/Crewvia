@@ -53,6 +53,7 @@ ALLOWED_KEYS = frozenset({
     'telegram', 'irc', 'escalation',
     'review',
     'wip_limit', 'daemons',
+    'ci',
 })
 #: 共有規則 (不変条件 5): 機ごとにずれると dispatcher と plan.sh の答えが割れる。local では上書き不可。
 EXCLUDED_KEYS = frozenset({'attempts', 'timeout_max_per_skill'})

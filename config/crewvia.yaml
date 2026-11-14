@@ -372,3 +372,15 @@ irc:
     token_ref: ""                 # source: op のとき。例 op://<vault>/<item>/token
     file: ""                      # source: file のとき。例 ~/.local/share/crewvia/irc-relay.token
     op_command: op                # 1Password CLI のコマンド名（PATH に無い場合は絶対パス）
+
+# ---------------------------------------------------------------------------
+# ci: PR の CI の門 (`plan.sh ci-gate` と `ci-green` / `merge-ready` 通知) が緑の根拠にする必須 check（repo ごと）
+# ---------------------------------------------------------------------------
+# crewvia 本体の repo は常に `ci-ok`（ここに書かなくても変わらない・書いても効かない）。
+# 他の repo（card の `pr_repo` / `target_dir` の PR）は `ci.required_checks` に **repo 名 → check 名の list** を書いた repo だけが通る。
+# 載っていない repo は `no_required_check_config` で通さない（fail-closed）。repo 名はユーザー固有の値なので、
+# **共通のこのファイルには書かず** `config/crewvia.local.yaml` に書く（例は crewvia.local.yaml.example）。
+# 変えたら dispatcher の restart が要る（`python3 scripts/lib_daemon_watch.py restart dispatcher`）。
+# 形が違う値（dict でない・list が空・check 名が空文字 など）は通さない（`unknown:config_invalid`）。
+ci:
+  required_checks: {}

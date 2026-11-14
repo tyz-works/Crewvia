@@ -61,12 +61,12 @@ Director:     通知を受けたら review の所見と承認 head を読み、p
 
 1. 記録の `state == "passed"`（全体は既存の集約: failed > unknown > running > passed）。
 2. 記録の `head` が **PR の現 head と一致**。現 head は門を引く瞬間に `gh pr view --json headRefOid` で取り直す（記録の head と突き合わせる。取り直せなければ通さない）。
-3. check が 1 件以上あり、**必須 check（§5 の `ci-ok`）が `passed`**。`none`（CI 未登録）は通さない。
+3. check が 1 件以上あり、**必須 check が全部 `passed`**。必須 check は crewvia 本体の repo なら §5 の `ci-ok`、他の repo は config `ci.required_checks`（`config/crewvia.local.yaml`。`knowledge/ci-status.md`「repo ごとの必須 check」）の集合。`none`（CI 未登録）は通さない。
 4. 記録の `observed_at` が新しい（既定 10 分以内）。古ければ「通さない」と理由 `stale`。
 5. `neutral`（skipped 等）は passed とは数えないが、`ci-ok` が passed なら妨げない。ただし **`ci-ok` 自体は「needs が全部 success」のときだけ緑**にする（§5.2-1。skipped を許すのは paths の絞りを入れる PR になってから）。
 6. （`merge-ready` にだけ要る条件。`ci-green` には要らない）承認した head が現 head と一致する（§2.5）。`gate_verdict` は CI の緑だけを見る関数のまま保ち、承認 head との比較は通知・`plan.sh ci-gate` の外側の層で行う。
 
-通さない理由は固定語で返す（`running` / `failed` / `unknown:<reason>` / `none` / `head_mismatch` / `stale` / `no_required_check`）。**疑わしきは通さない**＝ fail-closed。`gh` の失敗・timeout・形の違いは既存どおり `unknown` で、緑にも「CI なし」にも倒さない。
+通さない理由は固定語で返す（`running` / `failed` / `unknown:<reason>` / `none` / `head_mismatch` / `stale` / `no_required_check` / `no_required_check_config`）。`no_required_check` = 必須 check が記録に無い / 緑でない、`no_required_check_config` = その repo の必須 check が config に無い（未設定は通さない。出口は `crewvia.local.yaml` の `ci.required_checks` に足して dispatcher restart）。**疑わしきは通さない**＝ fail-closed。`gh` の失敗・timeout・形の違いは既存どおり `unknown` で、緑にも「CI なし」にも倒さない。
 
 使う場所は 2 つだけ:
 

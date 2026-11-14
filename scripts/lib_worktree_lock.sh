@@ -32,7 +32,9 @@ crewvia_wt_git() {
       # 旧名 (fd 8) → 新名 (fd 9) の順に取る。どちらかが取れなければ git を実行しない。
       flock -w "$CREWVIA_WT_LOCK_WAIT_SECONDS" 8 || exit 99
       flock -w "$CREWVIA_WT_LOCK_WAIT_SECONDS" 9 || exit 99
-      git -C "$repo" "$@"
+      # git (と、fetch が裏で起こす maintenance / gc --auto の detach した子) にロックの fd を継がせない。
+      # ロックは subshell 側の open file description が保持するので、子が閉じても外れない。
+      git -C "$repo" "$@" 8>&- 9>&-
     ) 8>>"${gcd}/${CREWVIA_WT_LEGACY_LOCK_NAME}" 9>>"${gcd}/${CREWVIA_WT_LOCK_NAME}"
   else
     git -C "$repo" "$@"

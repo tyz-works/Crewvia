@@ -266,3 +266,59 @@ def test_remove_worktree_fails_when_list_cannot_be_taken(tmp_path):
     finally:
         os.killpg(h.pid, 9)
         h.wait()
+
+
+def test_git_child_does_not_inherit_the_lock_fds(tmp_path):
+    """git が裏に残す子 (maintenance --auto 等) はロックの fd を継がない: crewvia_wt_git が戻ったらロックは取れる。"""
+    c = _clone(tmp_path)
+    real = shutil.which("git")
+    stub = tmp_path / "stubbin"
+    stub.mkdir()
+    pidfile = tmp_path / "child.pid"
+    (stub / "git").write_text(textwrap.dedent(f"""\
+        #!/usr/bin/env bash
+        for a in "$@"; do
+          if [[ "$a" == rev-parse ]]; then exec "{real}" "$@"; fi
+        done
+        # detach した子 (fd は継ぐ) を残して親は終わる
+        sleep 30 </dev/null >/dev/null 2>&1 &
+        echo $! > "{pidfile}"
+        exit 0
+        """))
+    (stub / "git").chmod(0o755)
+    try:
+        r = _bash(f'source "{LIB}"; PATH="{stub}:$PATH" crewvia_wt_git "{c}" fetch origin')
+        assert r.returncode == 0, r.stderr
+        for name in ("crewvia-worktree.lock", "kai-review-worktree.lock"):
+            lock = c / ".git" / name
+            got = _bash(f'flock -n -w 0 "{lock}" true')
+            assert got.returncode == 0, f"{name} が git の子に握られたまま"
+    finally:
+        if pidfile.exists():
+            try:
+                os.kill(int(pidfile.read_text().strip()), 9)
+            except (OSError, ValueError):
+                pass
+
+
+def test_remove_worktree_does_not_match_a_longer_sibling_path(tmp_path):
+    """…/task-foo を消すとき …/task-foo-bar の行を「在る」と読まない (部分一致): 無ければ skip して rc=0、sibling は残る。"""
+    c = _clone(tmp_path)
+    copy_plan_tree(c)
+    (c / "scripts" / "git-helpers.sh").write_text((SCRIPTS / "git-helpers.sh").read_text())
+    q = tmp_path / "queue" / "missions" / "m-sub" / "tasks"
+    q.mkdir(parents=True)
+    (q.parent / "mission.yaml").write_text("slug: m-sub\n")
+    env = {**os.environ, "CREWVIA_QUEUE": str(tmp_path / "queue")}
+    probe = subprocess.run(["bash", "-c", f'cd "{c}" && source scripts/git-helpers.sh && '
+                            '_crewvia_resolve_task m-sub t001 foo "$(_crewvia_repo_root)"'],
+                           capture_output=True, text=True, timeout=120, env=env)
+    assert probe.returncode == 0, probe.stderr
+    wt = probe.stdout.splitlines()[1]
+    sibling = wt + "-bar"
+    _git(c, "worktree", "add", "-q", "--detach", sibling, "HEAD")
+    r = subprocess.run(["bash", "-c", f'cd "{c}" && source scripts/git-helpers.sh && crewvia_remove_worktree m-sub t001 foo'],
+                       capture_output=True, text=True, timeout=120, env=env)
+    assert r.returncode == 0, r.stderr
+    assert "skipping" in r.stderr, r.stderr
+    assert Path(sibling).is_dir()

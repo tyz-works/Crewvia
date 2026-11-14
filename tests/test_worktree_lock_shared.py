@@ -322,3 +322,56 @@ def test_remove_worktree_does_not_match_a_longer_sibling_path(tmp_path):
     assert r.returncode == 0, r.stderr
     assert "skipping" in r.stderr, r.stderr
     assert Path(sibling).is_dir()
+
+
+# ---- t001 (mission 20261114-wt-lock-held-test): git の実行「中」もロックが握られている ----
+def _probing_git_stub(tmp_path):
+    """rev-parse は本物へ。それ以外は、旧名・新名の両方に flock -n を試して結果を書く stub の git。
+
+    stub は fd 8/9 を継いでいない (crewvia_wt_git が 8>&- 9>&- で閉じる) ので、ここでの flock -n は
+    別の open file description からの取得になる。握っているのは subshell だけ。
+    subshell の最後のコマンドが exec で git に置き換わると、その fd が閉じてここで取れてしまう。
+    """
+    real = shutil.which("git")
+    stub = tmp_path / "stubbin"
+    stub.mkdir()
+    out = tmp_path / "probe.txt"
+    (stub / "git").write_text(textwrap.dedent(f"""\
+        #!/usr/bin/env bash
+        for a in "$@"; do
+          if [[ "$a" == rev-parse ]]; then exec "{real}" "$@"; fi
+        done
+        gcd="$("{real}" -C "${{@:2:1}}" rev-parse --path-format=absolute --git-common-dir)"
+        : > "{out}"
+        for name in kai-review-worktree.lock crewvia-worktree.lock; do
+          flock -n "$gcd/$name" true
+          echo "$name $?" >> "{out}"
+        done
+        exit 0
+        """))
+    (stub / "git").chmod(0o755)
+    return stub, out
+
+
+def _assert_both_locks_were_held(out: Path):
+    got = dict(l.split() for l in out.read_text().splitlines())
+    assert set(got) == {"kai-review-worktree.lock", "crewvia-worktree.lock"}, got
+    # flock -n が取れなかった (rc=1) = git の実行中もロックが握られている。0 なら外れている。
+    assert got == {"kai-review-worktree.lock": "1", "crewvia-worktree.lock": "1"}, got
+
+
+def test_both_locks_are_held_while_git_runs(tmp_path):
+    c = _clone(tmp_path)
+    stub, out = _probing_git_stub(tmp_path)
+    r = _bash(f'source "{LIB}"; PATH="{stub}:$PATH" crewvia_wt_git "{c}" fetch origin')
+    assert r.returncode == 0, r.stderr
+    _assert_both_locks_were_held(out)
+
+
+def test_both_locks_are_held_while_git_runs_via_python_entry(tmp_path):
+    c = _clone(tmp_path)
+    stub, out = _probing_git_stub(tmp_path)
+    env = {**os.environ, "PATH": f"{stub}:{os.environ['PATH']}"}
+    rc, _o, err = pylock.wt_git(c, "fetch", "origin", timeout=60, env=env)
+    assert rc == 0, err
+    _assert_both_locks_were_held(out)

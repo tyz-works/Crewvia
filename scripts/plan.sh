@@ -6156,11 +6156,24 @@ def cmd_snapshot(args):
     with_lock(_do)
 
 
+_NOTE_HEADING_RE = re.compile(r'^(?=#)', re.MULTILINE)
+
+
+def _escape_note_headings(notes):
+    """notes の行頭の `#` を `\\#` にして、見出し (`## ` 節・`### ` 項目) として読まれないようにする (#382 P3-3)。
+
+    `## Verification` の項目は `### <時刻>` で割り `## ` で節を切る読み手 (keep_known_appendices / result_section /
+    _verification_recorded) が居る。notes の `## x` / `### y` がそのまま入ると節や項目が割れる。書き込みと再送の照合が
+    通る `_verification_entry_tail` の 1 か所で変換する (読み手は変えない)。`\\#` は Markdown ではただの `#` の表示で、
+    中身は失われない。`####` 以下への降格にしないのは、どの段も行頭 `#` のままで将来の `^#+` 読み手に割られるため。"""
+    return _NOTE_HEADING_RE.sub('\\\\', notes)
+
+
 def _verification_entry_tail(execution_tag, verdict, notes):
     """## Verification の 1 項目の、時刻の行より後ろ。再送の照合はこの全文一致 (試行・verdict・notes)。"""
     lines = [f"**Verdict:** {verdict}", f"**Execution:** {execution_tag}"]
     if notes:
-        lines.append(f"**Notes:** {notes}")
+        lines.append(f"**Notes:** {_escape_note_headings(notes)}")
     return '\n'.join(lines)
 
 

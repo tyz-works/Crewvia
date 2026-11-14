@@ -267,7 +267,7 @@ crewvia_remove_worktree() {
     echo "crewvia_remove_worktree: worktree list を取れません (ロック待ちの時間切れか git の失敗): $worktree_path" >&2
     return 1
   }
-  if ! grep -qF "worktree ${worktree_path}" <<<"$wt_list"; then
+  if ! grep -qxF "worktree ${worktree_path}" <<<"$wt_list"; then
     echo "crewvia_remove_worktree: worktree not found, skipping: $worktree_path" >&2
     return 0
   fi

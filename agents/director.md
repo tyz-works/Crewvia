@@ -1157,6 +1157,10 @@ merge task、という 4 段構成でも merge task まで届く）。`deliverab
 PR か一意に決まらない）には書き込まず、理由を stderr に出すだけで止める — Director が手で `--pr-number`
 を入れること。PR 番号待ちで止めておきたい task は drafting のうちから `status: blocked` + `blocked_reason`
 で積める（lint が受理する）。
+**動いている mission の task を手で止める**とき（触るファイルが先行 PR と重なるので merge まで止める等）は
+`plan.sh update <id> --mission <slug> --status blocked --blocked-reason "<理由 1 行・500 字まで>"`
+（理由なしの blocked は lint が FAIL にする）。戻すときは `--status pending`（`blocked_reason` は自動で消える）。
+理由だけの書き換えは blocked の card に `--blocked-reason` を単独で渡す。blocked にならない card への指定は拒否される。
 既に PR が存在する場合だけ `--pr-number <N>` で最初から入れる。`--pr` は Result 1 行目の `PR #<N>` と一緒に付ける。
 **`--pr` の付け忘れは仕組みで止まる**（t036）: その task を `blocked_by` に持つ未終了の codex-review に `pr_number` が
 無いのに `--pr` が無いと `done` は拒否する（exit 2・何も書かない）。PR を作らない task は

@@ -76,6 +76,19 @@ import time
 from pathlib import Path
 
 
+def _write_fake_node(path):
+    """`node` という名前の「長く生きて fork しない子」を作る。
+
+    以前は `path.symlink_to("/bin/sleep")` だった。Ubuntu 26.04 の `/bin/sleep` は uutils
+    (Rust coreutils) のマルチコール バイナリで、argv[0] が `node` だと
+    `Requested utility `node` does not match executable name` で起動を断る
+    (20261118-ci-ubuntu-2604 t003)。分類は名前を見ない (comm でなく構造・exe・環境変数)
+    ので、sh で `exec sleep` する実体ファイルで足りる。exec で environ はそのまま残る。
+    """
+    path.write_text('#!/bin/sh\nexec /bin/sleep "$@"\n')
+    path.chmod(0o755)
+
+
 def _infra_env() -> dict:
     """t091: 明示的に `CLAUDECODE=1` だけを持つ environ (`CLAUDE_CODE_CHILD_SESSION`
     / `CLAUDE_CODE_EXECPATH` は持たない) — 「確証のある infra」(MCP サーバー相当)
@@ -242,7 +255,7 @@ def worker_pane(tmp_path):
     shutil.copy2("/bin/sh", claude_bin)
     claude_bin.chmod(0o755)
     node_bin = tmp_path / "node"
-    node_bin.symlink_to("/bin/sleep")
+    _write_fake_node(node_bin)
     path_value = shlex.quote(os.environ.get("PATH", "/usr/bin:/bin"))
     session_cmd = (
         f'env -i PATH={path_value} {claude_bin} -c '
@@ -443,7 +456,7 @@ def test_startup_children_are_not_executing(tmp_path):
     (既知インフラ) にした symlink 経由で確かめる。
     """
     node_bin = tmp_path / "node"
-    node_bin.symlink_to("/bin/sleep")
+    _write_fake_node(node_bin)
     root = subprocess.Popen(
         ["sh", "-c", f"{node_bin} 30 & wait"],
         env=_infra_env(), start_new_session=True,

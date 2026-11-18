@@ -112,7 +112,10 @@ CLAUDE_VERSIONS_DIR="$ROOT/share/claude/versions"
 mkdir -p "$CLAUDE_VERSIONS_DIR"
 cp /bin/sh "$CLAUDE_VERSIONS_DIR/9.9.9"
 chmod +x "$CLAUDE_VERSIONS_DIR/9.9.9"
-ln -sf /bin/sleep "$FAKE_BIN_DIR/node"
+# symlink ではなく sh で `exec sleep` する実体にする: Ubuntu 26.04 の /bin/sleep は uutils の
+# マルチコール バイナリで、argv[0] が node だと起動を断る (20261118-ci-ubuntu-2604 t003)。
+printf '#!/bin/sh\nexec /bin/sleep "$@"\n' > "$FAKE_BIN_DIR/node"
+chmod +x "$FAKE_BIN_DIR/node"
 
 # Bash tool / Monitor が実際に生成する wrapper の形 (t074 実測) を再現するための
 # 使い捨て snapshot ファイル。中身は無害な no-op — 分類はパスの文字列

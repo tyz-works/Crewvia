@@ -605,6 +605,26 @@ fi
 # -C "$REVIEW_WT" で作業ディレクトリを指定する (codex が周辺コードを読む際の cwd)。
 # --sandbox read-only: レビューは書き込みを必要としないため、誤って
 # ファイルを変更されるリスクを構造的に無くす。
+# timeout --kill-after の「孤児を残さない」版 (20261118-ci-ubuntu-2604 t003)。
+#   usage: _timeout_kill_group <kill-after> <timeout> <cmd> [args...]   (exit code は timeout のもの: 124 / 137)
+# Ubuntu 26.04 の timeout は uutils (Rust coreutils) 0.10.0 で、--kill-after の SIGKILL を直接の子の pid にしか
+# 送らない (GNU は自分の process group 全体)。SIGTERM を無視する子 (codex / cursor-agent / claude が起こした
+# 孫を含む) が孤児で残り、`| tee` や `>file` の下で出力の pipe を握り続けて、timeout をかけたはずの kai-review が
+# 孫の寿命まで無言で座り続けた (t009 が塞いだ穴の再発)。timeout は自分で group leader になる (setpgid(0,0)) ので、
+# exec 前の subshell の pid = その group id。timeout が 124 / 137 で戻ったら、その group に残った子孫へ KILL を送る。
+# 正常終了 (rc=0) と他の失敗では何も送らない。GNU では group が空なので ESRCH で何も起きない。
+_timeout_kill_group() {
+  local ka="$1" t="$2" rc=0 pgf pg
+  shift 2
+  pgf="$(mktemp)" || { timeout --kill-after="$ka" "$t" "$@"; return; }
+  ( echo "$BASHPID" >"$pgf"; exec timeout --kill-after="$ka" "$t" "$@" ) || rc=$?
+  pg="$(cat "$pgf" 2>/dev/null)"; rm -f "$pgf"
+  if [[ ( $rc -eq 124 || $rc -eq 137 ) && "$pg" =~ ^[0-9]+$ ]]; then
+    kill -KILL -- "-${pg}" 2>/dev/null || true
+  fi
+  return "$rc"
+}
+
 # timeout (t009): codex 本体が応答しない・無言で座り込む場合、他の 3 エンジン (agy / cursor / claude)
 # と違って上限が無く、watchdog の timeout.max (review card は 7200 秒) まで無言で座り続けていた
 # (t007/Seo が PR #352 レビューで発見)。cursor / claude と同じ書き方 (timeout --kill-after) で揃える:
@@ -616,7 +636,7 @@ CODEX_KILL_AFTER_SECONDS=10
 run_codex_review() {
   _info "Running codex exec -C ${REVIEW_WT} --output-schema ... ${MODEL:+-m $MODEL} (diff=${DIFF_BYTES} bytes, timeout=${CODEX_TIMEOUT}s) ..."
   CODEX_EXIT=0
-  printf '%s' "$DIFF_CONTENT" | timeout --kill-after="${CODEX_KILL_AFTER_SECONDS}s" "${CODEX_TIMEOUT}s" codex exec -C "$REVIEW_WT" \
+  printf '%s' "$DIFF_CONTENT" | _timeout_kill_group "${CODEX_KILL_AFTER_SECONDS}s" "${CODEX_TIMEOUT}s" codex exec -C "$REVIEW_WT" \
     --sandbox read-only \
     --output-schema "$SCHEMA_FILE" \
     ${MODEL:+-m "$MODEL"} \
@@ -786,7 +806,7 @@ Read the unified diff from the file ${CURSOR_DIFF_DIR}/review.diff (it is outsid
 You may read files in this checkout to verify the code. Do not run commands. Do not create or modify any file.
 Your final message must END with the JSON object required by the schema (starting with {\"findings\"), with nothing after it."
   _info "Running cursor-agent --mode plan --model ${CURSOR_MODEL} (diff=${DIFF_BYTES} bytes, timeout=${CURSOR_TIMEOUT}s) ..."
-  ( cd "$CURSOR_WT" && timeout --kill-after="${CURSOR_KILL_AFTER_SECONDS}s" "${CURSOR_TIMEOUT}s" cursor-agent -p --model "$CURSOR_MODEL" --mode plan --trust \
+  ( cd "$CURSOR_WT" && _timeout_kill_group "${CURSOR_KILL_AFTER_SECONDS}s" "${CURSOR_TIMEOUT}s" cursor-agent -p --model "$CURSOR_MODEL" --mode plan --trust \
       --output-format json --add-dir "$CURSOR_DIFF_DIR" "$prompt" ) >"$CURSOR_OUT_FILE" 2>"$CURSOR_ERR_FILE" || rc=$?
   if [[ $rc -eq 124 ]]; then CURSOR_FAIL="timeout"; return 1; fi
   if [[ $rc -eq 137 ]]; then CURSOR_FAIL="timeout_killed"; return 1; fi   # SIGTERM を無視して --kill-after で落とした
@@ -865,7 +885,7 @@ Do not create, modify or delete any file. Return only the JSON object required b
     while IFS= read -r _v; do
       [[ "$CLAUDE_ENV_KEEP" == *" $_v "* ]] || unset "$_v" 2>/dev/null || true
     done < <(compgen -e)
-    exec timeout --kill-after="${CLAUDE_KILL_AFTER_SECONDS}s" "${CLAUDE_TIMEOUT}s" claude -p \
+    _timeout_kill_group "${CLAUDE_KILL_AFTER_SECONDS}s" "${CLAUDE_TIMEOUT}s" claude -p \
       --output-format json --json-schema "$schema" --permission-mode plan --model "$CLAUDE_MODEL" \
       --setting-sources user --strict-mcp-config --no-session-persistence \
       --add-dir "$CLAUDE_DIFF_DIR" \

@@ -513,7 +513,10 @@ def test_concurrent_ledger_writers_do_not_lose_each_others_entries(tmp_path):
     エントリが消える。消えたのが dispatcher のエントリなら、対処済みの通知が再送される。
     """
     path = str(tmp_path / "daemons" / "notified-state.json")
-    procs = [multiprocessing.Process(target=_hammer, args=(path, f"p{k}", 40)) for k in range(4)]
+    # fork を明示する: Python 3.14 の既定は forkserver で、補助プロセス (resource_tracker /
+    # forkserver) がテストの後に残り、子孫リーク検査が ERROR にする (Ubuntu 26.04 の python3 = 3.14)。
+    ctx = multiprocessing.get_context("fork")
+    procs = [ctx.Process(target=_hammer, args=(path, f"p{k}", 40)) for k in range(4)]
     for p in procs:
         p.start()
     for p in procs:

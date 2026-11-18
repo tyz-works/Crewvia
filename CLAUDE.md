@@ -102,7 +102,7 @@ registry/ workers.yaml（git 管理外・無ければ lib_registry が空から�
 5. 共有規則に env 停止スイッチを付けない（dispatcher と plan.sh で答えが割れる）
 6. `handoff_path` は絶対パスのみ
 7. `registry/daemons/*` の通知台帳（`notified-state.json`）・拒否記録（`review-refusals/`）・Telegram の状態（`telegram-questions.json` / `telegram-offset.json` / `telegram-send.json` / `telegram-receiver.json`）・段階上げの台帳（`escalation-state.json`。消すと時計が最初からになる = 通知が遅れる側）・IRC 中継の状態（`irc-state.json` = cursor と未配達。消すと bot が預かっている最大 24 時間分がもう一度届く（重複はあるが失われない）／`irc-quarantine.json` = identity が変わったときに退避した旧い未配達。消すとそれが失われる（24 時間で価値が無くなる通知なので許容）／`irc-receiver.json` = 受信側の心拍。次のサイクルで書き直される）は消してよい。それが復旧手順（質問台帳を消すと古いボタンが「不明」で断られるだけ）
-8. 本番機の `/usr/bin/python3` は触らない（apt が依存するため、常に OS 既定のバージョンのまま）。crewvia の文脈（`start.sh` 経由で起動したセッション）でだけ、`scripts/bin` が PATH の先頭にあることで `scripts/bin/python3` という shim が `python3.12` に解決し、bare `python3` / `#!/usr/bin/env python3` の呼び出し（全 call site がこの形）を 3.12 へ振り向ける。デーモン起動・respawn は `lib_daemon_watch.py spawn_command()` が同じ PATH export を埋め込む。経緯・実測・戻し方: `knowledge/python312-runtime-migration.md`
+8. 本番機の `/usr/bin/python3` は触らない（apt が依存するため、常に OS 既定のバージョンのまま）。crewvia の文脈（`start.sh` 経由で起動したセッション）でだけ、`scripts/bin` が PATH の先頭にあることで `scripts/bin/python3` という shim が `python3.12` に解決し（無ければ 3.12 以上の別の `python3`。無ければ 127。26.04 対応・`knowledge/ubuntu-2604-ci.md`）、bare `python3` / `#!/usr/bin/env python3` の呼び出し（全 call site がこの形）を 3.12 へ振り向ける。デーモン起動・respawn は `lib_daemon_watch.py spawn_command()` が同じ PATH export を埋め込む。経緯・実測・戻し方: `knowledge/python312-runtime-migration.md`
 
 ---
 

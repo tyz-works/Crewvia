@@ -166,10 +166,11 @@ ALLOWED_WRITES: dict[tuple[str, str], tuple[int, str]] = {
     ('git-helpers.sh', '<bash>'): (1, R_DIR + "。git worktree の親 dir (`mkdir -p \"$(dirname \"$worktree_path\")\"`)。queue の外。"
                                       "コメント中の `<<X` が走査を打ち切っていたときは見えなかった (t035)"),
     ('lib_worktree_lock.sh', '<bash>'): (2, R_LOCK + "。t001: worktree add / remove・fetch を repo 単位で直列化する flock のロックファイル (.git 配下の空ファイル `8>>` / `9>>`。新名 crewvia-worktree.lock と移行用の旧名 kai-review-worktree.lock)。状態を持たない・queue / registry ではない。"),
-    ('kai-review.sh', '<bash>'): (49, R_MARK + "。reviewer の heartbeat と、review の一時ファイル / worktree (" + R_TMP + ")。"
+    ('kai-review.sh', '<bash>'): (51, R_MARK + "。reviewer の heartbeat と、review の一時ファイル / worktree (" + R_TMP + ")。"
                                  "card に残す Result の一時ファイル (mktemp。queue / registry ではない)。"
                                  "t002: git worktree add / remove の直列化 (flock のロックファイル) は今は lib_worktree_lock.sh の crewvia_wt_git に寄せてあり (その行は上の lib_worktree_lock.sh)、この行の件数は kai-review.sh の他の書き込みの数。状態を持たない・queue / registry ではない。"
                                  "t080: agy の diff / 出力 / stderr の一時 dir・ファイル (mktemp。worktree の外・queue / registry ではない)。"
+                                 "20261118-ci-ubuntu-2604 t003: _timeout_kill_group が timeout の group id (pid) を控える mktemp の一時ファイル (書いて読んで消す。queue / registry ではない) の 2 件。"
                                  "claude / ensemble: claude の diff / git log / 出力 / stderr と、合議で 2 者の findings を合わせる一時ファイル (同上)。"
                                  "t001 (mission 20261113-approval-gate-holes): LGTM 経路で done を呼ぶ直前に PR の現head を再確認し、"
                                  "一致すれば approved_head 行を、食い違えば再レビューが要る旨をその Result の一時ファイルに追記する (3 箇所。同じ mktemp ファイル・queue / registry ではない)"),

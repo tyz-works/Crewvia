@@ -175,6 +175,8 @@ paths による絞りは**当面やらない**。得られる短縮が小さく�
 
 ### 6.2 CI での見積もり
 
+> 注 (2026-11-18): ubuntu-latest が 26.04 に切り替わり main CI が赤になったため、ci.yml の runs-on は ubuntu-24.04 に固定中（26.04 対応は mission 20261118-ci-ubuntu-2604 t003）。以下の `ubuntu-latest` は固定前の記述。
+
 GitHub の `ubuntu-latest` は 2〜4 vCPU（public repo は 4、private は 2）。CPU 時間約 74 分を割ると:
 
 | vCPU | 目安 |

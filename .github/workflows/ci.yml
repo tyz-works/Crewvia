@@ -14,8 +14,8 @@ on:
 jobs:
   shell-validate:
     name: Shell Validation
-    # 26.04 対応は t003 (mission 20261118-ci-ubuntu-2604) で。それまで 24.04 に固定
-    runs-on: ubuntu-24.04
+    # 26.04 で確認済み (knowledge/ubuntu-2604-ci.md)。ubuntu-latest には戻さない (次のイメージ切り替えで不意に赤くならないよう明示固定)
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v4
 
@@ -52,8 +52,8 @@ jobs:
 
   yaml-validate:
     name: YAML Validation
-    # 26.04 対応は t003 (mission 20261118-ci-ubuntu-2604) で。それまで 24.04 に固定
-    runs-on: ubuntu-24.04
+    # 26.04 で確認済み (knowledge/ubuntu-2604-ci.md)。ubuntu-latest には戻さない (次のイメージ切り替えで不意に赤くならないよう明示固定)
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v4
 
@@ -80,8 +80,8 @@ jobs:
   # 1 本ずつ走らせて結果を出し、1 本落ちても残りは止めない。knowledge/ci-script-tests.md
   script-tests:
     name: scripts/test_*.sh (all, minus the reasoned allowlist)
-    # 26.04 対応は t003 (mission 20261118-ci-ubuntu-2604) で。それまで 24.04 に固定
-    runs-on: ubuntu-24.04
+    # 26.04 で確認済み (knowledge/ubuntu-2604-ci.md)。ubuntu-latest には戻さない (次のイメージ切り替えで不意に赤くならないよう明示固定)
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v4
         with:
@@ -108,8 +108,8 @@ jobs:
   # 必要としない。knowledge/ci-script-tests.md
   tests-sh-tests:
     name: tests/*.sh (all, minus the reasoned allowlist)
-    # 26.04 対応は t003 (mission 20261118-ci-ubuntu-2604) で。それまで 24.04 に固定
-    runs-on: ubuntu-24.04
+    # 26.04 で確認済み (knowledge/ubuntu-2604-ci.md)。ubuntu-latest には戻さない (次のイメージ切り替えで不意に赤くならないよう明示固定)
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v4
 
@@ -118,8 +118,8 @@ jobs:
 
   bats:
     name: Bats Unit Tests
-    # 26.04 対応は t003 (mission 20261118-ci-ubuntu-2604) で。それまで 24.04 に固定
-    runs-on: ubuntu-24.04
+    # 26.04 で確認済み (knowledge/ubuntu-2604-ci.md)。ubuntu-latest には戻さない (次のイメージ切り替えで不意に赤くならないよう明示固定)
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v4
 
@@ -133,8 +133,8 @@ jobs:
 
   pytest:
     name: Python Unit Tests (pytest)
-    # 26.04 対応は t003 (mission 20261118-ci-ubuntu-2604) で。それまで 24.04 に固定
-    runs-on: ubuntu-24.04
+    # 26.04 で確認済み (knowledge/ubuntu-2604-ci.md)。ubuntu-latest には戻さない (次のイメージ切り替えで不意に赤くならないよう明示固定)
+    runs-on: ubuntu-26.04
     # fork() とスレッドの組み合わせ（execnet の worker）で止まると、既定では 6 時間まで終わらない。
     timeout-minutes: 60
     steps:
@@ -171,8 +171,8 @@ jobs:
     name: ci-ok
     if: always()
     needs: [shell-validate, yaml-validate, script-tests, tests-sh-tests, bats, pytest]
-    # 26.04 対応は t003 (mission 20261118-ci-ubuntu-2604) で。それまで 24.04 に固定
-    runs-on: ubuntu-24.04
+    # 26.04 で確認済み (knowledge/ubuntu-2604-ci.md)。ubuntu-latest には戻さない (次のイメージ切り替えで不意に赤くならないよう明示固定)
+    runs-on: ubuntu-26.04
     steps:
       - name: every needed job must be success
         env:

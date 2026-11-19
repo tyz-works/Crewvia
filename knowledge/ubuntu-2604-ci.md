@@ -79,6 +79,14 @@ python3 -m pytest tests/test_watchdog_idle.py tests/test_kai_review_engine_*.py 
 git は `init -b main` (既定の master だと plan.sh pull の worktree 作成が `invalid reference: main` で落ちる。
 CI の checkout は main)。
 
+## 後片付け (20261119-ci-2604-unpin-shim-recursion t001)
+
+- ci.yml の `runs-on` は 24.04 の応急固定 (#413) から **`ubuntu-26.04` の明示固定**に替えた（`ubuntu-latest` には戻さない）。
+- shim の再帰: PATH に別 checkout の `scripts/bin` (同じ shim) が並ぶと、here だけ飛ばしても A→B→A… と再帰した。
+  版検査の候補を `CREWVIA_PY3_SHIM=1` を立てて起こし、立って起動された shim は 127 で即終了する（呼んだ側は次の候補へ）。
+  python3.12 がある本番は手前の exec で終わるので挙動は変わらない。テスト: `tests/test_python3_shim_no_recursion.py`。
+- **再現テストは必ず別 process group + killpg(STOP→KILL)**。`subprocess.run(timeout=)` は孫を殺さず fork 爆弾になる (9,500 プロセスで rex.service が止まった)。変更前コードで走らせるときは `systemd-run --user --scope -p TasksMax=64 -p RuntimeMaxSec=60 -- …`。
+
 ## 関連
 
 - `knowledge/python312-runtime-migration.md` (shim の経緯)

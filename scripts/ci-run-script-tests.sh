@@ -27,6 +27,17 @@ esac
 
 # --- 除外ファイルを読む（ここで形式を検査する。黙って読み飛ばさない） ---
 excluded=""   # 改行区切りの path 一覧
+
+# 除外一覧に完全一致する行があるか。`printf | grep -q` にしない: set -o pipefail 下で
+# grep -q が先に抜けると printf が SIGPIPE (141) で落ち、pipeline が「一致なし」になる
+# （xdist 並列の CI で 1 回だけ SKIP が 1 行欠けた原因。t002 / 20261119-checkpoint-p3-allowlist-flake）。
+# パイプを使わない case の完全一致にする（行の前後に改行を足して部分一致を防ぐ）。
+in_excluded() {
+  case $'\n'"$excluded"$'\n' in
+    *$'\n'"$1"$'\n'*) return 0 ;;
+  esac
+  return 1
+}
 problems=0
 if [ ! -f "$ALLOWLIST" ]; then
   echo "[ci-script-tests] ERROR: 除外ファイルが無い: ${ALLOWLIST#"$ROOT"/}" >&2
@@ -66,7 +77,7 @@ while IFS= read -r line || [ -n "$line" ]; do
     echo "[ci-script-tests] ERROR: ${ALLOWLIST#"$ROOT"/}:$lineno: 存在しないファイル: $path" >&2
     problems=$((problems + 1)); continue
   fi
-  if printf '%s\n' "$excluded" | grep -qxF -- "$path"; then
+  if in_excluded "$path"; then
     echo "[ci-script-tests] ERROR: ${ALLOWLIST#"$ROOT"/}:$lineno: 重複: $path" >&2
     problems=$((problems + 1)); continue
   fi
@@ -85,7 +96,7 @@ for f in "$ROOT"/scripts/test_*.sh; do
   [ -f "$f" ] || continue
   rel="scripts/$(basename "$f")"
   total=$((total + 1))
-  if [ -n "$excluded" ] && printf '%s\n' "$excluded" | grep -qxF -- "$rel"; then
+  if [ -n "$excluded" ] && in_excluded "$rel"; then
     skipped=$((skipped + 1))
     [ "$mode" = list ] && echo "SKIP $rel"
     continue

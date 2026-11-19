@@ -650,6 +650,8 @@ def test_sweep_removes_only_old_matching_own_dirs(tmp_path):
     outside = tmp_path / "outside"
     outside.mkdir()
     (outside / "keep").write_text("k")
+    old_t = time.time() - 7200
+    os.utime(outside, (old_t, old_t))   # 年齢の検査で外れず、lstat → stat の退行 (リンク先を dir として消す) が赤になる
     link = tmp / "crewvia-ck-index-link0001"
     link.symlink_to(outside)
     assert ck.sweep_stale_index_dirs(tmp_root=tmp) == 1
@@ -688,3 +690,17 @@ def test_take_sweeps_stale_dirs_in_tmp(wt, tmp_path, monkeypatch):
     monkeypatch.setattr(ck.tempfile, "gettempdir", lambda: str(tmp))
     take(wt, tmp_path)
     assert not old.exists()
+
+
+def test_index_tmp_max_age_follows_checkpoint_seconds(monkeypatch):
+    import lib_daemon_watch as dw
+    for secs, want in ((20, 3600.0), (10, 3600.0), (60, 10800.0), (0, 3600.0), (-5, 3600.0)):
+        cfg = dw.WatchConfig()
+        cfg.checkpoint_seconds = secs
+        monkeypatch.setattr(dw, "load_config", lambda cfg=cfg: cfg)
+        assert ck.index_tmp_max_age() == want
+
+    def boom():
+        raise OSError("unreadable")
+    monkeypatch.setattr(dw, "load_config", boom)
+    assert ck.index_tmp_max_age() == ck.INDEX_TMP_MAX_AGE

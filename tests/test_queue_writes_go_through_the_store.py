@@ -195,7 +195,9 @@ ALLOWED_WRITES: dict[tuple[str, str], tuple[int, str]] = {
     ('sh_perm_manager.sh', '<module>'): (2, "hook の権限設定のスナップショット。queue の外"),
     ('notification.sh', '<bash>'): (2, R_MARK + "。registry/notifications/"),
     ('post-tool-use.sh', '<bash>'): (5, R_MARK + "。heartbeat / activity / backstop の throttle 印"),
-    ('pre-tool-use.sh', '<bash>'): (2, R_LOG + "。approvals.tsv"),
+    ('pre-tool-use.sh', '<bash>'): (9, R_LOG + "。approvals.tsv。+7 = 判定 python の stderr を受ける `mktemp` の一時ファイル"
+                                    "(`2>\"$_JERR\"` ×3 と `rm -f \"$_JERR\"` ×4。判定の起動失敗の理由 rc/stderr を拒否文言に載せる用。"
+                                    "queue / registry ではなくその 1 回の実行だけ。" + R_TMP + ")"),
     ('pre-compact.sh', '<bash>'): (1, R_LOG + "。card が書けなかったときの pre-compact-fallback.log。card 本文は `plan.sh snapshot` (lib 経由) だけが書く"),
     ('lib_skill_perms.py', 'load_config'): (5, R_TMP + "。権限設定のキャッシュ (/tmp、tmp+rename)"),
     ('worktree_gc.py', 'apply_quarantine'): (1, "worktree の隔離先 dir の作成。queue の外 (削除はしない)"),

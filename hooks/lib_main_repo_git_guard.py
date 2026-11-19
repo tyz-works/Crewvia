@@ -228,6 +228,13 @@ def decide(command: str, repo_abs: str) -> str:
 
 
 def main() -> int:
+    # 2 引数 (repo_abs) + stdin = command を stdin から読む (hook 用。argv は 128KB で E2BIG)。
+    # 3 引数 (command repo_abs) は互換のため残す。
+    if len(sys.argv) == 2:
+        command = sys.stdin.read()
+        if command.endswith("\n"):  # here-string が足す 1 個の改行
+            command = command[:-1]
+        sys.argv.insert(1, command)
     if len(sys.argv) != 3:
         print("OK")
         return 0

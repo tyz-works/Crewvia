@@ -314,7 +314,14 @@ if [ "$TOOL_NAME" = "Bash" ] && [ -n "$COMMAND" ] \
   if [ -d "${_MRG_REPO_REAL}/.git" ]; then
     _MRG_GUARD_PY="${_CREWVIA_REPO}/hooks/lib_main_repo_git_guard.py"
     if [ -f "$_MRG_GUARD_PY" ]; then
-      _MRG_RESULT="$(python3 "$_MRG_GUARD_PY" "$COMMAND" "$_MRG_REPO_REAL" 2>/dev/null || echo OK)"
+      # command は stdin で渡す (argv は 128KB で E2BIG → 判定が走らず通る穴だった)。
+      # 起動失敗・想定外の出力は許可でなく拒否に倒す (fail-closed)。
+      _MRG_RESULT="$(python3 "$_MRG_GUARD_PY" "$_MRG_REPO_REAL" <<<"$COMMAND" 2>/dev/null)" || _MRG_RESULT="FAIL"
+      if [ "$_MRG_RESULT" != "OK" ] && [ "$_MRG_RESULT" != "DENY" ]; then
+        echo "[pre-tool-use] 🚫 main repo guard: 判定の起動に失敗 (fail-closed)" >&2
+        emit_decision "deny" "main repo guard の判定の起動に失敗したため拒否します (判定の起動に失敗)。"
+        exit 0
+      fi
       if [ "$_MRG_RESULT" = "DENY" ]; then
         echo "[pre-tool-use] 🚫 main repo destructive git op via Bash blocked: $(echo "$COMMAND" | head -c 200)" >&2
         emit_decision "deny" "worktree Worker が主リポジトリ (${_CREWVIA_REPO}) に対して破壊的な git 操作を Bash 経由で実行しようとしました。worktree 内 (cwd: $(pwd)) で git 操作してください。"
@@ -634,8 +641,14 @@ fi
 # _global.deny は全チェックに先行する絶対安全弁（何があってもバイパスされない）
 # 注意: CREWVIA_TASKVIA=disabled でも _global.deny は発動する（意図的な設計）
 if [ -f "$_SKILL_PERMS_YAML" ] && [ -f "$_SKILL_PERMS_PY" ]; then
-  _GLOBAL_RESULT="$(python3 "$_SKILL_PERMS_PY" "$_SKILL_PERMS_YAML" "__global_only__" "$_TOOL_SIG" 2>/dev/null || echo '{"decision":"none"}')"
-  _GLOBAL_DECISION="$(echo "$_GLOBAL_RESULT" | jq -r '.decision')"
+  # tool signature は stdin で渡す (argv は 128KB で E2BIG → deny なしに倒れる穴だった)。
+  # 起動失敗は deny に倒す (絶対安全弁なので fail-closed)。
+  _GLOBAL_RESULT="$(python3 "$_SKILL_PERMS_PY" "$_SKILL_PERMS_YAML" "__global_only__" <<<"$_TOOL_SIG" 2>/dev/null)" \
+    || _GLOBAL_RESULT='{"decision":"deny","source":"判定の起動に失敗 (fail-closed)"}'
+  _GLOBAL_DECISION="$(echo "$_GLOBAL_RESULT" | jq -r '.decision' 2>/dev/null)" || _GLOBAL_DECISION="deny"
+  case "$_GLOBAL_DECISION" in deny|none|allow) ;; *)
+    _GLOBAL_DECISION="deny"; _GLOBAL_RESULT='{"decision":"deny","source":"判定の起動に失敗 (出力不正・fail-closed)"}' ;;
+  esac
   if [ "$_GLOBAL_DECISION" = "deny" ]; then
     _GLOBAL_SOURCE="$(echo "$_GLOBAL_RESULT" | jq -r '.source // "unknown"')"
     echo "[skill-perms] ❌ global denied: ${_TOOL_SIG} (${_GLOBAL_SOURCE})" >&2
@@ -734,8 +747,14 @@ if [ -n "${SKILLS:-}" ] && [ -f "$_SKILL_PERMS_YAML" ] && [ -f "$_SKILL_PERMS_PY
     [ -n "$_TS" ] && _TASK_SKILLS="$_TS"
   fi
 
-  _PERM_RESULT="$(python3 "$_SKILL_PERMS_PY" "$_SKILL_PERMS_YAML" "$_TASK_SKILLS" "$_TOOL_SIG" 2>/dev/null || echo '{"decision":"none"}')"
-  _PERM_DECISION="$(echo "$_PERM_RESULT" | jq -r '.decision')"
+  # stdin で渡す。起動失敗は none (= 承認に回る/Taskvia 無効時は素通り) でなく deny に倒す
+  # (urgent なら Taskvia の例外承認に回る既存の経路をそのまま使う)。
+  _PERM_RESULT="$(python3 "$_SKILL_PERMS_PY" "$_SKILL_PERMS_YAML" "$_TASK_SKILLS" <<<"$_TOOL_SIG" 2>/dev/null)" \
+    || _PERM_RESULT='{"decision":"deny","source":"判定の起動に失敗 (fail-closed)"}'
+  _PERM_DECISION="$(echo "$_PERM_RESULT" | jq -r '.decision' 2>/dev/null)" || _PERM_DECISION="deny"
+  case "$_PERM_DECISION" in deny|none|allow) ;; *)
+    _PERM_DECISION="deny"; _PERM_RESULT='{"decision":"deny","source":"判定の起動に失敗 (出力不正・fail-closed)"}' ;;
+  esac
   _PERM_SOURCE="$(echo "$_PERM_RESULT" | jq -r '.source // "unknown"')"
 
   case "$_PERM_DECISION" in

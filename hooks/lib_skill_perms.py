@@ -197,6 +197,14 @@ def check_permission(config: dict, skills_csv: str, tool_sig: str) -> dict:
 
 
 def main():
+    # 3 引数 (yaml skills) + stdin = tool_sig を stdin から読む (hook 用。
+    # Linux は 1 引数 128KB で exec が E2BIG になるので大きな command は argv に載せない)。
+    # 4 引数 (yaml skills tool_sig) は lint_plan.py 等の互換のため残す。
+    if len(sys.argv) == 3:
+        tool_sig = sys.stdin.read()
+        if tool_sig.endswith("\n"):  # here-string が足す 1 個の改行
+            tool_sig = tool_sig[:-1]
+        sys.argv.append(tool_sig)
     if len(sys.argv) != 4:
         print(json.dumps({"decision": "none", "source": "usage_error"}))
         sys.exit(0)

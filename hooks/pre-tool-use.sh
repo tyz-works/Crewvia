@@ -54,6 +54,9 @@ _crash_guard_early() {
     echo "[pre-tool-use] ⚠️ crash guard: hook exited without decision" >&2
     # jq に頼らない固定 JSON (jq が無い・起動不能でも必ず deny を出す)。printf は builtin。
     printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"Hook crashed without emitting decision"}}'
+    # EXIT trap の中の exit で終了コードを 0 にする。Claude Code は stdout の JSON を終了コード 0 の
+    # ときだけ処理し、0 / 2 以外 (set -e の 126 等) は「ブロックしないエラー」で通常の権限判定に進む。
+    exit 0
   fi
 }
 trap '_crash_guard_early' EXIT
@@ -92,11 +95,12 @@ fi
 #       ここでは emit_decision を定義し、_APPROVAL_LOG_DIR を設定する。
 _APPROVAL_LOG_DIR="${_CREWVIA_REPO}/registry/approvals"
 
-# 判定 (python) の起動失敗の理由に rc と stderr の先頭 1 行を添える (原因が E2BIG か lib の破損か見分けるため)。
+# 判定 (python) の起動失敗の理由に rc と stderr の最後の空でない行を添える (原因が E2BIG か lib の破損か見分けるため)。
+# 先頭行だと traceback では "Traceback ..." / "File ..." になり例外の種類 (ModuleNotFoundError 等) が載らない。
 # 使い方: _judge_note <rc> <stderr を書いたファイル> → "rc=… stderr=…" を出力 (200 字まで・改行なし)
 _judge_note() {
   local rc="$1" f="$2" line=""
-  [ -s "$f" ] && line="$(head -n 1 "$f" 2>/dev/null | tr -d '\000-\037"\\' | head -c 200)" || true
+  [ -s "$f" ] && line="$(grep -v '^[[:space:]]*$' "$f" 2>/dev/null | tail -n 1 | tr -d '\000-\037"\\' | head -c 200)" || true
   printf 'rc=%s stderr=%s' "$rc" "${line:-<empty>}"
 }
 
@@ -135,6 +139,9 @@ _crash_guard() {
     echo "[pre-tool-use] ⚠️ crash guard: hook exited without decision" >&2
     # jq に頼らない固定 JSON (jq が無い・起動不能でも必ず deny を出す)。printf は builtin。
     printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"Hook crashed without emitting decision"}}'
+    # EXIT trap の中の exit で終了コードを 0 にする。Claude Code は stdout の JSON を終了コード 0 の
+    # ときだけ処理し、0 / 2 以外 (set -e の 126 等) は「ブロックしないエラー」で通常の権限判定に進む。
+    exit 0
   fi
 }
 trap '_crash_guard' EXIT

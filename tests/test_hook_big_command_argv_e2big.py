@@ -171,6 +171,10 @@ def _run_with_jq_shim(hook_root, tmp_path, shim_body):
 
 
 def _assert_valid_deny(r):
+    # Claude Code は PreToolUse hook の stdout の JSON を終了コード 0 のときだけ処理する
+    # (0 / 2 以外は「ブロックしないエラー」で通常の権限判定に進む)。crash guard の deny が
+    # 効くよう、終了コードは 0 (JSON を読ませる) か 2 (stderr で止める) でなければならない
+    assert r.returncode in (0, 2), (r.returncode, r.stderr[:300])
     # silent (stdout 空) を合格にしない。有効な deny JSON が必ず出ること
     assert r.stdout.strip(), (r.returncode, r.stderr[:300])
     out = json.loads(r.stdout.strip().splitlines()[-1])
@@ -191,3 +195,12 @@ def test_all_jq_failure_still_emits_valid_deny(hook_root, tmp_path):
     # jq 全滅 (解析も emit も) でも crash guard が jq に頼らず deny を出す
     r = _run_with_jq_shim(hook_root, tmp_path, "#!/bin/sh\nexit 126\n")
     _assert_valid_deny(r)
+
+
+def test_judge_note_shows_the_exception_type_of_a_broken_lib(hook_root):
+    # python の traceback は先頭行が "Traceback ..." / "File ..." で例外の種類は最後の行にある。
+    # 起動失敗の deny の理由に ModuleNotFoundError 等が載ること
+    (hook_root / "hooks/lib_skill_perms.py").write_text("import crewvia_no_such_module_xyz\n")
+    d = _run(hook_root, "git status")
+    assert d.startswith("deny") and "判定の起動に失敗" in d, d[:300]
+    assert "ModuleNotFoundError" in d, d[:300]

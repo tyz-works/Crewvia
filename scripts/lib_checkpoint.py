@@ -28,8 +28,10 @@ import re
 import select
 import signal
 import stat
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -400,7 +402,7 @@ def _wait_within(clock, proc, hard_stop):
         raise CheckpointError(E_DEADLINE if clock.remaining() <= 0 else E_GIT, 'timeout')
 
 
-def _run_git(clock, worktree, *args, limit=GIT_READ_LIMIT, check=True):
+def _run_git(clock, worktree, *args, limit=GIT_READ_LIMIT, check=True, extra_env=None):
     """`(returncode, stdout_bytes, truncated)`。timeout は残り時間 (上限 GIT_TIMEOUT)。失敗は `E_GIT` (check=True のとき)。"""
     clock.check()
     timeout = max(0.1, min(GIT_TIMEOUT, clock.remaining()))
@@ -408,7 +410,7 @@ def _run_git(clock, worktree, *args, limit=GIT_READ_LIMIT, check=True):
             '-C', worktree, *args]
     try:
         proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
-                                env=_git_env(), start_new_session=True)
+                                env={**_git_env(), **(extra_env or {})}, start_new_session=True)
     except OSError:
         raise CheckpointError(E_GIT, 'spawn')
     chunks, size, truncated = [], 0, False
@@ -445,8 +447,28 @@ def _run_git(clock, worktree, *args, limit=GIT_READ_LIMIT, check=True):
     return proc.returncode, data, truncated
 
 
-def _git_text(clock, worktree, *args, limit=GIT_READ_LIMIT):
-    rc, data, truncated = _run_git(clock, worktree, *args, limit=limit)
+def _run_git_private_index(clock, worktree, *args, limit=GIT_READ_LIMIT):
+    """`_run_git` を、worktree の index の**複製**を `GIT_INDEX_FILE` に渡して走らせる (`diff` 用)。
+
+    `git diff` は stat だけずれた (racy-clean な) entry があると `--no-optional-locks` でも index を書き直す (git 2.43 で実測)。
+    複製は checkpoint の外の一時 dir に作り、必ず消す。**mtime も写す**。env を足すのはこの経路の呼び出しだけ (`_git_env` の allowlist は変えない)。"""
+    _rc, idx_raw, _t = _run_git(clock, worktree, 'rev-parse', '--git-path', 'index')
+    idx = os.path.join(worktree, os.fsdecode(idx_raw).strip('\n'))
+    tmp = tempfile.mkdtemp(prefix='crewvia-ck-index-')
+    try:
+        copy = os.path.join(tmp, 'index')
+        try:
+            shutil.copy2(idx, copy)     # mtime ごと (racy 判定は index の mtime との比較。新しい mtime だと同サイズ・同 mtime の変更を clean と読む)
+        except OSError:
+            raise CheckpointError(E_GIT, 'index_copy')
+        return _run_git(clock, worktree, *args, limit=limit, extra_env={'GIT_INDEX_FILE': copy})
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _git_text(clock, worktree, *args, limit=GIT_READ_LIMIT, private_index=False):
+    run = _run_git_private_index if private_index else _run_git
+    rc, data, truncated = run(clock, worktree, *args, limit=limit)
     return data.decode('utf-8', errors='replace'), truncated
 
 
@@ -891,7 +913,7 @@ def _build(clock, out, worktree, mission, task, execution_id, reason, pane_text,
         patch_raw, patch_trunc, secret_dropped = '', False, 0
     else:
         patch_raw, patch_trunc = _git_text(clock, worktree, 'diff', 'HEAD', '--no-ext-diff', '--no-textconv', '--no-color',
-                                        '--ignore-submodules=all', *pathspec)
+                                        '--ignore-submodules=all', *pathspec, private_index=True)
         patch_raw, secret_dropped = _drop_secret_sections(patch_raw)
         patch_raw, _extra = _drop_block_sections(patch_raw, block_paths)      # pathspec とは独立の網 (二重)
         secret_dropped += _extra
@@ -908,7 +930,7 @@ def _build(clock, out, worktree, mission, task, execution_id, reason, pane_text,
     binary_lines = []
     clock.check()
     numstat, _ = _git_text(clock, worktree, 'diff', 'HEAD', '--numstat', '-z', '--no-ext-diff', '--no-textconv',
-                              '--ignore-submodules=all', *pathspec)
+                              '--ignore-submodules=all', *pathspec, private_index=True)
     secret_excluded = secret_dropped + status_secret_dropped
     block_set = set(block_paths or ())
     for path in _numstat_binary_paths(numstat):
@@ -981,9 +1003,9 @@ _KEY_MARK = b'PRIVATE KEY-----'
 
 
 def _changed_entries(clock, worktree):
-    """`[(状態1文字, path)]` (rename 検出なし = 旧パスと新パスが別の行)。読み切れなければ None。"""
-    _rc, data, truncated = _run_git(clock, worktree, 'diff', 'HEAD', '--name-status', '-z', '--no-renames', '--no-ext-diff',
-                                    '--no-textconv', '--ignore-submodules=all')
+    """`[(状態1文字, path)]` (rename 検出なし = 旧パスと新パスが別の行)。読み切れなければ None。index は複製で読む (racy でも書かない)。"""
+    _rc, data, truncated = _run_git_private_index(clock, worktree, 'diff', 'HEAD', '--name-status', '-z', '--no-renames',
+                                                  '--no-ext-diff', '--no-textconv', '--ignore-submodules=all')
     if truncated:
         return None
     raw = os.fsdecode(data)         # surrogateescape: UTF-8 でない名前も、argv に戻すと元のバイト列になる (exclude が外れない)

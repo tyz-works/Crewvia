@@ -278,3 +278,23 @@ def test_runner_refuses_to_run_without_an_allowlist_file(tree):
     proc = _run_runner(tree.runner)
     assert proc.returncode == 2
     assert "除外ファイルが無い" in proc.stderr
+
+
+def test_runner_matches_allowlist_entry_even_when_the_list_is_long(tree):
+    """t002 (20261119-checkpoint-p3-allowlist-flake): 除外の一致判定は `printf | grep -q` にしない。
+
+    runner は set -o pipefail。grep -q は一致すると先に抜けるので、printf が SIGPIPE (141) で落ち、
+    pipeline 全体が「一致なし」になる。一覧が長いほど確実に起きる（短くても数千回に 1 回、
+    xdist 並列の CI で SKIP が 1 行欠けた原因）。長い除外一覧を置いて、先頭の行が必ず SKIP になることを見る。
+    """
+    names = [f"test_{i:04d}.sh" for i in range(1500)]
+    for n in names:
+        tree.test(n)
+    tree.test("test_keep.sh")
+    tree.allowlist(*[f"scripts/{n} | 理由" for n in names])
+    proc = _run_runner(tree.runner, "--list")
+    assert proc.returncode == 0, f"--list が落ちた: {proc.stdout[-300:]}{proc.stderr[-300:]}"
+    skipped = [ln.split(" ", 1)[1] for ln in proc.stdout.splitlines() if ln.startswith("SKIP ")]
+    assert len(skipped) == len(names), (
+        f"除外一覧に載せた {len(names)} 本のうち SKIP になったのは {len(skipped)} 本"
+        "（pipefail 下の printf | grep -q が SIGPIPE で一致を落としている）")

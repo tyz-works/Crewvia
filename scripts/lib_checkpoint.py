@@ -451,15 +451,37 @@ INDEX_TMP_PREFIX = 'crewvia-ck-index-'
 # mkdtemp の乱数部は 8 文字 (a-z0-9_)。形が一致するものだけを掃除の対象にする
 _INDEX_TMP_RE = re.compile(re.escape(INDEX_TMP_PREFIX) + r'[a-z0-9_]{8}')
 # 実行中の take() の複製を消さないための年齢のしきい値。take() の期限は daemons.checkpoint_seconds (既定 20 秒) で、
-# 複製は take() の中で数秒しか生きない。1 時間はその 180 倍で、設定を大きくしても (数分) 生きている複製に届かない。
+# 複製は take() の中で数秒しか生きない。1 時間はその 180 倍で、既定のままなら生きている複製に届かない。
 INDEX_TMP_MAX_AGE = 3600.0
+# config で checkpoint_seconds を伸ばしたとき、しきい値も max(INDEX_TMP_MAX_AGE, K × checkpoint_seconds) に伸ばす。
+# K = 180 は上の既定の比 (3600 / 20) を保つ値: 複製の寿命の上限は期限そのものなので、期限の 180 倍あれば
+# 実行中の複製を (時計のずれや遅い起動を見込んでも) 消さない。
+INDEX_TMP_AGE_FACTOR = 180
 
 
-def sweep_stale_index_dirs(now=None, tmp_root=None, max_age=INDEX_TMP_MAX_AGE):
+def index_tmp_max_age():
+    """掃除のしきい値 (秒)。`max(INDEX_TMP_MAX_AGE, INDEX_TMP_AGE_FACTOR × daemons.checkpoint_seconds)`。
+
+    checkpoint_seconds の読み口は `lib_daemon_watch.load_config()` の 1 か所 (config を自前で開かない。lib_config 経由)。
+    lib_daemon_watch は lib_retirement 経由でこの lib を import するので、循環を避けて関数の中で import する。
+    **読めない config は今の既定より短くしない**: 壊れ・読み込みの失敗・0 以下 / 非数の値はすべて INDEX_TMP_MAX_AGE。
+    """
+    try:
+        import lib_daemon_watch
+        secs = lib_daemon_watch.load_config().checkpoint_seconds
+        if isinstance(secs, bool) or not isinstance(secs, (int, float)) or secs <= 0:
+            return INDEX_TMP_MAX_AGE
+        return max(INDEX_TMP_MAX_AGE, INDEX_TMP_AGE_FACTOR * float(secs))
+    except Exception:       # 掃除のしきい値のために take() を止めない。迷ったら長い (= 消さない) 側
+        return INDEX_TMP_MAX_AGE
+
+
+def sweep_stale_index_dirs(now=None, tmp_root=None, max_age=None):
     """watchdog が take() の途中で SIGKILL / SIGTERM されると `_run_git_private_index` の一時 dir が残る (中身は index =
     パス名・blob の sha・stat)。古いものを消す。消した数を返す。**失敗は例外にしない** (take() と退役を止めない)。
 
     対象は「名前が mkdtemp の形に一致 ∧ 自分の uid ∧ dir (symlink でない) ∧ mtime が `max_age` より古い」だけ。
+    `max_age` 無指定は `index_tmp_max_age()` (config の期限に追従)。
     消すのは `SafeDir.remove_tree` (dir fd 基点・symlink を辿らない)。
 
     置き場所は take() の冒頭: 掃除の担当を増やさない (checkpoint_gc は「削除を呼ばない」ことを AST で固定しているので
@@ -467,6 +489,7 @@ def sweep_stale_index_dirs(now=None, tmp_root=None, max_age=INDEX_TMP_MAX_AGE):
     removed = 0
     try:
         now = time.time() if now is None else now
+        max_age = index_tmp_max_age() if max_age is None else max_age
         base = os.fspath(tmp_root) if tmp_root is not None else tempfile.gettempdir()
         uid = os.getuid()
         root = SafeDir.open_root(base)
@@ -673,7 +696,7 @@ class SafeDir:
         os.rename(src, dst, src_dir_fd=self.fd, dst_dir_fd=self.fd)
 
     def remove_tree(self, name):
-        """自分が作った dir の掃除 (partial 専用)。`rm -rf` ではなく、symlink を辿らず 1 つずつ unlink / rmdir する。"""
+        """自分が作った dir の掃除 (partial の後始末と、`sweep_stale_index_dirs` の古い index 複製の掃除)。`rm -rf` ではなく、symlink を辿らず 1 つずつ unlink / rmdir する。"""
         st = self.lstat(name)
         if st is None:
             return

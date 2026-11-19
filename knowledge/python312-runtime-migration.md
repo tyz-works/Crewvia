@@ -2,7 +2,7 @@
 
 ## 何が起きたか
 
-CI は `.github/workflows/ci.yml:133` で `ubuntu-latest` + Python 3.12 固定。一方、本番機（Worker/Director
+CI は（この調査当時）`ubuntu-latest` + Python 3.12 固定だった（現在の ci.yml は `runs-on: ubuntu-26.04` を明示固定。経緯は `knowledge/ubuntu-2604-ci.md`）。一方、本番機（Worker/Director
 が実際に動くホスト）は Ubuntu 22.04 / Python 3.10 / git 2.34 だった。この差分がどこにも文書化されておらず、
 CI を素通りしたコードの前提が本番で崩れて複数の実害が出た。すべて実測済み:
 
@@ -36,7 +36,7 @@ CI を素通りしたコードの前提が本番で崩れて複数の実害が�
 
 ## 根本原因
 
-CI のバージョン（`ubuntu-latest` = 直近の Ubuntu LTS、Python 3.12 固定）と本番機の実際のバージョンの対応関係が
+CI のバージョン（当時は `ubuntu-latest` = 直近の Ubuntu LTS、Python 3.12 固定。現在は `ubuntu-26.04` の明示固定・`knowledge/ubuntu-2604-ci.md`）と本番機の実際のバージョンの対応関係が
 どこにも書かれていなかった。そのため「CI が緑 = 本番で動く」という前提が暗黙に信じられていたが、
 本番機は CI より古い Ubuntu 22.04 / Python 3.10 / git 2.34 で、CI が検出できない構文・フラグの非互換が
 本番でだけ顕在化した。

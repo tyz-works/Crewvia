@@ -204,3 +204,25 @@ def test_judge_note_shows_the_exception_type_of_a_broken_lib(hook_root):
     d = _run(hook_root, "git status")
     assert d.startswith("deny") and "判定の起動に失敗" in d, d[:300]
     assert "ModuleNotFoundError" in d, d[:300]
+
+
+def test_early_crash_guard_emits_valid_deny_and_exits_zero(hook_root):
+    # 早い方の crash guard (_crash_guard_early) の経路。lib_approval_channel.sh の source で set -e が
+    # 落ちる場面は、後の方の guard (_crash_guard) を登録する前なので、走るのは early だけ。
+    # Claude Code は stdout の JSON を exit 0 のときだけ適用するので、rc は 0 でなければならない
+    # (_assert_valid_deny の「0 か 2」より厳しく 0 に縛る。exit 0 を外すと source の rc=1 が出る)。
+    (hook_root / "hooks/lib_approval_channel.sh").write_text("false\n")
+    payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": "git status"}})
+    env = {"HOME": "/tmp", "PATH": "/usr/local/bin:/usr/bin:/bin", "CREWVIA_REPO": str(hook_root),
+           "CREWVIA_TASKVIA": "disabled", "TASKVIA_TOKEN": "", "SKILLS": "bash", "AGENT_NAME": "Haruto"}
+    r = subprocess.run(["bash", str(hook_root / "hooks/pre-tool-use.sh")], input=payload,
+                       capture_output=True, text=True, env=env, timeout=120)
+    assert r.returncode == 0, (r.returncode, r.stderr[:300])
+    out = json.loads(r.stdout.strip().splitlines()[-1])["hookSpecificOutput"]
+    assert out["permissionDecision"] == "deny"
+    assert "crashed without emitting decision" in out["permissionDecisionReason"]
+    assert '"allow"' not in r.stdout
+    # early であること: 後の方の guard を登録する行 (emit_decision 定義後) まで進んでいれば approvals.tsv 等が
+    # 作られうるが、ここでは source で落ちるので判定の経路に一切入っていない
+    assert not (hook_root / "registry/approvals/approvals.tsv").exists()
+    assert r.stderr.count("crash guard") == 1, r.stderr[:300]

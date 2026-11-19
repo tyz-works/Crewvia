@@ -37,16 +37,16 @@ PYEOF
 _block() { echo "BLOCK: $1"; exit 1; }
 
 # ---- Stage 1: 絶対ブロック ----
-echo "$STRIPPED" | grep -qE 'curl[^|#]*\|[[:space:]]*(bash|sh)\b'           && _block "curl|bash (RCE)"
-echo "$STRIPPED" | grep -qE 'wget[^|#]*\|[[:space:]]*(bash|sh)\b'           && _block "wget|bash (RCE)"
-echo "$STRIPPED" | grep -qE 'bash[[:space:]]+<\([[:space:]]*(curl|wget)'    && _block "bash <(curl) (RCE)"
-echo "$STRIPPED" | grep -qE 'eval[[:space:]]*\$\((curl|wget)'               && _block "eval \$(curl) (RCE)"
-echo "$STRIPPED" | grep -qE '\bsudo\b'                                       && _block "sudo"
-echo "$STRIPPED" | grep -qE 'rm[[:space:]]+-[rf]*r[rf]*[[:space:]]+/[^t/]'  && _block "rm -rf on non-/tmp absolute path"
-echo "$STRIPPED" | grep -qE 'rm[[:space:]]+-[rf]*r[rf]*[[:space:]]+/\*'     && _block "rm -rf /*"
-echo "$STRIPPED" | grep -qE 'dd[[:space:]]+if=.*of=/dev/'                   && _block "dd to device"
-echo "$STRIPPED" | grep -qE '\bmkfs\b'                                       && _block "mkfs"
-echo "$STRIPPED" | grep -qE ':\(\)\{[[:space:]]*:[[:space:]]*\|[[:space:]]*:&' && _block "fork bomb"
+grep -qE 'curl[^|#]*\|[[:space:]]*(bash|sh)\b' <<<"$STRIPPED"           && _block "curl|bash (RCE)"
+grep -qE 'wget[^|#]*\|[[:space:]]*(bash|sh)\b' <<<"$STRIPPED"           && _block "wget|bash (RCE)"
+grep -qE 'bash[[:space:]]+<\([[:space:]]*(curl|wget)' <<<"$STRIPPED"    && _block "bash <(curl) (RCE)"
+grep -qE 'eval[[:space:]]*\$\((curl|wget)' <<<"$STRIPPED"               && _block "eval \$(curl) (RCE)"
+grep -qE '\bsudo\b' <<<"$STRIPPED"                                       && _block "sudo"
+grep -qE 'rm[[:space:]]+-[rf]*r[rf]*[[:space:]]+/[^t/]' <<<"$STRIPPED"  && _block "rm -rf on non-/tmp absolute path"
+grep -qE 'rm[[:space:]]+-[rf]*r[rf]*[[:space:]]+/\*' <<<"$STRIPPED"     && _block "rm -rf /*"
+grep -qE 'dd[[:space:]]+if=.*of=/dev/' <<<"$STRIPPED"                   && _block "dd to device"
+grep -qE '\bmkfs\b' <<<"$STRIPPED"                                       && _block "mkfs"
+grep -qE ':\(\)\{[[:space:]]*:[[:space:]]*\|[[:space:]]*:&' <<<"$STRIPPED" && _block "fork bomb"
 
 # ---- Stage 2: rm -rf "$VAR" のコンテキスト判定 ----
 # 変数名抽出は元ファイルから（STRIPPED は引用符内の変数名も除去するため）

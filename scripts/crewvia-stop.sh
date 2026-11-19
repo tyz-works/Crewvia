@@ -71,7 +71,7 @@ fi
 # ---------------------------------------------------------------------------
 plan_status_output=$("${REPO_ROOT}/scripts/plan.sh" status 2>&1 | grep -v '^\[plan.sh\] WARNING' || true)
 active_count=0
-if [[ -n "$plan_status_output" ]] && ! echo "$plan_status_output" | grep -q "^No active missions"; then
+if [[ -n "$plan_status_output" ]] && ! grep -q "^No active missions" <<<"$plan_status_output"; then
   # "Active missions (N):" 行から N を取得
   active_count=$(echo "$plan_status_output" | sed -n 's/^Active missions (\([0-9]*\)):.*/\1/p' | head -1)
   active_count=${active_count:-0}

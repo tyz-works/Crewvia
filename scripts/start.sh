@@ -935,7 +935,7 @@ PYEOF
       11) echo "[crewvia] $WINDOW_NAME exists but its pane could not be read — not launching a second one." >&2
           echo "          確認: mux_capture $WINDOW_NAME (中身が空の shell なら mux_kill $WINDOW_NAME してから再実行)" >&2 ;;
       *)
-        if mux_list | grep -qx "$WINDOW_NAME"; then
+        if grep -qx "$WINDOW_NAME" <<<"$(mux_list)"; then
           echo "[crewvia] ERROR: $WINDOW_NAME is listed but the launch did not take (spawn failed — see the warnings above)." >&2
           echo "          'already running' ではありません。確認: mux_capture $WINDOW_NAME / 直すなら mux_kill $WINDOW_NAME してから再実行" >&2
         else
@@ -975,7 +975,7 @@ PYEOF
   for _i in $(seq 1 30); do
     # `❯` はダイアログの選択カーソルでもあるので、先にダイアログかどうかを見る (t021)。
     _trust_dialog_check "❯ の待機中"
-    if mux_capture "$WINDOW_NAME" 2>/dev/null | grep -q '❯'; then
+    if grep -q '❯' <<<"$(mux_capture "$WINDOW_NAME" 2>/dev/null)"; then
       PROMPT_READY=1
       break
     fi

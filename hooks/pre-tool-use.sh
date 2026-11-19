@@ -160,7 +160,7 @@ FILE_PATH="$(echo "$TOOL_INPUT" | jq -r '.file_path // empty' 2>/dev/null || tru
 # と同じ書き込み系ツールなのにフィールド名が違うため下記ガードで二重に漏れていた)
 NOTEBOOK_PATH="$(echo "$TOOL_INPUT" | jq -r '.notebook_path // empty' 2>/dev/null || true)"
 if [ -n "$COMMAND" ]; then
-  TOOL_SUMMARY="${TOOL_NAME}($(echo "$COMMAND" | head -c 80))"
+  TOOL_SUMMARY="${TOOL_NAME}($(head -c 80 <<<"$COMMAND"))"
 elif [ -n "$FILE_PATH" ]; then
   TOOL_SUMMARY="${TOOL_NAME}(${FILE_PATH})"
 elif [ -n "$NOTEBOOK_PATH" ]; then
@@ -464,7 +464,7 @@ if [ "$TOOL_NAME" = "Bash" ] && [ -n "$COMMAND" ]; then
           # (t002/#183)。ネストインタプリタへの丸投げを示す狭いマーカーが
           # 実際にある場合に限り、フェイルセーフとして元の $COMMAND で判定する。
           _QM_NESTED_INTERP_RE='\b(bash|sh|zsh|dash|ksh)[[:space:]]+-c\b|\bpython3?[[:space:]]+-c\b|\b(perl|node|ruby)[[:space:]]+-e\b|\beval\b'
-          if ! printf '%s' "$COMMAND" | grep -qE "$_QM_NESTED_INTERP_RE"; then
+          if ! grep -qE "$_QM_NESTED_INTERP_RE" <<<"$COMMAND"; then
             _QM_CHECK_CMD="$_CMD_NO_QUOTES"
           fi
           ;;
@@ -476,11 +476,11 @@ if [ "$TOOL_NAME" = "Bash" ] && [ -n "$COMMAND" ]; then
   esac
 
   _TASK_FILE_WRITE=0
-  if echo "$_QM_CHECK_CMD" | grep -qE '>{1,2}[[:space:]]*['"'"'\"]?[A-Za-z0-9_./-]*queue/missions/[A-Za-z0-9_.-]+/tasks/[A-Za-z0-9_-]+\.md'; then
+  if grep -qE '>{1,2}[[:space:]]*['"'"'\"]?[A-Za-z0-9_./-]*queue/missions/[A-Za-z0-9_.-]+/tasks/[A-Za-z0-9_-]+\.md' <<<"$_QM_CHECK_CMD"; then
     _TASK_FILE_WRITE=1
-  elif echo "$_QM_CHECK_CMD" | grep -qE 'sed[[:space:]]+-i[^|;&]*queue/missions/[A-Za-z0-9_.-]+/tasks/[A-Za-z0-9_-]+\.md'; then
+  elif grep -qE 'sed[[:space:]]+-i[^|;&]*queue/missions/[A-Za-z0-9_.-]+/tasks/[A-Za-z0-9_-]+\.md' <<<"$_QM_CHECK_CMD"; then
     _TASK_FILE_WRITE=1
-  elif echo "$_QM_CHECK_CMD" | grep -qE '\btee\b[^|;&]*queue/missions/[A-Za-z0-9_.-]+/tasks/[A-Za-z0-9_-]+\.md'; then
+  elif grep -qE '\btee\b[^|;&]*queue/missions/[A-Za-z0-9_.-]+/tasks/[A-Za-z0-9_-]+\.md' <<<"$_QM_CHECK_CMD"; then
     _TASK_FILE_WRITE=1
   fi
   if [ "$_TASK_FILE_WRITE" = "1" ]; then
@@ -702,13 +702,13 @@ if [ "$TOOL_NAME" = "Bash" ] && [ -n "$COMMAND" ]; then
   # compound command 内の危険パターン検出（Python 側 _GLOBAL_DENY_SUBSTRINGS と二重化）
   if [[ "$COMMAND" == *"&&"* || "$COMMAND" == *"||"* || "$COMMAND" == *";"* || "$COMMAND" == *"|"* ]]; then
     _CMD_STRIPPED=$(printf '%s' "$COMMAND" | sed "s/'[^']*'//g; s/\"[^\"]*\"//g")
-    if printf '%s' "$_CMD_STRIPPED" | grep -qE '\brm\s+-\S*r\S*f'; then
+    if grep -qE '\brm\s+-\S*r\S*f' <<<"$_CMD_STRIPPED"; then
       _NEEDS_APPROVAL=true
     fi
-    if printf '%s' "$_CMD_STRIPPED" | grep -qE '\bsudo\b'; then
+    if grep -qE '\bsudo\b' <<<"$_CMD_STRIPPED"; then
       _NEEDS_APPROVAL=true
     fi
-    if printf '%s' "$_CMD_STRIPPED" | grep -qE '\|\s*(ba)?sh\b'; then
+    if grep -qE '\|\s*(ba)?sh\b' <<<"$_CMD_STRIPPED"; then
       _NEEDS_APPROVAL=true
     fi
   fi

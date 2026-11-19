@@ -49,6 +49,7 @@ def _make_path(tmp_path, copies, stub_version=None):
             f"  [ {minor} -ge 12 ] && exit 0 || exit 1\n"
             "fi\n"
             'echo "stub-python3 $*"\n'
+            'echo "shim-flag=${CREWVIA_PY3_SHIM-unset}"\n'
         )
         p.chmod(p.stat().st_mode | stat.S_IXUSR)
         dirs.append(s)
@@ -89,6 +90,8 @@ def test_two_shims_fall_through_to_real_python3(tmp_path):
     r = _run(path, first)
     assert r.returncode == 0, r.stderr
     assert "stub-python3 hello" in r.stdout
+    # 最終 exec の環境に再入防止の旗が漏れていない (子の python3 が shim と誤認されない)
+    assert "shim-flag=unset" in r.stdout
 
 
 def test_two_shims_and_nothing_else_exit_127_without_recursing(tmp_path):

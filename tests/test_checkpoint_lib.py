@@ -328,6 +328,56 @@ def test_the_worktree_is_left_exactly_as_it_was(wt, tmp_path):
     assert fingerprint() == before, "worktree (index を含む .git) が変わった"
 
 
+def test_same_size_edit_right_after_commit_is_in_the_patch(tmp_path):
+    """commit の直後に同じサイズで書き換えた変更が dirty.patch から落ちない (index の複製の mtime を写し忘れた退行の留め金)。
+
+    `diff` は index の複製で走らせる。複製の mtime が「今」になると、commit と同じ時刻に書いた同サイズの変更を git が
+    clean と読むことがある (複製が copyfile のとき 150 回中 3 回で再現。mtime を写せば 0 回)。確率的なので何度も繰り返す。"""
+    missed = []
+    for i in range(100):
+        d = tmp_path / f"r{i}"
+        d.mkdir()
+        git(d, "init", "-q", "-b", "task-branch")
+        git(d, "config", "gc.auto", "0")
+        git(d, "config", "maintenance.auto", "false")
+        (d / "x.conv").write_text("v1\n")
+        git(d, "add", "-A")
+        git(d, "commit", "-q", "-m", "init")
+        (d / "x.conv").write_text("v2\n")
+        out = pathlib.Path(take(d, tmp_path / f"s{i}"))
+        patch = out / "dirty.patch"
+        if not patch.exists() or "v2" not in patch.read_text():
+            missed.append(i)
+    assert not missed, f"同サイズの変更が dirty.patch に無い: {len(missed)}/100 回 ({missed[:5]})"
+
+
+def test_the_index_is_not_refreshed_for_racy_clean_entries(wt, tmp_path):
+    """内容は commit と同じだが stat が index とずれている追跡ファイル (racy-clean) があっても index を書き直さない。
+
+    `--no-optional-locks` を外すと、`git status` 等が stat のずれた entry を内容比較で clean と確かめ、その結果の
+    stat を index に書き戻す (opportunistic refresh)。a.txt を commit の後で変更する上のテストは entry が本当に dirty
+    なので refresh の対象にならず、この退行を捕まえない。mtime だけを index より後 (+10 秒) へ動かす (内容は不変)。
+    """
+    index = wt / ".git" / "index"
+    future = index.stat().st_mtime + 10
+    for name in ("a.txt", "b.dat"):
+        os.utime(wt / name, (future, future))
+    # 前提の陽性対照: 素の `git status` (optional locks あり) はこの index を書き直す
+    snap = index.read_bytes()
+    git(wt, "status", "--porcelain=v1")
+    assert index.read_bytes() != snap, "前提が成り立たない (stat のずれた entry を refresh しない git だった)"
+    # 素の status が refresh した後なので、もう一度 stat をずらして同じ状態に戻す
+    for name in ("a.txt", "b.dat"):
+        os.utime(wt / name, (future + 5, future + 5))
+
+    def state():
+        return index.read_bytes(), index.stat().st_mtime_ns
+
+    before = state()
+    take(wt, tmp_path)
+    assert state() == before, "lib_checkpoint の git が index を書き直した (--no-optional-locks が効いていない)"
+
+
 # ---------------------------------------------------------------- 無いもの・期限・照合
 
 def test_worktree_comes_from_the_record_and_missing_things_are_distinguished(wt, tmp_path):

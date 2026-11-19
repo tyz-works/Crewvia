@@ -207,6 +207,7 @@ ALLOWED_WRITES: dict[tuple[str, str], tuple[int, str]] = {
     ('lib_checkpoint.py', 'remove_tree'): (2, "書きかけ (`.partial`) の掃除。dir fd を基点に、自分が作った dir を symlink を辿らず 1 つずつ unlink / rmdir する (再帰削除コマンドではない)"),
     ('lib_checkpoint.py', 'rename'): (1, "同じ dir の中の rename (`.partial` → 最終の名前)。dir fd 基点"),
     ('lib_checkpoint.py', 'move_between'): (1, "checkpoint の隔離・復元の rename (元と先の dir fd を基点)。`checkpoint_gc` が使う唯一の移動。上書きしない (呼び出し側が先に存在を見る)。削除はしない。queue の外"),
+    ('lib_checkpoint.py', '_run_git_private_index'): (3, "worktree の index の複製 (`mkdtemp` + `copy2` + `rmtree`)。システムの一時 dir に作って `GIT_INDEX_FILE` で `git diff` に渡し、必ず消す (diff が worktree の index を書かないため)。queue / registry の外・自分が作った dir だけ"),
     ('lib_checkpoint.py', 'take'): (1, "完成した `.partial` を最終の名前へ rename (途中の dir が本物に見えない)"),
 }
 

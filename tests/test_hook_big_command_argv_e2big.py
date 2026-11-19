@@ -144,3 +144,28 @@ def test_stdin_and_argv_forms_agree():
     a = subprocess.run(["python3", *guard, cmd, "/repo"], capture_output=True, text=True)
     b = subprocess.run(["python3", *guard, "/repo"], input=cmd + "\n", capture_output=True, text=True)
     assert a.stdout == b.stdout == "DENY\n"
+
+
+# --- emit_decision の reason も argv に載せない (t003 レビュー P1) ---------------------
+
+@pytest.mark.parametrize("n", SIZES)
+def test_research_guard_deny_with_huge_reason_is_not_silent(hook_root, n):
+    # research guard の reason には command の語が入りうる。jq --arg r で渡すと E2BIG で出力なし = 素通りだった
+    cmd = f"git -c{'x' * n}=1 push --force origin main"
+    d = _run(hook_root, cmd, extra_env={"SKILLS": "research"})
+    assert d.startswith("deny"), (n, d[:200])
+
+
+def test_emit_decision_failure_never_allows(hook_root, tmp_path):
+    # jq が起動できなければ決定を出せない。許可が出ず、crash guard 側に落ちること
+    d = tmp_path / "jqfail"
+    d.mkdir()
+    p = d / "jq"
+    p.write_text("#!/bin/sh\nexit 126\n")
+    p.chmod(p.stat().st_mode | stat.S_IEXEC)
+    payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": "git status"}})
+    env = {"HOME": "/tmp", "PATH": f"{d}:/usr/local/bin:/usr/bin:/bin", "CREWVIA_REPO": str(hook_root),
+           "CREWVIA_TASKVIA": "disabled", "TASKVIA_TOKEN": "", "SKILLS": "bash", "AGENT_NAME": "Haruto"}
+    r = subprocess.run(["bash", str(hook_root / "hooks/pre-tool-use.sh")], input=payload,
+                       capture_output=True, text=True, env=env, timeout=120)
+    assert '"allow"' not in r.stdout

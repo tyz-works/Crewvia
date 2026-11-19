@@ -25,6 +25,15 @@
 
 PreToolUse hook（Taskvia承認）
 
+**判定は command を argv でなく stdin で渡す**（#425）。Linux は 1 引数 128KB（`MAX_ARG_STRLEN`）を超えると
+exec が E2BIG で失敗し、以前は `|| echo OK` / `|| none` で「deny なし」に倒れていた（global deny・main repo guard・
+skill の判定、さらに `emit_decision` の `jq --arg` も）。`lib_skill_perms.py` / `lib_main_repo_git_guard.py` は
+引数を 1 つ減らした呼び出しで stdin を読む（argv 形は `lint_plan.py` 等のため残す）。
+**python3（判定）が起動できない・非 0 で落ちる・出力が不正なときは許可でなく拒否**（global / main repo guard は deny、
+skill の判定は none でなく deny。理由に `判定の起動に失敗: rc=… stderr=<先頭 1 行>` が出る）。
+`emit_decision` は reason を stdin（`jq --rawfile`）で渡し、`_DECISION_EMITTED` は jq 成功後に立てる
+（失敗すれば crash guard が deny を出す）。回帰テスト: `tests/test_hook_big_command_argv_e2big.py`。
+
 ### `post-tool-use.sh`
 
 PostToolUse hook（ログ投稿）。role=director のときだけ、両デーモンの

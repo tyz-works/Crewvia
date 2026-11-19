@@ -18,6 +18,11 @@ hook は `git checkout <existing>` / `git switch <existing>` に一切発火し�
 を止める」手段は git hook 経由では原理的に存在しないため、主防御はこの Bash
 コマンド文字列ガードで行う。
 
+呼び出し形: `python3 hooks/lib_main_repo_git_guard.py <command> <repo_abs>` (argv 形・互換) または
+`<command> | python3 hooks/lib_main_repo_git_guard.py <repo_abs>` (stdin 形。hook はこちら。
+command は 128KB 超になりうり、argv だと exec が E2BIG で失敗して判定が走らないため)。
+出力は OK / DENY の 1 語。それ以外・非 0 終了は呼び出し側が拒否に倒す。
+
 判定方式: コマンド文字列に「主リポジトリへの参照」($CREWVIA_REPO_ROOT /
 $CREWVIA_REPO の変数表記、または主リポジトリの絶対パス) と「破壊的 git 動詞」
 (checkout/switch/reset/merge/rebase/commit/clean/stash/branch -D/worktree add)

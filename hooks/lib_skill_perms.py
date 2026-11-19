@@ -3,6 +3,10 @@
 
 Usage:
     python3 hooks/lib_skill_perms.py <yaml_path> <skills_csv> <tool_signature>
+    <tool_signature> | python3 hooks/lib_skill_perms.py <yaml_path> <skills_csv>   # stdin 形 (hook 用)
+
+    hook (pre-tool-use.sh) は stdin 形を使う。tool_signature には command 全文が入り、argv は
+    1 引数 128KB (MAX_ARG_STRLEN) で exec が E2BIG になるため。argv 形は lint_plan.py 等の互換のため残す。
 
 Output (JSON, single line):
     {"decision": "allow"|"deny"|"none", "source": "skill:code:allow:Edit"}

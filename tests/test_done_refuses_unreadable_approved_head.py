@@ -57,6 +57,12 @@ MISPLACED = [
     f"LGTM\napproved_head: {SHA[:12]}",                                 # 短縮形
     f"LGTM\nApproved_Head: {SHA}",                                      # 大文字小文字
     f"LGTM\napproved_head:{SHA}",                                       # コロンの後の空白なし
+    f"LGTM\n- approved_head: {SHA}",                                    # 箇条書き
+    f"LGTM\n`approved_head: {SHA}`",                                    # バッククォート
+    f'LGTM\n"approved_head: {SHA}"',                                    # 引用符
+    f"LGTM\n> approved_head: {SHA}",                                    # 引用 (>)
+    f"LGTM\n   approved_head: {SHA}\n所見",                             # 行頭の空白 (+ 後ろに所見)
+    f"LGTM\n* **approved_head**: {SHA}",                                # 太字の箇条書き
 ]
 
 
@@ -127,3 +133,23 @@ def test_has_approval_line_is_defined_next_to_approved_head():
     assert ci.has_approval_line("  approved_head : nope")
     assert not ci.has_approval_line("本文に approved_head: を含む行 (行頭でない)")
     assert not ci.has_approval_line(None)
+
+
+def test_has_approval_line_sha_anywhere_in_the_line():
+    for ln in (f"- approved_head: {SHA}", f"`approved_head: {SHA}`", f'"approved_head: {SHA}"',
+               f"> Approved_Head: {'A' * 40}"):
+        assert ci.has_approval_line(ln), ln
+    # sha を伴わない言及・40 桁に満たない値は (行頭でない限り) 承認の形ではない
+    for ln in ("所見: approved_head: の行が無い", f"approved_head という語だけ。{SHA} は別の話",
+               f"- `approved_head: {'a' * 39}` は短い", "- `approved_head: <sha>` と書く"):
+        assert not ci.has_approval_line(ln), ln
+
+
+def test_known_false_positive_quoting_the_form_with_a_real_sha_is_refused(box):
+    """広げたことで増える誤検出 (許容): 書き方の例に本物の 40 桁を入れて引用した Result も拒否される。
+    出口 = sha を省く (`<sha>`) か 40 桁を崩して書く。"""
+    xid = take(box)
+    p = _done(box, xid, f"要修正: 承認は `approved_head: {SHA}` の形で書くこと")
+    assert p.returncode == 3 and last_error_code(p.stderr) == CODE, p.stderr
+    p = _done(box, xid, "要修正: 承認は `approved_head: <sha>` の形で書くこと")
+    assert p.returncode == 0, p.stderr

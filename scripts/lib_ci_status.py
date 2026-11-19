@@ -457,6 +457,11 @@ _APPROVED_HEAD_RE = re.compile(r'approved_head: ([0-9a-f]{40})')
 #: 「承認の形の行」= 行頭 (空白は許す) が `approved_head` + `:` の行。大文字・短縮形・40 桁でない値も含む (それらは
 #: `approved_head` が読まない形なので、承認のつもりで書かれたなら gate には届かない)。`plan.sh done` の拒否だけが使う。
 _APPROVAL_LINE_RE = re.compile(r'\s*approved_head\s*:', re.IGNORECASE)
+#: もう 1 つの「承認の形の行」= 行のどこかに `approved_head:` と 40 桁の 16 進 (大文字小文字は問わない) を**両方**含む行。
+#: 箇条書き (`- approved_head: <sha>`)・バッククォート・引用符で包んだ承認は行頭が `approved_head` でないので上の形に
+#: 当たらず、gate も読まない (黙って `no_approval`) — sha を伴う言及は承認のつもりとみなして拒否する。sha を伴わない
+#: 言及 (要修正の review が語を引用しただけ) は当たらない。
+_APPROVAL_WITH_SHA_RE = re.compile(r'approved_head[\s*_`"\']*:.*[0-9a-f]{40}', re.IGNORECASE)
 
 
 def approved_head(result):
@@ -479,7 +484,8 @@ def has_approval_line(result):
     拒否するために使う。"""
     if not isinstance(result, str):
         return False
-    return any(_APPROVAL_LINE_RE.match(ln) for ln in result.splitlines())
+    return any(_APPROVAL_LINE_RE.match(ln) or _APPROVAL_WITH_SHA_RE.search(ln)
+               for ln in result.splitlines())
 
 
 def approval_verdict(reviews, *, pr_head):

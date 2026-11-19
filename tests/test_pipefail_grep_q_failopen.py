@@ -72,10 +72,10 @@ def hook_root(tmp_path):
     return root
 
 
-def _decision(root: Path, command: str) -> str:
+def _decision(root: Path, command: str, skills: str = "bash") -> str:
     payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": command}})
     env = {"HOME": "/tmp", "PATH": "/usr/local/bin:/usr/bin:/bin", "CREWVIA_REPO": str(root),
-           "CREWVIA_TASKVIA": "disabled", "TASKVIA_TOKEN": "", "SKILLS": "bash",
+           "CREWVIA_TASKVIA": "disabled", "TASKVIA_TOKEN": "", "SKILLS": skills,
            "AGENT_NAME": "Haruto"}
     r = subprocess.run(["bash", str(root / "hooks/pre-tool-use.sh")], input=payload,
                        capture_output=True, text=True, env=env, timeout=60)
@@ -99,6 +99,7 @@ CASES = [
     f"echo x > {_QUEUE_CARD}",              # queue の card の直接書き込み
     f"sed -i s/a/b/ {_QUEUE_CARD}",
     f"echo x | tee {_QUEUE_CARD}",
+    f'bash -c "echo x >> {_QUEUE_CARD}"; true',   # ネストしたインタプリタ (クォート除去の判定)
 ]
 
 
@@ -108,6 +109,37 @@ def test_big_command_gets_the_same_decision_as_the_small_one(hook_root, cmd):
     small = _decision(hook_root, cmd + "; A=x")
     for _ in range(3):
         assert _decision(hook_root, cmd + "; A=" + "x" * PAD) == small
+
+
+MULTILINE_PAD = 300_000   # t001 で判定が stdin 渡しになったので 128KB (単一 argv の上限) を超えてよい
+
+
+@pytest.mark.skipif(shutil.which("jq") is None, reason="jq が必要")
+@pytest.mark.parametrize("cmd", CASES)
+def test_multiline_big_command_gets_the_same_decision_as_the_small_one(hook_root, cmd):
+    # 元のパイプ (echo "$X" | grep -q) が fail-open するのは「一致する行が先頭にあり、
+    # 後ろの行が大きい」複数行の入力だけ (grep が一致で先に抜け、前段が SIGPIPE になる)。
+    # 1 行の 'cmd; A=<pad>' ではこの形を再現できないので、改行で分けた版を縛る。
+    small = _decision(hook_root, cmd + "\nA=x")
+    assert small != "SILENT" or cmd in ("git status", "ls -la")
+    for _ in range(3):
+        assert _decision(hook_root, cmd + "\nA=" + "x" * MULTILINE_PAD) == small
+
+
+COMPOUND_CASES = ["rm -rf ./build | cat", "echo x | sh", "ls && sudo ls"]
+
+
+@pytest.mark.skipif(shutil.which("jq") is None, reason="jq が必要")
+@pytest.mark.parametrize("cmd", COMPOUND_CASES)
+def test_multiline_compound_detection_without_skills(hook_root, cmd):
+    # python 側 (_global.deny / skill 判定) は同じ入力を先に deny して bash 側の fail-open を
+    # 隠す。skill-permissions.yaml を外し SKILLS も無しにして、compound 検出
+    # (rm -rf / sudo / | sh) だけが承認に回す砦になる状態で縛る。
+    (hook_root / "config" / "skill-permissions.yaml").unlink()
+    small = _decision(hook_root, cmd + "\nA=x", skills="")
+    assert not small.startswith("allow"), small
+    for _ in range(3):
+        assert _decision(hook_root, cmd + "\nA=" + "x" * MULTILINE_PAD, skills="") == small
 
 
 @pytest.mark.skipif(shutil.which("jq") is None, reason="jq が必要")

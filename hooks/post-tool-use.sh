@@ -262,7 +262,8 @@ TOOL_NAME="$(echo "$INPUT" | jq -r '.tool_name // "unknown"')"
 TOOL_INPUT="$(echo "$INPUT" | jq -c '.tool_input // {}' 2>/dev/null || echo '{}')"
 
 # tool_input の先頭80文字をサマリーとして使用
-TOOL_INPUT_SUMMARY="$(echo "$TOOL_INPUT" | head -c 80)"
+# (echo | head -c は pipefail 下で大きな入力だと SIGPIPE で crash した。パイプを使わず切り出す)
+TOOL_INPUT_SUMMARY="${TOOL_INPUT:0:80}"
 
 CONTENT="${TOOL_NAME}: ${TOOL_INPUT_SUMMARY}"
 

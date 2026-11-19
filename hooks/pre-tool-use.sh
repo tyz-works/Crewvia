@@ -52,7 +52,8 @@ _DECISION_EMITTED=false
 _crash_guard_early() {
   if ! $_DECISION_EMITTED; then
     echo "[pre-tool-use] ⚠️ crash guard: hook exited without decision" >&2
-    jq -nc '{hookSpecificOutput: {hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: "Hook crashed without emitting decision"}}' 2>/dev/null || true
+    # jq に頼らない固定 JSON (jq が無い・起動不能でも必ず deny を出す)。printf は builtin。
+    printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"Hook crashed without emitting decision"}}'
   fi
 }
 trap '_crash_guard_early' EXIT
@@ -132,7 +133,8 @@ emit_decision() {
 _crash_guard() {
   if ! $_DECISION_EMITTED; then
     echo "[pre-tool-use] ⚠️ crash guard: hook exited without decision" >&2
-    jq -nc '{hookSpecificOutput: {hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: "Hook crashed without emitting decision"}}' 2>/dev/null || true
+    # jq に頼らない固定 JSON (jq が無い・起動不能でも必ず deny を出す)。printf は builtin。
+    printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"Hook crashed without emitting decision"}}'
   fi
 }
 trap '_crash_guard' EXIT

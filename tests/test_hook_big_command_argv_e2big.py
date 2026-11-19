@@ -156,16 +156,38 @@ def test_research_guard_deny_with_huge_reason_is_not_silent(hook_root, n):
     assert d.startswith("deny"), (n, d[:200])
 
 
-def test_emit_decision_failure_never_allows(hook_root, tmp_path):
-    # jq が起動できなければ決定を出せない。許可が出ず、crash guard 側に落ちること
-    d = tmp_path / "jqfail"
+def _run_with_jq_shim(hook_root, tmp_path, shim_body):
+    d = tmp_path / "jqshim"
     d.mkdir()
+    real = shutil.which("jq")
     p = d / "jq"
-    p.write_text("#!/bin/sh\nexit 126\n")
+    p.write_text(shim_body.replace("@REAL@", real))
     p.chmod(p.stat().st_mode | stat.S_IEXEC)
     payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": "git status"}})
     env = {"HOME": "/tmp", "PATH": f"{d}:/usr/local/bin:/usr/bin:/bin", "CREWVIA_REPO": str(hook_root),
            "CREWVIA_TASKVIA": "disabled", "TASKVIA_TOKEN": "", "SKILLS": "bash", "AGENT_NAME": "Haruto"}
-    r = subprocess.run(["bash", str(hook_root / "hooks/pre-tool-use.sh")], input=payload,
-                       capture_output=True, text=True, env=env, timeout=120)
+    return subprocess.run(["bash", str(hook_root / "hooks/pre-tool-use.sh")], input=payload,
+                          capture_output=True, text=True, env=env, timeout=120)
+
+
+def _assert_valid_deny(r):
+    # silent (stdout 空) を合格にしない。有効な deny JSON が必ず出ること
+    assert r.stdout.strip(), (r.returncode, r.stderr[:300])
+    out = json.loads(r.stdout.strip().splitlines()[-1])
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
     assert '"allow"' not in r.stdout
+
+
+def test_emit_decision_jq_failure_emits_valid_deny(hook_root, tmp_path):
+    # emit_decision 内の jq (--rawfile) だけを失敗させる。入力の解析は通る
+    r = _run_with_jq_shim(hook_root, tmp_path, """#!/bin/sh
+for a in "$@"; do [ "$a" = "--rawfile" ] && exit 126; done
+exec @REAL@ "$@"
+""")
+    _assert_valid_deny(r)
+
+
+def test_all_jq_failure_still_emits_valid_deny(hook_root, tmp_path):
+    # jq 全滅 (解析も emit も) でも crash guard が jq に頼らず deny を出す
+    r = _run_with_jq_shim(hook_root, tmp_path, "#!/bin/sh\nexit 126\n")
+    _assert_valid_deny(r)

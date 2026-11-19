@@ -28,6 +28,16 @@ fi
 # では動かない 3.12 以降の構文 (PEP 701 など) を避ける」ことなので、3.12 以上であれば
 # 他の python3 でよい。この shim 自身のディレクトリは飛ばす (自分を exec して無限再帰しない)。
 # 3.12 未満しか無いときは黙って古い python3 に落とさず、理由を出して 127 で止める。
+#
+# 再入防止 (20261119-ci-2604-unpin-shim-recursion): PATH に別 checkout の scripts/bin (= 同じ shim)
+# が並ぶと、here だけ飛ばしても A が B を版検査 → B が A を… と無限に再帰する。版検査の候補を
+# 起こすときは CREWVIA_PY3_SHIM=1 を立て、立っている状態で起動された shim は (= 他の shim の
+# 候補として呼ばれた) 何も走査せず 127 で即座に終わる。候補としては「版を満たさない」扱いに
+# なるので、呼んだ側は次の PATH 要素へ進む。最終的な exec には立てない (子へ漏らさない)。
+# python3.12 がある本番では上の exec で終わるので、この挙動は本番に影響しない。
+if [ -n "${CREWVIA_PY3_SHIM:-}" ]; then
+    exit 127
+fi
 here=$(cd "$(dirname "$0")" && pwd -P)
 old_ifs=$IFS
 IFS=:
@@ -35,7 +45,7 @@ for d in $PATH; do
     [ -n "$d" ] || continue
     d=$(cd "$d" 2>/dev/null && pwd -P) || continue
     [ "$d" = "$here" ] && continue
-    if [ -x "$d/python3" ] && "$d/python3" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 12) else 1)' >/dev/null 2>&1; then
+    if [ -x "$d/python3" ] && CREWVIA_PY3_SHIM=1 "$d/python3" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 12) else 1)' >/dev/null 2>&1; then
         IFS=$old_ifs
         exec "$d/python3" "$@"
     fi

@@ -56,6 +56,10 @@ def wt(tmp_path):
     d = tmp_path / "wt"
     d.mkdir()
     git(d, "init", "-q", "-b", "task-branch")
+    # `git commit` は新しい git (CI の 2.56) だと detached の `maintenance run --auto` を起動し、.git/objects/maintenance.lock
+    # を一瞬作る。fixture の後始末が worktree 不変テストの前後比較 (.git を含む) と競合して落ちた (main schedule run 44428727790)。
+    git(d, "config", "gc.auto", "0")
+    git(d, "config", "maintenance.auto", "false")
     (d / "a.txt").write_text("one\ntwo\n")
     (d / "b.dat").write_bytes(b"\x00BIN-ORIGINAL\x00")
     git(d, "add", "-A")

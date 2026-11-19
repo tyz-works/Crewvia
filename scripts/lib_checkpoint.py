@@ -447,18 +447,69 @@ def _run_git(clock, worktree, *args, limit=GIT_READ_LIMIT, check=True, extra_env
     return proc.returncode, data, truncated
 
 
+INDEX_TMP_PREFIX = 'crewvia-ck-index-'
+# mkdtemp の乱数部は 8 文字 (a-z0-9_)。形が一致するものだけを掃除の対象にする
+_INDEX_TMP_RE = re.compile(re.escape(INDEX_TMP_PREFIX) + r'[a-z0-9_]{8}')
+# 実行中の take() の複製を消さないための年齢のしきい値。take() の期限は daemons.checkpoint_seconds (既定 20 秒) で、
+# 複製は take() の中で数秒しか生きない。1 時間はその 180 倍で、設定を大きくしても (数分) 生きている複製に届かない。
+INDEX_TMP_MAX_AGE = 3600.0
+
+
+def sweep_stale_index_dirs(now=None, tmp_root=None, max_age=INDEX_TMP_MAX_AGE):
+    """watchdog が take() の途中で SIGKILL / SIGTERM されると `_run_git_private_index` の一時 dir が残る (中身は index =
+    パス名・blob の sha・stat)。古いものを消す。消した数を返す。**失敗は例外にしない** (take() と退役を止めない)。
+
+    対象は「名前が mkdtemp の形に一致 ∧ 自分の uid ∧ dir (symlink でない) ∧ mtime が `max_age` より古い」だけ。
+    消すのは `SafeDir.remove_tree` (dir fd 基点・symlink を辿らない)。
+
+    置き場所は take() の冒頭: 掃除の担当を増やさない (checkpoint_gc は「削除を呼ばない」ことを AST で固定しているので
+    ここへは置けない)。複製を作る唯一の lib が、自分の残骸を次の take() で片付ける。"""
+    removed = 0
+    try:
+        now = time.time() if now is None else now
+        base = os.fspath(tmp_root) if tmp_root is not None else tempfile.gettempdir()
+        uid = os.getuid()
+        root = SafeDir.open_root(base)
+        if root is None:
+            return 0
+        try:
+            for name in os.listdir(root.fd):
+                if not _INDEX_TMP_RE.fullmatch(name):
+                    continue
+                try:
+                    st = root.lstat(name)
+                    if st is None or not stat.S_ISDIR(st.st_mode) or st.st_uid != uid or now - st.st_mtime <= max_age:
+                        continue
+                    root.remove_tree(name)
+                    removed += 1
+                except (OSError, CheckpointError):
+                    continue
+        finally:
+            root.close()
+    except (OSError, CheckpointError):
+        pass
+    return removed
+
+
 def _run_git_private_index(clock, worktree, *args, limit=GIT_READ_LIMIT):
     """`_run_git` を、worktree の index の**複製**を `GIT_INDEX_FILE` に渡して走らせる (`diff` 用)。
 
     `git diff` は stat だけずれた (racy-clean な) entry があると `--no-optional-locks` でも index を書き直す (git 2.43 で実測)。
-    複製は checkpoint の外の一時 dir に作り、必ず消す。**mtime も写す**。env を足すのはこの経路の呼び出しだけ (`_git_env` の allowlist は変えない)。"""
+    複製は checkpoint の外の一時 dir に作り、必ず消す (途中で殺されて残ったものは `sweep_stale_index_dirs` が take() の冒頭で消す)。
+    env を足すのはこの経路の呼び出しだけ (`_git_env` の allowlist は変えない)。
+
+    **複製は `copy2` でなければならない** (`copyfile` に「簡略化」しない)。git は entry の mtime が index ファイルの mtime 以上
+    のとき racy とみなして中身を比べ、そうでなければ stat (mtime・サイズ) だけで clean を決める。`copyfile` だと複製の mtime が
+    「複製した時刻」になり、次の秒に入ると本物の index なら racy と判定される entry が racy でなくなる。すると commit と同じ秒に
+    書いた同サイズの変更を stat だけで clean と読み、dirty.patch から落ちる (150 回中 3 回)。`copy2` は index の mtime を ns まで
+    写すので本物と同じ判定になる。留め金のテストは 2〜3% でしか赤にならない (確率的) ので、この注意が最後の網。"""
     _rc, idx_raw, _t = _run_git(clock, worktree, 'rev-parse', '--git-path', 'index')
     idx = os.path.join(worktree, os.fsdecode(idx_raw).strip('\n'))
-    tmp = tempfile.mkdtemp(prefix='crewvia-ck-index-')
+    tmp = tempfile.mkdtemp(prefix=INDEX_TMP_PREFIX)
     try:
         copy = os.path.join(tmp, 'index')
         try:
-            shutil.copy2(idx, copy)     # mtime ごと (racy 判定は index の mtime との比較。新しい mtime だと同サイズ・同 mtime の変更を clean と読む)
+            shutil.copy2(idx, copy)     # mtime ごと (上の docstring: racy 判定は index の mtime との比較)
         except OSError:
             raise CheckpointError(E_GIT, 'index_copy')
         return _run_git(clock, worktree, *args, limit=limit, extra_env={'GIT_INDEX_FILE': copy})
@@ -805,6 +856,7 @@ def take(*, registry_dir, queue_dir, mission, task, execution_id, reason='unknow
     同じ試行の dir が既にあり、`verify` を通れば**それを返す** (退役の再試行が毎サイクル撮り直さない)。
     `worktree` は試験用 (無ければ record から)。`pane_text` は呼び出し側がペインが生きているときだけ渡す。
     """
+    sweep_stale_index_dirs()            # 前の take() が殺されて残した index の複製 (失敗しても進む)
     clock = _Clock(seconds, now)
     # 相対の registry_dir は返す path・verify (絶対だけを受ける)・再実行の照合で食い違うので、作る前に絶対にする
     registry_dir = os.path.abspath(os.fspath(registry_dir))

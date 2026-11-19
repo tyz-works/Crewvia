@@ -627,3 +627,64 @@ def test_diff_and_status_do_not_descend_into_submodules(wt, tmp_path, monkeypatc
     for verb in ("status", "diff"):
         seen = [a for a in calls if a and a[0] == verb]
         assert seen and all("--ignore-submodules=all" in a for a in seen), (verb, seen)
+
+
+# ---------------------------------------------------------------- 残った一時 index の掃除
+
+def _old_dir(root, name, age=7200):
+    d = root / name
+    d.mkdir()
+    (d / "index").write_bytes(b"x")
+    t = time.time() - age
+    os.utime(d, (t, t))
+    return d
+
+
+def test_sweep_removes_only_old_matching_own_dirs(tmp_path):
+    tmp = tmp_path / "tmp"
+    tmp.mkdir()
+    old = _old_dir(tmp, "crewvia-ck-index-abcd1234")
+    new = _old_dir(tmp, "crewvia-ck-index-wxyz5678", age=5)
+    odd = _old_dir(tmp, "crewvia-ck-index-short")
+    other = _old_dir(tmp, "something-else")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "keep").write_text("k")
+    link = tmp / "crewvia-ck-index-link0001"
+    link.symlink_to(outside)
+    assert ck.sweep_stale_index_dirs(tmp_root=tmp) == 1
+    assert not old.exists()
+    assert new.exists() and odd.exists() and other.exists()
+    assert link.is_symlink() and (outside / "keep").exists()
+
+
+def test_sweep_skips_other_users_dirs(tmp_path, monkeypatch):
+    tmp = tmp_path / "tmp"
+    tmp.mkdir()
+    d = _old_dir(tmp, "crewvia-ck-index-abcd1234")
+    monkeypatch.setattr(os, "getuid", lambda: os.stat(d).st_uid + 1)
+    assert ck.sweep_stale_index_dirs(tmp_root=tmp) == 0
+    assert d.exists()
+
+
+def test_sweep_failure_does_not_stop_take(wt, tmp_path, monkeypatch):
+    tmp = tmp_path / "tmp"
+    tmp.mkdir()
+    _old_dir(tmp, "crewvia-ck-index-abcd1234")
+    monkeypatch.setattr(ck.tempfile, "gettempdir", lambda: str(tmp))
+
+    class Boom:
+        def fullmatch(self, _name):
+            raise OSError("listing failed")
+    monkeypatch.setattr(ck, "_INDEX_TMP_RE", Boom())
+    assert ck.sweep_stale_index_dirs(tmp_root=tmp) == 0      # 例外にならない
+    assert (pathlib.Path(take(wt, tmp_path)) / "meta.json").exists()
+
+
+def test_take_sweeps_stale_dirs_in_tmp(wt, tmp_path, monkeypatch):
+    tmp = tmp_path / "tmp"
+    tmp.mkdir()
+    old = _old_dir(tmp, "crewvia-ck-index-abcd1234")
+    monkeypatch.setattr(ck.tempfile, "gettempdir", lambda: str(tmp))
+    take(wt, tmp_path)
+    assert not old.exists()

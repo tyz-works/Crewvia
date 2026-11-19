@@ -146,6 +146,259 @@ _GLOBAL_DENY_SUBSTRINGS: list[tuple[re.Pattern, str]] = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# _global.deny の照合の前の正規化 (t001 / mission 20261120-global-deny-normalize)
+#
+# fnmatch は tool signature 全体への先頭一致なので、(a) git の大域オプション (git -C x push …)、
+# (b) 複合コマンドの 2 文目以降 (cd x && git push …)、(c) 前置き (env A=1 git push … /
+# /usr/bin/git push … / command git push …) で素通りする。ここでは Bash のコマンドを
+# 「文」に分け、各文から前置きと git の大域オプションを外した正規形を作り、元の文と正規形の
+# 両方を同じ _global.deny のパターンに照合する (パターンの意味は変えない)。
+#
+# 研究用ガード (lib_research_guard.py) は git の大域オプションを「許可して外す」のではなく
+# 「一律に拒否」する (allowlist 方式) ので、外す側の一覧は共有できない。ここが唯一の一覧。
+#
+# 塞がない形 (残した理由): 変数展開 ($GIT push)・alias・関数・xargs・eval の入れ子 2 段以上・
+# bash -c の入れ子 2 段以上・非クォートのヒアドキュメント本文中の $( )・base64 等で組み立てた
+# 文字列。静的な字面からは何が実行されるか確定できず、塞ぐと誤検出が全員の作業を止める。
+# bash -c / sh -c / eval は 1 段だけ中を見る。
+# ---------------------------------------------------------------------------
+
+_MAX_NEST = 4  # クォート内の $( ) / `` の再帰の上限 (超えたら字として扱う)
+_ASSIGN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\+?=")
+_KEYWORDS = frozenset(["!", "{", "}", "if", "then", "else", "elif", "do", "while", "until", "fi", "done"])
+_SHELLS = frozenset(["bash", "sh", "dash", "zsh", "ksh"])
+# git の大域オプション。値を次の語から取るもの (--x=v の結合形は「- で始まる語は全部外す」で足りる)
+_GIT_OPT_WITH_ARG = frozenset(["-c", "-C", "--git-dir", "--work-tree", "--namespace", "--config-env",
+                               "--super-prefix", "--attr-source"])
+
+
+def _scan(cmd: str, i: int, depth: int, out: list, closer: str | None = None) -> int:
+    """cmd[i:] を走査し、文 (raw, words) を out に積む。戻り値は読み終えた位置。
+
+    引用符を尊重する。区切りは ; & | ( ) ` と改行 (引用符の外)。ヒアドキュメントの本文・# コメントは
+    読み飛ばす。ダブルクォートの中の $( ) と `` は再帰して中の文も積む (closer がその閉じ)。
+    1 文字は高々 (再帰の深さ) 回しか読まない = 線形。
+    """
+    n = len(cmd)
+    words: list[str] = []
+    buf: list[str] = []
+    has = False
+    start = i
+    paren = 0
+    heredocs: list[tuple[str, bool]] = []
+
+    def flush() -> None:
+        nonlocal has
+        if has:
+            words.append("".join(buf))
+        buf.clear()
+        has = False
+
+    def end_stmt(end: int, nxt: int) -> None:
+        nonlocal words, start
+        flush()
+        if words:
+            out.append((cmd[start:end].strip(), words))
+        words = []
+        start = nxt
+
+    while i < n:
+        c = cmd[i]
+        if c == "\\":
+            if i + 1 < n:
+                if cmd[i + 1] != "\n":
+                    buf.append(cmd[i + 1])
+                    has = True
+                i += 2
+            else:
+                i += 1
+            continue
+        if c == "'":
+            j = cmd.find("'", i + 1)
+            if j < 0:
+                j = n
+            buf.append(cmd[i + 1:j])
+            has = True
+            i = j + 1
+            continue
+        if c == '"':
+            has = True
+            i += 1
+            while i < n and cmd[i] != '"':
+                d = cmd[i]
+                if d == "\\" and i + 1 < n:
+                    buf.append(cmd[i + 1] if cmd[i + 1] in '\\"$`' else "\\" + cmd[i + 1])
+                    i += 2
+                    continue
+                if depth < _MAX_NEST and d == "$" and cmd.startswith("(", i + 1):
+                    buf.append("$(")
+                    i = _scan(cmd, i + 2, depth + 1, out, ")")
+                    continue
+                if depth < _MAX_NEST and d == "`":
+                    buf.append("`")
+                    i = _scan(cmd, i + 1, depth + 1, out, "`")
+                    continue
+                buf.append(d)
+                i += 1
+            i += 1
+            continue
+        if c in " \t":
+            flush()
+            i += 1
+            continue
+        if c == "#" and not has:
+            j = cmd.find("\n", i)
+            i = n if j < 0 else j
+            continue
+        if c == "\n":
+            end_stmt(i, i + 1)
+            i += 1
+            for delim, tabs in heredocs:
+                while i < n:
+                    eol = cmd.find("\n", i)
+                    eol = n if eol < 0 else eol
+                    line = cmd[i:eol]
+                    i = eol + 1
+                    if (line.lstrip("\t") if tabs else line) == delim:
+                        break
+            heredocs = []
+            start = i
+            continue
+        if c == "<" and cmd.startswith("<<", i) and not cmd.startswith("<<<", i):
+            j = i + 2
+            tabs = j < n and cmd[j] == "-"
+            if tabs:
+                j += 1
+            while j < n and cmd[j] in " \t":
+                j += 1
+            d: list[str] = []
+            while j < n and cmd[j] not in " \t\n;&|()<>":
+                if cmd[j] in "'\"\\":
+                    j += 1
+                    continue
+                d.append(cmd[j])
+                j += 1
+            heredocs.append(("".join(d), tabs))
+            flush()
+            i = j
+            continue
+        if c == "&" and ((i > 0 and cmd[i - 1] == ">") or cmd.startswith(">", i + 1)):
+            buf.append(c)
+            has = True
+            i += 1
+            continue
+        if c in ";&|`" or c in "()":
+            if c == closer and c == "`":
+                end_stmt(i, i + 1)
+                return i + 1
+            if c == ")":
+                if closer == ")" and paren == 0:
+                    end_stmt(i, i + 1)
+                    return i + 1
+                paren = max(0, paren - 1)
+            elif c == "(":
+                paren += 1
+            end_stmt(i, i + 1)
+            i += 1
+            continue
+        buf.append(c)
+        has = True
+        i += 1
+    end_stmt(n, n)
+    return n
+
+
+def _strip_git_globals(words: list[str]) -> list[str]:
+    """['git', '-C', 'x', '-c', 'k=v', '--no-pager', 'push', …] → ['git', 'push', …]"""
+    k = 1
+    n = len(words)
+    while k < n and words[k].startswith("-") and words[k] != "--":
+        w = words[k]
+        k += 2 if w in _GIT_OPT_WITH_ARG else 1
+    return [words[0]] + words[k:]
+
+
+def _strip_prefix(words: list[str]) -> list[str]:
+    """VAR=val・env・command・builtin・exec・nohup・time・nice・timeout・制御構文の語・パス指定を外す。"""
+    words = list(words)
+    for _ in range(64):  # 前置きの積み重ねの上限 (無限ループ防止)
+        if not words:
+            return words
+        w0 = words[0]
+        base = w0.rsplit("/", 1)[-1] if "/" in w0 else w0
+        if w0 in _KEYWORDS or _ASSIGN_RE.match(w0):
+            words = words[1:]
+        elif base == "env":
+            k = 1
+            while k < len(words) and (words[k].startswith("-") or _ASSIGN_RE.match(words[k])):
+                k += 2 if words[k] in ("-u", "-C", "-S", "--unset", "--chdir", "--split-string") else 1
+            words = words[k:]
+        elif base in ("command", "builtin", "exec", "nohup", "setsid", "time"):
+            k = 1
+            while k < len(words) and words[k].startswith("-") and words[k] != "--":
+                k += 2 if (base == "exec" and words[k] == "-a") else 1
+            if k < len(words) and words[k] == "--":
+                k += 1
+            words = words[k:]
+        elif base == "nice":
+            k = 1
+            while k < len(words) and words[k].startswith("-"):
+                k += 2 if words[k] in ("-n", "--adjustment") else 1
+            words = words[k:]
+        elif base == "timeout":
+            k = 1
+            while k < len(words) and words[k].startswith("-"):
+                k += 2 if words[k] in ("-s", "-k", "--signal", "--kill-after") else 1
+            words = words[k + 1:]  # DURATION
+        else:
+            break
+    if words and "/" in words[0]:
+        words[0] = words[0].rsplit("/", 1)[-1]
+    return words
+
+
+def _normalized_forms(words: list[str]) -> list[list[str]]:
+    """1 文の語列 → 照合する語列 (前置きを外したもの。git なら大域オプションも外したもの)。"""
+    norm = _strip_prefix(words)
+    forms = [norm] if norm else []
+    if norm and norm[0] == "git":
+        forms.append(_strip_git_globals(norm))
+    return forms
+
+
+def _candidate_sigs(cmd: str) -> list[str]:
+    """cmd の各文について 元の文・前置きを外した形・git の大域オプションも外した形 を Bash(...) にして返す。
+    bash -c / sh -c / eval の引数は 1 段だけ中を見る。"""
+    out: list[tuple[str, list[str]]] = []
+    _scan(cmd, 0, 0, out)
+    sigs: dict[str, None] = {}
+    inner: list[str] = []
+    for raw, words in out:
+        if raw:
+            sigs[f"Bash({raw})"] = None
+        for form in _normalized_forms(words):
+            sigs[f"Bash({' '.join(form)})"] = None
+            head = form[0]
+            if head in _SHELLS:
+                for k in range(1, len(form)):
+                    t = form[k]
+                    if t.startswith("-") and not t.startswith("--") and "c" in t[1:] and k + 1 < len(form):
+                        inner.append(form[k + 1])
+                        break
+            elif head == "eval" and len(form) > 1:
+                inner.append(" ".join(form[1:]))
+    for text in inner:  # 1 段だけ
+        sub: list[tuple[str, list[str]]] = []
+        _scan(text, 0, _MAX_NEST, sub)
+        for raw, words in sub:
+            if raw:
+                sigs[f"Bash({raw})"] = None
+            for form in _normalized_forms(words):
+                sigs[f"Bash({' '.join(form)})"] = None
+    return list(sigs)
+
+
 def check_permission(config: dict, skills_csv: str, tool_sig: str) -> dict:
     """Check tool_sig against skill permissions.
 
@@ -156,6 +409,14 @@ def check_permission(config: dict, skills_csv: str, tool_sig: str) -> dict:
     for pattern in global_deny:
         if fnmatch(tool_sig, pattern):
             return {"decision": "deny", "source": f"_global:deny:{pattern}"}
+
+    # 1a. 正規化した各文 (複合コマンドの 2 文目以降・git の大域オプション・前置きを外した形) も照合する
+    cmd = _extract_bash_command(tool_sig)
+    if cmd is not None and global_deny:
+        for sig in _candidate_sigs(cmd):
+            for pattern in global_deny:
+                if fnmatch(sig, pattern):
+                    return {"decision": "deny", "source": f"_global:deny:{pattern}"}
 
     # 1b. Substring scan for compound commands (cd /tmp && rm -rf /)
     # Strip quoted strings first to avoid false positives on string literals

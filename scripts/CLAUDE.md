@@ -20,6 +20,7 @@ lib ごとの**破ってはいけない契約**の要約。理由・経緯・全
 - デーモン側 JSON 状態ストアは `lib_daemon_state.load_json_store(path, check=...)` が唯一の入口。壊れたエントリが
   1 つでもあればストア全体が `Unreadable`。
 - 例外は `plan.sh` の `load_state()` 1 つだけ（`knowledge/empty-vs-unobservable.md` §4）。
+- `plan.sh done` は、Result に `approved_head:` の形の行があるのに gate の読み口（`result_section` → `lib_ci_status.approved_head`）で承認 head が読めなければ拒否する（exit 3・何も書かない・`error_code=APPROVED_HEAD_NOT_LAST`。形の判定は `lib_ci_status.has_approval_line` / `approved_head` の 1 か所。`tests/test_done_refuses_unreadable_approved_head.py`）。
 
 ## 書き込みの入口（`lib_state_store.py`。**plan.sh の queue への書き込みは全部ここを通る**（S3 / t012））
 

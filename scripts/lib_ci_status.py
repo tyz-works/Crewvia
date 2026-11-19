@@ -454,6 +454,9 @@ APPROVAL_SKILLS = ('review', 'codex-review', 'qa')
 #: 承認 head の理由の固定語 (`gate_verdict` の理由とは別の欄。`plan.sh ci-gate` の 2 行目と `merge-ready` の条件に使う)。
 APPROVAL_REASONS = ('ok', 'no_approval', 'approved_head_mismatch')
 _APPROVED_HEAD_RE = re.compile(r'approved_head: ([0-9a-f]{40})')
+#: 「承認の形の行」= 行頭 (空白は許す) が `approved_head` + `:` の行。大文字・短縮形・40 桁でない値も含む (それらは
+#: `approved_head` が読まない形なので、承認のつもりで書かれたなら gate には届かない)。`plan.sh done` の拒否だけが使う。
+_APPROVAL_LINE_RE = re.compile(r'\s*approved_head\s*:', re.IGNORECASE)
 
 
 def approved_head(result):
@@ -468,6 +471,15 @@ def approved_head(result):
         return None
     m = _APPROVED_HEAD_RE.fullmatch(lines[-1])
     return m.group(1) if m else None
+
+
+def has_approval_line(result):
+    """Result に「承認の形の行」(`_APPROVAL_LINE_RE`) が 1 行でも含まれるか。`approved_head` と同じ定義の隣に置く
+    (形の定義を `plan.sh` に書き写さない)。`plan.sh done` が「承認の形の行があるのに `approved_head` が None」を
+    拒否するために使う。"""
+    if not isinstance(result, str):
+        return False
+    return any(_APPROVAL_LINE_RE.match(ln) for ln in result.splitlines())
 
 
 def approval_verdict(reviews, *, pr_head):

@@ -3683,6 +3683,7 @@ _PULL_EXECUTION_EXIT_CODES = frozenset({
 
 #: `plan.sh retire` が exit 3 (PRECONDITION_UNMET) で返す理由のうち、Controller のコード (EXECUTION_* / STATE_INVALID) に無いもの。
 #: watchdog (`lib_retirement.RETIRE_SETTLED_CODES` / `RETIRE_CHECKPOINT_CODE`) が stderr の最後の行のこの値で読み分ける。
+APPROVED_HEAD_NOT_LAST = 'APPROVED_HEAD_NOT_LAST'
 RETIRE_CHECKPOINT_INVALID = 'CHECKPOINT_INVALID'
 RETIRE_STATUS_NOT_RETIRABLE = 'RETIRE_STATUS_NOT_RETIRABLE'
 RETIRE_WORKER_MISMATCH = 'RETIRE_WORKER_MISMATCH'
@@ -5251,6 +5252,20 @@ def codex_reviews_awaiting_pr(slug, task_id):
     return waiting
 
 
+def _approved_head_unreadable(body, result):
+    """done が書く Result を gate の読み口で読み直し、承認の形の行があるのに承認 head が読めない (None) なら True。
+
+    書く本文の組み立て (`demote_section_headings` → `build_task_body`) → `lib_history.result_section` →
+    `lib_ci_status.approved_head` は gate (dispatcher / ci-gate) が実際に読む経路そのもの。形の判定
+    (`has_approval_line` / `approved_head`) は lib_ci_status の 1 か所で、ここに書き写さない。
+    承認の形の行が無い Result (要修正の review・review 以外) は False (今までどおり通す)。"""
+    if not _CI_STATUS.has_approval_line(result):
+        return False
+    desc, _ = parse_task_body(body)
+    stored = _HISTORY.result_section(build_task_body(desc, demote_section_headings(result)))
+    return _CI_STATUS.approved_head(stored) is None
+
+
 def cmd_done(args):
     opts, positional = parse_opts(args, {'--mission': 'value', '--pr': 'value', '--no-pr': 'value',
                                          '--result-file': 'value', '--execution': 'value'})
@@ -5338,6 +5353,19 @@ def cmd_done(args):
                 _resend_conflict('done', slug, task_id, diffs)
             print(f"Done: {slug}/{task_id} — already completed (idempotent)")
             return
+
+        # ── 承認 head の行が gate に読めない形の done は書かずに拒否 (D0 と同じ作法: exit 3・何も書かない) ──
+        # gate (`lib_ci_status.approved_head`) は Result の最後の非空行だけを読む。2 行目に書いて所見を続けた done は
+        # 承認したのに `no_approval` になる (#415 / #416 / #417)。Result の本文・sha は出さない。
+        if _approved_head_unreadable(body, result):
+            die(
+                f"[plan.sh] {task_id}: Result に approved_head の行がありますが、gate が読む位置・形"
+                f" (Result の最後の非空行が `approved_head: <40 桁の小文字 sha>`) ではありません。"
+                f" このまま完了すると承認したのに merge-ready が出ず no_approval になります。何も書いていません。\n"
+                f"  出口: approved_head 行を Result の最後の行に移し (形も確かめ)、同じ done を送り直してください。\n"
+                f"{_error_code_line(APPROVED_HEAD_NOT_LAST)}",
+                PRECONDITION_UNMET,
+            )
 
         # ── 自分自身の card に既にある pr_number との食い違い (t095 / PR#236 8巡目 P2-1) ──
         # 成果物を作った task 自身の card にも pr_number を残す (下の done 処理の中)。既に

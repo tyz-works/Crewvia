@@ -31,6 +31,7 @@ class FakeRelay:
         self.hang_seconds = hang_seconds
         self.redirect_to = redirect_to
         self.gap = False
+        self.irc = None                  # 応答の最上位 `irc` 欄 (None = 欄を付けない = 古い relay)。dict をそのまま入れる (壊れた形も可)
         self.delay = 0.0                 # 応答を遅らせる秒 (プロセス表の走査テスト用)
         self.raw_body = None             # mode=badjson のときに返すバイト列 (None なら壊れた JSON)
         self.mentions = []               # 積まれた発言 (instance つき)
@@ -120,6 +121,8 @@ class FakeRelay:
                             "now": relay.now, "head_id": relay.head_id, "cursor": max(cursor, after),
                             "has_more": has_more, "gap": relay.gap,
                             "mentions": [{k: v for k, v in m.items() if not k.startswith("_")} for m in page]}
+                    if relay.irc is not None:
+                        body["irc"] = relay.irc
                 self._send(200, body)
 
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)

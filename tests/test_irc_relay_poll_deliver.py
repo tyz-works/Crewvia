@@ -945,7 +945,7 @@ def _skipped_cycle_setup(reg, reason):
     state["last_poll_at"] = NOW - 10
     assert L.write_state(reg, state)
     receiver = {"enabled": True, "checked_at": NOW - 10, "reason": reason, "api": 1, "last_ok_at": NOW - 1000,
-                "pending_count": 0}
+                "pending_count": 0, "irc_connected": None, "irc_since": None}
     (reg / L.RECEIVER_FILE).write_text(json.dumps(receiver), encoding="utf-8")
     return cfg
 
@@ -1170,3 +1170,31 @@ def test_busy_then_idle_sends_exactly_once():
     assert len(mux.sent) == 1 and state["pending"] == [] and stats["delivered"] == 1
     state, _ = deliver(state, mux)
     assert len(mux.sent) == 1
+
+
+# ---------------------------------------------------------------------------
+# irc 欄 (relay が報告する IRC 側の接続状態。t002)
+# ---------------------------------------------------------------------------
+
+def test_poll_summary_carries_the_irc_status_and_down_seconds(reg, relay):
+    relay.irc = {"connected": False, "since": relay.now - 700, "last_error": "tls_handshake_failed"}
+    out = poll(reg, relay)
+    assert out["irc"] == {"status": "disconnected", "since": relay.now - 700, "last_error": "tls_handshake_failed",
+                          "down_seconds": 700}
+
+
+def test_poll_summary_without_the_field_has_irc_none(reg, relay):
+    assert poll(reg, relay)["irc"] is None
+
+
+def test_receiver_irc_fields_are_required_and_paired():
+    base = {"enabled": True, "checked_at": 1.0, "reason": "ok", "api": 1, "last_ok_at": 1.0, "pending_count": 0,
+            "irc_connected": None, "irc_since": None}
+    from lib_daemon_state import irc_receiver_problem
+    assert irc_receiver_problem(base) is None
+    assert irc_receiver_problem(dict(base, irc_connected=False, irc_since=5)) is None
+    for bad in (dict(base, irc_connected=False), dict(base, irc_since=5), dict(base, irc_connected="no", irc_since=5),
+                dict(base, irc_connected=True, irc_since=-1), dict(base, irc_connected=True, irc_since=True)):
+        assert irc_receiver_problem(bad), bad
+    for key in ("irc_connected", "irc_since"):
+        assert irc_receiver_problem({k: v for k, v in base.items() if k != key})

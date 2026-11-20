@@ -702,6 +702,15 @@ def irc_receiver_problem(data):
         return "'last_ok_at' is not a timestamp or null"
     if not _irc_is_int(data.get('pending_count'), 0):
         return "'pending_count' is not a non-negative integer"
+    # relay が報告する IRC 側の接続状態 (取得できなかった・欄なし・壊れていたときは両方 null)。読み手が [] で読む欄なので必須
+    irc_connected = data.get('irc_connected')
+    irc_since = data.get('irc_since')
+    if irc_connected is not None and not isinstance(irc_connected, bool):
+        return "'irc_connected' is not a boolean or null"
+    if irc_since is not None and not _irc_is_int(irc_since, 0):
+        return "'irc_since' is not an integer or null"
+    if 'irc_connected' not in data or 'irc_since' not in data or (irc_connected is None) != (irc_since is None):
+        return "'irc_connected' / 'irc_since' must both be present and both null or both set"
     quarantine = data.get('quarantine')
     if quarantine is not None:
         if not isinstance(quarantine, dict) or set(quarantine) != {'count', 'at', 'from'}:
@@ -709,7 +718,8 @@ def irc_receiver_problem(data):
         if not _irc_is_int(quarantine['count'], 0) or not is_finite_number(quarantine['at']) \
                 or not _is_hex(quarantine['from'], 16):
             return "'quarantine' has a bad value"
-    extra = set(data) - {'enabled', 'checked_at', 'reason', 'api', 'last_ok_at', 'pending_count', 'quarantine'}
+    extra = set(data) - {'enabled', 'checked_at', 'reason', 'api', 'last_ok_at', 'pending_count', 'quarantine',
+                         'irc_connected', 'irc_since'}
     if extra:
         return f'unexpected fields {sorted(extra)!r}'
     return None

@@ -331,7 +331,7 @@ irc:
 |---|---|---|---|
 | `irc-state.json` | dispatcher (poll と配達) | `identity` / `epoch` / `cursor` / `skew` / `last_poll_at` / `pending[]` | 受信箱に残っている最大 24 時間分が**もう一度届く** (重複はあるが失われない)。未配達の `pending` は bot から取り直される |
 | `irc-quarantine.json` | dispatcher (identity が変わったときだけ) | 旧 identity の `pending[]` の退避 (配達しない。件数と退避した時刻・旧 identity の指紋だけを `irc-receiver.json` に出す) | 退避された未配達が**永久に失われる** (24 時間で価値が無くなる通知なので許容。復旧手順の 1 つ) |
-| `irc-receiver.json` | dispatcher | `enabled` / `checked_at` / `reason` / `api` / `last_ok_at` / `pending_count` と、退避したときだけ `quarantine` = `{count, at, from}` (`from` は旧 identity の指紋 16 桁。固定コードと数だけ。トークン・URL の中身は書かない。心拍は 60 秒) | 次のサイクルで書き直される |
+| `irc-receiver.json` | dispatcher | `enabled` / `checked_at` / `reason` / `api` / `last_ok_at` / `pending_count` / `irc_connected` / `irc_since` (relay が報告した IRC 側の接続状態。取得できなかった・欄なし・壊れていたときは両方 null) と、退避したときだけ `quarantine` = `{count, at, from}` (`from` は旧 identity の指紋 16 桁。固定コードと数だけ。トークン・URL の中身は書かない。心拍は 60 秒) | 次のサイクルで書き直される |
 
 `irc-state.json`:
 
@@ -786,3 +786,15 @@ crewvia は `/v1/mentions` の 404 を `api_unsupported` と読む。
 ### poll サブプロセスの失敗 (t007 3 回目)
 
 子の `poll` が timeout・異常終了すると子は状態を書けない。親 (`run_cycle`) が `poll_timeout` / `poll_failed` を `fail_streak` に数え、`last_poll_at` を進めて backoff を働かせ、`http_unreachable` と同じ閾値で `irc_relay_unreachable` の通知に載せる。`irc_relay_gap` は `IRC_NOTIFY_KEYS` に入れ、`gap` でない成功の poll で台帳から消す (次の独立した欠落をもう一度通知できる)。
+
+### relay が IRC につながっていない状態の通知 (t002)
+
+背景: relay bot の HTTP は生きているのに bot 自身が IRC に 14 時間つながっておらず、crewvia の `irc-receiver.json` は `reason=ok` のままで誰も気づかなかった。
+
+- 契約 (relay 側 t001 と固定): `/v1/mentions` の応答の最上位に**任意の**欄 `irc = {connected: bool, since: int, last_error: 固定コード|null}`。
+- `parse_response` が `_parse_irc` で読む。**欄なし (古い relay)** → `irc: None` (何もしない・壊れ扱いにしない)。**形が壊れている** (型違い・`since` が負・`last_error` 欠け) → `{'status': 'unknown'}`。どちらでも `mentions` の採用は止めない (接続状態は別の情報。全体を捨てる規則は mentions の契約のためのもの)。
+- `last_error` は `[a-z_]{1,64}` だけを通し、外れたら `unknown` (画面に出す文字列なので無害化の規則に従う)。
+- 通知: `connected=false` が `irc.disconnect_notify_seconds` (既定 300・30〜86400) 以上続いたら `run_cycle` が `summary['irc_down']` を立て、dispatcher の `_irc_notices` が `irc_relay_irc_disconnected` を 1 回送る。継続時間は応答の `now - since` (bot の時計。crewvia の時計とのずれに左右されない)。fingerprint は `since` なので、続いても 1 回・新しい切断では再び 1 回。`connected=true` / 欄なしの成功した取得で台帳のキーを畳む。**`unknown` (壊れ) は回復ではないので畳まない**。取得できなかったサイクル・間引きのサイクルも畳まない。
+- `irc-receiver.json` に `irc_connected` / `irc_since` を足した (`irc_receiver_problem` が検査。読み手が `[]` で読む欄なので必須・両方 null か両方値)。取得していないサイクルは前回を引き継ぎ、取得したサイクルはその応答の値 (欄なし・壊れ・失敗は null)。**既存の `irc-receiver.json` は旧形式なので最初の 1 サイクルだけ「読めない」と扱われて書き直される** (消してよい復旧対象。前回の reason の引き継ぎが 1 回だけ `not_due` になる)。
+- `irc.enabled` が true でなければ何も読まず・書かず・送らない、取得できないときの `fail_streak` の扱いは今まで通り。
+- 戻し方: PR revert → `scripts/sync-main-checkout.sh`。receiver に増えた 2 欄は旧コードが「想定外の欄」として読めないと扱うが、次のサイクルで旧形式に書き直される。

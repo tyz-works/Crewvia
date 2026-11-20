@@ -62,6 +62,8 @@ STORE_FIELD_MAX = 100                         # sender / channel / account
 INTERVAL_MAX_SECONDS = 300
 UNREACHABLE_NOTIFY_STREAK = 6
 BAD_SHAPE_NOTIFY_STREAK = 3
+IRC_DISCONNECT_NOTIFY_SECONDS = 300            # relay が IRC につながっていない状態がこの秒数続いたら Director に 1 回 (config irc.disconnect_notify_seconds)
+IRC_LAST_ERROR_MAX = 64
 RECEIVER_HEARTBEAT_SECONDS = 60
 OP_TIMEOUT_SECONDS = 15
 POLL_SUBPROCESS_TIMEOUT = 8
@@ -86,6 +88,7 @@ _NAME_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9_-]{0,31}')
 _INSTANCE_RE = re.compile(r'[a-z0-9][a-z0-9_-]{0,31}')
 _TOKEN_RE = re.compile(r'[A-Za-z0-9._~+/=-]{32,256}')
 _HEX8_RE = re.compile(r'[0-9a-f]{8}')
+_ERROR_CODE_RE = re.compile(r'[a-z_]{1,64}')   # relay の irc.last_error (固定コード。外れたら unknown)
 
 ASCII_UPPER_TO_LOWER = str.maketrans(string.ascii_uppercase, string.ascii_lowercase)
 
@@ -242,6 +245,7 @@ def default_config():
     return {
         'enabled': False, 'url': '', 'instance': '', 'poll_interval_seconds': 10, 'request_timeout_seconds': 5,
         'max_deliver_per_cycle': 3, 'max_deliver_per_name_per_cycle': 2, 'max_text_chars': 300,
+        'disconnect_notify_seconds': IRC_DISCONNECT_NOTIFY_SECONDS,
         'allowed_targets': list(DEFAULT_ALLOWED_TARGETS),
         'credentials': {'source': '', 'token_ref': '', 'file': '', 'op_command': 'op'},
     }
@@ -272,6 +276,8 @@ def load_irc_config(config_path=None):
     cfg['max_deliver_per_cycle'] = _int_in(block.get('max_deliver_per_cycle'), 1, 20, 3)
     cfg['max_deliver_per_name_per_cycle'] = _int_in(block.get('max_deliver_per_name_per_cycle'), 1, 10, 2)
     cfg['max_text_chars'] = _int_in(block.get('max_text_chars'), 1, STORE_TEXT_MAX, 300)
+    cfg['disconnect_notify_seconds'] = _int_in(block.get('disconnect_notify_seconds'), 30, 86400,
+                                               IRC_DISCONNECT_NOTIFY_SECONDS)
     if 'allowed_targets' in block:
         targets = block.get('allowed_targets')
         if isinstance(targets, list) and all(isinstance(t, str) and t in VALID_TARGETS for t in targets):
@@ -536,7 +542,29 @@ def parse_response(body, after, limit, instance):
     elif data['cursor'] != data['head_id']:
         return 'bad_shape', None             # 続きが無いなら cursor は head_id
     return 'ok', {'epoch': epoch, 'now': data['now'], 'head_id': data['head_id'], 'cursor': data['cursor'],
-                  'has_more': data['has_more'], 'gap': data['gap'], 'mentions': clean}
+                  'has_more': data['has_more'], 'gap': data['gap'], 'mentions': clean,
+                  'irc': _parse_irc(data)}
+
+
+def _parse_irc(data):
+    """応答の最上位の任意の欄 `irc = {connected, since, last_error}` → `None` (欄なし = 古い relay) /
+    `{'status': 'unknown'}` (形が壊れている) / `{'status': 'connected'|'disconnected', 'since', 'last_error', 'down_seconds'}`。
+
+    接続状態は mentions の契約とは別の情報なので、**壊れていても mentions の採用は止めない** (呼び出し側は `parse_response` の
+    成功のまま)。`last_error` は固定コード (英小文字と `_` だけ・64 字まで) だけを通し、外れたら `unknown`。
+    """
+    if 'irc' not in data:
+        return None
+    irc = data['irc']
+    if not isinstance(irc, dict) or not isinstance(irc.get('connected'), bool) or not _is_int(irc.get('since'), 0):
+        return {'status': 'unknown'}
+    last_error = irc.get('last_error')
+    if last_error is not None:
+        last_error = last_error if (isinstance(last_error, str) and _ERROR_CODE_RE.fullmatch(last_error)) else 'unknown'
+    elif 'last_error' not in irc:
+        return {'status': 'unknown'}
+    return {'status': 'connected' if irc['connected'] else 'disconnected', 'since': irc['since'],
+            'last_error': last_error, 'down_seconds': max(0, data['now'] - irc['since'])}
 
 
 def _parse_mention(m):
@@ -678,7 +706,7 @@ def poll_once(registry_dir, config, token, *, now=None, fetch=http_get, warn=Non
     """
     now = time.time() if now is None else now
     summary = {'code': 'ok', 'received': 0, 'gap': False, 'epoch_changed': False, 'cursor_reset': False,
-               'quarantined': 0, 'fail_streak': 0, 'bad_streak': 0, 'api': None}
+               'quarantined': 0, 'fail_streak': 0, 'bad_streak': 0, 'api': None, 'irc': None}
     try:
         problem = config_problem(config)
         if problem:
@@ -749,6 +777,7 @@ def poll_once(registry_dir, config, token, *, now=None, fetch=http_get, warn=Non
 def _apply_response(state, parsed, now, summary):
     summary['api'] = API_VERSION
     summary['gap'] = parsed['gap']
+    summary['irc'] = parsed['irc']
     state['skew'] = parsed['now'] - now
     if state['epoch'] is not None and state['epoch'] != parsed['epoch']:
         # 別の採番の世界: この応答の id は使えない。cursor を 0 に戻し、次のサイクルで取り直す。pending は残す
@@ -1055,8 +1084,11 @@ def _plan_lines(entries, lines_left, per_name_cap):
 # 受信側の状態 (irc-receiver.json。固定コードと数だけ)
 # ---------------------------------------------------------------------------
 
+_UNSET = object()
+
+
 def write_receiver_state(registry_dir, config, enabled, reason, now, *, api=None, ok=False, pending_count=0,
-                         quarantine=None):
+                         quarantine=None, irc=_UNSET):
     """受信側の状態を書く (**書き手は dispatcher だけ**)。→ 書いたか。
 
     未設定で (`config` が無効) ファイルが無ければ何も作らない。変化が無く心拍の間隔に届いていなければ書き直さない。
@@ -1071,6 +1103,16 @@ def write_receiver_state(registry_dir, config, enabled, reason, now, *, api=None
     want = {'enabled': bool(enabled), 'checked_at': now, 'reason': reason,
             'api': api if api is not None else (prev.get('api') if prev else None),
             'last_ok_at': last_ok, 'pending_count': pending_count}
+    # irc = 取得したサイクルの接続状態 (`poll['irc']`。None = 欄なし)。取得していないサイクル (`_UNSET`) は前回を引き継ぐ。
+    if irc is _UNSET:
+        irc_connected = prev.get('irc_connected') if prev else None
+        irc_since = prev.get('irc_since') if prev else None
+    else:
+        known = irc is not None and irc.get('status') in ('connected', 'disconnected')
+        irc_connected = (irc['status'] == 'connected') if known else None
+        irc_since = irc['since'] if known else None
+    want['irc_connected'] = irc_connected
+    want['irc_since'] = irc_since
     q = quarantine if quarantine is not None else (prev.get('quarantine') if prev else None)
     if q is not None:
         want['quarantine'] = q
@@ -1097,7 +1139,7 @@ def run_cycle(registry_dir, config, token, token_reason, mux, *, now=None, confi
     now = time.time() if now is None else now
     summary = {'enabled': False, 'reason': 'disabled', 'polled': False, 'poll': None, 'delivered': 0,
                'expired': 0, 'omitted': 0, 'deferred': {}, 'failed': 0, 'state_unreadable': False,
-               'pending_count': 0}
+               'pending_count': 0, 'irc_down': None}
     try:
         if not config.get('enabled'):
             write_receiver_state(registry_dir, config, False, 'disabled', now)
@@ -1171,7 +1213,13 @@ def run_cycle(registry_dir, config, token, token_reason, mux, *, now=None, confi
                                'identity_changed_failed')
         summary['enabled'] = enabled
         write_receiver_state(registry_dir, config, enabled, code, now, api=poll.get('api'), ok=(summary['polled'] and code == 'ok'),
-                             pending_count=summary['pending_count'], quarantine=quarantine)
+                             pending_count=summary['pending_count'], quarantine=quarantine,
+                             irc=(poll.get('irc') if summary['polled'] else _UNSET))
+        irc = poll.get('irc') or {}
+        if (summary['polled'] and code == 'ok' and irc.get('status') == 'disconnected'
+                and irc.get('down_seconds', 0) >= config.get('disconnect_notify_seconds', IRC_DISCONNECT_NOTIFY_SECONDS)):
+            summary['irc_down'] = {'since': irc['since'], 'minutes': irc['down_seconds'] // 60,
+                                   'last_error': irc['last_error'] or 'unknown'}
     except Exception as e:  # noqa: BLE001 — dispatcher のサイクルを落とさない。型名だけ
         log(f'WARNING: irc cycle failed ({type(e).__name__})')
     return summary

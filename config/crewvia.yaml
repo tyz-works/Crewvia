@@ -366,6 +366,7 @@ irc:
   max_deliver_per_cycle: 3        # 1 サイクルに画面へ送る行の合計の上限
   max_deliver_per_name_per_cycle: 2
   max_text_chars: 300             # 画面に出す本文の長さ（上限 500）
+  disconnect_notify_seconds: 300  # relay bot が IRC につながっていない状態がこの秒数続いたら Director に 1 回（30〜86400）
   allowed_targets: [director, worker]
   credentials:
     source: ""                    # "" = 未設定 / op / file

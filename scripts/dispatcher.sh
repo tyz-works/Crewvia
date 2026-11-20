@@ -3862,7 +3862,8 @@ def run_ci_notify():
 # `irc.enabled` が true でなければ何も読まず何も書かない。全体を try/except で包む理由は run_telegram_cycle() と同じ。
 
 IRC_NOTIFY_KEYS = ('irc_relay_unreachable', 'irc_relay_unauthorized', 'irc_relay_api_unsupported',
-                   'irc_relay_bad_request', 'irc_relay_bad_response', 'irc_receiver_disabled', 'irc_relay_gap')
+                   'irc_relay_bad_request', 'irc_relay_bad_response', 'irc_receiver_disabled', 'irc_relay_gap',
+                   'irc_relay_irc_disconnected')
 
 
 def _irc_notices(summary):
@@ -3893,6 +3894,12 @@ def _irc_notices(summary):
         out.append(('irc_relay_bad_response', fingerprint('bad_response'),
                     '[irc] relay bot の応答が ' + str(poll.get('bad_streak')) + ' 回連続で不正です (' + code +
                     ')。bot の版を確認してください。受信箱は bot が 24 時間預かります。'))
+    down = summary.get('irc_down')
+    if isinstance(down, dict):
+        # relay bot は動いているが bot 自身が IRC につながっていない (t002)。fingerprint = since (新しい切断の episode ではまた 1 回)
+        out.append(('irc_relay_irc_disconnected', fingerprint(str(down['since'])),
+                    '[irc] relay bot が IRC につながっていません (約 ' + str(down['minutes']) + ' 分・last_error=' + str(down['last_error']) +
+                    ')。この間の IRC の呼びかけは集められていません (取りこぼし)。a1-free で journalctl -u irc-relay を確認してください。'))
     if poll.get('gap'):
         out.append(('irc_relay_gap', fingerprint('gap'),
                     '[irc] relay bot の受信箱で期限切れ・溢れにより一部の呼びかけが失われました (gap)。残っている分は届けています。'))
@@ -3921,6 +3928,8 @@ def run_irc_cycle():
             told = load_told()
             if not is_unreadable(told):
                 still = {k for k, _fp, _m in notices}        # 今回も出ている通知は消さない (gap は gap=false の成功で消える)
+                if ((summary.get('poll') or {}).get('irc') or {}).get('status') == 'unknown':
+                    still.add('irc_relay_irc_disconnected')  # 状態が読めないのは回復ではない (畳まない)
                 for key in IRC_NOTIFY_KEYS:
                     if key in told and key not in still:
                         clear_told_key(key)          # 回復 (次に同じ障害が起きたら再通知される)

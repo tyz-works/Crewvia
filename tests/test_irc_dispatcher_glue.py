@@ -326,3 +326,147 @@ def test_gap_notice_is_cleared_by_a_later_successful_poll_without_gap(tmp_path, 
     relay.gap = False
     ns.cycle()
     assert "irc_relay_gap" not in ns.told
+
+
+# ---------------------------------------------------------------------------
+# relay が IRC につながっていない状態の通知 (t002)
+# ---------------------------------------------------------------------------
+
+IRC_KEY = "irc_relay_irc_disconnected"
+
+
+def make_due(ns):
+    state_file = ns.registry / "daemons" / "irc-state.json"
+    s = json.loads(state_file.read_text())
+    s["last_poll_at"] = 0
+    state_file.write_text(json.dumps(s))
+
+
+def down(relay, seconds, last_error="connect_timeout"):
+    relay.irc = {"connected": False, "since": relay.now - seconds, "last_error": last_error}
+
+
+def receiver(ns):
+    return json.loads((ns.registry / "daemons" / "irc-receiver.json").read_text())
+
+
+def test_disconnect_under_threshold_is_quiet(tmp_path, monkeypatch, relay):
+    ns = Ns(tmp_path, monkeypatch)
+    ns.config(cfg_text(relay.url))
+    down(relay, 299)
+    ns.cycle()
+    assert ns.notified == []
+    assert receiver(ns)["irc_connected"] is False
+
+
+def test_disconnect_over_threshold_notifies_once_per_episode_and_recovery_clears(tmp_path, monkeypatch, relay):
+    ns = Ns(tmp_path, monkeypatch)
+    ns.config(cfg_text(relay.url))
+    down(relay, 600)
+    ns.cycle()
+    assert [n[0] for n in ns.notified] == [IRC_KEY]
+    key, fp, text = ns.notified[0]
+    assert "10 分" in text and "connect_timeout" in text and "journalctl -u irc-relay" in text and "集められていません" in text
+    # 続いても同じ fingerprint (= notify_state_once が 1 回にする)
+    ns.notified.clear()
+    make_due(ns)
+    relay.now += 60
+    ns.cycle()
+    assert [n[0] for n in ns.notified] == [IRC_KEY] and ns.notified[0][1] == fp
+    # 戻る: 台帳のキーを畳む
+    ns.told[IRC_KEY] = {"fp": fp}
+    ns.notified.clear()
+    relay.irc = {"connected": True, "since": relay.now, "last_error": None}
+    make_due(ns)
+    ns.cycle()
+    assert ns.notified == [] and IRC_KEY in ns.cleared
+    assert receiver(ns)["irc_connected"] is True
+    # 新しい切断 = 別の fingerprint
+    ns.notified.clear()
+    relay.irc = {"connected": False, "since": relay.now - 900, "last_error": "connect_timeout"}
+    make_due(ns)
+    ns.cycle()
+    assert [n[0] for n in ns.notified] == [IRC_KEY] and ns.notified[0][1] != fp
+
+
+def test_no_irc_field_is_old_relay_and_does_nothing(tmp_path, monkeypatch, relay):
+    ns = Ns(tmp_path, monkeypatch)
+    ns.config(cfg_text(relay.url))
+    relay.irc = None
+    ns.told[IRC_KEY] = {"fp": "x"}
+    ns.cycle()
+    assert ns.notified == [] and receiver(ns)["irc_connected"] is None and receiver(ns)["reason"] == "ok"
+
+
+@pytest.mark.parametrize("broken", [
+    "yes", [], {"connected": "yes", "since": 1, "last_error": None}, {"connected": False, "since": -1, "last_error": None},
+    {"connected": False, "since": True, "last_error": None}, {"connected": False, "since": 1}, None,
+])
+def test_broken_irc_field_still_delivers_mentions_and_does_not_notify_or_clear(tmp_path, monkeypatch, relay, broken):
+    ns = Ns(tmp_path, monkeypatch)
+    ns.config(cfg_text(relay.url))
+    relay.add(text="@Sora hello")
+    relay.irc = broken if broken is not None else {}
+    if broken is None:
+        relay.irc = {"connected": None}
+    ns.told[IRC_KEY] = {"fp": "x"}
+    ns.cycle()
+    assert len(ns.mux.sent) == 1
+    assert ns.notified == [] and IRC_KEY in ns.told and IRC_KEY not in ns.cleared
+    r = receiver(ns)
+    assert r["irc_connected"] is None and r["irc_since"] is None and r["reason"] == "ok"
+
+
+@pytest.mark.parametrize("bad", ["Bad Error!", "has\x1b[31mesc", "x" * 65, "UPPER", "a b", "rm;ls", "", "日本語"])
+def test_last_error_outside_the_fixed_code_shape_becomes_unknown(tmp_path, monkeypatch, relay, bad):
+    ns = Ns(tmp_path, monkeypatch)
+    ns.config(cfg_text(relay.url))
+    down(relay, 600, last_error=bad)
+    ns.cycle()
+    assert len(ns.notified) == 1 and "last_error=unknown" in ns.notified[0][2]
+    assert bad not in ns.notified[0][2] or bad == ""
+
+
+def test_last_error_null_is_unknown_in_the_message(tmp_path, monkeypatch, relay):
+    ns = Ns(tmp_path, monkeypatch)
+    ns.config(cfg_text(relay.url))
+    down(relay, 600, last_error=None)
+    ns.cycle()
+    assert "last_error=unknown" in ns.notified[0][2]
+
+
+def test_threshold_comes_from_the_irc_config_block(tmp_path, monkeypatch, relay):
+    ns = Ns(tmp_path, monkeypatch)
+    ns.config(cfg_text(relay.url, extra="  disconnect_notify_seconds: 900\n"))
+    down(relay, 600)
+    ns.cycle()
+    assert ns.notified == []
+    down(relay, 900)
+    make_due(ns)
+    ns.cycle()
+    assert [n[0] for n in ns.notified] == [IRC_KEY]
+
+
+def test_unreachable_relay_keeps_the_existing_handling_and_clears_no_irc_state(tmp_path, monkeypatch, relay):
+    ns = Ns(tmp_path, monkeypatch)
+    ns.config(cfg_text(relay.url))
+    down(relay, 600)
+    ns.cycle()
+    ns.notified.clear()
+    relay.mode = "http500"
+    make_due(ns)
+    ns.cycle()
+    assert [n[0] for n in ns.notified] == []          # fail_streak は 1 回目。従来どおり 6 回まで黙る
+    assert receiver(ns)["irc_connected"] is None      # 古い値を残さない (取得できなかった)
+    assert IRC_KEY not in ns.cleared                  # 成功した取得ではないので畳まない
+
+
+def test_token_never_appears_in_the_new_path(tmp_path, monkeypatch, relay):
+    ns = Ns(tmp_path, monkeypatch)
+    ns.config(cfg_text(relay.url))
+    down(relay, 600)
+    ns.cycle()
+    blob = json.dumps(ns.notified) + json.dumps(ns.logs)
+    for p in (ns.registry / "daemons").iterdir():
+        blob += p.read_text(errors="replace")
+    assert TOKEN not in blob

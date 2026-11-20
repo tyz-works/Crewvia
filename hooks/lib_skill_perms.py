@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import sys
 import tempfile
 from fnmatch import fnmatch, translate
@@ -146,27 +147,78 @@ _GLOBAL_DENY_SUBSTRINGS: list[tuple[re.Pattern, str]] = [
     (re.compile(r"\|\s*source\b"), "pipe-to-source"),
 ]
 
-# 正規化した各文 (Bash(<前置きを外した 1 文>)) の先頭に当てる正規表現の deny。fnmatch の先頭一致では
-# 引数の順番に左右される形 (gh のオプションの位置・gh api の URL / GraphQL の位置) を書けないので別に持つ。
-# 引用符の中の改行 (整形した GraphQL の query) も .* が越えるよう api の 2 本は DOTALL。
+# 正規化した各文 (Bash(<前置きを外した 1 文>)) を語に分けて見る merge の deny。fnmatch の先頭一致や正規表現では
+# gh のオプション (--repo o/r 等) の位置・gh api の引数の順番に左右されるので、語から option と値を外して判定する。
 # 目的: Worker が PR を merge しないこと (merge は Director だけ。Director は pre-tool-use.sh が
-# global deny より前に通す)。config の _global.deny の "Bash(gh pr merge*)" と重複してよい (ラベルが違うだけ)。
-_GH = r"^Bash\((?:\S*/)?gh\s+"
-_GLOBAL_DENY_STATEMENT_REGEX: list[tuple[re.Pattern, str]] = [
-    # gh pr merge (gh -R owner/repo pr merge … のようにオプションが前に付く形も)
-    (re.compile(_GH + r"(?:-{1,2}\S+\s+(?:[^-\s]\S*\s+)?)*pr\s+merge\b"), "gh pr merge"),
-    # gh api …/pulls/<N>/merge (-X PUT / --method PUT の有無・引数の順番を問わない)
-    (re.compile(_GH + r"api\b.*/pulls/[^\s/\"']+/merge\b", re.DOTALL), "gh api pulls/N/merge"),
-    # gh api graphql の merge 系 mutation
-    (re.compile(_GH + r"api\b.*\b(?:mergePullRequest|enablePullRequestAutoMerge)\b", re.DOTALL), "gh api graphql merge"),
-]
+# global deny より前に通す)。config の _global.deny の "Bash(gh pr merge*)" と重複してよい。
+# - gh pr merge: option と値 (--repo/-R/--hostname 等・位置を問わず) を外した残りが gh pr merge で始まるか
+# - gh api: payload は見ない。REST はエンドポイント (位置引数) が repos/*/pulls/*/merge か、
+#   GraphQL はエンドポイントが graphql のときだけ query の値を見る (コメントに書くだけの payload は通す)
+_GH_HEAD = re.compile(r"(?:\S*/)?gh(?:\s|$)")
+_GH_VALUE_OPTS = {"-R", "--repo", "--hostname"}
+_API_VALUE_OPTS = {"-X", "--method", "-H", "--header", "-f", "--raw-field", "-F", "--field", "--input",
+                   "-q", "--jq", "-t", "--template", "--cache", "--hostname", "-p", "--preview"}
+_API_FIELD_OPTS = {"-f", "--raw-field", "-F", "--field"}
+_MERGE_ENDPOINT = re.compile(r"^/?repos/[^/]+/[^/]+/pulls/[^/]+/merge/?(?:\?.*)?$")
+_MERGE_MUTATION = re.compile(r"\b(?:mergePullRequest|enablePullRequestAutoMerge)\b")
+
+
+def _gh_words(sig: str) -> list | None:
+    """Bash(<stmt>) の stmt を語に分け、gh の語列 (gh の次から) を返す。gh で始まらなければ None。"""
+    if not (sig.startswith("Bash(") and sig.endswith(")")):
+        return None
+    stmt = sig[5:-1]
+    if not _GH_HEAD.match(stmt):  # shlex は遅いので gh でない文 (巨大な入力を含む) は語に分けない
+        return None
+    try:
+        words = shlex.split(stmt)
+    except ValueError:
+        words = stmt.split()
+    if not words or os.path.basename(words[0]) != "gh":
+        return None
+    return words[1:]
+
+
+def _split_opts(words: list, value_opts: set) -> tuple[list, list]:
+    """(位置引数, [(option, 値)]) に分ける。-Xvalue / --opt=value の付け形も解く。"""
+    pos: list = []
+    opts: list = []
+    i = 0
+    while i < len(words):
+        w = words[i]
+        if w.startswith("--") and "=" in w:
+            k, v = w.split("=", 1)
+            opts.append((k, v))
+        elif w in value_opts:
+            opts.append((w, words[i + 1] if i + 1 < len(words) else ""))
+            i += 1
+        elif w.startswith("-") and not w.startswith("--") and len(w) > 2 and w[:2] in value_opts:
+            opts.append((w[:2], w[2:]))
+        elif w.startswith("-") and w != "-":
+            opts.append((w, ""))
+        else:
+            pos.append(w)
+        i += 1
+    return pos, opts
 
 
 def _match_statement_regex(sigs: list) -> str | None:
     for sig in sigs:
-        for regex, label in _GLOBAL_DENY_STATEMENT_REGEX:
-            if regex.search(sig):
-                return label
+        words = _gh_words(sig)
+        if words is None:
+            continue
+        pos, _ = _split_opts(words, _GH_VALUE_OPTS)
+        if pos[:2] == ["pr", "merge"]:
+            return "gh pr merge"
+        if pos[:1] == ["api"]:
+            pos, opts = _split_opts(words, _API_VALUE_OPTS | _GH_VALUE_OPTS)
+            endpoint = pos[1] if len(pos) > 1 else ""
+            if _MERGE_ENDPOINT.match(endpoint):
+                return "gh api pulls/N/merge"
+            if endpoint.lstrip("/") == "graphql":
+                for k, v in opts:
+                    if k in _API_FIELD_OPTS and v.startswith("query=") and _MERGE_MUTATION.search(v):
+                        return "gh api graphql merge"
     return None
 
 

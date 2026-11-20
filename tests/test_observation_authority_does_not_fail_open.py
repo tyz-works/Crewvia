@@ -459,7 +459,7 @@ OBSERVATION_SITES: dict[tuple[str, str, str], tuple[str, str]] = {
         (SAFE, "ENOENT/ESRCH だけ continue (消えた)。他は None を return し "
                "walk 全体を『不完全』として hold させる"),
     ("lib_daemon_watch.py", "scan_daemon_pids",
-     '(entry / "stat").read_text(encoding="utf-8")'):
+     '(entry / "stat").read_bytes()'):
         (SAFE, "cmdline 一致後の zombie 判定専用。読めなければ pass して "
                "found.append(pid) —— 『生きているとみなす』方向で、これは "
                "respawn を許可しない (=二重起動させない) 側の安全な倒し方"),
@@ -538,7 +538,7 @@ OBSERVATION_SITES: dict[tuple[str, str, str], tuple[str, str]] = {
                "他の OSError は理由文字列付きで返し、呼び出し側は全 Worker を "
                "keep にする (docstring: \"呼び出し側は全部 keep にする\")"),
     ("worktree_gc.py", "_cwd_unreadable_but_harmless",
-     "(base / 'stat').read_text()"):
+     "(base / 'stat').read_bytes()"):
         (SAFE, "FileNotFoundError だけ '消えた' を返す。他の (OSError, "
                "ValueError) は None (=harmless と言えない=デフォルトで keep "
                "側)。この関数自体が『keep するかどうか』の除外判定で、既定の "
@@ -549,7 +549,7 @@ OBSERVATION_SITES: dict[tuple[str, str, str], tuple[str, str]] = {
      "(base / 'cmdline').read_bytes()"):
         (SAFE, "同上 (同じ try/except ブロック内)"),
     ("worktree_gc.py", "_cwd_unreadable_but_harmless",
-     "(base / 'comm').read_text()"):
+     "(base / 'comm').read_bytes()"):
         (SAFE, "同上"),
     ("worktree_gc.py", "scan_process_cwds", "os.readlink(proc / pid / 'cwd')"):
         (SAFE, "ENOENT/ESRCH は継続 (消えた)。それ以外は "

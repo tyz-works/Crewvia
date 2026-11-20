@@ -53,6 +53,20 @@ DENIED = [
     'gh api graphql -f query="mutation {\n  mergePullRequest(input:{}) {x}\n}"',
     "gh api graphql \\\n  -f query='mutation { mergePullRequest(input:{}) {x} }'",
     "gh api \\\n  repos/o/r/pulls/12/merge -X PUT",
+    # Codex 2 巡目: pr と merge の間の option (値つき・付け形) / hostname / api の option の位置
+    "gh pr --repo o/r merge 12",
+    "gh pr -R o/r merge 12 --squash",
+    "gh pr --repo=o/r merge 12",
+    "gh pr -Ro/r merge 12",
+    "gh --hostname github.com pr merge 12",
+    "gh pr --hostname github.com --repo o/r merge 12",
+    "gh api --hostname github.com repos/o/r/pulls/12/merge -X PUT",
+    "gh api -XPUT repos/o/r/pulls/12/merge",
+    "gh api --method=PUT repos/o/r/pulls/12/merge",
+    "gh api -H 'Accept: x' repos/o/r/pulls/12/merge",
+    "gh api graphql -F query='mutation { mergePullRequest(input:{}) {x} }'",
+    "gh api graphql --field query='mutation { mergePullRequest(input:{}) {x} }'",
+    "gh api graphql -f owner=o -f query='mutation { enablePullRequestAutoMerge(input:{}) {x} }'",
 ]
 
 ALLOWED = [
@@ -72,6 +86,12 @@ ALLOWED = [
     'git commit -m "gh pr merge の説明"',
     "echo gh pr merge 12",
     "git status && gh pr view 3",
+    # Codex 2 巡目 P2: payload に merge 系の語を書くだけ (コメント・本文・別の field) は誤検出しない
+    "gh api graphql -f query='query { viewer { login } }' -f note=mergePullRequest",
+    "gh api repos/o/r/issues/12/comments -f body='mergePullRequest の話'",
+    "gh api repos/o/r/issues/12/comments -f body='see repos/o/r/pulls/1/merge'",
+    "gh pr --repo o/r view 12",
+    "gh pr -R o/r comment 12 --body merge",
 ]
 
 

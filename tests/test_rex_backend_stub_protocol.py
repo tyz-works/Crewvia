@@ -31,6 +31,7 @@ import time
 from pathlib import Path
 
 import pytest
+import proc_read
 
 from rex_harness import FakeRex, make_checkout, ok, status_json
 
@@ -43,11 +44,8 @@ SERVER_PID = os.getpid()      # 偽の server。テストが起こす子は ppid
 
 
 def _alive(pid):
-    try:
-        text = Path(f"/proc/{pid}/stat").read_text()
-    except OSError:
-        return False
-    return text.rsplit(")", 1)[1].split()[0] not in ("Z", "X")
+    state = proc_read.state_of(pid)
+    return state is not None and state not in ("Z", "X")
 
 
 def _wait(cond, seconds=6.0):

@@ -166,6 +166,7 @@ import time
 from pathlib import Path
 
 import pytest
+import proc_read
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "scripts"))
@@ -192,15 +193,8 @@ def _pid_alive(pid: int) -> bool:
     それを「生きている」と読むと、実際には殺せているのにテストが
     「殺せていない」と言い張る。/proc の state で見分ける。
     """
-    try:
-        stat = Path(f"/proc/{pid}/stat").read_text()
-    except OSError:
-        return False
-    try:
-        state = stat[stat.rindex(")") + 2]
-    except (ValueError, IndexError):
-        return False
-    return state != "Z"
+    state = proc_read.state_of(pid)
+    return state is not None and state != "Z"
 
 
 class FakeMux:

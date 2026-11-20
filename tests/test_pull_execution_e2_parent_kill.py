@@ -20,6 +20,7 @@ import subprocess
 import time
 
 import pytest
+import proc_read
 
 import pull_execution_helpers as h
 from pull_execution_helpers import Box, MISSION
@@ -27,11 +28,8 @@ from pull_execution_helpers import Box, MISSION
 
 def alive(pid: int) -> bool:
     """生きているか (ゾンビは死んでいる扱い。kill された子は親が reap するまでゾンビで `kill(pid, 0)` が通る)。"""
-    try:
-        with open(f"/proc/{pid}/stat") as f:
-            return f.read().rsplit(")", 1)[1].split()[0] != "Z"
-    except (FileNotFoundError, ProcessLookupError, IndexError):
-        return False
+    state = proc_read.state_of(pid)
+    return state is not None and state != "Z"
 
 
 def wait_dead(pid: int, timeout=20.0):

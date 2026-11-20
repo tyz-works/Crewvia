@@ -141,3 +141,128 @@ def test_structural_scan_detects_the_old_shapes():
                'Path(f"/proc/{pid}/stat").read_text(errors="replace")',
                'open(f"/proc/{pid}/cmdline", "rb")'):
         assert _SAFE.search(ok), ok
+
+
+# --- 構造テスト 2: Path の組み立て形 (entry / "stat"・Path("/proc") / pid / "stat") と別の行の read_text -------
+# 上の行単位の検査は `/proc/<pid>/stat` が 1 行に書かれた形しか見ない。scan_daemon_pids は
+# `(entry / "stat").read_text(encoding="utf-8")` (entry は Path(proc_root).iterdir() の要素) で、
+# 行単位の検査をすり抜けていた。ここでは .py の関数ごとに「/proc を指す語 (文字列 "/proc"・名前に proc を含む
+# 識別子) と stat/comm/cmdline/status の文字列定数が同居し、かつ同じ関数にバイト列でないテキスト読みがある」を拾う。
+
+import ast
+
+_PROC_FILES = ("stat", "comm", "cmdline", "status")
+
+
+_PROC_NAMES = frozenset(["proc_root", "procfs", "proc_dir", "proc_path"])
+
+
+def _is_text_read(node: ast.AST) -> bool:
+    if not isinstance(node, ast.Call):
+        return False
+    f = node.func
+    kw = {k.arg for k in node.keywords}
+    if isinstance(f, ast.Attribute) and f.attr == "read_text":
+        return "errors" not in kw
+    if (isinstance(f, ast.Name) and f.id == "open") or (isinstance(f, ast.Attribute) and f.attr == "open"):
+        modes = [a.value for a in node.args[1:2] if isinstance(a, ast.Constant)]
+        modes += [k.value.value for k in node.keywords if k.arg == "mode" and isinstance(k.value, ast.Constant)]
+        if any(isinstance(m, str) and "b" in m for m in modes):
+            return False
+        return "errors" not in kw
+    return False
+
+
+def _mentions_proc(node: ast.AST) -> bool:
+    for n in ast.walk(node):
+        if isinstance(n, ast.Constant) and isinstance(n.value, str) and n.value.startswith("/proc"):
+            return True
+        if isinstance(n, ast.Name) and n.id.lower().lstrip("_") in _PROC_NAMES:
+            return True
+        if isinstance(n, ast.arg) and n.arg.lower().lstrip("_") in _PROC_NAMES:
+            return True
+    return False
+
+
+def _names_proc_file(node: ast.AST) -> bool:
+    return any(isinstance(n, ast.Constant) and isinstance(n.value, str)
+               and (n.value in _PROC_FILES or re.search(r"^/proc/.*/(stat|comm|cmdline|status)\b", n.value))
+               for n in ast.walk(node))
+
+
+def _function_hits(source: str, rel: str) -> list[str]:
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []
+    hits = []
+    for fn in ast.walk(tree):
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if not (_mentions_proc(fn) and _names_proc_file(fn)):
+            continue
+        for n in ast.walk(fn):
+            if _is_text_read(n):
+                hits.append(f"{rel}:{n.lineno}: {fn.name}() が /proc の stat 等を組み立てた上でテキスト読みをしている")
+    return hits
+
+
+_FN_ALLOWLIST: dict = {}   # (相対パス, 関数名) -> 理由
+
+
+def _scan_functions():
+    hits, scanned = [], 0
+    for d in ("tests", "scripts"):
+        for path in (ROOT / d).rglob("*.py"):
+            if path.name == THIS or "__pycache__" in path.parts:
+                continue
+            scanned += 1
+            rel = str(path.relative_to(ROOT))
+            for h in _function_hits(path.read_text(errors="replace"), rel):
+                fn = h.split(": ", 1)[1].split("()", 1)[0]
+                if (rel, fn) not in _FN_ALLOWLIST:
+                    hits.append(h)
+    return scanned, hits
+
+
+def test_no_text_mode_proc_reads_via_built_paths():
+    scanned, hits = _scan_functions()
+    assert scanned > 100, f"検査対象が少なすぎる ({scanned})"
+    assert not hits, ("Path の組み立て形で /proc/<pid>/stat 等をテキストで読んでいる。read_bytes() を使い、"
+                      "最後の ')' より後ろを解釈すること:\n" + "\n".join(hits))
+
+
+def test_function_scan_detects_the_old_shapes():
+    old = (
+        "from pathlib import Path\n"
+        "def scan(proc_root='/proc'):\n"
+        "    for entry in Path(proc_root).iterdir():\n"
+        "        stat = (entry / 'stat').read_text(encoding='utf-8')\n"
+    )
+    assert _function_hits(old, "x.py")
+    split = (
+        "from pathlib import Path\n"
+        "def f(pid):\n"
+        "    p = Path('/proc') / str(pid) / 'comm'\n"
+        "    return p.read_text()\n"
+    )
+    assert _function_hits(split, "x.py")
+    assert _function_hits("def f(pid):\n    return open('/proc/%d/status' % pid).read()\n", "x.py")
+    ok = (
+        "from pathlib import Path\n"
+        "def scan(proc_root='/proc'):\n"
+        "    for entry in Path(proc_root).iterdir():\n"
+        "        stat = (entry / 'stat').read_bytes()\n"
+    )
+    assert not _function_hits(ok, "x.py")
+    assert not _function_hits("def f(proc_root):\n    return Path('/etc/x').read_text()\n", "x.py")
+
+
+def test_function_scan_is_red_on_the_original_lib_daemon_watch():
+    """lib_daemon_watch.py を元の形 (read_text) に戻すと赤になる。"""
+    src = (ROOT / "scripts" / "lib_daemon_watch.py").read_text()
+    good = '(entry / "stat").read_bytes()'
+    assert good in src, "scan_daemon_pids の bytes 読みが無い"
+    assert not _function_hits(src, "scripts/lib_daemon_watch.py")
+    bad = src.replace(good, '(entry / "stat").read_text(encoding="utf-8")')
+    assert _function_hits(bad, "scripts/lib_daemon_watch.py")

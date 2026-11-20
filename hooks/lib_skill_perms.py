@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import sys
 import tempfile
 from fnmatch import fnmatch, translate
@@ -145,6 +146,85 @@ _GLOBAL_DENY_SUBSTRINGS: list[tuple[re.Pattern, str]] = [
     (re.compile(r"\|\s*(ba)?sh\b"), "pipe-to-shell"),
     (re.compile(r"\|\s*source\b"), "pipe-to-source"),
 ]
+
+# 正規化した各文 (Bash(<前置きを外した 1 文>)) を語に分けて見る merge の deny。fnmatch の先頭一致や正規表現では
+# gh のオプション (--repo o/r 等) の位置・gh api の引数の順番に左右されるので、語から option と値を外して判定する。
+# 目的: Worker が PR を merge しないこと (merge は Director だけ。Director は pre-tool-use.sh が
+# global deny より前に通す)。config の _global.deny の "Bash(gh pr merge*)" と重複してよい。
+# - gh pr merge: option と値 (--repo/-R/--hostname 等・位置を問わず) を外した残りが gh pr merge で始まるか
+# - gh api: payload は見ない。REST はエンドポイント (位置引数) が repos/*/pulls/*/merge か、
+#   GraphQL はエンドポイントが graphql のときだけ query の値を見る (コメントに書くだけの payload は通す)
+_GH_VALUE_OPTS = {"-R", "--repo", "--hostname"}
+_API_VALUE_OPTS = {"-X", "--method", "-H", "--header", "-f", "--raw-field", "-F", "--field", "--input",
+                   "-q", "--jq", "-t", "--template", "--cache", "--hostname", "-p", "--preview"}
+_API_FIELD_OPTS = {"-f", "--raw-field", "-F", "--field"}
+_MERGE_ENDPOINT = re.compile(r"^/?repos/[^/]+/[^/]+/pulls/[^/]+/merge/?(?:\?.*)?$")
+_MERGE_MUTATION = re.compile(r"\b(?:mergePullRequest|enablePullRequestAutoMerge)\b")
+
+
+def _gh_words(argv) -> list | None:
+    """文の argv (引用符を解いた語の list。区切りごと渡す = 結合して再分割しない) から gh の語列 (gh の次から) を返す。"""
+    if not isinstance(argv, list) or not argv or os.path.basename(argv[0]) != "gh":
+        return None
+    return argv[1:]
+
+
+_URL_PREFIX = re.compile(r"^https?://[^/]+/(?:api/v3/|api/)?")
+
+
+def _endpoint_path(ep: str) -> str:
+    """完全 URL (https://api.github.com/…) は scheme + host (GHE の api/v3 も) を剥がして path にする。"""
+    m = _URL_PREFIX.match(ep)
+    return ep[m.end():] if m else ep
+
+
+def _split_opts(words: list, value_opts: set) -> tuple[list, list]:
+    """(位置引数, [(option, 値)]) に分ける。-Xvalue / --opt=value の付け形も解く。"""
+    pos: list = []
+    opts: list = []
+    i = 0
+    while i < len(words):
+        w = words[i]
+        if w.startswith("--") and "=" in w:
+            k, v = w.split("=", 1)
+            opts.append((k, v))
+        elif w in value_opts:
+            opts.append((w, words[i + 1] if i + 1 < len(words) else ""))
+            i += 1
+        elif w.startswith("-") and not w.startswith("--") and len(w) > 2 and w[:2] in value_opts:
+            opts.append((w[:2], w[2:]))
+        elif w.startswith("-") and w != "-":
+            opts.append((w, ""))
+        else:
+            pos.append(w)
+        i += 1
+    return pos, opts
+
+
+def _match_statement_regex(sigs) -> str | None:
+    """sigs: {sig 文字列: argv の list か None}。argv が積まれた文 (前置きを外した形) だけ語単位で見る。"""
+    for argv in (sigs.values() if isinstance(sigs, dict) else ()):
+        words = _gh_words(argv)
+        if words is None:
+            continue
+        pos, _ = _split_opts(words, _GH_VALUE_OPTS)
+        if pos[:2] == ["pr", "merge"]:
+            return "gh pr merge"
+        if pos[:1] == ["api"]:
+            pos, opts = _split_opts(words, _API_VALUE_OPTS | _GH_VALUE_OPTS)
+            endpoint = _endpoint_path(pos[1]) if len(pos) > 1 else ""
+            if _MERGE_ENDPOINT.match(endpoint):
+                return "gh api pulls/N/merge"
+            if endpoint.lstrip("/") == "graphql":
+                for k, v in opts:
+                    if k == "--input":  # query を file / stdin から読む: 中身を見られないので Worker では拒否 (fail-closed)
+                        return "gh api graphql --input"
+                    if k in _API_FIELD_OPTS and v.startswith("query="):
+                        if v.startswith("query=@"):
+                            return "gh api graphql query=@file"
+                        if _MERGE_MUTATION.search(v):
+                            return "gh api graphql merge"
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -532,7 +612,9 @@ def _emit(words: list[str], extra: list[str], sigs: dict, inner: list[str]) -> N
     if head == "git":
         forms.append(_strip_git_globals(norm))
     for form in forms:
-        sigs[f"Bash({' '.join(form)})"] = None
+        k = f"Bash({' '.join(form)})"
+        if sigs.get(k) is None:
+            sigs[k] = form  # argv を残す (gh の判定は結合した文字列でなくこちらを見る)
     if head in _SHELLS:
         for k in range(1, len(norm)):
             t = norm[k]
@@ -563,10 +645,10 @@ def _emit(words: list[str], extra: list[str], sigs: dict, inner: list[str]) -> N
             k += 1
 
 
-def _candidate_sigs(cmd: str) -> list[str]:
+def _candidate_sigs(cmd: str) -> dict:
     """cmd の各文について 元の文・前置きを外した形・git の大域オプションも外した形 を Bash(...) にして返す。
     bash -c / eval / env -S などの引数は _MAX_SHELL 段まで中を見る (置換の深さとは別に数える)。"""
-    sigs: dict[str, None] = {}
+    sigs: dict = {}
     work: list[tuple[str, int]] = [(cmd, 0)]
     while work:
         text, sd = work.pop()
@@ -582,7 +664,7 @@ def _candidate_sigs(cmd: str) -> list[str]:
                 work.append((t, sd + 1))
             else:
                 sigs[f"Bash({t})"] = None  # 打ち切り: 全体だけは照合する
-    return list(sigs)
+    return sigs
 
 
 @lru_cache(maxsize=8)
@@ -618,10 +700,14 @@ def check_permission(config: dict, skills_csv: str, tool_sig: str) -> dict:
 
     # 1a. 正規化した各文 (複合コマンドの 2 文目以降・git の大域オプション・前置きを外した形) も照合する
     cmd = _extract_bash_command(tool_sig)
-    if cmd is not None and global_deny:
-        hit = _match_global_deny(_candidate_sigs(cmd), global_deny)
+    if cmd is not None:
+        sigs = _candidate_sigs(cmd)
+        hit = _match_global_deny(sigs, global_deny) if global_deny else None
         if hit is not None:
             return {"decision": "deny", "source": f"_global:deny:{hit}"}
+        label = _match_statement_regex(sigs)
+        if label is not None:
+            return {"decision": "deny", "source": f"_global:deny:regex:{label}"}
 
     # 1b. Substring scan for compound commands (cd /tmp && rm -rf /)
     # Strip quoted strings first to avoid false positives on string literals

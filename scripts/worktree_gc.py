@@ -413,14 +413,14 @@ def _cwd_unreadable_but_harmless(pid: str) -> Optional[str]:
     """
     base = PROC_ROOT / pid
     try:
-        stat = (base / 'stat').read_text()
+        stat = (base / 'stat').read_bytes().decode('utf-8', 'replace')  # comm は任意のバイト列
         state = stat[stat.rindex(')') + 2:].split(' ', 1)[0]
         if state in ('Z', 'X'):
             return f'state {state}'
         cmdline = (base / 'cmdline').read_bytes()
         if not cmdline:
             return 'cmdline が空 (終了処理中)'
-        comm = (base / 'comm').read_text().strip()
+        comm = (base / 'comm').read_bytes().decode('utf-8', 'replace').strip()
     except FileNotFoundError:
         return '消えた'
     except (OSError, ValueError):

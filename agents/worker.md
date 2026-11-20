@@ -668,7 +668,7 @@ PR_URL=$(gh pr view --json url -q .url)
 echo "[worker] PR created: $PR_URL"
 ```
 
-- PR の merge は **Director** の責務（CI の結果と review の所見を見て `plan.sh ci-gate` → `gh pr merge --squash --match-head-commit` で行う）。自分でマージしないこと
+- PR の merge は **Director** の責務（CI の結果と review の所見を見て `plan.sh ci-gate` → `gh pr merge --squash --match-head-commit` で行う）。自分でマージしないこと（`gh pr merge` と API 経由の merge は global deny が Worker に対して止める）
 - PR URL は必ず完了報告フォーマットに含めること
 
 成果物がリポジトリ外（Obsidian 等）の場合でも、何を作成・変更したかを後で報告できるようメモしておくこと。

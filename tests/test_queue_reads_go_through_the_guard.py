@@ -394,10 +394,9 @@ ALLOWED_DIRECT_READS = {
      '(entry / "cmdline").read_bytes()'):
         "同上",
     ("lib_daemon_watch.py", "scan_daemon_pids",
-     '(entry / "stat").read_text(encoding="utf-8")'):
-        "同上 (t101 で監査: 呼び出し側の except が (OSError, ValueError, "
-        "IndexError) で UnicodeDecodeError=ValueError の派生を既に拾うので "
-        "変更不要)",
+     '(entry / "stat").read_bytes()'):
+        "同上 (/proc/<pid>/stat。comm が非 UTF-8 でも読めるようバイト列で読み、"
+        "最後の ')' より後ろの state だけを見る)",
     ("lib_mux.py", "_read_proc",
      'path.read_text(encoding="utf-8", errors="replace")'):
         "同上",

@@ -709,8 +709,8 @@ def scan_daemon_pids(repo_root, name: str, *, proc_root="/proc",
         if not any(arg.decode("utf-8", "replace") == needle for arg in argv):
             continue
         try:
-            stat = (entry / "stat").read_text(encoding="utf-8")
-            if stat[stat.rindex(")") + 2] == "Z":
+            stat = (entry / "stat").read_bytes()  # comm は任意のバイト列 (UTF-8 とは限らない)
+            if stat[stat.rindex(b")") + 2:stat.rindex(b")") + 3] == b"Z":
                 continue  # a zombie has already exited
         except (OSError, ValueError, IndexError):
             pass

@@ -197,7 +197,9 @@ def _split_opts(words: list, value_opts: set) -> tuple[list, list]:
             for j in range(1, len(w)):
                 if "-" + w[j] in value_opts:
                     val = w[j + 1:]
-                    if not val:
+                    if val.startswith("="):  # -f=値 / -if=値 (pflag は値を取る短いオプション直後の = を外す)
+                        val = val[1:]
+                    elif not val:
                         val = words[i + 1] if i + 1 < len(words) else ""
                         i += 1
                     opts.append(("-" + w[j], val))

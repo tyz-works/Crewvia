@@ -82,6 +82,11 @@ DENIED = [
     "gh api -iXPUT repos/o/r/pulls/12/merge",
     "gh api -i repos/o/r/pulls/12/merge",
     "gh api graphql -if query='mutation { mergePullRequest(input:{}) {x} }'",
+    "gh api graphql -f='query=mutation { mergePullRequest(input:{}) {x} }'",
+    "gh api graphql -f=query='mutation { mergePullRequest(input:{}) {x} }'",
+    "gh api graphql -if=query='mutation { mergePullRequest(input:{}) {x} }'",
+    "gh api graphql -F=query=@q.graphql",
+    "gh api repos/o/r/pulls/12/merge -X=PUT",
     "gh api 'repos/o/r/pulls/12/merge -X PUT'; gh api \"repos/o/r/pulls/12/merge\" -X PUT",
     "gh api 'repos/o/r/pulls/12/merge' -X PUT; gh api repos/o/r/pulls/12/merge -X PUT",
 ]

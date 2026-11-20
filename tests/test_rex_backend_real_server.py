@@ -21,6 +21,7 @@ import time
 from pathlib import Path
 
 import pytest
+import proc_read
 
 from rex_harness import (REX_AVAILABLE, RealRexServer, make_checkout)
 
@@ -39,10 +40,8 @@ def _alive(pid):
         return False
     except PermissionError:
         return True
-    try:
-        return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] != "Z"
-    except OSError:
-        return False
+    state = proc_read.state_of(pid)
+    return state is not None and state != "Z"
 
 
 def _wait(cond, seconds=8.0):

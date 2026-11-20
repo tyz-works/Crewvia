@@ -75,6 +75,7 @@ from pathlib import Path
 from typing import Optional
 
 import pytest
+import proc_read
 
 TESTS_DIR = Path(__file__).resolve().parent
 SCRIPTS_DIR = TESTS_DIR.parent / "scripts"
@@ -99,15 +100,8 @@ TARGET = f"{AGENT}-worker"
 
 def _pgid_of(pid: int) -> Optional[int]:
     """/proc/<pid>/stat の field 5 (pgid)。読めなければ None (= 既に居ない)。"""
-    try:
-        raw = Path(f"/proc/{pid}/stat").read_text()
-    except OSError:
-        return None
-    close = raw.rfind(")")
-    if close < 0:
-        return None
-    rest = raw[close + 1:].split()
-    if len(rest) < 3:
+    rest = proc_read.stat_fields(pid)
+    if rest is None or len(rest) < 3:
         return None
     try:
         return int(rest[2])

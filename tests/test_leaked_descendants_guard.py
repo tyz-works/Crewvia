@@ -25,6 +25,7 @@ import textwrap
 import time
 
 import pytest
+import proc_read
 
 import kill_budget
 import leaked_descendants
@@ -38,11 +39,8 @@ pytestmark = pytest.mark.skipif(
 
 
 def _alive(pid: int) -> bool:
-    try:
-        raw = pathlib.Path(f"/proc/{pid}/stat").read_text()
-    except OSError:
-        return False
-    return raw[raw.rfind(")") + 2:].split()[0] not in ("Z", "X")
+    state = proc_read.state_of(pid)
+    return state is not None and state not in ("Z", "X")
 
 
 def _wait_dead(pid: int, seconds: float = 5.0) -> bool:
@@ -102,7 +100,7 @@ def _wait_exec_done(pid: int, comm: str, seconds: float = 10.0) -> None:
     end = time.monotonic() + seconds
     while time.monotonic() < end:
         try:
-            if (pathlib.Path(f"/proc/{pid}/comm").read_text().strip() == comm
+            if (pathlib.Path(f"/proc/{pid}/comm").read_bytes().decode("utf-8", errors="replace").strip() == comm
                     and pathlib.Path(f"/proc/{pid}/environ").read_bytes()):
                 return
         except OSError:

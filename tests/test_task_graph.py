@@ -36,6 +36,7 @@ import sys
 import time
 
 import pytest
+import proc_read
 
 from fixture_tree import copy_plan_tree
 
@@ -448,8 +449,9 @@ def _mux():
 
 def _generation_of(pid: int) -> str:
     """herdr の server の世代と同じ形: `<pid>:<starttime>`。"""
-    stat = pathlib.Path(f"/proc/{pid}/stat").read_text()
-    return f"{pid}:{stat[stat.rindex(')') + 2:].split()[19]}"
+    rest = proc_read.stat_fields(pid)
+    assert rest is not None, f"/proc/{pid}/stat を読めない"
+    return f"{pid}:{rest[19]}"
 
 
 def _live_generation() -> str:

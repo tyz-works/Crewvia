@@ -27,6 +27,7 @@ import sys
 import time
 
 import pytest
+import proc_read
 
 import execution_e3_helpers as e3
 from execution_e3_helpers import MISSION, OTHER_ID, XID_RE, Box, audit_rows_for, last_error_code, run, set_card, take
@@ -508,11 +509,8 @@ class FakeMux:
 
 
 def _alive(pid):
-    try:
-        stat = pathlib.Path(f"/proc/{pid}/stat").read_text()
-    except OSError:
-        return False
-    return stat[stat.rindex(")") + 2] != "Z"
+    state = proc_read.state_of(pid)
+    return state is not None and state != "Z"
 
 
 def _sigkill_and_wait(pid, tries=200):

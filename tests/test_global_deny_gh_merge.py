@@ -77,6 +77,18 @@ DENIED = [
     "gh api https://api.github.com/repos/o/r/pulls/12/merge -X PUT",
     "gh api https://api.github.com/graphql -f query='mutation { mergePullRequest(input:{}) {x} }'",
     "gh api https://ghe.example.com/api/v3/repos/o/r/pulls/12/merge -X PUT",
+    # P3 follow-up: まとめた短いオプション / 鍵が同じで区切りの違う argv
+    "gh api -iX PUT repos/o/r/pulls/12/merge",
+    "gh api -iXPUT repos/o/r/pulls/12/merge",
+    "gh api -i repos/o/r/pulls/12/merge",
+    "gh api graphql -if query='mutation { mergePullRequest(input:{}) {x} }'",
+    "gh api graphql -f='query=mutation { mergePullRequest(input:{}) {x} }'",
+    "gh api graphql -f=query='mutation { mergePullRequest(input:{}) {x} }'",
+    "gh api graphql -if=query='mutation { mergePullRequest(input:{}) {x} }'",
+    "gh api graphql -F=query=@q.graphql",
+    "gh api repos/o/r/pulls/12/merge -X=PUT",
+    "gh api 'repos/o/r/pulls/12/merge -X PUT'; gh api \"repos/o/r/pulls/12/merge\" -X PUT",
+    "gh api 'repos/o/r/pulls/12/merge' -X PUT; gh api repos/o/r/pulls/12/merge -X PUT",
 ]
 
 ALLOWED = [
@@ -105,6 +117,9 @@ ALLOWED = [
     "env A=1 gh api graphql -f query='query { viewer { login } }'",
     "gh pr --repo o/r view 12",
     "gh pr -R o/r comment 12 --body merge",
+    "gh api -i repos/o/r/pulls/12",
+    "gh pr view -R o/r 12",
+    "gh api -iH 'Accept: application/json' repos/o/r/pulls/12/files",
 ]
 
 

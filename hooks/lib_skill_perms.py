@@ -148,6 +148,7 @@ _GLOBAL_DENY_SUBSTRINGS: list[tuple[re.Pattern, str]] = [
 
 # 正規化した各文 (Bash(<前置きを外した 1 文>)) の先頭に当てる正規表現の deny。fnmatch の先頭一致では
 # 引数の順番に左右される形 (gh のオプションの位置・gh api の URL / GraphQL の位置) を書けないので別に持つ。
+# 引用符の中の改行 (整形した GraphQL の query) も .* が越えるよう api の 2 本は DOTALL。
 # 目的: Worker が PR を merge しないこと (merge は Director だけ。Director は pre-tool-use.sh が
 # global deny より前に通す)。config の _global.deny の "Bash(gh pr merge*)" と重複してよい (ラベルが違うだけ)。
 _GH = r"^Bash\((?:\S*/)?gh\s+"
@@ -155,9 +156,9 @@ _GLOBAL_DENY_STATEMENT_REGEX: list[tuple[re.Pattern, str]] = [
     # gh pr merge (gh -R owner/repo pr merge … のようにオプションが前に付く形も)
     (re.compile(_GH + r"(?:-{1,2}\S+\s+(?:[^-\s]\S*\s+)?)*pr\s+merge\b"), "gh pr merge"),
     # gh api …/pulls/<N>/merge (-X PUT / --method PUT の有無・引数の順番を問わない)
-    (re.compile(_GH + r"api\b.*/pulls/[^\s/\"']+/merge\b"), "gh api pulls/N/merge"),
+    (re.compile(_GH + r"api\b.*/pulls/[^\s/\"']+/merge\b", re.DOTALL), "gh api pulls/N/merge"),
     # gh api graphql の merge 系 mutation
-    (re.compile(_GH + r"api\b.*\b(?:mergePullRequest|enablePullRequestAutoMerge)\b"), "gh api graphql merge"),
+    (re.compile(_GH + r"api\b.*\b(?:mergePullRequest|enablePullRequestAutoMerge)\b", re.DOTALL), "gh api graphql merge"),
 ]
 
 

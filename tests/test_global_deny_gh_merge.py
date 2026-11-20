@@ -48,6 +48,11 @@ DENIED = [
     "gh api graphql -f query='mutation { mergePullRequest(input:{pullRequestId:\"x\"}) { clientMutationId } }'",
     "gh api graphql -f query='mutation { enablePullRequestAutoMerge(input:{pullRequestId:\"x\"}) { clientMutationId } }'",
     "cd x && gh api graphql -f query='mutation { mergePullRequest(input:{}) {x} }'",
+    "gh api graphql -f query='mutation {\n  mergePullRequest(input:{pullRequestId:\"x\"}) {\n    clientMutationId\n  }\n}'",
+    "gh api graphql -f query='mutation {\n  enablePullRequestAutoMerge(input:{pullRequestId:\"x\"}) { clientMutationId }\n}'",
+    'gh api graphql -f query="mutation {\n  mergePullRequest(input:{}) {x}\n}"',
+    "gh api graphql \\\n  -f query='mutation { mergePullRequest(input:{}) {x} }'",
+    "gh api \\\n  repos/o/r/pulls/12/merge -X PUT",
 ]
 
 ALLOWED = [
@@ -92,9 +97,10 @@ def hook_root(tmp_path):
     shutil.copytree(REPO / "hooks", root / "hooks")
     shutil.copytree(REPO / "config", root / "config")
     (root / "registry").mkdir()
-    (root / "registry" / "workers.yaml").write_text(
-        "workers:\n  - name: Sora\n    role: director\n    skills: []\n"
-        "  - name: Luna\n    role: worker\n    skills: [code]\n", encoding="utf-8")
+    # registry への書き込みは lib_registry の入口を通す (構造ガード test_registry_lock.sh)
+    sys.path.insert(0, str(REPO / "scripts"))
+    import lib_registry
+    lib_registry.register_director(str(root / "registry" / "workers.yaml"), "Sora")
     (root / ".git").mkdir()
     return root
 

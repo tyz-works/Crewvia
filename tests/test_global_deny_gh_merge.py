@@ -67,6 +67,16 @@ DENIED = [
     "gh api graphql -F query='mutation { mergePullRequest(input:{}) {x} }'",
     "gh api graphql --field query='mutation { mergePullRequest(input:{}) {x} }'",
     "gh api graphql -f owner=o -f query='mutation { enablePullRequestAutoMerge(input:{}) {x} }'",
+    # Codex 3 巡目: 前置き (env) 越しでも query の値 (空白入り) が切れない / file・stdin 経由は fail-closed / 完全 URL
+    "env A=1 gh api graphql -f query='mutation { mergePullRequest(input:{}) {x} }'",
+    "FOO=1 gh api graphql -f query='mutation { mergePullRequest(input:{}) {x} }'",
+    "gh api graphql -F query=@q.graphql",
+    "gh api graphql -f query=@q.graphql",
+    "gh api graphql --input q.json",
+    "cat q.json | gh api graphql --input -",
+    "gh api https://api.github.com/repos/o/r/pulls/12/merge -X PUT",
+    "gh api https://api.github.com/graphql -f query='mutation { mergePullRequest(input:{}) {x} }'",
+    "gh api https://ghe.example.com/api/v3/repos/o/r/pulls/12/merge -X PUT",
 ]
 
 ALLOWED = [
@@ -90,6 +100,9 @@ ALLOWED = [
     "gh api graphql -f query='query { viewer { login } }' -f note=mergePullRequest",
     "gh api repos/o/r/issues/12/comments -f body='mergePullRequest の話'",
     "gh api repos/o/r/issues/12/comments -f body='see repos/o/r/pulls/1/merge'",
+    "gh api https://api.github.com/repos/o/r/pulls/12",
+    "gh api https://api.github.com/graphql -f query='query { viewer { login } }'",
+    "env A=1 gh api graphql -f query='query { viewer { login } }'",
     "gh pr --repo o/r view 12",
     "gh pr -R o/r comment 12 --body merge",
 ]

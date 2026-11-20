@@ -154,7 +154,6 @@ _GLOBAL_DENY_SUBSTRINGS: list[tuple[re.Pattern, str]] = [
 # - gh pr merge: option と値 (--repo/-R/--hostname 等・位置を問わず) を外した残りが gh pr merge で始まるか
 # - gh api: payload は見ない。REST はエンドポイント (位置引数) が repos/*/pulls/*/merge か、
 #   GraphQL はエンドポイントが graphql のときだけ query の値を見る (コメントに書くだけの payload は通す)
-_GH_HEAD = re.compile(r"(?:\S*/)?gh(?:\s|$)")
 _GH_VALUE_OPTS = {"-R", "--repo", "--hostname"}
 _API_VALUE_OPTS = {"-X", "--method", "-H", "--header", "-f", "--raw-field", "-F", "--field", "--input",
                    "-q", "--jq", "-t", "--template", "--cache", "--hostname", "-p", "--preview"}
@@ -163,20 +162,20 @@ _MERGE_ENDPOINT = re.compile(r"^/?repos/[^/]+/[^/]+/pulls/[^/]+/merge/?(?:\?.*)?
 _MERGE_MUTATION = re.compile(r"\b(?:mergePullRequest|enablePullRequestAutoMerge)\b")
 
 
-def _gh_words(sig: str) -> list | None:
-    """Bash(<stmt>) の stmt を語に分け、gh の語列 (gh の次から) を返す。gh で始まらなければ None。"""
-    if not (sig.startswith("Bash(") and sig.endswith(")")):
+def _gh_words(argv) -> list | None:
+    """文の argv (引用符を解いた語の list。区切りごと渡す = 結合して再分割しない) から gh の語列 (gh の次から) を返す。"""
+    if not isinstance(argv, list) or not argv or os.path.basename(argv[0]) != "gh":
         return None
-    stmt = sig[5:-1]
-    if not _GH_HEAD.match(stmt):  # shlex は遅いので gh でない文 (巨大な入力を含む) は語に分けない
-        return None
-    try:
-        words = shlex.split(stmt)
-    except ValueError:
-        words = stmt.split()
-    if not words or os.path.basename(words[0]) != "gh":
-        return None
-    return words[1:]
+    return argv[1:]
+
+
+_URL_PREFIX = re.compile(r"^https?://[^/]+/(?:api/v3/|api/)?")
+
+
+def _endpoint_path(ep: str) -> str:
+    """完全 URL (https://api.github.com/…) は scheme + host (GHE の api/v3 も) を剥がして path にする。"""
+    m = _URL_PREFIX.match(ep)
+    return ep[m.end():] if m else ep
 
 
 def _split_opts(words: list, value_opts: set) -> tuple[list, list]:
@@ -202,9 +201,10 @@ def _split_opts(words: list, value_opts: set) -> tuple[list, list]:
     return pos, opts
 
 
-def _match_statement_regex(sigs: list) -> str | None:
-    for sig in sigs:
-        words = _gh_words(sig)
+def _match_statement_regex(sigs) -> str | None:
+    """sigs: {sig 文字列: argv の list か None}。argv が積まれた文 (前置きを外した形) だけ語単位で見る。"""
+    for argv in (sigs.values() if isinstance(sigs, dict) else ()):
+        words = _gh_words(argv)
         if words is None:
             continue
         pos, _ = _split_opts(words, _GH_VALUE_OPTS)
@@ -212,13 +212,18 @@ def _match_statement_regex(sigs: list) -> str | None:
             return "gh pr merge"
         if pos[:1] == ["api"]:
             pos, opts = _split_opts(words, _API_VALUE_OPTS | _GH_VALUE_OPTS)
-            endpoint = pos[1] if len(pos) > 1 else ""
+            endpoint = _endpoint_path(pos[1]) if len(pos) > 1 else ""
             if _MERGE_ENDPOINT.match(endpoint):
                 return "gh api pulls/N/merge"
             if endpoint.lstrip("/") == "graphql":
                 for k, v in opts:
-                    if k in _API_FIELD_OPTS and v.startswith("query=") and _MERGE_MUTATION.search(v):
-                        return "gh api graphql merge"
+                    if k == "--input":  # query を file / stdin から読む: 中身を見られないので Worker では拒否 (fail-closed)
+                        return "gh api graphql --input"
+                    if k in _API_FIELD_OPTS and v.startswith("query="):
+                        if v.startswith("query=@"):
+                            return "gh api graphql query=@file"
+                        if _MERGE_MUTATION.search(v):
+                            return "gh api graphql merge"
     return None
 
 
@@ -607,7 +612,9 @@ def _emit(words: list[str], extra: list[str], sigs: dict, inner: list[str]) -> N
     if head == "git":
         forms.append(_strip_git_globals(norm))
     for form in forms:
-        sigs[f"Bash({' '.join(form)})"] = None
+        k = f"Bash({' '.join(form)})"
+        if sigs.get(k) is None:
+            sigs[k] = form  # argv を残す (gh の判定は結合した文字列でなくこちらを見る)
     if head in _SHELLS:
         for k in range(1, len(norm)):
             t = norm[k]
@@ -638,10 +645,10 @@ def _emit(words: list[str], extra: list[str], sigs: dict, inner: list[str]) -> N
             k += 1
 
 
-def _candidate_sigs(cmd: str) -> list[str]:
+def _candidate_sigs(cmd: str) -> dict:
     """cmd の各文について 元の文・前置きを外した形・git の大域オプションも外した形 を Bash(...) にして返す。
     bash -c / eval / env -S などの引数は _MAX_SHELL 段まで中を見る (置換の深さとは別に数える)。"""
-    sigs: dict[str, None] = {}
+    sigs: dict = {}
     work: list[tuple[str, int]] = [(cmd, 0)]
     while work:
         text, sd = work.pop()
@@ -657,7 +664,7 @@ def _candidate_sigs(cmd: str) -> list[str]:
                 work.append((t, sd + 1))
             else:
                 sigs[f"Bash({t})"] = None  # 打ち切り: 全体だけは照合する
-    return list(sigs)
+    return sigs
 
 
 @lru_cache(maxsize=8)

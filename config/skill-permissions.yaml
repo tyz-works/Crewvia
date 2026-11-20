@@ -50,6 +50,10 @@ _global:
     - "Bash(git push origin master*)"
     - "Bash(git push --force*)"
     - "Bash(git push -f *)"
+    # PR の merge は Director だけ (Director は hooks/pre-tool-use.sh が global deny より前に通す)。
+    # API 直叩き (gh api …/pulls/N/merge・graphql mergePullRequest) は hooks/lib_skill_perms.py の
+    # _GLOBAL_DENY_STATEMENT_REGEX が見る (引数の順番に左右されないため)
+    - "Bash(gh pr merge*)"
 
 skills:
   bash:

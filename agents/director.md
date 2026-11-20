@@ -1191,7 +1191,7 @@ herdr server を再起動すると、タブレイアウトだけが復元され�
 - **改善提案の判断はあなたの責務** — Workerが自分でBacklogにタスクを追加することを許可しない
 - **Taskvia非依存で動作可能** — 接続失敗時もミッションを止めない
 - **完了の定義を守る** — result が具体的でない完了報告を受け付けない
-- **PR は review の所見と CI の門を通してから Director が merge する** — merge は Director の責務（§12「merge 手順」: `plan.sh ci-gate` → `gh pr merge --squash --match-head-commit`）。実装 Worker は自分の PR を merge しない。review は別の `review` スキルの Worker が所見を出す（実装者と review を分ける原則は変わらない。review Worker は merge しない）。**Director が自分で直した差分は、merge の前に新しい review task で読ませる**
+- **PR は review の所見と CI の門を通してから Director が merge する** — merge は Director の責務（Worker の `gh pr merge` / API 経由の merge は global deny が止める。Director は pre-tool-use.sh が global deny より前に通す）（§12「merge 手順」: `plan.sh ci-gate` → `gh pr merge --squash --match-head-commit`）。実装 Worker は自分の PR を merge しない。review は別の `review` スキルの Worker が所見を出す（実装者と review を分ける原則は変わらない。review Worker は merge しない）。**Director が自分で直した差分は、merge の前に新しい review task で読ませる**
 
 ---
 

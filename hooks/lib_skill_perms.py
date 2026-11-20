@@ -146,6 +146,28 @@ _GLOBAL_DENY_SUBSTRINGS: list[tuple[re.Pattern, str]] = [
     (re.compile(r"\|\s*source\b"), "pipe-to-source"),
 ]
 
+# 正規化した各文 (Bash(<前置きを外した 1 文>)) の先頭に当てる正規表現の deny。fnmatch の先頭一致では
+# 引数の順番に左右される形 (gh のオプションの位置・gh api の URL / GraphQL の位置) を書けないので別に持つ。
+# 目的: Worker が PR を merge しないこと (merge は Director だけ。Director は pre-tool-use.sh が
+# global deny より前に通す)。config の _global.deny の "Bash(gh pr merge*)" と重複してよい (ラベルが違うだけ)。
+_GH = r"^Bash\((?:\S*/)?gh\s+"
+_GLOBAL_DENY_STATEMENT_REGEX: list[tuple[re.Pattern, str]] = [
+    # gh pr merge (gh -R owner/repo pr merge … のようにオプションが前に付く形も)
+    (re.compile(_GH + r"(?:-{1,2}\S+\s+(?:[^-\s]\S*\s+)?)*pr\s+merge\b"), "gh pr merge"),
+    # gh api …/pulls/<N>/merge (-X PUT / --method PUT の有無・引数の順番を問わない)
+    (re.compile(_GH + r"api\b.*/pulls/[^\s/\"']+/merge\b"), "gh api pulls/N/merge"),
+    # gh api graphql の merge 系 mutation
+    (re.compile(_GH + r"api\b.*\b(?:mergePullRequest|enablePullRequestAutoMerge)\b"), "gh api graphql merge"),
+]
+
+
+def _match_statement_regex(sigs: list) -> str | None:
+    for sig in sigs:
+        for regex, label in _GLOBAL_DENY_STATEMENT_REGEX:
+            if regex.search(sig):
+                return label
+    return None
+
 
 # ---------------------------------------------------------------------------
 # _global.deny の照合の前の正規化 (t001 / mission 20261120-global-deny-normalize)
@@ -618,10 +640,14 @@ def check_permission(config: dict, skills_csv: str, tool_sig: str) -> dict:
 
     # 1a. 正規化した各文 (複合コマンドの 2 文目以降・git の大域オプション・前置きを外した形) も照合する
     cmd = _extract_bash_command(tool_sig)
-    if cmd is not None and global_deny:
-        hit = _match_global_deny(_candidate_sigs(cmd), global_deny)
+    if cmd is not None:
+        sigs = _candidate_sigs(cmd)
+        hit = _match_global_deny(sigs, global_deny) if global_deny else None
         if hit is not None:
             return {"decision": "deny", "source": f"_global:deny:{hit}"}
+        label = _match_statement_regex(sigs)
+        if label is not None:
+            return {"decision": "deny", "source": f"_global:deny:regex:{label}"}
 
     # 1b. Substring scan for compound commands (cd /tmp && rm -rf /)
     # Strip quoted strings first to avoid false positives on string literals

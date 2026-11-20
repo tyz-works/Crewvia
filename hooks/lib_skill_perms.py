@@ -191,8 +191,18 @@ def _split_opts(words: list, value_opts: set) -> tuple[list, list]:
         elif w in value_opts:
             opts.append((w, words[i + 1] if i + 1 < len(words) else ""))
             i += 1
-        elif w.startswith("-") and not w.startswith("--") and len(w) > 2 and w[:2] in value_opts:
-            opts.append((w[:2], w[2:]))
+        elif w.startswith("-") and not w.startswith("--") and len(w) > 2:
+            # まとめた短いオプション (-iX PUT / -if query=… / -XPUT): 値を取らない文字を 1 つずつ外し、
+            # 値を取る文字に当たったら残りがその値 (空なら次の語)
+            for j in range(1, len(w)):
+                if "-" + w[j] in value_opts:
+                    val = w[j + 1:]
+                    if not val:
+                        val = words[i + 1] if i + 1 < len(words) else ""
+                        i += 1
+                    opts.append(("-" + w[j], val))
+                    break
+                opts.append(("-" + w[j], ""))
         elif w.startswith("-") and w != "-":
             opts.append((w, ""))
         else:
@@ -202,8 +212,9 @@ def _split_opts(words: list, value_opts: set) -> tuple[list, list]:
 
 
 def _match_statement_regex(sigs) -> str | None:
-    """sigs: {sig 文字列: argv の list か None}。argv が積まれた文 (前置きを外した形) だけ語単位で見る。"""
-    for argv in (sigs.values() if isinstance(sigs, dict) else ()):
+    """sigs: {sig 文字列: argv の list の list か None}。argv が積まれた文 (前置きを外した形) だけ語単位で見る。"""
+    argvs = [a for v in (sigs.values() if isinstance(sigs, dict) else ()) for a in (v or ())]
+    for argv in argvs:
         words = _gh_words(argv)
         if words is None:
             continue
@@ -613,8 +624,12 @@ def _emit(words: list[str], extra: list[str], sigs: dict, inner: list[str]) -> N
         forms.append(_strip_git_globals(norm))
     for form in forms:
         k = f"Bash({' '.join(form)})"
-        if sigs.get(k) is None:
-            sigs[k] = form  # argv を残す (gh の判定は結合した文字列でなくこちらを見る)
+        # argv を残す (gh の判定は結合した文字列でなくこちらを見る)。空白で join した鍵が同じでも
+        # 区切りの違う argv ('a b' と "a" "b") は別物なので全部残す
+        lst = sigs.get(k) or []
+        if form not in lst:
+            lst.append(form)
+        sigs[k] = lst
     if head in _SHELLS:
         for k in range(1, len(norm)):
             t = norm[k]
@@ -657,13 +672,13 @@ def _candidate_sigs(cmd: str) -> dict:
         inner: list[str] = []
         for raw, words, extra in out:
             if raw:
-                sigs[f"Bash({raw})"] = None
+                sigs.setdefault(f"Bash({raw})", None)
             _emit(words, extra, sigs, inner)
         for t in inner:
             if sd < _MAX_SHELL:
                 work.append((t, sd + 1))
             else:
-                sigs[f"Bash({t})"] = None  # 打ち切り: 全体だけは照合する
+                sigs.setdefault(f"Bash({t})", None)  # 打ち切り: 全体だけは照合する
     return sigs
 
 

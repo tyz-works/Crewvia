@@ -44,10 +44,12 @@ echo "== test_wait_for_plan_review.sh (t002) =="
 echo ""
 echo "--- Test 1: conformant fresh file → OK immediately ---"
 F1="$TMPDIR_TEST/t1.md"
+# START はファイルを書く**前**に取る。wait_for_plan_review.sh は mtime >= START で
+# 「新しい」と判定するため、書いた後で START を取ると秒の境目で古い扱いになる。
+START=$(date +%s)
 cat > "$F1" << 'EOF'
 **Verdict:** approve
 EOF
-START=$(date +%s)
 OUT="$(bash "$WAIT_SCRIPT" "$F1" "$START" 1 1)"; RC=$?
 STATUS="$(echo "$OUT" | head -1)"
 if [[ "$RC" -eq 0 && "$STATUS" == "OK" ]]; then
@@ -66,12 +68,14 @@ echo "--- Test 2 (F1, mission 20260912-verdict-ci-launcher: 挙動変更): alt-w
 # 単体では別表記は判定不能のまま — 危険側 (OK) ではなく安全側
 # (TIMEOUT_FRESH) に倒れることを確認する。
 F2="$TMPDIR_TEST/t2.md"
+# START はファイルを書く**前**に取る。wait_for_plan_review.sh は mtime >= START で
+# 「新しい」と判定するため、書いた後で START を取ると秒の境目で古い扱いになる。
+START=$(date +%s)
 cat > "$F2" << 'EOF'
 # Plan Review: test-mission
 
 ## 総合判定: **GO**
 EOF
-START=$(date +%s)
 OUT="$(bash "$WAIT_SCRIPT" "$F2" "$START" 1 1)"; RC=$?
 STATUS="$(echo "$OUT" | head -1)"
 if [[ "$RC" -eq 1 && "$STATUS" == "TIMEOUT_FRESH" ]]; then
@@ -112,13 +116,15 @@ fi
 echo ""
 echo "--- Test 5: fresh file but no recognizable verdict at all → TIMEOUT_FRESH ---"
 F5="$TMPDIR_TEST/t5.md"
+# START はファイルを書く**前**に取る。wait_for_plan_review.sh は mtime >= START で
+# 「新しい」と判定するため、書いた後で START を取ると秒の境目で古い扱いになる。
+START=$(date +%s)
 cat > "$F5" << 'EOF'
 # Plan Review: test-mission
 
 ## Summary
 まだ検査中です。
 EOF
-START=$(date +%s)
 OUT="$(bash "$WAIT_SCRIPT" "$F5" "$START" 1 1)"; RC=$?
 STATUS="$(echo "$OUT" | head -1)"
 if [[ "$RC" -eq 1 && "$STATUS" == "TIMEOUT_FRESH" ]]; then
@@ -130,6 +136,9 @@ fi
 echo ""
 echo "--- Test 6 (t011, QA t009 FINDING-B): unknown vocabulary ('**STOP**') with a large max_wait → breaks early instead of waiting the full timeout ---"
 F6="$TMPDIR_TEST/t6.md"
+# START はファイルを書く**前**に取る。wait_for_plan_review.sh は mtime >= START で
+# 「新しい」と判定するため、書いた後で START を取ると秒の境目で古い扱いになる。
+START=$(date +%s)
 cat > "$F6" << 'EOF'
 # Plan Review: test-mission
 
@@ -137,7 +146,6 @@ cat > "$F6" << 'EOF'
 
 **STOP**
 EOF
-START=$(date +%s)
 T0=$(date +%s)
 # MAX_WAIT=600 (実運用と同じ) だが、mtime が動かず判定不能が続くため
 # 早期打ち切りされるはず — 実測の経過時間が MAX_WAIT よりずっと短いことを
@@ -155,10 +163,12 @@ fi
 echo ""
 echo "--- Test 7 (F2, PR#188 t012 Seo 指摘): fresh file already has a literal '**Verdict:**' line but with an unrecognized word (STOP) → NOT accepted as OK (grep must also match a known verdict word) ---"
 F7="$TMPDIR_TEST/t7.md"
+# START はファイルを書く**前**に取る。wait_for_plan_review.sh は mtime >= START で
+# 「新しい」と判定するため、書いた後で START を取ると秒の境目で古い扱いになる。
+START=$(date +%s)
 cat > "$F7" << 'EOF'
 **Verdict:** STOP
 EOF
-START=$(date +%s)
 OUT="$(bash "$WAIT_SCRIPT" "$F7" "$START" 1 1)"; RC=$?
 STATUS="$(echo "$OUT" | head -1)"
 # 以前は `^\*\*Verdict:\*\*` の存在だけで OK にしていたため、下流の

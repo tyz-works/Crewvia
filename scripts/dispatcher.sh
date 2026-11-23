@@ -207,6 +207,7 @@ import sys
 import os
 import re
 import json
+import math
 import shlex
 import time
 import subprocess
@@ -2125,7 +2126,14 @@ def _first_seen_from_ledger(key: str, notice: str) -> Optional[float]:
     if not isinstance(fp, str) or not fp.startswith(prefix):
         return None
     tail = fp[len(prefix):]
-    return float(tail) if tail.isdigit() else None
+    # isdigit() は '²' 等も通し (float が ValueError)、400 桁は inf になる (int() が OverflowError)。
+    # 台帳と記録が両方壊れても復旧の経路が毎回落ちないよう、変換できない・有限でない・負は
+    # 「引き継がない」(None = 新しい first_seen)。
+    try:
+        seen = float(tail)
+    except (ValueError, OverflowError):
+        return None
+    return seen if math.isfinite(seen) and seen >= 0 else None
 
 
 def handle_usage_limit(name: str, target: str, assignment_file: Path) -> bool:

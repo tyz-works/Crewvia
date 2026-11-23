@@ -408,6 +408,17 @@ def test_a_corrupt_record_keeps_the_ledger_fp_across_a_second_boundary(r5):
     assert int(r5.entry()["first_seen"]) == int(first_seen)
 
 
+@pytest.mark.parametrize("tail", ["²", "9" * 400, "-5", "", "nan", "inf", "12.5x", "1700000000"])
+def test_a_garbled_ledger_fp_never_breaks_the_recovery(r5, monkeypatch, tail):
+    """台帳の fp の秒が壊れていても (isdigit を通る '²'・inf になる 400 桁・負・空) 例外にならず、
+    引き継ぎは None (= 新しい first_seen)。正常な秒だけがそのまま返る。"""
+    key = f"usage-limit_{AGENT}"
+    fp = f"{lib_usage_limit.identity(NOTICE_REL)}@{tail}"
+    monkeypatch.setitem(r5.ns, "load_told", lambda: {key: {"fp": fp}})
+    got = r5.ns["_first_seen_from_ledger"](key, NOTICE_REL)
+    assert got == (1700000000.0 if tail == "1700000000" else None)
+
+
 # ---------------------------------------------------------------------------
 # 3. watchdog (idle / max)
 # ---------------------------------------------------------------------------

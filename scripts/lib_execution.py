@@ -86,6 +86,9 @@ EXECUTION_FIELDS = (
     'current_execution_id', 'execution_status', 'execution_end_code', 'execution_count',
     'execution_reserved_at', 'execution_agent', 'task_slug',
 )
+#: 試行を走らせた Worker のモデル (任意。`EXECUTION_FIELDS` には入れない = 欄の無い card が今と同じに読める。設計 §4.4)。
+#: 書き手は Controller の `start_execution` だけ (pull が Worker の `registry/workers/<Name>/model.json` から写す)。
+EXECUTION_MODEL_FIELD = 'execution_model'
 #: 試行があるなら**必ずある**欄 (execution_end_code は terminal のときだけ、execution_agent は agent を
 #: 名指しして予約したときだけ)。
 REQUIRED_WHEN_PRESENT = ('current_execution_id', 'execution_status', 'execution_count',
@@ -377,6 +380,8 @@ def record_from_card(meta, mission, task, *, git=None):
         'ended_at': None,
         'end_code': meta.get('execution_end_code') or None,
         'git': g,
+        # 今の試行を走らせた Worker のモデル (任意の欄。start が渡したときだけ。card の `execution_model` の写し)
+        'model': meta.get('execution_model') or None,
     }
 
 
@@ -417,7 +422,7 @@ def record_shape_problem(record):
     status = record.get('status')
     if not isinstance(status, str) or status not in EXECUTION_STATUSES:
         return 'record_field_type'
-    for key in ('agent', 'end_code', 'running_at', 'ended_at'):
+    for key in ('agent', 'end_code', 'running_at', 'ended_at', 'model'):      # 'model' は PR-1 で足した任意の欄 (旧 record には無い)
         if record.get(key) is not None and not isinstance(record[key], str):
             return 'record_field_type'
     if not isinstance(record.get('git'), dict):
@@ -431,7 +436,7 @@ def record_follows_card(record, meta):
             and (record.get('end_code') or None) == (meta.get('execution_end_code') or None))
 
 
-def follow_card(record, meta, *, ended_at=None, running_at=None, git=None):
+def follow_card(record, meta, *, ended_at=None, running_at=None, git=None, model=None):
     """追従する欄だけ card に合わせた record の**コピー**を返す。不変の欄と card に無い欄は既存の値を残す。
     `ended_at` / `running_at` / `git` は書いた操作 (start 等) が渡したときだけ入れる (R-5 は渡さず、既存の値を残す)。"""
     out = dict(record)
@@ -444,6 +449,8 @@ def follow_card(record, meta, *, ended_at=None, running_at=None, git=None):
         out['running_at'] = running_at
     if git:
         out['git'].update({k: v for k, v in git.items() if k in out['git']})
+    if model is not None:
+        out['model'] = model                 # start が渡したときだけ (R-5 は渡さず、既存の値を残す)
     return out
 
 

@@ -479,6 +479,19 @@ Worker が起動された `TARGET_DIR` の記録の唯一の定義（t009 / #21�
 記録が嘘・無いときは `record` で書き直す（dispatcher は毎サイクル読み直す）。
 設計: `knowledge/assignment-routing.md`
 
+### `lib_worker_model.py`
+
+Worker が起動されたときのモデルの記録の唯一の定義（モデルの段上げ PR-1。書き手 `start.sh`・
+読み手 `plan.sh pull`）。`registry/workers/<Name>/model.json`
+`{"agent","model": <文字列|null>,"source": env|override|skill|none,"bound_task": <"slug/tid"|null>,"written_at"}`
+（`.gitignore` 対象。`target_dir.json` と同じ dir・別ファイル）。pull が `recorded_model()` で読み、
+card の `execution_model`・record の `model`・pull の JSON・台帳の `model`（閉じた試行の分）・
+`previous_attempt.model`・`plan.sh status` の `model=` に写す。**記録が無い・読めない・モデルが空の Worker では欄を書かない**
+（`unknown` を作らない）。**割り当ての判定は変えない**（`worker_may_take` は PR-2）。
+後任の `start.sh` が記録を置き換える（書けなかったときだけ先任の記録が残りうる = 既知の限界）。停止スイッチは無い。
+CLI: `record <registry_dir> <agent> <source> [<model> [<bound_task>]]` / `show`。
+設計: `knowledge/model-escalation.md`
+
 ### `lib_usage_limit.py`
 
 Worker の画面から「利用枠切れ」(`⚠ Usage limit reached · continuing automatically at 6pm`) を同定する

@@ -663,6 +663,15 @@ else
   SKILLS_CSV="$(IFS=,; echo "${SKILLS_ARR[*]:-}")"
   SELECTED_MODEL="$(_resolve_worker_model "${SKILLS_CSV}")"
 fi
+# 使ったモデルの出どころ (model.json の source。knowledge/model-escalation.md §4.2)。
+# env = 人が起動前に CREWVIA_WORKER_MODEL を明示 / skill = model_per_skill か worker_model / none = 解決が空
+if [[ "${ROLE}" == "worker" && "${WORKER_MODEL_EXPLICIT}" == "1" ]]; then
+  SELECTED_MODEL_SOURCE="env"
+elif [[ -n "$SELECTED_MODEL" ]]; then
+  SELECTED_MODEL_SOURCE="skill"
+else
+  SELECTED_MODEL_SOURCE="none"
+fi
 MODEL_FLAG=()
 if [[ -n "$SELECTED_MODEL" ]]; then
   MODEL_FLAG=(--model "$SELECTED_MODEL")
@@ -966,6 +975,11 @@ PYEOF
     python3 "${SCRIPT_DIR}/lib_worker_target.py" record "${REPO_ROOT}/registry" "$AGENT_NAME" \
       "$_RECORDED_TARGET" >/dev/null \
       || echo "[crewvia] WARNING: $AGENT_NAME の TARGET_DIR を記録できませんでした — target_dir 付きの task は割り当てられません" >&2
+    # 使ったモデルの記録 (段上げ PR-1・registry/workers/<Name>/model.json)。pull が card の execution_model に写す。
+    # 書けなくても起動は止めない: 記録の無い Worker は execution_model を書かないだけ (割り当ては変わらない)。
+    python3 "${SCRIPT_DIR}/lib_worker_model.py" record "${REPO_ROOT}/registry" "$AGENT_NAME" \
+      "$SELECTED_MODEL_SOURCE" "$SELECTED_MODEL" >/dev/null \
+      || echo "[crewvia] WARNING: $AGENT_NAME のモデルを記録できませんでした — 試行の記録に model が入りません" >&2
   fi
 
   # Claude Code の入力プロンプト（❯）が表示されるまで待ってから kickoff メッセージを送る。

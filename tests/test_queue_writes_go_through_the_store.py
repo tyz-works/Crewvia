@@ -146,6 +146,7 @@ ALLOWED_WRITES: dict[tuple[str, str], tuple[int, str]] = {
     ('lib_retirement.py', 'write_json_exclusive'): (5, "registry/retirements/ の marker (O_EXCL / link で確保)。同上"),
     ('lib_retirement.py', 'unlink_quiet'): (1, "registry/retirements/ の marker の撤去。同上"),
     ('lib_worker_target.py', 'write_record'): (5, "registry/workers/<name>/ の TARGET_DIR 記録 (tmp+replace)。書き手 1 者 (§5.3)"),
+    ('lib_worker_model.py', 'write_record'): (5, "registry/workers/<name>/model.json (Worker 起動時のモデルの記録。tmp+replace)。書き手は start.sh だけ (CLI `lib_worker_model.py record`)。lib_worker_target.write_record と同じ作法・同じ dir。queue には何も書かない・消してよい (消えた Worker は execution_model を書かないだけ)。モデルの段上げ PR-1 / knowledge/model-escalation.md §4.2"),
     ('lib_worker_target.py', 'sweep_stale_records'): (2, "registry/workers/<name>/ の古い記録の掃除。書き手 1 者 (§5.3)"),
     ('run_verification_checks.py', 'run_checks'): (3, "registry/verification/<task>/<cycle>.json。サイクル番号で新しい名前を"
                                                       "作る追記専用の検証結果 (書き手 1 者・既存を書き換えない)"),

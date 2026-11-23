@@ -487,6 +487,9 @@ _CONTROLLER = _import_scripts_module('lib_task_controller')
 # 試行の台帳 (queue/missions/<m>/history/tNNN/) の形と読み口は lib_history.py の 1 か所 (vNext 02 PR-D)。
 # 書くのは Controller の `_finish` だけ。plan.sh は `history` と `pull` の `previous_attempt` で読むだけ。
 _HISTORY = _import_scripts_module('lib_history')
+# Worker が起動されたときのモデルの記録 (registry/workers/<Name>/model.json) は lib_worker_model.py の 1 か所
+# (モデルの段上げ PR-1・knowledge/model-escalation.md §4.2)。plan.sh の pull が読むだけで、書くのは start.sh。
+_WORKER_MODEL = _import_scripts_module('lib_worker_model')
 # 共通 config/crewvia.yaml + マシン固有の config/crewvia.local.yaml を重ねて読むのは lib_config.py の 1 か所
 # (knowledge/machine-local-config.md)。config を読む subcommand は壊れた local を拒否する (UsageExit・何も書かない)。
 _CONFIG = _import_scripts_module('lib_config')
@@ -4003,9 +4006,23 @@ def _pull_result(slug, meta, body):
     }
 
 
-def _pull_start(slug, task_id, agent, generation, execution_id, git_context):
+def _pull_worker_model(agent):
+    """pull した Worker の起動時のモデル (`registry/workers/<Name>/model.json` の `model`)。**書けるときだけ**文字列、それ以外は None。
+
+    None = 記録が無い (PR-1 より前に起動した Worker)・読めない・壊れている・`--agent` が無い・モデルが空 (CLI の既定)。
+    どれも card の `execution_model` を**書かない**だけで、pull は止めない (`unknown` のような値を作らない)。
+    読めない (missing でない) ときは stderr に 1 行。registry の読み取りで queue ではないので、ロックの外で読む。"""
+    if not agent:
+        return None
+    model, warning = _WORKER_MODEL.recorded_model(registry_dir(), agent)
+    if warning:
+        print(f"[plan.sh pull] warn: {warning}", file=sys.stderr)
+    return model
+
+
+def _pull_start(slug, task_id, agent, generation, execution_id, git_context, model=None):
     """pull の 2 つ目のロック: reserved → running (start)。card が**この pull の予約のまま** (`_pull_cas_ok`) のときだけ。
-    戻り値: `(started, why)`。外れたら何も書かない (JSON を出させない)。"""
+    戻り値: `(started, why)`。外れたら何も書かない (JSON を出させない)。`model` は Worker の記録のモデル (あれば card・record に写す)。"""
     outcome = {'started': False, 'why': '', 'code': _EXEC.TASK_ALREADY_RESERVED}
 
     def _do():
@@ -4028,7 +4045,7 @@ def _pull_start(slug, task_id, agent, generation, execution_id, git_context):
                               f"(status={meta.get('status')}, worker={meta.get('worker')})")
             return
         try:
-            result = _CONTROLLER.start_execution(_txn(), slug, task_id, execution_id, git_context)
+            result = _CONTROLLER.start_execution(_txn(), slug, task_id, execution_id, git_context, model=model)
         except _EXEC.ControllerError as e:
             outcome['why'] = f"Controller が拒否しました ({e.code})"
             return
@@ -4618,7 +4635,9 @@ def cmd_pull(args):
     git_context = (_pull_git_context(mission_slug, task_id, task_slug, worktree_path,
                                       pass_fds=(prepare_lock.fileno(),))
                    if worktree_path is not None else None)
-    started, why, why_code = _pull_start(mission_slug, task_id, agent, started_holder[0], execution_id, git_context)
+    worker_model = _pull_worker_model(agent)
+    started, why, why_code = _pull_start(mission_slug, task_id, agent, started_holder[0], execution_id, git_context,
+                                         model=worker_model)
     if not started:
         die(f"[plan.sh pull] {mission_slug}/{task_id}: 開始 (start) できませんでした: {why}。書き換えていません。"
             f"JSON を出さないので、この pull の結果で作業を始めてはいけません。\n"
@@ -4629,6 +4648,8 @@ def cmd_pull(args):
     chosen_holder[0]['worktree_path'] = worktree_path
     chosen_holder[0]['execution_id'] = execution_id
     chosen_holder[0]['attempt'] = execution_holder[0]['attempt']
+    if worker_model is not None:
+        chosen_holder[0]['execution_model'] = worker_model          # 今の試行を走らせたモデル (記録のある Worker だけ)
     # 前の試行の台帳の要約 (無ければ欄ごと省く)。読めない台帳は pull を止めず、黙りもしない (stderr に固定コードだけ)
     try:
         previous = _HISTORY.previous_attempt(_HISTORY.load_events(QUEUE_DIR, mission_slug, task_id), execution_id)
@@ -5990,6 +6011,10 @@ def _print_mission_detail(slug):
         if (isinstance(xid, str) and _EXEC.is_execution_id(xid)
                 and m.get('execution_status') in _EXEC.ACTIVE_STATUSES):
             exec_suffix = f" [{xid} attempt {m.get('execution_count')}]"
+            # 走らせている Worker のモデル (記録のある Worker だけ。card の手編集で変な文字が来ても画面に出さない)
+            xmodel = m.get(_EXEC.EXECUTION_MODEL_FIELD)
+            if isinstance(xmodel, str) and re.fullmatch(r'[A-Za-z0-9._\[\]-]{1,64}', xmodel):
+                exec_suffix += f" model={xmodel}"
         print(f"[{icon}] {tid} {title} {suffix}{timeout_suffix}{exec_suffix}")
         if st in _CI_STATUS.POLL_STATUSES:
             ci = ci_status_line(slug, tid, m)

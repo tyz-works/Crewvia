@@ -42,7 +42,7 @@ NAME_RE = store.HISTORY_NAME_RE
 #: 再送で比べる欄 (`ended_at` は除く。本文は `body` として別に比べる)。
 COMPARED_FIELDS = ('execution_id', 'attempt', 'kind', 'end_code', 'reopen_count', 'head', 'pr_number', 'worker',
                    'actor', 'reason', 'handoff_path', 'over_cap', 'checkpoint_dir', 'result',
-                   'root', 'root_reopen_count')
+                   'root', 'root_reopen_count', 'model')
 
 #: `result` 欄の語彙 (§3.2)。recorded = 本文に Result 全文を入れた / none = その試行は Result を書かずに終わった /
 #: unattributed = 帰属の欄 (`result_execution_id`) が無い card (この設計より前のもの) で、旧本文の Result は入れない。
@@ -143,7 +143,7 @@ def _is_pr_number(value):
 
 #: 省略できる (None か str) 欄。型の違う値 (list / dict / bool / int) は `bad_field_type`。
 _OPTIONAL_TEXT_FIELDS = ('end_code', 'head', 'worker', 'actor', 'reason', 'handoff_path', 'over_cap', 'checkpoint_dir',
-                         'root')
+                         'root', 'model')
 
 
 def fields_problem(meta):
@@ -261,9 +261,10 @@ def result_section(body):
 def build_event(*, kind, execution_id, attempt, ended_at, end_code=None, reopen_count=0, head=None,
                 pr_number=None, worker=None, actor=None, reason=None, checkpoint_dir=None,
                 handoff_path=None, over_cap=None, result_state=RESULT_NONE, result_text='',
-                root=None, root_reopen_count=None):
+                root=None, root_reopen_count=None, model=None):
     """`(fields, body)`。`result_state` が recorded のときだけ本文に Result 全文を入れる。
 
+    `model` は閉じた試行の `execution_model` (その試行を走らせた Worker のモデル。無ければ None = 欄なし。段上げ PR-1)。
     `root` / `root_reopen_count` は reopen の cascade で戻された (閉じられた) 下流の task にだけ付ける (設計 §4.3.1-6):
     起点 I の id と、その reopen を始めた時点の I の `reopen_count` + 1。`store-check` が「I の card がまだその回数に
     届いていない」= cascade の途中で止まったことを見つけるための印。"""
@@ -272,7 +273,7 @@ def build_event(*, kind, execution_id, attempt, ended_at, end_code=None, reopen_
     fields = dict(execution_id=execution_id, attempt=attempt, kind=kind, end_code=end_code, ended_at=ended_at,
                   reopen_count=reopen_count, head=head, pr_number=pr_number, worker=worker, actor=actor,
                   reason=reason, handoff_path=handoff_path, over_cap=over_cap, checkpoint_dir=checkpoint_dir,
-                  result=result_state, root=root, root_reopen_count=root_reopen_count)
+                  result=result_state, root=root, root_reopen_count=root_reopen_count, model=model)
     body = (result_text or '').rstrip() if result_state == RESULT_RECORDED else ''
     return fields, body
 
@@ -444,10 +445,10 @@ def previous_attempt(events, current_execution_id):
     f = base['fields']
     out = {'execution_id': xid, 'attempt': f.get('attempt'), 'end_code': f.get('end_code'),
            'ended_at': f.get('ended_at'), 'head': f.get('head'), 'history_path': base['path'],
-           'checkpoint_dir': f.get('checkpoint_dir'), 'handoff_path': f.get('handoff_path')}
+           'checkpoint_dir': f.get('checkpoint_dir'), 'handoff_path': f.get('handoff_path'), 'model': f.get('model')}
     if reopened and reopened[-1] is last:
         r = reopened[-1]['fields']
-        for key in ('end_code', 'head', 'handoff_path', 'checkpoint_dir'):
+        for key in ('end_code', 'head', 'handoff_path', 'checkpoint_dir', 'model'):
             if out.get(key) is None:
                 out[key] = r.get(key)
         out['retry_reason'] = r.get('reason')

@@ -318,7 +318,7 @@ def _owner_slot(meta):
     return w if isinstance(w, str) and w and store.agent_name_problem(w) is None else None
 
 
-def _write_record(txn, slug, tid, meta, *, ended_at=None, running_at=None, git=None):
+def _write_record(txn, slug, tid, meta, *, ended_at=None, running_at=None, git=None, model=None):
     """record を card に合わせて書く (card の**後**)。無ければ card から作る。読めない・identity が食い違う record は
     消さない・上書きしない (回復 R-5 が報告する)。戻り値: 書いた record か None。"""
     xid = meta['current_execution_id']
@@ -330,7 +330,7 @@ def _write_record(txn, slug, tid, meta, *, ended_at=None, running_at=None, git=N
         if ended_at is not None:
             record['ended_at'] = ended_at
     elif got[0] == 'ok' and ex.record_problem(got[1], meta, slug, tid) is None:
-        record = ex.follow_card(got[1], meta, ended_at=ended_at, running_at=running_at, git=git)
+        record = ex.follow_card(got[1], meta, ended_at=ended_at, running_at=running_at, git=git, model=model)
     else:
         return None
     txn.write_execution_record(slug, xid, record)
@@ -439,7 +439,7 @@ def _resolve_ledger(txn, slug, tid, meta, out, body_out, *, end_code, ended_at, 
         kind=kind, execution_id=xid, attempt=meta['execution_count'], ended_at=ended_at, end_code=end_code,
         reopen_count=reopen, head=out.get('fail_head'), pr_number=out.get('pr_number'), worker=meta.get('worker'),
         actor=_ledger_actor(txn), reason=_ledger_reason(out, end_code), result_state=state, result_text=result_text,
-        checkpoint_dir=checkpoint_dir)
+        checkpoint_dir=checkpoint_dir, model=meta.get(ex.EXECUTION_MODEL_FIELD))
     args.update(ledger_extra or {})                          # reopen の cascade が reason / root / root_reopen_count を足す
     fields, body = hist.build_event(**args)
     # checkpoint_dir は再送の比較に入れない: 孤児の台帳 (retire が card の前に落ちた) の後の再送は、取り直した checkpoint が
@@ -646,6 +646,7 @@ def reserve_task(txn, slug, tid, agent, *, now, id_factory=None, foreign_slot_ch
                 execution_reserved_at=now,
                 task_slug=meta.get('task_slug') or ex.slugify_title(meta.get('title') or '', tid))
     meta.pop('execution_end_code', None)
+    meta.pop(ex.EXECUTION_MODEL_FIELD, None)            # 前の試行のモデルを持ち越さない (start が新しい試行の分を書く)
     if agent is None:
         meta.pop('execution_agent', None)
     else:
@@ -692,7 +693,7 @@ def abandon_detached_execution(txn, slug, tid, *, now=None):
 # start (pull の 2 つ目のロック)
 # ---------------------------------------------------------------------------
 
-def start_execution(txn, slug, tid, execution_id, git_context=None, *, now=None):
+def start_execution(txn, slug, tid, execution_id, git_context=None, *, now=None, model=None):
     """reserved → running。名指しの card の `current_execution_id` と `execution_id` が一致し、`ACTIVE` のときだけ。
 
     - 既に running なら**冪等** (何も書かず `Execution(idempotent=True)`)。「reserved だったか」を CAS として使う
@@ -700,8 +701,12 @@ def start_execution(txn, slug, tid, execution_id, git_context=None, *, now=None)
     - DETACHED・別の ID は `EXECUTION_NOT_CURRENT`、試行なしは `EXECUTION_NOT_FOUND`、terminal は `INVALID_TRANSITION`。
     - `git_context` (branch / base / pr_base / worktree (絶対パス) / head_at_start) は record の `git` に入れる
       (判断には使わない。W2 で前の試行の commit が残った worktree を再利用したとき、どの commit から始めた試行かを追う)。
+    - `model` は Worker の記録 (`model.json`) の `model` (文字列)。渡されたときだけ card の `execution_model` と record の `model` に
+      入る (記録の無い Worker・モデルが空の Worker は渡さない = 欄を作らない)。判断には使わない (段上げの起点の記録)。
     """
     git = _check_git_context(git_context)
+    if model is not None and (not isinstance(model, str) or not model.strip()):
+        raise _err(ex.INVALID_ARGUMENT, "model は空でない文字列か None")
     _check_now(now)
     meta, body = _load(txn, slug, tid)
     caller = Caller(execution_id, 'flag') if execution_id is not None else NO_CALLER
@@ -719,8 +724,10 @@ def start_execution(txn, slug, tid, execution_id, git_context=None, *, now=None)
         return _execution_of(txn, slug, tid, meta, idempotent=True)
     meta = dict(meta)
     meta['execution_status'] = ex.RUNNING
+    if model is not None:
+        meta[ex.EXECUTION_MODEL_FIELD] = model
     txn.write_card(slug, tid, meta, body)                       # コミット点
-    _write_record(txn, slug, tid, meta, running_at=_now_text(now), git=git)
+    _write_record(txn, slug, tid, meta, running_at=_now_text(now), git=git, model=model)
     txn.record(slug, tid, meta.get('status'), meta.get('status'), meta.get('started_at'),
                execution_id=execution_id, caller_check=ex.CHECK_VERIFIED)
     return _execution_of(txn, slug, tid, meta)
@@ -1064,7 +1071,8 @@ def _write_reopen(txn, slug, tid, meta, body, *, kind, reason, count, over_cap, 
             kind=kind, execution_id=xid, attempt=count, ended_at=ended_at, end_code=meta.get('execution_end_code'),
             reopen_count=reopen, head=meta.get('fail_head'), pr_number=meta.get('pr_number'), worker=meta.get('worker'),
             actor=_ledger_actor(txn), reason=reason, handoff_path=meta.get('handoff_path'),
-            over_cap=over_cap, result_state=hist.RESULT_NONE, root=root, root_reopen_count=root_reopen_count)
+            over_cap=over_cap, result_state=hist.RESULT_NONE, root=root, root_reopen_count=root_reopen_count,
+            model=meta.get(ex.EXECUTION_MODEL_FIELD))
         return _match_or_plan(txn, slug, tid, kind, xid, reopen, fields, text, ended_at)
 
     if dry_run:

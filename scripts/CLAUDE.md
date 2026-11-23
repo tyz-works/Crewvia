@@ -79,6 +79,14 @@ lib ごとの**破ってはいけない契約**の要約。理由・経緯・全
   コピーしない。**`failed` の依存は「保留（HELD）」**で、進める出口は Director の `plan.sh release-dep <id> --mission <slug>` だけ。
 - 共有規則に env 停止スイッチを付けない（dispatcher と plan.sh で答えが割れる）。
 
+## Worker のモデルの記録（`lib_worker_model.py`。モデルの段上げ PR-1。設計 `knowledge/model-escalation.md` §4.2）
+
+- `registry/workers/<Name>/model.json`（`model` / `source` / `bound_task` / `written_at`）。書き手は start.sh（CLI `lib_worker_model.py record`）だけ、読み手は plan.sh pull だけ（`recorded_model()`）。
+  pull が card の `execution_model`・record の `model`・台帳の `model`（閉じた試行の分）に写す。**記録が無い・読めない・モデルが空なら欄を書かない**（`unknown` を作らない・pull は止めない）。
+- `reserve` は前の試行の `execution_model` を消す（持ち越さない）。`execution_model` は `EXECUTION_FIELDS` に**入れない**（欄の無い card が今と同じに読める）。
+- **plan.sh は `lib_task_cards` を別に読み込むので `Unreadable` / `is_missing` の isinstance は lib 側とは別のクラス**。「無い / 読めない / 値」の判定は lib の関数に閉じ、plan.sh で `rec['…']` や `is_missing(rec)` を直接使わない。
+- PR-1 は割り当てを変えない（`worker_may_take` は PR-2）。戻し方: revert → sync。`model.json`・card の `execution_model`・record の `model`・台帳の `model` は残ってよい（旧コードは読まない）。
+
 ## Execution + Task Controller（`lib_execution.py` / `lib_task_controller.py`。01c E1 / t004 で作成。**呼び出し元は plan.sh だけ**: pull（E2 / t008）・done / fail / needs-director / ready-for-verification / verifying / verify-result と `update --close-execution`（E3 / t012））
 
 - `lib_execution.py` = card 1 枚から決まること（`ex-<32 hex>` の形・試行の欄 `EXECUTION_FIELDS`・`attempt_view`（照合・冪等・R-1・

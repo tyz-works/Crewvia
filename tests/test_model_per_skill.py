@@ -183,7 +183,7 @@ class TestRealConfig:
     """実 config/crewvia.yaml に対して解決結果を検証する。"""
 
     def test_planning_returns_opus(self):
-        assert lib_model.resolve(str(REAL_CONFIG), "planning") == "claude-opus-5"
+        assert lib_model.resolve(str(REAL_CONFIG), "planning") == "opus"
 
     @pytest.mark.parametrize("skill", ["docs", "qa", "verify"])
     def test_docs_qa_verify_are_sonnet_not_haiku(self, skill):
@@ -192,7 +192,7 @@ class TestRealConfig:
         # 「Haiku でない」ではなく「Sonnet である」を固定する: 未定義に戻って
         # worker_model にフォールバックしても、この 3 skill が意図して選ばれた
         # 値でなくなるので検出したい。
-        assert lib_model.resolve(str(REAL_CONFIG), skill) == "claude-sonnet-5"
+        assert lib_model.resolve(str(REAL_CONFIG), skill) == "sonnet"
         assert "haiku" not in lib_model.resolve(str(REAL_CONFIG), skill)
 
     def test_no_skill_in_model_per_skill_is_haiku(self):
@@ -211,11 +211,11 @@ class TestRealConfig:
 
     def test_planning_and_code_returns_opus(self):
         # 最高ランク選択: planning=opus, code=worker_model → opus
-        assert lib_model.resolve(str(REAL_CONFIG), "planning,code") == "claude-opus-5"
+        assert lib_model.resolve(str(REAL_CONFIG), "planning,code") == "opus"
 
     def test_docs_and_qa_returns_sonnet(self):
         # 同ランク: docs=sonnet, qa=sonnet → sonnet
-        assert lib_model.resolve(str(REAL_CONFIG), "docs,qa") == "claude-sonnet-5"
+        assert lib_model.resolve(str(REAL_CONFIG), "docs,qa") == "sonnet"
 
 
 class TestTiebreakWithFixture:
@@ -293,8 +293,8 @@ class TestParseYamlFallback:
         result = lib_model._parse_yaml_fallback(str(REAL_CONFIG))
         assert "worker_model" in result
         assert "model_per_skill" in result
-        assert result["model_per_skill"].get("planning") == "claude-opus-5"
-        assert result["model_per_skill"].get("docs") == "claude-sonnet-5"  # t028
+        assert result["model_per_skill"].get("planning") == "opus"
+        assert result["model_per_skill"].get("docs") == "sonnet"  # t028
 
 
 # ---------------------------------------------------------------------------
@@ -315,3 +315,17 @@ class TestModelRank:
 
     def test_case_insensitive(self):
         assert lib_model._model_rank("Claude-Opus-5") == 3
+
+
+class TestAliasOnly:
+    """別名 (opus / sonnet) だけの config でもランク付けが効き、WARNING が出ない。"""
+
+    def test_alias_ranks_without_warning(self, tmp_path, capsys):
+        p = tmp_path / "crewvia.yaml"
+        p.write_text("worker_model: sonnet\n\nmodel_per_skill:\n  planning: opus\n  docs: sonnet\n",
+                     encoding="utf-8")
+        assert lib_model._model_rank("opus") == 3
+        assert lib_model._model_rank("sonnet") == 2
+        assert lib_model.resolve(str(p), "planning,code") == "opus"
+        assert lib_model.resolve(str(p), "docs,code") == "sonnet"
+        assert "WARNING" not in capsys.readouterr().err

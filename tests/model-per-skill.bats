@@ -67,40 +67,40 @@ teardown() {
 # ---------------------------------------------------------------------------
 # Test 2: env 無しで model_per_skill が適用される
 # ---------------------------------------------------------------------------
-@test "env 無し: planning → claude-opus-5" {
+@test "env 無し: planning → opus" {
   result=$(CREWVIA_PRINT_MODEL=1 bash "$START_SH" worker planning 2>/dev/null)
-  [ "$result" = "claude-opus-5" ]
+  [ "$result" = "opus" ]
 }
 
 # docs / qa / verify は Sonnet (t028): Haiku は permission-mode auto を無視して承認ダイアログで止まる。
-@test "env 無し: docs → claude-sonnet-5" {
+@test "env 無し: docs → sonnet" {
   result=$(CREWVIA_PRINT_MODEL=1 bash "$START_SH" worker docs 2>/dev/null)
-  [ "$result" = "claude-sonnet-5" ]
+  [ "$result" = "sonnet" ]
 }
 
-@test "env 無し: qa → claude-sonnet-5" {
+@test "env 無し: qa → sonnet" {
   result=$(CREWVIA_PRINT_MODEL=1 bash "$START_SH" worker qa 2>/dev/null)
-  [ "$result" = "claude-sonnet-5" ]
+  [ "$result" = "sonnet" ]
 }
 
-@test "env 無し: verify → claude-sonnet-5" {
+@test "env 無し: verify → sonnet" {
   result=$(CREWVIA_PRINT_MODEL=1 bash "$START_SH" worker verify 2>/dev/null)
-  [ "$result" = "claude-sonnet-5" ]
+  [ "$result" = "sonnet" ]
 }
 
-@test "env 無し: code → claude-sonnet-5 (worker_model フォールバック)" {
+@test "env 無し: code → sonnet (worker_model フォールバック)" {
   result=$(CREWVIA_PRINT_MODEL=1 bash "$START_SH" worker code 2>/dev/null)
-  [ "$result" = "claude-sonnet-5" ]
+  [ "$result" = "sonnet" ]
 }
 
-@test "env 無し: docs qa → claude-sonnet-5 (複数 skill でも Haiku に落ちない)" {
+@test "env 無し: docs qa → sonnet (複数 skill でも Haiku に落ちない)" {
   result=$(CREWVIA_PRINT_MODEL=1 bash "$START_SH" worker docs qa 2>/dev/null)
-  [ "$result" = "claude-sonnet-5" ]
+  [ "$result" = "sonnet" ]
 }
 
-@test "env 無し: planning code → claude-opus-5 (最高ランク選択)" {
+@test "env 無し: planning code → opus (最高ランク選択)" {
   result=$(CREWVIA_PRINT_MODEL=1 bash "$START_SH" worker planning code 2>/dev/null)
-  [ "$result" = "claude-opus-5" ]
+  [ "$result" = "opus" ]
 }
 
 # ---------------------------------------------------------------------------
@@ -116,8 +116,8 @@ teardown() {
   # 実 config に director_model が設定されていれば、それが返る
   result=$(unset CREWVIA_DIRECTOR_MODEL; CREWVIA_PRINT_MODEL=1 \
            bash "$START_SH" director 2>/dev/null)
-  # config の director_model は claude-opus-5
-  [ "$result" = "claude-opus-5" ]
+  # config の director_model は opus
+  [ "$result" = "opus" ]
 }
 
 # ---------------------------------------------------------------------------

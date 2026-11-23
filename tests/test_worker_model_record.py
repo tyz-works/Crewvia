@@ -45,6 +45,12 @@ def test_empty_model_is_null_not_a_made_up_value(tmp_path):
     assert wm.load_record(tmp_path, "Ren")["model"] is None
 
 
+def test_blank_model_is_null_when_written(tmp_path):
+    rec = wm.write_record(tmp_path, "Ren", "env", "   ")
+    assert rec["model"] is None
+    assert wm.load_record(tmp_path, "Ren")["model"] is None
+
+
 def test_missing_is_missing_not_unreadable_value(tmp_path):
     rec = wm.load_record(tmp_path, "Ren")
     assert is_missing(rec) and is_unreadable(rec)       # Unreadable の一種。is_missing を先に見る契約
@@ -60,7 +66,7 @@ def test_every_field_is_required(tmp_path, drop):
 
 @pytest.mark.parametrize("key,bad", [
     ("agent", ""), ("agent", 3), ("agent", None),
-    ("model", ""), ("model", 3), ("model", []), ("model", {}), ("model", True),
+    ("model", ""), ("model", "  "), ("model", "\t\n"), ("model", 3), ("model", []), ("model", {}), ("model", True),
     ("source", "bogus"), ("source", []), ("source", None), ("source", 1), ("source", {}),
     ("bound_task", "no-slash"), ("bound_task", ""), ("bound_task", 5), ("bound_task", []),
     ("written_at", "x"), ("written_at", True), ("written_at", None), ("written_at", float("nan")),

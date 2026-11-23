@@ -64,13 +64,16 @@ def test_env_source_model_with_a_version_is_copied_as_is(box):
     assert box.card()["execution_model"] == "claude-opus-4-1"
 
 
-@pytest.mark.parametrize("how", ["missing", "broken_json", "bad_shape", "model_null", "no_agent"])
+@pytest.mark.parametrize("how", ["missing", "broken_json", "bad_shape", "blank_model", "model_null"])
 def test_no_usable_record_writes_no_field_and_pull_still_works(box, how):
     agent = "Ren"
     if how == "broken_json":
         put_raw(box, "{")
     elif how == "bad_shape":
         put_raw(box, json.dumps({"agent": "Ren", "model": 5, "source": "env", "bound_task": None, "written_at": 1}))
+    elif how == "blank_model":
+        # 空白だけの model は Controller が INVALID_ARGUMENT で断るので、記録の検査で先に落とす (pull を止めない)
+        put_raw(box, json.dumps({"agent": "Ren", "model": "  ", "source": "env", "bound_task": None, "written_at": 1}))
     elif how == "model_null":
         wm.write_record(box.root / "registry", "Ren", "none", None)
     p = box.pull(agent)
@@ -79,7 +82,7 @@ def test_no_usable_record_writes_no_field_and_pull_still_works(box, how):
     assert "execution_model" not in res
     assert "execution_model" not in box.card()
     assert "model" not in box.record(res["execution_id"]) or box.record(res["execution_id"])["model"] is None
-    if how in ("broken_json", "bad_shape"):
+    if how in ("broken_json", "bad_shape", "blank_model"):
         assert "execution_model を書きません" in p.stderr
     else:
         assert "execution_model" not in p.stderr

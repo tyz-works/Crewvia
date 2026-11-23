@@ -126,20 +126,17 @@ _dry_model() {
 
 @test "without the env the skill-resolved model is recorded with source skill, and matches the dry-run" {
     unset CREWVIA_WORKER_MODEL
-    run _dry_model code python
+    # config の model_per_skill に載っている skill (review = opus) なので、解決は必ず非空
+    run _dry_model review
     [ "$status" -eq 0 ]
+    [ -n "$output" ]
     DRY="$output"
-    run bash "$START_SH" worker --name Ren code python
+    run bash "$START_SH" worker --name Ren review
     [ "$status" -eq 0 ]
     run _record Ren
     [ "$status" -eq 0 ]
-    if [[ -n "$DRY" ]]; then
-        [[ "$output" == *"\"model\": \"${DRY}\""* ]]
-        [[ "$output" == *'"source": "skill"'* ]]
-    else
-        [[ "$output" == *'"model": null'* ]]
-        [[ "$output" == *'"source": "none"'* ]]
-    fi
+    [[ "$output" == *"\"model\": \"${DRY}\""* ]]
+    [[ "$output" == *'"source": "skill"'* ]]
 }
 
 @test "an explicit env wins over the skill mapping in the dry-run and in the record" {
@@ -175,4 +172,18 @@ _dry_model() {
 @test "a Director launch writes no model record" {
     run bash "$START_SH" director --name Sora
     [ ! -e "${REPO_ROOT}/registry/workers/Sora" ]
+}
+
+@test "inline launch (CREWVIA_MUX_ENABLED=0) records the model too, and replaces a predecessor's record" {
+    unset CREWVIA_MUX
+    export CREWVIA_MUX_ENABLED=0
+    CREWVIA_WORKER_MODEL=opus run bash "$START_SH" worker --name Ren code python
+    [ "$status" -eq 0 ]
+    run _record Ren
+    [[ "$output" == *'"model": "opus"'* ]]
+    [[ "$output" == *'"source": "env"'* ]]
+    CREWVIA_WORKER_MODEL=sonnet run bash "$START_SH" worker --name Ren code python
+    [ "$status" -eq 0 ]
+    run _record Ren
+    [[ "$output" == *'"model": "sonnet"'* ]]
 }

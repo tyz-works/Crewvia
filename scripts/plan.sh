@@ -4171,6 +4171,10 @@ def cmd_pull(args):
         _refuse_before_writing(f"{agent!r} は registry/workers.yaml で role: director です。Director は task を pull しません "
             f"(Worker に割り当てる側)。`plan.sh status` で状態を見るか、Worker として起動し直してください。")
 
+    # 自分の起動時のモデル (registry/workers/<Name>/model.json)。ロックの外・ロック 1 の前に読む (設計 §6。registry の記録で
+    # queue ではない)。ロック 2 の start_execution(model=) まで持ち回る。
+    worker_model = _pull_worker_model(agent)
+
     requested_skills = pull_skills(opts.get('--skills'), registered)
     if not requested_skills:
         _refuse_before_writing("pull requires the worker's skills: pass --skills <csv>, set the SKILLS environment "
@@ -4635,7 +4639,6 @@ def cmd_pull(args):
     git_context = (_pull_git_context(mission_slug, task_id, task_slug, worktree_path,
                                       pass_fds=(prepare_lock.fileno(),))
                    if worktree_path is not None else None)
-    worker_model = _pull_worker_model(agent)
     started, why, why_code = _pull_start(mission_slug, task_id, agent, started_holder[0], execution_id, git_context,
                                          model=worker_model)
     if not started:

@@ -61,7 +61,9 @@ def record_path(registry_dir, agent):
 
 
 def _is_text(value):
-    return isinstance(value, str) and value != ''
+    """空でも空白だけでもない文字列。Controller の `start_execution` (`model.strip()`) と同じ基準にそろえる
+    (ここで通した値を Controller が INVALID_ARGUMENT で断って pull が止まる、という食い違いを作らない)。"""
+    return isinstance(value, str) and value.strip() != ''
 
 
 def record_problem(data):
@@ -97,7 +99,7 @@ def record_problem(data):
 def build_record(agent, source, model=None, bound_task=None, now=None):
     return {
         'agent': agent,
-        'model': model if model else None,
+        'model': model if model and model.strip() else None,
         'source': source,
         'bound_task': bound_task if bound_task else None,
         'written_at': time.time() if now is None else now,

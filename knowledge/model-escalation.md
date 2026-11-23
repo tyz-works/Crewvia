@@ -119,6 +119,7 @@
    - `model`: `SELECTED_MODEL`（空 = `--model` なし = CLI の既定は `null`）。
    - `source`: `env`（`WORKER_MODEL_EXPLICIT=1`）/ `override`（§4.3 の束ねた起動で card の `model_override` を使った）/ `skill`（`model_per_skill` か `worker_model`）/ `none`（解決が空）。
    - `bound_task`: `"<slug>/<tid>"` か `null`（§4.3）。
+   - **mux でも inline（`CREWVIA_MUX_ENABLED=0`）でも書く**（`start.sh` の `_record_worker_model`。mux は spawn が成功した後・inline は `exec claude` の前。同名の先任の記録は丸ごと置き換わる）。`model` は空白だけの文字列も `null` に倒す（Controller の `start_execution` と同じ非空白の基準）。
    - 書き手は start.sh だけ（CLI は新しい lib。§4.3）。原子的に書く（`lib_state_store.atomic_write_text`）。置き場は TARGET_DIR の記録と同じ dir で、**`registry/mux/*.json`（kill の認可の証拠）には相乗りしない**（`lib_worker_target.py` 冒頭と同じ理由）。
 2. **pull** がロック 1 の前に自分（`--agent`）の `model.json` を読み（`lib_daemon_state.load_json_store`。`Unreadable` を `None` に潰さない）、ロック 2 の `start_execution(…, model=…)` に渡す。Controller は card の `execution_model` と record の `model` に書く（`git` と同じ「start が渡したときだけ」）。記録が無い・読めない Worker（PR-1 の前に起動した Worker を含む）は**欄を書かない**（`unknown` のような値を作らない）。
 3. **台帳**: 試行を閉じる遷移（end / reset / retire）と retry / reopen の台帳に `model`（閉じた試行の `execution_model`。無ければ欄なし）を足す（`lib_history.build_event` の引数を 1 つ増やす）。`plan.sh history` と pull の `previous_attempt` に出る。

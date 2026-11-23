@@ -672,6 +672,17 @@ elif [[ -n "$SELECTED_MODEL" ]]; then
 else
   SELECTED_MODEL_SOURCE="none"
 fi
+# 使ったモデルの記録 (段上げ PR-1・registry/workers/<Name>/model.json。設計 §4.2)。pull が card の execution_model に写す。
+# mux でも inline でも書く (inline = CREWVIA_MUX_ENABLED=0 も pull する Worker。書く場所を分岐の中に閉じ込めない)。
+# 書けなくても起動は止めない: 記録の無い Worker は execution_model を書かないだけ (割り当ては変わらない)。
+# 同名の先任の記録は呼ぶたびに丸ごと置き換わる (写さない)。mux は「既に居る」(10/11) で終わった呼び出しが
+# 生きた Worker の記録を上書きしないよう、spawn の成功の後に呼ぶ (TARGET_DIR の記録と同じ)。
+_record_worker_model() {
+  python3 "${SCRIPT_DIR}/lib_worker_model.py" record "${REPO_ROOT}/registry" "$AGENT_NAME" \
+    "$SELECTED_MODEL_SOURCE" "$SELECTED_MODEL" >/dev/null \
+    || echo "[crewvia] WARNING: $AGENT_NAME のモデルを記録できませんでした — 試行の記録に model が入りません" >&2
+}
+
 MODEL_FLAG=()
 if [[ -n "$SELECTED_MODEL" ]]; then
   MODEL_FLAG=(--model "$SELECTED_MODEL")
@@ -975,11 +986,7 @@ PYEOF
     python3 "${SCRIPT_DIR}/lib_worker_target.py" record "${REPO_ROOT}/registry" "$AGENT_NAME" \
       "$_RECORDED_TARGET" >/dev/null \
       || echo "[crewvia] WARNING: $AGENT_NAME の TARGET_DIR を記録できませんでした — target_dir 付きの task は割り当てられません" >&2
-    # 使ったモデルの記録 (段上げ PR-1・registry/workers/<Name>/model.json)。pull が card の execution_model に写す。
-    # 書けなくても起動は止めない: 記録の無い Worker は execution_model を書かないだけ (割り当ては変わらない)。
-    python3 "${SCRIPT_DIR}/lib_worker_model.py" record "${REPO_ROOT}/registry" "$AGENT_NAME" \
-      "$SELECTED_MODEL_SOURCE" "$SELECTED_MODEL" >/dev/null \
-      || echo "[crewvia] WARNING: $AGENT_NAME のモデルを記録できませんでした — 試行の記録に model が入りません" >&2
+    _record_worker_model
   fi
 
   # Claude Code の入力プロンプト（❯）が表示されるまで待ってから kickoff メッセージを送る。
@@ -1132,6 +1139,7 @@ else
     echo "[crewvia] ERROR: failed to cd into $WORK_DIR" >&2
     exit 1
   }
+  [[ "${ROLE}" == "worker" ]] && _record_worker_model
   # herdr server 汚染の伝播を防ぐため exec 直前に除去する (mux 経由と同様の防御)。
   unset CLAUDE_CODE_CHILD_SESSION
   # 二重防御: unset が漏れても transcript 保存を公式 env var で保証する (→ t004)。

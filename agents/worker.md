@@ -96,9 +96,9 @@ Worker 起動時に使用するモデルは以下の優先順位で決まる:
 
 | skill | デフォルトモデル |
 |---|---|
-| `planning` / `plan_review` / `review` / `research` | `claude-opus-5` (深い推論が必要) |
-| `docs` / `qa` / `verify` | `claude-sonnet-5` (Haiku は permission-mode auto を無視して承認ダイアログで止まるため) |
-| `code` / `bash` / `python` / `typescript` / `database` / `cloud` / `ops` | `claude-sonnet-5` (worker_model フォールバック — model_per_skill に定義なし) |
+| `planning` / `plan_review` / `review` / `research` | `opus` (深い推論が必要) |
+| `docs` / `qa` / `verify` | `sonnet` (Haiku は permission-mode auto を無視して承認ダイアログで止まるため) |
+| `code` / `bash` / `python` / `typescript` / `database` / `cloud` / `ops` | `sonnet` (worker_model フォールバック — model_per_skill に定義なし) |
 
 > ℹ️ 詳細な設計判断は `knowledge/model-per-skill.md` を参照。カスタマイズは `config/crewvia.yaml` の `model_per_skill` を編集すること。
 

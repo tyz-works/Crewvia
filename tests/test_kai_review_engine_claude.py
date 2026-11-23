@@ -97,7 +97,7 @@ def _argv(tmp_path):
 def test_get_prints_nine_lines_and_the_shipped_config_is_unchanged():
     c = lre.load_full(REPO_ROOT / "config" / "crewvia.yaml", environ={})
     assert c["engine"] == "codex" and c["compare"] == ["agy"]
-    assert c["claude_model"] == "claude-opus-5-5" and c["claude_timeout"] == 900
+    assert c["claude_model"] == "opus" and c["claude_timeout"] == 900
     assert c["codex_timeout"] == 900
 
 

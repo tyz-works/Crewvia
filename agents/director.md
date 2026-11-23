@@ -426,9 +426,9 @@ Worker 起動時のモデルは `config/crewvia.yaml` の `model_per_skill` で�
 
 | skill | デフォルトモデル | 理由 |
 |---|---|---|
-| `planning` / `plan_review` / `review` / `research` | `claude-opus-5` | 深い推論で誤判断を減らす |
-| `docs` / `qa` / `verify` | `claude-sonnet-5` | Haiku は permission-mode auto を無視して承認ダイアログで止まる |
-| `code` / `bash` / `python` / `typescript` / `database` / `cloud` / `ops` | `claude-sonnet-5` | worker_model フォールバック (model_per_skill に定義なし) |
+| `planning` / `plan_review` / `review` / `research` | `opus` | 深い推論で誤判断を減らす |
+| `docs` / `qa` / `verify` | `sonnet` | Haiku は permission-mode auto を無視して承認ダイアログで止まる |
+| `code` / `bash` / `python` / `typescript` / `database` / `cloud` / `ops` | `sonnet` | worker_model フォールバック (model_per_skill に定義なし) |
 
 複数 skill が指定された場合は最も要求の高いモデル (`opus > sonnet > haiku`) が選ばれる。詳細は `knowledge/model-per-skill.md` を参照。
 
@@ -571,7 +571,7 @@ AGENT_NAME=$WORKER_NAME bash scripts/start.sh worker ops bash cloud
 
 ```bash
 # docs Worker に Opus を使わせる（一時的な上書き）
-CREWVIA_WORKER_MODEL=claude-opus-5 AGENT_NAME=$WORKER_NAME bash scripts/start.sh worker docs
+CREWVIA_WORKER_MODEL=opus AGENT_NAME=$WORKER_NAME bash scripts/start.sh worker docs
 ```
 
 Worker 起動後、Dispatcher が自動的にスキルマッチしたタスクを Worker に割り当てる。

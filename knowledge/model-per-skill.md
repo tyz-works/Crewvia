@@ -9,22 +9,22 @@
 
 | skill | 割り当てモデル | 根拠 |
 |---|---|---|
-| `planning` | `claude-opus-5` | タスク分解・依存関係設計は誤判断のコストが高い |
-| `plan_review` | `claude-opus-5` | プランレビューは深い推論が必要 |
-| `review` | `claude-opus-5` | コードレビュー品質を最大化する |
-| `research` | `claude-opus-5` | 情報収集・要約の精度が結果に直結する |
-| `docs` | `claude-sonnet-5` | Haiku は `--permission-mode auto` を無視して承認ダイアログで止まる (t028 / backlog #16) |
-| `qa` | `claude-sonnet-5` | 同上 |
-| `verify` | `claude-sonnet-5` | 同上 |
-| `code` | `claude-sonnet-5` (worker_model) | 実装の精度とコストのバランス |
-| `bash` | `claude-sonnet-5` (worker_model) | 同上 |
-| `python` | `claude-sonnet-5` (worker_model) | 同上 |
-| `typescript` | `claude-sonnet-5` (worker_model) | 同上 |
-| `database` | `claude-sonnet-5` (worker_model) | 同上 |
-| `cloud` | `claude-sonnet-5` (worker_model) | 同上 |
-| `ops` | `claude-sonnet-5` (worker_model) | 同上 |
+| `planning` | `opus` | タスク分解・依存関係設計は誤判断のコストが高い |
+| `plan_review` | `opus` | プランレビューは深い推論が必要 |
+| `review` | `opus` | コードレビュー品質を最大化する |
+| `research` | `opus` | 情報収集・要約の精度が結果に直結する |
+| `docs` | `sonnet` | Haiku は `--permission-mode auto` を無視して承認ダイアログで止まる (t028 / backlog #16) |
+| `qa` | `sonnet` | 同上 |
+| `verify` | `sonnet` | 同上 |
+| `code` | `sonnet` (worker_model) | 実装の精度とコストのバランス |
+| `bash` | `sonnet` (worker_model) | 同上 |
+| `python` | `sonnet` (worker_model) | 同上 |
+| `typescript` | `sonnet` (worker_model) | 同上 |
+| `database` | `sonnet` (worker_model) | 同上 |
+| `cloud` | `sonnet` (worker_model) | 同上 |
+| `ops` | `sonnet` (worker_model) | 同上 |
 
-`worker_model` フォールバック = `config/crewvia.yaml` の `worker_model` 値（デフォルト `claude-sonnet-5`）。
+`worker_model` フォールバック = `config/crewvia.yaml` の `worker_model` 値（デフォルト `sonnet`）。
 
 ---
 
@@ -34,10 +34,10 @@
 **最も要求の高いモデル** (`opus > sonnet > haiku`) が選ばれる。
 
 ```
-planning,code  → planning=opus(3), code→sonnet(2)  → claude-opus-5
-docs,qa        → docs=sonnet(2),  qa=sonnet(2)      → claude-sonnet-5
-qa,bash        → qa=sonnet(2),    bash→sonnet(2)    → claude-sonnet-5
-code,python    → 両方 worker_model=sonnet(2)        → claude-sonnet-5
+planning,code  → planning=opus(3), code→sonnet(2)  → opus
+docs,qa        → docs=sonnet(2),  qa=sonnet(2)      → sonnet
+qa,bash        → qa=sonnet(2),    bash→sonnet(2)    → sonnet
+code,python    → 両方 worker_model=sonnet(2)        → sonnet
 ```
 
 同ランク同士の場合は skill 名をソートして最初に出たモデルを採用（決定的な挙動にするため）。
@@ -52,7 +52,7 @@ code,python    → 両方 worker_model=sonnet(2)        → claude-sonnet-5
 ### 一時的な上書き（1回の Worker 起動のみ）
 
 ```bash
-CREWVIA_WORKER_MODEL=claude-opus-5 bash scripts/start.sh worker docs
+CREWVIA_WORKER_MODEL=opus bash scripts/start.sh worker docs
 ```
 
 `CREWVIA_WORKER_MODEL` が起動前に設定されていると、`model_per_skill` より優先される（最優先）。
@@ -100,7 +100,7 @@ WORKER_MODEL_EXPLICIT=0
 
 ```bash
 CREWVIA_PRINT_MODEL=1 bash scripts/start.sh worker docs qa
-# → claude-sonnet-5 を stdout に出力して exit 0
+# → sonnet を stdout に出力して exit 0
 ```
 
 モデル解決結果を確認するだけで claude は起動しない。`AGENT_NAME` 割り当てや registry 書き込みなど
@@ -112,7 +112,7 @@ CREWVIA_PRINT_MODEL=1 bash scripts/start.sh worker docs qa
 
 Director が Worker を起動するたびに手で直していたものを機械にした 2 点。
 
-1. **docs / qa / verify を `claude-sonnet-5` に**。Haiku は `--permission-mode auto` を無視して
+1. **docs / qa / verify を `sonnet` に**。Haiku は `--permission-mode auto` を無視して
    承認ダイアログで止まり、毎回 `CREWVIA_WORKER_MODEL` で上書きしていた。`config/crewvia.yaml` の
    `model_per_skill` を直したので、上書きは要らない（env での上書きは従来どおり最優先で残る）。
    `tests/test_model_per_skill.py::TestRealConfig` が実 config の 3 skill が Haiku でないことを固定する。

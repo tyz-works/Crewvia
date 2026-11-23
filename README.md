@@ -309,9 +309,9 @@ The mapping is defined in `config/crewvia.yaml` under `model_per_skill`:
 
 | Skill | Default model | Rationale |
 |---|---|---|
-| `planning`, `plan_review`, `review`, `research` | `claude-opus-5` | Deep reasoning reduces errors |
-| `docs`, `qa`, `verify` | `claude-sonnet-5` | Haiku ignores `--permission-mode auto` and stalls on approval dialogs |
-| `code`, `bash`, `python`, `typescript`, `database`, `cloud`, `ops` | `claude-sonnet-5` | worker_model fallback (not in model_per_skill) |
+| `planning`, `plan_review`, `review`, `research` | `opus` | Deep reasoning reduces errors |
+| `docs`, `qa`, `verify` | `sonnet` | Haiku ignores `--permission-mode auto` and stalls on approval dialogs |
+| `code`, `bash`, `python`, `typescript`, `database`, `cloud`, `ops` | `sonnet` | worker_model fallback (not in model_per_skill) |
 
 When multiple skills are specified, the strongest model wins (`opus > sonnet > haiku`).
 
@@ -319,7 +319,7 @@ To override the model for a specific Worker launch, set `CREWVIA_WORKER_MODEL`:
 
 ```bash
 # Force Opus for a docs Worker
-CREWVIA_WORKER_MODEL=claude-opus-5 ./scripts/start.sh worker docs
+CREWVIA_WORKER_MODEL=opus ./scripts/start.sh worker docs
 ```
 
 To permanently change the mapping, edit `model_per_skill` in `config/crewvia.yaml`.

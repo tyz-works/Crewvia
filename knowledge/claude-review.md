@@ -12,7 +12,7 @@ findings の判定・needs-director / done の報告）は codex / agy と共通
 | 欄 | 既定 | 意味 |
 |---|---|---|
 | `engine` | `codex` | `codex` / `agy` / `claude` / `both` / `ensemble`。env `CREWVIA_REVIEW_ENGINE` が上書き（engine だけ） |
-| `claude_model` | `claude-opus-5-5` | `claude --model` に渡す名前。形の検査は agy と同じ（英数字で始まる・64 字まで） |
+| `claude_model` | `opus` | `claude --model` に渡す名前。形の検査は agy と同じ（英数字で始まる・64 字まで） |
 | `claude_timeout_seconds` | `900` | `timeout --kill-after=10s <N>s` で包む（CLI にタイムアウトのフラグが無い） |
 | `compare` | `[agy]` | `both` のときの併記の一覧に `claude` も置ける（agy / cursor / claude の部分集合） |
 

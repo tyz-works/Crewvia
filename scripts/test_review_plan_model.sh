@@ -4,7 +4,7 @@
 #
 # 背景: scripts/review-plan.sh は mux 経路 (L74 付近) と inline フォールバック
 # 経路 (L103 付近) の両方で `claude --model claude-opus-4-5` をハードコードして
-# おり、config/crewvia.yaml の model_per_skill.plan_review 設定 (claude-opus-5)
+# おり、config/crewvia.yaml の model_per_skill.plan_review 設定 (opus)
 # が完全に無視される dead config になっていた。しかも claude-opus-4-5 は存在
 # しない世代の ID だった。
 #
@@ -19,10 +19,10 @@
 # 差し替えて実際に渡された argv を検査する。
 #
 # 検証内容:
-#   1. mux 経路: INLINE_CMD に config 通りのモデル ID (--model claude-opus-5)
+#   1. mux 経路: INLINE_CMD に config 通りのモデル ID (--model opus)
 #      が含まれ、旧ハードコード値 (claude-opus-4-5) が含まれないこと
 #   2. inline フォールバック経路: claude スタブに渡る argv が
-#      ["--model", "claude-opus-5"] であること (config 通り)
+#      ["--model", "opus"] であること (config 通り)
 #   3. config を書き換えると解決結果も追従すること (dead config でないことの
 #      直接証明) — model_per_skill.plan_review を差し替えたカスタム config で
 #      inline フォールバック経路を再実行し、argv がカスタム値に変わること
@@ -93,8 +93,8 @@ RC1=$?
 set -e
 
 CAPTURED_CMD="$(cat "$CMD_LOG" 2>/dev/null || echo '<missing>')"
-if [[ "$RC1" -eq 0 && "$CAPTURED_CMD" == *"claude --model 'claude-opus-5'"* ]]; then
-  pass "mux 経路: INLINE_CMD に --model 'claude-opus-5' (config/crewvia.yaml の model_per_skill.plan_review 通り) が含まれる"
+if [[ "$RC1" -eq 0 && "$CAPTURED_CMD" == *"claude --model 'opus'"* ]]; then
+  pass "mux 経路: INLINE_CMD に --model 'opus' (config/crewvia.yaml の model_per_skill.plan_review 通り) が含まれる"
 else
   fail "mux 経路: 期待したモデル指定が見つからない (rc=$RC1) — captured: $CAPTURED_CMD"
 fi
@@ -136,8 +136,8 @@ RC2=$?
 set -e
 
 CAPTURED_ARGV="$(cat "$ARGV_LOG" 2>/dev/null | tr '\n' ' ')"
-if [[ "$RC2" -eq 0 && "$CAPTURED_ARGV" == *"--model claude-opus-5"* ]]; then
-  pass "inline フォールバック経路: claude に --model claude-opus-5 (config 通り) が渡される"
+if [[ "$RC2" -eq 0 && "$CAPTURED_ARGV" == *"--model opus"* ]]; then
+  pass "inline フォールバック経路: claude に --model opus (config 通り) が渡される"
 else
   fail "inline フォールバック経路: 期待した argv が見つからない (rc=$RC2) — captured argv: '$CAPTURED_ARGV', stdout: $(cat "$TMPDIR2/stdout.log")"
 fi

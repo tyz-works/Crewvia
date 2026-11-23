@@ -2115,7 +2115,7 @@ def _usage_limit_record_is_corrupt(name: str) -> bool:
     return not is_missing(entry) and is_unreadable(entry)
 
 
-def _first_seen_from_ledger(key: str, notice: str) -> Optional[float]:
+def _first_seen_from_ledger(key: str, notice: str, now: float) -> Optional[float]:
     """台帳の fp (`<identity>@<first_seen の秒>`) が今の通知行と同じなら、その秒。違えば None。"""
     told = load_told()
     if is_unreadable(told):
@@ -2133,7 +2133,11 @@ def _first_seen_from_ledger(key: str, notice: str) -> Optional[float]:
         seen = float(tail)
     except (ValueError, OverflowError):
         return None
-    return seen if math.isfinite(seen) and seen >= 0 else None
+    # 未来の値 (999999999999 等) を引き継ぐと excuse_deadline が数千年先に延び、上限つきの免除が
+    # 黙ったままになる。見え始めが今より (小さな時計のずれ以上に) 先なら引き継がない。
+    if not math.isfinite(seen) or seen < 0 or seen > now + 60:
+        return None
+    return seen
 
 
 def handle_usage_limit(name: str, target: str, assignment_file: Path) -> bool:
@@ -2159,7 +2163,7 @@ def handle_usage_limit(name: str, target: str, assignment_file: Path) -> bool:
         # 記録が壊れた (欠けたのではない)。first_seen を作り直すと台帳の fp (`…@<秒>`) が
         # 秒の境目をまたいで変わり、同じ通知がもう 1 回出る。台帳が同じ通知行の fp を持つなら
         # その見え始めを引き継ぐ (免除の上限の起点も延びない)。
-        kept = _first_seen_from_ledger(key, entry['notice'])
+        kept = _first_seen_from_ledger(key, entry['notice'], now)
         if kept is not None:
             entry['first_seen'] = kept
     if entry is None:

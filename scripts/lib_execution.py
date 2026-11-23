@@ -431,7 +431,11 @@ def record_shape_problem(record):
 
 
 def record_follows_card(record, meta):
-    """追従する欄 (`status` / `end_code`) が card と一致しているか。"""
+    """追従する欄 (`status` / `end_code` / `model`) が card と一致しているか。
+    `model` は card に `execution_model` があるときだけ比べる (card が正本。欄の無い card は record の値を問わない)。"""
+    card_model = meta.get('execution_model') or None
+    if card_model is not None and record.get('model') != card_model:
+        return False
     return (record.get('status') == meta['execution_status']
             and (record.get('end_code') or None) == (meta.get('execution_end_code') or None))
 
@@ -449,8 +453,10 @@ def follow_card(record, meta, *, ended_at=None, running_at=None, git=None, model
         out['running_at'] = running_at
     if git:
         out['git'].update({k: v for k, v in git.items() if k in out['git']})
+    if model is None:
+        model = meta.get('execution_model') or None     # card が正本: card にあれば record に写す (R-5 の回復もこれで直る)
     if model is not None:
-        out['model'] = model                 # start が渡したときだけ (R-5 は渡さず、既存の値を残す)
+        out['model'] = model                 # card に無く start も渡さなければ、既存の値を残す
     return out
 
 

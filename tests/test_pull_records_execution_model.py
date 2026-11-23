@@ -172,3 +172,46 @@ def test_assignment_is_unchanged_by_the_record(box):
         b = Box(box.root.parent / f"root-{agent}", tasks=("t001",))
         put_record(b, agent, model=model)
         assert b.pull(agent).returncode == 0
+
+
+def _drop_record_model(box, xid):
+    p = box.queue / "missions" / MISSION / "executions" / f"{xid}.json"
+    rec = json.loads(p.read_text())
+    rec["model"] = None
+    p.write_text(json.dumps(rec))
+
+
+def test_follow_card_and_follows_card_include_the_cards_model():
+    import lib_execution as ex
+    meta = {"execution_status": "running", "execution_end_code": None, "execution_model": "sonnet"}
+    rec = {"status": "running", "end_code": None, "model": None, "git": {}}
+    assert ex.record_follows_card(rec, meta) is False            # model が落ちた record は「遅れている」
+    assert ex.follow_card(rec, meta)["model"] == "sonnet"          # R-5 (model を渡さない呼び出し) でも card から写る
+    assert ex.record_follows_card(ex.follow_card(rec, meta), meta) is True
+    # card に model が無ければ record の値は問わない・上書きもしない
+    meta2 = {"execution_status": "running", "execution_end_code": None}
+    assert ex.record_follows_card({**rec, "model": "opus"}, meta2) is True
+    assert ex.follow_card({**rec, "model": "opus"}, meta2)["model"] == "opus"
+
+
+def test_interrupted_start_loses_the_model_in_the_record_and_r5_restores_it(box):
+    """start が card (running) を書いた後・record を書く前に止まった形: card は sonnet・record は model=null。"""
+    put_record(box, model="sonnet")
+    xid = take(box)
+    _drop_record_model(box, xid)
+    assert box.record(xid)["model"] is None
+    # 次に queue を書く plan.sh の回復 (R-5) が card の execution_model で直す
+    box.plan("update", TID, "--priority", "high", "--mission", MISSION, agent="Director")
+    box.plan("store-check", "--mission", MISSION)
+    assert box.record(xid)["model"] == "sonnet"
+
+
+def test_pull_without_agent_flag_uses_the_env_names_record_only(box):
+    put_record(box, model="sonnet")                  # Ren の記録だけがある
+    # --agent なし: 名前は AGENT_NAME (Hana。記録なし)。他の Worker (Ren) の model を写してはいけない
+    p = box.plan("pull", "--skills", "code", "--mission", MISSION, "--task", TID, agent="Hana")
+    assert p.returncode == 0, p.stderr
+    res = json.loads(p.stdout)
+    assert "execution_model" not in res
+    assert "execution_model" not in box.card()
+    assert box.record(res["execution_id"]).get("model") is None

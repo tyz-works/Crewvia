@@ -213,6 +213,11 @@ class TestRealConfig:
         # 最高ランク選択: planning=opus, code=worker_model → opus
         assert lib_model.resolve(str(REAL_CONFIG), "planning,code") == "opus"
 
+    def test_design_is_opus(self):
+        # 設計文書を書く skill。以前は Director が CREWVIA_WORKER_MODEL=opus を前置きしていた
+        assert lib_model.resolve(str(REAL_CONFIG), "design") == "opus"
+        assert lib_model.resolve(str(REAL_CONFIG), "design,docs") == "opus"
+
     def test_docs_and_qa_returns_sonnet(self):
         # 同ランク: docs=sonnet, qa=sonnet → sonnet
         assert lib_model.resolve(str(REAL_CONFIG), "docs,qa") == "sonnet"

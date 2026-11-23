@@ -96,3 +96,4 @@ customizations:
 # database   DB操作・クエリ
 # cloud      クラウド（AWS / OCI）
 # docs       ドキュメント作成
+# design     設計文書の作成（権限は docs と同じ・モデルは opus）

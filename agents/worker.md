@@ -96,7 +96,7 @@ Worker 起動時に使用するモデルは以下の優先順位で決まる:
 
 | skill | デフォルトモデル |
 |---|---|
-| `planning` / `plan_review` / `review` / `research` | `opus` (深い推論が必要) |
+| `planning` / `plan_review` / `review` / `research` / `design` | `opus` (深い推論が必要) |
 | `docs` / `qa` / `verify` | `sonnet` (Haiku は permission-mode auto を無視して承認ダイアログで止まるため) |
 | `code` / `bash` / `python` / `typescript` / `database` / `cloud` / `ops` | `sonnet` (worker_model フォールバック — model_per_skill に定義なし) |
 

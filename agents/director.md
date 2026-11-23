@@ -413,6 +413,7 @@ Worker に指示を出す際は:
 | `database` | DB操作・クエリ |
 | `cloud` | クラウド（AWS / OCI） |
 | `docs` | ドキュメント作成 |
+| `design` | 設計文書 (knowledge/*.md) を書いて PR にする。権限は docs と同じ・モデルは opus |
 | `review` | コードレビュー・PR承認 |
 | `qa` | QA・動作検証（実装者とは別Workerが担当） |
 | `planning` | プランレビュー（タスク分解・依存関係・スキル割り当ての妥当性検証）。Bash(plan.sh status/pull), git log/diff は可。Edit/Write は deny |
@@ -426,7 +427,7 @@ Worker 起動時のモデルは `config/crewvia.yaml` の `model_per_skill` で�
 
 | skill | デフォルトモデル | 理由 |
 |---|---|---|
-| `planning` / `plan_review` / `review` / `research` | `opus` | 深い推論で誤判断を減らす |
+| `planning` / `plan_review` / `review` / `research` / `design` | `opus` | 深い推論で誤判断を減らす |
 | `docs` / `qa` / `verify` | `sonnet` | Haiku は permission-mode auto を無視して承認ダイアログで止まる |
 | `code` / `bash` / `python` / `typescript` / `database` / `cloud` / `ops` | `sonnet` | worker_model フォールバック (model_per_skill に定義なし) |
 
@@ -447,6 +448,7 @@ Worker がファイルを編集・作成できるかはスキルで決まる。
 | `database` | ✅ 可 | DB操作・クエリ |
 | `cloud` | ✅ 可 | クラウドリソース操作 |
 | `docs` | ✅ 可 | ドキュメント作成 |
+| `design` | ✅ 可 | 設計文書の作成。**設計文書の task は design を使う（planning はプランレビュー専用で書けない）** |
 | `qa` | ✅ 可 | QA・動作検証（テスト結果記録等） |
 | `review` | ❌ deny | コードレビュー・PR承認（gh コマンド中心。Edit/Write は不可） |
 | `research` | ❌ deny | **調査のみ。実装タスクには絶対に使わない** |

@@ -214,6 +214,9 @@ PERMS = (
     "    can_produce_deliverable: true\n"
     "    allow: [Edit, Write, MultiEdit, \"Bash(git *)\"]\n"
     "    deny: []\n"
+    "  design:\n"
+    "    allow: [Edit, Write, MultiEdit, \"Bash(git *)\"]\n"
+    "    deny: []\n"
     "  research:\n"
     "    can_produce_deliverable: false\n"
     "    allow: []\n"
@@ -248,12 +251,12 @@ class TestCheckDeliverable:
         assert len(fails) == 1 and "t001" in fails[0] and "拒否されています" in fails[0], fails
 
     @pytest.mark.parametrize("declared", ["pr", "file"])
-    @pytest.mark.parametrize("skills", [["code"], ["docs"]])
+    @pytest.mark.parametrize("skills", [["code"], ["docs"], ["design"]])
     def test_a_lone_producing_skill_is_enough(self, perms, declared, skills):
         assert lint_plan.check_deliverable([_t(declared, skills)], perms) == []
 
     @pytest.mark.parametrize("declared", ["pr", "file"])
-    @pytest.mark.parametrize("skills", [["research", "code"], ["review", "docs"]])
+    @pytest.mark.parametrize("skills", [["research", "code"], ["review", "docs"], ["design", "research"]])
     def test_a_denying_skill_mixed_in_still_fails(self, perms, declared, skills):
         """t088 (PR#236 7巡目 P2): 「1 つでも can_produce_deliverable: true な skill が
         あれば作れる」という宣言の集計 (旧実装) は、hook (`check_permission()`) が

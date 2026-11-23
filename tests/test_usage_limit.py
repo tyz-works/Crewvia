@@ -392,6 +392,22 @@ def test_a_corrupt_record_does_not_make_the_notice_repeat(r5):
         assert r5.to_director(r5.run()) == []
 
 
+def test_a_corrupt_record_keeps_the_ledger_fp_across_a_second_boundary(r5):
+    """fp は `identity@<first_seen の秒>`。壊れた記録から作り直した first_seen が次の秒に入っても、
+    台帳の fp が変わらず通知は繰り返されない (main CI の flake: 17:59:22Z → 23Z で 2 回目が出た)。
+    first_seen (免除の上限の起点) も延びない。"""
+    PaneMux.screen = limited_screen(NOTICE_REL)
+    r5.age_state()
+    assert len(r5.to_director(r5.run())) == 1
+    first_seen = r5.entry()["first_seen"]
+    r5.entry_path.write_text("{not json")
+    r5.h.notify_cache.unlink(missing_ok=True)
+    time.sleep(1.1)                           # 確実に秒の境目をまたぐ
+    r5.age_state()
+    assert r5.to_director(r5.run()) == []
+    assert int(r5.entry()["first_seen"]) == int(first_seen)
+
+
 # ---------------------------------------------------------------------------
 # 3. watchdog (idle / max)
 # ---------------------------------------------------------------------------

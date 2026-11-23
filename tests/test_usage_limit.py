@@ -392,6 +392,41 @@ def test_a_corrupt_record_does_not_make_the_notice_repeat(r5):
         assert r5.to_director(r5.run()) == []
 
 
+def test_a_corrupt_record_keeps_the_ledger_fp_across_a_second_boundary(r5):
+    """fp は `identity@<first_seen の秒>`。壊れた記録から作り直した first_seen が次の秒に入っても、
+    台帳の fp が変わらず通知は繰り返されない (main CI の flake: 17:59:22Z → 23Z で 2 回目が出た)。
+    first_seen (免除の上限の起点) も延びない。"""
+    PaneMux.screen = limited_screen(NOTICE_REL)
+    r5.age_state()
+    assert len(r5.to_director(r5.run())) == 1
+    first_seen = r5.entry()["first_seen"]
+    r5.entry_path.write_text("{not json")
+    r5.h.notify_cache.unlink(missing_ok=True)
+    time.sleep(1.1)                           # 確実に秒の境目をまたぐ
+    r5.age_state()
+    assert r5.to_director(r5.run()) == []
+    assert int(r5.entry()["first_seen"]) == int(first_seen)
+
+
+@pytest.mark.parametrize("tail", ["²", "9" * 400, "-5", "", "nan", "inf", "12.5x", "1700000000", "999999999999", "1999999999"])
+def test_a_garbled_ledger_fp_never_breaks_the_recovery(r5, monkeypatch, tail):
+    """台帳の fp の秒が壊れていても (isdigit を通る '²'・inf になる 400 桁・負・空) 例外にならず、
+    引き継ぎは None (= 新しい first_seen)。正常な秒だけがそのまま返る。"""
+    key = f"usage-limit_{AGENT}"
+    fp = f"{lib_usage_limit.identity(NOTICE_REL)}@{tail}"
+    monkeypatch.setitem(r5.ns, "load_told", lambda: {key: {"fp": fp}})
+    got = r5.ns["_first_seen_from_ledger"](key, NOTICE_REL, 1700000100.0)
+    assert got == (1700000000.0 if tail == "1700000000" else None)
+
+
+def test_a_ledger_fp_slightly_ahead_of_now_is_still_inherited(r5, monkeypatch):
+    """時計のずれ (60 秒以内) は引き継ぐ。未来すぎる値だけ捨てる。"""
+    key = f"usage-limit_{AGENT}"
+    fp = f"{lib_usage_limit.identity(NOTICE_REL)}@1700000130"
+    monkeypatch.setitem(r5.ns, "load_told", lambda: {key: {"fp": fp}})
+    assert r5.ns["_first_seen_from_ledger"](key, NOTICE_REL, 1700000100.0) == 1700000130.0
+
+
 # ---------------------------------------------------------------------------
 # 3. watchdog (idle / max)
 # ---------------------------------------------------------------------------

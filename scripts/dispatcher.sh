@@ -207,6 +207,7 @@ import sys
 import os
 import re
 import json
+import math
 import shlex
 import time
 import subprocess
@@ -2108,6 +2109,37 @@ def _retire_usage_limit(name: str) -> bool:
     return _save_usage_limit(name, None)
 
 
+def _usage_limit_record_is_corrupt(name: str) -> bool:
+    """記録ファイルが「ある・読めない」。無い (ENOENT) は False — 新しい利用枠切れの始まり。"""
+    entry = load_json_store(_usage_limit_path(name), check=usage_limit_state_problem)
+    return not is_missing(entry) and is_unreadable(entry)
+
+
+def _first_seen_from_ledger(key: str, notice: str, now: float) -> Optional[float]:
+    """台帳の fp (`<identity>@<first_seen の秒>`) が今の通知行と同じなら、その秒。違えば None。"""
+    told = load_told()
+    if is_unreadable(told):
+        return None
+    entry = told.get(key)
+    fp = entry.get('fp') if isinstance(entry, dict) else None
+    prefix = lib_usage_limit.identity(notice) + '@'
+    if not isinstance(fp, str) or not fp.startswith(prefix):
+        return None
+    tail = fp[len(prefix):]
+    # isdigit() は '²' 等も通し (float が ValueError)、400 桁は inf になる (int() が OverflowError)。
+    # 台帳と記録が両方壊れても復旧の経路が毎回落ちないよう、変換できない・有限でない・負は
+    # 「引き継がない」(None = 新しい first_seen)。
+    try:
+        seen = float(tail)
+    except (ValueError, OverflowError):
+        return None
+    # 未来の値 (999999999999 等) を引き継ぐと excuse_deadline が数千年先に延び、上限つきの免除が
+    # 黙ったままになる。見え始めが今より (小さな時計のずれ以上に) 先なら引き継がない。
+    if not math.isfinite(seen) or seen < 0 or seen > now + 60:
+        return None
+    return seen
+
+
 def handle_usage_limit(name: str, target: str, assignment_file: Path) -> bool:
     """利用枠切れの Worker を Rule 5 の代わりに扱う。True = Rule 5 は黙る (この関数が扱った)。
 
@@ -2127,6 +2159,13 @@ def handle_usage_limit(name: str, target: str, assignment_file: Path) -> bool:
     entry = lib_usage_limit.observe(prev, screen, now)
     key = f'usage-limit_{name}'
     still_key = f'usage-limit-still_{name}'
+    if entry is not None and prev is None and _usage_limit_record_is_corrupt(name):
+        # 記録が壊れた (欠けたのではない)。first_seen を作り直すと台帳の fp (`…@<秒>`) が
+        # 秒の境目をまたいで変わり、同じ通知がもう 1 回出る。台帳が同じ通知行の fp を持つなら
+        # その見え始めを引き継ぐ (免除の上限の起点も延びない)。
+        kept = _first_seen_from_ledger(key, entry['notice'], now)
+        if kept is not None:
+            entry['first_seen'] = kept
     if entry is None:
         if prev is not None or _usage_limit_path(name).exists():
             # 解消した: 記録と台帳を畳む (次に同じ状態が来たら再通知する)。記録があったときだけ

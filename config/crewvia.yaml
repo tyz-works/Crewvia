@@ -17,7 +17,7 @@ wip_limit: 8
 # Director と Worker が起動時に使う Claude モデルを指定します。
 # 空にすると claude CLI のデフォルト（ユーザーの /model 設定）に従います。
 #
-# 利用可能な ID (2026-09 時点で claude CLI 2.1.263 に受理確認済み):
+# 指定できる値 (別名。版つきの ID も可):
 #   opus                       ← 最高性能。計画・調整・レビュー向き
 #   sonnet                     ← バランス型。実装・汎用作業向き (worker_model のデフォルト)
 #   claude-haiku-4-5-20251001  ← 高速・低コスト。ただし permission-mode auto を無視するので Worker には使わない
@@ -40,6 +40,7 @@ model_per_skill:
   plan_review: opus
   review:      opus
   research:    opus
+  design:      opus   # 設計文書を書く skill (権限は docs と同じ。planning は書けない)
   # docs / qa / verify を Haiku にしない: Haiku は --permission-mode auto を無視して承認
   # ダイアログで止まる (t028 / backlog #16)。以前は起動のたびに CREWVIA_WORKER_MODEL で上書きしていた。
   docs:        sonnet

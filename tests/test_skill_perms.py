@@ -211,6 +211,25 @@ class TestExpandedSkillAllow:
         result = check_permission(_config(), "docs", "Bash(git commit -m 'docs: update')")
         assert result["decision"] == "allow"
 
+    # design: 権限は docs と同じ (設計文書を書いて PR にする)
+    def test_design_write_allowed(self):
+        for tool in ("Write", "Edit", "MultiEdit"):
+            assert check_permission(_config(), "design", tool)["decision"] == "allow", tool
+
+    def test_design_git_push_feature_branch_allowed(self):
+        result = check_permission(_config(), "design", "Bash(git push origin feat/design-doc)")
+        assert result["decision"] == "allow"
+
+    def test_design_git_push_main_denied(self):
+        result = check_permission(_config(), "design", "Bash(git push origin main)")
+        assert result["decision"] == "deny"
+        assert "_global" in result["source"]
+
+    def test_design_has_same_allow_deny_as_docs(self):
+        skills = _config()["skills"]
+        assert skills["design"]["allow"] == skills["docs"]["allow"]
+        assert skills["design"]["deny"] == skills["docs"]["deny"]
+
 
 class TestGlobalDenyOverridesSkillAllow:
     """_global.deny must override skill allow — main push denied even for code skill."""

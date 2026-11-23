@@ -13,6 +13,7 @@
 | `plan_review` | `opus` | プランレビューは深い推論が必要 |
 | `review` | `opus` | コードレビュー品質を最大化する |
 | `research` | `opus` | 情報収集・要約の精度が結果に直結する |
+| `design` | `opus` | 設計文書 (knowledge/*.md) を書いて PR にする。権限は docs と同じ（planning はプランレビュー専用で書けない）。以前は Director が設計のたびに `CREWVIA_WORKER_MODEL=opus` を前置きしていた |
 | `docs` | `sonnet` | Haiku は `--permission-mode auto` を無視して承認ダイアログで止まる (t028 / backlog #16) |
 | `qa` | `sonnet` | 同上 |
 | `verify` | `sonnet` | 同上 |
@@ -112,7 +113,7 @@ CREWVIA_PRINT_MODEL=1 bash scripts/start.sh worker docs qa
 
 Director が Worker を起動するたびに手で直していたものを機械にした 2 点。
 
-1. **docs / qa / verify を `sonnet` に**。Haiku は `--permission-mode auto` を無視して
+1. **docs / qa / verify を `claude-sonnet-5` に**（当時の版名。現在は別名 `sonnet`）。Haiku は `--permission-mode auto` を無視して
    承認ダイアログで止まり、毎回 `CREWVIA_WORKER_MODEL` で上書きしていた。`config/crewvia.yaml` の
    `model_per_skill` を直したので、上書きは要らない（env での上書きは従来どおり最優先で残る）。
    `tests/test_model_per_skill.py::TestRealConfig` が実 config の 3 skill が Haiku でないことを固定する。

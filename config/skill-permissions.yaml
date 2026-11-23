@@ -208,6 +208,18 @@ skills:
       - "Bash(git *)"
     deny: []
 
+  # design: 設計文書 (knowledge/*.md) を書いて PR にする skill。権限は docs と同じ
+  # (読み取り・実測の Bash は足さない。Read / Grep / Glob は skill に関係なく使え、
+  # 実測が要るなら card に code / qa を併記する)。モデルは opus (crewvia.yaml model_per_skill)。
+  # planning はプランレビュー専用で書けないので、設計文書の task には design を使う。
+  design:
+    allow:
+      - "Edit"
+      - "Write"
+      - "MultiEdit"
+      - "Bash(git *)"
+    deny: []
+
   qa:
     allow:
       - "Edit"

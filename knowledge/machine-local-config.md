@@ -403,3 +403,11 @@ telegram/IRC の認証情報の取り出し) が混在している。
   `get` に置き換えたら該当テストを `get` 経由に書き直す。
 - 秘密は local にも**値を書かない** (`op://` 参照・ファイルパスだけ。既存の規則どおり)。`.example` にも値は入れない。
 - `.gitignore` の追加は `config/crewvia.local.yaml` の 1 行 (`registry/workers.yaml` は既に載っている — §7) (パターンで広げない — `config/*.yaml` を巻き込むと共通も外れる)。
+
+## 11. モデルの指定を local に置かない (2026-11-24)
+
+共通の `config/crewvia.yaml` のモデル指定が別名 (`opus` / `sonnet`) になった (#434 / 7bc6c16。`knowledge/model-per-skill.md`)。
+`config/crewvia.local.yaml` に `director_model` / `worker_model` / `model_per_skill` を置くと共通の別名を上書きし、版を固定し続けてしまうので、置かない (このマシンの local にあった版つきの値は同日削除した)。
+1 回だけ別モデルで動かしたいときは、起動時に `CREWVIA_WORKER_MODEL` / `CREWVIA_DIRECTOR_MODEL` を付ける (env は config より優先)。
+どうしても機械ごとに変える必要があるときは local に書いてよいが、その理由をコメントで残す。
+実効モデルは `CREWVIA_PRINT_MODEL=1 bash scripts/start.sh worker <skills>` で確かめる。
